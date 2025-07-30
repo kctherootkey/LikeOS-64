@@ -18,19 +18,33 @@ start:
     mov si, boot_msg
     call print_string
 
-    ; Load kernel from disk
-    ; We'll load 32 sectors (16KB) starting from sector 2
-    mov ah, 0x02            ; BIOS read sectors function
-    mov al, 32              ; Number of sectors to read
-    mov ch, 0               ; Cylinder 0
-    mov cl, 2               ; Start from sector 2 (sector 1 is boot sector)
-    mov dh, 0               ; Head 0
-    mov dl, 0x80            ; Drive 0 (first hard disk)
-    mov bx, 0x1000          ; Load kernel to 0x1000:0x0000 (0x10000 physical)
+    ; Load kernel from disk - VMware and QEMU compatibility
+    mov dl, 0x00            ; Try floppy first (VMware)
+    mov ah, 0x02
+    mov al, 32
+    mov ch, 0
+    mov cl, 2
+    mov dh, 0
+    mov bx, 0x1000
     mov es, bx
-    mov bx, 0
-    int 0x13                ; Call BIOS
-    jc disk_error
+    xor bx, bx
+    int 0x13
+    jnc .disk_loaded        ; Success with floppy
+    
+    ; Floppy failed, try hard disk (QEMU)
+    mov dl, 0x80
+    mov ah, 0x02
+    mov al, 32
+    mov ch, 0
+    mov cl, 2
+    mov dh, 0
+    mov bx, 0x1000
+    mov es, bx
+    xor bx, bx
+    int 0x13
+    jc disk_error           ; Both failed
+    
+.disk_loaded:
 
     ; Setup GDT
     lgdt [gdt_descriptor]
@@ -206,8 +220,8 @@ long_mode:
     mov rdi, 0x100000       ; Destination: 1MB mark
     mov rcx, 0x4000         ; Copy 16KB
     rep movsb
-
-    ; Jump to kernel entry point (absolute jump in 64-bit mode)
+    
+    ; If we reach here, kernel is properly loaded at 0x100000
     mov rax, 0x100000
     jmp rax
 
