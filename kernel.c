@@ -49,6 +49,7 @@ void kernel_main(void) {
     char c;
     while (1) {
         c = keyboard_get_char();
+
         if (c != 0) {
             if (c == '\n') {
                 // Handle Enter key
