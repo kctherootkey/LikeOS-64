@@ -25,6 +25,7 @@ LDFLAGS = -T linker.ld -nostdlib
 BOOTLOADER = $(BUILD_DIR)/boot.bin
 KERNEL_ASM_OBJ = $(BUILD_DIR)/boot64.o
 KERNEL_C_OBJ = $(BUILD_DIR)/kernel.o
+KPRINTF_OBJ = $(BUILD_DIR)/kprintf.o
 KERNEL_BIN = $(BUILD_DIR)/kernel.bin
 OS_IMAGE = $(BUILD_DIR)/LikeOS.img
 ISO_IMAGE = $(BUILD_DIR)/LikeOS.iso
@@ -46,12 +47,16 @@ $(KERNEL_ASM_OBJ): boot64.asm | $(BUILD_DIR)
 	$(NASM) -f elf64 boot64.asm -o $(KERNEL_ASM_OBJ)
 
 # Compile kernel C code
-$(KERNEL_C_OBJ): kernel.c | $(BUILD_DIR)
+$(KERNEL_C_OBJ): kernel.c kprintf.h | $(BUILD_DIR)
 	$(GCC) $(CFLAGS) -c kernel.c -o $(KERNEL_C_OBJ)
 
+# Compile kprintf module
+$(KPRINTF_OBJ): kprintf.c kprintf.h | $(BUILD_DIR)
+	$(GCC) $(CFLAGS) -c kprintf.c -o $(KPRINTF_OBJ)
+
 # Link kernel
-$(KERNEL_BIN): $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) linker.ld
-	$(LD) $(LDFLAGS) $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) -o $(KERNEL_BIN).elf
+$(KERNEL_BIN): $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KPRINTF_OBJ) linker.ld
+	$(LD) $(LDFLAGS) $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KPRINTF_OBJ) -o $(KERNEL_BIN).elf
 	objcopy -O binary $(KERNEL_BIN).elf $(KERNEL_BIN)
 
 # Create OS image
