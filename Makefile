@@ -26,6 +26,11 @@ BOOTLOADER = $(BUILD_DIR)/boot.bin
 KERNEL_ASM_OBJ = $(BUILD_DIR)/boot64.o
 KERNEL_C_OBJ = $(BUILD_DIR)/kernel.o
 KPRINTF_OBJ = $(BUILD_DIR)/kprintf.o
+INTERRUPTS_ASM_OBJ = $(BUILD_DIR)/interrupts.o
+INTERRUPTS_C_OBJ = $(BUILD_DIR)/interrupts_c.o
+GDT_ASM_OBJ = $(BUILD_DIR)/gdt.o
+GDT_C_OBJ = $(BUILD_DIR)/gdt_c.o
+KEYBOARD_OBJ = $(BUILD_DIR)/keyboard.o
 KERNEL_BIN = $(BUILD_DIR)/kernel.bin
 OS_IMAGE = $(BUILD_DIR)/LikeOS.img
 ISO_IMAGE = $(BUILD_DIR)/LikeOS.iso
@@ -54,9 +59,29 @@ $(KERNEL_C_OBJ): kernel.c kprintf.h | $(BUILD_DIR)
 $(KPRINTF_OBJ): kprintf.c kprintf.h | $(BUILD_DIR)
 	$(GCC) $(CFLAGS) -c kprintf.c -o $(KPRINTF_OBJ)
 
+# Assemble interrupt handlers
+$(INTERRUPTS_ASM_OBJ): interrupts.asm | $(BUILD_DIR)
+	$(NASM) -f elf64 interrupts.asm -o $(INTERRUPTS_ASM_OBJ)
+
+# Compile interrupt system
+$(INTERRUPTS_C_OBJ): interrupts.c interrupts.h kprintf.h | $(BUILD_DIR)
+	$(GCC) $(CFLAGS) -c interrupts.c -o $(INTERRUPTS_C_OBJ)
+
+# Compile keyboard driver
+$(KEYBOARD_OBJ): keyboard.c keyboard.h interrupts.h kprintf.h | $(BUILD_DIR)
+	$(GCC) $(CFLAGS) -c keyboard.c -o $(KEYBOARD_OBJ)
+
+# Assemble GDT
+$(GDT_ASM_OBJ): gdt.asm | $(BUILD_DIR)
+	$(NASM) -f elf64 gdt.asm -o $(GDT_ASM_OBJ)
+
+# Compile GDT
+$(GDT_C_OBJ): gdt.c interrupts.h kprintf.h | $(BUILD_DIR)
+	$(GCC) $(CFLAGS) -c gdt.c -o $(GDT_C_OBJ)
+
 # Link kernel
-$(KERNEL_BIN): $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KPRINTF_OBJ) linker.ld
-	$(LD) $(LDFLAGS) $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KPRINTF_OBJ) -o $(KERNEL_BIN).elf
+$(KERNEL_BIN): $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KPRINTF_OBJ) $(INTERRUPTS_ASM_OBJ) $(INTERRUPTS_C_OBJ) $(GDT_ASM_OBJ) $(GDT_C_OBJ) $(KEYBOARD_OBJ) linker.ld
+	$(LD) $(LDFLAGS) $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KPRINTF_OBJ) $(INTERRUPTS_ASM_OBJ) $(INTERRUPTS_C_OBJ) $(GDT_ASM_OBJ) $(GDT_C_OBJ) $(KEYBOARD_OBJ) -o $(KERNEL_BIN).elf
 	objcopy -O binary $(KERNEL_BIN).elf $(KERNEL_BIN)
 
 # Create OS image
