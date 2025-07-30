@@ -38,12 +38,19 @@ start:
     ; Enable A20 line (required for >1MB access)
     call enable_a20
 
+    ; VMware-compatible protected mode transition
+    ; Ensure interrupts are disabled and clear prefetch queue
+    cli                     ; Ensure interrupts disabled
+    
+    ; Clear any pending interrupts and serialize instruction execution
+    jmp $+2                 ; Short jump to clear prefetch queue
+    
     ; Switch to protected mode
     mov eax, cr0
-    or eax, 1
-    mov cr0, eax
+    or eax, 1               ; Set PE (Protection Enable) bit
+    mov cr0, eax            ; Enter protected mode
 
-    ; Jump to 32-bit protected mode code
+    ; Immediate far jump to flush CPU pipeline and load new CS
     jmp CODE_SEG:protected_mode
 
 disk_error:
@@ -52,45 +59,73 @@ disk_error:
     hlt
 
 enable_a20:
-    ; Enable A20 gate using keyboard controller
-    call wait_8042
-    mov al, 0xAD            ; Disable first PS/2 port
-    out 0x64, al
+    ; Fast A20 Gate method (port 0x92) - most reliable for virtualization
+    ; Check if A20 is already enabled first
+    call check_a20
+    cmp ax, 1
+    je .a20_enabled
     
-    call wait_8042
-    mov al, 0xD0            ; Read output port
-    out 0x64, al
+    ; Enable A20 using Fast A20 Gate
+    in al, 0x92             ; Read from Fast A20 port
+    test al, 2              ; Check if already enabled
+    jnz .a20_enabled        ; Already enabled, skip
+    or al, 2                ; Set bit 1 (A20 gate)
+    out 0x92, al            ; Write back to enable A20
     
-    call wait_8042_data
-    in al, 0x60
-    push ax
+    ; Small delay to let A20 stabilize
+    mov cx, 1000
+.delay:
+    nop
+    loop .delay
     
-    call wait_8042
-    mov al, 0xD1            ; Write output port
-    out 0x64, al
-    
-    call wait_8042
-    pop ax
-    or al, 2                ; Enable A20
-    out 0x60, al
-    
-    call wait_8042
-    mov al, 0xAE            ; Enable first PS/2 port
-    out 0x64, al
-    
-    call wait_8042
+.a20_enabled:
     ret
 
-wait_8042:
-    in al, 0x64
-    test al, 2
-    jnz wait_8042
-    ret
-
-wait_8042_data:
-    in al, 0x64
-    test al, 1
-    jz wait_8042_data
+check_a20:
+    ; Simple A20 test - check if we can access high memory
+    push ds
+    push es
+    push si
+    push di
+    
+    ; Point to low memory
+    xor ax, ax
+    mov ds, ax
+    mov si, 0x7DFE
+    
+    ; Point to high memory (will wrap if A20 disabled)
+    mov ax, 0xFFFF
+    mov es, ax
+    mov di, 0x7E0E
+    
+    ; Save original values
+    mov al, [ds:si]
+    mov ah, [es:di]
+    
+    ; Test with different values
+    mov byte [ds:si], 0x55
+    mov byte [es:di], 0xAA
+    
+    ; Check if they're different (A20 enabled)
+    mov bl, [ds:si]
+    mov bh, [es:di]
+    
+    ; Restore original values
+    mov [ds:si], al
+    mov [es:di], ah
+    
+    ; Return result
+    cmp bl, bh
+    je .a20_disabled
+    mov ax, 1               ; A20 enabled
+    jmp .done
+.a20_disabled:
+    mov ax, 0               ; A20 disabled
+.done:
+    pop di
+    pop si
+    pop es
+    pop ds
     ret
 
 print_string:
