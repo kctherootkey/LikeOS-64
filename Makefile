@@ -34,6 +34,7 @@ INTERRUPT_C_OBJ = $(BUILD_DIR)/interrupt_c.o
 GDT_ASM_OBJ = $(BUILD_DIR)/gdt.o
 GDT_C_OBJ = $(BUILD_DIR)/gdt_c.o
 KEYBOARD_OBJ = $(BUILD_DIR)/keyboard.o
+MEMORY_OBJ = $(BUILD_DIR)/memory.o
 KERNEL_BIN = $(BUILD_DIR)/kernel.bin
 OS_IMAGE = $(BUILD_DIR)/LikeOS.img
 ISO_IMAGE = $(BUILD_DIR)/LikeOS.iso
@@ -55,7 +56,7 @@ $(ENTRY_ASM_OBJ): $(BOOT_DIR)/entry64.asm | $(BUILD_DIR)
 	$(NASM) -f elf64 $(BOOT_DIR)/entry64.asm -o $(ENTRY_ASM_OBJ)
 
 # Compile kernel executive initialization
-$(INIT_OBJ): $(KERNEL_DIR)/ke/init.c $(INCLUDE_DIR)/kernel/console.h $(INCLUDE_DIR)/kernel/interrupt.h $(INCLUDE_DIR)/kernel/keyboard.h | $(BUILD_DIR)
+$(INIT_OBJ): $(KERNEL_DIR)/ke/init.c $(INCLUDE_DIR)/kernel/console.h $(INCLUDE_DIR)/kernel/interrupt.h $(INCLUDE_DIR)/kernel/keyboard.h $(INCLUDE_DIR)/kernel/memory.h | $(BUILD_DIR)
 	$(GCC) $(CFLAGS) -c $(KERNEL_DIR)/ke/init.c -o $(INIT_OBJ)
 
 # Compile HAL console
@@ -74,6 +75,10 @@ $(INTERRUPT_C_OBJ): $(KERNEL_DIR)/ke/interrupt.c $(INCLUDE_DIR)/kernel/interrupt
 $(KEYBOARD_OBJ): $(KERNEL_DIR)/io/keyboard.c $(INCLUDE_DIR)/kernel/keyboard.h $(INCLUDE_DIR)/kernel/interrupt.h $(INCLUDE_DIR)/kernel/console.h | $(BUILD_DIR)
 	$(GCC) $(CFLAGS) -c $(KERNEL_DIR)/io/keyboard.c -o $(KEYBOARD_OBJ)
 
+# Compile memory management
+$(MEMORY_OBJ): $(KERNEL_DIR)/mm/memory.c $(INCLUDE_DIR)/kernel/memory.h | $(BUILD_DIR)
+	$(GCC) $(CFLAGS) -c $(KERNEL_DIR)/mm/memory.c -o $(MEMORY_OBJ)
+
 # Assemble GDT
 $(GDT_ASM_OBJ): $(KERNEL_DIR)/ke/gdt.asm | $(BUILD_DIR)
 	$(NASM) -f elf64 $(KERNEL_DIR)/ke/gdt.asm -o $(GDT_ASM_OBJ)
@@ -83,8 +88,8 @@ $(GDT_C_OBJ): $(KERNEL_DIR)/ke/gdt.c $(INCLUDE_DIR)/kernel/interrupt.h $(INCLUDE
 	$(GCC) $(CFLAGS) -c $(KERNEL_DIR)/ke/gdt.c -o $(GDT_C_OBJ)
 
 # Link kernel
-$(KERNEL_BIN): $(ENTRY_ASM_OBJ) $(INIT_OBJ) $(CONSOLE_OBJ) $(INTERRUPT_ASM_OBJ) $(INTERRUPT_C_OBJ) $(GDT_ASM_OBJ) $(GDT_C_OBJ) $(KEYBOARD_OBJ) linker.ld
-	$(LD) $(LDFLAGS) $(ENTRY_ASM_OBJ) $(INIT_OBJ) $(CONSOLE_OBJ) $(INTERRUPT_ASM_OBJ) $(INTERRUPT_C_OBJ) $(GDT_ASM_OBJ) $(GDT_C_OBJ) $(KEYBOARD_OBJ) -o $(KERNEL_BIN).elf
+$(KERNEL_BIN): $(ENTRY_ASM_OBJ) $(INIT_OBJ) $(CONSOLE_OBJ) $(INTERRUPT_ASM_OBJ) $(INTERRUPT_C_OBJ) $(GDT_ASM_OBJ) $(GDT_C_OBJ) $(KEYBOARD_OBJ) $(MEMORY_OBJ) linker.ld
+	$(LD) $(LDFLAGS) $(ENTRY_ASM_OBJ) $(INIT_OBJ) $(CONSOLE_OBJ) $(INTERRUPT_ASM_OBJ) $(INTERRUPT_C_OBJ) $(GDT_ASM_OBJ) $(GDT_C_OBJ) $(KEYBOARD_OBJ) $(MEMORY_OBJ) -o $(KERNEL_BIN).elf
 	objcopy -O binary $(KERNEL_BIN).elf $(KERNEL_BIN)
 
 # Create OS image

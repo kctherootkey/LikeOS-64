@@ -212,20 +212,114 @@ void idt_init() {
     kprintf("IDT initialized\n");
 }
 
+// Exception names for better debugging
+static const char* exception_messages[] = {
+    "Division by Zero",                    // 0
+    "Debug",                              // 1
+    "Non-Maskable Interrupt",             // 2
+    "Breakpoint",                         // 3
+    "Overflow",                           // 4
+    "Bound Range Exceeded",               // 5
+    "Invalid Opcode",                     // 6
+    "Device Not Available",               // 7
+    "Double Fault",                       // 8
+    "Coprocessor Segment Overrun",        // 9
+    "Invalid TSS",                        // 10
+    "Segment Not Present",                // 11
+    "Stack-Segment Fault",                // 12
+    "General Protection Fault",           // 13
+    "Page Fault",                         // 14
+    "Reserved",                           // 15
+    "x87 Floating-Point Exception",       // 16
+    "Alignment Check",                    // 17
+    "Machine Check",                      // 18
+    "SIMD Floating-Point Exception",      // 19
+    "Virtualization Exception",           // 20
+    "Control Protection Exception",       // 21
+    "Reserved", "Reserved", "Reserved",   // 22-24
+    "Reserved", "Reserved", "Reserved",   // 25-27
+    "Hypervisor Injection Exception",     // 28
+    "VMM Communication Exception",        // 29
+    "Security Exception",                 // 30
+    "Reserved"                            // 31
+};
+
 // Exception handler - called from assembly with register structure pointer
 void exception_handler(uint64_t *regs) {
     uint64_t int_no = regs[15];  // Interrupt number at offset 15*8 = 120
     uint64_t err_code = regs[16]; // Error code at offset 16*8 = 128
+    uint64_t rip = regs[17];     // RIP from interrupt frame
     
-    kprintf("Exception %d occurred!\n", int_no);
+    // Print compact exception information in one screen
+    console_set_color(VGA_COLOR_RED, VGA_COLOR_BLACK);
+    kprintf("=== EXCEPTION: %s (INT %d) ===\n", 
+           (int_no < 32) ? exception_messages[int_no] : "Unknown", int_no);
     
-    // If this was an error-code exception, print the error code
-    if (int_no == 8 || (int_no >= 10 && int_no <= 14) || int_no == 17) {
-        kprintf("Error code: %d\n", err_code);
+    // Critical registers and RIP
+    kprintf("RIP: 0x%016llx  RSP: 0x%016llx  RBP: 0x%016llx\n", 
+           rip, regs[20], regs[6]);
+    kprintf("RAX: 0x%016llx  RBX: 0x%016llx  RCX: 0x%016llx\n", 
+           regs[0], regs[3], regs[1]);
+    kprintf("RDX: 0x%016llx  RSI: 0x%016llx  RDI: 0x%016llx\n", 
+           regs[2], regs[4], regs[5]);
+    
+    // Error code and special handling
+    if (int_no == 8 || (int_no >= 10 && int_no <= 14) || int_no == 17 || int_no == 21 || int_no == 29 || int_no == 30) {
+        kprintf("Error Code: 0x%016llx ", err_code);
+        
+        if (int_no == 14) { // Page fault
+            uint64_t cr2;
+            __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+            kprintf("PF Addr: 0x%016llx\n", cr2);
+            kprintf("PF Flags: %s%s%s%s\n", 
+                   (err_code & 1) ? "Present " : "NotPresent ",
+                   (err_code & 2) ? "Write " : "Read ",
+                   (err_code & 4) ? "User " : "Kernel ",
+                   (err_code & 16) ? "InstrFetch" : "DataAccess");
+        } else if (int_no == 13) { // GPF
+            kprintf("GPF Selector: 0x%04llx\n", (err_code >> 3) & 0x1FFF);
+        } else {
+            kprintf("\n");
+        }
     }
     
-    // Halt the system for serious exceptions
-    for (;;);
+    // Control registers
+    uint64_t cr0, cr2, cr3;
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    kprintf("CR0: 0x%016llx  CR2: 0x%016llx  CR3: 0x%016llx\n", cr0, cr2, cr3);
+    
+    // RFLAGS and segment registers
+    kprintf("RFLAGS: 0x%016llx  CS: 0x%04llx  SS: 0x%04llx\n", 
+           regs[19], regs[18], regs[21]);
+    
+    // Code around RIP (compact format)
+    kprintf("Code: ");
+    for (int i = -4; i <= 4; i++) {
+        uint8_t *code_ptr = (uint8_t*)(rip + i);
+        if (i == 0) {
+            kprintf("[%02x] ", *code_ptr);
+        } else {
+            kprintf("%02x ", *code_ptr);
+        }
+    }
+    kprintf("\n");
+    
+    // Stack dump (compact format)
+    kprintf("Stack: ");
+    uint64_t *stack_ptr = (uint64_t*)regs[20];
+    for (int i = 0; i < 4; i++) {
+        kprintf("%016llx ", stack_ptr[i]);
+    }
+    
+    console_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    kprintf("\nSystem halted.\n");
+    
+    // Halt the system
+    for (;;) {
+        __asm__ volatile ("hlt");
+    }
 }
 
 // IRQ handler - called from assembly with register structure pointer

@@ -4,6 +4,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/keyboard.h"
+#include "../../include/kernel/memory.h"
 
 // Function prototypes
 void KiSystemStartup(void);
@@ -28,6 +29,27 @@ void KiSystemStartup(void) {
     // Initialize interrupt system
     kprintf("\nInitializing interrupt system...\n");
     interrupts_init();
+        
+    // Initialize memory management subsystem
+    kprintf("\nInitializing Memory Management Subsystem...\n");
+    MmDetectMemory();
+
+    MmInitializePhysicalMemory(256 * 1024 * 1024); // 256MB minimum requirement
+
+    MmInitializeVirtualMemory();
+    MmInitializeHeap();
+    
+    // Print initial memory statistics
+    MmPrintMemoryStats();
+
+    // Test memory allocation
+    kprintf("Testing memory allocation...\n");
+    void* test_ptr1 = kalloc(1024);
+    void* test_ptr2 = kalloc(2048);
+    kprintf("  Allocated test blocks: 0x%p (1KB), 0x%p (2KB)\n", test_ptr1, test_ptr2);
+    kfree(test_ptr1);
+    kfree(test_ptr2);
+    kprintf("  Test blocks freed successfully\n");
     
     // Initialize keyboard
     keyboard_init();

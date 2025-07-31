@@ -21,7 +21,7 @@ start:
     ; Load kernel from disk - VMware and QEMU compatibility
     mov dl, 0x00            ; Try floppy first (VMware)
     mov ah, 0x02
-    mov al, 32
+    mov al, 64              ; Load 64 sectors (32KB) to accommodate larger kernel
     mov ch, 0
     mov cl, 2
     mov dh, 0
@@ -34,7 +34,7 @@ start:
     ; Floppy failed, try hard disk (QEMU)
     mov dl, 0x80
     mov ah, 0x02
-    mov al, 32
+    mov al, 64              ; Load 64 sectors (32KB) to accommodate larger kernel
     mov ch, 0
     mov cl, 2
     mov dh, 0
@@ -178,8 +178,13 @@ protected_mode:
     ; Setup page directory pointer (PDPT)
     mov dword [0x71000], 0x72003    ; Point to PD
 
-    ; Setup page directory (PD) - identity map first 2MB
-    mov dword [0x72000], 0x000083   ; 2MB page, present, writable, executable
+    ; Setup page directory (PD) - identity map first 12MB
+    mov dword [0x72000], 0x000083   ; 0-2MB
+    mov dword [0x72008], 0x200083   ; 2-4MB
+    mov dword [0x72010], 0x400083   ; 4-6MB
+    mov dword [0x72018], 0x600083   ; 6-8MB
+    mov dword [0x72020], 0x800083   ; 8-10MB
+    mov dword [0x72028], 0xa00083   ; 10-12MB
 
     ; Enable PAE
     mov eax, cr4
@@ -218,7 +223,7 @@ long_mode:
     ; Copy kernel to final location (1MB mark)
     mov rsi, 0x10000        ; Source: where we loaded kernel
     mov rdi, 0x100000       ; Destination: 1MB mark
-    mov rcx, 0x4000         ; Copy 16KB
+    mov rcx, 0x8000         ; Copy 32KB (increased from 16KB)
     rep movsb
     
     ; If we reach here, kernel is properly loaded at 0x100000
