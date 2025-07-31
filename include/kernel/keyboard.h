@@ -1,10 +1,10 @@
-// LikeOS-64 Keyboard Driver
-// PS/2 keyboard input handling
+// LikeOS-64 I/O Subsystem - Keyboard Driver Interface
+// PS/2 keyboard device management and input processing
 
-#ifndef KEYBOARD_H
-#define KEYBOARD_H
+#ifndef _KERNEL_KEYBOARD_H_
+#define _KERNEL_KEYBOARD_H_
 
-#include "kprintf.h"
+#include "console.h"
 
 // Keyboard ports
 #define KEYBOARD_DATA_PORT 0x60
@@ -62,4 +62,4 @@ uint8_t keyboard_buffer_has_data(void);
 char keyboard_get_char(void);
 void keyboard_wait_for_key(void);
 
-#endif // KEYBOARD_H
+#endif // _KERNEL_KEYBOARD_H_

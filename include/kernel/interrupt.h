@@ -1,10 +1,10 @@
-// LikeOS-64 Interrupt System
-// 64-bit IDT and IRQ management
+// LikeOS-64 Kernel Executive - Interrupt Management
+// IDT, IRQ, and exception handling for 64-bit kernel
 
-#ifndef INTERRUPTS_H
-#define INTERRUPTS_H
+#ifndef _KERNEL_INTERRUPT_H_
+#define _KERNEL_INTERRUPT_H_
 
-#include "kprintf.h"
+#include "console.h"
 
 // I/O port functions
 static inline void outb(uint16_t port, uint8_t val) {
@@ -153,4 +153,4 @@ extern void irq45(void);
 extern void irq46(void);
 extern void irq47(void);
 
-#endif // INTERRUPTS_H
+#endif // _KERNEL_INTERRUPT_H_

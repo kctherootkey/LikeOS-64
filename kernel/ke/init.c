@@ -1,15 +1,15 @@
-// LikeOS-64 Kernel
-// A minimal 64-bit kernel that displays a message using VGA text mode
+// LikeOS-64 Kernel Executive - Initialization
+// Main kernel initialization and executive services
 
-#include "kprintf.h"
-#include "interrupts.h"
-#include "keyboard.h"
+#include "../../include/kernel/console.h"
+#include "../../include/kernel/interrupt.h"
+#include "../../include/kernel/keyboard.h"
 
 // Function prototypes
-void kernel_main(void);
+void KiSystemStartup(void);
 
-// Kernel entry point
-void kernel_main(void) {
+// Kernel Executive entry point
+void KiSystemStartup(void) {
     // Initialize console system
     console_init();
     

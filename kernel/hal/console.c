@@ -1,7 +1,7 @@
-// LikeOS-64 Kernel Printf Implementation
-// Full-featured printf implementation for 64-bit kernel
+// LikeOS-64 Hardware Abstraction Layer - Console
+// VGA text mode console and printf implementation for 64-bit kernel
 
-#include "kprintf.h"
+#include "../../include/kernel/console.h"
 
 #define SIZE_MAX ((size_t)-1)
 #define NULL ((void*)0)

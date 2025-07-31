@@ -1,7 +1,7 @@
-// LikeOS-64 Interrupt System Implementation
-// 64-bit IDT and IRQ management
+// LikeOS-64 Kernel Executive - Interrupt Management
+// 64-bit IDT and IRQ management system
 
-#include "interrupts.h"
+#include "../../include/kernel/interrupt.h"
 
 // IDT table
 static struct idt_entry idt[IDT_ENTRIES];

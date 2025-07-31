@@ -1,5 +1,5 @@
 # LikeOS-64 Makefile
-# Professional kernel build system with modular directory structure
+# Builds a minimal 64-bit operating system
 
 # Tools
 NASM = nasm
@@ -12,25 +12,22 @@ MKISOFS = mkisofs
 
 # Directories
 BUILD_DIR = build
-BOOT_DIR = boot
-KERNEL_DIR = kernel
-INCLUDE_DIR = include
+SRC_DIR = .
 
 # Compiler flags
 CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin -fno-stack-protector \
-         -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -fno-pic -Wall -Wextra \
-         -I$(INCLUDE_DIR)
+         -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -fno-pic -Wall -Wextra
 
 # Linker flags
 LDFLAGS = -T linker.ld -nostdlib
 
 # Target files
-BOOTLOADER = $(BUILD_DIR)/bootloader.bin
-ENTRY_ASM_OBJ = $(BUILD_DIR)/entry64.o
-INIT_OBJ = $(BUILD_DIR)/init.o
-CONSOLE_OBJ = $(BUILD_DIR)/console.o
-INTERRUPT_ASM_OBJ = $(BUILD_DIR)/interrupt.o
-INTERRUPT_C_OBJ = $(BUILD_DIR)/interrupt_c.o
+BOOTLOADER = $(BUILD_DIR)/boot.bin
+KERNEL_ASM_OBJ = $(BUILD_DIR)/boot64.o
+KERNEL_C_OBJ = $(BUILD_DIR)/kernel.o
+KPRINTF_OBJ = $(BUILD_DIR)/kprintf.o
+INTERRUPTS_ASM_OBJ = $(BUILD_DIR)/interrupts.o
+INTERRUPTS_C_OBJ = $(BUILD_DIR)/interrupts_c.o
 GDT_ASM_OBJ = $(BUILD_DIR)/gdt.o
 GDT_C_OBJ = $(BUILD_DIR)/gdt_c.o
 KEYBOARD_OBJ = $(BUILD_DIR)/keyboard.o
@@ -47,44 +44,44 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 # Compile bootloader
-$(BOOTLOADER): $(BOOT_DIR)/bootloader.asm | $(BUILD_DIR)
-	$(NASM) -f bin $(BOOT_DIR)/bootloader.asm -o $(BOOTLOADER)
+$(BOOTLOADER): boot.asm | $(BUILD_DIR)
+	$(NASM) -f bin boot.asm -o $(BOOTLOADER)
 
-# Compile 64-bit kernel entry point
-$(ENTRY_ASM_OBJ): $(BOOT_DIR)/entry64.asm | $(BUILD_DIR)
-	$(NASM) -f elf64 $(BOOT_DIR)/entry64.asm -o $(ENTRY_ASM_OBJ)
+# Compile kernel assembly entry point
+$(KERNEL_ASM_OBJ): boot64.asm | $(BUILD_DIR)
+	$(NASM) -f elf64 boot64.asm -o $(KERNEL_ASM_OBJ)
 
-# Compile kernel executive initialization
-$(INIT_OBJ): $(KERNEL_DIR)/ke/init.c $(INCLUDE_DIR)/kernel/console.h $(INCLUDE_DIR)/kernel/interrupt.h $(INCLUDE_DIR)/kernel/keyboard.h | $(BUILD_DIR)
-	$(GCC) $(CFLAGS) -c $(KERNEL_DIR)/ke/init.c -o $(INIT_OBJ)
+# Compile kernel C code
+$(KERNEL_C_OBJ): kernel.c kprintf.h | $(BUILD_DIR)
+	$(GCC) $(CFLAGS) -c kernel.c -o $(KERNEL_C_OBJ)
 
-# Compile HAL console
-$(CONSOLE_OBJ): $(KERNEL_DIR)/hal/console.c $(INCLUDE_DIR)/kernel/console.h | $(BUILD_DIR)
-	$(GCC) $(CFLAGS) -c $(KERNEL_DIR)/hal/console.c -o $(CONSOLE_OBJ)
+# Compile kprintf module
+$(KPRINTF_OBJ): kprintf.c kprintf.h | $(BUILD_DIR)
+	$(GCC) $(CFLAGS) -c kprintf.c -o $(KPRINTF_OBJ)
 
 # Assemble interrupt handlers
-$(INTERRUPT_ASM_OBJ): $(KERNEL_DIR)/ke/interrupt.asm | $(BUILD_DIR)
-	$(NASM) -f elf64 $(KERNEL_DIR)/ke/interrupt.asm -o $(INTERRUPT_ASM_OBJ)
+$(INTERRUPTS_ASM_OBJ): interrupts.asm | $(BUILD_DIR)
+	$(NASM) -f elf64 interrupts.asm -o $(INTERRUPTS_ASM_OBJ)
 
 # Compile interrupt system
-$(INTERRUPT_C_OBJ): $(KERNEL_DIR)/ke/interrupt.c $(INCLUDE_DIR)/kernel/interrupt.h $(INCLUDE_DIR)/kernel/console.h | $(BUILD_DIR)
-	$(GCC) $(CFLAGS) -c $(KERNEL_DIR)/ke/interrupt.c -o $(INTERRUPT_C_OBJ)
+$(INTERRUPTS_C_OBJ): interrupts.c interrupts.h kprintf.h | $(BUILD_DIR)
+	$(GCC) $(CFLAGS) -c interrupts.c -o $(INTERRUPTS_C_OBJ)
 
-# Compile I/O keyboard driver
-$(KEYBOARD_OBJ): $(KERNEL_DIR)/io/keyboard.c $(INCLUDE_DIR)/kernel/keyboard.h $(INCLUDE_DIR)/kernel/interrupt.h $(INCLUDE_DIR)/kernel/console.h | $(BUILD_DIR)
-	$(GCC) $(CFLAGS) -c $(KERNEL_DIR)/io/keyboard.c -o $(KEYBOARD_OBJ)
+# Compile keyboard driver
+$(KEYBOARD_OBJ): keyboard.c keyboard.h interrupts.h kprintf.h | $(BUILD_DIR)
+	$(GCC) $(CFLAGS) -c keyboard.c -o $(KEYBOARD_OBJ)
 
 # Assemble GDT
-$(GDT_ASM_OBJ): $(KERNEL_DIR)/ke/gdt.asm | $(BUILD_DIR)
-	$(NASM) -f elf64 $(KERNEL_DIR)/ke/gdt.asm -o $(GDT_ASM_OBJ)
+$(GDT_ASM_OBJ): gdt.asm | $(BUILD_DIR)
+	$(NASM) -f elf64 gdt.asm -o $(GDT_ASM_OBJ)
 
 # Compile GDT
-$(GDT_C_OBJ): $(KERNEL_DIR)/ke/gdt.c $(INCLUDE_DIR)/kernel/interrupt.h $(INCLUDE_DIR)/kernel/console.h | $(BUILD_DIR)
-	$(GCC) $(CFLAGS) -c $(KERNEL_DIR)/ke/gdt.c -o $(GDT_C_OBJ)
+$(GDT_C_OBJ): gdt.c interrupts.h kprintf.h | $(BUILD_DIR)
+	$(GCC) $(CFLAGS) -c gdt.c -o $(GDT_C_OBJ)
 
 # Link kernel
-$(KERNEL_BIN): $(ENTRY_ASM_OBJ) $(INIT_OBJ) $(CONSOLE_OBJ) $(INTERRUPT_ASM_OBJ) $(INTERRUPT_C_OBJ) $(GDT_ASM_OBJ) $(GDT_C_OBJ) $(KEYBOARD_OBJ) linker.ld
-	$(LD) $(LDFLAGS) $(ENTRY_ASM_OBJ) $(INIT_OBJ) $(CONSOLE_OBJ) $(INTERRUPT_ASM_OBJ) $(INTERRUPT_C_OBJ) $(GDT_ASM_OBJ) $(GDT_C_OBJ) $(KEYBOARD_OBJ) -o $(KERNEL_BIN).elf
+$(KERNEL_BIN): $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KPRINTF_OBJ) $(INTERRUPTS_ASM_OBJ) $(INTERRUPTS_C_OBJ) $(GDT_ASM_OBJ) $(GDT_C_OBJ) $(KEYBOARD_OBJ) linker.ld
+	$(LD) $(LDFLAGS) $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KPRINTF_OBJ) $(INTERRUPTS_ASM_OBJ) $(INTERRUPTS_C_OBJ) $(GDT_ASM_OBJ) $(GDT_C_OBJ) $(KEYBOARD_OBJ) -o $(KERNEL_BIN).elf
 	objcopy -O binary $(KERNEL_BIN).elf $(KERNEL_BIN)
 
 # Create OS image
@@ -157,31 +154,33 @@ run-iso: $(ISO_IMAGE)
 run-usb: $(USB_IMAGE)
 	$(QEMU) -drive format=raw,file=$(USB_IMAGE) -m 128M
 
-# Clean build artifacts
+# Clean build files
 clean:
 	rm -rf $(BUILD_DIR)
+
+# Force rebuild
+rebuild: clean all
+
+# Install dependencies (for Ubuntu/Debian)
+install-deps:
+	sudo apt update
+	sudo apt install -y nasm gcc qemu-system-x86 build-essential genisoimage
 
 # Show help
 help:
 	@echo "LikeOS-64 Build System"
-	@echo "====================="
+	@echo "======================"
 	@echo "Targets:"
-	@echo "  all       - Build floppy disk image (default)"
-	@echo "  run       - Build and run in QEMU"
-	@echo "  debug     - Build and run in QEMU with GDB debugging"
-	@echo "  iso       - Create bootable ISO image"
-	@echo "  run-iso   - Build and run ISO in QEMU"
-	@echo "  usb       - Create bootable USB image"
-	@echo "  run-usb   - Build and run USB image in QEMU"
-	@echo "  clean     - Remove all build artifacts"
-	@echo "  help      - Show this help message"
-	@echo ""
-	@echo "Directory Structure:"
-	@echo "  boot/          - Bootloader and initial entry point"
-	@echo "  kernel/ke/     - Kernel Executive (core kernel)"
-	@echo "  kernel/hal/    - Hardware Abstraction Layer"
-	@echo "  kernel/io/     - I/O subsystem"
-	@echo "  kernel/mm/     - Memory Management (future)"
-	@echo "  include/kernel/ - Kernel headers"
+	@echo "  all          - Build the complete OS image"
+	@echo "  iso          - Create bootable ISO image"
+	@echo "  usb          - Create bootable USB image"
+	@echo "  run          - Build and run in QEMU"
+	@echo "  run-iso      - Build and run ISO in QEMU"
+	@echo "  run-usb      - Build and run USB image in QEMU"
+	@echo "  debug        - Build and run in QEMU with GDB debugging"
+	@echo "  clean        - Remove build files"
+	@echo "  rebuild      - Clean and build"
+	@echo "  install-deps - Install required dependencies (Ubuntu/Debian)"
+	@echo "  help         - Show this help message"
 
-.PHONY: all run debug iso run-iso usb run-usb clean help
+.PHONY: all iso usb run run-iso run-usb debug clean rebuild install-deps help

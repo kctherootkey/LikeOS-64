@@ -1,11 +1,11 @@
-; 64-bit kernel entry point
-; This assembly file provides the entry point for our C kernel
+; LikeOS-64 Boot - 64-bit Kernel Entry Point
+; Provides the entry point and initial setup for the kernel executive
 
 [BITS 64]
 
 section .text
 global _start
-extern kernel_main
+extern KiSystemStartup
 
 _start:
     ; Setup segment registers for 64-bit mode (redundant but safe)
@@ -23,10 +23,10 @@ _start:
     ; Clear direction flag
     cld
 
-    ; Call our C kernel main function
-    call kernel_main
+    ; Call kernel executive startup
+    call KiSystemStartup
     
-    ; If kernel_main returns (it shouldn't), halt
+    ; If KiSystemStartup returns (it shouldn't), halt
 hang:
     hlt
     jmp hang

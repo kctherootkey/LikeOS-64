@@ -1,8 +1,8 @@
-// LikeOS-64 Keyboard Driver Implementation
-// PS/2 keyboard input handling
+// LikeOS-64 I/O Subsystem - Keyboard Driver
+// PS/2 keyboard input handling and device management
 
-#include "keyboard.h"
-#include "interrupts.h"
+#include "../../include/kernel/keyboard.h"
+#include "../../include/kernel/interrupt.h"
 
 // Global keyboard state
 static keyboard_state_t kb_state = {0};

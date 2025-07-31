@@ -1,8 +1,8 @@
-// LikeOS-64 Kernel Printf Header
-// Full-featured printf implementation for 64-bit kernel
+// LikeOS-64 Hardware Abstraction Layer - Console Interface
+// VGA text mode console and printf services for kernel subsystems
 
-#ifndef KPRINTF_H
-#define KPRINTF_H
+#ifndef _KERNEL_CONSOLE_H_
+#define _KERNEL_CONSOLE_H_
 
 // Standard types for 64-bit kernel
 typedef unsigned long long uint64_t;
@@ -60,4 +60,4 @@ int kmemcmp(const void* s1, const void* s2, size_t n);
 #define VGA_COLOR_LIGHT_BROWN   14
 #define VGA_COLOR_WHITE         15
 
-#endif // KPRINTF_H
+#endif // _KERNEL_CONSOLE_H_
