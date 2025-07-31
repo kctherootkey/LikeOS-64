@@ -72,7 +72,6 @@ char scan_code_to_ascii(uint8_t scan_code, uint8_t shift) {
     if (shift) {
         return scan_code_to_ascii_shifted[scan_code];
     } else {
-        kprintf("shifted[0x1e]=%d, normal[0x1e]=%d\n", (int)scan_code_to_ascii_shifted[0x1e], (int)scan_code_to_ascii_table[0x1e]);
         return scan_code_to_ascii_table[scan_code];
     }
 }

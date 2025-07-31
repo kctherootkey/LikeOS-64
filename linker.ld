@@ -14,19 +14,19 @@ SECTIONS
         *(.text)
     }
     
-    /* Read-only data */
-    .rodata : ALIGN(4096)
+    /* Read-only data - immediately after text, no gap */
+    .rodata : ALIGN(4)
     {
         *(.rodata)
     }
     
-    /* Data section */
-    .data : ALIGN(4096)
+    /* Data section - immediately after rodata, no gap */
+    .data : ALIGN(4)
     {
         *(.data)
     }
     
-    /* BSS section (uninitialized data) */
+    /* BSS section (uninitialized data) - after everything else */
     .bss : ALIGN(4096)
     {
         *(COMMON)

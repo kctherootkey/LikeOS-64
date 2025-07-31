@@ -44,7 +44,7 @@ void kernel_main(void) {
     kprintf("\nSystem ready! Type to test keyboard input:\n");
     kprintf("> ");
     console_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-    
+
     // Main input loop
     char c;
     while (1) {
