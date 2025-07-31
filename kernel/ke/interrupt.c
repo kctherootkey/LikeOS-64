@@ -248,8 +248,6 @@ void irq_handler(uint64_t *regs) {
 
 // Initialize interrupt system
 void interrupts_init() {
-    kprintf("Initializing interrupt system...\n");
-    
     // Initialize GDT first
     extern void gdt_init();
     gdt_init();
