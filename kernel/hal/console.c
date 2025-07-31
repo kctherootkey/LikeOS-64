@@ -6,6 +6,17 @@
 #define SIZE_MAX ((size_t)-1)
 #define NULL ((void*)0)
 
+// I/O port functions for VGA cursor control
+static inline void outb(uint16_t port, uint8_t val) {
+    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint8_t inb(uint16_t port) {
+    uint8_t ret;
+    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
 // VGA text mode buffer
 #define VGA_BUFFER ((volatile uint16_t*)0xB8000)
 #define VGA_WIDTH 80
@@ -35,12 +46,44 @@ static struct {
     uint8_t color;
 } console = {0, 0, 0x0F}; // White on black
 
+// Update hardware cursor position
+static void console_update_cursor(void) {
+    uint16_t pos = console.cursor_y * VGA_WIDTH + console.cursor_x;
+    
+    // Cursor low byte to VGA register
+    outb(0x3D4, 0x0F);
+    outb(0x3D5, (uint8_t)(pos & 0xFF));
+    
+    // Cursor high byte to VGA register  
+    outb(0x3D4, 0x0E);
+    outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
+}
+
+// Enable hardware cursor
+static void console_enable_cursor(uint8_t cursor_start, uint8_t cursor_end) {
+    outb(0x3D4, 0x0A);
+    outb(0x3D5, (inb(0x3D5) & 0xC0) | cursor_start);
+    
+    outb(0x3D4, 0x0B);
+    outb(0x3D5, (inb(0x3D5) & 0xE0) | cursor_end);
+}
+
+// Disable hardware cursor
+static void console_disable_cursor(void) {
+    outb(0x3D4, 0x0A);
+    outb(0x3D5, 0x20);
+}
+
 // Initialize console
 void console_init(void) {
     console.cursor_x = 0;
     console.cursor_y = 0;
     console.color = 0x0F; // White on black
     console_clear();
+    
+    // Enable hardware cursor (underline style: start=14, end=15)
+    console_enable_cursor(14, 15);
+    console_update_cursor();
 }
 
 // Clear screen
@@ -51,6 +94,7 @@ void console_clear(void) {
     }
     console.cursor_x = 0;
     console.cursor_y = 0;
+    console_update_cursor();
 }
 
 // Set console colors
@@ -73,6 +117,7 @@ void console_scroll(void) {
     }
     
     console.cursor_y = VGA_HEIGHT - 1;
+    console_update_cursor();
 }
 
 // Put character to console
@@ -104,6 +149,9 @@ void console_putchar(char c) {
     if (console.cursor_y >= VGA_HEIGHT) {
         console_scroll();
     }
+    
+    // Update hardware cursor position
+    console_update_cursor();
 }
 
 // Put string to console
