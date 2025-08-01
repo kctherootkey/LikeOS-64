@@ -80,23 +80,34 @@ $(MINIMAL_BOOTLOADER): minimal_bootloader.c | $(BUILD_DIR)
 
 # Create UEFI bootable ISO
 $(MINIMAL_ISO): $(MINIMAL_BOOTLOADER) $(MINIMAL_KERNEL) | $(BUILD_DIR)
-	@echo "Creating UEFI bootable ISO..."
+	@echo "Creating UEFI bootable ISO with FAT filesystem..."
 	
-	# Create EFI directory structure
-	mkdir -p $(ISO_DIR)/EFI/BOOT
+	# Create temporary directory structure with FAT filesystem  
+	mkdir -p $(BUILD_DIR)/iso_temp
 	
-	# Copy bootloader as BOOTX64.EFI (standard UEFI name)
-	cp $(MINIMAL_BOOTLOADER) $(ISO_DIR)/EFI/BOOT/BOOTX64.EFI
+	# Create a small FAT image for EFI boot (16MB is sufficient)
+	$(DD) if=/dev/zero of=$(BUILD_DIR)/iso_temp/efiboot.img bs=1M count=16
+	$(MKFS_FAT) -F16 -n "EFIBOOT" $(BUILD_DIR)/iso_temp/efiboot.img
 	
-	# Copy kernel to root (now as ELF file)
-	cp $(MINIMAL_KERNEL) $(ISO_DIR)/minimal_kernel.elf
+	# Copy files to the EFI boot image
+	MTOOLS_SKIP_CHECK=1 mmd -i $(BUILD_DIR)/iso_temp/efiboot.img ::/EFI
+	MTOOLS_SKIP_CHECK=1 mmd -i $(BUILD_DIR)/iso_temp/efiboot.img ::/EFI/BOOT
+	MTOOLS_SKIP_CHECK=1 $(MTOOLS) -i $(BUILD_DIR)/iso_temp/efiboot.img $(MINIMAL_BOOTLOADER) ::/EFI/BOOT/BOOTX64.EFI
+	MTOOLS_SKIP_CHECK=1 $(MTOOLS) -i $(BUILD_DIR)/iso_temp/efiboot.img $(MINIMAL_KERNEL) ::/minimal_kernel.elf
 	
-	# Create bootable ISO with xorriso
+	# Also copy kernel to ISO root for easy access
+	cp $(MINIMAL_KERNEL) $(BUILD_DIR)/iso_temp/minimal_kernel.elf
+	
+	# Create hybrid UEFI/BIOS bootable ISO
 	$(XORRISO) -as mkisofs \
-		-R -f -e EFI/BOOT/BOOTX64.EFI -no-emul-boot \
-		-o $(MINIMAL_ISO) $(ISO_DIR)/
+		-R -J -joliet-long -l \
+		-iso-level 3 \
+		-eltorito-alt-boot \
+		-e efiboot.img \
+		-no-emul-boot \
+		-o $(MINIMAL_ISO) $(BUILD_DIR)/iso_temp/
 	
-	@echo "UEFI ISO created: $(MINIMAL_ISO)"
+	@echo "UEFI ISO with FAT filesystem created: $(MINIMAL_ISO)"
 	@echo ""
 	@echo "To test: make -f Makefile_minimal test"
 
@@ -202,6 +213,13 @@ usb: $(USB_IMAGE)
 clean:
 	rm -rf $(BUILD_DIR)
 
+# Convenience targets
+iso: $(MINIMAL_ISO)
+fat: $(MINIMAL_FAT)
+usb: $(USB_IMAGE)
+kernel: $(MINIMAL_KERNEL)
+bootloader: $(MINIMAL_BOOTLOADER)
+
 # Show help
 help:
 	@echo "Minimal UEFI Build System for LikeOS-64"
@@ -209,10 +227,11 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  all        - Build complete minimal system (default)"
-	@echo "  kernel     - Build only minimal kernel"
-	@echo "  bootloader - Build only UEFI bootloader"
+	@echo "  iso        - Build only bootable ISO"
 	@echo "  fat        - Build only FAT image"
 	@echo "  usb        - Build only USB image"
+	@echo "  kernel     - Build only minimal kernel"
+	@echo "  bootloader - Build only UEFI bootloader"
 	@echo "  test       - Test ISO in QEMU with OVMF"
 	@echo "  test-fat   - Test FAT image as USB device"
 	@echo "  test-usb   - Test USB image (with partitioning)"
