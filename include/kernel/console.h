@@ -32,6 +32,7 @@ void console_putchar(char c);
 void console_puts(const char* str);
 void console_set_color(uint8_t fg, uint8_t bg);
 void console_scroll(void);
+void console_backspace(void);
 
 // Printf family functions
 typedef __builtin_va_list va_list;

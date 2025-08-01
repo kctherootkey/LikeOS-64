@@ -86,9 +86,8 @@ void KiSystemStartup(void) {
                 // Handle Enter key
                 kprintf("\n> ");
             } else if (c == '\b') {
-                // Handle Backspace key
-                // Simple backspace implementation
-                kprintf("\b \b");
+                // Handle Backspace key using proper console function
+                console_backspace();
             } else if (c >= ' ' && c <= '~') {
                 // Printable character
                 kprintf("%c", c);

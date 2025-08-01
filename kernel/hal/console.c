@@ -313,6 +313,11 @@ void console_putchar(char c) {
         return;
     }
     
+    if (c == '\b') {
+        console_backspace();
+        return;
+    }
+    
     if (c == '\t') {
         cursor_x = (cursor_x + 8) & ~7; // Tab to next 8-character boundary
         if (cursor_x >= max_cols) {
@@ -355,6 +360,29 @@ void console_puts(const char* str) {
 // Dummy scroll function for compatibility
 void console_scroll(void) {
     console_scroll_up();
+}
+
+// Handle backspace - move cursor back and erase character
+void console_backspace(void) {
+    if (!fb_info) return;
+    
+    // Can't backspace if we're at the beginning of the first line
+    if (cursor_x == 0 && cursor_y == 0) return;
+    
+    // Move cursor back
+    if (cursor_x > 0) {
+        cursor_x--;
+    } else {
+        // Wrap to previous line
+        cursor_y--;
+        cursor_x = max_cols - 1;
+    }
+    
+    // Erase the character at the current cursor position
+    uint32_t pixel_x = cursor_x * CHAR_WIDTH;
+    uint32_t pixel_y = cursor_y * CHAR_HEIGHT;
+    
+    draw_char(' ', pixel_x, pixel_y, fg_color, bg_color);
 }
 
 // String utilities for printf
