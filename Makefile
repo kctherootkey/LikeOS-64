@@ -127,19 +127,14 @@ $(ISO_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) | $(BUILD_DIR)
 	# Also copy kernel to ISO root
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso_temp/kernel.elf
 	
-	# Create the ISO using xorriso
+	# Create hybrid UEFI/BIOS bootable ISO
 	$(XORRISO) -as mkisofs \
-		-rational-rock \
-		-volid "LikeOS-64" \
-		-joliet \
-		-joliet-long \
+		-R -J -joliet-long -l \
+		-iso-level 3 \
 		-eltorito-alt-boot \
 		-e efiboot.img \
 		-no-emul-boot \
-		-boot-load-size 4 \
-		-boot-info-table \
-		-o $(ISO_IMAGE) \
-		$(BUILD_DIR)/iso_temp
+		-o $(ISO_IMAGE) $(BUILD_DIR)/iso_temp/
 	
 	# Clean up temporary files
 	rm -rf $(BUILD_DIR)/iso_temp
