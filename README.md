@@ -1,178 +1,277 @@
 # LikeOS-64
 
-A minimal 64-bit operating system built from scratch, targeting x86_64 architecture with BIOS booting.
+A modern 64-bit operating system built from scratch, targeting x86_64 architecture with **UEFI booting** and **framebuffer graphics**.
 
 ## Overview
 
-LikeOS-64 is a simple operating system that demonstrates:
-- Custom bootloader written in x86 assembly
-- Transition from 16-bit real mode → 32-bit protected mode → 64-bit long mode
-- Basic memory management with paging
-- VGA text mode output
-- Minimal C kernel
+LikeOS-64 is a sophisticated operating system that demonstrates:
+- **UEFI bootloader** written in C using GNU-EFI
+- **ELF64 kernel** with framebuffer-based graphics console
+- **Advanced memory management** with paging and heap allocation
+- **Interrupt handling** with IDT and keyboard support
+- **Professional build system** with ISO, FAT, and USB image creation
 
 ## Features
 
-- **Custom Bootloader**: 512-byte bootloader that sets up GDT, enables paging, and switches to 64-bit mode
-- **64-bit Kernel**: Minimal kernel written in C that displays text using VGA buffer
-- **Memory Management**: Identity mapping of first 2MB using page tables
-- **BIOS Compatible**: Works with legacy BIOS systems (not UEFI)
+### Core System
+- **UEFI Bootloader**: Modern UEFI application that loads ELF64 kernels
+- **Framebuffer Console**: High-resolution graphics console with built-in 8x16 font
+- **64-bit ELF Kernel**: Professional kernel architecture with modular design
+- **Memory Management**: Complete MM subsystem with physical/virtual memory and heap
+- **Interrupt System**: Full IDT setup with keyboard interrupt handling
+
+### Display & I/O
+- **Graphics Console**: Framebuffer-based console supporting various resolutions
+- **VGA Color Compatibility**: 16-color VGA palette support for legacy compatibility
+- **Printf Family**: Complete printf implementation (kprintf, ksprintf, ksnprintf)
+- **Keyboard Input**: PS/2 keyboard support with proper interrupt handling
+- **Scrolling**: True framebuffer scrolling (no screen clearing)
+
+### Build System
+- **Hybrid UEFI/BIOS ISO**: Creates bootable ISOs compatible with modern systems
+- **FAT32 Images**: Direct UEFI boot images for testing and deployment
+- **USB Images**: Ready-to-use USB bootable images
+- **Professional Makefile**: Modular build system with dependency management
 
 ## Building
 
 ### Prerequisites
 
-Make sure you have the following tools installed:
-- `nasm` (Netwide Assembler)
-- `gcc` (GNU Compiler Collection)
-- `qemu-system-x86_64` (for testing)
-- `make`
+Install the required development tools:
 
-On Ubuntu/Debian:
 ```bash
+# Ubuntu/Debian
 sudo apt update
-sudo apt install nasm gcc qemu-system-x86 build-essential
+sudo apt install gcc nasm xorriso mtools dosfstools ovmf gnu-efi-dev
+
+# Or use the automated installer
+make deps
 ```
 
-Or use the provided target:
-```bash
-make install-deps
-```
+Required packages:
+- `gcc` - GNU Compiler Collection
+- `nasm` - Netwide Assembler  
+- `xorriso` - ISO image creation
+- `mtools` - FAT filesystem tools
+- `dosfstools` - FAT formatting utilities
+- `ovmf` - UEFI firmware for QEMU
+- `gnu-efi-dev` - UEFI development libraries
 
 ### Compilation
 
-Build the complete OS:
+Build the complete UEFI operating system:
+
 ```bash
-make
+make all
 ```
 
-This will create:
-- `build/boot.bin` - The bootloader
-- `build/kernel.bin` - The 64-bit kernel
-- `build/LikeOS.img` - The complete bootable OS image
+This creates:
+- `build/bootloader.efi` - UEFI bootloader application
+- `build/kernel.elf` - 64-bit ELF kernel
+- `build/LikeOS-64.iso` - Hybrid UEFI/BIOS bootable ISO
+- `build/LikeOS-64.img` - UEFI FAT32 boot image
+- `build/LikeOS-64-usb.img` - USB bootable image
+
+### Individual Build Targets
+
+```bash
+make kernel      # Build kernel only
+make bootloader  # Build UEFI bootloader only
+make iso         # Build bootable ISO
+make fat         # Build FAT32 boot image
+make usb         # Build USB image
+```
 
 ### Running
 
-Run the OS in QEMU:
+Run in QEMU with UEFI firmware:
+
 ```bash
-make run
+make qemu        # Boot from ISO
+make qemu-fat    # Boot from FAT image
 ```
 
-Or manually:
+Manual QEMU execution:
 ```bash
-qemu-system-x86_64 -drive format=raw,file=build/LikeOS.img -m 128M
+qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd -cdrom build/LikeOS-64.iso -m 512M
 ```
 
 ## Project Structure
 
 ```
 LikeOS-64/
-├── boot.asm      # Bootloader assembly code
-├── boot64.asm    # 64-bit kernel entry point
-├── kernel.c      # Main kernel code in C
-├── linker.ld     # Linker script for kernel
-├── Makefile      # Build system
-└── README.md     # This file
+├── boot/                    # UEFI bootloader
+│   ├── bootloader.c         # Main UEFI bootloader application
+│   └── uefi/               # Working UEFI implementation reference
+├── kernel/                  # Kernel source code
+│   ├── ke/                 # Kernel Executive
+│   │   ├── init.c          # Kernel initialization and main loop
+│   │   ├── interrupt.asm   # Low-level interrupt handlers
+│   │   ├── interrupt.c     # Interrupt management
+│   │   ├── gdt.asm        # Global Descriptor Table
+│   │   └── gdt.c          # GDT management
+│   ├── hal/                # Hardware Abstraction Layer
+│   │   └── console.c       # Framebuffer console implementation
+│   ├── io/                 # Input/Output subsystem
+│   │   └── keyboard.c      # PS/2 keyboard driver
+│   └── mm/                 # Memory Management
+│       └── memory.c        # Physical/virtual memory and heap
+├── include/                # Header files
+│   └── kernel/             # Kernel headers
+├── kernel.lds              # ELF64 kernel linker script
+├── Makefile               # Professional build system
+└── README.md              # This documentation
 ```
 
 ## Technical Details
 
 ### Boot Process
 
-1. **BIOS Stage**: BIOS loads the first 512 bytes (bootloader) to `0x7C00`
-2. **Bootloader Stage**: 
-   - Sets up segments and stack
-   - Loads kernel from disk to `0x10000`
-   - Sets up GDT for protected and long mode
-   - Enables A20 line for >1MB memory access
-   - Switches to 32-bit protected mode
-   - Sets up page tables for long mode
-   - Enables paging and enters 64-bit long mode
-   - Copies kernel to `0x100000` (1MB mark)
-   - Jumps to kernel entry point
-3. **Kernel Stage**: 
-   - Sets up stack at 2MB mark
-   - Calls C kernel main function
-   - Displays "LikeOS-64 Booting" message
-   - Enters infinite loop with `hlt` instruction
+1. **UEFI Firmware**: System firmware loads and executes BOOTX64.EFI
+2. **UEFI Bootloader**: 
+   - Initializes UEFI boot services and graphics
+   - Sets up framebuffer and gets system memory map
+   - Loads `kernel.elf` using ELF64 parser
+   - Sets up identity paging for kernel
+   - Calls `ExitBootServices()` and jumps to kernel
+3. **Kernel Initialization**: 
+   - Initializes framebuffer console system
+   - Sets up interrupt descriptor table (IDT)
+   - Initializes memory management subsystem
+   - Sets up PS/2 keyboard driver
+   - Enters interactive command loop
 
-### Memory Layout
+### Memory Layout (UEFI)
 
-- `0x00000000 - 0x000003FF`: Interrupt Vector Table
-- `0x00000400 - 0x000004FF`: BIOS Data Area
-- `0x00007C00 - 0x00007DFF`: Bootloader (512 bytes)
-- `0x00010000 - 0x0001FFFF`: Kernel temporary location
-- `0x00070000 - 0x00072FFF`: Page tables (12KB)
-- `0x00100000 - 0x001FFFFF`: Kernel final location (1MB+)
-- `0x00200000+`: Stack grows down from 2MB
+- `0x0000000000100000`: Kernel load address (1MB)
+- `0x0000000080000000+`: Framebuffer base (varies by system)
+- Dynamic UEFI memory map with proper virtual memory management
 
-### GDT Layout
+### Console System
 
-- Null Descriptor
-- 32-bit Code Segment (for protected mode)
-- 32-bit Data Segment (for protected mode)
-- 64-bit Code Segment (for long mode)
-- 64-bit Data Segment (for long mode)
+The framebuffer console provides:
+- **Resolutions**: Supports various UEFI graphics modes (tested at 1024x768)
+- **Font Rendering**: Built-in 8x16 bitmap font with full ASCII support
+- **Color Support**: 16-color VGA palette with RGB conversion
+- **Text Operations**: Character rendering, string output, scrolling
+- **Printf Support**: Full-featured printf family with format specifiers
+
+### Interrupt Handling
+
+- **IDT Setup**: 64-bit Interrupt Descriptor Table
+- **Keyboard IRQ**: PS/2 keyboard on IRQ 1
+- **Exception Handling**: Basic CPU exception handlers
+- **Interrupt Controllers**: PIC configuration and management
+
+### Memory Management
+
+- **Physical Memory**: Detection and bitmap-based allocation
+- **Virtual Memory**: Page table management with identity mapping
+- **Heap Allocation**: Dynamic memory allocation (kalloc/kfree)
+- **Memory Statistics**: Runtime memory usage reporting
 
 ## Customization
 
-### Changing the Boot Message
+### Modifying the Kernel
 
-Edit `kernel.c` and modify the string in the `kernel_main()` function:
+The kernel entry point is in `kernel/ke/init.c`:
 ```c
-print_string("Your Custom Message", 30, 12);
+void kernel_main(framebuffer_info_t* fb_info) {
+    console_init(fb_info);
+    KiSystemStartup();
+}
 ```
 
-### Adding More Kernel Features
+### Adding New Features
 
-The kernel can be extended with:
-- Interrupt handling (IDT setup)
-- Keyboard input
-- More sophisticated memory management
-- File system support
-- Process scheduling
+Extend the kernel by:
+- Adding new interrupt handlers in `kernel/ke/interrupt.c`
+- Creating device drivers in `kernel/io/`
+- Implementing new HAL components in `kernel/hal/`
+- Expanding memory management in `kernel/mm/`
 
-## Debugging
+### Console Customization
 
-Run with GDB debugging support:
+Modify console behavior in `kernel/hal/console.c`:
+- Change font rendering
+- Add new color schemes
+- Implement different graphics modes
+- Add cursor support
+
+## Development
+
+### Build System Features
+
 ```bash
-make debug
+make help        # Show all available targets
+make clean       # Clean all build artifacts
+make deps        # Install build dependencies
 ```
 
-Then in another terminal:
+### Testing
+
+The system supports various testing methods:
+- **QEMU**: Full system emulation with UEFI firmware
+- **Real Hardware**: Boot from USB on UEFI systems
+- **Virtual Machines**: VMware, VirtualBox with UEFI support
+
+### Debugging
+
+Enable debugging features:
 ```bash
-gdb
-(gdb) target remote :1234
-(gdb) set architecture i386:x86-64
+# Add debug symbols to kernel build
+KERNEL_CFLAGS += -g -O0
+
+# Run QEMU with GDB support
+qemu-system-x86_64 -s -S -bios /usr/share/ovmf/OVMF.fd -cdrom build/LikeOS-64.iso
 ```
+
+## Architecture Highlights
+
+### UEFI Integration
+- **Boot Services**: Proper UEFI application with boot services
+- **Graphics Output**: Native framebuffer support
+- **Memory Management**: UEFI memory map integration
+- **Standards Compliance**: Follows UEFI 2.x specifications
+
+### Modern Design
+- **Modular Architecture**: Clean separation of kernel subsystems
+- **Professional Build**: Industry-standard build system
+- **Error Handling**: Comprehensive error checking and reporting
+- **Documentation**: Well-documented code and APIs
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **QEMU not found**: Install qemu-system-x86_64
-2. **NASM not found**: Install nasm assembler
-3. **Boot loops**: Check that the bootloader is exactly 512 bytes with proper signature
-4. **No output**: Ensure VGA text mode is properly initialized
+1. **Missing UEFI firmware**: Install `ovmf` package
+2. **Build failures**: Run `make deps` to install dependencies
+3. **QEMU graphics issues**: Ensure OVMF firmware is properly installed
+4. **No keyboard input**: Check that interrupts are enabled (`sti` instruction)
 
-### Build Targets
+### Build Targets Reference
 
-- `make all` - Build everything
-- `make run` - Build and run in QEMU
-- `make clean` - Clean build files
-- `make rebuild` - Clean and rebuild
-- `make debug` - Run with debugging support
-- `make help` - Show available targets
+- `make all` - Build complete system (ISO + FAT + USB)
+- `make kernel` - Build kernel ELF only
+- `make bootloader` - Build UEFI bootloader only
+- `make iso` - Create bootable ISO image
+- `make fat` - Create FAT32 boot image
+- `make usb` - Create USB bootable image
+- `make qemu` - Run from ISO in QEMU
+- `make qemu-fat` - Run from FAT image in QEMU
+- `make clean` - Remove all build artifacts
+- `make deps` - Install build dependencies
 
 ## License
 
-This project is provided as educational material. Feel free to use and modify as needed.
+This project is provided as educational material demonstrating modern operating system development techniques. Feel free to use and modify for learning purposes.
 
 ## Contributing
 
-This is a minimal educational OS. For learning purposes, try extending it with:
-- Better error handling
-- More CPU features (SSE, etc.)
-- Hardware abstraction layer
-- Device drivers
-- User mode support
+LikeOS-64 demonstrates modern OS development practices. Consider extending it with:
+- **File Systems**: FAT32, ext2, or custom filesystem support
+- **Network Stack**: TCP/IP implementation
+- **User Mode**: Ring 3 user processes and system calls
+- **SMP Support**: Multi-processor support
+- **Advanced Graphics**: 2D/3D graphics acceleration
+- **Security Features**: Memory protection and privilege separation
