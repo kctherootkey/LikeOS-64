@@ -66,19 +66,19 @@ $(BUILD_DIR)/init.o: $(KERNEL_DIR)/ke/init.c | $(BUILD_DIR)
 $(BUILD_DIR)/console.o: $(KERNEL_DIR)/hal/console.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/interrupt.o: $(KERNEL_DIR)/ke/interrupt.asm | $(BUILD_DIR)
+$(BUILD_DIR)/interrupt.o: $(KERNEL_DIR)/hal/interrupt.asm | $(BUILD_DIR)
 	nasm -f elf64 $< -o $@
 
-$(BUILD_DIR)/interrupt_c.o: $(KERNEL_DIR)/ke/interrupt.c | $(BUILD_DIR)
+$(BUILD_DIR)/interrupt_c.o: $(KERNEL_DIR)/hal/interrupt.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/gdt.o: $(KERNEL_DIR)/ke/gdt.asm | $(BUILD_DIR)
+$(BUILD_DIR)/gdt.o: $(KERNEL_DIR)/hal/gdt.asm | $(BUILD_DIR)
 	nasm -f elf64 $< -o $@
 
-$(BUILD_DIR)/gdt_c.o: $(KERNEL_DIR)/ke/gdt.c | $(BUILD_DIR)
+$(BUILD_DIR)/gdt_c.o: $(KERNEL_DIR)/hal/gdt.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/keyboard.o: $(KERNEL_DIR)/io/keyboard.c | $(BUILD_DIR)
+$(BUILD_DIR)/keyboard.o: $(KERNEL_DIR)/hal/keyboard.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/memory.o: $(KERNEL_DIR)/mm/memory.c | $(BUILD_DIR)

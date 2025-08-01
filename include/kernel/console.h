@@ -1,5 +1,5 @@
 // LikeOS-64 Hardware Abstraction Layer - Console Interface
-// VGA text mode console and printf services for kernel subsystems
+// Framebuffer-based console and printf services for kernel subsystems
 
 #ifndef _KERNEL_CONSOLE_H_
 #define _KERNEL_CONSOLE_H_
@@ -15,8 +15,18 @@ typedef unsigned char uint8_t;
 typedef char int8_t;
 typedef unsigned long size_t;
 
-// VGA console interface
-void console_init(void);
+// Framebuffer information structure (must match bootloader)
+typedef struct {
+    void* framebuffer_base;
+    uint32_t framebuffer_size;
+    uint32_t horizontal_resolution;
+    uint32_t vertical_resolution;
+    uint32_t pixels_per_scanline;
+    uint32_t bytes_per_pixel;
+} framebuffer_info_t;
+
+// Console interface (now framebuffer-based)
+void console_init(framebuffer_info_t* fb_info);
 void console_clear(void);
 void console_putchar(char c);
 void console_puts(const char* str);

@@ -8,11 +8,20 @@
 
 // Function prototypes
 void KiSystemStartup(void);
+void kernel_main(framebuffer_info_t* fb_info);
+
+// UEFI kernel entry point - called by bootloader
+void kernel_main(framebuffer_info_t* fb_info) {
+    // Initialize console system with framebuffer info
+    console_init(fb_info);
+    
+    // Call the main system initialization
+    KiSystemStartup();
+}
 
 // Kernel Executive entry point
 void KiSystemStartup(void) {
-    // Initialize console system
-    console_init();
+    // Console is already initialized by kernel_main()
     
     // Print our boot message using kprintf
     kprintf("LikeOS-64 Kernel v1.0\n");
@@ -20,11 +29,11 @@ void KiSystemStartup(void) {
     kprintf("Kernel loaded successfully at address 0x%p\n", (void*)0x100000);
     
     // Set colored output
-    console_set_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK);
+    console_set_color(10, 0); // Light Green on Black
     kprintf("\nKernel initialization complete!\n");
         
     // Reset to default colors
-    console_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    console_set_color(15, 0); // White on Black
     
     // Initialize interrupt system
     kprintf("\nInitializing interrupt system...\n");
@@ -62,10 +71,10 @@ void KiSystemStartup(void) {
     kprintf("Interrupts enabled!\n");
     
     // Show ready prompt
-    console_set_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK);
+    console_set_color(11, 0); // Light Cyan on Black
     kprintf("\nSystem ready! Type to test keyboard input:\n");
     kprintf("> ");
-    console_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    console_set_color(15, 0); // White on Black
 
     // Main input loop
     char c;
