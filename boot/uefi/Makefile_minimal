@@ -1,0 +1,238 @@
+# Minimal UEFI Build System for LikeOS-64
+# Builds minimal kernel and UEFI bootloader separate from main system
+
+# Tools
+GCC = gcc
+LD = ld
+OBJCOPY = objcopy
+DD = dd
+QEMU = qemu-system-x86_64
+XORRISO = xorriso
+MKFS_FAT = mkfs.fat
+MTOOLS = mcopy
+
+# Build directories
+BUILD_DIR = build_minimal
+ISO_DIR = $(BUILD_DIR)/iso
+
+# UEFI/GNU-EFI paths
+EFI_INCLUDES = -I/usr/include/efi -I/usr/include/efi/x86_64
+EFI_LIBS = /usr/lib/crt0-efi-x86_64.o
+EFI_LDS = /usr/lib/elf_x86_64_efi.lds
+
+# Compiler flags for kernel
+KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
+                -fno-stack-protector -mno-red-zone -fno-pic -Wall -Wextra
+
+# Compiler flags for UEFI bootloader
+UEFI_CFLAGS = -fno-stack-protector -fpic -fshort-wchar -mno-red-zone \
+              -maccumulate-outgoing-args $(EFI_INCLUDES) -DEFI_FUNCTION_WRAPPER
+
+# Linker flags
+KERNEL_LDFLAGS = -nostdlib -static
+UEFI_LDFLAGS = -nostdlib -znocombreloc -T $(EFI_LDS) -shared -Bsymbolic
+
+# Target files
+MINIMAL_KERNEL = $(BUILD_DIR)/minimal_kernel.elf
+MINIMAL_BOOTLOADER = $(BUILD_DIR)/minimal_bootloader.efi
+MINIMAL_ISO = $(BUILD_DIR)/minimal_system.iso
+MINIMAL_FAT = $(BUILD_DIR)/minimal_system.img
+USB_IMAGE = $(BUILD_DIR)/minimal_usb.img
+
+# Default target
+all: $(MINIMAL_ISO) $(MINIMAL_FAT) $(USB_IMAGE)
+
+# Create build directory
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+	mkdir -p $(ISO_DIR)
+
+# Build minimal kernel
+$(MINIMAL_KERNEL): minimal_kernel.c minimal_console.c minimal_console.h | $(BUILD_DIR)
+	@echo "Building minimal kernel as ELF64..."
+	# Compile kernel objects
+	$(GCC) $(KERNEL_CFLAGS) -c minimal_kernel.c -o $(BUILD_DIR)/minimal_kernel.o
+	$(GCC) $(KERNEL_CFLAGS) -c minimal_console.c -o $(BUILD_DIR)/minimal_console.o
+	
+	# Link kernel as ELF64 (keep as ELF format)
+	$(LD) $(KERNEL_LDFLAGS) -T kernel.lds \
+		$(BUILD_DIR)/minimal_kernel.o $(BUILD_DIR)/minimal_console.o \
+		-o $(MINIMAL_KERNEL)
+	
+	@echo "Minimal ELF64 kernel built: $(MINIMAL_KERNEL)"
+
+# Build UEFI bootloader
+$(MINIMAL_BOOTLOADER): minimal_bootloader.c | $(BUILD_DIR)
+	@echo "Building UEFI bootloader..."
+	# Compile bootloader
+	$(GCC) $(UEFI_CFLAGS) -c minimal_bootloader.c -o $(BUILD_DIR)/minimal_bootloader.o
+	
+	# Link as shared object
+	$(LD) $(UEFI_LDFLAGS) $(EFI_LIBS) $(BUILD_DIR)/minimal_bootloader.o \
+		-o $(BUILD_DIR)/minimal_bootloader.so \
+		/usr/lib/libgnuefi.a /usr/lib/libefi.a
+	
+	# Convert to EFI executable
+	$(OBJCOPY) -j .text -j .sdata -j .data -j .dynamic \
+		-j .dynsym -j .rel -j .rela -j .reloc \
+		--target=efi-app-x86_64 $(BUILD_DIR)/minimal_bootloader.so $(MINIMAL_BOOTLOADER)
+	@echo "UEFI bootloader built: $(MINIMAL_BOOTLOADER)"
+
+# Create UEFI bootable ISO
+$(MINIMAL_ISO): $(MINIMAL_BOOTLOADER) $(MINIMAL_KERNEL) | $(BUILD_DIR)
+	@echo "Creating UEFI bootable ISO..."
+	
+	# Create EFI directory structure
+	mkdir -p $(ISO_DIR)/EFI/BOOT
+	
+	# Copy bootloader as BOOTX64.EFI (standard UEFI name)
+	cp $(MINIMAL_BOOTLOADER) $(ISO_DIR)/EFI/BOOT/BOOTX64.EFI
+	
+	# Copy kernel to root (now as ELF file)
+	cp $(MINIMAL_KERNEL) $(ISO_DIR)/minimal_kernel.elf
+	
+	# Create bootable ISO with xorriso
+	$(XORRISO) -as mkisofs \
+		-R -f -e EFI/BOOT/BOOTX64.EFI -no-emul-boot \
+		-o $(MINIMAL_ISO) $(ISO_DIR)/
+	
+	@echo "UEFI ISO created: $(MINIMAL_ISO)"
+	@echo ""
+	@echo "To test: make -f Makefile_minimal test"
+
+# Create FAT filesystem image
+$(MINIMAL_FAT): $(MINIMAL_BOOTLOADER) $(MINIMAL_KERNEL) | $(BUILD_DIR)
+	@echo "Creating FAT filesystem image..."
+	
+	# Create 64MB FAT32 image
+	$(DD) if=/dev/zero of=$(MINIMAL_FAT) bs=1M count=64
+	
+	# Format as FAT32
+	$(MKFS_FAT) -F32 -n "LIKEOS64" $(MINIMAL_FAT)
+	
+	# Create temporary mount directory for mtools
+	mkdir -p $(BUILD_DIR)/fat_temp
+	
+	# Copy files using mtools (no root required)
+	MTOOLS_SKIP_CHECK=1 mmd -i $(MINIMAL_FAT) ::/EFI
+	MTOOLS_SKIP_CHECK=1 mmd -i $(MINIMAL_FAT) ::/EFI/BOOT
+	MTOOLS_SKIP_CHECK=1 $(MTOOLS) -i $(MINIMAL_FAT) $(MINIMAL_BOOTLOADER) ::/EFI/BOOT/BOOTX64.EFI
+	MTOOLS_SKIP_CHECK=1 $(MTOOLS) -i $(MINIMAL_FAT) $(MINIMAL_KERNEL) ::/minimal_kernel.elf
+	
+	@echo "FAT image created: $(MINIMAL_FAT)"
+
+# Create USB stick style image with proper partitioning
+$(USB_IMAGE): $(MINIMAL_FAT) | $(BUILD_DIR)
+	@echo "Creating USB stick image with GPT partitioning..."
+	
+	# Create 128MB image for USB stick
+	$(DD) if=/dev/zero of=$(USB_IMAGE) bs=1M count=128
+	
+	# Create GPT partition table and EFI System Partition
+	/sbin/parted $(USB_IMAGE) --script \
+		mklabel gpt \
+		mkpart ESP fat32 1MiB 100% \
+		set 1 esp on
+	
+	# Calculate partition offset (1MB = 2048 sectors of 512 bytes)
+	$(DD) if=$(MINIMAL_FAT) of=$(USB_IMAGE) bs=512 seek=2048 conv=notrunc
+	
+	@echo "USB image created: $(USB_IMAGE)"
+
+# Test in QEMU with OVMF
+test: $(MINIMAL_ISO)
+	@echo "Testing minimal system in QEMU with OVMF (ISO)..."
+	@echo "Expected output: 'LikeOS-64 Kernel loaded' then system halt"
+	@echo ""
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(MINIMAL_ISO) \
+		-m 256M -serial stdio -display gtk
+
+# Test FAT image as USB device
+test-fat: $(MINIMAL_FAT)
+	@echo "Testing FAT image in QEMU with OVMF (USB-style)..."
+	@echo "Expected output: 'LikeOS-64 Kernel loaded' then system halt"
+	@echo ""
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd \
+		-drive file=$(MINIMAL_FAT),format=raw,if=none,id=usb \
+		-device nec-usb-xhci,id=xhci \
+		-device usb-storage,bus=xhci.0,drive=usb \
+		-m 256M -serial stdio -display gtk
+
+# Test USB image with proper partitioning
+test-usb: $(USB_IMAGE)
+	@echo "Testing USB image in QEMU with OVMF (Real USB stick simulation)..."
+	@echo "Expected output: 'LikeOS-64 Kernel loaded' then system halt"
+	@echo ""
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd \
+		-drive file=$(USB_IMAGE),format=raw,if=none,id=usb \
+		-device nec-usb-xhci,id=xhci \
+		-device usb-storage,bus=xhci.0,drive=usb \
+		-m 256M -serial stdio -display gtk
+
+# Alternative test with pflash OVMF (more realistic)
+test-pflash: $(MINIMAL_FAT)
+	@echo "Testing with pflash OVMF (closest to your example)..."
+	@echo "Expected output: 'LikeOS-64 Kernel loaded' then system halt"
+	@echo ""
+	$(QEMU) -L /usr/share/ovmf/ -pflash /usr/share/ovmf/OVMF.fd \
+		-drive file=$(MINIMAL_FAT),format=raw,if=none,id=usb \
+		-device nec-usb-xhci,id=xhci \
+		-device usb-storage,bus=xhci.0,drive=usb \
+		-m 256M -serial stdio -display gtk
+
+# Alternative test with different OVMF path (if needed)
+test-alt: $(MINIMAL_ISO)
+	@echo "Testing with alternative OVMF path..."
+	$(QEMU) -bios /usr/share/edk2-ovmf/OVMF_CODE.fd -cdrom $(MINIMAL_ISO) \
+		-m 256M -serial stdio -display gtk
+
+# Build just the kernel
+kernel: $(MINIMAL_KERNEL)
+
+# Build just the bootloader  
+bootloader: $(MINIMAL_BOOTLOADER)
+
+# Build just the FAT image
+fat: $(MINIMAL_FAT)
+
+# Build just the USB image  
+usb: $(USB_IMAGE)
+
+# Clean minimal build files
+clean:
+	rm -rf $(BUILD_DIR)
+
+# Show help
+help:
+	@echo "Minimal UEFI Build System for LikeOS-64"
+	@echo "========================================"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all        - Build complete minimal system (default)"
+	@echo "  kernel     - Build only minimal kernel"
+	@echo "  bootloader - Build only UEFI bootloader"
+	@echo "  fat        - Build only FAT image"
+	@echo "  usb        - Build only USB image"
+	@echo "  test       - Test ISO in QEMU with OVMF"
+	@echo "  test-fat   - Test FAT image as USB device"
+	@echo "  test-usb   - Test USB image (with partitioning)"
+	@echo "  test-pflash- Test with pflash OVMF (most realistic)"
+	@echo "  test-alt   - Test with alternative OVMF path"
+	@echo "  clean      - Remove build files"
+	@echo "  help       - Show this help"
+	@echo ""
+	@echo "Files created:"
+	@echo "  $(MINIMAL_KERNEL)     - Minimal kernel ELF64"
+	@echo "  $(MINIMAL_BOOTLOADER) - UEFI bootloader"
+	@echo "  $(MINIMAL_ISO)        - Bootable UEFI ISO"
+	@echo "  $(MINIMAL_FAT)        - FAT32 filesystem image"
+	@echo "  $(USB_IMAGE)          - USB stick image with GPT"
+	@echo ""
+	@echo "Requirements:"
+	@echo "  - GNU-EFI development packages"
+	@echo "  - OVMF firmware (/usr/share/ovmf/ or /usr/share/edk2-ovmf/)"
+	@echo "  - xorriso for ISO creation"
+	@echo "  - mtools for FAT manipulation"
+	@echo "  - parted for USB partitioning"
+
+.PHONY: all test test-fat test-usb test-pflash test-alt kernel bootloader fat usb clean help
