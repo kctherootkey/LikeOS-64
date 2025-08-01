@@ -167,6 +167,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                &LoadedImageProtocol, (VOID**)&loaded_image);
     if (EFI_ERROR(status)) {
         Print(L"ERROR: Could not get loaded image protocol: %r\r\n", status);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
         return status;
     }
     
@@ -175,6 +179,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                &FileSystemProtocol, (VOID**)&file_system);
     if (EFI_ERROR(status)) {
         Print(L"ERROR: Could not get file system protocol: %r\r\n", status);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
         return status;
     }
     
@@ -182,6 +190,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     status = uefi_call_wrapper(file_system->OpenVolume, 2, file_system, &root_dir);
     if (EFI_ERROR(status)) {
         Print(L"ERROR: Could not open root directory: %r\r\n", status);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
         return status;
     }
     
@@ -230,6 +242,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     if (EFI_ERROR(status)) {
         Print(L"ERROR: Could not open kernel.elf: %r\r\n", status);
         uefi_call_wrapper(root_dir->Close, 1, root_dir);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
         return status;
     }
     
@@ -240,6 +256,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         Print(L"ERROR: Could not allocate memory for file info: %r\r\n", status);
         uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
         uefi_call_wrapper(root_dir->Close, 1, root_dir);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
         return status;
     }
     
@@ -250,6 +270,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         uefi_call_wrapper(BS->FreePool, 1, file_info);
         uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
         uefi_call_wrapper(root_dir->Close, 1, root_dir);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
         return status;
     }
     
@@ -263,6 +287,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         uefi_call_wrapper(BS->FreePool, 1, file_info);
         uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
         uefi_call_wrapper(root_dir->Close, 1, root_dir);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
         return status;
     }
     
@@ -274,6 +302,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         uefi_call_wrapper(BS->FreePool, 1, file_info);
         uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
         uefi_call_wrapper(root_dir->Close, 1, root_dir);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
         return status;
     }
     
@@ -286,6 +318,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         uefi_call_wrapper(BS->FreePool, 1, file_info);
         uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
         uefi_call_wrapper(root_dir->Close, 1, root_dir);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
         return EFI_INVALID_PARAMETER;
     }
     
@@ -316,6 +352,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 uefi_call_wrapper(BS->FreePool, 1, file_info);
                 uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
                 uefi_call_wrapper(root_dir->Close, 1, root_dir);
+                Print(L"System halted. Press any key to continue...\r\n");
+                uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+                EFI_INPUT_KEY key;
+                uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
                 return status;
             }
             
@@ -352,6 +392,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                &map_key, &descriptor_size, &descriptor_version);
     if (status != EFI_BUFFER_TOO_SMALL) {
         Print(L"ERROR: Unexpected error getting memory map size: %r\r\n", status);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
         return status;
     }
     
@@ -361,6 +405,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                memory_map_size, (VOID**)&memory_map);
     if (EFI_ERROR(status)) {
         Print(L"ERROR: Could not allocate memory map: %r\r\n", status);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
         return status;
     }
     
@@ -370,6 +418,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     if (EFI_ERROR(status)) {
         Print(L"ERROR: Could not get memory map: %r\r\n", status);
         uefi_call_wrapper(BS->FreePool, 1, memory_map);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
         return status;
     }
     
@@ -386,6 +438,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                           &map_key, &descriptor_size, &descriptor_version);
         status = uefi_call_wrapper(BS->ExitBootServices, 2, ImageHandle, map_key);
         if (EFI_ERROR(status)) {
+            Print(L"ERROR: Could not exit boot services: %r\r\n", status);
+            Print(L"System halted. Press any key to continue...\r\n");
+            uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+            EFI_INPUT_KEY key;
+            uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
             return status;
         }
     }

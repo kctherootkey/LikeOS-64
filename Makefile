@@ -172,6 +172,56 @@ qemu-fat: $(FAT_IMAGE)
 	@echo "Running LikeOS-64 from FAT image in QEMU with UEFI firmware..."
 	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -drive format=raw,file=$(FAT_IMAGE) -m 512M -serial stdio
 
+# Write ISO to USB device with GPT partition table (like Rufus)
+# Usage: make usb-write USB_DEVICE=/dev/sdX
+usb-write: $(ISO_IMAGE)
+	@if [ -z "$(USB_DEVICE)" ]; then \
+		echo "Error: USB_DEVICE not specified. Usage: make usb-write USB_DEVICE=/dev/sdX"; \
+		echo "Available devices:"; \
+		lsblk -d -o NAME,SIZE,TYPE | grep disk; \
+		exit 1; \
+	fi
+	@echo "WARNING: This will completely erase $(USB_DEVICE)!"
+	@echo "Press Enter to continue or Ctrl+C to cancel..."
+	@read confirm
+	@echo "Creating GPT-partitioned UEFI bootable USB drive on $(USB_DEVICE)..."
+	
+	# Unmount any mounted partitions
+	-sudo umount $(USB_DEVICE)* 2>/dev/null || true
+	
+	# Create GPT partition table
+	sudo parted $(USB_DEVICE) --script mklabel gpt
+	
+	# Create EFI System Partition (FAT32, bootable)
+	sudo parted $(USB_DEVICE) --script mkpart primary fat32 1MiB 100%
+	sudo parted $(USB_DEVICE) --script set 1 esp on
+	sudo parted $(USB_DEVICE) --script set 1 boot on
+	
+	# Wait for partition to be recognized
+	sleep 2
+	
+	# Format as FAT32
+	sudo mkfs.fat -F32 -n "LikeOS-64" $(USB_DEVICE)1
+	
+	# Mount the partition
+	mkdir -p /tmp/likeos_usb_mount
+	sudo mount $(USB_DEVICE)1 /tmp/likeos_usb_mount
+	
+	# Create EFI directory structure
+	sudo mkdir -p /tmp/likeos_usb_mount/EFI/BOOT
+	
+	# Copy bootloader and kernel
+	sudo cp $(BOOTLOADER_EFI) /tmp/likeos_usb_mount/EFI/BOOT/BOOTX64.EFI
+	sudo cp $(KERNEL_ELF) /tmp/likeos_usb_mount/kernel.elf
+	
+	# Sync and unmount
+	sudo sync
+	sudo umount /tmp/likeos_usb_mount
+	rmdir /tmp/likeos_usb_mount
+	
+	@echo "UEFI bootable USB drive created successfully on $(USB_DEVICE)"
+	@echo "The USB drive should now boot on UEFI systems with GPT support."
+
 # Clean build files
 clean:
 	rm -rf $(BUILD_DIR)
@@ -194,8 +244,11 @@ help:
 	@echo "  usb        - Build USB bootable image"
 	@echo "  qemu       - Run in QEMU from ISO"
 	@echo "  qemu-fat   - Run in QEMU from FAT image"
+	@echo "  usb-write  - Write to USB device with GPT (requires USB_DEVICE=/dev/sdX)"
 	@echo "  clean      - Clean build files"
 	@echo "  deps       - Install build dependencies"
+	@echo ""
+	@echo "Example USB write: make usb-write USB_DEVICE=/dev/sdb"
 
 # Individual targets
 kernel: $(KERNEL_ELF)
@@ -204,4 +257,4 @@ iso: $(ISO_IMAGE)
 fat: $(FAT_IMAGE)
 usb: $(USB_IMAGE)
 
-.PHONY: all clean qemu qemu-fat deps help kernel bootloader iso fat usb
+.PHONY: all clean qemu qemu-fat usb-write deps help kernel bootloader iso fat usb
