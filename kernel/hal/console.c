@@ -258,8 +258,34 @@ void console_clear(void) {
 
 // Scroll the screen up by one line
 static void console_scroll_up(void) {
-    // Simple implementation: just clear screen and reset cursor
-    console_clear();
+    if (!fb_info || !fb_info->framebuffer_base) return;
+    
+    uint32_t* framebuffer = (uint32_t*)fb_info->framebuffer_base;
+    uint32_t width = fb_info->horizontal_resolution;
+    uint32_t height = fb_info->vertical_resolution;
+    uint32_t pixels_per_line = fb_info->pixels_per_scanline;
+    
+    // Calculate how many pixels to scroll (one character line)
+    uint32_t scroll_lines = CHAR_HEIGHT;
+    
+    // Move all scan lines up by scroll_lines using memory copy for efficiency
+    for (uint32_t y = scroll_lines; y < height; y++) {
+        uint32_t* src_line = &framebuffer[y * pixels_per_line];
+        uint32_t* dst_line = &framebuffer[(y - scroll_lines) * pixels_per_line];
+        kmemcpy(dst_line, src_line, width * sizeof(uint32_t));
+    }
+    
+    // Clear the bottom scroll_lines rows with background color
+    for (uint32_t y = height - scroll_lines; y < height; y++) {
+        uint32_t* line = &framebuffer[y * pixels_per_line];
+        for (uint32_t x = 0; x < width; x++) {
+            line[x] = bg_color;
+        }
+    }
+    
+    // Move cursor to last line
+    cursor_y = max_rows - 1;
+    cursor_x = 0;
 }
 
 // Set console colors (VGA compatibility)
