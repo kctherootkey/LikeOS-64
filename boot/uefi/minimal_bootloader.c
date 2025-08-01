@@ -42,8 +42,18 @@ typedef struct {
 #define EM_X86_64 62
 #define PT_LOAD 1
 
-// Kernel entry point type
-typedef void (*kernel_entry_t)(void);
+// Kernel entry point type (now takes framebuffer info)
+typedef void (*kernel_entry_t)(void* framebuffer_info);
+
+// Framebuffer information structure
+typedef struct {
+    void* framebuffer_base;
+    uint32_t framebuffer_size;
+    uint32_t horizontal_resolution;
+    uint32_t vertical_resolution;
+    uint32_t pixels_per_scanline;
+    uint32_t bytes_per_pixel;
+} framebuffer_info_t;
 
 // Paging structures (assuming 4-level paging)
 typedef struct {
@@ -142,6 +152,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     Elf64_Ehdr *elf_header;
     Elf64_Phdr *program_headers;
     kernel_entry_t kernel_entry;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
+    framebuffer_info_t fb_info;
     
     // Initialize GNU-EFI library
     InitializeLib(ImageHandle, SystemTable);
@@ -174,6 +186,43 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
     
     Print(L"Loading minimal_kernel.elf...\r\n");
+    
+    // Get Graphics Output Protocol for framebuffer info
+    status = uefi_call_wrapper(BS->LocateProtocol, 3, &GraphicsOutputProtocol, NULL, (VOID**)&gop);
+    if (EFI_ERROR(status)) {
+        Print(L"WARNING: Could not get Graphics Output Protocol: %r\r\n", status);
+        // Set up fallback VGA mode info
+        fb_info.framebuffer_base = (void*)0xB8000;
+        fb_info.framebuffer_size = 4000;
+        fb_info.horizontal_resolution = 80;
+        fb_info.vertical_resolution = 25;
+        fb_info.pixels_per_scanline = 80;
+        fb_info.bytes_per_pixel = 2;
+    } else {
+        // Get current mode information
+        fb_info.framebuffer_base = (void*)gop->Mode->FrameBufferBase;
+        fb_info.framebuffer_size = (uint32_t)gop->Mode->FrameBufferSize;
+        fb_info.horizontal_resolution = gop->Mode->Info->HorizontalResolution;
+        fb_info.vertical_resolution = gop->Mode->Info->VerticalResolution;
+        fb_info.pixels_per_scanline = gop->Mode->Info->PixelsPerScanLine;
+        
+        // Calculate bytes per pixel based on pixel format
+        switch (gop->Mode->Info->PixelFormat) {
+            case PixelRedGreenBlueReserved8BitPerColor:
+            case PixelBlueGreenRedReserved8BitPerColor:
+                fb_info.bytes_per_pixel = 4;
+                break;
+            case PixelBitMask:
+                fb_info.bytes_per_pixel = 4; // Assume 32-bit
+                break;
+            default:
+                fb_info.bytes_per_pixel = 4; // Safe default
+                break;
+        }
+        
+        Print(L"Framebuffer: 0x%lx, Size: %d bytes\r\n", fb_info.framebuffer_base, fb_info.framebuffer_size);
+        Print(L"Resolution: %dx%d, BPP: %d\r\n", fb_info.horizontal_resolution, fb_info.vertical_resolution, fb_info.bytes_per_pixel);
+    }
     
     // Open kernel file (now ELF format)
     status = uefi_call_wrapper(root_dir->Open, 5, root_dir, &kernel_file, 
@@ -346,7 +395,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     
     // Jump to kernel entry point
     kernel_entry = (kernel_entry_t)elf_header->e_entry;
-    kernel_entry();
+    kernel_entry(&fb_info);
     
     // Should never reach here
     return EFI_SUCCESS;
