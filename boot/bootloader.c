@@ -171,24 +171,126 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
     // Map kernel pages in higher half
     UINT64 kernel_pages = (kernel_size + 4095) / 4096;
     
-    // Map additional pages for kernel stack and data (at least 16 pages = 64KB extra)
-    UINT64 extra_pages = 16;
-    UINT64 total_pages = kernel_pages + extra_pages;
+    // Calculate how much virtual memory we need to map
+    // We need to cover at least 0xFFFFFFFF80A00000 which is 0xA00000 (10MB) above kernel base
+    UINT64 min_virtual_size = 11 * 1024 * 1024; // 11MB to be safe
+    UINT64 total_pages_needed = min_virtual_size / 4096; // Convert to 4KB pages
     
-    if (total_pages > (512 - pt_index)) {
-        total_pages = 512 - pt_index; // Don't overflow page table
+    Print(L"Mapping %lu MB (%lu pages) of virtual memory starting at 0x%lx...\r\n", 
+          min_virtual_size / (1024 * 1024), total_pages_needed, kernel_virt);
+    
+    // Calculate how many page tables we need
+    // Each page table can map 512 pages (2MB of virtual memory)
+    UINT64 page_tables_needed = (total_pages_needed + 511) / 512;
+    
+    Print(L"Allocating %lu additional page tables for extended mapping...\r\n", page_tables_needed - 1);
+    
+    // First page table is already allocated at PT_HIGH_ADDRESS
+    // Map what we can with the first page table
+    UINT64 first_pt_pages = (total_pages_needed < 512) ? total_pages_needed : 512;
+    
+    // Map kernel pages first with real physical addresses
+    for (UINT64 i = 0; i < kernel_pages && i < first_pt_pages; i++) {
+        UINT64 phys_addr = kernel_phys_addr + (i * 4096);
+        pt_high->entries[pt_index + i] = phys_addr | PAGE_RWX;
     }
     
-    for (UINT64 i = 0; i < total_pages; i++) {
-        UINT64 phys_addr = kernel_phys_addr + (i * 4096);
-        // Kernel pages should be executable (contains code)
+    // For pages beyond the kernel, allocate new physical memory
+    for (UINT64 i = kernel_pages; i < first_pt_pages; i++) {
+        // Allocate physical memory for this page
+        UINTN pages_to_allocate = 1;
+        EFI_PHYSICAL_ADDRESS phys_addr = 0;
+        
+        EFI_STATUS alloc_status = uefi_call_wrapper(BS->AllocatePages, 4, 
+                                                    AllocateAnyPages, 
+                                                    EfiLoaderData, 
+                                                    pages_to_allocate, 
+                                                    &phys_addr);
+        
+        if (EFI_ERROR(alloc_status)) {
+            Print(L"ERROR: Could not allocate physical memory for page %lu: %r\r\n", i, alloc_status);
+            break;
+        }
+        
+        // Map the allocated physical memory to virtual address
         pt_high->entries[pt_index + i] = phys_addr | PAGE_RWX;
+        
+        // Zero out the allocated memory
+        uefi_call_wrapper(BS->SetMem, 3, (VOID*)phys_addr, 4096, 0);
+    }
+    
+    // If we need more page tables, allocate and set them up
+    UINT64 pages_mapped = first_pt_pages;
+    
+    for (UINT64 pt_i = 1; pt_i < page_tables_needed && pages_mapped < total_pages_needed; pt_i++) {
+        // Allocate physical memory for this page table
+        UINTN pt_pages = 1;
+        EFI_PHYSICAL_ADDRESS pt_phys_addr = 0;
+        
+        EFI_STATUS pt_alloc_status = uefi_call_wrapper(BS->AllocatePages, 4, 
+                                                       AllocateAnyPages, 
+                                                       EfiLoaderData, 
+                                                       pt_pages, 
+                                                       &pt_phys_addr);
+        
+        if (EFI_ERROR(pt_alloc_status)) {
+            Print(L"ERROR: Could not allocate page table %lu: %r\r\n", pt_i, pt_alloc_status);
+            break;
+        }
+        
+        // Clear the page table
+        uefi_call_wrapper(BS->SetMem, 3, (VOID*)pt_phys_addr, 4096, 0);
+        
+        // Set up page directory entry to point to this page table
+        UINT64 pd_entry_index = pd_index + pt_i;
+        if (pd_entry_index < 512) {
+            pd_high->entries[pd_entry_index] = pt_phys_addr | PAGE_RWX;
+            
+            Print(L"Page table %lu allocated at 0x%lx, mapped to PD[%lu]\r\n", 
+                  pt_i, pt_phys_addr, pd_entry_index);
+            
+            // Get pointer to the new page table
+            page_table_t *current_pt = (page_table_t*)pt_phys_addr;
+            
+            // Map pages in this page table
+            UINT64 pages_in_this_pt = (total_pages_needed - pages_mapped < 512) ? 
+                                     (total_pages_needed - pages_mapped) : 512;
+            
+            for (UINT64 i = 0; i < pages_in_this_pt; i++) {
+                // Allocate physical memory for this page
+                UINTN pages_to_allocate = 1;
+                EFI_PHYSICAL_ADDRESS phys_addr = 0;
+                
+                EFI_STATUS alloc_status = uefi_call_wrapper(BS->AllocatePages, 4, 
+                                                            AllocateAnyPages, 
+                                                            EfiLoaderData, 
+                                                            pages_to_allocate, 
+                                                            &phys_addr);
+                
+                if (EFI_ERROR(alloc_status)) {
+                    Print(L"ERROR: Could not allocate physical memory for page %lu in PT %lu: %r\r\n", 
+                          i, pt_i, alloc_status);
+                    break;
+                }
+                
+                // Map the allocated physical memory to virtual address
+                current_pt->entries[i] = phys_addr | PAGE_RWX;
+                
+                // Zero out the allocated memory
+                uefi_call_wrapper(BS->SetMem, 3, (VOID*)phys_addr, 4096, 0);
+                
+                pages_mapped++;
+            }
+        }
     }
     
     Print(L"Higher half paging configured:\r\n");
     Print(L"  Identity mapped: 0x0 - 0x100000000 (4GB)\r\n");
-    Print(L"  Kernel virtual: 0x%lx -> 0x%lx (%lu total pages, %lu kernel + %lu extra)\r\n", 
-          kernel_virt, kernel_phys_addr, total_pages, kernel_pages, extra_pages);
+    Print(L"  Kernel virtual: 0x%lx -> 0x%lx (%lu total pages mapped)\r\n", 
+          kernel_virt, kernel_phys_addr, pages_mapped);
+    Print(L"  Virtual memory covers: 0x%lx - 0x%lx (%lu MB)\r\n", 
+          kernel_virt, kernel_virt + (pages_mapped * 4096), (pages_mapped * 4096) / (1024 * 1024));
+    Print(L"  Target address 0xFFFFFFFF80A00000 should now be accessible!\r\n");
 }
 
 // Allocate and setup trampoline below kernel space
