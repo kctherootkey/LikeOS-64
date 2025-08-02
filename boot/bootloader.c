@@ -60,64 +60,177 @@ typedef struct {
     UINT64 entries[512];
 } __attribute__((aligned(4096))) page_table_t;
 
+// Higher half kernel constants (must match kernel.lds and memory.h)
+#define KERNEL_OFFSET    0xFFFFFFFF80000000ULL
+#define KERNEL_START     0x0
+
 // Physical memory locations for page tables
 #define PML4_ADDRESS    0x1000
 #define PDPT_ADDRESS    0x2000
-#define PD_ADDRESS      0x3000
-#define PT_ADDRESS      0x4000
+#define PD_ADDRESS      0x3000   // Page directories start here (need multiple for 4GB)
+#define PT_ADDRESS      0x8000   // Page tables start here (after page directories)
+
+// Higher half page tables  
+#define PDPT_HIGH_ADDRESS  0x9000
+#define PD_HIGH_ADDRESS    0xA000
+#define PT_HIGH_ADDRESS    0xB000
+
+// Trampoline address (will be allocated below kernel)
+static EFI_PHYSICAL_ADDRESS trampoline_addr = 0;
 
 // Page table entry flags
 #define PAGE_PRESENT    (1ULL << 0)
 #define PAGE_WRITABLE   (1ULL << 1)
 #define PAGE_USER       (1ULL << 2)
+#define PAGE_SIZE       (1ULL << 7)    // PS bit for 2MB pages
+#define PAGE_NX         (1ULL << 63)   // No-Execute bit
 
-// Helper function to set up identity paging for low memory + kernel mapping
-static void setup_paging(UINT64 kernel_vaddr, UINT64 kernel_paddr, UINT64 kernel_size) {
+// Common page combinations
+#define PAGE_RW         (PAGE_PRESENT | PAGE_WRITABLE)
+#define PAGE_RWX        (PAGE_PRESENT | PAGE_WRITABLE)  // Executable (NX=0)
+#define PAGE_RW_NX      (PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX)  // Non-executable
+
+// Trampoline function type
+typedef void (*trampoline_func_t)(UINT64 kernel_entry, void* framebuffer_info, UINT64 pml4_addr);
+
+// External trampoline function from trampoline.S
+extern void trampoline_jump(UINT64 kernel_entry, void* framebuffer_info, UINT64 pml4_addr);
+
+// We need the end symbol to calculate the size
+extern char trampoline_jump_end[];
+
+// Set up higher half kernel paging with identity mapping for low memory
+static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size) {
     page_table_t *pml4 = (page_table_t*)PML4_ADDRESS;
-    page_table_t *pdpt = (page_table_t*)PDPT_ADDRESS;
-    page_table_t *pd = (page_table_t*)PD_ADDRESS;
-    page_table_t *pt = (page_table_t*)PT_ADDRESS;
+    page_table_t *pdpt_low = (page_table_t*)PDPT_ADDRESS;
     
-    // Clear page tables
+    // Higher half page tables
+    page_table_t *pdpt_high = (page_table_t*)PDPT_HIGH_ADDRESS;
+    page_table_t *pd_high = (page_table_t*)PD_HIGH_ADDRESS;
+    page_table_t *pt_high = (page_table_t*)PT_HIGH_ADDRESS;
+    
+    // Clear main page tables
     for (int i = 0; i < 512; i++) {
         pml4->entries[i] = 0;
-        pdpt->entries[i] = 0;
-        pd->entries[i] = 0;
-        pt->entries[i] = 0;
+        pdpt_low->entries[i] = 0;
+        pdpt_high->entries[i] = 0;
+        pd_high->entries[i] = 0;
+        pt_high->entries[i] = 0;
     }
     
-    // Set up PML4 -> PDPT
-    pml4->entries[0] = PDPT_ADDRESS | PAGE_PRESENT | PAGE_WRITABLE;
+    // Set up PML4 entries
+    // Entry 0: Low memory identity mapping (0x0 - 0x7FFFFFFFFF) - EXECUTABLE
+    pml4->entries[0] = PDPT_ADDRESS | PAGE_RWX;
     
-    // Set up PDPT -> PD for first 1GB (identity mapping)
-    pdpt->entries[0] = PD_ADDRESS | PAGE_PRESENT | PAGE_WRITABLE;
+    // Entry 511: Higher half mapping (0xFFFFFF8000000000 - 0xFFFFFFFFFFFFFFFF)
+    pml4->entries[511] = PDPT_HIGH_ADDRESS | PAGE_RWX;
     
-    // Set up PD -> PT for first 2MB (identity mapping)
-    pd->entries[0] = PT_ADDRESS | PAGE_PRESENT | PAGE_WRITABLE;
-    
-    // Identity map first 2MB (0x0 - 0x200000)
-    for (int i = 0; i < 512; i++) {
-        pt->entries[i] = (i * 4096) | PAGE_PRESENT | PAGE_WRITABLE;
-    }
-    
-    // If kernel is loaded above 2MB, we need additional mappings
-    if (kernel_vaddr >= 0x200000) {
-        UINT64 kernel_pde_index = kernel_vaddr / (2 * 1024 * 1024);  // 2MB pages
-        if (kernel_pde_index < 512) {
-            // Use 2MB pages for simplicity
-            pd->entries[kernel_pde_index] = (kernel_paddr & ~0x1FFFFF) | PAGE_PRESENT | PAGE_WRITABLE | (1ULL << 7); // PS bit for 2MB pages
+    // Set up low memory identity mapping for first 4GB
+    // 4GB = 4 PDPT entries (each covers 1GB)
+    for (int pdpt_i = 0; pdpt_i < 4; pdpt_i++) {
+        // Allocate page directory for this 1GB region
+        EFI_PHYSICAL_ADDRESS pd_addr = PD_ADDRESS + (pdpt_i * 4096);
+        page_table_t *pd = (page_table_t*)pd_addr;
+        
+        // Clear page directory
+        for (int i = 0; i < 512; i++) {
+            pd->entries[i] = 0;
+        }
+        
+        // Set PDPT entry to point to this page directory
+        pdpt_low->entries[pdpt_i] = pd_addr | PAGE_RWX;
+        
+        // Each page directory covers 512 * 2MB = 1GB using 2MB pages
+        // Set up 2MB page entries for this 1GB region
+        for (int pd_i = 0; pd_i < 512; pd_i++) {
+            // Calculate physical address for this 2MB page
+            UINT64 phys_addr = (UINT64)pdpt_i * 0x40000000ULL + (UINT64)pd_i * 0x200000ULL;
+            
+            // Create executable 2MB pages for identity mapping
+            // CRITICAL: These pages must be executable for trampoline to work
+            pd->entries[pd_i] = phys_addr | PAGE_RWX | PAGE_SIZE;
         }
     }
+    
+    // Set up higher half mapping for kernel
+    // KERNEL_OFFSET = 0xFFFFFFFF80000000
+    // Virtual address: KERNEL_OFFSET + KERNEL_START = 0xFFFFFFFF80000000
+    // Physical address: kernel_phys_addr
+    
+    // Calculate indices for higher half mapping
+    UINT64 kernel_virt = KERNEL_OFFSET + KERNEL_START;
+    UINT64 pml4_index = (kernel_virt >> 39) & 0x1FF;  // Should be 511
+    UINT64 pdpt_index = (kernel_virt >> 30) & 0x1FF;  // Should be 256 for 0xFFFFFFFF80000000
+    UINT64 pd_index = (kernel_virt >> 21) & 0x1FF;    // Should be 0
+    UINT64 pt_index = (kernel_virt >> 12) & 0x1FF;    // Should be 0
+    
+    // Set up higher half page table hierarchy
+    pdpt_high->entries[pdpt_index] = PD_HIGH_ADDRESS | PAGE_RWX;
+    pd_high->entries[pd_index] = PT_HIGH_ADDRESS | PAGE_RWX;
+    
+    // Map kernel pages in higher half
+    UINT64 kernel_pages = (kernel_size + 4095) / 4096;
+    
+    // Map additional pages for kernel stack and data (at least 16 pages = 64KB extra)
+    UINT64 extra_pages = 16;
+    UINT64 total_pages = kernel_pages + extra_pages;
+    
+    if (total_pages > (512 - pt_index)) {
+        total_pages = 512 - pt_index; // Don't overflow page table
+    }
+    
+    for (UINT64 i = 0; i < total_pages; i++) {
+        UINT64 phys_addr = kernel_phys_addr + (i * 4096);
+        // Kernel pages should be executable (contains code)
+        pt_high->entries[pt_index + i] = phys_addr | PAGE_RWX;
+    }
+    
+    Print(L"Higher half paging configured:\r\n");
+    Print(L"  Identity mapped: 0x0 - 0x100000000 (4GB)\r\n");
+    Print(L"  Kernel virtual: 0x%lx -> 0x%lx (%lu total pages, %lu kernel + %lu extra)\r\n", 
+          kernel_virt, kernel_phys_addr, total_pages, kernel_pages, extra_pages);
 }
 
-// Load CR3 with our page table
-static void enable_paging(void) {
-    __asm__ volatile (
-        "mov %0, %%cr3"
-        :
-        : "r" ((UINT64)PML4_ADDRESS)
-        : "memory"
-    );
+// Allocate and setup trampoline below kernel space
+static EFI_STATUS allocate_trampoline(UINT64 kernel_phys_addr) {
+    EFI_STATUS status;
+    
+    // Calculate the actual size of the trampoline function
+    UINTN trampoline_size = (UINTN)trampoline_jump_end - (UINTN)trampoline_jump;
+    
+    // Ensure we have at least some reasonable size
+    if (trampoline_size < 16 || trampoline_size > 4096) {
+        trampoline_size = 256; // Safe fallback
+    }
+    
+    // Allocate a page below the kernel's physical address
+    // This ensures the trampoline is in low memory and identity-mapped
+    EFI_PHYSICAL_ADDRESS max_addr = kernel_phys_addr - 1; // Just below kernel
+    UINTN pages = 1; // One page for trampoline
+    
+    status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateMaxAddress, 
+                               EfiLoaderCode, pages, &max_addr);
+    if (EFI_ERROR(status)) {
+        // If that fails, try to allocate anywhere below 1MB
+        max_addr = 0x100000 - 1;
+        status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateMaxAddress, 
+                                   EfiLoaderCode, pages, &max_addr);
+        if (EFI_ERROR(status)) {
+            Print(L"ERROR: Could not allocate trampoline memory: %r\r\n", status);
+            return status;
+        }
+    }
+    
+    trampoline_addr = max_addr;
+    Print(L"Trampoline allocated at: 0x%lx\r\n", trampoline_addr);
+    
+    // Copy trampoline function code to allocated memory
+    uefi_call_wrapper(BS->CopyMem, 3, (VOID*)trampoline_addr, 
+                      (VOID*)trampoline_jump, trampoline_size);
+    
+    Print(L"Trampoline code copied (%lu bytes)\r\n", trampoline_size);
+    
+    return EFI_SUCCESS;
 }
 
 // Validate ELF64 header
@@ -161,6 +274,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     Print(L"LikeOS-64 Enhanced UEFI Bootloader\r\n");
     Print(L"===================================\r\n");
     Print(L"ELF64 Loader with Paging Support\r\n\r\n");
+
+    // Dump UEFI memory map for debugging
+    //dump_memory_map();
+    //for (;;) {}
     
     // Get loaded image protocol
     status = uefi_call_wrapper(BS->HandleProtocol, 3, ImageHandle, 
@@ -332,6 +449,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     // Get program headers
     program_headers = (Elf64_Phdr*)((UINT8*)kernel_buffer + elf_header->e_phoff);
     
+    // Track kernel physical location for paging setup
+    EFI_PHYSICAL_ADDRESS kernel_phys_addr = 0;
+    UINT64 kernel_size_total = 0;
+    
     // Load program segments
     for (int i = 0; i < elf_header->e_phnum; i++) {
         Elf64_Phdr *phdr = &program_headers[i];
@@ -340,14 +461,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             Print(L"Loading segment %d: vaddr=0x%lx, paddr=0x%lx, size=%ld\r\n", 
                   i, phdr->p_vaddr, phdr->p_paddr, phdr->p_memsz);
             
-            // Allocate memory for this segment
+            // Allocate memory for this segment using AllocateAnyPages
             UINTN pages = (phdr->p_memsz + 4095) / 4096;
-            EFI_PHYSICAL_ADDRESS segment_addr = phdr->p_paddr;
+            EFI_PHYSICAL_ADDRESS segment_addr = 0;
             
-            status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAddress, 
+            status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, 
                                        EfiLoaderCode, pages, &segment_addr);
             if (EFI_ERROR(status)) {
-                Print(L"ERROR: Could not allocate memory at 0x%lx: %r\r\n", phdr->p_paddr, status);
+                Print(L"ERROR: Could not allocate memory: %r\r\n", status);
                 uefi_call_wrapper(BS->FreePool, 1, kernel_buffer);
                 uefi_call_wrapper(BS->FreePool, 1, file_info);
                 uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
@@ -357,6 +478,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 EFI_INPUT_KEY key;
                 uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
                 return status;
+            }
+            
+            // Track the kernel's physical location (use first segment)
+            if (kernel_phys_addr == 0) {
+                kernel_phys_addr = segment_addr;
+            }
+            
+            Print(L"Allocated at physical address: 0x%lx\r\n", segment_addr);
+            
+            // Calculate total kernel size
+            UINT64 segment_end = segment_addr + phdr->p_memsz;
+            if (segment_end > (kernel_phys_addr + kernel_size_total)) {
+                kernel_size_total = segment_end - kernel_phys_addr;
             }
             
             // Copy segment data
@@ -372,6 +506,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             }
         }
     }
+    
+    Print(L"Kernel physical location: 0x%lx (total size: %ld bytes)\r\n", 
+          kernel_phys_addr, kernel_size_total);
     
     Print(L"Kernel loaded successfully!\r\n");
     Print(L"Setting up paging and exiting UEFI...\r\n");
@@ -425,12 +562,26 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         return status;
     }
     
-    // Set up our own paging tables BEFORE exiting boot services
-    // setup_paging(elf_header->e_entry, elf_header->e_entry, 0x200000);
+    // Step 1: Allocate trampoline below kernel space
+    Print(L"Allocating trampoline below kernel space...\r\n");
+    status = allocate_trampoline(kernel_phys_addr);
+    if (EFI_ERROR(status)) {
+        uefi_call_wrapper(BS->FreePool, 1, memory_map);
+        Print(L"System halted. Press any key to continue...\r\n");
+        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
+        EFI_INPUT_KEY key;
+        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
+        return status;
+    }
+    
+    // Step 2: Set up higher half paging (including identity mapping for low memory)
+    Print(L"Setting up higher half kernel paging...\r\n");
+    setup_higher_half_paging(kernel_phys_addr, kernel_size_total);
     
     Print(L"About to exit boot services. Kernel entry: 0x%lx\r\n", elf_header->e_entry);
-    
-    // Exit boot services
+    Print(L"Trampoline at: 0x%lx\r\n", trampoline_addr);
+
+    // Step 3: Exit boot services
     status = uefi_call_wrapper(BS->ExitBootServices, 2, ImageHandle, map_key);
     if (EFI_ERROR(status)) {
         // Try one more time in case the memory map changed
@@ -447,12 +598,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         }
     }
     
-    // Don't enable custom paging for now - use UEFI's paging
-    // enable_paging();
+    // After ExitBootServices, UEFI services are no longer available
     
-    // Jump to kernel entry point
-    kernel_entry = (kernel_entry_t)elf_header->e_entry;
-    kernel_entry(&fb_info);
+    // Step 4: Call the copied trampoline function in low memory
+    // The trampoline will:
+    // - Load CR3 with our page tables  
+    // - Jump to the kernel's higher half virtual address
+    trampoline_func_t trampoline = (trampoline_func_t)trampoline_addr;
+    trampoline(elf_header->e_entry, &fb_info, PML4_ADDRESS);
     
     // Should never reach here
     return EFI_SUCCESS;

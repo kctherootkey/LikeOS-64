@@ -11,7 +11,7 @@
 #define PAGE_ALIGN(addr)        ((addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
 #define PAGE_ALIGN_DOWN(addr)   (addr & ~(PAGE_SIZE - 1))
 #define PAGES_PER_BITMAP_ENTRY  32          // 32 pages per uint32_t
-#define KERNEL_HEAP_START       0x200000    // 2MB - start of kernel heap
+#define KERNEL_HEAP_START       0xFFFFFFFF80200000ULL    // Higher half + 2MB - start of kernel heap
 #define KERNEL_HEAP_SIZE        0x800000    // 8MB initial heap size
 
 // Page flags for virtual memory

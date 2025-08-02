@@ -26,7 +26,7 @@ void KiSystemStartup(void) {
     // Print our boot message using kprintf
     kprintf("LikeOS-64 Kernel v1.0\n");
     kprintf("64-bit Long Mode Active\n");
-    kprintf("Kernel loaded successfully at address 0x%p\n", (void*)0x100000);
+    kprintf("Higher Half Kernel loaded at virtual address 0x%p\n", (void*)KiSystemStartup);
     
     // Set colored output
     console_set_color(10, 0); // Light Green on Black

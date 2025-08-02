@@ -24,7 +24,7 @@ EFI_LDS = /usr/lib/elf_x86_64_efi.lds
 
 # Compiler flags for kernel
 KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
-                -fno-stack-protector -mno-red-zone -fno-pic -Wall -Wextra \
+                -fno-stack-protector -mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
                 -I$(INCLUDE_DIR)
 
 # Compiler flags for UEFI bootloader
@@ -91,13 +91,16 @@ $(KERNEL_ELF): $(KERNEL_OBJS) kernel.lds | $(BUILD_DIR)
 	@echo "LikeOS-64 ELF64 kernel built: $(KERNEL_ELF)"
 
 # Build UEFI bootloader
-$(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c | $(BUILD_DIR)
+$(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/trampoline.S | $(BUILD_DIR)
 	@echo "Building UEFI bootloader..."
-	# Compile bootloader
+	# Compile bootloader C code
 	$(GCC) $(UEFI_CFLAGS) -c $(BOOT_DIR)/bootloader.c -o $(BUILD_DIR)/bootloader.o
 	
+	# Assemble trampoline code
+	$(GCC) $(UEFI_CFLAGS) -c $(BOOT_DIR)/trampoline.S -o $(BUILD_DIR)/trampoline.o
+	
 	# Link as shared object
-	$(LD) $(UEFI_LDFLAGS) $(EFI_LIBS) $(BUILD_DIR)/bootloader.o \
+	$(LD) $(UEFI_LDFLAGS) $(EFI_LIBS) $(BUILD_DIR)/bootloader.o $(BUILD_DIR)/trampoline.o \
 		-o $(BUILD_DIR)/bootloader.so \
 		/usr/lib/libgnuefi.a /usr/lib/libefi.a
 	
