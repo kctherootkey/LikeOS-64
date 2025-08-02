@@ -173,7 +173,7 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
     
     // Calculate how much virtual memory we need to map
     // We need to cover at least 0xFFFFFFFF80A00000 which is 0xA00000 (10MB) above kernel base
-    UINT64 min_virtual_size = 11 * 1024 * 1024; // 11MB to be safe
+    UINT64 min_virtual_size = 64 * 1024 * 1024; // 11MB to be safe
     UINT64 total_pages_needed = min_virtual_size / 4096; // Convert to 4KB pages
     
     Print(L"Mapping %lu MB (%lu pages) of virtual memory starting at 0x%lx...\r\n", 
