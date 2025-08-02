@@ -20,7 +20,7 @@ static void my_memset(void *dest, int val, size_t len) {
 }
 
 // External assembly functions
-extern void idt_flush(uint32_t);
+extern void idt_flush(uint64_t);
 extern void irq0();
 extern void irq1();
 extern void irq2();
@@ -149,6 +149,9 @@ void idt_init() {
     idt_desc.limit = sizeof(idt) - 1;
     idt_desc.base = (uint64_t)&idt;
     
+    kprintf("Setting up IDT: base=0x%p, limit=0x%04X\n", (void*)idt_desc.base, idt_desc.limit);
+    kprintf("IDT table address: 0x%p, size: %zu bytes\n", (void*)&idt, sizeof(idt));
+    
     // Clear IDT
     for (int i = 0; i < IDT_ENTRIES; i++) {
         idt_set_entry(i, 0, 0, 0);
@@ -207,7 +210,15 @@ void idt_init() {
     idt_set_entry(47, (uint64_t)irq15, 0x08, 0x8E);
     
     // Load IDT
+    kprintf("About to load IDT: descriptor at 0x%p\n", (void*)&idt_desc);
+    kprintf("Descriptor contents: base=0x%p, limit=0x%04X\n", (void*)idt_desc.base, idt_desc.limit);
+    
     idt_flush((uint64_t)&idt_desc);
+    
+    // Verify IDT is loaded immediately after flush
+    struct idt_descriptor current_idt;
+    __asm__ volatile ("sidt %0" : "=m"(current_idt));
+    kprintf("IDT loaded: base=0x%p, limit=0x%04X\n", (void*)current_idt.base, current_idt.limit);
     
     kprintf("IDT initialized\n");
 }
@@ -363,6 +374,8 @@ void interrupts_init() {
 
 // Initialize TSS
 void tss_init() {
+    kprintf("Initializing TSS...\n");
+    
     // Clear TSS structure
     my_memset(&tss, 0, sizeof(tss));
     
@@ -372,7 +385,28 @@ void tss_init() {
     // Set I/O permission bitmap offset (no I/O bitmap)
     tss.iopb_offset = sizeof(tss);
     
-    kprintf("TSS initialized, interrupt stack at 0x%p\n", (void*)tss.rsp0);
+    kprintf("  TSS structure at: 0x%p\n", &tss);
+    kprintf("  TSS size: %lu bytes\n", sizeof(tss));
+    kprintf("  Interrupt stack at: 0x%p\n", (void*)tss.rsp0);
+    kprintf("  Stack size: %lu bytes\n", sizeof(interrupt_stack));
+    
+    // Verify addresses are within mapped memory range
+    uint64_t tss_addr = (uint64_t)&tss;
+    uint64_t stack_addr = (uint64_t)interrupt_stack;
+    
+    if (tss_addr >= 0xFFFFFFFF80000000 && tss_addr < 0xFFFFFFFF80000000 + (11 * 1024 * 1024)) {
+        kprintf("  TSS address is within mapped kernel space ✓\n");
+    } else {
+        kprintf("  WARNING: TSS address may be outside mapped memory!\n");
+    }
+    
+    if (stack_addr >= 0xFFFFFFFF80000000 && stack_addr < 0xFFFFFFFF80000000 + (11 * 1024 * 1024)) {
+        kprintf("  Interrupt stack is within mapped kernel space ✓\n");
+    } else {
+        kprintf("  WARNING: Interrupt stack may be outside mapped memory!\n");
+    }
+    
+    kprintf("TSS initialized successfully\n");
 }
 
 // Install TSS in GDT

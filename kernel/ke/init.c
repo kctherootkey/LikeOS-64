@@ -38,7 +38,8 @@ void KiSystemStartup(void) {
     // Initialize interrupt system
     kprintf("\nInitializing interrupt system...\n");
     interrupts_init();
-        
+
+    kprintf("Interrupt system initialized successfully\n");
     // Initialize memory management subsystem
     kprintf("\nInitializing Memory Management Subsystem...\n");
     MmDetectMemory();

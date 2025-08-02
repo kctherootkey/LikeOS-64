@@ -68,16 +68,16 @@ void gdt_init() {
     gdt_set_gate(0, 0, 0, 0, 0);
     
     // Kernel code segment
-    gdt_set_gate(1, 0, 0xFFFFFFFF, 0x9A, 0xAF);  // AF = Long mode, 4KB granularity
+    gdt_set_gate(1, 0, 0xFFFFF, 0x9A, 0xAF);  // AF = Long mode, 4KB granularity
     
     // Kernel data segment 
-    gdt_set_gate(2, 0, 0xFFFFFFFF, 0x92, 0xCF);
+    gdt_set_gate(2, 0, 0xFFFFF, 0x92, 0xCF);
     
     // User code segment
-    gdt_set_gate(3, 0, 0xFFFFFFFF, 0xFA, 0xAF);
+    gdt_set_gate(3, 0, 0xFFFFF, 0xFA, 0xAF);
     
     // User data segment
-    gdt_set_gate(4, 0, 0xFFFFFFFF, 0xF2, 0xCF);
+    gdt_set_gate(4, 0, 0xFFFFF, 0xF2, 0xCF);
     
     // TSS entry - entries 5 and 6 (128-bit TSS descriptor)
     gdt_set_gate(5, 0, 0, 0, 0);  // Will be set up later
