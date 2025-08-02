@@ -93,4 +93,7 @@ uint64_t* MmGetPageTable(uint64_t virtual_addr, bool create);
 void MmFlushTLB(uint64_t virtual_addr);
 void MmFlushAllTLB(void);
 
+// External linker symbols
+extern char kernel_end[];
+
 #endif // _KERNEL_MEMORY_H_

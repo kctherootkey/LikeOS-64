@@ -136,16 +136,31 @@ void MmInitializePhysicalMemory(uint64_t memory_size) {
     kprintf("Initializing Physical Memory Manager...\n");
     
     // Calculate memory layout
-    mm_state.memory_start = 0x100000; // 1MB - after kernel
-    mm_state.memory_end = memory_size;
+    // Get kernel end virtual address and convert to physical
+    uint64_t kernel_end_virt = (uint64_t)kernel_end;
+    uint64_t kernel_end_phys = MmGetPhysicalAddress(kernel_end_virt);
+    
+    if (kernel_end_phys == 0) {
+        // Fallback: assume identity mapping offset
+        uint64_t kernel_virt_base = 0xFFFFFFFF80000000ULL;
+        kernel_end_phys = kernel_end_virt - kernel_virt_base;
+        kprintf("  Using fallback physical address calculation\n");
+    }
+    
+    // Start manageable memory after the kernel, aligned to page boundary
+    mm_state.memory_start = PAGE_ALIGN(kernel_end_phys);
+    mm_state.memory_end = mm_state.memory_start + memory_size;
     mm_state.total_pages = (mm_state.memory_end - mm_state.memory_start) / PAGE_SIZE;
     mm_state.bitmap_size = PAGE_ALIGN((mm_state.total_pages + 7) / 8);
     
     // Place bitmap after kernel heap area
     mm_state.physical_bitmap = (uint32_t*)(KERNEL_HEAP_START + KERNEL_HEAP_SIZE);
     
-    kprintf("  Memory range: 0x%p - 0x%p\n", 
-           (void*)mm_state.memory_start, (void*)mm_state.memory_end);
+    kprintf("  Kernel end virtual: 0x%p\n", kernel_end);
+    kprintf("  Kernel end physical: 0x%p\n", (void*)kernel_end_phys);
+    kprintf("  Memory range: 0x%p - 0x%p (%lu MB)\n", 
+           (void*)mm_state.memory_start, (void*)mm_state.memory_end,
+           (mm_state.memory_end - mm_state.memory_start) / (1024*1024));
     kprintf("  Total pages: %d\n", mm_state.total_pages);
     kprintf("  Heap: 0x%p - 0x%p\n", 
            (void*)KERNEL_HEAP_START, (void*)(KERNEL_HEAP_START + KERNEL_HEAP_SIZE));
@@ -167,31 +182,26 @@ void MmInitializePhysicalMemory(uint64_t memory_size) {
 
 // Reserve kernel memory areas
 void MmReserveKernelMemory(void) {
-    // Reserve kernel + heap areas (from 1MB to heap end)
-    uint64_t reserved_pages = (KERNEL_HEAP_START + KERNEL_HEAP_SIZE - mm_state.memory_start) / PAGE_SIZE;
-    
-    for (uint64_t i = 0; i < reserved_pages; i++) {
-        set_page_bit(i);
-        mm_state.free_pages--;
-    }
-    
-    // Reserve bitmap area
-    uint64_t bitmap_start_page = ((uint64_t)mm_state.physical_bitmap - mm_state.memory_start) / PAGE_SIZE;
+    // Reserve kernel heap area (virtual heap area doesn't consume physical pages here)
+    // The bitmap is what we need to reserve
+    uint64_t bitmap_start_page = ((uint64_t)mm_state.physical_bitmap - KERNEL_HEAP_START) / PAGE_SIZE;
     uint64_t bitmap_pages = mm_state.bitmap_size / PAGE_SIZE + 1;
     
+    // Note: We don't reserve the heap area in physical memory since it's in virtual space
+    // and will be mapped as needed
+    
     for (uint64_t i = 0; i < bitmap_pages; i++) {
-        set_page_bit(bitmap_start_page + i);
-        if (!is_page_allocated(bitmap_start_page + i)) {
-            mm_state.free_pages--; // Only decrement if not already reserved
+        if (bitmap_start_page + i < mm_state.total_pages) {
+            set_page_bit(bitmap_start_page + i);
+            mm_state.free_pages--;
         }
     }
     
     kprintf("  Reserved areas:\n");
-    kprintf("    Kernel: 0x100000 - 0x%p\n", (void*)KERNEL_HEAP_START);
-    kprintf("    Heap:   0x%p - 0x%p (%d MB)\n",
-           (void*)KERNEL_HEAP_START, (void*)(KERNEL_HEAP_START + KERNEL_HEAP_SIZE),
-           KERNEL_HEAP_SIZE / (1024*1024));
-    kprintf("  Total reserved: %d pages\n", reserved_pages + bitmap_pages);
+    kprintf("    Kernel: Virtual space (heap at 0x%p)\n", (void*)KERNEL_HEAP_START);
+    kprintf("    Bitmap: %d pages starting at virtual 0x%p\n", 
+           bitmap_pages, mm_state.physical_bitmap);
+    kprintf("  Total reserved: %d pages\n", bitmap_pages);
 }
 
 // Allocate a physical page

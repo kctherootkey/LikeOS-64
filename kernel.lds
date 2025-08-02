@@ -24,6 +24,8 @@ SECTIONS
         *(COMMON)
     }
     
+    kernel_end = .;
+    
     /DISCARD/ : {
         *(.note.gnu.property)
         *(.comment)

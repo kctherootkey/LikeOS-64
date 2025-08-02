@@ -19,14 +19,6 @@ void kernel_main(framebuffer_info_t* fb_info) {
     KiSystemStartup();
 }
 
-// Utility functions
-static void my_memset(void* dest, int val, size_t len) {
-    uint8_t* ptr = (uint8_t*)dest;
-    while (len--) {
-        *ptr++ = val;
-    }
-}
-
 // Kernel Executive entry point
 void KiSystemStartup(void) {
     // Console is already initialized by kernel_main()
@@ -36,10 +28,6 @@ void KiSystemStartup(void) {
     kprintf("64-bit Long Mode Active\n");
     kprintf("Higher Half Kernel loaded at virtual address 0x%p\n", (void*)KiSystemStartup);
     
-    my_memset((void*)0xffffffff80a00000, 'A', 1);
-
-    for(;;) {__asm__ volatile ("hlt");}
-
     // Set colored output
     console_set_color(10, 0); // Light Green on Black
     kprintf("\nKernel initialization complete!\n");
@@ -55,7 +43,7 @@ void KiSystemStartup(void) {
     kprintf("\nInitializing Memory Management Subsystem...\n");
     MmDetectMemory();
 
-    MmInitializePhysicalMemory(256 * 1024 * 1024); // 256MB minimum requirement
+    MmInitializePhysicalMemory(32 * 1024 * 1024); // 32MB minimum requirement
 
     MmInitializeVirtualMemory();
     MmInitializeHeap();
@@ -71,7 +59,7 @@ void KiSystemStartup(void) {
     kfree(test_ptr1);
     kfree(test_ptr2);
     kprintf("  Test blocks freed successfully\n");
-    
+
     // Initialize keyboard
     keyboard_init();
     
