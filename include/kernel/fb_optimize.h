@@ -12,7 +12,6 @@
 #define CPU_FEATURE_SSE4_1  (1 << 2)
 #define CPU_FEATURE_SSE4_2  (1 << 3)
 #define CPU_FEATURE_MTRR    (1 << 4)
-#define CPU_FEATURE_PAT     (1 << 5)
 
 // MTRR types
 #define MTRR_TYPE_WB        0x06    // Write-Back
@@ -64,7 +63,6 @@ const char* cpu_features_to_string(uint32_t features);
 
 // Memory type configuration
 int configure_write_combining_mtrr(uint64_t fb_base, uint64_t fb_size);
-int configure_write_combining_pat(uint64_t fb_base, uint64_t fb_size);
 int verify_write_combining(uint64_t fb_base);
 
 // Double buffering operations

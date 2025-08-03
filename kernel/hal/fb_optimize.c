@@ -96,11 +96,6 @@ uint32_t detect_cpu_features(void) {
         features |= CPU_FEATURE_MTRR;
     }
     
-    // Check PAT support (bit 16 in EDX)
-    if (edx & (1 << 16)) {
-        features |= CPU_FEATURE_PAT;
-    }
-    
     return features;
 }
 
@@ -114,7 +109,6 @@ const char* cpu_features_to_string(uint32_t features) {
     if (features & CPU_FEATURE_SSE4_1) kstrncat(feature_str, "SSE4.1 ", sizeof(feature_str));
     if (features & CPU_FEATURE_SSE4_2) kstrncat(feature_str, "SSE4.2 ", sizeof(feature_str));
     if (features & CPU_FEATURE_MTRR) kstrncat(feature_str, "MTRR ", sizeof(feature_str));
-    if (features & CPU_FEATURE_PAT) kstrncat(feature_str, "PAT ", sizeof(feature_str));
     
     return feature_str;
 }
@@ -298,11 +292,6 @@ int fb_optimize_init(framebuffer_info_t* fb_info) {
         if (configure_write_combining_mtrr(fb_base, fb_size) == 0) {
             g_double_buffer.write_combining_enabled = 1;
             kprintf("  Write-combining enabled via MTRR\n");
-        } else if (g_double_buffer.cpu_features & CPU_FEATURE_PAT) {
-            if (configure_write_combining_pat(fb_base, fb_size) == 0) {
-                g_double_buffer.write_combining_enabled = 1;
-                kprintf("  Write-combining enabled via PAT\n");
-            }
         }
     }
     
@@ -736,50 +725,6 @@ int configure_write_combining_mtrr(uint64_t fb_base, uint64_t fb_size) {
     );
     
     kprintf("    MTRR %d configured successfully\n", mtrr_index);
-    return 0;
-}
-
-// Configure write-combining using PAT
-int configure_write_combining_pat(uint64_t fb_base, uint64_t fb_size) {
-    (void)fb_base;  // Suppress unused parameter warning
-    (void)fb_size;  // Suppress unused parameter warning
-    
-    if (!(g_double_buffer.cpu_features & CPU_FEATURE_PAT)) {
-        return -1;
-    }
-    
-    kprintf("  Configuring PAT for write-combining...\n");
-    
-    // Read current PAT MSR
-    uint64_t pat_msr = read_msr(0x277);  // PAT MSR
-    kprintf("    Current PAT: 0x%llx\n", pat_msr);
-    
-    // PAT entries are 8 bits each, we'll use PAT4 (index 4) for WC
-    // PAT layout: PAT0|PAT1|PAT2|PAT3|PAT4|PAT5|PAT6|PAT7
-    uint64_t new_pat = pat_msr;
-    new_pat &= ~(0xFFULL << 32);  // Clear PAT4
-    new_pat |= ((uint64_t)MTRR_TYPE_WC << 32);  // Set PAT4 to WC
-    
-    // Update PAT MSR
-    write_msr(0x277, new_pat);
-    
-    kprintf("    PAT updated: 0x%llx\n", new_pat);
-    
-    // Flush caches and TLB
-    __asm__ volatile (
-        "wbinvd\n\t"
-        "mov %%cr3, %%rax\n\t"
-        "mov %%rax, %%cr3"
-        :
-        :
-        : "rax", "memory"
-    );
-    
-    // Note: The actual page table entries would need to be updated to use PAT4
-    // This is a simplified implementation - full PAT support would require
-    // modifying the page tables to set the PAT bit appropriately
-    
-    kprintf("    PAT configured (page table updates needed)\n");
     return 0;
 }
 
