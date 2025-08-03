@@ -15,6 +15,9 @@ void kernel_main(framebuffer_info_t* fb_info) {
     // Initialize console system with framebuffer info
     console_init(fb_info);
     
+    // Initialize framebuffer optimization after console is ready
+    console_init_fb_optimization();
+    
     // Call the main system initialization
     KiSystemStartup();
 }
@@ -24,10 +27,10 @@ void KiSystemStartup(void) {
     // Console is already initialized by kernel_main()
     
     // Print our boot message using kprintf
-    kprintf("LikeOS-64 Kernel v1.0\n");
+    kprintf("\nLikeOS-64 Kernel v1.0\n");
     kprintf("64-bit Long Mode Active\n");
     kprintf("Higher Half Kernel loaded at virtual address 0x%p\n", (void*)KiSystemStartup);
-    
+
     // Set colored output
     console_set_color(10, 0); // Light Green on Black
     kprintf("\nKernel initialization complete!\n");
@@ -40,6 +43,7 @@ void KiSystemStartup(void) {
     interrupts_init();
 
     kprintf("Interrupt system initialized successfully\n");
+    
     // Initialize memory management subsystem
     kprintf("\nInitializing Memory Management Subsystem...\n");
     MmDetectMemory();
@@ -51,6 +55,10 @@ void KiSystemStartup(void) {
     
     // Print initial memory statistics
     MmPrintMemoryStats();
+
+    // Display framebuffer optimization status
+    kprintf("\nFramebuffer Optimization Status:\n");
+    console_show_fb_status();
 
     // Test memory allocation
     kprintf("Testing memory allocation...\n");

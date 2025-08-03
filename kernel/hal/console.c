@@ -2,6 +2,7 @@
 // Framebuffer-based console and printf implementation for 64-bit kernel
 
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/fb_optimize.h"
 
 #define SIZE_MAX ((size_t)-1)
 #define NULL ((void*)0)
@@ -187,15 +188,21 @@ static uint32_t vga_to_rgb(uint8_t vga_color) {
     return vga_palette[vga_color & 0x0F];
 }
 
-// Draw a single pixel (32-bit BGRA format)
+// Draw a single pixel (32-bit BGRA format) - now uses optimized framebuffer
 static void set_pixel(uint32_t x, uint32_t y, uint32_t color) {
     if (!fb_info || !fb_info->framebuffer_base) return;
     if (x >= fb_info->horizontal_resolution || y >= fb_info->vertical_resolution) return;
     
-    uint32_t* framebuffer = (uint32_t*)fb_info->framebuffer_base;
-    uint32_t pixel_offset = y * fb_info->pixels_per_scanline + x;
-    
-    framebuffer[pixel_offset] = color;
+    // Use optimized framebuffer operations if available
+    fb_double_buffer_t* fb_opt = get_fb_double_buffer();
+    if (fb_opt) {
+        fb_set_pixel(x, y, color);
+    } else {
+        // Fallback to direct framebuffer access
+        uint32_t* framebuffer = (uint32_t*)fb_info->framebuffer_base;
+        uint32_t pixel_offset = y * fb_info->pixels_per_scanline + x;
+        framebuffer[pixel_offset] = color;
+    }
 }
 
 // Draw a character at specific position
@@ -240,16 +247,38 @@ void console_init(framebuffer_info_t* fb) {
     console_clear();
 }
 
+// Initialize framebuffer optimization system (call after console_init)
+void console_init_fb_optimization(void) {
+    if (!fb_info) {
+        kprintf("Console: No framebuffer available for optimization\n");
+        return;
+    }
+    
+    // Initialize framebuffer optimization system
+    if (fb_optimize_init(fb_info) == 0) {
+        kprintf("Console: Framebuffer optimization enabled\n");
+    } else {
+        kprintf("Console: Using direct framebuffer (no optimization)\n");
+    }
+}
+
 // Clear the entire screen
 void console_clear(void) {
     if (!fb_info || !fb_info->framebuffer_base) return;
     
-    // Clear framebuffer to background color
-    uint32_t* framebuffer = (uint32_t*)fb_info->framebuffer_base;
-    uint32_t total_pixels = fb_info->horizontal_resolution * fb_info->vertical_resolution;
-    
-    for (uint32_t i = 0; i < total_pixels; i++) {
-        framebuffer[i] = bg_color;
+    fb_double_buffer_t* fb_opt = get_fb_double_buffer();
+    if (fb_opt) {
+        // Use optimized fill operation
+        fb_fill_rect(0, 0, fb_info->horizontal_resolution, fb_info->vertical_resolution, bg_color);
+        fb_flush_dirty_regions();  // Immediately update the screen
+    } else {
+        // Fallback to direct framebuffer access
+        uint32_t* framebuffer = (uint32_t*)fb_info->framebuffer_base;
+        uint32_t total_pixels = fb_info->horizontal_resolution * fb_info->vertical_resolution;
+        
+        for (uint32_t i = 0; i < total_pixels; i++) {
+            framebuffer[i] = bg_color;
+        }
     }
     
     cursor_x = 0;
@@ -260,26 +289,38 @@ void console_clear(void) {
 static void console_scroll_up(void) {
     if (!fb_info || !fb_info->framebuffer_base) return;
     
-    uint32_t* framebuffer = (uint32_t*)fb_info->framebuffer_base;
     uint32_t width = fb_info->horizontal_resolution;
     uint32_t height = fb_info->vertical_resolution;
-    uint32_t pixels_per_line = fb_info->pixels_per_scanline;
-    
-    // Calculate how many pixels to scroll (one character line)
     uint32_t scroll_lines = CHAR_HEIGHT;
     
-    // Move all scan lines up by scroll_lines using memory copy for efficiency
-    for (uint32_t y = scroll_lines; y < height; y++) {
-        uint32_t* src_line = &framebuffer[y * pixels_per_line];
-        uint32_t* dst_line = &framebuffer[(y - scroll_lines) * pixels_per_line];
-        kmemcpy(dst_line, src_line, width * sizeof(uint32_t));
-    }
-    
-    // Clear the bottom scroll_lines rows with background color
-    for (uint32_t y = height - scroll_lines; y < height; y++) {
-        uint32_t* line = &framebuffer[y * pixels_per_line];
-        for (uint32_t x = 0; x < width; x++) {
-            line[x] = bg_color;
+    fb_double_buffer_t* fb_opt = get_fb_double_buffer();
+    if (fb_opt) {
+        // Use optimized copy operation
+        fb_copy_rect(0, 0, 0, scroll_lines, width, height - scroll_lines);
+        
+        // Clear the bottom area
+        fb_fill_rect(0, height - scroll_lines, width, scroll_lines, bg_color);
+        
+        // Flush changes to screen
+        fb_flush_dirty_regions();
+    } else {
+        // Fallback to direct framebuffer access
+        uint32_t* framebuffer = (uint32_t*)fb_info->framebuffer_base;
+        uint32_t pixels_per_line = fb_info->pixels_per_scanline;
+        
+        // Move all scan lines up by scroll_lines using memory copy for efficiency
+        for (uint32_t y = scroll_lines; y < height; y++) {
+            uint32_t* src_line = &framebuffer[y * pixels_per_line];
+            uint32_t* dst_line = &framebuffer[(y - scroll_lines) * pixels_per_line];
+            kmemcpy(dst_line, src_line, width * sizeof(uint32_t));
+        }
+        
+        // Clear the bottom scroll_lines rows with background color
+        for (uint32_t y = height - scroll_lines; y < height; y++) {
+            uint32_t* line = &framebuffer[y * pixels_per_line];
+            for (uint32_t x = 0; x < width; x++) {
+                line[x] = bg_color;
+            }
         }
     }
     
@@ -336,6 +377,12 @@ void console_putchar(char c) {
     
     draw_char(c, pixel_x, pixel_y, fg_color, bg_color);
     
+    // Flush to screen if using optimized framebuffer
+    fb_double_buffer_t* fb_opt = get_fb_double_buffer();
+    if (fb_opt) {
+        fb_flush_dirty_regions();
+    }
+    
     // Advance cursor
     cursor_x++;
     if (cursor_x >= max_cols) {
@@ -383,6 +430,22 @@ void console_backspace(void) {
     uint32_t pixel_y = cursor_y * CHAR_HEIGHT;
     
     draw_char(' ', pixel_x, pixel_y, fg_color, bg_color);
+    
+    // Flush to screen if using optimized framebuffer
+    fb_double_buffer_t* fb_opt = get_fb_double_buffer();
+    if (fb_opt) {
+        fb_flush_dirty_regions();
+    }
+}
+
+// Show framebuffer optimization status
+void console_show_fb_status(void) {
+    fb_print_optimization_status();
+}
+
+// Show framebuffer performance statistics
+void console_show_fb_stats(void) {
+    fb_print_performance_stats();
 }
 
 // String utilities for printf
@@ -390,6 +453,12 @@ size_t kstrlen(const char* str) {
     size_t len = 0;
     while (str[len]) len++;
     return len;
+}
+
+char* kstrcpy(char* dest, const char* src) {
+    char* orig_dest = dest;
+    while ((*dest++ = *src++));
+    return orig_dest;
 }
 
 int kstrncmp(const char* s1, const char* s2, size_t n) {

@@ -25,14 +25,19 @@ typedef struct {
     uint32_t bytes_per_pixel;
 } framebuffer_info_t;
 
-// Console interface (now framebuffer-based)
+// Console interface (now framebuffer-based with optimization)
 void console_init(framebuffer_info_t* fb_info);
+void console_init_fb_optimization(void);
 void console_clear(void);
 void console_putchar(char c);
 void console_puts(const char* str);
 void console_set_color(uint8_t fg, uint8_t bg);
 void console_scroll(void);
 void console_backspace(void);
+
+// Framebuffer optimization interface
+void console_show_fb_status(void);
+void console_show_fb_stats(void);
 
 // Printf family functions
 typedef __builtin_va_list va_list;
