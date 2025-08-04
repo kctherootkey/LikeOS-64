@@ -3,6 +3,7 @@
 
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/fb_optimize.h"
+#include "../../include/kernel/mouse.h"
 
 #define SIZE_MAX ((size_t)-1)
 #define NULL ((void*)0)
@@ -289,6 +290,9 @@ void console_clear(void) {
 static void console_scroll_up(void) {
     if (!fb_info || !fb_info->framebuffer_base) return;
     
+    // Hide mouse cursor before scrolling to prevent artifacts
+    mouse_show_cursor(0);
+    
     uint32_t width = fb_info->horizontal_resolution;
     uint32_t height = fb_info->vertical_resolution;
     uint32_t scroll_lines = CHAR_HEIGHT;
@@ -327,6 +331,9 @@ static void console_scroll_up(void) {
     // Move cursor to last line
     cursor_y = max_rows - 1;
     cursor_x = 0;
+    
+    // Show mouse cursor again after scrolling is complete
+    mouse_show_cursor(1);
 }
 
 // Set console colors (VGA compatibility)

@@ -326,11 +326,7 @@ void mouse_init(void) {
     }
     
     mouse_state.enabled = 1;
-    
-    // Draw initial cursor
-    mouse_draw_cursor(mouse_state.x, mouse_state.y);
-    fb_flush_dirty_regions();
-    
+        
     kprintf("Mouse initialized successfully\n");
     kprintf("  Position: (%d, %d)\n", mouse_state.x, mouse_state.y);
     kprintf("  Screen size: %dx%d\n", mouse_state.screen_width, mouse_state.screen_height);
