@@ -187,10 +187,8 @@ static void mouse_process_packet(void) {
     // Handle scroll wheel for IntelliMouse
     if (mouse_state.has_scroll_wheel && mouse_state.packet_size == 4) {
         raw_z = (int8_t)mouse_state.packet_buffer[3];
-        mouse_state.scroll_delta = raw_z & 0x0F;  // Lower 4 bits
-        if (mouse_state.scroll_delta & 0x08) {
-            mouse_state.scroll_delta |= 0xF0;  // Sign extend
-        }
+        // For IntelliMouse, use the full Z byte without masking
+        mouse_state.scroll_delta = raw_z;
     }
     
     // Process button states
@@ -209,9 +207,8 @@ static void mouse_process_packet(void) {
     }
     
     // Apply sensitivity and update position
-    // raw_x and raw_y are now properly signed 8-bit values (-128 to +127)
-    mouse_state.delta_x = (raw_x * mouse_state.sensitivity) / 4;
-    mouse_state.delta_y = -(raw_y * mouse_state.sensitivity) / 4;  // Invert Y axis
+    mouse_state.delta_x = (raw_x * mouse_state.sensitivity) / 2;  // Less division for IntelliMouse
+    mouse_state.delta_y = -(raw_y * mouse_state.sensitivity) / 2;  // Less division for IntelliMouse
     
     // Store last position for cursor clearing
     mouse_state.last_x = mouse_state.x;
