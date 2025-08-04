@@ -78,31 +78,42 @@ static void mouse_write_command(uint8_t cmd, uint8_t data) {
 static uint8_t mouse_detect_type(void) {
     uint8_t response;
     
+    kprintf("  Attempting mouse reset...\n");
     // Reset mouse
     mouse_write_command(MOUSE_CMD_RESET, 0xFF);
     response = mouse_read_data();  // Should be ACK
+    kprintf("  Reset ACK: 0x%02X\n", response);
     response = mouse_read_data();  // Should be 0xAA (self-test passed)
+    kprintf("  Self-test: 0x%02X\n", response);
     response = mouse_read_data();  // Should be 0x00 (device ID)
+    kprintf("  Device ID: 0x%02X\n", response);
     
     if (response != 0x00) {
         kprintf("  Mouse reset failed or not standard mouse\n");
         return MOUSE_TYPE_STANDARD;
     }
     
+    kprintf("  Attempting IntelliMouse detection sequence...\n");
     // Try to enable scroll wheel (IntelliMouse protocol)
     mouse_write_command(MOUSE_CMD_SET_SAMPLE_RATE, 200);
     response = mouse_read_data();  // ACK
+    kprintf("  Sample rate 200 ACK: 0x%02X\n", response);
     
     mouse_write_command(MOUSE_CMD_SET_SAMPLE_RATE, 100);
     response = mouse_read_data();  // ACK
+    kprintf("  Sample rate 100 ACK: 0x%02X\n", response);
     
     mouse_write_command(MOUSE_CMD_SET_SAMPLE_RATE, 80);
     response = mouse_read_data();  // ACK
+    kprintf("  Sample rate 80 ACK: 0x%02X\n", response);
     
     // Get device ID after the sequence
+    kprintf("  Getting device ID after sequence...\n");
     mouse_write_command(MOUSE_CMD_GET_DEVICE_ID, 0xFF);
     response = mouse_read_data();  // ACK
+    kprintf("  Get ID ACK: 0x%02X\n", response);
     response = mouse_read_data();  // Device ID
+    kprintf("  New Device ID: 0x%02X\n", response);
     
     if (response == MOUSE_TYPE_INTELLIMOUSE) {
         kprintf("  IntelliMouse detected (scroll wheel supported)\n");
@@ -176,11 +187,28 @@ static void mouse_process_packet(void) {
     int8_t raw_x = (int8_t)mouse_state.packet_buffer[1];  // Cast to signed 8-bit
     int8_t raw_y = (int8_t)mouse_state.packet_buffer[2];  // Cast to signed 8-bit
     int8_t raw_z = 0;
-    
+        
     // Check if this is a valid packet
     if (!(flags & 0x08)) {
         // Bit 3 should always be set in the first byte
-        mouse_state.packet_index = 0;
+        
+        // Try to resynchronize by looking for a valid first byte in the buffer
+        int sync_found = 0;
+        for (int i = 1; i < mouse_state.packet_size; i++) {
+            if (mouse_state.packet_buffer[i] & 0x08) {
+                // Shift buffer left to align with the valid flags byte
+                for (int j = 0; j < mouse_state.packet_size - i; j++) {
+                    mouse_state.packet_buffer[j] = mouse_state.packet_buffer[j + i];
+                }
+                mouse_state.packet_index = mouse_state.packet_size - i;
+                sync_found = 1;
+                break;
+            }
+        }
+        
+        if (!sync_found) {
+            mouse_state.packet_index = 0;
+        }
         return;
     }
     
@@ -189,6 +217,9 @@ static void mouse_process_packet(void) {
         raw_z = (int8_t)mouse_state.packet_buffer[3];
         // For IntelliMouse, use the full Z byte without masking
         mouse_state.scroll_delta = raw_z;
+        if (raw_z != 0) {
+            kprintf("Scroll wheel: raw_z=%d\n", raw_z);
+        }
     }
     
     // Process button states
@@ -209,7 +240,7 @@ static void mouse_process_packet(void) {
     // Apply sensitivity and update position
     mouse_state.delta_x = (raw_x * mouse_state.sensitivity) / 2;  // Less division for IntelliMouse
     mouse_state.delta_y = -(raw_y * mouse_state.sensitivity) / 2;  // Less division for IntelliMouse
-    
+        
     // Store last position for cursor clearing
     mouse_state.last_x = mouse_state.x;
     mouse_state.last_y = mouse_state.y;
@@ -320,6 +351,9 @@ void mouse_irq_handler(void) {
     if (mouse_state.expecting_ack) {
         if (data == MOUSE_ACK) {
             mouse_state.expecting_ack = 0;
+        } else {
+            // Stay silent
+            // kprintf("Expected ACK, got 0x%02X\n", data);
         }
         return;
     }
