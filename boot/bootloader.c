@@ -173,7 +173,7 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
     
     // Calculate how much virtual memory we need to map
     // We need to cover at least 0xFFFFFFFF80A00000 which is 0xA00000 (10MB) above kernel base
-    UINT64 min_virtual_size = 64 * 1024 * 1024; // 11MB to be safe
+    UINT64 min_virtual_size = 64 * 1024 * 1024; // 64MB to be safe
     UINT64 total_pages_needed = min_virtual_size / 4096; // Convert to 4KB pages
     
     Print(L"Mapping %lu MB (%lu pages) of virtual memory starting at 0x%lx...\r\n", 
@@ -290,7 +290,6 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
           kernel_virt, kernel_phys_addr, pages_mapped);
     Print(L"  Virtual memory covers: 0x%lx - 0x%lx (%lu MB)\r\n", 
           kernel_virt, kernel_virt + (pages_mapped * 4096), (pages_mapped * 4096) / (1024 * 1024));
-    Print(L"  Target address 0xFFFFFFFF80A00000 should now be accessible!\r\n");
 }
 
 // Allocate and setup trampoline below kernel space
@@ -560,8 +559,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         Elf64_Phdr *phdr = &program_headers[i];
         
         if (phdr->p_type == PT_LOAD) {
-            Print(L"Loading segment %d: vaddr=0x%lx, paddr=0x%lx, size=%ld\r\n", 
-                  i, phdr->p_vaddr, phdr->p_paddr, phdr->p_memsz);
+            Print(L"Loading segment %d: vaddr=0x%lx, size=%ld\r\n", 
+                  i, phdr->p_vaddr, phdr->p_memsz);
             
             // Allocate memory for this segment using AllocateAnyPages
             UINTN pages = (phdr->p_memsz + 4095) / 4096;

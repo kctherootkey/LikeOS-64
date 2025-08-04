@@ -29,7 +29,7 @@ void KiSystemStartup(void) {
     // Print our boot message using kprintf
     kprintf("\nLikeOS-64 Kernel v1.0\n");
     kprintf("64-bit Long Mode Active\n");
-    kprintf("Higher Half Kernel loaded at virtual address 0x%p\n", (void*)KiSystemStartup);
+    kprintf("Higher Half Kernel loaded at virtual address %p\n", (void*)KiSystemStartup);
 
     // Set colored output
     console_set_color(10, 0); // Light Green on Black
@@ -64,7 +64,7 @@ void KiSystemStartup(void) {
     kprintf("Testing memory allocation...\n");
     void* test_ptr1 = kalloc(1024);
     void* test_ptr2 = kalloc(2048);
-    kprintf("  Allocated test blocks: 0x%p (1KB), 0x%p (2KB)\n", test_ptr1, test_ptr2);
+    kprintf("  Allocated test blocks: %p (1KB), %p (2KB)\n", test_ptr1, test_ptr2);
     kfree(test_ptr1);
     kfree(test_ptr2);
     kprintf("  Test blocks freed successfully\n");

@@ -149,8 +149,8 @@ void idt_init() {
     idt_desc.limit = sizeof(idt) - 1;
     idt_desc.base = (uint64_t)&idt;
     
-    kprintf("Setting up IDT: base=0x%p, limit=0x%04X\n", (void*)idt_desc.base, idt_desc.limit);
-    kprintf("IDT table address: 0x%p, size: %zu bytes\n", (void*)&idt, sizeof(idt));
+    kprintf("Setting up IDT: base=%p, limit=0x%04X\n", (void*)idt_desc.base, idt_desc.limit);
+    kprintf("IDT table address: %p, size: %zu bytes\n", (void*)&idt, sizeof(idt));
     
     // Clear IDT
     for (int i = 0; i < IDT_ENTRIES; i++) {
@@ -210,15 +210,15 @@ void idt_init() {
     idt_set_entry(47, (uint64_t)irq15, 0x08, 0x8E);
     
     // Load IDT
-    kprintf("About to load IDT: descriptor at 0x%p\n", (void*)&idt_desc);
-    kprintf("Descriptor contents: base=0x%p, limit=0x%04X\n", (void*)idt_desc.base, idt_desc.limit);
+    kprintf("About to load IDT: descriptor at %p\n", (void*)&idt_desc);
+    kprintf("Descriptor contents: base=%p, limit=0x%04X\n", (void*)idt_desc.base, idt_desc.limit);
     
     idt_flush((uint64_t)&idt_desc);
     
     // Verify IDT is loaded immediately after flush
     struct idt_descriptor current_idt;
     __asm__ volatile ("sidt %0" : "=m"(current_idt));
-    kprintf("IDT loaded: base=0x%p, limit=0x%04X\n", (void*)current_idt.base, current_idt.limit);
+    kprintf("IDT loaded: base=%p, limit=0x%04X\n", (void*)current_idt.base, current_idt.limit);
     
     kprintf("IDT initialized\n");
 }
@@ -385,9 +385,9 @@ void tss_init() {
     // Set I/O permission bitmap offset (no I/O bitmap)
     tss.iopb_offset = sizeof(tss);
     
-    kprintf("  TSS structure at: 0x%p\n", &tss);
+    kprintf("  TSS structure at: %p\n", &tss);
     kprintf("  TSS size: %lu bytes\n", sizeof(tss));
-    kprintf("  Interrupt stack at: 0x%p\n", (void*)tss.rsp0);
+    kprintf("  Interrupt stack at: %p\n", (void*)tss.rsp0);
     kprintf("  Stack size: %lu bytes\n", sizeof(interrupt_stack));
     
     // Verify addresses are within mapped memory range
@@ -428,6 +428,6 @@ void idt_debug_entry(uint8_t num) {
     handler_addr |= ((uint64_t)idt[num].offset_mid) << 16;
     handler_addr |= ((uint64_t)idt[num].offset_high) << 32;
     
-    kprintf("  Entry %d: Handler=0x%p, Selector=0x%04x, Type=0x%02x\n", 
+    kprintf("  Entry %d: Handler=%p, Selector=0x%04x, Type=0x%02x\n", 
            num, (void*)handler_addr, idt[num].selector, idt[num].type_attr);
 }

@@ -156,17 +156,17 @@ void MmInitializePhysicalMemory(uint64_t memory_size) {
     // Place bitmap after kernel heap area
     mm_state.physical_bitmap = (uint32_t*)(KERNEL_HEAP_START + KERNEL_HEAP_SIZE);
     
-    kprintf("  Kernel end virtual: 0x%p\n", kernel_end);
-    kprintf("  Kernel end physical: 0x%p\n", (void*)kernel_end_phys);
-    kprintf("  Memory range: 0x%p - 0x%p (%lu MB)\n", 
+    kprintf("  Kernel end virtual: %p\n", kernel_end);
+    kprintf("  Kernel end physical: %p\n", (void*)kernel_end_phys);
+    kprintf("  Memory range: %p - %p (%lu MB)\n", 
            (void*)mm_state.memory_start, (void*)mm_state.memory_end,
            (mm_state.memory_end - mm_state.memory_start) / (1024*1024));
     kprintf("  Total pages: %d\n", mm_state.total_pages);
-    kprintf("  Heap: 0x%p - 0x%p\n", 
+    kprintf("  Heap: %p - %p\n", 
            (void*)KERNEL_HEAP_START, (void*)(KERNEL_HEAP_START + KERNEL_HEAP_SIZE));
-    kprintf("  Bitmap at: 0x%p (size: %d bytes)\n", 
+    kprintf("  Bitmap at: %p (size: %d bytes)\n", 
            mm_state.physical_bitmap, mm_state.bitmap_size);
-    kprintf("  Bitmap end: 0x%p\n", 
+    kprintf("  Bitmap end: %p\n", 
            (void*)((uint64_t)mm_state.physical_bitmap + mm_state.bitmap_size));
 
     // Clear bitmap (all pages free initially)
@@ -198,8 +198,8 @@ void MmReserveKernelMemory(void) {
     }
     
     kprintf("  Reserved areas:\n");
-    kprintf("    Kernel: Virtual space (heap at 0x%p)\n", (void*)KERNEL_HEAP_START);
-    kprintf("    Bitmap: %d pages starting at virtual 0x%p\n", 
+    kprintf("    Kernel: Virtual space (heap at %p)\n", (void*)KERNEL_HEAP_START);
+    kprintf("    Bitmap: %d pages starting at virtual %p\n", 
            bitmap_pages, mm_state.physical_bitmap);
     kprintf("  Total reserved: %d pages\n", bitmap_pages);
 }
@@ -326,8 +326,8 @@ void MmInitializeVirtualMemory(void) {
     mm_state.next_virtual_addr = KERNEL_HEAP_START + KERNEL_HEAP_SIZE + mm_state.bitmap_size;
     mm_state.next_virtual_addr = PAGE_ALIGN(mm_state.next_virtual_addr);
     
-    kprintf("  Page tables at: 0x%p\n", mm_state.pml4_table);
-    kprintf("  Next virtual address: 0x%p\n", (void*)mm_state.next_virtual_addr);
+    kprintf("  Page tables at: %p\n", mm_state.pml4_table);
+    kprintf("  Next virtual address: %p\n", (void*)mm_state.next_virtual_addr);
     
     kprintf("Virtual Memory Manager initialized\n");
 }
@@ -390,7 +390,7 @@ void MmInitializeHeap(void) {
     
     mm_state.free_list = mm_state.heap_start;
     
-    kprintf("  Heap range: 0x%p - 0x%p\n", mm_state.heap_start, mm_state.heap_end);
+    kprintf("  Heap range: %p - %p\n", mm_state.heap_start, mm_state.heap_end);
     kprintf("  Heap size: %d KB\n", mm_state.heap_size / 1024);
     
     kprintf("Kernel Heap Allocator initialized\n");
@@ -489,7 +489,7 @@ void kfree(void* ptr) {
     
     // Validate block
     if (block->magic != HEAP_MAGIC_ALLOCATED || block->is_free) {
-        kprintf("ERROR: Invalid free() call for address 0x%p\n", ptr);
+        kprintf("ERROR: Invalid free() call for address %p\n", ptr);
         return;
     }
     
@@ -593,7 +593,7 @@ bool MmValidateHeap(void) {
     while (current && (uint8_t*)current < (uint8_t*)mm_state.heap_end) {
         // Check magic numbers
         if (current->magic != HEAP_MAGIC_ALLOCATED && current->magic != HEAP_MAGIC_FREE) {
-            kprintf("ERROR: Invalid magic in heap block %d at 0x%p\n", block_count, current);
+            kprintf("ERROR: Invalid magic in heap block %d at %p\n", block_count, current);
             return false;
         }
         
@@ -626,7 +626,7 @@ void MmPrintHeapStats(void) {
     uint32_t allocated_blocks = 0;
     
     while (current && (uint8_t*)current < (uint8_t*)mm_state.heap_end && block_count < 20) {
-        kprintf("Block %d: 0x%p, size=%d, %s\n", 
+        kprintf("Block %d: %p, size=%d, %s\n", 
                block_count, current, current->size, 
                current->is_free ? "FREE" : "ALLOCATED");
         

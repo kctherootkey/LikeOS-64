@@ -273,7 +273,7 @@ int fb_optimize_init(framebuffer_info_t* fb_info) {
             return -1;
         }
         g_using_static_buffers = 0;
-        kprintf("  Back buffer dynamically allocated at: 0x%p\n", g_double_buffer.back_buffer);
+        kprintf("  Back buffer dynamically allocated at: %p\n", g_double_buffer.back_buffer);
     }
     
     // Always use static dirty regions array (small and fixed size)
@@ -583,8 +583,8 @@ void fb_print_optimization_status(void) {
     kprintf("=== Framebuffer Optimization Status ===\n");
     kprintf("Resolution: %dx%d (pitch: %d)\n", 
            g_double_buffer.width, g_double_buffer.height, g_double_buffer.pitch);
-    kprintf("Back buffer: 0x%p\n", g_double_buffer.back_buffer);
-    kprintf("Front buffer: 0x%p\n", g_double_buffer.front_buffer);
+    kprintf("Back buffer: %p\n", g_double_buffer.back_buffer);
+    kprintf("Front buffer: %p\n", g_double_buffer.front_buffer);
     kprintf("CPU Features: %s\n", cpu_features_to_string(g_double_buffer.cpu_features));
     kprintf("Write-combining: %s\n", g_double_buffer.write_combining_enabled ? "Enabled" : "Disabled");
     kprintf("SSE copying: %s\n", g_double_buffer.sse_copy_enabled ? "Enabled" : "Disabled");

@@ -625,6 +625,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
         // Parse length modifiers
         int is_long = 0;
         int is_long_long = 0;
+        int is_size_t = 0;
         if (*format == 'l') {
             format++;
             is_long = 1;
@@ -632,6 +633,9 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                 format++;
                 is_long_long = 1;
             }
+        } else if (*format == 'z') {
+            format++;
+            is_size_t = 1;
         }
         
         // Handle format specifiers
@@ -708,6 +712,8 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     value = va_arg(args, int64_t);
                 } else if (is_long) {
                     value = va_arg(args, long);
+                } else if (is_size_t) {
+                    value = (int64_t)va_arg(args, size_t);
                 } else {
                     value = va_arg(args, int);
                 }
@@ -760,6 +766,8 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     value = va_arg(args, uint64_t);
                 } else if (is_long) {
                     value = va_arg(args, unsigned long);
+                } else if (is_size_t) {
+                    value = va_arg(args, size_t);
                 } else {
                     value = va_arg(args, unsigned int);
                 }
@@ -785,6 +793,8 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     value = va_arg(args, uint64_t);
                 } else if (is_long) {
                     value = va_arg(args, unsigned long);
+                } else if (is_size_t) {
+                    value = va_arg(args, size_t);
                 } else {
                     value = va_arg(args, unsigned int);
                 }
@@ -813,6 +823,8 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     value = va_arg(args, uint64_t);
                 } else if (is_long) {
                     value = va_arg(args, unsigned long);
+                } else if (is_size_t) {
+                    value = va_arg(args, size_t);
                 } else {
                     value = va_arg(args, unsigned int);
                 }
@@ -840,6 +852,8 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     value = va_arg(args, uint64_t);
                 } else if (is_long) {
                     value = va_arg(args, unsigned long);
+                } else if (is_size_t) {
+                    value = va_arg(args, size_t);
                 } else {
                     value = va_arg(args, unsigned int);
                 }
