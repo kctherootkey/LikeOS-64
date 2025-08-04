@@ -77,10 +77,13 @@ void KiSystemStartup(void) {
     irq_enable(1);
 
     // Initialize mouse
-    //mouse_init();
+    mouse_init();
+    
+    // Enable cascade IRQ (IRQ 2) - required for slave PIC interrupts
+    irq_enable(2);
     
     // Enable mouse IRQ (IRQ 12)
-    //irq_enable(12);
+    irq_enable(12);
         
     // Enable interrupts after everything is initialized
     __asm__ volatile ("sti");

@@ -173,8 +173,8 @@ static void mouse_clear_cursor(int x, int y) {
 // Process mouse packet
 static void mouse_process_packet(void) {
     uint8_t flags = mouse_state.packet_buffer[0];
-    int16_t raw_x = mouse_state.packet_buffer[1];
-    int16_t raw_y = mouse_state.packet_buffer[2];
+    int8_t raw_x = (int8_t)mouse_state.packet_buffer[1];  // Cast to signed 8-bit
+    int8_t raw_y = (int8_t)mouse_state.packet_buffer[2];  // Cast to signed 8-bit
     int8_t raw_z = 0;
     
     // Check if this is a valid packet
@@ -202,21 +202,14 @@ static void mouse_process_packet(void) {
     mouse_state.right_button = (flags & MOUSE_RIGHT_BUTTON) ? 1 : 0;
     mouse_state.middle_button = (flags & MOUSE_MIDDLE_BUTTON) ? 1 : 0;
     
-    // Process movement (handle sign extension and overflow)
-    if (flags & MOUSE_X_SIGN) {
-        raw_x |= 0xFF00;  // Sign extend
-    }
-    if (flags & MOUSE_Y_SIGN) {
-        raw_y |= 0xFF00;  // Sign extend
-    }
-    
-    // Skip if overflow occurred
+    // Skip if overflow occurred (check flags, not the data values)
     if (flags & (MOUSE_X_OVERFLOW | MOUSE_Y_OVERFLOW)) {
         mouse_state.packet_index = 0;
         return;
     }
     
     // Apply sensitivity and update position
+    // raw_x and raw_y are now properly signed 8-bit values (-128 to +127)
     mouse_state.delta_x = (raw_x * mouse_state.sensitivity) / 4;
     mouse_state.delta_y = -(raw_y * mouse_state.sensitivity) / 4;  // Invert Y axis
     
