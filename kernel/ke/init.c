@@ -4,6 +4,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/keyboard.h"
+#include "../../include/kernel/mouse.h"
 #include "../../include/kernel/memory.h"
 
 // Function prototypes
@@ -52,13 +53,9 @@ void KiSystemStartup(void) {
 
     MmInitializeVirtualMemory();
     MmInitializeHeap();
-    
+
     // Print initial memory statistics
     MmPrintMemoryStats();
-
-    // Display framebuffer optimization status
-    kprintf("\nFramebuffer Optimization Status:\n");
-    console_show_fb_status();
 
     // Test memory allocation
     kprintf("Testing memory allocation...\n");
@@ -69,11 +66,21 @@ void KiSystemStartup(void) {
     kfree(test_ptr2);
     kprintf("  Test blocks freed successfully\n");
 
+    // Display framebuffer optimization status
+    kprintf("\nFramebuffer Optimization Status:\n");
+    console_show_fb_status();
+
     // Initialize keyboard
     keyboard_init();
     
     // Enable keyboard IRQ (IRQ 1)
     irq_enable(1);
+
+    // Initialize mouse
+    //mouse_init();
+    
+    // Enable mouse IRQ (IRQ 12)
+    //irq_enable(12);
         
     // Enable interrupts after everything is initialized
     __asm__ volatile ("sti");

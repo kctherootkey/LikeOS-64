@@ -86,6 +86,13 @@ void MmFlushAllTLB(void) {
     set_cr3(cr3);
 }
 
+// Get dynamic kernel heap start address
+uint64_t MmGetKernelHeapStart(void) {
+    // Align kernel_end to page boundary and add some padding
+    uint64_t kernel_end_addr = (uint64_t)kernel_end;
+    return PAGE_ALIGN(kernel_end_addr);
+}
+
 // PHYSICAL MEMORY MANAGER IMPLEMENTATION
 
 // Find first free bit in bitmap
@@ -154,7 +161,8 @@ void MmInitializePhysicalMemory(uint64_t memory_size) {
     mm_state.bitmap_size = PAGE_ALIGN((mm_state.total_pages + 7) / 8);
     
     // Place bitmap after kernel heap area
-    mm_state.physical_bitmap = (uint32_t*)(KERNEL_HEAP_START + KERNEL_HEAP_SIZE);
+    uint64_t heap_start = MmGetKernelHeapStart();
+    mm_state.physical_bitmap = (uint32_t*)(heap_start + KERNEL_HEAP_SIZE);
     
     kprintf("  Kernel end virtual: %p\n", kernel_end);
     kprintf("  Kernel end physical: %p\n", (void*)kernel_end_phys);
@@ -163,7 +171,7 @@ void MmInitializePhysicalMemory(uint64_t memory_size) {
            (mm_state.memory_end - mm_state.memory_start) / (1024*1024));
     kprintf("  Total pages: %d\n", mm_state.total_pages);
     kprintf("  Heap: %p - %p\n", 
-           (void*)KERNEL_HEAP_START, (void*)(KERNEL_HEAP_START + KERNEL_HEAP_SIZE));
+           (void*)heap_start, (void*)(heap_start + KERNEL_HEAP_SIZE));
     kprintf("  Bitmap at: %p (size: %d bytes)\n", 
            mm_state.physical_bitmap, mm_state.bitmap_size);
     kprintf("  Bitmap end: %p\n", 
@@ -184,7 +192,8 @@ void MmInitializePhysicalMemory(uint64_t memory_size) {
 void MmReserveKernelMemory(void) {
     // Reserve kernel heap area (virtual heap area doesn't consume physical pages here)
     // The bitmap is what we need to reserve
-    uint64_t bitmap_start_page = ((uint64_t)mm_state.physical_bitmap - KERNEL_HEAP_START) / PAGE_SIZE;
+    uint64_t heap_start = MmGetKernelHeapStart();
+    uint64_t bitmap_start_page = ((uint64_t)mm_state.physical_bitmap - heap_start) / PAGE_SIZE;
     uint64_t bitmap_pages = mm_state.bitmap_size / PAGE_SIZE + 1;
     
     // Note: We don't reserve the heap area in physical memory since it's in virtual space
@@ -198,7 +207,7 @@ void MmReserveKernelMemory(void) {
     }
     
     kprintf("  Reserved areas:\n");
-    kprintf("    Kernel: Virtual space (heap at %p)\n", (void*)KERNEL_HEAP_START);
+    kprintf("    Kernel: Virtual space (heap at %p)\n", (void*)heap_start);
     kprintf("    Bitmap: %d pages starting at virtual %p\n", 
            bitmap_pages, mm_state.physical_bitmap);
     kprintf("  Total reserved: %d pages\n", bitmap_pages);
@@ -323,7 +332,8 @@ void MmInitializeVirtualMemory(void) {
     kprintf("Initializing Virtual Memory Manager...\n");
     
     mm_state.pml4_table = (uint64_t*)(get_cr3() & ~0xFFF);
-    mm_state.next_virtual_addr = KERNEL_HEAP_START + KERNEL_HEAP_SIZE + mm_state.bitmap_size;
+    uint64_t heap_start = MmGetKernelHeapStart();
+    mm_state.next_virtual_addr = heap_start + KERNEL_HEAP_SIZE + mm_state.bitmap_size;
     mm_state.next_virtual_addr = PAGE_ALIGN(mm_state.next_virtual_addr);
     
     kprintf("  Page tables at: %p\n", mm_state.pml4_table);
@@ -373,10 +383,11 @@ bool MmIsPageMapped(uint64_t virtual_addr) {
 // Initialize heap
 void MmInitializeHeap(void) {
     kprintf("Initializing Kernel Heap Allocator...\n");
-    
-    mm_state.heap_start = (heap_block_t*)KERNEL_HEAP_START;
+
+    uint64_t heap_start = MmGetKernelHeapStart();
+    mm_state.heap_start = (heap_block_t*) heap_start;
     mm_state.heap_size = KERNEL_HEAP_SIZE;
-    mm_state.heap_end = (heap_block_t*)(KERNEL_HEAP_START + KERNEL_HEAP_SIZE);
+    mm_state.heap_end = (heap_block_t*)(heap_start + KERNEL_HEAP_SIZE);    
     mm_state.heap_used = 0;
     mm_state.allocation_count = 0;
     mm_state.deallocation_count = 0;
@@ -387,9 +398,9 @@ void MmInitializeHeap(void) {
     mm_state.heap_start->is_free = 1;
     mm_state.heap_start->next = NULL;
     mm_state.heap_start->prev = NULL;
-    
+
     mm_state.free_list = mm_state.heap_start;
-    
+
     kprintf("  Heap range: %p - %p\n", mm_state.heap_start, mm_state.heap_end);
     kprintf("  Heap size: %d KB\n", mm_state.heap_size / 1024);
     
@@ -399,7 +410,7 @@ void MmInitializeHeap(void) {
 // Find suitable free block
 static heap_block_t* find_free_block(size_t size) {
     heap_block_t* current = mm_state.free_list;
-    
+
     while (current) {
         if (current->is_free && current->size >= size) {
             return current;
@@ -475,7 +486,7 @@ void* kalloc(size_t size) {
     // Update statistics
     mm_state.heap_used += size + sizeof(heap_block_t);
     mm_state.allocation_count++;
-    
+
     return (uint8_t*)block + sizeof(heap_block_t);
 }
 

@@ -345,6 +345,9 @@ void irq_handler(uint64_t *regs) {
         case 33:  // IRQ1 - Keyboard
             keyboard_irq_handler();
             break;
+        case 44:  // IRQ12 - PS/2 Mouse
+            mouse_irq_handler();
+            break;
         default:
             kprintf("Unhandled IRQ %d\n", int_no - 32);
             break;

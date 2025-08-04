@@ -263,7 +263,7 @@ int fb_optimize_init(framebuffer_info_t* fb_info) {
     if (buffer_size <= MAX_STATIC_FB_SIZE) {
         g_double_buffer.back_buffer = g_static_back_buffer;
         g_using_static_buffers = 1;
-        kprintf("  Using static back buffer (size fits: %zu <= %zu)\n", buffer_size, (size_t)MAX_STATIC_FB_SIZE);
+        kprintf("  Using static back buffer %p (size fits: %zu <= %zu)\n", g_static_back_buffer, buffer_size, (size_t)MAX_STATIC_FB_SIZE);
     } else {
         // Try dynamic allocation for larger framebuffers
         g_double_buffer.back_buffer = (uint32_t*)kalloc(buffer_size);
@@ -275,7 +275,7 @@ int fb_optimize_init(framebuffer_info_t* fb_info) {
         g_using_static_buffers = 0;
         kprintf("  Back buffer dynamically allocated at: %p\n", g_double_buffer.back_buffer);
     }
-    
+
     // Always use static dirty regions array (small and fixed size)
     g_double_buffer.max_dirty_regions = MAX_DIRTY_REGIONS;
     g_double_buffer.dirty_regions = g_static_dirty_regions;

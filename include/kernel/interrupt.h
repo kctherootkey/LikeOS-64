@@ -100,6 +100,7 @@ void exception_handler(uint64_t *regs);
 // IRQ handlers
 void irq_handler(uint64_t *regs);
 void keyboard_irq_handler(void);
+void mouse_irq_handler(void);
 
 // Assembly interrupt stubs (defined in assembly)
 extern void isr0(void);
