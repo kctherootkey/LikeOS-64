@@ -4,6 +4,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/fb_optimize.h"
 #include "../../include/kernel/mouse.h"
+#include "../../include/kernel/scrollbar.h"
 
 #define SIZE_MAX ((size_t)-1)
 #define NULL ((void*)0)
@@ -237,7 +238,10 @@ void console_init(framebuffer_info_t* fb) {
     bg_color = 0x00000000; // Black
     
     if (fb_info) {
-        max_cols = fb_info->horizontal_resolution / CHAR_WIDTH;
+        // Calculate text area width (exclude scrollbar area)
+        uint32_t scrollbar_total_width = SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
+        uint32_t text_area_width = fb_info->horizontal_resolution - scrollbar_total_width;
+        max_cols = text_area_width / CHAR_WIDTH;
         max_rows = fb_info->vertical_resolution / CHAR_HEIGHT;
     } else {
         // Fallback values
@@ -263,22 +267,30 @@ void console_init_fb_optimization(void) {
     }
 }
 
-// Clear the entire screen
+// Clear the entire screen (text area only, preserve scrollbar)
 void console_clear(void) {
     if (!fb_info || !fb_info->framebuffer_base) return;
     
+    // Calculate text area width (exclude scrollbar area)
+    uint32_t scrollbar_total_width = SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
+    uint32_t text_area_width = fb_info->horizontal_resolution - scrollbar_total_width;
+    
     fb_double_buffer_t* fb_opt = get_fb_double_buffer();
     if (fb_opt) {
-        // Use optimized fill operation
-        fb_fill_rect(0, 0, fb_info->horizontal_resolution, fb_info->vertical_resolution, bg_color);
+        // Use optimized fill operation - only clear text area
+        fb_fill_rect(0, 0, text_area_width, fb_info->vertical_resolution, bg_color);
         fb_flush_dirty_regions();  // Immediately update the screen
     } else {
         // Fallback to direct framebuffer access
         uint32_t* framebuffer = (uint32_t*)fb_info->framebuffer_base;
-        uint32_t total_pixels = fb_info->horizontal_resolution * fb_info->vertical_resolution;
+        uint32_t pixels_per_line = fb_info->pixels_per_scanline;
         
-        for (uint32_t i = 0; i < total_pixels; i++) {
-            framebuffer[i] = bg_color;
+        // Clear only the text area, preserve scrollbar
+        for (uint32_t y = 0; y < fb_info->vertical_resolution; y++) {
+            uint32_t* line = &framebuffer[y * pixels_per_line];
+            for (uint32_t x = 0; x < text_area_width; x++) {
+                line[x] = bg_color;
+            }
         }
     }
     
@@ -293,17 +305,21 @@ static void console_scroll_up(void) {
     // Hide mouse cursor before scrolling to prevent artifacts
     mouse_show_cursor(0);
     
-    uint32_t width = fb_info->horizontal_resolution;
+    uint32_t screen_width = fb_info->horizontal_resolution;
     uint32_t height = fb_info->vertical_resolution;
     uint32_t scroll_lines = CHAR_HEIGHT;
     
+    // Calculate text area width (exclude scrollbar area)
+    uint32_t scrollbar_total_width = SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
+    uint32_t text_area_width = screen_width - scrollbar_total_width;
+    
     fb_double_buffer_t* fb_opt = get_fb_double_buffer();
     if (fb_opt) {
-        // Use optimized copy operation
-        fb_copy_rect(0, 0, 0, scroll_lines, width, height - scroll_lines);
+        // Use optimized copy operation - only scroll the text area
+        fb_copy_rect(0, 0, 0, scroll_lines, text_area_width, height - scroll_lines);
         
-        // Clear the bottom area
-        fb_fill_rect(0, height - scroll_lines, width, scroll_lines, bg_color);
+        // Clear the bottom area of text region only
+        fb_fill_rect(0, height - scroll_lines, text_area_width, scroll_lines, bg_color);
         
         // Flush changes to screen
         fb_flush_dirty_regions();
@@ -313,16 +329,17 @@ static void console_scroll_up(void) {
         uint32_t pixels_per_line = fb_info->pixels_per_scanline;
         
         // Move all scan lines up by scroll_lines using memory copy for efficiency
+        // Only copy the text area, not the scrollbar area
         for (uint32_t y = scroll_lines; y < height; y++) {
             uint32_t* src_line = &framebuffer[y * pixels_per_line];
             uint32_t* dst_line = &framebuffer[(y - scroll_lines) * pixels_per_line];
-            kmemcpy(dst_line, src_line, width * sizeof(uint32_t));
+            kmemcpy(dst_line, src_line, text_area_width * sizeof(uint32_t));
         }
         
-        // Clear the bottom scroll_lines rows with background color
+        // Clear the bottom scroll_lines rows with background color (text area only)
         for (uint32_t y = height - scroll_lines; y < height; y++) {
             uint32_t* line = &framebuffer[y * pixels_per_line];
-            for (uint32_t x = 0; x < width; x++) {
+            for (uint32_t x = 0; x < text_area_width; x++) {
                 line[x] = bg_color;
             }
         }
@@ -331,6 +348,9 @@ static void console_scroll_up(void) {
     // Move cursor to last line
     cursor_y = max_rows - 1;
     cursor_x = 0;
+    
+    // Refresh scrollbar after scrolling to ensure it remains visible
+    scrollbar_refresh_system();
     
     // Show mouse cursor again after scrolling is complete
     mouse_show_cursor(1);

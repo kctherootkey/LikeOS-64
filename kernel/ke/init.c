@@ -6,6 +6,7 @@
 #include "../../include/kernel/keyboard.h"
 #include "../../include/kernel/mouse.h"
 #include "../../include/kernel/memory.h"
+#include "../../include/kernel/scrollbar.h"
 
 // Function prototypes
 void KiSystemStartup(void);
@@ -69,6 +70,17 @@ void KiSystemStartup(void) {
     // Display framebuffer optimization status
     kprintf("\nFramebuffer Optimization Status:\n");
     console_show_fb_status();
+
+    // Initialize and render system scrollbar
+    kprintf("\nInitializing visual scrollbar system...\n");
+    static scrollbar_t system_scrollbar;
+    if (scrollbar_init_system_default(&system_scrollbar) == 0) {
+        scrollbar_render(&system_scrollbar);
+        fb_flush_dirty_regions();
+        kprintf("Visual scrollbar initialized and rendered successfully\n");
+    } else {
+        kprintf("Warning: Failed to initialize scrollbar\n");
+    }
 
     // Initialize keyboard
     keyboard_init();

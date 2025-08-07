@@ -45,7 +45,8 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/gdt_c.o \
               $(BUILD_DIR)/keyboard.o \
               $(BUILD_DIR)/mouse.o \
-              $(BUILD_DIR)/memory.o
+              $(BUILD_DIR)/memory.o \
+              $(BUILD_DIR)/scrollbar.o
 
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
@@ -90,6 +91,9 @@ $(BUILD_DIR)/mouse.o: $(KERNEL_DIR)/hal/mouse.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/memory.o: $(KERNEL_DIR)/mm/memory.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/scrollbar.o: $(KERNEL_DIR)/hal/scrollbar.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # Build kernel ELF
