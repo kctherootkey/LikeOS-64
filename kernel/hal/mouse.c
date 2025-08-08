@@ -325,11 +325,16 @@ static void mouse_process_packet(void) {
     mouse_state.x += mouse_state.delta_x;
     mouse_state.y += mouse_state.delta_y;
     
-    // Clamp origin to screen boundaries (allow partial rendering)
+    // Clamp origin to screen boundaries with partial visibility policy
     if (mouse_state.x < 0) mouse_state.x = 0;
     if (mouse_state.y < 0) mouse_state.y = 0;
-    if (mouse_state.x >= mouse_state.screen_width) mouse_state.x = mouse_state.screen_width - 1;
-    if (mouse_state.y >= mouse_state.screen_height) mouse_state.y = mouse_state.screen_height - 1;
+    int max_x_for_partial_visibility = mouse_state.screen_width - 2;
+    int max_y_for_tip_visibility = mouse_state.screen_height - TIP_VISIBLE_ROWS;
+    if (max_x_for_partial_visibility < 0) max_x_for_partial_visibility = 0;
+    if (max_y_for_tip_visibility < 0) max_y_for_tip_visibility = 0;
+    // Keep at least 2px (right) and TIP_VISIBLE_ROWS (bottom) visible
+    if (mouse_state.x > max_x_for_partial_visibility) mouse_state.x = max_x_for_partial_visibility;
+    if (mouse_state.y > max_y_for_tip_visibility) mouse_state.y = max_y_for_tip_visibility;
     
     // Update cursor if position changed
     if (mouse_state.x != mouse_state.last_x || mouse_state.y != mouse_state.last_y) {
