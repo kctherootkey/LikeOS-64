@@ -2,6 +2,7 @@
 // Framebuffer-based console and printf implementation for 64-bit kernel
 
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/serial.h"
 #include "../../include/kernel/fb_optimize.h"
 #include "../../include/kernel/mouse.h"
 #include "../../include/kernel/scrollbar.h"
@@ -236,6 +237,8 @@ void console_init(framebuffer_info_t* fb) {
     cursor_y = 0;
     fg_color = 0xFFFFFFFF; // White
     bg_color = 0x00000000; // Black
+    // Initialize serial console early so kprintf mirrors to QEMU if present
+    serial_init();
     
     if (fb_info) {
         // Calculate text area width (exclude scrollbar area)
@@ -365,6 +368,10 @@ void console_set_color(uint8_t fg, uint8_t bg) {
 // Print a single character
 void console_putchar(char c) {
     if (!fb_info) return;
+    // Mirror to serial (if present) before screen updates
+    if (serial_is_available()) {
+        serial_write_char(c);
+    }
     
     // Handle special characters
     if (c == '\n') {
@@ -958,6 +965,32 @@ int kprintf(const char* format, ...) {
     int result = kvprintf(format, args);
     va_end(args);
     return result;
+}
+
+// Serial-only printf (does not render to framebuffer)
+int kprintf_serial(const char* format, ...) {
+    // If serial not available, do nothing (return bytes that would be written)
+    // We still format into a temporary buffer to compute length when serial is present.
+    if (!serial_is_available()) {
+        // Quick path: count approximate length by formatting into a small scratch buffer
+        // Without vsnprintf, we can’t compute exact length cheaply; return 0 in this case.
+        return 0;
+    }
+
+    // Format into a temporary buffer using existing string formatter
+    // Choose a reasonable size for kernel logs
+    char buf[1024];
+    string_buffer_t sb = { buf, sizeof(buf), 0 };
+    va_list args;
+    va_start(args, format);
+    kvprintf_to_buffer(format, args, &sb);
+    va_end(args);
+    buf[sb.pos] = '\0';
+
+    if (sb.pos > 0) {
+        serial_write(buf, (uint32_t)sb.pos);
+    }
+    return (int)sb.pos;
 }
 
 // String printf

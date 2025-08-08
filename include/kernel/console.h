@@ -42,6 +42,8 @@ void console_show_fb_stats(void);
 // Printf family functions
 typedef __builtin_va_list va_list;
 int kprintf(const char* format, ...);
+// Print only to serial (no framebuffer output); mirrors kprintf signature
+int kprintf_serial(const char* format, ...);
 int ksprintf(char* buffer, const char* format, ...);
 int ksnprintf(char* buffer, size_t size, const char* format, ...);
 int kvprintf(const char* format, va_list args);
