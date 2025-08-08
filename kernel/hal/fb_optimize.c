@@ -5,6 +5,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
 
+
 // Define missing types for kernel
 typedef unsigned long uintptr_t;
 
@@ -184,46 +185,37 @@ void sse_copy_unaligned(void* dst, const void* src, size_t bytes) {
 // Fast memory copy with automatic alignment detection
 void* fast_memcpy(void* dst, const void* src, size_t bytes) {
     if (!bytes) return dst;
-    
-    // Check if we can use SSE
-    if (g_double_buffer.cpu_features & CPU_FEATURE_SSE2) {
-        // Check alignment
-        uintptr_t src_align = (uintptr_t)src & 15;
-        uintptr_t dst_align = (uintptr_t)dst & 15;
-        
-        if (src_align == 0 && dst_align == 0) {
-            sse_copy_aligned(dst, src, bytes);
-            return dst;
-        } else {
-            sse_copy_unaligned(dst, src, bytes);
-            return dst;
+
+    // If bytes are small (<16) or SSE2 unavailable, do scalar copy to avoid recursion
+    if (!(g_double_buffer.cpu_features & CPU_FEATURE_SSE2) || bytes < 16) {
+        char* d = (char*)dst;
+        const char* s = (const char*)src;
+        // Try to use 64-bit copies for large-enough, aligned chunks
+        if (bytes >= 8 && (((uintptr_t)d & 7) == 0) && (((uintptr_t)s & 7) == 0)) {
+            uint64_t* d64 = (uint64_t*)d;
+            const uint64_t* s64 = (const uint64_t*)s;
+            size_t count64 = bytes / 8;
+            for (size_t i = 0; i < count64; i++) {
+                d64[i] = s64[i];
+            }
+            bytes %= 8;
+            d += count64 * 8;
+            s += count64 * 8;
         }
-    }
-    
-    // Fallback to regular copy
-    char* d = (char*)dst;
-    const char* s = (const char*)src;
-    
-    // Try to use 64-bit copies for large blocks
-    if (bytes >= 8 && ((uintptr_t)dst & 7) == 0 && ((uintptr_t)src & 7) == 0) {
-        uint64_t* d64 = (uint64_t*)d;
-        const uint64_t* s64 = (const uint64_t*)s;
-        size_t count64 = bytes / 8;
-        
-        for (size_t i = 0; i < count64; i++) {
-            d64[i] = s64[i];
+        for (size_t i = 0; i < bytes; i++) {
+            d[i] = s[i];
         }
-        
-        bytes %= 8;
-        d += count64 * 8;
-        s += count64 * 8;
+        return dst;
     }
-    
-    // Copy remaining bytes
-    for (size_t i = 0; i < bytes; i++) {
-        d[i] = s[i];
+
+    // SSE path for >=16 bytes
+    uintptr_t src_align = (uintptr_t)src & 15;
+    uintptr_t dst_align = (uintptr_t)dst & 15;
+    if (src_align == 0 && dst_align == 0) {
+        sse_copy_aligned(dst, src, bytes);
+    } else {
+        sse_copy_unaligned(dst, src, bytes);
     }
-    
     return dst;
 }
 
@@ -467,7 +459,27 @@ void fb_flush_dirty_regions(void) {
     for (uint32_t i = 0; i < g_double_buffer.num_dirty_regions; i++) {
         dirty_rect_t* region = &g_double_buffer.dirty_regions[i];
         if (region->dirty) {
-            copy_region_to_front(region->x1, region->y1, region->x2, region->y2);
+            // Clamp region to bounds defensively
+            uint32_t x1 = region->x1;
+            uint32_t y1 = region->y1;
+            uint32_t x2 = region->x2;
+            uint32_t y2 = region->y2;
+            if (x1 >= g_double_buffer.width) x1 = g_double_buffer.width ? g_double_buffer.width - 1 : 0;
+            if (y1 >= g_double_buffer.height) y1 = g_double_buffer.height ? g_double_buffer.height - 1 : 0;
+            if (x2 >= g_double_buffer.width) x2 = g_double_buffer.width ? g_double_buffer.width - 1 : 0;
+            if (y2 >= g_double_buffer.height) y2 = g_double_buffer.height ? g_double_buffer.height - 1 : 0;
+            if (x1 > x2 || y1 > y2) continue;
+            uint32_t w = x2 - x1 + 1;
+            uint32_t h = y2 - y1 + 1;
+            if (!w || !h) continue;
+            // Sanity check offsets
+            uint64_t max_index = (uint64_t)(g_double_buffer.height - 1) * g_double_buffer.pitch + (g_double_buffer.width - 1);
+            uint64_t start_index = (uint64_t)y1 * g_double_buffer.pitch + x1;
+            uint64_t end_index = (uint64_t)y2 * g_double_buffer.pitch + x2;
+            if (start_index > max_index || end_index > max_index) {
+                continue;
+            }
+            copy_region_to_front(x1, y1, x2, y2);
         }
     }
     

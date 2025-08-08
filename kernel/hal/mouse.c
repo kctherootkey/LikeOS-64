@@ -9,6 +9,15 @@
 // Global mouse state
 static mouse_state_t mouse_state = {0};
 
+// How many top rows of the arrow remain visible at the bottom edge
+#define TIP_VISIBLE_ROWS 3
+// Sentinel color stored in background buffer for "not saved" entries
+static const uint32_t BG_SENTINEL = 0xDEADBEEF;
+
+static inline int clampi(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
 // Mouse cursor bitmap (11x19 Windows-style arrow cursor)
 static const uint32_t cursor_bitmap[CURSOR_HEIGHT][CURSOR_WIDTH] = {
     // Classic Windows cursor: white arrow with black outline
@@ -130,56 +139,122 @@ static uint8_t mouse_detect_type(void) {
 }
 
 // Draw cursor at specified position
-static void mouse_draw_cursor(int x, int y) {
+static void mouse_draw_cursor_full(int x, int y) {
     if (!mouse_state.cursor_visible) return;
-    
-    // Save background before drawing cursor
-    for (int cy = 0; cy < CURSOR_HEIGHT; cy++) {
-        for (int cx = 0; cx < CURSOR_WIDTH; cx++) {
+    if (!cursor_background) return;
+    int cw = mouse_state.cursor_w;
+    int ch = mouse_state.cursor_h;
+    if (x >= mouse_state.screen_width || y >= mouse_state.screen_height || x + cw - 1 < 0 || y + ch - 1 < 0) return;
+    for (int cy = 0; cy < ch; cy++) {
+        for (int cx = 0; cx < cw; cx++) {
+            int bg_index = cy * cw + cx;
+            if (bg_index < 0 || bg_index >= cw * ch) continue;
             int screen_x = x + cx;
             int screen_y = y + cy;
-            
-            // Check bounds
-            if (screen_x >= 0 && screen_x < mouse_state.screen_width &&
-                screen_y >= 0 && screen_y < mouse_state.screen_height) {
-                
-                // Save background pixel
-                cursor_background[cy * CURSOR_WIDTH + cx] = fb_get_pixel(screen_x, screen_y);
-                
-                // Draw cursor pixel if not transparent
-                if (cursor_bitmap[cy][cx] != 0x00000000) {
-                    fb_set_pixel(screen_x, screen_y, cursor_bitmap[cy][cx]);
-                }
-            }
+            if (screen_x < 0 || screen_y < 0 || screen_x >= mouse_state.screen_width || screen_y >= mouse_state.screen_height) continue;
+            cursor_background[bg_index] = fb_get_pixel((uint32_t)screen_x, (uint32_t)screen_y);
+            uint32_t pix = cursor_bitmap[cy][cx];
+            if (pix != 0x00000000) fb_set_pixel((uint32_t)screen_x, (uint32_t)screen_y, pix);
         }
     }
-    
-    // Mark cursor area as dirty
-    fb_mark_dirty(x, y, x + CURSOR_WIDTH - 1, y + CURSOR_HEIGHT - 1);
+    int x1 = clampi(x, 0, mouse_state.screen_width - 1);
+    int y1 = clampi(y, 0, mouse_state.screen_height - 1);
+    int x2 = clampi(x + cw - 1, 0, mouse_state.screen_width - 1);
+    int y2 = clampi(y + ch - 1, 0, mouse_state.screen_height - 1);
+    fb_mark_dirty((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
 }
 
 // Clear cursor at specified position
-static void mouse_clear_cursor(int x, int y) {
+static void mouse_clear_cursor_full(int x, int y) {
     if (!mouse_state.cursor_visible) return;
-    
-    // Restore background
-    for (int cy = 0; cy < CURSOR_HEIGHT; cy++) {
-        for (int cx = 0; cx < CURSOR_WIDTH; cx++) {
+    if (!cursor_background) return;
+    int cw = mouse_state.cursor_w;
+    int ch = mouse_state.cursor_h;
+    if (x >= mouse_state.screen_width || y >= mouse_state.screen_height || x + cw - 1 < 0 || y + ch - 1 < 0) return;
+    for (int cy = 0; cy < ch; cy++) {
+        for (int cx = 0; cx < cw; cx++) {
+            int bg_index = cy * cw + cx;
+            if (bg_index < 0 || bg_index >= cw * ch) continue;
             int screen_x = x + cx;
             int screen_y = y + cy;
-            
-            // Check bounds
-            if (screen_x >= 0 && screen_x < mouse_state.screen_width &&
-                screen_y >= 0 && screen_y < mouse_state.screen_height) {
-                
-                // Restore background pixel
-                fb_set_pixel(screen_x, screen_y, cursor_background[cy * CURSOR_WIDTH + cx]);
+            if (screen_x < 0 || screen_y < 0 || screen_x >= mouse_state.screen_width || screen_y >= mouse_state.screen_height) continue;
+            uint32_t bg = cursor_background[bg_index];
+            if (bg != BG_SENTINEL) {
+                fb_set_pixel((uint32_t)screen_x, (uint32_t)screen_y, bg);
             }
+            // Reset background entry so we never reuse stale data
+            cursor_background[bg_index] = BG_SENTINEL;
         }
     }
-    
-    // Mark cursor area as dirty
-    fb_mark_dirty(x, y, x + CURSOR_WIDTH - 1, y + CURSOR_HEIGHT - 1);
+    int x1 = clampi(x, 0, mouse_state.screen_width - 1);
+    int y1 = clampi(y, 0, mouse_state.screen_height - 1);
+    int x2 = clampi(x + cw - 1, 0, mouse_state.screen_width - 1);
+    int y2 = clampi(y + ch - 1, 0, mouse_state.screen_height - 1);
+    fb_mark_dirty((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
+}
+
+static void mouse_draw_cursor_partial(int x, int y, int visible_w, int visible_h) {
+    if (!mouse_state.cursor_visible) return;
+    if (!cursor_background) return;
+    int cw = mouse_state.cursor_w;
+    int ch = mouse_state.cursor_h;
+    if (visible_w <= 0 || visible_h <= 0) return;
+    if (x >= mouse_state.screen_width || y >= mouse_state.screen_height) return;
+    if (visible_w > cw) visible_w = cw;
+    if (visible_h > ch) visible_h = ch;
+
+    for (int cy = 0; cy < visible_h; cy++) {
+        for (int cx = 0; cx < visible_w; cx++) {
+            if (cx < 0 || cy < 0 || cx >= cw || cy >= ch) continue;
+            int bg_index = cy * cw + cx;
+            if (bg_index < 0 || bg_index >= cw * ch) continue;
+            int screen_x = x + cx;
+            int screen_y = y + cy;
+            if (screen_x < 0 || screen_y < 0 || screen_x >= mouse_state.screen_width || screen_y >= mouse_state.screen_height) continue;
+            cursor_background[bg_index] = fb_get_pixel((uint32_t)screen_x, (uint32_t)screen_y);
+            uint32_t pix = cursor_bitmap[cy][cx];
+            if (pix != 0x00000000) fb_set_pixel((uint32_t)screen_x, (uint32_t)screen_y, pix);
+        }
+    }
+
+    int x1 = clampi(x, 0, mouse_state.screen_width - 1);
+    int y1 = clampi(y, 0, mouse_state.screen_height - 1);
+    int x2 = clampi(x + visible_w - 1, 0, mouse_state.screen_width - 1);
+    int y2 = clampi(y + visible_h - 1, 0, mouse_state.screen_height - 1);
+    fb_mark_dirty((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
+}
+
+static void mouse_clear_cursor_partial(int x, int y, int visible_w, int visible_h) {
+    if (!mouse_state.cursor_visible) return;
+    if (!cursor_background) return;
+    int cw = mouse_state.cursor_w;
+    int ch = mouse_state.cursor_h;
+    if (visible_w <= 0 || visible_h <= 0) return;
+    if (x >= mouse_state.screen_width || y >= mouse_state.screen_height) return;
+    if (visible_w > cw) visible_w = cw;
+    if (visible_h > ch) visible_h = ch;
+
+    for (int cy = 0; cy < visible_h; cy++) {
+        for (int cx = 0; cx < visible_w; cx++) {
+            if (cx < 0 || cy < 0 || cx >= cw || cy >= ch) continue;
+            int bg_index = cy * cw + cx;
+            if (bg_index < 0 || bg_index >= cw * ch) continue;
+            int screen_x = x + cx;
+            int screen_y = y + cy;
+            if (screen_x < 0 || screen_y < 0 || screen_x >= mouse_state.screen_width || screen_y >= mouse_state.screen_height) continue;
+            uint32_t bg = cursor_background[bg_index];
+            if (bg != BG_SENTINEL) {
+                fb_set_pixel((uint32_t)screen_x, (uint32_t)screen_y, bg);
+            }
+            cursor_background[bg_index] = BG_SENTINEL;
+        }
+    }
+
+    int x1 = clampi(x, 0, mouse_state.screen_width - 1);
+    int y1 = clampi(y, 0, mouse_state.screen_height - 1);
+    int x2 = clampi(x + visible_w - 1, 0, mouse_state.screen_width - 1);
+    int y2 = clampi(y + visible_h - 1, 0, mouse_state.screen_height - 1);
+    fb_mark_dirty((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
 }
 
 // Process mouse packet
@@ -250,15 +325,11 @@ static void mouse_process_packet(void) {
     mouse_state.x += mouse_state.delta_x;
     mouse_state.y += mouse_state.delta_y;
     
-    // Clamp to screen boundaries
+    // Clamp origin to screen boundaries (allow partial rendering)
     if (mouse_state.x < 0) mouse_state.x = 0;
     if (mouse_state.y < 0) mouse_state.y = 0;
-    if (mouse_state.x >= mouse_state.screen_width - CURSOR_WIDTH) {
-        mouse_state.x = mouse_state.screen_width - CURSOR_WIDTH - 1;
-    }
-    if (mouse_state.y >= mouse_state.screen_height - CURSOR_HEIGHT) {
-        mouse_state.y = mouse_state.screen_height - CURSOR_HEIGHT - 1;
-    }
+    if (mouse_state.x >= mouse_state.screen_width) mouse_state.x = mouse_state.screen_width - 1;
+    if (mouse_state.y >= mouse_state.screen_height) mouse_state.y = mouse_state.screen_height - 1;
     
     // Update cursor if position changed
     if (mouse_state.x != mouse_state.last_x || mouse_state.y != mouse_state.last_y) {
@@ -292,13 +363,20 @@ void mouse_init(void) {
     fb_double_buffer_t* fb_buffer = get_fb_double_buffer();
     mouse_state.screen_width = fb_buffer->width;
     mouse_state.screen_height = fb_buffer->height;
-    
-    // Allocate cursor background buffer
-    cursor_background = (uint32_t*)kalloc(CURSOR_WIDTH * CURSOR_HEIGHT * sizeof(uint32_t));
+
+    // Set runtime cursor dimensions
+    mouse_state.cursor_w = CURSOR_WIDTH;
+    mouse_state.cursor_h = CURSOR_HEIGHT;
+
+    // Allocate cursor background buffer sized to runtime dimensions
+    size_t bg_count = (size_t)mouse_state.cursor_w * (size_t)mouse_state.cursor_h;
+    cursor_background = (uint32_t*)kalloc(bg_count * sizeof(uint32_t));
     if (!cursor_background) {
         kprintf("ERROR: Failed to allocate cursor background buffer\n");
         return;
     }
+    for (size_t i = 0; i < bg_count; ++i) cursor_background[i] = BG_SENTINEL;
+    (void)bg_count; // count reserved for potential diagnostics
     
     // Enable PS/2 mouse port
     mouse_wait_input();
@@ -332,6 +410,7 @@ void mouse_init(void) {
     kprintf("  Position: (%d, %d)\n", mouse_state.x, mouse_state.y);
     kprintf("  Screen size: %dx%d\n", mouse_state.screen_width, mouse_state.screen_height);
     kprintf("  Mouse type: %s\n", mouse_state.has_scroll_wheel ? "IntelliMouse" : "Standard");
+    kprintf("  Cursor size: %dx%d\n", mouse_state.cursor_w, mouse_state.cursor_h);
 }
 
 // Mouse IRQ handler (called from interrupt.c)
@@ -369,12 +448,55 @@ void mouse_irq_handler(void) {
 void mouse_update_cursor(void) {
     if (!mouse_state.enabled || !mouse_state.cursor_visible) return;
     
-    // Clear cursor at old position
-    mouse_clear_cursor(mouse_state.last_x, mouse_state.last_y);
-    
-    // Draw cursor at new position
-    mouse_draw_cursor(mouse_state.x, mouse_state.y);
-    
+    int max_x_for_partial_visibility = mouse_state.screen_width - 2;
+    int max_y_for_tip_visibility = mouse_state.screen_height - TIP_VISIBLE_ROWS;
+
+    // Compute prev visible region
+    int prev_w = mouse_state.cursor_w;
+    int prev_h = mouse_state.cursor_h;
+    if (mouse_state.last_x >= max_x_for_partial_visibility) {
+        int rem = mouse_state.screen_width - mouse_state.last_x;
+        prev_w = rem > 0 ? (rem < 2 ? rem : 2) : 0;
+    }
+    if (mouse_state.last_y >= max_y_for_tip_visibility) {
+        int rem = mouse_state.screen_height - mouse_state.last_y;
+        int tip = TIP_VISIBLE_ROWS;
+        if (rem < tip) tip = rem < 0 ? 0 : rem;
+        if (tip > mouse_state.cursor_h) tip = mouse_state.cursor_h;
+        prev_h = tip;
+    }
+    if (prev_w > mouse_state.cursor_w) prev_w = mouse_state.cursor_w;
+    if (prev_h > mouse_state.cursor_h) prev_h = mouse_state.cursor_h;
+
+    // Clear prev
+    if (prev_w > 0 && prev_h > 0 && (mouse_state.last_x >= max_x_for_partial_visibility || mouse_state.last_y >= max_y_for_tip_visibility)) {
+        mouse_clear_cursor_partial(mouse_state.last_x, mouse_state.last_y, prev_w, prev_h);
+    } else {
+        mouse_clear_cursor_full(mouse_state.last_x, mouse_state.last_y);
+    }
+
+    // Draw new
+    int visible_w = mouse_state.cursor_w;
+    int visible_h = mouse_state.cursor_h;
+    if (mouse_state.x >= max_x_for_partial_visibility) {
+        int rem = mouse_state.screen_width - mouse_state.x;
+        visible_w = rem > 0 ? (rem < 2 ? rem : 2) : 0;
+    }
+    if (mouse_state.y >= max_y_for_tip_visibility) {
+        int rem = mouse_state.screen_height - mouse_state.y;
+        int tip = TIP_VISIBLE_ROWS;
+        if (rem < tip) tip = rem < 0 ? 0 : rem;
+        if (tip > mouse_state.cursor_h) tip = mouse_state.cursor_h;
+        visible_h = tip;
+    }
+    if (visible_w > mouse_state.cursor_w) visible_w = mouse_state.cursor_w;
+    if (visible_h > mouse_state.cursor_h) visible_h = mouse_state.cursor_h;
+    if (visible_w > 0 && visible_h > 0 && (mouse_state.x >= max_x_for_partial_visibility || mouse_state.y >= max_y_for_tip_visibility)) {
+        mouse_draw_cursor_partial(mouse_state.x, mouse_state.y, visible_w, visible_h);
+    } else {
+        mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
+    }
+
     // Flush dirty regions to display changes
     fb_flush_dirty_regions();
 }
@@ -422,10 +544,10 @@ void mouse_set_sensitivity(int sensitivity) {
 void mouse_show_cursor(int show) {
     if (show && !mouse_state.cursor_visible) {
         mouse_state.cursor_visible = 1;
-        mouse_draw_cursor(mouse_state.x, mouse_state.y);
+    mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
         fb_flush_dirty_regions();
     } else if (!show && mouse_state.cursor_visible) {
-        mouse_clear_cursor(mouse_state.x, mouse_state.y);
+    mouse_clear_cursor_full(mouse_state.x, mouse_state.y);
         mouse_state.cursor_visible = 0;
         fb_flush_dirty_regions();
     }

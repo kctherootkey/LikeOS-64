@@ -60,7 +60,7 @@
 #define MOUSE_TYPE_INTELLIMOUSE 0x03
 #define MOUSE_TYPE_EXPLORER     0x04
 
-// Mouse cursor size
+// Mouse cursor size (compile-time for bitmap definition)
 #define CURSOR_WIDTH  11
 #define CURSOR_HEIGHT 19
 
@@ -101,12 +101,19 @@ typedef struct {
     // Screen bounds
     int screen_width;
     int screen_height;
+
+    // Cursor dimensions (runtime, derived from bitmap)
+    int cursor_w;
+    int cursor_h;
 } mouse_state_t;
 
 // Core functions
 void mouse_init(void);
 void mouse_irq_handler(void);
 void mouse_update_cursor(void);
+// Update paths (full vs partial visible regions)
+void mouse_update_cursor_full(void);
+void mouse_update_cursor_partial(void);
 
 // State queries
 int mouse_get_x(void);
