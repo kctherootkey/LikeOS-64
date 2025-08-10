@@ -747,13 +747,13 @@ void console_handle_mouse_event(int x, int y, uint8_t left_pressed) {
 }
 
 void console_handle_mouse_wheel(int delta) {
+    // Positive delta should scroll down; negative delta scroll up (GNOME/Chrome behavior)
     if (delta > 0) {
-        // wheel up: scroll up a few lines
         uint32_t steps = (delta > 3) ? 3 : (uint32_t)delta;
-        for (uint32_t i = 0; i < steps; ++i) console_scroll_up_line();
+        for (uint32_t i = 0; i < steps; ++i) console_scroll_down_line();
     } else if (delta < 0) {
         uint32_t steps = (-delta > 3) ? 3 : (uint32_t)(-delta);
-        for (uint32_t i = 0; i < steps; ++i) console_scroll_down_line();
+        for (uint32_t i = 0; i < steps; ++i) console_scroll_up_line();
     }
 }
 
