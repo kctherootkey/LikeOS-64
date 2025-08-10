@@ -25,6 +25,43 @@ typedef struct {
     uint32_t bytes_per_pixel;
 } framebuffer_info_t;
 
+// ================= Scrollback configuration and API =================
+// Capacity: 10,000 lines. Each line has a fixed character capacity to avoid heap use.
+#define CONSOLE_SCROLLBACK_LINES 10000
+#define CONSOLE_MAX_LINE_LENGTH  256
+
+// Ring-buffer line
+typedef struct {
+    char     text[CONSOLE_MAX_LINE_LENGTH];
+    uint16_t length;     // number of used characters in text
+    uint8_t  fg;         // optional attribute (VGA color index)
+    uint8_t  bg;         // optional attribute (VGA color index)
+} console_line_t;
+
+// Scrollback state
+typedef struct {
+    console_line_t* lines;        // storage (pre-allocated, capacity CONSOLE_SCROLLBACK_LINES)
+    uint32_t head;                // index of the current write line in ring [0..LINES-1]
+    uint32_t total_filled_lines;  // total lines ever written (monotonic)
+
+    // Viewport
+    uint32_t viewport_top;        // first visible logical line (0 = oldest)
+    uint32_t visible_lines;       // count of lines visible on screen (rows)
+    uint8_t  at_bottom;           // 1 if viewport is pinned to bottom
+
+    // Dragging state for scrollbar thumb
+    uint8_t  dragging_thumb;      // 1 while dragging thumb
+    int      drag_start_y;        // mouse Y at drag start
+    uint32_t drag_start_viewport; // viewport_top at drag start
+} console_scrollback_t;
+
+// Public APIs for scrollback-driven viewport control
+void console_scroll_up_line(void);
+void console_scroll_down_line(void);
+void console_set_viewport_top(uint32_t line);
+void console_handle_mouse_event(int x, int y, uint8_t left_pressed);
+void console_handle_mouse_wheel(int delta);
+
 // Console interface (now framebuffer-based with optimization)
 void console_init(framebuffer_info_t* fb_info);
 void console_init_fb_optimization(void);

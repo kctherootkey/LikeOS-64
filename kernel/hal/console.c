@@ -191,6 +191,157 @@ static uint32_t vga_to_rgb(uint8_t vga_color) {
     return vga_palette[vga_color & 0x0F];
 }
 
+// ================= Scrollback storage and helpers =================
+// Forward declaration for draw_char used in render before definition
+static void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color, uint32_t bg_color);
+
+static console_scrollback_t g_sb;
+static console_line_t g_lines[CONSOLE_SCROLLBACK_LINES];
+
+static inline uint32_t sb_capacity(void) { return CONSOLE_SCROLLBACK_LINES; }
+
+static inline uint32_t sb_visible_lines(void) { return max_rows; }
+
+static uint32_t sb_effective_total(void) {
+    // effective total lines available to view (min(total_filled, capacity))
+    uint32_t cap = sb_capacity();
+    return (g_sb.total_filled_lines < cap) ? g_sb.total_filled_lines : cap;
+}
+
+static void sb_reset(void) {
+    g_sb.lines = g_lines;
+    g_sb.head = 0;
+    g_sb.total_filled_lines = 0;
+    g_sb.viewport_top = 0;
+    g_sb.visible_lines = sb_visible_lines();
+    g_sb.at_bottom = 1;
+    g_sb.dragging_thumb = 0;
+    g_sb.drag_start_y = 0;
+    g_sb.drag_start_viewport = 0;
+    // Zero first line
+    for (uint32_t i = 0; i < sb_capacity(); ++i) {
+        g_lines[i].length = 0;
+        g_lines[i].text[0] = '\0';
+        g_lines[i].fg = VGA_COLOR_WHITE;
+        g_lines[i].bg = VGA_COLOR_BLACK;
+    }
+}
+
+static console_line_t* sb_current_line(void) { return &g_sb.lines[g_sb.head]; }
+
+static void sb_new_line(void) {
+    // Advance head in ring
+    g_sb.head = (g_sb.head + 1) % sb_capacity();
+    if (g_sb.total_filled_lines < 0xFFFFFFFFu) g_sb.total_filled_lines++;
+    // Clear the new line
+    g_sb.lines[g_sb.head].length = 0;
+    g_sb.lines[g_sb.head].text[0] = '\0';
+    g_sb.lines[g_sb.head].fg = VGA_COLOR_WHITE;
+    g_sb.lines[g_sb.head].bg = VGA_COLOR_BLACK;
+    // Auto-follow: if at bottom, keep viewport pinned
+    if (g_sb.at_bottom) {
+        uint32_t eff = sb_effective_total();
+        if (g_sb.visible_lines <= eff) {
+            uint32_t max_vp = eff > g_sb.visible_lines ? (eff - g_sb.visible_lines) : 0;
+            g_sb.viewport_top = max_vp;
+        }
+    }
+}
+
+static void sb_append_char(char c) {
+    console_line_t* line = sb_current_line();
+    if (c == '\n') {
+        sb_new_line();
+        return;
+    }
+    if (c == '\r') {
+        // carriage return: reset line length to 0 (simple behavior)
+        line->length = 0;
+        line->text[0] = '\0';
+        return;
+    }
+    if (c == '\t') {
+        // simple tab expansion: up to next 8-char boundary using spaces
+        uint16_t next = (uint16_t)(((line->length + 8) & ~7) - line->length);
+        for (uint16_t i = 0; i < next && line->length < CONSOLE_MAX_LINE_LENGTH - 1; ++i) {
+            line->text[line->length++] = ' ';
+        }
+        line->text[line->length] = '\0';
+        return;
+    }
+    if (c == '\b') {
+        if (line->length > 0) {
+            line->length--;
+            line->text[line->length] = '\0';
+        }
+        return;
+    }
+    if (line->length < CONSOLE_MAX_LINE_LENGTH - 1) {
+        line->text[line->length++] = c;
+        line->text[line->length] = '\0';
+    }
+}
+
+static void console_render_view(void) {
+    if (!fb_info) return;
+    // Text area excludes scrollbar default width and margin
+    uint32_t sb_total_w = SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
+    uint32_t text_w = (fb_info->horizontal_resolution > sb_total_w) ? (fb_info->horizontal_resolution - sb_total_w) : 0;
+    uint32_t text_h = fb_info->vertical_resolution;
+
+    // Clear text area
+    fb_fill_rect(0, 0, text_w, text_h, bg_color);
+
+    // Compute which logical line index corresponds to viewport_top in ring
+    uint32_t eff = sb_effective_total();
+    uint32_t start = g_sb.viewport_top; // 0..eff
+    // Oldest logical line index maps to ring index: if total_filled <= cap, logical==ring
+    uint32_t base_ring_idx;
+    if (g_sb.total_filled_lines <= sb_capacity()) {
+        base_ring_idx = 0;
+    } else {
+        // Oldest is head+1 mod cap
+        base_ring_idx = (g_sb.head + 1) % sb_capacity();
+    }
+    // Render rows
+    uint32_t rows = sb_visible_lines();
+    for (uint32_t row = 0; row < rows; ++row) {
+        uint32_t logical_idx = start + row;
+        if (logical_idx >= eff) break;
+        // Map logical to ring index
+        uint32_t ring_idx = (g_sb.total_filled_lines <= sb_capacity())
+            ? logical_idx
+            : (base_ring_idx + logical_idx) % sb_capacity();
+        console_line_t* line = &g_sb.lines[ring_idx];
+        uint32_t y = row * CHAR_HEIGHT;
+        // Draw characters
+        uint32_t cols = (line->length < max_cols) ? line->length : max_cols;
+        for (uint32_t col = 0; col < cols; ++col) {
+            draw_char(line->text[col], col * CHAR_WIDTH, y, fg_color, bg_color);
+        }
+        // Clear remaining cells on the row
+        if (cols < max_cols) {
+            uint32_t px = cols * CHAR_WIDTH;
+            uint32_t w = (max_cols - cols) * CHAR_WIDTH;
+            if (w) fb_fill_rect(px, y, w, CHAR_HEIGHT, bg_color);
+        }
+    }
+    // Mark dirty
+    if (text_w && text_h) fb_mark_dirty(0, 0, text_w - 1, text_h - 1);
+}
+
+static void console_sync_scrollbar(void) {
+    scrollbar_t* sb = scrollbar_get_system();
+    if (!sb) return;
+    scrollbar_content_t content = {
+        .total_lines = sb_effective_total(),
+        .visible_lines = sb_visible_lines(),
+        .viewport_top = g_sb.viewport_top,
+    };
+    scrollbar_sync_content(sb, &content);
+    scrollbar_render(sb);
+}
+
 // Draw a single pixel (32-bit BGRA format) - now uses optimized framebuffer
 static void set_pixel(uint32_t x, uint32_t y, uint32_t color) {
     if (!fb_info || !fb_info->framebuffer_base) return;
@@ -253,6 +404,8 @@ void console_init(framebuffer_info_t* fb) {
     }
     
     console_clear();
+    // Initialize scrollback storage once fb and rows/cols are known
+    sb_reset();
 }
 
 // Initialize framebuffer optimization system (call after console_init)
@@ -299,6 +452,9 @@ void console_clear(void) {
     
     cursor_x = 0;
     cursor_y = 0;
+    // reset viewport to top as well
+    g_sb.viewport_top = 0;
+    g_sb.at_bottom = 1;
 }
 
 // Scroll the screen up by one line
@@ -372,59 +528,78 @@ void console_putchar(char c) {
     if (serial_is_available()) {
         serial_write_char(c);
     }
-    
-    // Handle special characters
+    // Fast path drawing when at bottom; otherwise only update scrollback/scrollbar
     if (c == '\n') {
-        cursor_x = 0;
-        cursor_y++;
-        if (cursor_y >= max_rows) {
+        sb_append_char(c);
+        if (g_sb.at_bottom) {
+            cursor_x = 0;
+            // Physically scroll the text area up by one line
             console_scroll_up();
+            console_sync_scrollbar();
+            fb_flush_dirty_regions();
+        } else {
+            console_sync_scrollbar();
         }
         return;
     }
-    
     if (c == '\r') {
-        cursor_x = 0;
+        sb_append_char(c);
+        if (g_sb.at_bottom) {
+            // Clear current line and move to column 0
+            uint32_t sb_total_w = SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
+            uint32_t text_w = (fb_info->horizontal_resolution > sb_total_w) ? (fb_info->horizontal_resolution - sb_total_w) : 0;
+            uint32_t y = cursor_y * CHAR_HEIGHT;
+            fb_fill_rect(0, y, text_w, CHAR_HEIGHT, bg_color);
+            fb_mark_dirty(0, y, text_w ? (text_w - 1) : 0, y + CHAR_HEIGHT - 1);
+            fb_flush_dirty_regions();
+            cursor_x = 0;
+        }
         return;
     }
-    
+    if (c == '\t') {
+        // Expand to spaces in buffer and draw spaces on screen
+        // Determine spaces to next tab stop (8)
+        console_line_t* line = sb_current_line();
+        uint16_t current_len = line->length;
+        sb_append_char(c);
+        if (g_sb.at_bottom) {
+            uint32_t spaces = ((current_len + 8) & ~7) - current_len;
+            for (uint32_t i = 0; i < spaces; ++i) {
+                if (cursor_x >= max_cols) {
+                    // wrap
+                    cursor_x = 0;
+                    console_scroll_up();
+                }
+                draw_char(' ', cursor_x * CHAR_WIDTH, cursor_y * CHAR_HEIGHT, fg_color, bg_color);
+                cursor_x++;
+            }
+            fb_flush_dirty_regions();
+        } else {
+        }
+        return;
+    }
     if (c == '\b') {
+        // Backspace handled by console_backspace
         console_backspace();
         return;
     }
-    
-    if (c == '\t') {
-        cursor_x = (cursor_x + 8) & ~7; // Tab to next 8-character boundary
-        if (cursor_x >= max_cols) {
-            cursor_x = 0;
-            cursor_y++;
-            if (cursor_y >= max_rows) {
-                console_scroll_up();
-            }
-        }
-        return;
-    }
-    
-    // Draw the character
-    uint32_t pixel_x = cursor_x * CHAR_WIDTH;
-    uint32_t pixel_y = cursor_y * CHAR_HEIGHT;
-    
-    draw_char(c, pixel_x, pixel_y, fg_color, bg_color);
-    
-    // Flush to screen if using optimized framebuffer
-    fb_double_buffer_t* fb_opt = get_fb_double_buffer();
-    if (fb_opt) {
+    // Normal printable character
+    sb_append_char(c);
+    if (g_sb.at_bottom) {
+        // Draw at current cursor cell
+        uint32_t px = cursor_x * CHAR_WIDTH;
+        uint32_t py = cursor_y * CHAR_HEIGHT;
+        draw_char(c, px, py, fg_color, bg_color);
         fb_flush_dirty_regions();
-    }
-    
-    // Advance cursor
-    cursor_x++;
-    if (cursor_x >= max_cols) {
-        cursor_x = 0;
-        cursor_y++;
-        if (cursor_y >= max_rows) {
+        cursor_x++;
+        if (cursor_x >= max_cols) {
+            // Wrap to new line: scroll up and reset cursor_x
+            cursor_x = 0;
             console_scroll_up();
+            fb_flush_dirty_regions();
         }
+    } else {
+    // Not at bottom: do nothing visually here
     }
 }
 
@@ -440,35 +615,118 @@ void console_puts(const char* str) {
 
 // Dummy scroll function for compatibility
 void console_scroll(void) {
-    console_scroll_up();
+    // legacy hook: scroll one line up in viewport
+    console_scroll_up_line();
 }
 
 // Handle backspace - move cursor back and erase character
 void console_backspace(void) {
     if (!fb_info) return;
-    
-    // Can't backspace if we're at the beginning of the first line
-    if (cursor_x == 0 && cursor_y == 0) return;
-    
-    // Move cursor back
+    // Reflect backspace in scrollback current line
+    sb_append_char('\b');
+    if (!g_sb.at_bottom) {
+        // Do not touch the screen when scrolled up
+        console_sync_scrollbar();
+        return;
+    }
+    // Visual backspace when at bottom
+    if (cursor_x == 0 && cursor_y == 0) return; // nothing to erase
     if (cursor_x > 0) {
         cursor_x--;
     } else {
-        // Wrap to previous line
-        cursor_y--;
-        cursor_x = max_cols - 1;
+        // Move to end of previous line
+        cursor_y = (cursor_y > 0) ? (cursor_y - 1) : 0;
+        cursor_x = (max_cols > 0) ? (max_cols - 1) : 0;
     }
-    
-    // Erase the character at the current cursor position
-    uint32_t pixel_x = cursor_x * CHAR_WIDTH;
-    uint32_t pixel_y = cursor_y * CHAR_HEIGHT;
-    
-    draw_char(' ', pixel_x, pixel_y, fg_color, bg_color);
-    
-    // Flush to screen if using optimized framebuffer
-    fb_double_buffer_t* fb_opt = get_fb_double_buffer();
-    if (fb_opt) {
+    uint32_t px = cursor_x * CHAR_WIDTH;
+    uint32_t py = cursor_y * CHAR_HEIGHT;
+    draw_char(' ', px, py, fg_color, bg_color);
+    fb_flush_dirty_regions();
+}
+
+// ================= Scrollback public APIs =================
+void console_scroll_up_line(void) {
+    if (g_sb.viewport_top > 0) {
+        g_sb.viewport_top--;
+        g_sb.at_bottom = 0;
+        console_render_view();
+        console_sync_scrollbar();
         fb_flush_dirty_regions();
+    }
+}
+
+void console_scroll_down_line(void) {
+    uint32_t eff = sb_effective_total();
+    uint32_t max_vp = (eff > g_sb.visible_lines) ? (eff - g_sb.visible_lines) : 0;
+    if (g_sb.viewport_top < max_vp) {
+        g_sb.viewport_top++;
+        if (g_sb.viewport_top >= max_vp) g_sb.at_bottom = 1; else g_sb.at_bottom = 0;
+        console_render_view();
+        console_sync_scrollbar();
+        fb_flush_dirty_regions();
+    }
+}
+
+void console_set_viewport_top(uint32_t line) {
+    uint32_t eff = sb_effective_total();
+    uint32_t max_vp = (eff > g_sb.visible_lines) ? (eff - g_sb.visible_lines) : 0;
+    if (line > max_vp) line = max_vp;
+    g_sb.viewport_top = line;
+    g_sb.at_bottom = (line >= max_vp);
+    console_render_view();
+    console_sync_scrollbar();
+    fb_flush_dirty_regions();
+}
+
+void console_handle_mouse_event(int x, int y, uint8_t left_pressed) {
+    scrollbar_t* sb = scrollbar_get_system();
+    if (!sb) return;
+    // Arrow clicks
+    if (left_pressed) {
+        if (scrollbar_hit_up(sb, (uint32_t)x, (uint32_t)y)) {
+            console_scroll_up_line();
+            return;
+        }
+        if (scrollbar_hit_down(sb, (uint32_t)x, (uint32_t)y)) {
+            console_scroll_down_line();
+            return;
+        }
+        // Begin drag if thumb
+        if (!g_sb.dragging_thumb && scrollbar_hit_thumb(sb, (uint32_t)x, (uint32_t)y)) {
+            g_sb.dragging_thumb = 1;
+            g_sb.drag_start_y = y;
+            g_sb.drag_start_viewport = g_sb.viewport_top;
+            return;
+        }
+    } else {
+        g_sb.dragging_thumb = 0;
+    }
+    // Drag update
+    if (g_sb.dragging_thumb) {
+        // Map delta Y to viewport range
+        uint32_t track_range = (sb->track_height > sb->thumb_height) ? (sb->track_height - sb->thumb_height) : 0;
+        uint32_t eff = sb_effective_total();
+        uint32_t max_vp = (eff > g_sb.visible_lines) ? (eff - g_sb.visible_lines) : 0;
+        if (track_range > 0 && max_vp > 0) {
+            int dy = y - g_sb.drag_start_y;
+            // Compute proportional change: dy/track_range * max_vp
+            int d_view = (int)((int64_t)dy * (int64_t)max_vp / (int64_t)track_range);
+            int new_vp = (int)g_sb.drag_start_viewport + d_view;
+            if (new_vp < 0) new_vp = 0;
+            if (new_vp > (int)max_vp) new_vp = (int)max_vp;
+            console_set_viewport_top((uint32_t)new_vp);
+        }
+    }
+}
+
+void console_handle_mouse_wheel(int delta) {
+    if (delta > 0) {
+        // wheel up: scroll up a few lines
+        uint32_t steps = (delta > 3) ? 3 : (uint32_t)delta;
+        for (uint32_t i = 0; i < steps; ++i) console_scroll_up_line();
+    } else if (delta < 0) {
+        uint32_t steps = (-delta > 3) ? 3 : (uint32_t)(-delta);
+        for (uint32_t i = 0; i < steps; ++i) console_scroll_down_line();
     }
 }
 

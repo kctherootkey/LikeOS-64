@@ -5,6 +5,7 @@
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/fb_optimize.h"
 #include "../../include/kernel/memory.h"
+#include "../../include/kernel/console.h"
 
 // Global mouse state
 static mouse_state_t mouse_state = {0};
@@ -294,7 +295,9 @@ static void mouse_process_packet(void) {
         // For IntelliMouse, use the full Z byte without masking
         mouse_state.scroll_delta = raw_z;
         if (raw_z != 0) {
-            kprintf("Scroll wheel: raw_z=%d\n", raw_z);
+            // kprintf("Scroll wheel: raw_z=%d\n", raw_z);
+            // Forward wheel to console immediately
+            console_handle_mouse_wheel((int)raw_z);
         }
     }
     
@@ -340,6 +343,9 @@ static void mouse_process_packet(void) {
     if (mouse_state.x != mouse_state.last_x || mouse_state.y != mouse_state.last_y) {
         mouse_update_cursor();
     }
+
+    // Forward button/position events to console for scrollbar interactions
+    console_handle_mouse_event(mouse_state.x, mouse_state.y, mouse_state.left_button ? 1 : 0);
     
     // Reset packet index for next packet
     mouse_state.packet_index = 0;

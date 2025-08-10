@@ -27,8 +27,8 @@ int scrollbar_init(scrollbar_t* scrollbar, uint32_t x, uint32_t y, uint32_t heig
     scrollbar->auto_hide = 0;
     
     // Initialize future scrolling parameters
-    scrollbar->total_content = 100;
-    scrollbar->visible_content = 30;
+    scrollbar->total_content = 0;
+    scrollbar->visible_content = 0;
     scrollbar->scroll_position = 0;
     
     // Calculate component positions
@@ -48,11 +48,10 @@ void scrollbar_calculate_positions(scrollbar_t* scrollbar) {
     scrollbar->track_y = scrollbar->y + scrollbar->button_size;
     scrollbar->track_height = scrollbar->height - (2 * scrollbar->button_size);
     
-    // Thumb is 30% of track height, positioned at 1/3 from top
-    scrollbar->thumb_height = scrollbar->track_height * 30 / 100;
-    if (scrollbar->thumb_height < 12) scrollbar->thumb_height = 12; // Minimum size
-    
-    scrollbar->thumb_y = scrollbar->track_y + (scrollbar->track_height / 3);
+    // Default thumb until content sync sets real values
+    scrollbar->thumb_height = (scrollbar->track_height > 0) ? (scrollbar->track_height / 4) : 0;
+    if (scrollbar->thumb_height < 8) scrollbar->thumb_height = 8; // Minimum size
+    scrollbar->thumb_y = scrollbar->track_y;
 }
 
 // Set scrollbar visibility
@@ -374,4 +373,69 @@ void scrollbar_refresh_system(void) {
 // Get pointer to system scrollbar
 scrollbar_t* scrollbar_get_system(void) {
     return g_system_scrollbar;
+}
+
+// ===== New helpers for content/geometry sync and hit-testing =====
+static uint32_t clampu32(uint32_t v, uint32_t lo, uint32_t hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+void scrollbar_compute_geometry(scrollbar_t* sb) {
+    if (!sb) return;
+    sb->button_size = sb->width;
+    sb->track_y = sb->y + sb->button_size;
+    sb->track_height = (sb->height > 2 * sb->button_size) ? (sb->height - 2 * sb->button_size) : 0;
+    if (sb->track_height == 0) {
+        sb->thumb_height = 0;
+        sb->thumb_y = sb->track_y;
+        return;
+    }
+    // Compute thumb height proportional to visible/total
+    if (sb->total_content == 0 || sb->visible_content == 0 || sb->total_content <= sb->visible_content) {
+        sb->thumb_height = sb->track_height; // all content fits
+        sb->thumb_y = sb->track_y;
+        return;
+    }
+    uint32_t min_thumb = 8;
+    uint32_t h = (uint32_t)((uint64_t)sb->track_height * (uint64_t)sb->visible_content / (uint64_t)sb->total_content);
+    if (h < min_thumb) h = min_thumb;
+    if (h > sb->track_height) h = sb->track_height;
+    sb->thumb_height = h;
+    // Map scroll_position to thumb_y within track
+    uint32_t max_scroll = sb->total_content - sb->visible_content;
+    uint32_t track_range = (sb->track_height > sb->thumb_height) ? (sb->track_height - sb->thumb_height) : 0;
+    uint32_t ty = sb->track_y;
+    if (max_scroll > 0 && track_range > 0) {
+        ty = sb->track_y + (uint32_t)((uint64_t)sb->scroll_position * (uint64_t)track_range / (uint64_t)max_scroll);
+    }
+    sb->thumb_y = ty;
+}
+
+void scrollbar_sync_content(scrollbar_t* sb, const scrollbar_content_t* content) {
+    if (!sb || !content) return;
+    sb->total_content = content->total_lines;
+    sb->visible_content = content->visible_lines;
+    sb->scroll_position = content->viewport_top;
+    scrollbar_compute_geometry(sb);
+}
+
+int scrollbar_hit_up(const scrollbar_t* sb, uint32_t x, uint32_t y) {
+    if (!sb || !sb->visible) return 0;
+    return (x >= sb->x && x < sb->x + sb->width && y >= sb->y && y < sb->y + sb->button_size);
+}
+
+int scrollbar_hit_down(const scrollbar_t* sb, uint32_t x, uint32_t y) {
+    if (!sb || !sb->visible) return 0;
+    uint32_t by = sb->y + sb->height - sb->button_size;
+    return (x >= sb->x && x < sb->x + sb->width && y >= by && y < by + sb->button_size);
+}
+
+int scrollbar_hit_thumb(const scrollbar_t* sb, uint32_t x, uint32_t y) {
+    if (!sb || !sb->visible) return 0;
+    // Thumb is inset by 1px on X in render; accept within track width
+    uint32_t tx = sb->x + 1;
+    uint32_t tw = (sb->width > 2) ? (sb->width - 2) : sb->width;
+    return (x >= tx && x < tx + tw && y >= sb->thumb_y && y < sb->thumb_y + sb->thumb_height);
 }

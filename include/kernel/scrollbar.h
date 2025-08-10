@@ -57,6 +57,13 @@ typedef struct {
     uint32_t scroll_position;   // Current scroll position
 } scrollbar_t;
 
+// Lightweight content sync descriptor for console integration
+typedef struct {
+    uint32_t total_lines;     // total_filled_lines (clamped to capacity)
+    uint32_t visible_lines;   // rows on screen
+    uint32_t viewport_top;    // first visible line (0..max)
+} scrollbar_content_t;
+
 // Function prototypes
 
 // Initialization and configuration
@@ -70,6 +77,15 @@ void scrollbar_render_up_button(scrollbar_t* scrollbar);
 void scrollbar_render_down_button(scrollbar_t* scrollbar);
 void scrollbar_render_track(scrollbar_t* scrollbar);
 void scrollbar_render_thumb(scrollbar_t* scrollbar);
+
+// Content/geometry syncing
+void scrollbar_sync_content(scrollbar_t* sb, const scrollbar_content_t* content);
+void scrollbar_compute_geometry(scrollbar_t* sb);
+
+// Hit-test helpers (returns 0/1)
+int scrollbar_hit_up(const scrollbar_t* sb, uint32_t x, uint32_t y);
+int scrollbar_hit_down(const scrollbar_t* sb, uint32_t x, uint32_t y);
+int scrollbar_hit_thumb(const scrollbar_t* sb, uint32_t x, uint32_t y);
 
 // Utility drawing functions
 void draw_triangle_up(uint32_t x, uint32_t y, uint32_t size, uint32_t color);

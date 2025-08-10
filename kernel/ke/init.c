@@ -7,6 +7,7 @@
 #include "../../include/kernel/mouse.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/scrollbar.h"
+#include "../../include/kernel/fb_optimize.h"
 
 // Function prototypes
 void KiSystemStartup(void);
@@ -71,7 +72,7 @@ void KiSystemStartup(void) {
     kprintf("\nFramebuffer Optimization Status:\n");
     console_show_fb_status();
 
-    // Initialize and render system scrollbar
+    // Initialize and render system scrollbar (single source of truth)
     kprintf("\nInitializing visual scrollbar system...\n");
     static scrollbar_t system_scrollbar;
     if (scrollbar_init_system_default(&system_scrollbar) == 0) {
