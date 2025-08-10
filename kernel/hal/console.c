@@ -508,9 +508,6 @@ static void console_scroll_up(void) {
     cursor_y = max_rows - 1;
     cursor_x = 0;
     
-    // Refresh scrollbar after scrolling to ensure it remains visible
-    scrollbar_refresh_system();
-    
     // Show mouse cursor again after scrolling is complete
     mouse_show_cursor(1);
 }
@@ -533,10 +530,12 @@ void console_putchar(char c) {
         sb_append_char(c);
         if (g_sb.at_bottom) {
             cursor_x = 0;
-            // Physically scroll the text area up by one line
+            // Hide cursor, scroll text area, sync scrollbar, show cursor
+            mouse_show_cursor(0);
             console_scroll_up();
             console_sync_scrollbar();
             fb_flush_dirty_regions();
+            mouse_show_cursor(1);
         } else {
             console_sync_scrollbar();
         }
@@ -649,9 +648,11 @@ void console_scroll_up_line(void) {
     if (g_sb.viewport_top > 0) {
         g_sb.viewport_top--;
         g_sb.at_bottom = 0;
-        console_render_view();
-        console_sync_scrollbar();
-        fb_flush_dirty_regions();
+    mouse_show_cursor(0);
+    console_render_view();
+    console_sync_scrollbar();
+    fb_flush_dirty_regions();
+    mouse_show_cursor(1);
     }
 }
 
@@ -661,9 +662,11 @@ void console_scroll_down_line(void) {
     if (g_sb.viewport_top < max_vp) {
         g_sb.viewport_top++;
         if (g_sb.viewport_top >= max_vp) g_sb.at_bottom = 1; else g_sb.at_bottom = 0;
-        console_render_view();
-        console_sync_scrollbar();
-        fb_flush_dirty_regions();
+    mouse_show_cursor(0);
+    console_render_view();
+    console_sync_scrollbar();
+    fb_flush_dirty_regions();
+    mouse_show_cursor(1);
     }
 }
 
@@ -673,9 +676,11 @@ void console_set_viewport_top(uint32_t line) {
     if (line > max_vp) line = max_vp;
     g_sb.viewport_top = line;
     g_sb.at_bottom = (line >= max_vp);
+    mouse_show_cursor(0);
     console_render_view();
     console_sync_scrollbar();
     fb_flush_dirty_regions();
+    mouse_show_cursor(1);
 }
 
 void console_handle_mouse_event(int x, int y, uint8_t left_pressed) {
@@ -692,10 +697,32 @@ void console_handle_mouse_event(int x, int y, uint8_t left_pressed) {
             return;
         }
         // Begin drag if thumb
-        if (!g_sb.dragging_thumb && scrollbar_hit_thumb(sb, (uint32_t)x, (uint32_t)y)) {
+    if (!g_sb.dragging_thumb && scrollbar_hit_thumb(sb, (uint32_t)x, (uint32_t)y)) {
             g_sb.dragging_thumb = 1;
             g_sb.drag_start_y = y;
             g_sb.drag_start_viewport = g_sb.viewport_top;
+            return;
+        }
+        // Track click (outside buttons and thumb): page up/down like GNOME Chrome
+        // Check if inside the track area
+        uint32_t track_top = sb->track_y;
+        uint32_t track_bottom = sb->track_y + sb->track_height;
+        if ((uint32_t)x >= sb->x && (uint32_t)x < sb->x + sb->width && (uint32_t)y >= track_top && (uint32_t)y < track_bottom) {
+            // Determine page size and direction relative to thumb
+            uint32_t page = (g_sb.visible_lines > 1) ? (g_sb.visible_lines - 1) : g_sb.visible_lines;
+            if ((uint32_t)y < sb->thumb_y) {
+                // Page up
+                uint32_t new_top = (g_sb.viewport_top > page) ? (g_sb.viewport_top - page) : 0;
+                console_set_viewport_top(new_top);
+            } else if ((uint32_t)y >= sb->thumb_y + sb->thumb_height) {
+                // Page down
+                uint32_t eff = sb_effective_total();
+                uint32_t max_vp = (eff > g_sb.visible_lines) ? (eff - g_sb.visible_lines) : 0;
+                uint32_t add = page;
+                uint32_t new_top = g_sb.viewport_top + add;
+                if (new_top > max_vp) new_top = max_vp;
+                console_set_viewport_top(new_top);
+            }
             return;
         }
     } else {

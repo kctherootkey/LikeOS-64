@@ -68,7 +68,9 @@ void scrollbar_render(scrollbar_t* scrollbar) {
     scrollbar_render_track(scrollbar);
     scrollbar_render_up_button(scrollbar);
     scrollbar_render_down_button(scrollbar);
-    scrollbar_render_thumb(scrollbar);
+    if (scrollbar->thumb_height > 0) {
+        scrollbar_render_thumb(scrollbar);
+    }
     
     // Mark the entire scrollbar area as dirty
     scrollbar_mark_dirty_region(scrollbar);
@@ -165,8 +167,9 @@ void scrollbar_render_thumb(scrollbar_t* scrollbar) {
     
     uint32_t x = scrollbar->x + 1; // 1 pixel inset from track edge
     uint32_t y = scrollbar->thumb_y;
-    uint32_t width = scrollbar->width - 2; // 2 pixels narrower than track
+    uint32_t width = (scrollbar->width > 2) ? (scrollbar->width - 2) : scrollbar->width; // 2px inset guard
     uint32_t height = scrollbar->thumb_height;
+    if (height == 0 || width == 0) return;
     
     // Get thumb color based on state
     uint32_t bg_color = get_thumb_color(scrollbar->thumb_state);
@@ -175,8 +178,10 @@ void scrollbar_render_thumb(scrollbar_t* scrollbar) {
     draw_rounded_rect(x, y, width, height, bg_color, SCROLLBAR_BORDER_COLOR - 0x222222);
     
     // Add subtle gradient effect
-    draw_gradient_rect(x + 1, y + 1, width - 2, height - 2, 
-                      bg_color + 0x101010, bg_color - 0x101010);
+    if (width > 2 && height > 2) {
+        draw_gradient_rect(x + 1, y + 1, width - 2, height - 2,
+                           bg_color + 0x101010, bg_color - 0x101010);
+    }
 }
 
 // Draw an upward-pointing triangle
@@ -222,27 +227,28 @@ void draw_rounded_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
     // Right
     fb_fill_rect(x + width - 1, y, 1, height, border_color);
     
-    // Simple corner rounding - remove corner pixels
+    // Simple corner rounding - remove/adjust corner pixels if size permits
     if (width > 4 && height > 4) {
+        uint32_t x1 = x;
+        uint32_t y1 = y;
+        uint32_t x2 = x + width - 1;
+        uint32_t y2 = y + height - 1;
         // Top-left corner
-        fb_set_pixel(x, y, border_color);
-        fb_set_pixel(x + 1, y, color);
-        fb_set_pixel(x, y + 1, color);
-        
+        fb_set_pixel(x1, y1, border_color);
+        fb_set_pixel(x1 + 1, y1, color);
+        fb_set_pixel(x1, y1 + 1, color);
         // Top-right corner
-        fb_set_pixel(x + width - 1, y, border_color);
-        fb_set_pixel(x + width - 2, y, color);
-        fb_set_pixel(x + width - 1, y + 1, color);
-        
+        fb_set_pixel(x2, y1, border_color);
+        if (x2 > 0) fb_set_pixel(x2 - 1, y1, color);
+        fb_set_pixel(x2, y1 + 1, color);
         // Bottom-left corner
-        fb_set_pixel(x, y + height - 1, border_color);
-        fb_set_pixel(x + 1, y + height - 1, color);
-        fb_set_pixel(x, y + height - 2, color);
-        
+        fb_set_pixel(x1, y2, border_color);
+        if (y2 > 0) fb_set_pixel(x1, y2 - 1, color);
+        fb_set_pixel(x1 + 1, y2, color);
         // Bottom-right corner
-        fb_set_pixel(x + width - 1, y + height - 1, border_color);
-        fb_set_pixel(x + width - 2, y + height - 1, color);
-        fb_set_pixel(x + width - 1, y + height - 2, color);
+        fb_set_pixel(x2, y2, border_color);
+        if (x2 > 0) fb_set_pixel(x2 - 1, y2, color);
+        if (y2 > 0) fb_set_pixel(x2, y2 - 1, color);
     }
 }
 
