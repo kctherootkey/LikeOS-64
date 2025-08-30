@@ -34,8 +34,11 @@ typedef struct {
 typedef struct {
     char     text[CONSOLE_MAX_LINE_LENGTH];
     uint16_t length;     // number of used characters in text
-    uint8_t  fg;         // optional attribute (VGA color index)
-    uint8_t  bg;         // optional attribute (VGA color index)
+    uint8_t  fg;         // legacy line-level fg (first char or last written)
+    uint8_t  bg;         // legacy line-level bg
+    // Per-character attributes to preserve color across scrolling
+    uint8_t  fg_attrs[CONSOLE_MAX_LINE_LENGTH];
+    uint8_t  bg_attrs[CONSOLE_MAX_LINE_LENGTH];
 } console_line_t;
 
 // Scrollback state

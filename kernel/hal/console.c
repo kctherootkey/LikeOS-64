@@ -31,8 +31,10 @@ static void string_putchar(char c, string_buffer_t* sb) {
 static uint32_t cursor_x = 0;
 static uint32_t cursor_y = 0;
 static framebuffer_info_t* fb_info = 0;
-static uint32_t fg_color = 0xFFFFFFFF; // White
-static uint32_t bg_color = 0x00000000; // Black
+static uint32_t fg_color = 0xFFFFFFFF; // White (RGB)
+static uint32_t bg_color = 0x00000000; // Black (RGB)
+static uint8_t current_vga_fg = VGA_COLOR_WHITE; // Track current VGA indices
+static uint8_t current_vga_bg = VGA_COLOR_BLACK;
 
 // Font - simple 8x16 bitmap font (complete character set)
 static const uint8_t font_8x16[128][16] = {
@@ -203,9 +205,11 @@ static inline uint32_t sb_capacity(void) { return CONSOLE_SCROLLBACK_LINES; }
 static inline uint32_t sb_visible_lines(void) { return max_rows; }
 
 static uint32_t sb_effective_total(void) {
-    // effective total lines available to view (min(total_filled, capacity))
+    // Include current in-progress line. total_filled_lines counts completed lines.
     uint32_t cap = sb_capacity();
-    return (g_sb.total_filled_lines < cap) ? g_sb.total_filled_lines : cap;
+    uint64_t eff = (uint64_t)g_sb.total_filled_lines + 1ULL;
+    if (eff > cap) eff = cap;
+    return (uint32_t)eff;
 }
 
 static void sb_reset(void) {
@@ -224,6 +228,10 @@ static void sb_reset(void) {
         g_lines[i].text[0] = '\0';
         g_lines[i].fg = VGA_COLOR_WHITE;
         g_lines[i].bg = VGA_COLOR_BLACK;
+        for (uint32_t c = 0; c < CONSOLE_MAX_LINE_LENGTH; ++c) {
+            g_lines[i].fg_attrs[c] = VGA_COLOR_WHITE;
+            g_lines[i].bg_attrs[c] = VGA_COLOR_BLACK;
+        }
     }
 }
 
@@ -236,8 +244,12 @@ static void sb_new_line(void) {
     // Clear the new line
     g_sb.lines[g_sb.head].length = 0;
     g_sb.lines[g_sb.head].text[0] = '\0';
-    g_sb.lines[g_sb.head].fg = VGA_COLOR_WHITE;
-    g_sb.lines[g_sb.head].bg = VGA_COLOR_BLACK;
+    g_sb.lines[g_sb.head].fg = current_vga_fg;
+    g_sb.lines[g_sb.head].bg = current_vga_bg;
+    for (uint32_t c = 0; c < CONSOLE_MAX_LINE_LENGTH; ++c) {
+        g_sb.lines[g_sb.head].fg_attrs[c] = current_vga_fg;
+        g_sb.lines[g_sb.head].bg_attrs[c] = current_vga_bg;
+    }
     // Auto-follow: if at bottom, keep viewport pinned
     if (g_sb.at_bottom) {
         uint32_t eff = sb_effective_total();
@@ -258,13 +270,19 @@ static void sb_append_char(char c) {
         // carriage return: reset line length to 0 (simple behavior)
         line->length = 0;
         line->text[0] = '\0';
+        line->fg = current_vga_fg;
+        line->bg = current_vga_bg;
         return;
     }
     if (c == '\t') {
         // simple tab expansion: up to next 8-char boundary using spaces
         uint16_t next = (uint16_t)(((line->length + 8) & ~7) - line->length);
         for (uint16_t i = 0; i < next && line->length < CONSOLE_MAX_LINE_LENGTH - 1; ++i) {
-            line->text[line->length++] = ' ';
+            uint16_t idx = line->length;
+            line->text[idx] = ' ';
+            line->fg_attrs[idx] = current_vga_fg;
+            line->bg_attrs[idx] = current_vga_bg;
+            line->length++;
         }
         line->text[line->length] = '\0';
         return;
@@ -277,8 +295,14 @@ static void sb_append_char(char c) {
         return;
     }
     if (line->length < CONSOLE_MAX_LINE_LENGTH - 1) {
-        line->text[line->length++] = c;
+        uint16_t idx = line->length;
+        line->text[idx] = c;
+        line->fg_attrs[idx] = current_vga_fg;
+        line->bg_attrs[idx] = current_vga_bg;
+        line->length++;
         line->text[line->length] = '\0';
+        line->fg = current_vga_fg;
+        line->bg = current_vga_bg;
     }
 }
 
@@ -317,7 +341,9 @@ static void console_render_view(void) {
         // Draw characters
         uint32_t cols = (line->length < max_cols) ? line->length : max_cols;
         for (uint32_t col = 0; col < cols; ++col) {
-            draw_char(line->text[col], col * CHAR_WIDTH, y, fg_color, bg_color);
+            uint8_t ch_fg = line->fg_attrs[col];
+            uint8_t ch_bg = line->bg_attrs[col];
+            draw_char(line->text[col], col * CHAR_WIDTH, y, vga_to_rgb(ch_fg), vga_to_rgb(ch_bg));
         }
         // Clear remaining cells on the row
         if (cols < max_cols) {
@@ -388,6 +414,8 @@ void console_init(framebuffer_info_t* fb) {
     cursor_y = 0;
     fg_color = 0xFFFFFFFF; // White
     bg_color = 0x00000000; // Black
+    current_vga_fg = VGA_COLOR_WHITE;
+    current_vga_bg = VGA_COLOR_BLACK;
     // Initialize serial console early so kprintf mirrors to QEMU if present
     serial_init();
     
@@ -514,6 +542,8 @@ static void console_scroll_up(void) {
 
 // Set console colors (VGA compatibility)
 void console_set_color(uint8_t fg, uint8_t bg) {
+    current_vga_fg = fg;
+    current_vga_bg = bg;
     fg_color = vga_to_rgb(fg);
     bg_color = vga_to_rgb(bg);
 }
@@ -570,6 +600,7 @@ void console_putchar(char c) {
                     console_scroll_up();
                 }
                 draw_char(' ', cursor_x * CHAR_WIDTH, cursor_y * CHAR_HEIGHT, fg_color, bg_color);
+                // The sb_append_char already stored attributes; nothing extra here.
                 cursor_x++;
             }
             fb_flush_dirty_regions();
