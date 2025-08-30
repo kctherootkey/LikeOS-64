@@ -47,14 +47,21 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/serial.o \
               $(BUILD_DIR)/mouse.o \
               $(BUILD_DIR)/memory.o \
-              $(BUILD_DIR)/scrollbar.o
-
+			  $(BUILD_DIR)/scrollbar.o \
+			  $(BUILD_DIR)/vfs.o \
+			  $(BUILD_DIR)/pci.o \
+			  $(BUILD_DIR)/block.o \
+			  $(BUILD_DIR)/xhci.o \
+			  $(BUILD_DIR)/fat32.o \
+			  $(BUILD_DIR)/usb.o \
+			  $(BUILD_DIR)/usb_msd.o
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
 ISO_IMAGE = $(BUILD_DIR)/LikeOS-64.iso
 FAT_IMAGE = $(BUILD_DIR)/LikeOS-64.img
 USB_IMAGE = $(BUILD_DIR)/LikeOS-64-usb.img
+DATA_IMAGE = $(BUILD_DIR)/msdata.img
 
 # Default target
 all: $(ISO_IMAGE) $(FAT_IMAGE) $(USB_IMAGE)
@@ -98,6 +105,27 @@ $(BUILD_DIR)/memory.o: $(KERNEL_DIR)/mm/memory.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/scrollbar.o: $(KERNEL_DIR)/hal/scrollbar.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vfs.o: $(KERNEL_DIR)/fs/vfs.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/pci.o: $(KERNEL_DIR)/hal/pci.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/block.o: $(KERNEL_DIR)/hal/block.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/xhci.o: $(KERNEL_DIR)/hal/xhci.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fat32.o: $(KERNEL_DIR)/fs/fat32.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/usb.o: $(KERNEL_DIR)/hal/usb.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/usb_msd.o: $(KERNEL_DIR)/hal/usb_msd.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # Build kernel ELF
@@ -190,6 +218,28 @@ qemu: $(ISO_IMAGE)
 qemu-fat: $(FAT_IMAGE)
 	@echo "Running LikeOS-64 from FAT image in QEMU with UEFI firmware..."
 	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -drive format=raw,file=$(FAT_IMAGE) -m 512M -serial stdio
+
+# Standalone USB mass storage data image (larger 64MB FAT32) with sample files
+# Small (< ~32MB) FAT32 volumes can fall below the FAT32 minimum cluster count, causing mtools copy failures.
+# Use a 64MB image to satisfy FAT32 constraints so mcopy reliably works and files appear to the OS.
+$(DATA_IMAGE): | $(BUILD_DIR)
+	@echo "Creating USB data FAT32 image (msdata.img, 64MB)..."
+	$(DD) if=/dev/zero of=$(DATA_IMAGE) bs=1M count=64
+	$(MKFS_FAT) -F32 -n "MSDATA" $(DATA_IMAGE)
+	echo "Hello from USB mass storage" > $(BUILD_DIR)/HELLO.TXT
+	echo "Second file for listing test" > $(BUILD_DIR)/SECOND.TXT
+	set -e; \
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/HELLO.TXT ::/HELLO.TXT; \
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/SECOND.TXT ::/SECOND.TXT; \
+	rm -f $(BUILD_DIR)/HELLO.TXT $(BUILD_DIR)/SECOND.TXT || true
+	@echo "Data image created with sample files: $(DATA_IMAGE)"
+
+# Run with ISO boot plus attached xHCI controller and USB mass storage device
+qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
+	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage..."
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio \
+		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
+		-device usb-storage,drive=usbdisk
 
 # Write ISO to USB device with GPT partition table (like Rufus)
 # Usage: make usb-write USB_DEVICE=/dev/sdX
