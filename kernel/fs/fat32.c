@@ -354,14 +354,19 @@ unsigned long fat32_parent_cluster(unsigned long dir_cluster){
     return g_root_dir_cluster;
 }
 
+// Forward declare ops so open can assign pointer
+static int fat32_open(const char* path, vfs_file_t** out);
+static long fat32_read(vfs_file_t* f, void* buf, long bytes);
+static int fat32_close(vfs_file_t* f);
+static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_read, fat32_close };
+
 static int fat32_open(const char* path, vfs_file_t** out){
     if(!out) return ST_INVALID;
     unsigned attr; unsigned long fc; unsigned long size;
-    // Use current working directory cluster
     if(fat32_resolve_path(fat32_get_cwd(), path, &attr, &fc, &size)!=ST_OK) return ST_NOT_FOUND;
     if(attr & FAT32_ATTR_DIRECTORY) return ST_UNSUPPORTED;
     fat32_file_t* ff = (fat32_file_t*)kalloc(sizeof(fat32_file_t)); if(!ff) return ST_NOMEM;
-    ff->fs = g_root_fs; ff->start_cluster = fc; ff->current_cluster = fc; ff->size = size; ff->pos = 0; ff->vfs.ops=0; ff->vfs.fs_private=ff;
+    ff->fs = g_root_fs; ff->start_cluster = fc; ff->current_cluster = fc; ff->size = size; ff->pos = 0; ff->vfs.ops=&fat32_vfs_ops; ff->vfs.fs_private=ff;
     *out = &ff->vfs;
     kprintf("FAT32: open %s size=%lu cluster=%lu\n", path, ff->size, ff->start_cluster);
     return ST_OK;
@@ -396,9 +401,9 @@ static long fat32_read(vfs_file_t* f, void* buf, long bytes){
     }
     return (long)copied;
 }
-static int fat32_close(vfs_file_t* f){ (void)f; return ST_OK; }
+static int fat32_close(vfs_file_t* f){ if(!f) return ST_INVALID; fat32_file_t* ff=(fat32_file_t*)f->fs_private; if(ff) kfree(ff); return ST_OK; }
 
-static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_read, fat32_close };
+// (ops struct moved earlier)
 
 // Accessor for root cluster
 unsigned long fat32_root_cluster(void){ return g_root_dir_cluster; }
