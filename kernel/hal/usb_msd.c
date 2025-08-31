@@ -40,12 +40,15 @@ static int bot_send_cbw(xhci_controller_t* ctrl, usb_device_t* dev, usb_msd_cbw_
     if(sizeof(usb_msd_cbw_t) > 64){ kprintf("MSD: CBW size unexpected %u\n", (unsigned)sizeof(usb_msd_cbw_t)); return -1; }
     // Copy CBW
     for(unsigned i=0;i<sizeof(usb_msd_cbw_t);++i) ((uint8_t*)ctrl->msd_cbw_buf)[i] = ((uint8_t*)cbw)[i];
-    // Enqueue OUT transfer
+    // Enqueue OUT transfer (only CBW now; defer DATA/CSW until CBW completion event)
     if(xhci_enqueue_bulk_out(ctrl, dev, ctrl->msd_cbw_buf, sizeof(usb_msd_cbw_t)) != ST_OK) return -1;
-    // Save last enqueued OUT TRB pointer for correlation (bulk_out_enqueue already advanced)
-    unsigned idx = (ctrl->bulk_out_enqueue - 1) % 16;
+    unsigned idx = (ctrl->bulk_out_enqueue - 1) % 16; // last enqueued index
     ctrl->msd_cbw_trb = &((xhci_trb_t*)ctrl->bulk_out_ring)[idx];
+    ctrl->msd_cbw_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_cbw_trb);
+    // Reset stage TRB pointers for new operation
+    ctrl->msd_data_trb = 0; ctrl->msd_csw_trb = 0; ctrl->msd_data_phys=0; ctrl->msd_csw_phys=0;
     ctrl->msd_state = 1; // CBW out in flight
+    ctrl->msd_pending_data_buf = 0; ctrl->msd_pending_data_len = 0; ctrl->msd_need_csw = 0;
     return 0;
 }
 
@@ -69,11 +72,8 @@ static void msd_issue_inquiry(xhci_controller_t* ctrl, usb_device_t* dev){
     if(!ctrl->msd_csw_buf) ctrl->msd_csw_buf = kcalloc(1,64);
     if(bot_send_cbw(ctrl, dev, &cbw)==0){
         if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_data_buf, 36)==ST_OK){
-            unsigned didx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_data_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[didx];
-            ctrl->msd_expected_data_len=36; ctrl->msd_state=2; ctrl->msd_op=1; /* log suppressed: INQUIRY issued */
-            if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_csw_buf, sizeof(usb_msd_csw_t))==ST_OK){
-                unsigned cidx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_csw_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[cidx];
-            }
+            unsigned didx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_data_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[didx]; ctrl->msd_data_phys=(unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_data_trb);
+            ctrl->msd_expected_data_len=36; ctrl->msd_state=2; ctrl->msd_op=1; ctrl->msd_need_csw=1; // defer CSW until data complete
         }
     }
 }
@@ -84,12 +84,7 @@ static void msd_issue_test_unit_ready(xhci_controller_t* ctrl, usb_device_t* dev
     unsigned tag = next_tag(ctrl); ctrl->msd_expected_tag = tag;
     cbw.signature=0x43425355; cbw.tag=tag; cbw.data_len=0; cbw.flags=0x80; cbw.lun=0; cbw.cb_len=6; cbw.cb[0]=0x00; // TEST UNIT READY
     if(bot_send_cbw(ctrl, dev, &cbw)==0){
-        // Just queue CSW read (no data phase)
-        if(!ctrl->msd_csw_buf) ctrl->msd_csw_buf = kcalloc(1,64);
-        if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_csw_buf, sizeof(usb_msd_csw_t))==ST_OK){
-            unsigned cidx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_csw_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[cidx];
-            ctrl->msd_state=3; ctrl->msd_op=4; /* log suppressed: TEST UNIT READY issued */
-        }
+        ctrl->msd_need_csw=1; ctrl->msd_op=4; // no data stage; CSW will be queued on CBW completion
     }
 }
 
@@ -101,12 +96,8 @@ static void msd_issue_request_sense(xhci_controller_t* ctrl, usb_device_t* dev){
     if(!ctrl->msd_data_buf) ctrl->msd_data_buf = kcalloc(1,512);
     if(bot_send_cbw(ctrl, dev, &cbw)==0){
         if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_data_buf, 18)==ST_OK){
-            unsigned didx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_data_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[didx];
-            ctrl->msd_expected_data_len=18; ctrl->msd_state=2; ctrl->msd_op=5; /* log suppressed: REQUEST SENSE issued */
-            if(!ctrl->msd_csw_buf) ctrl->msd_csw_buf = kcalloc(1,64);
-            if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_csw_buf, sizeof(usb_msd_csw_t))==ST_OK){
-                unsigned cidx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_csw_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[cidx];
-            }
+            unsigned didx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_data_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[didx]; ctrl->msd_data_phys=(unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_data_trb);
+            ctrl->msd_expected_data_len=18; ctrl->msd_state=2; ctrl->msd_op=5; ctrl->msd_need_csw=1; // defer CSW
         }
     }
 }
@@ -178,11 +169,8 @@ static void msd_issue_read_capacity(xhci_controller_t* ctrl, usb_device_t* dev){
     if(!ctrl->msd_data_buf) ctrl->msd_data_buf = kcalloc(1,512);
     if(bot_send_cbw(ctrl, dev, &cbw)==0){
         if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_data_buf, 8)==ST_OK){
-            unsigned didx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_data_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[didx];
-            ctrl->msd_expected_data_len=8; ctrl->msd_state=2; ctrl->msd_op=2; kprintf("MSD: READ CAPACITY (10) issued\n");
-            if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_csw_buf, sizeof(usb_msd_csw_t))==ST_OK){
-                unsigned cidx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_csw_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[cidx];
-            }
+            unsigned didx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_data_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[didx]; ctrl->msd_data_phys=(unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_data_trb);
+            ctrl->msd_expected_data_len=8; ctrl->msd_state=2; ctrl->msd_op=2; ctrl->msd_need_csw=1; kprintf("MSD: READ CAPACITY (10) issued\n");
         }
     }
 }
@@ -199,14 +187,9 @@ static int msd_issue_read10(xhci_controller_t* ctrl, usb_device_t* dev, unsigned
     cbw.cb[2]=(lba>>24)&0xFF; cbw.cb[3]=(lba>>16)&0xFF; cbw.cb[4]=(lba>>8)&0xFF; cbw.cb[5]=lba&0xFF; cbw.cb[7]=(blocks>>8)&0xFF; cbw.cb[8]=blocks&0xFF;
     if(bot_send_cbw(ctrl, dev, &cbw)==0){
         if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_read_buf, bytes)==ST_OK){
-            unsigned didx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_data_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[didx];
-            ctrl->msd_expected_data_len=bytes; ctrl->msd_state=2; ctrl->msd_op=3;
-            if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_csw_buf, sizeof(usb_msd_csw_t))==ST_OK){
-                unsigned cidx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_csw_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[cidx];
-            }
-            ctrl->msd_read_lba=lba; ctrl->msd_read_blocks=blocks; ctrl->msd_read_result=0;
-            /* log suppressed: READ(10) issued */
-            return ST_OK;
+            unsigned didx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_data_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[didx]; ctrl->msd_data_phys=(unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_data_trb);
+            ctrl->msd_expected_data_len=bytes; ctrl->msd_state=2; ctrl->msd_op=3; ctrl->msd_need_csw=1;
+            ctrl->msd_read_lba=lba; ctrl->msd_read_blocks=blocks; ctrl->msd_read_result=0; return ST_OK;
         }
     }
     return ST_ERR;
@@ -229,7 +212,11 @@ static int msd_block_read(block_device_t* bdev, unsigned long lba, unsigned long
         extern char keyboard_get_char(void); while(keyboard_get_char()){};
         // Timeout safeguard (arbitrary 10k polls)
         if(ctrl->msd_poll_counter - start_poll > 10000){
-            kprintf("MSD: read timeout lba=%lu count=%lu\n", lba, count);
+            kprintf("MSD: read timeout lba=%lu count=%lu (cbw_ev=%u data_ev=%u csw_ev=%u state=%u op=%u)\n", lba, count,
+                ctrl->msd_cbw_events, ctrl->msd_data_events, ctrl->msd_csw_events, ctrl->msd_state, ctrl->msd_op);
+            kprintf("  TRB phys: cbw=%p data=%p csw=%p last_evt_ptr=%p last_cc=%u last_epid=%u\n",
+                (void*)ctrl->msd_cbw_phys, (void*)ctrl->msd_data_phys, (void*)ctrl->msd_csw_phys, (void*)ctrl->msd_last_event_ptr,
+                ctrl->msd_last_event_cc, ctrl->msd_last_event_epid);
             break;
         }
     }
@@ -261,12 +248,14 @@ static void msd_progress(xhci_controller_t* ctrl){
     }
     if(!ctrl->msd_op){
         if(!ctrl->msd_ready){
-            msd_issue_inquiry(ctrl, dev); ctrl->msd_op_start_tick=ctrl->msd_poll_counter; ctrl->msd_timeout_ticks=5000; // generous initial
+            // Pre-ready: run INQUIRY then READ CAPACITY flow, afterwards readiness flag stops further polling
+            msd_issue_inquiry(ctrl, dev); ctrl->msd_op_start_tick=ctrl->msd_poll_counter; ctrl->msd_timeout_ticks=5000;
         } else {
-            if(ctrl->msd_backoff_until && ctrl->msd_poll_counter < ctrl->msd_backoff_until){ return; }
-            msd_issue_test_unit_ready(ctrl, dev); ctrl->msd_op_start_tick=ctrl->msd_poll_counter; ctrl->msd_timeout_ticks=200; // quick TUR timeout
+            // Once ready, stop issuing periodic TEST UNIT READY to avoid spamming device
+            return;
         }
     }
+    // (Deferred logic removed; immediate queue of data+CSW used)
     if(ctrl->msd_op==1 && ctrl->msd_state==4){
         char vendor[9]; char product[17]; for(int i=0;i<8;i++){ vendor[i]=((char*)ctrl->msd_data_buf)[8+i]; if(vendor[i]<' '||vendor[i]>'~') vendor[i]=' '; } vendor[8]='\0';
         for(int i=0;i<16;i++){ product[i]=((char*)ctrl->msd_data_buf)[16+i]; if(product[i]<' '||product[i]>'~') product[i]=' '; } product[16]='\0';
@@ -315,7 +304,7 @@ static void msd_progress(xhci_controller_t* ctrl){
             kprintf("MSD: TEST UNIT READY failed status=%u -> REQUEST SENSE\n", csw->status);
             ctrl->msd_state=0; ctrl->msd_op=0; msd_issue_request_sense(ctrl, dev);
             ctrl->msd_op_start_tick=ctrl->msd_poll_counter; ctrl->msd_timeout_ticks=200; // sense soon
-        } else { ctrl->msd_state=0; ctrl->msd_op=0; }
+    } else { ctrl->msd_state=0; ctrl->msd_op=0; }
     }
     if(ctrl->msd_op==5 && ctrl->msd_state==4){
         // Parse sense data

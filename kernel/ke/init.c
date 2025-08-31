@@ -365,12 +365,6 @@ after_cmd: ;
                         if(fat32_mount(b0, &fs)==ST_OK){
                             fat32_vfs_register_root(&fs);
                             kprintf("FAT32: mount succeeded on %s\n", b0->name);
-                            // Auto list root for debug
-                            extern void fat32_list_root(void (*cb)(const char*, unsigned, unsigned long));
-                            extern void shell_ls_cb(const char*, unsigned, unsigned long);
-                            kprintf("FAT32: auto root listing (debug)\n");
-                            shell_ls_count = 0; fat32_list_root(shell_ls_cb);
-                            if(shell_ls_count==0){ extern void fat32_debug_dump_root(void); fat32_debug_dump_root(); }
                             tried_mount = 1;
                         } else {
                             kprintf("FAT32: mount attempt failed\n");

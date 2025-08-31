@@ -12,13 +12,13 @@
 #define XHCI_DEBUG 0          // general one-off init messages currently suppressed
 #endif
 #ifndef XHCI_EVT_DEBUG
-#define XHCI_EVT_DEBUG 1     // disable verbose transfer event logging
+#define XHCI_EVT_DEBUG 0     // enable verbose transfer event logging
 #endif
 #ifndef XHCI_BULK_DEBUG
-#define XHCI_BULK_DEBUG 1      // disable bulk enqueue logging
+#define XHCI_BULK_DEBUG 0      // enable bulk enqueue logging
 #endif
 #ifndef XHCI_MSD_DEBUG
-#define XHCI_MSD_DEBUG 1       // disable MSD BOT phase completion logs
+#define XHCI_MSD_DEBUG 0       // enable MSD BOT phase completion logs
 #endif
 
 #define XHCI_LOG(fmt, ...)        do { if(XHCI_DEBUG)     kprintf(fmt, ##__VA_ARGS__); } while(0)
@@ -473,13 +473,17 @@ int xhci_process_events(xhci_controller_t* ctrl){
                     dev->endpoints_configured = 1; dev->configured = 1;
                     XHCI_EVT_LOG("xhci: configure_endpoint complete slot=%u bulk in ep=%u out ep=%u\n", dev->slot_id, dev->bulk_in_ep, dev->bulk_out_ep);
                     unsigned ctx_stride2 = (ctrl->hccparams1 & (1u<<2)) ? 64u : 32u;
-                    unsigned epid_out2 = dev->bulk_out_ep ? (dev->bulk_out_ep << 1) : 0;
-                    unsigned epid_in2  = dev->bulk_in_ep ? ((dev->bulk_in_ep << 1) | 1) : 0;
+                    // Revert EPID computation to spec: EPID = (EpNum << 1) | Dir (1=IN); EP0=1.
+                    unsigned epid_out2 = dev->bulk_out_ep ? ((dev->bulk_out_ep << 1) | 0) : 0;
+                    unsigned epid_in2  = dev->bulk_in_ep  ? ((dev->bulk_in_ep  << 1) | 1) : 0;
                     // Device Context indexing per spec: Slot Context at index 0, EP0 at 1, EPID n at index n
                     volatile uint32_t* ep_out_ctx2 = epid_out2 ? (volatile uint32_t*)((uint8_t*)dev->device_ctx + ctx_stride2 * epid_out2) : 0;
                     volatile uint32_t* ep_in_ctx2  = epid_in2  ? (volatile uint32_t*)((uint8_t*)dev->device_ctx + ctx_stride2 * epid_in2) : 0;
                     if(ep_out_ctx2) XHCI_EVT_LOG("xhci: OUT epctx dw0=%08x dw1=%08x dw2=%08x dw3=%08x\n", ep_out_ctx2[0],ep_out_ctx2[1],ep_out_ctx2[2],ep_out_ctx2[3]);
                     if(ep_in_ctx2)  XHCI_EVT_LOG("xhci: IN  epctx dw0=%08x dw1=%08x dw2=%08x dw3=%08x\n", ep_in_ctx2[0],ep_in_ctx2[1],ep_in_ctx2[2],ep_in_ctx2[3]);
+                    // Extra sanity: dump slot context dword0/1 and EPIDs used
+                    volatile uint32_t* slotc_dbg = (volatile uint32_t*)dev->device_ctx;
+                    XHCI_EVT_LOG("xhci: DC slotc0=%08x slotc1=%08x (epid_out=%u epid_in=%u)\n", slotc_dbg[0], slotc_dbg[1], epid_out2, epid_in2);
                     // If endpoint contexts look uninitialized, request Evaluate Context to re-supply them to controller
                     unsigned add_mask_eval = 0;
                     if(ep_out_ctx2){
@@ -550,11 +554,57 @@ cmd_done:;
                 uint64_t data_phys = ctrl->msd_data_trb ? (uint64_t)MmGetPhysicalAddress((uint64_t)ctrl->msd_data_trb) : 0;
                 uint64_t csw_phys = ctrl->msd_csw_trb ? (uint64_t)MmGetPhysicalAddress((uint64_t)ctrl->msd_csw_trb) : 0;
                 if(ep_trb_ptr == cbw_phys){
-                    if(ctrl->msd_state==1){ ctrl->msd_state=2; XHCI_MSD_LOG("MSD: CBW complete cc=%u\n", cc); }
+                    // Always record CBW event
+                    ctrl->msd_cbw_events++; ctrl->msd_last_event_cc=cc; ctrl->msd_last_event_epid=epid; ctrl->msd_last_event_ptr = ep_trb_ptr;
+                    if(cc!=1){
+                        XHCI_MSD_LOG("MSD: CBW completion error cc=%u -> abort\n", cc);
+                        ctrl->msd_state=0; ctrl->msd_op=0; // host BOT reset logic will see timeout/idle and recover
+                    } else if(ctrl->msd_state==1){
+                        ctrl->msd_state=2; XHCI_MSD_LOG("MSD: CBW complete (state->2)\n");
+                        // If we deferred queuing DATA stage, queue it now
+                        if(ctrl->msd_pending_data_len && ctrl->msd_pending_data_buf){
+                            if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_pending_data_buf, ctrl->msd_pending_data_len)==ST_OK){
+                                unsigned didx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_data_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[didx];
+                                ctrl->msd_data_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_data_trb);
+                            }
+                            ctrl->msd_pending_data_buf=0; ctrl->msd_pending_data_len=0;
+                        } else if(ctrl->msd_need_csw){
+                            // No data: queue CSW now
+                            if(!ctrl->msd_csw_buf) ctrl->msd_csw_buf = kcalloc(1,64);
+                            if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_csw_buf, sizeof(usb_msd_csw_t))==ST_OK){
+                                unsigned cidx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_csw_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[cidx];
+                                ctrl->msd_csw_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_csw_trb);
+                                ctrl->msd_state=3; ctrl->msd_need_csw=0;
+                            }
+                        }
+                    }
                 } else if(ep_trb_ptr == data_phys){
-                    if(ctrl->msd_state==2){ ctrl->msd_state=3; XHCI_MSD_LOG("MSD: DATA phase complete cc=%u epid=%u\n", cc, epid); }
+                    if(ctrl->msd_state==2){
+                        ctrl->msd_data_events++; ctrl->msd_last_event_cc=cc; ctrl->msd_last_event_epid=epid; ctrl->msd_last_event_ptr=ep_trb_ptr;
+                        if(cc!=1){
+                            XHCI_MSD_LOG("MSD: DATA phase error cc=%u -> abort\n", cc);
+                            ctrl->msd_state=0; ctrl->msd_op=0;
+                        } else {
+                            ctrl->msd_state=3; XHCI_MSD_LOG("MSD: DATA phase complete (queue CSW)\n");
+                            if(ctrl->msd_op){
+                                if(!ctrl->msd_csw_buf) ctrl->msd_csw_buf = kcalloc(1,64);
+                                if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_csw_buf, sizeof(usb_msd_csw_t))==ST_OK){
+                                    unsigned cidx=(ctrl->bulk_in_enqueue-1)%16; ctrl->msd_csw_trb=&((xhci_trb_t*)ctrl->bulk_in_ring)[cidx];
+                                    ctrl->msd_csw_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_csw_trb);
+                                }
+                            }
+                        }
+                    }
                 } else if(ep_trb_ptr == csw_phys){
-                    if(ctrl->msd_state==3){ ctrl->msd_state=4; XHCI_MSD_LOG("MSD: CSW complete cc=%u\n", cc); }
+                    if(ctrl->msd_state==3){
+                        ctrl->msd_csw_events++; ctrl->msd_last_event_cc=cc; ctrl->msd_last_event_epid=epid; ctrl->msd_last_event_ptr=ep_trb_ptr;
+                        if(cc==1){
+                            ctrl->msd_state=4; XHCI_MSD_LOG("MSD: CSW complete (success)\n");
+                        } else {
+                            XHCI_MSD_LOG("MSD: CSW error cc=%u -> reset pending\n", cc);
+                            ctrl->msd_state=0; ctrl->msd_op=0; // trigger retry logic outside
+                        }
+                    }
                 }
             }
         }
@@ -615,8 +665,9 @@ int xhci_enqueue_bulk_out(xhci_controller_t* ctrl, struct usb_device* dev, void*
     void* trb=0; int st = xhci_bulk_enqueue(ctrl, ctrl->bulk_out_ring, &ctrl->bulk_out_enqueue, &ctrl->bulk_out_cycle, &trb, buf, len); if(st!=ST_OK) return st;
     uint64_t trb_phys = ctrl->bulk_out_ring_phys + ((uint8_t*)trb - (uint8_t*)ctrl->bulk_out_ring);
     volatile uint32_t* db = (volatile uint32_t*)(ctrl->doorbell_array + dev->slot_id*4);
-    unsigned epid = (dev->bulk_out_ep << 1); // OUT direction bit 0
+    unsigned epid = (dev->bulk_out_ep << 1); // EPID per spec (OUT dir=0). EP0 is 1; ep1 OUT =>2.
     *db = epid;
+    static int once_out=0; if(!once_out){ once_out=1; kprintf("xhci: bulk OUT first enqueue idx=%u cyc=%u trb_phys=%p\n", (ctrl->bulk_out_enqueue-1)%16, ctrl->bulk_out_cycle&1, (void*)trb_phys); }
     // verbose doorbell log removed
     return ST_OK;
 }
@@ -625,8 +676,9 @@ int xhci_enqueue_bulk_in(xhci_controller_t* ctrl, struct usb_device* dev, void* 
     void* trb=0; int st = xhci_bulk_enqueue(ctrl, ctrl->bulk_in_ring, &ctrl->bulk_in_enqueue, &ctrl->bulk_in_cycle, &trb, buf, len); if(st!=ST_OK) return st;
     uint64_t trb_phys = ctrl->bulk_in_ring_phys + ((uint8_t*)trb - (uint8_t*)ctrl->bulk_in_ring);
     volatile uint32_t* db = (volatile uint32_t*)(ctrl->doorbell_array + dev->slot_id*4);
-    unsigned epid = (dev->bulk_in_ep << 1) | 1; // IN direction bit 1
+    unsigned epid = ((dev->bulk_in_ep << 1) | 1); // EPID per spec (IN dir=1). ep1 IN =>3, ep2 IN =>5.
     *db = epid;
+    static int once_in=0; if(!once_in){ once_in=1; kprintf("xhci: bulk IN first enqueue idx=%u cyc=%u trb_phys=%p\n", (ctrl->bulk_in_enqueue-1)%16, ctrl->bulk_in_cycle&1, (void*)trb_phys); }
     // verbose doorbell log removed
     return ST_OK;
 }
@@ -666,9 +718,9 @@ static void xhci_configure_bulk_endpoints(xhci_controller_t* ctrl, usb_device_t*
     volatile uint32_t* icc = (volatile uint32_t*)dev->input_ctx;
     // Prepare Input Control Context flags
     uint32_t add = 0x1; // include slot only; we'll add bulk endpoints below (exclude EP0 to avoid reconfig of control)
-    // Compute EPIDs (EPID formula: EPID = (EndpointNumber << 1) | Direction (1=IN), with EP0=1)
-    unsigned epid_out = dev->bulk_out_ep ? (dev->bulk_out_ep << 1) : 0; // direction 0
-    unsigned epid_in  = dev->bulk_in_ep  ? ((dev->bulk_in_ep << 1) | 1) : 0; // direction 1
+    // Compute EPIDs per spec: EPID = (EpNum << 1) | Dir (1=IN). EP0 = 1.
+    unsigned epid_out = dev->bulk_out_ep ? ((dev->bulk_out_ep << 1) | 0) : 0; // OUT dir=0
+    unsigned epid_in  = dev->bulk_in_ep  ? ((dev->bulk_in_ep  << 1) | 1) : 0; // IN dir=1
     unsigned max_epid = 1; // at least EP0
     if(epid_out){ add |= (1u << epid_out); if(epid_out > max_epid) max_epid = epid_out; }
     if(epid_in){ add |= (1u << epid_in); if(epid_in > max_epid) max_epid = epid_in; }
@@ -683,7 +735,7 @@ static void xhci_configure_bulk_endpoints(xhci_controller_t* ctrl, usb_device_t*
     XHCI_EVT_LOG("xhci: slot_ctx build sc0=%08x sc1=%08x max_epid=%u speed=%u\n", slot_ctx[0], slot_ctx[1], max_epid, speed_code);
     // OUT endpoint context
     if(epid_out){
-        // In Input Context, contexts start after the Input Control Context, so offset = (EPID+1)*stride
+        // In Input Context layout, after Input Control (2 contexts?), spec: we used (EPID+1) previously; keep for now but verify: EPID index in device context, input adds +1 offset.
         volatile uint32_t* ep_out_ctx = (volatile uint32_t*)((uint8_t*)dev->input_ctx + ctx_stride * (epid_out + 1));
     unsigned out_mps = dev->bulk_out_mps; if(dev->speed != USB_SPEED_SUPER && out_mps > 512) out_mps = 512; if(dev->speed == USB_SPEED_SUPER && out_mps > 1024) out_mps = 1024;
     xhci_init_ep_ctx(ep_out_ctx, out_mps, 0);

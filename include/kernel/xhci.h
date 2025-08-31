@@ -137,6 +137,20 @@ typedef struct {
     unsigned long msd_op_start_tick;     // poll counter at op start
     unsigned long msd_timeout_ticks;     // threshold before declaring timeout
     unsigned long msd_backoff_until;     // poll counter until which we delay re-issuing TUR
+    // Deferred BOT queuing (queue only CBW first; DATA+CSW after CBW completion)
+    void* msd_pending_data_buf;          // buffer to use for data phase (if any)
+    unsigned int msd_pending_data_len;   // length of data phase
+    int msd_need_csw;                    // set if a CSW IN transfer must be queued after DATA (or immediately if no DATA)
+    // Instrumentation (lightweight): event counters & last event metadata
+    unsigned int msd_cbw_events;
+    unsigned int msd_data_events;
+    unsigned int msd_csw_events;
+    unsigned int msd_last_event_cc;
+    unsigned int msd_last_event_epid;
+    unsigned long msd_cbw_phys;
+    unsigned long msd_data_phys;
+    unsigned long msd_csw_phys;
+    unsigned long msd_last_event_ptr;
 } xhci_controller_t;
 
 int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev);
