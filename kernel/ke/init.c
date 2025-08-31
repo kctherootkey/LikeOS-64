@@ -4,10 +4,12 @@
 
 // Shell helpers
 static int shell_ls_count = 0;
-static void shell_ls_cb(const char* name, unsigned attr, unsigned long size){
-    if(!name || !name[0]) return; // skip unexpected blank names
+static void shell_ls_cb(const char* name, unsigned attr, unsigned long size) {
+    if (!name || !name[0]) {
+        return; // skip unexpected blank names
+    }
     shell_ls_count++;
-    kprintf("%s %c %lu\n", name, (attr & 0x10)?'d':'-', size);
+    kprintf("%s %c %lu\n", name, (attr & 0x10) ? 'd' : '-', size);
 }
 // LikeOS-64 Kernel Executive - Initialization
 // Main kernel initialization and executive services
@@ -35,19 +37,35 @@ static unsigned long shell_path_clusters[SHELL_MAX_DEPTH];
 static char          shell_path_names[SHELL_MAX_DEPTH][SHELL_NAME_MAX];
 static int           shell_path_depth = 0; // 0 means at root
 
-static void shell_path_reset(){ shell_path_depth = 0; }
-static void shell_path_push(unsigned long cluster, const char* name){
-    if(shell_path_depth >= SHELL_MAX_DEPTH) return; // ignore overflow
+static void shell_path_reset(void) {
+    shell_path_depth = 0;
+}
+static void shell_path_push(unsigned long cluster, const char* name) {
+    if (shell_path_depth >= SHELL_MAX_DEPTH) {
+        return; // ignore overflow
+    }
     shell_path_clusters[shell_path_depth] = cluster;
-    int i=0; for(; name && name[i] && i<(SHELL_NAME_MAX-1); ++i) shell_path_names[shell_path_depth][i]=name[i];
-    shell_path_names[shell_path_depth][i]='\0';
+    int i = 0;
+    for (; name && name[i] && i < (SHELL_NAME_MAX - 1); ++i) {
+        shell_path_names[shell_path_depth][i] = name[i];
+    }
+    shell_path_names[shell_path_depth][i] = '\0';
     shell_path_depth++;
 }
-static void shell_path_pop(){ if(shell_path_depth>0) shell_path_depth--; }
-static void shell_prompt(){
-    if(fat32_get_cwd()==fat32_root_cluster()){ kprintf("/ > "); return; }
+static void shell_path_pop(void) {
+    if (shell_path_depth > 0) {
+        shell_path_depth--;
+    }
+}
+static void shell_prompt(void) {
+    if (fat32_get_cwd() == fat32_root_cluster()) {
+        kprintf("/ > ");
+        return;
+    }
     kprintf("/");
-    for(int i=0;i<shell_path_depth;i++){ kprintf("%s/", shell_path_names[i]); }
+    for (int i = 0; i < shell_path_depth; i++) {
+        kprintf("%s/", shell_path_names[i]);
+    }
     kprintf(" > ");
 }
 // UEFI kernel entry point - called by bootloader
@@ -195,111 +213,186 @@ void KiSystemStartup(void) {
                 cmd_buf[cmd_len] = '\0';
                 kprintf("\n");
                 // Process command
-                if(cmd_len > 0){
+                if (cmd_len > 0) {
                     // Trim leading spaces
-                    int start=0; while(cmd_buf[start]==' '&&start<cmd_len) start++;
+                    int start = 0;
+                    while (cmd_buf[start] == ' ' && start < cmd_len) {
+                        start++;
+                    }
                     // Find first space
-                    int sp=start; while(sp<cmd_len && cmd_buf[sp] != ' ') sp++;
-                    int cmdlen = sp-start;
+                    int sp = start;
+                    while (sp < cmd_len && cmd_buf[sp] != ' ') {
+                        sp++;
+                    }
+                    int cmdlen = sp - start;
                     // Compare commands manually
-                    int is_ls = (cmdlen==2 && cmd_buf[start]=='l' && cmd_buf[start+1]=='s');
-                    int is_cat = (cmdlen==3 && cmd_buf[start]=='c' && cmd_buf[start+1]=='a' && cmd_buf[start+2]=='t');
-                    int is_cd = (cmdlen==2 && cmd_buf[start]=='c' && cmd_buf[start+1]=='d');
-                    int is_pwd = (cmdlen==3 && cmd_buf[start]=='p' && cmd_buf[start+1]=='w' && cmd_buf[start+2]=='d');
-                    int is_stat = (cmdlen==4 && cmd_buf[start]=='s' && cmd_buf[start+1]=='t' && cmd_buf[start+2]=='a' && cmd_buf[start+3]=='t');
-                    if(is_ls){
-                        if(block_count()>0){
-                            int fn = sp; while(fn<cmd_len && cmd_buf[fn]==' ') fn++;
+                    int is_ls = (cmdlen == 2 && cmd_buf[start] == 'l' && cmd_buf[start + 1] == 's');
+                    int is_cat = (cmdlen == 3 && cmd_buf[start] == 'c' && cmd_buf[start + 1] == 'a' && cmd_buf[start + 2] == 't');
+                    int is_cd = (cmdlen == 2 && cmd_buf[start] == 'c' && cmd_buf[start + 1] == 'd');
+                    int is_pwd = (cmdlen == 3 && cmd_buf[start] == 'p' && cmd_buf[start + 1] == 'w' && cmd_buf[start + 2] == 'd');
+                    int is_stat = (cmdlen == 4 && cmd_buf[start] == 's' && cmd_buf[start + 1] == 't' && cmd_buf[start + 2] == 'a' && cmd_buf[start + 3] == 't');
+                    if (is_ls) {
+                        if (block_count() > 0) {
+                            int fn = sp;
+                            while (fn < cmd_len && cmd_buf[fn] == ' ') {
+                                fn++;
+                            }
                             unsigned long list_cluster;
-                            if(fn>=cmd_len){ list_cluster = fat32_get_cwd(); }
-                            else {
+                            if (fn >= cmd_len) {
+                                list_cluster = fat32_get_cwd();
+                            } else {
                                 // Resolve provided path
-                                unsigned a; unsigned long fc; unsigned long sz;
-                                if(fat32_resolve_path(fat32_get_cwd(), &cmd_buf[fn], &a, &fc, &sz)==ST_OK){
-                                    if(a & 0x10) list_cluster = fc; else { kprintf("ls: not a directory\n"); goto after_cmd; }
-                                } else { kprintf("ls: path not found\n"); goto after_cmd; }
+                                unsigned a;
+                                unsigned long fc;
+                                unsigned long sz;
+                                if (fat32_resolve_path(fat32_get_cwd(), &cmd_buf[fn], &a, &fc, &sz) == ST_OK) {
+                                    if (a & 0x10) {
+                                        list_cluster = fc;
+                                    } else {
+                                        kprintf("ls: not a directory\n");
+                                        goto after_cmd;
+                                    }
+                                } else {
+                                    kprintf("ls: path not found\n");
+                                    goto after_cmd;
+                                }
                             }
                             shell_ls_count = 0;
-                            if(list_cluster==fat32_root_cluster()) fat32_list_root(shell_ls_cb); else fat32_dir_list(list_cluster, shell_ls_cb);
-                            if(shell_ls_count==0 && list_cluster==fat32_root_cluster()){
+                            if (list_cluster == fat32_root_cluster()) {
+                                fat32_list_root(shell_ls_cb);
+                            } else {
+                                fat32_dir_list(list_cluster, shell_ls_cb);
+                            }
+                            if (shell_ls_count == 0 && list_cluster == fat32_root_cluster()) {
                                 // Extra debug: dump first 4 raw 8.3 names from cached root to see what's there
                                 extern void fat32_debug_dump_root(void);
                                 fat32_debug_dump_root();
                             }
-                            if(shell_ls_count==0) kprintf("(empty)\n");
-                        } else { kprintf("No block device yet\n"); }
-                    } else if(is_cd){
-                            int fn = sp; while(fn<cmd_len && cmd_buf[fn]==' ') fn++;
-                            if(fn>=cmd_len){ kprintf("Usage: cd <dir>\n"); }
-                            else {
-                                const char* path = &cmd_buf[fn];
-                                // Handle absolute path by resetting stack
-                                if(path[0]=='/') { fat32_set_cwd(0); shell_path_reset(); }
-                                // Tokenize path by '/'
-                                char segment[64]; int idx=0; int i=0; while(1){
-                                    char ch = path[i];
-                                    if(ch=='/' || ch=='\0'){
-                                        segment[idx]='\0';
-                                        if(idx>0){
-                                            if(segment[0]=='.' && segment[1]=='\0'){
-                                                // stay
-                                            } else if(segment[0]=='.' && segment[1]=='.' && segment[2]=='\0'){
-                                                // up
-                                                unsigned long cur = fat32_get_cwd();
-                                                unsigned long parent = fat32_parent_cluster(cur);
-                                                fat32_set_cwd(parent==fat32_root_cluster()?0:parent);
-                                                shell_path_pop();
+                            if (shell_ls_count == 0) {
+                                kprintf("(empty)\n");
+                            }
+                        } else {
+                            kprintf("No block device yet\n");
+                        }
+                    } else if (is_cd) {
+                        int fn = sp;
+                        while (fn < cmd_len && cmd_buf[fn] == ' ') {
+                            fn++;
+                        }
+                        if (fn >= cmd_len) {
+                            kprintf("Usage: cd <dir>\n");
+                        } else {
+                            const char* path = &cmd_buf[fn];
+                            // Handle absolute path by resetting stack
+                            if (path[0] == '/') {
+                                fat32_set_cwd(0);
+                                shell_path_reset();
+                            }
+                            // Tokenize path by '/'
+                            char segment[64];
+                            int idx = 0;
+                            int i = 0;
+                            while (1) {
+                                char ch = path[i];
+                                if (ch == '/' || ch == '\0') {
+                                    segment[idx] = '\0';
+                                    if (idx > 0) {
+                                        if (segment[0] == '.' && segment[1] == '\0') {
+                                            // stay
+                                        } else if (segment[0] == '.' && segment[1] == '.' && segment[2] == '\0') {
+                                            // up
+                                            unsigned long cur = fat32_get_cwd();
+                                            unsigned long parent = fat32_parent_cluster(cur);
+                                            fat32_set_cwd(parent == fat32_root_cluster() ? 0 : parent);
+                                            shell_path_pop();
+                                        } else {
+                                            unsigned a;
+                                            unsigned long fc;
+                                            unsigned long sz;
+                                            if (fat32_resolve_path(fat32_get_cwd(), segment, &a, &fc, &sz) == ST_OK && (a & 0x10)) {
+                                                fat32_set_cwd(fc == fat32_root_cluster() ? 0 : fc);
+                                                shell_path_push(fc, segment);
                                             } else {
-                                                unsigned a; unsigned long fc; unsigned long sz;
-                                                if(fat32_resolve_path(fat32_get_cwd(), segment, &a, &fc, &sz)==ST_OK && (a & 0x10)){
-                                                    fat32_set_cwd(fc==fat32_root_cluster()?0:fc);
-                                                    shell_path_push(fc, segment);
-                                                } else { kprintf("cd: component '%s' not dir\n", segment); break; }
+                                                kprintf("cd: component '%s' not dir\n", segment);
+                                                break;
                                             }
                                         }
-                                        idx=0; if(ch=='\0') break; i++; continue;
-                                    } else if(idx < 63) segment[idx++]=ch; i++;
+                                    }
+                                    idx = 0;
+                                    if (ch == '\0') {
+                                        break;
+                                    }
+                                    i++;
+                                    continue;
+                                } else if (idx < 63) {
+                                    segment[idx++] = ch;
+                                    i++;
                                 }
-                                kprintf("cd ok\n");
                             }
-                    } else if(is_pwd){
-                        if(fat32_get_cwd()==fat32_root_cluster()) kprintf("/\n");
-                        else {
+                            kprintf("cd ok\n");
+                        }
+                    } else if (is_pwd) {
+                        if (fat32_get_cwd() == fat32_root_cluster()) {
+                            kprintf("/\n");
+                        } else {
                             kprintf("/");
-                            for(int i=0;i<shell_path_depth;i++) kprintf("%s/", shell_path_names[i]);
+                            for (int i = 0; i < shell_path_depth; i++) {
+                                kprintf("%s/", shell_path_names[i]);
+                            }
                             kprintf("\n");
                         }
-                    } else if(is_stat){
-                        int fn = sp; while(fn<cmd_len && cmd_buf[fn]==' ') fn++;
-                        if(fn>=cmd_len){ kprintf("Usage: stat <path>\n"); }
-                        else {
-                            unsigned a; unsigned long fc; unsigned long sz;
-                            if(fat32_stat(fat32_get_cwd(), &cmd_buf[fn], &a, &fc, &sz)==ST_OK){
-                                kprintf("attr=%c size=%lu cluster=%lu\n", (a & 0x10)?'d':'f', sz, fc);
-                            } else kprintf("stat: not found\n");
+                    } else if (is_stat) {
+                        int fn = sp;
+                        while (fn < cmd_len && cmd_buf[fn] == ' ') {
+                            fn++;
                         }
-                    } else if(is_cat){
+                        if (fn >= cmd_len) {
+                            kprintf("Usage: stat <path>\n");
+                        } else {
+                            unsigned a;
+                            unsigned long fc;
+                            unsigned long sz;
+                            if (fat32_stat(fat32_get_cwd(), &cmd_buf[fn], &a, &fc, &sz) == ST_OK) {
+                                kprintf("attr=%c size=%lu cluster=%lu\n", (a & 0x10) ? 'd' : 'f', sz, fc);
+                            } else {
+                                kprintf("stat: not found\n");
+                            }
+                        }
+                    } else if (is_cat) {
                         // Skip spaces to filename
-                        int fn = sp; while(fn<cmd_len && cmd_buf[fn]==' ') fn++;
-                        if(fn>=cmd_len){ kprintf("Usage: cat <file>\n"); }
-                        else {
+                        int fn = sp;
+                        while (fn < cmd_len && cmd_buf[fn] == ' ') {
+                            fn++;
+                        }
+                        if (fn >= cmd_len) {
+                            kprintf("Usage: cat <file>\n");
+                        } else {
                             // Open via VFS
-                            vfs_file_t* vf=0;
+                            vfs_file_t* vf = 0;
                             const char* name = &cmd_buf[fn];
                             char pathbuf[128];
-                            if(name[0]!='/'){
+                            (void)pathbuf; // unused in current logic
+                            if (name[0] != '/') {
                                 unsigned long cc = fat32_get_cwd();
-                                if(cc!=fat32_root_cluster()){
+                                if (cc != fat32_root_cluster()) {
                                     // Not yet supporting subdirs, so fallback to root
                                     name = &cmd_buf[fn];
                                 }
                             }
-                            if(vfs_open(name, &vf)==ST_OK){
+                            if (vfs_open(name, &vf) == ST_OK) {
                                 // Read up to 4096 bytes
                                 char* rbuf = (char*)kalloc(4096);
-                                if(rbuf){
+                                if (rbuf) {
                                     long r = vfs_read(vf, rbuf, 4096);
-                                    if(r>0){ for(long i=0;i<r;i++){ char ch=rbuf[i]; if(ch=='\r') ch='\n'; kprintf("%c", ch); } }
+                                    if (r > 0) {
+                                        for (long i = 0; i < r; i++) {
+                                            char ch = rbuf[i];
+                                            if (ch == '\r') {
+                                                ch = '\n';
+                                            }
+                                            kprintf("%c", ch);
+                                        }
+                                    }
                                     kfree(rbuf);
                                 }
                                 vfs_close(vf);
@@ -311,37 +404,41 @@ void KiSystemStartup(void) {
                     } else {
                         kprintf("Unknown command\n");
                     }
-after_cmd: ;
+after_cmd:				;
                 }
                 cmd_len = 0;
                 shell_prompt();
             } else if (c == '\b') {
-                if(cmd_len>0){
+                if (cmd_len > 0) {
                     console_backspace();
                     cmd_len--;
                 }
             } else if (c >= ' ' && c <= '~') {
-                if(cmd_len < (int)(sizeof(cmd_buf)-1)){
+                if (cmd_len < (int)(sizeof(cmd_buf) - 1)) {
                     cmd_buf[cmd_len++] = c;
                     kprintf("%c", c);
                 }
             }
         }
-        
+
         // Periodic XHCI polling (ports + events)
         if (xhci_available) {
             xhci_poll_ports(&g_xhci);
             xhci_process_events(&g_xhci);
             usb_msd_poll(&g_xhci); // attempt MSD actions
-            static int dbg_counter=0; if(((dbg_counter++) & 0x3F)==0){ extern void xhci_debug_state(xhci_controller_t*); xhci_debug_state(&g_xhci); }
+            static int dbg_counter = 0;
+            if (((dbg_counter++) & 0x3F) == 0) {
+                extern void xhci_debug_state(xhci_controller_t*);
+                xhci_debug_state(&g_xhci);
+            }
             // Command ring stall poke: if a command pending too long, re-doorbell
-            if(g_xhci.pending_cmd_type){
+            if (g_xhci.pending_cmd_type) {
                 g_xhci.cmd_ring_stall_ticks++;
-                if((g_xhci.cmd_ring_stall_ticks & 0xFF)==0){
+                if ((g_xhci.cmd_ring_stall_ticks & 0xFF) == 0) {
                     volatile uint32_t* db0 = (volatile uint32_t*)(g_xhci.doorbell_array + 0x00);
                     *db0 = 0; // poke doorbell
                 }
-                if((g_xhci.cmd_ring_stall_ticks & 0x3FF)==0){
+                if ((g_xhci.cmd_ring_stall_ticks & 0x3FF) == 0) {
                     // Rewrite CRCR (some controllers may need reprogram after stall) and doorbell again
                     volatile unsigned long* crcr = (volatile unsigned long*)(g_xhci.op_base + XHCI_OP_CRCR);
                     unsigned long val = (g_xhci.cmd_ring_phys & ~0x3FUL) | (g_xhci.cmd_cycle_state & 1);
@@ -354,15 +451,15 @@ after_cmd: ;
             }
             // Attempt FAT32 mount once usb0 appears and not yet mounted
             static int tried_mount = 0;
-            if(!tried_mount){
+            if (!tried_mount) {
                 const block_device_t* b0 = block_get(0);
-                if(b0){
+                if (b0) {
                     // Require MSD ready (capacity known and block size set) before mount attempt to avoid early timeouts
                     extern int xhci_msd_ready_check(void* ctrl_ptr);
                     int ready = ((xhci_controller_t*)b0->driver_data)->msd_ready; // direct access
-                    if(ready){
+                    if (ready) {
                         static fat32_fs_t fs; // global root fs instance
-                        if(fat32_mount(b0, &fs)==ST_OK){
+                        if (fat32_mount(b0, &fs) == ST_OK) {
                             fat32_vfs_register_root(&fs);
                             kprintf("FAT32: mount succeeded on %s\n", b0->name);
                             tried_mount = 1;

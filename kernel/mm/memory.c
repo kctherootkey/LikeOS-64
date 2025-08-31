@@ -254,7 +254,7 @@ uint64_t MmAllocateContiguousPages(size_t page_count) {
     // Find contiguous free pages
     for (uint64_t start_page = 0; start_page <= mm_state.total_pages - page_count; start_page++) {
         bool found = true;
-        
+
         // Check if all pages in range are free
         for (size_t i = 0; i < page_count; i++) {
             if (is_page_allocated(start_page + i)) {
@@ -262,7 +262,7 @@ uint64_t MmAllocateContiguousPages(size_t page_count) {
                 break;
             }
         }
-        
+
         if (found) {
             // Allocate all pages in range
             for (size_t i = 0; i < page_count; i++) {
@@ -298,32 +298,42 @@ uint64_t* MmGetPageTable(uint64_t virtual_addr, bool create) {
     uint64_t* pdpt = (uint64_t*)(mm_state.pml4_table[pml4_index] & ~0xFFF);
     if (!pdpt && create) {
         uint64_t pdpt_phys = MmAllocatePhysicalPage();
-        if (!pdpt_phys) return NULL;
+        if (!pdpt_phys) {
+            return NULL;
+        }
         mm_memset((void*)pdpt_phys, 0, PAGE_SIZE);
         mm_state.pml4_table[pml4_index] = pdpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
         pdpt = (uint64_t*)pdpt_phys;
     }
-    if (!pdpt) return NULL;
+    if (!pdpt) {
+        return NULL;
+    }
     
     uint64_t* pd = (uint64_t*)(pdpt[pdpt_index] & ~0xFFF);
     if (!pd && create) {
         uint64_t pd_phys = MmAllocatePhysicalPage();
-        if (!pd_phys) return NULL;
+        if (!pd_phys) {
+            return NULL;
+        }
         mm_memset((void*)pd_phys, 0, PAGE_SIZE);
         pdpt[pdpt_index] = pd_phys | PAGE_PRESENT | PAGE_WRITABLE;
         pd = (uint64_t*)pd_phys;
     }
-    if (!pd) return NULL;
+    if (!pd) {
+        return NULL;
+    }
     
     uint64_t* pt = (uint64_t*)(pd[pd_index] & ~0xFFF);
     if (!pt && create) {
         uint64_t pt_phys = MmAllocatePhysicalPage();
-        if (!pt_phys) return NULL;
+        if (!pt_phys) {
+            return NULL;
+        }
         mm_memset((void*)pt_phys, 0, PAGE_SIZE);
         pd[pd_index] = pt_phys | PAGE_PRESENT | PAGE_WRITABLE;
         pt = (uint64_t*)pt_phys;
     }
-    
+
     return pt ? &pt[pt_index] : NULL;
 }
 
