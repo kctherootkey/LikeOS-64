@@ -242,7 +242,7 @@ qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
 		-device usb-storage,drive=usbdisk
 
 # Extended USB passthrough target: attach tablet + optional host devices (edit vendor/product)
-qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE)
+qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)
 	@echo "Running LikeOS-64 with xHCI, virtual storage, and host USB passthrough (if any)..."
 	@echo "Autodetecting host USB devices via lsusb (override with PASSTHROUGH_FILTER=vid:pid,vid:pid)."
 	@set -e; \
@@ -306,6 +306,11 @@ usb-write: $(ISO_IMAGE)
 	# Copy bootloader and kernel
 	sudo cp $(BOOTLOADER_EFI) /tmp/likeos_usb_mount/EFI/BOOT/BOOTX64.EFI
 	sudo cp $(KERNEL_ELF) /tmp/likeos_usb_mount/kernel.elf
+
+	# Create signature file and sample hello on target (mirrors data image contents)
+	sudo sh -c 'echo "THIS IS A DEVICE STORING LIKEOS" > /tmp/likeos_usb_mount/LIKEOS.SIG'
+	sudo sh -c 'echo "Hello from USB mass storage" > /tmp/likeos_usb_mount/HELLO.TXT'
+	sudo sync
 	
 	# Sync and unmount
 	sudo sync
