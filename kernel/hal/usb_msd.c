@@ -365,41 +365,53 @@ static int msd_block_read(block_device_t *bdev, unsigned long lba,
     int st;
     if (!dev)
         return ST_INVALID;
+retry_issue:
     st = msd_issue_read10(ctrl, dev, lba, count);
-    if (st != ST_OK)
-        return st;
+    if (st == ST_BUSY || st == ST_AGAIN) {
+        /* Another operation in flight; process events briefly then retry */
+        for (int i = 0; i < 256 && (ctrl->msd_op || ctrl->msd_state); ++i) {
+            xhci_process_events(ctrl);
+            msd_progress(ctrl);
+        }
+        if (ctrl->msd_op || ctrl->msd_state)
+            return ST_BUSY; /* let caller retry later */
+        goto retry_issue;
+    } else if (st != ST_OK) {
+        return st; /* propagate fatal conditions */
+    }
     start_poll = ctrl->msd_poll_counter;
-    while (ctrl->msd_op == 3 && ctrl->msd_state != 4) {
+    while (1) {
+        if (ctrl->msd_read_result > 0)
+            break; /* success */
+        if ((ctrl->msd_op != 3 && ctrl->msd_read_result == 0) || (ctrl->msd_op == 3 && ctrl->msd_state == 0)) {
+            /* Operation ended without setting result (unexpected) */
+            break;
+        }
+        if (ctrl->msd_op == 3 && ctrl->msd_state == 4 && ctrl->msd_read_result == 0) {
+            /* CSW arrived; parse via msd_progress to set result */
+            msd_progress(ctrl);
+            if (ctrl->msd_read_result > 0)
+                break;
+        }
         xhci_process_events(ctrl);
         msd_progress(ctrl);
-        {
-            extern char keyboard_get_char(void);
-            while (keyboard_get_char())
-                ;
-        }
-        if (ctrl->msd_poll_counter - start_poll > 10000) {
+        /* light backoff to avoid starving controller (acts like previous kprintf latency) */
+        for (volatile int spin = 0; spin < 200; ++spin) __asm__ __volatile__("pause");
+        if (ctrl->msd_poll_counter - start_poll > 20000) { /* extended timeout */
             XHCI_MSD_LOG("MSD: read timeout lba=%lu count=%lu (cbw_ev=%u data_ev=%u csw_ev=%u state=%u op=%u)\n",
                 lba, count, ctrl->msd_cbw_events, ctrl->msd_data_events,
                 ctrl->msd_csw_events, ctrl->msd_state, ctrl->msd_op);
-            XHCI_MSD_LOG("  TRB phys: cbw=%p data=%p csw=%p last_evt_ptr=%p last_cc=%u last_epid=%u\n",
-                (void *)ctrl->msd_cbw_phys, (void *)ctrl->msd_data_phys,
-                (void *)ctrl->msd_csw_phys, (void *)ctrl->msd_last_event_ptr,
-                ctrl->msd_last_event_cc, ctrl->msd_last_event_epid);
             break;
         }
     }
-    /* If state reached 4 (CSW complete) but msd_read_result not yet populated (race: event handler set state before msd_progress parsed CSW), parse now */
-    if (ctrl->msd_op == 3 && ctrl->msd_state == 4 && ctrl->msd_read_result == 0) {
-        msd_progress(ctrl); /* This will set msd_read_result */
-    }
     if (ctrl->msd_read_result > 0) {
         unsigned copy = (unsigned)ctrl->msd_read_result;
-        unsigned i;
-        for (i = 0; i < copy; i++)
+        __asm__ __volatile__("mfence" ::: "memory"); /* ensure data visible before copy */
+        for (unsigned i = 0; i < copy; i++)
             ((uint8_t *)buf)[i] = ((uint8_t *)ctrl->msd_read_buf)[i];
         return ST_OK;
     }
-    return ST_ERR;
+    return ST_IO;
 }
 
 static void msd_progress(xhci_controller_t *ctrl)
