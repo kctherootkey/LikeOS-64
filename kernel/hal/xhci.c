@@ -1,4 +1,4 @@
-// LikeOS-64 - XHCI early bring-up (polling only, reconstructed clean version)
+// LikeOS-64 - XHCI early bring-up (polling + optional interrupts)
 #include "../../include/kernel/xhci.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/status.h"
@@ -6,6 +6,9 @@
 #include "../../include/kernel/xhci_trb.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/usb_msd.h"
+
+// Global controller instance (single-controller bring-up scenario)
+xhci_controller_t g_xhci; // referenced via extern in init.c / interrupt.c
 
 // Debug verbosity controls (set to 1 to re-enable selective logging)
 #ifndef XHCI_DEBUG
@@ -61,6 +64,35 @@ static inline void io_delay(void)
     volatile int i;
     for (i = 0; i < 10000; i++)
         ; /* busy wait */
+}
+
+void xhci_irq_service(xhci_controller_t *ctrl)
+{
+#if 1
+    if(!ctrl || !ctrl->runtime_base) {
+        return;
+    }
+    volatile uint32_t *iman = (volatile uint32_t *)(ctrl->runtime_base + XHCI_RT_IR0_IMAN);
+    uint32_t v = *iman;
+    if(v & 0x1) {
+        /* Clear interrupt pending (write 1 to IP) while preserving IE */
+        *iman = v;
+    }
+    XHCI_LOG("XHCI: IRQ iman=%08x dequeue=%u cycle=%u\n", v, ctrl->event_ring_dequeue, ctrl->event_ring_cycle);
+    /* Process any available events */
+    xhci_process_events(ctrl);
+    /* Advance ERDP to current dequeue pointer (set EHB=1) */
+    if(ctrl->event_ring_virt) {
+        volatile uint64_t *erdp = (volatile uint64_t *)(ctrl->runtime_base + XHCI_RT_IR0_ERDP);
+        uint64_t newp = ctrl->event_ring_phys + (ctrl->event_ring_dequeue % ctrl->event_ring_size) * sizeof(xhci_trb_t);
+        *erdp = newp | 0x1ULL; /* EHB */
+        XHCI_LOG("XHCI: IRQ ERDP advanced to %p\n", (void*)newp);
+    }
+    else {
+        /* If event ring missing, poke IMAN to test if write is visible */
+        *iman |= 0x2; /* ensure IE stays set */
+    }
+#endif
 }
 
 // Robustly program CRCR with validation
@@ -222,11 +254,11 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev)
     XHCI_LOG("XHCI: CAP dump @%p\n", (void *)ctrl->mmio_base);
     if(XHCI_DEBUG) {
         for(int off = 0; off < 0x80; off += 16) {
-            kprintf("  %02x: ", off);
+            XHCI_LOG("  %02x: ", off);
             for(int b = 0; b < 16; b++) {
-                kprintf("%02x ", base8[off + b]);
+                XHCI_LOG("%02x ", base8[off + b]);
             }
-            kprintf("\n");
+            XHCI_LOG("\n");
         }
     }
     volatile unsigned int *cap32 = (volatile unsigned int *)ctrl->mmio_base;
@@ -385,11 +417,14 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev)
     *erdp = ctrl->event_ring_phys;
     volatile uint32_t *iman = (volatile uint32_t *)(ctrl->runtime_base + XHCI_RT_IR0_IMAN);
     uint32_t iman_val = *iman;
-    if(iman_val & 1) {
-        *iman = (iman_val & ~1u) | 1u;
-    }
-    *iman = ((*iman) & ~1u) | 0x2;
-    *usbcmd |= XHCI_USBCMD_RS | XHCI_USBCMD_INTE;
+    /* Clear any pending IP (bit0) and set IE (bit1) */
+    *iman = (iman_val | 0x2) & ~0x1u; /* write back with IE=1, IP cleared */
+    uint32_t iman_rb = *iman;
+    XHCI_LOG("XHCI: IMAN programmed val=%08x\n", iman_rb);
+    *usbcmd |= XHCI_USBCMD_INTE; /* enable interrupts before run */
+    XHCI_LOG("XHCI: USBCMD after INTE=%08x\n", *usbcmd);
+    *usbcmd |= XHCI_USBCMD_RS;   /* run */
+    XHCI_LOG("XHCI: USBCMD after RS=%08x\n", *usbcmd);
     for(int t = 0; t < 500000; t++) {
         if(!(*usbsts & XHCI_USBSTS_HCH)) {
             break;
@@ -398,6 +433,7 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev)
     XHCI_LOG("XHCI: controller running USBSTS=%08x\n", *usbsts);
     /* Prime ring with NO-OP (don't track as pending to avoid stale completion confusing state machine) */
     xhci_cmd_enqueue(ctrl, XHCI_TRB_TYPE_NO_OP_CMD, 0);
+    XHCI_LOG("XHCI: queued initial NO-OP command (expect silent completion)\n");
     ctrl->last_noop_trb_phys = ctrl->pending_cmd_trb_phys;
     ctrl->pending_cmd_type = 0; /* do not track NO-OP */
     ctrl->pending_cmd_trb = 0;
@@ -788,18 +824,31 @@ cmd_done:;
         } else if(type == XHCI_TRB_TYPE_TRANSFER_EVENT) {
             unsigned int cc = (trb->status >> 24) & 0xFF;
             uint64_t ep_trb_ptr_dbg = ((uint64_t)trb->param_hi << 32) | trb->param_lo;
-            unsigned epid_dbg = (trb->control >> 16) & 0x1F;
+            unsigned epid_dbg = (trb->control >> 16) & 0x1F; /* bits 20:16 per spec */
             XHCI_EVT_LOG("xhci: transfer event cc=%u epid=%u ptr=%p rawsts=%08x rawctl=%08x\n", cc, epid_dbg, (void *)ep_trb_ptr_dbg, trb->status, trb->control);
-            /* Determine device (first mapped slot for now) */
+            ctrl->msd_transfer_events++; /* count all transfer events */
+            /* Determine device: prefer endpoint ID match for bulk traffic */
             usb_device_t *dev = 0;
-            for(unsigned s = 1; s < 64; s++) {
-                if(ctrl->slot_device_map[s]) {
-                    dev = (usb_device_t *)ctrl->slot_device_map[s];
-                    break;
+            unsigned epid = (trb->control >> 16) & 0x1F; /* Endpoint ID bits 20:16 */
+            if(epid > 1) { /* bulk or interrupt endpoints (EP0 is 1) */
+                for(unsigned s = 1; s < 64; s++) {
+                    usb_device_t *cand = (usb_device_t *)ctrl->slot_device_map[s];
+                    if(!cand) continue;
+                    if(cand->bulk_in_ep || cand->bulk_out_ep) {
+                        unsigned epid_out = cand->bulk_out_ep ? ((cand->bulk_out_ep << 1) | 0) : 0;
+                        unsigned epid_in  = cand->bulk_in_ep  ? ((cand->bulk_in_ep  << 1) | 1) : 0;
+                        if(epid == epid_out || epid == epid_in) { dev = cand; break; }
+                    }
+                }
+                ctrl->msd_bulk_transfer_events++;
+            }
+            if(!dev) {
+                /* Fallback: first present device */
+                for(unsigned s = 1; s < 64 && !dev; s++) {
+                    if(ctrl->slot_device_map[s]) dev = (usb_device_t *)ctrl->slot_device_map[s];
                 }
             }
             uint64_t ep_trb_ptr = ((uint64_t)trb->param_hi << 32) | trb->param_lo;
-            unsigned epid = (trb->control >> 16) & 0x1F; /* Endpoint ID from Transfer Event per spec (bits 20:16) */
             /* Identify which TRB in ring this event refers to by physical address */
             if(dev && ctrl->ep0_ring) {
                 xhci_trb_t *ring0 = (xhci_trb_t *)ctrl->ep0_ring;
@@ -826,9 +875,21 @@ cmd_done:;
             }
             /* Bulk ring correlation for MSD BOT (compare to tracked TRB virtual pointers -> phys) */
             if(dev && (ctrl->msd_cbw_trb || ctrl->msd_data_trb || ctrl->msd_csw_trb)) {
-                uint64_t cbw_phys = ctrl->msd_cbw_trb ? (uint64_t)MmGetPhysicalAddress((uint64_t)ctrl->msd_cbw_trb) : 0;
-                uint64_t data_phys = ctrl->msd_data_trb ? (uint64_t)MmGetPhysicalAddress((uint64_t)ctrl->msd_data_trb) : 0;
-                uint64_t csw_phys = ctrl->msd_csw_trb ? (uint64_t)MmGetPhysicalAddress((uint64_t)ctrl->msd_csw_trb) : 0;
+                /* Use cached physical TRB addresses (avoid repeated MmGetPhysicalAddress calls which may differ) */
+                uint64_t cbw_phys = ctrl->msd_cbw_phys;
+                uint64_t data_phys = ctrl->msd_data_phys;
+                uint64_t csw_phys = ctrl->msd_csw_phys;
+                /* Compute expected EPIDs for bulk IN/OUT for this device */
+                unsigned epid_out_expected = dev->bulk_out_ep ? ((dev->bulk_out_ep << 1) | 0) : 0;
+                unsigned epid_in_expected  = dev->bulk_in_ep  ? ((dev->bulk_in_ep  << 1) | 1) : 0;
+                /* Unconditional diagnostic log (lightweight) for bulk endpoints */
+                if(epid > 1) {
+                    XHCI_MSD_LOG("MSDDBG: TE cc=%u epid=%u ptr=%p cbw=%p data=%p csw=%p state=%u op=%u outEP=%u(in=%u) bulk_ev=%u total_ev=%u\n",
+                        cc, epid, (void*)ep_trb_ptr, (void*)cbw_phys, (void*)data_phys, (void*)csw_phys,
+                        ctrl->msd_state, ctrl->msd_op, epid_out_expected, epid_in_expected,
+                        ctrl->msd_bulk_transfer_events, ctrl->msd_transfer_events);
+                }
+                int matched = 0;
                 if(ep_trb_ptr == cbw_phys) {
                     /* Always record CBW event */
                     ctrl->msd_cbw_events++;
@@ -839,9 +900,13 @@ cmd_done:;
                         XHCI_MSD_LOG("MSD: CBW completion error cc=%u -> abort\n", cc);
                         ctrl->msd_state = 0;
                         ctrl->msd_op = 0; /* host BOT reset logic will see timeout/idle and recover */
-                    } else if(ctrl->msd_state == 1) {
-                        ctrl->msd_state = 2;
-                        XHCI_MSD_LOG("MSD: CBW complete (state->2)\n");
+                    } else if(ctrl->msd_state == 1 || ctrl->msd_state == 2) {
+                        if(ctrl->msd_state == 1) {
+                            ctrl->msd_state = 2;
+                            XHCI_MSD_LOG("MSD: CBW complete (state->2)\n");
+                        } else {
+                            XHCI_MSD_LOG("MSD: CBW complete (state already 2)\n");
+                        }
                         /* If we deferred queuing DATA stage, queue it now */
                         if(ctrl->msd_pending_data_len && ctrl->msd_pending_data_buf) {
                             if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_pending_data_buf, ctrl->msd_pending_data_len) == ST_OK) {
@@ -859,12 +924,14 @@ cmd_done:;
                             if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_csw_buf, sizeof(usb_msd_csw_t)) == ST_OK) {
                                 unsigned cidx = (ctrl->bulk_in_enqueue - 1) % 16;
                                 ctrl->msd_csw_trb = &((xhci_trb_t *)ctrl->bulk_in_ring)[cidx];
-                                ctrl->msd_csw_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_csw_trb);
+                                ctrl->msd_csw_phys = ctrl->bulk_in_ring_phys + ((uint8_t *)ctrl->msd_csw_trb - (uint8_t *)ctrl->bulk_in_ring);
+                                XHCI_MSD_LOG("MSD: CSW queued csw_trb=%p trb_phys=%p\n", ctrl->msd_csw_trb, (void *)ctrl->msd_csw_phys);
                                 ctrl->msd_state = 3;
                                 ctrl->msd_need_csw = 0;
                             }
                         }
                     }
+                    matched = 1;
                 } else if(ep_trb_ptr == data_phys) {
                     if(ctrl->msd_state == 2) {
                         ctrl->msd_data_events++;
@@ -885,11 +952,13 @@ cmd_done:;
                                 if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_csw_buf, sizeof(usb_msd_csw_t)) == ST_OK) {
                                     unsigned cidx = (ctrl->bulk_in_enqueue - 1) % 16;
                                     ctrl->msd_csw_trb = &((xhci_trb_t *)ctrl->bulk_in_ring)[cidx];
-                                    ctrl->msd_csw_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_csw_trb);
+                                    ctrl->msd_csw_phys = ctrl->bulk_in_ring_phys + ((uint8_t *)ctrl->msd_csw_trb - (uint8_t *)ctrl->bulk_in_ring);
+                                    XHCI_MSD_LOG("MSD: CSW queued (post DATA) csw_trb=%p trb_phys=%p\n", ctrl->msd_csw_trb, (void *)ctrl->msd_csw_phys);
                                 }
                             }
                         }
                     }
+                    matched = 1;
                 } else if(ep_trb_ptr == csw_phys) {
                     if(ctrl->msd_state == 3) {
                         ctrl->msd_csw_events++;
@@ -904,6 +973,26 @@ cmd_done:;
                             ctrl->msd_state = 0;
                             ctrl->msd_op = 0; /* trigger retry logic outside */
                         }
+                    }
+                    matched = 1;
+                }
+                /* Fallback: if pointer mismatch but epid matches expected and we are in appropriate state, advance state */
+                if(!matched && ctrl->msd_op) {
+                    if(epid == epid_out_expected && (ctrl->msd_state == 1 || ctrl->msd_state == 2)) {
+                        XHCI_MSD_LOG("MSD: Fallback CBW event epid=%u ptr=%p expected_ptr=%p\n", epid, (void*)ep_trb_ptr, (void*)cbw_phys);
+                        if(ctrl->msd_state == 1) ctrl->msd_state = 2;
+                        matched = 1;
+                    } else if(epid == epid_in_expected && ctrl->msd_state == 2) {
+                        XHCI_MSD_LOG("MSD: Fallback DATA event epid=%u ptr=%p expected_ptr=%p\n", epid, (void*)ep_trb_ptr, (void*)data_phys);
+                        ctrl->msd_state = 3;
+                        matched = 1;
+                    } else if(epid == epid_in_expected && ctrl->msd_state == 3) {
+                        XHCI_MSD_LOG("MSD: Fallback CSW event epid=%u ptr=%p expected_ptr=%p\n", epid, (void*)ep_trb_ptr, (void*)csw_phys);
+                        ctrl->msd_state = (cc == 1) ? 4 : 0;
+                        matched = 1;
+                    }
+                    if(!matched) {
+                        XHCI_MSD_LOG("MSD: Unmatched transfer event (epid=%u ptr=%p cbw=%p data=%p csw=%p state=%u op=%u)\n", epid, (void*)ep_trb_ptr, (void*)cbw_phys, (void*)data_phys, (void*)csw_phys, ctrl->msd_state, ctrl->msd_op);
                     }
                 }
             }
@@ -960,7 +1049,7 @@ int xhci_configure_mass_storage_endpoints(xhci_controller_t *ctrl, struct usb_de
     /* Build contexts + issue configure endpoint */
     xhci_configure_bulk_endpoints(ctrl, dev);
     /* Do NOT mark endpoints_configured yet; wait for CONFIG_ENDPOINT completion event */
-    kprintf("xhci: MSD endpoint configuration command queued (IN ep=%u OUT ep=%u)\n", dev->bulk_in_ep, dev->bulk_out_ep);
+    XHCI_LOG("xhci: MSD endpoint configuration command queued (IN ep=%u OUT ep=%u)\n", dev->bulk_in_ep, dev->bulk_out_ep);
     return ST_OK;
 }
 
@@ -1007,7 +1096,7 @@ int xhci_enqueue_bulk_out(xhci_controller_t *ctrl, struct usb_device *dev, void 
     static int once_out = 0;
     if(!once_out) {
         once_out = 1;
-        kprintf("xhci: bulk OUT first enqueue idx=%u cyc=%u trb_phys=%p\n", (ctrl->bulk_out_enqueue - 1) % 16, ctrl->bulk_out_cycle & 1, (void *)trb_phys);
+        XHCI_LOG("xhci: bulk OUT first enqueue idx=%u cyc=%u trb_phys=%p\n", (ctrl->bulk_out_enqueue - 1) % 16, ctrl->bulk_out_cycle & 1, (void *)trb_phys);
     }
     return ST_OK;
 }
@@ -1029,7 +1118,7 @@ int xhci_enqueue_bulk_in(xhci_controller_t *ctrl, struct usb_device *dev, void *
     static int once_in = 0;
     if(!once_in) {
         once_in = 1;
-        kprintf("xhci: bulk IN first enqueue idx=%u cyc=%u trb_phys=%p\n", (ctrl->bulk_in_enqueue - 1) % 16, ctrl->bulk_in_cycle & 1, (void *)trb_phys);
+        XHCI_LOG("xhci: bulk IN first enqueue idx=%u cyc=%u trb_phys=%p\n", (ctrl->bulk_in_enqueue - 1) % 16, ctrl->bulk_in_cycle & 1, (void *)trb_phys);
     }
     return ST_OK;
 }

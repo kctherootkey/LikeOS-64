@@ -24,8 +24,8 @@ EFI_LDS = /usr/lib/elf_x86_64_efi.lds
 
 # Compiler flags for kernel
 KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
-                -fno-stack-protector -mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
-                -I$(INCLUDE_DIR)
+			-fno-stack-protector -mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
+			-I$(INCLUDE_DIR) -DXHCI_USE_INTERRUPTS=1
 
 # Compiler flags for UEFI bootloader
 UEFI_CFLAGS = -fno-stack-protector -fpic -fshort-wchar -mno-red-zone \
@@ -227,11 +227,11 @@ $(DATA_IMAGE): | $(BUILD_DIR)
 	$(DD) if=/dev/zero of=$(DATA_IMAGE) bs=1M count=64
 	$(MKFS_FAT) -F32 -n "MSDATA" $(DATA_IMAGE)
 	echo "Hello from USB mass storage" > $(BUILD_DIR)/HELLO.TXT
-	echo "Second file for listing test" > $(BUILD_DIR)/SECOND.TXT
+	echo "THIS IS A DEVICE STORING LIKEOS" > $(BUILD_DIR)/LIKEOS.SIG
 	set -e; \
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/HELLO.TXT ::/HELLO.TXT; \
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/SECOND.TXT ::/SECOND.TXT; \
-	rm -f $(BUILD_DIR)/HELLO.TXT $(BUILD_DIR)/SECOND.TXT || true
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/LIKEOS.SIG ::/LIKEOS.SIG; \
+	rm -f $(BUILD_DIR)/HELLO.TXT $(BUILD_DIR)/LIKEOS.SIG || true
 	@echo "Data image created with sample files: $(DATA_IMAGE)"
 
 # Run with ISO boot plus attached xHCI controller and USB mass storage device
@@ -240,6 +240,30 @@ qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
 	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio \
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
 		-device usb-storage,drive=usbdisk
+
+# Extended USB passthrough target: attach tablet + optional host devices (edit vendor/product)
+qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE)
+	@echo "Running LikeOS-64 with xHCI, virtual storage, and host USB passthrough (if any)..."
+	@echo "Autodetecting host USB devices via lsusb (override with PASSTHROUGH_FILTER=vid:pid,vid:pid)."
+	@set -e; \
+	devices=""; \
+	if [ -n "$$PASSTHROUGH_FILTER" ]; then \
+	  OLDIFS="$$IFS"; IFS=','; set -- $$PASSTHROUGH_FILTER; IFS="$$OLDIFS"; \
+	  for spec in "$$@"; do \
+	    vid=$${spec%%:*}; pid=$${spec##*:}; \
+	    if [ -n "$$vid" ] && [ -n "$$pid" ]; then \
+	      devices="$$devices -device usb-host,vendorid=0x$${vid},productid=0x$${pid}"; \
+	    fi; \
+	  done; \
+	else \
+	  devices=$$(lsusb 2>/dev/null | awk '!/root hub/ && !/Linux Foundation/ { id=$$6; split(id,a,":"); if(length(a[1])==4 && length(a[2])==4) printf(" -device usb-host,vendorid=0x%s,productid=0x%s", a[1], a[2]); }'); \
+	fi; \
+	if [ -z "$$devices" ]; then echo "(No host USB devices selected for passthrough. Set PASSTHROUGH_FILTER=vid:pid to choose explicitly.)"; fi; \
+	if [ "$$USE_USB_BOOT" = "1" ]; then echo "Using bootable FAT image as USB device"; usbimg="$(FAT_IMAGE)"; else usbimg="$(DATA_IMAGE)"; fi; \
+	echo "Passing through devices:$$devices"; \
+	set -x; \
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio -machine q35 -device qemu-xhci,id=xhci -device usb-tablet -drive if=none,id=usbdisk,file=$$usbimg,format=raw,readonly=off -device usb-storage,drive=usbdisk $$devices || echo "QEMU exited with status $$?"; \
+	set +x || true
 
 # Write ISO to USB device with GPT partition table (like Rufus)
 # Usage: make usb-write USB_DEVICE=/dev/sdX

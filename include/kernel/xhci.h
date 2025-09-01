@@ -4,6 +4,7 @@
 
 #include "status.h"
 #include "pci.h"
+#include "console.h" /* for kprintf used by debug macros */
 
 // Minimal subset of XHCI register layout (polling, single controller)
 // NOTE: This intentionally omits full spec accuracy; offsets suffice for early bring-up.
@@ -151,11 +152,24 @@ typedef struct {
     unsigned long msd_data_phys;
     unsigned long msd_csw_phys;
     unsigned long msd_last_event_ptr;
+    // Extended instrumentation: total transfer events observed and bulk-specific
+    unsigned int msd_transfer_events;      // all transfer events processed
+    unsigned int msd_bulk_transfer_events; // transfer events with epid>1 (bulk/interrupt)
 } xhci_controller_t;
+
+/* Debug macro access (allow other modules like usb_msd.c to reuse logging gate) */
+#ifndef XHCI_MSD_DEBUG
+#define XHCI_MSD_DEBUG 0
+#endif
+#ifndef XHCI_MSD_LOG
+#define XHCI_MSD_LOG(fmt, ...) do { if (XHCI_MSD_DEBUG) kprintf(fmt, ##__VA_ARGS__); } while(0)
+#endif
 
 int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev);
 int xhci_poll_ports(xhci_controller_t* ctrl); // log simple connect status
 int xhci_process_events(xhci_controller_t* ctrl); // poll event ring
+// Interrupt service routine hook (called from generic IRQ dispatch)
+void xhci_irq_service(xhci_controller_t* ctrl);
 struct usb_device; // forward declare
 
 // Simple control transfer state machine (device enumeration)

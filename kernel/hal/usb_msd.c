@@ -50,14 +50,17 @@ static int bot_send_cbw(xhci_controller_t *ctrl, usb_device_t *dev, usb_msd_cbw_
     }
     for (i = 0; i < sizeof(usb_msd_cbw_t); ++i)
         ((uint8_t *)ctrl->msd_cbw_buf)[i] = ((uint8_t *)cbw)[i];
-    if (xhci_enqueue_bulk_out(ctrl, dev, ctrl->msd_cbw_buf,
-        sizeof(usb_msd_cbw_t)) != ST_OK)
-        return -1;
-    {
-        unsigned idx = (ctrl->bulk_out_enqueue - 1) % 16;
-        ctrl->msd_cbw_trb = &((xhci_trb_t *)ctrl->bulk_out_ring)[idx];
-        ctrl->msd_cbw_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_cbw_trb);
+    /* Pre-track TRB slot BEFORE ringing doorbell to avoid race where event fires first */
+    if (ctrl->bulk_out_ring) {
+        unsigned pre_idx = ctrl->bulk_out_enqueue % 16; /* index that will be used */
+        ctrl->msd_cbw_trb = &((xhci_trb_t *)ctrl->bulk_out_ring)[pre_idx];
+        ctrl->msd_cbw_phys = ctrl->bulk_out_ring_phys + pre_idx * sizeof(xhci_trb_t);
     }
+    if (xhci_enqueue_bulk_out(ctrl, dev, ctrl->msd_cbw_buf, sizeof(usb_msd_cbw_t)) != ST_OK)
+        return -1;
+    XHCI_MSD_LOG("MSD: CBW queued tag=%u opcode=0x%02x data_len=%u flags=0x%02x cbw_trb=%p trb_phys=%p\n",
+        cbw->tag, cbw->cb[0], cbw->data_len, cbw->flags,
+        ctrl->msd_cbw_trb, (void *)ctrl->msd_cbw_phys);
     ctrl->msd_data_trb = 0;
     ctrl->msd_csw_trb = 0;
     ctrl->msd_data_phys = 0;
@@ -103,14 +106,25 @@ static void msd_issue_inquiry(xhci_controller_t *ctrl, usb_device_t *dev)
     if (!ctrl->msd_csw_buf)
         ctrl->msd_csw_buf = kcalloc(1, 64);
     if (bot_send_cbw(ctrl, dev, &cbw) == 0) {
+        /* Pre-track data TRB before enqueue */
+        if (ctrl->bulk_in_ring) {
+            unsigned pre_idx = ctrl->bulk_in_enqueue % 16;
+            ctrl->msd_data_trb = &((xhci_trb_t *)ctrl->bulk_in_ring)[pre_idx];
+            ctrl->msd_data_phys = ctrl->bulk_in_ring_phys + pre_idx * sizeof(xhci_trb_t);
+        }
+        /* Set operation state BEFORE ringing doorbell so completion ISR sees correct state */
+        ctrl->msd_expected_data_len = 36;
+        ctrl->msd_state = 2; /* transition to data stage queued */
+        ctrl->msd_op = 1;    /* INQUIRY */
+        ctrl->msd_need_csw = 1;
         if (xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_data_buf, 36) == ST_OK) {
-            unsigned didx = (ctrl->bulk_in_enqueue - 1) % 16;
-            ctrl->msd_data_trb = &((xhci_trb_t *)ctrl->bulk_in_ring)[didx];
-            ctrl->msd_data_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_data_trb);
-            ctrl->msd_expected_data_len = 36;
-            ctrl->msd_state = 2;
-            ctrl->msd_op = 1;
-            ctrl->msd_need_csw = 1;
+            XHCI_MSD_LOG("MSD: INQUIRY data IN queued len=%u data_trb=%p trb_phys=%p\n", 36, ctrl->msd_data_trb, (void *)ctrl->msd_data_phys);
+        } else {
+            /* Revert on failure */
+            ctrl->msd_state = 1;
+            ctrl->msd_op = 0;
+            ctrl->msd_need_csw = 0;
+            ctrl->msd_expected_data_len = 0;
         }
     }
 }
@@ -138,14 +152,22 @@ static void msd_issue_request_sense(xhci_controller_t *ctrl, usb_device_t *dev)
     if (!ctrl->msd_data_buf)
         ctrl->msd_data_buf = kcalloc(1, 512);
     if (bot_send_cbw(ctrl, dev, &cbw) == 0) {
+        if (ctrl->bulk_in_ring) {
+            unsigned pre_idx = ctrl->bulk_in_enqueue % 16;
+            ctrl->msd_data_trb = &((xhci_trb_t *)ctrl->bulk_in_ring)[pre_idx];
+            ctrl->msd_data_phys = ctrl->bulk_in_ring_phys + pre_idx * sizeof(xhci_trb_t);
+        }
+        ctrl->msd_expected_data_len = 18;
+        ctrl->msd_state = 2;
+        ctrl->msd_op = 5; /* REQUEST SENSE */
+        ctrl->msd_need_csw = 1;
         if (xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_data_buf, 18) == ST_OK) {
-            unsigned didx = (ctrl->bulk_in_enqueue - 1) % 16;
-            ctrl->msd_data_trb = &((xhci_trb_t *)ctrl->bulk_in_ring)[didx];
-            ctrl->msd_data_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_data_trb);
-            ctrl->msd_expected_data_len = 18;
-            ctrl->msd_state = 2;
-            ctrl->msd_op = 5;
-            ctrl->msd_need_csw = 1;
+            XHCI_MSD_LOG("MSD: REQUEST SENSE data IN queued len=%u data_trb=%p trb_phys=%p\n", 18, ctrl->msd_data_trb, (void *)ctrl->msd_data_phys);
+        } else {
+            ctrl->msd_state = 1;
+            ctrl->msd_op = 0;
+            ctrl->msd_need_csw = 0;
+            ctrl->msd_expected_data_len = 0;
         }
     }
 }
@@ -192,7 +214,7 @@ static void msd_recover_clear_stalls(xhci_controller_t *ctrl, usb_device_t *dev)
                 volatile uint32_t *db_slot = (volatile uint32_t *)(ctrl->doorbell_array + 1 * 4);
                 *db_slot = 0;
             }
-            kprintf("MSD: CLEAR_FEATURE(HALT) ep=0x%02x issued\n", epaddr);
+            XHCI_MSD_LOG("MSD: CLEAR_FEATURE(HALT) ep=0x%02x issued\n", epaddr);
         }
     }
 }
@@ -230,7 +252,7 @@ static void msd_recover_reset(xhci_controller_t *ctrl, usb_device_t *dev)
             volatile uint32_t *db_slot = (volatile uint32_t *)(ctrl->doorbell_array + 1 * 4);
             *db_slot = 0;
         }
-        kprintf("MSD: BOT RESET issued\n");
+    XHCI_MSD_LOG("MSD: BOT RESET issued\n");
     }
     msd_recover_clear_stalls(ctrl, dev);
 }
@@ -256,15 +278,23 @@ static void msd_issue_read_capacity(xhci_controller_t *ctrl, usb_device_t *dev)
     if (!ctrl->msd_data_buf)
         ctrl->msd_data_buf = kcalloc(1, 512);
     if (bot_send_cbw(ctrl, dev, &cbw) == 0) {
+        if (ctrl->bulk_in_ring) {
+            unsigned pre_idx = ctrl->bulk_in_enqueue % 16;
+            ctrl->msd_data_trb = &((xhci_trb_t *)ctrl->bulk_in_ring)[pre_idx];
+            ctrl->msd_data_phys = ctrl->bulk_in_ring_phys + pre_idx * sizeof(xhci_trb_t);
+        }
+        ctrl->msd_expected_data_len = 8;
+        ctrl->msd_state = 2;
+        ctrl->msd_op = 2; /* READ CAPACITY(10) */
+        ctrl->msd_need_csw = 1;
         if (xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_data_buf, 8) == ST_OK) {
-            unsigned didx = (ctrl->bulk_in_enqueue - 1) % 16;
-            ctrl->msd_data_trb = &((xhci_trb_t *)ctrl->bulk_in_ring)[didx];
-            ctrl->msd_data_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_data_trb);
-            ctrl->msd_expected_data_len = 8;
-            ctrl->msd_state = 2;
-            ctrl->msd_op = 2;
-            ctrl->msd_need_csw = 1;
-            kprintf("MSD: READ CAPACITY (10) issued\n");
+            XHCI_MSD_LOG("MSD: READ CAPACITY(10) data IN queued len=%u data_trb=%p trb_phys=%p\n", 8, ctrl->msd_data_trb, (void *)ctrl->msd_data_phys);
+            XHCI_MSD_LOG("MSD: READ CAPACITY (10) issued\n");
+        } else {
+            ctrl->msd_state = 1;
+            ctrl->msd_op = 0;
+            ctrl->msd_need_csw = 0;
+            ctrl->msd_expected_data_len = 0;
         }
     }
 }
@@ -301,18 +331,26 @@ static int msd_issue_read10(xhci_controller_t *ctrl, usb_device_t *dev,
     cbw.cb[7] = (blocks >> 8) & 0xFF;
     cbw.cb[8] = blocks & 0xFF;
     if (bot_send_cbw(ctrl, dev, &cbw) == 0) {
+        if (ctrl->bulk_in_ring) {
+            unsigned pre_idx = ctrl->bulk_in_enqueue % 16;
+            ctrl->msd_data_trb = &((xhci_trb_t *)ctrl->bulk_in_ring)[pre_idx];
+            ctrl->msd_data_phys = ctrl->bulk_in_ring_phys + pre_idx * sizeof(xhci_trb_t);
+        }
+        ctrl->msd_expected_data_len = bytes;
+        ctrl->msd_state = 2;
+        ctrl->msd_op = 3; /* READ(10) */
+        ctrl->msd_need_csw = 1;
+        ctrl->msd_read_lba = lba;
+        ctrl->msd_read_blocks = blocks;
+        ctrl->msd_read_result = 0;
         if (xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_read_buf, bytes) == ST_OK) {
-            unsigned didx = (ctrl->bulk_in_enqueue - 1) % 16;
-            ctrl->msd_data_trb = &((xhci_trb_t *)ctrl->bulk_in_ring)[didx];
-            ctrl->msd_data_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_data_trb);
-            ctrl->msd_expected_data_len = bytes;
-            ctrl->msd_state = 2;
-            ctrl->msd_op = 3;
-            ctrl->msd_need_csw = 1;
-            ctrl->msd_read_lba = lba;
-            ctrl->msd_read_blocks = blocks;
-            ctrl->msd_read_result = 0;
+            XHCI_MSD_LOG("MSD: READ(10) data IN queued len=%u data_trb=%p trb_phys=%p\n", bytes, ctrl->msd_data_trb, (void *)ctrl->msd_data_phys);
             return ST_OK;
+        } else {
+            ctrl->msd_state = 1;
+            ctrl->msd_op = 0;
+            ctrl->msd_need_csw = 0;
+            ctrl->msd_expected_data_len = 0;
         }
     }
     return ST_ERR;
@@ -340,15 +378,19 @@ static int msd_block_read(block_device_t *bdev, unsigned long lba,
                 ;
         }
         if (ctrl->msd_poll_counter - start_poll > 10000) {
-            kprintf("MSD: read timeout lba=%lu count=%lu (cbw_ev=%u data_ev=%u csw_ev=%u state=%u op=%u)\n",
+            XHCI_MSD_LOG("MSD: read timeout lba=%lu count=%lu (cbw_ev=%u data_ev=%u csw_ev=%u state=%u op=%u)\n",
                 lba, count, ctrl->msd_cbw_events, ctrl->msd_data_events,
                 ctrl->msd_csw_events, ctrl->msd_state, ctrl->msd_op);
-            kprintf("  TRB phys: cbw=%p data=%p csw=%p last_evt_ptr=%p last_cc=%u last_epid=%u\n",
+            XHCI_MSD_LOG("  TRB phys: cbw=%p data=%p csw=%p last_evt_ptr=%p last_cc=%u last_epid=%u\n",
                 (void *)ctrl->msd_cbw_phys, (void *)ctrl->msd_data_phys,
                 (void *)ctrl->msd_csw_phys, (void *)ctrl->msd_last_event_ptr,
                 ctrl->msd_last_event_cc, ctrl->msd_last_event_epid);
             break;
         }
+    }
+    /* If state reached 4 (CSW complete) but msd_read_result not yet populated (race: event handler set state before msd_progress parsed CSW), parse now */
+    if (ctrl->msd_op == 3 && ctrl->msd_state == 4 && ctrl->msd_read_result == 0) {
+        msd_progress(ctrl); /* This will set msd_read_result */
     }
     if (ctrl->msd_read_result > 0) {
         unsigned copy = (unsigned)ctrl->msd_read_result;
@@ -374,8 +416,16 @@ static void msd_progress(xhci_controller_t *ctrl)
     if (ctrl->msd_op && ctrl->msd_timeout_ticks) {
         if (ctrl->msd_poll_counter - ctrl->msd_op_start_tick >
             ctrl->msd_timeout_ticks) {
-            kprintf("MSD: Operation %u timeout -> reset\n", ctrl->msd_op);
-            msd_recover_reset(ctrl, dev);
+            XHCI_MSD_LOG("MSD: Operation %u timeout (state=%u reset_count=%u) -> reset\n", ctrl->msd_op, ctrl->msd_state, ctrl->msd_reset_count);
+            XHCI_MSD_LOG("  Debug: cbw_ev=%u data_ev=%u csw_ev=%u cbw_phys=%p data_phys=%p csw_phys=%p last_evt_ptr=%p last_cc=%u last_epid=%u\n",
+                ctrl->msd_cbw_events, ctrl->msd_data_events, ctrl->msd_csw_events,
+                (void *)ctrl->msd_cbw_phys, (void *)ctrl->msd_data_phys, (void *)ctrl->msd_csw_phys,
+                (void *)ctrl->msd_last_event_ptr, ctrl->msd_last_event_cc, ctrl->msd_last_event_epid);
+            if(ctrl->msd_reset_count < 5) {
+                msd_recover_reset(ctrl, dev);
+            } else {
+                XHCI_MSD_LOG("MSD: giving up further resets\n");
+            }
             ctrl->msd_state = 0;
             ctrl->msd_op = 0;
             ctrl->msd_timeout_ticks = 0;
@@ -383,6 +433,7 @@ static void msd_progress(xhci_controller_t *ctrl)
     }
     if (!ctrl->msd_op) {
         if (!ctrl->msd_ready) {
+            XHCI_MSD_LOG("MSD: issuing INQUIRY (poll_counter=%lu)\n", ctrl->msd_poll_counter);
             msd_issue_inquiry(ctrl, dev);
             ctrl->msd_op_start_tick = ctrl->msd_poll_counter;
             ctrl->msd_timeout_ticks = 5000;
@@ -406,7 +457,7 @@ static void msd_progress(xhci_controller_t *ctrl)
                 product[i] = ' ';
         }
         product[16] = '\0';
-        kprintf("MSD: INQUIRY vendor='%s' product='%s'\n", vendor, product);
+    XHCI_MSD_LOG("MSD: INQUIRY vendor='%s' product='%s'\n", vendor, product);
         ctrl->msd_state = 0;
         ctrl->msd_op = 0;
         msd_issue_read_capacity(ctrl, dev);
@@ -423,9 +474,47 @@ static void msd_progress(xhci_controller_t *ctrl)
         ctrl->msd_capacity_blocks = last_lba + 1;
         ctrl->msd_block_size = blen;
         ctrl->msd_ready = 1;
-        kprintf("MSD: Capacity blocks=%lu block_size=%u (~%lu KB)\n",
+    XHCI_MSD_LOG("MSD: Capacity blocks=%lu block_size=%u (~%lu KB)\n",
             ctrl->msd_capacity_blocks, blen,
             (ctrl->msd_capacity_blocks * (unsigned long)blen) / 1024);
+        /* Immediately read and hex dump sector 0 for diagnostics */
+        if (!ctrl->msd_read_buf)
+            ctrl->msd_read_buf = kcalloc(1, 512);
+        if (ctrl->msd_read_buf) {
+            /* Synchronously issue a READ(10) of first sector (1 block) */
+            if (msd_issue_read10(ctrl, dev, 0, 1) == ST_OK) {
+                unsigned long start_poll = ctrl->msd_poll_counter;
+                while (ctrl->msd_op == 3 && ctrl->msd_state != 4 && (ctrl->msd_poll_counter - start_poll < 10000)) {
+                    xhci_process_events(ctrl);
+                    /* fast path; don't call msd_progress recursively for nested read until done */
+                    ctrl->msd_poll_counter++; /* emulate tick */
+                }
+                if (ctrl->msd_state == 4 && ctrl->msd_read_result > 0) {
+                    unsigned dump = ctrl->msd_read_result;
+                    if (dump > 512) dump = 512;
+                    XHCI_MSD_LOG("MSD: Sector0 dump (first %u bytes):\n", dump);
+                    for (unsigned i = 0; i < dump; i += 16) {
+                        XHCI_MSD_LOG("  %03x: ", i);
+                        for (unsigned j = 0; j < 16 && (i + j) < dump; j++) {
+                            XHCI_MSD_LOG("%02x ", ((uint8_t*)ctrl->msd_read_buf)[i + j]);
+                        }
+                        XHCI_MSD_LOG(" | ");
+                        for (unsigned j = 0; j < 16 && (i + j) < dump; j++) {
+                            uint8_t c = ((uint8_t*)ctrl->msd_read_buf)[i + j];
+                            if (c < 32 || c > 126) c = '.';
+                            XHCI_MSD_LOG("%c", c);
+                        }
+                        XHCI_MSD_LOG("\n");
+                    }
+                } else {
+                    XHCI_MSD_LOG("MSD: Sector0 read failed (state=%u op=%u result=%d)\n", ctrl->msd_state, ctrl->msd_op, ctrl->msd_read_result);
+                }
+                /* Reset read state after diagnostic read */
+                ctrl->msd_state = 0;
+                ctrl->msd_op = 0;
+                ctrl->msd_timeout_ticks = 0;
+            }
+        }
         if (!g_msd_block_dev.name) {
             g_msd_block_dev.name = "usb0";
             g_msd_block_dev.sector_size = blen;
@@ -433,7 +522,7 @@ static void msd_progress(xhci_controller_t *ctrl)
             g_msd_block_dev.read = msd_block_read;
             g_msd_block_dev.driver_data = ctrl;
             if (block_register(&g_msd_block_dev) == ST_OK)
-                kprintf("MSD: Registered block device 'usb0'\n");
+                XHCI_MSD_LOG("MSD: Registered block device 'usb0'\n");
         }
         ctrl->msd_state = 0;
         ctrl->msd_op = 0;
@@ -444,7 +533,7 @@ static void msd_progress(xhci_controller_t *ctrl)
         int tag_ok = (csw->tag == ctrl->msd_expected_tag);
         int sig_ok = (csw->signature == 0x53425355);
         if (!sig_ok || !tag_ok) {
-            kprintf("MSD: CSW invalid sig_ok=%d tag_ok=%d exp_tag=%u got=%u -> reset\n",
+            XHCI_MSD_LOG("MSD: CSW invalid sig_ok=%d tag_ok=%d exp_tag=%u got=%u -> reset\n",
                 sig_ok, tag_ok, ctrl->msd_expected_tag, csw->tag);
             ctrl->msd_read_result = -1;
             msd_recover_reset(ctrl, dev);
@@ -454,16 +543,16 @@ static void msd_progress(xhci_controller_t *ctrl)
         }
         if (csw->status == 0) {
             if (csw->residue)
-                kprintf("MSD: READ(10) residue %u (expected %u)\n",
+                XHCI_MSD_LOG("MSD: READ(10) residue %u (expected %u)\n",
                     csw->residue, ctrl->msd_expected_data_len);
             ctrl->msd_read_result = ctrl->msd_expected_data_len - csw->residue;
         } else {
             ctrl->msd_read_result = -1;
-            kprintf("MSD: READ(10) CSW status=%u residue=%u\n",
+            XHCI_MSD_LOG("MSD: READ(10) CSW status=%u residue=%u\n",
                 csw->status, csw->residue);
             if (ctrl->msd_retry_count < 3) {
                 ctrl->msd_retry_count++;
-                kprintf("MSD: Retrying READ(10) attempt %u\n",
+                XHCI_MSD_LOG("MSD: Retrying READ(10) attempt %u\n",
                     ctrl->msd_retry_count);
                 ctrl->msd_state = 0;
                 ctrl->msd_op = 0;
@@ -485,14 +574,14 @@ static void msd_progress(xhci_controller_t *ctrl)
         int tag_ok = (csw->tag == ctrl->msd_expected_tag);
         int sig_ok = (csw->signature == 0x53425355);
         if (!sig_ok || !tag_ok) {
-            kprintf("MSD: TUR CSW invalid -> reset\n");
+            XHCI_MSD_LOG("MSD: TUR CSW invalid -> reset\n");
             msd_recover_reset(ctrl, dev);
             ctrl->msd_state = 0;
             ctrl->msd_op = 0;
             return;
         }
         if (csw->status != 0) {
-            kprintf("MSD: TEST UNIT READY failed status=%u -> REQUEST SENSE\n",
+            XHCI_MSD_LOG("MSD: TEST UNIT READY failed status=%u -> REQUEST SENSE\n",
                 csw->status);
             ctrl->msd_state = 0;
             ctrl->msd_op = 0;
@@ -512,17 +601,17 @@ static void msd_progress(xhci_controller_t *ctrl)
         ctrl->msd_last_sense_key = key;
         ctrl->msd_last_sense_asc = asc;
         ctrl->msd_last_sense_ascq = ascq;
-        kprintf("MSD: SENSE key=%u asc=%02x ascq=%02x\n", key, asc, ascq);
+    XHCI_MSD_LOG("MSD: SENSE key=%u asc=%02x ascq=%02x\n", key, asc, ascq);
         if (key == 0x02) {
             if (ctrl->msd_retry_count < 5) {
                 ctrl->msd_retry_count++;
-                kprintf("MSD: Not ready, retry #%u TUR backoff\n",
+                XHCI_MSD_LOG("MSD: Not ready, retry #%u TUR backoff\n",
                     ctrl->msd_retry_count);
             }
             ctrl->msd_backoff_until = ctrl->msd_poll_counter +
                 (500 * (ctrl->msd_retry_count ? ctrl->msd_retry_count : 1));
         } else if (key == 0x06) {
-            kprintf("MSD: Unit attention, resetting retry counter\n");
+            XHCI_MSD_LOG("MSD: Unit attention, resetting retry counter\n");
             ctrl->msd_retry_count = 0;
             ctrl->msd_backoff_until = 0;
         } else if (key) {
@@ -553,7 +642,7 @@ int usb_msd_try_init(void *ctrl_ptr)
             continue;
         if (dev->class_code == USB_CLASS_MASS_STORAGE &&
             dev->bulk_in_ep && dev->bulk_out_ep) {
-            kprintf("MSD: Ready (slot %d vid=%04x pid=%04x) - BOT not yet implemented\n",
+            XHCI_MSD_LOG("MSD: Ready (slot %d vid=%04x pid=%04x) - BOT not yet implemented\n",
                 s, dev->vid, dev->pid);
             return 0;
         }

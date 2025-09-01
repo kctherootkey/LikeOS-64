@@ -16,6 +16,8 @@ typedef struct {
     unsigned char subclass;
     unsigned char prog_if;
     unsigned int bar[6];
+    unsigned char interrupt_line; /* legacy INTx line (0-15 or 0xFF) */
+    unsigned char interrupt_pin;  /* 1=INTA ... */
 } pci_device_t;
 
 void pci_init(void);

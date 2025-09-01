@@ -126,7 +126,7 @@ void KiSystemStartup(void) {
 
     // Locate first XHCI controller (USB 3) and initialize skeleton
     const pci_device_t* xhci_dev = pci_get_first_xhci();
-    static xhci_controller_t g_xhci; // single controller instance
+    extern xhci_controller_t g_xhci; // global defined in xhci.c
     int xhci_available = 0;
     if (xhci_dev) {
         kprintf("Found XHCI: bus=%u dev=%u func=%u vendor=%04x device=%04x\n",
@@ -136,6 +136,13 @@ void KiSystemStartup(void) {
         if (xr == ST_OK) {
             kprintf("XHCI controller running (mmio=%p)\n", (void*)g_xhci.mmio_base);
             xhci_available = 1;
+            /* Enable legacy INTx line for xHCI if valid */
+            if (xhci_dev->interrupt_line != 0xFF) {
+                irq_enable(xhci_dev->interrupt_line);
+                kprintf("XHCI: enabled IRQ line %u\n", xhci_dev->interrupt_line);
+            } else {
+                kprintf("XHCI: no valid interrupt line, remaining in polling mode\n");
+            }
         } else {
             kprintf("XHCI initialization failed (status=%d)\n", xr);
         }
@@ -421,10 +428,22 @@ after_cmd:				;
             }
         }
 
-        // Periodic XHCI polling (ports + events)
+        // Periodic XHCI polling (ports + events) - skip heavy polling when interrupts active
         if (xhci_available) {
+#ifdef XHCI_USE_INTERRUPTS
+            static unsigned poll_div = 0;
+            // Still poll ports occasionally (connect status changes may not always interrupt early proto)
+            if ((poll_div++ & 0xF) == 0) {
+                xhci_poll_ports(&g_xhci);
+            }
+            // Event ring normally advanced by IRQ handler; optional safety poll if no events for a while
+            if ((poll_div & 0x1F) == 0) {
+                xhci_process_events(&g_xhci);
+            }
+#else
             xhci_poll_ports(&g_xhci);
             xhci_process_events(&g_xhci);
+#endif
             usb_msd_poll(&g_xhci); // attempt MSD actions
             static int dbg_counter = 0;
             if (((dbg_counter++) & 0x3F) == 0) {
@@ -449,23 +468,43 @@ after_cmd:				;
             } else {
                 g_xhci.cmd_ring_stall_ticks = 0;
             }
-            // Attempt FAT32 mount once usb0 appears and not yet mounted
-            static int tried_mount = 0;
-            if (!tried_mount) {
-                const block_device_t* b0 = block_get(0);
-                if (b0) {
-                    // Require MSD ready (capacity known and block size set) before mount attempt to avoid early timeouts
-                    extern int xhci_msd_ready_check(void* ctrl_ptr);
-                    int ready = ((xhci_controller_t*)b0->driver_data)->msd_ready; // direct access
-                    if (ready) {
-                        static fat32_fs_t fs; // global root fs instance
-                        if (fat32_mount(b0, &fs) == ST_OK) {
-                            fat32_vfs_register_root(&fs);
-                            kprintf("FAT32: mount succeeded on %s\n", b0->name);
-                            tried_mount = 1;
+            // Attempt FAT32 mounts across all block devices until signature file /LIKEOS.SIG is found
+            // We keep testing new devices; once signature is found we stop further attempts
+            static int signature_found = 0;
+            static unsigned int tested_mask = 0; // bit i set => device i fully tested (mounted + signature check)
+            static fat32_fs_t fs_instances[BLOCK_MAX_DEVICES];
+            if (!signature_found) {
+                int nblk = block_count();
+                for (int bi = 0; bi < nblk && !signature_found; ++bi) {
+                    if (tested_mask & (1u << bi))
+                        continue; // already tested this device
+                    const block_device_t* bdev = block_get(bi);
+                    if (!bdev || !bdev->driver_data) {
+                        tested_mask |= (1u << bi);
+                        continue;
+                    }
+                    xhci_controller_t* xh = (xhci_controller_t*)bdev->driver_data;
+                    if (!xh || !xh->msd_ready) {
+                        // Not yet ready (capacity unknown) - skip this round, will retry later
+                        continue;
+                    }
+                    fat32_fs_t* fs = &fs_instances[bi];
+                    if (fat32_mount(bdev, fs) == ST_OK) {
+                        fat32_vfs_register_root(fs); // temporarily becomes active root
+                        kprintf("FAT32: mount succeeded on %s (checking signature)\n", bdev->name);
+                        vfs_file_t* sf = 0;
+                        if (vfs_open("/LIKEOS.SIG", &sf) == ST_OK) {
+                            // Signature present - select this device permanently
+                            vfs_close(sf);
+                            signature_found = 1;
+                            kprintf("FAT32: signature /LIKEOS.SIG found on %s (root storage selected)\n", bdev->name);
                         } else {
-                            kprintf("FAT32: mount attempt failed\n");
+                            kprintf("FAT32: signature not found on %s\n", bdev->name);
+                            tested_mask |= (1u << bi); // do not retry unless rebooted
                         }
+                    } else {
+                        kprintf("FAT32: mount failed on %s\n", bdev->name ? bdev->name : "(unnamed)");
+                        tested_mask |= (1u << bi);
                     }
                 }
             }

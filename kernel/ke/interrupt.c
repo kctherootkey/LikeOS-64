@@ -2,6 +2,7 @@
 // 64-bit IDT and IRQ management system
 
 #include "../../include/kernel/interrupt.h"
+#include "../../include/kernel/xhci.h" // for xhci_controller_t and irq service
 
 // IDT table
 static struct idt_entry idt[IDT_ENTRIES];
@@ -348,9 +349,14 @@ void irq_handler(uint64_t *regs) {
         case 44: // IRQ12 - PS/2 Mouse
             mouse_irq_handler();
             break;
-        default:
-            kprintf("Unhandled IRQ %d\n", int_no - 32);
+        default: {
+            /* Attempt xHCI IRQ match (legacy INTx line unknown at compile time).
+               We route here if the line isn't keyboard/mouse and let the xHCI
+               service routine decide if it has work. */
+            extern xhci_controller_t g_xhci; /* defined in xhci.c */
+            xhci_irq_service(&g_xhci);
             break;
+        }
     }
 }
 

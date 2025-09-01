@@ -174,6 +174,9 @@ static void record_device(unsigned char bus, unsigned char dev, unsigned char fu
     for(int i = 0; i < 6; i++) {
         p->bar[i] = pci_cfg_read32(bus, dev, func, 0x10 + i * 4);
     }
+    unsigned int ilr = pci_cfg_read32(bus, dev, func, 0x3C);
+    p->interrupt_line = ilr & 0xFF;
+    p->interrupt_pin = (ilr >> 8) & 0xFF;
 }
 
 int pci_enumerate(void)
