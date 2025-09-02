@@ -21,13 +21,15 @@ xhci_controller_t g_xhci; // referenced via extern in init.c / interrupt.c
 #define XHCI_BULK_DEBUG 0      // enable bulk enqueue logging
 #endif
 #ifndef XHCI_MSD_DEBUG
-#define XHCI_MSD_DEBUG 0       // enable MSD BOT phase completion logs
+/* XHCI_MSD_DEBUG (and XHCI_MSD_LOG) now centrally defined in xhci.h so other modules can reuse.
+    Keep a fallback here only if the header was included without its guard (should not happen). */
+#define XHCI_MSD_DEBUG 0
 #endif
 
-#define XHCI_LOG(fmt, ...)        do { if(XHCI_DEBUG)     kprintf(fmt, ##__VA_ARGS__); } while(0)
-#define XHCI_EVT_LOG(fmt, ...)    do { if(XHCI_EVT_DEBUG) kprintf(fmt, ##__VA_ARGS__); } while(0)
-#define XHCI_BULK_LOG(fmt, ...)   do { if(XHCI_BULK_DEBUG)kprintf(fmt, ##__VA_ARGS__); } while(0)
-#define XHCI_MSD_LOG(fmt, ...)    do { if(XHCI_MSD_DEBUG) kprintf(fmt, ##__VA_ARGS__); } while(0)
+#define XHCI_LOG(fmt, ...)      do { if(XHCI_DEBUG)      kprintf(fmt, ##__VA_ARGS__); } while(0)
+#define XHCI_EVT_LOG(fmt, ...)  do { if(XHCI_EVT_DEBUG)  kprintf(fmt, ##__VA_ARGS__); } while(0)
+#define XHCI_BULK_LOG(fmt, ...) do { if(XHCI_BULK_DEBUG) kprintf(fmt, ##__VA_ARGS__); } while(0)
+/* XHCI_MSD_LOG provided by header (avoid local redefinition) */
 
 // Forward declarations for new control transfer helpers
 static void xhci_post_ep0_doorbell(xhci_controller_t* ctrl, unsigned slot_id);

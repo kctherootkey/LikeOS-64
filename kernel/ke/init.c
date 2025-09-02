@@ -24,6 +24,8 @@ static void shell_ls_cb(const char* name, unsigned attr, unsigned long size) {
 #include "../../include/kernel/usb.h"
 #include "../../include/kernel/usb_msd.h"
 #include "../../include/kernel/block.h"
+#include "../../include/kernel/ps2.h"
+#include "../../include/kernel/ioapic.h"
 // (fat32.h and vfs.h already included above)
 
 // Function prototypes
@@ -177,10 +179,17 @@ void KiSystemStartup(void) {
         kprintf("Warning: Failed to initialize scrollbar\n");
     }
 
-    // Initialize keyboard
+    // Initialize legacy PS/2 controller before keyboard driver (safe no-op if absent)
+    ps2_init();
+    // Configure IOAPIC redirection for keyboard (GSI 1) with potential active-low polarity
+    // On some hardware (e.g., Dell notebooks) ACPI reports IRQ1 override active low.
+    // Without ACPI parser yet, force active-low configuration for GSI 1.
+    if (ioapic_configure_legacy_irq(1, 0x21, IOAPIC_POLARITY_LOW, IOAPIC_TRIGGER_EDGE) != 0) {
+        kprintf("IOAPIC: keyboard redirection not configured (absent or unmapped)\n");
+    }
+    // Initialize keyboard driver state
     keyboard_init();
-    
-    // Enable keyboard IRQ (IRQ 1)
+    // Enable keyboard IRQ (PIC mask) still, in case we fall back to PIC routing
     irq_enable(1);
 
     // Initialize mouse

@@ -17,8 +17,16 @@ static uint8_t g_initialized = 0;
 #define MAX_DIRTY_REGIONS 64
 
 // Static buffers for early initialization (before heap is ready)
-// Support up to 1920x1080 framebuffer (8.3MB)
-#define MAX_STATIC_FB_SIZE (1920 * 1080 * 4)
+// Support higher resolutions (e.g. 4K 3840x2160) for notebooks with large panels.
+// You can override at compile time by defining MAX_STATIC_FB_WIDTH/HEIGHT.
+#ifndef MAX_STATIC_FB_WIDTH
+#define MAX_STATIC_FB_WIDTH 1920
+#endif
+#ifndef MAX_STATIC_FB_HEIGHT
+#define MAX_STATIC_FB_HEIGHT 1200
+#endif
+// 4 bytes per pixel (32-bit RGBA)
+#define MAX_STATIC_FB_SIZE (MAX_STATIC_FB_WIDTH * MAX_STATIC_FB_HEIGHT * 4)
 static uint32_t g_static_back_buffer[MAX_STATIC_FB_SIZE / sizeof(uint32_t)] __attribute__((aligned(64)));
 static dirty_rect_t g_static_dirty_regions[MAX_DIRTY_REGIONS] __attribute__((aligned(64)));
 static uint8_t g_using_static_buffers = 0;

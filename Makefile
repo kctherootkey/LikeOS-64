@@ -54,7 +54,9 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/xhci.o \
 			  $(BUILD_DIR)/fat32.o \
 			  $(BUILD_DIR)/usb.o \
-			  $(BUILD_DIR)/usb_msd.o
+			  $(BUILD_DIR)/usb_msd.o \
+			  $(BUILD_DIR)/ps2.o \
+			  $(BUILD_DIR)/ioapic.o
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -126,6 +128,12 @@ $(BUILD_DIR)/usb.o: $(KERNEL_DIR)/hal/usb.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/usb_msd.o: $(KERNEL_DIR)/hal/usb_msd.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ps2.o: $(KERNEL_DIR)/hal/ps2.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ioapic.o: $(KERNEL_DIR)/hal/ioapic.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # Build kernel ELF
@@ -219,20 +227,24 @@ qemu-fat: $(FAT_IMAGE)
 	@echo "Running LikeOS-64 from FAT image in QEMU with UEFI firmware..."
 	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -drive format=raw,file=$(FAT_IMAGE) -m 512M -serial stdio
 
-# Standalone USB mass storage data image (larger 64MB FAT32) with sample files
-# Small (< ~32MB) FAT32 volumes can fall below the FAT32 minimum cluster count, causing mtools copy failures.
-# Use a 64MB image to satisfy FAT32 constraints so mcopy reliably works and files appear to the OS.
-$(DATA_IMAGE): | $(BUILD_DIR)
-	@echo "Creating USB data FAT32 image (msdata.img, 64MB)..."
+# Standalone USB mass storage data image (64MB FAT32) now mirrors usb-write target (UEFI bootable + signature files)
+# Provides: EFI/BOOT/BOOTX64.EFI, kernel.elf, LIKEOS.SIG, HELLO.TXT
+$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) | $(BUILD_DIR)
+	@echo "Creating USB data FAT32 image (msdata.img, 64MB, UEFI bootable)..."
 	$(DD) if=/dev/zero of=$(DATA_IMAGE) bs=1M count=64
 	$(MKFS_FAT) -F32 -n "MSDATA" $(DATA_IMAGE)
-	echo "Hello from USB mass storage" > $(BUILD_DIR)/HELLO.TXT
+	# Create EFI directory structure and copy boot components
+	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/EFI
+	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/EFI/BOOT
+	MTOOLS_SKIP_CHECK=1 $(MTOOLS) -i $(DATA_IMAGE) $(BOOTLOADER_EFI) ::/EFI/BOOT/BOOTX64.EFI
+	MTOOLS_SKIP_CHECK=1 $(MTOOLS) -i $(DATA_IMAGE) $(KERNEL_ELF) ::/kernel.elf
+	# Add signature + sample files
 	echo "THIS IS A DEVICE STORING LIKEOS" > $(BUILD_DIR)/LIKEOS.SIG
-	set -e; \
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/HELLO.TXT ::/HELLO.TXT; \
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/LIKEOS.SIG ::/LIKEOS.SIG; \
-	rm -f $(BUILD_DIR)/HELLO.TXT $(BUILD_DIR)/LIKEOS.SIG || true
-	@echo "Data image created with sample files: $(DATA_IMAGE)"
+	echo "Hello from USB mass storage" > $(BUILD_DIR)/HELLO.TXT
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/LIKEOS.SIG ::/LIKEOS.SIG
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/HELLO.TXT ::/HELLO.TXT
+	rm -f $(BUILD_DIR)/LIKEOS.SIG $(BUILD_DIR)/HELLO.TXT || true
+	@echo "Data image created (UEFI + signature files): $(DATA_IMAGE)"
 
 # Run with ISO boot plus attached xHCI controller and USB mass storage device
 qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
