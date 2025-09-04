@@ -78,6 +78,18 @@ static uint8_t mouse_read_data(void)
     return inb(PS2_DATA_PORT);
 }
 
+// Flush any pending bytes from controller output (bounded)
+static void mouse_flush_output(void)
+{
+    for(int i=0;i<32;i++) {
+        if(inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) {
+            (void)inb(PS2_DATA_PORT);
+        } else {
+            break;
+        }
+    }
+}
+
 // Write command to mouse via PS/2 controller
 static void mouse_write_command(uint8_t cmd, uint8_t data)
 {
@@ -492,15 +504,51 @@ void mouse_init(void)
         return;
     }
 
-    // Detect mouse type and capabilities
+    // Detect mouse type and capabilities (may leave extra bytes in buffer depending on emulation)
     mouse_state.mouse_type = mouse_detect_type();
 
-    // Enable mouse data reporting
-    mouse_write_command(MOUSE_CMD_ENABLE_REPORTING, 0xFF);
-    uint8_t response = mouse_read_data();
+    // Apply defaults and stream mode explicitly to satisfy some VMs (e.g., VirtualBox)
+    mouse_write_command(MOUSE_CMD_SET_DEFAULTS, 0xFF); // expect ACK
+    uint8_t resp = mouse_read_data();
+    if(resp != MOUSE_ACK) {
+        kprintf("Mouse: SET_DEFAULTS unexpected resp=0x%02X (continuing)\n", resp);
+    }
+    mouse_flush_output();
+    mouse_write_command(MOUSE_CMD_SET_STREAM_MODE, 0xFF); // expect ACK
+    resp = mouse_read_data();
+    if(resp != MOUSE_ACK) {
+        kprintf("Mouse: SET_STREAM_MODE unexpected resp=0x%02X (continuing)\n", resp);
+    }
+    mouse_flush_output();
 
-    if(response != MOUSE_ACK) {
-        kprintf("ERROR: Mouse failed to enable reporting (response: 0x%02X)\n", response);
+    // Enable mouse data reporting (robust ACK handling)
+    mouse_write_command(MOUSE_CMD_ENABLE_REPORTING, 0xFF);
+    uint8_t enable_ack = 0x00;
+    int tries = 0;
+    for(tries=0; tries<4; ++tries) {
+        enable_ack = mouse_read_data();
+        // Some emulators may leave a stray device ID (0x00 or 0x03) before ACK
+        if(enable_ack == MOUSE_ACK) {
+            break;
+        }
+        if(enable_ack == 0x00 || enable_ack == 0x03) {
+            kprintf("Mouse: ignoring stray ID 0x%02X before ACK\n", enable_ack);
+            continue; // read next
+        }
+        if(enable_ack == MOUSE_NACK) {
+            kprintf("Mouse: NACK on enable, resending...\n");
+            mouse_write_command(MOUSE_CMD_ENABLE_REPORTING, 0xFF);
+            continue;
+        }
+        if(enable_ack == MOUSE_ERROR) {
+            kprintf("ERROR: Mouse reported error (0xFC) during enable\n");
+            break;
+        }
+        // Unknown byte - continue reading a few more times
+        kprintf("Mouse: unexpected byte 0x%02X during enable sequence\n", enable_ack);
+    }
+    if(enable_ack != MOUSE_ACK) {
+        kprintf("ERROR: Mouse failed to enable reporting (final resp: 0x%02X)\n", enable_ack);
         return;
     }
 
