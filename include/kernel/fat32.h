@@ -10,6 +10,7 @@ typedef struct {
     const block_device_t* bdev;
     unsigned long fat_start_lba;
     unsigned long data_start_lba;
+    unsigned long part_lba_offset; // partition/superfloppy base LBA (0 for superfloppy)
     unsigned int sectors_per_cluster;
     unsigned int bytes_per_sector;
     unsigned int root_cluster;

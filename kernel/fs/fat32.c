@@ -73,7 +73,7 @@ static int read_sectors(const block_device_t *bdev, unsigned long lba, unsigned 
 
 static unsigned long cluster_to_lba(fat32_fs_t *fs, unsigned long cluster)
 {
-    return fs->data_start_lba + (cluster - 2) * fs->sectors_per_cluster;
+    return fs->part_lba_offset + fs->data_start_lba + (cluster - 2) * fs->sectors_per_cluster;
 }
 
 // Simple root directory cache (single cluster only for now)
@@ -94,7 +94,7 @@ static unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long clu
             first_fat_sectors = fat_total; /* if only one FAT */
         g_fat_cache = kalloc(first_fat_sectors * fs->bytes_per_sector);
         if (g_fat_cache) {
-            read_sectors(fs->bdev, fs->fat_start_lba, first_fat_sectors, g_fat_cache);
+            read_sectors(fs->bdev, fs->part_lba_offset + fs->fat_start_lba, first_fat_sectors, g_fat_cache);
             g_fat_cache_entries = (first_fat_sectors * fs->bytes_per_sector) / 4;
         }
     }
@@ -120,47 +120,214 @@ static int str_eq(const char *a, const char *b)
 static unsigned long g_cwd_cluster = 0; // 0 means root
 // For now we don't maintain full parent map; parent of any dir except root collapses to root.
 
-int fat32_mount(const block_device_t *bdev, fat32_fs_t *out)
+// Minimal BPB sanity check
+static int fat32_validate_bpb(const fat32_bpb_t *bpb)
 {
-    if (!bdev || !out)
-        return ST_INVALID;
+    if (!bpb) return 0;
+    // Common jump opcodes: EB ?? 90  or  EB ?? EB  or  E9 ?? ??
+    if (!( (bpb->jmp[0] == 0xEB && bpb->jmp[2] == 0x90) || bpb->jmp[0] == 0xE9 ))
+        return 0;
+    if (bpb->bytes_per_sector != 512 && bpb->bytes_per_sector != 1024 &&
+        bpb->bytes_per_sector != 2048 && bpb->bytes_per_sector != 4096)
+        return 0;
+    // Sectors per cluster must be power of two and <= 128 (FAT spec)
+    if (bpb->sectors_per_cluster == 0 || (bpb->sectors_per_cluster & (bpb->sectors_per_cluster - 1)) || bpb->sectors_per_cluster > 128)
+        return 0;
+    if (bpb->reserved_sector_count == 0)
+        return 0;
+    if (bpb->num_fats == 0 || bpb->num_fats > 2)
+        return 0;
+    if (bpb->root_cluster < 2)
+        return 0;
+    if (bpb->fat_size16 == 0 && bpb->fat_size32 == 0)
+        return 0;
+    // For FAT32 root_entry_count should be 0
+    if (bpb->root_entry_count != 0)
+        return 0;
+    // fs_type field should contain 'FAT'
+    if (!(bpb->fs_type[0] == 'F' && bpb->fs_type[1] == 'A' && bpb->fs_type[2] == 'T'))
+        return 0;
+    return 1;
+}
+
+static int fat32_mount_at_lba(const block_device_t *bdev, unsigned long base_lba, fat32_fs_t *out)
+{
     void *sector = kalloc(512);
     if (!sector)
         return ST_NOMEM;
-    if (read_sectors(bdev, 0, 1, sector) != ST_OK) {
+    if (read_sectors(bdev, base_lba, 1, sector) != ST_OK) {
         kfree(sector);
         return ST_IO;
     }
     fat32_bpb_t *bpb = (fat32_bpb_t *)sector;
-    if (bpb->bytes_per_sector == 0 || bpb->sectors_per_cluster == 0) {
-        kfree(sector);
-        return ST_ERR;
+    if (!fat32_validate_bpb(bpb)) {
+        // Relaxed secondary acceptance (silent)
+        if (!(bpb->bytes_per_sector == 512 || bpb->bytes_per_sector == 1024 || bpb->bytes_per_sector == 2048 || bpb->bytes_per_sector == 4096) ||
+            bpb->sectors_per_cluster == 0 || bpb->reserved_sector_count == 0 || bpb->num_fats == 0 || bpb->root_cluster < 2 ||
+            (bpb->fat_size16 == 0 && bpb->fat_size32 == 0)) {
+            kfree(sector);
+            return ST_ERR;
+        }
     }
     unsigned long fat_sz = bpb->fat_size32 ? bpb->fat_size32 : bpb->fat_size16;
     unsigned long first_data_sector = bpb->reserved_sector_count + (bpb->num_fats * fat_sz);
     out->bdev = bdev;
     out->bytes_per_sector = bpb->bytes_per_sector;
     out->sectors_per_cluster = bpb->sectors_per_cluster;
+    // Store fat_start_lba and data_start_lba relative to base (partition) so cluster_to_lba adds base once.
     out->fat_start_lba = bpb->reserved_sector_count;
     out->data_start_lba = first_data_sector;
     out->root_cluster = bpb->root_cluster;
+    out->part_lba_offset = base_lba;
     g_root_dir_cluster = out->root_cluster;
-    g_root_fs = out; /* register internal pointer */
-    /* Load first root cluster */
+    g_root_fs = out;
     if (!g_root_dir_cache)
         g_root_dir_cache = kalloc(out->sectors_per_cluster * out->bytes_per_sector);
     if (g_root_dir_cache) {
         unsigned long root_lba = cluster_to_lba(out, out->root_cluster);
-        unsigned long read_count = out->sectors_per_cluster;
-        if (read_count == 0)
-            read_count = 1; /* safety */
+        unsigned long read_count = out->sectors_per_cluster ? out->sectors_per_cluster : 1;
         read_sectors(bdev, root_lba, read_count, g_root_dir_cache);
     }
-    kprintf("FAT32: mount %s bytes/sector=%u spc=%u root_cluster=%lu data_lba=%lu\n",
-        bdev->name, out->bytes_per_sector, out->sectors_per_cluster,
-        out->root_cluster, out->data_start_lba);
+    unsigned long abs_data = out->part_lba_offset + out->data_start_lba;
+    unsigned long abs_fat = out->part_lba_offset + out->fat_start_lba;
+    kprintf("FAT32: mounted %s base=%lu root=%lu\n", bdev->name, base_lba, out->root_cluster);
     kfree(sector);
     return ST_OK;
+}
+
+// Very small MBR partition entry structure
+typedef struct __attribute__((packed)) {
+    uint8_t status;
+    uint8_t chs_first[3];
+    uint8_t type;
+    uint8_t chs_last[3];
+    uint32_t lba_first;
+    uint32_t sectors;
+} mbr_part_t;
+
+int fat32_mount(const block_device_t *bdev, fat32_fs_t *out)
+{
+    if (!bdev || !out)
+        return ST_INVALID;
+    unsigned long candidates[16];
+    int cand_count = 0;
+    int protective_gpt = 0;
+
+    void *mbr = kalloc(512);
+    if (!mbr)
+        return ST_NOMEM;
+    if (read_sectors(bdev, 0, 1, mbr) != ST_OK) {
+        kfree(mbr);
+        return ST_IO;
+    }
+    uint8_t *m = (uint8_t *)mbr;
+    int has_sig = (m[510] == 0x55 && m[511] == 0xAA);
+    mbr_part_t *p = (mbr_part_t *)(m + 446);
+
+    if (has_sig) {
+        for (int i = 0; i < 4; i++) {
+            if (p[i].type == 0xEE) protective_gpt = 1; // Protective GPT
+        }
+    }
+
+    // Collect MBR partition starts first (skip protective entry itself)
+    if (has_sig) {
+        for (int i = 0; i < 4; i++) {
+            if (p[i].lba_first && p[i].sectors && p[i].type != 0x00 && p[i].type != 0xEE) {
+                int dup = 0; for (int j = 0; j < cand_count; j++) if (candidates[j] == p[i].lba_first) dup = 1;
+                if (!dup && cand_count < (int)(sizeof(candidates)/sizeof(candidates[0]))) candidates[cand_count++] = p[i].lba_first;
+            }
+        }
+    }
+
+    // If GPT, parse GPT header to discover ESP (or any) partitions
+    if (protective_gpt) {
+        void *hdr = kalloc(512);
+        if (hdr && read_sectors(bdev, 1, 1, hdr) == ST_OK) {
+            uint8_t *h = (uint8_t *)hdr;
+            if (h[0]=='E' && h[1]=='F' && h[2]=='I' && h[3]==' ' && h[4]=='P' && h[5]=='A' && h[6]=='R' && h[7]=='T') {
+                uint32_t num_entries = *(uint32_t *)(h + 80);
+                uint32_t entry_size = *(uint32_t *)(h + 84);
+                uint64_t part_lba = *(uint64_t *)(h + 72); // partition entry starting LBA
+                if (entry_size >= 128 && num_entries > 0 && num_entries < 512) {
+                    uint32_t to_read = num_entries;
+                    if (to_read > 32) to_read = 32; // cap
+                    uint64_t bytes = (uint64_t)to_read * entry_size;
+                    uint32_t sectors = (uint32_t)((bytes + 511) / 512);
+                    void *pe = kalloc(sectors * 512);
+                    if (pe && read_sectors(bdev, (unsigned long)part_lba, sectors, pe) == ST_OK) {
+                        for (uint32_t i = 0; i < to_read; i++) {
+                            uint8_t *e = (uint8_t *)pe + i * entry_size;
+                            int empty = 1; for (int k = 0; k < 16; k++) if (e[k]) { empty = 0; break; }
+                            if (empty) continue;
+                            // ESP type GUID little-endian: 28 73 2A C1 1F F8 D2 11 BA 4B 00 A0 C9 3E C9 3B
+                            int is_esp = (e[0]==0x28&&e[1]==0x73&&e[2]==0x2A&&e[3]==0xC1&&e[4]==0x1F&&e[5]==0xF8&&e[6]==0xD2&&e[7]==0x11&&e[8]==0xBA&&e[9]==0x4B&&e[10]==0x00&&e[11]==0xA0&&e[12]==0xC9&&e[13]==0x3E&&e[14]==0xC9&&e[15]==0x3B);
+                            uint64_t first_lba = *(uint64_t *)(e + 32);
+                            if (first_lba && first_lba < 0xFFFFFFFFULL) {
+                                // Add ESP first, others later
+                                if (is_esp) {
+                                    int dup = 0; for (int j = 0; j < cand_count; j++) if (candidates[j] == (unsigned long)first_lba) dup = 1;
+                                    if (!dup && cand_count < (int)(sizeof(candidates)/sizeof(candidates[0]))) candidates[cand_count++] = (unsigned long)first_lba;
+                                }
+                            }
+                        }
+                        // Second pass: add any non-ESP we didn't add yet
+                        for (uint32_t i = 0; i < to_read; i++) {
+                            uint8_t *e = (uint8_t *)pe + i * entry_size;
+                            int empty = 1; for (int k = 0; k < 16; k++) if (e[k]) { empty = 0; break; }
+                            if (empty) continue;
+                            int is_esp = (e[0]==0x28&&e[1]==0x73&&e[2]==0x2A&&e[3]==0xC1&&e[4]==0x1F&&e[5]==0xF8&&e[6]==0xD2&&e[7]==0x11&&e[8]==0xBA&&e[9]==0x4B&&e[10]==0x00&&e[11]==0xA0&&e[12]==0xC9&&e[13]==0x3E&&e[14]==0xC9&&e[15]==0x3B);
+                            if (is_esp) continue;
+                            uint64_t first_lba = *(uint64_t *)(e + 32);
+                            if (first_lba && first_lba < 0xFFFFFFFFULL) {
+                                int dup = 0; for (int j = 0; j < cand_count; j++) if (candidates[j] == (unsigned long)first_lba) dup = 1;
+                                if (!dup && cand_count < (int)(sizeof(candidates)/sizeof(candidates[0]))) candidates[cand_count++] = (unsigned long)first_lba;
+                            }
+                        }
+                    }
+                    if (pe) kfree(pe);
+                }
+            }
+        }
+        if (hdr) kfree(hdr);
+    }
+
+    // Only consider LBA0 as superfloppy last if NOT GPT and no conventional partitions found
+    if (!protective_gpt) {
+        int any_part = 0; for (int i = 0; i < 4; i++) if (p[i].type != 0) any_part = 1;
+        if (!any_part) {
+            // attempt superfloppy at 0 (add if not already from earlier logic)
+            int dup = 0; for (int j = 0; j < cand_count; j++) if (candidates[j] == 0) dup = 1;
+            if (!dup && cand_count < (int)(sizeof(candidates)/sizeof(candidates[0]))) candidates[cand_count++] = 0;
+        }
+    }
+    kfree(mbr);
+
+    // Also add sector 2048 heuristic if space left and not already included
+    if (cand_count < (int)(sizeof(candidates)/sizeof(candidates[0]))) {
+        int dup = 0; for (int j = 0; j < cand_count; j++) if (candidates[j] == 2048) dup = 1;
+        if (!dup) candidates[cand_count++] = 2048;
+    }
+
+    /* (debug output removed) */
+    fat32_fs_t best;
+    int best_set = 0;
+    int best_score = -999;
+    for (int i = 0; i < cand_count; i++) {
+        fat32_fs_t tmp;
+        if (fat32_mount_at_lba(bdev, candidates[i], &tmp) == ST_OK) {
+            int score = 0;
+            if (candidates[i] != 0) score += 10; /* prefer partition */
+            if (!best_set || score > best_score) { best = tmp; best_set = 1; best_score = score; }
+        }
+    }
+    if (best_set) {
+        *out = best;
+        /* selection silent (summary printed by mount_at_lba) */
+        return ST_OK;
+    }
+    kprintf("FAT32: no valid FAT32 volume found on %s\n", bdev->name);
+    return ST_ERR;
 }
 
 // VFS bridge
@@ -729,39 +896,10 @@ int fat32_vfs_register_root(fat32_fs_t *fs)
 
 void fat32_list_root(void (*cb)(const char *name, unsigned attr, unsigned long size))
 {
-    if (!g_root_fs || !g_root_dir_cache || !cb)
+    if (!g_root_fs || !cb)
         return;
-    unsigned entries = (g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector) / sizeof(fat32_dirent_t);
-    fat32_dirent_t *ents = (fat32_dirent_t *)g_root_dir_cache;
-    for (unsigned i = 0; i < entries; i++) {
-        if (ents[i].name[0] == 0x00)
-            break;
-        if (ents[i].name[0] == 0xE5)
-            continue;
-        if (ents[i].attr == FAT32_ATTR_LONG_NAME)
-            continue;
-        if (ents[i].attr & 0x08)
-            continue;
-        char temp[13];
-        int p = 0;
-        for (int j = 0; j < 8; j++) {
-            if (ents[i].name[j] == ' ')
-                break;
-            temp[p++] = ents[i].name[j];
-        }
-        if (ents[i].name[8] != ' ') {
-            temp[p++] = '.';
-            for (int j = 8; j < 11; j++) {
-                if (ents[i].name[j] == ' ')
-                    break;
-                temp[p++] = ents[i].name[j];
-            }
-        }
-        temp[p] = '\0';
-        if (p == 0)
-            continue;
-        cb(temp, ents[i].attr, ents[i].fileSize);
-    }
+    // Reuse directory iterator over entire root cluster chain for multi-cluster roots
+    fat32_dir_list_internal(g_root_dir_cluster, cb);
 }
 
 // Debug helper: dump first few raw directory entries (8.3) for diagnostics

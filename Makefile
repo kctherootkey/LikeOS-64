@@ -208,6 +208,12 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) | $(BUILD_DIR)
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/EFI/BOOT
 	MTOOLS_SKIP_CHECK=1 $(MTOOLS) -i $(FAT_IMAGE) $(BOOTLOADER_EFI) ::/EFI/BOOT/BOOTX64.EFI
 	MTOOLS_SKIP_CHECK=1 $(MTOOLS) -i $(FAT_IMAGE) $(KERNEL_ELF) ::/kernel.elf
+	# Add signature + hello files (align with data image so USB_BOOT tests see them)
+	echo "THIS IS A DEVICE STORING LIKEOS" > $(BUILD_DIR)/LIKEOS.SIG
+	echo "Hello from USB mass storage" > $(BUILD_DIR)/HELLO.TXT
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/LIKEOS.SIG ::/LIKEOS.SIG
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/HELLO.TXT ::/HELLO.TXT
+	rm -f $(BUILD_DIR)/LIKEOS.SIG $(BUILD_DIR)/HELLO.TXT || true
 	
 	@echo "UEFI bootable FAT image created: $(FAT_IMAGE)"
 
