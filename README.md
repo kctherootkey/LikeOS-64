@@ -96,6 +96,15 @@ make qemu        # Boot from ISO
 make qemu-fat    # Boot from FAT image
 ```
 
+Seamless USB host that auto-launches LikeOS in QEMU/KVM:
+
+```bash
+make linux-usb               # Build a minimal Debian USB image with X11 + QEMU
+make linux-usb-write USB_DEVICE=/dev/sdX
+```
+
+Boot the USB stick on real hardware: GRUB (timeout 0) -> minimal X11 -> full-screen QEMU with LikeOS ISO, giving the impression of booting directly into the hobby OS.
+
 Manual QEMU execution:
 ```bash
 qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd -cdrom build/LikeOS-64.iso -m 512M

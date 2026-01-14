@@ -64,6 +64,9 @@ ISO_IMAGE = $(BUILD_DIR)/LikeOS-64.iso
 FAT_IMAGE = $(BUILD_DIR)/LikeOS-64.img
 USB_IMAGE = $(BUILD_DIR)/LikeOS-64-usb.img
 DATA_IMAGE = $(BUILD_DIR)/msdata.img
+LINUX_USB_DIR = host/linux-usb
+LINUX_USB_BUILD_DIR = $(BUILD_DIR)/linux-usb
+LINUX_USB_IMAGE = $(LINUX_USB_BUILD_DIR)/linux-usb.img
 
 # Default target
 all: $(ISO_IMAGE) $(FAT_IMAGE) $(USB_IMAGE)
@@ -338,6 +341,28 @@ usb-write: $(ISO_IMAGE)
 	@echo "UEFI bootable USB drive created successfully on $(USB_DEVICE)"
 	@echo "The USB drive should now boot on UEFI systems with GPT support."
 
+# Build a minimal Linux host that auto-starts LikeOS under QEMU/KVM
+linux-usb: $(ISO_IMAGE)
+	@echo "Building Linux host USB image with seamless LikeOS handoff..."
+	$(LINUX_USB_DIR)/create-rootfs.sh
+
+# Write the host Linux image to a USB device
+# Usage: make linux-usb-write USB_DEVICE=/dev/sdX
+linux-usb-write: linux-usb
+	@if [ -z "$(USB_DEVICE)" ]; then \
+		echo "Error: USB_DEVICE not specified. Usage: make linux-usb-write USB_DEVICE=/dev/sdX"; \
+		echo "Available devices:"; \
+		lsblk -d -o NAME,SIZE,TYPE | grep disk; \
+		exit 1; \
+	fi
+	@echo "WARNING: This will overwrite $(USB_DEVICE) with the Linux host image!"
+	@echo "Press Enter to continue or Ctrl+C to cancel..."
+	@read confirm
+	@echo "Writing $(LINUX_USB_IMAGE) to $(USB_DEVICE) (this may take a while)..."
+	@sudo dd if=$(LINUX_USB_IMAGE) of=$(USB_DEVICE) bs=4M status=progress oflag=sync
+	@sync
+	@echo "Linux host USB written to $(USB_DEVICE). The stick will boot straight into X11 and launch LikeOS inside QEMU/KVM."
+
 # Clean build files
 clean:
 	rm -rf $(BUILD_DIR)
@@ -346,7 +371,9 @@ clean:
 deps:
 	@echo "Installing build dependencies..."
 	sudo apt update
-	sudo apt install -y gcc nasm xorriso mtools dosfstools ovmf gnu-efi-dev
+	# Ubuntu names the package gnu-efi (no -dev); Debian uses gnu-efi-dev. Try both.
+	sudo apt install -y gcc nasm xorriso mtools dosfstools ovmf debootstrap parted gdisk qemu-utils grub-efi-amd64-bin rsync || true
+	sudo apt install -y gnu-efi-dev || sudo apt install -y gnu-efi
 
 # Help target
 help:
@@ -364,6 +391,8 @@ help:
 	@echo "  qemu-usb   - Run QEMU attaching data image as USB mass storage"
 	@echo "  qemu-usb-passthrough - Run QEMU with host USB device passthrough (experimental)"
 	@echo "  usb-write  - Write to USB device with GPT (requires USB_DEVICE=/dev/sdX)"
+	@echo "  linux-usb  - Build Debian-based host USB image that auto-launches LikeOS via QEMU/KVM"
+	@echo "  linux-usb-write - Write the host Linux image to USB (requires USB_DEVICE=/dev/sdX)"
 	@echo "  clean      - Clean build files"
 	@echo "  deps       - Install build dependencies"
 	@echo ""
@@ -383,4 +412,4 @@ iso: $(ISO_IMAGE)
 fat: $(FAT_IMAGE)
 usb: $(USB_IMAGE)
 
-.PHONY: all clean qemu qemu-fat usb-write deps help kernel bootloader iso fat usb
+.PHONY: all clean qemu qemu-fat usb-write deps help kernel bootloader iso fat usb linux-usb linux-usb-write

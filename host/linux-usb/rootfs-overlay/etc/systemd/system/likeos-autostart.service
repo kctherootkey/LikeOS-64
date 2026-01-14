@@ -1,0 +1,25 @@
+[Unit]
+Description=Launch LikeOS inside QEMU with KVM as the primary session
+DefaultDependencies=no
+After=systemd-user-sessions.service systemd-logind.service
+Conflicts=getty@tty1.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=likeos
+WorkingDirectory=/home/likeos
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/likeos/.Xauthority
+Environment=HOME=/home/likeos
+ExecStart=/usr/local/bin/likeos-startx
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

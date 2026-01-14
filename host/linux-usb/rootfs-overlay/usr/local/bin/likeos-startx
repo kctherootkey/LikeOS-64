@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Ensure HOME/ENV are set for the session
+export HOME=${HOME:-/home/likeos}
+export USER=${USER:-likeos}
+export DISPLAY=${DISPLAY:-:0}
+export XAUTHORITY=${XAUTHORITY:-/home/likeos/.Xauthority}
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u likeos)}
+LOGDIR=/home/likeos/.local/share
+
+ensure_env()
+{
+    # Prepare /tmp and X sockets with root ownership
+    sudo mkdir -p /tmp /tmp/.X11-unix || true
+    sudo chmod 1777 /tmp /tmp/.X11-unix || true
+    sudo chown root:root /tmp/.X11-unix || true
+    sudo rm -f /tmp/.X*-lock /tmp/.X11-unix/X* 2>/dev/null || true
+
+    # Prepare runtime dir for the likeos user (logind should also do this, but ensure manually)
+    sudo mkdir -p "$XDG_RUNTIME_DIR" || true
+    sudo chown likeos:likeos "$XDG_RUNTIME_DIR" || true
+    sudo chmod 700 "$XDG_RUNTIME_DIR" || true
+
+    # Ensure Xauthority exists and is owned by likeos
+    sudo -u likeos touch "$XAUTHORITY"
+
+    # Ensure log dir exists
+    sudo -u likeos mkdir -p "$LOGDIR" || true
+}
+
+ensure_env
+
+# Run X as the likeos user if invoked by root
+if [ "$(id -un)" != "likeos" ]; then
+    exec sudo -u likeos -H env HOME=/home/likeos USER=likeos DISPLAY=$DISPLAY XAUTHORITY=$XAUTHORITY XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR \
+        startx -- :0 vt1 -keeptty -dpi 96 -s 0 >>$LOGDIR/startx.log 2>&1
+fi
+
+exec startx -- :0 vt1 -keeptty -dpi 96 -s 0 >>$LOGDIR/startx.log 2>&1

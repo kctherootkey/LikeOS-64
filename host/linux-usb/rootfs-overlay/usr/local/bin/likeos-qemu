@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ISO_PATH=${HOBBY_ISO:-/usr/local/share/likeos/LikeOS-64.iso}
+RAM_MB=${HOBBY_RAM_MB:-2048}
+SMP=${HOBBY_SMP:-2}
+VIDEO=${HOBBY_DISPLAY:-gtk,gl=off}
+ACCEL=${HOBBY_ACCEL:-kvm}
+FULLSCREEN=${HOBBY_FULLSCREEN:-off}
+LOGDIR=/home/likeos/.local/share
+LOGFILE=$LOGDIR/likeos-qemu.log
+
+if [ ! -f "$ISO_PATH" ]; then
+    echo "LikeOS ISO not found at $ISO_PATH" >&2
+    exit 1
+fi
+
+mkdir -p "$LOGDIR"
+
+QEMU_ARGS=(
+    -m "$RAM_MB"
+    -smp "$SMP"
+    -bios /usr/share/ovmf/OVMF.fd
+    -cdrom "$ISO_PATH"
+    -vga std
+    -device qemu-xhci,id=xhci
+    -device usb-tablet
+    -serial mon:stdio
+    -display "$VIDEO"
+    -no-reboot
+    -no-shutdown
+)
+
+if [ "$FULLSCREEN" = "on" ]; then
+    QEMU_ARGS=( "${QEMU_ARGS[@]}" -full-screen )
+fi
+
+case "$ACCEL" in
+    kvm)
+        QEMU_ARGS=( -enable-kvm -cpu host "${QEMU_ARGS[@]}" )
+        ;;
+    hvf|whpx)
+        QEMU_ARGS=( -accel "$ACCEL" -cpu host "${QEMU_ARGS[@]}" )
+        ;;
+    none)
+        QEMU_ARGS=( -accel tcg,thread=multi -cpu max "${QEMU_ARGS[@]}" )
+        ;;
+    *)
+        QEMU_ARGS=( -accel "$ACCEL" -cpu host "${QEMU_ARGS[@]}" )
+        ;;
+esac
+
+exec qemu-system-x86_64 "${QEMU_ARGS[@]}" 2>"$LOGFILE" | tee -a "$LOGFILE"
