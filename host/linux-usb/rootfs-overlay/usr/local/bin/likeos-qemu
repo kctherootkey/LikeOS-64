@@ -4,7 +4,7 @@ set -euo pipefail
 ISO_PATH=${HOBBY_ISO:-/usr/local/share/likeos/LikeOS-64.iso}
 RAM_MB=${HOBBY_RAM_MB:-512}
 SMP=${HOBBY_SMP:-2}
-VIDEO=${HOBBY_DISPLAY:-gtk,gl=off}
+VIDEO=${HOBBY_DISPLAY:-gtk,gl=off,show-menubar=off,show-tabs=off,grab-on-hover=on}
 ACCEL=none
 FULLSCREEN=${HOBBY_FULLSCREEN:-off}
 LOGDIR=/home/likeos/.local/share

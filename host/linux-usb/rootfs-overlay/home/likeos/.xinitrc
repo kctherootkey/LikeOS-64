@@ -7,6 +7,7 @@ mkdir -p "$LOGDIR"
 xsetroot -solid "#000000"
 xset -dpms
 xset s off
+xrandr -s 1280x800 >/dev/null 2>&1 || true
 
 if [ "$DEBUG" = "1" ]; then
 	# Run QEMU in background so we can keep an xterm visible for debugging
