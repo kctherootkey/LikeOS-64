@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ISO_PATH=${HOBBY_ISO:-/usr/local/share/likeos/LikeOS-64.iso}
+USB_IMG=${HOBBY_USB_IMG:-/usr/local/share/likeos/msdata.img}
 RAM_MB=${HOBBY_RAM_MB:-512}
 SMP=${HOBBY_SMP:-2}
 VIDEO=${HOBBY_DISPLAY:-gtk,gl=off,show-menubar=off,show-tabs=off,grab-on-hover=on}
@@ -17,6 +18,10 @@ if [ ! -f "$ISO_PATH" ]; then
     echo "LikeOS ISO not found at $ISO_PATH" >&2
     exit 1
 fi
+if [ ! -f "$USB_IMG" ]; then
+    echo "USB image not found at $USB_IMG" >&2
+    exit 1
+fi
 
 mkdir -p "$LOGDIR" "$RUNTIME_DIR" || true
 chmod 700 "$RUNTIME_DIR" || true
@@ -29,6 +34,8 @@ QEMU_ARGS=(
     -vga std
     -device qemu-xhci,id=xhci
     -device usb-tablet
+    -drive if=none,id=usbdisk,file="$USB_IMG",format=raw,readonly=off
+    -device usb-storage,drive=usbdisk
     -serial mon:stdio
     -monitor unix:$MONITOR_SOCK,server,nowait
     -display "$VIDEO"

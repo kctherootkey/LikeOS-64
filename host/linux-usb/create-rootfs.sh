@@ -11,6 +11,7 @@ MNT_ROOT="$BUILD_DIR/mnt-root"
 MNT_EFI="$BUILD_DIR/mnt-efi"
 IMAGE_PATH="$BUILD_DIR/linux-usb.img"
 ISO_PATH="$PROJECT_ROOT/build/LikeOS-64.iso"
+DATA_IMG_PATH="$PROJECT_ROOT/build/msdata.img"
 DEBIAN_CODENAME="bookworm"
 IMAGE_SIZE_MB=${IMAGE_SIZE_MB:-}
 EFI_SIZE_MB=${EFI_SIZE_MB:-256}
@@ -37,6 +38,10 @@ done
 
 if [ ! -f "$ISO_PATH" ]; then
     echo "LikeOS ISO missing at $ISO_PATH. Build it first (make iso)." >&2
+    exit 1
+fi
+if [ ! -f "$DATA_IMG_PATH" ]; then
+    echo "LikeOS data image missing at $DATA_IMG_PATH. Build it first (make data-image)." >&2
     exit 1
 fi
 
@@ -72,6 +77,7 @@ fi
 sudo rsync -a "$OVERLAY_DIR/" "$ROOTFS_DIR/"
 sudo mkdir -p "$ROOTFS_DIR/usr/local/share/likeos"
 sudo cp "$ISO_PATH" "$ROOTFS_DIR/usr/local/share/likeos/LikeOS-64.iso"
+sudo cp "$DATA_IMG_PATH" "$ROOTFS_DIR/usr/local/share/likeos/msdata.img"
 
 # 3) Configure inside chroot
 sudo chroot "$ROOTFS_DIR" /bin/bash <<'EOF'
@@ -109,6 +115,8 @@ chmod 440 /etc/sudoers.d/likeos
 
 # Ensure home files belong to the user
 chown -R likeos:likeos /home/likeos
+# Ensure bundled images are readable by the likeos user
+chown -R likeos:likeos /usr/local/share/likeos || true
 
 # Enable the autostart unit and disable tty1 getty to keep a clean handoff
 systemctl enable likeos-autostart.service

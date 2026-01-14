@@ -342,7 +342,7 @@ usb-write: $(ISO_IMAGE)
 	@echo "The USB drive should now boot on UEFI systems with GPT support."
 
 # Build a minimal Linux host that auto-starts LikeOS under QEMU/KVM
-linux-usb: $(ISO_IMAGE)
+linux-usb: $(ISO_IMAGE) $(DATA_IMAGE)
 	@echo "Building Linux host USB image with seamless LikeOS handoff..."
 	$(LINUX_USB_DIR)/create-rootfs.sh
 
