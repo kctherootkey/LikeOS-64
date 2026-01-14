@@ -7,6 +7,7 @@ SMP=${HOBBY_SMP:-2}
 VIDEO=${HOBBY_DISPLAY:-gtk,gl=off,show-menubar=off,show-tabs=off,grab-on-hover=on}
 ACCEL=none
 FULLSCREEN=${HOBBY_FULLSCREEN:-off}
+FOCUS=${HOBBY_FOCUS:-on}
 LOGDIR=/home/likeos/.local/share
 LOGFILE=$LOGDIR/likeos-qemu.log
 RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
@@ -67,7 +68,6 @@ info version
 EOF
             then
                 socat - UNIX-CONNECT:$MONITOR_SOCK <<'EOF'
-sendkey ctrl-alt-g
 sendkey ctrl-alt-f
 EOF
                 break
@@ -76,7 +76,27 @@ EOF
         done
     ) &
 else
-    echo "socat not found; cannot auto-send ctrl-alt-g/f" >>"$LOGFILE"
+    echo "socat not found; cannot auto-send ctrl-alt-f" >>"$LOGFILE"
+fi
+
+if [ "$FOCUS" = "on" ]; then
+    (
+        if command -v wmctrl >/dev/null 2>&1; then
+            for i in $(seq 1 15); do
+                wmctrl -a "QEMU" 2>/dev/null && break
+                sleep 0.5
+            done
+        elif command -v xdotool >/dev/null 2>&1; then
+            for i in $(seq 1 15); do
+                win=$(xdotool search --name "QEMU" 2>/dev/null | head -n1) || true
+                if [ -n "$win" ]; then
+                    xdotool windowactivate "$win" windowfocus "$win"
+                    break
+                fi
+                sleep 0.5
+            done
+        fi
+    ) &
 fi
 
 wait $QEMU_PID
