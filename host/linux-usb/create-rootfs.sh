@@ -81,7 +81,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends \
     xserver-xorg xserver-xorg-legacy xinit x11-xserver-utils openbox dbus-x11 xterm \
-    qemu-system-x86 qemu-system-gui qemu-utils ovmf \
+    qemu-system-x86 qemu-system-gui qemu-utils ovmf socat \
     grub-efi-amd64-bin grub2-common \
     locales curl ca-certificates
 

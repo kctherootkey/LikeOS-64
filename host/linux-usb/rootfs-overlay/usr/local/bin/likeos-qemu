@@ -2,20 +2,23 @@
 set -euo pipefail
 
 ISO_PATH=${HOBBY_ISO:-/usr/local/share/likeos/LikeOS-64.iso}
-RAM_MB=${HOBBY_RAM_MB:-2048}
+RAM_MB=${HOBBY_RAM_MB:-512}
 SMP=${HOBBY_SMP:-2}
 VIDEO=${HOBBY_DISPLAY:-gtk,gl=off}
-ACCEL=${HOBBY_ACCEL:-kvm}
+ACCEL=none
 FULLSCREEN=${HOBBY_FULLSCREEN:-off}
 LOGDIR=/home/likeos/.local/share
 LOGFILE=$LOGDIR/likeos-qemu.log
+RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+MONITOR_SOCK=$RUNTIME_DIR/likeos-qemu.monitor
 
 if [ ! -f "$ISO_PATH" ]; then
     echo "LikeOS ISO not found at $ISO_PATH" >&2
     exit 1
 fi
 
-mkdir -p "$LOGDIR"
+mkdir -p "$LOGDIR" "$RUNTIME_DIR" || true
+chmod 700 "$RUNTIME_DIR" || true
 
 QEMU_ARGS=(
     -m "$RAM_MB"
@@ -26,6 +29,7 @@ QEMU_ARGS=(
     -device qemu-xhci,id=xhci
     -device usb-tablet
     -serial mon:stdio
+    -monitor unix:$MONITOR_SOCK,server,nowait
     -display "$VIDEO"
     -no-reboot
     -no-shutdown
@@ -50,4 +54,29 @@ case "$ACCEL" in
         ;;
 esac
 
-exec qemu-system-x86_64 "${QEMU_ARGS[@]}" 2>"$LOGFILE" | tee -a "$LOGFILE"
+# Launch QEMU
+qemu-system-x86_64 "${QEMU_ARGS[@]}" 2>"$LOGFILE" | tee -a "$LOGFILE" &
+QEMU_PID=$!
+
+# Attempt to send hotkeys via monitor once ready
+if command -v socat >/dev/null 2>&1; then
+    (
+        for i in $(seq 1 10); do
+            if socat - UNIX-CONNECT:$MONITOR_SOCK 2>/dev/null <<'EOF'
+info version
+EOF
+            then
+                socat - UNIX-CONNECT:$MONITOR_SOCK <<'EOF'
+sendkey ctrl-alt-g
+sendkey ctrl-alt-f
+EOF
+                break
+            fi
+            sleep 1
+        done
+    ) &
+else
+    echo "socat not found; cannot auto-send ctrl-alt-g/f" >>"$LOGFILE"
+fi
+
+wait $QEMU_PID
