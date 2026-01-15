@@ -4,6 +4,10 @@ A modern 64-bit operating system built from scratch, targeting x86_64 architectu
 
 Current state: For real hardware the operating system boots from linux bootstrapper that runs qemu right after the boot sequence - in order to avoid supporting every different hardware on the planet. This is accomplished by creating a bootable usb stick with the make linux-usb and make linux-usb-write targets. The os can be also booted into qemu on for example windows or linux hosts by using the make qemu target.
 
+https://github.com/user-attachments/assets/4026c84f-08db-44f6-9677-a5a9447e4654
+
+LikeOS-64 running on a Lenovo Notebook through the Linux bootstrapper and embedded qemu.
+
 ## Overview
 
 LikeOS-64 is a sophisticated operating system that demonstrates:
