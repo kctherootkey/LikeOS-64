@@ -36,7 +36,8 @@ static void xhci_post_ep0_doorbell(xhci_controller_t* ctrl, unsigned slot_id);
 static void xhci_ep0_build_setup(xhci_controller_t* ctrl, xhci_trb_t* ring, uint8_t bm, uint8_t req, uint16_t wValue, uint16_t wIndex, uint16_t wLength, int in_dir);
 void xhci_start_enumeration(xhci_controller_t* ctrl, struct usb_device* dev);
 void xhci_control_xfer_event(xhci_controller_t* ctrl, struct usb_device* dev, unsigned cc);
-static void xhci_issue_set_tr_dequeue(xhci_controller_t* ctrl, usb_device_t* dev, unsigned epid, uint64_t ring_phys, unsigned cycle);
+void xhci_issue_reset_endpoint(xhci_controller_t* ctrl, usb_device_t* dev, unsigned epid);
+void xhci_issue_set_tr_dequeue(xhci_controller_t* ctrl, usb_device_t* dev, unsigned epid, uint64_t ring_phys, unsigned cycle);
 static xhci_trb_t* xhci_cmd_enqueue_nodoorbell(xhci_controller_t* ctrl, unsigned int type, unsigned long param);
 // Issue Evaluate Context for a subset of endpoints (add_mask should include the endpoint IDs; slot bit added here)
 static void xhci_issue_eval_context_endpoints(xhci_controller_t* ctrl, usb_device_t* dev, unsigned add_mask)
@@ -511,7 +512,7 @@ int xhci_process_events(xhci_controller_t *ctrl)
         if(type == XHCI_TRB_TYPE_COMMAND_COMPLETION) {
             unsigned int status = trb->status;
             unsigned int cc = (status >> 24) & 0xFF; /* completion code */
-            const char *cc_name = "?";
+            const char *cc_name = "Unknown";
             switch(cc) {
             case 1: cc_name = "Success"; break;
             case 5: cc_name = "TRBError"; break;
@@ -764,6 +765,15 @@ int xhci_process_events(xhci_controller_t *ctrl)
                     ctrl->pending_cmd_trb_phys = 0;
                     ctrl->pending_device = 0;
                 }
+            } else if(ctrl->pending_cmd_type == XHCI_TRB_TYPE_RESET_ENDPOINT || ctrl->pending_cmd_type == XHCI_TRB_TYPE_SET_TR_DEQUEUE_POINTER) {
+                /* Clear pending for endpoint maintenance commands regardless of CC */
+                ctrl->pending_cmd_type = 0;
+                ctrl->pending_cmd_trb = 0;
+                ctrl->pending_cmd_trb_phys = 0;
+                ctrl->pending_device = 0;
+                if(cc != 1) {
+                    XHCI_EVT_LOG("xhci: endpoint cmd type=%u cc=%u\n", type, cc);
+                }
             } else if(ctrl->pending_cmd_type == XHCI_TRB_TYPE_CONFIG_ENDPOINT && ctrl->pending_device) {
                 usb_device_t *dev = (usb_device_t *)ctrl->pending_device;
                 if(cc == 1) {
@@ -853,7 +863,6 @@ cmd_done:;
             uint64_t ep_trb_ptr = ((uint64_t)trb->param_hi << 32) | trb->param_lo;
             /* Identify which TRB in ring this event refers to by physical address */
             if(dev && ctrl->ep0_ring) {
-                xhci_trb_t *ring0 = (xhci_trb_t *)ctrl->ep0_ring;
                 for(unsigned i = 0; i < 16; i++) {
                     uint64_t phys = ctrl->ep0_ring_phys + i * sizeof(xhci_trb_t);
                     if(phys == ep_trb_ptr) {
@@ -1062,6 +1071,13 @@ static int xhci_bulk_enqueue(xhci_controller_t *ctrl, void *ring_base, unsigned 
         return ST_INVALID;
     }
     if(*enqueue_idx >= 15) {
+        /* Update link TRB cycle to current PCS before wrapping, then toggle PCS */
+        xhci_trb_t *ring = (xhci_trb_t *)ring_base;
+        xhci_trb_t *link = &ring[15];
+        unsigned int ctl = link->control;
+        ctl &= ~1u;
+        ctl |= (*cycle & 1u);
+        link->control = ctl; /* preserve type+toggle bit programmed at init */
         *enqueue_idx = 0;
         *cycle ^= 1;
     }
@@ -1642,7 +1658,7 @@ void xhci_control_xfer_event(xhci_controller_t *ctrl, struct usb_device *dev,
     }
 }
 
-static void xhci_issue_set_tr_dequeue(xhci_controller_t* ctrl, usb_device_t* dev, unsigned epid, uint64_t ring_phys, unsigned cycle)
+void xhci_issue_set_tr_dequeue(xhci_controller_t* ctrl, usb_device_t* dev, unsigned epid, uint64_t ring_phys, unsigned cycle)
 {
     if(!ctrl || !dev || !epid || !ring_phys) {
         return;
@@ -1659,4 +1675,21 @@ static void xhci_issue_set_tr_dequeue(xhci_controller_t* ctrl, usb_device_t* dev
     volatile uint32_t *db0 = (volatile uint32_t *)(ctrl->doorbell_array + 0);
     *db0 = 0;
     XHCI_EVT_LOG("xhci: SET_TR_DEQ slot=%u epid=%u ptr=%p cycle=%u\n", dev->slot_id, epid, (void *)ptr, cycle & 1);
+}
+
+void xhci_issue_reset_endpoint(xhci_controller_t* ctrl, usb_device_t* dev, unsigned epid)
+{
+    if(!ctrl || !dev || !epid) {
+        return;
+    }
+    xhci_trb_t *trb = xhci_cmd_enqueue_nodoorbell(ctrl, XHCI_TRB_TYPE_RESET_ENDPOINT, 0);
+    if(!trb) {
+        return;
+    }
+    trb->status = 0;
+    trb->control |= ((dev->slot_id & 0xFF) << 24) | ((epid & 0x1F) << 16);
+    __asm__ __volatile__("mfence":::"memory");
+    volatile uint32_t *db0 = (volatile uint32_t *)(ctrl->doorbell_array + 0);
+    *db0 = 0;
+    XHCI_EVT_LOG("xhci: RESET_ENDPOINT slot=%u epid=%u\n", dev->slot_id, epid);
 }

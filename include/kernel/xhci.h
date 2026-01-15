@@ -121,6 +121,7 @@ typedef struct {
     unsigned int msd_block_size;
     // Pending read operation fields
     void* msd_read_buf;
+    unsigned int msd_read_buf_len;
     unsigned long msd_read_lba;
     unsigned int msd_read_blocks;
     int msd_read_result; // 0 pending, >0 success bytes, <0 error
@@ -192,6 +193,8 @@ void xhci_control_xfer_event(xhci_controller_t* ctrl, struct usb_device* dev, un
 int xhci_configure_mass_storage_endpoints(xhci_controller_t* ctrl, struct usb_device* dev);
 int xhci_enqueue_bulk_out(xhci_controller_t* ctrl, struct usb_device* dev, void* buf, unsigned len);
 int xhci_enqueue_bulk_in(xhci_controller_t* ctrl, struct usb_device* dev, void* buf, unsigned len);
+void xhci_issue_reset_endpoint(xhci_controller_t* ctrl, struct usb_device* dev, unsigned epid);
+void xhci_issue_set_tr_dequeue(xhci_controller_t* ctrl, struct usb_device* dev, unsigned epid, uint64_t ring_phys, unsigned cycle);
 void xhci_debug_state(xhci_controller_t* ctrl);
 
 #endif // LIKEOS_XHCI_H

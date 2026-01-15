@@ -20,6 +20,7 @@ typedef struct __attribute__((packed)) {
 #define XHCI_TRB_TYPE_ENABLE_SLOT    9
 #define XHCI_TRB_TYPE_ADDRESS_DEVICE 11
 #define XHCI_TRB_TYPE_CONFIG_ENDPOINT 12
+#define XHCI_TRB_TYPE_RESET_ENDPOINT 14
 #define XHCI_TRB_TYPE_EVAL_CONTEXT    13
 #define XHCI_TRB_TYPE_LINK            6
 #define XHCI_TRB_TYPE_NO_OP_CMD       23

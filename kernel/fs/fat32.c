@@ -5,6 +5,15 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/block.h"
 
+#ifndef FAT32_DEBUG_ENABLED
+#define FAT32_DEBUG_ENABLED 0
+#endif
+#if FAT32_DEBUG_ENABLED
+#define FAT32_LOG(fmt, ...) kprintf("FAT32 dbg: " fmt, ##__VA_ARGS__)
+#else
+#define FAT32_LOG(...) do { } while (0)
+#endif
+
 // BPB offsets (FAT32)
 typedef struct __attribute__((packed)) {
     uint8_t	jmp[3];
@@ -68,7 +77,12 @@ typedef struct __attribute__((packed)) {
 
 static int read_sectors(const block_device_t *bdev, unsigned long lba, unsigned long count, void *buf)
 {
-    return bdev->read((block_device_t *)bdev, lba, count, buf);
+    int st = bdev->read((block_device_t *)bdev, lba, count, buf);
+    if (st != ST_OK) {
+        FAT32_LOG("read fail dev=%s lba=%lu count=%lu st=%d\n",
+            bdev ? bdev->name : "?", lba, count, st);
+    }
+    return st;
 }
 
 static unsigned long cluster_to_lba(fat32_fs_t *fs, unsigned long cluster)
@@ -376,29 +390,44 @@ static int fat32_match_name(const uint8_t *raw, const char *name)
 }
 
 static int fat32_dir_list_internal(unsigned long start_cluster,
-        void (*cb)(const char *, unsigned, unsigned long))
+    void (*cb)(const char *, unsigned, unsigned long),
+    unsigned *out_count)
 {
     if (!g_root_fs || !cb)
         return ST_INVALID;
     unsigned cluster_size = g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+    FAT32_LOG("list start cluster=%lu cluster_size=%u bytes_per_sector=%u spc=%u\n",
+        start_cluster, cluster_size, g_root_fs->bytes_per_sector, g_root_fs->sectors_per_cluster);
     unsigned long cluster = start_cluster;
+    unsigned listed = 0;
+    unsigned clusters = 0;
     while (cluster < 0x0FFFFFF8) {
         void *buf = kalloc(cluster_size);
         if (!buf)
             return ST_NOMEM;
-        if (read_sectors(g_root_fs->bdev,
-            cluster_to_lba(g_root_fs, cluster),
-            g_root_fs->sectors_per_cluster, buf) != ST_OK) {
+        unsigned long lba = cluster_to_lba(g_root_fs, cluster);
+        int st = read_sectors(g_root_fs->bdev, lba,
+            g_root_fs->sectors_per_cluster, buf);
+        if (st != ST_OK) {
+            FAT32_LOG("list read err cluster=%lu lba=%lu st=%d\n", cluster, lba, st);
             kfree(buf);
             return ST_IO;
         }
+        clusters++;
         fat32_dirent_t *ents = (fat32_dirent_t *)buf;
         unsigned entries = cluster_size / sizeof(fat32_dirent_t);
+        FAT32_LOG("list cluster=%lu lba=%lu entries=%u\n", cluster, lba, entries);
         char lfn_buf[260];
         lfn_buf[0] = '\0';
+        uint16_t lfn_tmp[260];
+        int lfn_len = 0;
         for (unsigned i = 0; i < entries; i++) {
             if (ents[i].name[0] == 0x00) {
+                FAT32_LOG("list end marker cluster=%lu index=%u listed=%u\n", cluster, i, listed);
                 kfree(buf);
+                if (out_count)
+                    *out_count = listed;
+                FAT32_LOG("list done start=%lu clusters=%u listed=%u\n", start_cluster, clusters, listed);
                 return ST_OK;
             }
             if (ents[i].name[0] == 0xE5)
@@ -407,8 +436,6 @@ static int fat32_dir_list_internal(unsigned long start_cluster,
                 fat32_lfn_t *l = (fat32_lfn_t *)&ents[i];
                 int ord = (l->seq & 0x1F);
                 int last = (l->seq & 0x40) ? 1 : 0;
-                static uint16_t lfn_tmp[260];
-                static int lfn_len = 0;
                 if (last) {
                     lfn_len = 0;
                     for (int j = 0; j < 260; j++)
@@ -460,6 +487,7 @@ static int fat32_dir_list_internal(unsigned long start_cluster,
             }
             temp[p] = '\0';
             cb((lfn_buf[0]) ? lfn_buf : temp, ents[i].attr, ents[i].fileSize);
+            listed++;
             lfn_buf[0] = '\0';
         }
         kfree(buf);
@@ -468,12 +496,15 @@ static int fat32_dir_list_internal(unsigned long start_cluster,
             break;
         cluster = next;
     }
+    if (out_count)
+        *out_count = listed;
+    FAT32_LOG("list done start=%lu clusters=%u listed=%u last_cluster=%lu\n", start_cluster, clusters, listed, cluster);
     return ST_OK;
 }
 
 int fat32_dir_list(unsigned long cluster, void (*cb)(const char *, unsigned, unsigned long))
 {
-    return fat32_dir_list_internal(cluster, cb);
+    return fat32_dir_list_internal(cluster, cb, 0);
 }
 
 int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr,
@@ -505,8 +536,8 @@ int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr
         unsigned entries = cluster_size / sizeof(fat32_dirent_t);
         char lfn_buf[260];
         lfn_buf[0] = '\0';
-        static uint16_t lfn_tmp[260];
-        static int lfn_len = 0;
+        uint16_t lfn_tmp[260];
+        int lfn_len = 0;
         for (unsigned i = 0; i < entries; i++) {
             if (ents[i].name[0] == 0x00) {
                 kfree(buf);
@@ -898,8 +929,11 @@ void fat32_list_root(void (*cb)(const char *name, unsigned attr, unsigned long s
 {
     if (!g_root_fs || !cb)
         return;
+    unsigned listed = 0;
+    FAT32_LOG("list_root start cluster=%lu\n", g_root_dir_cluster);
     // Reuse directory iterator over entire root cluster chain for multi-cluster roots
-    fat32_dir_list_internal(g_root_dir_cluster, cb);
+    fat32_dir_list_internal(g_root_dir_cluster, cb, &listed);
+    FAT32_LOG("list_root done listed=%u\n", listed);
 }
 
 // Debug helper: dump first few raw directory entries (8.3) for diagnostics

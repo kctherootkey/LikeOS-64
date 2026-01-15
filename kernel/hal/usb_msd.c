@@ -7,6 +7,12 @@
 #include "../../include/kernel/xhci_trb.h"
 #include "../../include/kernel/block.h"
 
+/* Disable MSD debug logging by default for normal runs */
+#undef XHCI_MSD_DEBUG
+#define XHCI_MSD_DEBUG 0
+#undef XHCI_MSD_LOG
+#define XHCI_MSD_LOG(...) do { } while (0)
+
 static block_device_t g_msd_block_dev; /* single device instance */
 static void msd_issue_inquiry(xhci_controller_t *ctrl, usb_device_t *dev);
 static void msd_issue_read_capacity(xhci_controller_t *ctrl, usb_device_t *dev);
@@ -16,6 +22,8 @@ static void msd_issue_request_sense(xhci_controller_t *ctrl, usb_device_t *dev);
 static void msd_recover_reset(xhci_controller_t *ctrl, usb_device_t *dev);
 static void msd_recover_clear_stalls(xhci_controller_t *ctrl, usb_device_t *dev);
 static void msd_progress(xhci_controller_t *ctrl); /* forward declaration */
+static void msd_wait_cmd_clear(xhci_controller_t *ctrl, unsigned max_iters);
+
 
 static usb_device_t *find_msd(xhci_controller_t *ctrl)
 {
@@ -72,6 +80,22 @@ static int bot_send_cbw(xhci_controller_t *ctrl, usb_device_t *dev, usb_msd_cbw_
     return 0;
 }
 
+// Ensure the bulk read buffer is large enough for the requested transfer.
+static int msd_ensure_read_buf(xhci_controller_t *ctrl, unsigned bytes)
+{
+    if (ctrl->msd_read_buf && ctrl->msd_read_buf_len >= bytes)
+        return ST_OK;
+    if (ctrl->msd_read_buf)
+        kfree(ctrl->msd_read_buf);
+    ctrl->msd_read_buf = kcalloc(1, bytes);
+    if (!ctrl->msd_read_buf) {
+        ctrl->msd_read_buf_len = 0;
+        return ST_NOMEM;
+    }
+    ctrl->msd_read_buf_len = bytes;
+    return ST_OK;
+}
+
 
 static unsigned next_tag(xhci_controller_t *ctrl)
 {
@@ -97,6 +121,7 @@ static void msd_issue_inquiry(xhci_controller_t *ctrl, usb_device_t *dev)
     cbw.tag = tag;
     cbw.data_len = 36;
     cbw.flags = 0x80;
+
     cbw.lun = 0;
     cbw.cb_len = 6;
     cbw.cb[0] = SCSI_INQUIRY;
@@ -255,6 +280,48 @@ static void msd_recover_reset(xhci_controller_t *ctrl, usb_device_t *dev)
     XHCI_MSD_LOG("MSD: BOT RESET issued\n");
     }
     msd_recover_clear_stalls(ctrl, dev);
+    /* Rebuild bulk endpoint configuration and rings from scratch to avoid stale halted state */
+    if (dev) {
+        dev->endpoints_configured = 0;
+    }
+    ctrl->bulk_in_ring = 0;
+    ctrl->bulk_out_ring = 0;
+    ctrl->bulk_in_ring_phys = 0;
+    ctrl->bulk_out_ring_phys = 0;
+    ctrl->bulk_in_cycle = 1;
+    ctrl->bulk_out_cycle = 1;
+    ctrl->bulk_in_enqueue = 0;
+    ctrl->bulk_out_enqueue = 0;
+    xhci_configure_mass_storage_endpoints(ctrl, dev);
+    msd_wait_cmd_clear(ctrl, 4000);
+    /* Clear instrumentation so future attempts count fresh events */
+    ctrl->msd_cbw_events = 0;
+    ctrl->msd_data_events = 0;
+    ctrl->msd_csw_events = 0;
+    ctrl->msd_transfer_events = 0;
+    ctrl->msd_bulk_transfer_events = 0;
+    ctrl->msd_last_event_cc = 0;
+    ctrl->msd_last_event_epid = 0;
+    ctrl->msd_last_event_ptr = 0;
+    /* Give the controller a moment to process reconfiguration before reissuing commands */
+    msd_wait_cmd_clear(ctrl, 2048);
+    /* After reset, drop stale TRB tracking to force fresh enqueue/use */
+    ctrl->msd_cbw_trb = 0;
+    ctrl->msd_data_trb = 0;
+    ctrl->msd_csw_trb = 0;
+    ctrl->msd_cbw_phys = 0;
+    ctrl->msd_data_phys = 0;
+    ctrl->msd_csw_phys = 0;
+}
+
+/* Poll command completions until pending_cmd_type clears or max_iters exhausted */
+static void msd_wait_cmd_clear(xhci_controller_t *ctrl, unsigned max_iters)
+{
+    for (unsigned i = 0; i < max_iters; ++i) {
+        if (!ctrl->pending_cmd_type)
+            break;
+        xhci_process_events(ctrl);
+    }
 }
 
 static void msd_issue_read_capacity(xhci_controller_t *ctrl, usb_device_t *dev)
@@ -309,9 +376,7 @@ static int msd_issue_read10(xhci_controller_t *ctrl, usb_device_t *dev,
     if (ctrl->msd_op || !ctrl->msd_ready)
         return ST_BUSY;
     bytes = blocks * ctrl->msd_block_size;
-    if (!ctrl->msd_read_buf)
-        ctrl->msd_read_buf = kcalloc(1, bytes);
-    if (!ctrl->msd_read_buf)
+    if (msd_ensure_read_buf(ctrl, bytes) != ST_OK)
         return ST_NOMEM;
     for (i = 0; i < 16; i++)
         cbw.cb[i] = 0;
@@ -362,55 +427,80 @@ static int msd_block_read(block_device_t *bdev, unsigned long lba,
     xhci_controller_t *ctrl = (xhci_controller_t *)bdev->driver_data;
     usb_device_t *dev = find_msd(ctrl);
     unsigned long start_poll;
+    unsigned long start_overall;
     int st;
     if (!dev)
         return ST_INVALID;
-retry_issue:
-    st = msd_issue_read10(ctrl, dev, lba, count);
-    if (st == ST_BUSY || st == ST_AGAIN) {
-        /* Another operation in flight; process events briefly then retry */
-        for (int i = 0; i < 256 && (ctrl->msd_op || ctrl->msd_state); ++i) {
+    XHCI_MSD_LOG("MSD: block_read lba=%lu count=%lu\n", lba, count);
+    start_overall = ctrl->msd_poll_counter;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        XHCI_MSD_LOG("MSD: read attempt %d state=%u op=%u\n", attempt + 1, ctrl->msd_state, ctrl->msd_op);
+        st = msd_issue_read10(ctrl, dev, lba, count);
+        if (st == ST_BUSY || st == ST_AGAIN) {
+            /* Another operation in flight; process events and retry until a reasonable deadline */
+            for (int i = 0; i < 512 && (ctrl->msd_op || ctrl->msd_state); ++i) {
+                xhci_process_events(ctrl);
+                msd_progress(ctrl);
+            }
+            XHCI_MSD_LOG("MSD: busy/again lba=%lu attempt=%d state=%u op=%u cbw_ev=%u data_ev=%u csw_ev=%u\n",
+                lba, attempt + 1, ctrl->msd_state, ctrl->msd_op,
+                ctrl->msd_cbw_events, ctrl->msd_data_events, ctrl->msd_csw_events);
+            if (ctrl->msd_poll_counter - start_overall > 60000)
+                return ST_IO;
+            attempt--; /* don't count this as a full attempt */
+            continue;
+        } else if (st != ST_OK) {
+            return st; /* propagate fatal conditions */
+        }
+
+        start_poll = ctrl->msd_poll_counter;
+        while (1) {
+            if (ctrl->msd_read_result > 0)
+                break; /* success */
+            if ((ctrl->msd_op != 3 && ctrl->msd_read_result == 0) || (ctrl->msd_op == 3 && ctrl->msd_state == 0)) {
+                /* Operation ended without setting result (unexpected) */
+                break;
+            }
+            if (ctrl->msd_op == 3 && ctrl->msd_state == 4 && ctrl->msd_read_result == 0) {
+                /* CSW arrived; parse via msd_progress to set result */
+                msd_progress(ctrl);
+                if (ctrl->msd_read_result > 0)
+                    break;
+            }
             xhci_process_events(ctrl);
             msd_progress(ctrl);
-        }
-        if (ctrl->msd_op || ctrl->msd_state)
-            return ST_BUSY; /* let caller retry later */
-        goto retry_issue;
-    } else if (st != ST_OK) {
-        return st; /* propagate fatal conditions */
-    }
-    start_poll = ctrl->msd_poll_counter;
-    while (1) {
-        if (ctrl->msd_read_result > 0)
-            break; /* success */
-        if ((ctrl->msd_op != 3 && ctrl->msd_read_result == 0) || (ctrl->msd_op == 3 && ctrl->msd_state == 0)) {
-            /* Operation ended without setting result (unexpected) */
-            break;
-        }
-        if (ctrl->msd_op == 3 && ctrl->msd_state == 4 && ctrl->msd_read_result == 0) {
-            /* CSW arrived; parse via msd_progress to set result */
-            msd_progress(ctrl);
-            if (ctrl->msd_read_result > 0)
+            /* light backoff to avoid starving controller (acts like previous kprintf latency) */
+            for (volatile int spin = 0; spin < 200; ++spin) __asm__ __volatile__("pause");
+            if (ctrl->msd_poll_counter - start_poll > 25000) { /* extended timeout */
+                XHCI_MSD_LOG("MSD: read timeout lba=%lu count=%lu (cbw_ev=%u data_ev=%u csw_ev=%u state=%u op=%u)\n",
+                    lba, count, ctrl->msd_cbw_events, ctrl->msd_data_events,
+                    ctrl->msd_csw_events, ctrl->msd_state, ctrl->msd_op);
                 break;
+            }
         }
-        xhci_process_events(ctrl);
-        msd_progress(ctrl);
-        /* light backoff to avoid starving controller (acts like previous kprintf latency) */
-        for (volatile int spin = 0; spin < 200; ++spin) __asm__ __volatile__("pause");
-        if (ctrl->msd_poll_counter - start_poll > 20000) { /* extended timeout */
-            XHCI_MSD_LOG("MSD: read timeout lba=%lu count=%lu (cbw_ev=%u data_ev=%u csw_ev=%u state=%u op=%u)\n",
-                lba, count, ctrl->msd_cbw_events, ctrl->msd_data_events,
-                ctrl->msd_csw_events, ctrl->msd_state, ctrl->msd_op);
-            break;
+
+        if (ctrl->msd_read_result > 0) {
+            unsigned copy = (unsigned)ctrl->msd_read_result;
+            __asm__ __volatile__("mfence" ::: "memory"); /* ensure data visible before copy */
+            for (unsigned i = 0; i < copy; i++)
+                ((uint8_t *)buf)[i] = ((uint8_t *)ctrl->msd_read_buf)[i];
+            XHCI_MSD_LOG("MSD: read success lba=%lu count=%lu bytes=%u attempt=%d cbw_ev=%u data_ev=%u csw_ev=%u\n",
+                lba, count, copy, attempt + 1,
+                ctrl->msd_cbw_events, ctrl->msd_data_events, ctrl->msd_csw_events);
+            return ST_OK;
         }
+
+        /* failed this attempt; reset BOT state and retry */
+        XHCI_MSD_LOG("MSD: read attempt %d failed result=%d state=%u op=%u cbw_ev=%u data_ev=%u csw_ev=%u\n",
+            attempt + 1, ctrl->msd_read_result, ctrl->msd_state, ctrl->msd_op,
+            ctrl->msd_cbw_events, ctrl->msd_data_events, ctrl->msd_csw_events);
+        ctrl->msd_state = 0;
+        ctrl->msd_op = 0;
+        ctrl->msd_timeout_ticks = 0;
+        ctrl->msd_read_result = 0;
+        msd_recover_reset(ctrl, dev);
     }
-    if (ctrl->msd_read_result > 0) {
-        unsigned copy = (unsigned)ctrl->msd_read_result;
-        __asm__ __volatile__("mfence" ::: "memory"); /* ensure data visible before copy */
-        for (unsigned i = 0; i < copy; i++)
-            ((uint8_t *)buf)[i] = ((uint8_t *)ctrl->msd_read_buf)[i];
-        return ST_OK;
-    }
+    XHCI_MSD_LOG("MSD: read give up lba=%lu count=%lu\n", lba, count);
     return ST_IO;
 }
 
@@ -490,9 +580,7 @@ static void msd_progress(xhci_controller_t *ctrl)
             ctrl->msd_capacity_blocks, blen,
             (ctrl->msd_capacity_blocks * (unsigned long)blen) / 1024);
         /* Immediately read and hex dump sector 0 for diagnostics */
-        if (!ctrl->msd_read_buf)
-            ctrl->msd_read_buf = kcalloc(1, 512);
-        if (ctrl->msd_read_buf) {
+        if (msd_ensure_read_buf(ctrl, 512) == ST_OK) {
             /* Synchronously issue a READ(10) of first sector (1 block) */
             if (msd_issue_read10(ctrl, dev, 0, 1) == ST_OK) {
                 unsigned long start_poll = ctrl->msd_poll_counter;
