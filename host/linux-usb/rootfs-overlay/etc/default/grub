@@ -1,5 +1,5 @@
 GRUB_DEFAULT=0
 GRUB_TIMEOUT=0
-GRUB_DISTRIBUTOR=LikeOS-64
+GRUB_DISTRIBUTOR=LikeOS-64-Blessed-Kitty
 GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3 splash vt.global_cursor_default=0"
 GRUB_CMDLINE_LINUX=""

@@ -37,6 +37,9 @@ UEFI_LDFLAGS = -nostdlib -znocombreloc -T $(EFI_LDS) -shared -Bsymbolic
 
 # Kernel object files
 KERNEL_OBJS = $(BUILD_DIR)/init.o \
+			  $(BUILD_DIR)/shell.o \
+			  $(BUILD_DIR)/xhci_boot.o \
+			  $(BUILD_DIR)/storage.o \
               $(BUILD_DIR)/console.o \
               $(BUILD_DIR)/fb_optimize.o \
               $(BUILD_DIR)/interrupt.o \
@@ -77,6 +80,15 @@ $(BUILD_DIR):
 
 # Compile kernel source files
 $(BUILD_DIR)/init.o: $(KERNEL_DIR)/ke/init.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/shell.o: $(KERNEL_DIR)/ke/shell.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/xhci_boot.o: $(KERNEL_DIR)/ke/xhci_boot.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/storage.o: $(KERNEL_DIR)/ke/storage.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/console.o: $(KERNEL_DIR)/hal/console.c | $(BUILD_DIR)
