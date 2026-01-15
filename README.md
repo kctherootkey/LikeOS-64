@@ -1,7 +1,6 @@
 # LikeOS-64
 
 A modern 64-bit operating system built from scratch, targeting x86_64 architecture with **UEFI booting** and **framebuffer graphics**.
-All source code was written by vibe coding with ChatGPT and Claude Sonnet using GitHub CoPilot in Visual Studio Code.
 
 Current state: For real hardware the operating system boots from linux bootstrapper that runs qemu right after the boot sequence - in order to avoid supporting every different hardware on the planet. This is accomplished by creating a bootable usb stick with the make linux-usb and make linux-usb-write targets. The os can be also booted into qemu on for example windows or linux hosts by using the make qemu-usb target.
 
