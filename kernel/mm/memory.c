@@ -875,7 +875,6 @@ uint64_t* MmCreateUserAddressSpace(void) {
     // It also provides access to kernel heap, stacks, etc.
     new_pml4[511] = current_pml4[511];
     
-    kprintf("MmCreateUserAddressSpace: Created PML4 at %p with deep-copied identity mapping\n", new_pml4);
     return new_pml4;
 }
 
@@ -981,9 +980,6 @@ bool MmMapUserStack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
     
     size_t pages = (stack_size + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t stack_bottom = stack_top - stack_size;
-    
-    kprintf("MmMapUserStack: Mapping %zu pages from %p to %p\n", 
-            pages, (void*)stack_bottom, (void*)stack_top);
     
     for (size_t i = 0; i < pages; i++) {
         uint64_t vaddr = stack_bottom + (i * PAGE_SIZE);

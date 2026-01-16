@@ -1,20 +1,14 @@
-// LikeOS-64 Kernel Executive - Interrupt Management
-// 64-bit IDT and IRQ management system
-
+// LikeOS-64 Interrupt Management
 #include "../../include/kernel/interrupt.h"
-#include "../../include/kernel/xhci.h" // for xhci_controller_t and irq service
+#include "../../include/kernel/xhci.h"
 #include "../../include/kernel/timer.h"
-#include "../../include/kernel/memory.h" // for COW handling
+#include "../../include/kernel/memory.h"
 
-// IDT table
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_descriptor idt_desc;
-
-// TSS and interrupt stack
 static struct tss_entry tss;
-static uint8_t interrupt_stack[8192] __attribute__((aligned(16))); // 8KB stack for interrupts
+static uint8_t interrupt_stack[8192] __attribute__((aligned(16)));
 
-// Simple memset implementation
 static void my_memset(void *dest, int val, size_t len) {
     uint8_t *ptr = (uint8_t*)dest;
     while (len--) {
@@ -22,7 +16,6 @@ static void my_memset(void *dest, int val, size_t len) {
     }
 }
 
-// External assembly functions
 extern void idt_flush(uint64_t);
 extern void irq0();
 extern void irq1();
@@ -41,7 +34,6 @@ extern void irq13();
 extern void irq14();
 extern void irq15();
 
-// Exception handlers
 extern void isr0();
 extern void isr1();
 extern void isr2();
@@ -75,7 +67,6 @@ extern void isr29();
 extern void isr30();
 extern void isr31();
 
-// PIC helper functions
 void pic_send_eoi(uint8_t irq) {
     if (irq >= 8) {
         outb(PIC2_CMD, 0x20);
@@ -111,42 +102,27 @@ void irq_disable(uint8_t irq) {
     outb(port, value);
 }
 
-// Initialize the 8259 PIC
 void pic_init() {
-    // ICW1: Start initialization sequence
-    outb(PIC1_CMD, 0x11); // ICW1: Initialize + ICW4 needed
+    outb(PIC1_CMD, 0x11);
     outb(PIC2_CMD, 0x11);
-
-    // ICW2: Set vector offsets
-    outb(PIC1_DATA, 0x20); // IRQ 0-7 → interrupts 32-39
-    outb(PIC2_DATA, 0x28); // IRQ 8-15 → interrupts 40-47
-
-    // ICW3: Set cascade connection
-    outb(PIC1_DATA, 0x04); // Tell master PIC there's a slave at IRQ2
-    outb(PIC2_DATA, 0x02); // Tell slave PIC its cascade identity
-
-    // Set mode
-    outb(PIC1_DATA, 0x01); // ICW4: 8086/88 mode
+    outb(PIC1_DATA, 0x20);
+    outb(PIC2_DATA, 0x28);
+    outb(PIC1_DATA, 0x04);
+    outb(PIC2_DATA, 0x02);
+    outb(PIC1_DATA, 0x01);
     outb(PIC2_DATA, 0x01);
-
-    // Disable all IRQs initially
-    outb(PIC1_DATA, 0xFF); // Mask all IRQs on master
-    outb(PIC2_DATA, 0xFF); // Mask all IRQs on slave
-
+    outb(PIC1_DATA, 0xFF);
+    outb(PIC2_DATA, 0xFF);
     kprintf("PIC initialized\n");
 }
 
-// Route legacy IRQs through PIC instead of APIC (IMCR)
 static void imcr_route_to_pic(void) {
-    // IMCR selector/data ports: 0x22/0x23, select register 0x70
     outb(0x22, 0x70);
     uint8_t val = inb(0x23);
-    val &= ~0x01; // bit0=0 => route to PIC
+    val &= ~0x01;
     outb(0x23, val);
-    kprintf("IMCR set to PIC mode (val=0x%02x)\n", val);
 }
 
-// Set IDT entry
 void idt_set_entry(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags) {
     idt[num].offset_low = base & 0xFFFF;
     idt[num].offset_mid = (base >> 16) & 0xFFFF;
@@ -157,20 +133,14 @@ void idt_set_entry(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags) {
     idt[num].zero = 0;
 }
 
-// Initialize IDT
 void idt_init() {
     idt_desc.limit = sizeof(idt) - 1;
     idt_desc.base = (uint64_t)&idt;
 
-    kprintf("Setting up IDT: base=%p, limit=0x%04X\n", (void*)idt_desc.base, idt_desc.limit);
-    kprintf("IDT table address: %p, size: %zu bytes\n", (void*)&idt, sizeof(idt));
-
-    // Clear IDT
     for (int i = 0; i < IDT_ENTRIES; i++) {
         idt_set_entry(i, 0, 0, 0);
     }
 
-    // Set up exception handlers
     idt_set_entry(0, (uint64_t)isr0, 0x08, 0x8E);
     idt_set_entry(1, (uint64_t)isr1, 0x08, 0x8E);
     idt_set_entry(2, (uint64_t)isr2, 0x08, 0x8E);
@@ -204,7 +174,6 @@ void idt_init() {
     idt_set_entry(30, (uint64_t)isr30, 0x08, 0x8E);
     idt_set_entry(31, (uint64_t)isr31, 0x08, 0x8E);
     
-    // Set up IRQ handlers
     idt_set_entry(32, (uint64_t)irq0, 0x08, 0x8E);
     idt_set_entry(33, (uint64_t)irq1, 0x08, 0x8E);
     idt_set_entry(34, (uint64_t)irq2, 0x08, 0x8E);
@@ -222,290 +191,122 @@ void idt_init() {
     idt_set_entry(46, (uint64_t)irq14, 0x08, 0x8E);
     idt_set_entry(47, (uint64_t)irq15, 0x08, 0x8E);
     
-    // Load IDT
-    kprintf("About to load IDT: descriptor at %p\n", (void*)&idt_desc);
-    kprintf("Descriptor contents: base=%p, limit=0x%04X\n", (void*)idt_desc.base, idt_desc.limit);
-
     idt_flush((uint64_t)&idt_desc);
-
-    // Verify IDT is loaded immediately after flush
-    struct idt_descriptor current_idt;
-    __asm__ volatile ("sidt %0" : "=m"(current_idt));
-    kprintf("IDT loaded: base=%p, limit=0x%04X\n", (void*)current_idt.base, current_idt.limit);
-
     kprintf("IDT initialized\n");
 }
 
-// Exception names for better debugging
 static const char* exception_messages[] = {
-    "Division by Zero",                    // 0
-    "Debug",                              // 1
-    "Non-Maskable Interrupt",             // 2
-    "Breakpoint",                         // 3
-    "Overflow",                           // 4
-    "Bound Range Exceeded",               // 5
-    "Invalid Opcode",                     // 6
-    "Device Not Available",               // 7
-    "Double Fault",                       // 8
-    "Coprocessor Segment Overrun",        // 9
-    "Invalid TSS",                        // 10
-    "Segment Not Present",                // 11
-    "Stack-Segment Fault",                // 12
-    "General Protection Fault",           // 13
-    "Page Fault",                         // 14
-    "Reserved",                           // 15
-    "x87 Floating-Point Exception",       // 16
-    "Alignment Check",                    // 17
-    "Machine Check",                      // 18
-    "SIMD Floating-Point Exception",      // 19
-    "Virtualization Exception",           // 20
-    "Control Protection Exception",       // 21
-    "Reserved", "Reserved", "Reserved",   // 22-24
-    "Reserved", "Reserved", "Reserved",   // 25-27
-    "Hypervisor Injection Exception",     // 28
-    "VMM Communication Exception",        // 29
-    "Security Exception",                 // 30
-    "Reserved"                            // 31
+    "Division by Zero", "Debug", "Non-Maskable Interrupt", "Breakpoint",
+    "Overflow", "Bound Range Exceeded", "Invalid Opcode", "Device Not Available",
+    "Double Fault", "Coprocessor Segment Overrun", "Invalid TSS", "Segment Not Present",
+    "Stack-Segment Fault", "General Protection Fault", "Page Fault", "Reserved",
+    "x87 FP Exception", "Alignment Check", "Machine Check", "SIMD FP Exception",
+    "Virtualization Exception", "Control Protection Exception", "Reserved", "Reserved",
+    "Reserved", "Reserved", "Reserved", "Reserved", "Hypervisor Injection",
+    "VMM Communication Exception", "Security Exception", "Reserved"
 };
 
-// Exception handler - called from assembly with register structure pointer
 void exception_handler(uint64_t *regs) {
-    uint64_t int_no = regs[15]; // Interrupt number at offset 15*8 = 120
-    uint64_t err_code = regs[16]; // Error code at offset 16*8 = 128
-    uint64_t rip = regs[17]; // RIP from interrupt frame
+    uint64_t int_no = regs[15];
+    uint64_t err_code = regs[16];
+    uint64_t rip = regs[17];
 
-    // Handle page fault specially - check for COW
     if (int_no == 14) {
         uint64_t cr2;
         __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-        
-        // Check if this is a write to a present page (potential COW)
-        // Error code bit 0: P (page present)
-        // Error code bit 1: W/R (write access)
-        if ((err_code & 0x3) == 0x3) {  // Present page + write access
-            // Try to handle as COW fault
+        if ((err_code & 0x3) == 0x3) {
             if (MmHandleCOWFault(cr2)) {
-                // COW handled successfully, return to retry the instruction
                 return;
             }
         }
     }
 
-    // Print compact exception information in one screen
     console_set_color(VGA_COLOR_RED, VGA_COLOR_BLACK);
-    kprintf("=== EXCEPTION: %s (INT %d) ===\n",
+    kprintf("=== EXCEPTION: %s (INT %llu) ===\n",
            (int_no < 32) ? exception_messages[int_no] : "Unknown", int_no);
+    kprintf("RIP: 0x%016llx  RSP: 0x%016llx  RBP: 0x%016llx\n", rip, regs[20], regs[6]);
+    kprintf("RAX: 0x%016llx  RBX: 0x%016llx  RCX: 0x%016llx\n", regs[0], regs[3], regs[1]);
+    kprintf("RDX: 0x%016llx  RSI: 0x%016llx  RDI: 0x%016llx\n", regs[2], regs[4], regs[5]);
 
-    // Critical registers and RIP
-    kprintf("RIP: 0x%016llx  RSP: 0x%016llx  RBP: 0x%016llx\n",
-           rip, regs[20], regs[6]);
-    kprintf("RAX: 0x%016llx  RBX: 0x%016llx  RCX: 0x%016llx\n",
-           regs[0], regs[3], regs[1]);
-    kprintf("RDX: 0x%016llx  RSI: 0x%016llx  RDI: 0x%016llx\n",
-           regs[2], regs[4], regs[5]);
-
-    // Error code and special handling
     if (int_no == 8 || (int_no >= 10 && int_no <= 14) || int_no == 17 || int_no == 21 || int_no == 29 || int_no == 30) {
-        kprintf("Error Code: 0x%016llx ", err_code);
-
-        if (int_no == 14) { // Page fault
+        kprintf("Error Code: 0x%016llx\n", err_code);
+        if (int_no == 14) {
             uint64_t cr2;
             __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-            kprintf("PF Addr: 0x%016llx\n", cr2);
-            kprintf("PF Flags: %s%s%s%s\n",
-                   (err_code & 1) ? "Present " : "NotPresent ",
-                   (err_code & 2) ? "Write " : "Read ",
-                   (err_code & 4) ? "User " : "Kernel ",
-                   (err_code & 16) ? "InstrFetch" : "DataAccess");
-        } else if (int_no == 13) { // GPF
-            kprintf("GPF Selector: 0x%04llx\n", (err_code >> 3) & 0x1FFF);
-        } else {
-            kprintf("\n");
+            kprintf("Page Fault Address: 0x%016llx\n", cr2);
         }
     }
 
-    // Control registers
     uint64_t cr0, cr2, cr3;
     __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
     __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
     __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
     kprintf("CR0: 0x%016llx  CR2: 0x%016llx  CR3: 0x%016llx\n", cr0, cr2, cr3);
 
-    // RFLAGS and segment registers
-    kprintf("RFLAGS: 0x%016llx  CS: 0x%04llx  SS: 0x%04llx\n",
-           regs[19], regs[18], regs[21]);
-
-    // Code around RIP (compact format)
-    kprintf("Code: ");
-    for (int i = -4; i <= 4; i++) {
-        uint8_t *code_ptr = (uint8_t*)(rip + i);
-        if (i == 0) {
-            kprintf("[%02x] ", *code_ptr);
-        } else {
-            kprintf("%02x ", *code_ptr);
-        }
-    }
-    kprintf("\n");
-
-    // Stack dump (compact format)
-    kprintf("Stack: ");
-    uint64_t *stack_ptr = (uint64_t*)regs[20];
-    for (int i = 0; i < 4; i++) {
-        kprintf("%016llx ", stack_ptr[i]);
-    }
-
     console_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
     kprintf("\nSystem halted.\n");
 
-    // Halt the system
     for (;;) {
         __asm__ volatile ("hlt");
     }
 }
 
-// IRQ handler - called from assembly with register structure pointer
 volatile uint64_t g_irq0_count = 0;
 volatile uint64_t g_irq1_count = 0;
 volatile uint64_t g_irq12_count = 0;
-void irq_handler(uint64_t *regs) {
-    static int irq0_logged = 0;
-    static int irq1_logged = 0;
-    static int irq12_logged = 0;
-    uint64_t int_no = regs[15]; // Interrupt number at offset 15*8 = 120
 
-    // Send EOI
+void irq_handler(uint64_t *regs) {
+    uint64_t int_no = regs[15];
     pic_send_eoi(int_no - 32);
 
-    // Handle specific IRQs
     switch (int_no) {
-        case 32: // IRQ0 - Timer
+        case 32:
             g_irq0_count++;
-            if (!irq0_logged) {
-                irq0_logged = 1;
-                kprintf("[IRQ] timer delivered\n");
-            }
             timer_irq_handler();
             break;
-        case 33: // IRQ1 - Keyboard
+        case 33:
             g_irq1_count++;
-            if (!irq1_logged) {
-                irq1_logged = 1;
-                kprintf("[IRQ] keyboard delivered\n");
-            }
             keyboard_irq_handler();
             break;
-        case 44: // IRQ12 - PS/2 Mouse
+        case 44:
             g_irq12_count++;
-            if (!irq12_logged) {
-                irq12_logged = 1;
-                kprintf("[IRQ] mouse delivered\n");
-            }
             mouse_irq_handler();
             break;
         default: {
-            /* Attempt xHCI IRQ match (legacy INTx line unknown at compile time).
-               We route here if the line isn't keyboard/mouse and let the xHCI
-               service routine decide if it has work. */
-            extern xhci_controller_t g_xhci; /* defined in xhci.c */
+            extern xhci_controller_t g_xhci;
             xhci_irq_service(&g_xhci);
             break;
         }
     }
 }
 
-// Initialize interrupt system
 void interrupts_init() {
-    // Initialize GDT first
     extern void gdt_init();
     gdt_init();
-
-    // Initialize TSS
     tss_init();
-
-    // Install TSS in GDT
     gdt_install_tss();
-
-    // Initialize PIC
     pic_init();
-
-    // Ensure legacy IRQs are routed through PIC
     imcr_route_to_pic();
-
-    // Initialize IDT
     idt_init();
-
     kprintf("Interrupt system initialized\n");
 }
 
-// Initialize TSS
 void tss_init() {
-    kprintf("Initializing TSS...\n");
-
-    // Clear TSS structure
     my_memset(&tss, 0, sizeof(tss));
-
-    // Set up RSP0 (ring 0 stack pointer) for interrupt handling
     tss.rsp0 = (uint64_t)(interrupt_stack + sizeof(interrupt_stack));
-
-    // Set I/O permission bitmap offset (no I/O bitmap)
     tss.iopb_offset = sizeof(tss);
-
-    kprintf("  TSS structure at: %p\n", &tss);
-    kprintf("  TSS size: %lu bytes\n", sizeof(tss));
-    kprintf("  Interrupt stack at: %p\n", (void*)tss.rsp0);
-    kprintf("  Stack size: %lu bytes\n", sizeof(interrupt_stack));
-
-    // Verify addresses are within mapped memory range
-    // Bootloader maps 64MB of virtual memory starting at KERNEL_OFFSET
-    uint64_t tss_addr = (uint64_t)&tss;
-    uint64_t stack_addr = (uint64_t)interrupt_stack;
-
-    if (tss_addr >= 0xFFFFFFFF80000000 && tss_addr < 0xFFFFFFFF80000000 + (64 * 1024 * 1024)) {
-        kprintf("  TSS address is within mapped kernel space\n");
-    } else {
-        kprintf("  WARNING: TSS address may be outside mapped memory!\n");
-    }
-
-    if (stack_addr >= 0xFFFFFFFF80000000 && stack_addr < 0xFFFFFFFF80000000 + (64 * 1024 * 1024)) {
-        kprintf("  Interrupt stack is within mapped kernel space\n");
-    } else {
-        kprintf("  WARNING: Interrupt stack may be outside mapped memory!\n");
-    }
-
-    kprintf("TSS initialized successfully\n");
+    kprintf("TSS initialized\n");
 }
 
-// Install TSS in GDT
 void gdt_install_tss() {
     extern void gdt_install_tss_real(uint64_t tss_base, uint64_t tss_size);
     gdt_install_tss_real((uint64_t)&tss, sizeof(tss) - 1);
 }
 
-// Update TSS.RSP0 for user mode task switching
-// This must be called before switching to a user task so interrupts
-// will use the correct kernel stack
 void tss_set_kernel_stack(uint64_t stack_top) {
     tss.rsp0 = stack_top;
 }
 
-// Get current TSS.RSP0 value
 uint64_t tss_get_kernel_stack(void) {
     return tss.rsp0;
-}
-
-// Debug function to print IDT entry details
-void idt_debug_entry(uint8_t num) {
-    if (num >= IDT_ENTRIES) {
-        kprintf("  Invalid IDT entry number: %d\n", num);
-        return;
-    }
-
-    // Reconstruct the full 64-bit address from the IDT entry
-    uint64_t handler_addr = 0;
-    handler_addr |= idt[num].offset_low;
-    handler_addr |= ((uint64_t)idt[num].offset_mid) << 16;
-    handler_addr |= ((uint64_t)idt[num].offset_high) << 32;
-
-    kprintf("  Entry %d: Handler=%p, Selector=0x%04x, Type=0x%02x\n",
-           num, (void*)handler_addr, idt[num].selector, idt[num].type_attr);
 }
