@@ -16,7 +16,7 @@
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/sched.h"
 
-void KiSystemStartup(boot_info_t* boot_info);
+void system_startup(boot_info_t* boot_info);
 void kernel_main(boot_info_t* boot_info);
 static void spawn_user_test_task(void);
 
@@ -31,10 +31,10 @@ void kernel_main(boot_info_t* boot_info) {
     g_boot_info = boot_info;
     console_init((framebuffer_info_t*)&boot_info->fb_info);
     console_init_fb_optimization();
-    KiSystemStartup(boot_info);
+    system_startup(boot_info);
 }
 
-void KiSystemStartup(boot_info_t* boot_info) {
+void system_startup(boot_info_t* boot_info) {
     kprintf("\nLikeOS-64 Kernel v1.0\n");
     kprintf("64-bit Long Mode Active\n");
 

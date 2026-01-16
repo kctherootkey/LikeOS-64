@@ -3,7 +3,22 @@ set -euo pipefail
 
 ISO_PATH=${HOBBY_ISO:-/usr/local/share/likeos/LikeOS-64.iso}
 USB_IMG=${HOBBY_USB_IMG:-/usr/local/share/likeos/msdata.img}
-RAM_MB=${HOBBY_RAM_MB:-512}
+
+# Calculate RAM: free memory - 256MB, minimum 256MB, default to 512MB if calculation fails
+calculate_ram() {
+    local free_kb reserved_mb=256 min_mb=256
+    free_kb=$(grep -E '^MemAvailable:' /proc/meminfo 2>/dev/null | awk '{print $2}') || free_kb=0
+    if [ "$free_kb" -gt 0 ]; then
+        local free_mb=$((free_kb / 1024))
+        local ram_mb=$((free_mb - reserved_mb))
+        [ "$ram_mb" -lt "$min_mb" ] && ram_mb=$min_mb
+        echo "$ram_mb"
+    else
+        echo "512"
+    fi
+}
+
+RAM_MB=${HOBBY_RAM_MB:-$(calculate_ram)}
 SMP=${HOBBY_SMP:-2}
 VIDEO=${HOBBY_DISPLAY:-gtk,gl=off,show-menubar=off,show-tabs=off,grab-on-hover=on}
 ACCEL=none
