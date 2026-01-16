@@ -4,6 +4,7 @@
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/xhci.h" // for xhci_controller_t and irq service
 #include "../../include/kernel/timer.h"
+#include "../../include/kernel/memory.h" // for COW handling
 
 // IDT table
 static struct idt_entry idt[IDT_ENTRIES];
@@ -263,6 +264,23 @@ void exception_handler(uint64_t *regs) {
     uint64_t err_code = regs[16]; // Error code at offset 16*8 = 128
     uint64_t rip = regs[17]; // RIP from interrupt frame
 
+    // Handle page fault specially - check for COW
+    if (int_no == 14) {
+        uint64_t cr2;
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+        
+        // Check if this is a write to a present page (potential COW)
+        // Error code bit 0: P (page present)
+        // Error code bit 1: W/R (write access)
+        if ((err_code & 0x3) == 0x3) {  // Present page + write access
+            // Try to handle as COW fault
+            if (MmHandleCOWFault(cr2)) {
+                // COW handled successfully, return to retry the instruction
+                return;
+            }
+        }
+    }
+
     // Print compact exception information in one screen
     console_set_color(VGA_COLOR_RED, VGA_COLOR_BLACK);
     kprintf("=== EXCEPTION: %s (INT %d) ===\n",
@@ -427,6 +445,18 @@ void tss_init() {
 void gdt_install_tss() {
     extern void gdt_install_tss_real(uint64_t tss_base, uint64_t tss_size);
     gdt_install_tss_real((uint64_t)&tss, sizeof(tss) - 1);
+}
+
+// Update TSS.RSP0 for user mode task switching
+// This must be called before switching to a user task so interrupts
+// will use the correct kernel stack
+void tss_set_kernel_stack(uint64_t stack_top) {
+    tss.rsp0 = stack_top;
+}
+
+// Get current TSS.RSP0 value
+uint64_t tss_get_kernel_stack(void) {
+    return tss.rsp0;
 }
 
 // Debug function to print IDT entry details

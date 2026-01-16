@@ -42,8 +42,11 @@ typedef struct {
 #define EM_X86_64 62
 #define PT_LOAD 1
 
-// Kernel entry point type (now takes framebuffer info)
-typedef void (*kernel_entry_t)(void* framebuffer_info);
+// Kernel entry point type (now takes boot info)
+typedef void (*kernel_entry_t)(void* boot_info);
+
+// Trampoline function type
+typedef void (*trampoline_func_t)(UINT64 kernel_entry, void* boot_info, UINT64 pml4_addr);
 
 // Framebuffer information structure
 typedef struct {
@@ -54,6 +57,34 @@ typedef struct {
     uint32_t pixels_per_scanline;
     uint32_t bytes_per_pixel;
 } framebuffer_info_t;
+
+// UEFI memory map entry (matching EFI_MEMORY_DESCRIPTOR)
+typedef struct {
+    uint32_t type;
+    uint32_t pad;
+    uint64_t physical_start;
+    uint64_t virtual_start;
+    uint64_t number_of_pages;
+    uint64_t attribute;
+} memory_map_entry_t;
+
+// Memory map information passed to kernel
+#define MAX_MEMORY_MAP_ENTRIES 256
+typedef struct {
+    uint32_t entry_count;
+    uint32_t descriptor_size;
+    uint64_t total_memory;
+    memory_map_entry_t entries[MAX_MEMORY_MAP_ENTRIES];
+} memory_map_info_t;
+
+// Boot information passed to kernel
+typedef struct {
+    framebuffer_info_t fb_info;
+    memory_map_info_t mem_info;
+} boot_info_t;
+
+// Global boot info to pass to kernel
+static boot_info_t g_boot_info;
 
 // Paging structures (assuming 4-level paging)
 typedef struct {
@@ -90,11 +121,8 @@ static EFI_PHYSICAL_ADDRESS trampoline_addr = 0;
 #define PAGE_RWX        (PAGE_PRESENT | PAGE_WRITABLE)  // Executable (NX=0)
 #define PAGE_RW_NX      (PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX)  // Non-executable
 
-// Trampoline function type
-typedef void (*trampoline_func_t)(UINT64 kernel_entry, void* framebuffer_info, UINT64 pml4_addr);
-
 // External trampoline function from trampoline.S
-extern void trampoline_jump(UINT64 kernel_entry, void* framebuffer_info, UINT64 pml4_addr);
+extern void trampoline_jump(UINT64 kernel_entry, void* boot_info, UINT64 pml4_addr);
 
 // We need the end symbol to calculate the size
 extern char trampoline_jump_end[];
@@ -257,27 +285,34 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
                                      (total_pages_needed - pages_mapped) : 512;
             
             for (UINT64 i = 0; i < pages_in_this_pt; i++) {
-                // Allocate physical memory for this page
-                UINTN pages_to_allocate = 1;
-                EFI_PHYSICAL_ADDRESS phys_addr = 0;
-                
-                EFI_STATUS alloc_status = uefi_call_wrapper(BS->AllocatePages, 4, 
-                                                            AllocateAnyPages, 
-                                                            EfiLoaderData, 
-                                                            pages_to_allocate, 
-                                                            &phys_addr);
-                
-                if (EFI_ERROR(alloc_status)) {
-                    Print(L"ERROR: Could not allocate physical memory for page %lu in PT %lu: %r\r\n", 
-                          i, pt_i, alloc_status);
-                    break;
+                // Check if this page is still within the kernel's pre-allocated physical memory
+                if (pages_mapped < kernel_pages) {
+                    // Map to the kernel's physical memory
+                    UINT64 phys_addr = kernel_phys_addr + (pages_mapped * 4096);
+                    current_pt->entries[i] = phys_addr | PAGE_RWX;
+                } else {
+                    // Allocate physical memory for this page (beyond kernel)
+                    UINTN pages_to_allocate = 1;
+                    EFI_PHYSICAL_ADDRESS phys_addr = 0;
+                    
+                    EFI_STATUS alloc_status = uefi_call_wrapper(BS->AllocatePages, 4, 
+                                                                AllocateAnyPages, 
+                                                                EfiLoaderData, 
+                                                                pages_to_allocate, 
+                                                                &phys_addr);
+                    
+                    if (EFI_ERROR(alloc_status)) {
+                        Print(L"ERROR: Could not allocate physical memory for page %lu in PT %lu: %r\r\n", 
+                              i, pt_i, alloc_status);
+                        break;
+                    }
+                    
+                    // Map the allocated physical memory to virtual address
+                    current_pt->entries[i] = phys_addr | PAGE_RWX;
+                    
+                    // Zero out the allocated memory
+                    uefi_call_wrapper(BS->SetMem, 3, (VOID*)phys_addr, 4096, 0);
                 }
-                
-                // Map the allocated physical memory to virtual address
-                current_pt->entries[i] = phys_addr | PAGE_RWX;
-                
-                // Zero out the allocated memory
-                uefi_call_wrapper(BS->SetMem, 3, (VOID*)phys_addr, 4096, 0);
                 
                 pages_mapped++;
             }
@@ -367,7 +402,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     Elf64_Phdr *program_headers;
     kernel_entry_t kernel_entry;
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
-    framebuffer_info_t fb_info;
     
     // Initialize GNU-EFI library
     InitializeLib(ImageHandle, SystemTable);
@@ -422,36 +456,36 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     if (EFI_ERROR(status)) {
         Print(L"WARNING: Could not get Graphics Output Protocol: %r\r\n", status);
         // Set up fallback VGA mode info
-        fb_info.framebuffer_base = (void*)0xB8000;
-        fb_info.framebuffer_size = 4000;
-        fb_info.horizontal_resolution = 80;
-        fb_info.vertical_resolution = 25;
-        fb_info.pixels_per_scanline = 80;
-        fb_info.bytes_per_pixel = 2;
+        g_boot_info.fb_info.framebuffer_base = (void*)0xB8000;
+        g_boot_info.fb_info.framebuffer_size = 4000;
+        g_boot_info.fb_info.horizontal_resolution = 80;
+        g_boot_info.fb_info.vertical_resolution = 25;
+        g_boot_info.fb_info.pixels_per_scanline = 80;
+        g_boot_info.fb_info.bytes_per_pixel = 2;
     } else {
         // Get current mode information
-        fb_info.framebuffer_base = (void*)gop->Mode->FrameBufferBase;
-        fb_info.framebuffer_size = (uint32_t)gop->Mode->FrameBufferSize;
-        fb_info.horizontal_resolution = gop->Mode->Info->HorizontalResolution;
-        fb_info.vertical_resolution = gop->Mode->Info->VerticalResolution;
-        fb_info.pixels_per_scanline = gop->Mode->Info->PixelsPerScanLine;
+        g_boot_info.fb_info.framebuffer_base = (void*)gop->Mode->FrameBufferBase;
+        g_boot_info.fb_info.framebuffer_size = (uint32_t)gop->Mode->FrameBufferSize;
+        g_boot_info.fb_info.horizontal_resolution = gop->Mode->Info->HorizontalResolution;
+        g_boot_info.fb_info.vertical_resolution = gop->Mode->Info->VerticalResolution;
+        g_boot_info.fb_info.pixels_per_scanline = gop->Mode->Info->PixelsPerScanLine;
         
         // Calculate bytes per pixel based on pixel format
         switch (gop->Mode->Info->PixelFormat) {
             case PixelRedGreenBlueReserved8BitPerColor:
             case PixelBlueGreenRedReserved8BitPerColor:
-                fb_info.bytes_per_pixel = 4;
+                g_boot_info.fb_info.bytes_per_pixel = 4;
                 break;
             case PixelBitMask:
-                fb_info.bytes_per_pixel = 4; // Assume 32-bit
+                g_boot_info.fb_info.bytes_per_pixel = 4; // Assume 32-bit
                 break;
             default:
-                fb_info.bytes_per_pixel = 4; // Safe default
+                g_boot_info.fb_info.bytes_per_pixel = 4; // Safe default
                 break;
         }
         
-        Print(L"Framebuffer: 0x%lx, Size: %d bytes\r\n", fb_info.framebuffer_base, fb_info.framebuffer_size);
-        Print(L"Resolution: %dx%d, BPP: %d\r\n", fb_info.horizontal_resolution, fb_info.vertical_resolution, fb_info.bytes_per_pixel);
+        Print(L"Framebuffer: 0x%lx, Size: %d bytes\r\n", g_boot_info.fb_info.framebuffer_base, g_boot_info.fb_info.framebuffer_size);
+        Print(L"Resolution: %dx%d, BPP: %d\r\n", g_boot_info.fb_info.horizontal_resolution, g_boot_info.fb_info.vertical_resolution, g_boot_info.fb_info.bytes_per_pixel);
     }
     
     // Open kernel file (now ELF format)
@@ -663,6 +697,39 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         return status;
     }
     
+    // Store memory map info for kernel
+    {
+        UINTN num_entries = memory_map_size / descriptor_size;
+        g_boot_info.mem_info.entry_count = 0;
+        g_boot_info.mem_info.descriptor_size = (uint32_t)descriptor_size;
+        g_boot_info.mem_info.total_memory = 0;
+        
+        Print(L"Processing %lu memory map entries...\r\n", num_entries);
+        
+        for (UINTN i = 0; i < num_entries && g_boot_info.mem_info.entry_count < MAX_MEMORY_MAP_ENTRIES; i++) {
+            EFI_MEMORY_DESCRIPTOR *desc = (EFI_MEMORY_DESCRIPTOR*)((UINT8*)memory_map + i * descriptor_size);
+            
+            // Copy entry to boot_info
+            memory_map_entry_t *entry = &g_boot_info.mem_info.entries[g_boot_info.mem_info.entry_count];
+            entry->type = desc->Type;
+            entry->physical_start = desc->PhysicalStart;
+            entry->virtual_start = desc->VirtualStart;
+            entry->number_of_pages = desc->NumberOfPages;
+            entry->attribute = desc->Attribute;
+            
+            // Count usable memory (EfiConventionalMemory type = 7)
+            if (desc->Type == 7) {
+                g_boot_info.mem_info.total_memory += desc->NumberOfPages * 4096;
+            }
+            
+            g_boot_info.mem_info.entry_count++;
+        }
+        
+        Print(L"Stored %d memory entries, total usable: %lu MB\r\n", 
+              g_boot_info.mem_info.entry_count, 
+              g_boot_info.mem_info.total_memory / (1024 * 1024));
+    }
+    
     // Step 1: Allocate trampoline below kernel space
     Print(L"Allocating trampoline below kernel space...\r\n");
     status = allocate_trampoline(kernel_phys_addr);
@@ -706,7 +773,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     // - Load CR3 with our page tables  
     // - Jump to the kernel's higher half virtual address
     trampoline_func_t trampoline = (trampoline_func_t)trampoline_addr;
-    trampoline(elf_header->e_entry, &fb_info, PML4_ADDRESS);
+    trampoline(elf_header->e_entry, &g_boot_info, PML4_ADDRESS);
     
     // Should never reach here
     return EFI_SUCCESS;

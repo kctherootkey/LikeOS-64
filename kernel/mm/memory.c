@@ -47,15 +47,15 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
-// Utility functions
-static void mm_memset(void* dest, int val, size_t len) {
+// Utility functions (non-static, declared in memory.h)
+void mm_memset(void* dest, int val, size_t len) {
     uint8_t* ptr = (uint8_t*)dest;
     while (len--) {
         *ptr++ = val;
     }
 }
 
-static void mm_memcpy(void* dest, const void* src, size_t len) {
+void mm_memcpy(void* dest, const void* src, size_t len) {
     uint8_t* d = (uint8_t*)dest;
     const uint8_t* s = (const uint8_t*)src;
     while (len--) {
@@ -671,4 +671,537 @@ void MmDetectMemory(void) {
     // For now, we assume 256MB minimum as specified
     // In a real implementation, this would query BIOS memory map
     kprintf("Memory detection: Assuming 256MB minimum requirement\n");
+}
+
+// ============================================================================
+// USER ADDRESS SPACE MANAGEMENT
+// ============================================================================
+
+// Get page table entry from a specific PML4, creating intermediate tables if needed
+uint64_t* MmGetPageTableFromPml4(uint64_t* pml4, uint64_t virtual_addr, bool create) {
+    if (!pml4) {
+        return NULL;
+    }
+    
+    uint64_t pml4_index = (virtual_addr >> 39) & 0x1FF;
+    uint64_t pdpt_index = (virtual_addr >> 30) & 0x1FF;
+    uint64_t pd_index = (virtual_addr >> 21) & 0x1FF;
+    uint64_t pt_index = (virtual_addr >> 12) & 0x1FF;
+    
+    bool is_user_space = (virtual_addr < KERNEL_OFFSET);
+    
+    // Get PDPT
+    uint64_t* pdpt;
+    if (!(pml4[pml4_index] & PAGE_PRESENT)) {
+        if (!create) return NULL;
+        uint64_t pdpt_phys = MmAllocatePhysicalPage();
+        if (!pdpt_phys) return NULL;
+        mm_memset((void*)pdpt_phys, 0, PAGE_SIZE);
+        // For user space, set PAGE_USER on all levels
+        uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE;
+        if (is_user_space) {
+            flags |= PAGE_USER;
+        }
+        pml4[pml4_index] = pdpt_phys | flags;
+        pdpt = (uint64_t*)pdpt_phys;
+    } else {
+        // Entry exists - but for user space mapping, we may need to add PAGE_USER
+        if (is_user_space && create && !(pml4[pml4_index] & PAGE_USER)) {
+            pml4[pml4_index] |= PAGE_USER;
+        }
+        pdpt = (uint64_t*)(pml4[pml4_index] & ~0xFFFULL);
+    }
+    
+    // Get PD
+    uint64_t* pd;
+    if (!(pdpt[pdpt_index] & PAGE_PRESENT)) {
+        if (!create) return NULL;
+        uint64_t pd_phys = MmAllocatePhysicalPage();
+        if (!pd_phys) return NULL;
+        mm_memset((void*)pd_phys, 0, PAGE_SIZE);
+        uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE;
+        if (is_user_space) {
+            flags |= PAGE_USER;
+        }
+        pdpt[pdpt_index] = pd_phys | flags;
+        pd = (uint64_t*)pd_phys;
+    } else {
+        // Entry exists - but for user space mapping, we may need to add PAGE_USER
+        if (is_user_space && create && !(pdpt[pdpt_index] & PAGE_USER)) {
+            pdpt[pdpt_index] |= PAGE_USER;
+        }
+        pd = (uint64_t*)(pdpt[pdpt_index] & ~0xFFFULL);
+    }
+    
+    // Get PT
+    uint64_t* pt;
+    uint64_t pd_entry = pd[pd_index];
+    
+    // Check if this is a 2MB large page (PS bit set)
+    if ((pd_entry & PAGE_PRESENT) && (pd_entry & 0x80)) {
+        // This is a 2MB page - we need to split it into 4KB pages
+        if (!create) return NULL;
+        
+        // Get the base physical address of the 2MB page
+        uint64_t large_page_base = pd_entry & ~0x1FFFFFULL;  // Mask off lower 21 bits
+        uint64_t old_flags = pd_entry & 0x1FFFFFULL;        // Keep old flags
+        
+        // Allocate a new page table
+        uint64_t pt_phys = MmAllocatePhysicalPage();
+        if (!pt_phys) return NULL;
+        
+        pt = (uint64_t*)pt_phys;
+        
+        // Fill the page table with 512 4KB pages covering the same 2MB region
+        for (int i = 0; i < 512; i++) {
+            uint64_t page_phys = large_page_base + (i * PAGE_SIZE);
+            // Keep original flags but remove PS bit and add any user flags if needed
+            uint64_t pt_flags = (old_flags & ~0x80) | PAGE_PRESENT;
+            if (is_user_space) {
+                pt_flags |= PAGE_USER;
+            }
+            pt[i] = page_phys | pt_flags;
+        }
+        
+        // Update PD entry to point to the new page table
+        uint64_t pd_flags = PAGE_PRESENT | PAGE_WRITABLE;
+        if (is_user_space) {
+            pd_flags |= PAGE_USER;
+        }
+        pd[pd_index] = pt_phys | pd_flags;
+    } else if (!(pd_entry & PAGE_PRESENT)) {
+        if (!create) return NULL;
+        uint64_t pt_phys = MmAllocatePhysicalPage();
+        if (!pt_phys) return NULL;
+        mm_memset((void*)pt_phys, 0, PAGE_SIZE);
+        uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE;
+        if (is_user_space) {
+            flags |= PAGE_USER;
+        }
+        pd[pd_index] = pt_phys | flags;
+        pt = (uint64_t*)pt_phys;
+    } else {
+        // Entry exists - but for user space mapping, we may need to add PAGE_USER
+        if (is_user_space && create && !(pd[pd_index] & PAGE_USER)) {
+            pd[pd_index] |= PAGE_USER;
+        }
+        pt = (uint64_t*)(pd[pd_index] & ~0xFFFULL);
+    }
+    
+    return &pt[pt_index];
+}
+
+// Create a new user address space (PML4)
+// Shares kernel higher-half mappings (PML4[511]) with current address space
+// Also shares identity mapping (PML4[0-3]) for kernel stack access during interrupts
+uint64_t* MmCreateUserAddressSpace(void) {
+    // Allocate PML4
+    uint64_t pml4_phys = MmAllocatePhysicalPage();
+    if (!pml4_phys) {
+        kprintf("MmCreateUserAddressSpace: Failed to allocate PML4\n");
+        return NULL;
+    }
+    
+    uint64_t* new_pml4 = (uint64_t*)pml4_phys;
+    mm_memset(new_pml4, 0, PAGE_SIZE);
+    
+    uint64_t* current_pml4 = (uint64_t*)(get_cr3() & ~0xFFFULL);
+    
+    // Copy identity mapping entries (PML4[0-3] cover 0-4GB)
+    // These are needed so the kernel can access the stack during context switch
+    // and interrupt handling. These entries are SUPERVISOR ONLY (no PAGE_USER)
+    // so user code cannot access them, but kernel code can.
+    for (int i = 0; i < 4; i++) {
+        if (current_pml4[i] & PAGE_PRESENT) {
+            // Copy as-is - the kernel's identity mapping is supervisor-only
+            new_pml4[i] = current_pml4[i];
+        }
+    }
+    
+    // Copy PML4[511] - kernel higher-half mapping (supervisor only)
+    // This allows kernel code to run while in user's address space
+    new_pml4[511] = current_pml4[511];
+    
+    kprintf("MmCreateUserAddressSpace: Created PML4 at %p\n", new_pml4);
+    kprintf("  Copied PML4[0-3] (identity, supervisor) and PML4[511] (kernel) from kernel PML4=%p\n", 
+            current_pml4);
+    return new_pml4;
+}
+
+// Destroy an address space and free all user pages
+void MmDestroyAddressSpace(uint64_t* pml4) {
+    if (!pml4) return;
+    
+    // Don't free if it's the kernel PML4
+    uint64_t* kernel_pml4 = (uint64_t*)(get_cr3() & ~0xFFFULL);
+    if (pml4 == kernel_pml4) {
+        kprintf("MmDestroyAddressSpace: Cannot destroy kernel PML4!\n");
+        return;
+    }
+    
+    // Free user-space page tables (entries 0-510, excluding entry 0 identity mapping)
+    for (int i = 1; i < 511; i++) {
+        if (pml4[i] & PAGE_PRESENT) {
+            uint64_t* pdpt = (uint64_t*)(pml4[i] & ~0xFFFULL);
+            
+            for (int j = 0; j < 512; j++) {
+                if (pdpt[j] & PAGE_PRESENT) {
+                    uint64_t* pd = (uint64_t*)(pdpt[j] & ~0xFFFULL);
+                    
+                    for (int k = 0; k < 512; k++) {
+                        if (pd[k] & PAGE_PRESENT) {
+                            // Check if it's a 2MB page or a page table
+                            if (pd[k] & PAGE_SIZE_FLAG) {
+                                // 2MB page - don't free, these are identity-mapped
+                            } else {
+                                uint64_t* pt = (uint64_t*)(pd[k] & ~0xFFFULL);
+                                
+                                // Free all physical pages in this PT
+                                for (int l = 0; l < 512; l++) {
+                                    if (pt[l] & PAGE_PRESENT) {
+                                        uint64_t phys = pt[l] & ~0xFFFULL;
+                                        MmFreePhysicalPage(phys);
+                                    }
+                                }
+                                
+                                // Free the PT itself
+                                MmFreePhysicalPage((uint64_t)pt);
+                            }
+                        }
+                    }
+                    
+                    // Free the PD
+                    MmFreePhysicalPage((uint64_t)pd);
+                }
+            }
+            
+            // Free the PDPT
+            MmFreePhysicalPage((uint64_t)pdpt);
+        }
+    }
+    
+    // Free the PML4 itself
+    MmFreePhysicalPage((uint64_t)pml4);
+}
+
+// Switch to a different address space
+void MmSwitchAddressSpace(uint64_t* pml4) {
+    if (pml4) {
+        set_cr3((uint64_t)pml4);
+    }
+}
+
+// Get the current address space
+uint64_t* MmGetCurrentAddressSpace(void) {
+    return (uint64_t*)(get_cr3() & ~0xFFFULL);
+}
+
+// Map a page in a specific address space
+bool MmMapPageInAddressSpace(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
+    uint64_t* pte = MmGetPageTableFromPml4(pml4, virtual_addr, true);
+    if (!pte) {
+        return false;
+    }
+    
+    *pte = (physical_addr & ~0xFFFULL) | flags;
+    
+    // Flush TLB if this is the current address space
+    if (pml4 == MmGetCurrentAddressSpace()) {
+        MmFlushTLB(virtual_addr);
+    }
+    
+    return true;
+}
+
+// Map a user page with appropriate flags
+bool MmMapUserPage(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
+    // Ensure user bit is set for user-space addresses
+    if (virtual_addr < KERNEL_OFFSET) {
+        flags |= PAGE_USER;
+    }
+    return MmMapPageInAddressSpace(pml4, virtual_addr, physical_addr, flags);
+}
+
+// Map a user stack region
+bool MmMapUserStack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
+    if (!pml4 || stack_size == 0) {
+        return false;
+    }
+    
+    size_t pages = (stack_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t stack_bottom = stack_top - stack_size;
+    
+    kprintf("MmMapUserStack: Mapping %zu pages from %p to %p\n", 
+            pages, (void*)stack_bottom, (void*)stack_top);
+    
+    for (size_t i = 0; i < pages; i++) {
+        uint64_t vaddr = stack_bottom + (i * PAGE_SIZE);
+        uint64_t phys = MmAllocatePhysicalPage();
+        
+        if (!phys) {
+            kprintf("MmMapUserStack: Failed to allocate physical page %zu\n", i);
+            // TODO: Unmap already-mapped pages
+            return false;
+        }
+        
+        // Zero the stack page
+        mm_memset((void*)phys, 0, PAGE_SIZE);
+        
+        // Map with user, writable flags (NX disabled until EFER.NXE is set)
+        uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+        if (!MmMapPageInAddressSpace(pml4, vaddr, phys, flags)) {
+            kprintf("MmMapUserStack: Failed to map page at %p\n", (void*)vaddr);
+            MmFreePhysicalPage(phys);
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+// Get physical address from a specific PML4
+uint64_t MmGetPhysicalAddressFromPml4(uint64_t* pml4, uint64_t virtual_addr) {
+    uint64_t* pte = MmGetPageTableFromPml4(pml4, virtual_addr, false);
+    if (pte && (*pte & PAGE_PRESENT)) {
+        return (*pte & ~0xFFFULL) | (virtual_addr & 0xFFF);
+    }
+    return 0;
+}
+
+// Get page flags for a virtual address
+uint64_t MmGetPageFlags(uint64_t virtual_addr) {
+    uint64_t* pte = MmGetPageTable(virtual_addr, false);
+    if (pte) {
+        return *pte & 0xFFF;  // Return just the flag bits
+    }
+    return 0;
+}
+
+// Set page flags for a virtual address
+bool MmSetPageFlags(uint64_t virtual_addr, uint64_t flags) {
+    uint64_t* pte = MmGetPageTable(virtual_addr, false);
+    if (pte && (*pte & PAGE_PRESENT)) {
+        uint64_t phys = *pte & ~0xFFFULL;
+        *pte = phys | flags;
+        MmFlushTLB(virtual_addr);
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// COPY-ON-WRITE SUPPORT
+// ============================================================================
+
+// Mark a page as copy-on-write (make it read-only with COW flag)
+bool MmMarkPageCOW(uint64_t virtual_addr) {
+    uint64_t* pte = MmGetPageTable(virtual_addr, false);
+    if (!pte || !(*pte & PAGE_PRESENT)) {
+        return false;
+    }
+    
+    // Remove writable, add COW marker
+    *pte = (*pte & ~PAGE_WRITABLE) | PAGE_COW;
+    MmFlushTLB(virtual_addr);
+    return true;
+}
+
+// Handle a COW page fault - allocate new page and copy contents
+bool MmHandleCOWFault(uint64_t fault_addr) {
+    uint64_t page_addr = fault_addr & ~0xFFFULL;
+    uint64_t* pte = MmGetPageTable(page_addr, false);
+    
+    if (!pte || !(*pte & PAGE_PRESENT)) {
+        return false;
+    }
+    
+    // Check if this is a COW page
+    if (!(*pte & PAGE_COW)) {
+        return false;  // Not a COW fault
+    }
+    
+    uint64_t old_phys = *pte & ~0xFFFULL;
+    
+    // Allocate a new physical page
+    uint64_t new_phys = MmAllocatePhysicalPage();
+    if (!new_phys) {
+        kprintf("MmHandleCOWFault: Failed to allocate new page\n");
+        return false;
+    }
+    
+    // Copy contents from old page to new page
+    mm_memcpy((void*)new_phys, (void*)old_phys, PAGE_SIZE);
+    
+    // Update PTE: remove COW, add writable, point to new page
+    uint64_t flags = (*pte & 0xFFF) & ~PAGE_COW;
+    flags |= PAGE_WRITABLE;
+    *pte = new_phys | flags;
+    
+    MmFlushTLB(page_addr);
+    
+    // Note: In a real implementation, we'd track reference counts
+    // and only free the old page when refcount reaches 0
+    
+    return true;
+}
+
+// Clone an address space for fork() - uses COW for efficiency
+uint64_t* MmCloneAddressSpace(uint64_t* src_pml4) {
+    if (!src_pml4) {
+        return NULL;
+    }
+    
+    // Create new address space
+    uint64_t* new_pml4 = MmCreateUserAddressSpace();
+    if (!new_pml4) {
+        return NULL;
+    }
+    
+    // Clone user-space mappings with COW
+    // For now, we only support entries 1-510 (skip identity mapping at 0 and kernel at 511)
+    for (int i = 1; i < 511; i++) {
+        if (src_pml4[i] & PAGE_PRESENT) {
+            uint64_t* src_pdpt = (uint64_t*)(src_pml4[i] & ~0xFFFULL);
+            
+            // Allocate PDPT for new address space
+            uint64_t pdpt_phys = MmAllocatePhysicalPage();
+            if (!pdpt_phys) goto fail;
+            mm_memset((void*)pdpt_phys, 0, PAGE_SIZE);
+            new_pml4[i] = pdpt_phys | (src_pml4[i] & 0xFFF);
+            uint64_t* new_pdpt = (uint64_t*)pdpt_phys;
+            
+            for (int j = 0; j < 512; j++) {
+                if (src_pdpt[j] & PAGE_PRESENT) {
+                    uint64_t* src_pd = (uint64_t*)(src_pdpt[j] & ~0xFFFULL);
+                    
+                    uint64_t pd_phys = MmAllocatePhysicalPage();
+                    if (!pd_phys) goto fail;
+                    mm_memset((void*)pd_phys, 0, PAGE_SIZE);
+                    new_pdpt[j] = pd_phys | (src_pdpt[j] & 0xFFF);
+                    uint64_t* new_pd = (uint64_t*)pd_phys;
+                    
+                    for (int k = 0; k < 512; k++) {
+                        if (src_pd[k] & PAGE_PRESENT) {
+                            if (src_pd[k] & PAGE_SIZE_FLAG) {
+                                // 2MB huge page - just share for now
+                                new_pd[k] = src_pd[k];
+                            } else {
+                                uint64_t* src_pt = (uint64_t*)(src_pd[k] & ~0xFFFULL);
+                                
+                                uint64_t pt_phys = MmAllocatePhysicalPage();
+                                if (!pt_phys) goto fail;
+                                mm_memset((void*)pt_phys, 0, PAGE_SIZE);
+                                new_pd[k] = pt_phys | (src_pd[k] & 0xFFF);
+                                uint64_t* new_pt = (uint64_t*)pt_phys;
+                                
+                                for (int l = 0; l < 512; l++) {
+                                    if (src_pt[l] & PAGE_PRESENT) {
+                                        // Mark both source and dest as COW
+                                        uint64_t cow_flags = (src_pt[l] & ~PAGE_WRITABLE) | PAGE_COW;
+                                        src_pt[l] = cow_flags;
+                                        new_pt[l] = cow_flags;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Flush TLB for source address space
+    MmFlushAllTLB();
+    
+    return new_pml4;
+    
+fail:
+    MmDestroyAddressSpace(new_pml4);
+    return NULL;
+}
+
+// ============================================================================
+// SYSCALL/SYSRET CONFIGURATION
+// ============================================================================
+
+// MSR definitions for SYSCALL/SYSRET
+#define MSR_STAR        0xC0000081  // Segment selectors for SYSCALL
+#define MSR_LSTAR       0xC0000082  // RIP for SYSCALL (64-bit)
+#define MSR_CSTAR       0xC0000083  // RIP for SYSCALL (compat mode)
+#define MSR_SFMASK      0xC0000084  // RFLAGS mask for SYSCALL
+#define MSR_EFER        0xC0000080  // Extended Feature Enable Register
+
+// Read MSR
+static inline uint64_t rdmsr(uint32_t msr) {
+    uint32_t low, high;
+    __asm__ volatile ("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
+    return ((uint64_t)high << 32) | low;
+}
+
+// Write MSR
+static inline void wrmsr(uint32_t msr, uint64_t value) {
+    uint32_t low = value & 0xFFFFFFFF;
+    uint32_t high = value >> 32;
+    __asm__ volatile ("wrmsr" : : "c"(msr), "a"(low), "d"(high));
+}
+
+// Syscall entry point - defined in syscall.asm
+extern void syscall_entry(void);
+
+// Initialize SYSCALL/SYSRET
+void MmInitializeSyscall(void) {
+    // Enable SCE (System Call Extensions) in EFER
+    uint64_t efer = rdmsr(MSR_EFER);
+    efer |= 1;  // Set SCE bit
+    wrmsr(MSR_EFER, efer);
+    
+    // Set up STAR register
+    // Bits 63:48 = User CS/SS base selector (user CS = base + 16, user SS = base + 8)
+    // Bits 47:32 = Kernel CS/SS base selector (kernel CS = base, kernel SS = base + 8)
+    // GDT layout: 0=null, 1=kernel code, 2=kernel data, 3=user code, 4=user data
+    // Kernel CS = 0x08, Kernel SS = 0x10
+    // User CS = 0x18 | 3 = 0x1B, User SS = 0x20 | 3 = 0x23
+    // But SYSRET adds 16 to get user CS and adds 8 to get user SS
+    // So user selector base should be 0x18 - 16 = 0x08... no wait
+    // SYSRET: CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
+    // We want CS = 0x1B (user code with RPL 3), SS = 0x23 (user data with RPL 3)
+    // But SYSRET ORs with RPL 3, so we just need base = 0x10
+    // CS = 0x10 + 16 = 0x20 | 3 = 0x23... that's wrong
+    // Actually for 64-bit: CS = STAR[63:48] + 16 | 3, SS = STAR[63:48] + 8 | 3
+    // We want user CS = 0x1B (selector 0x18 | RPL 3), user SS = 0x23 (selector 0x20 | RPL 3)
+    // 0x1B = 0x18 | 3, so base + 16 = 0x18, base = 0x08
+    // But 0x08 + 8 = 0x10 | 3 = 0x13, not 0x23
+    // The GDT layout needs user data BEFORE user code for SYSRET to work correctly
+    // Or we accept different selector values
+    // Actually for AMD64 SYSRET: SS = STAR[63:48] + 8 | 3, CS = STAR[63:48] + 16 | 3
+    // Current GDT: 0=null, 1=kcode, 2=kdata, 3=ucode, 4=udata
+    // Selectors: 0x00, 0x08, 0x10, 0x18, 0x20
+    // For SYSRET with base = 0x10: SS = 0x18|3=0x1B, CS = 0x20|3=0x23
+    // That means user code = 0x23, user data = 0x1B, which is reversed!
+    // 
+    // The Intel/AMD way is: GDT order should be kcode, kdata, udata, ucode (32-bit), ucode (64-bit)
+    // For simplicity now, we'll use STAR[63:48] = 0x10
+    // This gives SS = 0x1B (will use GDT[3] as user data)
+    //            CS = 0x23 (will use GDT[4] as user code)
+    // We'll need to swap GDT entries 3 and 4 for correct SYSRET behavior
+    // For now, just set it up - the GDT can be fixed later
+    
+    uint64_t star = 0;
+    star |= ((uint64_t)0x10 << 48);  // User selector base (CS = 0x23, SS = 0x1B after SYSRET)
+    star |= ((uint64_t)0x08 << 32);  // Kernel selector base (CS = 0x08, SS = 0x10)
+    wrmsr(MSR_STAR, star);
+    
+    // Set LSTAR to syscall entry point
+    wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
+    
+    // Set CSTAR for compatibility mode (not used in 64-bit only kernel)
+    wrmsr(MSR_CSTAR, (uint64_t)syscall_entry);
+    
+    // Set SFMASK - RFLAGS bits to clear on SYSCALL
+    // Clear IF (disable interrupts), TF (no single-step), DF (clear direction)
+    wrmsr(MSR_SFMASK, 0x200 | 0x100 | 0x400);  // IF | TF | DF
+    
+    kprintf("SYSCALL/SYSRET initialized\n");
+    kprintf("  STAR = 0x%016llx\n", star);
+    kprintf("  LSTAR = 0x%016llx\n", (uint64_t)syscall_entry);
 }

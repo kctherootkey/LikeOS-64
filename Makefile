@@ -61,7 +61,10 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/ps2.o \
 			  $(BUILD_DIR)/ioapic.o \
 			  $(BUILD_DIR)/timer.o \
-			  $(BUILD_DIR)/sched.o
+			  $(BUILD_DIR)/sched.o \
+			  $(BUILD_DIR)/syscall.o \
+			  $(BUILD_DIR)/syscall_c.o \
+			  $(BUILD_DIR)/user_test.o
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -158,6 +161,15 @@ $(BUILD_DIR)/timer.o: $(KERNEL_DIR)/ke/timer.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/sched.o: $(KERNEL_DIR)/ke/sched.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/syscall.o: $(KERNEL_DIR)/ke/syscall.asm | $(BUILD_DIR)
+	nasm -f elf64 $< -o $@
+
+$(BUILD_DIR)/syscall_c.o: $(KERNEL_DIR)/ke/syscall.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/user_test.o: $(KERNEL_DIR)/ke/user_test.asm | $(BUILD_DIR)
+	nasm -f elf64 $< -o $@
 
 # Build kernel ELF
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel.lds | $(BUILD_DIR)

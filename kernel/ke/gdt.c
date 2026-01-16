@@ -67,17 +67,19 @@ void gdt_init() {
     // Null descriptor
     gdt_set_gate(0, 0, 0, 0, 0);
     
-    // Kernel code segment
+    // Kernel code segment (selector 0x08)
     gdt_set_gate(1, 0, 0xFFFFF, 0x9A, 0xAF);  // AF = Long mode, 4KB granularity
     
-    // Kernel data segment 
+    // Kernel data segment (selector 0x10)
     gdt_set_gate(2, 0, 0xFFFFF, 0x92, 0xCF);
     
-    // User code segment
-    gdt_set_gate(3, 0, 0xFFFFF, 0xFA, 0xAF);
+    // User data segment (selector 0x18) - MUST come before user code for SYSRET!
+    // SYSRET: SS = STAR[63:48] + 8 | 3 = 0x10 + 8 | 3 = 0x1B
+    gdt_set_gate(3, 0, 0xFFFFF, 0xF2, 0xCF);
     
-    // User data segment
-    gdt_set_gate(4, 0, 0xFFFFF, 0xF2, 0xCF);
+    // User code segment (selector 0x20) - 64-bit
+    // SYSRET: CS = STAR[63:48] + 16 | 3 = 0x10 + 16 | 3 = 0x23
+    gdt_set_gate(4, 0, 0xFFFFF, 0xFA, 0xAF);
     
     // TSS entry - entries 5 and 6 (128-bit TSS descriptor)
     gdt_set_gate(5, 0, 0, 0, 0);  // Will be set up later

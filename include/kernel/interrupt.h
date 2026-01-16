@@ -136,6 +136,10 @@ extern void isr29(void);
 extern void isr30(void);
 extern void isr31(void);
 
+// TSS management for user mode
+void tss_set_kernel_stack(uint64_t stack_top);
+uint64_t tss_get_kernel_stack(void);
+
 // IRQ stubs
 extern void irq32(void);  // Timer
 extern void irq33(void);  // Keyboard

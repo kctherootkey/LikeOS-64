@@ -16,24 +16,34 @@
 #include "../../include/kernel/sched.h"
 
 // Function prototypes
-void KiSystemStartup(void);
-void kernel_main(framebuffer_info_t* fb_info);
+void KiSystemStartup(boot_info_t* boot_info);
+void kernel_main(boot_info_t* boot_info);
+static void spawn_user_test_task(void);
+
+// External symbols for user test program (from user_test.asm)
+extern char user_test_start[];
+extern char user_test_end[];
 
 static xhci_boot_state_t g_xhci_boot;
 static storage_fs_state_t g_storage_state;
+static boot_info_t* g_boot_info;  // Global boot info pointer
 
 // UEFI kernel entry point - called by bootloader
-void kernel_main(framebuffer_info_t* fb_info) {
+void kernel_main(boot_info_t* boot_info) {
+    // Store boot info globally
+    g_boot_info = boot_info;
+    
     // Initialize console system with framebuffer info
-    console_init(fb_info);
+    // Cast boot_framebuffer_info_t to framebuffer_info_t (compatible structure)
+    console_init((framebuffer_info_t*)&boot_info->fb_info);
     // Initialize framebuffer optimization after console is ready
     console_init_fb_optimization();
     // Call the main system initialization
-    KiSystemStartup();
+    KiSystemStartup(boot_info);
 }
 
 // Kernel Executive entry point
-void KiSystemStartup(void) {
+void KiSystemStartup(boot_info_t* boot_info) {
     // Console is already initialized by kernel_main()
 
     kprintf("\nLikeOS-64 Kernel v1.0\n");
@@ -49,13 +59,27 @@ void KiSystemStartup(void) {
     interrupts_init();
     kprintf("Interrupt system initialized successfully\n");
 
-    // Initialize memory management subsystem
+    // Initialize memory management subsystem using boot info
     kprintf("\nInitializing Memory Management Subsystem...\n");
+    kprintf("Boot info: %d memory map entries, %lu MB total usable\n",
+            boot_info->mem_info.entry_count,
+            boot_info->mem_info.total_memory / (1024 * 1024));
+    
+    // Use actual memory size from boot info, with 256MB minimum
+    uint64_t memory_size = boot_info->mem_info.total_memory;
+    if (memory_size < 256 * 1024 * 1024) {
+        memory_size = 256 * 1024 * 1024;
+    }
+    
     MmDetectMemory();
-    MmInitializePhysicalMemory(256 * 1024 * 1024); // 256MB minimum requirement
+    MmInitializePhysicalMemory(memory_size);
     MmInitializeVirtualMemory();
     MmInitializeHeap();
     MmPrintMemoryStats();
+    
+    // Initialize SYSCALL/SYSRET for user mode support
+    kprintf("\nInitializing SYSCALL/SYSRET...\n");
+    MmInitializeSyscall();
 
     // Initialize PCI and enumerate devices
     kprintf("\nInitializing PCI subsystem...\n");
@@ -121,6 +145,9 @@ void KiSystemStartup(void) {
     timer_init(100);
     timer_start();
 
+    // Spawn user mode test task
+    spawn_user_test_task();
+
     // Show ready prompt and enter shell loop
     shell_init();
 
@@ -135,5 +162,128 @@ void KiSystemStartup(void) {
             __asm__ volatile ("hlt");
         }
     }
+}
+
+// Spawn a user-mode test task
+static void spawn_user_test_task(void) {
+    kprintf("\n=== Spawning User Mode Test Task ===\n");
+    
+    // Calculate size of user test program
+    size_t user_code_size = (size_t)(user_test_end - user_test_start);
+    kprintf("User test code: %zu bytes at kernel %p\n", user_code_size, user_test_start);
+    
+    if (user_code_size == 0 || user_code_size > 4096) {
+        kprintf("ERROR: Invalid user code size\n");
+        return;
+    }
+    
+    kprintf("DEBUG: About to create user address space\n");
+    
+    // Create a new user address space
+    uint64_t* user_pml4 = MmCreateUserAddressSpace();
+    if (!user_pml4) {
+        kprintf("ERROR: Failed to create user address space\n");
+        return;
+    }
+    
+    kprintf("DEBUG: User address space created, about to allocate code page\n");
+    
+    // Allocate and map user code at a fixed user address
+    #define USER_CODE_VADDR 0x400000  // Standard user code start
+    
+    uint64_t code_phys = MmAllocatePhysicalPage();
+    if (!code_phys) {
+        kprintf("ERROR: Failed to allocate physical page for user code\n");
+        MmDestroyAddressSpace(user_pml4);
+        return;
+    }
+    
+    // Copy user test code to the physical page
+    kprintf("DEBUG: Copying %zu bytes from %p to phys %p\n", 
+            user_code_size, user_test_start, (void*)code_phys);
+    mm_memcpy((void*)code_phys, user_test_start, user_code_size);
+    
+    // Debug: verify the copy by reading back first 8 bytes
+    uint8_t* check = (uint8_t*)code_phys;
+    kprintf("DEBUG: First 8 bytes at phys: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            check[0], check[1], check[2], check[3], check[4], check[5], check[6], check[7]);
+    uint8_t* orig = (uint8_t*)user_test_start;
+    kprintf("DEBUG: First 8 bytes at src:  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            orig[0], orig[1], orig[2], orig[3], orig[4], orig[5], orig[6], orig[7]);
+    
+    // Map code page as user, read-only, executable
+    // NOTE: PAGE_USER must be set, and PAGE_NO_EXECUTE must NOT be set for code execution
+    uint64_t code_flags = PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE;  // Writable for now to test
+    kprintf("DEBUG: code_flags = %p\n", (void*)code_flags);
+    if (!MmMapPageInAddressSpace(user_pml4, USER_CODE_VADDR, code_phys, code_flags)) {
+        kprintf("ERROR: Failed to map user code page\n");
+        MmFreePhysicalPage(code_phys);
+        MmDestroyAddressSpace(user_pml4);
+        return;
+    }
+    
+    // Debug: Read back the PTE to verify
+    uint64_t* pte = MmGetPageTableFromPml4(user_pml4, USER_CODE_VADDR, false);
+    if (pte) {
+        kprintf("DEBUG: Code page PTE = %p\n", (void*)*pte);
+        if (*pte & 0x8000000000000000ULL) {
+            kprintf("DEBUG: WARNING - NX bit is SET on code page!\n");
+        }
+    }
+    
+    // Debug: Check all page table levels for USER bit
+    uint64_t pml4_idx = (USER_CODE_VADDR >> 39) & 0x1FF;
+    uint64_t pdpt_idx = (USER_CODE_VADDR >> 30) & 0x1FF;
+    uint64_t pd_idx = (USER_CODE_VADDR >> 21) & 0x1FF;
+    uint64_t pt_idx = (USER_CODE_VADDR >> 12) & 0x1FF;
+    kprintf("DEBUG: Indices: PML4[%d] PDPT[%d] PD[%d] PT[%d]\n", 
+            (int)pml4_idx, (int)pdpt_idx, (int)pd_idx, (int)pt_idx);
+    kprintf("DEBUG: PML4[%d] = %p\n", (int)pml4_idx, (void*)user_pml4[pml4_idx]);
+    if (user_pml4[pml4_idx] & 1) {
+        uint64_t* pdpt = (uint64_t*)(user_pml4[pml4_idx] & ~0xFFFULL);
+        kprintf("DEBUG: PDPT[%d] = %p\n", (int)pdpt_idx, (void*)pdpt[pdpt_idx]);
+        if (pdpt[pdpt_idx] & 1) {
+            uint64_t* pd = (uint64_t*)(pdpt[pdpt_idx] & ~0xFFFULL);
+            kprintf("DEBUG: PD[%d] = %p\n", (int)pd_idx, (void*)pd[pd_idx]);
+        }
+    }
+    
+    kprintf("Mapped user code at vaddr %p -> phys %p\n", 
+            (void*)USER_CODE_VADDR, (void*)code_phys);
+    
+    // Create user stack (16KB) 
+    // Use a simpler address that's easier to map
+    #define USER_STACK_TOP  0x800000ULL   // 8MB - simple address in low user space
+    #define USER_STACK_SIZE (16 * 1024)
+    
+    if (!MmMapUserStack(user_pml4, USER_STACK_TOP, USER_STACK_SIZE)) {
+        kprintf("ERROR: Failed to map user stack\n");
+        MmFreePhysicalPage(code_phys);
+        MmDestroyAddressSpace(user_pml4);
+        return;
+    }
+    kprintf("Mapped user stack: %p - %p (%u KB)\n", 
+            (void*)(USER_STACK_TOP - USER_STACK_SIZE), 
+            (void*)USER_STACK_TOP,
+            USER_STACK_SIZE / 1024);
+    
+    // Create the user task
+    task_t* user_task = sched_add_user_task(
+        (task_entry_t)USER_CODE_VADDR,  // Entry point in user space
+        NULL,                            // No argument
+        user_pml4,                       // User's page table
+        USER_STACK_TOP,                  // User stack pointer
+        0                                // Kernel stack allocated by sched_add_user_task
+    );
+    
+    if (!user_task) {
+        kprintf("ERROR: Failed to create user task\n");
+        MmDestroyAddressSpace(user_pml4);
+        return;
+    }
+    
+    kprintf("User test task created: id=%d, entry=%p\n", 
+            user_task->id, (void*)USER_CODE_VADDR);
+    kprintf("=== User task ready, will run on next schedule ===\n\n");
 }
 
