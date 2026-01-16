@@ -215,7 +215,7 @@ void exception_handler(uint64_t *regs) {
         uint64_t cr2;
         __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
         if ((err_code & 0x3) == 0x3) {
-            if (MmHandleCOWFault(cr2)) {
+            if (mm_handle_cow_fault(cr2)) {
                 return;
             }
         }

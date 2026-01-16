@@ -49,12 +49,12 @@ void KiSystemStartup(boot_info_t* boot_info) {
         memory_size = 256 * 1024 * 1024;
     }
     
-    MmDetectMemory();
-    MmInitializePhysicalMemory(memory_size);
-    MmInitializeVirtualMemory();
-    MmInitializeHeap();
-    MmPrintMemoryStats();
-    MmInitializeSyscall();
+    mm_detect_memory();
+    mm_initialize_physical_memory(memory_size);
+    mm_initialize_virtual_memory();
+    mm_initialize_heap();
+    mm_print_memory_stats();
+    mm_initialize_syscall();
 
     pci_init();
     pci_enumerate();
@@ -122,7 +122,7 @@ static void spawn_user_test_task(void) {
         return;
     }
     
-    uint64_t* user_pml4 = MmCreateUserAddressSpace();
+    uint64_t* user_pml4 = mm_create_user_address_space();
     if (!user_pml4) {
         kprintf("ERROR: Failed to create user address space\n");
         return;
@@ -130,30 +130,30 @@ static void spawn_user_test_task(void) {
     
     #define USER_CODE_VADDR 0x400000
     
-    uint64_t code_phys = MmAllocatePhysicalPage();
+    uint64_t code_phys = mm_allocate_physical_page();
     if (!code_phys) {
         kprintf("ERROR: Failed to allocate physical page for user code\n");
-        MmDestroyAddressSpace(user_pml4);
+        mm_destroy_address_space(user_pml4);
         return;
     }
     
     mm_memcpy((void*)code_phys, user_test_start, user_code_size);
     
     uint64_t code_flags = PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE;
-    if (!MmMapPageInAddressSpace(user_pml4, USER_CODE_VADDR, code_phys, code_flags)) {
+    if (!mm_map_page_in_address_space(user_pml4, USER_CODE_VADDR, code_phys, code_flags)) {
         kprintf("ERROR: Failed to map user code page\n");
-        MmFreePhysicalPage(code_phys);
-        MmDestroyAddressSpace(user_pml4);
+        mm_free_physical_page(code_phys);
+        mm_destroy_address_space(user_pml4);
         return;
     }
     
     #define USER_TEST_STACK_TOP  0x800000ULL
     #define USER_TEST_STACK_SIZE (16 * 1024)
     
-    if (!MmMapUserStack(user_pml4, USER_TEST_STACK_TOP, USER_TEST_STACK_SIZE)) {
+    if (!mm_map_user_stack(user_pml4, USER_TEST_STACK_TOP, USER_TEST_STACK_SIZE)) {
         kprintf("ERROR: Failed to map user stack\n");
-        MmFreePhysicalPage(code_phys);
-        MmDestroyAddressSpace(user_pml4);
+        mm_free_physical_page(code_phys);
+        mm_destroy_address_space(user_pml4);
         return;
     }
     
@@ -167,7 +167,7 @@ static void spawn_user_test_task(void) {
     
     if (!user_task) {
         kprintf("ERROR: Failed to create user task\n");
-        MmDestroyAddressSpace(user_pml4);
+        mm_destroy_address_space(user_pml4);
         return;
     }
     

@@ -50,7 +50,7 @@ static void xhci_issue_eval_context_endpoints(xhci_controller_t* ctrl, usb_devic
     icc[0] = 0;
     /* Add Context Flags (include slot) */
     icc[1] = (add_mask | 0x1u);
-    unsigned long phys = (unsigned long)MmGetPhysicalAddress((uint64_t)dev->input_ctx);
+    unsigned long phys = (unsigned long)mm_get_physical_address((uint64_t)dev->input_ctx);
     xhci_trb_t *trb = xhci_cmd_enqueue_nodoorbell(ctrl, XHCI_TRB_TYPE_EVAL_CONTEXT, phys);
     if(!trb) {
         return;
@@ -322,7 +322,7 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev)
     if(!cmd_ring_raw) {
         return ST_NOMEM;
     }
-    unsigned long raw_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)cmd_ring_raw);
+    unsigned long raw_phys = (unsigned long)mm_get_physical_address((uint64_t)cmd_ring_raw);
     unsigned long aligned_virt = ((unsigned long)cmd_ring_raw + 63) & ~63UL;
     unsigned long aligned_phys = raw_phys + (aligned_virt - (unsigned long)cmd_ring_raw);
     if(aligned_phys & 0x3F) {
@@ -341,7 +341,7 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev)
     XHCI_LOG("XHCI: Command ring initial cycle=%u phys=%p\n", ctrl->cmd_cycle_state & 1, (void *)ctrl->cmd_ring_phys);
     /* DCBAA */
     ctrl->dcbaa_virt = kcalloc(ctrl->max_slots + 1, sizeof(unsigned long));
-    ctrl->dcbaa_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->dcbaa_virt);
+    ctrl->dcbaa_phys = (unsigned long)mm_get_physical_address((uint64_t)ctrl->dcbaa_virt);
     /* Scratchpads */
     unsigned int sp_lo = ctrl->hcsparams2 & 0x1F;
     unsigned int sp_hi = (ctrl->hcsparams2 >> 27) & 0x1F;
@@ -353,20 +353,20 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev)
         unsigned long *entries = (unsigned long *)spa_aligned;
         for(unsigned i = 0; i < scratchpad_count; i++) {
             void *page = kcalloc(1, 4096);
-            entries[i] = (unsigned long)MmGetPhysicalAddress((uint64_t)page);
+            entries[i] = (unsigned long)mm_get_physical_address((uint64_t)page);
         }
-        unsigned long spa_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)entries);
+        unsigned long spa_phys = (unsigned long)mm_get_physical_address((uint64_t)entries);
         ((unsigned long *)ctrl->dcbaa_virt)[0] = spa_phys;
         XHCI_LOG("XHCI: scratchpads=%u array_phys=%p\n", scratchpad_count, (void *)spa_phys);
     }
     /* Event ring */
     ctrl->event_ring_size = 16;
     ctrl->event_ring_virt = kcalloc(1, 4096);
-    ctrl->event_ring_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->event_ring_virt);
+    ctrl->event_ring_phys = (unsigned long)mm_get_physical_address((uint64_t)ctrl->event_ring_virt);
     ctrl->event_ring_dequeue = 0;
     ctrl->event_ring_cycle = 1;
     ctrl->erst_virt = kcalloc(1, 16);
-    ctrl->erst_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->erst_virt);
+    ctrl->erst_phys = (unsigned long)mm_get_physical_address((uint64_t)ctrl->erst_virt);
     uint64_t *erst = (uint64_t *)ctrl->erst_virt;
     erst[0] = ctrl->event_ring_phys;
     ((uint32_t *)erst)[2] = ctrl->event_ring_size;
@@ -574,8 +574,8 @@ int xhci_process_events(xhci_controller_t *ctrl)
                         for(unsigned i = 0; i < 4096 / 8; i++) {
                             ((volatile uint64_t *)dev->device_ctx)[i] = 0;
                         }
-                        unsigned long in_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)dev->input_ctx);
-                        unsigned long dc_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)dev->device_ctx);
+                        unsigned long in_phys = (unsigned long)mm_get_physical_address((uint64_t)dev->input_ctx);
+                        unsigned long dc_phys = (unsigned long)mm_get_physical_address((uint64_t)dev->device_ctx);
                         if((in_phys & 0x3F) || (dc_phys & 0x3F)) {
                             XHCI_LOG("XHCI: WARN context phys alignment in=%p dev=%p\n", (void *)in_phys, (void *)dc_phys);
                         } else {
@@ -625,7 +625,7 @@ int xhci_process_events(xhci_controller_t *ctrl)
                         if(!ctrl->ep0_ring) {
                             void *ring_raw = kcalloc(1, 16 * sizeof(xhci_trb_t) + 64);
                             if(ring_raw) {
-                                unsigned long raw_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ring_raw);
+                                unsigned long raw_phys = (unsigned long)mm_get_physical_address((uint64_t)ring_raw);
                                 unsigned long aligned_virt = ((unsigned long)ring_raw + 63) & ~63UL; /* 64-byte align */
                                 unsigned long aligned_phys = raw_phys + (aligned_virt - (unsigned long)ring_raw);
                                 ctrl->ep0_ring = (void *)aligned_virt;
@@ -650,13 +650,13 @@ int xhci_process_events(xhci_controller_t *ctrl)
                         }
                         if(slot < ctrl->max_slots + 1) {
                             unsigned long *dcbaa = (unsigned long *)ctrl->dcbaa_virt;
-                            unsigned long dev_ctx_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)dev->device_ctx);
+                            unsigned long dev_ctx_phys = (unsigned long)mm_get_physical_address((uint64_t)dev->device_ctx);
                             dcbaa[slot] = dev_ctx_phys;
                         }
                         // Queue ADDRESS_DEVICE
                         // Debug: dump first 8 dwords of Input Context and DCBAA entry
                         /* reduced debug: remove large context dump */
-                        unsigned long input_ctx_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)dev->input_ctx);
+                        unsigned long input_ctx_phys = (unsigned long)mm_get_physical_address((uint64_t)dev->input_ctx);
                         __asm__ __volatile__("mfence":::"memory");
                         xhci_trb_t *ad = xhci_cmd_enqueue_nodoorbell(ctrl, XHCI_TRB_TYPE_ADDRESS_DEVICE, input_ctx_phys);
                         if(ad) {
@@ -886,7 +886,7 @@ cmd_done:;
             }
             /* Bulk ring correlation for MSD BOT (compare to tracked TRB virtual pointers -> phys) */
             if(dev && (ctrl->msd_cbw_trb || ctrl->msd_data_trb || ctrl->msd_csw_trb)) {
-                /* Use cached physical TRB addresses (avoid repeated MmGetPhysicalAddress calls which may differ) */
+                /* Use cached physical TRB addresses (avoid repeated mm_get_physical_address calls which may differ) */
                 uint64_t cbw_phys = ctrl->msd_cbw_phys;
                 uint64_t data_phys = ctrl->msd_data_phys;
                 uint64_t csw_phys = ctrl->msd_csw_phys;
@@ -923,7 +923,7 @@ cmd_done:;
                             if(xhci_enqueue_bulk_in(ctrl, dev, ctrl->msd_pending_data_buf, ctrl->msd_pending_data_len) == ST_OK) {
                                 unsigned didx = (ctrl->bulk_in_enqueue - 1) % 16;
                                 ctrl->msd_data_trb = &((xhci_trb_t *)ctrl->bulk_in_ring)[didx];
-                                ctrl->msd_data_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)ctrl->msd_data_trb);
+                                ctrl->msd_data_phys = (unsigned long)mm_get_physical_address((uint64_t)ctrl->msd_data_trb);
                             }
                             ctrl->msd_pending_data_buf = 0;
                             ctrl->msd_pending_data_len = 0;
@@ -1083,7 +1083,7 @@ static int xhci_bulk_enqueue(xhci_controller_t *ctrl, void *ring_base, unsigned 
     }
     xhci_trb_t *ring = (xhci_trb_t *)ring_base;
     xhci_trb_t *trb = &ring[*enqueue_idx];
-    unsigned long phys = (unsigned long)MmGetPhysicalAddress((uint64_t)buf);
+    unsigned long phys = (unsigned long)mm_get_physical_address((uint64_t)buf);
     trb->param_lo = (uint32_t)(phys & 0xFFFFFFFFu);
     trb->param_hi = (uint32_t)(phys >> 32);
     trb->status = len;
@@ -1258,7 +1258,7 @@ static void xhci_configure_bulk_endpoints(xhci_controller_t *ctrl, usb_device_t 
         if(!ctrl->bulk_out_ring) {
             void *raw = kcalloc(1, 16 * sizeof(xhci_trb_t) + 64);
             if(raw) {
-                unsigned long raw_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)raw);
+                unsigned long raw_phys = (unsigned long)mm_get_physical_address((uint64_t)raw);
                 unsigned long av = ((unsigned long)raw + 63) & ~63UL;
                 unsigned long phys = raw_phys + (av - (unsigned long)raw);
                 ctrl->bulk_out_ring = (void *)av;
@@ -1291,7 +1291,7 @@ static void xhci_configure_bulk_endpoints(xhci_controller_t *ctrl, usb_device_t 
         if(!ctrl->bulk_in_ring) {
             void *raw = kcalloc(1, 16 * sizeof(xhci_trb_t) + 64);
             if(raw) {
-                unsigned long raw_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)raw);
+                unsigned long raw_phys = (unsigned long)mm_get_physical_address((uint64_t)raw);
                 unsigned long av = ((unsigned long)raw + 63) & ~63UL;
                 unsigned long phys = raw_phys + (av - (unsigned long)raw);
                 ctrl->bulk_in_ring = (void *)av;
@@ -1311,7 +1311,7 @@ static void xhci_configure_bulk_endpoints(xhci_controller_t *ctrl, usb_device_t 
         }
     }
     /* Issue Configure Endpoint command */
-    unsigned long ic_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)dev->input_ctx);
+    unsigned long ic_phys = (unsigned long)mm_get_physical_address((uint64_t)dev->input_ctx);
     xhci_trb_t *cfg = xhci_cmd_enqueue_nodoorbell(ctrl, XHCI_TRB_TYPE_CONFIG_ENDPOINT, ic_phys);
     if(cfg) {
         cfg->control |= (dev->slot_id & 0xFF) << 24;
@@ -1371,7 +1371,7 @@ void xhci_start_enumeration(xhci_controller_t *ctrl, struct usb_device *dev)
     ctrl->pending_xfer_stage = 1;
     xhci_ep0_build_setup(ctrl, t, USB_REQTYPE_DEVICE_TO_HOST,
         USB_REQ_GET_DESCRIPTOR, (USB_DESC_DEVICE << 8) | 0, 0, 8, 1);
-    buf8_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)buf8);
+    buf8_phys = (unsigned long)mm_get_physical_address((uint64_t)buf8);
     t[1].param_lo = (uint32_t)(buf8_phys & 0xFFFFFFFFu);
     t[1].param_hi = (uint32_t)(buf8_phys >> 32);
     t[1].status = 8;
@@ -1390,7 +1390,7 @@ void xhci_start_enumeration(xhci_controller_t *ctrl, struct usb_device *dev)
         xhci_trb_t *eval;
         icc[0] = 0;
         icc[1] = 0x3;
-        input_ctx_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)dev->input_ctx);
+        input_ctx_phys = (unsigned long)mm_get_physical_address((uint64_t)dev->input_ctx);
         eval = xhci_cmd_enqueue_nodoorbell(ctrl, XHCI_TRB_TYPE_EVAL_CONTEXT,
             input_ctx_phys);
         if (eval) {
@@ -1440,7 +1440,7 @@ void xhci_control_xfer_event(xhci_controller_t *ctrl, struct usb_device *dev,
             if (dev->input_ctx) {
                 volatile uint32_t *icc = (volatile uint32_t *)dev->input_ctx;
                 unsigned long ic_phys = (unsigned long)
-                    MmGetPhysicalAddress((uint64_t)dev->input_ctx);
+                    mm_get_physical_address((uint64_t)dev->input_ctx);
                 xhci_trb_t *eval = xhci_cmd_enqueue_nodoorbell(ctrl,
                     XHCI_TRB_TYPE_EVAL_CONTEXT, ic_phys);
                 if (eval) {
@@ -1466,7 +1466,7 @@ void xhci_control_xfer_event(xhci_controller_t *ctrl, struct usb_device *dev,
             ctrl->pending_xfer_len = 18;
             xhci_ep0_build_setup(ctrl, t, USB_REQTYPE_DEVICE_TO_HOST,
                 USB_REQ_GET_DESCRIPTOR, (USB_DESC_DEVICE << 8) | 0, 0, 18, 1);
-            buf18_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)buf18);
+            buf18_phys = (unsigned long)mm_get_physical_address((uint64_t)buf18);
             t[1].param_lo = (uint32_t)(buf18_phys & 0xFFFFFFFFu);
             t[1].param_hi = (uint32_t)(buf18_phys >> 32);
             t[1].status = 18;
@@ -1508,7 +1508,7 @@ void xhci_control_xfer_event(xhci_controller_t *ctrl, struct usb_device *dev,
             ctrl->pending_xfer_len = 9;
             xhci_ep0_build_setup(ctrl, t, USB_REQTYPE_DEVICE_TO_HOST,
                 USB_REQ_GET_DESCRIPTOR, (USB_DESC_CONFIGURATION << 8) | 0, 0, 9, 1);
-            cfg9_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)cfg9);
+            cfg9_phys = (unsigned long)mm_get_physical_address((uint64_t)cfg9);
             t[1].param_lo = (uint32_t)(cfg9_phys & 0xFFFFFFFFu);
             t[1].param_hi = (uint32_t)(cfg9_phys >> 32);
             t[1].status = 9;
@@ -1550,7 +1550,7 @@ void xhci_control_xfer_event(xhci_controller_t *ctrl, struct usb_device *dev,
             xhci_ep0_build_setup(ctrl, t, USB_REQTYPE_DEVICE_TO_HOST,
                 USB_REQ_GET_DESCRIPTOR, (USB_DESC_CONFIGURATION << 8) | 0, 0,
                 total_len, 1);
-            cfg_phys = (unsigned long)MmGetPhysicalAddress((uint64_t)cfg_full);
+            cfg_phys = (unsigned long)mm_get_physical_address((uint64_t)cfg_full);
             t[1].param_lo = (uint32_t)(cfg_phys & 0xFFFFFFFFu);
             t[1].param_hi = (uint32_t)(cfg_phys >> 32);
             t[1].status = total_len;

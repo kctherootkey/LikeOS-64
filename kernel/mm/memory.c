@@ -76,18 +76,18 @@ static void set_cr3(uint64_t cr3) {
 }
 
 // Flush TLB for specific address
-void MmFlushTLB(uint64_t virtual_addr) {
+void mm_flush_tlb(uint64_t virtual_addr) {
     __asm__ volatile ("invlpg (%0)" : : "r"(virtual_addr) : "memory");
 }
 
 // Flush all TLB entries
-void MmFlushAllTLB(void) {
+void mm_flush_all_tlb(void) {
     uint64_t cr3 = get_cr3();
     set_cr3(cr3);
 }
 
 // Get dynamic kernel heap start address
-uint64_t MmGetKernelHeapStart(void) {
+uint64_t mm_get_kernel_heap_start(void) {
     // Align kernel_end to page boundary and add some padding
     uint64_t kernel_end_addr = (uint64_t)kernel_end;
     return PAGE_ALIGN(kernel_end_addr);
@@ -139,13 +139,13 @@ static bool is_page_allocated(uint64_t page) {
 }
 
 // Initialize physical memory manager
-void MmInitializePhysicalMemory(uint64_t memory_size) {
+void mm_initialize_physical_memory(uint64_t memory_size) {
     kprintf("Initializing Physical Memory Manager...\n");
     
     // Calculate memory layout
     // Get kernel end virtual address and convert to physical
     uint64_t kernel_end_virt = (uint64_t)kernel_end;
-    uint64_t kernel_end_phys = MmGetPhysicalAddress(kernel_end_virt);
+    uint64_t kernel_end_phys = mm_get_physical_address(kernel_end_virt);
     
     if (kernel_end_phys == 0) {
         // Fallback: assume identity mapping offset
@@ -161,7 +161,7 @@ void MmInitializePhysicalMemory(uint64_t memory_size) {
     mm_state.bitmap_size = PAGE_ALIGN((mm_state.total_pages + 7) / 8);
     
     // Place bitmap after kernel heap area
-    uint64_t heap_start = MmGetKernelHeapStart();
+    uint64_t heap_start = mm_get_kernel_heap_start();
     mm_state.physical_bitmap = (uint32_t*)(heap_start + KERNEL_HEAP_SIZE);
     
     kprintf("  Kernel end virtual: %p\n", kernel_end);
@@ -183,16 +183,16 @@ void MmInitializePhysicalMemory(uint64_t memory_size) {
     mm_state.free_pages = mm_state.total_pages;
 
     // Reserve kernel memory areas
-    MmReserveKernelMemory();
+    mm_reserve_kernel_memory();
     
     kprintf("Physical Memory Manager initialized\n");
 }
 
 // Reserve kernel memory areas
-void MmReserveKernelMemory(void) {
+void mm_reserve_kernel_memory(void) {
     // Reserve kernel heap area (virtual heap area doesn't consume physical pages here)
     // The bitmap is what we need to reserve
-    uint64_t heap_start = MmGetKernelHeapStart();
+    uint64_t heap_start = mm_get_kernel_heap_start();
     uint64_t bitmap_start_page = ((uint64_t)mm_state.physical_bitmap - heap_start) / PAGE_SIZE;
     uint64_t bitmap_pages = mm_state.bitmap_size / PAGE_SIZE + 1;
     
@@ -214,7 +214,7 @@ void MmReserveKernelMemory(void) {
 }
 
 // Allocate a physical page
-uint64_t MmAllocatePhysicalPage(void) {
+uint64_t mm_allocate_physical_page(void) {
     if (mm_state.free_pages == 0) {
         return 0; // Out of memory
     }
@@ -231,7 +231,7 @@ uint64_t MmAllocatePhysicalPage(void) {
 }
 
 // Free a physical page
-void MmFreePhysicalPage(uint64_t physical_address) {
+void mm_free_physical_page(uint64_t physical_address) {
     if (physical_address < mm_state.memory_start || physical_address >= mm_state.memory_end) {
         return; // Invalid address
     }
@@ -246,7 +246,7 @@ void MmFreePhysicalPage(uint64_t physical_address) {
 }
 
 // Allocate contiguous physical pages
-uint64_t MmAllocateContiguousPages(size_t page_count) {
+uint64_t mm_allocate_contiguous_pages(size_t page_count) {
     if (page_count == 0 || mm_state.free_pages < page_count) {
         return 0;
     }
@@ -277,16 +277,16 @@ uint64_t MmAllocateContiguousPages(size_t page_count) {
 }
 
 // Free contiguous physical pages
-void MmFreeContiguousPages(uint64_t physical_address, size_t page_count) {
+void mm_free_contiguous_pages(uint64_t physical_address, size_t page_count) {
     for (size_t i = 0; i < page_count; i++) {
-        MmFreePhysicalPage(physical_address + (i * PAGE_SIZE));
+        mm_free_physical_page(physical_address + (i * PAGE_SIZE));
     }
 }
 
 // VIRTUAL MEMORY MANAGER IMPLEMENTATION
 
 // Get page table for virtual address
-uint64_t* MmGetPageTable(uint64_t virtual_addr, bool create) {
+uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
     uint64_t pml4_index = (virtual_addr >> 39) & 0x1FF;
     uint64_t pdpt_index = (virtual_addr >> 30) & 0x1FF;
     uint64_t pd_index = (virtual_addr >> 21) & 0x1FF;
@@ -297,7 +297,7 @@ uint64_t* MmGetPageTable(uint64_t virtual_addr, bool create) {
     
     uint64_t* pdpt = (uint64_t*)(mm_state.pml4_table[pml4_index] & ~0xFFF);
     if (!pdpt && create) {
-        uint64_t pdpt_phys = MmAllocatePhysicalPage();
+        uint64_t pdpt_phys = mm_allocate_physical_page();
         if (!pdpt_phys) {
             return NULL;
         }
@@ -311,7 +311,7 @@ uint64_t* MmGetPageTable(uint64_t virtual_addr, bool create) {
     
     uint64_t* pd = (uint64_t*)(pdpt[pdpt_index] & ~0xFFF);
     if (!pd && create) {
-        uint64_t pd_phys = MmAllocatePhysicalPage();
+        uint64_t pd_phys = mm_allocate_physical_page();
         if (!pd_phys) {
             return NULL;
         }
@@ -325,7 +325,7 @@ uint64_t* MmGetPageTable(uint64_t virtual_addr, bool create) {
     
     uint64_t* pt = (uint64_t*)(pd[pd_index] & ~0xFFF);
     if (!pt && create) {
-        uint64_t pt_phys = MmAllocatePhysicalPage();
+        uint64_t pt_phys = mm_allocate_physical_page();
         if (!pt_phys) {
             return NULL;
         }
@@ -338,11 +338,11 @@ uint64_t* MmGetPageTable(uint64_t virtual_addr, bool create) {
 }
 
 // Initialize virtual memory manager
-void MmInitializeVirtualMemory(void) {
+void mm_initialize_virtual_memory(void) {
     kprintf("Initializing Virtual Memory Manager...\n");
     
     mm_state.pml4_table = (uint64_t*)(get_cr3() & ~0xFFF);
-    uint64_t heap_start = MmGetKernelHeapStart();
+    uint64_t heap_start = mm_get_kernel_heap_start();
     mm_state.next_virtual_addr = heap_start + KERNEL_HEAP_SIZE + mm_state.bitmap_size;
     mm_state.next_virtual_addr = PAGE_ALIGN(mm_state.next_virtual_addr);
     
@@ -353,29 +353,29 @@ void MmInitializeVirtualMemory(void) {
 }
 
 // Map virtual page to physical page
-bool MmMapPage(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
-    uint64_t* pte = MmGetPageTable(virtual_addr, true);
+bool mm_map_page(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
+    uint64_t* pte = mm_get_page_table(virtual_addr, true);
     if (!pte) {
         return false;
     }
     
     *pte = (physical_addr & ~0xFFF) | flags;
-    MmFlushTLB(virtual_addr);
+    mm_flush_tlb(virtual_addr);
     return true;
 }
 
 // Unmap virtual page
-void MmUnmapPage(uint64_t virtual_addr) {
-    uint64_t* pte = MmGetPageTable(virtual_addr, false);
+void mm_unmap_page(uint64_t virtual_addr) {
+    uint64_t* pte = mm_get_page_table(virtual_addr, false);
     if (pte && (*pte & PAGE_PRESENT)) {
         *pte = 0;
-        MmFlushTLB(virtual_addr);
+        mm_flush_tlb(virtual_addr);
     }
 }
 
 // Get physical address for virtual address
-uint64_t MmGetPhysicalAddress(uint64_t virtual_addr) {
-    uint64_t* pte = MmGetPageTable(virtual_addr, false);
+uint64_t mm_get_physical_address(uint64_t virtual_addr) {
+    uint64_t* pte = mm_get_page_table(virtual_addr, false);
     if (pte && (*pte & PAGE_PRESENT)) {
         return (*pte & ~0xFFF) | (virtual_addr & 0xFFF);
     }
@@ -383,18 +383,18 @@ uint64_t MmGetPhysicalAddress(uint64_t virtual_addr) {
 }
 
 // Check if page is mapped
-bool MmIsPageMapped(uint64_t virtual_addr) {
-    uint64_t* pte = MmGetPageTable(virtual_addr, false);
+bool mm_is_page_mapped(uint64_t virtual_addr) {
+    uint64_t* pte = mm_get_page_table(virtual_addr, false);
     return pte && (*pte & PAGE_PRESENT);
 }
 
 // KERNEL HEAP ALLOCATOR IMPLEMENTATION
 
 // Initialize heap
-void MmInitializeHeap(void) {
+void mm_initialize_heap(void) {
     kprintf("Initializing Kernel Heap Allocator...\n");
 
-    uint64_t heap_start = MmGetKernelHeapStart();
+    uint64_t heap_start = mm_get_kernel_heap_start();
     mm_state.heap_start = (heap_block_t*) heap_start;
     mm_state.heap_size = KERNEL_HEAP_SIZE;
     mm_state.heap_end = (heap_block_t*)(heap_start + KERNEL_HEAP_SIZE);    
@@ -569,7 +569,7 @@ void* kcalloc(size_t count, size_t size) {
 // MEMORY STATISTICS AND DEBUGGING
 
 // Get memory statistics
-void MmGetMemoryStats(memory_stats_t* stats) {
+void mm_get_memory_stats(memory_stats_t* stats) {
     stats->total_memory = mm_state.memory_end - mm_state.memory_start;
     stats->free_memory = mm_state.free_pages * PAGE_SIZE;
     stats->used_memory = stats->total_memory - stats->free_memory;
@@ -583,9 +583,9 @@ void MmGetMemoryStats(memory_stats_t* stats) {
 }
 
 // Print memory statistics
-void MmPrintMemoryStats(void) {
+void mm_print_memory_stats(void) {
     memory_stats_t stats;
-    MmGetMemoryStats(&stats);
+    mm_get_memory_stats(&stats);
     
     kprintf("\n=== Memory Statistics ===\n");
     kprintf("Physical Memory:\n");
@@ -607,7 +607,7 @@ void MmPrintMemoryStats(void) {
 }
 
 // Validate heap integrity
-bool MmValidateHeap(void) {
+bool mm_validate_heap(void) {
     heap_block_t* current = mm_state.heap_start;
     uint32_t block_count = 0;
     
@@ -638,7 +638,7 @@ bool MmValidateHeap(void) {
 }
 
 // Print heap statistics
-void MmPrintHeapStats(void) {
+void mm_print_heap_stats(void) {
     kprintf("\n=== Heap Block Information ===\n");
     
     heap_block_t* current = mm_state.heap_start;
@@ -667,7 +667,7 @@ void MmPrintHeapStats(void) {
 }
 
 // Memory detection (simplified - assume 256MB minimum)
-void MmDetectMemory(void) {
+void mm_detect_memory(void) {
     // For now, we assume 256MB minimum as specified
     // In a real implementation, this would query BIOS memory map
     kprintf("Memory detection: Assuming 256MB minimum requirement\n");
@@ -678,7 +678,7 @@ void MmDetectMemory(void) {
 // ============================================================================
 
 // Get page table entry from a specific PML4, creating intermediate tables if needed
-uint64_t* MmGetPageTableFromPml4(uint64_t* pml4, uint64_t virtual_addr, bool create) {
+uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, bool create) {
     if (!pml4) {
         return NULL;
     }
@@ -694,7 +694,7 @@ uint64_t* MmGetPageTableFromPml4(uint64_t* pml4, uint64_t virtual_addr, bool cre
     uint64_t* pdpt;
     if (!(pml4[pml4_index] & PAGE_PRESENT)) {
         if (!create) return NULL;
-        uint64_t pdpt_phys = MmAllocatePhysicalPage();
+        uint64_t pdpt_phys = mm_allocate_physical_page();
         if (!pdpt_phys) return NULL;
         mm_memset((void*)pdpt_phys, 0, PAGE_SIZE);
         // For user space, set PAGE_USER on all levels
@@ -716,7 +716,7 @@ uint64_t* MmGetPageTableFromPml4(uint64_t* pml4, uint64_t virtual_addr, bool cre
     uint64_t* pd;
     if (!(pdpt[pdpt_index] & PAGE_PRESENT)) {
         if (!create) return NULL;
-        uint64_t pd_phys = MmAllocatePhysicalPage();
+        uint64_t pd_phys = mm_allocate_physical_page();
         if (!pd_phys) return NULL;
         mm_memset((void*)pd_phys, 0, PAGE_SIZE);
         uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE;
@@ -747,7 +747,7 @@ uint64_t* MmGetPageTableFromPml4(uint64_t* pml4, uint64_t virtual_addr, bool cre
         uint64_t old_flags = pd_entry & 0x1FFFFFULL;        // Keep old flags
         
         // Allocate a new page table
-        uint64_t pt_phys = MmAllocatePhysicalPage();
+        uint64_t pt_phys = mm_allocate_physical_page();
         if (!pt_phys) return NULL;
         
         pt = (uint64_t*)pt_phys;
@@ -771,7 +771,7 @@ uint64_t* MmGetPageTableFromPml4(uint64_t* pml4, uint64_t virtual_addr, bool cre
         pd[pd_index] = pt_phys | pd_flags;
     } else if (!(pd_entry & PAGE_PRESENT)) {
         if (!create) return NULL;
-        uint64_t pt_phys = MmAllocatePhysicalPage();
+        uint64_t pt_phys = mm_allocate_physical_page();
         if (!pt_phys) return NULL;
         mm_memset((void*)pt_phys, 0, PAGE_SIZE);
         uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE;
@@ -794,11 +794,11 @@ uint64_t* MmGetPageTableFromPml4(uint64_t* pml4, uint64_t virtual_addr, bool cre
 // Create a new user address space (PML4)
 // Shares kernel higher-half mappings (PML4[511]) with current address space
 // Also shares identity mapping (PML4[0-3]) for kernel stack access during interrupts
-uint64_t* MmCreateUserAddressSpace(void) {
+uint64_t* mm_create_user_address_space(void) {
     // Allocate PML4
-    uint64_t pml4_phys = MmAllocatePhysicalPage();
+    uint64_t pml4_phys = mm_allocate_physical_page();
     if (!pml4_phys) {
-        kprintf("MmCreateUserAddressSpace: Failed to allocate PML4\n");
+        kprintf("mm_create_user_address_space: Failed to allocate PML4\n");
         return NULL;
     }
     
@@ -820,9 +820,9 @@ uint64_t* MmCreateUserAddressSpace(void) {
     
     if (current_pml4[0] & PAGE_PRESENT) {
         // Allocate new PDPT for user's address space
-        uint64_t new_pdpt_phys = MmAllocatePhysicalPage();
+        uint64_t new_pdpt_phys = mm_allocate_physical_page();
         if (!new_pdpt_phys) {
-            MmFreePhysicalPage(pml4_phys);
+            mm_free_physical_page(pml4_phys);
             return NULL;
         }
         uint64_t* new_pdpt = (uint64_t*)new_pdpt_phys;
@@ -837,12 +837,12 @@ uint64_t* MmCreateUserAddressSpace(void) {
         for (int i = 0; i < 4; i++) {
             if (kernel_pdpt[i] & PAGE_PRESENT) {
                 // Allocate new PD for this 1GB region
-                uint64_t new_pd_phys = MmAllocatePhysicalPage();
+                uint64_t new_pd_phys = mm_allocate_physical_page();
                 if (!new_pd_phys) {
                     // Cleanup on failure - simplified, just fail
-                    kprintf("MmCreateUserAddressSpace: Failed to allocate PD[%d]\n", i);
-                    MmFreePhysicalPage(new_pdpt_phys);
-                    MmFreePhysicalPage(pml4_phys);
+                    kprintf("mm_create_user_address_space: Failed to allocate PD[%d]\n", i);
+                    mm_free_physical_page(new_pdpt_phys);
+                    mm_free_physical_page(pml4_phys);
                     return NULL;
                 }
                 uint64_t* new_pd = (uint64_t*)new_pd_phys;
@@ -879,13 +879,13 @@ uint64_t* MmCreateUserAddressSpace(void) {
 }
 
 // Destroy an address space and free all user pages
-void MmDestroyAddressSpace(uint64_t* pml4) {
+void mm_destroy_address_space(uint64_t* pml4) {
     if (!pml4) return;
     
     // Don't free if it's the kernel PML4
     uint64_t* kernel_pml4 = (uint64_t*)(get_cr3() & ~0xFFFULL);
     if (pml4 == kernel_pml4) {
-        kprintf("MmDestroyAddressSpace: Cannot destroy kernel PML4!\n");
+        kprintf("mm_destroy_address_space: Cannot destroy kernel PML4!\n");
         return;
     }
     
@@ -910,45 +910,45 @@ void MmDestroyAddressSpace(uint64_t* pml4) {
                                 for (int l = 0; l < 512; l++) {
                                     if (pt[l] & PAGE_PRESENT) {
                                         uint64_t phys = pt[l] & ~0xFFFULL;
-                                        MmFreePhysicalPage(phys);
+                                        mm_free_physical_page(phys);
                                     }
                                 }
                                 
                                 // Free the PT itself
-                                MmFreePhysicalPage((uint64_t)pt);
+                                mm_free_physical_page((uint64_t)pt);
                             }
                         }
                     }
                     
                     // Free the PD
-                    MmFreePhysicalPage((uint64_t)pd);
+                    mm_free_physical_page((uint64_t)pd);
                 }
             }
             
             // Free the PDPT
-            MmFreePhysicalPage((uint64_t)pdpt);
+            mm_free_physical_page((uint64_t)pdpt);
         }
     }
     
     // Free the PML4 itself
-    MmFreePhysicalPage((uint64_t)pml4);
+    mm_free_physical_page((uint64_t)pml4);
 }
 
 // Switch to a different address space
-void MmSwitchAddressSpace(uint64_t* pml4) {
+void mm_switch_address_space(uint64_t* pml4) {
     if (pml4) {
         set_cr3((uint64_t)pml4);
     }
 }
 
 // Get the current address space
-uint64_t* MmGetCurrentAddressSpace(void) {
+uint64_t* mm_get_current_address_space(void) {
     return (uint64_t*)(get_cr3() & ~0xFFFULL);
 }
 
 // Map a page in a specific address space
-bool MmMapPageInAddressSpace(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
-    uint64_t* pte = MmGetPageTableFromPml4(pml4, virtual_addr, true);
+bool mm_map_page_in_address_space(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
+    uint64_t* pte = mm_get_page_table_from_pml4(pml4, virtual_addr, true);
     if (!pte) {
         return false;
     }
@@ -956,24 +956,24 @@ bool MmMapPageInAddressSpace(uint64_t* pml4, uint64_t virtual_addr, uint64_t phy
     *pte = (physical_addr & ~0xFFFULL) | flags;
     
     // Flush TLB if this is the current address space
-    if (pml4 == MmGetCurrentAddressSpace()) {
-        MmFlushTLB(virtual_addr);
+    if (pml4 == mm_get_current_address_space()) {
+        mm_flush_tlb(virtual_addr);
     }
     
     return true;
 }
 
 // Map a user page with appropriate flags
-bool MmMapUserPage(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
+bool mm_map_user_page(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
     // Ensure user bit is set for user-space addresses
     if (virtual_addr < KERNEL_OFFSET) {
         flags |= PAGE_USER;
     }
-    return MmMapPageInAddressSpace(pml4, virtual_addr, physical_addr, flags);
+    return mm_map_page_in_address_space(pml4, virtual_addr, physical_addr, flags);
 }
 
 // Map a user stack region
-bool MmMapUserStack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
+bool mm_map_user_stack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
     if (!pml4 || stack_size == 0) {
         return false;
     }
@@ -983,10 +983,10 @@ bool MmMapUserStack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
     
     for (size_t i = 0; i < pages; i++) {
         uint64_t vaddr = stack_bottom + (i * PAGE_SIZE);
-        uint64_t phys = MmAllocatePhysicalPage();
+        uint64_t phys = mm_allocate_physical_page();
         
         if (!phys) {
-            kprintf("MmMapUserStack: Failed to allocate physical page %zu\n", i);
+            kprintf("mm_map_user_stack: Failed to allocate physical page %zu\n", i);
             // TODO: Unmap already-mapped pages
             return false;
         }
@@ -996,9 +996,9 @@ bool MmMapUserStack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
         
         // Map with user, writable flags (NX disabled until EFER.NXE is set)
         uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-        if (!MmMapPageInAddressSpace(pml4, vaddr, phys, flags)) {
-            kprintf("MmMapUserStack: Failed to map page at %p\n", (void*)vaddr);
-            MmFreePhysicalPage(phys);
+        if (!mm_map_page_in_address_space(pml4, vaddr, phys, flags)) {
+            kprintf("mm_map_user_stack: Failed to map page at %p\n", (void*)vaddr);
+            mm_free_physical_page(phys);
             return false;
         }
     }
@@ -1007,8 +1007,8 @@ bool MmMapUserStack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
 }
 
 // Get physical address from a specific PML4
-uint64_t MmGetPhysicalAddressFromPml4(uint64_t* pml4, uint64_t virtual_addr) {
-    uint64_t* pte = MmGetPageTableFromPml4(pml4, virtual_addr, false);
+uint64_t mm_get_physical_address_from_pml4(uint64_t* pml4, uint64_t virtual_addr) {
+    uint64_t* pte = mm_get_page_table_from_pml4(pml4, virtual_addr, false);
     if (pte && (*pte & PAGE_PRESENT)) {
         return (*pte & ~0xFFFULL) | (virtual_addr & 0xFFF);
     }
@@ -1016,8 +1016,8 @@ uint64_t MmGetPhysicalAddressFromPml4(uint64_t* pml4, uint64_t virtual_addr) {
 }
 
 // Get page flags for a virtual address
-uint64_t MmGetPageFlags(uint64_t virtual_addr) {
-    uint64_t* pte = MmGetPageTable(virtual_addr, false);
+uint64_t mm_get_page_flags(uint64_t virtual_addr) {
+    uint64_t* pte = mm_get_page_table(virtual_addr, false);
     if (pte) {
         return *pte & 0xFFF;  // Return just the flag bits
     }
@@ -1025,12 +1025,12 @@ uint64_t MmGetPageFlags(uint64_t virtual_addr) {
 }
 
 // Set page flags for a virtual address
-bool MmSetPageFlags(uint64_t virtual_addr, uint64_t flags) {
-    uint64_t* pte = MmGetPageTable(virtual_addr, false);
+bool mm_set_page_flags(uint64_t virtual_addr, uint64_t flags) {
+    uint64_t* pte = mm_get_page_table(virtual_addr, false);
     if (pte && (*pte & PAGE_PRESENT)) {
         uint64_t phys = *pte & ~0xFFFULL;
         *pte = phys | flags;
-        MmFlushTLB(virtual_addr);
+        mm_flush_tlb(virtual_addr);
         return true;
     }
     return false;
@@ -1041,22 +1041,22 @@ bool MmSetPageFlags(uint64_t virtual_addr, uint64_t flags) {
 // ============================================================================
 
 // Mark a page as copy-on-write (make it read-only with COW flag)
-bool MmMarkPageCOW(uint64_t virtual_addr) {
-    uint64_t* pte = MmGetPageTable(virtual_addr, false);
+bool mm_mark_page_cow(uint64_t virtual_addr) {
+    uint64_t* pte = mm_get_page_table(virtual_addr, false);
     if (!pte || !(*pte & PAGE_PRESENT)) {
         return false;
     }
     
     // Remove writable, add COW marker
     *pte = (*pte & ~PAGE_WRITABLE) | PAGE_COW;
-    MmFlushTLB(virtual_addr);
+    mm_flush_tlb(virtual_addr);
     return true;
 }
 
 // Handle a COW page fault - allocate new page and copy contents
-bool MmHandleCOWFault(uint64_t fault_addr) {
+bool mm_handle_cow_fault(uint64_t fault_addr) {
     uint64_t page_addr = fault_addr & ~0xFFFULL;
-    uint64_t* pte = MmGetPageTable(page_addr, false);
+    uint64_t* pte = mm_get_page_table(page_addr, false);
     
     if (!pte || !(*pte & PAGE_PRESENT)) {
         return false;
@@ -1070,9 +1070,9 @@ bool MmHandleCOWFault(uint64_t fault_addr) {
     uint64_t old_phys = *pte & ~0xFFFULL;
     
     // Allocate a new physical page
-    uint64_t new_phys = MmAllocatePhysicalPage();
+    uint64_t new_phys = mm_allocate_physical_page();
     if (!new_phys) {
-        kprintf("MmHandleCOWFault: Failed to allocate new page\n");
+        kprintf("mm_handle_cow_fault: Failed to allocate new page\n");
         return false;
     }
     
@@ -1084,7 +1084,7 @@ bool MmHandleCOWFault(uint64_t fault_addr) {
     flags |= PAGE_WRITABLE;
     *pte = new_phys | flags;
     
-    MmFlushTLB(page_addr);
+    mm_flush_tlb(page_addr);
     
     // Note: In a real implementation, we'd track reference counts
     // and only free the old page when refcount reaches 0
@@ -1093,13 +1093,13 @@ bool MmHandleCOWFault(uint64_t fault_addr) {
 }
 
 // Clone an address space for fork() - uses COW for efficiency
-uint64_t* MmCloneAddressSpace(uint64_t* src_pml4) {
+uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
     if (!src_pml4) {
         return NULL;
     }
     
     // Create new address space
-    uint64_t* new_pml4 = MmCreateUserAddressSpace();
+    uint64_t* new_pml4 = mm_create_user_address_space();
     if (!new_pml4) {
         return NULL;
     }
@@ -1111,7 +1111,7 @@ uint64_t* MmCloneAddressSpace(uint64_t* src_pml4) {
             uint64_t* src_pdpt = (uint64_t*)(src_pml4[i] & ~0xFFFULL);
             
             // Allocate PDPT for new address space
-            uint64_t pdpt_phys = MmAllocatePhysicalPage();
+            uint64_t pdpt_phys = mm_allocate_physical_page();
             if (!pdpt_phys) goto fail;
             mm_memset((void*)pdpt_phys, 0, PAGE_SIZE);
             new_pml4[i] = pdpt_phys | (src_pml4[i] & 0xFFF);
@@ -1121,7 +1121,7 @@ uint64_t* MmCloneAddressSpace(uint64_t* src_pml4) {
                 if (src_pdpt[j] & PAGE_PRESENT) {
                     uint64_t* src_pd = (uint64_t*)(src_pdpt[j] & ~0xFFFULL);
                     
-                    uint64_t pd_phys = MmAllocatePhysicalPage();
+                    uint64_t pd_phys = mm_allocate_physical_page();
                     if (!pd_phys) goto fail;
                     mm_memset((void*)pd_phys, 0, PAGE_SIZE);
                     new_pdpt[j] = pd_phys | (src_pdpt[j] & 0xFFF);
@@ -1135,7 +1135,7 @@ uint64_t* MmCloneAddressSpace(uint64_t* src_pml4) {
                             } else {
                                 uint64_t* src_pt = (uint64_t*)(src_pd[k] & ~0xFFFULL);
                                 
-                                uint64_t pt_phys = MmAllocatePhysicalPage();
+                                uint64_t pt_phys = mm_allocate_physical_page();
                                 if (!pt_phys) goto fail;
                                 mm_memset((void*)pt_phys, 0, PAGE_SIZE);
                                 new_pd[k] = pt_phys | (src_pd[k] & 0xFFF);
@@ -1158,12 +1158,12 @@ uint64_t* MmCloneAddressSpace(uint64_t* src_pml4) {
     }
     
     // Flush TLB for source address space
-    MmFlushAllTLB();
+    mm_flush_all_tlb();
     
     return new_pml4;
     
 fail:
-    MmDestroyAddressSpace(new_pml4);
+    mm_destroy_address_space(new_pml4);
     return NULL;
 }
 
@@ -1196,7 +1196,7 @@ static inline void wrmsr(uint32_t msr, uint64_t value) {
 extern void syscall_entry(void);
 
 // Initialize SYSCALL/SYSRET
-void MmInitializeSyscall(void) {
+void mm_initialize_syscall(void) {
     // Enable SCE (System Call Extensions) in EFER
     uint64_t efer = rdmsr(MSR_EFER);
     efer |= 1;  // Set SCE bit

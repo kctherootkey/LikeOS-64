@@ -37,7 +37,7 @@ static inline void switch_address_space(task_t* prev, task_t* next) {
     }
     
     if (prev_pml4 != next_pml4) {
-        MmSwitchAddressSpace(next_pml4);
+        mm_switch_address_space(next_pml4);
     }
 }
 
@@ -52,7 +52,7 @@ static void enqueue_task(task_t* t) {
 }
 
 void sched_init(void) {
-    g_kernel_pml4 = MmGetCurrentAddressSpace();
+    g_kernel_pml4 = mm_get_current_address_space();
     g_default_kernel_stack = tss_get_kernel_stack();
     
     __asm__ volatile ("mov %%rsp, %0" : "=r"(g_bootstrap_task.sp));

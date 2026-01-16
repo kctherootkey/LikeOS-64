@@ -23,7 +23,7 @@
 #define KERNEL_OFFSET           0xFFFFFFFF80000000ULL  // Higher-half kernel base
 
 // Function to get dynamic kernel heap start address
-uint64_t MmGetKernelHeapStart(void);
+uint64_t mm_get_kernel_heap_start(void);
 
 // Page flags for virtual memory
 #define PAGE_PRESENT            0x001
@@ -108,62 +108,62 @@ typedef struct heap_block {
 } heap_block_t;
 
 // Physical Memory Manager
-void MmInitializePhysicalMemory(uint64_t memory_size);
-void MmInitializeFromBootInfo(boot_info_t* boot_info);
-uint64_t MmAllocatePhysicalPage(void);
-void MmFreePhysicalPage(uint64_t physical_address);
-uint64_t MmAllocateContiguousPages(size_t page_count);
-void MmFreeContiguousPages(uint64_t physical_address, size_t page_count);
+void mm_initialize_physical_memory(uint64_t memory_size);
+void mm_initialize_from_boot_info(boot_info_t* boot_info);
+uint64_t mm_allocate_physical_page(void);
+void mm_free_physical_page(uint64_t physical_address);
+uint64_t mm_allocate_contiguous_pages(size_t page_count);
+void mm_free_contiguous_pages(uint64_t physical_address, size_t page_count);
 
 // Virtual Memory Manager
-void MmInitializeVirtualMemory(void);
-bool MmMapPage(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags);
-bool MmMapPageInAddressSpace(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags);
-void MmUnmapPage(uint64_t virtual_addr);
-uint64_t MmGetPhysicalAddress(uint64_t virtual_addr);
-uint64_t MmGetPhysicalAddressFromPml4(uint64_t* pml4, uint64_t virtual_addr);
-bool MmIsPageMapped(uint64_t virtual_addr);
-uint64_t MmGetPageFlags(uint64_t virtual_addr);
-bool MmSetPageFlags(uint64_t virtual_addr, uint64_t flags);
+void mm_initialize_virtual_memory(void);
+bool mm_map_page(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags);
+bool mm_map_page_in_address_space(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags);
+void mm_unmap_page(uint64_t virtual_addr);
+uint64_t mm_get_physical_address(uint64_t virtual_addr);
+uint64_t mm_get_physical_address_from_pml4(uint64_t* pml4, uint64_t virtual_addr);
+bool mm_is_page_mapped(uint64_t virtual_addr);
+uint64_t mm_get_page_flags(uint64_t virtual_addr);
+bool mm_set_page_flags(uint64_t virtual_addr, uint64_t flags);
 
 // User Address Space Management
-uint64_t* MmCreateUserAddressSpace(void);
-void MmDestroyAddressSpace(uint64_t* pml4);
-void MmSwitchAddressSpace(uint64_t* pml4);
-uint64_t* MmGetCurrentAddressSpace(void);
-bool MmMapUserStack(uint64_t* pml4, uint64_t stack_top, size_t stack_size);
-bool MmMapUserPage(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags);
+uint64_t* mm_create_user_address_space(void);
+void mm_destroy_address_space(uint64_t* pml4);
+void mm_switch_address_space(uint64_t* pml4);
+uint64_t* mm_get_current_address_space(void);
+bool mm_map_user_stack(uint64_t* pml4, uint64_t stack_top, size_t stack_size);
+bool mm_map_user_page(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags);
 
 // Copy-on-Write support
-bool MmMarkPageCOW(uint64_t virtual_addr);
-bool MmHandleCOWFault(uint64_t fault_addr);
-uint64_t* MmCloneAddressSpace(uint64_t* src_pml4);
+bool mm_mark_page_cow(uint64_t virtual_addr);
+bool mm_handle_cow_fault(uint64_t fault_addr);
+uint64_t* mm_clone_address_space(uint64_t* src_pml4);
 
 // Kernel Heap Allocator
-void MmInitializeHeap(void);
+void mm_initialize_heap(void);
 void* kalloc(size_t size);
 void kfree(void* ptr);
 void* krealloc(void* ptr, size_t new_size);
 void* kcalloc(size_t count, size_t size);
 
 // Memory utilities
-void MmGetMemoryStats(memory_stats_t* stats);
-void MmPrintMemoryStats(void);
-void MmPrintHeapStats(void);
-bool MmValidateHeap(void);
+void mm_get_memory_stats(memory_stats_t* stats);
+void mm_print_memory_stats(void);
+void mm_print_heap_stats(void);
+bool mm_validate_heap(void);
 
 // Memory detection and initialization
-void MmDetectMemory(void);
-void MmReserveKernelMemory(void);
+void mm_detect_memory(void);
+void mm_reserve_kernel_memory(void);
 
 // Page table management
-uint64_t* MmGetPageTable(uint64_t virtual_addr, bool create);
-uint64_t* MmGetPageTableFromPml4(uint64_t* pml4, uint64_t virtual_addr, bool create);
-void MmFlushTLB(uint64_t virtual_addr);
-void MmFlushAllTLB(void);
+uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create);
+uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, bool create);
+void mm_flush_tlb(uint64_t virtual_addr);
+void mm_flush_all_tlb(void);
 
 // SYSCALL/SYSRET configuration
-void MmInitializeSyscall(void);
+void mm_initialize_syscall(void);
 
 // Memory utility functions
 void mm_memset(void* dest, int val, size_t len);
