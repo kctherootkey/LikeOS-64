@@ -117,6 +117,7 @@ void mm_free_contiguous_pages(uint64_t physical_address, size_t page_count);
 
 // Virtual Memory Manager
 void mm_initialize_virtual_memory(void);
+void mm_remap_kernel_with_nx(void);
 bool mm_map_page(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags);
 bool mm_map_page_in_address_space(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags);
 void mm_unmap_page(uint64_t virtual_addr);
@@ -169,6 +170,17 @@ void mm_memset(void* dest, int val, size_t len);
 void mm_memcpy(void* dest, const void* src, size_t len);
 
 // External linker symbols
+extern char kernel_text_start[];
+extern char kernel_text_end[];
+extern char kernel_rodata_start[];
+extern char kernel_rodata_end[];
+extern char kernel_data_start[];
+extern char kernel_data_end[];
+extern char kernel_bss_start[];
+extern char kernel_bss_end[];
 extern char kernel_end[];
+
+// Enable NX bit support
+void mm_enable_nx(void);
 
 #endif // _KERNEL_MEMORY_H_

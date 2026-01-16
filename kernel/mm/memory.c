@@ -352,6 +352,62 @@ void mm_initialize_virtual_memory(void) {
     kprintf("Virtual Memory Manager initialized\n");
 }
 
+// Remap kernel sections with proper NX permissions
+void mm_remap_kernel_with_nx(void) {
+    kprintf("Remapping kernel with NX permissions...\n");
+    
+    uint64_t text_start = (uint64_t)kernel_text_start;
+    uint64_t text_end = (uint64_t)kernel_text_end;
+    uint64_t rodata_start = (uint64_t)kernel_rodata_start;
+    uint64_t rodata_end = (uint64_t)kernel_rodata_end;
+    uint64_t data_start = (uint64_t)kernel_data_start;
+    uint64_t data_end = (uint64_t)kernel_data_end;
+    uint64_t bss_start = (uint64_t)kernel_bss_start;
+    uint64_t bss_end = (uint64_t)kernel_bss_end;
+    
+    kprintf("  .text:   %p - %p (R-X)\n", (void*)text_start, (void*)text_end);
+    kprintf("  .rodata: %p - %p (R--)\n", (void*)rodata_start, (void*)rodata_end);
+    kprintf("  .data:   %p - %p (RW-)\n", (void*)data_start, (void*)data_end);
+    kprintf("  .bss:    %p - %p (RW-)\n", (void*)bss_start, (void*)bss_end);
+    
+    // Remap .text section: Present + Executable (no NX bit)
+    for (uint64_t addr = PAGE_ALIGN_DOWN(text_start); addr < text_end; addr += PAGE_SIZE) {
+        uint64_t phys = mm_get_physical_address(addr);
+        if (phys) {
+            mm_set_page_flags(addr, PAGE_PRESENT | PAGE_GLOBAL);
+        }
+    }
+    
+    // Remap .rodata section: Present + Non-Executable (NX bit set)
+    for (uint64_t addr = PAGE_ALIGN_DOWN(rodata_start); addr < rodata_end; addr += PAGE_SIZE) {
+        uint64_t phys = mm_get_physical_address(addr);
+        if (phys) {
+            mm_set_page_flags(addr, PAGE_PRESENT | PAGE_GLOBAL | PAGE_NO_EXECUTE);
+        }
+    }
+    
+    // Remap .data section: Present + Writable + Non-Executable
+    for (uint64_t addr = PAGE_ALIGN_DOWN(data_start); addr < data_end; addr += PAGE_SIZE) {
+        uint64_t phys = mm_get_physical_address(addr);
+        if (phys) {
+            mm_set_page_flags(addr, PAGE_PRESENT | PAGE_WRITABLE | PAGE_GLOBAL | PAGE_NO_EXECUTE);
+        }
+    }
+    
+    // Remap .bss section: Present + Writable + Non-Executable
+    for (uint64_t addr = PAGE_ALIGN_DOWN(bss_start); addr < bss_end; addr += PAGE_SIZE) {
+        uint64_t phys = mm_get_physical_address(addr);
+        if (phys) {
+            mm_set_page_flags(addr, PAGE_PRESENT | PAGE_WRITABLE | PAGE_GLOBAL | PAGE_NO_EXECUTE);
+        }
+    }
+    
+    // Flush all TLB entries to apply new permissions
+    mm_flush_all_tlb();
+    
+    kprintf("Kernel remapped with NX permissions\n");
+}
+
 // Map virtual page to physical page
 bool mm_map_page(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
     uint64_t* pte = mm_get_page_table(virtual_addr, true);
@@ -987,8 +1043,8 @@ bool mm_map_user_stack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
         // Zero the stack page
         mm_memset((void*)phys, 0, PAGE_SIZE);
         
-        // Map with user, writable flags (NX disabled until EFER.NXE is set)
-        uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+        // Map with user, writable, non-executable flags (stack should not be executable)
+        uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;
         if (!mm_map_page_in_address_space(pml4, vaddr, phys, flags)) {
             kprintf("mm_map_user_stack: Failed to map page at %p\n", (void*)vaddr);
             mm_free_physical_page(phys);
@@ -1012,16 +1068,20 @@ uint64_t mm_get_physical_address_from_pml4(uint64_t* pml4, uint64_t virtual_addr
 uint64_t mm_get_page_flags(uint64_t virtual_addr) {
     uint64_t* pte = mm_get_page_table(virtual_addr, false);
     if (pte) {
-        return *pte & 0xFFF;  // Return just the flag bits
+        // Return flags: bits 0-11 (low flags) and bit 63 (NX)
+        return (*pte & 0xFFFULL) | (*pte & PAGE_NO_EXECUTE);
     }
     return 0;
 }
+
+// Physical address mask: bits 12-51 contain the physical page frame
+#define PTE_PHYS_MASK 0x000FFFFFFFFFF000ULL
 
 // Set page flags for a virtual address
 bool mm_set_page_flags(uint64_t virtual_addr, uint64_t flags) {
     uint64_t* pte = mm_get_page_table(virtual_addr, false);
     if (pte && (*pte & PAGE_PRESENT)) {
-        uint64_t phys = *pte & ~0xFFFULL;
+        uint64_t phys = *pte & PTE_PHYS_MASK;  // Extract physical address (bits 12-51)
         *pte = phys | flags;
         mm_flush_tlb(virtual_addr);
         return true;
@@ -1187,6 +1247,14 @@ static inline void wrmsr(uint32_t msr, uint64_t value) {
 
 // Syscall entry point - defined in syscall.asm
 extern void syscall_entry(void);
+
+// Enable NX (No-Execute) bit support
+void mm_enable_nx(void) {
+    uint64_t efer = rdmsr(MSR_EFER);
+    efer |= (1ULL << 11);  // Set NXE (No-Execute Enable) bit
+    wrmsr(MSR_EFER, efer);
+    kprintf("NX bit enabled in EFER\n");
+}
 
 // Initialize SYSCALL/SYSRET
 void mm_initialize_syscall(void) {

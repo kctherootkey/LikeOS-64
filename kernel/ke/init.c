@@ -53,6 +53,10 @@ void KiSystemStartup(boot_info_t* boot_info) {
     mm_initialize_virtual_memory();
     mm_initialize_heap();
     mm_print_memory_stats();
+    
+    mm_enable_nx();
+    mm_remap_kernel_with_nx();
+    
     mm_initialize_syscall();
 
     pci_init();
@@ -127,7 +131,8 @@ static void spawn_user_test_task(void) {
     
     mm_memcpy((void*)code_phys, user_test_start, user_code_size);
     
-    uint64_t code_flags = PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE;
+    // Code page: user, executable (no NX bit for executable code)
+    uint64_t code_flags = PAGE_PRESENT | PAGE_USER;
     if (!mm_map_page_in_address_space(user_pml4, USER_CODE_VADDR, code_phys, code_flags)) {
         kprintf("ERROR: Failed to map user code page\n");
         mm_free_physical_page(code_phys);
