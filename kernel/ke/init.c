@@ -19,6 +19,7 @@
 void KiSystemStartup(boot_info_t* boot_info);
 void kernel_main(boot_info_t* boot_info);
 static void spawn_user_test_task(void);
+static void test_direct_iret_to_user(void);
 
 // External symbols for user test program (from user_test.asm)
 extern char user_test_start[];
@@ -122,21 +123,26 @@ void KiSystemStartup(boot_info_t* boot_info) {
     }
 
     // Initialize legacy PS/2 controller before keyboard driver (safe no-op if absent)
+    // Use PIC routing for legacy IRQs unless LAPIC is fully initialized.
     ps2_init();
-    if (ioapic_configure_legacy_irq(1, 0x21, IOAPIC_POLARITY_LOW, IOAPIC_TRIGGER_EDGE) != 0) {
-        kprintf("IOAPIC: keyboard redirection not configured (absent or unmapped)\n");
-    }
     keyboard_init();
+    irq_enable(0);
     irq_enable(1);
+    irq_enable(2); // Cascade line for slave PIC
 
     // Initialize mouse
     mouse_init();
-    irq_enable(2);
     irq_enable(12);
 
     // Enable interrupts after everything is initialized
     __asm__ volatile ("sti");
     kprintf("Interrupts enabled!\n");
+
+    // One-time software IRQ test to verify IRQ handler path
+    extern volatile uint64_t g_irq0_count;
+    kprintf("Testing IRQ0 delivery...\n");
+    __asm__ volatile ("int $0x20");
+    kprintf("IRQ0 count after test: %llu\n", g_irq0_count);
 
     // Initialize scheduler (cooperative mode)
     sched_init();
@@ -145,6 +151,27 @@ void KiSystemStartup(boot_info_t* boot_info) {
     timer_init(100);
     timer_start();
 
+    // NOTE: test_direct_iret_to_user() is a destructive test that never returns.
+    // It performs a raw IRET to user mode, bypassing the scheduler entirely.
+    // This breaks the kernel execution flow. Use spawn_user_test_task() instead,
+    // which properly integrates with the scheduler.
+    // kprintf("\n=== Direct IRET to User Mode Test ===\n");
+    // test_direct_iret_to_user();
+
+    // Clear debug registers that may have been left by UEFI
+    // This prevents spurious Debug exceptions (INT 1)
+    __asm__ volatile (
+        "xor %%rax, %%rax\n\t"
+        "mov %%rax, %%dr0\n\t"
+        "mov %%rax, %%dr1\n\t"
+        "mov %%rax, %%dr2\n\t"
+        "mov %%rax, %%dr3\n\t"
+        "mov %%rax, %%dr6\n\t"
+        "mov %%rax, %%dr7\n\t"
+        : : : "rax"
+    );
+    kprintf("Debug registers cleared\n");
+
     // Spawn user mode test task
     spawn_user_test_task();
 
@@ -152,16 +179,88 @@ void KiSystemStartup(boot_info_t* boot_info) {
     shell_init();
 
     while (1) {
+        __asm__ volatile ("sti");
         int handled_input = shell_tick();
         xhci_boot_poll(&g_xhci_boot);
         storage_fs_poll(&g_storage_state);
         sched_run_ready();
 
+        static uint64_t last_irq0 = 0;
+        extern volatile uint64_t g_irq0_count;
+        extern volatile uint64_t g_irq1_count;
+        extern volatile uint64_t g_irq12_count;
+        if (g_irq0_count - last_irq0 >= 100) {
+            last_irq0 = g_irq0_count;
+            kprintf("[IRQ] timer=%llu keyboard=%llu mouse=%llu\n",
+                    g_irq0_count, g_irq1_count, g_irq12_count);
+        }
+
         // Halt CPU when idle to avoid spinning at 100% while waiting for input
         if (!handled_input) {
+            __asm__ volatile ("sti");
             __asm__ volatile ("hlt");
         }
     }
+}
+
+// Direct test: IRET to user mode without scheduler
+// This tests if IRET itself is working correctly
+static void test_direct_iret_to_user(void) {
+    // Create a user address space
+    uint64_t* user_pml4 = MmCreateUserAddressSpace();
+    if (!user_pml4) {
+        kprintf("Failed to create user PML4\n");
+        return;
+    }
+    
+    // Allocate and map user code page
+    #define USER_CODE_VADDR 0x400000
+    uint64_t code_phys = MmAllocatePhysicalPage();
+    if (!code_phys) {
+        kprintf("Failed to allocate code page\n");
+        return;
+    }
+    
+    // Copy user code
+    size_t user_code_size = (size_t)(user_test_end - user_test_start);
+    mm_memcpy((void*)code_phys, user_test_start, user_code_size);
+    
+    // Map the code page
+    uint64_t code_flags = PAGE_PRESENT | PAGE_USER | PAGE_WRITABLE;
+    MmMapPageInAddressSpace(user_pml4, USER_CODE_VADDR, code_phys, code_flags);
+    
+    // Map user stack
+    #define USER_STACK_TOP_TEST 0x800000ULL
+    MmMapUserStack(user_pml4, USER_STACK_TOP_TEST, 16 * 1024);
+    
+    // Verify the mappings
+    uint64_t* pte = MmGetPageTableFromPml4(user_pml4, USER_CODE_VADDR, false);
+    kprintf("Direct test: code PTE = %p\n", pte ? (void*)*pte : 0);
+    
+    // Switch to user's CR3
+    kprintf("Direct test: switching CR3 to %p\n", user_pml4);
+    MmSwitchAddressSpace(user_pml4);
+    
+    // Now do IRET directly
+    // User RIP = 0x400000
+    // User CS = 0x23
+    // User RFLAGS = 0x202
+    // User RSP = 0x7ffff8
+    // User SS = 0x1b
+    kprintf("Direct test: about to IRET to user mode (RIP=0x400000)\n");
+    
+    __asm__ volatile (
+        "cli\n\t"                       // Disable interrupts
+        "push $0x1b\n\t"                // SS
+        "push $0x7ffff8\n\t"            // RSP
+        "push $0x202\n\t"               // RFLAGS
+        "push $0x23\n\t"                // CS
+        "push $0x400000\n\t"            // RIP
+        "iretq\n\t"
+    );
+    
+    // Should never reach here
+    kprintf("ERROR: Returned from user mode!\n");
 }
 
 // Spawn a user-mode test task

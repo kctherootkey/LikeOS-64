@@ -27,10 +27,16 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
             if (cur) {
                 cur->state = TASK_ZOMBIE;
             }
-            // Yield to next task
+            // Yield to next task - never returns for exiting task
+            __asm__ volatile ("sti");
             sched_yield();
-            // Should not return
-            return 0;
+            // Should NEVER reach here - the context switch should not return
+            // If we get here, something is very wrong
+            kprintf("FATAL: SYS_EXIT sched_yield returned!\n");
+            for (;;) {
+                __asm__ volatile ("cli; hlt");
+            }
+            return 0;  // Never reached
         }
         
         case SYS_WRITE: {
@@ -61,6 +67,7 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
         
         case SYS_YIELD: {
             // Yield CPU to other tasks
+            __asm__ volatile ("sti");
             sched_yield();
             return 0;
         }

@@ -807,24 +807,75 @@ uint64_t* MmCreateUserAddressSpace(void) {
     
     uint64_t* current_pml4 = (uint64_t*)(get_cr3() & ~0xFFFULL);
     
-    // Copy identity mapping entries (PML4[0-3] cover 0-4GB)
-    // These are needed so the kernel can access the stack during context switch
-    // and interrupt handling. These entries are SUPERVISOR ONLY (no PAGE_USER)
-    // so user code cannot access them, but kernel code can.
-    for (int i = 0; i < 4; i++) {
+    // We need identity mapping (PML4[0-3]) for kernel stack access when running
+    // with user's CR3. However, we can't just share the kernel's page tables
+    // because mapping user pages would corrupt them.
+    //
+    // Solution: Deep copy the page table hierarchy for PML4[0] (covers 0-512GB).
+    // This allows the kernel to access low memory while user mappings get their
+    // own page tables.
+    //
+    // For PML4[0], we copy the PDPT, and for each 1GB region (PDPT entries 0-3),
+    // we copy the PD. This way user mappings in 0-4GB get their own PD/PT.
+    
+    if (current_pml4[0] & PAGE_PRESENT) {
+        // Allocate new PDPT for user's address space
+        uint64_t new_pdpt_phys = MmAllocatePhysicalPage();
+        if (!new_pdpt_phys) {
+            MmFreePhysicalPage(pml4_phys);
+            return NULL;
+        }
+        uint64_t* new_pdpt = (uint64_t*)new_pdpt_phys;
+        
+        uint64_t* kernel_pdpt = (uint64_t*)(current_pml4[0] & ~0xFFFULL);
+        
+        // Copy all 512 PDPT entries initially (preserves identity mapping structure)
+        mm_memcpy(new_pdpt, kernel_pdpt, PAGE_SIZE);
+        
+        // For the first 4 GB (PDPT entries 0-3), deep copy the PD structures
+        // so user page mappings don't corrupt kernel's identity mapping
+        for (int i = 0; i < 4; i++) {
+            if (kernel_pdpt[i] & PAGE_PRESENT) {
+                // Allocate new PD for this 1GB region
+                uint64_t new_pd_phys = MmAllocatePhysicalPage();
+                if (!new_pd_phys) {
+                    // Cleanup on failure - simplified, just fail
+                    kprintf("MmCreateUserAddressSpace: Failed to allocate PD[%d]\n", i);
+                    MmFreePhysicalPage(new_pdpt_phys);
+                    MmFreePhysicalPage(pml4_phys);
+                    return NULL;
+                }
+                uint64_t* new_pd = (uint64_t*)new_pd_phys;
+                uint64_t* kernel_pd = (uint64_t*)(kernel_pdpt[i] & ~0xFFFULL);
+                
+                // Copy PD entries (these are 2MB pages with PS bit, or pointers to PTs)
+                mm_memcpy(new_pd, kernel_pd, PAGE_SIZE);
+                
+                // Update PDPT to point to new PD (keep same flags)
+                uint64_t flags = kernel_pdpt[i] & 0xFFFULL;
+                new_pdpt[i] = new_pd_phys | flags;
+            }
+        }
+        
+        // Update PML4 to point to new PDPT (keep same flags, supervisor-only)
+        uint64_t pml4_flags = current_pml4[0] & 0xFFFULL;
+        new_pml4[0] = new_pdpt_phys | pml4_flags;
+    }
+    
+    // Copy PML4[1-3] directly (these are less likely to have user mappings)
+    // If user code is placed above 512GB this would need similar treatment
+    for (int i = 1; i < 4; i++) {
         if (current_pml4[i] & PAGE_PRESENT) {
-            // Copy as-is - the kernel's identity mapping is supervisor-only
             new_pml4[i] = current_pml4[i];
         }
     }
     
     // Copy PML4[511] - kernel higher-half mapping (supervisor only)
     // This allows kernel code to run while in user's address space
+    // It also provides access to kernel heap, stacks, etc.
     new_pml4[511] = current_pml4[511];
     
-    kprintf("MmCreateUserAddressSpace: Created PML4 at %p\n", new_pml4);
-    kprintf("  Copied PML4[0-3] (identity, supervisor) and PML4[511] (kernel) from kernel PML4=%p\n", 
-            current_pml4);
+    kprintf("MmCreateUserAddressSpace: Created PML4 at %p with deep-copied identity mapping\n", new_pml4);
     return new_pml4;
 }
 
@@ -1198,8 +1249,8 @@ void MmInitializeSyscall(void) {
     wrmsr(MSR_CSTAR, (uint64_t)syscall_entry);
     
     // Set SFMASK - RFLAGS bits to clear on SYSCALL
-    // Clear IF (disable interrupts), TF (no single-step), DF (clear direction)
-    wrmsr(MSR_SFMASK, 0x200 | 0x100 | 0x400);  // IF | TF | DF
+    // Clear TF (no single-step) and DF (clear direction), keep IF enabled
+    wrmsr(MSR_SFMASK, 0x100 | 0x400);  // TF | DF
     
     kprintf("SYSCALL/SYSRET initialized\n");
     kprintf("  STAR = 0x%016llx\n", star);

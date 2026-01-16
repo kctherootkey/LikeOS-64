@@ -17,44 +17,35 @@ global user_test_start
 global user_test_end
 
 user_test_start:
-    ; Entry point for user task
-    ; Simple test: write a message and exit
-
-    ; First, get our PID
+    ; Get our PID
     mov rax, SYS_GETPID
     syscall
-    ; RAX now has PID, save it
     mov r12, rax
     
     ; Write "Hello from user mode!" to stdout
-    mov rax, SYS_WRITE      ; syscall number
-    mov rdi, 1              ; fd = stdout
-    lea rsi, [rel msg]      ; buffer
-    mov rdx, msg_len        ; length
+    mov rax, SYS_WRITE
+    mov rdi, 1
+    lea rsi, [rel msg]
+    mov rdx, msg_len
     syscall
 
     ; Loop a few times, yielding each time
-    mov r13, 3              ; loop counter
+    mov r13, 3
 .loop:
-    ; Yield to show cooperative scheduling works
     mov rax, SYS_YIELD
     syscall
-    
     dec r13
     jnz .loop
 
-    ; Exit with success
+    ; Exit
     mov rax, SYS_EXIT
-    mov rdi, 0              ; exit code 0
+    mov rdi, 0
     syscall
 
-    ; Should not reach here
 .hang:
     jmp .hang
 
-; Message to print
-msg:
-    db "[USER] Hello from user mode! Task running in Ring 3", 10, 0
+msg: db "[USER] Hello from user mode! Task running in Ring 3", 10
 msg_len equ $ - msg
 
 user_test_end:

@@ -5,6 +5,12 @@
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/types.h"
 
+// External assembly trampoline for IRET to user mode
+extern void user_mode_iret_trampoline(void);
+
+// External assembly context switch function
+extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
+
 #define SCHED_SLICE_TICKS 10
 
 static task_t g_bootstrap_task;
@@ -21,7 +27,6 @@ static inline int is_idle_task(const task_t* t) {
 }
 
 static void task_trampoline(void);
-static void user_trampoline(void);  // naked function for IRET to user mode
 static void idle_entry(void* arg);
 
 // Switch address space (CR3) if needed, and update TSS for user mode
@@ -46,29 +51,7 @@ static inline void switch_address_space(task_t* prev, task_t* next) {
     }
 }
 
-// Minimal context switch: save/restore callee-saved regs + return address
-// naked attribute prevents compiler from generating prologue/epilogue
-__attribute__((naked))
-static void ctx_switch(uint64_t** old_sp, uint64_t* new_sp) {
-    // old_sp in %rdi, new_sp in %rsi (System V AMD64 ABI)
-    __asm__ volatile(
-        "pushq %%rbp\n\t"
-        "pushq %%rbx\n\t"
-        "pushq %%r12\n\t"
-        "pushq %%r13\n\t"
-        "pushq %%r14\n\t"
-        "pushq %%r15\n\t"
-        "movq %%rsp, (%%rdi)\n\t"
-        "movq %%rsi, %%rsp\n\t"
-        "popq %%r15\n\t"
-        "popq %%r14\n\t"
-        "popq %%r13\n\t"
-        "popq %%r12\n\t"
-        "popq %%rbx\n\t"
-        "popq %%rbp\n\t"
-        "ret\n\t"
-        ::: "memory");
-}
+// ctx_switch is now implemented in assembly (syscall.asm) as ctx_switch_asm
 
 static void enqueue_task(task_t* t) {
     if (!g_current) {
@@ -166,6 +149,9 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
     uint64_t* k_sp = (uint64_t*)(k_stack_mem + 4096);
     k_sp = (uint64_t*)((uint64_t)k_sp & ~0xFUL); // align
     
+    kprintf("DEBUG: Setting up user task kernel stack at %p (top=%p)\n", 
+            k_stack_mem, k_sp);
+    
     // Set up IRET frame for returning to user mode
     // Stack layout for IRET (in order of pop): SS, RSP, RFLAGS, CS, RIP
     // GDT layout (for SYSRET compatibility):
@@ -179,13 +165,30 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
     *(--k_sp) = (uint64_t)entry;         // RIP (entry point in user space)
     
     // Callee-saved registers and return address to user trampoline (naked IRET)
-    *(--k_sp) = (uint64_t)user_trampoline; // return RIP - naked function that does IRET
+    *(--k_sp) = (uint64_t)user_mode_iret_trampoline; // return RIP - asm function that does IRET
     *(--k_sp) = 0; // rbp
     *(--k_sp) = 0; // rbx
     *(--k_sp) = 0; // r12
     *(--k_sp) = 0; // r13
     *(--k_sp) = 0; // r14
     *(--k_sp) = 0; // r15
+
+    // Debug: dump the stack layout
+    kprintf("DEBUG: Stack layout (top to bottom):\n");
+    uint64_t* ptr = k_sp;
+    kprintf("  [%p] r15     = %p\n", ptr, (void*)ptr[0]); ptr++;
+    kprintf("  [%p] r14     = %p\n", ptr, (void*)ptr[0]); ptr++;
+    kprintf("  [%p] r13     = %p\n", ptr, (void*)ptr[0]); ptr++;
+    kprintf("  [%p] r12     = %p\n", ptr, (void*)ptr[0]); ptr++;
+    kprintf("  [%p] rbx     = %p\n", ptr, (void*)ptr[0]); ptr++;
+    kprintf("  [%p] rbp     = %p\n", ptr, (void*)ptr[0]); ptr++;
+    kprintf("  [%p] ret_rip = %p (user_mode_iret_trampoline)\n", ptr, (void*)ptr[0]); ptr++;
+    kprintf("  [%p] RIP     = %p (entry=%p)\n", ptr, (void*)ptr[0], entry); ptr++;
+    kprintf("  [%p] CS      = %p\n", ptr, (void*)ptr[0]); ptr++;
+    kprintf("  [%p] RFLAGS  = %p\n", ptr, (void*)ptr[0]); ptr++;
+    kprintf("  [%p] RSP     = %p\n", ptr, (void*)ptr[0]); ptr++;
+    kprintf("  [%p] SS      = %p\n", ptr, (void*)ptr[0]);
+    kprintf("DEBUG: t->sp = %p\n", k_sp);
 
     t->sp = k_sp;
     t->pml4 = pml4;
@@ -252,7 +255,9 @@ void sched_yield(void) {
     }
     g_slice_accum = 0;
     task_t* next = pick_next(g_current);
+    kprintf("[YIELD] cur=%d next=%d\n", g_current->id, next->id);
     if (next == g_current) {
+        kprintf("[YIELD] same task, returning\n");
         return;
     }
     
@@ -264,13 +269,18 @@ void sched_yield(void) {
     
     task_t* prev = g_current;
     g_current = next;
-    prev->state = TASK_READY;
+    // Only set READY if task is not already ZOMBIE (exited)
+    if (prev->state != TASK_ZOMBIE) {
+        prev->state = TASK_READY;
+    }
     next->state = TASK_RUNNING;
     
     // Switch address space before context switch
     switch_address_space(prev, next);
     
-    ctx_switch(&prev->sp, next->sp);
+    kprintf("[YIELD] switching to task %d, sp=%p\n", next->id, next->sp);
+    ctx_switch_asm(&prev->sp, next->sp);
+    kprintf("[YIELD] returned from ctx_switch\n");
 }
 
 void sched_run_ready(void) {
@@ -299,13 +309,18 @@ void sched_run_ready(void) {
     
     task_t* prev = g_current;
     g_current = next;
-    prev->state = TASK_READY;
+    // Only set READY if task is not already ZOMBIE (exited)
+    if (prev->state != TASK_ZOMBIE) {
+        prev->state = TASK_READY;
+    }
     next->state = TASK_RUNNING;
     
     // Switch address space before context switch
     switch_address_space(prev, next);
     
-    ctx_switch(&prev->sp, next->sp);
+    kprintf("[RUN_READY] switching %d->%d, sp=%p\n", prev->id, next->id, next->sp);
+    ctx_switch_asm(&prev->sp, next->sp);
+    kprintf("[RUN_READY] returned from ctx_switch\n");
 }
 
 task_t* sched_current(void) {
@@ -318,14 +333,7 @@ void sched_debug_check(const char* label) {
             label, g_bootstrap_task.next, g_idle_task.next);
 }
 
-// Trampoline for user tasks - does IRET to ring 3
-// This is entered with IRET frame already on stack: RIP, CS, RFLAGS, RSP, SS
-__attribute__((naked))
-static void user_trampoline(void) {
-    __asm__ volatile (
-        "iretq\n\t"
-    );
-}
+// Note: user_mode_iret_trampoline is now in syscall.asm
 
 // Trampoline for kernel tasks - just calls entry function directly
 static void task_trampoline(void) {
@@ -344,7 +352,8 @@ static void task_trampoline(void) {
 
 static void idle_entry(void* arg) {
     (void)arg;
-    for (;;); {
+    for (;;) {
+        __asm__ volatile ("sti");
         __asm__ volatile ("hlt");
     }
 }

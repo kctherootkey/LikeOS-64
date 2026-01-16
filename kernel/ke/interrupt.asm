@@ -92,6 +92,7 @@ isr_common_stub:
     add rsp, 16
     
     ; Return from interrupt (interrupts automatically re-enabled)
+    sti
     iretq
 
 ; Common IRQ stub

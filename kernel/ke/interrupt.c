@@ -136,6 +136,16 @@ void pic_init() {
     kprintf("PIC initialized\n");
 }
 
+// Route legacy IRQs through PIC instead of APIC (IMCR)
+static void imcr_route_to_pic(void) {
+    // IMCR selector/data ports: 0x22/0x23, select register 0x70
+    outb(0x22, 0x70);
+    uint8_t val = inb(0x23);
+    val &= ~0x01; // bit0=0 => route to PIC
+    outb(0x23, val);
+    kprintf("IMCR set to PIC mode (val=0x%02x)\n", val);
+}
+
 // Set IDT entry
 void idt_set_entry(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags) {
     idt[num].offset_low = base & 0xFFFF;
@@ -354,7 +364,13 @@ void exception_handler(uint64_t *regs) {
 }
 
 // IRQ handler - called from assembly with register structure pointer
+volatile uint64_t g_irq0_count = 0;
+volatile uint64_t g_irq1_count = 0;
+volatile uint64_t g_irq12_count = 0;
 void irq_handler(uint64_t *regs) {
+    static int irq0_logged = 0;
+    static int irq1_logged = 0;
+    static int irq12_logged = 0;
     uint64_t int_no = regs[15]; // Interrupt number at offset 15*8 = 120
 
     // Send EOI
@@ -363,12 +379,27 @@ void irq_handler(uint64_t *regs) {
     // Handle specific IRQs
     switch (int_no) {
         case 32: // IRQ0 - Timer
+            g_irq0_count++;
+            if (!irq0_logged) {
+                irq0_logged = 1;
+                kprintf("[IRQ] timer delivered\n");
+            }
             timer_irq_handler();
             break;
         case 33: // IRQ1 - Keyboard
+            g_irq1_count++;
+            if (!irq1_logged) {
+                irq1_logged = 1;
+                kprintf("[IRQ] keyboard delivered\n");
+            }
             keyboard_irq_handler();
             break;
         case 44: // IRQ12 - PS/2 Mouse
+            g_irq12_count++;
+            if (!irq12_logged) {
+                irq12_logged = 1;
+                kprintf("[IRQ] mouse delivered\n");
+            }
             mouse_irq_handler();
             break;
         default: {
@@ -396,6 +427,9 @@ void interrupts_init() {
 
     // Initialize PIC
     pic_init();
+
+    // Ensure legacy IRQs are routed through PIC
+    imcr_route_to_pic();
 
     // Initialize IDT
     idt_init();
