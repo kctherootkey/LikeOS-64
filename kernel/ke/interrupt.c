@@ -3,6 +3,7 @@
 
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/xhci.h" // for xhci_controller_t and irq service
+#include "../../include/kernel/timer.h"
 
 // IDT table
 static struct idt_entry idt[IDT_ENTRIES];
@@ -343,6 +344,9 @@ void irq_handler(uint64_t *regs) {
 
     // Handle specific IRQs
     switch (int_no) {
+        case 32: // IRQ0 - Timer
+            timer_irq_handler();
+            break;
         case 33: // IRQ1 - Keyboard
             keyboard_irq_handler();
             break;

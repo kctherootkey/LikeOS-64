@@ -12,6 +12,8 @@
 #include "../../include/kernel/xhci_boot.h"
 #include "../../include/kernel/storage.h"
 #include "../../include/kernel/shell.h"
+#include "../../include/kernel/timer.h"
+#include "../../include/kernel/sched.h"
 
 // Function prototypes
 void KiSystemStartup(void);
@@ -112,6 +114,13 @@ void KiSystemStartup(void) {
     __asm__ volatile ("sti");
     kprintf("Interrupts enabled!\n");
 
+    // Initialize scheduler (cooperative mode)
+    sched_init();
+
+    // Initialize and start PIT timer (100 Hz)
+    timer_init(100);
+    timer_start();
+
     // Show ready prompt and enter shell loop
     shell_init();
 
@@ -119,6 +128,7 @@ void KiSystemStartup(void) {
         int handled_input = shell_tick();
         xhci_boot_poll(&g_xhci_boot);
         storage_fs_poll(&g_storage_state);
+        sched_run_ready();
 
         // Halt CPU when idle to avoid spinning at 100% while waiting for input
         if (!handled_input) {
