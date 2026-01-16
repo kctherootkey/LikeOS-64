@@ -666,13 +666,6 @@ void mm_print_heap_stats(void) {
     kprintf("==============================\n\n");
 }
 
-// Memory detection (simplified - assume 256MB minimum)
-void mm_detect_memory(void) {
-    // For now, we assume 256MB minimum as specified
-    // In a real implementation, this would query BIOS memory map
-    kprintf("Memory detection: Assuming 256MB minimum requirement\n");
-}
-
 // ============================================================================
 // USER ADDRESS SPACE MANAGEMENT
 // ============================================================================

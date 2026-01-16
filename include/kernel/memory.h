@@ -153,7 +153,6 @@ void mm_print_heap_stats(void);
 bool mm_validate_heap(void);
 
 // Memory detection and initialization
-void mm_detect_memory(void);
 void mm_reserve_kernel_memory(void);
 
 // Page table management

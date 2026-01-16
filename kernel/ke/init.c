@@ -49,7 +49,6 @@ void KiSystemStartup(boot_info_t* boot_info) {
         memory_size = 256 * 1024 * 1024;
     }
     
-    mm_detect_memory();
     mm_initialize_physical_memory(memory_size);
     mm_initialize_virtual_memory();
     mm_initialize_heap();
@@ -85,17 +84,6 @@ void KiSystemStartup(boot_info_t* boot_info) {
 
     timer_init(100);
     timer_start();
-
-    __asm__ volatile (
-        "xor %%rax, %%rax\n\t"
-        "mov %%rax, %%dr0\n\t"
-        "mov %%rax, %%dr1\n\t"
-        "mov %%rax, %%dr2\n\t"
-        "mov %%rax, %%dr3\n\t"
-        "mov %%rax, %%dr6\n\t"
-        "mov %%rax, %%dr7\n\t"
-        : : : "rax"
-    );
 
     spawn_user_test_task();
 
