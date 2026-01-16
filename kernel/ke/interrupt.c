@@ -404,17 +404,18 @@ void tss_init() {
     kprintf("  Stack size: %lu bytes\n", sizeof(interrupt_stack));
 
     // Verify addresses are within mapped memory range
+    // Bootloader maps 64MB of virtual memory starting at KERNEL_OFFSET
     uint64_t tss_addr = (uint64_t)&tss;
     uint64_t stack_addr = (uint64_t)interrupt_stack;
 
-    if (tss_addr >= 0xFFFFFFFF80000000 && tss_addr < 0xFFFFFFFF80000000 + (11 * 1024 * 1024)) {
-        kprintf("  TSS address is within mapped kernel space ✓\n");
+    if (tss_addr >= 0xFFFFFFFF80000000 && tss_addr < 0xFFFFFFFF80000000 + (64 * 1024 * 1024)) {
+        kprintf("  TSS address is within mapped kernel space\n");
     } else {
         kprintf("  WARNING: TSS address may be outside mapped memory!\n");
     }
 
-    if (stack_addr >= 0xFFFFFFFF80000000 && stack_addr < 0xFFFFFFFF80000000 + (11 * 1024 * 1024)) {
-        kprintf("  Interrupt stack is within mapped kernel space ✓\n");
+    if (stack_addr >= 0xFFFFFFFF80000000 && stack_addr < 0xFFFFFFFF80000000 + (64 * 1024 * 1024)) {
+        kprintf("  Interrupt stack is within mapped kernel space\n");
     } else {
         kprintf("  WARNING: Interrupt stack may be outside mapped memory!\n");
     }

@@ -52,7 +52,7 @@ void KiSystemStartup(void) {
     // Initialize memory management subsystem
     kprintf("\nInitializing Memory Management Subsystem...\n");
     MmDetectMemory();
-    MmInitializePhysicalMemory(32 * 1024 * 1024); // 32MB minimum requirement
+    MmInitializePhysicalMemory(256 * 1024 * 1024); // 256MB minimum requirement
     MmInitializeVirtualMemory();
     MmInitializeHeap();
     MmPrintMemoryStats();
