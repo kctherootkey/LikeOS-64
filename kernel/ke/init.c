@@ -109,8 +109,11 @@ void system_startup(boot_info_t* boot_info) {
 static void spawn_user_test_task(void) {
     size_t user_code_size = (size_t)(user_test_end - user_test_start);
     
-    if (user_code_size == 0 || user_code_size > 4096) {
-        kprintf("ERROR: Invalid user code size\n");
+    // Allow up to 64KB for user test program (16 pages)
+    #define USER_CODE_MAX_SIZE (64 * 1024)
+    
+    if (user_code_size == 0 || user_code_size > USER_CODE_MAX_SIZE) {
+        kprintf("ERROR: Invalid user code size (%u bytes)\n", (unsigned)user_code_size);
         return;
     }
     
@@ -122,30 +125,58 @@ static void spawn_user_test_task(void) {
     
     #define USER_CODE_VADDR 0x400000
     
-    uint64_t code_phys = mm_allocate_physical_page();
-    if (!code_phys) {
-        kprintf("ERROR: Failed to allocate physical page for user code\n");
-        mm_destroy_address_space(user_pml4);
-        return;
+    // Calculate number of pages needed
+    size_t pages_needed = (user_code_size + 4095) / 4096;
+    uint64_t code_phys_pages[16];  // Max 16 pages (64KB)
+    
+    for (size_t i = 0; i < pages_needed; i++) {
+        code_phys_pages[i] = mm_allocate_physical_page();
+        if (!code_phys_pages[i]) {
+            kprintf("ERROR: Failed to allocate physical page for user code\n");
+            for (size_t j = 0; j < i; j++) {
+                mm_free_physical_page(code_phys_pages[j]);
+            }
+            mm_destroy_address_space(user_pml4);
+            return;
+        }
     }
     
-    mm_memcpy((void*)code_phys, user_test_start, user_code_size);
-    
-    // Code page: user, executable (no NX bit for executable code)
-    uint64_t code_flags = PAGE_PRESENT | PAGE_USER;
-    if (!mm_map_page_in_address_space(user_pml4, USER_CODE_VADDR, code_phys, code_flags)) {
-        kprintf("ERROR: Failed to map user code page\n");
-        mm_free_physical_page(code_phys);
-        mm_destroy_address_space(user_pml4);
-        return;
+    // Copy user code to physical pages
+    uint8_t* src = (uint8_t*)user_test_start;
+    size_t remaining = user_code_size;
+    for (size_t i = 0; i < pages_needed; i++) {
+        size_t copy_size = (remaining > 4096) ? 4096 : remaining;
+        mm_memcpy((void*)code_phys_pages[i], src, copy_size);
+        src += copy_size;
+        remaining -= copy_size;
     }
     
-    #define USER_TEST_STACK_TOP  0x800000ULL
-    #define USER_TEST_STACK_SIZE (16 * 1024)
+    // User program pages: user, readable, writable, executable
+    // For simplicity, map all pages as RWX. A real loader would parse ELF sections.
+    uint64_t code_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+    for (size_t i = 0; i < pages_needed; i++) {
+        if (!mm_map_page_in_address_space(user_pml4, USER_CODE_VADDR + i * 4096, code_phys_pages[i], code_flags)) {
+            kprintf("ERROR: Failed to map user code page %u\n", (unsigned)i);
+            for (size_t j = 0; j < pages_needed; j++) {
+                mm_free_physical_page(code_phys_pages[j]);
+            }
+            mm_destroy_address_space(user_pml4);
+            return;
+        }
+    }
+    
+    kprintf("User code: %u bytes (%u pages) loaded at 0x%x\n", 
+            (unsigned)user_code_size, (unsigned)pages_needed, USER_CODE_VADDR);
+    
+    // Stack at 128MB - plenty of room for heap to grow from 5MB
+    #define USER_TEST_STACK_TOP  0x8000000ULL
+    #define USER_TEST_STACK_SIZE (64 * 1024)
     
     if (!mm_map_user_stack(user_pml4, USER_TEST_STACK_TOP, USER_TEST_STACK_SIZE)) {
         kprintf("ERROR: Failed to map user stack\n");
-        mm_free_physical_page(code_phys);
+        for (size_t j = 0; j < pages_needed; j++) {
+            mm_free_physical_page(code_phys_pages[j]);
+        }
         mm_destroy_address_space(user_pml4);
         return;
     }

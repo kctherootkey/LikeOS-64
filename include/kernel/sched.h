@@ -3,6 +3,16 @@
 #define _KERNEL_SCHED_H_
 
 #include "types.h"
+#include "vfs.h"
+
+// Forward declaration
+struct vfs_file;
+
+// Maximum file descriptors per task
+#define TASK_MAX_FDS    1024
+
+// Maximum memory regions per task (for mmap tracking)
+#define TASK_MAX_MMAP   64
 
 typedef void (*task_entry_t)(void* arg);
 
@@ -19,6 +29,17 @@ typedef enum {
     TASK_USER = 3      // Ring 3
 } task_privilege_t;
 
+// Memory region for mmap tracking
+typedef struct mmap_region {
+    uint64_t start;     // Virtual start address
+    uint64_t length;    // Length in bytes
+    uint64_t prot;      // Protection flags (PROT_READ, PROT_WRITE, PROT_EXEC)
+    uint64_t flags;     // MAP_ANONYMOUS, MAP_PRIVATE, etc.
+    int fd;             // File descriptor (-1 for anonymous)
+    uint64_t offset;    // Offset in file
+    bool in_use;        // Whether this slot is used
+} mmap_region_t;
+
 typedef struct task {
     uint64_t* sp;          // Saved stack pointer
     uint64_t* pml4;        // Page table base (CR3) - NULL for kernel tasks (uses kernel PML4)
@@ -32,6 +53,15 @@ typedef struct task {
     // User mode support
     uint64_t user_stack_top;    // User stack virtual address (for user tasks)
     uint64_t kernel_stack_top;  // Kernel stack for syscalls/interrupts (for user tasks)
+    
+    // File descriptor table
+    struct vfs_file* fd_table[TASK_MAX_FDS];
+    
+    // Memory management
+    uint64_t brk;               // Current program break (heap end)
+    uint64_t brk_start;         // Initial program break (heap start)
+    mmap_region_t mmap_regions[TASK_MAX_MMAP];  // mmap'd regions
+    uint64_t mmap_base;         // Base address for mmap allocations
 } task_t;
 
 void sched_init(void);

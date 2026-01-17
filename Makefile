@@ -16,6 +16,7 @@ BUILD_DIR = build
 KERNEL_DIR = kernel
 INCLUDE_DIR = include
 BOOT_DIR = boot
+USER_DIR = user
 
 # UEFI/GNU-EFI paths
 EFI_INCLUDES = -I/usr/include/efi -I/usr/include/efi/x86_64
@@ -26,6 +27,11 @@ EFI_LDS = /usr/lib/elf_x86_64_efi.lds
 KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-fno-stack-protector -mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
 			-I$(INCLUDE_DIR) -DXHCI_USE_INTERRUPTS=1
+
+# Compiler flags for userspace programs
+USER_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
+			-fno-stack-protector -mno-red-zone -mcmodel=small -fno-pic -Wall -Wextra \
+			-I$(USER_DIR)
 
 # Compiler flags for UEFI bootloader
 UEFI_CFLAGS = -fno-stack-protector -fpic -fshort-wchar -mno-red-zone \
@@ -168,8 +174,26 @@ $(BUILD_DIR)/syscall.o: $(KERNEL_DIR)/ke/syscall.asm | $(BUILD_DIR)
 $(BUILD_DIR)/syscall_c.o: $(KERNEL_DIR)/ke/syscall.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/user_test.o: $(KERNEL_DIR)/ke/user_test.asm | $(BUILD_DIR)
-	nasm -f elf64 $< -o $@
+# Build userspace startup code
+$(BUILD_DIR)/user_start.o: $(USER_DIR)/start.S | $(BUILD_DIR)
+	nasm -f elf64 $(USER_DIR)/start.S -o $@
+
+# Build userspace test program
+$(BUILD_DIR)/user_test.elf: $(BUILD_DIR)/user_start.o $(USER_DIR)/test_syscalls.c $(USER_DIR)/syscall.h $(USER_DIR)/user.lds | $(BUILD_DIR)
+	$(GCC) $(USER_CFLAGS) -c $(USER_DIR)/test_syscalls.c -o $(BUILD_DIR)/user_test_c.o
+	$(LD) -nostdlib -static -T $(USER_DIR)/user.lds $(BUILD_DIR)/user_start.o $(BUILD_DIR)/user_test_c.o -o $@
+
+# Convert user test to binary blob and then to object file
+$(BUILD_DIR)/user_test.o: $(BUILD_DIR)/user_test.elf | $(BUILD_DIR)
+	$(OBJCOPY) -O binary $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/user_test.bin
+	@# Create assembly wrapper to embed the binary
+	@echo 'section .rodata' > $(BUILD_DIR)/user_test_embed.asm
+	@echo 'global user_test_start' >> $(BUILD_DIR)/user_test_embed.asm
+	@echo 'global user_test_end' >> $(BUILD_DIR)/user_test_embed.asm
+	@echo 'user_test_start:' >> $(BUILD_DIR)/user_test_embed.asm
+	@echo '    incbin "$(BUILD_DIR)/user_test.bin"' >> $(BUILD_DIR)/user_test_embed.asm
+	@echo 'user_test_end:' >> $(BUILD_DIR)/user_test_embed.asm
+	nasm -f elf64 $(BUILD_DIR)/user_test_embed.asm -o $@
 
 # Build kernel ELF
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel.lds | $(BUILD_DIR)

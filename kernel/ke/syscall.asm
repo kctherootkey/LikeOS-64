@@ -51,9 +51,16 @@ syscall_entry:
     sti
     call syscall_handler
     
+    ; Restore stack to where registers were saved
     lea rsp, [rel kernel_syscall_stack_top]
     sub rsp, 16*8
-    mov [rsp + 14*8], rax
+    
+    ; Store return value where rax will be popped from
+    ; Stack layout (from rsp):
+    ;   0: r15, 8: r14, 16: r13, 24: r12, 32: r10, 40: r9, 48: r8
+    ;   56: rbp, 64: rdi, 72: rsi, 80: rdx, 88: rbx, 96: rax
+    ;   104: rcx, 112: r11, 120: user_rsp
+    mov [rsp + 12*8], rax
     
     pop r15
     pop r14

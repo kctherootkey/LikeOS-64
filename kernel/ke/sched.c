@@ -99,6 +99,17 @@ void sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack
     t->id = g_next_id++;
     t->user_stack_top = 0;
     t->kernel_stack_top = 0;
+    
+    // Initialize file descriptor table (kernel tasks don't use fd_table)
+    for (int i = 0; i < TASK_MAX_FDS; i++) {
+        t->fd_table[i] = NULL;
+    }
+    t->brk_start = 0;
+    t->brk = 0;
+    t->mmap_base = 0;
+    for (int i = 0; i < TASK_MAX_MMAP; i++) {
+        t->mmap_regions[i].in_use = false;
+    }
 
     enqueue_task(t);
 }
@@ -148,6 +159,28 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
     t->id = g_next_id++;
     t->user_stack_top = user_stack;
     t->kernel_stack_top = (uint64_t)(k_stack_mem + 4096);
+    
+    // Initialize file descriptor table (all NULL)
+    for (int i = 0; i < TASK_MAX_FDS; i++) {
+        t->fd_table[i] = NULL;
+    }
+    
+    // Initialize memory management
+    // Memory layout:
+    //   Code:   0x00400000 - 0x00500000 (1MB)
+    //   Heap:   0x00500000 - grows up
+    //   ...
+    //   mmap:   below stack, grows down
+    //   Stack:  at user_stack, grows down
+    t->brk_start = 0x500000;  // 5MB - after code area
+    t->brk = t->brk_start;
+    // mmap area starts 4MB below stack and grows downward
+    t->mmap_base = user_stack - (4 * 1024 * 1024);
+    
+    // Initialize mmap regions
+    for (int i = 0; i < TASK_MAX_MMAP; i++) {
+        t->mmap_regions[i].in_use = false;
+    }
 
     enqueue_task(t);
     kprintf("Added user task %d\n", t->id);
