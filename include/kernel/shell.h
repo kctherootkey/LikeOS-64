@@ -10,4 +10,7 @@ void shell_init(void);
 // Poll shell input once; returns non-zero if a character was handled
 int shell_tick(void);
 
+// Request shell to redisplay prompt (call after printing messages)
+void shell_redisplay_prompt(void);
+
 #endif // _KERNEL_SHELL_H_

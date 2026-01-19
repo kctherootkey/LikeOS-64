@@ -75,6 +75,11 @@ void console_set_color(uint8_t fg, uint8_t bg);
 void console_scroll(void);
 void console_backspace(void);
 
+// Cursor control functions
+void console_cursor_enable(void);
+void console_cursor_disable(void);
+void console_cursor_update(void);  // Call periodically to handle blinking
+
 // Framebuffer optimization interface
 void console_show_fb_status(void);
 void console_show_fb_stats(void);

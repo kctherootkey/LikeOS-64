@@ -71,5 +71,6 @@ void sched_tick(void);
 void sched_yield(void);
 void sched_run_ready(void);
 task_t* sched_current(void);
+int sched_has_user_tasks(void);  // Check if any user tasks are running
 
 #endif // _KERNEL_SCHED_H_

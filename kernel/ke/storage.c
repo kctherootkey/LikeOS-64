@@ -2,6 +2,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/vfs.h"
 #include "../../include/kernel/xhci.h"
+#include "../../include/kernel/shell.h"
 
 void storage_fs_init(storage_fs_state_t* state) {
     if (!state) {
@@ -42,13 +43,16 @@ void storage_fs_poll(storage_fs_state_t* state) {
                 vfs_close(sf);
                 state->signature_found = 1;
                 kprintf("FAT32: signature /LIKEOS.SIG found on %s (root storage selected)\n", bdev->name);
+                shell_redisplay_prompt();  // Redisplay prompt after mount messages
             } else {
                 kprintf("FAT32: signature not found on %s\n", bdev->name);
                 state->tested_mask |= (1u << bi);
+                shell_redisplay_prompt();  // Redisplay prompt after mount messages
             }
         } else {
             kprintf("FAT32: mount failed on %s\n", bdev->name ? bdev->name : "(unnamed)");
             state->tested_mask |= (1u << bi);
+            shell_redisplay_prompt();  // Redisplay prompt after mount messages
         }
     }
 }

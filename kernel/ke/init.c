@@ -92,6 +92,7 @@ void system_startup(boot_info_t* boot_info) {
         int handled_input = shell_tick();
         xhci_boot_poll(&g_xhci_boot);
         storage_fs_poll(&g_storage_state);
+        console_cursor_update();  // Update blinking cursor
         sched_run_ready();
 
         if (!handled_input) {

@@ -6,6 +6,7 @@
 #include "../../include/kernel/block.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/elf.h"
+#include "../../include/kernel/sched.h"
 
 // Simple path stack for prompt (stores directory names after root)
 #define SHELL_MAX_DEPTH 16
@@ -13,6 +14,9 @@
 static unsigned long shell_path_clusters[SHELL_MAX_DEPTH];
 static char          shell_path_names[SHELL_MAX_DEPTH][SHELL_NAME_MAX];
 static int           shell_path_depth = 0; // 0 means at root
+
+// Track if we're waiting for a user program to complete
+static int shell_waiting_for_program = 0;
 
 // Shell helpers
 static int shell_ls_count = 0;
@@ -49,14 +53,19 @@ static void shell_path_pop(void) {
 
 static void shell_prompt(void) {
     if (fat32_get_cwd() == fat32_root_cluster()) {
-        kprintf("/ > ");
+        kprintf("/ # ");
         return;
     }
     kprintf("/");
     for (int i = 0; i < shell_path_depth; i++) {
         kprintf("%s/", shell_path_names[i]);
     }
-    kprintf(" > ");
+    kprintf(" # ");
+}
+
+void shell_redisplay_prompt(void) {
+    shell_prompt();
+    console_cursor_enable();
 }
 
 void shell_init(void) {
@@ -65,11 +74,25 @@ void shell_init(void) {
     shell_path_reset();
     shell_prompt();
     console_set_color(15, 0);
+    console_cursor_enable();  // Enable blinking cursor
 }
 
 int shell_tick(void) {
     static char cmd_buf[128];
     static int cmd_len = 0;
+    
+    // Check if we're waiting for a program to finish
+    if (shell_waiting_for_program) {
+        if (!sched_has_user_tasks()) {
+            // Program finished - show prompt
+            shell_waiting_for_program = 0;
+            shell_prompt();
+            console_cursor_enable();
+        }
+        // Don't process keyboard input while program is running
+        return 0;
+    }
+    
     char c = keyboard_get_char();
 
     if (c == 0) {
@@ -94,7 +117,17 @@ int shell_tick(void) {
             int is_cd = (cmdlen == 2 && cmd_buf[start] == 'c' && cmd_buf[start + 1] == 'd');
             int is_pwd = (cmdlen == 3 && cmd_buf[start] == 'p' && cmd_buf[start + 1] == 'w' && cmd_buf[start + 2] == 'd');
             int is_stat = (cmdlen == 4 && cmd_buf[start] == 's' && cmd_buf[start + 1] == 't' && cmd_buf[start + 2] == 'a' && cmd_buf[start + 3] == 't');
-            if (is_ls) {
+            int is_help = (cmdlen == 4 && cmd_buf[start] == 'h' && cmd_buf[start + 1] == 'e' && cmd_buf[start + 2] == 'l' && cmd_buf[start + 3] == 'p');
+            if (is_help) {
+                kprintf("LikeOS-64 Shell - Available Commands:\n");
+                kprintf("  ls [path]      - List directory contents\n");
+                kprintf("  cd <dir>       - Change directory\n");
+                kprintf("  pwd            - Print working directory\n");
+                kprintf("  cat <file>     - Display file contents\n");
+                kprintf("  stat <path>    - Show file/directory information\n");
+                kprintf("  help           - Display this help message\n");
+                kprintf("  ./<file>       - Execute a program (e.g., ./tests)\n");
+            } else if (is_ls) {
                 if (block_count() > 0) {
                     int fn = sp;
                     while (fn < cmd_len && cmd_buf[fn] == ' ') {
@@ -276,6 +309,9 @@ int shell_tick(void) {
                     int ret = elf_exec(exec_path, argv, envp);
                     if (ret != 0) {
                         kprintf("exec: failed (error %d)\n", ret);
+                    } else {
+                        // Program started successfully - wait for it to complete
+                        shell_waiting_for_program = 1;
                     }
                 } else {
                     kprintf("Unknown command\n");
@@ -285,7 +321,11 @@ after_cmd:
             ;
         }
         cmd_len = 0;
-        shell_prompt();
+        // Only show prompt if we're not waiting for a program
+        if (!shell_waiting_for_program) {
+            shell_prompt();
+            console_cursor_enable();  // Re-enable cursor after command
+        }
     } else if (c == '\b') {
         if (cmd_len > 0) {
             console_backspace();

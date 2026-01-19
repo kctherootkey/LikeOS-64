@@ -36,6 +36,13 @@ static uint32_t bg_color = 0x00000000; // Black (RGB)
 static uint8_t current_vga_fg = VGA_COLOR_WHITE; // Track current VGA indices
 static uint8_t current_vga_bg = VGA_COLOR_BLACK;
 
+// Cursor blinking support
+static uint8_t cursor_enabled = 0;     // Is cursor visible feature enabled
+static uint8_t cursor_shown = 0;       // Current cursor visible state (for blinking)
+static uint32_t cursor_blink_ticks = 0; // Tick counter for blinking
+static uint32_t cursor_last_x = 0;     // Last cursor X position
+static uint32_t cursor_last_y = 0;     // Last cursor Y position
+
 // Font - simple 8x16 bitmap font (complete character set)
 static const uint8_t font_8x16[128][16] = {
     // Space (32)
@@ -385,6 +392,23 @@ static void set_pixel(uint32_t x, uint32_t y, uint32_t color) {
     }
 }
 
+// Draw or clear the cursor at the current position
+static void draw_cursor_at(uint32_t x, uint32_t y, uint8_t show) {
+    if (!fb_info) return;
+    
+    uint32_t pixel_x = x * CHAR_WIDTH;
+    uint32_t pixel_y = y * CHAR_HEIGHT;
+    
+    // Gray color for cursor (RGB: 128, 128, 128)
+    uint32_t cursor_color = show ? 0x00808080 : bg_color;
+    
+    // Draw a thin vertical bar (2 pixels wide for better visibility)
+    for (int row = 0; row < CHAR_HEIGHT; row++) {
+        set_pixel(pixel_x, pixel_y + row, cursor_color);
+        set_pixel(pixel_x + 1, pixel_y + row, cursor_color);
+    }
+}
+
 // Draw a character at specific position
 static void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color, uint32_t bg_color) {
     unsigned char uc = (unsigned char)c;
@@ -559,6 +583,10 @@ void console_putchar(char c) {
     if (c == '\n') {
         sb_append_char(c);
         if (g_sb.at_bottom) {
+            // Erase cursor at old position before moving
+            if (cursor_enabled && cursor_shown) {
+                draw_cursor_at(cursor_x, cursor_y, 0);
+            }
             cursor_x = 0;
             // Hide cursor, scroll text area, sync scrollbar, show cursor
             mouse_show_cursor(0);
@@ -574,6 +602,10 @@ void console_putchar(char c) {
     if (c == '\r') {
         sb_append_char(c);
         if (g_sb.at_bottom) {
+            // Erase cursor at old position before moving
+            if (cursor_enabled && cursor_shown) {
+                draw_cursor_at(cursor_x, cursor_y, 0);
+            }
             // Clear current line and move to column 0
             uint32_t sb_total_w = SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
             uint32_t text_w = (fb_info->horizontal_resolution > sb_total_w) ? (fb_info->horizontal_resolution - sb_total_w) : 0;
@@ -616,18 +648,28 @@ void console_putchar(char c) {
     // Normal printable character
     sb_append_char(c);
     if (g_sb.at_bottom) {
-        // Draw at current cursor cell
+        // Draw at current cursor cell - character will overwrite cursor
         uint32_t px = cursor_x * CHAR_WIDTH;
         uint32_t py = cursor_y * CHAR_HEIGHT;
         draw_char(c, px, py, fg_color, bg_color);
-        fb_flush_dirty_regions();
         cursor_x++;
+        // Update cursor tracking immediately so cursor_update knows position changed
+        if (cursor_enabled) {
+            cursor_last_x = cursor_x;
+            cursor_last_y = cursor_y;
+            cursor_shown = 1;
+            cursor_blink_ticks = 0;
+        }
         if (cursor_x >= max_cols) {
             // Wrap to new line: scroll up and reset cursor_x
             cursor_x = 0;
             console_scroll_up();
-            fb_flush_dirty_regions();
+            if (cursor_enabled) {
+                cursor_last_x = cursor_x;
+                cursor_last_y = cursor_y;
+            }
         }
+        fb_flush_dirty_regions();
     } else {
     // Not at bottom: do nothing visually here
     }
@@ -661,6 +703,10 @@ void console_backspace(void) {
     }
     // Visual backspace when at bottom
     if (cursor_x == 0 && cursor_y == 0) return; // nothing to erase
+    // Erase cursor at old position before moving
+    if (cursor_enabled && cursor_shown) {
+        draw_cursor_at(cursor_x, cursor_y, 0);
+    }
     if (cursor_x > 0) {
         cursor_x--;
     } else {
@@ -672,6 +718,54 @@ void console_backspace(void) {
     uint32_t py = cursor_y * CHAR_HEIGHT;
     draw_char(' ', px, py, fg_color, bg_color);
     fb_flush_dirty_regions();
+}
+
+// ================= Cursor Control Functions =================
+void console_cursor_enable(void) {
+    cursor_enabled = 1;
+    cursor_shown = 1;
+    cursor_blink_ticks = 0;
+    cursor_last_x = cursor_x;
+    cursor_last_y = cursor_y;
+    draw_cursor_at(cursor_x, cursor_y, 1);
+    fb_flush_dirty_regions();
+}
+
+void console_cursor_disable(void) {
+    if (cursor_shown) {
+        draw_cursor_at(cursor_x, cursor_y, 0);
+        fb_flush_dirty_regions();
+    }
+    cursor_enabled = 0;
+    cursor_shown = 0;
+}
+
+void console_cursor_update(void) {
+    if (!cursor_enabled || !g_sb.at_bottom) {
+        return;
+    }
+    
+    // If cursor position changed, erase old and draw new
+    if (cursor_last_x != cursor_x || cursor_last_y != cursor_y) {
+        draw_cursor_at(cursor_last_x, cursor_last_y, 0);
+        cursor_last_x = cursor_x;
+        cursor_last_y = cursor_y;
+        cursor_shown = 1;
+        cursor_blink_ticks = 0;
+        draw_cursor_at(cursor_x, cursor_y, 1);
+        fb_flush_dirty_regions();
+        return;
+    }
+    
+    cursor_blink_ticks++;
+    
+    // Blink every ~50 ticks (adjust to get desired blink rate)
+    if (cursor_blink_ticks >= 50) {
+        cursor_blink_ticks = 0;
+        cursor_shown = !cursor_shown;
+        draw_cursor_at(cursor_x, cursor_y, cursor_shown);
+        fb_flush_dirty_regions();
+    }
 }
 
 // ================= Scrollback public APIs =================

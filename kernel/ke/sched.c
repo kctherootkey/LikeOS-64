@@ -280,6 +280,24 @@ task_t* sched_current(void) {
     return g_current;
 }
 
+int sched_has_user_tasks(void) {
+    // Check if there are any active user tasks (not idle, not zombie)
+    if (!g_current) {
+        return 0;
+    }
+    
+    task_t* start = g_current;
+    task_t* t = g_current;
+    do {
+        if (t->privilege == TASK_USER && t->state != TASK_ZOMBIE && !is_idle_task(t)) {
+            return 1;
+        }
+        t = t->next;
+    } while (t && t != start);
+    
+    return 0;
+}
+
 static void task_trampoline(void) {
     task_t* cur = g_current;
     if (cur && cur->entry) {
