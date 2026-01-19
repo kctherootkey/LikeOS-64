@@ -1,0 +1,133 @@
+#include "../../include/stdlib.h"
+#include "../../include/string.h"
+#include "../../include/unistd.h"
+#include "../../include/errno.h"
+
+// Simple block header for tracking allocations
+typedef struct block {
+    size_t size;
+    int free;
+    struct block* next;
+} block_t;
+
+#define BLOCK_SIZE sizeof(block_t)
+#define align4(x) (((x) + 3) & ~3)
+#define align8(x) (((x) + 7) & ~7)
+
+static block_t* heap_start = NULL;
+
+// Find a free block that fits
+static block_t* find_free_block(block_t** last, size_t size) {
+    block_t* current = heap_start;
+    while (current && !(current->free && current->size >= size)) {
+        *last = current;
+        current = current->next;
+    }
+    return current;
+}
+
+// Request more space from the system
+static block_t* request_space(block_t* last, size_t size) {
+    block_t* block;
+    block = sbrk(0);
+    void* request = sbrk(BLOCK_SIZE + size);
+    
+    if (request == (void*)-1) {
+        return NULL; // sbrk failed
+    }
+    
+    if (last) {
+        last->next = block;
+    }
+    
+    block->size = size;
+    block->free = 0;
+    block->next = NULL;
+    return block;
+}
+
+void* malloc(size_t size) {
+    if (size == 0) {
+        return NULL;
+    }
+    
+    size = align8(size);
+    block_t* block;
+    
+    if (!heap_start) {
+        // First call to malloc
+        block = request_space(NULL, size);
+        if (!block) {
+            return NULL;
+        }
+        heap_start = block;
+    } else {
+        block_t* last = heap_start;
+        block = find_free_block(&last, size);
+        
+        if (!block) {
+            // No free block found, request more space
+            block = request_space(last, size);
+            if (!block) {
+                return NULL;
+            }
+        } else {
+            // Found a free block
+            block->free = 0;
+        }
+    }
+    
+    return (void*)(block + 1);
+}
+
+// Get block from user pointer
+static block_t* get_block_ptr(void* ptr) {
+    return (block_t*)ptr - 1;
+}
+
+void free(void* ptr) {
+    if (!ptr) {
+        return;
+    }
+    
+    block_t* block = get_block_ptr(ptr);
+    block->free = 1;
+    
+    // TODO: Coalesce adjacent free blocks
+}
+
+void* calloc(size_t nmemb, size_t size) {
+    size_t total = nmemb * size;
+    void* ptr = malloc(total);
+    if (ptr) {
+        memset(ptr, 0, total);
+    }
+    return ptr;
+}
+
+void* realloc(void* ptr, size_t size) {
+    if (!ptr) {
+        return malloc(size);
+    }
+    
+    if (size == 0) {
+        free(ptr);
+        return NULL;
+    }
+    
+    block_t* block = get_block_ptr(ptr);
+    
+    if (block->size >= size) {
+        return ptr;
+    }
+    
+    // Need to allocate new block
+    void* new_ptr = malloc(size);
+    if (!new_ptr) {
+        return NULL;
+    }
+    
+    memcpy(new_ptr, ptr, block->size);
+    free(ptr);
+    return new_ptr;
+}

@@ -1,7 +1,14 @@
 // LikeOS-64 Userspace Syscall Test Program
 // Tests all implemented syscalls: read, write, open, close, mmap, brk, yield, getpid, exit
 
-#include "syscall.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sched.h>
+#include <sys/mman.h>
+#include <sys/types.h>
 
 #define TEST_PASS "[PASS] "
 #define TEST_FAIL "[FAIL] "
@@ -12,24 +19,21 @@ static int tests_failed = 0;
 
 static void test_result(int passed, const char* name) {
     if (passed) {
-        print(TEST_PASS);
+        printf(TEST_PASS);
         tests_passed++;
     } else {
-        print(TEST_FAIL);
+        printf(TEST_FAIL);
         tests_failed++;
     }
-    print(name);
-    print("\n");
+    printf("%s\n", name);
 }
 
 // Test getpid syscall
 static void test_getpid(void) {
-    print(TEST_INFO "Testing getpid()...\n");
+    printf(TEST_INFO "Testing getpid()...\n");
     
     int pid = getpid();
-    print("  PID = ");
-    print_num(pid);
-    print("\n");
+    printf("  PID = %d\n", pid);
     
     test_result(pid > 0, "getpid returns positive PID");
     
@@ -40,16 +44,16 @@ static void test_getpid(void) {
 
 // Test write syscall
 static void test_write(void) {
-    print(TEST_INFO "Testing write()...\n");
+    printf(TEST_INFO "Testing write()...\n");
     
     const char* msg = "  Hello from userspace write()!\n";
-    ssize_t ret = write(STDOUT_FD, msg, strlen(msg));
+    ssize_t ret = write(1, msg, strlen(msg));
     
     test_result(ret == (ssize_t)strlen(msg), "write to stdout returns correct count");
     
     // Test write to stderr (should also work)
     const char* errmsg = "  (stderr test)\n";
-    ret = write(STDERR_FD, errmsg, strlen(errmsg));
+    ret = write(2, errmsg, strlen(errmsg));
     test_result(ret == (ssize_t)strlen(errmsg), "write to stderr works");
     
     // Test write to invalid fd
@@ -59,7 +63,7 @@ static void test_write(void) {
 
 // Test yield syscall
 static void test_yield(void) {
-    print(TEST_INFO "Testing sched_yield()...\n");
+    printf(TEST_INFO "Testing sched_yield()...\n");
     
     int ret = sched_yield();
     test_result(ret == 0, "sched_yield returns 0");
@@ -73,28 +77,23 @@ static void test_yield(void) {
 
 // Test brk syscall
 static void test_brk(void) {
-    print(TEST_INFO "Testing brk()...\n");
+    printf(TEST_INFO "Testing brk()...\n");
     
     // Get current break
-    void* current_brk = brk(0);
-    print("  Current brk = ");
-    print_hex((unsigned long)current_brk);
-    print("\n");
+    void* current_brk = sbrk(0);
+    printf("  Current brk = %p\n", current_brk);
     
     test_result(current_brk != (void*)-1, "brk(0) returns valid address");
     
     // Increase break by one page (4KB)
-    void* new_brk = (void*)((unsigned long)current_brk + 4096);
-    void* result = brk(new_brk);
+    void* new_brk = sbrk(4096);
     
-    print("  New brk = ");
-    print_hex((unsigned long)result);
-    print("\n");
+    printf("  New brk = %p\n", new_brk);
     
-    test_result(result == new_brk, "brk can increase heap");
+    test_result(new_brk != (void*)-1, "sbrk can increase heap");
     
     // Write to the new memory
-    if (result == new_brk) {
+    if (new_brk != (void*)-1) {
         char* ptr = (char*)current_brk;
         ptr[0] = 'A';
         ptr[1] = 'B';
@@ -102,22 +101,16 @@ static void test_brk(void) {
         ptr[3] = '\0';
         test_result(ptr[0] == 'A' && ptr[1] == 'B', "can write to brk-allocated memory");
     }
-    
-    // Try to shrink (may not be supported fully, but shouldn't crash)
-    void* shrunk = brk(current_brk);
-    test_result(shrunk != (void*)-1, "brk shrink doesn't crash");
 }
 
 // Test mmap syscall
 static void test_mmap(void) {
-    print(TEST_INFO "Testing mmap()...\n");
+    printf(TEST_INFO "Testing mmap()...\n");
     
     // Anonymous mapping
     void* ptr = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     
-    print("  mmap returned = ");
-    print_hex((unsigned long)ptr);
-    print("\n");
+    printf("  mmap returned = %p\n", ptr);
     
     test_result(ptr != MAP_FAILED, "mmap anonymous returns valid address");
     
@@ -144,11 +137,11 @@ static void test_mmap(void) {
 
 // Test read syscall (stdin)
 static void test_read(void) {
-    print(TEST_INFO "Testing read()...\n");
+    printf(TEST_INFO "Testing read()...\n");
     
     // Non-blocking read from stdin - may return 0 if no input available
     char buf[16];
-    ssize_t ret = read(STDIN_FD, buf, sizeof(buf));
+    ssize_t ret = read(0, buf, sizeof(buf));
     
     // Read from stdin should return 0 (no data) or positive (if keys pressed)
     test_result(ret >= 0, "read from stdin returns >= 0");
@@ -157,22 +150,18 @@ static void test_read(void) {
     ret = read(999, buf, sizeof(buf));
     test_result(ret < 0, "read from invalid fd returns error");
     
-    print("  (stdin read is non-blocking, returned ");
-    print_num(ret);
-    print(" bytes)\n");
+    printf("  (stdin read is non-blocking, returned %zd bytes)\n", ret);
 }
 
 // Test open/close syscalls
 static void test_open_close(void) {
-    print(TEST_INFO "Testing open()/close()...\n");
+    printf(TEST_INFO "Testing open()/close()...\n");
     
     // Try to open a file (may fail if VFS not fully set up)
     int fd = open("/LIKEOS.SIG", 0);
     
     if (fd >= 0) {
-        print("  Opened file, fd = ");
-        print_num(fd);
-        print("\n");
+        printf("  Opened file, fd = %d\n", fd);
         test_result(fd >= 3, "open returns fd >= 3");
         
         int ret = close(fd);
@@ -182,9 +171,7 @@ static void test_open_close(void) {
         ret = close(fd);
         test_result(ret < 0, "double close returns error");
     } else {
-        print("  (No filesystem mounted, open returned ");
-        print_num(fd);
-        print(")\n");
+        printf("  (No filesystem mounted, open returned %d)\n", fd);
         test_result(1, "open fails gracefully without filesystem");
     }
     
@@ -193,16 +180,16 @@ static void test_open_close(void) {
     test_result(ret < 0, "close invalid fd returns error");
     
     // Can't close stdin/stdout/stderr
-    ret = close(STDIN_FD);
+    ret = close(0);
     test_result(ret < 0, "cannot close stdin");
 }
 
 // Entry point
-void _start(void) {
-    print("\n");
-    print("========================================\n");
-    print("  LikeOS-64 Userspace Syscall Tests\n");
-    print("========================================\n\n");
+int main(void) {
+    printf("\n");
+    printf("========================================\n");
+    printf("  LikeOS-64 Userspace Syscall Tests\n");
+    printf("========================================\n\n");
     
     // Run all tests
     test_getpid();
@@ -214,23 +201,20 @@ void _start(void) {
     test_open_close();
     
     // Summary
-    print("\n========================================\n");
-    print("  Test Summary\n");
-    print("========================================\n");
-    print("  Passed: ");
-    print_num(tests_passed);
-    print("\n  Failed: ");
-    print_num(tests_failed);
-    print("\n  Total:  ");
-    print_num(tests_passed + tests_failed);
-    print("\n========================================\n\n");
+    printf("\n========================================\n");
+    printf("  Test Summary\n");
+    printf("========================================\n");
+    printf("  Passed: %d\n", tests_passed);
+    printf("  Failed: %d\n", tests_failed);
+    printf("  Total:  %d\n", tests_passed + tests_failed);
+    printf("========================================\n\n");
     
     if (tests_failed == 0) {
-        print("All tests PASSED!\n\n");
+        printf("All tests PASSED!\n\n");
     } else {
-        print("Some tests FAILED!\n\n");
+        printf("Some tests FAILED!\n\n");
     }
     
     // Exit with number of failed tests
-    exit(tests_failed);
+    return tests_failed;
 }

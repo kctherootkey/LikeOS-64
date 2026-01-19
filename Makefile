@@ -177,14 +177,19 @@ $(BUILD_DIR)/syscall_c.o: $(KERNEL_DIR)/ke/syscall.c | $(BUILD_DIR)
 $(BUILD_DIR)/elf_loader.o: $(KERNEL_DIR)/ke/elf_loader.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-# Build userspace startup code
-$(BUILD_DIR)/user_start.o: $(USER_DIR)/start.S | $(BUILD_DIR)
-	nasm -f elf64 $(USER_DIR)/start.S -o $@
+# Build userland C library
+.PHONY: userland-libc
+userland-libc:
+	$(MAKE) -C userland/libc
 
-# Build userspace test program
-$(BUILD_DIR)/user_test.elf: $(BUILD_DIR)/user_start.o $(USER_DIR)/test_syscalls.c $(USER_DIR)/syscall.h $(USER_DIR)/user.lds | $(BUILD_DIR)
-	$(GCC) $(USER_CFLAGS) -c $(USER_DIR)/test_syscalls.c -o $(BUILD_DIR)/user_test_c.o
-	$(LD) -nostdlib -static -T $(USER_DIR)/user.lds $(BUILD_DIR)/user_start.o $(BUILD_DIR)/user_test_c.o -o $@
+# Build test programs using libc
+$(BUILD_DIR)/user_test.elf: userland-libc | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) test_syscalls
+	cp $(USER_DIR)/test_syscalls $@
+
+$(BUILD_DIR)/test_libc: userland-libc | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) test_libc
+	cp $(USER_DIR)/test_libc $@
 
 # Build kernel ELF
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel.lds | $(BUILD_DIR)
@@ -285,7 +290,7 @@ qemu-fat: $(FAT_IMAGE)
 
 # Standalone USB mass storage data image (64MB FAT32) now mirrors usb-write target (UEFI bootable + signature files)
 # Provides: EFI/BOOT/BOOTX64.EFI, kernel.elf, LIKEOS.SIG, HELLO.TXT, tests
-$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf | $(BUILD_DIR)
+$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/test_libc | $(BUILD_DIR)
 	@echo "Creating USB data FAT32 image (msdata.img, 64MB, UEFI bootable)..."
 	$(DD) if=/dev/zero of=$(DATA_IMAGE) bs=1M count=64
 	$(MKFS_FAT) -F32 -n "MSDATA" $(DATA_IMAGE)
@@ -296,6 +301,7 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf | $(BU
 	MTOOLS_SKIP_CHECK=1 $(MTOOLS) -i $(DATA_IMAGE) $(KERNEL_ELF) ::/kernel.elf
 	# Add test program ELF
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/user_test.elf ::/tests
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/test_libc ::/testlibc
 	# Add signature + sample files
 	echo "THIS IS A DEVICE STORING LIKEOS" > $(BUILD_DIR)/LIKEOS.SIG
 	echo "Hello from USB mass storage" > $(BUILD_DIR)/HELLO.TXT

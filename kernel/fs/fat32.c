@@ -75,13 +75,25 @@ typedef struct __attribute__((packed)) {
 #define FAT32_ATTR_DIRECTORY 0x10
 #define FAT32_ATTR_LONG_NAME 0x0F
 
+// Maximum sectors per single USB read (QEMU xHCI limitation)
+#define MAX_SECTORS_PER_READ 1
+
 static int read_sectors(const block_device_t *bdev, unsigned long lba, unsigned long count, void *buf)
 {
-    int st = bdev->read((block_device_t *)bdev, lba, count, buf);
-    if (st != ST_OK) {
-        kprintf("FAT32: read_sectors FAILED lba=%lu count=%lu st=%d\n", lba, count, st);
+    // Chunk large reads to work around QEMU xHCI DMA limitations
+    unsigned long offset = 0;
+    while (count > 0) {
+        unsigned long chunk = (count > MAX_SECTORS_PER_READ) ? MAX_SECTORS_PER_READ : count;
+        int st = bdev->read((block_device_t *)bdev, lba, chunk, (uint8_t *)buf + offset);
+        if (st != ST_OK) {
+            kprintf("FAT32: read_sectors FAILED lba=%lu count=%lu st=%d\n", lba, chunk, st);
+            return st;
+        }
+        lba += chunk;
+        offset += chunk * 512;
+        count -= chunk;
     }
-    return st;
+    return ST_OK;
 }
 
 static unsigned long cluster_to_lba(fat32_fs_t *fs, unsigned long cluster)
@@ -114,8 +126,8 @@ static unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long clu
             return 0x0FFFFFFF;
         }
         
-        /* Read FAT in chunks (max 64 sectors = 32KB per read to avoid USB buffer issues) */
-        #define FAT_READ_CHUNK 64
+        /* Read FAT in chunks (max 1 sector = 512 bytes per read for QEMU xHCI compatibility) */
+        #define FAT_READ_CHUNK 1
         unsigned long lba = fs->part_lba_offset + fs->fat_start_lba;
         unsigned long remaining = first_fat_sectors;
         uint8_t *dest = (uint8_t*)g_fat_cache;
@@ -190,6 +202,13 @@ static int fat32_validate_bpb(const fat32_bpb_t *bpb)
 
 static int fat32_mount_at_lba(const block_device_t *bdev, unsigned long base_lba, fat32_fs_t *out)
 {
+    // Invalidate old FAT cache (important for re-mounts or device changes)
+    if (g_fat_cache) {
+        kfree(g_fat_cache);
+        g_fat_cache = 0;
+        g_fat_cache_entries = 0;
+    }
+    
     void *sector = kalloc(512);
     if (!sector)
         return ST_NOMEM;
@@ -884,7 +903,6 @@ static long fat32_read(vfs_file_t *f, void *buf, long bytes)
     unsigned long remaining = (unsigned long)bytes;
     unsigned long copied = 0;
     unsigned cluster_size = ff->fs->sectors_per_cluster * ff->fs->bytes_per_sector;
-    
     
     while (remaining) {
         unsigned cluster_offset = ff->pos % cluster_size;
