@@ -421,6 +421,8 @@ linux-usb-write: linux-usb
 # Clean build files
 clean:
 	rm -rf $(BUILD_DIR)
+	$(MAKE) -C userland/libc clean
+	$(MAKE) -C user clean
 
 # Install dependencies (Ubuntu/Debian)
 deps:
