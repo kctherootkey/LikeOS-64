@@ -79,8 +79,7 @@ static int read_sectors(const block_device_t *bdev, unsigned long lba, unsigned 
 {
     int st = bdev->read((block_device_t *)bdev, lba, count, buf);
     if (st != ST_OK) {
-        FAT32_LOG("read fail dev=%s lba=%lu count=%lu st=%d\n",
-            bdev ? bdev->name : "?", lba, count, st);
+        kprintf("FAT32: read_sectors FAILED lba=%lu count=%lu st=%d\n", lba, count, st);
     }
     return st;
 }
@@ -106,11 +105,36 @@ static unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long clu
         unsigned long first_fat_sectors = fat_total / 2;
         if (first_fat_sectors == 0)
             first_fat_sectors = fat_total; /* if only one FAT */
-        g_fat_cache = kalloc(first_fat_sectors * fs->bytes_per_sector);
-        if (g_fat_cache) {
-            read_sectors(fs->bdev, fs->part_lba_offset + fs->fat_start_lba, first_fat_sectors, g_fat_cache);
-            g_fat_cache_entries = (first_fat_sectors * fs->bytes_per_sector) / 4;
+        
+        /* Allocate FAT cache buffer */
+        unsigned long fat_bytes = first_fat_sectors * fs->bytes_per_sector;
+        g_fat_cache = kalloc(fat_bytes);
+        if (!g_fat_cache) {
+            kprintf("FAT32: FAT cache alloc failed!\n");
+            return 0x0FFFFFFF;
         }
+        
+        /* Read FAT in chunks (max 64 sectors = 32KB per read to avoid USB buffer issues) */
+        #define FAT_READ_CHUNK 64
+        unsigned long lba = fs->part_lba_offset + fs->fat_start_lba;
+        unsigned long remaining = first_fat_sectors;
+        uint8_t *dest = (uint8_t*)g_fat_cache;
+        
+        while (remaining > 0) {
+            unsigned long chunk = (remaining > FAT_READ_CHUNK) ? FAT_READ_CHUNK : remaining;
+            int read_st = read_sectors(fs->bdev, lba, chunk, dest);
+            if (read_st != ST_OK) {
+                kprintf("FAT32: FAT read failed at LBA %lu! st=%d\n", lba, read_st);
+                kfree(g_fat_cache);
+                g_fat_cache = 0;
+                return 0x0FFFFFFF;
+            }
+            lba += chunk;
+            dest += chunk * fs->bytes_per_sector;
+            remaining -= chunk;
+        }
+        
+        g_fat_cache_entries = fat_bytes / 4;
     }
     if (!g_fat_cache)
         return 0x0FFFFFFF;
@@ -841,7 +865,6 @@ static int fat32_open(const char *path, vfs_file_t **out)
     ff->vfs.ops = &fat32_vfs_ops;
     ff->vfs.fs_private = ff;
     *out = &ff->vfs;
-    kprintf("FAT32: open %s size=%lu cluster=%lu\n", path, ff->size, ff->start_cluster);
     return ST_OK;
 }
 
@@ -861,6 +884,8 @@ static long fat32_read(vfs_file_t *f, void *buf, long bytes)
     unsigned long remaining = (unsigned long)bytes;
     unsigned long copied = 0;
     unsigned cluster_size = ff->fs->sectors_per_cluster * ff->fs->bytes_per_sector;
+    
+    
     while (remaining) {
         unsigned cluster_offset = ff->pos % cluster_size;
         unsigned avail_in_cluster = cluster_size - cluster_offset;
@@ -884,8 +909,9 @@ static long fat32_read(vfs_file_t *f, void *buf, long bytes)
             break;
         if (ff->pos % cluster_size == 0) {
             unsigned long next = fat32_next_cluster_cached(ff->fs, ff->current_cluster);
-            if (next >= 0x0FFFFFF8 || next == 0)
+            if (next >= 0x0FFFFFF8 || next == 0) {
                 break;
+            }
             ff->current_cluster = next;
         }
     }

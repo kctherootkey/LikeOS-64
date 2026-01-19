@@ -154,24 +154,44 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
         kprintf("  Using fallback physical address calculation\n");
     }
     
-    // Start manageable memory after the kernel, aligned to page boundary
-    mm_state.memory_start = PAGE_ALIGN(kernel_end_phys);
+    // The kernel heap is allocated right after kernel_end in virtual space
+    // It occupies 8MB of physical memory. The bitmap follows.
+    // We must start the physical memory pool AFTER the heap AND bitmap.
+    
+    // Calculate the heap end in physical terms
+    uint64_t heap_start_virt = mm_get_kernel_heap_start();
+    uint64_t heap_end_virt = heap_start_virt + KERNEL_HEAP_SIZE;
+    
+    // Convert heap end virtual to physical
+    uint64_t kernel_virt_base = 0xFFFFFFFF80000000ULL;
+    uint64_t heap_end_phys = (heap_end_virt - kernel_virt_base) + (kernel_end_phys - (kernel_end_virt - kernel_virt_base));
+    
+    // Simplified: heap_end_phys = kernel_end_phys + KERNEL_HEAP_SIZE
+    heap_end_phys = kernel_end_phys + KERNEL_HEAP_SIZE;
+    
+    // Add space for bitmap (estimate) - we'll refine this after calculating total pages
+    // For 512MB of RAM, we need about 512MB/4KB = 128K pages = 16KB bitmap
+    // But let's be generous and reserve 64KB for the bitmap
+    uint64_t bitmap_reserve = 64 * 1024;
+    
+    // Start manageable memory after heap + bitmap, aligned to page boundary  
+    mm_state.memory_start = PAGE_ALIGN(heap_end_phys + bitmap_reserve);
     mm_state.memory_end = mm_state.memory_start + memory_size;
     mm_state.total_pages = (mm_state.memory_end - mm_state.memory_start) / PAGE_SIZE;
     mm_state.bitmap_size = PAGE_ALIGN((mm_state.total_pages + 7) / 8);
     
-    // Place bitmap after kernel heap area
-    uint64_t heap_start = mm_get_kernel_heap_start();
-    mm_state.physical_bitmap = (uint32_t*)(heap_start + KERNEL_HEAP_SIZE);
+    // Place bitmap after kernel heap area (in virtual space)
+    mm_state.physical_bitmap = (uint32_t*)(heap_start_virt + KERNEL_HEAP_SIZE);
     
     kprintf("  Kernel end virtual: %p\n", kernel_end);
     kprintf("  Kernel end physical: %p\n", (void*)kernel_end_phys);
+    kprintf("  Heap end physical: %p\n", (void*)heap_end_phys);
     kprintf("  Memory range: %p - %p (%lu MB)\n", 
            (void*)mm_state.memory_start, (void*)mm_state.memory_end,
            (mm_state.memory_end - mm_state.memory_start) / (1024*1024));
     kprintf("  Total pages: %d\n", mm_state.total_pages);
     kprintf("  Heap: %p - %p\n", 
-           (void*)heap_start, (void*)(heap_start + KERNEL_HEAP_SIZE));
+           (void*)heap_start_virt, (void*)(heap_start_virt + KERNEL_HEAP_SIZE));
     kprintf("  Bitmap at: %p (size: %d bytes)\n", 
            mm_state.physical_bitmap, mm_state.bitmap_size);
     kprintf("  Bitmap end: %p\n", 
@@ -190,27 +210,16 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
 
 // Reserve kernel memory areas
 void mm_reserve_kernel_memory(void) {
-    // Reserve kernel heap area (virtual heap area doesn't consume physical pages here)
-    // The bitmap is what we need to reserve
+    // The physical memory pool now starts AFTER the kernel, heap, and bitmap.
+    // So there's nothing to reserve - those areas are already excluded from
+    // the physical memory range [memory_start, memory_end).
+    
     uint64_t heap_start = mm_get_kernel_heap_start();
-    uint64_t bitmap_start_page = ((uint64_t)mm_state.physical_bitmap - heap_start) / PAGE_SIZE;
-    uint64_t bitmap_pages = mm_state.bitmap_size / PAGE_SIZE + 1;
     
-    // Note: We don't reserve the heap area in physical memory since it's in virtual space
-    // and will be mapped as needed
-    
-    for (uint64_t i = 0; i < bitmap_pages; i++) {
-        if (bitmap_start_page + i < mm_state.total_pages) {
-            set_page_bit(bitmap_start_page + i);
-            mm_state.free_pages--;
-        }
-    }
-    
-    kprintf("  Reserved areas:\n");
-    kprintf("    Kernel: Virtual space (heap at %p)\n", (void*)heap_start);
-    kprintf("    Bitmap: %d pages starting at virtual %p\n", 
-           bitmap_pages, mm_state.physical_bitmap);
-    kprintf("  Total reserved: %d pages\n", bitmap_pages);
+    kprintf("  Reserved areas (excluded from physical memory pool):\n");
+    kprintf("    Kernel + Heap + Bitmap: physical addresses before %p\n", 
+           (void*)mm_state.memory_start);
+    kprintf("  Physical memory starts at: %p\n", (void*)mm_state.memory_start);
 }
 
 // Allocate a physical page
@@ -528,6 +537,40 @@ static void coalesce_blocks(heap_block_t* block) {
     }
 }
 
+// Validate heap integrity - returns 0 if OK, -1 if corrupted
+int heap_validate(const char* caller) {
+    heap_block_t* cur = mm_state.free_list;
+    int count = 0;
+    uint64_t heap_end_addr = (uint64_t)mm_state.heap_end;
+    
+    while (cur && count < 1000) {
+        // Check magic
+        if (cur->magic != HEAP_MAGIC_ALLOCATED && cur->magic != HEAP_MAGIC_FREE) {
+            kprintf("HEAP CORRUPT at %s: block %p has bad magic 0x%08x\n", 
+                    caller, cur, cur->magic);
+            return -1;
+        }
+        // Check size is reasonable
+        if (cur->size == 0 || cur->size > mm_state.heap_size) {
+            kprintf("HEAP CORRUPT at %s: block %p has bad size %lu\n",
+                    caller, cur, cur->size);
+            return -1;
+        }
+        // Check next pointer is within heap or NULL
+        if (cur->next) {
+            uint64_t next_addr = (uint64_t)cur->next;
+            if (next_addr < (uint64_t)mm_state.heap_start || next_addr >= heap_end_addr) {
+                kprintf("HEAP CORRUPT at %s: block %p has bad next %p\n",
+                        caller, cur, cur->next);
+                return -1;
+            }
+        }
+        cur = cur->next;
+        count++;
+    }
+    return 0;
+}
+
 // Allocate memory
 void* kalloc(size_t size) {
     if (size == 0) {
@@ -539,6 +582,8 @@ void* kalloc(size_t size) {
     
     heap_block_t* block = find_free_block(size);
     if (!block) {
+        kprintf("kalloc FAILED for size %lu, heap used=%lu/%lu\n", 
+                (unsigned long)size, mm_state.heap_used, mm_state.heap_size);
         return NULL; // Out of memory
     }
     
@@ -566,7 +611,8 @@ void kfree(void* ptr) {
     
     // Validate block
     if (block->magic != HEAP_MAGIC_ALLOCATED || block->is_free) {
-        kprintf("ERROR: Invalid free() call for address %p\n", ptr);
+        kprintf("ERROR: Invalid free() call for address %p (magic=0x%08x free=%d)\n", 
+                ptr, block->magic, block->is_free);
         return;
     }
     
@@ -1035,7 +1081,6 @@ bool mm_map_user_stack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
         uint64_t phys = mm_allocate_physical_page();
         
         if (!phys) {
-            kprintf("mm_map_user_stack: Failed to allocate physical page %zu\n", i);
             // TODO: Unmap already-mapped pages
             return false;
         }
@@ -1046,7 +1091,6 @@ bool mm_map_user_stack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
         // Map with user, writable, non-executable flags (stack should not be executable)
         uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;
         if (!mm_map_page_in_address_space(pml4, vaddr, phys, flags)) {
-            kprintf("mm_map_user_stack: Failed to map page at %p\n", (void*)vaddr);
             mm_free_physical_page(phys);
             return false;
         }
@@ -1059,7 +1103,9 @@ bool mm_map_user_stack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
 uint64_t mm_get_physical_address_from_pml4(uint64_t* pml4, uint64_t virtual_addr) {
     uint64_t* pte = mm_get_page_table_from_pml4(pml4, virtual_addr, false);
     if (pte && (*pte & PAGE_PRESENT)) {
-        return (*pte & ~0xFFFULL) | (virtual_addr & 0xFFF);
+        // Physical address is in bits 12-51 (mask off flags at bits 0-11 and bit 63)
+        #define PTE_PHYS_MASK_ADDR 0x000FFFFFFFFFF000ULL
+        return (*pte & PTE_PHYS_MASK_ADDR) | (virtual_addr & 0xFFF);
     }
     return 0;
 }

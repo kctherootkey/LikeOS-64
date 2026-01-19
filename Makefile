@@ -70,7 +70,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/sched.o \
 			  $(BUILD_DIR)/syscall.o \
 			  $(BUILD_DIR)/syscall_c.o \
-			  $(BUILD_DIR)/user_test.o
+			  $(BUILD_DIR)/elf_loader.o
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -174,6 +174,9 @@ $(BUILD_DIR)/syscall.o: $(KERNEL_DIR)/ke/syscall.asm | $(BUILD_DIR)
 $(BUILD_DIR)/syscall_c.o: $(KERNEL_DIR)/ke/syscall.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/elf_loader.o: $(KERNEL_DIR)/ke/elf_loader.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
 # Build userspace startup code
 $(BUILD_DIR)/user_start.o: $(USER_DIR)/start.S | $(BUILD_DIR)
 	nasm -f elf64 $(USER_DIR)/start.S -o $@
@@ -182,18 +185,6 @@ $(BUILD_DIR)/user_start.o: $(USER_DIR)/start.S | $(BUILD_DIR)
 $(BUILD_DIR)/user_test.elf: $(BUILD_DIR)/user_start.o $(USER_DIR)/test_syscalls.c $(USER_DIR)/syscall.h $(USER_DIR)/user.lds | $(BUILD_DIR)
 	$(GCC) $(USER_CFLAGS) -c $(USER_DIR)/test_syscalls.c -o $(BUILD_DIR)/user_test_c.o
 	$(LD) -nostdlib -static -T $(USER_DIR)/user.lds $(BUILD_DIR)/user_start.o $(BUILD_DIR)/user_test_c.o -o $@
-
-# Convert user test to binary blob and then to object file
-$(BUILD_DIR)/user_test.o: $(BUILD_DIR)/user_test.elf | $(BUILD_DIR)
-	$(OBJCOPY) -O binary $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/user_test.bin
-	@# Create assembly wrapper to embed the binary
-	@echo 'section .rodata' > $(BUILD_DIR)/user_test_embed.asm
-	@echo 'global user_test_start' >> $(BUILD_DIR)/user_test_embed.asm
-	@echo 'global user_test_end' >> $(BUILD_DIR)/user_test_embed.asm
-	@echo 'user_test_start:' >> $(BUILD_DIR)/user_test_embed.asm
-	@echo '    incbin "$(BUILD_DIR)/user_test.bin"' >> $(BUILD_DIR)/user_test_embed.asm
-	@echo 'user_test_end:' >> $(BUILD_DIR)/user_test_embed.asm
-	nasm -f elf64 $(BUILD_DIR)/user_test_embed.asm -o $@
 
 # Build kernel ELF
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel.lds | $(BUILD_DIR)
@@ -293,8 +284,8 @@ qemu-fat: $(FAT_IMAGE)
 	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -drive format=raw,file=$(FAT_IMAGE) -m 512M -serial stdio
 
 # Standalone USB mass storage data image (64MB FAT32) now mirrors usb-write target (UEFI bootable + signature files)
-# Provides: EFI/BOOT/BOOTX64.EFI, kernel.elf, LIKEOS.SIG, HELLO.TXT
-$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) | $(BUILD_DIR)
+# Provides: EFI/BOOT/BOOTX64.EFI, kernel.elf, LIKEOS.SIG, HELLO.TXT, tests
+$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf | $(BUILD_DIR)
 	@echo "Creating USB data FAT32 image (msdata.img, 64MB, UEFI bootable)..."
 	$(DD) if=/dev/zero of=$(DATA_IMAGE) bs=1M count=64
 	$(MKFS_FAT) -F32 -n "MSDATA" $(DATA_IMAGE)
@@ -303,13 +294,15 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) | $(BUILD_DIR)
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/EFI/BOOT
 	MTOOLS_SKIP_CHECK=1 $(MTOOLS) -i $(DATA_IMAGE) $(BOOTLOADER_EFI) ::/EFI/BOOT/BOOTX64.EFI
 	MTOOLS_SKIP_CHECK=1 $(MTOOLS) -i $(DATA_IMAGE) $(KERNEL_ELF) ::/kernel.elf
+	# Add test program ELF
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/user_test.elf ::/tests
 	# Add signature + sample files
 	echo "THIS IS A DEVICE STORING LIKEOS" > $(BUILD_DIR)/LIKEOS.SIG
 	echo "Hello from USB mass storage" > $(BUILD_DIR)/HELLO.TXT
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/LIKEOS.SIG ::/LIKEOS.SIG
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/HELLO.TXT ::/HELLO.TXT
 	rm -f $(BUILD_DIR)/LIKEOS.SIG $(BUILD_DIR)/HELLO.TXT || true
-	@echo "Data image created (UEFI + signature files): $(DATA_IMAGE)"
+	@echo "Data image created (UEFI + signature files + tests): $(DATA_IMAGE)"
 
 # Run with ISO boot plus attached xHCI controller and USB mass storage device
 qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)

@@ -29,5 +29,6 @@ int vfs_register_root(const vfs_ops_t* ops);
 int vfs_open(const char* path, vfs_file_t** out);
 long vfs_read(vfs_file_t* f, void* buf, long bytes);
 int vfs_close(vfs_file_t* f);
+size_t vfs_size(vfs_file_t* f);
 
 #endif // LIKEOS_VFS_H

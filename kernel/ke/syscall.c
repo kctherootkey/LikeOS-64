@@ -231,13 +231,14 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         vaddr = addr;
     } else {
         // Allocate from mmap area (grows down from below stack)
-        vaddr = cur->mmap_base;
+        // Move base down first, then return the new base as the start of the mapped region
         cur->mmap_base -= length;
         if (cur->mmap_base < cur->brk + (4 * 1024 * 1024)) {
             // Too close to heap
             cur->mmap_base += length;  // Rollback
             return (int64_t)MAP_FAILED;
         }
+        vaddr = cur->mmap_base;
     }
     
     // Calculate page flags

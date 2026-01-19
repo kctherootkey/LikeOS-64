@@ -5,6 +5,7 @@
 #include "../../include/kernel/vfs.h"
 #include "../../include/kernel/block.h"
 #include "../../include/kernel/memory.h"
+#include "../../include/kernel/elf.h"
 
 // Simple path stack for prompt (stores directory names after root)
 #define SHELL_MAX_DEPTH 16
@@ -254,7 +255,31 @@ int shell_tick(void) {
                     }
                 }
             } else {
-                kprintf("Unknown command\n");
+                // Check if command starts with ./ (execute ELF)
+                int is_exec = (cmdlen >= 2 && cmd_buf[start] == '.' && cmd_buf[start + 1] == '/');
+                if (is_exec) {
+                    // Extract path (skip the ./)
+                    const char* exec_path = &cmd_buf[start + 1];  // Keep the leading /
+                    
+                    // Build argv: program name and any arguments
+                    // For now, just use the path as argv[0]
+                    char* argv[2];
+                    argv[0] = (char*)exec_path;
+                    argv[1] = NULL;
+                    
+                    // Build envp with PATH=/
+                    char* envp[2];
+                    char path_env[] = "PATH=/";
+                    envp[0] = path_env;
+                    envp[1] = NULL;
+                    
+                    int ret = elf_exec(exec_path, argv, envp);
+                    if (ret != 0) {
+                        kprintf("exec: failed (error %d)\n", ret);
+                    }
+                } else {
+                    kprintf("Unknown command\n");
+                }
             }
 after_cmd:
             ;

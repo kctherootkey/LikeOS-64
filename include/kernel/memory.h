@@ -11,7 +11,7 @@
 #define PAGE_ALIGN(addr)        ((addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
 #define PAGE_ALIGN_DOWN(addr)   (addr & ~(PAGE_SIZE - 1))
 #define PAGES_PER_BITMAP_ENTRY  32          // 32 pages per uint32_t
-#define KERNEL_HEAP_SIZE        0x800000    // 8MB initial heap size
+#define KERNEL_HEAP_SIZE        0x800000    // 8MB kernel heap size
 
 // User space virtual address constants
 #define USER_SPACE_START        0x0000000000400000ULL  // 4MB - typical ELF load address
@@ -146,6 +146,7 @@ void* kalloc(size_t size);
 void kfree(void* ptr);
 void* krealloc(void* ptr, size_t new_size);
 void* kcalloc(size_t count, size_t size);
+int heap_validate(const char* caller);
 
 // Memory utilities
 void mm_get_memory_stats(memory_stats_t* stats);

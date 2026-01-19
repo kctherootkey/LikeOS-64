@@ -59,8 +59,12 @@ static int bot_send_cbw(xhci_controller_t *ctrl, usb_device_t *dev, usb_msd_cbw_
     for (i = 0; i < sizeof(usb_msd_cbw_t); ++i)
         ((uint8_t *)ctrl->msd_cbw_buf)[i] = ((uint8_t *)cbw)[i];
     /* Pre-track TRB slot BEFORE ringing doorbell to avoid race where event fires first */
+    /* Handle wrapping: if enqueue_idx >= 15, we'll wrap to 0 inside xhci_enqueue_bulk_out */
     if (ctrl->bulk_out_ring) {
-        unsigned pre_idx = ctrl->bulk_out_enqueue % 16; /* index that will be used */
+        unsigned pre_idx = ctrl->bulk_out_enqueue;
+        if (pre_idx >= 15) {
+            pre_idx = 0; /* Will wrap to index 0 */
+        }
         ctrl->msd_cbw_trb = &((xhci_trb_t *)ctrl->bulk_out_ring)[pre_idx];
         ctrl->msd_cbw_phys = ctrl->bulk_out_ring_phys + pre_idx * sizeof(xhci_trb_t);
     }
@@ -280,20 +284,10 @@ static void msd_recover_reset(xhci_controller_t *ctrl, usb_device_t *dev)
     XHCI_MSD_LOG("MSD: BOT RESET issued\n");
     }
     msd_recover_clear_stalls(ctrl, dev);
-    /* Rebuild bulk endpoint configuration and rings from scratch to avoid stale halted state */
-    if (dev) {
-        dev->endpoints_configured = 0;
-    }
-    ctrl->bulk_in_ring = 0;
-    ctrl->bulk_out_ring = 0;
-    ctrl->bulk_in_ring_phys = 0;
-    ctrl->bulk_out_ring_phys = 0;
-    ctrl->bulk_in_cycle = 1;
-    ctrl->bulk_out_cycle = 1;
-    ctrl->bulk_in_enqueue = 0;
-    ctrl->bulk_out_enqueue = 0;
-    xhci_configure_mass_storage_endpoints(ctrl, dev);
-    msd_wait_cmd_clear(ctrl, 4000);
+    /* Don't touch the rings or endpoint configuration */
+    /* Just clear the BOT protocol state - the retry logic will handle re-issuing commands */
+    XHCI_MSD_LOG("MSD: BOT reset complete\n");
+    
     /* Clear instrumentation so future attempts count fresh events */
     ctrl->msd_cbw_events = 0;
     ctrl->msd_data_events = 0;
@@ -397,7 +391,10 @@ static int msd_issue_read10(xhci_controller_t *ctrl, usb_device_t *dev,
     cbw.cb[8] = blocks & 0xFF;
     if (bot_send_cbw(ctrl, dev, &cbw) == 0) {
         if (ctrl->bulk_in_ring) {
-            unsigned pre_idx = ctrl->bulk_in_enqueue % 16;
+            unsigned pre_idx = ctrl->bulk_in_enqueue;
+            if (pre_idx >= 15) {
+                pre_idx = 0; /* Will wrap to index 0 */
+            }
             ctrl->msd_data_trb = &((xhci_trb_t *)ctrl->bulk_in_ring)[pre_idx];
             ctrl->msd_data_phys = ctrl->bulk_in_ring_phys + pre_idx * sizeof(xhci_trb_t);
         }

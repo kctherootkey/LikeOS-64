@@ -183,7 +183,6 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
     }
 
     enqueue_task(t);
-    kprintf("Added user task %d\n", t->id);
     
     return t;
 }
