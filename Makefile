@@ -309,7 +309,7 @@ qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
 	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage..."
 	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio \
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
-		-device usb-storage,drive=usbdisk
+		-device usb-storage,drive=usbdisk -machine type=pc,accel=kvm:tcg
 
 # Extended USB passthrough target: attach tablet + optional host devices (edit vendor/product)
 qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)

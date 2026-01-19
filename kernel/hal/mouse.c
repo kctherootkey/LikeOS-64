@@ -156,10 +156,11 @@ static uint8_t mouse_detect_type(void)
         mouse_state.packet_size = 4;
         return MOUSE_TYPE_INTELLIMOUSE;
     } else {
-        kprintf("  Standard mouse detected\n");
-        mouse_state.has_scroll_wheel = 0;
-        mouse_state.packet_size = 3;
-        return MOUSE_TYPE_STANDARD;
+        // QEMU workaround: force IntelliMouse mode even if detection failed
+        kprintf("  Standard mouse ID detected, but forcing IntelliMouse mode for QEMU compatibility\n");
+        mouse_state.has_scroll_wheel = 1;
+        mouse_state.packet_size = 4;
+        return MOUSE_TYPE_INTELLIMOUSE;
     }
 }
 

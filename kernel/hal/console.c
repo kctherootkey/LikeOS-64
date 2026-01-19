@@ -722,22 +722,30 @@ void console_backspace(void) {
 
 // ================= Cursor Control Functions =================
 void console_cursor_enable(void) {
+    // Update tracking to current position first
+    cursor_last_x = cursor_x;
+    cursor_last_y = cursor_y;
     cursor_enabled = 1;
     cursor_shown = 1;
     cursor_blink_ticks = 0;
-    cursor_last_x = cursor_x;
-    cursor_last_y = cursor_y;
-    draw_cursor_at(cursor_x, cursor_y, 1);
-    fb_flush_dirty_regions();
+    // Draw cursor at current position
+    if (g_sb.at_bottom) {
+        draw_cursor_at(cursor_x, cursor_y, 1);
+        fb_flush_dirty_regions();
+    }
 }
 
 void console_cursor_disable(void) {
-    if (cursor_shown) {
-        draw_cursor_at(cursor_x, cursor_y, 0);
+    if (cursor_enabled && cursor_shown) {
+        // Erase cursor at the position where it was last drawn
+        draw_cursor_at(cursor_last_x, cursor_last_y, 0);
         fb_flush_dirty_regions();
     }
     cursor_enabled = 0;
     cursor_shown = 0;
+    // Update tracking to current position
+    cursor_last_x = cursor_x;
+    cursor_last_y = cursor_y;
 }
 
 void console_cursor_update(void) {
@@ -879,6 +887,16 @@ void console_handle_mouse_wheel(int delta) {
     } else if (delta < 0) {
         uint32_t steps = (-delta > 3) ? 3 : (uint32_t)(-delta);
         for (uint32_t i = 0; i < steps; ++i) console_scroll_up_line();
+    }
+    
+    // If we're back at bottom and cursor should be visible, draw it
+    if (cursor_enabled && g_sb.at_bottom) {
+        cursor_shown = 1;
+        cursor_blink_ticks = 0;
+        cursor_last_x = cursor_x;
+        cursor_last_y = cursor_y;
+        draw_cursor_at(cursor_x, cursor_y, 1);
+        fb_flush_dirty_regions();
     }
 }
 
