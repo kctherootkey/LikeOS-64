@@ -105,7 +105,7 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
         return -EBADF;
     }
     
-    // TODO: Implement vfs_write when VFS supports it
+    // Write to USB storage not currently supported (read-only filesystem)
     return -ENOSYS;
 }
 
@@ -154,6 +154,30 @@ static int64_t sys_close(uint64_t fd) {
     cur->fd_table[fd] = NULL;
     
     return 0;
+}
+
+// SYS_LSEEK - reposition file offset
+static int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    // stdin/stdout/stderr are not seekable
+    if (fd < 3) {
+        return -ESPIPE;
+    }
+    
+    if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) {
+        return -EBADF;
+    }
+    
+    vfs_file_t* file = cur->fd_table[fd];
+    long result = vfs_seek(file, (long)offset, (int)whence);
+    
+    if (result < 0) {
+        return -EINVAL;
+    }
+    
+    return result;
 }
 
 // SYS_BRK - set program break
@@ -252,11 +276,18 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     
     // Map pages
     bool is_anonymous = (flags & MAP_ANONYMOUS) || (int64_t)fd == -1;
+    uint64_t pages_mapped = 0;
     
     for (uint64_t off = 0; off < length; off += PAGE_SIZE) {
         uint64_t phys = mm_allocate_physical_page();
         if (!phys) {
-            // TODO: Unmap already-mapped pages on failure
+            // Unmap already-mapped pages on failure
+            for (uint64_t cleanup = 0; cleanup < off; cleanup += PAGE_SIZE) {
+                mm_unmap_page_in_address_space(cur->pml4, vaddr + cleanup);
+            }
+            if (!(flags & MAP_FIXED)) {
+                cur->mmap_base += length;  // Rollback
+            }
             return (int64_t)MAP_FAILED;
         }
         
@@ -264,15 +295,26 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         
         // For file-backed mappings, read content from file
         if (!is_anonymous && fd < TASK_MAX_FDS && cur->fd_table[fd]) {
-            // TODO: Implement file-backed mapping with vfs_read
-            // For now, we'd need vfs_seek + vfs_read
-            // Just zero-fill for now
+            vfs_file_t* file = cur->fd_table[fd];
+            // Seek to the correct position and read
+            long file_off = (long)(offset + off);
+            if (vfs_seek(file, file_off, SEEK_SET) >= 0) {
+                vfs_read(file, (void*)phys, PAGE_SIZE);
+            }
         }
         
         if (!mm_map_page_in_address_space(cur->pml4, vaddr + off, phys, page_flags)) {
             mm_free_physical_page(phys);
+            // Unmap already-mapped pages on failure
+            for (uint64_t cleanup = 0; cleanup < off; cleanup += PAGE_SIZE) {
+                mm_unmap_page_in_address_space(cur->pml4, vaddr + cleanup);
+            }
+            if (!(flags & MAP_FIXED)) {
+                cur->mmap_base += length;  // Rollback
+            }
             return (int64_t)MAP_FAILED;
         }
+        pages_mapped++;
     }
     
     // Record the mapping
@@ -330,6 +372,9 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
             
         case SYS_CLOSE:
             return sys_close(a1);
+            
+        case SYS_LSEEK:
+            return sys_lseek(a1, (int64_t)a2, a3);
             
         case SYS_MMAP:
             return sys_mmap(a1, a2, a3, a4, a5, 0);  // Note: 6th arg (offset) would need special handling

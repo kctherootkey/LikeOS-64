@@ -3,6 +3,7 @@
 #define SYS_WRITE       1
 #define SYS_OPEN        2
 #define SYS_CLOSE       3
+#define SYS_LSEEK       8
 #define SYS_BRK         12
 #define SYS_MMAP        9
 #define SYS_MUNMAP      11

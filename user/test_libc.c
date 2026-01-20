@@ -113,6 +113,62 @@ int main(int argc, char** argv) {
     len = snprintf(sprbuf, 10, "Long string that will be truncated");
     printf("  snprintf(10) returned %d, result: \"%s\"\n", len, sprbuf);
     
+    // Test fseek/ftell/rewind
+    printf("\n[TEST] fseek/ftell/rewind\n");
+    fp = fopen("/HELLO.TXT", "r");
+    if (fp) {
+        // Read first 5 bytes
+        char seekbuf[32];
+        memset(seekbuf, 0, sizeof(seekbuf));
+        fread(seekbuf, 1, 5, fp);
+        printf("  First 5 bytes: \"%s\"\n", seekbuf);
+        
+        // Check position with ftell
+        long pos = ftell(fp);
+        printf("  ftell() after read = %ld\n", pos);
+        
+        // Seek back to start
+        fseek(fp, 0, 0); // SEEK_SET
+        pos = ftell(fp);
+        printf("  ftell() after fseek(0, SEEK_SET) = %ld\n", pos);
+        
+        // Seek to position 6
+        fseek(fp, 6, 0); // SEEK_SET
+        memset(seekbuf, 0, sizeof(seekbuf));
+        fread(seekbuf, 1, 4, fp);
+        printf("  4 bytes after seek to 6: \"%s\"\n", seekbuf);
+        
+        // Test rewind
+        rewind(fp);
+        pos = ftell(fp);
+        printf("  ftell() after rewind = %ld\n", pos);
+        
+        fclose(fp);
+    } else {
+        printf("  fopen failed for seek test\n");
+    }
+    
+    // Test getenv/setenv
+    printf("\n[TEST] getenv/setenv\n");
+    char* val = getenv("TEST_VAR");
+    printf("  getenv(\"TEST_VAR\") before set = %s\n", val ? val : "(null)");
+    
+    int rc = setenv("TEST_VAR", "hello_world", 1);
+    printf("  setenv(\"TEST_VAR\", \"hello_world\", 1) = %d\n", rc);
+    
+    val = getenv("TEST_VAR");
+    printf("  getenv(\"TEST_VAR\") after set = %s\n", val ? val : "(null)");
+    
+    // Test setenv with overwrite=0
+    rc = setenv("TEST_VAR", "new_value", 0);
+    val = getenv("TEST_VAR");
+    printf("  After setenv with overwrite=0, value = %s\n", val ? val : "(null)");
+    
+    // Test unsetenv
+    rc = unsetenv("TEST_VAR");
+    val = getenv("TEST_VAR");
+    printf("  After unsetenv, getenv = %s\n", val ? val : "(null)");
+
     printf("\n========================================\n");
     printf("  All libc tests completed!\n");
     printf("========================================\n");

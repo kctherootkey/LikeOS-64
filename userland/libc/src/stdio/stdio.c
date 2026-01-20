@@ -171,23 +171,35 @@ int puts(const char* s) {
 }
 
 int fflush(FILE* stream) {
-    // TODO: Implement buffering
+    // Currently unbuffered I/O - fread/fwrite go directly to syscalls
+    // No buffered data to flush, so this is a no-op
     (void)stream;
     return 0;
 }
 
 int fseek(FILE* stream, long offset, int whence) {
-    // TODO: Implement when lseek syscall is available
-    (void)stream;
-    (void)offset;
-    (void)whence;
-    return -1;
+    if (!stream) {
+        return -1;
+    }
+    
+    // Clear EOF flag on seek
+    stream->eof = 0;
+    
+    off_t result = lseek(stream->fd, offset, whence);
+    if (result < 0) {
+        stream->error = 1;
+        return -1;
+    }
+    return 0;
 }
 
 long ftell(FILE* stream) {
-    // TODO: Implement when lseek syscall is available
-    (void)stream;
-    return -1;
+    if (!stream) {
+        return -1;
+    }
+    
+    // Use lseek with offset 0 and SEEK_CUR to get current position
+    return (long)lseek(stream->fd, 0, SEEK_CUR);
 }
 
 void rewind(FILE* stream) {

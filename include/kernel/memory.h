@@ -121,6 +121,7 @@ void mm_remap_kernel_with_nx(void);
 bool mm_map_page(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags);
 bool mm_map_page_in_address_space(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags);
 void mm_unmap_page(uint64_t virtual_addr);
+void mm_unmap_page_in_address_space(uint64_t* pml4, uint64_t virtual_addr);
 uint64_t mm_get_physical_address(uint64_t virtual_addr);
 uint64_t mm_get_physical_address_from_pml4(uint64_t* pml4, uint64_t virtual_addr);
 bool mm_is_page_mapped(uint64_t virtual_addr);

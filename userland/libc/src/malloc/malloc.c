@@ -93,7 +93,25 @@ void free(void* ptr) {
     block_t* block = get_block_ptr(ptr);
     block->free = 1;
     
-    // TODO: Coalesce adjacent free blocks
+    // Coalesce with next block if it's free
+    if (block->next && block->next->free) {
+        block->size += BLOCK_SIZE + block->next->size;
+        block->next = block->next->next;
+    }
+    
+    // Coalesce with previous block if it's free
+    // Need to find the previous block by walking from heap_start
+    block_t* prev = NULL;
+    block_t* current = heap_start;
+    while (current && current != block) {
+        prev = current;
+        current = current->next;
+    }
+    
+    if (prev && prev->free) {
+        prev->size += BLOCK_SIZE + block->size;
+        prev->next = block->next;
+    }
 }
 
 void* calloc(size_t nmemb, size_t size) {

@@ -438,6 +438,23 @@ void mm_unmap_page(uint64_t virtual_addr) {
     }
 }
 
+// Unmap virtual page in a specific address space
+void mm_unmap_page_in_address_space(uint64_t* pml4, uint64_t virtual_addr) {
+    uint64_t* pte = mm_get_page_table_from_pml4(pml4, virtual_addr, false);
+    if (pte && (*pte & PAGE_PRESENT)) {
+        // Free the physical page
+        uint64_t phys = *pte & ~0xFFFULL;
+        if (phys) {
+            mm_free_physical_page(phys);
+        }
+        *pte = 0;
+        // Flush TLB if this is the current address space
+        if (pml4 == mm_get_current_address_space()) {
+            mm_flush_tlb(virtual_addr);
+        }
+    }
+}
+
 // Get physical address for virtual address
 uint64_t mm_get_physical_address(uint64_t virtual_addr) {
     uint64_t* pte = mm_get_page_table(virtual_addr, false);
@@ -1081,7 +1098,10 @@ bool mm_map_user_stack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
         uint64_t phys = mm_allocate_physical_page();
         
         if (!phys) {
-            // TODO: Unmap already-mapped pages
+            // Unmap already-mapped pages on failure
+            for (size_t j = 0; j < i; j++) {
+                mm_unmap_page_in_address_space(pml4, stack_bottom + (j * PAGE_SIZE));
+            }
             return false;
         }
         
@@ -1092,6 +1112,10 @@ bool mm_map_user_stack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
         uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;
         if (!mm_map_page_in_address_space(pml4, vaddr, phys, flags)) {
             mm_free_physical_page(phys);
+            // Unmap already-mapped pages on failure
+            for (size_t j = 0; j < i; j++) {
+                mm_unmap_page_in_address_space(pml4, stack_bottom + (j * PAGE_SIZE));
+            }
             return false;
         }
     }

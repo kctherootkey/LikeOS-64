@@ -9,6 +9,7 @@
 #define SYS_WRITE       1
 #define SYS_OPEN        2
 #define SYS_CLOSE       3
+#define SYS_LSEEK       8
 #define SYS_MMAP        9
 #define SYS_BRK         12
 #define SYS_GETPID      39
@@ -59,6 +60,7 @@
 #define EFAULT          14  // Bad address
 #define EINVAL          22  // Invalid argument
 #define EMFILE          24  // Too many open files
+#define ESPIPE          29  // Illegal seek
 #define ENOSYS          38  // Function not implemented
 
 // Syscall handler prototype

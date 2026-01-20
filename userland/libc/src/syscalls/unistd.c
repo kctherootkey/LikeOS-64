@@ -42,10 +42,12 @@ int close(int fd) {
 }
 
 off_t lseek(int fd, off_t offset, int whence) {
-    // TODO: Implement SYS_LSEEK in kernel
-    (void)fd; (void)offset; (void)whence;
-    errno = ENOSYS;
-    return -1;
+    long ret = syscall3(SYS_LSEEK, fd, offset, whence);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return ret;
 }
 
 pid_t getpid(void) {

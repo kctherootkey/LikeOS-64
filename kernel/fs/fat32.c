@@ -859,8 +859,9 @@ unsigned long fat32_parent_cluster(unsigned long dir_cluster)
 // Forward declare ops so open can assign pointer
 static int fat32_open(const char* path, vfs_file_t** out);
 static long fat32_read(vfs_file_t* f, void* buf, long bytes);
+static long fat32_seek(vfs_file_t* f, long offset, int whence);
 static int fat32_close(vfs_file_t* f);
-static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_read, fat32_close };
+static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_read, fat32_seek, fat32_close };
 
 static int fat32_open(const char *path, vfs_file_t **out)
 {
@@ -935,6 +936,59 @@ static long fat32_read(vfs_file_t *f, void *buf, long bytes)
     }
     return (long)copied;
 }
+
+// Seek to position in file
+static long fat32_seek(vfs_file_t *f, long offset, int whence)
+{
+    if (!f)
+        return -1;
+    fat32_file_t *ff = (fat32_file_t *)f->fs_private;
+    if (!ff)
+        return -1;
+    
+    long new_pos;
+    switch (whence) {
+        case 0: // SEEK_SET
+            new_pos = offset;
+            break;
+        case 1: // SEEK_CUR
+            new_pos = (long)ff->pos + offset;
+            break;
+        case 2: // SEEK_END
+            new_pos = (long)ff->size + offset;
+            break;
+        default:
+            return -1;
+    }
+    
+    if (new_pos < 0)
+        return -1;
+    if ((unsigned long)new_pos > ff->size)
+        new_pos = (long)ff->size;
+    
+    // Update position and recalculate current cluster
+    unsigned long target_pos = (unsigned long)new_pos;
+    unsigned cluster_size = ff->fs->sectors_per_cluster * ff->fs->bytes_per_sector;
+    
+    // Walk the cluster chain to find the cluster containing target_pos
+    unsigned long cluster = ff->start_cluster;
+    unsigned long cluster_start = 0;
+    
+    while (cluster_start + cluster_size <= target_pos && target_pos < ff->size) {
+        unsigned long next = fat32_next_cluster_cached(ff->fs, cluster);
+        if (next >= 0x0FFFFFF8 || next == 0) {
+            break;
+        }
+        cluster = next;
+        cluster_start += cluster_size;
+    }
+    
+    ff->pos = target_pos;
+    ff->current_cluster = cluster;
+    
+    return (long)ff->pos;
+}
+
 static int fat32_close(vfs_file_t *f)
 {
     if (!f)

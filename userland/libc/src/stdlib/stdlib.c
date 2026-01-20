@@ -1,6 +1,15 @@
 #include "../../include/stdlib.h"
 #include "../../include/unistd.h"
 #include "../../include/ctype.h"
+#include "../../include/string.h"
+
+// Simple environment variable storage
+#define MAX_ENV_VARS 32
+#define MAX_ENV_SIZE 256
+
+static char env_names[MAX_ENV_VARS][MAX_ENV_SIZE];
+static char env_values[MAX_ENV_VARS][MAX_ENV_SIZE];
+static int env_count = 0;
 
 void exit(int status) {
     _exit(status);
@@ -107,9 +116,65 @@ unsigned long long strtoull(const char* nptr, char** endptr, int base) {
 }
 
 char* getenv(const char* name) {
-    // TODO: Implement environment variable support
-    (void)name;
+    if (!name) {
+        return NULL;
+    }
+    
+    for (int i = 0; i < env_count; i++) {
+        if (strcmp(env_names[i], name) == 0) {
+            return env_values[i];
+        }
+    }
     return NULL;
+}
+
+int setenv(const char* name, const char* value, int overwrite) {
+    if (!name || !value || name[0] == '\0' || strchr(name, '=') != NULL) {
+        return -1;
+    }
+    
+    // Check if variable already exists
+    for (int i = 0; i < env_count; i++) {
+        if (strcmp(env_names[i], name) == 0) {
+            if (overwrite) {
+                strncpy(env_values[i], value, MAX_ENV_SIZE - 1);
+                env_values[i][MAX_ENV_SIZE - 1] = '\0';
+            }
+            return 0;
+        }
+    }
+    
+    // Add new variable
+    if (env_count >= MAX_ENV_VARS) {
+        return -1;  // No space
+    }
+    
+    strncpy(env_names[env_count], name, MAX_ENV_SIZE - 1);
+    env_names[env_count][MAX_ENV_SIZE - 1] = '\0';
+    strncpy(env_values[env_count], value, MAX_ENV_SIZE - 1);
+    env_values[env_count][MAX_ENV_SIZE - 1] = '\0';
+    env_count++;
+    
+    return 0;
+}
+
+int unsetenv(const char* name) {
+    if (!name || name[0] == '\0' || strchr(name, '=') != NULL) {
+        return -1;
+    }
+    
+    for (int i = 0; i < env_count; i++) {
+        if (strcmp(env_names[i], name) == 0) {
+            // Move last entry to this position
+            if (i < env_count - 1) {
+                strcpy(env_names[i], env_names[env_count - 1]);
+                strcpy(env_values[i], env_values[env_count - 1]);
+            }
+            env_count--;
+            return 0;
+        }
+    }
+    return 0;  // Not found is not an error
 }
 
 int abs(int n) {
