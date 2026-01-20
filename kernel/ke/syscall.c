@@ -432,99 +432,52 @@ static int64_t sys_fork(void) {
         return -1;
     }
     
-    // Capture user context BEFORE fork (these are set at syscall entry)
-    uint64_t user_rip = syscall_saved_user_rip;
-    uint64_t user_rsp = syscall_saved_user_rsp;
-    uint64_t user_rflags = syscall_saved_user_rflags;
+    // Capture user context saved by syscall entry (from syscall.asm)
+    uint64_t user_rip = syscall_saved_user_rip;      // Where to resume execution
+    uint64_t user_rsp = syscall_saved_user_rsp;      // User stack pointer
+    uint64_t user_rflags = syscall_saved_user_rflags; // Saved RFLAGS
     
-    // Create child process with cloned address space
+    // Create child with cloned address space and file descriptors
     task_t* child = sched_fork_current();
     if (!child) {
         return -1;  // Fork failed
     }
     
-    // Set up child's kernel stack to return to userspace via IRET with RAX=0
-    // The child's kernel stack needs to be set up like sched_add_user_task does
-    // but returning to the user's current RIP instead of a new entry point
+    // Set up child's kernel stack to return to userspace
+    // When the child is scheduled, it will resume at user_rip with fork() returning 0
+    // 
+    // Stack layout (from top to bottom):
+    // 1. IRET frame: SS, RSP, RFLAGS, CS, RIP (to return to userspace)
+    // 2. RAX value (0 for child's fork return value)
+    // 3. Saved callee-saved registers for ctx_switch_asm (r15-rbp)
+    // 4. Return address (fork_child_return trampoline)
     
     uint64_t* k_sp = (uint64_t*)child->kernel_stack_top;
-    k_sp = (uint64_t*)((uint64_t)k_sp & ~0xFUL);
+    k_sp = (uint64_t*)((uint64_t)k_sp & ~0xFUL);  // Align to 16 bytes
     
-    // IRET frame: SS, RSP, RFLAGS, CS, RIP
-    *(--k_sp) = 0x1B;                    // SS (user data segment)
-    *(--k_sp) = user_rsp;                // User RSP
-    *(--k_sp) = user_rflags | 0x200;     // RFLAGS (ensure IF is set)
-    *(--k_sp) = 0x23;                    // CS (user code segment)
-    *(--k_sp) = user_rip;                // Return to where parent called fork
+    // Push IRET frame (used by fork_child_return to return to userspace)
+    *(--k_sp) = 0x1B;                    // SS: user data segment
+    *(--k_sp) = user_rsp;                // User stack pointer
+    *(--k_sp) = user_rflags | 0x200;     // RFLAGS with interrupts enabled
+    *(--k_sp) = 0x23;                    // CS: user code segment
+    *(--k_sp) = user_rip;                // Resume at parent's fork() call site
     
-    // Before IRET, we need to set RAX to 0 (fork return value for child)
-    // We'll use a small trampoline that sets RAX=0 then does IRET
-    // For now, push a return address that goes to user_mode_iret_trampoline
-    // but first we need to set RAX=0
+    // Push fork return value for child (0)
+    *(--k_sp) = 0;  // RAX = 0 (child sees fork() return 0)
     
-    // Actually, we need to set up for ctx_switch_asm which expects:
-    // r15, r14, r13, r12, rbx, rbp, [return address]
-    // The return address should be a function that sets RAX=0 and does IRET
-    
-    // We'll push 0s for callee-saved regs and use a wrapper that sets RAX=0
-    // For simplicity, we'll store RAX in a register that will be restored
-    
-    // Stack for ctx_switch_asm: needs return addr, rbp, rbx, r12, r13, r14, r15
-    // When ctx_switch_asm returns (ret), it will go to our trampoline
-    
-    // We push a return address to fork_child_return which sets RAX=0 and does IRET
-    // But we don't have such a function... let's create inline asm for it
-    
-    // Alternative: use r15 to hold 0 and have the trampoline move it to RAX
-    // But that's complex. Simpler: set up full iret frame and use a trampoline
-    
-    // Let's use a slightly different approach: set up like a fresh user task
-    // The child will start executing at user_rip with RAX=0
-    
-    // We can set RAX on the user stack or use a register
-    // Actually, IRET doesn't set RAX. We need the code before IRET to set RAX=0
-    
-    // Create a kernel function that sets RAX=0 and does IRET
-    // For now, we'll inline it in the child's execution path
-    
-    // Simple approach: set is_fork_child flag and check in sched_yield/run_ready
-    // When switching TO a fork_child, set RAX=0 before returning
-    // This requires modifying ctx_switch_asm or having a fork_child trampoline
-    
-    // For this implementation, let's use a simpler approach:
-    // We add r15=0 (which will be the fork return value) and have the 
-    // trampoline copy r15 to rax before doing iret
-    
-    // Actually the cleanest way: add a fork_child_entry in asm that:
-    // 1. Sets RAX to 0
-    // 2. Does IRET using the stack frame we set up
-    
-    // For now, let's create a minimal solution: 
-    // The IRET frame is set up. Before that, we push callee-saved regs.
-    // The "return address" for ctx_switch goes to fork_child_trampoline
-    // which just does: xor eax,eax; iretq
-    
-    // Since we don't have that yet, let's make the child manually clear rax
-    // by having the user code check. OR, we can embed a return of 0 directly.
-    
-    // The simplest working solution: modify the stack to include rax=0
-    // before the IRET, and have a trampoline that pops rax then iretq
-    
-    // Let's push rax=0 and use a modified trampoline
-    *(--k_sp) = 0;  // RAX value (fork returns 0 for child)
-    
-    // Now set up for ctx_switch_asm
-    *(--k_sp) = (uint64_t)fork_child_return;  // Return address
-    *(--k_sp) = 0; // rbp
-    *(--k_sp) = 0; // rbx
-    *(--k_sp) = 0; // r12
-    *(--k_sp) = 0; // r13
-    *(--k_sp) = 0; // r14
-    *(--k_sp) = 0; // r15
+    // Push callee-saved registers (ctx_switch_asm will restore these)
+    *(--k_sp) = (uint64_t)fork_child_return;  // Return address: sets RAX=0 and does IRET
+    *(--k_sp) = 0; // RBP
+    *(--k_sp) = 0; // RBX
+    *(--k_sp) = 0; // R12
+    *(--k_sp) = 0; // R13
+    *(--k_sp) = 0; // R14
+    *(--k_sp) = 0; // R15
     
     child->sp = k_sp;
     
-    return child->id;  // Parent returns child PID
+    // Parent returns child's PID
+    return child->id;
 }
 
 // SYS_WAIT4/SYS_WAITPID - wait for child process
