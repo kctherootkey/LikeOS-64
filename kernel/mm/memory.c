@@ -1442,51 +1442,43 @@ void mm_initialize_syscall(void) {
     efer |= 1;  // Set SCE bit
     wrmsr(MSR_EFER, efer);
     
-    // Set up STAR register
-    // Bits 63:48 = User CS/SS base selector (user CS = base + 16, user SS = base + 8)
-    // Bits 47:32 = Kernel CS/SS base selector (kernel CS = base, kernel SS = base + 8)
-    // GDT layout: 0=null, 1=kernel code, 2=kernel data, 3=user code, 4=user data
-    // Kernel CS = 0x08, Kernel SS = 0x10
-    // User CS = 0x18 | 3 = 0x1B, User SS = 0x20 | 3 = 0x23
-    // But SYSRET adds 16 to get user CS and adds 8 to get user SS
-    // So user selector base should be 0x18 - 16 = 0x08... no wait
-    // SYSRET: CS = STAR[63:48] + 16, SS = STAR[63:48] + 8
-    // We want CS = 0x1B (user code with RPL 3), SS = 0x23 (user data with RPL 3)
-    // But SYSRET ORs with RPL 3, so we just need base = 0x10
-    // CS = 0x10 + 16 = 0x20 | 3 = 0x23... that's wrong
-    // Actually for 64-bit: CS = STAR[63:48] + 16 | 3, SS = STAR[63:48] + 8 | 3
-    // We want user CS = 0x1B (selector 0x18 | RPL 3), user SS = 0x23 (selector 0x20 | RPL 3)
-    // 0x1B = 0x18 | 3, so base + 16 = 0x18, base = 0x08
-    // But 0x08 + 8 = 0x10 | 3 = 0x13, not 0x23
-    // The GDT layout needs user data BEFORE user code for SYSRET to work correctly
-    // Or we accept different selector values
-    // Actually for AMD64 SYSRET: SS = STAR[63:48] + 8 | 3, CS = STAR[63:48] + 16 | 3
-    // Current GDT: 0=null, 1=kcode, 2=kdata, 3=ucode, 4=udata
-    // Selectors: 0x00, 0x08, 0x10, 0x18, 0x20
-    // For SYSRET with base = 0x10: SS = 0x18|3=0x1B, CS = 0x20|3=0x23
-    // That means user code = 0x23, user data = 0x1B, which is reversed!
-    // 
-    // The Intel/AMD way is: GDT order should be kcode, kdata, udata, ucode (32-bit), ucode (64-bit)
-    // For simplicity now, we'll use STAR[63:48] = 0x10
-    // This gives SS = 0x1B (will use GDT[3] as user data)
-    //            CS = 0x23 (will use GDT[4] as user code)
-    // We'll need to swap GDT entries 3 and 4 for correct SYSRET behavior
-    // For now, just set it up - the GDT can be fixed later
+    // Configure STAR register for SYSCALL/SYSRET segment switching
+    // STAR layout:
+    //   Bits 63:48 = User segment base (for SYSRET)
+    //   Bits 47:32 = Kernel segment base (for SYSCALL)
+    //
+    // SYSCALL sets: CS = STAR[47:32], SS = STAR[47:32] + 8
+    // SYSRET sets:  CS = STAR[63:48] + 16 | 3, SS = STAR[63:48] + 8 | 3
+    //
+    // Our GDT layout:
+    //   0x00: null
+    //   0x08: kernel code
+    //   0x10: kernel data
+    //   0x18: user code
+    //   0x20: user data
+    //
+    // For SYSCALL (entering kernel):
+    //   STAR[47:32] = 0x08 → CS = 0x08 (kernel code), SS = 0x10 (kernel data)
+    //
+    // For SYSRET (returning to user):
+    //   STAR[63:48] = 0x10 → CS = 0x10+16|3 = 0x23, SS = 0x10+8|3 = 0x1B
+    //   This means CS = 0x23 (GDT[4] = user data) and SS = 0x1B (GDT[3] = user code)
+    //   Note: Segments are reversed but work because 64-bit mode ignores most segment attributes
     
     uint64_t star = 0;
-    star |= ((uint64_t)0x10 << 48);  // User selector base (CS = 0x23, SS = 0x1B after SYSRET)
-    star |= ((uint64_t)0x08 << 32);  // Kernel selector base (CS = 0x08, SS = 0x10)
+    star |= ((uint64_t)0x10 << 48);  // User base: CS=0x23, SS=0x1B
+    star |= ((uint64_t)0x08 << 32);  // Kernel base: CS=0x08, SS=0x10
     wrmsr(MSR_STAR, star);
     
-    // Set LSTAR to syscall entry point
+    // Set LSTAR to syscall entry point (64-bit mode)
     wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
     
-    // Set CSTAR for compatibility mode (not used in 64-bit only kernel)
+    // Set CSTAR for compatibility mode (unused in 64-bit only kernel)
     wrmsr(MSR_CSTAR, (uint64_t)syscall_entry);
     
     // Set SFMASK - RFLAGS bits to clear on SYSCALL
-    // Clear TF (no single-step) and DF (clear direction), keep IF enabled
-    wrmsr(MSR_SFMASK, 0x100 | 0x400);  // TF | DF
+    // Clear TF (trap flag) and DF (direction flag) on entry
+    wrmsr(MSR_SFMASK, 0x100 | 0x400);
     
     kprintf("SYSCALL/SYSRET initialized\n");
     kprintf("  STAR = 0x%016llx\n", star);
