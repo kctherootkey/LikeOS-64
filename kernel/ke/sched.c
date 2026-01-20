@@ -9,12 +9,13 @@
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
 
+
 #define SCHED_SLICE_TICKS 10
 
 static task_t g_bootstrap_task;
 static task_t g_idle_task;
 static uint8_t g_idle_stack[4096] __attribute__((aligned(16)));
-static uint8_t g_bootstrap_stack[8192] __attribute__((aligned(16)));  // Stack for bootstrap task
+static uint8_t g_bootstrap_stack[8192] __attribute__((aligned(16)));
 static task_t* g_current = 0;
 static int g_next_id = 1;
 static uint64_t g_slice_accum = 0;
@@ -62,10 +63,10 @@ void sched_init(void) {
     g_kernel_pml4 = mm_get_current_address_space();
     g_default_kernel_stack = tss_get_kernel_stack();
     
-    uint64_t rsp_val;
-    __asm__ volatile ("mov %%rsp, %0" : "=r"(rsp_val));
-    g_bootstrap_task.sp = (uint64_t*)rsp_val;
-    
+    // Bootstrap task represents the current execution context (main kernel loop)
+    // We'll context-switch away from it when user tasks run
+    // For now, just set a placeholder - it will be properly set on first switch
+    g_bootstrap_task.sp = 0;  // Will be set by ctx_switch_asm on first switch
     g_bootstrap_task.pml4 = NULL;
     g_bootstrap_task.entry = 0;
     g_bootstrap_task.arg = 0;
@@ -225,28 +226,44 @@ static inline int is_bootstrap_task(const task_t* t) {
     return t == &g_bootstrap_task;
 }
 
-static task_t* pick_next(task_t* start) {
+static task_t* pick_next(task_t* start, int from_timer) {
+    (void)from_timer;
     if (!start || !start->next) {
         return start;
     }
     
     task_t* it = start->next;
     task_t* idle_candidate = 0;
+    task_t* bootstrap_candidate = 0;
     
     while (it != start) {
         if (it->state == TASK_READY || it->state == TASK_RUNNING) {
-            // Skip both idle task and bootstrap task for context switching
+            // Prefer regular user tasks first
             if (!is_idle_task(it) && !is_bootstrap_task(it)) {
                 return it;
             }
             if (is_idle_task(it)) {
                 idle_candidate = it;
             }
+            if (is_bootstrap_task(it)) {
+                bootstrap_candidate = it;
+            }
         }
         it = it->next;
         if (!it) break;
     }
     
+    // If current task is a user task and ready, keep running it
+    if (!is_idle_task(start) && !is_bootstrap_task(start) && 
+        (start->state == TASK_READY || start->state == TASK_RUNNING)) {
+        return start;
+    }
+    
+    // Prefer bootstrap over idle
+    // Bootstrap runs the main kernel loop (shell_tick, etc.)
+    if (bootstrap_candidate) {
+        return bootstrap_candidate;
+    }
     if (idle_candidate) {
         return idle_candidate;
     }
@@ -265,7 +282,7 @@ void sched_yield(void) {
         return;
     }
     g_slice_accum = 0;
-    task_t* next = pick_next(g_current);
+    task_t* next = pick_next(g_current, 0);  // from_timer=0
     if (next == g_current) {
         return;
     }
@@ -291,7 +308,7 @@ void sched_run_ready(void) {
         return;
     }
     g_slice_accum = 0;
-    task_t* next = pick_next(g_current);
+    task_t* next = pick_next(g_current, 0);  // from_timer=0, exclude bootstrap
     
     if (!next) {
         return;
