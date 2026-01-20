@@ -141,6 +141,12 @@ bool mm_mark_page_cow(uint64_t virtual_addr);
 bool mm_handle_cow_fault(uint64_t fault_addr);
 uint64_t* mm_clone_address_space(uint64_t* src_pml4);
 
+// Physical page refcounting (for COW)
+void mm_init_page_refcounts(void);
+void mm_incref_page(uint64_t physical_addr);
+bool mm_decref_page(uint64_t physical_addr);  // Returns true if refcount reached 0
+uint16_t mm_get_page_refcount(uint64_t physical_addr);
+
 // Kernel Heap Allocator
 void mm_initialize_heap(void);
 void* kalloc(size_t size);

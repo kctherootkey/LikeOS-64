@@ -3,6 +3,7 @@
 #include "../../include/kernel/xhci.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/memory.h"
+#include "../../include/kernel/sched.h"
 
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_descriptor idt_desc;

@@ -19,6 +19,10 @@ static struct {
     uint64_t memory_start;          // Start of manageable memory
     uint64_t memory_end;            // End of manageable memory
     
+    // Page reference counting for COW
+    uint16_t* page_refcounts;       // Reference count per physical page
+    uint64_t refcount_array_size;   // Size in bytes
+    
     // Virtual memory management
     uint64_t* pml4_table;           // Page Map Level 4 table
     uint64_t next_virtual_addr;     // Next available virtual address
@@ -201,6 +205,14 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     mm_memset(mm_state.physical_bitmap, 0, mm_state.bitmap_size);
 
     mm_state.free_pages = mm_state.total_pages;
+    
+    // Initialize page reference count array
+    // Each page gets 2 bytes (uint16_t) for refcount - max 65535 references
+    mm_state.refcount_array_size = mm_state.total_pages * sizeof(uint16_t);
+    mm_state.page_refcounts = (uint16_t*)((uint64_t)mm_state.physical_bitmap + mm_state.bitmap_size);
+    mm_memset(mm_state.page_refcounts, 0, mm_state.refcount_array_size);
+    kprintf("  Page refcounts at: %p (size: %lu bytes)\n",
+           mm_state.page_refcounts, mm_state.refcount_array_size);
 
     // Reserve kernel memory areas
     mm_reserve_kernel_memory();
@@ -1190,7 +1202,19 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
         return false;  // Not a COW fault
     }
     
-    uint64_t old_phys = *pte & ~0xFFFULL;
+    // Extract physical address (bits 12-51, mask off flags and NX bit)
+    uint64_t old_phys = *pte & 0x000FFFFFFFFFF000ULL;
+    
+    // Check if we're the only reference - can just make writable
+    uint16_t refcount = mm_get_page_refcount(old_phys);
+    if (refcount <= 1) {
+        // We're the only user, just make it writable again
+        uint64_t flags = (*pte & 0xFFF) & ~PAGE_COW;
+        flags |= PAGE_WRITABLE;
+        *pte = (*pte & 0x8000000000000000ULL) | old_phys | flags; // Preserve NX bit
+        mm_flush_tlb(page_addr);
+        return true;
+    }
     
     // Allocate a new physical page
     uint64_t new_phys = mm_allocate_physical_page();
@@ -1202,15 +1226,20 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
     // Copy contents from old page to new page
     mm_memcpy((void*)new_phys, (void*)old_phys, PAGE_SIZE);
     
-    // Update PTE: remove COW, add writable, point to new page
+    // Update PTE: remove COW, add writable, point to new page, preserve NX bit
     uint64_t flags = (*pte & 0xFFF) & ~PAGE_COW;
     flags |= PAGE_WRITABLE;
-    *pte = new_phys | flags;
+    *pte = (*pte & 0x8000000000000000ULL) | new_phys | flags;
     
     mm_flush_tlb(page_addr);
     
-    // Note: In a real implementation, we'd track reference counts
-    // and only free the old page when refcount reaches 0
+    // Decrement refcount on old page - free if it reaches 0
+    if (mm_decref_page(old_phys)) {
+        mm_free_physical_page(old_phys);
+    }
+    
+    // New page starts with refcount of 0 (private to this process)
+    // We don't need to track it until it's shared via fork again
     
     return true;
 }
@@ -1221,14 +1250,85 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
         return NULL;
     }
     
-    // Create new address space
+    // Create new address space (this sets up kernel mappings)
     uint64_t* new_pml4 = mm_create_user_address_space();
     if (!new_pml4) {
         return NULL;
     }
     
-    // Clone user-space mappings with COW
-    // For now, we only support entries 1-510 (skip identity mapping at 0 and kernel at 511)
+    // Clone user-space mappings with COW from source PML4
+    // User code lives in PML4[0] around virtual address 0x400000
+    // We need to find user pages (those with PAGE_USER flag) in the source
+    // and add them to the child's address space with COW semantics.
+    
+    // Handle PML4[0] - user code and data live here
+    if (src_pml4[0] & PAGE_PRESENT) {
+        uint64_t* src_pdpt = (uint64_t*)(src_pml4[0] & ~0xFFFULL);
+        uint64_t* new_pdpt = (uint64_t*)(new_pml4[0] & ~0xFFFULL);
+        
+        // Note: new_pdpt was created by mm_create_user_address_space and has
+        // its own PD structures for the first 4GB. We need to copy user pages
+        // from source into these structures.
+        
+        for (int j = 0; j < 512; j++) {
+            if ((src_pdpt[j] & PAGE_PRESENT)) {
+                uint64_t* src_pd = (uint64_t*)(src_pdpt[j] & ~0xFFFULL);
+                
+                // Get or create PD in new address space
+                uint64_t* new_pd;
+                if (new_pdpt[j] & PAGE_PRESENT) {
+                    new_pd = (uint64_t*)(new_pdpt[j] & ~0xFFFULL);
+                } else {
+                    uint64_t pd_phys = mm_allocate_physical_page();
+                    if (!pd_phys) goto fail;
+                    mm_memset((void*)pd_phys, 0, PAGE_SIZE);
+                    new_pdpt[j] = pd_phys | (src_pdpt[j] & 0xFFF);
+                    new_pd = (uint64_t*)pd_phys;
+                }
+                
+                for (int k = 0; k < 512; k++) {
+                    if ((src_pd[k] & PAGE_PRESENT) && (src_pd[k] & PAGE_USER)) {
+                        if (src_pd[k] & PAGE_SIZE_FLAG) {
+                            // 2MB huge page with user flag - share with COW
+                            uint64_t cow_flags = (src_pd[k] & ~PAGE_WRITABLE) | PAGE_COW;
+                            src_pd[k] = cow_flags;
+                            new_pd[k] = cow_flags;
+                        } else {
+                            uint64_t* src_pt = (uint64_t*)(src_pd[k] & ~0xFFFULL);
+                            
+                            // Allocate new page table for child
+                            uint64_t pt_phys = mm_allocate_physical_page();
+                            if (!pt_phys) goto fail;
+                            mm_memset((void*)pt_phys, 0, PAGE_SIZE);
+                            new_pd[k] = pt_phys | (src_pd[k] & 0xFFF);
+                            uint64_t* new_pt = (uint64_t*)pt_phys;
+                            
+                            for (int l = 0; l < 512; l++) {
+                                if ((src_pt[l] & PAGE_PRESENT) && (src_pt[l] & PAGE_USER)) {
+                                    // Extract physical address (bits 12-51, mask off flags and NX bit)
+                                    uint64_t phys_page = src_pt[l] & 0x000FFFFFFFFFF000ULL;
+                                    
+                                    // Mark both source and dest as COW
+                                    uint64_t cow_flags = (src_pt[l] & ~PAGE_WRITABLE) | PAGE_COW;
+                                    src_pt[l] = cow_flags;
+                                    new_pt[l] = cow_flags;
+                                    
+                                    // Increment page reference count
+                                    // First call sets it to 1 (for parent), second to 2 (for child)
+                                    if (mm_get_page_refcount(phys_page) == 0) {
+                                        mm_incref_page(phys_page);
+                                    }
+                                    mm_incref_page(phys_page);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Clone entries 1-510 (other user mappings if any)
     for (int i = 1; i < 511; i++) {
         if (src_pml4[i] & PAGE_PRESENT) {
             uint64_t* src_pdpt = (uint64_t*)(src_pml4[i] & ~0xFFFULL);
@@ -1266,10 +1366,19 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
                                 
                                 for (int l = 0; l < 512; l++) {
                                     if (src_pt[l] & PAGE_PRESENT) {
+                                        uint64_t phys_page = src_pt[l] & ~0xFFFULL;
+                                        
                                         // Mark both source and dest as COW
                                         uint64_t cow_flags = (src_pt[l] & ~PAGE_WRITABLE) | PAGE_COW;
                                         src_pt[l] = cow_flags;
                                         new_pt[l] = cow_flags;
+                                        
+                                        // Increment page reference count (shared by parent and child)
+                                        // First call sets refcount to 1 (parent), second to 2 (parent+child)
+                                        if (mm_get_page_refcount(phys_page) == 0) {
+                                            mm_incref_page(phys_page);  // Parent's reference
+                                        }
+                                        mm_incref_page(phys_page);  // Child's reference
                                     }
                                 }
                             }
@@ -1382,4 +1491,55 @@ void mm_initialize_syscall(void) {
     kprintf("SYSCALL/SYSRET initialized\n");
     kprintf("  STAR = 0x%016llx\n", star);
     kprintf("  LSTAR = 0x%016llx\n", (uint64_t)syscall_entry);
+}
+
+// ============================================================================
+// PAGE REFERENCE COUNTING (for COW fork)
+// ============================================================================
+
+// Get page index from physical address
+static inline uint64_t page_to_index(uint64_t phys_addr) {
+    if (phys_addr < mm_state.memory_start || phys_addr >= mm_state.memory_end) {
+        return (uint64_t)-1;  // Out of tracked range
+    }
+    return (phys_addr - mm_state.memory_start) / PAGE_SIZE;
+}
+
+// Initialize page reference counts (called after physical memory init)
+void mm_init_page_refcounts(void) {
+    // Already done in mm_initialize_physical_memory
+    // This function exists for explicit re-initialization if needed
+    if (mm_state.page_refcounts) {
+        mm_memset(mm_state.page_refcounts, 0, mm_state.refcount_array_size);
+    }
+}
+
+// Increment reference count for a physical page
+void mm_incref_page(uint64_t phys_addr) {
+    uint64_t idx = page_to_index(phys_addr);
+    if (idx == (uint64_t)-1) return;
+    
+    if (mm_state.page_refcounts[idx] < 0xFFFF) {
+        mm_state.page_refcounts[idx]++;
+    }
+}
+
+// Decrement reference count - returns true if page should be freed
+bool mm_decref_page(uint64_t phys_addr) {
+    uint64_t idx = page_to_index(phys_addr);
+    if (idx == (uint64_t)-1) return false;
+    
+    if (mm_state.page_refcounts[idx] > 0) {
+        mm_state.page_refcounts[idx]--;
+        return mm_state.page_refcounts[idx] == 0;
+    }
+    return true;  // Already 0, can free
+}
+
+// Get reference count for a physical page
+uint16_t mm_get_page_refcount(uint64_t phys_addr) {
+    uint64_t idx = page_to_index(phys_addr);
+    if (idx == (uint64_t)-1) return 0;
+    
+    return mm_state.page_refcounts[idx];
 }

@@ -2,176 +2,282 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
+
+// Test result tracking
+static int tests_passed = 0;
+static int tests_failed = 0;
+
+static void test_pass(const char* name) {
+    tests_passed++;
+    printf("  [PASS] %s\n", name);
+}
+
+static void test_fail(const char* name) {
+    tests_failed++;
+    printf("  [FAIL] %s\n", name);
+}
+
+static void test_result(const char* name, int condition) {
+    if (condition) {
+        test_pass(name);
+    } else {
+        test_fail(name);
+    }
+}
 
 int main(int argc, char** argv) {
     printf("\n========================================\n");
     printf("  LikeOS-64 Libc Tests\n");
     printf("========================================\n\n");
 
-    // Test printf
+    // ========================================
+    // Test: printf
+    // ========================================
     printf("[TEST] printf()\n");
     printf("  Hello from userland libc!\n");
     printf("  argc = %d\n", argc);
-    
     for (int i = 0; i < argc; i++) {
         printf("  argv[%d] = %s\n", i, argv[i]);
     }
-    
-    // Test malloc
+    test_pass("printf basic output");
+
+    // ========================================
+    // Test: malloc/free
+    // ========================================
     printf("\n[TEST] malloc/free\n");
     char* buf = malloc(100);
+    test_result("malloc(100) returns non-NULL", buf != NULL);
+    
     if (buf) {
-        printf("  malloc(100) = %p\n", buf);
-        
-        // Test string functions
         strcpy(buf, "Hello, ");
         strcat(buf, "World!");
-        printf("  String: %s (len=%zu)\n", buf, strlen(buf));
-        
+        size_t len = strlen(buf);
+        printf("  String: %s (len=%zu)\n", buf, len);
+        test_result("strcpy/strcat/strlen", len == 13);
         free(buf);
-        printf("  Buffer freed\n");
+        test_pass("free() completed");
     }
-    
-    // Test atoi and string conversions
+
+    // ========================================
+    // Test: atoi
+    // ========================================
     printf("\n[TEST] atoi()\n");
-    const char* numbers[] = {"42", "-123", "0xFF", "777"};
-    for (int i = 0; i < 4; i++) {
-        printf("  atoi(\"%s\") = %d\n", numbers[i], atoi(numbers[i]));
-    }
-    
-    // Test formatted output
+    test_result("atoi(\"42\") == 42", atoi("42") == 42);
+    test_result("atoi(\"-123\") == -123", atoi("-123") == -123);
+    test_result("atoi(\"0\") == 0", atoi("0") == 0);
+    printf("  atoi(\"777\") = %d\n", atoi("777"));
+    test_result("atoi(\"777\") == 777", atoi("777") == 777);
+
+    // ========================================
+    // Test: printf format specifiers
+    // ========================================
     printf("\n[TEST] printf format specifiers\n");
-    printf("  Hex: 0x%x, Decimal: %d, String: %s\n", 0xDEADBEEF, 12345, "test");
-    
-    // Test write syscall
+    char fmtbuf[64];
+    sprintf(fmtbuf, "0x%x %d %s", 0xCAFE, 12345, "test");
+    test_result("sprintf format specifiers", strcmp(fmtbuf, "0xcafe 12345 test") == 0);
+
+    // ========================================
+    // Test: write syscall
+    // ========================================
     printf("\n[TEST] write() syscall\n");
     const char* msg = "  Direct write syscall!\n";
-    write(1, msg, strlen(msg));
-    
-    printf("\n[TEST] getpid()\n");
-    printf("  PID: %d\n", getpid());
-    
+    ssize_t written = write(1, msg, strlen(msg));
+    test_result("write() returns correct count", written == (ssize_t)strlen(msg));
+
     // ========================================
-    // FILE* functions tests
+    // Test: getpid
+    // ========================================
+    printf("\n[TEST] getpid()\n");
+    pid_t pid = getpid();
+    printf("  PID: %d\n", pid);
+    test_result("getpid() returns positive value", pid > 0);
+
+    // ========================================
+    // Test: FILE* functions - fopen/fread/fclose
     // ========================================
     printf("\n[TEST] FILE* functions\n");
-    
-    // Test fopen with a file we know exists
     FILE* fp = fopen("/HELLO.TXT", "r");
+    test_result("fopen(\"/HELLO.TXT\", \"r\") succeeds", fp != NULL);
+    
     if (fp) {
-        printf("  fopen(\"/HELLO.TXT\", \"r\") = %p (fd=%d)\n", (void*)fp, fp->fd);
-        
-        // Test fread
         char readbuf[64];
         memset(readbuf, 0, sizeof(readbuf));
         size_t nread = fread(readbuf, 1, sizeof(readbuf) - 1, fp);
         printf("  fread() returned %zu bytes\n", nread);
-        if (nread > 0) {
-            // Remove trailing newline for cleaner output
-            if (readbuf[nread-1] == '\n') readbuf[nread-1] = '\0';
-            printf("  Contents: \"%s\"\n", readbuf);
-        }
+        test_result("fread() returns > 0 bytes", nread > 0);
         
-        // Test feof/ferror
-        printf("  feof() = %d, ferror() = %d\n", feof(fp), ferror(fp));
+        if (nread > 0 && readbuf[nread-1] == '\n') readbuf[nread-1] = '\0';
+        printf("  Contents: \"%s\"\n", readbuf);
         
-        // Test fclose
         int rc = fclose(fp);
-        printf("  fclose() = %d\n", rc);
-    } else {
-        printf("  fopen(\"/HELLO.TXT\", \"r\") failed\n");
+        test_result("fclose() returns 0", rc == 0);
     }
     
     // Test fopen with non-existent file
     fp = fopen("/NONEXISTENT.TXT", "r");
-    printf("  fopen(\"/NONEXISTENT.TXT\") = %p (expected NULL)\n", (void*)fp);
-    
-    // Test fputs/puts to stdout
+    test_result("fopen(non-existent) returns NULL", fp == NULL);
+
+    // ========================================
+    // Test: fputs/puts
+    // ========================================
     printf("\n[TEST] fputs/puts\n");
-    fputs("  fputs to stdout\n", stdout);
-    puts("  puts to stdout");
-    
-    // Test fprintf
+    int fputs_rc = fputs("  fputs output\n", stdout);
+    test_result("fputs() returns >= 0", fputs_rc >= 0);
+    puts("  puts output");
+    test_pass("puts() completed");
+
+    // ========================================
+    // Test: fprintf
+    // ========================================
     printf("\n[TEST] fprintf\n");
-    fprintf(stdout, "  fprintf: int=%d, hex=0x%x, str=%s\n", 42, 0xCAFE, "hello");
-    fprintf(stderr, "  fprintf to stderr\n");
-    
-    // Test putchar/fputc
+    int fprintf_rc = fprintf(stdout, "  fprintf: int=%d, hex=0x%x\n", 42, 0xCAFE);
+    test_result("fprintf() returns > 0", fprintf_rc > 0);
+
+    // ========================================
+    // Test: putchar/fputc
+    // ========================================
     printf("\n[TEST] putchar/fputc\n");
     printf("  Characters: ");
-    putchar('A');
-    putchar('B');
-    fputc('C', stdout);
-    fputc('\n', stdout);
-    
-    // Test sprintf/snprintf
+    int pc = putchar('A');
+    test_result("putchar('A') returns 'A'", pc == 'A');
+    pc = fputc('B', stdout);
+    test_result("fputc('B') returns 'B'", pc == 'B');
+    putchar('\n');
+
+    // ========================================
+    // Test: sprintf/snprintf
+    // ========================================
     printf("\n[TEST] sprintf/snprintf\n");
     char sprbuf[64];
     int len = sprintf(sprbuf, "Value: %d", 12345);
-    printf("  sprintf returned %d, result: \"%s\"\n", len, sprbuf);
+    test_result("sprintf returns correct length", len == 12);
+    test_result("sprintf produces correct string", strcmp(sprbuf, "Value: 12345") == 0);
     
     len = snprintf(sprbuf, 10, "Long string that will be truncated");
-    printf("  snprintf(10) returned %d, result: \"%s\"\n", len, sprbuf);
-    
-    // Test fseek/ftell/rewind
+    test_result("snprintf truncates correctly", strlen(sprbuf) == 9);
+
+    // ========================================
+    // Test: fseek/ftell/rewind
+    // ========================================
     printf("\n[TEST] fseek/ftell/rewind\n");
     fp = fopen("/HELLO.TXT", "r");
     if (fp) {
-        // Read first 5 bytes
         char seekbuf[32];
         memset(seekbuf, 0, sizeof(seekbuf));
         fread(seekbuf, 1, 5, fp);
-        printf("  First 5 bytes: \"%s\"\n", seekbuf);
         
-        // Check position with ftell
         long pos = ftell(fp);
-        printf("  ftell() after read = %ld\n", pos);
+        printf("  ftell() after read 5 bytes = %ld\n", pos);
+        test_result("ftell() returns 5 after reading 5 bytes", pos == 5);
         
-        // Seek back to start
         fseek(fp, 0, 0); // SEEK_SET
         pos = ftell(fp);
-        printf("  ftell() after fseek(0, SEEK_SET) = %ld\n", pos);
+        test_result("fseek(0, SEEK_SET) resets to 0", pos == 0);
         
-        // Seek to position 6
-        fseek(fp, 6, 0); // SEEK_SET
-        memset(seekbuf, 0, sizeof(seekbuf));
-        fread(seekbuf, 1, 4, fp);
-        printf("  4 bytes after seek to 6: \"%s\"\n", seekbuf);
-        
-        // Test rewind
         rewind(fp);
         pos = ftell(fp);
-        printf("  ftell() after rewind = %ld\n", pos);
+        test_result("rewind() resets to 0", pos == 0);
         
         fclose(fp);
     } else {
-        printf("  fopen failed for seek test\n");
+        test_fail("fseek/ftell test - fopen failed");
     }
-    
-    // Test getenv/setenv
-    printf("\n[TEST] getenv/setenv\n");
+
+    // ========================================
+    // Test: getenv/setenv/unsetenv
+    // ========================================
+    printf("\n[TEST] getenv/setenv/unsetenv\n");
     char* val = getenv("TEST_VAR");
-    printf("  getenv(\"TEST_VAR\") before set = %s\n", val ? val : "(null)");
+    test_result("getenv() returns NULL for unset var", val == NULL);
     
     int rc = setenv("TEST_VAR", "hello_world", 1);
-    printf("  setenv(\"TEST_VAR\", \"hello_world\", 1) = %d\n", rc);
+    test_result("setenv() returns 0", rc == 0);
     
     val = getenv("TEST_VAR");
-    printf("  getenv(\"TEST_VAR\") after set = %s\n", val ? val : "(null)");
+    test_result("getenv() returns set value", val != NULL && strcmp(val, "hello_world") == 0);
     
     // Test setenv with overwrite=0
     rc = setenv("TEST_VAR", "new_value", 0);
     val = getenv("TEST_VAR");
-    printf("  After setenv with overwrite=0, value = %s\n", val ? val : "(null)");
+    test_result("setenv with overwrite=0 keeps old value", val != NULL && strcmp(val, "hello_world") == 0);
     
     // Test unsetenv
     rc = unsetenv("TEST_VAR");
     val = getenv("TEST_VAR");
-    printf("  After unsetenv, getenv = %s\n", val ? val : "(null)");
+    test_result("unsetenv() clears variable", val == NULL);
 
+    // ========================================
+    // Test: fork/wait/getpid/getppid
+    // ========================================
+    printf("\n[TEST] fork/wait/getpid/getppid\n");
+    pid_t my_pid = getpid();
+    pid_t my_ppid = getppid();
+    printf("  PID=%d, PPID=%d calling fork()...\n", my_pid, my_ppid);
+    
+    pid_t child_pid = fork();
+    printf("  fork() returned %d in process %d\n", child_pid, getpid());
+    
+    if (child_pid < 0) {
+        test_fail("fork() failed");
+    } else if (child_pid == 0) {
+        // Child process
+        printf("  [CHILD] I am the child, my PID = %d, parent = %d\n", getpid(), getppid());
+        printf("  [CHILD] Exiting with code 42\n");
+        _exit(42);
+    } else {
+        // Parent process
+        printf("  [PARENT] fork() returned child PID = %d\n", child_pid);
+        test_result("fork() returns positive child PID", child_pid > 0);
+        
+        // Wait for child
+        int status = 0;
+        pid_t waited = waitpid(child_pid, &status, 0);
+        printf("  [PARENT] waitpid(%d, ...) returned %d\n", child_pid, waited);
+        test_result("waitpid() returns child PID", waited == child_pid);
+        
+        if (WIFEXITED(status)) {
+            int exit_status = WEXITSTATUS(status);
+            printf("  [PARENT] Child exited with status %d (raw status=0x%x)\n", exit_status, status);
+            test_result("Child exit status is 42", exit_status == 42);
+        } else {
+            printf("  [PARENT] Child did not exit normally (status=0x%x)\n", status);
+            test_fail("Child did not exit normally");
+        }
+    }
+
+    // ========================================
+    // Test: dup/dup2
+    // ========================================
+    printf("\n[TEST] dup/dup2\n");
+    int newfd = dup(1);  // Dup stdout
+    printf("  dup(1) returned %d\n", newfd);
+    test_result("dup(1) returns valid fd", newfd >= 0);
+    
+    if (newfd >= 0) {
+        const char* dupmsg = "  Write via duped fd\n";
+        ssize_t wr = write(newfd, dupmsg, strlen(dupmsg));
+        test_result("write to duped fd succeeds", wr > 0);
+        close(newfd);
+    }
+
+    // ========================================
+    // Summary
+    // ========================================
     printf("\n========================================\n");
-    printf("  All libc tests completed!\n");
+    printf("  TEST SUMMARY\n");
+    printf("========================================\n");
+    printf("  Passed: %d\n", tests_passed);
+    printf("  Failed: %d\n", tests_failed);
+    printf("  Total:  %d\n", tests_passed + tests_failed);
     printf("========================================\n");
     
-    return 0;
+    if (tests_failed == 0) {
+        printf("  ALL TESTS PASSED!\n");
+    } else {
+        printf("  SOME TESTS FAILED!\n");
+    }
+    printf("========================================\n");
+    
+    return tests_failed > 0 ? 1 : 0;
 }

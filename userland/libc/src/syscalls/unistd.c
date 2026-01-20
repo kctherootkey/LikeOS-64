@@ -1,5 +1,6 @@
 #include "../../include/unistd.h"
 #include "../../include/errno.h"
+#include "../../include/sys/wait.h"
 #include "syscall.h"
 
 int errno = 0;
@@ -54,9 +55,63 @@ pid_t getpid(void) {
     return syscall0(SYS_GETPID);
 }
 
+pid_t getppid(void) {
+    return syscall0(SYS_GETPPID);
+}
+
+pid_t fork(void) {
+    long ret = syscall0(SYS_FORK);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return ret;
+}
+
 void _exit(int status) {
     syscall1(SYS_EXIT, status);
     __builtin_unreachable();
+}
+
+int dup(int oldfd) {
+    long ret = syscall1(SYS_DUP, oldfd);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return ret;
+}
+
+int dup2(int oldfd, int newfd) {
+    long ret = syscall2(SYS_DUP2, oldfd, newfd);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return ret;
+}
+
+pid_t wait(int* status) {
+    return waitpid(-1, status, 0);
+}
+
+pid_t waitpid(pid_t pid, int* status, int options) {
+    // If WNOHANG is not set, loop until child exits
+    while (1) {
+        long ret = syscall3(SYS_WAIT4, pid, (long)status, options);
+        if (ret >= 0) {
+            return ret;
+        }
+        // EAGAIN (11) means no child has exited yet - retry
+        // ECHILD (10) means no children exist - return error
+        if (ret == -11 && !(options & WNOHANG)) {
+            // Yield and retry
+            syscall0(SYS_YIELD);
+            continue;
+        }
+        errno = -ret;
+        return -1;
+    }
 }
 
 void* sbrk(intptr_t increment) {

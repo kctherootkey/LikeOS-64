@@ -21,7 +21,13 @@ int sched_yield(void);
 
 // Process operations
 pid_t getpid(void);
+pid_t getppid(void);
+pid_t fork(void);
 void _exit(int status) __attribute__((noreturn));
+
+// File descriptor operations
+int dup(int oldfd);
+int dup2(int oldfd, int newfd);
 
 // Memory
 void* sbrk(intptr_t increment);

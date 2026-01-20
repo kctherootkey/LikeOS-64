@@ -47,12 +47,25 @@ typedef struct task {
     void* arg;             // Entry argument
     task_state_t state;
     task_privilege_t privilege;  // Ring level
-    struct task* next;
+    struct task* next;     // Scheduler circular list
     int id;
+    
+    // Process hierarchy
+    struct task* parent;        // Parent task (NULL for init)
+    struct task* first_child;   // First child in linked list
+    struct task* next_sibling;  // Next sibling in parent's child list
+    
+    // Exit status tracking
+    int exit_code;              // Exit status for waitpid
+    bool has_exited;            // True when exit() was called
+    bool is_fork_child;         // True if this is a newly forked child (should return 0)
     
     // User mode support
     uint64_t user_stack_top;    // User stack virtual address (for user tasks)
     uint64_t kernel_stack_top;  // Kernel stack for syscalls/interrupts (for user tasks)
+    
+    // Current working directory
+    char cwd[256];
     
     // File descriptor table
     struct vfs_file* fd_table[TASK_MAX_FDS];
@@ -72,5 +85,14 @@ void sched_yield(void);
 void sched_run_ready(void);
 task_t* sched_current(void);
 int sched_has_user_tasks(void);  // Check if any user tasks are running
+
+// Process management
+task_t* sched_fork_current(void);           // Fork current task with COW
+void sched_remove_task(task_t* task);       // Remove task from scheduler
+task_t* sched_find_task_by_id(uint32_t pid); // Find task by PID
+void sched_add_child(task_t* parent, task_t* child);  // Add child to parent
+void sched_remove_child(task_t* parent, task_t* child);  // Remove child from parent
+void sched_reparent_children(task_t* task); // Reparent children to init (task 1)
+uint32_t sched_get_ppid(task_t* task);      // Get parent PID
 
 #endif // _KERNEL_SCHED_H_

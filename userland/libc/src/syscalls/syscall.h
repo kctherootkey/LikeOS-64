@@ -11,6 +11,16 @@
 #define SYS_GETPID      39
 #define SYS_YIELD       24
 
+// Process syscalls
+#define SYS_FORK        57
+#define SYS_EXECVE      59
+#define SYS_WAIT4       61
+#define SYS_GETPPID     110
+#define SYS_DUP         32
+#define SYS_DUP2        33
+#define SYS_PIPE        22
+#define SYS_SPAWN       500  // LikeOS extension
+
 // Syscall wrapper - uses inline assembly to invoke syscall instruction
 static inline long syscall0(long number) {
     long ret;

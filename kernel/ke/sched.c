@@ -4,6 +4,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/types.h"
+#include "../../include/kernel/vfs.h"
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
@@ -13,11 +14,15 @@ extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
 static task_t g_bootstrap_task;
 static task_t g_idle_task;
 static uint8_t g_idle_stack[4096] __attribute__((aligned(16)));
+static uint8_t g_bootstrap_stack[8192] __attribute__((aligned(16)));  // Stack for bootstrap task
 static task_t* g_current = 0;
 static int g_next_id = 1;
 static uint64_t g_slice_accum = 0;
 static uint64_t* g_kernel_pml4 = 0;
 static uint64_t g_default_kernel_stack = 0;
+
+// Current kernel stack for syscall handler (per-task)
+uint64_t g_current_kernel_stack = 0;
 
 static inline int is_idle_task(const task_t* t) {
     return t == &g_idle_task;
@@ -32,8 +37,10 @@ static inline void switch_address_space(task_t* prev, task_t* next) {
     
     if (next->privilege == TASK_USER && next->kernel_stack_top != 0) {
         tss_set_kernel_stack(next->kernel_stack_top);
+        g_current_kernel_stack = next->kernel_stack_top;
     } else {
         tss_set_kernel_stack(g_default_kernel_stack);
+        g_current_kernel_stack = g_default_kernel_stack;
     }
     
     if (prev_pml4 != next_pml4) {
@@ -55,7 +62,10 @@ void sched_init(void) {
     g_kernel_pml4 = mm_get_current_address_space();
     g_default_kernel_stack = tss_get_kernel_stack();
     
-    __asm__ volatile ("mov %%rsp, %0" : "=r"(g_bootstrap_task.sp));
+    uint64_t rsp_val;
+    __asm__ volatile ("mov %%rsp, %0" : "=r"(rsp_val));
+    g_bootstrap_task.sp = (uint64_t*)rsp_val;
+    
     g_bootstrap_task.pml4 = NULL;
     g_bootstrap_task.entry = 0;
     g_bootstrap_task.arg = 0;
@@ -99,6 +109,18 @@ void sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack
     t->id = g_next_id++;
     t->user_stack_top = 0;
     t->kernel_stack_top = 0;
+    
+    // Initialize process hierarchy
+    t->parent = NULL;
+    t->first_child = NULL;
+    t->next_sibling = NULL;
+    t->exit_code = 0;
+    t->has_exited = false;
+    t->is_fork_child = false;
+    
+    // Initialize cwd
+    t->cwd[0] = '/';
+    t->cwd[1] = 0;
     
     // Initialize file descriptor table (kernel tasks don't use fd_table)
     for (int i = 0; i < TASK_MAX_FDS; i++) {
@@ -160,6 +182,18 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
     t->user_stack_top = user_stack;
     t->kernel_stack_top = (uint64_t)(k_stack_mem + 4096);
     
+    // Initialize process hierarchy
+    t->parent = NULL;
+    t->first_child = NULL;
+    t->next_sibling = NULL;
+    t->exit_code = 0;
+    t->has_exited = false;
+    t->is_fork_child = false;
+    
+    // Initialize cwd
+    t->cwd[0] = '/';
+    t->cwd[1] = 0;
+    
     // Initialize file descriptor table (all NULL)
     for (int i = 0; i < TASK_MAX_FDS; i++) {
         t->fd_table[i] = NULL;
@@ -187,6 +221,10 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
     return t;
 }
 
+static inline int is_bootstrap_task(const task_t* t) {
+    return t == &g_bootstrap_task;
+}
+
 static task_t* pick_next(task_t* start) {
     if (!start || !start->next) {
         return start;
@@ -197,10 +235,13 @@ static task_t* pick_next(task_t* start) {
     
     while (it != start) {
         if (it->state == TASK_READY || it->state == TASK_RUNNING) {
-            if (!is_idle_task(it)) {
+            // Skip both idle task and bootstrap task for context switching
+            if (!is_idle_task(it) && !is_bootstrap_task(it)) {
                 return it;
             }
-            idle_candidate = it;
+            if (is_idle_task(it)) {
+                idle_candidate = it;
+            }
         }
         it = it->next;
         if (!it) break;
@@ -317,3 +358,219 @@ static void idle_entry(void* arg) {
         __asm__ volatile ("hlt");
     }
 }
+
+// ============================================================================
+// PROCESS HIERARCHY MANAGEMENT
+// ============================================================================
+
+// Find a task by its ID
+task_t* sched_find_task_by_id(uint32_t id) {
+    if (!g_current) return NULL;
+    
+    task_t* start = g_current;
+    task_t* t = g_current;
+    do {
+        if (t->id == id) {
+            return t;
+        }
+        t = t->next;
+    } while (t && t != start);
+    
+    return NULL;
+}
+
+// Add a child to parent's child list
+void sched_add_child(task_t* parent, task_t* child) {
+    if (!parent || !child) return;
+    
+    child->parent = parent;
+    child->next_sibling = parent->first_child;
+    parent->first_child = child;
+}
+
+// Remove a child from parent's child list
+void sched_remove_child(task_t* parent, task_t* child) {
+    if (!parent || !child || child->parent != parent) return;
+    
+    if (parent->first_child == child) {
+        parent->first_child = child->next_sibling;
+    } else {
+        task_t* prev = parent->first_child;
+        while (prev && prev->next_sibling != child) {
+            prev = prev->next_sibling;
+        }
+        if (prev) {
+            prev->next_sibling = child->next_sibling;
+        }
+    }
+    child->parent = NULL;
+    child->next_sibling = NULL;
+}
+
+// Reparent all children to init (task 0)
+void sched_reparent_children(task_t* task) {
+    if (!task) return;
+    
+    task_t* child = task->first_child;
+    while (child) {
+        task_t* next = child->next_sibling;
+        child->parent = &g_bootstrap_task;  // Reparent to init (task 0)
+        child->next_sibling = g_bootstrap_task.first_child;
+        g_bootstrap_task.first_child = child;
+        child = next;
+    }
+    task->first_child = NULL;
+}
+
+// Remove task from scheduler run queue
+static void remove_from_runqueue(task_t* t) {
+    if (!g_current || !t) return;
+    
+    // Can't remove current or idle
+    if (t == g_current || t == &g_idle_task || t == &g_bootstrap_task) return;
+    
+    // Find predecessor in circular list
+    task_t* prev = g_current;
+    while (prev->next != t && prev->next != g_current) {
+        prev = prev->next;
+    }
+    
+    if (prev->next == t) {
+        prev->next = t->next;
+        t->next = NULL;
+    }
+}
+
+// Remove a task completely (after being reaped)
+void sched_remove_task(task_t* task) {
+    if (!task || task == &g_bootstrap_task || task == &g_idle_task) return;
+    
+    // Remove from parent's child list
+    if (task->parent) {
+        sched_remove_child(task->parent, task);
+    }
+    
+    // Reparent any children to init
+    sched_reparent_children(task);
+    
+    // Remove from run queue
+    remove_from_runqueue(task);
+    
+    // Close all open file descriptors
+    for (int i = 0; i < TASK_MAX_FDS; i++) {
+        if (task->fd_table[i]) {
+            // Check for console dup markers (magic pointers 1, 2, 3)
+            uint64_t marker = (uint64_t)task->fd_table[i];
+            if (marker >= 1 && marker <= 3) {
+                // Just clear the marker, don't call vfs_close
+                task->fd_table[i] = NULL;
+            } else {
+                vfs_close(task->fd_table[i]);
+                task->fd_table[i] = NULL;
+            }
+        }
+    }
+    
+    // Destroy address space if user task
+    if (task->pml4) {
+        mm_destroy_address_space(task->pml4);
+        task->pml4 = NULL;
+    }
+    
+    // Free the task structure
+    kfree(task);
+}
+
+// Fork the current task - creates child with cloned address space
+task_t* sched_fork_current(void) {
+    task_t* cur = sched_current();
+    if (!cur || cur->privilege != TASK_USER) {
+        return NULL;
+    }
+    
+    // Allocate new task structure
+    task_t* child = (task_t*)kalloc(sizeof(task_t));
+    if (!child) {
+        return NULL;
+    }
+    
+    // Clone address space with COW
+    uint64_t* child_pml4 = mm_clone_address_space(cur->pml4);
+    if (!child_pml4) {
+        kfree(child);
+        return NULL;
+    }
+    
+    // Allocate kernel stack for child
+    uint8_t* k_stack_mem = (uint8_t*)kalloc(4096);
+    if (!k_stack_mem) {
+        mm_destroy_address_space(child_pml4);
+        kfree(child);
+        return NULL;
+    }
+    
+    // Copy most fields from parent using mm_memcpy (no libc in kernel)
+    mm_memcpy(child, cur, sizeof(task_t));
+    
+    // Set up child-specific fields
+    child->id = g_next_id++;
+    child->pml4 = child_pml4;
+    child->state = TASK_READY;
+    child->kernel_stack_top = (uint64_t)(k_stack_mem + 4096);
+    child->next = NULL;  // Will be set by enqueue_task
+    
+    // Process hierarchy
+    child->parent = cur;
+    child->first_child = NULL;
+    child->next_sibling = NULL;
+    child->exit_code = 0;
+    child->has_exited = false;
+    child->is_fork_child = true;  // Child should return 0 from fork
+    
+    // Add to parent's child list
+    sched_add_child(cur, child);
+    
+    // Duplicate file descriptors (increment refcounts)
+    for (int i = 0; i < TASK_MAX_FDS; i++) {
+        if (cur->fd_table[i]) {
+            // Check for console dup markers (magic pointers 1, 2, 3)
+            uint64_t marker = (uint64_t)cur->fd_table[i];
+            if (marker >= 1 && marker <= 3) {
+                // Just copy the marker, don't call vfs_dup
+                child->fd_table[i] = cur->fd_table[i];
+            } else {
+                child->fd_table[i] = vfs_dup(cur->fd_table[i]);
+            }
+        } else {
+            child->fd_table[i] = NULL;
+        }
+    }
+    
+    // Copy mmap regions (pages are COW, no need to change region metadata)
+    for (int i = 0; i < TASK_MAX_MMAP; i++) {
+        child->mmap_regions[i] = cur->mmap_regions[i];
+    }
+    
+    // The kernel stack needs to be set up so that when we switch to child,
+    // it will return from the fork syscall with return value 0.
+    // We copy parent's kernel stack and adjust the return value.
+    // Note: The actual implementation depends on how we enter this function
+    // (via syscall). For now, we set up a fresh return path.
+    
+    // Set up child's kernel stack for returning from syscall
+    // This will be done by the caller (sys_fork)
+    
+    // Add to scheduler run queue
+    enqueue_task(child);
+    
+    return child;
+}
+
+// Get parent PID
+uint32_t sched_get_ppid(task_t* task) {
+    if (!task || !task->parent) {
+        return 0;  // Init or no parent
+    }
+    return task->parent->id;
+}
+

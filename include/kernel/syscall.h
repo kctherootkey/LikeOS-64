@@ -11,10 +11,19 @@
 #define SYS_CLOSE       3
 #define SYS_LSEEK       8
 #define SYS_MMAP        9
+#define SYS_MUNMAP      11
 #define SYS_BRK         12
-#define SYS_GETPID      39
-#define SYS_EXIT        60
+#define SYS_PIPE        22
 #define SYS_YIELD       24   // sched_yield
+#define SYS_DUP         32
+#define SYS_DUP2        33
+#define SYS_GETPID      39
+#define SYS_FORK        57
+#define SYS_EXECVE      59
+#define SYS_EXIT        60
+#define SYS_WAIT4       61
+#define SYS_GETPPID     110
+#define SYS_SPAWN       500  // LikeOS extension: spawn new process from ELF
 
 // File descriptor limits
 #define MAX_FDS         1024
@@ -54,10 +63,13 @@
 #define SEEK_END        2
 
 // Error codes
+#define EAGAIN          11  // Resource temporarily unavailable
 #define EBADF           9   // Bad file descriptor
+#define ECHILD          10  // No child processes
 #define ENOMEM          12  // Out of memory
 #define EACCES          13  // Permission denied
 #define EFAULT          14  // Bad address
+#define ENOEXEC         8   // Exec format error
 #define EINVAL          22  // Invalid argument
 #define EMFILE          24  // Too many open files
 #define ESPIPE          29  // Illegal seek
