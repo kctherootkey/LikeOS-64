@@ -1,4 +1,4 @@
-// LikeOS-64 - FAT32 read-only minimal implementation (root dir, 8.3 files)
+// LikeOS-64 - FAT32 minimal implementation (root dir, 8.3 files, read/write)
 #include "../../include/kernel/fat32.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/vfs.h"
