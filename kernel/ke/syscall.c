@@ -9,7 +9,6 @@
 #include "../../include/kernel/status.h"
 #include "../../include/kernel/elf.h"
 #include "../../include/kernel/pipe.h"
-#include "../../include/kernel/fat32.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/stat.h"
 
@@ -470,24 +469,10 @@ static int64_t sys_stat_common(const char* path, uint64_t stat_buf) {
     if (!validate_user_ptr((uint64_t)path, 1) || !validate_user_ptr(stat_buf, sizeof(struct kstat))) {
         return -EFAULT;
     }
-    unsigned attr = 0;
-    unsigned long fc = 0;
-    unsigned long size = 0;
-    if (fat32_resolve_path(fat32_get_cwd(), path, &attr, &fc, &size) != ST_OK) {
-        return -ENOENT;
-    }
     struct kstat st;
-    st.st_nlink = 1;
-    st.st_uid = 0;
-    st.st_gid = 0;
-    st.st_size = size;
-    st.st_atime = 0;
-    st.st_mtime = 0;
-    st.st_ctime = 0;
-    if (attr & FAT32_ATTR_DIRECTORY) {
-        st.st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
-    } else {
-        st.st_mode = S_IFREG | (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    int ret = vfs_stat(path, &st);
+    if (ret != ST_OK) {
+        return (ret == ST_NOT_FOUND) ? -ENOENT : -EINVAL;
     }
     mm_memcpy((void*)stat_buf, &st, sizeof(st));
     return 0;
@@ -541,11 +526,10 @@ static int64_t sys_access(uint64_t pathname, uint64_t mode) {
     if (!validate_user_ptr(pathname, 1)) {
         return -EFAULT;
     }
-    unsigned attr = 0;
-    unsigned long fc = 0;
-    unsigned long size = 0;
-    if (fat32_resolve_path(fat32_get_cwd(), (const char*)pathname, &attr, &fc, &size) != ST_OK) {
-        return -ENOENT;
+    struct kstat st;
+    int ret = vfs_stat((const char*)pathname, &st);
+    if (ret != ST_OK) {
+        return (ret == ST_NOT_FOUND) ? -ENOENT : -EINVAL;
     }
     return 0;
 }
@@ -556,17 +540,10 @@ static int64_t sys_chdir(uint64_t pathname) {
     if (!validate_user_ptr(pathname, 1)) {
         return -EFAULT;
     }
-    unsigned attr = 0;
-    unsigned long fc = 0;
-    unsigned long size = 0;
     const char* path = (const char*)pathname;
-    if (fat32_resolve_path(fat32_get_cwd(), path, &attr, &fc, &size) != ST_OK) {
-        return -ENOENT;
-    }
-    if (!(attr & FAT32_ATTR_DIRECTORY)) {
-        return -ENOTDIR;
-    }
-    fat32_set_cwd(fc);
+    int st = vfs_chdir(path);
+    if (st == ST_NOT_FOUND) return -ENOENT;
+    if (st != ST_OK) return -ENOTDIR;
     // Update task cwd string (best-effort, no canonicalization)
     mm_memset(cur->cwd, 0, sizeof(cur->cwd));
     if (path[0] == '/') {
@@ -798,7 +775,7 @@ static int64_t sys_kill(uint64_t pid, uint64_t sig) {
 
 static int64_t sys_unlink(uint64_t pathname) {
     if (!validate_user_ptr(pathname, 1)) return -EFAULT;
-    int st = fat32_unlink_path((const char*)pathname);
+    int st = vfs_unlink((const char*)pathname);
     if (st == ST_OK) return 0;
     if (st == ST_NOT_FOUND) return -ENOENT;
     return -EINVAL;
@@ -806,7 +783,7 @@ static int64_t sys_unlink(uint64_t pathname) {
 
 static int64_t sys_rename(uint64_t oldpath, uint64_t newpath) {
     if (!validate_user_ptr(oldpath, 1) || !validate_user_ptr(newpath, 1)) return -EFAULT;
-    int st = fat32_rename_path((const char*)oldpath, (const char*)newpath);
+    int st = vfs_rename((const char*)oldpath, (const char*)newpath);
     if (st == ST_OK) return 0;
     if (st == ST_NOT_FOUND) return -ENOENT;
     return -EINVAL;
@@ -815,7 +792,7 @@ static int64_t sys_rename(uint64_t oldpath, uint64_t newpath) {
 static int64_t sys_mkdir(uint64_t pathname, uint64_t mode) {
     (void)mode;
     if (!validate_user_ptr(pathname, 1)) return -EFAULT;
-    int st = fat32_mkdir_path((const char*)pathname);
+    int st = vfs_mkdir((const char*)pathname, (unsigned int)mode);
     if (st == ST_OK) return 0;
     if (st == ST_NOT_FOUND) return -ENOENT;
     if (st == ST_NOMEM) return -ENOMEM;
@@ -824,7 +801,7 @@ static int64_t sys_mkdir(uint64_t pathname, uint64_t mode) {
 }
 static int64_t sys_rmdir(uint64_t pathname) {
     if (!validate_user_ptr(pathname, 1)) return -EFAULT;
-    int st = fat32_rmdir_path((const char*)pathname);
+    int st = vfs_rmdir((const char*)pathname);
     if (st == ST_OK) return 0;
     if (st == ST_NOT_FOUND) return -ENOENT;
     if (st == ST_NOMEM) return -ENOMEM;

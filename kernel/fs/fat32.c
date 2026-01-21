@@ -1191,12 +1191,18 @@ unsigned long fat32_parent_cluster(unsigned long dir_cluster)
 
 // Forward declare ops so open can assign pointer
 static int fat32_open(const char* path, int flags, vfs_file_t** out);
+static int fat32_stat_vfs(const char* path, struct kstat* st);
 static long fat32_read(vfs_file_t* f, void* buf, long bytes);
 static long fat32_write(vfs_file_t* f, const void* buf, long bytes);
 static long fat32_seek(vfs_file_t* f, long offset, int whence);
 static int fat32_truncate(vfs_file_t* f, unsigned long size);
 static int fat32_close(vfs_file_t* f);
-static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_read, fat32_write, fat32_seek, fat32_truncate, fat32_close };
+static int fat32_unlink(const char* path);
+static int fat32_rename(const char* oldpath, const char* newpath);
+static int fat32_mkdir(const char* path, unsigned int mode);
+static int fat32_rmdir(const char* path);
+static int fat32_chdir(const char* path);
+static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_stat_vfs, fat32_read, fat32_write, fat32_seek, fat32_truncate, fat32_unlink, fat32_rename, fat32_mkdir, fat32_rmdir, fat32_chdir, fat32_close };
 
 static int fat32_resolve_parent(unsigned long start_cluster, const char *path,
     unsigned long *parent_cluster, char *name_out, unsigned name_out_len)
@@ -1373,6 +1379,29 @@ static int fat32_open(const char *path, int flags, vfs_file_t **out)
     return ST_OK;
 }
 
+static int fat32_stat_vfs(const char* path, struct kstat* st)
+{
+    if (!st || !path)
+        return ST_INVALID;
+    unsigned attr = 0;
+    unsigned long fc = 0;
+    unsigned long size = 0;
+    if (fat32_resolve_path(fat32_get_cwd(), path, &attr, &fc, &size) != ST_OK) {
+        return ST_NOT_FOUND;
+    }
+    mm_memset(st, 0, sizeof(*st));
+    st->st_nlink = 1;
+    st->st_uid = 0;
+    st->st_gid = 0;
+    st->st_size = size;
+    if (attr & FAT32_ATTR_DIRECTORY) {
+        st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+    } else {
+        st->st_mode = S_IFREG | (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    }
+    return ST_OK;
+}
+
 int fat32_unlink_path(const char* path)
 {
     unsigned long parent = 0;
@@ -1413,6 +1442,11 @@ int fat32_unlink_path(const char* path)
         fat32_free_chain(g_root_fs, fc);
     }
     return ST_OK;
+}
+
+static int fat32_unlink(const char* path)
+{
+    return fat32_unlink_path(path);
 }
 
 int fat32_rename_path(const char* oldpath, const char* newpath)
@@ -1461,6 +1495,11 @@ int fat32_rename_path(const char* oldpath, const char* newpath)
     int st = write_sectors(g_root_fs->bdev, lba, g_root_fs->sectors_per_cluster, buf);
     kfree(buf);
     return st;
+}
+
+static int fat32_rename(const char* oldpath, const char* newpath)
+{
+    return fat32_rename_path(oldpath, newpath);
 }
 
 int fat32_mkdir_path(const char* path)
@@ -1512,6 +1551,12 @@ int fat32_mkdir_path(const char* path)
         return st;
 
     return ST_OK;
+}
+
+static int fat32_mkdir(const char* path, unsigned int mode)
+{
+    (void)mode;
+    return fat32_mkdir_path(path);
 }
 
 int fat32_rmdir_path(const char* path)
@@ -1582,6 +1627,24 @@ int fat32_rmdir_path(const char* path)
 
     if (fc >= 2)
         fat32_free_chain(g_root_fs, fc);
+    return ST_OK;
+}
+
+static int fat32_rmdir(const char* path)
+{
+    return fat32_rmdir_path(path);
+}
+
+static int fat32_chdir(const char* path)
+{
+    unsigned attr = 0;
+    unsigned long fc = 0;
+    unsigned long size = 0;
+    if (fat32_resolve_path(fat32_get_cwd(), path, &attr, &fc, &size) != ST_OK)
+        return ST_NOT_FOUND;
+    if (!(attr & FAT32_ATTR_DIRECTORY))
+        return ST_INVALID;
+    fat32_set_cwd(fc);
     return ST_OK;
 }
 

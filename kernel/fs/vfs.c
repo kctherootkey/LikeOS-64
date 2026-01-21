@@ -19,10 +19,24 @@ int vfs_open(const char* path, int flags, vfs_file_t** out) {
     return ret;
 }
 
+int vfs_stat(const char* path, struct kstat* st) {
+    if (!g_root_ops || !g_root_ops->stat) return ST_UNSUPPORTED;
+    return g_root_ops->stat(path, st);
+}
+
+int vfs_chdir(const char* path) {
+    if (!g_root_ops || !g_root_ops->chdir) return ST_UNSUPPORTED;
+    return g_root_ops->chdir(path);
+}
+
 long vfs_read(vfs_file_t* f, void* buf, long bytes) { if (!f || !f->ops || !f->ops->read) return ST_INVALID; return f->ops->read(f, buf, bytes); }
 long vfs_write(vfs_file_t* f, const void* buf, long bytes) { if (!f || !f->ops || !f->ops->write) return ST_INVALID; return f->ops->write(f, buf, bytes); }
 long vfs_seek(vfs_file_t* f, long offset, int whence) { if (!f || !f->ops || !f->ops->seek) return -1; return f->ops->seek(f, offset, whence); }
 int vfs_truncate(vfs_file_t* f, unsigned long size) { if (!f || !f->ops || !f->ops->truncate) return ST_UNSUPPORTED; return f->ops->truncate(f, size); }
+int vfs_unlink(const char* path) { if (!g_root_ops || !g_root_ops->unlink) return ST_UNSUPPORTED; return g_root_ops->unlink(path); }
+int vfs_rename(const char* oldpath, const char* newpath) { if (!g_root_ops || !g_root_ops->rename) return ST_UNSUPPORTED; return g_root_ops->rename(oldpath, newpath); }
+int vfs_mkdir(const char* path, unsigned int mode) { if (!g_root_ops || !g_root_ops->mkdir) return ST_UNSUPPORTED; return g_root_ops->mkdir(path, mode); }
+int vfs_rmdir(const char* path) { if (!g_root_ops || !g_root_ops->rmdir) return ST_UNSUPPORTED; return g_root_ops->rmdir(path); }
 
 int vfs_close(vfs_file_t* f) {
     if (!f || !f->ops || !f->ops->close) return ST_INVALID;
