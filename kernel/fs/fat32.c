@@ -73,9 +73,7 @@ typedef struct __attribute__((packed)) {
     uint16_t name3[2]; /* characters 12-13 */
 } fat32_lfn_t;
 
-#define FAT32_ATTR_DIRECTORY 0x10
 #define FAT32_ATTR_LONG_NAME 0x0F
-#define FAT32_ATTR_ARCHIVE  0x20
 
 // Maximum sectors per single USB read (QEMU xHCI limitation)
 #define MAX_SECTORS_PER_READ 1
@@ -412,6 +410,19 @@ static int fat32_write_dirent(unsigned long dir_cluster, unsigned int index, con
     int st = write_sectors(g_root_fs->bdev, lba, g_root_fs->sectors_per_cluster, buf);
     kfree(buf);
     return st;
+}
+
+static void fat32_init_dirent(fat32_dirent_t *ent, const char name83[11], uint8_t attr,
+    unsigned long first_cluster, unsigned long size)
+{
+    mm_memset(ent, 0, sizeof(*ent));
+    for (int i = 0; i < 11; ++i) {
+        ent->name[i] = (uint8_t)name83[i];
+    }
+    ent->attr = attr;
+    ent->fstClusHI = (uint16_t)((first_cluster >> 16) & 0xFFFF);
+    ent->fstClusLO = (uint16_t)(first_cluster & 0xFFFF);
+    ent->fileSize = (uint32_t)size;
 }
 
 static unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster)
@@ -1183,8 +1194,9 @@ static int fat32_open(const char* path, int flags, vfs_file_t** out);
 static long fat32_read(vfs_file_t* f, void* buf, long bytes);
 static long fat32_write(vfs_file_t* f, const void* buf, long bytes);
 static long fat32_seek(vfs_file_t* f, long offset, int whence);
+static int fat32_truncate(vfs_file_t* f, unsigned long size);
 static int fat32_close(vfs_file_t* f);
-static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_read, fat32_write, fat32_seek, fat32_close };
+static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_read, fat32_write, fat32_seek, fat32_truncate, fat32_close };
 
 static int fat32_resolve_parent(unsigned long start_cluster, const char *path,
     unsigned long *parent_cluster, char *name_out, unsigned name_out_len)
@@ -1361,6 +1373,218 @@ static int fat32_open(const char *path, int flags, vfs_file_t **out)
     return ST_OK;
 }
 
+int fat32_unlink_path(const char* path)
+{
+    unsigned long parent = 0;
+    char name[64];
+    name[0] = '\0';
+    if (fat32_resolve_parent(fat32_get_cwd(), path, &parent, name, sizeof(name)) != ST_OK)
+        return ST_NOT_FOUND;
+    char name83[11];
+    if (fat32_make_83_name(name, name83) != ST_OK)
+        return ST_INVALID;
+
+    unsigned attr = 0;
+    unsigned long fc = 0;
+    unsigned long size = 0;
+    unsigned long dir_cluster = 0;
+    unsigned int dir_index = 0;
+    if (fat32_dir_find_entry(parent, name83, &attr, &fc, &size, &dir_cluster, &dir_index) != ST_OK)
+        return ST_NOT_FOUND;
+    if (attr & FAT32_ATTR_DIRECTORY)
+        return ST_UNSUPPORTED;
+
+    unsigned cluster_size = g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+    void *buf = kalloc(cluster_size);
+    if (!buf)
+        return ST_NOMEM;
+    unsigned long lba = cluster_to_lba(g_root_fs, dir_cluster);
+    if (read_sectors(g_root_fs->bdev, lba, g_root_fs->sectors_per_cluster, buf) != ST_OK) {
+        kfree(buf);
+        return ST_IO;
+    }
+    fat32_dirent_t *ents = (fat32_dirent_t *)buf;
+    ents[dir_index].name[0] = 0xE5;
+    int st = write_sectors(g_root_fs->bdev, lba, g_root_fs->sectors_per_cluster, buf);
+    kfree(buf);
+    if (st != ST_OK)
+        return st;
+    if (fc >= 2) {
+        fat32_free_chain(g_root_fs, fc);
+    }
+    return ST_OK;
+}
+
+int fat32_rename_path(const char* oldpath, const char* newpath)
+{
+    unsigned long old_parent = 0;
+    char old_name[64];
+    old_name[0] = '\0';
+    if (fat32_resolve_parent(fat32_get_cwd(), oldpath, &old_parent, old_name, sizeof(old_name)) != ST_OK)
+        return ST_NOT_FOUND;
+    unsigned long new_parent = 0;
+    char new_name[64];
+    new_name[0] = '\0';
+    if (fat32_resolve_parent(fat32_get_cwd(), newpath, &new_parent, new_name, sizeof(new_name)) != ST_OK)
+        return ST_NOT_FOUND;
+    if (old_parent != new_parent)
+        return ST_UNSUPPORTED;
+
+    char old83[11];
+    char new83[11];
+    if (fat32_make_83_name(old_name, old83) != ST_OK)
+        return ST_INVALID;
+    if (fat32_make_83_name(new_name, new83) != ST_OK)
+        return ST_INVALID;
+
+    unsigned attr = 0;
+    unsigned long fc = 0;
+    unsigned long size = 0;
+    unsigned long dir_cluster = 0;
+    unsigned int dir_index = 0;
+    if (fat32_dir_find_entry(old_parent, old83, &attr, &fc, &size, &dir_cluster, &dir_index) != ST_OK)
+        return ST_NOT_FOUND;
+
+    unsigned cluster_size = g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+    void *buf = kalloc(cluster_size);
+    if (!buf)
+        return ST_NOMEM;
+    unsigned long lba = cluster_to_lba(g_root_fs, dir_cluster);
+    if (read_sectors(g_root_fs->bdev, lba, g_root_fs->sectors_per_cluster, buf) != ST_OK) {
+        kfree(buf);
+        return ST_IO;
+    }
+    fat32_dirent_t *ents = (fat32_dirent_t *)buf;
+    for (int i = 0; i < 11; ++i) {
+        ents[dir_index].name[i] = (uint8_t)new83[i];
+    }
+    int st = write_sectors(g_root_fs->bdev, lba, g_root_fs->sectors_per_cluster, buf);
+    kfree(buf);
+    return st;
+}
+
+int fat32_mkdir_path(const char* path)
+{
+    unsigned long parent = 0;
+    char name[64];
+    name[0] = '\0';
+    if (fat32_resolve_parent(fat32_get_cwd(), path, &parent, name, sizeof(name)) != ST_OK)
+        return ST_NOT_FOUND;
+    char name83[11];
+    if (fat32_make_83_name(name, name83) != ST_OK)
+        return ST_INVALID;
+
+    unsigned attr = 0;
+    unsigned long fc = 0;
+    unsigned long size = 0;
+    unsigned long dir_cluster = 0;
+    unsigned int dir_index = 0;
+    if (fat32_dir_find_entry(parent, name83, &attr, &fc, &size, &dir_cluster, &dir_index) == ST_OK) {
+        return ST_INVALID;
+    }
+
+    if (fat32_dir_find_free_entry(parent, &dir_cluster, &dir_index) != ST_OK)
+        return ST_IO;
+
+    unsigned long newc = 0;
+    if (fat32_alloc_cluster(g_root_fs, &newc) != ST_OK)
+        return ST_IO;
+
+    fat32_dirent_t ent;
+    fat32_init_dirent(&ent, name83, FAT32_ATTR_DIRECTORY, newc, 0);
+    if (fat32_write_dirent(dir_cluster, dir_index, &ent) != ST_OK)
+        return ST_IO;
+
+    // Initialize directory cluster with . and ..
+    unsigned cluster_size = g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+    void *buf = kcalloc(1, cluster_size);
+    if (!buf)
+        return ST_NOMEM;
+    fat32_dirent_t *ents = (fat32_dirent_t *)buf;
+    char dot[11] = {'.',' ',' ',' ',' ',' ',' ',' ',' ',' ',' '};
+    char dotdot[11] = {'.','.', ' ',' ',' ',' ',' ',' ',' ',' ',' '};
+    fat32_init_dirent(&ents[0], dot, FAT32_ATTR_DIRECTORY, newc, 0);
+    fat32_init_dirent(&ents[1], dotdot, FAT32_ATTR_DIRECTORY, parent, 0);
+    int st = write_sectors(g_root_fs->bdev, cluster_to_lba(g_root_fs, newc),
+        g_root_fs->sectors_per_cluster, buf);
+    kfree(buf);
+    if (st != ST_OK)
+        return st;
+
+    return ST_OK;
+}
+
+int fat32_rmdir_path(const char* path)
+{
+    unsigned long parent = 0;
+    char name[64];
+    name[0] = '\0';
+    if (fat32_resolve_parent(fat32_get_cwd(), path, &parent, name, sizeof(name)) != ST_OK)
+        return ST_NOT_FOUND;
+    char name83[11];
+    if (fat32_make_83_name(name, name83) != ST_OK)
+        return ST_INVALID;
+
+    unsigned attr = 0;
+    unsigned long fc = 0;
+    unsigned long size = 0;
+    unsigned long dir_cluster = 0;
+    unsigned int dir_index = 0;
+    if (fat32_dir_find_entry(parent, name83, &attr, &fc, &size, &dir_cluster, &dir_index) != ST_OK)
+        return ST_NOT_FOUND;
+    if (!(attr & FAT32_ATTR_DIRECTORY))
+        return ST_NOT_FOUND;
+
+    // Ensure directory is empty (only . and ..)
+    unsigned cluster_size = g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+    void *buf = kalloc(cluster_size);
+    if (!buf)
+        return ST_NOMEM;
+    if (read_sectors(g_root_fs->bdev, cluster_to_lba(g_root_fs, fc),
+        g_root_fs->sectors_per_cluster, buf) != ST_OK) {
+        kfree(buf);
+        return ST_IO;
+    }
+    fat32_dirent_t *ents = (fat32_dirent_t *)buf;
+    unsigned entries = cluster_size / sizeof(fat32_dirent_t);
+    int empty = 1;
+    for (unsigned i = 0; i < entries; ++i) {
+        if (ents[i].name[0] == 0x00)
+            break;
+        if (ents[i].name[0] == 0xE5)
+            continue;
+        if (ents[i].attr == FAT32_ATTR_LONG_NAME)
+            continue;
+        if (ents[i].name[0] == '.' && (ents[i].name[1] == ' ' || ents[i].name[1] == '.'))
+            continue;
+        empty = 0;
+        break;
+    }
+    kfree(buf);
+    if (!empty)
+        return ST_INVALID;
+
+    // Delete directory entry in parent
+    void *pbuf = kalloc(cluster_size);
+    if (!pbuf)
+        return ST_NOMEM;
+    unsigned long lba = cluster_to_lba(g_root_fs, dir_cluster);
+    if (read_sectors(g_root_fs->bdev, lba, g_root_fs->sectors_per_cluster, pbuf) != ST_OK) {
+        kfree(pbuf);
+        return ST_IO;
+    }
+    fat32_dirent_t *pents = (fat32_dirent_t *)pbuf;
+    pents[dir_index].name[0] = 0xE5;
+    int st = write_sectors(g_root_fs->bdev, lba, g_root_fs->sectors_per_cluster, pbuf);
+    kfree(pbuf);
+    if (st != ST_OK)
+        return st;
+
+    if (fc >= 2)
+        fat32_free_chain(g_root_fs, fc);
+    return ST_OK;
+}
+
 static long fat32_read(vfs_file_t *f, void *buf, long bytes)
 {
     if (!f || !buf)
@@ -1489,6 +1713,96 @@ static long fat32_write(vfs_file_t *f, const void *buf, long bytes)
     }
 
     return (long)written;
+}
+
+static int fat32_get_cluster_at(fat32_fs_t *fs, unsigned long start_cluster,
+    unsigned long index, unsigned long *out_cluster)
+{
+    if (!fs || !out_cluster || start_cluster < 2)
+        return ST_INVALID;
+    unsigned long cluster = start_cluster;
+    unsigned long i = 0;
+    while (i < index) {
+        unsigned long next = fat32_next_cluster_cached(fs, cluster);
+        if (next >= 0x0FFFFFF8 || next == 0)
+            return ST_NOT_FOUND;
+        cluster = next;
+        i++;
+    }
+    *out_cluster = cluster;
+    return ST_OK;
+}
+
+static int fat32_truncate(vfs_file_t *f, unsigned long new_size)
+{
+    if (!f)
+        return ST_INVALID;
+    fat32_file_t *ff = (fat32_file_t *)f->fs_private;
+    if (!ff || !ff->fs)
+        return ST_INVALID;
+
+    unsigned cluster_size = ff->fs->sectors_per_cluster * ff->fs->bytes_per_sector;
+
+    if (new_size == ff->size) {
+        return ST_OK;
+    }
+
+    if (new_size == 0) {
+        if (ff->start_cluster >= 2) {
+            fat32_free_chain(ff->fs, ff->start_cluster);
+        }
+        ff->start_cluster = 0;
+        ff->current_cluster = 0;
+        ff->size = 0;
+        if (ff->pos > 0) ff->pos = 0;
+        return fat32_update_dirent(ff);
+    }
+
+    unsigned long needed_clusters = (new_size + cluster_size - 1) / cluster_size;
+
+    if (ff->start_cluster < 2) {
+        unsigned long newc = 0;
+        if (fat32_alloc_cluster(ff->fs, &newc) != ST_OK)
+            return ST_IO;
+        ff->start_cluster = newc;
+        ff->current_cluster = newc;
+    }
+
+    // Ensure chain length
+    unsigned long last_cluster = ff->start_cluster;
+    unsigned long index = 0;
+    while (index + 1 < needed_clusters) {
+        unsigned long next = fat32_next_cluster_cached(ff->fs, last_cluster);
+        if (next >= 0x0FFFFFF8 || next == 0) {
+            unsigned long newc = 0;
+            if (fat32_append_cluster(ff->fs, last_cluster, &newc) != ST_OK)
+                return ST_IO;
+            last_cluster = newc;
+        } else {
+            last_cluster = next;
+        }
+        index++;
+    }
+
+    // Trim extra clusters if shrinking
+    if (new_size < ff->size) {
+        unsigned long cut_cluster = 0;
+        if (fat32_get_cluster_at(ff->fs, ff->start_cluster, needed_clusters - 1, &cut_cluster) == ST_OK) {
+            unsigned long next = fat32_next_cluster_cached(ff->fs, cut_cluster);
+            if (next < 0x0FFFFFF8 && next != 0) {
+                fat32_free_chain(ff->fs, next);
+            }
+            fat32_fat_set(ff->fs, cut_cluster, 0x0FFFFFFF);
+        }
+    }
+
+    ff->size = new_size;
+    if (ff->pos > ff->size) {
+        ff->pos = ff->size;
+        fat32_set_position(ff, ff->pos);
+    }
+
+    return fat32_update_dirent(ff);
 }
 
 // Seek to position in file

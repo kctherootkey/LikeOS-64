@@ -20,6 +20,49 @@
 #define SYS_DUP2        33
 #define SYS_PIPE        22
 
+// Extended syscalls
+#define SYS_STAT        200
+#define SYS_LSTAT       201
+#define SYS_FSTAT       202
+#define SYS_ACCESS      203
+#define SYS_CHDIR       204
+#define SYS_GETCWD      205
+#define SYS_UMASK       206
+#define SYS_GETUID      207
+#define SYS_GETGID      208
+#define SYS_GETEUID     209
+#define SYS_GETEGID     210
+#define SYS_GETGROUPS   211
+#define SYS_SETGROUPS   212
+#define SYS_GETHOSTNAME 213
+#define SYS_UNAME       214
+#define SYS_TIME        215
+#define SYS_GETTIMEOFDAY 216
+#define SYS_FSYNC       217
+#define SYS_FTRUNCATE   218
+#define SYS_FCNTL       219
+#define SYS_IOCTL       220
+#define SYS_SETPGID     221
+#define SYS_GETPGRP     222
+#define SYS_TCGETPGRP   223
+#define SYS_TCSETPGRP   224
+#define SYS_KILL        225
+#define SYS_SETUID      227
+#define SYS_SETGID      228
+#define SYS_SETEUID     229
+#define SYS_SETEGID     230
+#define SYS_UNLINK      231
+#define SYS_RENAME      232
+#define SYS_MKDIR       233
+#define SYS_RMDIR       234
+#define SYS_LINK        235
+#define SYS_SYMLINK     236
+#define SYS_READLINK    237
+#define SYS_CHMOD       238
+#define SYS_FCHMOD      239
+#define SYS_CHOWN       240
+#define SYS_FCHOWN      241
+
 // Syscall wrapper - uses inline assembly to invoke syscall instruction
 static inline long syscall0(long number) {
     long ret;

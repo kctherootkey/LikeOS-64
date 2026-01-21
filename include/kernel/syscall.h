@@ -24,6 +24,49 @@
 #define SYS_WAIT4       61
 #define SYS_GETPPID     110
 
+// Extended syscalls
+#define SYS_STAT        200
+#define SYS_LSTAT       201
+#define SYS_FSTAT       202
+#define SYS_ACCESS      203
+#define SYS_CHDIR       204
+#define SYS_GETCWD      205
+#define SYS_UMASK       206
+#define SYS_GETUID      207
+#define SYS_GETGID      208
+#define SYS_GETEUID     209
+#define SYS_GETEGID     210
+#define SYS_GETGROUPS   211
+#define SYS_SETGROUPS   212
+#define SYS_GETHOSTNAME 213
+#define SYS_UNAME       214
+#define SYS_TIME        215
+#define SYS_GETTIMEOFDAY 216
+#define SYS_FSYNC       217
+#define SYS_FTRUNCATE   218
+#define SYS_FCNTL       219
+#define SYS_IOCTL       220
+#define SYS_SETPGID     221
+#define SYS_GETPGRP     222
+#define SYS_TCGETPGRP   223
+#define SYS_TCSETPGRP   224
+#define SYS_KILL        225
+#define SYS_SETUID      227
+#define SYS_SETGID      228
+#define SYS_SETEUID     229
+#define SYS_SETEGID     230
+#define SYS_UNLINK      231
+#define SYS_RENAME      232
+#define SYS_MKDIR       233
+#define SYS_RMDIR       234
+#define SYS_LINK        235
+#define SYS_SYMLINK     236
+#define SYS_READLINK    237
+#define SYS_CHMOD       238
+#define SYS_FCHMOD      239
+#define SYS_CHOWN       240
+#define SYS_FCHOWN      241
+
 // File descriptor limits
 #define MAX_FDS         1024
 
@@ -65,10 +108,16 @@
 #define EAGAIN          11  // Resource temporarily unavailable
 #define EBADF           9   // Bad file descriptor
 #define ECHILD          10  // No child processes
+#define ESRCH           3   // No such process
+#define EIO             5   // I/O error
 #define ENOMEM          12  // Out of memory
 #define EACCES          13  // Permission denied
 #define EFAULT          14  // Bad address
 #define ENOEXEC         8   // Exec format error
+#define ENOENT          2   // No such file or directory
+#define EPERM           1   // Operation not permitted
+#define ENOTDIR         20  // Not a directory
+#define ENOTTY          25  // Not a typewriter
 #define EINVAL          22  // Invalid argument
 #define EMFILE          24  // Too many open files
 #define ESPIPE          29  // Illegal seek

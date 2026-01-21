@@ -31,6 +31,10 @@ typedef struct {
     char name83[12]; // 8.3 name (11 chars + null)
 } fat32_file_t;
 
+// FAT32 attribute flags
+#define FAT32_ATTR_DIRECTORY 0x10
+#define FAT32_ATTR_ARCHIVE   0x20
+
 int fat32_mount(const block_device_t* bdev, fat32_fs_t* out);
 int fat32_vfs_register_root(fat32_fs_t* fs);
 void fat32_list_root(void (*cb)(const char*, unsigned attr, unsigned long size));
@@ -46,5 +50,11 @@ int fat32_resolve_path(unsigned long start_cluster, const char* path, unsigned* 
 int fat32_stat(unsigned long start_cluster, const char* path, unsigned* attr, unsigned long* first_cluster, unsigned long* size);
 // Get parent cluster of directory (returns same cluster for root)
 unsigned long fat32_parent_cluster(unsigned long dir_cluster);
+
+// Write helpers
+int fat32_unlink_path(const char* path);
+int fat32_rename_path(const char* oldpath, const char* newpath);
+int fat32_mkdir_path(const char* path);
+int fat32_rmdir_path(const char* path);
 
 #endif // LIKEOS_FAT32_H

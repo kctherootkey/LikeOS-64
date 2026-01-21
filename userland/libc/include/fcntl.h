@@ -9,6 +9,10 @@
 #define O_TRUNC     0x0200
 #define O_APPEND    0x0400
 
+// fcntl commands
+#define F_GETFL     3
+#define F_SETFL     4
+
 // File access
 int open(const char* pathname, int flags, ...);
 

@@ -9,6 +9,9 @@
 #include "../../include/kernel/status.h"
 #include "../../include/kernel/elf.h"
 #include "../../include/kernel/pipe.h"
+#include "../../include/kernel/fat32.h"
+#include "../../include/kernel/timer.h"
+#include "../../include/kernel/stat.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
@@ -202,6 +205,27 @@ static int alloc_fd(task_t* task) {
     }
     return -EMFILE;  // Too many open files
 }
+
+// Forward declarations for helper syscalls used before definition
+static int64_t sys_getpid(void);
+static void sys_exit(uint64_t status);
+
+// Simple umask (global for now)
+static uint32_t g_umask = 0022;
+
+// Minimal uname struct (kernel-side)
+typedef struct {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+} k_utsname_t;
+
+typedef struct {
+    long tv_sec;
+    long tv_usec;
+} k_timeval_t;
 
 // Find free mmap region slot
 static mmap_region_t* alloc_mmap_region(task_t* task) {
@@ -441,6 +465,379 @@ static int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence) {
     
     return result;
 }
+
+static int64_t sys_stat_common(const char* path, uint64_t stat_buf) {
+    if (!validate_user_ptr((uint64_t)path, 1) || !validate_user_ptr(stat_buf, sizeof(struct kstat))) {
+        return -EFAULT;
+    }
+    unsigned attr = 0;
+    unsigned long fc = 0;
+    unsigned long size = 0;
+    if (fat32_resolve_path(fat32_get_cwd(), path, &attr, &fc, &size) != ST_OK) {
+        return -ENOENT;
+    }
+    struct kstat st;
+    st.st_nlink = 1;
+    st.st_uid = 0;
+    st.st_gid = 0;
+    st.st_size = size;
+    st.st_atime = 0;
+    st.st_mtime = 0;
+    st.st_ctime = 0;
+    if (attr & FAT32_ATTR_DIRECTORY) {
+        st.st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+    } else {
+        st.st_mode = S_IFREG | (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    }
+    mm_memcpy((void*)stat_buf, &st, sizeof(st));
+    return 0;
+}
+
+static int64_t sys_stat(uint64_t pathname, uint64_t stat_buf) {
+    return sys_stat_common((const char*)pathname, stat_buf);
+}
+
+static int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf) {
+    return sys_stat_common((const char*)pathname, stat_buf);
+}
+
+static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (!validate_user_ptr(stat_buf, sizeof(struct kstat))) {
+        return -EFAULT;
+    }
+    struct kstat st;
+    st.st_nlink = 1;
+    st.st_uid = 0;
+    st.st_gid = 0;
+    st.st_atime = 0;
+    st.st_mtime = 0;
+    st.st_ctime = 0;
+    if (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD) {
+        st.st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+        st.st_size = 0;
+        mm_memcpy((void*)stat_buf, &st, sizeof(st));
+        return 0;
+    }
+    if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) {
+        return -EBADF;
+    }
+    vfs_file_t* file = cur->fd_table[fd];
+    if (pipe_is_end(file)) {
+        st.st_mode = S_IFIFO | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+        st.st_size = 0;
+        mm_memcpy((void*)stat_buf, &st, sizeof(st));
+        return 0;
+    }
+    st.st_mode = S_IFREG | (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    st.st_size = vfs_size(file);
+    mm_memcpy((void*)stat_buf, &st, sizeof(st));
+    return 0;
+}
+
+static int64_t sys_access(uint64_t pathname, uint64_t mode) {
+    (void)mode;
+    if (!validate_user_ptr(pathname, 1)) {
+        return -EFAULT;
+    }
+    unsigned attr = 0;
+    unsigned long fc = 0;
+    unsigned long size = 0;
+    if (fat32_resolve_path(fat32_get_cwd(), (const char*)pathname, &attr, &fc, &size) != ST_OK) {
+        return -ENOENT;
+    }
+    return 0;
+}
+
+static int64_t sys_chdir(uint64_t pathname) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (!validate_user_ptr(pathname, 1)) {
+        return -EFAULT;
+    }
+    unsigned attr = 0;
+    unsigned long fc = 0;
+    unsigned long size = 0;
+    const char* path = (const char*)pathname;
+    if (fat32_resolve_path(fat32_get_cwd(), path, &attr, &fc, &size) != ST_OK) {
+        return -ENOENT;
+    }
+    if (!(attr & FAT32_ATTR_DIRECTORY)) {
+        return -ENOTDIR;
+    }
+    fat32_set_cwd(fc);
+    // Update task cwd string (best-effort, no canonicalization)
+    mm_memset(cur->cwd, 0, sizeof(cur->cwd));
+    if (path[0] == '/') {
+        size_t i = 0;
+        for (; path[i] && i < sizeof(cur->cwd) - 1; ++i) cur->cwd[i] = path[i];
+        cur->cwd[i] = '\0';
+    } else {
+        cur->cwd[0] = '/';
+        size_t i = 0;
+        for (; path[i] && (i + 1) < sizeof(cur->cwd) - 1; ++i) cur->cwd[i + 1] = path[i];
+        cur->cwd[i + 1] = '\0';
+    }
+    return 0;
+}
+
+static int64_t sys_getcwd(uint64_t buf, uint64_t size) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (!validate_user_ptr(buf, size)) {
+        return -EFAULT;
+    }
+    const char* src = (cur->cwd[0] != 0) ? cur->cwd : "/";
+    size_t len = 0;
+    while (src[len]) len++;
+    if (size == 0 || len + 1 > size) {
+        return -EINVAL;
+    }
+    mm_memcpy((void*)buf, src, len + 1);
+    return (int64_t)buf;
+}
+
+static int64_t sys_umask(uint64_t mask) {
+    uint32_t old = g_umask;
+    g_umask = (uint32_t)mask;
+    return old;
+}
+
+static int64_t sys_getuid(void) { return 0; }
+static int64_t sys_geteuid(void) { return 0; }
+static int64_t sys_getgid(void) { return 0; }
+static int64_t sys_getegid(void) { return 0; }
+
+static int64_t sys_setuid(uint64_t uid) { return uid == 0 ? 0 : -EPERM; }
+static int64_t sys_seteuid(uint64_t uid) { return uid == 0 ? 0 : -EPERM; }
+static int64_t sys_setgid(uint64_t gid) { return gid == 0 ? 0 : -EPERM; }
+static int64_t sys_setegid(uint64_t gid) { return gid == 0 ? 0 : -EPERM; }
+
+static int64_t sys_getgroups(uint64_t size, uint64_t list) {
+    if (size == 0) return 0;
+    if (!validate_user_ptr(list, sizeof(int) * size)) return -EFAULT;
+    return 0;
+}
+
+static int64_t sys_setgroups(uint64_t size, uint64_t list) {
+    (void)size; (void)list;
+    return -EPERM;
+}
+
+static int64_t sys_gethostname(uint64_t name, uint64_t len) {
+    const char* host = "LikeOS";
+    size_t hlen = 0;
+    while (host[hlen]) hlen++;
+    if (!validate_user_ptr(name, len)) return -EFAULT;
+    if (len < hlen + 1) return -EINVAL;
+    mm_memcpy((void*)name, host, hlen + 1);
+    return 0;
+}
+
+static int64_t sys_uname(uint64_t buf) {
+    if (!validate_user_ptr(buf, sizeof(k_utsname_t))) return -EFAULT;
+    k_utsname_t u;
+    mm_memset(&u, 0, sizeof(u));
+    const char* sys = "LikeOS";
+    const char* node = "likeos";
+    const char* rel = "0.2";
+    const char* ver = "LikeOS-64";
+    const char* mach = "x86_64";
+    mm_memcpy(u.sysname, sys, 7);
+    mm_memcpy(u.nodename, node, 7);
+    mm_memcpy(u.release, rel, 4);
+    mm_memcpy(u.version, ver, 9);
+    mm_memcpy(u.machine, mach, 7);
+    mm_memcpy((void*)buf, &u, sizeof(u));
+    return 0;
+}
+
+static int64_t sys_time(uint64_t tloc) {
+    uint64_t ticks = timer_ticks();
+    uint64_t sec = ticks / 100;
+    if (tloc && validate_user_ptr(tloc, sizeof(uint64_t))) {
+        *(uint64_t*)tloc = sec;
+    }
+    return (int64_t)sec;
+}
+
+static int64_t sys_gettimeofday(uint64_t tv, uint64_t tz) {
+    (void)tz;
+    if (!validate_user_ptr(tv, sizeof(k_timeval_t))) return -EFAULT;
+    uint64_t ticks = timer_ticks();
+    k_timeval_t kv;
+    kv.tv_sec = (long)(ticks / 100);
+    kv.tv_usec = (long)((ticks % 100) * 10000);
+    mm_memcpy((void*)tv, &kv, sizeof(kv));
+    return 0;
+}
+
+static int64_t sys_fsync(uint64_t fd) {
+    (void)fd;
+    return 0;
+}
+
+static int64_t sys_ftruncate(uint64_t fd, uint64_t length) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) return -EBADF;
+    vfs_file_t* file = cur->fd_table[fd];
+    return vfs_truncate(file, (unsigned long)length);
+}
+
+static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) return -EBADF;
+
+    // Handle console markers
+    if (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD) {
+        if (cmd == 3) { // F_GETFL
+            if (fd == STDIN_FD) return O_RDONLY;
+            return O_WRONLY;
+        }
+        if (cmd == 4) { // F_SETFL
+            return 0;
+        }
+        return -EINVAL;
+    }
+
+    vfs_file_t* file = cur->fd_table[fd];
+    if (pipe_is_end(file)) {
+        pipe_end_t* end = (pipe_end_t*)file;
+        if (cmd == 3) {
+            return end->is_read ? O_RDONLY : O_WRONLY;
+        }
+        if (cmd == 4) {
+            return 0;
+        }
+        return -EINVAL;
+    }
+
+    if (cmd == 3) { // F_GETFL
+        return file->flags;
+    }
+    if (cmd == 4) { // F_SETFL
+        // only allow changing O_APPEND
+        file->flags = (file->flags & ~O_APPEND) | (arg & O_APPEND);
+        return 0;
+    }
+    return -EINVAL;
+}
+
+static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp) {
+    (void)fd; (void)req; (void)argp;
+    return -ENOTTY;
+}
+
+static int64_t sys_setpgid(uint64_t pid, uint64_t pgid) {
+    (void)pid; (void)pgid;
+    return 0;
+}
+
+static int64_t sys_getpgrp(void) {
+    return sys_getpid();
+}
+
+static int64_t sys_tcgetpgrp(uint64_t fd) {
+    (void)fd;
+    return sys_getpid();
+}
+
+static int64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgrp) {
+    (void)fd; (void)pgrp;
+    return 0;
+}
+
+static void kill_task(task_t* t, int sig) {
+    if (!t) {
+        return;
+    }
+    if (t == sched_current()) {
+        sys_exit(128 + sig);
+        return;
+    }
+
+    // Close all file descriptors
+    for (int i = 0; i < TASK_MAX_FDS; i++) {
+        if (t->fd_table[i]) {
+            uint64_t marker = (uint64_t)t->fd_table[i];
+            if (marker >= 1 && marker <= 3) {
+                t->fd_table[i] = NULL;
+            } else if (pipe_is_end(t->fd_table[i])) {
+                pipe_close_end((pipe_end_t*)t->fd_table[i]);
+                t->fd_table[i] = NULL;
+            } else {
+                vfs_close(t->fd_table[i]);
+                t->fd_table[i] = NULL;
+            }
+        }
+    }
+
+    // Reparent children to init
+    sched_reparent_children(t);
+
+    // Mark as exited
+    __asm__ volatile ("cli");
+    t->exit_code = 128 + sig;
+    t->has_exited = true;
+    t->state = TASK_ZOMBIE;
+}
+
+static int64_t sys_kill(uint64_t pid, uint64_t sig) {
+    if (pid == 0) return 0;
+    if (sig > 64) return -EINVAL;
+    task_t* t = sched_find_task_by_id((uint32_t)pid);
+    if (!t) return -ESRCH;
+    if (sig == 0) return 0;
+    // Default behavior: terminate task for any signal
+    kill_task(t, (int)sig);
+    return 0;
+}
+
+static int64_t sys_unlink(uint64_t pathname) {
+    if (!validate_user_ptr(pathname, 1)) return -EFAULT;
+    int st = fat32_unlink_path((const char*)pathname);
+    if (st == ST_OK) return 0;
+    if (st == ST_NOT_FOUND) return -ENOENT;
+    return -EINVAL;
+}
+
+static int64_t sys_rename(uint64_t oldpath, uint64_t newpath) {
+    if (!validate_user_ptr(oldpath, 1) || !validate_user_ptr(newpath, 1)) return -EFAULT;
+    int st = fat32_rename_path((const char*)oldpath, (const char*)newpath);
+    if (st == ST_OK) return 0;
+    if (st == ST_NOT_FOUND) return -ENOENT;
+    return -EINVAL;
+}
+
+static int64_t sys_mkdir(uint64_t pathname, uint64_t mode) {
+    (void)mode;
+    if (!validate_user_ptr(pathname, 1)) return -EFAULT;
+    int st = fat32_mkdir_path((const char*)pathname);
+    if (st == ST_OK) return 0;
+    if (st == ST_NOT_FOUND) return -ENOENT;
+    if (st == ST_NOMEM) return -ENOMEM;
+    if (st == ST_IO) return -EIO;
+    return -EINVAL;
+}
+static int64_t sys_rmdir(uint64_t pathname) {
+    if (!validate_user_ptr(pathname, 1)) return -EFAULT;
+    int st = fat32_rmdir_path((const char*)pathname);
+    if (st == ST_OK) return 0;
+    if (st == ST_NOT_FOUND) return -ENOENT;
+    if (st == ST_NOMEM) return -ENOMEM;
+    if (st == ST_IO) return -EIO;
+    return -EINVAL;
+}
+static int64_t sys_link(uint64_t oldpath, uint64_t newpath) { (void)oldpath; (void)newpath; return -ENOSYS; }
+static int64_t sys_symlink(uint64_t target, uint64_t linkpath) { (void)target; (void)linkpath; return -ENOSYS; }
+static int64_t sys_readlink(uint64_t pathname, uint64_t buf, uint64_t bufsiz) { (void)pathname; (void)buf; (void)bufsiz; return -ENOSYS; }
+static int64_t sys_chmod(uint64_t pathname, uint64_t mode) { (void)pathname; (void)mode; return -ENOSYS; }
+static int64_t sys_fchmod(uint64_t fd, uint64_t mode) { (void)fd; (void)mode; return -ENOSYS; }
+static int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group) { (void)pathname; (void)owner; (void)group; return -ENOSYS; }
+static int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group) { (void)fd; (void)owner; (void)group; return -ENOSYS; }
 
 // SYS_BRK - set program break
 static int64_t sys_brk(uint64_t new_brk) {
@@ -1110,6 +1507,129 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
             
         case SYS_YIELD:
             return sys_yield();
+
+        case SYS_STAT:
+            return sys_stat(a1, a2);
+
+        case SYS_LSTAT:
+            return sys_lstat(a1, a2);
+
+        case SYS_FSTAT:
+            return sys_fstat(a1, a2);
+
+        case SYS_ACCESS:
+            return sys_access(a1, a2);
+
+        case SYS_CHDIR:
+            return sys_chdir(a1);
+
+        case SYS_GETCWD:
+            return sys_getcwd(a1, a2);
+
+        case SYS_UMASK:
+            return sys_umask(a1);
+
+        case SYS_GETUID:
+            return sys_getuid();
+
+        case SYS_GETGID:
+            return sys_getgid();
+
+        case SYS_GETEUID:
+            return sys_geteuid();
+
+        case SYS_GETEGID:
+            return sys_getegid();
+
+        case SYS_SETUID:
+            return sys_setuid(a1);
+
+        case SYS_SETGID:
+            return sys_setgid(a1);
+
+        case SYS_SETEUID:
+            return sys_seteuid(a1);
+
+        case SYS_SETEGID:
+            return sys_setegid(a1);
+
+        case SYS_GETGROUPS:
+            return sys_getgroups(a1, a2);
+
+        case SYS_SETGROUPS:
+            return sys_setgroups(a1, a2);
+
+        case SYS_GETHOSTNAME:
+            return sys_gethostname(a1, a2);
+
+        case SYS_UNAME:
+            return sys_uname(a1);
+
+        case SYS_TIME:
+            return sys_time(a1);
+
+        case SYS_GETTIMEOFDAY:
+            return sys_gettimeofday(a1, a2);
+
+        case SYS_FSYNC:
+            return sys_fsync(a1);
+
+        case SYS_FTRUNCATE:
+            return sys_ftruncate(a1, a2);
+
+        case SYS_FCNTL:
+            return sys_fcntl(a1, a2, a3);
+
+        case SYS_IOCTL:
+            return sys_ioctl(a1, a2, a3);
+
+        case SYS_SETPGID:
+            return sys_setpgid(a1, a2);
+
+        case SYS_GETPGRP:
+            return sys_getpgrp();
+
+        case SYS_TCGETPGRP:
+            return sys_tcgetpgrp(a1);
+
+        case SYS_TCSETPGRP:
+            return sys_tcsetpgrp(a1, a2);
+
+        case SYS_KILL:
+            return sys_kill(a1, a2);
+
+        case SYS_UNLINK:
+            return sys_unlink(a1);
+
+        case SYS_RENAME:
+            return sys_rename(a1, a2);
+
+        case SYS_MKDIR:
+            return sys_mkdir(a1, a2);
+
+        case SYS_RMDIR:
+            return sys_rmdir(a1);
+
+        case SYS_LINK:
+            return sys_link(a1, a2);
+
+        case SYS_SYMLINK:
+            return sys_symlink(a1, a2);
+
+        case SYS_READLINK:
+            return sys_readlink(a1, a2, a3);
+
+        case SYS_CHMOD:
+            return sys_chmod(a1, a2);
+
+        case SYS_FCHMOD:
+            return sys_fchmod(a1, a2);
+
+        case SYS_CHOWN:
+            return sys_chown(a1, a2, a3);
+
+        case SYS_FCHOWN:
+            return sys_fchown(a1, a2, a3);
             
         default:
             return -ENOSYS;

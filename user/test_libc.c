@@ -4,12 +4,43 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/utsname.h>
+#include <time.h>
+#include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
 
 // Test result tracking
 static int tests_passed = 0;
 static int tests_failed = 0;
+
+static volatile int g_sigusr1_hit = 0;
+static volatile int g_sigusr2_hit = 0;
+static volatile int g_last_signal = 0;
+static volatile int g_signal_hits = 0;
+static volatile int g_sigalrm_hit = 0;
+
+static void handle_sigusr1(int sig) {
+    (void)sig;
+    g_sigusr1_hit = 1;
+}
+
+static void handle_sigusr2(int sig) {
+    (void)sig;
+    g_sigusr2_hit = 1;
+}
+
+static void handle_generic(int sig) {
+    g_last_signal = sig;
+    g_signal_hits++;
+}
+
+static void handle_sigalrm(int sig) {
+    (void)sig;
+    g_sigalrm_hit = 1;
+}
 
 static void test_pass(const char* name) {
     tests_passed++;
@@ -275,6 +306,50 @@ int main(int argc, char** argv) {
     }
 
     // ========================================
+    // Test: execv/execvp (via fork)
+    // ========================================
+    printf("\n[TEST] execv/execvp via fork\n");
+    pid_t execv_child = fork();
+    if (execv_child < 0) {
+        test_fail("fork() for execv failed");
+    } else if (execv_child == 0) {
+        char* exec_argv[] = { "/hello", NULL };
+        execv("/hello", exec_argv);
+        _exit(1);
+    } else {
+        int status = 0;
+        pid_t waited = waitpid(execv_child, &status, 0);
+        test_result("waitpid() returns execv child PID", waited == execv_child);
+        if (WIFEXITED(status)) {
+            int exit_status = WEXITSTATUS(status);
+            test_result("execv child exited 0", exit_status == 0);
+        } else {
+            test_fail("execv child did not exit normally");
+        }
+    }
+
+    // Ensure PATH for execvp
+    setenv("PATH", "/", 1);
+    pid_t execvp_child = fork();
+    if (execvp_child < 0) {
+        test_fail("fork() for execvp failed");
+    } else if (execvp_child == 0) {
+        char* exec_argv[] = { "hello", NULL };
+        execvp("hello", exec_argv);
+        _exit(1);
+    } else {
+        int status = 0;
+        pid_t waited = waitpid(execvp_child, &status, 0);
+        test_result("waitpid() returns execvp child PID", waited == execvp_child);
+        if (WIFEXITED(status)) {
+            int exit_status = WEXITSTATUS(status);
+            test_result("execvp child exited 0", exit_status == 0);
+        } else {
+            test_fail("execvp child did not exit normally");
+        }
+    }
+
+    // ========================================
     // Test: pipe
     // ========================================
     printf("\n[TEST] pipe()\n");
@@ -327,6 +402,51 @@ int main(int argc, char** argv) {
         test_result("write to duped fd succeeds", wr > 0);
         close(newfd);
     }
+
+    // ========================================
+    // Test: stat/access/chdir/getcwd
+    // ========================================
+    printf("\n[TEST] stat/access/chdir/getcwd\n");
+    struct stat st;
+    int sret = stat("/HELLO.TXT", &st);
+    test_result("stat(/HELLO.TXT) succeeds", sret == 0);
+    if (sret == 0) {
+        test_result("stat size > 0", st.st_size > 0);
+    }
+    test_result("access(/HELLO.TXT) succeeds", access("/HELLO.TXT", R_OK) == 0);
+    char cwd[64];
+    char* cwdret = getcwd(cwd, sizeof(cwd));
+    test_result("getcwd returns non-NULL", cwdret != NULL);
+    test_result("chdir('/') succeeds", chdir("/") == 0);
+    cwdret = getcwd(cwd, sizeof(cwd));
+    test_result("getcwd after chdir", cwdret != NULL);
+
+    // ========================================
+    // Test: uid/gid and time
+    // ========================================
+    printf("\n[TEST] uid/gid/time\n");
+    test_result("getuid returns 0", getuid() == 0);
+    test_result("getgid returns 0", getgid() == 0);
+    struct timeval tv;
+    test_result("gettimeofday succeeds", gettimeofday(&tv, NULL) == 0);
+    test_result("gettimeofday tv_sec non-negative", tv.tv_sec >= 0);
+    time_t tnow = time(NULL);
+    test_result("time returns non-negative", tnow >= 0);
+    test_result("time >= gettimeofday", tnow >= (time_t)tv.tv_sec);
+
+    // ========================================
+    // Test: gethostname/uname
+    // ========================================
+    printf("\n[TEST] gethostname/uname\n");
+    char host[64];
+    test_result("gethostname succeeds", gethostname(host, sizeof(host)) == 0);
+    test_result("gethostname non-empty", host[0] != '\0');
+    printf("  hostname: %s\n", host);
+    struct utsname un;
+    test_result("uname succeeds", uname(&un) == 0);
+    test_result("uname sysname non-empty", un.sysname[0] != '\0');
+    printf("  uname: sysname=%s nodename=%s release=%s version=%s machine=%s\n",
+        un.sysname, un.nodename, un.release, un.version, un.machine);
 
     // ========================================
     // Test: file write/create/truncate/append
@@ -392,6 +512,115 @@ int main(int argc, char** argv) {
         test_result("overwrite applied", rbuf[5] == '-');
         close(wfd);
     }
+
+    // ========================================
+    // Test: fstat/fsync/ftruncate
+    // ========================================
+    printf("\n[TEST] fstat/fsync/ftruncate\n");
+    int tfd = open("/WRITE.TXT", O_WRONLY);
+    test_result("open existing file for fstat", tfd >= 0);
+    if (tfd >= 0) {
+        test_result("fstat succeeds", fstat(tfd, &st) == 0);
+        test_result("fsync succeeds", fsync(tfd) == 0);
+        test_result("ftruncate to 4 bytes", ftruncate(tfd, 4) == 0);
+        int fl = fcntl(tfd, F_GETFL);
+        test_result("fcntl(F_GETFL) returns flags", fl >= 0);
+        test_result("fcntl(F_SETFL) sets O_APPEND", fcntl(tfd, F_SETFL, O_APPEND) == 0);
+        close(tfd);
+    }
+    // verify truncate
+    tfd = open("/WRITE.TXT", O_RDONLY);
+    if (tfd >= 0) {
+        char rbuf[16];
+        memset(rbuf, 0, sizeof(rbuf));
+        ssize_t rr = read(tfd, rbuf, sizeof(rbuf) - 1);
+        test_result("truncate reduced size", rr == 4);
+        close(tfd);
+    }
+    // rename/unlink
+    test_result("rename succeeds", rename("/WRITE.TXT", "/WRITE2.TXT") == 0);
+    test_result("unlink succeeds", unlink("/WRITE2.TXT") == 0);
+
+    // ========================================
+    // Test: mkdir/rmdir
+    // ========================================
+    printf("\n[TEST] mkdir/rmdir\n");
+    test_result("mkdir('/TESTDIR') succeeds", mkdir("/TESTDIR", 0777) == 0);
+    test_result("chdir('/TESTDIR') succeeds", chdir("/TESTDIR") == 0);
+    int dfd = open("/TESTDIR/FILE.TXT", O_CREAT | O_TRUNC | O_WRONLY);
+    test_result("create file in dir", dfd >= 0);
+    if (dfd >= 0) {
+        write(dfd, "X", 1);
+        close(dfd);
+    }
+    test_result("unlink file in dir", unlink("/TESTDIR/FILE.TXT") == 0);
+    test_result("chdir('/') succeeds", chdir("/") == 0);
+    test_result("rmdir('/TESTDIR') succeeds", rmdir("/TESTDIR") == 0);
+
+    // ========================================
+    // Test: kill
+    // ========================================
+    printf("\n[TEST] kill\n");
+    test_result("kill(getpid(), 0) succeeds", kill(getpid(), 0) == 0);
+    test_result("kill(invalid, 0) fails", kill(99999, 0) == -1 && errno == ESRCH);
+    pid_t kchild = fork();
+    if (kchild == 0) {
+        // child waits to be killed
+        sleep(5);
+        _exit(0);
+    } else if (kchild > 0) {
+        test_result("kill(child, SIGTERM) succeeds", kill(kchild, SIGTERM) == 0);
+        int kst = 0;
+        pid_t kw = waitpid(kchild, &kst, 0);
+        test_result("waitpid returns child", kw == kchild);
+        test_result("child killed exit status", WIFEXITED(kst) && WEXITSTATUS(kst) == (128 + SIGTERM));
+    } else {
+        test_fail("fork() for kill test failed");
+    }
+
+    // ========================================
+    // Test: signals
+    // ========================================
+    printf("\n[TEST] signals\n");
+    g_sigusr1_hit = 0;
+    g_sigusr2_hit = 0;
+    g_last_signal = 0;
+    g_signal_hits = 0;
+    test_result("signal(SIGUSR1) set", signal(SIGUSR1, handle_sigusr1) != SIG_ERR);
+    test_result("raise(SIGUSR1) returns 0", raise(SIGUSR1) == 0);
+    test_result("SIGUSR1 handler ran", g_sigusr1_hit == 1);
+
+    signal(SIGUSR2, handle_sigusr2);
+    test_result("kill(self,SIGUSR2) returns 0", kill(getpid(), SIGUSR2) == 0);
+    test_result("SIGUSR2 handler ran", g_sigusr2_hit == 1);
+
+    // Test a range of signals with a generic handler (skip SIGKILL/SIGSTOP)
+    int sigs_to_test[] = { SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE,
+                           SIGUSR1, SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD,
+                           SIGCONT, SIGTSTP, SIGTTIN, SIGTTOU };
+    int sig_count = (int)(sizeof(sigs_to_test) / sizeof(sigs_to_test[0]));
+    for (int i = 0; i < sig_count; i++) {
+        int sig = sigs_to_test[i];
+        g_last_signal = 0;
+        signal(sig, handle_generic);
+        int rr = raise(sig);
+        char name[64];
+        snprintf(name, sizeof(name), "raise signal %d", sig);
+        test_result(name, rr == 0 && g_last_signal == sig);
+    }
+
+    // ========================================
+    // Test: alarm/sleep
+    // ========================================
+    printf("\n[TEST] alarm/sleep\n");
+    g_sigalrm_hit = 0;
+    signal(SIGALRM, handle_sigalrm);
+    unsigned int rem = alarm(1);
+    test_result("alarm(1) returns remaining", rem == 0);
+    sleep(2);
+    test_result("SIGALRM delivered", g_sigalrm_hit == 1);
+
+    // rename/unlink
 
     // large write to force multi-cluster
     printf("\n[TEST] large file write (multi-cluster)\n");

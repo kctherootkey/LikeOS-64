@@ -18,6 +18,7 @@ typedef struct {
     long (*read)(vfs_file_t* f, void* buf, long bytes);
     long (*write)(vfs_file_t* f, const void* buf, long bytes);
     long (*seek)(vfs_file_t* f, long offset, int whence);
+    int (*truncate)(vfs_file_t* f, unsigned long size);
     int (*close)(vfs_file_t* f);
 } vfs_ops_t;
 
@@ -37,6 +38,7 @@ int vfs_open(const char* path, int flags, vfs_file_t** out);
 long vfs_read(vfs_file_t* f, void* buf, long bytes);
 long vfs_write(vfs_file_t* f, const void* buf, long bytes);
 long vfs_seek(vfs_file_t* f, long offset, int whence);
+int vfs_truncate(vfs_file_t* f, unsigned long size);
 int vfs_close(vfs_file_t* f);
 size_t vfs_size(vfs_file_t* f);
 vfs_file_t* vfs_dup(vfs_file_t* f);  // Increment refcount and return same pointer

@@ -9,7 +9,7 @@ STDIO_SRC = src/stdio/stdio.c
 STRING_SRC = src/string/string.c
 STDLIB_SRC = src/stdlib/stdlib.c
 CTYPE_SRC = src/ctype/ctype.c
-SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c
+SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c
 CRT0_SRC = src/crt0.S
 
 # Object files
