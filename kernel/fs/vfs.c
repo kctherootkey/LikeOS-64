@@ -9,17 +9,18 @@ static const vfs_ops_t* g_root_ops = 0;
 int vfs_init(void) { g_root_ops = 0; return ST_OK; }
 int vfs_register_root(const vfs_ops_t* ops) { if (!ops) return ST_INVALID; g_root_ops = ops; return ST_OK; }
 
-int vfs_open(const char* path, vfs_file_t** out) {
+int vfs_open(const char* path, int flags, vfs_file_t** out) {
     if (!g_root_ops || !g_root_ops->open) return ST_UNSUPPORTED;
-    int ret = g_root_ops->open(path, out);
+    int ret = g_root_ops->open(path, flags, out);
     if (ret == ST_OK && *out) {
         (*out)->refcount = 1;
-        (*out)->flags = 0;
+        (*out)->flags = flags;
     }
     return ret;
 }
 
 long vfs_read(vfs_file_t* f, void* buf, long bytes) { if (!f || !f->ops || !f->ops->read) return ST_INVALID; return f->ops->read(f, buf, bytes); }
+long vfs_write(vfs_file_t* f, const void* buf, long bytes) { if (!f || !f->ops || !f->ops->write) return ST_INVALID; return f->ops->write(f, buf, bytes); }
 long vfs_seek(vfs_file_t* f, long offset, int whence) { if (!f || !f->ops || !f->ops->seek) return -1; return f->ops->seek(f, offset, whence); }
 
 int vfs_close(vfs_file_t* f) {

@@ -61,7 +61,7 @@ void storage_fs_poll(storage_fs_state_t* state) {
             fat32_vfs_register_root(fs);
             kprintf("FAT32: mount succeeded on %s (checking signature)\n", bdev->name);
             vfs_file_t* sf = 0;
-            if (vfs_open("/LIKEOS.SIG", &sf) == ST_OK) {
+            if (vfs_open("/LIKEOS.SIG", 0, &sf) == ST_OK) {
                 vfs_close(sf);
                 state->signature_found = 1;
                 kprintf("FAT32: signature /LIKEOS.SIG found on %s (root storage selected)\n", bdev->name);

@@ -271,7 +271,7 @@ int shell_tick(void) {
                             name = &cmd_buf[fn];
                         }
                     }
-                    if (vfs_open(name, &vf) == ST_OK) {
+                    if (vfs_open(name, 0, &vf) == ST_OK) {
                         char* rbuf = (char*)kalloc(4096);
                         if (rbuf) {
                             long r = vfs_read(vf, rbuf, 4096);

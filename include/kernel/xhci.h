@@ -125,6 +125,12 @@ typedef struct {
     unsigned long msd_read_lba;
     unsigned int msd_read_blocks;
     int msd_read_result; // 0 pending, >0 success bytes, <0 error
+    // Pending write operation fields
+    void* msd_write_buf;
+    unsigned int msd_write_buf_len;
+    unsigned long msd_write_lba;
+    unsigned int msd_write_blocks;
+    int msd_write_result; // 0 pending, >0 success bytes, <0 error
     // Recovery / error handling
     unsigned int msd_retry_count;
     unsigned int msd_reset_count;

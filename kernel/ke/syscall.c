@@ -282,6 +282,11 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
         return pipe_read_to_user((pipe_end_t*)file, buf, count);
     }
 
+    // Respect open flags (deny read on write-only)
+    if (file->flags & O_WRONLY) {
+        return -EBADF;
+    }
+
     return vfs_read(file, (void*)buf, (long)count);
 }
 
@@ -331,8 +336,17 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
         return pipe_write_from_user((pipe_end_t*)file, buf, count);
     }
 
-    // Write to USB storage not currently supported (read-only filesystem)
-    return -ENOSYS;
+    // Respect open flags (deny write on read-only)
+    if ((file->flags & (O_WRONLY | O_RDWR | O_APPEND)) == 0) {
+        return -EBADF;
+    }
+
+    // Write to filesystem if supported
+    long wret = vfs_write(file, (const void*)buf, (long)count);
+    if (wret < 0) {
+        return wret;
+    }
+    return wret;
 }
 
 // SYS_OPEN - open a file
@@ -352,7 +366,7 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode) {
     }
     
     vfs_file_t* file = NULL;
-    int ret = vfs_open((const char*)pathname, &file);
+    int ret = vfs_open((const char*)pathname, (int)flags, &file);
     if (ret != ST_OK || file == NULL) {
         return -EACCES;
     }

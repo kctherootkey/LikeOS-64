@@ -188,7 +188,7 @@ int elf_exec(const char* path, char* const argv[], char* const envp[], task_t** 
     
     // Open the file
     vfs_file_t* file = NULL;
-    int ret = vfs_open(path, &file);
+    int ret = vfs_open(path, 0, &file);
     if (ret != 0 || !file) {
         kprintf("elf_exec: cannot open '%s' (error %d)\n", path, ret);
         return -1;

@@ -993,7 +993,7 @@ cmd_done:;
                         XHCI_MSD_LOG("MSD: Fallback CBW event epid=%u ptr=%p expected_ptr=%p\n", epid, (void*)ep_trb_ptr, (void*)cbw_phys);
                         if(ctrl->msd_state == 1) ctrl->msd_state = 2;
                         matched = 1;
-                    } else if(epid == epid_in_expected && ctrl->msd_state == 2) {
+                    } else if(((ctrl->msd_op == 6) ? (epid == epid_out_expected) : (epid == epid_in_expected)) && ctrl->msd_state == 2) {
                         XHCI_MSD_LOG("MSD: Fallback DATA event epid=%u ptr=%p expected_ptr=%p\n", epid, (void*)ep_trb_ptr, (void*)data_phys);
                         ctrl->msd_state = 3;
                         matched = 1;

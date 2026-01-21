@@ -9,12 +9,14 @@
 typedef struct block_device block_device_t;
 
 typedef int (*block_read_fn)(block_device_t* dev, unsigned long lba, unsigned long count, void* buf);
+typedef int (*block_write_fn)(block_device_t* dev, unsigned long lba, unsigned long count, const void* buf);
 
 struct block_device {
     const char* name;
     unsigned int sector_size; // bytes per sector
     unsigned long total_sectors;
     block_read_fn read;
+    block_write_fn write;
     void* driver_data; // pointer to underlying msd/scsi device
 };
 

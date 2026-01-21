@@ -5,6 +5,7 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include <fcntl.h>
 
 // Test result tracking
 static int tests_passed = 0;
@@ -325,6 +326,107 @@ int main(int argc, char** argv) {
         ssize_t wr = write(newfd, dupmsg, strlen(dupmsg));
         test_result("write to duped fd succeeds", wr > 0);
         close(newfd);
+    }
+
+    // ========================================
+    // Test: file write/create/truncate/append
+    // ========================================
+    printf("\n[TEST] file write (create/truncate/append)\n");
+    const char* wpath = "/WRITE.TXT";
+    const char* wmsg1 = "HelloWrite";
+    int wfd = open(wpath, O_CREAT | O_TRUNC | O_WRONLY);
+    test_result("open(O_CREAT|O_TRUNC|O_WRONLY) succeeds", wfd >= 0);
+    if (wfd >= 0) {
+        ssize_t w1 = write(wfd, wmsg1, strlen(wmsg1));
+        test_result("write initial data", w1 == (ssize_t)strlen(wmsg1));
+        close(wfd);
+    }
+    // read back
+    wfd = open(wpath, O_RDONLY);
+    test_result("open(O_RDONLY) succeeds", wfd >= 0);
+    if (wfd >= 0) {
+        char rbuf[64];
+        memset(rbuf, 0, sizeof(rbuf));
+        ssize_t r1 = read(wfd, rbuf, sizeof(rbuf) - 1);
+        test_result("read back initial data", r1 == (ssize_t)strlen(wmsg1) && strcmp(rbuf, wmsg1) == 0);
+        close(wfd);
+    }
+    // append
+    const char* wmsg2 = "+APPEND";
+    wfd = open(wpath, O_APPEND | O_WRONLY);
+    test_result("open(O_APPEND|O_WRONLY) succeeds", wfd >= 0);
+    if (wfd >= 0) {
+        ssize_t w2 = write(wfd, wmsg2, strlen(wmsg2));
+        test_result("append write", w2 == (ssize_t)strlen(wmsg2));
+        close(wfd);
+    }
+    // read back combined
+    wfd = open(wpath, O_RDONLY);
+    test_result("open after append succeeds", wfd >= 0);
+    if (wfd >= 0) {
+        char rbuf[64];
+        memset(rbuf, 0, sizeof(rbuf));
+        ssize_t r2 = read(wfd, rbuf, sizeof(rbuf) - 1);
+        char expect[64];
+        snprintf(expect, sizeof(expect), "%s%s", wmsg1, wmsg2);
+        test_result("read back appended data", r2 == (ssize_t)strlen(expect) && strcmp(rbuf, expect) == 0);
+        close(wfd);
+    }
+    // overwrite via lseek
+    wfd = open(wpath, O_WRONLY);
+    test_result("open(O_WRONLY) succeeds", wfd >= 0);
+    if (wfd >= 0) {
+        lseek(wfd, 5, 0);
+        const char* wmsg3 = "-";
+        ssize_t w3 = write(wfd, wmsg3, 1);
+        test_result("lseek+overwrite", w3 == 1);
+        close(wfd);
+    }
+    // read back overwrite
+    wfd = open(wpath, O_RDONLY);
+    test_result("open after overwrite succeeds", wfd >= 0);
+    if (wfd >= 0) {
+        char rbuf[64];
+        memset(rbuf, 0, sizeof(rbuf));
+        read(wfd, rbuf, sizeof(rbuf) - 1);
+        test_result("overwrite applied", rbuf[5] == '-');
+        close(wfd);
+    }
+
+    // large write to force multi-cluster
+    printf("\n[TEST] large file write (multi-cluster)\n");
+    const char* lpath = "/LARGE.TXT";
+    size_t lsize = 7000;
+    char* lbuf = (char*)malloc(lsize);
+    if (lbuf) {
+        for (size_t i = 0; i < lsize; i++) {
+            lbuf[i] = (char)('A' + (i % 26));
+        }
+        int lfd = open(lpath, O_CREAT | O_TRUNC | O_WRONLY);
+        test_result("open large file for write", lfd >= 0);
+        if (lfd >= 0) {
+            ssize_t lw = write(lfd, lbuf, lsize);
+            test_result("write large buffer", lw == (ssize_t)lsize);
+            close(lfd);
+        }
+        lfd = open(lpath, O_RDONLY);
+        test_result("open large file for read", lfd >= 0);
+        if (lfd >= 0) {
+            char* lread = (char*)malloc(lsize + 1);
+            if (lread) {
+                memset(lread, 0, lsize + 1);
+                ssize_t lr = read(lfd, lread, lsize);
+                test_result("read large buffer", lr == (ssize_t)lsize);
+                test_result("large data matches", lr == (ssize_t)lsize && memcmp(lbuf, lread, lsize) == 0);
+                free(lread);
+            } else {
+                test_fail("malloc for large read buffer");
+            }
+            close(lfd);
+        }
+        free(lbuf);
+    } else {
+        test_fail("malloc for large write buffer");
     }
 
     // ========================================

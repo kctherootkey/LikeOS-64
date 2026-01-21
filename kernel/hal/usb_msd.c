@@ -18,6 +18,8 @@ static void msd_issue_inquiry(xhci_controller_t *ctrl, usb_device_t *dev);
 static void msd_issue_read_capacity(xhci_controller_t *ctrl, usb_device_t *dev);
 static int msd_issue_read10(xhci_controller_t *ctrl, usb_device_t *dev,
         unsigned long lba, unsigned blocks);
+static int msd_issue_write10(xhci_controller_t *ctrl, usb_device_t *dev,
+    unsigned long lba, unsigned blocks, const void* buf);
 static void msd_issue_request_sense(xhci_controller_t *ctrl, usb_device_t *dev);
 static void msd_recover_reset(xhci_controller_t *ctrl, usb_device_t *dev);
 static void msd_recover_clear_stalls(xhci_controller_t *ctrl, usb_device_t *dev);
@@ -97,6 +99,22 @@ static int msd_ensure_read_buf(xhci_controller_t *ctrl, unsigned bytes)
         return ST_NOMEM;
     }
     ctrl->msd_read_buf_len = bytes;
+    return ST_OK;
+}
+
+// Ensure the bulk write buffer is large enough for the requested transfer.
+static int msd_ensure_write_buf(xhci_controller_t *ctrl, unsigned bytes)
+{
+    if (ctrl->msd_write_buf && ctrl->msd_write_buf_len >= bytes)
+        return ST_OK;
+    if (ctrl->msd_write_buf)
+        kfree(ctrl->msd_write_buf);
+    ctrl->msd_write_buf = kcalloc(1, bytes);
+    if (!ctrl->msd_write_buf) {
+        ctrl->msd_write_buf_len = 0;
+        return ST_NOMEM;
+    }
+    ctrl->msd_write_buf_len = bytes;
     return ST_OK;
 }
 
@@ -418,6 +436,67 @@ static int msd_issue_read10(xhci_controller_t *ctrl, usb_device_t *dev,
     return ST_ERR;
 }
 
+static int msd_issue_write10(xhci_controller_t *ctrl, usb_device_t *dev,
+    unsigned long lba, unsigned blocks, const void* buf)
+{
+    unsigned bytes;
+    unsigned tag;
+    int i;
+    usb_msd_cbw_t cbw;
+    if (ctrl->msd_op || !ctrl->msd_ready)
+        return ST_BUSY;
+    bytes = blocks * ctrl->msd_block_size;
+    if (msd_ensure_write_buf(ctrl, bytes) != ST_OK)
+        return ST_NOMEM;
+    if (buf && bytes) {
+        mm_memcpy(ctrl->msd_write_buf, buf, bytes);
+    }
+    for (i = 0; i < 16; i++)
+        cbw.cb[i] = 0;
+    tag = next_tag(ctrl);
+    ctrl->msd_expected_tag = tag;
+    cbw.signature = 0x43425355;
+    cbw.tag = tag;
+    cbw.data_len = bytes;
+    cbw.flags = 0x00; // OUT
+    cbw.lun = 0;
+    cbw.cb_len = 10;
+    cbw.cb[0] = 0x2A; // WRITE(10)
+    cbw.cb[2] = (lba >> 24) & 0xFF;
+    cbw.cb[3] = (lba >> 16) & 0xFF;
+    cbw.cb[4] = (lba >> 8) & 0xFF;
+    cbw.cb[5] = lba & 0xFF;
+    cbw.cb[7] = (blocks >> 8) & 0xFF;
+    cbw.cb[8] = blocks & 0xFF;
+    if (bot_send_cbw(ctrl, dev, &cbw) == 0) {
+        if (ctrl->bulk_out_ring) {
+            unsigned pre_idx = ctrl->bulk_out_enqueue;
+            if (pre_idx >= 15) {
+                pre_idx = 0; /* Will wrap to index 0 */
+            }
+            ctrl->msd_data_trb = &((xhci_trb_t *)ctrl->bulk_out_ring)[pre_idx];
+            ctrl->msd_data_phys = ctrl->bulk_out_ring_phys + pre_idx * sizeof(xhci_trb_t);
+        }
+        ctrl->msd_expected_data_len = bytes;
+        ctrl->msd_state = 2;
+        ctrl->msd_op = 6; /* WRITE(10) */
+        ctrl->msd_need_csw = 1;
+        ctrl->msd_write_lba = lba;
+        ctrl->msd_write_blocks = blocks;
+        ctrl->msd_write_result = 0;
+        if (xhci_enqueue_bulk_out(ctrl, dev, ctrl->msd_write_buf, bytes) == ST_OK) {
+            XHCI_MSD_LOG("MSD: WRITE(10) data OUT queued len=%u data_trb=%p trb_phys=%p\n", bytes, ctrl->msd_data_trb, (void *)ctrl->msd_data_phys);
+            return ST_OK;
+        } else {
+            ctrl->msd_state = 1;
+            ctrl->msd_op = 0;
+            ctrl->msd_need_csw = 0;
+            ctrl->msd_expected_data_len = 0;
+        }
+    }
+    return ST_ERR;
+}
+
 static int msd_block_read(block_device_t *bdev, unsigned long lba,
     unsigned long count, void *buf)
 {
@@ -498,6 +577,69 @@ static int msd_block_read(block_device_t *bdev, unsigned long lba,
         msd_recover_reset(ctrl, dev);
     }
     XHCI_MSD_LOG("MSD: read give up lba=%lu count=%lu\n", lba, count);
+    return ST_IO;
+}
+
+static int msd_block_write(block_device_t *bdev, unsigned long lba,
+    unsigned long count, const void *buf)
+{
+    xhci_controller_t *ctrl = (xhci_controller_t *)bdev->driver_data;
+    usb_device_t *dev = find_msd(ctrl);
+    unsigned long start_poll;
+    unsigned long start_overall;
+    int st;
+    if (!dev)
+        return ST_INVALID;
+    XHCI_MSD_LOG("MSD: block_write lba=%lu count=%lu\n", lba, count);
+    start_overall = ctrl->msd_poll_counter;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        XHCI_MSD_LOG("MSD: write attempt %d state=%u op=%u\n", attempt + 1, ctrl->msd_state, ctrl->msd_op);
+        st = msd_issue_write10(ctrl, dev, lba, count, buf);
+        if (st == ST_BUSY || st == ST_AGAIN) {
+            for (int i = 0; i < 512 && (ctrl->msd_op || ctrl->msd_state); ++i) {
+                xhci_process_events(ctrl);
+                msd_progress(ctrl);
+            }
+            if (ctrl->msd_poll_counter - start_overall > 60000)
+                return ST_IO;
+            attempt--;
+            continue;
+        } else if (st != ST_OK) {
+            return st;
+        }
+
+        start_poll = ctrl->msd_poll_counter;
+        while (1) {
+            if (ctrl->msd_write_result > 0)
+                break;
+            if ((ctrl->msd_op != 6 && ctrl->msd_write_result == 0) || (ctrl->msd_op == 6 && ctrl->msd_state == 0)) {
+                break;
+            }
+            if (ctrl->msd_op == 6 && ctrl->msd_state == 4 && ctrl->msd_write_result == 0) {
+                msd_progress(ctrl);
+                if (ctrl->msd_write_result > 0)
+                    break;
+            }
+            xhci_process_events(ctrl);
+            msd_progress(ctrl);
+            for (volatile int spin = 0; spin < 200; ++spin) __asm__ __volatile__("pause");
+            if (ctrl->msd_poll_counter - start_poll > 25000) {
+                break;
+            }
+        }
+
+        if (ctrl->msd_write_result > 0) {
+            XHCI_MSD_LOG("MSD: write success lba=%lu count=%lu bytes=%u attempt=%d\n",
+                lba, count, (unsigned)ctrl->msd_write_result, attempt + 1);
+            return ST_OK;
+        }
+
+        ctrl->msd_state = 0;
+        ctrl->msd_op = 0;
+        ctrl->msd_timeout_ticks = 0;
+        ctrl->msd_write_result = 0;
+        msd_recover_reset(ctrl, dev);
+    }
     return ST_IO;
 }
 
@@ -617,6 +759,7 @@ static void msd_progress(xhci_controller_t *ctrl)
             g_msd_block_dev.sector_size = blen;
             g_msd_block_dev.total_sectors = ctrl->msd_capacity_blocks;
             g_msd_block_dev.read = msd_block_read;
+            g_msd_block_dev.write = msd_block_write;
             g_msd_block_dev.driver_data = ctrl;
             if (block_register(&g_msd_block_dev) == ST_OK)
                 XHCI_MSD_LOG("MSD: Registered block device 'usb0'\n");
@@ -661,6 +804,32 @@ static void msd_progress(xhci_controller_t *ctrl)
             } else {
                 msd_recover_reset(ctrl, dev);
             }
+        }
+        ctrl->msd_state = 0;
+        ctrl->msd_op = 0;
+        ctrl->msd_timeout_ticks = 0;
+    }
+    if (ctrl->msd_op == 6 && ctrl->msd_state == 4) {
+        usb_msd_csw_t *csw = (usb_msd_csw_t *)ctrl->msd_csw_buf;
+        int tag_ok = (csw->tag == ctrl->msd_expected_tag);
+        int sig_ok = (csw->signature == 0x53425355);
+        if (!sig_ok || !tag_ok) {
+            XHCI_MSD_LOG("MSD: WRITE(10) CSW invalid -> reset\n");
+            ctrl->msd_write_result = -1;
+            msd_recover_reset(ctrl, dev);
+            ctrl->msd_state = 0;
+            ctrl->msd_op = 0;
+            return;
+        }
+        if (csw->status == 0) {
+            if (csw->residue)
+                XHCI_MSD_LOG("MSD: WRITE(10) residue %u (expected %u)\n",
+                    csw->residue, ctrl->msd_expected_data_len);
+            ctrl->msd_write_result = ctrl->msd_expected_data_len - csw->residue;
+        } else {
+            ctrl->msd_write_result = -1;
+            XHCI_MSD_LOG("MSD: WRITE(10) CSW status=%u residue=%u\n",
+                csw->status, csw->residue);
         }
         ctrl->msd_state = 0;
         ctrl->msd_op = 0;

@@ -14,6 +14,8 @@ typedef struct {
     unsigned int sectors_per_cluster;
     unsigned int bytes_per_sector;
     unsigned int root_cluster;
+    unsigned int num_fats;
+    unsigned long fat_size_sectors;
 } fat32_fs_t;
 
 typedef struct {
@@ -23,6 +25,10 @@ typedef struct {
     unsigned long size;
     unsigned long pos;
     unsigned long current_cluster; // cluster we have loaded
+    unsigned long parent_cluster;
+    unsigned long dirent_cluster;
+    unsigned int dirent_index;
+    char name83[12]; // 8.3 name (11 chars + null)
 } fat32_file_t;
 
 int fat32_mount(const block_device_t* bdev, fat32_fs_t* out);
