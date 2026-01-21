@@ -656,14 +656,17 @@ static int64_t sys_pipe(uint64_t pipefd_ptr) {
         return fd_read;
     }
 
+    // Reserve the read end fd before allocating the write end
+    cur->fd_table[fd_read] = (vfs_file_t*)read_end;
+
     int fd_write = alloc_fd(cur);
     if (fd_write < 0) {
+        cur->fd_table[fd_read] = NULL;
         pipe_close_end(read_end);
         pipe_close_end(write_end);
         return fd_write;
     }
 
-    cur->fd_table[fd_read] = (vfs_file_t*)read_end;
     cur->fd_table[fd_write] = (vfs_file_t*)write_end;
 
     int* user_pipefd = (int*)pipefd_ptr;

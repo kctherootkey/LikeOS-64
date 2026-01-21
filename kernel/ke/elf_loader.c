@@ -404,6 +404,9 @@ int elf_exec(const char* path, char* const argv[], char* const envp[], task_t** 
     // Set up task memory management fields
     task->brk_start = load_result.brk_start;
     task->brk = load_result.brk_start;
+    // Ensure stack top and mmap base use the aligned stack top, not the current SP
+    task->user_stack_top = USER_STACK_TOP;
+    task->mmap_base = USER_STACK_TOP - (4 * 1024 * 1024);
     
     // Set up parent relationship so the task can be reaped
     task_t* current = sched_current();

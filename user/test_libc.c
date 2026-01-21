@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <errno.h>
 
@@ -270,6 +271,44 @@ int main(int argc, char** argv) {
         } else {
             test_fail("execve child did not exit normally");
         }
+    }
+
+    // ========================================
+    // Test: pipe
+    // ========================================
+    printf("\n[TEST] pipe()\n");
+    int fds[2];
+    int prc = pipe(fds);
+    test_result("pipe() returns 0", prc == 0);
+    if (prc == 0) {
+        const char* pipemsg = "pipe works";
+        ssize_t pwr = write(fds[1], pipemsg, strlen(pipemsg));
+        test_result("pipe write returns full length", pwr == (ssize_t)strlen(pipemsg));
+
+        char pipebuf[32];
+        memset(pipebuf, 0, sizeof(pipebuf));
+        ssize_t prd = read(fds[0], pipebuf, sizeof(pipebuf) - 1);
+        test_result("pipe read returns full length", prd == (ssize_t)strlen(pipemsg));
+        test_result("pipe read matches data", prd > 0 && strcmp(pipebuf, pipemsg) == 0);
+
+        close(fds[0]);
+        close(fds[1]);
+    }
+
+    // ========================================
+    // Test: munmap
+    // ========================================
+    printf("\n[TEST] munmap()\n");
+    size_t map_len = 8192;
+    void* map = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    test_result("mmap() returns non-NULL", map != MAP_FAILED);
+    if (map != MAP_FAILED) {
+        unsigned char* p = (unsigned char*)map;
+        for (size_t i = 0; i < map_len; i++) {
+            p[i] = (unsigned char)(i & 0xFF);
+        }
+        int mrc = munmap(map, map_len);
+        test_result("munmap() returns 0", mrc == 0);
     }
 
 
