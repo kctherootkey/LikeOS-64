@@ -11,6 +11,7 @@ typedef struct {
     int signature_found;
     unsigned int tested_mask;
     fat32_fs_t fs_instances[BLOCK_MAX_DEVICES];
+    unsigned char ready_reads[BLOCK_MAX_DEVICES];
 } storage_fs_state_t;
 
 void storage_fs_init(storage_fs_state_t* state);

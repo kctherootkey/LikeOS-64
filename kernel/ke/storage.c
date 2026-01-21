@@ -3,6 +3,7 @@
 #include "../../include/kernel/vfs.h"
 #include "../../include/kernel/xhci.h"
 #include "../../include/kernel/shell.h"
+#include "../../include/kernel/memory.h"
 
 void storage_fs_init(storage_fs_state_t* state) {
     if (!state) {
@@ -12,6 +13,7 @@ void storage_fs_init(storage_fs_state_t* state) {
     state->tested_mask = 0;
     for (int i = 0; i < BLOCK_MAX_DEVICES; ++i) {
         state->fs_instances[i].bdev = 0;
+        state->ready_reads[i] = 0;
     }
 }
 
@@ -34,6 +36,26 @@ void storage_fs_poll(storage_fs_state_t* state) {
         if (!xh || !xh->msd_ready) {
             continue;
         }
+
+        // Probe LBA0 to ensure the device is responding before mounting
+        uint8_t* probe = (uint8_t*)kalloc(512);
+        if (!probe) {
+            continue;
+        }
+        int probe_st = bdev->read((block_device_t*)bdev, 0, 1, probe);
+        kfree(probe);
+        if (probe_st != ST_OK) {
+            // Device not ready yet; retry on next poll without marking tested
+            state->ready_reads[bi] = 0;
+            continue;
+        }
+
+        // Require a few consecutive successful probe reads before mounting
+        if (state->ready_reads[bi] < 3) {
+            state->ready_reads[bi]++;
+            continue;
+        }
+
         fat32_fs_t* fs = &state->fs_instances[bi];
         if (fat32_mount(bdev, fs) == ST_OK) {
             fat32_vfs_register_root(fs);

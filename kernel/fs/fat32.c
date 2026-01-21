@@ -84,7 +84,18 @@ static int read_sectors(const block_device_t *bdev, unsigned long lba, unsigned 
     unsigned long offset = 0;
     while (count > 0) {
         unsigned long chunk = (count > MAX_SECTORS_PER_READ) ? MAX_SECTORS_PER_READ : count;
-        int st = bdev->read((block_device_t *)bdev, lba, chunk, (uint8_t *)buf + offset);
+        int st = ST_OK;
+        int attempts = 5;
+        while (attempts-- > 0) {
+            st = bdev->read((block_device_t *)bdev, lba, chunk, (uint8_t *)buf + offset);
+            if (st == ST_OK) {
+                break;
+            }
+            // small backoff before retry
+            for (volatile int spin = 0; spin < 10000; ++spin) {
+                __asm__ __volatile__("pause");
+            }
+        }
         if (st != ST_OK) {
             kprintf("FAT32: read_sectors FAILED lba=%lu count=%lu st=%d\n", lba, chunk, st);
             return st;
@@ -117,36 +128,50 @@ static unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long clu
         unsigned long first_fat_sectors = fat_total / 2;
         if (first_fat_sectors == 0)
             first_fat_sectors = fat_total; /* if only one FAT */
-        
+
         /* Allocate FAT cache buffer */
         unsigned long fat_bytes = first_fat_sectors * fs->bytes_per_sector;
-        g_fat_cache = kalloc(fat_bytes);
-        if (!g_fat_cache) {
-            kprintf("FAT32: FAT cache alloc failed!\n");
-            return 0x0FFFFFFF;
-        }
-        
-        /* Read FAT in chunks (max 1 sector = 512 bytes per read for QEMU xHCI compatibility) */
-        #define FAT_READ_CHUNK 1
-        unsigned long lba = fs->part_lba_offset + fs->fat_start_lba;
-        unsigned long remaining = first_fat_sectors;
-        uint8_t *dest = (uint8_t*)g_fat_cache;
-        
-        while (remaining > 0) {
-            unsigned long chunk = (remaining > FAT_READ_CHUNK) ? FAT_READ_CHUNK : remaining;
-            int read_st = read_sectors(fs->bdev, lba, chunk, dest);
-            if (read_st != ST_OK) {
-                kprintf("FAT32: FAT read failed at LBA %lu! st=%d\n", lba, read_st);
-                kfree(g_fat_cache);
-                g_fat_cache = 0;
+
+        /* Read FAT with a few retries for transient USB errors */
+        for (int attempt = 0; attempt < 3 && !g_fat_cache; ++attempt) {
+            g_fat_cache = kalloc(fat_bytes);
+            if (!g_fat_cache) {
+                kprintf("FAT32: FAT cache alloc failed!\n");
                 return 0x0FFFFFFF;
             }
-            lba += chunk;
-            dest += chunk * fs->bytes_per_sector;
-            remaining -= chunk;
+
+            /* Read FAT in chunks (max 1 sector = 512 bytes per read for QEMU xHCI compatibility) */
+            #define FAT_READ_CHUNK 1
+            unsigned long lba = fs->part_lba_offset + fs->fat_start_lba;
+            unsigned long remaining = first_fat_sectors;
+            uint8_t *dest = (uint8_t*)g_fat_cache;
+            int read_failed = 0;
+
+            while (remaining > 0) {
+                unsigned long chunk = (remaining > FAT_READ_CHUNK) ? FAT_READ_CHUNK : remaining;
+                int read_st = read_sectors(fs->bdev, lba, chunk, dest);
+                if (read_st != ST_OK) {
+                    kprintf("FAT32: FAT read failed at LBA %lu! st=%d\n", lba, read_st);
+                    read_failed = 1;
+                    break;
+                }
+                lba += chunk;
+                dest += chunk * fs->bytes_per_sector;
+                remaining -= chunk;
+            }
+
+            if (read_failed) {
+                kfree(g_fat_cache);
+                g_fat_cache = 0;
+                g_fat_cache_entries = 0;
+                for (volatile int spin = 0; spin < 50000; ++spin) {
+                    __asm__ __volatile__("pause");
+                }
+                continue;
+            }
+
+            g_fat_cache_entries = fat_bytes / 4;
         }
-        
-        g_fat_cache_entries = fat_bytes / 4;
     }
     if (!g_fat_cache)
         return 0x0FFFFFFF;
