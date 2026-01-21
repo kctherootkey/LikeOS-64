@@ -84,13 +84,18 @@ int shell_tick(void) {
     // Check if we're waiting for a program to finish
     if (shell_waiting_for_program) {
         if (!sched_has_user_tasks()) {
-            // Program finished - show prompt
+            // Program finished - reap zombie children and show prompt
+            task_t* cur = sched_current();
+            if (cur) {
+                sched_reap_zombies(cur);
+            }
             shell_waiting_for_program = 0;
+            kprintf("\n");
             shell_prompt();
             console_cursor_enable();
         }
-        // Don't process keyboard input while program is running
-        return 0;
+        // Don't process keyboard input while program is running, but keep checking
+        return 1;  // Return 1 to prevent HLT so we keep checking task completion
     }
     
     char c = keyboard_get_char();
@@ -306,7 +311,7 @@ int shell_tick(void) {
                     envp[0] = path_env;
                     envp[1] = NULL;
                     
-                    int ret = elf_exec(exec_path, argv, envp);
+                    int ret = elf_exec(exec_path, argv, envp, NULL);
                     if (ret != 0) {
                         kprintf("exec: failed (error %d)\n", ret);
                     } else {

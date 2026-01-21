@@ -5,6 +5,7 @@
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/types.h"
 #include "../../include/kernel/vfs.h"
+#include "../../include/kernel/pipe.h"
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
@@ -23,6 +24,7 @@ static uint64_t* g_kernel_pml4 = 0;
 static uint64_t g_default_kernel_stack = 0;
 
 // Current kernel stack for syscall handler (per-task)
+#include "../../include/kernel/pipe.h"
 uint64_t g_current_kernel_stack = 0;
 
 static inline int is_idle_task(const task_t* t) {
@@ -346,14 +348,17 @@ int sched_has_user_tasks(void) {
     
     task_t* start = g_current;
     task_t* t = g_current;
+    int count = 0;
     do {
-        if (t->privilege == TASK_USER && t->state != TASK_ZOMBIE && !is_idle_task(t)) {
-            return 1;
+        if (t->privilege == TASK_USER) {
+            if (t->state != TASK_ZOMBIE && !is_idle_task(t)) {
+                count++;
+            }
         }
         t = t->next;
     } while (t && t != start);
     
-    return 0;
+    return count > 0;
 }
 
 static void task_trampoline(void) {
@@ -481,6 +486,9 @@ void sched_remove_task(task_t* task) {
             if (marker >= 1 && marker <= 3) {
                 // Just clear the marker, don't call vfs_close
                 task->fd_table[i] = NULL;
+            } else if (pipe_is_end(task->fd_table[i])) {
+                pipe_close_end((pipe_end_t*)task->fd_table[i]);
+                task->fd_table[i] = NULL;
             } else {
                 vfs_close(task->fd_table[i]);
                 task->fd_table[i] = NULL;
@@ -555,6 +563,9 @@ task_t* sched_fork_current(void) {
             if (marker >= 1 && marker <= 3) {
                 // Just copy the marker, don't call vfs_dup
                 child->fd_table[i] = cur->fd_table[i];
+            } else if (pipe_is_end(cur->fd_table[i])) {
+                pipe_end_t* new_end = pipe_dup_end((pipe_end_t*)cur->fd_table[i]);
+                child->fd_table[i] = (vfs_file_t*)new_end;
             } else {
                 child->fd_table[i] = vfs_dup(cur->fd_table[i]);
             }
@@ -589,5 +600,29 @@ uint32_t sched_get_ppid(task_t* task) {
         return 0;  // Init or no parent
     }
     return task->parent->id;
+}
+
+// Reap all zombie children of a parent task
+void sched_reap_zombies(task_t* parent) {
+    if (!parent) return;
+    
+    // Collect zombies first to avoid list corruption during removal
+    #define MAX_ZOMBIES 32
+    task_t* zombies[MAX_ZOMBIES];
+    int zombie_count = 0;
+    
+    task_t* child = parent->first_child;
+    while (child && zombie_count < MAX_ZOMBIES) {
+        task_t* next = child->next_sibling;
+        if (child->has_exited && child->state == TASK_ZOMBIE) {
+            zombies[zombie_count++] = child;
+        }
+        child = next;
+    }
+    
+    // Now remove all collected zombies
+    for (int i = 0; i < zombie_count; i++) {
+        sched_remove_task(zombies[i]);
+    }
 }
 

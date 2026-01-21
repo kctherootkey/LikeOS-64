@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <errno.h>
 
 // Test result tracking
 static int tests_passed = 0;
@@ -245,6 +246,32 @@ int main(int argc, char** argv) {
             test_fail("Child did not exit normally");
         }
     }
+
+    // ========================================
+    // Test: execve (via fork)
+    // ========================================
+    printf("\n[TEST] execve() via fork\n");
+    pid_t exec_child = fork();
+    if (exec_child < 0) {
+        test_fail("fork() for execve failed");
+    } else if (exec_child == 0) {
+        char* exec_argv[] = { "/hello", NULL };
+        char* exec_envp[] = { NULL };
+        execve("/hello", exec_argv, exec_envp);
+        printf("  [CHILD] execve failed: errno=%d\n", errno);
+        _exit(1);
+    } else {
+        int status = 0;
+        pid_t waited = waitpid(exec_child, &status, 0);
+        test_result("waitpid() returns execve child PID", waited == exec_child);
+        if (WIFEXITED(status)) {
+            int exit_status = WEXITSTATUS(status);
+            test_result("execve child exited 0", exit_status == 0);
+        } else {
+            test_fail("execve child did not exit normally");
+        }
+    }
+
 
     // ========================================
     // Test: dup/dup2

@@ -19,7 +19,6 @@
 #define SYS_DUP         32
 #define SYS_DUP2        33
 #define SYS_PIPE        22
-#define SYS_SPAWN       500  // LikeOS extension
 
 // Syscall wrapper - uses inline assembly to invoke syscall instruction
 static inline long syscall0(long number) {

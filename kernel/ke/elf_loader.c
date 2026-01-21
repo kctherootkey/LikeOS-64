@@ -180,7 +180,7 @@ static size_t elf_strlen(const char* s) {
 }
 
 // Execute an ELF file from the filesystem
-int elf_exec(const char* path, char* const argv[], char* const envp[]) {
+int elf_exec(const char* path, char* const argv[], char* const envp[], task_t** out_task) {
     if (!path) {
         kprintf("elf_exec: no path\n");
         return -1;
@@ -405,5 +405,16 @@ int elf_exec(const char* path, char* const argv[], char* const envp[]) {
     task->brk_start = load_result.brk_start;
     task->brk = load_result.brk_start;
     
+    // Set up parent relationship so the task can be reaped
+    task_t* current = sched_current();
+    if (current) {
+        task->parent = current;
+        sched_add_child(current, task);
+    }
+    
+    if (out_task) {
+        *out_task = task;
+    }
+
     return 0;
 }

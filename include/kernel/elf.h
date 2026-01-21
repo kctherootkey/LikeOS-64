@@ -105,6 +105,9 @@ typedef struct {
     uint64_t sh_entsize;          // Entry size if section holds table
 } __attribute__((packed)) Elf64_Shdr;
 
+// Forward declaration for task
+struct task;
+
 // ELF loader result structure
 typedef struct {
     uint64_t entry_point;         // Program entry point
@@ -133,7 +136,8 @@ int elf_load_user(const void* elf_data, size_t elf_size,
 //   path: Path to ELF file
 //   argv: NULL-terminated array of argument strings
 //   envp: NULL-terminated array of environment strings
+//   out_task: Optional pointer to receive created task
 // Returns 0 on success (task created), negative error code on failure
-int elf_exec(const char* path, char* const argv[], char* const envp[]);
+int elf_exec(const char* path, char* const argv[], char* const envp[], struct task** out_task);
 
 #endif // _KERNEL_ELF_H_

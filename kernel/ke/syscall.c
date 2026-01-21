@@ -7,6 +7,8 @@
 #include "../../include/kernel/keyboard.h"
 #include "../../include/kernel/vfs.h"
 #include "../../include/kernel/status.h"
+#include "../../include/kernel/elf.h"
+#include "../../include/kernel/pipe.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
@@ -14,6 +16,180 @@ static bool validate_user_ptr(uint64_t ptr, size_t len) {
     if (ptr >= 0x7FFFFFFFFFFF) return false;  // Beyond user space
     if (ptr + len < ptr) return false;  // Overflow check
     return true;
+}
+
+// Safe string length (bounded) from user space
+static int user_strnlen(const char* user_str, size_t max_len, size_t* out_len) {
+    if (!user_str || !out_len) {
+        return -EFAULT;
+    }
+    for (size_t i = 0; i < max_len; i++) {
+        if (!validate_user_ptr((uint64_t)user_str + i, 1)) {
+            return -EFAULT;
+        }
+        if (user_str[i] == '\0') {
+            *out_len = i;
+            return 0;
+        }
+    }
+    return -EINVAL;  // Too long
+}
+
+static int copy_user_string(const char* user_str, size_t max_len, char** out_str, size_t* out_len) {
+    if (!user_str || !out_str) {
+        return -EFAULT;
+    }
+
+    size_t len = 0;
+    int ret = user_strnlen(user_str, max_len, &len);
+    if (ret != 0) {
+        return ret;
+    }
+
+    char* kstr = (char*)kalloc(len + 1);
+    if (!kstr) {
+        return -ENOMEM;
+    }
+    mm_memcpy(kstr, user_str, len);
+    kstr[len] = '\0';
+
+    *out_str = kstr;
+    if (out_len) {
+        *out_len = len;
+    }
+    return 0;
+}
+
+static void free_user_string_array(char** arr) {
+    if (!arr) {
+        return;
+    }
+    for (size_t i = 0; arr[i]; i++) {
+        kfree(arr[i]);
+    }
+    kfree(arr);
+}
+
+static int copy_user_string_array(const char* const* user_arr, size_t max_count,
+                                  size_t max_str_len, size_t max_total_bytes,
+                                  char*** out_arr) {
+    if (!out_arr) {
+        return -EFAULT;
+    }
+    *out_arr = NULL;
+
+    if (!user_arr) {
+        return 0;
+    }
+
+    if (!validate_user_ptr((uint64_t)user_arr, sizeof(uint64_t))) {
+        return -EFAULT;
+    }
+
+    char** karr = (char**)kalloc((max_count + 1) * sizeof(char*));
+    if (!karr) {
+        return -ENOMEM;
+    }
+    mm_memset(karr, 0, (max_count + 1) * sizeof(char*));
+
+    size_t total = 0;
+    for (size_t i = 0; i < max_count; i++) {
+        const char* user_str = user_arr[i];
+        if (!user_str) {
+            karr[i] = NULL;
+            *out_arr = karr;
+            return 0;
+        }
+        if (!validate_user_ptr((uint64_t)user_arr + (i * sizeof(uint64_t)), sizeof(uint64_t))) {
+            free_user_string_array(karr);
+            return -EFAULT;
+        }
+
+        char* kstr = NULL;
+        size_t len = 0;
+        int ret = copy_user_string(user_str, max_str_len, &kstr, &len);
+        if (ret != 0) {
+            free_user_string_array(karr);
+            return ret;
+        }
+
+        total += len + 1;
+        if (total > max_total_bytes) {
+            kfree(kstr);
+            free_user_string_array(karr);
+            return -EINVAL;
+        }
+
+        karr[i] = kstr;
+    }
+
+    free_user_string_array(karr);
+    return -EINVAL;  // Too many entries
+}
+
+// Pipe read/write helpers
+static int64_t pipe_read_to_user(pipe_end_t* end, uint64_t buf, uint64_t count) {
+    if (!end || !end->pipe || !end->is_read) {
+        return -EBADF;
+    }
+    pipe_t* pipe = end->pipe;
+
+    if (count == 0) {
+        return 0;
+    }
+    if (pipe->used == 0) {
+        return (pipe->writers == 0) ? 0 : -EAGAIN;
+    }
+
+    size_t to_read = (count < pipe->used) ? count : pipe->used;
+    size_t first = pipe->size - pipe->read_pos;
+    if (first > to_read) {
+        first = to_read;
+    }
+
+    mm_memcpy((void*)buf, pipe->buffer + pipe->read_pos, first);
+    if (to_read > first) {
+        mm_memcpy((void*)(buf + first), pipe->buffer, to_read - first);
+    }
+
+    pipe->read_pos = (pipe->read_pos + to_read) % pipe->size;
+    pipe->used -= to_read;
+
+    return (int64_t)to_read;
+}
+
+static int64_t pipe_write_from_user(pipe_end_t* end, uint64_t buf, uint64_t count) {
+    if (!end || !end->pipe || end->is_read) {
+        return -EBADF;
+    }
+    pipe_t* pipe = end->pipe;
+
+    if (count == 0) {
+        return 0;
+    }
+    if (pipe->readers == 0) {
+        return -EAGAIN;
+    }
+    if (pipe->used == pipe->size) {
+        return -EAGAIN;
+    }
+
+    size_t space = pipe->size - pipe->used;
+    size_t to_write = (count < space) ? count : space;
+    size_t first = pipe->size - pipe->write_pos;
+    if (first > to_write) {
+        first = to_write;
+    }
+
+    mm_memcpy(pipe->buffer + pipe->write_pos, (void*)buf, first);
+    if (to_write > first) {
+        mm_memcpy(pipe->buffer, (void*)(buf + first), to_write - first);
+    }
+
+    pipe->write_pos = (pipe->write_pos + to_write) % pipe->size;
+    pipe->used += to_write;
+
+    return (int64_t)to_write;
 }
 
 // Allocate a file descriptor for current task
@@ -99,6 +275,13 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
         return -EBADF;
     }
     
+    if (pipe_is_end(file)) {
+        if (!validate_user_ptr(buf, count)) {
+            return -EFAULT;
+        }
+        return pipe_read_to_user((pipe_end_t*)file, buf, count);
+    }
+
     return vfs_read(file, (void*)buf, (long)count);
 }
 
@@ -141,6 +324,13 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
         return -EBADF;
     }
     
+    if (pipe_is_end(file)) {
+        if (!validate_user_ptr(buf, count)) {
+            return -EFAULT;
+        }
+        return pipe_write_from_user((pipe_end_t*)file, buf, count);
+    }
+
     // Write to USB storage not currently supported (read-only filesystem)
     return -ENOSYS;
 }
@@ -191,6 +381,12 @@ static int64_t sys_close(uint64_t fd) {
     uint64_t marker = (uint64_t)file;
     if (marker >= 1 && marker <= 3) {
         // Console dup marker - just clear the entry
+        cur->fd_table[fd] = NULL;
+        return 0;
+    }
+
+    if (pipe_is_end(file)) {
+        pipe_close_end((pipe_end_t*)file);
         cur->fd_table[fd] = NULL;
         return 0;
     }
@@ -381,6 +577,102 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     return (int64_t)vaddr;
 }
 
+// SYS_MUNMAP - unmap memory
+static int64_t sys_munmap(uint64_t addr, uint64_t length) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+
+    if (addr == 0 || length == 0) {
+        return -EINVAL;
+    }
+    if (addr & (PAGE_SIZE - 1)) {
+        return -EINVAL;
+    }
+
+    length = PAGE_ALIGN(length);
+
+    mmap_region_t* region = find_mmap_region(cur, addr);
+    if (!region) {
+        return -EINVAL;
+    }
+
+    uint64_t region_end = region->start + region->length;
+    if (addr < region->start || addr + length > region_end) {
+        return -EINVAL;
+    }
+
+    for (uint64_t off = 0; off < length; off += PAGE_SIZE) {
+        mm_unmap_page_in_address_space(cur->pml4, addr + off);
+    }
+
+    if (addr == region->start && length == region->length) {
+        region->in_use = false;
+    } else if (addr == region->start) {
+        region->start += length;
+        region->length -= length;
+    } else if (addr + length == region_end) {
+        region->length -= length;
+    } else {
+        // Splitting regions not supported yet
+        return -EINVAL;
+    }
+
+    return 0;
+}
+
+// SYS_PIPE - create a pipe
+static int64_t sys_pipe(uint64_t pipefd_ptr) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+
+    if (!validate_user_ptr(pipefd_ptr, sizeof(int) * 2)) {
+        return -EFAULT;
+    }
+
+    pipe_t* pipe = pipe_create(4096);
+    if (!pipe) {
+        return -ENOMEM;
+    }
+
+    pipe_end_t* read_end = pipe_create_end(pipe, true);
+    if (!read_end) {
+        if (pipe->buffer) {
+            kfree(pipe->buffer);
+        }
+        kfree(pipe);
+        return -ENOMEM;
+    }
+
+    pipe_end_t* write_end = pipe_create_end(pipe, false);
+    if (!write_end) {
+        pipe_close_end(read_end);
+        return -ENOMEM;
+    }
+
+    int fd_read = alloc_fd(cur);
+    if (fd_read < 0) {
+        pipe_close_end(read_end);
+        pipe_close_end(write_end);
+        return fd_read;
+    }
+
+    int fd_write = alloc_fd(cur);
+    if (fd_write < 0) {
+        pipe_close_end(read_end);
+        pipe_close_end(write_end);
+        return fd_write;
+    }
+
+    cur->fd_table[fd_read] = (vfs_file_t*)read_end;
+    cur->fd_table[fd_write] = (vfs_file_t*)write_end;
+
+    int* user_pipefd = (int*)pipefd_ptr;
+    user_pipefd[0] = fd_read;
+    user_pipefd[1] = fd_write;
+
+    return 0;
+}
+
 // SYS_EXIT - exit task
 __attribute__((noreturn))
 static void sys_exit(uint64_t status) {
@@ -388,8 +680,6 @@ static void sys_exit(uint64_t status) {
     if (cur) {
         // Store exit code
         cur->exit_code = (int)status;
-        cur->has_exited = true;
-        cur->state = TASK_ZOMBIE;
         
         // Close all file descriptors
         for (int i = 0; i < TASK_MAX_FDS; i++) {
@@ -398,6 +688,9 @@ static void sys_exit(uint64_t status) {
                 uint64_t marker = (uint64_t)cur->fd_table[i];
                 if (marker >= 1 && marker <= 3) {
                     // Console marker - just clear, don't call vfs_close
+                    cur->fd_table[i] = NULL;
+                } else if (pipe_is_end(cur->fd_table[i])) {
+                    pipe_close_end((pipe_end_t*)cur->fd_table[i]);
                     cur->fd_table[i] = NULL;
                 } else {
                     vfs_close(cur->fd_table[i]);
@@ -408,8 +701,12 @@ static void sys_exit(uint64_t status) {
         
         // Reparent children to init
         sched_reparent_children(cur);
+
+        // Mark as exited only after cleanup to avoid early reap races
+        __asm__ volatile ("cli");
+        cur->has_exited = true;
+        cur->state = TASK_ZOMBIE;
     }
-    __asm__ volatile ("sti");
     sched_yield();
     for (;;) {
         __asm__ volatile ("cli; hlt");
@@ -532,6 +829,55 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options) {
     return child_pid;
 }
 
+// SYS_EXECVE - execute a new program (spawns and exits current)
+static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr, uint64_t envp_ptr) {
+    if (!validate_user_ptr(pathname, 1)) {
+        return -EFAULT;
+    }
+
+    const char* user_path = (const char*)pathname;
+    const char* const* user_argv = (const char* const*)argv_ptr;
+    const char* const* user_envp = (const char* const*)envp_ptr;
+
+    char* kpath = NULL;
+    char** kargv = NULL;
+    char** kenvp = NULL;
+
+    int ret = copy_user_string(user_path, VFS_MAX_PATH, &kpath, NULL);
+    if (ret != 0) {
+        return ret;
+    }
+
+    ret = copy_user_string_array(user_argv, 128, 4096, 16384, &kargv);
+    if (ret != 0) {
+        kfree(kpath);
+        return ret;
+    }
+
+    ret = copy_user_string_array(user_envp, 128, 4096, 16384, &kenvp);
+    if (ret != 0) {
+        free_user_string_array(kargv);
+        kfree(kpath);
+        return ret;
+    }
+
+    int exec_ret = elf_exec(kpath, kargv, kenvp, NULL);
+
+    free_user_string_array(kenvp);
+    free_user_string_array(kargv);
+    kfree(kpath);
+
+    if (exec_ret == 0) {
+        sys_exit(0);
+        return 0;
+    }
+
+    if (exec_ret == -1) return -EACCES;
+    if (exec_ret == -3 || exec_ret == -5 || exec_ret == -8 || exec_ret == -10) return -ENOMEM;
+    return -ENOEXEC;
+}
+
+
 // SYS_GETPPID - get parent process ID
 static int64_t sys_getppid(void) {
     task_t* cur = sched_current();
@@ -600,6 +946,15 @@ static int64_t sys_dup(uint64_t oldfd) {
         cur->fd_table[newfd] = cur->fd_table[oldfd];  // Copy the marker
         return newfd;
     }
+
+    if (pipe_is_end(cur->fd_table[oldfd])) {
+        pipe_end_t* new_end = pipe_dup_end((pipe_end_t*)cur->fd_table[oldfd]);
+        if (!new_end) {
+            return -ENOMEM;
+        }
+        cur->fd_table[newfd] = (vfs_file_t*)new_end;
+        return newfd;
+    }
     
     cur->fd_table[newfd] = vfs_dup(cur->fd_table[oldfd]);
     return newfd;
@@ -623,6 +978,8 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd) {
         uint64_t marker = (uint64_t)cur->fd_table[newfd];
         if (marker >= 1 && marker <= 3) {
             // It's a console dup marker, just overwrite
+        } else if (pipe_is_end(cur->fd_table[newfd])) {
+            pipe_close_end((pipe_end_t*)cur->fd_table[newfd]);
         } else {
             vfs_close(cur->fd_table[newfd]);
         }
@@ -648,6 +1005,15 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd) {
     uint64_t marker = (uint64_t)cur->fd_table[oldfd];
     if (marker >= 1 && marker <= 3) {
         cur->fd_table[newfd] = cur->fd_table[oldfd];  // Copy the marker
+        return newfd;
+    }
+
+    if (pipe_is_end(cur->fd_table[oldfd])) {
+        pipe_end_t* new_end = pipe_dup_end((pipe_end_t*)cur->fd_table[oldfd]);
+        if (!new_end) {
+            return -ENOMEM;
+        }
+        cur->fd_table[newfd] = (vfs_file_t*)new_end;
         return newfd;
     }
     
@@ -690,6 +1056,9 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
             
         case SYS_MMAP:
             return sys_mmap(a1, a2, a3, a4, a5, 0);  // Note: 6th arg (offset) would need special handling
+
+        case SYS_MUNMAP:
+            return sys_munmap(a1, a2);
             
         case SYS_BRK:
             return sys_brk(a1);
@@ -705,6 +1074,9 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
             
         case SYS_GETPPID:
             return sys_getppid();
+
+        case SYS_EXECVE:
+            return sys_execve(a1, a2, a3);
             
         case SYS_DUP:
             return sys_dup(a1);
@@ -715,6 +1087,9 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
         case SYS_EXIT:
             sys_exit(a1);
             // Never returns
+
+        case SYS_PIPE:
+            return sys_pipe(a1);
             
         case SYS_YIELD:
             return sys_yield();

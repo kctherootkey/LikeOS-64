@@ -94,5 +94,6 @@ void sched_add_child(task_t* parent, task_t* child);  // Add child to parent
 void sched_remove_child(task_t* parent, task_t* child);  // Remove child from parent
 void sched_reparent_children(task_t* task); // Reparent children to init (task 1)
 uint32_t sched_get_ppid(task_t* task);      // Get parent PID
+void sched_reap_zombies(task_t* parent);    // Reap all zombie children of parent
 
 #endif // _KERNEL_SCHED_H_

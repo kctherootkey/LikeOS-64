@@ -15,6 +15,7 @@ ssize_t read(int fd, void* buf, size_t count);
 ssize_t write(int fd, const void* buf, size_t count);
 int close(int fd);
 off_t lseek(int fd, off_t offset, int whence);
+int pipe(int pipefd[2]);
 
 // Scheduling
 int sched_yield(void);
@@ -23,6 +24,7 @@ int sched_yield(void);
 pid_t getpid(void);
 pid_t getppid(void);
 pid_t fork(void);
+int execve(const char* pathname, char* const argv[], char* const envp[]);
 void _exit(int status) __attribute__((noreturn));
 
 // File descriptor operations

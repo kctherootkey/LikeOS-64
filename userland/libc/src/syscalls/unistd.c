@@ -42,6 +42,15 @@ int close(int fd) {
     return ret;
 }
 
+int pipe(int pipefd[2]) {
+    long ret = syscall1(SYS_PIPE, (long)pipefd);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return ret;
+}
+
 off_t lseek(int fd, off_t offset, int whence) {
     long ret = syscall3(SYS_LSEEK, fd, offset, whence);
     if (ret < 0) {
@@ -61,6 +70,15 @@ pid_t getppid(void) {
 
 pid_t fork(void) {
     long ret = syscall0(SYS_FORK);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return ret;
+}
+
+int execve(const char* pathname, char* const argv[], char* const envp[]) {
+    long ret = syscall3(SYS_EXECVE, (long)pathname, (long)argv, (long)envp);
     if (ret < 0) {
         errno = -ret;
         return -1;
@@ -95,6 +113,16 @@ pid_t wait(int* status) {
     return waitpid(-1, status, 0);
 }
 
+pid_t wait4(pid_t pid, int* status, int options, void* rusage) {
+    (void)rusage;
+    long ret = syscall3(SYS_WAIT4, pid, (long)status, options);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return ret;
+}
+
 pid_t waitpid(pid_t pid, int* status, int options) {
     // If WNOHANG is not set, loop until child exits
     while (1) {
@@ -106,7 +134,7 @@ pid_t waitpid(pid_t pid, int* status, int options) {
         // ECHILD (10) means no children exist - return error
         if (ret == -11 && !(options & WNOHANG)) {
             // Yield and retry
-            syscall0(SYS_YIELD);
+            sched_yield();
             continue;
         }
         errno = -ret;

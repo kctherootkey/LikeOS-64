@@ -9,7 +9,7 @@ LIBS = $(LIBC_DIR)/libc.a
 CRT0 = $(LIBC_DIR)/crt0.o
 
 # Programs
-PROGRAMS = test_syscalls test_libc
+PROGRAMS = test_syscalls test_libc hello
 
 all: $(PROGRAMS)
 
@@ -18,6 +18,9 @@ test_syscalls: $(CRT0) test_syscalls.o $(LIBS)
 
 test_libc: $(CRT0) test_libc.o $(LIBS)
 	$(LD) $(LDFLAGS) $(CRT0) test_libc.o $(LIBS) -o $@
+
+hello: $(CRT0) hello.o $(LIBS)
+	$(LD) $(LDFLAGS) $(CRT0) hello.o $(LIBS) -o $@
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
