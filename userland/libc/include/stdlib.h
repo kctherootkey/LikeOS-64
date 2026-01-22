@@ -27,6 +27,9 @@ char* getenv(const char* name);
 int setenv(const char* name, const char* value, int overwrite);
 int unsetenv(const char* name);
 
+// Path utilities
+char* realpath(const char* path, char* resolved_path);
+
 // Utilities
 int abs(int n);
 long labs(long n);

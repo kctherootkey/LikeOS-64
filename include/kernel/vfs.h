@@ -20,6 +20,7 @@ typedef struct {
     long (*read)(vfs_file_t* f, void* buf, long bytes);
     long (*write)(vfs_file_t* f, const void* buf, long bytes);
     long (*seek)(vfs_file_t* f, long offset, int whence);
+    long (*readdir)(vfs_file_t* f, void* buf, long bytes);
     int (*truncate)(vfs_file_t* f, unsigned long size);
     int (*unlink)(const char* path);
     int (*rename)(const char* oldpath, const char* newpath);
@@ -42,12 +43,14 @@ struct vfs_file {
 int vfs_init(void);
 int vfs_register_root(const vfs_ops_t* ops);
 int vfs_register_devfs(const vfs_ops_t* ops);
+int vfs_root_ready(void);
 int vfs_open(const char* path, int flags, vfs_file_t** out);
 int vfs_stat(const char* path, struct kstat* st);
 int vfs_chdir(const char* path);
 long vfs_read(vfs_file_t* f, void* buf, long bytes);
 long vfs_write(vfs_file_t* f, const void* buf, long bytes);
 long vfs_seek(vfs_file_t* f, long offset, int whence);
+long vfs_readdir(vfs_file_t* f, void* buf, long bytes);
 int vfs_truncate(vfs_file_t* f, unsigned long size);
 int vfs_unlink(const char* path);
 int vfs_rename(const char* oldpath, const char* newpath);

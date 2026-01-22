@@ -2,6 +2,7 @@
 #include "../../include/unistd.h"
 #include "../../include/ctype.h"
 #include "../../include/string.h"
+#include "../../include/errno.h"
 
 // Simple environment variable storage
 #define MAX_ENV_VARS 32
@@ -175,6 +176,101 @@ int unsetenv(const char* name) {
         }
     }
     return 0;  // Not found is not an error
+}
+
+static int normalize_path(const char* in, char* out, size_t out_size) {
+    if (!in || !out || out_size < 2) {
+        return -1;
+    }
+    size_t out_len = 0;
+    out[out_len++] = '/';
+
+    size_t i = 0;
+    while (in[i]) {
+        while (in[i] == '/') i++;
+        if (!in[i]) break;
+        char segment[64];
+        size_t seg_len = 0;
+        while (in[i] && in[i] != '/' && seg_len < sizeof(segment) - 1) {
+            segment[seg_len++] = in[i++];
+        }
+        segment[seg_len] = '\0';
+        if (seg_len == 0 || (seg_len == 1 && segment[0] == '.')) {
+            continue;
+        }
+        if (seg_len == 2 && segment[0] == '.' && segment[1] == '.') {
+            if (out_len > 1) {
+                out_len--;
+                while (out_len > 1 && out[out_len - 1] != '/') {
+                    out_len--;
+                }
+            }
+            out[out_len] = '\0';
+            continue;
+        }
+        if (out_len > 1 && out[out_len - 1] != '/') {
+            if (out_len + 1 >= out_size) return -1;
+            out[out_len++] = '/';
+        }
+        if (out_len + seg_len + 1 >= out_size) return -1;
+        for (size_t s = 0; s < seg_len; ++s) {
+            out[out_len++] = segment[s];
+        }
+        out[out_len] = '\0';
+    }
+    if (out_len > 1 && out[out_len - 1] == '/') {
+        out[out_len - 1] = '\0';
+    }
+    return 0;
+}
+
+char* realpath(const char* path, char* resolved_path) {
+    if (!path) {
+        errno = EINVAL;
+        return NULL;
+    }
+    char tmp[512];
+    if (path[0] == '/') {
+        strncpy(tmp, path, sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = '\0';
+    } else {
+        char cwd[256];
+        if (!getcwd(cwd, sizeof(cwd))) {
+            errno = EINVAL;
+            return NULL;
+        }
+        size_t len = strlen(cwd);
+        if (len + 1 >= sizeof(tmp)) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        strcpy(tmp, cwd);
+        if (len == 0 || tmp[len - 1] != '/') {
+            tmp[len++] = '/';
+            tmp[len] = '\0';
+        }
+        if (len + strlen(path) + 1 >= sizeof(tmp)) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        strcpy(tmp + len, path);
+    }
+
+    char norm[512];
+    if (normalize_path(tmp, norm, sizeof(norm)) != 0) {
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    if (!resolved_path) {
+        resolved_path = (char*)malloc(strlen(norm) + 1);
+        if (!resolved_path) {
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+    strcpy(resolved_path, norm);
+    return resolved_path;
 }
 
 int abs(int n) {

@@ -23,6 +23,7 @@ int pipe(int pipefd[2]);
 #define W_OK 2
 #define R_OK 4
 int access(const char* path, int mode);
+int faccessat(int dirfd, const char* path, int mode, int flags);
 int chdir(const char* path);
 char* getcwd(char* buf, size_t size);
 
@@ -63,6 +64,11 @@ int symlink(const char* target, const char* linkpath);
 int readlink(const char* path, char* buf, size_t bufsiz);
 int chown(const char* path, int owner, int group);
 int fchown(int fd, int owner, int group);
+
+// getdents wrappers
+struct dirent;
+int getdents(int fd, struct dirent* dirp, unsigned int count);
+int getdents64(int fd, void* dirp, unsigned int count);
 
 // PTY helpers
 int posix_openpt(int flags);

@@ -10,6 +10,7 @@ static const vfs_ops_t* g_dev_ops = 0;
 int vfs_init(void) { g_root_ops = 0; g_dev_ops = 0; return ST_OK; }
 int vfs_register_root(const vfs_ops_t* ops) { if (!ops) return ST_INVALID; g_root_ops = ops; return ST_OK; }
 int vfs_register_devfs(const vfs_ops_t* ops) { if (!ops) return ST_INVALID; g_dev_ops = ops; return ST_OK; }
+int vfs_root_ready(void) { return g_root_ops != 0; }
 
 static int vfs_is_dev_path(const char* path) {
     if (!path) return 0;
@@ -58,6 +59,7 @@ int vfs_chdir(const char* path) {
 long vfs_read(vfs_file_t* f, void* buf, long bytes) { if (!f || !f->ops || !f->ops->read) return ST_INVALID; return f->ops->read(f, buf, bytes); }
 long vfs_write(vfs_file_t* f, const void* buf, long bytes) { if (!f || !f->ops || !f->ops->write) return ST_INVALID; return f->ops->write(f, buf, bytes); }
 long vfs_seek(vfs_file_t* f, long offset, int whence) { if (!f || !f->ops || !f->ops->seek) return -1; return f->ops->seek(f, offset, whence); }
+long vfs_readdir(vfs_file_t* f, void* buf, long bytes) { if (!f || !f->ops || !f->ops->readdir) return ST_UNSUPPORTED; return f->ops->readdir(f, buf, bytes); }
 int vfs_truncate(vfs_file_t* f, unsigned long size) { if (!f || !f->ops || !f->ops->truncate) return ST_UNSUPPORTED; return f->ops->truncate(f, size); }
 int vfs_unlink(const char* path) { if (!g_root_ops || !g_root_ops->unlink) return ST_UNSUPPORTED; return g_root_ops->unlink(path); }
 int vfs_rename(const char* oldpath, const char* newpath) { if (!g_root_ops || !g_root_ops->rename) return ST_UNSUPPORTED; return g_root_ops->rename(oldpath, newpath); }

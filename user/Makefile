@@ -9,7 +9,7 @@ LIBS = $(LIBC_DIR)/libc.a
 CRT0 = $(LIBC_DIR)/crt0.o
 
 # Programs
-PROGRAMS = test_syscalls test_libc hello
+PROGRAMS = test_syscalls test_libc hello sh ls cat pwd stat
 
 all: $(PROGRAMS)
 
@@ -21,6 +21,21 @@ test_libc: $(CRT0) test_libc.o $(LIBS)
 
 hello: $(CRT0) hello.o $(LIBS)
 	$(LD) $(LDFLAGS) $(CRT0) hello.o $(LIBS) -o $@
+
+sh: $(CRT0) sh.o $(LIBS)
+	$(LD) $(LDFLAGS) $(CRT0) sh.o $(LIBS) -o $@
+
+ls: $(CRT0) ls.o $(LIBS)
+	$(LD) $(LDFLAGS) $(CRT0) ls.o $(LIBS) -o $@
+
+cat: $(CRT0) cat.o $(LIBS)
+	$(LD) $(LDFLAGS) $(CRT0) cat.o $(LIBS) -o $@
+
+pwd: $(CRT0) pwd.o $(LIBS)
+	$(LD) $(LDFLAGS) $(CRT0) pwd.o $(LIBS) -o $@
+
+stat: $(CRT0) stat.o $(LIBS)
+	$(LD) $(LDFLAGS) $(CRT0) stat.o $(LIBS) -o $@
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

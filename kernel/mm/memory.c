@@ -545,12 +545,37 @@ static void split_block(heap_block_t* block, size_t size) {
     block->size = size;
 }
 
+// Validate a heap block pointer is within the heap
+static int is_valid_heap_block(heap_block_t* block) {
+    if (!block) return 1;  // NULL is valid (end of list)
+    uint64_t addr = (uint64_t)block;
+    uint64_t heap_start = (uint64_t)mm_state.heap_start;
+    uint64_t heap_end = (uint64_t)mm_state.heap_end;
+    if (addr < heap_start || addr >= heap_end) return 0;
+    if (block->magic != HEAP_MAGIC_ALLOCATED && block->magic != HEAP_MAGIC_FREE) return 0;
+    return 1;
+}
+
 // Coalesce adjacent free blocks
 static void coalesce_blocks(heap_block_t* block) {
+    // Validate current block
+    if (!is_valid_heap_block(block)) {
+        kprintf("coalesce_blocks: invalid block %p\n", block);
+        return;
+    }
+    
     // Coalesce with next block
     if (block->next && block->next->is_free) {
+        if (!is_valid_heap_block(block->next)) {
+            kprintf("coalesce_blocks: invalid block->next %p (from %p)\n", block->next, block);
+            return;
+        }
         block->size += block->next->size + sizeof(heap_block_t);
         if (block->next->next) {
+            if (!is_valid_heap_block(block->next->next)) {
+                kprintf("coalesce_blocks: invalid block->next->next %p\n", block->next->next);
+                return;
+            }
             block->next->next->prev = block;
         }
         block->next = block->next->next;
@@ -558,8 +583,16 @@ static void coalesce_blocks(heap_block_t* block) {
     
     // Coalesce with previous block
     if (block->prev && block->prev->is_free) {
+        if (!is_valid_heap_block(block->prev)) {
+            kprintf("coalesce_blocks: invalid block->prev %p (from %p)\n", block->prev, block);
+            return;
+        }
         block->prev->size += block->size + sizeof(heap_block_t);
         if (block->next) {
+            if (!is_valid_heap_block(block->next)) {
+                kprintf("coalesce_blocks: invalid block->next %p (in prev merge)\n", block->next);
+                return;
+            }
             block->next->prev = block->prev;
         }
         block->prev->next = block->next;
@@ -611,8 +644,9 @@ void* kalloc(size_t size) {
     
     heap_block_t* block = find_free_block(size);
     if (!block) {
-        kprintf("kalloc FAILED for size %lu, heap used=%lu/%lu\n", 
-                (unsigned long)size, mm_state.heap_used, mm_state.heap_size);
+        void* ra = __builtin_return_address(0);
+        kprintf("kalloc FAILED for size %lu, heap used=%lu/%lu (caller=%p)\n", 
+            (unsigned long)size, mm_state.heap_used, mm_state.heap_size, ra);
         return NULL; // Out of memory
     }
     
@@ -635,13 +669,28 @@ void kfree(void* ptr) {
     if (!ptr) {
         return;
     }
+
+    if (!mm_state.heap_start || !mm_state.heap_end) {
+        void* ra = __builtin_return_address(0);
+        kprintf("ERROR: kfree before heap init (%p, caller=%p)\n", ptr, ra);
+        return;
+    }
+
+    uint8_t* heap_start = (uint8_t*)mm_state.heap_start;
+    uint8_t* heap_end = (uint8_t*)mm_state.heap_end;
+    if ((uint8_t*)ptr < heap_start + sizeof(heap_block_t) || (uint8_t*)ptr >= heap_end) {
+        void* ra = __builtin_return_address(0);
+        kprintf("ERROR: Invalid free() call for non-heap address %p (caller=%p)\n", ptr, ra);
+        return;
+    }
     
     heap_block_t* block = (heap_block_t*)((uint8_t*)ptr - sizeof(heap_block_t));
     
     // Validate block
     if (block->magic != HEAP_MAGIC_ALLOCATED || block->is_free) {
-        kprintf("ERROR: Invalid free() call for address %p (magic=0x%08x free=%d)\n", 
-                ptr, block->magic, block->is_free);
+        void* ra = __builtin_return_address(0);
+        kprintf("ERROR: Invalid free() call for address %p (magic=0x%08x free=%d caller=%p)\n", 
+            ptr, block->magic, block->is_free, ra);
         return;
     }
     

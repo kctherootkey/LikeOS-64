@@ -21,11 +21,29 @@ user_rsp_save:
 global syscall_saved_user_rip
 global syscall_saved_user_rsp
 global syscall_saved_user_rflags
+global syscall_saved_user_rbp
+global syscall_saved_user_rbx
+global syscall_saved_user_r12
+global syscall_saved_user_r13
+global syscall_saved_user_r14
+global syscall_saved_user_r15
 syscall_saved_user_rip:
     dq 0
 syscall_saved_user_rsp:
     dq 0
 syscall_saved_user_rflags:
+    dq 0
+syscall_saved_user_rbp:
+    dq 0
+syscall_saved_user_rbx:
+    dq 0
+syscall_saved_user_r12:
+    dq 0
+syscall_saved_user_r13:
+    dq 0
+syscall_saved_user_r14:
+    dq 0
+syscall_saved_user_r15:
     dq 0
 
 SECTION .text
@@ -47,6 +65,14 @@ syscall_entry:
     mov rax, [rel user_rsp_save]
     mov [rel syscall_saved_user_rsp], rax      ; Save actual user RSP
     pop rax                                     ; Restore syscall number
+    
+    ; Save callee-saved registers for fork()
+    mov [rel syscall_saved_user_rbp], rbp
+    mov [rel syscall_saved_user_rbx], rbx
+    mov [rel syscall_saved_user_r12], r12
+    mov [rel syscall_saved_user_r13], r13
+    mov [rel syscall_saved_user_r14], r14
+    mov [rel syscall_saved_user_r15], r15
     
     push rax
     push rbx
@@ -111,10 +137,25 @@ user_mode_iret_trampoline:
     iretq
 
 ; Fork child return trampoline
-; Stack has: RAX value, then IRET frame (RIP, CS, RFLAGS, RSP, SS)
+; Stack layout when we get here (from RSP upward):
+;   RAX value (0)
+;   IRET frame: RIP, CS, RFLAGS, RSP, SS
+;   User callee-saved: RBP, RBX, R12, R13, R14, R15
+; We need to pop RAX, then load the callee-saved regs (after IRET frame), then iretq
 global fork_child_return
 fork_child_return:
     pop rax        ; Get fork return value (0)
+    
+    ; IRET frame starts at RSP (5 qwords: RIP, CS, RFLAGS, RSP, SS)
+    ; User callee-saved regs are at RSP + 40 (after the 5 qwords)
+    ; Order on stack: RBP, RBX, R12, R13, R14, R15 (pushed in reverse, so RBP is first)
+    mov rbp, [rsp + 40]
+    mov rbx, [rsp + 48]
+    mov r12, [rsp + 56]
+    mov r13, [rsp + 64]
+    mov r14, [rsp + 72]
+    mov r15, [rsp + 80]
+    
     iretq          ; Return to userspace
 
 ; Context switch between tasks

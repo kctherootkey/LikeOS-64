@@ -3,16 +3,20 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/syscall.h"
+#include "../../include/kernel/dirent.h"
 
 #define DEVFS_TYPE_TTY       1
 #define DEVFS_TYPE_PTY_MASTER 2
 #define DEVFS_TYPE_PTY_SLAVE  3
+#define DEVFS_TYPE_DIR        4
+#define DEVFS_TYPE_PTS_DIR    5
 
 typedef struct {
     vfs_file_t vfs;
     int type;
     tty_t* tty;
     int pty_id;
+    unsigned dir_pos;
 } devfs_file_t;
 
 static vfs_ops_t g_devfs_ops;
@@ -30,12 +34,15 @@ static int is_prefix(const char* path, const char* prefix) {
     return 1;
 }
 
+long devfs_readdir(vfs_file_t* f, void* buf, long bytes);
+
 int devfs_init(void) {
     g_devfs_ops.open = devfs_open;
     g_devfs_ops.stat = devfs_stat;
     g_devfs_ops.read = devfs_read;
     g_devfs_ops.write = devfs_write;
     g_devfs_ops.seek = NULL;
+    g_devfs_ops.readdir = devfs_readdir;
     g_devfs_ops.truncate = NULL;
     g_devfs_ops.unlink = NULL;
     g_devfs_ops.rename = NULL;
@@ -65,6 +72,17 @@ static int devfs_open_tty(tty_t* tty, vfs_file_t** out) {
     if (!df) return ST_NOMEM;
     df->type = DEVFS_TYPE_TTY;
     df->tty = tty;
+    *out = &df->vfs;
+    return ST_OK;
+}
+
+static int devfs_open_dir(int type, vfs_file_t** out) {
+    if (!out) return ST_INVALID;
+    devfs_file_t* df = devfs_alloc_file();
+    if (!df) return ST_NOMEM;
+    df->type = type;
+    df->tty = NULL;
+    df->pty_id = -1;
     *out = &df->vfs;
     return ST_OK;
 }
@@ -100,6 +118,13 @@ static int devfs_open_pty_slave(int id, vfs_file_t** out) {
 int devfs_open_for_task(const char* path, int flags, vfs_file_t** out, task_t* cur) {
     (void)flags;
     if (!path || !out) return ST_INVALID;
+
+    if (is_path(path, "/dev") || is_path(path, "/dev/")) {
+        return devfs_open_dir(DEVFS_TYPE_DIR, out);
+    }
+    if (is_path(path, "/dev/pts") || is_path(path, "/dev/pts/")) {
+        return devfs_open_dir(DEVFS_TYPE_PTS_DIR, out);
+    }
 
     if (is_path(path, "/dev/tty") && cur) {
         tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
@@ -195,6 +220,70 @@ long devfs_write(vfs_file_t* f, const void* buf, long bytes) {
         return tty_pty_master_write(df->pty_id, buf, bytes);
     }
     return -EINVAL;
+}
+
+static unsigned devfs_write_dirent64(char* out, unsigned out_size, unsigned* out_off,
+                                     const char* name, uint64_t ino, uint8_t type) {
+    if (!out || !out_off || !name) return 0;
+    unsigned name_len = 0;
+    while (name[name_len] && name_len < 255) name_len++;
+    unsigned reclen = (unsigned)sizeof(struct linux_dirent64) + name_len + 1;
+    reclen = (reclen + 7u) & ~7u;
+    if (*out_off + reclen > out_size) return 0;
+    struct linux_dirent64* d = (struct linux_dirent64*)(out + *out_off);
+    d->d_ino = ino;
+    d->d_off = 0;
+    d->d_reclen = (uint16_t)reclen;
+    d->d_type = type;
+    char* dn = (char*)d->d_name;
+    for (unsigned i = 0; i < name_len; ++i) dn[i] = name[i];
+    dn[name_len] = '\0';
+    *out_off += reclen;
+    return 1;
+}
+
+long devfs_readdir(vfs_file_t* f, void* buf, long bytes) {
+    if (!f || !buf || bytes <= 0) return -EINVAL;
+    devfs_file_t* df = (devfs_file_t*)f->fs_private;
+    if (!df) return -EINVAL;
+    if (df->type != DEVFS_TYPE_DIR && df->type != DEVFS_TYPE_PTS_DIR) {
+        return -ENOTDIR;
+    }
+    if (df->dir_pos) {
+        return 0;
+    }
+
+    unsigned out_off = 0;
+    if (df->type == DEVFS_TYPE_DIR) {
+        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "tty", 1, 2);
+        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "console", 2, 2);
+        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "tty0", 3, 2);
+        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "ptmx", 4, 2);
+        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "pts", 5, 4);
+        df->dir_pos = 1;
+        return (long)out_off;
+    }
+
+    for (int i = 0; i < 16; ++i) {
+        if (!tty_pty_is_allocated(i)) continue;
+        char name[8];
+        int len = 0;
+        int n = i;
+        if (n == 0) {
+            name[len++] = '0';
+        } else {
+            char tmp[8];
+            int t = 0;
+            while (n > 0 && t < 7) { tmp[t++] = (char)('0' + (n % 10)); n /= 10; }
+            while (t > 0) { name[len++] = tmp[--t]; }
+        }
+        name[len] = '\0';
+        if (!devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, name, (uint64_t)(100 + i), 2)) {
+            break;
+        }
+    }
+    df->dir_pos = 1;
+    return (long)out_off;
 }
 
 int devfs_close(vfs_file_t* f) {

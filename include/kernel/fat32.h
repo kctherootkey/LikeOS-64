@@ -25,6 +25,9 @@ typedef struct {
     unsigned long size;
     unsigned long pos;
     unsigned long current_cluster; // cluster we have loaded
+    int is_dir;
+    unsigned long dir_iter_cluster;
+    unsigned int dir_iter_index;
     unsigned long parent_cluster;
     unsigned long dirent_cluster;
     unsigned int dirent_index;

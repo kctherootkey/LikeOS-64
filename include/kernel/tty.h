@@ -43,6 +43,7 @@ typedef unsigned int speed_t;
 #define TIOCGWINSZ 0x5413
 #define TIOCSWINSZ 0x5414
 #define TIOCGPTN   0x80045430
+#define TIOCSGUARD 0x5420
 
 struct winsize {
     uint16_t ws_row;

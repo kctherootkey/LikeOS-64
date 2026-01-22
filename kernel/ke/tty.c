@@ -332,6 +332,12 @@ int tty_ioctl(tty_t* tty, unsigned long req, void* argp, task_t* cur) {
             if (!argp) return -EFAULT;
             mm_memcpy(&tty->winsz, argp, sizeof(struct winsize));
             return 0;
+        case TIOCSGUARD:
+            if (tty == tty_get_console()) {
+                console_set_prompt_guard();
+                return 0;
+            }
+            return 0;
         default:
             return -ENOTTY;
     }

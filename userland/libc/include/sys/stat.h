@@ -33,6 +33,8 @@ struct stat {
 int stat(const char* path, struct stat* st);
 int lstat(const char* path, struct stat* st);
 int fstat(int fd, struct stat* st);
+int fstatat(int dirfd, const char* path, struct stat* st, int flags);
+#define AT_SYMLINK_NOFOLLOW 0x100
 int chmod(const char* path, mode_t mode);
 int fchmod(int fd, mode_t mode);
 

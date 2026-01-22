@@ -8,16 +8,15 @@ _start:
     xor %rbp, %rbp
     
     # The kernel sets up the stack with:
-    #   [argc]
+    #   [argc]        <- RSP points here
     #   [argv[0]] [argv[1]] ... [NULL]
     #   [envp[0]] [envp[1]] ... [NULL]
-    # RSP points 8 bytes before argc when we start
     
-    # Load argc from stack BEFORE alignment
-    mov 8(%rsp), %rdi      # argc at rsp+8
+    # Load argc from stack
+    mov (%rsp), %rdi       # argc at rsp
     
-    # Calculate argv pointer (rsp + 16)
-    lea 16(%rsp), %rsi     # argv starts at rsp+16
+    # Calculate argv pointer (rsp + 8)
+    lea 8(%rsp), %rsi      # argv starts at rsp+8
     
     # Calculate envp pointer
     # envp = argv + (argc + 1) * 8

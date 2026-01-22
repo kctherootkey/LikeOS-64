@@ -162,18 +162,18 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
         return NULL;
     }
     
-    uint8_t* k_stack_mem = (uint8_t*)kalloc(4096);
+    uint8_t* k_stack_mem = (uint8_t*)kalloc(8192);
     if (!k_stack_mem) {
         kfree(t);
         return NULL;
     }
     
-    uint64_t* k_sp = (uint64_t*)(k_stack_mem + 4096);
+    uint64_t* k_sp = (uint64_t*)(k_stack_mem + 8192);
     k_sp = (uint64_t*)((uint64_t)k_sp & ~0xFUL);
     
     // IRET frame: SS, RSP, RFLAGS, CS, RIP
     *(--k_sp) = 0x1B;                    // SS
-    *(--k_sp) = user_stack - 8;          // RSP
+    *(--k_sp) = user_stack;              // RSP (points to argc on user stack)
     *(--k_sp) = 0x202;                   // RFLAGS (IF enabled)
     *(--k_sp) = 0x23;                    // CS
     *(--k_sp) = (uint64_t)entry;         // RIP
@@ -195,7 +195,7 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
     t->privilege = TASK_USER;
     t->id = g_next_id++;
     t->user_stack_top = user_stack;
-    t->kernel_stack_top = (uint64_t)(k_stack_mem + 4096);
+    t->kernel_stack_top = (uint64_t)(k_stack_mem + 8192);
     t->pgid = t->id;
     t->sid = t->id;
     t->ctty = tty_get_console();
@@ -519,6 +519,14 @@ void sched_remove_task(task_t* task) {
         task->pml4 = NULL;
     }
     
+
+    
+    // Free kernel stack if allocated (kernel_stack_top points to top, base is top - 8192)
+    if (task->kernel_stack_top && task->privilege == TASK_USER) {
+        void* k_stack_base = (void*)(task->kernel_stack_top - 8192);
+        kfree(k_stack_base);
+    }
+    
     // Free the task structure
     kfree(task);
 }
@@ -544,7 +552,7 @@ task_t* sched_fork_current(void) {
     }
     
     // Allocate kernel stack for child
-    uint8_t* k_stack_mem = (uint8_t*)kalloc(4096);
+    uint8_t* k_stack_mem = (uint8_t*)kalloc(8192);
     if (!k_stack_mem) {
         mm_destroy_address_space(child_pml4);
         kfree(child);
@@ -558,7 +566,7 @@ task_t* sched_fork_current(void) {
     child->id = g_next_id++;
     child->pml4 = child_pml4;
     child->state = TASK_READY;
-    child->kernel_stack_top = (uint64_t)(k_stack_mem + 4096);
+    child->kernel_stack_top = (uint64_t)(k_stack_mem + 8192);
     child->next = NULL;  // Will be set by enqueue_task
     
     // Process hierarchy

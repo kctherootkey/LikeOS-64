@@ -413,6 +413,23 @@ int elf_exec(const char* path, char* const argv[], char* const envp[], task_t** 
     if (current) {
         task->parent = current;
         sched_add_child(current, task);
+        // Inherit pgid from parent (important for job control)
+        task->pgid = current->pgid;
+        task->sid = current->sid;
+        // Inherit controlling tty
+        task->ctty = current->ctty;
+            // Inherit cwd from parent
+            mm_memset(task->cwd, 0, sizeof(task->cwd));
+            if (current->cwd[0]) {
+                size_t i = 0;
+                for (; current->cwd[i] && i < sizeof(task->cwd) - 1; ++i) {
+                    task->cwd[i] = current->cwd[i];
+                }
+                task->cwd[i] = '\0';
+            } else {
+                task->cwd[0] = '/';
+                task->cwd[1] = '\0';
+            }
     }
     
     if (out_task) {
@@ -420,4 +437,195 @@ int elf_exec(const char* path, char* const argv[], char* const envp[], task_t** 
     }
 
     return 0;
+}
+
+// Execute an ELF file, replacing the current task's memory (for execve semantics)
+// Returns: new entry point on success, 0 on failure
+// On success, also sets *out_stack_ptr to the new user stack pointer
+uint64_t elf_exec_replace(const char* path, char* const argv[], char* const envp[], uint64_t* out_stack_ptr) {
+    if (!path || !out_stack_ptr) {
+        return 0;
+    }
+    
+    task_t* current = sched_current();
+    if (!current) {
+        return 0;
+    }
+    
+    // Open the file
+    vfs_file_t* file = NULL;
+    int ret = vfs_open(path, 0, &file);
+    if (ret != 0 || !file) {
+        return 0;
+    }
+    
+    // Get file size
+    size_t file_size = vfs_size(file);
+    if (file_size == 0 || file_size > 16 * 1024 * 1024) {
+        vfs_close(file);
+        return 0;
+    }
+    
+    // Allocate buffer for ELF file
+    void* elf_buf = kalloc(file_size);
+    if (!elf_buf) {
+        vfs_close(file);
+        return 0;
+    }
+    
+    // Read entire file
+    long bytes_read = vfs_read(file, elf_buf, file_size);
+    vfs_close(file);
+    
+    if (bytes_read != (long)file_size) {
+        kfree(elf_buf);
+        return 0;
+    }
+    
+    // Save the old address space to destroy later
+    uint64_t* old_pml4 = current->pml4;
+    
+    // Create NEW user address space
+    uint64_t* user_pml4 = mm_create_user_address_space();
+    if (!user_pml4) {
+        kfree(elf_buf);
+        return 0;
+    }
+    
+    // Load ELF into the new address space
+    elf_load_result_t load_result;
+    ret = elf_load_user(elf_buf, file_size, user_pml4, &load_result);
+    kfree(elf_buf);
+    
+    if (ret != 0) {
+        mm_destroy_address_space(user_pml4);
+        return 0;
+    }
+    
+    // Set up stack in new address space
+    #define USER_STACK_TOP_EXEC   0x8000000ULL
+    #define USER_STACK_SIZE_EXEC  (64 * 1024)
+    
+    if (!mm_map_user_stack(user_pml4, USER_STACK_TOP_EXEC, USER_STACK_SIZE_EXEC)) {
+        mm_destroy_address_space(user_pml4);
+        return 0;
+    }
+    
+    // Calculate argc/envc
+    int argc = 0;
+    if (argv) {
+        while (argv[argc]) argc++;
+    }
+    int envc = 0;
+    if (envp) {
+        while (envp[envc]) envc++;
+    }
+    
+    // Calculate string space needed
+    size_t strings_size = 0;
+    for (int i = 0; i < argc; i++) {
+        strings_size += elf_strlen(argv[i]) + 1;
+    }
+    for (int i = 0; i < envc; i++) {
+        strings_size += elf_strlen(envp[i]) + 1;
+    }
+    
+    // Stack layout (similar to elf_exec)
+    size_t total_size = strings_size + 
+                        (envc + 1) * sizeof(uint64_t) +
+                        (argc + 1) * sizeof(uint64_t) +
+                        sizeof(uint64_t);
+    
+    if (total_size > PAGE_SIZE) {
+        mm_destroy_address_space(user_pml4);
+        return 0;
+    }
+    
+    // Allocate temp buffer for stack setup
+    uint8_t* stack_setup = kalloc(PAGE_SIZE);
+    if (!stack_setup) {
+        mm_destroy_address_space(user_pml4);
+        return 0;
+    }
+    mm_memset(stack_setup, 0, PAGE_SIZE);
+    
+    // Build stack content
+    uint64_t stack_base = USER_STACK_TOP_EXEC - USER_STACK_SIZE_EXEC;
+    uint64_t stack_page_base = USER_STACK_TOP_EXEC - PAGE_SIZE;
+    
+    uint64_t string_area = stack_page_base;
+    uint8_t* str_ptr = stack_setup;
+    
+    uint64_t argv_ptrs[128];
+    uint64_t envp_ptrs[128];
+    
+    for (int i = 0; i < argc && i < 128; i++) {
+        argv_ptrs[i] = string_area + (str_ptr - stack_setup);
+        size_t len = elf_strlen(argv[i]);
+        mm_memcpy(str_ptr, argv[i], len + 1);
+        str_ptr += len + 1;
+    }
+    for (int i = 0; i < envc && i < 128; i++) {
+        envp_ptrs[i] = string_area + (str_ptr - stack_setup);
+        size_t len = elf_strlen(envp[i]);
+        mm_memcpy(str_ptr, envp[i], len + 1);
+        str_ptr += len + 1;
+    }
+    
+    // Calculate where arrays go
+    size_t strings_used = str_ptr - stack_setup;
+    size_t array_space = (envc + 1 + argc + 1 + 1) * sizeof(uint64_t);
+    size_t total_used = strings_used + array_space;
+    total_used = (total_used + 15) & ~15ULL;
+    
+    uint64_t stack_ptr = USER_STACK_TOP_EXEC - total_used;
+    size_t offset_in_page = PAGE_SIZE - total_used;
+    
+    uint64_t* sp = (uint64_t*)(stack_setup + offset_in_page);
+    *sp++ = argc;
+    for (int i = 0; i < argc; i++) {
+        *sp++ = argv_ptrs[i];
+    }
+    *sp++ = 0;  // NULL terminator for argv
+    for (int i = 0; i < envc; i++) {
+        *sp++ = envp_ptrs[i];
+    }
+    *sp++ = 0;  // NULL terminator for envp
+    
+    // Copy stack page to physical memory
+    uint64_t top_page_vaddr = USER_STACK_TOP_EXEC - PAGE_SIZE;
+    uint64_t phys = mm_get_physical_address_from_pml4(user_pml4, top_page_vaddr);
+    if (phys) {
+        mm_memcpy((void*)phys, stack_setup, PAGE_SIZE);
+    }
+    kfree(stack_setup);
+    
+    // Now switch the current task to use the new address space
+    // First, switch CR3 to the new address space
+    current->pml4 = user_pml4;
+    
+    // Update task's memory management fields
+    current->brk_start = load_result.brk_start;
+    current->brk = load_result.brk_start;
+    current->user_stack_top = USER_STACK_TOP_EXEC;
+    current->mmap_base = USER_STACK_TOP_EXEC - (4 * 1024 * 1024);
+    
+    // Close all file descriptors except 0, 1, 2
+    for (int i = 3; i < TASK_MAX_FDS; i++) {
+        if (current->fd_table[i]) {
+            vfs_close(current->fd_table[i]);
+            current->fd_table[i] = NULL;
+        }
+    }
+    
+    // Switch to new address space now
+    __asm__ volatile("mov %0, %%cr3" : : "r"((uint64_t)user_pml4) : "memory");
+    
+    // Destroy old address space (after switching!)
+    if (old_pml4) {
+        mm_destroy_address_space(old_pml4);
+    }
+    
+    *out_stack_ptr = stack_ptr;
+    return load_result.entry_point;
 }

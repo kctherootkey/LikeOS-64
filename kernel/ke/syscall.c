@@ -14,6 +14,7 @@
 #include "../../include/kernel/tty.h"
 #include "../../include/kernel/signal.h"
 #include "../../include/kernel/devfs.h"
+#include "../../include/kernel/dirent.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
@@ -375,6 +376,9 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
     return wret;
 }
 
+static int build_at_path(task_t* cur, int dirfd, const char* path, char* out, size_t out_size);
+static int normalize_path(const char* base, const char* path, char* out, size_t out_size);
+
 // SYS_OPEN - open a file
 static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode) {
     (void)flags; (void)mode;  // Currently ignore flags/mode
@@ -393,6 +397,12 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode) {
     
     vfs_file_t* file = NULL;
     const char* path = (const char*)pathname;
+    char full[VFS_MAX_PATH];
+    if (path[0] != '/') {
+        int brest = build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
+        if (brest != 0) return brest;
+        path = full;
+    }
     int ret;
     if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && (path[4] == '/' || path[4] == '\0')) {
         ret = devfs_open_for_task(path, (int)flags, &file, cur);
@@ -407,6 +417,45 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode) {
         return -EACCES;
     }
     
+    cur->fd_table[fd] = file;
+    return fd;
+}
+
+// SYS_OPENAT - open a file relative to dirfd
+static int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags, uint64_t mode) {
+    (void)mode;
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (!validate_user_ptr(pathname, 1)) return -EFAULT;
+    const char* upath = (const char*)pathname;
+    char full[VFS_MAX_PATH];
+    int ret;
+    if (upath[0] == '/') {
+        size_t i = 0;
+        for (; upath[i] && i < sizeof(full) - 1; ++i) full[i] = upath[i];
+        full[i] = '\0';
+    } else {
+        ret = build_at_path(cur, (int)dirfd, upath, full, sizeof(full));
+        if (ret != 0) return ret;
+    }
+    int fd = alloc_fd(cur);
+    if (fd < 0) {
+        return fd;
+    }
+    vfs_file_t* file = NULL;
+    if (full[0] == '/' && full[1] == 'd' && full[2] == 'e' && full[3] == 'v' &&
+        (full[4] == '/' || full[4] == '\0')) {
+        ret = devfs_open_for_task(full, (int)flags, &file, cur);
+        if (ret == ST_OK && file) {
+            file->refcount = 1;
+            file->flags = (int)flags;
+        }
+    } else {
+        ret = vfs_open(full, (int)flags, &file);
+    }
+    if (ret != ST_OK || file == NULL) {
+        return -EACCES;
+    }
     cur->fd_table[fd] = file;
     return fd;
 }
@@ -478,8 +527,11 @@ static int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence) {
     return result;
 }
 
-static int64_t sys_stat_common(const char* path, uint64_t stat_buf) {
-    if (!validate_user_ptr((uint64_t)path, 1) || !validate_user_ptr(stat_buf, sizeof(struct kstat))) {
+static int64_t sys_stat_common(const char* path, uint64_t stat_buf, int validate_path) {
+    if (!path || !validate_user_ptr(stat_buf, sizeof(struct kstat))) {
+        return -EFAULT;
+    }
+    if (validate_path && !validate_user_ptr((uint64_t)path, 1)) {
         return -EFAULT;
     }
     struct kstat st;
@@ -492,11 +544,31 @@ static int64_t sys_stat_common(const char* path, uint64_t stat_buf) {
 }
 
 static int64_t sys_stat(uint64_t pathname, uint64_t stat_buf) {
-    return sys_stat_common((const char*)pathname, stat_buf);
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (!validate_user_ptr(pathname, 1)) return -EFAULT;
+    const char* path = (const char*)pathname;
+    if (path[0] == '/') {
+        return sys_stat_common(path, stat_buf, 1);
+    }
+    char full[VFS_MAX_PATH];
+    int ret = build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
+    if (ret != 0) return ret;
+    return sys_stat_common(full, stat_buf, 0);
 }
 
 static int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf) {
-    return sys_stat_common((const char*)pathname, stat_buf);
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (!validate_user_ptr(pathname, 1)) return -EFAULT;
+    const char* path = (const char*)pathname;
+    if (path[0] == '/') {
+        return sys_stat_common(path, stat_buf, 1);
+    }
+    char full[VFS_MAX_PATH];
+    int ret = build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
+    if (ret != 0) return ret;
+    return sys_stat_common(full, stat_buf, 0);
 }
 
 static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf) {
@@ -538,17 +610,88 @@ static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf) {
     return 0;
 }
 
-static int64_t sys_access(uint64_t pathname, uint64_t mode) {
-    (void)mode;
-    if (!validate_user_ptr(pathname, 1)) {
+static int64_t sys_fstatat(uint64_t dirfd, uint64_t pathname, uint64_t stat_buf, uint64_t flags) {
+    (void)flags;
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (!validate_user_ptr(pathname, 1) || !validate_user_ptr(stat_buf, sizeof(struct kstat))) {
         return -EFAULT;
     }
+    const char* upath = (const char*)pathname;
+    char full[VFS_MAX_PATH];
+    if (upath[0] == '/') {
+        size_t i = 0;
+        for (; upath[i] && i < sizeof(full) - 1; ++i) full[i] = upath[i];
+        full[i] = '\0';
+    } else {
+        int ret = build_at_path(cur, (int)dirfd, upath, full, sizeof(full));
+        if (ret != 0) return ret;
+    }
+    return sys_stat_common(full, stat_buf, 0);
+}
+
+static int64_t sys_access(uint64_t pathname, uint64_t mode) {
+    (void)mode;
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (!validate_user_ptr(pathname, 1)) return -EFAULT;
+    const char* path = (const char*)pathname;
+    char full[VFS_MAX_PATH];
+    if (path[0] != '/') {
+        int retb = build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
+        if (retb != 0) return retb;
+        path = full;
+    }
     struct kstat st;
-    int ret = vfs_stat((const char*)pathname, &st);
+    int ret = vfs_stat(path, &st);
     if (ret != ST_OK) {
         return (ret == ST_NOT_FOUND) ? -ENOENT : -EINVAL;
     }
     return 0;
+}
+
+static int64_t sys_faccessat(uint64_t dirfd, uint64_t pathname, uint64_t mode, uint64_t flags) {
+    (void)mode; (void)flags;
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (!validate_user_ptr(pathname, 1)) {
+        return -EFAULT;
+    }
+    const char* upath = (const char*)pathname;
+    char full[VFS_MAX_PATH];
+    if (upath[0] == '/') {
+        size_t i = 0;
+        for (; upath[i] && i < sizeof(full) - 1; ++i) full[i] = upath[i];
+        full[i] = '\0';
+    } else {
+        int ret = build_at_path(cur, (int)dirfd, upath, full, sizeof(full));
+        if (ret != 0) return ret;
+    }
+    struct kstat st;
+    int st_ret = vfs_stat(full, &st);
+    if (st_ret != ST_OK) {
+        return (st_ret == ST_NOT_FOUND) ? -ENOENT : -EINVAL;
+    }
+    return 0;
+}
+
+static int64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (count == 0) return 0;
+    if (!validate_user_ptr(dirp, count)) return -EFAULT;
+    if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) return -EBADF;
+    vfs_file_t* file = cur->fd_table[fd];
+    uint64_t marker = (uint64_t)file;
+    if (marker >= 1 && marker <= 3) return -ENOTDIR;
+    if (pipe_is_end(file)) return -ENOTDIR;
+    long ret = vfs_readdir(file, (void*)dirp, (long)count);
+    if (ret == ST_UNSUPPORTED) return -ENOTDIR;
+    return ret;
+}
+
+static int64_t sys_getdents(uint64_t fd, uint64_t dirp, uint64_t count) {
+    return sys_getdents64(fd, dirp, count);
 }
 
 static int64_t sys_chdir(uint64_t pathname) {
@@ -558,21 +701,20 @@ static int64_t sys_chdir(uint64_t pathname) {
         return -EFAULT;
     }
     const char* path = (const char*)pathname;
-    int st = vfs_chdir(path);
-    if (st == ST_NOT_FOUND) return -ENOENT;
-    if (st != ST_OK) return -ENOTDIR;
-    // Update task cwd string (best-effort, no canonicalization)
+    char full[VFS_MAX_PATH];
+    const char* cwd = (cur->cwd[0] != 0) ? cur->cwd : "/";
+    int ret = normalize_path(cwd, path, full, sizeof(full));
+    if (ret != 0) return ret;
+    struct kstat st;
+    int vret = vfs_stat(full, &st);
+    if (vret == ST_NOT_FOUND) return -ENOENT;
+    if (vret != ST_OK) return -ENOTDIR;
+    if ((st.st_mode & S_IFMT) != S_IFDIR) return -ENOTDIR;
+    // Update task cwd string with canonical absolute path
     mm_memset(cur->cwd, 0, sizeof(cur->cwd));
-    if (path[0] == '/') {
-        size_t i = 0;
-        for (; path[i] && i < sizeof(cur->cwd) - 1; ++i) cur->cwd[i] = path[i];
-        cur->cwd[i] = '\0';
-    } else {
-        cur->cwd[0] = '/';
-        size_t i = 0;
-        for (; path[i] && (i + 1) < sizeof(cur->cwd) - 1; ++i) cur->cwd[i + 1] = path[i];
-        cur->cwd[i + 1] = '\0';
-    }
+    size_t i = 0;
+    for (; full[i] && i < sizeof(cur->cwd) - 1; ++i) cur->cwd[i] = full[i];
+    cur->cwd[i] = '\0';
     return 0;
 }
 
@@ -881,6 +1023,96 @@ static int64_t sys_fchmod(uint64_t fd, uint64_t mode) { (void)fd; (void)mode; re
 static int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group) { (void)pathname; (void)owner; (void)group; return -ENOSYS; }
 static int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group) { (void)fd; (void)owner; (void)group; return -ENOSYS; }
 
+static int normalize_path(const char* base, const char* path, char* out, size_t out_size) {
+    if (!path || !out || out_size < 2) return -EINVAL;
+    const char* base_path = (base && base[0]) ? base : "/";
+    char combined[VFS_MAX_PATH];
+    size_t ci = 0;
+
+    if (path[0] == '/') {
+        // Absolute path: copy as-is into combined
+        while (path[ci] && ci < sizeof(combined) - 1) {
+            combined[ci] = path[ci];
+            ci++;
+        }
+    } else {
+        // Relative path: base + '/' + path
+        size_t bi = 0;
+        while (base_path[bi] && ci < sizeof(combined) - 1) {
+            combined[ci++] = base_path[bi++];
+        }
+        if (ci == 0 || combined[ci - 1] != '/') {
+            if (ci < sizeof(combined) - 1) combined[ci++] = '/';
+        }
+        size_t pi = 0;
+        while (path[pi] && ci < sizeof(combined) - 1) {
+            combined[ci++] = path[pi++];
+        }
+    }
+    combined[ci] = '\0';
+
+    // Normalize combined into out
+    size_t out_len = 0;
+    size_t seg_stack[64];
+    size_t seg_top = 0;
+
+    out[out_len++] = '/';
+    size_t i = 0;
+    while (combined[i]) {
+        while (combined[i] == '/') i++;
+        if (!combined[i]) break;
+        char segment[64];
+        size_t si = 0;
+        while (combined[i] && combined[i] != '/' && si < sizeof(segment) - 1) {
+            segment[si++] = combined[i++];
+        }
+        segment[si] = '\0';
+
+        if (segment[0] == '\0' || (segment[0] == '.' && segment[1] == '\0')) {
+            continue;
+        }
+        if (segment[0] == '.' && segment[1] == '.' && segment[2] == '\0') {
+            if (seg_top > 0) {
+                out_len = seg_stack[--seg_top];
+                out[out_len] = '\0';
+            } else {
+                out_len = 1;
+                out[1] = '\0';
+            }
+            continue;
+        }
+
+        if (out_len > 1 && out[out_len - 1] != '/') {
+            if (out_len < out_size - 1) out[out_len++] = '/';
+        }
+        if (out_len >= out_size - 1) return -EINVAL;
+        seg_stack[seg_top++] = out_len;
+        for (size_t j = 0; j < si && out_len < out_size - 1; ++j) {
+            out[out_len++] = segment[j];
+        }
+        out[out_len] = '\0';
+        if (seg_top >= (sizeof(seg_stack) / sizeof(seg_stack[0]))) {
+            return -EINVAL;
+        }
+    }
+
+    if (out_len > 1 && out[out_len - 1] == '/') {
+        out[out_len - 1] = '\0';
+    } else {
+        out[out_len] = '\0';
+    }
+    return 0;
+}
+
+static int build_at_path(task_t* cur, int dirfd, const char* path, char* out, size_t out_size) {
+    if (!cur || !path || !out || out_size < 2) return -EINVAL;
+    if (dirfd != AT_FDCWD) {
+        return -ENOTDIR;
+    }
+    const char* cwd = (cur->cwd[0] != 0) ? cur->cwd : "/";
+    return normalize_path(cwd, path, out, out_size);
+}
+
 // SYS_BRK - set program break
 static int64_t sys_brk(uint64_t new_brk) {
     task_t* cur = sched_current();
@@ -1146,6 +1378,12 @@ static void sys_exit(uint64_t status) {
 extern uint64_t syscall_saved_user_rip;
 extern uint64_t syscall_saved_user_rsp;
 extern uint64_t syscall_saved_user_rflags;
+extern uint64_t syscall_saved_user_rbp;
+extern uint64_t syscall_saved_user_rbx;
+extern uint64_t syscall_saved_user_r12;
+extern uint64_t syscall_saved_user_r13;
+extern uint64_t syscall_saved_user_r14;
+extern uint64_t syscall_saved_user_r15;
 
 // External: user_mode_iret_trampoline from syscall.asm
 extern void user_mode_iret_trampoline(void);
@@ -1173,13 +1411,22 @@ static int64_t sys_fork(void) {
     // When the child is scheduled, it will resume at user_rip with fork() returning 0
     // 
     // Stack layout (from top to bottom):
-    // 1. IRET frame: SS, RSP, RFLAGS, CS, RIP (to return to userspace)
-    // 2. RAX value (0 for child's fork return value)
-    // 3. Saved callee-saved registers for ctx_switch_asm (r15-rbp)
-    // 4. Return address (fork_child_return trampoline)
+    // 1. Saved user callee-saved registers (RBP, RBX, R12-R15)
+    // 2. IRET frame: SS, RSP, RFLAGS, CS, RIP (to return to userspace)
+    // 3. RAX value (0 for child's fork return value)
+    // 4. Saved callee-saved registers for ctx_switch_asm (r15-rbp)
+    // 5. Return address (fork_child_return trampoline)
     
     uint64_t* k_sp = (uint64_t*)child->kernel_stack_top;
     k_sp = (uint64_t*)((uint64_t)k_sp & ~0xFUL);  // Align to 16 bytes
+    
+    // Push user callee-saved registers (fork_child_return will restore these)
+    *(--k_sp) = syscall_saved_user_r15;
+    *(--k_sp) = syscall_saved_user_r14;
+    *(--k_sp) = syscall_saved_user_r13;
+    *(--k_sp) = syscall_saved_user_r12;
+    *(--k_sp) = syscall_saved_user_rbx;
+    *(--k_sp) = syscall_saved_user_rbp;
     
     // Push IRET frame (used by fork_child_return to return to userspace)
     *(--k_sp) = 0x1B;                    // SS: user data segment
@@ -1193,12 +1440,12 @@ static int64_t sys_fork(void) {
     
     // Push callee-saved registers (ctx_switch_asm will restore these)
     *(--k_sp) = (uint64_t)fork_child_return;  // Return address: sets RAX=0 and does IRET
-    *(--k_sp) = 0; // RBP
-    *(--k_sp) = 0; // RBX
-    *(--k_sp) = 0; // R12
-    *(--k_sp) = 0; // R13
-    *(--k_sp) = 0; // R14
-    *(--k_sp) = 0; // R15
+    *(--k_sp) = 0; // RBP (kernel)
+    *(--k_sp) = 0; // RBX (kernel)
+    *(--k_sp) = 0; // R12 (kernel)
+    *(--k_sp) = 0; // R13 (kernel)
+    *(--k_sp) = 0; // R14 (kernel)
+    *(--k_sp) = 0; // R15 (kernel)
     
     child->sp = k_sp;
     
@@ -1258,7 +1505,8 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options) {
     return child_pid;
 }
 
-// SYS_EXECVE - execute a new program (spawns and exits current)
+// SYS_EXECVE - execute a new program, replacing current process image
+// This is the POSIX-compliant version that replaces the current task
 static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr, uint64_t envp_ptr) {
     if (!validate_user_ptr(pathname, 1)) {
         return -EFAULT;
@@ -1290,20 +1538,54 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr, uint64_t envp_pt
         return ret;
     }
 
-    int exec_ret = elf_exec(kpath, kargv, kenvp, NULL);
+    uint64_t new_stack_ptr = 0;
+    uint64_t entry_point = elf_exec_replace(kpath, kargv, kenvp, &new_stack_ptr);
 
     free_user_string_array(kenvp);
     free_user_string_array(kargv);
     kfree(kpath);
 
-    if (exec_ret == 0) {
-        sys_exit(0);
-        return 0;
+    if (entry_point == 0) {
+        // exec failed, return error to caller
+        return -ENOEXEC;
     }
 
-    if (exec_ret == -1) return -EACCES;
-    if (exec_ret == -3 || exec_ret == -5 || exec_ret == -8 || exec_ret == -10) return -ENOMEM;
-    return -ENOEXEC;
+    // Success! Jump to the new program
+    // We need to return to userspace at the new entry point with the new stack
+    // Use inline assembly to set up IRET frame and jump
+    __asm__ volatile (
+        "cli\n\t"
+        // Set up IRET frame on current stack
+        "push $0x1B\n\t"        // SS (user data segment)
+        "push %0\n\t"           // RSP (new user stack)
+        "pushfq\n\t"            // RFLAGS
+        "orq $0x200, (%%rsp)\n\t" // Enable interrupts in RFLAGS
+        "push $0x23\n\t"        // CS (user code segment)
+        "push %1\n\t"           // RIP (entry point)
+        // Clear registers for clean start
+        "xor %%rax, %%rax\n\t"
+        "xor %%rbx, %%rbx\n\t"
+        "xor %%rcx, %%rcx\n\t"
+        "xor %%rdx, %%rdx\n\t"
+        "xor %%rsi, %%rsi\n\t"
+        "xor %%rdi, %%rdi\n\t"
+        "xor %%rbp, %%rbp\n\t"
+        "xor %%r8, %%r8\n\t"
+        "xor %%r9, %%r9\n\t"
+        "xor %%r10, %%r10\n\t"
+        "xor %%r11, %%r11\n\t"
+        "xor %%r12, %%r12\n\t"
+        "xor %%r13, %%r13\n\t"
+        "xor %%r14, %%r14\n\t"
+        "xor %%r15, %%r15\n\t"
+        "iretq\n\t"
+        :
+        : "r"(new_stack_ptr), "r"(entry_point)
+        : "memory"
+    );
+    
+    // Should never reach here
+    __builtin_unreachable();
 }
 
 
@@ -1642,6 +1924,16 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
 
         case SYS_CHOWN:
             return sys_chown(a1, a2, a3);
+        case SYS_OPENAT:
+            return sys_openat(a1, a2, a3, a4);
+        case SYS_FSTATAT:
+            return sys_fstatat(a1, a2, a3, a4);
+        case SYS_FACCESSAT:
+            return sys_faccessat(a1, a2, a3, a4);
+        case SYS_GETDENTS64:
+            return sys_getdents64(a1, a2, a3);
+        case SYS_GETDENTS:
+            return sys_getdents(a1, a2, a3);
 
         case SYS_FCHOWN:
             return sys_fchown(a1, a2, a3);

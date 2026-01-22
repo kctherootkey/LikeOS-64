@@ -66,6 +66,14 @@
 #define SYS_FCHMOD      239
 #define SYS_CHOWN       240
 #define SYS_FCHOWN      241
+#define SYS_OPENAT      242
+#define SYS_FSTATAT     243
+#define SYS_FACCESSAT   244
+#define SYS_GETDENTS64  245
+#define SYS_GETDENTS    246
+
+// Special dirfd value for *at() syscalls
+#define AT_FDCWD        -100
 
 // File descriptor limits
 #define MAX_FDS         1024

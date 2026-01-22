@@ -140,4 +140,9 @@ int elf_load_user(const void* elf_data, size_t elf_size,
 // Returns 0 on success (task created), negative error code on failure
 int elf_exec(const char* path, char* const argv[], char* const envp[], struct task** out_task);
 
+// Execute ELF file, replacing current task's memory (for execve semantics)
+// Returns: entry point address on success, 0 on failure
+// On success, *out_stack_ptr is set to the new user stack pointer
+uint64_t elf_exec_replace(const char* path, char* const argv[], char* const envp[], uint64_t* out_stack_ptr);
+
 #endif // _KERNEL_ELF_H_

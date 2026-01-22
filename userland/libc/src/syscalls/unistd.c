@@ -23,6 +23,15 @@ int open(const char* pathname, int flags, ...) {
     return ret;
 }
 
+int openat(int dirfd, const char* pathname, int flags, ...) {
+    long ret = syscall4(SYS_OPENAT, dirfd, (long)pathname, flags, 0);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return ret;
+}
+
 ssize_t read(int fd, void* buf, size_t count) {
     long ret = syscall3(SYS_READ, fd, (long)buf, count);
     if (ret < 0) {
@@ -60,7 +69,11 @@ int pipe(int pipefd[2]) {
 }
 
 int access(const char* path, int mode) {
-    long ret = syscall2(SYS_ACCESS, (long)path, mode);
+    return faccessat(AT_FDCWD, path, mode, 0);
+}
+
+int faccessat(int dirfd, const char* path, int mode, int flags) {
+    long ret = syscall4(SYS_FACCESSAT, dirfd, (long)path, mode, flags);
     if (ret < 0) { errno = -ret; return -1; }
     return 0;
 }
@@ -91,6 +104,12 @@ int lstat(const char* path, struct stat* st) {
 
 int fstat(int fd, struct stat* st) {
     long ret = syscall2(SYS_FSTAT, fd, (long)st);
+    if (ret < 0) { errno = -ret; return -1; }
+    return 0;
+}
+
+int fstatat(int dirfd, const char* path, struct stat* st, int flags) {
+    long ret = syscall4(SYS_FSTATAT, dirfd, (long)path, (long)st, flags);
     if (ret < 0) { errno = -ret; return -1; }
     return 0;
 }
@@ -512,6 +531,18 @@ int symlink(const char* target, const char* linkpath) {
 
 int readlink(const char* path, char* buf, size_t bufsiz) {
     long ret = syscall3(SYS_READLINK, (long)path, (long)buf, bufsiz);
+    if (ret < 0) { errno = -ret; return -1; }
+    return (int)ret;
+}
+
+int getdents64(int fd, void* dirp, unsigned int count) {
+    long ret = syscall3(SYS_GETDENTS64, fd, (long)dirp, count);
+    if (ret < 0) { errno = -ret; return -1; }
+    return (int)ret;
+}
+
+int getdents(int fd, struct dirent* dirp, unsigned int count) {
+    long ret = syscall3(SYS_GETDENTS, fd, (long)dirp, count);
     if (ret < 0) { errno = -ret; return -1; }
     return (int)ret;
 }

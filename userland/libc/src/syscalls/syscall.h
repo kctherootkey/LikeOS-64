@@ -62,6 +62,11 @@
 #define SYS_FCHMOD      239
 #define SYS_CHOWN       240
 #define SYS_FCHOWN      241
+#define SYS_OPENAT      242
+#define SYS_FSTATAT     243
+#define SYS_FACCESSAT   244
+#define SYS_GETDENTS64  245
+#define SYS_GETDENTS    246
 
 // Syscall wrapper - uses inline assembly to invoke syscall instruction
 static inline long syscall0(long number) {

@@ -9,6 +9,7 @@ STDIO_SRC = src/stdio/stdio.c
 STRING_SRC = src/string/string.c
 STDLIB_SRC = src/stdlib/stdlib.c
 CTYPE_SRC = src/ctype/ctype.c
+DIR_SRC = src/dirent/dirent.c
 SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c
 CRT0_SRC = src/crt0.S
 
@@ -18,11 +19,12 @@ STDIO_OBJ = $(STDIO_SRC:.c=.o)
 STRING_OBJ = $(STRING_SRC:.c=.o)
 STDLIB_OBJ = $(STDLIB_SRC:.c=.o)
 CTYPE_OBJ = $(CTYPE_SRC:.c=.o)
+DIR_OBJ = $(DIR_SRC:.c=.o)
 SYSCALLS_OBJ = $(SYSCALLS_SRC:.c=.o)
 CRT0_OBJ = $(CRT0_SRC:.S=.o)
 
 ALL_OBJ = $(MALLOC_OBJ) $(STDIO_OBJ) $(STRING_OBJ) $(STDLIB_OBJ) \
-          $(CTYPE_OBJ) $(SYSCALLS_OBJ)
+		  $(CTYPE_OBJ) $(DIR_OBJ) $(SYSCALLS_OBJ)
 
 # Output
 LIBC = libc.a
