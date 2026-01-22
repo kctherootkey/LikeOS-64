@@ -64,6 +64,12 @@ int readlink(const char* path, char* buf, size_t bufsiz);
 int chown(const char* path, int owner, int group);
 int fchown(int fd, int owner, int group);
 
+// PTY helpers
+int posix_openpt(int flags);
+int grantpt(int fd);
+int unlockpt(int fd);
+char* ptsname(int fd);
+
 // Scheduling
 int sched_yield(void);
 

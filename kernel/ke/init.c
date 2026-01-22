@@ -15,6 +15,8 @@
 #include "../../include/kernel/shell.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/tty.h"
+#include "../../include/kernel/devfs.h"
 
 void system_startup(boot_info_t* boot_info);
 void kernel_main(boot_info_t* boot_info);
@@ -60,6 +62,9 @@ void system_startup(boot_info_t* boot_info) {
     pci_assign_unassigned_bars();
 
     vfs_init();
+    devfs_init();
+    vfs_register_devfs(devfs_get_ops());
+    tty_init();
     xhci_boot_init(&g_xhci_boot);
     storage_fs_init(&g_storage_state);
 
@@ -86,6 +91,7 @@ void system_startup(boot_info_t* boot_info) {
     timer_start();
 
     shell_init();
+    storage_fs_set_ready(&g_storage_state);
 
     while (1) {
         __asm__ volatile ("sti");

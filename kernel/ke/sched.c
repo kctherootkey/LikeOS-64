@@ -6,6 +6,8 @@
 #include "../../include/kernel/types.h"
 #include "../../include/kernel/vfs.h"
 #include "../../include/kernel/pipe.h"
+#include "../../include/kernel/tty.h"
+#include "../../include/kernel/signal.h"
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
@@ -78,6 +80,11 @@ void sched_init(void) {
     g_bootstrap_task.next = &g_bootstrap_task;
     g_bootstrap_task.user_stack_top = 0;
     g_bootstrap_task.kernel_stack_top = 0;
+    g_bootstrap_task.pgid = 0;
+    g_bootstrap_task.sid = 0;
+    g_bootstrap_task.ctty = NULL;
+    g_bootstrap_task.wait_next = NULL;
+    g_bootstrap_task.wait_channel = NULL;
     g_current = &g_bootstrap_task;
 
     sched_add_task(idle_entry, 0, g_idle_stack, sizeof(g_idle_stack));
@@ -112,6 +119,11 @@ void sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack
     t->id = g_next_id++;
     t->user_stack_top = 0;
     t->kernel_stack_top = 0;
+    t->pgid = 0;
+    t->sid = 0;
+    t->ctty = NULL;
+    t->wait_next = NULL;
+    t->wait_channel = NULL;
     
     // Initialize process hierarchy
     t->parent = NULL;
@@ -184,6 +196,11 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
     t->id = g_next_id++;
     t->user_stack_top = user_stack;
     t->kernel_stack_top = (uint64_t)(k_stack_mem + 4096);
+    t->pgid = t->id;
+    t->sid = t->id;
+    t->ctty = tty_get_console();
+    t->wait_next = NULL;
+    t->wait_channel = NULL;
     
     // Initialize process hierarchy
     t->parent = NULL;
@@ -351,7 +368,7 @@ int sched_has_user_tasks(void) {
     int count = 0;
     do {
         if (t->privilege == TASK_USER) {
-            if (t->state != TASK_ZOMBIE && !is_idle_task(t)) {
+            if ((t->state == TASK_READY || t->state == TASK_RUNNING || t->state == TASK_BLOCKED) && !is_idle_task(t)) {
                 count++;
             }
         }
@@ -551,6 +568,8 @@ task_t* sched_fork_current(void) {
     child->exit_code = 0;
     child->has_exited = false;
     child->is_fork_child = true;  // Child should return 0 from fork
+    child->wait_next = NULL;
+    child->wait_channel = NULL;
     
     // Add to parent's child list
     sched_add_child(cur, child);
@@ -624,5 +643,84 @@ void sched_reap_zombies(task_t* parent) {
     for (int i = 0; i < zombie_count; i++) {
         sched_remove_task(zombies[i]);
     }
+}
+
+void sched_mark_task_exited(task_t* task, int status) {
+    if (!task) {
+        return;
+    }
+    task->exit_code = status;
+
+    // Close all open file descriptors
+    for (int i = 0; i < TASK_MAX_FDS; i++) {
+        if (task->fd_table[i]) {
+            uint64_t marker = (uint64_t)task->fd_table[i];
+            if (marker >= 1 && marker <= 3) {
+                task->fd_table[i] = NULL;
+            } else if (pipe_is_end(task->fd_table[i])) {
+                pipe_close_end((pipe_end_t*)task->fd_table[i]);
+                task->fd_table[i] = NULL;
+            } else {
+                vfs_close(task->fd_table[i]);
+                task->fd_table[i] = NULL;
+            }
+        }
+    }
+
+    sched_reparent_children(task);
+
+    __asm__ volatile ("cli");
+    task->has_exited = true;
+    task->state = TASK_ZOMBIE;
+}
+
+void sched_signal_task(task_t* task, int sig) {
+    if (!task) {
+        return;
+    }
+    if (sig == SIGCONT) {
+        if (task->state == TASK_STOPPED) {
+            task->state = TASK_READY;
+        }
+        return;
+    }
+    if (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) {
+        task->state = TASK_STOPPED;
+        if (task == sched_current()) {
+            sched_yield();
+        }
+        return;
+    }
+    // Default: terminate task
+    sched_mark_task_exited(task, 128 + sig);
+}
+
+void sched_signal_pgrp(int pgid, int sig) {
+    if (pgid <= 0 || !g_current) {
+        return;
+    }
+    task_t* start = g_current;
+    task_t* t = g_current;
+    do {
+        if (t->pgid == pgid && t->state != TASK_ZOMBIE) {
+            sched_signal_task(t, sig);
+        }
+        t = t->next;
+    } while (t && t != start);
+}
+
+int sched_pgid_exists(int pgid) {
+    if (pgid <= 0 || !g_current) {
+        return 0;
+    }
+    task_t* start = g_current;
+    task_t* t = g_current;
+    do {
+        if (t->pgid == pgid && t->state != TASK_ZOMBIE) {
+            return 1;
+        }
+        t = t->next;
+    } while (t && t != start);
+    return 0;
 }
 

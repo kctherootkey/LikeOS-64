@@ -139,18 +139,14 @@ static void test_mmap(void) {
 static void test_read(void) {
     printf(TEST_INFO "Testing read()...\n");
     
-    // Non-blocking read from stdin - may return 0 if no input available
+    // stdin is blocking now; use zero-length read to avoid blocking
     char buf[16];
-    ssize_t ret = read(0, buf, sizeof(buf));
-    
-    // Read from stdin should return 0 (no data) or positive (if keys pressed)
-    test_result(ret >= 0, "read from stdin returns >= 0");
+    ssize_t ret = read(0, buf, 0);
+    test_result(ret == 0, "read(stdin, 0) returns 0");
     
     // Read from invalid fd should fail
     ret = read(999, buf, sizeof(buf));
     test_result(ret < 0, "read from invalid fd returns error");
-    
-    printf("  (stdin read is non-blocking, returned %zd bytes)\n", ret);
 }
 
 // Test open/close syscalls

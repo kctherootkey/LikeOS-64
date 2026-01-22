@@ -41,6 +41,7 @@ struct vfs_file {
 
 int vfs_init(void);
 int vfs_register_root(const vfs_ops_t* ops);
+int vfs_register_devfs(const vfs_ops_t* ops);
 int vfs_open(const char* path, int flags, vfs_file_t** out);
 int vfs_stat(const char* path, struct kstat* st);
 int vfs_chdir(const char* path);

@@ -7,6 +7,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/elf.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/tty.h"
 
 // Simple path stack for prompt (stores directory names after root)
 #define SHELL_MAX_DEPTH 16
@@ -29,6 +30,31 @@ static void shell_ls_cb(const char* name, unsigned attr, unsigned long size) {
     }
     shell_ls_count++;
     kprintf("%s %c %lu\n", name, (attr & 0x10) ? 'd' : '-', size);
+}
+
+static void shell_ls_dev(const char* path) {
+    if (!path || path[0] == '\0' || (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && (path[4] == '\0' || (path[4] == '/' && path[5] == '\0')))) {
+        kprintf("tty %c 0\n", '-');
+        kprintf("console %c 0\n", '-');
+        kprintf("tty0 %c 0\n", '-');
+        kprintf("ptmx %c 0\n", '-');
+        kprintf("pts %c 0\n", 'd');
+        return;
+    }
+    if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && path[4] == '/' && path[5] == 'p' && path[6] == 't' && path[7] == 's' && (path[8] == '\0' || (path[8] == '/' && path[9] == '\0'))) {
+        int any = 0;
+        for (int i = 0; i < 16; ++i) {
+            if (tty_pty_is_allocated(i)) {
+                any = 1;
+                kprintf("%d %c 0\n", i, '-');
+            }
+        }
+        if (!any) {
+            kprintf("(empty)\n");
+        }
+        return;
+    }
+    kprintf("ls: path not found\n");
 }
 
 static void shell_path_reset(void) {
@@ -57,6 +83,7 @@ static void shell_path_pop(void) {
 static void shell_prompt(void) {
     if (fat32_get_cwd() == fat32_root_cluster()) {
         kprintf("/ # ");
+        console_set_prompt_guard();
         return;
     }
     kprintf("/");
@@ -64,6 +91,7 @@ static void shell_prompt(void) {
         kprintf("%s/", shell_path_names[i]);
     }
     kprintf(" # ");
+    console_set_prompt_guard();
 }
 
 void shell_redisplay_prompt(void) {
@@ -72,10 +100,8 @@ void shell_redisplay_prompt(void) {
 }
 
 void shell_init(void) {
-    console_set_color(11, 0);
-    kprintf("\nSystem ready! Type to test keyboard input:\n");
     shell_path_reset();
-    shell_prompt();
+    tty_reset_termios(tty_get_console());
     console_set_color(15, 0);
     console_cursor_enable();  // Enable blinking cursor
 }
@@ -92,6 +118,11 @@ int shell_tick(void) {
             if (cur) {
                 sched_reap_zombies(cur);
             }
+            tty_t* tty = tty_get_console();
+            if (tty) {
+                tty->fg_pgid = 0;
+                tty_reset_termios(tty);
+            }
             shell_waiting_for_program = 0;
             kprintf("\n");
             shell_prompt();
@@ -101,62 +132,83 @@ int shell_tick(void) {
         return 1;  // Return 1 to prevent HLT so we keep checking task completion
     }
     
-    char c = keyboard_get_char();
-
-    if (c == 0) {
+    char in_buf[64];
+    long r = tty_read(tty_get_console(), in_buf, sizeof(in_buf), 1);
+    if (r <= 0) {
         return 0;
     }
 
-    // If user is scrolled up, snap back to bottom on any keypress
+    // If user is scrolled up, snap back to bottom on any input
     console_scroll_to_bottom();
 
-    if (c == '\n') {
-        cmd_buf[cmd_len] = '\0';
-        kprintf("\n");
-        if (cmd_len > 0) {
-            // Tokenize command line (simple whitespace split, no quotes)
-            char* argv[SHELL_MAX_ARGS + 1];
-            int argc = 0;
+    for (long ri = 0; ri < r; ++ri) {
+        char c = in_buf[ri];
+        if (c == '\b' || c == 127) {
+            if (cmd_len > 0) {
+                cmd_len--;
+            }
+            continue;
+        }
+        if (c == '\n') {
             cmd_buf[cmd_len] = '\0';
-            char* p = cmd_buf;
-            while (*p && argc < SHELL_MAX_ARGS) {
-                while (*p == ' ') p++;
-                if (!*p) break;
-                argv[argc++] = p;
-                while (*p && *p != ' ') p++;
-                if (*p) {
-                    *p = '\0';
-                    p++;
+            if (cmd_len > 0) {
+                // Tokenize command line (simple whitespace split, no quotes)
+                char* argv[SHELL_MAX_ARGS + 1];
+                int argc = 0;
+                char* p = cmd_buf;
+                while (*p && argc < SHELL_MAX_ARGS) {
+                    while (*p == ' ') p++;
+                    if (!*p) break;
+                    argv[argc++] = p;
+                    while (*p && *p != ' ') p++;
+                    if (*p) {
+                        *p = '\0';
+                        p++;
+                    }
                 }
-            }
-            argv[argc] = 0;
-            if (argc == 0) {
-                goto after_cmd;
-            }
+                argv[argc] = 0;
+                if (argc == 0) {
+                    goto after_cmd;
+                }
 
-            const char* cmd = argv[0];
-            int is_ls = (kstrcmp(cmd, "ls") == 0);
-            int is_cat = (kstrcmp(cmd, "cat") == 0);
-            int is_cd = (kstrcmp(cmd, "cd") == 0);
-            int is_pwd = (kstrcmp(cmd, "pwd") == 0);
-            int is_stat = (kstrcmp(cmd, "stat") == 0);
-            int is_help = (kstrcmp(cmd, "help") == 0);
-            if (is_help) {
-                kprintf("LikeOS-64 Shell - Available Commands:\n");
-                kprintf("  ls [path]      - List directory contents\n");
-                kprintf("  cd <dir>       - Change directory\n");
-                kprintf("  pwd            - Print working directory\n");
-                kprintf("  cat <file>     - Display file contents\n");
-                kprintf("  stat <path>    - Show file/directory information\n");
-                kprintf("  help           - Display this help message\n");
-                kprintf("  <cmd> [args]   - Execute program via PATH (/), ./, or absolute path\n");
-            } else if (is_ls) {
-                if (block_count() > 0) {
+                const char* cmd = argv[0];
+                int is_ls = (kstrcmp(cmd, "ls") == 0);
+                int is_cat = (kstrcmp(cmd, "cat") == 0);
+                int is_cd = (kstrcmp(cmd, "cd") == 0);
+                int is_pwd = (kstrcmp(cmd, "pwd") == 0);
+                int is_stat = (kstrcmp(cmd, "stat") == 0);
+                int is_help = (kstrcmp(cmd, "help") == 0);
+                if (is_help) {
+                    kprintf("LikeOS-64 Shell - Available Commands:\n");
+                    kprintf("  ls [path]      - List directory contents\n");
+                    kprintf("  cd <dir>       - Change directory\n");
+                    kprintf("  pwd            - Print working directory\n");
+                    kprintf("  cat <file>     - Display file contents\n");
+                    kprintf("  stat <path>    - Show file/directory information\n");
+                    kprintf("  help           - Display this help message\n");
+                    kprintf("  <cmd> [args]   - Execute program via PATH (/), ./, or absolute path\n");
+                } else if (is_ls) {
+                    if (argc >= 2) {
+                        const char* path = argv[1];
+                        if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v') {
+                            shell_ls_dev(path);
+                            goto after_cmd;
+                        }
+                        if (path[0] == 'd' && path[1] == 'e' && path[2] == 'v' && (path[3] == '\0' || path[3] == '/')) {
+                            shell_ls_dev("/dev");
+                            goto after_cmd;
+                        }
+                    }
+                    if (block_count() > 0) {
                     unsigned long list_cluster;
                     if (argc < 2) {
                         list_cluster = fat32_get_cwd();
                     } else {
-                        const char* path = argv[1];
+                            const char* path = argv[1];
+                            if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v') {
+                                shell_ls_dev(path);
+                                goto after_cmd;
+                            }
                         unsigned a;
                         unsigned long fc;
                         unsigned long sz;
@@ -164,7 +216,7 @@ int shell_tick(void) {
                             if (a & 0x10) {
                                 list_cluster = fc;
                             } else {
-                                kprintf("ls: not a directory\n");
+                                kprintf("%s %c %lu\n", path, '-', sz);
                                 goto after_cmd;
                             }
                         } else {
@@ -185,8 +237,15 @@ int shell_tick(void) {
                     if (shell_ls_count == 0) {
                         kprintf("(empty)\n");
                     }
+                    if (argc < 2 && list_cluster == fat32_root_cluster()) {
+                        kprintf("dev %c 0\n", 'd');
+                    }
                 } else {
-                    kprintf("No block device yet\n");
+                    if (argc < 2) {
+                        kprintf("dev %c 0\n", 'd');
+                    } else {
+                        kprintf("No block device yet\n");
+                    }
                 }
             } else if (is_cd) {
                 if (argc < 2) {
@@ -334,32 +393,33 @@ int shell_tick(void) {
                 envp[0] = path_env;
                 envp[1] = NULL;
 
-                int ret = elf_exec(exec_path, exec_argv, envp, NULL);
+                task_t* spawned = NULL;
+                console_clear_prompt_guard();
+                int ret = elf_exec(exec_path, exec_argv, envp, &spawned);
                 if (ret != 0) {
                     kprintf("exec: failed (error %d)\n", ret);
                 } else {
+                    tty_t* tty = tty_get_console();
+                    if (tty && spawned) {
+                        tty->fg_pgid = spawned->pgid;
+                    }
                     // Program started successfully - wait for it to complete
                     shell_waiting_for_program = 1;
                 }
             }
 after_cmd:
-            ;
-        }
-        cmd_len = 0;
-        // Only show prompt if we're not waiting for a program
-        if (!shell_waiting_for_program) {
-            shell_prompt();
-            console_cursor_enable();  // Re-enable cursor after command
-        }
-    } else if (c == '\b') {
-        if (cmd_len > 0) {
-            console_backspace();
-            cmd_len--;
-        }
-    } else if (c >= ' ' && c <= '~') {
-        if (cmd_len < (int)(sizeof(cmd_buf) - 1)) {
-            cmd_buf[cmd_len++] = c;
-            kprintf("%c", c);
+                ;
+            }
+            cmd_len = 0;
+            // Only show prompt if we're not waiting for a program
+            if (!shell_waiting_for_program) {
+                shell_prompt();
+                console_cursor_enable();  // Re-enable cursor after command
+            }
+        } else if (c >= ' ' && c <= '~') {
+            if (cmd_len < (int)(sizeof(cmd_buf) - 1)) {
+                cmd_buf[cmd_len++] = c;
+            }
         }
     }
     return 1;

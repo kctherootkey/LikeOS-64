@@ -11,6 +11,9 @@
 #include "../../include/kernel/pipe.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/stat.h"
+#include "../../include/kernel/tty.h"
+#include "../../include/kernel/signal.h"
+#include "../../include/kernel/devfs.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
@@ -256,43 +259,37 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
         return -EFAULT;
     }
     
-    // Handle stdin specially (keyboard)
-    if (fd == STDIN_FD) {
-        char* ubuf = (char*)buf;
-        size_t read_count = 0;
-        
-        while (read_count < count) {
-            if (keyboard_buffer_has_data()) {
-                ubuf[read_count++] = keyboard_get_char();
-            } else {
-                // Non-blocking: return what we have
-                break;
-            }
-        }
-        return (int64_t)read_count;
+    vfs_file_t* file = NULL;
+    if (fd < TASK_MAX_FDS) {
+        file = cur->fd_table[fd];
     }
-    
-    // Handle regular file descriptors
-    if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) {
+    if (!file && fd == STDIN_FD) {
+        tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
+        if (tty && tty->fg_pgid == 0) {
+            tty->fg_pgid = cur->pgid;
+        }
+        if (tty && tty->fg_pgid != 0 && tty->fg_pgid != cur->pgid && (tty->term.c_lflag & ISIG)) {
+            sched_signal_task(cur, SIGTTIN);
+            return -EIO;
+        }
+        return tty_read(tty, (void*)buf, (long)count, 0);
+    }
+    if (!file) {
         return -EBADF;
     }
-    
-    vfs_file_t* file = cur->fd_table[fd];
     
     // Check for console dup markers (magic pointers 1, 2, 3)
     uint64_t marker = (uint64_t)file;
     if (marker == 1) {
-        // Dup'd stdin - read from keyboard
-        char* ubuf = (char*)buf;
-        size_t read_count = 0;
-        while (read_count < count) {
-            if (keyboard_buffer_has_data()) {
-                ubuf[read_count++] = keyboard_get_char();
-            } else {
-                break;
-            }
+        tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
+        if (tty && tty->fg_pgid == 0) {
+            tty->fg_pgid = cur->pgid;
         }
-        return (int64_t)read_count;
+        if (tty && tty->fg_pgid != 0 && tty->fg_pgid != cur->pgid && (tty->term.c_lflag & ISIG)) {
+            sched_signal_task(cur, SIGTTIN);
+            return -EIO;
+        }
+        return tty_read(tty, (void*)buf, (long)count, 0);
     } else if (marker == 2 || marker == 3) {
         // Can't read from stdout/stderr
         return -EBADF;
@@ -322,31 +319,37 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
         return -EFAULT;
     }
     
-    // Handle stdout/stderr (console)
-    if (fd == STDOUT_FD || fd == STDERR_FD) {
-        const char* ubuf = (const char*)buf;
-        for (size_t i = 0; i < count; i++) {
-            console_putchar(ubuf[i]);
-        }
-        return (int64_t)count;
+    vfs_file_t* file = NULL;
+    if (fd < TASK_MAX_FDS) {
+        file = cur->fd_table[fd];
     }
-    
-    // Regular file descriptors
-    if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) {
+    if (!file && (fd == STDOUT_FD || fd == STDERR_FD)) {
+        tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
+        if (tty && tty->fg_pgid == 0) {
+            tty->fg_pgid = cur->pgid;
+        }
+        if (tty && tty->fg_pgid != 0 && tty->fg_pgid != cur->pgid && (tty->term.c_lflag & ISIG)) {
+            sched_signal_task(cur, SIGTTOU);
+            return -EIO;
+        }
+        return tty_write(tty, (const void*)buf, (long)count);
+    }
+    if (!file) {
         return -EBADF;
     }
-    
-    vfs_file_t* file = cur->fd_table[fd];
     
     // Check for console dup markers (magic pointers 1, 2, 3)
     uint64_t marker = (uint64_t)file;
     if (marker == 2 || marker == 3) {
-        // Dup'd stdout/stderr - write to console
-        const char* ubuf = (const char*)buf;
-        for (size_t i = 0; i < count; i++) {
-            console_putchar(ubuf[i]);
+        tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
+        if (tty && tty->fg_pgid == 0) {
+            tty->fg_pgid = cur->pgid;
         }
-        return (int64_t)count;
+        if (tty && tty->fg_pgid != 0 && tty->fg_pgid != cur->pgid && (tty->term.c_lflag & ISIG)) {
+            sched_signal_task(cur, SIGTTOU);
+            return -EIO;
+        }
+        return tty_write(tty, (const void*)buf, (long)count);
     } else if (marker == 1) {
         // Can't write to stdin
         return -EBADF;
@@ -389,7 +392,17 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode) {
     }
     
     vfs_file_t* file = NULL;
-    int ret = vfs_open((const char*)pathname, (int)flags, &file);
+    const char* path = (const char*)pathname;
+    int ret;
+    if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v' && (path[4] == '/' || path[4] == '\0')) {
+        ret = devfs_open_for_task(path, (int)flags, &file, cur);
+        if (ret == ST_OK && file) {
+            file->refcount = 1;
+            file->flags = (int)flags;
+        }
+    } else {
+        ret = vfs_open(path, (int)flags, &file);
+    }
     if (ret != ST_OK || file == NULL) {
         return -EACCES;
     }
@@ -512,6 +525,10 @@ static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf) {
     if (pipe_is_end(file)) {
         st.st_mode = S_IFIFO | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
         st.st_size = 0;
+        mm_memcpy((void*)stat_buf, &st, sizeof(st));
+        return 0;
+    }
+    if (devfs_fstat(file, &st) == 0) {
         mm_memcpy((void*)stat_buf, &st, sizeof(st));
         return 0;
     }
@@ -704,26 +721,83 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
 }
 
 static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp) {
-    (void)fd; (void)req; (void)argp;
-    return -ENOTTY;
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    vfs_file_t* file = NULL;
+    if (fd < TASK_MAX_FDS) {
+        file = cur->fd_table[fd];
+    }
+    if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
+        tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
+        return tty_ioctl(tty, (unsigned long)req, (void*)argp, cur);
+    }
+    if (!file) {
+        return -EBADF;
+    }
+    return devfs_ioctl(file, (unsigned long)req, (void*)argp, cur);
 }
 
 static int64_t sys_setpgid(uint64_t pid, uint64_t pgid) {
-    (void)pid; (void)pgid;
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (pid == 0) {
+        pid = (uint64_t)cur->id;
+    }
+    if (pgid == 0) {
+        pgid = pid;
+    }
+    task_t* t = sched_find_task_by_id((uint32_t)pid);
+    if (!t) {
+        return -ESRCH;
+    }
+    t->pgid = (int)pgid;
     return 0;
 }
 
 static int64_t sys_getpgrp(void) {
-    return sys_getpid();
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    return cur->pgid;
 }
 
 static int64_t sys_tcgetpgrp(uint64_t fd) {
-    (void)fd;
-    return sys_getpid();
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    vfs_file_t* file = NULL;
+    if (fd < TASK_MAX_FDS) {
+        file = cur->fd_table[fd];
+    }
+    tty_t* tty = NULL;
+    if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
+        tty = cur->ctty ? cur->ctty : tty_get_console();
+    }
+    if (file) {
+        tty = devfs_get_tty(file);
+    }
+    if (!tty) {
+        return -ENOTTY;
+    }
+    return tty->fg_pgid;
 }
 
 static int64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgrp) {
-    (void)fd; (void)pgrp;
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    vfs_file_t* file = NULL;
+    if (fd < TASK_MAX_FDS) {
+        file = cur->fd_table[fd];
+    }
+    tty_t* tty = NULL;
+    if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
+        tty = cur->ctty ? cur->ctty : tty_get_console();
+    }
+    if (file) {
+        tty = devfs_get_tty(file);
+    }
+    if (!tty) {
+        return -ENOTTY;
+    }
+    tty->fg_pgid = (int)pgrp;
     return 0;
 }
 
@@ -735,40 +809,31 @@ static void kill_task(task_t* t, int sig) {
         sys_exit(128 + sig);
         return;
     }
-
-    // Close all file descriptors
-    for (int i = 0; i < TASK_MAX_FDS; i++) {
-        if (t->fd_table[i]) {
-            uint64_t marker = (uint64_t)t->fd_table[i];
-            if (marker >= 1 && marker <= 3) {
-                t->fd_table[i] = NULL;
-            } else if (pipe_is_end(t->fd_table[i])) {
-                pipe_close_end((pipe_end_t*)t->fd_table[i]);
-                t->fd_table[i] = NULL;
-            } else {
-                vfs_close(t->fd_table[i]);
-                t->fd_table[i] = NULL;
-            }
-        }
-    }
-
-    // Reparent children to init
-    sched_reparent_children(t);
-
-    // Mark as exited
-    __asm__ volatile ("cli");
-    t->exit_code = 128 + sig;
-    t->has_exited = true;
-    t->state = TASK_ZOMBIE;
+    sched_signal_task(t, sig);
 }
 
 static int64_t sys_kill(uint64_t pid, uint64_t sig) {
-    if (pid == 0) return 0;
     if (sig > 64) return -EINVAL;
+    if ((int64_t)pid < 0) {
+        int pgid = -(int)pid;
+        if (sig == 0) {
+            return sched_pgid_exists(pgid) ? 0 : -ESRCH;
+        }
+        sched_signal_pgrp(pgid, (int)sig);
+        return 0;
+    }
+    if (pid == 0) {
+        task_t* cur = sched_current();
+        if (!cur) return -EFAULT;
+        if (sig == 0) {
+            return sched_pgid_exists(cur->pgid) ? 0 : -ESRCH;
+        }
+        sched_signal_pgrp(cur->pgid, (int)sig);
+        return 0;
+    }
     task_t* t = sched_find_task_by_id((uint32_t)pid);
     if (!t) return -ESRCH;
     if (sig == 0) return 0;
-    // Default behavior: terminate task for any signal
     kill_task(t, (int)sig);
     return 0;
 }
@@ -1069,34 +1134,7 @@ __attribute__((noreturn))
 static void sys_exit(uint64_t status) {
     task_t* cur = sched_current();
     if (cur) {
-        // Store exit code
-        cur->exit_code = (int)status;
-        
-        // Close all file descriptors
-        for (int i = 0; i < TASK_MAX_FDS; i++) {
-            if (cur->fd_table[i]) {
-                // Check for console dup markers (magic pointers 1, 2, 3)
-                uint64_t marker = (uint64_t)cur->fd_table[i];
-                if (marker >= 1 && marker <= 3) {
-                    // Console marker - just clear, don't call vfs_close
-                    cur->fd_table[i] = NULL;
-                } else if (pipe_is_end(cur->fd_table[i])) {
-                    pipe_close_end((pipe_end_t*)cur->fd_table[i]);
-                    cur->fd_table[i] = NULL;
-                } else {
-                    vfs_close(cur->fd_table[i]);
-                    cur->fd_table[i] = NULL;
-                }
-            }
-        }
-        
-        // Reparent children to init
-        sched_reparent_children(cur);
-
-        // Mark as exited only after cleanup to avoid early reap races
-        __asm__ volatile ("cli");
-        cur->has_exited = true;
-        cur->state = TASK_ZOMBIE;
+        sched_mark_task_exited(cur, (int)status);
     }
     sched_yield();
     for (;;) {

@@ -206,6 +206,7 @@ static void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color, uint32_
 
 static console_scrollback_t g_sb;
 static console_line_t g_lines[CONSOLE_SCROLLBACK_LINES];
+static uint16_t g_prompt_guard_len = 0;
 
 static inline uint32_t sb_capacity(void) { return CONSOLE_SCROLLBACK_LINES; }
 
@@ -229,6 +230,7 @@ static void sb_reset(void) {
     g_sb.dragging_thumb = 0;
     g_sb.drag_start_y = 0;
     g_sb.drag_start_viewport = 0;
+    g_prompt_guard_len = 0;
     // Zero first line
     for (uint32_t i = 0; i < sb_capacity(); ++i) {
         g_lines[i].length = 0;
@@ -248,6 +250,7 @@ static void sb_new_line(void) {
     // Advance head in ring
     g_sb.head = (g_sb.head + 1) % sb_capacity();
     if (g_sb.total_filled_lines < 0xFFFFFFFFu) g_sb.total_filled_lines++;
+    g_prompt_guard_len = 0;
     // Clear the new line
     g_sb.lines[g_sb.head].length = 0;
     g_sb.lines[g_sb.head].text[0] = '\0';
@@ -296,6 +299,9 @@ static void sb_append_char(char c) {
     }
     if (c == '\b') {
         if (line->length > 0) {
+            if (line->length <= g_prompt_guard_len) {
+                return;
+            }
             line->length--;
             line->text[line->length] = '\0';
         }
@@ -504,9 +510,19 @@ void console_clear(void) {
     
     cursor_x = 0;
     cursor_y = 0;
+    g_prompt_guard_len = 0;
     // reset viewport to top as well
     g_sb.viewport_top = 0;
     g_sb.at_bottom = 1;
+}
+
+void console_set_prompt_guard(void) {
+    console_line_t* line = sb_current_line();
+    g_prompt_guard_len = line ? line->length : 0;
+}
+
+void console_clear_prompt_guard(void) {
+    g_prompt_guard_len = 0;
 }
 
 // Scroll the screen up by one line
@@ -694,6 +710,10 @@ void console_scroll(void) {
 // Handle backspace - move cursor back and erase character
 void console_backspace(void) {
     if (!fb_info) return;
+    console_line_t* line = sb_current_line();
+    if (line && line->length <= g_prompt_guard_len) {
+        return;
+    }
     // Reflect backspace in scrollback current line
     sb_append_char('\b');
     if (!g_sb.at_bottom) {

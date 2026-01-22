@@ -85,15 +85,11 @@ static int read_sectors(const block_device_t *bdev, unsigned long lba, unsigned 
     while (count > 0) {
         unsigned long chunk = (count > MAX_SECTORS_PER_READ) ? MAX_SECTORS_PER_READ : count;
         int st = ST_OK;
-        int attempts = 5;
+        int attempts = 1;
         while (attempts-- > 0) {
             st = bdev->read((block_device_t *)bdev, lba, chunk, (uint8_t *)buf + offset);
             if (st == ST_OK) {
                 break;
-            }
-            // small backoff before retry
-            for (volatile int spin = 0; spin < 10000; ++spin) {
-                __asm__ __volatile__("pause");
             }
         }
         if (st != ST_OK) {
@@ -116,14 +112,11 @@ static int write_sectors(const block_device_t *bdev, unsigned long lba, unsigned
     while (count > 0) {
         unsigned long chunk = (count > MAX_SECTORS_PER_READ) ? MAX_SECTORS_PER_READ : count;
         int st = ST_OK;
-        int attempts = 5;
+        int attempts = 1;
         while (attempts-- > 0) {
             st = bdev->write((block_device_t *)bdev, lba, chunk, (const uint8_t *)buf + offset);
             if (st == ST_OK) {
                 break;
-            }
-            for (volatile int spin = 0; spin < 10000; ++spin) {
-                __asm__ __volatile__("pause");
             }
         }
         if (st != ST_OK) {

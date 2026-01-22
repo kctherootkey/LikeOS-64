@@ -58,6 +58,8 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/memory.o \
 			  $(BUILD_DIR)/scrollbar.o \
 			  $(BUILD_DIR)/vfs.o \
+			  $(BUILD_DIR)/devfs.o \
+			  $(BUILD_DIR)/tty.o \
 			  $(BUILD_DIR)/pci.o \
 			  $(BUILD_DIR)/block.o \
 			  $(BUILD_DIR)/xhci.o \
@@ -139,6 +141,9 @@ $(BUILD_DIR)/scrollbar.o: $(KERNEL_DIR)/hal/scrollbar.c | $(BUILD_DIR)
 $(BUILD_DIR)/vfs.o: $(KERNEL_DIR)/fs/vfs.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/devfs.o: $(KERNEL_DIR)/fs/devfs.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/pci.o: $(KERNEL_DIR)/hal/pci.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
@@ -167,6 +172,9 @@ $(BUILD_DIR)/timer.o: $(KERNEL_DIR)/ke/timer.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/sched.o: $(KERNEL_DIR)/ke/sched.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tty.o: $(KERNEL_DIR)/ke/tty.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/syscall.o: $(KERNEL_DIR)/ke/syscall.asm | $(BUILD_DIR)

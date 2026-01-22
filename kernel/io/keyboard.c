@@ -3,6 +3,7 @@
 
 #include "../../include/kernel/keyboard.h"
 #include "../../include/kernel/interrupt.h"
+#include "../../include/kernel/tty.h"
 
 // Global keyboard state
 static keyboard_state_t kb_state = {0};
@@ -144,6 +145,13 @@ void keyboard_irq_handler(void) {
     
     // Add to buffer for processing
     keyboard_buffer_add(scan_code);
+
+    // Feed TTY input (console)
+    uint8_t shift = kb_state.shift_pressed || kb_state.caps_lock;
+    char ch = scan_code_to_ascii(scan_code, shift);
+    if (ch) {
+        tty_input_char(tty_get_console(), ch, kb_state.ctrl_pressed);
+    }
 }
 
 // Get processed character from keyboard

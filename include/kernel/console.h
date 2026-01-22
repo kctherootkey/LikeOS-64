@@ -75,6 +75,8 @@ void console_puts(const char* str);
 void console_set_color(uint8_t fg, uint8_t bg);
 void console_scroll(void);
 void console_backspace(void);
+void console_set_prompt_guard(void);
+void console_clear_prompt_guard(void);
 
 // Cursor control functions
 void console_cursor_enable(void);

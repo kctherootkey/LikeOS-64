@@ -7,6 +7,7 @@
 
 // Forward declaration
 struct vfs_file;
+struct tty;
 
 // Maximum file descriptors per task
 #define TASK_MAX_FDS    1024
@@ -20,6 +21,7 @@ typedef enum {
     TASK_READY = 0,
     TASK_RUNNING,
     TASK_BLOCKED,
+    TASK_STOPPED,
     TASK_ZOMBIE
 } task_state_t;
 
@@ -63,6 +65,15 @@ typedef struct task {
     // User mode support
     uint64_t user_stack_top;    // User stack virtual address (for user tasks)
     uint64_t kernel_stack_top;  // Kernel stack for syscalls/interrupts (for user tasks)
+
+    // Job control / session
+    int pgid;
+    int sid;
+    struct tty* ctty;
+
+    // Wait linkage for blocking I/O
+    struct task* wait_next;
+    void* wait_channel;
     
     // Current working directory
     char cwd[256];
@@ -95,5 +106,9 @@ void sched_remove_child(task_t* parent, task_t* child);  // Remove child from pa
 void sched_reparent_children(task_t* task); // Reparent children to init (task 1)
 uint32_t sched_get_ppid(task_t* task);      // Get parent PID
 void sched_reap_zombies(task_t* parent);    // Reap all zombie children of parent
+void sched_mark_task_exited(task_t* task, int status);
+void sched_signal_task(task_t* task, int sig);
+void sched_signal_pgrp(int pgid, int sig);
+int sched_pgid_exists(int pgid);
 
 #endif // _KERNEL_SCHED_H_

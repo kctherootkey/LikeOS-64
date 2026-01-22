@@ -11,14 +11,27 @@ void storage_fs_init(storage_fs_state_t* state) {
     }
     state->signature_found = 0;
     state->tested_mask = 0;
+    state->os_ready = 0;
     for (int i = 0; i < BLOCK_MAX_DEVICES; ++i) {
         state->fs_instances[i].bdev = 0;
         state->ready_reads[i] = 0;
+        state->ready_polls[i] = 0;
     }
+}
+
+void storage_fs_set_ready(storage_fs_state_t* state) {
+    if (!state) {
+        return;
+    }
+    state->os_ready = 1;
 }
 
 void storage_fs_poll(storage_fs_state_t* state) {
     if (!state || state->signature_found) {
+        return;
+    }
+
+    if (!state->os_ready) {
         return;
     }
 
@@ -34,25 +47,18 @@ void storage_fs_poll(storage_fs_state_t* state) {
         }
         xhci_controller_t* xh = (xhci_controller_t*)bdev->driver_data;
         if (!xh || !xh->msd_ready) {
+            if (state->ready_polls[bi] == 0) {
+                /* quiet: waiting for MSD ready log removed */
+            }
+            state->ready_polls[bi] = 0;
             continue;
         }
-
-        // Probe LBA0 to ensure the device is responding before mounting
-        uint8_t* probe = (uint8_t*)kalloc(512);
-        if (!probe) {
-            continue;
-        }
-        int probe_st = bdev->read((block_device_t*)bdev, 0, 1, probe);
-        kfree(probe);
-        if (probe_st != ST_OK) {
-            // Device not ready yet; retry on next poll without marking tested
-            state->ready_reads[bi] = 0;
-            continue;
-        }
-
-        // Require a few consecutive successful probe reads before mounting
-        if (state->ready_reads[bi] < 3) {
-            state->ready_reads[bi]++;
+        // Wait for controller to remain ready for a minimum number of polls
+        if (state->ready_polls[bi] < 20) {
+            state->ready_polls[bi]++;
+            if (state->ready_polls[bi] == 1 || state->ready_polls[bi] == 10 || state->ready_polls[bi] == 20) {
+                /* quiet: ready poll log removed */
+            }
             continue;
         }
 

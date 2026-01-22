@@ -11,6 +11,8 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <termios.h>
+#include <sys/ioctl.h>
 
 // Test result tracking
 static int tests_passed = 0;
@@ -576,6 +578,59 @@ int main(int argc, char** argv) {
         test_result("child killed exit status", WIFEXITED(kst) && WEXITSTATUS(kst) == (128 + SIGTERM));
     } else {
         test_fail("fork() for kill test failed");
+    }
+
+    // ========================================
+    // Test: tty/pty + termios
+    // ========================================
+    printf("\n[TEST] tty/pty\n");
+    int mfd = posix_openpt(O_RDWR);
+    test_result("posix_openpt() succeeds", mfd >= 0);
+    int pty_num = -1;
+    if (mfd >= 0) {
+        test_result("ioctl(TIOCGPTN) succeeds", ioctl(mfd, TIOCGPTN, &pty_num) == 0 && pty_num >= 0);
+    }
+    char pts_path[32];
+    int sfd = -1;
+    if (pty_num >= 0) {
+        snprintf(pts_path, sizeof(pts_path), "/dev/pts/%d", pty_num);
+        sfd = open(pts_path, O_RDWR);
+        test_result("open pts slave succeeds", sfd >= 0);
+    }
+
+    if (mfd >= 0 && sfd >= 0) {
+        struct termios tio;
+        test_result("tcgetattr succeeds", tcgetattr(sfd, &tio) == 0);
+        test_result("canonical enabled by default", (tio.c_lflag & ICANON) != 0);
+        test_result("echo enabled by default", (tio.c_lflag & ECHO) != 0);
+
+        cfmakeraw(&tio);
+        test_result("tcsetattr(TCSANOW) succeeds", tcsetattr(sfd, TCSANOW, &tio) == 0);
+        test_result("tcgetattr raw", tcgetattr(sfd, &tio) == 0);
+        test_result("canonical disabled in raw", (tio.c_lflag & ICANON) == 0);
+
+        const char* ping = "ping";
+        test_result("write master->slave", write(mfd, ping, 4) == 4);
+        char rbuf[8];
+        memset(rbuf, 0, sizeof(rbuf));
+        ssize_t rr = read(sfd, rbuf, 4);
+        test_result("read slave receives data", rr == 4 && memcmp(rbuf, ping, 4) == 0);
+
+        const char* pong = "pong";
+        test_result("write slave->master", write(sfd, pong, 4) == 4);
+        memset(rbuf, 0, sizeof(rbuf));
+        rr = read(mfd, rbuf, 4);
+        test_result("read master receives data", rr == 4 && memcmp(rbuf, pong, 4) == 0);
+
+        test_result("tcsetpgrp succeeds", tcsetpgrp(sfd, getpgrp()) == 0);
+        test_result("tcgetpgrp matches", tcgetpgrp(sfd) == getpgrp());
+
+        close(sfd);
+        close(mfd);
+    } else {
+        test_fail("pty master/slave setup failed");
+        if (mfd >= 0) close(mfd);
+        if (sfd >= 0) close(sfd);
     }
 
     // ========================================
