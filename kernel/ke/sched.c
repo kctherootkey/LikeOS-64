@@ -702,19 +702,16 @@ void sched_signal_task(task_t* task, int sig) {
         }
         return;
     }
-    // For terminal signals (SIGINT, SIGTERM, etc.), set pending and wake
-    // This allows blocked tasks to see the signal and exit gracefully
+    // For terminal signals (SIGINT, SIGTERM, SIGKILL, etc.), kill the task immediately
+    // This allows blocked tasks to be terminated properly
     task->pending_signal = sig;
     task->exit_code = 128 + sig;
     
-    // If task is blocked, wake it so it can handle the signal
-    if (task->state == TASK_BLOCKED) {
-        task->state = TASK_READY;
-    }
+    // Mark the task as exited immediately (don't wait for it to check pending_signal)
+    sched_mark_task_exited(task, 128 + sig);
     
-    // If this is the current task, mark it exited and yield
+    // If this is the current task, yield to switch away
     if (task == sched_current()) {
-        sched_mark_task_exited(task, 128 + sig);
         sched_yield();
     }
 }
