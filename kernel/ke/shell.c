@@ -18,6 +18,9 @@ static int           shell_path_depth = 0; // 0 means at root
 // Track if we're waiting for a user program to complete
 static int shell_waiting_for_program = 0;
 
+// Simple argument handling
+#define SHELL_MAX_ARGS 16
+
 // Shell helpers
 static int shell_ls_count = 0;
 static void shell_ls_cb(const char* name, unsigned attr, unsigned long size) {
@@ -104,25 +107,40 @@ int shell_tick(void) {
         return 0;
     }
 
+    // If user is scrolled up, snap back to bottom on any keypress
+    console_scroll_to_bottom();
+
     if (c == '\n') {
         cmd_buf[cmd_len] = '\0';
         kprintf("\n");
         if (cmd_len > 0) {
-            int start = 0;
-            while (cmd_buf[start] == ' ' && start < cmd_len) {
-                start++;
+            // Tokenize command line (simple whitespace split, no quotes)
+            char* argv[SHELL_MAX_ARGS + 1];
+            int argc = 0;
+            cmd_buf[cmd_len] = '\0';
+            char* p = cmd_buf;
+            while (*p && argc < SHELL_MAX_ARGS) {
+                while (*p == ' ') p++;
+                if (!*p) break;
+                argv[argc++] = p;
+                while (*p && *p != ' ') p++;
+                if (*p) {
+                    *p = '\0';
+                    p++;
+                }
             }
-            int sp = start;
-            while (sp < cmd_len && cmd_buf[sp] != ' ') {
-                sp++;
+            argv[argc] = 0;
+            if (argc == 0) {
+                goto after_cmd;
             }
-            int cmdlen = sp - start;
-            int is_ls = (cmdlen == 2 && cmd_buf[start] == 'l' && cmd_buf[start + 1] == 's');
-            int is_cat = (cmdlen == 3 && cmd_buf[start] == 'c' && cmd_buf[start + 1] == 'a' && cmd_buf[start + 2] == 't');
-            int is_cd = (cmdlen == 2 && cmd_buf[start] == 'c' && cmd_buf[start + 1] == 'd');
-            int is_pwd = (cmdlen == 3 && cmd_buf[start] == 'p' && cmd_buf[start + 1] == 'w' && cmd_buf[start + 2] == 'd');
-            int is_stat = (cmdlen == 4 && cmd_buf[start] == 's' && cmd_buf[start + 1] == 't' && cmd_buf[start + 2] == 'a' && cmd_buf[start + 3] == 't');
-            int is_help = (cmdlen == 4 && cmd_buf[start] == 'h' && cmd_buf[start + 1] == 'e' && cmd_buf[start + 2] == 'l' && cmd_buf[start + 3] == 'p');
+
+            const char* cmd = argv[0];
+            int is_ls = (kstrcmp(cmd, "ls") == 0);
+            int is_cat = (kstrcmp(cmd, "cat") == 0);
+            int is_cd = (kstrcmp(cmd, "cd") == 0);
+            int is_pwd = (kstrcmp(cmd, "pwd") == 0);
+            int is_stat = (kstrcmp(cmd, "stat") == 0);
+            int is_help = (kstrcmp(cmd, "help") == 0);
             if (is_help) {
                 kprintf("LikeOS-64 Shell - Available Commands:\n");
                 kprintf("  ls [path]      - List directory contents\n");
@@ -131,21 +149,18 @@ int shell_tick(void) {
                 kprintf("  cat <file>     - Display file contents\n");
                 kprintf("  stat <path>    - Show file/directory information\n");
                 kprintf("  help           - Display this help message\n");
-                kprintf("  ./<file>       - Execute a program (e.g., ./tests)\n");
+                kprintf("  <cmd> [args]   - Execute program via PATH (/), ./, or absolute path\n");
             } else if (is_ls) {
                 if (block_count() > 0) {
-                    int fn = sp;
-                    while (fn < cmd_len && cmd_buf[fn] == ' ') {
-                        fn++;
-                    }
                     unsigned long list_cluster;
-                    if (fn >= cmd_len) {
+                    if (argc < 2) {
                         list_cluster = fat32_get_cwd();
                     } else {
+                        const char* path = argv[1];
                         unsigned a;
                         unsigned long fc;
                         unsigned long sz;
-                        if (fat32_resolve_path(fat32_get_cwd(), &cmd_buf[fn], &a, &fc, &sz) == ST_OK) {
+                        if (fat32_resolve_path(fat32_get_cwd(), path, &a, &fc, &sz) == ST_OK) {
                             if (a & 0x10) {
                                 list_cluster = fc;
                             } else {
@@ -174,14 +189,10 @@ int shell_tick(void) {
                     kprintf("No block device yet\n");
                 }
             } else if (is_cd) {
-                int fn = sp;
-                while (fn < cmd_len && cmd_buf[fn] == ' ') {
-                    fn++;
-                }
-                if (fn >= cmd_len) {
+                if (argc < 2) {
                     kprintf("Usage: cd <dir>\n");
                 } else {
-                    const char* path = &cmd_buf[fn];
+                    const char* path = argv[1];
                     if (path[0] == '/') {
                         fat32_set_cwd(0);
                         shell_path_reset();
@@ -237,38 +248,30 @@ int shell_tick(void) {
                     kprintf("\n");
                 }
             } else if (is_stat) {
-                int fn = sp;
-                while (fn < cmd_len && cmd_buf[fn] == ' ') {
-                    fn++;
-                }
-                if (fn >= cmd_len) {
+                if (argc < 2) {
                     kprintf("Usage: stat <path>\n");
                 } else {
                     unsigned a;
                     unsigned long fc;
                     unsigned long sz;
-                    if (fat32_stat(fat32_get_cwd(), &cmd_buf[fn], &a, &fc, &sz) == ST_OK) {
+                    if (fat32_stat(fat32_get_cwd(), argv[1], &a, &fc, &sz) == ST_OK) {
                         kprintf("attr=%c size=%lu cluster=%lu\n", (a & 0x10) ? 'd' : 'f', sz, fc);
                     } else {
                         kprintf("stat: not found\n");
                     }
                 }
             } else if (is_cat) {
-                int fn = sp;
-                while (fn < cmd_len && cmd_buf[fn] == ' ') {
-                    fn++;
-                }
-                if (fn >= cmd_len) {
+                if (argc < 2) {
                     kprintf("Usage: cat <file>\n");
                 } else {
                     vfs_file_t* vf = 0;
-                    const char* name = &cmd_buf[fn];
+                    const char* name = argv[1];
                     char pathbuf[128];
                     (void)pathbuf;
                     if (name[0] != '/') {
                         unsigned long cc = fat32_get_cwd();
                         if (cc != fat32_root_cluster()) {
-                            name = &cmd_buf[fn];
+                            name = argv[1];
                         }
                     }
                     if (vfs_open(name, 0, &vf) == ST_OK) {
@@ -293,33 +296,50 @@ int shell_tick(void) {
                     }
                 }
             } else {
-                // Check if command starts with ./ (execute ELF)
-                int is_exec = (cmdlen >= 2 && cmd_buf[start] == '.' && cmd_buf[start + 1] == '/');
-                if (is_exec) {
-                    // Extract path (skip the ./)
-                    const char* exec_path = &cmd_buf[start + 1];  // Keep the leading /
-                    
-                    // Build argv: program name and any arguments
-                    // For now, just use the path as argv[0]
-                    char* argv[2];
-                    argv[0] = (char*)exec_path;
-                    argv[1] = NULL;
-                    
-                    // Build envp with PATH=/
-                    char* envp[2];
-                    char path_env[] = "PATH=/";
-                    envp[0] = path_env;
-                    envp[1] = NULL;
-                    
-                    int ret = elf_exec(exec_path, argv, envp, NULL);
-                    if (ret != 0) {
-                        kprintf("exec: failed (error %d)\n", ret);
-                    } else {
-                        // Program started successfully - wait for it to complete
-                        shell_waiting_for_program = 1;
+                // Execute program (absolute path, relative path with '/', or PATH lookup)
+                const char* exec_path = argv[0];
+                char exec_buf[128];
+                int has_slash = 0;
+                for (const char* s = argv[0]; *s; ++s) {
+                    if (*s == '/') { has_slash = 1; break; }
+                }
+                if (!has_slash) {
+                    size_t cmdlen = kstrlen(argv[0]);
+                    if (cmdlen + 1 >= sizeof(exec_buf)) {
+                        kprintf("exec: path too long\n");
+                        goto after_cmd;
                     }
+                    exec_buf[0] = '/';
+                    kstrcpy(&exec_buf[1], argv[0]);
+                    exec_path = exec_buf;
+                }
+
+                struct kstat st;
+                if (vfs_stat(exec_path, &st) != ST_OK) {
+                    kprintf("exec: not found: %s\n", exec_path);
+                    goto after_cmd;
+                }
+
+                // Build argv for exec (argv[0] = exec_path)
+                char* exec_argv[SHELL_MAX_ARGS + 1];
+                exec_argv[0] = (char*)exec_path;
+                for (int i = 1; i < argc && i < SHELL_MAX_ARGS; ++i) {
+                    exec_argv[i] = argv[i];
+                }
+                exec_argv[(argc < SHELL_MAX_ARGS) ? argc : SHELL_MAX_ARGS] = NULL;
+
+                // Build envp with PATH=/
+                char* envp[2];
+                static char path_env[] = "PATH=/";
+                envp[0] = path_env;
+                envp[1] = NULL;
+
+                int ret = elf_exec(exec_path, exec_argv, envp, NULL);
+                if (ret != 0) {
+                    kprintf("exec: failed (error %d)\n", ret);
                 } else {
-                    kprintf("Unknown command\n");
+                    // Program started successfully - wait for it to complete
+                    shell_waiting_for_program = 1;
                 }
             }
 after_cmd:

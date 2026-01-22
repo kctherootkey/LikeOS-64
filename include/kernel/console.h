@@ -62,6 +62,7 @@ typedef struct {
 void console_scroll_up_line(void);
 void console_scroll_down_line(void);
 void console_set_viewport_top(uint32_t line);
+void console_scroll_to_bottom(void);
 void console_handle_mouse_event(int x, int y, uint8_t left_pressed);
 void console_handle_mouse_wheel(int delta);
 

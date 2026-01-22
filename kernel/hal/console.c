@@ -816,6 +816,21 @@ void console_set_viewport_top(uint32_t line) {
     mouse_show_cursor(1);
 }
 
+void console_scroll_to_bottom(void) {
+    if (g_sb.at_bottom) {
+        return;
+    }
+    uint32_t eff = sb_effective_total();
+    uint32_t max_vp = (eff > g_sb.visible_lines) ? (eff - g_sb.visible_lines) : 0;
+    g_sb.viewport_top = max_vp;
+    g_sb.at_bottom = 1;
+    mouse_show_cursor(0);
+    console_render_view();
+    console_sync_scrollbar();
+    fb_flush_dirty_regions();
+    mouse_show_cursor(1);
+}
+
 void console_handle_mouse_event(int x, int y, uint8_t left_pressed) {
     scrollbar_t* sb = scrollbar_get_system();
     if (!sb) return;
@@ -930,6 +945,14 @@ int kstrncmp(const char* s1, const char* s2, size_t n) {
         --n;
     }
     return n == (size_t)-1 ? 0 : *(unsigned char*)s1 - *(unsigned char*)s2;
+}
+
+int kstrcmp(const char* s1, const char* s2) {
+    while (*s1 && (*s1 == *s2)) {
+        ++s1;
+        ++s2;
+    }
+    return *(unsigned char*)s1 - *(unsigned char*)s2;
 }
 
 // Memory set
