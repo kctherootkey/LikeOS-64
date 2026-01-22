@@ -35,6 +35,8 @@ struct vfs_file {
     void* fs_private; // points to underlying FS-specific handle
     int refcount;     // Reference count for dup/fork
     int flags;        // O_CLOEXEC, O_RDONLY, etc.
+    int is_root_dir;  // True if this is the root "/" directory
+    int dev_injected; // True if we've already injected /dev entry in readdir
 };
 
 // File descriptor flags

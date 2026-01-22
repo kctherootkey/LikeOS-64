@@ -76,7 +76,7 @@ typedef struct __attribute__((packed)) {
 
 #define FAT32_ATTR_LONG_NAME 0x0F
 
-// Maximum sectors per single USB read (QEMU xHCI limitation)
+// Maximum sectors per single USB read (1 sector = 512 bytes)
 #define MAX_SECTORS_PER_READ 1
 
 static int read_sectors(const block_device_t *bdev, unsigned long lba, unsigned long count, void *buf)
@@ -94,7 +94,6 @@ static int read_sectors(const block_device_t *bdev, unsigned long lba, unsigned 
             }
         }
         if (st != ST_OK) {
-            kprintf("FAT32: read_sectors FAILED lba=%lu count=%lu st=%d\n", lba, chunk, st);
             return st;
         }
         lba += chunk;
@@ -121,7 +120,6 @@ static int write_sectors(const block_device_t *bdev, unsigned long lba, unsigned
             }
         }
         if (st != ST_OK) {
-            kprintf("FAT32: write_sectors FAILED lba=%lu count=%lu st=%d\n", lba, chunk, st);
             return st;
         }
         lba += chunk;
@@ -450,27 +448,25 @@ static unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long clu
 
         /* Allocate FAT cache buffer */
         unsigned long fat_bytes = first_fat_sectors * fs->bytes_per_sector;
-
+        
         /* Read FAT with a few retries for transient USB errors */
         for (int attempt = 0; attempt < 3 && !g_fat_cache; ++attempt) {
             g_fat_cache = kalloc(fat_bytes);
             if (!g_fat_cache) {
-                kprintf("FAT32: FAT cache alloc failed!\n");
                 return 0x0FFFFFFF;
             }
 
-            /* Read FAT in chunks (max 1 sector = 512 bytes per read for QEMU xHCI compatibility) */
+            /* Read FAT in chunks (1 sector = 512 bytes per read) */
             #define FAT_READ_CHUNK 1
             unsigned long lba = fs->part_lba_offset + fs->fat_start_lba;
             unsigned long remaining = first_fat_sectors;
             uint8_t *dest = (uint8_t*)g_fat_cache;
             int read_failed = 0;
-
+            
             while (remaining > 0) {
                 unsigned long chunk = (remaining > FAT_READ_CHUNK) ? FAT_READ_CHUNK : remaining;
                 int read_st = read_sectors(fs->bdev, lba, chunk, dest);
                 if (read_st != ST_OK) {
-                    kprintf("FAT32: FAT read failed at LBA %lu! st=%d\n", lba, read_st);
                     read_failed = 1;
                     break;
                 }
@@ -478,7 +474,7 @@ static unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long clu
                 dest += chunk * fs->bytes_per_sector;
                 remaining -= chunk;
             }
-
+            
             if (read_failed) {
                 kfree(g_fat_cache);
                 g_fat_cache = 0;
@@ -1754,9 +1750,10 @@ static long fat32_read(vfs_file_t *f, void *buf, long bytes)
             kprintf("fat32_read: kalloc(%u) failed, remaining=%lu copied=%lu\n", cluster_size, remaining, copied);
             return copied ? (long)copied : ST_NOMEM;
         }
-        if (read_sectors(ff->fs->bdev,
+        int st = read_sectors(ff->fs->bdev,
             cluster_to_lba(ff->fs, ff->current_cluster),
-            ff->fs->sectors_per_cluster, tmp) != ST_OK) {
+            ff->fs->sectors_per_cluster, tmp);
+        if (st != ST_OK) {
             kfree(tmp);
             return copied ? (long)copied : ST_IO;
         }
@@ -1770,7 +1767,16 @@ static long fat32_read(vfs_file_t *f, void *buf, long bytes)
             break;
         if (ff->pos % cluster_size == 0) {
             unsigned long next = fat32_next_cluster_cached(ff->fs, ff->current_cluster);
-            if (next >= 0x0FFFFFF8 || next == 0) {
+            if (next >= 0x0FFFFFF8) {
+                // Valid end-of-chain marker
+                break;
+            }
+            if (next == 0 && remaining > 0) {
+                // FAT entry is 0 (free) but file still has data - filesystem corruption
+                // Try to continue with next sequential cluster as fallback
+                next = ff->current_cluster + 1;
+            }
+            if (next == 0) {
                 break;
             }
             ff->current_cluster = next;

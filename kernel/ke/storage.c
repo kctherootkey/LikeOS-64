@@ -2,6 +2,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/vfs.h"
 #include "../../include/kernel/xhci.h"
+#include "../../include/kernel/usb_msd.h"
 #include "../../include/kernel/shell.h"
 #include "../../include/kernel/memory.h"
 
@@ -45,8 +46,9 @@ void storage_fs_poll(storage_fs_state_t* state) {
             state->tested_mask |= (1u << bi);
             continue;
         }
-        xhci_controller_t* xh = (xhci_controller_t*)bdev->driver_data;
-        if (!xh || !xh->msd_ready) {
+        // driver_data now points to usb_msd_device_t
+        usb_msd_device_t* msd = (usb_msd_device_t*)bdev->driver_data;
+        if (!msd || !msd->ready) {
             if (state->ready_polls[bi] == 0) {
                 /* quiet: waiting for MSD ready log removed */
             }

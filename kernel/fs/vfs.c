@@ -3,6 +3,8 @@
 #include "../../include/kernel/fat32.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/dirent.h"
+#include "../../include/kernel/stat.h"
 
 static const vfs_ops_t* g_root_ops = 0;
 static const vfs_ops_t* g_dev_ops = 0;
@@ -19,6 +21,13 @@ static int vfs_is_dev_path(const char* path) {
     return 0;
 }
 
+static int vfs_is_root_path(const char* path) {
+    if (!path) return 0;
+    // "/" or "/.." or "/." all resolve to root
+    if (path[0] == '/' && path[1] == '\0') return 1;
+    return 0;
+}
+
 int vfs_open(const char* path, int flags, vfs_file_t** out) {
     if (vfs_is_dev_path(path)) {
         if (!g_dev_ops || !g_dev_ops->open) return ST_UNSUPPORTED;
@@ -26,6 +35,8 @@ int vfs_open(const char* path, int flags, vfs_file_t** out) {
         if (ret == ST_OK && *out) {
             (*out)->refcount = 1;
             (*out)->flags = flags;
+            (*out)->is_root_dir = 0;
+            (*out)->dev_injected = 0;
         }
         return ret;
     }
@@ -34,6 +45,8 @@ int vfs_open(const char* path, int flags, vfs_file_t** out) {
     if (ret == ST_OK && *out) {
         (*out)->refcount = 1;
         (*out)->flags = flags;
+        (*out)->is_root_dir = vfs_is_root_path(path);
+        (*out)->dev_injected = 0;
     }
     return ret;
 }
@@ -59,7 +72,48 @@ int vfs_chdir(const char* path) {
 long vfs_read(vfs_file_t* f, void* buf, long bytes) { if (!f || !f->ops || !f->ops->read) return ST_INVALID; return f->ops->read(f, buf, bytes); }
 long vfs_write(vfs_file_t* f, const void* buf, long bytes) { if (!f || !f->ops || !f->ops->write) return ST_INVALID; return f->ops->write(f, buf, bytes); }
 long vfs_seek(vfs_file_t* f, long offset, int whence) { if (!f || !f->ops || !f->ops->seek) return -1; return f->ops->seek(f, offset, whence); }
-long vfs_readdir(vfs_file_t* f, void* buf, long bytes) { if (!f || !f->ops || !f->ops->readdir) return ST_UNSUPPORTED; return f->ops->readdir(f, buf, bytes); }
+
+long vfs_readdir(vfs_file_t* f, void* buf, long bytes) {
+    if (!f || !f->ops || !f->ops->readdir) return ST_UNSUPPORTED;
+    
+    unsigned char* out = (unsigned char*)buf;
+    long total = 0;
+    
+    // If this is the root directory and we haven't injected /dev yet, inject it first
+    if (f->is_root_dir && !f->dev_injected && g_dev_ops) {
+        // Calculate size for "dev" entry
+        unsigned short reclen = (unsigned short)(sizeof(struct linux_dirent64) + 4); // "dev" + null
+        reclen = (reclen + 7) & ~7;  // Align to 8 bytes
+        
+        if (bytes >= reclen) {
+            struct linux_dirent64* ent = (struct linux_dirent64*)out;
+            ent->d_ino = 2;  // Fake inode for /dev
+            ent->d_off = reclen;
+            ent->d_reclen = reclen;
+            ent->d_type = DT_DIR;
+            ent->d_name[0] = 'd';
+            ent->d_name[1] = 'e';
+            ent->d_name[2] = 'v';
+            ent->d_name[3] = '\0';
+            
+            out += reclen;
+            bytes -= reclen;
+            total += reclen;
+            f->dev_injected = 1;
+        }
+    }
+    
+    // Now get remaining entries from underlying FS
+    long ret = f->ops->readdir(f, out, bytes);
+    if (ret > 0) {
+        total += ret;
+    } else if (ret < 0 && total == 0) {
+        return ret;  // Error and no /dev was injected
+    }
+    
+    return total;
+}
+
 int vfs_truncate(vfs_file_t* f, unsigned long size) { if (!f || !f->ops || !f->ops->truncate) return ST_UNSUPPORTED; return f->ops->truncate(f, size); }
 int vfs_unlink(const char* path) { if (!g_root_ops || !g_root_ops->unlink) return ST_UNSUPPORTED; return g_root_ops->unlink(path); }
 int vfs_rename(const char* oldpath, const char* newpath) { if (!g_root_ops || !g_root_ops->rename) return ST_UNSUPPORTED; return g_root_ops->rename(oldpath, newpath); }

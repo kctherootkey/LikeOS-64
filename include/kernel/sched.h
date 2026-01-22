@@ -75,6 +75,9 @@ typedef struct task {
     struct task* wait_next;
     void* wait_channel;
     
+    // Pending signal (for deferred signal handling)
+    int pending_signal;  // 0 = none, >0 = signal number
+    
     // Current working directory
     char cwd[256];
     

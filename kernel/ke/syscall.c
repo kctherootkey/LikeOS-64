@@ -710,6 +710,8 @@ static int64_t sys_chdir(uint64_t pathname) {
     if (vret == ST_NOT_FOUND) return -ENOENT;
     if (vret != ST_OK) return -ENOTDIR;
     if ((st.st_mode & S_IFMT) != S_IFDIR) return -ENOTDIR;
+    // Update FAT32 layer's cwd cluster
+    vfs_chdir(full);
     // Update task cwd string with canonical absolute path
     mm_memset(cur->cwd, 0, sizeof(cur->cwd));
     size_t i = 0;

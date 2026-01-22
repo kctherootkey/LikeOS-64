@@ -116,6 +116,7 @@
 #define EAGAIN          11  // Resource temporarily unavailable
 #define EBADF           9   // Bad file descriptor
 #define ECHILD          10  // No child processes
+#define EINTR           4   // Interrupted system call
 #define ESRCH           3   // No such process
 #define EIO             5   // I/O error
 #define ENOMEM          12  // Out of memory

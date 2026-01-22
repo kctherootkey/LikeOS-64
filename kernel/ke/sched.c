@@ -124,6 +124,7 @@ void sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack
     t->ctty = NULL;
     t->wait_next = NULL;
     t->wait_channel = NULL;
+    t->pending_signal = 0;
     
     // Initialize process hierarchy
     t->parent = NULL;
@@ -201,6 +202,7 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
     t->ctty = tty_get_console();
     t->wait_next = NULL;
     t->wait_channel = NULL;
+    t->pending_signal = 0;
     
     // Initialize process hierarchy
     t->parent = NULL;
@@ -578,6 +580,7 @@ task_t* sched_fork_current(void) {
     child->is_fork_child = true;  // Child should return 0 from fork
     child->wait_next = NULL;
     child->wait_channel = NULL;
+    child->pending_signal = 0;    // Clear any pending signals
     
     // Add to parent's child list
     sched_add_child(cur, child);
@@ -699,8 +702,21 @@ void sched_signal_task(task_t* task, int sig) {
         }
         return;
     }
-    // Default: terminate task
-    sched_mark_task_exited(task, 128 + sig);
+    // For terminal signals (SIGINT, SIGTERM, etc.), set pending and wake
+    // This allows blocked tasks to see the signal and exit gracefully
+    task->pending_signal = sig;
+    task->exit_code = 128 + sig;
+    
+    // If task is blocked, wake it so it can handle the signal
+    if (task->state == TASK_BLOCKED) {
+        task->state = TASK_READY;
+    }
+    
+    // If this is the current task, mark it exited and yield
+    if (task == sched_current()) {
+        sched_mark_task_exited(task, 128 + sig);
+        sched_yield();
+    }
 }
 
 void sched_signal_pgrp(int pgid, int sig) {

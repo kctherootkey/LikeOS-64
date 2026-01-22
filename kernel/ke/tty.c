@@ -98,7 +98,9 @@ static void tty_set_default_termios(tty_t* tty) {
     tty->term.c_lflag = ISIG | ICANON | ECHO;
     tty->term.c_cc[VINTR] = 3;   // Ctrl+C
     tty->term.c_cc[VQUIT] = 28;  // Ctrl+\
-    tty->term.c_cc[VERASE] = 8;  // Backspace
+    // Use volatile to prevent compiler from optimizing away the write
+    volatile cc_t* verase_ptr = &tty->term.c_cc[VERASE];
+    *verase_ptr = 8;  // Backspace (ASCII 8)
     tty->term.c_cc[VKILL] = 21;  // Ctrl+U
     tty->term.c_cc[VEOF] = 4;    // Ctrl+D
     tty->term.c_cc[VSTART] = 17; // Ctrl+Q
@@ -144,6 +146,8 @@ static void tty_signal_pgrp(tty_t* tty, int sig) {
         return;
     }
     sched_signal_pgrp(tty->fg_pgid, sig);
+    // Wake any blocked readers so they can see they've been signaled/killed
+    tty_wake_readers(&tty->read_waiters);
 }
 
 void tty_input_char(tty_t* tty, char c, int ctrl) {
@@ -165,21 +169,44 @@ void tty_input_char(tty_t* tty, char c, int ctrl) {
 
     if (tty->term.c_lflag & ISIG) {
         if (c == tty->term.c_cc[VINTR]) {
+            // Echo ^C if ECHO is set
+            if (tty->term.c_lflag & ECHO) {
+                tty->output(tty, '^');
+                tty->output(tty, 'C');
+                tty->output(tty, '\n');
+            }
+            // Clear any pending canonical input
+            tty->canon_len = 0;
             tty_signal_pgrp(tty, SIGINT);
             return;
         }
         if (c == tty->term.c_cc[VQUIT]) {
+            // Echo ^\\ if ECHO is set
+            if (tty->term.c_lflag & ECHO) {
+                tty->output(tty, '^');
+                tty->output(tty, '\\');
+                tty->output(tty, '\n');
+            }
+            tty->canon_len = 0;
             tty_signal_pgrp(tty, SIGQUIT);
             return;
         }
         if (c == tty->term.c_cc[VSUSP]) {
+            // Echo ^Z if ECHO is set
+            if (tty->term.c_lflag & ECHO) {
+                tty->output(tty, '^');
+                tty->output(tty, 'Z');
+                tty->output(tty, '\n');
+            }
+            tty->canon_len = 0;
             tty_signal_pgrp(tty, SIGTSTP);
             return;
         }
     }
 
     if (tty->term.c_lflag & ICANON) {
-        if (c == tty->term.c_cc[VERASE]) {
+        // Handle backspace: check VERASE (typically 8) or DEL (127)
+        if (c == tty->term.c_cc[VERASE] || c == 127) {
             if (tty->canon_len > 0) {
                 tty->canon_len--;
                 if (tty->term.c_lflag & ECHO) {
@@ -247,6 +274,15 @@ long tty_read(tty_t* tty, void* buf, long count, int nonblock) {
     long read = 0;
 
     while (read < count) {
+        // Check if we've been killed or have a pending signal
+        if (cur && (cur->state == TASK_ZOMBIE || cur->pending_signal > 0)) {
+            // Mark task as exited due to signal
+            if (cur->pending_signal > 0) {
+                sched_mark_task_exited(cur, cur->exit_code);
+                sched_yield();
+            }
+            return read > 0 ? read : -EINTR;
+        }
         if (tty->eof_pending && tty->read_count == 0) {
             tty->eof_pending = 0;
             return read;
@@ -262,6 +298,15 @@ long tty_read(tty_t* tty, void* buf, long count, int nonblock) {
                 cur->wait_channel = tty;
                 tty->read_waiters = cur;
                 sched_yield();
+                // Check if we were killed or have a pending signal
+                if (cur->state == TASK_ZOMBIE || cur->has_exited || cur->pending_signal > 0) {
+                    // Mark task as exited due to signal
+                    if (cur->pending_signal > 0) {
+                        sched_mark_task_exited(cur, cur->exit_code);
+                        sched_yield();
+                    }
+                    return read > 0 ? read : -EINTR;
+                }
                 continue;
             }
             break;
