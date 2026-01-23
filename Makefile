@@ -392,7 +392,7 @@ qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)
 
 # Write ISO to USB device with GPT partition table (like Rufus)
 # Usage: make usb-write USB_DEVICE=/dev/sdX
-usb-write: $(ISO_IMAGE)
+usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf
 	@if [ -z "$(USB_DEVICE)" ]; then \
 		echo "Error: USB_DEVICE not specified. Usage: make usb-write USB_DEVICE=/dev/sdX"; \
 		echo "Available devices:"; \
@@ -427,10 +427,21 @@ usb-write: $(ISO_IMAGE)
 	
 	# Create EFI directory structure
 	sudo mkdir -p /tmp/likeos_usb_mount/EFI/BOOT
+	sudo mkdir -p /tmp/likeos_usb_mount/bin
 	
 	# Copy bootloader and kernel
 	sudo cp $(BOOTLOADER_EFI) /tmp/likeos_usb_mount/EFI/BOOT/BOOTX64.EFI
 	sudo cp $(KERNEL_ELF) /tmp/likeos_usb_mount/kernel.elf
+
+	# Copy userland programs to /bin
+	sudo cp $(BUILD_DIR)/sh /tmp/likeos_usb_mount/bin/sh
+	sudo cp $(BUILD_DIR)/ls /tmp/likeos_usb_mount/bin/ls
+	sudo cp $(BUILD_DIR)/cat /tmp/likeos_usb_mount/bin/cat
+	sudo cp $(BUILD_DIR)/pwd /tmp/likeos_usb_mount/bin/pwd
+	sudo cp $(BUILD_DIR)/stat /tmp/likeos_usb_mount/bin/stat
+	sudo cp $(BUILD_DIR)/hello /tmp/likeos_usb_mount/hello
+	sudo cp $(BUILD_DIR)/test_libc /tmp/likeos_usb_mount/testlibc
+	sudo cp $(BUILD_DIR)/user_test.elf /tmp/likeos_usb_mount/tests
 
 	# Create signature file and sample hello on target (mirrors data image contents)
 	sudo sh -c 'echo "THIS IS A DEVICE STORING LIKEOS" > /tmp/likeos_usb_mount/LIKEOS.SIG'

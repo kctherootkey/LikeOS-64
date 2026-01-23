@@ -53,18 +53,21 @@ void xhci_boot_poll(xhci_boot_state_t* state) {
     // Process any pending events
     xhci_process_events(ctrl);
     
-    // If enumeration not complete, check for devices
-    if (!state->enum_complete) {
+    // Keep polling ports until we have a mass storage device or reach max devices
+    if (!state->msd_ready) {
         int connected = xhci_poll_ports(ctrl);
-        if (connected > 0 && ctrl->num_devices > 0) {
-            state->enum_complete = 1;
-            kprintf("[XHCI BOOT] Device enumeration complete (%d devices)\n", ctrl->num_devices);
-            
+        
+        // Check if we have new devices to examine
+        if (ctrl->num_devices > 0) {
             // Check for mass storage device
             for (int i = 0; i < ctrl->num_devices; i++) {
                 usb_device_t* dev = &ctrl->devices[i];
                 if (dev->configured && dev->class_code == USB_CLASS_MASS_STORAGE) {
-                    kprintf("[XHCI BOOT] Found USB Mass Storage device\n");
+                    if (!state->enum_complete) {
+                        state->enum_complete = 1;
+                        kprintf("[XHCI BOOT] Device enumeration complete (%d devices)\n", ctrl->num_devices);
+                    }
+                    kprintf("[XHCI BOOT] Found USB Mass Storage device on port %d\n", dev->port);
                     
                     // Initialize MSD
                     int st = usb_msd_init(&g_msd_device, dev, ctrl);
@@ -74,7 +77,7 @@ void xhci_boot_poll(xhci_boot_state_t* state) {
                     } else {
                         kprintf("[XHCI BOOT] MSD init failed: %d\n", st);
                     }
-                    break;
+                    return;
                 }
             }
         }

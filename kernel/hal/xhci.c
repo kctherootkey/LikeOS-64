@@ -590,10 +590,22 @@ int xhci_poll_ports(xhci_controller_t* ctrl) {
             xhci_dbg("Port %d: Connected, PORTSC=0x%08x\n", port, portsc);
             connected++;
             
-            // Try to enumerate if not already done
-            if (ctrl->num_devices == 0 || !ctrl->devices[0].configured) {
+            // Check if this port is already enumerated
+            int already_enumerated = 0;
+            for (int i = 0; i < ctrl->num_devices; i++) {
+                if (ctrl->devices[i].port == port && ctrl->devices[i].configured) {
+                    already_enumerated = 1;
+                    break;
+                }
+            }
+            
+            // Try to enumerate if not already done for this port
+            if (!already_enumerated && ctrl->num_devices < XHCI_MAX_SLOTS) {
+                xhci_dbg("Port %d: Attempting enumeration...\n", port);
                 if (xhci_enumerate_device(ctrl, port) == ST_OK) {
                     xhci_dbg("Device enumerated on port %d\n", port);
+                } else {
+                    xhci_dbg("Port %d: Enumeration failed\n", port);
                 }
             }
         }
