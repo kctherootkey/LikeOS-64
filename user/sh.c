@@ -89,12 +89,23 @@ int main(void) {
 
         pid_t pid = fork();
         if (pid == 0) {
+            // Set child as foreground process group to receive Ctrl+C
+            setpgid(0, 0);  // Create new process group with child's PID
+            tcsetpgrp(STDIN_FILENO, getpid());  // Make it foreground
+            
             execvp(argv[0], argv);
             printf("exec: not found: %s\n", argv[0]);
             _exit(127);
         } else if (pid > 0) {
+            // Set child as foreground process group (also from parent side)
+            setpgid(pid, pid);
+            tcsetpgrp(STDIN_FILENO, pid);
+            
             int status = 0;
             waitpid(pid, &status, 0);
+            
+            // Restore shell as foreground process group
+            tcsetpgrp(STDIN_FILENO, getpgrp());
         } else {
             printf("fork failed\n");
         }

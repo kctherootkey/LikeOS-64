@@ -6,6 +6,7 @@
 #include "../../include/kernel/block.h"
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/dirent.h"
+#include "../../include/kernel/sched.h"
 
 #ifndef FAT32_DEBUG_ENABLED
 #define FAT32_DEBUG_ENABLED 0
@@ -136,6 +137,7 @@ static unsigned long cluster_to_lba(fat32_fs_t *fs, unsigned long cluster)
 
 // Forward declaration (defined later)
 static unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster);
+static unsigned long fat32_get_task_cwd_cluster(void);
 
 // Simple root directory cache (single cluster only for now)
 static void* g_root_dir_cache = 0; // first cluster of root directory cached
@@ -149,10 +151,32 @@ static unsigned long g_cwd_cluster = 0; // 0 means root
 static const char* fat32_normalize_start(const char* path, unsigned long* start_cluster)
 {
     if (!path || !start_cluster) return path;
+    
+    // Handle absolute paths starting with /
     if (path[0] == '/') {
         *start_cluster = g_root_dir_cluster;
         while (*path == '/') path++;
+        return path;
     }
+    
+    // Handle relative paths starting with ./
+    if (path[0] == '.' && path[1] == '/') {
+        // Stay in current directory, skip the ./
+        path += 2;
+        while (*path == '/') path++;
+        return path;
+    }
+    
+    // Handle relative paths starting with ../
+    if (path[0] == '.' && path[1] == '.' && path[2] == '/') {
+        // Move to parent directory
+        unsigned long cur = *start_cluster;
+        *start_cluster = fat32_parent_cluster(cur);
+        path += 3;
+        while (*path == '/') path++;
+        return path;
+    }
+    
     return path;
 }
 
@@ -1323,16 +1347,16 @@ static int fat32_open(const char *path, int flags, vfs_file_t **out)
     if (!path || !path[0])
         return ST_INVALID;
 
-    unsigned long start_cluster = fat32_get_cwd();
+    unsigned long start_cluster = fat32_get_task_cwd_cluster();
     const char* rpath = fat32_normalize_start(path, &start_cluster);
 
     // Directory open handling
     if (kstrcmp(path, "/") == 0 || kstrcmp(path, ".") == 0 || kstrcmp(path, "..") == 0 || (rpath && rpath[0] == '\0')) {
         unsigned long dir_cluster = fat32_root_cluster();
         if (kstrcmp(path, ".") == 0) {
-            dir_cluster = fat32_get_cwd();
+            dir_cluster = fat32_get_task_cwd_cluster();
         } else if (kstrcmp(path, "..") == 0) {
-            unsigned long cur = fat32_get_cwd();
+            unsigned long cur = fat32_get_task_cwd_cluster();
             dir_cluster = fat32_parent_cluster(cur);
         }
         fat32_file_t *ff = (fat32_file_t *)kalloc(sizeof(fat32_file_t));
@@ -1455,7 +1479,7 @@ static int fat32_stat_vfs(const char* path, struct kstat* st)
 {
     if (!st || !path)
         return ST_INVALID;
-    unsigned long start_cluster = fat32_get_cwd();
+    unsigned long start_cluster = fat32_get_task_cwd_cluster();
     const char* rpath = fat32_normalize_start(path, &start_cluster);
     unsigned attr = 0;
     unsigned long fc = 0;
@@ -1481,7 +1505,7 @@ int fat32_unlink_path(const char* path)
     unsigned long parent = 0;
     char name[64];
     name[0] = '\0';
-    if (fat32_resolve_parent(fat32_get_cwd(), path, &parent, name, sizeof(name)) != ST_OK)
+    if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), path, &parent, name, sizeof(name)) != ST_OK)
         return ST_NOT_FOUND;
     char name83[11];
     if (fat32_make_83_name(name, name83) != ST_OK)
@@ -1528,12 +1552,12 @@ int fat32_rename_path(const char* oldpath, const char* newpath)
     unsigned long old_parent = 0;
     char old_name[64];
     old_name[0] = '\0';
-    if (fat32_resolve_parent(fat32_get_cwd(), oldpath, &old_parent, old_name, sizeof(old_name)) != ST_OK)
+    if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), oldpath, &old_parent, old_name, sizeof(old_name)) != ST_OK)
         return ST_NOT_FOUND;
     unsigned long new_parent = 0;
     char new_name[64];
     new_name[0] = '\0';
-    if (fat32_resolve_parent(fat32_get_cwd(), newpath, &new_parent, new_name, sizeof(new_name)) != ST_OK)
+    if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), newpath, &new_parent, new_name, sizeof(new_name)) != ST_OK)
         return ST_NOT_FOUND;
     if (old_parent != new_parent)
         return ST_UNSUPPORTED;
@@ -1581,7 +1605,7 @@ int fat32_mkdir_path(const char* path)
     unsigned long parent = 0;
     char name[64];
     name[0] = '\0';
-    if (fat32_resolve_parent(fat32_get_cwd(), path, &parent, name, sizeof(name)) != ST_OK)
+    if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), path, &parent, name, sizeof(name)) != ST_OK)
         return ST_NOT_FOUND;
     char name83[11];
     if (fat32_make_83_name(name, name83) != ST_OK)
@@ -1638,7 +1662,7 @@ int fat32_rmdir_path(const char* path)
     unsigned long parent = 0;
     char name[64];
     name[0] = '\0';
-    if (fat32_resolve_parent(fat32_get_cwd(), path, &parent, name, sizeof(name)) != ST_OK)
+    if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), path, &parent, name, sizeof(name)) != ST_OK)
         return ST_NOT_FOUND;
     char name83[11];
     if (fat32_make_83_name(name, name83) != ST_OK)
@@ -1714,7 +1738,7 @@ static int fat32_chdir(const char* path)
     unsigned attr = 0;
     unsigned long fc = 0;
     unsigned long size = 0;
-    unsigned long start_cluster = fat32_get_cwd();
+    unsigned long start_cluster = fat32_get_task_cwd_cluster();
     const char* rpath = fat32_normalize_start(path, &start_cluster);
     if (fat32_resolve_path(start_cluster, rpath, &attr, &fc, &size) != ST_OK)
         return ST_NOT_FOUND;
@@ -2128,6 +2152,36 @@ void fat32_set_cwd(unsigned long cluster)
 unsigned long fat32_get_cwd(void)
 {
     return g_cwd_cluster ? g_cwd_cluster : g_root_dir_cluster;
+}
+
+// Get current task's cwd cluster (not the global one)
+static unsigned long fat32_get_task_cwd_cluster(void)
+{
+    // Get current task's cwd path
+    task_t* cur = sched_current();
+    if (!cur || cur->cwd[0] == '\0' || kstrcmp(cur->cwd, "/") == 0) {
+        return g_root_dir_cluster;
+    }
+    
+    // Resolve the task's cwd path to get cluster
+    const char* path = cur->cwd;
+    if (path[0] == '/') path++; // Skip leading /
+    
+    unsigned attr = 0;
+    unsigned long fc = 0;
+    unsigned long size = 0;
+    
+    if (path[0] == '\0') {
+        return g_root_dir_cluster; // Root directory
+    }
+    
+    int res = fat32_resolve_path(g_root_dir_cluster, path, &attr, &fc, &size);
+    if (res == ST_OK && (attr & FAT32_ATTR_DIRECTORY)) {
+        return fc;
+    }
+    
+    // Fallback to root if resolution fails
+    return g_root_dir_cluster;
 }
 
 int fat32_vfs_register_root(fat32_fs_t *fs)
