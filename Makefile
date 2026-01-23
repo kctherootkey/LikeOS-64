@@ -366,6 +366,17 @@ qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
 		-device usb-storage,drive=usbdisk -machine type=pc,accel=kvm:tcg
 
+# Run with ISO boot and real USB device (like /dev/sdb) as xHCI USB mass storage
+# Usage: make qemu-realusb USB_DEVICE=/dev/sdb
+qemu-realusb: $(ISO_IMAGE)
+ifndef USB_DEVICE
+	$(error USB_DEVICE is not set. Usage: make qemu-realusb USB_DEVICE=/dev/sdb)
+endif
+	@echo "Running LikeOS-64 in QEMU with xHCI + real USB device $(USB_DEVICE)..."
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio \
+		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
+		-device usb-storage,bus=xhci.0,drive=stick -machine type=pc,accel=kvm:tcg
+
 # Extended USB passthrough target: attach tablet + optional host devices (edit vendor/product)
 qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)
 	@echo "Running LikeOS-64 with xHCI, virtual storage, and host USB passthrough (if any)..."
@@ -506,6 +517,7 @@ help:
 	@echo "  qemu       - Run in QEMU from ISO"
 	@echo "  qemu-fat   - Run in QEMU from FAT image"
 	@echo "  qemu-usb   - Run QEMU attaching data image as USB mass storage"
+	@echo "  qemu-realusb - Run QEMU with real USB device as xHCI storage (requires USB_DEVICE=/dev/sdX)"
 	@echo "  qemu-usb-passthrough - Run QEMU with host USB device passthrough (experimental)"
 	@echo "  usb-write  - Write to USB device with GPT (requires USB_DEVICE=/dev/sdX)"
 	@echo "  linux-usb  - Build Debian-based host USB image that auto-launches LikeOS via QEMU/KVM"

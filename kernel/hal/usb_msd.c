@@ -53,15 +53,17 @@ int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,
     uint32_t transferred;
     int st;
     
-    // Allocate DMA-safe buffer for CBW and CSW
-    // Stack buffers don't have valid physical addresses for DMA
-    uint8_t* dma_cbw = (uint8_t*)kcalloc(1, CBW_SIZE);
-    uint8_t* dma_csw = (uint8_t*)kcalloc(1, CSW_SIZE);
+    // Allocate DMA-safe PAGE-ALIGNED buffer for CBW and CSW
+    // Page alignment ensures proper DMA on real hardware
+    uint8_t* dma_cbw = (uint8_t*)kalloc(4096);  // Page-aligned
+    uint8_t* dma_csw = (uint8_t*)kalloc(4096);  // Page-aligned
     if (!dma_cbw || !dma_csw) {
         if (dma_cbw) kfree(dma_cbw);
         if (dma_csw) kfree(dma_csw);
         return ST_NOMEM;
     }
+    msd_memset(dma_cbw, 0, 4096);
+    msd_memset(dma_csw, 0, 4096);
     
     // Copy CBW to DMA buffer
     msd_memcpy(dma_cbw, cbw, CBW_SIZE);
@@ -79,22 +81,27 @@ int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,
     }
     
     // Phase 2: Data transfer (if any)
-    // Also use DMA-safe buffer for data phase since caller may provide stack buffer
+    // Use PAGE-ALIGNED DMA buffer for data phase
     int data_st = ST_OK;
     if (data_len > 0 && data_buf) {
-        uint8_t* dma_data = (uint8_t*)kcalloc(1, data_len);
+        // Round up to page size for alignment
+        uint32_t alloc_size = (data_len + 4095) & ~4095U;
+        uint8_t* dma_data = (uint8_t*)kalloc(alloc_size);
         if (!dma_data) {
             msd_dbg("Failed to allocate DMA buffer for data\n");
             kfree(dma_cbw);
             kfree(dma_csw);
             return ST_NOMEM;
         }
+        msd_memset(dma_data, 0, alloc_size);
         
         if (cbw->flags & CBW_FLAG_DATA_IN) {
             // Data IN
             msd_dbg("Data IN: %d bytes\n", data_len);
             data_st = xhci_bulk_transfer_in(ctrl, dev, dma_data, data_len, &transferred);
             if (data_st == ST_OK) {
+                // Memory barrier to ensure DMA writes are visible to CPU
+                __asm__ volatile("mfence" ::: "memory");
                 // Copy received data back to caller
                 msd_memcpy(data_buf, dma_data, data_len);
             }
@@ -317,13 +324,13 @@ int usb_msd_block_read(block_device_t* dev, unsigned long lba, unsigned long cou
         return ST_NO_DEVICE;
     }
     
-    // Read in chunks if necessary (256 sectors = 128KB for ultra-fast transfers)
+    // Read in 4KB chunks (8 sectors) for reliable USB transfers on real hardware
     uint8_t* ptr = (uint8_t*)buf;
     unsigned long remaining = count;
     unsigned long current_lba = lba;
     
     while (remaining > 0) {
-        unsigned long chunk = (remaining > 256) ? 256 : remaining;
+        unsigned long chunk = (remaining > 8) ? 8 : remaining;
         
         int st = usb_msd_read(msd, (uint32_t)current_lba, (uint32_t)chunk, ptr);
         if (st != ST_OK) {

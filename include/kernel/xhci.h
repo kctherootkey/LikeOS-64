@@ -110,7 +110,7 @@
 #define TRB_FLAG_BSR            (1 << 9)   // Block Set Address Request
 
 // Ring sizes (power of 2, last entry is link TRB)
-#define XHCI_RING_SIZE          32
+#define XHCI_RING_SIZE          256
 #define XHCI_MAX_SLOTS          16
 #define XHCI_MAX_ENDPOINTS      32
 #define XHCI_MAX_PORTS          8
