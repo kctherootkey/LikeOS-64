@@ -1,6 +1,8 @@
 // LikeOS-64 Hardware Abstraction Layer - Console
 // Framebuffer-based console and printf implementation for 64-bit kernel
 
+#define BOOT_DEBUG 0
+
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/serial.h"
 #include "../../include/kernel/fb_optimize.h"
@@ -469,15 +471,21 @@ void console_init(framebuffer_info_t* fb) {
 // Initialize framebuffer optimization system (call after console_init)
 void console_init_fb_optimization(void) {
     if (!fb_info) {
+#if BOOT_DEBUG
         kprintf("Console: No framebuffer available for optimization\n");
+#endif
         return;
     }
     
     // Initialize framebuffer optimization system
     if (fb_optimize_init(fb_info) == 0) {
+#if BOOT_DEBUG
         kprintf("Console: Framebuffer optimization enabled\n");
+#endif
     } else {
+#if BOOT_DEBUG
         kprintf("Console: Using direct framebuffer (no optimization)\n");
+#endif
     }
 }
 

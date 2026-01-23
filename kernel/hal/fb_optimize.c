@@ -1,6 +1,8 @@
 // LikeOS-64 Framebuffer Optimization System - Implementation
 // High-performance double buffering, write-combining, and SSE-optimized rendering
 
+#define BOOT_DEBUG 0
+
 #include "../../include/kernel/fb_optimize.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
@@ -240,17 +242,25 @@ void* fast_memcpy(void* dst, const void* src, size_t bytes)
 int fb_optimize_init(framebuffer_info_t* fb_info)
 {
     if(!fb_info || !fb_info->framebuffer_base) {
+#if BOOT_DEBUG
         kprintf("FB Optimize: Invalid framebuffer info\n");
+#endif
         return -1;
     }
     if(g_initialized) {
+#if BOOT_DEBUG
         kprintf("FB Optimize: Already initialized\n");
+#endif
         return 0;
     }
+#if BOOT_DEBUG
     kprintf("Initializing framebuffer optimization system...\n");
+#endif
     // Detect CPU features
     g_double_buffer.cpu_features = detect_cpu_features();
+#if BOOT_DEBUG
     kprintf("  CPU Features: %s\n", cpu_features_to_string(g_double_buffer.cpu_features));
+#endif
     // Store framebuffer info
     g_double_buffer.front_buffer = (uint32_t*)fb_info->framebuffer_base;
     g_double_buffer.width = fb_info->horizontal_resolution;
@@ -259,24 +269,32 @@ int fb_optimize_init(framebuffer_info_t* fb_info)
     g_double_buffer.bytes_per_pixel = fb_info->bytes_per_pixel;
     // Calculate back buffer size
     size_t buffer_size = g_double_buffer.height * g_double_buffer.pitch * sizeof(uint32_t);
+#if BOOT_DEBUG
     kprintf("  Framebuffer: %dx%d, pitch=%d, size=%zu bytes\n",
         g_double_buffer.width, g_double_buffer.height,
         g_double_buffer.pitch, buffer_size);
+#endif
     // Try to use static buffer first if size fits and no kalloc available yet
     if(buffer_size <= MAX_STATIC_FB_SIZE) {
         g_double_buffer.back_buffer = g_static_back_buffer;
         g_using_static_buffers = 1;
+#if BOOT_DEBUG
         kprintf("  Using static back buffer %p (size fits: %zu <= %zu)\n", g_static_back_buffer, buffer_size, (size_t)MAX_STATIC_FB_SIZE);
+#endif
     } else {
         // Try dynamic allocation for larger framebuffers
         g_double_buffer.back_buffer = (uint32_t*)kalloc(buffer_size);
         if(!g_double_buffer.back_buffer) {
+#if BOOT_DEBUG
             kprintf("  ERROR: Framebuffer too large for static buffer (%zu > %zu) and kalloc failed\n",
                 buffer_size, (size_t)MAX_STATIC_FB_SIZE);
+#endif
             return -1;
         }
         g_using_static_buffers = 0;
+#if BOOT_DEBUG
         kprintf("  Back buffer dynamically allocated at: %p\n", g_double_buffer.back_buffer);
+#endif
     }
     // Always use static dirty regions array (small and fixed size)
     g_double_buffer.max_dirty_regions = MAX_DIRTY_REGIONS;
@@ -290,13 +308,17 @@ int fb_optimize_init(framebuffer_info_t* fb_info)
     if(g_double_buffer.cpu_features & CPU_FEATURE_MTRR) {
         if(configure_write_combining_mtrr(fb_base, fb_size) == 0) {
             g_double_buffer.write_combining_enabled = 1;
+#if BOOT_DEBUG
             kprintf("  Write-combining enabled via MTRR\n");
+#endif
         }
     }
     // Enable SSE copying if available
     if(g_double_buffer.cpu_features & CPU_FEATURE_SSE2) {
         g_double_buffer.sse_copy_enabled = 1;
+#if BOOT_DEBUG
         kprintf("  SSE-optimized copying enabled\n");
+#endif
     }
     // Initialize statistics
     g_double_buffer.total_updates = 0;
@@ -305,7 +327,9 @@ int fb_optimize_init(framebuffer_info_t* fb_info)
     // Copy current framebuffer content to back buffer
     fast_memcpy(g_double_buffer.back_buffer, g_double_buffer.front_buffer, buffer_size);
     g_initialized = 1;
+#if BOOT_DEBUG
     kprintf("Framebuffer optimization system initialized successfully\n");
+#endif
     return 0;
 }
 
@@ -715,13 +739,19 @@ int configure_write_combining_mtrr(uint64_t fb_base, uint64_t fb_size)
     if(!(g_double_buffer.cpu_features & CPU_FEATURE_MTRR)) {
         return -1;
     }
+#if BOOT_DEBUG
     kprintf("  Configuring MTRR for write-combining...\n");
+#endif
     // Read MTRR capabilities
     uint64_t mtrr_cap = read_msr(MSR_MTRRcap);
     uint32_t num_var_mtrrs = (uint32_t)(mtrr_cap & 0xFF);
+#if BOOT_DEBUG
     kprintf("    MTRR cap: 0x%llx, variable MTRRs: %d\n", mtrr_cap, num_var_mtrrs);
+#endif
     if(num_var_mtrrs == 0) {
+#if BOOT_DEBUG
         kprintf("    No variable MTRRs available\n");
+#endif
         return -1;
     }
     // Find the largest power-of-2 size that fits in fb_size
@@ -735,7 +765,9 @@ int configure_write_combining_mtrr(uint64_t fb_base, uint64_t fb_size)
     }
     // Align base address to the MTRR size
     uint64_t mtrr_base = fb_base & ~(mtrr_size - 1);
+#if BOOT_DEBUG
     kprintf("    Setting MTRR: base=0x%llx, size=0x%llx, type=WC\n", mtrr_base, mtrr_size);
+#endif
     // Find an available MTRR
     int mtrr_index = -1;
     for(uint32_t i = 0; i < num_var_mtrrs; i++) {
@@ -746,7 +778,9 @@ int configure_write_combining_mtrr(uint64_t fb_base, uint64_t fb_size)
         }
     }
     if(mtrr_index == -1) {
+#if BOOT_DEBUG
         kprintf("    No available MTRR slots\n");
+#endif
         return -1;
     }
     // Disable MTRRs while modifying
@@ -768,7 +802,9 @@ int configure_write_combining_mtrr(uint64_t fb_base, uint64_t fb_size)
         :
         : "rax", "memory"
     );
+#if BOOT_DEBUG
     kprintf("    MTRR %d configured successfully\n", mtrr_index);
+#endif
     return 0;
 }
 

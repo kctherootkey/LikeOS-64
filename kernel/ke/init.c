@@ -33,12 +33,11 @@ void kernel_main(boot_info_t* boot_info) {
 }
 
 void system_startup(boot_info_t* boot_info) {
-    kprintf("\nLikeOS-64 Kernel v1.0\n");
-    kprintf("64-bit Long Mode Active\n");
-
     console_set_color(10, 0);
-    kprintf("\nKernel initialization complete!\n");
+    kprintf("\nLikeOS-64 Kernel v0.2\n\n");
     console_set_color(15, 0);
+
+    kprintf("64-bit Long Mode Active\n");
 
     interrupts_init();
 
