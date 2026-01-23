@@ -2,7 +2,7 @@
 
 A modern 64-bit operating system built from scratch, targeting x86_64 architecture with **UEFI booting** and **framebuffer graphics**.
 
-Current state: For real hardware the operating system boots from linux bootstrapper that runs qemu right after the boot sequence - in order to avoid supporting every different hardware on the planet. This is accomplished by creating a bootable usb stick with the make linux-usb and make linux-usb-write targets. The os can be also booted into qemu on for example windows or linux hosts by using the make qemu-usb target or booting in VMware with USB 3.1 enabled through the make usb-write target (USB boot). Once the os is running you can type "help" to get the shell help text.
+Current state: For real hardware the operating system boots from linux bootstrapper that runs qemu right after the boot sequence - in order to avoid supporting every different hardware on the planet. This is accomplished by creating a bootable usb stick with the make linux-usb and make linux-usb-write targets. The os can be also booted into qemu on for example windows or linux hosts by using the make qemu-usb target. The os can also be run in VMware with USB 3.1 enabled through the make usb-write target (USB drive boot). Once the os is running you can type "help" to get the shell help text.
 
 [LikeOS qemu readme video.webm](https://github.com/user-attachments/assets/e3dadb65-568a-4d1a-ba2a-bc1fbb553643)
 
