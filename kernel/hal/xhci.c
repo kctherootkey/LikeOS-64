@@ -296,14 +296,17 @@ static void xhci_setup_scratchpad(xhci_controller_t* ctrl) {
         return;
     }
     
-    // Allocate pages for scratchpad
+    // Allocate pages for scratchpad (must be page-aligned for DMA)
     for (uint16_t i = 0; i < ctrl->num_scratchpads; i++) {
-        void* page = kcalloc(1, PAGE_SIZE);
-        if (!page) {
+        // Allocate extra for alignment since kcalloc doesn't guarantee page alignment
+        void* raw = kcalloc(1, PAGE_SIZE + PAGE_SIZE);
+        if (!raw) {
             kprintf("[XHCI] Failed to allocate scratchpad page %d\n", i);
             return;
         }
-        ctrl->scratchpad_pages[i] = page;
+        // Align to page boundary
+        void* page = (void*)(((uint64_t)raw + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
+        ctrl->scratchpad_pages[i] = raw;  // Store raw for freeing later
         ctrl->scratchpad_array[i] = mm_get_physical_address((uint64_t)page);
     }
     
@@ -833,12 +836,14 @@ int xhci_enumerate_device(xhci_controller_t* ctrl, uint8_t port) {
     
     usb_device_t* dev = &ctrl->devices[slot - 1];
     
-    // Allocate DMA-safe buffer for descriptors (stack buffers may not work)
-    uint8_t* dma_buf = (uint8_t*)kcalloc(1, 256);
-    if (!dma_buf) {
+    // Allocate DMA-safe PAGE-ALIGNED buffer for descriptors
+    // kcalloc only provides 8-byte alignment, so allocate extra and align manually
+    uint8_t* raw_buf = (uint8_t*)kcalloc(1, 4096 + 4096);
+    if (!raw_buf) {
         kprintf("[XHCI] Failed to allocate DMA buffer\n");
         return ST_NOMEM;
     }
+    uint8_t* dma_buf = (uint8_t*)(((uint64_t)raw_buf + 4095) & ~4095ULL);
     usb_device_desc_t* desc = (usb_device_desc_t*)dma_buf;
     
     // Get device descriptor (first 8 bytes to get max packet size)
@@ -942,8 +947,8 @@ int xhci_enumerate_device(xhci_controller_t* ctrl, uint8_t port) {
         // Continue anyway, some devices work without this
     }
     
-    // Free DMA buffer
-    kfree(dma_buf);
+    // Free DMA buffer (free the raw allocation, not the aligned pointer)
+    kfree(raw_buf);
     
     // Configure bulk endpoints if found
     if (dev->bulk_in_ep && dev->bulk_out_ep) {

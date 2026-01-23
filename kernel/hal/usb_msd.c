@@ -54,14 +54,19 @@ int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,
     int st;
     
     // Allocate DMA-safe PAGE-ALIGNED buffer for CBW and CSW
-    // Page alignment ensures proper DMA on real hardware
-    uint8_t* dma_cbw = (uint8_t*)kalloc(4096);  // Page-aligned
-    uint8_t* dma_csw = (uint8_t*)kalloc(4096);  // Page-aligned
-    if (!dma_cbw || !dma_csw) {
-        if (dma_cbw) kfree(dma_cbw);
-        if (dma_csw) kfree(dma_csw);
+    // kalloc only provides 8-byte alignment, so we allocate extra and align manually
+    uint8_t* raw_cbw = (uint8_t*)kcalloc(1, 4096 + 4096);  // Extra page for alignment
+    uint8_t* raw_csw = (uint8_t*)kcalloc(1, 4096 + 4096);  // Extra page for alignment
+    if (!raw_cbw || !raw_csw) {
+        if (raw_cbw) kfree(raw_cbw);
+        if (raw_csw) kfree(raw_csw);
         return ST_NOMEM;
     }
+    
+    // Align to page boundary
+    uint8_t* dma_cbw = (uint8_t*)(((uint64_t)raw_cbw + 4095) & ~4095ULL);
+    uint8_t* dma_csw = (uint8_t*)(((uint64_t)raw_csw + 4095) & ~4095ULL);
+    
     msd_memset(dma_cbw, 0, 4096);
     msd_memset(dma_csw, 0, 4096);
     
@@ -75,25 +80,29 @@ int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,
     st = xhci_bulk_transfer_out(ctrl, dev, dma_cbw, CBW_SIZE, &transferred);
     if (st != ST_OK) {
         msd_dbg("CBW send failed: st=%d\n", st);
-        kfree(dma_cbw);
-        kfree(dma_csw);
+        kfree(raw_cbw);
+        kfree(raw_csw);
         return st;
     }
     
     // Phase 2: Data transfer (if any)
     // Use PAGE-ALIGNED DMA buffer for data phase
     int data_st = ST_OK;
+    uint8_t* raw_data = NULL;
     if (data_len > 0 && data_buf) {
-        // Round up to page size for alignment
-        uint32_t alloc_size = (data_len + 4095) & ~4095U;
-        uint8_t* dma_data = (uint8_t*)kalloc(alloc_size);
-        if (!dma_data) {
+        // Allocate with extra page for alignment
+        uint32_t alloc_size = ((data_len + 4095) & ~4095U) + 4096;
+        raw_data = (uint8_t*)kcalloc(1, alloc_size);
+        if (!raw_data) {
             msd_dbg("Failed to allocate DMA buffer for data\n");
-            kfree(dma_cbw);
-            kfree(dma_csw);
+            kfree(raw_cbw);
+            kfree(raw_csw);
             return ST_NOMEM;
         }
-        msd_memset(dma_data, 0, alloc_size);
+        
+        // Align to page boundary
+        uint8_t* dma_data = (uint8_t*)(((uint64_t)raw_data + 4095) & ~4095ULL);
+        msd_memset(dma_data, 0, data_len);
         
         if (cbw->flags & CBW_FLAG_DATA_IN) {
             // Data IN
@@ -112,7 +121,8 @@ int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,
             data_st = xhci_bulk_transfer_out(ctrl, dev, dma_data, data_len, &transferred);
         }
         
-        kfree(dma_data);
+        kfree(raw_data);
+        raw_data = NULL;
         
         if (data_st != ST_OK) {
             msd_dbg("Data transfer failed: st=%d\n", data_st);
@@ -125,15 +135,15 @@ int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,
     st = xhci_bulk_transfer_in(ctrl, dev, dma_csw, CSW_SIZE, &transferred);
     if (st != ST_OK) {
         msd_dbg("CSW receive failed: st=%d\n", st);
-        kfree(dma_cbw);
-        kfree(dma_csw);
+        kfree(raw_cbw);
+        kfree(raw_csw);
         return st;
     }
     
     // Copy CSW back to caller's buffer
     msd_memcpy(csw, dma_csw, CSW_SIZE);
-    kfree(dma_cbw);
-    kfree(dma_csw);
+    kfree(raw_cbw);
+    kfree(raw_csw);
     
     // Validate CSW
     if (csw->signature != CSW_SIGNATURE) {
