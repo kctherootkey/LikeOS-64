@@ -156,11 +156,12 @@ static uint8_t mouse_detect_type(void)
         mouse_state.packet_size = 4;
         return MOUSE_TYPE_INTELLIMOUSE;
     } else {
-        // QEMU workaround: force IntelliMouse mode even if detection failed
-        kprintf("  Standard mouse ID detected, but forcing IntelliMouse mode for QEMU compatibility\n");
-        mouse_state.has_scroll_wheel = 1;
-        mouse_state.packet_size = 4;
-        return MOUSE_TYPE_INTELLIMOUSE;
+        // Standard 3-byte mouse - don't force IntelliMouse mode
+        // VirtualBox and some other emulators don't support 4-byte packets
+        kprintf("  Standard mouse detected (3-byte mode)\n");
+        mouse_state.has_scroll_wheel = 0;
+        mouse_state.packet_size = 3;
+        return MOUSE_TYPE_STANDARD;
     }
 }
 
