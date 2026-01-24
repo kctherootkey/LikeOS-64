@@ -371,16 +371,16 @@ qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
 		-device usb-storage,drive=usbdisk -machine type=pc,accel=kvm:tcg
 
-# Run with ISO boot and real USB device (like /dev/sdb) as xHCI USB mass storage
+# Run with real USB device (like /dev/sdb) as xHCI USB mass storage - boots from USB only
 # Usage: make qemu-realusb USB_DEVICE=/dev/sdb
-qemu-realusb: $(ISO_IMAGE)
+qemu-realusb:
 ifndef USB_DEVICE
 	$(error USB_DEVICE is not set. Usage: make qemu-realusb USB_DEVICE=/dev/sdb)
 endif
-	@echo "Running LikeOS-64 in QEMU with xHCI + real USB device $(USB_DEVICE)..."
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio \
+	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE)..."
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M -serial stdio \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
-		-device usb-storage,bus=xhci.0,drive=stick -machine type=pc,accel=kvm:tcg
+		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg
 
 # Extended USB passthrough target: attach tablet + optional host devices (edit vendor/product)
 qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)
