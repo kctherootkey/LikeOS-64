@@ -4,6 +4,7 @@
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/signal.h"
 
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_descriptor idt_desc;
@@ -211,6 +212,8 @@ void exception_handler(uint64_t *regs) {
     uint64_t int_no = regs[15];
     uint64_t err_code = regs[16];
     uint64_t rip = regs[17];
+    uint64_t cs = regs[18];
+    int user_mode = (cs & 0x3) == 0x3;
 
     if (int_no == 14) {
         uint64_t cr2;
@@ -219,6 +222,60 @@ void exception_handler(uint64_t *regs) {
             if (mm_handle_cow_fault(cr2)) {
                 return;
             }
+        }
+    }
+
+    if (user_mode) {
+        task_t* cur = sched_current();
+        switch (int_no) {
+            case 14: {
+                uint64_t cr2;
+                __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+                kprintf("User process %d killed by SIGSEGV at RIP=0x%016llx CR2=0x%016llx (err=0x%llx)\n",
+                        cur ? (int)cur->id : -1, rip, cr2, err_code);
+                sched_signal_task(cur, SIGSEGV);
+                return;
+            }
+            case 6:
+                kprintf("User process %d killed by SIGILL at RIP=0x%016llx\n",
+                        cur ? (int)cur->id : -1, rip);
+                sched_signal_task(cur, SIGILL);
+                return;
+            case 0:
+                kprintf("User process %d killed by SIGFPE at RIP=0x%016llx\n",
+                        cur ? (int)cur->id : -1, rip);
+                sched_signal_task(cur, SIGFPE);
+                return;
+            case 3:
+                kprintf("User process %d killed by SIGTRAP at RIP=0x%016llx\n",
+                        cur ? (int)cur->id : -1, rip);
+                sched_signal_task(cur, SIGTRAP);
+                return;
+            case 4:
+                kprintf("User process %d killed by SIGFPE at RIP=0x%016llx\n",
+                        cur ? (int)cur->id : -1, rip);
+                sched_signal_task(cur, SIGFPE);
+                return;
+            case 5:
+                kprintf("User process %d killed by SIGTRAP at RIP=0x%016llx\n",
+                        cur ? (int)cur->id : -1, rip);
+                sched_signal_task(cur, SIGTRAP);
+                return;
+            case 13:
+                kprintf("User process %d killed by SIGSEGV at RIP=0x%016llx (err=0x%llx)\n",
+                        cur ? (int)cur->id : -1, rip, err_code);
+                sched_signal_task(cur, SIGSEGV);
+                return;
+            case 17:
+                kprintf("User process %d killed by SIGBUS at RIP=0x%016llx (err=0x%llx)\n",
+                        cur ? (int)cur->id : -1, rip, err_code);
+                sched_signal_task(cur, SIGBUS);
+                return;
+            default:
+                kprintf("User process %d killed by SIGABRT at RIP=0x%016llx (INT %llu)\n",
+                        cur ? (int)cur->id : -1, rip, int_no);
+                sched_signal_task(cur, SIGABRT);
+                return;
         }
     }
 

@@ -62,6 +62,35 @@ static void test_result(const char* name, int condition) {
     }
 }
 
+static void run_programerror_case(const char* name, const char* mode, int expected_sig) {
+    pid_t child = fork();
+    if (child < 0) {
+        test_fail(name);
+        return;
+    }
+    if (child == 0) {
+        char* argv_exec[] = { "/progerr", (char*)mode, NULL };
+        char* envp_exec[] = { NULL };
+        execve("/progerr", argv_exec, envp_exec);
+        _exit(1);
+    }
+
+    int status = 0;
+    pid_t waited = waitpid(child, &status, 0);
+    if (waited != child) {
+        test_fail(name);
+        return;
+    }
+
+    int ok = 0;
+    if (WIFSIGNALED(status) && WTERMSIG(status) == expected_sig) {
+        ok = 1;
+    } else if (WIFEXITED(status) && WEXITSTATUS(status) == (128 + expected_sig)) {
+        ok = 1;
+    }
+    test_result(name, ok);
+}
+
 int main(int argc, char** argv) {
     printf("\n========================================\n");
     printf("  LikeOS-64 Libc Tests\n");
@@ -305,6 +334,14 @@ int main(int argc, char** argv) {
         } else {
             test_fail("execve child did not exit normally");
         }
+
+        // ========================================
+        // Test: progerr (user fault handling)
+        // ========================================
+        printf("\n[TEST] progerr (user fault handling)\n");
+        run_programerror_case("illegal instruction -> SIGILL", "ill", SIGILL);
+        run_programerror_case("invalid user write -> SIGSEGV", "baduser", SIGSEGV);
+        run_programerror_case("kernel write -> SIGSEGV", "badkernel", SIGSEGV);
     }
 
     // ========================================
@@ -575,7 +612,9 @@ int main(int argc, char** argv) {
         int kst = 0;
         pid_t kw = waitpid(kchild, &kst, 0);
         test_result("waitpid returns child", kw == kchild);
-        test_result("child killed exit status", WIFEXITED(kst) && WEXITSTATUS(kst) == (128 + SIGTERM));
+        test_result("child killed exit status",
+                (WIFSIGNALED(kst) && WTERMSIG(kst) == SIGTERM) ||
+                (WIFEXITED(kst) && WEXITSTATUS(kst) == (128 + SIGTERM)));
     } else {
         test_fail("fork() for kill test failed");
     }

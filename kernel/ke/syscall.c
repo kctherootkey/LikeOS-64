@@ -1495,8 +1495,15 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options) {
     
     // Store status if requested
     if (status_ptr && validate_user_ptr(status_ptr, sizeof(int))) {
-        // Linux-style status: exit_code << 8
-        *(int*)status_ptr = (child->exit_code & 0xFF) << 8;
+        int status = 0;
+        if (child->pending_signal) {
+            // Signaled exit: low 7 bits are signal number
+            status = (child->pending_signal & 0x7F);
+        } else {
+            // Normal exit: exit_code << 8
+            status = (child->exit_code & 0xFF) << 8;
+        }
+        *(int*)status_ptr = status;
     }
     
     int child_pid = child->id;
