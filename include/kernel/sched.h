@@ -4,6 +4,7 @@
 
 #include "types.h"
 #include "vfs.h"
+#include "signal.h"
 
 // Forward declaration
 struct vfs_file;
@@ -75,8 +76,19 @@ typedef struct task {
     struct task* wait_next;
     void* wait_channel;
     
-    // Pending signal (for deferred signal handling)
-    int pending_signal;  // 0 = none, >0 = signal number
+    // Signal handling state
+    task_signal_state_t signals;    // Full signal state
+    
+    // Saved syscall context for signal delivery (per-task, not global)
+    uint64_t syscall_rsp;           // User RSP on syscall entry
+    uint64_t syscall_rip;           // User RIP (return address)
+    uint64_t syscall_rflags;        // User RFLAGS
+    uint64_t syscall_rbp;           // Callee-saved
+    uint64_t syscall_rbx;           // Callee-saved
+    uint64_t syscall_r12;           // Callee-saved
+    uint64_t syscall_r13;           // Callee-saved
+    uint64_t syscall_r14;           // Callee-saved
+    uint64_t syscall_r15;           // Callee-saved
     
     // Current working directory
     char cwd[256];

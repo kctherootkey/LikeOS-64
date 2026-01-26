@@ -3,6 +3,7 @@
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/signal.h"
 
 static volatile uint64_t g_ticks = 0;
 static uint32_t g_frequency = 100; // Default 100 Hz
@@ -42,6 +43,11 @@ uint64_t timer_ticks(void) {
 
 void timer_irq_handler(void) {
     g_ticks++;
+    // Check signal timers for current task
+    task_t* cur = sched_current();
+    if (cur) {
+        signal_check_timers(cur, g_ticks);
+    }
     // Notify scheduler of tick (cooperative only increments counter for now)
     sched_tick();
 }

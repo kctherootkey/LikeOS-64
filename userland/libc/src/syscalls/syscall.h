@@ -68,6 +68,29 @@
 #define SYS_GETDENTS64  245
 #define SYS_GETDENTS    246
 
+// Signal syscalls
+#define SYS_RT_SIGACTION    250
+#define SYS_RT_SIGPROCMASK  251
+#define SYS_RT_SIGPENDING   252
+#define SYS_RT_SIGTIMEDWAIT 253
+#define SYS_RT_SIGQUEUEINFO 254
+#define SYS_RT_SIGSUSPEND   255
+#define SYS_RT_SIGRETURN    256
+#define SYS_SIGALTSTACK     257
+#define SYS_TKILL           258
+#define SYS_TGKILL          259
+#define SYS_ALARM           260
+#define SYS_SETITIMER       261
+#define SYS_GETITIMER       262
+#define SYS_TIMER_CREATE    263
+#define SYS_TIMER_SETTIME   264
+#define SYS_TIMER_GETTIME   265
+#define SYS_TIMER_GETOVERRUN 266
+#define SYS_TIMER_DELETE    267
+#define SYS_SIGNALFD        268
+#define SYS_PAUSE           270
+#define SYS_NANOSLEEP       271
+
 // Syscall wrapper - uses inline assembly to invoke syscall instruction
 static inline long syscall0(long number) {
     long ret;

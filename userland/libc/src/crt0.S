@@ -1,6 +1,7 @@
 .section .text
 .global _start
 .global _entry
+.global __restore_rt
 
 _entry:
 _start:
@@ -37,4 +38,12 @@ _start:
     syscall
     
     # Should never get here
+    hlt
+
+# Signal return trampoline - called when a signal handler returns
+# This calls sys_rt_sigreturn to restore the original context
+__restore_rt:
+    mov $256, %rax     # SYS_RT_SIGRETURN = 256
+    syscall
+    # Should never return; if it does, just loop forever
     hlt

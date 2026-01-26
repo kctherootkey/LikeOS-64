@@ -50,6 +50,11 @@ syscall_saved_user_r14:
 syscall_saved_user_r15:
     dq 0
 
+; Signal delivery: if non-zero, this is the signal number to pass in RDI
+global syscall_signal_pending
+syscall_signal_pending:
+    dq 0
+
 SECTION .text
 
 syscall_entry:
@@ -103,6 +108,13 @@ syscall_entry:
     sti
     call syscall_handler
     
+    ; Check if signal delivery modified the return context
+    ; If syscall_signal_pending is non-zero, use modified context for signal handler
+    mov rdi, [rel syscall_signal_pending]
+    test rdi, rdi
+    jnz .signal_return
+    
+    ; Normal syscall return path
     ; Restore stack to where registers were saved
     ; Use per-task kernel stack
     mov rsp, [rel g_current_kernel_stack]
@@ -132,6 +144,70 @@ syscall_entry:
     pop rcx
     pop r11
     pop rsp
+    
+    o64 sysret
+
+.signal_return:
+    ; Signal handler or sigreturn path
+    ; RDI has value from syscall_signal_pending
+    ; If RDI == -1 (0xFFFFFFFFFFFFFFFF), this is sigreturn - don't set RDI to signal
+    ; Otherwise, RDI is the signal number for the handler
+    
+    ; Clear the pending flag
+    xor rax, rax
+    mov [rel syscall_signal_pending], rax
+    
+    ; Check if this is sigreturn (RDI == -1) or signal delivery
+    cmp rdi, -1
+    je .sigreturn_restore
+    
+    ; Signal handler call - RDI already has signal number
+    ; Load modified context from saved variables
+    mov rcx, [rel syscall_saved_user_rip]     ; Handler address -> RCX for SYSRET
+    mov r11, [rel syscall_saved_user_rflags]  ; RFLAGS -> R11 for SYSRET
+    mov rsp, [rel syscall_saved_user_rsp]     ; Signal frame on stack
+    
+    ; Restore callee-saved registers (handler expects these)
+    mov rbp, [rel syscall_saved_user_rbp]
+    mov rbx, [rel syscall_saved_user_rbx]
+    mov r12, [rel syscall_saved_user_r12]
+    mov r13, [rel syscall_saved_user_r13]
+    mov r14, [rel syscall_saved_user_r14]
+    mov r15, [rel syscall_saved_user_r15]
+    
+    ; Clear other registers for security (except RDI which has signal number)
+    xor rax, rax
+    xor rsi, rsi
+    xor rdx, rdx
+    xor r8, r8
+    xor r9, r9
+    xor r10, r10
+    
+    o64 sysret
+
+.sigreturn_restore:
+    ; Sigreturn path - restore full context from saved variables
+    ; The saved variables were already updated by signal_restore_frame
+    mov rcx, [rel syscall_saved_user_rip]     ; Original RIP -> RCX for SYSRET
+    mov r11, [rel syscall_saved_user_rflags]  ; RFLAGS -> R11 for SYSRET
+    mov rsp, [rel syscall_saved_user_rsp]     ; Original user RSP
+    
+    ; Restore callee-saved registers
+    mov rbp, [rel syscall_saved_user_rbp]
+    mov rbx, [rel syscall_saved_user_rbx]
+    mov r12, [rel syscall_saved_user_r12]
+    mov r13, [rel syscall_saved_user_r13]
+    mov r14, [rel syscall_saved_user_r14]
+    mov r15, [rel syscall_saved_user_r15]
+    
+    ; Clear other registers
+    xor rax, rax
+    xor rdi, rdi
+    xor rsi, rsi
+    xor rdx, rdx
+    xor r8, r8
+    xor r9, r9
+    xor r10, r10
     
     o64 sysret
 

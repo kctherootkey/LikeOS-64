@@ -305,11 +305,10 @@ long tty_read(tty_t* tty, void* buf, long count, int nonblock) {
 
     while (read < count) {
         // Check if we've been killed or have a pending signal
-        if (cur && (cur->state == TASK_ZOMBIE || cur->pending_signal > 0)) {
-            // Mark task as exited due to signal
-            if (cur->pending_signal > 0) {
-                sched_mark_task_exited(cur, cur->exit_code);
-                sched_yield();
+        if (cur && (cur->state == TASK_ZOMBIE || signal_pending(cur))) {
+            // Handle pending signal
+            if (signal_pending(cur)) {
+                return read > 0 ? read : -EINTR;
             }
             return read > 0 ? read : -EINTR;
         }
@@ -329,11 +328,10 @@ long tty_read(tty_t* tty, void* buf, long count, int nonblock) {
                 tty->read_waiters = cur;
                 sched_yield();
                 // Check if we were killed or have a pending signal
-                if (cur->state == TASK_ZOMBIE || cur->has_exited || cur->pending_signal > 0) {
-                    // Mark task as exited due to signal
-                    if (cur->pending_signal > 0) {
-                        sched_mark_task_exited(cur, cur->exit_code);
-                        sched_yield();
+                if (cur->state == TASK_ZOMBIE || cur->has_exited || signal_pending(cur)) {
+                    // Handle pending signal
+                    if (signal_pending(cur)) {
+                        return read > 0 ? read : -EINTR;
                     }
                     return read > 0 ? read : -EINTR;
                 }

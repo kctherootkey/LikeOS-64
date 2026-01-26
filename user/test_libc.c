@@ -704,6 +704,107 @@ int main(int argc, char** argv) {
     }
 
     // ========================================
+    // Test: Extended signal handling (kernel syscalls)
+    // ========================================
+    printf("\n[TEST] extended signal handling\n");
+    
+    // Reinstall handle_sigusr1 (was overwritten by handle_generic in loop above)
+    signal(SIGUSR1, handle_sigusr1);
+    
+    // Test sigprocmask
+    sigset_t oldmask, newmask, pendmask;
+    sigemptyset(&newmask);
+    sigaddset(&newmask, SIGUSR1);
+    
+    test_result("sigprocmask(SIG_BLOCK, SIGUSR1) returns 0", 
+                sigprocmask(SIG_BLOCK, &newmask, &oldmask) == 0);
+    
+    // Signal should now be blocked - raise it, it should be pending
+    g_sigusr1_hit = 0;
+    raise(SIGUSR1);
+    test_result("SIGUSR1 blocked, handler not called", g_sigusr1_hit == 0);
+    
+    // Check sigpending
+    sigemptyset(&pendmask);
+    test_result("sigpending returns 0", sigpending(&pendmask) == 0);
+    test_result("SIGUSR1 is pending", sigismember(&pendmask, SIGUSR1) == 1);
+    
+    // Unblock and deliver
+    test_result("sigprocmask(SIG_UNBLOCK, SIGUSR1) returns 0", 
+                sigprocmask(SIG_UNBLOCK, &newmask, NULL) == 0);
+    test_result("SIGUSR1 delivered after unblock", g_sigusr1_hit == 1);
+    
+    // Test sigaction with structure
+    struct sigaction sa_new, sa_old;
+    memset(&sa_new, 0, sizeof(sa_new));
+    sa_new.sa_handler = handle_sigusr2;
+    sigemptyset(&sa_new.sa_mask);
+    sa_new.sa_flags = 0;
+    
+    g_sigusr2_hit = 0;
+    test_result("sigaction(SIGUSR2) returns 0", 
+                sigaction(SIGUSR2, &sa_new, &sa_old) == 0);
+    raise(SIGUSR2);
+    test_result("sigaction handler called", g_sigusr2_hit == 1);
+    
+    // Test sigfillset
+    sigset_t fullset;
+    sigfillset(&fullset);
+    test_result("sigfillset: SIGUSR1 set", sigismember(&fullset, SIGUSR1) == 1);
+    test_result("sigfillset: SIGUSR2 set", sigismember(&fullset, SIGUSR2) == 1);
+    test_result("sigfillset: SIGTERM set", sigismember(&fullset, SIGTERM) == 1);
+    
+    // Test sigdelset
+    sigdelset(&fullset, SIGUSR1);
+    test_result("sigdelset(SIGUSR1) works", sigismember(&fullset, SIGUSR1) == 0);
+    test_result("sigdelset: SIGUSR2 still set", sigismember(&fullset, SIGUSR2) == 1);
+    
+    // Test SIG_IGN
+    signal(SIGUSR1, SIG_IGN);
+    g_sigusr1_hit = 0;
+    raise(SIGUSR1);
+    test_result("SIG_IGN: handler not called", g_sigusr1_hit == 0);
+    
+    // Test SIG_DFL restore
+    signal(SIGUSR1, handle_sigusr1);
+    g_sigusr1_hit = 0;
+    raise(SIGUSR1);
+    test_result("handler restored after SIG_IGN", g_sigusr1_hit == 1);
+    
+    // Test nanosleep
+    printf("\n[TEST] nanosleep\n");
+    struct timespec ts_req, ts_rem;
+    ts_req.tv_sec = 0;
+    ts_req.tv_nsec = 50000000;  // 50ms
+    ts_rem.tv_sec = 0;
+    ts_rem.tv_nsec = 0;
+    int ns_ret = nanosleep(&ts_req, &ts_rem);
+    test_result("nanosleep(50ms) returns 0", ns_ret == 0);
+    
+    // Test usleep
+    printf("\n[TEST] usleep\n");
+    test_result("usleep(10000) returns 0", usleep(10000) == 0);  // 10ms
+    
+    // Test sigaltstack
+    printf("\n[TEST] sigaltstack\n");
+    stack_t ss_new, ss_old;
+    static char alt_stack_buf[SIGSTKSZ];
+    ss_new.ss_sp = alt_stack_buf;
+    ss_new.ss_size = SIGSTKSZ;
+    ss_new.ss_flags = 0;
+    test_result("sigaltstack set returns 0", sigaltstack(&ss_new, &ss_old) == 0);
+    
+    // Verify we can get it back
+    stack_t ss_check;
+    test_result("sigaltstack get returns 0", sigaltstack(NULL, &ss_check) == 0);
+    test_result("sigaltstack ss_sp matches", ss_check.ss_sp == alt_stack_buf);
+    test_result("sigaltstack ss_size matches", ss_check.ss_size == SIGSTKSZ);
+    
+    // Disable alternate stack
+    ss_new.ss_flags = SS_DISABLE;
+    test_result("sigaltstack disable returns 0", sigaltstack(&ss_new, NULL) == 0);
+
+    // ========================================
     // Test: alarm/sleep
     // ========================================
     printf("\n[TEST] alarm/sleep\n");

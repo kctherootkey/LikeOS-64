@@ -310,19 +310,7 @@ int tcsetpgrp(int fd, int pgrp) {
     return 0;
 }
 
-int kill(int pid, int sig) {
-    if (sig == 0) {
-        long ret = syscall2(SYS_KILL, pid, sig);
-        if (ret < 0) { errno = -ret; return -1; }
-        return 0;
-    }
-    if (pid == getpid()) {
-        return raise(sig);
-    }
-    long ret = syscall2(SYS_KILL, pid, sig);
-    if (ret < 0) { errno = -ret; return -1; }
-    return 0;
-}
+// Note: kill() is defined in signal.c
 
 pid_t wait(int* status) {
     return waitpid(-1, status, 0);
@@ -424,70 +412,7 @@ time_t time(time_t* tloc) {
     return (time_t)ret;
 }
 
-static int alarm_active = 0;
-static struct timeval alarm_deadline;
-
-static void alarm_check(void) {
-    if (!alarm_active) {
-        return;
-    }
-    struct timeval now;
-    if (gettimeofday(&now, 0) != 0) {
-        return;
-    }
-    if (now.tv_sec > alarm_deadline.tv_sec ||
-        (now.tv_sec == alarm_deadline.tv_sec && now.tv_usec >= alarm_deadline.tv_usec)) {
-        alarm_active = 0;
-        raise(SIGALRM);
-    }
-}
-
-unsigned int alarm(unsigned int seconds) {
-    unsigned int remaining = 0;
-    if (alarm_active) {
-        struct timeval now;
-        if (gettimeofday(&now, 0) == 0) {
-            long dsec = alarm_deadline.tv_sec - now.tv_sec;
-            long dusec = alarm_deadline.tv_usec - now.tv_usec;
-            if (dusec < 0) { dsec -= 1; dusec += 1000000; }
-            if (dsec > 0) {
-                remaining = (unsigned int)dsec;
-                if (dusec > 0) {
-                    remaining += 1; // round up
-                }
-            }
-        }
-    }
-
-    if (seconds == 0) {
-        alarm_active = 0;
-        return remaining;
-    }
-
-    struct timeval now;
-    if (gettimeofday(&now, 0) != 0) {
-        errno = EINVAL;
-        return remaining;
-    }
-    alarm_deadline.tv_sec = now.tv_sec + (long)seconds;
-    alarm_deadline.tv_usec = now.tv_usec;
-    alarm_active = 1;
-    return remaining;
-}
-
-unsigned int sleep(unsigned int seconds) {
-    struct timeval start;
-    struct timeval now;
-    gettimeofday(&start, 0);
-    while (1) {
-        alarm_check();
-        gettimeofday(&now, 0);
-        long elapsed = now.tv_sec - start.tv_sec;
-        if (elapsed >= (long)seconds) break;
-        sched_yield();
-    }
-    return 0;
-}
+// Note: alarm() and sleep() are defined in signal.c
 
 int isatty(int fd) {
     return (fd == 0 || fd == 1 || fd == 2) ? 1 : 0;

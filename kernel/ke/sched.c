@@ -124,7 +124,9 @@ void sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack
     t->ctty = NULL;
     t->wait_next = NULL;
     t->wait_channel = NULL;
-    t->pending_signal = 0;
+    
+    // Initialize signal state
+    signal_init_task(t);
     
     // Initialize process hierarchy
     t->parent = NULL;
@@ -202,7 +204,9 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
     t->ctty = tty_get_console();
     t->wait_next = NULL;
     t->wait_channel = NULL;
-    t->pending_signal = 0;
+    
+    // Initialize signal state
+    signal_init_task(t);
     
     // Initialize process hierarchy
     t->parent = NULL;
@@ -580,7 +584,9 @@ task_t* sched_fork_current(void) {
     child->is_fork_child = true;  // Child should return 0 from fork
     child->wait_next = NULL;
     child->wait_channel = NULL;
-    child->pending_signal = 0;    // Clear any pending signals
+    
+    // Initialize signal state for child
+    signal_init_task(child);
     
     // Add to parent's child list
     sched_add_child(cur, child);
@@ -689,30 +695,108 @@ void sched_signal_task(task_t* task, int sig) {
     if (!task) {
         return;
     }
-    if (sig == SIGCONT) {
-        if (task->state == TASK_STOPPED) {
-            task->state = TASK_READY;
-        }
-        return;
-    }
-    if (sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) {
-        task->state = TASK_STOPPED;
+    
+    // Build siginfo
+    siginfo_t info;
+    mm_memset(&info, 0, sizeof(info));
+    info.si_signo = sig;
+    info.si_code = SI_USER;
+    
+    // SIGKILL and SIGSTOP cannot be caught or ignored
+    if (sig == SIGKILL) {
+        signal_send(task, sig, &info);
+        task->exit_code = 128 + sig;
+        sched_mark_task_exited(task, 128 + sig);
         if (task == sched_current()) {
             sched_yield();
         }
         return;
     }
-    // For terminal signals (SIGINT, SIGTERM, SIGKILL, etc.), kill the task immediately
-    // This allows blocked tasks to be terminated properly
-    task->pending_signal = sig;
-    task->exit_code = 128 + sig;
     
-    // Mark the task as exited immediately (don't wait for it to check pending_signal)
-    sched_mark_task_exited(task, 128 + sig);
+    if (sig == SIGSTOP) {
+        task->state = TASK_STOPPED;
+        signal_send(task, sig, &info);
+        if (task == sched_current()) {
+            sched_yield();
+        }
+        return;
+    }
     
-    // If this is the current task, yield to switch away
-    if (task == sched_current()) {
-        sched_yield();
+    if (sig == SIGCONT) {
+        if (task->state == TASK_STOPPED) {
+            task->state = TASK_READY;
+        }
+        signal_send(task, sig, &info);
+        return;
+    }
+    
+    // For stop signals (SIGTSTP, SIGTTIN, SIGTTOU), check handler
+    if (sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU) {
+        struct k_sigaction* act = &task->signals.action[sig];
+        if (act->sa_handler == SIG_DFL) {
+            // Default action: stop
+            task->state = TASK_STOPPED;
+            signal_send(task, sig, &info);
+            if (task == sched_current()) {
+                sched_yield();
+            }
+            return;
+        }
+        // Has handler - send signal normally
+        signal_send(task, sig, &info);
+        // Wake if blocked
+        if (task->state == TASK_BLOCKED) {
+            task->state = TASK_READY;
+        }
+        return;
+    }
+    
+    // For other signals (SIGINT, SIGTERM, SIGQUIT, etc.), check for handler
+    struct k_sigaction* act = &task->signals.action[sig];
+    
+    if (act->sa_handler == SIG_IGN) {
+        // Signal is ignored - do nothing
+        return;
+    }
+    
+    if (act->sa_handler != SIG_DFL) {
+        // Has a user handler - send signal, don't kill
+        signal_send(task, sig, &info);
+        // Wake if blocked so it can handle the signal
+        if (task->state == TASK_BLOCKED) {
+            task->state = TASK_READY;
+        }
+        return;
+    }
+    
+    // SIG_DFL - check default action
+    int def_action = sig_default_action(sig);
+    signal_send(task, sig, &info);
+    
+    switch (def_action) {
+        case SIG_DFL_TERM:
+        case SIG_DFL_CORE:
+            // Default action is terminate
+            task->exit_code = 128 + sig;
+            sched_mark_task_exited(task, 128 + sig);
+            if (task == sched_current()) {
+                sched_yield();
+            }
+            break;
+        case SIG_DFL_STOP:
+            task->state = TASK_STOPPED;
+            if (task == sched_current()) {
+                sched_yield();
+            }
+            break;
+        case SIG_DFL_IGN:
+            // Ignore
+            break;
+        case SIG_DFL_CONT:
+            if (task->state == TASK_STOPPED) {
+                task->state = TASK_READY;
+            }
+            break;
     }
 }
 

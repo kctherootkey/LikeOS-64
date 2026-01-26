@@ -1087,15 +1087,27 @@ static int64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgrp) {
     return 0;
 }
 
+// Forward declaration for signal functions
+extern ktimer_t timer_create_internal(task_t* task, clockid_t clockid, struct k_sigevent* sevp);
+extern int timer_settime_internal(ktimer_t timerid, int flags, 
+                                  const struct k_itimerspec* new_value,
+                                  struct k_itimerspec* old_value);
+extern int timer_gettime_internal(ktimer_t timerid, struct k_itimerspec* curr_value);
+extern int timer_getoverrun_internal(ktimer_t timerid);
+extern int timer_delete_internal(ktimer_t timerid);
+
 static void kill_task(task_t* t, int sig) {
     if (!t) {
         return;
     }
-    if (t == sched_current()) {
-        sys_exit(128 + sig);
-        return;
-    }
-    sched_signal_task(t, sig);
+    // Use new signal infrastructure - queue the signal for later delivery
+    // The signal will be delivered when returning from this syscall
+    siginfo_t info;
+    mm_memset(&info, 0, sizeof(info));
+    info.si_signo = sig;
+    info.si_code = SI_USER;
+    info.si_pid = sched_current() ? sched_current()->id : 0;
+    signal_send(t, sig, &info);
 }
 
 static int64_t sys_kill(uint64_t pid, uint64_t sig) {
@@ -1686,9 +1698,10 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options) {
     // Store status if requested
     if (status_ptr && validate_user_ptr(status_ptr, sizeof(int))) {
         int status = 0;
-        if (child->pending_signal) {
+        // Check if child exited due to signal (via exit_code > 128)
+        if (child->exit_code >= 128 && child->exit_code < 256) {
             // Signaled exit: low 7 bits are signal number
-            status = (child->pending_signal & 0x7F);
+            status = (child->exit_code - 128) & 0x7F;
         } else {
             // Normal exit: exit_code << 8
             status = (child->exit_code & 0xFF) << 8;
@@ -1946,8 +1959,541 @@ static int64_t sys_yield(void) {
     return 0;
 }
 
-// Main syscall dispatcher
-int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, 
+// ============================================================================
+// Signal Syscalls
+// ============================================================================
+
+// SYS_RT_SIGACTION - set signal handler
+static int64_t sys_rt_sigaction(uint64_t sig, uint64_t act_ptr, uint64_t oldact_ptr, uint64_t sigsetsize) {
+    if (sigsetsize != sizeof(kernel_sigset_t)) {
+        return -EINVAL;
+    }
+    if (sig <= 0 || sig >= NSIG) {
+        return -EINVAL;
+    }
+    if (sig_kernel_only(sig)) {
+        return -EINVAL;  // Can't change SIGKILL/SIGSTOP
+    }
+    
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    struct k_sigaction* kact = &cur->signals.action[sig];
+    
+    // Copy old action if requested
+    if (oldact_ptr) {
+        if (copy_to_user((void*)oldact_ptr, kact, sizeof(struct k_sigaction)) != 0) {
+            return -EFAULT;
+        }
+    }
+    
+    // Set new action if provided
+    if (act_ptr) {
+        struct k_sigaction newact;
+        if (copy_from_user(&newact, (void*)act_ptr, sizeof(struct k_sigaction)) != 0) {
+            return -EFAULT;
+        }
+        mm_memcpy(kact, &newact, sizeof(struct k_sigaction));
+    }
+    
+    return 0;
+}
+
+// SYS_RT_SIGPROCMASK - change blocked signals
+static int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set_ptr, uint64_t oldset_ptr, uint64_t sigsetsize) {
+    if (sigsetsize != sizeof(kernel_sigset_t)) {
+        return -EINVAL;
+    }
+    
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    kernel_sigset_t* blocked = &cur->signals.blocked;
+    
+    // Copy old mask if requested
+    if (oldset_ptr) {
+        if (copy_to_user((void*)oldset_ptr, blocked, sizeof(kernel_sigset_t)) != 0) {
+            return -EFAULT;
+        }
+    }
+    
+    // Set new mask if provided
+    if (set_ptr) {
+        kernel_sigset_t newset;
+        if (copy_from_user(&newset, (void*)set_ptr, sizeof(kernel_sigset_t)) != 0) {
+            return -EFAULT;
+        }
+        
+        switch (how) {
+            case SIG_BLOCK:
+                sigorset_k(blocked, blocked, &newset);
+                break;
+            case SIG_UNBLOCK:
+                signandset_k(blocked, blocked, &newset);
+                break;
+            case SIG_SETMASK:
+                *blocked = newset;
+                break;
+            default:
+                return -EINVAL;
+        }
+        
+        // Can't block SIGKILL or SIGSTOP
+        sigdelset_k(blocked, SIGKILL);
+        sigdelset_k(blocked, SIGSTOP);
+    }
+    
+    return 0;
+}
+
+// SYS_RT_SIGPENDING - get pending signals
+static int64_t sys_rt_sigpending(uint64_t set_ptr, uint64_t sigsetsize) {
+    if (sigsetsize != sizeof(kernel_sigset_t)) {
+        return -EINVAL;
+    }
+    
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    if (copy_to_user((void*)set_ptr, &cur->signals.pending, sizeof(kernel_sigset_t)) != 0) {
+        return -EFAULT;
+    }
+    
+    return 0;
+}
+
+// SYS_RT_SIGTIMEDWAIT - wait for signal with timeout
+static int64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr, uint64_t timeout_ptr, uint64_t sigsetsize) {
+    if (sigsetsize != sizeof(kernel_sigset_t)) {
+        return -EINVAL;
+    }
+    
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    kernel_sigset_t wait_set;
+    if (copy_from_user(&wait_set, (void*)set_ptr, sizeof(kernel_sigset_t)) != 0) {
+        return -EFAULT;
+    }
+    
+    struct k_timespec timeout;
+    uint64_t deadline = 0;
+    if (timeout_ptr) {
+        if (copy_from_user(&timeout, (void*)timeout_ptr, sizeof(struct k_timespec)) != 0) {
+            return -EFAULT;
+        }
+        uint64_t ticks = timeout.tv_sec * 100 + timeout.tv_nsec / 10000000;
+        deadline = timer_ticks() + ticks;
+    }
+    
+    // Check if any signals in wait_set are already pending
+    while (1) {
+        for (int sig = 1; sig < NSIG; sig++) {
+            if (sigismember_k(&wait_set, sig) && sigismember_k(&cur->signals.pending, sig)) {
+                // Found a signal
+                siginfo_t info;
+                signal_dequeue(cur, &wait_set, &info);
+                
+                if (info_ptr) {
+                    if (copy_to_user((void*)info_ptr, &info, sizeof(siginfo_t)) != 0) {
+                        return -EFAULT;
+                    }
+                }
+                return sig;
+            }
+        }
+        
+        // Check timeout
+        if (timeout_ptr && timer_ticks() >= deadline) {
+            return -EAGAIN;
+        }
+        
+        // Block task and wait
+        cur->state = TASK_BLOCKED;
+        sched_yield();
+        
+        // Check if we should exit
+        if (cur->has_exited) {
+            return -EINTR;
+        }
+    }
+}
+
+// SYS_RT_SIGQUEUEINFO - queue signal with info
+static int64_t sys_rt_sigqueueinfo(uint64_t pid, uint64_t sig, uint64_t info_ptr) {
+    if (sig <= 0 || sig >= NSIG) {
+        return -EINVAL;
+    }
+    
+    task_t* target = sched_find_task_by_id((uint32_t)pid);
+    if (!target) {
+        return -ESRCH;
+    }
+    
+    siginfo_t info;
+    if (copy_from_user(&info, (void*)info_ptr, sizeof(siginfo_t)) != 0) {
+        return -EFAULT;
+    }
+    
+    // Enforce that si_code indicates user-originated
+    info.si_code = SI_QUEUE;
+    
+    return signal_send(target, (int)sig, &info);
+}
+
+// SYS_RT_SIGSUSPEND - suspend until signal
+static int64_t sys_rt_sigsuspend(uint64_t mask_ptr, uint64_t sigsetsize) {
+    if (sigsetsize != sizeof(kernel_sigset_t)) {
+        return -EINVAL;
+    }
+    
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    kernel_sigset_t newmask;
+    if (copy_from_user(&newmask, (void*)mask_ptr, sizeof(kernel_sigset_t)) != 0) {
+        return -EFAULT;
+    }
+    
+    // Save current mask and set new one
+    cur->signals.saved_mask = cur->signals.blocked;
+    cur->signals.blocked = newmask;
+    cur->signals.in_sigsuspend = 1;
+    
+    // Can't block SIGKILL/SIGSTOP
+    sigdelset_k(&cur->signals.blocked, SIGKILL);
+    sigdelset_k(&cur->signals.blocked, SIGSTOP);
+    
+    // Block until signal
+    cur->state = TASK_BLOCKED;
+    
+    while (!signal_pending(cur)) {
+        sched_yield();
+        if (cur->has_exited) {
+            cur->signals.in_sigsuspend = 0;
+            cur->signals.blocked = cur->signals.saved_mask;
+            return -EINTR;
+        }
+    }
+    
+    // Restore mask
+    cur->signals.in_sigsuspend = 0;
+    cur->signals.blocked = cur->signals.saved_mask;
+    
+    return -EINTR;  // sigsuspend always returns EINTR
+}
+
+// SYS_RT_SIGRETURN - return from signal handler
+static int64_t sys_rt_sigreturn(void) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    // Restore context from the signal frame
+    if (signal_restore_frame(cur) < 0) {
+        kprintf("sys_rt_sigreturn: failed to restore frame\n");
+        return -EFAULT;
+    }
+    
+    // The return value will be ignored - we're restoring the original
+    // context which includes the original RAX value
+    return 0;
+}
+
+// SYS_SIGALTSTACK - set/get alternate signal stack
+static int64_t sys_sigaltstack(uint64_t ss_ptr, uint64_t old_ss_ptr) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    // Copy old stack if requested
+    if (old_ss_ptr) {
+        if (copy_to_user((void*)old_ss_ptr, &cur->signals.altstack, sizeof(stack_t)) != 0) {
+            return -EFAULT;
+        }
+    }
+    
+    // Set new stack if provided
+    if (ss_ptr) {
+        stack_t newss;
+        if (copy_from_user(&newss, (void*)ss_ptr, sizeof(stack_t)) != 0) {
+            return -EFAULT;
+        }
+        
+        // Validate
+        if (!(newss.ss_flags & SS_DISABLE)) {
+            if (newss.ss_size < MINSIGSTKSZ) {
+                return -ENOMEM;
+            }
+        }
+        
+        cur->signals.altstack = newss;
+    }
+    
+    return 0;
+}
+
+// SYS_TKILL - send signal to specific thread
+static int64_t sys_tkill(uint64_t tid, uint64_t sig) {
+    if (sig <= 0 || sig >= NSIG) {
+        return -EINVAL;
+    }
+    
+    task_t* target = sched_find_task_by_id((uint32_t)tid);
+    if (!target) {
+        return -ESRCH;
+    }
+    
+    siginfo_t info;
+    mm_memset(&info, 0, sizeof(info));
+    info.si_signo = (int)sig;
+    info.si_code = SI_TKILL;
+    info.si_pid = sched_current() ? sched_current()->id : 0;
+    
+    return signal_send(target, (int)sig, &info);
+}
+
+// SYS_TGKILL - send signal to thread in thread group
+static int64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig) {
+    (void)tgid;  // We don't have thread groups, just use tid
+    return sys_tkill(tid, sig);
+}
+
+// SYS_ALARM - set alarm clock
+static int64_t sys_alarm(uint64_t seconds) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    uint64_t old_remaining = 0;
+    
+    // Calculate remaining time from old alarm
+    if (cur->signals.alarm_ticks > 0) {
+        uint64_t now = timer_ticks();
+        if (cur->signals.alarm_ticks > now) {
+            old_remaining = (cur->signals.alarm_ticks - now) / 100;  // ticks to seconds
+        }
+    }
+    
+    // Set new alarm
+    if (seconds > 0) {
+        cur->signals.alarm_ticks = timer_ticks() + seconds * 100;  // 100 Hz
+    } else {
+        cur->signals.alarm_ticks = 0;  // Cancel
+    }
+    
+    return (int64_t)old_remaining;
+}
+
+// SYS_SETITIMER - set interval timer
+static int64_t sys_setitimer(uint64_t which, uint64_t new_value_ptr, uint64_t old_value_ptr) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    struct k_itimerval* timer;
+    switch (which) {
+        case ITIMER_REAL:
+            timer = &cur->signals.itimer_real;
+            break;
+        case ITIMER_VIRTUAL:
+            timer = &cur->signals.itimer_virtual;
+            break;
+        case ITIMER_PROF:
+            timer = &cur->signals.itimer_prof;
+            break;
+        default:
+            return -EINVAL;
+    }
+    
+    // Copy old value if requested
+    if (old_value_ptr) {
+        if (copy_to_user((void*)old_value_ptr, timer, sizeof(struct k_itimerval)) != 0) {
+            return -EFAULT;
+        }
+    }
+    
+    // Set new value if provided
+    if (new_value_ptr) {
+        if (copy_from_user(timer, (void*)new_value_ptr, sizeof(struct k_itimerval)) != 0) {
+            return -EFAULT;
+        }
+    }
+    
+    return 0;
+}
+
+// SYS_GETITIMER - get interval timer
+static int64_t sys_getitimer(uint64_t which, uint64_t curr_value_ptr) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    struct k_itimerval* timer;
+    switch (which) {
+        case ITIMER_REAL:
+            timer = &cur->signals.itimer_real;
+            break;
+        case ITIMER_VIRTUAL:
+            timer = &cur->signals.itimer_virtual;
+            break;
+        case ITIMER_PROF:
+            timer = &cur->signals.itimer_prof;
+            break;
+        default:
+            return -EINVAL;
+    }
+    
+    if (copy_to_user((void*)curr_value_ptr, timer, sizeof(struct k_itimerval)) != 0) {
+        return -EFAULT;
+    }
+    
+    return 0;
+}
+
+// SYS_TIMER_CREATE - create POSIX timer
+static int64_t sys_timer_create(uint64_t clockid, uint64_t sevp_ptr, uint64_t timerid_ptr) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    struct k_sigevent sevp;
+    if (sevp_ptr) {
+        if (copy_from_user(&sevp, (void*)sevp_ptr, sizeof(struct k_sigevent)) != 0) {
+            return -EFAULT;
+        }
+    } else {
+        // Default
+        mm_memset(&sevp, 0, sizeof(sevp));
+        sevp.sigev_notify = SIGEV_SIGNAL;
+        sevp.sigev_signo = SIGALRM;
+    }
+    
+    ktimer_t tid = timer_create_internal(cur, (clockid_t)clockid, &sevp);
+    if (tid < 0) {
+        return -EAGAIN;
+    }
+    
+    if (copy_to_user((void*)timerid_ptr, &tid, sizeof(ktimer_t)) != 0) {
+        timer_delete_internal(tid);
+        return -EFAULT;
+    }
+    
+    return 0;
+}
+
+// SYS_TIMER_SETTIME - set POSIX timer
+static int64_t sys_timer_settime(uint64_t timerid, uint64_t flags, uint64_t new_value_ptr, uint64_t old_value_ptr) {
+    struct k_itimerspec new_value, old_value;
+    
+    if (copy_from_user(&new_value, (void*)new_value_ptr, sizeof(struct k_itimerspec)) != 0) {
+        return -EFAULT;
+    }
+    
+    int ret = timer_settime_internal((ktimer_t)timerid, (int)flags, &new_value, 
+                                     old_value_ptr ? &old_value : NULL);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    if (old_value_ptr) {
+        if (copy_to_user((void*)old_value_ptr, &old_value, sizeof(struct k_itimerspec)) != 0) {
+            return -EFAULT;
+        }
+    }
+    
+    return 0;
+}
+
+// SYS_TIMER_GETTIME - get POSIX timer
+static int64_t sys_timer_gettime(uint64_t timerid, uint64_t curr_value_ptr) {
+    struct k_itimerspec curr_value;
+    
+    int ret = timer_gettime_internal((ktimer_t)timerid, &curr_value);
+    if (ret < 0) {
+        return ret;
+    }
+    
+    if (copy_to_user((void*)curr_value_ptr, &curr_value, sizeof(struct k_itimerspec)) != 0) {
+        return -EFAULT;
+    }
+    
+    return 0;
+}
+
+// SYS_TIMER_GETOVERRUN - get timer overrun count
+static int64_t sys_timer_getoverrun(uint64_t timerid) {
+    return timer_getoverrun_internal((ktimer_t)timerid);
+}
+
+// SYS_TIMER_DELETE - delete POSIX timer
+static int64_t sys_timer_delete(uint64_t timerid) {
+    return timer_delete_internal((ktimer_t)timerid);
+}
+
+// SYS_PAUSE - suspend until signal
+static int64_t sys_pause(void) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    // Block until any signal arrives
+    cur->state = TASK_BLOCKED;
+    
+    while (!signal_pending(cur)) {
+        sched_yield();
+        if (cur->has_exited) {
+            return -EINTR;
+        }
+    }
+    
+    return -EINTR;  // pause always returns EINTR
+}
+
+// SYS_NANOSLEEP - sleep with nanosecond precision
+static int64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    
+    struct k_timespec req;
+    if (copy_from_user(&req, (void*)req_ptr, sizeof(struct k_timespec)) != 0) {
+        return -EFAULT;
+    }
+    
+    // Calculate ticks to sleep (100 Hz = 10ms per tick)
+    uint64_t ticks = req.tv_sec * 100 + req.tv_nsec / 10000000;
+    uint64_t start = timer_ticks();
+    uint64_t end = start + ticks;
+    
+    cur->state = TASK_BLOCKED;
+    
+    while (timer_ticks() < end) {
+        sched_yield();
+        
+        // Check for signal interruption
+        if (signal_pending(cur)) {
+            // Calculate remaining time
+            if (rem_ptr) {
+                uint64_t elapsed = timer_ticks() - start;
+                uint64_t remaining = (elapsed < ticks) ? ticks - elapsed : 0;
+                struct k_timespec rem;
+                rem.tv_sec = remaining / 100;
+                rem.tv_nsec = (remaining % 100) * 10000000;
+                copy_to_user((void*)rem_ptr, &rem, sizeof(struct k_timespec));
+            }
+            cur->state = TASK_READY;
+            return -EINTR;
+        }
+    }
+    
+    cur->state = TASK_READY;
+    return 0;
+}
+
+// SYS_SIGNALFD / SYS_SIGNALFD4 - create signalfd (simplified stub)
+static int64_t sys_signalfd(uint64_t fd, uint64_t mask_ptr, uint64_t flags) {
+    (void)fd;
+    (void)mask_ptr;
+    (void)flags;
+    // signalfd is complex to implement fully - return ENOSYS for now
+    return -ENOSYS;
+}
+
+// Main syscall dispatcher (inner function)
+static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2, 
                         uint64_t a3, uint64_t a4, uint64_t a5) {
     switch (num) {
         case SYS_READ:
@@ -2137,8 +2683,88 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
 
         case SYS_FCHOWN:
             return sys_fchown(a1, a2, a3);
+
+        // Signal syscalls
+        case SYS_RT_SIGACTION:
+            return sys_rt_sigaction(a1, a2, a3, a4);
+        case SYS_RT_SIGPROCMASK:
+            return sys_rt_sigprocmask(a1, a2, a3, a4);
+        case SYS_RT_SIGPENDING:
+            return sys_rt_sigpending(a1, a2);
+        case SYS_RT_SIGTIMEDWAIT:
+            return sys_rt_sigtimedwait(a1, a2, a3, a4);
+        case SYS_RT_SIGQUEUEINFO:
+            return sys_rt_sigqueueinfo(a1, a2, a3);
+        case SYS_RT_SIGSUSPEND:
+            return sys_rt_sigsuspend(a1, a2);
+        case SYS_RT_SIGRETURN:
+            return sys_rt_sigreturn();
+        case SYS_SIGALTSTACK:
+            return sys_sigaltstack(a1, a2);
+        case SYS_TKILL:
+            return sys_tkill(a1, a2);
+        case SYS_TGKILL:
+            return sys_tgkill(a1, a2, a3);
+        case SYS_ALARM:
+            return sys_alarm(a1);
+        case SYS_SETITIMER:
+            return sys_setitimer(a1, a2, a3);
+        case SYS_GETITIMER:
+            return sys_getitimer(a1, a2);
+        case SYS_TIMER_CREATE:
+            return sys_timer_create(a1, a2, a3);
+        case SYS_TIMER_SETTIME:
+            return sys_timer_settime(a1, a2, a3, a4);
+        case SYS_TIMER_GETTIME:
+            return sys_timer_gettime(a1, a2);
+        case SYS_TIMER_GETOVERRUN:
+            return sys_timer_getoverrun(a1);
+        case SYS_TIMER_DELETE:
+            return sys_timer_delete(a1);
+        case SYS_SIGNALFD:
+            return sys_signalfd(a1, a2, a3);
+        case SYS_PAUSE:
+            return sys_pause();
+        case SYS_NANOSLEEP:
+            return sys_nanosleep(a1, a2);
             
         default:
             return -ENOSYS;
     }
+}
+
+// Wrapper that handles signal delivery after syscall
+int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, 
+                        uint64_t a3, uint64_t a4, uint64_t a5) {
+    // Save syscall context to current task (so signals work after yield)
+    task_t* cur = sched_current();
+    if (cur && cur->privilege == TASK_USER) {
+        cur->syscall_rsp = syscall_saved_user_rsp;
+        cur->syscall_rip = syscall_saved_user_rip;
+        cur->syscall_rflags = syscall_saved_user_rflags;
+        cur->syscall_rbp = syscall_saved_user_rbp;
+        cur->syscall_rbx = syscall_saved_user_rbx;
+        cur->syscall_r12 = syscall_saved_user_r12;
+        cur->syscall_r13 = syscall_saved_user_r13;
+        cur->syscall_r14 = syscall_saved_user_r14;
+        cur->syscall_r15 = syscall_saved_user_r15;
+    }
+    
+    int64_t ret = syscall_handler_inner(num, a1, a2, a3, a4, a5);
+    
+    // Check for pending signals before returning to userspace
+    // Skip this for exit (task may be gone) and sigreturn (just restored context)
+    if (num != SYS_EXIT && num != SYS_RT_SIGRETURN) {
+        cur = sched_current();  // Re-fetch in case of fork
+        if (cur && cur->privilege == TASK_USER && signal_pending(cur)) {
+            signal_deliver(cur);
+            // Check if signal_deliver terminated the task (e.g., SIG_DFL for SIGTERM)
+            if (cur->has_exited || cur->state == TASK_ZOMBIE) {
+                sched_yield();
+                // Should not return here
+            }
+        }
+    }
+    
+    return ret;
 }
