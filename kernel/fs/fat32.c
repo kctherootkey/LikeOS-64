@@ -406,12 +406,18 @@ static unsigned long cluster_to_lba(fat32_fs_t *fs, unsigned long cluster)
 // Forward declaration (defined later)
 static unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster);
 static unsigned long fat32_get_task_cwd_cluster(void);
+static int fat32_load_fat_window(fat32_fs_t *fs, unsigned long start_entry);
 
 // Simple root directory cache (single cluster only for now)
 static void* g_root_dir_cache = 0; // first cluster of root directory cached
 static unsigned long g_root_dir_cluster = 0;
-static void* g_fat_cache = 0; // cached first FAT
-static unsigned long g_fat_cache_entries = 0;
+static void* g_fat_cache = 0; // cached FAT window
+static unsigned long g_fat_cache_entries = 0; // number of entries in cache window
+static unsigned long g_fat_cache_start = 0;   // first cluster entry in cache window
+static unsigned long g_fat_total_entries = 0; // total FAT entries on disk
+static unsigned long g_fat_first_sectors = 0; // first FAT size in sectors
+#define FAT_CACHE_MAX_BYTES (1024 * 1024) // 1MB max FAT cache
+#define FAT_CACHE_MAX_ENTRIES (FAT_CACHE_MAX_BYTES / 4) // 262144 entries
 static fat32_fs_t* g_root_fs = 0;
 static fat32_fs_t g_static_fs; // internal singleton instance
 static unsigned long g_cwd_cluster = 0; // 0 means root
@@ -461,30 +467,49 @@ static int fat32_ensure_fat_loaded(fat32_fs_t *fs)
 
 static int fat32_fat_set(fat32_fs_t *fs, unsigned long cluster, uint32_t value)
 {
-    if (!fs || !g_fat_cache || cluster >= g_fat_cache_entries)
+    if (!fs || cluster >= g_fat_total_entries)
         return ST_INVALID;
+    
+    /* Ensure cluster is in cache window */
+    if (!g_fat_cache || cluster < g_fat_cache_start || 
+        cluster >= g_fat_cache_start + g_fat_cache_entries) {
+        /* Load window containing this cluster */
+        unsigned long window_start = 0;
+        if (cluster >= FAT_CACHE_MAX_ENTRIES / 2)
+            window_start = cluster - FAT_CACHE_MAX_ENTRIES / 2;
+        unsigned long entries_per_sector = fs->bytes_per_sector / 4;
+        window_start = (window_start / entries_per_sector) * entries_per_sector;
+        if (fat32_load_fat_window(fs, window_start) != 0)
+            return ST_IO;
+    }
+    
+    /* Update in cache */
+    unsigned long cache_index = cluster - g_fat_cache_start;
     uint32_t *fat = (uint32_t *)g_fat_cache;
-    fat[cluster] = value & 0x0FFFFFFF;
+    fat[cache_index] = value & 0x0FFFFFFF;
 
+    /* Calculate sector for this FAT entry and write to disk */
     unsigned long fat_byte = cluster * 4;
     unsigned long sector = fat_byte / fs->bytes_per_sector;
-    unsigned long offset = fat_byte % fs->bytes_per_sector;
     unsigned long lba = fs->part_lba_offset + fs->fat_start_lba + sector;
+    
+    /* Get the sector data from cache */
+    unsigned long cache_sector = (cluster - g_fat_cache_start) * 4 / fs->bytes_per_sector;
+    uint8_t *sector_data = ((uint8_t *)g_fat_cache) + cache_sector * fs->bytes_per_sector;
 
     // write updated FAT sector (first FAT)
-    if (write_sectors(fs->bdev, lba, 1, ((uint8_t *)g_fat_cache) + sector * fs->bytes_per_sector) != ST_OK) {
+    if (write_sectors(fs->bdev, lba, 1, sector_data) != ST_OK) {
         return ST_IO;
     }
 
     // mirror to additional FATs if present
     for (unsigned int f = 1; f < fs->num_fats; ++f) {
         unsigned long lba2 = fs->part_lba_offset + fs->fat_start_lba + (f * fs->fat_size_sectors) + sector;
-        if (write_sectors(fs->bdev, lba2, 1, ((uint8_t *)g_fat_cache) + sector * fs->bytes_per_sector) != ST_OK) {
+        if (write_sectors(fs->bdev, lba2, 1, sector_data) != ST_OK) {
             return ST_IO;
         }
     }
 
-    (void)offset;
     return ST_OK;
 }
 
@@ -494,9 +519,12 @@ static int fat32_alloc_cluster(fat32_fs_t *fs, unsigned long *out_cluster)
         return ST_INVALID;
     if (fat32_ensure_fat_loaded(fs) != ST_OK)
         return ST_IO;
-    uint32_t *fat = (uint32_t *)g_fat_cache;
-    for (unsigned long c = 2; c < g_fat_cache_entries; ++c) {
-        if ((fat[c] & 0x0FFFFFFF) == 0) {
+    
+    /* Search all FAT entries for a free cluster */
+    for (unsigned long c = 2; c < g_fat_total_entries; ++c) {
+        unsigned long next = fat32_next_cluster_cached(fs, c);
+        if (next == 0) {
+            /* Found free cluster */
             if (fat32_fat_set(fs, c, 0x0FFFFFFF) != ST_OK)
                 return ST_IO;
             // zero new cluster on disk
@@ -1119,64 +1147,83 @@ static void fat32_init_dirent(fat32_dirent_t *ent, const char name83[11], uint8_
     ent->fileSize = (uint32_t)size;
 }
 
-static unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster)
+static int fat32_load_fat_window(fat32_fs_t *fs, unsigned long start_entry)
 {
+    /* Calculate how many sectors we need and can cache */
+    unsigned long entries_per_sector = fs->bytes_per_sector / 4;
+    unsigned long start_sector = start_entry / entries_per_sector;
+    
+    /* Limit cache to FAT_CACHE_MAX_ENTRIES or remaining FAT entries */
+    unsigned long entries_to_load = g_fat_total_entries - start_entry;
+    if (entries_to_load > FAT_CACHE_MAX_ENTRIES)
+        entries_to_load = FAT_CACHE_MAX_ENTRIES;
+    
+    unsigned long sectors_to_load = (entries_to_load * 4 + fs->bytes_per_sector - 1) / fs->bytes_per_sector;
+    unsigned long bytes_to_load = sectors_to_load * fs->bytes_per_sector;
+    
+    /* Allocate cache if not already done */
     if (!g_fat_cache) {
-        /* Derive FAT size (sectors) using difference to data_start and number of FATs (assume 2) approximated */
-        unsigned long fat_total = fs->data_start_lba - fs->fat_start_lba; /* includes all FAT copies */
-        if (fat_total == 0)
-            return 0x0FFFFFFF;
-        unsigned long first_fat_sectors = fat_total / 2;
-        if (first_fat_sectors == 0)
-            first_fat_sectors = fat_total; /* if only one FAT */
-
-        /* Allocate FAT cache buffer */
-        unsigned long fat_bytes = first_fat_sectors * fs->bytes_per_sector;
-        
-        /* Read FAT with a few retries for transient USB errors */
-        for (int attempt = 0; attempt < 3 && !g_fat_cache; ++attempt) {
-            g_fat_cache = kalloc(fat_bytes);
-            if (!g_fat_cache) {
-                return 0x0FFFFFFF;
-            }
-
-            /* Read FAT in chunks (1 sector = 512 bytes per read) */
-            #define FAT_READ_CHUNK 1
-            unsigned long lba = fs->part_lba_offset + fs->fat_start_lba;
-            unsigned long remaining = first_fat_sectors;
-            uint8_t *dest = (uint8_t*)g_fat_cache;
-            int read_failed = 0;
-            
-            while (remaining > 0) {
-                unsigned long chunk = (remaining > FAT_READ_CHUNK) ? FAT_READ_CHUNK : remaining;
-                int read_st = read_sectors(fs->bdev, lba, chunk, dest);
-                if (read_st != ST_OK) {
-                    read_failed = 1;
-                    break;
-                }
-                lba += chunk;
-                dest += chunk * fs->bytes_per_sector;
-                remaining -= chunk;
-            }
-            
-            if (read_failed) {
-                kfree(g_fat_cache);
-                g_fat_cache = 0;
-                g_fat_cache_entries = 0;
-                for (volatile int spin = 0; spin < 50000; ++spin) {
-                    __asm__ __volatile__("pause");
-                }
-                continue;
-            }
-
-            g_fat_cache_entries = fat_bytes / 4;
+        g_fat_cache = kalloc(bytes_to_load);
+        if (!g_fat_cache) {
+            return -1;
         }
     }
-    if (!g_fat_cache)
+    
+    /* Read FAT window */
+    unsigned long lba = fs->part_lba_offset + fs->fat_start_lba + start_sector;
+    uint8_t *dest = (uint8_t*)g_fat_cache;
+    unsigned long remaining = sectors_to_load;
+    
+    while (remaining > 0) {
+        unsigned long chunk = (remaining > 8) ? 8 : remaining; /* read up to 8 sectors at once */
+        int read_st = read_sectors(fs->bdev, lba, chunk, dest);
+        if (read_st != ST_OK) {
+            return -1;
+        }
+        lba += chunk;
+        dest += chunk * fs->bytes_per_sector;
+        remaining -= chunk;
+    }
+    
+    g_fat_cache_start = start_sector * entries_per_sector;
+    g_fat_cache_entries = sectors_to_load * entries_per_sector;
+    
+    return 0;
+}
+
+static unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster)
+{
+    /* First time: calculate total FAT entries */
+    if (g_fat_total_entries == 0) {
+        unsigned long fat_total = fs->data_start_lba - fs->fat_start_lba;
+        if (fat_total == 0)
+            return 0x0FFFFFFF;
+        g_fat_first_sectors = fat_total / fs->num_fats;
+        if (g_fat_first_sectors == 0)
+            g_fat_first_sectors = fat_total;
+        g_fat_total_entries = (g_fat_first_sectors * fs->bytes_per_sector) / 4;
+    }
+    
+    if (cluster >= g_fat_total_entries)
         return 0x0FFFFFFF;
-    if (cluster >= g_fat_cache_entries)
-        return 0x0FFFFFFF;
-    return ((uint32_t *)g_fat_cache)[cluster] & 0x0FFFFFFF;
+    
+    /* Check if cluster is in current cache window */
+    if (!g_fat_cache || cluster < g_fat_cache_start || 
+        cluster >= g_fat_cache_start + g_fat_cache_entries) {
+        /* Need to load a new window centered around cluster */
+        unsigned long window_start = 0;
+        if (cluster >= FAT_CACHE_MAX_ENTRIES / 2)
+            window_start = cluster - FAT_CACHE_MAX_ENTRIES / 2;
+        /* Align to sector boundary */
+        unsigned long entries_per_sector = fs->bytes_per_sector / 4;
+        window_start = (window_start / entries_per_sector) * entries_per_sector;
+        
+        if (fat32_load_fat_window(fs, window_start) != 0)
+            return 0x0FFFFFFF;
+    }
+    
+    unsigned long cache_index = cluster - g_fat_cache_start;
+    return ((uint32_t *)g_fat_cache)[cache_index] & 0x0FFFFFFF;
 }
 
 // (globals moved above)

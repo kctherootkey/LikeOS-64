@@ -196,6 +196,7 @@ int elf_exec(const char* path, char* const argv[], char* const envp[], task_t** 
     
     // Get file size
     size_t file_size = vfs_size(file);
+    
     if (file_size == 0 || file_size > 16 * 1024 * 1024) {  // 16MB max
         kprintf("elf_exec: invalid file size %u\n", (unsigned)file_size);
         vfs_close(file);
