@@ -28,3 +28,14 @@ int block_count(void)
 {
     return g_block_count;
 }
+
+int block_sync(block_device_t* dev)
+{
+    if (!dev) {
+        return ST_INVALID;
+    }
+    if (dev->sync) {
+        return dev->sync(dev);
+    }
+    return ST_OK;  // No sync function = no-op (success)
+}

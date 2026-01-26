@@ -19,6 +19,7 @@
 #define SCSI_READ_CAPACITY_10       0x25
 #define SCSI_READ_10                0x28
 #define SCSI_WRITE_10               0x2A
+#define SCSI_SYNCHRONIZE_CACHE_10   0x35
 
 // Command Block Wrapper (CBW) - 31 bytes
 #define CBW_SIGNATURE               0x43425355  // "USBC"
@@ -116,6 +117,7 @@ int usb_msd_read_capacity(usb_msd_device_t* msd, uint32_t* block_count, uint32_t
 int usb_msd_request_sense(usb_msd_device_t* msd, scsi_sense_data_t* data);
 int usb_msd_read(usb_msd_device_t* msd, uint32_t lba, uint32_t count, void* buf);
 int usb_msd_write(usb_msd_device_t* msd, uint32_t lba, uint32_t count, const void* buf);
+int usb_msd_sync(usb_msd_device_t* msd);
 
 // Low-level BOT protocol functions
 int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,

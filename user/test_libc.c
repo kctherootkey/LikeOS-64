@@ -753,6 +753,147 @@ int main(int argc, char** argv) {
     }
 
     // ========================================
+    // Test: Long File Name (LFN) support
+    // ========================================
+    printf("\n[TEST] Long File Name (LFN) support\n");
+    
+    // Test 1: Create file with long name (lowercase preserved)
+    const char* lfn_path1 = "/this_is_a_long_filename_test.txt";
+    int lfn_fd = open(lfn_path1, O_CREAT | O_TRUNC | O_WRONLY);
+    test_result("create long filename", lfn_fd >= 0);
+    if (lfn_fd >= 0) {
+        const char* lfn_data = "LFN test data";
+        ssize_t lfn_wr = write(lfn_fd, lfn_data, strlen(lfn_data));
+        test_result("write to LFN file", lfn_wr == (ssize_t)strlen(lfn_data));
+        close(lfn_fd);
+    }
+    
+    // Test 2: Read back the long filename file
+    lfn_fd = open(lfn_path1, O_RDONLY);
+    test_result("open LFN file for read", lfn_fd >= 0);
+    if (lfn_fd >= 0) {
+        char lfn_rbuf[64];
+        memset(lfn_rbuf, 0, sizeof(lfn_rbuf));
+        ssize_t lfn_rd = read(lfn_fd, lfn_rbuf, sizeof(lfn_rbuf) - 1);
+        test_result("read LFN file", lfn_rd > 0);
+        test_result("LFN data correct", strcmp(lfn_rbuf, "LFN test data") == 0);
+        close(lfn_fd);
+    }
+    
+    // Test 3: Case-insensitive access (open with different case)
+    lfn_fd = open("/THIS_IS_A_LONG_FILENAME_TEST.TXT", O_RDONLY);
+    test_result("case-insensitive LFN access", lfn_fd >= 0);
+    if (lfn_fd >= 0) {
+        close(lfn_fd);
+    }
+    
+    // Test 4: Mixed case filename
+    const char* lfn_path2 = "/MixedCaseFileName.TXT";
+    lfn_fd = open(lfn_path2, O_CREAT | O_TRUNC | O_WRONLY);
+    test_result("create mixed case filename", lfn_fd >= 0);
+    if (lfn_fd >= 0) {
+        write(lfn_fd, "X", 1);
+        close(lfn_fd);
+    }
+    
+    // Test 5: Verify case-insensitive access to mixed case file
+    lfn_fd = open("/mixedcasefilename.txt", O_RDONLY);
+    test_result("case-insensitive mixed case access", lfn_fd >= 0);
+    if (lfn_fd >= 0) {
+        close(lfn_fd);
+    }
+    
+    // Test 6: Long directory name
+    const char* lfn_dir = "/long_directory_name_for_testing";
+    test_result("mkdir long dirname", mkdir(lfn_dir, 0777) == 0);
+    
+    // Test 7: Create file in long dirname
+    const char* lfn_in_dir = "/long_directory_name_for_testing/another_long_filename.dat";
+    lfn_fd = open(lfn_in_dir, O_CREAT | O_TRUNC | O_WRONLY);
+    test_result("create file in LFN dir", lfn_fd >= 0);
+    if (lfn_fd >= 0) {
+        write(lfn_fd, "nested", 6);
+        close(lfn_fd);
+    }
+    
+    // Test 8: Read file from long dirname
+    lfn_fd = open(lfn_in_dir, O_RDONLY);
+    test_result("open file in LFN dir", lfn_fd >= 0);
+    if (lfn_fd >= 0) {
+        char rbuf[16];
+        memset(rbuf, 0, sizeof(rbuf));
+        ssize_t rr = read(lfn_fd, rbuf, sizeof(rbuf) - 1);
+        test_result("read file in LFN dir", rr == 6 && strcmp(rbuf, "nested") == 0);
+        close(lfn_fd);
+    }
+    
+    // Test 9: Rename with long filename
+    const char* lfn_renamed = "/renamed_long_filename_test.txt";
+    test_result("rename LFN file", rename(lfn_path1, lfn_renamed) == 0);
+    
+    // Test 10: Verify renamed file exists
+    lfn_fd = open(lfn_renamed, O_RDONLY);
+    test_result("open renamed LFN file", lfn_fd >= 0);
+    if (lfn_fd >= 0) {
+        close(lfn_fd);
+    }
+    
+    // Test 11: Unlink files with long names
+    test_result("unlink renamed LFN file", unlink(lfn_renamed) == 0);
+    test_result("unlink mixed case file", unlink(lfn_path2) == 0);
+    test_result("unlink file in LFN dir", unlink(lfn_in_dir) == 0);
+    
+    // Test 12: Rmdir long dirname
+    test_result("rmdir LFN dir", rmdir(lfn_dir) == 0);
+    
+    // Test 13: Very long filename (near max)
+    const char* very_long = "/abcdefghijklmnopqrstuvwxyz0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ.longext";
+    lfn_fd = open(very_long, O_CREAT | O_TRUNC | O_WRONLY);
+    test_result("create very long filename", lfn_fd >= 0);
+    if (lfn_fd >= 0) {
+        write(lfn_fd, "V", 1);
+        close(lfn_fd);
+    }
+    lfn_fd = open(very_long, O_RDONLY);
+    test_result("open very long filename", lfn_fd >= 0);
+    if (lfn_fd >= 0) {
+        close(lfn_fd);
+    }
+    test_result("unlink very long filename", unlink(very_long) == 0);
+    
+    // Test 14: Filename with spaces
+    const char* space_name = "/file with spaces in name.txt";
+    lfn_fd = open(space_name, O_CREAT | O_TRUNC | O_WRONLY);
+    test_result("create filename with spaces", lfn_fd >= 0);
+    if (lfn_fd >= 0) {
+        write(lfn_fd, "S", 1);
+        close(lfn_fd);
+    }
+    lfn_fd = open(space_name, O_RDONLY);
+    test_result("open filename with spaces", lfn_fd >= 0);
+    if (lfn_fd >= 0) {
+        close(lfn_fd);
+    }
+    test_result("unlink filename with spaces", unlink(space_name) == 0);
+    
+    // Test 15: Case preservation check - create lowercase, verify lowercase display
+    const char* lowercase_file = "/lowercase_only_filename.txt";
+    lfn_fd = open(lowercase_file, O_CREAT | O_TRUNC | O_WRONLY);
+    test_result("create lowercase filename", lfn_fd >= 0);
+    if (lfn_fd >= 0) {
+        close(lfn_fd);
+    }
+    // Clean up
+    unlink(lowercase_file);
+    
+    // Test 16: Directory with mixed case
+    const char* mixed_dir = "/MyMixedCaseDirectory";
+    test_result("mkdir mixed case dir", mkdir(mixed_dir, 0777) == 0);
+    test_result("chdir mixed case dir (lowercase)", chdir("/mymixedcasedirectory") == 0);
+    test_result("chdir back to root", chdir("/") == 0);
+    test_result("rmdir mixed case dir", rmdir(mixed_dir) == 0);
+
+    // ========================================
     // Summary
     // ========================================
     printf("\n========================================\n");

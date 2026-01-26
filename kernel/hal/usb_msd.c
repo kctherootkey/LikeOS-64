@@ -323,6 +323,29 @@ int usb_msd_write(usb_msd_device_t* msd, uint32_t lba, uint32_t count, const voi
     return usb_msd_bot_transfer(msd, &cbw, (void*)buf, transfer_len, &csw);
 }
 
+int usb_msd_sync(usb_msd_device_t* msd) {
+    usb_msd_cbw_t cbw;
+    usb_msd_csw_t csw;
+    
+    if (!msd || !msd->ready) {
+        return ST_INVALID;
+    }
+    
+    msd_memset(&cbw, 0, sizeof(cbw));
+    cbw.signature = CBW_SIGNATURE;
+    cbw.tag = ++msd->next_tag;
+    cbw.data_transfer_len = 0;  // No data transfer
+    cbw.flags = CBW_FLAG_DATA_IN;  // No data but use IN for status
+    cbw.lun = 0;
+    cbw.cb_length = 10;
+    cbw.cb[0] = SCSI_SYNCHRONIZE_CACHE_10;
+    // All other bytes are 0: sync entire device
+    
+    msd_dbg("Sync: sending SYNCHRONIZE_CACHE_10\n");
+    
+    return usb_msd_bot_transfer(msd, &cbw, NULL, 0, &csw);
+}
+
 //=============================================================================
 // Block Device Interface
 //=============================================================================
@@ -381,6 +404,16 @@ int usb_msd_block_write(block_device_t* dev, unsigned long lba, unsigned long co
     }
     
     return ST_OK;
+}
+
+int usb_msd_block_sync(block_device_t* dev) {
+    usb_msd_device_t* msd = (usb_msd_device_t*)dev->driver_data;
+    
+    if (!msd || !msd->ready) {
+        return ST_NO_DEVICE;
+    }
+    
+    return usb_msd_sync(msd);
 }
 
 //=============================================================================
@@ -457,6 +490,7 @@ int usb_msd_init(usb_msd_device_t* msd, usb_device_t* dev, xhci_controller_t* ct
     msd->blk.total_sectors = msd->block_count;
     msd->blk.read = usb_msd_block_read;
     msd->blk.write = usb_msd_block_write;
+    msd->blk.sync = usb_msd_block_sync;
     msd->blk.driver_data = msd;
     
     // Register block device
