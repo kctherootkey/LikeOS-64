@@ -10,6 +10,67 @@
 static int g_init_attempted = 0;
 static usb_msd_device_t g_msd_device;
 
+// Boot-time initialization timeout (in milliseconds)
+#define XHCI_BOOT_INIT_TIMEOUT_MS  5000
+#define XHCI_BOOT_POLL_INTERVAL_MS 10
+
+// Verify controller is in expected state after initialization
+static int xhci_verify_controller_state(xhci_controller_t* ctrl) {
+    if (!ctrl || !ctrl->base) {
+        return ST_ERR;
+    }
+    
+    // Check if controller is running (USBSTS.HCH should be 0 after start)
+    uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+    if (usbsts & XHCI_STS_HCH) {
+        kprintf("[XHCI BOOT] Warning: Controller halted unexpectedly\n");
+        return ST_ERR;
+    }
+    
+    // Verify DCBAA is properly set
+    uint64_t dcbaap = xhci_op_read64(ctrl, XHCI_OP_DCBAAP);
+    if (dcbaap != ctrl->dcbaa_phys) {
+        kprintf("[XHCI BOOT] Warning: DCBAA mismatch (expected 0x%llx, got 0x%llx)\n",
+                ctrl->dcbaa_phys, dcbaap);
+        return ST_ERR;
+    }
+    
+    // Verify command ring is set (CRCR.CRP should match)
+    uint64_t crcr = xhci_op_read64(ctrl, XHCI_OP_CRCR);
+    if ((crcr & ~0x3FULL) != (ctrl->cmd_ring_phys & ~0x3FULL)) {
+        kprintf("[XHCI BOOT] Warning: Command ring mismatch\n");
+        return ST_ERR;
+    }
+    
+    return ST_OK;
+}
+
+// Log extended capability information (for debugging)
+static void xhci_log_ext_caps(xhci_controller_t* ctrl) {
+    if (!ctrl->ext_caps_base) {
+        kprintf("[XHCI BOOT] No extended capabilities\n");
+        return;
+    }
+    
+    // Look for Supported Protocol capabilities (ID=2)
+    uint32_t protocol_offset = xhci_find_ext_cap(ctrl, XHCI_EXT_CAP_PROTOCOL, 0);
+    if (protocol_offset) {
+        // xhci_find_ext_cap returns offset from ctrl->base, not absolute address
+        volatile uint32_t* cap_ptr = (volatile uint32_t*)(ctrl->base + protocol_offset);
+        uint32_t cap_data = cap_ptr[0];
+        uint8_t minor_rev = (cap_data >> 16) & 0xFF;
+        uint8_t major_rev = (cap_data >> 24) & 0xFF;
+        
+        // Port offset and count are in DWORD 2 (offset +8 bytes)
+        uint32_t port_info = cap_ptr[2];
+        uint8_t port_offset = port_info & 0xFF;
+        uint8_t port_count = (port_info >> 8) & 0xFF;
+        
+        kprintf("[XHCI BOOT] Protocol: USB %d.%d, ports %d-%d\n",
+                major_rev, minor_rev, port_offset, port_offset + port_count - 1);
+    }
+}
+
 void xhci_boot_init(xhci_boot_state_t* state) {
     if (!state) return;
     
@@ -33,7 +94,13 @@ void xhci_boot_init(xhci_boot_state_t* state) {
             xhci_pci->bus, xhci_pci->device, xhci_pci->function,
             xhci_pci->bar[0]);
     
+    // Check vendor/device ID for known quirks
+    uint16_t vendor_id = xhci_pci->vendor_id;
+    uint16_t device_id = xhci_pci->device_id;
+    kprintf("[XHCI BOOT] Vendor: 0x%04x, Device: 0x%04x\n", vendor_id, device_id);
+    
     // Initialize the global xHCI controller
+    // This now includes BIOS handoff
     int st = xhci_init(&g_xhci, xhci_pci);
     if (st != ST_OK) {
         kprintf("[XHCI BOOT] Controller initialization failed: %d\n", st);
@@ -42,8 +109,19 @@ void xhci_boot_init(xhci_boot_state_t* state) {
     
     state->ctrl = &g_xhci;
     
-    kprintf("[XHCI BOOT] Controller initialized successfully\n");
+    // Log extended capabilities (debug)
+    xhci_log_ext_caps(&g_xhci);
+    
+    // Verify controller state after initialization
+    if (xhci_verify_controller_state(&g_xhci) != ST_OK) {
+        kprintf("[XHCI BOOT] Warning: Controller state verification failed\n");
+        // Don't fail - some controllers may have quirks
+    }
+    
+    kprintf("[XHCI BOOT] Controller initialized successfully (version %x.%02x)\n",
+            g_xhci.hci_version >> 8, g_xhci.hci_version & 0xFF);
 }
+
 
 void xhci_boot_poll(xhci_boot_state_t* state) {
     if (!state || !state->ctrl) return;
@@ -55,7 +133,7 @@ void xhci_boot_poll(xhci_boot_state_t* state) {
     
     // Keep polling ports until we have a mass storage device or reach max devices
     if (!state->msd_ready) {
-        int connected = xhci_poll_ports(ctrl);
+        xhci_poll_ports(ctrl);
         
         // Check if we have new devices to examine
         if (ctrl->num_devices > 0) {

@@ -15,6 +15,40 @@
 #define XHCI_CAP_HCCPARAMS1     0x10
 #define XHCI_CAP_DBOFF          0x14
 #define XHCI_CAP_RTSOFF         0x18
+#define XHCI_CAP_HCCPARAMS2     0x1C
+
+// Extended Capabilities (xHCI 7.1)
+#define XHCI_EXT_CAP_ID_MASK        0xFF
+#define XHCI_EXT_CAP_NEXT_SHIFT     8
+#define XHCI_EXT_CAP_NEXT_MASK      0xFF00
+
+// Extended Capability IDs
+#define XHCI_EXT_CAP_LEGACY         1       // USB Legacy Support
+#define XHCI_EXT_CAP_PROTOCOL       2       // Supported Protocol
+#define XHCI_EXT_CAP_POWER          3       // Extended Power Management
+#define XHCI_EXT_CAP_IOVIRT         4       // I/O Virtualization
+#define XHCI_EXT_CAP_MSG_IRQ        5       // Message Interrupt
+#define XHCI_EXT_CAP_LOCAL_MEM      6       // Local Memory
+#define XHCI_EXT_CAP_DEBUG          10      // USB Debug Capability
+
+// USB Legacy Support Capability (USBLEGSUP) - xHCI 7.1.1
+#define XHCI_USBLEGSUP_BIOS_OWNED   (1 << 16)   // HC BIOS Owned Semaphore
+#define XHCI_USBLEGSUP_OS_OWNED     (1 << 24)   // HC OS Owned Semaphore
+
+// USB Legacy Support Control/Status (USBLEGCTLSTS) - offset 4 from USBLEGSUP
+#define XHCI_USBLEGCTLSTS_DISABLE_SMI   0xE0000000  // Disable all SMIs
+
+// HCCPARAMS1 bits
+#define XHCI_HCC_64BIT_ADDR         (1 << 0)   // 64-bit Addressing Capability
+#define XHCI_HCC_CSZ                (1 << 2)   // Context Size (0=32, 1=64)
+#define XHCI_HCC_XECP_SHIFT         16         // xHCI Extended Capabilities Pointer
+#define XHCI_HCC_XECP_MASK          0xFFFF0000
+
+// Maximum halt/reset wait times
+#define XHCI_MAX_HALT_USEC          (16 * 1000)     // 16ms
+#define XHCI_RESET_LONG_USEC        (10 * 1000 * 1000)  // 10s for reset
+#define XHCI_RESET_SHORT_USEC       (250 * 1000)    // 250ms
+#define XHCI_LEGACY_TIMEOUT_USEC    (1000 * 1000)   // 1s for BIOS handoff
 
 // xHCI Operational Register offsets
 #define XHCI_OP_USBCMD          0x00
@@ -104,16 +138,37 @@
 #define TRB_FLAG_CYCLE          (1 << 0)
 #define TRB_FLAG_TC             (1 << 1)   // Toggle Cycle
 #define TRB_FLAG_ISP            (1 << 2)   // Interrupt on Short Packet
-#define TRB_FLAG_CH             (1 << 4)   // Chain
+#define TRB_FLAG_CHAIN          (1 << 4)   // Chain bit for multi-TRB transfers
+#define TRB_FLAG_CH             (1 << 4)   // Chain (alias)
 #define TRB_FLAG_IOC            (1 << 5)   // Interrupt on Completion
 #define TRB_FLAG_IDT            (1 << 6)   // Immediate Data
 #define TRB_FLAG_BSR            (1 << 9)   // Block Set Address Request
 
+// 64KB boundary - TRB buffers cannot cross this boundary (xHCI spec)
+#define TRB_MAX_BUFF_SIZE       65536
+#define TRB_BUFF_LEN_UP_TO_BOUNDARY(addr) \
+    (TRB_MAX_BUFF_SIZE - ((addr) & (TRB_MAX_BUFF_SIZE - 1)))
+
+// TD_SIZE field (bits 21:17 of TRB status) - packets remaining in TD
+// xHCI 1.0+: number of packets remaining, capped at 31
+// xHCI 0.96: remaining bytes >> 10, capped at 31
+#define TRB_TD_SIZE(p)          (((p) & 0x1F) << 17)
+#define TRB_LEN(len)            ((len) & 0x1FFFF)  // TRB transfer length (bits 16:0)
+#define TRB_INTR_TARGET(t)      (((t) & 0x3FF) << 22)  // Interrupter target (bits 31:22)
+
+// Maximum soft retries before endpoint reset
+#define MAX_SOFT_RETRY          3
+
 // Ring sizes (power of 2, last entry is link TRB)
 #define XHCI_RING_SIZE          256
+#define XHCI_TRBS_PER_SEGMENT   (XHCI_RING_SIZE - 1)  // -1 for link TRB
+#define XHCI_MAX_RING_SEGMENTS  16   // Maximum segments per ring (can expand)
 #define XHCI_MAX_SLOTS          16
 #define XHCI_MAX_ENDPOINTS      32
 #define XHCI_MAX_PORTS          8
+
+// Scatter-gather list maximum entries
+#define XHCI_MAX_SG_ENTRIES     32
 
 // Context sizes
 #define XHCI_SLOT_CTX_SIZE      32
@@ -130,6 +185,22 @@
 #define EP_TYPE_BULK_IN         6
 #define EP_TYPE_INTERRUPT_IN    7
 
+// Scatter-gather list entry
+// Describes a single physically contiguous buffer segment
+typedef struct {
+    uint64_t phys_addr;     // Physical address of buffer
+    uint32_t length;        // Length in bytes
+    uint32_t reserved;      // Padding for alignment
+} xhci_sg_entry_t;
+
+// Scatter-gather list
+// Used for transfers spanning multiple non-contiguous physical buffers
+typedef struct {
+    xhci_sg_entry_t entries[XHCI_MAX_SG_ENTRIES];
+    uint32_t num_entries;   // Number of valid entries
+    uint32_t total_len;     // Total transfer length
+} xhci_sg_list_t;
+
 // TRB structure (16 bytes, must be aligned to 16)
 typedef struct __attribute__((packed, aligned(16))) {
     uint64_t param;
@@ -137,7 +208,17 @@ typedef struct __attribute__((packed, aligned(16))) {
     uint32_t control;
 } xhci_trb_t;
 
-// Transfer ring with link TRB
+// Ring segment for dynamic ring expansion
+// Each segment contains XHCI_RING_SIZE TRBs with last one as link TRB
+typedef struct xhci_ring_segment {
+    xhci_trb_t trbs[XHCI_RING_SIZE];        // TRBs in this segment
+    uint64_t dma;                            // Physical address of this segment
+    struct xhci_ring_segment* next;          // Next segment in ring (circular)
+    uint32_t num;                            // Segment number in ring
+    uint32_t reserved;
+} __attribute__((aligned(4096))) xhci_ring_segment_t;
+
+// Transfer ring with link TRB (legacy fixed-size ring)
 typedef struct __attribute__((aligned(64))) {
     xhci_trb_t trbs[XHCI_RING_SIZE];
     uint32_t enqueue;
@@ -145,6 +226,21 @@ typedef struct __attribute__((aligned(64))) {
     uint8_t cycle;
     uint8_t pad[3];
 } xhci_ring_t;
+
+// Expandable transfer ring using linked segments
+typedef struct {
+    xhci_ring_segment_t* first_seg;   // First segment in ring
+    xhci_ring_segment_t* last_seg;    // Last segment (for expansion)
+    xhci_ring_segment_t* enq_seg;     // Current enqueue segment
+    xhci_ring_segment_t* deq_seg;     // Current dequeue segment
+    xhci_trb_t* enqueue;              // Current enqueue pointer
+    xhci_trb_t* dequeue;              // Current dequeue pointer
+    uint32_t num_segs;                // Number of segments
+    uint32_t num_trbs_free;           // Number of free TRBs
+    uint8_t cycle_state;              // Producer cycle state
+    uint8_t type;                     // Ring type (command/transfer/event)
+    uint8_t pad[2];
+} xhci_ring_ex_t;
 
 // Event ring segment table entry
 typedef struct __attribute__((packed, aligned(64))) {
@@ -210,6 +306,10 @@ typedef struct usb_device {
     uint8_t lun_count;
     uint8_t configured;
     
+    // Error tracking for retry logic
+    uint8_t err_count_in;      // Error count for bulk IN endpoint
+    uint8_t err_count_out;     // Error count for bulk OUT endpoint
+    
     // Transfer rings for bulk endpoints
     xhci_ring_t* bulk_in_ring;
     xhci_ring_t* bulk_out_ring;
@@ -232,6 +332,15 @@ typedef struct xhci_controller {
     uint64_t op_base;               // Operational registers
     uint64_t db_base;               // Doorbell registers
     uint64_t rt_base;               // Runtime registers
+    uint64_t ext_caps_base;         // Extended capabilities base (from HCCPARAMS1)
+    
+    // Capability parameters cache
+    uint32_t hcs_params1;
+    uint32_t hcs_params2;
+    uint32_t hcs_params3;
+    uint32_t hcc_params1;
+    uint32_t hcc_params2;
+    uint16_t hci_version;
     
     // Controller info
     uint8_t max_slots;
@@ -317,12 +426,41 @@ int xhci_bulk_transfer_in(xhci_controller_t* ctrl, usb_device_t* dev,
 int xhci_bulk_transfer_out(xhci_controller_t* ctrl, usb_device_t* dev,
                            const void* buf, uint32_t len, uint32_t* transferred);
 
+// Scatter-gather bulk transfers
+int xhci_bulk_transfer_in_sg(xhci_controller_t* ctrl, usb_device_t* dev,
+                             xhci_sg_list_t* sg_list, uint32_t* transferred);
+int xhci_bulk_transfer_out_sg(xhci_controller_t* ctrl, usb_device_t* dev,
+                              xhci_sg_list_t* sg_list, uint32_t* transferred);
+
+// Scatter-gather list helpers
+void xhci_sg_init(xhci_sg_list_t* sg);
+int xhci_sg_add(xhci_sg_list_t* sg, uint64_t phys_addr, uint32_t length);
+uint32_t xhci_sg_count_trbs(xhci_sg_list_t* sg);
+
+// Endpoint reset (for error recovery)
+int xhci_reset_endpoint(xhci_controller_t* ctrl, uint8_t slot, uint8_t dci);
+
+// Extended capability and BIOS handoff
+uint32_t xhci_find_ext_cap(xhci_controller_t* ctrl, uint32_t cap_id, uint32_t start_offset);
+int xhci_bios_handoff(xhci_controller_t* ctrl);
+int xhci_halt(xhci_controller_t* ctrl);
+void xhci_quiesce(xhci_controller_t* ctrl);
+
 // Ring management
 xhci_ring_t* xhci_alloc_ring(void);
 void xhci_free_ring(xhci_ring_t* ring);
 void xhci_ring_init(xhci_ring_t* ring, uint64_t phys);
 int xhci_ring_enqueue(xhci_ring_t* ring, uint64_t param, uint32_t status, uint32_t control);
 void xhci_ring_doorbell(xhci_controller_t* ctrl, uint8_t slot, uint8_t ep);
+
+// Expandable ring management (dynamic ring expansion support)
+xhci_ring_segment_t* xhci_segment_alloc(void);
+void xhci_segment_free(xhci_ring_segment_t* seg);
+xhci_ring_ex_t* xhci_ring_ex_alloc(uint32_t num_segs);
+void xhci_ring_ex_free(xhci_ring_ex_t* ring);
+int xhci_ring_expansion(xhci_ring_ex_t* ring, uint32_t num_new_segs);
+uint32_t xhci_ring_ex_num_trbs_free(xhci_ring_ex_t* ring);
+int xhci_ring_ex_enqueue(xhci_ring_ex_t* ring, uint64_t param, uint32_t status, uint32_t control);
 
 // Command ring operations
 int xhci_send_command(xhci_controller_t* ctrl, uint64_t param, uint32_t status, uint32_t control);
