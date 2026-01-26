@@ -15,29 +15,70 @@
 #include "../../include/kernel/signal.h"
 #include "../../include/kernel/devfs.h"
 #include "../../include/kernel/dirent.h"
+#include "../../include/kernel/serial.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
-    if (ptr < 0x1000) return false;  // NULL-ish pointer
+    if (ptr < 0x10000) return false;  // Reject low addresses (NULL deref protection)
     if (ptr >= 0x7FFFFFFFFFFF) return false;  // Beyond user space
     if (ptr + len < ptr) return false;  // Overflow check
     return true;
 }
 
-// Safe string length (bounded) from user space
+// SMAP-aware copy from user space to kernel space
+// Returns 0 on success, -EFAULT on failure
+static int copy_from_user(void* kernel_dst, const void* user_src, size_t len) {
+    if (!validate_user_ptr((uint64_t)user_src, len)) {
+        return -EFAULT;
+    }
+    if (!kernel_dst || len == 0) {
+        return (len == 0) ? 0 : -EFAULT;
+    }
+    // Temporarily allow supervisor access to user pages (SMAP bypass)
+    smap_disable();
+    mm_memcpy(kernel_dst, user_src, len);
+    // Re-enable SMAP protection
+    smap_enable();
+    return 0;
+}
+
+// SMAP-aware copy from kernel space to user space
+// Returns 0 on success, -EFAULT on failure
+static int copy_to_user(void* user_dst, const void* kernel_src, size_t len) {
+    if (!validate_user_ptr((uint64_t)user_dst, len)) {
+        return -EFAULT;
+    }
+    if (!kernel_src || len == 0) {
+        return (len == 0) ? 0 : -EFAULT;
+    }
+    // Temporarily allow supervisor access to user pages (SMAP bypass)
+    smap_disable();
+    mm_memcpy(user_dst, kernel_src, len);
+    // Re-enable SMAP protection
+    smap_enable();
+    return 0;
+}
+
+// Safe string length (bounded) from user space (SMAP-aware)
 static int user_strnlen(const char* user_str, size_t max_len, size_t* out_len) {
     if (!user_str || !out_len) {
         return -EFAULT;
     }
-    for (size_t i = 0; i < max_len; i++) {
-        if (!validate_user_ptr((uint64_t)user_str + i, 1)) {
-            return -EFAULT;
-        }
+    // Validate entire potential range first
+    if (!validate_user_ptr((uint64_t)user_str, max_len)) {
+        return -EFAULT;
+    }
+    // Temporarily allow user memory access
+    smap_disable();
+    size_t i;
+    for (i = 0; i < max_len; i++) {
         if (user_str[i] == '\0') {
             *out_len = i;
+            smap_enable();
             return 0;
         }
     }
+    smap_enable();
     return -EINVAL;  // Too long
 }
 
@@ -56,13 +97,36 @@ static int copy_user_string(const char* user_str, size_t max_len, char** out_str
     if (!kstr) {
         return -ENOMEM;
     }
-    mm_memcpy(kstr, user_str, len);
+    // Use copy_from_user for SMAP-aware copy
+    if (copy_from_user(kstr, user_str, len) != 0) {
+        kfree(kstr);
+        return -EFAULT;
+    }
     kstr[len] = '\0';
 
     *out_str = kstr;
     if (out_len) {
         *out_len = len;
     }
+    return 0;
+}
+
+// Helper: Copy user path string directly into fixed kernel buffer (no allocation)
+// Returns 0 on success, negative error on failure
+static int copy_user_path(const char* user_path, char* kbuf, size_t kbuf_size) {
+    if (!user_path || !kbuf || kbuf_size < 2) {
+        return -EINVAL;
+    }
+    char* kstr = NULL;
+    size_t len = 0;
+    int ret = copy_user_string(user_path, kbuf_size - 1, &kstr, &len);
+    if (ret != 0) {
+        return ret;
+    }
+    for (size_t i = 0; i <= len; i++) {
+        kbuf[i] = kstr[i];
+    }
+    kfree(kstr);
     return 0;
 }
 
@@ -100,7 +164,11 @@ static int copy_user_string_array(const char* const* user_arr, size_t max_count,
 
     size_t total = 0;
     for (size_t i = 0; i < max_count; i++) {
-        const char* user_str = user_arr[i];
+        // SMAP-aware read of user array element
+        const char* user_str;
+        smap_disable();
+        user_str = user_arr[i];
+        smap_enable();
         if (!user_str) {
             karr[i] = NULL;
             *out_arr = karr;
@@ -153,10 +221,13 @@ static int64_t pipe_read_to_user(pipe_end_t* end, uint64_t buf, uint64_t count) 
         first = to_read;
     }
 
+    // SMAP-aware copy to user buffer
+    smap_disable();
     mm_memcpy((void*)buf, pipe->buffer + pipe->read_pos, first);
     if (to_read > first) {
         mm_memcpy((void*)(buf + first), pipe->buffer, to_read - first);
     }
+    smap_enable();
 
     pipe->read_pos = (pipe->read_pos + to_read) % pipe->size;
     pipe->used -= to_read;
@@ -187,10 +258,13 @@ static int64_t pipe_write_from_user(pipe_end_t* end, uint64_t buf, uint64_t coun
         first = to_write;
     }
 
+    // SMAP-aware copy from user buffer
+    smap_disable();
     mm_memcpy(pipe->buffer + pipe->write_pos, (void*)buf, first);
     if (to_write > first) {
         mm_memcpy(pipe->buffer, (void*)(buf + first), to_write - first);
     }
+    smap_enable();
 
     pipe->write_pos = (pipe->write_pos + to_write) % pipe->size;
     pipe->used += to_write;
@@ -256,6 +330,12 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
     
+    // Security: Validate count to prevent excessive reads and overflow
+    if (count == 0) return 0;
+    if (count > (1024ULL * 1024 * 1024)) {
+        return -EINVAL;  // Max 1GB per read call
+    }
+    
     if (!validate_user_ptr(buf, count)) {
         return -EFAULT;
     }
@@ -315,6 +395,12 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
 static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
+    
+    // Security: Validate count to prevent excessive writes and overflow
+    if (count == 0) return 0;
+    if (count > (1024ULL * 1024 * 1024)) {
+        return -EINVAL;  // Max 1GB per write call
+    }
     
     if (!validate_user_ptr(buf, count)) {
         return -EFAULT;
@@ -390,13 +476,18 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode) {
         return -EFAULT;
     }
     
+    // Copy user path to kernel buffer first
+    char kpath[VFS_MAX_PATH];
+    int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
+    if (cret != 0) return cret;
+    
     int fd = alloc_fd(cur);
     if (fd < 0) {
         return fd;  // Error code
     }
     
     vfs_file_t* file = NULL;
-    const char* path = (const char*)pathname;
+    const char* path = kpath;
     char full[VFS_MAX_PATH];
     if (path[0] != '/') {
         int brest = build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
@@ -427,15 +518,20 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags, uin
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
     if (!validate_user_ptr(pathname, 1)) return -EFAULT;
-    const char* upath = (const char*)pathname;
+    
+    // Copy user path string to kernel buffer first
+    char kpath[VFS_MAX_PATH];
+    int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
+    if (cret != 0) return cret;
+    
     char full[VFS_MAX_PATH];
     int ret;
-    if (upath[0] == '/') {
+    if (kpath[0] == '/') {
         size_t i = 0;
-        for (; upath[i] && i < sizeof(full) - 1; ++i) full[i] = upath[i];
+        for (; kpath[i] && i < sizeof(full) - 1; ++i) full[i] = kpath[i];
         full[i] = '\0';
     } else {
-        ret = build_at_path(cur, (int)dirfd, upath, full, sizeof(full));
+        ret = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
         if (ret != 0) return ret;
     }
     int fd = alloc_fd(cur);
@@ -534,12 +630,17 @@ static int64_t sys_stat_common(const char* path, uint64_t stat_buf, int validate
     if (validate_path && !validate_user_ptr((uint64_t)path, 1)) {
         return -EFAULT;
     }
+    // Security: Zero the struct to prevent leaking uninitialized kernel stack data
     struct kstat st;
+    mm_memset(&st, 0, sizeof(st));
     int ret = vfs_stat(path, &st);
     if (ret != ST_OK) {
         return (ret == ST_NOT_FOUND) ? -ENOENT : -EINVAL;
     }
-    mm_memcpy((void*)stat_buf, &st, sizeof(st));
+    // Security: Use SMAP-aware copy to user
+    if (copy_to_user((void*)stat_buf, &st, sizeof(st)) != 0) {
+        return -EFAULT;
+    }
     return 0;
 }
 
@@ -547,12 +648,17 @@ static int64_t sys_stat(uint64_t pathname, uint64_t stat_buf) {
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
     if (!validate_user_ptr(pathname, 1)) return -EFAULT;
-    const char* path = (const char*)pathname;
-    if (path[0] == '/') {
-        return sys_stat_common(path, stat_buf, 1);
+    
+    // Copy user path to kernel buffer first
+    char kpath[VFS_MAX_PATH];
+    int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
+    if (cret != 0) return cret;
+    
+    if (kpath[0] == '/') {
+        return sys_stat_common(kpath, stat_buf, 0);
     }
     char full[VFS_MAX_PATH];
-    int ret = build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
+    int ret = build_at_path(cur, AT_FDCWD, kpath, full, sizeof(full));
     if (ret != 0) return ret;
     return sys_stat_common(full, stat_buf, 0);
 }
@@ -561,12 +667,17 @@ static int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf) {
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
     if (!validate_user_ptr(pathname, 1)) return -EFAULT;
-    const char* path = (const char*)pathname;
-    if (path[0] == '/') {
-        return sys_stat_common(path, stat_buf, 1);
+    
+    // Copy user path to kernel buffer first
+    char kpath[VFS_MAX_PATH];
+    int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
+    if (cret != 0) return cret;
+    
+    if (kpath[0] == '/') {
+        return sys_stat_common(kpath, stat_buf, 0);
     }
     char full[VFS_MAX_PATH];
-    int ret = build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
+    int ret = build_at_path(cur, AT_FDCWD, kpath, full, sizeof(full));
     if (ret != 0) return ret;
     return sys_stat_common(full, stat_buf, 0);
 }
@@ -577,7 +688,9 @@ static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf) {
     if (!validate_user_ptr(stat_buf, sizeof(struct kstat))) {
         return -EFAULT;
     }
+    // Security: Zero the struct to prevent leaking uninitialized kernel stack data
     struct kstat st;
+    mm_memset(&st, 0, sizeof(st));
     st.st_nlink = 1;
     st.st_uid = 0;
     st.st_gid = 0;
@@ -587,8 +700,8 @@ static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf) {
     if (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD) {
         st.st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
         st.st_size = 0;
-        mm_memcpy((void*)stat_buf, &st, sizeof(st));
-        return 0;
+        // Security: Use SMAP-aware copy to user
+        return copy_to_user((void*)stat_buf, &st, sizeof(st));
     }
     if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) {
         return -EBADF;
@@ -597,17 +710,17 @@ static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf) {
     if (pipe_is_end(file)) {
         st.st_mode = S_IFIFO | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
         st.st_size = 0;
-        mm_memcpy((void*)stat_buf, &st, sizeof(st));
-        return 0;
+        // Security: Use SMAP-aware copy to user
+        return copy_to_user((void*)stat_buf, &st, sizeof(st));
     }
     if (devfs_fstat(file, &st) == 0) {
-        mm_memcpy((void*)stat_buf, &st, sizeof(st));
-        return 0;
+        // Security: Use SMAP-aware copy to user
+        return copy_to_user((void*)stat_buf, &st, sizeof(st));
     }
     st.st_mode = S_IFREG | (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
     st.st_size = vfs_size(file);
-    mm_memcpy((void*)stat_buf, &st, sizeof(st));
-    return 0;
+    // Security: Use SMAP-aware copy to user
+    return copy_to_user((void*)stat_buf, &st, sizeof(st));
 }
 
 static int64_t sys_fstatat(uint64_t dirfd, uint64_t pathname, uint64_t stat_buf, uint64_t flags) {
@@ -617,14 +730,19 @@ static int64_t sys_fstatat(uint64_t dirfd, uint64_t pathname, uint64_t stat_buf,
     if (!validate_user_ptr(pathname, 1) || !validate_user_ptr(stat_buf, sizeof(struct kstat))) {
         return -EFAULT;
     }
-    const char* upath = (const char*)pathname;
+    
+    // Copy user path to kernel buffer first
+    char kpath[VFS_MAX_PATH];
+    int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
+    if (cret != 0) return cret;
+    
     char full[VFS_MAX_PATH];
-    if (upath[0] == '/') {
+    if (kpath[0] == '/') {
         size_t i = 0;
-        for (; upath[i] && i < sizeof(full) - 1; ++i) full[i] = upath[i];
+        for (; kpath[i] && i < sizeof(full) - 1; ++i) full[i] = kpath[i];
         full[i] = '\0';
     } else {
-        int ret = build_at_path(cur, (int)dirfd, upath, full, sizeof(full));
+        int ret = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
         if (ret != 0) return ret;
     }
     return sys_stat_common(full, stat_buf, 0);
@@ -635,7 +753,13 @@ static int64_t sys_access(uint64_t pathname, uint64_t mode) {
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
     if (!validate_user_ptr(pathname, 1)) return -EFAULT;
-    const char* path = (const char*)pathname;
+    
+    // Copy user path to kernel buffer first
+    char kpath[VFS_MAX_PATH];
+    int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
+    if (cret != 0) return cret;
+    
+    const char* path = kpath;
     char full[VFS_MAX_PATH];
     if (path[0] != '/') {
         int retb = build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
@@ -657,14 +781,19 @@ static int64_t sys_faccessat(uint64_t dirfd, uint64_t pathname, uint64_t mode, u
     if (!validate_user_ptr(pathname, 1)) {
         return -EFAULT;
     }
-    const char* upath = (const char*)pathname;
+    
+    // Copy user path to kernel buffer first
+    char kpath[VFS_MAX_PATH];
+    int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
+    if (cret != 0) return cret;
+    
     char full[VFS_MAX_PATH];
-    if (upath[0] == '/') {
+    if (kpath[0] == '/') {
         size_t i = 0;
-        for (; upath[i] && i < sizeof(full) - 1; ++i) full[i] = upath[i];
+        for (; kpath[i] && i < sizeof(full) - 1; ++i) full[i] = kpath[i];
         full[i] = '\0';
     } else {
-        int ret = build_at_path(cur, (int)dirfd, upath, full, sizeof(full));
+        int ret = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
         if (ret != 0) return ret;
     }
     struct kstat st;
@@ -700,10 +829,15 @@ static int64_t sys_chdir(uint64_t pathname) {
     if (!validate_user_ptr(pathname, 1)) {
         return -EFAULT;
     }
-    const char* path = (const char*)pathname;
+    
+    // Copy user path to kernel buffer first
+    char kpath[VFS_MAX_PATH];
+    int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
+    if (cret != 0) return cret;
+    
     char full[VFS_MAX_PATH];
     const char* cwd = (cur->cwd[0] != 0) ? cur->cwd : "/";
-    int ret = normalize_path(cwd, path, full, sizeof(full));
+    int ret = normalize_path(cwd, kpath, full, sizeof(full));
     if (ret != 0) return ret;
     struct kstat st;
     int vret = vfs_stat(full, &st);
@@ -732,7 +866,9 @@ static int64_t sys_getcwd(uint64_t buf, uint64_t size) {
     if (size == 0 || len + 1 > size) {
         return -EINVAL;
     }
-    mm_memcpy((void*)buf, src, len + 1);
+    if (copy_to_user((void*)buf, src, len + 1) < 0) {
+        return -EFAULT;
+    }
     return (int64_t)buf;
 }
 
@@ -769,7 +905,9 @@ static int64_t sys_gethostname(uint64_t name, uint64_t len) {
     while (host[hlen]) hlen++;
     if (!validate_user_ptr(name, len)) return -EFAULT;
     if (len < hlen + 1) return -EINVAL;
-    mm_memcpy((void*)name, host, hlen + 1);
+    if (copy_to_user((void*)name, host, hlen + 1) < 0) {
+        return -EFAULT;
+    }
     return 0;
 }
 
@@ -787,7 +925,9 @@ static int64_t sys_uname(uint64_t buf) {
     mm_memcpy(u.release, rel, 4);
     mm_memcpy(u.version, ver, 9);
     mm_memcpy(u.machine, mach, 7);
-    mm_memcpy((void*)buf, &u, sizeof(u));
+    if (copy_to_user((void*)buf, &u, sizeof(u)) < 0) {
+        return -EFAULT;
+    }
     return 0;
 }
 
@@ -795,7 +935,7 @@ static int64_t sys_time(uint64_t tloc) {
     uint64_t ticks = timer_ticks();
     uint64_t sec = ticks / 100;
     if (tloc && validate_user_ptr(tloc, sizeof(uint64_t))) {
-        *(uint64_t*)tloc = sec;
+        copy_to_user((void*)tloc, &sec, sizeof(sec));
     }
     return (int64_t)sec;
 }
@@ -807,7 +947,9 @@ static int64_t sys_gettimeofday(uint64_t tv, uint64_t tz) {
     k_timeval_t kv;
     kv.tv_sec = (long)(ticks / 100);
     kv.tv_usec = (long)((ticks % 100) * 10000);
-    mm_memcpy((void*)tv, &kv, sizeof(kv));
+    if (copy_to_user((void*)tv, &kv, sizeof(kv)) < 0) {
+        return -EFAULT;
+    }
     return 0;
 }
 
@@ -984,7 +1126,13 @@ static int64_t sys_kill(uint64_t pid, uint64_t sig) {
 
 static int64_t sys_unlink(uint64_t pathname) {
     if (!validate_user_ptr(pathname, 1)) return -EFAULT;
-    int st = vfs_unlink((const char*)pathname);
+    
+    // Copy user path to kernel buffer first
+    char kpath[VFS_MAX_PATH];
+    int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
+    if (cret != 0) return cret;
+    
+    int st = vfs_unlink(kpath);
     if (st == ST_OK) return 0;
     if (st == ST_NOT_FOUND) return -ENOENT;
     return -EINVAL;
@@ -992,7 +1140,15 @@ static int64_t sys_unlink(uint64_t pathname) {
 
 static int64_t sys_rename(uint64_t oldpath, uint64_t newpath) {
     if (!validate_user_ptr(oldpath, 1) || !validate_user_ptr(newpath, 1)) return -EFAULT;
-    int st = vfs_rename((const char*)oldpath, (const char*)newpath);
+    
+    // Copy user paths to kernel buffers first
+    char koldpath[VFS_MAX_PATH], knewpath[VFS_MAX_PATH];
+    int cret = copy_user_path((const char*)oldpath, koldpath, sizeof(koldpath));
+    if (cret != 0) return cret;
+    cret = copy_user_path((const char*)newpath, knewpath, sizeof(knewpath));
+    if (cret != 0) return cret;
+    
+    int st = vfs_rename(koldpath, knewpath);
     if (st == ST_OK) return 0;
     if (st == ST_NOT_FOUND) return -ENOENT;
     return -EINVAL;
@@ -1001,7 +1157,13 @@ static int64_t sys_rename(uint64_t oldpath, uint64_t newpath) {
 static int64_t sys_mkdir(uint64_t pathname, uint64_t mode) {
     (void)mode;
     if (!validate_user_ptr(pathname, 1)) return -EFAULT;
-    int st = vfs_mkdir((const char*)pathname, (unsigned int)mode);
+    
+    // Copy user path to kernel buffer first
+    char kpath[VFS_MAX_PATH];
+    int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
+    if (cret != 0) return cret;
+    
+    int st = vfs_mkdir(kpath, (unsigned int)mode);
     if (st == ST_OK) return 0;
     if (st == ST_NOT_FOUND) return -ENOENT;
     if (st == ST_NOMEM) return -ENOMEM;
@@ -1010,7 +1172,13 @@ static int64_t sys_mkdir(uint64_t pathname, uint64_t mode) {
 }
 static int64_t sys_rmdir(uint64_t pathname) {
     if (!validate_user_ptr(pathname, 1)) return -EFAULT;
-    int st = vfs_rmdir((const char*)pathname);
+    
+    // Copy user path to kernel buffer first
+    char kpath[VFS_MAX_PATH];
+    int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
+    if (cret != 0) return cret;
+    
+    int st = vfs_rmdir(kpath);
     if (st == ST_OK) return 0;
     if (st == ST_NOT_FOUND) return -ENOENT;
     if (st == ST_NOMEM) return -ENOMEM;
@@ -1167,13 +1335,23 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     task_t* cur = sched_current();
     if (!cur) return (int64_t)MAP_FAILED;
     
-    // Validate length
+    // Security: Validate length - must be non-zero and reasonable
     if (length == 0) {
         return (int64_t)MAP_FAILED;
     }
     
+    // Security: Prevent integer overflow when aligning length
+    if (length > 0x7FFFFFFFFFFFFFF0ULL) {
+        return (int64_t)MAP_FAILED;  // Would overflow during PAGE_ALIGN
+    }
+    
     // Round up length to page size
     length = PAGE_ALIGN(length);
+    
+    // Security: Prevent excessive allocation (max 2GB per mmap call)
+    if (length > (2ULL * 1024 * 1024 * 1024)) {
+        return (int64_t)MAP_FAILED;
+    }
     
     // Find a free mmap region slot
     mmap_region_t* region = alloc_mmap_region(cur);
@@ -1187,6 +1365,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (addr == 0 || (addr & (PAGE_SIZE - 1))) {
             return (int64_t)MAP_FAILED;  // Invalid fixed address
         }
+        // Security: Reject mappings below 64KB to prevent NULL deref exploits
+        if (addr < 0x10000) {
+            return (int64_t)MAP_FAILED;
+        }
         vaddr = addr;
     } else {
         // Allocate from mmap area (grows down from below stack)
@@ -1194,6 +1376,11 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         cur->mmap_base -= length;
         if (cur->mmap_base < cur->brk + (4 * 1024 * 1024)) {
             // Too close to heap
+            cur->mmap_base += length;  // Rollback
+            return (int64_t)MAP_FAILED;
+        }
+        // Security: Reject mappings below 64KB to prevent NULL deref exploits
+        if (cur->mmap_base < 0x10000) {
             cur->mmap_base += length;  // Rollback
             return (int64_t)MAP_FAILED;
         }
@@ -1356,9 +1543,12 @@ static int64_t sys_pipe(uint64_t pipefd_ptr) {
 
     cur->fd_table[fd_write] = (vfs_file_t*)write_end;
 
+    // SMAP-aware write to user array
     int* user_pipefd = (int*)pipefd_ptr;
+    smap_disable();
     user_pipefd[0] = fd_read;
     user_pipefd[1] = fd_write;
+    smap_enable();
 
     return 0;
 }
@@ -1503,7 +1693,7 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options) {
             // Normal exit: exit_code << 8
             status = (child->exit_code & 0xFF) << 8;
         }
-        *(int*)status_ptr = status;
+        copy_to_user((void*)status_ptr, &status, sizeof(status));
     }
     
     int child_pid = child->id;
@@ -1750,6 +1940,7 @@ static int64_t sys_getpid(void) {
 // SYS_YIELD - yield CPU
 static int64_t sys_yield(void) {
     task_t* cur = sched_current();
+    (void)cur;
     __asm__ volatile ("sti");
     sched_yield();
     return 0;

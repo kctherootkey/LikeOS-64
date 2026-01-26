@@ -86,15 +86,21 @@ long vfs_readdir(vfs_file_t* f, void* buf, long bytes) {
         reclen = (reclen + 7) & ~7;  // Align to 8 bytes
         
         if (bytes >= reclen) {
-            struct linux_dirent64* ent = (struct linux_dirent64*)out;
-            ent->d_ino = 2;  // Fake inode for /dev
-            ent->d_off = reclen;
-            ent->d_reclen = reclen;
-            ent->d_type = DT_DIR;
-            ent->d_name[0] = 'd';
-            ent->d_name[1] = 'e';
-            ent->d_name[2] = 'v';
-            ent->d_name[3] = '\0';
+            // Build entry in kernel buffer first, then copy to user
+            struct linux_dirent64 ent;
+            ent.d_ino = 2;  // Fake inode for /dev
+            ent.d_off = reclen;
+            ent.d_reclen = reclen;
+            ent.d_type = DT_DIR;
+            ent.d_name[0] = 'd';
+            ent.d_name[1] = 'e';
+            ent.d_name[2] = 'v';
+            ent.d_name[3] = '\0';
+            
+            // SMAP-aware copy to user buffer
+            smap_disable();
+            mm_memcpy(out, &ent, sizeof(ent));
+            smap_enable();
             
             out += reclen;
             bytes -= reclen;

@@ -16,6 +16,10 @@ kernel_syscall_stack_top:
 SECTION .data
 user_rsp_save:
     dq 0
+    
+; Saved kernel RSP before syscall_handler call (for restoring after context switch)
+syscall_saved_ksp:
+    dq 0
 
 ; Saved user context for fork
 global syscall_saved_user_rip

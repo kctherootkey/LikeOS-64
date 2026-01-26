@@ -7,6 +7,36 @@
 
 #define TTY_MAX_PTYS 16
 
+// Security: Validate user pointer is in user space
+static bool tty_validate_user_ptr(uint64_t ptr, size_t len) {
+    if (ptr < 0x10000) return false;  // Reject low addresses (NULL deref protection)
+    if (ptr >= 0x7FFFFFFFFFFF) return false;  // Beyond user space
+    if (ptr + len < ptr) return false;  // Overflow check
+    return true;
+}
+
+// Security: SMAP-aware copy from kernel to user
+static int tty_copy_to_user(void* user_dst, const void* kernel_src, size_t len) {
+    if (!tty_validate_user_ptr((uint64_t)user_dst, len)) {
+        return -EFAULT;
+    }
+    smap_disable();
+    mm_memcpy(user_dst, kernel_src, len);
+    smap_enable();
+    return 0;
+}
+
+// Security: SMAP-aware copy from user to kernel
+static int tty_copy_from_user(void* kernel_dst, const void* user_src, size_t len) {
+    if (!tty_validate_user_ptr((uint64_t)user_src, len)) {
+        return -EFAULT;
+    }
+    smap_disable();
+    mm_memcpy(kernel_dst, user_src, len);
+    smap_enable();
+    return 0;
+}
+
 typedef struct pty {
     int id;
     tty_t slave;
@@ -311,7 +341,10 @@ long tty_read(tty_t* tty, void* buf, long count, int nonblock) {
             }
             break;
         }
+        // SMAP-aware write to user buffer
+        smap_disable();
         out[read++] = c;
+        smap_enable();
         if ((tty->term.c_lflag & ICANON) && c == '\n') {
             break;
         }
@@ -326,7 +359,10 @@ long tty_write(tty_t* tty, const void* buf, long count) {
     }
     const char* in = (const char*)buf;
     for (long i = 0; i < count; ++i) {
+        // SMAP-aware read from user buffer
+        smap_disable();
         char c = in[i];
+        smap_enable();
         if (tty->term.c_iflag & INLCR) {
             if (c == '\n') {
                 c = '\r';
@@ -349,34 +385,41 @@ int tty_ioctl(tty_t* tty, unsigned long req, void* argp, task_t* cur) {
     switch (req) {
         case TCGETS:
             if (!argp) return -EFAULT;
-            mm_memcpy(argp, &tty->term, sizeof(termios_k_t));
-            return 0;
+            // Security: Use SMAP-aware copy to user space
+            return tty_copy_to_user(argp, &tty->term, sizeof(termios_k_t));
         case TCSETS:
         case TCSETSW:
         case TCSETSF:
             if (!argp) return -EFAULT;
-            mm_memcpy(&tty->term, argp, sizeof(termios_k_t));
-            return 0;
-        case TIOCGPGRP:
+            // Security: Use SMAP-aware copy from user space
+            return tty_copy_from_user(&tty->term, argp, sizeof(termios_k_t));
+        case TIOCGPGRP: {
             if (!argp) return -EFAULT;
-            *(int*)argp = tty->fg_pgid;
-            return 0;
-        case TIOCSPGRP:
+            int pgid = tty->fg_pgid;
+            // Security: Use SMAP-aware copy to user space
+            return tty_copy_to_user(argp, &pgid, sizeof(int));
+        }
+        case TIOCSPGRP: {
             if (!argp) return -EFAULT;
-            tty->fg_pgid = *(int*)argp;
+            int pgid;
+            // Security: Use SMAP-aware copy from user space
+            int ret = tty_copy_from_user(&pgid, argp, sizeof(int));
+            if (ret != 0) return ret;
+            tty->fg_pgid = pgid;
             return 0;
+        }
         case TIOCSCTTY:
             if (!cur) return -EINVAL;
             cur->ctty = tty;
             return 0;
         case TIOCGWINSZ:
             if (!argp) return -EFAULT;
-            mm_memcpy(argp, &tty->winsz, sizeof(struct winsize));
-            return 0;
+            // Security: Use SMAP-aware copy to user space
+            return tty_copy_to_user(argp, &tty->winsz, sizeof(struct winsize));
         case TIOCSWINSZ:
             if (!argp) return -EFAULT;
-            mm_memcpy(&tty->winsz, argp, sizeof(struct winsize));
-            return 0;
+            // Security: Use SMAP-aware copy from user space
+            return tty_copy_from_user(&tty->winsz, argp, sizeof(struct winsize));
         case TIOCSGUARD:
             if (tty == tty_get_console()) {
                 console_set_prompt_guard();
@@ -464,7 +507,10 @@ long tty_pty_master_read(int id, void* buf, long count, int nonblock) {
             }
             break;
         }
+        // SMAP-aware write to user buffer
+        smap_disable();
         out[read++] = pty->master_buf[pty->m_head];
+        smap_enable();
         pty->m_head = (pty->m_head + 1) % sizeof(pty->master_buf);
         pty->m_count--;
     }
@@ -478,7 +524,11 @@ long tty_pty_master_write(int id, const void* buf, long count) {
     }
     const char* in = (const char*)buf;
     for (long i = 0; i < count; ++i) {
-        tty_input_char(&pty->slave, in[i], 0);
+        // SMAP-aware read from user buffer
+        smap_disable();
+        char c = in[i];
+        smap_enable();
+        tty_input_char(&pty->slave, c, 0);
     }
     return count;
 }

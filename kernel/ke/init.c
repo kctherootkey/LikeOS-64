@@ -53,6 +53,7 @@ void system_startup(boot_info_t* boot_info) {
     
     mm_enable_nx();
     mm_remap_kernel_with_nx();
+    mm_enable_smep_smap();
     
     mm_initialize_syscall();
 

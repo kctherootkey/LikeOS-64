@@ -2484,8 +2484,11 @@ static long fat32_read(vfs_file_t *f, void *buf, long bytes)
             kfree(tmp);
             return copied ? (long)copied : ST_IO;
         }
+        // SMAP-aware copy to user buffer
+        smap_disable();
         for (unsigned i = 0; i < chunk; i++)
             ((uint8_t *)buf)[copied + i] = ((uint8_t *)tmp)[cluster_offset + i];
+        smap_enable();
         kfree(tmp);
         ff->pos += chunk;
         copied += chunk;
@@ -2556,8 +2559,11 @@ static long fat32_write(vfs_file_t *f, const void *buf, long bytes)
             return written ? (long)written : ST_IO;
         }
 
+        // SMAP-aware copy from user buffer
+        smap_disable();
         for (unsigned i = 0; i < chunk; i++)
             ((uint8_t *)tmp)[cluster_offset + i] = ((const uint8_t *)buf)[written + i];
+        smap_enable();
 
         if (write_sectors(ff->fs->bdev,
             cluster_to_lba(ff->fs, ff->current_cluster),
@@ -2607,6 +2613,8 @@ static unsigned fat32_write_dirent64(char* out, unsigned out_size, unsigned* out
     if (*out_off + reclen > out_size) {
         return 0;
     }
+    // SMAP-aware write to user buffer
+    smap_disable();
     struct linux_dirent64* d = (struct linux_dirent64*)(out + *out_off);
     d->d_ino = ino;
     d->d_off = 0;
@@ -2617,6 +2625,7 @@ static unsigned fat32_write_dirent64(char* out, unsigned out_size, unsigned* out
         dn[i] = name[i];
     }
     dn[name_len] = '\0';
+    smap_enable();
     *out_off += reclen;
     return 1;
 }

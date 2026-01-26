@@ -230,6 +230,8 @@ static unsigned devfs_write_dirent64(char* out, unsigned out_size, unsigned* out
     unsigned reclen = (unsigned)sizeof(struct linux_dirent64) + name_len + 1;
     reclen = (reclen + 7u) & ~7u;
     if (*out_off + reclen > out_size) return 0;
+    // SMAP-aware write to user buffer
+    smap_disable();
     struct linux_dirent64* d = (struct linux_dirent64*)(out + *out_off);
     d->d_ino = ino;
     d->d_off = 0;
@@ -238,6 +240,7 @@ static unsigned devfs_write_dirent64(char* out, unsigned out_size, unsigned* out
     char* dn = (char*)d->d_name;
     for (unsigned i = 0; i < name_len; ++i) dn[i] = name[i];
     dn[name_len] = '\0';
+    smap_enable();
     *out_off += reclen;
     return 1;
 }
@@ -309,7 +312,9 @@ int devfs_ioctl(vfs_file_t* f, unsigned long req, void* argp, task_t* cur) {
     }
     if (df->type == DEVFS_TYPE_PTY_MASTER) {
         if (req == TIOCGPTN && argp) {
+            smap_disable();
             *(int*)argp = df->pty_id;
+            smap_enable();
             return 0;
         }
     }

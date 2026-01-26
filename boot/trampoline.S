@@ -26,8 +26,10 @@ trampoline_jump:
     mov %rdx, %rcx          # Save pml4_addr in RCX
     
     # Enable PGE (Page Global Enable) in CR4
+    # SMEP/SMAP are deferred to kernel initialization where we can safely
+    # check CPUID and have a proper execution environment
     mov %cr4, %rdx
-    or $0x80, %rdx          # Set bit 7 (PGE)
+    or $0x80, %rdx          # Set bit 7 (PGE - Page Global Enable)
     mov %rdx, %cr4
     
     # Note: NX enablement is deferred to kernel initialization

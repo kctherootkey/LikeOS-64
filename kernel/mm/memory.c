@@ -1476,6 +1476,55 @@ static inline void wrmsr(uint32_t msr, uint64_t value) {
 // Syscall entry point - defined in syscall.asm
 extern void syscall_entry(void);
 
+// Global flag indicating SMAP is active (used by copy_from_user/copy_to_user)
+bool g_smap_enabled = false;
+
+// SMAP control: temporarily allow supervisor access to user pages
+void smap_disable(void) {
+    if (g_smap_enabled) {
+        __asm__ volatile("stac" ::: "cc");
+    }
+}
+
+// SMAP control: re-enable SMAP protection
+void smap_enable(void) {
+    if (g_smap_enabled) {
+        __asm__ volatile("clac" ::: "cc");
+    }
+}
+
+// Enable SMEP and SMAP if CPU supports them
+void mm_enable_smep_smap(void) {
+    // Check CPUID leaf 7, subleaf 0 for SMEP/SMAP support
+    uint32_t eax, ebx, ecx, edx;
+    eax = 7;
+    ecx = 0;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(eax), "c"(ecx));
+    
+    uint64_t cr4;
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    
+    // SMEP: bit 7 of EBX from CPUID, enables CR4 bit 20
+    if (ebx & (1 << 7)) {
+        cr4 |= (1ULL << 20);
+        kprintf("SMEP enabled (Supervisor Mode Execution Prevention)\n");
+    } else {
+        kprintf("SMEP not supported by CPU\n");
+    }
+    
+    // SMAP: bit 20 of EBX from CPUID, enables CR4 bit 21
+    if (ebx & (1 << 20)) {
+        cr4 |= (1ULL << 21);
+        g_smap_enabled = true;
+        kprintf("SMAP enabled (Supervisor Mode Access Prevention)\n");
+    } else {
+        g_smap_enabled = false;
+        kprintf("SMAP not supported by CPU\n");
+    }
+    
+    __asm__ volatile("mov %0, %%cr4" : : "r"(cr4));
+}
+
 // Enable NX (No-Execute) bit support
 void mm_enable_nx(void) {
     uint64_t efer = rdmsr(MSR_EFER);
@@ -1526,8 +1575,9 @@ void mm_initialize_syscall(void) {
     wrmsr(MSR_CSTAR, (uint64_t)syscall_entry);
     
     // Set SFMASK - RFLAGS bits to clear on SYSCALL
-    // Clear TF (trap flag) and DF (direction flag) on entry
-    wrmsr(MSR_SFMASK, 0x100 | 0x400);
+    // Clear IF (interrupt flag), TF (trap flag), DF (direction flag), and AC (SMAP bypass)
+    // IF (bit 9) = 0x200, TF (bit 8) = 0x100, DF (bit 10) = 0x400, AC (bit 18) = 0x40000
+    wrmsr(MSR_SFMASK, 0x200 | 0x100 | 0x400 | 0x40000);
     
     kprintf("SYSCALL/SYSRET initialized\n");
     kprintf("  STAR = 0x%016llx\n", star);

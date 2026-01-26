@@ -191,4 +191,15 @@ extern char kernel_end[];
 // Enable NX bit support
 void mm_enable_nx(void);
 
+// Enable SMEP/SMAP if CPU supports them
+void mm_enable_smep_smap(void);
+
+// Global flag indicating SMAP is active (use stac/clac only when true)
+extern bool g_smap_enabled;
+
+// SMAP control functions for user memory access
+// Call smap_disable() before accessing user memory, smap_enable() after
+void smap_disable(void);  // Execute STAC if SMAP is enabled
+void smap_enable(void);   // Execute CLAC if SMAP is enabled
+
 #endif // _KERNEL_MEMORY_H_

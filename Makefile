@@ -24,8 +24,9 @@ EFI_LIBS = /usr/lib/crt0-efi-x86_64.o
 EFI_LDS = /usr/lib/elf_x86_64_efi.lds
 
 # Compiler flags for kernel
+# Security: Use -fstack-protector-strong for stack buffer overflow detection
 KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
-			-fno-stack-protector -mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
+			-fstack-protector-strong -mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
 			-I$(INCLUDE_DIR) -DXHCI_USE_INTERRUPTS=1
 
 # Compiler flags for userspace programs
@@ -73,7 +74,8 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/syscall.o \
 			  $(BUILD_DIR)/syscall_c.o \
 			  $(BUILD_DIR)/elf_loader.o \
-			  $(BUILD_DIR)/pipe.o
+			  $(BUILD_DIR)/pipe.o \
+			  $(BUILD_DIR)/stack_guard.o
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -187,6 +189,9 @@ $(BUILD_DIR)/elf_loader.o: $(KERNEL_DIR)/ke/elf_loader.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/pipe.o: $(KERNEL_DIR)/ke/pipe.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/stack_guard.o: $(KERNEL_DIR)/ke/stack_guard.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # Build userland C library

@@ -894,6 +894,146 @@ int main(int argc, char** argv) {
     test_result("rmdir mixed case dir", rmdir(mixed_dir) == 0);
 
     // ========================================
+    // Test: Security - Invalid Pointer Handling
+    // ========================================
+    printf("\n[TEST] Security - Invalid Pointer Handling\n");
+    
+    // Test: NULL pointer should fail with EFAULT
+    int sec_ret = read(0, NULL, 100);
+    test_result("read(NULL) returns EFAULT", sec_ret == -1 && errno == EFAULT);
+    
+    sec_ret = write(1, NULL, 100);
+    test_result("write(NULL) returns EFAULT", sec_ret == -1 && errno == EFAULT);
+    
+    // Test: Kernel address pointer should fail with EFAULT
+    void* kernel_addr = (void*)0xFFFFFFFF80000000ULL;
+    sec_ret = read(0, kernel_addr, 100);
+    test_result("read(kernel_addr) returns EFAULT", sec_ret == -1 && errno == EFAULT);
+    
+    sec_ret = write(1, kernel_addr, 100);
+    test_result("write(kernel_addr) returns EFAULT", sec_ret == -1 && errno == EFAULT);
+    
+    // Test: stat with NULL buffer should fail
+    sec_ret = stat("/", NULL);
+    test_result("stat(NULL buf) returns EFAULT", sec_ret == -1 && errno == EFAULT);
+    
+    // Test: open with NULL path should fail
+    sec_ret = open(NULL, O_RDONLY);
+    test_result("open(NULL) returns EFAULT", sec_ret == -1 && errno == EFAULT);
+
+    // ========================================
+    // Test: Security - Integer Overflow Protection
+    // ========================================
+    printf("\n[TEST] Security - Integer Overflow Protection\n");
+    
+    // Test: Excessive mmap size should fail
+    void* bad_mmap = mmap(NULL, 0xFFFFFFFFFFFFFFFFULL, PROT_READ | PROT_WRITE, 
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    test_result("mmap(huge size) fails", bad_mmap == MAP_FAILED);
+    
+    // Test: Very large read should fail gracefully (not crash)
+    // Note: We can't actually pass >1GB to read in practice, but the kernel should handle it
+    char tiny_buf[1];
+    // The kernel will reject this because the buffer is only 1 byte but we're asking for huge read
+    // Either way, the kernel should not crash
+    sec_ret = read(0, tiny_buf, 0x7FFFFFFFFFFFFFFULL);
+    test_result("read(huge count) returns error", sec_ret == -1);
+
+    // ========================================
+    // Test: Security - IOCTL Validation
+    // ========================================
+    printf("\n[TEST] Security - IOCTL Validation\n");
+    
+    // Test: TIOCGWINSZ with NULL should fail
+    sec_ret = ioctl(0, TIOCGWINSZ, NULL);
+    test_result("ioctl(TIOCGWINSZ, NULL) returns EFAULT", sec_ret == -1 && errno == EFAULT);
+    
+    // Test: TIOCGWINSZ with kernel address should fail
+    sec_ret = ioctl(0, TIOCGWINSZ, kernel_addr);
+    test_result("ioctl(TIOCGWINSZ, kernel_addr) returns EFAULT", sec_ret == -1 && errno == EFAULT);
+    
+    // Test: Valid IOCTL should succeed
+    struct winsize ws;
+    sec_ret = ioctl(0, TIOCGWINSZ, &ws);
+    test_result("ioctl(TIOCGWINSZ, valid) succeeds", sec_ret == 0);
+
+    // ========================================
+    // Test: Security - Memory Protection
+    // ========================================
+    printf("\n[TEST] Security - Memory Protection\n");
+    
+    // Test: mmap anonymous memory works
+    void* anon_mem = mmap(NULL, 4096, PROT_READ | PROT_WRITE, 
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    test_result("mmap anonymous succeeds", anon_mem != MAP_FAILED);
+    if (anon_mem != MAP_FAILED) {
+        // Test: Memory should be zero-initialized
+        int zero_init = 1;
+        unsigned char* mem = (unsigned char*)anon_mem;
+        for (int i = 0; i < 4096; i++) {
+            if (mem[i] != 0) {
+                zero_init = 0;
+                break;
+            }
+        }
+        test_result("mmap memory is zero-initialized", zero_init);
+        munmap(anon_mem, 4096);
+    }
+    
+    // Test: mmap with zero length should fail
+    void* zero_mmap = mmap(NULL, 0, PROT_READ | PROT_WRITE, 
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    test_result("mmap(0 length) fails", zero_mmap == MAP_FAILED);
+
+    // Test: MAP_FIXED at low address (< 64KB) should fail
+    void* low_mmap = mmap((void*)0x1000, 4096, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    test_result("mmap(MAP_FIXED, addr=0x1000) fails", low_mmap == MAP_FAILED);
+    
+    // Test: MAP_FIXED at NULL should fail
+    void* null_fixed = mmap((void*)0, 4096, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    test_result("mmap(MAP_FIXED, addr=0) fails", null_fixed == MAP_FAILED);
+    
+    // Test: MAP_FIXED at address just below 64KB boundary should fail
+    void* boundary_mmap = mmap((void*)0xF000, 4096, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    test_result("mmap(MAP_FIXED, addr=0xF000) fails", boundary_mmap == MAP_FAILED);
+    
+    // Test: MAP_FIXED at valid address (>= 64KB) should succeed
+    // Use a high address that's unlikely to conflict
+    void* valid_fixed = mmap((void*)0x10000000, 4096, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    test_result("mmap(MAP_FIXED, addr=0x10000000) succeeds", valid_fixed != MAP_FAILED);
+    if (valid_fixed != MAP_FAILED) {
+        munmap(valid_fixed, 4096);
+    }
+    
+    // Test: Excessive mmap size (> 2GB limit) should fail
+    void* huge_mmap = mmap(NULL, 3ULL * 1024 * 1024 * 1024, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    test_result("mmap(3GB) fails (exceeds 2GB limit)", huge_mmap == MAP_FAILED);
+    
+    // Test: Multiple small mmaps should succeed
+    void* multi1 = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void* multi2 = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void* multi3 = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    test_result("multiple mmap calls succeed", 
+                multi1 != MAP_FAILED && multi2 != MAP_FAILED && multi3 != MAP_FAILED);
+    test_result("mmap returns different addresses", 
+                multi1 != multi2 && multi2 != multi3 && multi1 != multi3);
+    if (multi1 != MAP_FAILED) munmap(multi1, 4096);
+    if (multi2 != MAP_FAILED) munmap(multi2, 4096);
+    if (multi3 != MAP_FAILED) munmap(multi3, 4096);
+    
+    // Test: mmap with PROT_NONE should succeed (reserve memory)
+    void* prot_none = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    test_result("mmap(PROT_NONE) succeeds", prot_none != MAP_FAILED);
+    if (prot_none != MAP_FAILED) {
+        munmap(prot_none, 4096);
+    }
+
+    // ========================================
     // Summary
     // ========================================
     printf("\n========================================\n");
