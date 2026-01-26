@@ -165,7 +165,7 @@
 #define XHCI_MAX_RING_SEGMENTS  16   // Maximum segments per ring (can expand)
 #define XHCI_MAX_SLOTS          16
 #define XHCI_MAX_ENDPOINTS      32
-#define XHCI_MAX_PORTS          8
+#define XHCI_MAX_PORTS          16   // Increased to support USB 3.0 ports in VirtualBox
 
 // Scatter-gather list maximum entries
 #define XHCI_MAX_SG_ENTRIES     32
@@ -403,6 +403,7 @@ void xhci_irq_service(xhci_controller_t* ctrl);
 void xhci_process_events(xhci_controller_t* ctrl);
 
 // Port management
+int xhci_power_ports(xhci_controller_t* ctrl);
 int xhci_poll_ports(xhci_controller_t* ctrl);
 int xhci_port_reset(xhci_controller_t* ctrl, uint8_t port);
 uint8_t xhci_port_speed(xhci_controller_t* ctrl, uint8_t port);

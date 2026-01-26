@@ -1103,6 +1103,39 @@ static void xhci_handle_port_event(xhci_controller_t* ctrl, xhci_trb_t* trb) {
 // Port Management
 //=============================================================================
 
+int xhci_power_ports(xhci_controller_t* ctrl) {
+    if (!ctrl) return ST_INVALID;
+    
+    // Power up all ports
+    for (uint8_t port = 1; port <= ctrl->max_ports; port++) {
+        uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
+        uint32_t portsc = xhci_op_read32(ctrl, off);
+        
+        if (!(portsc & XHCI_PORTSC_PP)) {
+            // Set Port Power (PP) bit
+            xhci_op_write32(ctrl, off, XHCI_PORTSC_PP);
+        } else if (portsc & XHCI_PORTSC_WPR_MASK) {
+            // Clear any pending change bits
+            xhci_op_write32(ctrl, off, (portsc & XHCI_PORTSC_PP) | XHCI_PORTSC_WPR_MASK);
+        }
+    }
+    
+    // Wait for port power stabilization (USB spec: 100ms, use 200ms for compatibility)
+    delay_ms(200);
+    
+    // Clear any port status change bits that appeared during power-up
+    for (uint8_t port = 1; port <= ctrl->max_ports; port++) {
+        uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
+        uint32_t portsc = xhci_op_read32(ctrl, off);
+        
+        if (portsc & XHCI_PORTSC_WPR_MASK) {
+            xhci_op_write32(ctrl, off, (portsc & (XHCI_PORTSC_PP | XHCI_PORTSC_PED)) | XHCI_PORTSC_WPR_MASK);
+        }
+    }
+    
+    return ST_OK;
+}
+
 int xhci_poll_ports(xhci_controller_t* ctrl) {
     int connected = 0;
     

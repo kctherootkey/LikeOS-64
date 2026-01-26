@@ -52,9 +52,10 @@ static void xhci_log_ext_caps(xhci_controller_t* ctrl) {
         return;
     }
     
-    // Look for Supported Protocol capabilities (ID=2)
-    uint32_t protocol_offset = xhci_find_ext_cap(ctrl, XHCI_EXT_CAP_PROTOCOL, 0);
-    if (protocol_offset) {
+    // Look for ALL Supported Protocol capabilities (ID=2)
+    // There can be multiple: one for USB 2.0 ports and one for USB 3.0 ports
+    uint32_t protocol_offset = 0;
+    while ((protocol_offset = xhci_find_ext_cap(ctrl, XHCI_EXT_CAP_PROTOCOL, protocol_offset)) != 0) {
         // xhci_find_ext_cap returns offset from ctrl->base, not absolute address
         volatile uint32_t* cap_ptr = (volatile uint32_t*)(ctrl->base + protocol_offset);
         uint32_t cap_data = cap_ptr[0];
@@ -68,6 +69,9 @@ static void xhci_log_ext_caps(xhci_controller_t* ctrl) {
         
         kprintf("[XHCI BOOT] Protocol: USB %d.%d, ports %d-%d\n",
                 major_rev, minor_rev, port_offset, port_offset + port_count - 1);
+        
+        // Move to next capability (offset is in DWORDs)
+        protocol_offset += 4;  // Move past current capability to search for next
     }
 }
 
@@ -111,6 +115,9 @@ void xhci_boot_init(xhci_boot_state_t* state) {
     
     // Log extended capabilities (debug)
     xhci_log_ext_caps(&g_xhci);
+    
+    // Power up all ports - required for VirtualBox and some real hardware
+    xhci_power_ports(&g_xhci);
     
     // Verify controller state after initialization
     if (xhci_verify_controller_state(&g_xhci) != ST_OK) {
