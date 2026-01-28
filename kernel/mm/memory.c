@@ -254,6 +254,11 @@ uint64_t mm_allocate_physical_page(void) {
     set_page_bit(page);
     mm_state.free_pages--;
     
+    // Clear refcount for newly allocated page (it may have stale refcount from previous use)
+    if (mm_state.page_refcounts) {
+        mm_state.page_refcounts[page] = 0;
+    }
+    
     return mm_state.memory_start + (page * PAGE_SIZE);
 }
 
@@ -270,6 +275,16 @@ void mm_free_physical_page(uint64_t physical_address) {
     
     clear_page_bit(page);
     mm_state.free_pages++;
+    
+    // Clear refcount so page can be properly reused
+    if (mm_state.page_refcounts) {
+        mm_state.page_refcounts[page] = 0;
+    }
+}
+
+// Get free pages count
+uint64_t mm_get_free_pages(void) {
+    return mm_state.free_pages;
 }
 
 // Allocate contiguous physical pages
@@ -328,7 +343,7 @@ int mm_debug_pt = 0;
 
 // Page table page pool - allocated from kernel heap which is properly mapped
 // We use a simple pool because kalloc may not be available during early init
-#define PT_POOL_SIZE 128  // 128 pages = 512KB for page tables
+#define PT_POOL_SIZE 512  // 512 pages = 2MB for page tables (increased for large allocations)
 static struct {
     uint64_t virt_addr;  // Virtual address (for accessing the page)
     uint64_t phys_addr;  // Physical address (for page table entries)
@@ -1252,28 +1267,28 @@ void mm_destroy_address_space(uint64_t* pml4) {
     // Don't free if it's the kernel PML4
     uint64_t kernel_pml4_phys = get_cr3() & ~0xFFFULL;
     if (pml4_phys == kernel_pml4_phys) {
-        kprintf("mm_destroy_address_space: Cannot destroy kernel PML4!\n");
         return;
     }
     
     // Free user-space page tables (entries 0-255, user space only)
     // Skip 256-511 (kernel space) and 272 (direct map)
+    // Use 0x000FFFFFFFFFF000ULL mask to extract physical address (bits 12-51)
     for (int i = 0; i < 256; i++) {
         if (pml4[i] & PAGE_PRESENT) {
-            uint64_t pdpt_phys = pml4[i] & ~0xFFFULL;
+            uint64_t pdpt_phys = pml4[i] & 0x000FFFFFFFFFF000ULL;
             uint64_t* pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
             
             for (int j = 0; j < 512; j++) {
                 if (pdpt[j] & PAGE_PRESENT) {
-                    uint64_t pd_phys = pdpt[j] & ~0xFFFULL;
+                    uint64_t pd_phys = pdpt[j] & 0x000FFFFFFFFFF000ULL;
                     uint64_t* pd = (uint64_t*)phys_to_virt(pd_phys);
                     
                     for (int k = 0; k < 512; k++) {
                         if (pd[k] & PAGE_PRESENT) {
                             // Check if it's a 2MB page or a page table
                             if (pd[k] & PAGE_SIZE_FLAG) {
-                                // 2MB page - check COW refcount before freeing
-                                uint64_t phys = pd[k] & ~0x1FFFFFULL;
+                                // 2MB page - check COW refcount before freeing (mask 21 bits for 2MB alignment)
+                                uint64_t phys = pd[k] & 0x000FFFFFFFE00000ULL;
                                 if (pd[k] & PAGE_USER) {
                                     // User page - use refcount
                                     if (mm_decref_page(phys)) {
@@ -1283,13 +1298,13 @@ void mm_destroy_address_space(uint64_t* pml4) {
                                     mm_free_physical_page(phys);
                                 }
                             } else {
-                                uint64_t pt_phys = pd[k] & ~0xFFFULL;
+                                uint64_t pt_phys = pd[k] & 0x000FFFFFFFFFF000ULL;
                                 uint64_t* pt = (uint64_t*)phys_to_virt(pt_phys);
                                 
                                 // Free all physical pages in this PT
                                 for (int l = 0; l < 512; l++) {
                                     if (pt[l] & PAGE_PRESENT) {
-                                        uint64_t phys = pt[l] & ~0xFFFULL;
+                                        uint64_t phys = pt[l] & 0x000FFFFFFFFFF000ULL;
                                         // Check if this is a user page (could be COW shared)
                                         if (pt[l] & PAGE_USER) {
                                             // Use refcount - only free if last reference
@@ -1865,7 +1880,8 @@ bool mm_decref_page(uint64_t phys_addr) {
         mm_state.page_refcounts[idx]--;
         return mm_state.page_refcounts[idx] == 0;
     }
-    return true;  // Already 0, can free
+    // refcount is 0 - this page was never shared, free it directly
+    return true;
 }
 
 // Get reference count for a physical page

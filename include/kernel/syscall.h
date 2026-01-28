@@ -96,6 +96,9 @@
 #define SYS_PAUSE           270
 #define SYS_NANOSLEEP       271
 
+// Debug/diagnostic syscalls (LikeOS specific)
+#define SYS_MEMSTATS        300  // Print memory stats
+
 // Special dirfd value for *at() syscalls
 #define AT_FDCWD        -100
 

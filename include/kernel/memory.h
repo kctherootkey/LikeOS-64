@@ -189,6 +189,7 @@ void mm_get_memory_stats(memory_stats_t* stats);
 void mm_print_memory_stats(void);
 void mm_print_heap_stats(void);
 bool mm_validate_heap(void);
+uint64_t mm_get_free_pages(void);
 
 // Memory detection and initialization
 void mm_reserve_kernel_memory(void);

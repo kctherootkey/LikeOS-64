@@ -9,7 +9,7 @@ LIBS = $(LIBC_DIR)/libc.a
 CRT0 = $(LIBC_DIR)/crt0.o
 
 # Programs
-PROGRAMS = test_syscalls test_libc hello sh ls cat pwd stat progerr testmem
+PROGRAMS = test_syscalls test_libc hello sh ls cat pwd stat progerr testmem memstat
 
 all: $(PROGRAMS)
 
@@ -42,6 +42,9 @@ progerr: $(CRT0) progerr.o $(LIBS)
 
 testmem: $(CRT0) testmem.o $(LIBS)
 	$(LD) $(LDFLAGS) $(CRT0) testmem.o $(LIBS) -o $@
+
+memstat: $(CRT0) memstat.o $(LIBS)
+	$(LD) $(LDFLAGS) $(CRT0) memstat.o $(LIBS) -o $@
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

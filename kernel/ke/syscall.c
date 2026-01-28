@@ -2730,6 +2730,10 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         case SYS_NANOSLEEP:
             return sys_nanosleep(a1, a2);
             
+        case SYS_MEMSTATS:
+            mm_print_memory_stats();
+            return 0;
+            
         default:
             return -ENOSYS;
     }
