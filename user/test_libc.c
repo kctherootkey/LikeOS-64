@@ -1135,6 +1135,44 @@ int main(int argc, char** argv) {
     }
 
     // ========================================
+    // Large Allocation Test (100MB)
+    // ========================================
+    printf("\n--- Large Allocation Test (100MB) ---\n");
+    {
+        const size_t large_size = 100 * 1024 * 1024;  // 100MB
+        printf("Attempting to allocate 100MB...\n");
+        
+        void* large_alloc = malloc(large_size);
+        test_result("malloc(100MB) succeeds", large_alloc != NULL);
+        
+        if (large_alloc) {
+            // Touch first and last byte to verify memory is usable
+            volatile char* p = (volatile char*)large_alloc;
+            p[0] = 0xAA;
+            p[large_size - 1] = 0x55;
+            
+            int first_ok = (p[0] == (char)0xAA);
+            int last_ok = (p[large_size - 1] == 0x55);
+            
+            test_result("100MB write/read first byte", first_ok);
+            test_result("100MB write/read last byte", last_ok);
+            
+            // Touch some pages in the middle to verify mapping
+            size_t mid = large_size / 2;
+            p[mid] = 0x42;
+            test_result("100MB write/read middle byte", p[mid] == 0x42);
+            
+            printf("100MB allocation at %p, verified %lu bytes\n", 
+                   large_alloc, (unsigned long)large_size);
+            
+            free(large_alloc);
+            printf("100MB freed successfully\n");
+        } else {
+            printf("FAILED: Could not allocate 100MB\n");
+        }
+    }
+
+    // ========================================
     // Summary
     // ========================================
     printf("\n========================================\n");

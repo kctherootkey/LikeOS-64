@@ -3,6 +3,10 @@
 
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/slab.h"
+
+// Enable SLAB allocator (comment out to use legacy fixed-size heap)
+#define USE_SLAB_ALLOCATOR
 
 // Magic numbers for heap validation
 #define HEAP_MAGIC_ALLOCATED    0xDEADBEEF
@@ -148,15 +152,12 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     
     // Calculate memory layout
     // Get kernel end virtual address and convert to physical
+    // The kernel is loaded at physical 0x100000 and mapped to virtual 0xFFFFFFFF80000000
+    // So: phys = virt - 0xFFFFFFFF80000000 + 0x100000
     uint64_t kernel_end_virt = (uint64_t)kernel_end;
-    uint64_t kernel_end_phys = mm_get_physical_address(kernel_end_virt);
-    
-    if (kernel_end_phys == 0) {
-        // Fallback: assume identity mapping offset
-        uint64_t kernel_virt_base = 0xFFFFFFFF80000000ULL;
-        kernel_end_phys = kernel_end_virt - kernel_virt_base;
-        kprintf("  Using fallback physical address calculation\n");
-    }
+    uint64_t kernel_virt_base = 0xFFFFFFFF80000000ULL;
+    uint64_t kernel_phys_base = 0x100000ULL;  // 1MB - where bootloader loads kernel
+    uint64_t kernel_end_phys = (kernel_end_virt - kernel_virt_base) + kernel_phys_base;
     
     // The kernel heap is allocated right after kernel_end in virtual space
     // It occupies 8MB of physical memory. The bitmap follows.
@@ -166,12 +167,8 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     uint64_t heap_start_virt = mm_get_kernel_heap_start();
     uint64_t heap_end_virt = heap_start_virt + KERNEL_HEAP_SIZE;
     
-    // Convert heap end virtual to physical
-    uint64_t kernel_virt_base = 0xFFFFFFFF80000000ULL;
-    uint64_t heap_end_phys = (heap_end_virt - kernel_virt_base) + (kernel_end_phys - (kernel_end_virt - kernel_virt_base));
-    
     // Simplified: heap_end_phys = kernel_end_phys + KERNEL_HEAP_SIZE
-    heap_end_phys = kernel_end_phys + KERNEL_HEAP_SIZE;
+    uint64_t heap_end_phys = kernel_end_phys + KERNEL_HEAP_SIZE;
     
     // Add space for bitmap (estimate) - we'll refine this after calculating total pages
     // For 512MB of RAM, we need about 512MB/4KB = 128K pages = 16KB bitmap
@@ -180,7 +177,20 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     
     // Start manageable memory after heap + bitmap, aligned to page boundary  
     mm_state.memory_start = PAGE_ALIGN(heap_end_phys + bitmap_reserve);
-    mm_state.memory_end = mm_state.memory_start + memory_size;
+    
+    kprintf("  DEBUG: memory_size passed = %lu (0x%lx)\n", 
+            (unsigned long)memory_size, (unsigned long)memory_size);
+    kprintf("  DEBUG: memory_start calculated = %p\n", (void*)mm_state.memory_start);
+    
+    // memory_end is the total physical RAM, not memory_start + memory_size!
+    mm_state.memory_end = memory_size;
+    // Make sure memory_end doesn't exceed available RAM
+    if (mm_state.memory_end <= mm_state.memory_start) {
+        kprintf("ERROR: Not enough RAM! memory_start=%p > memory_end=%p (memory_size=%lu)\n",
+                (void*)mm_state.memory_start, (void*)mm_state.memory_end, 
+                (unsigned long)memory_size);
+        mm_state.memory_end = mm_state.memory_start + (16 * 1024 * 1024); // Fallback 16MB
+    }
     mm_state.total_pages = (mm_state.memory_end - mm_state.memory_start) / PAGE_SIZE;
     mm_state.bitmap_size = PAGE_ALIGN((mm_state.total_pages + 7) / 8);
     
@@ -268,7 +278,18 @@ void mm_free_physical_page(uint64_t physical_address) {
 
 // Allocate contiguous physical pages
 uint64_t mm_allocate_contiguous_pages(size_t page_count) {
-    if (page_count == 0 || mm_state.free_pages < page_count) {
+    if (page_count == 0) {
+        kprintf("mm_allocate_contiguous_pages: page_count is 0\n");
+        return 0;
+    }
+    if (mm_state.free_pages < page_count) {
+        kprintf("mm_allocate_contiguous_pages: not enough free pages (%lu free, need %lu)\n",
+                (unsigned long)mm_state.free_pages, (unsigned long)page_count);
+        return 0;
+    }
+    if (page_count > mm_state.total_pages) {
+        kprintf("mm_allocate_contiguous_pages: page_count %lu > total_pages %lu\n",
+                (unsigned long)page_count, (unsigned long)mm_state.total_pages);
         return 0;
     }
     
@@ -306,6 +327,96 @@ void mm_free_contiguous_pages(uint64_t physical_address, size_t page_count) {
 
 // VIRTUAL MEMORY MANAGER IMPLEMENTATION
 
+// Debug flag for page table operations (non-static so slab.c can use it)
+int mm_debug_pt = 0;
+
+// Page table page pool - allocated from kernel heap which is properly mapped
+// We use a simple pool because kalloc may not be available during early init
+#define PT_POOL_SIZE 128  // 128 pages = 512KB for page tables
+static struct {
+    uint64_t virt_addr;  // Virtual address (for accessing the page)
+    uint64_t phys_addr;  // Physical address (for page table entries)
+} pt_pool_pages[PT_POOL_SIZE];
+static int pt_pool_next = 0;
+static int pt_pool_initialized = 0;
+
+// Forward declarations
+void* kalloc_dma(size_t size);
+uint64_t mm_virt_to_phys_heap(uint64_t virt);
+
+// Convert kernel heap virtual address to physical address
+// The kernel heap is at KERNEL_OFFSET + kernel_end, mapped linearly
+uint64_t mm_virt_to_phys_heap(uint64_t virt) {
+    // Kernel virtual base: 0xFFFFFFFF80000000
+    // The kernel is loaded at physical 0x100000 and mapped to virtual 0xFFFFFFFF80000000
+    // So: phys = virt - KERNEL_OFFSET + 0x100000
+    
+    if (virt >= KERNEL_OFFSET && virt < 0xFFFFFFFF90000000ULL) {
+        return (virt - KERNEL_OFFSET) + 0x100000ULL;  // KERNEL_START = 0x100000
+    }
+    
+    // For identity-mapped addresses (< 4GB), virt = phys
+    if (virt < 0x100000000ULL) {
+        return virt;
+    }
+    
+    kprintf("ERROR: mm_virt_to_phys_heap: unknown address %p\n", (void*)virt);
+    return 0;
+}
+
+// Allocate a page for page table structures
+// Returns: physical address (for use in page table entries)
+// Use pt_pool_pages[].virt_addr to access the page contents
+static uint64_t allocate_pt_page(void) {
+    // First try the pre-allocated pool
+    if (pt_pool_initialized && pt_pool_next < PT_POOL_SIZE) {
+        int idx = pt_pool_next++;
+        uint64_t virt = pt_pool_pages[idx].virt_addr;
+        uint64_t phys = pt_pool_pages[idx].phys_addr;
+        if (virt && phys) {
+            mm_memset((void*)virt, 0, PAGE_SIZE);
+            return phys;  // Return physical address for page table entries
+        }
+    }
+    
+    // Fall back to DMA allocation - need page-aligned memory!
+    // Allocate extra space to ensure we can get a page-aligned address
+    void* page = kalloc_dma(PAGE_SIZE * 2);  // Double size for alignment
+    if (page) {
+        // Align to page boundary
+        uint64_t aligned = ((uint64_t)page + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        mm_memset((void*)aligned, 0, PAGE_SIZE);
+        uint64_t phys = mm_virt_to_phys_heap(aligned);
+        if (mm_debug_pt) {
+            kprintf("PT: Fallback alloc: raw=%p aligned=%p phys=%p\n", 
+                    page, (void*)aligned, (void*)phys);
+        }
+        return phys;
+    }
+    
+    return 0;
+}
+
+// Initialize page table page pool
+void mm_init_pt_pool(void) {
+    kprintf("Initializing page table pool (%d pages)...\n", PT_POOL_SIZE);
+    for (int i = 0; i < PT_POOL_SIZE; i++) {
+        // Allocate from DMA heap with extra space for alignment
+        void* raw = kalloc_dma(PAGE_SIZE * 2);  // Double size for alignment
+        if (raw) {
+            // Align to page boundary
+            uint64_t aligned = ((uint64_t)raw + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+            pt_pool_pages[i].virt_addr = aligned;
+            pt_pool_pages[i].phys_addr = mm_virt_to_phys_heap(aligned);
+        } else {
+            kprintf("  Warning: Only allocated %d PT pages\n", i);
+            break;
+        }
+    }
+    pt_pool_initialized = 1;
+    kprintf("  Page table pool ready\n");
+}
+
 // Get page table for virtual address
 uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
     uint64_t pml4_index = (virtual_addr >> 39) & 0x1FF;
@@ -316,45 +427,74 @@ uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
     // Use existing page tables (assume identity mapping for now)
     mm_state.pml4_table = (uint64_t*)(get_cr3() & ~0xFFF);
     
+    if (mm_debug_pt) {
+        kprintf("PT: vaddr=%p pml4=%lu pdpt=%lu pd=%lu pt=%lu\n",
+                (void*)virtual_addr, pml4_index, pdpt_index, pd_index, pt_index);
+        kprintf("PT: PML4 at %p, entry[%lu]=%p\n", 
+                mm_state.pml4_table, pml4_index, (void*)mm_state.pml4_table[pml4_index]);
+    }
+    
     uint64_t* pdpt = (uint64_t*)(mm_state.pml4_table[pml4_index] & ~0xFFF);
     if (!pdpt && create) {
-        uint64_t pdpt_phys = mm_allocate_physical_page();
+        uint64_t pdpt_phys = allocate_pt_page();
         if (!pdpt_phys) {
             return NULL;
         }
-        mm_memset((void*)pdpt_phys, 0, PAGE_SIZE);
+        // Already zeroed by allocate_pt_page
         mm_state.pml4_table[pml4_index] = pdpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
         pdpt = (uint64_t*)pdpt_phys;
+        if (mm_debug_pt) kprintf("PT: Created new PDPT at %p\n", pdpt);
     }
     if (!pdpt) {
         return NULL;
     }
     
+    if (mm_debug_pt) {
+        kprintf("PT: PDPT at %p, entry[%lu]=%p\n", pdpt, pdpt_index, (void*)pdpt[pdpt_index]);
+    }
+    
     uint64_t* pd = (uint64_t*)(pdpt[pdpt_index] & ~0xFFF);
     if (!pd && create) {
-        uint64_t pd_phys = mm_allocate_physical_page();
+        uint64_t pd_phys = allocate_pt_page();
         if (!pd_phys) {
             return NULL;
         }
-        mm_memset((void*)pd_phys, 0, PAGE_SIZE);
+        // Already zeroed by allocate_pt_page
         pdpt[pdpt_index] = pd_phys | PAGE_PRESENT | PAGE_WRITABLE;
         pd = (uint64_t*)pd_phys;
+        if (mm_debug_pt) kprintf("PT: Created new PD at %p\n", pd);
     }
     if (!pd) {
         return NULL;
     }
     
+    if (mm_debug_pt) {
+        kprintf("PT: PD at %p, entry[%lu]=%p\n", pd, pd_index, (void*)pd[pd_index]);
+    }
+    
     uint64_t* pt = (uint64_t*)(pd[pd_index] & ~0xFFF);
     if (!pt && create) {
-        uint64_t pt_phys = mm_allocate_physical_page();
+        uint64_t pt_phys = allocate_pt_page();
         if (!pt_phys) {
             return NULL;
         }
-        mm_memset((void*)pt_phys, 0, PAGE_SIZE);
-        pd[pd_index] = pt_phys | PAGE_PRESENT | PAGE_WRITABLE;
+        // Already zeroed by allocate_pt_page
+        uint64_t new_entry = pt_phys | PAGE_PRESENT | PAGE_WRITABLE;
+        if (mm_debug_pt) {
+            kprintf("PT: Creating PT at %p for pd[%lu]\n", (void*)pt_phys, pd_index);
+        }
+        pd[pd_index] = new_entry;
+        if (mm_debug_pt) {
+            kprintf("PT: Wrote pd[%lu] = 0x%lx, readback = 0x%lx\n", pd_index, new_entry, pd[pd_index]);
+        }
         pt = (uint64_t*)pt_phys;
+        if (mm_debug_pt) kprintf("PT: Created new PT at %p\n", pt);
     }
 
+    if (mm_debug_pt && pt) {
+        kprintf("PT: PT at %p, returning &pt[%lu] = %p\n", pt, pt_index, &pt[pt_index]);
+    }
+    
     return pt ? &pt[pt_index] : NULL;
 }
 
@@ -436,7 +576,14 @@ bool mm_map_page(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) 
         return false;
     }
     
-    *pte = (physical_addr & ~0xFFF) | flags;
+    uint64_t entry = (physical_addr & ~0xFFF) | flags;
+    if (mm_debug_pt) {
+        kprintf("MAP: pte=%p writing entry=0x%lx\n", pte, entry);
+    }
+    *pte = entry;
+    if (mm_debug_pt) {
+        kprintf("MAP: readback *pte=0x%lx\n", *pte);
+    }
     mm_flush_tlb(virtual_addr);
     return true;
 }
@@ -470,8 +617,13 @@ void mm_unmap_page_in_address_space(uint64_t* pml4, uint64_t virtual_addr) {
 // Get physical address for virtual address
 uint64_t mm_get_physical_address(uint64_t virtual_addr) {
     uint64_t* pte = mm_get_page_table(virtual_addr, false);
+    if (mm_debug_pt) {
+        kprintf("GET_PHYS: vaddr=%p pte=%p *pte=0x%lx\n", 
+                (void*)virtual_addr, pte, pte ? *pte : 0);
+    }
     if (pte && (*pte & PAGE_PRESENT)) {
-        return (*pte & ~0xFFF) | (virtual_addr & 0xFFF);
+        // Mask out NX bit (63) and other reserved bits, keep only physical address bits 12-51
+        return (*pte & 0x000FFFFFFFFFF000ULL) | (virtual_addr & 0xFFF);
     }
     return 0;
 }
@@ -635,6 +787,9 @@ int heap_validate(const char* caller) {
 
 // Allocate memory
 void* kalloc(size_t size) {
+#ifdef USE_SLAB_ALLOCATOR
+    return slab_alloc(size);
+#else
     if (size == 0) {
         return NULL;
     }
@@ -662,10 +817,14 @@ void* kalloc(size_t size) {
     mm_state.allocation_count++;
 
     return (uint8_t*)block + sizeof(heap_block_t);
+#endif
 }
 
 // Free memory
 void kfree(void* ptr) {
+#ifdef USE_SLAB_ALLOCATOR
+    slab_free(ptr);
+#else
     if (!ptr) {
         return;
     }
@@ -704,10 +863,14 @@ void kfree(void* ptr) {
     
     // Coalesce with adjacent free blocks
     coalesce_blocks(block);
+#endif
 }
 
 // Reallocate memory
 void* krealloc(void* ptr, size_t new_size) {
+#ifdef USE_SLAB_ALLOCATOR
+    return slab_realloc(ptr, new_size);
+#else
     if (!ptr) {
         return kalloc(new_size);
     }
@@ -734,16 +897,97 @@ void* krealloc(void* ptr, size_t new_size) {
     }
     
     return new_ptr;
+#endif
 }
 
 // Allocate and zero memory
 void* kcalloc(size_t count, size_t size) {
+#ifdef USE_SLAB_ALLOCATOR
+    return slab_calloc(count, size);
+#else
     size_t total_size = count * size;
     void* ptr = kalloc(total_size);
     if (ptr) {
         mm_memset(ptr, 0, total_size);
     }
     return ptr;
+#endif
+}
+
+// ============================================================================
+// DMA-SAFE ALLOCATIONS
+// These always use the legacy heap which is in low physical memory (< 4GB)
+// Use for device DMA buffers (XHCI, USB, etc.)
+// ============================================================================
+
+// DMA-safe allocation (always uses legacy heap for low physical addresses)
+void* kalloc_dma(size_t size) {
+    if (size == 0) {
+        return NULL;
+    }
+    
+    // Align size to 8 bytes
+    size = (size + 7) & ~7;
+    
+    heap_block_t* block = find_free_block(size);
+    if (!block) {
+        void* ra = __builtin_return_address(0);
+        kprintf("kalloc_dma FAILED for size %lu, heap used=%lu/%lu (caller=%p)\n", 
+            (unsigned long)size, mm_state.heap_used, mm_state.heap_size, ra);
+        return NULL;
+    }
+    
+    split_block(block, size);
+    block->magic = HEAP_MAGIC_ALLOCATED;
+    block->is_free = 0;
+    mm_state.heap_used += size + sizeof(heap_block_t);
+    mm_state.allocation_count++;
+
+    return (uint8_t*)block + sizeof(heap_block_t);
+}
+
+// DMA-safe calloc
+void* kcalloc_dma(size_t count, size_t size) {
+    size_t total_size = count * size;
+    void* ptr = kalloc_dma(total_size);
+    if (ptr) {
+        mm_memset(ptr, 0, total_size);
+    }
+    return ptr;
+}
+
+// Free DMA-safe allocation
+void kfree_dma(void* ptr) {
+    if (!ptr) {
+        return;
+    }
+
+    if (!mm_state.heap_start || !mm_state.heap_end) {
+        return;
+    }
+
+    uint8_t* heap_start = (uint8_t*)mm_state.heap_start;
+    uint8_t* heap_end = (uint8_t*)mm_state.heap_end;
+    if ((uint8_t*)ptr < heap_start + sizeof(heap_block_t) || (uint8_t*)ptr >= heap_end) {
+        void* ra = __builtin_return_address(0);
+        kprintf("ERROR: Invalid kfree_dma for address %p (caller=%p)\n", ptr, ra);
+        return;
+    }
+    
+    heap_block_t* block = (heap_block_t*)((uint8_t*)ptr - sizeof(heap_block_t));
+    
+    if (block->magic != HEAP_MAGIC_ALLOCATED || block->is_free) {
+        void* ra = __builtin_return_address(0);
+        kprintf("ERROR: Invalid kfree_dma for address %p (magic=0x%08x free=%d caller=%p)\n", 
+            ptr, block->magic, block->is_free, ra);
+        return;
+    }
+    
+    block->magic = HEAP_MAGIC_FREE;
+    block->is_free = 1;
+    mm_state.heap_used -= block->size + sizeof(heap_block_t);
+    mm_state.deallocation_count++;
+    coalesce_blocks(block);
 }
 
 // MEMORY STATISTICS AND DEBUGGING

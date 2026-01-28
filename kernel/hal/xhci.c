@@ -69,11 +69,11 @@ static void xhci_memcpy(void* dst, const void* src, size_t n) {
 
 xhci_ring_t* xhci_alloc_ring(void) {
     // For xHCI rings, we need 64-byte alignment minimum, but page alignment is safer for DMA
-    // kalloc doesn't guarantee alignment, so allocate extra and align manually
+    // Use DMA-safe allocation for low physical addresses required by XHCI
     size_t ring_size = sizeof(xhci_ring_t);
     size_t alloc_size = ring_size + 4096;  // Extra page for alignment
     
-    uint8_t* raw = (uint8_t*)kcalloc(1, alloc_size);
+    uint8_t* raw = (uint8_t*)kcalloc_dma(1, alloc_size);
     if (!raw) return NULL;
     
     // Align to 4KB page boundary
@@ -156,10 +156,11 @@ void xhci_ring_doorbell(xhci_controller_t* ctrl, uint8_t slot, uint8_t ep) {
 // Allocate a single ring segment (page-aligned for DMA)
 xhci_ring_segment_t* xhci_segment_alloc(void) {
     // Ring segments need page alignment for DMA
+    // Use DMA-safe allocation for low physical addresses
     size_t seg_size = sizeof(xhci_ring_segment_t);
     size_t alloc_size = seg_size + 4096;
     
-    uint8_t* raw = (uint8_t*)kcalloc(1, alloc_size);
+    uint8_t* raw = (uint8_t*)kcalloc_dma(1, alloc_size);
     if (!raw) return NULL;
     
     // Align to 4KB page boundary
@@ -198,7 +199,7 @@ xhci_ring_ex_t* xhci_ring_ex_alloc(uint32_t num_segs) {
     if (num_segs == 0) num_segs = 1;
     if (num_segs > XHCI_MAX_RING_SEGMENTS) num_segs = XHCI_MAX_RING_SEGMENTS;
     
-    xhci_ring_ex_t* ring = (xhci_ring_ex_t*)kcalloc(1, sizeof(xhci_ring_ex_t));
+    xhci_ring_ex_t* ring = (xhci_ring_ex_t*)kcalloc_dma(1, sizeof(xhci_ring_ex_t));
     if (!ring) return NULL;
     
     // Allocate segments
@@ -259,7 +260,7 @@ void xhci_ring_ex_free(xhci_ring_ex_t* ring) {
         }
     }
     
-    kfree(ring);
+    kfree_dma(ring);
 }
 
 // Expand ring by adding new segments after the current enqueue segment
@@ -714,8 +715,8 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev) {
         return ST_ERR;
     }
     
-    // Allocate DCBAA (Device Context Base Address Array)
-    ctrl->dcbaa = (uint64_t*)kcalloc(1, (ctrl->max_slots + 1) * sizeof(uint64_t) + 64);
+    // Allocate DCBAA (Device Context Base Address Array) - DMA-safe
+    ctrl->dcbaa = (uint64_t*)kcalloc_dma(1, (ctrl->max_slots + 1) * sizeof(uint64_t) + 64);
     if (!ctrl->dcbaa) {
         kprintf("[XHCI] Failed to allocate DCBAA\n");
         return ST_NOMEM;
@@ -743,8 +744,8 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev) {
     ctrl->cmd_ring_phys = mm_get_physical_address((uint64_t)ctrl->cmd_ring->trbs);
     xhci_ring_init(ctrl->cmd_ring, ctrl->cmd_ring_phys);
     
-    // Allocate input context
-    ctrl->input_ctx = (xhci_input_ctx_t*)kcalloc(1, sizeof(xhci_input_ctx_t) + 64);
+    // Allocate input context - DMA-safe
+    ctrl->input_ctx = (xhci_input_ctx_t*)kcalloc_dma(1, sizeof(xhci_input_ctx_t) + 64);
     if (!ctrl->input_ctx) {
         kprintf("[XHCI] Failed to allocate input context\n");
         return ST_NOMEM;
@@ -801,9 +802,9 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev) {
 static void xhci_setup_scratchpad(xhci_controller_t* ctrl) {
     if (ctrl->num_scratchpads == 0) return;
     
-    // Allocate scratchpad array
-    ctrl->scratchpad_array = (uint64_t*)kcalloc(ctrl->num_scratchpads, sizeof(uint64_t));
-    ctrl->scratchpad_pages = (void**)kcalloc(ctrl->num_scratchpads, sizeof(void*));
+    // Allocate scratchpad array (DMA-safe for low physical addresses)
+    ctrl->scratchpad_array = (uint64_t*)kcalloc_dma(ctrl->num_scratchpads, sizeof(uint64_t));
+    ctrl->scratchpad_pages = (void**)kcalloc_dma(ctrl->num_scratchpads, sizeof(void*));
     
     if (!ctrl->scratchpad_array || !ctrl->scratchpad_pages) {
         kprintf("[XHCI] Failed to allocate scratchpad\n");
@@ -812,8 +813,8 @@ static void xhci_setup_scratchpad(xhci_controller_t* ctrl) {
     
     // Allocate pages for scratchpad (must be page-aligned for DMA)
     for (uint16_t i = 0; i < ctrl->num_scratchpads; i++) {
-        // Allocate extra for alignment since kcalloc doesn't guarantee page alignment
-        void* raw = kcalloc(1, PAGE_SIZE + PAGE_SIZE);
+        // Allocate extra for alignment, DMA-safe for low physical addresses
+        void* raw = kcalloc_dma(1, PAGE_SIZE + PAGE_SIZE);
         if (!raw) {
             kprintf("[XHCI] Failed to allocate scratchpad page %d\n", i);
             return;
@@ -844,8 +845,8 @@ static void xhci_setup_event_ring(xhci_controller_t* ctrl) {
     ctrl->event_ring->dequeue = 0;
     ctrl->event_ring->cycle = 1;
     
-    // Allocate ERST (Event Ring Segment Table)
-    ctrl->erst = (xhci_erst_entry_t*)kcalloc(1, sizeof(xhci_erst_entry_t) * 2 + 64);
+    // Allocate ERST (Event Ring Segment Table) - DMA-safe
+    ctrl->erst = (xhci_erst_entry_t*)kcalloc_dma(1, sizeof(xhci_erst_entry_t) * 2 + 64);
     if (!ctrl->erst) {
         kprintf("[XHCI] Failed to allocate ERST\n");
         return;
@@ -1258,8 +1259,8 @@ int xhci_enable_slot(xhci_controller_t* ctrl) {
 int xhci_address_device(xhci_controller_t* ctrl, uint8_t slot, uint8_t port, uint8_t speed) {
     if (slot == 0 || slot > ctrl->max_slots) return ST_INVALID;
     
-    // Allocate device context
-    xhci_dev_ctx_t* dev_ctx = (xhci_dev_ctx_t*)kcalloc(1, sizeof(xhci_dev_ctx_t) + 64);
+    // Allocate device context - DMA-safe for low physical addresses
+    xhci_dev_ctx_t* dev_ctx = (xhci_dev_ctx_t*)kcalloc_dma(1, sizeof(xhci_dev_ctx_t) + 64);
     if (!dev_ctx) return ST_NOMEM;
     
     // Align to 64 bytes
@@ -1384,8 +1385,8 @@ int xhci_enumerate_device(xhci_controller_t* ctrl, uint8_t port) {
     usb_device_t* dev = &ctrl->devices[slot - 1];
     
     // Allocate DMA-safe PAGE-ALIGNED buffer for descriptors
-    // kcalloc only provides 8-byte alignment, so allocate extra and align manually
-    uint8_t* raw_buf = (uint8_t*)kcalloc(1, 4096 + 4096);
+    // Uses legacy heap for low physical addresses required by XHCI DMA
+    uint8_t* raw_buf = (uint8_t*)kcalloc_dma(1, 4096 + 4096);
     if (!raw_buf) {
         kprintf("[XHCI] Failed to allocate DMA buffer\n");
         return ST_NOMEM;
@@ -1495,7 +1496,7 @@ int xhci_enumerate_device(xhci_controller_t* ctrl, uint8_t port) {
     }
     
     // Free DMA buffer (free the raw allocation, not the aligned pointer)
-    kfree(raw_buf);
+    kfree_dma(raw_buf);
     
     // Configure bulk endpoints if found
     if (dev->bulk_in_ep && dev->bulk_out_ep) {
@@ -2142,7 +2143,7 @@ void xhci_shutdown(xhci_controller_t* ctrl) {
     
     // Free device resources
     for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
-        if (ctrl->dev_ctx[i]) kfree(ctrl->dev_ctx[i]);
+        if (ctrl->dev_ctx[i]) kfree_dma(ctrl->dev_ctx[i]);
         if (ctrl->devices[i].bulk_in_ring) xhci_free_ring(ctrl->devices[i].bulk_in_ring);
         if (ctrl->devices[i].bulk_out_ring) xhci_free_ring(ctrl->devices[i].bulk_out_ring);
     }

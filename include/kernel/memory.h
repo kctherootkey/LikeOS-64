@@ -149,11 +149,18 @@ uint16_t mm_get_page_refcount(uint64_t physical_addr);
 
 // Kernel Heap Allocator
 void mm_initialize_heap(void);
+void mm_init_pt_pool(void);  // Initialize page table page pool
 void* kalloc(size_t size);
 void kfree(void* ptr);
 void* krealloc(void* ptr, size_t new_size);
 void* kcalloc(size_t count, size_t size);
 int heap_validate(const char* caller);
+
+// DMA-safe allocation (uses legacy heap which is in low physical memory)
+// Use these for device DMA buffers that need physical addresses < 4GB
+void* kalloc_dma(size_t size);
+void* kcalloc_dma(size_t count, size_t size);
+void kfree_dma(void* ptr);
 
 // Memory utilities
 void mm_get_memory_stats(memory_stats_t* stats);

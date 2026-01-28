@@ -57,6 +57,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/serial.o \
               $(BUILD_DIR)/mouse.o \
               $(BUILD_DIR)/memory.o \
+			  $(BUILD_DIR)/slab.o \
 			  $(BUILD_DIR)/scrollbar.o \
 			  $(BUILD_DIR)/vfs.o \
 			  $(BUILD_DIR)/devfs.o \
@@ -136,6 +137,9 @@ $(BUILD_DIR)/mouse.o: $(KERNEL_DIR)/hal/mouse.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/memory.o: $(KERNEL_DIR)/mm/memory.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/slab.o: $(KERNEL_DIR)/mm/slab.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/scrollbar.o: $(KERNEL_DIR)/hal/scrollbar.c | $(BUILD_DIR)
