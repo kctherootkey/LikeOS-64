@@ -484,19 +484,15 @@ void console_remap_to_direct_map(void) {
     if (fb_info && fb_info->framebuffer_base) {
         // The framebuffer base was passed as a physical address (identity-mapped by bootloader)
         uint64_t fb_phys = (uint64_t)fb_info->framebuffer_base;
-        kprintf("Remapping framebuffer: phys=0x%lx ", fb_phys);
         
         // Check if framebuffer is within our 4GB direct map range
         if (fb_phys >= 0x100000000ULL) {
-            kprintf("-> WARNING: Framebuffer above 4GB, cannot use direct map!\n");
             // Leave as identity-mapped - this will crash after identity map removal
-            // TODO: Extend direct map to cover framebuffer region
             return;
         }
         
         // Convert it to use the direct map at PHYS_MAP_BASE
         fb_info->framebuffer_base = phys_to_virt(fb_phys);
-        kprintf("-> virt=0x%lx\n", (uint64_t)fb_info->framebuffer_base);
     }
 }
 

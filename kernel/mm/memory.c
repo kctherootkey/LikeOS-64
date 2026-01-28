@@ -178,10 +178,6 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     // Start manageable memory after heap + bitmap, aligned to page boundary  
     mm_state.memory_start = PAGE_ALIGN(heap_end_phys + bitmap_reserve);
     
-    kprintf("  DEBUG: memory_size passed = %lu (0x%lx)\n", 
-            (unsigned long)memory_size, (unsigned long)memory_size);
-    kprintf("  DEBUG: memory_start calculated = %p\n", (void*)mm_state.memory_start);
-    
     // memory_end is the total physical RAM, not memory_start + memory_size!
     mm_state.memory_end = memory_size;
     // Make sure memory_end doesn't exceed available RAM
@@ -660,9 +656,6 @@ void mm_initialize_heap(void) {
     mm_state.heap_start->prev = NULL;
 
     mm_state.free_list = mm_state.heap_start;
-
-    kprintf("  Heap range: %p - %p\n", mm_state.heap_start, mm_state.heap_end);
-    kprintf("  Heap size: %d KB\n", mm_state.heap_size / 1024);
     
     kprintf("Kernel Heap Allocator initialized\n");
 }
@@ -1023,14 +1016,6 @@ void mm_print_memory_stats(void) {
            stats.used_memory / (1024*1024), stats.used_pages);
     kprintf("  Free:  %d MB (%d pages)\n", 
            stats.free_memory / (1024*1024), stats.free_pages);
-    
-    kprintf("Kernel Heap:\n");
-    kprintf("  Total: %d KB\n", mm_state.heap_size / 1024);
-    kprintf("  Used:  %d KB\n", stats.heap_allocated / 1024);
-    kprintf("  Free:  %d KB\n", stats.heap_free / 1024);
-    kprintf("  Allocations: %d\n", stats.allocations);
-    kprintf("  Deallocations: %d\n", stats.deallocations);
-    kprintf("  Active allocations: %d\n", stats.allocations - stats.deallocations);
     kprintf("========================\n\n");
 }
 
@@ -1413,13 +1398,6 @@ bool mm_map_user_stack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
             }
             return false;
         }
-        
-        // DEBUG: Verify the page was mapped with correct flags
-        uint64_t* pte = mm_get_page_table_from_pml4(pml4, vaddr, false);
-        if (pte && i == pages - 1) {  // Only log last page
-            kprintf("  Stack page 0x%lx: PTE=0x%lx (USER=%d)\n", 
-                    vaddr, *pte, (*pte & PAGE_USER) ? 1 : 0);
-        }
     }
     
     return true;
@@ -1738,8 +1716,6 @@ static void continue_after_stack_switch(void);
 void mm_switch_to_kernel_stack(void) {
     uint64_t new_rsp = mm_get_kernel_stack_top();
     
-    kprintf("Switching to kernel stack at 0x%lx\n", new_rsp);
-    
     // This function switches the stack and calls continue_after_stack_switch
     // It will NOT return - execution continues from continue_after_stack_switch
     switch_stack_and_call(new_rsp, continue_after_stack_switch);
@@ -1749,8 +1725,6 @@ void mm_switch_to_kernel_stack(void) {
 
 // This function is called on the new stack
 static void continue_after_stack_switch(void) {
-    kprintf("Now running on kernel higher-half stack\n");
-    
     // Remove identity mapping now that we're on the new stack
     mm_remove_identity_mapping();
     
@@ -1767,8 +1741,6 @@ void mm_remove_identity_mapping(void) {
     // Disable interrupts during this critical section
     // Interrupt handlers may access identity-mapped memory
     __asm__ volatile("cli");
-    
-    kprintf("Removing identity mapping...\n");
     
     // Get current PML4 via direct map
     uint64_t pml4_phys = get_cr3() & ~0xFFFULL;
@@ -1789,8 +1761,6 @@ void mm_remove_identity_mapping(void) {
     // Flush entire TLB
     uint64_t cr3_val = get_cr3();
     set_cr3(cr3_val);
-    
-    kprintf("Identity mapping removed - physical memory now via direct map at 0xFFFF880000000000\n");
     
     // Re-enable interrupts now that identity mapping is removed
     __asm__ volatile("sti");

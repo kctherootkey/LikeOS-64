@@ -59,51 +59,6 @@ void system_startup(boot_info_t* boot_info) {
     
     mm_print_memory_stats();
     
-// Uncomment to test 100MB kernel allocation at boot
-#define KERNEL_SLAB_100MB_TEST
-#ifdef KERNEL_SLAB_100MB_TEST
-    {
-        kprintf("\n=== SLAB 100MB Allocation Test ===\n");
-        const size_t test_size = 100 * 1024 * 1024;  // 100MB
-        kprintf("Allocating %lu MB...\n", (unsigned long)(test_size / (1024*1024)));
-        void* big_alloc = kalloc(test_size);
-        if (big_alloc) {
-            kprintf("  Allocated at %p\n", big_alloc);
-            // Touch first and last page to verify mapping
-            volatile uint8_t* p = (volatile uint8_t*)big_alloc;
-            p[0] = 0xAA;
-            p[test_size - 1] = 0x55;
-            // Also write to middle
-            p[test_size / 2] = 0x42;
-            
-            // Verify all writes
-            int first_ok = (p[0] == 0xAA);
-            int last_ok = (p[test_size - 1] == 0x55);
-            int mid_ok = (p[test_size / 2] == 0x42);
-            
-            kprintf("  Write test: first=0x%02x (expect 0xAA) %s\n", 
-                    p[0], first_ok ? "OK" : "FAIL");
-            kprintf("  Write test: middle=0x%02x (expect 0x42) %s\n", 
-                    p[test_size / 2], mid_ok ? "OK" : "FAIL");
-            kprintf("  Write test: last=0x%02x (expect 0x55) %s\n", 
-                    p[test_size - 1], last_ok ? "OK" : "FAIL");
-            
-            if (first_ok && last_ok && mid_ok) {
-                kprintf("  All verification PASSED!\n");
-            } else {
-                kprintf("  VERIFICATION FAILED!\n");
-            }
-            
-            kfree(big_alloc);
-            kprintf("  Freed successfully\n");
-            slab_print_stats();
-        } else {
-            kprintf("  FAILED to allocate 100MB!\n");
-        }
-        kprintf("=================================\n\n");
-    }
-#endif
-    
     mm_enable_nx();
     mm_remap_kernel_with_nx();
     mm_enable_smep_smap();
@@ -134,8 +89,6 @@ void continue_system_startup(void) {
     devfs_init();
     vfs_register_devfs(devfs_get_ops());
     tty_init();
-    xhci_boot_init(&g_xhci_boot);
-    storage_fs_init(&g_storage_state);
 
     static scrollbar_t system_scrollbar;
     if (scrollbar_init_system_default(&system_scrollbar) == 0) {
@@ -151,6 +104,9 @@ void continue_system_startup(void) {
 
     mouse_init();
     irq_enable(12);
+
+    xhci_boot_init(&g_xhci_boot);
+    storage_fs_init(&g_storage_state);
 
     __asm__ volatile ("sti");
 

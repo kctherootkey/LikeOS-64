@@ -357,14 +357,12 @@ void fb_optimize_shutdown(void)
 void fb_optimize_remap_to_direct_map(void)
 {
     if(!g_initialized || !g_double_buffer.front_buffer) {
-        kprintf("fb_optimize_remap: not initialized or no front_buffer\n");
         return;
     }
     // The front buffer was stored as an identity-mapped physical address
     // Convert it to use the direct map at PHYS_MAP_BASE
     uint64_t fb_phys = (uint64_t)g_double_buffer.front_buffer;
     g_double_buffer.front_buffer = (uint32_t*)phys_to_virt(fb_phys);
-    kprintf("fb_optimize_remap: front_buffer 0x%lx -> 0x%lx\n", fb_phys, (uint64_t)g_double_buffer.front_buffer);
 }
 
 // Merge overlapping dirty regions to optimize copy operations
