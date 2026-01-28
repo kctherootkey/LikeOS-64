@@ -103,6 +103,16 @@ uint64_t mm_get_kernel_heap_start(void) {
 
 // PHYSICAL MEMORY MANAGER IMPLEMENTATION
 
+// Forward declarations
+static bool is_page_allocated(uint64_t page);
+
+// Page table pool - Reserved from start of physical memory range.
+// All page tables are allocated from this pool, which is outside the bitmap range.
+#define PT_POOL_SIZE 2048  // 2048 pages = 8MB for page tables
+static uint64_t pt_pool_phys_start = 0;
+static int pt_pool_next = 0;
+static int pt_pool_initialized = 0;
+
 // Find first free bit in bitmap
 static uint64_t find_free_page(void) {
     for (uint64_t i = 0; i < mm_state.bitmap_size / sizeof(uint32_t); i++) {
@@ -161,11 +171,9 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     
     // The kernel heap is allocated right after kernel_end in virtual space
     // It occupies 8MB of physical memory. The bitmap follows.
-    // We must start the physical memory pool AFTER the heap AND bitmap.
     
     // Calculate the heap end in physical terms
     uint64_t heap_start_virt = mm_get_kernel_heap_start();
-    uint64_t heap_end_virt = heap_start_virt + KERNEL_HEAP_SIZE;
     
     // Simplified: heap_end_phys = kernel_end_phys + KERNEL_HEAP_SIZE
     uint64_t heap_end_phys = kernel_end_phys + KERNEL_HEAP_SIZE;
@@ -173,10 +181,23 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     // Add space for bitmap (estimate) - we'll refine this after calculating total pages
     // For 512MB of RAM, we need about 512MB/4KB = 128K pages = 16KB bitmap
     // But let's be generous and reserve 64KB for the bitmap
+    // ALSO need to reserve space for the refcount array: 2 bytes per page
+    // For 2GB RAM: ~500K pages * 2 = ~1MB for refcounts
     uint64_t bitmap_reserve = 64 * 1024;
+    uint64_t refcount_reserve = 2 * 1024 * 1024;  // 2MB for refcounts (generous)
     
-    // Start manageable memory after heap + bitmap, aligned to page boundary  
-    mm_state.memory_start = PAGE_ALIGN(heap_end_phys + bitmap_reserve);
+    // Start manageable memory after heap + bitmap + refcounts, aligned to page boundary  
+    mm_state.memory_start = PAGE_ALIGN(heap_end_phys + bitmap_reserve + refcount_reserve);
+    
+    // Reserve the first PT_POOL_SIZE pages of the allocatable range for page tables
+    // These pages will be accessed via the direct map but NOT tracked by the bitmap
+    pt_pool_phys_start = mm_state.memory_start;
+    uint64_t pt_pool_size_bytes = PT_POOL_SIZE * PAGE_SIZE;
+    mm_state.memory_start += pt_pool_size_bytes;  // Advance past the PT pool
+    
+    kprintf("  PT pool reserved: %p - %p (%d pages, %lu MB)\n",
+            (void*)pt_pool_phys_start, (void*)mm_state.memory_start,
+            PT_POOL_SIZE, pt_pool_size_bytes / (1024*1024));
     
     // memory_end is the total physical RAM, not memory_start + memory_size!
     mm_state.memory_end = memory_size;
@@ -216,28 +237,25 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     // Each page gets 2 bytes (uint16_t) for refcount - max 65535 references
     mm_state.refcount_array_size = mm_state.total_pages * sizeof(uint16_t);
     mm_state.page_refcounts = (uint16_t*)((uint64_t)mm_state.physical_bitmap + mm_state.bitmap_size);
+    
+    // Verify refcounts fit in reserved space
+    uint64_t refcount_end_virt = (uint64_t)mm_state.page_refcounts + mm_state.refcount_array_size;
+    uint64_t refcount_end_phys = (refcount_end_virt - kernel_virt_base) + kernel_phys_base;
+    if (refcount_end_phys > mm_state.memory_start) {
+        kprintf("ERROR: Refcount array (ends at phys 0x%lx) overlaps memory pool (starts at 0x%lx)!\n",
+                refcount_end_phys, mm_state.memory_start);
+        // Adjust memory_start to be safe
+        mm_state.memory_start = PAGE_ALIGN(refcount_end_phys);
+        mm_state.total_pages = (mm_state.memory_end - mm_state.memory_start) / PAGE_SIZE;
+        kprintf("  Adjusted memory_start to 0x%lx, total_pages to %lu\n",
+                mm_state.memory_start, mm_state.total_pages);
+    }
+    
     mm_memset(mm_state.page_refcounts, 0, mm_state.refcount_array_size);
     kprintf("  Page refcounts at: %p (size: %lu bytes)\n",
            mm_state.page_refcounts, mm_state.refcount_array_size);
-
-    // Reserve kernel memory areas
-    mm_reserve_kernel_memory();
     
     kprintf("Physical Memory Manager initialized\n");
-}
-
-// Reserve kernel memory areas
-void mm_reserve_kernel_memory(void) {
-    // The physical memory pool now starts AFTER the kernel, heap, and bitmap.
-    // So there's nothing to reserve - those areas are already excluded from
-    // the physical memory range [memory_start, memory_end).
-    
-    uint64_t heap_start = mm_get_kernel_heap_start();
-    
-    kprintf("  Reserved areas (excluded from physical memory pool):\n");
-    kprintf("    Kernel + Heap + Bitmap: physical addresses before %p\n", 
-           (void*)mm_state.memory_start);
-    kprintf("  Physical memory starts at: %p\n", (void*)mm_state.memory_start);
 }
 
 // Allocate a physical page
@@ -254,12 +272,14 @@ uint64_t mm_allocate_physical_page(void) {
     set_page_bit(page);
     mm_state.free_pages--;
     
-    // Clear refcount for newly allocated page (it may have stale refcount from previous use)
+    uint64_t phys = mm_state.memory_start + (page * PAGE_SIZE);
+    
+    // Clear refcount for newly allocated page
     if (mm_state.page_refcounts) {
         mm_state.page_refcounts[page] = 0;
     }
     
-    return mm_state.memory_start + (page * PAGE_SIZE);
+    return phys;
 }
 
 // Free a physical page
@@ -276,7 +296,7 @@ void mm_free_physical_page(uint64_t physical_address) {
     clear_page_bit(page);
     mm_state.free_pages++;
     
-    // Clear refcount so page can be properly reused
+    // Clear refcount
     if (mm_state.page_refcounts) {
         mm_state.page_refcounts[page] = 0;
     }
@@ -341,16 +361,6 @@ void mm_free_contiguous_pages(uint64_t physical_address, size_t page_count) {
 // Debug flag for page table operations (non-static so slab.c can use it)
 int mm_debug_pt = 0;
 
-// Page table page pool - allocated from kernel heap which is properly mapped
-// We use a simple pool because kalloc may not be available during early init
-#define PT_POOL_SIZE 512  // 512 pages = 2MB for page tables (increased for large allocations)
-static struct {
-    uint64_t virt_addr;  // Virtual address (for accessing the page)
-    uint64_t phys_addr;  // Physical address (for page table entries)
-} pt_pool_pages[PT_POOL_SIZE];
-static int pt_pool_next = 0;
-static int pt_pool_initialized = 0;
-
 // Forward declarations
 void* kalloc_dma(size_t size);
 uint64_t mm_virt_to_phys_heap(uint64_t virt);
@@ -377,53 +387,39 @@ uint64_t mm_virt_to_phys_heap(uint64_t virt) {
 
 // Allocate a page for page table structures
 // Returns: physical address (for use in page table entries)
-// Use pt_pool_pages[].virt_addr to access the page contents
+// Pages come from the reserved PT pool which is OUTSIDE the bitmap range
 static uint64_t allocate_pt_page(void) {
-    // First try the pre-allocated pool
-    if (pt_pool_initialized && pt_pool_next < PT_POOL_SIZE) {
-        int idx = pt_pool_next++;
-        uint64_t virt = pt_pool_pages[idx].virt_addr;
-        uint64_t phys = pt_pool_pages[idx].phys_addr;
-        if (virt && phys) {
-            mm_memset((void*)virt, 0, PAGE_SIZE);
-            return phys;  // Return physical address for page table entries
-        }
+    if (!pt_pool_initialized) {
+        kprintf("ERROR: PT pool not initialized!\n");
+        return 0;
     }
     
-    // Fall back to DMA allocation - need page-aligned memory!
-    // Allocate extra space to ensure we can get a page-aligned address
-    void* page = kalloc_dma(PAGE_SIZE * 2);  // Double size for alignment
-    if (page) {
-        // Align to page boundary
-        uint64_t aligned = ((uint64_t)page + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-        mm_memset((void*)aligned, 0, PAGE_SIZE);
-        uint64_t phys = mm_virt_to_phys_heap(aligned);
-        if (mm_debug_pt) {
-            kprintf("PT: Fallback alloc: raw=%p aligned=%p phys=%p\n", 
-                    page, (void*)aligned, (void*)phys);
-        }
-        return phys;
+    if (pt_pool_next >= PT_POOL_SIZE) {
+        kprintf("ERROR: PT pool exhausted! (%d pages used)\n", pt_pool_next);
+        return 0;
     }
     
-    return 0;
+    uint64_t phys = pt_pool_phys_start + (pt_pool_next * PAGE_SIZE);
+    pt_pool_next++;
+    
+    // Access via direct map and zero it
+    uint64_t* virt = (uint64_t*)phys_to_virt(phys);
+    mm_memset(virt, 0, PAGE_SIZE);
+    
+    return phys;
 }
 
-// Initialize page table page pool
+// Initialize page table page pool by reserving physical memory
+// Must be called BEFORE mm_init_physical_memory to reserve the region
 void mm_init_pt_pool(void) {
-    kprintf("Initializing page table pool (%d pages)...\n", PT_POOL_SIZE);
-    for (int i = 0; i < PT_POOL_SIZE; i++) {
-        // Allocate from DMA heap with extra space for alignment
-        void* raw = kalloc_dma(PAGE_SIZE * 2);  // Double size for alignment
-        if (raw) {
-            // Align to page boundary
-            uint64_t aligned = ((uint64_t)raw + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-            pt_pool_pages[i].virt_addr = aligned;
-            pt_pool_pages[i].phys_addr = mm_virt_to_phys_heap(aligned);
-        } else {
-            kprintf("  Warning: Only allocated %d PT pages\n", i);
-            break;
-        }
+    // The pool is already reserved during mm_init_physical_memory
+    // This just marks it as ready to use
+    if (pt_pool_phys_start == 0) {
+        kprintf("ERROR: PT pool physical region not set!\n");
+        return;
     }
+    kprintf("Initializing page table pool (%d pages at phys %p)...\n", 
+            PT_POOL_SIZE, (void*)pt_pool_phys_start);
     pt_pool_initialized = 1;
     kprintf("  Page table pool ready\n");
 }
@@ -1117,9 +1113,9 @@ uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, boo
     uint64_t pdpt_phys = pml4[pml4_index] & ~0xFFFULL;
     if (!(pml4[pml4_index] & PAGE_PRESENT)) {
         if (!create) return NULL;
-        pdpt_phys = mm_allocate_physical_page();
+        pdpt_phys = allocate_pt_page();  // Use safe PT pool
         if (!pdpt_phys) return NULL;
-        mm_memset(phys_to_virt(pdpt_phys), 0, PAGE_SIZE);
+        // Page already zeroed by allocate_pt_page
         // For user space, set PAGE_USER on all levels
         uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE;
         if (is_user_space) {
@@ -1140,9 +1136,9 @@ uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, boo
     uint64_t pd_phys = pdpt[pdpt_index] & ~0xFFFULL;
     if (!(pdpt[pdpt_index] & PAGE_PRESENT)) {
         if (!create) return NULL;
-        pd_phys = mm_allocate_physical_page();
+        pd_phys = allocate_pt_page();  // Use safe PT pool
         if (!pd_phys) return NULL;
-        mm_memset(phys_to_virt(pd_phys), 0, PAGE_SIZE);
+        // Page already zeroed by allocate_pt_page
         uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE;
         if (is_user_space) {
             flags |= PAGE_USER;
@@ -1170,8 +1166,8 @@ uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, boo
         uint64_t large_page_base = pd_entry & ~0x1FFFFFULL;  // Mask off lower 21 bits
         uint64_t old_flags = pd_entry & 0xFFFULL;           // Keep flags (lower 12 bits)
         
-        // Allocate a new page table
-        uint64_t pt_phys = mm_allocate_physical_page();
+        // Allocate a new page table from safe PT pool
+        uint64_t pt_phys = allocate_pt_page();
         if (!pt_phys) return NULL;
         
         pt = (uint64_t*)phys_to_virt(pt_phys);
@@ -1195,9 +1191,10 @@ uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, boo
         pd[pd_index] = pt_phys | pd_flags;
     } else if (!(pd_entry & PAGE_PRESENT)) {
         if (!create) return NULL;
-        uint64_t pt_phys = mm_allocate_physical_page();
+        uint64_t pt_phys = allocate_pt_page();  // Use safe PT pool
         if (!pt_phys) return NULL;
-        mm_memset(phys_to_virt(pt_phys), 0, PAGE_SIZE);
+        
+        // Page already zeroed by allocate_pt_page
         uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE;
         if (is_user_space) {
             flags |= PAGE_USER;
@@ -1222,16 +1219,15 @@ uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, boo
 //   - PML4[272]: Direct map (PHYS_MAP_BASE) for kernel physical memory access
 //   - PML4[511]: Kernel higher-half mapping for kernel code/data
 uint64_t* mm_create_user_address_space(void) {
-    // Allocate PML4
-    uint64_t pml4_phys = mm_allocate_physical_page();
+    // Allocate PML4 from safe PT pool
+    uint64_t pml4_phys = allocate_pt_page();
     if (!pml4_phys) {
         kprintf("mm_create_user_address_space: Failed to allocate PML4\n");
         return NULL;
     }
     
-    // Access via direct map
+    // Access via direct map (already zeroed by allocate_pt_page)
     uint64_t* new_pml4 = (uint64_t*)phys_to_virt(pml4_phys);
-    mm_memset(new_pml4, 0, PAGE_SIZE);
     
     // Get kernel PML4 via direct map
     uint64_t kernel_pml4_phys = get_cr3() & ~0xFFFULL;
@@ -1554,10 +1550,10 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
         uint64_t src_pdpt_phys = src_pml4[i] & ~0xFFFULL;
         uint64_t* src_pdpt = (uint64_t*)phys_to_virt(src_pdpt_phys);
         
-        // Allocate PDPT for new address space
-        uint64_t pdpt_phys = mm_allocate_physical_page();
+        // Allocate PDPT for new address space from safe PT pool
+        uint64_t pdpt_phys = allocate_pt_page();
         if (!pdpt_phys) goto fail;
-        mm_memset(phys_to_virt(pdpt_phys), 0, PAGE_SIZE);
+        // Page already zeroed by allocate_pt_page
         new_pml4[i] = pdpt_phys | (src_pml4[i] & 0xFFF);
         uint64_t* new_pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
         
@@ -1567,9 +1563,9 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
             uint64_t src_pd_phys = src_pdpt[j] & ~0xFFFULL;
             uint64_t* src_pd = (uint64_t*)phys_to_virt(src_pd_phys);
             
-            uint64_t pd_phys = mm_allocate_physical_page();
+            uint64_t pd_phys = allocate_pt_page();
             if (!pd_phys) goto fail;
-            mm_memset(phys_to_virt(pd_phys), 0, PAGE_SIZE);
+            // Page already zeroed by allocate_pt_page
             new_pdpt[j] = pd_phys | (src_pdpt[j] & 0xFFF);
             uint64_t* new_pd = (uint64_t*)phys_to_virt(pd_phys);
             
@@ -1590,9 +1586,9 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
                     uint64_t src_pt_phys = src_pd[k] & ~0xFFFULL;
                     uint64_t* src_pt = (uint64_t*)phys_to_virt(src_pt_phys);
                     
-                    uint64_t pt_phys = mm_allocate_physical_page();
+                    uint64_t pt_phys = allocate_pt_page();
                     if (!pt_phys) goto fail;
-                    mm_memset(phys_to_virt(pt_phys), 0, PAGE_SIZE);
+                    // Page already zeroed by allocate_pt_page
                     new_pd[k] = pt_phys | (src_pd[k] & 0xFFF);
                     uint64_t* new_pt = (uint64_t*)phys_to_virt(pt_phys);
                     

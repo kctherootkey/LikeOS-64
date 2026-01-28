@@ -1320,6 +1320,8 @@ static int64_t sys_brk(uint64_t new_brk) {
         uint64_t old_page = PAGE_ALIGN(cur->brk);
         uint64_t new_page = PAGE_ALIGN(new_brk);
         
+        uint64_t pages_to_map = (new_page - old_page) / PAGE_SIZE;
+        
         // Map new pages
         for (uint64_t addr = old_page; addr < new_page; addr += PAGE_SIZE) {
             uint64_t phys = mm_allocate_physical_page();

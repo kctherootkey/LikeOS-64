@@ -96,6 +96,9 @@ typedef struct {
 #define KERNEL_START     0x0
 
 // Physical memory locations for page tables
+// IMPORTANT: All page tables must be allocated BELOW the kernel's memory pool start
+// (which begins at ~0x1ba5000) to avoid being allocated as user memory later.
+// We reserve 0x1000 - 0x100000 (1MB) for all bootloader page tables.
 #define PML4_ADDRESS    0x1000
 #define PDPT_ADDRESS    0x2000
 #define PD_ADDRESS      0x3000   // Page directories start here (need multiple for 4GB)
@@ -111,6 +114,11 @@ typedef struct {
 #define PDPT_PHYSMAP_ADDRESS  0x10000
 #define PD_PHYSMAP_ADDRESS    0x11000   // 4 PDs for 4GB at 0x11000-0x14FFF
 
+// Reserved area for additional page tables allocated during boot
+// This covers 0x20000 - 0x100000 (896KB = ~224 page tables)
+#define PT_POOL_START         0x20000
+#define PT_POOL_END           0x100000
+
 // Trampoline address (will be allocated below kernel)
 static EFI_PHYSICAL_ADDRESS trampoline_addr = 0;
 
@@ -125,6 +133,66 @@ static EFI_PHYSICAL_ADDRESS trampoline_addr = 0;
 #define PAGE_RW         (PAGE_PRESENT | PAGE_WRITABLE)
 #define PAGE_RWX        (PAGE_PRESENT | PAGE_WRITABLE)  // Executable (NX=0)
 #define PAGE_RW_NX      (PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX)  // Non-executable
+
+// Page table pool allocator - allocates from reserved low memory to avoid conflicts
+// We'll allocate a contiguous block from UEFI in low memory during init
+static EFI_PHYSICAL_ADDRESS pt_pool_base = 0;
+static EFI_PHYSICAL_ADDRESS pt_pool_next = 0;
+static UINTN pt_pool_pages = 64;  // 64 pages = 256KB for page tables
+
+static EFI_STATUS init_page_table_pool(void) {
+    // Allocate page table pool in low memory (below 1MB to be safe)
+    EFI_PHYSICAL_ADDRESS max_addr = 0x100000 - 1;  // Below 1MB
+    
+    EFI_STATUS status = uefi_call_wrapper(BS->AllocatePages, 4,
+                                          AllocateMaxAddress,
+                                          EfiLoaderData,
+                                          pt_pool_pages,
+                                          &max_addr);
+    
+    if (EFI_ERROR(status)) {
+        // Try anywhere below kernel memory pool start
+        max_addr = 0x1b00000 - 1;  // ~27MB, well below memory pool
+        status = uefi_call_wrapper(BS->AllocatePages, 4,
+                                   AllocateMaxAddress,
+                                   EfiLoaderData,
+                                   pt_pool_pages,
+                                   &max_addr);
+    }
+    
+    if (EFI_ERROR(status)) {
+        Print(L"ERROR: Could not allocate page table pool: %r\r\n", status);
+        return status;
+    }
+    
+    pt_pool_base = max_addr;
+    pt_pool_next = max_addr;
+    
+    // Zero the entire pool
+    uefi_call_wrapper(BS->SetMem, 3, (VOID*)pt_pool_base, pt_pool_pages * 4096, 0);
+    
+    Print(L"Page table pool allocated at 0x%lx (%lu pages)\r\n", pt_pool_base, pt_pool_pages);
+    
+    return EFI_SUCCESS;
+}
+
+static EFI_PHYSICAL_ADDRESS allocate_page_table(void) {
+    if (!pt_pool_base) {
+        Print(L"ERROR: Page table pool not initialized!\r\n");
+        return 0;
+    }
+    
+    if (pt_pool_next >= pt_pool_base + (pt_pool_pages * 4096)) {
+        Print(L"ERROR: Page table pool exhausted!\r\n");
+        return 0;
+    }
+    
+    EFI_PHYSICAL_ADDRESS addr = pt_pool_next;
+    pt_pool_next += 4096;
+    
+    // Memory is already zeroed during pool init
+    return addr;
+}
 
 // External trampoline function from trampoline.S
 extern void trampoline_jump(UINT64 kernel_entry, void* boot_info, UINT64 pml4_addr);
@@ -256,23 +324,15 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
     UINT64 pages_mapped = first_pt_pages;
     
     for (UINT64 pt_i = 1; pt_i < page_tables_needed && pages_mapped < total_pages_needed; pt_i++) {
-        // Allocate physical memory for this page table
-        UINTN pt_pages = 1;
-        EFI_PHYSICAL_ADDRESS pt_phys_addr = 0;
+        // Allocate page table from our reserved pool (not AllocateAnyPages!)
+        EFI_PHYSICAL_ADDRESS pt_phys_addr = allocate_page_table();
         
-        EFI_STATUS pt_alloc_status = uefi_call_wrapper(BS->AllocatePages, 4, 
-                                                       AllocateAnyPages, 
-                                                       EfiLoaderData, 
-                                                       pt_pages, 
-                                                       &pt_phys_addr);
-        
-        if (EFI_ERROR(pt_alloc_status)) {
-            Print(L"ERROR: Could not allocate page table %lu: %r\r\n", pt_i, pt_alloc_status);
+        if (!pt_phys_addr) {
+            Print(L"ERROR: Could not allocate page table %lu from pool\r\n", pt_i);
             break;
         }
         
-        // Clear the page table
-        uefi_call_wrapper(BS->SetMem, 3, (VOID*)pt_phys_addr, 4096, 0);
+        // Page table is already zeroed by allocate_page_table()
         
         // Set up page directory entry to point to this page table
         UINT64 pd_entry_index = pd_index + pt_i;
@@ -790,6 +850,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     
     // Step 2: Set up higher half paging (including identity mapping for low memory)
     Print(L"Setting up higher half kernel paging...\r\n");
+    
+    // Initialize page table pool first
+    status = init_page_table_pool();
+    if (EFI_ERROR(status)) {
+        Print(L"Failed to initialize page table pool\r\n");
+        return status;
+    }
+    
     setup_higher_half_paging(kernel_phys_addr, kernel_size_total);
     
     Print(L"About to exit boot services. Kernel entry: 0x%lx\r\n", elf_header->e_entry);

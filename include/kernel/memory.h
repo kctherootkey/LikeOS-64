@@ -191,9 +191,6 @@ void mm_print_heap_stats(void);
 bool mm_validate_heap(void);
 uint64_t mm_get_free_pages(void);
 
-// Memory detection and initialization
-void mm_reserve_kernel_memory(void);
-
 // Page table management
 uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create);
 uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, bool create);
