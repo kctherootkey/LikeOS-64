@@ -58,15 +58,6 @@ static inline uint8_t inb(uint16_t port) {
 // Utility functions (non-static, declared in memory.h)
 void mm_memset(void* dest, int val, size_t len) {
     uint8_t* ptr = (uint8_t*)dest;
-    // Debug memsets in SLAB region that could reach fault address
-    uint64_t start = (uint64_t)dest;
-    uint64_t end = start + len;
-    // Check if this memset would touch addresses past 0xffffffff8e489000
-    if (start >= 0xFFFFFFFF88000000ULL && end > 0xffffffff8e489000ULL) {
-        void* ra = __builtin_return_address(0);
-        kprintf("MM_MEMSET OVERFLOW: dest=%p len=0x%lx end=%p caller=%p\n",
-                dest, (unsigned long)len, (void*)end, ra);
-    }
     while (len--) {
         *ptr++ = val;
     }
@@ -1296,9 +1287,16 @@ void mm_destroy_address_space(uint64_t* pml4) {
                         if (pd[k] & PAGE_PRESENT) {
                             // Check if it's a 2MB page or a page table
                             if (pd[k] & PAGE_SIZE_FLAG) {
-                                // 2MB page - free the physical page
+                                // 2MB page - check COW refcount before freeing
                                 uint64_t phys = pd[k] & ~0x1FFFFFULL;
-                                mm_free_physical_page(phys);
+                                if (pd[k] & PAGE_USER) {
+                                    // User page - use refcount
+                                    if (mm_decref_page(phys)) {
+                                        mm_free_physical_page(phys);
+                                    }
+                                } else {
+                                    mm_free_physical_page(phys);
+                                }
                             } else {
                                 uint64_t pt_phys = pd[k] & ~0xFFFULL;
                                 uint64_t* pt = (uint64_t*)phys_to_virt(pt_phys);
@@ -1307,22 +1305,30 @@ void mm_destroy_address_space(uint64_t* pml4) {
                                 for (int l = 0; l < 512; l++) {
                                     if (pt[l] & PAGE_PRESENT) {
                                         uint64_t phys = pt[l] & ~0xFFFULL;
-                                        mm_free_physical_page(phys);
+                                        // Check if this is a user page (could be COW shared)
+                                        if (pt[l] & PAGE_USER) {
+                                            // Use refcount - only free if last reference
+                                            if (mm_decref_page(phys)) {
+                                                mm_free_physical_page(phys);
+                                            }
+                                        } else {
+                                            mm_free_physical_page(phys);
+                                        }
                                     }
                                 }
                                 
-                                // Free the PT itself
+                                // Free the PT itself (page tables are not shared)
                                 mm_free_physical_page(pt_phys);
                             }
                         }
                     }
                     
-                    // Free the PD
+                    // Free the PD (page directories are not shared)
                     mm_free_physical_page(pd_phys);
                 }
             }
             
-            // Free the PDPT
+            // Free the PDPT (not shared)
             mm_free_physical_page(pdpt_phys);
         }
     }

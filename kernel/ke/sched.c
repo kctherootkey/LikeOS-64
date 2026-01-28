@@ -80,6 +80,7 @@ void sched_init(void) {
     g_bootstrap_task.next = &g_bootstrap_task;
     g_bootstrap_task.user_stack_top = 0;
     g_bootstrap_task.kernel_stack_top = 0;
+    g_bootstrap_task.kernel_stack_base = NULL;
     g_bootstrap_task.pgid = 0;
     g_bootstrap_task.sid = 0;
     g_bootstrap_task.ctty = NULL;
@@ -119,6 +120,7 @@ void sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack
     t->id = g_next_id++;
     t->user_stack_top = 0;
     t->kernel_stack_top = 0;
+    t->kernel_stack_base = NULL;
     t->pgid = 0;
     t->sid = 0;
     t->ctty = NULL;
@@ -171,8 +173,9 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
         return NULL;
     }
     
-    uint64_t* k_sp = (uint64_t*)(k_stack_mem + 8192);
-    k_sp = (uint64_t*)((uint64_t)k_sp & ~0xFUL);
+    // Align stack top to 16 bytes for ABI compliance
+    uint64_t k_stack_top = ((uint64_t)(k_stack_mem + 8192)) & ~0xFUL;
+    uint64_t* k_sp = (uint64_t*)k_stack_top;
     
     // IRET frame: SS, RSP, RFLAGS, CS, RIP
     *(--k_sp) = 0x1B;                    // SS
@@ -198,7 +201,8 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
     t->privilege = TASK_USER;
     t->id = g_next_id++;
     t->user_stack_top = user_stack;
-    t->kernel_stack_top = (uint64_t)(k_stack_mem + 8192);
+    t->kernel_stack_top = k_stack_top;  // Use aligned stack top
+    t->kernel_stack_base = k_stack_mem; // Save original allocation for freeing
     t->pgid = t->id;
     t->sid = t->id;
     t->ctty = tty_get_console();
@@ -527,10 +531,9 @@ void sched_remove_task(task_t* task) {
     
 
     
-    // Free kernel stack if allocated (kernel_stack_top points to top, base is top - 8192)
-    if (task->kernel_stack_top && task->privilege == TASK_USER) {
-        void* k_stack_base = (void*)(task->kernel_stack_top - 8192);
-        kfree(k_stack_base);
+    // Free kernel stack if allocated
+    if (task->kernel_stack_base && task->privilege == TASK_USER) {
+        kfree(task->kernel_stack_base);
     }
     
     // Free the task structure
@@ -565,6 +568,9 @@ task_t* sched_fork_current(void) {
         return NULL;
     }
     
+    // Align stack top to 16 bytes for ABI compliance
+    uint64_t k_stack_top = ((uint64_t)(k_stack_mem + 8192)) & ~0xFUL;
+    
     // Copy most fields from parent using mm_memcpy (no libc in kernel)
     mm_memcpy(child, cur, sizeof(task_t));
     
@@ -572,7 +578,8 @@ task_t* sched_fork_current(void) {
     child->id = g_next_id++;
     child->pml4 = child_pml4;
     child->state = TASK_READY;
-    child->kernel_stack_top = (uint64_t)(k_stack_mem + 8192);
+    child->kernel_stack_top = k_stack_top;  // Use aligned stack top
+    child->kernel_stack_base = k_stack_mem; // Save original allocation for freeing
     child->next = NULL;  // Will be set by enqueue_task
     
     // Process hierarchy

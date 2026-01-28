@@ -2740,6 +2740,7 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
                         uint64_t a3, uint64_t a4, uint64_t a5) {
     // Save syscall context to current task (so signals work after yield)
     task_t* cur = sched_current();
+    
     if (cur && cur->privilege == TASK_USER) {
         cur->syscall_rsp = syscall_saved_user_rsp;
         cur->syscall_rip = syscall_saved_user_rip;

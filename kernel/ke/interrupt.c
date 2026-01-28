@@ -231,8 +231,8 @@ void exception_handler(uint64_t *regs) {
             case 14: {
                 uint64_t cr2;
                 __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-                kprintf("User process %d killed by SIGSEGV at RIP=0x%016llx CR2=0x%016llx (err=0x%llx)\n",
-                        cur ? (int)cur->id : -1, rip, cr2, err_code);
+                kprintf("User process %d killed by SIGSEGV at RIP=0x%016llx CR2=0x%016llx\n",
+                        cur ? (int)cur->id : -1, rip, cr2);
                 sched_signal_task(cur, SIGSEGV);
                 return;
             }

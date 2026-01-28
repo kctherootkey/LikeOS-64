@@ -312,17 +312,12 @@ void* slab_alloc(size_t size) {
         size_t total_size = size + sizeof(large_alloc_header_t);
         size_t page_count = (total_size + PAGE_SIZE - 1) / PAGE_SIZE;
         
-        kprintf("SLAB: Large alloc: size=%lu, pages=%lu\n", 
-                (unsigned long)size, (unsigned long)page_count);
-        
         uint64_t phys_pages = mm_allocate_contiguous_pages(page_count);
         if (phys_pages == 0) {
             kprintf("SLAB: Failed to allocate %lu pages for large allocation\n", 
                     (unsigned long)page_count);
             return NULL;
         }
-        
-        kprintf("SLAB: Got phys pages at %p\n", (void*)phys_pages);
         
         // Allocate virtual address space for the pages
         uint64_t virt_base = slab_next_virt_addr;
@@ -333,21 +328,11 @@ void* slab_alloc(size_t size) {
         }
         slab_next_virt_addr += page_count * PAGE_SIZE;
         
-        kprintf("SLAB: Mapping %lu pages: virt=%p phys=%p\n", 
-                (unsigned long)page_count, (void*)virt_base, (void*)phys_pages);
-        
-        // Enable page table debug for first page
-        mm_debug_pt = 1;
-        
         // Map all pages
-        size_t mapped_count = 0;
         for (size_t i = 0; i < page_count; i++) {
             uint64_t vaddr = virt_base + (i * PAGE_SIZE);
             uint64_t paddr = phys_pages + (i * PAGE_SIZE);
             bool ok = mm_map_page(vaddr, paddr, PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE);
-            
-            // Disable debug after first page
-            if (i == 0) mm_debug_pt = 0;
             
             if (!ok) {
                 kprintf("SLAB: Failed to map large alloc page %lu\n", (unsigned long)i);
@@ -358,35 +343,6 @@ void* slab_alloc(size_t size) {
                 mm_free_contiguous_pages(phys_pages, page_count);
                 return NULL;
             }
-            mapped_count++;
-            // Verify first page mapping
-            if (i == 0) {
-                uint64_t check = mm_get_physical_address(vaddr);
-                kprintf("SLAB: Page 0 verify: vaddr=%p -> phys=%p (expect %p)\n",
-                        (void*)vaddr, (void*)check, (void*)paddr);
-                if (check != paddr) {
-                    kprintf("SLAB: MAPPING VERIFICATION FAILED!\n");
-                }
-            }
-        }
-        
-        kprintf("SLAB: Mapped %lu of %lu pages, writing header at %p\n", 
-                (unsigned long)mapped_count, (unsigned long)page_count, (void*)virt_base);
-        
-        // Verify middle and last pages too
-        if (page_count > 1) {
-            size_t mid_idx = page_count / 2;
-            size_t last_idx = page_count - 1;
-            uint64_t mid_vaddr = virt_base + (mid_idx * PAGE_SIZE);
-            uint64_t last_vaddr = virt_base + (last_idx * PAGE_SIZE);
-            uint64_t mid_check = mm_get_physical_address(mid_vaddr);
-            uint64_t last_check = mm_get_physical_address(last_vaddr);
-            kprintf("SLAB: Mid page %lu: vaddr=%p -> phys=%p (expect %p)\n",
-                    (unsigned long)mid_idx, (void*)mid_vaddr, (void*)mid_check,
-                    (void*)(phys_pages + mid_idx * PAGE_SIZE));
-            kprintf("SLAB: Last page %lu: vaddr=%p -> phys=%p (expect %p)\n",
-                    (unsigned long)last_idx, (void*)last_vaddr, (void*)last_check,
-                    (void*)(phys_pages + last_idx * PAGE_SIZE));
         }
         
         // Set up header (now using virtual address)

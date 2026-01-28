@@ -2,6 +2,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/ioapic.h"
 #include "../../include/kernel/interrupt.h" // for idt vector constants if needed
+#include "../../include/kernel/memory.h"    // for phys_to_virt
 
 // Default IOAPIC MMIO base (commonly 0xFEC00000). No ACPI parsing yet.
 #define IOAPIC_DEFAULT_BASE 0xFEC00000UL
@@ -12,16 +13,27 @@
 #define IOAPIC_REG_ARB     0x02
 #define IOAPIC_REG_REDIR(n) (0x10 + (n) * 2) // low 32 bits; high at +1
 
-static volatile uint32_t *ioapic_base = (volatile uint32_t*)IOAPIC_DEFAULT_BASE;
+// IOAPIC base pointer - initialized on first use via direct map
+static volatile uint32_t *ioapic_base = NULL;
 static int g_ioapic_present = 0;
 
+static inline volatile uint32_t* get_ioapic_base(void) {
+    if (!ioapic_base) {
+        // Convert physical MMIO address to virtual via direct map
+        ioapic_base = (volatile uint32_t*)phys_to_virt(IOAPIC_DEFAULT_BASE);
+    }
+    return ioapic_base;
+}
+
 static inline void ioapic_write(uint8_t reg, uint32_t value) {
-    ioapic_base[0] = reg;
-    ioapic_base[4] = value; // data register at base+0x10 (index 4 of 32-bit array)
+    volatile uint32_t* base = get_ioapic_base();
+    base[0] = reg;
+    base[4] = value; // data register at base+0x10 (index 4 of 32-bit array)
 }
 static inline uint32_t ioapic_read(uint8_t reg) {
-    ioapic_base[0] = reg;
-    return ioapic_base[4];
+    volatile uint32_t* base = get_ioapic_base();
+    base[0] = reg;
+    return base[4];
 }
 
 int ioapic_detect(void) {

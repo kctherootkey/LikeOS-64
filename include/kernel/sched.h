@@ -66,6 +66,7 @@ typedef struct task {
     // User mode support
     uint64_t user_stack_top;    // User stack virtual address (for user tasks)
     uint64_t kernel_stack_top;  // Kernel stack for syscalls/interrupts (for user tasks)
+    void* kernel_stack_base;    // Kernel stack allocation base (for freeing)
 
     // Job control / session
     int pgid;

@@ -620,7 +620,8 @@ uint64_t elf_exec_replace(const char* path, char* const argv[], char* const envp
     }
     
     // Switch to new address space now
-    __asm__ volatile("mov %0, %%cr3" : : "r"((uint64_t)user_pml4) : "memory");
+    // Use mm_switch_address_space which correctly converts virtual to physical for CR3
+    mm_switch_address_space(user_pml4);
     
     // Destroy old address space (after switching!)
     if (old_pml4) {
