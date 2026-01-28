@@ -106,6 +106,11 @@ typedef struct {
 #define PD_HIGH_ADDRESS    0xA000
 #define PT_HIGH_ADDRESS    0xB000
 
+// Direct map page tables (for PHYS_MAP_BASE = 0xFFFF880000000000)
+// PML4 index 272 covers 0xFFFF880000000000 - 0xFFFF887FFFFFFFFF
+#define PDPT_PHYSMAP_ADDRESS  0x10000
+#define PD_PHYSMAP_ADDRESS    0x11000   // 4 PDs for 4GB at 0x11000-0x14FFF
+
 // Trampoline address (will be allocated below kernel)
 static EFI_PHYSICAL_ADDRESS trampoline_addr = 0;
 
@@ -319,8 +324,49 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
         }
     }
     
+    // ===================================================================
+    // Set up DIRECT MAP region at PHYS_MAP_BASE = 0xFFFF880000000000
+    // This maps physical memory 0-4GB to virtual 0xFFFF880000000000-0xFFFF880100000000
+    // PML4 index 272 = (0xFFFF880000000000 >> 39) & 0x1FF
+    // ===================================================================
+    {
+        page_table_t *pdpt_physmap = (page_table_t*)PDPT_PHYSMAP_ADDRESS;
+        
+        // Clear the PDPT for direct map
+        for (int i = 0; i < 512; i++) {
+            pdpt_physmap->entries[i] = 0;
+        }
+        
+        // Set up PML4 entry 272 to point to direct map PDPT
+        pml4->entries[272] = PDPT_PHYSMAP_ADDRESS | PAGE_RWX;
+        
+        // Map first 4GB of physical memory using 2MB pages
+        for (int pdpt_i = 0; pdpt_i < 4; pdpt_i++) {
+            // Allocate page directory for this 1GB region
+            EFI_PHYSICAL_ADDRESS pd_addr = PD_PHYSMAP_ADDRESS + (pdpt_i * 4096);
+            page_table_t *pd = (page_table_t*)pd_addr;
+            
+            // Clear page directory
+            for (int i = 0; i < 512; i++) {
+                pd->entries[i] = 0;
+            }
+            
+            // Set PDPT entry to point to this page directory (supervisor-only, RWX)
+            pdpt_physmap->entries[pdpt_i] = pd_addr | PAGE_RWX;
+            
+            // Map each 2MB page in this 1GB region
+            for (int pd_i = 0; pd_i < 512; pd_i++) {
+                UINT64 phys_addr = (UINT64)pdpt_i * 0x40000000ULL + (UINT64)pd_i * 0x200000ULL;
+                // Use 2MB pages (PAGE_SIZE bit set), supervisor-only (no PAGE_USER)
+                pd->entries[pd_i] = phys_addr | PAGE_RWX | PAGE_SIZE;
+            }
+        }
+        
+        Print(L"  Direct map: 0xFFFF880000000000 -> phys 0x0 (4GB, 2MB pages)\r\n");
+    }
+    
     Print(L"Higher half paging configured:\r\n");
-    Print(L"  Identity mapped: 0x0 - 0x100000000 (4GB)\r\n");
+    Print(L"  Identity mapped: 0x0 - 0x100000000 (4GB) [for boot only]\r\n");
     Print(L"  Kernel virtual: 0x%lx -> 0x%lx (%lu total pages mapped)\r\n", 
           kernel_virt, kernel_phys_addr, pages_mapped);
     Print(L"  Virtual memory covers: 0x%lx - 0x%lx (%lu MB)\r\n", 

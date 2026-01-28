@@ -645,12 +645,16 @@ int xhci_halt(xhci_controller_t* ctrl) {
 int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev) {
     xhci_memset(ctrl, 0, sizeof(*ctrl));
     
-    // Get BAR0 (MMIO base)
-    ctrl->base = dev->bar[0] & ~0xFULL;
-    if (ctrl->base == 0) {
+    // Get BAR0 (MMIO base) - physical address
+    uint64_t bar0_phys = dev->bar[0] & ~0xFULL;
+    if (bar0_phys == 0) {
         kprintf("[XHCI] ERROR: BAR0 not configured\n");
         return ST_ERR;
     }
+    
+    // Convert physical MMIO address to virtual via direct map
+    // After identity mapping removal, we must access MMIO through the direct map
+    ctrl->base = (uint64_t)phys_to_virt(bar0_phys);
     
     // Enable bus mastering and memory access
     pci_enable_busmaster_mem(dev);

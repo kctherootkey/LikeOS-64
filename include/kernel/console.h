@@ -90,8 +90,6 @@ void console_show_fb_stats(void);
 // Printf family functions
 typedef __builtin_va_list va_list;
 int kprintf(const char* format, ...);
-// Print only to serial (no framebuffer output); mirrors kprintf signature
-int kprintf_serial(const char* format, ...);
 int ksprintf(char* buffer, const char* format, ...);
 int ksnprintf(char* buffer, size_t size, const char* format, ...);
 int kvprintf(const char* format, va_list args);
@@ -107,6 +105,9 @@ int kstrncmp(const char* s1, const char* s2, size_t n);
 void* kmemset(void* ptr, int value, size_t size);
 void* kmemcpy(void* dest, const void* src, size_t size);
 int kmemcmp(const void* s1, const void* s2, size_t n);
+
+// Remap framebuffer to use direct map (call before removing identity mapping)
+void console_remap_to_direct_map(void);
 
 // VGA colors
 #define VGA_COLOR_BLACK         0

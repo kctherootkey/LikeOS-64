@@ -24,9 +24,10 @@ EFI_LIBS = /usr/lib/crt0-efi-x86_64.o
 EFI_LDS = /usr/lib/elf_x86_64_efi.lds
 
 # Compiler flags for kernel
-# Security: Use -fstack-protector-strong for stack buffer overflow detection
+# Note: Stack protector disabled because __stack_chk_guard access can conflict
+# with identity mapping removal during boot
 KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
-			-fstack-protector-strong -mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
+			-fno-stack-protector -mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
 			-I$(INCLUDE_DIR) -DXHCI_USE_INTERRUPTS=1
 
 # Compiler flags for userspace programs
@@ -57,6 +58,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/serial.o \
               $(BUILD_DIR)/mouse.o \
               $(BUILD_DIR)/memory.o \
+			  $(BUILD_DIR)/stack_switch.o \
 			  $(BUILD_DIR)/slab.o \
 			  $(BUILD_DIR)/scrollbar.o \
 			  $(BUILD_DIR)/vfs.o \
@@ -138,6 +140,9 @@ $(BUILD_DIR)/mouse.o: $(KERNEL_DIR)/hal/mouse.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/memory.o: $(KERNEL_DIR)/mm/memory.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/stack_switch.o: $(KERNEL_DIR)/mm/stack_switch.asm | $(BUILD_DIR)
+	nasm -f elf64 $< -o $@
 
 $(BUILD_DIR)/slab.o: $(KERNEL_DIR)/mm/slab.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@

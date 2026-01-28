@@ -1326,7 +1326,8 @@ static int64_t sys_brk(uint64_t new_brk) {
             if (!phys) {
                 return (int64_t)cur->brk;  // Out of memory
             }
-            mm_memset((void*)phys, 0, PAGE_SIZE);
+            // Zero page via direct map
+            mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
             
             uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;
             if (!mm_map_page_in_address_space(cur->pml4, addr, phys, flags)) {
@@ -1425,15 +1426,16 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
             return (int64_t)MAP_FAILED;
         }
         
-        mm_memset((void*)phys, 0, PAGE_SIZE);
+        // Zero page via direct map
+        mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
         
         // For file-backed mappings, read content from file
         if (!is_anonymous && fd < TASK_MAX_FDS && cur->fd_table[fd]) {
             vfs_file_t* file = cur->fd_table[fd];
-            // Seek to the correct position and read
+            // Seek to the correct position and read into direct-mapped address
             long file_off = (long)(offset + off);
             if (vfs_seek(file, file_off, SEEK_SET) >= 0) {
-                vfs_read(file, (void*)phys, PAGE_SIZE);
+                vfs_read(file, phys_to_virt(phys), PAGE_SIZE);
             }
         }
         

@@ -22,6 +22,28 @@
 // Kernel space virtual address constants  
 #define KERNEL_OFFSET           0xFFFFFFFF80000000ULL  // Higher-half kernel base
 
+// Direct map region - maps ALL physical memory to a high virtual address
+// This is the Linux-style approach: no identity mapping after boot.
+// Physical address 0 maps to PHYS_MAP_BASE, phys addr X maps to PHYS_MAP_BASE + X
+// PML4 index 272 = 0xFFFF880000000000 (like Linux's direct map)
+#define PHYS_MAP_BASE           0xFFFF880000000000ULL
+#define PHYS_MAP_PML4_INDEX     272  // (PHYS_MAP_BASE >> 39) & 0x1FF
+
+// Convert physical address to its direct-mapped virtual address
+static inline void* phys_to_virt(uint64_t phys_addr) {
+    return (void*)(PHYS_MAP_BASE + phys_addr);
+}
+
+// Convert direct-mapped virtual address back to physical address
+static inline uint64_t virt_to_phys(void* virt_addr) {
+    return (uint64_t)virt_addr - PHYS_MAP_BASE;
+}
+
+// Check if an address is in the direct map region
+static inline bool is_direct_map_addr(uint64_t addr) {
+    return (addr >= PHYS_MAP_BASE) && (addr < (PHYS_MAP_BASE + 0x100000000ULL));
+}
+
 // Function to get dynamic kernel heap start address
 uint64_t mm_get_kernel_heap_start(void);
 
@@ -200,6 +222,14 @@ void mm_enable_nx(void);
 
 // Enable SMEP/SMAP if CPU supports them
 void mm_enable_smep_smap(void);
+
+// Switch to a kernel stack in higher-half space
+// Must be called before mm_remove_identity_mapping()
+void mm_switch_to_kernel_stack(void);
+
+// Remove identity mapping from kernel PML4
+// Call this after all boot-time initialization is complete
+void mm_remove_identity_mapping(void);
 
 // Global flag indicating SMAP is active (use stac/clac only when true)
 extern bool g_smap_enabled;

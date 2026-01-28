@@ -125,8 +125,8 @@ int elf_load_user(const void* elf_data, size_t elf_size,
                 return -11;  // Out of memory
             }
             
-            // Zero the page first
-            mm_memset((void*)phys, 0, PAGE_SIZE);
+            // Zero the page via direct map
+            mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
             
             // Copy data from ELF file if applicable
             uint64_t page_offset_in_seg = vaddr - phdr->p_vaddr;
@@ -140,7 +140,7 @@ int elf_load_user(const void* elf_data, size_t elf_size,
                                     (PAGE_SIZE - copy_start) : remaining_filesz;
                 
                 if (copy_len > 0 && file_offset + copy_len <= elf_size) {
-                    mm_memcpy((void*)(phys + copy_start), 
+                    mm_memcpy((uint8_t*)phys_to_virt(phys) + copy_start, 
                              elf_bytes + file_offset, 
                              copy_len);
                 }
@@ -152,7 +152,7 @@ int elf_load_user(const void* elf_data, size_t elf_size,
                     copy_len = phdr->p_filesz;
                 }
                 if (copy_len > 0) {
-                    mm_memcpy((void*)(phys + offset_in_page),
+                    mm_memcpy((uint8_t*)phys_to_virt(phys) + offset_in_page,
                              elf_bytes + phdr->p_offset,
                              copy_len);
                 }
@@ -377,10 +377,10 @@ int elf_exec(const char* path, char* const argv[], char* const envp[], task_t** 
     // The stack is mapped at USER_STACK_TOP - USER_STACK_SIZE to USER_STACK_TOP
     // We need to copy our buffer to the top page
     
-    // Get physical address of the top stack page and copy
+    // Get physical address of the top stack page and copy via direct map
     uint64_t phys = mm_get_physical_address_from_pml4(user_pml4, top_page_vaddr);
     if (phys) {
-        mm_memcpy((void*)phys, stack_setup, PAGE_SIZE);
+        mm_memcpy(phys_to_virt(phys), stack_setup, PAGE_SIZE);
     } else {
         kprintf("elf_exec: cannot get physical address for stack page\n");
     }
@@ -593,11 +593,11 @@ uint64_t elf_exec_replace(const char* path, char* const argv[], char* const envp
     }
     *sp++ = 0;  // NULL terminator for envp
     
-    // Copy stack page to physical memory
+    // Copy stack page to physical memory via direct map
     uint64_t top_page_vaddr = USER_STACK_TOP_EXEC - PAGE_SIZE;
     uint64_t phys = mm_get_physical_address_from_pml4(user_pml4, top_page_vaddr);
     if (phys) {
-        mm_memcpy((void*)phys, stack_setup, PAGE_SIZE);
+        mm_memcpy(phys_to_virt(phys), stack_setup, PAGE_SIZE);
     }
     kfree(stack_setup);
     

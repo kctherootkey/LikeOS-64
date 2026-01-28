@@ -108,6 +108,22 @@ void system_startup(boot_info_t* boot_info) {
     mm_remap_kernel_with_nx();
     mm_enable_smep_smap();
     
+    // Before removing identity mapping, remap framebuffer pointers to direct map
+    console_remap_to_direct_map();
+    fb_optimize_remap_to_direct_map();
+    
+    // Switch to a kernel stack in higher-half space before removing identity mapping
+    // The current stack is in low memory (set up by bootloader)
+    // This function does NOT return - it switches stacks and calls continue_system_startup
+    mm_switch_to_kernel_stack();
+    
+    // Never reached - execution continues in continue_system_startup()
+    for(;;) __asm__ volatile("hlt");
+}
+
+// This function continues system startup after switching to the kernel stack
+// and removing identity mapping. Called from mm_switch_to_kernel_stack()
+void continue_system_startup(void) {
     mm_initialize_syscall();
 
     pci_init();

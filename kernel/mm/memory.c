@@ -364,9 +364,9 @@ uint64_t mm_virt_to_phys_heap(uint64_t virt) {
         return (virt - KERNEL_OFFSET) + 0x100000ULL;  // KERNEL_START = 0x100000
     }
     
-    // For identity-mapped addresses (< 4GB), virt = phys
-    if (virt < 0x100000000ULL) {
-        return virt;
+    // For direct-mapped addresses (PHYS_MAP_BASE + phys), extract physical address
+    if (virt >= PHYS_MAP_BASE && virt < (PHYS_MAP_BASE + 0x100000000ULL)) {
+        return virt - PHYS_MAP_BASE;
     }
     
     kprintf("ERROR: mm_virt_to_phys_heap: unknown address %p\n", (void*)virt);
@@ -433,8 +433,9 @@ uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
     uint64_t pd_index = (virtual_addr >> 21) & 0x1FF;
     uint64_t pt_index = (virtual_addr >> 12) & 0x1FF;
     
-    // Use existing page tables (assume identity mapping for now)
-    mm_state.pml4_table = (uint64_t*)(get_cr3() & ~0xFFF);
+    // Get PML4 via direct map
+    uint64_t pml4_phys = get_cr3() & ~0xFFF;
+    mm_state.pml4_table = (uint64_t*)phys_to_virt(pml4_phys);
     
     if (mm_debug_pt) {
         kprintf("PT: vaddr=%p pml4=%lu pdpt=%lu pd=%lu pt=%lu\n",
@@ -443,15 +444,16 @@ uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
                 mm_state.pml4_table, pml4_index, (void*)mm_state.pml4_table[pml4_index]);
     }
     
-    uint64_t* pdpt = (uint64_t*)(mm_state.pml4_table[pml4_index] & ~0xFFF);
+    uint64_t pdpt_phys = mm_state.pml4_table[pml4_index] & ~0xFFF;
+    uint64_t* pdpt = pdpt_phys ? (uint64_t*)phys_to_virt(pdpt_phys) : NULL;
     if (!pdpt && create) {
-        uint64_t pdpt_phys = allocate_pt_page();
+        pdpt_phys = allocate_pt_page();
         if (!pdpt_phys) {
             return NULL;
         }
         // Already zeroed by allocate_pt_page
         mm_state.pml4_table[pml4_index] = pdpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
-        pdpt = (uint64_t*)pdpt_phys;
+        pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
         if (mm_debug_pt) kprintf("PT: Created new PDPT at %p\n", pdpt);
     }
     if (!pdpt) {
@@ -462,15 +464,16 @@ uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
         kprintf("PT: PDPT at %p, entry[%lu]=%p\n", pdpt, pdpt_index, (void*)pdpt[pdpt_index]);
     }
     
-    uint64_t* pd = (uint64_t*)(pdpt[pdpt_index] & ~0xFFF);
+    uint64_t pd_phys = pdpt[pdpt_index] & ~0xFFF;
+    uint64_t* pd = pd_phys ? (uint64_t*)phys_to_virt(pd_phys) : NULL;
     if (!pd && create) {
-        uint64_t pd_phys = allocate_pt_page();
+        pd_phys = allocate_pt_page();
         if (!pd_phys) {
             return NULL;
         }
         // Already zeroed by allocate_pt_page
         pdpt[pdpt_index] = pd_phys | PAGE_PRESENT | PAGE_WRITABLE;
-        pd = (uint64_t*)pd_phys;
+        pd = (uint64_t*)phys_to_virt(pd_phys);
         if (mm_debug_pt) kprintf("PT: Created new PD at %p\n", pd);
     }
     if (!pd) {
@@ -481,9 +484,10 @@ uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
         kprintf("PT: PD at %p, entry[%lu]=%p\n", pd, pd_index, (void*)pd[pd_index]);
     }
     
-    uint64_t* pt = (uint64_t*)(pd[pd_index] & ~0xFFF);
+    uint64_t pt_phys = pd[pd_index] & ~0xFFF;
+    uint64_t* pt = pt_phys ? (uint64_t*)phys_to_virt(pt_phys) : NULL;
     if (!pt && create) {
-        uint64_t pt_phys = allocate_pt_page();
+        pt_phys = allocate_pt_page();
         if (!pt_phys) {
             return NULL;
         }
@@ -496,7 +500,7 @@ uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
         if (mm_debug_pt) {
             kprintf("PT: Wrote pd[%lu] = 0x%lx, readback = 0x%lx\n", pd_index, new_entry, pd[pd_index]);
         }
-        pt = (uint64_t*)pt_phys;
+        pt = (uint64_t*)phys_to_virt(pt_phys);
         if (mm_debug_pt) kprintf("PT: Created new PT at %p\n", pt);
     }
 
@@ -1104,6 +1108,7 @@ void mm_print_heap_stats(void) {
 // ============================================================================
 
 // Get page table entry from a specific PML4, creating intermediate tables if needed
+// Note: pml4 is expected to be a virtual address (via phys_to_virt)
 uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, bool create) {
     if (!pml4) {
         return NULL;
@@ -1118,45 +1123,47 @@ uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, boo
     
     // Get PDPT
     uint64_t* pdpt;
+    uint64_t pdpt_phys = pml4[pml4_index] & ~0xFFFULL;
     if (!(pml4[pml4_index] & PAGE_PRESENT)) {
         if (!create) return NULL;
-        uint64_t pdpt_phys = mm_allocate_physical_page();
+        pdpt_phys = mm_allocate_physical_page();
         if (!pdpt_phys) return NULL;
-        mm_memset((void*)pdpt_phys, 0, PAGE_SIZE);
+        mm_memset(phys_to_virt(pdpt_phys), 0, PAGE_SIZE);
         // For user space, set PAGE_USER on all levels
         uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE;
         if (is_user_space) {
             flags |= PAGE_USER;
         }
         pml4[pml4_index] = pdpt_phys | flags;
-        pdpt = (uint64_t*)pdpt_phys;
+        pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
     } else {
         // Entry exists - but for user space mapping, we may need to add PAGE_USER
         if (is_user_space && create && !(pml4[pml4_index] & PAGE_USER)) {
             pml4[pml4_index] |= PAGE_USER;
         }
-        pdpt = (uint64_t*)(pml4[pml4_index] & ~0xFFFULL);
+        pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
     }
     
     // Get PD
     uint64_t* pd;
+    uint64_t pd_phys = pdpt[pdpt_index] & ~0xFFFULL;
     if (!(pdpt[pdpt_index] & PAGE_PRESENT)) {
         if (!create) return NULL;
-        uint64_t pd_phys = mm_allocate_physical_page();
+        pd_phys = mm_allocate_physical_page();
         if (!pd_phys) return NULL;
-        mm_memset((void*)pd_phys, 0, PAGE_SIZE);
+        mm_memset(phys_to_virt(pd_phys), 0, PAGE_SIZE);
         uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE;
         if (is_user_space) {
             flags |= PAGE_USER;
         }
         pdpt[pdpt_index] = pd_phys | flags;
-        pd = (uint64_t*)pd_phys;
+        pd = (uint64_t*)phys_to_virt(pd_phys);
     } else {
         // Entry exists - but for user space mapping, we may need to add PAGE_USER
         if (is_user_space && create && !(pdpt[pdpt_index] & PAGE_USER)) {
             pdpt[pdpt_index] |= PAGE_USER;
         }
-        pd = (uint64_t*)(pdpt[pdpt_index] & ~0xFFFULL);
+        pd = (uint64_t*)phys_to_virt(pd_phys);
     }
     
     // Get PT
@@ -1170,13 +1177,13 @@ uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, boo
         
         // Get the base physical address of the 2MB page
         uint64_t large_page_base = pd_entry & ~0x1FFFFFULL;  // Mask off lower 21 bits
-        uint64_t old_flags = pd_entry & 0x1FFFFFULL;        // Keep old flags
+        uint64_t old_flags = pd_entry & 0xFFFULL;           // Keep flags (lower 12 bits)
         
         // Allocate a new page table
         uint64_t pt_phys = mm_allocate_physical_page();
         if (!pt_phys) return NULL;
         
-        pt = (uint64_t*)pt_phys;
+        pt = (uint64_t*)phys_to_virt(pt_phys);
         
         // Fill the page table with 512 4KB pages covering the same 2MB region
         for (int i = 0; i < 512; i++) {
@@ -1199,27 +1206,30 @@ uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, boo
         if (!create) return NULL;
         uint64_t pt_phys = mm_allocate_physical_page();
         if (!pt_phys) return NULL;
-        mm_memset((void*)pt_phys, 0, PAGE_SIZE);
+        mm_memset(phys_to_virt(pt_phys), 0, PAGE_SIZE);
         uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE;
         if (is_user_space) {
             flags |= PAGE_USER;
         }
         pd[pd_index] = pt_phys | flags;
-        pt = (uint64_t*)pt_phys;
+        pt = (uint64_t*)phys_to_virt(pt_phys);
     } else {
         // Entry exists - but for user space mapping, we may need to add PAGE_USER
         if (is_user_space && create && !(pd[pd_index] & PAGE_USER)) {
             pd[pd_index] |= PAGE_USER;
         }
-        pt = (uint64_t*)(pd[pd_index] & ~0xFFFULL);
+        uint64_t pt_phys = pd[pd_index] & ~0xFFFULL;
+        pt = (uint64_t*)phys_to_virt(pt_phys);
     }
     
     return &pt[pt_index];
 }
 
 // Create a new user address space (PML4)
-// Shares kernel higher-half mappings (PML4[511]) with current address space
-// Also shares identity mapping (PML4[0-3]) for kernel stack access during interrupts
+// No identity mapping - user space is clean.
+// Shares:
+//   - PML4[272]: Direct map (PHYS_MAP_BASE) for kernel physical memory access
+//   - PML4[511]: Kernel higher-half mapping for kernel code/data
 uint64_t* mm_create_user_address_space(void) {
     // Allocate PML4
     uint64_t pml4_phys = mm_allocate_physical_page();
@@ -1228,78 +1238,29 @@ uint64_t* mm_create_user_address_space(void) {
         return NULL;
     }
     
-    uint64_t* new_pml4 = (uint64_t*)pml4_phys;
+    // Access via direct map
+    uint64_t* new_pml4 = (uint64_t*)phys_to_virt(pml4_phys);
     mm_memset(new_pml4, 0, PAGE_SIZE);
     
-    uint64_t* current_pml4 = (uint64_t*)(get_cr3() & ~0xFFFULL);
+    // Get kernel PML4 via direct map
+    uint64_t kernel_pml4_phys = get_cr3() & ~0xFFFULL;
+    uint64_t* kernel_pml4 = (uint64_t*)phys_to_virt(kernel_pml4_phys);
     
-    // We need identity mapping (PML4[0-3]) for kernel stack access when running
-    // with user's CR3. However, we can't just share the kernel's page tables
-    // because mapping user pages would corrupt them.
-    //
-    // Solution: Deep copy the page table hierarchy for PML4[0] (covers 0-512GB).
-    // This allows the kernel to access low memory while user mappings get their
-    // own page tables.
-    //
-    // For PML4[0], we copy the PDPT, and for each 1GB region (PDPT entries 0-3),
-    // we copy the PD. This way user mappings in 0-4GB get their own PD/PT.
-    
-    if (current_pml4[0] & PAGE_PRESENT) {
-        // Allocate new PDPT for user's address space
-        uint64_t new_pdpt_phys = mm_allocate_physical_page();
-        if (!new_pdpt_phys) {
-            mm_free_physical_page(pml4_phys);
-            return NULL;
-        }
-        uint64_t* new_pdpt = (uint64_t*)new_pdpt_phys;
-        
-        uint64_t* kernel_pdpt = (uint64_t*)(current_pml4[0] & ~0xFFFULL);
-        
-        // Copy all 512 PDPT entries initially (preserves identity mapping structure)
-        mm_memcpy(new_pdpt, kernel_pdpt, PAGE_SIZE);
-        
-        // For the first 4 GB (PDPT entries 0-3), deep copy the PD structures
-        // so user page mappings don't corrupt kernel's identity mapping
-        for (int i = 0; i < 4; i++) {
-            if (kernel_pdpt[i] & PAGE_PRESENT) {
-                // Allocate new PD for this 1GB region
-                uint64_t new_pd_phys = mm_allocate_physical_page();
-                if (!new_pd_phys) {
-                    // Cleanup on failure - simplified, just fail
-                    kprintf("mm_create_user_address_space: Failed to allocate PD[%d]\n", i);
-                    mm_free_physical_page(new_pdpt_phys);
-                    mm_free_physical_page(pml4_phys);
-                    return NULL;
-                }
-                uint64_t* new_pd = (uint64_t*)new_pd_phys;
-                uint64_t* kernel_pd = (uint64_t*)(kernel_pdpt[i] & ~0xFFFULL);
-                
-                // Copy PD entries (these are 2MB pages with PS bit, or pointers to PTs)
-                mm_memcpy(new_pd, kernel_pd, PAGE_SIZE);
-                
-                // Update PDPT to point to new PD (keep same flags)
-                uint64_t flags = kernel_pdpt[i] & 0xFFFULL;
-                new_pdpt[i] = new_pd_phys | flags;
-            }
-        }
-        
-        // Update PML4 to point to new PDPT (keep same flags, supervisor-only)
-        uint64_t pml4_flags = current_pml4[0] & 0xFFFULL;
-        new_pml4[0] = new_pdpt_phys | pml4_flags;
+    // Copy PML4[272] - Direct map (PHYS_MAP_BASE = 0xFFFF880000000000)
+    // This allows kernel code to access physical memory via phys_to_virt()
+    if (kernel_pml4[PHYS_MAP_PML4_INDEX] & PAGE_PRESENT) {
+        new_pml4[PHYS_MAP_PML4_INDEX] = kernel_pml4[PHYS_MAP_PML4_INDEX];
     }
     
-    // Copy PML4[1-3] directly (these are less likely to have user mappings)
-    // If user code is placed above 512GB this would need similar treatment
-    for (int i = 1; i < 4; i++) {
-        if (current_pml4[i] & PAGE_PRESENT) {
-            new_pml4[i] = current_pml4[i];
-        }
-    }
-    
-    // Copy PML4[511] - kernel higher-half mapping (supervisor only)
+    // Copy PML4[511] - Kernel higher-half mapping (supervisor only)
     // This allows kernel code to run while in user's address space
     // It also provides access to kernel heap, stacks, etc.
-    new_pml4[511] = current_pml4[511];
+    if (kernel_pml4[511] & PAGE_PRESENT) {
+        new_pml4[511] = kernel_pml4[511];
+    }
+    
+    // User space mappings (PML4[0-255]) start empty
+    // They will be filled in by mm_map_user_page() when loading ELF, etc.
     
     return new_pml4;
 }
@@ -1308,29 +1269,39 @@ uint64_t* mm_create_user_address_space(void) {
 void mm_destroy_address_space(uint64_t* pml4) {
     if (!pml4) return;
     
+    // pml4 is a virtual address (via phys_to_virt)
+    // Calculate the physical address for freeing
+    uint64_t pml4_phys = virt_to_phys(pml4);
+    
     // Don't free if it's the kernel PML4
-    uint64_t* kernel_pml4 = (uint64_t*)(get_cr3() & ~0xFFFULL);
-    if (pml4 == kernel_pml4) {
+    uint64_t kernel_pml4_phys = get_cr3() & ~0xFFFULL;
+    if (pml4_phys == kernel_pml4_phys) {
         kprintf("mm_destroy_address_space: Cannot destroy kernel PML4!\n");
         return;
     }
     
-    // Free user-space page tables (entries 0-510, excluding entry 0 identity mapping)
-    for (int i = 1; i < 511; i++) {
+    // Free user-space page tables (entries 0-255, user space only)
+    // Skip 256-511 (kernel space) and 272 (direct map)
+    for (int i = 0; i < 256; i++) {
         if (pml4[i] & PAGE_PRESENT) {
-            uint64_t* pdpt = (uint64_t*)(pml4[i] & ~0xFFFULL);
+            uint64_t pdpt_phys = pml4[i] & ~0xFFFULL;
+            uint64_t* pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
             
             for (int j = 0; j < 512; j++) {
                 if (pdpt[j] & PAGE_PRESENT) {
-                    uint64_t* pd = (uint64_t*)(pdpt[j] & ~0xFFFULL);
+                    uint64_t pd_phys = pdpt[j] & ~0xFFFULL;
+                    uint64_t* pd = (uint64_t*)phys_to_virt(pd_phys);
                     
                     for (int k = 0; k < 512; k++) {
                         if (pd[k] & PAGE_PRESENT) {
                             // Check if it's a 2MB page or a page table
                             if (pd[k] & PAGE_SIZE_FLAG) {
-                                // 2MB page - don't free, these are identity-mapped
+                                // 2MB page - free the physical page
+                                uint64_t phys = pd[k] & ~0x1FFFFFULL;
+                                mm_free_physical_page(phys);
                             } else {
-                                uint64_t* pt = (uint64_t*)(pd[k] & ~0xFFFULL);
+                                uint64_t pt_phys = pd[k] & ~0xFFFULL;
+                                uint64_t* pt = (uint64_t*)phys_to_virt(pt_phys);
                                 
                                 // Free all physical pages in this PT
                                 for (int l = 0; l < 512; l++) {
@@ -1341,35 +1312,39 @@ void mm_destroy_address_space(uint64_t* pml4) {
                                 }
                                 
                                 // Free the PT itself
-                                mm_free_physical_page((uint64_t)pt);
+                                mm_free_physical_page(pt_phys);
                             }
                         }
                     }
                     
                     // Free the PD
-                    mm_free_physical_page((uint64_t)pd);
+                    mm_free_physical_page(pd_phys);
                 }
             }
             
             // Free the PDPT
-            mm_free_physical_page((uint64_t)pdpt);
+            mm_free_physical_page(pdpt_phys);
         }
     }
     
     // Free the PML4 itself
-    mm_free_physical_page((uint64_t)pml4);
+    mm_free_physical_page(pml4_phys);
 }
 
 // Switch to a different address space
+// pml4 is a virtual address (from phys_to_virt)
 void mm_switch_address_space(uint64_t* pml4) {
     if (pml4) {
-        set_cr3((uint64_t)pml4);
+        // Convert virtual address back to physical for CR3
+        uint64_t pml4_phys = virt_to_phys(pml4);
+        set_cr3(pml4_phys);
     }
 }
 
-// Get the current address space
+// Get the current address space (returns virtual address via phys_to_virt)
 uint64_t* mm_get_current_address_space(void) {
-    return (uint64_t*)(get_cr3() & ~0xFFFULL);
+    uint64_t pml4_phys = get_cr3() & ~0xFFFULL;
+    return (uint64_t*)phys_to_virt(pml4_phys);
 }
 
 // Map a page in a specific address space
@@ -1419,8 +1394,8 @@ bool mm_map_user_stack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
             return false;
         }
         
-        // Zero the stack page
-        mm_memset((void*)phys, 0, PAGE_SIZE);
+        // Zero the stack page via direct map
+        mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
         
         // Map with user, writable, non-executable flags (stack should not be executable)
         uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;
@@ -1431,6 +1406,13 @@ bool mm_map_user_stack(uint64_t* pml4, uint64_t stack_top, size_t stack_size) {
                 mm_unmap_page_in_address_space(pml4, stack_bottom + (j * PAGE_SIZE));
             }
             return false;
+        }
+        
+        // DEBUG: Verify the page was mapped with correct flags
+        uint64_t* pte = mm_get_page_table_from_pml4(pml4, vaddr, false);
+        if (pte && i == pages - 1) {  // Only log last page
+            kprintf("  Stack page 0x%lx: PTE=0x%lx (USER=%d)\n", 
+                    vaddr, *pte, (*pte & PAGE_USER) ? 1 : 0);
         }
     }
     
@@ -1496,11 +1478,13 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
     uint64_t* pte = mm_get_page_table(page_addr, false);
     
     if (!pte || !(*pte & PAGE_PRESENT)) {
+        kprintf("COW: no PTE for 0x%lx\n", fault_addr);
         return false;
     }
     
     // Check if this is a COW page
     if (!(*pte & PAGE_COW)) {
+        kprintf("COW: PTE 0x%lx not COW (PTE=0x%lx)\n", fault_addr, *pte);
         return false;  // Not a COW fault
     }
     
@@ -1525,8 +1509,8 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
         return false;
     }
     
-    // Copy contents from old page to new page
-    mm_memcpy((void*)new_phys, (void*)old_phys, PAGE_SIZE);
+    // Copy contents from old page to new page via direct map
+    mm_memcpy(phys_to_virt(new_phys), phys_to_virt(old_phys), PAGE_SIZE);
     
     // Update PTE: remove COW, add writable, point to new page, preserve NX bit
     uint64_t flags = (*pte & 0xFFF) & ~PAGE_COW;
@@ -1563,127 +1547,74 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
     // We need to find user pages (those with PAGE_USER flag) in the source
     // and add them to the child's address space with COW semantics.
     
-    // Handle PML4[0] - user code and data live here
-    if (src_pml4[0] & PAGE_PRESENT) {
-        uint64_t* src_pdpt = (uint64_t*)(src_pml4[0] & ~0xFFFULL);
-        uint64_t* new_pdpt = (uint64_t*)(new_pml4[0] & ~0xFFFULL);
+    // Handle PML4 entries 0-255 (user space)
+    // User space starts fresh and we copy user pages with COW semantics
+    for (int i = 0; i < 256; i++) {
+        if (!(src_pml4[i] & PAGE_PRESENT)) continue;
         
-        // Note: new_pdpt was created by mm_create_user_address_space and has
-        // its own PD structures for the first 4GB. We need to copy user pages
-        // from source into these structures.
+        uint64_t src_pdpt_phys = src_pml4[i] & ~0xFFFULL;
+        uint64_t* src_pdpt = (uint64_t*)phys_to_virt(src_pdpt_phys);
+        
+        // Allocate PDPT for new address space
+        uint64_t pdpt_phys = mm_allocate_physical_page();
+        if (!pdpt_phys) goto fail;
+        mm_memset(phys_to_virt(pdpt_phys), 0, PAGE_SIZE);
+        new_pml4[i] = pdpt_phys | (src_pml4[i] & 0xFFF);
+        uint64_t* new_pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
         
         for (int j = 0; j < 512; j++) {
-            if ((src_pdpt[j] & PAGE_PRESENT)) {
-                uint64_t* src_pd = (uint64_t*)(src_pdpt[j] & ~0xFFFULL);
+            if (!(src_pdpt[j] & PAGE_PRESENT)) continue;
+            
+            uint64_t src_pd_phys = src_pdpt[j] & ~0xFFFULL;
+            uint64_t* src_pd = (uint64_t*)phys_to_virt(src_pd_phys);
+            
+            uint64_t pd_phys = mm_allocate_physical_page();
+            if (!pd_phys) goto fail;
+            mm_memset(phys_to_virt(pd_phys), 0, PAGE_SIZE);
+            new_pdpt[j] = pd_phys | (src_pdpt[j] & 0xFFF);
+            uint64_t* new_pd = (uint64_t*)phys_to_virt(pd_phys);
+            
+            for (int k = 0; k < 512; k++) {
+                if (!(src_pd[k] & PAGE_PRESENT)) continue;
                 
-                // Get or create PD in new address space
-                uint64_t* new_pd;
-                if (new_pdpt[j] & PAGE_PRESENT) {
-                    new_pd = (uint64_t*)(new_pdpt[j] & ~0xFFFULL);
-                } else {
-                    uint64_t pd_phys = mm_allocate_physical_page();
-                    if (!pd_phys) goto fail;
-                    mm_memset((void*)pd_phys, 0, PAGE_SIZE);
-                    new_pdpt[j] = pd_phys | (src_pdpt[j] & 0xFFF);
-                    new_pd = (uint64_t*)pd_phys;
-                }
-                
-                for (int k = 0; k < 512; k++) {
-                    if ((src_pd[k] & PAGE_PRESENT) && (src_pd[k] & PAGE_USER)) {
-                        if (src_pd[k] & PAGE_SIZE_FLAG) {
-                            // 2MB huge page with user flag - share with COW
-                            uint64_t cow_flags = (src_pd[k] & ~PAGE_WRITABLE) | PAGE_COW;
-                            src_pd[k] = cow_flags;
-                            new_pd[k] = cow_flags;
-                        } else {
-                            uint64_t* src_pt = (uint64_t*)(src_pd[k] & ~0xFFFULL);
-                            
-                            // Allocate new page table for child
-                            uint64_t pt_phys = mm_allocate_physical_page();
-                            if (!pt_phys) goto fail;
-                            mm_memset((void*)pt_phys, 0, PAGE_SIZE);
-                            new_pd[k] = pt_phys | (src_pd[k] & 0xFFF);
-                            uint64_t* new_pt = (uint64_t*)pt_phys;
-                            
-                            for (int l = 0; l < 512; l++) {
-                                if ((src_pt[l] & PAGE_PRESENT) && (src_pt[l] & PAGE_USER)) {
-                                    // Extract physical address (bits 12-51, mask off flags and NX bit)
-                                    uint64_t phys_page = src_pt[l] & 0x000FFFFFFFFFF000ULL;
-                                    
-                                    // Mark both source and dest as COW
-                                    uint64_t cow_flags = (src_pt[l] & ~PAGE_WRITABLE) | PAGE_COW;
-                                    src_pt[l] = cow_flags;
-                                    new_pt[l] = cow_flags;
-                                    
-                                    // Increment page reference count
-                                    // First call sets it to 1 (for parent), second to 2 (for child)
-                                    if (mm_get_page_refcount(phys_page) == 0) {
-                                        mm_incref_page(phys_page);
-                                    }
-                                    mm_incref_page(phys_page);
-                                }
-                            }
-                        }
+                if (src_pd[k] & PAGE_SIZE_FLAG) {
+                    // 2MB huge page - share with COW if it has user flag
+                    if (src_pd[k] & PAGE_USER) {
+                        uint64_t cow_flags = (src_pd[k] & ~PAGE_WRITABLE) | PAGE_COW;
+                        src_pd[k] = cow_flags;
+                        new_pd[k] = cow_flags;
+                    } else {
+                        // Kernel page - just share
+                        new_pd[k] = src_pd[k];
                     }
-                }
-            }
-        }
-    }
-    
-    // Clone entries 1-510 (other user mappings if any)
-    for (int i = 1; i < 511; i++) {
-        if (src_pml4[i] & PAGE_PRESENT) {
-            uint64_t* src_pdpt = (uint64_t*)(src_pml4[i] & ~0xFFFULL);
-            
-            // Allocate PDPT for new address space
-            uint64_t pdpt_phys = mm_allocate_physical_page();
-            if (!pdpt_phys) goto fail;
-            mm_memset((void*)pdpt_phys, 0, PAGE_SIZE);
-            new_pml4[i] = pdpt_phys | (src_pml4[i] & 0xFFF);
-            uint64_t* new_pdpt = (uint64_t*)pdpt_phys;
-            
-            for (int j = 0; j < 512; j++) {
-                if (src_pdpt[j] & PAGE_PRESENT) {
-                    uint64_t* src_pd = (uint64_t*)(src_pdpt[j] & ~0xFFFULL);
+                } else {
+                    uint64_t src_pt_phys = src_pd[k] & ~0xFFFULL;
+                    uint64_t* src_pt = (uint64_t*)phys_to_virt(src_pt_phys);
                     
-                    uint64_t pd_phys = mm_allocate_physical_page();
-                    if (!pd_phys) goto fail;
-                    mm_memset((void*)pd_phys, 0, PAGE_SIZE);
-                    new_pdpt[j] = pd_phys | (src_pdpt[j] & 0xFFF);
-                    uint64_t* new_pd = (uint64_t*)pd_phys;
+                    uint64_t pt_phys = mm_allocate_physical_page();
+                    if (!pt_phys) goto fail;
+                    mm_memset(phys_to_virt(pt_phys), 0, PAGE_SIZE);
+                    new_pd[k] = pt_phys | (src_pd[k] & 0xFFF);
+                    uint64_t* new_pt = (uint64_t*)phys_to_virt(pt_phys);
                     
-                    for (int k = 0; k < 512; k++) {
-                        if (src_pd[k] & PAGE_PRESENT) {
-                            if (src_pd[k] & PAGE_SIZE_FLAG) {
-                                // 2MB huge page - just share for now
-                                new_pd[k] = src_pd[k];
-                            } else {
-                                uint64_t* src_pt = (uint64_t*)(src_pd[k] & ~0xFFFULL);
-                                
-                                uint64_t pt_phys = mm_allocate_physical_page();
-                                if (!pt_phys) goto fail;
-                                mm_memset((void*)pt_phys, 0, PAGE_SIZE);
-                                new_pd[k] = pt_phys | (src_pd[k] & 0xFFF);
-                                uint64_t* new_pt = (uint64_t*)pt_phys;
-                                
-                                for (int l = 0; l < 512; l++) {
-                                    if (src_pt[l] & PAGE_PRESENT) {
-                                        uint64_t phys_page = src_pt[l] & ~0xFFFULL;
-                                        
-                                        // Mark both source and dest as COW
-                                        uint64_t cow_flags = (src_pt[l] & ~PAGE_WRITABLE) | PAGE_COW;
-                                        src_pt[l] = cow_flags;
-                                        new_pt[l] = cow_flags;
-                                        
-                                        // Increment page reference count (shared by parent and child)
-                                        // First call sets refcount to 1 (parent), second to 2 (parent+child)
-                                        if (mm_get_page_refcount(phys_page) == 0) {
-                                            mm_incref_page(phys_page);  // Parent's reference
-                                        }
-                                        mm_incref_page(phys_page);  // Child's reference
-                                    }
-                                }
+                    for (int l = 0; l < 512; l++) {
+                        if (!(src_pt[l] & PAGE_PRESENT)) continue;
+                        
+                        if (src_pt[l] & PAGE_USER) {
+                            // User page - share with COW
+                            uint64_t phys_page = src_pt[l] & 0x000FFFFFFFFFF000ULL;
+                            uint64_t cow_flags = (src_pt[l] & ~PAGE_WRITABLE) | PAGE_COW;
+                            src_pt[l] = cow_flags;
+                            new_pt[l] = cow_flags;
+                            
+                            // Increment page reference count
+                            if (mm_get_page_refcount(phys_page) == 0) {
+                                mm_incref_page(phys_page);
                             }
+                            mm_incref_page(phys_page);
+                        } else {
+                            // Kernel page - just copy mapping
+                            new_pt[l] = src_pt[l];
                         }
                     }
                 }
@@ -1776,6 +1707,87 @@ void mm_enable_smep_smap(void) {
     }
     
     __asm__ volatile("mov %0, %%cr4" : : "r"(cr4));
+}
+
+// Kernel stack for after identity mapping removal
+// This needs to be in the kernel's .bss section (which is in higher-half)
+#define KERNEL_INIT_STACK_SIZE (64 * 1024)  // 64KB kernel init stack
+static uint8_t g_kernel_init_stack[KERNEL_INIT_STACK_SIZE] __attribute__((aligned(16)));
+
+// Get the new kernel stack top address
+uint64_t mm_get_kernel_stack_top(void) {
+    // Stack grows down, return top of stack array minus some space for safety
+    return (uint64_t)&g_kernel_init_stack[KERNEL_INIT_STACK_SIZE - 16] & ~0xFULL;
+}
+
+// Assembly helper to switch stacks - defined in stack_switch.asm
+extern void switch_stack_and_call(uint64_t new_rsp, void (*func)(void));
+
+// Internal function that runs on the new stack
+static void continue_after_stack_switch(void);
+
+// Switch to a kernel stack in higher-half space
+// This must be called before mm_remove_identity_mapping() because the current
+// stack is in low memory (set up by bootloader in identity-mapped region)
+void mm_switch_to_kernel_stack(void) {
+    uint64_t new_rsp = mm_get_kernel_stack_top();
+    
+    kprintf("Switching to kernel stack at 0x%lx\n", new_rsp);
+    
+    // This function switches the stack and calls continue_after_stack_switch
+    // It will NOT return - execution continues from continue_after_stack_switch
+    switch_stack_and_call(new_rsp, continue_after_stack_switch);
+    
+    // Never reached
+}
+
+// This function is called on the new stack
+static void continue_after_stack_switch(void) {
+    kprintf("Now running on kernel higher-half stack\n");
+    
+    // Remove identity mapping now that we're on the new stack
+    mm_remove_identity_mapping();
+    
+    // Continue with the rest of initialization
+    extern void continue_system_startup(void);
+    continue_system_startup();
+    
+    // Never returns
+}
+
+// Remove identity mapping from kernel PML4
+// After this, physical memory can only be accessed via direct map at PHYS_MAP_BASE
+void mm_remove_identity_mapping(void) {
+    // Disable interrupts during this critical section
+    // Interrupt handlers may access identity-mapped memory
+    __asm__ volatile("cli");
+    
+    kprintf("Removing identity mapping...\n");
+    
+    // Get current PML4 via direct map
+    uint64_t pml4_phys = get_cr3() & ~0xFFFULL;
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+    
+    // Clear PML4 entry 0 - this removes the 0-512GB identity mapping
+    if (pml4[0] & PAGE_PRESENT) {
+        pml4[0] = 0;
+    }
+    
+    // Clear any other low entries that were identity-mapped
+    for (int i = 1; i < 4; i++) {
+        if (pml4[i] & PAGE_PRESENT) {
+            pml4[i] = 0;
+        }
+    }
+    
+    // Flush entire TLB
+    uint64_t cr3_val = get_cr3();
+    set_cr3(cr3_val);
+    
+    kprintf("Identity mapping removed - physical memory now via direct map at 0xFFFF880000000000\n");
+    
+    // Re-enable interrupts now that identity mapping is removed
+    __asm__ volatile("sti");
 }
 
 // Enable NX (No-Execute) bit support

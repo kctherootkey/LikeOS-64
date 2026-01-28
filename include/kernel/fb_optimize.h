@@ -57,6 +57,9 @@ typedef struct {
 int fb_optimize_init(framebuffer_info_t* fb_info);
 void fb_optimize_shutdown(void);
 
+// Remap front buffer to use direct map (call before removing identity mapping)
+void fb_optimize_remap_to_direct_map(void);
+
 // CPU feature detection
 uint32_t detect_cpu_features(void);
 const char* cpu_features_to_string(uint32_t features);

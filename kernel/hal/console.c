@@ -8,6 +8,7 @@
 #include "../../include/kernel/fb_optimize.h"
 #include "../../include/kernel/mouse.h"
 #include "../../include/kernel/scrollbar.h"
+#include "../../include/kernel/memory.h"
 
 #define SIZE_MAX ((size_t)-1)
 #define NULL ((void*)0)
@@ -32,6 +33,8 @@ static void string_putchar(char c, string_buffer_t* sb) {
 // Global console state
 static uint32_t cursor_x = 0;
 static uint32_t cursor_y = 0;
+// Static copy of framebuffer info - we copy from boot_info since boot_info is in identity-mapped memory
+static framebuffer_info_t g_fb_info_copy;
 static framebuffer_info_t* fb_info = 0;
 static uint32_t fg_color = 0xFFFFFFFF; // White (RGB)
 static uint32_t bg_color = 0x00000000; // Black (RGB)
@@ -441,7 +444,14 @@ static void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color, uint32_
 
 // Initialize the console with framebuffer info
 void console_init(framebuffer_info_t* fb) {
-    fb_info = fb;
+    // Copy the framebuffer info to our static storage so we don't depend on
+    // the boot_info structure which is in identity-mapped memory
+    if (fb) {
+        g_fb_info_copy = *fb;  // Copy the structure
+        fb_info = &g_fb_info_copy;  // Point to our copy
+    } else {
+        fb_info = 0;
+    }
     cursor_x = 0;
     cursor_y = 0;
     fg_color = 0xFFFFFFFF; // White
@@ -466,6 +476,28 @@ void console_init(framebuffer_info_t* fb) {
     console_clear();
     // Initialize scrollback storage once fb and rows/cols are known
     sb_reset();
+}
+
+// Remap framebuffer to use direct map (call before removing identity mapping)
+// This converts the framebuffer_base from identity-mapped address to direct-mapped address
+void console_remap_to_direct_map(void) {
+    if (fb_info && fb_info->framebuffer_base) {
+        // The framebuffer base was passed as a physical address (identity-mapped by bootloader)
+        uint64_t fb_phys = (uint64_t)fb_info->framebuffer_base;
+        kprintf("Remapping framebuffer: phys=0x%lx ", fb_phys);
+        
+        // Check if framebuffer is within our 4GB direct map range
+        if (fb_phys >= 0x100000000ULL) {
+            kprintf("-> WARNING: Framebuffer above 4GB, cannot use direct map!\n");
+            // Leave as identity-mapped - this will crash after identity map removal
+            // TODO: Extend direct map to cover framebuffer region
+            return;
+        }
+        
+        // Convert it to use the direct map at PHYS_MAP_BASE
+        fb_info->framebuffer_base = phys_to_virt(fb_phys);
+        kprintf("-> virt=0x%lx\n", (uint64_t)fb_info->framebuffer_base);
+    }
 }
 
 // Initialize framebuffer optimization system (call after console_init)
@@ -603,6 +635,7 @@ void console_putchar(char c) {
     if (serial_is_available()) {
         serial_write_char(c);
     }
+    
     // Fast path drawing when at bottom; otherwise only update scrollback/scrollbar
     if (c == '\n') {
         sb_append_char(c);
@@ -1444,32 +1477,6 @@ int kprintf(const char* format, ...) {
     int result = kvprintf(format, args);
     va_end(args);
     return result;
-}
-
-// Serial-only printf (does not render to framebuffer)
-int kprintf_serial(const char* format, ...) {
-    // If serial not available, do nothing (return bytes that would be written)
-    // We still format into a temporary buffer to compute length when serial is present.
-    if (!serial_is_available()) {
-        // Quick path: count approximate length by formatting into a small scratch buffer
-        // Without vsnprintf, we can’t compute exact length cheaply; return 0 in this case.
-        return 0;
-    }
-
-    // Format into a temporary buffer using existing string formatter
-    // Choose a reasonable size for kernel logs
-    char buf[1024];
-    string_buffer_t sb = { buf, sizeof(buf), 0 };
-    va_list args;
-    va_start(args, format);
-    kvprintf_to_buffer(format, args, &sb);
-    va_end(args);
-    buf[sb.pos] = '\0';
-
-    if (sb.pos > 0) {
-        serial_write(buf, (uint32_t)sb.pos);
-    }
-    return (int)sb.pos;
 }
 
 // String printf
