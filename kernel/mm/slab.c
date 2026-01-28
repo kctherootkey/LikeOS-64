@@ -9,9 +9,10 @@
 // External debug flag from memory.c
 extern int mm_debug_pt;
 
-// Size classes: 32, 64, 128, 256, 512, 1024, 2048, 4096 bytes
+// Size classes: 32, 64, 128, 256, 512, 1024, 2048 bytes
+// Note: 4096 cannot fit in a single page with slab header, so it goes to large alloc
 static const uint32_t size_classes[SLAB_NUM_CLASSES] = {
-    32, 64, 128, 256, 512, 1024, 2048, 4096
+    32, 64, 128, 256, 512, 1024, 2048
 };
 
 // Slab caches for each size class
@@ -171,6 +172,13 @@ static slab_page_t* slab_alloc_page(slab_cache_t* cache) {
         return NULL;
     }
     
+    // Verify mapping before memset
+    uint64_t check_phys = mm_get_physical_address(virt_addr);
+    if (check_phys != phys_page) {
+        kprintf("SLAB: MAPPING FAILED! virt=%p expected phys=%p got=%p\n",
+                (void*)virt_addr, (void*)phys_page, (void*)check_phys);
+    }
+    
     // Initialize slab page header (now using virtual address)
     slab_page_t* slab = (slab_page_t*)virt_addr;
     mm_memset(slab, 0, PAGE_SIZE);
@@ -298,6 +306,7 @@ void* slab_alloc(size_t size) {
     }
     
     // For large allocations, use direct page allocation
+    // Note: size >= SLAB_MAX_SIZE because max slab object (2048) needs room for header
     if (size > SLAB_MAX_SIZE) {
         // Calculate pages needed (including header)
         size_t total_size = size + sizeof(large_alloc_header_t);

@@ -58,6 +58,15 @@ static inline uint8_t inb(uint16_t port) {
 // Utility functions (non-static, declared in memory.h)
 void mm_memset(void* dest, int val, size_t len) {
     uint8_t* ptr = (uint8_t*)dest;
+    // Debug memsets in SLAB region that could reach fault address
+    uint64_t start = (uint64_t)dest;
+    uint64_t end = start + len;
+    // Check if this memset would touch addresses past 0xffffffff8e489000
+    if (start >= 0xFFFFFFFF88000000ULL && end > 0xffffffff8e489000ULL) {
+        void* ra = __builtin_return_address(0);
+        kprintf("MM_MEMSET OVERFLOW: dest=%p len=0x%lx end=%p caller=%p\n",
+                dest, (unsigned long)len, (void*)end, ra);
+    }
     while (len--) {
         *ptr++ = val;
     }

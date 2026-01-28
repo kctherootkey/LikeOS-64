@@ -9,14 +9,14 @@
 
 // Configuration
 #define SLAB_MIN_SIZE           32          // Minimum allocation size (32 bytes)
-#define SLAB_MAX_SIZE           4096        // Maximum slab-managed size (4KB)
-#define SLAB_NUM_CLASSES        8           // Number of size classes
+#define SLAB_MAX_SIZE           2048        // Maximum slab-managed size (2KB)
+#define SLAB_NUM_CLASSES        7           // Number of size classes (32 to 2048)
 #define SLAB_OBJECTS_PER_PAGE   ((PAGE_SIZE - sizeof(slab_page_t)) / 64)  // Approximate
 #define SLAB_MAGIC              0x534C4142  // "SLAB" magic number
 #define SLAB_LARGE_MAGIC        0x4C524745  // "LRGE" for large allocations
 
-// Size classes: 32, 64, 128, 256, 512, 1024, 2048, 4096 bytes
-// Each class manages objects of up to that size
+// Size classes: 32, 64, 128, 256, 512, 1024, 2048 bytes
+// Note: 4096 cannot fit in a single page with slab header, so >= 4096 goes to large alloc
 
 // Forward declarations
 struct slab_page;
