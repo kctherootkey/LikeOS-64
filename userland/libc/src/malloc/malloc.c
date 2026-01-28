@@ -26,6 +26,24 @@ static block_t* find_free_block(block_t** last, size_t size) {
     return current;
 }
 
+// Split a block if it's significantly larger than needed
+// Returns the block to use (same as input, but potentially smaller)
+static void split_block(block_t* block, size_t size) {
+    // Only split if remaining space can hold a useful block
+    // Need at least BLOCK_SIZE for header + some minimum payload (16 bytes)
+    if (block->size >= size + BLOCK_SIZE + 16) {
+        // Create new block after the allocated space
+        block_t* new_block = (block_t*)((char*)(block + 1) + size);
+        new_block->size = block->size - size - BLOCK_SIZE;
+        new_block->free = 1;
+        new_block->next = block->next;
+        
+        // Update original block
+        block->size = size;
+        block->next = new_block;
+    }
+}
+
 // Request more space from the system
 static block_t* request_space(block_t* last, size_t size) {
     block_t* block;
@@ -72,7 +90,8 @@ void* malloc(size_t size) {
                 return NULL;
             }
         } else {
-            // Found a free block
+            // Found a free block - split it if much larger than needed
+            split_block(block, size);
             block->free = 0;
         }
     }
