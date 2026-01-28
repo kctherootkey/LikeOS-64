@@ -241,9 +241,9 @@ int elf_exec(const char* path, char* const argv[], char* const envp[], task_t** 
         return -6;
     }
     
-    // Set up stack
-    #define USER_STACK_TOP   0x8000000ULL   // 128MB
-    #define USER_STACK_SIZE  (64 * 1024)    // 64KB
+    // Set up stack - place at top of user address space to maximize heap space
+    #define USER_STACK_TOP   0x00007FFFFFF00000ULL   // Near canonical limit (~128TB)
+    #define USER_STACK_SIZE  (64 * 1024)             // 64KB
     
     if (!mm_map_user_stack(user_pml4, USER_STACK_TOP, USER_STACK_SIZE)) {
         kprintf("elf_exec: cannot map stack\n");
@@ -503,8 +503,8 @@ uint64_t elf_exec_replace(const char* path, char* const argv[], char* const envp
         return 0;
     }
     
-    // Set up stack in new address space
-    #define USER_STACK_TOP_EXEC   0x8000000ULL
+    // Set up stack in new address space - place at top of user address space
+    #define USER_STACK_TOP_EXEC   0x00007FFFFFF00000ULL  // Near canonical limit
     #define USER_STACK_SIZE_EXEC  (64 * 1024)
     
     if (!mm_map_user_stack(user_pml4, USER_STACK_TOP_EXEC, USER_STACK_SIZE_EXEC)) {
