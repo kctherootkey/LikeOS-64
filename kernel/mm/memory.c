@@ -105,6 +105,8 @@ uint64_t mm_get_kernel_heap_start(void) {
 
 // Forward declarations
 static bool is_page_allocated(uint64_t page);
+static void set_page_bit(uint64_t page);
+static void clear_page_bit(uint64_t page);
 
 // Page table pool - Reserved from start of physical memory range.
 // All page tables are allocated from this pool, which is outside the bitmap range.
@@ -112,6 +114,126 @@ static bool is_page_allocated(uint64_t page);
 static uint64_t pt_pool_phys_start = 0;
 static int pt_pool_next = 0;
 static int pt_pool_initialized = 0;
+
+// ============================================================================
+// EARLY PAGE TABLE WALKING (before full VM is initialized)
+// Walk the bootloader's page tables to find physical addresses for virtual addresses
+// This does NOT use mm_get_page_table (which needs allocation) - read only!
+// ============================================================================
+
+// Get physical address for virtual address by walking page tables (read-only, early boot)
+// Returns 0 if the address is not mapped
+static uint64_t early_virt_to_phys(uint64_t virtual_addr) {
+    uint64_t pml4_index = (virtual_addr >> 39) & 0x1FF;
+    uint64_t pdpt_index = (virtual_addr >> 30) & 0x1FF;
+    uint64_t pd_index = (virtual_addr >> 21) & 0x1FF;
+    uint64_t pt_index = (virtual_addr >> 12) & 0x1FF;
+    
+    // Get PML4 from CR3
+    uint64_t pml4_phys = get_cr3() & ~0xFFF;
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+    
+    // Check PML4 entry
+    uint64_t pml4e = pml4[pml4_index];
+    if (!(pml4e & PAGE_PRESENT)) {
+        return 0;  // Not mapped
+    }
+    
+    // Get PDPT
+    uint64_t pdpt_phys = pml4e & ~0xFFF;
+    uint64_t* pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
+    
+    // Check PDPT entry
+    uint64_t pdpte = pdpt[pdpt_index];
+    if (!(pdpte & PAGE_PRESENT)) {
+        return 0;  // Not mapped
+    }
+    
+    // Check for 1GB page
+    if (pdpte & PAGE_SIZE_FLAG) {
+        // 1GB page - physical address is pdpte[51:30] + vaddr[29:0]
+        return (pdpte & 0x000FFFFFC0000000ULL) | (virtual_addr & 0x3FFFFFFF);
+    }
+    
+    // Get PD
+    uint64_t pd_phys = pdpte & ~0xFFF;
+    uint64_t* pd = (uint64_t*)phys_to_virt(pd_phys);
+    
+    // Check PD entry
+    uint64_t pde = pd[pd_index];
+    if (!(pde & PAGE_PRESENT)) {
+        return 0;  // Not mapped
+    }
+    
+    // Check for 2MB page
+    if (pde & PAGE_SIZE_FLAG) {
+        // 2MB page - physical address is pde[51:21] + vaddr[20:0]
+        return (pde & 0x000FFFFFFFE00000ULL) | (virtual_addr & 0x1FFFFF);
+    }
+    
+    // Get PT
+    uint64_t pt_phys = pde & ~0xFFF;
+    uint64_t* pt = (uint64_t*)phys_to_virt(pt_phys);
+    
+    // Check PT entry
+    uint64_t pte = pt[pt_index];
+    if (!(pte & PAGE_PRESENT)) {
+        return 0;  // Not mapped
+    }
+    
+    // 4KB page - physical address is pte[51:12] + vaddr[11:0]
+    return (pte & 0x000FFFFFFFFFF000ULL) | (virtual_addr & 0xFFF);
+}
+
+// Reserve a physical page in the bitmap (mark as allocated)
+// Used during init to mark bootloader-mapped pages as reserved
+static void reserve_physical_page(uint64_t phys_addr) {
+    if (phys_addr < mm_state.memory_start || phys_addr >= mm_state.memory_end) {
+        return;  // Outside managed range
+    }
+    
+    uint64_t page = (phys_addr - mm_state.memory_start) / PAGE_SIZE;
+    if (page < mm_state.total_pages && !is_page_allocated(page)) {
+        set_page_bit(page);
+        mm_state.free_pages--;
+    }
+}
+
+// Walk all kernel virtual addresses and reserve their backing physical pages
+// This ensures we never allocate physical pages that are already in use by the kernel
+static void reserve_bootloader_mapped_pages(void) {
+    uint64_t kernel_start_virt = KERNEL_OFFSET;
+    uint64_t heap_start_virt = mm_get_kernel_heap_start();
+    uint64_t heap_end_virt = heap_start_virt + KERNEL_HEAP_SIZE;
+    
+    // Also reserve pages for bitmap and refcount array
+    uint64_t bitmap_end_virt = (uint64_t)mm_state.physical_bitmap + mm_state.bitmap_size;
+    uint64_t refcount_end_virt = (uint64_t)mm_state.page_refcounts + mm_state.refcount_array_size;
+    
+    // Find the highest virtual address we need to scan
+    uint64_t scan_end = refcount_end_virt;
+    if (bitmap_end_virt > scan_end) scan_end = bitmap_end_virt;
+    if (heap_end_virt > scan_end) scan_end = heap_end_virt;
+    
+    uint64_t pages_reserved = 0;
+    
+    kprintf("  Scanning bootloader mappings: 0x%lx - 0x%lx\n",
+            kernel_start_virt, scan_end);
+    
+    // Walk through all virtual pages in the kernel space
+    for (uint64_t virt = kernel_start_virt; virt < scan_end; virt += PAGE_SIZE) {
+        uint64_t phys = early_virt_to_phys(virt);
+        if (phys != 0) {
+            // Check if this physical page is in our managed range
+            if (phys >= mm_state.memory_start && phys < mm_state.memory_end) {
+                reserve_physical_page(phys);
+                pages_reserved++;
+            }
+        }
+    }
+    
+    kprintf("  Reserved %lu bootloader-mapped pages in managed range\n", pages_reserved);
+}
 
 // Find first free bit in bitmap
 static uint64_t find_free_page(void) {
@@ -160,101 +282,79 @@ static bool is_page_allocated(uint64_t page) {
 void mm_initialize_physical_memory(uint64_t memory_size) {
     kprintf("Initializing Physical Memory Manager...\n");
     
-    // Calculate memory layout
-    // Get kernel end virtual address and convert to physical
-    // The kernel is loaded at physical 0x100000 and mapped to virtual 0xFFFFFFFF80000000
-    // So: phys = virt - 0xFFFFFFFF80000000 + 0x100000
-    uint64_t kernel_end_virt = (uint64_t)kernel_end;
-    uint64_t kernel_virt_base = 0xFFFFFFFF80000000ULL;
-    uint64_t kernel_phys_base = 0x100000ULL;  // 1MB - where bootloader loads kernel
-    uint64_t kernel_end_phys = (kernel_end_virt - kernel_virt_base) + kernel_phys_base;
+    // =========================================================================
+    // KEY INSIGHT: The bootloader uses AllocateAnyPages which allocates physical
+    // pages at ARBITRARY locations, not contiguously after kernel_end.
+    // 
+    // We CANNOT assume physical addresses are linear with virtual addresses.
+    // Instead, we:
+    //   1. Start our managed physical memory well past any bootloader allocations
+    //   2. Walk the page tables to find which physical pages are actually in use
+    //   3. Mark those pages as reserved in our bitmap
+    // =========================================================================
     
-    // The kernel heap is allocated right after kernel_end in virtual space
-    // It occupies 8MB of physical memory. The bitmap follows.
-    
-    // Calculate the heap end in physical terms
     uint64_t heap_start_virt = mm_get_kernel_heap_start();
     
-    // Simplified: heap_end_phys = kernel_end_phys + KERNEL_HEAP_SIZE
-    uint64_t heap_end_phys = kernel_end_phys + KERNEL_HEAP_SIZE;
+    // Start managed memory at a safe location (well past typical bootloader allocations)
+    // The bootloader typically allocates in low memory, so starting at 32MB should be safe
+    // We'll verify by walking page tables and reserving any pages that are actually in use
+    uint64_t safe_start = 32 * 1024 * 1024;  // 32MB
     
-    // Add space for bitmap (estimate) - we'll refine this after calculating total pages
-    // For 512MB of RAM, we need about 512MB/4KB = 128K pages = 16KB bitmap
-    // But let's be generous and reserve 64KB for the bitmap
-    // ALSO need to reserve space for the refcount array: 2 bytes per page
-    // For 2GB RAM: ~500K pages * 2 = ~1MB for refcounts
-    uint64_t bitmap_reserve = 64 * 1024;
-    uint64_t refcount_reserve = 2 * 1024 * 1024;  // 2MB for refcounts (generous)
-    
-    // Start manageable memory after heap + bitmap + refcounts, aligned to page boundary  
-    mm_state.memory_start = PAGE_ALIGN(heap_end_phys + bitmap_reserve + refcount_reserve);
-    
-    // Reserve the first PT_POOL_SIZE pages of the allocatable range for page tables
-    // These pages will be accessed via the direct map but NOT tracked by the bitmap
-    pt_pool_phys_start = mm_state.memory_start;
+    // Reserve space for page table pool at start of managed range
+    pt_pool_phys_start = safe_start;
     uint64_t pt_pool_size_bytes = PT_POOL_SIZE * PAGE_SIZE;
-    mm_state.memory_start += pt_pool_size_bytes;  // Advance past the PT pool
+    mm_state.memory_start = pt_pool_phys_start + pt_pool_size_bytes;
     
-    kprintf("  PT pool reserved: %p - %p (%d pages, %lu MB)\n",
-            (void*)pt_pool_phys_start, (void*)mm_state.memory_start,
+    kprintf("  PT pool reserved: 0x%lx - 0x%lx (%d pages, %lu MB)\n",
+            pt_pool_phys_start, mm_state.memory_start,
             PT_POOL_SIZE, pt_pool_size_bytes / (1024*1024));
     
-    // memory_end is the total physical RAM, not memory_start + memory_size!
+    // End of managed memory is total RAM
     mm_state.memory_end = memory_size;
-    // Make sure memory_end doesn't exceed available RAM
+    
+    // Sanity check
     if (mm_state.memory_end <= mm_state.memory_start) {
-        kprintf("ERROR: Not enough RAM! memory_start=%p > memory_end=%p (memory_size=%lu)\n",
-                (void*)mm_state.memory_start, (void*)mm_state.memory_end, 
-                (unsigned long)memory_size);
-        mm_state.memory_end = mm_state.memory_start + (16 * 1024 * 1024); // Fallback 16MB
+        kprintf("ERROR: Not enough RAM! memory_start=0x%lx > memory_end=0x%lx\n",
+                mm_state.memory_start, mm_state.memory_end);
+        mm_state.memory_end = mm_state.memory_start + (64 * 1024 * 1024); // Fallback
     }
+    
     mm_state.total_pages = (mm_state.memory_end - mm_state.memory_start) / PAGE_SIZE;
     mm_state.bitmap_size = PAGE_ALIGN((mm_state.total_pages + 7) / 8);
     
-    // Place bitmap after kernel heap area (in virtual space)
+    // Place bitmap in kernel virtual space (after heap)
+    // The bootloader mapped 32MB of virtual space starting at kernel_end
     mm_state.physical_bitmap = (uint32_t*)(heap_start_virt + KERNEL_HEAP_SIZE);
     
-    kprintf("  Kernel end virtual: %p\n", kernel_end);
-    kprintf("  Kernel end physical: %p\n", (void*)kernel_end_phys);
-    kprintf("  Heap end physical: %p\n", (void*)heap_end_phys);
-    kprintf("  Memory range: %p - %p (%lu MB)\n", 
-           (void*)mm_state.memory_start, (void*)mm_state.memory_end,
+    kprintf("  Memory range: 0x%lx - 0x%lx (%lu MB)\n", 
+           mm_state.memory_start, mm_state.memory_end,
            (mm_state.memory_end - mm_state.memory_start) / (1024*1024));
-    kprintf("  Total pages: %d\n", mm_state.total_pages);
-    kprintf("  Heap: %p - %p\n", 
-           (void*)heap_start_virt, (void*)(heap_start_virt + KERNEL_HEAP_SIZE));
-    kprintf("  Bitmap at: %p (size: %d bytes)\n", 
+    kprintf("  Total pages: %lu\n", mm_state.total_pages);
+    kprintf("  Heap: 0x%lx - 0x%lx\n", 
+           heap_start_virt, heap_start_virt + KERNEL_HEAP_SIZE);
+    kprintf("  Bitmap at: %p (size: %lu bytes)\n", 
            mm_state.physical_bitmap, mm_state.bitmap_size);
-    kprintf("  Bitmap end: %p\n", 
-           (void*)((uint64_t)mm_state.physical_bitmap + mm_state.bitmap_size));
 
     // Clear bitmap (all pages free initially)
     mm_memset(mm_state.physical_bitmap, 0, mm_state.bitmap_size);
-
     mm_state.free_pages = mm_state.total_pages;
     
     // Initialize page reference count array
-    // Each page gets 2 bytes (uint16_t) for refcount - max 65535 references
     mm_state.refcount_array_size = mm_state.total_pages * sizeof(uint16_t);
     mm_state.page_refcounts = (uint16_t*)((uint64_t)mm_state.physical_bitmap + mm_state.bitmap_size);
-    
-    // Verify refcounts fit in reserved space
-    uint64_t refcount_end_virt = (uint64_t)mm_state.page_refcounts + mm_state.refcount_array_size;
-    uint64_t refcount_end_phys = (refcount_end_virt - kernel_virt_base) + kernel_phys_base;
-    if (refcount_end_phys > mm_state.memory_start) {
-        kprintf("ERROR: Refcount array (ends at phys 0x%lx) overlaps memory pool (starts at 0x%lx)!\n",
-                refcount_end_phys, mm_state.memory_start);
-        // Adjust memory_start to be safe
-        mm_state.memory_start = PAGE_ALIGN(refcount_end_phys);
-        mm_state.total_pages = (mm_state.memory_end - mm_state.memory_start) / PAGE_SIZE;
-        kprintf("  Adjusted memory_start to 0x%lx, total_pages to %lu\n",
-                mm_state.memory_start, mm_state.total_pages);
-    }
-    
     mm_memset(mm_state.page_refcounts, 0, mm_state.refcount_array_size);
+    
     kprintf("  Page refcounts at: %p (size: %lu bytes)\n",
            mm_state.page_refcounts, mm_state.refcount_array_size);
     
+    // =========================================================================
+    // CRITICAL: Walk the bootloader's page tables and reserve any physical pages
+    // that are already mapped. This prevents us from allocating pages that are
+    // backing kernel code, heap, bitmap, or refcount array.
+    // =========================================================================
+    reserve_bootloader_mapped_pages();
+    
+    kprintf("  Free pages after reservations: %lu\n", mm_state.free_pages);
     kprintf("Physical Memory Manager initialized\n");
 }
 
