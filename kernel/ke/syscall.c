@@ -1320,13 +1320,15 @@ static int64_t sys_brk(uint64_t new_brk) {
         uint64_t old_page = PAGE_ALIGN(cur->brk);
         uint64_t new_page = PAGE_ALIGN(new_brk);
         
-        uint64_t pages_to_map = (new_page - old_page) / PAGE_SIZE;
-        
         // Map new pages
         for (uint64_t addr = old_page; addr < new_page; addr += PAGE_SIZE) {
             uint64_t phys = mm_allocate_physical_page();
             if (!phys) {
-                return (int64_t)cur->brk;  // Out of memory
+                // Out of physical memory - rollback pages we already mapped
+                for (uint64_t cleanup = old_page; cleanup < addr; cleanup += PAGE_SIZE) {
+                    mm_unmap_page_in_address_space(cur->pml4, cleanup);
+                }
+                return (int64_t)cur->brk;  // Return unchanged brk
             }
             // Zero page via direct map
             mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
@@ -1334,7 +1336,11 @@ static int64_t sys_brk(uint64_t new_brk) {
             uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;
             if (!mm_map_page_in_address_space(cur->pml4, addr, phys, flags)) {
                 mm_free_physical_page(phys);
-                return (int64_t)cur->brk;
+                // Rollback pages we already mapped
+                for (uint64_t cleanup = old_page; cleanup < addr; cleanup += PAGE_SIZE) {
+                    mm_unmap_page_in_address_space(cur->pml4, cleanup);
+                }
+                return (int64_t)cur->brk;  // Return unchanged brk
             }
         }
     }

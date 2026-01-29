@@ -108,7 +108,7 @@ static EFI_PHYSICAL_ADDRESS g_pdpt_high_addr = 0;
 static EFI_PHYSICAL_ADDRESS g_pd_high_addr = 0;
 static EFI_PHYSICAL_ADDRESS g_pt_high_addr = 0;
 static EFI_PHYSICAL_ADDRESS g_pdpt_physmap_addr = 0;
-static EFI_PHYSICAL_ADDRESS g_pd_physmap_addr[4] = {0}; // 4 page directories for physmap (4GB)
+static EFI_PHYSICAL_ADDRESS g_pd_physmap_addr[16] = {0}; // 16 page directories for physmap (16GB)
 
 // Trampoline address (will be allocated below kernel)
 static EFI_PHYSICAL_ADDRESS trampoline_addr = 0;
@@ -306,8 +306,8 @@ static EFI_STATUS init_page_tables(void) {
     g_pdpt_physmap_addr = allocate_page_table();
     if (!g_pdpt_physmap_addr) return EFI_OUT_OF_RESOURCES;
     
-    // Allocate 4 page directories for physmap (4GB)
-    for (int i = 0; i < 4; i++) {
+    // Allocate 16 page directories for physmap (16GB)
+    for (int i = 0; i < 16; i++) {
         g_pd_physmap_addr[i] = allocate_page_table();
         if (!g_pd_physmap_addr[i]) return EFI_OUT_OF_RESOURCES;
     }
@@ -320,7 +320,7 @@ static EFI_STATUS init_page_tables(void) {
     Print(L"  PD (high):    0x%lx\r\n", g_pd_high_addr);
     Print(L"  PT (high):    0x%lx\r\n", g_pt_high_addr);
     Print(L"  PDPT (phys):  0x%lx\r\n", g_pdpt_physmap_addr);
-    Print(L"  PD (phys):    0x%lx - 0x%lx\r\n", g_pd_physmap_addr[0], g_pd_physmap_addr[3]);
+    Print(L"  PD (phys):    0x%lx - 0x%lx\r\n", g_pd_physmap_addr[0], g_pd_physmap_addr[15]);
     
     serial_puts("Page tables allocated:\n");
     serial_puts("  PML4:       "); serial_puthex(g_pml4_addr); serial_puts("\n");
@@ -523,7 +523,7 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
     
     // ===================================================================
     // Set up DIRECT MAP region at PHYS_MAP_BASE = 0xFFFF880000000000
-    // This maps physical memory 0-4GB to virtual 0xFFFF880000000000-0xFFFF880100000000
+    // This maps physical memory 0-16GB to virtual 0xFFFF880000000000-0xFFFF880400000000
     // PML4 index 272 = (0xFFFF880000000000 >> 39) & 0x1FF
     // ===================================================================
     {
@@ -537,8 +537,8 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
         // Set up PML4 entry 272 to point to direct map PDPT
         pml4->entries[272] = g_pdpt_physmap_addr | PAGE_RWX;
         
-        // Map first 4GB of physical memory using 2MB pages
-        for (int pdpt_i = 0; pdpt_i < 4; pdpt_i++) {
+        // Map first 16GB of physical memory using 2MB pages
+        for (int pdpt_i = 0; pdpt_i < 16; pdpt_i++) {
             // Use pre-allocated page directory for this 1GB region
             EFI_PHYSICAL_ADDRESS pd_addr = g_pd_physmap_addr[pdpt_i];
             page_table_t *pd = (page_table_t*)pd_addr;
@@ -559,7 +559,7 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
             }
         }
         
-        Print(L"  Direct map: 0xFFFF880000000000 -> phys 0x0 (4GB, 2MB pages)\r\n");
+        Print(L"  Direct map: 0xFFFF880000000000 -> phys 0x0 (16GB, 2MB pages)\r\n");
     }
     
     Print(L"Higher half paging configured:\r\n");

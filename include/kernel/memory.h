@@ -41,7 +41,7 @@ static inline uint64_t virt_to_phys(void* virt_addr) {
 
 // Check if an address is in the direct map region
 static inline bool is_direct_map_addr(uint64_t addr) {
-    return (addr >= PHYS_MAP_BASE) && (addr < (PHYS_MAP_BASE + 0x100000000ULL));
+    return (addr >= PHYS_MAP_BASE) && (addr < (PHYS_MAP_BASE + 0x400000000ULL));  // 16GB
 }
 
 // Function to get dynamic kernel heap start address

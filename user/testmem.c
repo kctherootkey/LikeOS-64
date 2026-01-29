@@ -25,9 +25,13 @@ static int test_single_allocation(size_t size_mb) {
     
     // Write test values
     printf("  Writing test patterns...\n");
+    printf("    buf=%p, size=%lu (0x%lx)\n", (void*)buf, (unsigned long)size, (unsigned long)size);
+    printf("    End address: %p\n", (void*)&buf[size - 1]);
     buf[0] = 0xAA;                    // Beginning
     buf[size / 2] = 0x55;             // Middle
+    printf("    Writing 0xBB to end...\n");
     buf[size - 1] = 0xBB;             // End
+    printf("    Write complete, now reading back...\n");
     
     // Verify reads
     printf("  Verifying...\n");

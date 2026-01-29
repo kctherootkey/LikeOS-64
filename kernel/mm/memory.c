@@ -270,6 +270,68 @@ static const char* mm_get_efi_memory_type_name(uint32_t type) {
     }
 }
 
+// Mark usable UEFI memory regions as free (inverse of reserve)
+// This is used after setting all pages as used, to mark only actual RAM as available
+static void mark_usable_uefi_regions(void) {
+    if (g_uefi_memory_map.entry_count == 0) {
+        kprintf("  WARNING: No UEFI memory map - marking all managed pages as usable\n");
+        // Fallback: mark all as free (old behavior)
+        mm_memset(mm_state.physical_bitmap, 0, mm_state.bitmap_size);
+        mm_state.free_pages = mm_state.total_pages;
+        return;
+    }
+    
+    uint64_t pages_marked_free = 0;
+    
+    kprintf("  Marking UEFI usable memory regions as free:\n");
+    
+    for (uint32_t i = 0; i < g_uefi_memory_map.entry_count; i++) {
+        memory_map_entry_t* entry = &g_uefi_memory_map.entries[i];
+        
+        // Only process usable memory types
+        if (!mm_is_usable_memory_type(entry->type)) {
+            continue;
+        }
+        
+        // This is a usable region - mark pages as free
+        uint64_t region_start = entry->physical_start;
+        uint64_t region_end = region_start + (entry->number_of_pages * PAGE_SIZE);
+        
+        // Only process regions that overlap with our managed memory range
+        if (region_end <= mm_state.memory_start || region_start >= mm_state.memory_end) {
+            continue;  // Region is outside our managed range
+        }
+        
+        // Clamp to our managed range
+        if (region_start < mm_state.memory_start) {
+            region_start = mm_state.memory_start;
+        }
+        if (region_end > mm_state.memory_end) {
+            region_end = mm_state.memory_end;
+        }
+        
+        uint64_t region_pages = (region_end - region_start) / PAGE_SIZE;
+        
+        kprintf("    [%02u] 0x%lx-0x%lx (%s): %lu pages\n",
+                i, entry->physical_start, 
+                entry->physical_start + (entry->number_of_pages * PAGE_SIZE),
+                mm_get_efi_memory_type_name(entry->type),
+                region_pages);
+        
+        // Mark each page in this region as free
+        for (uint64_t phys = region_start; phys < region_end; phys += PAGE_SIZE) {
+            uint64_t page = (phys - mm_state.memory_start) / PAGE_SIZE;
+            if (page < mm_state.total_pages && is_page_allocated(page)) {
+                clear_page_bit(page);
+                mm_state.free_pages++;
+                pages_marked_free++;
+            }
+        }
+    }
+    
+    kprintf("  Marked %lu pages as free from UEFI usable regions\n", pages_marked_free);
+}
+
 static void reserve_uefi_memory_regions(void) {
     if (g_uefi_memory_map.entry_count == 0) {
         kprintf("  WARNING: No UEFI memory map available!\n");
@@ -429,8 +491,17 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
             pt_pool_phys_start, mm_state.memory_start,
             pt_pool_size, pt_pool_size_bytes / (1024*1024));
     
-    // End of managed memory is total RAM
+    // End of managed memory is total RAM, but limited to what the direct map covers
+    // The bootloader sets up a 16GB direct map (phys 0 - 16GB at virt 0xFFFF880000000000)
+    // We cannot allocate physical pages beyond this because phys_to_virt() won't work
+    #define DIRECT_MAP_LIMIT (16ULL * 1024 * 1024 * 1024)  // 16GB
     mm_state.memory_end = memory_size;
+    if (mm_state.memory_end > DIRECT_MAP_LIMIT) {
+        kprintf("  NOTE: Limiting managed memory to 16GB (direct map limit)\n");
+        kprintf("  System has %lu MB but only %lu MB is usable\n",
+                memory_size / (1024*1024), DIRECT_MAP_LIMIT / (1024*1024));
+        mm_state.memory_end = DIRECT_MAP_LIMIT;
+    }
     
     // Sanity check
     if (mm_state.memory_end <= mm_state.memory_start) {
@@ -455,9 +526,11 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     kprintf("  Bitmap at: %p (size: %lu bytes)\n", 
            mm_state.physical_bitmap, mm_state.bitmap_size);
 
-    // Clear bitmap (all pages free initially)
-    mm_memset(mm_state.physical_bitmap, 0, mm_state.bitmap_size);
-    mm_state.free_pages = mm_state.total_pages;
+    // CRITICAL FIX: Start with ALL pages marked as USED (allocated)
+    // This prevents allocating pages from gaps in physical RAM (like the PCI hole).
+    // Then we'll mark only pages in UEFI usable regions as free.
+    mm_memset(mm_state.physical_bitmap, 0xFF, mm_state.bitmap_size);
+    mm_state.free_pages = 0;
     
     // Initialize page reference count array
     mm_state.refcount_array_size = mm_state.total_pages * sizeof(uint16_t);
@@ -466,6 +539,12 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     
     kprintf("  Page refcounts at: %p (size: %lu bytes)\n",
            mm_state.page_refcounts, mm_state.refcount_array_size);
+    
+    // =========================================================================
+    // CRITICAL: Mark ONLY pages in UEFI usable memory regions as free.
+    // This correctly handles gaps in physical RAM (PCI hole, etc.)
+    // =========================================================================
+    mark_usable_uefi_regions();
     
     // =========================================================================
     // CRITICAL: Walk the bootloader's page tables and reserve any physical pages
