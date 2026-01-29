@@ -322,18 +322,24 @@ int signal_setup_frame(task_t* task, int sig, siginfo_t* info, struct k_sigactio
     // Save frame address in task for sigreturn to find
     task->signals.signal_frame_addr = frame_addr;
     
+    // Also update task's saved values
+    task->syscall_rsp = frame_addr;
+    task->syscall_rip = (uint64_t)act->sa_handler;
+    
+    // CRITICAL: Disable interrupts before modifying global syscall return context
+    // This prevents a race where a timer interrupt could cause a context switch
+    // to another task that overwrites these globals before we return via sysret
+    __asm__ volatile("cli" ::: "memory");
+    
     // Modify the syscall return context to call the signal handler
     // RSP = signal frame (handler should see pretcode as return address)
     // RIP = handler address
     syscall_saved_user_rsp = frame_addr;
     syscall_saved_user_rip = (uint64_t)act->sa_handler;
     
-    // Also update task's saved values
-    task->syscall_rsp = frame_addr;
-    task->syscall_rip = (uint64_t)act->sa_handler;
-    
     // Set signal pending flag - this tells syscall.asm to use signal return path
     // The value is the signal number which will be loaded into RDI
+    // NOTE: Interrupts remain disabled until after sysret in syscall.asm
     syscall_signal_pending = (uint64_t)sig;
     
     return 0;
@@ -361,18 +367,7 @@ int signal_restore_frame(task_t* task) {
     mm_memcpy(&kframe, (void*)frame_addr, sizeof(kframe));
     smap_enable();
     
-    // Restore registers to globals (output to syscall.asm) and task (for consistency)
-    syscall_saved_user_rip = kframe.rip;
-    syscall_saved_user_rsp = kframe.rsp;
-    syscall_saved_user_rflags = kframe.rflags;
-    syscall_saved_user_rbp = kframe.rbp;
-    syscall_saved_user_rbx = kframe.rbx;
-    syscall_saved_user_r12 = kframe.r12;
-    syscall_saved_user_r13 = kframe.r13;
-    syscall_saved_user_r14 = kframe.r14;
-    syscall_saved_user_r15 = kframe.r15;
-    
-    // Also update task's saved values
+    // Update task's saved values first (safe without cli)
     task->syscall_rip = kframe.rip;
     task->syscall_rsp = kframe.rsp;
     task->syscall_rflags = kframe.rflags;
@@ -389,8 +384,25 @@ int signal_restore_frame(task_t* task) {
     // Clear sigsuspend flag if set
     task->signals.in_sigsuspend = 0;
     
+    // CRITICAL: Disable interrupts before modifying global syscall return context
+    // This prevents a race where a timer interrupt could cause a context switch
+    // to another task that overwrites these globals before we return via sysret
+    __asm__ volatile("cli" ::: "memory");
+    
+    // Restore registers to globals (output to syscall.asm)
+    syscall_saved_user_rip = kframe.rip;
+    syscall_saved_user_rsp = kframe.rsp;
+    syscall_saved_user_rflags = kframe.rflags;
+    syscall_saved_user_rbp = kframe.rbp;
+    syscall_saved_user_rbx = kframe.rbx;
+    syscall_saved_user_r12 = kframe.r12;
+    syscall_saved_user_r13 = kframe.r13;
+    syscall_saved_user_r14 = kframe.r14;
+    syscall_saved_user_r15 = kframe.r15;
+    
     // Tell syscall.asm to use the restored context
     // Use special value 0xFFFFFFFFFFFFFFFF (-1) to indicate sigreturn (not a handler call)
+    // NOTE: Interrupts remain disabled until after sysret in syscall.asm
     syscall_signal_pending = 0xFFFFFFFFFFFFFFFFULL;
     
     return 0;

@@ -47,6 +47,10 @@ void system_startup(boot_info_t* boot_info) {
         memory_size = 256 * 1024 * 1024;
     }
     
+    // Store UEFI memory map before initializing memory manager
+    // This allows us to mark UEFI reserved regions as off-limits
+    mm_initialize_from_boot_info(boot_info);
+    
     mm_initialize_physical_memory(memory_size);
     mm_initialize_virtual_memory();
     mm_initialize_heap();

@@ -104,9 +104,14 @@ syscall_entry:
     mov rsi, rdi
     mov rdi, rax
     
+    ; Use RBP as frame pointer to remember where our saved registers are
+    ; This way we can find them even after sched_yield context switches
+    mov rbp, rsp                               ; RBP = top of our saved register area
+    
     and rsp, ~0xF
     sti
     call syscall_handler
+    cli                                        ; Disable interrupts for return path
     
     ; Check if signal delivery modified the return context
     ; If syscall_signal_pending is non-zero, use modified context for signal handler
@@ -115,10 +120,9 @@ syscall_entry:
     jnz .signal_return
     
     ; Normal syscall return path
-    ; Restore stack to where registers were saved
-    ; Use per-task kernel stack
-    mov rsp, [rel g_current_kernel_stack]
-    sub rsp, 16*8
+    ; Restore RSP from RBP (which was preserved through any context switches
+    ; since it's a callee-saved register)
+    mov rsp, rbp
     
     ; Store return value where rax will be popped from
     ; Stack layout (from rsp):

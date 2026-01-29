@@ -96,31 +96,106 @@ typedef struct {
 #define KERNEL_START     0x0
 
 // Physical memory locations for page tables
-// IMPORTANT: All page tables must be allocated BELOW the kernel's memory pool start
-// (which begins at ~0x1ba5000) to avoid being allocated as user memory later.
-// We reserve 0x1000 - 0x100000 (1MB) for all bootloader page tables.
-#define PML4_ADDRESS    0x1000
-#define PDPT_ADDRESS    0x2000
-#define PD_ADDRESS      0x3000   // Page directories start here (need multiple for 4GB)
-#define PT_ADDRESS      0x8000   // Page tables start here (after page directories)
+// These will be dynamically allocated from UEFI at low addresses
+// to avoid conflicts with VMware's EfiRuntimeServicesData regions.
+// All page tables are allocated using AllocateMaxAddress to get low addresses.
 
-// Higher half page tables  
-#define PDPT_HIGH_ADDRESS  0x9000
-#define PD_HIGH_ADDRESS    0xA000
-#define PT_HIGH_ADDRESS    0xB000
-
-// Direct map page tables (for PHYS_MAP_BASE = 0xFFFF880000000000)
-// PML4 index 272 covers 0xFFFF880000000000 - 0xFFFF887FFFFFFFFF
-#define PDPT_PHYSMAP_ADDRESS  0x10000
-#define PD_PHYSMAP_ADDRESS    0x11000   // 4 PDs for 4GB at 0x11000-0x14FFF
-
-// Reserved area for additional page tables allocated during boot
-// This covers 0x20000 - 0x100000 (896KB = ~224 page tables)
-#define PT_POOL_START         0x20000
-#define PT_POOL_END           0x100000
+// Dynamic page table addresses (set by init_page_tables())
+static EFI_PHYSICAL_ADDRESS g_pml4_addr = 0;
+static EFI_PHYSICAL_ADDRESS g_pdpt_addr = 0;
+static EFI_PHYSICAL_ADDRESS g_pd_addr[4] = {0};    // 4 page directories for identity map (4GB)
+static EFI_PHYSICAL_ADDRESS g_pdpt_high_addr = 0;
+static EFI_PHYSICAL_ADDRESS g_pd_high_addr = 0;
+static EFI_PHYSICAL_ADDRESS g_pt_high_addr = 0;
+static EFI_PHYSICAL_ADDRESS g_pdpt_physmap_addr = 0;
+static EFI_PHYSICAL_ADDRESS g_pd_physmap_addr[4] = {0}; // 4 page directories for physmap (4GB)
 
 // Trampoline address (will be allocated below kernel)
 static EFI_PHYSICAL_ADDRESS trampoline_addr = 0;
+
+// Serial port I/O for debug output (COM1 = 0x3F8)
+#define COM1_PORT 0x3F8
+
+static inline void outb(UINT16 port, UINT8 val) {
+    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline UINT8 inb(UINT16 port) {
+    UINT8 ret;
+    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+static void serial_init(void) {
+    outb(COM1_PORT + 1, 0x00);    // Disable interrupts
+    outb(COM1_PORT + 3, 0x80);    // Enable DLAB
+    outb(COM1_PORT + 0, 0x03);    // 38400 baud (low byte)
+    outb(COM1_PORT + 1, 0x00);    // (high byte)
+    outb(COM1_PORT + 3, 0x03);    // 8 bits, no parity, one stop bit
+    outb(COM1_PORT + 2, 0xC7);    // Enable FIFO
+    outb(COM1_PORT + 4, 0x0B);    // IRQs enabled, RTS/DSR set
+}
+
+static void serial_putc(char c) {
+    while ((inb(COM1_PORT + 5) & 0x20) == 0);  // Wait for transmit buffer empty
+    outb(COM1_PORT, c);
+}
+
+static void serial_puts(const char* s) {
+    while (*s) {
+        if (*s == '\n') serial_putc('\r');
+        serial_putc(*s++);
+    }
+}
+
+static void serial_puthex(UINT64 val) {
+    const char hex[] = "0123456789abcdef";
+    char buf[17];
+    buf[16] = 0;
+    for (int i = 15; i >= 0; i--) {
+        buf[i] = hex[val & 0xF];
+        val >>= 4;
+    }
+    serial_puts("0x");
+    serial_puts(buf);
+}
+
+static void serial_putdec(UINT64 val) {
+    char buf[21];
+    buf[20] = 0;
+    int i = 19;
+    if (val == 0) {
+        serial_putc('0');
+        return;
+    }
+    while (val > 0 && i >= 0) {
+        buf[i--] = '0' + (val % 10);
+        val /= 10;
+    }
+    serial_puts(&buf[i+1]);
+}
+
+// Memory type names for debug output
+static const char* efi_memory_type_name(UINT32 type) {
+    switch (type) {
+        case 0: return "EfiReservedMemoryType";
+        case 1: return "EfiLoaderCode";
+        case 2: return "EfiLoaderData";
+        case 3: return "EfiBootServicesCode";
+        case 4: return "EfiBootServicesData";
+        case 5: return "EfiRuntimeServicesCode";
+        case 6: return "EfiRuntimeServicesData";
+        case 7: return "EfiConventionalMemory";
+        case 8: return "EfiUnusableMemory";
+        case 9: return "EfiACPIReclaimMemory";
+        case 10: return "EfiACPIMemoryNVS";
+        case 11: return "EfiMemoryMappedIO";
+        case 12: return "EfiMemoryMappedIOPortSpace";
+        case 13: return "EfiPalCode";
+        case 14: return "EfiPersistentMemory";
+        default: return "Unknown";
+    }
+}
 
 // Page table entry flags
 #define PAGE_PRESENT    (1ULL << 0)
@@ -138,7 +213,7 @@ static EFI_PHYSICAL_ADDRESS trampoline_addr = 0;
 // We'll allocate a contiguous block from UEFI in low memory during init
 static EFI_PHYSICAL_ADDRESS pt_pool_base = 0;
 static EFI_PHYSICAL_ADDRESS pt_pool_next = 0;
-static UINTN pt_pool_pages = 64;  // 64 pages = 256KB for page tables
+static UINTN pt_pool_pages = 128;  // 128 pages = 512KB for page tables (increased for all initial tables)
 
 static EFI_STATUS init_page_table_pool(void) {
     // Allocate page table pool in low memory (below 1MB to be safe)
@@ -171,7 +246,8 @@ static EFI_STATUS init_page_table_pool(void) {
     // Zero the entire pool
     uefi_call_wrapper(BS->SetMem, 3, (VOID*)pt_pool_base, pt_pool_pages * 4096, 0);
     
-    Print(L"Page table pool allocated at 0x%lx (%lu pages)\r\n", pt_pool_base, pt_pool_pages);
+    Print(L"Page table pool allocated at 0x%lx (%lu pages, %lu KB)\r\n", 
+          pt_pool_base, pt_pool_pages, (pt_pool_pages * 4096) / 1024);
     
     return EFI_SUCCESS;
 }
@@ -194,6 +270,67 @@ static EFI_PHYSICAL_ADDRESS allocate_page_table(void) {
     return addr;
 }
 
+// Allocate all initial page tables from the pool
+static EFI_STATUS init_page_tables(void) {
+    // First allocate the pool
+    EFI_STATUS status = init_page_table_pool();
+    if (EFI_ERROR(status)) {
+        return status;
+    }
+    
+    // Allocate PML4 (one page)
+    g_pml4_addr = allocate_page_table();
+    if (!g_pml4_addr) return EFI_OUT_OF_RESOURCES;
+    
+    // Allocate PDPT for identity mapping (one page)
+    g_pdpt_addr = allocate_page_table();
+    if (!g_pdpt_addr) return EFI_OUT_OF_RESOURCES;
+    
+    // Allocate 4 page directories for identity mapping (4GB)
+    for (int i = 0; i < 4; i++) {
+        g_pd_addr[i] = allocate_page_table();
+        if (!g_pd_addr[i]) return EFI_OUT_OF_RESOURCES;
+    }
+    
+    // Allocate higher half page tables
+    g_pdpt_high_addr = allocate_page_table();
+    if (!g_pdpt_high_addr) return EFI_OUT_OF_RESOURCES;
+    
+    g_pd_high_addr = allocate_page_table();
+    if (!g_pd_high_addr) return EFI_OUT_OF_RESOURCES;
+    
+    g_pt_high_addr = allocate_page_table();
+    if (!g_pt_high_addr) return EFI_OUT_OF_RESOURCES;
+    
+    // Allocate physmap page tables
+    g_pdpt_physmap_addr = allocate_page_table();
+    if (!g_pdpt_physmap_addr) return EFI_OUT_OF_RESOURCES;
+    
+    // Allocate 4 page directories for physmap (4GB)
+    for (int i = 0; i < 4; i++) {
+        g_pd_physmap_addr[i] = allocate_page_table();
+        if (!g_pd_physmap_addr[i]) return EFI_OUT_OF_RESOURCES;
+    }
+    
+    Print(L"Page tables allocated dynamically:\r\n");
+    Print(L"  PML4:         0x%lx\r\n", g_pml4_addr);
+    Print(L"  PDPT (low):   0x%lx\r\n", g_pdpt_addr);
+    Print(L"  PD (low):     0x%lx - 0x%lx\r\n", g_pd_addr[0], g_pd_addr[3]);
+    Print(L"  PDPT (high):  0x%lx\r\n", g_pdpt_high_addr);
+    Print(L"  PD (high):    0x%lx\r\n", g_pd_high_addr);
+    Print(L"  PT (high):    0x%lx\r\n", g_pt_high_addr);
+    Print(L"  PDPT (phys):  0x%lx\r\n", g_pdpt_physmap_addr);
+    Print(L"  PD (phys):    0x%lx - 0x%lx\r\n", g_pd_physmap_addr[0], g_pd_physmap_addr[3]);
+    
+    serial_puts("Page tables allocated:\n");
+    serial_puts("  PML4:       "); serial_puthex(g_pml4_addr); serial_puts("\n");
+    serial_puts("  PDPT (low): "); serial_puthex(g_pdpt_addr); serial_puts("\n");
+    serial_puts("  PDPT (high):"); serial_puthex(g_pdpt_high_addr); serial_puts("\n");
+    serial_puts("  PDPT (phys):"); serial_puthex(g_pdpt_physmap_addr); serial_puts("\n");
+    
+    return EFI_SUCCESS;
+}
+
 // External trampoline function from trampoline.S
 extern void trampoline_jump(UINT64 kernel_entry, void* boot_info, UINT64 pml4_addr);
 
@@ -202,15 +339,15 @@ extern char trampoline_jump_end[];
 
 // Set up higher half kernel paging with identity mapping for low memory
 static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size) {
-    page_table_t *pml4 = (page_table_t*)PML4_ADDRESS;
-    page_table_t *pdpt_low = (page_table_t*)PDPT_ADDRESS;
+    page_table_t *pml4 = (page_table_t*)g_pml4_addr;
+    page_table_t *pdpt_low = (page_table_t*)g_pdpt_addr;
     
     // Higher half page tables
-    page_table_t *pdpt_high = (page_table_t*)PDPT_HIGH_ADDRESS;
-    page_table_t *pd_high = (page_table_t*)PD_HIGH_ADDRESS;
-    page_table_t *pt_high = (page_table_t*)PT_HIGH_ADDRESS;
+    page_table_t *pdpt_high = (page_table_t*)g_pdpt_high_addr;
+    page_table_t *pd_high = (page_table_t*)g_pd_high_addr;
+    page_table_t *pt_high = (page_table_t*)g_pt_high_addr;
     
-    // Clear main page tables
+    // Clear main page tables (they should already be zeroed from pool, but be safe)
     for (int i = 0; i < 512; i++) {
         pml4->entries[i] = 0;
         pdpt_low->entries[i] = 0;
@@ -221,16 +358,16 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
     
     // Set up PML4 entries
     // Entry 0: Low memory identity mapping (0x0 - 0x7FFFFFFFFF) - EXECUTABLE
-    pml4->entries[0] = PDPT_ADDRESS | PAGE_RWX;
+    pml4->entries[0] = g_pdpt_addr | PAGE_RWX;
     
     // Entry 511: Higher half mapping (0xFFFFFF8000000000 - 0xFFFFFFFFFFFFFFFF)
-    pml4->entries[511] = PDPT_HIGH_ADDRESS | PAGE_RWX;
+    pml4->entries[511] = g_pdpt_high_addr | PAGE_RWX;
     
     // Set up low memory identity mapping for first 4GB
     // 4GB = 4 PDPT entries (each covers 1GB)
     for (int pdpt_i = 0; pdpt_i < 4; pdpt_i++) {
-        // Allocate page directory for this 1GB region
-        EFI_PHYSICAL_ADDRESS pd_addr = PD_ADDRESS + (pdpt_i * 4096);
+        // Use pre-allocated page directory for this 1GB region
+        EFI_PHYSICAL_ADDRESS pd_addr = g_pd_addr[pdpt_i];
         page_table_t *pd = (page_table_t*)pd_addr;
         
         // Clear page directory
@@ -266,8 +403,8 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
     UINT64 pt_index = (kernel_virt >> 12) & 0x1FF;    // Should be 0
     
     // Set up higher half page table hierarchy
-    pdpt_high->entries[pdpt_index] = PD_HIGH_ADDRESS | PAGE_RWX;
-    pd_high->entries[pd_index] = PT_HIGH_ADDRESS | PAGE_RWX;
+    pdpt_high->entries[pdpt_index] = g_pd_high_addr | PAGE_RWX;
+    pd_high->entries[pd_index] = g_pt_high_addr | PAGE_RWX;
     
     // Map kernel pages in higher half
     UINT64 kernel_pages = (kernel_size + 4095) / 4096;
@@ -390,7 +527,7 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
     // PML4 index 272 = (0xFFFF880000000000 >> 39) & 0x1FF
     // ===================================================================
     {
-        page_table_t *pdpt_physmap = (page_table_t*)PDPT_PHYSMAP_ADDRESS;
+        page_table_t *pdpt_physmap = (page_table_t*)g_pdpt_physmap_addr;
         
         // Clear the PDPT for direct map
         for (int i = 0; i < 512; i++) {
@@ -398,12 +535,12 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
         }
         
         // Set up PML4 entry 272 to point to direct map PDPT
-        pml4->entries[272] = PDPT_PHYSMAP_ADDRESS | PAGE_RWX;
+        pml4->entries[272] = g_pdpt_physmap_addr | PAGE_RWX;
         
         // Map first 4GB of physical memory using 2MB pages
         for (int pdpt_i = 0; pdpt_i < 4; pdpt_i++) {
-            // Allocate page directory for this 1GB region
-            EFI_PHYSICAL_ADDRESS pd_addr = PD_PHYSMAP_ADDRESS + (pdpt_i * 4096);
+            // Use pre-allocated page directory for this 1GB region
+            EFI_PHYSICAL_ADDRESS pd_addr = g_pd_physmap_addr[pdpt_i];
             page_table_t *pd = (page_table_t*)pd_addr;
             
             // Clear page directory
@@ -511,6 +648,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     
     // Initialize GNU-EFI library
     InitializeLib(ImageHandle, SystemTable);
+    
+    // Initialize serial port for debug output (VMware)
+    serial_init();
+    serial_puts("\n\n=== LikeOS-64 UEFI Bootloader starting ===\n");
     
     Print(L"LikeOS-64 Enhanced UEFI Bootloader\r\n");
     Print(L"===================================\r\n");
@@ -812,8 +953,33 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         
         Print(L"Processing %lu memory map entries...\r\n", num_entries);
         
+        // Dump full memory map to serial for VMware debugging
+        serial_puts("\n=== UEFI MEMORY MAP ===\n");
+        serial_puts("Entries: ");
+        serial_putdec(num_entries);
+        serial_puts(", Descriptor size: ");
+        serial_putdec(descriptor_size);
+        serial_puts("\n\n");
+        
         for (UINTN i = 0; i < num_entries && g_boot_info.mem_info.entry_count < MAX_MEMORY_MAP_ENTRIES; i++) {
             EFI_MEMORY_DESCRIPTOR *desc = (EFI_MEMORY_DESCRIPTOR*)((UINT8*)memory_map + i * descriptor_size);
+            
+            // Dump to serial
+            serial_puts("[");
+            serial_putdec(i);
+            serial_puts("] ");
+            serial_puthex(desc->PhysicalStart);
+            serial_puts(" - ");
+            serial_puthex(desc->PhysicalStart + desc->NumberOfPages * 4096);
+            serial_puts(" (");
+            serial_putdec(desc->NumberOfPages);
+            serial_puts(" pages, ");
+            serial_putdec(desc->NumberOfPages * 4096 / 1024);
+            serial_puts(" KB) Type=");
+            serial_putdec(desc->Type);
+            serial_puts(" ");
+            serial_puts(efi_memory_type_name(desc->Type));
+            serial_puts("\n");
             
             // Copy entry to boot_info
             memory_map_entry_t *entry = &g_boot_info.mem_info.entries[g_boot_info.mem_info.entry_count];
@@ -830,6 +996,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             
             g_boot_info.mem_info.entry_count++;
         }
+        
+        serial_puts("\nTotal usable memory: ");
+        serial_putdec(g_boot_info.mem_info.total_memory / (1024 * 1024));
+        serial_puts(" MB\n");
+        serial_puts("=== END MEMORY MAP ===\n\n");
         
         Print(L"Stored %d memory entries, total usable: %lu MB\r\n", 
               g_boot_info.mem_info.entry_count, 
@@ -851,10 +1022,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     // Step 2: Set up higher half paging (including identity mapping for low memory)
     Print(L"Setting up higher half kernel paging...\r\n");
     
-    // Initialize page table pool first
-    status = init_page_table_pool();
+    // Initialize and allocate all page tables from UEFI at low addresses
+    status = init_page_tables();
     if (EFI_ERROR(status)) {
-        Print(L"Failed to initialize page table pool\r\n");
+        Print(L"Failed to initialize page tables\r\n");
         return status;
     }
     
@@ -887,7 +1058,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     // - Load CR3 with our page tables  
     // - Jump to the kernel's higher half virtual address
     trampoline_func_t trampoline = (trampoline_func_t)trampoline_addr;
-    trampoline(elf_header->e_entry, &g_boot_info, PML4_ADDRESS);
+    trampoline(elf_header->e_entry, &g_boot_info, g_pml4_addr);
     
     // Should never reach here
     return EFI_SUCCESS;

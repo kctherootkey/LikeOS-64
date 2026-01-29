@@ -44,6 +44,9 @@ static struct {
     memory_stats_t stats;           // Memory statistics
 } mm_state = {0};
 
+// UEFI memory map storage - saved from boot_info for later use
+static memory_map_info_t g_uefi_memory_map = {0};
+
 // I/O port functions
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
@@ -236,6 +239,115 @@ static void reserve_bootloader_mapped_pages(void) {
     kprintf("  Reserved %lu bootloader-mapped pages in managed range\n", pages_reserved);
 }
 
+// ============================================================================
+// UEFI MEMORY MAP HANDLING
+// Reserve all physical memory regions that are marked as non-usable by UEFI.
+// This prevents us from allocating memory that is used by:
+//   - UEFI Runtime Services (firmware callbacks)
+//   - ACPI tables and NVS data
+//   - Memory-mapped I/O regions
+//   - Reserved firmware memory
+// ============================================================================
+
+static const char* mm_get_efi_memory_type_name(uint32_t type) {
+    switch (type) {
+        case EFI_RESERVED_MEMORY_TYPE:        return "Reserved";
+        case EFI_LOADER_CODE:                 return "LoaderCode";
+        case EFI_LOADER_DATA:                 return "LoaderData";
+        case EFI_BOOT_SERVICES_CODE:          return "BootServicesCode";
+        case EFI_BOOT_SERVICES_DATA:          return "BootServicesData";
+        case EFI_RUNTIME_SERVICES_CODE:       return "RuntimeServicesCode";
+        case EFI_RUNTIME_SERVICES_DATA:       return "RuntimeServicesData";
+        case EFI_CONVENTIONAL_MEMORY:         return "ConventionalMemory";
+        case EFI_UNUSABLE_MEMORY:             return "UnusableMemory";
+        case EFI_ACPI_RECLAIM_MEMORY:         return "ACPIReclaimMemory";
+        case EFI_ACPI_MEMORY_NVS:             return "ACPIMemoryNVS";
+        case EFI_MEMORY_MAPPED_IO:            return "MemoryMappedIO";
+        case EFI_MEMORY_MAPPED_IO_PORT_SPACE: return "MMIOPortSpace";
+        case EFI_PAL_CODE:                    return "PALCode";
+        case EFI_PERSISTENT_MEMORY:           return "PersistentMemory";
+        default:                              return "Unknown";
+    }
+}
+
+static void reserve_uefi_memory_regions(void) {
+    if (g_uefi_memory_map.entry_count == 0) {
+        kprintf("  WARNING: No UEFI memory map available!\n");
+        return;
+    }
+    
+    uint64_t pages_reserved = 0;
+    uint64_t reserved_regions = 0;
+    
+    kprintf("  Reserving UEFI non-usable memory regions:\n");
+    
+    for (uint32_t i = 0; i < g_uefi_memory_map.entry_count; i++) {
+        memory_map_entry_t* entry = &g_uefi_memory_map.entries[i];
+        
+        // Skip usable memory types - these are safe to allocate from
+        if (mm_is_usable_memory_type(entry->type)) {
+            continue;
+        }
+        
+        // This is a reserved/non-usable region - mark all pages as allocated
+        uint64_t region_start = entry->physical_start;
+        uint64_t region_end = region_start + (entry->number_of_pages * PAGE_SIZE);
+        
+        // Only process regions that overlap with our managed memory range
+        if (region_end <= mm_state.memory_start || region_start >= mm_state.memory_end) {
+            continue;  // Region is outside our managed range
+        }
+        
+        // Clamp to our managed range
+        if (region_start < mm_state.memory_start) {
+            region_start = mm_state.memory_start;
+        }
+        if (region_end > mm_state.memory_end) {
+            region_end = mm_state.memory_end;
+        }
+        
+        uint64_t region_pages = (region_end - region_start) / PAGE_SIZE;
+        
+        kprintf("    [%02u] 0x%lx-0x%lx (%s): %lu pages\n",
+                i, entry->physical_start, 
+                entry->physical_start + (entry->number_of_pages * PAGE_SIZE),
+                mm_get_efi_memory_type_name(entry->type),
+                region_pages);
+        
+        // Reserve each page in this region
+        for (uint64_t phys = region_start; phys < region_end; phys += PAGE_SIZE) {
+            reserve_physical_page(phys);
+            pages_reserved++;
+        }
+        reserved_regions++;
+    }
+    
+    kprintf("  Reserved %lu pages across %lu UEFI reserved regions\n",
+            pages_reserved, reserved_regions);
+}
+
+// Initialize memory manager with UEFI memory map from boot_info
+// This should be called before mm_initialize_physical_memory if boot_info is available
+void mm_initialize_from_boot_info(boot_info_t* boot_info) {
+    if (!boot_info) {
+        kprintf("WARNING: No boot_info provided, UEFI memory map not available\n");
+        return;
+    }
+    
+    // Copy the memory map to our static storage
+    g_uefi_memory_map.entry_count = boot_info->mem_info.entry_count;
+    g_uefi_memory_map.descriptor_size = boot_info->mem_info.descriptor_size;
+    g_uefi_memory_map.total_memory = boot_info->mem_info.total_memory;
+    
+    for (uint32_t i = 0; i < boot_info->mem_info.entry_count && i < MAX_MEMORY_MAP_ENTRIES; i++) {
+        g_uefi_memory_map.entries[i] = boot_info->mem_info.entries[i];
+    }
+    
+    kprintf("Stored UEFI memory map: %u entries, %lu MB total\n",
+            g_uefi_memory_map.entry_count,
+            g_uefi_memory_map.total_memory / (1024 * 1024));
+}
+
 // Find first free bit in bitmap
 static uint64_t find_free_page(void) {
     for (uint64_t i = 0; i < mm_state.bitmap_size / sizeof(uint32_t); i++) {
@@ -361,6 +473,13 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     // backing kernel code, heap, bitmap, or refcount array.
     // =========================================================================
     reserve_bootloader_mapped_pages();
+    
+    // =========================================================================
+    // CRITICAL: Reserve all UEFI non-usable memory regions (Runtime Services,
+    // ACPI, MMIO, etc.). This prevents us from allocating memory that the
+    // firmware still needs for runtime callbacks.
+    // =========================================================================
+    reserve_uefi_memory_regions();
     
     kprintf("  Free pages after reservations: %lu\n", mm_state.free_pages);
     kprintf("Physical Memory Manager initialized\n");

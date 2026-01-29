@@ -90,6 +90,7 @@ typedef struct task {
     uint64_t syscall_r13;           // Callee-saved
     uint64_t syscall_r14;           // Callee-saved
     uint64_t syscall_r15;           // Callee-saved
+    uint64_t syscall_kernel_rsp;    // Kernel RSP for syscall return (set before call)
     
     // Current working directory
     char cwd[256];

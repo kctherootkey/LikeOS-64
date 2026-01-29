@@ -70,8 +70,37 @@ typedef struct {
     uint64_t attribute;
 } memory_map_entry_t;
 
-// UEFI memory type constants
-#define EFI_CONVENTIONAL_MEMORY 7
+// UEFI memory type constants (matching EfiMemoryType from UEFI spec)
+#define EFI_RESERVED_MEMORY_TYPE        0   // Not usable
+#define EFI_LOADER_CODE                 1   // Usable after ExitBootServices
+#define EFI_LOADER_DATA                 2   // Usable after ExitBootServices
+#define EFI_BOOT_SERVICES_CODE          3   // Usable after ExitBootServices
+#define EFI_BOOT_SERVICES_DATA          4   // Usable after ExitBootServices
+#define EFI_RUNTIME_SERVICES_CODE       5   // RESERVED - runtime firmware code
+#define EFI_RUNTIME_SERVICES_DATA       6   // RESERVED - runtime firmware data
+#define EFI_CONVENTIONAL_MEMORY         7   // Free usable memory
+#define EFI_UNUSABLE_MEMORY             8   // Memory with errors, don't use
+#define EFI_ACPI_RECLAIM_MEMORY         9   // ACPI tables, can reclaim after parsing
+#define EFI_ACPI_MEMORY_NVS             10  // RESERVED - ACPI firmware needs this
+#define EFI_MEMORY_MAPPED_IO            11  // RESERVED - MMIO regions
+#define EFI_MEMORY_MAPPED_IO_PORT_SPACE 12  // RESERVED - MMIO port space
+#define EFI_PAL_CODE                    13  // RESERVED - processor specific
+#define EFI_PERSISTENT_MEMORY           14  // Persistent memory (NVDIMM)
+#define EFI_MAX_MEMORY_TYPE             15
+
+// Helper to check if memory type is usable (safe to allocate from)
+static inline int mm_is_usable_memory_type(uint32_t type) {
+    switch (type) {
+        case EFI_LOADER_CODE:
+        case EFI_LOADER_DATA:
+        case EFI_BOOT_SERVICES_CODE:
+        case EFI_BOOT_SERVICES_DATA:
+        case EFI_CONVENTIONAL_MEMORY:
+            return 1;  // These are safe to use after ExitBootServices
+        default:
+            return 0;  // Everything else is reserved
+    }
+}
 
 // Memory map information passed from bootloader
 #define MAX_MEMORY_MAP_ENTRIES 256
