@@ -8,12 +8,14 @@
 #include "../../include/kernel/pipe.h"
 #include "../../include/kernel/tty.h"
 #include "../../include/kernel/signal.h"
+#include "../../include/kernel/timer.h"
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
 
 
 #define SCHED_SLICE_TICKS 10
+#define SCHED_BOOTSTRAP_INTERVAL 10  // Run bootstrap every N yields (was 50)
 
 static task_t g_bootstrap_task;
 static task_t g_idle_task;
@@ -22,6 +24,7 @@ static uint8_t g_bootstrap_stack[8192] __attribute__((aligned(16)));
 static task_t* g_current = 0;
 static int g_next_id = 1;
 static uint64_t g_slice_accum = 0;
+static uint64_t g_yield_count = 0;  // Counter to ensure bootstrap runs periodically
 static uint64_t* g_kernel_pml4 = 0;
 static uint64_t g_default_kernel_stack = 0;
 
@@ -265,10 +268,16 @@ static task_t* pick_next(task_t* start, int from_timer) {
     task_t* idle_candidate = 0;
     task_t* bootstrap_candidate = 0;
     
+    // First, check the start task itself (in case it's bootstrap and ready)
+    if (is_bootstrap_task(start) && (start->state == TASK_READY || start->state == TASK_RUNNING)) {
+        bootstrap_candidate = start;
+    }
+    
     while (it != start) {
         if (it->state == TASK_READY || it->state == TASK_RUNNING) {
             // Prefer regular user tasks first
             if (!is_idle_task(it) && !is_bootstrap_task(it)) {
+                g_yield_count = 0;  // Reset counter when switching to user task
                 return it;
             }
             if (is_idle_task(it)) {
@@ -280,6 +289,13 @@ static task_t* pick_next(task_t* start, int from_timer) {
         }
         it = it->next;
         if (!it) break;
+    }
+    
+    // Periodically let bootstrap run for system housekeeping (shell, USB polling)
+    // This prevents user tasks from completely starving the kernel loop
+    if (bootstrap_candidate && g_yield_count >= SCHED_BOOTSTRAP_INTERVAL) {
+        g_yield_count = 0;
+        return bootstrap_candidate;
     }
     
     // If current task is a user task and ready, keep running it
@@ -306,11 +322,16 @@ void sched_tick(void) {
     g_slice_accum++;
 }
 
+// Debug: track yield calls for watchdog
+static volatile uint64_t g_total_yields = 0;
+
 void sched_yield(void) {
     if (!g_current) {
         return;
     }
     g_slice_accum = 0;
+    g_yield_count++;  // Track yields to ensure bootstrap runs periodically
+    g_total_yields++;  // Debug counter
     task_t* next = pick_next(g_current, 0);  // from_timer=0
     if (next == g_current) {
         return;
@@ -836,3 +857,30 @@ int sched_pgid_exists(int pgid) {
     return 0;
 }
 
+// Debug: Dump all tasks and their states
+extern volatile uint64_t g_irq0_count;
+extern volatile uint64_t g_total_irq_count;
+extern uint64_t timer_ticks(void);
+
+void sched_dump_tasks(void) {
+    static const char* state_names[] = { "READY", "RUN", "BLOCK", "ZOMBIE", "STOP" };
+    kprintf("\n=== Debug Dump (Ctrl+D) ===\n");
+    kprintf("Ticks: %llu  IRQ0: %llu  TotalIRQ: %llu  Yields: %llu\n", 
+            timer_ticks(), g_irq0_count, g_total_irq_count, g_total_yields);
+    kprintf("FreeMem: %llu KB\n", mm_get_free_pages() * 4);
+    kprintf("PID  PPID STATE   PGID\n");
+    if (!g_current) {
+        kprintf("(no tasks)\n");
+        return;
+    }
+    task_t* start = g_current;
+    task_t* t = g_current;
+    do {
+        const char* sn = (t->state <= TASK_STOPPED) ? state_names[t->state] : "???";
+        int ppid = t->parent ? t->parent->id : 0;
+        char marker = (t == g_current) ? '*' : ' ';
+        kprintf("%c%-4d %-4d %-7s %-4d\n", marker, t->id, ppid, sn, t->pgid);
+        t = t->next;
+    } while (t && t != start);
+    kprintf("===============================\n");
+}

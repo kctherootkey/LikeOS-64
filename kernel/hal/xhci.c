@@ -1018,13 +1018,32 @@ void xhci_process_events(xhci_controller_t* ctrl) {
     xhci_ring_t* ring = ctrl->event_ring;
     int processed = 0;
     
+    // Memory barrier to ensure we see DMA-written events
+    __asm__ volatile("mfence" ::: "memory");
+    
     while (processed < XHCI_RING_SIZE) {
         xhci_trb_t* trb = &ring->trbs[ring->dequeue];
         
         // Check cycle bit matches expected
         uint8_t trb_cycle = (trb->control & TRB_FLAG_CYCLE) ? 1 : 0;
         if (trb_cycle != ring->cycle) {
-            break;  // No more events
+            // Check if EINT is set but we have cycle mismatch - might need resync
+            uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+            if ((usbsts & XHCI_STS_EINT) && processed == 0) {
+                // EINT set but no events - try toggling cycle bit
+                ring->cycle ^= 1;
+                trb_cycle = (trb->control & TRB_FLAG_CYCLE) ? 1 : 0;
+                if (trb_cycle == ring->cycle) {
+                    // Fixed! Continue processing
+                    //kprintf("[XHCI] Event ring cycle resync at deq=%d\n", ring->dequeue);
+                } else {
+                    // Still mismatched, revert and break
+                    ring->cycle ^= 1;
+                    break;
+                }
+            } else {
+                break;  // No more events
+            }
         }
         
         uint8_t trb_type = (trb->control >> 10) & 0x3F;
@@ -1909,6 +1928,48 @@ int xhci_bulk_transfer_in(xhci_controller_t* ctrl, usb_device_t* dev,
         
         delay_us(100);  // 100 microsecond delay for ultra-fast response
     }
+    
+    // Debug: transfer timed out - dump comprehensive state
+    kprintf("[XHCI] ===== BULK IN TIMEOUT =====\n");
+    kprintf("[XHCI] slot=%d dci=%d len=%d ring_enq=%d\n", slot, dci, len, ring->enqueue);
+    
+    // Check endpoint context state
+    if (ctrl->dcbaa && slot > 0) {
+        uint64_t* dev_ctx = (uint64_t*)phys_to_virt(ctrl->dcbaa[slot]);
+        if (dev_ctx) {
+            uint32_t* ep_ctx = (uint32_t*)((uint8_t*)dev_ctx + 32 * dci);
+            uint32_t ep_state = ep_ctx[0] & 0x7;
+            uint64_t ep_deq = ((uint64_t)ep_ctx[3] << 32) | (ep_ctx[2] & ~0xF);
+            kprintf("[XHCI] EP_state=%d (0=Dis 1=Run 2=Halt 3=Stop 4=Err) deq=0x%lx\n",
+                    ep_state, ep_deq);
+        }
+    }
+    
+    // Check event ring state
+    if (ctrl->event_ring) {
+        xhci_ring_t* er = ctrl->event_ring;
+        volatile xhci_trb_t* trb = &er->trbs[er->dequeue];
+        uint32_t ctrl_field = trb->control;
+        int trb_cycle = ctrl_field & 1;
+        int trb_type = (ctrl_field >> 10) & 0x3F;
+        kprintf("[XHCI] Event ring: deq=%d cycle=%d trb_cycle=%d trb_type=%d\n",
+                er->dequeue, er->cycle, trb_cycle, trb_type);
+    }
+    
+    // Check transfer ring TRBs around enqueue
+    if (ring->trbs) {
+        int prev = (ring->enqueue > 0) ? ring->enqueue - 1 : XHCI_RING_SIZE - 2;
+        volatile xhci_trb_t* prev_trb = &ring->trbs[prev];
+        kprintf("[XHCI] Xfer TRB[%d]: addr=0x%lx len=%d ctrl=0x%x\n",
+                prev, prev_trb->param, prev_trb->status & 0x1FFFF, prev_trb->control);
+    }
+    
+    // Check USB status register
+    uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+    uint32_t usbcmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
+    kprintf("[XHCI] USBSTS=0x%x USBCMD=0x%x (HCH=%d HSE=%d)\n",
+            usbsts, usbcmd, (usbsts >> 0) & 1, (usbsts >> 2) & 1);
+    kprintf("[XHCI] ==========================\n");
     
     ctrl->pending_xfer[slot - 1][dci] = NULL;
     return ST_TIMEOUT;

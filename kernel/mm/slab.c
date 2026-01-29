@@ -31,15 +31,101 @@ static bool slab_initialized = false;
 #define SLAB_VIRT_END       0xFFFFFFFF90000000ULL
 static uint64_t slab_next_virt_addr = SLAB_VIRT_BASE;
 
-// Allocate a virtual address for a slab page
+// Free virtual address range tracking for large allocations
+// Linked list of freed ranges that can be reused (with coalescing)
+#define SLAB_MAX_FREE_RANGES 1024
+typedef struct free_virt_range {
+    uint64_t start;
+    uint64_t size;  // in bytes
+} free_virt_range_t;
+
+static free_virt_range_t slab_free_ranges[SLAB_MAX_FREE_RANGES];
+static int slab_num_free_ranges = 0;
+
+// Try to allocate from freed virtual ranges first
+static uint64_t slab_alloc_virt_range(size_t size) {
+    // Look for an exact or larger fit in free ranges
+    for (int i = 0; i < slab_num_free_ranges; i++) {
+        if (slab_free_ranges[i].size >= size) {
+            uint64_t addr = slab_free_ranges[i].start;
+            if (slab_free_ranges[i].size == size) {
+                // Exact fit - remove this range
+                slab_free_ranges[i] = slab_free_ranges[slab_num_free_ranges - 1];
+                slab_num_free_ranges--;
+            } else {
+                // Split - shrink this range
+                slab_free_ranges[i].start += size;
+                slab_free_ranges[i].size -= size;
+            }
+            return addr;
+        }
+    }
+    return 0;  // No suitable range found
+}
+
+// Add a freed virtual range to the free list (with coalescing)
+static void slab_free_virt_range(uint64_t start, size_t size) {
+    // Try to coalesce with an existing range
+    for (int i = 0; i < slab_num_free_ranges; i++) {
+        // Check if this range is immediately after an existing range
+        if (slab_free_ranges[i].start + slab_free_ranges[i].size == start) {
+            slab_free_ranges[i].size += size;
+            
+            // Check if we can also coalesce with the next range
+            for (int j = 0; j < slab_num_free_ranges; j++) {
+                if (j != i && slab_free_ranges[j].start == 
+                    slab_free_ranges[i].start + slab_free_ranges[i].size) {
+                    slab_free_ranges[i].size += slab_free_ranges[j].size;
+                    slab_free_ranges[j] = slab_free_ranges[slab_num_free_ranges - 1];
+                    slab_num_free_ranges--;
+                    break;
+                }
+            }
+            return;
+        }
+        // Check if this range is immediately before an existing range
+        if (start + size == slab_free_ranges[i].start) {
+            slab_free_ranges[i].start = start;
+            slab_free_ranges[i].size += size;
+            return;
+        }
+    }
+    
+    // No coalescing possible - add as new range
+    if (slab_num_free_ranges >= SLAB_MAX_FREE_RANGES) {
+        // Free list is full, just lose this range (unfortunate but safe)
+        static int warned = 0;
+        if (!warned) {
+            kprintf("SLAB: WARNING - free range list full, leaking virtual address space\n");
+            warned = 1;
+        }
+        return;
+    }
+    slab_free_ranges[slab_num_free_ranges].start = start;
+    slab_free_ranges[slab_num_free_ranges].size = size;
+    slab_num_free_ranges++;
+}
+
+// Allocate a virtual address for a slab page (single page)
 static uint64_t slab_alloc_virt_addr(void) {
+    // First try free list
+    uint64_t addr = slab_alloc_virt_range(PAGE_SIZE);
+    if (addr) {
+        return addr;
+    }
+    
     if (slab_next_virt_addr >= SLAB_VIRT_END) {
         kprintf("SLAB: Virtual address space exhausted!\n");
         return 0;
     }
-    uint64_t addr = slab_next_virt_addr;
+    addr = slab_next_virt_addr;
     slab_next_virt_addr += PAGE_SIZE;
     return addr;
+}
+
+// Free a single slab page's virtual address
+static void slab_free_virt_addr(uint64_t addr) {
+    slab_free_virt_range(addr, PAGE_SIZE);
 }
 
 // ============================================================================
@@ -223,6 +309,9 @@ static void slab_free_page(slab_page_t* slab) {
     
     // Free the physical page
     mm_free_physical_page(phys_addr);
+    
+    // Reclaim the virtual address for reuse
+    slab_free_virt_addr(virt_addr);
 }
 
 // Move slab between lists (partial <-> full <-> empty)
@@ -311,6 +400,7 @@ void* slab_alloc(size_t size) {
         // Calculate pages needed (including header)
         size_t total_size = size + sizeof(large_alloc_header_t);
         size_t page_count = (total_size + PAGE_SIZE - 1) / PAGE_SIZE;
+        size_t alloc_bytes = page_count * PAGE_SIZE;
         
         uint64_t phys_pages = mm_allocate_contiguous_pages(page_count);
         if (phys_pages == 0) {
@@ -319,14 +409,25 @@ void* slab_alloc(size_t size) {
             return NULL;
         }
         
-        // Allocate virtual address space for the pages
-        uint64_t virt_base = slab_next_virt_addr;
-        if (virt_base + (page_count * PAGE_SIZE) > SLAB_VIRT_END) {
-            kprintf("SLAB: Virtual address space exhausted for large alloc\n");
-            mm_free_contiguous_pages(phys_pages, page_count);
-            return NULL;
+        // Try to get virtual address from free list first
+        uint64_t virt_base = slab_alloc_virt_range(alloc_bytes);
+        if (!virt_base) {
+            // Fall back to allocating new virtual address space
+            if (slab_next_virt_addr + alloc_bytes > SLAB_VIRT_END) {
+                kprintf("SLAB: Virtual address space exhausted for large alloc\n");
+                kprintf("SLAB: requested=%lu pages, next_virt=0x%lx, end=0x%lx\n",
+                        (unsigned long)page_count, slab_next_virt_addr, SLAB_VIRT_END);
+                kprintf("SLAB: large_allocs=%lu, large_frees=%lu, active=%lu\n",
+                        slab_global_stats.large_allocations, slab_global_stats.large_frees,
+                        slab_global_stats.large_allocations - slab_global_stats.large_frees);
+                kprintf("SLAB: free_ranges=%d (max=%d)\n", 
+                        slab_num_free_ranges, SLAB_MAX_FREE_RANGES);
+                mm_free_contiguous_pages(phys_pages, page_count);
+                return NULL;
+            }
+            virt_base = slab_next_virt_addr;
+            slab_next_virt_addr += alloc_bytes;
         }
-        slab_next_virt_addr += page_count * PAGE_SIZE;
         
         // Map all pages
         for (size_t i = 0; i < page_count; i++) {
@@ -438,6 +539,7 @@ void slab_free(void* ptr) {
         size_t page_count = large_header->page_count;
         uint64_t phys_addr = large_header->phys_addr;
         uint64_t virt_addr = (uint64_t)large_header;
+        size_t alloc_bytes = page_count * PAGE_SIZE;
         
         // Unmap all pages
         for (size_t i = 0; i < page_count; i++) {
@@ -446,6 +548,9 @@ void slab_free(void* ptr) {
         
         // Free the physical pages
         mm_free_contiguous_pages(phys_addr, page_count);
+        
+        // Reclaim the virtual address space
+        slab_free_virt_range(virt_addr, alloc_bytes);
         
         slab_global_stats.large_frees++;
         slab_global_stats.total_frees++;
@@ -619,13 +724,21 @@ void slab_print_stats(void) {
     kprintf("Total frees: %lu\n", slab_global_stats.total_frees);
     kprintf("Active allocations: %lu\n", 
             slab_global_stats.total_allocations - slab_global_stats.total_frees);
-    kprintf("Large allocations: %lu (freed: %lu)\n", 
-            slab_global_stats.large_allocations, slab_global_stats.large_frees);
+    kprintf("Large allocations: %lu (freed: %lu, active: %lu)\n", 
+            slab_global_stats.large_allocations, slab_global_stats.large_frees,
+            slab_global_stats.large_allocations - slab_global_stats.large_frees);
     kprintf("Total pages used: %lu (%lu KB)\n", 
             slab_global_stats.total_pages_used,
             slab_global_stats.total_pages_used * 4);
     kprintf("Cache hits: %lu, misses: %lu\n",
             slab_global_stats.cache_hits, slab_global_stats.cache_misses);
+    
+    // Virtual address space usage
+    uint64_t virt_used = slab_next_virt_addr - SLAB_VIRT_BASE;
+    uint64_t virt_total = SLAB_VIRT_END - SLAB_VIRT_BASE;
+    kprintf("Virtual space: used=%lu KB / %lu KB (%lu%%), free_ranges=%d\n",
+            virt_used / 1024, virt_total / 1024, 
+            (virt_used * 100) / virt_total, slab_num_free_ranges);
     
     kprintf("\nPer-cache statistics:\n");
     for (int i = 0; i < SLAB_NUM_CLASSES; i++) {

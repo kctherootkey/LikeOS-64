@@ -4,6 +4,7 @@
 #include "../../include/kernel/keyboard.h"
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/tty.h"
+#include "../../include/kernel/sched.h"
 
 // Global keyboard state
 static keyboard_state_t kb_state = {0};
@@ -145,6 +146,12 @@ void keyboard_irq_handler(void) {
     
     // Add to buffer for processing
     keyboard_buffer_add(scan_code);
+
+    // Debug hotkey: Ctrl+D dumps all task states
+    if (kb_state.ctrl_pressed && !kb_state.alt_pressed && scan_code == 0x20) {  // 0x20 = 'd'
+        sched_dump_tasks();
+        return;
+    }
 
     // Feed TTY input (console)
     uint8_t shift = kb_state.shift_pressed || kb_state.caps_lock;

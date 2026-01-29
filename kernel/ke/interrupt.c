@@ -312,30 +312,78 @@ void exception_handler(uint64_t *regs) {
 volatile uint64_t g_irq0_count = 0;
 volatile uint64_t g_irq1_count = 0;
 volatile uint64_t g_irq12_count = 0;
+volatile uint64_t g_spurious_irq_count = 0;
+volatile uint64_t g_total_irq_count = 0;
+
+// Read the PIC In-Service Register to check for spurious IRQs
+static inline uint8_t pic_read_isr(void) {
+    outb(PIC1_CMD, 0x0B);  // Read ISR command
+    return inb(PIC1_CMD);
+}
+
+static inline uint8_t pic2_read_isr(void) {
+    outb(PIC2_CMD, 0x0B);  // Read ISR command
+    return inb(PIC2_CMD);
+}
 
 void irq_handler(uint64_t *regs) {
     uint64_t int_no = regs[15];
-    pic_send_eoi(int_no - 32);
-
+    uint8_t irq = (uint8_t)(int_no - 32);
+    
+    g_total_irq_count++;
+    
+    // Check for spurious IRQ7 (from master PIC)
+    if (irq == 7) {
+        uint8_t isr = pic_read_isr();
+        if ((isr & 0x80) == 0) {
+            // Spurious IRQ7 - do NOT send EOI
+            g_spurious_irq_count++;
+            return;
+        }
+    }
+    
+    // Check for spurious IRQ15 (from slave PIC)
+    if (irq == 15) {
+        uint8_t isr = pic2_read_isr();
+        if ((isr & 0x80) == 0) {
+            // Spurious IRQ15 - only send EOI to master (for cascade)
+            g_spurious_irq_count++;
+            outb(PIC1_CMD, 0x20);  // EOI to master only
+            return;
+        }
+    }
+    
+    // Handle known IRQs
     switch (int_no) {
-        case 32:
+        case 32: {
             g_irq0_count++;
             timer_irq_handler();
             break;
+        }
         case 33:
             g_irq1_count++;
             keyboard_irq_handler();
+            break;
+        case 34:
+            // IRQ2 is cascade - should never fire, just ACK it
             break;
         case 44:
             g_irq12_count++;
             mouse_irq_handler();
             break;
         default: {
+            // Only call XHCI for XHCI's configured IRQ, not all unknowns
             extern xhci_controller_t g_xhci;
-            xhci_irq_service(&g_xhci);
+            if (g_xhci.initialized && g_xhci.irq_enabled && irq == g_xhci.irq) {
+                xhci_irq_service(&g_xhci);
+            }
+            // Ignore other IRQs (they shouldn't fire since they're masked)
             break;
         }
     }
+    
+    // Send EOI after handling the interrupt
+    pic_send_eoi(irq);
 }
 
 void interrupts_init() {

@@ -346,7 +346,7 @@ static void fat32_extract_lfn(const fat32_lfn_t *entries, int count, char *out, 
 }
 
 // Maximum sectors per single USB read (1 sector = 512 bytes)
-#define MAX_SECTORS_PER_READ 1
+#define MAX_SECTORS_PER_READ 8
 
 static int read_sectors(const block_device_t *bdev, unsigned long lba, unsigned long count, void *buf)
 {
@@ -1516,6 +1516,11 @@ static int fat32_dir_list_internal(unsigned long start_cluster,
     unsigned long cluster = start_cluster;
     unsigned listed = 0;
     unsigned clusters = 0;
+    // LFN state must persist across cluster boundaries
+    char lfn_buf[260];
+    lfn_buf[0] = '\0';
+    uint16_t lfn_tmp[260];
+    int lfn_len = 0;
     while (cluster < 0x0FFFFFF8) {
         void *buf = kalloc(cluster_size);
         if (!buf)
@@ -1532,10 +1537,6 @@ static int fat32_dir_list_internal(unsigned long start_cluster,
         fat32_dirent_t *ents = (fat32_dirent_t *)buf;
         unsigned entries = cluster_size / sizeof(fat32_dirent_t);
         FAT32_LOG("list cluster=%lu lba=%lu entries=%u\n", cluster, lba, entries);
-        char lfn_buf[260];
-        lfn_buf[0] = '\0';
-        uint16_t lfn_tmp[260];
-        int lfn_len = 0;
         for (unsigned i = 0; i < entries; i++) {
             if (ents[i].name[0] == 0x00) {
                 FAT32_LOG("list end marker cluster=%lu index=%u listed=%u\n", cluster, i, listed);
@@ -1547,7 +1548,7 @@ static int fat32_dir_list_internal(unsigned long start_cluster,
             }
             if (ents[i].name[0] == 0xE5)
                 continue;
-            if (ents[i].attr == FAT32_ATTR_LONG_NAME) {
+            if ((ents[i].attr & FAT32_ATTR_LONG_NAME_MASK) == FAT32_ATTR_LONG_NAME) {
                 fat32_lfn_t *l = (fat32_lfn_t *)&ents[i];
                 int ord = (l->seq & 0x1F);
                 int last = (l->seq & 0x40) ? 1 : 0;
@@ -1644,6 +1645,11 @@ int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr
         canon[ci] = c;
     }
     canon[ci] = '\0';
+    // LFN state must persist across cluster boundaries
+    char lfn_buf[260];
+    lfn_buf[0] = '\0';
+    uint16_t lfn_tmp[260];
+    int lfn_len = 0;
     while (cluster < 0x0FFFFFF8) {
         void *buf = kalloc(cluster_size);
         if (!buf)
@@ -1655,10 +1661,6 @@ int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr
         }
         fat32_dirent_t *ents = (fat32_dirent_t *)buf;
         unsigned entries = cluster_size / sizeof(fat32_dirent_t);
-        char lfn_buf[260];
-        lfn_buf[0] = '\0';
-        uint16_t lfn_tmp[260];
-        int lfn_len = 0;
         for (unsigned i = 0; i < entries; i++) {
             if (ents[i].name[0] == 0x00) {
                 kfree(buf);
@@ -1666,7 +1668,7 @@ int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr
             }
             if (ents[i].name[0] == 0xE5)
                 continue;
-            if (ents[i].attr == FAT32_ATTR_LONG_NAME) {
+            if ((ents[i].attr & FAT32_ATTR_LONG_NAME_MASK) == FAT32_ATTR_LONG_NAME) {
                 fat32_lfn_t *l = (fat32_lfn_t *)&ents[i];
                 int ord = (l->seq & 0x1F);
                 int last = (l->seq & 0x40) ? 1 : 0;
@@ -1924,7 +1926,7 @@ unsigned long fat32_parent_cluster(unsigned long dir_cluster)
     for (i = 0; i < (cluster_size / sizeof(fat32_dirent_t)); ++i) {
         if (ents[i].name[0] == 0x00)
             break;
-        if (ents[i].attr == FAT32_ATTR_LONG_NAME)
+        if ((ents[i].attr & FAT32_ATTR_LONG_NAME_MASK) == FAT32_ATTR_LONG_NAME)
             continue;
         if (ents[i].name[0] == '.') {
             if (ents[i].name[1] == '.') {
@@ -3075,7 +3077,7 @@ void fat32_debug_dump_root(void)
             kprintf("  [%u] deleted\n", i);
             continue;
         }
-        if (ents[i].attr == FAT32_ATTR_LONG_NAME) {
+        if ((ents[i].attr & FAT32_ATTR_LONG_NAME_MASK) == FAT32_ATTR_LONG_NAME) {
             kprintf("  [%u] LFN seq=%02x\n", i, ((fat32_lfn_t *)&ents[i])->seq);
             continue;
         }

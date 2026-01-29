@@ -61,14 +61,69 @@ static inline uint8_t inb(uint16_t port) {
 // Utility functions (non-static, declared in memory.h)
 void mm_memset(void* dest, int val, size_t len) {
     uint8_t* ptr = (uint8_t*)dest;
+    uint8_t byte_val = (uint8_t)val;
+    
+    // Fast path: for larger sizes, use 64-bit stores
+    if (len >= 32 && ((uint64_t)ptr & 7) == 0) {
+        // Create 64-bit pattern from byte value
+        uint64_t pattern = byte_val;
+        pattern |= pattern << 8;
+        pattern |= pattern << 16;
+        pattern |= pattern << 32;
+        
+        uint64_t* ptr64 = (uint64_t*)ptr;
+        size_t words = len / 8;
+        size_t remainder = len % 8;
+        
+        // Use rep stosq for very large fills (uses CPU's optimized path)
+        if (words >= 64) {
+            __asm__ volatile (
+                "rep stosq"
+                : "+D"(ptr64), "+c"(words)
+                : "a"(pattern)
+                : "memory"
+            );
+            ptr = (uint8_t*)ptr64;
+            len = remainder;
+        } else {
+            // Manual unrolled loop for medium sizes
+            while (words >= 4) {
+                ptr64[0] = pattern;
+                ptr64[1] = pattern;
+                ptr64[2] = pattern;
+                ptr64[3] = pattern;
+                ptr64 += 4;
+                words -= 4;
+            }
+            while (words--) {
+                *ptr64++ = pattern;
+            }
+            ptr = (uint8_t*)ptr64;
+            len = remainder;
+        }
+    }
+    
+    // Handle remaining bytes
     while (len--) {
-        *ptr++ = val;
+        *ptr++ = byte_val;
     }
 }
 
 void mm_memcpy(void* dest, const void* src, size_t len) {
     uint8_t* d = (uint8_t*)dest;
     const uint8_t* s = (const uint8_t*)src;
+    
+    // Fast path: use rep movsb for larger aligned copies
+    if (len >= 64) {
+        __asm__ volatile (
+            "rep movsb"
+            : "+D"(d), "+S"(s), "+c"(len)
+            :
+            : "memory"
+        );
+        return;
+    }
+    
     while (len--) {
         *d++ = *s++;
     }
@@ -410,18 +465,42 @@ void mm_initialize_from_boot_info(boot_info_t* boot_info) {
             g_uefi_memory_map.total_memory / (1024 * 1024));
 }
 
+// Allocation hint - start searching from here for faster subsequent allocations
+static uint64_t g_alloc_hint = 0;
+
 // Find first free bit in bitmap
+// Uses hint to avoid rescanning already-allocated low pages
 static uint64_t find_free_page(void) {
-    for (uint64_t i = 0; i < mm_state.bitmap_size / sizeof(uint32_t); i++) {
+    uint64_t num_words = mm_state.bitmap_size / sizeof(uint32_t);
+    uint64_t start = g_alloc_hint / 32;  // Start from hint word
+    
+    // Search from hint to end
+    for (uint64_t i = start; i < num_words; i++) {
         if (mm_state.physical_bitmap[i] != 0xFFFFFFFF) {
             // Found a uint32_t with free bits
             for (int bit = 0; bit < 32; bit++) {
                 if (!(mm_state.physical_bitmap[i] & (1 << bit))) {
-                    return i * 32 + bit;
+                    uint64_t page = i * 32 + bit;
+                    g_alloc_hint = page + 1;  // Next search starts after this
+                    return page;
                 }
             }
         }
     }
+    
+    // Wrap around: search from beginning to hint
+    for (uint64_t i = 0; i < start; i++) {
+        if (mm_state.physical_bitmap[i] != 0xFFFFFFFF) {
+            for (int bit = 0; bit < 32; bit++) {
+                if (!(mm_state.physical_bitmap[i] & (1 << bit))) {
+                    uint64_t page = i * 32 + bit;
+                    g_alloc_hint = page + 1;
+                    return page;
+                }
+            }
+        }
+    }
+    
     return (uint64_t)-1; // No free pages
 }
 
@@ -601,6 +680,11 @@ void mm_free_physical_page(uint64_t physical_address) {
     
     clear_page_bit(page);
     mm_state.free_pages++;
+    
+    // Update allocation hint to allow reusing freed pages
+    if (page < g_alloc_hint) {
+        g_alloc_hint = page;
+    }
     
     // Clear refcount
     if (mm_state.page_refcounts) {
@@ -926,8 +1010,8 @@ void mm_unmap_page(uint64_t virtual_addr) {
 void mm_unmap_page_in_address_space(uint64_t* pml4, uint64_t virtual_addr) {
     uint64_t* pte = mm_get_page_table_from_pml4(pml4, virtual_addr, false);
     if (pte && (*pte & PAGE_PRESENT)) {
-        // Free the physical page
-        uint64_t phys = *pte & ~0xFFFULL;
+        // Free the physical page - mask out flags (bits 0-11) AND upper reserved/NX bits
+        uint64_t phys = *pte & 0x000FFFFFFFFFF000ULL;
         if (phys) {
             mm_free_physical_page(phys);
         }

@@ -79,9 +79,13 @@ int serial_is_available(void)
 
 static inline void uart_wait_thr_empty(void)
 {
-    /* Busy-wait until THR empty */
+    /* Busy-wait until THR empty, with timeout to prevent hangs */
+    volatile int timeout = 100000;  // ~1ms at typical CPU speeds
     while((uart_in(UART_LSR) & LSR_THR_EMPTY) == 0) {
-        /* spin */
+        if (--timeout <= 0) {
+            // UART seems stuck, give up to prevent hang
+            return;
+        }
     }
 }
 
