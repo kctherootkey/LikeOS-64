@@ -110,9 +110,10 @@ static void clear_page_bit(uint64_t page);
 
 // Page table pool - Reserved from start of physical memory range.
 // All page tables are allocated from this pool, which is outside the bitmap range.
-#define PT_POOL_SIZE 2048  // 2048 pages = 8MB for page tables
+// Size is calculated dynamically based on RAM: ~1 PT page per 2MB of RAM (worst case)
+static uint64_t pt_pool_size = 0;       // Calculated at runtime
 static uint64_t pt_pool_phys_start = 0;
-static int pt_pool_next = 0;
+static uint64_t pt_pool_next = 0;
 static int pt_pool_initialized = 0;
 
 // ============================================================================
@@ -295,19 +296,26 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     
     uint64_t heap_start_virt = mm_get_kernel_heap_start();
     
-    // Start managed memory at a safe location (well past typical bootloader allocations)
-    // The bootloader typically allocates in low memory, so starting at 32MB should be safe
-    // We'll verify by walking page tables and reserving any pages that are actually in use
-    uint64_t safe_start = 32 * 1024 * 1024;  // 32MB
+    // Calculate PT pool size dynamically based on RAM:
+    // - Each PT page can map 512 * 4KB = 2MB of memory
+    // - For worst case (all 4KB pages), need memory_size / 2MB page tables
+    // - Plus PD pages (memory_size / 1GB) and PDPT pages (small constant)
+    // - Add 25% overhead for fragmentation and dynamic allocations
+    uint64_t pt_pages_needed = memory_size / (2 * 1024 * 1024);  // 1 PT per 2MB
+    uint64_t pd_pages_needed = memory_size / (1024 * 1024 * 1024) + 1;  // 1 PD per 1GB
+    uint64_t pdpt_pages_needed = 4;  // Up to 512GB coverage
+    pt_pool_size = pt_pages_needed + pd_pages_needed + pdpt_pages_needed;
+    pt_pool_size = (pt_pool_size * 5) / 4;  // Add 25% overhead
+    if (pt_pool_size < 256) pt_pool_size = 256;  // Minimum 1MB pool
     
-    // Reserve space for page table pool at start of managed range
-    pt_pool_phys_start = safe_start;
-    uint64_t pt_pool_size_bytes = PT_POOL_SIZE * PAGE_SIZE;
+    // Start at 32MB
+    pt_pool_phys_start = 32 * 1024 * 1024;
+    uint64_t pt_pool_size_bytes = pt_pool_size * PAGE_SIZE;
     mm_state.memory_start = pt_pool_phys_start + pt_pool_size_bytes;
     
-    kprintf("  PT pool reserved: 0x%lx - 0x%lx (%d pages, %lu MB)\n",
+    kprintf("  PT pool reserved: 0x%lx - 0x%lx (%lu pages, %lu MB)\n",
             pt_pool_phys_start, mm_state.memory_start,
-            PT_POOL_SIZE, pt_pool_size_bytes / (1024*1024));
+            pt_pool_size, pt_pool_size_bytes / (1024*1024));
     
     // End of managed memory is total RAM
     mm_state.memory_end = memory_size;
@@ -487,20 +495,28 @@ uint64_t mm_virt_to_phys_heap(uint64_t virt) {
 
 // Allocate a page for page table structures
 // Returns: physical address (for use in page table entries)
-// Pages come from the reserved PT pool which is OUTSIDE the bitmap range
+// Pages come from the reserved PT pool first, then fall back to physical allocator
 static uint64_t allocate_pt_page(void) {
     if (!pt_pool_initialized) {
         kprintf("ERROR: PT pool not initialized!\n");
         return 0;
     }
     
-    if (pt_pool_next >= PT_POOL_SIZE) {
-        kprintf("ERROR: PT pool exhausted! (%d pages used)\n", pt_pool_next);
-        return 0;
-    }
+    uint64_t phys;
     
-    uint64_t phys = pt_pool_phys_start + (pt_pool_next * PAGE_SIZE);
-    pt_pool_next++;
+    if (pt_pool_next < pt_pool_size) {
+        // Use reserved pool (preferred - outside bitmap range)
+        phys = pt_pool_phys_start + (pt_pool_next * PAGE_SIZE);
+        pt_pool_next++;
+    } else {
+        // Pool exhausted - fall back to physical memory allocator
+        // This is fine for large allocations after initial setup
+        phys = mm_allocate_physical_page();
+        if (!phys) {
+            kprintf("ERROR: Cannot allocate PT page (pool exhausted, phys alloc failed)\n");
+            return 0;
+        }
+    }
     
     // Access via direct map and zero it
     uint64_t* virt = (uint64_t*)phys_to_virt(phys);
@@ -518,8 +534,8 @@ void mm_init_pt_pool(void) {
         kprintf("ERROR: PT pool physical region not set!\n");
         return;
     }
-    kprintf("Initializing page table pool (%d pages at phys %p)...\n", 
-            PT_POOL_SIZE, (void*)pt_pool_phys_start);
+    kprintf("Initializing page table pool (%lu pages at phys %p)...\n", 
+            pt_pool_size, (void*)pt_pool_phys_start);
     pt_pool_initialized = 1;
     kprintf("  Page table pool ready\n");
 }
