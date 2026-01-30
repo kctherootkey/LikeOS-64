@@ -645,6 +645,17 @@ int xhci_halt(xhci_controller_t* ctrl) {
 int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev) {
     xhci_memset(ctrl, 0, sizeof(*ctrl));
     
+    // Store PCI IDs for quirk detection
+    ctrl->pci_vendor = dev->vendor_id;
+    ctrl->pci_device = dev->device_id;
+    
+    // VirtualBox uses Intel 8086:1e31 and sets EINT spuriously,
+    // causing cycle resync to match stale TRBs. Disable resync for it.
+    if (ctrl->pci_vendor == 0x8086 && ctrl->pci_device == 0x1e31) {
+        ctrl->quirk_no_resync = 1;
+        kprintf("[XHCI] VirtualBox quirk: disabling EINT cycle resync\n");
+    }
+    
     // Get BAR0 (MMIO base) - physical address
     uint64_t bar0_phys = dev->bar[0] & ~0xFULL;
     if (bar0_phys == 0) {
@@ -1028,8 +1039,9 @@ void xhci_process_events(xhci_controller_t* ctrl) {
         uint8_t trb_cycle = (trb->control & TRB_FLAG_CYCLE) ? 1 : 0;
         if (trb_cycle != ring->cycle) {
             // Check if EINT is set but we have cycle mismatch - might need resync
+            // Skip resync on VirtualBox (quirk_no_resync) as it sets EINT spuriously
             uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-            if ((usbsts & XHCI_STS_EINT) && processed == 0) {
+            if (!ctrl->quirk_no_resync && (usbsts & XHCI_STS_EINT) && processed == 0) {
                 // EINT set but no events - try toggling cycle bit
                 ring->cycle ^= 1;
                 trb_cycle = (trb->control & TRB_FLAG_CYCLE) ? 1 : 0;

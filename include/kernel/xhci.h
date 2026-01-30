@@ -382,6 +382,11 @@ typedef struct xhci_controller {
     uint8_t running;
     uint8_t initialized;
     
+    // PCI info (for quirks detection)
+    uint16_t pci_vendor;
+    uint16_t pci_device;
+    uint8_t quirk_no_resync;  // Disable EINT cycle resync (VirtualBox)
+    
     // Scratchpad
     uint64_t* scratchpad_array;
     void** scratchpad_pages;
