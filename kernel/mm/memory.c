@@ -199,7 +199,7 @@ static uint64_t early_virt_to_phys(uint64_t virtual_addr) {
     }
     
     // Get PDPT
-    uint64_t pdpt_phys = pml4e & ~0xFFF;
+    uint64_t pdpt_phys = pml4e & PTE_ADDR_MASK;
     uint64_t* pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
     
     // Check PDPT entry
@@ -215,7 +215,7 @@ static uint64_t early_virt_to_phys(uint64_t virtual_addr) {
     }
     
     // Get PD
-    uint64_t pd_phys = pdpte & ~0xFFF;
+    uint64_t pd_phys = pdpte & PTE_ADDR_MASK;
     uint64_t* pd = (uint64_t*)phys_to_virt(pd_phys);
     
     // Check PD entry
@@ -231,7 +231,7 @@ static uint64_t early_virt_to_phys(uint64_t virtual_addr) {
     }
     
     // Get PT
-    uint64_t pt_phys = pde & ~0xFFF;
+    uint64_t pt_phys = pde & PTE_ADDR_MASK;
     uint64_t* pt = (uint64_t*)phys_to_virt(pt_phys);
     
     // Check PT entry
@@ -840,7 +840,7 @@ uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
                 mm_state.pml4_table, pml4_index, (void*)mm_state.pml4_table[pml4_index]);
     }
     
-    uint64_t pdpt_phys = mm_state.pml4_table[pml4_index] & ~0xFFF;
+    uint64_t pdpt_phys = mm_state.pml4_table[pml4_index] & PTE_ADDR_MASK;
     uint64_t* pdpt = pdpt_phys ? (uint64_t*)phys_to_virt(pdpt_phys) : NULL;
     if (!pdpt && create) {
         pdpt_phys = allocate_pt_page();
@@ -860,7 +860,7 @@ uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
         kprintf("PT: PDPT at %p, entry[%lu]=%p\n", pdpt, pdpt_index, (void*)pdpt[pdpt_index]);
     }
     
-    uint64_t pd_phys = pdpt[pdpt_index] & ~0xFFF;
+    uint64_t pd_phys = pdpt[pdpt_index] & PTE_ADDR_MASK;
     uint64_t* pd = pd_phys ? (uint64_t*)phys_to_virt(pd_phys) : NULL;
     if (!pd && create) {
         pd_phys = allocate_pt_page();
@@ -880,7 +880,7 @@ uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
         kprintf("PT: PD at %p, entry[%lu]=%p\n", pd, pd_index, (void*)pd[pd_index]);
     }
     
-    uint64_t pt_phys = pd[pd_index] & ~0xFFF;
+    uint64_t pt_phys = pd[pd_index] & PTE_ADDR_MASK;
     uint64_t* pt = pt_phys ? (uint64_t*)phys_to_virt(pt_phys) : NULL;
     if (!pt && create) {
         pt_phys = allocate_pt_page();
@@ -1508,7 +1508,7 @@ uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, boo
     
     // Get PDPT
     uint64_t* pdpt;
-    uint64_t pdpt_phys = pml4[pml4_index] & ~0xFFFULL;
+    uint64_t pdpt_phys = pml4[pml4_index] & PTE_ADDR_MASK;
     if (!(pml4[pml4_index] & PAGE_PRESENT)) {
         if (!create) return NULL;
         pdpt_phys = allocate_pt_page();  // Use safe PT pool
@@ -1531,7 +1531,7 @@ uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, boo
     
     // Get PD
     uint64_t* pd;
-    uint64_t pd_phys = pdpt[pdpt_index] & ~0xFFFULL;
+    uint64_t pd_phys = pdpt[pdpt_index] & PTE_ADDR_MASK;
     if (!(pdpt[pdpt_index] & PAGE_PRESENT)) {
         if (!create) return NULL;
         pd_phys = allocate_pt_page();  // Use safe PT pool
@@ -1560,9 +1560,9 @@ uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, boo
         // This is a 2MB page - we need to split it into 4KB pages
         if (!create) return NULL;
         
-        // Get the base physical address of the 2MB page
-        uint64_t large_page_base = pd_entry & ~0x1FFFFFULL;  // Mask off lower 21 bits
-        uint64_t old_flags = pd_entry & 0xFFFULL;           // Keep flags (lower 12 bits)
+        // Get the base physical address of the 2MB page (bits 21-51)
+        uint64_t large_page_base = pd_entry & 0x000FFFFFFFE00000ULL;
+        uint64_t old_flags = pd_entry & PTE_FLAGS_MASK;     // Keep flags including NX bit
         
         // Allocate a new page table from safe PT pool
         uint64_t pt_phys = allocate_pt_page();
@@ -1604,7 +1604,7 @@ uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, boo
         if (is_user_space && create && !(pd[pd_index] & PAGE_USER)) {
             pd[pd_index] |= PAGE_USER;
         }
-        uint64_t pt_phys = pd[pd_index] & ~0xFFFULL;
+        uint64_t pt_phys = pd[pd_index] & PTE_ADDR_MASK;
         pt = (uint64_t*)phys_to_virt(pt_phys);
     }
     
@@ -1882,7 +1882,7 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
     }
     
     // Extract physical address (bits 12-51, mask off flags and NX bit)
-    uint64_t old_phys = *pte & 0x000FFFFFFFFFF000ULL;
+    uint64_t old_phys = *pte & PTE_ADDR_MASK;
     
     // Check if we're the only reference - can just make writable
     uint16_t refcount = mm_get_page_refcount(old_phys);
@@ -1890,7 +1890,7 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
         // We're the only user, just make it writable again
         uint64_t flags = (*pte & 0xFFF) & ~PAGE_COW;
         flags |= PAGE_WRITABLE;
-        *pte = (*pte & 0x8000000000000000ULL) | old_phys | flags; // Preserve NX bit
+        *pte = (*pte & PAGE_NO_EXECUTE) | old_phys | flags; // Preserve NX bit
         mm_flush_tlb(page_addr);
         return true;
     }
@@ -1908,7 +1908,7 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
     // Update PTE: remove COW, add writable, point to new page, preserve NX bit
     uint64_t flags = (*pte & 0xFFF) & ~PAGE_COW;
     flags |= PAGE_WRITABLE;
-    *pte = (*pte & 0x8000000000000000ULL) | new_phys | flags;
+    *pte = (*pte & PAGE_NO_EXECUTE) | new_phys | flags;
     
     mm_flush_tlb(page_addr);
     
@@ -1945,26 +1945,26 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
     for (int i = 0; i < 256; i++) {
         if (!(src_pml4[i] & PAGE_PRESENT)) continue;
         
-        uint64_t src_pdpt_phys = src_pml4[i] & ~0xFFFULL;
+        uint64_t src_pdpt_phys = src_pml4[i] & PTE_ADDR_MASK;
         uint64_t* src_pdpt = (uint64_t*)phys_to_virt(src_pdpt_phys);
         
         // Allocate PDPT for new address space from safe PT pool
         uint64_t pdpt_phys = allocate_pt_page();
         if (!pdpt_phys) goto fail;
         // Page already zeroed by allocate_pt_page
-        new_pml4[i] = pdpt_phys | (src_pml4[i] & 0xFFF);
+        new_pml4[i] = pdpt_phys | (src_pml4[i] & PTE_FLAGS_MASK);
         uint64_t* new_pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
         
         for (int j = 0; j < 512; j++) {
             if (!(src_pdpt[j] & PAGE_PRESENT)) continue;
             
-            uint64_t src_pd_phys = src_pdpt[j] & ~0xFFFULL;
+            uint64_t src_pd_phys = src_pdpt[j] & PTE_ADDR_MASK;
             uint64_t* src_pd = (uint64_t*)phys_to_virt(src_pd_phys);
             
             uint64_t pd_phys = allocate_pt_page();
             if (!pd_phys) goto fail;
             // Page already zeroed by allocate_pt_page
-            new_pdpt[j] = pd_phys | (src_pdpt[j] & 0xFFF);
+            new_pdpt[j] = pd_phys | (src_pdpt[j] & PTE_FLAGS_MASK);
             uint64_t* new_pd = (uint64_t*)phys_to_virt(pd_phys);
             
             for (int k = 0; k < 512; k++) {
@@ -1981,13 +1981,13 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
                         new_pd[k] = src_pd[k];
                     }
                 } else {
-                    uint64_t src_pt_phys = src_pd[k] & ~0xFFFULL;
+                    uint64_t src_pt_phys = src_pd[k] & PTE_ADDR_MASK;
                     uint64_t* src_pt = (uint64_t*)phys_to_virt(src_pt_phys);
                     
                     uint64_t pt_phys = allocate_pt_page();
                     if (!pt_phys) goto fail;
                     // Page already zeroed by allocate_pt_page
-                    new_pd[k] = pt_phys | (src_pd[k] & 0xFFF);
+                    new_pd[k] = pt_phys | (src_pd[k] & PTE_FLAGS_MASK);
                     uint64_t* new_pt = (uint64_t*)phys_to_virt(pt_phys);
                     
                     for (int l = 0; l < 512; l++) {

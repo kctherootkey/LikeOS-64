@@ -60,6 +60,13 @@ uint64_t mm_get_kernel_heap_start(void);
 #define PAGE_COW                0x200       // Copy-on-Write marker (available bit)
 #define PAGE_NO_EXECUTE         0x8000000000000000ULL
 
+// Physical address mask for extracting physical address from page table entries
+// Bits 12-51 contain the physical address, bits 0-11 are flags, bits 52-62 are available/reserved, bit 63 is NX
+#define PTE_ADDR_MASK           0x000FFFFFFFFFF000ULL
+
+// Flag mask including NX bit (for preserving flags when copying PTEs)
+#define PTE_FLAGS_MASK          (0xFFFULL | PAGE_NO_EXECUTE)
+
 // UEFI memory map entry (matching bootloader)
 typedef struct {
     uint32_t type;

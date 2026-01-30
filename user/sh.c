@@ -42,10 +42,23 @@ static int tokenize(char* line, char** argv, int max_args) {
 
 static void show_help(void) {
     printf("LikeOS-64 Shell (userland)\n");
+    printf("Built-in commands:\n");
     printf("  cd <dir>       - Change directory\n");
     printf("  help           - Show this help\n");
-    printf("  ls, cat, pwd, stat are external commands in /bin\n");
-    printf("  <cmd> [args]   - Execute program via PATH\n");
+    printf("External commands (in / or /bin):\n");
+    printf("  ls             - List directory contents\n");
+    printf("  cat <file>     - Display file contents\n");
+    printf("  pwd            - Print working directory\n");
+    printf("  stat <file>    - Show file status\n");
+    printf("  testlibc       - Run libc test suite\n");
+    printf("  testmem <MB>   - Memory allocation test\n");
+    printf("  memstat        - Show memory statistics\n");
+    printf("  progerr        - Test error handling\n");
+    printf("  teststress     - Run stress test (10 min)\n");
+    printf("  hello          - Hello world program\n");
+    printf("Keyboard shortcuts:\n");
+    printf("  Ctrl+D         - Debug dump (tasks, IRQs, memory)\n");
+    printf("  Ctrl+C         - Interrupt current process (still buggy, might crash the system)\n");
 }
 
 int main(void) {

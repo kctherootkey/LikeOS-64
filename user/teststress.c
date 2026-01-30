@@ -3,6 +3,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <time.h>
+
+#define TIMEOUT_SECONDS (10 * 60)  // 10 minutes
 
 // Simple linear congruential generator for random numbers
 static unsigned int seed = 12345;
@@ -83,15 +86,24 @@ int main(int argc, char** argv) {
     (void)argv;
     
     int iteration = 0;
+    time_t start_time = time(NULL);
     
     printf("=== STRESS TEST STARTED ===\n");
-    printf("Running random commands in an infinite loop...\n");
-    printf("Press Ctrl+C to stop\n\n");
+    printf("Running random commands for up to 10 minutes...\n");
+    printf("Press Ctrl+C to stop early\n\n");
     
     // Use pid as part of seed for some variation
     seed = (unsigned int)getpid() * 31337;
     
     while (1) {
+        // Check if 10 minutes have passed
+        time_t now = time(NULL);
+        if (now - start_time >= TIMEOUT_SECONDS) {
+            printf("\n=== 10 MINUTES ELAPSED - STRESS TEST COMPLETE ===\n");
+            printf("Total iterations: %d\n", iteration);
+            break;
+        }
+        
         // Pick a random command
         int cmd_idx = rand_simple() % NUM_COMMANDS;
         const char* cmd = commands[cmd_idx];

@@ -868,7 +868,7 @@ void sched_dump_tasks(void) {
     kprintf("Ticks: %llu  IRQ0: %llu  TotalIRQ: %llu  Yields: %llu\n", 
             timer_ticks(), g_irq0_count, g_total_irq_count, g_total_yields);
     kprintf("FreeMem: %llu KB\n", mm_get_free_pages() * 4);
-    kprintf("PID  PPID STATE   PGID\n");
+    kprintf("PID  PPID STATE   PGID  LastRIP          UserRIP\n");
     if (!g_current) {
         kprintf("(no tasks)\n");
         return;
@@ -879,7 +879,12 @@ void sched_dump_tasks(void) {
         const char* sn = (t->state <= TASK_STOPPED) ? state_names[t->state] : "???";
         int ppid = t->parent ? t->parent->id : 0;
         char marker = (t == g_current) ? '*' : ' ';
-        kprintf("%c%-4d %-4d %-7s %-4d\n", marker, t->id, ppid, sn, t->pgid);
+        // Get last kernel RIP from saved stack (ctx_switch_asm saves r15,r14,r13,r12,rbx,rbp, then ret addr at sp+48)
+        uint64_t last_rip = 0;
+        if (t->sp && t != g_current) {
+            last_rip = t->sp[6];  // Return address is at offset 6 (after 6 pushed regs)
+        }
+        kprintf("%c%-4d %-4d %-7s %-4d  0x%016llx 0x%llx\n", marker, t->id, ppid, sn, t->pgid, last_rip, t->syscall_rip);
         t = t->next;
     } while (t && t != start);
     kprintf("===============================\n");
