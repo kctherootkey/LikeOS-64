@@ -165,7 +165,7 @@
 #define XHCI_MAX_RING_SEGMENTS  16   // Maximum segments per ring (can expand)
 #define XHCI_MAX_SLOTS          16
 #define XHCI_MAX_ENDPOINTS      32
-#define XHCI_MAX_PORTS          16   // Increased to support USB 3.0 ports in VirtualBox
+#define XHCI_MAX_PORTS          32   // Support USB 2.0 and USB 3.0 ports (typical max is ~30)
 
 // Scatter-gather list maximum entries
 #define XHCI_MAX_SG_ENTRIES     32
@@ -364,7 +364,8 @@ typedef struct xhci_controller {
     
     // Device contexts
     xhci_dev_ctx_t* dev_ctx[XHCI_MAX_SLOTS];
-    xhci_input_ctx_t* input_ctx;
+    xhci_input_ctx_t* input_ctx;       // For compatibility (deprecated)
+    uint8_t* input_ctx_raw;             // Raw byte access for variable context size
     uint64_t input_ctx_phys;
     
     // Devices
@@ -486,11 +487,17 @@ static inline void xhci_op_write32(xhci_controller_t* ctrl, uint32_t off, uint32
 }
 
 static inline uint64_t xhci_op_read64(xhci_controller_t* ctrl, uint32_t off) {
-    return *(volatile uint64_t*)(ctrl->op_base + off);
+    // Read as two 32-bit values for better compatibility
+    uint32_t lo = *(volatile uint32_t*)(ctrl->op_base + off);
+    uint32_t hi = *(volatile uint32_t*)(ctrl->op_base + off + 4);
+    return ((uint64_t)hi << 32) | lo;
 }
 
 static inline void xhci_op_write64(xhci_controller_t* ctrl, uint32_t off, uint64_t val) {
-    *(volatile uint64_t*)(ctrl->op_base + off) = val;
+    // Write as two 32-bit values for better compatibility
+    // Low DWORD first, then high DWORD
+    *(volatile uint32_t*)(ctrl->op_base + off) = (uint32_t)(val & 0xFFFFFFFF);
+    *(volatile uint32_t*)(ctrl->op_base + off + 4) = (uint32_t)(val >> 32);
 }
 
 static inline uint32_t xhci_rt_read32(xhci_controller_t* ctrl, uint32_t off) {

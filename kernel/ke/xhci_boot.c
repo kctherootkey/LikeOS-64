@@ -27,6 +27,12 @@ static int xhci_verify_controller_state(xhci_controller_t* ctrl) {
         return ST_ERR;
     }
     
+    // Check for HSE (Host System Error) - indicates DMA failure
+    if (usbsts & XHCI_STS_HSE) {
+        kprintf("[XHCI BOOT] Warning: Host System Error (HSE) set - DMA problem!\n");
+        return ST_ERR;
+    }
+    
     // Verify DCBAA is properly set
     uint64_t dcbaap = xhci_op_read64(ctrl, XHCI_OP_DCBAAP);
     if (dcbaap != ctrl->dcbaa_phys) {
@@ -35,12 +41,14 @@ static int xhci_verify_controller_state(xhci_controller_t* ctrl) {
         return ST_ERR;
     }
     
-    // Verify command ring is set (CRCR.CRP should match)
+    // Note: Per xHCI spec 5.4.5, CRCR Command Ring Pointer always reads as 0
+    // We can only verify CRR (Command Ring Running) bit which should be 0 initially
     uint64_t crcr = xhci_op_read64(ctrl, XHCI_OP_CRCR);
-    if ((crcr & ~0x3FULL) != (ctrl->cmd_ring_phys & ~0x3FULL)) {
-        kprintf("[XHCI BOOT] Warning: Command ring mismatch\n");
-        return ST_ERR;
+    if (crcr & (1 << 3)) {
+        // CRR=1 means command ring is unexpectedly running
+        kprintf("[XHCI BOOT] Note: CRR=1, command ring already running\n");
     }
+    // Cannot verify CRP since it always reads as 0 per spec
     
     return ST_OK;
 }
@@ -94,9 +102,17 @@ void xhci_boot_init(xhci_boot_state_t* state) {
         return;
     }
     
-    kprintf("[XHCI BOOT] Found xHCI at PCI %02x:%02x.%x, BAR0=0x%08x\n",
+    // Check if 64-bit BAR
+    uint64_t bar0_full;
+    if ((xhci_pci->bar[0] & 0x6) == 0x4) {
+        bar0_full = ((uint64_t)xhci_pci->bar[1] << 32) | (xhci_pci->bar[0] & ~0xFULL);
+    } else {
+        bar0_full = xhci_pci->bar[0] & ~0xFULL;
+    }
+    
+    kprintf("[XHCI BOOT] Found xHCI at PCI %02x:%02x.%x, BAR0=0x%llx\n",
             xhci_pci->bus, xhci_pci->device, xhci_pci->function,
-            xhci_pci->bar[0]);
+            bar0_full);
     
     // Check vendor/device ID for known quirks
     uint16_t vendor_id = xhci_pci->vendor_id;
