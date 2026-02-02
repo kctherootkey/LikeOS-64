@@ -706,11 +706,11 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev) {
     ctrl->pci_vendor = dev->vendor_id;
     ctrl->pci_device = dev->device_id;
     
-    // Intel xHCI controllers (including VirtualBox 8086:1e31 and real hardware)
-    // can set EINT spuriously, causing cycle resync to match stale TRBs.
-    // Disable resync for all Intel controllers.
-    if (ctrl->pci_vendor == 0x8086) {
-        ctrl->quirk_no_resync = 1;
+    // Most xHCI controllers (Intel, VMware, VirtualBox) set EINT spuriously,
+    // causing cycle resync to match stale TRBs. Only QEMU needs resync.
+    // 0x1b36:0x000d = QEMU xHCI
+    if (ctrl->pci_vendor == 0x1b36 && ctrl->pci_device == 0x000d) {
+        ctrl->quirk_resync = 1;
     }
     
     // CRITICAL: Enable bus mastering and memory access BEFORE any MMIO access
@@ -849,9 +849,6 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev) {
             kprintf("[XHCI]   DCBAA=0x%llx, CRCR=0x%llx\n", ctrl->dcbaa_phys, ctrl->cmd_ring_phys);
         }
     }
-    
-    kprintf("[XHCI] DMA: DCBAA=0x%llx, CRCR=0x%llx\n",
-            ctrl->dcbaa_phys, ctrl->cmd_ring_phys);
     
     // Allocate input context - DMA-safe
     // Size: 33 contexts (input control + slot + 31 endpoints) * context_size
@@ -1308,9 +1305,9 @@ void xhci_process_events(xhci_controller_t* ctrl) {
         uint8_t trb_cycle = (trb->control & TRB_FLAG_CYCLE) ? 1 : 0;
         if (trb_cycle != ring->cycle) {
             // Check if EINT is set but we have cycle mismatch - might need resync
-            // Skip resync on VirtualBox (quirk_no_resync) as it sets EINT spuriously
+            // Only QEMU needs resync - other controllers set EINT spuriously
             uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-            if (!ctrl->quirk_no_resync && (usbsts & XHCI_STS_EINT) && processed == 0) {
+            if (ctrl->quirk_resync && (usbsts & XHCI_STS_EINT) && processed == 0) {
                 // EINT set but no events - try toggling cycle bit
                 ring->cycle ^= 1;
                 trb_cycle = (trb->control & TRB_FLAG_CYCLE) ? 1 : 0;

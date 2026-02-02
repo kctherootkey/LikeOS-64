@@ -386,7 +386,7 @@ typedef struct xhci_controller {
     // PCI info (for quirks detection)
     uint16_t pci_vendor;
     uint16_t pci_device;
-    uint8_t quirk_no_resync;  // Disable EINT cycle resync (VirtualBox)
+    uint8_t quirk_resync;  // Enable EINT cycle resync (QEMU only)
     
     // Scratchpad
     uint64_t* scratchpad_array;
