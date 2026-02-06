@@ -7,7 +7,17 @@ mkdir -p "$LOGDIR"
 xsetroot -solid "#000000"
 xset -dpms
 xset s off
-xrandr -s 1280x800 >/dev/null 2>&1 || true
+
+# Set preferred resolution: try 1280x800, 1280x768, 1024x768 in order
+set_preferred_resolution() {
+    for res in 1280x800 1280x768 1024x768; do
+        if xrandr -q 2>/dev/null | grep -q "$res"; then
+            xrandr -s "$res" 2>/dev/null && return 0
+        fi
+    done
+    return 1
+}
+set_preferred_resolution || true
 
 if [ "$DEBUG" = "1" ]; then
 	# Run QEMU in background so we can keep an xterm visible for debugging

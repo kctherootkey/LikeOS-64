@@ -715,7 +715,60 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         g_boot_info.fb_info.pixels_per_scanline = 80;
         g_boot_info.fb_info.bytes_per_pixel = 2;
     } else {
-        // Get current mode information
+        // Preferred resolutions in priority order: 1280x800, 1280x768, 1024x768
+        struct { UINT32 width; UINT32 height; } preferred[] = {
+            {1280, 800},
+            {1280, 768},
+            {1024, 768}
+        };
+        UINTN num_preferred = sizeof(preferred) / sizeof(preferred[0]);
+        UINT32 selected_mode = gop->Mode->Mode;  // Default to current mode
+        BOOLEAN found_preferred = FALSE;
+        
+        Print(L"Enumerating %d GOP modes for preferred resolution...\r\n", gop->Mode->MaxMode);
+        
+        // Search for preferred resolutions in priority order
+        for (UINTN pref = 0; pref < num_preferred && !found_preferred; pref++) {
+            for (UINT32 mode = 0; mode < gop->Mode->MaxMode; mode++) {
+                EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mode_info;
+                UINTN mode_info_size;
+                
+                status = uefi_call_wrapper(gop->QueryMode, 4, gop, mode, &mode_info_size, &mode_info);
+                if (EFI_ERROR(status)) continue;
+                
+                // Only consider 32-bit pixel formats (BGR or RGB)
+                if (mode_info->PixelFormat != PixelBlueGreenRedReserved8BitPerColor &&
+                    mode_info->PixelFormat != PixelRedGreenBlueReserved8BitPerColor) {
+                    continue;
+                }
+                
+                // Check for exact match with current preferred resolution
+                if (mode_info->HorizontalResolution == preferred[pref].width &&
+                    mode_info->VerticalResolution == preferred[pref].height) {
+                    selected_mode = mode;
+                    found_preferred = TRUE;
+                    Print(L"Found preferred resolution %dx%d (mode %d)\r\n",
+                          preferred[pref].width, preferred[pref].height, mode);
+                    break;
+                }
+            }
+        }
+        
+        if (!found_preferred) {
+            Print(L"No preferred resolution found, using firmware default\r\n");
+        }
+        
+        // Set the selected mode if different from current
+        if (selected_mode != gop->Mode->Mode) {
+            status = uefi_call_wrapper(gop->SetMode, 2, gop, selected_mode);
+            if (EFI_ERROR(status)) {
+                Print(L"WARNING: SetMode(%d) failed: %r, using default\r\n", selected_mode, status);
+            } else {
+                Print(L"Set graphics mode to %d\r\n", selected_mode);
+            }
+        }
+        
+        // Get (possibly updated) mode information
         g_boot_info.fb_info.framebuffer_base = (void*)gop->Mode->FrameBufferBase;
         g_boot_info.fb_info.framebuffer_size = (uint32_t)gop->Mode->FrameBufferSize;
         g_boot_info.fb_info.horizontal_resolution = gop->Mode->Info->HorizontalResolution;
