@@ -212,6 +212,31 @@ int signal_pending(task_t* task) {
     return !sigisemptyset_k(&unblocked);
 }
 
+// Check if all pending signals have SA_RESTART set
+// Returns 1 if syscall should be restarted (all signals have SA_RESTART)
+// Returns 0 if syscall should return -EINTR (at least one signal lacks SA_RESTART)
+int signal_should_restart(task_t* task) {
+    if (!task) return 0;
+    
+    task_signal_state_t* sig = &task->signals;
+    
+    // Check all pending, unblocked signals
+    for (int s = 1; s < NSIG; s++) {
+        if (sigismember_k(&sig->pending, s)) {
+            // Skip blocked signals (except SIGKILL/SIGSTOP)
+            if (!sig_kernel_only(s) && sigismember_k(&sig->blocked, s)) {
+                continue;
+            }
+            // Check if this signal's handler has SA_RESTART
+            if (!(sig->action[s].sa_flags & SA_RESTART)) {
+                return 0;  // At least one signal lacks SA_RESTART
+            }
+        }
+    }
+    
+    return 1;  // All pending signals have SA_RESTART (or no pending signals)
+}
+
 // Dequeue a pending signal (returns signal number, 0 if none)
 int signal_dequeue(task_t* task, kernel_sigset_t* mask, siginfo_t* info) {
     if (!task) return 0;

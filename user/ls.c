@@ -4,6 +4,8 @@
 #include <sys/stat.h>
 #include <errno.h>
 
+static int g_errors = 0;
+
 static void print_entry(const char* name, const struct stat* st) {
     char type = '-';
     if ((st->st_mode & S_IFMT) == S_IFDIR) type = 'd';
@@ -14,6 +16,7 @@ static void list_dir(const char* path, int show_header) {
     DIR* dir = opendir(path);
     if (!dir) {
         printf("ls: cannot access %s (%d)\n", path, errno);
+        g_errors++;
         return;
     }
     if (show_header) {
@@ -55,6 +58,7 @@ static void list_path(const char* path, int show_header) {
     struct stat st;
     if (stat(path, &st) != 0) {
         printf("ls: cannot access %s (%d)\n", path, errno);
+        g_errors++;
         return;
     }
     print_entry(path, &st);
@@ -63,10 +67,10 @@ static void list_path(const char* path, int show_header) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         list_path(".", 0);
-        return 0;
+        return g_errors > 0 ? 1 : 0;
     }
     for (int i = 1; i < argc; ++i) {
         list_path(argv[i], argc > 2);
     }
-    return 0;
+    return g_errors > 0 ? 1 : 0;
 }

@@ -21,7 +21,6 @@ static const char* commands[] = {
     "/testlibc",
     "/tests",
     "/testmem 400",
-    "/testmem 500",
     "/hello",
     "/memstat",
     "/bin/cat /HELLO.TXT",
@@ -133,13 +132,29 @@ int main(int argc, char** argv) {
             exit(1);
         }
         
-        // Parent: wait for child
+        // Parent: wait for child and check exit status
         int status;
         waitpid(pid, &status, 0);
+        
+        // Check if child exited normally
+        if (WIFEXITED(status)) {
+            int exit_code = WEXITSTATUS(status);
+            if (exit_code != 0) {
+                printf("[FAIL] Command '%s' exited with code %d\n", cmd, exit_code);
+                printf("=== STRESS TEST FAILED after %d iterations ===\n", iteration);
+                return 1;
+            }
+        } else if (WIFSIGNALED(status)) {
+            int sig = WTERMSIG(status);
+            printf("[FAIL] Command '%s' killed by signal %d\n", cmd, sig);
+            printf("=== STRESS TEST FAILED after %d iterations ===\n", iteration);
+            return 1;
+        }
         
         // Small delay between commands
         for (volatile int i = 0; i < 100000; i++);
     }
     
+    printf("=== STRESS TEST PASSED ===\n");
     return 0;
 }

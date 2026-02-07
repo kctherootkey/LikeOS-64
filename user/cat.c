@@ -27,6 +27,7 @@ static int cat_fd(int fd) {
 }
 
 int main(int argc, char** argv) {
+    int errors = 0;
     if (argc < 2) {
         if (cat_fd(STDIN_FILENO) != 0) {
             printf("cat: read error (%d)\n", errno);
@@ -38,6 +39,7 @@ int main(int argc, char** argv) {
         int fd = open(argv[i], O_RDONLY);
         if (fd < 0) {
             printf("cat: cannot open %s (%d)\n", argv[i], errno);
+            errors++;
             continue;
         }
         if (cat_fd(fd) != 0) {
@@ -47,5 +49,5 @@ int main(int argc, char** argv) {
         }
         close(fd);
     }
-    return 0;
+    return errors > 0 ? 1 : 0;
 }

@@ -446,6 +446,7 @@ void signal_cleanup_task(struct task* task);
 int signal_send(struct task* task, int sig, siginfo_t* info);
 int signal_send_group(int pgid, int sig, siginfo_t* info);
 int signal_pending(struct task* task);
+int signal_should_restart(struct task* task);
 int signal_dequeue(struct task* task, kernel_sigset_t* mask, siginfo_t* info);
 void signal_deliver(struct task* task);
 void signal_check_timers(struct task* task, uint64_t current_tick);

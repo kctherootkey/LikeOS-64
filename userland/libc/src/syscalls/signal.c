@@ -73,7 +73,7 @@ sighandler_t signal(int sig, sighandler_t handler) {
     memset(&act, 0, sizeof(act));
     act.sa_handler = handler;
     sigemptyset(&act.sa_mask);
-    act.sa_flags = SA_RESTART | SA_RESTORER;  // Use restorer
+    act.sa_flags = SA_RESTORER;  // Do NOT set SA_RESTART - syscalls return EINTR
     act.sa_restorer = __restore_rt;
     
     if (sigaction(sig, &act, &oldact) < 0) {
