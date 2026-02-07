@@ -31,6 +31,7 @@ global syscall_saved_user_r12
 global syscall_saved_user_r13
 global syscall_saved_user_r14
 global syscall_saved_user_r15
+global syscall_saved_user_rax
 syscall_saved_user_rip:
     dq 0
 syscall_saved_user_rsp:
@@ -48,6 +49,8 @@ syscall_saved_user_r13:
 syscall_saved_user_r14:
     dq 0
 syscall_saved_user_r15:
+    dq 0
+syscall_saved_user_rax:
     dq 0
 
 ; Signal delivery: if non-zero, this is the signal number to pass in RDI
@@ -204,8 +207,10 @@ syscall_entry:
     mov r14, [rel syscall_saved_user_r14]
     mov r15, [rel syscall_saved_user_r15]
     
+    ; Restore RAX (syscall return value, e.g., -EINTR)
+    mov rax, [rel syscall_saved_user_rax]
+    
     ; Clear other registers
-    xor rax, rax
     xor rdi, rdi
     xor rsi, rsi
     xor rdx, rdx

@@ -90,6 +90,8 @@
 #define SYS_SIGNALFD        268
 #define SYS_PAUSE           270
 #define SYS_NANOSLEEP       271
+#define SYS_CLOCK_GETTIME   272
+#define SYS_CLOCK_GETRES    273
 
 // Syscall wrapper - uses inline assembly to invoke syscall instruction
 static inline long syscall0(long number) {

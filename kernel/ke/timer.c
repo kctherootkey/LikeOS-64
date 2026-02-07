@@ -43,11 +43,26 @@ uint64_t timer_ticks(void) {
 
 void timer_irq_handler(void) {
     g_ticks++;
-    // Check signal timers for current task
+    
+    // Wake any tasks whose sleep timer has expired and check signal timers
+    // This handles alarm(), itimer, and wakes sleeping tasks
+    sched_wake_expired_sleepers(g_ticks);
+    
+    // Preemption logic for current task
     task_t* cur = sched_current();
     if (cur) {
-        signal_check_timers(cur, g_ticks);
+        // Preemption logic: decrement time slice and trigger reschedule if expired
+        if (cur->remaining_ticks > 0) {
+            cur->remaining_ticks--;
+        }
+        // If time slice expired and task is runnable, mark for rescheduling
+        // Check both RUNNING and READY since current task might not have RUNNING set
+        if (cur->remaining_ticks == 0 && (cur->state == TASK_RUNNING || cur->state == TASK_READY)) {
+            // Time slice expired - mark for rescheduling
+            sched_set_need_resched(cur);
+        }
     }
-    // Notify scheduler of tick (cooperative only increments counter for now)
+    
+    // Notify scheduler of tick (updates statistics)
     sched_tick();
 }

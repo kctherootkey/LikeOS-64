@@ -327,22 +327,14 @@ pid_t wait4(pid_t pid, int* status, int options, void* rusage) {
 }
 
 pid_t waitpid(pid_t pid, int* status, int options) {
-    // If WNOHANG is not set, loop until child exits
-    while (1) {
-        long ret = syscall3(SYS_WAIT4, pid, (long)status, options);
-        if (ret >= 0) {
-            return ret;
-        }
-        // EAGAIN (11) means no child has exited yet - retry
-        // ECHILD (10) means no children exist - return error
-        if (ret == -11 && !(options & WNOHANG)) {
-            // Yield and retry
-            sched_yield();
-            continue;
-        }
-        errno = -ret;
-        return -1;
+    // Kernel handles blocking when WNOHANG is not set
+    // No need for userspace busy-loop - preemptive kernel blocks until child exits
+    long ret = syscall3(SYS_WAIT4, pid, (long)status, options);
+    if (ret >= 0) {
+        return ret;
     }
+    errno = -ret;
+    return -1;
 }
 
 void* sbrk(intptr_t increment) {

@@ -1,6 +1,7 @@
 #include "../../include/signal.h"
 #include "../../include/errno.h"
 #include "../../include/unistd.h"
+#include "../../include/time.h"
 #include "syscall.h"
 #include "../../include/string.h"
 
@@ -367,6 +368,24 @@ int usleep(unsigned int usec) {
     req.tv_nsec = (usec % 1000000) * 1000;
     
     if (nanosleep(&req, &rem) < 0 && errno != EINTR) {
+        return -1;
+    }
+    return 0;
+}
+
+int clock_gettime(clockid_t clk_id, struct timespec* tp) {
+    long ret = syscall2(SYS_CLOCK_GETTIME, (long)clk_id, (long)tp);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return 0;
+}
+
+int clock_getres(clockid_t clk_id, struct timespec* res) {
+    long ret = syscall2(SYS_CLOCK_GETRES, (long)clk_id, (long)res);
+    if (ret < 0) {
+        errno = -ret;
         return -1;
     }
     return 0;

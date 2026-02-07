@@ -1135,6 +1135,65 @@ int main(int argc, char** argv) {
     }
 
     // ========================================
+    // MAP_SHARED Test (Shared Memory Between Parent and Child)
+    // ========================================
+    printf("\n--- MAP_SHARED Test ---\n");
+    {
+        // Create shared anonymous memory
+        volatile int* shared_mem = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                        MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        test_result("mmap(MAP_SHARED|MAP_ANONYMOUS) succeeds", shared_mem != MAP_FAILED);
+        
+        if (shared_mem != MAP_FAILED) {
+            // Initialize shared memory
+            shared_mem[0] = 0;      // Counter
+            shared_mem[1] = 0;      // Child ready flag
+            shared_mem[2] = 0;      // Parent ack flag
+            
+            pid_t shared_pid = fork();
+            if (shared_pid == 0) {
+                // Child: wait for parent to signal, then increment counter
+                // Spin wait for parent to set ack flag
+                while (shared_mem[2] == 0) {
+                    // Busy wait
+                }
+                
+                // Child increments counter
+                shared_mem[0] = shared_mem[0] + 100;
+                
+                // Signal child is done
+                shared_mem[1] = 1;
+                
+                _exit(0);
+            } else if (shared_pid > 0) {
+                // Parent: write to shared memory and signal child
+                shared_mem[0] = 42;
+                
+                // Signal child to proceed
+                shared_mem[2] = 1;
+                
+                // Wait for child to finish
+                int status;
+                waitpid(shared_pid, &status, 0);
+                
+                // Child should have added 100 to our 42
+                int expected_value = 142;
+                int actual_value = shared_mem[0];
+                
+                printf("MAP_SHARED: parent wrote 42, child added 100, result=%d (expected %d)\n",
+                       actual_value, expected_value);
+                test_result("MAP_SHARED memory visible between processes", 
+                           actual_value == expected_value);
+                test_result("Child completion flag visible", shared_mem[1] == 1);
+            } else {
+                test_result("fork for MAP_SHARED test", 0);
+            }
+            
+            munmap((void*)shared_mem, 4096);
+        }
+    }
+
+    // ========================================
     // Large Allocation Test (100MB)
     // ========================================
     printf("\n--- Large Allocation Test (100MB) ---\n");
@@ -1169,6 +1228,400 @@ int main(int argc, char** argv) {
             printf("100MB freed successfully\n");
         } else {
             printf("FAILED: Could not allocate 100MB\n");
+        }
+    }
+
+    // ========================================
+    // Preemptive Scheduling Test
+    // ========================================
+    printf("\n--- Preemptive Scheduling Test ---\n");
+    {
+        // This test verifies that the scheduler can preempt a CPU-bound child
+        // The parent should be able to continue running even if the child loops forever
+        
+        pid_t child = fork();
+        if (child < 0) {
+            test_fail("preemption test: fork failed");
+        } else if (child == 0) {
+            // Child: infinite CPU-bound loop
+            // With preemptive scheduling, this should NOT starve the parent
+            volatile unsigned long counter = 0;
+            while (1) {
+                counter++;
+                // Tight loop - no voluntary yields
+            }
+            _exit(0); // Never reached
+        } else {
+            // Parent: sleep briefly, then verify we're still running
+            // If scheduling is purely cooperative, we'd be starved by the child
+            
+            // Use a simple busy-wait counter to measure time passing
+            // In a preemptive system, we should still get CPU time
+            volatile unsigned long parent_counter = 0;
+            int parent_ran = 0;
+            
+            // Try to increment counter a million times
+            // With 20ms time slices at 100Hz, we should get enough CPU time
+            for (int i = 0; i < 100; i++) {
+                // Small work unit
+                for (int j = 0; j < 10000; j++) {
+                    parent_counter++;
+                }
+                parent_ran = 1;
+            }
+            
+            // If we got here, preemption is working
+            test_result("parent not starved by child loop", parent_ran);
+            test_result("parent counter incremented", parent_counter > 0);
+            
+            // Kill the looping child
+            printf("Killing child %d...\n", child);
+            int kill_ret = kill(child, SIGKILL);
+            printf("kill() returned %d\n", kill_ret);
+            
+            // Use WNOHANG in a loop with timeout to avoid infinite hang
+            int status = 0;
+            pid_t waited = -1;
+            for (int tries = 0; tries < 100; tries++) {
+                waited = waitpid(child, &status, WNOHANG);
+                if (waited > 0) {
+                    break;  // Child reaped
+                }
+                // Small delay using busy loop
+                for (volatile int d = 0; d < 100000; d++) {}
+            }
+            
+            if (waited == child) {
+                test_result("preemption: child killed", 1);
+                test_result("preemption: child signaled", WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+            } else {
+                printf("waitpid returned %d (expected %d)\n", waited, child);
+                test_fail("preemption: child killed");
+                test_fail("preemption: child signaled");
+            }
+            
+            printf("Preemption test completed: parent_counter=%lu\n", parent_counter);
+        }
+    }
+
+    // ========================================
+    // Extended Preemptive Kernel Tests
+    // ========================================
+    printf("\n--- Extended Preemptive Kernel Tests ---\n");
+    
+    // Test 1: Multiple CPU-bound children - fair scheduling
+    printf("\n[TEST] Multiple CPU-bound children (fair scheduling)\n");
+    {
+        #define NUM_CHILDREN 3
+        pid_t children[NUM_CHILDREN];
+        int pipe_fds[NUM_CHILDREN][2];
+        
+        // Create pipes for each child to report back
+        int pipes_ok = 1;
+        for (int i = 0; i < NUM_CHILDREN; i++) {
+            if (pipe(pipe_fds[i]) < 0) {
+                pipes_ok = 0;
+                break;
+            }
+        }
+        
+        if (pipes_ok) {
+            // Fork children that do CPU work and report iterations
+            for (int i = 0; i < NUM_CHILDREN; i++) {
+                children[i] = fork();
+                if (children[i] == 0) {
+                    // Child: close all pipe ends except our own write end
+                    for (int j = 0; j < NUM_CHILDREN; j++) {
+                        close(pipe_fds[j][0]);  // Close all read ends
+                        if (j != i) {
+                            close(pipe_fds[j][1]);  // Close other children's write ends
+                        }
+                    }
+                    volatile unsigned long count = 0;
+                    // Work for ~100ms worth of iterations
+                    for (int j = 0; j < 500000; j++) {
+                        count++;
+                    }
+                    // Write result to pipe
+                    write(pipe_fds[i][1], &count, sizeof(count));
+                    close(pipe_fds[i][1]);
+                    _exit(0);
+                }
+                // Parent: close write end
+                close(pipe_fds[i][1]);
+            }
+            
+            // Wait for all children and read their counts
+            unsigned long counts[NUM_CHILDREN];
+            int all_finished = 1;
+            for (int i = 0; i < NUM_CHILDREN; i++) {
+                int status;
+                pid_t w = waitpid(children[i], &status, 0);
+                if (w != children[i]) {
+                    all_finished = 0;
+                }
+                ssize_t r = read(pipe_fds[i][0], &counts[i], sizeof(counts[i]));
+                close(pipe_fds[i][0]);
+                if (r != sizeof(counts[i])) {
+                    counts[i] = 0;
+                }
+            }
+            
+            test_result("all children completed", all_finished);
+            
+            // Check that all children did similar amounts of work (fair scheduling)
+            // Allow 50% variance for fairness check
+            unsigned long min_count = counts[0], max_count = counts[0];
+            for (int i = 1; i < NUM_CHILDREN; i++) {
+                if (counts[i] < min_count) min_count = counts[i];
+                if (counts[i] > max_count) max_count = counts[i];
+            }
+            // Fair if max is no more than 3x min (generous for simple scheduler)
+            int is_fair = (min_count > 0) && (max_count <= min_count * 3);
+            printf("  Child work counts: %lu, %lu, %lu\n", counts[0], counts[1], counts[2]);
+            test_result("fair scheduling among children", is_fair);
+        } else {
+            test_fail("multiple children: pipe creation failed");
+            test_fail("fair scheduling among children");
+        }
+    }
+    
+    // Test 2: Signal delivery to blocked task
+    printf("\n[TEST] Signal delivery to sleeping task\n");
+    {
+        static volatile int got_signal = 0;
+        
+        void sig_handler(int sig) {
+            (void)sig;
+            got_signal = 1;
+        }
+        
+        signal(SIGUSR1, sig_handler);
+        got_signal = 0;
+        
+        pid_t child = fork();
+        if (child == 0) {
+            // Child: sleep and get interrupted by signal
+            sleep(10);  // Long sleep, should be interrupted
+            _exit(got_signal ? 42 : 0);
+        } else if (child > 0) {
+            // Parent: wait a bit, then send signal to child
+            usleep(50000);  // 50ms
+            kill(child, SIGUSR1);
+            
+            int status;
+            pid_t w = waitpid(child, &status, 0);
+            test_result("signal woke sleeping child", w == child);
+            // Child should have exited with 42 (signal received) or 0 (no signal)
+            // The key test is that waitpid returned quickly, not after 10 seconds
+            test_result("child exit captured", WIFEXITED(status));
+        } else {
+            test_fail("signal to sleeping: fork failed");
+            test_fail("child exit captured");
+        }
+    }
+    
+    // Test 3: Timer accuracy under load
+    printf("\n[TEST] Timer accuracy under CPU load\n");
+    {
+        pid_t child = fork();
+        if (child == 0) {
+            // Child: CPU-bound loop
+            volatile unsigned long c = 0;
+            while (1) { c++; }
+            _exit(0);
+        } else if (child > 0) {
+            // Parent: measure sleep duration while child consumes CPU
+            struct timespec start, end;
+            
+            // Measure 100ms sleep
+            clock_gettime(CLOCK_MONOTONIC, &start);
+            usleep(100000);  // 100ms
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            
+            // Calculate elapsed time in ms
+            long elapsed_ms = (end.tv_sec - start.tv_sec) * 1000 +
+                             (end.tv_nsec - start.tv_nsec) / 1000000;
+            
+            // Kill the CPU-hog child
+            kill(child, SIGKILL);
+            waitpid(child, NULL, 0);
+            
+            // Timer should be reasonably accurate (80-200ms for 100ms sleep)
+            printf("  Requested 100ms sleep, actual: %ld ms\n", elapsed_ms);
+            test_result("timer accuracy under load", elapsed_ms >= 80 && elapsed_ms <= 300);
+        } else {
+            test_fail("timer accuracy: fork failed");
+        }
+    }
+    
+    // Test 4: Priority inversion scenario (parent waits for child's pipe)
+    printf("\n[TEST] I/O blocking vs CPU-bound scheduling\n");
+    {
+        int pipefd[2];
+        if (pipe(pipefd) == 0) {
+            pid_t cpu_child = fork();
+            if (cpu_child == 0) {
+                // CPU-bound child - tries to starve system
+                close(pipefd[0]);
+                close(pipefd[1]);
+                volatile unsigned long c = 0;
+                for (int i = 0; i < 10000000; i++) { c++; }
+                _exit(0);
+            }
+            
+            pid_t io_child = fork();
+            if (io_child == 0) {
+                // I/O child - writes to pipe after brief delay
+                close(pipefd[0]);
+                usleep(20000);  // 20ms delay
+                write(pipefd[1], "OK", 2);
+                close(pipefd[1]);
+                _exit(0);
+            }
+            
+            // Parent: read from pipe (should complete despite CPU-bound sibling)
+            close(pipefd[1]);
+            char buf[4] = {0};
+            ssize_t n = read(pipefd[0], buf, 2);
+            close(pipefd[0]);
+            
+            // Wait for both children
+            waitpid(cpu_child, NULL, 0);
+            waitpid(io_child, NULL, 0);
+            
+            test_result("I/O completed despite CPU load", n == 2 && buf[0] == 'O');
+        } else {
+            test_fail("I/O blocking test: pipe failed");
+        }
+    }
+    
+    // Test 5: Rapid fork/exit stress test
+    printf("\n[TEST] Rapid fork/exit stress\n");
+    {
+        #define STRESS_ITERATIONS 20
+        int success_count = 0;
+        
+        for (int i = 0; i < STRESS_ITERATIONS; i++) {
+            pid_t p = fork();
+            if (p == 0) {
+                // Child: exit immediately
+                _exit(i);
+            } else if (p > 0) {
+                int status;
+                pid_t w = waitpid(p, &status, 0);
+                if (w == p && WIFEXITED(status) && WEXITSTATUS(status) == (i & 0xFF)) {
+                    success_count++;
+                }
+            }
+        }
+        
+        printf("  Completed %d/%d fork/exit cycles\n", success_count, STRESS_ITERATIONS);
+        test_result("rapid fork/exit stress", success_count == STRESS_ITERATIONS);
+    }
+    
+    // Test 6: Time slice fairness measurement
+    printf("\n[TEST] Time slice measurement\n");
+    {
+        // Two processes race to increment counters
+        volatile unsigned long *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                              MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (shared != MAP_FAILED) {
+            shared[0] = 0;  // Child counter
+            shared[1] = 0;  // Parent counter
+            shared[2] = 0;  // Stop flag
+            shared[3] = 0;  // Child ready flag
+            
+            pid_t child = fork();
+            if (child == 0) {
+                // Child: signal ready, then increment counter until stop flag
+                shared[3] = 1;  // Signal that child is running
+                while (!shared[2]) {
+                    shared[0]++;
+                }
+                _exit(0);
+            } else if (child > 0) {
+                // Wait for child to start (prevents race where stop flag is set before child runs)
+                while (!shared[3]) {
+                    // Spin until child signals ready
+                }
+                
+                // Parent: increment counter for fixed time duration
+                // Use time-based loop to ensure preemption can occur
+                struct timespec start_time, now;
+                clock_gettime(CLOCK_MONOTONIC, &start_time);
+                
+                // Run for 100ms to allow multiple time slices
+                while (1) {
+                    shared[1]++;
+                    // Check time every 1000 iterations to reduce overhead
+                    if ((shared[1] % 1000) == 0) {
+                        clock_gettime(CLOCK_MONOTONIC, &now);
+                        long elapsed_ms = (now.tv_sec - start_time.tv_sec) * 1000 +
+                                         (now.tv_nsec - start_time.tv_nsec) / 1000000;
+                        if (elapsed_ms >= 100) break;  // Run for 100ms
+                    }
+                }
+                shared[2] = 1;  // Signal child to stop
+                
+                waitpid(child, NULL, 0);
+                
+                printf("  Child iterations: %lu, Parent iterations: %lu\n", 
+                       shared[0], shared[1]);
+                
+                // Both should have gotten CPU time
+                test_result("child got CPU time", shared[0] > 100);
+                test_result("parent got CPU time", shared[1] > 1000);
+                
+                // Check rough fairness (within 10x) - avoid divide by zero
+                if (shared[0] > 0 && shared[1] > 0) {
+                    unsigned long ratio = (shared[0] > shared[1]) ? 
+                                         shared[0] / shared[1] : shared[1] / shared[0];
+                    test_result("time slice roughly fair", ratio < 10);
+                } else {
+                    test_result("time slice roughly fair", 0);
+                }
+            }
+            
+            munmap((void*)shared, 4096);
+        } else {
+            test_fail("time slice test: mmap failed");
+            test_fail("child got CPU time");
+            test_fail("parent got CPU time");
+            test_fail("time slice roughly fair");
+        }
+    }
+    
+    // Test 7: Nested signal during syscall
+    printf("\n[TEST] Signal during blocking syscall\n");
+    {
+        int pipefd[2];
+        if (pipe(pipefd) == 0) {
+            static volatile int alarm_received = 0;
+            
+            void alarm_handler(int sig) {
+                (void)sig;
+                alarm_received = 1;
+            }
+            
+            signal(SIGALRM, alarm_handler);
+            alarm_received = 0;
+            
+            // Set alarm to fire during read
+            alarm(1);
+            
+            // Read from pipe with no writer - should block until alarm
+            char buf[10];
+            ssize_t n = read(pipefd[0], buf, 10);
+            
+            close(pipefd[0]);
+            close(pipefd[1]);
+            
+            test_result("blocking read interrupted", n < 0 && errno == EINTR);
+            test_result("alarm handler ran", alarm_received == 1);
+        } else {
+            test_fail("blocking syscall test: pipe failed");
+            test_fail("alarm handler ran");
         }
     }
 

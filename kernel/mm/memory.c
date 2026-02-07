@@ -2025,6 +2025,132 @@ fail:
     return NULL;
 }
 
+// Helper: check if virtual address is in a shared range
+static bool is_in_shared_range(uint64_t vaddr, uint64_t* shared_regions, int num_shared) {
+    if (!shared_regions) return false;
+    for (int i = 0; i < num_shared; i++) {
+        uint64_t start = shared_regions[i * 2];
+        uint64_t end = shared_regions[i * 2 + 1];
+        if (vaddr >= start && vaddr < end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Clone an address space with support for shared memory regions
+// For MAP_SHARED regions, we keep the same physical pages (no COW)
+uint64_t* mm_clone_address_space_with_shared(uint64_t* src_pml4, 
+    uint64_t* shared_regions, int num_shared) {
+    
+    if (!src_pml4) {
+        return NULL;
+    }
+    
+    // Create new address space (this sets up kernel mappings)
+    uint64_t* new_pml4 = mm_create_user_address_space();
+    if (!new_pml4) {
+        return NULL;
+    }
+    
+    // Handle PML4 entries 0-255 (user space)
+    for (int i = 0; i < 256; i++) {
+        if (!(src_pml4[i] & PAGE_PRESENT)) continue;
+        
+        uint64_t src_pdpt_phys = src_pml4[i] & PTE_ADDR_MASK;
+        uint64_t* src_pdpt = (uint64_t*)phys_to_virt(src_pdpt_phys);
+        
+        uint64_t pdpt_phys = allocate_pt_page();
+        if (!pdpt_phys) goto fail;
+        new_pml4[i] = pdpt_phys | (src_pml4[i] & PTE_FLAGS_MASK);
+        uint64_t* new_pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
+        
+        for (int j = 0; j < 512; j++) {
+            if (!(src_pdpt[j] & PAGE_PRESENT)) continue;
+            
+            uint64_t src_pd_phys = src_pdpt[j] & PTE_ADDR_MASK;
+            uint64_t* src_pd = (uint64_t*)phys_to_virt(src_pd_phys);
+            
+            uint64_t pd_phys = allocate_pt_page();
+            if (!pd_phys) goto fail;
+            new_pdpt[j] = pd_phys | (src_pdpt[j] & PTE_FLAGS_MASK);
+            uint64_t* new_pd = (uint64_t*)phys_to_virt(pd_phys);
+            
+            for (int k = 0; k < 512; k++) {
+                if (!(src_pd[k] & PAGE_PRESENT)) continue;
+                
+                // Calculate virtual address for this PD entry
+                uint64_t vaddr_base = ((uint64_t)i << 39) | ((uint64_t)j << 30) | ((uint64_t)k << 21);
+                
+                if (src_pd[k] & PAGE_SIZE_FLAG) {
+                    // 2MB huge page
+                    if (src_pd[k] & PAGE_USER) {
+                        if (is_in_shared_range(vaddr_base, shared_regions, num_shared)) {
+                            // Shared - keep same physical page, keep writable
+                            new_pd[k] = src_pd[k];
+                        } else {
+                            // Not shared - use COW
+                            uint64_t cow_flags = (src_pd[k] & ~PAGE_WRITABLE) | PAGE_COW;
+                            src_pd[k] = cow_flags;
+                            new_pd[k] = cow_flags;
+                        }
+                    } else {
+                        new_pd[k] = src_pd[k];
+                    }
+                } else {
+                    uint64_t src_pt_phys = src_pd[k] & PTE_ADDR_MASK;
+                    uint64_t* src_pt = (uint64_t*)phys_to_virt(src_pt_phys);
+                    
+                    uint64_t pt_phys = allocate_pt_page();
+                    if (!pt_phys) goto fail;
+                    new_pd[k] = pt_phys | (src_pd[k] & PTE_FLAGS_MASK);
+                    uint64_t* new_pt = (uint64_t*)phys_to_virt(pt_phys);
+                    
+                    for (int l = 0; l < 512; l++) {
+                        if (!(src_pt[l] & PAGE_PRESENT)) continue;
+                        
+                        // Calculate full virtual address
+                        uint64_t vaddr = vaddr_base | ((uint64_t)l << 12);
+                        
+                        if (src_pt[l] & PAGE_USER) {
+                            uint64_t phys_page = src_pt[l] & 0x000FFFFFFFFFF000ULL;
+                            
+                            if (is_in_shared_range(vaddr, shared_regions, num_shared)) {
+                                // Shared region - map same physical page, keep original flags
+                                new_pt[l] = src_pt[l];
+                                // Increment refcount for shared page
+                                mm_incref_page(phys_page);
+                            } else {
+                                // Not shared - use COW
+                                uint64_t cow_flags = (src_pt[l] & ~PAGE_WRITABLE) | PAGE_COW;
+                                src_pt[l] = cow_flags;
+                                new_pt[l] = cow_flags;
+                                
+                                // Increment page reference count
+                                if (mm_get_page_refcount(phys_page) == 0) {
+                                    mm_incref_page(phys_page);
+                                }
+                                mm_incref_page(phys_page);
+                            }
+                        } else {
+                            new_pt[l] = src_pt[l];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Flush TLB
+    mm_flush_all_tlb();
+    
+    return new_pml4;
+    
+fail:
+    mm_destroy_address_space(new_pml4);
+    return NULL;
+}
+
 // ============================================================================
 // SYSCALL/SYSRET CONFIGURATION
 // ============================================================================

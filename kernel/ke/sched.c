@@ -1,4 +1,4 @@
-// LikeOS-64 Cooperative Scheduler
+// LikeOS-64 Preemptive Scheduler with Full Kernel Preemption
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/memory.h"
@@ -9,12 +9,17 @@
 #include "../../include/kernel/tty.h"
 #include "../../include/kernel/signal.h"
 #include "../../include/kernel/timer.h"
+#include "../../include/kernel/syscall.h"  // For MAP_SHARED
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
 
+// Preemption control - global counter (per-CPU for SMP in future)
+volatile int g_preempt_count = 0;
 
-#define SCHED_SLICE_TICKS 10
+// Scheduler spinlock for SMP safety
+spinlock_t g_sched_lock = SPINLOCK_INIT("sched");
+
 #define SCHED_BOOTSTRAP_INTERVAL 10  // Run bootstrap every N yields (was 50)
 
 static task_t g_bootstrap_task;
@@ -23,10 +28,10 @@ static uint8_t g_idle_stack[4096] __attribute__((aligned(16)));
 static uint8_t g_bootstrap_stack[8192] __attribute__((aligned(16)));
 static task_t* g_current = 0;
 static int g_next_id = 1;
-static uint64_t g_slice_accum = 0;
 static uint64_t g_yield_count = 0;  // Counter to ensure bootstrap runs periodically
 static uint64_t* g_kernel_pml4 = 0;
 static uint64_t g_default_kernel_stack = 0;
+static uint64_t g_preempt_count_total = 0;  // Debug: total preemptions
 
 // Current kernel stack for syscall handler (per-task)
 #include "../../include/kernel/pipe.h"
@@ -89,10 +94,15 @@ void sched_init(void) {
     g_bootstrap_task.ctty = NULL;
     g_bootstrap_task.wait_next = NULL;
     g_bootstrap_task.wait_channel = NULL;
+    g_bootstrap_task.wakeup_tick = 0;
+    // Preemption fields
+    g_bootstrap_task.need_resched = 0;
+    g_bootstrap_task.remaining_ticks = SCHED_TIME_SLICE;
+    g_bootstrap_task.preempt_frame = NULL;
     g_current = &g_bootstrap_task;
 
     sched_add_task(idle_entry, 0, g_idle_stack, sizeof(g_idle_stack));
-    kprintf("Scheduler initialized\n");
+    kprintf("Preemptive scheduler initialized (time slice=%d ticks)\n", SCHED_TIME_SLICE);
 }
 
 void sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack_size) {
@@ -129,6 +139,12 @@ void sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack
     t->ctty = NULL;
     t->wait_next = NULL;
     t->wait_channel = NULL;
+    t->wakeup_tick = 0;
+    
+    // Initialize preemption fields
+    t->need_resched = 0;
+    t->remaining_ticks = SCHED_TIME_SLICE;
+    t->preempt_frame = NULL;
     
     // Initialize signal state
     signal_init_task(t);
@@ -211,6 +227,12 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint6
     t->ctty = tty_get_console();
     t->wait_next = NULL;
     t->wait_channel = NULL;
+    t->wakeup_tick = 0;
+    
+    // Initialize preemption fields
+    t->need_resched = 0;
+    t->remaining_ticks = SCHED_TIME_SLICE;
+    t->preempt_frame = NULL;
     
     // Initialize signal state
     signal_init_task(t);
@@ -259,7 +281,6 @@ static inline int is_bootstrap_task(const task_t* t) {
 }
 
 static task_t* pick_next(task_t* start, int from_timer) {
-    (void)from_timer;
     if (!start || !start->next) {
         return start;
     }
@@ -267,18 +288,26 @@ static task_t* pick_next(task_t* start, int from_timer) {
     task_t* it = start->next;
     task_t* idle_candidate = 0;
     task_t* bootstrap_candidate = 0;
+    task_t* other_user_task = 0;
     
     // First, check the start task itself (in case it's bootstrap and ready)
-    if (is_bootstrap_task(start) && (start->state == TASK_READY || start->state == TASK_RUNNING)) {
+    if (is_bootstrap_task(start) && (start->state == TASK_READY || start->state == TASK_RUNNING) && !start->has_exited) {
         bootstrap_candidate = start;
     }
     
     while (it != start) {
+        // Skip exited/zombie tasks - they must never be scheduled
+        if (it->has_exited) {
+            it = it->next;
+            if (!it) break;
+            continue;
+        }
         if (it->state == TASK_READY || it->state == TASK_RUNNING) {
-            // Prefer regular user tasks first
+            // Track user tasks that are not the current one
             if (!is_idle_task(it) && !is_bootstrap_task(it)) {
-                g_yield_count = 0;  // Reset counter when switching to user task
-                return it;
+                if (!other_user_task) {
+                    other_user_task = it;
+                }
             }
             if (is_idle_task(it)) {
                 idle_candidate = it;
@@ -291,73 +320,124 @@ static task_t* pick_next(task_t* start, int from_timer) {
         if (!it) break;
     }
     
+    // If there's another user task ready, switch to it (round-robin)
+    if (other_user_task) {
+        g_yield_count = 0;
+        return other_user_task;
+    }
+    
+    // No other user tasks - increment yield count for bootstrap interval
+    g_yield_count++;
+    
     // Periodically let bootstrap run for system housekeeping (shell, USB polling)
-    // This prevents user tasks from completely starving the kernel loop
+    // This prevents a single user task from completely starving the kernel loop
     if (bootstrap_candidate && g_yield_count >= SCHED_BOOTSTRAP_INTERVAL) {
         g_yield_count = 0;
         return bootstrap_candidate;
     }
     
-    // If current task is a user task and ready, keep running it
-    if (!is_idle_task(start) && !is_bootstrap_task(start) && 
-        (start->state == TASK_READY || start->state == TASK_RUNNING)) {
+    // If called from timer preemption, occasionally let idle/bootstrap run
+    // This ensures system responsiveness even with a single CPU-bound task
+    if (from_timer && (g_yield_count % 10) == 0) {
+        if (bootstrap_candidate && bootstrap_candidate != start) {
+            return bootstrap_candidate;
+        }
+        if (idle_candidate && idle_candidate != start) {
+            return idle_candidate;
+        }
+    }
+    
+    // If current task is runnable and not exited, keep running it
+    if (!start->has_exited && (start->state == TASK_READY || start->state == TASK_RUNNING)) {
         return start;
     }
     
-    // Prefer bootstrap over idle
-    // Bootstrap runs the main kernel loop (shell_tick, etc.)
-    if (bootstrap_candidate) {
-        return bootstrap_candidate;
-    }
+    // Current task is blocked/stopped/zombie/exited, must switch
     if (idle_candidate) {
         return idle_candidate;
     }
-    return start;
+    if (bootstrap_candidate) {
+        return bootstrap_candidate;
+    }
+    
+    // FATAL: No runnable task found - should never happen
+    // At minimum, idle task should always be READY
+    kprintf("FATAL: pick_next: no runnable task! start=%p state=%d\n",
+            start, start ? start->state : -1);
+    kprintf("  idle_candidate=%p bootstrap_candidate=%p\n",
+            idle_candidate, bootstrap_candidate);
+    for(;;) __asm__ volatile("hlt");
 }
 
 void sched_tick(void) {
+    // In preemptive mode, time slice tracking is done in timer_irq_handler
+    // This function is kept for backward compatibility and statistics
     if (!g_current) {
         return;
     }
-    g_slice_accum++;
+    // Statistics only - preemption is handled by timer_irq_handler
 }
 
-// Debug: track yield calls for watchdog
-static volatile uint64_t g_total_yields = 0;
+// Debug: track schedule calls for watchdog
+static volatile uint64_t g_total_schedules = 0;
 
-void sched_yield(void) {
+// Core scheduling function - selects next task and switches to it
+// Does NOT modify current task's state - caller must set it appropriately before calling
+// (TASK_BLOCKED, TASK_ZOMBIE, TASK_READY, etc.)
+void sched_schedule(void) {
     if (!g_current) {
-        return;
-    }
-    g_slice_accum = 0;
-    g_yield_count++;  // Track yields to ensure bootstrap runs periodically
-    g_total_yields++;  // Debug counter
-    task_t* next = pick_next(g_current, 0);  // from_timer=0
-    if (next == g_current) {
         return;
     }
     
-    if (next->sp == 0) {
-        kprintf("FATAL: sched_yield next->sp is NULL!\n");
+    // Acquire scheduler lock (for SMP safety)
+    // Note: We don't use preempt_disable here because we're about to switch tasks
+    // and each task needs its own preemption state
+    spin_lock(&g_sched_lock);
+    
+    g_yield_count++;  // Track schedules
+    g_total_schedules++;  // Debug counter
+    
+    task_t* next = pick_next(g_current, 0);  // from_timer=0
+    if (next == g_current) {
+        // No context switch needed, just reset time slice
+        g_current->remaining_ticks = SCHED_TIME_SLICE;
+        g_current->need_resched = 0;
+        spin_unlock(&g_sched_lock);
+        return;
+    }
+    
+    if (!next || next->sp == 0) {
+        kprintf("FATAL: sched_schedule next is NULL or sp is NULL!\n");
+        spin_unlock(&g_sched_lock);
         for(;;) __asm__ volatile("hlt");
     }
     
     task_t* prev = g_current;
     g_current = next;
-    if (prev->state != TASK_ZOMBIE) {
-        prev->state = TASK_READY;
-    }
+    
+    // Note: We do NOT touch prev->state here - caller already set it
+    // (could be TASK_BLOCKED, TASK_ZOMBIE, TASK_STOPPED, or TASK_READY)
+    
     next->state = TASK_RUNNING;
+    next->remaining_ticks = SCHED_TIME_SLICE;
+    next->need_resched = 0;
+    
+    spin_unlock(&g_sched_lock);
     
     switch_address_space(prev, next);
     ctx_switch_asm(&prev->sp, next->sp);
+    
+    // We return here when this task is scheduled again
+    // g_preempt_count should be 0 for normal operation
 }
 
 void sched_run_ready(void) {
-    if (!g_current || g_slice_accum < SCHED_SLICE_TICKS) {
+    // In preemptive mode, check if reschedule is needed
+    if (!g_current || !sched_need_resched()) {
         return;
     }
-    g_slice_accum = 0;
+    g_current->remaining_ticks = SCHED_TIME_SLICE;
+    g_current->need_resched = 0;
     task_t* next = pick_next(g_current, 0);  // from_timer=0, exclude bootstrap
     
     if (!next) {
@@ -416,7 +496,7 @@ static void task_trampoline(void) {
     }
     cur->state = TASK_ZOMBIE;
     for (;;) {
-        sched_yield();
+        sched_schedule();
         __asm__ volatile ("hlt");
     }
 }
@@ -574,8 +654,27 @@ task_t* sched_fork_current(void) {
         return NULL;
     }
     
-    // Clone address space with COW
-    uint64_t* child_pml4 = mm_clone_address_space(cur->pml4);
+    // Build list of MAP_SHARED regions for the clone function
+    // Format: pairs of (start, end) addresses
+    uint64_t shared_regions[TASK_MAX_MMAP * 2];
+    int num_shared = 0;
+    
+    for (int i = 0; i < TASK_MAX_MMAP; i++) {
+        if (cur->mmap_regions[i].in_use && 
+            (cur->mmap_regions[i].flags & MAP_SHARED)) {
+            shared_regions[num_shared * 2] = cur->mmap_regions[i].start;
+            shared_regions[num_shared * 2 + 1] = cur->mmap_regions[i].start + cur->mmap_regions[i].length;
+            num_shared++;
+        }
+    }
+    
+    // Clone address space with COW (but keep MAP_SHARED regions truly shared)
+    uint64_t* child_pml4;
+    if (num_shared > 0) {
+        child_pml4 = mm_clone_address_space_with_shared(cur->pml4, shared_regions, num_shared);
+    } else {
+        child_pml4 = mm_clone_address_space(cur->pml4);
+    }
     if (!child_pml4) {
         kfree(child);
         return NULL;
@@ -612,9 +711,10 @@ task_t* sched_fork_current(void) {
     child->is_fork_child = true;  // Child should return 0 from fork
     child->wait_next = NULL;
     child->wait_channel = NULL;
+    child->wakeup_tick = 0;
     
-    // Initialize signal state for child
-    signal_init_task(child);
+    // Copy signal handlers from parent (POSIX: inherited across fork)
+    signal_fork_copy(child, cur);
     
     // Add to parent's child list
     sched_add_child(cur, child);
@@ -690,6 +790,62 @@ void sched_reap_zombies(task_t* parent) {
     }
 }
 
+// Wake up a task that's waiting (blocked)
+static void sched_wake_task(task_t* task) {
+    if (task && task->state == TASK_BLOCKED) {
+        task->state = TASK_READY;
+        task->wait_channel = NULL;
+        task->wakeup_tick = 0;
+    }
+}
+
+// Wake all tasks waiting on a specific channel
+void sched_wake_channel(void* channel) {
+    if (!channel || !g_current) return;
+    
+    task_t* start = g_current;
+    task_t* t = start;
+    
+    do {
+        if (t->state == TASK_BLOCKED && t->wait_channel == channel) {
+            t->state = TASK_READY;
+            t->wait_channel = NULL;
+        }
+        t = t->next;
+    } while (t && t != start);
+}
+
+// Wake all tasks whose sleep timer has expired
+// Called from timer interrupt
+void sched_wake_expired_sleepers(uint64_t current_tick) {
+    if (!g_current) return;
+    
+    task_t* start = g_current;
+    task_t* t = start;
+    
+    do {
+        // Check signal timers for ALL tasks (not just current)
+        // This ensures alarm() fires even when task is sleeping
+        signal_check_timers(t, current_tick);
+        
+        // Check if task is sleeping and its timer has expired
+        if (t->state == TASK_BLOCKED && t->wakeup_tick != 0) {
+            if (current_tick >= t->wakeup_tick) {
+                t->state = TASK_READY;
+                t->wakeup_tick = 0;
+            }
+        }
+        
+        // Wake blocked tasks that have pending signals
+        if (t->state == TASK_BLOCKED && signal_pending(t)) {
+            t->state = TASK_READY;
+            t->wakeup_tick = 0;
+        }
+        
+        t = t->next;
+    } while (t && t != start);
+}
+
 void sched_mark_task_exited(task_t* task, int status) {
     if (!task) {
         return;
@@ -717,6 +873,19 @@ void sched_mark_task_exited(task_t* task, int status) {
     __asm__ volatile ("cli");
     task->has_exited = true;
     task->state = TASK_ZOMBIE;
+    
+    // CRITICAL: Clear sp so this task can never be context-switched to again
+    // This prevents resuming a zombie's saved kernel context which would
+    // return through the exception handler and iret to the faulting instruction
+    task->sp = 0;
+    
+    // Wake up parent if it's waiting in waitpid()
+    if (task->parent && task->parent->state == TASK_BLOCKED) {
+        // Check if parent is waiting for children (wait_channel == parent itself)
+        if (task->parent->wait_channel == task->parent) {
+            sched_wake_task(task->parent);
+        }
+    }
 }
 
 void sched_signal_task(task_t* task, int sig) {
@@ -736,7 +905,7 @@ void sched_signal_task(task_t* task, int sig) {
         task->exit_code = 128 + sig;
         sched_mark_task_exited(task, 128 + sig);
         if (task == sched_current()) {
-            sched_yield();
+            sched_schedule();
         }
         return;
     }
@@ -745,7 +914,7 @@ void sched_signal_task(task_t* task, int sig) {
         task->state = TASK_STOPPED;
         signal_send(task, sig, &info);
         if (task == sched_current()) {
-            sched_yield();
+            sched_schedule();
         }
         return;
     }
@@ -766,7 +935,7 @@ void sched_signal_task(task_t* task, int sig) {
             task->state = TASK_STOPPED;
             signal_send(task, sig, &info);
             if (task == sched_current()) {
-                sched_yield();
+                sched_schedule();
             }
             return;
         }
@@ -808,13 +977,13 @@ void sched_signal_task(task_t* task, int sig) {
             task->exit_code = 128 + sig;
             sched_mark_task_exited(task, 128 + sig);
             if (task == sched_current()) {
-                sched_yield();
+                sched_schedule();
             }
             break;
         case SIG_DFL_STOP:
             task->state = TASK_STOPPED;
             if (task == sched_current()) {
-                sched_yield();
+                sched_schedule();
             }
             break;
         case SIG_DFL_IGN:
@@ -865,8 +1034,8 @@ extern uint64_t timer_ticks(void);
 void sched_dump_tasks(void) {
     static const char* state_names[] = { "READY", "RUN", "BLOCK", "ZOMBIE", "STOP" };
     kprintf("\n=== Debug Dump (Ctrl+D) ===\n");
-    kprintf("Ticks: %llu  IRQ0: %llu  TotalIRQ: %llu  Yields: %llu\n", 
-            timer_ticks(), g_irq0_count, g_total_irq_count, g_total_yields);
+    kprintf("Ticks: %llu  IRQ0: %llu  TotalIRQ: %llu  Schedules: %llu\n", 
+            timer_ticks(), g_irq0_count, g_total_irq_count, g_total_schedules);
     kprintf("FreeMem: %llu KB\n", mm_get_free_pages() * 4);
     kprintf("PID  PPID STATE   PGID  LastRIP          UserRIP\n");
     if (!g_current) {
@@ -888,4 +1057,88 @@ void sched_dump_tasks(void) {
         t = t->next;
     } while (t && t != start);
     kprintf("===============================\n");
+}
+
+// ============ PREEMPTIVE SCHEDULING SUPPORT ============
+
+// Check if the current task needs rescheduling
+int sched_need_resched(void) {
+    if (!g_current) return 0;
+    return g_current->need_resched;
+}
+
+// Mark a task as needing rescheduling
+void sched_set_need_resched(task_t* t) {
+    if (t) {
+        t->need_resched = 1;
+    }
+}
+
+// Preemptive context switch called from timer interrupt
+// This is called with interrupts disabled and must be very careful
+void sched_preempt(interrupt_frame_t* frame) {
+    if (!g_current) return;
+    
+    // Acquire scheduler lock (SMP-safe)
+    // Use trylock to avoid deadlock if lock is held
+    if (!spin_trylock(&g_sched_lock)) {
+        // Lock held, skip this preemption attempt
+        return;
+    }
+    
+    // Clear the need_resched flag
+    g_current->need_resched = 0;
+    
+    // Save the interrupt frame so we can resume later
+    g_current->preempt_frame = frame;
+    
+    // Pick next task (use from_timer=1 for more aggressive scheduling)
+    task_t* next = pick_next(g_current, 1);
+    
+    if (next == g_current || !next) {
+        // No switch needed, just reset time slice
+        g_current->remaining_ticks = SCHED_TIME_SLICE;
+        g_current->preempt_frame = NULL;
+        spin_unlock(&g_sched_lock);
+        return;
+    }
+    
+    if (next->sp == 0) {
+        // Invalid target, don't switch
+        g_current->remaining_ticks = SCHED_TIME_SLICE;
+        g_current->preempt_frame = NULL;
+        spin_unlock(&g_sched_lock);
+        return;
+    }
+    
+    // Reset time slice for next task
+    next->remaining_ticks = SCHED_TIME_SLICE;
+    
+    // Perform the context switch
+    task_t* prev = g_current;
+    g_current = next;
+    
+    if (prev->state == TASK_RUNNING) {
+        prev->state = TASK_READY;
+    }
+    next->state = TASK_RUNNING;
+    
+    // Update preemption statistics
+    g_preempt_count_total++;
+    
+    spin_unlock(&g_sched_lock);
+    
+    // Switch address space if needed
+    switch_address_space(prev, next);
+    
+    // Perform the actual context switch
+    // For preemption, we use the same ctx_switch_asm but
+    // the registers are already saved on the interrupt stack
+    ctx_switch_asm(&prev->sp, next->sp);
+    
+    // When we return here, this task has been resumed
+    // Clear preempt_frame as we're no longer in preemption context
+    if (g_current) {
+        g_current->preempt_frame = NULL;
+    }
 }

@@ -326,7 +326,7 @@ long tty_read(tty_t* tty, void* buf, long count, int nonblock) {
                 cur->wait_next = tty->read_waiters;
                 cur->wait_channel = tty;
                 tty->read_waiters = cur;
-                sched_yield();
+                sched_schedule();
                 // Check if we were killed or have a pending signal
                 if (cur->state == TASK_ZOMBIE || cur->has_exited || signal_pending(cur)) {
                     // Handle pending signal
@@ -500,7 +500,7 @@ long tty_pty_master_read(int id, void* buf, long count, int nonblock) {
                 cur->wait_next = pty->master_read_waiters;
                 cur->wait_channel = pty;
                 pty->master_read_waiters = cur;
-                sched_yield();
+                sched_schedule();
                 continue;
             }
             break;

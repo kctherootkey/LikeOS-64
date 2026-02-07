@@ -95,6 +95,14 @@
 #define SYS_SIGNALFD4       269
 #define SYS_PAUSE           270
 #define SYS_NANOSLEEP       271
+#define SYS_CLOCK_GETTIME   272
+#define SYS_CLOCK_GETRES    273
+
+// Clock IDs for clock_gettime
+#define CLOCK_REALTIME      0
+#define CLOCK_MONOTONIC     1
+#define CLOCK_PROCESS_CPUTIME_ID 2
+#define CLOCK_THREAD_CPUTIME_ID  3
 
 // Debug/diagnostic syscalls (LikeOS specific)
 #define SYS_MEMSTATS        300  // Print memory stats
@@ -157,6 +165,7 @@
 #define EINVAL          22  // Invalid argument
 #define EMFILE          24  // Too many open files
 #define ESPIPE          29  // Illegal seek
+#define EPIPE           32  // Broken pipe
 #define ENOSYS          38  // Function not implemented
 
 // Syscall handler prototype

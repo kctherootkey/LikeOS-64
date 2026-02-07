@@ -1,4 +1,4 @@
-// LikeOS-64 minimal cooperative scheduler
+// LikeOS-64 Preemptive Scheduler with Full Kernel Preemption and SMP Spinlocks
 #ifndef _KERNEL_SCHED_H_
 #define _KERNEL_SCHED_H_
 
@@ -15,6 +15,153 @@ struct tty;
 
 // Maximum memory regions per task (for mmap tracking)
 #define TASK_MAX_MMAP   64
+
+// Preemption configuration
+// Time slice in timer ticks (at 100Hz, 2 ticks = 20ms for better responsiveness)
+#define SCHED_TIME_SLICE    2
+
+// ============================================================================
+// SMP-READY SPINLOCK IMPLEMENTATION
+// ============================================================================
+
+typedef struct spinlock {
+    volatile uint32_t locked;    // 0 = unlocked, 1 = locked
+    volatile uint32_t owner_cpu; // For debugging: CPU that holds lock (0xFFFFFFFF = none)
+    const char* name;            // Lock name for debugging
+} spinlock_t;
+
+// Static initializer for spinlock
+#define SPINLOCK_INIT(n) { .locked = 0, .owner_cpu = 0xFFFFFFFF, .name = (n) }
+
+// Initialize a spinlock at runtime
+static inline void spinlock_init(spinlock_t* lock, const char* name) {
+    lock->locked = 0;
+    lock->owner_cpu = 0xFFFFFFFF;
+    lock->name = name;
+}
+
+// Acquire spinlock (SMP-safe using atomic compare-and-swap)
+static inline void spin_lock(spinlock_t* lock) {
+    while (1) {
+        uint32_t expected = 0;
+        uint32_t desired = 1;
+        uint32_t old;
+        __asm__ volatile (
+            "lock cmpxchgl %2, %1"
+            : "=a"(old), "+m"(lock->locked)
+            : "r"(desired), "0"(expected)
+            : "memory", "cc"
+        );
+        if (old == 0) {
+            __asm__ volatile("" ::: "memory"); // Memory barrier
+            return;
+        }
+        // Spin with PAUSE instruction (reduces power, improves SMP performance)
+        __asm__ volatile("pause" ::: "memory");
+    }
+}
+
+// Try to acquire spinlock, return 1 if acquired, 0 if failed
+static inline int spin_trylock(spinlock_t* lock) {
+    uint32_t expected = 0;
+    uint32_t desired = 1;
+    uint32_t old;
+    __asm__ volatile (
+        "lock cmpxchgl %2, %1"
+        : "=a"(old), "+m"(lock->locked)
+        : "r"(desired), "0"(expected)
+        : "memory", "cc"
+    );
+    if (old == 0) {
+        __asm__ volatile("" ::: "memory");
+        return 1;
+    }
+    return 0;
+}
+
+// Release spinlock
+static inline void spin_unlock(spinlock_t* lock) {
+    __asm__ volatile("" ::: "memory"); // Memory barrier before release
+    lock->locked = 0;
+    lock->owner_cpu = 0xFFFFFFFF;
+}
+
+// Check if spinlock is held
+static inline int spin_is_locked(spinlock_t* lock) {
+    return lock->locked != 0;
+}
+
+// Save interrupt flags and disable interrupts
+static inline uint64_t local_irq_save(void) {
+    uint64_t flags;
+    __asm__ volatile (
+        "pushfq\n\t"
+        "popq %0\n\t"
+        "cli"
+        : "=r"(flags)
+        :
+        : "memory"
+    );
+    return flags;
+}
+
+// Restore interrupt flags
+static inline void local_irq_restore(uint64_t flags) {
+    __asm__ volatile (
+        "pushq %0\n\t"
+        "popfq"
+        :
+        : "r"(flags)
+        : "memory", "cc"
+    );
+}
+
+// Spinlock with interrupt save/restore (for use in interrupt handlers)
+static inline void spin_lock_irqsave(spinlock_t* lock, uint64_t* flags) {
+    *flags = local_irq_save();
+    spin_lock(lock);
+}
+
+static inline void spin_unlock_irqrestore(spinlock_t* lock, uint64_t flags) {
+    spin_unlock(lock);
+    local_irq_restore(flags);
+}
+
+// ============================================================================
+// PREEMPTION CONTROL (Full Kernel Preemption)
+// ============================================================================
+
+// Global preemption counter (per-CPU for SMP, single for UP)
+// When > 0, preemption is disabled in the current context
+extern volatile int g_preempt_count;
+
+// Disable kernel preemption (increment counter)
+static inline void preempt_disable(void) {
+    __asm__ volatile("" ::: "memory");
+    g_preempt_count++;
+    __asm__ volatile("" ::: "memory");
+}
+
+// Enable kernel preemption (decrement counter)
+static inline void preempt_enable(void) {
+    __asm__ volatile("" ::: "memory");
+    g_preempt_count--;
+    __asm__ volatile("" ::: "memory");
+}
+
+// Get current preemption count
+static inline int preempt_count_get(void) {
+    return g_preempt_count;
+}
+
+// Check if preemption is currently enabled
+static inline int preemption_enabled(void) {
+    return g_preempt_count == 0;
+}
+
+// ============================================================================
+// TASK DEFINITIONS
+// ============================================================================
 
 typedef void (*task_entry_t)(void* arg);
 
@@ -43,8 +190,20 @@ typedef struct mmap_region {
     bool in_use;        // Whether this slot is used
 } mmap_region_t;
 
+// Saved interrupt frame for preemptive context switch
+// Layout must match push order in irq_common_stub
+typedef struct interrupt_frame {
+    // Pushed by irq_common_stub (in reverse order of struct)
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    // Pushed by IRQ macro
+    uint64_t int_no, err_code;
+    // Pushed by CPU on interrupt
+    uint64_t rip, cs, rflags, rsp, ss;
+} interrupt_frame_t;
+
 typedef struct task {
-    uint64_t* sp;          // Saved stack pointer
+    uint64_t* sp;          // Saved stack pointer (cooperative switch)
     uint64_t* pml4;        // Page table base (CR3) - NULL for kernel tasks (uses kernel PML4)
     task_entry_t entry;    // Entry function
     void* arg;             // Entry argument
@@ -52,6 +211,11 @@ typedef struct task {
     task_privilege_t privilege;  // Ring level
     struct task* next;     // Scheduler circular list
     int id;
+    
+    // Preemption support
+    volatile int need_resched;       // Set by timer when time slice expired
+    int remaining_ticks;             // Remaining time slice ticks
+    interrupt_frame_t* preempt_frame; // Saved interrupt frame (NULL if cooperative switch)
     
     // Process hierarchy
     struct task* parent;        // Parent task (NULL for init)
@@ -77,6 +241,9 @@ typedef struct task {
     struct task* wait_next;
     void* wait_channel;
     
+    // Timer-based sleep support
+    uint64_t wakeup_tick;           // Tick count when task should wake (0 = not sleeping)
+    
     // Signal handling state
     task_signal_state_t signals;    // Full signal state
     
@@ -84,6 +251,7 @@ typedef struct task {
     uint64_t syscall_rsp;           // User RSP on syscall entry
     uint64_t syscall_rip;           // User RIP (return address)
     uint64_t syscall_rflags;        // User RFLAGS
+    uint64_t syscall_rax;           // Syscall return value (for sigreturn)
     uint64_t syscall_rbp;           // Callee-saved
     uint64_t syscall_rbx;           // Callee-saved
     uint64_t syscall_r12;           // Callee-saved
@@ -109,10 +277,20 @@ void sched_init(void);
 void sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack_size);
 task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint64_t user_stack, uint64_t kernel_stack);
 void sched_tick(void);
-void sched_yield(void);
+void sched_schedule(void);    // Core preemptive scheduler - switch to next ready task
 void sched_run_ready(void);
 task_t* sched_current(void);
 int sched_has_user_tasks(void);  // Check if any user tasks are running
+
+// Preemptive scheduling API
+void sched_preempt(interrupt_frame_t* frame);  // Called from timer IRQ, performs context switch
+int sched_need_resched(void);                  // Check if reschedule is needed
+void sched_set_need_resched(task_t* t);        // Mark task as needing reschedule
+void sched_wake_expired_sleepers(uint64_t current_tick);  // Wake tasks whose sleep timer expired
+void sched_wake_channel(void* channel);        // Wake all tasks waiting on a channel
+
+// Scheduler lock for SMP safety
+extern spinlock_t g_sched_lock;
 
 // Process management
 task_t* sched_fork_current(void);           // Fork current task with COW

@@ -1,6 +1,7 @@
 // LikeOS-64 Pipe Implementation
 #include <kernel/pipe.h>
 #include <kernel/memory.h>
+#include <kernel/sched.h>
 
 bool pipe_is_end(const void* ptr) {
     if (!ptr) {
@@ -80,10 +81,14 @@ void pipe_close_end(pipe_end_t* end) {
             if (pipe->readers > 0) {
                 pipe->readers--;
             }
+            // Wake up writers waiting on this pipe (they may get EPIPE now)
+            sched_wake_channel(pipe);
         } else {
             if (pipe->writers > 0) {
                 pipe->writers--;
             }
+            // Wake up readers waiting on this pipe (they may get EOF now)
+            sched_wake_channel(pipe);
         }
 
         if (pipe->readers == 0 && pipe->writers == 0) {

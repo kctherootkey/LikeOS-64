@@ -211,8 +211,35 @@ static int64_t pipe_read_to_user(pipe_end_t* end, uint64_t buf, uint64_t count) 
     if (count == 0) {
         return 0;
     }
-    if (pipe->used == 0) {
-        return (pipe->writers == 0) ? 0 : -EAGAIN;
+    
+    task_t* cur = sched_current();
+    
+    // Block until data is available or all writers are gone
+    while (pipe->used == 0) {
+        if (pipe->writers == 0) {
+            return 0;  // EOF - no more writers
+        }
+        
+        // Check for pending signals BEFORE blocking
+        if (cur && signal_pending(cur)) {
+            return -EINTR;
+        }
+        
+        // Block waiting for data
+        if (cur) {
+            cur->state = TASK_BLOCKED;
+            cur->wait_channel = pipe;  // Wait on the pipe
+            sched_schedule();
+            cur->state = TASK_READY;
+            cur->wait_channel = NULL;
+            
+            // Check if we were woken by a signal
+            if (signal_pending(cur)) {
+                return -EINTR;
+            }
+        } else {
+            return -EAGAIN;
+        }
     }
 
     size_t to_read = (count < pipe->used) ? count : pipe->used;
@@ -245,8 +272,15 @@ static int64_t pipe_write_from_user(pipe_end_t* end, uint64_t buf, uint64_t coun
         return 0;
     }
     if (pipe->readers == 0) {
-        return -EAGAIN;
+        // No readers - send SIGPIPE to caller
+        task_t* cur = sched_current();
+        if (cur) {
+            sched_signal_task(cur, SIGPIPE);
+        }
+        return -EPIPE;
     }
+    
+    // Block if pipe is full (simplified: just return EAGAIN for now)
     if (pipe->used == pipe->size) {
         return -EAGAIN;
     }
@@ -268,6 +302,9 @@ static int64_t pipe_write_from_user(pipe_end_t* end, uint64_t buf, uint64_t coun
 
     pipe->write_pos = (pipe->write_pos + to_write) % pipe->size;
     pipe->used += to_write;
+    
+    // Wake up any readers blocked on this pipe
+    sched_wake_channel(pipe);
 
     return (int64_t)to_write;
 }
@@ -917,13 +954,13 @@ static int64_t sys_uname(uint64_t buf) {
     mm_memset(&u, 0, sizeof(u));
     const char* sys = "LikeOS";
     const char* node = "likeos";
-    const char* rel = "0.2";
+    const char* rel = "0.2-preempt";
     const char* ver = "LikeOS-64";
     const char* mach = "x86_64";
     mm_memcpy(u.sysname, sys, 7);
     mm_memcpy(u.nodename, node, 7);
-    mm_memcpy(u.release, rel, 4);
-    mm_memcpy(u.version, ver, 9);
+    mm_memcpy(u.release, rel, 12);
+    mm_memcpy(u.version, ver, 18);
     mm_memcpy(u.machine, mach, 7);
     if (copy_to_user((void*)buf, &u, sizeof(u)) < 0) {
         return -EFAULT;
@@ -1100,14 +1137,9 @@ static void kill_task(task_t* t, int sig) {
     if (!t) {
         return;
     }
-    // Use new signal infrastructure - queue the signal for later delivery
-    // The signal will be delivered when returning from this syscall
-    siginfo_t info;
-    mm_memset(&info, 0, sizeof(info));
-    info.si_signo = sig;
-    info.si_code = SI_USER;
-    info.si_pid = sched_current() ? sched_current()->id : 0;
-    signal_send(t, sig, &info);
+    // Use sched_signal_task which properly handles SIGKILL/SIGSTOP
+    // and other signals with their default actions
+    sched_signal_task(t, sig);
 }
 
 static int64_t sys_kill(uint64_t pid, uint64_t sig) {
@@ -1582,7 +1614,7 @@ static void sys_exit(uint64_t status) {
     if (cur) {
         sched_mark_task_exited(cur, (int)status);
     }
-    sched_yield();
+    sched_schedule();
     for (;;) {
         __asm__ volatile ("cli; hlt");
     }
@@ -1610,10 +1642,11 @@ static int64_t sys_fork(void) {
         return -1;
     }
     
-    // Capture user context saved by syscall entry (from syscall.asm)
-    uint64_t user_rip = syscall_saved_user_rip;      // Where to resume execution
-    uint64_t user_rsp = syscall_saved_user_rsp;      // User stack pointer
-    uint64_t user_rflags = syscall_saved_user_rflags; // Saved RFLAGS
+    // Use task-local copies of user context, not globals!
+    // Globals can be overwritten if preemption switches to another task.
+    uint64_t user_rip = cur->syscall_rip;         // Where to resume execution
+    uint64_t user_rsp = cur->syscall_rsp;         // User stack pointer
+    uint64_t user_rflags = cur->syscall_rflags;   // Saved RFLAGS
     
     // Create child with cloned address space and file descriptors
     task_t* child = sched_fork_current();
@@ -1635,12 +1668,14 @@ static int64_t sys_fork(void) {
     k_sp = (uint64_t*)((uint64_t)k_sp & ~0xFUL);  // Align to 16 bytes
     
     // Push user callee-saved registers (fork_child_return will restore these)
-    *(--k_sp) = syscall_saved_user_r15;
-    *(--k_sp) = syscall_saved_user_r14;
-    *(--k_sp) = syscall_saved_user_r13;
-    *(--k_sp) = syscall_saved_user_r12;
-    *(--k_sp) = syscall_saved_user_rbx;
-    *(--k_sp) = syscall_saved_user_rbp;
+    // IMPORTANT: Use task-local copies (cur->syscall_*) not globals!
+    // Globals can be overwritten by preemption switching to another task.
+    *(--k_sp) = cur->syscall_r15;
+    *(--k_sp) = cur->syscall_r14;
+    *(--k_sp) = cur->syscall_r13;
+    *(--k_sp) = cur->syscall_r12;
+    *(--k_sp) = cur->syscall_rbx;
+    *(--k_sp) = cur->syscall_rbp;
     
     // Push IRET frame (used by fork_child_return to return to userspace)
     *(--k_sp) = 0x1B;                    // SS: user data segment
@@ -1668,63 +1703,93 @@ static int64_t sys_fork(void) {
 }
 
 // SYS_WAIT4/SYS_WAITPID - wait for child process
+// In a preemptive kernel, this BLOCKS until a child exits (unless WNOHANG)
 static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options) {
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
     
-    // Find a zombie child
-    task_t* child = NULL;
+    // Check if there are any children at all
+    if (!cur->first_child) {
+        return -ECHILD;
+    }
     
-    if (pid == -1) {
-        // Wait for any child
-        task_t* c = cur->first_child;
-        while (c) {
-            if (c->has_exited) {
-                child = c;
-                break;
+    // Loop until we find a zombie child or get interrupted
+    while (1) {
+        task_t* child = NULL;
+        
+        if (pid == -1) {
+            // Wait for any child
+            task_t* c = cur->first_child;
+            while (c) {
+                if (c->has_exited) {
+                    child = c;
+                    break;
+                }
+                c = c->next_sibling;
             }
-            c = c->next_sibling;
+        } else if (pid > 0) {
+            // Wait for specific child
+            task_t* found = sched_find_task_by_id((uint32_t)pid);
+            if (found && found->parent == cur) {
+                if (found->has_exited) {
+                    child = found;
+                }
+            } else if (!found || found->parent != cur) {
+                // Child doesn't exist or isn't ours
+                return -ECHILD;
+            }
         }
-    } else if (pid > 0) {
-        // Wait for specific child
-        task_t* found = sched_find_task_by_id((uint32_t)pid);
-        if (found && found->parent == cur && found->has_exited) {
-            child = found;
+        
+        if (child) {
+            // Found a zombie child - reap it
+            int status = 0;
+            if (child->exit_code >= 128 && child->exit_code < 256) {
+                // Signaled exit: low 7 bits are signal number
+                status = (child->exit_code - 128) & 0x7F;
+            } else {
+                // Normal exit: exit_code << 8
+                status = (child->exit_code & 0xFF) << 8;
+            }
+            
+            if (status_ptr && validate_user_ptr(status_ptr, sizeof(int))) {
+                copy_to_user((void*)status_ptr, &status, sizeof(status));
+            }
+            
+            int child_pid = child->id;
+            sched_remove_task(child);
+            return child_pid;
         }
+        
+        // No zombie child yet
+        if (options & 1) {  // WNOHANG
+            return 0;  // No child exited yet, return immediately
+        }
+        
+        // Check for pending signal BEFORE blocking - avoids race condition
+        if (signal_pending(cur)) {
+            return -EINTR;
+        }
+        
+        // Block until a child exits or we get a signal
+        // The parent will be woken by sched_wake_task() when child exits
+        cur->state = TASK_BLOCKED;
+        cur->wait_channel = cur;  // Waiting for our own children
+        sched_schedule();
+        cur->state = TASK_READY;
+        cur->wait_channel = 0;
+        
+        // Check if we were woken by a signal
+        if (signal_pending(cur)) {
+            return -EINTR;
+        }
+        
+        // Check if we were terminated
+        if (cur->has_exited) {
+            return -EINTR;
+        }
+        
+        // Loop back to check for zombie children again
     }
-    
-    if (!child) {
-        // Check if there are any children at all
-        if (!cur->first_child) {
-            return -ECHILD;
-        }
-        // Non-blocking: return EAGAIN if no zombie children
-        if (options & 1) {  // WNOHANG = 1
-            return 0;  // No child exited yet
-        }
-        return -EAGAIN;  // Would block - caller should poll
-    }
-    
-    // Store status if requested
-    if (status_ptr && validate_user_ptr(status_ptr, sizeof(int))) {
-        int status = 0;
-        // Check if child exited due to signal (via exit_code > 128)
-        if (child->exit_code >= 128 && child->exit_code < 256) {
-            // Signaled exit: low 7 bits are signal number
-            status = (child->exit_code - 128) & 0x7F;
-        } else {
-            // Normal exit: exit_code << 8
-            status = (child->exit_code & 0xFF) << 8;
-        }
-        copy_to_user((void*)status_ptr, &status, sizeof(status));
-    }
-    
-    int child_pid = child->id;
-    
-    // Reap the zombie - remove from scheduler and free
-    sched_remove_task(child);
-    
-    return child_pid;
 }
 
 // SYS_EXECVE - execute a new program, replacing current process image
@@ -1960,12 +2025,23 @@ static int64_t sys_getpid(void) {
     return cur ? cur->id : -1;
 }
 
-// SYS_YIELD - yield CPU
+// SYS_YIELD - yield CPU to other runnable tasks (Linux-style)
+// Moves current task to back of run queue and immediately reschedules.
+// Returns 0 on success. In a preemptive kernel this is a hint to the
+// scheduler that the caller is willing to give up its remaining timeslice.
 static int64_t sys_yield(void) {
     task_t* cur = sched_current();
-    (void)cur;
-    __asm__ volatile ("sti");
-    sched_yield();
+    if (!cur) {
+        return 0;
+    }
+    
+    // Reset time slice - we're voluntarily giving it up
+    cur->remaining_ticks = 0;
+    cur->state = TASK_READY;
+    
+    // Immediate reschedule (Linux does this via schedule())
+    sched_schedule();
+    
     return 0;
 }
 
@@ -2120,7 +2196,7 @@ static int64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr, uint64_t
         
         // Block task and wait
         cur->state = TASK_BLOCKED;
-        sched_yield();
+        sched_schedule();
         
         // Check if we should exit
         if (cur->has_exited) {
@@ -2178,7 +2254,7 @@ static int64_t sys_rt_sigsuspend(uint64_t mask_ptr, uint64_t sigsetsize) {
     cur->state = TASK_BLOCKED;
     
     while (!signal_pending(cur)) {
-        sched_yield();
+        sched_schedule();
         if (cur->has_exited) {
             cur->signals.in_sigsuspend = 0;
             cur->signals.blocked = cur->signals.saved_mask;
@@ -2444,7 +2520,7 @@ static int64_t sys_pause(void) {
     cur->state = TASK_BLOCKED;
     
     while (!signal_pending(cur)) {
-        sched_yield();
+        sched_schedule();
         if (cur->has_exited) {
             return -EINTR;
         }
@@ -2454,6 +2530,7 @@ static int64_t sys_pause(void) {
 }
 
 // SYS_NANOSLEEP - sleep with nanosecond precision
+// Uses timer-based wakeup: set wakeup_tick and block, timer IRQ wakes us
 static int64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr) {
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
@@ -2465,31 +2542,98 @@ static int64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr) {
     
     // Calculate ticks to sleep (100 Hz = 10ms per tick)
     uint64_t ticks = req.tv_sec * 100 + req.tv_nsec / 10000000;
+    if (ticks == 0 && (req.tv_sec > 0 || req.tv_nsec > 0)) {
+        ticks = 1;  // At least 1 tick for any non-zero sleep
+    }
+    
     uint64_t start = timer_ticks();
     uint64_t end = start + ticks;
     
-    cur->state = TASK_BLOCKED;
-    
+    // Loop until sleep time expires or interrupted by signal
     while (timer_ticks() < end) {
-        sched_yield();
-        
-        // Check for signal interruption
+        // Check for pending signal BEFORE blocking
         if (signal_pending(cur)) {
-            // Calculate remaining time
             if (rem_ptr) {
-                uint64_t elapsed = timer_ticks() - start;
+                uint64_t now = timer_ticks();
+                uint64_t elapsed = now - start;
                 uint64_t remaining = (elapsed < ticks) ? ticks - elapsed : 0;
                 struct k_timespec rem;
                 rem.tv_sec = remaining / 100;
                 rem.tv_nsec = (remaining % 100) * 10000000;
                 copy_to_user((void*)rem_ptr, &rem, sizeof(struct k_timespec));
             }
-            cur->state = TASK_READY;
+            cur->wakeup_tick = 0;
             return -EINTR;
+        }
+        
+        // Set wakeup timer and block - timer IRQ will wake us
+        cur->wakeup_tick = end;
+        cur->state = TASK_BLOCKED;
+        sched_schedule();
+        
+        // Woken up - either by timer expiry or signal
+        // Loop will check timer and signal conditions
+    }
+    
+    cur->wakeup_tick = 0;
+    return 0;
+}
+
+// SYS_CLOCK_GETTIME - get time from specified clock
+static int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr) {
+    if (!validate_user_ptr(tp_ptr, sizeof(struct k_timespec))) {
+        return -EFAULT;
+    }
+    
+    struct k_timespec tp;
+    uint64_t ticks = timer_ticks();
+    
+    switch (clk_id) {
+        case 0:  // CLOCK_REALTIME
+        case 1:  // CLOCK_MONOTONIC
+            // Both return monotonic time from boot (no RTC for real time)
+            // 100 Hz timer = 10ms per tick
+            tp.tv_sec = ticks / 100;
+            tp.tv_nsec = (ticks % 100) * 10000000;  // 10ms = 10,000,000 ns
+            break;
+        case 2:  // CLOCK_PROCESS_CPUTIME_ID
+        case 3:  // CLOCK_THREAD_CPUTIME_ID
+            // Simplified: return same as monotonic for now
+            tp.tv_sec = ticks / 100;
+            tp.tv_nsec = (ticks % 100) * 10000000;
+            break;
+        default:
+            return -EINVAL;
+    }
+    
+    if (copy_to_user((void*)tp_ptr, &tp, sizeof(tp)) != 0) {
+        return -EFAULT;
+    }
+    
+    return 0;
+}
+
+// SYS_CLOCK_GETRES - get clock resolution
+static int64_t sys_clock_getres(uint64_t clk_id, uint64_t res_ptr) {
+    if (clk_id > 3) {
+        return -EINVAL;
+    }
+    
+    if (res_ptr) {
+        if (!validate_user_ptr(res_ptr, sizeof(struct k_timespec))) {
+            return -EFAULT;
+        }
+        
+        struct k_timespec res;
+        // 100 Hz timer = 10ms resolution
+        res.tv_sec = 0;
+        res.tv_nsec = 10000000;  // 10ms
+        
+        if (copy_to_user((void*)res_ptr, &res, sizeof(res)) != 0) {
+            return -EFAULT;
         }
     }
     
-    cur->state = TASK_READY;
     return 0;
 }
 
@@ -2737,6 +2881,10 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
             return sys_pause();
         case SYS_NANOSLEEP:
             return sys_nanosleep(a1, a2);
+        case SYS_CLOCK_GETTIME:
+            return sys_clock_gettime(a1, a2);
+        case SYS_CLOCK_GETRES:
+            return sys_clock_getres(a1, a2);
             
         case SYS_MEMSTATS:
             mm_print_memory_stats();
@@ -2772,10 +2920,12 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
     if (num != SYS_EXIT && num != SYS_RT_SIGRETURN) {
         cur = sched_current();  // Re-fetch in case of fork
         if (cur && cur->privilege == TASK_USER && signal_pending(cur)) {
+            // Save syscall return value so sigreturn can restore it
+            cur->syscall_rax = (uint64_t)ret;
             signal_deliver(cur);
             // Check if signal_deliver terminated the task (e.g., SIG_DFL for SIGTERM)
             if (cur->has_exited || cur->state == TASK_ZOMBIE) {
-                sched_yield();
+                sched_schedule();
                 // Should not return here
             }
         }

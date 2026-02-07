@@ -234,48 +234,50 @@ void exception_handler(uint64_t *regs) {
                 kprintf("User process %d killed by SIGSEGV at RIP=0x%016llx CR2=0x%016llx\n",
                         cur ? (int)cur->id : -1, rip, cr2);
                 sched_signal_task(cur, SIGSEGV);
-                return;
+                // NEVER return - the iret frame points to faulting code
+                // Enable interrupts and halt forever, timer will preempt us away
+                for (;;) { __asm__ volatile("sti; hlt"); }
             }
             case 6:
                 kprintf("User process %d killed by SIGILL at RIP=0x%016llx\n",
                         cur ? (int)cur->id : -1, rip);
                 sched_signal_task(cur, SIGILL);
-                return;
+                for (;;) { __asm__ volatile("sti; hlt"); }
             case 0:
                 kprintf("User process %d killed by SIGFPE at RIP=0x%016llx\n",
                         cur ? (int)cur->id : -1, rip);
                 sched_signal_task(cur, SIGFPE);
-                return;
+                for (;;) { __asm__ volatile("sti; hlt"); }
             case 3:
                 kprintf("User process %d killed by SIGTRAP at RIP=0x%016llx\n",
                         cur ? (int)cur->id : -1, rip);
                 sched_signal_task(cur, SIGTRAP);
-                return;
+                for (;;) { __asm__ volatile("sti; hlt"); }
             case 4:
                 kprintf("User process %d killed by SIGFPE at RIP=0x%016llx\n",
                         cur ? (int)cur->id : -1, rip);
                 sched_signal_task(cur, SIGFPE);
-                return;
+                for (;;) { __asm__ volatile("sti; hlt"); }
             case 5:
                 kprintf("User process %d killed by SIGTRAP at RIP=0x%016llx\n",
                         cur ? (int)cur->id : -1, rip);
                 sched_signal_task(cur, SIGTRAP);
-                return;
+                for (;;) { __asm__ volatile("sti; hlt"); }
             case 13:
                 kprintf("User process %d killed by SIGSEGV at RIP=0x%016llx (err=0x%llx)\n",
                         cur ? (int)cur->id : -1, rip, err_code);
                 sched_signal_task(cur, SIGSEGV);
-                return;
+                for (;;) { __asm__ volatile("sti; hlt"); }
             case 17:
                 kprintf("User process %d killed by SIGBUS at RIP=0x%016llx (err=0x%llx)\n",
                         cur ? (int)cur->id : -1, rip, err_code);
                 sched_signal_task(cur, SIGBUS);
-                return;
+                for (;;) { __asm__ volatile("sti; hlt"); }
             default:
                 kprintf("User process %d killed by SIGABRT at RIP=0x%016llx (INT %llu)\n",
                         cur ? (int)cur->id : -1, rip, int_no);
                 sched_signal_task(cur, SIGABRT);
-                return;
+                for (;;) { __asm__ volatile("sti; hlt"); }
         }
     }
 
@@ -358,7 +360,27 @@ void irq_handler(uint64_t *regs) {
         case 32: {
             g_irq0_count++;
             timer_irq_handler();
-            break;
+            // Send EOI before preemption to avoid missing ticks
+            pic_send_eoi(irq);
+            
+            // Check for pending signals on current task
+            // This handles fatal signals (SIGKILL, etc.) for tasks in user mode
+            task_t* cur = sched_current();
+            if (cur && cur->privilege == TASK_USER && signal_pending(cur)) {
+                signal_deliver(cur);
+                // If signal terminated the task, force reschedule
+                if (cur->has_exited || cur->state == TASK_ZOMBIE) {
+                    sched_schedule();
+                    return;
+                }
+            }
+            
+            // Check if preemption is needed after timer
+            if (sched_need_resched()) {
+                // Preempt if not in critical section
+                sched_preempt((interrupt_frame_t*)regs);
+            }
+            return; // EOI already sent
         }
         case 33:
             g_irq1_count++;

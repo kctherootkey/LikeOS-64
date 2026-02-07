@@ -51,6 +51,45 @@ void signal_init_task(task_t* task) {
     sig->signal_frame_addr = 0;
 }
 
+// Copy signal handlers from parent to child during fork
+// POSIX: signal dispositions are inherited across fork
+void signal_fork_copy(task_t* child, task_t* parent) {
+    if (!child || !parent) return;
+    
+    task_signal_state_t* csig = &child->signals;
+    task_signal_state_t* psig = &parent->signals;
+    
+    // Copy signal handlers (dispositions are inherited)
+    for (int i = 0; i < NSIG; i++) {
+        csig->action[i] = psig->action[i];
+    }
+    
+    // Copy blocked mask (inherited across fork)
+    csig->blocked = psig->blocked;
+    
+    // Clear pending signals (not inherited - child starts fresh)
+    sigemptyset_k(&csig->pending);
+    csig->pending_queue = NULL;
+    
+    // Clear saved mask and sigsuspend state
+    sigemptyset_k(&csig->saved_mask);
+    csig->in_sigsuspend = 0;
+    
+    // Alternate stack is NOT inherited across fork
+    csig->altstack.ss_sp = NULL;
+    csig->altstack.ss_flags = SS_DISABLE;
+    csig->altstack.ss_size = 0;
+    
+    // Timers are NOT inherited (child gets fresh timer state)
+    mm_memset(&csig->itimer_real, 0, sizeof(csig->itimer_real));
+    mm_memset(&csig->itimer_virtual, 0, sizeof(csig->itimer_virtual));
+    mm_memset(&csig->itimer_prof, 0, sizeof(csig->itimer_prof));
+    csig->alarm_ticks = 0;
+    
+    // Clear signal frame address
+    csig->signal_frame_addr = 0;
+}
+
 // Cleanup signal state when task exits
 void signal_cleanup_task(task_t* task) {
     if (!task) return;
@@ -117,16 +156,22 @@ int signal_send(task_t* task, int sig, siginfo_t* info) {
         }
     }
     
-    // Wake task if blocked
+    // Wake task if blocked - any signal that isn't blocked should wake the task
     if (task->state == TASK_BLOCKED || task->state == TASK_STOPPED) {
+        int should_wake = 0;
+        
         // SIGCONT always continues a stopped process
         if (sig == SIGCONT && task->state == TASK_STOPPED) {
             task->state = TASK_READY;
+            should_wake = 1;
         }
-        // Any unblocked signal wakes from sigsuspend/pause
-        if (!sigismember_k(&sigstate->blocked, sig) || sig_kernel_only(sig)) {
-            if (task->state == TASK_BLOCKED) {
+        
+        // Any unblocked signal wakes a blocked task
+        // SIGKILL/SIGSTOP can't be blocked
+        if (!should_wake && task->state == TASK_BLOCKED) {
+            if (sig_kernel_only(sig) || !sigismember_k(&sigstate->blocked, sig)) {
                 task->state = TASK_READY;
+                task->wait_channel = 0;  // Clear wait channel so it doesn't re-block
             }
         }
     }
@@ -262,7 +307,6 @@ int signal_setup_frame(task_t* task, int sig, siginfo_t* info, struct k_sigactio
     kframe.r13 = task->syscall_r13;
     kframe.r14 = task->syscall_r14;
     kframe.r15 = task->syscall_r15;
-    kframe.rax = 0;  // Will be clobbered anyway
     kframe.rcx = 0;
     kframe.rdx = 0;
     kframe.rsi = 0;
@@ -271,6 +315,9 @@ int signal_setup_frame(task_t* task, int sig, siginfo_t* info, struct k_sigactio
     kframe.r9 = 0;
     kframe.r10 = 0;
     kframe.r11 = 0;
+    
+    // Save syscall return value for sigreturn
+    kframe.rax = task->syscall_rax;
     
     // Signal info
     kframe.sig = sig;
@@ -378,6 +425,9 @@ int signal_restore_frame(task_t* task) {
     task->syscall_r14 = kframe.r14;
     task->syscall_r15 = kframe.r15;
     
+    // Save RAX (syscall return value) for assembly to restore
+    task->syscall_rax = kframe.rax;
+    
     // Restore signal mask
     task->signals.blocked = kframe.saved_mask;
     
@@ -399,6 +449,7 @@ int signal_restore_frame(task_t* task) {
     syscall_saved_user_r13 = kframe.r13;
     syscall_saved_user_r14 = kframe.r14;
     syscall_saved_user_r15 = kframe.r15;
+    syscall_saved_user_rax = kframe.rax;  // Syscall return value (e.g., -EINTR)
     
     // Tell syscall.asm to use the restored context
     // Use special value 0xFFFFFFFFFFFFFFFF (-1) to indicate sigreturn (not a handler call)

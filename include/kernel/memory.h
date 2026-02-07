@@ -199,6 +199,12 @@ bool mm_mark_page_cow(uint64_t virtual_addr);
 bool mm_handle_cow_fault(uint64_t fault_addr);
 uint64_t* mm_clone_address_space(uint64_t* src_pml4);
 
+// Clone with shared memory support (for MAP_SHARED regions)
+// shared_regions: array of {start, end} pairs, null-terminated
+// These ranges will NOT use COW - they'll share the same physical pages
+uint64_t* mm_clone_address_space_with_shared(uint64_t* src_pml4, 
+    uint64_t* shared_regions, int num_shared);
+
 // Physical page refcounting (for COW)
 void mm_init_page_refcounts(void);
 void mm_incref_page(uint64_t physical_addr);

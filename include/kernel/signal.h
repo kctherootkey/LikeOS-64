@@ -437,9 +437,11 @@ extern uint64_t syscall_saved_user_r12;
 extern uint64_t syscall_saved_user_r13;
 extern uint64_t syscall_saved_user_r14;
 extern uint64_t syscall_saved_user_r15;
+extern uint64_t syscall_saved_user_rax;
 
 // Signal API for kernel use
 void signal_init_task(struct task* task);
+void signal_fork_copy(struct task* child, struct task* parent);
 void signal_cleanup_task(struct task* task);
 int signal_send(struct task* task, int sig, siginfo_t* info);
 int signal_send_group(int pgid, int sig, siginfo_t* info);
