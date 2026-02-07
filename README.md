@@ -11,7 +11,7 @@ A modern 64-bit operating system built from scratch, featuring a Unix-like userl
 
 Be sure to always enable UEFI booting for the VM. Once the os is running you can type "help" to get the shell help text.
 
-[LikeOS qemu readme video.webm](https://github.com/user-attachments/assets/e3dadb65-568a-4d1a-ba2a-bc1fbb553643)
+https://github.com/user-attachments/assets/69c8a79c-cc04-4bbe-8e2a-3067befd1708
 
 LikeOS-64 running inside qemu on an Ubuntu host.
 
