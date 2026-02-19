@@ -177,9 +177,9 @@ int xhci_ring_enqueue(xhci_ring_t* ring, uint64_t param, uint32_t status, uint32
         link_ctrl = (link_ctrl & ~TRB_FLAG_CYCLE) | (ring->cycle ? TRB_FLAG_CYCLE : 0);
         ring->trbs[XHCI_RING_SIZE - 1].control = link_ctrl;
         
-        // Flush the link TRB from cache for DMA coherency
-        xhci_flush_cache(&ring->trbs[XHCI_RING_SIZE - 1], sizeof(xhci_trb_t));
-        xhci_mb();
+        // Compiler barrier: ensure link TRB write is emitted before we continue.
+        // No clflush needed — x86 DMA is cache-coherent (bus snooping).
+        __asm__ volatile("" ::: "memory");
         
         // Toggle our cycle to match post-link state
         ring->cycle ^= 1;
@@ -193,10 +193,10 @@ int xhci_ring_enqueue(xhci_ring_t* ring, uint64_t param, uint32_t status, uint32
     ring->trbs[idx].status = status;
     ring->trbs[idx].control = (control & ~TRB_FLAG_CYCLE) | (ring->cycle ? TRB_FLAG_CYCLE : 0);
     
-    // Flush the TRB from CPU cache so hardware can see it
-    xhci_flush_cache(&ring->trbs[idx], sizeof(xhci_trb_t));
-    
-    xhci_mb();
+    // Compiler barrier: ensure TRB fields are written before enqueue advances.
+    // No clflush/mfence needed — x86 DMA is cache-coherent (bus snooping)
+    // and x86 stores are naturally ordered (TSO).
+    __asm__ volatile("" ::: "memory");
     
     ring->enqueue++;
     
@@ -204,10 +204,12 @@ int xhci_ring_enqueue(xhci_ring_t* ring, uint64_t param, uint32_t status, uint32
 }
 
 // Ring doorbell for a slot/endpoint
+// Compiler barrier ensures TRB stores are emitted before the MMIO write.
+// On x86, stores to WB memory are ordered before MMIO (UC) writes,
+// and DMA is cache-coherent, so mfence is unnecessary.
 void xhci_ring_doorbell(xhci_controller_t* ctrl, uint8_t slot, uint8_t ep) {
-    xhci_mb();
+    __asm__ volatile("" ::: "memory");
     xhci_db_write32(ctrl, slot, ep);
-    xhci_mb();
 }
 
 //=============================================================================
@@ -1332,8 +1334,11 @@ void xhci_process_events(xhci_controller_t* ctrl) {
         xhci_rt_write32(ctrl, 0x20, iman_val | (1 << 0)); // W1C the IP bit
     }
     
-    // Memory barrier to ensure we see DMA-written events
-    __asm__ volatile("mfence" ::: "memory");
+    // Compiler barrier: ensure we re-read event ring TRBs from memory (not
+    // cached in registers).  On x86, DMA writes to WB memory are coherent
+    // and the preceding MMIO reads (UC) already serialise; mfence is not
+    // needed here and was very expensive inside the 50 000-iteration poll loop.
+    __asm__ volatile("" ::: "memory");
     
     while (processed < XHCI_RING_SIZE) {
         xhci_trb_t* trb = &ring->trbs[ring->dequeue];
@@ -2285,8 +2290,9 @@ int xhci_bulk_transfer_in(xhci_controller_t* ctrl, usb_device_t* dev,
         if (xfer.completed) {
             ctrl->pending_xfer[slot - 1][dci] = NULL;
             
-            // Memory barrier to ensure CPU sees DMA-written data
-            __asm__ volatile("mfence" ::: "memory");
+            // Compiler barrier — x86 DMA is cache-coherent so mfence is not
+            // needed; just prevent compiler from caching stale values.
+            __asm__ volatile("" ::: "memory");
             
             if (xfer.cc == TRB_CC_SUCCESS || xfer.cc == TRB_CC_SHORT_PACKET) {
                 if (transferred) {
@@ -2483,7 +2489,7 @@ int xhci_bulk_transfer_in_sg(xhci_controller_t* ctrl, usb_device_t* dev,
         if (xfer.completed) {
             ctrl->pending_xfer[slot - 1][dci] = NULL;
             
-            __asm__ volatile("mfence" ::: "memory");
+            __asm__ volatile("" ::: "memory");  // compiler barrier only (x86 DMA is coherent)
             
             if (xfer.cc == TRB_CC_SUCCESS || xfer.cc == TRB_CC_SHORT_PACKET) {
                 if (transferred) {

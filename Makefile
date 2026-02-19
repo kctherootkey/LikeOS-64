@@ -8,6 +8,16 @@ OBJCOPY = objcopy
 DD = dd
 QEMU = qemu-system-x86_64
 XORRISO = xorriso
+
+# SMP configuration for QEMU targets:
+#   NUM_CPUS=N   - set number of CPUs (default: 4)
+#   NO_SMP=1     - disable SMP entirely (omit -smp argument)
+ifdef NO_SMP
+  QEMU_SMP =
+else
+  NUM_CPUS ?= 4
+  QEMU_SMP = -smp $(NUM_CPUS)
+endif
 MKFS_FAT = mkfs.fat
 MTOOLS = mcopy
 
@@ -383,12 +393,12 @@ $(USB_IMAGE): $(FAT_IMAGE) | $(BUILD_DIR)
 # Run in QEMU with UEFI firmware
 qemu: $(ISO_IMAGE)
 	@echo "Running LikeOS-64 in QEMU with UEFI firmware..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio -smp 4
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio $(QEMU_SMP)
 
 # Run from FAT image in QEMU
 qemu-fat: $(FAT_IMAGE)
 	@echo "Running LikeOS-64 from FAT image in QEMU with UEFI firmware..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -drive format=raw,file=$(FAT_IMAGE) -m 512M -serial stdio -smp 4
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -drive format=raw,file=$(FAT_IMAGE) -m 512M -serial stdio $(QEMU_SMP)
 
 # Standalone USB mass storage data image (64MB FAT32) now mirrors usb-write target (UEFI bootable + signature files)
 # Provides: EFI/BOOT/BOOTX64.EFI, kernel.elf, LIKEOS.SIG, HELLO.TXT, tests
@@ -427,7 +437,7 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 # Run with ISO boot plus attached xHCI controller and USB mass storage device
 qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
 	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio -smp 4 \
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
 		-device usb-storage,drive=usbdisk -machine type=pc,accel=kvm:tcg
 
@@ -438,7 +448,7 @@ ifndef USB_DEVICE
 	$(error USB_DEVICE is not set. Usage: make qemu-realusb USB_DEVICE=/dev/sdb)
 endif
 	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE)..."
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M -serial stdio -smp 4 \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M -serial stdio $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg
 
@@ -463,7 +473,7 @@ qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)
 	if [ "$$USE_USB_BOOT" = "1" ]; then echo "Using bootable FAT image as USB device"; usbimg="$(FAT_IMAGE)"; else usbimg="$(DATA_IMAGE)"; fi; \
 	echo "Passing through devices:$$devices"; \
 	set -x; \
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio -machine q35 -device qemu-xhci,id=xhci -device usb-tablet -drive if=none,id=usbdisk,file=$$usbimg,format=raw,readonly=off -device usb-storage,drive=usbdisk $$devices || echo "QEMU exited with status $$?"; \
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio $(QEMU_SMP) -machine q35 -device qemu-xhci,id=xhci -device usb-tablet -drive if=none,id=usbdisk,file=$$usbimg,format=raw,readonly=off -device usb-storage,drive=usbdisk $$devices || echo "QEMU exited with status $$?"; \
 	set +x || true
 
 # Write ISO to USB device with GPT partition table (like Rufus)
@@ -596,6 +606,8 @@ help:
 	@echo "  deps       - Install build dependencies"
 	@echo ""
 	@echo "Environment/Options:"
+	@echo "  NUM_CPUS=N        - Set number of QEMU CPUs (default: 4)"
+	@echo "  NO_SMP=1          - Disable SMP (omit -smp argument entirely)"
 	@echo "  USE_USB_BOOT=1    - For qemu-usb* targets, attempt USB mass storage boot path"
 	@echo ""
 	@echo "Subsystem Notes:"

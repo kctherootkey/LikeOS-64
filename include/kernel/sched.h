@@ -80,8 +80,11 @@ static inline int spin_trylock(spinlock_t* lock) {
 }
 
 // Release spinlock
+// On x86, stores are not reordered with stores (TSO model), so a compiler
+// barrier is sufficient for release semantics.  mfence (~33-100 cycles)
+// was needlessly serialising the pipeline on every unlock kernel-wide.
 static inline void spin_unlock(spinlock_t* lock) {
-    __asm__ volatile("mfence" ::: "memory"); // Full memory barrier before release
+    __asm__ volatile("" ::: "memory");  // compiler barrier (release semantics on x86)
     lock->locked = 0;
     lock->owner_cpu = 0xFFFFFFFF;
 }

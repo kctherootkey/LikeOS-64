@@ -74,6 +74,10 @@ extern void isr31();
 // Track whether LAPIC is active (set by lapic_init on BSP)
 static volatile int g_lapic_active = 0;
 
+// Forward declarations — needed by pic_send_eoi below
+static inline uint8_t pic_read_isr(void);
+static inline uint8_t pic2_read_isr(void);
+
 void interrupts_set_lapic_active(int active) {
     g_lapic_active = active;
 }
@@ -92,15 +96,28 @@ void pic_send_eoi(uint8_t irq) {
         if (lapic_read(isr_reg) & isr_bit) {
             // LAPIC ISR bit is set — always send LAPIC EOI
             lapic_eoi();
-            // On BSP (CPU 0), PIC interrupts arrive via virtual wire
-            // (LINT0=ExtINT) which DOES set LAPIC ISR bits.  We must
-            // also send PIC EOI so the 8259 un-stalls and can deliver
-            // further interrupts.  APs never receive PIC interrupts.
+            // On BSP (CPU 0) we must also send PIC EOI when the
+            // interrupt actually came from the 8259 PIC (virtual wire
+            // via LINT0=ExtINT).  However, the BSP's LAPIC timer
+            // fires at the SAME vector (0x20) and the PIC is NOT
+            // involved in that case.  Blindly sending PIC EOI would
+            // acknowledge whatever the PIC considers highest priority,
+            // potentially swallowing a keyboard or mouse IRQ.
+            // Fix: read the PIC ISR and only ACK the PIC when the
+            // corresponding IRQ bit is actually in-service.
             if (this_cpu_id() == 0) {
-                if (irq >= 8) {
-                    outb(PIC2_CMD, 0x20);
+                if (irq < 8) {
+                    uint8_t isr = pic_read_isr();
+                    if (isr & (1u << irq)) {
+                        outb(PIC1_CMD, 0x20);
+                    }
+                } else {
+                    uint8_t isr2 = pic2_read_isr();
+                    if (isr2 & (1u << (irq - 8))) {
+                        outb(PIC2_CMD, 0x20);
+                        outb(PIC1_CMD, 0x20);
+                    }
                 }
-                outb(PIC1_CMD, 0x20);
             }
             return;
         }

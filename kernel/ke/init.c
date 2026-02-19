@@ -21,6 +21,7 @@
 #include "../../include/kernel/acpi.h"
 #include "../../include/kernel/percpu.h"
 #include "../../include/kernel/smp.h"
+#include "../../include/kernel/lapic.h"
 
 void system_startup(boot_info_t* boot_info);
 void kernel_main(boot_info_t* boot_info);
@@ -140,6 +141,22 @@ void continue_system_startup(void) {
 
     timer_init(100);
     timer_start();
+
+    // Detect whether PIT (IRQ0) is reaching the BSP now that the LAPIC
+    // is active.  QEMU delivers PIT via virtual wire (PIC→LINT0) fine,
+    // but VMware stops PIT delivery, expecting I/O APIC routing.
+    // If no PIT tick arrives within a brief spin, switch to LAPIC timer.
+    if (lapic_is_available()) {
+        uint64_t t0 = timer_ticks();
+        for (volatile int i = 0; i < 10000000; i++) {
+            if (timer_ticks() != t0) break;
+        }
+        if (timer_ticks() == t0) {
+            irq_disable(0);
+            lapic_timer_start(100);
+            kprintf("Timer: PIT not delivering, using LAPIC timer at 100 Hz\n");
+        }
+    }
 
     shell_init();
     storage_fs_set_ready(&g_storage_state);

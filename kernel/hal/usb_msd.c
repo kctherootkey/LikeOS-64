@@ -113,8 +113,10 @@ int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,
             msd_dbg("Data IN: %d bytes\n", data_len);
             data_st = xhci_bulk_transfer_in(ctrl, dev, dma_data, data_len, &transferred);
             if (data_st == ST_OK) {
-                // Memory barrier to ensure DMA writes are visible to CPU
-                __asm__ volatile("mfence" ::: "memory");
+                // Compiler barrier to prevent compiler from reordering the memcpy
+                // before the DMA transfer completes.  On x86, DMA is cache-coherent
+                // so mfence is not needed — the transfer_in already returned.
+                __asm__ volatile("" ::: "memory");
                 // Copy received data back to caller
                 msd_memcpy(data_buf, dma_data, data_len);
             }
