@@ -140,7 +140,7 @@ void ap_entry(void) {
     __atomic_fetch_add(&g_aps_started, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&g_ap_ready, 1, __ATOMIC_SEQ_CST);
     
-    kprintf("SMP: AP %u started (APIC ID %u)\n", cpu_id, apic_id);
+    smp_dbg("SMP: AP %u started (APIC ID %u)\n", cpu_id, apic_id);
     
     // Enable interrupts
     __asm__ volatile("sti");
@@ -166,19 +166,19 @@ void ap_entry(void) {
 // ============================================================================
 
 void smp_init(uint64_t trampoline_addr) {
-    kprintf("SMP: Initializing...\n");
+    smp_dbg("SMP: Initializing...\n");
     
     // Set AP trampoline address (from bootloader or fallback to default)
     if (trampoline_addr != 0 && trampoline_addr < 0x100000 && (trampoline_addr & 0xFFF) == 0) {
         g_ap_trampoline_addr = trampoline_addr;
-        kprintf("SMP: Using bootloader-provided trampoline at 0x%lx\n", trampoline_addr);
+        smp_dbg("SMP: Using bootloader-provided trampoline at 0x%lx\n", trampoline_addr);
     } else {
         g_ap_trampoline_addr = AP_TRAMPOLINE_ADDR_DEFAULT;
         if (trampoline_addr != 0) {
-            kprintf("SMP: Invalid trampoline address 0x%lx, using default 0x%lx\n", 
+            smp_dbg("SMP: Invalid trampoline address 0x%lx, using default 0x%lx\n", 
                     trampoline_addr, g_ap_trampoline_addr);
         } else {
-            kprintf("SMP: Using default trampoline address 0x%lx\n", g_ap_trampoline_addr);
+            smp_dbg("SMP: Using default trampoline address 0x%lx\n", g_ap_trampoline_addr);
         }
     }
     
@@ -189,11 +189,11 @@ void smp_init(uint64_t trampoline_addr) {
     }
     
     if (g_cpu_count > MAX_CPUS) {
-        kprintf("SMP: Limiting CPU count from %u to %u\n", g_cpu_count, MAX_CPUS);
+        smp_dbg("SMP: Limiting CPU count from %u to %u\n", g_cpu_count, MAX_CPUS);
         g_cpu_count = MAX_CPUS;
     }
     
-    kprintf("SMP: %u CPU(s) detected\n", g_cpu_count);
+    smp_dbg("SMP: %u CPU(s) detected\n", g_cpu_count);
     
     // Initialize BSP's LAPIC
     lapic_init();
@@ -206,7 +206,7 @@ void smp_init(uint64_t trampoline_addr) {
     sched_enable_smp();
     
     if (g_cpu_count == 1) {
-        kprintf("SMP: Single CPU system, no APs to start\n");
+        smp_dbg("SMP: Single CPU system, no APs to start\n");
         g_smp_state = SMP_STATE_RUNNING;
         return;
     }
@@ -222,7 +222,7 @@ void smp_boot_aps(void) {
         return;
     }
     
-    kprintf("SMP: Starting %u Application Processor(s)...\n", g_cpu_count - 1);
+    smp_dbg("SMP: Starting %u Application Processor(s)...\n", g_cpu_count - 1);
     
     // Copy trampoline code to low memory (at bootloader-reserved address)
     size_t trampoline_size = (size_t)(ap_trampoline_end - ap_trampoline_start);
@@ -236,14 +236,14 @@ void smp_boot_aps(void) {
         return;
     }
     
-    kprintf("SMP: Trampoline copied to 0x%lx, size=%u bytes\n", g_ap_trampoline_addr, (uint32_t)trampoline_size);
+    smp_dbg("SMP: Trampoline copied to 0x%lx, size=%u bytes\n", g_ap_trampoline_addr, (uint32_t)trampoline_size);
     
     // Get PML4 physical address for APs (same as BSP)
     uint64_t pml4_phys;
     __asm__ volatile("mov %%cr3, %0" : "=r"(pml4_phys));
     pml4_phys &= 0x000FFFFFFFFFF000ULL;
     
-    kprintf("SMP: BSP PML4 physical address = 0x%lx\n", pml4_phys);
+    smp_dbg("SMP: BSP PML4 physical address = 0x%lx\n", pml4_phys);
     
     // Store PML4 address in trampoline
     volatile uint64_t* pml4_ptr = (volatile uint64_t*)(phys_to_virt(g_ap_trampoline_addr + AP_TRAMPOLINE_PML4_OFFSET));
@@ -254,7 +254,7 @@ void smp_boot_aps(void) {
     
     // Verify the write
     uint64_t verify = *pml4_ptr;
-    kprintf("SMP: PML4 written to 0x%lx, readback = 0x%lx\n", 
+    smp_dbg("SMP: PML4 written to 0x%lx, readback = 0x%lx\n", 
             g_ap_trampoline_addr + AP_TRAMPOLINE_PML4_OFFSET, verify);
     
     if (verify != pml4_phys) {
@@ -283,7 +283,7 @@ void smp_boot_aps(void) {
             continue;
         }
         
-        kprintf("SMP: Starting AP %u (APIC ID %u)...\n", ap_index, cpu->apic_id);
+        smp_dbg("SMP: Starting AP %u (APIC ID %u)...\n", ap_index, cpu->apic_id);
         
         // Allocate stack for this AP
         g_ap_stacks[ap_index] = (uint8_t*)kalloc(AP_STACK_SIZE);
@@ -339,7 +339,7 @@ void smp_boot_aps(void) {
     mm_remove_smp_identity_map(g_ap_trampoline_addr, trampoline_size + 0x200);
     
     g_smp_state = SMP_STATE_RUNNING;
-    kprintf("SMP: %u AP(s) started successfully\n", g_aps_started);
+    smp_dbg("SMP: %u AP(s) started successfully\n", g_aps_started);
 }
 
 void smp_wait_for_aps(void) {

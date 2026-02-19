@@ -5,6 +5,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/acpi.h"
+#include "../../include/kernel/smp.h"
 
 // ============================================================================
 // Global Per-CPU Data
@@ -24,7 +25,7 @@ static percpu_t g_bsp_percpu __attribute__((aligned(4096)));
 // ============================================================================
 
 void percpu_init(void) {
-    kprintf("PERCPU: Initializing per-CPU infrastructure\n");
+    smp_dbg("PERCPU: Initializing per-CPU infrastructure\n");
     
     // Initialize BSP's per-CPU data
     mm_memset(&g_bsp_percpu, 0, sizeof(percpu_t));
@@ -50,7 +51,7 @@ void percpu_init(void) {
     // Set GS base to point to BSP's per-CPU data
     write_gs_base((uint64_t)&g_bsp_percpu);
     
-    kprintf("PERCPU: BSP per-CPU data at 0x%lx\n", (uint64_t)&g_bsp_percpu);
+    smp_dbg("PERCPU: BSP per-CPU data at 0x%lx\n", (uint64_t)&g_bsp_percpu);
 }
 
 void percpu_init_cpu(uint32_t cpu_id, uint32_t apic_id) {
@@ -106,7 +107,7 @@ void percpu_init_cpu(uint32_t cpu_id, uint32_t apic_id) {
     // Increment online CPU count atomically
     __atomic_fetch_add(&g_cpus_online, 1, __ATOMIC_SEQ_CST);
     
-    kprintf("PERCPU: CPU %u initialized (APIC ID %u, percpu at 0x%lx)\n",
+    smp_dbg("PERCPU: CPU %u initialized (APIC ID %u, percpu at 0x%lx)\n",
             cpu_id, apic_id, (uint64_t)percpu);
 }
 

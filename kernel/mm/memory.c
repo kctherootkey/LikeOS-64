@@ -3,6 +3,7 @@
 
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/smp.h"
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/sched.h"  // For spinlock_t
 
@@ -55,17 +56,6 @@ static struct {
 
 // UEFI memory map storage - saved from boot_info for later use
 static memory_map_info_t g_uefi_memory_map = {0};
-
-// I/O port functions
-static inline void outb(uint16_t port, uint8_t val) {
-    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-
-static inline uint8_t inb(uint16_t port) {
-    uint8_t ret;
-    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
 
 // Utility functions (non-static, declared in memory.h)
 void mm_memset(void* dest, int val, size_t len) {
@@ -2360,7 +2350,7 @@ bool mm_identity_map_for_smp(uint64_t physical_addr, size_t size) {
         page_aligned += 0x1000;
     }
     
-    kprintf("SMP: Identity-mapped 0x%lx - 0x%lx for AP trampoline\n", 
+    smp_dbg("SMP: Identity-mapped 0x%lx - 0x%lx for AP trampoline\n", 
             physical_addr & ~0xFFFULL, end_addr);
     return true;
 }
@@ -2375,7 +2365,7 @@ void mm_remove_smp_identity_map(uint64_t physical_addr, size_t size) {
         page_aligned += 0x1000;
     }
     
-    kprintf("SMP: Removed identity mapping for AP trampoline\n");
+    smp_dbg("SMP: Removed identity mapping for AP trampoline\n");
 }
 
 // Initialize SYSCALL/SYSRET

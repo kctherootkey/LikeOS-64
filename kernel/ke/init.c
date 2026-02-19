@@ -138,6 +138,7 @@ void continue_system_startup(void) {
     // Boot Application Processors (APs)
     // After this, all CPUs are running and SMP is fully initialized
     smp_boot_aps();
+    kprintf("SMP: %u CPU(s) online\n", smp_get_cpu_count());
 
     timer_init(100);
     timer_start();

@@ -5,6 +5,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/interrupt.h"
+#include "../../include/kernel/smp.h"
 
 // ============================================================================
 // LAPIC Base Address
@@ -158,7 +159,7 @@ void lapic_setup_logical_dest(uint32_t logical_id) {
 
 void lapic_init(void) {
     if (!lapic_is_available()) {
-        kprintf("LAPIC: Not available on this CPU\n");
+        smp_dbg("LAPIC: Not available on this CPU\n");
         return;
     }
     
@@ -166,7 +167,7 @@ void lapic_init(void) {
     lapic_phys_base = lapic_get_base();
     lapic_base = NULL;  // Will be set on first access
     
-    kprintf("LAPIC: Base address = 0x%lx\n", lapic_phys_base);
+    smp_dbg("LAPIC: Base address = 0x%lx\n", lapic_phys_base);
     
     // Enable LAPIC
     lapic_enable();
@@ -210,7 +211,7 @@ void lapic_init(void) {
         interrupts_set_lapic_active(1);
     }
     
-    kprintf("LAPIC: Initialized (APIC ID = %u)\n", apic_id);
+    smp_dbg("LAPIC: Initialized (APIC ID = %u)\n", apic_id);
 }
 
 // ============================================================================
@@ -221,7 +222,7 @@ void lapic_timer_calibrate(void) {
     // Use PIT to calibrate LAPIC timer
     // We'll count LAPIC ticks over a known PIT interval
     
-    kprintf("LAPIC: Calibrating timer...\n");
+    smp_dbg("LAPIC: Calibrating timer...\n");
     
     // Set up LAPIC timer with divide by 16
     lapic_write(LAPIC_TIMER_DCR, LAPIC_TIMER_DIV_16);
@@ -243,7 +244,7 @@ void lapic_timer_calibrate(void) {
     // elapsed ticks / 10ms = elapsed * 100 ticks per second
     lapic_timer_freq = (uint64_t)elapsed * 100;
     
-    kprintf("LAPIC: Timer frequency = %lu Hz (elapsed=%u in 10ms)\n", 
+    smp_dbg("LAPIC: Timer frequency = %lu Hz (elapsed=%u in 10ms)\n", 
             lapic_timer_freq, elapsed);
 }
 
@@ -261,7 +262,7 @@ void lapic_timer_start(uint32_t frequency) {
     lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LAPIC_TIMER_PERIODIC);
     lapic_write(LAPIC_TIMER_ICR, count);
     
-    kprintf("LAPIC: Timer started at %u Hz (count=%u)\n", frequency, count);
+    smp_dbg("LAPIC: Timer started at %u Hz (count=%u)\n", frequency, count);
 }
 
 void lapic_timer_stop(void) {

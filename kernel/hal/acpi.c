@@ -4,6 +4,7 @@
 #include "../../include/kernel/acpi.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/memory.h"
+#include "../../include/kernel/smp.h"
 
 // ============================================================================
 // Global ACPI State
@@ -72,7 +73,7 @@ static acpi_rsdp_t* acpi_find_rsdp(uint64_t rsdp_hint) {
         if (my_memcmp(ptr, ACPI_SIG_RSDP, 8) == 0) {
             rsdp = (acpi_rsdp_t*)ptr;
             if (acpi_validate_checksum(rsdp, 20)) {
-                kprintf("ACPI: RSDP found at hint address 0x%lx\n", rsdp_hint);
+                smp_dbg("ACPI: RSDP found at hint address 0x%lx\n", rsdp_hint);
                 return rsdp;
             }
         }
@@ -84,7 +85,7 @@ static acpi_rsdp_t* acpi_find_rsdp(uint64_t rsdp_hint) {
     // Search BIOS ROM area: 0xE0000 - 0xFFFFF
     rsdp = acpi_find_rsdp_in_range(0xE0000, 0x100000);
     if (rsdp) {
-        kprintf("ACPI: RSDP found in BIOS ROM area at 0x%lx\n", 
+        smp_dbg("ACPI: RSDP found in BIOS ROM area at 0x%lx\n", 
                 (uint64_t)rsdp - PHYS_MAP_BASE);
         return rsdp;
     }
@@ -109,7 +110,7 @@ static acpi_sdt_header_t* acpi_find_table(const char* signature) {
         // Use XSDT (64-bit entries)
         acpi_xsdt_t* xsdt = (acpi_xsdt_t*)phys_to_virt(rsdp->xsdt_address);
         if (!acpi_validate_checksum(xsdt, xsdt->header.length)) {
-            kprintf("ACPI: XSDT checksum invalid\n");
+            smp_dbg("ACPI: XSDT checksum invalid\n");
             return NULL;
         }
         
@@ -126,7 +127,7 @@ static acpi_sdt_header_t* acpi_find_table(const char* signature) {
         // Use RSDT (32-bit entries)
         acpi_rsdt_t* rsdt = (acpi_rsdt_t*)phys_to_virt(rsdp->rsdt_address);
         if (!acpi_validate_checksum(rsdt, rsdt->header.length)) {
-            kprintf("ACPI: RSDT checksum invalid\n");
+            smp_dbg("ACPI: RSDT checksum invalid\n");
             return NULL;
         }
         
@@ -155,7 +156,7 @@ static void acpi_parse_madt(void) {
         return;
     }
     
-    kprintf("ACPI: MADT found, length=%u\n", madt->header.length);
+    smp_dbg("ACPI: MADT found, length=%u\n", madt->header.length);
     
     // Save LAPIC address
     g_acpi_info.lapic_address = madt->lapic_address;
@@ -238,7 +239,7 @@ static void acpi_parse_madt(void) {
 // ============================================================================
 
 int acpi_init(uint64_t rsdp_hint) {
-    kprintf("ACPI: Initializing...\n");
+    smp_dbg("ACPI: Initializing...\n");
     
     // Find RSDP
     acpi_rsdp_t* rsdp = acpi_find_rsdp(rsdp_hint);
@@ -254,12 +255,12 @@ int acpi_init(uint64_t rsdp_hint) {
     // Convert virtual back to physical
     g_acpi_info.rsdp_phys_addr = virt_to_phys((void*)rsdp);
     
-    kprintf("ACPI: Revision %u, OEM: %.6s\n", rsdp->revision, rsdp->oem_id);
+    smp_dbg("ACPI: Revision %u, OEM: %.6s\n", rsdp->revision, rsdp->oem_id);
     
     if (rsdp->revision >= 2) {
-        kprintf("ACPI: XSDT at 0x%lx\n", rsdp->xsdt_address);
+        smp_dbg("ACPI: XSDT at 0x%lx\n", rsdp->xsdt_address);
     }
-    kprintf("ACPI: RSDT at 0x%x\n", rsdp->rsdt_address);
+    smp_dbg("ACPI: RSDT at 0x%x\n", rsdp->rsdt_address);
     
     // Parse MADT for CPU information
     acpi_parse_madt();
@@ -326,35 +327,35 @@ uint32_t acpi_irq_to_gsi(uint8_t isa_irq) {
 }
 
 void acpi_print_info(void) {
-    kprintf("ACPI: LAPIC address = 0x%lx\n", g_acpi_info.lapic_address);
-    kprintf("ACPI: %u CPU(s) found:\n", g_acpi_info.cpu_count);
+    smp_dbg("ACPI: LAPIC address = 0x%lx\n", g_acpi_info.lapic_address);
+    smp_dbg("ACPI: %u CPU(s) found:\n", g_acpi_info.cpu_count);
     
     for (uint32_t i = 0; i < g_acpi_info.cpu_count; i++) {
         cpu_info_t* cpu = &g_acpi_info.cpus[i];
-        kprintf("  CPU %u: APIC ID=%u, %s%s%s\n",
+        smp_dbg("  CPU %u: APIC ID=%u, %s%s%s\n",
                 i, cpu->apic_id,
                 cpu->enabled ? "enabled" : "disabled",
                 cpu->bsp ? ", BSP" : "",
                 cpu->online_capable ? ", online-capable" : "");
     }
     
-    kprintf("ACPI: %u I/O APIC(s) found:\n", g_acpi_info.ioapic_count);
+    smp_dbg("ACPI: %u I/O APIC(s) found:\n", g_acpi_info.ioapic_count);
     for (uint32_t i = 0; i < g_acpi_info.ioapic_count; i++) {
         ioapic_info_t* ioapic = &g_acpi_info.ioapics[i];
-        kprintf("  I/O APIC %u: ID=%u, addr=0x%x, GSI base=%u\n",
+        smp_dbg("  I/O APIC %u: ID=%u, addr=0x%x, GSI base=%u\n",
                 i, ioapic->id, ioapic->address, ioapic->gsi_base);
     }
     
     if (g_acpi_info.irq_override_count > 0) {
-        kprintf("ACPI: %u IRQ override(s):\n", g_acpi_info.irq_override_count);
+        smp_dbg("ACPI: %u IRQ override(s):\n", g_acpi_info.irq_override_count);
         for (uint32_t i = 0; i < g_acpi_info.irq_override_count; i++) {
             irq_override_t* ovr = &g_acpi_info.irq_overrides[i];
-            kprintf("  IRQ %u -> GSI %u (pol=%u, trig=%u)\n",
+            smp_dbg("  IRQ %u -> GSI %u (pol=%u, trig=%u)\n",
                     ovr->bus_irq, ovr->gsi, ovr->polarity, ovr->trigger_mode);
         }
     }
     
     if (g_acpi_info.dual_8259_present) {
-        kprintf("ACPI: PC-AT compatible dual-8259 present\n");
+        smp_dbg("ACPI: PC-AT compatible dual-8259 present\n");
     }
 }

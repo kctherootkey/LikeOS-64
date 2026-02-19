@@ -1320,18 +1320,20 @@ void xhci_process_events(xhci_controller_t* ctrl) {
     xhci_ring_t* ring = ctrl->event_ring;
     int processed = 0;
     
-    // Clear EINT and Interrupter Pending (IP) BEFORE checking events.
-    // This is critical for SMP: when PIC interrupts share the LAPIC path,
-    // the XHCI IRQ may not be delivered promptly, leaving EINT stale.
-    // Without clearing, the QEMU quirk_resync sees perpetual EINT and
-    // falsely toggles the event ring cycle bit, processing stale TRBs.
-    uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-    if (sts & XHCI_STS_EINT) {
-        xhci_op_write32(ctrl, XHCI_OP_USBSTS, XHCI_STS_EINT);
-    }
-    uint32_t iman_val = xhci_rt_read32(ctrl, 0x20);
-    if (iman_val & 1) {
-        xhci_rt_write32(ctrl, 0x20, iman_val | (1 << 0)); // W1C the IP bit
+    // QEMU quirk: pre-clear EINT/IP so the quirk_resync cycle-toggle
+    // check below doesn't see stale EINT left over from missed IRQs.
+    // Only QEMU needs this; on other controllers (VirtualBox, VMware,
+    // real hardware) pre-clearing can race with event posting and cause
+    // the controller to not re-assert EINT for new events.
+    if (ctrl->quirk_resync) {
+        uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+        if (sts & XHCI_STS_EINT) {
+            xhci_op_write32(ctrl, XHCI_OP_USBSTS, XHCI_STS_EINT);
+        }
+        uint32_t iman_val = xhci_rt_read32(ctrl, 0x20);
+        if (iman_val & 1) {
+            xhci_rt_write32(ctrl, 0x20, iman_val | (1 << 0));
+        }
     }
     
     // Compiler barrier: ensure we re-read event ring TRBs from memory (not
@@ -1396,10 +1398,21 @@ void xhci_process_events(xhci_controller_t* ctrl) {
         processed++;
     }
     
-    // Update ERDP to acknowledge processed events
+    // Update ERDP and clear EINT/IP after processing (xHCI spec 4.17.2).
+    // Clearing EINT after processing (not before) is the spec-compliant
+    // order and avoids races on VirtualBox/VMware where pre-clearing can
+    // prevent the controller from properly re-asserting EINT.
     if (processed > 0) {
+        uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+        if (sts & XHCI_STS_EINT) {
+            xhci_op_write32(ctrl, XHCI_OP_USBSTS, XHCI_STS_EINT);
+        }
+        uint32_t iman_val = xhci_rt_read32(ctrl, 0x20);
+        if (iman_val & 1) {
+            xhci_rt_write32(ctrl, 0x20, iman_val | (1 << 0));
+        }
         uint64_t erdp = mm_get_physical_address((uint64_t)&ring->trbs[ring->dequeue]);
-        xhci_rt_write64(ctrl, 0x38, erdp | (1 << 3)); // Set EHB
+        xhci_rt_write64(ctrl, 0x38, erdp | (1 << 3)); // Set EHB (W1C)
     }
 }
 
