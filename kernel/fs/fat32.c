@@ -1632,16 +1632,15 @@ int fat32_dir_list(unsigned long cluster, void (*cb)(const char *, unsigned, uns
     return fat32_dir_list_internal(cluster, cb, 0);
 }
 
-int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr,
-    unsigned long *first_cluster, unsigned long *size)
+// Lock-free core of fat32_dir_find — caller must hold fat32_lock or ensure
+// exclusive access.  Used by internal helpers (fat32_resolve_parent, etc.)
+// that are already called under fat32_lock.
+static int fat32_dir_find_nolock(unsigned long start_cluster, const char *name,
+    unsigned *attr, unsigned long *first_cluster, unsigned long *size)
 {
-    uint64_t flags;
-    spin_lock_irqsave(&fat32_lock, &flags);
-
-    if (!g_root_fs || !name) {
-        spin_unlock_irqrestore(&fat32_lock, flags);
+    if (!g_root_fs || !name)
         return ST_INVALID;
-    }
+
     unsigned cluster_size = g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
     unsigned long cluster = start_cluster;
     char canon[FAT32_LFN_MAX];
@@ -1660,14 +1659,11 @@ int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr
     int lfn_len = 0;
     while (cluster < 0x0FFFFFF8) {
         void *buf = kalloc(cluster_size);
-        if (!buf) {
-            spin_unlock_irqrestore(&fat32_lock, flags);
+        if (!buf)
             return ST_NOMEM;
-        }
         if (read_sectors(g_root_fs->bdev, cluster_to_lba(g_root_fs, cluster),
             g_root_fs->sectors_per_cluster, buf) != ST_OK) {
             kfree(buf);
-            spin_unlock_irqrestore(&fat32_lock, flags);
             return ST_IO;
         }
         fat32_dirent_t *ents = (fat32_dirent_t *)buf;
@@ -1675,7 +1671,6 @@ int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr
         for (unsigned i = 0; i < entries; i++) {
             if (ents[i].name[0] == 0x00) {
                 kfree(buf);
-                spin_unlock_irqrestore(&fat32_lock, flags);
                 return ST_NOT_FOUND;
             }
             if (ents[i].name[0] == 0xE5)
@@ -1761,7 +1756,6 @@ int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr
                 if (size)
                     *size = ents[i].fileSize;
                 kfree(buf);
-                spin_unlock_irqrestore(&fat32_lock, flags);
                 return ST_OK;
             }
             lfn_buf[0] = '\0';
@@ -1773,8 +1767,18 @@ int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr
             break;
         cluster = next;
     }
-    spin_unlock_irqrestore(&fat32_lock, flags);
     return ST_NOT_FOUND;
+}
+
+// Public API: acquires fat32_lock, then delegates to nolock version.
+int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr,
+    unsigned long *first_cluster, unsigned long *size)
+{
+    uint64_t flags;
+    spin_lock_irqsave(&fat32_lock, &flags);
+    int ret = fat32_dir_find_nolock(start_cluster, name, attr, first_cluster, size);
+    spin_unlock_irqrestore(&fat32_lock, flags);
+    return ret;
 }
 
 static int fat32_path_resolve(const char *path, unsigned *attr,
@@ -1800,7 +1804,7 @@ static int fat32_path_resolve(const char *path, unsigned *attr,
         unsigned a;
         unsigned long fc;
         unsigned long sz;
-        if (fat32_dir_find(current, part, &a, &fc, &sz) != ST_OK)
+        if (fat32_dir_find_nolock(current, part, &a, &fc, &sz) != ST_OK)
             return ST_NOT_FOUND;
         if (*seg == '/') {
             if (!(a & FAT32_ATTR_DIRECTORY))
@@ -1876,7 +1880,7 @@ int fat32_resolve_path(unsigned long start_cluster, const char *path, unsigned *
             unsigned a;
             unsigned long fc;
             unsigned long sz;
-            if (fat32_dir_find(current, part, &a, &fc, &sz) != ST_OK)
+            if (fat32_dir_find_nolock(current, part, &a, &fc, &sz) != ST_OK)
                 return ST_NOT_FOUND;
             if (*seg == '/') {
                 if (!(a & FAT32_ATTR_DIRECTORY))
@@ -1998,7 +2002,7 @@ static int fat32_resolve_parent(unsigned long start_cluster, const char *path,
             unsigned a;
             unsigned long fc;
             unsigned long sz;
-            if (fat32_dir_find(current, part, &a, &fc, &sz) != ST_OK)
+            if (fat32_dir_find_nolock(current, part, &a, &fc, &sz) != ST_OK)
                 return ST_NOT_FOUND;
             if (!(a & FAT32_ATTR_DIRECTORY))
                 return ST_INVALID;
