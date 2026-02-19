@@ -1318,6 +1318,20 @@ void xhci_process_events(xhci_controller_t* ctrl) {
     xhci_ring_t* ring = ctrl->event_ring;
     int processed = 0;
     
+    // Clear EINT and Interrupter Pending (IP) BEFORE checking events.
+    // This is critical for SMP: when PIC interrupts share the LAPIC path,
+    // the XHCI IRQ may not be delivered promptly, leaving EINT stale.
+    // Without clearing, the QEMU quirk_resync sees perpetual EINT and
+    // falsely toggles the event ring cycle bit, processing stale TRBs.
+    uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+    if (sts & XHCI_STS_EINT) {
+        xhci_op_write32(ctrl, XHCI_OP_USBSTS, XHCI_STS_EINT);
+    }
+    uint32_t iman_val = xhci_rt_read32(ctrl, 0x20);
+    if (iman_val & 1) {
+        xhci_rt_write32(ctrl, 0x20, iman_val | (1 << 0)); // W1C the IP bit
+    }
+    
     // Memory barrier to ensure we see DMA-written events
     __asm__ volatile("mfence" ::: "memory");
     

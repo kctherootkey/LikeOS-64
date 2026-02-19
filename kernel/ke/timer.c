@@ -4,6 +4,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/signal.h"
+#include "../../include/kernel/percpu.h"
 
 static volatile uint64_t g_ticks = 0;
 static uint32_t g_frequency = 100; // Default 100 Hz
@@ -42,13 +43,25 @@ uint64_t timer_ticks(void) {
 }
 
 void timer_irq_handler(void) {
-    g_ticks++;
+    // Determine if we're on BSP or AP
+    // Only BSP (CPU 0) manages global tick counter and task wakeups.
+    // APs receive this via LAPIC timer at the same vector but only
+    // manage their own per-CPU time slice tracking.
+    int is_bsp = 1;
+    if (sched_is_smp()) {
+        is_bsp = (this_cpu_id() == 0);
+    }
     
-    // Wake any tasks whose sleep timer has expired and check signal timers
-    // This handles alarm(), itimer, and wakes sleeping tasks
-    sched_wake_expired_sleepers(g_ticks);
+    if (is_bsp) {
+        g_ticks++;
+        
+        // Wake any tasks whose sleep timer has expired and check signal timers
+        // This handles alarm(), itimer, and wakes sleeping tasks
+        sched_wake_expired_sleepers(g_ticks);
+    }
     
-    // Preemption logic for current task
+    // Per-CPU: manage this CPU's current task time slice
+    // sched_current() returns per-CPU current task (NULL on APs with no tasks)
     task_t* cur = sched_current();
     if (cur) {
         // Preemption logic: decrement time slice and trigger reschedule if expired
@@ -63,6 +76,8 @@ void timer_irq_handler(void) {
         }
     }
     
-    // Notify scheduler of tick (updates statistics)
-    sched_tick();
+    // Only BSP calls sched_tick for global statistics
+    if (is_bsp) {
+        sched_tick();
+    }
 }

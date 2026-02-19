@@ -377,7 +377,8 @@ static task_t* pick_next(task_t* start, int from_timer) {
 void sched_tick(void) {
     // In preemptive mode, time slice tracking is done in timer_irq_handler
     // This function is kept for backward compatibility and statistics
-    if (!g_current) {
+    task_t* cur = sched_current();
+    if (!cur) {
         return;
     }
     // Statistics only - preemption is handled by timer_irq_handler
@@ -390,7 +391,9 @@ static volatile uint64_t g_total_schedules = 0;
 // Does NOT modify current task's state - caller must set it appropriately before calling
 // (TASK_BLOCKED, TASK_ZOMBIE, TASK_READY, etc.)
 void sched_schedule(void) {
-    if (!g_current) {
+    // SMP: use per-CPU current task, not the global g_current
+    task_t* cur = sched_current();
+    if (!cur) {
         return;
     }
     
@@ -402,11 +405,11 @@ void sched_schedule(void) {
     g_yield_count++;  // Track schedules
     g_total_schedules++;  // Debug counter
     
-    task_t* next = pick_next(g_current, 0);  // from_timer=0
-    if (next == g_current) {
+    task_t* next = pick_next(cur, 0);  // from_timer=0
+    if (next == cur) {
         // No context switch needed, just reset time slice
-        g_current->remaining_ticks = SCHED_TIME_SLICE;
-        g_current->need_resched = 0;
+        cur->remaining_ticks = SCHED_TIME_SLICE;
+        cur->need_resched = 0;
         spin_unlock(&g_sched_lock);
         return;
     }
@@ -417,8 +420,8 @@ void sched_schedule(void) {
         for(;;) __asm__ volatile("hlt");
     }
     
-    task_t* prev = g_current;
-    g_current = next;
+    task_t* prev = cur;
+    g_current = next;  // Update global (used as list traversal head)
     
     // Update per-CPU current task for SMP
     if (g_smp_initialized) {
@@ -438,23 +441,23 @@ void sched_schedule(void) {
     ctx_switch_asm(&prev->sp, next->sp);
     
     // We return here when this task is scheduled again
-    // g_preempt_count should be 0 for normal operation
 }
 
 void sched_run_ready(void) {
-    // In preemptive mode, check if reschedule is needed
-    if (!g_current || !sched_need_resched()) {
+    // SMP: use per-CPU current task, not the global g_current
+    task_t* cur = sched_current();
+    if (!cur || !cur->need_resched) {
         return;
     }
-    g_current->remaining_ticks = SCHED_TIME_SLICE;
-    g_current->need_resched = 0;
-    task_t* next = pick_next(g_current, 0);  // from_timer=0, exclude bootstrap
+    cur->remaining_ticks = SCHED_TIME_SLICE;
+    cur->need_resched = 0;
+    task_t* next = pick_next(cur, 0);  // from_timer=0, exclude bootstrap
     
     if (!next) {
         return;
     }
     
-    if (next == g_current || (is_idle_task(next) && !is_idle_task(g_current))) {
+    if (next == cur || (is_idle_task(next) && !is_idle_task(cur))) {
         return;
     }
     
@@ -463,8 +466,8 @@ void sched_run_ready(void) {
         for(;;) __asm__ volatile("hlt");
     }
     
-    task_t* prev = g_current;
-    g_current = next;
+    task_t* prev = cur;
+    g_current = next;  // Update global (used as list traversal head)
     
     // Update per-CPU current task for SMP
     if (g_smp_initialized) {
@@ -510,11 +513,13 @@ int sched_has_user_tasks(void) {
 }
 
 static void task_trampoline(void) {
-    task_t* cur = g_current;
+    task_t* cur = sched_current();
     if (cur && cur->entry) {
         cur->entry(cur->arg);
     }
-    cur->state = TASK_ZOMBIE;
+    // Re-read in case sched_current changed (shouldn't, but safe)
+    cur = sched_current();
+    if (cur) cur->state = TASK_ZOMBIE;
     for (;;) {
         sched_schedule();
         __asm__ volatile ("hlt");
@@ -1083,8 +1088,10 @@ void sched_dump_tasks(void) {
 
 // Check if the current task needs rescheduling
 int sched_need_resched(void) {
-    if (!g_current) return 0;
-    return g_current->need_resched;
+    // SMP: use per-CPU current task so APs don't read BSP's state
+    task_t* cur = sched_current();
+    if (!cur) return 0;
+    return cur->need_resched;
 }
 
 // Mark a task as needing rescheduling
@@ -1097,7 +1104,10 @@ void sched_set_need_resched(task_t* t) {
 // Preemptive context switch called from timer interrupt
 // This is called with interrupts disabled and must be very careful
 void sched_preempt(interrupt_frame_t* frame) {
-    if (!g_current) return;
+    // SMP: use per-CPU current task, not the global g_current
+    // Without this, an AP's LAPIC timer could hijack the BSP's task
+    task_t* cur = sched_current();
+    if (!cur) return;
     
     // Acquire scheduler lock (SMP-safe)
     // Use trylock to avoid deadlock if lock is held
@@ -1107,26 +1117,26 @@ void sched_preempt(interrupt_frame_t* frame) {
     }
     
     // Clear the need_resched flag
-    g_current->need_resched = 0;
+    cur->need_resched = 0;
     
     // Save the interrupt frame so we can resume later
-    g_current->preempt_frame = frame;
+    cur->preempt_frame = frame;
     
     // Pick next task (use from_timer=1 for more aggressive scheduling)
-    task_t* next = pick_next(g_current, 1);
+    task_t* next = pick_next(cur, 1);
     
-    if (next == g_current || !next) {
+    if (next == cur || !next) {
         // No switch needed, just reset time slice
-        g_current->remaining_ticks = SCHED_TIME_SLICE;
-        g_current->preempt_frame = NULL;
+        cur->remaining_ticks = SCHED_TIME_SLICE;
+        cur->preempt_frame = NULL;
         spin_unlock(&g_sched_lock);
         return;
     }
     
     if (next->sp == 0) {
         // Invalid target, don't switch
-        g_current->remaining_ticks = SCHED_TIME_SLICE;
-        g_current->preempt_frame = NULL;
+        cur->remaining_ticks = SCHED_TIME_SLICE;
+        cur->preempt_frame = NULL;
         spin_unlock(&g_sched_lock);
         return;
     }
@@ -1135,8 +1145,8 @@ void sched_preempt(interrupt_frame_t* frame) {
     next->remaining_ticks = SCHED_TIME_SLICE;
     
     // Perform the context switch
-    task_t* prev = g_current;
-    g_current = next;
+    task_t* prev = cur;
+    g_current = next;  // Update global (used as list traversal head)
     
     // Update per-CPU current task for SMP
     if (g_smp_initialized) {
@@ -1163,8 +1173,9 @@ void sched_preempt(interrupt_frame_t* frame) {
     
     // When we return here, this task has been resumed
     // Clear preempt_frame as we're no longer in preemption context
-    if (g_current) {
-        g_current->preempt_frame = NULL;
+    task_t* resumed = sched_current();
+    if (resumed) {
+        resumed->preempt_frame = NULL;
     }
 }
 // Enable SMP mode for scheduler

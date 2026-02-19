@@ -6,6 +6,7 @@
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/signal.h"
 #include "../../include/kernel/lapic.h"
+#include "../../include/kernel/percpu.h"
 
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_descriptor idt_desc;
@@ -78,25 +79,34 @@ void interrupts_set_lapic_active(int active) {
 }
 
 void pic_send_eoi(uint8_t irq) {
-    // When LAPIC is active, check if this interrupt came from the LAPIC
-    // (e.g. LAPIC timer on APs) vs the 8259 PIC (e.g. keyboard/mouse on BSP).
-    // LAPIC-sourced interrupts set the ISR bit; PIC-via-virtual-wire do not.
-    // We must ONLY send EOI to the correct controller:
-    //   - LAPIC interrupt → lapic_eoi() only, do NOT touch the 8259 PIC
-    //   - PIC interrupt   → PIC EOI only, do NOT send lapic_eoi()
+    // When LAPIC is active, check if this interrupt came through the LAPIC.
+    // Two cases set the LAPIC ISR bit:
+    //   1. AP LAPIC timer: only LAPIC EOI needed, do NOT touch the 8259 PIC
+    //   2. BSP virtual wire (PIC via LINT0=ExtINT): BOTH LAPIC EOI and PIC EOI
+    //      needed — LAPIC EOI clears the ISR bit, PIC EOI un-stalls the 8259
     // Sending PIC EOI from an AP would corrupt the shared 8259 PIC state.
     if (g_lapic_active) {
         uint8_t vector = irq + 32;
         uint32_t isr_reg = LAPIC_ISR_BASE + (vector / 32) * 0x10;
         uint32_t isr_bit = 1U << (vector % 32);
         if (lapic_read(isr_reg) & isr_bit) {
-            // LAPIC owns this interrupt - only LAPIC EOI, skip PIC
+            // LAPIC ISR bit is set — always send LAPIC EOI
             lapic_eoi();
+            // On BSP (CPU 0), PIC interrupts arrive via virtual wire
+            // (LINT0=ExtINT) which DOES set LAPIC ISR bits.  We must
+            // also send PIC EOI so the 8259 un-stalls and can deliver
+            // further interrupts.  APs never receive PIC interrupts.
+            if (this_cpu_id() == 0) {
+                if (irq >= 8) {
+                    outb(PIC2_CMD, 0x20);
+                }
+                outb(PIC1_CMD, 0x20);
+            }
             return;
         }
     }
     
-    // PIC interrupt - send PIC EOI only
+    // PIC interrupt without LAPIC involvement (pre-LAPIC init)
     if (irq >= 8) {
         outb(PIC2_CMD, 0x20);
     }
