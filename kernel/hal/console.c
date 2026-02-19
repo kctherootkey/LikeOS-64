@@ -9,9 +9,16 @@
 #include "../../include/kernel/mouse.h"
 #include "../../include/kernel/scrollbar.h"
 #include "../../include/kernel/memory.h"
+#include "../../include/kernel/sched.h"  // For spinlock_t
 
 #define SIZE_MAX ((size_t)-1)
 #define NULL ((void*)0)
+
+// ============================================================================
+// SMP LOCKING
+// ============================================================================
+// Console lock for thread-safe output
+static spinlock_t console_lock = SPINLOCK_INIT("console");
 
 // String buffer for ksprintf/ksnprintf
 typedef struct {
@@ -625,7 +632,8 @@ void console_set_color(uint8_t fg, uint8_t bg) {
 }
 
 // Print a single character
-void console_putchar(char c) {
+// Internal unlocked version - called when console_lock is already held
+static void console_putchar_unlocked(char c) {
     if (!fb_info) return;
     // Mirror to serial (if present) before screen updates
     if (serial_is_available()) {
@@ -728,14 +736,25 @@ void console_putchar(char c) {
     }
 }
 
+// Public locked version - safe for external callers
+void console_putchar(char c) {
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
+    console_putchar_unlocked(c);
+    spin_unlock_irqrestore(&console_lock, flags);
+}
+
 // Print a string
 void console_puts(const char* str) {
     if (!str) return;
     
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
     while (*str) {
-        console_putchar(*str);
+        console_putchar_unlocked(*str);
         str++;
     }
+    spin_unlock_irqrestore(&console_lock, flags);
 }
 
 // Dummy scroll function for compatibility
@@ -1124,7 +1143,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
             if (sb) {
                 string_putchar(*format, sb);
             } else {
-                console_putchar(*format);
+                console_putchar_unlocked(*format);
             }
             count++;
             format++;
@@ -1186,7 +1205,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                 if (sb) {
                     string_putchar('%', sb);
                 } else {
-                    console_putchar('%');
+                    console_putchar_unlocked('%');
                 }
                 count++;
                 break;
@@ -1196,7 +1215,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                 if (sb) {
                     string_putchar(c, sb);
                 } else {
-                    console_putchar(c);
+                    console_putchar_unlocked(c);
                 }
                 count++;
                 break;
@@ -1217,7 +1236,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                         if (sb) {
                             string_putchar(' ', sb);
                         } else {
-                            console_putchar(' ');
+                            console_putchar_unlocked(' ');
                         }
                         count++;
                     }
@@ -1228,7 +1247,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     if (sb) {
                         string_putchar(str[i], sb);
                     } else {
-                        console_putchar(str[i]);
+                        console_putchar_unlocked(str[i]);
                     }
                     count++;
                 }
@@ -1239,7 +1258,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                         if (sb) {
                             string_putchar(' ', sb);
                         } else {
-                            console_putchar(' ');
+                            console_putchar_unlocked(' ');
                         }
                         count++;
                     }
@@ -1272,7 +1291,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                         if (sb) {
                             string_putchar(pad_char, sb);
                         } else {
-                            console_putchar(pad_char);
+                            console_putchar_unlocked(pad_char);
                         }
                         count++;
                     }
@@ -1283,7 +1302,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     if (sb) {
                         string_putchar(buffer[i], sb);
                     } else {
-                        console_putchar(buffer[i]);
+                        console_putchar_unlocked(buffer[i]);
                     }
                     count++;
                 }
@@ -1294,7 +1313,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                         if (sb) {
                             string_putchar(' ', sb);
                         } else {
-                            console_putchar(' ');
+                            console_putchar_unlocked(' ');
                         }
                         count++;
                     }
@@ -1322,7 +1341,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     if (sb) {
                         string_putchar(buffer[i], sb);
                     } else {
-                        console_putchar(buffer[i]);
+                        console_putchar_unlocked(buffer[i]);
                     }
                     count++;
                 }
@@ -1352,7 +1371,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     if (sb) {
                         string_putchar(c, sb);
                     } else {
-                        console_putchar(c);
+                        console_putchar_unlocked(c);
                     }
                     count++;
                 }
@@ -1381,7 +1400,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     if (sb) {
                         string_putchar(c, sb);
                     } else {
-                        console_putchar(c);
+                        console_putchar_unlocked(c);
                     }
                     count++;
                 }
@@ -1408,7 +1427,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     if (sb) {
                         string_putchar(buffer[i], sb);
                     } else {
-                        console_putchar(buffer[i]);
+                        console_putchar_unlocked(buffer[i]);
                     }
                     count++;
                 }
@@ -1424,8 +1443,8 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     string_putchar('0', sb);
                     string_putchar('x', sb);
                 } else {
-                    console_putchar('0');
-                    console_putchar('x');
+                    console_putchar_unlocked('0');
+                    console_putchar_unlocked('x');
                 }
                 count += 2;
                 
@@ -1440,7 +1459,7 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     if (sb) {
                         string_putchar(c, sb);
                     } else {
-                        console_putchar(c);
+                        console_putchar_unlocked(c);
                     }
                     count++;
                 }
@@ -1453,8 +1472,8 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
                     string_putchar('%', sb);
                     string_putchar(*format, sb);
                 } else {
-                    console_putchar('%');
-                    console_putchar(*format);
+                    console_putchar_unlocked('%');
+                    console_putchar_unlocked(*format);
                 }
                 count += 2;
                 break;
@@ -1468,10 +1487,15 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
 
 // Main printf function
 int kprintf(const char* format, ...) {
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
+    
     va_list args;
     va_start(args, format);
     int result = kvprintf(format, args);
     va_end(args);
+    
+    spin_unlock_irqrestore(&console_lock, flags);
     return result;
 }
 

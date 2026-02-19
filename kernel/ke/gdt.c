@@ -107,3 +107,8 @@ void gdt_install_tss_real(uint64_t tss_base, uint64_t tss_size) {
 
     kprintf("TSS installed in GDT\n");
 }
+
+// Get GDT pointer for AP initialization
+void* gdt_get_descriptor(void) {
+    return &gdt_pointer;
+}

@@ -1,11 +1,12 @@
 // LikeOS-64 SLAB Allocator
 // Dynamic kernel heap using size-class caches for efficient allocation
-// Uses identity-mapped physical pages, spinlock-ready for future SMP
+// SMP-safe with per-cache spinlocks
 
 #ifndef _KERNEL_SLAB_H_
 #define _KERNEL_SLAB_H_
 
 #include "types.h"
+#include "sched.h"  // For spinlock_t
 
 // Configuration
 #define SLAB_MIN_SIZE           32          // Minimum allocation size (32 bytes)
@@ -46,7 +47,7 @@ typedef struct slab_cache {
     uint64_t total_frees;               // Statistics: total frees
     uint32_t slab_count;                // Number of slab pages
     uint32_t empty_slab_count;          // Number of empty slabs (for cleanup)
-    // Future: spinlock_t lock;         // For SMP support
+    spinlock_t lock;                    // Per-cache lock for SMP safety
 } slab_cache_t;
 
 // Large allocation header (for allocations > SLAB_MAX_SIZE)

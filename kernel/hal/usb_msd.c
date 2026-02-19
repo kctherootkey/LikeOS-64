@@ -9,6 +9,7 @@
 #include "../../include/kernel/usb_msd.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/sched.h"
 
 // Debug output control
 #define MSD_DEBUG 0
@@ -17,6 +18,9 @@
 #else
     #define msd_dbg(fmt, ...) ((void)0)
 #endif
+
+// Spinlock for MSD device list access
+static spinlock_t msd_lock = SPINLOCK_INIT("usb_msd");
 
 // Global MSD device list
 usb_msd_device_t* g_msd_devices[8] = {0};
@@ -498,10 +502,13 @@ int usb_msd_init(usb_msd_device_t* msd, usb_device_t* dev, xhci_controller_t* ct
         msd_dbg("Block device registered: %s\n", msd->blk.name);
     }
     
-    // Add to global list
+    // Add to global list (protected by spinlock)
+    uint64_t flags;
+    spin_lock_irqsave(&msd_lock, &flags);
     if (g_msd_count < 8) {
         g_msd_devices[g_msd_count++] = msd;
     }
+    spin_unlock_irqrestore(&msd_lock, flags);
     
     return ST_OK;
 }

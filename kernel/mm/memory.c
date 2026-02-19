@@ -4,9 +4,18 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/slab.h"
+#include "../../include/kernel/sched.h"  // For spinlock_t
 
 // Enable SLAB allocator (comment out to use legacy fixed-size heap)
 #define USE_SLAB_ALLOCATOR
+
+// ============================================================================
+// SMP LOCKING
+// ============================================================================
+// Spinlock for physical memory allocator (bitmap access)
+static spinlock_t mm_phys_lock = SPINLOCK_INIT("mm_phys");
+// Spinlock for page table pool
+static spinlock_t mm_pt_pool_lock = SPINLOCK_INIT("mm_pt_pool");
 
 // Magic numbers for heap validation
 #define HEAP_MAGIC_ALLOCATED    0xDEADBEEF
@@ -643,14 +652,19 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     kprintf("Physical Memory Manager initialized\n");
 }
 
-// Allocate a physical page
+// Allocate a physical page (SMP-safe)
 uint64_t mm_allocate_physical_page(void) {
+    uint64_t flags;
+    spin_lock_irqsave(&mm_phys_lock, &flags);
+    
     if (mm_state.free_pages == 0) {
+        spin_unlock_irqrestore(&mm_phys_lock, flags);
         return 0; // Out of memory
     }
     
     uint64_t page = find_free_page();
     if (page == (uint64_t)-1) {
+        spin_unlock_irqrestore(&mm_phys_lock, flags);
         return 0; // No free pages found
     }
     
@@ -664,17 +678,22 @@ uint64_t mm_allocate_physical_page(void) {
         mm_state.page_refcounts[page] = 0;
     }
     
+    spin_unlock_irqrestore(&mm_phys_lock, flags);
     return phys;
 }
 
-// Free a physical page
+// Free a physical page (SMP-safe)
 void mm_free_physical_page(uint64_t physical_address) {
     if (physical_address < mm_state.memory_start || physical_address >= mm_state.memory_end) {
         return; // Invalid address
     }
     
+    uint64_t flags;
+    spin_lock_irqsave(&mm_phys_lock, &flags);
+    
     uint64_t page = (physical_address - mm_state.memory_start) / PAGE_SIZE;
     if (!is_page_allocated(page)) {
+        spin_unlock_irqrestore(&mm_phys_lock, flags);
         return; // Already free
     }
     
@@ -690,6 +709,8 @@ void mm_free_physical_page(uint64_t physical_address) {
     if (mm_state.page_refcounts) {
         mm_state.page_refcounts[page] = 0;
     }
+    
+    spin_unlock_irqrestore(&mm_phys_lock, flags);
 }
 
 // Get free pages count
@@ -697,18 +718,24 @@ uint64_t mm_get_free_pages(void) {
     return mm_state.free_pages;
 }
 
-// Allocate contiguous physical pages
+// Allocate contiguous physical pages (SMP-safe)
 uint64_t mm_allocate_contiguous_pages(size_t page_count) {
     if (page_count == 0) {
         kprintf("mm_allocate_contiguous_pages: page_count is 0\n");
         return 0;
     }
+    
+    uint64_t flags;
+    spin_lock_irqsave(&mm_phys_lock, &flags);
+    
     if (mm_state.free_pages < page_count) {
+        spin_unlock_irqrestore(&mm_phys_lock, flags);
         kprintf("mm_allocate_contiguous_pages: not enough free pages (%lu free, need %lu)\n",
                 (unsigned long)mm_state.free_pages, (unsigned long)page_count);
         return 0;
     }
     if (page_count > mm_state.total_pages) {
+        spin_unlock_irqrestore(&mm_phys_lock, flags);
         kprintf("mm_allocate_contiguous_pages: page_count %lu > total_pages %lu\n",
                 (unsigned long)page_count, (unsigned long)mm_state.total_pages);
         return 0;
@@ -732,10 +759,13 @@ uint64_t mm_allocate_contiguous_pages(size_t page_count) {
                 set_page_bit(start_page + i);
                 mm_state.free_pages--;
             }
-            return mm_state.memory_start + (start_page * PAGE_SIZE);
+            uint64_t result = mm_state.memory_start + (start_page * PAGE_SIZE);
+            spin_unlock_irqrestore(&mm_phys_lock, flags);
+            return result;
         }
     }
     
+    spin_unlock_irqrestore(&mm_phys_lock, flags);
     return 0; // No contiguous block found
 }
 
@@ -775,7 +805,7 @@ uint64_t mm_virt_to_phys_heap(uint64_t virt) {
     return 0;
 }
 
-// Allocate a page for page table structures
+// Allocate a page for page table structures (SMP-safe)
 // Returns: physical address (for use in page table entries)
 // Pages come from the reserved PT pool first, then fall back to physical allocator
 static uint64_t allocate_pt_page(void) {
@@ -785,12 +815,17 @@ static uint64_t allocate_pt_page(void) {
     }
     
     uint64_t phys;
+    uint64_t flags;
+    
+    spin_lock_irqsave(&mm_pt_pool_lock, &flags);
     
     if (pt_pool_next < pt_pool_size) {
         // Use reserved pool (preferred - outside bitmap range)
         phys = pt_pool_phys_start + (pt_pool_next * PAGE_SIZE);
         pt_pool_next++;
+        spin_unlock_irqrestore(&mm_pt_pool_lock, flags);
     } else {
+        spin_unlock_irqrestore(&mm_pt_pool_lock, flags);
         // Pool exhausted - fall back to physical memory allocator
         // This is fine for large allocations after initial setup
         phys = mm_allocate_physical_page();
@@ -2307,6 +2342,40 @@ void mm_enable_nx(void) {
     efer |= (1ULL << 11);  // Set NXE (No-Execute Enable) bit
     wrmsr(MSR_EFER, efer);
     kprintf("NX bit enabled in EFER\n");
+}
+
+// Identity-map physical memory for SMP AP trampoline
+// Maps physical pages to the same virtual address (identity mapping)
+bool mm_identity_map_for_smp(uint64_t physical_addr, size_t size) {
+    uint64_t page_aligned = physical_addr & ~0xFFFULL;
+    uint64_t end_addr = (physical_addr + size + 0xFFF) & ~0xFFFULL;
+    
+    while (page_aligned < end_addr) {
+        // Map physical address to same virtual address (identity map)
+        // Use PAGE_PRESENT | PAGE_WRITABLE, no NX since code will execute here
+        if (!mm_map_page(page_aligned, page_aligned, PAGE_PRESENT | PAGE_WRITABLE)) {
+            kprintf("mm_identity_map_for_smp: failed to map 0x%lx\n", page_aligned);
+            return false;
+        }
+        page_aligned += 0x1000;
+    }
+    
+    kprintf("SMP: Identity-mapped 0x%lx - 0x%lx for AP trampoline\n", 
+            physical_addr & ~0xFFFULL, end_addr);
+    return true;
+}
+
+// Remove identity mapping for SMP AP trampoline
+void mm_remove_smp_identity_map(uint64_t physical_addr, size_t size) {
+    uint64_t page_aligned = physical_addr & ~0xFFFULL;
+    uint64_t end_addr = (physical_addr + size + 0xFFF) & ~0xFFFULL;
+    
+    while (page_aligned < end_addr) {
+        mm_unmap_page(page_aligned);
+        page_aligned += 0x1000;
+    }
+    
+    kprintf("SMP: Removed identity mapping for AP trampoline\n");
 }
 
 // Initialize SYSCALL/SYSRET

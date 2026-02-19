@@ -6,10 +6,14 @@
 #include "../../include/kernel/fb_optimize.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/sched.h"
 
 
 // Define missing types for kernel
 typedef unsigned long uintptr_t;
+
+// Spinlock for framebuffer access
+static spinlock_t fb_lock = SPINLOCK_INIT("framebuffer");
 
 // Global double buffer state
 static fb_double_buffer_t g_double_buffer = {0};
@@ -431,7 +435,11 @@ static void copy_region_to_front(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t
 // Mark a rectangular region as dirty
 void fb_mark_dirty(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2)
 {
+    uint64_t flags;
+    spin_lock_irqsave(&fb_lock, &flags);
+
     if(!g_initialized) {
+        spin_unlock_irqrestore(&fb_lock, flags);
         return;
     }
     // Clamp coordinates to screen bounds
@@ -461,6 +469,7 @@ void fb_mark_dirty(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2)
     // If we're at maximum dirty regions, mark full screen dirty
     if(g_double_buffer.num_dirty_regions >= g_double_buffer.max_dirty_regions) {
         g_double_buffer.full_screen_dirty = 1;
+        spin_unlock_irqrestore(&fb_lock, flags);
         return;
     }
     // Add new dirty region
@@ -473,22 +482,34 @@ void fb_mark_dirty(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2)
     g_double_buffer.num_dirty_regions++;
     // Try to merge overlapping regions to optimize performance
     merge_dirty_regions();
+
+    spin_unlock_irqrestore(&fb_lock, flags);
 }
 
 // Mark the entire screen as dirty
 void fb_mark_full_dirty(void)
 {
+    uint64_t flags;
+    spin_lock_irqsave(&fb_lock, &flags);
+
     if(!g_initialized) {
+        spin_unlock_irqrestore(&fb_lock, flags);
         return;
     }
     g_double_buffer.full_screen_dirty = 1;
     g_double_buffer.num_dirty_regions = 0;
+
+    spin_unlock_irqrestore(&fb_lock, flags);
 }
 
 // Flush all dirty regions to the front buffer
 void fb_flush_dirty_regions(void)
 {
+    uint64_t flags;
+    spin_lock_irqsave(&fb_lock, &flags);
+
     if(!g_initialized) {
+        spin_unlock_irqrestore(&fb_lock, flags);
         return;
     }
     g_double_buffer.total_updates++;
@@ -499,6 +520,7 @@ void fb_flush_dirty_regions(void)
         g_double_buffer.pixels_copied += g_double_buffer.width * g_double_buffer.height;
         g_double_buffer.full_screen_dirty = 0;
         g_double_buffer.num_dirty_regions = 0;
+        spin_unlock_irqrestore(&fb_lock, flags);
         return;
     }
     // Copy individual dirty regions
@@ -542,6 +564,8 @@ void fb_flush_dirty_regions(void)
     }
     // Clear dirty regions
     g_double_buffer.num_dirty_regions = 0;
+
+    spin_unlock_irqrestore(&fb_lock, flags);
 }
 
 // Clear all dirty regions without flushing

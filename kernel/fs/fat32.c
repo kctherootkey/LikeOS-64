@@ -8,6 +8,9 @@
 #include "../../include/kernel/dirent.h"
 #include "../../include/kernel/sched.h"
 
+// Spinlock for FAT32 filesystem access
+static spinlock_t fat32_lock = SPINLOCK_INIT("fat32");
+
 #ifndef FAT32_DEBUG_ENABLED
 #define FAT32_DEBUG_ENABLED 0
 #endif
@@ -1632,8 +1635,13 @@ int fat32_dir_list(unsigned long cluster, void (*cb)(const char *, unsigned, uns
 int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr,
     unsigned long *first_cluster, unsigned long *size)
 {
-    if (!g_root_fs || !name)
+    uint64_t flags;
+    spin_lock_irqsave(&fat32_lock, &flags);
+
+    if (!g_root_fs || !name) {
+        spin_unlock_irqrestore(&fat32_lock, flags);
         return ST_INVALID;
+    }
     unsigned cluster_size = g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
     unsigned long cluster = start_cluster;
     char canon[FAT32_LFN_MAX];
@@ -1652,11 +1660,14 @@ int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr
     int lfn_len = 0;
     while (cluster < 0x0FFFFFF8) {
         void *buf = kalloc(cluster_size);
-        if (!buf)
+        if (!buf) {
+            spin_unlock_irqrestore(&fat32_lock, flags);
             return ST_NOMEM;
+        }
         if (read_sectors(g_root_fs->bdev, cluster_to_lba(g_root_fs, cluster),
             g_root_fs->sectors_per_cluster, buf) != ST_OK) {
             kfree(buf);
+            spin_unlock_irqrestore(&fat32_lock, flags);
             return ST_IO;
         }
         fat32_dirent_t *ents = (fat32_dirent_t *)buf;
@@ -1664,6 +1675,7 @@ int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr
         for (unsigned i = 0; i < entries; i++) {
             if (ents[i].name[0] == 0x00) {
                 kfree(buf);
+                spin_unlock_irqrestore(&fat32_lock, flags);
                 return ST_NOT_FOUND;
             }
             if (ents[i].name[0] == 0xE5)
@@ -1749,6 +1761,7 @@ int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr
                 if (size)
                     *size = ents[i].fileSize;
                 kfree(buf);
+                spin_unlock_irqrestore(&fat32_lock, flags);
                 return ST_OK;
             }
             lfn_buf[0] = '\0';
@@ -1760,6 +1773,7 @@ int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr
             break;
         cluster = next;
     }
+    spin_unlock_irqrestore(&fat32_lock, flags);
     return ST_NOT_FOUND;
 }
 
@@ -2242,11 +2256,16 @@ static int fat32_stat_vfs(const char* path, struct kstat* st)
 
 int fat32_unlink_path(const char* path)
 {
+    uint64_t flags;
+    spin_lock_irqsave(&fat32_lock, &flags);
+
     unsigned long parent = 0;
     char name[256];
     name[0] = '\0';
-    if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), path, &parent, name, sizeof(name)) != ST_OK)
+    if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), path, &parent, name, sizeof(name)) != ST_OK) {
+        spin_unlock_irqrestore(&fat32_lock, flags);
         return ST_NOT_FOUND;
+    }
 
     unsigned attr = 0;
     unsigned long fc = 0;
@@ -2257,19 +2276,26 @@ int fat32_unlink_path(const char* path)
     unsigned int lfn_start_index = 0;
     
     if (fat32_dir_find_entry_lfn(parent, name, &attr, &fc, &size, 
-        &dir_cluster, &dir_index, &lfn_start_cluster, &lfn_start_index) != ST_OK)
+        &dir_cluster, &dir_index, &lfn_start_cluster, &lfn_start_index) != ST_OK) {
+        spin_unlock_irqrestore(&fat32_lock, flags);
         return ST_NOT_FOUND;
-    if (attr & FAT32_ATTR_DIRECTORY)
+    }
+    if (attr & FAT32_ATTR_DIRECTORY) {
+        spin_unlock_irqrestore(&fat32_lock, flags);
         return ST_UNSUPPORTED;
+    }
 
     // Delete all entries from LFN start to short entry
     int st = fat32_delete_entries(lfn_start_cluster, lfn_start_index, dir_cluster, dir_index);
-    if (st != ST_OK)
+    if (st != ST_OK) {
+        spin_unlock_irqrestore(&fat32_lock, flags);
         return st;
+    }
     
     if (fc >= 2) {
         fat32_free_chain(g_root_fs, fc);
     }
+    spin_unlock_irqrestore(&fat32_lock, flags);
     return ST_OK;
 }
 

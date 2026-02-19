@@ -4,8 +4,12 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/signal.h"
+#include "../../include/kernel/sched.h"
 
 #define TTY_MAX_PTYS 16
+
+// Spinlock for TTY buffer access
+static spinlock_t tty_lock = SPINLOCK_INIT("tty");
 
 // Security: Validate user pointer is in user space
 static bool tty_validate_user_ptr(uint64_t ptr, size_t len) {
@@ -67,21 +71,33 @@ static void tty_wake_readers(task_t** waiters) {
 }
 
 static void tty_enqueue_read(tty_t* tty, char c) {
+    uint64_t flags;
+    spin_lock_irqsave(&tty_lock, &flags);
+
     if (tty->read_count >= sizeof(tty->read_buf)) {
+        spin_unlock_irqrestore(&tty_lock, flags);
         return;
     }
     tty->read_buf[tty->read_tail] = c;
     tty->read_tail = (tty->read_tail + 1) % sizeof(tty->read_buf);
     tty->read_count++;
+
+    spin_unlock_irqrestore(&tty_lock, flags);
 }
 
 static int tty_dequeue_read(tty_t* tty, char* out) {
+    uint64_t flags;
+    spin_lock_irqsave(&tty_lock, &flags);
+
     if (tty->read_count == 0) {
+        spin_unlock_irqrestore(&tty_lock, flags);
         return 0;
     }
     *out = tty->read_buf[tty->read_head];
     tty->read_head = (tty->read_head + 1) % sizeof(tty->read_buf);
     tty->read_count--;
+
+    spin_unlock_irqrestore(&tty_lock, flags);
     return 1;
 }
 

@@ -6,9 +6,13 @@
 #include "../../include/kernel/fb_optimize.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/sched.h"
 
 // Global mouse state
 static mouse_state_t mouse_state = {0};
+
+// Spinlock for mouse state protection
+static spinlock_t mouse_lock = SPINLOCK_INIT("mouse");
 
 // How many top rows of the arrow remain visible at the bottom edge
 #define TIP_VISIBLE_ROWS 3
@@ -566,9 +570,13 @@ void mouse_init(void)
 // Mouse IRQ handler (called from interrupt.c)
 void mouse_irq_handler(void)
 {
+    uint64_t flags;
+    spin_lock_irqsave(&mouse_lock, &flags);
+
     if(!mouse_state.enabled) {
         // Clear the data port to prevent buffer overflow
         inb(PS2_DATA_PORT);
+        spin_unlock_irqrestore(&mouse_lock, flags);
         return;
     }
 
@@ -593,12 +601,18 @@ void mouse_irq_handler(void)
     if(mouse_state.packet_index >= mouse_state.packet_size) {
         mouse_process_packet();
     }
+
+    spin_unlock_irqrestore(&mouse_lock, flags);
 }
 
 // Update cursor position on screen
 void mouse_update_cursor(void)
 {
+    uint64_t flags;
+    spin_lock_irqsave(&mouse_lock, &flags);
+
     if(!mouse_state.enabled || !mouse_state.cursor_visible) {
+        spin_unlock_irqrestore(&mouse_lock, flags);
         return;
     }
 
@@ -669,6 +683,8 @@ void mouse_update_cursor(void)
 
     // Flush dirty regions to display changes
     fb_flush_dirty_regions();
+
+    spin_unlock_irqrestore(&mouse_lock, flags);
 }
 
 // Get current mouse X position

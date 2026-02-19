@@ -13,6 +13,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/ioapic.h"
+#include "../../include/kernel/sched.h"
 
 // Debug output control
 #define XHCI_DEBUG 0
@@ -24,6 +25,9 @@
 
 // Global controller instance
 xhci_controller_t g_xhci;
+
+// Spinlock for xHCI controller access
+static spinlock_t xhci_lock = SPINLOCK_INIT("xhci");
 
 // Internal helper prototypes
 static void xhci_setup_scratchpad(xhci_controller_t* ctrl);
@@ -1204,6 +1208,9 @@ static volatile uint8_t g_cmd_cc = 0;
 static volatile uint32_t g_cmd_slot = 0;
 
 int xhci_send_command(xhci_controller_t* ctrl, uint64_t param, uint32_t status, uint32_t control) {
+    uint64_t flags;
+    spin_lock_irqsave(&xhci_lock, &flags);
+
     g_cmd_complete = 0;
     g_cmd_cc = TRB_CC_INVALID;
     g_cmd_slot = 0;
@@ -1222,6 +1229,7 @@ int xhci_send_command(xhci_controller_t* ctrl, uint64_t param, uint32_t status, 
     
     if (usbsts & XHCI_STS_HCH) {
         kprintf("[XHCI] ERROR: Controller halted!\n");
+        spin_unlock_irqrestore(&xhci_lock, flags);
         return ST_ERR;
     }
     
@@ -1233,13 +1241,17 @@ int xhci_send_command(xhci_controller_t* ctrl, uint64_t param, uint32_t status, 
     }
     
     int idx = xhci_ring_enqueue(ctrl->cmd_ring, param, status, control);
-    if (idx < 0) return ST_ERR;
+    if (idx < 0) {
+        spin_unlock_irqrestore(&xhci_lock, flags);
+        return ST_ERR;
+    }
     
 
     
     // Ring command doorbell (slot 0, target 0)
     xhci_ring_doorbell(ctrl, 0, 0);
     
+    spin_unlock_irqrestore(&xhci_lock, flags);
     return ST_OK;
 }
 
@@ -1272,11 +1284,20 @@ int xhci_wait_command(xhci_controller_t* ctrl, uint32_t timeout_ms) {
 //=============================================================================
 
 void xhci_irq_service(xhci_controller_t* ctrl) {
-    if (!ctrl || !ctrl->initialized) return;
+    uint64_t flags;
+    spin_lock_irqsave(&xhci_lock, &flags);
+
+    if (!ctrl || !ctrl->initialized) {
+        spin_unlock_irqrestore(&xhci_lock, flags);
+        return;
+    }
     
     // Check if we have an interrupt pending
     uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-    if (!(sts & XHCI_STS_EINT)) return;
+    if (!(sts & XHCI_STS_EINT)) {
+        spin_unlock_irqrestore(&xhci_lock, flags);
+        return;
+    }
     
     // Clear interrupt
     xhci_op_write32(ctrl, XHCI_OP_USBSTS, XHCI_STS_EINT);
@@ -1287,6 +1308,8 @@ void xhci_irq_service(xhci_controller_t* ctrl) {
     
     // Process events
     xhci_process_events(ctrl);
+
+    spin_unlock_irqrestore(&xhci_lock, flags);
 }
 
 void xhci_process_events(xhci_controller_t* ctrl) {

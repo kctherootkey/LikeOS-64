@@ -10,6 +10,7 @@
 #include "../../include/kernel/signal.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/syscall.h"  // For MAP_SHARED
+#include "../../include/kernel/percpu.h"   // For per-CPU current task
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
@@ -20,13 +21,17 @@ volatile int g_preempt_count = 0;
 // Scheduler spinlock for SMP safety
 spinlock_t g_sched_lock = SPINLOCK_INIT("sched");
 
+// SMP mode flag - when true, use per-CPU current task via GS segment
+// Set by smp_init() after per-CPU data is initialized
+int g_smp_initialized = 0;
+
 #define SCHED_BOOTSTRAP_INTERVAL 10  // Run bootstrap every N yields (was 50)
 
 static task_t g_bootstrap_task;
 static task_t g_idle_task;
 static uint8_t g_idle_stack[4096] __attribute__((aligned(16)));
 static uint8_t g_bootstrap_stack[8192] __attribute__((aligned(16)));
-static task_t* g_current = 0;
+static task_t* g_current = 0;  // Legacy global - used before SMP init
 static int g_next_id = 1;
 static uint64_t g_yield_count = 0;  // Counter to ensure bootstrap runs periodically
 static uint64_t* g_kernel_pml4 = 0;
@@ -415,6 +420,11 @@ void sched_schedule(void) {
     task_t* prev = g_current;
     g_current = next;
     
+    // Update per-CPU current task for SMP
+    if (g_smp_initialized) {
+        set_current(next);
+    }
+    
     // Note: We do NOT touch prev->state here - caller already set it
     // (could be TASK_BLOCKED, TASK_ZOMBIE, TASK_STOPPED, or TASK_READY)
     
@@ -455,6 +465,12 @@ void sched_run_ready(void) {
     
     task_t* prev = g_current;
     g_current = next;
+    
+    // Update per-CPU current task for SMP
+    if (g_smp_initialized) {
+        set_current(next);
+    }
+    
     if (prev->state != TASK_ZOMBIE) {
         prev->state = TASK_READY;
     }
@@ -465,6 +481,10 @@ void sched_run_ready(void) {
 }
 
 task_t* sched_current(void) {
+    // When SMP is initialized, use per-CPU current task
+    if (g_smp_initialized) {
+        return current();  // From percpu.h - reads GS:offset
+    }
     return g_current;
 }
 
@@ -1118,6 +1138,11 @@ void sched_preempt(interrupt_frame_t* frame) {
     task_t* prev = g_current;
     g_current = next;
     
+    // Update per-CPU current task for SMP
+    if (g_smp_initialized) {
+        set_current(next);
+    }
+    
     if (prev->state == TASK_RUNNING) {
         prev->state = TASK_READY;
     }
@@ -1141,4 +1166,17 @@ void sched_preempt(interrupt_frame_t* frame) {
     if (g_current) {
         g_current->preempt_frame = NULL;
     }
+}
+// Enable SMP mode for scheduler
+// Called by smp_init() after per-CPU data is set up
+void sched_enable_smp(void) {
+    // Set BSP's per-CPU current task before enabling SMP mode
+    set_current(g_current);
+    g_smp_initialized = 1;
+    kprintf("Scheduler: SMP mode enabled\n");
+}
+
+// Get SMP mode status
+int sched_is_smp(void) {
+    return g_smp_initialized;
 }

@@ -81,6 +81,8 @@ typedef struct {
 typedef struct {
     framebuffer_info_t fb_info;
     memory_map_info_t mem_info;
+    uint64_t rsdp_address;        // ACPI RSDP physical address from UEFI
+    uint64_t smp_trampoline_addr; // Reserved SMP AP trampoline address (4KB aligned, < 1MB)
 } boot_info_t;
 
 // Global boot info to pass to kernel
@@ -329,6 +331,64 @@ static EFI_STATUS init_page_tables(void) {
     serial_puts("  PDPT (phys):"); serial_puthex(g_pdpt_physmap_addr); serial_puts("\n");
     
     return EFI_SUCCESS;
+}
+
+// Reserve memory for SMP AP trampoline
+// Must be below 1MB and 4KB aligned (SIPI vector constraint)
+// Preferred address: 0x8000 (avoids real-mode IVT at 0x0-0x400 and BDA at 0x400-0x500)
+static EFI_STATUS reserve_smp_trampoline(void) {
+    EFI_STATUS status;
+    
+    // Preferred address for SMP trampoline (must be 4KB aligned, < 1MB)
+    // We try several addresses to handle different UEFI memory layouts
+    EFI_PHYSICAL_ADDRESS preferred_addrs[] = {
+        0x8000,   // Traditional address (32KB)
+        0x10000,  // 64KB
+        0x20000,  // 128KB  
+        0x40000,  // 256KB
+        0x70000,  // 448KB (below EBDA)
+    };
+    
+    for (UINTN i = 0; i < sizeof(preferred_addrs) / sizeof(preferred_addrs[0]); i++) {
+        EFI_PHYSICAL_ADDRESS addr = preferred_addrs[i];
+        
+        // Try to allocate exactly at this address
+        status = uefi_call_wrapper(BS->AllocatePages, 4,
+                                   AllocateAddress,
+                                   EfiLoaderData,
+                                   1,  // 1 page = 4KB
+                                   &addr);
+        
+        if (!EFI_ERROR(status)) {
+            g_boot_info.smp_trampoline_addr = addr;
+            Print(L"SMP trampoline reserved at: 0x%lx\r\n", addr);
+            serial_puts("SMP trampoline at: ");
+            serial_puthex(addr);
+            serial_puts("\n");
+            return EFI_SUCCESS;
+        }
+    }
+    
+    // Fallback: allocate any address below 1MB
+    EFI_PHYSICAL_ADDRESS max_addr = 0xA0000 - 1;  // Below VGA memory
+    status = uefi_call_wrapper(BS->AllocatePages, 4,
+                               AllocateMaxAddress,
+                               EfiLoaderData,
+                               1,
+                               &max_addr);
+    
+    if (!EFI_ERROR(status)) {
+        g_boot_info.smp_trampoline_addr = max_addr;
+        Print(L"SMP trampoline allocated at: 0x%lx (fallback)\r\n", max_addr);
+        serial_puts("SMP trampoline (fallback): ");
+        serial_puthex(max_addr);
+        serial_puts("\n");
+        return EFI_SUCCESS;
+    }
+    
+    Print(L"WARNING: Could not reserve SMP trampoline memory: %r\r\n", status);
+    g_boot_info.smp_trampoline_addr = 0;
+    return status;
 }
 
 // External trampoline function from trampoline.S
@@ -1065,6 +1125,46 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
               g_boot_info.mem_info.total_memory / (1024 * 1024));
     }
     
+    // Find ACPI RSDP from UEFI Configuration Tables
+    g_boot_info.rsdp_address = 0;
+    {
+        // ACPI 2.0+ GUID: 8868e871-e4f1-11d3-bc22-0080c73c8881
+        EFI_GUID acpi20_guid = {0x8868e871, 0xe4f1, 0x11d3, {0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81}};
+        // ACPI 1.0 GUID: eb9d2d30-2d88-11d3-9a16-0090273fc14d
+        EFI_GUID acpi10_guid = {0xeb9d2d30, 0x2d88, 0x11d3, {0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d}};
+        
+        for (UINTN i = 0; i < ST->NumberOfTableEntries; i++) {
+            EFI_CONFIGURATION_TABLE *table = &ST->ConfigurationTable[i];
+            // Check for ACPI 2.0+ first (preferred)
+            if (table->VendorGuid.Data1 == acpi20_guid.Data1 &&
+                table->VendorGuid.Data2 == acpi20_guid.Data2 &&
+                table->VendorGuid.Data3 == acpi20_guid.Data3) {
+                g_boot_info.rsdp_address = (uint64_t)table->VendorTable;
+                serial_puts("Found ACPI 2.0+ RSDP at 0x");
+                serial_puthex(g_boot_info.rsdp_address);
+                serial_puts("\n");
+                Print(L"Found ACPI 2.0+ RSDP at 0x%lx\r\n", g_boot_info.rsdp_address);
+                break;
+            }
+            // Check for ACPI 1.0
+            if (table->VendorGuid.Data1 == acpi10_guid.Data1 &&
+                table->VendorGuid.Data2 == acpi10_guid.Data2 &&
+                table->VendorGuid.Data3 == acpi10_guid.Data3) {
+                if (g_boot_info.rsdp_address == 0) {
+                    g_boot_info.rsdp_address = (uint64_t)table->VendorTable;
+                    serial_puts("Found ACPI 1.0 RSDP at 0x");
+                    serial_puthex(g_boot_info.rsdp_address);
+                    serial_puts("\n");
+                    Print(L"Found ACPI 1.0 RSDP at 0x%lx\r\n", g_boot_info.rsdp_address);
+                }
+            }
+        }
+        if (g_boot_info.rsdp_address == 0) {
+            serial_puts("WARNING: ACPI RSDP not found in UEFI tables!\n");
+            Print(L"WARNING: ACPI RSDP not found in UEFI tables!\r\n");
+        }
+    }
+    
     // Step 1: Allocate trampoline below kernel space
     Print(L"Allocating trampoline below kernel space...\r\n");
     status = allocate_trampoline(kernel_phys_addr);
@@ -1085,6 +1185,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     if (EFI_ERROR(status)) {
         Print(L"Failed to initialize page tables\r\n");
         return status;
+    }
+    
+    // Reserve memory for SMP AP trampoline (must be done before ExitBootServices)
+    status = reserve_smp_trampoline();
+    if (EFI_ERROR(status)) {
+        Print(L"WARNING: SMP trampoline reservation failed, SMP may not work\r\n");
+        // Continue anyway - single CPU will still work
     }
     
     setup_higher_half_paging(kernel_phys_addr, kernel_size_total);

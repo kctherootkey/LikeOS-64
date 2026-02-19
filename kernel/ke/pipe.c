@@ -34,6 +34,7 @@ pipe_t* pipe_create(size_t size) {
     pipe->used = 0;
     pipe->readers = 0;
     pipe->writers = 0;
+    spinlock_init(&pipe->lock, "pipe");
 
     return pipe;
 }
@@ -53,11 +54,14 @@ pipe_end_t* pipe_create_end(pipe_t* pipe, bool is_read) {
     end->pad[0] = end->pad[1] = end->pad[2] = 0;
     end->pipe = pipe;
 
+    uint64_t flags;
+    spin_lock_irqsave(&pipe->lock, &flags);
     if (is_read) {
         pipe->readers++;
     } else {
         pipe->writers++;
     }
+    spin_unlock_irqrestore(&pipe->lock, flags);
 
     return end;
 }
@@ -77,21 +81,30 @@ void pipe_close_end(pipe_end_t* end) {
 
     pipe_t* pipe = end->pipe;
     if (pipe) {
+        uint64_t flags;
+        spin_lock_irqsave(&pipe->lock, &flags);
+        
+        bool should_free = false;
         if (end->is_read) {
             if (pipe->readers > 0) {
                 pipe->readers--;
             }
-            // Wake up writers waiting on this pipe (they may get EPIPE now)
-            sched_wake_channel(pipe);
         } else {
             if (pipe->writers > 0) {
                 pipe->writers--;
             }
-            // Wake up readers waiting on this pipe (they may get EOF now)
-            sched_wake_channel(pipe);
         }
 
         if (pipe->readers == 0 && pipe->writers == 0) {
+            should_free = true;
+        }
+        
+        spin_unlock_irqrestore(&pipe->lock, flags);
+        
+        // Wake up waiters outside the lock
+        sched_wake_channel(pipe);
+
+        if (should_free) {
             if (pipe->buffer) {
                 kfree(pipe->buffer);
             }

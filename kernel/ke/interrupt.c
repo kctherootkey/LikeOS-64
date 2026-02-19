@@ -438,3 +438,8 @@ void tss_set_kernel_stack(uint64_t stack_top) {
 uint64_t tss_get_kernel_stack(void) {
     return tss.rsp0;
 }
+
+// Get IDT descriptor for AP initialization
+void* interrupts_get_idt_descriptor(void) {
+    return &idt_desc;
+}

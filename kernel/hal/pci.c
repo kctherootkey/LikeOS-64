@@ -1,12 +1,16 @@
 // LikeOS-64 - Minimal PCI enumeration
 #include "../../include/kernel/pci.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/sched.h"
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
 
 static pci_device_t g_pci_devices[PCI_MAX_DEVICES];
 static int g_pci_count = 0;
+
+// Spinlock for PCI config space access (address + data must be atomic)
+static spinlock_t pci_lock = SPINLOCK_INIT("pci");
 
 static inline void outl(unsigned short port, unsigned int val)
 {
@@ -27,8 +31,12 @@ unsigned int pci_cfg_read32(unsigned char bus, unsigned char dev, unsigned char 
         ((unsigned int)dev << 11) |
         ((unsigned int)func << 8) |
         (off & 0xFC));
+    uint64_t flags;
+    spin_lock_irqsave(&pci_lock, &flags);
     outl(PCI_CONFIG_ADDRESS, address);
-    return inl(PCI_CONFIG_DATA);
+    unsigned int value = inl(PCI_CONFIG_DATA);
+    spin_unlock_irqrestore(&pci_lock, flags);
+    return value;
 }
 
 void pci_cfg_write32(unsigned char bus, unsigned char dev, unsigned char func, unsigned char off, unsigned int value)
@@ -38,8 +46,11 @@ void pci_cfg_write32(unsigned char bus, unsigned char dev, unsigned char func, u
         ((unsigned int)dev << 11) |
         ((unsigned int)func << 8) |
         (off & 0xFC));
+    uint64_t flags;
+    spin_lock_irqsave(&pci_lock, &flags);
     outl(PCI_CONFIG_ADDRESS, address);
     outl(PCI_CONFIG_DATA, value);
+    spin_unlock_irqrestore(&pci_lock, flags);
 }
 
 void pci_enable_busmaster_mem(const pci_device_t* dev)

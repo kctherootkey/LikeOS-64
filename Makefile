@@ -79,7 +79,12 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/elf_loader.o \
 			  $(BUILD_DIR)/pipe.o \
 			  $(BUILD_DIR)/stack_guard.o \
-			  $(BUILD_DIR)/signal.o
+			  $(BUILD_DIR)/signal.o \
+			  $(BUILD_DIR)/lapic.o \
+			  $(BUILD_DIR)/acpi.o \
+			  $(BUILD_DIR)/percpu.o \
+			  $(BUILD_DIR)/smp.o \
+			  $(BUILD_DIR)/ap_trampoline.o
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -206,6 +211,21 @@ $(BUILD_DIR)/stack_guard.o: $(KERNEL_DIR)/ke/stack_guard.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/signal.o: $(KERNEL_DIR)/ke/signal.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/lapic.o: $(KERNEL_DIR)/hal/lapic.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/acpi.o: $(KERNEL_DIR)/hal/acpi.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/percpu.o: $(KERNEL_DIR)/ke/percpu.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/smp.o: $(KERNEL_DIR)/ke/smp.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ap_trampoline.o: $(KERNEL_DIR)/ke/ap_trampoline.S | $(BUILD_DIR)
+	nasm -f elf64 $< -o $@
 
 # Build userland C library
 .PHONY: userland-libc
@@ -363,12 +383,12 @@ $(USB_IMAGE): $(FAT_IMAGE) | $(BUILD_DIR)
 # Run in QEMU with UEFI firmware
 qemu: $(ISO_IMAGE)
 	@echo "Running LikeOS-64 in QEMU with UEFI firmware..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio -smp 4
 
 # Run from FAT image in QEMU
 qemu-fat: $(FAT_IMAGE)
 	@echo "Running LikeOS-64 from FAT image in QEMU with UEFI firmware..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -drive format=raw,file=$(FAT_IMAGE) -m 512M -serial stdio
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -drive format=raw,file=$(FAT_IMAGE) -m 512M -serial stdio -smp 4
 
 # Standalone USB mass storage data image (64MB FAT32) now mirrors usb-write target (UEFI bootable + signature files)
 # Provides: EFI/BOOT/BOOTX64.EFI, kernel.elf, LIKEOS.SIG, HELLO.TXT, tests
@@ -407,7 +427,7 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 # Run with ISO boot plus attached xHCI controller and USB mass storage device
 qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
 	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio \
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio -smp 4 \
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
 		-device usb-storage,drive=usbdisk -machine type=pc,accel=kvm:tcg
 
@@ -418,7 +438,7 @@ ifndef USB_DEVICE
 	$(error USB_DEVICE is not set. Usage: make qemu-realusb USB_DEVICE=/dev/sdb)
 endif
 	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE)..."
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M -serial stdio \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M -serial stdio -smp 4 \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg
 

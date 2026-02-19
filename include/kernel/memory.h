@@ -132,6 +132,8 @@ typedef struct {
 typedef struct {
     boot_framebuffer_info_t fb_info;
     memory_map_info_t mem_info;
+    uint64_t rsdp_address;        // ACPI RSDP physical address from UEFI
+    uint64_t smp_trampoline_addr; // Reserved SMP AP trampoline address (4KB aligned, < 1MB)
 } boot_info_t;
 
 // Memory regions
@@ -270,6 +272,11 @@ void mm_switch_to_kernel_stack(void);
 // Remove identity mapping from kernel PML4
 // Call this after all boot-time initialization is complete
 void mm_remove_identity_mapping(void);
+
+// Temporarily restore identity mapping for SMP AP trampoline
+// Maps physical address range to same virtual address
+bool mm_identity_map_for_smp(uint64_t physical_addr, size_t size);
+void mm_remove_smp_identity_map(uint64_t physical_addr, size_t size);
 
 // Global flag indicating SMAP is active (use stac/clac only when true)
 extern bool g_smap_enabled;

@@ -9,6 +9,9 @@
 // Global keyboard state
 static keyboard_state_t kb_state = {0};
 
+// Spinlock for keyboard buffer protection
+static spinlock_t kb_lock = SPINLOCK_INIT("keyboard");
+
 // US QWERTY scan code to ASCII conversion table
 static char scan_code_to_ascii_table[] = {
     0,   0,   '1', '2', '3', '4', '5', '6',    // 0x00-0x07
@@ -80,26 +83,33 @@ char scan_code_to_ascii(uint8_t scan_code, uint8_t shift) {
 
 // Add character to keyboard buffer
 void keyboard_buffer_add(uint8_t scan_code) {
+    uint64_t flags;
+    spin_lock_irqsave(&kb_lock, &flags);
     if (kb_state.buffer_count < KEYBOARD_BUFFER_SIZE) {
         kb_state.buffer[kb_state.buffer_end] = scan_code;
         kb_state.buffer_end = (kb_state.buffer_end + 1) % KEYBOARD_BUFFER_SIZE;
         kb_state.buffer_count++;
     }
+    spin_unlock_irqrestore(&kb_lock, flags);
 }
 
 // Get character from keyboard buffer
 uint8_t keyboard_buffer_get(void) {
+    uint64_t flags;
+    spin_lock_irqsave(&kb_lock, &flags);
+    uint8_t scan_code = 0;
     if (kb_state.buffer_count > 0) {
-        uint8_t scan_code = kb_state.buffer[kb_state.buffer_start];
+        scan_code = kb_state.buffer[kb_state.buffer_start];
         kb_state.buffer_start = (kb_state.buffer_start + 1) % KEYBOARD_BUFFER_SIZE;
         kb_state.buffer_count--;
-        return scan_code;
     }
-    return 0;
+    spin_unlock_irqrestore(&kb_lock, flags);
+    return scan_code;
 }
 
 // Check if keyboard buffer has data
 uint8_t keyboard_buffer_has_data(void) {
+    // Simple read of volatile count - no lock needed for single read
     return kb_state.buffer_count > 0;
 }
 

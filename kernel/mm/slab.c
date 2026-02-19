@@ -5,9 +5,16 @@
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/sched.h"  // For spinlock_t
 
 // External debug flag from memory.c
 extern int mm_debug_pt;
+
+// ============================================================================
+// SMP LOCKING
+// ============================================================================
+// Global SLAB allocator lock (protects virtual address allocator and large alloc tracking)
+static spinlock_t slab_global_lock = SPINLOCK_INIT("slab_global");
 
 // Size classes: 32, 64, 128, 256, 512, 1024, 2048 bytes
 // Note: 4096 cannot fit in a single page with slab header, so it goes to large alloc
@@ -359,6 +366,9 @@ void slab_init(void) {
         cache->slab_count = 0;
         cache->empty_slab_count = 0;
         
+        // Initialize per-cache spinlock
+        spinlock_init(&cache->lock, "slab_cache");
+        
         // Ensure we have at least 1 object per slab
         if (cache->objects_per_slab == 0) {
             cache->objects_per_slab = 1;
@@ -380,7 +390,7 @@ void slab_init(void) {
         kprintf("%u ", size_classes[i]);
     }
     kprintf("\n");
-    kprintf("  SLAB allocator ready (dynamic heap growth enabled)\n");
+    kprintf("  SLAB allocator ready (SMP-safe, dynamic heap growth enabled)\n");
 }
 
 // Allocate memory from SLAB allocator
@@ -453,9 +463,12 @@ void* slab_alloc(size_t size) {
         header->size = size;
         header->phys_addr = phys_pages;
         
+        uint64_t flags;
+        spin_lock_irqsave(&slab_global_lock, &flags);
         slab_global_stats.large_allocations++;
         slab_global_stats.total_allocations++;
         slab_global_stats.total_pages_used += page_count;
+        spin_unlock_irqrestore(&slab_global_lock, flags);
         
         return (uint8_t*)header + sizeof(large_alloc_header_t);
     }
@@ -469,6 +482,10 @@ void* slab_alloc(size_t size) {
     
     slab_cache_t* cache = &slab_caches[class_idx];
     slab_page_t* slab = NULL;
+    uint64_t flags;
+    
+    // Lock the cache for thread-safety
+    spin_lock_irqsave(&cache->lock, &flags);
     
     // Try to allocate from partial slabs first
     if (cache->partial_slabs) {
@@ -484,8 +501,13 @@ void* slab_alloc(size_t size) {
     }
     // Need to allocate a new slab page
     else {
+        // Release lock while allocating page (may be slow)
+        spin_unlock_irqrestore(&cache->lock, flags);
         slab = slab_alloc_page(cache);
+        spin_lock_irqsave(&cache->lock, &flags);
+        
         if (!slab) {
+            spin_unlock_irqrestore(&cache->lock, flags);
             return NULL;
         }
         // Add to partial list
@@ -500,6 +522,7 @@ void* slab_alloc(size_t size) {
     // Find free object in slab
     int obj_idx = bitmap_find_free(slab->bitmap, slab->total_objects);
     if (obj_idx < 0) {
+        spin_unlock_irqrestore(&cache->lock, flags);
         kprintf("SLAB: Corrupt slab - no free object but in partial list\n");
         return NULL;
     }
@@ -516,7 +539,10 @@ void* slab_alloc(size_t size) {
     cache->total_allocs++;
     slab_global_stats.total_allocations++;
     
-    return slab_get_object(slab, obj_idx);
+    void* result = slab_get_object(slab, obj_idx);
+    spin_unlock_irqrestore(&cache->lock, flags);
+    
+    return result;
 }
 
 // Free memory allocated by slab_alloc
@@ -549,12 +575,14 @@ void slab_free(void* ptr) {
         // Free the physical pages
         mm_free_contiguous_pages(phys_addr, page_count);
         
-        // Reclaim the virtual address space
+        // Reclaim the virtual address space (protected by global lock)
+        uint64_t flags;
+        spin_lock_irqsave(&slab_global_lock, &flags);
         slab_free_virt_range(virt_addr, alloc_bytes);
-        
         slab_global_stats.large_frees++;
         slab_global_stats.total_frees++;
         slab_global_stats.total_pages_used -= page_count;
+        spin_unlock_irqrestore(&slab_global_lock, flags);
         return;
     }
     
@@ -602,6 +630,10 @@ void slab_free(void* ptr) {
         return;
     }
     
+    // Lock the cache for thread-safety
+    uint64_t flags;
+    spin_lock_irqsave(&cache->lock, &flags);
+    
     // Was this slab full?
     bool was_full = (slab->free_count == 0);
     
@@ -628,13 +660,18 @@ void slab_free(void* ptr) {
                     cache->empty_slabs->prev = NULL;
                 }
                 cache->empty_slab_count--;
+                // Release lock before freeing page (slow path)
+                spin_unlock_irqrestore(&cache->lock, flags);
                 slab_free_page(to_free);
+                // Re-lock to update stats
+                spin_lock_irqsave(&cache->lock, &flags);
             }
         }
     }
     
     cache->total_frees++;
     slab_global_stats.total_frees++;
+    spin_unlock_irqrestore(&cache->lock, flags);
 }
 
 // Reallocate memory

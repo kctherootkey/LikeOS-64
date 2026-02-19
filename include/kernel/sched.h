@@ -292,6 +292,10 @@ void sched_wake_channel(void* channel);        // Wake all tasks waiting on a ch
 // Scheduler lock for SMP safety
 extern spinlock_t g_sched_lock;
 
+// SMP support
+void sched_enable_smp(void);   // Called after per-CPU init to enable per-CPU current task
+int sched_is_smp(void);        // Check if SMP mode is enabled
+
 // Process management
 task_t* sched_fork_current(void);           // Fork current task with COW
 void sched_remove_task(task_t* task);       // Remove task from scheduler

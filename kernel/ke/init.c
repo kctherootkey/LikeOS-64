@@ -18,6 +18,9 @@
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/tty.h"
 #include "../../include/kernel/devfs.h"
+#include "../../include/kernel/acpi.h"
+#include "../../include/kernel/percpu.h"
+#include "../../include/kernel/smp.h"
 
 void system_startup(boot_info_t* boot_info);
 void kernel_main(boot_info_t* boot_info);
@@ -25,6 +28,8 @@ void kernel_main(boot_info_t* boot_info);
 static xhci_boot_state_t g_xhci_boot;
 static storage_fs_state_t g_storage_state;
 static boot_info_t* g_boot_info;
+static uint64_t g_rsdp_address;           // Saved RSDP address (copied before identity unmap)
+static uint64_t g_smp_trampoline_address; // Saved SMP trampoline address from bootloader
 
 void kernel_main(boot_info_t* boot_info) {
     g_boot_info = boot_info;
@@ -71,6 +76,12 @@ void system_startup(boot_info_t* boot_info) {
     console_remap_to_direct_map();
     fb_optimize_remap_to_direct_map();
     
+    // Save RSDP address before identity mapping is removed (boot_info is in low memory)
+    g_rsdp_address = boot_info->rsdp_address;
+    
+    // Save SMP trampoline address from bootloader
+    g_smp_trampoline_address = boot_info->smp_trampoline_addr;
+    
     // Switch to a kernel stack in higher-half space before removing identity mapping
     // The current stack is in low memory (set up by bootloader)
     // This function does NOT return - it switches stacks and calls continue_system_startup
@@ -115,6 +126,17 @@ void continue_system_startup(void) {
     __asm__ volatile ("sti");
 
     sched_init();
+
+    // Initialize SMP support
+    // This sets up per-CPU data and detects available CPUs via ACPI
+    // Pass RSDP address from UEFI bootloader for proper ACPI table discovery
+    acpi_init(g_rsdp_address);
+    percpu_init();
+    smp_init(g_smp_trampoline_address);
+    
+    // Boot Application Processors (APs)
+    // After this, all CPUs are running and SMP is fully initialized
+    smp_boot_aps();
 
     timer_init(100);
     timer_start();

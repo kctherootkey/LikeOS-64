@@ -4,6 +4,7 @@
 #include "../../include/kernel/scrollbar.h"
 #include "../../include/kernel/fb_optimize.h"
 #include "../../include/kernel/memory.h"
+#include "../../include/kernel/sched.h"
 
 #define NULL ((void*)0)
 
@@ -327,6 +328,9 @@ void scrollbar_set_thumb_state(scrollbar_t* scrollbar, uint8_t state) {
 
 // Global system scrollbar
 static scrollbar_t* g_system_scrollbar = NULL;
+
+// Spinlock for scrollbar access
+static spinlock_t scrollbar_lock = SPINLOCK_INIT("scrollbar");
 
 // Get screen dimensions from framebuffer
 uint32_t get_screen_width(void) {

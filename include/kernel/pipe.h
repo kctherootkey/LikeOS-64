@@ -3,6 +3,7 @@
 #define _KERNEL_PIPE_H_
 
 #include "types.h"
+#include "sched.h"
 
 #define PIPE_MAGIC 0x50495045U  // "PIPE"
 
@@ -14,6 +15,7 @@ typedef struct pipe {
     size_t used;
     int readers;
     int writers;
+    spinlock_t lock;  // Protects all pipe state
 } pipe_t;
 
 typedef struct pipe_end {

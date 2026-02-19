@@ -140,6 +140,10 @@ extern void isr31(void);
 void tss_set_kernel_stack(uint64_t stack_top);
 uint64_t tss_get_kernel_stack(void);
 
+// Get IDT and GDT descriptors for AP initialization
+void* interrupts_get_idt_descriptor(void);
+void* gdt_get_descriptor(void);
+
 // IRQ stubs
 extern void irq32(void);  // Timer
 extern void irq33(void);  // Keyboard

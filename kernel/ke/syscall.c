@@ -213,15 +213,20 @@ static int64_t pipe_read_to_user(pipe_end_t* end, uint64_t buf, uint64_t count) 
     }
     
     task_t* cur = sched_current();
+    uint64_t flags;
+    
+    spin_lock_irqsave(&pipe->lock, &flags);
     
     // Block until data is available or all writers are gone
     while (pipe->used == 0) {
         if (pipe->writers == 0) {
+            spin_unlock_irqrestore(&pipe->lock, flags);
             return 0;  // EOF - no more writers
         }
         
         // Check for pending signals BEFORE blocking
         if (cur && signal_pending(cur)) {
+            spin_unlock_irqrestore(&pipe->lock, flags);
             return -EINTR;
         }
         
@@ -229,15 +234,19 @@ static int64_t pipe_read_to_user(pipe_end_t* end, uint64_t buf, uint64_t count) 
         if (cur) {
             cur->state = TASK_BLOCKED;
             cur->wait_channel = pipe;  // Wait on the pipe
+            spin_unlock_irqrestore(&pipe->lock, flags);
             sched_schedule();
+            spin_lock_irqsave(&pipe->lock, &flags);
             cur->state = TASK_READY;
             cur->wait_channel = NULL;
             
             // Check if we were woken by a signal
             if (signal_pending(cur)) {
+                spin_unlock_irqrestore(&pipe->lock, flags);
                 return -EINTR;
             }
         } else {
+            spin_unlock_irqrestore(&pipe->lock, flags);
             return -EAGAIN;
         }
     }
@@ -258,6 +267,11 @@ static int64_t pipe_read_to_user(pipe_end_t* end, uint64_t buf, uint64_t count) 
 
     pipe->read_pos = (pipe->read_pos + to_read) % pipe->size;
     pipe->used -= to_read;
+    
+    spin_unlock_irqrestore(&pipe->lock, flags);
+
+    // Wake up writers outside the lock
+    sched_wake_channel(pipe);
 
     return (int64_t)to_read;
 }
@@ -271,7 +285,12 @@ static int64_t pipe_write_from_user(pipe_end_t* end, uint64_t buf, uint64_t coun
     if (count == 0) {
         return 0;
     }
+    
+    uint64_t flags;
+    spin_lock_irqsave(&pipe->lock, &flags);
+    
     if (pipe->readers == 0) {
+        spin_unlock_irqrestore(&pipe->lock, flags);
         // No readers - send SIGPIPE to caller
         task_t* cur = sched_current();
         if (cur) {
@@ -282,6 +301,7 @@ static int64_t pipe_write_from_user(pipe_end_t* end, uint64_t buf, uint64_t coun
     
     // Block if pipe is full (simplified: just return EAGAIN for now)
     if (pipe->used == pipe->size) {
+        spin_unlock_irqrestore(&pipe->lock, flags);
         return -EAGAIN;
     }
 
@@ -302,6 +322,8 @@ static int64_t pipe_write_from_user(pipe_end_t* end, uint64_t buf, uint64_t coun
 
     pipe->write_pos = (pipe->write_pos + to_write) % pipe->size;
     pipe->used += to_write;
+    
+    spin_unlock_irqrestore(&pipe->lock, flags);
     
     // Wake up any readers blocked on this pipe
     sched_wake_channel(pipe);

@@ -3,6 +3,7 @@
 
 #include "../../include/kernel/serial.h"
 #include "../../include/kernel/interrupt.h" // for inb/outb
+#include "../../include/kernel/sched.h"
 
 #define COM1_PORT 0x3F8
 
@@ -19,6 +20,9 @@
 // LSR bits
 #define LSR_DATA_READY   0x01
 #define LSR_THR_EMPTY    0x20
+
+// Spinlock for serial port access
+static spinlock_t serial_lock = SPINLOCK_INIT("serial");
 
 static int g_serial_available = 0;
 static int g_serial_initialized = 0;
@@ -91,10 +95,14 @@ static inline void uart_wait_thr_empty(void)
 
 void serial_write_char(char c)
 {
+    uint64_t flags;
+    spin_lock_irqsave(&serial_lock, &flags);
+
     if(!g_serial_initialized) {
         serial_init();
     }
     if(!g_serial_available) {
+        spin_unlock_irqrestore(&serial_lock, flags);
         return;
     }
     if(c == '\n') {
@@ -104,17 +112,30 @@ void serial_write_char(char c)
     }
     uart_wait_thr_empty();
     uart_out(UART_DATA, (unsigned char)c);
+
+    spin_unlock_irqrestore(&serial_lock, flags);
 }
 
 void serial_write(const char* s, uint32_t len)
 {
+    uint64_t flags;
+    spin_lock_irqsave(&serial_lock, &flags);
+
     if(!g_serial_initialized) {
         serial_init();
     }
     if(!g_serial_available || !s) {
+        spin_unlock_irqrestore(&serial_lock, flags);
         return;
     }
     for(uint32_t i = 0; i < len; ++i) {
-        serial_write_char(s[i]);
+        if(s[i] == '\n') {
+            uart_wait_thr_empty();
+            uart_out(UART_DATA, '\r');
+        }
+        uart_wait_thr_empty();
+        uart_out(UART_DATA, (unsigned char)s[i]);
     }
+
+    spin_unlock_irqrestore(&serial_lock, flags);
 }
