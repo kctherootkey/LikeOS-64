@@ -19,6 +19,9 @@ static spinlock_t mouse_lock = SPINLOCK_INIT("mouse");
 // Sentinel color stored in background buffer for "not saved" entries
 static const uint32_t BG_SENTINEL = 0xDEADBEEF;
 
+// Forward declaration - internal cursor update (caller must hold mouse_lock)
+static void mouse_update_cursor_internal(void);
+
 static inline int clampi(int v, int lo, int hi)
 {
     if(v < lo) {
@@ -445,7 +448,7 @@ static void mouse_process_packet(void)
 
     // Update cursor if position changed
     if(mouse_state.x != mouse_state.last_x || mouse_state.y != mouse_state.last_y) {
-        mouse_update_cursor();
+        mouse_update_cursor_internal();
     }
 
     // Forward button/position events to console for scrollbar interactions
@@ -590,6 +593,7 @@ void mouse_irq_handler(void)
             // Stay silent
             // kprintf("Expected ACK, got 0x%02X\n", data);
         }
+        spin_unlock_irqrestore(&mouse_lock, flags);
         return;
     }
 
@@ -605,14 +609,10 @@ void mouse_irq_handler(void)
     spin_unlock_irqrestore(&mouse_lock, flags);
 }
 
-// Update cursor position on screen
-void mouse_update_cursor(void)
+// Internal cursor update - caller must already hold mouse_lock
+static void mouse_update_cursor_internal(void)
 {
-    uint64_t flags;
-    spin_lock_irqsave(&mouse_lock, &flags);
-
     if(!mouse_state.enabled || !mouse_state.cursor_visible) {
-        spin_unlock_irqrestore(&mouse_lock, flags);
         return;
     }
 
@@ -683,7 +683,14 @@ void mouse_update_cursor(void)
 
     // Flush dirty regions to display changes
     fb_flush_dirty_regions();
+}
 
+// Update cursor position on screen (public wrapper, takes lock)
+void mouse_update_cursor(void)
+{
+    uint64_t flags;
+    spin_lock_irqsave(&mouse_lock, &flags);
+    mouse_update_cursor_internal();
     spin_unlock_irqrestore(&mouse_lock, flags);
 }
 

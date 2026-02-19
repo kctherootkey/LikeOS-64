@@ -86,6 +86,7 @@ struct gdt_tss_entry {
 
 // Function prototypes
 void interrupts_init(void);
+void interrupts_set_lapic_active(int active);
 void pic_init(void);
 void irq_enable(uint8_t irq);
 void irq_disable(uint8_t irq);

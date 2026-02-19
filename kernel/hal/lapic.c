@@ -182,9 +182,20 @@ void lapic_init(void) {
     lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
     lapic_write(LAPIC_LVT_THERMAL, LAPIC_LVT_MASKED);
     lapic_write(LAPIC_LVT_PMC, LAPIC_LVT_MASKED);
-    lapic_write(LAPIC_LVT_LINT0, LAPIC_LVT_MASKED);
-    lapic_write(LAPIC_LVT_LINT1, LAPIC_LVT_MASKED);
     lapic_write(LAPIC_LVT_ERROR, LAPIC_ERROR_VECTOR);
+    
+    // Configure LINT0 and LINT1 based on BSP vs AP
+    uint64_t apic_msr = rdmsr(MSR_APIC_BASE);
+    if (apic_msr & MSR_APIC_BASE_BSP) {
+        // BSP: Do NOT touch LINT0/LINT1!
+        // UEFI firmware already configured virtual wire mode (LINT0=ExtINT)
+        // for PIC interrupt pass-through. Overwriting it can break PIC delivery.
+    } else {
+        // APs: mask LINT0 (only BSP receives PIC interrupts)
+        lapic_write(LAPIC_LVT_LINT0, LAPIC_LVT_MASKED);
+        // APs: LINT1 = NMI
+        lapic_write(LAPIC_LVT_LINT1, 0x00000400);  // NMI delivery mode (100)
+    }
     
     // Clear error status (write twice as per Intel manual)
     lapic_write(LAPIC_ESR, 0);
@@ -192,6 +203,12 @@ void lapic_init(void) {
     
     // Clear any pending interrupts
     lapic_eoi();
+    
+    // Notify the interrupt subsystem that LAPIC is now active on BSP
+    // so that pic_send_eoi() also sends LAPIC EOI
+    if (apic_msr & MSR_APIC_BASE_BSP) {
+        interrupts_set_lapic_active(1);
+    }
     
     kprintf("LAPIC: Initialized (APIC ID = %u)\n", apic_id);
 }

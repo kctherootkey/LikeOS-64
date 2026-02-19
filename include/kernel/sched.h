@@ -81,7 +81,7 @@ static inline int spin_trylock(spinlock_t* lock) {
 
 // Release spinlock
 static inline void spin_unlock(spinlock_t* lock) {
-    __asm__ volatile("" ::: "memory"); // Memory barrier before release
+    __asm__ volatile("mfence" ::: "memory"); // Full memory barrier before release
     lock->locked = 0;
     lock->owner_cpu = 0xFFFFFFFF;
 }

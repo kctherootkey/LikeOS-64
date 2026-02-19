@@ -5,6 +5,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/signal.h"
+#include "../../include/kernel/lapic.h"
 
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_descriptor idt_desc;
@@ -69,7 +70,33 @@ extern void isr29();
 extern void isr30();
 extern void isr31();
 
+// Track whether LAPIC is active (set by lapic_init on BSP)
+static volatile int g_lapic_active = 0;
+
+void interrupts_set_lapic_active(int active) {
+    g_lapic_active = active;
+}
+
 void pic_send_eoi(uint8_t irq) {
+    // When LAPIC is active, check if this interrupt came from the LAPIC
+    // (e.g. LAPIC timer on APs) vs the 8259 PIC (e.g. keyboard/mouse on BSP).
+    // LAPIC-sourced interrupts set the ISR bit; PIC-via-virtual-wire do not.
+    // We must ONLY send EOI to the correct controller:
+    //   - LAPIC interrupt → lapic_eoi() only, do NOT touch the 8259 PIC
+    //   - PIC interrupt   → PIC EOI only, do NOT send lapic_eoi()
+    // Sending PIC EOI from an AP would corrupt the shared 8259 PIC state.
+    if (g_lapic_active) {
+        uint8_t vector = irq + 32;
+        uint32_t isr_reg = LAPIC_ISR_BASE + (vector / 32) * 0x10;
+        uint32_t isr_bit = 1U << (vector % 32);
+        if (lapic_read(isr_reg) & isr_bit) {
+            // LAPIC owns this interrupt - only LAPIC EOI, skip PIC
+            lapic_eoi();
+            return;
+        }
+    }
+    
+    // PIC interrupt - send PIC EOI only
     if (irq >= 8) {
         outb(PIC2_CMD, 0x20);
     }
@@ -338,7 +365,8 @@ void irq_handler(uint64_t *regs) {
     if (irq == 7) {
         uint8_t isr = pic_read_isr();
         if ((isr & 0x80) == 0) {
-            // Spurious IRQ7 - do NOT send EOI
+            // Spurious IRQ7 - do NOT send any EOI
+            // ExtINT delivery does not set LAPIC ISR bits, so no LAPIC EOI either
             g_spurious_irq_count++;
             return;
         }
@@ -349,6 +377,7 @@ void irq_handler(uint64_t *regs) {
         uint8_t isr = pic2_read_isr();
         if ((isr & 0x80) == 0) {
             // Spurious IRQ15 - only send EOI to master (for cascade)
+            // ExtINT delivery does not set LAPIC ISR bits, so no LAPIC EOI
             g_spurious_irq_count++;
             outb(PIC1_CMD, 0x20);  // EOI to master only
             return;
