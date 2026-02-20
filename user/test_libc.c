@@ -1626,6 +1626,235 @@ int main(int argc, char** argv) {
     }
 
     // ========================================
+    // SMP Stress Tests
+    // ========================================
+    printf("\n--- SMP Stress Tests ---\n");
+    
+    // Test: Concurrent fork() from multiple processes
+    printf("\n[TEST] Concurrent fork() stress\n");
+    {
+        #define CONCURRENT_FORKS 5
+        pid_t fork_children[CONCURRENT_FORKS];
+        int fork_ok = 1;
+        
+        // Fork several children, each of which also forks
+        for (int i = 0; i < CONCURRENT_FORKS; i++) {
+            fork_children[i] = fork();
+            if (fork_children[i] == 0) {
+                // Child: fork a grandchild and wait for it
+                pid_t gc = fork();
+                if (gc == 0) {
+                    // Grandchild: do some work and exit
+                    volatile unsigned long c = 0;
+                    for (int j = 0; j < 10000; j++) c++;
+                    _exit((int)(c & 0xFF));
+                } else if (gc > 0) {
+                    int status;
+                    waitpid(gc, &status, 0);
+                    _exit(WIFEXITED(status) ? 0 : 1);
+                } else {
+                    _exit(2);  // fork failed
+                }
+            } else if (fork_children[i] < 0) {
+                fork_ok = 0;
+            }
+        }
+        
+        // Wait for all direct children
+        int all_ok = fork_ok;
+        for (int i = 0; i < CONCURRENT_FORKS; i++) {
+            if (fork_children[i] > 0) {
+                int status;
+                pid_t w = waitpid(fork_children[i], &status, 0);
+                if (w != fork_children[i] || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                    all_ok = 0;
+                }
+            }
+        }
+        test_result("concurrent fork/grandchild stress", all_ok);
+    }
+    
+    // Test: Parallel memory allocation stress
+    printf("\n[TEST] Parallel malloc stress\n");
+    {
+        #define MALLOC_CHILDREN 4
+        #define MALLOC_ITERATIONS 50
+        pid_t malloc_children[MALLOC_CHILDREN];
+        int malloc_pipes[MALLOC_CHILDREN][2];
+        int pipes_ok = 1;
+        
+        for (int i = 0; i < MALLOC_CHILDREN; i++) {
+            if (pipe(malloc_pipes[i]) < 0) {
+                pipes_ok = 0;
+                break;
+            }
+        }
+        
+        if (pipes_ok) {
+            for (int i = 0; i < MALLOC_CHILDREN; i++) {
+                malloc_children[i] = fork();
+                if (malloc_children[i] == 0) {
+                    // Close read ends and other write ends
+                    for (int j = 0; j < MALLOC_CHILDREN; j++) {
+                        close(malloc_pipes[j][0]);
+                        if (j != i) close(malloc_pipes[j][1]);
+                    }
+                    
+                    // Allocate and free memory in a loop
+                    int success = 0;
+                    for (int j = 0; j < MALLOC_ITERATIONS; j++) {
+                        size_t sz = 64 + (j * 37) % 4096;  // Varying sizes
+                        void* p = malloc(sz);
+                        if (p) {
+                            // Touch the memory
+                            memset(p, (char)(j & 0xFF), sz);
+                            // Verify first byte
+                            if (((unsigned char*)p)[0] == (unsigned char)(j & 0xFF)) {
+                                success++;
+                            }
+                            free(p);
+                        }
+                    }
+                    
+                    write(malloc_pipes[i][1], &success, sizeof(success));
+                    close(malloc_pipes[i][1]);
+                    _exit(0);
+                }
+                close(malloc_pipes[i][1]);
+            }
+            
+            // Collect results
+            int total_success = 0;
+            int all_finished = 1;
+            for (int i = 0; i < MALLOC_CHILDREN; i++) {
+                int status;
+                pid_t w = waitpid(malloc_children[i], &status, 0);
+                if (w != malloc_children[i]) all_finished = 0;
+                
+                int child_success = 0;
+                read(malloc_pipes[i][0], &child_success, sizeof(child_success));
+                close(malloc_pipes[i][0]);
+                total_success += child_success;
+            }
+            
+            int expected = MALLOC_CHILDREN * MALLOC_ITERATIONS;
+            printf("  Parallel malloc: %d/%d allocations succeeded\n", total_success, expected);
+            test_result("parallel malloc all children finished", all_finished);
+            test_result("parallel malloc all allocations ok", total_success == expected);
+        } else {
+            test_fail("parallel malloc: pipe creation failed");
+            test_fail("parallel malloc all children finished");
+            test_fail("parallel malloc all allocations ok");
+        }
+    }
+    
+    // Test: Multi-process pipe read/write stress
+    printf("\n[TEST] Multi-process pipe stress\n");
+    {
+        #define PIPE_WRITERS 3
+        #define PIPE_MSGS_PER_WRITER 10
+        int stress_pipe[2];
+        
+        if (pipe(stress_pipe) == 0) {
+            pid_t writers[PIPE_WRITERS];
+            
+            // Fork writer processes
+            for (int i = 0; i < PIPE_WRITERS; i++) {
+                writers[i] = fork();
+                if (writers[i] == 0) {
+                    close(stress_pipe[0]);  // Close read end
+                    
+                    // Write messages to pipe
+                    for (int j = 0; j < PIPE_MSGS_PER_WRITER; j++) {
+                        char msg[16];
+                        int len = 0;
+                        // Simple message: "Wij\n" where i=writer, j=msg
+                        msg[len++] = 'W';
+                        msg[len++] = '0' + i;
+                        msg[len++] = '0' + j;
+                        msg[len++] = '\n';
+                        write(stress_pipe[1], msg, len);
+                    }
+                    
+                    close(stress_pipe[1]);
+                    _exit(0);
+                }
+            }
+            
+            // Parent reads all messages
+            close(stress_pipe[1]);  // Close write end
+            
+            int msgs_received = 0;
+            char rbuf[256];
+            ssize_t total_read = 0;
+            
+            while (1) {
+                ssize_t n = read(stress_pipe[0], rbuf + total_read, 
+                                sizeof(rbuf) - total_read - 1);
+                if (n <= 0) break;
+                total_read += n;
+                
+                // Count newlines as message delimiters
+                for (ssize_t k = total_read - n; k < total_read; k++) {
+                    if (rbuf[k] == '\n') msgs_received++;
+                }
+            }
+            close(stress_pipe[0]);
+            
+            // Wait for all writers
+            for (int i = 0; i < PIPE_WRITERS; i++) {
+                waitpid(writers[i], NULL, 0);
+            }
+            
+            int expected_msgs = PIPE_WRITERS * PIPE_MSGS_PER_WRITER;
+            printf("  Pipe stress: received %d/%d messages\n", msgs_received, expected_msgs);
+            test_result("multi-process pipe all messages received", msgs_received == expected_msgs);
+        } else {
+            test_fail("multi-process pipe stress: pipe creation failed");
+        }
+    }
+    
+    // Test: sched_yield() syscall (if available)
+    printf("\n[TEST] sched_yield() behavior\n");
+    {
+        // Verify that yielding doesn't crash or hang
+        // Fork a child, both yield repeatedly
+        volatile int *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (shared != MAP_FAILED) {
+            shared[0] = 0;  // Child counter
+            shared[1] = 0;  // Parent counter
+            shared[2] = 0;  // Stop flag
+            
+            pid_t child = fork();
+            if (child == 0) {
+                while (!shared[2]) {
+                    shared[0]++;
+                    sched_yield();
+                }
+                _exit(0);
+            } else if (child > 0) {
+                // Parent yields for a while
+                for (int i = 0; i < 200; i++) {
+                    shared[1]++;
+                    sched_yield();
+                }
+                shared[2] = 1;  // Signal child to stop
+                
+                waitpid(child, NULL, 0);
+                
+                printf("  yield test: parent=%d, child=%d iterations\n", 
+                       (int)shared[1], (int)shared[0]);
+                test_result("sched_yield parent ran", shared[1] >= 200);
+                test_result("sched_yield child ran", shared[0] > 0);
+            }
+            munmap((void*)shared, 4096);
+        } else {
+            test_fail("sched_yield test: mmap failed");
+        }
+    }
+
+    // ========================================
     // Summary
     // ========================================
     printf("\n========================================\n");

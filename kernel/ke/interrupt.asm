@@ -192,3 +192,66 @@ IRQ 12, 44              ; PS/2 mouse
 IRQ 13, 45              ; FPU
 IRQ 14, 46              ; Primary ATA
 IRQ 15, 47              ; Secondary ATA
+
+; ============================================================================
+; IPI (Inter-Processor Interrupt) Handlers for SMP
+; These are high-vector interrupts sent between CPUs via LAPIC
+; ============================================================================
+
+extern ipi_handler
+
+; Common IPI stub - same register save/restore as IRQ but calls ipi_handler
+ipi_common_stub:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    mov rdi, rsp               ; Pass pointer to register structure
+    call ipi_handler
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    add rsp, 16                ; Clean up vector number + dummy error code
+    iretq
+
+; Macro for IPI vector stubs (no error code, push vector number)
+%macro IPI_STUB 1
+global ipi_vector_%1
+ipi_vector_%1:
+    cli
+    push 0              ; Dummy error code
+    push %1             ; Push vector number
+    jmp ipi_common_stub
+%endmacro
+
+; IPI vector stubs
+IPI_STUB 0xFC           ; TLB shootdown
+IPI_STUB 0xFD           ; Halt CPU
+IPI_STUB 0xFE           ; Reschedule
+IPI_STUB 0xFF           ; LAPIC spurious interrupt

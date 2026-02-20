@@ -10,8 +10,13 @@
 
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_descriptor idt_desc;
-static struct tss_entry tss;
+static struct tss_entry tss;  // BSP TSS
 static uint8_t interrupt_stack[8192] __attribute__((aligned(16)));
+
+// Per-CPU TSS for SMP (index 0 = BSP, 1..MAX_CPUS-1 = APs)
+#define MAX_CPUS_TSS 64
+static struct tss_entry ap_tss[MAX_CPUS_TSS] __attribute__((aligned(16)));
+static uint8_t ap_interrupt_stacks[MAX_CPUS_TSS][8192] __attribute__((aligned(16)));
 
 static void my_memset(void *dest, int val, size_t len) {
     uint8_t *ptr = (uint8_t*)dest;
@@ -247,6 +252,12 @@ void idt_init() {
     idt_set_entry(46, (uint64_t)irq14, 0x08, 0x8E);
     idt_set_entry(47, (uint64_t)irq15, 0x08, 0x8E);
     
+    // IPI vectors for SMP
+    idt_set_entry(0xFC, (uint64_t)ipi_vector_0xFC, 0x08, 0x8E);  // TLB shootdown
+    idt_set_entry(0xFD, (uint64_t)ipi_vector_0xFD, 0x08, 0x8E);  // Halt CPU
+    idt_set_entry(0xFE, (uint64_t)ipi_vector_0xFE, 0x08, 0x8E);  // Reschedule
+    idt_set_entry(0xFF, (uint64_t)ipi_vector_0xFF, 0x08, 0x8E);  // LAPIC spurious
+    
     idt_flush((uint64_t)&idt_desc);
     kprintf("IDT initialized\n");
 }
@@ -464,6 +475,55 @@ void irq_handler(uint64_t *regs) {
     pic_send_eoi(irq);
 }
 
+// ============================================================================
+// IPI Handler (called from ipi_common_stub in assembly)
+// ============================================================================
+
+void ipi_handler(uint64_t *regs) {
+    uint64_t vector = regs[15];  // Vector number pushed by IPI stub
+    
+    switch (vector) {
+        case 0xFE:  // IPI_RESCHEDULE_VECTOR
+            // Mark current task as needing reschedule
+            {
+                task_t* cur = sched_current();
+                if (cur) {
+                    sched_set_need_resched(cur);
+                }
+            }
+            lapic_eoi();
+            break;
+            
+        case 0xFD:  // IPI_HALT_VECTOR
+            // Halt this CPU
+            lapic_eoi();
+            __asm__ volatile("cli");
+            while (1) {
+                __asm__ volatile("hlt");
+            }
+            break;
+            
+        case 0xFC:  // IPI_TLB_SHOOTDOWN
+            // Invalidate TLB on this CPU
+            {
+                uint64_t cr3;
+                __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+                __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+            }
+            lapic_eoi();
+            break;
+            
+        case 0xFF:  // LAPIC_SPURIOUS_VECTOR
+            // Spurious interrupt - do NOT send EOI
+            break;
+            
+        default:
+            // Unknown IPI vector - just send EOI
+            lapic_eoi();
+            break;
+    }
+}
+
 void interrupts_init() {
     extern void gdt_init();
     gdt_init();
@@ -488,11 +548,90 @@ void gdt_install_tss() {
 }
 
 void tss_set_kernel_stack(uint64_t stack_top) {
-    tss.rsp0 = stack_top;
+    // In SMP mode, set the per-CPU TSS RSP0
+    if (sched_is_smp()) {
+        uint32_t cpu = this_cpu_id();
+        if (cpu == 0) {
+            tss.rsp0 = stack_top;
+        } else if (cpu < MAX_CPUS_TSS) {
+            ap_tss[cpu].rsp0 = stack_top;
+        }
+    } else {
+        tss.rsp0 = stack_top;
+    }
 }
 
 uint64_t tss_get_kernel_stack(void) {
+    if (sched_is_smp()) {
+        uint32_t cpu = this_cpu_id();
+        if (cpu == 0) {
+            return tss.rsp0;
+        } else if (cpu < MAX_CPUS_TSS) {
+            return ap_tss[cpu].rsp0;
+        }
+    }
     return tss.rsp0;
+}
+
+// Initialize TSS for an Application Processor
+// Each AP needs its own TSS with a unique RSP0 for kernel entry
+// CRITICAL: We must NOT call gdt_flush() here because it reloads GS with
+// selector 0x10 (data segment), which zeroes the GS base and destroys the
+// per-CPU data pointer set up by percpu_init_cpu().
+// Instead, we directly update the GDT TSS entry and do LTR.
+// This is safe because APs start serially (one at a time in smp_boot_aps).
+void tss_init_ap(uint32_t cpu_id) {
+    if (cpu_id == 0 || cpu_id >= MAX_CPUS_TSS) {
+        return;
+    }
+    
+    // Initialize the per-CPU TSS
+    my_memset(&ap_tss[cpu_id], 0, sizeof(struct tss_entry));
+    ap_tss[cpu_id].rsp0 = (uint64_t)(ap_interrupt_stacks[cpu_id] + sizeof(ap_interrupt_stacks[cpu_id]));
+    ap_tss[cpu_id].iopb_offset = sizeof(struct tss_entry);
+    
+    // Directly update the shared GDT's TSS entry (slots 5-6) without gdt_flush.
+    // The GDT is already loaded via lgdt in ap_entry(); we just need to update
+    // the in-memory TSS descriptor and then LTR to load it into this CPU's TR.
+    //
+    // Access the GDT through the pointer returned by gdt_get_descriptor().
+    // The gdt_ptr structure: { uint16_t limit; uint64_t base; }
+    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) *gdtp = gdt_get_descriptor();
+    
+    // GDT entry is 8 bytes each; TSS descriptor is at entries 5-6 (offset 40)
+    uint8_t* gdt_base = (uint8_t*)(gdtp->base);
+    uint8_t* tss_desc = gdt_base + (5 * 8);  // Entry 5
+    
+    uint64_t base = (uint64_t)&ap_tss[cpu_id];
+    uint64_t limit = sizeof(struct tss_entry) - 1;
+    
+    // First 8 bytes (standard TSS descriptor format)
+    tss_desc[0] = limit & 0xFF;              // Limit low byte 0
+    tss_desc[1] = (limit >> 8) & 0xFF;       // Limit low byte 1
+    tss_desc[2] = base & 0xFF;               // Base low byte 0
+    tss_desc[3] = (base >> 8) & 0xFF;        // Base low byte 1
+    tss_desc[4] = (base >> 16) & 0xFF;       // Base middle
+    tss_desc[5] = 0x89;                      // Access: Present, Ring 0, TSS Available (not Busy!)
+    tss_desc[6] = (limit >> 16) & 0x0F;      // Granularity + limit high nibble
+    tss_desc[7] = (base >> 24) & 0xFF;       // Base high byte
+    
+    // Second 8 bytes (upper 32 bits of base for 64-bit TSS)
+    tss_desc[8]  = (base >> 32) & 0xFF;
+    tss_desc[9]  = (base >> 40) & 0xFF;
+    tss_desc[10] = (base >> 48) & 0xFF;
+    tss_desc[11] = (base >> 56) & 0xFF;
+    tss_desc[12] = 0;
+    tss_desc[13] = 0;
+    tss_desc[14] = 0;
+    tss_desc[15] = 0;
+    
+    // Memory barrier to ensure GDT writes are visible before LTR
+    __asm__ volatile("mfence" ::: "memory");
+    
+    // Load Task Register (selector 0x28 = entry 5)
+    __asm__ volatile("ltr %0" : : "r"((uint16_t)0x28));
+    
+    kprintf("TSS installed for AP %u\n", cpu_id);
 }
 
 // Get IDT descriptor for AP initialization

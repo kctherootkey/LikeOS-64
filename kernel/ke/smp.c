@@ -133,6 +133,9 @@ void ap_entry(void) {
     // Initialize per-CPU data for this AP
     percpu_init_cpu(cpu_id, apic_id);
     
+    // Initialize per-CPU TSS (each AP needs its own TSS for RSP0)
+    tss_init_ap(cpu_id);
+    
     // Initialize LAPIC for this CPU
     lapic_init();
     

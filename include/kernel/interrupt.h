@@ -141,6 +141,9 @@ extern void isr31(void);
 void tss_set_kernel_stack(uint64_t stack_top);
 uint64_t tss_get_kernel_stack(void);
 
+// Per-CPU TSS initialization for Application Processors
+void tss_init_ap(uint32_t cpu_id);
+
 // Get IDT and GDT descriptors for AP initialization
 void* interrupts_get_idt_descriptor(void);
 void* gdt_get_descriptor(void);
@@ -162,5 +165,14 @@ extern void irq44(void);
 extern void irq45(void);
 extern void irq46(void);
 extern void irq47(void);
+
+// IPI stubs (SMP inter-processor interrupts)
+extern void ipi_vector_0xFC(void);  // TLB shootdown
+extern void ipi_vector_0xFD(void);  // Halt CPU
+extern void ipi_vector_0xFE(void);  // Reschedule
+extern void ipi_vector_0xFF(void);  // LAPIC spurious
+
+// IPI handler (called from assembly)
+void ipi_handler(uint64_t *regs);
 
 #endif // _KERNEL_INTERRUPT_H_
