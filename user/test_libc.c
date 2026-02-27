@@ -1523,46 +1523,49 @@ int main(int argc, char** argv) {
     // Test 6: Time slice fairness measurement
     printf("\n[TEST] Time slice measurement\n");
     {
-        // Two processes race to increment counters
+        // Both processes run identical time-based loops for fair comparison
         volatile unsigned long *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
                                               MAP_SHARED | MAP_ANONYMOUS, -1, 0);
         if (shared != MAP_FAILED) {
             shared[0] = 0;  // Child counter
             shared[1] = 0;  // Parent counter
-            shared[2] = 0;  // Stop flag
-            shared[3] = 0;  // Child ready flag
+            shared[2] = 0;  // Child done flag
+            shared[3] = 0;  // Parent done flag
             
             pid_t child = fork();
             if (child == 0) {
-                // Child: signal ready, then increment counter until stop flag
-                shared[3] = 1;  // Signal that child is running
-                while (!shared[2]) {
-                    shared[0]++;
-                }
-                _exit(0);
-            } else if (child > 0) {
-                // Wait for child to start (prevents race where stop flag is set before child runs)
-                while (!shared[3]) {
-                    // Spin until child signals ready
-                }
-                
-                // Parent: increment counter for fixed time duration
-                // Use time-based loop to ensure preemption can occur
+                // Child: run identical time-based loop as parent
                 struct timespec start_time, now;
                 clock_gettime(CLOCK_MONOTONIC, &start_time);
                 
-                // Run for 100ms to allow multiple time slices
+                // Run for 100ms with identical logic as parent
+                while (1) {
+                    shared[0]++;
+                    if ((shared[0] % 1000) == 0) {
+                        clock_gettime(CLOCK_MONOTONIC, &now);
+                        long elapsed_ms = (now.tv_sec - start_time.tv_sec) * 1000 +
+                                         (now.tv_nsec - start_time.tv_nsec) / 1000000;
+                        if (elapsed_ms >= 100) break;
+                    }
+                }
+                shared[2] = 1;  // Signal child done
+                _exit(0);
+            } else if (child > 0) {
+                // Parent: run identical time-based loop as child
+                struct timespec start_time, now;
+                clock_gettime(CLOCK_MONOTONIC, &start_time);
+                
+                // Run for 100ms with identical logic as child
                 while (1) {
                     shared[1]++;
-                    // Check time every 1000 iterations to reduce overhead
                     if ((shared[1] % 1000) == 0) {
                         clock_gettime(CLOCK_MONOTONIC, &now);
                         long elapsed_ms = (now.tv_sec - start_time.tv_sec) * 1000 +
                                          (now.tv_nsec - start_time.tv_nsec) / 1000000;
-                        if (elapsed_ms >= 100) break;  // Run for 100ms
+                        if (elapsed_ms >= 100) break;
                     }
                 }
-                shared[2] = 1;  // Signal child to stop
+                shared[3] = 1;  // Signal parent done
                 
                 waitpid(child, NULL, 0);
                 
@@ -1570,13 +1573,16 @@ int main(int argc, char** argv) {
                        shared[0], shared[1]);
                 
                 // Both should have gotten CPU time
-                test_result("child got CPU time", shared[0] > 100);
+                test_result("child got CPU time", shared[0] > 1000);
                 test_result("parent got CPU time", shared[1] > 1000);
                 
-                // Check rough fairness (within 10x) - avoid divide by zero
+                // Check fairness: both ran for 100ms doing identical work.
+                // With fair scheduling, iteration counts should be within 10x.
+                // Larger ratios indicate one process was starved of CPU time.
                 if (shared[0] > 0 && shared[1] > 0) {
                     unsigned long ratio = (shared[0] > shared[1]) ? 
                                          shared[0] / shared[1] : shared[1] / shared[0];
+                    printf("  Fairness ratio: %lu\n", ratio);
                     test_result("time slice roughly fair", ratio < 10);
                 } else {
                     test_result("time slice roughly fair", 0);

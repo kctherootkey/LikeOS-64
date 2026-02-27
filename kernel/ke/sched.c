@@ -1081,7 +1081,10 @@ void sched_signal_task(task_t* task, int sig) {
         signal_send(task, sig, &info);
         task->exit_code = 128 + sig;
         sched_mark_task_exited(task, 128 + sig);
-        if (task == sched_current()) sched_schedule();
+        // NOTE: Do NOT call sched_schedule() here! The caller (exception handler)
+        // will loop with 'sti; hlt', and the timer will safely preempt us.
+        // Calling sched_schedule() while still on this task's kernel stack creates
+        // a race: another CPU can free the stack via waitpid before ctx_switch.
         return;
     }
 
@@ -1141,11 +1144,13 @@ void sched_signal_task(task_t* task, int sig) {
         case SIG_DFL_CORE:
             task->exit_code = 128 + sig;
             sched_mark_task_exited(task, 128 + sig);
-            if (task == sched_current()) sched_schedule();
+            // NOTE: Do NOT call sched_schedule() here! Same race as SIGKILL.
+            // Timer preemption will safely switch us off this stack.
             break;
         case SIG_DFL_STOP:
             if (task->on_rq) rq_remove(task);
             task->state = TASK_STOPPED;
+            // Stopped tasks can safely schedule since they're not being freed
             if (task == sched_current()) sched_schedule();
             break;
         case SIG_DFL_IGN:

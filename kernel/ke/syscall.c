@@ -984,8 +984,8 @@ static int64_t sys_uname(uint64_t buf) {
     const char* mach = "x86_64";
     mm_memcpy(u.sysname, sys, 7);
     mm_memcpy(u.nodename, node, 7);
-    mm_memcpy(u.release, rel, 12);
-    mm_memcpy(u.version, ver, 18);
+    mm_memcpy(u.release, rel, 16);
+    mm_memcpy(u.version, ver, 10);
     mm_memcpy(u.machine, mach, 7);
     if (copy_to_user((void*)buf, &u, sizeof(u)) < 0) {
         return -EFAULT;
@@ -1801,9 +1801,34 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options) {
         }
         
         // Block until a child exits or we get a signal
-        // The parent will be woken by sched_wake_task() when child exits
+        // CRITICAL: Disable interrupts to prevent race with child exit.
+        // The child's exit path checks parent->state under IRQ-disabled section.
+        // We must set BLOCKED atomically with respect to that check.
+        uint64_t irq_flags = local_irq_save();
+        
+        // Re-check for zombie children under lock to close the race window
+        // where child exits between our check above and setting BLOCKED
+        bool found_zombie = false;
+        task_t* zombie_check = cur->first_child;
+        while (zombie_check) {
+            if (zombie_check->has_exited) {
+                found_zombie = true;
+                break;
+            }
+            zombie_check = zombie_check->next_sibling;
+        }
+        
+        if (found_zombie) {
+            // A child exited while we were about to block - retry the loop
+            local_irq_restore(irq_flags);
+            continue;  // Jump to top of while(1) to reap the zombie
+        }
+        
+        // No zombie found under lock, safe to block
         cur->state = TASK_BLOCKED;
         cur->wait_channel = cur;  // Waiting for our own children
+        local_irq_restore(irq_flags);
+        
         sched_schedule();
         // NOTE: Do NOT set cur->state = TASK_READY here!
         // When sched_schedule() returns, the scheduler has already set us

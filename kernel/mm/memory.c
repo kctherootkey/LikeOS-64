@@ -22,6 +22,11 @@ static spinlock_t mm_pt_pool_lock = SPINLOCK_INIT("mm_pt_pool");
 // race when creating intermediate page table levels (PDPT/PD/PT), causing one
 // CPU's newly-allocated level to be silently overwritten by the other.
 static spinlock_t mm_kernel_pt_lock = SPINLOCK_INIT("mm_kpt");
+// Spinlock for page refcount operations (COW safety on SMP)
+static spinlock_t mm_refcount_lock = SPINLOCK_INIT("mm_refcount");
+
+// Forward declaration for page_to_index (used in COW handler before definition)
+static inline uint64_t page_to_index(uint64_t phys_addr);
 
 // Magic numbers for heap validation
 #define HEAP_MAGIC_ALLOCATED    0xDEADBEEF
@@ -1970,38 +1975,75 @@ bool mm_mark_page_cow(uint64_t virtual_addr) {
 }
 
 // Handle a COW page fault - allocate new page and copy contents
+// This must be SMP-safe: multiple CPUs may handle COW faults simultaneously
 bool mm_handle_cow_fault(uint64_t fault_addr) {
     uint64_t page_addr = fault_addr & ~0xFFFULL;
     uint64_t* pte = mm_get_page_table(page_addr, false);
     
     if (!pte || !(*pte & PAGE_PRESENT)) {
-        kprintf("COW: no PTE for 0x%lx\n", fault_addr);
         return false;
     }
     
     // Check if this is a COW page
     if (!(*pte & PAGE_COW)) {
-        kprintf("COW: PTE 0x%lx not COW (PTE=0x%lx)\n", fault_addr, *pte);
-        return false;  // Not a COW fault
+        // Not a COW page - but on SMP another CPU may have already resolved this
+        // COW fault. If the page is now writable, just flush our TLB and succeed.
+        if (*pte & PAGE_WRITABLE) {
+            mm_flush_tlb(page_addr);
+            return true;
+        }
+        return false;  // Not a COW fault and not writable - genuine fault
     }
     
     // Extract physical address (bits 12-51, mask off flags and NX bit)
     uint64_t old_phys = *pte & PTE_ADDR_MASK;
     
+    // Validate the physical address is in tracked range
+    uint64_t page_idx = page_to_index(old_phys);
+    if (page_idx == (uint64_t)-1) {
+        // Page is outside tracked memory - just make it writable without refcount tracking
+        uint64_t flags = (*pte & 0xFFF) & ~PAGE_COW;
+        flags |= PAGE_WRITABLE;
+        *pte = (*pte & PAGE_NO_EXECUTE) | old_phys | flags;
+        mm_flush_tlb(page_addr);
+        return true;
+    }
+    
+    // Lock the refcount operations to prevent TOCTOU races
+    // We need to atomically: check refcount, decide action, and update state
+    uint64_t irq_flags;
+    spin_lock_irqsave(&mm_refcount_lock, &irq_flags);
+    
+    // Re-check COW flag under lock (another CPU may have resolved it)
+    if (!(*pte & PAGE_COW)) {
+        // Another CPU already resolved this COW fault
+        spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
+        return true;
+    }
+    
     // Check if we're the only reference - can just make writable
-    uint16_t refcount = mm_get_page_refcount(old_phys);
+    uint16_t refcount = __atomic_load_n(&mm_state.page_refcounts[page_idx], __ATOMIC_ACQUIRE);
     if (refcount <= 1) {
         // We're the only user, just make it writable again
         uint64_t flags = (*pte & 0xFFF) & ~PAGE_COW;
         flags |= PAGE_WRITABLE;
         *pte = (*pte & PAGE_NO_EXECUTE) | old_phys | flags; // Preserve NX bit
         mm_flush_tlb(page_addr);
+        spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
         return true;
     }
     
-    // Allocate a new physical page
+    // Need to copy - decrement refcount now while holding lock
+    uint16_t old_refcount = __atomic_fetch_sub(&mm_state.page_refcounts[page_idx], 1, __ATOMIC_SEQ_CST);
+    bool should_free_old = (old_refcount == 1);
+    
+    spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
+    
+    // Allocate a new physical page (outside lock for performance)
     uint64_t new_phys = mm_allocate_physical_page();
     if (!new_phys) {
+        // Restore refcount since we couldn't complete the copy
+        __atomic_fetch_add(&mm_state.page_refcounts[page_idx], 1, __ATOMIC_SEQ_CST);
         kprintf("mm_handle_cow_fault: Failed to allocate new page\n");
         return false;
     }
@@ -2016,8 +2058,8 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
     
     mm_flush_tlb(page_addr);
     
-    // Decrement refcount on old page - free if it reaches 0
-    if (mm_decref_page(old_phys)) {
+    // Free old page if we were the last reference
+    if (should_free_old) {
         mm_free_physical_page(old_phys);
     }
     
@@ -2519,7 +2561,7 @@ void mm_initialize_syscall(void) {
 }
 
 // ============================================================================
-// PAGE REFERENCE COUNTING (for COW fork)
+// PAGE REFERENCE COUNTING (for COW fork) - SMP SAFE
 // ============================================================================
 
 // Get page index from physical address
@@ -2539,33 +2581,38 @@ void mm_init_page_refcounts(void) {
     }
 }
 
-// Increment reference count for a physical page
+// Increment reference count for a physical page (SMP-safe)
 void mm_incref_page(uint64_t phys_addr) {
     uint64_t idx = page_to_index(phys_addr);
     if (idx == (uint64_t)-1) return;
     
-    if (mm_state.page_refcounts[idx] < 0xFFFF) {
-        mm_state.page_refcounts[idx]++;
+    // Use atomic increment to avoid races on SMP
+    uint16_t old = __atomic_load_n(&mm_state.page_refcounts[idx], __ATOMIC_ACQUIRE);
+    if (old < 0xFFFF) {
+        __atomic_fetch_add(&mm_state.page_refcounts[idx], 1, __ATOMIC_SEQ_CST);
     }
 }
 
-// Decrement reference count - returns true if page should be freed
+// Decrement reference count - returns true if page should be freed (SMP-safe)
 bool mm_decref_page(uint64_t phys_addr) {
     uint64_t idx = page_to_index(phys_addr);
     if (idx == (uint64_t)-1) return false;
     
-    if (mm_state.page_refcounts[idx] > 0) {
-        mm_state.page_refcounts[idx]--;
-        return mm_state.page_refcounts[idx] == 0;
+    // Atomically decrement and check if we should free
+    uint16_t old = __atomic_fetch_sub(&mm_state.page_refcounts[idx], 1, __ATOMIC_SEQ_CST);
+    if (old == 0) {
+        // Was already 0, restore and return true (page was never shared)
+        __atomic_fetch_add(&mm_state.page_refcounts[idx], 1, __ATOMIC_SEQ_CST);
+        return true;
     }
-    // refcount is 0 - this page was never shared, free it directly
-    return true;
+    // old was the value before decrement, so if old == 1, new value is 0
+    return old == 1;
 }
 
-// Get reference count for a physical page
+// Get reference count for a physical page (SMP-safe)
 uint16_t mm_get_page_refcount(uint64_t phys_addr) {
     uint64_t idx = page_to_index(phys_addr);
     if (idx == (uint64_t)-1) return 0;
     
-    return mm_state.page_refcounts[idx];
+    return __atomic_load_n(&mm_state.page_refcounts[idx], __ATOMIC_ACQUIRE);
 }
