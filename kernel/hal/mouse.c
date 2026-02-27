@@ -197,10 +197,10 @@ static void mouse_draw_cursor_full(int x, int y)
             if(screen_x < 0 || screen_y < 0 || screen_x >= mouse_state.screen_width || screen_y >= mouse_state.screen_height) {
                 continue;
             }
-            cursor_background[bg_index] = fb_get_pixel((uint32_t)screen_x, (uint32_t)screen_y);
+            cursor_background[bg_index] = fb_get_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y);
             uint32_t pix = cursor_bitmap[cy][cx];
             if(pix != 0x00000000) {
-                fb_set_pixel((uint32_t)screen_x, (uint32_t)screen_y, pix);
+                fb_set_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y, pix);
             }
         }
     }
@@ -208,7 +208,7 @@ static void mouse_draw_cursor_full(int x, int y)
     int y1 = clampi(y, 0, mouse_state.screen_height - 1);
     int x2 = clampi(x + cw - 1, 0, mouse_state.screen_width - 1);
     int y2 = clampi(y + ch - 1, 0, mouse_state.screen_height - 1);
-    fb_mark_dirty((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
+    fb_mark_dirty_unlocked((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
 }
 
 // Clear cursor at specified position
@@ -238,7 +238,7 @@ static void mouse_clear_cursor_full(int x, int y)
             }
             uint32_t bg = cursor_background[bg_index];
             if(bg != BG_SENTINEL) {
-                fb_set_pixel((uint32_t)screen_x, (uint32_t)screen_y, bg);
+                fb_set_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y, bg);
             }
             // Reset background entry so we never reuse stale data
             cursor_background[bg_index] = BG_SENTINEL;
@@ -248,7 +248,7 @@ static void mouse_clear_cursor_full(int x, int y)
     int y1 = clampi(y, 0, mouse_state.screen_height - 1);
     int x2 = clampi(x + cw - 1, 0, mouse_state.screen_width - 1);
     int y2 = clampi(y + ch - 1, 0, mouse_state.screen_height - 1);
-    fb_mark_dirty((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
+    fb_mark_dirty_unlocked((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
 }
 
 static void mouse_draw_cursor_partial(int x, int y, int visible_w, int visible_h)
@@ -288,10 +288,10 @@ static void mouse_draw_cursor_partial(int x, int y, int visible_w, int visible_h
             if(screen_x < 0 || screen_y < 0 || screen_x >= mouse_state.screen_width || screen_y >= mouse_state.screen_height) {
                 continue;
             }
-            cursor_background[bg_index] = fb_get_pixel((uint32_t)screen_x, (uint32_t)screen_y);
+            cursor_background[bg_index] = fb_get_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y);
             uint32_t pix = cursor_bitmap[cy][cx];
             if(pix != 0x00000000) {
-                fb_set_pixel((uint32_t)screen_x, (uint32_t)screen_y, pix);
+                fb_set_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y, pix);
             }
         }
     }
@@ -300,7 +300,7 @@ static void mouse_draw_cursor_partial(int x, int y, int visible_w, int visible_h
     int y1 = clampi(y, 0, mouse_state.screen_height - 1);
     int x2 = clampi(x + visible_w - 1, 0, mouse_state.screen_width - 1);
     int y2 = clampi(y + visible_h - 1, 0, mouse_state.screen_height - 1);
-    fb_mark_dirty((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
+    fb_mark_dirty_unlocked((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
 }
 
 static void mouse_clear_cursor_partial(int x, int y, int visible_w, int visible_h)
@@ -342,7 +342,7 @@ static void mouse_clear_cursor_partial(int x, int y, int visible_w, int visible_
             }
             uint32_t bg = cursor_background[bg_index];
             if(bg != BG_SENTINEL) {
-                fb_set_pixel((uint32_t)screen_x, (uint32_t)screen_y, bg);
+                fb_set_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y, bg);
             }
             cursor_background[bg_index] = BG_SENTINEL;
         }
@@ -352,7 +352,7 @@ static void mouse_clear_cursor_partial(int x, int y, int visible_w, int visible_
     int y1 = clampi(y, 0, mouse_state.screen_height - 1);
     int x2 = clampi(x + visible_w - 1, 0, mouse_state.screen_width - 1);
     int y2 = clampi(y + visible_h - 1, 0, mouse_state.screen_height - 1);
-    fb_mark_dirty((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
+    fb_mark_dirty_unlocked((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
 }
 
 // Process mouse packet
@@ -616,6 +616,11 @@ static void mouse_update_cursor_internal(void)
         return;
     }
 
+    // Acquire framebuffer lock for the entire cursor update operation
+    // This prevents artifacts when console output races with cursor drawing on SMP
+    uint64_t fb_flags;
+    fb_acquire(&fb_flags);
+
     int max_x_for_partial_visibility = mouse_state.screen_width - 2;
     int max_y_for_tip_visibility = mouse_state.screen_height - TIP_VISIBLE_ROWS;
 
@@ -682,7 +687,10 @@ static void mouse_update_cursor_internal(void)
     }
 
     // Flush dirty regions to display changes
-    fb_flush_dirty_regions();
+    fb_flush_dirty_regions_unlocked();
+    
+    // Release framebuffer lock
+    fb_release(fb_flags);
 }
 
 // Update cursor position on screen (public wrapper, takes lock)

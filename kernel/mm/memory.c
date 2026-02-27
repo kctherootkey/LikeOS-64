@@ -1059,8 +1059,33 @@ bool mm_map_page(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) 
     return true;
 }
 
-// Unmap virtual page (SMP-safe)
-void mm_unmap_page(uint64_t virtual_addr) {
+// Map virtual page without TLB shootdown (for batched operations)
+// This is useful when mapping multiple pages in a loop - do a single
+// smp_tlb_shootdown_sync() after all mappings are complete.
+// Note: For fresh mappings (unmapped -> mapped), no shootdown is needed.
+// Shootdown is only needed when remapping existing pages.
+bool mm_map_page_no_shootdown(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
+    uint64_t lock_flags;
+    spin_lock_irqsave(&mm_kernel_pt_lock, &lock_flags);
+
+    uint64_t* pte = mm_get_page_table(virtual_addr, true);
+    if (!pte) {
+        spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
+        return false;
+    }
+
+    uint64_t entry = (physical_addr & ~0xFFF) | flags;
+    *pte = entry;
+
+    spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
+    mm_flush_tlb(virtual_addr);
+
+    return true;
+}
+
+// Unmap virtual page without TLB shootdown (for batched operations)
+// Caller MUST call smp_tlb_shootdown_sync() after unmapping all pages!
+void mm_unmap_page_no_shootdown(uint64_t virtual_addr) {
     uint64_t lock_flags;
     spin_lock_irqsave(&mm_kernel_pt_lock, &lock_flags);
 
@@ -1071,8 +1096,13 @@ void mm_unmap_page(uint64_t virtual_addr) {
 
     spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
     
-    // Flush local TLB first
+    // Flush local TLB only - caller is responsible for cross-CPU shootdown
     mm_flush_tlb(virtual_addr);
+}
+
+// Unmap virtual page (SMP-safe, includes TLB shootdown)
+void mm_unmap_page(uint64_t virtual_addr) {
+    mm_unmap_page_no_shootdown(virtual_addr);
     
     // On SMP, other CPUs may have this page cached - do TLB shootdown
     if (sched_is_smp()) {
@@ -2304,19 +2334,14 @@ void mm_enable_smep_smap(void) {
     // SMEP: bit 7 of EBX from CPUID, enables CR4 bit 20
     if (ebx & (1 << 7)) {
         cr4 |= (1ULL << 20);
-        kprintf("SMEP enabled (Supervisor Mode Execution Prevention)\n");
-    } else {
-        kprintf("SMEP not supported by CPU\n");
     }
     
     // SMAP: bit 20 of EBX from CPUID, enables CR4 bit 21
     if (ebx & (1 << 20)) {
         cr4 |= (1ULL << 21);
         g_smap_enabled = true;
-        kprintf("SMAP enabled (Supervisor Mode Access Prevention)\n");
     } else {
         g_smap_enabled = false;
-        kprintf("SMAP not supported by CPU\n");
     }
     
     __asm__ volatile("mov %0, %%cr4" : : "r"(cr4));
@@ -2400,7 +2425,6 @@ void mm_enable_nx(void) {
     uint64_t efer = rdmsr(MSR_EFER);
     efer |= (1ULL << 11);  // Set NXE (No-Execute Enable) bit
     wrmsr(MSR_EFER, efer);
-    kprintf("NX bit enabled in EFER\n");
 }
 
 // Identity-map physical memory for SMP AP trampoline
@@ -2429,15 +2453,17 @@ void mm_remove_smp_identity_map(uint64_t physical_addr, size_t size) {
     uint64_t page_aligned = physical_addr & ~0xFFFULL;
     uint64_t end_addr = (physical_addr + size + 0xFFF) & ~0xFFFULL;
     
+    // Unmap all pages without individual TLB shootdowns (batched for performance)
     while (page_aligned < end_addr) {
-        mm_unmap_page(page_aligned);
+        mm_unmap_page_no_shootdown(page_aligned);
         page_aligned += 0x1000;
     }
     
-    // CRITICAL: All CPUs (BSP and APs) share the kernel page tables and may
-    // have TLB entries for the trampoline identity mapping. We must invalidate
-    // them on ALL CPUs before proceeding, otherwise a CPU could use a stale
-    // TLB entry and access the wrong memory or page fault.
+    // CRITICAL: Single batched TLB shootdown. All CPUs (BSP and APs) share
+    // the kernel page tables and may have TLB entries for the trampoline
+    // identity mapping. We must invalidate them on ALL CPUs before proceeding,
+    // otherwise a CPU could use a stale TLB entry and access the wrong memory
+    // or page fault.
     if (sched_is_smp()) {
         smp_tlb_shootdown_sync();
     }
@@ -2490,10 +2516,6 @@ void mm_initialize_syscall(void) {
     // Clear IF (interrupt flag), TF (trap flag), DF (direction flag), and AC (SMAP bypass)
     // IF (bit 9) = 0x200, TF (bit 8) = 0x100, DF (bit 10) = 0x400, AC (bit 18) = 0x40000
     wrmsr(MSR_SFMASK, 0x200 | 0x100 | 0x400 | 0x40000);
-    
-    kprintf("SYSCALL/SYSRET initialized\n");
-    kprintf("  STAR = 0x%016llx\n", star);
-    kprintf("  LSTAR = 0x%016llx\n", (uint64_t)syscall_entry);
 }
 
 // ============================================================================

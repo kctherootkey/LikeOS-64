@@ -6,6 +6,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"  // For spinlock_t, sched_is_smp
+#include "../../include/kernel/smp.h"    // For smp_tlb_shootdown_sync
 
 // External debug flag from memory.c
 extern int mm_debug_pt;
@@ -473,9 +474,12 @@ void* slab_alloc(size_t size) {
             
             if (!ok) {
                 kprintf("SLAB: Failed to map large alloc page %lu\n", (unsigned long)i);
-                // Unmap what we mapped so far (each unmap includes TLB shootdown)
+                // Unmap what we mapped so far (batched shootdown for performance)
                 for (size_t j = 0; j < i; j++) {
-                    mm_unmap_page(virt_base + (j * PAGE_SIZE));
+                    mm_unmap_page_no_shootdown(virt_base + (j * PAGE_SIZE));
+                }
+                if (i > 0 && sched_is_smp()) {
+                    smp_tlb_shootdown_sync();
                 }
                 mm_free_contiguous_pages(phys_pages, page_count);
                 return NULL;
@@ -586,9 +590,14 @@ void slab_free(void* ptr) {
         uint64_t virt_addr = (uint64_t)large_header;
         size_t alloc_bytes = page_count * PAGE_SIZE;
         
-        // Unmap all pages (each unmap includes TLB shootdown on SMP)
+        // Unmap all pages WITHOUT individual TLB shootdowns (batched for performance)
         for (size_t i = 0; i < page_count; i++) {
-            mm_unmap_page(virt_addr + (i * PAGE_SIZE));
+            mm_unmap_page_no_shootdown(virt_addr + (i * PAGE_SIZE));
+        }
+        
+        // Single batched TLB shootdown after all unmaps
+        if (sched_is_smp()) {
+            smp_tlb_shootdown_sync();
         }
         
         // Free the physical pages

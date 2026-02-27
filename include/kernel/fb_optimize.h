@@ -68,6 +68,17 @@ const char* cpu_features_to_string(uint32_t features);
 int configure_write_combining_mtrr(uint64_t fb_base, uint64_t fb_size);
 int verify_write_combining(uint64_t fb_base);
 
+// SMP-safe framebuffer locking
+// Use these to perform atomic multi-pixel operations (e.g., cursor drawing)
+void fb_acquire(uint64_t* saved_flags);
+void fb_release(uint64_t saved_flags);
+
+// Unlocked variants - use ONLY when caller already holds fb_lock via fb_acquire()
+void fb_set_pixel_unlocked(uint32_t x, uint32_t y, uint32_t color);
+uint32_t fb_get_pixel_unlocked(uint32_t x, uint32_t y);
+void fb_mark_dirty_unlocked(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2);
+void fb_flush_dirty_regions_unlocked(void);
+
 // Double buffering operations
 void fb_mark_dirty(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2);
 void fb_mark_full_dirty(void);

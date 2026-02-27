@@ -694,8 +694,6 @@ void tss_init_ap(uint32_t cpu_id) {
     
     // Load Task Register (selector 0x28 = entry 5)
     __asm__ volatile("ltr %0" : : "r"((uint16_t)0x28));
-    
-    kprintf("TSS installed for AP %u\n", cpu_id);
 }
 
 // Get IDT descriptor for AP initialization

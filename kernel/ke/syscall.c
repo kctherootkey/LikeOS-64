@@ -979,7 +979,7 @@ static int64_t sys_uname(uint64_t buf) {
     mm_memset(&u, 0, sizeof(u));
     const char* sys = "LikeOS";
     const char* node = "likeos";
-    const char* rel = "0.2-preempt";
+    const char* rel = "0.2-preempt-smp";
     const char* ver = "LikeOS-64";
     const char* mach = "x86_64";
     mm_memcpy(u.sysname, sys, 7);

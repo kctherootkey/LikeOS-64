@@ -1,5 +1,17 @@
 // LikeOS-64 Per-CPU Preemptive Scheduler
-// True per-CPU run queues with global task list for admin operations.
+// ============================================================================
+// SCHEDULER TYPE: O(1) RR with Preemption
+// ============================================================================
+//
+// This is a simple O(1) preemptive RR scheduler with per-CPU run
+// queues. Both enqueue and dequeue operations are O(1) using FIFO linked lists.
+//
+// Key characteristics:
+//   - Time complexity: O(1) for enqueue, dequeue, and context switch
+//   - Scheduling policy: RR with fixed time slices (SCHED_TIME_SLICE)
+//   - Preemption: Timer-driven preemptive multitasking via sched_preempt()
+//   - SMP support: True per-CPU run queues with load balancing
+//   - No priority levels (all tasks are equal priority)
 //
 // Architecture:
 //   - Each CPU has its own run queue (percpu->runqueue_head/tail) protected

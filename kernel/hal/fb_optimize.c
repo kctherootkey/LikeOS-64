@@ -437,9 +437,14 @@ void fb_mark_dirty(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2)
 {
     uint64_t flags;
     spin_lock_irqsave(&fb_lock, &flags);
+    fb_mark_dirty_unlocked(x1, y1, x2, y2);
+    spin_unlock_irqrestore(&fb_lock, flags);
+}
 
+// Unlocked variant - caller must hold fb_lock
+void fb_mark_dirty_unlocked(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2)
+{
     if(!g_initialized) {
-        spin_unlock_irqrestore(&fb_lock, flags);
         return;
     }
     // Clamp coordinates to screen bounds
@@ -469,7 +474,6 @@ void fb_mark_dirty(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2)
     // If we're at maximum dirty regions, mark full screen dirty
     if(g_double_buffer.num_dirty_regions >= g_double_buffer.max_dirty_regions) {
         g_double_buffer.full_screen_dirty = 1;
-        spin_unlock_irqrestore(&fb_lock, flags);
         return;
     }
     // Add new dirty region
@@ -482,8 +486,6 @@ void fb_mark_dirty(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2)
     g_double_buffer.num_dirty_regions++;
     // Try to merge overlapping regions to optimize performance
     merge_dirty_regions();
-
-    spin_unlock_irqrestore(&fb_lock, flags);
 }
 
 // Mark the entire screen as dirty
@@ -507,9 +509,14 @@ void fb_flush_dirty_regions(void)
 {
     uint64_t flags;
     spin_lock_irqsave(&fb_lock, &flags);
+    fb_flush_dirty_regions_unlocked();
+    spin_unlock_irqrestore(&fb_lock, flags);
+}
 
+// Unlocked variant - caller must hold fb_lock via fb_acquire()
+void fb_flush_dirty_regions_unlocked(void)
+{
     if(!g_initialized) {
-        spin_unlock_irqrestore(&fb_lock, flags);
         return;
     }
     g_double_buffer.total_updates++;
@@ -520,7 +527,6 @@ void fb_flush_dirty_regions(void)
         g_double_buffer.pixels_copied += g_double_buffer.width * g_double_buffer.height;
         g_double_buffer.full_screen_dirty = 0;
         g_double_buffer.num_dirty_regions = 0;
-        spin_unlock_irqrestore(&fb_lock, flags);
         return;
     }
     // Copy individual dirty regions
@@ -564,8 +570,6 @@ void fb_flush_dirty_regions(void)
     }
     // Clear dirty regions
     g_double_buffer.num_dirty_regions = 0;
-
-    spin_unlock_irqrestore(&fb_lock, flags);
 }
 
 // Clear all dirty regions without flushing
@@ -593,8 +597,47 @@ void fb_set_pixel(uint32_t x, uint32_t y, uint32_t color)
     fb_mark_dirty(x, y, x, y);
 }
 
+// Unlocked variant - caller must hold fb_lock via fb_acquire()
+void fb_set_pixel_unlocked(uint32_t x, uint32_t y, uint32_t color)
+{
+    if(!g_initialized) {
+        return;
+    }
+    if(x >= g_double_buffer.width || y >= g_double_buffer.height) {
+        return;
+    }
+    uint32_t offset = y * g_double_buffer.pitch + x;
+    g_double_buffer.back_buffer[offset] = color;
+    fb_mark_dirty_unlocked(x, y, x, y);
+}
+
+// SMP-safe framebuffer locking for multi-pixel operations
+// Caller must provide storage for saved interrupt flags to avoid SMP corruption.
+void fb_acquire(uint64_t* saved_flags)
+{
+    spin_lock_irqsave(&fb_lock, saved_flags);
+}
+
+void fb_release(uint64_t saved_flags)
+{
+    spin_unlock_irqrestore(&fb_lock, saved_flags);
+}
+
 // Get pixel from back buffer (never read from front buffer)
 uint32_t fb_get_pixel(uint32_t x, uint32_t y)
+{
+    if(!g_initialized) {
+        return 0;
+    }
+    if(x >= g_double_buffer.width || y >= g_double_buffer.height) {
+        return 0;
+    }
+    uint32_t offset = y * g_double_buffer.pitch + x;
+    return g_double_buffer.back_buffer[offset];
+}
+
+// Unlocked variant - caller must hold fb_lock via fb_acquire()
+uint32_t fb_get_pixel_unlocked(uint32_t x, uint32_t y)
 {
     if(!g_initialized) {
         return 0;
