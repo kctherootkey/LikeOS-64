@@ -793,8 +793,15 @@ void sched_remove_task(task_t* task) {
         task->pml4 = NULL;
     }
 
-    // Free kernel stack
+    // Free kernel stack - but first ensure no CPU is still using it.
+    // On SMP, a CPU may have just switched away from this task but still be
+    // in the context switch epilogue using the old stack. The TLB shootdown
+    // acts as a cross-CPU synchronization barrier: after it completes, all
+    // other CPUs have executed the IPI handler and are no longer mid-switch.
     if (task->kernel_stack_base && task->privilege == TASK_USER) {
+        if (smp_is_enabled()) {
+            smp_tlb_shootdown_sync();  // Synchronize with all CPUs
+        }
         kfree(task->kernel_stack_base);
     }
 
