@@ -24,6 +24,11 @@ struct tty;
 // SMP-READY SPINLOCK IMPLEMENTATION
 // ============================================================================
 
+// UP (Uniprocessor) mode flag - when set, spinlocks only use interrupt disable
+// This avoids deadlocks on single-CPU systems where spinning would be fatal
+// Defined in smp.c, set to 1 if only one CPU is active
+extern volatile uint32_t g_smp_up_mode;
+
 typedef struct spinlock {
     volatile uint32_t locked;    // 0 = unlocked, 1 = locked
     volatile uint32_t owner_cpu; // For debugging: CPU that holds lock (0xFFFFFFFF = none)
@@ -41,7 +46,17 @@ static inline void spinlock_init(spinlock_t* lock, const char* name) {
 }
 
 // Acquire spinlock (SMP-safe using atomic compare-and-swap)
+// On UP systems, we don't spin - interrupts must be disabled by caller
 static inline void spin_lock(spinlock_t* lock) {
+    // In UP mode, if interrupts are disabled, no other context can run,
+    // so we can "acquire" the lock without spinning
+    if (g_smp_up_mode) {
+        // Just mark as locked for debugging/assertions
+        __asm__ volatile("" ::: "memory");
+        lock->locked = 1;
+        return;
+    }
+    // SMP mode: actual spinlock with atomic CAS
     while (1) {
         uint32_t expected = 0;
         uint32_t desired = 1;
@@ -63,6 +78,13 @@ static inline void spin_lock(spinlock_t* lock) {
 
 // Try to acquire spinlock, return 1 if acquired, 0 if failed
 static inline int spin_trylock(spinlock_t* lock) {
+    // In UP mode, always succeed if interrupts are disabled
+    if (g_smp_up_mode) {
+        __asm__ volatile("" ::: "memory");
+        lock->locked = 1;
+        return 1;
+    }
+    // SMP mode: actual atomic trylock
     uint32_t expected = 0;
     uint32_t desired = 1;
     uint32_t old;
@@ -212,7 +234,10 @@ typedef struct task {
     void* arg;             // Entry argument
     task_state_t state;
     task_privilege_t privilege;  // Ring level
-    struct task* next;     // Scheduler circular list
+    struct task* next;     // Global task list link (linear, all tasks)
+    struct task* rq_next;   // Per-CPU run queue link (NULL when not in rq)
+    uint32_t on_cpu;        // CPU this task is assigned to
+    bool on_rq;             // Whether currently in a per-CPU run queue
     int id;
     
     // Preemption support
@@ -292,12 +317,17 @@ void sched_set_need_resched(task_t* t);        // Mark task as needing reschedul
 void sched_wake_expired_sleepers(uint64_t current_tick);  // Wake tasks whose sleep timer expired
 void sched_wake_channel(void* channel);        // Wake all tasks waiting on a channel
 
-// Scheduler lock for SMP safety
-extern spinlock_t g_sched_lock;
+// Global task list lock (protects the all-tasks linked list)
+extern spinlock_t g_task_list_lock;
 
 // SMP support
 void sched_enable_smp(void);   // Called after per-CPU init to enable per-CPU current task
 int sched_is_smp(void);        // Check if SMP mode is enabled
+
+// Per-CPU scheduling API
+void sched_init_ap(uint32_t cpu_id);     // Initialize per-CPU scheduler for AP
+void sched_enqueue_ready(task_t* task);  // Enqueue task to its assigned CPU's run queue
+void sched_load_balance(void);           // Pull tasks from busiest CPU (called from timer)
 
 // Process management
 task_t* sched_fork_current(void);           // Fork current task with COW
@@ -313,5 +343,4 @@ void sched_signal_task(task_t* task, int sig);
 void sched_signal_pgrp(int pgid, int sig);
 int sched_pgid_exists(int pgid);
 void sched_dump_tasks(void);  // Debug: dump all task states
-
 #endif // _KERNEL_SCHED_H_

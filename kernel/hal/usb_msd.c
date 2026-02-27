@@ -363,10 +363,15 @@ int usb_msd_block_read(block_device_t* dev, unsigned long lba, unsigned long cou
         return ST_NO_DEVICE;
     }
     
+    // Serialize I/O to this device (SMP: prevent concurrent XHCI transfers)
+    uint64_t flags;
+    spin_lock_irqsave(&msd->io_lock, &flags);
+    
     // Read in 4KB chunks (8 sectors) for reliable USB transfers on real hardware
     uint8_t* ptr = (uint8_t*)buf;
     unsigned long remaining = count;
     unsigned long current_lba = lba;
+    int result = ST_OK;
     
     while (remaining > 0) {
         unsigned long chunk = (remaining > 8) ? 8 : remaining;
@@ -374,7 +379,8 @@ int usb_msd_block_read(block_device_t* dev, unsigned long lba, unsigned long cou
         int st = usb_msd_read(msd, (uint32_t)current_lba, (uint32_t)chunk, ptr);
         if (st != ST_OK) {
             msd_dbg("Block read failed at LBA %lu: st=%d\n", current_lba, st);
-            return st;
+            result = st;
+            break;
         }
         
         ptr += chunk * msd->block_size;
@@ -382,7 +388,8 @@ int usb_msd_block_read(block_device_t* dev, unsigned long lba, unsigned long cou
         remaining -= chunk;
     }
     
-    return ST_OK;
+    spin_unlock_irqrestore(&msd->io_lock, flags);
+    return result;
 }
 
 int usb_msd_block_write(block_device_t* dev, unsigned long lba, unsigned long count, const void* buf) {
@@ -392,16 +399,22 @@ int usb_msd_block_write(block_device_t* dev, unsigned long lba, unsigned long co
         return ST_NO_DEVICE;
     }
     
+    // Serialize I/O to this device (SMP: prevent concurrent XHCI transfers)
+    uint64_t flags;
+    spin_lock_irqsave(&msd->io_lock, &flags);
+    
     const uint8_t* ptr = (const uint8_t*)buf;
     unsigned long remaining = count;
     unsigned long current_lba = lba;
+    int result = ST_OK;
     
     while (remaining > 0) {
         unsigned long chunk = (remaining > 256) ? 256 : remaining;
         
         int st = usb_msd_write(msd, (uint32_t)current_lba, (uint32_t)chunk, ptr);
         if (st != ST_OK) {
-            return st;
+            result = st;
+            break;
         }
         
         ptr += chunk * msd->block_size;
@@ -409,7 +422,8 @@ int usb_msd_block_write(block_device_t* dev, unsigned long lba, unsigned long co
         remaining -= chunk;
     }
     
-    return ST_OK;
+    spin_unlock_irqrestore(&msd->io_lock, flags);
+    return result;
 }
 
 int usb_msd_block_sync(block_device_t* dev) {
@@ -419,7 +433,12 @@ int usb_msd_block_sync(block_device_t* dev) {
         return ST_NO_DEVICE;
     }
     
-    return usb_msd_sync(msd);
+    // Serialize I/O to this device (SMP: prevent concurrent XHCI transfers)
+    uint64_t flags;
+    spin_lock_irqsave(&msd->io_lock, &flags);
+    int result = usb_msd_sync(msd);
+    spin_unlock_irqrestore(&msd->io_lock, flags);
+    return result;
 }
 
 //=============================================================================
@@ -433,6 +452,9 @@ int usb_msd_init(usb_msd_device_t* msd, usb_device_t* dev, xhci_controller_t* ct
     msd->usb_dev = dev;
     msd->ctrl = ctrl;
     msd->next_tag = 0x12340000;
+    
+    // Initialize per-device I/O lock for SMP safety
+    spinlock_init(&msd->io_lock, "msd_io");
     
     msd_dbg("Initializing MSD device...\n");
     

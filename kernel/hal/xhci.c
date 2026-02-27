@@ -29,6 +29,26 @@ xhci_controller_t g_xhci;
 // Spinlock for xHCI controller access
 static spinlock_t xhci_lock = SPINLOCK_INIT("xhci");
 
+// Process events while holding xhci_lock with IRQs disabled.
+// This serialises against the IRQ handler (xhci_irq_service) and prevents
+// concurrent/reentrant access to the event ring (dequeue, cycle, ERDP).
+void xhci_process_events_locked(xhci_controller_t* ctrl) {
+    uint64_t flags;
+    spin_lock_irqsave(&xhci_lock, &flags);
+    xhci_process_events(ctrl);
+    spin_unlock_irqrestore(&xhci_lock, flags);
+}
+
+// Safely clear pending_xfer pointer under lock to prevent race with IRQ handler.
+// Must be called before returning from any transfer function to prevent the IRQ
+// handler from writing to a stale stack address.
+static inline void xhci_clear_pending_xfer(xhci_controller_t* ctrl, uint8_t slot, uint8_t dci) {
+    uint64_t flags;
+    spin_lock_irqsave(&xhci_lock, &flags);
+    ctrl->pending_xfer[slot - 1][dci] = NULL;
+    spin_unlock_irqrestore(&xhci_lock, flags);
+}
+
 // Internal helper prototypes
 static void xhci_setup_scratchpad(xhci_controller_t* ctrl);
 static int xhci_wait_ready(xhci_controller_t* ctrl, uint32_t timeout_ms);
@@ -1260,7 +1280,7 @@ int xhci_send_command(xhci_controller_t* ctrl, uint64_t param, uint32_t status, 
 int xhci_wait_command(xhci_controller_t* ctrl, uint32_t timeout_ms) {
     for (uint32_t i = 0; i < timeout_ms * 10; i++) {  // 10x iterations with 100us delays
         // Process events (either from interrupt or polling)
-        xhci_process_events(ctrl);
+        xhci_process_events_locked(ctrl);
         
         if (g_cmd_complete) {
             if (g_cmd_cc == TRB_CC_SUCCESS) {
@@ -1564,7 +1584,7 @@ int xhci_port_reset(xhci_controller_t* ctrl, uint8_t port) {
         delay_ms(1);
         
         // Poll events - xHC may need this to update port status
-        xhci_process_events(ctrl);
+        xhci_process_events_locked(ctrl);
         
         portsc = xhci_op_read32(ctrl, off);
         
@@ -1598,7 +1618,7 @@ int xhci_port_reset(xhci_controller_t* ctrl, uint8_t port) {
         delay_ms(1);
         
         // Poll events - xHC may need this to update port status
-        xhci_process_events(ctrl);
+        xhci_process_events_locked(ctrl);
         
         portsc = xhci_op_read32(ctrl, off);
         
@@ -2154,10 +2174,10 @@ int xhci_control_transfer(xhci_controller_t* ctrl, usb_device_t* dev,
     
     // Wait for completion (only Status TRB has IOC, so one event expected)
     for (int i = 0; i < 1000; i++) {
-        xhci_process_events(ctrl);
+        xhci_process_events_locked(ctrl);
         
         if (xfer.completed) {
-            ctrl->pending_xfer[slot - 1][1] = NULL;
+            xhci_clear_pending_xfer(ctrl, slot, 1);
             
             if (xfer.cc == TRB_CC_SUCCESS || xfer.cc == TRB_CC_SHORT_PACKET) {
                 return ST_OK;
@@ -2170,7 +2190,7 @@ int xhci_control_transfer(xhci_controller_t* ctrl, usb_device_t* dev,
     }
     
     // Timeout
-    ctrl->pending_xfer[slot - 1][1] = NULL;
+    xhci_clear_pending_xfer(ctrl, slot, 1);
     return ST_TIMEOUT;
 }
 
@@ -2298,10 +2318,10 @@ int xhci_bulk_transfer_in(xhci_controller_t* ctrl, usb_device_t* dev,
     
     // Wait for completion (ultra-fast polling with 100us delays)
     for (int i = 0; i < 50000; i++) {  // 5 second timeout total
-        xhci_process_events(ctrl);
+        xhci_process_events_locked(ctrl);
         
         if (xfer.completed) {
-            ctrl->pending_xfer[slot - 1][dci] = NULL;
+            xhci_clear_pending_xfer(ctrl, slot, dci);
             
             // Compiler barrier — x86 DMA is cache-coherent so mfence is not
             // needed; just prevent compiler from caching stale values.
@@ -2389,7 +2409,7 @@ int xhci_bulk_transfer_in(xhci_controller_t* ctrl, usb_device_t* dev,
             usbsts, usbcmd, (usbsts >> 0) & 1, (usbsts >> 2) & 1);
     kprintf("[XHCI] ==========================\n");
     
-    ctrl->pending_xfer[slot - 1][dci] = NULL;
+    xhci_clear_pending_xfer(ctrl, slot, dci);
     return ST_TIMEOUT;
 }
 
@@ -2419,10 +2439,10 @@ int xhci_bulk_transfer_out(xhci_controller_t* ctrl, usb_device_t* dev,
     
     // Wait for completion (ultra-fast polling with 100us delays)
     for (int i = 0; i < 50000; i++) {  // 5 second timeout total
-        xhci_process_events(ctrl);
+        xhci_process_events_locked(ctrl);
         
         if (xfer.completed) {
-            ctrl->pending_xfer[slot - 1][dci] = NULL;
+            xhci_clear_pending_xfer(ctrl, slot, dci);
             
             if (transferred) {
                 *transferred = len - xfer.bytes_transferred;
@@ -2464,7 +2484,7 @@ int xhci_bulk_transfer_out(xhci_controller_t* ctrl, usb_device_t* dev,
         delay_us(100);  // 100 microsecond delay for ultra-fast response
     }
     
-    ctrl->pending_xfer[slot - 1][dci] = NULL;
+    xhci_clear_pending_xfer(ctrl, slot, dci);
     return ST_TIMEOUT;
 }
 
@@ -2497,10 +2517,10 @@ int xhci_bulk_transfer_in_sg(xhci_controller_t* ctrl, usb_device_t* dev,
     
     // Wait for completion
     for (int i = 0; i < 50000; i++) {  // 5 second timeout
-        xhci_process_events(ctrl);
+        xhci_process_events_locked(ctrl);
         
         if (xfer.completed) {
-            ctrl->pending_xfer[slot - 1][dci] = NULL;
+            xhci_clear_pending_xfer(ctrl, slot, dci);
             
             __asm__ volatile("" ::: "memory");  // compiler barrier only (x86 DMA is coherent)
             
@@ -2540,7 +2560,7 @@ int xhci_bulk_transfer_in_sg(xhci_controller_t* ctrl, usb_device_t* dev,
         delay_us(100);
     }
     
-    ctrl->pending_xfer[slot - 1][dci] = NULL;
+    xhci_clear_pending_xfer(ctrl, slot, dci);
     return ST_TIMEOUT;
 }
 
@@ -2569,10 +2589,10 @@ int xhci_bulk_transfer_out_sg(xhci_controller_t* ctrl, usb_device_t* dev,
     
     // Wait for completion
     for (int i = 0; i < 50000; i++) {  // 5 second timeout
-        xhci_process_events(ctrl);
+        xhci_process_events_locked(ctrl);
         
         if (xfer.completed) {
-            ctrl->pending_xfer[slot - 1][dci] = NULL;
+            xhci_clear_pending_xfer(ctrl, slot, dci);
             
             if (transferred) {
                 *transferred = len - xfer.bytes_transferred;
@@ -2611,7 +2631,7 @@ int xhci_bulk_transfer_out_sg(xhci_controller_t* ctrl, usb_device_t* dev,
         delay_us(100);
     }
     
-    ctrl->pending_xfer[slot - 1][dci] = NULL;
+    xhci_clear_pending_xfer(ctrl, slot, dci);
     return ST_TIMEOUT;
 }
 

@@ -20,7 +20,25 @@
 
 struct percpu {
     // Self-pointer for quick access (GS:0 == &this_percpu)
-    struct percpu* self;
+    struct percpu* self;                      // GS:0
+    
+    // Syscall scratch area — accessed from assembly via GS: prefix.
+    // MUST remain at FIXED offsets; NASM constants in syscall.asm depend on this.
+    uint64_t syscall_kernel_rsp;              // GS:8   — kernel RSP for current user task
+    uint64_t syscall_user_rsp;                // GS:16  — scratch: saves user RSP on syscall entry
+    
+    // Per-CPU syscall context (for signal delivery, fork, etc.)
+    // These replace the global syscall_saved_user_* variables.
+    uint64_t syscall_saved_user_rip;          // GS:24  — user RIP for sysret
+    uint64_t syscall_saved_user_rflags;       // GS:32  — user RFLAGS for sysret
+    uint64_t syscall_saved_user_rbp;          // GS:40  — callee-saved
+    uint64_t syscall_saved_user_rbx;          // GS:48  — callee-saved
+    uint64_t syscall_saved_user_r12;          // GS:56  — callee-saved
+    uint64_t syscall_saved_user_r13;          // GS:64  — callee-saved
+    uint64_t syscall_saved_user_r14;          // GS:72  — callee-saved
+    uint64_t syscall_saved_user_r15;          // GS:80  — callee-saved
+    uint64_t syscall_saved_user_rax;          // GS:88  — syscall return value
+    uint64_t syscall_signal_pending;          // GS:96  — signal number if pending, 0 otherwise
     
     // CPU identification
     uint32_t cpu_id;            // Logical CPU index (0 = BSP)
@@ -62,10 +80,26 @@ struct percpu {
     // struct gdt_entry* gdt;
     
     // Padding to ensure page alignment and cache line separation
-    uint8_t padding[PERCPU_SIZE - 128];  // Adjust based on actual struct size
+    uint8_t padding[PERCPU_SIZE - 224];  // Adjust based on actual struct size (was 144, added 80 for syscall context)
 } __attribute__((aligned(64)));
 
 typedef struct percpu percpu_t;
+
+// Static assertions to verify structure layout matches assembly constants
+// These MUST match the %define constants in syscall.asm
+_Static_assert(__builtin_offsetof(percpu_t, self) == 0, "percpu: self must be at offset 0");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_kernel_rsp) == 8, "percpu: syscall_kernel_rsp must be at offset 8");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_user_rsp) == 16, "percpu: syscall_user_rsp must be at offset 16");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_rip) == 24, "percpu: syscall_saved_user_rip must be at offset 24");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_rflags) == 32, "percpu: syscall_saved_user_rflags must be at offset 32");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_rbp) == 40, "percpu: syscall_saved_user_rbp must be at offset 40");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_rbx) == 48, "percpu: syscall_saved_user_rbx must be at offset 48");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_r12) == 56, "percpu: syscall_saved_user_r12 must be at offset 56");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_r13) == 64, "percpu: syscall_saved_user_r13 must be at offset 64");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_r14) == 72, "percpu: syscall_saved_user_r14 must be at offset 72");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_r15) == 80, "percpu: syscall_saved_user_r15 must be at offset 80");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_rax) == 88, "percpu: syscall_saved_user_rax must be at offset 88");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_signal_pending) == 96, "percpu: syscall_signal_pending must be at offset 96");
 
 // ============================================================================
 // Per-CPU Access Macros

@@ -105,8 +105,15 @@ void smp_send_reschedule(uint32_t cpu_id);
 // Send reschedule IPI to all other CPUs
 void smp_send_reschedule_all(void);
 
-// Send TLB shootdown IPI to all other CPUs
+// Send TLB shootdown IPI to all other CPUs (asynchronous)
 void smp_tlb_shootdown(void);
+
+// Send TLB shootdown IPI and wait for all CPUs to acknowledge (synchronous).
+// Use this when virtual addresses are about to be recycled after unmapping.
+void smp_tlb_shootdown_sync(void);
+
+// Called by TLB shootdown IPI handler to acknowledge completion
+void smp_tlb_shootdown_ack(void);
 
 // Halt all other CPUs (for panic)
 void smp_halt_others(void);

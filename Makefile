@@ -441,6 +441,18 @@ qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
 		-device usb-storage,drive=usbdisk -machine type=pc,accel=kvm:tcg
 
+# Run with ISO boot plus xHCI + USB mass storage, with GDB support and debug symbols
+# Connect with: gdb build/kernel.elf -ex "target remote :1234"
+qemu-usb-gdb:
+	@echo "Rebuilding kernel with debug symbols (-g)..."
+	$(MAKE) clean
+	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" $(ISO_IMAGE) $(DATA_IMAGE)
+	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage + GDB server on :1234..."
+	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio $(QEMU_SMP) \
+		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
+		-device usb-storage,drive=usbdisk -machine type=pc,accel=kvm:tcg -s -S -monitor telnet:127.0.0.1:5555,server,nowait -d int 2> /tmp/qemu_int_log
+
 # Run with real USB device (like /dev/sdb) as xHCI USB mass storage - boots from USB only
 # Usage: make qemu-realusb USB_DEVICE=/dev/sdb
 qemu-realusb:

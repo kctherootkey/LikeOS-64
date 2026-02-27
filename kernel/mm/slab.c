@@ -5,7 +5,7 @@
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
-#include "../../include/kernel/sched.h"  // For spinlock_t
+#include "../../include/kernel/sched.h"  // For spinlock_t, sched_is_smp
 
 // External debug flag from memory.c
 extern int mm_debug_pt;
@@ -115,18 +115,25 @@ static void slab_free_virt_range(uint64_t start, size_t size) {
 
 // Allocate a virtual address for a slab page (single page)
 static uint64_t slab_alloc_virt_addr(void) {
+    uint64_t flags;
+    spin_lock_irqsave(&slab_global_lock, &flags);
+
     // First try free list
     uint64_t addr = slab_alloc_virt_range(PAGE_SIZE);
     if (addr) {
+        spin_unlock_irqrestore(&slab_global_lock, flags);
         return addr;
     }
     
     if (slab_next_virt_addr >= SLAB_VIRT_END) {
+        spin_unlock_irqrestore(&slab_global_lock, flags);
         kprintf("SLAB: Virtual address space exhausted!\n");
         return 0;
     }
     addr = slab_next_virt_addr;
     slab_next_virt_addr += PAGE_SIZE;
+
+    spin_unlock_irqrestore(&slab_global_lock, flags);
     return addr;
 }
 
@@ -311,14 +318,17 @@ static void slab_free_page(slab_page_t* slab) {
     uint64_t phys_addr = slab->phys_addr;
     uint64_t virt_addr = (uint64_t)slab;
     
-    // Unmap the virtual address
+    // Unmap the virtual address (includes TLB shootdown on SMP)
     mm_unmap_page(virt_addr);
     
     // Free the physical page
     mm_free_physical_page(phys_addr);
     
-    // Reclaim the virtual address for reuse
-    slab_free_virt_addr(virt_addr);
+    // Reclaim the virtual address for reuse (protected by global lock)
+    uint64_t vflags;
+    spin_lock_irqsave(&slab_global_lock, &vflags);
+    slab_free_virt_range(virt_addr, PAGE_SIZE);
+    spin_unlock_irqrestore(&slab_global_lock, vflags);
 }
 
 // Move slab between lists (partial <-> full <-> empty)
@@ -419,11 +429,20 @@ void* slab_alloc(size_t size) {
             return NULL;
         }
         
+        // Acquire global lock to protect virtual address allocation.
+        // On SMP, two CPUs calling slab_alloc concurrently could read the
+        // same slab_next_virt_addr and get overlapping virtual ranges,
+        // causing mm_map_page to overwrite each other's page table entries
+        // and aliasing two allocations to the same physical pages.
+        uint64_t flags;
+        spin_lock_irqsave(&slab_global_lock, &flags);
+
         // Try to get virtual address from free list first
         uint64_t virt_base = slab_alloc_virt_range(alloc_bytes);
         if (!virt_base) {
             // Fall back to allocating new virtual address space
             if (slab_next_virt_addr + alloc_bytes > SLAB_VIRT_END) {
+                spin_unlock_irqrestore(&slab_global_lock, flags);
                 kprintf("SLAB: Virtual address space exhausted for large alloc\n");
                 kprintf("SLAB: requested=%lu pages, next_virt=0x%lx, end=0x%lx\n",
                         (unsigned long)page_count, slab_next_virt_addr, SLAB_VIRT_END);
@@ -438,8 +457,15 @@ void* slab_alloc(size_t size) {
             virt_base = slab_next_virt_addr;
             slab_next_virt_addr += alloc_bytes;
         }
+
+        // Update stats while holding lock
+        slab_global_stats.large_allocations++;
+        slab_global_stats.total_allocations++;
+        slab_global_stats.total_pages_used += page_count;
+
+        spin_unlock_irqrestore(&slab_global_lock, flags);
         
-        // Map all pages
+        // Map all pages (done outside lock — mm_map_page may be slow)
         for (size_t i = 0; i < page_count; i++) {
             uint64_t vaddr = virt_base + (i * PAGE_SIZE);
             uint64_t paddr = phys_pages + (i * PAGE_SIZE);
@@ -447,7 +473,7 @@ void* slab_alloc(size_t size) {
             
             if (!ok) {
                 kprintf("SLAB: Failed to map large alloc page %lu\n", (unsigned long)i);
-                // Unmap what we mapped so far
+                // Unmap what we mapped so far (each unmap includes TLB shootdown)
                 for (size_t j = 0; j < i; j++) {
                     mm_unmap_page(virt_base + (j * PAGE_SIZE));
                 }
@@ -462,13 +488,6 @@ void* slab_alloc(size_t size) {
         header->page_count = page_count;
         header->size = size;
         header->phys_addr = phys_pages;
-        
-        uint64_t flags;
-        spin_lock_irqsave(&slab_global_lock, &flags);
-        slab_global_stats.large_allocations++;
-        slab_global_stats.total_allocations++;
-        slab_global_stats.total_pages_used += page_count;
-        spin_unlock_irqrestore(&slab_global_lock, flags);
         
         return (uint8_t*)header + sizeof(large_alloc_header_t);
     }
@@ -567,7 +586,7 @@ void slab_free(void* ptr) {
         uint64_t virt_addr = (uint64_t)large_header;
         size_t alloc_bytes = page_count * PAGE_SIZE;
         
-        // Unmap all pages
+        // Unmap all pages (each unmap includes TLB shootdown on SMP)
         for (size_t i = 0; i < page_count; i++) {
             mm_unmap_page(virt_addr + (i * PAGE_SIZE));
         }

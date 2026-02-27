@@ -106,9 +106,9 @@ protected_mode:
     wrmsr
     
     ; Enable paging (CR0.PG) - this activates long mode
-    mov eax, cr0
-    or eax, (1 << 31)   ; PG
-    or eax, (1 << 16)   ; WP (Write Protect)
+    ; After INIT, CR0 has CD=1, NW=1 (caching disabled). Set exact value
+    ; to match BSP: PG|WP|NE|ET|MP|PE = 0x80010033
+    mov eax, 0x80010033
     mov cr0, eax
     
     ; Far jump to 64-bit long mode code using patched jump pointer

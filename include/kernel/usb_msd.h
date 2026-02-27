@@ -6,6 +6,7 @@
 #include "status.h"
 #include "xhci.h"
 #include "block.h"
+#include "sched.h"
 
 // USB Mass Storage class codes
 #define USB_CLASS_MASS_STORAGE      0x08
@@ -98,6 +99,9 @@ typedef struct usb_msd_device {
     
     // Transaction tracking
     uint32_t next_tag;
+    
+    // Per-device lock for serializing I/O (SMP safety)
+    spinlock_t io_lock;
     
     // Block device
     block_device_t blk;

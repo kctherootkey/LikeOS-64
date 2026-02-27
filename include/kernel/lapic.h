@@ -112,6 +112,10 @@ void lapic_write(uint32_t reg, uint32_t value);
 // Get the current CPU's APIC ID
 uint32_t lapic_get_id(void);
 
+// Get APIC ID via CPUID (safe to call before lapic_init)
+// Use this during early AP startup before LAPIC is fully initialized
+uint32_t lapic_get_id_cpuid(void);
+
 // Send End-Of-Interrupt to LAPIC
 void lapic_eoi(void);
 

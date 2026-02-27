@@ -127,11 +127,11 @@ int vfs_mkdir(const char* path, unsigned int mode) { if (!g_root_ops || !g_root_
 int vfs_rmdir(const char* path) { if (!g_root_ops || !g_root_ops->rmdir) return ST_UNSUPPORTED; return g_root_ops->rmdir(path); }
 
 int vfs_close(vfs_file_t* f) {
-    if (!f || !f->ops || !f->ops->close) return ST_INVALID;
+     if (!f || !f->ops || !f->ops->close) return ST_INVALID;
     
-    // Decrement refcount
-    if (f->refcount > 1) {
-        f->refcount--;
+    // Atomically decrement refcount; only the thread that transitions 1→0 closes
+    int old = __sync_fetch_and_sub(&f->refcount, 1);
+    if (old > 1) {
         return ST_OK;
     }
     
@@ -142,13 +142,14 @@ int vfs_close(vfs_file_t* f) {
 // Duplicate file descriptor - increment refcount
 vfs_file_t* vfs_dup(vfs_file_t* f) {
     if (!f) return NULL;
-    f->refcount++;
+
+    __sync_fetch_and_add(&f->refcount, 1);
     return f;
 }
 
 // Just increment refcount
 void vfs_incref(vfs_file_t* f) {
-    if (f) f->refcount++;
+    if (f) __sync_fetch_and_add(&f->refcount, 1);
 }
 
 size_t vfs_size(vfs_file_t* f) {

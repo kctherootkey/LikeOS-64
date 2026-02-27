@@ -16,6 +16,7 @@
 #include "../../include/kernel/devfs.h"
 #include "../../include/kernel/dirent.h"
 #include "../../include/kernel/serial.h"
+#include "../../include/kernel/percpu.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
@@ -237,7 +238,9 @@ static int64_t pipe_read_to_user(pipe_end_t* end, uint64_t buf, uint64_t count) 
             spin_unlock_irqrestore(&pipe->lock, flags);
             sched_schedule();
             spin_lock_irqsave(&pipe->lock, &flags);
-            cur->state = TASK_READY;
+            // NOTE: Do NOT set cur->state = TASK_READY here!
+            // sched_schedule() already set us to TASK_RUNNING on return.
+            // Overwriting with TASK_READY causes SMP double-scheduling.
             cur->wait_channel = NULL;
             
             // Check if we were woken by a signal
@@ -1642,7 +1645,9 @@ static void sys_exit(uint64_t status) {
     }
 }
 
-// External: saved user context from syscall entry (in syscall.asm)
+// DEPRECATED: These global externs are no longer used directly.
+// Syscall context is now stored per-CPU in percpu_t and copied to task->syscall_*.
+// Kept for backward compatibility but should not be referenced in new code.
 extern uint64_t syscall_saved_user_rip;
 extern uint64_t syscall_saved_user_rsp;
 extern uint64_t syscall_saved_user_rflags;
@@ -1656,6 +1661,7 @@ extern uint64_t syscall_saved_user_r15;
 // External: user_mode_iret_trampoline from syscall.asm
 extern void user_mode_iret_trampoline(void);
 extern void fork_child_return(void);
+
 
 // SYS_FORK - fork current process
 static int64_t sys_fork(void) {
@@ -1719,6 +1725,8 @@ static int64_t sys_fork(void) {
     *(--k_sp) = 0; // R15 (kernel)
     
     child->sp = k_sp;
+    
+    sched_enqueue_ready(child);
     
     // Parent returns child's PID
     return child->id;
@@ -1797,7 +1805,11 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options) {
         cur->state = TASK_BLOCKED;
         cur->wait_channel = cur;  // Waiting for our own children
         sched_schedule();
-        cur->state = TASK_READY;
+        // NOTE: Do NOT set cur->state = TASK_READY here!
+        // When sched_schedule() returns, the scheduler has already set us
+        // to TASK_RUNNING.  Overwriting with TASK_READY causes a race on SMP
+        // where sched_wake_expired_sleepers sees READY + !on_rq and enqueues
+        // us on another CPU while we're still running → double scheduling.
         cur->wait_channel = 0;
         
         // Check if we were woken by a signal
@@ -2920,20 +2932,32 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 // Wrapper that handles signal delivery after syscall
 int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, 
                         uint64_t a3, uint64_t a4, uint64_t a5) {
-    // Save syscall context to current task (so signals work after yield)
+    // CRITICAL: Interrupts are DISABLED when we enter (syscall_entry no longer does sti)
+    // This prevents a race where:
+    // 1. Task A enters syscall, writes to per-CPU storage
+    // 2. Timer fires, preempts to task B  
+    // 3. Task B makes syscall, overwrites per-CPU storage
+    // 4. Task A resumes, reads corrupted values from per-CPU
+    //
+    // We snapshot the per-CPU values to task-local storage before enabling interrupts.
     task_t* cur = sched_current();
+    percpu_t* cpu = this_cpu();
     
     if (cur && cur->privilege == TASK_USER) {
-        cur->syscall_rsp = syscall_saved_user_rsp;
-        cur->syscall_rip = syscall_saved_user_rip;
-        cur->syscall_rflags = syscall_saved_user_rflags;
-        cur->syscall_rbp = syscall_saved_user_rbp;
-        cur->syscall_rbx = syscall_saved_user_rbx;
-        cur->syscall_r12 = syscall_saved_user_r12;
-        cur->syscall_r13 = syscall_saved_user_r13;
-        cur->syscall_r14 = syscall_saved_user_r14;
-        cur->syscall_r15 = syscall_saved_user_r15;
+        // Read from per-CPU storage (set by syscall_entry in assembly)
+        cur->syscall_rsp = cpu->syscall_user_rsp;
+        cur->syscall_rip = cpu->syscall_saved_user_rip;
+        cur->syscall_rflags = cpu->syscall_saved_user_rflags;
+        cur->syscall_rbp = cpu->syscall_saved_user_rbp;
+        cur->syscall_rbx = cpu->syscall_saved_user_rbx;
+        cur->syscall_r12 = cpu->syscall_saved_user_r12;
+        cur->syscall_r13 = cpu->syscall_saved_user_r13;
+        cur->syscall_r14 = cpu->syscall_saved_user_r14;
+        cur->syscall_r15 = cpu->syscall_saved_user_r15;
     }
+
+    // NOW enable interrupts - per-CPU values are safely copied to task struct
+    __asm__ volatile("sti" ::: "memory");
     
     int64_t ret = syscall_handler_inner(num, a1, a2, a3, a4, a5);
     

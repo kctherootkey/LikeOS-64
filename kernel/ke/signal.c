@@ -6,9 +6,10 @@
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/status.h"
 #include "../../include/kernel/syscall.h"
+#include "../../include/kernel/percpu.h"
 
-// Extern: signal number to pass to handler (set by signal_setup_frame)
-extern volatile uint64_t syscall_signal_pending;
+// NOTE: Signal delivery now uses per-CPU storage via percpu_t
+// The old global syscall_signal_pending is deprecated.
 
 // Global POSIX timer pool
 static kernel_timer_t g_posix_timers[MAX_POSIX_TIMERS];
@@ -156,23 +157,18 @@ int signal_send(task_t* task, int sig, siginfo_t* info) {
         }
     }
     
-    // Wake task if blocked - any signal that isn't blocked should wake the task
-    if (task->state == TASK_BLOCKED || task->state == TASK_STOPPED) {
-        int should_wake = 0;
-        
-        // SIGCONT always continues a stopped process
-        if (sig == SIGCONT && task->state == TASK_STOPPED) {
+    // Wake BLOCKED tasks when the signal is actionable (not masked).
+    // This is needed because some callers (sys_tkill, sys_rt_sigqueueinfo,
+    // SIGCHLD delivery) call signal_send() directly without their own wake
+    // logic.  Callers that already wake (sched_signal_task, sched_wake_expired_sleepers)
+    // are safe: sched_enqueue_ready() guards with !on_rq && TASK_READY,
+    // so a double-wake is a harmless no-op.
+    if (task->state == TASK_BLOCKED) {
+        if (sig_kernel_only(sig) || !sigismember_k(&sigstate->blocked, sig)) {
             task->state = TASK_READY;
-            should_wake = 1;
-        }
-        
-        // Any unblocked signal wakes a blocked task
-        // SIGKILL/SIGSTOP can't be blocked
-        if (!should_wake && task->state == TASK_BLOCKED) {
-            if (sig_kernel_only(sig) || !sigismember_k(&sigstate->blocked, sig)) {
-                task->state = TASK_READY;
-                task->wait_channel = 0;  // Clear wait channel so it doesn't re-block
-            }
+            task->wait_channel = NULL;
+            task->wakeup_tick = 0;
+            sched_enqueue_ready(task);
         }
     }
     
@@ -398,22 +394,141 @@ int signal_setup_frame(task_t* task, int sig, siginfo_t* info, struct k_sigactio
     task->syscall_rsp = frame_addr;
     task->syscall_rip = (uint64_t)act->sa_handler;
     
-    // CRITICAL: Disable interrupts before modifying global syscall return context
+    // CRITICAL: Disable interrupts before modifying per-CPU syscall return context
     // This prevents a race where a timer interrupt could cause a context switch
-    // to another task that overwrites these globals before we return via sysret
     __asm__ volatile("cli" ::: "memory");
     
-    // Modify the syscall return context to call the signal handler
+    // Modify the per-CPU syscall return context to call the signal handler
     // RSP = signal frame (handler should see pretcode as return address)
     // RIP = handler address
-    syscall_saved_user_rsp = frame_addr;
-    syscall_saved_user_rip = (uint64_t)act->sa_handler;
+    percpu_t* cpu = this_cpu();
+    cpu->syscall_user_rsp = frame_addr;
+    cpu->syscall_saved_user_rip = (uint64_t)act->sa_handler;
     
     // Set signal pending flag - this tells syscall.asm to use signal return path
     // The value is the signal number which will be loaded into RDI
     // NOTE: Interrupts remain disabled until after sysret in syscall.asm
-    syscall_signal_pending = (uint64_t)sig;
+    cpu->syscall_signal_pending = (uint64_t)sig;
     
+    return 0;
+}
+
+// Setup a signal frame for IRQ context (modifies IRETQ frame, not per-CPU SYSRET state)
+// This is the safe variant called from timer IRQ or other interrupt handlers.
+// Instead of writing to PERCPU_SIGNAL_PENDING / PERCPU_SAVED_USER_RIP etc. (which
+// are only consumed by the SYSRET path in syscall.asm), we directly modify the
+// interrupt_frame_t on the stack so that IRETQ returns to the signal handler.
+int signal_setup_frame_irq(task_t* task, int sig, siginfo_t* info,
+                           struct k_sigaction* act, interrupt_frame_t* frame) {
+    if (!task || !act || !frame) return -1;
+
+    // Get current user context from the IRETQ frame (this is what the CPU
+    // pushed when the interrupt fired — the real user RIP/RSP/RFLAGS)
+    uint64_t user_rsp    = frame->rsp;
+    uint64_t user_rip    = frame->rip;
+    uint64_t user_rflags = frame->rflags;
+
+    // Calculate new stack position for signal frame (16-byte aligned)
+    uint64_t frame_addr = (user_rsp - sizeof(signal_frame_t)) & ~0xFULL;
+
+    // Validate the stack address is in user space
+    if (frame_addr < 0x10000 || frame_addr >= 0x7FFFFFFFFFFF) {
+        return -1;
+    }
+
+    // Build the signal frame in kernel memory first
+    signal_frame_t kframe;
+    mm_memset(&kframe, 0, sizeof(kframe));
+
+    // Save all registers from the interrupt frame
+    kframe.rip    = user_rip;
+    kframe.rsp    = user_rsp;
+    kframe.rflags = user_rflags;
+    kframe.rbp = frame->rbp;
+    kframe.rbx = frame->rbx;
+    kframe.r12 = frame->r12;
+    kframe.r13 = frame->r13;
+    kframe.r14 = frame->r14;
+    kframe.r15 = frame->r15;
+    kframe.rcx = frame->rcx;
+    kframe.rdx = frame->rdx;
+    kframe.rsi = frame->rsi;
+    kframe.rdi = frame->rdi;
+    kframe.r8  = frame->r8;
+    kframe.r9  = frame->r9;
+    kframe.r10 = frame->r10;
+    kframe.r11 = frame->r11;
+
+    // Save RAX for sigreturn
+    kframe.rax = frame->rax;
+
+    // Signal info
+    kframe.sig = sig;
+    if (info) {
+        mm_memcpy(&kframe.info, info, sizeof(siginfo_t));
+    }
+
+    // Save current blocked mask
+    kframe.saved_mask = task->signals.blocked;
+
+    // Set up sigreturn trampoline code
+    kframe.retcode[0] = 0x48;  // REX.W
+    kframe.retcode[1] = 0xc7;  // mov rax, imm32
+    kframe.retcode[2] = 0xc0;
+    kframe.retcode[3] = 0x00;  // SYS_RT_SIGRETURN = 256 = 0x100
+    kframe.retcode[4] = 0x01;
+    kframe.retcode[5] = 0x00;
+    kframe.retcode[6] = 0x00;
+    kframe.retcode[7] = 0x0f;  // syscall
+    kframe.retcode[8] = 0x05;
+
+    // Set return address
+    if (act->sa_restorer) {
+        kframe.pretcode = (uint64_t)act->sa_restorer;
+    } else {
+        kframe.pretcode = frame_addr + __builtin_offsetof(signal_frame_t, retcode);
+    }
+
+    // Copy frame to user stack
+    smap_disable();
+    mm_memcpy((void*)frame_addr, &kframe, sizeof(kframe));
+    smap_enable();
+
+    // Update signal mask
+    sigorset_k(&task->signals.blocked, &task->signals.blocked, &act->sa_mask);
+    if (!(act->sa_flags & SA_NODEFER)) {
+        sigaddset_k(&task->signals.blocked, sig);
+    }
+
+    // Reset handler if SA_RESETHAND
+    if (act->sa_flags & SA_RESETHAND) {
+        act->sa_handler = SIG_DFL;
+    }
+
+    // Save frame address for sigreturn
+    task->signals.signal_frame_addr = frame_addr;
+
+    // Also update task's saved syscall values so sigreturn works correctly
+    task->syscall_rsp = frame_addr;
+    task->syscall_rip = (uint64_t)act->sa_handler;
+    task->syscall_rflags = user_rflags;
+    task->syscall_rbp = frame->rbp;
+    task->syscall_rbx = frame->rbx;
+    task->syscall_r12 = frame->r12;
+    task->syscall_r13 = frame->r13;
+    task->syscall_r14 = frame->r14;
+    task->syscall_r15 = frame->r15;
+    task->syscall_rax = frame->rax;
+
+    // Modify the IRETQ frame directly so that when the interrupt returns
+    // via iretq, execution goes to the signal handler with correct state.
+    frame->rip = (uint64_t)act->sa_handler;
+    frame->rsp = frame_addr;  // Signal frame on user stack
+    frame->rdi = (uint64_t)sig;  // First argument: signal number
+    // CS, SS, RFLAGS stay the same (user mode, same flags)
+
+    // Do NOT touch per-CPU SYSRET state — this path returns via IRETQ.
+
     return 0;
 }
 
@@ -459,27 +574,27 @@ int signal_restore_frame(task_t* task) {
     // Clear sigsuspend flag if set
     task->signals.in_sigsuspend = 0;
     
-    // CRITICAL: Disable interrupts before modifying global syscall return context
+    // CRITICAL: Disable interrupts before modifying per-CPU syscall return context
     // This prevents a race where a timer interrupt could cause a context switch
-    // to another task that overwrites these globals before we return via sysret
     __asm__ volatile("cli" ::: "memory");
     
-    // Restore registers to globals (output to syscall.asm)
-    syscall_saved_user_rip = kframe.rip;
-    syscall_saved_user_rsp = kframe.rsp;
-    syscall_saved_user_rflags = kframe.rflags;
-    syscall_saved_user_rbp = kframe.rbp;
-    syscall_saved_user_rbx = kframe.rbx;
-    syscall_saved_user_r12 = kframe.r12;
-    syscall_saved_user_r13 = kframe.r13;
-    syscall_saved_user_r14 = kframe.r14;
-    syscall_saved_user_r15 = kframe.r15;
-    syscall_saved_user_rax = kframe.rax;  // Syscall return value (e.g., -EINTR)
+    // Restore registers to per-CPU storage (output to syscall.asm)
+    percpu_t* cpu = this_cpu();
+    cpu->syscall_saved_user_rip = kframe.rip;
+    cpu->syscall_user_rsp = kframe.rsp;
+    cpu->syscall_saved_user_rflags = kframe.rflags;
+    cpu->syscall_saved_user_rbp = kframe.rbp;
+    cpu->syscall_saved_user_rbx = kframe.rbx;
+    cpu->syscall_saved_user_r12 = kframe.r12;
+    cpu->syscall_saved_user_r13 = kframe.r13;
+    cpu->syscall_saved_user_r14 = kframe.r14;
+    cpu->syscall_saved_user_r15 = kframe.r15;
+    cpu->syscall_saved_user_rax = kframe.rax;  // Syscall return value (e.g., -EINTR)
     
     // Tell syscall.asm to use the restored context
     // Use special value 0xFFFFFFFFFFFFFFFF (-1) to indicate sigreturn (not a handler call)
     // NOTE: Interrupts remain disabled until after sysret in syscall.asm
-    syscall_signal_pending = 0xFFFFFFFFFFFFFFFFULL;
+    cpu->syscall_signal_pending = 0xFFFFFFFFFFFFFFFFULL;
     
     return 0;
 }
@@ -538,6 +653,63 @@ void signal_deliver(task_t* task) {
     // User-defined handler - set up signal frame
     if (signal_setup_frame(task, signum, &info, act) < 0) {
         // Failed to set up frame - terminate with signal
+        sched_mark_task_exited(task, 128 + signum);
+    }
+}
+
+// Deliver pending signals via IRETQ frame (called from timer IRQ / interrupt context)
+// This is the interrupt-safe variant of signal_deliver().  Instead of writing
+// per-CPU SYSRET state (PERCPU_SIGNAL_PENDING etc.), it modifies the IRETQ
+// frame on the interrupt stack so that the interrupt return goes directly to
+// the signal handler in user space.
+void signal_deliver_irq(task_t* task, interrupt_frame_t* frame) {
+    if (!task || !frame || task->privilege != TASK_USER) return;
+
+    task_signal_state_t* sig = &task->signals;
+    siginfo_t info;
+
+    int signum = signal_dequeue(task, NULL, &info);
+    if (signum == 0) return;
+
+    struct k_sigaction* act = &sig->action[signum];
+
+    // Handle based on disposition
+    if (act->sa_handler == SIG_IGN) {
+        return;
+    }
+
+    if (act->sa_handler == SIG_DFL) {
+        int action = sig_default_action(signum);
+        switch (action) {
+            case SIG_DFL_TERM:
+            case SIG_DFL_CORE:
+                sched_mark_task_exited(task, 128 + signum);
+                break;
+            case SIG_DFL_STOP:
+                task->state = TASK_STOPPED;
+                if (task->parent) {
+                    siginfo_t chld_info;
+                    mm_memset(&chld_info, 0, sizeof(chld_info));
+                    chld_info.si_signo = SIGCHLD;
+                    chld_info.si_code = CLD_STOPPED;
+                    chld_info.si_pid = task->id;
+                    chld_info.si_status = signum;
+                    signal_send(task->parent, SIGCHLD, &chld_info);
+                }
+                break;
+            case SIG_DFL_CONT:
+                if (task->state == TASK_STOPPED) {
+                    task->state = TASK_READY;
+                }
+                break;
+            case SIG_DFL_IGN:
+                break;
+        }
+        return;
+    }
+
+    // User-defined handler — modify the IRETQ frame
+    if (signal_setup_frame_irq(task, signum, &info, act, frame) < 0) {
         sched_mark_task_exited(task, 128 + signum);
     }
 }

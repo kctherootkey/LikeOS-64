@@ -4,8 +4,22 @@ BITS 64
 SECTION .text
 
 extern syscall_handler
-extern g_current_kernel_stack    ; Per-task kernel stack pointer
 global syscall_entry
+
+; Per-CPU offsets into percpu_t (must match struct percpu in percpu.h)
+; These fields are right after the self-pointer at GS:0.
+%define PERCPU_SYSCALL_KRSP         8    ; percpu_t::syscall_kernel_rsp
+%define PERCPU_SYSCALL_URSP         16   ; percpu_t::syscall_user_rsp
+%define PERCPU_SAVED_USER_RIP       24   ; percpu_t::syscall_saved_user_rip
+%define PERCPU_SAVED_USER_RFLAGS    32   ; percpu_t::syscall_saved_user_rflags
+%define PERCPU_SAVED_USER_RBP       40   ; percpu_t::syscall_saved_user_rbp
+%define PERCPU_SAVED_USER_RBX       48   ; percpu_t::syscall_saved_user_rbx
+%define PERCPU_SAVED_USER_R12       56   ; percpu_t::syscall_saved_user_r12
+%define PERCPU_SAVED_USER_R13       64   ; percpu_t::syscall_saved_user_r13
+%define PERCPU_SAVED_USER_R14       72   ; percpu_t::syscall_saved_user_r14
+%define PERCPU_SAVED_USER_R15       80   ; percpu_t::syscall_saved_user_r15
+%define PERCPU_SAVED_USER_RAX       88   ; percpu_t::syscall_saved_user_rax
+%define PERCPU_SIGNAL_PENDING       96   ; percpu_t::syscall_signal_pending
 
 SECTION .bss
 align 16
@@ -14,14 +28,13 @@ kernel_syscall_stack:
 kernel_syscall_stack_top:
 
 SECTION .data
-user_rsp_save:
-    dq 0
-    
 ; Saved kernel RSP before syscall_handler call (for restoring after context switch)
 syscall_saved_ksp:
     dq 0
 
-; Saved user context for fork
+; NOTE: The following global variables are DEPRECATED and kept only for backward
+; compatibility with C code that hasn't been updated yet. The assembly code now
+; uses per-CPU storage via GS: prefix for SMP safety.
 global syscall_saved_user_rip
 global syscall_saved_user_rsp
 global syscall_saved_user_rflags
@@ -53,7 +66,7 @@ syscall_saved_user_r15:
 syscall_saved_user_rax:
     dq 0
 
-; Signal delivery: if non-zero, this is the signal number to pass in RDI
+; Signal delivery: per-CPU via GS:PERCPU_SIGNAL_PENDING (global kept for compat)
 global syscall_signal_pending
 syscall_signal_pending:
     dq 0
@@ -61,30 +74,31 @@ syscall_signal_pending:
 SECTION .text
 
 syscall_entry:
-    mov [rel user_rsp_save], rsp
-    ; Use per-task kernel stack instead of global one
-    mov rsp, [rel g_current_kernel_stack]
+    mov [gs:PERCPU_SYSCALL_URSP], rsp
+    ; Use per-CPU kernel stack (set by context switch on this CPU)
+    mov rsp, [gs:PERCPU_SYSCALL_KRSP]
     
-    push qword [rel user_rsp_save]
+    push qword [gs:PERCPU_SYSCALL_URSP]
     push r11
     push rcx
     
-    ; Save user context for fork() to use
+    ; Save user context to PER-CPU storage for fork() and signal handling
     ; At this point: RCX = user RIP, R11 = user RFLAGS
-    mov [rel syscall_saved_user_rip], rcx      ; RCX = user RIP
-    mov [rel syscall_saved_user_rflags], r11   ; R11 = user RFLAGS
+    ; Using GS-relative addressing for SMP safety (each CPU has its own copy)
+    mov [gs:PERCPU_SAVED_USER_RIP], rcx        ; RCX = user RIP
+    mov [gs:PERCPU_SAVED_USER_RFLAGS], r11     ; R11 = user RFLAGS
     push rax                                    ; Temporarily save syscall number
-    mov rax, [rel user_rsp_save]
-    mov [rel syscall_saved_user_rsp], rax      ; Save actual user RSP
+    mov rax, [gs:PERCPU_SYSCALL_URSP]
+    ; Note: user RSP is already in PERCPU_SYSCALL_URSP, no need to duplicate
     pop rax                                     ; Restore syscall number
     
-    ; Save callee-saved registers for fork()
-    mov [rel syscall_saved_user_rbp], rbp
-    mov [rel syscall_saved_user_rbx], rbx
-    mov [rel syscall_saved_user_r12], r12
-    mov [rel syscall_saved_user_r13], r13
-    mov [rel syscall_saved_user_r14], r14
-    mov [rel syscall_saved_user_r15], r15
+    ; Save callee-saved registers to per-CPU storage for fork()
+    mov [gs:PERCPU_SAVED_USER_RBP], rbp
+    mov [gs:PERCPU_SAVED_USER_RBX], rbx
+    mov [gs:PERCPU_SAVED_USER_R12], r12
+    mov [gs:PERCPU_SAVED_USER_R13], r13
+    mov [gs:PERCPU_SAVED_USER_R14], r14
+    mov [gs:PERCPU_SAVED_USER_R15], r15
     
     push rax
     push rbx
@@ -112,13 +126,15 @@ syscall_entry:
     mov rbp, rsp                               ; RBP = top of our saved register area
     
     and rsp, ~0xF
-    sti
+    ; NOTE: Interrupts remain DISABLED here. syscall_handler will enable them
+    ; AFTER copying per-CPU values to task-local storage (to prevent race condition
+    ; where another task overwrites our per-CPU data before we read it).
     call syscall_handler
     cli                                        ; Disable interrupts for return path
     
     ; Check if signal delivery modified the return context
-    ; If syscall_signal_pending is non-zero, use modified context for signal handler
-    mov rdi, [rel syscall_signal_pending]
+    ; If per-CPU syscall_signal_pending is non-zero, use modified context for signal handler
+    mov rdi, [gs:PERCPU_SIGNAL_PENDING]
     test rdi, rdi
     jnz .signal_return
     
@@ -156,31 +172,31 @@ syscall_entry:
 
 .signal_return:
     ; Signal handler or sigreturn path
-    ; RDI has value from syscall_signal_pending
+    ; RDI has value from per-CPU syscall_signal_pending
     ; If RDI == -1 (0xFFFFFFFFFFFFFFFF), this is sigreturn - don't set RDI to signal
     ; Otherwise, RDI is the signal number for the handler
     
-    ; Clear the pending flag
+    ; Clear the per-CPU pending flag
     xor rax, rax
-    mov [rel syscall_signal_pending], rax
+    mov [gs:PERCPU_SIGNAL_PENDING], rax
     
     ; Check if this is sigreturn (RDI == -1) or signal delivery
     cmp rdi, -1
     je .sigreturn_restore
     
     ; Signal handler call - RDI already has signal number
-    ; Load modified context from saved variables
-    mov rcx, [rel syscall_saved_user_rip]     ; Handler address -> RCX for SYSRET
-    mov r11, [rel syscall_saved_user_rflags]  ; RFLAGS -> R11 for SYSRET
-    mov rsp, [rel syscall_saved_user_rsp]     ; Signal frame on stack
+    ; Load modified context from per-CPU saved variables
+    mov rcx, [gs:PERCPU_SAVED_USER_RIP]       ; Handler address -> RCX for SYSRET
+    mov r11, [gs:PERCPU_SAVED_USER_RFLAGS]    ; RFLAGS -> R11 for SYSRET
+    mov rsp, [gs:PERCPU_SYSCALL_URSP]         ; Signal frame on stack (stored in user_rsp)
     
     ; Restore callee-saved registers (handler expects these)
-    mov rbp, [rel syscall_saved_user_rbp]
-    mov rbx, [rel syscall_saved_user_rbx]
-    mov r12, [rel syscall_saved_user_r12]
-    mov r13, [rel syscall_saved_user_r13]
-    mov r14, [rel syscall_saved_user_r14]
-    mov r15, [rel syscall_saved_user_r15]
+    mov rbp, [gs:PERCPU_SAVED_USER_RBP]
+    mov rbx, [gs:PERCPU_SAVED_USER_RBX]
+    mov r12, [gs:PERCPU_SAVED_USER_R12]
+    mov r13, [gs:PERCPU_SAVED_USER_R13]
+    mov r14, [gs:PERCPU_SAVED_USER_R14]
+    mov r15, [gs:PERCPU_SAVED_USER_R15]
     
     ; Clear other registers for security (except RDI which has signal number)
     xor rax, rax
@@ -193,22 +209,22 @@ syscall_entry:
     o64 sysret
 
 .sigreturn_restore:
-    ; Sigreturn path - restore full context from saved variables
+    ; Sigreturn path - restore full context from per-CPU saved variables
     ; The saved variables were already updated by signal_restore_frame
-    mov rcx, [rel syscall_saved_user_rip]     ; Original RIP -> RCX for SYSRET
-    mov r11, [rel syscall_saved_user_rflags]  ; RFLAGS -> R11 for SYSRET
-    mov rsp, [rel syscall_saved_user_rsp]     ; Original user RSP
+    mov rcx, [gs:PERCPU_SAVED_USER_RIP]       ; Original RIP -> RCX for SYSRET
+    mov r11, [gs:PERCPU_SAVED_USER_RFLAGS]    ; RFLAGS -> R11 for SYSRET
+    mov rsp, [gs:PERCPU_SYSCALL_URSP]         ; Original user RSP
     
     ; Restore callee-saved registers
-    mov rbp, [rel syscall_saved_user_rbp]
-    mov rbx, [rel syscall_saved_user_rbx]
-    mov r12, [rel syscall_saved_user_r12]
-    mov r13, [rel syscall_saved_user_r13]
-    mov r14, [rel syscall_saved_user_r14]
-    mov r15, [rel syscall_saved_user_r15]
+    mov rbp, [gs:PERCPU_SAVED_USER_RBP]
+    mov rbx, [gs:PERCPU_SAVED_USER_RBX]
+    mov r12, [gs:PERCPU_SAVED_USER_R12]
+    mov r13, [gs:PERCPU_SAVED_USER_R13]
+    mov r14, [gs:PERCPU_SAVED_USER_R14]
+    mov r15, [gs:PERCPU_SAVED_USER_R15]
     
     ; Restore RAX (syscall return value, e.g., -EINTR)
-    mov rax, [rel syscall_saved_user_rax]
+    mov rax, [gs:PERCPU_SAVED_USER_RAX]
     
     ; Clear other registers
     xor rdi, rdi

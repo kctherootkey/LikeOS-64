@@ -112,6 +112,14 @@ bool lapic_is_available(void) {
     return (edx & (1 << 9)) != 0;  // APIC feature bit
 }
 
+// Get initial APIC ID from CPUID (safe to call before lapic_init)
+// This doesn't require LAPIC MMIO access, so it works even if LAPIC isn't fully enabled
+uint32_t lapic_get_id_cpuid(void) {
+    uint32_t eax, ebx, ecx, edx;
+    cpuid(1, &eax, &ebx, &ecx, &edx);
+    return (ebx >> 24) & 0xFF;  // Initial APIC ID is in EBX[31:24]
+}
+
 uint64_t lapic_get_base(void) {
     uint64_t msr = rdmsr(MSR_APIC_BASE);
     return msr & 0xFFFFFFFFFFFFF000ULL;

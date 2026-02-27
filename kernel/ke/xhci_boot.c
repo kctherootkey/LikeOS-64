@@ -149,10 +149,17 @@ void xhci_boot_init(xhci_boot_state_t* state) {
 void xhci_boot_poll(xhci_boot_state_t* state) {
     if (!state || !state->ctrl) return;
     
+    // Once boot enumeration is done, stop touching the event ring.
+    // Transfer functions and the IRQ handler process events under
+    // xhci_lock; doing it here without the lock caused a race that
+    // corrupted event-ring dequeue/cycle and hung USB transfers.
+    if (state->msd_ready) return;
+    
     xhci_controller_t* ctrl = state->ctrl;
     
-    // Process any pending events
-    xhci_process_events(ctrl);
+    // Process any pending events (use locked version to serialise with
+    // the IRQ handler and any concurrent transfer polling on other CPUs).
+    xhci_process_events_locked(ctrl);
     
     // Keep polling ports until we have a mass storage device or reach max devices
     if (!state->msd_ready) {

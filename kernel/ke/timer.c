@@ -61,19 +61,20 @@ void timer_irq_handler(void) {
     }
     
     // Per-CPU: manage this CPU's current task time slice
-    // sched_current() returns per-CPU current task (NULL on APs with no tasks)
     task_t* cur = sched_current();
     if (cur) {
-        // Preemption logic: decrement time slice and trigger reschedule if expired
         if (cur->remaining_ticks > 0) {
             cur->remaining_ticks--;
         }
-        // If time slice expired and task is runnable, mark for rescheduling
-        // Check both RUNNING and READY since current task might not have RUNNING set
         if (cur->remaining_ticks == 0 && (cur->state == TASK_RUNNING || cur->state == TASK_READY)) {
-            // Time slice expired - mark for rescheduling
             sched_set_need_resched(cur);
         }
+    }
+    
+    // Per-CPU load balancing: periodically pull tasks from busiest CPU
+    // Run every LOAD_BALANCE_INTERVAL ticks (checked via global tick counter)
+    if (sched_is_smp() && (g_ticks % 50) == 0) {
+        sched_load_balance();
     }
     
     // Only BSP calls sched_tick for global statistics

@@ -4,6 +4,10 @@
 
 #include "types.h"
 
+// Forward declarations
+struct task;
+struct interrupt_frame;
+
 // Signal numbers (Linux compatible)
 #define SIGHUP      1
 #define SIGINT      2
@@ -427,7 +431,9 @@ typedef struct kernel_timer {
 // Forward declaration
 struct task;
 
-// Saved user context for signal delivery (set by syscall entry)
+// DEPRECATED: These global externs are no longer used.
+// Signal delivery and syscall return now use per-CPU storage in percpu_t.
+// Kept for backward compatibility but should not be referenced.
 extern uint64_t syscall_saved_user_rip;
 extern uint64_t syscall_saved_user_rsp;
 extern uint64_t syscall_saved_user_rflags;
@@ -449,10 +455,12 @@ int signal_pending(struct task* task);
 int signal_should_restart(struct task* task);
 int signal_dequeue(struct task* task, kernel_sigset_t* mask, siginfo_t* info);
 void signal_deliver(struct task* task);
+void signal_deliver_irq(struct task* task, struct interrupt_frame* frame);
 void signal_check_timers(struct task* task, uint64_t current_tick);
 
 // Signal frame setup/restore for syscall handling
 int signal_setup_frame(struct task* task, int sig, siginfo_t* info, struct k_sigaction* act);
+int signal_setup_frame_irq(struct task* task, int sig, siginfo_t* info, struct k_sigaction* act, struct interrupt_frame* frame);
 int signal_restore_frame(struct task* task);
 
 #endif // _KERNEL_SIGNAL_H_

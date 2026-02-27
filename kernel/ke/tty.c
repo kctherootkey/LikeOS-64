@@ -57,6 +57,11 @@ static tty_t g_console_tty;
 static pty_t g_ptys[TTY_MAX_PTYS];
 
 static void tty_wake_readers(task_t** waiters) {
+    // Collect woken tasks first, then enqueue them after clearing the list.
+    // We must enqueue via sched_enqueue_ready (not just set TASK_READY)
+    // so they actually get placed on a run queue and scheduled on SMP.
+    task_t* woken[16];
+    int nwoken = 0;
     task_t* t = *waiters;
     while (t) {
         task_t* next = t->wait_next;
@@ -64,10 +69,16 @@ static void tty_wake_readers(task_t** waiters) {
         t->wait_channel = NULL;
         if (t->state == TASK_BLOCKED) {
             t->state = TASK_READY;
+            if (nwoken < 16) {
+                woken[nwoken++] = t;
+            }
         }
         t = next;
     }
     *waiters = NULL;
+    for (int i = 0; i < nwoken; i++) {
+        sched_enqueue_ready(woken[i]);
+    }
 }
 
 static void tty_enqueue_read(tty_t* tty, char c) {
@@ -371,25 +382,42 @@ long tty_write(tty_t* tty, const void* buf, long count) {
     if (!tty || !buf || count <= 0) {
         return 0;
     }
-    const char* in = (const char*)buf;
-    for (long i = 0; i < count; ++i) {
-        // SMAP-aware read from user buffer
+
+    // Copy user buffer into a small kernel-side staging buffer so we do
+    // one SMAP window per chunk instead of per character, and hold the
+    // tty_lock for the entire write so two CPUs can't interleave chars.
+    #define TTY_WRITE_CHUNK 256
+    char tmp[TTY_WRITE_CHUNK];
+    long written = 0;
+
+    while (written < count) {
+        long chunk = count - written;
+        if (chunk > TTY_WRITE_CHUNK) chunk = TTY_WRITE_CHUNK;
+
+        // Bulk copy from user space
         smap_disable();
-        char c = in[i];
+        for (long i = 0; i < chunk; i++)
+            tmp[i] = ((const char*)buf)[written + i];
         smap_enable();
-        if (tty->term.c_iflag & INLCR) {
-            if (c == '\n') {
-                c = '\r';
+
+        uint64_t flags;
+        spin_lock_irqsave(&tty_lock, &flags);
+        for (long i = 0; i < chunk; i++) {
+            char c = tmp[i];
+            if (tty->term.c_iflag & INLCR) {
+                if (c == '\n') c = '\r';
             }
-        }
-        if (tty->term.c_iflag & IGNCR) {
-            if (c == '\r') {
-                continue;
+            if (tty->term.c_iflag & IGNCR) {
+                if (c == '\r') continue;
             }
+            tty->output(tty, c);
         }
-        tty->output(tty, c);
+        spin_unlock_irqrestore(&tty_lock, flags);
+
+        written += chunk;
     }
     return count;
+    #undef TTY_WRITE_CHUNK
 }
 
 int tty_ioctl(tty_t* tty, unsigned long req, void* argp, task_t* cur) {

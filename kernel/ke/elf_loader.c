@@ -4,6 +4,7 @@
 #include <kernel/sched.h>
 #include <kernel/console.h>
 #include <kernel/vfs.h>
+#include <kernel/pipe.h>
 
 // Validate an ELF64 static executable
 int elf_validate(const void* data, size_t size) {
@@ -614,8 +615,17 @@ uint64_t elf_exec_replace(const char* path, char* const argv[], char* const envp
     // Close all file descriptors except 0, 1, 2
     for (int i = 3; i < TASK_MAX_FDS; i++) {
         if (current->fd_table[i]) {
-            vfs_close(current->fd_table[i]);
-            current->fd_table[i] = NULL;
+            uint64_t marker = (uint64_t)current->fd_table[i];
+            if (marker >= 1 && marker <= 3) {
+                /* Console dup marker – just clear */
+                current->fd_table[i] = NULL;
+            } else if (pipe_is_end(current->fd_table[i])) {
+                pipe_close_end((pipe_end_t*)current->fd_table[i]);
+                current->fd_table[i] = NULL;
+            } else {
+                vfs_close(current->fd_table[i]);
+                current->fd_table[i] = NULL;
+            }
         }
     }
     

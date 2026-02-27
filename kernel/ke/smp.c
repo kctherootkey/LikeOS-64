@@ -32,6 +32,11 @@ static volatile uint32_t g_aps_started = 0;
 static uint32_t g_cpu_count = 1;  // At least BSP
 static smp_barrier_t g_startup_barrier;
 
+// UP (Uniprocessor) mode flag - when set to 1, spinlocks skip spinning
+// since there's only one CPU and spinning would cause deadlocks.
+// This is global so spinlock inline functions in sched.h can access it.
+volatile uint32_t g_smp_up_mode = 1;  // Default to UP mode until SMP is initialized
+
 // AP trampoline address (set from boot_info or fallback to default)
 static uint64_t g_ap_trampoline_addr = 0;
 
@@ -77,20 +82,26 @@ static inline void ap_enable_sse(void) {
     // Read CR0
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
     
-    // Clear CR0.EM (bit 2) - disable x87 emulation
-    // Set CR0.MP (bit 1) - enable FPU monitoring
-    cr0 &= ~(1ULL << 2);  // Clear EM
-    cr0 |= (1ULL << 1);   // Set MP
+    // Match BSP CR0 settings (0x80010033):
+    // Clear CD (bit 30) - enable caching (INIT sets CD=1)
+    // Clear NW (bit 29) - enable write-through (INIT sets NW=1)
+    // Clear EM (bit 2)  - disable x87 emulation
+    // Set   NE (bit 5)  - native FPU error reporting
+    // Set   MP (bit 1)  - enable FPU monitoring
+    cr0 &= ~((1ULL << 30) | (1ULL << 29) | (1ULL << 2));  // Clear CD, NW, EM
+    cr0 |= (1ULL << 5) | (1ULL << 1);                      // Set NE, MP
     
     __asm__ volatile("mov %0, %%cr0" : : "r"(cr0));
     
     // Read CR4
     __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
     
-    // Set CR4.OSFXSR (bit 9) - enable FXSAVE/FXRSTOR
-    // Set CR4.OSXMMEXCPT (bit 10) - enable SIMD exceptions
-    cr4 |= (1ULL << 9);   // OSFXSR
-    cr4 |= (1ULL << 10);  // OSXMMEXCPT
+    // Match BSP CR4 settings (0x6e8):
+    // Set OSFXSR (bit 9)    - enable FXSAVE/FXRSTOR
+    // Set OSXMMEXCPT (bit 10) - enable SIMD exceptions
+    // Set MCE (bit 6)       - Machine Check Enable
+    // Set DE  (bit 3)       - Debugging Extensions (DR4/DR5 trapping)
+    cr4 |= (1ULL << 10) | (1ULL << 9) | (1ULL << 6) | (1ULL << 3);
     
     __asm__ volatile("mov %0, %%cr4" : : "r"(cr4));
     
@@ -127,8 +138,9 @@ void ap_entry(void) {
     // Get our CPU ID from the trampoline data
     uint32_t cpu_id = *(volatile uint32_t*)(phys_to_virt(g_ap_trampoline_addr + AP_TRAMPOLINE_CPU_OFFSET));
     
-    // Get our APIC ID
-    uint32_t apic_id = lapic_get_id();
+    // Get our APIC ID via CPUID (safe before lapic_init)
+    // We use CPUID because LAPIC MMIO access may not be safe until lapic_init()
+    uint32_t apic_id = lapic_get_id_cpuid();
     
     // Initialize per-CPU data for this AP
     percpu_init_cpu(cpu_id, apic_id);
@@ -136,8 +148,21 @@ void ap_entry(void) {
     // Initialize per-CPU TSS (each AP needs its own TSS for RSP0)
     tss_init_ap(cpu_id);
     
+    // Enable NX bit in EFER (per-CPU MSR)
+    mm_enable_nx();
+    
+    // Enable SMEP/SMAP (per-CPU CR4 bits)
+    mm_enable_smep_smap();
+    
+    // Initialize SYSCALL/SYSRET MSRs (STAR, LSTAR, SFMASK, EFER.SCE are per-CPU)
+    // Without this, any 'syscall' instruction on this AP would cause #UD
+    mm_initialize_syscall();
+    
     // Initialize LAPIC for this CPU
     lapic_init();
+    
+    // Initialize per-CPU scheduler (creates idle task, sets current_task)
+    sched_init_ap(cpu_id);
     
     // Signal that we're ready
     __atomic_fetch_add(&g_aps_started, 1, __ATOMIC_SEQ_CST);
@@ -151,16 +176,12 @@ void ap_entry(void) {
     // Start LAPIC timer for this CPU
     lapic_timer_start(100);  // 100 Hz
     
-    // Enter idle loop - the scheduler will give us work
+    // Enter idle loop - the scheduler/timer will preempt us when work arrives.
+    // When a task is enqueued to our run queue (by fork, wake, or load balance),
+    // the enqueuer sends a reschedule IPI which wakes us from HLT, and the
+    // next timer tick will call sched_preempt() to switch to the new task.
     while (1) {
-        __asm__ volatile("hlt");
-        
-        // Check if we have work to do
-        percpu_t* cpu = this_cpu();
-        if (cpu->need_resched) {
-            cpu->need_resched = 0;
-            // sched_schedule() will be called
-        }
+        __asm__ volatile("sti; hlt");
     }
 }
 
@@ -197,6 +218,10 @@ void smp_init(uint64_t trampoline_addr) {
     }
     
     smp_dbg("SMP: %u CPU(s) detected\n", g_cpu_count);
+    
+    // Set UP mode flag based on CPU count
+    // When only one CPU is present, spinlocks should not spin
+    g_smp_up_mode = (g_cpu_count == 1) ? 1 : 0;
     
     // Initialize BSP's LAPIC
     lapic_init();
@@ -334,7 +359,18 @@ void smp_boot_aps(void) {
             cpu->started = true;
             ap_index++;
         } else {
-            kprintf("SMP: AP %u (APIC ID %u) failed to start\n", ap_index, cpu->apic_id);
+            // Give it a bit more time - there's a race between AP setting g_ap_ready
+            // and BSP checking it
+            pit_delay_ms(50);
+            if (__atomic_load_n(&g_ap_ready, __ATOMIC_SEQ_CST)) {
+                cpu->started = true;
+                ap_index++;
+            } else {
+                kprintf("SMP: AP %u (APIC ID %u) failed to start\n", ap_index, cpu->apic_id);
+                // IMPORTANT: Still increment ap_index so the next AP gets a unique ID
+                // Otherwise two APs could get the same cpu_id, corrupting per-CPU data
+                ap_index++;
+            }
         }
     }
     
@@ -414,6 +450,41 @@ void smp_send_reschedule_all(void) {
 
 void smp_tlb_shootdown(void) {
     lapic_send_ipi_all_excl_self(IPI_TLB_SHOOTDOWN);
+}
+
+// Atomic acknowledgment counter for synchronous TLB shootdown
+static volatile int g_tlb_ack_count = 0;
+
+void smp_tlb_shootdown_ack(void) {
+    __atomic_add_fetch(&g_tlb_ack_count, 1, __ATOMIC_SEQ_CST);
+}
+
+void smp_tlb_shootdown_sync(void) {
+    if (g_cpu_count <= 1) return;
+
+    int expect = (int)g_cpu_count - 1;
+    // Reset ack counter, then send IPI, then busy-wait for all CPUs.
+    // A simple atomic exchange serialises concurrent callers: the second
+    // caller sees ack_count reset by the first and will itself wait for
+    // the IPIs it sends.
+    __atomic_store_n(&g_tlb_ack_count, 0, __ATOMIC_RELEASE);
+    
+    // CRITICAL: Ensure all page table writes are globally visible to all CPUs
+    // before they flush their TLBs. Without this, a remote CPU could flush its
+    // TLB before seeing the updated PTE, then later re-cache the stale entry.
+    __asm__ volatile("mfence" ::: "memory");
+    
+    lapic_send_ipi_all_excl_self(IPI_TLB_SHOOTDOWN);
+
+    // Wait for all remote CPUs to acknowledge (with timeout to avoid hang)
+    for (int i = 0; i < 10000000; i++) {
+        if (__atomic_load_n(&g_tlb_ack_count, __ATOMIC_ACQUIRE) >= expect)
+            return;
+        __asm__ volatile("pause" ::: "memory");
+    }
+    // Timed out — not fatal but log it
+    kprintf("SMP: TLB shootdown sync timeout (ack=%d expect=%d)\n",
+            __atomic_load_n(&g_tlb_ack_count, __ATOMIC_ACQUIRE), expect);
 }
 
 void smp_halt_others(void) {

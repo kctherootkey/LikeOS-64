@@ -407,6 +407,7 @@ void xhci_stop(xhci_controller_t* ctrl);
 // Interrupt handling
 void xhci_irq_service(xhci_controller_t* ctrl);
 void xhci_process_events(xhci_controller_t* ctrl);
+void xhci_process_events_locked(xhci_controller_t* ctrl);
 
 // Port management
 int xhci_power_ports(xhci_controller_t* ctrl);

@@ -798,6 +798,8 @@ void console_backspace(void) {
 
 // ================= Cursor Control Functions =================
 void console_cursor_enable(void) {
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
     // Update tracking to current position first
     cursor_last_x = cursor_x;
     cursor_last_y = cursor_y;
@@ -809,9 +811,12 @@ void console_cursor_enable(void) {
         draw_cursor_at(cursor_x, cursor_y, 1);
         fb_flush_dirty_regions();
     }
+    spin_unlock_irqrestore(&console_lock, flags);
 }
 
 void console_cursor_disable(void) {
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
     if (cursor_enabled && cursor_shown) {
         // Erase cursor at the position where it was last drawn
         draw_cursor_at(cursor_last_x, cursor_last_y, 0);
@@ -822,10 +827,14 @@ void console_cursor_disable(void) {
     // Update tracking to current position
     cursor_last_x = cursor_x;
     cursor_last_y = cursor_y;
+    spin_unlock_irqrestore(&console_lock, flags);
 }
 
 void console_cursor_update(void) {
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
     if (!cursor_enabled || !g_sb.at_bottom) {
+        spin_unlock_irqrestore(&console_lock, flags);
         return;
     }
     
@@ -838,6 +847,7 @@ void console_cursor_update(void) {
         cursor_blink_ticks = 0;
         draw_cursor_at(cursor_x, cursor_y, 1);
         fb_flush_dirty_regions();
+        spin_unlock_irqrestore(&console_lock, flags);
         return;
     }
     
@@ -850,6 +860,7 @@ void console_cursor_update(void) {
         draw_cursor_at(cursor_x, cursor_y, cursor_shown);
         fb_flush_dirty_regions();
     }
+    spin_unlock_irqrestore(&console_lock, flags);
 }
 
 // ================= Scrollback public APIs =================

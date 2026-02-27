@@ -7,16 +7,37 @@
 #include "../../include/kernel/signal.h"
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/percpu.h"
+#include "../../include/kernel/smp.h"
 
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_descriptor idt_desc;
 static struct tss_entry tss;  // BSP TSS
 static uint8_t interrupt_stack[8192] __attribute__((aligned(16)));
 
+// IST (Interrupt Stack Table) stacks for critical exceptions that need
+// guaranteed separate stacks (double fault, NMI, machine check).
+// These are per-CPU to avoid stack sharing in SMP.
+#define IST_STACK_SIZE 4096
+
+// IST stack assignments:
+//   IST1 = Double Fault (#DF, INT 8)  - CRITICAL: prevents triple fault
+//   IST2 = NMI (INT 2)                - can interrupt at any time
+//   IST3 = Machine Check (#MC, INT 18) - similar to NMI
+
+// BSP IST stacks
+static uint8_t bsp_ist1_stack[IST_STACK_SIZE] __attribute__((aligned(16)));  // Double Fault
+static uint8_t bsp_ist2_stack[IST_STACK_SIZE] __attribute__((aligned(16)));  // NMI
+static uint8_t bsp_ist3_stack[IST_STACK_SIZE] __attribute__((aligned(16)));  // Machine Check
+
 // Per-CPU TSS for SMP (index 0 = BSP, 1..MAX_CPUS-1 = APs)
 #define MAX_CPUS_TSS 64
 static struct tss_entry ap_tss[MAX_CPUS_TSS] __attribute__((aligned(16)));
 static uint8_t ap_interrupt_stacks[MAX_CPUS_TSS][8192] __attribute__((aligned(16)));
+
+// Per-AP IST stacks
+static uint8_t ap_ist1_stacks[MAX_CPUS_TSS][IST_STACK_SIZE] __attribute__((aligned(16)));  // Double Fault
+static uint8_t ap_ist2_stacks[MAX_CPUS_TSS][IST_STACK_SIZE] __attribute__((aligned(16)));  // NMI
+static uint8_t ap_ist3_stacks[MAX_CPUS_TSS][IST_STACK_SIZE] __attribute__((aligned(16)));  // Machine Check
 
 static void my_memset(void *dest, int val, size_t len) {
     uint8_t *ptr = (uint8_t*)dest;
@@ -94,7 +115,11 @@ void pic_send_eoi(uint8_t irq) {
     //   2. BSP virtual wire (PIC via LINT0=ExtINT): BOTH LAPIC EOI and PIC EOI
     //      needed — LAPIC EOI clears the ISR bit, PIC EOI un-stalls the 8259
     // Sending PIC EOI from an AP would corrupt the shared 8259 PIC state.
-    if (g_lapic_active) {
+    //
+    // NOTE: g_lapic_active is set on the BSP after lapic_init(), but APs also
+    // have a live LAPIC (their timer fires at this same vector 0x20).  Use
+    // lapic_is_available() as the per-CPU test so APs send LAPIC EOI too.
+    if (g_lapic_active || lapic_is_available()) {
         uint8_t vector = irq + 32;
         uint32_t isr_reg = LAPIC_ISR_BASE + (vector / 32) * 0x10;
         uint32_t isr_bit = 1U << (vector % 32);
@@ -194,6 +219,18 @@ void idt_set_entry(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags) {
     idt[num].zero = 0;
 }
 
+// Set IDT entry with IST (Interrupt Stack Table) index
+// ist_index: 1-7 for IST1-IST7, 0 for no IST (use RSP0)
+void idt_set_entry_ist(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags, uint8_t ist_index) {
+    idt[num].offset_low = base & 0xFFFF;
+    idt[num].offset_mid = (base >> 16) & 0xFFFF;
+    idt[num].offset_high = (base >> 32) & 0xFFFFFFFF;
+    idt[num].selector = sel;
+    idt[num].ist = ist_index & 0x7;  // IST is 3 bits (0-7)
+    idt[num].type_attr = flags;
+    idt[num].zero = 0;
+}
+
 void idt_init() {
     idt_desc.limit = sizeof(idt) - 1;
     idt_desc.base = (uint64_t)&idt;
@@ -204,13 +241,13 @@ void idt_init() {
 
     idt_set_entry(0, (uint64_t)isr0, 0x08, 0x8E);
     idt_set_entry(1, (uint64_t)isr1, 0x08, 0x8E);
-    idt_set_entry(2, (uint64_t)isr2, 0x08, 0x8E);
+    idt_set_entry_ist(2, (uint64_t)isr2, 0x08, 0x8E, 2);   // NMI -> IST2
     idt_set_entry(3, (uint64_t)isr3, 0x08, 0x8E);
     idt_set_entry(4, (uint64_t)isr4, 0x08, 0x8E);
     idt_set_entry(5, (uint64_t)isr5, 0x08, 0x8E);
     idt_set_entry(6, (uint64_t)isr6, 0x08, 0x8E);
     idt_set_entry(7, (uint64_t)isr7, 0x08, 0x8E);
-    idt_set_entry(8, (uint64_t)isr8, 0x08, 0x8E);
+    idt_set_entry_ist(8, (uint64_t)isr8, 0x08, 0x8E, 1);   // Double Fault -> IST1 (CRITICAL!)
     idt_set_entry(9, (uint64_t)isr9, 0x08, 0x8E);
     idt_set_entry(10, (uint64_t)isr10, 0x08, 0x8E);
     idt_set_entry(11, (uint64_t)isr11, 0x08, 0x8E);
@@ -220,7 +257,7 @@ void idt_init() {
     idt_set_entry(15, (uint64_t)isr15, 0x08, 0x8E);
     idt_set_entry(16, (uint64_t)isr16, 0x08, 0x8E);
     idt_set_entry(17, (uint64_t)isr17, 0x08, 0x8E);
-    idt_set_entry(18, (uint64_t)isr18, 0x08, 0x8E);
+    idt_set_entry_ist(18, (uint64_t)isr18, 0x08, 0x8E, 3); // Machine Check -> IST3
     idt_set_entry(19, (uint64_t)isr19, 0x08, 0x8E);
     idt_set_entry(20, (uint64_t)isr20, 0x08, 0x8E);
     idt_set_entry(21, (uint64_t)isr21, 0x08, 0x8E);
@@ -426,19 +463,26 @@ void irq_handler(uint64_t *regs) {
     switch (int_no) {
         case 32: {
             g_irq0_count++;
+            
             timer_irq_handler();
             // Send EOI before preemption to avoid missing ticks
             pic_send_eoi(irq);
             
-            // Check for pending signals on current task
-            // This handles fatal signals (SIGKILL, etc.) for tasks in user mode
-            task_t* cur = sched_current();
-            if (cur && cur->privilege == TASK_USER && signal_pending(cur)) {
-                signal_deliver(cur);
-                // If signal terminated the task, force reschedule
-                if (cur->has_exited || cur->state == TASK_ZOMBIE) {
-                    sched_schedule();
-                    return;
+            // Deliver pending signals to the current user task.
+            // We use signal_deliver_irq() which modifies the IRETQ frame
+            // on the stack directly, NOT the per-CPU SYSRET state.  The
+            // regular signal_deliver() sets PERCPU_SIGNAL_PENDING etc.
+            // which is only consumed by the sysret path in syscall.asm —
+            // timer interrupts return via iretq, so those per-CPU writes
+            // would be stale and corrupt the next syscall return.
+            {
+                interrupt_frame_t* frame = (interrupt_frame_t*)regs;
+                // Only deliver if we interrupted user mode (CS RPL == 3)
+                if ((frame->cs & 3) == 3) {
+                    task_t* cur = sched_current();
+                    if (cur && cur->privilege == TASK_USER) {
+                        signal_deliver_irq(cur, frame);
+                    }
                 }
             }
             
@@ -481,7 +525,7 @@ void irq_handler(uint64_t *regs) {
 
 void ipi_handler(uint64_t *regs) {
     uint64_t vector = regs[15];  // Vector number pushed by IPI stub
-    
+
     switch (vector) {
         case 0xFE:  // IPI_RESCHEDULE_VECTOR
             // Mark current task as needing reschedule
@@ -504,11 +548,15 @@ void ipi_handler(uint64_t *regs) {
             break;
             
         case 0xFC:  // IPI_TLB_SHOOTDOWN
-            // Invalidate TLB on this CPU
+            // Invalidate TLB on this CPU and acknowledge
             {
+                // Memory barrier to ensure we see all page table updates
+                // from the CPU that initiated the shootdown
+                __asm__ volatile("mfence" ::: "memory");
                 uint64_t cr3;
                 __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
                 __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+                smp_tlb_shootdown_ack();
             }
             lapic_eoi();
             break;
@@ -538,8 +586,17 @@ void interrupts_init() {
 void tss_init() {
     my_memset(&tss, 0, sizeof(tss));
     tss.rsp0 = (uint64_t)(interrupt_stack + sizeof(interrupt_stack));
+    
+    // Configure IST entries for critical exceptions
+    // IST1: Double Fault - MUST have separate stack to avoid triple fault
+    tss.ist1 = (uint64_t)(bsp_ist1_stack + IST_STACK_SIZE);
+    // IST2: NMI - can interrupt at any time, needs guaranteed stack
+    tss.ist2 = (uint64_t)(bsp_ist2_stack + IST_STACK_SIZE);
+    // IST3: Machine Check - similar to NMI
+    tss.ist3 = (uint64_t)(bsp_ist3_stack + IST_STACK_SIZE);
+    
     tss.iopb_offset = sizeof(tss);
-    kprintf("TSS initialized\n");
+    kprintf("TSS initialized with IST entries\n");
 }
 
 void gdt_install_tss() {
@@ -588,6 +645,13 @@ void tss_init_ap(uint32_t cpu_id) {
     // Initialize the per-CPU TSS
     my_memset(&ap_tss[cpu_id], 0, sizeof(struct tss_entry));
     ap_tss[cpu_id].rsp0 = (uint64_t)(ap_interrupt_stacks[cpu_id] + sizeof(ap_interrupt_stacks[cpu_id]));
+    
+    // Configure IST entries for this AP - each AP MUST have its own IST stacks
+    // to avoid stack corruption when handling critical exceptions on different CPUs
+    ap_tss[cpu_id].ist1 = (uint64_t)(ap_ist1_stacks[cpu_id] + IST_STACK_SIZE);  // Double Fault
+    ap_tss[cpu_id].ist2 = (uint64_t)(ap_ist2_stacks[cpu_id] + IST_STACK_SIZE);  // NMI
+    ap_tss[cpu_id].ist3 = (uint64_t)(ap_ist3_stacks[cpu_id] + IST_STACK_SIZE);  // Machine Check
+    
     ap_tss[cpu_id].iopb_offset = sizeof(struct tss_entry);
     
     // Directly update the shared GDT's TSS entry (slots 5-6) without gdt_flush.

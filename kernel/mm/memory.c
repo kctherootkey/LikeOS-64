@@ -17,6 +17,11 @@
 static spinlock_t mm_phys_lock = SPINLOCK_INIT("mm_phys");
 // Spinlock for page table pool
 static spinlock_t mm_pt_pool_lock = SPINLOCK_INIT("mm_pt_pool");
+// Spinlock for kernel page table modifications (mm_map_page / mm_unmap_page).
+// On SMP, two CPUs calling mm_get_page_table(create=true) simultaneously can
+// race when creating intermediate page table levels (PDPT/PD/PT), causing one
+// CPU's newly-allocated level to be silently overwritten by the other.
+static spinlock_t mm_kernel_pt_lock = SPINLOCK_INIT("mm_kpt");
 
 // Magic numbers for heap validation
 #define HEAP_MAGIC_ALLOCATED    0xDEADBEEF
@@ -140,12 +145,20 @@ static void set_cr3(uint64_t cr3) {
     __asm__ volatile ("mov %0, %%cr3" : : "r"(cr3) : "memory");
 }
 
-// Flush TLB for specific address
+// Flush TLB for specific address (SMP-safe: flushes on all CPUs)
 void mm_flush_tlb(uint64_t virtual_addr) {
     __asm__ volatile ("invlpg (%0)" : : "r"(virtual_addr) : "memory");
+    // SMP note: cross-CPU TLB invalidation is NOT done here.
+    // User pages: per-process CR3 means only the local CPU needs invlpg.
+    // Kernel SLAB pages: slab_free() calls smp_tlb_shootdown_sync()
+    // explicitly after unmapping, before recycling virtual addresses.
+    // Doing broadcast IPIs here caused an IPI storm (every COW fault
+    // would shootdown all CPUs, flushing their entire TLBs).
 }
 
-// Flush all TLB entries
+// Flush all TLB entries (local CPU only)
+// Callers: boot-time NX remapping, address-space cloning (per-process)
+// — neither requires cross-CPU invalidation.
 void mm_flush_all_tlb(void) {
     uint64_t cr3 = get_cr3();
     set_cr3(cr3);
@@ -1003,13 +1016,28 @@ void mm_remap_kernel_with_nx(void) {
     kprintf("Kernel remapped with NX permissions\n");
 }
 
-// Map virtual page to physical page
+// Map virtual page to physical page (SMP-safe)
 bool mm_map_page(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
+    uint64_t lock_flags;
+    spin_lock_irqsave(&mm_kernel_pt_lock, &lock_flags);
+
     uint64_t* pte = mm_get_page_table(virtual_addr, true);
     if (!pte) {
+        spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
         return false;
     }
     
+    // Detect remap: if PTE was present with a different physical address,
+    // other CPUs may have stale TLB entries pointing to the old page (Case B).
+    bool needs_shootdown = false;
+    if (*pte & PAGE_PRESENT) {
+        uint64_t old_phys = *pte & 0x000FFFFFFFFFF000ULL;
+        uint64_t new_phys = physical_addr & ~0xFFFULL;
+        if (old_phys != new_phys) {
+            needs_shootdown = true;
+        }
+    }
+
     uint64_t entry = (physical_addr & ~0xFFF) | flags;
     if (mm_debug_pt) {
         kprintf("MAP: pte=%p writing entry=0x%lx\n", pte, entry);
@@ -1018,16 +1046,37 @@ bool mm_map_page(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) 
     if (mm_debug_pt) {
         kprintf("MAP: readback *pte=0x%lx\n", *pte);
     }
+
+    spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
     mm_flush_tlb(virtual_addr);
+
+    // If we replaced an existing mapping pointing to a different physical page,
+    // invalidate stale TLB entries on all other CPUs.
+    if (needs_shootdown && sched_is_smp()) {
+        smp_tlb_shootdown_sync();
+    }
+
     return true;
 }
 
-// Unmap virtual page
+// Unmap virtual page (SMP-safe)
 void mm_unmap_page(uint64_t virtual_addr) {
+    uint64_t lock_flags;
+    spin_lock_irqsave(&mm_kernel_pt_lock, &lock_flags);
+
     uint64_t* pte = mm_get_page_table(virtual_addr, false);
     if (pte && (*pte & PAGE_PRESENT)) {
         *pte = 0;
-        mm_flush_tlb(virtual_addr);
+    }
+
+    spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
+    
+    // Flush local TLB first
+    mm_flush_tlb(virtual_addr);
+    
+    // On SMP, other CPUs may have this page cached - do TLB shootdown
+    if (sched_is_smp()) {
+        smp_tlb_shootdown_sync();
     }
 }
 
@@ -1960,6 +2009,12 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
         return NULL;
     }
     
+    // CRITICAL: Disable interrupts during COW setup to prevent race conditions.
+    // If an interrupt caused a write to a page we just marked COW but haven't
+    // yet incremented the refcount, the COW handler would see refcount=0 and
+    // not make a copy, leaving the child with a stale reference.
+    uint64_t irq_flags = local_irq_save();
+    
     // Clone user-space mappings with COW from source PML4
     // User code lives in PML4[0] around virtual address 0x400000
     // We need to find user pages (those with PAGE_USER flag) in the source
@@ -2043,9 +2098,13 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
     // Flush TLB for source address space
     mm_flush_all_tlb();
     
+    // Restore interrupts after COW setup is complete
+    local_irq_restore(irq_flags);
+    
     return new_pml4;
     
 fail:
+    local_irq_restore(irq_flags);
     mm_destroy_address_space(new_pml4);
     return NULL;
 }
@@ -2077,6 +2136,12 @@ uint64_t* mm_clone_address_space_with_shared(uint64_t* src_pml4,
     if (!new_pml4) {
         return NULL;
     }
+    
+    // CRITICAL: Disable interrupts during COW setup to prevent race conditions.
+    // If an interrupt caused a write to a page we just marked COW but haven't
+    // yet incremented the refcount, the COW handler would see refcount=0 and
+    // not make a copy, leaving the child with a stale reference.
+    uint64_t irq_flags = local_irq_save();
     
     // Handle PML4 entries 0-255 (user space)
     for (int i = 0; i < 256; i++) {
@@ -2169,9 +2234,13 @@ uint64_t* mm_clone_address_space_with_shared(uint64_t* src_pml4,
     // Flush TLB
     mm_flush_all_tlb();
     
+    // Restore interrupts after COW setup is complete
+    local_irq_restore(irq_flags);
+    
     return new_pml4;
     
 fail:
+    local_irq_restore(irq_flags);
     mm_destroy_address_space(new_pml4);
     return NULL;
 }
@@ -2363,6 +2432,14 @@ void mm_remove_smp_identity_map(uint64_t physical_addr, size_t size) {
     while (page_aligned < end_addr) {
         mm_unmap_page(page_aligned);
         page_aligned += 0x1000;
+    }
+    
+    // CRITICAL: All CPUs (BSP and APs) share the kernel page tables and may
+    // have TLB entries for the trampoline identity mapping. We must invalidate
+    // them on ALL CPUs before proceeding, otherwise a CPU could use a stale
+    // TLB entry and access the wrong memory or page fault.
+    if (sched_is_smp()) {
+        smp_tlb_shootdown_sync();
     }
     
     smp_dbg("SMP: Removed identity mapping for AP trampoline\n");
