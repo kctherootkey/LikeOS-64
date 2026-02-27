@@ -19,7 +19,7 @@ calculate_ram() {
 }
 
 RAM_MB=${HOBBY_RAM_MB:-$(calculate_ram)}
-SMP=${HOBBY_SMP:-2}
+SMP=${HOBBY_SMP:-$(nproc)}
 VIDEO=${HOBBY_DISPLAY:-gtk,gl=off,show-menubar=off,show-tabs=off,grab-on-hover=on}
 ACCEL=none
 FULLSCREEN=${HOBBY_FULLSCREEN:-off}
