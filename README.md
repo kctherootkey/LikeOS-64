@@ -7,7 +7,7 @@ A modern 64-bit operating system built from scratch, featuring a Unix-like userl
 * Real hardware support: The OS has been tested with one Lenovo Notebook by booting from an USB stick. For most of real hardware the operating system boots from Linux bootstrapper that runs qemu right after the boot sequence. This is accomplished by creating a bootable usb stick with the make linux-usb and make linux-usb-write targets.
 * QEMU: The os can be also booted into qemu on for example windows or linux hosts by using the make qemu-usb target.
 * VMWare: The os can also be run in VMware with USB 3.1 enabled through the make usb-write target (USB drive boot).
-* VirtualBox: Is also supported with xHCI (USB 3) selected and the ICH9 chipset as a setting.
+* VirtualBox: Is also supported with xHCI (USB 3) selected and the ICH9 chipset as a setting. For VirtualBox you have to either configure one CPU or at least four CPUs to run LikeOS.
 
 Be sure to always enable UEFI booting for the VM. Once the os is running you can type "help" to get the shell help text.
 
