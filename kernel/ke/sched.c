@@ -1081,10 +1081,16 @@ void sched_signal_task(task_t* task, int sig) {
         signal_send(task, sig, &info);
         task->exit_code = 128 + sig;
         sched_mark_task_exited(task, 128 + sig);
-        // NOTE: Do NOT call sched_schedule() here! The caller (exception handler)
-        // will loop with 'sti; hlt', and the timer will safely preempt us.
-        // Calling sched_schedule() while still on this task's kernel stack creates
-        // a race: another CPU can free the stack via waitpid before ctx_switch.
+        // On SMP, do NOT call sched_schedule() here - the exception handler will
+        // loop with 'sti; hlt' and the timer will safely preempt us. Calling
+        // sched_schedule() while on this task's kernel stack creates a race:
+        // another CPU can free the stack via waitpid before ctx_switch.
+        // On single-CPU, this race can't happen, so schedule immediately.
+        if (task == sched_current()) {
+            if (!smp_is_enabled()) {
+                sched_schedule();
+            }
+        }
         return;
     }
 
@@ -1144,8 +1150,11 @@ void sched_signal_task(task_t* task, int sig) {
         case SIG_DFL_CORE:
             task->exit_code = 128 + sig;
             sched_mark_task_exited(task, 128 + sig);
-            // NOTE: Do NOT call sched_schedule() here! Same race as SIGKILL.
-            // Timer preemption will safely switch us off this stack.
+            // On SMP, let timer preemption safely switch us off this stack.
+            // On single-CPU, schedule immediately (no race possible).
+            if (task == sched_current() && !smp_is_enabled()) {
+                sched_schedule();
+            }
             break;
         case SIG_DFL_STOP:
             if (task->on_rq) rq_remove(task);
