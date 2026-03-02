@@ -11,6 +11,8 @@ STDLIB_SRC = src/stdlib/stdlib.c
 CTYPE_SRC = src/ctype/ctype.c
 DIR_SRC = src/dirent/dirent.c
 SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/sched.c
+PTHREAD_SRC = src/pthread/pthread.c src/pthread/pthread_mutex.c src/pthread/pthread_cond.c src/pthread/pthread_sync.c src/pthread/pthread_tsd.c
+PTHREAD_ASM = src/pthread/clone.S
 CRT0_SRC = src/crt0.S
 
 # Object files
@@ -21,10 +23,11 @@ STDLIB_OBJ = $(STDLIB_SRC:.c=.o)
 CTYPE_OBJ = $(CTYPE_SRC:.c=.o)
 DIR_OBJ = $(DIR_SRC:.c=.o)
 SYSCALLS_OBJ = $(SYSCALLS_SRC:.c=.o)
+PTHREAD_OBJ = $(PTHREAD_SRC:.c=.o) $(PTHREAD_ASM:.S=.o)
 CRT0_OBJ = $(CRT0_SRC:.S=.o)
 
 ALL_OBJ = $(MALLOC_OBJ) $(STDIO_OBJ) $(STRING_OBJ) $(STDLIB_OBJ) \
-		  $(CTYPE_OBJ) $(DIR_OBJ) $(SYSCALLS_OBJ)
+		  $(CTYPE_OBJ) $(DIR_OBJ) $(SYSCALLS_OBJ) $(PTHREAD_OBJ)
 
 # Output
 LIBC = libc.a

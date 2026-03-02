@@ -38,14 +38,49 @@ extern int errno;
 #define EPIPE          32  /* Broken pipe */
 #define EDOM           33  /* Math argument out of domain of func */
 #define ERANGE         34  /* Math result not representable */
+#define EDEADLK        35  /* Resource deadlock would occur */
+#define ENAMETOOLONG   36  /* File name too long */
+#define ENOLCK         37  /* No record locks available */
 #define ENOSYS         38  /* Function not implemented */
-#define ENOTTY         25  /* Not a typewriter */
-#define ETXTBSY        26  /* Text file busy */
-#define EFBIG          27  /* File too large */
-#define ENOSPC         28  /* No space left on device */
-#define ESPIPE         29  /* Illegal seek */
-#define EROFS          30  /* Read-only file system */
-#define EMLINK         31  /* Too many links */
-#define EPIPE          32  /* Broken pipe */
+#define ENOTEMPTY      39  /* Directory not empty */
+#define ELOOP          40  /* Too many symbolic links encountered */
+#define EWOULDBLOCK    EAGAIN  /* Operation would block */
+#define ENOMSG         42  /* No message of desired type */
+#define EIDRM          43  /* Identifier removed */
+#define ENOSTR         60  /* Device not a stream */
+#define ENODATA        61  /* No data available */
+#define ETIME          62  /* Timer expired */
+#define ENOSR          63  /* Out of streams resources */
+#define ENOLINK        67  /* Link has been severed */
+#define EPROTO         71  /* Protocol error */
+#define EBADMSG        74  /* Not a data message */
+#define EOVERFLOW      75  /* Value too large for defined data type */
+#define EILSEQ         84  /* Illegal byte sequence */
+#define ENOTSOCK       88  /* Socket operation on non-socket */
+#define EDESTADDRREQ   89  /* Destination address required */
+#define EMSGSIZE       90  /* Message too long */
+#define EPROTOTYPE     91  /* Protocol wrong type for socket */
+#define ENOPROTOOPT    92  /* Protocol not available */
+#define EPROTONOSUPPORT 93 /* Protocol not supported */
+#define ESOCKTNOSUPPORT 94 /* Socket type not supported */
+#define EOPNOTSUPP     95  /* Operation not supported on transport endpoint */
+#define EAFNOSUPPORT   97  /* Address family not supported */
+#define EADDRINUSE     98  /* Address already in use */
+#define EADDRNOTAVAIL  99  /* Cannot assign requested address */
+#define ENETDOWN       100 /* Network is down */
+#define ENETUNREACH    101 /* Network is unreachable */
+#define ECONNABORTED   103 /* Software caused connection abort */
+#define ECONNRESET     104 /* Connection reset by peer */
+#define ENOBUFS        105 /* No buffer space available */
+#define EISCONN        106 /* Transport endpoint is already connected */
+#define ENOTCONN       107 /* Transport endpoint is not connected */
+#define ETIMEDOUT      110 /* Connection timed out */
+#define ECONNREFUSED   111 /* Connection refused */
+#define EHOSTUNREACH   113 /* No route to host */
+#define EALREADY       114 /* Operation already in progress */
+#define EINPROGRESS    115 /* Operation now in progress */
+#define ESTALE         116 /* Stale file handle */
+#define EOWNERDEAD     130 /* Owner died */
+#define ENOTRECOVERABLE 131 /* State not recoverable */
 
 #endif

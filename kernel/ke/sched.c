@@ -1107,7 +1107,7 @@ void sched_mark_task_exited(task_t* task, int status) {
     // This writes 0 to the address and wakes any futex waiters
     if (task->clear_child_tid) {
         smap_disable();
-        *(task->clear_child_tid) = 0;
+        *(volatile int*)task->clear_child_tid = 0;
         smap_enable();
         
         // Wake any threads waiting on this futex (pthread_join uses this)

@@ -328,6 +328,22 @@ void exception_handler(uint64_t *regs) {
                 return;
             }
         }
+        
+        // Handle page faults in kernel mode when accessing user memory
+        // (e.g., during syscall, copy_to_user, copy_from_user)
+        // If the faulting address is in user space and we have a user task context,
+        // kill the user process instead of panicking the kernel.
+        if (!user_mode && cr2 < 0x8000000000000000ULL) {
+            task_t* cur = sched_current();
+            if (cur && cur->privilege == TASK_USER) {
+                kprintf("User process %d killed by SIGSEGV (kernel access to bad user addr)\n",
+                        (int)cur->id);
+                kprintf("  RIP=0x%016llx CR2=0x%016llx err=0x%llx\n", rip, cr2, err_code);
+                sched_signal_task(cur, SIGSEGV);
+                // Enable interrupts and halt - timer will preempt us to another task
+                for (;;) { __asm__ volatile("sti; hlt"); }
+            }
+        }
     }
 
     if (user_mode) {

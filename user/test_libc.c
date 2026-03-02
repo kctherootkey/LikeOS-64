@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sched.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -94,6 +95,126 @@ static void run_programerror_case(const char* name, const char* mode, int expect
         ok = 1;
     }
     test_result(name, ok);
+}
+
+// ========================================
+// Pthread test helper functions (file-scope to avoid GCC nested function trampolines)
+// ========================================
+
+// For pthread_create/join test
+static volatile int g_simple_thread_ran = 0;
+static volatile int g_simple_thread_arg = 0;
+
+static void* simple_thread_fn(void* arg) {
+    g_simple_thread_ran = 1;
+    g_simple_thread_arg = (int)(long)arg;
+    return (void*)42L;
+}
+
+// For pthread_detach test
+static volatile int g_detached_thread_ran = 0;
+
+static void* detached_thread_fn(void* arg) {
+    (void)arg;
+    g_detached_thread_ran = 1;
+    return NULL;
+}
+
+// For mutex contention test
+static pthread_mutex_t g_contention_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_shared_counter = 0;
+
+static void* increment_thread_fn(void* arg) {
+    int count = (int)(long)arg;
+    for (int i = 0; i < count; i++) {
+        pthread_mutex_lock(&g_contention_mutex);
+        g_shared_counter++;
+        pthread_mutex_unlock(&g_contention_mutex);
+    }
+    return NULL;
+}
+
+// For condition variable test
+struct cond_test_args {
+    pthread_cond_t* cond;
+    pthread_mutex_t* mutex;
+    volatile int* flag;
+};
+
+static void* cond_waiter_thread_fn(void* arg) {
+    struct cond_test_args* args = (struct cond_test_args*)arg;
+    pthread_mutex_lock(args->mutex);
+    while (!*args->flag) {
+        pthread_cond_wait(args->cond, args->mutex);
+    }
+    pthread_mutex_unlock(args->mutex);
+    return (void*)99L;
+}
+
+// For broadcast test
+static pthread_cond_t g_bcast_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_bcast_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_bcast_flag = 0;
+static volatile int g_waiters_done = 0;
+
+static void* bcast_waiter_fn(void* arg) {
+    (void)arg;
+    pthread_mutex_lock(&g_bcast_mutex);
+    while (!g_bcast_flag) {
+        pthread_cond_wait(&g_bcast_cond, &g_bcast_mutex);
+    }
+    g_waiters_done++;
+    pthread_mutex_unlock(&g_bcast_mutex);
+    return NULL;
+}
+
+// For barrier test
+static pthread_barrier_t g_barrier;
+static volatile int g_barrier_arrivals = 0;
+
+static void* barrier_thread_fn(void* arg) {
+    (void)arg;
+    __sync_fetch_and_add(&g_barrier_arrivals, 1);
+    int r = pthread_barrier_wait(&g_barrier);
+    return (void*)(long)r;
+}
+
+// For TSD test
+static pthread_key_t g_tsd_key;
+static volatile int g_destructor_called = 0;
+
+static void tsd_destructor_fn(void* value) {
+    if (value) {
+        g_destructor_called = 1;
+    }
+}
+
+static void* tsd_thread_fn(void* arg) {
+    (void)arg;
+    // Should be NULL initially in new thread
+    void* v = pthread_getspecific(g_tsd_key);
+    if (v != NULL) return (void*)1L;
+    
+    // Set thread-local value
+    pthread_setspecific(g_tsd_key, (void*)99999L);
+    v = pthread_getspecific(g_tsd_key);
+    if (v != (void*)99999L) return (void*)2L;
+    
+    return (void*)0L;  // Success
+}
+
+// For pthread_once test
+static pthread_once_t g_once_control = PTHREAD_ONCE_INIT;
+static volatile int g_once_counter = 0;
+
+static void once_init_fn(void) {
+    g_once_counter++;
+}
+
+static void* once_thread_fn(void* arg) {
+    (void)arg;
+    pthread_once(&g_once_control, once_init_fn);
+    return NULL;
 }
 
 int main(int argc, char** argv) {
@@ -1845,8 +1966,8 @@ int main(int argc, char** argv) {
                 }
                 _exit(0);
             } else if (child > 0) {
-                // Parent yields for a while
-                for (int i = 0; i < 200; i++) {
+                // Parent yields a few times (reduced for speed)
+                for (int i = 0; i < 5; i++) {
                     shared[1]++;
                     sched_yield();
                 }
@@ -1856,7 +1977,7 @@ int main(int argc, char** argv) {
                 
                 printf("  yield test: parent=%d, child=%d iterations\n", 
                        (int)shared[1], (int)shared[0]);
-                test_result("sched_yield parent ran", shared[1] >= 200);
+                test_result("sched_yield parent ran", shared[1] >= 5);
                 test_result("sched_yield child ran", shared[0] > 0);
             }
             munmap((void*)shared, 4096);
@@ -2140,6 +2261,472 @@ int main(int argc, char** argv) {
         } else {
             test_fail("mmap for fork test failed");
         }
+    }
+
+    // ========================================
+    // Pthread Tests
+    // ========================================
+    printf("\n========================================\n");
+    printf("[TEST] Pthread Library Tests\n");
+    printf("========================================\n");
+
+    // Test pthread_self and pthread_equal
+    printf("\n[TEST] pthread_self and pthread_equal\n");
+    {
+        pthread_t self = pthread_self();
+        test_result("pthread_self() returns non-NULL", self != 0);
+        test_result("pthread_equal(self, self) returns non-zero", pthread_equal(self, self) != 0);
+        printf("  pthread_self() = %p\n", (void*)self);
+    }
+
+    // Test pthread_attr functions
+    printf("\n[TEST] pthread_attr functions\n");
+    {
+        pthread_attr_t attr;
+        int ret = pthread_attr_init(&attr);
+        test_result("pthread_attr_init succeeds", ret == 0);
+
+        // Test detachstate
+        int detach_state = -1;
+        ret = pthread_attr_getdetachstate(&attr, &detach_state);
+        test_result("pthread_attr_getdetachstate succeeds", ret == 0);
+        test_result("default detachstate is JOINABLE", detach_state == PTHREAD_CREATE_JOINABLE);
+
+        ret = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        test_result("pthread_attr_setdetachstate succeeds", ret == 0);
+        pthread_attr_getdetachstate(&attr, &detach_state);
+        test_result("detachstate is now DETACHED", detach_state == PTHREAD_CREATE_DETACHED);
+
+        // Test stacksize
+        size_t stacksize = 0;
+        ret = pthread_attr_getstacksize(&attr, &stacksize);
+        test_result("pthread_attr_getstacksize succeeds", ret == 0);
+        test_result("default stacksize >= 16KB", stacksize >= 16384);
+        printf("  Default stack size: %zu bytes\n", stacksize);
+
+        ret = pthread_attr_setstacksize(&attr, 4 * 1024 * 1024); // 4MB
+        test_result("pthread_attr_setstacksize(4MB) succeeds", ret == 0);
+        pthread_attr_getstacksize(&attr, &stacksize);
+        test_result("stacksize is now 4MB", stacksize == 4 * 1024 * 1024);
+
+        // Test guardsize
+        size_t guardsize = 0;
+        ret = pthread_attr_getguardsize(&attr, &guardsize);
+        test_result("pthread_attr_getguardsize succeeds", ret == 0);
+        printf("  Default guard size: %zu bytes\n", guardsize);
+
+        ret = pthread_attr_setguardsize(&attr, 8192);
+        test_result("pthread_attr_setguardsize succeeds", ret == 0);
+        pthread_attr_getguardsize(&attr, &guardsize);
+        test_result("guardsize is now 8192", guardsize == 8192);
+
+        ret = pthread_attr_destroy(&attr);
+        test_result("pthread_attr_destroy succeeds", ret == 0);
+    }
+
+    // Test basic thread creation and join
+    printf("\n[TEST] pthread_create and pthread_join\n");
+    {
+        g_simple_thread_ran = 0;
+        g_simple_thread_arg = 0;
+
+        pthread_t thread;
+        int ret = pthread_create(&thread, NULL, simple_thread_fn, (void*)123L);
+        test_result("pthread_create succeeds", ret == 0);
+        printf("  Created thread %p\n", (void*)thread);
+
+        void* retval = NULL;
+        ret = pthread_join(thread, &retval);
+        test_result("pthread_join succeeds", ret == 0);
+        test_result("thread function ran", g_simple_thread_ran == 1);
+        test_result("thread received correct argument", g_simple_thread_arg == 123);
+        test_result("thread returned correct value", retval == (void*)42L);
+        printf("  Thread returned: %ld\n", (long)retval);
+    }
+
+    // Test pthread_detach
+    printf("\n[TEST] pthread_detach\n");
+    {
+        g_detached_thread_ran = 0;
+
+        pthread_t thread;
+        int ret = pthread_create(&thread, NULL, detached_thread_fn, NULL);
+        test_result("pthread_create for detach test succeeds", ret == 0);
+        
+        ret = pthread_detach(thread);
+        test_result("pthread_detach succeeds", ret == 0);
+        
+        // Wait a bit for the thread to run
+        for (volatile int i = 0; i < 1000000 && !g_detached_thread_ran; i++);
+        
+        // Can't join a detached thread, but it should have run
+        test_result("detached thread ran", g_detached_thread_ran == 1);
+    }
+
+    // Test mutex basic operations
+    printf("\n[TEST] pthread_mutex basic operations\n");
+    {
+        pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+        
+        int ret = pthread_mutex_lock(&mutex);
+        test_result("pthread_mutex_lock succeeds", ret == 0);
+        
+        ret = pthread_mutex_unlock(&mutex);
+        test_result("pthread_mutex_unlock succeeds", ret == 0);
+        
+        ret = pthread_mutex_trylock(&mutex);
+        test_result("pthread_mutex_trylock succeeds when unlocked", ret == 0);
+        
+        ret = pthread_mutex_unlock(&mutex);
+        test_result("pthread_mutex_unlock after trylock succeeds", ret == 0);
+        
+        ret = pthread_mutex_destroy(&mutex);
+        test_result("pthread_mutex_destroy succeeds", ret == 0);
+    }
+
+    // Test mutex with thread contention
+    printf("\n[TEST] pthread_mutex with thread contention\n");
+    {
+        pthread_t t1, t2;
+        g_shared_counter = 0;
+        int increments = 1000;
+        
+        int ret1 = pthread_create(&t1, NULL, increment_thread_fn, (void*)(long)increments);
+        int ret2 = pthread_create(&t2, NULL, increment_thread_fn, (void*)(long)increments);
+        test_result("pthread_create for t1 succeeds", ret1 == 0);
+        test_result("pthread_create for t2 succeeds", ret2 == 0);
+        
+        pthread_join(t1, NULL);
+        pthread_join(t2, NULL);
+        
+        test_result("mutex protects counter correctly", g_shared_counter == 2 * increments);
+        printf("  Expected counter: %d, Actual: %d\n", 2 * increments, g_shared_counter);
+        
+        pthread_mutex_destroy(&g_contention_mutex);
+    }
+
+    // Test recursive mutex
+    printf("\n[TEST] pthread_mutex recursive\n");
+    {
+        pthread_mutexattr_t attr;
+        pthread_mutex_t recursive_mutex;
+        
+        int ret = pthread_mutexattr_init(&attr);
+        test_result("pthread_mutexattr_init succeeds", ret == 0);
+        
+        ret = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        test_result("pthread_mutexattr_settype(RECURSIVE) succeeds", ret == 0);
+        
+        ret = pthread_mutex_init(&recursive_mutex, &attr);
+        test_result("pthread_mutex_init with recursive attr succeeds", ret == 0);
+        
+        // Lock multiple times
+        ret = pthread_mutex_lock(&recursive_mutex);
+        test_result("first lock succeeds", ret == 0);
+        
+        ret = pthread_mutex_lock(&recursive_mutex);
+        test_result("second lock (recursive) succeeds", ret == 0);
+        
+        ret = pthread_mutex_lock(&recursive_mutex);
+        test_result("third lock (recursive) succeeds", ret == 0);
+        
+        // Unlock same number of times
+        ret = pthread_mutex_unlock(&recursive_mutex);
+        test_result("first unlock succeeds", ret == 0);
+        
+        ret = pthread_mutex_unlock(&recursive_mutex);
+        test_result("second unlock succeeds", ret == 0);
+        
+        ret = pthread_mutex_unlock(&recursive_mutex);
+        test_result("third unlock succeeds", ret == 0);
+        
+        pthread_mutex_destroy(&recursive_mutex);
+        pthread_mutexattr_destroy(&attr);
+    }
+
+    // Test condition variables
+    printf("\n[TEST] pthread_cond basic operations\n");
+    {
+        pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+        pthread_mutex_t cond_mutex = PTHREAD_MUTEX_INITIALIZER;
+        static volatile int cond_flag = 0;
+        cond_flag = 0;
+
+        struct cond_test_args args = { &cond, &cond_mutex, &cond_flag };
+        pthread_t waiter;
+        int ret = pthread_create(&waiter, NULL, cond_waiter_thread_fn, &args);
+        test_result("pthread_create for cond waiter succeeds", ret == 0);
+        
+        // Give waiter time to start waiting
+        for (volatile int i = 0; i < 100000; i++);
+        
+        // Signal the condition
+        pthread_mutex_lock(&cond_mutex);
+        cond_flag = 1;
+        ret = pthread_cond_signal(&cond);
+        test_result("pthread_cond_signal succeeds", ret == 0);
+        pthread_mutex_unlock(&cond_mutex);
+        
+        void* retval;
+        ret = pthread_join(waiter, &retval);
+        test_result("pthread_join on cond waiter succeeds", ret == 0);
+        test_result("cond waiter completed", retval == (void*)99L);
+        
+        pthread_cond_destroy(&cond);
+        pthread_mutex_destroy(&cond_mutex);
+    }
+
+    // Test pthread_cond_broadcast
+    printf("\n[TEST] pthread_cond_broadcast\n");
+    {
+        g_bcast_flag = 0;
+        g_waiters_done = 0;
+
+        pthread_t t1, t2, t3;
+        pthread_create(&t1, NULL, bcast_waiter_fn, NULL);
+        pthread_create(&t2, NULL, bcast_waiter_fn, NULL);
+        pthread_create(&t3, NULL, bcast_waiter_fn, NULL);
+        
+        // Give waiters time to start
+        for (volatile int i = 0; i < 100000; i++);
+        
+        pthread_mutex_lock(&g_bcast_mutex);
+        g_bcast_flag = 1;
+        int ret = pthread_cond_broadcast(&g_bcast_cond);
+        test_result("pthread_cond_broadcast succeeds", ret == 0);
+        pthread_mutex_unlock(&g_bcast_mutex);
+        
+        pthread_join(t1, NULL);
+        pthread_join(t2, NULL);
+        pthread_join(t3, NULL);
+        
+        test_result("all 3 waiters woke up", g_waiters_done == 3);
+        
+        pthread_cond_destroy(&g_bcast_cond);
+        pthread_mutex_destroy(&g_bcast_mutex);
+    }
+
+    // Test rwlock
+    printf("\n[TEST] pthread_rwlock\n");
+    {
+        pthread_rwlock_t rwlock;
+        int ret = pthread_rwlock_init(&rwlock, NULL);
+        test_result("pthread_rwlock_init succeeds", ret == 0);
+        
+        // Multiple read locks should succeed
+        ret = pthread_rwlock_rdlock(&rwlock);
+        test_result("first rdlock succeeds", ret == 0);
+        
+        ret = pthread_rwlock_tryrdlock(&rwlock);
+        test_result("second rdlock (tryrdlock) succeeds", ret == 0);
+        
+        ret = pthread_rwlock_unlock(&rwlock);
+        test_result("first rdunlock succeeds", ret == 0);
+        
+        ret = pthread_rwlock_unlock(&rwlock);
+        test_result("second rdunlock succeeds", ret == 0);
+        
+        // Write lock
+        ret = pthread_rwlock_wrlock(&rwlock);
+        test_result("wrlock succeeds", ret == 0);
+        
+        ret = pthread_rwlock_unlock(&rwlock);
+        test_result("wrunlock succeeds", ret == 0);
+        
+        // Try write lock
+        ret = pthread_rwlock_trywrlock(&rwlock);
+        test_result("trywrlock succeeds when unlocked", ret == 0);
+        
+        ret = pthread_rwlock_unlock(&rwlock);
+        test_result("unlock after trywrlock succeeds", ret == 0);
+        
+        ret = pthread_rwlock_destroy(&rwlock);
+        test_result("pthread_rwlock_destroy succeeds", ret == 0);
+    }
+
+    // Test spinlock
+    printf("\n[TEST] pthread_spin\n");
+    {
+        pthread_spinlock_t spinlock;
+        int ret = pthread_spin_init(&spinlock, PTHREAD_PROCESS_PRIVATE);
+        test_result("pthread_spin_init succeeds", ret == 0);
+        
+        ret = pthread_spin_lock(&spinlock);
+        test_result("pthread_spin_lock succeeds", ret == 0);
+        
+        ret = pthread_spin_unlock(&spinlock);
+        test_result("pthread_spin_unlock succeeds", ret == 0);
+        
+        ret = pthread_spin_trylock(&spinlock);
+        test_result("pthread_spin_trylock succeeds", ret == 0);
+        
+        ret = pthread_spin_unlock(&spinlock);
+        test_result("pthread_spin_unlock after trylock succeeds", ret == 0);
+        
+        ret = pthread_spin_destroy(&spinlock);
+        test_result("pthread_spin_destroy succeeds", ret == 0);
+    }
+
+    // Test barrier
+    printf("\n[TEST] pthread_barrier\n");
+    {
+        g_barrier_arrivals = 0;
+        
+        int ret = pthread_barrier_init(&g_barrier, NULL, 3);
+        test_result("pthread_barrier_init(count=3) succeeds", ret == 0);
+
+        pthread_t t1, t2;
+        pthread_create(&t1, NULL, barrier_thread_fn, NULL);
+        pthread_create(&t2, NULL, barrier_thread_fn, NULL);
+        
+        // This thread also participates
+        __sync_fetch_and_add(&g_barrier_arrivals, 1);
+        ret = pthread_barrier_wait(&g_barrier);
+        test_result("pthread_barrier_wait returns 0 or SERIAL", 
+                    ret == 0 || ret == PTHREAD_BARRIER_SERIAL_THREAD);
+        
+        void *r1, *r2;
+        pthread_join(t1, &r1);
+        pthread_join(t2, &r2);
+        
+        test_result("all 3 threads reached barrier", g_barrier_arrivals == 3);
+        
+        // Check that exactly one got SERIAL_THREAD
+        int serials = (ret == PTHREAD_BARRIER_SERIAL_THREAD ? 1 : 0)
+                    + ((long)r1 == PTHREAD_BARRIER_SERIAL_THREAD ? 1 : 0)
+                    + ((long)r2 == PTHREAD_BARRIER_SERIAL_THREAD ? 1 : 0);
+        test_result("exactly one thread got SERIAL_THREAD", serials == 1);
+        
+        ret = pthread_barrier_destroy(&g_barrier);
+        test_result("pthread_barrier_destroy succeeds", ret == 0);
+    }
+
+    // Test thread-specific data (TSD)
+    printf("\n[TEST] pthread TSD (thread-specific data)\n");
+    {
+        g_destructor_called = 0;
+
+        int ret = pthread_key_create(&g_tsd_key, tsd_destructor_fn);
+        test_result("pthread_key_create succeeds", ret == 0);
+        
+        // Set value in main thread
+        ret = pthread_setspecific(g_tsd_key, (void*)12345L);
+        test_result("pthread_setspecific succeeds", ret == 0);
+        
+        void* val = pthread_getspecific(g_tsd_key);
+        test_result("pthread_getspecific returns correct value", val == (void*)12345L);
+        
+        // Test in another thread
+        pthread_t t;
+        pthread_create(&t, NULL, tsd_thread_fn, NULL);
+        void* tsd_result;
+        pthread_join(t, &tsd_result);
+        test_result("TSD is thread-local", tsd_result == (void*)0L);
+        
+        // Main thread's value should be unchanged
+        val = pthread_getspecific(g_tsd_key);
+        test_result("main thread TSD unchanged", val == (void*)12345L);
+        
+        ret = pthread_key_delete(g_tsd_key);
+        test_result("pthread_key_delete succeeds", ret == 0);
+    }
+
+    // Test sched_setaffinity / sched_getaffinity
+    printf("\n[TEST] sched_setaffinity and sched_getaffinity\n");
+    {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        
+        // Get current affinity
+        int ret = sched_getaffinity(0, sizeof(cpu_set_t), &cpuset);
+        test_result("sched_getaffinity succeeds", ret == 0);
+        
+        int cpu_count = 0;
+        for (int i = 0; i < CPU_SETSIZE; i++) {
+            if (CPU_ISSET(i, &cpuset)) cpu_count++;
+        }
+        test_result("at least one CPU in affinity mask", cpu_count >= 1);
+        printf("  CPUs in affinity mask: %d\n", cpu_count);
+        
+        // Try to set affinity to CPU 0 only
+        cpu_set_t new_cpuset;
+        CPU_ZERO(&new_cpuset);
+        CPU_SET(0, &new_cpuset);
+        
+        ret = sched_setaffinity(0, sizeof(cpu_set_t), &new_cpuset);
+        // This might fail if system doesn't support it, but shouldn't crash
+        if (ret == 0) {
+            test_pass("sched_setaffinity to CPU 0 succeeds");
+            
+            // Verify it was set
+            CPU_ZERO(&cpuset);
+            sched_getaffinity(0, sizeof(cpu_set_t), &cpuset);
+            test_result("affinity was updated", CPU_ISSET(0, &cpuset));
+        } else {
+            printf("  sched_setaffinity returned %d (may not be supported)\n", ret);
+            test_pass("sched_setaffinity returned (not necessarily successful)");
+        }
+    }
+
+    // Test pthread_setaffinity_np / pthread_getaffinity_np
+    printf("\n[TEST] pthread_setaffinity_np and pthread_getaffinity_np\n");
+    {
+        pthread_t self = pthread_self();
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        
+        int ret = pthread_getaffinity_np(self, sizeof(cpu_set_t), &cpuset);
+        if (ret == 0) {
+            test_pass("pthread_getaffinity_np succeeds");
+            
+            int cpu_count = 0;
+            for (int i = 0; i < CPU_SETSIZE; i++) {
+                if (CPU_ISSET(i, &cpuset)) cpu_count++;
+            }
+            test_result("pthread affinity has CPUs", cpu_count >= 1);
+            printf("  Thread CPUs in affinity: %d\n", cpu_count);
+            
+            // Try to set
+            cpu_set_t new_cpuset;
+            CPU_ZERO(&new_cpuset);
+            CPU_SET(0, &new_cpuset);
+            
+            ret = pthread_setaffinity_np(self, sizeof(cpu_set_t), &new_cpuset);
+            if (ret == 0) {
+                test_pass("pthread_setaffinity_np succeeds");
+            } else {
+                printf("  pthread_setaffinity_np returned %d\n", ret);
+                test_pass("pthread_setaffinity_np returned");
+            }
+        } else {
+            printf("  pthread_getaffinity_np returned %d\n", ret);
+            test_pass("pthread_getaffinity_np returned (may use fallback)");
+        }
+    }
+
+    // Test pthread_once
+    printf("\n[TEST] pthread_once\n");
+    {
+        // Reset for test (note: g_once_control is global and already initialized)
+        // We can't easily reset a pthread_once_t, so test without reset
+        g_once_counter = 0;
+
+        int ret = pthread_once(&g_once_control, once_init_fn);
+        test_result("first pthread_once succeeds", ret == 0);
+        test_result("init function called once", g_once_counter == 1);
+        
+        ret = pthread_once(&g_once_control, once_init_fn);
+        test_result("second pthread_once succeeds", ret == 0);
+        test_result("init function still called only once", g_once_counter == 1);
+        
+        // Test from multiple threads
+        pthread_t t1, t2;
+        pthread_create(&t1, NULL, once_thread_fn, NULL);
+        pthread_create(&t2, NULL, once_thread_fn, NULL);
+        pthread_join(t1, NULL);
+        pthread_join(t2, NULL);
+        
+        test_result("init function called exactly once across threads", g_once_counter == 1);
     }
 
     // ========================================

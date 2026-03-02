@@ -134,7 +134,7 @@ int sched_rr_get_interval(pid_t pid, struct timespec* tp) {
 #define FUTEX_PRIVATE_FLAG  128
 
 // SYS_FUTEX - fast userspace mutex operations
-int futex_wait(int* uaddr, int val, const struct timespec* timeout) {
+int futex_wait(volatile int* uaddr, int val, const struct timespec* timeout) {
     long ret = syscall4(SYS_FUTEX, (long)uaddr, FUTEX_WAIT, val, (long)timeout);
     if (ret < 0) {
         errno = -ret;
@@ -143,7 +143,7 @@ int futex_wait(int* uaddr, int val, const struct timespec* timeout) {
     return 0;
 }
 
-int futex_wake(int* uaddr, int count) {
+int futex_wake(volatile int* uaddr, int count) {
     long ret = syscall3(SYS_FUTEX, (long)uaddr, FUTEX_WAKE, count);
     if (ret < 0) {
         errno = -ret;
