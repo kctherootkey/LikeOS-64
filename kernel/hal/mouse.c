@@ -7,9 +7,13 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/cursor.h"
 
 // Global mouse state
 static mouse_state_t mouse_state = {0};
+
+// Flag indicating whether to use loaded cursor or built-in
+static int use_loaded_cursor = 0;
 
 // Spinlock for mouse state protection
 static spinlock_t mouse_lock = SPINLOCK_INIT("mouse");
@@ -59,6 +63,42 @@ static const uint32_t cursor_bitmap[CURSOR_HEIGHT][CURSOR_WIDTH] = {
 
 // Cursor background buffer for restoration
 static uint32_t* cursor_background = NULL;
+
+// Alpha blend foreground (ARGB) over background (xRGB), returns blended xRGB
+static inline uint32_t alpha_blend(uint32_t fg, uint32_t bg) {
+    uint32_t alpha = (fg >> 24) & 0xFF;
+    if (alpha == 0) {
+        return bg;  // Fully transparent
+    }
+    if (alpha == 255) {
+        return fg | 0xFF000000;  // Fully opaque
+    }
+    // Extract components
+    uint32_t fg_r = (fg >> 16) & 0xFF;
+    uint32_t fg_g = (fg >> 8) & 0xFF;
+    uint32_t fg_b = fg & 0xFF;
+    uint32_t bg_r = (bg >> 16) & 0xFF;
+    uint32_t bg_g = (bg >> 8) & 0xFF;
+    uint32_t bg_b = bg & 0xFF;
+    // Blend: out = fg * alpha + bg * (255 - alpha)
+    uint32_t inv_alpha = 255 - alpha;
+    uint32_t out_r = (fg_r * alpha + bg_r * inv_alpha) / 255;
+    uint32_t out_g = (fg_g * alpha + bg_g * inv_alpha) / 255;
+    uint32_t out_b = (fg_b * alpha + bg_b * inv_alpha) / 255;
+    return 0xFF000000 | (out_r << 16) | (out_g << 8) | out_b;
+}
+
+// Helper to get cursor pixel at position (from loaded cursor or built-in)
+static inline uint32_t get_cursor_pixel(int cx, int cy) {
+    if (use_loaded_cursor && cursor_is_loaded()) {
+        return cursor_get_pixel((uint32_t)cx, (uint32_t)cy);
+    }
+    // Built-in cursor
+    if (cx >= 0 && cx < CURSOR_WIDTH && cy >= 0 && cy < CURSOR_HEIGHT) {
+        return cursor_bitmap[cy][cx];
+    }
+    return 0;
+}
 
 // Wait for PS/2 controller input buffer to be ready
 static void mouse_wait_input(void)
@@ -198,9 +238,12 @@ static void mouse_draw_cursor_full(int x, int y)
                 continue;
             }
             cursor_background[bg_index] = fb_get_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y);
-            uint32_t pix = cursor_bitmap[cy][cx];
-            if(pix != 0x00000000) {
-                fb_set_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y, pix);
+            uint32_t pix = get_cursor_pixel(cx, cy);
+            // Alpha blend cursor pixel with background for smooth anti-aliased edges
+            uint8_t alpha = (pix >> 24) & 0xFF;
+            if(alpha > 0) {
+                uint32_t blended = alpha_blend(pix, cursor_background[bg_index]);
+                fb_set_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y, blended);
             }
         }
     }
@@ -289,9 +332,12 @@ static void mouse_draw_cursor_partial(int x, int y, int visible_w, int visible_h
                 continue;
             }
             cursor_background[bg_index] = fb_get_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y);
-            uint32_t pix = cursor_bitmap[cy][cx];
-            if(pix != 0x00000000) {
-                fb_set_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y, pix);
+            uint32_t pix = get_cursor_pixel(cx, cy);
+            // Alpha blend cursor pixel with background for smooth anti-aliased edges
+            uint8_t alpha = (pix >> 24) & 0xFF;
+            if(alpha > 0) {
+                uint32_t blended = alpha_blend(pix, cursor_background[bg_index]);
+                fb_set_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y, blended);
             }
         }
     }
@@ -760,4 +806,61 @@ void mouse_show_cursor(int show)
         mouse_state.cursor_visible = 0;
         fb_flush_dirty_regions();
     }
+}
+
+// Apply a loaded cursor (must be called after cursor_load succeeded)
+void mouse_apply_cursor(void)
+{
+    uint64_t flags;
+    spin_lock_irqsave(&mouse_lock, &flags);
+
+    if (!cursor_is_loaded()) {
+        spin_unlock_irqrestore(&mouse_lock, flags);
+        return;
+    }
+
+    // Clear the old cursor first
+    if (mouse_state.cursor_visible) {
+        mouse_clear_cursor_full(mouse_state.x, mouse_state.y);
+    }
+
+    // Get new cursor dimensions
+    uint32_t new_w = cursor_get_width();
+    uint32_t new_h = cursor_get_height();
+
+    // Reallocate background buffer if size changed
+    size_t old_count = (size_t)mouse_state.cursor_w * (size_t)mouse_state.cursor_h;
+    size_t new_count = (size_t)new_w * (size_t)new_h;
+
+    if (new_count != old_count && cursor_background) {
+        kfree(cursor_background);
+        cursor_background = (uint32_t*)kalloc(new_count * sizeof(uint32_t));
+        if (!cursor_background) {
+            kprintf("mouse: failed to reallocate cursor background buffer\n");
+            spin_unlock_irqrestore(&mouse_lock, flags);
+            return;
+        }
+    }
+
+    // Initialize background buffer
+    for (size_t i = 0; i < new_count; ++i) {
+        cursor_background[i] = BG_SENTINEL;
+    }
+
+    // Update cursor dimensions
+    mouse_state.cursor_w = (int)new_w;
+    mouse_state.cursor_h = (int)new_h;
+
+    // Enable the loaded cursor
+    use_loaded_cursor = 1;
+
+    // Draw the new cursor
+    if (mouse_state.cursor_visible) {
+        mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
+        fb_flush_dirty_regions();
+    }
+
+    spin_unlock_irqrestore(&mouse_lock, flags);
+
+    kprintf("mouse: using loaded cursor (%ux%u)\n", new_w, new_h);
 }

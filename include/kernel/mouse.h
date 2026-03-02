@@ -126,5 +126,6 @@ int mouse_scroll_delta(void);
 // Configuration
 void mouse_set_sensitivity(int sensitivity);
 void mouse_show_cursor(int show);
+void mouse_apply_cursor(void);  // Apply loaded cursor from cursor.h
 
 #endif // _KERNEL_MOUSE_H_

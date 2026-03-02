@@ -60,6 +60,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/storage.o \
               $(BUILD_DIR)/console.o \
               $(BUILD_DIR)/sysfont.o \
+              $(BUILD_DIR)/cursor.o \
               $(BUILD_DIR)/fb_optimize.o \
               $(BUILD_DIR)/interrupt.o \
               $(BUILD_DIR)/interrupt_c.o \
@@ -131,6 +132,9 @@ $(BUILD_DIR)/console.o: $(KERNEL_DIR)/hal/console.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/sysfont.o: $(KERNEL_DIR)/hal/sysfont.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/cursor.o: $(KERNEL_DIR)/hal/cursor.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/fb_optimize.o: $(KERNEL_DIR)/hal/fb_optimize.c | $(BUILD_DIR)
@@ -385,6 +389,8 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	# Add system font resource
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/res || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) res/Lat15-Fixed16.psf ::/res/Lat15-Fixed16.psf
+	# Add mouse cursor resource
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) res/left_ptr ::/res/left_ptr
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/LIKEOS.SIG ::/LIKEOS.SIG
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/HELLO.TXT ::/HELLO.TXT
 	rm -f $(BUILD_DIR)/LIKEOS.SIG $(BUILD_DIR)/HELLO.TXT || true
@@ -436,6 +442,8 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	# Add system font resource
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/res || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/Lat15-Fixed16.psf ::/res/Lat15-Fixed16.psf
+	# Add mouse cursor resource
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/left_ptr ::/res/left_ptr
 	# Add signature + sample files
 	echo "THIS IS A DEVICE STORING LIKEOS" > $(BUILD_DIR)/LIKEOS.SIG
 	echo "Hello from USB mass storage" > $(BUILD_DIR)/HELLO.TXT
@@ -544,6 +552,8 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 
 	# Copy system font
 	sudo cp res/Lat15-Fixed16.psf /tmp/likeos_usb_mount/res/Lat15-Fixed16.psf
+	# Copy mouse cursor
+	sudo cp res/left_ptr /tmp/likeos_usb_mount/res/left_ptr
 
 	# Copy userland programs to /bin
 	sudo cp $(BUILD_DIR)/sh /tmp/likeos_usb_mount/bin/sh

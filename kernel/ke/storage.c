@@ -6,6 +6,8 @@
 #include "../../include/kernel/shell.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/sysfont.h"
+#include "../../include/kernel/cursor.h"
+#include "../../include/kernel/mouse.h"
 
 void storage_fs_init(storage_fs_state_t* state) {
     if (!state) {
@@ -78,6 +80,11 @@ void storage_fs_poll(storage_fs_state_t* state) {
                 // Load system console font from /res/Lat15-Fixed16.psf
                 if (sysfont_load("/res/Lat15-Fixed16.psf") == 0) {
                     console_apply_sysfont();
+                }
+                
+                // Load mouse cursor from /res/left_ptr
+                if (cursor_load("/res/left_ptr") == 0) {
+                    mouse_apply_cursor();
                 }
                 
                 shell_redisplay_prompt();  // Redisplay prompt after mount messages
