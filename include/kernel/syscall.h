@@ -104,6 +104,32 @@
 #define CLOCK_PROCESS_CPUTIME_ID 2
 #define CLOCK_THREAD_CPUTIME_ID  3
 
+// SMP/Threading syscalls (using 310+ to avoid conflicts)
+#define SYS_CLONE           310
+#define SYS_VFORK           311
+#define SYS_EXIT_GROUP      312
+#define SYS_GETTID          313
+#define SYS_SET_TID_ADDRESS 314
+#define SYS_FUTEX           315
+#define SYS_SET_ROBUST_LIST 316
+#define SYS_GET_ROBUST_LIST 317
+#define SYS_ARCH_PRCTL      318  // TLS support (ARCH_SET_FS/ARCH_GET_FS)
+#define SYS_FUTEX_REQUEUE   319  // Futex requeue operation
+
+// Scheduling syscalls (using 320+ to avoid conflicts)
+#define SYS_SCHED_SETAFFINITY       320
+#define SYS_SCHED_GETAFFINITY       321
+#define SYS_SCHED_SETSCHEDULER      322
+#define SYS_SCHED_GETSCHEDULER      323
+#define SYS_SCHED_SETPARAM          324
+#define SYS_SCHED_GETPARAM          325
+#define SYS_SCHED_GET_PRIORITY_MAX  326
+#define SYS_SCHED_GET_PRIORITY_MIN  327
+#define SYS_SCHED_RR_GET_INTERVAL   328
+
+// Memory protection
+#define SYS_MPROTECT        329
+
 // Debug/diagnostic syscalls (LikeOS specific)
 #define SYS_MEMSTATS        300  // Print memory stats
 

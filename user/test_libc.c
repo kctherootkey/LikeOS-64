@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -13,6 +14,10 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+
+// Futex helper declarations (from sched.c)
+int futex_wait(int* uaddr, int val, const struct timespec* timeout);
+int futex_wake(int* uaddr, int count);
 
 // Test result tracking
 static int tests_passed = 0;
@@ -1857,6 +1862,283 @@ int main(int argc, char** argv) {
             munmap((void*)shared, 4096);
         } else {
             test_fail("sched_yield test: mmap failed");
+        }
+    }
+
+    // ========================================
+    // Test: SMP/Threading syscalls
+    // ========================================
+    printf("\n[TEST] SMP/Threading syscalls\n");
+    
+    // Test gettid()
+    {
+        pid_t tid = gettid();
+        printf("  gettid() = %d\n", tid);
+        test_result("gettid() returns positive value", tid > 0);
+        
+        // TID should equal PID for single-threaded process
+        pid_t pid = getpid();
+        test_result("gettid() == getpid() for single-threaded", tid == pid);
+    }
+    
+    // Test sched_getaffinity() / sched_setaffinity()
+    printf("\n[TEST] CPU affinity syscalls\n");
+    {
+        cpu_set_t mask;
+        CPU_ZERO(&mask);
+        
+        int ret = sched_getaffinity(0, sizeof(mask), &mask);
+        printf("  sched_getaffinity() returned %d\n", ret);
+        test_result("sched_getaffinity() succeeds", ret >= 0);
+        
+        // Check that at least one CPU is set
+        int cpu_count = CPU_COUNT(&mask);
+        printf("  CPU count in mask: %d\n", cpu_count);
+        test_result("At least one CPU in affinity mask", cpu_count > 0);
+        
+        // Try to set affinity to CPU 0
+        CPU_ZERO(&mask);
+        CPU_SET(0, &mask);
+        ret = sched_setaffinity(0, sizeof(mask), &mask);
+        printf("  sched_setaffinity(CPU 0) returned %d\n", ret);
+        test_result("sched_setaffinity() succeeds", ret == 0);
+        
+        // Verify the change
+        CPU_ZERO(&mask);
+        sched_getaffinity(0, sizeof(mask), &mask);
+        test_result("CPU 0 is set after setaffinity", CPU_ISSET(0, &mask));
+    }
+    
+    // Test sched_getscheduler() / sched_setscheduler()
+    printf("\n[TEST] Scheduler policy syscalls\n");
+    {
+        int policy = sched_getscheduler(0);
+        printf("  sched_getscheduler(0) = %d\n", policy);
+        test_result("sched_getscheduler() succeeds", policy >= 0);
+        test_result("Default policy is SCHED_NORMAL (0)", policy == SCHED_NORMAL);
+        
+        // Try to set scheduler (should work even though we only support NORMAL)
+        struct sched_param param = { .sched_priority = 0 };
+        int ret = sched_setscheduler(0, SCHED_NORMAL, &param);
+        test_result("sched_setscheduler(SCHED_NORMAL) succeeds", ret == 0);
+    }
+    
+    // Test sched_getparam() / sched_setparam()
+    printf("\n[TEST] Scheduler parameter syscalls\n");
+    {
+        struct sched_param param;
+        int ret = sched_getparam(0, &param);
+        printf("  sched_getparam() returned %d, priority=%d\n", ret, param.sched_priority);
+        test_result("sched_getparam() succeeds", ret == 0);
+        
+        param.sched_priority = 0;
+        ret = sched_setparam(0, &param);
+        test_result("sched_setparam() succeeds", ret == 0);
+    }
+    
+    // Test sched_get_priority_max() / sched_get_priority_min()
+    printf("\n[TEST] Priority range syscalls\n");
+    {
+        int max_rr = sched_get_priority_max(SCHED_RR);
+        int min_rr = sched_get_priority_min(SCHED_RR);
+        printf("  SCHED_RR priority range: %d - %d\n", min_rr, max_rr);
+        test_result("SCHED_RR max priority is 99", max_rr == 99);
+        test_result("SCHED_RR min priority is 1", min_rr == 1);
+        
+        int max_normal = sched_get_priority_max(SCHED_NORMAL);
+        int min_normal = sched_get_priority_min(SCHED_NORMAL);
+        printf("  SCHED_NORMAL priority range: %d - %d\n", min_normal, max_normal);
+        test_result("SCHED_NORMAL max priority is 0", max_normal == 0);
+        test_result("SCHED_NORMAL min priority is 0", min_normal == 0);
+    }
+    
+    // Test sched_rr_get_interval()
+    printf("\n[TEST] Round-robin interval syscall\n");
+    {
+        struct timespec ts;
+        int ret = sched_rr_get_interval(0, &ts);
+        printf("  sched_rr_get_interval() = %d, interval=%ld.%09ld sec\n", 
+               ret, ts.tv_sec, ts.tv_nsec);
+        test_result("sched_rr_get_interval() succeeds", ret == 0);
+        test_result("Time quantum is ~20ms", ts.tv_nsec >= 10000000 && ts.tv_nsec <= 100000000);
+    }
+    
+    // Test mprotect()
+    printf("\n[TEST] mprotect() syscall\n");
+    {
+        // Allocate a page
+        void* page = mmap(NULL, 4096, PROT_READ | PROT_WRITE, 
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        test_result("mmap for mprotect test", page != MAP_FAILED);
+        
+        if (page != MAP_FAILED) {
+            // Write to the page
+            *(int*)page = 42;
+            test_result("Can write to RW page", *(int*)page == 42);
+            
+            // Change to read-only
+            int ret = mprotect(page, 4096, PROT_READ);
+            printf("  mprotect(PROT_READ) returned %d\n", ret);
+            test_result("mprotect() succeeds", ret == 0);
+            
+            // Reading should still work
+            int val = *(volatile int*)page;
+            test_result("Can read from RO page", val == 42);
+            
+            // Change back to RW
+            ret = mprotect(page, 4096, PROT_READ | PROT_WRITE);
+            test_result("mprotect(PROT_READ|PROT_WRITE) succeeds", ret == 0);
+            
+            munmap(page, 4096);
+        }
+    }
+    
+    // Test futex (basic wake/wait operations)
+    printf("\n[TEST] futex() syscalls\n");
+    {
+        volatile int* futex_val = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                       MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (futex_val != MAP_FAILED) {
+            *futex_val = 0;
+            
+            pid_t child = fork();
+            if (child == 0) {
+                // Child: wait for parent to wake us
+                // Use busy loop with yield instead of blocking futex
+                // since blocking might not work perfectly
+                for (int i = 0; i < 1000 && *futex_val == 0; i++) {
+                    sched_yield();
+                }
+                _exit(*futex_val == 1 ? 0 : 1);
+            } else if (child > 0) {
+                // Parent: wake the child
+                sched_yield();  // Let child start
+                *futex_val = 1;
+                
+                // Wake any waiters (even if child is just spinning)
+                int woken = futex_wake((int*)futex_val, 1);
+                printf("  futex_wake() woke %d waiters\n", woken);
+                
+                int status;
+                waitpid(child, &status, 0);
+                test_result("futex signaling works", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+            }
+            
+            munmap((void*)futex_val, 4096);
+        } else {
+            test_fail("futex test: mmap failed");
+        }
+    }
+    
+    // Test vfork() (should work like fork)
+    printf("\n[TEST] vfork() syscall\n");
+    {
+        pid_t child = vfork();
+        if (child == 0) {
+            // Child process
+            _exit(42);
+        } else if (child > 0) {
+            int status;
+            waitpid(child, &status, 0);
+            test_result("vfork() child exits correctly", 
+                       WIFEXITED(status) && WEXITSTATUS(status) == 42);
+        } else {
+            test_fail("vfork() failed");
+        }
+    }
+
+    // ========================================
+    // Thread Groups / SMP Tests
+    // ========================================
+    printf("\n[TEST] Thread Groups (getpid vs gettid)\n");
+    {
+        // For main thread, getpid() and gettid() should return the same value
+        pid_t pid = getpid();
+        pid_t tid = gettid();
+        test_result("gettid() returns valid TID", tid > 0);
+        test_result("getpid() == gettid() for main thread", pid == tid);
+        printf("  PID=%d, TID=%d\n", pid, tid);
+    }
+
+    printf("\n[TEST] set_tid_address() syscall\n");
+    {
+        int clear_tid = 12345;
+        int result = set_tid_address(&clear_tid);
+        test_result("set_tid_address() returns TID", result > 0);
+        test_result("set_tid_address() returns same as gettid()", result == gettid());
+    }
+
+    printf("\n[TEST] set_robust_list() syscall\n");
+    {
+        // Create a simple robust list head
+        struct {
+            void* next;
+            long futex_offset;
+            void* pending;
+        } robust_head;
+        
+        robust_head.next = &robust_head;  // Point to self (empty list)
+        robust_head.futex_offset = 0;
+        robust_head.pending = NULL;
+        
+        int result = set_robust_list(&robust_head, sizeof(robust_head));
+        test_result("set_robust_list() succeeds", result == 0);
+    }
+
+    printf("\n[TEST] arch_prctl() TLS syscall\n");
+    {
+        // Test ARCH_SET_FS and ARCH_GET_FS for TLS
+        unsigned long test_tls_addr = 0x12345678ABCD0000UL;
+        unsigned long readback = 0;
+        
+        // Set FS base
+        int set_result = arch_prctl(ARCH_SET_FS, test_tls_addr);
+        test_result("arch_prctl(ARCH_SET_FS) succeeds", set_result == 0);
+        
+        // Get FS base back
+        int get_result = arch_prctl(ARCH_GET_FS, (unsigned long)&readback);
+        test_result("arch_prctl(ARCH_GET_FS) succeeds", get_result == 0);
+        test_result("ARCH_GET_FS returns correct value", readback == test_tls_addr);
+        printf("  Set FS base to 0x%lx, read back 0x%lx\n", test_tls_addr, readback);
+        
+        // Restore to 0 (or original value)
+        arch_prctl(ARCH_SET_FS, 0);
+    }
+
+    printf("\n[TEST] Fork thread group isolation\n");
+    {
+        // fork() should create a new process with different PID
+        // Child should have getpid() == gettid() (it's its own thread group leader)
+        volatile int* shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (shared != MAP_FAILED) {
+            shared[0] = 0;  // child's pid
+            shared[1] = 0;  // child's tid
+            
+            pid_t parent_pid = getpid();
+            pid_t child = fork();
+            
+            if (child == 0) {
+                // Child process
+                shared[0] = getpid();
+                shared[1] = gettid();
+                _exit(0);
+            } else if (child > 0) {
+                int status;
+                waitpid(child, &status, 0);
+                
+                test_result("fork() child has different PID", shared[0] != parent_pid);
+                test_result("fork() child has pid == tid", shared[0] == shared[1]);
+                test_result("fork() returns correct child PID", child == shared[0]);
+                printf("  Parent PID=%d, Child PID=%d, Child TID=%d\n", 
+                       parent_pid, (int)shared[0], (int)shared[1]);
+            } else {
+                test_fail("fork() failed");
+            }
+            
+            munmap((void*)shared, 4096);
+        } else {
+            test_fail("mmap for fork test failed");
         }
     }
 

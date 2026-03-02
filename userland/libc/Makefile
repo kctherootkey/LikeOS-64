@@ -10,7 +10,7 @@ STRING_SRC = src/string/string.c
 STDLIB_SRC = src/stdlib/stdlib.c
 CTYPE_SRC = src/ctype/ctype.c
 DIR_SRC = src/dirent/dirent.c
-SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c
+SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/sched.c
 CRT0_SRC = src/crt0.S
 
 # Object files

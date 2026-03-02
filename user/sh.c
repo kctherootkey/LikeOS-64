@@ -57,8 +57,8 @@ static void show_help(void) {
     printf("  teststress     - Run stress test (10 min)\n");
     printf("  hello          - Hello world program\n");
     printf("Keyboard shortcuts:\n");
-    printf("  Ctrl+D         - Debug dump (tasks, IRQs, memory)\n");
-    printf("  Ctrl+C         - Interrupt current process (still buggy, might crash the system)\n");
+    printf("  Ctrl+D         - Debug dump (threads, tasks, IRQs, memory)\n");
+    printf("  Ctrl+C         - Interrupt current process\n");
 }
 
 int main(void) {

@@ -43,6 +43,7 @@
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/percpu.h"
 #include "../../include/kernel/smp.h"
+#include "../../include/kernel/futex.h"
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
@@ -64,8 +65,8 @@ int g_smp_initialized = 0;
 // Legacy global current (pre-SMP only; post-SMP uses percpu->current_task)
 static task_t* g_current = 0;
 
-// PID allocator
-static int g_next_id = 1;
+// PID allocator (non-static for sys_clone in syscall.c)
+int g_next_id = 1;
 
 // Kernel page table and default kernel stack
 static uint64_t* g_kernel_pml4 = 0;
@@ -97,6 +98,18 @@ static uint8_t* g_ap_idle_stacks[MAX_AP_IDLE] = {0};
 
 static void task_trampoline(void);
 static void idle_entry(void* arg);
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Validate user pointer is in user space
+static inline bool validate_user_ptr(uint64_t ptr, size_t len) {
+    if (ptr < 0x10000) return false;  // Reject low addresses (NULL deref protection)
+    if (ptr >= 0x7FFFFFFFFFFF) return false;  // Beyond user space
+    if (ptr + len < ptr) return false;  // Overflow check
+    return true;
+}
 
 static inline int is_idle_task(const task_t* t) {
     if (t == &g_idle_task) return 1;
@@ -131,6 +144,11 @@ static inline void switch_address_space(task_t* prev, task_t* next) {
     if (prev_pml4 != next_pml4) {
         mm_switch_address_space(next_pml4);
     }
+    
+    // Load TLS (FS base) for the next task
+    if (next->privilege == TASK_USER) {
+        task_load_tls(next);
+    }
 }
 
 // ============================================================================
@@ -139,7 +157,7 @@ static inline void switch_address_space(task_t* prev, task_t* next) {
 // The global list links every task (regardless of state) via task->next.
 // Protected by g_task_list_lock.  Used for admin operations only.
 
-static void task_list_add(task_t* t) {
+void task_list_add(task_t* t) {
     t->next = g_task_list_head;
     g_task_list_head = t;
 }
@@ -286,6 +304,7 @@ static void task_init_common(task_t* t) {
     t->rq_next = NULL;
     t->on_rq = false;
     t->on_cpu = 0;
+    t->cpu_affinity = 0;       // 0 = allowed on all CPUs
     t->user_stack_top = 0;
     t->kernel_stack_top = 0;
     t->kernel_stack_base = NULL;
@@ -312,6 +331,33 @@ static void task_init_common(task_t* t) {
     t->brk = 0;
     t->mmap_base = 0;
     for (int i = 0; i < TASK_MAX_MMAP; i++) t->mmap_regions[i].in_use = false;
+    
+    // Thread group support
+    t->tgid = t->id;           // Will be set properly after id is assigned
+    t->group_leader = t;       // Initially points to self
+    t->thread_group_next = t;  // Circular list of one
+    t->thread_group_prev = t;
+    t->nr_threads = 1;
+    t->group_exit_code = 0;
+    t->group_exiting = false;
+    t->exit_signal = SIGCHLD;  // Default for processes
+    
+    // CLONE_CHILD_CLEARTID support
+    t->clear_child_tid = NULL;
+    t->set_child_tid = NULL;
+    
+    // TLS support
+    t->fs_base = 0;
+    t->gs_base = 0;
+    
+    // Robust futex support
+    t->robust_list = NULL;
+    t->robust_list_len = 0;
+    
+    // Shared structures (NULL = use legacy per-task fields)
+    t->mm = NULL;
+    t->files = NULL;
+    t->sighand = NULL;
 }
 
 // ============================================================================
@@ -869,6 +915,24 @@ task_t* sched_fork_current(void) {
     child->need_resched = 0;
     child->remaining_ticks = SCHED_TIME_SLICE;
     child->preempt_frame = NULL;
+    
+    // Thread group: fork creates a new process (new thread group)
+    thread_group_init(child);
+    
+    // Clear clone-related fields (not inherited)
+    child->clear_child_tid = NULL;
+    child->set_child_tid = NULL;
+    child->robust_list = NULL;
+    child->robust_list_len = 0;
+    
+    // TLS: child does not inherit parent's TLS
+    child->fs_base = 0;
+    child->gs_base = 0;
+    
+    // Shared structures: fork creates independent copies
+    child->mm = NULL;      // We're using legacy pml4 field
+    child->files = NULL;   // We're using legacy fd_table
+    child->sighand = NULL; // We're using legacy signals.action
 
     // Assign to least-loaded CPU for load distribution
     if (g_smp_initialized) {
@@ -1031,21 +1095,64 @@ void sched_mark_task_exited(task_t* task, int status) {
     if (!task) return;
 
     task->exit_code = status;
-
-    // Close all open file descriptors
-    for (int i = 0; i < TASK_MAX_FDS; i++) {
-        if (task->fd_table[i]) {
-            uint64_t marker = (uint64_t)task->fd_table[i];
-            if (marker >= 1 && marker <= 3) {
-                task->fd_table[i] = NULL;
-            } else if (pipe_is_end(task->fd_table[i])) {
-                pipe_close_end((pipe_end_t*)task->fd_table[i]);
-                task->fd_table[i] = NULL;
-            } else {
-                vfs_close(task->fd_table[i]);
-                task->fd_table[i] = NULL;
+    
+    // ========================================================================
+    // THREAD GROUP EXIT HANDLING
+    // ========================================================================
+    
+    // Process robust futex list before anything else
+    exit_robust_list(task);
+    
+    // Handle clear_child_tid (CLONE_CHILD_CLEARTID)
+    // This writes 0 to the address and wakes any futex waiters
+    if (task->clear_child_tid) {
+        smap_disable();
+        *(task->clear_child_tid) = 0;
+        smap_enable();
+        
+        // Wake any threads waiting on this futex (pthread_join uses this)
+        futex_wake((uint64_t)task->clear_child_tid, 1);
+        task->clear_child_tid = NULL;
+    }
+    
+    // Remove from thread group
+    thread_group_remove(task);
+    
+    // Release shared structures with reference counting
+    if (task->mm) {
+        mm_struct_put(task->mm);
+        task->mm = NULL;
+        task->pml4 = NULL;  // PML4 was owned by mm_struct
+    }
+    
+    if (task->files) {
+        files_struct_put(task->files);
+        task->files = NULL;
+        // Clear legacy fd_table pointers (they were aliases)
+        for (int i = 0; i < TASK_MAX_FDS; i++) {
+            task->fd_table[i] = NULL;
+        }
+    } else {
+        // Legacy path: close file descriptors directly
+        for (int i = 0; i < TASK_MAX_FDS; i++) {
+            if (task->fd_table[i]) {
+                uint64_t marker = (uint64_t)task->fd_table[i];
+                if (marker >= 1 && marker <= 3) {
+                    task->fd_table[i] = NULL;
+                } else if (pipe_is_end(task->fd_table[i])) {
+                    pipe_close_end((pipe_end_t*)task->fd_table[i]);
+                    task->fd_table[i] = NULL;
+                } else {
+                    vfs_close(task->fd_table[i]);
+                    task->fd_table[i] = NULL;
+                }
             }
         }
+    }
+    
+    if (task->sighand) {
+        sighand_struct_put(task->sighand);
+        task->sighand = NULL;
     }
 
     sched_reparent_children(task);
@@ -1062,8 +1169,19 @@ void sched_mark_task_exited(task_t* task, int status) {
     // on another CPU and will crash when trying to save context. The zombie
     // state check in scheduler functions prevents it from being scheduled.
 
+    // Only send exit_signal (SIGCHLD) if:
+    // 1. This is the thread group leader (or a normal process)
+    // 2. All threads in the group have exited
+    // Threads (exit_signal == 0) don't notify parent
+    bool should_notify_parent = (task->exit_signal != 0);
+    
+    // For thread group leader, only notify when all threads have exited
+    if (task == task->group_leader && task->nr_threads > 0) {
+        should_notify_parent = false;  // Still have threads running
+    }
+
     // Wake parent if blocked in waitpid
-    if (task->parent && task->parent->state == TASK_BLOCKED) {
+    if (should_notify_parent && task->parent && task->parent->state == TASK_BLOCKED) {
         if (task->parent->wait_channel == task->parent) {
             sched_wake_task(task->parent);
         }
@@ -1244,8 +1362,8 @@ void sched_dump_tasks(void) {
         }
     }
 
-    kprintf(" PID  PPID  CPU  State   onRQ  lastRIP           userRIP\n");
-    kprintf("----  ----  ---  ------  ----  ----------------  ----------------\n");
+    kprintf(" TID  TGID PPID  CPU  State   onRQ  #Th  Ldr  lastRIP           userRIP\n");
+    kprintf("----  ---- ----  ---  ------  ----  ---  ---  ----------------  ----------------\n");
 
     uint64_t flags;
     spin_lock_irqsave(&g_task_list_lock, &flags);
@@ -1256,12 +1374,15 @@ void sched_dump_tasks(void) {
         char marker = (t == cur) ? '*' : ' ';
         uint64_t last_rip = t->preempt_frame ? t->preempt_frame->rip : 0;
         uint64_t user_rip = t->syscall_rip;
-        kprintf("%c%3d  %4d  %3u  %-6s  %4d  %016lx  %016lx\n",
-                marker, t->id, ppid, t->on_cpu, sn, t->on_rq,
-                last_rip, user_rip);
+        int tgid = t->tgid;
+        int nr_threads = t->group_leader ? t->group_leader->nr_threads : 1;
+        char is_leader = (t == t->group_leader) ? 'L' : '-';
+        kprintf("%c%3d  %4d %4d  %3u  %-6s  %4d  %3d   %c   %016lx  %016lx\n",
+                marker, t->id, tgid, ppid, t->on_cpu, sn, t->on_rq,
+                nr_threads, is_leader, last_rip, user_rip);
     }
     spin_unlock_irqrestore(&g_task_list_lock, flags);
-    kprintf("==========================================\n");
+    kprintf("=======================================================================\n");
 }
 
 // ============================================================================
@@ -1524,11 +1645,16 @@ void sched_load_balance(void) {
     // - Must be READY state (not RUNNING - could be current on source CPU)
     // - Not idle or bootstrap
     // - User task (kernel tasks may have CPU affinity)
+    // - Must be allowed to run on destination CPU (check cpu_affinity)
     task_t* prev_rq = NULL;
     task_t* migrate = NULL;
     for (task_t* t = src->runqueue_head; t; t = t->rq_next) {
+        // Check affinity: 0 means all CPUs allowed, otherwise check bitmask
+        bool affinity_ok = (t->cpu_affinity == 0) || 
+                           (t->cpu_affinity & (1ULL << my_cpu));
+        
         if (!is_idle_task(t) && !is_bootstrap_task(t) && 
-            t->privilege == TASK_USER && t->state == TASK_READY) {
+            t->privilege == TASK_USER && t->state == TASK_READY && affinity_ok) {
             migrate = t;
             break;
         }
@@ -1564,3 +1690,412 @@ void sched_load_balance(void) {
     spin_unlock(&second->runqueue_lock);
     spin_unlock_irqrestore(&first->runqueue_lock, flags);
 }
+
+// ============================================================================
+// CPU FEATURE DETECTION
+// ============================================================================
+
+// Global CPU extended features (detected at boot)
+uint32_t g_cpu_features_ext = 0;
+
+// Detect extended CPU features (CPUID leaf 7)
+void detect_cpu_features_ext(void) {
+    uint32_t eax, ebx, ecx, edx;
+    
+    // Check if CPUID leaf 7 is supported
+    eax = 0;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(eax));
+    if (eax < 7) {
+        return;  // Leaf 7 not supported
+    }
+    
+    // Query CPUID leaf 7, subleaf 0
+    eax = 7;
+    ecx = 0;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(eax), "c"(ecx));
+    
+    // FSGSBASE: bit 0 of EBX
+    if (ebx & (1 << 0)) {
+        g_cpu_features_ext |= CPU_FEATURE_FSGSBASE;
+    }
+}
+
+// Check if FSGSBASE instructions are supported
+bool cpu_has_fsgsbase(void) {
+    return (g_cpu_features_ext & CPU_FEATURE_FSGSBASE) != 0;
+}
+
+// Enable FSGSBASE if supported (must be called on each CPU)
+void enable_fsgsbase(void) {
+    if (!cpu_has_fsgsbase()) return;
+    
+    // Set CR4.FSGSBASE (bit 16)
+    uint64_t cr4;
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1ULL << 16);
+    __asm__ volatile("mov %0, %%cr4" : : "r"(cr4));
+}
+
+// ============================================================================
+// THREAD GROUP MANAGEMENT
+// ============================================================================
+
+// Initialize a task as a thread group leader (its own group of 1)
+void thread_group_init(task_t* leader) {
+    if (!leader) return;
+    
+    leader->tgid = leader->id;
+    leader->group_leader = leader;
+    leader->thread_group_next = leader;  // Circular list: points to self
+    leader->thread_group_prev = leader;
+    leader->nr_threads = 1;
+    leader->exit_signal = SIGCHLD;  // Process exit sends SIGCHLD to parent
+    leader->group_exiting = false;
+    leader->group_exit_code = 0;
+}
+
+// Add a thread to an existing thread group
+void thread_group_add(task_t* leader, task_t* thread) {
+    if (!leader || !thread) return;
+    
+    // Thread inherits leader's tgid
+    thread->tgid = leader->tgid;
+    thread->group_leader = leader;
+    thread->exit_signal = 0;  // Threads don't send signals on exit
+    thread->group_exiting = false;
+    
+    // Insert into circular list (after leader)
+    uint64_t flags;
+    spin_lock_irqsave(&g_task_list_lock, &flags);
+    
+    thread->thread_group_next = leader->thread_group_next;
+    thread->thread_group_prev = leader;
+    leader->thread_group_next->thread_group_prev = thread;
+    leader->thread_group_next = thread;
+    leader->nr_threads++;
+    
+    spin_unlock_irqrestore(&g_task_list_lock, flags);
+}
+
+// Remove a thread from its thread group
+void thread_group_remove(task_t* thread) {
+    if (!thread || !thread->group_leader) return;
+    
+    task_t* leader = thread->group_leader;
+    
+    uint64_t flags;
+    spin_lock_irqsave(&g_task_list_lock, &flags);
+    
+    // Remove from circular list
+    thread->thread_group_prev->thread_group_next = thread->thread_group_next;
+    thread->thread_group_next->thread_group_prev = thread->thread_group_prev;
+    
+    // Decrement thread count in leader
+    if (leader->nr_threads > 0) {
+        leader->nr_threads--;
+    }
+    
+    // Clear thread's group links
+    thread->thread_group_next = thread;
+    thread->thread_group_prev = thread;
+    
+    spin_unlock_irqrestore(&g_task_list_lock, flags);
+}
+
+// Get number of threads in a thread group
+int thread_group_count(task_t* task) {
+    if (!task || !task->group_leader) return 1;
+    return task->group_leader->nr_threads;
+}
+
+// Signal all threads in a thread group
+void thread_group_signal_all(task_t* task, int sig) {
+    if (!task || !task->group_leader) return;
+    
+    task_t* leader = task->group_leader;
+    task_t* t = leader;
+    
+    do {
+        sched_signal_task(t, sig);
+        t = t->thread_group_next;
+    } while (t != leader);
+}
+
+// ============================================================================
+// SHARED STRUCTURE MANAGEMENT: mm_struct
+// ============================================================================
+
+// Create a new mm_struct with an existing PML4
+mm_struct_t* mm_struct_create(uint64_t* pml4) {
+    mm_struct_t* mm = (mm_struct_t*)kalloc(sizeof(mm_struct_t));
+    if (!mm) return NULL;
+    
+    mm->pml4 = pml4;
+    mm->refcount = 1;
+    spinlock_init(&mm->lock, "mm");
+    mm->brk_start = 0;
+    mm->brk = 0;
+    mm->mmap_base = 0;
+    mm->mmap_regions = NULL;
+    mm->mmap_count = 0;
+    mm->mmap_capacity = 0;
+    
+    return mm;
+}
+
+// Clone an mm_struct (for fork - creates COW copy of address space)
+mm_struct_t* mm_struct_clone(mm_struct_t* src) {
+    if (!src) return NULL;
+    
+    uint64_t flags;
+    spin_lock_irqsave(&src->lock, &flags);
+    
+    // Clone the address space with COW
+    uint64_t* new_pml4 = mm_clone_address_space(src->pml4);
+    if (!new_pml4) {
+        spin_unlock_irqrestore(&src->lock, flags);
+        return NULL;
+    }
+    
+    mm_struct_t* mm = (mm_struct_t*)kalloc(sizeof(mm_struct_t));
+    if (!mm) {
+        mm_destroy_address_space(new_pml4);
+        spin_unlock_irqrestore(&src->lock, flags);
+        return NULL;
+    }
+    
+    mm->pml4 = new_pml4;
+    mm->refcount = 1;
+    spinlock_init(&mm->lock, "mm");
+    mm->brk_start = src->brk_start;
+    mm->brk = src->brk;
+    mm->mmap_base = src->mmap_base;
+    
+    // Clone mmap regions array if present
+    if (src->mmap_regions && src->mmap_count > 0) {
+        mm->mmap_regions = (mmap_region_t*)kalloc(src->mmap_capacity * sizeof(mmap_region_t));
+        if (mm->mmap_regions) {
+            mm_memcpy(mm->mmap_regions, src->mmap_regions, 
+                      src->mmap_count * sizeof(mmap_region_t));
+            mm->mmap_count = src->mmap_count;
+            mm->mmap_capacity = src->mmap_capacity;
+        }
+    } else {
+        mm->mmap_regions = NULL;
+        mm->mmap_count = 0;
+        mm->mmap_capacity = 0;
+    }
+    
+    spin_unlock_irqrestore(&src->lock, flags);
+    return mm;
+}
+
+// Increment mm_struct reference count
+void mm_struct_get(mm_struct_t* mm) {
+    if (!mm) return;
+    __atomic_add_fetch(&mm->refcount, 1, __ATOMIC_SEQ_CST);
+}
+
+// Decrement mm_struct reference count, free if it reaches 0
+void mm_struct_put(mm_struct_t* mm) {
+    if (!mm) return;
+    
+    int old = __atomic_fetch_sub(&mm->refcount, 1, __ATOMIC_SEQ_CST);
+    if (old == 1) {
+        // Last reference - free the address space
+        if (mm->pml4) {
+            mm_destroy_address_space(mm->pml4);
+        }
+        if (mm->mmap_regions) {
+            kfree(mm->mmap_regions);
+        }
+        kfree(mm);
+    }
+}
+
+// ============================================================================
+// SHARED STRUCTURE MANAGEMENT: files_struct
+// ============================================================================
+
+// Create a new files_struct
+files_struct_t* files_struct_create(void) {
+    files_struct_t* files = (files_struct_t*)kalloc(sizeof(files_struct_t));
+    if (!files) return NULL;
+    
+    files->refcount = 1;
+    spinlock_init(&files->lock, "files");
+    
+    for (int i = 0; i < TASK_MAX_FDS; i++) {
+        files->fd_table[i] = NULL;
+    }
+    
+    return files;
+}
+
+// Clone a files_struct (for fork - duplicates all file descriptors)
+files_struct_t* files_struct_clone(files_struct_t* src) {
+    if (!src) return NULL;
+    
+    files_struct_t* files = files_struct_create();
+    if (!files) return NULL;
+    
+    uint64_t flags;
+    spin_lock_irqsave(&src->lock, &flags);
+    
+    for (int i = 0; i < TASK_MAX_FDS; i++) {
+        if (src->fd_table[i]) {
+            uint64_t marker = (uint64_t)src->fd_table[i];
+            if (marker >= 1 && marker <= 3) {
+                // Stdin/stdout/stderr markers
+                files->fd_table[i] = src->fd_table[i];
+            } else if (pipe_is_end(src->fd_table[i])) {
+                // Pipe end - duplicate it
+                pipe_end_t* new_end = pipe_dup_end((pipe_end_t*)src->fd_table[i]);
+                files->fd_table[i] = (vfs_file_t*)new_end;
+            } else {
+                // Regular file - duplicate it
+                files->fd_table[i] = vfs_dup(src->fd_table[i]);
+            }
+        }
+    }
+    
+    spin_unlock_irqrestore(&src->lock, flags);
+    return files;
+}
+
+// Increment files_struct reference count
+void files_struct_get(files_struct_t* files) {
+    if (!files) return;
+    __atomic_add_fetch(&files->refcount, 1, __ATOMIC_SEQ_CST);
+}
+
+// Decrement files_struct reference count, close all files and free if it reaches 0
+void files_struct_put(files_struct_t* files) {
+    if (!files) return;
+    
+    int old = __atomic_fetch_sub(&files->refcount, 1, __ATOMIC_SEQ_CST);
+    if (old == 1) {
+        // Last reference - close all files
+        for (int i = 0; i < TASK_MAX_FDS; i++) {
+            if (files->fd_table[i]) {
+                uint64_t marker = (uint64_t)files->fd_table[i];
+                if (marker >= 1 && marker <= 3) {
+                    files->fd_table[i] = NULL;
+                } else if (pipe_is_end(files->fd_table[i])) {
+                    pipe_close_end((pipe_end_t*)files->fd_table[i]);
+                } else {
+                    vfs_close(files->fd_table[i]);
+                }
+                files->fd_table[i] = NULL;
+            }
+        }
+        kfree(files);
+    }
+}
+
+// ============================================================================
+// SHARED STRUCTURE MANAGEMENT: sighand_struct
+// ============================================================================
+
+// Create a new sighand_struct
+sighand_struct_t* sighand_struct_create(void) {
+    sighand_struct_t* sighand = (sighand_struct_t*)kalloc(sizeof(sighand_struct_t));
+    if (!sighand) return NULL;
+    
+    sighand->refcount = 1;
+    spinlock_init(&sighand->lock, "sighand");
+    
+    // Initialize all handlers to default
+    for (int i = 0; i < 65; i++) {
+        sighand->action[i].sa_handler = SIG_DFL;
+        sighand->action[i].sa_flags = 0;
+        sighand->action[i].sa_restorer = NULL;
+        sighand->action[i].sa_mask.sig[0] = 0;
+    }
+    
+    return sighand;
+}
+
+// Clone a sighand_struct (for fork - copies signal handlers)
+sighand_struct_t* sighand_struct_clone(sighand_struct_t* src) {
+    if (!src) return NULL;
+    
+    sighand_struct_t* sighand = (sighand_struct_t*)kalloc(sizeof(sighand_struct_t));
+    if (!sighand) return NULL;
+    
+    sighand->refcount = 1;
+    spinlock_init(&sighand->lock, "sighand");
+    
+    uint64_t flags;
+    spin_lock_irqsave(&src->lock, &flags);
+    
+    for (int i = 0; i < 65; i++) {
+        sighand->action[i] = src->action[i];
+    }
+    
+    spin_unlock_irqrestore(&src->lock, flags);
+    return sighand;
+}
+
+// Increment sighand_struct reference count
+void sighand_struct_get(sighand_struct_t* sighand) {
+    if (!sighand) return;
+    __atomic_add_fetch(&sighand->refcount, 1, __ATOMIC_SEQ_CST);
+}
+
+// Decrement sighand_struct reference count, free if it reaches 0
+void sighand_struct_put(sighand_struct_t* sighand) {
+    if (!sighand) return;
+    
+    int old = __atomic_fetch_sub(&sighand->refcount, 1, __ATOMIC_SEQ_CST);
+    if (old == 1) {
+        kfree(sighand);
+    }
+}
+
+// ============================================================================
+// TLS (THREAD LOCAL STORAGE) SUPPORT
+// ============================================================================
+
+// MSR addresses for FS/GS base
+#define MSR_FS_BASE 0xC0000100
+#define MSR_GS_BASE 0xC0000101
+
+static inline void wrmsr(uint32_t msr, uint64_t value) {
+    uint32_t low = (uint32_t)value;
+    uint32_t high = (uint32_t)(value >> 32);
+    __asm__ volatile("wrmsr" : : "c"(msr), "a"(low), "d"(high));
+}
+
+static inline uint64_t rdmsr(uint32_t msr) {
+    uint32_t low, high;
+    __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
+    return ((uint64_t)high << 32) | low;
+}
+
+// Set FS base for a task
+void task_set_fs_base(task_t* task, uint64_t base) {
+    if (!task) return;
+    task->fs_base = base;
+}
+
+// Get FS base for a task
+uint64_t task_get_fs_base(task_t* task) {
+    if (!task) return 0;
+    return task->fs_base;
+}
+
+// Load TLS (FS base) on context switch
+// Called when switching to a user task
+void task_load_tls(task_t* task) {
+    if (!task || task->fs_base == 0) return;
+    
+    if (cpu_has_fsgsbase()) {
+        // Use WRFSBASE instruction (faster)
+        __asm__ volatile("wrfsbase %0" : : "r"(task->fs_base));
+    } else {
+        // Fall back to MSR write
+        wrmsr(MSR_FS_BASE, task->fs_base);
+    }
+}
+

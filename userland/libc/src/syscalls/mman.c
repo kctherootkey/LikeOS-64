@@ -19,3 +19,12 @@ int munmap(void* addr, size_t length) {
     }
     return 0;
 }
+
+int mprotect(void* addr, size_t len, int prot) {
+    long ret = syscall3(SYS_MPROTECT, (long)addr, len, prot);
+    if (ret < 0) {
+        errno = -ret;
+        return -1;
+    }
+    return 0;
+}

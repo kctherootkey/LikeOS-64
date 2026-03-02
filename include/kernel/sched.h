@@ -9,12 +9,25 @@
 // Forward declaration
 struct vfs_file;
 struct tty;
+struct task;
 
 // Maximum file descriptors per task
 #define TASK_MAX_FDS    1024
 
 // Maximum memory regions per task (for mmap tracking)
 #define TASK_MAX_MMAP   64
+
+// ============================================================================
+// CPU FEATURE FLAGS
+// ============================================================================
+
+// CPUID leaf 7 extended features (EBX)
+#define CPU_FEATURE_FSGSBASE    (1 << 0)   // FSGSBASE instructions supported
+#define CPU_FEATURE_SMEP        (1 << 7)   // Supervisor Mode Execution Prevention
+#define CPU_FEATURE_SMAP        (1 << 20)  // Supervisor Mode Access Prevention
+
+// Global CPU feature flags (detected at boot)
+extern uint32_t g_cpu_features_ext;
 
 // Preemption configuration
 // Time slice in timer ticks (at 100Hz, 2 ticks = 20ms for better responsiveness)
@@ -185,6 +198,48 @@ static inline int preemption_enabled(void) {
 }
 
 // ============================================================================
+// THREAD GROUP SUPPORT STRUCTURES
+// ============================================================================
+
+// mm_struct - Shared address space descriptor (for CLONE_VM)
+// When threads share address space, they point to the same mm_struct.
+// Reference counting ensures the address space is freed only when all
+// threads exit.
+typedef struct mm_struct {
+    uint64_t* pml4;              // Page table base (CR3)
+    volatile int refcount;        // Number of tasks sharing this mm
+    spinlock_t lock;              // Protects mm operations
+    
+    // Heap management
+    uint64_t brk_start;          // Initial program break (heap start)
+    uint64_t brk;                // Current program break (heap end)
+    uint64_t mmap_base;          // Base address for mmap allocations
+    
+    // Memory region tracking
+    struct mmap_region* mmap_regions;  // Dynamic mmap region array
+    int mmap_count;              // Number of active mmap regions
+    int mmap_capacity;           // Allocated capacity
+} mm_struct_t;
+
+// files_struct - Shared file descriptor table (for CLONE_FILES)
+typedef struct files_struct {
+    volatile int refcount;        // Number of tasks sharing this fd table
+    spinlock_t lock;              // Protects fd table operations
+    struct vfs_file* fd_table[TASK_MAX_FDS];  // File descriptor array
+} files_struct_t;
+
+// sighand_struct - Shared signal handlers (for CLONE_SIGHAND)
+typedef struct sighand_struct {
+    volatile int refcount;        // Number of tasks sharing these handlers
+    spinlock_t lock;              // Protects signal handler operations
+    struct k_sigaction action[65]; // Signal handlers (NSIG = 65)
+} sighand_struct_t;
+
+// Forward declarations for robust futex support (full definitions in futex.h)
+struct robust_list;
+struct robust_list_head;
+
+// ============================================================================
 // TASK DEFINITIONS
 // ============================================================================
 
@@ -236,7 +291,8 @@ typedef struct task {
     task_privilege_t privilege;  // Ring level
     struct task* next;     // Global task list link (linear, all tasks)
     struct task* rq_next;   // Per-CPU run queue link (NULL when not in rq)
-    uint32_t on_cpu;        // CPU this task is assigned to
+    uint32_t on_cpu;        // CPU this task is currently assigned to
+    uint64_t cpu_affinity;  // Bitmask of allowed CPUs (0 = all CPUs allowed)
     bool on_rq;             // Whether currently in a per-CPU run queue
     int id;
     
@@ -291,14 +347,47 @@ typedef struct task {
     // Current working directory
     char cwd[256];
     
-    // File descriptor table
+    // File descriptor table (legacy - used when files == NULL)
     struct vfs_file* fd_table[TASK_MAX_FDS];
     
-    // Memory management
+    // Memory management (legacy - used when mm == NULL)
     uint64_t brk;               // Current program break (heap end)
     uint64_t brk_start;         // Initial program break (heap start)
     mmap_region_t mmap_regions[TASK_MAX_MMAP];  // mmap'd regions
     uint64_t mmap_base;         // Base address for mmap allocations
+    
+    // ========================================================================
+    // THREAD GROUP SUPPORT (POSIX threads / clone)
+    // ========================================================================
+    
+    // Thread group identification
+    int tgid;                       // Thread group ID (= id for group leader, = leader's id for threads)
+    struct task* group_leader;      // Pointer to thread group leader
+    struct task* thread_group_next; // Next thread in same thread group (circular list)
+    struct task* thread_group_prev; // Previous thread in thread group (for O(1) removal)
+    volatile int nr_threads;        // Thread count in group (only valid in leader)
+    volatile int group_exit_code;   // Exit code for exit_group()
+    volatile bool group_exiting;    // Set when exit_group() is called
+    
+    // Exit behavior
+    int exit_signal;                // Signal to send parent on exit (SIGCHLD for processes, 0 for threads)
+    
+    // CLONE_CHILD_CLEARTID / set_tid_address support
+    uint64_t* clear_child_tid;      // Address to write 0 and futex-wake on exit
+    uint64_t* set_child_tid;        // Address to write TID on creation
+    
+    // TLS (Thread Local Storage) support
+    uint64_t fs_base;               // FS segment base for user TLS
+    uint64_t gs_base;               // GS segment base (usually not used by user)
+    
+    // Robust futex support
+    struct robust_list_head* robust_list;  // Robust futex list head
+    size_t robust_list_len;                // Size of robust list head structure
+    
+    // Shared structures (NULL = use legacy per-task fields)
+    mm_struct_t* mm;                // Shared address space (CLONE_VM)
+    files_struct_t* files;          // Shared file descriptors (CLONE_FILES)
+    sighand_struct_t* sighand;      // Shared signal handlers (CLONE_SIGHAND)
 } task_t;
 
 void sched_init(void);
@@ -343,4 +432,66 @@ void sched_signal_task(task_t* task, int sig);
 void sched_signal_pgrp(int pgid, int sig);
 int sched_pgid_exists(int pgid);
 void sched_dump_tasks(void);  // Debug: dump all task states
+
+// ============================================================================
+// THREAD GROUP MANAGEMENT
+// ============================================================================
+
+// Thread group operations
+void thread_group_init(task_t* leader);      // Initialize task as thread group leader
+void thread_group_add(task_t* leader, task_t* thread);  // Add thread to group
+void thread_group_remove(task_t* thread);    // Remove thread from group
+int thread_group_count(task_t* task);        // Get number of threads in group
+void thread_group_signal_all(task_t* task, int sig);  // Signal all threads in group
+
+// Iterate over all threads in a thread group
+#define for_each_thread(leader, t) \
+    for ((t) = (leader); (t); (t) = ((t)->thread_group_next == (leader) ? NULL : (t)->thread_group_next))
+
+// ============================================================================
+// SHARED STRUCTURE MANAGEMENT
+// ============================================================================
+
+// mm_struct operations
+mm_struct_t* mm_struct_create(uint64_t* pml4);  // Create new mm_struct
+mm_struct_t* mm_struct_clone(mm_struct_t* src); // Clone mm_struct (for fork)
+void mm_struct_get(mm_struct_t* mm);             // Increment refcount
+void mm_struct_put(mm_struct_t* mm);             // Decrement refcount, free if 0
+
+// files_struct operations
+files_struct_t* files_struct_create(void);       // Create new files_struct
+files_struct_t* files_struct_clone(files_struct_t* src);  // Clone (for fork)
+void files_struct_get(files_struct_t* files);    // Increment refcount
+void files_struct_put(files_struct_t* files);    // Decrement refcount, free if 0
+
+// sighand_struct operations
+sighand_struct_t* sighand_struct_create(void);   // Create new sighand_struct
+sighand_struct_t* sighand_struct_clone(sighand_struct_t* src);  // Clone (for fork)
+void sighand_struct_get(sighand_struct_t* sighand);  // Increment refcount
+void sighand_struct_put(sighand_struct_t* sighand);  // Decrement refcount, free if 0
+
+// ============================================================================
+// TLS (THREAD LOCAL STORAGE) SUPPORT
+// ============================================================================
+
+// Set FS base for a task (used by CLONE_SETTLS and arch_prctl)
+void task_set_fs_base(task_t* task, uint64_t base);
+uint64_t task_get_fs_base(task_t* task);
+
+// Apply FS base on context switch (called by scheduler)
+void task_load_tls(task_t* task);
+
+// Check if FSGSBASE instructions are supported
+bool cpu_has_fsgsbase(void);
+
+// ============================================================================
+// INTERNAL FUNCTIONS (exported for syscall.c)
+// ============================================================================
+
+// Global task ID allocator
+extern int g_next_id;
+
+// Add task to global task list (must hold g_task_list_lock)
+void task_list_add(task_t* t);
+
 #endif // _KERNEL_SCHED_H_

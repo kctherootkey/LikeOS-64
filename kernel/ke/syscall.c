@@ -17,6 +17,8 @@
 #include "../../include/kernel/dirent.h"
 #include "../../include/kernel/serial.h"
 #include "../../include/kernel/percpu.h"
+#include "../../include/kernel/smp.h"
+#include "../../include/kernel/futex.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
@@ -2078,10 +2080,14 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd) {
     return newfd;
 }
 
-// SYS_GETPID - get process ID
+// SYS_GETPID - get process ID (thread group ID)
+// With thread groups, getpid() returns the tgid (thread group leader's ID)
+// which is the same for all threads in the process.
 static int64_t sys_getpid(void) {
     task_t* cur = sched_current();
-    return cur ? cur->id : -1;
+    if (!cur) return -1;
+    // Return tgid (thread group ID) which equals id for single-threaded processes
+    return cur->tgid;
 }
 
 // SYS_YIELD - yield CPU to other runnable tasks (Linux-style)
@@ -2396,10 +2402,42 @@ static int64_t sys_tkill(uint64_t tid, uint64_t sig) {
     return signal_send(target, (int)sig, &info);
 }
 
-// SYS_TGKILL - send signal to thread in thread group
+// SYS_TGKILL - send signal to thread in specific thread group
+// This is the secure way to send signals to threads - validates that
+// the target thread belongs to the specified thread group.
 static int64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig) {
-    (void)tgid;  // We don't have thread groups, just use tid
-    return sys_tkill(tid, sig);
+    if (tgid <= 0 || tid <= 0) {
+        return -EINVAL;
+    }
+    
+    if (sig < 0 || sig >= 65) {
+        return -EINVAL;
+    }
+    
+    // Find the target thread
+    task_t* target = sched_find_task_by_id((uint32_t)tid);
+    if (!target) {
+        return -ESRCH;
+    }
+    
+    // Validate that target belongs to the specified thread group
+    if (target->tgid != (int)tgid) {
+        return -ESRCH;  // Thread not in specified group
+    }
+    
+    // sig == 0 is a permission check only
+    if (sig == 0) {
+        return 0;
+    }
+    
+    // Build siginfo
+    siginfo_t info;
+    mm_memset(&info, 0, sizeof(info));
+    info.si_signo = (int)sig;
+    info.si_code = SI_TKILL;
+    info.si_pid = sched_current()->tgid;
+    
+    return signal_send(target, (int)sig, &info);
 }
 
 // SYS_ALARM - set alarm clock
@@ -2705,6 +2743,885 @@ static int64_t sys_signalfd(uint64_t fd, uint64_t mask_ptr, uint64_t flags) {
     return -ENOSYS;
 }
 
+// ============================================================================
+// SMP/THREADING SYSCALLS - FULL IMPLEMENTATION
+// ============================================================================
+
+// Clone flags (Linux compatible)
+#define CLONE_VM             0x00000100  // Share memory space
+#define CLONE_FS             0x00000200  // Share filesystem info
+#define CLONE_FILES          0x00000400  // Share file descriptors
+#define CLONE_SIGHAND        0x00000800  // Share signal handlers
+#define CLONE_PTRACE         0x00002000  // Allow tracing child
+#define CLONE_VFORK          0x00004000  // vfork() semantics
+#define CLONE_PARENT         0x00008000  // Same parent as cloner
+#define CLONE_THREAD         0x00010000  // Same thread group
+#define CLONE_NEWNS          0x00020000  // New mount namespace
+#define CLONE_SYSVSEM        0x00040000  // Share SysV semaphore undo
+#define CLONE_SETTLS         0x00080000  // Set TLS
+#define CLONE_PARENT_SETTID  0x00100000  // Set parent's TID
+#define CLONE_CHILD_CLEARTID 0x00200000  // Clear child's TID on exit
+#define CLONE_DETACHED       0x00400000  // Unused
+#define CLONE_UNTRACED       0x00800000  // Cannot force trace
+#define CLONE_CHILD_SETTID   0x01000000  // Set child's TID
+#define CLONE_STOPPED        0x02000000  // Start in TASK_STOPPED
+#define CLONE_NEWUTS         0x04000000  // New UTS namespace
+#define CLONE_NEWIPC         0x08000000  // New IPC namespace
+
+// Forward declare from sched.c
+extern void thread_group_add(task_t* leader, task_t* thread);
+extern void thread_group_init(task_t* leader);
+extern mm_struct_t* mm_struct_create(uint64_t* pml4);
+extern void mm_struct_get(mm_struct_t* mm);
+extern files_struct_t* files_struct_create(void);
+extern files_struct_t* files_struct_clone(files_struct_t* src);
+extern void files_struct_get(files_struct_t* files);
+extern sighand_struct_t* sighand_struct_create(void);
+extern sighand_struct_t* sighand_struct_clone(sighand_struct_t* src);
+extern void sighand_struct_get(sighand_struct_t* sighand);
+extern void task_set_fs_base(task_t* task, uint64_t base);
+
+// PID allocator (from sched.c)
+extern int g_next_id;
+extern spinlock_t g_task_list_lock;
+
+// SYS_CLONE - create a new thread or process
+// Full implementation with all CLONE_* flags
+static int64_t sys_clone(uint64_t flags, uint64_t child_stack, 
+                         uint64_t parent_tidptr, uint64_t child_tidptr,
+                         uint64_t tls) {
+    task_t* cur = sched_current();
+    if (!cur || cur->privilege != TASK_USER) {
+        return -EPERM;
+    }
+    
+    // Validate flag combinations
+    // CLONE_THREAD requires CLONE_SIGHAND which requires CLONE_VM
+    if ((flags & CLONE_THREAD) && !(flags & CLONE_SIGHAND)) {
+        return -EINVAL;
+    }
+    if ((flags & CLONE_SIGHAND) && !(flags & CLONE_VM)) {
+        return -EINVAL;
+    }
+    
+    // Extract flag meanings
+    bool share_vm = (flags & CLONE_VM) != 0;
+    bool share_files = (flags & CLONE_FILES) != 0;
+    bool share_sighand = (flags & CLONE_SIGHAND) != 0;
+    bool is_thread = (flags & CLONE_THREAD) != 0;
+    bool set_tls = (flags & CLONE_SETTLS) != 0;
+    bool set_parent_tid = (flags & CLONE_PARENT_SETTID) != 0;
+    bool set_child_tid = (flags & CLONE_CHILD_SETTID) != 0;
+    bool clear_child_tid = (flags & CLONE_CHILD_CLEARTID) != 0;
+    
+    // For threads, child_stack is required
+    if (is_thread && child_stack == 0) {
+        return -EINVAL;
+    }
+    
+    // Allocate child task structure
+    task_t* child = (task_t*)kalloc(sizeof(task_t));
+    if (!child) {
+        return -ENOMEM;
+    }
+    
+    // Allocate kernel stack for child
+    uint8_t* k_stack_mem = (uint8_t*)kalloc(8192);
+    if (!k_stack_mem) {
+        kfree(child);
+        return -ENOMEM;
+    }
+    uint64_t k_stack_top = ((uint64_t)(k_stack_mem + 8192)) & ~0xFUL;
+    
+    // Initialize child from parent
+    mm_memcpy(child, cur, sizeof(task_t));
+    
+    // Assign unique ID
+    uint64_t irq_flags;
+    spin_lock_irqsave(&g_task_list_lock, &irq_flags);
+    child->id = g_next_id++;
+    spin_unlock_irqrestore(&g_task_list_lock, irq_flags);
+    
+    // Basic child setup
+    child->state = TASK_READY;
+    child->kernel_stack_top = k_stack_top;
+    child->kernel_stack_base = k_stack_mem;
+    child->rq_next = NULL;
+    child->on_rq = false;
+    child->wait_next = NULL;
+    child->wait_channel = NULL;
+    child->wakeup_tick = 0;
+    child->need_resched = 0;
+    child->remaining_ticks = SCHED_TIME_SLICE;
+    child->preempt_frame = NULL;
+    child->exit_code = 0;
+    child->has_exited = false;
+    child->is_fork_child = true;
+    child->first_child = NULL;
+    child->next_sibling = NULL;
+    
+    // Handle CLONE_VM (share address space)
+    if (share_vm) {
+        // Share parent's address space with reference counting
+        if (cur->mm) {
+            // Parent already uses mm_struct
+            mm_struct_get(cur->mm);
+            child->mm = cur->mm;
+            child->pml4 = cur->mm->pml4;
+        } else {
+            // First time: create mm_struct from parent's legacy pml4
+            cur->mm = mm_struct_create(cur->pml4);
+            if (!cur->mm) {
+                kfree(k_stack_mem);
+                kfree(child);
+                return -ENOMEM;
+            }
+            cur->mm->brk = cur->brk;
+            cur->mm->brk_start = cur->brk_start;
+            cur->mm->mmap_base = cur->mmap_base;
+            
+            mm_struct_get(cur->mm);
+            child->mm = cur->mm;
+            child->pml4 = cur->pml4;
+        }
+    } else {
+        // COW clone of address space
+        uint64_t* child_pml4 = mm_clone_address_space(cur->pml4);
+        if (!child_pml4) {
+            kfree(k_stack_mem);
+            kfree(child);
+            return -ENOMEM;
+        }
+        child->pml4 = child_pml4;
+        child->mm = NULL;  // Use legacy fields
+    }
+    
+    // Handle CLONE_FILES (share file descriptors)
+    if (share_files) {
+        if (cur->files) {
+            files_struct_get(cur->files);
+            child->files = cur->files;
+        } else {
+            // Create files_struct from parent's legacy fd_table
+            cur->files = files_struct_create();
+            if (!cur->files) {
+                if (!share_vm && child->pml4) {
+                    mm_destroy_address_space(child->pml4);
+                }
+                kfree(k_stack_mem);
+                kfree(child);
+                return -ENOMEM;
+            }
+            // Copy existing fd_table to files_struct
+            for (int i = 0; i < TASK_MAX_FDS; i++) {
+                cur->files->fd_table[i] = cur->fd_table[i];
+            }
+            
+            files_struct_get(cur->files);
+            child->files = cur->files;
+        }
+        // Clear legacy fd_table (now using files_struct)
+        for (int i = 0; i < TASK_MAX_FDS; i++) {
+            child->fd_table[i] = NULL;
+        }
+    } else {
+        // Clone file descriptors
+        child->files = NULL;
+        for (int i = 0; i < TASK_MAX_FDS; i++) {
+            vfs_file_t* src_fd = cur->files ? cur->files->fd_table[i] : cur->fd_table[i];
+            if (src_fd) {
+                uint64_t marker = (uint64_t)src_fd;
+                if (marker >= 1 && marker <= 3) {
+                    child->fd_table[i] = src_fd;
+                } else if (pipe_is_end(src_fd)) {
+                    child->fd_table[i] = (vfs_file_t*)pipe_dup_end((pipe_end_t*)src_fd);
+                } else {
+                    child->fd_table[i] = vfs_dup(src_fd);
+                }
+            } else {
+                child->fd_table[i] = NULL;
+            }
+        }
+    }
+    
+    // Handle CLONE_SIGHAND (share signal handlers)
+    if (share_sighand) {
+        if (cur->sighand) {
+            sighand_struct_get(cur->sighand);
+            child->sighand = cur->sighand;
+        } else {
+            // Create sighand_struct from parent's legacy signal handlers
+            cur->sighand = sighand_struct_create();
+            if (!cur->sighand) {
+                // Cleanup and fail
+                if (share_files && child->files) {
+                    // files_struct_put would be called in cleanup
+                }
+                if (!share_vm && child->pml4) {
+                    mm_destroy_address_space(child->pml4);
+                }
+                kfree(k_stack_mem);
+                kfree(child);
+                return -ENOMEM;
+            }
+            // Copy signal handlers
+            for (int i = 0; i < 65; i++) {
+                cur->sighand->action[i] = cur->signals.action[i];
+            }
+            
+            sighand_struct_get(cur->sighand);
+            child->sighand = cur->sighand;
+        }
+    } else {
+        // Copy signal handlers (already done by memcpy)
+        child->sighand = NULL;
+        signal_fork_copy(child, cur);
+    }
+    
+    // Handle CLONE_THREAD (same thread group)
+    if (is_thread) {
+        // Add to parent's thread group
+        thread_group_add(cur->group_leader, child);
+        child->exit_signal = 0;  // Threads don't send exit signal
+        child->parent = cur->parent;  // Same parent as thread group leader
+    } else {
+        // New process (new thread group)
+        thread_group_init(child);
+        child->exit_signal = SIGCHLD;
+        child->parent = cur;
+        sched_add_child(cur, child);
+    }
+    
+    // Handle CLONE_SETTLS
+    if (set_tls) {
+        task_set_fs_base(child, tls);
+    } else {
+        child->fs_base = 0;
+    }
+    
+    // Handle CLONE_CHILD_CLEARTID
+    if (clear_child_tid && child_tidptr) {
+        if (validate_user_ptr(child_tidptr, sizeof(int))) {
+            child->clear_child_tid = (uint64_t*)child_tidptr;
+        }
+    } else {
+        child->clear_child_tid = NULL;
+    }
+    
+    // Handle CLONE_CHILD_SETTID
+    if (set_child_tid && child_tidptr) {
+        if (validate_user_ptr(child_tidptr, sizeof(int))) {
+            child->set_child_tid = (uint64_t*)child_tidptr;
+            // This will be written when child starts
+        }
+    } else {
+        child->set_child_tid = NULL;
+    }
+    
+    // Handle CLONE_PARENT_SETTID
+    if (set_parent_tid && parent_tidptr) {
+        if (validate_user_ptr(parent_tidptr, sizeof(int))) {
+            smap_disable();
+            *(int*)parent_tidptr = child->id;
+            smap_enable();
+        }
+    }
+    
+    // Clear robust list (not inherited)
+    child->robust_list = NULL;
+    child->robust_list_len = 0;
+    
+    // Copy mmap regions (if not sharing VM)
+    if (!share_vm) {
+        for (int i = 0; i < TASK_MAX_MMAP; i++) {
+            child->mmap_regions[i] = cur->mmap_regions[i];
+        }
+    }
+    
+    // Assign to least-loaded CPU
+    extern int g_smp_initialized;
+    if (g_smp_initialized) {
+        child->on_cpu = percpu_find_least_loaded_cpu();
+    } else {
+        child->on_cpu = 0;
+    }
+    
+    // Set up child's kernel stack to return to userspace
+    uint64_t user_rip = cur->syscall_rip;
+    uint64_t user_rsp = child_stack ? child_stack : cur->syscall_rsp;
+    uint64_t user_rflags = cur->syscall_rflags;
+    
+    uint64_t* k_sp = (uint64_t*)child->kernel_stack_top;
+    k_sp = (uint64_t*)((uint64_t)k_sp & ~0xFUL);
+    
+    // Push user callee-saved registers
+    *(--k_sp) = cur->syscall_r15;
+    *(--k_sp) = cur->syscall_r14;
+    *(--k_sp) = cur->syscall_r13;
+    *(--k_sp) = cur->syscall_r12;
+    *(--k_sp) = cur->syscall_rbx;
+    *(--k_sp) = cur->syscall_rbp;
+    
+    // IRET frame
+    *(--k_sp) = 0x1B;               // SS
+    *(--k_sp) = user_rsp;           // RSP
+    *(--k_sp) = user_rflags | 0x200;// RFLAGS with IF
+    *(--k_sp) = 0x23;               // CS
+    *(--k_sp) = user_rip;           // RIP
+    
+    // Return value for child (0 or TID depending on CLONE_CHILD_SETTID)
+    *(--k_sp) = 0;  // RAX = 0 for child
+    
+    // Kernel callee-saved for context switch
+    *(--k_sp) = (uint64_t)fork_child_return;
+    *(--k_sp) = 0; // RBP
+    *(--k_sp) = 0; // RBX
+    *(--k_sp) = 0; // R12
+    *(--k_sp) = 0; // R13
+    *(--k_sp) = 0; // R14
+    *(--k_sp) = 0; // R15
+    
+    child->sp = k_sp;
+    
+    // Add to global task list
+    spin_lock_irqsave(&g_task_list_lock, &irq_flags);
+    extern void task_list_add(task_t* t);
+    task_list_add(child);
+    spin_unlock_irqrestore(&g_task_list_lock, irq_flags);
+    
+    // Handle CLONE_CHILD_SETTID: write TID to child's address space
+    // This must be done after child is set up but before scheduling
+    if (set_child_tid && child->set_child_tid) {
+        smap_disable();
+        *(int*)(child->set_child_tid) = child->id;
+        smap_enable();
+    }
+    
+    // Enqueue child
+    sched_enqueue_ready(child);
+    
+    return child->id;
+}
+
+// SYS_VFORK - create child that shares parent's memory until exec/exit
+static int64_t sys_vfork(void) {
+    // For now, implement as regular fork
+    // True vfork semantics would suspend parent until child execs or exits
+    return sys_fork();
+}
+
+// SYS_EXIT_GROUP - terminate all threads in the process
+static void sys_exit_group(uint64_t status) {
+    task_t* cur = sched_current();
+    if (!cur) {
+        while(1) { __asm__ volatile("hlt"); }
+    }
+    
+    task_t* leader = cur->group_leader;
+    if (!leader) leader = cur;
+    
+    // Mark the group as exiting to prevent new threads
+    leader->group_exiting = true;
+    leader->group_exit_code = (int)status;
+    
+    // Signal all threads in the group to exit (except ourselves)
+    task_t* t = leader;
+    do {
+        if (t != cur && !t->has_exited) {
+            // Send SIGKILL to force immediate termination
+            sched_signal_task(t, SIGKILL);
+        }
+        t = t->thread_group_next;
+    } while (t != leader);
+    
+    // Now exit ourselves
+    sched_mark_task_exited(cur, (int)status);
+    sched_schedule();
+    
+    // Never returns
+    while(1) { __asm__ volatile("hlt"); }
+}
+
+// SYS_GETTID - get thread ID (unique per thread)
+static int64_t sys_gettid(void) {
+    task_t* cur = sched_current();
+    if (!cur) return -ESRCH;
+    return cur->id;  // TID is always the unique task ID
+}
+
+// SYS_SET_TID_ADDRESS - set address for clear-on-exit notification
+static int64_t sys_set_tid_address(uint64_t tidptr) {
+    task_t* cur = sched_current();
+    if (!cur) return -ESRCH;
+    
+    if (tidptr && validate_user_ptr(tidptr, sizeof(int))) {
+        cur->clear_child_tid = (uint64_t*)tidptr;
+    } else {
+        cur->clear_child_tid = NULL;
+    }
+    
+    return cur->id;
+}
+
+// Futex operations
+#define FUTEX_WAIT          0
+#define FUTEX_WAKE          1
+#define FUTEX_FD            2
+#define FUTEX_REQUEUE       3
+#define FUTEX_CMP_REQUEUE   4
+#define FUTEX_WAKE_OP       5
+#define FUTEX_LOCK_PI       6
+#define FUTEX_UNLOCK_PI     7
+#define FUTEX_TRYLOCK_PI    8
+#define FUTEX_WAIT_BITSET   9
+#define FUTEX_WAKE_BITSET   10
+#define FUTEX_PRIVATE_FLAG  128
+
+// SYS_FUTEX - fast userspace mutex operations (uses hash-bucket implementation)
+static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
+                         uint64_t timeout, uint64_t uaddr2, uint64_t val3) {
+    (void)val3;  // Used for FUTEX_CMP_REQUEUE comparison value
+    
+    int cmd = op & ~FUTEX_PRIVATE_FLAG;
+    
+    if (!validate_user_ptr(uaddr, sizeof(uint32_t))) {
+        return -EFAULT;
+    }
+    
+    switch (cmd) {
+        case FUTEX_WAIT: {
+            // Convert timeout to nanoseconds
+            uint64_t timeout_ns = 0;
+            if (timeout) {
+                // timeout points to struct timespec
+                if (validate_user_ptr(timeout, sizeof(struct k_timespec))) {
+                    smap_disable();
+                    struct k_timespec* ts = (struct k_timespec*)timeout;
+                    timeout_ns = (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
+                    smap_enable();
+                }
+            }
+            return futex_wait(uaddr, (uint32_t)val, timeout_ns);
+        }
+        
+        case FUTEX_WAKE:
+            return futex_wake(uaddr, (int)val);
+        
+        case FUTEX_REQUEUE:
+        case FUTEX_CMP_REQUEUE:
+            if (!validate_user_ptr(uaddr2, sizeof(uint32_t))) {
+                return -EFAULT;
+            }
+            // For CMP_REQUEUE, val3 is the expected value to compare
+            if (cmd == FUTEX_CMP_REQUEUE) {
+                smap_disable();
+                uint32_t curval = *(volatile uint32_t*)uaddr;
+                smap_enable();
+                if (curval != (uint32_t)val3) {
+                    return -EAGAIN;
+                }
+            }
+            // val = nr_wake, timeout = nr_requeue (reusing timeout arg)
+            return futex_requeue(uaddr, uaddr2, (int)val, (int)timeout);
+        
+        default:
+            return -ENOSYS;
+    }
+}
+
+// SYS_SET_ROBUST_LIST - set robust futex list head
+static int64_t sys_set_robust_list(uint64_t head, uint64_t len) {
+    task_t* cur = sched_current();
+    if (!cur) return -ESRCH;
+    
+    // Validate the length matches expected structure size
+    if (len != sizeof(struct robust_list_head)) {
+        return -EINVAL;
+    }
+    
+    if (head && !validate_user_ptr(head, len)) {
+        return -EFAULT;
+    }
+    
+    cur->robust_list = (struct robust_list_head*)head;
+    cur->robust_list_len = len;
+    
+    return 0;
+}
+
+// SYS_GET_ROBUST_LIST - get robust futex list head
+static int64_t sys_get_robust_list(uint64_t pid, uint64_t head_ptr, uint64_t len_ptr) {
+    task_t* target;
+    
+    if (pid == 0) {
+        target = sched_current();
+    } else {
+        target = sched_find_task_by_id((uint32_t)pid);
+    }
+    
+    if (!target) return -ESRCH;
+    
+    // Permission check: can only get own robust list or if privileged
+    task_t* cur = sched_current();
+    if (target != cur && target->parent != cur) {
+        return -EPERM;
+    }
+    
+    if (!validate_user_ptr(head_ptr, sizeof(void*)) ||
+        !validate_user_ptr(len_ptr, sizeof(size_t))) {
+        return -EFAULT;
+    }
+    
+    smap_disable();
+    *(struct robust_list_head**)head_ptr = target->robust_list;
+    *(size_t*)len_ptr = target->robust_list_len;
+    smap_enable();
+    
+    return 0;
+}
+
+// arch_prctl codes
+#define ARCH_SET_GS     0x1001
+#define ARCH_SET_FS     0x1002
+#define ARCH_GET_FS     0x1003
+#define ARCH_GET_GS     0x1004
+
+// SYS_ARCH_PRCTL - architecture-specific thread state
+static int64_t sys_arch_prctl(uint64_t code, uint64_t addr) {
+    task_t* cur = sched_current();
+    if (!cur) return -ESRCH;
+    
+    switch (code) {
+        case ARCH_SET_FS:
+            task_set_fs_base(cur, addr);
+            // Apply immediately
+            task_load_tls(cur);
+            return 0;
+        
+        case ARCH_GET_FS:
+            if (!validate_user_ptr(addr, sizeof(uint64_t))) {
+                return -EFAULT;
+            }
+            smap_disable();
+            *(uint64_t*)addr = cur->fs_base;
+            smap_enable();
+            return 0;
+        
+        case ARCH_SET_GS:
+            cur->gs_base = addr;
+            return 0;
+        
+        case ARCH_GET_GS:
+            if (!validate_user_ptr(addr, sizeof(uint64_t))) {
+                return -EFAULT;
+            }
+            smap_disable();
+            *(uint64_t*)addr = cur->gs_base;
+            smap_enable();
+            return 0;
+        
+        default:
+            return -EINVAL;
+    }
+}
+
+// Scheduling policies
+#define SCHED_NORMAL    0
+#define SCHED_FIFO      1
+#define SCHED_RR        2
+#define SCHED_BATCH     3
+#define SCHED_IDLE      5
+#define SCHED_DEADLINE  6
+
+// CPU set for affinity
+#define CPU_SETSIZE 64
+typedef struct {
+    uint64_t bits[CPU_SETSIZE / 64];
+} cpu_set_t;
+
+// SYS_SCHED_SETAFFINITY - bind thread to specific CPUs
+static int64_t sys_sched_setaffinity(uint64_t pid, uint64_t cpusetsize, uint64_t mask_ptr) {
+    (void)cpusetsize;
+    
+    if (!validate_user_ptr(mask_ptr, sizeof(uint64_t))) {
+        return -EFAULT;
+    }
+    
+    task_t* target;
+    if (pid == 0) {
+        target = sched_current();
+    } else {
+        target = sched_find_task_by_id((uint32_t)pid);
+    }
+    
+    if (!target) {
+        return -ESRCH;
+    }
+    
+    // Read affinity mask from user
+    smap_disable();
+    uint64_t mask = *(uint64_t*)mask_ptr;
+    smap_enable();
+    
+    // Validate: at least one CPU must be set
+    if (mask == 0) {
+        return -EINVAL;
+    }
+    
+    // Store the full affinity mask (0 means all CPUs allowed)
+    target->cpu_affinity = mask;
+    
+    // If current CPU is not in the new affinity mask, migrate to first allowed CPU
+    if (!(mask & (1ULL << target->on_cpu))) {
+        for (int i = 0; i < 64; i++) {
+            if (mask & (1ULL << i)) {
+                target->on_cpu = (uint32_t)i;
+                // Mark for reschedule to migrate
+                target->need_resched = 1;
+                break;
+            }
+        }
+    }
+    
+    return 0;
+}
+
+// SYS_SCHED_GETAFFINITY - get CPU affinity mask
+static int64_t sys_sched_getaffinity(uint64_t pid, uint64_t cpusetsize, uint64_t mask_ptr) {
+    (void)cpusetsize;
+    
+    if (!validate_user_ptr(mask_ptr, sizeof(uint64_t))) {
+        return -EFAULT;
+    }
+    
+    task_t* target;
+    if (pid == 0) {
+        target = sched_current();
+    } else {
+        target = sched_find_task_by_id((uint32_t)pid);
+    }
+    
+    if (!target) {
+        return -ESRCH;
+    }
+    
+    // Return stored affinity mask, or all CPUs if not set
+    uint64_t mask = target->cpu_affinity;
+    if (mask == 0) {
+        // Affinity not set = all CPUs allowed, return mask with all online CPUs
+        uint32_t cpu_count = smp_get_cpu_count();
+        mask = (1ULL << cpu_count) - 1;
+        if (mask == 0) mask = 1;  // At least CPU 0
+    }
+    
+    smap_disable();
+    *(uint64_t*)mask_ptr = mask;
+    smap_enable();
+    
+    return sizeof(uint64_t);
+}
+
+// Scheduling parameters
+struct sched_param {
+    int sched_priority;
+};
+
+// SYS_SCHED_SETSCHEDULER - set scheduling policy
+static int64_t sys_sched_setscheduler(uint64_t pid, uint64_t policy, uint64_t param_ptr) {
+    (void)param_ptr;
+    
+    task_t* target;
+    if (pid == 0) {
+        target = sched_current();
+    } else {
+        target = sched_find_task_by_id((uint32_t)pid);
+    }
+    
+    if (!target) {
+        return -ESRCH;
+    }
+    
+    // We only support SCHED_NORMAL for now
+    if (policy != SCHED_NORMAL && policy != SCHED_RR) {
+        return -EINVAL;
+    }
+    
+    return 0;
+}
+
+// SYS_SCHED_GETSCHEDULER - get scheduling policy
+static int64_t sys_sched_getscheduler(uint64_t pid) {
+    task_t* target;
+    if (pid == 0) {
+        target = sched_current();
+    } else {
+        target = sched_find_task_by_id((uint32_t)pid);
+    }
+    
+    if (!target) {
+        return -ESRCH;
+    }
+    
+    return SCHED_NORMAL;  // We use round-robin by default
+}
+
+// SYS_SCHED_SETPARAM - set scheduling parameters
+static int64_t sys_sched_setparam(uint64_t pid, uint64_t param_ptr) {
+    (void)param_ptr;
+    
+    task_t* target;
+    if (pid == 0) {
+        target = sched_current();
+    } else {
+        target = sched_find_task_by_id((uint32_t)pid);
+    }
+    
+    if (!target) {
+        return -ESRCH;
+    }
+    
+    // Accept but ignore (we use fixed round-robin)
+    return 0;
+}
+
+// SYS_SCHED_GETPARAM - get scheduling parameters
+static int64_t sys_sched_getparam(uint64_t pid, uint64_t param_ptr) {
+    if (!validate_user_ptr(param_ptr, sizeof(struct sched_param))) {
+        return -EFAULT;
+    }
+    
+    task_t* target;
+    if (pid == 0) {
+        target = sched_current();
+    } else {
+        target = sched_find_task_by_id((uint32_t)pid);
+    }
+    
+    if (!target) {
+        return -ESRCH;
+    }
+    
+    struct sched_param param = { .sched_priority = 0 };
+    
+    smap_disable();
+    *(struct sched_param*)param_ptr = param;
+    smap_enable();
+    
+    return 0;
+}
+
+// SYS_SCHED_GET_PRIORITY_MAX - get max priority for policy
+static int64_t sys_sched_get_priority_max(uint64_t policy) {
+    switch (policy) {
+        case SCHED_FIFO:
+        case SCHED_RR:
+            return 99;
+        case SCHED_NORMAL:
+        case SCHED_BATCH:
+        case SCHED_IDLE:
+            return 0;
+        default:
+            return -EINVAL;
+    }
+}
+
+// SYS_SCHED_GET_PRIORITY_MIN - get min priority for policy
+static int64_t sys_sched_get_priority_min(uint64_t policy) {
+    switch (policy) {
+        case SCHED_FIFO:
+        case SCHED_RR:
+            return 1;
+        case SCHED_NORMAL:
+        case SCHED_BATCH:
+        case SCHED_IDLE:
+            return 0;
+        default:
+            return -EINVAL;
+    }
+}
+
+// SYS_SCHED_RR_GET_INTERVAL - get round-robin time quantum
+static int64_t sys_sched_rr_get_interval(uint64_t pid, uint64_t tp_ptr) {
+    if (!validate_user_ptr(tp_ptr, sizeof(struct k_timespec))) {
+        return -EFAULT;
+    }
+    
+    task_t* target;
+    if (pid == 0) {
+        target = sched_current();
+    } else {
+        target = sched_find_task_by_id((uint32_t)pid);
+    }
+    
+    if (!target) {
+        return -ESRCH;
+    }
+    
+    // Return time slice (at 100Hz, 2 ticks = 20ms)
+    struct k_timespec ts = { .tv_sec = 0, .tv_nsec = 20000000 };  // 20ms
+    
+    smap_disable();
+    *(struct k_timespec*)tp_ptr = ts;
+    smap_enable();
+    
+    return 0;
+}
+
+// SYS_MPROTECT - change memory protection
+static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot) {
+    task_t* cur = sched_current();
+    if (!cur) {
+        return -ESRCH;
+    }
+    
+    // Validate alignment
+    if (addr & (PAGE_SIZE - 1)) {
+        return -EINVAL;
+    }
+    
+    // Round up length to page boundary
+    uint64_t pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+    
+    // Build page flags
+    uint64_t flags = PAGE_PRESENT | PAGE_USER;
+    if (prot & 0x2) {  // PROT_WRITE
+        flags |= PAGE_WRITABLE;
+    }
+    if (!(prot & 0x4)) {  // !PROT_EXEC
+        flags |= PAGE_NO_EXECUTE;
+    }
+    
+    // Update page table entries
+    uint64_t* pml4 = cur->pml4;
+    if (!pml4) {
+        return -EFAULT;
+    }
+    
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t vaddr = addr + i * PAGE_SIZE;
+        
+        // Get current PTE
+        uint64_t phys = mm_get_physical_address(vaddr);
+        if (phys == 0) {
+            // Page not mapped
+            continue;
+        }
+        
+        // Remap with new protection
+        mm_map_page_in_address_space(pml4, vaddr, phys, flags);
+    }
+    
+    // Flush TLB for modified pages on local CPU
+    // Use virt_to_phys() for the PML4 pointer itself (not mm_get_physical_address)
+    __asm__ volatile("mov %0, %%cr3" : : "r"(virt_to_phys(pml4)));
+    
+    // TLB shootdown: threads sharing this address space (CLONE_VM) may be running
+    // on other CPUs with stale TLB entries. Broadcast invalidation to all CPUs.
+    smp_tlb_shootdown_sync();
+    
+    return 0;
+}
+
 // Main syscall dispatcher (inner function)
 static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2, 
                         uint64_t a3, uint64_t a4, uint64_t a5) {
@@ -2944,6 +3861,47 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
             return sys_clock_gettime(a1, a2);
         case SYS_CLOCK_GETRES:
             return sys_clock_getres(a1, a2);
+            
+        // SMP/Threading syscalls
+        case SYS_CLONE:
+            return sys_clone(a1, a2, a3, a4, a5);
+        case SYS_VFORK:
+            return sys_vfork();
+        case SYS_EXIT_GROUP:
+            sys_exit_group(a1);
+            return 0;  // Never reached
+        case SYS_GETTID:
+            return sys_gettid();
+        case SYS_SET_TID_ADDRESS:
+            return sys_set_tid_address(a1);
+        case SYS_FUTEX:
+            return sys_futex(a1, a2, a3, a4, a5, 0);
+        case SYS_SET_ROBUST_LIST:
+            return sys_set_robust_list(a1, a2);
+        case SYS_GET_ROBUST_LIST:
+            return sys_get_robust_list(a1, a2, a3);
+        case SYS_ARCH_PRCTL:
+            return sys_arch_prctl(a1, a2);
+        case SYS_SCHED_SETAFFINITY:
+            return sys_sched_setaffinity(a1, a2, a3);
+        case SYS_SCHED_GETAFFINITY:
+            return sys_sched_getaffinity(a1, a2, a3);
+        case SYS_SCHED_SETSCHEDULER:
+            return sys_sched_setscheduler(a1, a2, a3);
+        case SYS_SCHED_GETSCHEDULER:
+            return sys_sched_getscheduler(a1);
+        case SYS_SCHED_SETPARAM:
+            return sys_sched_setparam(a1, a2);
+        case SYS_SCHED_GETPARAM:
+            return sys_sched_getparam(a1, a2);
+        case SYS_SCHED_GET_PRIORITY_MAX:
+            return sys_sched_get_priority_max(a1);
+        case SYS_SCHED_GET_PRIORITY_MIN:
+            return sys_sched_get_priority_min(a1);
+        case SYS_SCHED_RR_GET_INTERVAL:
+            return sys_sched_rr_get_interval(a1, a2);
+        case SYS_MPROTECT:
+            return sys_mprotect(a1, a2, a3);
             
         case SYS_MEMSTATS:
             mm_print_memory_stats();

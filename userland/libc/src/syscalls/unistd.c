@@ -371,9 +371,7 @@ int brk(void* addr) {
     return 0;
 }
 
-int sched_yield(void) {
-    return syscall0(SYS_YIELD);
-}
+// sched_yield moved to sched.c
 
 int gethostname(char* name, size_t len) {
     long ret = syscall2(SYS_GETHOSTNAME, (long)name, len);

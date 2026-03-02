@@ -96,7 +96,8 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/acpi.o \
 			  $(BUILD_DIR)/percpu.o \
 			  $(BUILD_DIR)/smp.o \
-			  $(BUILD_DIR)/ap_trampoline.o
+			  $(BUILD_DIR)/ap_trampoline.o \
+			  $(BUILD_DIR)/futex.o
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -244,6 +245,9 @@ $(BUILD_DIR)/smp.o: $(KERNEL_DIR)/ke/smp.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/ap_trampoline.o: $(KERNEL_DIR)/ke/ap_trampoline.S | $(BUILD_DIR)
 	nasm -f elf64 $< -o $@
+
+$(BUILD_DIR)/futex.o: $(KERNEL_DIR)/ke/futex.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # Build userland C library
 .PHONY: userland-libc
