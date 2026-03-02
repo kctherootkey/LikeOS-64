@@ -69,6 +69,7 @@ void console_handle_mouse_wheel(int delta);
 // Console interface (now framebuffer-based with optimization)
 void console_init(framebuffer_info_t* fb_info);
 void console_init_fb_optimization(void);
+void console_apply_sysfont(void);  // Apply loaded system font and redraw screen
 void console_clear(void);
 void console_putchar(char c);
 void console_puts(const char* str);

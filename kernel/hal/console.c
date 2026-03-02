@@ -10,6 +10,7 @@
 #include "../../include/kernel/scrollbar.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/sched.h"  // For spinlock_t
+#include "../../include/kernel/sysfont.h"  // For external PSF font loading
 
 #define SIZE_MAX ((size_t)-1)
 #define NULL ((void*)0)
@@ -163,9 +164,15 @@ static const uint8_t font_8x16[128][16] = {
     ['"'] = {0x00, 0x00, 0x66, 0x66, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 };
 
-// Character dimensions
-#define CHAR_WIDTH 8
-#define CHAR_HEIGHT 16
+// Character dimensions - default values for built-in font, updated when external font loaded
+#define DEFAULT_CHAR_WIDTH 8
+#define DEFAULT_CHAR_HEIGHT 16
+static uint32_t char_width = DEFAULT_CHAR_WIDTH;
+static uint32_t char_height = DEFAULT_CHAR_HEIGHT;
+
+// Macros to access current character dimensions
+#define CHAR_WIDTH char_width
+#define CHAR_HEIGHT char_height
 
 // Calculate max text rows and columns
 static uint32_t max_rows = 0;
@@ -421,7 +428,7 @@ static void draw_cursor_at(uint32_t x, uint32_t y, uint8_t show) {
     uint32_t cursor_color = show ? 0x00808080 : bg_color;
     
     // Draw a thin vertical bar (2 pixels wide for better visibility)
-    for (int row = 0; row < CHAR_HEIGHT; row++) {
+    for (uint32_t row = 0; row < char_height; row++) {
         set_pixel(pixel_x, pixel_y + row, cursor_color);
         set_pixel(pixel_x + 1, pixel_y + row, cursor_color);
     }
@@ -430,13 +437,45 @@ static void draw_cursor_at(uint32_t x, uint32_t y, uint8_t show) {
 // Draw a character at specific position
 static void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color, uint32_t bg_color) {
     unsigned char uc = (unsigned char)c;
+    
+    // Use external PSF font if loaded, otherwise fall back to built-in font
+    if (sysfont_is_loaded()) {
+        const uint8_t* glyph = sysfont_get_glyph(uc);
+        if (!glyph) {
+            glyph = sysfont_get_glyph('?');
+        }
+        if (glyph) {
+            uint32_t font_w = sysfont_get_width();
+            uint32_t font_h = sysfont_get_height();
+            // bytes_per_row = (width + 7) / 8 for PSF fonts
+            uint32_t bytes_per_row = (font_w + 7) / 8;
+            
+            for (uint32_t row = 0; row < font_h; row++) {
+                for (uint32_t col = 0; col < font_w; col++) {
+                    uint32_t byte_idx = row * bytes_per_row + (col / 8);
+                    uint8_t bit_mask = 0x80 >> (col % 8);
+                    uint32_t pixel_x = x + col;
+                    uint32_t pixel_y = y + row;
+                    
+                    if (glyph[byte_idx] & bit_mask) {
+                        set_pixel(pixel_x, pixel_y, fg_color);
+                    } else {
+                        set_pixel(pixel_x, pixel_y, bg_color);
+                    }
+                }
+            }
+            return;
+        }
+    }
+    
+    // Fall back to built-in 8x16 font
     if (uc >= 128) uc = '?'; // Default for unknown chars
     
     const uint8_t* char_bitmap = font_8x16[uc];
     
-    for (int row = 0; row < CHAR_HEIGHT; row++) {
+    for (int row = 0; row < DEFAULT_CHAR_HEIGHT; row++) {
         uint8_t line = char_bitmap[row];
-        for (int col = 0; col < CHAR_WIDTH; col++) {
+        for (int col = 0; col < DEFAULT_CHAR_WIDTH; col++) {
             uint32_t pixel_x = x + col;
             uint32_t pixel_y = y + row;
             
@@ -522,6 +561,48 @@ void console_init_fb_optimization(void) {
         kprintf("Console: Using direct framebuffer (no optimization)\n");
 #endif
     }
+}
+
+// Apply the system font (after loading via sysfont_load)
+// Updates character dimensions, recalculates rows/cols, and redraws the screen
+void console_apply_sysfont(void) {
+    if (!sysfont_is_loaded()) {
+        return;
+    }
+    
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
+    
+    // Update character dimensions from loaded font
+    char_width = sysfont_get_width();
+    char_height = sysfont_get_height();
+    
+    // Recalculate max rows and columns based on new font size
+    if (fb_info) {
+        uint32_t scrollbar_total_width = SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
+        uint32_t text_area_width = fb_info->horizontal_resolution - scrollbar_total_width;
+        max_cols = text_area_width / char_width;
+        max_rows = fb_info->vertical_resolution / char_height;
+        
+        // Update scrollback visible lines
+        g_sb.visible_lines = max_rows;
+    }
+    
+    // Hide cursor temporarily
+    if (cursor_enabled && cursor_shown) {
+        draw_cursor_at(cursor_last_x, cursor_last_y, 0);
+    }
+    
+    // Redraw the entire screen with the scrollback content using the new font
+    console_render_view();
+    console_sync_scrollbar();
+    
+    // Flush changes
+    fb_flush_dirty_regions();
+    
+    spin_unlock_irqrestore(&console_lock, flags);
+    
+    kprintf("Console: using system font (%ux%u)\n", char_width, char_height);
 }
 
 // Clear the entire screen (text area only, preserve scrollbar)
