@@ -665,6 +665,13 @@ void signal_deliver(task_t* task) {
 void signal_deliver_irq(task_t* task, interrupt_frame_t* frame) {
     if (!task || !frame || task->privilege != TASK_USER) return;
 
+    // Skip signal delivery for zombie/exited tasks.  A cross-CPU kill()
+    // may have already marked this task as zombie via sched_mark_task_exited
+    // while SIGKILL is still pending in the signal queue.  Re-processing
+    // the signal would call sched_mark_task_exited a second time, causing
+    // double resource release and state corruption.
+    if (task->has_exited || task->state == TASK_ZOMBIE) return;
+
     task_signal_state_t* sig = &task->signals;
     siginfo_t info;
 
@@ -684,6 +691,9 @@ void signal_deliver_irq(task_t* task, interrupt_frame_t* frame) {
             case SIG_DFL_TERM:
             case SIG_DFL_CORE:
                 sched_mark_task_exited(task, 128 + signum);
+                // Ensure sched_preempt runs after we return to irq_handler,
+                // even if the timer's remaining_ticks hasn't expired yet.
+                sched_set_need_resched(task);
                 break;
             case SIG_DFL_STOP:
                 task->state = TASK_STOPPED;

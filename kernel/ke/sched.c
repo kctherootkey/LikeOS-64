@@ -79,6 +79,19 @@ static uint64_t g_default_kernel_stack = 0;
 static volatile uint64_t g_total_schedules = 0;
 static uint64_t g_preempt_count_total = 0;
 
+// ============================================================================
+// DEAD THREAD REAPING
+// ============================================================================
+// Threads (exit_signal == 0) can never be waited on via waitpid, so they must
+// be freed automatically.  We can't free them inside sched_mark_task_exited
+// because the thread is still running on its own kernel stack.  Instead, after
+// every context switch we check if the previous task was a zombie thread and
+// free it — by that point we've switched to a different stack and it's safe.
+#define DEAD_THREAD_MAX 64
+static task_t* g_dead_threads[DEAD_THREAD_MAX];
+static volatile int g_dead_thread_count = 0;
+static spinlock_t g_dead_thread_lock = SPINLOCK_INIT("dead_threads");
+
 // Bootstrap and BSP idle tasks (statically allocated)
 static task_t g_bootstrap_task;
 static task_t g_idle_task;
@@ -123,12 +136,48 @@ static inline int is_bootstrap_task(const task_t* t) {
     return t == &g_bootstrap_task;
 }
 
+// Queue a dead thread for deferred reaping (called from sched_mark_task_exited)
+static void dead_thread_queue(task_t* task) {
+    uint64_t flags;
+    spin_lock_irqsave(&g_dead_thread_lock, &flags);
+    if (g_dead_thread_count < DEAD_THREAD_MAX) {
+        g_dead_threads[g_dead_thread_count++] = task;
+    } else {
+        // Overflow – shouldn't happen unless many threads exit simultaneously.
+        // Drop on the floor; leak is better than corruption.
+        kprintf("WARN: dead_thread_queue overflow (pid %d dropped)\n", task->id);
+    }
+    spin_unlock_irqrestore(&g_dead_thread_lock, flags);
+}
+
+// Reap all dead threads.  Called AFTER ctx_switch_asm when we are safely on a
+// different kernel stack and can free the previous thread's stack.
+static void dead_thread_reap(void) {
+    if (g_dead_thread_count == 0) return;  // Fast path – no lock needed
+
+    task_t* batch[DEAD_THREAD_MAX];
+    int count;
+
+    uint64_t flags;
+    spin_lock_irqsave(&g_dead_thread_lock, &flags);
+    count = g_dead_thread_count;
+    for (int i = 0; i < count; i++) {
+        batch[i] = g_dead_threads[i];
+    }
+    g_dead_thread_count = 0;
+    spin_unlock_irqrestore(&g_dead_thread_lock, flags);
+
+    for (int i = 0; i < count; i++) {
+        sched_remove_task(batch[i]);
+    }
+}
+
 // ============================================================================
 // ADDRESS SPACE SWITCHING
 // ============================================================================
 
 static inline void switch_address_space(task_t* prev, task_t* next) {
-    uint64_t* prev_pml4 = prev->pml4 ? prev->pml4 : g_kernel_pml4;
+    (void)prev;  // Not used — we check actual hardware CR3 below
     uint64_t* next_pml4 = next->pml4 ? next->pml4 : g_kernel_pml4;
 
     if (next->privilege == TASK_USER && next->kernel_stack_top != 0) {
@@ -141,7 +190,17 @@ static inline void switch_address_space(task_t* prev, task_t* next) {
         this_cpu()->syscall_kernel_rsp = cpu_kernel_stack;
     }
 
-    if (prev_pml4 != next_pml4) {
+    // Compare against the ACTUAL hardware CR3, not prev->pml4.
+    // After sched_mark_task_exited or cross-CPU SIGKILL, prev->pml4 may
+    // be NULL while the real CR3 still holds the user PML4.  The old
+    // comparison wrongly concluded "already on kernel PML4" and skipped
+    // the switch, leaving a freed/stale PML4 in CR3.  When that page is
+    // later recycled and zeroed, PML4[511] (kernel mapping) is wiped and
+    // the next kernel instruction fetch causes a triple fault.
+    uint64_t actual_cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(actual_cr3));
+    uint64_t next_phys = virt_to_phys(next_pml4);
+    if ((actual_cr3 & ~0xFFFULL) != next_phys) {
         mm_switch_address_space(next_pml4);
     }
     
@@ -443,6 +502,8 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4,
 
     uint8_t* k_stack_mem = (uint8_t*)kalloc(8192);
     if (!k_stack_mem) { kfree(t); return NULL; }
+    // Zero the kernel stack to prevent stale data issues
+    mm_memset(k_stack_mem, 0, 8192);
 
     uint64_t k_stack_top = ((uint64_t)(k_stack_mem + 8192)) & ~0xFUL;
     uint64_t* k_sp = (uint64_t*)k_stack_top;
@@ -538,7 +599,7 @@ void sched_schedule(void) {
 
     // If still nothing or same as cur, stay on current
     if (!next || next == cur) {
-        if (cur) {
+        if (cur && !cur->has_exited) {
             cur->state = TASK_RUNNING;
             cur->remaining_ticks = SCHED_TIME_SLICE;
             cur->need_resched = 0;
@@ -547,13 +608,23 @@ void sched_schedule(void) {
         return;
     }
 
-    // Check sp BEFORE enqueueing cur
+    // Check sp BEFORE enqueueing cur — if next is unusable, fall through
+    // to the idle task instead of bailing out entirely.  The old code
+    // returned immediately, which left zombie/exited tasks stuck as
+    // current_task because the only alternative (e.g. bootstrap, sp=0)
+    // was always rejected.
     if (next->sp == 0 || next->state == TASK_ZOMBIE) {
-        // Invalid target – put it back and stay on current
-        kprintf("WARN: sched_schedule: next invalid (pid %d, sp=%p, state=%d)\n", 
-                next->id, (void*)next->sp, next->state);
         if (!is_idle_task(next) && next->state != TASK_ZOMBIE) rq_enqueue_locked(cpu, next);
-        if (cur) { cur->state = TASK_RUNNING; cur->remaining_ticks = SCHED_TIME_SLICE; }
+        next = cpu->idle_task;
+        // idle_task might be cur (e.g. idle calling schedule) — handle below
+    }
+
+    // Final sanity: if next is still cur or NULL or invalid, stay on current
+    if (!next || next == cur || next->sp == 0) {
+        if (cur && !cur->has_exited) {
+            cur->state = TASK_RUNNING;
+            cur->remaining_ticks = SCHED_TIME_SLICE;
+        }
         spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
         return;
     }
@@ -580,12 +651,42 @@ void sched_schedule(void) {
     spin_unlock(&cpu->runqueue_lock);
 
     switch_address_space(prev, next);
-    
+
+    // CRITICAL: We already set cpu->current_task = next, but we are still on
+    // prev's kernel stack.  We MUST re-enable interrupts so TLB shootdown
+    // IPIs can be ACKed (otherwise we'd timeout).  However, the timer-driven
+    // preempt handler must NOT preempt us here, because it would see
+    // current_task == next and save the wrong RSP into next->sp.
+    // The per-CPU in_context_switch flag tells sched_preempt to skip us.
+    this_cpu()->in_context_switch = 1;
+    __asm__ volatile("" ::: "memory");  // Compiler barrier — same-CPU store ordering is guaranteed on x86
+    __asm__ volatile("sti");
+
+    // Save zombie pointer BEFORE the switch — we are still on prev's stack.
+    // Queue it AFTER ctx_switch_asm when we are on a safe stack.
+    // If there is already an unprocessed deferred_zombie (e.g. because
+    // fork_child_return skipped the post-switch check), queue it now
+    // to prevent overwriting and leaking it.
+    if (prev->state == TASK_ZOMBIE && prev->exit_signal == 0) {
+        if (this_cpu()->deferred_zombie) {
+            dead_thread_queue(this_cpu()->deferred_zombie);
+        }
+        this_cpu()->deferred_zombie = prev;
+    }
+
     ctx_switch_asm(&prev->sp, next->sp);
 
-    // Resumed. sched_schedule() is always called with IF=1 (from syscall
-    // handler after 'sti'), so re-enable interrupts unconditionally.
+    // Resumed on the new task's stack.  Always clear the guard — the task
+    // we just resumed could have been suspended from any scheduling path.
+    this_cpu()->in_context_switch = 0;
     __asm__ volatile("sti");
+
+    // Queue and reap deferred zombie now that we are on a safe stack.
+    if (this_cpu()->deferred_zombie) {
+        dead_thread_queue(this_cpu()->deferred_zombie);
+        this_cpu()->deferred_zombie = NULL;
+    }
+    dead_thread_reap();
 }
 
 // Called from BSP main loop to check if reschedule is needed
@@ -620,15 +721,19 @@ void sched_run_ready(void) {
     
     // If still nothing or same as cur, stay on current
     if (!next || next == cur) {
-        if (cur) { cur->state = TASK_RUNNING; cur->remaining_ticks = SCHED_TIME_SLICE; }
+        if (cur && !cur->has_exited) { cur->state = TASK_RUNNING; cur->remaining_ticks = SCHED_TIME_SLICE; }
         spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
         return;
     }
 
-    // Check sp BEFORE enqueueing cur
+    // Check sp BEFORE enqueueing cur — fall through to idle if next is bad
     if (next->sp == 0 || next->state == TASK_ZOMBIE) {
         if (!is_idle_task(next) && next->state != TASK_ZOMBIE) rq_enqueue_locked(cpu, next);
-        if (cur) { cur->state = TASK_RUNNING; }
+        next = cpu->idle_task;
+    }
+
+    if (!next || next == cur || next->sp == 0) {
+        if (cur && !cur->has_exited) { cur->state = TASK_RUNNING; }
         spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
         return;
     }
@@ -655,10 +760,33 @@ void sched_run_ready(void) {
     spin_unlock(&cpu->runqueue_lock);
 
     switch_address_space(prev, next);
+
+    // Same in_context_switch guard as sched_schedule (see comment there).
+    this_cpu()->in_context_switch = 1;
+    __asm__ volatile("" ::: "memory");
+    __asm__ volatile("sti");
+
+    // Save zombie pointer BEFORE the switch.
+    // Flush any leftover deferred_zombie first (see sched_schedule comment).
+    if (prev->state == TASK_ZOMBIE && prev->exit_signal == 0) {
+        if (this_cpu()->deferred_zombie) {
+            dead_thread_queue(this_cpu()->deferred_zombie);
+        }
+        this_cpu()->deferred_zombie = prev;
+    }
+
     ctx_switch_asm(&prev->sp, next->sp);
 
-    // Resumed. Same as sched_schedule — always called with IF=1.
+    // Resumed on the new task's stack.  Always clear the guard.
+    this_cpu()->in_context_switch = 0;
     __asm__ volatile("sti");
+
+    // Queue and reap deferred zombie now that we are on a safe stack.
+    if (this_cpu()->deferred_zombie) {
+        dead_thread_queue(this_cpu()->deferred_zombie);
+        this_cpu()->deferred_zombie = NULL;
+    }
+    dead_thread_reap();
 }
 
 task_t* sched_current(void) {
@@ -684,6 +812,23 @@ int sched_has_user_tasks(void) {
 }
 
 static void task_trampoline(void) {
+    // We arrived here from ctx_switch_asm → ret (fresh task, never scheduled
+    // before).  The scheduling function (sched_schedule / sched_run_ready) set
+    // in_context_switch = 1 before ctx_switch_asm but the normal post-switch
+    // cleanup (in_context_switch = 0, deferred zombie reap) was never executed
+    // because we diverged to this trampoline instead of returning to the
+    // scheduling function.  Clear the flag now, otherwise sched_preempt will
+    // bail out on every timer tick and this CPU can never do preemptive
+    // scheduling again.
+    this_cpu()->in_context_switch = 0;
+
+    // Process any deferred zombie from the previous task on this CPU.
+    if (this_cpu()->deferred_zombie) {
+        dead_thread_queue(this_cpu()->deferred_zombie);
+        this_cpu()->deferred_zombie = NULL;
+    }
+    dead_thread_reap();
+
     task_t* cur = sched_current();
     if (cur && cur->entry) {
         cur->entry(cur->arg);
@@ -696,6 +841,25 @@ static void task_trampoline(void) {
     for (;;) {
         sched_schedule();
         __asm__ volatile("hlt");
+    }
+}
+
+// Called from fork_child_return (assembly) to perform the same post-switch
+// cleanup that sched_schedule / sched_run_ready / sched_preempt do after
+// ctx_switch_asm.  Fresh tasks (fork/clone children) diverge to
+// fork_child_return instead of returning to the scheduling function, so
+// without this call in_context_switch stays permanently set to 1 on the
+// CPU, blocking all future preemptive scheduling.
+void sched_after_fork_child(void) {
+    this_cpu()->in_context_switch = 0;
+
+    // Queue deferred zombie but do NOT reap here — fork_child_return calls
+    // us before iretq with IRQs disabled.  Same deadlock risk as
+    // sched_preempt: dead_thread_reap → sched_remove_task →
+    // smp_tlb_shootdown_sync cannot safely run with IRQs off.
+    if (this_cpu()->deferred_zombie) {
+        dead_thread_queue(this_cpu()->deferred_zombie);
+        this_cpu()->deferred_zombie = NULL;
     }
 }
 
@@ -799,6 +963,12 @@ void sched_remove_task(task_t* task) {
         if (retries >= max_retries) {
             kprintf("sched_remove_task: WARNING: task %d still running after %d retries\n",
                     task->id, max_retries);
+            // SAFETY: Do NOT proceed with destruction!  The task's PML4 may
+            // still be loaded in a CPU's CR3.  Destroying the address space
+            // would free the PML4 page, which gets zeroed on reuse, wiping
+            // PML4[511] (kernel mapping) and causing a triple fault.
+            // Leak the task rather than crash the system.
+            return;
         }
     }
 
@@ -833,21 +1003,32 @@ void sched_remove_task(task_t* task) {
         }
     }
 
-    // Destroy address space
+    // SMP barrier: Before destroying address space, ensure no other CPU has
+    // TLB entries pointing to pages we're about to free. This prevents races
+    // where another CPU uses stale TLB entries to access freed/reallocated pages.
+    if (smp_is_enabled()) {
+        smp_tlb_shootdown_sync();
+    }
+
+    // Release mm_struct (deferred from sched_mark_task_exited).
+    // The spin-wait above guarantees the task is no longer running on any
+    // CPU, so no CR3 register still references this PML4.
+    if (task->mm) {
+        mm_struct_put(task->mm);
+        task->mm = NULL;
+        task->pml4 = NULL;  // PML4 was owned by mm_struct
+    }
+
+    // Destroy address space (legacy path — tasks without mm_struct)
     if (task->pml4) {
         mm_destroy_address_space(task->pml4);
         task->pml4 = NULL;
     }
 
-    // Free kernel stack - but first ensure no CPU is still using it.
-    // On SMP, a CPU may have just switched away from this task but still be
-    // in the context switch epilogue using the old stack. The TLB shootdown
-    // acts as a cross-CPU synchronization barrier: after it completes, all
-    // other CPUs have executed the IPI handler and are no longer mid-switch.
+    // Free kernel stack - the TLB shootdown above already synchronized with
+    // all CPUs, ensuring none are still in the context switch epilogue using
+    // this task's kernel stack.
     if (task->kernel_stack_base && task->privilege == TASK_USER) {
-        if (smp_is_enabled()) {
-            smp_tlb_shootdown_sync();  // Synchronize with all CPUs
-        }
         kfree(task->kernel_stack_base);
     }
 
@@ -890,6 +1071,8 @@ task_t* sched_fork_current(void) {
         kfree(child);
         return NULL;
     }
+    // Zero the kernel stack to prevent stale data issues
+    mm_memset(k_stack_mem, 0, 8192);
     uint64_t k_stack_top = ((uint64_t)(k_stack_mem + 8192)) & ~0xFUL;
 
     // Copy parent
@@ -1094,6 +1277,13 @@ void sched_wake_expired_sleepers(uint64_t current_tick) {
 void sched_mark_task_exited(task_t* task, int status) {
     if (!task) return;
 
+    // Guard against double-call.  Cross-CPU SIGKILL marks the task exited
+    // from the sender's CPU; if the timer later delivers the same signal
+    // on the victim's CPU, signal_deliver_irq would call us a second time.
+    // The second call would try files_struct_put(NULL)/sighand_struct_put(NULL)
+    // and corrupt state.  Bail out if already processed.
+    if (task->has_exited) return;
+
     task->exit_code = status;
     
     // ========================================================================
@@ -1110,20 +1300,35 @@ void sched_mark_task_exited(task_t* task, int status) {
         *(volatile int*)task->clear_child_tid = 0;
         smap_enable();
         
-        // Wake any threads waiting on this futex (pthread_join uses this)
-        futex_wake((uint64_t)task->clear_child_tid, 1);
+        // Wake any threads waiting on this futex (pthread_join uses this).
+        // Use futex_wake_for_task with the dying task's PML4, because
+        // sched_mark_task_exited can be called cross-CPU (e.g. SIGKILL
+        // from exit_group) where sched_current() is the sender, not the
+        // victim.  Using the wrong PML4 produces a wrong futex key and
+        // the wake silently fails to find the waiter.
+        futex_wake_for_task((uint64_t)task->clear_child_tid, 1, task);
         task->clear_child_tid = NULL;
     }
+    
+    // Clean up any futex waiter entries belonging to this task.
+    // If the task was killed (e.g. SIGKILL from exit_group) while BLOCKED
+    // in futex_wait, its waiter entry is still in the hash bucket.  The
+    // normal cleanup (run by the task after sched_schedule returns) will
+    // never execute.  Stale entries silently consume wake slots in later
+    // futex_wake calls and cause deadlocks.
+    futex_cleanup_task(task);
     
     // Remove from thread group
     thread_group_remove(task);
     
-    // Release shared structures with reference counting
-    if (task->mm) {
-        mm_struct_put(task->mm);
-        task->mm = NULL;
-        task->pml4 = NULL;  // PML4 was owned by mm_struct
-    }
+    // CRITICAL: Do NOT release mm_struct here!  The PML4 owned by the
+    // mm_struct may still be loaded in this CPU's (or another CPU's) CR3.
+    // If mm_struct_put freed the address space now, the PML4 page would
+    // return to the PT-pool freelist, and a later allocate_pt_page would
+    // zero it — wiping PML4[511] (kernel-code mapping) and causing a
+    // triple fault.  Defer mm_struct_put to sched_remove_task, which
+    // first waits for the task to stop running on ALL CPUs.
+    // (task->mm and task->pml4 are intentionally kept alive here.)
     
     if (task->files) {
         files_struct_put(task->files);
@@ -1196,6 +1401,10 @@ void sched_mark_task_exited(task_t* task, int status) {
 
 void sched_signal_task(task_t* task, int sig) {
     if (!task) return;
+
+    // Skip already-exited/zombie tasks.  A cross-CPU kill or exception
+    // may have already marked this task as exited.
+    if (task->has_exited || task->state == TASK_ZOMBIE) return;
 
     siginfo_t info;
     mm_memset(&info, 0, sizeof(info));
@@ -1383,6 +1592,11 @@ void sched_dump_tasks(void) {
     }
     spin_unlock_irqrestore(&g_task_list_lock, flags);
     kprintf("=======================================================================\n");
+    
+    // Dump futex trace ring buffer for debugging missed wakeups
+    // (only compiled in when FUTEX_TRACE_DEBUG is defined in futex.c)
+    extern void futex_dump_trace(void);
+    futex_dump_trace();
 }
 
 // ============================================================================
@@ -1404,6 +1618,13 @@ void sched_preempt(interrupt_frame_t* frame) {
     if (!g_smp_initialized) return;
 
     percpu_t* cpu = this_cpu();
+    
+    // CRITICAL: If this CPU is between current_task update and ctx_switch_asm,
+    // current_task already points to "next" but we are still on "prev"'s
+    // kernel stack.  Preempting here would save the wrong RSP into next->sp,
+    // permanently corrupting its saved stack pointer → triple fault later.
+    if (cpu->in_context_switch) return;
+    
     task_t* cur = cpu->current_task;
     if (!cur) return;
     
@@ -1435,20 +1656,26 @@ void sched_preempt(interrupt_frame_t* frame) {
 
     // If next is still cur (idle == cur??) or no next, stay on current
     if (!next || next == cur) {
-        if (cur) {
+        if (cur && !cur->has_exited) {
             cur->state = TASK_RUNNING;
             cur->remaining_ticks = SCHED_TIME_SLICE;
-            cur->preempt_frame = NULL;
         }
+        cur->preempt_frame = NULL;
         spin_unlock(&cpu->runqueue_lock);
         local_irq_restore(flags);
         return;
     }
 
-    // Check sp BEFORE enqueueing cur to avoid corruption
+    // Check sp BEFORE enqueueing cur — fall through to idle if next is bad
     if (next->sp == 0 || next->state == TASK_ZOMBIE) {
         if (!is_idle_task(next) && next->state != TASK_ZOMBIE) rq_enqueue_locked(cpu, next);
-        cur->remaining_ticks = SCHED_TIME_SLICE;
+        next = cpu->idle_task;
+    }
+
+    if (!next || next == cur || next->sp == 0) {
+        if (cur && !cur->has_exited) {
+            cur->remaining_ticks = SCHED_TIME_SLICE;
+        }
         cur->preempt_frame = NULL;
         spin_unlock(&cpu->runqueue_lock);
         local_irq_restore(flags);
@@ -1479,14 +1706,45 @@ void sched_preempt(interrupt_frame_t* frame) {
     spin_unlock(&cpu->runqueue_lock);
 
     switch_address_space(prev, next);
-    
+
+    // CRITICAL SMP FIX: Save zombie pointer in per-CPU data BEFORE the switch.
+    // Do NOT queue yet — we are still on prev's kernel stack.
+    // Flush any leftover deferred_zombie first (see sched_schedule comment).
+    if (prev->state == TASK_ZOMBIE && prev->exit_signal == 0) {
+        if (this_cpu()->deferred_zombie) {
+            dead_thread_queue(this_cpu()->deferred_zombie);
+        }
+        this_cpu()->deferred_zombie = prev;
+    }
+
     ctx_switch_asm(&prev->sp, next->sp);
 
     // Resumed from timer preemption. IF is left at 0 — the interrupt
     // epilogue (iretq in irq_common_stub) restores the correct RFLAGS
     // for this task when it exits the interrupt frame.
+    //
+    // CRITICAL: Always clear in_context_switch.  We don't know which
+    // scheduling function originally suspended the task we just resumed;
+    // if it was sched_schedule or sched_run_ready, they set the flag on
+    // this CPU before ctx_switch_asm.  Leaving it set would permanently
+    // block all future preemptions on this CPU.
+    this_cpu()->in_context_switch = 0;
     task_t* resumed = sched_current();
     if (resumed) resumed->preempt_frame = NULL;
+
+    // Queue deferred zombie now that we are on a safe stack.
+    // NOTE: Do NOT call dead_thread_reap() here!  sched_preempt runs in
+    // interrupt context (IRQs disabled by hardware on entry to the timer/IPI
+    // handler).  dead_thread_reap → sched_remove_task → smp_tlb_shootdown_sync
+    // sends IPIs and waits for remote acks.  If another CPU already holds
+    // g_tlb_shootdown_lock and is waiting for *us* to ack its TLB shootdown,
+    // we deadlock: we can't ack (IRQs off) and it can't release the lock
+    // (waiting for our ack).  Reaping is deferred to the next voluntary
+    // sched_schedule / sched_run_ready which runs with IRQs enabled.
+    if (this_cpu()->deferred_zombie) {
+        dead_thread_queue(this_cpu()->deferred_zombie);
+        this_cpu()->deferred_zombie = NULL;
+    }
 }
 
 // ============================================================================
@@ -1893,7 +2151,7 @@ mm_struct_t* mm_struct_clone(mm_struct_t* src) {
 // Increment mm_struct reference count
 void mm_struct_get(mm_struct_t* mm) {
     if (!mm) return;
-    __atomic_add_fetch(&mm->refcount, 1, __ATOMIC_SEQ_CST);
+    __atomic_fetch_add(&mm->refcount, 1, __ATOMIC_SEQ_CST);
 }
 
 // Decrement mm_struct reference count, free if it reaches 0
@@ -1903,6 +2161,13 @@ void mm_struct_put(mm_struct_t* mm) {
     int old = __atomic_fetch_sub(&mm->refcount, 1, __ATOMIC_SEQ_CST);
     if (old == 1) {
         // Last reference - free the address space
+        // CRITICAL: TLB shootdown BEFORE destroying address space!
+        // Other CPUs may still have stale TLB entries pointing to pages
+        // we're about to free. Without this, those CPUs could access
+        // freed/reallocated memory causing corruption or triple faults.
+        if (smp_is_enabled()) {
+            smp_tlb_shootdown_sync();
+        }
         if (mm->pml4) {
             mm_destroy_address_space(mm->pml4);
         }

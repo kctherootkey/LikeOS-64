@@ -5,6 +5,7 @@
 #include <kernel/console.h>
 #include <kernel/vfs.h>
 #include <kernel/pipe.h>
+#include <kernel/smp.h>
 
 // Validate an ELF64 static executable
 int elf_validate(const void* data, size_t size) {
@@ -119,10 +120,12 @@ int elf_load_user(const void* elf_data, size_t elf_size,
         uint64_t vaddr_start = phdr->p_vaddr & ~0xFFFULL;  // Page-align down
         uint64_t vaddr_end = (phdr->p_vaddr + phdr->p_memsz + 0xFFF) & ~0xFFFULL;  // Page-align up
         
+        int page_count = 0;
         for (uint64_t vaddr = vaddr_start; vaddr < vaddr_end; vaddr += PAGE_SIZE) {
             // Allocate physical page
             uint64_t phys = mm_allocate_physical_page();
             if (!phys) {
+                kprintf("ELF: out of memory at page %d\n", page_count);
                 return -11;  // Out of memory
             }
             
@@ -161,9 +164,11 @@ int elf_load_user(const void* elf_data, size_t elf_size,
             
             // Map the page
             if (!mm_map_page_in_address_space(pml4, vaddr, phys, flags)) {
+                kprintf("ELF: map failed at page %d vaddr=%p\n", page_count, (void*)vaddr);
                 mm_free_physical_page(phys);
                 return -12;  // Failed to map
             }
+            page_count++;
         }
     }
     
@@ -498,7 +503,6 @@ uint64_t elf_exec_replace(const char* path, char* const argv[], char* const envp
     elf_load_result_t load_result;
     ret = elf_load_user(elf_buf, file_size, user_pml4, &load_result);
     kfree(elf_buf);
-    
     if (ret != 0) {
         mm_destroy_address_space(user_pml4);
         return 0;
@@ -630,8 +634,13 @@ uint64_t elf_exec_replace(const char* path, char* const argv[], char* const envp
     }
     
     // Switch to new address space now
-    // Use mm_switch_address_space which correctly converts virtual to physical for CR3
     mm_switch_address_space(user_pml4);
+    
+    // CRITICAL: TLB shootdown before destroying old address space!
+    // Other CPUs (if this process had threads) may have stale TLB entries.
+    if (smp_is_enabled()) {
+        smp_tlb_shootdown_sync();
+    }
     
     // Destroy old address space (after switching!)
     if (old_pml4) {

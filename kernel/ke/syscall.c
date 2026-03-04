@@ -1728,10 +1728,20 @@ static int64_t sys_fork(void) {
     
     child->sp = k_sp;
     
+    // CRITICAL: Save child PID BEFORE enqueueing!
+    // On SMP, another CPU might run the child, it exits, and dead_thread_reap
+    // frees it before we return from sched_enqueue_ready. Accessing child->id
+    // after enqueue would be use-after-free.
+    int32_t child_pid = child->id;
+    
     sched_enqueue_ready(child);
     
-    // Parent returns child's PID
-    return child->id;
+    // Set need_resched so the parent yields at the next opportunity,
+    // giving the new child process a chance to start promptly.
+    cur->need_resched = 1;
+    
+    // Parent returns child's PID (saved before enqueue to avoid use-after-free)
+    return child_pid;
 }
 
 // SYS_WAIT4/SYS_WAITPID - wait for child process
@@ -2831,6 +2841,8 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
         kfree(child);
         return -ENOMEM;
     }
+    // Zero the kernel stack to prevent stale data issues
+    mm_memset(k_stack_mem, 0, 8192);
     uint64_t k_stack_top = ((uint64_t)(k_stack_mem + 8192)) & ~0xFUL;
     
     // Initialize child from parent
@@ -3097,10 +3109,19 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
         smap_enable();
     }
     
+    // IMPORTANT: Save child->id BEFORE enqueueing!
+    // Once enqueued, another CPU might run and free the child before we read it.
+    int64_t child_pid = child->id;
+    
     // Enqueue child
     sched_enqueue_ready(child);
     
-    return child->id;
+    // Set need_resched so the parent yields at the next opportunity,
+    // giving the newly created thread a chance to start promptly.
+    // This is the standard behavior: thread creation is a reschedule point.
+    cur->need_resched = 1;
+    
+    return child_pid;
 }
 
 // SYS_VFORK - create child that shares parent's memory until exec/exit

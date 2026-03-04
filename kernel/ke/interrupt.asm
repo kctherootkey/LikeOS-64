@@ -91,8 +91,12 @@ isr_common_stub:
     ; Clean up error code and interrupt number
     add rsp, 16
     
-    ; Return from interrupt (interrupts automatically re-enabled)
-    sti
+    ; Return from interrupt
+    ; NOTE: iretq restores RFLAGS (including IF) from the stack frame,
+    ; so interrupts are automatically re-enabled when returning to code
+    ; that had them enabled.  Do NOT use 'sti' here — it opens a window
+    ; where a timer IRQ can fire between sti and iretq, potentially
+    ; causing a context switch that corrupts the IRET frame.
     iretq
 
 ; Common IRQ stub

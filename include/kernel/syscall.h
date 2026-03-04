@@ -193,6 +193,7 @@
 #define ESPIPE          29  // Illegal seek
 #define EPIPE           32  // Broken pipe
 #define ENOSYS          38  // Function not implemented
+#define ETIMEDOUT      110  // Connection timed out
 
 // Syscall handler prototype
 int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,

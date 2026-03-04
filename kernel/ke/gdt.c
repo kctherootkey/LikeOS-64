@@ -71,11 +71,11 @@ void gdt_init() {
     gdt_set_gate(1, 0, 0xFFFFF, 0x9A, 0xAF);  // AF = Long mode, 4KB granularity
     
     // Kernel data segment (selector 0x10)
-    gdt_set_gate(2, 0, 0xFFFFF, 0x92, 0xCF);
+    gdt_set_gate(2, 0, 0xFFFFF, 0x93, 0xCF);  // 0x93 = Present, Ring 0, RW Data
     
     // User data segment (selector 0x18) - MUST come before user code for SYSRET!
     // SYSRET: SS = STAR[63:48] + 8 | 3 = 0x10 + 8 | 3 = 0x1B
-    gdt_set_gate(3, 0, 0xFFFFF, 0xF2, 0xCF);
+    gdt_set_gate(3, 0, 0xFFFFF, 0xF3, 0xCF);  // 0xF3 = Present, Ring 3, RW Data
     
     // User code segment (selector 0x20) - 64-bit
     // SYSRET: CS = STAR[63:48] + 16 | 3 = 0x10 + 16 | 3 = 0x23

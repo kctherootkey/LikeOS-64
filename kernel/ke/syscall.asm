@@ -248,7 +248,18 @@ user_mode_iret_trampoline:
 ;   User callee-saved: RBP, RBX, R12, R13, R14, R15
 ; We need to pop RAX, then load the callee-saved regs (after IRET frame), then iretq
 global fork_child_return
+extern sched_after_fork_child
 fork_child_return:
+    ; We just arrived from ctx_switch_asm (fresh fork/clone child, never
+    ; scheduled before).  The scheduling function set in_context_switch = 1
+    ; before ctx_switch_asm but the normal post-switch cleanup was never
+    ; executed because we diverged here.  Call the C helper to clear the
+    ; flag and process deferred zombies before entering user mode.
+    ; This must happen before iretq enables interrupts (IF in RFLAGS),
+    ; otherwise the first timer tick on this CPU would see
+    ; in_context_switch == 1 and skip preemption forever.
+    call sched_after_fork_child
+
     pop rax        ; Get fork return value (0)
     
     ; IRET frame starts at RSP (5 qwords: RIP, CS, RFLAGS, RSP, SS)
@@ -260,6 +271,18 @@ fork_child_return:
     mov r13, [rsp + 64]
     mov r14, [rsp + 72]
     mov r15, [rsp + 80]
+    
+    ; Clear volatile registers to prevent leaking kernel addresses to userspace.
+    ; These regs are caller-saved so user code doesn't depend on their values,
+    ; but leaving kernel pointers in them is an information leak.
+    xor ecx, ecx
+    xor edx, edx
+    xor esi, esi
+    xor edi, edi
+    xor r8d, r8d
+    xor r9d, r9d
+    xor r10d, r10d
+    xor r11d, r11d
     
     iretq          ; Return to userspace
 

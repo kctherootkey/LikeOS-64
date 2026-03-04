@@ -555,6 +555,13 @@ void ipi_handler(uint64_t *regs) {
                 }
             }
             lapic_eoi();
+            // Actually preempt now — don't just set a flag and wait for the
+            // next timer tick.  When sched_remove_task sends reschedule IPIs
+            // to get a zombie task off a CPU, we must switch away immediately
+            // or the spin-wait times out and the system crashes.
+            if (sched_need_resched()) {
+                sched_preempt((interrupt_frame_t*)regs);
+            }
             break;
             
         case 0xFD:  // IPI_HALT_VECTOR

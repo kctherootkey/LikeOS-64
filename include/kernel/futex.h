@@ -48,6 +48,11 @@ int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns);
 // Returns: number of waiters woken
 int futex_wake(uint64_t uaddr, int nr_wake);
 
+// Like futex_wake but uses a specific task's PML4 for key computation.
+// Use when performing futex operations on behalf of a task that may differ
+// from sched_current() (e.g. cross-CPU SIGKILL in sched_mark_task_exited).
+int futex_wake_for_task(uint64_t uaddr, int nr_wake, task_t* on_behalf_of);
+
 // Futex requeue: wake some waiters and move others to a different futex
 // Returns: total number of waiters processed (woken + requeued)
 int futex_requeue(uint64_t uaddr, uint64_t uaddr2, int nr_wake, int nr_requeue);
@@ -70,5 +75,10 @@ struct robust_list_head {
 // Process robust futex list on thread exit
 // Marks owned futexes as FUTEX_OWNER_DIED and wakes waiters
 void exit_robust_list(task_t* task);
+
+// Remove all futex waiter entries belonging to a dying task.
+// Must be called before the task is freed, to prevent stale entries
+// in the futex hash table from consuming wake slots.
+void futex_cleanup_task(task_t* task);
 
 #endif // _KERNEL_FUTEX_H_

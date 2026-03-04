@@ -66,7 +66,14 @@ void timer_irq_handler(void) {
         if (cur->remaining_ticks > 0) {
             cur->remaining_ticks--;
         }
-        if (cur->remaining_ticks == 0 && (cur->state == TASK_RUNNING || cur->state == TASK_READY)) {
+        // Always request preemption when the timeslice expires, regardless
+        // of task state.  In particular, a ZOMBIE task (killed by signal
+        // while running) sits in an `sti; hlt` loop waiting to be preempted
+        // off this CPU.  If we only checked RUNNING/READY here, the ZOMBIE
+        // would never get need_resched set, sched_preempt would never be
+        // called, and sched_remove_task on another CPU would spin forever
+        // waiting for this CPU to context-switch away.
+        if (cur->remaining_ticks == 0) {
             sched_set_need_resched(cur);
         }
     }

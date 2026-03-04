@@ -79,8 +79,20 @@ struct percpu {
     // Per-CPU GDT pointer (if using per-CPU GDT) - optional
     // struct gdt_entry* gdt;
     
+    // Deferred zombie: task to queue for reaping AFTER ctx_switch_asm.
+    // We must not queue the zombie before the context switch because another
+    // CPU could reap it (freeing the kernel stack) while we are still using it.
+    task_t* deferred_zombie;
+    
+    // Guard flag: set to 1 between current_task update and ctx_switch_asm
+    // completion.  While set, sched_preempt() must NOT preempt this CPU
+    // because current_task already points to "next" but we are still running
+    // on "prev"'s kernel stack — a preemption here would save the wrong RSP
+    // into next->sp, permanently corrupting its saved stack pointer.
+    volatile int in_context_switch;
+    
     // Padding to ensure page alignment and cache line separation
-    uint8_t padding[PERCPU_SIZE - 224];  // Adjust based on actual struct size (was 144, added 80 for syscall context)
+    uint8_t padding[PERCPU_SIZE - 240];  // Adjust based on actual struct size
 } __attribute__((aligned(64)));
 
 typedef struct percpu percpu_t;

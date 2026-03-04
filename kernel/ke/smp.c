@@ -454,37 +454,73 @@ void smp_tlb_shootdown(void) {
 
 // Atomic acknowledgment counter for synchronous TLB shootdown
 static volatile int g_tlb_ack_count = 0;
+// Spinlock to serialize TLB shootdowns: the ack counter is global, so
+// concurrent shootdowns would corrupt each other's counts.
+static spinlock_t g_tlb_shootdown_lock = SPINLOCK_INIT("tlb_shootdown");
 
 void smp_tlb_shootdown_ack(void) {
     __atomic_add_fetch(&g_tlb_ack_count, 1, __ATOMIC_SEQ_CST);
 }
 
 void smp_tlb_shootdown_sync(void) {
-    if (g_cpu_count <= 1) return;
+    uint32_t online = percpu_get_online_count();
+    if (online <= 1) return;
 
-    int expect = (int)g_cpu_count - 1;
-    // Reset ack counter, then send IPI, then busy-wait for all CPUs.
-    // A simple atomic exchange serialises concurrent callers: the second
-    // caller sees ack_count reset by the first and will itself wait for
-    // the IPIs it sends.
+    int expect = (int)online - 1;
+    
+    // Must serialize: the global ack counter would be corrupted if multiple
+    // CPUs tried to do shootdowns concurrently.
+    //
+    // CRITICAL: We need IRQs disabled while holding the lock to prevent:
+    //
+    // 1. Same-CPU IRQ re-entry:  Timer IRQ fires while we hold the lock.
+    //    The timer handler path (sched_preempt → dead_thread_reap →
+    //    sched_remove_task) also calls smp_tlb_shootdown_sync, which
+    //    tries to acquire the same lock → same-CPU deadlock.
+    //
+    // 2. Lock-holder preemption:  Timer IRQ preempts us while we hold
+    //    the lock.  The holder is context-switched off the CPU and can
+    //    never release it → permanent deadlock.
+    //
+    // However, we CANNOT simply cli+spin_lock: if CPU A holds the lock
+    // and sends TLB IPIs, a CPU spinning with IRQs disabled cannot ACK
+    // the IPI → CPU A's ack-wait times out.
+    //
+    // Solution: trylock loop with brief IRQ windows.  Between trylock
+    // attempts, IRQs are enabled so we can respond to TLB shootdown IPIs
+    // from the current lock holder.  Once we acquire the lock, IRQs are
+    // already disabled.
+    uint64_t irq_flags = local_irq_save();
+    while (!spin_trylock(&g_tlb_shootdown_lock)) {
+        local_irq_restore(irq_flags);
+        // Brief window: IRQs enabled — respond to pending TLB IPIs etc.
+        __asm__ volatile("pause" ::: "memory");
+        irq_flags = local_irq_save();
+    }
+    // Lock acquired with IRQs disabled
+    
     __atomic_store_n(&g_tlb_ack_count, 0, __ATOMIC_RELEASE);
     
-    // CRITICAL: Ensure all page table writes are globally visible to all CPUs
-    // before they flush their TLBs. Without this, a remote CPU could flush its
-    // TLB before seeing the updated PTE, then later re-cache the stale entry.
+    // Ensure all page table writes are globally visible before remote CPUs flush
     __asm__ volatile("mfence" ::: "memory");
     
     lapic_send_ipi_all_excl_self(IPI_TLB_SHOOTDOWN);
 
     // Wait for all remote CPUs to acknowledge (with timeout to avoid hang)
     for (int i = 0; i < 10000000; i++) {
-        if (__atomic_load_n(&g_tlb_ack_count, __ATOMIC_ACQUIRE) >= expect)
+        if (__atomic_load_n(&g_tlb_ack_count, __ATOMIC_ACQUIRE) >= expect) {
+            spin_unlock(&g_tlb_shootdown_lock);
+            local_irq_restore(irq_flags);
             return;
+        }
         __asm__ volatile("pause" ::: "memory");
     }
+    
     // Timed out — not fatal but log it
     kprintf("SMP: TLB shootdown sync timeout (ack=%d expect=%d)\n",
             __atomic_load_n(&g_tlb_ack_count, __ATOMIC_ACQUIRE), expect);
+    spin_unlock(&g_tlb_shootdown_lock);
+    local_irq_restore(irq_flags);
 }
 
 void smp_halt_others(void) {

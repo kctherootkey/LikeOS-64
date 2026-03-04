@@ -25,6 +25,9 @@ static spinlock_t mm_kernel_pt_lock = SPINLOCK_INIT("mm_kpt");
 // Spinlock for page refcount operations (COW safety on SMP)
 static spinlock_t mm_refcount_lock = SPINLOCK_INIT("mm_refcount");
 
+// Kernel PML4 - saved at init time, used when destroying current address space
+static uint64_t g_kernel_pml4_phys = 0;
+
 // Forward declaration for page_to_index (used in COW handler before definition)
 static inline uint64_t page_to_index(uint64_t phys_addr);
 
@@ -189,6 +192,7 @@ static void clear_page_bit(uint64_t page);
 static uint64_t pt_pool_size = 0;       // Calculated at runtime
 static uint64_t pt_pool_phys_start = 0;
 static uint64_t pt_pool_next = 0;
+static uint64_t pt_pool_freelist = 0;   // Phys addr of first free recycled page
 static int pt_pool_initialized = 0;
 
 // ============================================================================
@@ -827,8 +831,14 @@ static uint64_t allocate_pt_page(void) {
     
     spin_lock_irqsave(&mm_pt_pool_lock, &flags);
     
-    if (pt_pool_next < pt_pool_size) {
-        // Use reserved pool (preferred - outside bitmap range)
+    if (pt_pool_freelist) {
+        // Reuse a recycled page from the freelist (preferred)
+        phys = pt_pool_freelist;
+        uint64_t* page = (uint64_t*)phys_to_virt(phys);
+        pt_pool_freelist = page[0];
+        spin_unlock_irqrestore(&mm_pt_pool_lock, flags);
+    } else if (pt_pool_next < pt_pool_size) {
+        // Use reserved pool (outside bitmap range)
         phys = pt_pool_phys_start + (pt_pool_next * PAGE_SIZE);
         pt_pool_next++;
         spin_unlock_irqrestore(&mm_pt_pool_lock, flags);
@@ -850,6 +860,25 @@ static uint64_t allocate_pt_page(void) {
     return phys;
 }
 
+// Free a page table page back to the PT pool (or general allocator)
+static void free_pt_page(uint64_t phys) {
+    if (!phys) return;
+    
+    uint64_t pt_pool_end = pt_pool_phys_start + (pt_pool_size * PAGE_SIZE);
+    if (phys >= pt_pool_phys_start && phys < pt_pool_end) {
+        // PT pool page — recycle to our freelist
+        uint64_t flags;
+        spin_lock_irqsave(&mm_pt_pool_lock, &flags);
+        uint64_t* page = (uint64_t*)phys_to_virt(phys);
+        page[0] = pt_pool_freelist;
+        pt_pool_freelist = phys;
+        spin_unlock_irqrestore(&mm_pt_pool_lock, flags);
+    } else {
+        // Allocated from general pool — return there
+        mm_free_physical_page(phys);
+    }
+}
+
 // Initialize page table page pool by reserving physical memory
 // Must be called BEFORE mm_init_physical_memory to reserve the region
 void mm_init_pt_pool(void) {
@@ -866,32 +895,37 @@ void mm_init_pt_pool(void) {
 }
 
 // Get page table for virtual address
+// NOTE: Uses local variable for PML4 pointer to be SMP-safe. The global
+// mm_state.pml4_table is only updated for compatibility but should NOT be
+// relied upon in concurrent code paths.
 uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
     uint64_t pml4_index = (virtual_addr >> 39) & 0x1FF;
     uint64_t pdpt_index = (virtual_addr >> 30) & 0x1FF;
     uint64_t pd_index = (virtual_addr >> 21) & 0x1FF;
     uint64_t pt_index = (virtual_addr >> 12) & 0x1FF;
     
-    // Get PML4 via direct map
+    // Get PML4 via direct map - use LOCAL variable for SMP safety!
+    // Multiple CPUs can call this function concurrently, so we must not
+    // rely on the global mm_state.pml4_table being stable.
     uint64_t pml4_phys = get_cr3() & ~0xFFF;
-    mm_state.pml4_table = (uint64_t*)phys_to_virt(pml4_phys);
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
     
     if (mm_debug_pt) {
         kprintf("PT: vaddr=%p pml4=%lu pdpt=%lu pd=%lu pt=%lu\n",
                 (void*)virtual_addr, pml4_index, pdpt_index, pd_index, pt_index);
         kprintf("PT: PML4 at %p, entry[%lu]=%p\n", 
-                mm_state.pml4_table, pml4_index, (void*)mm_state.pml4_table[pml4_index]);
+                pml4, pml4_index, (void*)pml4[pml4_index]);
     }
     
-    uint64_t pdpt_phys = mm_state.pml4_table[pml4_index] & PTE_ADDR_MASK;
-    uint64_t* pdpt = pdpt_phys ? (uint64_t*)phys_to_virt(pdpt_phys) : NULL;
+    uint64_t pdpt_phys = pml4[pml4_index] & PTE_ADDR_MASK;
+    uint64_t* pdpt = (pml4[pml4_index] & PAGE_PRESENT) ? (uint64_t*)phys_to_virt(pdpt_phys) : NULL;
     if (!pdpt && create) {
         pdpt_phys = allocate_pt_page();
         if (!pdpt_phys) {
             return NULL;
         }
         // Already zeroed by allocate_pt_page
-        mm_state.pml4_table[pml4_index] = pdpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
+        pml4[pml4_index] = pdpt_phys | PAGE_PRESENT | PAGE_WRITABLE;
         pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
         if (mm_debug_pt) kprintf("PT: Created new PDPT at %p\n", pdpt);
     }
@@ -904,7 +938,7 @@ uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
     }
     
     uint64_t pd_phys = pdpt[pdpt_index] & PTE_ADDR_MASK;
-    uint64_t* pd = pd_phys ? (uint64_t*)phys_to_virt(pd_phys) : NULL;
+    uint64_t* pd = (pdpt[pdpt_index] & PAGE_PRESENT) ? (uint64_t*)phys_to_virt(pd_phys) : NULL;
     if (!pd && create) {
         pd_phys = allocate_pt_page();
         if (!pd_phys) {
@@ -924,7 +958,7 @@ uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
     }
     
     uint64_t pt_phys = pd[pd_index] & PTE_ADDR_MASK;
-    uint64_t* pt = pt_phys ? (uint64_t*)phys_to_virt(pt_phys) : NULL;
+    uint64_t* pt = (pd[pd_index] & PAGE_PRESENT) ? (uint64_t*)phys_to_virt(pt_phys) : NULL;
     if (!pt && create) {
         pt_phys = allocate_pt_page();
         if (!pt_phys) {
@@ -955,6 +989,10 @@ void mm_initialize_virtual_memory(void) {
     kprintf("Initializing Virtual Memory Manager...\n");
     
     mm_state.pml4_table = (uint64_t*)(get_cr3() & ~0xFFF);
+    
+    // Save kernel PML4 for mm_destroy_address_space to know which PML4 not to free
+    g_kernel_pml4_phys = get_cr3() & ~0xFFFULL;
+    
     uint64_t heap_start = mm_get_kernel_heap_start();
     mm_state.next_virtual_addr = heap_start + KERNEL_HEAP_SIZE + mm_state.bitmap_size;
     mm_state.next_virtual_addr = PAGE_ALIGN(mm_state.next_virtual_addr);
@@ -1736,9 +1774,11 @@ uint64_t* mm_create_user_address_space(void) {
     // Access via direct map (already zeroed by allocate_pt_page)
     uint64_t* new_pml4 = (uint64_t*)phys_to_virt(pml4_phys);
     
-    // Get kernel PML4 via direct map
-    uint64_t kernel_pml4_phys = get_cr3() & ~0xFFFULL;
-    uint64_t* kernel_pml4 = (uint64_t*)phys_to_virt(kernel_pml4_phys);
+    // CRITICAL: Use the saved kernel PML4, NOT current CR3!
+    // During fork, CR3 points to the parent's address space. Using CR3 would
+    // copy the parent's kernel mappings which might be stale if parent's
+    // address space was modified. Always use the original kernel PML4.
+    uint64_t* kernel_pml4 = (uint64_t*)phys_to_virt(g_kernel_pml4_phys);
     
     // Copy PML4[272] - Direct map (PHYS_MAP_BASE = 0xFFFF880000000000)
     // This allows kernel code to access physical memory via phys_to_virt()
@@ -1767,11 +1807,22 @@ void mm_destroy_address_space(uint64_t* pml4) {
     // Calculate the physical address for freeing
     uint64_t pml4_phys = virt_to_phys(pml4);
     
-    // Don't free if it's the kernel PML4
-    uint64_t kernel_pml4_phys = get_cr3() & ~0xFFFULL;
-    if (pml4_phys == kernel_pml4_phys) {
+    // Don't free the kernel PML4 itself (set during mm_initialize_virtual_memory)
+    if (pml4_phys == g_kernel_pml4_phys) {
         return;
     }
+    
+    // If we're about to destroy the currently active address space,
+    // switch to kernel page tables first. This happens when a process
+    // exits and mm_struct_put is called before the scheduler switches.
+    uint64_t current_cr3 = get_cr3() & ~0xFFFULL;
+    if (pml4_phys == current_cr3) {
+        set_cr3(g_kernel_pml4_phys);
+    }
+    
+    int pages_freed = 0;
+    int pages_decref_only = 0;
+    int pt_freed = 0;
     
     // Free user-space page tables (entries 0-255, user space only)
     // Skip 256-511 (kernel space) and 272 (direct map)
@@ -1796,9 +1847,13 @@ void mm_destroy_address_space(uint64_t* pml4) {
                                     // User page - use refcount
                                     if (mm_decref_page(phys)) {
                                         mm_free_physical_page(phys);
+                                        pages_freed += 512;  // 2MB = 512 4K pages
+                                    } else {
+                                        pages_decref_only += 512;
                                     }
                                 } else {
                                     mm_free_physical_page(phys);
+                                    pages_freed += 512;
                                 }
                             } else {
                                 uint64_t pt_phys = pd[k] & 0x000FFFFFFFFFF000ULL;
@@ -1813,31 +1868,44 @@ void mm_destroy_address_space(uint64_t* pml4) {
                                             // Use refcount - only free if last reference
                                             if (mm_decref_page(phys)) {
                                                 mm_free_physical_page(phys);
+                                                pages_freed++;
+                                            } else {
+                                                pages_decref_only++;
                                             }
                                         } else {
                                             mm_free_physical_page(phys);
+                                            pages_freed++;
                                         }
                                     }
                                 }
                                 
                                 // Free the PT itself (page tables are not shared)
-                                mm_free_physical_page(pt_phys);
+                                free_pt_page(pt_phys);
+                                pt_freed++;
                             }
                         }
                     }
                     
                     // Free the PD (page directories are not shared)
-                    mm_free_physical_page(pd_phys);
+                    free_pt_page(pd_phys);
+                    pt_freed++;
                 }
             }
             
             // Free the PDPT (not shared)
-            mm_free_physical_page(pdpt_phys);
+            free_pt_page(pdpt_phys);
+            pt_freed++;
         }
     }
     
     // Free the PML4 itself
-    mm_free_physical_page(pml4_phys);
+    free_pt_page(pml4_phys);
+    pt_freed++;
+    
+    // Suppress unused variable warnings (used for debugging)
+    (void)pages_freed;
+    (void)pages_decref_only;
+    (void)pt_freed;
 }
 
 // Switch to a different address space
@@ -2033,22 +2101,21 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
         return true;
     }
     
-    // Need to copy - decrement refcount now while holding lock
-    uint16_t old_refcount = __atomic_fetch_sub(&mm_state.page_refcounts[page_idx], 1, __ATOMIC_SEQ_CST);
-    bool should_free_old = (old_refcount == 1);
-    
+    // Need to copy.  Do NOT decrement refcount yet!  Our reference keeps
+    // the old page alive.  If we decremented now and released the lock,
+    // another CPU could decrement to 0 and free the page while we are
+    // still copying from it — a use-after-free that corrupts data or crashes.
     spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
     
     // Allocate a new physical page (outside lock for performance)
     uint64_t new_phys = mm_allocate_physical_page();
     if (!new_phys) {
-        // Restore refcount since we couldn't complete the copy
-        __atomic_fetch_add(&mm_state.page_refcounts[page_idx], 1, __ATOMIC_SEQ_CST);
         kprintf("mm_handle_cow_fault: Failed to allocate new page\n");
         return false;
     }
     
-    // Copy contents from old page to new page via direct map
+    // Copy contents from old page to new page via direct map.
+    // Safe: our refcount reference prevents the old page from being freed.
     mm_memcpy(phys_to_virt(new_phys), phys_to_virt(old_phys), PAGE_SIZE);
     
     // Update PTE: remove COW, add writable, point to new page, preserve NX bit
@@ -2058,8 +2125,8 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
     
     mm_flush_tlb(page_addr);
     
-    // Free old page if we were the last reference
-    if (should_free_old) {
+    // NOW release our reference to the old page.  We no longer access it.
+    if (mm_decref_page(old_phys)) {
         mm_free_physical_page(old_phys);
     }
     
@@ -2167,11 +2234,19 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
         }
     }
     
-    // Flush TLB for source address space
+    // Flush TLB on this CPU
     mm_flush_all_tlb();
     
     // Restore interrupts after COW setup is complete
     local_irq_restore(irq_flags);
+    
+    // CRITICAL: Flush TLB on ALL CPUs! We just marked the source (parent)
+    // pages as read-only/COW. If the parent is running on another CPU with
+    // stale TLB entries that still have write permission, it could write to
+    // pages without triggering a COW fault, corrupting shared memory.
+    if (sched_is_smp()) {
+        smp_tlb_shootdown_sync();
+    }
     
     return new_pml4;
     
@@ -2303,11 +2378,19 @@ uint64_t* mm_clone_address_space_with_shared(uint64_t* src_pml4,
         }
     }
     
-    // Flush TLB
+    // Flush TLB on this CPU
     mm_flush_all_tlb();
     
     // Restore interrupts after COW setup is complete
     local_irq_restore(irq_flags);
+    
+    // CRITICAL: Flush TLB on ALL CPUs! We just marked the source (parent)
+    // pages as read-only/COW. If the parent is running on another CPU with
+    // stale TLB entries that still have write permission, it could write to
+    // pages without triggering a COW fault, corrupting shared memory.
+    if (sched_is_smp()) {
+        smp_tlb_shootdown_sync();
+    }
     
     return new_pml4;
     
@@ -2598,13 +2681,15 @@ bool mm_decref_page(uint64_t phys_addr) {
     uint64_t idx = page_to_index(phys_addr);
     if (idx == (uint64_t)-1) return false;
     
-    // Atomically decrement and check if we should free
-    uint16_t old = __atomic_fetch_sub(&mm_state.page_refcounts[idx], 1, __ATOMIC_SEQ_CST);
-    if (old == 0) {
-        // Was already 0, restore and return true (page was never shared)
-        __atomic_fetch_add(&mm_state.page_refcounts[idx], 1, __ATOMIC_SEQ_CST);
+    // Check current value first to avoid underflow
+    uint16_t current = __atomic_load_n(&mm_state.page_refcounts[idx], __ATOMIC_ACQUIRE);
+    if (current == 0) {
+        // Page was never shared - caller should free it
         return true;
     }
+    
+    // Atomically decrement and check if we should free
+    uint16_t old = __atomic_fetch_sub(&mm_state.page_refcounts[idx], 1, __ATOMIC_SEQ_CST);
     // old was the value before decrement, so if old == 1, new value is 0
     return old == 1;
 }
