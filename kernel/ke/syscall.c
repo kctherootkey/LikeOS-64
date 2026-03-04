@@ -3313,11 +3313,18 @@ static int64_t sys_arch_prctl(uint64_t code, uint64_t addr) {
     if (!cur) return -ESRCH;
     
     switch (code) {
-        case ARCH_SET_FS:
+        case ARCH_SET_FS: {
+            // Reject non-canonical addresses — wrmsr to MSR_FS_BASE
+            // will #GP if bits 63:48 are not a sign-extension of bit 47.
+            uint64_t top = addr >> 47;
+            if (addr != 0 && top != 0 && top != 0x1FFFF) {
+                return -EINVAL;
+            }
             task_set_fs_base(cur, addr);
             // Apply immediately
             task_load_tls(cur);
             return 0;
+        }
         
         case ARCH_GET_FS:
             if (!validate_user_ptr(addr, sizeof(uint64_t))) {
@@ -3328,9 +3335,15 @@ static int64_t sys_arch_prctl(uint64_t code, uint64_t addr) {
             smap_enable();
             return 0;
         
-        case ARCH_SET_GS:
+        case ARCH_SET_GS: {
+            // Reject non-canonical addresses
+            uint64_t top = addr >> 47;
+            if (addr != 0 && top != 0 && top != 0x1FFFF) {
+                return -EINVAL;
+            }
             cur->gs_base = addr;
             return 0;
+        }
         
         case ARCH_GET_GS:
             if (!validate_user_ptr(addr, sizeof(uint64_t))) {

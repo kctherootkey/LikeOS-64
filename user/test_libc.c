@@ -2220,7 +2220,7 @@ int main(int argc, char** argv) {
     printf("\n[TEST] arch_prctl() TLS syscall\n");
     {
         // Test ARCH_SET_FS and ARCH_GET_FS for TLS
-        unsigned long test_tls_addr = 0x12345678ABCD0000UL;
+        unsigned long test_tls_addr = 0x00007F0012340000UL;  // Must be canonical
         unsigned long readback = 0;
         
         // Set FS base
