@@ -547,7 +547,7 @@ qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)
 
 # Write ISO to USB device with GPT partition table (like Rufus)
 # Usage: make usb-write USB_DEVICE=/dev/sdX
-usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress
+usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libpthread.so $(BUILD_DIR)/libtestlib.so
 	@if [ -z "$(USB_DEVICE)" ]; then \
 		echo "Error: USB_DEVICE not specified. Usage: make usb-write USB_DEVICE=/dev/sdX"; \
 		echo "Available devices:"; \
@@ -583,6 +583,7 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	# Create EFI directory structure
 	sudo mkdir -p /tmp/likeos_usb_mount/EFI/BOOT
 	sudo mkdir -p /tmp/likeos_usb_mount/bin
+	sudo mkdir -p /tmp/likeos_usb_mount/lib
 	sudo mkdir -p /tmp/likeos_usb_mount/res
 	
 	# Copy bootloader and kernel
@@ -608,6 +609,12 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo cp $(BUILD_DIR)/memstat /tmp/likeos_usb_mount/memstat
 	sudo cp $(BUILD_DIR)/memstat /tmp/likeos_usb_mount/bin/memstat
 	sudo cp $(BUILD_DIR)/teststress /tmp/likeos_usb_mount/teststress
+
+	# Copy shared libraries to /lib
+	sudo cp $(BUILD_DIR)/ld-likeos.so /tmp/likeos_usb_mount/lib/ld-likeos.so
+	sudo cp $(BUILD_DIR)/libc.so /tmp/likeos_usb_mount/lib/libc.so
+	sudo cp $(BUILD_DIR)/libpthread.so /tmp/likeos_usb_mount/lib/libpthread.so
+	sudo cp $(BUILD_DIR)/libtestlib.so /tmp/likeos_usb_mount/lib/libtestlib.so
 
 	# Create signature file and sample hello on target (mirrors data image contents)
 	sudo sh -c 'echo "THIS IS A DEVICE STORING LIKEOS" > /tmp/likeos_usb_mount/LIKEOS.SIG'
