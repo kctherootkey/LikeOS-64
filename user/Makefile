@@ -1,53 +1,34 @@
 CC = gcc
 LD = ld
-LIBC_DIR = ../userland/libc
-CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fno-stack-protector \
-         -mno-red-zone -ffreestanding -I$(LIBC_DIR)/include
 
-LDFLAGS = -nostdlib -T user.lds
-LIBS = $(LIBC_DIR)/libc.a
-CRT0 = $(LIBC_DIR)/crt0.o
+LIBC_DIR = ../userland/libc
+RTLD_DIR = ../userland/rtld
+
+CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fno-stack-protector \
+         -mno-red-zone -ffreestanding -fPIE -I$(LIBC_DIR)/include
+
+# Dynamic PIE linking against libc.so and libpthread.so
+LDFLAGS = -pie -nostdlib -T user_dyn.lds --hash-style=sysv \
+          -rpath /lib -dynamic-linker /lib/ld-likeos.so \
+          -L$(LIBC_DIR) -L$(RTLD_DIR)
+
+CRT1 = $(LIBC_DIR)/crt1.o
+
+# Shared libraries to link against (ld-likeos.so provides _rtld_* symbols for dlfcn)
+LIBS = -lc -lpthread -l:ld-likeos.so
 
 # Programs
 PROGRAMS = test_syscalls test_libc hello sh ls cat pwd stat progerr testmem memstat teststress
 
 all: $(PROGRAMS)
 
-test_syscalls: $(CRT0) test_syscalls.o $(LIBS)
-	$(LD) $(LDFLAGS) $(CRT0) test_syscalls.o $(LIBS) -o $@
+# Generic link rule: crt1.o + program.o → PIE binary linked against libc.so + libpthread.so
+define LINK_RULE
+$(1): $(CRT1) $(1).o
+	$(LD) $(LDFLAGS) $(CRT1) $(1).o $(LIBS) -o $$@
+endef
 
-test_libc: $(CRT0) test_libc.o $(LIBS)
-	$(LD) $(LDFLAGS) $(CRT0) test_libc.o $(LIBS) -o $@
-
-hello: $(CRT0) hello.o $(LIBS)
-	$(LD) $(LDFLAGS) $(CRT0) hello.o $(LIBS) -o $@
-
-sh: $(CRT0) sh.o $(LIBS)
-	$(LD) $(LDFLAGS) $(CRT0) sh.o $(LIBS) -o $@
-
-ls: $(CRT0) ls.o $(LIBS)
-	$(LD) $(LDFLAGS) $(CRT0) ls.o $(LIBS) -o $@
-
-cat: $(CRT0) cat.o $(LIBS)
-	$(LD) $(LDFLAGS) $(CRT0) cat.o $(LIBS) -o $@
-
-pwd: $(CRT0) pwd.o $(LIBS)
-	$(LD) $(LDFLAGS) $(CRT0) pwd.o $(LIBS) -o $@
-
-stat: $(CRT0) stat.o $(LIBS)
-	$(LD) $(LDFLAGS) $(CRT0) stat.o $(LIBS) -o $@
-
-progerr: $(CRT0) progerr.o $(LIBS)
-	$(LD) $(LDFLAGS) $(CRT0) progerr.o $(LIBS) -o $@
-
-testmem: $(CRT0) testmem.o $(LIBS)
-	$(LD) $(LDFLAGS) $(CRT0) testmem.o $(LIBS) -o $@
-
-memstat: $(CRT0) memstat.o $(LIBS)
-	$(LD) $(LDFLAGS) $(CRT0) memstat.o $(LIBS) -o $@
-
-teststress: $(CRT0) teststress.o $(LIBS)
-	$(LD) $(LDFLAGS) $(CRT0) teststress.o $(LIBS) -o $@
+$(foreach prog,$(PROGRAMS),$(eval $(call LINK_RULE,$(prog))))
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

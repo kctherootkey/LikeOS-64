@@ -6,6 +6,7 @@
 #include "../../include/sys/utsname.h"
 #include "../../include/time.h"
 #include "../../include/string.h"
+#include "../../include/stdlib.h"
 #include "../../include/fcntl.h"
 #include "../../include/stdarg.h"
 #include "../../include/signal.h"

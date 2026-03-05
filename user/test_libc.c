@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <dlfcn.h>
 
 // Futex helper declarations (from sched.c)
 int futex_wait(int* uaddr, int val, const struct timespec* timeout);
@@ -2738,6 +2739,152 @@ int main(int argc, char** argv) {
         pthread_join(t2, NULL);
         
         test_result("init function called exactly once across threads", g_once_counter == 1);
+    }
+
+    // ========================================
+    // Dynamic Linking (dlopen/dlsym/dlclose/dlerror) Tests
+    // ========================================
+    printf("\n--- Dynamic Linking Tests ---\n");
+    {
+        // Test 1: dlerror returns NULL when no error
+        printf("\n[TEST] dlerror() initial state\n");
+        char *err = dlerror();
+        /* dlerror may or may not be NULL initially; just call it to clear state */
+        (void)err;
+        test_pass("dlerror() called without crash");
+
+        // Test 2: dlopen a non-existent library should fail
+        printf("\n[TEST] dlopen() non-existent library\n");
+        void *bad_handle = dlopen("/lib/libnonexistent.so", RTLD_LAZY);
+        test_result("dlopen non-existent returns NULL", bad_handle == NULL);
+        if (bad_handle == NULL) {
+            err = dlerror();
+            test_result("dlerror returns non-NULL after failed dlopen",
+                        err != NULL);
+            if (err) {
+                printf("    dlerror: %s\n", err);
+            }
+        }
+
+        // Test 3: dlopen libtestlib.so
+        printf("\n[TEST] dlopen() libtestlib.so\n");
+        void *handle = dlopen("/lib/libtestlib.so", RTLD_LAZY);
+        test_result("dlopen(\"/lib/libtestlib.so\") returns non-NULL",
+                    handle != NULL);
+        if (handle == NULL) {
+            err = dlerror();
+            printf("    dlopen failed: %s\n", err ? err : "(null)");
+        }
+
+        if (handle != NULL) {
+            // Test 4: dlsym - look up testlib_add
+            printf("\n[TEST] dlsym() testlib_add\n");
+            int (*fn_add)(int, int) = (int (*)(int, int))dlsym(handle, "testlib_add");
+            test_result("dlsym(\"testlib_add\") returns non-NULL",
+                        fn_add != NULL);
+            if (fn_add) {
+                int result = fn_add(17, 25);
+                test_result("testlib_add(17, 25) == 42", result == 42);
+                result = fn_add(-5, 5);
+                test_result("testlib_add(-5, 5) == 0", result == 0);
+            }
+
+            // Test 5: dlsym - look up testlib_mul
+            printf("\n[TEST] dlsym() testlib_mul\n");
+            int (*fn_mul)(int, int) = (int (*)(int, int))dlsym(handle, "testlib_mul");
+            test_result("dlsym(\"testlib_mul\") returns non-NULL",
+                        fn_mul != NULL);
+            if (fn_mul) {
+                int result = fn_mul(6, 7);
+                test_result("testlib_mul(6, 7) == 42", result == 42);
+                result = fn_mul(0, 999);
+                test_result("testlib_mul(0, 999) == 0", result == 0);
+            }
+
+            // Test 6: dlsym - look up testlib_hello (returns string)
+            printf("\n[TEST] dlsym() testlib_hello\n");
+            const char *(*fn_hello)(void) = (const char *(*)(void))dlsym(handle, "testlib_hello");
+            test_result("dlsym(\"testlib_hello\") returns non-NULL",
+                        fn_hello != NULL);
+            if (fn_hello) {
+                const char *msg = fn_hello();
+                test_result("testlib_hello() returns non-NULL string",
+                            msg != NULL);
+                if (msg) {
+                    printf("    testlib_hello() = \"%s\"\n", msg);
+                    test_result("testlib_hello() contains \"libtestlib\"",
+                                strstr(msg, "libtestlib") != NULL);
+                }
+            }
+
+            // Test 7: dlsym - look up testlib_counter (stateful)
+            printf("\n[TEST] dlsym() testlib_counter\n");
+            int (*fn_counter)(void) = (int (*)(void))dlsym(handle, "testlib_counter");
+            void (*fn_reset)(void) = (void (*)(void))dlsym(handle, "testlib_counter_reset");
+            test_result("dlsym(\"testlib_counter\") returns non-NULL",
+                        fn_counter != NULL);
+            test_result("dlsym(\"testlib_counter_reset\") returns non-NULL",
+                        fn_reset != NULL);
+            if (fn_counter && fn_reset) {
+                fn_reset();
+                int v0 = fn_counter();  /* returns 0, increments to 1 */
+                int v1 = fn_counter();  /* returns 1, increments to 2 */
+                int v2 = fn_counter();  /* returns 2, increments to 3 */
+                test_result("counter sequence 0,1,2",
+                            v0 == 0 && v1 == 1 && v2 == 2);
+                fn_reset();
+                int v3 = fn_counter();
+                test_result("counter reset works", v3 == 0);
+            }
+
+            // Test 8: dlsym - look up global variable testlib_version
+            printf("\n[TEST] dlsym() testlib_version (global variable)\n");
+            int *p_version = (int *)dlsym(handle, "testlib_version");
+            test_result("dlsym(\"testlib_version\") returns non-NULL",
+                        p_version != NULL);
+            if (p_version) {
+                test_result("testlib_version == 1", *p_version == 1);
+                printf("    testlib_version = %d\n", *p_version);
+            }
+
+            // Test 9: dlsym - non-existent symbol
+            printf("\n[TEST] dlsym() non-existent symbol\n");
+            void *bad_sym = dlsym(handle, "this_symbol_does_not_exist");
+            test_result("dlsym non-existent returns NULL", bad_sym == NULL);
+            if (bad_sym == NULL) {
+                err = dlerror();
+                test_result("dlerror returns non-NULL after failed dlsym",
+                            err != NULL);
+                if (err) {
+                    printf("    dlerror: %s\n", err);
+                }
+            }
+
+            // Test 10: dlclose
+            printf("\n[TEST] dlclose()\n");
+            int close_ret = dlclose(handle);
+            test_result("dlclose returns 0", close_ret == 0);
+
+            // Test 11: dlerror after successful dlclose should be NULL
+            err = dlerror();
+            /* After a successful operation, dlerror should return NULL */
+            test_result("dlerror() returns NULL after successful dlclose",
+                        err == NULL);
+        }
+
+        // Test 12: dlopen with RTLD_NOW
+        printf("\n[TEST] dlopen() with RTLD_NOW\n");
+        void *handle2 = dlopen("/lib/libtestlib.so", RTLD_NOW);
+        test_result("dlopen RTLD_NOW returns non-NULL", handle2 != NULL);
+        if (handle2) {
+            int (*fn_add2)(int, int) = (int (*)(int, int))dlsym(handle2, "testlib_add");
+            test_result("dlsym after RTLD_NOW works", fn_add2 != NULL);
+            if (fn_add2) {
+                test_result("testlib_add(100, 200) == 300",
+                            fn_add2(100, 200) == 300);
+            }
+            dlclose(handle2);
+        }
     }
 
     // ========================================

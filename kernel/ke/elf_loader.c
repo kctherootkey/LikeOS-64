@@ -1,4 +1,7 @@
 // LikeOS-64 ELF64 Loader Implementation
+// Supports static (ET_EXEC) and dynamic/PIE (ET_DYN) executables.
+// When PT_INTERP is present, loads the dynamic linker (ld-likeos.so) and
+// passes control to it with an auxiliary vector on the stack.
 #include <kernel/elf.h>
 #include <kernel/memory.h>
 #include <kernel/sched.h>
@@ -7,646 +10,468 @@
 #include <kernel/pipe.h>
 #include <kernel/smp.h>
 
-// Validate an ELF64 static executable
+// ============================================================================
+// VALIDATION
+// ============================================================================
+
 int elf_validate(const void* data, size_t size) {
-    if (!data || size < sizeof(Elf64_Ehdr)) {
-        return -1;  // Too small
-    }
-    
+    if (!data || size < sizeof(Elf64_Ehdr)) return -1;
+
     const Elf64_Ehdr* ehdr = (const Elf64_Ehdr*)data;
-    
-    // Check magic number
+
     if (ehdr->e_ident[EI_MAG0] != ELFMAG0 ||
         ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
         ehdr->e_ident[EI_MAG2] != ELFMAG2 ||
-        ehdr->e_ident[EI_MAG3] != ELFMAG3) {
-        return -2;  // Bad magic
-    }
-    
-    // Check class (must be 64-bit)
-    if (ehdr->e_ident[EI_CLASS] != ELFCLASS64) {
-        return -3;  // Not 64-bit
-    }
-    
-    // Check endianness (must be little endian)
-    if (ehdr->e_ident[EI_DATA] != ELFDATA2LSB) {
-        return -4;  // Not little endian
-    }
-    
-    // Check type (must be executable)
-    if (ehdr->e_type != ET_EXEC) {
-        return -5;  // Not executable
-    }
-    
-    // Check machine (must be x86-64)
-    if (ehdr->e_machine != EM_X86_64) {
-        return -6;  // Not x86-64
-    }
-    
-    // Check program header info
-    if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0) {
-        return -7;  // No program headers
-    }
-    
-    // Validate program headers are within file
+        ehdr->e_ident[EI_MAG3] != ELFMAG3) return -2;
+
+    if (ehdr->e_ident[EI_CLASS] != ELFCLASS64)  return -3;
+    if (ehdr->e_ident[EI_DATA]  != ELFDATA2LSB) return -4;
+
+    // Accept both ET_EXEC (static) and ET_DYN (PIE / shared object)
+    if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN) return -5;
+    if (ehdr->e_machine != EM_X86_64) return -6;
+    if (ehdr->e_phoff == 0 || ehdr->e_phnum == 0) return -7;
+
     uint64_t ph_end = ehdr->e_phoff + (uint64_t)ehdr->e_phnum * ehdr->e_phentsize;
-    if (ph_end > size) {
-        return -8;  // Program headers out of bounds
-    }
-    
-    return 0;  // Valid
+    if (ph_end > size) return -8;
+
+    return 0;
 }
 
-// Load a static ELF64 executable into user address space
-int elf_load_user(const void* elf_data, size_t elf_size,
-                  uint64_t* pml4, elf_load_result_t* result) {
-    if (!elf_data || !pml4 || !result) {
-        return -1;
-    }
-    
-    int valid = elf_validate(elf_data, elf_size);
-    if (valid != 0) {
-        return valid;
-    }
-    
+// ============================================================================
+// SEGMENT LOADER  (common for main binary & interpreter)
+// ============================================================================
+
+// Load PT_LOAD segments of an ELF into *pml4* at the given base offset.
+// For ET_EXEC base_offset = 0 (absolute addresses in ELF).
+// For ET_DYN  base_offset shifts every p_vaddr.
+static int elf_load_segments(const void* elf_data, size_t elf_size,
+                             uint64_t* pml4, uint64_t base_offset,
+                             elf_load_result_t* result) {
     const Elf64_Ehdr* ehdr = (const Elf64_Ehdr*)elf_data;
     const uint8_t* elf_bytes = (const uint8_t*)elf_data;
-    
-    result->entry_point = ehdr->e_entry;
-    result->load_base = ~0ULL;
-    result->load_end = 0;
-    result->brk_start = 0;
-    
-    // Process program headers
+
+    result->load_base    = ~0ULL;
+    result->load_end     = 0;
+    result->brk_start    = 0;
+    result->phdr_addr    = 0;
+    result->has_interp   = 0;
+    result->is_dynamic   = (ehdr->e_type == ET_DYN);
+    result->interp_base  = 0;
+    result->interp_entry = 0;
+    result->interp_path[0] = '\0';
+    result->phnum        = ehdr->e_phnum;
+    result->phentsize    = ehdr->e_phentsize;
+
+    // ---- First pass: PT_INTERP ----
     for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
-        const Elf64_Phdr* phdr = (const Elf64_Phdr*)(elf_bytes + ehdr->e_phoff + 
-                                                      i * ehdr->e_phentsize);
-        
-        // Only load PT_LOAD segments
-        if (phdr->p_type != PT_LOAD) {
+        const Elf64_Phdr* ph = (const Elf64_Phdr*)(elf_bytes + ehdr->e_phoff +
+                                                    i * ehdr->e_phentsize);
+        if (ph->p_type == PT_INTERP && ph->p_filesz > 0 &&
+            ph->p_filesz < 256 && ph->p_offset + ph->p_filesz <= elf_size) {
+            size_t len = ph->p_filesz;
+            if (len > 255) len = 255;
+            for (size_t j = 0; j < len; j++)
+                result->interp_path[j] = (char)elf_bytes[ph->p_offset + j];
+            result->interp_path[len] = '\0';
+            // Trim trailing NUL that the ELF may include in p_filesz
+            while (len > 0 && result->interp_path[len - 1] == '\0') len--;
+            result->has_interp = 1;
+        }
+    }
+
+    // ---- Second pass: PT_LOAD + PT_PHDR ----
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        const Elf64_Phdr* ph = (const Elf64_Phdr*)(elf_bytes + ehdr->e_phoff +
+                                                    i * ehdr->e_phentsize);
+
+        if (ph->p_type == PT_PHDR) {
+            result->phdr_addr = ph->p_vaddr + base_offset;
             continue;
         }
-        
-        // Validate segment bounds
-        if (phdr->p_offset + phdr->p_filesz > elf_size) {
-            return -9;  // Segment out of file bounds
-        }
-        
-        // User space validation
-        if (phdr->p_vaddr < USER_SPACE_START || 
-            phdr->p_vaddr + phdr->p_memsz > USER_SPACE_END) {
-            return -10;  // Invalid virtual address
-        }
-        
-        // Track memory bounds
-        if (phdr->p_vaddr < result->load_base) {
-            result->load_base = phdr->p_vaddr;
-        }
-        uint64_t seg_end = phdr->p_vaddr + phdr->p_memsz;
-        if (seg_end > result->load_end) {
-            result->load_end = seg_end;
-        }
-        
-        // Calculate page flags
+        if (ph->p_type != PT_LOAD) continue;
+
+        // File-bounds check
+        if (ph->p_offset + ph->p_filesz > elf_size) return -9;
+
+        uint64_t seg_vaddr = ph->p_vaddr + base_offset;
+        uint64_t seg_end   = seg_vaddr + ph->p_memsz;
+
+        if (seg_vaddr < USER_SPACE_START || seg_end > USER_SPACE_END)
+            return -10;
+
+        if (seg_vaddr < result->load_base) result->load_base = seg_vaddr;
+        if (seg_end   > result->load_end)  result->load_end  = seg_end;
+
+        // Page flags
         uint64_t flags = PAGE_PRESENT | PAGE_USER;
-        if (phdr->p_flags & PF_W) {
-            flags |= PAGE_WRITABLE;
-        }
-        if (!(phdr->p_flags & PF_X)) {
-            flags |= PAGE_NO_EXECUTE;
-        }
-        
-        // Map pages for this segment
-        uint64_t vaddr_start = phdr->p_vaddr & ~0xFFFULL;  // Page-align down
-        uint64_t vaddr_end = (phdr->p_vaddr + phdr->p_memsz + 0xFFF) & ~0xFFFULL;  // Page-align up
-        
-        int page_count = 0;
-        for (uint64_t vaddr = vaddr_start; vaddr < vaddr_end; vaddr += PAGE_SIZE) {
-            // Allocate physical page
-            uint64_t phys = mm_allocate_physical_page();
-            if (!phys) {
-                kprintf("ELF: out of memory at page %d\n", page_count);
-                return -11;  // Out of memory
-            }
-            
-            // Zero the page via direct map
-            mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
-            
-            // Copy data from ELF file if applicable
-            uint64_t page_offset_in_seg = vaddr - phdr->p_vaddr;
-            if (vaddr >= phdr->p_vaddr && page_offset_in_seg < phdr->p_filesz) {
-                // Calculate how much to copy
-                uint64_t copy_start = (vaddr < phdr->p_vaddr) ? 
-                                      (phdr->p_vaddr - vaddr) : 0;
-                uint64_t file_offset = phdr->p_offset + page_offset_in_seg;
-                uint64_t remaining_filesz = phdr->p_filesz - page_offset_in_seg;
-                uint64_t copy_len = (remaining_filesz > PAGE_SIZE - copy_start) ? 
-                                    (PAGE_SIZE - copy_start) : remaining_filesz;
-                
-                if (copy_len > 0 && file_offset + copy_len <= elf_size) {
-                    mm_memcpy((uint8_t*)phys_to_virt(phys) + copy_start, 
-                             elf_bytes + file_offset, 
-                             copy_len);
+        if (ph->p_flags & PF_W)   flags |= PAGE_WRITABLE;
+        if (!(ph->p_flags & PF_X)) flags |= PAGE_NO_EXECUTE;
+
+        uint64_t vaddr_start = seg_vaddr & ~0xFFFULL;
+        uint64_t vaddr_end   = (seg_end + 0xFFF) & ~0xFFFULL;
+
+        for (uint64_t va = vaddr_start; va < vaddr_end; va += PAGE_SIZE) {
+            // Check if page already mapped (overlapping segments)
+            uint64_t existing = mm_get_physical_address_from_pml4(pml4, va);
+            uint8_t* page_ptr;
+
+            if (existing) {
+                page_ptr = (uint8_t*)phys_to_virt(existing);
+            } else {
+                uint64_t phys = mm_allocate_physical_page();
+                if (!phys) return -11;
+                mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
+                if (!mm_map_page_in_address_space(pml4, va, phys, flags)) {
+                    mm_free_physical_page(phys);
+                    return -12;
                 }
-            } else if (vaddr < phdr->p_vaddr) {
-                // Page spans before segment start
-                uint64_t offset_in_page = phdr->p_vaddr - vaddr;
-                uint64_t copy_len = PAGE_SIZE - offset_in_page;
-                if (copy_len > phdr->p_filesz) {
-                    copy_len = phdr->p_filesz;
-                }
-                if (copy_len > 0) {
-                    mm_memcpy((uint8_t*)phys_to_virt(phys) + offset_in_page,
-                             elf_bytes + phdr->p_offset,
-                             copy_len);
-                }
+                page_ptr = (uint8_t*)phys_to_virt(phys);
             }
-            
-            // Map the page
-            if (!mm_map_page_in_address_space(pml4, vaddr, phys, flags)) {
-                kprintf("ELF: map failed at page %d vaddr=%p\n", page_count, (void*)vaddr);
-                mm_free_physical_page(phys);
-                return -12;  // Failed to map
+
+            // Copy file data that falls within this page
+            // The segment occupies user addresses [seg_vaddr, seg_vaddr+p_filesz)
+            // for file-backed data and [seg_vaddr+p_filesz, seg_end) for BSS (zeros).
+            uint64_t page_lo = va;
+            uint64_t page_hi = va + PAGE_SIZE;
+
+            uint64_t data_lo = seg_vaddr;
+            uint64_t data_hi = seg_vaddr + ph->p_filesz;
+
+            uint64_t cpy_lo = (page_lo > data_lo) ? page_lo : data_lo;
+            uint64_t cpy_hi = (page_hi < data_hi) ? page_hi : data_hi;
+
+            if (cpy_lo < cpy_hi) {
+                uint64_t dst_off  = cpy_lo - va;
+                uint64_t file_off = ph->p_offset + (cpy_lo - seg_vaddr);
+                uint64_t len      = cpy_hi - cpy_lo;
+                if (file_off + len <= elf_size)
+                    mm_memcpy(page_ptr + dst_off, elf_bytes + file_off, len);
             }
-            page_count++;
         }
     }
-    
-    // Set brk_start to end of loaded segments (page-aligned)
-    result->brk_start = (result->load_end + 0xFFF) & ~0xFFFULL;
-    
+
+    // phdr_addr fallback
+    if (result->phdr_addr == 0 && result->load_base != ~0ULL)
+        result->phdr_addr = result->load_base + ehdr->e_phoff;
+
+    result->entry_point = ehdr->e_entry + base_offset;
+    result->brk_start   = (result->load_end + 0xFFF) & ~0xFFFULL;
     return 0;
 }
 
-// Helper: calculate string length
+// ============================================================================
+// PUBLIC: elf_load_user
+// ============================================================================
+
+int elf_load_user(const void* elf_data, size_t elf_size,
+                  uint64_t* pml4, elf_load_result_t* result) {
+    if (!elf_data || !pml4 || !result) return -1;
+
+    int rc = elf_validate(elf_data, elf_size);
+    if (rc != 0) return rc;
+
+    const Elf64_Ehdr* ehdr = (const Elf64_Ehdr*)elf_data;
+    uint64_t base = (ehdr->e_type == ET_DYN) ? 0x400000ULL : 0;
+
+    return elf_load_segments(elf_data, elf_size, pml4, base, result);
+}
+
+// ============================================================================
+// INTERPRETER LOADING
+// ============================================================================
+
+static int elf_load_interp(const char* path, uint64_t* pml4,
+                           uint64_t* out_entry, uint64_t* out_base) {
+    vfs_file_t* file = NULL;
+    int ret = vfs_open(path, 0, &file);
+    if (ret != 0 || !file) {
+        kprintf("elf: cannot open interp '%s' (err %d)\n", path, ret);
+        return -1;
+    }
+    size_t sz = vfs_size(file);
+    if (sz == 0 || sz > 4 * 1024 * 1024) { vfs_close(file); return -2; }
+
+    void* buf = kalloc(sz);
+    if (!buf) { vfs_close(file); return -3; }
+
+    long rd = vfs_read(file, buf, sz);
+    vfs_close(file);
+    if (rd != (long)sz) { kfree(buf); return -4; }
+
+    ret = elf_validate(buf, sz);
+    if (ret != 0) { kfree(buf); return ret; }
+
+    const Elf64_Ehdr* eh = (const Elf64_Ehdr*)buf;
+    if (eh->e_type != ET_DYN) { kfree(buf); return -5; }
+
+    uint64_t interp_base = 0x7F0000000000ULL;   // High address, clear of app
+    elf_load_result_t ir;
+    mm_memset(&ir, 0, sizeof(ir));
+    ret = elf_load_segments(buf, sz, pml4, interp_base, &ir);
+    kfree(buf);
+    if (ret != 0) return ret;
+
+    *out_entry = ir.entry_point;
+    *out_base  = interp_base;
+    return 0;
+}
+
+// ============================================================================
+// STACK BUILDER  (argc, argv, envp, auxv)
+// ============================================================================
+
 static size_t elf_strlen(const char* s) {
-    size_t len = 0;
-    while (s[len]) len++;
-    return len;
+    size_t n = 0;
+    while (s[n]) n++;
+    return n;
 }
 
-// Execute an ELF file from the filesystem
-int elf_exec(const char* path, char* const argv[], char* const envp[], task_t** out_task) {
-    if (!path) {
-        kprintf("elf_exec: no path\n");
-        return -1;
-    }
-    
-    // Open the file
-    vfs_file_t* file = NULL;
-    int ret = vfs_open(path, 0, &file);
-    if (ret != 0 || !file) {
-        kprintf("elf_exec: cannot open '%s' (error %d)\n", path, ret);
-        return -1;
-    }
-    
-    // Get file size
-    size_t file_size = vfs_size(file);
-    
-    if (file_size == 0 || file_size > 16 * 1024 * 1024) {  // 16MB max
-        kprintf("elf_exec: invalid file size %u\n", (unsigned)file_size);
-        vfs_close(file);
-        return -2;
-    }
-    
-    // Allocate buffer for ELF file
-    void* elf_buf = kalloc(file_size);
-    if (!elf_buf) {
-        kprintf("elf_exec: cannot allocate %u bytes\n", (unsigned)file_size);
-        vfs_close(file);
-        return -3;
-    }
-    
-    // Read entire file
-    long bytes_read = vfs_read(file, elf_buf, file_size);
-    vfs_close(file);
-    
-    if (bytes_read != (long)file_size) {
-        kprintf("elf_exec: read error (got %ld, expected %u)\n", 
-                bytes_read, (unsigned)file_size);
-        kfree(elf_buf);
-        return -4;
-    }
-    
-    // Create user address space
-    uint64_t* user_pml4 = mm_create_user_address_space();
-    if (!user_pml4) {
-        kprintf("elf_exec: cannot create address space\n");
-        kfree(elf_buf);
-        return -5;
-    }
-    
-    // Load ELF
-    elf_load_result_t load_result;
-    ret = elf_load_user(elf_buf, file_size, user_pml4, &load_result);
-    kfree(elf_buf);  // Done with ELF buffer
-    
-    if (ret != 0) {
-        kprintf("elf_exec: load failed (error %d)\n", ret);
-        mm_destroy_address_space(user_pml4);
-        return -6;
-    }
-    
-    // Set up stack - place at top of user address space to maximize heap space
-    #define USER_STACK_TOP   0x00007FFFFFF00000ULL   // Near canonical limit (~128TB)
-    #define USER_STACK_SIZE  (64 * 1024)             // 64KB
-    
-    if (!mm_map_user_stack(user_pml4, USER_STACK_TOP, USER_STACK_SIZE)) {
-        kprintf("elf_exec: cannot map stack\n");
-        mm_destroy_address_space(user_pml4);
-        return -7;
-    }
-    
-    // Calculate argc
+static uint64_t elf_setup_stack(uint64_t* pml4,
+                                uint64_t stack_top, uint64_t stack_size,
+                                char* const argv[], char* const envp[],
+                                elf_load_result_t* mr, uint64_t interp_base) {
+    if (!mm_map_user_stack(pml4, stack_top, stack_size)) return 0;
+
     int argc = 0;
-    if (argv) {
-        while (argv[argc]) argc++;
-    }
-    
-    // Calculate envc
+    if (argv) while (argv[argc]) argc++;
     int envc = 0;
-    if (envp) {
-        while (envp[envc]) envc++;
-    }
-    
-    // We need to set up the stack with:
-    //   [strings for argv and envp]
-    //   [NULL terminator for envp]
-    //   [envp pointers]
-    //   [NULL terminator for argv]
-    //   [argv pointers]
-    //   [argc]  <- RSP points here at entry
-    
-    // Calculate total string space needed
-    size_t strings_size = 0;
-    for (int i = 0; i < argc; i++) {
-        strings_size += elf_strlen(argv[i]) + 1;
-    }
-    for (int i = 0; i < envc; i++) {
-        strings_size += elf_strlen(envp[i]) + 1;
-    }
-    
-    // Calculate stack layout
-    // Align strings to 8 bytes
-    size_t strings_aligned = (strings_size + 7) & ~7ULL;
-    size_t pointers_size = (argc + 1 + envc + 1) * 8;  // +1 for NULL terminators
-    size_t total_size = 8 + pointers_size + strings_aligned;  // +8 for argc
-    
-    // Ensure 16-byte alignment for stack
-    total_size = (total_size + 15) & ~15ULL;
-    
-    // Make sure our stack layout fits in one page (for simplicity)
-    if (total_size > PAGE_SIZE) {
-        kprintf("elf_exec: stack layout too large (%lu bytes)\n", (unsigned long)total_size);
-        mm_destroy_address_space(user_pml4);
-        return -7;
-    }
-    
-    uint64_t stack_ptr = USER_STACK_TOP - total_size;
-    
-    // The top page of the stack is at USER_STACK_TOP - PAGE_SIZE
-    uint64_t top_page_vaddr = USER_STACK_TOP - PAGE_SIZE;
-    
-    // Allocate a single page buffer to build the stack
-    uint8_t* stack_setup = (uint8_t*)kalloc(PAGE_SIZE);
-    if (!stack_setup) {
-        kprintf("elf_exec: cannot allocate stack setup buffer\n");
-        mm_destroy_address_space(user_pml4);
-        return -8;
-    }
-    mm_memset(stack_setup, 0, PAGE_SIZE);
-    
-    // The buffer represents addresses [top_page_vaddr, USER_STACK_TOP)
-    // stack_ptr is within this range, at offset (stack_ptr - top_page_vaddr)
-    
-    uint64_t* stack_base = (uint64_t*)(stack_setup + (stack_ptr - top_page_vaddr));
-    
-    // Strings go at the top of the page (end of buffer)
-    // We'll copy strings from the end of the buffer downward
-    uint8_t* str_dest = stack_setup + PAGE_SIZE;  // End of buffer
-    uint64_t str_vaddr = USER_STACK_TOP;  // Virtual address tracking
-    
-    uint64_t* argv_ptrs = (uint64_t*)kalloc((argc + 1) * sizeof(uint64_t));
-    uint64_t* envp_ptrs = (uint64_t*)kalloc((envc + 1) * sizeof(uint64_t));
-    
-    if (!argv_ptrs || !envp_ptrs) {
-        kfree(stack_setup);
-        if (argv_ptrs) kfree(argv_ptrs);
-        if (envp_ptrs) kfree(envp_ptrs);
-        mm_destroy_address_space(user_pml4);
-        return -9;
-    }
-    
-    // Copy strings from top of stack down
+    if (envp) while (envp[envc]) envc++;
+
+    // Auxiliary vector entries
+    typedef struct { uint64_t t, v; } ax_t;
+    ax_t ax[16];
+    int ac = 0;
+    ax[ac].t = AT_PHDR;   ax[ac].v = mr->phdr_addr;   ac++;
+    ax[ac].t = AT_PHENT;  ax[ac].v = mr->phentsize;    ac++;
+    ax[ac].t = AT_PHNUM;  ax[ac].v = mr->phnum;        ac++;
+    ax[ac].t = AT_PAGESZ; ax[ac].v = PAGE_SIZE;        ac++;
+    ax[ac].t = AT_ENTRY;  ax[ac].v = mr->entry_point;  ac++;
+    ax[ac].t = AT_BASE;   ax[ac].v = interp_base;      ac++;
+    ax[ac].t = AT_UID;    ax[ac].v = 0;  ac++;
+    ax[ac].t = AT_EUID;   ax[ac].v = 0;  ac++;
+    ax[ac].t = AT_GID;    ax[ac].v = 0;  ac++;
+    ax[ac].t = AT_EGID;   ax[ac].v = 0;  ac++;
+    ax[ac].t = AT_SECURE; ax[ac].v = 0;  ac++;
+    ax[ac].t = AT_NULL;   ax[ac].v = 0;  ac++;
+
+    // Total string space
+    size_t str_total = 0;
+    for (int i = 0; i < argc; i++) str_total += elf_strlen(argv[i]) + 1;
+    for (int i = 0; i < envc; i++) str_total += elf_strlen(envp[i]) + 1;
+
+    // Pointers area: argc + argv[] + NULL + envp[] + NULL + auxv
+    size_t ptrs = 8 + (argc + 1) * 8 + (envc + 1) * 8 + ac * 16;
+    size_t total = ptrs + ((str_total + 15) & ~15ULL);
+    total = (total + 15) & ~15ULL;
+
+    if (total > PAGE_SIZE) return 0;  // Won't fit in one-page model
+
+    // Temp buffer for the top stack page
+    uint8_t* buf = (uint8_t*)kalloc(PAGE_SIZE);
+    if (!buf) return 0;
+    mm_memset(buf, 0, PAGE_SIZE);
+
+    uint64_t top_page = stack_top - PAGE_SIZE;
+
+    // Strings: place from end of buffer downward
+    uint8_t* sw = buf + PAGE_SIZE;
+    uint64_t sv = stack_top;
+    uint64_t av[128], ev[128];
+
     for (int i = argc - 1; i >= 0; i--) {
-        size_t len = elf_strlen(argv[i]) + 1;
-        str_dest -= len;
-        str_vaddr -= len;
-        mm_memcpy(str_dest, argv[i], len);
-        argv_ptrs[i] = str_vaddr;
+        size_t l = elf_strlen(argv[i]) + 1;
+        sw -= l; sv -= l;
+        mm_memcpy(sw, argv[i], l);
+        av[i] = sv;
     }
-    
     for (int i = envc - 1; i >= 0; i--) {
-        size_t len = elf_strlen(envp[i]) + 1;
-        str_dest -= len;
-        str_vaddr -= len;
-        mm_memcpy(str_dest, envp[i], len);
-        envp_ptrs[i] = str_vaddr;
-    }
-    
-    // Align string pointer (not really needed since we use argv_ptrs/envp_ptrs)
-    
-    // Now build the pointer array
-    // Layout from stack_ptr:
-    //   [argc]
-    //   [argv[0]] [argv[1]] ... [argv[argc-1]] [NULL]
-    //   [envp[0]] [envp[1]] ... [envp[envc-1]] [NULL]
-    
-    uint64_t* sp = stack_base;
-    *sp++ = argc;
-    
-    for (int i = 0; i < argc; i++) {
-        *sp++ = argv_ptrs[i];
-    }
-    *sp++ = 0;  // NULL terminator for argv
-    
-    for (int i = 0; i < envc; i++) {
-        *sp++ = envp_ptrs[i];
-    }
-    *sp++ = 0;  // NULL terminator for envp
-    
-    kfree(argv_ptrs);
-    kfree(envp_ptrs);
-    
-    // Now copy the stack setup buffer to the actual stack pages
-    // We need to write to the physical pages backing the stack
-    // The stack is mapped at USER_STACK_TOP - USER_STACK_SIZE to USER_STACK_TOP
-    // We need to copy our buffer to the top page
-    
-    // Get physical address of the top stack page and copy via direct map
-    uint64_t phys = mm_get_physical_address_from_pml4(user_pml4, top_page_vaddr);
-    if (phys) {
-        mm_memcpy(phys_to_virt(phys), stack_setup, PAGE_SIZE);
-    } else {
-        kprintf("elf_exec: cannot get physical address for stack page\n");
-    }
-    
-    kfree(stack_setup);
-    
-    // Create the user task
-    task_t* task = sched_add_user_task(
-        (task_entry_t)load_result.entry_point,
-        NULL,
-        user_pml4,
-        stack_ptr,  // User stack pointer (with argc/argv/envp set up)
-        0           // Auto-allocate kernel stack
-    );
-    
-    if (!task) {
-        kprintf("elf_exec: cannot create task\n");
-        mm_destroy_address_space(user_pml4);
-        return -10;
-    }
-    
-    // Set up task memory management fields
-    task->brk_start = load_result.brk_start;
-    task->brk = load_result.brk_start;
-    // Ensure stack top and mmap base use the aligned stack top, not the current SP
-    task->user_stack_top = USER_STACK_TOP;
-    task->mmap_base = USER_STACK_TOP - (4 * 1024 * 1024);
-    
-    // Set up parent relationship so the task can be reaped
-    task_t* current = sched_current();
-    if (current) {
-        task->parent = current;
-        sched_add_child(current, task);
-        // Inherit pgid from parent (important for job control)
-        task->pgid = current->pgid;
-        task->sid = current->sid;
-        // Inherit controlling tty
-        task->ctty = current->ctty;
-            // Inherit cwd from parent
-            mm_memset(task->cwd, 0, sizeof(task->cwd));
-            if (current->cwd[0]) {
-                size_t i = 0;
-                for (; current->cwd[i] && i < sizeof(task->cwd) - 1; ++i) {
-                    task->cwd[i] = current->cwd[i];
-                }
-                task->cwd[i] = '\0';
-            } else {
-                task->cwd[0] = '/';
-                task->cwd[1] = '\0';
-            }
-    }
-    
-    if (out_task) {
-        *out_task = task;
+        size_t l = elf_strlen(envp[i]) + 1;
+        sw -= l; sv -= l;
+        mm_memcpy(sw, envp[i], l);
+        ev[i] = sv;
     }
 
+    uint64_t sp_va = (sv - ptrs) & ~15ULL;
+    if (sp_va < top_page) { kfree(buf); return 0; }
+
+    uint64_t* sp = (uint64_t*)(buf + (sp_va - top_page));
+    *sp++ = (uint64_t)argc;
+    for (int i = 0; i < argc; i++) *sp++ = av[i];
+    *sp++ = 0;
+    for (int i = 0; i < envc; i++) *sp++ = ev[i];
+    *sp++ = 0;
+    for (int i = 0; i < ac; i++) { *sp++ = ax[i].t; *sp++ = ax[i].v; }
+
+    // Flush buffer to physical page
+    uint64_t phys = mm_get_physical_address_from_pml4(pml4, top_page);
+    if (phys) mm_memcpy(phys_to_virt(phys), buf, PAGE_SIZE);
+    kfree(buf);
+
+    return sp_va;
+}
+
+// ============================================================================
+// PUBLIC: elf_exec  (launch new task)
+// ============================================================================
+
+int elf_exec(const char* path, char* const argv[], char* const envp[],
+             task_t** out_task) {
+    if (!path) return -1;
+
+    vfs_file_t* file = NULL;
+    int ret = vfs_open(path, 0, &file);
+    if (ret || !file) { kprintf("elf_exec: open '%s' err %d\n", path, ret); return -1; }
+
+    size_t sz = vfs_size(file);
+    if (sz == 0 || sz > 16*1024*1024) { vfs_close(file); return -2; }
+
+    void* eb = kalloc(sz);
+    if (!eb) { vfs_close(file); return -3; }
+
+    long rd = vfs_read(file, eb, sz);
+    vfs_close(file);
+    if (rd != (long)sz) { kfree(eb); return -4; }
+
+    uint64_t* pml4 = mm_create_user_address_space();
+    if (!pml4) { kfree(eb); return -5; }
+
+    elf_load_result_t lr;
+    mm_memset(&lr, 0, sizeof(lr));
+    ret = elf_load_user(eb, sz, pml4, &lr);
+    kfree(eb);
+    if (ret) { mm_destroy_address_space(pml4); return -6; }
+
+    uint64_t entry = lr.entry_point;
+    uint64_t ib = 0;
+
+    if (lr.has_interp) {
+        uint64_t ie = 0;
+        ret = elf_load_interp(lr.interp_path, pml4, &ie, &ib);
+        if (ret) {
+            kprintf("elf_exec: interp '%s' err %d\n", lr.interp_path, ret);
+            mm_destroy_address_space(pml4);
+            return -6;
+        }
+        entry = ie;
+        lr.interp_base  = ib;
+        lr.interp_entry = ie;
+    }
+
+    #define USER_STACK_TOP   0x00007FFFFFF00000ULL
+    #define USER_STACK_SIZE  (64 * 1024)
+
+    uint64_t sp = elf_setup_stack(pml4, USER_STACK_TOP, USER_STACK_SIZE,
+                                  argv, envp, &lr, ib);
+    if (!sp) { mm_destroy_address_space(pml4); return -7; }
+
+    task_t* t = sched_add_user_task((task_entry_t)entry, NULL, pml4, sp, 0);
+    if (!t) { mm_destroy_address_space(pml4); return -10; }
+
+    t->brk_start      = lr.brk_start;
+    t->brk             = lr.brk_start;
+    t->user_stack_top  = USER_STACK_TOP;
+    t->mmap_base       = USER_STACK_TOP - (4 * 1024 * 1024);
+
+    task_t* cur = sched_current();
+    if (cur) {
+        t->parent = cur;
+        sched_add_child(cur, t);
+        t->pgid = cur->pgid;
+        t->sid  = cur->sid;
+        t->ctty = cur->ctty;
+        mm_memset(t->cwd, 0, sizeof(t->cwd));
+        if (cur->cwd[0]) {
+            size_t i = 0;
+            for (; cur->cwd[i] && i < sizeof(t->cwd) - 1; i++)
+                t->cwd[i] = cur->cwd[i];
+            t->cwd[i] = '\0';
+        } else {
+            t->cwd[0] = '/'; t->cwd[1] = '\0';
+        }
+    }
+    if (out_task) *out_task = t;
     return 0;
 }
 
-// Execute an ELF file, replacing the current task's memory (for execve semantics)
-// Returns: new entry point on success, 0 on failure
-// On success, also sets *out_stack_ptr to the new user stack pointer
-uint64_t elf_exec_replace(const char* path, char* const argv[], char* const envp[], uint64_t* out_stack_ptr) {
-    if (!path || !out_stack_ptr) {
-        return 0;
-    }
-    
-    task_t* current = sched_current();
-    if (!current) {
-        return 0;
-    }
-    
-    // Open the file
+// ============================================================================
+// PUBLIC: elf_exec_replace  (execve semantics)
+// ============================================================================
+
+uint64_t elf_exec_replace(const char* path, char* const argv[],
+                          char* const envp[], uint64_t* out_stack_ptr) {
+    if (!path || !out_stack_ptr) return 0;
+    task_t* cur = sched_current();
+    if (!cur) return 0;
+
     vfs_file_t* file = NULL;
     int ret = vfs_open(path, 0, &file);
-    if (ret != 0 || !file) {
-        return 0;
-    }
-    
-    // Get file size
-    size_t file_size = vfs_size(file);
-    if (file_size == 0 || file_size > 16 * 1024 * 1024) {
-        vfs_close(file);
-        return 0;
-    }
-    
-    // Allocate buffer for ELF file
-    void* elf_buf = kalloc(file_size);
-    if (!elf_buf) {
-        vfs_close(file);
-        return 0;
-    }
-    
-    // Read entire file
-    long bytes_read = vfs_read(file, elf_buf, file_size);
+    if (ret || !file) return 0;
+
+    size_t sz = vfs_size(file);
+    if (sz == 0 || sz > 16*1024*1024) { vfs_close(file); return 0; }
+
+    void* eb = kalloc(sz);
+    if (!eb) { vfs_close(file); return 0; }
+
+    long rd = vfs_read(file, eb, sz);
     vfs_close(file);
-    
-    if (bytes_read != (long)file_size) {
-        kfree(elf_buf);
-        return 0;
+    if (rd != (long)sz) { kfree(eb); return 0; }
+
+    uint64_t* old = cur->pml4;
+    uint64_t* pml4 = mm_create_user_address_space();
+    if (!pml4) { kfree(eb); return 0; }
+
+    elf_load_result_t lr;
+    mm_memset(&lr, 0, sizeof(lr));
+    ret = elf_load_user(eb, sz, pml4, &lr);
+    kfree(eb);
+    if (ret) { mm_destroy_address_space(pml4); return 0; }
+
+    uint64_t entry = lr.entry_point;
+    uint64_t ib = 0;
+
+    if (lr.has_interp) {
+        uint64_t ie = 0;
+        ret = elf_load_interp(lr.interp_path, pml4, &ie, &ib);
+        if (ret) { mm_destroy_address_space(pml4); return 0; }
+        entry = ie;
+        lr.interp_base  = ib;
+        lr.interp_entry = ie;
     }
-    
-    // Save the old address space to destroy later
-    uint64_t* old_pml4 = current->pml4;
-    
-    // Create NEW user address space
-    uint64_t* user_pml4 = mm_create_user_address_space();
-    if (!user_pml4) {
-        kfree(elf_buf);
-        return 0;
-    }
-    
-    // Load ELF into the new address space
-    elf_load_result_t load_result;
-    ret = elf_load_user(elf_buf, file_size, user_pml4, &load_result);
-    kfree(elf_buf);
-    if (ret != 0) {
-        mm_destroy_address_space(user_pml4);
-        return 0;
-    }
-    
-    // Set up stack in new address space - place at top of user address space
-    #define USER_STACK_TOP_EXEC   0x00007FFFFFF00000ULL  // Near canonical limit
+
+    #define USER_STACK_TOP_EXEC   0x00007FFFFFF00000ULL
     #define USER_STACK_SIZE_EXEC  (64 * 1024)
-    
-    if (!mm_map_user_stack(user_pml4, USER_STACK_TOP_EXEC, USER_STACK_SIZE_EXEC)) {
-        mm_destroy_address_space(user_pml4);
-        return 0;
-    }
-    
-    // Calculate argc/envc
-    int argc = 0;
-    if (argv) {
-        while (argv[argc]) argc++;
-    }
-    int envc = 0;
-    if (envp) {
-        while (envp[envc]) envc++;
-    }
-    
-    // Calculate string space needed
-    size_t strings_size = 0;
-    for (int i = 0; i < argc; i++) {
-        strings_size += elf_strlen(argv[i]) + 1;
-    }
-    for (int i = 0; i < envc; i++) {
-        strings_size += elf_strlen(envp[i]) + 1;
-    }
-    
-    // Stack layout (similar to elf_exec)
-    size_t total_size = strings_size + 
-                        (envc + 1) * sizeof(uint64_t) +
-                        (argc + 1) * sizeof(uint64_t) +
-                        sizeof(uint64_t);
-    
-    if (total_size > PAGE_SIZE) {
-        mm_destroy_address_space(user_pml4);
-        return 0;
-    }
-    
-    // Allocate temp buffer for stack setup
-    uint8_t* stack_setup = kalloc(PAGE_SIZE);
-    if (!stack_setup) {
-        mm_destroy_address_space(user_pml4);
-        return 0;
-    }
-    mm_memset(stack_setup, 0, PAGE_SIZE);
-    
-    // Build stack content
-    uint64_t stack_base = USER_STACK_TOP_EXEC - USER_STACK_SIZE_EXEC;
-    uint64_t stack_page_base = USER_STACK_TOP_EXEC - PAGE_SIZE;
-    
-    uint64_t string_area = stack_page_base;
-    uint8_t* str_ptr = stack_setup;
-    
-    uint64_t argv_ptrs[128];
-    uint64_t envp_ptrs[128];
-    
-    for (int i = 0; i < argc && i < 128; i++) {
-        argv_ptrs[i] = string_area + (str_ptr - stack_setup);
-        size_t len = elf_strlen(argv[i]);
-        mm_memcpy(str_ptr, argv[i], len + 1);
-        str_ptr += len + 1;
-    }
-    for (int i = 0; i < envc && i < 128; i++) {
-        envp_ptrs[i] = string_area + (str_ptr - stack_setup);
-        size_t len = elf_strlen(envp[i]);
-        mm_memcpy(str_ptr, envp[i], len + 1);
-        str_ptr += len + 1;
-    }
-    
-    // Calculate where arrays go
-    size_t strings_used = str_ptr - stack_setup;
-    size_t array_space = (envc + 1 + argc + 1 + 1) * sizeof(uint64_t);
-    size_t total_used = strings_used + array_space;
-    total_used = (total_used + 15) & ~15ULL;
-    
-    uint64_t stack_ptr = USER_STACK_TOP_EXEC - total_used;
-    size_t offset_in_page = PAGE_SIZE - total_used;
-    
-    uint64_t* sp = (uint64_t*)(stack_setup + offset_in_page);
-    *sp++ = argc;
-    for (int i = 0; i < argc; i++) {
-        *sp++ = argv_ptrs[i];
-    }
-    *sp++ = 0;  // NULL terminator for argv
-    for (int i = 0; i < envc; i++) {
-        *sp++ = envp_ptrs[i];
-    }
-    *sp++ = 0;  // NULL terminator for envp
-    
-    // Copy stack page to physical memory via direct map
-    uint64_t top_page_vaddr = USER_STACK_TOP_EXEC - PAGE_SIZE;
-    uint64_t phys = mm_get_physical_address_from_pml4(user_pml4, top_page_vaddr);
-    if (phys) {
-        mm_memcpy(phys_to_virt(phys), stack_setup, PAGE_SIZE);
-    }
-    kfree(stack_setup);
-    
-    // Now switch the current task to use the new address space
-    // First, switch CR3 to the new address space
-    current->pml4 = user_pml4;
-    
-    // Update task's memory management fields
-    current->brk_start = load_result.brk_start;
-    current->brk = load_result.brk_start;
-    current->user_stack_top = USER_STACK_TOP_EXEC;
-    current->mmap_base = USER_STACK_TOP_EXEC - (4 * 1024 * 1024);
-    
-    // Close all file descriptors except 0, 1, 2
+
+    uint64_t sp = elf_setup_stack(pml4, USER_STACK_TOP_EXEC, USER_STACK_SIZE_EXEC,
+                                  argv, envp, &lr, ib);
+    if (!sp) { mm_destroy_address_space(pml4); return 0; }
+
+    cur->pml4          = pml4;
+    cur->brk_start     = lr.brk_start;
+    cur->brk           = lr.brk_start;
+    cur->user_stack_top = USER_STACK_TOP_EXEC;
+    cur->mmap_base     = USER_STACK_TOP_EXEC - (4 * 1024 * 1024);
+
     for (int i = 3; i < TASK_MAX_FDS; i++) {
-        if (current->fd_table[i]) {
-            uint64_t marker = (uint64_t)current->fd_table[i];
+        if (cur->fd_table[i]) {
+            uint64_t marker = (uint64_t)cur->fd_table[i];
             if (marker >= 1 && marker <= 3) {
-                /* Console dup marker – just clear */
-                current->fd_table[i] = NULL;
-            } else if (pipe_is_end(current->fd_table[i])) {
-                pipe_close_end((pipe_end_t*)current->fd_table[i]);
-                current->fd_table[i] = NULL;
+                cur->fd_table[i] = NULL;
+            } else if (pipe_is_end(cur->fd_table[i])) {
+                pipe_close_end((pipe_end_t*)cur->fd_table[i]);
+                cur->fd_table[i] = NULL;
             } else {
-                vfs_close(current->fd_table[i]);
-                current->fd_table[i] = NULL;
+                vfs_close(cur->fd_table[i]);
+                cur->fd_table[i] = NULL;
             }
         }
     }
-    
-    // Switch to new address space now
-    mm_switch_address_space(user_pml4);
-    
-    // CRITICAL: TLB shootdown before destroying old address space!
-    // Other CPUs (if this process had threads) may have stale TLB entries.
-    if (smp_is_enabled()) {
-        smp_tlb_shootdown_sync();
-    }
-    
-    // Destroy old address space (after switching!)
-    if (old_pml4) {
-        mm_destroy_address_space(old_pml4);
-    }
-    
-    *out_stack_ptr = stack_ptr;
-    return load_result.entry_point;
+
+    mm_switch_address_space(pml4);
+    if (smp_is_enabled()) smp_tlb_shootdown_sync();
+    if (old) mm_destroy_address_space(old);
+
+    *out_stack_ptr = sp;
+    return entry;
 }

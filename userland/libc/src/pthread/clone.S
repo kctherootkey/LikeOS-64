@@ -101,7 +101,12 @@ clone:
     pop     %rbp
     // Set errno and return -1
     neg     %rax                // Make errno positive
+#ifdef __PIC__
+    mov     errno@GOTPCREL(%rip), %rcx
+    mov     %rax, (%rcx)
+#else
     mov     %rax, errno(%rip)   // Store in errno
+#endif
     mov     $-1, %rax
     ret
 
@@ -127,8 +132,16 @@ clone:
 
 .Lerror_inval:
     mov     $22, %rax           // EINVAL = 22
+#ifdef __PIC__
+    mov     errno@GOTPCREL(%rip), %rcx
+    mov     %rax, (%rcx)
+#else
     mov     %rax, errno(%rip)
+#endif
     mov     $-1, %rax
     ret
 
 .size clone, .-clone
+
+/* Non-executable stack */
+.section .note.GNU-stack,"",@progbits

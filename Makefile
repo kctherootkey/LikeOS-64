@@ -254,52 +254,75 @@ $(BUILD_DIR)/futex.o: $(KERNEL_DIR)/ke/futex.c | $(BUILD_DIR)
 userland-libc:
 	$(MAKE) -C userland/libc
 
+# Build runtime linker
+.PHONY: userland-rtld
+userland-rtld:
+	$(MAKE) -C userland/rtld
+
+# Build test shared library
+.PHONY: userland-testlib
+userland-testlib:
+	$(MAKE) -C userland/testlib
+
+# Copy shared libraries to build directory
+$(BUILD_DIR)/ld-likeos.so: userland-rtld | $(BUILD_DIR)
+	cp userland/rtld/ld-likeos.so $@
+
+$(BUILD_DIR)/libc.so: userland-libc | $(BUILD_DIR)
+	cp userland/libc/libc.so $@
+
+$(BUILD_DIR)/libpthread.so: userland-libc | $(BUILD_DIR)
+	cp userland/libc/libpthread.so $@
+
+$(BUILD_DIR)/libtestlib.so: userland-testlib | $(BUILD_DIR)
+	cp userland/testlib/libtestlib.so $@
+
 # Build test programs using libc
-$(BUILD_DIR)/user_test.elf: userland-libc | $(BUILD_DIR)
+$(BUILD_DIR)/user_test.elf: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) test_syscalls
 	cp $(USER_DIR)/test_syscalls $@
 
-$(BUILD_DIR)/test_libc: userland-libc | $(BUILD_DIR)
+$(BUILD_DIR)/test_libc: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) test_libc
 	cp $(USER_DIR)/test_libc $@
 
-$(BUILD_DIR)/hello: userland-libc | $(BUILD_DIR)
+$(BUILD_DIR)/hello: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) hello
 	cp $(USER_DIR)/hello $@
 
-$(BUILD_DIR)/sh: userland-libc | $(BUILD_DIR)
+$(BUILD_DIR)/sh: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) sh
 	cp $(USER_DIR)/sh $@
 
-$(BUILD_DIR)/ls: userland-libc | $(BUILD_DIR)
+$(BUILD_DIR)/ls: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) ls
 	cp $(USER_DIR)/ls $@
 
-$(BUILD_DIR)/cat: userland-libc | $(BUILD_DIR)
+$(BUILD_DIR)/cat: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) cat
 	cp $(USER_DIR)/cat $@
 
-$(BUILD_DIR)/pwd: userland-libc | $(BUILD_DIR)
+$(BUILD_DIR)/pwd: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) pwd
 	cp $(USER_DIR)/pwd $@
 
-$(BUILD_DIR)/stat: userland-libc | $(BUILD_DIR)
+$(BUILD_DIR)/stat: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) stat
 	cp $(USER_DIR)/stat $@
 
-$(BUILD_DIR)/progerr: userland-libc | $(BUILD_DIR)
+$(BUILD_DIR)/progerr: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) progerr
 	cp $(USER_DIR)/progerr $@
 
-$(BUILD_DIR)/testmem: userland-libc | $(BUILD_DIR)
+$(BUILD_DIR)/testmem: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) testmem
 	cp $(USER_DIR)/testmem $@
 
-$(BUILD_DIR)/memstat: userland-libc | $(BUILD_DIR)
+$(BUILD_DIR)/memstat: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) memstat
 	cp $(USER_DIR)/memstat $@
 
-$(BUILD_DIR)/teststress: userland-libc | $(BUILD_DIR)
+$(BUILD_DIR)/teststress: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) teststress
 	cp $(USER_DIR)/teststress $@
 
@@ -363,7 +386,7 @@ $(ISO_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) | $(BUILD_DIR)
 	@echo "UEFI bootable ISO created: $(ISO_IMAGE)"
 
 # Create UEFI bootable FAT image (for direct use)
-$(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress | $(BUILD_DIR)
+$(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libpthread.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
 	@echo "Creating UEFI bootable FAT image..."
 	
 	# Create a 64MB FAT32 image
@@ -390,6 +413,12 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/testmem ::/testmem
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/memstat ::/memstat
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/teststress ::/teststress
+	# Create /lib directory and copy shared libraries
+	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/lib || true
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/ld-likeos.so ::/lib/ld-likeos.so
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libc.so ::/lib/libc.so
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libpthread.so ::/lib/libpthread.so
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libtestlib.so ::/lib/libtestlib.so
 	# Add system font resource
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/res || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) res/Lat15-Fixed16.psf ::/res/Lat15-Fixed16.psf
@@ -419,7 +448,7 @@ qemu-fat: $(FAT_IMAGE)
 
 # Standalone USB mass storage data image (64MB FAT32) now mirrors usb-write target (UEFI bootable + signature files)
 # Provides: EFI/BOOT/BOOTX64.EFI, kernel.elf, LIKEOS.SIG, HELLO.TXT, tests
-$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress | $(BUILD_DIR)
+$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libpthread.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
 	@echo "Creating USB data FAT32 image (msdata.img, 64MB, UEFI bootable)..."
 	$(DD) if=/dev/zero of=$(DATA_IMAGE) bs=1M count=64
 	$(MKFS_FAT) -F32 -n "MSDATA" $(DATA_IMAGE)
@@ -443,6 +472,12 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/pwd ::/bin/pwd
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/stat ::/bin/stat
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/memstat ::/bin/memstat
+	# Create /lib directory and copy shared libraries
+	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/lib || true
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/ld-likeos.so ::/lib/ld-likeos.so
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/libc.so ::/lib/libc.so
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/libpthread.so ::/lib/libpthread.so
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/libtestlib.so ::/lib/libtestlib.so
 	# Add system font resource
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/res || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/Lat15-Fixed16.psf ::/res/Lat15-Fixed16.psf
@@ -613,6 +648,8 @@ linux-usb-write: linux-usb
 clean:
 	rm -rf $(BUILD_DIR)
 	$(MAKE) -C userland/libc clean
+	$(MAKE) -C userland/rtld clean
+	$(MAKE) -C userland/testlib clean
 	$(MAKE) -C user clean
 
 # Install dependencies (Ubuntu/Debian)
