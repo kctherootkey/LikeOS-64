@@ -40,32 +40,27 @@ LIBC_OBJ = $(MALLOC_OBJ) $(STDIO_OBJ) $(STRING_OBJ) $(STDLIB_OBJ) \
 
 ALL_OBJ = $(LIBC_OBJ) $(PTHREAD_OBJ)
 
-# PIC object files (for shared libraries)  – include dlfcn in shared libc
+# PIC object files (for shared libraries)  – include dlfcn + pthread in shared libc
 DLFCN_PIC = $(DLFCN_OBJ:.o=.pic.o)
-LIBC_PIC = $(LIBC_OBJ:.o=.pic.o) $(DLFCN_PIC)
 PTHREAD_PIC = $(PTHREAD_OBJ:.o=.pic.o)
+LIBC_PIC = $(LIBC_OBJ:.o=.pic.o) $(DLFCN_PIC) $(PTHREAD_PIC)
 
 # Output
 LIBC_A      = libc.a
 LIBC_SO     = libc.so
-LIBPTHREAD_SO = libpthread.so
 CRT0        = crt0.o
 CRT1        = crt1.o
 
-all: $(LIBC_A) $(CRT0) $(CRT1) $(LIBC_SO) $(LIBPTHREAD_SO)
+all: $(LIBC_A) $(CRT0) $(CRT1) $(LIBC_SO)
 
 # ---- Static library (libc.a) — contains everything including pthread ----
 $(LIBC_A): $(ALL_OBJ)
 	$(AR) rcs $@ $^
 
-# ---- Shared libraries ----
+# ---- Shared library (libc.so — includes pthread) ----
 $(LIBC_SO): $(LIBC_PIC)
-	$(LD) -shared -nostdlib -Bsymbolic-functions --hash-style=sysv \
+	$(LD) -shared -nostdlib -Bsymbolic-functions --hash-style=gnu \
 	    -soname libc.so -o $@ $^
-
-$(LIBPTHREAD_SO): $(PTHREAD_PIC)
-	$(LD) -shared -nostdlib -Bsymbolic-functions --hash-style=sysv \
-	    -soname libpthread.so -o $@ $^
 
 # ---- CRT objects ----
 $(CRT0): $(CRT0_OBJ)
@@ -89,6 +84,6 @@ $(CRT1): $(CRT1_OBJ)
 
 clean:
 	rm -f $(ALL_OBJ) $(DLFCN_OBJ) $(CRT0_OBJ) $(CRT1_OBJ) $(LIBC_A) $(CRT0) $(CRT1)
-	rm -f $(LIBC_PIC) $(DLFCN_PIC) $(PTHREAD_PIC) $(LIBC_SO) $(LIBPTHREAD_SO)
+	rm -f $(LIBC_PIC) $(DLFCN_PIC) $(PTHREAD_PIC) $(LIBC_SO)
 
 .PHONY: all clean

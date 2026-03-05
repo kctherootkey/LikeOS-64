@@ -668,30 +668,56 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
     int fd = rtld_open(path, O_RDONLY);
     if (fd < 0) return NULL;
 
-    Elf64_Ehdr ehdr;
-    if (rtld_read(fd, &ehdr, sizeof ehdr) != (long)sizeof ehdr)
-        goto fail;
-    if (ehdr.e_ident[0] != 0x7F || ehdr.e_ident[1] != 'E' ||
-        ehdr.e_ident[2] != 'L'  || ehdr.e_ident[3] != 'F' ||
-        ehdr.e_type != ET_DYN)
-        goto fail;
+    /* Get file size and read entire file at once — avoids repeated seek+read syscalls */
+    long file_size = rtld_lseek(fd, 0, SEEK_END);
+    if (file_size <= 0 || file_size > 4 * 1024 * 1024) goto fail;
+    rtld_lseek(fd, 0, SEEK_SET);
 
-    Elf64_Phdr phdrs[64];
-    if (ehdr.e_phnum > 64) goto fail;
-    size_t phsz = ehdr.e_phnum * ehdr.e_phentsize;
-    rtld_lseek(fd, ehdr.e_phoff, SEEK_SET);
-    if (rtld_read(fd, phdrs, phsz) != (long)phsz) goto fail;
+    void *file_buf = rtld_mmap(NULL, (size_t)file_size,
+                               PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (file_buf == MAP_FAILED) goto fail;
+
+    /* Read entire file in one call */
+    {
+        uint8_t *dst = (uint8_t *)file_buf;
+        size_t rem = (size_t)file_size;
+        while (rem) {
+            long r = rtld_read(fd, dst, rem);
+            if (r <= 0) { rtld_munmap(file_buf, (size_t)file_size); goto fail; }
+            dst += r; rem -= r;
+        }
+    }
+    rtld_close(fd);
+    fd = -1;
+
+    const uint8_t *fb = (const uint8_t *)file_buf;
+    Elf64_Ehdr *ehdr = (Elf64_Ehdr *)fb;
+    if ((size_t)file_size < sizeof(Elf64_Ehdr) ||
+        ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
+        ehdr->e_ident[2] != 'L'  || ehdr->e_ident[3] != 'F' ||
+        ehdr->e_type != ET_DYN) {
+        rtld_munmap(file_buf, (size_t)file_size);
+        return NULL;
+    }
+
+    Elf64_Phdr *phdrs = (Elf64_Phdr *)(fb + ehdr->e_phoff);
+    if (ehdr->e_phnum > 64 ||
+        ehdr->e_phoff + (size_t)ehdr->e_phnum * ehdr->e_phentsize > (size_t)file_size) {
+        rtld_munmap(file_buf, (size_t)file_size);
+        return NULL;
+    }
 
     /* Total memory span */
     uint64_t lo = ~0ULL, hi = 0;
-    for (int i = 0; i < ehdr.e_phnum; i++) {
+    for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdrs[i].p_type != PT_LOAD) continue;
         uint64_t s = phdrs[i].p_vaddr & ~0xFFFULL;
         uint64_t e = (phdrs[i].p_vaddr + phdrs[i].p_memsz + 0xFFF) & ~0xFFFULL;
         if (s < lo) lo = s;
         if (e > hi) hi = e;
     }
-    if (lo >= hi) goto fail;
+    if (lo >= hi) { rtld_munmap(file_buf, (size_t)file_size); return NULL; }
     uint64_t span = hi - lo;
 
     /* Reserve address space */
@@ -704,8 +730,8 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
     d->map_base = map;
     d->map_size = span;
 
-    /* Map each PT_LOAD */
-    for (int i = 0; i < ehdr.e_phnum; i++) {
+    /* Map each PT_LOAD — copy from in-memory file buffer (zero syscalls) */
+    for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdrs[i].p_type != PT_LOAD) continue;
 
         uint64_t va  = phdrs[i].p_vaddr + d->base;
@@ -722,26 +748,19 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
                             PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
                             -1, 0);
-        if (m == MAP_FAILED) goto fail;
+        if (m == MAP_FAILED) { rtld_munmap(file_buf, (size_t)file_size); return NULL; }
 
         if (phdrs[i].p_filesz) {
-            rtld_lseek(fd, phdrs[i].p_offset, SEEK_SET);
-            size_t rem = phdrs[i].p_filesz;
-            uint8_t *dst = (uint8_t *)va;
-            while (rem) {
-                long c = rem > 4096 ? 4096 : rem;
-                long r = rtld_read(fd, dst, c);
-                if (r <= 0) break;
-                dst += r; rem -= r;
-            }
+            /* Direct memcpy from file buffer — no syscalls */
+            if (phdrs[i].p_offset + phdrs[i].p_filesz <= (uint64_t)file_size)
+                rtld_memcpy((void *)va, fb + phdrs[i].p_offset, phdrs[i].p_filesz);
         }
         if (!(prot & PROT_WRITE))
             rtld_mprotect((void *)alv, len, prot);
     }
-    rtld_close(fd);
 
     /* PT_DYNAMIC, PT_TLS */
-    for (int i = 0; i < ehdr.e_phnum; i++) {
+    for (int i = 0; i < ehdr->e_phnum; i++) {
         if (phdrs[i].p_type == PT_DYNAMIC)
             d->dynamic = (const Elf64_Dyn *)(phdrs[i].p_vaddr + d->base);
         if (phdrs[i].p_type == PT_TLS) {
@@ -751,7 +770,11 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
             d->tls_align  = phdrs[i].p_align;
         }
     }
-    d->phnum = ehdr.e_phnum;
+    d->phnum = ehdr->e_phnum;
+
+    /* Release file buffer — no longer needed */
+    rtld_munmap(file_buf, (size_t)file_size);
+
     rtld_parse_dynamic(d);
     rtld_assign_tls(d);
 
@@ -765,7 +788,7 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
     return d;
 
 fail:
-    rtld_close(fd);
+    if (fd >= 0) rtld_close(fd);
     return NULL;
 }
 

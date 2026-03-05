@@ -15,7 +15,7 @@ ASFLAGS = -c
 LDFLAGS = -shared -nostdlib -T rtld.lds \
           -Bsymbolic --no-undefined \
           -z now \
-          --hash-style=sysv
+          --hash-style=gnu
 
 TARGET  = ld-likeos.so
 OBJS    = rtld.o rtld_entry.o

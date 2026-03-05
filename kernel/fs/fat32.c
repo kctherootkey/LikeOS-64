@@ -2547,28 +2547,28 @@ static long fat32_read(vfs_file_t *f, void *buf, long bytes)
     unsigned long copied = 0;
     unsigned cluster_size = ff->fs->sectors_per_cluster * ff->fs->bytes_per_sector;
     
+    /* Allocate ONE cluster buffer and reuse it for all reads */
+    void *tmp = kalloc(cluster_size);
+    if (!tmp) {
+        kprintf("fat32_read: kalloc(%u) failed\n", cluster_size);
+        return ST_NOMEM;
+    }
+    
+    smap_disable();
     while (remaining) {
         unsigned cluster_offset = ff->pos % cluster_size;
         unsigned avail_in_cluster = cluster_size - cluster_offset;
         unsigned chunk = (remaining < avail_in_cluster) ? (unsigned)remaining : avail_in_cluster;
-        void *tmp = kalloc(cluster_size);
-        if (!tmp) {
-            kprintf("fat32_read: kalloc(%u) failed, remaining=%lu copied=%lu\n", cluster_size, remaining, copied);
-            return copied ? (long)copied : ST_NOMEM;
-        }
         int st = read_sectors(ff->fs->bdev,
             cluster_to_lba(ff->fs, ff->current_cluster),
             ff->fs->sectors_per_cluster, tmp);
         if (st != ST_OK) {
+            smap_enable();
             kfree(tmp);
             return copied ? (long)copied : ST_IO;
         }
-        // SMAP-aware copy to user buffer
-        smap_disable();
-        for (unsigned i = 0; i < chunk; i++)
-            ((uint8_t *)buf)[copied + i] = ((uint8_t *)tmp)[cluster_offset + i];
-        smap_enable();
-        kfree(tmp);
+        /* Use mm_memcpy instead of byte-by-byte copy */
+        mm_memcpy(((uint8_t *)buf) + copied, ((uint8_t *)tmp) + cluster_offset, chunk);
         ff->pos += chunk;
         copied += chunk;
         remaining -= chunk;
@@ -2591,6 +2591,8 @@ static long fat32_read(vfs_file_t *f, void *buf, long bytes)
             ff->current_cluster = next;
         }
     }
+    smap_enable();
+    kfree(tmp);
     return (long)copied;
 }
 
