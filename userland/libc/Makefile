@@ -11,8 +11,9 @@ PIC_CFLAGS = $(CFLAGS) -fPIC
 MALLOC_SRC = src/malloc/malloc.c
 STDIO_SRC = src/stdio/stdio.c
 STRING_SRC = src/string/string.c
-STDLIB_SRC = src/stdlib/stdlib.c
+STDLIB_SRC = src/stdlib/stdlib.c src/stdlib/getopt.c
 CTYPE_SRC = src/ctype/ctype.c
+TIME_SRC = src/time/time.c
 DIR_SRC = src/dirent/dirent.c
 SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/sched.c
 DLFCN_SRC = src/dl/dlfcn.c
@@ -27,6 +28,7 @@ STDIO_OBJ = $(STDIO_SRC:.c=.o)
 STRING_OBJ = $(STRING_SRC:.c=.o)
 STDLIB_OBJ = $(STDLIB_SRC:.c=.o)
 CTYPE_OBJ = $(CTYPE_SRC:.c=.o)
+TIME_OBJ = $(TIME_SRC:.c=.o)
 DIR_OBJ = $(DIR_SRC:.c=.o)
 SYSCALLS_OBJ = $(SYSCALLS_SRC:.c=.o)
 DLFCN_OBJ = $(DLFCN_SRC:.c=.o)
@@ -36,7 +38,7 @@ CRT1_OBJ = $(CRT1_SRC:.S=.o)
 
 # All static objects (libc – everything except pthread)
 LIBC_OBJ = $(MALLOC_OBJ) $(STDIO_OBJ) $(STRING_OBJ) $(STDLIB_OBJ) \
-           $(CTYPE_OBJ) $(DIR_OBJ) $(SYSCALLS_OBJ)
+           $(CTYPE_OBJ) $(TIME_OBJ) $(DIR_OBJ) $(SYSCALLS_OBJ)
 
 ALL_OBJ = $(LIBC_OBJ) $(PTHREAD_OBJ)
 

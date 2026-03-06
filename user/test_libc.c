@@ -16,6 +16,7 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <dlfcn.h>
+#include <getopt.h>
 
 // Futex helper declarations (from sched.c)
 int futex_wait(int* uaddr, int val, const struct timespec* timeout);
@@ -2885,6 +2886,319 @@ int main(int argc, char** argv) {
             }
             dlclose(handle2);
         }
+    }
+
+    // ========================================
+    // uname() syscall tests
+    // ========================================
+    printf("\n========================================\n");
+    printf("  uname() SYSCALL TESTS\n");
+    printf("========================================\n");
+    {
+        struct utsname uts;
+        int ret = uname(&uts);
+        test_result("uname() returns 0", ret == 0);
+
+        if (ret == 0) {
+            /* sysname should be "LikeOS" */
+            test_result("uname sysname == \"LikeOS\"",
+                        strcmp(uts.sysname, "LikeOS") == 0);
+
+            /* nodename should be non-empty */
+            test_result("uname nodename is non-empty",
+                        strlen(uts.nodename) > 0);
+
+            /* release should be non-empty */
+            test_result("uname release is non-empty",
+                        strlen(uts.release) > 0);
+
+            /* version should be non-empty */
+            test_result("uname version is non-empty",
+                        strlen(uts.version) > 0);
+
+            /* machine should be "x86_64" */
+            test_result("uname machine == \"x86_64\"",
+                        strcmp(uts.machine, "x86_64") == 0);
+
+            /* Print the fields for manual inspection */
+            printf("  sysname:  %s\n", uts.sysname);
+            printf("  nodename: %s\n", uts.nodename);
+            printf("  release:  %s\n", uts.release);
+            printf("  version:  %s\n", uts.version);
+            printf("  machine:  %s\n", uts.machine);
+
+            /* Each field should be shorter than the buffer size (65) */
+            test_result("sysname length < 65", strlen(uts.sysname) < 65);
+            test_result("nodename length < 65", strlen(uts.nodename) < 65);
+            test_result("release length < 65", strlen(uts.release) < 65);
+            test_result("version length < 65", strlen(uts.version) < 65);
+            test_result("machine length < 65", strlen(uts.machine) < 65);
+        }
+    }
+
+    // ========================================
+    // getopt() tests
+    // ========================================
+    printf("\n========================================\n");
+    printf("  getopt() TESTS\n");
+    printf("========================================\n");
+    {
+        /* Reset getopt state */
+        extern int optind, opterr, optopt;
+        extern char *optarg;
+        optind = 1;
+        opterr = 0;
+
+        /* Test 1: simple option parsing */
+        char *argv1[] = { "prog", "-a", "-b", NULL };
+        int argc1 = 3;
+        int got_a = 0, got_b = 0;
+        int ch;
+        optind = 1;
+        while ((ch = getopt(argc1, argv1, "ab")) != -1) {
+            if (ch == 'a') got_a = 1;
+            if (ch == 'b') got_b = 1;
+        }
+        test_result("getopt: -a parsed", got_a == 1);
+        test_result("getopt: -b parsed", got_b == 1);
+        test_result("getopt: optind after -a -b == 3", optind == 3);
+
+        /* Test 2: grouped options */
+        char *argv2[] = { "prog", "-abc", NULL };
+        int argc2 = 2;
+        int got_a2 = 0, got_b2 = 0, got_c2 = 0;
+        optind = 1;
+        while ((ch = getopt(argc2, argv2, "abc")) != -1) {
+            if (ch == 'a') got_a2 = 1;
+            if (ch == 'b') got_b2 = 1;
+            if (ch == 'c') got_c2 = 1;
+        }
+        test_result("getopt grouped: -a parsed", got_a2 == 1);
+        test_result("getopt grouped: -b parsed", got_b2 == 1);
+        test_result("getopt grouped: -c parsed", got_c2 == 1);
+
+        /* Test 3: option with argument */
+        char *argv3[] = { "prog", "-f", "file.txt", NULL };
+        int argc3 = 3;
+        char *farg = NULL;
+        optind = 1;
+        while ((ch = getopt(argc3, argv3, "f:")) != -1) {
+            if (ch == 'f') farg = optarg;
+        }
+        test_result("getopt arg: -f file.txt parses", farg != NULL);
+        if (farg)
+            test_result("getopt arg: optarg == \"file.txt\"",
+                        strcmp(farg, "file.txt") == 0);
+
+        /* Test 4: unknown option returns '?' */
+        char *argv4[] = { "prog", "-z", NULL };
+        int argc4 = 2;
+        int got_q = 0;
+        optind = 1;
+        while ((ch = getopt(argc4, argv4, "ab")) != -1) {
+            if (ch == '?') got_q = 1;
+        }
+        test_result("getopt: unknown option returns '?'", got_q == 1);
+
+        /* Test 5: "--" stops scanning */
+        char *argv5[] = { "prog", "--", "-a", NULL };
+        int argc5 = 3;
+        int got_a5 = 0;
+        optind = 1;
+        while ((ch = getopt(argc5, argv5, "a")) != -1) {
+            if (ch == 'a') got_a5 = 1;
+        }
+        test_result("getopt: -- stops scanning", got_a5 == 0);
+        test_result("getopt: optind after -- == 2", optind == 2);
+    }
+
+    // ========================================
+    // getopt_long tests
+    // ========================================
+    printf("\n--- getopt_long tests ---\n");
+    {
+        /* Test 1: long option without argument */
+        struct option longopts1[] = {
+            { "verbose", no_argument, NULL, 'v' },
+            { "help", no_argument, NULL, 'h' },
+            { NULL, 0, NULL, 0 }
+        };
+        char *argv1[] = { "prog", "--verbose", NULL };
+        int argc1 = 2;
+        optind = 1;
+        int longidx = -1;
+        int ch = getopt_long(argc1, argv1, "vh", longopts1, &longidx);
+        test_result("getopt_long: --verbose returns 'v'", ch == 'v');
+
+        /* Test 2: long option with required argument (= syntax) */
+        struct option longopts2[] = {
+            { "output", required_argument, NULL, 'o' },
+            { NULL, 0, NULL, 0 }
+        };
+        char *argv2[] = { "prog", "--output=file.txt", NULL };
+        int argc2 = 2;
+        optind = 1;
+        ch = getopt_long(argc2, argv2, "o:", longopts2, &longidx);
+        test_result("getopt_long: --output=file.txt returns 'o'", ch == 'o');
+        test_result("getopt_long: optarg is 'file.txt'",
+                     optarg != NULL && strcmp(optarg, "file.txt") == 0);
+
+        /* Test 3: long option with required argument (space syntax) */
+        char *argv3[] = { "prog", "--output", "result.dat", NULL };
+        int argc3 = 3;
+        optind = 1;
+        ch = getopt_long(argc3, argv3, "o:", longopts2, &longidx);
+        test_result("getopt_long: --output result.dat returns 'o'", ch == 'o');
+        test_result("getopt_long: optarg is 'result.dat'",
+                     optarg != NULL && strcmp(optarg, "result.dat") == 0);
+
+        /* Test 4: flag pointer stores value (val into *flag) */
+        int flag_val = 0;
+        struct option longopts4[] = {
+            { "debug", no_argument, &flag_val, 42 },
+            { NULL, 0, NULL, 0 }
+        };
+        char *argv4[] = { "prog", "--debug", NULL };
+        int argc4 = 2;
+        optind = 1;
+        ch = getopt_long(argc4, argv4, "", longopts4, &longidx);
+        test_result("getopt_long: flag pointer returns 0", ch == 0);
+        test_result("getopt_long: flag value set to 42", flag_val == 42);
+
+        /* Test 5: short option still works through getopt_long */
+        struct option longopts5[] = {
+            { "verbose", no_argument, NULL, 'v' },
+            { NULL, 0, NULL, 0 }
+        };
+        char *argv5[] = { "prog", "-v", NULL };
+        int argc5 = 2;
+        optind = 1;
+        ch = getopt_long(argc5, argv5, "v", longopts5, &longidx);
+        test_result("getopt_long: short -v still works", ch == 'v');
+
+        /* Test 6: mixed short and long options */
+        struct option longopts6[] = {
+            { "all", no_argument, NULL, 'a' },
+            { "long", no_argument, NULL, 'l' },
+            { NULL, 0, NULL, 0 }
+        };
+        char *argv6[] = { "prog", "-a", "--long", NULL };
+        int argc6 = 3;
+        optind = 1;
+        int got_a = 0, got_l = 0;
+        while ((ch = getopt_long(argc6, argv6, "al", longopts6, &longidx)) != -1) {
+            if (ch == 'a') got_a = 1;
+            if (ch == 'l') got_l = 1;
+        }
+        test_result("getopt_long: mixed -a --long: got 'a'", got_a == 1);
+        test_result("getopt_long: mixed -a --long: got 'l'", got_l == 1);
+
+        /* Test 7: unknown long option returns '?' */
+        struct option longopts7[] = {
+            { "known", no_argument, NULL, 'k' },
+            { NULL, 0, NULL, 0 }
+        };
+        char *argv7[] = { "prog", "--unknown", NULL };
+        int argc7 = 2;
+        optind = 1;
+        opterr = 0;  /* suppress error message */
+        ch = getopt_long(argc7, argv7, "k", longopts7, &longidx);
+        test_result("getopt_long: unknown --unknown returns '?'", ch == '?');
+        opterr = 1;
+    }
+
+    // ========================================
+    // time function tests (gmtime, mktime, strftime)
+    // ========================================
+    printf("\n--- time function tests ---\n");
+    {
+        /* Test 1: gmtime of epoch 0 */
+        time_t t0 = 0;
+        struct tm *tm0 = gmtime(&t0);
+        test_result("gmtime(0): year=1970", tm0 != NULL && tm0->tm_year == 70);
+        test_result("gmtime(0): mon=0 (Jan)", tm0 != NULL && tm0->tm_mon == 0);
+        test_result("gmtime(0): mday=1", tm0 != NULL && tm0->tm_mday == 1);
+        test_result("gmtime(0): hour=0", tm0 != NULL && tm0->tm_hour == 0);
+        test_result("gmtime(0): min=0", tm0 != NULL && tm0->tm_min == 0);
+        test_result("gmtime(0): sec=0", tm0 != NULL && tm0->tm_sec == 0);
+        test_result("gmtime(0): wday=4 (Thu)", tm0 != NULL && tm0->tm_wday == 4);
+
+        /* Test 2: gmtime of known timestamp: 2024-01-01 00:00:00 UTC = 1704067200 */
+        time_t t1 = 1704067200;
+        struct tm tm1;
+        gmtime_r(&t1, &tm1);
+        test_result("gmtime(2024-01-01): year=124", tm1.tm_year == 124);
+        test_result("gmtime(2024-01-01): mon=0", tm1.tm_mon == 0);
+        test_result("gmtime(2024-01-01): mday=1", tm1.tm_mday == 1);
+        test_result("gmtime(2024-01-01): wday=1 (Mon)", tm1.tm_wday == 1);
+
+        /* Test 3: gmtime_r known timestamp: 2000-06-15 12:30:45 UTC = 961072245 */
+        time_t t2 = 961072245;
+        struct tm tm2;
+        gmtime_r(&t2, &tm2);
+        test_result("gmtime(2000-06-15 12:30:45): year=100", tm2.tm_year == 100);
+        test_result("gmtime(2000-06-15 12:30:45): mon=5 (Jun)", tm2.tm_mon == 5);
+        test_result("gmtime(2000-06-15 12:30:45): mday=15", tm2.tm_mday == 15);
+        test_result("gmtime(2000-06-15 12:30:45): hour=12", tm2.tm_hour == 12);
+        test_result("gmtime(2000-06-15 12:30:45): min=30", tm2.tm_min == 30);
+        test_result("gmtime(2000-06-15 12:30:45): sec=45", tm2.tm_sec == 45);
+
+        /* Test 4: mktime round-trip */
+        struct tm tm_rt;
+        tm_rt.tm_year = 124;  /* 2024 */
+        tm_rt.tm_mon = 0;     /* January */
+        tm_rt.tm_mday = 1;
+        tm_rt.tm_hour = 0;
+        tm_rt.tm_min = 0;
+        tm_rt.tm_sec = 0;
+        tm_rt.tm_isdst = 0;
+        time_t rt = mktime(&tm_rt);
+        test_result("mktime(2024-01-01) == 1704067200", rt == 1704067200);
+
+        /* Test 5: mktime round-trip for 2000-06-15 12:30:45 */
+        struct tm tm_rt2;
+        tm_rt2.tm_year = 100;
+        tm_rt2.tm_mon = 5;
+        tm_rt2.tm_mday = 15;
+        tm_rt2.tm_hour = 12;
+        tm_rt2.tm_min = 30;
+        tm_rt2.tm_sec = 45;
+        tm_rt2.tm_isdst = 0;
+        time_t rt2 = mktime(&tm_rt2);
+        test_result("mktime(2000-06-15 12:30:45) == 961072245", rt2 == 961072245);
+
+        /* Test 6: strftime basic formatting */
+        char buf[128];
+        struct tm tmf;
+        tmf.tm_year = 124; tmf.tm_mon = 0; tmf.tm_mday = 15;
+        tmf.tm_hour = 9; tmf.tm_min = 5; tmf.tm_sec = 3;
+        tmf.tm_wday = 1; tmf.tm_yday = 14; tmf.tm_isdst = 0;
+
+        strftime(buf, sizeof(buf), "%Y-%m-%d", &tmf);
+        test_result("strftime %Y-%m-%d == '2024-01-15'", strcmp(buf, "2024-01-15") == 0);
+
+        strftime(buf, sizeof(buf), "%H:%M:%S", &tmf);
+        test_result("strftime %H:%M:%S == '09:05:03'", strcmp(buf, "09:05:03") == 0);
+
+        strftime(buf, sizeof(buf), "%a", &tmf);
+        test_result("strftime %a == 'Mon'", strcmp(buf, "Mon") == 0);
+
+        strftime(buf, sizeof(buf), "%b", &tmf);
+        test_result("strftime %b == 'Jan'", strcmp(buf, "Jan") == 0);
+
+        strftime(buf, sizeof(buf), "%F", &tmf);
+        test_result("strftime %F == '2024-01-15'", strcmp(buf, "2024-01-15") == 0);
+
+        strftime(buf, sizeof(buf), "%T", &tmf);
+        test_result("strftime %T == '09:05:03'", strcmp(buf, "09:05:03") == 0);
+
+        /* Test 7: leap year handling */
+        time_t t_leap = 951782400;  /* 2000-02-29 00:00:00 UTC */
+        struct tm tm_leap;
+        gmtime_r(&t_leap, &tm_leap);
+        test_result("gmtime leap year 2000-02-29: year=100", tm_leap.tm_year == 100);
+        test_result("gmtime leap year 2000-02-29: mon=1 (Feb)", tm_leap.tm_mon == 1);
+        test_result("gmtime leap year 2000-02-29: mday=29", tm_leap.tm_mday == 29);
     }
 
     // ========================================

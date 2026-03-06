@@ -112,8 +112,152 @@ static int tty_dequeue_read(tty_t* tty, char* out) {
     return 1;
 }
 
+/* ======================================================================
+ * ANSI CSI (Control Sequence Introducer) escape sequence parser
+ * Handles ESC [ Pn ; Pn ... m  (SGR – Select Graphic Rendition)
+ * Also silently consumes other CSI sequences (cursor movement, etc.)
+ * ====================================================================== */
+enum ansi_state {
+    ANSI_NORMAL = 0,
+    ANSI_ESC,       /* saw ESC (0x1B) */
+    ANSI_CSI,       /* saw ESC [ */
+};
+
+static enum ansi_state g_ansi_state = ANSI_NORMAL;
+#define ANSI_MAX_PARAMS 16
+static int  g_ansi_params[ANSI_MAX_PARAMS];
+static int  g_ansi_nparam = 0;
+static int  g_ansi_cur_param = 0;       /* accumulating current number */
+static int  g_ansi_have_digit = 0;      /* have we seen a digit for cur param? */
+
+/* Map ANSI SGR color index (0-7) to VGA palette index */
+static uint8_t ansi_to_vga_fg[8] = {
+    0,   /* 0 = black   → VGA 0  */
+    4,   /* 1 = red     → VGA 4  */
+    2,   /* 2 = green   → VGA 2  */
+    6,   /* 3 = yellow  → VGA 6 (brown) */
+    1,   /* 4 = blue    → VGA 1  */
+    5,   /* 5 = magenta → VGA 5  */
+    3,   /* 6 = cyan    → VGA 3  */
+    7,   /* 7 = white   → VGA 7 (light grey) */
+};
+
+static uint8_t g_cur_vga_fg = 15;  /* VGA_COLOR_WHITE */
+static uint8_t g_cur_vga_bg = 0;   /* VGA_COLOR_BLACK */
+static int     g_ansi_bold  = 0;
+
+static void ansi_reset_state(void) {
+    g_ansi_state = ANSI_NORMAL;
+    g_ansi_nparam = 0;
+    g_ansi_cur_param = 0;
+    g_ansi_have_digit = 0;
+}
+
+static void ansi_apply_sgr(void) {
+    /* If no params, treat as SGR 0 (reset) */
+    if (g_ansi_nparam == 0 && !g_ansi_have_digit) {
+        g_ansi_params[0] = 0;
+        g_ansi_nparam = 1;
+    } else if (g_ansi_have_digit) {
+        /* flush last accumulated param */
+        if (g_ansi_nparam < ANSI_MAX_PARAMS)
+            g_ansi_params[g_ansi_nparam++] = g_ansi_cur_param;
+    }
+    for (int i = 0; i < g_ansi_nparam; i++) {
+        int p = g_ansi_params[i];
+        if (p == 0) {
+            /* Reset */
+            g_cur_vga_fg = 15; /* white */
+            g_cur_vga_bg = 0;  /* black */
+            g_ansi_bold = 0;
+        } else if (p == 1) {
+            /* Bold / bright */
+            g_ansi_bold = 1;
+            /* If we already have a color set, make it bright */
+            if (g_cur_vga_fg < 8)
+                g_cur_vga_fg += 8;
+        } else if (p == 22) {
+            /* Normal intensity */
+            g_ansi_bold = 0;
+            if (g_cur_vga_fg >= 8 && g_cur_vga_fg <= 15)
+                g_cur_vga_fg -= 8;
+        } else if (p >= 30 && p <= 37) {
+            /* Foreground color */
+            g_cur_vga_fg = ansi_to_vga_fg[p - 30];
+            if (g_ansi_bold) g_cur_vga_fg += 8;
+        } else if (p == 39) {
+            /* Default foreground */
+            g_cur_vga_fg = g_ansi_bold ? 15 : 7;
+        } else if (p >= 40 && p <= 47) {
+            /* Background color */
+            g_cur_vga_bg = ansi_to_vga_fg[p - 40];
+        } else if (p == 49) {
+            /* Default background */
+            g_cur_vga_bg = 0;
+        } else if (p >= 90 && p <= 97) {
+            /* Bright foreground */
+            g_cur_vga_fg = ansi_to_vga_fg[p - 90] + 8;
+        } else if (p >= 100 && p <= 107) {
+            /* Bright background */
+            g_cur_vga_bg = ansi_to_vga_fg[p - 100] + 8;
+        }
+        /* Other SGR codes silently ignored */
+    }
+    console_set_color(g_cur_vga_fg, g_cur_vga_bg);
+}
+
 static void tty_output_console(tty_t* tty, char c) {
     (void)tty;
+    unsigned char ch = (unsigned char)c;
+
+    switch (g_ansi_state) {
+    case ANSI_NORMAL:
+        if (ch == 0x1B) {
+            g_ansi_state = ANSI_ESC;
+            return;
+        }
+        console_putchar(c);
+        return;
+
+    case ANSI_ESC:
+        if (ch == '[') {
+            g_ansi_state = ANSI_CSI;
+            g_ansi_nparam = 0;
+            g_ansi_cur_param = 0;
+            g_ansi_have_digit = 0;
+            return;
+        }
+        /* Not a CSI sequence — emit the ESC as-is and re-process char */
+        ansi_reset_state();
+        console_putchar(c);
+        return;
+
+    case ANSI_CSI:
+        if (ch >= '0' && ch <= '9') {
+            g_ansi_cur_param = g_ansi_cur_param * 10 + (ch - '0');
+            g_ansi_have_digit = 1;
+            return;
+        }
+        if (ch == ';') {
+            if (g_ansi_nparam < ANSI_MAX_PARAMS) {
+                g_ansi_params[g_ansi_nparam++] = g_ansi_have_digit ? g_ansi_cur_param : 0;
+            }
+            g_ansi_cur_param = 0;
+            g_ansi_have_digit = 0;
+            return;
+        }
+        /* Final byte — the command character */
+        if (ch == 'm') {
+            ansi_apply_sgr();
+        }
+        /* All other CSI sequences (cursor movement, erase, etc.)
+         * are silently consumed for now. */
+        ansi_reset_state();
+        return;
+    }
+
+    /* Fallback */
+    ansi_reset_state();
     console_putchar(c);
 }
 

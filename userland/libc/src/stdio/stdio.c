@@ -252,140 +252,241 @@ static int num_to_str(long long num, char* buf, int base, int uppercase) {
 }
 
 int vsnprintf(char* str, size_t size, const char* format, va_list ap) {
+    if (!str || size == 0) return 0;
     size_t pos = 0;
-    
+
     while (*format && pos < size - 1) {
+        if (*format != '%') {
+            str[pos++] = *format++;
+            continue;
+        }
+        format++; /* skip '%' */
+
+        /* %% */
         if (*format == '%') {
+            str[pos++] = '%';
             format++;
-            
-            // Handle %%
-            if (*format == '%') {
-                str[pos++] = '%';
-                format++;
-                continue;
-            }
-            
-            // Parse flags, width, precision (simplified)
-            int width = 0;
-            int precision = -1;
-            int long_flag = 0;
-            int long_long_flag = 0;
-            
-            // Width
+            continue;
+        }
+
+        /* --- Parse flags --- */
+        int fl_minus = 0, fl_zero = 0, fl_plus = 0, fl_space = 0, fl_hash = 0;
+        for (;;) {
+            if      (*format == '-') { fl_minus = 1; format++; }
+            else if (*format == '0') { fl_zero  = 1; format++; }
+            else if (*format == '+') { fl_plus  = 1; format++; }
+            else if (*format == ' ') { fl_space = 1; format++; }
+            else if (*format == '#') { fl_hash  = 1; format++; }
+            else break;
+        }
+        if (fl_minus) fl_zero = 0;
+
+        /* --- Width --- */
+        int width = 0;
+        if (*format == '*') {
+            width = va_arg(ap, int);
+            if (width < 0) { fl_minus = 1; width = -width; }
+            format++;
+        } else {
             while (*format >= '0' && *format <= '9') {
                 width = width * 10 + (*format - '0');
                 format++;
             }
-            
-            // Precision
-            if (*format == '.') {
-                format++;
-                precision = 0;
-                while (*format >= '0' && *format <= '9') {
-                    precision = precision * 10 + (*format - '0');
-                    format++;
-                }
-            }
-            
-            // Length modifiers
-            if (*format == 'l') {
-                format++;
-                long_flag = 1;
-                if (*format == 'l') {
-                    format++;
-                    long_long_flag = 1;
-                    long_flag = 0;
-                }
-            } else if (*format == 'z') {
-                format++;
-                long_long_flag = 1;  // size_t is 64-bit (treat as long long)
-            }
-            
-            // Conversion specifier
-            char buf[64];
-            int len = 0;
-            
-            switch (*format) {
-                case 'd':
-                case 'i': {
-                    long long val;
-                    if (long_long_flag) {
-                        val = va_arg(ap, long long);
-                    } else if (long_flag) {
-                        val = va_arg(ap, long);
-                    } else {
-                        val = va_arg(ap, int);
-                    }
-                    len = num_to_str(val, buf, 10, 0);
-                    break;
-                }
-                case 'u': {
-                    unsigned long long val;
-                    if (long_long_flag) {
-                        val = va_arg(ap, unsigned long long);
-                    } else if (long_flag) {
-                        val = va_arg(ap, unsigned long);
-                    } else {
-                        val = va_arg(ap, unsigned int);
-                    }
-                    len = num_to_str(val, buf, 10, 0);
-                    break;
-                }
-                case 'x':
-                case 'X': {
-                    unsigned long long val;
-                    if (long_long_flag) {
-                        val = va_arg(ap, unsigned long long);
-                    } else if (long_flag) {
-                        val = va_arg(ap, unsigned long);
-                    } else {
-                        val = va_arg(ap, unsigned int);
-                    }
-                    len = num_to_str(val, buf, 16, *format == 'X');
-                    break;
-                }
-                case 'p': {
-                    void* ptr = va_arg(ap, void*);
-                    str[pos++] = '0';
-                    if (pos >= size - 1) break;
-                    str[pos++] = 'x';
-                    if (pos >= size - 1) break;
-                    len = num_to_str((unsigned long long)ptr, buf, 16, 0);
-                    break;
-                }
-                case 's': {
-                    char* s = va_arg(ap, char*);
-                    if (!s) s = "(null)";
-                    while (*s && pos < size - 1) {
-                        str[pos++] = *s++;
-                    }
-                    format++;
-                    continue;
-                }
-                case 'c': {
-                    char c = (char)va_arg(ap, int);
-                    str[pos++] = c;
-                    format++;
-                    continue;
-                }
-                default:
-                    str[pos++] = *format;
-                    format++;
-                    continue;
-            }
-            
-            // Copy number to output
-            for (int i = 0; i < len && pos < size - 1; i++) {
-                str[pos++] = buf[i];
-            }
+        }
+
+        /* --- Precision --- */
+        int prec = -1;
+        if (*format == '.') {
             format++;
-        } else {
-            str[pos++] = *format++;
+            prec = 0;
+            if (*format == '*') {
+                prec = va_arg(ap, int);
+                if (prec < 0) prec = -1;
+                format++;
+            } else {
+                while (*format >= '0' && *format <= '9') {
+                    prec = prec * 10 + (*format - '0');
+                    format++;
+                }
+            }
+        }
+
+        /* --- Length modifiers --- */
+        int lng = 0;   /* 1 = long, 2 = long long */
+        if (*format == 'l') {
+            format++; lng = 1;
+            if (*format == 'l') { format++; lng = 2; }
+        } else if (*format == 'z' || *format == 'j') {
+            format++; lng = 2;
+        } else if (*format == 'h') {
+            format++;
+            if (*format == 'h') format++;
+        }
+
+        /* --- Specifier --- */
+        char buf[64];
+        int len = 0;
+
+        switch (*format) {
+
+        /* ---- signed integer ---- */
+        case 'd': case 'i': {
+            long long val;
+            if (lng == 2)      val = va_arg(ap, long long);
+            else if (lng == 1) val = va_arg(ap, long);
+            else               val = va_arg(ap, int);
+
+            char sign = 0;
+            unsigned long long uval;
+            if (val < 0) { sign = '-'; uval = (unsigned long long)(-(val + 1)) + 1; }
+            else { uval = (unsigned long long)val; if (fl_plus) sign = '+'; else if (fl_space) sign = ' '; }
+
+            len = num_to_str((long long)uval, buf, 10, 0);
+
+            int total = len + (sign ? 1 : 0);
+            int pad = (width > total) ? width - total : 0;
+
+            if (!fl_minus && !fl_zero)
+                for (int p = 0; p < pad && pos < size - 1; p++) str[pos++] = ' ';
+            if (sign && pos < size - 1) str[pos++] = sign;
+            if (!fl_minus && fl_zero)
+                for (int p = 0; p < pad && pos < size - 1; p++) str[pos++] = '0';
+            for (int i = 0; i < len && pos < size - 1; i++) str[pos++] = buf[i];
+            if (fl_minus)
+                for (int p = 0; p < pad && pos < size - 1; p++) str[pos++] = ' ';
+
+            format++;
+            continue;
+        }
+
+        /* ---- unsigned integer ---- */
+        case 'u': {
+            unsigned long long val;
+            if (lng == 2)      val = va_arg(ap, unsigned long long);
+            else if (lng == 1) val = va_arg(ap, unsigned long);
+            else               val = va_arg(ap, unsigned int);
+
+            len = num_to_str((long long)val, buf, 10, 0);
+
+            int pad = (width > len) ? width - len : 0;
+            if (!fl_minus) {
+                char pc = fl_zero ? '0' : ' ';
+                for (int p = 0; p < pad && pos < size - 1; p++) str[pos++] = pc;
+            }
+            for (int i = 0; i < len && pos < size - 1; i++) str[pos++] = buf[i];
+            if (fl_minus)
+                for (int p = 0; p < pad && pos < size - 1; p++) str[pos++] = ' ';
+
+            format++;
+            continue;
+        }
+
+        /* ---- hex ---- */
+        case 'x': case 'X': {
+            unsigned long long val;
+            if (lng == 2)      val = va_arg(ap, unsigned long long);
+            else if (lng == 1) val = va_arg(ap, unsigned long);
+            else               val = va_arg(ap, unsigned int);
+
+            len = num_to_str((long long)val, buf, 16, *format == 'X');
+            int pfx = (fl_hash && val != 0) ? 2 : 0;
+            int total = len + pfx;
+            int pad = (width > total) ? width - total : 0;
+
+            if (!fl_minus) {
+                if (fl_zero) {
+                    if (pfx) { if (pos < size-1) str[pos++]='0'; if (pos < size-1) str[pos++]=(*format=='X'?'X':'x'); }
+                    for (int p=0; p<pad && pos<size-1; p++) str[pos++]='0';
+                } else {
+                    for (int p=0; p<pad && pos<size-1; p++) str[pos++]=' ';
+                    if (pfx) { if (pos < size-1) str[pos++]='0'; if (pos < size-1) str[pos++]=(*format=='X'?'X':'x'); }
+                }
+            } else {
+                if (pfx) { if (pos < size-1) str[pos++]='0'; if (pos < size-1) str[pos++]=(*format=='X'?'X':'x'); }
+            }
+            for (int i=0; i<len && pos<size-1; i++) str[pos++]=buf[i];
+            if (fl_minus)
+                for (int p=0; p<pad && pos<size-1; p++) str[pos++]=' ';
+
+            format++;
+            continue;
+        }
+
+        /* ---- octal ---- */
+        case 'o': {
+            unsigned long long val;
+            if (lng == 2)      val = va_arg(ap, unsigned long long);
+            else if (lng == 1) val = va_arg(ap, unsigned long);
+            else               val = va_arg(ap, unsigned int);
+
+            len = num_to_str((long long)val, buf, 8, 0);
+
+            int pad = (width > len) ? width - len : 0;
+            if (!fl_minus) {
+                char pc = fl_zero ? '0' : ' ';
+                for (int p=0; p<pad && pos<size-1; p++) str[pos++]=pc;
+            }
+            for (int i=0; i<len && pos<size-1; i++) str[pos++]=buf[i];
+            if (fl_minus)
+                for (int p=0; p<pad && pos<size-1; p++) str[pos++]=' ';
+
+            format++;
+            continue;
+        }
+
+        /* ---- pointer ---- */
+        case 'p': {
+            void* ptr = va_arg(ap, void*);
+            if (pos < size-1) str[pos++] = '0';
+            if (pos < size-1) str[pos++] = 'x';
+            len = num_to_str((long long)(unsigned long long)(unsigned long)ptr, buf, 16, 0);
+            for (int i=0; i<len && pos<size-1; i++) str[pos++]=buf[i];
+            format++;
+            continue;
+        }
+
+        /* ---- string ---- */
+        case 's': {
+            char* s = va_arg(ap, char*);
+            if (!s) s = "(null)";
+            int slen = 0;
+            while (s[slen]) slen++;
+            if (prec >= 0 && prec < slen) slen = prec;
+            int pad = (width > slen) ? width - slen : 0;
+
+            if (!fl_minus)
+                for (int p=0; p<pad && pos<size-1; p++) str[pos++]=' ';
+            for (int i=0; i<slen && pos<size-1; i++) str[pos++]=s[i];
+            if (fl_minus)
+                for (int p=0; p<pad && pos<size-1; p++) str[pos++]=' ';
+
+            format++;
+            continue;
+        }
+
+        /* ---- character ---- */
+        case 'c': {
+            char c = (char)va_arg(ap, int);
+            int pad = (width > 1) ? width - 1 : 0;
+            if (!fl_minus)
+                for (int p=0; p<pad && pos<size-1; p++) str[pos++]=' ';
+            if (pos < size-1) str[pos++] = c;
+            if (fl_minus)
+                for (int p=0; p<pad && pos<size-1; p++) str[pos++]=' ';
+            format++;
+            continue;
+        }
+
+        /* ---- unknown ---- */
+        default:
+            if (pos < size-1) str[pos++] = *format;
+            format++;
+            continue;
         }
     }
-    
+
     str[pos] = '\0';
-    return pos;
+    return (int)pos;
 }
 
 int snprintf(char* str, size_t size, const char* format, ...) {

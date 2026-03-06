@@ -4,6 +4,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/dirent.h"
+#include "../../include/kernel/timer.h"
 
 #define DEVFS_TYPE_TTY       1
 #define DEVFS_TYPE_PTY_MASTER 2
@@ -167,19 +168,29 @@ int devfs_open(const char* path, int flags, vfs_file_t** out) {
 int devfs_stat(const char* path, struct kstat* st) {
     if (!path || !st) return ST_INVALID;
     mm_memset(st, 0, sizeof(*st));
+    uint64_t now = timer_get_epoch();  /* real wall-clock seconds */
     if (is_path(path, "/dev") || is_path(path, "/dev/") || is_path(path, "/dev/pts") || is_path(path, "/dev/pts/")) {
-        st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
         st->st_nlink = 1;
+        st->st_atime = now;
+        st->st_mtime = now;
+        st->st_ctime = now;
         return ST_OK;
     }
     if (is_path(path, "/dev/tty") || is_path(path, "/dev/console") || is_path(path, "/dev/tty0") || is_path(path, "/dev/ptmx")) {
         st->st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
         st->st_nlink = 1;
+        st->st_atime = now;
+        st->st_mtime = now;
+        st->st_ctime = now;
         return ST_OK;
     }
     if (is_prefix(path, "/dev/pts/")) {
         st->st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
         st->st_nlink = 1;
+        st->st_atime = now;
+        st->st_mtime = now;
+        st->st_ctime = now;
         return ST_OK;
     }
     return ST_NOT_FOUND;

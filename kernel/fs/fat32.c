@@ -7,6 +7,7 @@
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/dirent.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/timer.h"
 
 // Spinlock for FAT32 filesystem access
 static spinlock_t fat32_lock = SPINLOCK_INIT("fat32");
@@ -1632,11 +1633,42 @@ int fat32_dir_list(unsigned long cluster, void (*cb)(const char *, unsigned, uns
     return fat32_dir_list_internal(cluster, cb, 0);
 }
 
+/* Convert FAT32 date/time to Unix epoch seconds.
+ * Date: bits 15-9 = year-1980, 8-5 = month(1-12), 4-0 = day(1-31)
+ * Time: bits 15-11 = hours, 10-5 = minutes, 4-0 = seconds/2 */
+static uint64_t fat32_datetime_to_epoch(uint16_t date, uint16_t time_val)
+{
+    if (date == 0) return 0;
+    int year  = ((date >> 9) & 0x7F) + 1980;
+    int month = (date >> 5) & 0x0F;
+    int day   = date & 0x1F;
+    int hour  = (time_val >> 11) & 0x1F;
+    int min   = (time_val >> 5) & 0x3F;
+    int sec   = (time_val & 0x1F) * 2;
+    if (month < 1) month = 1;
+    if (day < 1) day = 1;
+    static const int mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+    uint64_t days = 0;
+    for (int y = 1970; y < year; y++) {
+        int lp = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+        days += lp ? 366 : 365;
+    }
+    int leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+    for (int m = 1; m < month && m <= 12; m++) {
+        days += mdays[m];
+        if (m == 2 && leap) days++;
+    }
+    days += day - 1;
+    return days * 86400 + (uint64_t)hour * 3600 + (uint64_t)min * 60 + sec;
+}
+
 // Lock-free core of fat32_dir_find — caller must hold fat32_lock or ensure
 // exclusive access.  Used by internal helpers (fat32_resolve_parent, etc.)
 // that are already called under fat32_lock.
+// out_wrt_time/out_wrt_date are optional — pass NULL if not needed.
 static int fat32_dir_find_nolock(unsigned long start_cluster, const char *name,
-    unsigned *attr, unsigned long *first_cluster, unsigned long *size)
+    unsigned *attr, unsigned long *first_cluster, unsigned long *size,
+    uint16_t *out_wrt_time, uint16_t *out_wrt_date)
 {
     if (!g_root_fs || !name)
         return ST_INVALID;
@@ -1755,6 +1787,10 @@ static int fat32_dir_find_nolock(unsigned long start_cluster, const char *name,
                     *first_cluster = ((unsigned long)ents[i].fstClusHI << 16) | ents[i].fstClusLO;
                 if (size)
                     *size = ents[i].fileSize;
+                if (out_wrt_time)
+                    *out_wrt_time = ents[i].wrtTime;
+                if (out_wrt_date)
+                    *out_wrt_date = ents[i].wrtDate;
                 kfree(buf);
                 return ST_OK;
             }
@@ -1776,7 +1812,7 @@ int fat32_dir_find(unsigned long start_cluster, const char *name, unsigned *attr
 {
     uint64_t flags;
     spin_lock_irqsave(&fat32_lock, &flags);
-    int ret = fat32_dir_find_nolock(start_cluster, name, attr, first_cluster, size);
+    int ret = fat32_dir_find_nolock(start_cluster, name, attr, first_cluster, size, NULL, NULL);
     spin_unlock_irqrestore(&fat32_lock, flags);
     return ret;
 }
@@ -1804,7 +1840,7 @@ static int fat32_path_resolve(const char *path, unsigned *attr,
         unsigned a;
         unsigned long fc;
         unsigned long sz;
-        if (fat32_dir_find_nolock(current, part, &a, &fc, &sz) != ST_OK)
+        if (fat32_dir_find_nolock(current, part, &a, &fc, &sz, NULL, NULL) != ST_OK)
             return ST_NOT_FOUND;
         if (*seg == '/') {
             if (!(a & FAT32_ATTR_DIRECTORY))
@@ -1880,7 +1916,7 @@ int fat32_resolve_path(unsigned long start_cluster, const char *path, unsigned *
             unsigned a;
             unsigned long fc;
             unsigned long sz;
-            if (fat32_dir_find_nolock(current, part, &a, &fc, &sz) != ST_OK)
+            if (fat32_dir_find_nolock(current, part, &a, &fc, &sz, NULL, NULL) != ST_OK)
                 return ST_NOT_FOUND;
             if (*seg == '/') {
                 if (!(a & FAT32_ATTR_DIRECTORY))
@@ -2002,7 +2038,7 @@ static int fat32_resolve_parent(unsigned long start_cluster, const char *path,
             unsigned a;
             unsigned long fc;
             unsigned long sz;
-            if (fat32_dir_find_nolock(current, part, &a, &fc, &sz) != ST_OK)
+            if (fat32_dir_find_nolock(current, part, &a, &fc, &sz, NULL, NULL) != ST_OK)
                 return ST_NOT_FOUND;
             if (!(a & FAT32_ATTR_DIRECTORY))
                 return ST_INVALID;
@@ -2255,6 +2291,63 @@ static int fat32_stat_vfs(const char* path, struct kstat* st)
     } else {
         st->st_mode = S_IFREG | (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
     }
+
+    /* Extract FAT32 timestamps for non-root entries */
+    if (rpath[0] != '\0') {
+        /* Find parent directory cluster and final component name */
+        const char *last_slash = 0;
+        for (const char *p = rpath; *p; p++)
+            if (*p == '/') last_slash = p;
+
+        unsigned long parent_cluster;
+        char final_name[256];
+
+        if (!last_slash) {
+            /* Single component: parent is start_cluster */
+            parent_cluster = start_cluster;
+            int i;
+            for (i = 0; rpath[i] && i < 255; i++)
+                final_name[i] = rpath[i];
+            final_name[i] = '\0';
+        } else {
+            /* Multi-component: resolve parent path to get parent cluster */
+            char parent_path[512];
+            int plen = (int)(last_slash - rpath);
+            for (int i = 0; i < plen && i < 511; i++)
+                parent_path[i] = rpath[i];
+            parent_path[plen] = '\0';
+
+            unsigned pattr;
+            unsigned long pfc;
+            unsigned long psz;
+            if (fat32_resolve_path(start_cluster, parent_path, &pattr, &pfc, &psz) == ST_OK) {
+                parent_cluster = pfc;
+            } else {
+                parent_cluster = start_cluster;
+            }
+            const char *fn = last_slash + 1;
+            int i;
+            for (i = 0; fn[i] && i < 255; i++)
+                final_name[i] = fn[i];
+            final_name[i] = '\0';
+        }
+
+        /* Look up the entry to get write timestamp */
+        uint16_t wrt_time = 0, wrt_date = 0;
+        if (fat32_dir_find_nolock(parent_cluster, final_name, 0, 0, 0, &wrt_time, &wrt_date) == ST_OK) {
+            uint64_t epoch = fat32_datetime_to_epoch(wrt_date, wrt_time);
+            st->st_mtime = epoch;
+            st->st_atime = epoch;
+            st->st_ctime = epoch;
+        }
+    } else {
+        /* Root directory has no parent entry — use current wall-clock time */
+        uint64_t now = timer_get_epoch();
+        st->st_mtime = now;
+        st->st_atime = now;
+        st->st_ctime = now;
+    }
+
     return ST_OK;
 }
 

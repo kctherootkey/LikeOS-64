@@ -996,8 +996,7 @@ static int64_t sys_uname(uint64_t buf) {
 }
 
 static int64_t sys_time(uint64_t tloc) {
-    uint64_t ticks = timer_ticks();
-    uint64_t sec = ticks / 100;
+    uint64_t sec = timer_get_epoch();
     if (tloc && validate_user_ptr(tloc, sizeof(uint64_t))) {
         copy_to_user((void*)tloc, &sec, sizeof(sec));
     }
@@ -1009,7 +1008,7 @@ static int64_t sys_gettimeofday(uint64_t tv, uint64_t tz) {
     if (!validate_user_ptr(tv, sizeof(k_timeval_t))) return -EFAULT;
     uint64_t ticks = timer_ticks();
     k_timeval_t kv;
-    kv.tv_sec = (long)(ticks / 100);
+    kv.tv_sec = (long)timer_get_epoch();
     kv.tv_usec = (long)((ticks % 100) * 10000);
     if (copy_to_user((void*)tv, &kv, sizeof(kv)) < 0) {
         return -EFAULT;
@@ -2697,11 +2696,13 @@ static int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr) {
     
     switch (clk_id) {
         case 0:  // CLOCK_REALTIME
-        case 1:  // CLOCK_MONOTONIC
-            // Both return monotonic time from boot (no RTC for real time)
-            // 100 Hz timer = 10ms per tick
-            tp.tv_sec = ticks / 100;
+            tp.tv_sec = timer_get_epoch();
             tp.tv_nsec = (ticks % 100) * 10000000;  // 10ms = 10,000,000 ns
+            break;
+        case 1:  // CLOCK_MONOTONIC
+            // Monotonic = uptime from boot
+            tp.tv_sec = ticks / 100;
+            tp.tv_nsec = (ticks % 100) * 10000000;
             break;
         case 2:  // CLOCK_PROCESS_CPUTIME_ID
         case 3:  // CLOCK_THREAD_CPUTIME_ID

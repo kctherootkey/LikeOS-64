@@ -19,7 +19,7 @@ CRT1 = $(LIBC_DIR)/crt1.o
 LIBS = -lc -l:ld-likeos.so
 
 # Programs
-PROGRAMS = test_syscalls test_libc hello sh ls cat pwd stat progerr testmem memstat teststress
+PROGRAMS = test_syscalls test_libc hello sh ls cat pwd stat progerr testmem memstat teststress uname
 
 all: $(PROGRAMS)
 
