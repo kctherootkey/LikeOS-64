@@ -142,22 +142,19 @@ void continue_system_startup(void) {
     kprintf("SMP: %u CPU(s) online\n", smp_get_cpu_count());
 
     timer_init(100);
-    timer_start();
 
-    // Detect whether PIT (IRQ0) is reaching the BSP now that the LAPIC
-    // is active.  QEMU delivers PIT via virtual wire (PIC→LINT0) fine,
-    // but VMware stops PIT delivery, expecting I/O APIC routing.
-    // If no PIT tick arrives within a brief spin, switch to LAPIC timer.
+    // Use LAPIC timer when available — it was already calibrated in smp_init()
+    // and is 100% reliable on all platforms (QEMU, VMware, bare metal).
+    // PIT delivery via virtual wire (ExtINT→LINT0) is unreliable: VMware
+    // may deliver it sporadically (just enough to pass a tick-detection test,
+    // then nearly stop), causing g_ticks to crawl and all sleeps to hang.
     if (lapic_is_available()) {
-        uint64_t t0 = timer_ticks();
-        for (volatile int i = 0; i < 10000000; i++) {
-            if (timer_ticks() != t0) break;
-        }
-        if (timer_ticks() == t0) {
-            irq_disable(0);
-            lapic_timer_start(100);
-            kprintf("Timer: PIT not delivering, using LAPIC timer at 100 Hz\n");
-        }
+        lapic_timer_start(100);
+        kprintf("Timer: using LAPIC timer at 100 Hz\n");
+    } else {
+        // No LAPIC — legacy PIT IRQ0 (old hardware / single-CPU)
+        timer_start();
+        kprintf("Timer: using PIT at 100 Hz\n");
     }
 
     shell_init();

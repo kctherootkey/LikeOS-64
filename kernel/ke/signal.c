@@ -827,15 +827,16 @@ int timer_settime_internal(ktimer_t timerid, int flags,
     if (new_value) {
         mm_memcpy(&kt->spec, new_value, sizeof(struct k_itimerspec));
         
-        // Calculate next expiration in ticks (100Hz = 10ms per tick)
+        // Calculate next expiration in ticks using measured frequency
+        uint32_t freq = timer_get_frequency();
         uint64_t current = timer_ticks();
         uint64_t nsec = new_value->it_value.tv_sec * 1000000000ULL + new_value->it_value.tv_nsec;
-        uint64_t ticks = nsec / 10000000;  // 10ms per tick
+        uint64_t ticks = nsec * freq / 1000000000ULL;
         kt->next_tick = current + ticks;
         
         // Calculate interval
         nsec = new_value->it_interval.tv_sec * 1000000000ULL + new_value->it_interval.tv_nsec;
-        kt->interval_ticks = nsec / 10000000;
+        kt->interval_ticks = nsec * freq / 1000000000ULL;
         
         kt->overrun = 0;
     }
@@ -858,7 +859,7 @@ int timer_gettime_internal(ktimer_t timerid, struct k_itimerspec* curr_value) {
         // Calculate remaining time
         uint64_t current = timer_ticks();
         if (kt->next_tick > current) {
-            uint64_t remaining = (kt->next_tick - current) * 10000000;  // ns
+            uint64_t remaining = (kt->next_tick - current) * (1000000000ULL / timer_get_frequency());
             curr_value->it_value.tv_sec = remaining / 1000000000ULL;
             curr_value->it_value.tv_nsec = remaining % 1000000000ULL;
         } else {

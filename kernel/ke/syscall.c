@@ -1008,9 +1008,10 @@ static int64_t sys_gettimeofday(uint64_t tv, uint64_t tz) {
     (void)tz;
     if (!validate_user_ptr(tv, sizeof(k_timeval_t))) return -EFAULT;
     uint64_t ticks = timer_ticks();
+    uint32_t freq = timer_get_frequency();
     k_timeval_t kv;
     kv.tv_sec = (long)timer_get_epoch();
-    kv.tv_usec = (long)((ticks % 100) * 10000);
+    kv.tv_usec = (long)((ticks % freq) * (1000000 / freq));
     if (copy_to_user((void*)tv, &kv, sizeof(kv)) < 0) {
         return -EFAULT;
     }
@@ -2243,7 +2244,8 @@ static int64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr, uint64_t
         if (copy_from_user(&timeout, (void*)timeout_ptr, sizeof(struct k_timespec)) != 0) {
             return -EFAULT;
         }
-        uint64_t ticks = timeout.tv_sec * 100 + timeout.tv_nsec / 10000000;
+        uint32_t freq = timer_get_frequency();
+        uint64_t ticks = timeout.tv_sec * freq + (uint64_t)timeout.tv_nsec * freq / 1000000000ULL;
         deadline = timer_ticks() + ticks;
     }
     
@@ -2458,16 +2460,17 @@ static int64_t sys_alarm(uint64_t seconds) {
     uint64_t old_remaining = 0;
     
     // Calculate remaining time from old alarm
+    uint32_t freq = timer_get_frequency();
     if (cur->signals.alarm_ticks > 0) {
         uint64_t now = timer_ticks();
         if (cur->signals.alarm_ticks > now) {
-            old_remaining = (cur->signals.alarm_ticks - now) / 100;  // ticks to seconds
+            old_remaining = (cur->signals.alarm_ticks - now) / freq;
         }
     }
     
     // Set new alarm
     if (seconds > 0) {
-        cur->signals.alarm_ticks = timer_ticks() + seconds * 100;  // 100 Hz
+        cur->signals.alarm_ticks = timer_ticks() + seconds * freq;
     } else {
         cur->signals.alarm_ticks = 0;  // Cancel
     }
@@ -2647,8 +2650,9 @@ static int64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr) {
         return -EFAULT;
     }
     
-    // Calculate ticks to sleep (100 Hz = 10ms per tick)
-    uint64_t ticks = req.tv_sec * 100 + req.tv_nsec / 10000000;
+    // Calculate ticks to sleep using measured timer frequency
+    uint32_t freq = timer_get_frequency();
+    uint64_t ticks = req.tv_sec * freq + (uint64_t)req.tv_nsec * freq / 1000000000ULL;
     if (ticks == 0 && (req.tv_sec > 0 || req.tv_nsec > 0)) {
         ticks = 1;  // At least 1 tick for any non-zero sleep
     }
@@ -2665,8 +2669,8 @@ static int64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr) {
                 uint64_t elapsed = now - start;
                 uint64_t remaining = (elapsed < ticks) ? ticks - elapsed : 0;
                 struct k_timespec rem;
-                rem.tv_sec = remaining / 100;
-                rem.tv_nsec = (remaining % 100) * 10000000;
+                rem.tv_sec = remaining / freq;
+                rem.tv_nsec = (uint64_t)(remaining % freq) * 1000000000ULL / freq;
                 copy_to_user((void*)rem_ptr, &rem, sizeof(struct k_timespec));
             }
             cur->wakeup_tick = 0;
@@ -2695,21 +2699,22 @@ static int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr) {
     struct k_timespec tp;
     uint64_t ticks = timer_ticks();
     
+    uint32_t freq = timer_get_frequency();
     switch (clk_id) {
         case 0:  // CLOCK_REALTIME
             tp.tv_sec = timer_get_epoch();
-            tp.tv_nsec = (ticks % 100) * 10000000;  // 10ms = 10,000,000 ns
+            tp.tv_nsec = (uint64_t)(ticks % freq) * 1000000000ULL / freq;
             break;
         case 1:  // CLOCK_MONOTONIC
             // Monotonic = uptime from boot
-            tp.tv_sec = ticks / 100;
-            tp.tv_nsec = (ticks % 100) * 10000000;
+            tp.tv_sec = ticks / freq;
+            tp.tv_nsec = (uint64_t)(ticks % freq) * 1000000000ULL / freq;
             break;
         case 2:  // CLOCK_PROCESS_CPUTIME_ID
         case 3:  // CLOCK_THREAD_CPUTIME_ID
             // Simplified: return same as monotonic for now
-            tp.tv_sec = ticks / 100;
-            tp.tv_nsec = (ticks % 100) * 10000000;
+            tp.tv_sec = ticks / freq;
+            tp.tv_nsec = (uint64_t)(ticks % freq) * 1000000000ULL / freq;
             break;
         default:
             return -EINVAL;
@@ -2734,9 +2739,9 @@ static int64_t sys_clock_getres(uint64_t clk_id, uint64_t res_ptr) {
         }
         
         struct k_timespec res;
-        // 100 Hz timer = 10ms resolution
+        // Resolution = 1 tick in nanoseconds
         res.tv_sec = 0;
-        res.tv_nsec = 10000000;  // 10ms
+        res.tv_nsec = 1000000000 / timer_get_frequency();
         
         if (copy_to_user((void*)res_ptr, &res, sizeof(res)) != 0) {
             return -EFAULT;

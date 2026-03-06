@@ -19,6 +19,8 @@ void timer_start(void);
 void timer_stop(void);
 uint64_t timer_ticks(void);
 uint64_t timer_get_epoch(void);
+uint32_t timer_get_frequency(void);
+void timer_calibrate_frequency(void);
 void timer_irq_handler(void);
 
 #endif // _KERNEL_TIMER_H_

@@ -227,32 +227,36 @@ void lapic_init(void) {
 // ============================================================================
 
 void lapic_timer_calibrate(void) {
-    // Use PIT to calibrate LAPIC timer
-    // We'll count LAPIC ticks over a known PIT interval
+    // Calibrate LAPIC timer by counting LAPIC ticks over a known PIT ch2 interval.
+    // We use a 100ms window (10x the old 10ms) to reduce the multiplication
+    // factor and improve accuracy.  PIT channel 2 (one-shot, ports 0x42/0x43/0x61)
+    // is independent of channel 0 (IRQ0) and works reliably in all environments.
+    //
+    // IMPORTANT: This must be called on the BSP *before* starting APs so the
+    // result is cached and APs never need to calibrate (no contention).
     
-    smp_dbg("LAPIC: Calibrating timer...\n");
+    smp_dbg("LAPIC: Calibrating timer via PIT ch2 (100ms)...\n");
     
     // Set up LAPIC timer with divide by 16
     lapic_write(LAPIC_TIMER_DCR, LAPIC_TIMER_DIV_16);
     
-    // Set initial count to max and start timer in one-shot mode
+    // Set initial count to max and start timer in one-shot mode (masked)
     lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED | LAPIC_TIMER_ONESHOT);
     lapic_write(LAPIC_TIMER_ICR, 0xFFFFFFFF);
     
-    // Wait 10ms using PIT
-    pit_delay_ms(10);
+    // Wait 100ms using PIT channel 2
+    pit_delay_ms(100);
     
-    // Read current count
+    // Read how many LAPIC ticks elapsed
     uint32_t elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CCR);
     
     // Stop timer
     lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
     
-    // Calculate frequency (ticks per second)
-    // elapsed ticks / 10ms = elapsed * 100 ticks per second
-    lapic_timer_freq = (uint64_t)elapsed * 100;
+    // Calculate frequency: elapsed ticks in 100ms → ticks per second
+    lapic_timer_freq = (uint64_t)elapsed * 10;
     
-    smp_dbg("LAPIC: Timer frequency = %lu Hz (elapsed=%u in 10ms)\n", 
+    smp_dbg("LAPIC: Timer frequency = %lu Hz (elapsed=%u in 100ms)\n", 
             lapic_timer_freq, elapsed);
 }
 

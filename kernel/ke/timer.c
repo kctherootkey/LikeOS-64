@@ -130,6 +130,60 @@ uint64_t timer_get_epoch(void) {
     return g_boot_epoch + g_ticks / g_frequency;
 }
 
+uint32_t timer_get_frequency(void) {
+    return g_frequency;
+}
+
+/*
+ * Calibrate the actual timer frequency by measuring ticks between two
+ * CMOS RTC second boundaries.  This corrects for inaccurate LAPIC timer
+ * calibration that can happen in virtual machines (e.g. VMware).
+ *
+ * Must be called AFTER the timer interrupt is running (PIT or LAPIC).
+ * Takes ~2 seconds (waits for two RTC second transitions).
+ */
+void timer_calibrate_frequency(void) {
+    /* Wait for the RTC to NOT be updating */
+    while (cmos_is_updating())
+        ;
+    uint8_t prev_sec = cmos_read(0x00);
+
+    /* Wait for the second to change (first boundary) */
+    for (;;) {
+        while (cmos_is_updating())
+            ;
+        uint8_t cur_sec = cmos_read(0x00);
+        if (cur_sec != prev_sec)
+            break;
+    }
+    uint64_t t0 = g_ticks;
+
+    /* Wait for the second to change again (second boundary = exactly 1s later) */
+    uint8_t boundary_sec;
+    while (cmos_is_updating())
+        ;
+    boundary_sec = cmos_read(0x00);
+    for (;;) {
+        while (cmos_is_updating())
+            ;
+        uint8_t cur_sec = cmos_read(0x00);
+        if (cur_sec != boundary_sec)
+            break;
+    }
+    uint64_t t1 = g_ticks;
+
+    uint64_t measured = t1 - t0;
+    if (measured >= 10 && measured <= 10000) {
+        /* Sane range — accept the measurement */
+        g_frequency = (uint32_t)measured;
+        kprintf("Timer: calibrated frequency = %u Hz (was 100 Hz nominal)\n",
+                g_frequency);
+    } else {
+        kprintf("Timer: calibration out of range (%lu ticks/sec), keeping %u Hz\n",
+                (unsigned long)measured, g_frequency);
+    }
+}
+
 void timer_init(uint32_t frequency_hz) {
     if (frequency_hz < 19 || frequency_hz > 1193182) {
         frequency_hz = 100; // Clamp to safe default

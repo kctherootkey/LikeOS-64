@@ -226,6 +226,12 @@ void smp_init(uint64_t trampoline_addr) {
     // Initialize BSP's LAPIC
     lapic_init();
     
+    // Calibrate LAPIC timer on BSP before starting any APs.
+    // This populates the global lapic_timer_freq so that APs simply
+    // reuse the cached value — no per-AP calibration, no CMOS/PIT
+    // contention, no races.
+    lapic_timer_calibrate();
+    
     // Update BSP's per-CPU data with APIC ID
     percpu_t* bsp = this_cpu();
     bsp->apic_id = lapic_get_id();
