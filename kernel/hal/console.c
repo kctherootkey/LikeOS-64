@@ -505,7 +505,9 @@ void console_init(framebuffer_info_t* fb) {
     current_vga_fg = VGA_COLOR_WHITE;
     current_vga_bg = VGA_COLOR_BLACK;
     // Initialize serial console early so kprintf mirrors to QEMU if present
+#ifdef SERIAL_ENABLED
     serial_init();
+#endif
     
     if (fb_info) {
         // Calculate text area width (exclude scrollbar area)
@@ -640,6 +642,120 @@ void console_clear(void) {
     g_sb.at_bottom = 1;
 }
 
+// Set cursor position (0-based row, col)
+void console_set_cursor_pos(uint32_t row, uint32_t col) {
+    if (!fb_info) return;
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
+
+    // Hide cursor at old position
+    if (cursor_enabled && cursor_shown) {
+        draw_cursor_at(cursor_x, cursor_y, 0);
+    }
+
+    if (row >= max_rows) row = max_rows - 1;
+    if (col >= max_cols) col = max_cols - 1;
+    cursor_y = row;
+    cursor_x = col;
+
+    // Ensure viewport is at bottom for subsequent output
+    g_sb.at_bottom = 1;
+
+    spin_unlock_irqrestore(&console_lock, flags);
+}
+
+void console_get_cursor_pos(uint32_t *row, uint32_t *col) {
+    if (row) *row = cursor_y;
+    if (col) *col = cursor_x;
+}
+
+// Erase display: 0=from cursor to end, 1=from start to cursor, 2=entire screen
+void console_erase_display(int mode) {
+    if (!fb_info || !fb_info->framebuffer_base) return;
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
+
+    uint32_t sb_total_w = SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
+    uint32_t text_w = (fb_info->horizontal_resolution > sb_total_w)
+                     ? (fb_info->horizontal_resolution - sb_total_w) : 0;
+    uint32_t scr_h = fb_info->vertical_resolution;
+
+    // Hide cursor before erasing
+    if (cursor_enabled && cursor_shown)
+        draw_cursor_at(cursor_x, cursor_y, 0);
+
+    if (mode == 2) {
+        // Erase entire screen
+        fb_fill_rect(0, 0, text_w, scr_h, bg_color);
+        cursor_x = 0;
+        cursor_y = 0;
+    } else if (mode == 0) {
+        // Erase from cursor to end: rest of current line + all lines below
+        uint32_t y = cursor_y * CHAR_HEIGHT;
+        uint32_t x = cursor_x * CHAR_WIDTH;
+        // Clear rest of current line
+        if (x < text_w)
+            fb_fill_rect(x, y, text_w - x, CHAR_HEIGHT, bg_color);
+        // Clear all lines below
+        uint32_t below_y = (cursor_y + 1) * CHAR_HEIGHT;
+        if (below_y < scr_h)
+            fb_fill_rect(0, below_y, text_w, scr_h - below_y, bg_color);
+    } else if (mode == 1) {
+        // Erase from start to cursor: all lines above + start of current line
+        uint32_t y = cursor_y * CHAR_HEIGHT;
+        if (y > 0)
+            fb_fill_rect(0, 0, text_w, y, bg_color);
+        // Clear start of current line up to cursor
+        uint32_t x = (cursor_x + 1) * CHAR_WIDTH;
+        if (x > text_w) x = text_w;
+        fb_fill_rect(0, y, x, CHAR_HEIGHT, bg_color);
+    }
+
+    fb_flush_dirty_regions();
+    g_sb.at_bottom = 1;
+
+    spin_unlock_irqrestore(&console_lock, flags);
+}
+
+// Erase line: 0=from cursor to end, 1=from start to cursor, 2=entire line
+void console_erase_line(int mode) {
+    if (!fb_info || !fb_info->framebuffer_base) return;
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
+
+    uint32_t sb_total_w = SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
+    uint32_t text_w = (fb_info->horizontal_resolution > sb_total_w)
+                     ? (fb_info->horizontal_resolution - sb_total_w) : 0;
+    uint32_t y = cursor_y * CHAR_HEIGHT;
+
+    if (cursor_enabled && cursor_shown)
+        draw_cursor_at(cursor_x, cursor_y, 0);
+
+    if (mode == 2) {
+        // Erase entire line
+        fb_fill_rect(0, y, text_w, CHAR_HEIGHT, bg_color);
+    } else if (mode == 0) {
+        // Erase from cursor to end
+        uint32_t x = cursor_x * CHAR_WIDTH;
+        if (x < text_w)
+            fb_fill_rect(x, y, text_w - x, CHAR_HEIGHT, bg_color);
+    } else if (mode == 1) {
+        // Erase from start to cursor
+        uint32_t x = (cursor_x + 1) * CHAR_WIDTH;
+        if (x > text_w) x = text_w;
+        fb_fill_rect(0, y, x, CHAR_HEIGHT, bg_color);
+    }
+
+    fb_flush_dirty_regions();
+
+    spin_unlock_irqrestore(&console_lock, flags);
+}
+
+void console_get_dimensions(uint32_t *rows, uint32_t *cols) {
+    if (rows) *rows = max_rows;
+    if (cols) *cols = max_cols;
+}
+
 void console_set_prompt_guard(void) {
     console_line_t* line = sb_current_line();
     g_prompt_guard_len = line ? line->length : 0;
@@ -717,9 +833,11 @@ void console_set_color(uint8_t fg, uint8_t bg) {
 static void console_putchar_unlocked(char c) {
     if (!fb_info) return;
     // Mirror to serial (if present) before screen updates
+#ifdef SERIAL_ENABLED
     if (serial_is_available()) {
         serial_write_char(c);
     }
+#endif
     
     // Fast path drawing when at bottom; otherwise only update scrollback/scrollbar
     if (c == '\n') {
@@ -730,12 +848,17 @@ static void console_putchar_unlocked(char c) {
                 draw_cursor_at(cursor_x, cursor_y, 0);
             }
             cursor_x = 0;
-            // Hide cursor, scroll text area, sync scrollbar, show cursor
-            mouse_show_cursor(0);
-            console_scroll_up();
-            console_sync_scrollbar();
-            fb_flush_dirty_regions();
-            mouse_show_cursor(1);
+            if (cursor_y >= max_rows - 1) {
+                // At bottom of screen: scroll up
+                mouse_show_cursor(0);
+                console_scroll_up();
+                console_sync_scrollbar();
+                fb_flush_dirty_regions();
+                mouse_show_cursor(1);
+            } else {
+                // Not at bottom: just move cursor down
+                cursor_y++;
+            }
         } else {
             console_sync_scrollbar();
         }
@@ -771,7 +894,11 @@ static void console_putchar_unlocked(char c) {
                 if (cursor_x >= max_cols) {
                     // wrap
                     cursor_x = 0;
-                    console_scroll_up();
+                    if (cursor_y >= max_rows - 1) {
+                        console_scroll_up();
+                    } else {
+                        cursor_y++;
+                    }
                 }
                 draw_char(' ', cursor_x * CHAR_WIDTH, cursor_y * CHAR_HEIGHT, fg_color, bg_color);
                 // The sb_append_char already stored attributes; nothing extra here.
@@ -803,9 +930,13 @@ static void console_putchar_unlocked(char c) {
             cursor_blink_ticks = 0;
         }
         if (cursor_x >= max_cols) {
-            // Wrap to new line: scroll up and reset cursor_x
+            // Wrap to new line
             cursor_x = 0;
-            console_scroll_up();
+            if (cursor_y >= max_rows - 1) {
+                console_scroll_up();
+            } else {
+                cursor_y++;
+            }
             if (cursor_enabled) {
                 cursor_last_x = cursor_x;
                 cursor_last_y = cursor_y;

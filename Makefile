@@ -18,6 +18,16 @@ else
   NUM_CPUS ?= 4
   QEMU_SMP = -smp $(NUM_CPUS)
 endif
+
+# Serial console: pass SERIAL=1 on the command line to enable kprintf mirroring
+# to COM1 and QEMU -serial stdio.  Default is off (no serial output).
+ifdef SERIAL
+  SERIAL_CFLAGS = -DSERIAL_ENABLED
+  QEMU_SERIAL = -serial stdio
+else
+  SERIAL_CFLAGS =
+  QEMU_SERIAL =
+endif
 MKFS_FAT = mkfs.fat
 MTOOLS = mcopy
 
@@ -38,7 +48,7 @@ EFI_LDS = /usr/lib/elf_x86_64_efi.lds
 # with identity mapping removal during boot
 KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-fno-stack-protector -mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
-			-I$(INCLUDE_DIR) -DXHCI_USE_INTERRUPTS=1
+			-I$(INCLUDE_DIR) -DXHCI_USE_INTERRUPTS=1 $(SERIAL_CFLAGS)
 
 # Compiler flags for userspace programs
 USER_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
@@ -359,6 +369,18 @@ $(BUILD_DIR)/rmdir: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) rmdir
 	cp $(USER_DIR)/rmdir $@
 
+$(BUILD_DIR)/touch: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) touch
+	cp $(USER_DIR)/touch $@
+
+$(BUILD_DIR)/more: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) more
+	cp $(USER_DIR)/more $@
+
+$(BUILD_DIR)/less: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) less
+	cp $(USER_DIR)/less $@
+
 $(BUILD_DIR)/reboot: $(BUILD_DIR)/poweroff | $(BUILD_DIR)
 	cp $(BUILD_DIR)/poweroff $@
 
@@ -425,7 +447,7 @@ $(ISO_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) | $(BUILD_DIR)
 	@echo "UEFI bootable ISO created: $(ISO_IMAGE)"
 
 # Create UEFI bootable FAT image (for direct use)
-$(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
+$(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
 	@echo "Creating UEFI bootable FAT image..."
 	
 	# Create a 64MB FAT32 image
@@ -457,6 +479,9 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/rm ::/bin/rm
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/mkdir ::/bin/mkdir
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/rmdir ::/bin/rmdir
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/touch ::/bin/touch
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/more ::/bin/more
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/less ::/bin/less
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/test_libc ::/testlibc
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/hello ::/hello
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/progerr ::/progerr
@@ -475,6 +500,7 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) res/left_ptr ::/res/left_ptr
 	# Create /tmp directory
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/tmp || true
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) /etc/services ::/tmp/services
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/LIKEOS.SIG ::/LIKEOS.SIG
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/HELLO.TXT ::/HELLO.TXT
 	rm -f $(BUILD_DIR)/LIKEOS.SIG $(BUILD_DIR)/HELLO.TXT || true
@@ -490,16 +516,16 @@ $(USB_IMAGE): $(FAT_IMAGE) | $(BUILD_DIR)
 # Run in QEMU with UEFI firmware
 qemu: $(ISO_IMAGE)
 	@echo "Running LikeOS-64 in QEMU with UEFI firmware..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio $(QEMU_SMP)
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP)
 
 # Run from FAT image in QEMU
 qemu-fat: $(FAT_IMAGE)
 	@echo "Running LikeOS-64 from FAT image in QEMU with UEFI firmware..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -drive format=raw,file=$(FAT_IMAGE) -m 512M -serial stdio $(QEMU_SMP)
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -drive format=raw,file=$(FAT_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP)
 
 # Standalone USB mass storage data image (64MB FAT32) now mirrors usb-write target (UEFI bootable + signature files)
 # Provides: EFI/BOOT/BOOTX64.EFI, kernel.elf, LIKEOS.SIG, HELLO.TXT, tests
-$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
+$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
 	@echo "Creating USB data FAT32 image (msdata.img, 64MB, UEFI bootable)..."
 	$(DD) if=/dev/zero of=$(DATA_IMAGE) bs=1M count=64
 	$(MKFS_FAT) -F32 -n "MSDATA" $(DATA_IMAGE)
@@ -533,6 +559,9 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/rm ::/bin/rm
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/mkdir ::/bin/mkdir
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/rmdir ::/bin/rmdir
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/touch ::/bin/touch
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/more ::/bin/more
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/less ::/bin/less
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/memstat ::/bin/memstat
 	# Create /lib directory and copy shared libraries
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/lib || true
@@ -546,6 +575,7 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/left_ptr ::/res/left_ptr
 	# Create /tmp directory
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/tmp || true
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) /etc/services ::/tmp/services
 	# Add signature + sample files
 	echo "THIS IS A DEVICE STORING LIKEOS" > $(BUILD_DIR)/LIKEOS.SIG
 	echo "Hello from USB mass storage" > $(BUILD_DIR)/HELLO.TXT
@@ -557,7 +587,7 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 # Run with ISO boot plus attached xHCI controller and USB mass storage device
 qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
 	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio $(QEMU_SMP) \
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
 		-device usb-storage,drive=usbdisk -machine type=pc,accel=kvm:tcg
 
@@ -569,7 +599,7 @@ qemu-usb-gdb:
 	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" $(ISO_IMAGE) $(DATA_IMAGE)
 	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio $(QEMU_SMP) \
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
 		-device usb-storage,drive=usbdisk -machine type=pc,accel=kvm:tcg -s -S -monitor telnet:127.0.0.1:5555,server,nowait -d int 2> /tmp/qemu_int_log
 
@@ -580,7 +610,7 @@ ifndef USB_DEVICE
 	$(error USB_DEVICE is not set. Usage: make qemu-realusb USB_DEVICE=/dev/sdb)
 endif
 	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE)..."
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M -serial stdio $(QEMU_SMP) \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg
 
@@ -605,12 +635,12 @@ qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)
 	if [ "$$USE_USB_BOOT" = "1" ]; then echo "Using bootable FAT image as USB device"; usbimg="$(FAT_IMAGE)"; else usbimg="$(DATA_IMAGE)"; fi; \
 	echo "Passing through devices:$$devices"; \
 	set -x; \
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M -serial stdio $(QEMU_SMP) -machine q35 -device qemu-xhci,id=xhci -device usb-tablet -drive if=none,id=usbdisk,file=$$usbimg,format=raw,readonly=off -device usb-storage,drive=usbdisk $$devices || echo "QEMU exited with status $$?"; \
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) -machine q35 -device qemu-xhci,id=xhci -device usb-tablet -drive if=none,id=usbdisk,file=$$usbimg,format=raw,readonly=off -device usb-storage,drive=usbdisk $$devices || echo "QEMU exited with status $$?"; \
 	set +x || true
 
 # Write ISO to USB device with GPT partition table (like Rufus)
 # Usage: make usb-write USB_DEVICE=/dev/sdX
-usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so
+usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so
 	@if [ -z "$(USB_DEVICE)" ]; then \
 		echo "Error: USB_DEVICE not specified. Usage: make usb-write USB_DEVICE=/dev/sdX"; \
 		echo "Available devices:"; \
@@ -649,6 +679,7 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo mkdir -p /tmp/likeos_usb_mount/lib
 	sudo mkdir -p /tmp/likeos_usb_mount/res
 	sudo mkdir -p /tmp/likeos_usb_mount/tmp
+	sudo cp /etc/services /tmp/likeos_usb_mount/tmp/services
 	
 	# Copy bootloader and kernel
 	sudo cp $(BOOTLOADER_EFI) /tmp/likeos_usb_mount/EFI/BOOT/BOOTX64.EFI
@@ -676,6 +707,9 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo cp $(BUILD_DIR)/rm /tmp/likeos_usb_mount/bin/rm
 	sudo cp $(BUILD_DIR)/mkdir /tmp/likeos_usb_mount/bin/mkdir
 	sudo cp $(BUILD_DIR)/rmdir /tmp/likeos_usb_mount/bin/rmdir
+	sudo cp $(BUILD_DIR)/touch /tmp/likeos_usb_mount/bin/touch
+	sudo cp $(BUILD_DIR)/more /tmp/likeos_usb_mount/bin/more
+	sudo cp $(BUILD_DIR)/less /tmp/likeos_usb_mount/bin/less
 	sudo cp $(BUILD_DIR)/hello /tmp/likeos_usb_mount/hello
 	sudo cp $(BUILD_DIR)/test_libc /tmp/likeos_usb_mount/testlibc
 	sudo cp $(BUILD_DIR)/user_test.elf /tmp/likeos_usb_mount/tests

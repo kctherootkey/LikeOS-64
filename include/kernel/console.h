@@ -79,6 +79,15 @@ void console_backspace(void);
 void console_set_prompt_guard(void);
 void console_clear_prompt_guard(void);
 
+// ANSI CSI support: cursor positioning and erase operations
+void console_set_cursor_pos(uint32_t row, uint32_t col);
+void console_get_cursor_pos(uint32_t *row, uint32_t *col);
+void console_erase_display(int mode);   // 0=below, 1=above, 2=all
+void console_erase_line(int mode);      // 0=to end, 1=to start, 2=whole line
+
+// Query console dimensions (actual rows/cols based on framebuffer and font)
+void console_get_dimensions(uint32_t *rows, uint32_t *cols);
+
 // Cursor control functions
 void console_cursor_enable(void);
 void console_cursor_disable(void);

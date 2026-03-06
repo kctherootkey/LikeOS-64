@@ -36,6 +36,21 @@
 // Key release flag
 #define KEY_RELEASE 0x80
 
+// Extended key prefix
+#define KEY_EXTENDED_PREFIX 0xE0
+
+// Extended key scan codes (after 0xE0 prefix)
+#define KEY_EXT_UP      0x48
+#define KEY_EXT_DOWN    0x50
+#define KEY_EXT_LEFT    0x4B
+#define KEY_EXT_RIGHT   0x4D
+#define KEY_EXT_HOME    0x47
+#define KEY_EXT_END     0x4F
+#define KEY_EXT_PGUP    0x49
+#define KEY_EXT_PGDN    0x51
+#define KEY_EXT_INSERT  0x52
+#define KEY_EXT_DELETE  0x53
+
 // Input buffer size
 #define KEYBOARD_BUFFER_SIZE 256
 
@@ -45,6 +60,7 @@ typedef struct {
     uint8_t ctrl_pressed;
     uint8_t alt_pressed;
     uint8_t caps_lock;
+    uint8_t e0_prefix;     // 1 when last scan code was 0xE0
     uint8_t buffer[KEYBOARD_BUFFER_SIZE];
     uint8_t buffer_start;
     uint8_t buffer_end;

@@ -116,6 +116,82 @@ uint8_t keyboard_buffer_has_data(void) {
 // Keyboard interrupt handler
 void keyboard_irq_handler(void) {
     uint8_t scan_code = keyboard_read_scan_code();
+
+    // Handle extended key prefix (0xE0)
+    if (scan_code == KEY_EXTENDED_PREFIX) {
+        kb_state.e0_prefix = 1;
+        return;
+    }
+
+    // Handle extended keys (arrow, pgup, pgdn, home, end, insert, delete)
+    if (kb_state.e0_prefix) {
+        kb_state.e0_prefix = 0;
+
+        // Ignore extended key releases
+        if (scan_code & KEY_RELEASE)
+            return;
+
+        // Map extended scan codes to ANSI escape sequences
+        tty_t *tty = tty_get_console();
+        switch (scan_code) {
+            case KEY_EXT_UP:
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, 'A', 0);
+                return;
+            case KEY_EXT_DOWN:
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, 'B', 0);
+                return;
+            case KEY_EXT_RIGHT:
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, 'C', 0);
+                return;
+            case KEY_EXT_LEFT:
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, 'D', 0);
+                return;
+            case KEY_EXT_HOME:
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, 'H', 0);
+                return;
+            case KEY_EXT_END:
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, 'F', 0);
+                return;
+            case KEY_EXT_PGUP:
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, '5', 0);
+                tty_input_char(tty, '~', 0);
+                return;
+            case KEY_EXT_PGDN:
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, '6', 0);
+                tty_input_char(tty, '~', 0);
+                return;
+            case KEY_EXT_INSERT:
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, '2', 0);
+                tty_input_char(tty, '~', 0);
+                return;
+            case KEY_EXT_DELETE:
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, '3', 0);
+                tty_input_char(tty, '~', 0);
+                return;
+            default:
+                return;  // Unknown extended key, ignore
+        }
+    }
     
     // Handle key release
     if (scan_code & KEY_RELEASE) {

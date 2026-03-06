@@ -23,5 +23,6 @@ char* strrchr(const char* s, int c);
 char* strstr(const char* haystack, const char* needle);
 char* strdup(const char* s);
 char* strtok(char* str, const char* delim);
+char* strerror(int errnum);
 
 #endif

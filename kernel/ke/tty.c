@@ -144,7 +144,8 @@ static uint8_t ansi_to_vga_fg[8] = {
 
 static uint8_t g_cur_vga_fg = 15;  /* VGA_COLOR_WHITE */
 static uint8_t g_cur_vga_bg = 0;   /* VGA_COLOR_BLACK */
-static int     g_ansi_bold  = 0;
+static int     g_ansi_bold    = 0;
+static int     g_ansi_reverse = 0;
 
 static void ansi_reset_state(void) {
     g_ansi_state = ANSI_NORMAL;
@@ -170,6 +171,7 @@ static void ansi_apply_sgr(void) {
             g_cur_vga_fg = 15; /* white */
             g_cur_vga_bg = 0;  /* black */
             g_ansi_bold = 0;
+            g_ansi_reverse = 0;
         } else if (p == 1) {
             /* Bold / bright */
             g_ansi_bold = 1;
@@ -200,10 +202,19 @@ static void ansi_apply_sgr(void) {
         } else if (p >= 100 && p <= 107) {
             /* Bright background */
             g_cur_vga_bg = ansi_to_vga_fg[p - 100] + 8;
+        } else if (p == 7) {
+            /* Reverse video */
+            g_ansi_reverse = 1;
+        } else if (p == 27) {
+            /* Reverse video off */
+            g_ansi_reverse = 0;
         }
         /* Other SGR codes silently ignored */
     }
-    console_set_color(g_cur_vga_fg, g_cur_vga_bg);
+    if (g_ansi_reverse)
+        console_set_color(g_cur_vga_bg, g_cur_vga_fg);
+    else
+        console_set_color(g_cur_vga_fg, g_cur_vga_bg);
 }
 
 static void tty_output_console(tty_t* tty, char c) {
@@ -249,9 +260,56 @@ static void tty_output_console(tty_t* tty, char c) {
         /* Final byte — the command character */
         if (ch == 'm') {
             ansi_apply_sgr();
+            ansi_reset_state();
+            return;
         }
-        /* All other CSI sequences (cursor movement, erase, etc.)
-         * are silently consumed for now. */
+
+        /* Flush last param if we have digits */
+        if (g_ansi_have_digit && g_ansi_nparam < ANSI_MAX_PARAMS) {
+            g_ansi_params[g_ansi_nparam++] = g_ansi_cur_param;
+        }
+
+        if (ch == 'H' || ch == 'f') {
+            /* CUP — Cursor Position: ESC [ row ; col H  (1-based, default 1;1) */
+            int row = (g_ansi_nparam >= 1 && g_ansi_params[0] > 0) ? g_ansi_params[0] - 1 : 0;
+            int col = (g_ansi_nparam >= 2 && g_ansi_params[1] > 0) ? g_ansi_params[1] - 1 : 0;
+            console_set_cursor_pos((uint32_t)row, (uint32_t)col);
+        } else if (ch == 'J') {
+            /* ED — Erase Display: ESC [ Ps J  (0=below, 1=above, 2=all) */
+            int mode = (g_ansi_nparam >= 1) ? g_ansi_params[0] : 0;
+            console_erase_display(mode);
+        } else if (ch == 'K') {
+            /* EL — Erase Line: ESC [ Ps K  (0=to end, 1=to start, 2=whole) */
+            int mode = (g_ansi_nparam >= 1) ? g_ansi_params[0] : 0;
+            console_erase_line(mode);
+        } else if (ch == 'A') {
+            /* CUU — Cursor Up: ESC [ Ps A */
+            int n = (g_ansi_nparam >= 1 && g_ansi_params[0] > 0) ? g_ansi_params[0] : 1;
+            uint32_t row, col;
+            console_get_cursor_pos(&row, &col);
+            row = (row >= (uint32_t)n) ? row - (uint32_t)n : 0;
+            console_set_cursor_pos(row, col);
+        } else if (ch == 'B') {
+            /* CUD — Cursor Down: ESC [ Ps B */
+            int n = (g_ansi_nparam >= 1 && g_ansi_params[0] > 0) ? g_ansi_params[0] : 1;
+            uint32_t row, col;
+            console_get_cursor_pos(&row, &col);
+            console_set_cursor_pos(row + (uint32_t)n, col);
+        } else if (ch == 'C') {
+            /* CUF — Cursor Forward: ESC [ Ps C */
+            int n = (g_ansi_nparam >= 1 && g_ansi_params[0] > 0) ? g_ansi_params[0] : 1;
+            uint32_t row, col;
+            console_get_cursor_pos(&row, &col);
+            console_set_cursor_pos(row, col + (uint32_t)n);
+        } else if (ch == 'D') {
+            /* CUB — Cursor Backward: ESC [ Ps D */
+            int n = (g_ansi_nparam >= 1 && g_ansi_params[0] > 0) ? g_ansi_params[0] : 1;
+            uint32_t row, col;
+            console_get_cursor_pos(&row, &col);
+            col = (col >= (uint32_t)n) ? col - (uint32_t)n : 0;
+            console_set_cursor_pos(row, col);
+        }
+        /* All other CSI sequences silently consumed */
         ansi_reset_state();
         return;
     }
@@ -316,8 +374,12 @@ void tty_init(void) {
     g_console_tty.is_master = 0;
     g_console_tty.fg_pgid = 0;
     g_console_tty.output = tty_output_console;
-    g_console_tty.winsz.ws_row = 25;
-    g_console_tty.winsz.ws_col = 80;
+
+    /* Query actual console dimensions from the framebuffer driver */
+    uint32_t rows = 25, cols = 80;
+    console_get_dimensions(&rows, &cols);
+    g_console_tty.winsz.ws_row = (unsigned short)rows;
+    g_console_tty.winsz.ws_col = (unsigned short)cols;
     tty_set_default_termios(&g_console_tty);
 
     for (int i = 0; i < TTY_MAX_PTYS; ++i) {
