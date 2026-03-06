@@ -1237,6 +1237,7 @@ static int64_t sys_mkdir(uint64_t pathname, uint64_t mode) {
     
     int st = vfs_mkdir(kpath, (unsigned int)mode);
     if (st == ST_OK) return 0;
+    if (st == ST_EXISTS) return -EEXIST;
     if (st == ST_NOT_FOUND) return -ENOENT;
     if (st == ST_NOMEM) return -ENOMEM;
     if (st == ST_IO) return -EIO;
@@ -1260,10 +1261,15 @@ static int64_t sys_rmdir(uint64_t pathname) {
 static int64_t sys_link(uint64_t oldpath, uint64_t newpath) { (void)oldpath; (void)newpath; return -ENOSYS; }
 static int64_t sys_symlink(uint64_t target, uint64_t linkpath) { (void)target; (void)linkpath; return -ENOSYS; }
 static int64_t sys_readlink(uint64_t pathname, uint64_t buf, uint64_t bufsiz) { (void)pathname; (void)buf; (void)bufsiz; return -ENOSYS; }
-static int64_t sys_chmod(uint64_t pathname, uint64_t mode) { (void)pathname; (void)mode; return -ENOSYS; }
-static int64_t sys_fchmod(uint64_t fd, uint64_t mode) { (void)fd; (void)mode; return -ENOSYS; }
-static int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group) { (void)pathname; (void)owner; (void)group; return -ENOSYS; }
-static int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group) { (void)fd; (void)owner; (void)group; return -ENOSYS; }
+// chmod/fchmod/chown/fchown: FAT32 has no permissions/ownership; silently succeed
+static int64_t sys_chmod(uint64_t pathname, uint64_t mode) { (void)pathname; (void)mode; return 0; }
+static int64_t sys_fchmod(uint64_t fd, uint64_t mode) { (void)fd; (void)mode; return 0; }
+static int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group) { (void)pathname; (void)owner; (void)group; return 0; }
+static int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group) { (void)fd; (void)owner; (void)group; return 0; }
+// utimensat: FAT32 timestamps are managed by the FS driver; silently succeed
+static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times, uint64_t flags) {
+    (void)dirfd; (void)pathname; (void)times; (void)flags; return 0;
+}
 
 static int normalize_path(const char* base, const char* path, char* out, size_t out_size) {
     if (!path || !out || out_size < 2) return -EINVAL;
@@ -4086,6 +4092,9 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 
         case SYS_FCHOWN:
             return sys_fchown(a1, a2, a3);
+
+        case SYS_UTIMENSAT:
+            return sys_utimensat(a1, a2, a3, a4);
 
         // Signal syscalls
         case SYS_RT_SIGACTION:

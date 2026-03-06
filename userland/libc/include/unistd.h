@@ -66,6 +66,10 @@ int readlink(const char* path, char* buf, size_t bufsiz);
 int chown(const char* path, int owner, int group);
 int fchown(int fd, int owner, int group);
 
+// Timestamp operations
+#include <time.h>
+int utimensat(int dirfd, const char* pathname, const struct timespec times[2], int flags);
+
 // getdents wrappers
 struct dirent;
 int getdents(int fd, struct dirent* dirp, unsigned int count);

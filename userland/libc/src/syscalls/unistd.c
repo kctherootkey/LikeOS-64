@@ -492,6 +492,12 @@ int fchmod(int fd, mode_t mode) {
     return 0;
 }
 
+int utimensat(int dirfd, const char* pathname, const struct timespec times[2], int flags) {
+    long ret = syscall4(SYS_UTIMENSAT, dirfd, (long)pathname, (long)times, flags);
+    if (ret < 0) { errno = -ret; return -1; }
+    return 0;
+}
+
 int reboot(int cmd) {
     // Use Linux reboot magic numbers
     long ret = syscall4(SYS_REBOOT, 0xfee1dead, 672274793, cmd, 0);

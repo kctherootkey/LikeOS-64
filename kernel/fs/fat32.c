@@ -2493,7 +2493,7 @@ int fat32_mkdir_path(const char* path)
     
     if (fat32_dir_find_entry_lfn(parent, name, &attr, &fc, &size, 
         &dir_cluster, &dir_index, &lfn_start_cluster, &lfn_start_index) == ST_OK) {
-        return ST_INVALID;  // Already exists
+        return ST_EXISTS;  // Already exists
     }
 
     // Find space for new entries

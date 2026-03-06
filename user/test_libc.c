@@ -3265,6 +3265,184 @@ int main(int argc, char** argv) {
     }
 
     // ========================================
+    // Filesystem syscalls: mkdir, rmdir, rename, unlink, chmod, utimensat
+    // ========================================
+    printf("\n[TEST] mkdir()\n");
+    {
+        int ret = mkdir("/tmp/test_mkdir_dir", 0755);
+        test_result("mkdir(/tmp/test_mkdir_dir) succeeds", ret == 0);
+
+        struct stat st;
+        ret = stat("/tmp/test_mkdir_dir", &st);
+        test_result("stat new dir succeeds", ret == 0);
+        test_result("new dir is a directory", ret == 0 && S_ISDIR(st.st_mode));
+
+        /* mkdir on existing dir should fail with EEXIST */
+        ret = mkdir("/tmp/test_mkdir_dir", 0755);
+        test_result("mkdir existing dir fails", ret == -1);
+        test_result("mkdir existing dir sets EEXIST", errno == EEXIST);
+    }
+
+    printf("\n[TEST] rmdir()\n");
+    {
+        int ret = rmdir("/tmp/test_mkdir_dir");
+        test_result("rmdir(/tmp/test_mkdir_dir) succeeds", ret == 0);
+
+        /* rmdir on nonexistent dir should fail */
+        ret = rmdir("/tmp/test_mkdir_dir");
+        test_result("rmdir nonexistent dir fails", ret == -1);
+        test_result("rmdir nonexistent dir sets ENOENT", errno == ENOENT);
+
+        /* rmdir on "/" should fail when it's not empty */
+        ret = rmdir("/");
+        test_result("rmdir(/) fails", ret == -1);
+    }
+
+    printf("\n[TEST] unlink()\n");
+    {
+        /* Create a test file first */
+        int fd = open("/tmp/test_unlink_file", O_WRONLY | O_CREAT | O_TRUNC);
+        test_result("create /tmp/test_unlink_file", fd >= 0);
+        if (fd >= 0) {
+            write(fd, "test", 4);
+            close(fd);
+
+            int ret = unlink("/tmp/test_unlink_file");
+            test_result("unlink(/tmp/test_unlink_file) succeeds", ret == 0);
+
+            /* Should be gone now */
+            struct stat st;
+            ret = stat("/tmp/test_unlink_file", &st);
+            test_result("stat after unlink fails (ENOENT)", ret == -1 && errno == ENOENT);
+        }
+
+        /* unlink nonexistent file */
+        int ret = unlink("/tmp/no_such_file_for_test");
+        test_result("unlink nonexistent file fails", ret == -1);
+        test_result("unlink nonexistent sets ENOENT", errno == ENOENT);
+    }
+
+    printf("\n[TEST] rename()\n");
+    {
+        /* Create source file */
+        int fd = open("/tmp/test_rename_src", O_WRONLY | O_CREAT | O_TRUNC);
+        test_result("create /tmp/test_rename_src", fd >= 0);
+        if (fd >= 0) {
+            write(fd, "rename_test", 11);
+            close(fd);
+
+            int ret = rename("/tmp/test_rename_src", "/tmp/test_rename_dst");
+            test_result("rename succeeds", ret == 0);
+
+            /* Source should be gone */
+            struct stat st;
+            ret = stat("/tmp/test_rename_src", &st);
+            test_result("old name gone after rename", ret == -1);
+
+            /* Destination should exist */
+            ret = stat("/tmp/test_rename_dst", &st);
+            test_result("new name exists after rename", ret == 0);
+
+            /* Verify contents */
+            fd = open("/tmp/test_rename_dst", O_RDONLY);
+            test_result("can open renamed file", fd >= 0);
+            if (fd >= 0) {
+                char buf[32];
+                ssize_t n = read(fd, buf, sizeof(buf));
+                test_result("renamed file has correct size", n == 11);
+                close(fd);
+            }
+
+            /* Cleanup */
+            unlink("/tmp/test_rename_dst");
+        }
+    }
+
+    printf("\n[TEST] chmod()\n");
+    {
+        /* chmod should succeed (returns 0 on FAT32) */
+        int fd = open("/tmp/test_chmod_file", O_WRONLY | O_CREAT | O_TRUNC);
+        test_result("create /tmp/test_chmod_file", fd >= 0);
+        if (fd >= 0) {
+            close(fd);
+
+            int ret = chmod("/tmp/test_chmod_file", 0644);
+            test_result("chmod returns 0", ret == 0);
+
+            ret = chmod("/tmp/test_chmod_file", 0755);
+            test_result("chmod to 0755 returns 0", ret == 0);
+
+            unlink("/tmp/test_chmod_file");
+        }
+
+        /* chmod on nonexistent should succeed (kernel returns 0 regardless) */
+    }
+
+    printf("\n[TEST] chown()\n");
+    {
+        int fd = open("/tmp/test_chown_file", O_WRONLY | O_CREAT | O_TRUNC);
+        test_result("create /tmp/test_chown_file", fd >= 0);
+        if (fd >= 0) {
+            close(fd);
+
+            int ret = chown("/tmp/test_chown_file", 0, 0);
+            test_result("chown returns 0", ret == 0);
+
+            ret = fchown(open("/tmp/test_chown_file", O_RDONLY), 0, 0);
+            test_result("fchown returns 0", ret == 0);
+
+            unlink("/tmp/test_chown_file");
+        }
+    }
+
+    printf("\n[TEST] utimensat()\n");
+    {
+        int fd = open("/tmp/test_utime_file", O_WRONLY | O_CREAT | O_TRUNC);
+        test_result("create /tmp/test_utime_file", fd >= 0);
+        if (fd >= 0) {
+            close(fd);
+
+            struct timespec times[2];
+            times[0].tv_sec = 1000000;
+            times[0].tv_nsec = 0;
+            times[1].tv_sec = 2000000;
+            times[1].tv_nsec = 0;
+            int ret = utimensat(-100, "/tmp/test_utime_file", times, 0);
+            test_result("utimensat returns 0", ret == 0);
+
+            unlink("/tmp/test_utime_file");
+        }
+    }
+
+    printf("\n[TEST] mkdir+rmdir parents\n");
+    {
+        /* Create nested dirs */
+        int ret = mkdir("/tmp/test_parent_a", 0755);
+        test_result("mkdir /tmp/test_parent_a", ret == 0);
+
+        ret = mkdir("/tmp/test_parent_a/b", 0755);
+        test_result("mkdir /tmp/test_parent_a/b", ret == 0);
+
+        ret = mkdir("/tmp/test_parent_a/b/c", 0755);
+        test_result("mkdir /tmp/test_parent_a/b/c", ret == 0);
+
+        /* Verify they exist */
+        struct stat st;
+        ret = stat("/tmp/test_parent_a/b/c", &st);
+        test_result("nested dir exists", ret == 0 && S_ISDIR(st.st_mode));
+
+        /* Remove in reverse order */
+        ret = rmdir("/tmp/test_parent_a/b/c");
+        test_result("rmdir /tmp/test_parent_a/b/c", ret == 0);
+
+        ret = rmdir("/tmp/test_parent_a/b");
+        test_result("rmdir /tmp/test_parent_a/b", ret == 0);
+
+        ret = rmdir("/tmp/test_parent_a");
+        test_result("rmdir /tmp/test_parent_a", ret == 0);
+    }
+
+    // ========================================
     // Summary
     // ========================================
     printf("\n========================================\n");

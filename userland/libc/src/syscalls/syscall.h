@@ -124,6 +124,9 @@
 // Process information (LikeOS specific)
 #define SYS_GETPROCINFO     331
 
+// Filesystem extended syscalls
+#define SYS_UTIMENSAT       332
+
 // Syscall wrapper - uses inline assembly to invoke syscall instruction
 static inline long syscall0(long number) {
     long ret;

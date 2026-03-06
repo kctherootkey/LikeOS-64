@@ -136,6 +136,9 @@
 // Process information (LikeOS specific)
 #define SYS_GETPROCINFO     331
 
+// Filesystem extended syscalls
+#define SYS_UTIMENSAT       332
+
 // Debug/diagnostic syscalls (LikeOS specific)
 #define SYS_MEMSTATS        300  // Print memory stats
 
@@ -155,6 +158,7 @@
 #define O_WRONLY        0x0001
 #define O_RDWR          0x0002
 #define O_CREAT         0x0040
+#define O_EXCL          0x0080
 #define O_TRUNC         0x0200
 #define O_APPEND        0x0400
 
@@ -198,7 +202,15 @@
 #define EMFILE          24  // Too many open files
 #define ESPIPE          29  // Illegal seek
 #define EPIPE           32  // Broken pipe
+#define EBUSY           16  // Device or resource busy
+#define EEXIST          17  // File exists
+#define EXDEV           18  // Cross-device link
+#define EISDIR          21  // Is a directory
+#define ENOSPC          28  // No space left on device
+#define EROFS           30  // Read-only file system
+#define ENAMETOOLONG    36  // File name too long
 #define ENOSYS          38  // Function not implemented
+#define ENOTEMPTY       39  // Directory not empty
 #define ETIMEDOUT      110  // Connection timed out
 
 // Syscall handler prototype
