@@ -377,9 +377,13 @@ int elf_exec(const char* path, char* const argv[], char* const envp[],
     if (cur) {
         t->parent = cur;
         sched_add_child(cur, t);
+        // Inherit session/group from parent, but only override ctty
+        // if parent actually has one (otherwise keep the default from
+        // sched_add_user_task which sets tty_get_console)
         t->pgid = cur->pgid;
         t->sid  = cur->sid;
-        t->ctty = cur->ctty;
+        if (cur->ctty)
+            t->ctty = cur->ctty;
         mm_memset(t->cwd, 0, sizeof(t->cwd));
         if (cur->cwd[0]) {
             size_t i = 0;
@@ -390,6 +394,41 @@ int elf_exec(const char* path, char* const argv[], char* const envp[],
             t->cwd[0] = '/'; t->cwd[1] = '\0';
         }
     }
+    // Set comm from basename of path
+    {
+        const char* src = path;
+        const char* p2 = src;
+        while (*p2) { if (*p2 == '/') src = p2 + 1; p2++; }
+        int ci;
+        for (ci = 0; ci < 255 && src[ci]; ci++)
+            t->comm[ci] = src[ci];
+        t->comm[ci] = '\0';
+    }
+    // Build cmdline from argv (space-separated)
+    {
+        int pos = 0;
+        if (argv) {
+            for (int a = 0; argv[a] && pos < 1023; a++) {
+                if (a > 0 && pos < 1023) t->cmdline[pos++] = ' ';
+                for (int c = 0; argv[a][c] && pos < 1023; c++)
+                    t->cmdline[pos++] = argv[a][c];
+            }
+        }
+        t->cmdline[pos] = '\0';
+    }
+    // Build environ from envp (space-separated)
+    {
+        int pos = 0;
+        if (envp) {
+            for (int a = 0; envp[a] && pos < 2047; a++) {
+                if (a > 0 && pos < 2047) t->environ[pos++] = ' ';
+                for (int c = 0; envp[a][c] && pos < 2047; c++)
+                    t->environ[pos++] = envp[a][c];
+            }
+        }
+        t->environ[pos] = '\0';
+    }
+
     if (out_task) *out_task = t;
     return 0;
 }

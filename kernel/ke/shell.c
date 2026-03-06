@@ -17,8 +17,12 @@ static int shell_spawn(void) {
     task_t* task = NULL;
     int ret = elf_exec("/bin/sh", argv, envp, &task);
     if (ret == 0 && task) {
+        // Make the shell a session leader with its own process group
+        task->pgid = task->id;
+        task->sid  = task->id;
         tty_t* tty = tty_get_console();
         if (tty) {
+            task->ctty = tty;
             tty->fg_pgid = task->pgid;
         }
         g_shell_task = task;

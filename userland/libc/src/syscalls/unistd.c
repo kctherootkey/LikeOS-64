@@ -498,3 +498,9 @@ int reboot(int cmd) {
     if (ret < 0) { errno = -ret; return -1; }
     return 0;
 }
+
+int getprocinfo(void* buf, int max_count) {
+    long ret = syscall2(SYS_GETPROCINFO, (long)buf, (long)max_count);
+    if (ret < 0) { errno = -ret; return -1; }
+    return (int)ret;
+}

@@ -344,6 +344,20 @@ typedef struct task {
     uint64_t syscall_r15;           // Callee-saved
     uint64_t syscall_kernel_rsp;    // Kernel RSP for syscall return (set before call)
     
+    // Process name (set from argv[0] basename on execve)
+    char comm[256];
+    
+    // Full command line (argv joined by spaces, set on execve)
+    char cmdline[1024];
+    
+    // Environment string (envp joined by spaces, set on execve)
+    char environ[2048];
+    
+    // Timing / accounting
+    uint64_t start_tick;        // Tick count when task was created
+    uint64_t utime_ticks;       // Ticks spent in user mode
+    uint64_t stime_ticks;       // Ticks spent in kernel mode
+    
     // Current working directory
     char cwd[256];
     
@@ -422,6 +436,7 @@ void sched_load_balance(void);           // Pull tasks from busiest CPU (called 
 task_t* sched_fork_current(void);           // Fork current task with COW
 void sched_remove_task(task_t* task);       // Remove task from scheduler
 task_t* sched_find_task_by_id(uint32_t pid); // Find task by PID
+task_t* sched_find_task_by_id_locked(uint32_t pid); // Find task by PID (caller holds g_task_list_lock)
 void sched_add_child(task_t* parent, task_t* child);  // Add child to parent
 void sched_remove_child(task_t* parent, task_t* child);  // Remove child from parent
 void sched_reparent_children(task_t* task); // Reparent children to init (task 1)

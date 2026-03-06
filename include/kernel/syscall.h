@@ -133,6 +133,9 @@
 // System management
 #define SYS_REBOOT          330
 
+// Process information (LikeOS specific)
+#define SYS_GETPROCINFO     331
+
 // Debug/diagnostic syscalls (LikeOS specific)
 #define SYS_MEMSTATS        300  // Print memory stats
 
@@ -201,5 +204,36 @@
 // Syscall handler prototype
 int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
                         uint64_t a3, uint64_t a4, uint64_t a5);
+
+// ============================================================================
+// Process info structure for SYS_GETPROCINFO
+// ============================================================================
+typedef struct procinfo {
+    int     pid;            // Process ID
+    int     ppid;           // Parent PID
+    int     tgid;           // Thread group ID
+    int     pgid;           // Process group ID
+    int     sid;            // Session ID
+    int     uid;            // Real user ID
+    int     gid;            // Real group ID
+    int     euid;           // Effective user ID
+    int     egid;           // Effective group ID
+    int     state;          // 0=READY 1=RUNNING 2=BLOCKED 3=STOPPED 4=ZOMBIE
+    int     nice;           // Nice value (always 0 for now)
+    int     nr_threads;     // Number of threads in thread group
+    int     on_cpu;         // CPU number the task runs on
+    int     exit_code;      // Exit status (for zombies)
+    int     tty_nr;         // Controlling terminal (0 = none)
+    int     is_kernel;      // 1 if kernel task, 0 if user
+    uint64_t start_tick;    // Tick when process started
+    uint64_t utime_ticks;   // User-mode ticks
+    uint64_t stime_ticks;   // Kernel-mode ticks
+    uint64_t vsz;           // Virtual memory size (bytes)
+    uint64_t rss;           // Resident set size (pages)
+    char    comm[256];      // Process name (basename of executable)
+    char    cmdline[1024];  // Full command line (argv joined by spaces)
+    char    environ[2048];  // Environment (envp joined by spaces)
+    char    cwd[256];       // Current working directory
+} procinfo_t;
 
 #endif // _KERNEL_SYSCALL_H_

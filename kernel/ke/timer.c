@@ -241,6 +241,18 @@ void timer_irq_handler(void) {
     // Per-CPU: manage this CPU's current task time slice
     task_t* cur = sched_current();
     if (cur) {
+        // Accounting: charge a tick to user or system time.
+        // If the task was preempted from user mode (privilege == USER and
+        // preempt_frame CS == ring 3) it was in user space.
+        if (cur->privilege == TASK_USER) {
+            if (cur->preempt_frame && (cur->preempt_frame->cs & 3) == 3)
+                cur->utime_ticks++;
+            else
+                cur->stime_ticks++;
+        } else {
+            cur->stime_ticks++;
+        }
+
         if (cur->remaining_ticks > 0) {
             cur->remaining_ticks--;
         }

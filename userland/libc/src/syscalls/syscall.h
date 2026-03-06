@@ -121,6 +121,9 @@
 // System management
 #define SYS_REBOOT          330
 
+// Process information (LikeOS specific)
+#define SYS_GETPROCINFO     331
+
 // Syscall wrapper - uses inline assembly to invoke syscall instruction
 static inline long syscall0(long number) {
     long ret;

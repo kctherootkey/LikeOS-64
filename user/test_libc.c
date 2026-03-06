@@ -17,6 +17,7 @@
 #include <sys/ioctl.h>
 #include <dlfcn.h>
 #include <getopt.h>
+#include <sys/procinfo.h>
 
 // Futex helper declarations (from sched.c)
 int futex_wait(int* uaddr, int val, const struct timespec* timeout);
@@ -3199,6 +3200,68 @@ int main(int argc, char** argv) {
         test_result("gmtime leap year 2000-02-29: year=100", tm_leap.tm_year == 100);
         test_result("gmtime leap year 2000-02-29: mon=1 (Feb)", tm_leap.tm_mon == 1);
         test_result("gmtime leap year 2000-02-29: mday=29", tm_leap.tm_mday == 29);
+    }
+
+    // ========================================
+    // SYS_GETPROCINFO tests
+    // ========================================
+    {
+        printf("\n--- SYS_GETPROCINFO tests ---\n");
+
+        /* Allocate buffer for up to 128 procs */
+        int max = 128;
+        procinfo_t *buf = (procinfo_t *)malloc(max * sizeof(procinfo_t));
+        test_result("getprocinfo: malloc ok", buf != NULL);
+        if (buf) {
+            int n = getprocinfo(buf, max);
+            test_result("getprocinfo: returns > 0", n > 0);
+
+            /* Find our own PID */
+            pid_t my_pid = getpid();
+            int found_self = 0;
+            int self_idx = -1;
+            for (int i = 0; i < n; i++) {
+                if (buf[i].pid == (int)my_pid) {
+                    found_self = 1;
+                    self_idx = i;
+                    break;
+                }
+            }
+            test_result("getprocinfo: found own PID", found_self);
+
+            if (self_idx >= 0) {
+                test_result("getprocinfo: own state is READY or RUNNING",
+                            buf[self_idx].state == 0 || buf[self_idx].state == 1);
+                test_result("getprocinfo: own tty_nr > 0",
+                            buf[self_idx].tty_nr > 0);
+                test_result("getprocinfo: own is_kernel == 0",
+                            buf[self_idx].is_kernel == 0);
+                test_result("getprocinfo: own ppid > 0",
+                            buf[self_idx].ppid > 0);
+                test_result("getprocinfo: own cwd starts with /",
+                            buf[self_idx].cwd[0] == '/');
+                test_result("getprocinfo: own comm is 'testlibc'",
+                            strcmp(buf[self_idx].comm, "testlibc") == 0);
+            }
+
+            /* Check that PID 0 (kernel bootstrap) exists */
+            int found_kernel = 0;
+            for (int i = 0; i < n; i++) {
+                if (buf[i].pid == 0) {
+                    found_kernel = 1;
+                    test_result("getprocinfo: PID 0 is kernel",
+                                buf[i].is_kernel == 1);
+                    break;
+                }
+            }
+            test_result("getprocinfo: PID 0 exists", found_kernel);
+
+            /* Edge case: max_count=0 */
+            int n0 = getprocinfo(buf, 0);
+            test_result("getprocinfo(buf,0) returns 0", n0 == 0);
+
+            free(buf);
+        }
     }
 
     // ========================================

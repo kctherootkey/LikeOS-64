@@ -383,6 +383,12 @@ static void task_init_common(task_t* t) {
     t->has_exited = false;
     t->is_fork_child = false;
     signal_init_task(t);
+    t->comm[0] = '\0';
+    t->cmdline[0] = '\0';
+    t->environ[0] = '\0';
+    t->start_tick = timer_ticks();
+    t->utime_ticks = 0;
+    t->stime_ticks = 0;
     t->cwd[0] = '/';
     t->cwd[1] = 0;
     for (int i = 0; i < TASK_MAX_FDS; i++) t->fd_table[i] = NULL;
@@ -438,6 +444,8 @@ void sched_init(void) {
     g_bootstrap_task.id = 0;
     task_init_common(&g_bootstrap_task);
     g_bootstrap_task.on_cpu = 0;
+    // Name the bootstrap/kernel task
+    mm_memcpy(g_bootstrap_task.comm, "kernel", 7);
 
     // Legacy pre-SMP current
     g_current = &g_bootstrap_task;
@@ -447,6 +455,8 @@ void sched_init(void) {
 
     // Create BSP idle task
     sched_add_task(idle_entry, 0, g_idle_stack, sizeof(g_idle_stack));
+    // Name the BSP idle task (Linux-like)
+    mm_memcpy(g_idle_task.comm, "kernel idle/0", 14);
 
     kprintf("Preemptive scheduler initialized (time slice=%d ticks)\n", SCHED_TIME_SLICE);
 }
@@ -889,6 +899,15 @@ task_t* sched_find_task_by_id(uint32_t id) {
     return NULL;
 }
 
+// Same but caller must hold g_task_list_lock
+task_t* sched_find_task_by_id_locked(uint32_t id) {
+    for (task_t* t = g_task_list_head; t; t = t->next) {
+        if ((uint32_t)t->id == id)
+            return t;
+    }
+    return NULL;
+}
+
 void sched_add_child(task_t* parent, task_t* child) {
     if (!parent || !child) return;
     child->parent = parent;
@@ -1098,6 +1117,9 @@ task_t* sched_fork_current(void) {
     child->need_resched = 0;
     child->remaining_ticks = SCHED_TIME_SLICE;
     child->preempt_frame = NULL;
+    child->start_tick = timer_ticks();
+    child->utime_ticks = 0;
+    child->stime_ticks = 0;
     
     // Thread group: fork creates a new process (new thread group)
     thread_group_init(child);
@@ -1826,6 +1848,15 @@ void sched_init_ap(uint32_t cpu_id) {
     idle->id = g_next_id++;
     task_init_common(idle);
     idle->on_cpu = cpu_id;
+    // Name the AP idle task (Linux-like: kernel idle/N)
+    {
+        char name[32] = "kernel idle/";
+        int pos = 12; /* length of "kernel idle/" */
+        if (cpu_id >= 10) name[pos++] = '0' + (cpu_id / 10);
+        name[pos++] = '0' + (cpu_id % 10);
+        name[pos] = '\0';
+        for (int i = 0; i <= pos; i++) idle->comm[i] = name[i];
+    }
 
     g_ap_idle_tasks[cpu_id] = idle;
 

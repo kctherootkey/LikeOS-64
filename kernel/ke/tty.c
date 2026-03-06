@@ -311,7 +311,7 @@ static void tty_set_default_termios(tty_t* tty) {
 
 void tty_init(void) {
     mm_memset(&g_console_tty, 0, sizeof(g_console_tty));
-    g_console_tty.id = 0;
+    g_console_tty.id = 1;  // 1-based so 0 means "no tty"
     g_console_tty.is_pty = 0;
     g_console_tty.is_master = 0;
     g_console_tty.fg_pgid = 0;

@@ -965,7 +965,7 @@ static int64_t sys_setgroups(uint64_t size, uint64_t list) {
 }
 
 static int64_t sys_gethostname(uint64_t name, uint64_t len) {
-    const char* host = "LikeOS";
+    const char* host = "r00tbox";
     size_t hlen = 0;
     while (host[hlen]) hlen++;
     if (!validate_user_ptr(name, len)) return -EFAULT;
@@ -981,14 +981,14 @@ static int64_t sys_uname(uint64_t buf) {
     k_utsname_t u;
     mm_memset(&u, 0, sizeof(u));
     const char* sys = "LikeOS";
-    const char* node = "likeos";
+    const char* node = "r00tbox";
     const char* rel = "0.2-preempt-smp";
-    const char* ver = "LikeOS-64";
+    const char* ver = "BlessedKitty";
     const char* mach = "x86_64";
     mm_memcpy(u.sysname, sys, 7);
-    mm_memcpy(u.nodename, node, 7);
+    mm_memcpy(u.nodename, node, 8);
     mm_memcpy(u.release, rel, 16);
-    mm_memcpy(u.version, ver, 10);
+    mm_memcpy(u.version, ver, 13);
     mm_memcpy(u.machine, mach, 7);
     if (copy_to_user((void*)buf, &u, sizeof(u)) < 0) {
         return -EFAULT;
@@ -1900,14 +1900,52 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr, uint64_t envp_pt
     uint64_t new_stack_ptr = 0;
     uint64_t entry_point = elf_exec_replace(kpath, kargv, kenvp, &new_stack_ptr);
 
+    if (entry_point == 0) {
+        // exec failed, return error to caller
+        free_user_string_array(kenvp);
+        free_user_string_array(kargv);
+        kfree(kpath);
+        return -ENOEXEC;
+    }
+
+    // Set task comm from basename of path (or argv[0])
+    {
+        task_t* cur = sched_current();
+        if (cur) {
+            const char* src = kpath;
+            // Use basename
+            const char* p = src;
+            while (*p) { if (*p == '/') src = p + 1; p++; }
+            int i;
+            for (i = 0; i < 255 && src[i]; i++)
+                cur->comm[i] = src[i];
+            cur->comm[i] = '\0';
+            // Build cmdline from argv (space-separated)
+            int pos = 0;
+            if (kargv) {
+                for (int a = 0; kargv[a] && pos < 1023; a++) {
+                    if (a > 0 && pos < 1023) cur->cmdline[pos++] = ' ';
+                    for (int c = 0; kargv[a][c] && pos < 1023; c++)
+                        cur->cmdline[pos++] = kargv[a][c];
+                }
+            }
+            cur->cmdline[pos] = '\0';
+            // Build environ from envp (space-separated)
+            pos = 0;
+            if (kenvp) {
+                for (int a = 0; kenvp[a] && pos < 2047; a++) {
+                    if (a > 0 && pos < 2047) cur->environ[pos++] = ' ';
+                    for (int c = 0; kenvp[a][c] && pos < 2047; c++)
+                        cur->environ[pos++] = kenvp[a][c];
+                }
+            }
+            cur->environ[pos] = '\0';
+        }
+    }
+
     free_user_string_array(kenvp);
     free_user_string_array(kargv);
     kfree(kpath);
-
-    if (entry_point == 0) {
-        // exec failed, return error to caller
-        return -ENOEXEC;
-    }
 
     // Success! Jump to the new program
     // We need to return to userspace at the new entry point with the new stack
@@ -3735,6 +3773,128 @@ static int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd, uint64
     }
 }
 
+// SYS_GETPROCINFO - retrieve info about all processes
+// a1 = pointer to user-space procinfo_t array
+// a2 = max number of entries the array can hold
+// Returns: number of entries filled, or negative error
+static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count) {
+    if (max_count == 0) return 0;
+    if (!validate_user_ptr(buf_ptr, max_count * sizeof(procinfo_t)))
+        return -EFAULT;
+
+    // Allocate a kernel-side buffer (limit to prevent DoS)
+    if (max_count > 4096) max_count = 4096;
+    size_t buf_size = max_count * sizeof(procinfo_t);
+    procinfo_t* kbuf = (procinfo_t*)kalloc(buf_size);
+    if (!kbuf) return -ENOMEM;
+    mm_memset(kbuf, 0, buf_size);
+
+    uint64_t freq = timer_get_frequency();
+    if (freq == 0) freq = 100;
+
+    uint64_t flags;
+    int count = 0;
+    spin_lock_irqsave(&g_task_list_lock, &flags);
+    
+    // g_task_list_head is declared static in sched.c, but we can
+    // iterate using sched_find_task_by_id or we use extern.
+    // Actually we declared g_task_list_lock extern in sched.h, 
+    // but not g_task_list_head. Let's just use a different approach:
+    // iterate IDs from 0 upward.
+    // Actually, let's access the list directly. We need to declare it extern.
+    // For now, use the approach of iterating via sched_find_task_by_id
+    // which acquires its own lock... but we already hold the lock.
+    // Better: we declared an extern iterator in the header or iterate by PID.
+    
+    // We'll iterate PIDs. Not ideal but safe. sched_find_task_by_id
+    // acquires the lock internally, so we must NOT hold it here.
+    spin_unlock_irqrestore(&g_task_list_lock, flags);
+    
+    // Iterate all possible PIDs (g_next_id is the next ID to assign)
+    extern int g_next_id;
+    int max_pid = g_next_id;
+    
+    for (int pid = 0; pid < max_pid && count < (int)max_count; pid++) {
+        spin_lock_irqsave(&g_task_list_lock, &flags);
+        task_t* t = sched_find_task_by_id_locked(pid);
+        if (!t) {
+            spin_unlock_irqrestore(&g_task_list_lock, flags);
+            continue;
+        }
+        
+        procinfo_t* p = &kbuf[count];
+        p->pid = t->id;
+        p->ppid = t->parent ? t->parent->id : 0;
+        p->tgid = t->tgid;
+        p->pgid = t->pgid;
+        p->sid = t->sid;
+        p->state = (int)t->state;
+        p->nice = 0;
+        p->nr_threads = t->group_leader ? t->group_leader->nr_threads : 1;
+        p->on_cpu = t->on_cpu;
+        p->exit_code = t->exit_code;
+        p->tty_nr = t->ctty ? t->ctty->id : 0;  // Use actual tty id
+        p->is_kernel = (t->privilege == TASK_KERNEL) ? 1 : 0;
+        p->start_tick = t->start_tick;
+        p->utime_ticks = t->utime_ticks;
+        p->stime_ticks = t->stime_ticks;
+        
+        // UID/GID from signal state (where the kernel stores it)
+        p->uid = 0;
+        p->gid = 0;
+        p->euid = 0;
+        p->egid = 0;
+        
+        // VSZ: count pages mapped in user space (rough estimate)
+        p->vsz = 0;
+        p->rss = 0;
+        if (t->privilege == TASK_USER) {
+            // Estimate from brk and mmap
+            if (t->brk > t->brk_start)
+                p->vsz += (t->brk - t->brk_start);
+            // User stack (assume 2MB)
+            p->vsz += 2 * 1024 * 1024;
+            // mmap regions
+            for (int i = 0; i < TASK_MAX_MMAP; i++) {
+                if (t->mmap_regions[i].in_use)
+                    p->vsz += t->mmap_regions[i].length;
+            }
+            // RSS: rough estimate (VSZ/4096 as pages, assume all resident)
+            p->rss = p->vsz / 4096;
+        }
+        
+        // Copy comm
+        for (int i = 0; i < 255 && t->comm[i]; i++)
+            p->comm[i] = t->comm[i];
+        p->comm[255] = '\0';
+        
+        // Copy cmdline
+        for (int i = 0; i < 1023 && t->cmdline[i]; i++)
+            p->cmdline[i] = t->cmdline[i];
+        p->cmdline[1023] = '\0';
+        
+        // Copy environ
+        for (int i = 0; i < 2047 && t->environ[i]; i++)
+            p->environ[i] = t->environ[i];
+        p->environ[2047] = '\0';
+        
+        // Copy cwd
+        for (int i = 0; i < 255 && t->cwd[i]; i++)
+            p->cwd[i] = t->cwd[i];
+        p->cwd[255] = '\0';
+        
+        spin_unlock_irqrestore(&g_task_list_lock, flags);
+        count++;
+    }
+    
+    // Copy to user space
+    int err = copy_to_user((void*)buf_ptr, kbuf, count * sizeof(procinfo_t));
+    kfree(kbuf);
+    
+    if (err) return err;
+    return count;
+}
+
 // Main syscall dispatcher (inner function)
 static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2, 
                         uint64_t a3, uint64_t a4, uint64_t a5) {
@@ -4018,6 +4178,9 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
             
         case SYS_REBOOT:
             return sys_reboot(a1, a2, a3, a4);
+            
+        case SYS_GETPROCINFO:
+            return sys_getprocinfo(a1, a2);
             
         case SYS_MEMSTATS:
             mm_print_memory_stats();
