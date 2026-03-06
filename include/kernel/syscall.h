@@ -130,6 +130,9 @@
 // Memory protection
 #define SYS_MPROTECT        329
 
+// System management
+#define SYS_REBOOT          330
+
 // Debug/diagnostic syscalls (LikeOS specific)
 #define SYS_MEMSTATS        300  // Print memory stats
 

@@ -359,3 +359,192 @@ void acpi_print_info(void) {
         smp_dbg("ACPI: PC-AT compatible dual-8259 present\n");
     }
 }
+
+// ============================================================================
+// ACPI Power Management — S5 (poweroff) and reset
+// ============================================================================
+
+static uint32_t g_pm1a_cnt_blk = 0;   // PM1a control block I/O port
+static uint32_t g_pm1b_cnt_blk = 0;   // PM1b control block I/O port
+static uint16_t g_slp_typa = 0;       // SLP_TYPa value for S5
+static uint16_t g_slp_typb = 0;       // SLP_TYPb value for S5
+static uint8_t  g_reset_reg_space = 0;
+static uint64_t g_reset_reg_addr = 0;
+static uint8_t  g_reset_value = 0;
+static int      g_pm_initialized = 0;
+
+// I/O port access helpers
+static inline void acpi_outw(uint16_t port, uint16_t val) {
+    __asm__ volatile("outw %0, %1" :: "a"(val), "Nd"(port));
+}
+
+static inline void acpi_outb(uint16_t port, uint8_t val) {
+    __asm__ volatile("outb %0, %1" :: "a"(val), "Nd"(port));
+}
+
+static inline uint16_t acpi_inw(uint16_t port) {
+    uint16_t val;
+    __asm__ volatile("inw %1, %0" : "=a"(val) : "Nd"(port));
+    return val;
+}
+
+// Parse DSDT/SSDT for \_S5 object to get SLP_TYP values
+static int acpi_parse_s5(uint8_t *aml, uint32_t length) {
+    // Search for the byte sequence: '_' 'S' '5' '_'
+    for (uint32_t i = 0; i + 4 < length; i++) {
+        if (aml[i] == '_' && aml[i+1] == 'S' && aml[i+2] == '5' && aml[i+3] == '_') {
+            // Found \_S5 name — skip to the package
+            // Look for PackageOp (0x12) within a small window after the name
+            for (uint32_t j = i + 4; j < i + 32 && j + 5 < length; j++) {
+                if (aml[j] == 0x12) {
+                    // PackageOp found: skip PkgLength and NumElements
+                    uint32_t k = j + 1;
+                    // Decode PkgLength (simple 1-byte form)
+                    uint8_t pkg_lead = aml[k];
+                    if (pkg_lead & 0xC0) {
+                        // Multi-byte PkgLength
+                        int extra = (pkg_lead >> 6) & 3;
+                        k += 1 + extra;
+                    } else {
+                        k += 1;
+                    }
+                    // NumElements byte
+                    k++;
+                    // Now read SLP_TYPa — could be BytePrefix (0x0A) + byte, or raw byte
+                    if (k < length) {
+                        if (aml[k] == 0x0A && k + 1 < length) {
+                            g_slp_typa = aml[k + 1];
+                            k += 2;
+                        } else {
+                            g_slp_typa = aml[k];
+                            k += 1;
+                        }
+                    }
+                    // SLP_TYPb
+                    if (k < length) {
+                        if (aml[k] == 0x0A && k + 1 < length) {
+                            g_slp_typb = aml[k + 1];
+                            k += 2;
+                        } else {
+                            g_slp_typb = aml[k];
+                            k += 1;
+                        }
+                    }
+                    return 1; // Success
+                }
+            }
+        }
+    }
+    return 0; // Not found
+}
+
+void acpi_pm_init(void) {
+    acpi_fadt_t *fadt = (acpi_fadt_t *)acpi_find_table(ACPI_SIG_FADT);
+    if (!fadt) {
+        kprintf("ACPI PM: FADT not found, power management unavailable\n");
+        return;
+    }
+
+    // Read PM1a/PM1b control block I/O port addresses directly from FADT
+    g_pm1a_cnt_blk = fadt->pm1a_control_block;
+    g_pm1b_cnt_blk = fadt->pm1b_control_block;
+
+    // Save reset register info
+    if (fadt->header.length >= 129) {
+        g_reset_reg_space = fadt->reset_reg_addr_space;
+        g_reset_reg_addr = fadt->reset_reg_address;
+        g_reset_value = fadt->reset_value;
+    }
+
+    // Find the DSDT to parse \_S5 for sleep type values
+    uint64_t dsdt_addr = 0;
+    if (fadt->header.length >= 148 && fadt->x_dsdt != 0) {
+        dsdt_addr = fadt->x_dsdt;
+    } else {
+        dsdt_addr = fadt->dsdt;
+    }
+
+    if (dsdt_addr) {
+        acpi_sdt_header_t *dsdt = (acpi_sdt_header_t *)phys_to_virt(dsdt_addr);
+        uint8_t *aml = (uint8_t *)dsdt + sizeof(acpi_sdt_header_t);
+        uint32_t aml_len = dsdt->length - sizeof(acpi_sdt_header_t);
+        if (acpi_parse_s5(aml, aml_len)) {
+            kprintf("ACPI PM: S5 sleep type: SLP_TYPa=%u SLP_TYPb=%u\n",
+                    g_slp_typa, g_slp_typb);
+        } else {
+            kprintf("ACPI PM: \\_S5 not found in DSDT, using defaults\n");
+            g_slp_typa = 5;  // Common default for S5
+            g_slp_typb = 0;
+        }
+    }
+
+    g_pm_initialized = 1;
+    kprintf("ACPI PM: initialized (PM1a=0x%x, PM1b=0x%x, reset=0x%lx)\n",
+            g_pm1a_cnt_blk, g_pm1b_cnt_blk, (unsigned long)g_reset_reg_addr);
+}
+
+void acpi_poweroff(void) {
+    if (!g_pm_initialized) {
+        kprintf("ACPI: power management not initialized, trying QEMU exit\n");
+        // QEMU debug exit (ISA debug port)
+        acpi_outw(0x604, 0x2000);
+        // If that didn't work, halt
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+
+    kprintf("ACPI: powering off...\n");
+
+    // Disable all interrupts
+    __asm__ volatile("cli");
+
+    // Write SLP_TYPa | SLP_EN to PM1a control register
+    uint16_t val = ACPI_PM1_SLP_TYP(g_slp_typa) | ACPI_PM1_SLP_EN;
+    acpi_outw((uint16_t)g_pm1a_cnt_blk, val);
+
+    // If PM1b exists, write there too
+    if (g_pm1b_cnt_blk) {
+        val = ACPI_PM1_SLP_TYP(g_slp_typb) | ACPI_PM1_SLP_EN;
+        acpi_outw((uint16_t)g_pm1b_cnt_blk, val);
+    }
+
+    // If ACPI poweroff failed, try QEMU debug port
+    acpi_outw(0x604, 0x2000);
+
+    // Should not reach here
+    for (;;) __asm__ volatile("hlt");
+}
+
+void acpi_reset(void) {
+    kprintf("ACPI: resetting system...\n");
+
+    // Disable all interrupts
+    __asm__ volatile("cli");
+
+    // Method 1: ACPI reset register (ACPI 2.0+)
+    if (g_reset_reg_addr != 0) {
+        if (g_reset_reg_space == 1) {
+            // System I/O space
+            acpi_outb((uint16_t)g_reset_reg_addr, g_reset_value);
+        }
+        // Small delay
+        for (volatile int i = 0; i < 1000000; i++);
+    }
+
+    // Method 2: Keyboard controller reset (8042)
+    // Pulse the CPU reset line via the keyboard controller
+    uint8_t good = 0x02;
+    while (good & 0x02) {
+        __asm__ volatile("inb $0x64, %0" : "=a"(good));
+    }
+    __asm__ volatile("outb %0, $0x64" :: "a"((uint8_t)0xFE));
+
+    // Small delay
+    for (volatile int i = 0; i < 1000000; i++);
+
+    // Method 3: Triple fault — load a null IDT and trigger an interrupt
+    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) null_idt = {0, 0};
+    __asm__ volatile("lidt %0; int $3" :: "m"(null_idt));
+
+    // Should never reach here
+    for (;;) __asm__ volatile("hlt");
+}

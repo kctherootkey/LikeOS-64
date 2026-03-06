@@ -52,6 +52,7 @@ unsigned int sleep(unsigned int seconds);
 int gethostname(char* name, size_t len);
 char* getlogin(void);
 int fsync(int fd);
+void sync(void);
 int ftruncate(int fd, off_t length);
 int fcntl(int fd, int cmd, ...);
 int isatty(int fd);

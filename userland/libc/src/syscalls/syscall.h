@@ -118,6 +118,9 @@
 // Memory protection
 #define SYS_MPROTECT        329
 
+// System management
+#define SYS_REBOOT          330
+
 // Syscall wrapper - uses inline assembly to invoke syscall instruction
 static inline long syscall0(long number) {
     long ret;

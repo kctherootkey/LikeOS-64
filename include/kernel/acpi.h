@@ -252,4 +252,80 @@ uint32_t acpi_irq_to_gsi(uint8_t isa_irq);
 // Debug: Print ACPI information
 void acpi_print_info(void);
 
+// ============================================================================
+// FADT (Fixed ACPI Description Table) for Power Management
+// ============================================================================
+typedef struct __attribute__((packed)) {
+    acpi_sdt_header_t header;
+    uint32_t firmware_ctrl;
+    uint32_t dsdt;
+    uint8_t  reserved0;
+    uint8_t  preferred_pm_profile;
+    uint16_t sci_interrupt;
+    uint32_t smi_command_port;
+    uint8_t  acpi_enable;
+    uint8_t  acpi_disable;
+    uint8_t  s4bios_req;
+    uint8_t  pstate_control;
+    uint32_t pm1a_event_block;
+    uint32_t pm1b_event_block;
+    uint32_t pm1a_control_block;
+    uint32_t pm1b_control_block;
+    uint32_t pm2_control_block;
+    uint32_t pm_timer_block;
+    uint32_t gpe0_block;
+    uint32_t gpe1_block;
+    uint8_t  pm1_event_length;
+    uint8_t  pm1_control_length;
+    uint8_t  pm2_control_length;
+    uint8_t  pm_timer_length;
+    uint8_t  gpe0_block_length;
+    uint8_t  gpe1_block_length;
+    uint8_t  gpe1_base;
+    uint8_t  cstate_control;
+    uint16_t worst_c2_latency;
+    uint16_t worst_c3_latency;
+    uint16_t flush_size;
+    uint16_t flush_stride;
+    uint8_t  duty_offset;
+    uint8_t  duty_width;
+    uint8_t  day_alarm;
+    uint8_t  month_alarm;
+    uint8_t  century;
+    uint16_t boot_arch_flags;
+    uint8_t  reserved1;
+    uint32_t flags;
+    /* Generic Address Structure for reset register (ACPI 2.0+) */
+    uint8_t  reset_reg_addr_space;
+    uint8_t  reset_reg_bit_width;
+    uint8_t  reset_reg_bit_offset;
+    uint8_t  reset_reg_access_size;
+    uint64_t reset_reg_address;
+    uint8_t  reset_value;
+    uint16_t arm_boot_arch;
+    uint8_t  fadt_minor_version;
+    uint64_t x_firmware_ctrl;
+    uint64_t x_dsdt;
+    /* Extended PM registers (ACPI 2.0+) */
+    uint8_t  x_pm1a_event_block[12];
+    uint8_t  x_pm1b_event_block[12];
+    uint8_t  x_pm1a_control_block[12];
+    uint8_t  x_pm1b_control_block[12];
+    uint8_t  x_pm2_control_block[12];
+    uint8_t  x_pm_timer_block[12];
+    uint8_t  x_gpe0_block[12];
+    uint8_t  x_gpe1_block[12];
+} acpi_fadt_t;
+
+// PM1 control register bits
+#define ACPI_PM1_SLP_EN     (1 << 13)
+#define ACPI_PM1_SLP_TYP(x) ((x) << 10)
+
+// Power management: shutdown and reset
+void acpi_poweroff(void);
+void acpi_reset(void);
+
+// Initialize power management (call after acpi_init)
+void acpi_pm_init(void);
+
 #endif // _KERNEL_ACPI_H_

@@ -19,6 +19,7 @@
 #include "../../include/kernel/percpu.h"
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/futex.h"
+#include "../../include/kernel/acpi.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
@@ -3657,6 +3658,78 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot) {
     return 0;
 }
 
+// Linux reboot() magic numbers and commands
+#define LINUX_REBOOT_MAGIC1        0xfee1dead
+#define LINUX_REBOOT_MAGIC2        672274793   // 0x28121969
+#define LINUX_REBOOT_MAGIC2A       85072278
+#define LINUX_REBOOT_MAGIC2B       369367448
+#define LINUX_REBOOT_MAGIC2C       537993216
+
+#define LINUX_REBOOT_CMD_RESTART   0x01234567
+#define LINUX_REBOOT_CMD_HALT      0xCDEF0123
+#define LINUX_REBOOT_CMD_CAD_ON    0x89ABCDEF
+#define LINUX_REBOOT_CMD_CAD_OFF   0x00000000
+#define LINUX_REBOOT_CMD_POWER_OFF 0x4321FEDC
+#define LINUX_REBOOT_CMD_RESTART2  0xA1B2C3D4
+
+static int g_cad_enabled = 0;  // Ctrl-Alt-Del behaviour
+
+static int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd, uint64_t arg) {
+    // Validate magic numbers
+    if ((uint32_t)magic1 != LINUX_REBOOT_MAGIC1)
+        return -EINVAL;
+    
+    uint32_t m2 = (uint32_t)magic2;
+    if (m2 != LINUX_REBOOT_MAGIC2 && m2 != LINUX_REBOOT_MAGIC2A &&
+        m2 != LINUX_REBOOT_MAGIC2B && m2 != LINUX_REBOOT_MAGIC2C)
+        return -EINVAL;
+    
+    // Only root (PID 1 shell or PID 0) can reboot - we don't have UID so check PID <= 2
+    // In a simple OS, just allow it from any process for now
+    
+    switch ((uint32_t)cmd) {
+        case LINUX_REBOOT_CMD_RESTART:
+            kprintf("[REBOOT] System is going down for reboot NOW!\n");
+            __asm__ volatile("cli");
+            smp_halt_others();
+            acpi_reset();
+            for (;;) __asm__ volatile("hlt");
+        
+        case LINUX_REBOOT_CMD_HALT:
+            kprintf("[HALT] System halted.\n");
+            __asm__ volatile("cli");
+            smp_halt_others();
+            for (;;) __asm__ volatile("hlt");
+        
+        case LINUX_REBOOT_CMD_POWER_OFF:
+            kprintf("[POWEROFF] Power down.\n");
+            __asm__ volatile("cli");
+            smp_halt_others();
+            acpi_poweroff();
+            for (;;) __asm__ volatile("hlt");
+            
+        case LINUX_REBOOT_CMD_CAD_ON:
+            g_cad_enabled = 1;
+            return 0;
+            
+        case LINUX_REBOOT_CMD_CAD_OFF:
+            g_cad_enabled = 0;
+            return 0;
+            
+        case LINUX_REBOOT_CMD_RESTART2: {
+            // arg is a pointer to a command string (ignored in our impl)
+            kprintf("[REBOOT] System is going down for reboot NOW!\n");
+            __asm__ volatile("cli");
+            smp_halt_others();
+            acpi_reset();
+            for (;;) __asm__ volatile("hlt");
+        }
+            
+        default:
+            return -EINVAL;
+    }
+}
+
 // Main syscall dispatcher (inner function)
 static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2, 
                         uint64_t a3, uint64_t a4, uint64_t a5) {
@@ -3937,6 +4010,9 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
             return sys_sched_rr_get_interval(a1, a2);
         case SYS_MPROTECT:
             return sys_mprotect(a1, a2, a3);
+            
+        case SYS_REBOOT:
+            return sys_reboot(a1, a2, a3, a4);
             
         case SYS_MEMSTATS:
             mm_print_memory_stats();

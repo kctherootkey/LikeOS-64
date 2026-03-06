@@ -132,6 +132,7 @@ void continue_system_startup(void) {
     // This sets up per-CPU data and detects available CPUs via ACPI
     // Pass RSDP address from UEFI bootloader for proper ACPI table discovery
     acpi_init(g_rsdp_address);
+    acpi_pm_init();
     percpu_init();
     smp_init(g_smp_trampoline_address);
     

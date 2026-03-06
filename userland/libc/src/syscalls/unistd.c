@@ -10,6 +10,7 @@
 #include "../../include/fcntl.h"
 #include "../../include/stdarg.h"
 #include "../../include/signal.h"
+#include "../../include/sys/reboot.h"
 #include "syscall.h"
 
 int errno = 0;
@@ -264,6 +265,10 @@ int fsync(int fd) {
     return 0;
 }
 
+void sync(void) {
+    /* LikeOS FAT32 writes are synchronous - no-op */
+}
+
 int ftruncate(int fd, off_t length) {
     long ret = syscall2(SYS_FTRUNCATE, fd, length);
     if (ret < 0) { errno = -ret; return -1; }
@@ -483,6 +488,13 @@ int chmod(const char* path, mode_t mode) {
 
 int fchmod(int fd, mode_t mode) {
     long ret = syscall2(SYS_FCHMOD, fd, mode);
+    if (ret < 0) { errno = -ret; return -1; }
+    return 0;
+}
+
+int reboot(int cmd) {
+    // Use Linux reboot magic numbers
+    long ret = syscall4(SYS_REBOOT, 0xfee1dead, 672274793, cmd, 0);
     if (ret < 0) { errno = -ret; return -1; }
     return 0;
 }

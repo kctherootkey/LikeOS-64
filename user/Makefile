@@ -19,9 +19,9 @@ CRT1 = $(LIBC_DIR)/crt1.o
 LIBS = -lc -l:ld-likeos.so
 
 # Programs
-PROGRAMS = test_syscalls test_libc hello sh ls cat pwd stat progerr testmem memstat teststress uname
+PROGRAMS = test_syscalls test_libc hello sh ls cat pwd stat progerr testmem memstat teststress uname shutdown poweroff
 
-all: $(PROGRAMS)
+all: $(PROGRAMS) reboot halt
 
 # Generic link rule: crt1.o + program.o → PIE binary linked against libc.so + libpthread.so
 define LINK_RULE
@@ -31,6 +31,13 @@ endef
 
 $(foreach prog,$(PROGRAMS),$(eval $(call LINK_RULE,$(prog))))
 
+# reboot and halt are copies of poweroff (determines action from argv[0])
+reboot: poweroff
+	cp poweroff reboot
+
+halt: poweroff
+	cp poweroff halt
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -38,6 +45,6 @@ $(foreach prog,$(PROGRAMS),$(eval $(call LINK_RULE,$(prog))))
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f *.o $(PROGRAMS)
+	rm -f *.o $(PROGRAMS) reboot halt
 
 .PHONY: all clean
