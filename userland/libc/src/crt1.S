@@ -33,6 +33,20 @@ _start:
     /* Align stack to 16 bytes */
     and     $-16, %rsp
 
+    /* Save argc, argv, envp in callee-saved registers across call */
+    mov     %rdi, %rbx         /* rbx = argc  */
+    mov     %rsi, %r12         /* r12 = argv  */
+    mov     %rdx, %r13         /* r13 = envp  */
+
+    /* Populate libc environment storage from envp before main */
+    mov     %rdx, %rdi
+    call    __libc_init_environ
+
+    /* Restore argc, argv, envp for main(argc, argv, envp) */
+    mov     %rbx, %rdi
+    mov     %r12, %rsi
+    mov     %r13, %rdx
+
     /* Call main(argc, argv, envp) */
     call    main
 

@@ -5,12 +5,10 @@
 #include "../../include/errno.h"
 
 // Simple environment variable storage
-#define MAX_ENV_VARS 32
-#define MAX_ENV_SIZE 256
 
 static char env_names[MAX_ENV_VARS][MAX_ENV_SIZE];
 static char env_values[MAX_ENV_VARS][MAX_ENV_SIZE];
-static int env_count = 0;
+static int g_env_count = 0;
 
 void exit(int status) {
     _exit(status);
@@ -121,7 +119,7 @@ char* getenv(const char* name) {
         return NULL;
     }
     
-    for (int i = 0; i < env_count; i++) {
+    for (int i = 0; i < g_env_count; i++) {
         if (strcmp(env_names[i], name) == 0) {
             return env_values[i];
         }
@@ -135,7 +133,7 @@ int setenv(const char* name, const char* value, int overwrite) {
     }
     
     // Check if variable already exists
-    for (int i = 0; i < env_count; i++) {
+    for (int i = 0; i < g_env_count; i++) {
         if (strcmp(env_names[i], name) == 0) {
             if (overwrite) {
                 strncpy(env_values[i], value, MAX_ENV_SIZE - 1);
@@ -146,15 +144,15 @@ int setenv(const char* name, const char* value, int overwrite) {
     }
     
     // Add new variable
-    if (env_count >= MAX_ENV_VARS) {
+    if (g_env_count >= MAX_ENV_VARS) {
         return -1;  // No space
     }
     
-    strncpy(env_names[env_count], name, MAX_ENV_SIZE - 1);
-    env_names[env_count][MAX_ENV_SIZE - 1] = '\0';
-    strncpy(env_values[env_count], value, MAX_ENV_SIZE - 1);
-    env_values[env_count][MAX_ENV_SIZE - 1] = '\0';
-    env_count++;
+    strncpy(env_names[g_env_count], name, MAX_ENV_SIZE - 1);
+    env_names[g_env_count][MAX_ENV_SIZE - 1] = '\0';
+    strncpy(env_values[g_env_count], value, MAX_ENV_SIZE - 1);
+    env_values[g_env_count][MAX_ENV_SIZE - 1] = '\0';
+    g_env_count++;
     
     return 0;
 }
@@ -164,18 +162,74 @@ int unsetenv(const char* name) {
         return -1;
     }
     
-    for (int i = 0; i < env_count; i++) {
+    for (int i = 0; i < g_env_count; i++) {
         if (strcmp(env_names[i], name) == 0) {
             // Move last entry to this position
-            if (i < env_count - 1) {
-                strcpy(env_names[i], env_names[env_count - 1]);
-                strcpy(env_values[i], env_values[env_count - 1]);
+            if (i < g_env_count - 1) {
+                strcpy(env_names[i], env_names[g_env_count - 1]);
+                strcpy(env_values[i], env_values[g_env_count - 1]);
             }
-            env_count--;
+            g_env_count--;
             return 0;
         }
     }
     return 0;  // Not found is not an error
+}
+
+int clearenv(void) {
+    g_env_count = 0;
+    return 0;
+}
+
+int putenv(char* string) {
+    if (!string) return -1;
+    char* eq = strchr(string, '=');
+    if (!eq) {
+        /* No '=' means remove the variable */
+        return unsetenv(string);
+    }
+    /* Split at '=' */
+    size_t nlen = (size_t)(eq - string);
+    if (nlen == 0 || nlen >= MAX_ENV_SIZE) return -1;
+    char name[MAX_ENV_SIZE];
+    memcpy(name, string, nlen);
+    name[nlen] = '\0';
+    return setenv(name, eq + 1, 1);
+}
+
+int env_iter(int *cookie, const char **name, const char **value) {
+    if (!cookie || !name || !value) return 0;
+    int idx = *cookie;
+    if (idx < 0 || idx >= g_env_count) return 0;
+    *name = env_names[idx];
+    *value = env_values[idx];
+    *cookie = idx + 1;
+    return 1;
+}
+
+int env_count(void) {
+    return g_env_count;
+}
+
+/*
+ * Called from _start (crt0.S) before main() to populate the libc
+ * static environment storage from the envp[] array that the kernel
+ * placed on the stack.
+ */
+void __libc_init_environ(char **envp) {
+    g_env_count = 0;
+    if (!envp) return;
+    for (int i = 0; envp[i] && g_env_count < MAX_ENV_VARS; i++) {
+        char *eq = strchr(envp[i], '=');
+        if (!eq) continue;
+        size_t nlen = (size_t)(eq - envp[i]);
+        if (nlen == 0 || nlen >= MAX_ENV_SIZE) continue;
+        memcpy(env_names[g_env_count], envp[i], nlen);
+        env_names[g_env_count][nlen] = '\0';
+        strncpy(env_values[g_env_count], eq + 1, MAX_ENV_SIZE - 1);
+        env_values[g_env_count][MAX_ENV_SIZE - 1] = '\0';
+        g_env_count++;
+    }
 }
 
 static int normalize_path(const char* in, char* out, size_t out_size) {

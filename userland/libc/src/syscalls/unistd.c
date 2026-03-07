@@ -193,7 +193,36 @@ int execve(const char* pathname, char* const argv[], char* const envp[]) {
 }
 
 int execv(const char* pathname, char* const argv[]) {
-    return execve(pathname, argv, NULL);
+    /*
+     * Build envp from the libc static environment storage so that
+     * child processes inherit the current environment.
+     */
+    int n = env_count();
+    if (n <= 0)
+        return execve(pathname, argv, NULL);
+
+    /* Static buffers are fine: execve replaces the process on success */
+    static char bufs[MAX_ENV_VARS][MAX_ENV_SIZE * 2 + 2];
+    char *envp[MAX_ENV_VARS + 1];
+
+    int cookie = 0;
+    const char *name, *value;
+    int i = 0;
+    while (env_iter(&cookie, &name, &value) && i < MAX_ENV_VARS) {
+        size_t nlen = strlen(name);
+        size_t vlen = strlen(value);
+        if (nlen + 1 + vlen + 1 > sizeof(bufs[i])) {
+            /* skip oversized entry */
+            continue;
+        }
+        memcpy(bufs[i], name, nlen);
+        bufs[i][nlen] = '=';
+        memcpy(bufs[i] + nlen + 1, value, vlen + 1);
+        envp[i] = bufs[i];
+        i++;
+    }
+    envp[i] = NULL;
+    return execve(pathname, argv, envp);
 }
 
 int execvp(const char* file, char* const argv[]) {
@@ -209,7 +238,7 @@ int execvp(const char* file, char* const argv[]) {
     // PATH search
     const char* path = getenv("PATH");
     if (!path) {
-        return execv(file, argv);
+        path = "/bin:/usr/local/bin";
     }
     char full[256];
     const char* start = path;

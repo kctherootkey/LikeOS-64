@@ -3,6 +3,10 @@
 
 #include <stddef.h>
 
+/* Environment storage limits */
+#define MAX_ENV_VARS 128
+#define MAX_ENV_SIZE 4096
+
 // Memory allocation
 void* malloc(size_t size);
 void* calloc(size_t nmemb, size_t size);
@@ -26,6 +30,18 @@ void abort(void) __attribute__((noreturn));
 char* getenv(const char* name);
 int setenv(const char* name, const char* value, int overwrite);
 int unsetenv(const char* name);
+int clearenv(void);
+int putenv(char* string);
+
+/* Iterate all environment variables.
+ * Call with *cookie = 0 to start; returns name/value pairs.
+ * Returns 0 when no more variables. */
+int env_iter(int *cookie, const char **name, const char **value);
+/* Return count of environment variables */
+int env_count(void);
+
+/* Initialize libc env storage from envp[] (called by _start before main) */
+void __libc_init_environ(char **envp);
 
 // Path utilities
 char* realpath(const char* path, char* resolved_path);
