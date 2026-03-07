@@ -36,6 +36,7 @@ static int term_rows = 25;
 static int term_cols = 80;
 static struct termios saved_termios;
 static int raw_mode = 0;
+static int tty_fd = -1;  /* fd for keyboard/terminal control (/dev/tty when piped) */
 
 /* File list */
 static int file_count = 0;
@@ -51,10 +52,18 @@ static char **lines = NULL;
 static int total_lines = 0;
 static int current_line = 0;
 static int scroll_size = 11;
+static int lines_capacity = 0;
+
+/* Pipe incremental reading */
+static int pipe_fd = -1;
+static char pipe_linebuf[LINE_BUF_SIZE];
+static int pipe_lpos = 0;
+static int pipe_prev_blank = 0;
 
 static void get_term_size(void) {
     struct winsize ws;
-    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) {
+    int fd = (tty_fd >= 0) ? tty_fd : STDIN_FILENO;
+    if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) {
         term_rows = ws.ws_row;
         term_cols = ws.ws_col;
     }
@@ -63,18 +72,20 @@ static void get_term_size(void) {
 }
 
 static void enter_raw_mode(void) {
-    if (!isatty(STDIN_FILENO))
+    int fd = (tty_fd >= 0) ? tty_fd : STDIN_FILENO;
+    if (!isatty(fd))
         return;
-    tcgetattr(STDIN_FILENO, &saved_termios);
+    tcgetattr(fd, &saved_termios);
     struct termios raw = saved_termios;
     raw.c_lflag &= ~(ICANON | ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    tcsetattr(fd, TCSANOW, &raw);
     raw_mode = 1;
 }
 
 static void exit_raw_mode(void) {
     if (raw_mode) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
+        int fd = (tty_fd >= 0) ? tty_fd : STDIN_FILENO;
+        tcsetattr(fd, TCSANOW, &saved_termios);
         raw_mode = 0;
     }
 }
@@ -94,7 +105,8 @@ static void clear_line(void) {
 /* Read a single character from terminal */
 static int read_char(void) {
     char c;
-    if (read(STDIN_FILENO, &c, 1) != 1)
+    int fd = (tty_fd >= 0) ? tty_fd : STDIN_FILENO;
+    if (read(fd, &c, 1) != 1)
         return -1;
     return (unsigned char)c;
 }
@@ -102,7 +114,10 @@ static int read_char(void) {
 /* Display the --More-- prompt */
 static void show_prompt(const char *filename) {
     char buf[256];
-    if (total_lines > 0) {
+    if (pipe_fd >= 0) {
+        /* Pipe still open — don't show percentage, it would be misleading */
+        snprintf(buf, sizeof(buf), "--More--");
+    } else if (total_lines > 0) {
         int pct = (current_line * 100) / total_lines;
         if (pct > 100) pct = 100;
         snprintf(buf, sizeof(buf), "--More--(%d%%)", pct);
@@ -130,15 +145,63 @@ static void free_lines(void) {
     }
     total_lines = 0;
     current_line = 0;
+    lines_capacity = 0;
+}
+
+static int add_line_more(const char *text, int len) {
+    if (total_lines >= lines_capacity) {
+        int new_cap = lines_capacity ? lines_capacity * 2 : 1024;
+        if (new_cap > MAX_LINES) new_cap = MAX_LINES;
+        if (total_lines >= new_cap) return -1;
+        char **new_lines = (char **)realloc(lines, (size_t)new_cap * sizeof(char *));
+        if (!new_lines) return -1;
+        lines = new_lines;
+        lines_capacity = new_cap;
+    }
+    lines[total_lines] = (char *)malloc((size_t)(len + 1));
+    if (!lines[total_lines]) return -1;
+    memcpy(lines[total_lines], text, (size_t)len);
+    lines[total_lines][len] = '\0';
+    total_lines++;
+    return 0;
+}
+
+/* Read more data from pipe (non-blocking). Returns 1 if new lines, 0 if nothing, -1 on EOF */
+static int pipe_read_more(void) {
+    if (pipe_fd < 0) return -1;
+    char buf[4096];
+    int added = 0;
+    for (;;) {
+        ssize_t r = read(pipe_fd, buf, sizeof(buf));
+        if (r < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            goto eof;
+        }
+        if (r == 0) goto eof;
+        for (ssize_t i = 0; i < r; i++) {
+            if (buf[i] == '\n' || pipe_lpos >= LINE_BUF_SIZE - 1) {
+                int is_blank = (pipe_lpos == 0);
+                if (opt_squeeze && is_blank && pipe_prev_blank)
+                    { pipe_lpos = 0; continue; }
+                pipe_prev_blank = is_blank;
+                add_line_more(pipe_linebuf, pipe_lpos);
+                pipe_lpos = 0;
+                added = 1;
+            } else {
+                pipe_linebuf[pipe_lpos++] = buf[i];
+            }
+        }
+    }
+    return added ? 1 : 0;
+eof:
+    if (pipe_lpos > 0) { add_line_more(pipe_linebuf, pipe_lpos); pipe_lpos = 0; added = 1; }
+    pipe_fd = -1;
+    return added ? 1 : -1;
 }
 
 /* Load file into lines array. Returns 0 on success. */
 static int load_file(int fd) {
     free_lines();
-
-    int capacity = 1024;
-    lines = (char **)malloc((size_t)capacity * sizeof(char *));
-    if (!lines) return -1;
 
     char buf[4096];
     char linebuf[LINE_BUF_SIZE];
@@ -152,27 +215,11 @@ static int load_file(int fd) {
 
         for (ssize_t i = 0; i < r; i++) {
             if (buf[i] == '\n' || line_pos >= LINE_BUF_SIZE - 1) {
-                linebuf[line_pos] = '\0';
-
-                /* Squeeze blank lines */
                 int is_blank = (line_pos == 0);
-                if (opt_squeeze && is_blank && prev_blank) {
-                    line_pos = 0;
-                    continue;
-                }
+                if (opt_squeeze && is_blank && prev_blank)
+                    { line_pos = 0; continue; }
                 prev_blank = is_blank;
-
-                if (total_lines >= capacity) {
-                    capacity *= 2;
-                    char **new_lines = (char **)realloc(lines, (size_t)capacity * sizeof(char *));
-                    if (!new_lines) return -1;
-                    lines = new_lines;
-                }
-
-                lines[total_lines] = (char *)malloc((size_t)(line_pos + 1));
-                if (!lines[total_lines]) return -1;
-                memcpy(lines[total_lines], linebuf, (size_t)(line_pos + 1));
-                total_lines++;
+                if (add_line_more(linebuf, line_pos) < 0) return -1;
                 line_pos = 0;
             } else {
                 linebuf[line_pos++] = buf[i];
@@ -180,19 +227,56 @@ static int load_file(int fd) {
         }
     }
 
-    /* Handle last line without newline */
     if (line_pos > 0) {
-        linebuf[line_pos] = '\0';
-        if (total_lines >= capacity) {
-            capacity++;
-            char **new_lines = (char **)realloc(lines, (size_t)capacity * sizeof(char *));
-            if (!new_lines) return -1;
-            lines = new_lines;
+        if (add_line_more(linebuf, line_pos) < 0) return -1;
+    }
+
+    return 0;
+}
+
+/* Load initial data from pipe, then return for interactive paging */
+static int load_pipe_more(int fd) {
+    free_lines();
+    pipe_lpos = 0;
+    pipe_prev_blank = 0;
+
+    int fl = fcntl(fd, F_GETFL);
+    pipe_fd = fd;  /* set immediately so EOF paths can clear it */
+
+    int screen_lines = term_rows - 1;
+    int need_lines = screen_lines + 1;
+
+    /* Read at least one screenful (blocking) */
+    char buf[4096];
+    while (total_lines < need_lines) {
+        ssize_t r = read(fd, buf, sizeof(buf));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            pipe_fd = -1;
+            return total_lines > 0 ? 0 : -1;
         }
-        lines[total_lines] = (char *)malloc((size_t)(line_pos + 1));
-        if (!lines[total_lines]) return -1;
-        memcpy(lines[total_lines], linebuf, (size_t)(line_pos + 1));
-        total_lines++;
+        if (r == 0) {
+            if (pipe_lpos > 0) { add_line_more(pipe_linebuf, pipe_lpos); pipe_lpos = 0; }
+            pipe_fd = -1;
+            break;
+        }
+        for (ssize_t i = 0; i < r; i++) {
+            if (buf[i] == '\n' || pipe_lpos >= LINE_BUF_SIZE - 1) {
+                int is_blank = (pipe_lpos == 0);
+                if (opt_squeeze && is_blank && pipe_prev_blank)
+                    { pipe_lpos = 0; continue; }
+                pipe_prev_blank = is_blank;
+                add_line_more(pipe_linebuf, pipe_lpos);
+                pipe_lpos = 0;
+            } else {
+                pipe_linebuf[pipe_lpos++] = buf[i];
+            }
+        }
+    }
+
+    /* Set non-blocking for subsequent reads */
+    if (pipe_fd >= 0) {
+        fcntl(pipe_fd, F_SETFL, fl | O_NONBLOCK);
     }
 
     return 0;
@@ -201,7 +285,47 @@ static int load_file(int fd) {
 /* Display one screenful of lines starting at current_line */
 static void display_screen(int num_lines) {
     int displayed = 0;
-    while (displayed < num_lines && current_line < total_lines) {
+    while (displayed < num_lines) {
+        /* If we've consumed all loaded lines but pipe is still open, block for more */
+        if (current_line >= total_lines && pipe_fd >= 0) {
+            int fl = fcntl(pipe_fd, F_GETFL);
+            fcntl(pipe_fd, F_SETFL, fl & ~O_NONBLOCK);  /* blocking */
+
+            char buf[4096];
+            int got_lines = 0;
+            while (!got_lines && pipe_fd >= 0) {
+                ssize_t r = read(pipe_fd, buf, sizeof(buf));
+                if (r <= 0) {
+                    if (pipe_lpos > 0) {
+                        add_line_more(pipe_linebuf, pipe_lpos);
+                        pipe_lpos = 0;
+                    }
+                    pipe_fd = -1;
+                    break;
+                }
+                for (ssize_t i = 0; i < r; i++) {
+                    if (buf[i] == '\n' || pipe_lpos >= LINE_BUF_SIZE - 1) {
+                        int is_blank = (pipe_lpos == 0);
+                        if (opt_squeeze && is_blank && pipe_prev_blank)
+                            { pipe_lpos = 0; continue; }
+                        pipe_prev_blank = is_blank;
+                        add_line_more(pipe_linebuf, pipe_lpos);
+                        pipe_lpos = 0;
+                        got_lines = 1;
+                    } else {
+                        pipe_linebuf[pipe_lpos++] = buf[i];
+                    }
+                }
+            }
+
+            /* Restore non-blocking */
+            if (pipe_fd >= 0)
+                fcntl(pipe_fd, F_SETFL, fl);
+        }
+
+        if (current_line >= total_lines)
+            break;
+
         write_str(lines[current_line]);
         write_str("\n");
         current_line++;
@@ -272,13 +396,15 @@ static int page_file(const char *filename) {
     display_screen(screen_lines);
 
     if (current_line >= total_lines) {
-        if (opt_exit_on_eof || !isatty(STDIN_FILENO))
+        if (opt_exit_on_eof || (pipe_fd < 0 && tty_fd < 0 && !isatty(STDIN_FILENO)))
             return 0;
     }
 
     /* Interactive loop */
     for (;;) {
-        if (current_line >= total_lines) {
+        /* Pull in new data from pipe (non-blocking) */
+        pipe_read_more();
+        if (current_line >= total_lines && pipe_fd < 0) {
             if (opt_exit_on_eof)
                 return 0;
             /* Show (END) prompt */
@@ -614,6 +740,11 @@ int main(int argc, char **argv) {
     (void)opt_no_pause;
     (void)opt_plain;
 
+    /* If stdin is not a tty (piped), open /dev/tty for keyboard input */
+    if (!isatty(STDIN_FILENO)) {
+        tty_fd = open("/dev/tty", O_RDWR);
+    }
+
     get_term_size();
     enter_raw_mode();
 
@@ -624,8 +755,8 @@ int main(int argc, char **argv) {
     int ret = 0;
 
     if (file_count == 0) {
-        /* Read stdin */
-        if (load_file(STDIN_FILENO) != 0) {
+        /* Read stdin (pipe) — use incremental loading */
+        if (load_pipe_more(STDIN_FILENO) != 0) {
             fprintf(stderr, "%s: cannot read standard input: %s\n",
                     PROGRAM_NAME, strerror(errno));
             ret = 1;
@@ -683,6 +814,14 @@ int main(int argc, char **argv) {
     write_str("\n");
     free_lines();
     exit_raw_mode();
+    if (pipe_fd >= 0) {
+        close(pipe_fd);
+        pipe_fd = -1;
+    }
+    if (tty_fd >= 0) {
+        close(tty_fd);
+        tty_fd = -1;
+    }
     free(real_argv);
     return ret;
 }

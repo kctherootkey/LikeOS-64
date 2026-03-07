@@ -20,6 +20,7 @@
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/futex.h"
 #include "../../include/kernel/acpi.h"
+#include "../../include/kernel/fat32.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
@@ -228,6 +229,12 @@ static int64_t pipe_read_to_user(pipe_end_t* end, uint64_t buf, uint64_t count) 
             return 0;  // EOF - no more writers
         }
         
+        // Non-blocking mode: return EAGAIN immediately
+        if (end->flags & O_NONBLOCK) {
+            spin_unlock_irqrestore(&pipe->lock, flags);
+            return -EAGAIN;
+        }
+        
         // Check for pending signals BEFORE blocking
         if (cur && signal_pending(cur)) {
             spin_unlock_irqrestore(&pipe->lock, flags);
@@ -291,24 +298,55 @@ static int64_t pipe_write_from_user(pipe_end_t* end, uint64_t buf, uint64_t coun
     if (count == 0) {
         return 0;
     }
-    
+
+    task_t* cur = sched_current();
     uint64_t flags;
+
     spin_lock_irqsave(&pipe->lock, &flags);
-    
+
     if (pipe->readers == 0) {
         spin_unlock_irqrestore(&pipe->lock, flags);
-        // No readers - send SIGPIPE to caller
-        task_t* cur = sched_current();
         if (cur) {
             sched_signal_task(cur, SIGPIPE);
         }
         return -EPIPE;
     }
-    
-    // Block if pipe is full (simplified: just return EAGAIN for now)
-    if (pipe->used == pipe->size) {
-        spin_unlock_irqrestore(&pipe->lock, flags);
-        return -EAGAIN;
+
+    // Block while pipe is full, waiting for readers to consume data
+    while (pipe->used == pipe->size) {
+        // Re-check readers (may have closed while we waited)
+        if (pipe->readers == 0) {
+            spin_unlock_irqrestore(&pipe->lock, flags);
+            if (cur) {
+                sched_signal_task(cur, SIGPIPE);
+            }
+            return -EPIPE;
+        }
+
+        // Check for pending signals BEFORE blocking
+        if (cur && signal_pending(cur)) {
+            spin_unlock_irqrestore(&pipe->lock, flags);
+            return -EINTR;
+        }
+
+        // Block waiting for space
+        if (cur) {
+            cur->state = TASK_BLOCKED;
+            cur->wait_channel = pipe;
+            spin_unlock_irqrestore(&pipe->lock, flags);
+            sched_schedule();
+            spin_lock_irqsave(&pipe->lock, &flags);
+            cur->wait_channel = NULL;
+
+            // Check if we were woken by a signal
+            if (signal_pending(cur)) {
+                spin_unlock_irqrestore(&pipe->lock, flags);
+                return -EINTR;
+            }
+        } else {
+            spin_unlock_irqrestore(&pipe->lock, flags);
+            return -EAGAIN;
+        }
     }
 
     size_t space = pipe->size - pipe->used;
@@ -480,7 +518,7 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
         if (tty && tty->fg_pgid == 0) {
             tty->fg_pgid = cur->pgid;
         }
-        if (tty && tty->fg_pgid != 0 && tty->fg_pgid != cur->pgid && (tty->term.c_lflag & ISIG)) {
+        if (tty && tty->fg_pgid != 0 && tty->fg_pgid != cur->pgid && (tty->term.c_lflag & TOSTOP)) {
             sched_signal_task(cur, SIGTTOU);
             return -EIO;
         }
@@ -497,7 +535,7 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
         if (tty && tty->fg_pgid == 0) {
             tty->fg_pgid = cur->pgid;
         }
-        if (tty && tty->fg_pgid != 0 && tty->fg_pgid != cur->pgid && (tty->term.c_lflag & ISIG)) {
+        if (tty && tty->fg_pgid != 0 && tty->fg_pgid != cur->pgid && (tty->term.c_lflag & TOSTOP)) {
             sched_signal_task(cur, SIGTTOU);
             return -EIO;
         }
@@ -1048,10 +1086,13 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length) {
 static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
-    if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) return -EBADF;
+    if (fd >= TASK_MAX_FDS) return -EBADF;
 
-    // Handle console markers
-    if (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD) {
+    vfs_file_t* file = cur->fd_table[fd];
+
+    // Handle console markers: only when fd_table entry is NULL
+    // (implicit console fd). If fd_table has a real file/pipe, skip this.
+    if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
         if (cmd == 3) { // F_GETFL
             if (fd == STDIN_FD) return O_RDONLY;
             return O_WRONLY;
@@ -1062,13 +1103,17 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
         return -EINVAL;
     }
 
-    vfs_file_t* file = cur->fd_table[fd];
+    if (!file) return -EBADF;
+
     if (pipe_is_end(file)) {
         pipe_end_t* end = (pipe_end_t*)file;
         if (cmd == 3) {
-            return end->is_read ? O_RDONLY : O_WRONLY;
+            uint32_t fl = end->is_read ? O_RDONLY : O_WRONLY;
+            if (end->flags & O_NONBLOCK) fl |= O_NONBLOCK;
+            return fl;
         }
         if (cmd == 4) {
+            end->flags = (end->flags & ~O_NONBLOCK) | ((uint32_t)arg & O_NONBLOCK);
             return 0;
         }
         return -EINVAL;
@@ -1195,16 +1240,13 @@ static int64_t sys_kill(uint64_t pid, uint64_t sig) {
         return 0;
     }
     if (pid == 0) {
-        task_t* cur = sched_current();
-        if (!cur) return -EFAULT;
-        if (sig == 0) {
-            return sched_pgid_exists(cur->pgid) ? 0 : -ESRCH;
-        }
-        sched_signal_pgrp(cur->pgid, (int)sig);
-        return 0;
+        /* PID 0 is the kernel idle task — cannot be signalled */
+        return -EPERM;
     }
     task_t* t = sched_find_task_by_id((uint32_t)pid);
     if (!t) return -ESRCH;
+    // Kernel tasks (idle, init, kernel threads) cannot be signalled
+    if (t->privilege == TASK_KERNEL) return -EPERM;
     if (sig == 0) return 0;
     kill_task(t, (int)sig);
     return 0;
@@ -1283,6 +1325,92 @@ static int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group) { (void)f
 // utimensat: FAT32 timestamps are managed by the FS driver; silently succeed
 static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times, uint64_t flags) {
     (void)dirfd; (void)pathname; (void)times; (void)flags; return 0;
+}
+
+// Userspace struct statfs layout (must match userland/libc/include/sys/vfs.h)
+typedef struct {
+    unsigned long f_type;
+    unsigned long f_bsize;
+    unsigned long f_blocks;
+    unsigned long f_bfree;
+    unsigned long f_bavail;
+    unsigned long f_files;
+    unsigned long f_ffree;
+    unsigned long f_fsid;
+    unsigned long f_namelen;
+    unsigned long f_frsize;
+    unsigned long f_flags;
+    unsigned long f_spare[4];
+} user_statfs_t;
+
+// statfs: get filesystem statistics for the given path
+static int64_t sys_statfs(uint64_t u_path, uint64_t u_buf) {
+    if (!validate_user_ptr(u_buf, sizeof(user_statfs_t)))
+        return -EFAULT;
+
+    char kpath[VFS_MAX_PATH];
+    size_t plen;
+    int err = user_strnlen((const char*)u_path, VFS_MAX_PATH, &plen);
+    if (err) return err;
+    err = copy_from_user(kpath, (const void*)u_path, plen + 1);
+    if (err) return err;
+
+    // devfs has no meaningful statfs - return ENOSYS
+    if (kpath[0] == '/' && kpath[1] == 'd' && kpath[2] == 'e' &&
+        kpath[3] == 'v' && (kpath[4] == '\0' || kpath[4] == '/'))
+        return -ENOSYS;
+
+    fat32_statfs_t kinfo;
+    err = fat32_get_statfs(&kinfo);
+    if (err) return err;
+
+    // Translate kernel struct to userspace layout
+    user_statfs_t uinfo;
+    mm_memset(&uinfo, 0, sizeof(uinfo));
+    uinfo.f_type    = kinfo.f_type;
+    uinfo.f_bsize   = kinfo.f_bsize;
+    uinfo.f_blocks  = kinfo.f_blocks;
+    uinfo.f_bfree   = kinfo.f_bfree;
+    uinfo.f_bavail  = kinfo.f_bavail;
+    uinfo.f_files   = kinfo.f_files;
+    uinfo.f_ffree   = kinfo.f_ffree;
+    uinfo.f_fsid    = kinfo.f_fsid;
+    uinfo.f_namelen = kinfo.f_namelen;
+    uinfo.f_frsize  = kinfo.f_frsize;
+    uinfo.f_flags   = 0;
+
+    return copy_to_user((void*)u_buf, &uinfo, sizeof(uinfo));
+}
+
+// fstatfs: get filesystem statistics for an open file descriptor
+static int64_t sys_fstatfs(uint64_t fd, uint64_t u_buf) {
+    if (!validate_user_ptr(u_buf, sizeof(user_statfs_t)))
+        return -EFAULT;
+    if (fd >= MAX_FDS) return -EBADF;
+
+    task_t* cur = sched_current();
+    if (!cur || !cur->fd_table[fd]) return -EBADF;
+
+    // All real file descriptors sit on the FAT32 root FS
+    fat32_statfs_t kinfo;
+    int err = fat32_get_statfs(&kinfo);
+    if (err) return err;
+
+    user_statfs_t uinfo;
+    mm_memset(&uinfo, 0, sizeof(uinfo));
+    uinfo.f_type    = kinfo.f_type;
+    uinfo.f_bsize   = kinfo.f_bsize;
+    uinfo.f_blocks  = kinfo.f_blocks;
+    uinfo.f_bfree   = kinfo.f_bfree;
+    uinfo.f_bavail  = kinfo.f_bavail;
+    uinfo.f_files   = kinfo.f_files;
+    uinfo.f_ffree   = kinfo.f_ffree;
+    uinfo.f_fsid    = kinfo.f_fsid;
+    uinfo.f_namelen = kinfo.f_namelen;
+    uinfo.f_frsize  = kinfo.f_frsize;
+    uinfo.f_flags   = 0;
+
+    return copy_to_user((void*)u_buf, &uinfo, sizeof(uinfo));
 }
 
 static int normalize_path(const char* base, const char* path, char* out, size_t out_size) {
@@ -4109,6 +4237,11 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 
         case SYS_UTIMENSAT:
             return sys_utimensat(a1, a2, a3, a4);
+
+        case SYS_STATFS:
+            return sys_statfs(a1, a2);
+        case SYS_FSTATFS:
+            return sys_fstatfs(a1, a2);
 
         // Signal syscalls
         case SYS_RT_SIGACTION:

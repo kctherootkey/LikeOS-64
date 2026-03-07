@@ -53,6 +53,7 @@ pipe_end_t* pipe_create_end(pipe_t* pipe, bool is_read) {
     end->is_read = is_read ? 1 : 0;
     end->pad[0] = end->pad[1] = end->pad[2] = 0;
     end->pipe = pipe;
+    end->flags = 0;
 
     uint64_t flags;
     spin_lock_irqsave(&pipe->lock, &flags);

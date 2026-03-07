@@ -138,6 +138,8 @@
 
 // Filesystem extended syscalls
 #define SYS_UTIMENSAT       332
+#define SYS_STATFS          333
+#define SYS_FSTATFS         334
 
 // Debug/diagnostic syscalls (LikeOS specific)
 #define SYS_MEMSTATS        300  // Print memory stats
@@ -161,6 +163,7 @@
 #define O_EXCL          0x0080
 #define O_TRUNC         0x0200
 #define O_APPEND        0x0400
+#define O_NONBLOCK      0x0800
 
 // mmap protection flags
 #define PROT_NONE       0x0

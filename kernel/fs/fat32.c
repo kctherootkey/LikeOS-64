@@ -426,6 +426,12 @@ static fat32_fs_t* g_root_fs = 0;
 static fat32_fs_t g_static_fs; // internal singleton instance
 static unsigned long g_cwd_cluster = 0; // 0 means root
 
+/* Cached free cluster count — avoids scanning the entire FAT every statfs call.
+ * Initialised from the FSInfo sector at mount time; kept in sync by alloc/free. 
+ * A value of (unsigned long)-1 means "not yet known, do a full scan once". */
+static unsigned long g_free_cluster_count = (unsigned long)-1;
+static unsigned long g_fsinfo_sector = 0; // absolute LBA of FSInfo sector
+
 static const char* fat32_normalize_start(const char* path, unsigned long* start_cluster)
 {
     if (!path || !start_cluster) return path;
@@ -543,6 +549,8 @@ static int fat32_alloc_cluster(fat32_fs_t *fs, unsigned long *out_cluster)
             if (st != ST_OK)
                 return ST_IO;
             *out_cluster = c;
+            if (g_free_cluster_count != (unsigned long)-1 && g_free_cluster_count > 0)
+                g_free_cluster_count--;
             return ST_OK;
         }
     }
@@ -560,6 +568,8 @@ static int fat32_free_chain(fat32_fs_t *fs, unsigned long start_cluster)
         unsigned long next = fat32_next_cluster_cached(fs, c);
         if (fat32_fat_set(fs, c, 0) != ST_OK)
             return ST_IO;
+        if (g_free_cluster_count != (unsigned long)-1)
+            g_free_cluster_count++;
         if (next >= 0x0FFFFFF8 || next == 0)
             break;
         c = next;
@@ -1323,6 +1333,35 @@ static int fat32_mount_at_lba(const block_device_t *bdev, unsigned long base_lba
     }
     unsigned long abs_data = out->part_lba_offset + out->data_start_lba;
     unsigned long abs_fat = out->part_lba_offset + out->fat_start_lba;
+
+    /* ---- Read FSInfo sector to get cached free cluster count ---- */
+    g_free_cluster_count = (unsigned long)-1; /* assume unknown */
+    g_fsinfo_sector = 0;
+    {
+        uint16_t fsinfo_sec = bpb->fs_info;
+        if (fsinfo_sec >= 1 && fsinfo_sec < bpb->reserved_sector_count) {
+            void *fi_buf = kalloc(512);
+            if (fi_buf) {
+                unsigned long fi_lba = base_lba + fsinfo_sec;
+                if (read_sectors(bdev, fi_lba, 1, fi_buf) == ST_OK) {
+                    uint8_t *fb = (uint8_t *)fi_buf;
+                    /* Validate FSInfo signatures: 0x41615252 at 0, 0x61417272 at 484 */
+                    uint32_t sig1 = *(uint32_t *)(fb + 0);
+                    uint32_t sig2 = *(uint32_t *)(fb + 484);
+                    if (sig1 == 0x41615252 && sig2 == 0x61417272) {
+                        uint32_t free_cnt = *(uint32_t *)(fb + 488);
+                        if (free_cnt != 0xFFFFFFFF) {
+                            g_free_cluster_count = free_cnt;
+                            g_fsinfo_sector = fi_lba;
+                            kprintf("FAT32: FSInfo free clusters = %lu\n", g_free_cluster_count);
+                        }
+                    }
+                }
+                kfree(fi_buf);
+            }
+        }
+    }
+
     kprintf("FAT32: mounted %s base=%lu root=%lu\n", bdev->name, base_lba, out->root_cluster);
     kfree(sector);
     return ST_OK;
@@ -2275,16 +2314,69 @@ static int fat32_stat_vfs(const char* path, struct kstat* st)
         return ST_INVALID;
     unsigned long start_cluster = fat32_get_task_cwd_cluster();
     const char* rpath = fat32_normalize_start(path, &start_cluster);
-    unsigned attr = 0;
-    unsigned long fc = 0;
-    unsigned long size = 0;
-    if (fat32_resolve_path(start_cluster, rpath, &attr, &fc, &size) != ST_OK) {
-        return ST_NOT_FOUND;
-    }
+
     mm_memset(st, 0, sizeof(*st));
     st->st_nlink = 1;
     st->st_uid = 0;
     st->st_gid = 0;
+
+    /* Root directory — special case, no parent entry */
+    if (rpath[0] == '\0') {
+        st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+        st->st_size = 0;
+        uint64_t now = timer_get_epoch();
+        st->st_mtime = now;
+        st->st_atime = now;
+        st->st_ctime = now;
+        return ST_OK;
+    }
+
+    /* Split path into parent directory and final name component.
+     * Resolve parent to its cluster, then do ONE dir_find_nolock to get
+     * attr + first_cluster + size + timestamps — all in a single pass. */
+    const char *last_slash = 0;
+    for (const char *p = rpath; *p; p++)
+        if (*p == '/') last_slash = p;
+
+    unsigned long parent_cluster;
+    char final_name[256];
+
+    if (!last_slash) {
+        /* Single component: parent is start_cluster */
+        parent_cluster = start_cluster;
+        int i;
+        for (i = 0; rpath[i] && i < 255; i++)
+            final_name[i] = rpath[i];
+        final_name[i] = '\0';
+    } else {
+        /* Multi-component: resolve parent path */
+        char parent_path[512];
+        int plen = (int)(last_slash - rpath);
+        for (int i = 0; i < plen && i < 511; i++)
+            parent_path[i] = rpath[i];
+        parent_path[plen] = '\0';
+
+        unsigned pattr;
+        unsigned long pfc;
+        unsigned long psz;
+        if (fat32_resolve_path(start_cluster, parent_path, &pattr, &pfc, &psz) != ST_OK)
+            return ST_NOT_FOUND;
+        parent_cluster = pfc;
+        const char *fn = last_slash + 1;
+        int i;
+        for (i = 0; fn[i] && i < 255; i++)
+            final_name[i] = fn[i];
+        final_name[i] = '\0';
+    }
+
+    /* Single directory lookup: get attr, cluster, size AND timestamps */
+    unsigned attr = 0;
+    unsigned long fc = 0;
+    unsigned long size = 0;
+    uint16_t wrt_time = 0, wrt_date = 0;
+    if (fat32_dir_find_nolock(parent_cluster, final_name, &attr, &fc, &size, &wrt_time, &wrt_date) != ST_OK)
+        return ST_NOT_FOUND;
+
     st->st_size = size;
     if (attr & FAT32_ATTR_DIRECTORY) {
         st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
@@ -2292,61 +2384,10 @@ static int fat32_stat_vfs(const char* path, struct kstat* st)
         st->st_mode = S_IFREG | (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
     }
 
-    /* Extract FAT32 timestamps for non-root entries */
-    if (rpath[0] != '\0') {
-        /* Find parent directory cluster and final component name */
-        const char *last_slash = 0;
-        for (const char *p = rpath; *p; p++)
-            if (*p == '/') last_slash = p;
-
-        unsigned long parent_cluster;
-        char final_name[256];
-
-        if (!last_slash) {
-            /* Single component: parent is start_cluster */
-            parent_cluster = start_cluster;
-            int i;
-            for (i = 0; rpath[i] && i < 255; i++)
-                final_name[i] = rpath[i];
-            final_name[i] = '\0';
-        } else {
-            /* Multi-component: resolve parent path to get parent cluster */
-            char parent_path[512];
-            int plen = (int)(last_slash - rpath);
-            for (int i = 0; i < plen && i < 511; i++)
-                parent_path[i] = rpath[i];
-            parent_path[plen] = '\0';
-
-            unsigned pattr;
-            unsigned long pfc;
-            unsigned long psz;
-            if (fat32_resolve_path(start_cluster, parent_path, &pattr, &pfc, &psz) == ST_OK) {
-                parent_cluster = pfc;
-            } else {
-                parent_cluster = start_cluster;
-            }
-            const char *fn = last_slash + 1;
-            int i;
-            for (i = 0; fn[i] && i < 255; i++)
-                final_name[i] = fn[i];
-            final_name[i] = '\0';
-        }
-
-        /* Look up the entry to get write timestamp */
-        uint16_t wrt_time = 0, wrt_date = 0;
-        if (fat32_dir_find_nolock(parent_cluster, final_name, 0, 0, 0, &wrt_time, &wrt_date) == ST_OK) {
-            uint64_t epoch = fat32_datetime_to_epoch(wrt_date, wrt_time);
-            st->st_mtime = epoch;
-            st->st_atime = epoch;
-            st->st_ctime = epoch;
-        }
-    } else {
-        /* Root directory has no parent entry — use current wall-clock time */
-        uint64_t now = timer_get_epoch();
-        st->st_mtime = now;
-        st->st_atime = now;
-        st->st_ctime = now;
-    }
+    uint64_t epoch = fat32_datetime_to_epoch(wrt_date, wrt_time);
+    st->st_mtime = epoch;
+    st->st_atime = epoch;
+    st->st_ctime = epoch;
 
     return ST_OK;
 }
@@ -3224,4 +3265,51 @@ void fat32_debug_dump_root(void)
         temp[p] = '\0';
         kprintf("  [%u] %s attr=%02x size=%lu\n", i, temp, ents[i].attr, ents[i].fileSize);
     }
+}
+
+/* ========================================================================
+ * fat32_get_statfs — fill filesystem statistics
+ * ======================================================================== */
+int fat32_get_statfs(fat32_statfs_t *info)
+{
+    if (!info || !g_root_fs)
+        return -1;
+
+    unsigned long bsize = (unsigned long)g_root_fs->sectors_per_cluster *
+                          (unsigned long)g_root_fs->bytes_per_sector;
+
+    /* Calculate total FAT entries if not yet known */
+    if (g_fat_total_entries == 0) {
+        if (fat32_ensure_fat_loaded(g_root_fs) != ST_OK)
+            return -1;
+    }
+    unsigned long total = (g_fat_total_entries > 2) ? g_fat_total_entries - 2 : 0;
+
+    /* Use cached free cluster count (from FSInfo or previous scan).
+     * Only do a full FAT scan if FSInfo was unavailable or invalid. */
+    unsigned long free_count = g_free_cluster_count;
+    if (free_count == (unsigned long)-1) {
+        /* One-time scan — result is cached for all future calls */
+        if (fat32_ensure_fat_loaded(g_root_fs) != ST_OK)
+            return -1;
+        free_count = 0;
+        for (unsigned long c = 2; c < g_fat_total_entries; ++c) {
+            unsigned long v = fat32_next_cluster_cached(g_root_fs, c);
+            if (v == 0)
+                free_count++;
+        }
+        g_free_cluster_count = free_count;
+    }
+
+    info->f_bsize   = bsize;
+    info->f_frsize  = bsize;
+    info->f_blocks  = total;
+    info->f_bfree   = free_count;
+    info->f_bavail  = free_count;
+    info->f_files   = 0;       /* FAT32 has no fixed inode table */
+    info->f_ffree   = 0;
+    info->f_fsid    = 0;
+    info->f_namelen = 255;     /* LFN maximum */
+    info->f_type    = 0x4d44;  /* MSDOS_SUPER_MAGIC */
+    return 0;
 }

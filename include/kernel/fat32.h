@@ -60,4 +60,21 @@ int fat32_rename_path(const char* oldpath, const char* newpath);
 int fat32_mkdir_path(const char* path);
 int fat32_rmdir_path(const char* path);
 
+/* Filesystem statistics for statfs(2) */
+typedef struct {
+    unsigned long f_bsize;    /* optimal transfer block size */
+    unsigned long f_frsize;   /* fragment size (same as bsize for FAT32) */
+    unsigned long f_blocks;   /* total data blocks */
+    unsigned long f_bfree;    /* free blocks */
+    unsigned long f_bavail;   /* free blocks available to unprivileged users */
+    unsigned long f_files;    /* total file nodes */
+    unsigned long f_ffree;    /* free file nodes */
+    unsigned long f_fsid;     /* filesystem ID (not meaningful here) */
+    unsigned long f_namelen;  /* maximum filename length */
+    unsigned long f_type;     /* filesystem type magic */
+} fat32_statfs_t;
+
+/* Fill fs_info with current filesystem statistics.  Returns 0 on success. */
+int fat32_get_statfs(fat32_statfs_t *info);
+
 #endif // LIKEOS_FAT32_H

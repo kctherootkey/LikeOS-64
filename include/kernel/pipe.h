@@ -23,6 +23,7 @@ typedef struct pipe_end {
     uint8_t is_read;
     uint8_t pad[3];
     pipe_t* pipe;
+    uint32_t flags;   // O_NONBLOCK etc.
 } pipe_end_t;
 
 bool pipe_is_end(const void* ptr);

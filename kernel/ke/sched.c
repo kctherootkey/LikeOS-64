@@ -599,11 +599,20 @@ void sched_schedule(void) {
     task_t* next = rq_dequeue_locked(cpu);
     int my_cpu = this_cpu_id();
 
-    // If we got nothing or ourselves back, try idle task
-    if (!next || next == cur) {
-        if (next == cur) {
-            kprintf("BUG: schedule dequeued cur (pid %d)!\n", cur->id);
-        }
+    // If we dequeued ourselves, it means we were blocked but got woken
+    // before we reached sched_schedule().  This is a normal race between
+    // the blocking path (set BLOCKED, release lock, call schedule) and
+    // the wakeup path (set READY, enqueue).  Just keep running.
+    if (next == cur) {
+        cur->state = TASK_RUNNING;
+        cur->remaining_ticks = SCHED_TIME_SLICE;
+        cur->need_resched = 0;
+        spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
+        return;
+    }
+
+    // If we got nothing, try idle task
+    if (!next) {
         next = cpu->idle_task;
     }
 
@@ -641,9 +650,11 @@ void sched_schedule(void) {
 
     // We have a valid different task to switch to
     // Now enqueue current if it's runnable (voluntary yield)
+    // Check !cur->on_rq to avoid double-enqueue when wake_channel
+    // already enqueued this task while it was still running as cur.
     if (!cur->has_exited &&
         (cur->state == TASK_READY || cur->state == TASK_RUNNING) &&
-        !is_idle_task(cur)) {
+        !is_idle_task(cur) && !cur->on_rq) {
         cur->state = TASK_READY;
         rq_enqueue_locked(cpu, cur);
     }
@@ -1538,7 +1549,7 @@ void sched_signal_pgrp(int pgid, int sig) {
     task_t* targets[MAX_PGRP_TARGETS];
     int count = 0;
     for (task_t* t = g_task_list_head; t && count < MAX_PGRP_TARGETS; t = t->next) {
-        if (t->pgid == pgid && t->state != TASK_ZOMBIE) {
+        if (t->pgid == pgid && t->state != TASK_ZOMBIE && t->privilege != TASK_KERNEL) {
             targets[count++] = t;
         }
     }
@@ -1667,12 +1678,19 @@ void sched_preempt(interrupt_frame_t* frame) {
     // First, dequeue the next task to see what we're switching to
     task_t* next = rq_dequeue_locked(cpu);
     
-    // If queue was empty or we got ourselves back, try idle task
-    if (!next || next == cur) {
-        if (next == cur) {
-            // BUG: current task was in the run queue while running!
-            kprintf("BUG: preempt dequeued cur (pid %d)!\n", cur->id);
-        }
+    // If we dequeued ourselves (wake_channel enqueued cur while it was
+    // still running), just stay on current — this is a normal race.
+    if (next == cur) {
+        cur->state = TASK_RUNNING;
+        cur->remaining_ticks = SCHED_TIME_SLICE;
+        cur->preempt_frame = NULL;
+        spin_unlock(&cpu->runqueue_lock);
+        local_irq_restore(flags);
+        return;
+    }
+    
+    // If queue was empty, try idle task
+    if (!next) {
         next = cpu->idle_task;
     }
 
@@ -1706,9 +1724,11 @@ void sched_preempt(interrupt_frame_t* frame) {
 
     // We have a valid different task to switch to
     // Now enqueue current if it's runnable (not idle, not exited)
+    // Check !cur->on_rq to avoid double-enqueue when wake_channel
+    // already enqueued this task while it was still running as cur.
     if (!cur->has_exited &&
         (cur->state == TASK_READY || cur->state == TASK_RUNNING) &&
-        !is_idle_task(cur)) {
+        !is_idle_task(cur) && !cur->on_rq) {
         cur->state = TASK_READY;
         rq_enqueue_locked(cpu, cur);
     }

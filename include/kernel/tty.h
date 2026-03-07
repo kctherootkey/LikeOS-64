@@ -21,6 +21,7 @@ typedef unsigned int speed_t;
 #define ISIG    0x0001
 #define ICANON  0x0002
 #define ECHO    0x0004
+#define TOSTOP  0x0008
 
 // Control character indices
 #define VINTR   0

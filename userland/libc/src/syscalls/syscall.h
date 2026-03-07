@@ -126,6 +126,8 @@
 
 // Filesystem extended syscalls
 #define SYS_UTIMENSAT       332
+#define SYS_STATFS          333
+#define SYS_FSTATFS         334
 
 // Syscall wrapper - uses inline assembly to invoke syscall instruction
 static inline long syscall0(long number) {

@@ -3,6 +3,7 @@
 #include "../../include/ctype.h"
 #include "../../include/string.h"
 #include "../../include/errno.h"
+#include "../../include/stdio.h"
 
 // Simple environment variable storage
 
@@ -11,6 +12,8 @@ static char env_values[MAX_ENV_VARS][MAX_ENV_SIZE];
 static int g_env_count = 0;
 
 void exit(int status) {
+    fflush(stdout);
+    fflush(stderr);
     _exit(status);
 }
 

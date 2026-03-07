@@ -11,6 +11,9 @@
 #include "../../include/stdarg.h"
 #include "../../include/signal.h"
 #include "../../include/sys/reboot.h"
+#include "../../include/sys/vfs.h"
+#include "../../include/termios.h"
+#include "../../include/sys/ioctl.h"
 #include "syscall.h"
 
 int errno = 0;
@@ -112,6 +115,18 @@ int fstat(int fd, struct stat* st) {
 
 int fstatat(int dirfd, const char* path, struct stat* st, int flags) {
     long ret = syscall4(SYS_FSTATAT, dirfd, (long)path, (long)st, flags);
+    if (ret < 0) { errno = -ret; return -1; }
+    return 0;
+}
+
+int statfs(const char* path, struct statfs* buf) {
+    long ret = syscall2(SYS_STATFS, (long)path, (long)buf);
+    if (ret < 0) { errno = -ret; return -1; }
+    return 0;
+}
+
+int fstatfs(int fd, struct statfs* buf) {
+    long ret = syscall2(SYS_FSTATFS, fd, (long)buf);
     if (ret < 0) { errno = -ret; return -1; }
     return 0;
 }
@@ -440,7 +455,12 @@ time_t time(time_t* tloc) {
 // Note: alarm() and sleep() are defined in signal.c
 
 int isatty(int fd) {
-    return (fd == 0 || fd == 1 || fd == 2) ? 1 : 0;
+    struct termios t;
+    /* Try TCGETS ioctl — succeeds only on tty devices */
+    int saved_errno = errno;
+    int ret = ioctl(fd, TCGETS, &t);
+    errno = saved_errno;  /* isatty must not clobber errno on success */
+    return ret == 0 ? 1 : 0;
 }
 
 int unlink(const char* path) {

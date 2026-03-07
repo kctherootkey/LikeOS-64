@@ -10,17 +10,30 @@
 #define SEEK_CUR 1
 #define SEEK_END 2
 
-#define BUFSIZ 1024
+#define BUFSIZ 4096
+
+/* Buffering modes for setvbuf */
+#define _IONBF 0   /* unbuffered */
+#define _IOLBF 1   /* line buffered */
+#define _IOFBF 2   /* fully buffered */
 
 typedef struct {
     int fd;
+    /* Read buffer */
     unsigned char* buffer;
     size_t buf_size;
     size_t buf_pos;
     size_t buf_end;
+    /* Write buffer */
+    unsigned char* wbuf;
+    size_t wbuf_size;
+    size_t wbuf_pos;
+    /* Buffering mode and state */
+    int buf_mode;       /* _IONBF, _IOLBF, _IOFBF */
     int flags;
     int error;
     int eof;
+    int ungetc_buf;     /* -1 if empty, else the ungotten char */
 } FILE;
 
 extern FILE* stdin;
@@ -39,6 +52,10 @@ int feof(FILE* stream);
 int ferror(FILE* stream);
 void clearerr(FILE* stream);
 int fflush(FILE* stream);
+int setvbuf(FILE* stream, char* buf, int mode, size_t size);
+void setbuf(FILE* stream, char* buf);
+void setlinebuf(FILE* stream);
+int fileno(FILE* stream);
 
 // Character I/O
 int fgetc(FILE* stream);

@@ -18,6 +18,7 @@
 #include <dlfcn.h>
 #include <getopt.h>
 #include <sys/procinfo.h>
+#include <sys/vfs.h>
 
 // Futex helper declarations (from sched.c)
 int futex_wait(int* uaddr, int val, const struct timespec* timeout);
@@ -3440,6 +3441,72 @@ int main(int argc, char** argv) {
 
         ret = rmdir("/tmp/test_parent_a");
         test_result("rmdir /tmp/test_parent_a", ret == 0);
+    }
+
+    // ========================================
+    // statfs / fstatfs tests
+    // ========================================
+    printf("\n--- statfs / fstatfs tests ---\n");
+    {
+        struct statfs sfs;
+        int ret;
+
+        /* statfs on root "/" should succeed */
+        ret = statfs("/", &sfs);
+        test_result("statfs(\"/\") succeeds", ret == 0);
+
+        if (ret == 0) {
+            /* Block size should be non-zero */
+            test_result("statfs f_bsize > 0", sfs.f_bsize > 0);
+
+            /* Total blocks should be non-zero */
+            test_result("statfs f_blocks > 0", sfs.f_blocks > 0);
+
+            /* Free blocks should be <= total blocks */
+            test_result("statfs f_bfree <= f_blocks", sfs.f_bfree <= sfs.f_blocks);
+
+            /* Available should be <= free */
+            test_result("statfs f_bavail <= f_bfree", sfs.f_bavail <= sfs.f_bfree);
+
+            /* f_type should be FAT32 magic (0x4d44) */
+            test_result("statfs f_type == 0x4d44", sfs.f_type == 0x4d44);
+
+            /* f_namelen should be reasonable */
+            test_result("statfs f_namelen > 0", sfs.f_namelen > 0);
+
+            printf("  f_bsize=%lu f_blocks=%lu f_bfree=%lu f_bavail=%lu f_type=0x%lx\n",
+                   sfs.f_bsize, sfs.f_blocks, sfs.f_bfree, sfs.f_bavail, sfs.f_type);
+        }
+
+        /* statfs on an existing file should also work */
+        ret = statfs("/bin/sh", &sfs);
+        test_result("statfs(\"/bin/sh\") succeeds", ret == 0);
+
+        /* statfs on /dev should fail with ENOSYS */
+        ret = statfs("/dev", &sfs);
+        test_result("statfs(\"/dev\") fails", ret == -1);
+        test_result("statfs(\"/dev\") errno==ENOSYS", errno == ENOSYS);
+
+        /* fstatfs on an open file */
+        int fd = open("/bin/sh", 0);
+        if (fd >= 0) {
+            struct statfs fst;
+            ret = fstatfs(fd, &fst);
+            test_result("fstatfs(fd) succeeds", ret == 0);
+            if (ret == 0) {
+                test_result("fstatfs f_bsize > 0", fst.f_bsize > 0);
+                test_result("fstatfs f_type == 0x4d44", fst.f_type == 0x4d44);
+            }
+            close(fd);
+        } else {
+            test_fail("fstatfs: could not open /bin/sh");
+        }
+
+        /* fstatfs on invalid fd should fail */
+        struct statfs bad_fst;
+        ret = fstatfs(999, &bad_fst);
+        test_result("fstatfs(999) fails", ret == -1);
+        test_result("fstatfs(999) errno==EBADF", errno == EBADF);
     }
 
     // ========================================

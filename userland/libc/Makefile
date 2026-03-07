@@ -10,7 +10,7 @@ PIC_CFLAGS = $(CFLAGS) -fPIC
 # Source files
 MALLOC_SRC = src/malloc/malloc.c
 STDIO_SRC = src/stdio/stdio.c
-STRING_SRC = src/string/string.c
+STRING_SRC = src/string/string.c src/string/fnmatch.c
 STDLIB_SRC = src/stdlib/stdlib.c src/stdlib/getopt.c
 CTYPE_SRC = src/ctype/ctype.c
 TIME_SRC = src/time/time.c

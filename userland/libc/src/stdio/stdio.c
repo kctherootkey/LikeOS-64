@@ -5,10 +5,25 @@
 #include "../../include/stdarg.h"
 #include "../../include/fcntl.h"
 
-// Standard file streams
-static FILE __stdin = { .fd = 0, .buffer = NULL, .buf_size = 0, .buf_pos = 0, .buf_end = 0, .flags = 0, .eof = 0, .error = 0 };
-static FILE __stdout = { .fd = 1, .buffer = NULL, .buf_size = 0, .buf_pos = 0, .buf_end = 0, .flags = 0, .eof = 0, .error = 0 };
-static FILE __stderr = { .fd = 2, .buffer = NULL, .buf_size = 0, .buf_pos = 0, .buf_end = 0, .flags = 0, .eof = 0, .error = 0 };
+// Standard file streams - with buffering
+static unsigned char __stdin_rbuf[BUFSIZ];
+static unsigned char __stdout_wbuf[BUFSIZ];
+
+static FILE __stdin  = { .fd = 0, .buffer = __stdin_rbuf, .buf_size = BUFSIZ,
+                         .buf_pos = 0, .buf_end = 0,
+                         .wbuf = NULL, .wbuf_size = 0, .wbuf_pos = 0,
+                         .buf_mode = _IOFBF, .flags = 0, .eof = 0, .error = 0,
+                         .ungetc_buf = -1 };
+static FILE __stdout = { .fd = 1, .buffer = NULL, .buf_size = 0,
+                         .buf_pos = 0, .buf_end = 0,
+                         .wbuf = __stdout_wbuf, .wbuf_size = BUFSIZ, .wbuf_pos = 0,
+                         .buf_mode = _IOLBF, .flags = 0, .eof = 0, .error = 0,
+                         .ungetc_buf = -1 };
+static FILE __stderr = { .fd = 2, .buffer = NULL, .buf_size = 0,
+                         .buf_pos = 0, .buf_end = 0,
+                         .wbuf = NULL, .wbuf_size = 0, .wbuf_pos = 0,
+                         .buf_mode = _IONBF, .flags = 0, .eof = 0, .error = 0,
+                         .ungetc_buf = -1 };
 
 FILE* stdin = &__stdin;
 FILE* stdout = &__stdout;
@@ -48,13 +63,18 @@ FILE* fopen(const char* pathname, const char* mode) {
     }
     
     fp->fd = fd;
-    fp->buffer = NULL;
-    fp->buf_size = 0;
+    fp->buffer = malloc(BUFSIZ);   /* read buffer */
+    fp->buf_size = fp->buffer ? BUFSIZ : 0;
     fp->buf_pos = 0;
     fp->buf_end = 0;
+    fp->wbuf = malloc(BUFSIZ);     /* write buffer */
+    fp->wbuf_size = fp->wbuf ? BUFSIZ : 0;
+    fp->wbuf_pos = 0;
+    fp->buf_mode = _IOFBF;         /* fully buffered by default */
     fp->flags = flags;
     fp->error = 0;
     fp->eof = 0;
+    fp->ungetc_buf = -1;
     
     return fp;
 }
@@ -64,52 +84,206 @@ int fclose(FILE* stream) {
         return EOF;
     }
     
+    fflush(stream);
     int result = close(stream->fd);
     if (stream != stdin && stream != stdout && stream != stderr) {
+        free(stream->buffer);
+        free(stream->wbuf);
         free(stream);
     }
     return result == 0 ? 0 : EOF;
 }
 
-size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
-    if (!stream || !ptr) {
-        return 0;
+/* ------------------------------------------------------------------ */
+/* Internal: flush write buffer to fd                                   */
+/* ------------------------------------------------------------------ */
+static int __flush_wbuf(FILE* stream) {
+    if (!stream || stream->wbuf_pos == 0) return 0;
+    
+    size_t remaining = stream->wbuf_pos;
+    const unsigned char* p = stream->wbuf;
+    while (remaining > 0) {
+        ssize_t n = write(stream->fd, p, remaining);
+        if (n < 0) {
+            stream->error = 1;
+            return EOF;
+        }
+        p += n;
+        remaining -= n;
     }
+    stream->wbuf_pos = 0;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Internal: fill read buffer from fd                                   */
+/* ------------------------------------------------------------------ */
+static int __fill_rbuf(FILE* stream) {
+    if (!stream || !stream->buffer || stream->buf_size == 0) return -1;
+
+    stream->buf_pos = 0;
+    stream->buf_end = 0;
+    ssize_t n = read(stream->fd, stream->buffer, stream->buf_size);
+    if (n < 0) {
+        stream->error = 1;
+        return -1;
+    }
+    if (n == 0) {
+        stream->eof = 1;
+        return -1;
+    }
+    stream->buf_end = n;
+    return 0;
+}
+
+size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
+    if (!stream || !ptr || size == 0 || nmemb == 0) return 0;
     
     size_t total = size * nmemb;
-    ssize_t bytes = read(stream->fd, ptr, total);
-    
-    if (bytes < 0) {
-        stream->error = 1;
-        return 0;
+    unsigned char* dst = (unsigned char*)ptr;
+    size_t got = 0;
+
+    /* First: return any ungotten char */
+    if (stream->ungetc_buf >= 0 && got < total) {
+        *dst++ = (unsigned char)stream->ungetc_buf;
+        stream->ungetc_buf = -1;
+        got++;
     }
-    
-    if ((size_t)bytes < total) {
-        stream->eof = 1;
+
+    /* Drain read buffer first */
+    if (stream->buffer && stream->buf_pos < stream->buf_end) {
+        size_t avail = stream->buf_end - stream->buf_pos;
+        size_t take = (total - got < avail) ? total - got : avail;
+        memcpy(dst, stream->buffer + stream->buf_pos, take);
+        stream->buf_pos += take;
+        dst += take;
+        got += take;
     }
-    
-    return bytes / size;
+
+    /* If we still need data: for large reads, bypass buffer */
+    if (got < total && (total - got) >= (stream->buf_size > 0 ? stream->buf_size : 1)) {
+        ssize_t n = read(stream->fd, dst, total - got);
+        if (n < 0) { stream->error = 1; }
+        else if (n == 0) { stream->eof = 1; }
+        else { got += n; }
+        return got / size;
+    }
+
+    /* For small remaining reads, fill buffer and copy */
+    while (got < total) {
+        if (!stream->buffer || stream->buf_size == 0) {
+            /* No read buffer — direct read */
+            ssize_t n = read(stream->fd, dst, total - got);
+            if (n < 0) { stream->error = 1; break; }
+            if (n == 0) { stream->eof = 1; break; }
+            got += n;
+            break;
+        }
+        if (__fill_rbuf(stream) < 0) break;
+        size_t avail = stream->buf_end - stream->buf_pos;
+        size_t take = (total - got < avail) ? total - got : avail;
+        memcpy(dst, stream->buffer + stream->buf_pos, take);
+        stream->buf_pos += take;
+        dst += take;
+        got += take;
+    }
+
+    return got / size;
 }
 
 size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* stream) {
-    if (!stream || !ptr) {
-        return 0;
-    }
+    if (!stream || !ptr || size == 0 || nmemb == 0) return 0;
     
     size_t total = size * nmemb;
-    ssize_t bytes = write(stream->fd, ptr, total);
-    
-    if (bytes < 0) {
-        stream->error = 1;
-        return 0;
+    const unsigned char* src = (const unsigned char*)ptr;
+
+    /* Unbuffered: write directly */
+    if (stream->buf_mode == _IONBF || !stream->wbuf || stream->wbuf_size == 0) {
+        ssize_t n = write(stream->fd, src, total);
+        if (n < 0) { stream->error = 1; return 0; }
+        return n / size;
     }
-    
-    return bytes / size;
+
+    /* Line buffered: copy to buffer, flush on '\n' or when full */
+    if (stream->buf_mode == _IOLBF) {
+        size_t written = 0;
+        while (written < total) {
+            /* Find next newline in remaining data */
+            size_t remaining = total - written;
+            const unsigned char* nl = memchr(src + written, '\n', remaining);
+            size_t chunk;
+            int do_flush = 0;
+
+            if (nl) {
+                chunk = (nl - (src + written)) + 1; /* include the '\n' */
+                do_flush = 1;
+            } else {
+                chunk = remaining;
+            }
+
+            /* Copy to buffer, flushing as needed */
+            while (chunk > 0) {
+                size_t space = stream->wbuf_size - stream->wbuf_pos;
+                size_t copy = (chunk < space) ? chunk : space;
+                memcpy(stream->wbuf + stream->wbuf_pos, src + written, copy);
+                stream->wbuf_pos += copy;
+                written += copy;
+                chunk -= copy;
+                if (stream->wbuf_pos >= stream->wbuf_size) {
+                    if (__flush_wbuf(stream) == EOF) return written / size;
+                }
+            }
+            if (do_flush) {
+                if (__flush_wbuf(stream) == EOF) return written / size;
+            }
+        }
+        return written / size;
+    }
+
+    /* Fully buffered: copy to buffer, flush when full */
+    size_t written = 0;
+    while (written < total) {
+        size_t space = stream->wbuf_size - stream->wbuf_pos;
+        size_t chunk = total - written;
+        if (chunk <= space) {
+            memcpy(stream->wbuf + stream->wbuf_pos, src + written, chunk);
+            stream->wbuf_pos += chunk;
+            written += chunk;
+        } else {
+            /* Fill remainder of buffer and flush */
+            memcpy(stream->wbuf + stream->wbuf_pos, src + written, space);
+            stream->wbuf_pos += space;
+            written += space;
+            if (__flush_wbuf(stream) == EOF) return written / size;
+        }
+    }
+    return written / size;
 }
 
 int fgetc(FILE* stream) {
+    if (!stream) return EOF;
+
+    /* Check ungetc buffer first */
+    if (stream->ungetc_buf >= 0) {
+        int c = stream->ungetc_buf;
+        stream->ungetc_buf = -1;
+        return c;
+    }
+
+    /* Read from buffer */
+    if (stream->buffer && stream->buf_size > 0) {
+        if (stream->buf_pos >= stream->buf_end) {
+            if (__fill_rbuf(stream) < 0) return EOF;
+        }
+        return stream->buffer[stream->buf_pos++];
+    }
+
+    /* No read buffer — direct 1-byte read */
     unsigned char c;
-    if (fread(&c, 1, 1, stream) != 1) {
+    ssize_t n = read(stream->fd, &c, 1);
+    if (n <= 0) {
+        if (n == 0) stream->eof = 1;
+        else stream->error = 1;
         return EOF;
     }
     return c;
@@ -148,7 +322,7 @@ int fputc(int c, FILE* stream) {
     if (fwrite(&ch, 1, 1, stream) != 1) {
         return EOF;
     }
-    return ch;
+    return (unsigned char)c;
 }
 
 int putchar(int c) {
@@ -171,10 +345,12 @@ int puts(const char* s) {
 }
 
 int fflush(FILE* stream) {
-    // Currently unbuffered I/O - fread/fwrite go directly to syscalls
-    // No buffered data to flush, so this is a no-op
-    (void)stream;
-    return 0;
+    if (!stream) {
+        /* Flush all open streams — at minimum stdout */
+        __flush_wbuf(stdout);
+        return 0;
+    }
+    return __flush_wbuf(stream);
 }
 
 int fseek(FILE* stream, long offset, int whence) {
@@ -182,7 +358,15 @@ int fseek(FILE* stream, long offset, int whence) {
         return -1;
     }
     
-    // Clear EOF flag on seek
+    /* Flush any pending writes */
+    __flush_wbuf(stream);
+    
+    /* Invalidate read buffer */
+    stream->buf_pos = 0;
+    stream->buf_end = 0;
+    stream->ungetc_buf = -1;
+    
+    /* Clear EOF flag on seek */
     stream->eof = 0;
     
     off_t result = lseek(stream->fd, offset, whence);
@@ -198,8 +382,22 @@ long ftell(FILE* stream) {
         return -1;
     }
     
-    // Use lseek with offset 0 and SEEK_CUR to get current position
-    return (long)lseek(stream->fd, 0, SEEK_CUR);
+    /* Flush any pending writes so the fd position is up to date */
+    __flush_wbuf(stream);
+    
+    long pos = (long)lseek(stream->fd, 0, SEEK_CUR);
+    if (pos < 0) return -1;
+    
+    /* Subtract unread data still sitting in the read buffer.
+     * The kernel fd position is *ahead* of what the user has consumed. */
+    if (stream->buffer && stream->buf_end > stream->buf_pos)
+        pos -= (long)(stream->buf_end - stream->buf_pos);
+    
+    /* Account for ungetc'd character */
+    if (stream->ungetc_buf >= 0)
+        pos--;
+    
+    return pos;
 }
 
 void rewind(FILE* stream) {
@@ -212,6 +410,54 @@ int feof(FILE* stream) {
 
 int ferror(FILE* stream) {
     return stream ? stream->error : 0;
+}
+
+void clearerr(FILE* stream) {
+    if (stream) {
+        stream->eof = 0;
+        stream->error = 0;
+    }
+}
+
+int ungetc(int c, FILE* stream) {
+    if (!stream || c == EOF) return EOF;
+    stream->ungetc_buf = (unsigned char)c;
+    stream->eof = 0;
+    return (unsigned char)c;
+}
+
+int fileno(FILE* stream) {
+    if (!stream) return -1;
+    return stream->fd;
+}
+
+int setvbuf(FILE* stream, char* buf, int mode, size_t size) {
+    if (!stream) return -1;
+    if (mode != _IONBF && mode != _IOLBF && mode != _IOFBF) return -1;
+
+    /* Flush any pending output first */
+    __flush_wbuf(stream);
+
+    stream->buf_mode = mode;
+
+    if (mode == _IONBF) {
+        /* Unbuffered: no write buffer needed */
+        return 0;
+    }
+
+    /* If user provides a buffer, we can't really use it for both r+w,
+       so just set the mode and keep our own buffers */
+    (void)buf;
+    (void)size;
+    return 0;
+}
+
+void setbuf(FILE* stream, char* buf) {
+    setvbuf(stream, buf, buf ? _IOFBF : _IONBF, BUFSIZ);
+}
+
+void setlinebuf(FILE* stream) {
+    setvbuf(stream, NULL, _IOLBF, BUFSIZ);
 }
 
 // Helper function for number to string conversion
