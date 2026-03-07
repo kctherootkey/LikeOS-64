@@ -78,9 +78,9 @@ static void run_programerror_case(const char* name, const char* mode, int expect
         return;
     }
     if (child == 0) {
-        char* argv_exec[] = { "/progerr", (char*)mode, NULL };
+        char* argv_exec[] = { "/usr/local/bin/progerr", (char*)mode, NULL };
         char* envp_exec[] = { NULL };
-        execve("/progerr", argv_exec, envp_exec);
+        execve("/usr/local/bin/progerr", argv_exec, envp_exec);
         _exit(1);
     }
 
@@ -448,9 +448,9 @@ int main(int argc, char** argv) {
     if (exec_child < 0) {
         test_fail("fork() for execve failed");
     } else if (exec_child == 0) {
-        char* exec_argv[] = { "/hello", NULL };
+        char* exec_argv[] = { "/usr/local/bin/hello", NULL };
         char* exec_envp[] = { NULL };
-        execve("/hello", exec_argv, exec_envp);
+        execve("/usr/local/bin/hello", exec_argv, exec_envp);
         printf("  [CHILD] execve failed: errno=%d\n", errno);
         _exit(1);
     } else {
@@ -481,8 +481,8 @@ int main(int argc, char** argv) {
     if (execv_child < 0) {
         test_fail("fork() for execv failed");
     } else if (execv_child == 0) {
-        char* exec_argv[] = { "/hello", NULL };
-        execv("/hello", exec_argv);
+        char* exec_argv[] = { "/usr/local/bin/hello", NULL };
+        execv("/usr/local/bin/hello", exec_argv);
         _exit(1);
     } else {
         int status = 0;
@@ -497,7 +497,7 @@ int main(int argc, char** argv) {
     }
 
     // Ensure PATH for execvp
-    setenv("PATH", "/", 1);
+    setenv("PATH", "/usr/local/bin:/bin", 1);
     pid_t execvp_child = fork();
     if (execvp_child < 0) {
         test_fail("fork() for execvp failed");

@@ -21,7 +21,18 @@ calculate_ram() {
 RAM_MB=${HOBBY_RAM_MB:-$(calculate_ram)}
 SMP=${HOBBY_SMP:-$(nproc)}
 VIDEO=${HOBBY_DISPLAY:-gtk,gl=off,show-menubar=off,show-tabs=off,grab-on-hover=on}
-ACCEL=none
+
+# Auto-detect KVM: use it if /dev/kvm exists and is accessible, otherwise fall back to TCG
+if [ -z "${HOBBY_ACCEL:-}" ]; then
+    if [ -w /dev/kvm ] 2>/dev/null; then
+        ACCEL=kvm
+    else
+        ACCEL=none
+    fi
+else
+    ACCEL=$HOBBY_ACCEL
+fi
+
 FULLSCREEN=${HOBBY_FULLSCREEN:-off}
 FOCUS=${HOBBY_FOCUS:-on}
 LOGDIR=/home/likeos/.local/share

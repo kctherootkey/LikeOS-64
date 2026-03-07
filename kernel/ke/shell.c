@@ -13,7 +13,7 @@ static int shell_spawn(void) {
         return -EAGAIN;
     }
     char* argv[] = { "/bin/sh", NULL };
-    char* envp[] = { "PATH=/bin:/", NULL };
+    char* envp[] = { "PATH=/bin:/usr/local/bin", NULL };
     task_t* task = NULL;
     int ret = elf_exec("/bin/sh", argv, envp, &task);
     if (ret == 0 && task) {

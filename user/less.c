@@ -101,7 +101,7 @@ static void enter_raw(void) {
     if (!isatty(STDIN_FILENO)) return;
     tcgetattr(STDIN_FILENO, &saved_termios);
     struct termios raw = saved_termios;
-    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_lflag &= ~(ICANON | ECHO | ISIG);
     raw.c_iflag &= ~(ICRNL);
     tcsetattr(STDIN_FILENO, TCSANOW, &raw);
     raw_mode_active = 1;
@@ -1232,16 +1232,15 @@ int main(int argc, char **argv) {
     current_file = 0;
 
     get_term_size();
-    enter_raw();
-
-    if (!opt_no_init)
-        term_clear();
 
     int ret = 0;
 
     if (nfiles == 0) {
         /* Read from stdin */
         current_filename = NULL;
+        enter_raw();
+        if (!opt_no_init)
+            term_clear();
         if (load_fd(STDIN_FILENO) < 0) {
             exit_raw();
             fprintf(stderr, "%s: cannot read stdin\n", PROGRAM_NAME);
@@ -1251,11 +1250,13 @@ int main(int argc, char **argv) {
     } else {
         current_filename = filenames[0];
         if (load_file(filenames[0]) < 0) {
-            exit_raw();
             fprintf(stderr, "%s: %s: %s\n", PROGRAM_NAME, filenames[0], strerror(errno));
             free(real_argv);
             return 1;
         }
+        enter_raw();
+        if (!opt_no_init)
+            term_clear();
     }
 
     /* Handle initial command */

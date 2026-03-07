@@ -45,7 +45,7 @@ static void show_help(void) {
     printf("Built-in commands:\n");
     printf("  cd <dir>       - Change directory\n");
     printf("  help           - Show this help\n");
-    printf("External commands (in / or /bin):\n");
+    printf("External commands (in /bin or /usr/local/bin):\n");
     printf("  ls             - List directory contents\n");
     printf("  cat <file>     - Display file contents\n");
     printf("  pwd            - Print working directory\n");
@@ -62,7 +62,7 @@ static void show_help(void) {
 }
 
 int main(void) {
-    setenv("PATH", "/bin:/", 1);
+    setenv("PATH", "/bin:/usr/local/bin", 1);
 
     char line[SHELL_MAX_LINE];
     char* argv[SHELL_MAX_ARGS + 1];

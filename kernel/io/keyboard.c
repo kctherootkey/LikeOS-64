@@ -189,7 +189,7 @@ void keyboard_irq_handler(void) {
                 tty_input_char(tty, '~', 0);
                 return;
             default:
-                return;  // Unknown extended key, ignore
+                return;
         }
     }
     
@@ -237,6 +237,69 @@ void keyboard_irq_handler(void) {
     if (kb_state.ctrl_pressed && !kb_state.alt_pressed && scan_code == 0x20) {  // 0x20 = 'd'
         sched_dump_tasks();
         return;
+    }
+
+    // Numpad navigation keys (same scan codes as extended keys, but without E0 prefix).
+    // QEMU and some hardware send these for PgUp/PgDn/Home/End/arrows/Ins/Del.
+    // Handle them as navigation keys, generating ANSI escape sequences.
+    {
+        tty_t *tty = tty_get_console();
+        switch (scan_code) {
+            case 0x47: /* Numpad 7 / Home */
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, 'H', 0);
+                return;
+            case 0x48: /* Numpad 8 / Up */
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, 'A', 0);
+                return;
+            case 0x49: /* Numpad 9 / PgUp */
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, '5', 0);
+                tty_input_char(tty, '~', 0);
+                return;
+            case 0x4B: /* Numpad 4 / Left */
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, 'D', 0);
+                return;
+            case 0x4D: /* Numpad 6 / Right */
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, 'C', 0);
+                return;
+            case 0x4F: /* Numpad 1 / End */
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, 'F', 0);
+                return;
+            case 0x50: /* Numpad 2 / Down */
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, 'B', 0);
+                return;
+            case 0x51: /* Numpad 3 / PgDn */
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, '6', 0);
+                tty_input_char(tty, '~', 0);
+                return;
+            case 0x52: /* Numpad 0 / Insert */
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, '2', 0);
+                tty_input_char(tty, '~', 0);
+                return;
+            case 0x53: /* Numpad . / Delete */
+                tty_input_char(tty, 27, 0);
+                tty_input_char(tty, '[', 0);
+                tty_input_char(tty, '3', 0);
+                tty_input_char(tty, '~', 0);
+                return;
+        }
     }
 
     // Feed TTY input (console)

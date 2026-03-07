@@ -242,15 +242,25 @@ void timer_irq_handler(void) {
     task_t* cur = sched_current();
     if (cur) {
         // Accounting: charge a tick to user or system time.
-        // If the task was preempted from user mode (privilege == USER and
-        // preempt_frame CS == ring 3) it was in user space.
-        if (cur->privilege == TASK_USER) {
-            if (cur->preempt_frame && (cur->preempt_frame->cs & 3) == 3)
-                cur->utime_ticks++;
-            else
+        // Skip idle tasks and the bootstrap task (PID 0) — their CPU time
+        // should not be counted (like Linux).
+        // Guard: this_cpu() reads %gs:0 which faults before percpu_init(),
+        // so only attempt the idle-task check after SMP is initialized.
+        int skip = (cur->id == 0);
+        if (!skip && sched_is_smp()) {
+            percpu_t* cpu = this_cpu();
+            if (cur == cpu->idle_task)
+                skip = 1;
+        }
+        if (!skip) {
+            if (cur->privilege == TASK_USER) {
+                if (cur->preempt_frame && (cur->preempt_frame->cs & 3) == 3)
+                    cur->utime_ticks++;
+                else
+                    cur->stime_ticks++;
+            } else {
                 cur->stime_ticks++;
-        } else {
-            cur->stime_ticks++;
+            }
         }
 
         if (cur->remaining_ticks > 0) {

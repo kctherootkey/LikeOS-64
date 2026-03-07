@@ -530,6 +530,20 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
 static int build_at_path(task_t* cur, int dirfd, const char* path, char* out, size_t out_size);
 static int normalize_path(const char* base, const char* path, char* out, size_t out_size);
 
+// Convert VFS status codes to negative errno values
+static int vfs_status_to_errno(int st) {
+    switch (st) {
+        case ST_NOT_FOUND: return -ENOENT;
+        case ST_NOMEM:     return -ENOMEM;
+        case ST_INVALID:   return -EINVAL;
+        case ST_IO:        return -EIO;
+        case ST_EXISTS:    return -EEXIST;
+        case ST_BUSY:      return -EBUSY;
+        case ST_AGAIN:     return -EAGAIN;
+        default:           return -EACCES;
+    }
+}
+
 // SYS_OPEN - open a file
 static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode) {
     (void)flags; (void)mode;  // Currently ignore flags/mode
@@ -570,7 +584,7 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode) {
         ret = vfs_open(path, (int)flags, &file);
     }
     if (ret != ST_OK || file == NULL) {
-        return -EACCES;
+        return vfs_status_to_errno(ret);
     }
     
     cur->fd_table[fd] = file;
@@ -615,7 +629,7 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags, uin
         ret = vfs_open(full, (int)flags, &file);
     }
     if (ret != ST_OK || file == NULL) {
-        return -EACCES;
+        return vfs_status_to_errno(ret);
     }
     cur->fd_table[fd] = file;
     return fd;

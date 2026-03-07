@@ -482,12 +482,15 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/touch ::/bin/touch
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/more ::/bin/more
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/less ::/bin/less
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/test_libc ::/testlibc
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/hello ::/hello
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/progerr ::/progerr
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/testmem ::/testmem
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/memstat ::/memstat
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/teststress ::/teststress
+	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr || true
+	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr/local || true
+	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr/local/bin || true
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/test_libc ::/usr/local/bin/testlibc
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/hello ::/usr/local/bin/hello
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/progerr ::/usr/local/bin/progerr
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/testmem ::/usr/local/bin/testmem
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/memstat ::/usr/local/bin/memstat
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/teststress ::/usr/local/bin/teststress
 	# Create /lib directory and copy shared libraries
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/lib || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/ld-likeos.so ::/lib/ld-likeos.so
@@ -498,9 +501,10 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) res/Lat15-Fixed16.psf ::/res/Lat15-Fixed16.psf
 	# Add mouse cursor resource
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) res/left_ptr ::/res/left_ptr
-	# Create /tmp directory
+	# Create /tmp and /etc directories
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/tmp || true
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) /etc/services ::/tmp/services
+	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/etc || true
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) /etc/services ::/etc/services
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/LIKEOS.SIG ::/LIKEOS.SIG
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/HELLO.TXT ::/HELLO.TXT
 	rm -f $(BUILD_DIR)/LIKEOS.SIG $(BUILD_DIR)/HELLO.TXT || true
@@ -535,13 +539,16 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 $(MTOOLS) -i $(DATA_IMAGE) $(BOOTLOADER_EFI) ::/EFI/BOOT/BOOTX64.EFI
 	MTOOLS_SKIP_CHECK=1 $(MTOOLS) -i $(DATA_IMAGE) $(KERNEL_ELF) ::/kernel.elf
 	# Add test program ELF
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/user_test.elf ::/tests
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/test_libc ::/testlibc
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/hello ::/hello
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/progerr ::/progerr
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/testmem ::/testmem
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/memstat ::/memstat
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/teststress ::/teststress
+	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/usr || true
+	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/usr/local || true
+	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/usr/local/bin || true
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/user_test.elf ::/usr/local/bin/tests
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/test_libc ::/usr/local/bin/testlibc
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/hello ::/usr/local/bin/hello
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/progerr ::/usr/local/bin/progerr
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/testmem ::/usr/local/bin/testmem
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/memstat ::/usr/local/bin/memstat
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/teststress ::/usr/local/bin/teststress
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/bin || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/sh ::/bin/sh
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/ls ::/bin/ls
@@ -562,7 +569,6 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/touch ::/bin/touch
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/more ::/bin/more
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/less ::/bin/less
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/memstat ::/bin/memstat
 	# Create /lib directory and copy shared libraries
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/lib || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/ld-likeos.so ::/lib/ld-likeos.so
@@ -573,9 +579,10 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/Lat15-Fixed16.psf ::/res/Lat15-Fixed16.psf
 	# Add mouse cursor resource
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/left_ptr ::/res/left_ptr
-	# Create /tmp directory
+	# Create /tmp and /etc directories
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/tmp || true
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) /etc/services ::/tmp/services
+	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/etc || true
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) /etc/services ::/etc/services
 	# Add signature + sample files
 	echo "THIS IS A DEVICE STORING LIKEOS" > $(BUILD_DIR)/LIKEOS.SIG
 	echo "Hello from USB mass storage" > $(BUILD_DIR)/HELLO.TXT
@@ -679,7 +686,9 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo mkdir -p /tmp/likeos_usb_mount/lib
 	sudo mkdir -p /tmp/likeos_usb_mount/res
 	sudo mkdir -p /tmp/likeos_usb_mount/tmp
-	sudo cp /etc/services /tmp/likeos_usb_mount/tmp/services
+	sudo mkdir -p /tmp/likeos_usb_mount/etc
+	sudo mkdir -p /tmp/likeos_usb_mount/usr/local/bin
+	sudo cp /etc/services /tmp/likeos_usb_mount/etc/services
 	
 	# Copy bootloader and kernel
 	sudo cp $(BOOTLOADER_EFI) /tmp/likeos_usb_mount/EFI/BOOT/BOOTX64.EFI
@@ -710,14 +719,13 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo cp $(BUILD_DIR)/touch /tmp/likeos_usb_mount/bin/touch
 	sudo cp $(BUILD_DIR)/more /tmp/likeos_usb_mount/bin/more
 	sudo cp $(BUILD_DIR)/less /tmp/likeos_usb_mount/bin/less
-	sudo cp $(BUILD_DIR)/hello /tmp/likeos_usb_mount/hello
-	sudo cp $(BUILD_DIR)/test_libc /tmp/likeos_usb_mount/testlibc
-	sudo cp $(BUILD_DIR)/user_test.elf /tmp/likeos_usb_mount/tests
-	sudo cp $(BUILD_DIR)/progerr /tmp/likeos_usb_mount/progerr
-	sudo cp $(BUILD_DIR)/testmem /tmp/likeos_usb_mount/testmem
-	sudo cp $(BUILD_DIR)/memstat /tmp/likeos_usb_mount/memstat
-	sudo cp $(BUILD_DIR)/memstat /tmp/likeos_usb_mount/bin/memstat
-	sudo cp $(BUILD_DIR)/teststress /tmp/likeos_usb_mount/teststress
+	sudo cp $(BUILD_DIR)/hello /tmp/likeos_usb_mount/usr/local/bin/hello
+	sudo cp $(BUILD_DIR)/test_libc /tmp/likeos_usb_mount/usr/local/bin/testlibc
+	sudo cp $(BUILD_DIR)/user_test.elf /tmp/likeos_usb_mount/usr/local/bin/tests
+	sudo cp $(BUILD_DIR)/progerr /tmp/likeos_usb_mount/usr/local/bin/progerr
+	sudo cp $(BUILD_DIR)/testmem /tmp/likeos_usb_mount/usr/local/bin/testmem
+	sudo cp $(BUILD_DIR)/memstat /tmp/likeos_usb_mount/usr/local/bin/memstat
+	sudo cp $(BUILD_DIR)/teststress /tmp/likeos_usb_mount/usr/local/bin/teststress
 
 	# Copy shared libraries to /lib
 	sudo cp $(BUILD_DIR)/ld-likeos.so /tmp/likeos_usb_mount/lib/ld-likeos.so
