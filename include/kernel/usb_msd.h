@@ -100,8 +100,12 @@ typedef struct usb_msd_device {
     // Transaction tracking
     uint32_t next_tag;
     
-    // Per-device lock for serializing I/O (SMP safety)
-    spinlock_t io_lock;
+    // Per-device sleeping mutex for serializing I/O (SMP safety).
+    // A spinlock is inappropriate here: USB transfers take milliseconds on
+    // real hardware, and holding a spinlock with IRQs disabled that long
+    // blocks TLB shootdown ACKs and starves other CPUs.
+    volatile int io_locked;          // 0 = free, 1 = held
+    spinlock_t   io_wait_lock;       // protects the sleep/wake race
     
     // Block device
     block_device_t blk;

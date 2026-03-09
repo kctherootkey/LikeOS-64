@@ -654,7 +654,8 @@ void slab_free(void* ptr) {
     // Check if already free (double-free detection)
     if (!bitmap_is_set(slab->bitmap, obj_idx)) {
         void* ra = __builtin_return_address(0);
-        kprintf("SLAB: Double free detected at %p (caller=%p)\n", ptr, ra);
+        kprintf("SLAB: Double free detected at %p (caller=%p size=%u)\n",
+                ptr, ra, (unsigned)cache->object_size);
         return;
     }
     

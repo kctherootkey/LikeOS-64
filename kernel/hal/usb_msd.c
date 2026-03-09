@@ -356,6 +356,38 @@ int usb_msd_sync(usb_msd_device_t* msd) {
 // Block Device Interface
 //=============================================================================
 
+// Sleeping mutex for MSD I/O serialization.
+// Unlike a spinlock, this blocks the calling task (via the scheduler) when
+// the device is busy, keeping IRQs enabled so TLB shootdowns, timer ticks,
+// and other IPIs can still be serviced.
+static void msd_io_lock(usb_msd_device_t* msd) {
+    while (1) {
+        uint64_t flags;
+        spin_lock_irqsave(&msd->io_wait_lock, &flags);
+        if (!msd->io_locked) {
+            msd->io_locked = 1;
+            spin_unlock_irqrestore(&msd->io_wait_lock, flags);
+            return;
+        }
+        // Device busy — sleep until the holder releases it.
+        task_t* cur = sched_current();
+        if (cur) {
+            cur->state = TASK_BLOCKED;
+            cur->wait_channel = &msd->io_locked;
+        }
+        spin_unlock_irqrestore(&msd->io_wait_lock, flags);
+        sched_schedule();  // yields with IRQs enabled
+    }
+}
+
+static void msd_io_unlock(usb_msd_device_t* msd) {
+    uint64_t flags;
+    spin_lock_irqsave(&msd->io_wait_lock, &flags);
+    msd->io_locked = 0;
+    spin_unlock_irqrestore(&msd->io_wait_lock, flags);
+    sched_wake_channel(&msd->io_locked);
+}
+
 int usb_msd_block_read(block_device_t* dev, unsigned long lba, unsigned long count, void* buf) {
     usb_msd_device_t* msd = (usb_msd_device_t*)dev->driver_data;
     
@@ -363,9 +395,8 @@ int usb_msd_block_read(block_device_t* dev, unsigned long lba, unsigned long cou
         return ST_NO_DEVICE;
     }
     
-    // Serialize I/O to this device (SMP: prevent concurrent XHCI transfers)
-    uint64_t flags;
-    spin_lock_irqsave(&msd->io_lock, &flags);
+    // Serialize I/O to this device (sleeping mutex — IRQs stay enabled)
+    msd_io_lock(msd);
     
     // Read in 4KB chunks (8 sectors) for reliable USB transfers on real hardware
     uint8_t* ptr = (uint8_t*)buf;
@@ -388,7 +419,7 @@ int usb_msd_block_read(block_device_t* dev, unsigned long lba, unsigned long cou
         remaining -= chunk;
     }
     
-    spin_unlock_irqrestore(&msd->io_lock, flags);
+    msd_io_unlock(msd);
     return result;
 }
 
@@ -399,9 +430,8 @@ int usb_msd_block_write(block_device_t* dev, unsigned long lba, unsigned long co
         return ST_NO_DEVICE;
     }
     
-    // Serialize I/O to this device (SMP: prevent concurrent XHCI transfers)
-    uint64_t flags;
-    spin_lock_irqsave(&msd->io_lock, &flags);
+    // Serialize I/O to this device (sleeping mutex — IRQs stay enabled)
+    msd_io_lock(msd);
     
     const uint8_t* ptr = (const uint8_t*)buf;
     unsigned long remaining = count;
@@ -422,7 +452,7 @@ int usb_msd_block_write(block_device_t* dev, unsigned long lba, unsigned long co
         remaining -= chunk;
     }
     
-    spin_unlock_irqrestore(&msd->io_lock, flags);
+    msd_io_unlock(msd);
     return result;
 }
 
@@ -433,11 +463,10 @@ int usb_msd_block_sync(block_device_t* dev) {
         return ST_NO_DEVICE;
     }
     
-    // Serialize I/O to this device (SMP: prevent concurrent XHCI transfers)
-    uint64_t flags;
-    spin_lock_irqsave(&msd->io_lock, &flags);
+    // Serialize I/O to this device (sleeping mutex — IRQs stay enabled)
+    msd_io_lock(msd);
     int result = usb_msd_sync(msd);
-    spin_unlock_irqrestore(&msd->io_lock, flags);
+    msd_io_unlock(msd);
     return result;
 }
 
@@ -453,8 +482,9 @@ int usb_msd_init(usb_msd_device_t* msd, usb_device_t* dev, xhci_controller_t* ct
     msd->ctrl = ctrl;
     msd->next_tag = 0x12340000;
     
-    // Initialize per-device I/O lock for SMP safety
-    spinlock_init(&msd->io_lock, "msd_io");
+    // Initialize per-device sleeping I/O mutex for SMP safety
+    msd->io_locked = 0;
+    spinlock_init(&msd->io_wait_lock, "msd_io_wait");
     
     msd_dbg("Initializing MSD device...\n");
     

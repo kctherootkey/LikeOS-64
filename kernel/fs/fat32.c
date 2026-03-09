@@ -12,6 +12,43 @@
 // Spinlock for FAT32 filesystem access
 static spinlock_t fat32_lock = SPINLOCK_INIT("fat32");
 
+// Sleeping mutex for FAT32 file I/O operations (SMP safety).
+// The FAT cache (g_fat_cache, g_fat_cache_start, g_fat_cache_entries) is a
+// single global window.  Concurrent fat32_read/fat32_write from different CPUs
+// race on the cache: one CPU can evict the window while another is mid-traversal,
+// reading garbage cluster numbers.  This causes infinite loops or XHCI hangs.
+// A spinlock is unsuitable because USB I/O takes milliseconds; this sleeping
+// mutex blocks the calling task via the scheduler with IRQs enabled.
+static volatile int fat32_io_locked = 0;
+static spinlock_t  fat32_io_wait_lock = SPINLOCK_INIT("fat32_io_wait");
+
+static void fat32_io_lock(void) {
+    while (1) {
+        uint64_t flags;
+        spin_lock_irqsave(&fat32_io_wait_lock, &flags);
+        if (!fat32_io_locked) {
+            fat32_io_locked = 1;
+            spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
+            return;
+        }
+        task_t* cur = sched_current();
+        if (cur) {
+            cur->state = TASK_BLOCKED;
+            cur->wait_channel = &fat32_io_locked;
+        }
+        spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
+        sched_schedule();
+    }
+}
+
+static void fat32_io_unlock(void) {
+    uint64_t flags;
+    spin_lock_irqsave(&fat32_io_wait_lock, &flags);
+    fat32_io_locked = 0;
+    spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
+    sched_wake_channel(&fat32_io_locked);
+}
+
 #ifndef FAT32_DEBUG_ENABLED
 #define FAT32_DEBUG_ENABLED 0
 #endif
@@ -2035,20 +2072,60 @@ unsigned long fat32_parent_cluster(unsigned long dir_cluster)
     return g_root_dir_cluster;
 }
 
-// Forward declare ops so open can assign pointer
-static int fat32_open(const char* path, int flags, vfs_file_t** out);
-static int fat32_stat_vfs(const char* path, struct kstat* st);
-static long fat32_read(vfs_file_t* f, void* buf, long bytes);
-static long fat32_write(vfs_file_t* f, const void* buf, long bytes);
-static long fat32_seek(vfs_file_t* f, long offset, int whence);
-static long fat32_readdir(vfs_file_t* f, void* buf, long bytes);
-static int fat32_truncate(vfs_file_t* f, unsigned long size);
-static int fat32_close(vfs_file_t* f);
-static int fat32_unlink(const char* path);
-static int fat32_rename(const char* oldpath, const char* newpath);
-static int fat32_mkdir(const char* path, unsigned int mode);
-static int fat32_rmdir(const char* path);
-static int fat32_chdir(const char* path);
+// Forward declare _impl functions (unlocked, internal)
+static int fat32_open_impl(const char* path, int flags, vfs_file_t** out);
+static int fat32_stat_vfs_impl(const char* path, struct kstat* st);
+static long fat32_read_impl(vfs_file_t* f, void* buf, long bytes);
+static long fat32_write_impl(vfs_file_t* f, const void* buf, long bytes);
+static long fat32_seek_impl(vfs_file_t* f, long offset, int whence);
+static long fat32_readdir_impl(vfs_file_t* f, void* buf, long bytes);
+static int fat32_truncate_impl(vfs_file_t* f, unsigned long size);
+static int fat32_close(vfs_file_t* f);  // close doesn't touch disk/cache
+static int fat32_unlink_impl(const char* path);
+static int fat32_rename_impl(const char* oldpath, const char* newpath);
+static int fat32_mkdir_impl(const char* path, unsigned int mode);
+static int fat32_rmdir_impl(const char* path);
+static int fat32_chdir_impl(const char* path);
+
+// Locked wrappers: serialize all FAT32 VFS operations via the sleeping mutex
+// to protect the shared FAT cache (g_fat_cache) from SMP races.
+static int fat32_open(const char* path, int flags, vfs_file_t** out) {
+    fat32_io_lock(); int r = fat32_open_impl(path, flags, out); fat32_io_unlock(); return r;
+}
+static int fat32_stat_vfs(const char* path, struct kstat* st) {
+    fat32_io_lock(); int r = fat32_stat_vfs_impl(path, st); fat32_io_unlock(); return r;
+}
+static long fat32_read(vfs_file_t* f, void* buf, long bytes) {
+    fat32_io_lock(); long r = fat32_read_impl(f, buf, bytes); fat32_io_unlock(); return r;
+}
+static long fat32_write(vfs_file_t* f, const void* buf, long bytes) {
+    fat32_io_lock(); long r = fat32_write_impl(f, buf, bytes); fat32_io_unlock(); return r;
+}
+static long fat32_seek(vfs_file_t* f, long offset, int whence) {
+    fat32_io_lock(); long r = fat32_seek_impl(f, offset, whence); fat32_io_unlock(); return r;
+}
+static long fat32_readdir(vfs_file_t* f, void* buf, long bytes) {
+    fat32_io_lock(); long r = fat32_readdir_impl(f, buf, bytes); fat32_io_unlock(); return r;
+}
+static int fat32_truncate(vfs_file_t* f, unsigned long size) {
+    fat32_io_lock(); int r = fat32_truncate_impl(f, size); fat32_io_unlock(); return r;
+}
+static int fat32_unlink(const char* path) {
+    fat32_io_lock(); int r = fat32_unlink_impl(path); fat32_io_unlock(); return r;
+}
+static int fat32_rename(const char* oldpath, const char* newpath) {
+    fat32_io_lock(); int r = fat32_rename_impl(oldpath, newpath); fat32_io_unlock(); return r;
+}
+static int fat32_mkdir(const char* path, unsigned int mode) {
+    fat32_io_lock(); int r = fat32_mkdir_impl(path, mode); fat32_io_unlock(); return r;
+}
+static int fat32_rmdir(const char* path) {
+    fat32_io_lock(); int r = fat32_rmdir_impl(path); fat32_io_unlock(); return r;
+}
+static int fat32_chdir(const char* path) {
+    fat32_io_lock(); int r = fat32_chdir_impl(path); fat32_io_unlock(); return r;
+}
+
 static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_stat_vfs, fat32_read, fat32_write, fat32_seek, fat32_readdir, fat32_truncate, fat32_unlink, fat32_rename, fat32_mkdir, fat32_rmdir, fat32_chdir, fat32_close };
 
 static int fat32_resolve_parent(unsigned long start_cluster, const char *path,
@@ -2146,13 +2223,12 @@ static int fat32_set_position(fat32_file_t *ff, unsigned long target_pos)
     return ST_OK;
 }
 
-static int fat32_open(const char *path, int flags, vfs_file_t **out)
+static int fat32_open_impl(const char *path, int flags, vfs_file_t **out)
 {
     if (!out)
         return ST_INVALID;
     if (!path || !path[0])
         return ST_INVALID;
-
     unsigned long start_cluster = fat32_get_task_cwd_cluster();
     const char* rpath = fat32_normalize_start(path, &start_cluster);
 
@@ -2308,22 +2384,38 @@ static int fat32_open(const char *path, int flags, vfs_file_t **out)
     return ST_OK;
 }
 
-static int fat32_stat_vfs(const char* path, struct kstat* st)
+static int fat32_stat_vfs_impl(const char* path, struct kstat* st)
 {
     if (!st || !path)
         return ST_INVALID;
     unsigned long start_cluster = fat32_get_task_cwd_cluster();
     const char* rpath = fat32_normalize_start(path, &start_cluster);
 
+    /* Strip trailing slashes so "/tmp/" resolves the same as "/tmp".
+       We work on a small local copy to avoid modifying the caller's string. */
+    char clean[512];
+    {
+        int ci = 0;
+        while (rpath[ci] && ci < 511) { clean[ci] = rpath[ci]; ci++; }
+        clean[ci] = '\0';
+        while (ci > 0 && clean[ci - 1] == '/') { clean[--ci] = '\0'; }
+        rpath = clean;
+    }
+
     mm_memset(st, 0, sizeof(*st));
+    st->st_dev = 0;
+    st->st_rdev = 0;
     st->st_nlink = 1;
     st->st_uid = 0;
     st->st_gid = 0;
+    st->st_blksize = g_root_fs ? (uint64_t)g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector : 4096;
 
     /* Root directory — special case, no parent entry */
     if (rpath[0] == '\0') {
+        st->st_ino = g_root_fs ? g_root_fs->root_cluster : 2;
         st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
         st->st_size = 0;
+        st->st_blocks = 0;
         uint64_t now = timer_get_epoch();
         st->st_mtime = now;
         st->st_atime = now;
@@ -2378,6 +2470,8 @@ static int fat32_stat_vfs(const char* path, struct kstat* st)
         return ST_NOT_FOUND;
 
     st->st_size = size;
+    st->st_ino = fc;  /* use first cluster as inode number */
+    st->st_blocks = (size + 511) / 512;
     if (attr & FAT32_ATTR_DIRECTORY) {
         st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
     } else {
@@ -2437,7 +2531,7 @@ int fat32_unlink_path(const char* path)
     return ST_OK;
 }
 
-static int fat32_unlink(const char* path)
+static int fat32_unlink_impl(const char* path)
 {
     return fat32_unlink_path(path);
 }
@@ -2505,7 +2599,7 @@ int fat32_rename_path(const char* oldpath, const char* newpath)
     return st;
 }
 
-static int fat32_rename(const char* oldpath, const char* newpath)
+static int fat32_rename_impl(const char* oldpath, const char* newpath)
 {
     return fat32_rename_path(oldpath, newpath);
 }
@@ -2577,7 +2671,7 @@ int fat32_mkdir_path(const char* path)
     return ST_OK;
 }
 
-static int fat32_mkdir(const char* path, unsigned int mode)
+static int fat32_mkdir_impl(const char* path, unsigned int mode)
 {
     (void)mode;
     return fat32_mkdir_path(path);
@@ -2644,12 +2738,12 @@ int fat32_rmdir_path(const char* path)
     return ST_OK;
 }
 
-static int fat32_rmdir(const char* path)
+static int fat32_rmdir_impl(const char* path)
 {
     return fat32_rmdir_path(path);
 }
 
-static int fat32_chdir(const char* path)
+static int fat32_chdir_impl(const char* path)
 {
     unsigned attr = 0;
     unsigned long fc = 0;
@@ -2664,7 +2758,7 @@ static int fat32_chdir(const char* path)
     return ST_OK;
 }
 
-static long fat32_read(vfs_file_t *f, void *buf, long bytes)
+static long fat32_read_impl(vfs_file_t *f, void *buf, long bytes)
 {
     if (!f || !buf)
         return ST_INVALID;
@@ -2675,6 +2769,7 @@ static long fat32_read(vfs_file_t *f, void *buf, long bytes)
         return 0;
     if (bytes < 0)
         return ST_INVALID;
+
     if ((unsigned long)bytes > ff->size - ff->pos)
         bytes = (long)(ff->size - ff->pos);
     unsigned long remaining = (unsigned long)bytes;
@@ -2730,7 +2825,7 @@ static long fat32_read(vfs_file_t *f, void *buf, long bytes)
     return (long)copied;
 }
 
-static long fat32_write(vfs_file_t *f, const void *buf, long bytes)
+static long fat32_write_impl(vfs_file_t *f, const void *buf, long bytes)
 {
     if (!f || !buf)
         return ST_INVALID;
@@ -2764,8 +2859,9 @@ static long fat32_write(vfs_file_t *f, const void *buf, long bytes)
         unsigned avail_in_cluster = cluster_size - cluster_offset;
         unsigned chunk = (remaining < avail_in_cluster) ? (unsigned)remaining : avail_in_cluster;
         void *tmp = kalloc(cluster_size);
-        if (!tmp)
+        if (!tmp) {
             return written ? (long)written : ST_NOMEM;
+        }
 
         if (read_sectors(ff->fs->bdev,
             cluster_to_lba(ff->fs, ff->current_cluster),
@@ -2845,7 +2941,7 @@ static unsigned fat32_write_dirent64(char* out, unsigned out_size, unsigned* out
     return 1;
 }
 
-static long fat32_readdir(vfs_file_t* f, void* buf, long bytes)
+static long fat32_readdir_impl(vfs_file_t* f, void* buf, long bytes)
 {
     if (!f || !buf || bytes <= 0) {
         return ST_INVALID;
@@ -3041,7 +3137,7 @@ static int fat32_get_cluster_at(fat32_fs_t *fs, unsigned long start_cluster,
     return ST_OK;
 }
 
-static int fat32_truncate(vfs_file_t *f, unsigned long new_size)
+static int fat32_truncate_impl(vfs_file_t *f, unsigned long new_size)
 {
     if (!f)
         return ST_INVALID;
@@ -3114,7 +3210,7 @@ static int fat32_truncate(vfs_file_t *f, unsigned long new_size)
 }
 
 // Seek to position in file
-static long fat32_seek(vfs_file_t *f, long offset, int whence)
+static long fat32_seek_impl(vfs_file_t *f, long offset, int whence)
 {
     if (!f)
         return -1;

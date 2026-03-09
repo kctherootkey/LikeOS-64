@@ -44,4 +44,6 @@ struct tm *localtime_r(const time_t *timep, struct tm *result);
 time_t mktime(struct tm *tm);
 size_t strftime(char *s, size_t max, const char *format, const struct tm *tm);
 
+int nanosleep(const struct timespec *req, struct timespec *rem);
+
 #endif

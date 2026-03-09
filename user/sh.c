@@ -1125,6 +1125,14 @@ static int exec_pipeline(pipeline_t *pl) {
 
             if (pl->cmds[i].argc == 0) _exit(0);
 
+            /* Run builtins inside the pipeline child process */
+            if (is_builtin(pl->cmds[i].argv[0])) {
+                int rc = run_builtin(pl->cmds[i].argc, pl->cmds[i].argv);
+                fflush(stdout);
+                fflush(stderr);
+                _exit(rc);
+            }
+
             execvp(pl->cmds[i].argv[0], pl->cmds[i].argv);
             fprintf(stderr, "%s: command not found\n", pl->cmds[i].argv[0]);
             _exit(127);

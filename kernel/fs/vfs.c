@@ -302,8 +302,16 @@ int vfs_close(vfs_file_t* f) {
     if (old > 1) {
         return ST_OK;
     }
+
+    // Guard against refcount underflow (double-close).
+    // If old <= 0, someone already closed this file; undo the decrement and bail.
+    if (old <= 0) {
+        __sync_fetch_and_add(&f->refcount, 1);  // undo
+        kprintf("vfs_close: BUG refcount underflow on %p (old=%d)\n", f, old);
+        return ST_INVALID;
+    }
     
-    // Actually close when refcount reaches 0
+    // Actually close when refcount reaches 0 (old was 1, now 0)
     return f->ops->close(f);
 }
 

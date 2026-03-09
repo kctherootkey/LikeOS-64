@@ -309,6 +309,7 @@ typedef struct task {
     // Exit status tracking
     int exit_code;              // Exit status for waitpid
     bool has_exited;            // True when exit() was called
+    volatile int exit_lock;     // Atomic guard for sched_mark_task_exited (0=unlocked)
     bool is_fork_child;         // True if this is a newly forked child (should return 0)
     
     // User mode support

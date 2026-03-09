@@ -808,14 +808,20 @@ static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf) {
     // Security: Zero the struct to prevent leaking uninitialized kernel stack data
     struct kstat st;
     mm_memset(&st, 0, sizeof(st));
+    st.st_dev = 0;
+    st.st_ino = 0;
+    st.st_rdev = 0;
     st.st_nlink = 1;
     st.st_uid = 0;
     st.st_gid = 0;
+    st.st_blksize = 4096;
+    st.st_blocks = 0;
     st.st_atime = 0;
     st.st_mtime = 0;
     st.st_ctime = 0;
     if (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD) {
         st.st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+        st.st_rdev = ((uint64_t)5 << 8) | (fd & 0xff); /* tty major=5 */
         st.st_size = 0;
         // Security: Use SMAP-aware copy to user
         return copy_to_user((void*)stat_buf, &st, sizeof(st));
@@ -3061,6 +3067,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
     child->preempt_frame = NULL;
     child->exit_code = 0;
     child->has_exited = false;
+    child->exit_lock = 0;
     child->is_fork_child = true;
     child->first_child = NULL;
     child->next_sibling = NULL;

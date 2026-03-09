@@ -381,6 +381,7 @@ static void task_init_common(task_t* t) {
     t->next_sibling = NULL;
     t->exit_code = 0;
     t->has_exited = false;
+    t->exit_lock = 0;
     t->is_fork_child = false;
     signal_init_task(t);
     t->comm[0] = '\0';
@@ -1017,21 +1018,12 @@ void sched_remove_task(task_t* task) {
     task_list_remove(task);
     spin_unlock_irqrestore(&g_task_list_lock, flags);
 
-    // Close all open file descriptors
-    for (int i = 0; i < TASK_MAX_FDS; i++) {
-        if (task->fd_table[i]) {
-            uint64_t marker = (uint64_t)task->fd_table[i];
-            if (marker >= 1 && marker <= 3) {
-                task->fd_table[i] = NULL;
-            } else if (pipe_is_end(task->fd_table[i])) {
-                pipe_close_end((pipe_end_t*)task->fd_table[i]);
-                task->fd_table[i] = NULL;
-            } else {
-                vfs_close(task->fd_table[i]);
-                task->fd_table[i] = NULL;
-            }
-        }
-    }
+    // NOTE: File descriptors are NOT closed here.  sched_mark_task_exited()
+    // already closed all FDs (via files_struct_put or the legacy fd_table
+    // loop) and NULLed the fd_table entries.  Closing them again here would
+    // double-free pipe ends / vfs_file_t objects whose memory may have been
+    // reallocated.  The redundant close was the root cause of SLAB double-free
+    // crashes observed on VMware SMP.
 
     // SMP barrier: Before destroying address space, ensure no other CPU has
     // TLB entries pointing to pages we're about to free. This prevents races
@@ -1121,6 +1113,7 @@ task_t* sched_fork_current(void) {
     child->next_sibling = NULL;
     child->exit_code = 0;
     child->has_exited = false;
+    child->exit_lock = 0;
     child->is_fork_child = true;
     child->wait_next = NULL;
     child->wait_channel = NULL;
@@ -1310,12 +1303,16 @@ void sched_wake_expired_sleepers(uint64_t current_tick) {
 void sched_mark_task_exited(task_t* task, int status) {
     if (!task) return;
 
-    // Guard against double-call.  Cross-CPU SIGKILL marks the task exited
-    // from the sender's CPU; if the timer later delivers the same signal
-    // on the victim's CPU, signal_deliver_irq would call us a second time.
-    // The second call would try files_struct_put(NULL)/sighand_struct_put(NULL)
-    // and corrupt state.  Bail out if already processed.
-    if (task->has_exited) return;
+    // Atomic guard against concurrent calls from multiple CPUs.
+    // Scenario: CPU 0 sends SIGKILL → sched_signal_task → sched_mark_task_exited.
+    // Meanwhile CPU 1's timer fires → signal_deliver_irq dequeues the same SIGKILL
+    // → sched_mark_task_exited.  Without an atomic guard, both CPUs enter the body,
+    // close FDs twice → SLAB double-free.
+    // Use atomic test-and-set on exit_lock (NOT has_exited) so that waitpid does
+    // not see the task as "exited" until cleanup is fully complete.
+    if (__sync_lock_test_and_set(&task->exit_lock, 1)) {
+        return;  // Another CPU already started exit processing
+    }
 
     task->exit_code = status;
     
@@ -1401,6 +1398,7 @@ void sched_mark_task_exited(task_t* task, int status) {
     // Remove from run queue if it's on one
     if (task->on_rq) rq_remove(task);
 
+    // Signal to waitpid and other observers that exit processing is complete.
     task->has_exited = true;
     task->state = TASK_ZOMBIE;
     // NOTE: Do NOT set task->sp = 0 here! The task might still be running

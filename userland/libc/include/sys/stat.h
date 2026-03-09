@@ -39,11 +39,16 @@
 #define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
 
 struct stat {
+    uint64_t st_dev;
+    uint64_t st_ino;
     uint32_t st_mode;
     uint32_t st_nlink;
     uint32_t st_uid;
     uint32_t st_gid;
+    uint64_t st_rdev;
     uint64_t st_size;
+    uint64_t st_blksize;
+    uint64_t st_blocks;
     uint64_t st_atime;
     uint64_t st_mtime;
     uint64_t st_ctime;

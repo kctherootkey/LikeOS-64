@@ -80,6 +80,9 @@ void pipe_close_end(pipe_end_t* end) {
         return;
     }
 
+    // Invalidate magic BEFORE freeing to prevent double-close via stale pointer
+    end->magic = 0;
+
     pipe_t* pipe = end->pipe;
     if (pipe) {
         uint64_t flags;
