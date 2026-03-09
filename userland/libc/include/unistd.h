@@ -101,4 +101,11 @@ int dup2(int oldfd, int newfd);
 void* sbrk(intptr_t increment);
 int brk(void* addr);
 
+// System information
+struct sysinfo;
+int sysinfo(struct sysinfo *info);
+
+// Kernel log
+int klogctl(int type, char *bufp, int len);
+
 #endif

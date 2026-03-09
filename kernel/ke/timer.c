@@ -134,6 +134,110 @@ uint32_t timer_get_frequency(void) {
     return g_frequency;
 }
 
+uint64_t timer_get_uptime(void) {
+    return g_ticks / g_frequency;
+}
+
+uint64_t timer_get_boot_epoch(void) {
+    return g_boot_epoch;
+}
+
+/* ======================================================================
+ * CMOS RTC writer — writes wall-clock time back to the hardware RTC
+ * ====================================================================== */
+
+static uint8_t bin_to_bcd(uint8_t val) {
+    return (uint8_t)(((val / 10) << 4) | (val % 10));
+}
+
+static void cmos_write(uint8_t reg, uint8_t val) {
+    outb(CMOS_ADDR, reg);
+    outb(CMOS_DATA, val);
+}
+
+/*
+ * Convert epoch seconds back to broken-down UTC date/time components
+ * and write them into the CMOS RTC registers.
+ *
+ * The caller must ensure interrupts are in a safe state.
+ */
+static void cmos_write_datetime(uint64_t epoch) {
+    /* Break epoch into date/time components */
+    uint64_t rem = epoch;
+    int sec  = (int)(rem % 60); rem /= 60;
+    int min  = (int)(rem % 60); rem /= 60;
+    int hour = (int)(rem % 24); rem /= 24;
+
+    /* rem is now days since 1970-01-01 */
+    int year = 1970;
+    for (;;) {
+        int ylen = is_leap_year(year) ? 366 : 365;
+        if ((int)rem < ylen) break;
+        rem -= ylen;
+        year++;
+    }
+
+    int month = 1;
+    for (int m = 0; m < 12; m++) {
+        int mlen = days_in_month[m];
+        if (m == 1 && is_leap_year(year)) mlen++;
+        if ((int)rem < mlen) break;
+        rem -= mlen;
+        month++;
+    }
+    int day = (int)rem + 1;
+
+    /* Wait for the RTC to finish any in-progress update */
+    while (cmos_is_updating())
+        ;
+
+    /* Read register B to determine BCD vs binary mode */
+    uint8_t regB = cmos_read(0x0B);
+
+    /* Disable RTC updates while we write (set bit 7 of register B) */
+    cmos_write(0x0B, regB | 0x80);
+
+    if (!(regB & 0x04)) {
+        /* RTC uses BCD encoding */
+        cmos_write(0x00, bin_to_bcd((uint8_t)sec));
+        cmos_write(0x02, bin_to_bcd((uint8_t)min));
+        cmos_write(0x04, bin_to_bcd((uint8_t)hour));
+        cmos_write(0x07, bin_to_bcd((uint8_t)day));
+        cmos_write(0x08, bin_to_bcd((uint8_t)month));
+        cmos_write(0x09, bin_to_bcd((uint8_t)(year % 100)));
+        cmos_write(0x32, bin_to_bcd((uint8_t)(year / 100)));
+    } else {
+        /* RTC uses binary encoding */
+        cmos_write(0x00, (uint8_t)sec);
+        cmos_write(0x02, (uint8_t)min);
+        cmos_write(0x04, (uint8_t)hour);
+        cmos_write(0x07, (uint8_t)day);
+        cmos_write(0x08, (uint8_t)month);
+        cmos_write(0x09, (uint8_t)(year % 100));
+        cmos_write(0x32, (uint8_t)(year / 100));
+    }
+
+    /* Re-enable RTC updates (restore register B, clearing the inhibit bit) */
+    cmos_write(0x0B, regB & ~0x80);
+
+    kprintf("RTC: set to %d-%02d-%02d %02d:%02d:%02d UTC (epoch=%lu)\n",
+            year, month, day, hour, min, sec, (unsigned long)epoch);
+}
+
+void timer_set_boot_epoch(uint64_t epoch) {
+    /* Compute new boot_epoch such that timer_get_epoch() returns the
+     * requested wall-clock time:
+     *   epoch_now = boot_epoch + ticks/frequency
+     *   => boot_epoch = epoch_now - ticks/frequency
+     * But the caller gives us the desired epoch_now, so:
+     */
+    uint64_t uptime = g_ticks / g_frequency;
+    g_boot_epoch = epoch - uptime;
+
+    /* Sync the hardware CMOS RTC to the new wall-clock time */
+    cmos_write_datetime(epoch);
+}
+
 /*
  * Calibrate the actual timer frequency by measuring ticks between two
  * CMOS RTC second boundaries.  This corrects for inaccurate LAPIC timer
@@ -236,6 +340,11 @@ void timer_irq_handler(void) {
         // Wake any tasks whose sleep timer has expired and check signal timers
         // This handles alarm(), itimer, and wakes sleeping tasks
         sched_wake_expired_sleepers(g_ticks);
+
+        // Update load averages every 500 ticks (~5 seconds at 100Hz)
+        if ((g_ticks % 500) == 0) {
+            sched_calc_load();
+        }
     }
     
     // Per-CPU: manage this CPU's current task time slice

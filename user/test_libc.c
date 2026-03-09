@@ -19,6 +19,8 @@
 #include <getopt.h>
 #include <sys/procinfo.h>
 #include <sys/vfs.h>
+#include <sys/sysinfo.h>
+#include <sys/klog.h>
 
 // Futex helper declarations (from sched.c)
 int futex_wait(int* uaddr, int val, const struct timespec* timeout);
@@ -3507,6 +3509,71 @@ int main(int argc, char** argv) {
         ret = fstatfs(999, &bad_fst);
         test_result("fstatfs(999) fails", ret == -1);
         test_result("fstatfs(999) errno==EBADF", errno == EBADF);
+    }
+
+    // ========================================
+    // Test: sysinfo() syscall
+    // ========================================
+    printf("\n[TEST] sysinfo()\n");
+    {
+        struct sysinfo si;
+        memset(&si, 0, sizeof(si));
+        int ret = sysinfo(&si);
+        test_result("sysinfo() returns 0", ret == 0);
+        test_result("sysinfo: uptime > 0", si.uptime > 0);
+        printf("  uptime: %ld seconds\n", si.uptime);
+        test_result("sysinfo: totalram > 0", si.totalram > 0);
+        printf("  totalram: %lu bytes (mem_unit=%u)\n",
+               (unsigned long)si.totalram, si.mem_unit);
+        test_result("sysinfo: freeram > 0", si.freeram > 0);
+        test_result("sysinfo: freeram <= totalram", si.freeram <= si.totalram);
+        printf("  freeram: %lu bytes\n", (unsigned long)si.freeram);
+        test_result("sysinfo: procs > 0", si.procs > 0);
+        printf("  procs: %d\n", si.procs);
+        printf("  loads[0]=%lu loads[1]=%lu loads[2]=%lu\n",
+               si.loads[0], si.loads[1], si.loads[2]);
+        test_result("sysinfo: mem_unit > 0", si.mem_unit > 0);
+
+        /* Test with NULL pointer - should fail */
+        ret = sysinfo(NULL);
+        test_result("sysinfo(NULL) returns -1", ret == -1);
+    }
+
+    // ========================================
+    // Test: klogctl() syscall
+    // ========================================
+    printf("\n[TEST] klogctl()\n");
+    {
+        /* Get buffer size */
+        int size = klogctl(SYSLOG_ACTION_SIZE_BUFFER, NULL, 0);
+        test_result("klogctl(SIZE_BUFFER) >= 0", size >= 0);
+        printf("  kernel log buffer used: %d bytes\n", size);
+
+        /* Read kernel log */
+        char kbuf[4096];
+        int nread = klogctl(SYSLOG_ACTION_READ_ALL, kbuf, sizeof(kbuf) - 1);
+        test_result("klogctl(READ_ALL) >= 0", nread >= 0);
+        if (nread > 0) {
+            kbuf[nread] = '\0';
+            /* There should be some kernel output */
+            test_result("klogctl: read some data", nread > 0);
+            printf("  read %d bytes of kernel log (first 80 chars):\n  ", nread);
+            int show = nread < 80 ? nread : 80;
+            for (int i = 0; i < show; i++) {
+                if (kbuf[i] == '\n') printf("\\n");
+                else if (kbuf[i] >= 32 && kbuf[i] < 127) putchar(kbuf[i]);
+                else printf(".");
+            }
+            printf("\n");
+        }
+
+        /* Test invalid type */
+        int ret = klogctl(999, NULL, 0);
+        test_result("klogctl(invalid) returns -1", ret == -1);
+
+        /* Test NULL buffer with READ_ALL should fail */
+        ret = klogctl(SYSLOG_ACTION_READ_ALL, NULL, 100);
+        test_result("klogctl(READ_ALL, NULL) returns -1", ret == -1);
     }
 
     // ========================================

@@ -1076,6 +1076,17 @@ static int64_t sys_gettimeofday(uint64_t tv, uint64_t tz) {
     return 0;
 }
 
+static int64_t sys_settimeofday(uint64_t tv_ptr, uint64_t tz) {
+    (void)tz;
+    if (!validate_user_ptr(tv_ptr, sizeof(k_timeval_t))) return -EFAULT;
+    k_timeval_t kv;
+    if (copy_from_user(&kv, (const void*)tv_ptr, sizeof(kv)) < 0)
+        return -EFAULT;
+    /* Set the wall-clock time (adjusts boot_epoch and writes CMOS RTC) */
+    timer_set_boot_epoch((uint64_t)kv.tv_sec);
+    return 0;
+}
+
 static int64_t sys_fsync(uint64_t fd) {
     (void)fd;
     return 0;
@@ -1901,7 +1912,7 @@ static int64_t sys_fork(void) {
 
 // SYS_WAIT4/SYS_WAITPID - wait for child process
 // In a preemptive kernel, this BLOCKS until a child exits (unless WNOHANG)
-static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options) {
+static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options, uint64_t rusage_ptr) {
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
     
@@ -1951,7 +1962,30 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options) {
             if (status_ptr && validate_user_ptr(status_ptr, sizeof(int))) {
                 copy_to_user((void*)status_ptr, &status, sizeof(status));
             }
-            
+
+            /* Fill in resource usage from the child's accounting data */
+            if (rusage_ptr && validate_user_ptr(rusage_ptr, 56)) {
+                uint32_t freq = timer_get_frequency();
+                if (freq == 0) freq = 100;
+                struct {
+                    long ru_utime_sec;
+                    long ru_utime_usec;
+                    long ru_stime_sec;
+                    long ru_stime_usec;
+                    long ru_maxrss;
+                    long ru_minflt;
+                    long ru_majflt;
+                } ru;
+                ru.ru_utime_sec  = (long)(child->utime_ticks / freq);
+                ru.ru_utime_usec = (long)((child->utime_ticks % freq) * (1000000 / freq));
+                ru.ru_stime_sec  = (long)(child->stime_ticks / freq);
+                ru.ru_stime_usec = (long)((child->stime_ticks % freq) * (1000000 / freq));
+                ru.ru_maxrss = 0;
+                ru.ru_minflt = 0;
+                ru.ru_majflt = 0;
+                copy_to_user((void*)rusage_ptr, &ru, sizeof(ru));
+            }
+
             int child_pid = child->id;
             sched_remove_task(child);
             return child_pid;
@@ -4050,6 +4084,92 @@ static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count) {
     return count;
 }
 
+// ============================================================================
+// SYS_SYSINFO - Return system information (memory, uptime, load averages)
+// ============================================================================
+static int64_t sys_sysinfo(uint64_t info_ptr) {
+    if (!validate_user_ptr(info_ptr, sizeof(k_sysinfo_t)))
+        return -EFAULT;
+
+    k_sysinfo_t info;
+    kmemset(&info, 0, sizeof(info));
+
+    // Uptime
+    info.uptime = (long)timer_get_uptime();
+
+    // Load averages
+    sched_get_loadavg(info.loads);
+
+    // Memory stats
+    memory_stats_t mstats;
+    mm_get_memory_stats(&mstats);
+    info.totalram   = mstats.total_memory;
+    info.freeram    = mstats.free_memory;
+    info.sharedram  = mstats.heap_allocated;  // kernel heap as shared
+    info.bufferram  = 0;                       // no buffer cache
+    info.totalswap  = 0;
+    info.freeswap   = 0;
+    info.procs      = (unsigned short)sched_get_nr_procs();
+    info.totalhigh  = 0;
+    info.freehigh   = 0;
+    info.mem_unit   = 1;  // byte granularity
+    info.cached     = mstats.heap_allocated;
+    info.available  = mstats.free_memory;
+
+    if (copy_to_user((void*)info_ptr, &info, sizeof(info)) != 0)
+        return -EFAULT;
+    return 0;
+}
+
+// ============================================================================
+// SYS_KLOGCTL - Kernel ring buffer operations (for dmesg)
+// ============================================================================
+static int64_t sys_klogctl(uint64_t type, uint64_t bufp, uint64_t len) {
+    switch ((int)type) {
+    case SYSLOG_ACTION_READ:
+    case SYSLOG_ACTION_READ_ALL: {
+        if (len == 0) return 0;
+        if (!bufp || !validate_user_ptr(bufp, (size_t)len)) return -EFAULT;
+        int ksize = klog_size();
+        int rlen = (int)len;
+        if (rlen > ksize) rlen = ksize;
+        // Allocate kernel temp buffer
+        char* tmp = (char*)kalloc(rlen + 1);
+        if (!tmp) return -ENOMEM;
+        int got = klog_read(tmp, rlen);
+        if (copy_to_user((void*)bufp, tmp, got) != 0) {
+            kfree(tmp);
+            return -EFAULT;
+        }
+        kfree(tmp);
+        return got;
+    }
+    case SYSLOG_ACTION_READ_CLEAR: {
+        if (len == 0) return 0;
+        if (!bufp || !validate_user_ptr(bufp, (size_t)len)) return -EFAULT;
+        int ksize = klog_size();
+        int rlen = (int)len;
+        if (rlen > ksize) rlen = ksize;
+        char* tmp = (char*)kalloc(rlen + 1);
+        if (!tmp) return -ENOMEM;
+        int got = klog_read_clear(tmp, rlen);
+        if (copy_to_user((void*)bufp, tmp, got) != 0) {
+            kfree(tmp);
+            return -EFAULT;
+        }
+        kfree(tmp);
+        return got;
+    }
+    case SYSLOG_ACTION_CLEAR:
+        klog_clear();
+        return 0;
+    case SYSLOG_ACTION_SIZE_BUFFER:
+        return klog_size();
+    default:
+        return -EINVAL;
+    }
+}
+
 // Main syscall dispatcher (inner function)
 static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2, 
                         uint64_t a3, uint64_t a4, uint64_t a5) {
@@ -4085,7 +4205,7 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
             return sys_fork();
             
         case SYS_WAIT4:
-            return sys_waitpid((int64_t)a1, a2, a3);
+            return sys_waitpid((int64_t)a1, a2, a3, a4);
             
         case SYS_GETPPID:
             return sys_getppid();
@@ -4171,6 +4291,9 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 
         case SYS_GETTIMEOFDAY:
             return sys_gettimeofday(a1, a2);
+
+        case SYS_SETTIMEOFDAY:
+            return sys_settimeofday(a1, a2);
 
         case SYS_FSYNC:
             return sys_fsync(a1);
@@ -4348,6 +4471,12 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         case SYS_MEMSTATS:
             mm_print_memory_stats();
             return 0;
+
+        case SYS_SYSINFO:
+            return sys_sysinfo(a1);
+
+        case SYS_KLOGCTL:
+            return sys_klogctl(a1, a2, a3);
             
         default:
             return -ENOSYS;

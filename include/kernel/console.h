@@ -137,4 +137,15 @@ void console_remap_to_direct_map(void);
 #define VGA_COLOR_LIGHT_BROWN   14
 #define VGA_COLOR_WHITE         15
 
+// ============================================================================
+// Kernel log ring buffer (for dmesg)
+// ============================================================================
+#define KLOG_BUF_SIZE  (256 * 1024)  // 256 KB ring buffer
+
+void klog_append(const char *str, int len);
+int klog_read(char *buf, int size);
+int klog_read_clear(char *buf, int size);
+void klog_clear(void);
+int klog_size(void);
+
 #endif // _KERNEL_CONSOLE_H_

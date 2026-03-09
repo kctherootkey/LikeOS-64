@@ -14,6 +14,8 @@
 #include "../../include/sys/vfs.h"
 #include "../../include/termios.h"
 #include "../../include/sys/ioctl.h"
+#include "../../include/sys/sysinfo.h"
+#include "../../include/sys/klog.h"
 #include "syscall.h"
 
 int errno = 0;
@@ -366,9 +368,8 @@ pid_t wait(int* status) {
     return waitpid(-1, status, 0);
 }
 
-pid_t wait4(pid_t pid, int* status, int options, void* rusage) {
-    (void)rusage;
-    long ret = syscall3(SYS_WAIT4, pid, (long)status, options);
+pid_t wait4(pid_t pid, int* status, int options, struct rusage* rusage) {
+    long ret = syscall4(SYS_WAIT4, pid, (long)status, options, (long)rusage);
     if (ret < 0) {
         errno = -ret;
         return -1;
@@ -442,6 +443,12 @@ int uname(struct utsname* buf) {
 
 int gettimeofday(struct timeval* tv, void* tz) {
     long ret = syscall2(SYS_GETTIMEOFDAY, (long)tv, (long)tz);
+    if (ret < 0) { errno = -ret; return -1; }
+    return 0;
+}
+
+int settimeofday(const struct timeval* tv, const void* tz) {
+    long ret = syscall2(SYS_SETTIMEOFDAY, (long)tv, (long)tz);
     if (ret < 0) { errno = -ret; return -1; }
     return 0;
 }
@@ -556,6 +563,18 @@ int reboot(int cmd) {
 
 int getprocinfo(void* buf, int max_count) {
     long ret = syscall2(SYS_GETPROCINFO, (long)buf, (long)max_count);
+    if (ret < 0) { errno = -ret; return -1; }
+    return (int)ret;
+}
+
+int sysinfo(struct sysinfo *info) {
+    long ret = syscall1(SYS_SYSINFO, (long)info);
+    if (ret < 0) { errno = -ret; return -1; }
+    return 0;
+}
+
+int klogctl(int type, char *bufp, int len) {
+    long ret = syscall3(SYS_KLOGCTL, type, (long)bufp, len);
     if (ret < 0) { errno = -ret; return -1; }
     return (int)ret;
 }

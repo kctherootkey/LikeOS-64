@@ -141,6 +141,36 @@
 #define SYS_STATFS          333
 #define SYS_FSTATFS         334
 
+// System information and kernel log
+#define SYS_SYSINFO         335  // Get system info (memory, uptime, loadavg)
+#define SYS_KLOGCTL         336  // Kernel ring buffer read/clear
+#define SYS_SETTIMEOFDAY    337  // Set system time (and sync to CMOS RTC)
+
+// Kernel log control operations (for SYS_KLOGCTL)
+#define SYSLOG_ACTION_READ       2
+#define SYSLOG_ACTION_READ_ALL   3
+#define SYSLOG_ACTION_READ_CLEAR 4
+#define SYSLOG_ACTION_CLEAR      5
+#define SYSLOG_ACTION_SIZE_BUFFER 10
+
+// sysinfo structure returned by SYS_SYSINFO
+typedef struct k_sysinfo {
+    long     uptime;          // Seconds since boot
+    unsigned long loads[3];   // 1, 5, 15 minute load averages (fixed-point << 16)
+    unsigned long totalram;   // Total usable main memory in bytes
+    unsigned long freeram;    // Available memory in bytes
+    unsigned long sharedram;  // Shared memory (kernel heap used)
+    unsigned long bufferram;  // Memory used by buffers (0 for now)
+    unsigned long totalswap;  // Total swap space (0)
+    unsigned long freeswap;   // Free swap space (0)
+    unsigned short procs;     // Number of current processes
+    unsigned long totalhigh;  // Total high memory (0)
+    unsigned long freehigh;   // Free high memory (0)
+    unsigned int  mem_unit;   // Memory unit size in bytes
+    unsigned long cached;     // Kernel heap used as proxy for cached
+    unsigned long available;  // Estimated available memory
+} k_sysinfo_t;
+
 // Debug/diagnostic syscalls (LikeOS specific)
 #define SYS_MEMSTATS        300  // Print memory stats
 

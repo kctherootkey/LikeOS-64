@@ -510,4 +510,12 @@ extern int g_next_id;
 // Add task to global task list (must hold g_task_list_lock)
 void task_list_add(task_t* t);
 
+// ============================================================================
+// LOAD AVERAGE AND SYSTEM STATISTICS
+// ============================================================================
+void sched_calc_load(void);            // Update load averages (call from timer)
+void sched_get_loadavg(unsigned long loads[3]); // Get 1/5/15 min load averages (<<16 fixed-point)
+int sched_get_nr_running(void);        // Count of runnable tasks
+int sched_get_nr_procs(void);          // Total process count
+
 #endif // _KERNEL_SCHED_H_

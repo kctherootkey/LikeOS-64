@@ -157,6 +157,12 @@ void continue_system_startup(void) {
         kprintf("Timer: using PIT at 100 Hz\n");
     }
 
+    // Measure the actual tick rate against the CMOS RTC second boundary.
+    // LAPIC timer calibration (via PIT ch2) can be inaccurate in virtual
+    // machines, leading to g_frequency diverging from the real tick rate.
+    // This takes ~2 seconds but keeps wall-clock time accurate.
+    timer_calibrate_frequency();
+
     shell_init();
     storage_fs_set_ready(&g_storage_state);
 

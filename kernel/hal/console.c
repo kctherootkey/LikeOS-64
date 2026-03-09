@@ -1718,6 +1718,19 @@ int kprintf(const char* format, ...) {
     int result = kvprintf(format, args);
     va_end(args);
     
+    // Also capture output to kernel log ring buffer
+    // Re-format into a temp buffer for the klog
+    if (result > 0) {
+        char klog_tmp[1024];
+        va_list args2;
+        va_start(args2, format);
+        string_buffer_t sb2 = {klog_tmp, sizeof(klog_tmp), 0};
+        kvprintf_to_buffer(format, args2, &sb2);
+        klog_tmp[sb2.pos] = '\\0';
+        va_end(args2);
+        klog_append(klog_tmp, (int)sb2.pos);
+    }
+    
     spin_unlock_irqrestore(&console_lock, flags);
     return result;
 }
@@ -1751,4 +1764,86 @@ int ksnprintf(char* buffer, size_t size, const char* format, ...) {
     
     va_end(args);
     return result;
+}
+
+// ============================================================================
+// KERNEL LOG RING BUFFER (for dmesg)
+// ============================================================================
+
+static char g_klog_buffer[KLOG_BUF_SIZE];
+static uint32_t g_klog_head = 0;      // Next write position
+static uint32_t g_klog_count = 0;     // Number of valid characters
+static spinlock_t g_klog_lock = SPINLOCK_INIT("klog");
+
+void klog_append(const char *str, int len) {
+    // Note: caller may already hold console_lock; klog_lock must be separate
+    uint64_t flags;
+    spin_lock_irqsave(&g_klog_lock, &flags);
+    for (int i = 0; i < len; i++) {
+        g_klog_buffer[g_klog_head] = str[i];
+        g_klog_head = (g_klog_head + 1) % KLOG_BUF_SIZE;
+        if (g_klog_count < KLOG_BUF_SIZE)
+            g_klog_count++;
+    }
+    spin_unlock_irqrestore(&g_klog_lock, flags);
+}
+
+int klog_read(char *buf, int size) {
+    uint64_t flags;
+    spin_lock_irqsave(&g_klog_lock, &flags);
+    int count = (int)g_klog_count;
+    if (size < count)
+        count = size;
+    // Calculate start position in ring buffer
+    uint32_t start;
+    if (g_klog_count < KLOG_BUF_SIZE) {
+        start = 0;
+    } else {
+        start = g_klog_head;  // oldest data is at head (was overwritten)
+    }
+    // Skip to read only the last 'count' chars
+    uint32_t skip = g_klog_count - (uint32_t)count;
+    uint32_t pos = (start + skip) % KLOG_BUF_SIZE;
+    for (int i = 0; i < count; i++) {
+        buf[i] = g_klog_buffer[pos];
+        pos = (pos + 1) % KLOG_BUF_SIZE;
+    }
+    spin_unlock_irqrestore(&g_klog_lock, flags);
+    return count;
+}
+
+int klog_read_clear(char *buf, int size) {
+    uint64_t flags;
+    spin_lock_irqsave(&g_klog_lock, &flags);
+    int count = (int)g_klog_count;
+    if (size < count)
+        count = size;
+    uint32_t start;
+    if (g_klog_count < KLOG_BUF_SIZE) {
+        start = 0;
+    } else {
+        start = g_klog_head;
+    }
+    uint32_t skip = g_klog_count - (uint32_t)count;
+    uint32_t pos = (start + skip) % KLOG_BUF_SIZE;
+    for (int i = 0; i < count; i++) {
+        buf[i] = g_klog_buffer[pos];
+        pos = (pos + 1) % KLOG_BUF_SIZE;
+    }
+    g_klog_count = 0;
+    g_klog_head = 0;
+    spin_unlock_irqrestore(&g_klog_lock, flags);
+    return count;
+}
+
+void klog_clear(void) {
+    uint64_t flags;
+    spin_lock_irqsave(&g_klog_lock, &flags);
+    g_klog_count = 0;
+    g_klog_head = 0;
+    spin_unlock_irqrestore(&g_klog_lock, flags);
+}
+
+int klog_size(void) {
+    return (int)g_klog_count;
 }

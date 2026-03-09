@@ -22,5 +22,8 @@ uint64_t timer_get_epoch(void);
 uint32_t timer_get_frequency(void);
 void timer_calibrate_frequency(void);
 void timer_irq_handler(void);
+uint64_t timer_get_uptime(void);      // seconds since boot
+uint64_t timer_get_boot_epoch(void);  // Unix epoch at boot time
+void     timer_set_boot_epoch(uint64_t epoch); // Set epoch and sync CMOS RTC
 
 #endif // _KERNEL_TIMER_H_

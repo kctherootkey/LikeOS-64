@@ -80,6 +80,24 @@ static volatile uint64_t g_total_schedules = 0;
 static uint64_t g_preempt_count_total = 0;
 
 // ============================================================================
+// LOAD AVERAGE TRACKING
+// ============================================================================
+// Fixed-point arithmetic (shifted by 16 bits)
+// Exponential decay coefficients for 5-second sampling:
+//   1 min:  exp(-5/60)  * 65536 ≈ 60350
+//   5 min:  exp(-5/300) * 65536 ≈ 64462
+//  15 min:  exp(-5/900) * 65536 ≈ 65173
+#define LOADAVG_FSHIFT  16
+#define LOADAVG_FIXED_1 (1UL << LOADAVG_FSHIFT)
+#define LOADAVG_EXP_1   60350UL   // 1 minute
+#define LOADAVG_EXP_5   64462UL   // 5 minutes
+#define LOADAVG_EXP_15  65173UL   // 15 minutes
+
+static unsigned long g_loadavg[3] = {0, 0, 0};
+static spinlock_t g_loadavg_lock = SPINLOCK_INIT("loadavg");
+static uint64_t g_loadavg_last_tick = 0;
+
+// ============================================================================
 // DEAD THREAD REAPING
 // ============================================================================
 // Threads (exit_signal == 0) can never be waited on via waitpid, so they must
@@ -2411,5 +2429,84 @@ void task_load_tls(task_t* task) {
         // Fall back to MSR write
         wrmsr(MSR_FS_BASE, task->fs_base);
     }
+}
+
+// ============================================================================
+// LOAD AVERAGE AND SYSTEM STATISTICS
+// ============================================================================
+
+// Helper: compute exponentially weighted moving average
+static unsigned long calc_load(unsigned long load, unsigned long exp, unsigned long active) {
+    unsigned long newload;
+    newload = load * exp + active * LOADAVG_FIXED_1 * (LOADAVG_FIXED_1 - exp);
+    // Both exp and the factor are in <<16 space, so we shift back once
+    return newload / LOADAVG_FIXED_1;
+}
+
+// Called periodically from timer IRQ (every 5 seconds = 500 ticks at 100Hz)
+void sched_calc_load(void) {
+    // Count runnable tasks (TASK_READY or TASK_RUNNING, excluding idle/pid0)
+    int nr_active = 0;
+    spin_lock(&g_task_list_lock);
+    task_t* t = g_task_list_head;
+    while (t) {
+        if (t->id != 0 && !t->has_exited &&
+            (t->state == TASK_READY || t->state == TASK_RUNNING)) {
+            // Skip idle tasks
+            int is_idle = 0;
+            if (g_smp_initialized) {
+                // Check if this is any CPU's idle task (check by comm)
+                if (t->comm[0] == 'i' && t->comm[1] == 'd' && 
+                    t->comm[2] == 'l' && t->comm[3] == 'e')
+                    is_idle = 1;
+            }
+            if (!is_idle)
+                nr_active++;
+        }
+        t = t->next;
+    }
+    spin_unlock(&g_task_list_lock);
+
+    uint64_t flags;
+    spin_lock_irqsave(&g_loadavg_lock, &flags);
+    g_loadavg[0] = calc_load(g_loadavg[0], LOADAVG_EXP_1, (unsigned long)nr_active);
+    g_loadavg[1] = calc_load(g_loadavg[1], LOADAVG_EXP_5, (unsigned long)nr_active);
+    g_loadavg[2] = calc_load(g_loadavg[2], LOADAVG_EXP_15, (unsigned long)nr_active);
+    spin_unlock_irqrestore(&g_loadavg_lock, flags);
+}
+
+void sched_get_loadavg(unsigned long loads[3]) {
+    uint64_t flags;
+    spin_lock_irqsave(&g_loadavg_lock, &flags);
+    loads[0] = g_loadavg[0];
+    loads[1] = g_loadavg[1];
+    loads[2] = g_loadavg[2];
+    spin_unlock_irqrestore(&g_loadavg_lock, flags);
+}
+
+int sched_get_nr_running(void) {
+    int count = 0;
+    spin_lock(&g_task_list_lock);
+    task_t* t = g_task_list_head;
+    while (t) {
+        if (!t->has_exited && (t->state == TASK_READY || t->state == TASK_RUNNING))
+            count++;
+        t = t->next;
+    }
+    spin_unlock(&g_task_list_lock);
+    return count;
+}
+
+int sched_get_nr_procs(void) {
+    int count = 0;
+    spin_lock(&g_task_list_lock);
+    task_t* t = g_task_list_head;
+    while (t) {
+        if (!t->has_exited)
+            count++;
+        t = t->next;
+    }
+    spin_unlock(&g_task_list_lock);
+    return count;
 }
 

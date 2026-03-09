@@ -129,6 +129,18 @@
 #define SYS_STATFS          333
 #define SYS_FSTATFS         334
 
+// System information and kernel log
+#define SYS_SYSINFO         335
+#define SYS_KLOGCTL         336
+#define SYS_SETTIMEOFDAY    337
+
+// Kernel log control operations
+#define SYSLOG_ACTION_READ       2
+#define SYSLOG_ACTION_READ_ALL   3
+#define SYSLOG_ACTION_READ_CLEAR 4
+#define SYSLOG_ACTION_CLEAR      5
+#define SYSLOG_ACTION_SIZE_BUFFER 10
+
 // Syscall wrapper - uses inline assembly to invoke syscall instruction
 static inline long syscall0(long number) {
     long ret;

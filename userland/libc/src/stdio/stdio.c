@@ -723,6 +723,232 @@ int vsnprintf(char* str, size_t size, const char* format, va_list ap) {
             continue;
         }
 
+        /* ---- floating-point ---- */
+        case 'f': case 'F': {
+            double val = va_arg(ap, double);
+            int fprec = (prec < 0) ? 6 : prec;
+
+            /* Handle negative / sign */
+            int is_neg = 0;
+            if (val < 0.0) { is_neg = 1; val = -val; }
+
+            /* Separate integer and fractional parts.
+             * Multiply fractional part by 10^fprec and round. */
+            unsigned long long int_part = (unsigned long long)val;
+            double frac = val - (double)int_part;
+
+            /* Build the power-of-ten multiplier for the fractional digits */
+            unsigned long long fmul = 1;
+            for (int i = 0; i < fprec; i++) fmul *= 10;
+
+            unsigned long long frac_val = (unsigned long long)(frac * (double)fmul + 0.5);
+            /* Handle rounding overflow (e.g. 9.9999... rounds up) */
+            if (frac_val >= fmul) {
+                frac_val = 0;
+                int_part++;
+            }
+
+            /* Convert integer part to string */
+            char ibuf[24];
+            int ilen = 0;
+            if (int_part == 0) {
+                ibuf[ilen++] = '0';
+            } else {
+                char tmp[24]; int ti = 0;
+                unsigned long long v = int_part;
+                while (v > 0) { tmp[ti++] = '0' + (char)(v % 10); v /= 10; }
+                while (ti > 0) ibuf[ilen++] = tmp[--ti];
+            }
+
+            /* Convert fractional part to string (zero-padded to fprec width) */
+            char fbuf[24];
+            if (fprec > 0) {
+                for (int i = fprec - 1; i >= 0; i--) {
+                    fbuf[i] = '0' + (char)(frac_val % 10);
+                    frac_val /= 10;
+                }
+            }
+
+            /* Total output length: sign + int + '.' + frac */
+            char sign = 0;
+            if (is_neg) sign = '-';
+            else if (fl_plus) sign = '+';
+            else if (fl_space) sign = ' ';
+
+            int total = (sign ? 1 : 0) + ilen + (fprec > 0 ? 1 + fprec : 0);
+            int pad = (width > total) ? width - total : 0;
+
+            if (!fl_minus && !fl_zero)
+                for (int p = 0; p < pad && pos < size-1; p++) str[pos++] = ' ';
+            if (sign && pos < size-1) str[pos++] = sign;
+            if (!fl_minus && fl_zero)
+                for (int p = 0; p < pad && pos < size-1; p++) str[pos++] = '0';
+            for (int i = 0; i < ilen && pos < size-1; i++) str[pos++] = ibuf[i];
+            if (fprec > 0) {
+                if (pos < size-1) str[pos++] = '.';
+                for (int i = 0; i < fprec && pos < size-1; i++) str[pos++] = fbuf[i];
+            }
+            if (fl_minus)
+                for (int p = 0; p < pad && pos < size-1; p++) str[pos++] = ' ';
+
+            format++;
+            continue;
+        }
+
+        case 'e': case 'E': {
+            double val = va_arg(ap, double);
+            int fprec = (prec < 0) ? 6 : prec;
+            int is_neg = 0;
+            if (val < 0.0) { is_neg = 1; val = -val; }
+
+            /* Compute exponent: normalize val to [1.0, 10.0) */
+            int exponent = 0;
+            if (val != 0.0) {
+                while (val >= 10.0) { val /= 10.0; exponent++; }
+                while (val < 1.0)   { val *= 10.0; exponent--; }
+            }
+
+            /* Now val is in [1.0, 10.0). Separate integer and fraction */
+            unsigned long long int_digit = (unsigned long long)val;
+            double frac = val - (double)int_digit;
+            unsigned long long fmul = 1;
+            for (int i = 0; i < fprec; i++) fmul *= 10;
+            unsigned long long frac_val = (unsigned long long)(frac * (double)fmul + 0.5);
+            if (frac_val >= fmul) { frac_val = 0; int_digit++; if (int_digit >= 10) { int_digit = 1; exponent++; } }
+
+            char sign = 0;
+            if (is_neg) sign = '-';
+            else if (fl_plus) sign = '+';
+            else if (fl_space) sign = ' ';
+
+            /* Build: [sign] digit '.' frac 'e' [+-] exp (at least 2 digits) */
+            char ebuf[8];
+            int abs_exp = exponent < 0 ? -exponent : exponent;
+            int ei = 0;
+            ebuf[ei++] = (*format == 'E') ? 'E' : 'e';
+            ebuf[ei++] = exponent < 0 ? '-' : '+';
+            if (abs_exp < 10) ebuf[ei++] = '0';
+            { char tmp[8]; int ti=0; int ae=abs_exp; if(ae==0){tmp[ti++]='0';}else{while(ae>0){tmp[ti++]='0'+(char)(ae%10);ae/=10;}} while(ti>0) ebuf[ei++]=tmp[--ti]; }
+            int elen = ei;
+
+            char fbuf[24];
+            if (fprec > 0) {
+                for (int i = fprec - 1; i >= 0; i--) { fbuf[i] = '0' + (char)(frac_val % 10); frac_val /= 10; }
+            }
+
+            int total = (sign?1:0) + 1 + (fprec>0 ? 1+fprec : 0) + elen;
+            int pad = (width > total) ? width - total : 0;
+
+            if (!fl_minus && !fl_zero)
+                for (int p=0; p<pad && pos<size-1; p++) str[pos++]=' ';
+            if (sign && pos<size-1) str[pos++] = sign;
+            if (!fl_minus && fl_zero)
+                for (int p=0; p<pad && pos<size-1; p++) str[pos++]='0';
+            if (pos<size-1) str[pos++] = '0' + (char)int_digit;
+            if (fprec > 0) {
+                if (pos<size-1) str[pos++] = '.';
+                for (int i=0; i<fprec && pos<size-1; i++) str[pos++] = fbuf[i];
+            }
+            for (int i=0; i<elen && pos<size-1; i++) str[pos++] = ebuf[i];
+            if (fl_minus)
+                for (int p=0; p<pad && pos<size-1; p++) str[pos++]=' ';
+
+            format++;
+            continue;
+        }
+
+        case 'g': case 'G': {
+            /* %g: use %e if exponent < -4 or >= precision, else %f style */
+            double val = va_arg(ap, double);
+            int fprec = (prec < 0) ? 6 : (prec == 0 ? 1 : prec);
+            int is_neg = 0;
+            if (val < 0.0) { is_neg = 1; val = -val; }
+
+            int exponent = 0;
+            double nval = val;
+            if (nval != 0.0) {
+                while (nval >= 10.0) { nval /= 10.0; exponent++; }
+                while (nval < 1.0)   { nval *= 10.0; exponent--; }
+            }
+
+            /* Restore val (we just needed the exponent) */
+            if (is_neg) {
+                /* Re-format using %f or %e style. For simplicity, push the
+                 * value back to its negative form and use 'f' or 'e' logic
+                 * via a recursive snprintf into buf. */
+            }
+
+            char tmp_buf[80];
+            int tlen;
+            if (exponent < -4 || exponent >= fprec) {
+                /* Use %e style with (fprec-1) digits after decimal */
+                int ep = fprec - 1;
+                if (ep < 0) ep = 0;
+                /* Normalize to [1,10) */
+                nval = val;
+                int exp2 = 0;
+                if (nval != 0.0) {
+                    while (nval >= 10.0) { nval /= 10.0; exp2++; }
+                    while (nval < 1.0)   { nval *= 10.0; exp2--; }
+                }
+                unsigned long long idig = (unsigned long long)nval;
+                double fr = nval - (double)idig;
+                unsigned long long fmul = 1;
+                for (int i = 0; i < ep; i++) fmul *= 10;
+                unsigned long long fv = (unsigned long long)(fr * (double)fmul + 0.5);
+                if (fv >= fmul) { fv = 0; idig++; if (idig >= 10) { idig = 1; exp2++; } }
+                tlen = 0;
+                if (is_neg) tmp_buf[tlen++] = '-';
+                tmp_buf[tlen++] = '0' + (char)idig;
+                /* Strip trailing zeros unless # flag */
+                char fbuf2[24]; int flen2 = ep;
+                for (int i = ep-1; i >= 0; i--) { fbuf2[i] = '0'+(char)(fv%10); fv /= 10; }
+                if (!fl_hash) { while (flen2>0 && fbuf2[flen2-1]=='0') flen2--; }
+                if (flen2 > 0) {
+                    tmp_buf[tlen++] = '.';
+                    for (int i=0; i<flen2; i++) tmp_buf[tlen++] = fbuf2[i];
+                }
+                tmp_buf[tlen++] = (*format=='G') ? 'E' : 'e';
+                tmp_buf[tlen++] = exp2 < 0 ? '-' : '+';
+                int aexp = exp2 < 0 ? -exp2 : exp2;
+                if (aexp < 10) tmp_buf[tlen++] = '0';
+                { char et[8]; int ei2=0; int ae2=aexp; if(ae2==0){et[ei2++]='0';}else{while(ae2>0){et[ei2++]='0'+(char)(ae2%10);ae2/=10;}} while(ei2>0) tmp_buf[tlen++]=et[--ei2]; }
+            } else {
+                /* Use %f style with (fprec - 1 - exponent) fractional digits */
+                int fp = fprec - 1 - exponent;
+                if (fp < 0) fp = 0;
+                unsigned long long ipart = (unsigned long long)val;
+                double fr = val - (double)ipart;
+                unsigned long long fmul = 1;
+                for (int i = 0; i < fp; i++) fmul *= 10;
+                unsigned long long fv = (unsigned long long)(fr * (double)fmul + 0.5);
+                if (fv >= fmul) { fv = 0; ipart++; }
+                tlen = 0;
+                if (is_neg) tmp_buf[tlen++] = '-';
+                /* Integer part */
+                if (ipart == 0) { tmp_buf[tlen++] = '0'; }
+                else { char it[24]; int ii=0; unsigned long long v=ipart; while(v>0){it[ii++]='0'+(char)(v%10);v/=10;} while(ii>0) tmp_buf[tlen++]=it[--ii]; }
+                /* Fractional part with trailing-zero stripping */
+                char fbuf2[24]; int flen2 = fp;
+                for (int i=fp-1; i>=0; i--) { fbuf2[i] = '0'+(char)(fv%10); fv /= 10; }
+                if (!fl_hash) { while (flen2>0 && fbuf2[flen2-1]=='0') flen2--; }
+                if (flen2 > 0) {
+                    tmp_buf[tlen++] = '.';
+                    for (int i=0; i<flen2; i++) tmp_buf[tlen++] = fbuf2[i];
+                }
+            }
+
+            int pad = (width > tlen) ? width - tlen : 0;
+            if (!fl_minus)
+                for (int p=0; p<pad && pos<size-1; p++) str[pos++] = fl_zero ? '0' : ' ';
+            for (int i=0; i<tlen && pos<size-1; i++) str[pos++] = tmp_buf[i];
+            if (fl_minus)
+                for (int p=0; p<pad && pos<size-1; p++) str[pos++] = ' ';
+
+            format++;
+            continue;
+        }
+
         /* ---- unknown ---- */
         default:
             if (pos < size-1) str[pos++] = *format;
