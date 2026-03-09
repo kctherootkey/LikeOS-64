@@ -425,6 +425,26 @@ $(BUILD_DIR)/grep: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) grep
 	cp $(USER_DIR)/grep $@
 
+$(BUILD_DIR)/wc: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) wc
+	cp $(USER_DIR)/wc $@
+
+$(BUILD_DIR)/head: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) head
+	cp $(USER_DIR)/head $@
+
+$(BUILD_DIR)/tail: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) tail
+	cp $(USER_DIR)/tail $@
+
+$(BUILD_DIR)/echo: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) echo
+	cp $(USER_DIR)/echo $@
+
+$(BUILD_DIR)/printf: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) printf
+	cp $(USER_DIR)/printf $@
+
 $(BUILD_DIR)/reboot: $(BUILD_DIR)/poweroff | $(BUILD_DIR)
 	cp $(BUILD_DIR)/poweroff $@
 
@@ -491,7 +511,7 @@ $(ISO_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) | $(BUILD_DIR)
 	@echo "UEFI bootable ISO created: $(ISO_IMAGE)"
 
 # Create UEFI bootable FAT image (for direct use)
-$(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
+$(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
 	@echo "Creating UEFI bootable FAT image..."
 	
 	# Create a 64MB FAT32 image
@@ -537,6 +557,11 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/strings ::/bin/strings
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/file ::/bin/file
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/grep ::/bin/grep
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/wc ::/bin/wc
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/head ::/bin/head
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/tail ::/bin/tail
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/echo ::/bin/echo
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/printf ::/bin/printf
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr || true
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr/local || true
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr/local/bin || true
@@ -584,7 +609,7 @@ qemu-fat: $(FAT_IMAGE)
 
 # Standalone USB mass storage data image (64MB FAT32) now mirrors usb-write target (UEFI bootable + signature files)
 # Provides: EFI/BOOT/BOOTX64.EFI, kernel.elf, LIKEOS.SIG, HELLO.TXT, tests
-$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
+$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
 	@echo "Creating USB data FAT32 image (msdata.img, 64MB, UEFI bootable)..."
 	$(DD) if=/dev/zero of=$(DATA_IMAGE) bs=1M count=64
 	$(MKFS_FAT) -F32 -n "MSDATA" $(DATA_IMAGE)
@@ -635,6 +660,11 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/strings ::/bin/strings
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/file ::/bin/file
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/grep ::/bin/grep
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/wc ::/bin/wc
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/head ::/bin/head
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/tail ::/bin/tail
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/echo ::/bin/echo
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/printf ::/bin/printf
 	# Create /lib directory and copy shared libraries
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/lib || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/ld-likeos.so ::/lib/ld-likeos.so
@@ -730,7 +760,7 @@ qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)
 
 # Write ISO to USB device with GPT partition table (like Rufus)
 # Usage: make usb-write USB_DEVICE=/dev/sdX
-usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so
+usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so
 	@if [ -z "$(USB_DEVICE)" ]; then \
 		echo "Error: USB_DEVICE not specified. Usage: make usb-write USB_DEVICE=/dev/sdX"; \
 		echo "Available devices:"; \
@@ -813,6 +843,11 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo cp $(BUILD_DIR)/strings /tmp/likeos_usb_mount/bin/strings
 	sudo cp $(BUILD_DIR)/file /tmp/likeos_usb_mount/bin/file
 	sudo cp $(BUILD_DIR)/grep /tmp/likeos_usb_mount/bin/grep
+	sudo cp $(BUILD_DIR)/wc /tmp/likeos_usb_mount/bin/wc
+	sudo cp $(BUILD_DIR)/head /tmp/likeos_usb_mount/bin/head
+	sudo cp $(BUILD_DIR)/tail /tmp/likeos_usb_mount/bin/tail
+	sudo cp $(BUILD_DIR)/echo /tmp/likeos_usb_mount/bin/echo
+	sudo cp $(BUILD_DIR)/printf /tmp/likeos_usb_mount/bin/printf
 	sudo cp $(BUILD_DIR)/hello /tmp/likeos_usb_mount/usr/local/bin/hello
 	sudo cp $(BUILD_DIR)/test_libc /tmp/likeos_usb_mount/usr/local/bin/testlibc
 	sudo cp $(BUILD_DIR)/user_test.elf /tmp/likeos_usb_mount/usr/local/bin/tests
