@@ -119,8 +119,8 @@ static int make_backup(const char *path) {
     if (opt_backup == BACKUP_SIMPLE || opt_backup == BACKUP_EXISTING) {
         snprintf(backup, sizeof(backup), "%s%s", path, suffix);
         if (rename(path, backup) < 0) {
-            fprintf(stderr, PROGRAM_NAME ": cannot create backup '%s': %d\n",
-                    backup, errno);
+            fprintf(stderr, PROGRAM_NAME ": cannot create backup '%s': %s\n",
+                    backup, strerror(errno));
             return -1;
         }
         if (opt_verbose || opt_debug)
@@ -130,8 +130,8 @@ static int make_backup(const char *path) {
             snprintf(backup, sizeof(backup), "%s.~%d~", path, i);
             if (stat(backup, &st) < 0) {
                 if (rename(path, backup) < 0) {
-                    fprintf(stderr, PROGRAM_NAME ": cannot create backup '%s': %d\n",
-                            backup, errno);
+                    fprintf(stderr, PROGRAM_NAME ": cannot create backup '%s': %s\n",
+                            backup, strerror(errno));
                     return -1;
                 }
                 if (opt_verbose || opt_debug)
@@ -152,13 +152,13 @@ static int copy_recursive(const char *src, const char *dest);
 static int copy_file(const char *src, const char *dest) {
     int sfd = open(src, O_RDONLY);
     if (sfd < 0) {
-        fprintf(stderr, PROGRAM_NAME ": cannot open '%s': %d\n", src, errno);
+        fprintf(stderr, PROGRAM_NAME ": cannot open '%s': %s\n", src, strerror(errno));
         return -1;
     }
 
     int dfd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (dfd < 0) {
-        fprintf(stderr, PROGRAM_NAME ": cannot create '%s': %d\n", dest, errno);
+        fprintf(stderr, PROGRAM_NAME ": cannot create '%s': %s\n", dest, strerror(errno));
         close(sfd);
         return -1;
     }
@@ -172,8 +172,8 @@ static int copy_file(const char *src, const char *dest) {
         while (written < nread) {
             ssize_t w = write(dfd, buf + written, (size_t)(nread - written));
             if (w < 0) {
-                fprintf(stderr, PROGRAM_NAME ": error writing '%s': %d\n",
-                        dest, errno);
+                fprintf(stderr, PROGRAM_NAME ": error writing '%s': %s\n",
+                        dest, strerror(errno));
                 ret = -1;
                 goto done;
             }
@@ -182,7 +182,7 @@ static int copy_file(const char *src, const char *dest) {
     }
 
     if (nread < 0) {
-        fprintf(stderr, PROGRAM_NAME ": error reading '%s': %d\n", src, errno);
+        fprintf(stderr, PROGRAM_NAME ": error reading '%s': %s\n", src, strerror(errno));
         ret = -1;
     }
 
@@ -230,21 +230,21 @@ static int remove_recursive(const char *path) {
 static int copy_recursive(const char *src, const char *dest) {
     struct stat st;
     if (stat(src, &st) < 0) {
-        fprintf(stderr, PROGRAM_NAME ": cannot stat '%s': %d\n", src, errno);
+        fprintf(stderr, PROGRAM_NAME ": cannot stat '%s': %s\n", src, strerror(errno));
         return -1;
     }
 
     if (S_ISDIR(st.st_mode)) {
         if (mkdir(dest, st.st_mode & 07777) < 0 && errno != EEXIST) {
-            fprintf(stderr, PROGRAM_NAME ": cannot create directory '%s': %d\n",
-                    dest, errno);
+            fprintf(stderr, PROGRAM_NAME ": cannot create directory '%s': %s\n",
+                    dest, strerror(errno));
             return -1;
         }
 
         DIR *d = opendir(src);
         if (!d) {
-            fprintf(stderr, PROGRAM_NAME ": cannot open directory '%s': %d\n",
-                    src, errno);
+            fprintf(stderr, PROGRAM_NAME ": cannot open directory '%s': %s\n",
+                    src, strerror(errno));
             return -1;
         }
 
@@ -323,7 +323,7 @@ static int do_move(const char *src, const char *dest) {
 
         struct stat src_st;
         if (stat(src, &src_st) < 0) {
-            fprintf(stderr, PROGRAM_NAME ": cannot stat '%s': %d\n", src, errno);
+            fprintf(stderr, PROGRAM_NAME ": cannot stat '%s': %s\n", src, strerror(errno));
             return -1;
         }
 
@@ -357,8 +357,8 @@ static int do_move(const char *src, const char *dest) {
     }
 
     /* rename failed for another reason */
-    fprintf(stderr, PROGRAM_NAME ": cannot move '%s' to '%s': %d\n",
-            src, dest, errno);
+    fprintf(stderr, PROGRAM_NAME ": cannot move '%s' to '%s': %s\n",
+            src, dest, strerror(errno));
     return -1;
 }
 

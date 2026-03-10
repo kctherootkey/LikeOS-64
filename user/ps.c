@@ -1286,7 +1286,7 @@ int main(int argc, char **argv) {
 
     int total = getprocinfo(all, MAX_PROCS);
     if (total < 0) {
-        fprintf(stderr, "ps: getprocinfo failed (errno %d)\n", errno);
+        fprintf(stderr, "ps: getprocinfo failed: %s\n", strerror(errno));
         free(all);
         return 1;
     }

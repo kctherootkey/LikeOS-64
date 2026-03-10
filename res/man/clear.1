@@ -1,0 +1,37 @@
+CLEAR(1)                         User Commands                        CLEAR(1)
+
+NAME
+       clear - clear the terminal screen
+
+SYNOPSIS
+       clear [-x] [-T type]
+       clear -V
+
+DESCRIPTION
+       clear clears the terminal screen and scrollback buffer using ANSI escape
+       sequences.  If the -x option is given, only the visible screen is
+       cleared and the scrollback buffer is preserved.
+
+OPTIONS
+       -x     Do not clear the scrollback buffer (clear visible screen only).
+
+       -T type
+              Specify terminal type (accepted for compatibility but ignored;
+              the console is always ANSI-compatible).
+
+       -V     Output version information and exit.
+
+DETAILS
+       By default, clear sends ESC[H ESC[2J ESC[3J to reset the cursor to the
+       top-left corner and clear both the visible screen and the scrollback
+       buffer.
+
+       With -x, only ESC[H ESC[2J is sent, preserving the scrollback history.
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       sh(1)
+
+LikeOS-64                         2026-03-10                           CLEAR(1)

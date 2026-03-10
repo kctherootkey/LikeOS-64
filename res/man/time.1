@@ -1,0 +1,75 @@
+TIME(1)                          User Commands                         TIME(1)
+
+NAME
+       time - run programs and summarize system resource usage
+
+SYNOPSIS
+       time [OPTION] COMMAND [ARG]...
+
+DESCRIPTION
+       Run COMMAND with arguments ARG...  When it finishes, time writes
+       a message to standard error giving timing statistics about the
+       program run.
+
+OPTIONS
+       -f FORMAT, --format=FORMAT
+              specify output format, overriding the format specified
+              in the environment variable TIME
+
+       -o FILE, --output=FILE
+              write the resource use statistics to FILE instead of stderr
+
+       -a, --append
+              with -o, append instead of overwriting
+
+       -p, --portability
+              use the portable output format (POSIX):
+              real %e\nuser %U\nsys %S
+
+       -v, --verbose
+              give very verbose output about all resources tracked
+
+       --quiet
+              don't report the status of the program even if it differs
+              from zero
+
+       -V, --version
+              output version information and exit
+
+       --help display this help and exit
+
+   FORMAT SPECIFIERS:
+       %E     elapsed real time (wall clock) in [hours:]minutes:seconds
+
+       %e     elapsed real time in seconds
+
+       %S     total CPU-seconds used by the system on behalf of the
+              process (kernel mode)
+
+       %U     total CPU-seconds of user-mode execution
+
+       %P     percentage of CPU this job got (%U + %S) / %E
+
+       %M     maximum resident set size of the process in Kbytes
+
+       %x     exit status of the command
+
+       %C     name and command-line arguments of the command
+
+       %%     a literal %
+
+       The default format is:
+              %C: %es real, %Us user, %Ss sys
+
+EXIT STATUS
+       Returns the exit status of the timed command.  If the command
+       was killed by a signal, returns 128 + signal number.  On internal
+       errors, returns 1.
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       ps(1), top(1)
+
+LikeOS-64                         2026-03-10                            TIME(1)

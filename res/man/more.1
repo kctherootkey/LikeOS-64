@@ -1,0 +1,90 @@
+MORE(1)                          User Commands                         MORE(1)
+
+NAME
+       more - file perusal filter for crt viewing
+
+SYNOPSIS
+       more [options] [file ...]
+
+DESCRIPTION
+       more  is  a  filter for paging through text one screenful at a time.
+       Unlike less, more can only scroll forward except in limited cases.
+
+OPTIONS
+       -d, --silent
+              prompt with "[Press space to continue, 'q' to quit.]",
+              display "[Press 'h' for instructions.]" instead of ringing
+              the bell when an illegal key is pressed
+
+       -l, --logical
+              do not pause after any line which contains a ^L (form feed)
+
+       -e, --exit-on-eof
+              exit on end-of-file reached for the second time
+
+       -f, --no-pause
+              count logical lines, rather than screen lines
+
+       -p, --print-over
+              do not scroll; instead, clear the screen and display the
+              text
+
+       -c, --clean-print
+              do not scroll; instead, paint each screen from the top,
+              clearing the remainder of each line
+
+       -s, --squeeze
+              squeeze multiple blank lines into one
+
+       -u, --plain
+              suppress underlining and bold
+
+       -n, --lines NUMBER
+              specify the number of lines per screenful
+
+       +NUMBER
+              start displaying at line number NUMBER
+
+       +/STRING
+              start displaying at line containing STRING
+
+       --help display this help and exit
+
+       -V, --version
+              output version information and exit
+
+INTERACTIVE COMMANDS
+       SPACE  display next screenful
+
+       ENTER  display next line
+
+       q, Q   exit more
+
+       h, ?   display help summary
+
+       /pattern
+              search for pattern
+
+       n      find next occurrence of pattern
+
+       =      display current line number
+
+       :f     display file name and current line number
+
+       :n     skip to next file
+
+       :p     go back to previous file
+
+       b      go back one screenful (if input is a file)
+
+       .      repeat previous command
+
+       d      display next half-screenful
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       less(1), cat(1), head(1)
+
+LikeOS-64                         2026-03-10                            MORE(1)

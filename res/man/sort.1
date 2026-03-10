@@ -1,0 +1,113 @@
+SORT(1)                          User Commands                         SORT(1)
+
+NAME
+       sort - sort lines of text files
+
+SYNOPSIS
+       sort [OPTION]... [FILE]...
+
+DESCRIPTION
+       Write sorted concatenation of all FILE(s) to standard output.
+       With no FILE, or when FILE is -, read standard input.
+
+OPTIONS
+   Ordering:
+       -b, --ignore-leading-blanks
+              ignore leading blanks
+
+       -d, --dictionary-order
+              consider only blanks and alphanumeric characters
+
+       -f, --ignore-case
+              fold lower case to upper case characters
+
+       -g, --general-numeric-sort
+              compare according to general numerical value
+
+       -h, --human-numeric-sort
+              compare human readable numbers (e.g., 2K 1G)
+
+       -i, --ignore-nonprinting
+              consider only printable characters
+
+       -M, --month-sort
+              compare (unknown) < 'JAN' < ... < 'DEC'
+
+       -n, --numeric-sort
+              compare according to string numerical value
+
+       -R, --random-sort
+              shuffle, but group identical keys
+
+       -r, --reverse
+              reverse the result of comparisons
+
+       -V, --version-sort
+              natural sort of (version) numbers within text
+
+   Key definition:
+       -k, --key=KEYDEF
+              sort via a key; KEYDEF gives location and type
+
+       -t, --field-separator=SEP
+              use SEP instead of non-blank to blank transition
+
+   Output control:
+       -c, --check
+              check for sorted input; do not sort
+
+       -C, --check=quiet
+              like -c, but do not report first bad line
+
+       -o, --output=FILE
+              write result to FILE instead of standard output
+
+       -s, --stable
+              stabilize sort by disabling last-resort comparison
+
+       -u, --unique
+              with -c, check strict ordering; without -c, output only
+              the first of an equal run
+
+   Miscellaneous:
+       -m, --merge
+              merge already sorted files; do not sort
+
+       -z, --zero-terminated
+              line delimiter is NUL, not newline
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+   KEYDEF is F[.C][OPTS][,F[.C][OPTS]] for start and stop position,
+   where F is a field number and C a character position (both origin 1).
+   OPTS is one or more single-letter ordering options [bdfgiMhnRrV],
+   which override global ordering options for that key.  If no key is
+   given, use the entire line as the key.
+
+EXAMPLES
+       sort -t: -k3,3n /etc/passwd
+              sort by third field numerically
+
+       sort -u
+              remove duplicate lines from sorted output
+
+       sort -k2,2 -k1,1r
+              sort by field 2, then reverse by field 1
+
+EXIT STATUS
+       0      if OK, or if -c and input is sorted
+
+       1      if -c and input is not sorted
+
+       2      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       uniq(1), cat(1)
+
+LikeOS-64                         2026-03-10                            SORT(1)

@@ -42,8 +42,8 @@ static int do_rmdir(const char *dir) {
     if (rmdir(dir) < 0) {
         if (opt_ignore_non_empty && errno == ENOTEMPTY)
             return -1;  /* silently ignored */
-        fprintf(stderr, PROGRAM_NAME ": failed to remove '%s': %d\n",
-                dir, errno);
+        fprintf(stderr, PROGRAM_NAME ": failed to remove '%s': %s\n",
+                dir, strerror(errno));
         return -1;
     }
     if (opt_verbose)

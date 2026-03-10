@@ -1,0 +1,159 @@
+LS(1)                            User Commands                           LS(1)
+
+NAME
+       ls - list directory contents
+
+SYNOPSIS
+       ls [OPTION]... [FILE]...
+
+DESCRIPTION
+       List information about the FILEs (the current directory by
+       default).  Sort entries alphabetically unless a sort option is
+       given.
+
+OPTIONS
+   Listing format:
+       -l     use a long listing format
+
+       -1     list one file per line
+
+       -m     list entries separated by commas
+
+       -C     list entries by columns (default for terminal output)
+
+       -x     list entries by lines instead of by columns
+
+       -g     like -l, but do not list owner
+
+       -o     like -l, but do not list group information
+
+       -n, --numeric-uid-gid
+              like -l, but list numeric user and group IDs
+
+   File selection:
+       -a, --all
+              do not ignore entries starting with .
+
+       -A, --almost-all
+              do not list implied . and ..
+
+       -d, --directory
+              list directories themselves, not their contents
+
+       -B, --ignore-backups
+              do not list implied entries ending with ~
+
+       --hide=PATTERN
+              do not list implied entries matching PATTERN
+
+       -I, --ignore=PATTERN
+              do not list implied entries matching PATTERN
+
+   Sorting:
+       -S     sort by file size, largest first
+
+       -t     sort by time, newest first
+
+       -v     natural sort of (version) numbers within text
+
+       -U     do not sort; list entries in directory order
+
+       -f     list all entries in directory order (implies -aU)
+
+       -r, --reverse
+              reverse order while sorting
+
+   Display options:
+       -h, --human-readable
+              with -l and -s, print sizes like 1K 234M 2G etc.
+
+       --si   likewise, but use powers of 1000 not 1024
+
+       -k, --kibibytes
+              default to 1024-byte blocks for file system usage
+
+       -s, --size
+              print the allocated size of each file, in blocks
+
+       -i, --inode
+              print the index number of each file
+
+       -F, --classify
+              append indicator (one of */=>@|) to entries
+
+       -p     append / indicator to directories
+
+       --file-type
+              likewise, except do not append *
+
+       --color[=WHEN]
+              color the output; WHEN can be 'always', 'auto' (default
+              if omitted), or 'never'
+
+       -G, --no-group
+              in a long listing, don't print group names
+
+       -N, --literal
+              print entry names without quoting
+
+       -q, --hide-control-chars
+              print ? instead of nongraphic characters
+
+       --show-control-chars
+              show nongraphic characters as-is
+
+       -Q, --quote-name
+              enclose entry names in double quotes
+
+       --quoting-style=WORD
+              use quoting style WORD for entry names: literal, locale,
+              shell, shell-always, shell-escape, shell-escape-always,
+              c, escape
+
+       --indicator-style=WORD
+              append indicator WORD to entry names: none, slash,
+              file-type, classify
+
+       --format=WORD
+              across (-x), commas (-m), horizontal (-x), long (-l),
+              single-column (-1), verbose (-l), vertical (-C)
+
+       --sort=WORD
+              sort by WORD: none (-U), size (-S), time (-t), version (-v),
+              extension (-X)
+
+       --time=WORD
+              change the default of using modification time; access time
+              (-u): atime, access, use; change time (-c): ctime, status;
+              birth time: birth, creation
+
+       -c     with -lt: sort by, and show, ctime; with -l: show ctime
+              and sort by name; otherwise: sort by ctime
+
+       -u     with -lt: sort by, and show, access time; with -l: show
+              access time and sort by name; otherwise: sort by access
+              time
+
+   Recursive:
+       -R, --recursive
+              list subdirectories recursively
+
+   Miscellaneous:
+       -T, --tabsize=COLS
+              assume tab stops at each COLS instead of 8
+
+       -w, --width=COLS
+              set output width to COLS. 0 means no limit
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       find(1), stat(1), du(1)
+
+LikeOS-64                         2026-03-10                              LS(1)

@@ -1,0 +1,79 @@
+TAIL(1)                          User Commands                         TAIL(1)
+
+NAME
+       tail - output the last part of files
+
+SYNOPSIS
+       tail [OPTION]... [FILE]...
+
+DESCRIPTION
+       Print the last 10 lines of each FILE to standard output.  With
+       more than one FILE, precede each with a header giving the file
+       name.
+
+       With no FILE, or when FILE is -, read standard input.
+
+OPTIONS
+       -c, --bytes=[+]NUM
+              output the last NUM bytes; or use -c +NUM to output
+              starting with byte NUM of each file
+
+       -f, --follow[=name|descriptor]
+              output appended data as the file grows.  With --follow=name,
+              retry opening the file by name; with --follow=descriptor
+              (default), follow the open file descriptor.
+
+       -F     same as --follow=name --retry
+
+       -n, --lines=[+]NUM
+              output the last NUM lines, instead of the last 10; or use
+              -n +NUM to output starting with line NUM
+
+       --max-unchanged-stats=N
+              with --follow=name, reopen a FILE which has not changed
+              size after N iterations (default 5) to check if it has
+              been renamed or rotated
+
+       --pid=PID
+              with -f, terminate after process PID dies
+
+       -q, --quiet, --silent
+              never output headers giving file names
+
+       --retry
+              keep trying to open a file if it is inaccessible
+
+       -s, --sleep-interval=N
+              with -f, sleep approximately N seconds (default 1.0)
+              between iterations; fractional values allowed
+
+       -v, --verbose
+              always output headers giving file names
+
+       -z, --zero-terminated
+              line delimiter is NUL, not newline
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+   NUM may have a multiplier suffix:
+       b 512, kB 1000, K 1024, MB 1000*1000, M 1024*1024, and so on
+       for G, T, P, E.
+
+NOTES
+       Obsolete syntax -NUM (e.g., tail -20) and +NUM are also accepted.
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       head(1), cat(1), less(1)
+
+LikeOS-64                         2026-03-10                            TAIL(1)

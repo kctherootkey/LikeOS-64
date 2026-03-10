@@ -1,0 +1,87 @@
+MAN(1)                           User Commands                          MAN(1)
+
+NAME
+       man - an interface to the system reference manuals
+
+SYNOPSIS
+       man [OPTION...] [SECTION] PAGE...
+
+DESCRIPTION
+       man is the system's manual pager.  Each  page  argument  given  to
+       man is normally the name of a program, utility or function.  The
+       manual page associated with each of these arguments is then found
+       and displayed.  A section, if provided, will restrict the search
+       to that section only.
+
+OPTIONS
+       -f, --whatis
+              equivalent to whatis; display a brief description of each
+              page argument from the manual page NAME section
+
+       -k, --apropos
+              equivalent to apropos; search all man page NAME sections
+              for keywords
+
+       -w, --where, --path, --location
+              print the location of the manual page file(s) that would
+              be displayed
+
+       -a, --all
+              display all matching manual pages (not just the first)
+
+       -s, --sections=LIST
+              restrict search to colon-separated LIST of sections
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+INTERACTIVE COMMANDS
+       The manual page is displayed in an interactive pager with the
+       following commands:
+
+       SPACE, PgDn, f
+              scroll forward one page
+
+       b, PgUp
+              scroll backward one page
+
+       Down, j, RETURN
+              scroll forward one line
+
+       Up, k  scroll backward one line
+
+       Home, g
+              go to beginning
+
+       End, G go to end
+
+       /pattern
+              search forward for pattern
+
+       n      next search match
+
+       N      previous search match
+
+       q      quit
+
+SEARCH PATH
+       man searches for pages in /usr/share/man/man<section>/, defaulting
+       to section 1.  Page files are named <name>.<section> (e.g.,
+       ls.1).
+
+EXIT STATUS
+       0      if OK
+
+       1      no manual entry found
+
+       2      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       less(1), grep(1)
+
+LikeOS-64                         2026-03-10                             MAN(1)

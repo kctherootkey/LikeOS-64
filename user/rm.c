@@ -91,8 +91,8 @@ static int remove_file(const char *path) {
 
     if (unlink(path) < 0) {
         if (!opt_force) {
-            fprintf(stderr, PROGRAM_NAME ": cannot remove '%s': %d\n",
-                    path, errno);
+            fprintf(stderr, PROGRAM_NAME ": cannot remove '%s': %s\n",
+                    path, strerror(errno));
             return -1;
         }
         return 0;
@@ -111,8 +111,8 @@ static int remove_dir_recursive(const char *path) {
     DIR *d = opendir(path);
     if (!d) {
         if (!opt_force) {
-            fprintf(stderr, PROGRAM_NAME ": cannot open directory '%s': %d\n",
-                    path, errno);
+            fprintf(stderr, PROGRAM_NAME ": cannot open directory '%s': %s\n",
+                    path, strerror(errno));
             return -1;
         }
         return 0;
@@ -150,8 +150,8 @@ static int remove_dir_recursive(const char *path) {
     }
 
     if (rmdir(path) < 0) {
-        fprintf(stderr, PROGRAM_NAME ": cannot remove '%s': %d\n",
-                path, errno);
+        fprintf(stderr, PROGRAM_NAME ": cannot remove '%s': %s\n",
+                path, strerror(errno));
         return -1;
     }
 
@@ -167,8 +167,8 @@ static int remove_entry(const char *path) {
     if (lstat(path, &st) < 0) {
         if (opt_force && errno == ENOENT)
             return 0;
-        fprintf(stderr, PROGRAM_NAME ": cannot stat '%s': %d\n",
-                path, errno);
+        fprintf(stderr, PROGRAM_NAME ": cannot stat '%s': %s\n",
+                path, strerror(errno));
         return opt_force ? 0 : -1;
     }
 
@@ -188,8 +188,8 @@ static int remove_entry(const char *path) {
                     return 0;
             }
             if (rmdir(path) < 0) {
-                fprintf(stderr, PROGRAM_NAME ": cannot remove '%s': %d\n",
-                        path, errno);
+                fprintf(stderr, PROGRAM_NAME ": cannot remove '%s': %s\n",
+                        path, strerror(errno));
                 return -1;
             }
             if (opt_verbose)

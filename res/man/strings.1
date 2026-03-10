@@ -1,0 +1,70 @@
+STRINGS(1)                       User Commands                      STRINGS(1)
+
+NAME
+       strings - print the sequences of printable characters in files
+
+SYNOPSIS
+       strings [OPTION]... [FILE]...
+
+DESCRIPTION
+       For each file given, print the sequences of printable characters
+       that are at least 4 characters long (or the number given with the
+       -n option).  By default, only the contents of initialized and
+       loaded sections of object files are printed.
+
+       If no file is specified, standard input is read.
+
+OPTIONS
+       -a, --all, -
+              scan the whole file, not just the data section
+
+       -d     scan only data sections of object files (default)
+
+       -f, --print-file-name
+              print the name of the file before each string
+
+       -n, --bytes=MIN-LEN
+              print sequences of at least MIN-LEN characters (default 4)
+
+       -t, --radix=RADIX
+              print the offset within the file before each string.
+              RADIX is one of: o (octal), x (hex), d (decimal)
+
+       -o     an alias for -t o (octal offset)
+
+       -w, --include-all-whitespace
+              include all whitespace as valid string characters
+
+       -e, --encoding=ENCODING
+              select the character encoding:
+              s = single-7-bit-byte (ASCII, default)
+              S = single-8-bit-byte (Latin)
+              b = 16-bit bigendian
+              l = 16-bit littleendian
+              B = 32-bit bigendian
+              L = 32-bit littleendian
+
+       -T, --target=FORMAT
+              specify the binary file format (accepted for compat)
+
+       -s, --output-separator=SEP
+              use SEP as the output record separator (default newline)
+
+       -h, --help
+              display this help and exit
+
+       -V, -v, --version
+              output version information and exit
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       hexdump(1), file(1), grep(1)
+
+LikeOS-64                         2026-03-10                         STRINGS(1)

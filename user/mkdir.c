@@ -69,8 +69,8 @@ static int make_parents(const char *path, unsigned int parent_mode) {
             struct stat st;
             if (stat(buf, &st) < 0) {
                 if (mkdir(buf, parent_mode) < 0 && errno != EEXIST) {
-                    fprintf(stderr, PROGRAM_NAME ": cannot create directory '%s': %d\n",
-                            buf, errno);
+                    fprintf(stderr, PROGRAM_NAME ": cannot create directory '%s': %s\n",
+                            buf, strerror(errno));
                     return -1;
                 }
                 if (opt_verbose)
@@ -147,8 +147,8 @@ int main(int argc, char **argv) {
                 if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode))
                     continue;
             }
-            fprintf(stderr, PROGRAM_NAME ": cannot create directory '%s': %d\n",
-                    dir, errno);
+            fprintf(stderr, PROGRAM_NAME ": cannot create directory '%s': %s\n",
+                    dir, strerror(errno));
             errors++;
             continue;
         }

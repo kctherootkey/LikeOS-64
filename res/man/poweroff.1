@@ -1,0 +1,46 @@
+POWEROFF(1)                      User Commands                      POWEROFF(1)
+
+NAME
+       poweroff - power off the machine
+
+SYNOPSIS
+       poweroff [OPTION]
+
+DESCRIPTION
+       poweroff  instructs  the  system hardware to power off the machine.
+
+OPTIONS
+       -f, --force
+              force immediate power-off; do not call shutdown
+
+       -w, --wtmp-only
+              don't actually power off; only write wtmp record (no-op)
+
+       -d, --no-wtmp
+              don't write wtmp record
+
+       -n, --no-sync
+              don't sync before power off
+
+       --no-wall
+              don't send wall message before powering off
+
+       --help display this help and exit
+
+NOTES
+       halt, reboot, and poweroff are the same binary.  The command name
+       (argv[0]) determines the action:
+
+       halt      halts the system
+       reboot    reboots the system
+       poweroff  powers off the system
+
+       The -f flag skips the graceful shutdown sequence.
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       halt(1), reboot(1), shutdown(1)
+
+LikeOS-64                         2026-03-10                        POWEROFF(1)

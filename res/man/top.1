@@ -1,0 +1,150 @@
+TOP(1)                           User Commands                          TOP(1)
+
+NAME
+       top - display processes
+
+SYNOPSIS
+       top [OPTION]...
+
+DESCRIPTION
+       The  top  program  provides  a  dynamic  real-time  view  of  a
+       running system.  It can display system summary information as
+       well as a list of processes currently being managed by the kernel.
+
+OPTIONS
+       -b, --batch
+              starts top in batch mode, useful for sending output from
+              top to other programs or to a file
+
+       -c, --cmdline
+              toggle full command line display (show program arguments)
+
+       -d, --delay=SECS
+              specifies the delay between screen updates (default 3.0)
+
+       -E, --scale-summary-mem=SCALE
+              scale summary area memory display; SCALE is one of:
+              k (KiB), m (MiB, default), g (GiB), t (TiB), p (PiB), e (EiB)
+
+       -e, --scale-task-mem=SCALE
+              scale task area memory display; SCALE is one of:
+              k (KiB, default), m (MiB), g (GiB), t (TiB), p (PiB), e (EiB)
+
+       -H, --threads
+              show individual threads
+
+       -i, --idle
+              toggle idle processes display (hide idle by default with
+              this flag)
+
+       -n, --iterations=NUMBER
+              maximum number of iterations (refreshes) before ending
+
+       -o, --sort-field=FIELD
+              sort by FIELD; prefix with + for descending (default) or
+              - for ascending.  Fields: pid, user, pri, ni, virt, res,
+              shr, s, cpu, mem, time, command
+
+       -O, --list-fields
+              print the available sort field names and exit
+
+       -p, --pid=PID[,PID...]
+              monitor only processes with the specified PIDs
+
+       -S, --cumulative
+              toggle cumulative time mode
+
+       -s, --secure
+              run in secure mode
+
+       -U, --filter-user=USER
+              show only processes with a user name or UID matching USER
+
+       -u, --filter-user-only=USER
+              show only processes with effective user name matching USER
+
+       -V, --version
+              display version information and exit
+
+       -w, --width=COLS
+              override screen width detection
+
+       -1, --single-cpu
+              toggle single/separate CPU states display
+
+       --help display this help and exit
+
+INTERACTIVE COMMANDS
+       When top is running interactively, the following single-key
+       commands are recognized:
+
+       SPACE, RETURN
+              refresh display immediately
+
+       q      quit
+
+       h, ?   display help
+
+       k      kill a process (prompts for PID and signal)
+
+       r      renice a process (prompts for PID and value)
+
+       d, s   change delay interval (prompts for value)
+
+       n, #   change number of processes shown
+
+       u, U   filter by user (prompts for username)
+
+       o, O   change sort field (prompts for field name)
+
+       R      toggle sort direction
+
+       f      toggle full command line display
+
+       c      toggle command name / command line display
+
+       S      toggle cumulative mode
+
+       H      toggle threads mode
+
+       i      toggle idle processes display
+
+       B      toggle bold highlighting
+
+       x      toggle sort column highlight
+
+       y      toggle running task highlight
+
+       z      toggle color/mono mode
+
+       l      toggle load average display
+
+       t      toggle task/CPU states display
+
+       m      toggle memory display
+
+       1      toggle single CPU/all CPUs display
+
+       E      cycle summary memory scale (KiB → MiB → GiB → ...)
+
+       e      cycle task memory scale
+
+       W      write configuration (not currently saved)
+
+       <, >   change sort column left/right
+
+       Up/Down, PgUp/PgDn, Home/End
+              navigate the process list
+
+EXIT STATUS
+       0      normal exit via 'q' or after -n iterations
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       ps(1), free(1), kill(1), uptime(1)
+
+LikeOS-64                         2026-03-10                             TOP(1)

@@ -1,0 +1,70 @@
+UNIQ(1)                          User Commands                         UNIQ(1)
+
+NAME
+       uniq - report or omit repeated lines
+
+SYNOPSIS
+       uniq [OPTION]... [INPUT [OUTPUT]]
+
+DESCRIPTION
+       Filter adjacent matching lines from INPUT (or standard input),
+       writing to OUTPUT (or standard output).
+
+       With no options, matching lines are merged to the first occurrence.
+
+OPTIONS
+       -c, --count
+              prefix lines by the number of occurrences
+
+       -d, --repeated
+              only print duplicate lines, one for each group
+
+       -D     print all duplicate lines
+
+       --all-repeated[=METHOD]
+              like -D, but allow separating groups with an empty line;
+              METHOD={none(default),prepend,separate}
+
+       -f, --skip-fields=N
+              avoid comparing the first N fields
+
+       --group[=METHOD]
+              show all items, separating groups with an empty line;
+              METHOD={separate(default),prepend,append,both}
+
+       -i, --ignore-case
+              ignore differences in case when comparing
+
+       -s, --skip-chars=N
+              avoid comparing the first N characters
+
+       -u, --unique
+              only print unique lines
+
+       -z, --zero-terminated
+              line delimiter is NUL, not newline
+
+       -w, --check-chars=N
+              compare no more than N characters in lines
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+NOTES
+       A field is a run of blanks then non-blank characters.  Fields are
+       skipped before chars.
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       sort(1), cat(1), wc(1)
+
+LikeOS-64                         2026-03-10                            UNIQ(1)

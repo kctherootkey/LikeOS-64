@@ -1,0 +1,64 @@
+SHUTDOWN(1)                      User Commands                      SHUTDOWN(1)
+
+NAME
+       shutdown - halt, power-off or reboot the machine
+
+SYNOPSIS
+       shutdown [OPTION]... [TIME] [WALL]...
+
+DESCRIPTION
+       shutdown  may  be  used  to  halt, power-off or reboot the machine.
+       The first argument may be a TIME string.  The optional WALL
+       argument is a wall message to send to all users.
+
+   TIME
+       The time at which to shut down may be specified as:
+
+       now    shut down immediately
+
+       +m     shut down in m minutes from now
+
+       hh:mm  shut down at the specified time (24-hour clock)
+
+       If TIME is not specified, "+1" (one minute delay) is implied.
+
+OPTIONS
+       -H, --halt
+              halt the machine
+
+       -P, --poweroff
+              power-off the machine (default)
+
+       -r, --reboot
+              reboot the machine
+
+       -h     equivalent to --poweroff, overridden by --halt
+
+       -k     don't halt, power-off, reboot; just write the wall message
+
+       -c     cancel a pending shutdown
+
+       --show show pending shutdown
+
+       --no-wall
+              don't send wall message
+
+       --help display this help and exit
+
+NOTES
+       If a shutdown is scheduled, a file /run/nologin is created to
+       prevent new user logins.  The file is removed when the shutdown
+       is cancelled.
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       halt(1), poweroff(1), reboot(1)
+
+LikeOS-64                         2026-03-10                         SHUTDOWN(1)

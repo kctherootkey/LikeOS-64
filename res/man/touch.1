@@ -1,0 +1,63 @@
+TOUCH(1)                         User Commands                        TOUCH(1)
+
+NAME
+       touch - change file timestamps
+
+SYNOPSIS
+       touch [OPTION]... FILE...
+
+DESCRIPTION
+       Update  the  access  and  modification  times  of each FILE to the
+       current time.  A FILE argument that does not exist is created
+       empty, unless -c or -h is supplied.
+
+OPTIONS
+       -a     change only the access time
+
+       -c, --no-create
+              do not create any files
+
+       -d, --date=STRING
+              parse STRING and use it instead of current time.
+              Recognized formats include:
+              YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, YYYY-MM-DD HH:MM:SS,
+              and various other common date/time formats
+
+       -f     (ignored, for compatibility)
+
+       -h, --no-dereference
+              affect each symbolic link instead of any referenced file
+
+       -m     change only the modification time
+
+       -r, --reference=FILE
+              use this FILE's times instead of current time
+
+       -t STAMP
+              use [[CC]YY]MMDDhhmm[.ss] instead of current time
+
+       --time=WORD
+              change the specified time:
+              WORD is access, atime, or use: equivalent to -a
+              WORD is modify or mtime: equivalent to -m
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+NOTES
+       If neither -a nor -m is specified, both times are updated.
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       stat(1), date(1), ls(1)
+
+LikeOS-64                         2026-03-10                           TOUCH(1)

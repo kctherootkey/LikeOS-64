@@ -1,0 +1,105 @@
+PS(1)                            User Commands                           PS(1)
+
+NAME
+       ps - report a snapshot of the current processes
+
+SYNOPSIS
+       ps [options]
+
+DESCRIPTION
+       ps  displays  information  about a selection of the active processes.
+       It supports UNIX, BSD, and GNU-style options.  UNIX options are
+       preceded by a dash, BSD options are not, and GNU long options
+       start with --.
+
+   UNIX OPTIONS
+       -e, -A select all processes
+
+       -f     full-format listing
+
+       -l     long format
+
+       -o format
+              user-defined format (comma-separated keywords)
+
+       -p pidlist
+              select by process ID
+
+       -u userlist
+              select by effective user ID or name
+
+       -a     select all with a tty except session leaders
+
+       -d     select all except session leaders
+
+       -N, --deselect
+              negate selection
+
+       -r     select only running processes
+
+       -T     select all processes with this terminal
+
+       -x     include processes without a controlling terminal
+
+   BSD OPTIONS
+       a      select all processes with a terminal, or used with x to
+              select all processes
+
+       e      show the environment after the command
+
+       x      select processes without controlling terminals
+
+       u      display user-oriented format
+
+       j      BSD job control format
+
+       l      BSD long format
+
+       s      signal format
+
+       v      virtual memory format
+
+   GNU LONG OPTIONS
+       --forest
+              display process tree (ASCII art hierarchy)
+
+       --sort spec
+              sorting order (+ ascending, - descending, e.g., --sort=-pcpu)
+
+       --no-headers
+              print no header line at all
+
+       --headers
+              repeat header lines, one per page of output
+
+       --cols N, --columns N, --width N
+              set screen width
+
+       --rows N, --lines N
+              set screen height
+
+       --cumulative
+              include dead child process data
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+   FORMAT KEYWORDS
+       pid, ppid, pgid, sid, tty, stat, user, uid, pri, ni, vsz, rss,
+       pcpu, pmem, time, etime, comm, args, wchan, start_time, tname,
+       nlwp, psr, cls, flags
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       top(1), kill(1), free(1)
+
+LikeOS-64                         2026-03-10                              PS(1)

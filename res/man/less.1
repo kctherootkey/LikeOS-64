@@ -1,0 +1,165 @@
+LESS(1)                          User Commands                         LESS(1)
+
+NAME
+       less - opposite of more
+
+SYNOPSIS
+       less [options] [file ...]
+
+DESCRIPTION
+       less  is  a  program  similar  to more, but it allows backward
+       movement in the file as well as forward movement.  Also, less
+       does  not  have  to  read  the  entire  input file before starting,
+       so with large input files it starts up faster than text editors.
+
+OPTIONS
+       -c     repaint screen from top instead of scrolling
+
+       -e     quit at second end-of-file
+
+       -E     quit at first end-of-file
+
+       -f     force open non-regular files
+
+       -g     highlight only last search match
+
+       -G     don't highlight search matches
+
+       -i, --ignore-case
+              ignore case in searches
+
+       -I, --IGNORE-CASE
+              ignore case even when pattern has uppercase
+
+       -J, --status-column
+              display a status column
+
+       -m     use a medium prompt (filename + percentage)
+
+       -M     use a long prompt (filename + lines + percentage)
+
+       -N, --line-numbers
+              show line numbers
+
+       -q, --quiet, --silent
+              quiet (no bell)
+
+       -Q, --QUIET, --SILENT
+              very quiet
+
+       -r, --raw-control-chars
+              raw control characters
+
+       -R, --RAW-CONTROL-CHARS
+              output ANSI color escape sequences in raw form
+
+       -s, --squeeze-blank-lines
+              squeeze consecutive blank lines
+
+       -S, --chop-long-lines
+              chop (truncate) long lines rather than wrapping
+
+       -V, --version
+              display version information and exit
+
+       -x, --tabs=n
+              set tab stops (default 8)
+
+       -X, --no-init
+              don't send termcap initialization and deinitialization
+              strings
+
+       -z, --window=n
+              set window size; if negative, window is that many lines
+              less than screen height
+
+       -~, --tilde
+              don't display tildes after end-of-file
+
+       -#, --shift=n
+              horizontal scroll amount
+
+       --use-color
+              enable colored text
+
+       --help display this help and exit
+
+       +command
+              initial command (e.g., +G go to end, +/pattern search,
+              +N go to line N)
+
+INTERACTIVE COMMANDS
+       SPACE, f, PgDn
+              forward one window
+
+       b, PgUp
+              backward one window
+
+       RETURN, e, j, Down
+              forward one line
+
+       y, k, Up
+              backward one line
+
+       d      forward half window
+
+       u      backward half window
+
+       g, <, Home
+              go to beginning of file (or line N)
+
+       G, >, End
+              go to end of file (or line N)
+
+       Np or N%
+              go to N percent into file
+
+       /pattern
+              search forward for pattern
+
+       ?pattern
+              search backward for pattern
+
+       n      repeat previous search
+
+       N      repeat previous search in reverse direction
+
+       m<letter>
+              set a mark at the current position
+
+       '<letter>
+              go to a previously set mark
+
+       -<flag>
+              toggle a command-line option at runtime
+
+       =      display file information
+
+       :n     examine the next file
+
+       :p     examine the previous file
+
+       :e file
+              examine a new file
+
+       q, :q, Q
+              quit
+
+       h, H   display help
+
+       r, R   repaint screen
+
+       Right  scroll right
+
+       Left   scroll left
+
+ENVIRONMENT
+       LESS   Default options for less.
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       more(1), cat(1), head(1), tail(1)
+
+LikeOS-64                         2026-03-10                            LESS(1)

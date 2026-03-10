@@ -1,0 +1,76 @@
+MV(1)                            User Commands                           MV(1)
+
+NAME
+       mv - move (rename) files
+
+SYNOPSIS
+       mv [OPTION]... [-T] SOURCE DEST
+       mv [OPTION]... SOURCE... DIRECTORY
+       mv [OPTION]... -t DIRECTORY SOURCE...
+
+DESCRIPTION
+       Rename SOURCE to DEST, or move SOURCE(s) to DIRECTORY.
+
+OPTIONS
+       --backup[=CONTROL]
+              make a backup of each existing destination file.  CONTROL
+              can be 'none'/'off' (default), 'numbered'/'t',
+              'existing'/'nil', or 'simple'/'never'.
+
+       -b     like --backup but does not accept an argument (uses
+              simple backup)
+
+       -f, --force
+              do not prompt before overwriting
+
+       -i, --interactive
+              prompt before overwriting
+
+       -n, --no-clobber
+              do not overwrite an existing file
+
+       If you specify more than one of -i, -f, -n, only the final one
+       takes effect.
+
+       -S, --suffix=SUFFIX
+              override the usual backup suffix (default '~')
+
+       -t, --target-directory=DIRECTORY
+              move all SOURCE arguments into DIRECTORY
+
+       -T, --no-target-directory
+              treat DEST as a normal file
+
+       -u, --update
+              move only when the SOURCE file is newer than the
+              destination file or when the destination file is missing
+
+       -v, --verbose
+              explain what is being done
+
+       --strip-trailing-slashes
+              remove any trailing slashes from each SOURCE argument
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+NOTES
+       If source and destination are on different filesystems, mv falls
+       back to copying the file and removing the source.  Backup files
+       are created with a numbered suffix (.~1~, .~2~, ...) or a simple
+       tilde (~) suffix depending on the backup control method.
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       cp(1), rm(1), ls(1)
+
+LikeOS-64                         2026-03-10                              MV(1)

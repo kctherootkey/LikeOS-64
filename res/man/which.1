@@ -1,0 +1,37 @@
+WHICH(1)                         User Commands                        WHICH(1)
+
+NAME
+       which - locate a command
+
+SYNOPSIS
+       which [-a] [-s] NAME...
+
+DESCRIPTION
+       which  returns  the  pathnames  of  the  files  (or  links)  which
+       would  be  executed  in  the  current environment, by searching
+       the  PATH  for  matching  executable  files.
+
+OPTIONS
+       -a     print all matching pathnames of each argument
+
+       -s     silent mode; no output, only return exit status
+
+NOTES
+       which  does  not  support  long-form  options.  It searches the
+       directories in the PATH environment variable.  Shell builtins
+       and aliases are not found by which.
+
+EXIT STATUS
+       0      if all specified commands were found
+
+       1      if one or more commands were not found
+
+       2      if an error occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       sh(1), ls(1), find(1)
+
+LikeOS-64                         2026-03-10                           WHICH(1)

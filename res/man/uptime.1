@@ -1,0 +1,41 @@
+UPTIME(1)                        User Commands                       UPTIME(1)
+
+NAME
+       uptime - tell how long the system has been running
+
+SYNOPSIS
+       uptime [OPTION]
+
+DESCRIPTION
+       Print the current time, how long the system has been running, the
+       number of users currently logged on, and the system load averages
+       for the past 1, 5, and 15 minutes.
+
+OPTIONS
+       -p, --pretty
+              show uptime in pretty format (up X days, Y hours,
+              Z minutes)
+
+       -s, --since
+              system up since, in yyyy-mm-dd HH:MM:SS format
+
+       --help display this help and exit
+
+       -V, --version
+              output version information and exit
+
+NOTES
+       The number of users is hardcoded to 1 on LikeOS-64.
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       top(1), free(1), uname(1)
+
+LikeOS-64                         2026-03-10                          UPTIME(1)

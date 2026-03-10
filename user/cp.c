@@ -210,8 +210,8 @@ static int make_backup(const char *path) {
     if (opt_backup == BACKUP_SIMPLE || opt_backup == BACKUP_EXISTING) {
         snprintf(backup, sizeof(backup), "%s%s", path, suffix);
         if (rename(path, backup) < 0) {
-            fprintf(stderr, PROGRAM_NAME ": cannot create backup '%s': %d\n",
-                    backup, errno);
+            fprintf(stderr, PROGRAM_NAME ": cannot create backup '%s': %s\n",
+                    backup, strerror(errno));
             return -1;
         }
         if (opt_verbose || opt_debug)
@@ -221,8 +221,8 @@ static int make_backup(const char *path) {
             snprintf(backup, sizeof(backup), "%s.~%d~", path, i);
             if (stat(backup, &st) < 0) {
                 if (rename(path, backup) < 0) {
-                    fprintf(stderr, PROGRAM_NAME ": cannot create backup '%s': %d\n",
-                            backup, errno);
+                    fprintf(stderr, PROGRAM_NAME ": cannot create backup '%s': %s\n",
+                    backup, strerror(errno));
                     return -1;
                 }
                 if (opt_verbose || opt_debug)
@@ -259,7 +259,7 @@ static int copy_file_data(const char *src, const char *dest,
         /* Create the file but don't copy data */
         int fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0666);
         if (fd < 0) {
-            fprintf(stderr, PROGRAM_NAME ": cannot create '%s': %d\n", dest, errno);
+            fprintf(stderr, PROGRAM_NAME ": cannot create '%s': %s\n", dest, strerror(errno));
             return -1;
         }
         close(fd);
@@ -269,8 +269,8 @@ static int copy_file_data(const char *src, const char *dest,
 
     int sfd = open(src, O_RDONLY);
     if (sfd < 0) {
-        fprintf(stderr, PROGRAM_NAME ": cannot open '%s' for reading: %d\n",
-                src, errno);
+        fprintf(stderr, PROGRAM_NAME ": cannot open '%s' for reading: %s\n",
+                    src, strerror(errno));
         return -1;
     }
 
@@ -282,8 +282,8 @@ static int copy_file_data(const char *src, const char *dest,
             dfd = open(dest, O_WRONLY | O_CREAT | O_TRUNC, 0666);
         }
         if (dfd < 0) {
-            fprintf(stderr, PROGRAM_NAME ": cannot create '%s': %d\n",
-                    dest, errno);
+            fprintf(stderr, PROGRAM_NAME ": cannot create '%s': %s\n",
+                    dest, strerror(errno));
             close(sfd);
             return -1;
         }
@@ -298,8 +298,8 @@ static int copy_file_data(const char *src, const char *dest,
         while (written < nread) {
             ssize_t w = write(dfd, buf + written, (size_t)(nread - written));
             if (w < 0) {
-                fprintf(stderr, PROGRAM_NAME ": error writing '%s': %d\n",
-                        dest, errno);
+                fprintf(stderr, PROGRAM_NAME ": error writing '%s': %s\n",
+                    dest, strerror(errno));
                 ret = -1;
                 goto done;
             }
@@ -308,8 +308,8 @@ static int copy_file_data(const char *src, const char *dest,
     }
 
     if (nread < 0) {
-        fprintf(stderr, PROGRAM_NAME ": error reading '%s': %d\n",
-                src, errno);
+        fprintf(stderr, PROGRAM_NAME ": error reading '%s': %s\n",
+                    src, strerror(errno));
         ret = -1;
     }
 
@@ -333,8 +333,8 @@ static int copy_directory(const char *src, const char *dest,
     struct stat dst_st;
     if (stat(dest, &dst_st) < 0) {
         if (mkdir(dest, src_st->st_mode & 07777) < 0) {
-            fprintf(stderr, PROGRAM_NAME ": cannot create directory '%s': %d\n",
-                    dest, errno);
+            fprintf(stderr, PROGRAM_NAME ": cannot create directory '%s': %s\n",
+                    dest, strerror(errno));
             return -1;
         }
         if (opt_verbose || opt_debug)
@@ -343,8 +343,8 @@ static int copy_directory(const char *src, const char *dest,
 
     DIR *d = opendir(src);
     if (!d) {
-        fprintf(stderr, PROGRAM_NAME ": cannot open directory '%s': %d\n",
-                src, errno);
+        fprintf(stderr, PROGRAM_NAME ": cannot open directory '%s': %s\n",
+                    src, strerror(errno));
         return -1;
     }
 
@@ -385,12 +385,12 @@ static int do_copy(const char *src, const char *dest, int is_cmdline_arg) {
 
     if (follow_links) {
         if (stat(src, &src_st) < 0) {
-            fprintf(stderr, PROGRAM_NAME ": cannot stat '%s': %d\n", src, errno);
+            fprintf(stderr, PROGRAM_NAME ": cannot stat '%s': %s\n", src, strerror(errno));
             return -1;
         }
     } else {
         if (lstat(src, &src_st) < 0) {
-            fprintf(stderr, PROGRAM_NAME ": cannot stat '%s': %d\n", src, errno);
+            fprintf(stderr, PROGRAM_NAME ": cannot stat '%s': %s\n", src, strerror(errno));
             return -1;
         }
     }
@@ -451,13 +451,13 @@ static int do_copy(const char *src, const char *dest, int is_cmdline_arg) {
                 if (errno == EEXIST && (opt_force || opt_remove_destination)) {
                     unlink(dest);
                     if (link(src, dest) < 0) {
-                        fprintf(stderr, PROGRAM_NAME ": cannot create hard link '%s': %d\n",
-                                dest, errno);
+                        fprintf(stderr, PROGRAM_NAME ": cannot create hard link '%s': %s\n",
+                    dest, strerror(errno));
                         return -1;
                     }
                 } else {
-                    fprintf(stderr, PROGRAM_NAME ": cannot create hard link '%s': %d\n",
-                            dest, errno);
+                    fprintf(stderr, PROGRAM_NAME ": cannot create hard link '%s': %s\n",
+                    dest, strerror(errno));
                     return -1;
                 }
             }
@@ -472,13 +472,13 @@ static int do_copy(const char *src, const char *dest, int is_cmdline_arg) {
                 if (errno == EEXIST && (opt_force || opt_remove_destination)) {
                     unlink(dest);
                     if (symlink(src, dest) < 0) {
-                        fprintf(stderr, PROGRAM_NAME ": cannot create symbolic link '%s': %d\n",
-                                dest, errno);
+                        fprintf(stderr, PROGRAM_NAME ": cannot create symbolic link '%s': %s\n",
+                    dest, strerror(errno));
                         return -1;
                     }
                 } else {
-                    fprintf(stderr, PROGRAM_NAME ": cannot create symbolic link '%s': %d\n",
-                            dest, errno);
+                    fprintf(stderr, PROGRAM_NAME ": cannot create symbolic link '%s': %s\n",
+                    dest, strerror(errno));
                     return -1;
                 }
             }

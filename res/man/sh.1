@@ -1,0 +1,233 @@
+SH(1)                            User Commands                           SH(1)
+
+NAME
+       sh - LikeOS-64 command interpreter
+
+SYNOPSIS
+       sh
+
+DESCRIPTION
+       sh  is  the  default  interactive command interpreter for LikeOS-64.  It
+       reads commands from  standard  input,  parses  them,  and  executes  the
+       corresponding  programs.   It supports pipelines, I/O redirection, here-
+       documents, command chaining, aliases, command history, and job control.
+
+       sh is not a POSIX shell.  It does not support  shell  scripting  (loops,
+       conditionals,  functions),  variable  expansion,  globbing, or arithmetic
+       expansion.  It is designed as a lightweight interactive command line  for
+       the LikeOS-64 operating system.
+
+INVOCATION
+       sh  is  normally started automatically by the system as the login shell.
+       It sets PATH to /bin:/usr/local/bin before entering the interactive read-
+       eval-execute loop.
+
+PROMPT
+       The prompt displays the current working directory followed by " # ":
+
+              /bin # _
+
+       If the current directory is the root, the prompt is simply:
+
+              / # _
+
+QUOTING
+       Single quotes preserve the literal value of all characters  within  the
+       quotes.  No escape sequences are recognized inside single quotes.
+
+       Double  quotes  preserve  the literal value of all characters except for
+       backslash (\), which can be used to escape the next character.
+
+       A backslash (\) outside of quotes escapes the next character,  including
+       the pipe character (\|) for a literal pipe.
+
+OPERATORS
+       The following operators are supported:
+
+   Pipelines
+       command1 | command2
+              Connect  stdout  of  command1  to  stdin of command2.  Multiple
+              pipes can be chained.
+
+       command1 |& command2
+              Connect both stdout and stderr of command1 to stdin of command2.
+
+   I/O Redirection
+       command > file
+              Redirect stdout to file (overwrite).
+
+       command >> file
+              Redirect stdout to file (append).
+
+       command < file
+              Redirect stdin from file.
+
+       command 2> file
+              Redirect stderr to file (overwrite).
+
+       command 2>> file
+              Redirect stderr to file (append).
+
+       command 2>&1
+              Redirect stderr to stdout.
+
+       command &> file
+              Redirect both stdout and stderr to file (overwrite).
+
+       command &>> file
+              Redirect both stdout and stderr to file (append).
+
+       command >& file
+              Same as &> (older form).
+
+       command <> file
+              Open file for read/write on stdin.
+
+       command >| file
+              Force overwrite even with noclobber (override).
+
+   Here-Documents
+       command << DELIMITER
+              Read input lines until a line containing only DELIMITER is  seen.
+              The collected text is fed to the command's stdin.
+
+   Here-Strings
+       command <<< word
+              Feed  the  single  word  (or  quoted string) directly to the
+              command's stdin.
+
+   Command Lists
+       command1 ; command2
+              Execute command1, then execute command2.
+
+       command1 && command2
+              Execute command2 only if command1 succeeds (exit status 0).
+
+       command1 || command2
+              Execute command2 only if command1 fails (non-zero exit status).
+
+   Background Execution
+       command &
+              Run command in the background without waiting for it to complete.
+
+BUILT-IN COMMANDS
+       cd [dir]
+              Change  the  current  working directory to dir.  If dir is omitted,
+              change to the directory specified by the HOME environment variable,
+              or / if HOME is not set.
+
+       alias [-p] [name[=value] ...]
+              With  no  arguments  or  with -p, print all defined aliases in the
+              form alias name='value'.  With arguments, define  aliases  so  that
+              name is expanded to value before command execution.
+
+              Aliases  are expanded in pipelines, so an alias for a multi-word
+              command works correctly even when piped.
+
+       unalias [-a] name ...
+              Remove each name from the list of defined aliases.  With -a, remove
+              all alias definitions.
+
+       export [-fnp] [name[=value] ...]
+              Mark  each  name  to  be  passed  to  child  processes  in   the
+              environment.
+
+              -f     Not implemented (reserved for functions).
+
+              -n     Remove  the  export  property  from each name (unset the
+                     variable).
+
+              -p     Display all exported variables.
+
+              With no arguments, list all exported variables.
+
+       history [-cdanrwsp]
+              Display or manipulate the command history list.
+
+              -c     Clear the history list.
+
+              -d offset
+                     Delete the history entry at position offset.
+
+              -a     Append new history lines to the history file.
+
+              -n     Read history lines not already read from the history file.
+
+              -r     Read the history file and append its contents to the history
+                     list.
+
+              -w     Write the current history to the history file.
+
+              -s arg ...
+                     Append args to the history list as a single entry.
+
+              -p arg ...
+                     Perform history substitution on each arg and display the
+                     result.
+
+              With no arguments, display the history list with line numbers.
+
+       time [-p] pipeline
+              Execute  pipeline and print a summary of the real time elapsed and
+              the user and system time consumed.
+
+              -p     Use the POSIX output format.
+
+       help   Display a summary of built-in commands, operators, external
+              commands, and keyboard shortcuts.
+
+       exit [N]
+              Exit the shell with status N.  If N is omitted, exit with the
+              status of the last command executed.
+
+KEYBOARD SHORTCUTS
+       Ctrl+C Interrupt the currently running foreground process by sending
+              SIGINT.
+
+       Ctrl+D Print a debug dump of the shell's internal state.
+
+ENVIRONMENT
+       PATH   Colon-separated list of directories to search for external
+              commands.  Defaults to /bin:/usr/local/bin.
+
+       HOME   The home directory, used by cd when invoked without arguments.
+
+EXTERNAL COMMANDS
+       The following external commands are available in /bin:
+
+              cat clear cp cut date df dmesg du echo env false file find free
+              grep halt head hexdump kill less ls man mkdir more mv poweroff
+              printf ps pwd reboot rm rmdir shutdown sleep sort stat strings
+              tail time top touch tr true uname uniq uptime wc which yes
+
+       Additional programs are in /usr/local/bin:
+
+              hello memstat progerr testlibc testmem teststress tests
+
+EXIT STATUS
+       The shell returns the exit status of the last command executed, or the
+       value specified by the exit built-in.
+
+NOTES
+       This shell does not support:
+
+       o  Shell scripting (for, while, until, if/then/else, case/esac)
+       o  Shell functions
+       o  Variable expansion ($VAR, ${VAR}, $(...), `...`)
+       o  Arithmetic expansion ($((...)))
+       o  Filename globbing (*, ?, [...])
+       o  Tilde expansion (~)
+       o  Brace expansion ({a,b,c})
+       o  Process substitution (<(...), >(...))
+       o  Signal trapping (trap)
+       o  Startup files (.profile, .bashrc)
+
+       For a fully featured POSIX shell, see bash(1) if available.
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       man(1), ls(1), cat(1), ps(1), top(1)
+
+LikeOS-64                         2026-03-10                             SH(1)

@@ -1,0 +1,167 @@
+FIND(1)                          User Commands                         FIND(1)
+
+NAME
+       find - search for files in a directory hierarchy
+
+SYNOPSIS
+       find [path...] [expression]
+
+DESCRIPTION
+       Search for files in a directory hierarchy.  For each file found,
+       evaluate the given expression.
+
+       If no path is specified, the current directory (.) is used.
+       If no action is specified, -print is implied.
+
+   GLOBAL OPTIONS
+       -maxdepth LEVELS
+              descend at most LEVELS levels below the starting points
+
+       -mindepth LEVELS
+              do not apply any tests at levels less than LEVELS
+
+       -depth process each directory's contents before the directory
+
+       -xdev, -mount
+              don't descend directories on other filesystems
+
+       -help, --help
+              display this help
+
+       -version, --version
+              display version
+
+   TESTS
+       -name PATTERN
+              base of file name matches shell pattern PATTERN
+
+       -iname PATTERN
+              like -name, but the match is case insensitive
+
+       -path PATTERN, -wholename PATTERN
+              file name matches shell pattern PATTERN
+
+       -ipath PATTERN, -iwholename PATTERN
+              like -path, but the match is case insensitive
+
+       -type [bcdpfls]
+              file is of type: block, char, directory, pipe, regular
+              file, symbolic link, or socket
+
+       -size N[bcwkMG]
+              file uses N units of space (b=512, c=bytes, w=2-byte
+              words, k=kibibytes, M=mebibytes, G=gibibytes)
+
+       -empty file is empty (zero size or empty directory)
+
+       -perm [-/]MODE
+              file's permission bits are exactly MODE (octal).
+              With -, all bits in MODE must be set.
+              With /, any bit in MODE must be set.
+
+       -newer FILE
+              file was modified more recently than FILE
+
+       -mtime N
+              file's data was last modified N*24 hours ago
+
+       -atime N
+              file was last accessed N*24 hours ago
+
+       -ctime N
+              file's status was last changed N*24 hours ago
+
+       -mmin N
+              file's data was last modified N minutes ago
+
+       -amin N
+              file was last accessed N minutes ago
+
+       -cmin N
+              file's status was last changed N minutes ago
+
+       -links N
+              file has N hard links
+
+       -readable
+              readable by current user
+
+       -writable
+              writable by current user
+
+       -executable
+              executable by current user
+
+       -true  always true
+
+       -false always false
+
+       Numeric arguments accept +N (greater than), -N (less than), or
+       N (exactly).
+
+   ACTIONS
+       -print print the full file name, followed by a newline
+
+       -print0
+              print the full file name, followed by a NUL character
+
+       -printf FORMAT
+              print format string.  Directives:
+              %p  file's name
+              %f  file's basename
+              %h  file's dirname
+              %s  file's size in bytes
+              %k  file's size in 1K blocks
+              %m  file's permission bits (octal)
+              %M  file's permissions (symbolic)
+              %u  file's user ID
+              %g  file's group ID
+              %n  number of hard links
+              %T@ modification time as seconds.nanoseconds
+              %A@ access time as seconds.nanoseconds
+              %C@ change time as seconds.nanoseconds
+              %y  file's type (single letter)
+              %d  file's depth in the directory tree
+              %%  a literal percent sign
+
+       -exec command {} ;
+              execute command; {} is replaced by the current file name
+
+       -exec command {} +
+              like -exec but multiple file names are passed at once
+
+       -execdir command {} ;
+              like -exec, but command is run from the directory
+              containing the matched file
+
+       -delete
+              delete files (implies -depth)
+
+       -ls    list current file in ls -dils format
+
+       -prune if the file is a directory, do not descend into it
+
+       -quit  exit immediately
+
+   OPERATORS
+       ! expr, -not expr
+              true if expr is false
+
+       expr1 -a expr2, expr1 -and expr2
+              AND; expr2 is not evaluated if expr1 is false
+
+       expr1 -o expr2, expr1 -or expr2
+              OR; expr2 is not evaluated if expr1 is true
+
+       ( expr )
+              force precedence
+
+       Implicit AND between adjacent tests.
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       ls(1), grep(1), stat(1)
+
+LikeOS-64                         2026-03-10                            FIND(1)

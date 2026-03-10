@@ -541,8 +541,8 @@ static int collect_entries(const char *dirpath, entry_t *entries, int max_entrie
 {
     DIR *dir = opendir(dirpath);
     if (!dir) {
-        fprintf(stderr, "ls: cannot open directory '%s': error %d\n", dirpath,
-                errno);
+        fprintf(stderr, "ls: cannot open directory '%s': %s\n", dirpath,
+                strerror(errno));
         exit_status = 2;
         return 0;
     }
@@ -999,7 +999,7 @@ static void process_arg(const char *path,
 {
     struct stat st;
     if (stat_entry(path, &st, 1) != 0) {
-        fprintf(stderr, "ls: cannot access '%s': error %d\n", path, errno);
+        fprintf(stderr, "ls: cannot access '%s': %s\n", path, strerror(errno));
         exit_status = 2;
         return;
     }

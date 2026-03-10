@@ -1,0 +1,61 @@
+WC(1)                            User Commands                           WC(1)
+
+NAME
+       wc - print newline, word, and byte counts for each file
+
+SYNOPSIS
+       wc [OPTION]... [FILE]...
+
+DESCRIPTION
+       Print newline, word, and byte counts for each FILE, and a total
+       line if more than one FILE is specified.  A word is a non-zero-
+       length sequence of characters delimited by white space.
+
+       With no FILE, or when FILE is -, read standard input.
+
+OPTIONS
+       -c, --bytes
+              print the byte counts
+
+       -m, --chars
+              print the character counts
+
+       -l, --lines
+              print the newline counts
+
+       -L, --max-line-length
+              print the maximum display width
+
+       -w, --words
+              print the word counts
+
+       --files0-from=FILE
+              read input from the files specified by NUL-terminated
+              names in FILE; if FILE is -, read names from standard
+              input
+
+       --total=WHEN
+              when to print a line with total counts; WHEN can be:
+              auto, always, only, never
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+NOTES
+       If no counting option is specified, -c -l -w are the defaults
+       (bytes, lines, words).
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       cat(1), head(1), tail(1)
+
+LikeOS-64                         2026-03-10                              WC(1)

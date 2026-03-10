@@ -1,0 +1,103 @@
+PRINTF(1)                        User Commands                       PRINTF(1)
+
+NAME
+       printf - format and print data
+
+SYNOPSIS
+       printf FORMAT [ARGUMENT]...
+       printf OPTION
+
+DESCRIPTION
+       Print ARGUMENT(s) according to FORMAT, similar to the C printf
+       function.
+
+OPTIONS
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+FORMAT
+       FORMAT controls the output.  Interpreted sequences:
+
+       \" \\   double-quote and backslash
+
+       \a     alert (BEL)
+
+       \b     backspace
+
+       \c     produce no further output
+
+       \e     escape
+
+       \f     form feed
+
+       \n     new line
+
+       \r     carriage return
+
+       \t     horizontal tab
+
+       \v     vertical tab
+
+       \NNN   byte with octal value NNN (1 to 3 digits)
+
+       \xHH   byte with hexadecimal value HH (1 to 2 digits)
+
+       \uHHHH Unicode character with hex value HHHH (1 to 4 digits)
+
+       \UHHHHHHHH
+              Unicode character with hex value HHHHHHHH (1 to 8 digits)
+
+       %%     a single %
+
+       %b     ARGUMENT as a string with '\' escapes interpreted,
+              except that octal escapes use \0NNN form
+
+       %q     ARGUMENT is printed in a format that can be reused as
+              shell input, escaping non-printable characters
+
+       %d, %i signed decimal integer
+
+       %u     unsigned decimal integer
+
+       %o     unsigned octal integer
+
+       %x, %X unsigned hexadecimal integer
+
+       %e, %E double number in scientific notation
+
+       %f, %F double number
+
+       %g, %G double number in either %e or %f format
+
+       %c     single character (first character of ARGUMENT)
+
+       %s     string
+
+       Width and precision may be specified as '*' to use the next
+       ARGUMENT as the value.
+
+       If there are more ARGUMENTs than format specifiers, the FORMAT
+       string is reused until all ARGUMENTs are consumed.  Missing
+       ARGUMENTs are treated as 0 (for numbers) or empty string (for
+       strings).
+
+NOTES
+       Unlike echo, printf does not append a trailing newline unless
+       explicitly specified in FORMAT.  The single-quote prefix ('c or
+       "c) for character constants yields the numeric value of the
+       character.
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       echo(1), sh(1)
+
+LikeOS-64                         2026-03-10                          PRINTF(1)

@@ -1,0 +1,61 @@
+KILL(1)                          User Commands                         KILL(1)
+
+NAME
+       kill - send a signal to a process
+
+SYNOPSIS
+       kill [-s sigspec | -sigspec] pid ...
+       kill -l [sigspec]
+       kill -L
+
+DESCRIPTION
+       Send  the  specified  signal to the specified processes.  The
+       default signal is SIGTERM (15).
+
+OPTIONS
+       -s sigspec
+              specify the signal to send by name or number
+
+       -sigspec
+              signal shorthand (e.g., -9, -HUP, -SIGTERM)
+
+       -l [sigspec]
+              list signal names.  If sigspec is a signal number, print
+              the name.  If sigspec is a name, print the number.  With
+              no argument, list all standard signal names.
+
+       -L     list signal names in a table format
+
+       -q value
+              queue signal (accepted for compatibility but not
+              implemented)
+
+SIGNALS
+       The following signals are recognized (with or without SIG prefix):
+
+       HUP (1), INT (2), QUIT (3), ILL (4), TRAP (5), ABRT (6), BUS (7),
+       FPE (8), KILL (9), USR1 (10), SEGV (11), USR2 (12), PIPE (13),
+       ALRM (14), TERM (15), STKFLT (16), CHLD (17), CONT (18),
+       STOP (19), TSTP (20), TTIN (21), TTOU (22), URG (23), XCPU (24),
+       XFSZ (25), VTALRM (26), PROF (27), WINCH (28), IO (29), PWR (30),
+       SYS (31)
+
+       Real-time signals RTMIN through RTMAX are also supported, with
+       RTMIN+n and RTMAX-n notation.
+
+NOTES
+       Signal numbers above 128 are treated as exit-status encodings:
+       the actual signal number is computed as num - 128.
+
+EXIT STATUS
+       0      if OK
+
+       1      if an error occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       ps(1), top(1), sh(1)
+
+LikeOS-64                         2026-03-10                            KILL(1)

@@ -1,0 +1,101 @@
+DU(1)                            User Commands                           DU(1)
+
+NAME
+       du - estimate file space usage
+
+SYNOPSIS
+       du [OPTION]... [FILE]...
+
+DESCRIPTION
+       Summarize  disk  usage  of the set of FILEs, recursively for
+       directories.
+
+OPTIONS
+       -0, --null
+              end each output line with NUL, not newline
+
+       -a, --all
+              write counts for all files, not just directories
+
+       --apparent-size
+              print apparent sizes rather than disk usage
+
+       -b, --bytes
+              equivalent to --apparent-size --block-size=1
+
+       -B, --block-size=SIZE
+              scale sizes by SIZE before printing
+
+       -c, --total
+              produce a grand total
+
+       -d, --max-depth=N
+              print the total for a directory only if it is N or fewer
+              levels below the argument
+
+       -D, --dereference-args
+              dereference only symlinks listed on the command line
+
+       -h, --human-readable
+              print sizes in human readable format (e.g., 1K 234M 2G)
+
+       -H     equivalent to --dereference-args
+
+       --si   like -h, but use powers of 1000 not 1024
+
+       -k     like --block-size=1K
+
+       -l, --count-links
+              count sizes many times if hard linked
+
+       -L, --dereference
+              dereference all symbolic links
+
+       -m     like --block-size=1M
+
+       -P, --no-dereference
+              don't follow any symbolic links (this is the default)
+
+       -S, --separate-dirs
+              for directories do not include size of subdirectories
+
+       -s, --summarize
+              display only a total for each argument
+
+       --inodes
+              list inode usage information instead of block usage
+
+       -t, --threshold=SIZE
+              exclude entries smaller than SIZE if positive, or entries
+              larger than SIZE if negative
+
+       --time show time of the last modification of any file in the
+              directory, or any of its subdirectories
+
+       -x, --one-file-system
+              skip directories on different file systems
+
+       --exclude=PATTERN
+              exclude files that match PATTERN
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+NOTES
+       Default block size is 1K.  If no FILE is given, the current
+       directory (.) is used.
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       df(1), ls(1), stat(1)
+
+LikeOS-64                         2026-03-10                              DU(1)

@@ -1,0 +1,93 @@
+DMESG(1)                         User Commands                        DMESG(1)
+
+NAME
+       dmesg - print or control the kernel ring buffer
+
+SYNOPSIS
+       dmesg [options]
+
+DESCRIPTION
+       dmesg is used to examine or control the kernel ring buffer.
+
+OPTIONS
+       -C, --clear
+              clear the kernel ring buffer
+
+       -c, --read-clear
+              read and clear all messages
+
+       -d, --show-delta
+              show time delta between printed messages
+
+       -e, --reltime
+              show local time and time delta in readable format
+
+       -F, --file=FILE
+              use FILE instead of the kernel log buffer
+
+       -f, --facility=LIST
+              restrict output to defined facilities (comma-separated):
+              kern, mail, daemon, auth, syslog, lpr, news, uucp, cron,
+              authpriv, ftp, local0-local7
+
+       -H, --human
+              human-readable output (enables reltime format)
+
+       -h, --help
+              display this help and exit
+
+       -k, --kernel
+              display kernel messages
+
+       -l, --level=LIST
+              restrict output to defined levels (comma-separated):
+              emerg, alert, crit, err, warn, notice, info, debug
+
+       -n, --console-level=LEVEL
+              set level of messages printed to console (not supported)
+
+       --noescape
+              don't escape unprintable characters
+
+       -P, --nopager
+              do not pipe output into a pager
+
+       -r, --raw
+              print the raw message buffer
+
+       -s, --buffer-size=SIZE
+              buffer size to query the kernel ring buffer (default 256K)
+
+       -T, --ctime
+              show human-readable timestamp
+
+       -t, --notime
+              don't show any timestamp with messages
+
+       --time-format=FORMAT
+              show timestamp using FORMAT: delta, reltime, ctime, notime,
+              iso
+
+       -u, --userspace
+              display userspace messages
+
+       -V, --version
+              output version information and exit
+
+       -w, --follow
+              wait for new messages (poll every 1 second)
+
+       -x, --decode
+              decode facility and level to readable strings
+
+NOTES
+       Default behavior shows kernel-only messages.  The default buffer
+       size is 256KB.  -H implies reltime display.
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       ps(1), free(1), uptime(1)
+
+LikeOS-64                         2026-03-10                           DMESG(1)

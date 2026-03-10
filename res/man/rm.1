@@ -1,0 +1,68 @@
+RM(1)                            User Commands                           RM(1)
+
+NAME
+       rm - remove files or directories
+
+SYNOPSIS
+       rm [OPTION]... [FILE]...
+
+DESCRIPTION
+       rm removes each specified file.  By default, it does not remove
+       directories.
+
+OPTIONS
+       -f, --force
+              ignore nonexistent files and arguments, never prompt
+
+       -i     prompt before every removal
+
+       -I     prompt once before removing more than three files, or when
+              removing recursively; less intrusive than -i, while still
+              giving protection against most mistakes
+
+       --interactive[=WHEN]
+              prompt according to WHEN: never, once (-I), or always (-i)
+
+       --one-file-system
+              when removing a hierarchy recursively, skip any directory
+              that is on a file system different from the starting point
+
+       --no-preserve-root
+              do not treat '/' specially
+
+       --preserve-root[=all]
+              do not remove '/' (default); with 'all', reject any
+              command line argument on a separate device from its parent
+
+       -r, -R, --recursive
+              remove directories and their contents recursively
+
+       -d, --dir
+              remove empty directories
+
+       -v, --verbose
+              explain what is being done
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+NOTES
+       To remove a file whose name starts with a '-', use:
+              rm -- -filename   or   rm ./-filename
+
+       rm does not remove '.' or '..' directory entries.
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       rmdir(1), mv(1), ls(1)
+
+LikeOS-64                         2026-03-10                              RM(1)

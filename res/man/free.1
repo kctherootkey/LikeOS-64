@@ -1,0 +1,78 @@
+FREE(1)                          User Commands                         FREE(1)
+
+NAME
+       free - display amount of free and used memory in the system
+
+SYNOPSIS
+       free [options]
+
+DESCRIPTION
+       free displays the total amount of free and used physical and swap
+       memory in the system, as well as the buffers and caches used by
+       the kernel.  The information is gathered from the sysinfo syscall.
+
+OPTIONS
+       -b, --bytes
+              show output in bytes
+
+       --kilo show output in kilobytes (1000-based)
+
+       --mega show output in megabytes (1000-based)
+
+       --giga show output in gigabytes (1000-based)
+
+       --tera show output in terabytes (1000-based)
+
+       --peta show output in petabytes (1000-based)
+
+       -k, --kibi
+              show output in kibibytes (default)
+
+       -m, --mebi
+              show output in mebibytes
+
+       -g, --gibi
+              show output in gibibytes
+
+       --tebi show output in tebibytes
+
+       --pebi show output in pebibytes
+
+       -h, --human
+              show human-readable output (powers of 1024)
+
+       --si   use powers of 1000 instead of 1024
+
+       -l, --lohi
+              show detailed low and high memory statistics
+
+       -L, --line
+              show output on a single line
+
+       -t, --total
+              show total for RAM + swap
+
+       -v, --committed
+              show committed memory and commit limit
+
+       -s, --seconds N
+              repeat printing every N seconds
+
+       -c, --count N
+              repeat printing N times, then exit
+
+       -w, --wide
+              wide output (separate buffers and cache columns)
+
+       --help display this help and exit
+
+       -V, --version
+              output version information and exit
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       top(1), ps(1), uptime(1)
+
+LikeOS-64                         2026-03-10                            FREE(1)

@@ -1,0 +1,65 @@
+ECHO(1)                          User Commands                         ECHO(1)
+
+NAME
+       echo - display a line of text
+
+SYNOPSIS
+       echo [SHORT-OPTION]... [STRING]...
+       echo LONG-OPTION
+
+DESCRIPTION
+       Echo the STRING(s) to standard output.
+
+OPTIONS
+       -n     do not output the trailing newline
+
+       -e     enable interpretation of backslash escapes
+
+       -E     disable interpretation of backslash escapes (default)
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+   If -e is in effect, the following sequences are recognized:
+
+       \\     backslash
+
+       \a     alert (BEL)
+
+       \b     backspace
+
+       \c     produce no further output
+
+       \e     escape character
+
+       \f     form feed
+
+       \n     new line
+
+       \r     carriage return
+
+       \t     horizontal tab
+
+       \v     vertical tab
+
+       \0nnn  byte with octal value nnn (1 to 3 digits)
+
+       \xHH   byte with hexadecimal value HH (1 to 2 digits)
+
+NOTES
+       Options are parsed manually; only leading arguments composed of -
+       followed by n, e, or E characters are treated as options (e.g.,
+       -neE is valid).  Multiple flags can be combined.
+
+EXIT STATUS
+       Always 0.
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       printf(1)
+
+LikeOS-64                         2026-03-10                            ECHO(1)

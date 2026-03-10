@@ -1,0 +1,72 @@
+CUT(1)                           User Commands                          CUT(1)
+
+NAME
+       cut - remove sections from each line of files
+
+SYNOPSIS
+       cut OPTION... [FILE]...
+
+DESCRIPTION
+       Print selected parts of lines from each FILE to standard output.
+
+       With no FILE, or when FILE is -, read standard input.
+
+       Exactly one of -b, -c, or -f must be specified.
+
+OPTIONS
+       -b, --bytes=LIST
+              select only these bytes
+
+       -c, --characters=LIST
+              select only these characters
+
+       -d, --delimiter=DELIM
+              use DELIM instead of TAB for field delimiter
+
+       -f, --fields=LIST
+              select only these fields; also print any line that contains
+              no delimiter character, unless the -s option is specified
+
+       -n     (ignored)
+
+       --complement
+              complement the set of selected bytes, characters or fields
+
+       -s, --only-delimited
+              do not print lines not containing delimiters
+
+       --output-delimiter=STRING
+              use STRING as the output delimiter; the default is to use
+              the input delimiter
+
+       -z, --zero-terminated
+              line delimiter is NUL, not newline
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+   LIST format:
+       N      Nth byte, character, or field (counted from 1)
+
+       N-     from Nth byte, character, or field, to end of line
+
+       N-M    from Nth to Mth byte, character, or field (inclusive)
+
+       -M     from first to Mth byte, character, or field
+
+       Multiple ranges may be separated by commas.
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       tr(1), sort(1), uniq(1)
+
+LikeOS-64                         2026-03-10                             CUT(1)

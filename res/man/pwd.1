@@ -1,0 +1,39 @@
+PWD(1)                           User Commands                          PWD(1)
+
+NAME
+       pwd - print name of current/working directory
+
+SYNOPSIS
+       pwd [OPTION]...
+
+DESCRIPTION
+       Print the full filename of the current working directory.
+
+OPTIONS
+       -L, --logical
+              use PWD from environment, even if it contains symlinks
+
+       -P, --physical
+              avoid all symlinks (default)
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+NOTES
+       pwd defaults to physical mode (-P), resolving symlinks via the
+       getcwd() system call.
+
+EXIT STATUS
+       0      if OK
+
+       1      if errors occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       ls(1), cd (built-in in sh(1))
+
+LikeOS-64                         2026-03-10                             PWD(1)

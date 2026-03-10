@@ -1,0 +1,155 @@
+GREP(1)                          User Commands                         GREP(1)
+
+NAME
+       grep - print lines that match patterns
+
+SYNOPSIS
+       grep [OPTION]... PATTERNS [FILE]...
+
+DESCRIPTION
+       grep  searches  for  PATTERNS  in  each  FILE.  PATTERNS is one or
+       more patterns separated by newline  characters,  and  grep  prints
+       each line that matches a pattern.
+
+       A  FILE  of  -  stands  for  standard input.  If no FILE is given,
+       the current directory is searched recursively when -r is given,
+       otherwise standard input is read.
+
+OPTIONS
+   Pattern selection and interpretation:
+       -E, --extended-regexp
+              interpret PATTERNS as extended regular expressions (ERE)
+
+       -F, --fixed-strings
+              interpret PATTERNS as fixed strings, not regexps
+
+       -G, --basic-regexp
+              interpret PATTERNS as basic regular expressions (BRE,
+              default)
+
+       -e, --regexp=PATTERNS
+              use PATTERNS for matching
+
+       -f, --file=FILE
+              take PATTERNS from FILE
+
+       -i, --ignore-case
+              ignore case distinctions in patterns and data
+
+       -w, --word-regexp
+              match only whole words
+
+       -x, --line-regexp
+              match only whole lines
+
+   Output control:
+       -c, --count
+              print only a count of selected lines per FILE
+
+       --color[=WHEN], --colour[=WHEN]
+              use markers to highlight the matching strings; WHEN is
+              'always', 'never', or 'auto'
+
+       -l, --files-with-matches
+              print only names of FILEs with selected lines
+
+       -L, --files-without-match
+              print only names of FILEs with no selected lines
+
+       -m, --max-count=NUM
+              stop after NUM selected lines
+
+       -o, --only-matching
+              show only nonempty parts of lines that match
+
+       -q, --quiet, --silent
+              suppress all normal output
+
+       -s, --no-messages
+              suppress error messages
+
+   Output line prefix control:
+       -b, --byte-offset
+              print the byte offset with output lines
+
+       -H, --with-filename
+              print file name with output lines
+
+       -h, --no-filename
+              suppress the file name prefix on output
+
+       -n, --line-number
+              print line number with output lines
+
+       -T, --initial-tab
+              make tabs line up (if needed)
+
+       -Z, --null
+              print 0 byte after FILE name
+
+       --label=LABEL
+              use LABEL as the standard input file name prefix
+
+   Context control:
+       -A, --after-context=NUM
+              print NUM lines of trailing context
+
+       -B, --before-context=NUM
+              print NUM lines of leading context
+
+       -C, --context=NUM
+              print NUM lines of output context
+
+       --group-separator=SEP
+              print SEP instead of -- between context groups
+
+       -NUM   same as --context=NUM
+
+   File and directory selection:
+       -a, --text
+              equivalent to --binary-files=text
+
+       -I     equivalent to --binary-files=without-match
+
+       -r, --recursive
+              search files under each directory recursively
+
+       -R, --dereference-recursive
+              likewise, but follow all symlinks
+
+       --include=GLOB
+              search only files that match GLOB
+
+       --exclude=GLOB
+              skip files matching GLOB
+
+       --exclude-dir=GLOB
+              skip directories matching GLOB
+
+   Miscellaneous:
+       -v, --invert-match
+              select non-matching lines
+
+       --help display this help and exit
+
+       -V, --version
+              display version information and exit
+
+NOTES
+       grep includes a built-in BRE/ERE regex engine with support for
+       POSIX character classes ([:alnum:], [:alpha:], etc.).
+
+EXIT STATUS
+       0      at least one line was selected
+
+       1      no lines were selected
+
+       2      an error occurred
+
+AUTHORS
+       LikeOS-64 project.
+
+SEE ALSO
+       find(1), less(1), cat(1)
+
+LikeOS-64                         2026-03-10                            GREP(1)
