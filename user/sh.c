@@ -1,7 +1,7 @@
 /*
  * sh - LikeOS-64 userland shell
  *
- * Built-in commands: cd, help, history, export, exit
+ * Built-in commands: cd, help, history, export, alias, unalias, time, exit
  *
  * Supported operators:
  *   |    Pipe stdout to stdin
@@ -35,6 +35,8 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <ctype.h>
+#include <time.h>
+#include <sys/time.h>
 
 #define SHELL_MAX_LINE 1024
 #define SHELL_MAX_ARGS 64
@@ -166,6 +168,350 @@ static void hist_delete(int offset) {
         strcpy(hist_buf[ri], hist_buf[ri1]);
     }
     hist_count--;
+}
+
+/* ------------------------------------------------------------------ */
+/* Alias management                                                     */
+/* ------------------------------------------------------------------ */
+#define MAX_ALIASES  256
+#define ALIAS_NAME   128
+#define ALIAS_VALUE  512
+#define ALIAS_FILE   "/.aliases"
+
+typedef struct {
+    char name[ALIAS_NAME];
+    char value[ALIAS_VALUE];
+} alias_entry_t;
+
+static alias_entry_t alias_table[MAX_ALIASES];
+static int alias_count;
+
+static int alias_find(const char *name) {
+    for (int i = 0; i < alias_count; i++)
+        if (strcmp(alias_table[i].name, name) == 0)
+            return i;
+    return -1;
+}
+
+static void alias_set(const char *name, const char *value) {
+    int idx = alias_find(name);
+    if (idx >= 0) {
+        strncpy(alias_table[idx].value, value, ALIAS_VALUE - 1);
+        alias_table[idx].value[ALIAS_VALUE - 1] = '\0';
+        return;
+    }
+    if (alias_count >= MAX_ALIASES) {
+        fprintf(stderr, "alias: too many aliases\n");
+        return;
+    }
+    strncpy(alias_table[alias_count].name,  name,  ALIAS_NAME  - 1);
+    alias_table[alias_count].name[ALIAS_NAME - 1] = '\0';
+    strncpy(alias_table[alias_count].value, value, ALIAS_VALUE - 1);
+    alias_table[alias_count].value[ALIAS_VALUE - 1] = '\0';
+    alias_count++;
+}
+
+static int alias_remove(const char *name) {
+    int idx = alias_find(name);
+    if (idx < 0) return -1;
+    alias_table[idx] = alias_table[--alias_count];
+    return 0;
+}
+
+static void alias_remove_all(void) {
+    alias_count = 0;
+}
+
+static void alias_print_all(void) {
+    for (int i = 0; i < alias_count; i++)
+        printf("alias %s='%s'\n", alias_table[i].name, alias_table[i].value);
+}
+
+static void alias_load_defaults(void) {
+    alias_set("grep", "grep --color=auto");
+    alias_set("l",    "ls -CF");
+    alias_set("la",   "ls -A");
+    alias_set("ll",   "ls -alF");
+    alias_set("ls",   "ls --color=auto");
+}
+
+static void alias_load(void) {
+    alias_count = 0;
+    FILE *f = fopen(ALIAS_FILE, "r");
+    if (!f) {
+        alias_load_defaults();
+        return;
+    }
+    char line[ALIAS_NAME + ALIAS_VALUE + 16];
+    while (fgets(line, sizeof(line), f) && alias_count < MAX_ALIASES) {
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] == '\n') line[len - 1] = '\0';
+        /* Format: alias name='value' */
+        if (strncmp(line, "alias ", 6) != 0) continue;
+        char *p = line + 6;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *val = eq + 1;
+        size_t vlen = strlen(val);
+        if (vlen >= 2 && val[0] == '\'' && val[vlen - 1] == '\'') {
+            val[vlen - 1] = '\0';
+            val++;
+        }
+        alias_set(p, val);
+    }
+    fclose(f);
+}
+
+static void alias_save(void) {
+    FILE *f = fopen(ALIAS_FILE, "w");
+    if (!f) return;
+    for (int i = 0; i < alias_count; i++)
+        fprintf(f, "alias %s='%s'\n", alias_table[i].name, alias_table[i].value);
+    fclose(f);
+}
+
+/*
+ * Expand aliases in the input line (before tokenizing).
+ * Only the first word of each simple command is subject to alias expansion.
+ * If the alias value ends with a space, the next word is also checked.
+ * Protects against infinite recursion with a depth limit.
+ */
+/*
+ * Expand an alias at position *pos within line (in-place).
+ * Returns 1 if expansion happened, 0 otherwise.
+ */
+static int alias_expand_at(char *line, int maxlen, int pos,
+                           char **seen, int *nseen) {
+    char expanded[SHELL_MAX_LINE * 2];
+
+    /* Skip whitespace at pos */
+    char *p = line + pos;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) return 0;
+
+    /* Extract the first word of this segment */
+    char *word_start = p;
+    while (*p && *p != ' ' && *p != '\t' && *p != '|' &&
+           *p != ';' && *p != '>' && *p != '<' && *p != '&')
+        p++;
+    int word_len = (int)(p - word_start);
+    if (word_len <= 0 || word_len >= ALIAS_NAME) return 0;
+
+    char word[ALIAS_NAME];
+    memcpy(word, word_start, (size_t)word_len);
+    word[word_len] = '\0';
+
+    /* Check if we already expanded this alias (avoid recursion) */
+    for (int i = 0; i < *nseen; i++) {
+        if (strcmp(seen[i], word) == 0) return 0;
+    }
+
+    int idx = alias_find(word);
+    if (idx < 0) return 0;
+
+    /* Expand: replace the word with the alias value */
+    int vlen = (int)strlen(alias_table[idx].value);
+    int rest_len = (int)strlen(p);
+    int prefix_len = (int)(word_start - line);
+
+    if (prefix_len + vlen + rest_len >= maxlen - 1) return 0;
+
+    memcpy(expanded, line, (size_t)prefix_len);
+    memcpy(expanded + prefix_len, alias_table[idx].value, (size_t)vlen);
+    memcpy(expanded + prefix_len + vlen, p, (size_t)rest_len + 1);
+    memcpy(line, expanded, (size_t)(prefix_len + vlen + rest_len + 1));
+
+    if (*nseen < 32)
+        seen[(*nseen)++] = alias_table[idx].name;
+    return 1;
+}
+
+/*
+ * Expand aliases for every command segment in the line.
+ * Segments are separated by |, ;, &&, ||.
+ */
+static void alias_expand(char *line, int maxlen) {
+    char *seen[32];
+    int nseen = 0;
+
+    /* Expand alias at position 0 (first command) */
+    for (int passes = 0; passes < 16; passes++) {
+        if (!alias_expand_at(line, maxlen, 0, seen, &nseen))
+            break;
+    }
+
+    /* Walk through the line finding pipe/semicolon/&&/|| boundaries,
+     * and expand the alias of the first word after each separator. */
+    int i = 0;
+    int in_sq = 0, in_dq = 0;  /* track quoting */
+    while (line[i]) {
+        if (line[i] == '\'' && !in_dq) { in_sq = !in_sq; i++; continue; }
+        if (line[i] == '"'  && !in_sq) { in_dq = !in_dq; i++; continue; }
+        if (in_sq || in_dq) { i++; continue; }
+
+        int sep_len = 0;
+        if (line[i] == '|' && line[i + 1] == '|') sep_len = 2;       /* || */
+        else if (line[i] == '&' && line[i + 1] == '&') sep_len = 2;  /* && */
+        else if (line[i] == '|') sep_len = 1;                         /* |  */
+        else if (line[i] == ';') sep_len = 1;                         /* ;  */
+
+        if (sep_len > 0) {
+            int cmd_start = i + sep_len;
+            nseen = 0;  /* reset recursion guard for new command */
+            for (int passes = 0; passes < 16; passes++) {
+                if (!alias_expand_at(line, maxlen, cmd_start, seen, &nseen))
+                    break;
+            }
+            /* Re-scan from cmd_start since the line may have grown */
+            i = cmd_start;
+        } else {
+            i++;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Builtin: alias                                                       */
+/* ------------------------------------------------------------------ */
+
+static void builtin_alias(int argc, char **argv) {
+    int opt_print = 0;
+    int first_arg = 1;
+
+    if (first_arg < argc && strcmp(argv[first_arg], "-p") == 0) {
+        opt_print = 1;
+        first_arg++;
+    }
+
+    if (opt_print || first_arg >= argc) {
+        alias_print_all();
+        return;
+    }
+
+    for (int i = first_arg; i < argc; i++) {
+        char *eq = strchr(argv[i], '=');
+        if (eq) {
+            *eq = '\0';
+            alias_set(argv[i], eq + 1);
+            *eq = '=';
+        } else {
+            int idx = alias_find(argv[i]);
+            if (idx >= 0)
+                printf("alias %s='%s'\n", alias_table[idx].name,
+                       alias_table[idx].value);
+            else
+                fprintf(stderr, "alias: %s: not found\n", argv[i]);
+        }
+    }
+    alias_save();
+}
+
+/* ------------------------------------------------------------------ */
+/* Builtin: unalias                                                     */
+/* ------------------------------------------------------------------ */
+
+static void builtin_unalias(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "unalias: usage: unalias [-a] name [name ...]\n");
+        return;
+    }
+
+    int i = 1;
+    if (strcmp(argv[1], "-a") == 0) {
+        alias_remove_all();
+        alias_save();
+        return;
+    }
+
+    for (; i < argc; i++) {
+        if (alias_remove(argv[i]) < 0)
+            fprintf(stderr, "unalias: %s: not found\n", argv[i]);
+    }
+    alias_save();
+}
+
+/* ------------------------------------------------------------------ */
+/* Builtin: time                                                        */
+/* ------------------------------------------------------------------ */
+
+static int builtin_time(int argc, char **argv) {
+    int posix_fmt = 0;
+    int arg_start = 1;
+
+    /* Parse time's own options: only -p is defined for the builtin */
+    if (arg_start < argc && strcmp(argv[arg_start], "-p") == 0) {
+        posix_fmt = 1;
+        arg_start++;
+    }
+
+    if (arg_start >= argc) {
+        fprintf(stderr, "time: missing command\n");
+        return 1;
+    }
+
+    struct timespec ts_start, ts_end;
+    clock_gettime(0 /* CLOCK_MONOTONIC is 0 in our kernel */, &ts_start);
+
+    /* Fork and exec the command */
+    pid_t child = fork();
+    if (child < 0) {
+        fprintf(stderr, "time: cannot fork: %s\n", strerror(errno));
+        return 127;
+    }
+
+    if (child == 0) {
+        /* Child: exec the pipeline */
+        setpgid(0, 0);
+        tcsetpgrp(STDIN_FILENO, getpid());
+        execvp(argv[arg_start], &argv[arg_start]);
+        fprintf(stderr, "time: %s: %s\n", argv[arg_start], strerror(errno));
+        _exit(errno == 2 /* ENOENT */ ? 127 : 126);
+    }
+
+    /* Parent: set process group and wait */
+    setpgid(child, child);
+    tcsetpgrp(STDIN_FILENO, child);
+
+    int status = 0;
+    struct rusage ru;
+    memset(&ru, 0, sizeof(ru));
+    wait4(child, &status, 0, &ru);
+
+    /* Restore shell as foreground */
+    tcsetpgrp(STDIN_FILENO, getpgrp());
+
+    clock_gettime(0, &ts_end);
+
+    double real_secs = (double)(ts_end.tv_sec - ts_start.tv_sec) +
+                       (double)(ts_end.tv_nsec - ts_start.tv_nsec) / 1000000000.0;
+    double user_secs = (double)ru.ru_utime.tv_sec +
+                       (double)ru.ru_utime.tv_usec / 1000000.0;
+    double sys_secs  = (double)ru.ru_stime.tv_sec +
+                       (double)ru.ru_stime.tv_usec / 1000000.0;
+
+    int exit_status = 0;
+    if (WIFEXITED(status))
+        exit_status = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status))
+        exit_status = 128 + WTERMSIG(status);
+
+    if (posix_fmt) {
+        fprintf(stderr, "real %.2f\nuser %.2f\nsys %.2f\n",
+                real_secs, user_secs, sys_secs);
+    } else {
+        /* Default shell format (like bash) */
+        int r_min = (int)(real_secs / 60.0);
+        double r_sec = real_secs - r_min * 60.0;
+        int u_min = (int)(user_secs / 60.0);
+        double u_sec = user_secs - u_min * 60.0;
+        int s_min = (int)(sys_secs / 60.0);
+        double s_sec = sys_secs - s_min * 60.0;
+        fprintf(stderr, "\nreal\t%dm%.3fs\nuser\t%dm%.3fs\nsys\t%dm%.3fs\n",
+                r_min, r_sec, u_min, u_sec, s_min, s_sec);
+    }
+
+    return exit_status;
 }
 
 static void builtin_history(int argc, char **argv) {
@@ -918,7 +1264,10 @@ static int is_builtin(const char *name) {
             strcmp(name, "exit") == 0 ||
             strcmp(name, "help") == 0 ||
             strcmp(name, "history") == 0 ||
-            strcmp(name, "export") == 0);
+            strcmp(name, "export") == 0 ||
+            strcmp(name, "alias") == 0 ||
+            strcmp(name, "unalias") == 0 ||
+            strcmp(name, "time") == 0);
 }
 
 static int run_builtin(int argc, char **argv) {
@@ -942,6 +1291,9 @@ static int run_builtin(int argc, char **argv) {
         printf("LikeOS-64 Shell (userland)\n");
         printf("Built-in commands:\n");
         printf("  cd <dir>       - Change directory\n");
+        printf("  alias [-p] [name[=value] ...] - Define/display aliases\n");
+        printf("  unalias [-a] name ... - Remove alias definitions\n");
+        printf("  time [-p] pipeline    - Time a pipeline\n");
         printf("  export [-fnp]  - Set/display exported variables\n");
         printf("  history [-cdanrwsp] - Command history\n");
         printf("  help           - Show this help\n");
@@ -952,6 +1304,7 @@ static int run_builtin(int argc, char **argv) {
         printf("External commands (in /bin or /usr/local/bin):\n");
         printf("  ls cat pwd stat clear env more less touch cp mv rm\n");
         printf("  mkdir rmdir uname ps kill find df du hexdump\n");
+        printf("  sort uniq cut tr yes true false time\n");
         printf("  shutdown reboot poweroff halt\n");
         printf("Keyboard shortcuts:\n");
         printf("  Ctrl+D  - Debug dump\n");
@@ -965,6 +1318,17 @@ static int run_builtin(int argc, char **argv) {
     if (strcmp(argv[0], "export") == 0) {
         builtin_export(argc, argv);
         return 0;
+    }
+    if (strcmp(argv[0], "alias") == 0) {
+        builtin_alias(argc, argv);
+        return 0;
+    }
+    if (strcmp(argv[0], "unalias") == 0) {
+        builtin_unalias(argc, argv);
+        return 0;
+    }
+    if (strcmp(argv[0], "time") == 0) {
+        return builtin_time(argc, argv);
     }
     if (strcmp(argv[0], "exit") == 0) {
         int code = 0;
@@ -1236,6 +1600,7 @@ static void print_prompt(void) {
 int main(void) {
     setenv("PATH", "/bin:/usr/local/bin", 1);
     hist_load();
+    alias_load();
 
     char line[SHELL_MAX_LINE];
     static token_t tokens[128];
@@ -1265,6 +1630,9 @@ int main(void) {
             strcmp(hist_buf[hist_real(hist_count - 1)], hist_line) != 0) {
             hist_add(hist_line);
         }
+
+        /* Expand aliases on the command line */
+        alias_expand(line, SHELL_MAX_LINE);
 
         /* Tokenize */
         int ntok = tokenize(line, tokens,

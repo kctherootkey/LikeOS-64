@@ -117,6 +117,183 @@ unsigned long long strtoull(const char* nptr, char** endptr, int base) {
     return (unsigned long long)strtoll(nptr, endptr, base);
 }
 
+/* ── Floating-point string conversion ───────────────────────────────── */
+
+double strtod(const char* nptr, char** endptr) {
+    const char* s = nptr;
+
+    /* Skip leading whitespace */
+    while (*s == ' ' || *s == '\t' || *s == '\n' ||
+           *s == '\r' || *s == '\f' || *s == '\v')
+        s++;
+
+    /* Sign */
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    else if (*s == '+') { s++; }
+
+    /* Handle special values: inf, infinity, nan */
+    if ((s[0] == 'i' || s[0] == 'I') &&
+        (s[1] == 'n' || s[1] == 'N') &&
+        (s[2] == 'f' || s[2] == 'F')) {
+        s += 3;
+        if ((s[0] == 'i' || s[0] == 'I') &&
+            (s[1] == 'n' || s[1] == 'N') &&
+            (s[2] == 'i' || s[2] == 'I') &&
+            (s[3] == 't' || s[3] == 'T') &&
+            (s[4] == 'y' || s[4] == 'Y'))
+            s += 5;
+        if (endptr) *endptr = (char*)s;
+        /* Use integer trick for infinity: 1.0/0.0 is +inf */
+        double inf = 1e308 * 10.0;
+        return neg ? -inf : inf;
+    }
+    if ((s[0] == 'n' || s[0] == 'N') &&
+        (s[1] == 'a' || s[1] == 'A') &&
+        (s[2] == 'n' || s[2] == 'N')) {
+        s += 3;
+        /* Skip optional (n-char-sequence) */
+        if (*s == '(') {
+            const char* p = s + 1;
+            while (*p && *p != ')') p++;
+            if (*p == ')') s = p + 1;
+        }
+        if (endptr) *endptr = (char*)s;
+        double nan_val = 0.0 / 0.0;
+        return nan_val;
+    }
+
+    /* Handle 0x hex float */
+    int hex = 0;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        /* Only if followed by hex digit or '.' */
+        const char* t = s + 2;
+        if ((*t >= '0' && *t <= '9') || (*t >= 'a' && *t <= 'f') ||
+            (*t >= 'A' && *t <= 'F') || *t == '.') {
+            hex = 1;
+            s += 2;
+        }
+    }
+
+    double result = 0.0;
+    int got_digit = 0;
+
+    if (hex) {
+        /* Hex float: digits.digits p exponent */
+        while (1) {
+            int d;
+            if (*s >= '0' && *s <= '9') d = *s - '0';
+            else if (*s >= 'a' && *s <= 'f') d = *s - 'a' + 10;
+            else if (*s >= 'A' && *s <= 'F') d = *s - 'A' + 10;
+            else break;
+            result = result * 16.0 + d;
+            got_digit = 1;
+            s++;
+        }
+        if (*s == '.') {
+            s++;
+            double frac = 1.0 / 16.0;
+            while (1) {
+                int d;
+                if (*s >= '0' && *s <= '9') d = *s - '0';
+                else if (*s >= 'a' && *s <= 'f') d = *s - 'a' + 10;
+                else if (*s >= 'A' && *s <= 'F') d = *s - 'A' + 10;
+                else break;
+                result += d * frac;
+                frac /= 16.0;
+                got_digit = 1;
+                s++;
+            }
+        }
+        /* Binary exponent: p[+-]digits */
+        if (got_digit && (*s == 'p' || *s == 'P')) {
+            s++;
+            int exp_neg = 0;
+            if (*s == '-') { exp_neg = 1; s++; }
+            else if (*s == '+') { s++; }
+            int exp_val = 0;
+            while (*s >= '0' && *s <= '9') {
+                exp_val = exp_val * 10 + (*s - '0');
+                s++;
+            }
+            double base = 2.0;
+            double mult = 1.0;
+            while (exp_val > 0) {
+                if (exp_val & 1) mult *= base;
+                base *= base;
+                exp_val >>= 1;
+            }
+            if (exp_neg) result /= mult;
+            else result *= mult;
+        }
+    } else {
+        /* Decimal float: digits.digits e exponent */
+        while (*s >= '0' && *s <= '9') {
+            result = result * 10.0 + (*s - '0');
+            got_digit = 1;
+            s++;
+        }
+        if (*s == '.') {
+            s++;
+            double frac = 0.1;
+            while (*s >= '0' && *s <= '9') {
+                result += (*s - '0') * frac;
+                frac *= 0.1;
+                got_digit = 1;
+                s++;
+            }
+        }
+        /* Decimal exponent: e[+-]digits */
+        if (got_digit && (*s == 'e' || *s == 'E')) {
+            s++;
+            int exp_neg = 0;
+            if (*s == '-') { exp_neg = 1; s++; }
+            else if (*s == '+') { s++; }
+            int exp_val = 0;
+            int exp_digits = 0;
+            while (*s >= '0' && *s <= '9') {
+                exp_val = exp_val * 10 + (*s - '0');
+                exp_digits = 1;
+                s++;
+            }
+            if (exp_digits) {
+                /* Apply power of 10 via repeated squaring */
+                double base = 10.0;
+                double mult = 1.0;
+                int e = exp_val;
+                while (e > 0) {
+                    if (e & 1) mult *= base;
+                    base *= base;
+                    e >>= 1;
+                }
+                if (exp_neg) result /= mult;
+                else result *= mult;
+            }
+        }
+    }
+
+    if (!got_digit) {
+        /* No valid conversion; set endptr to nptr */
+        if (endptr) *endptr = (char*)nptr;
+        return 0.0;
+    }
+
+    if (endptr) *endptr = (char*)s;
+    return neg ? -result : result;
+}
+
+float strtof(const char* nptr, char** endptr) {
+    return (float)strtod(nptr, endptr);
+}
+
+long double strtold(const char* nptr, char** endptr) {
+    return (long double)strtod(nptr, endptr);
+}
+
+double atof(const char* nptr) {
+    return strtod(nptr, NULL);
+}
+
 char* getenv(const char* name) {
     if (!name) {
         return NULL;
