@@ -603,17 +603,16 @@ static void collect_processes(void) {
     for (int i = 0; i < n; i++) {
         procinfo_t *raw = &g_raw[i];
 
-        /* Skip kernel tasks by default */
-        if (raw->is_kernel) continue;
-
         proc_entry_t *pe = &g_procs[g_nprocs];
         memcpy(&pe->info, raw, sizeof(procinfo_t));
 
         /* Calculate total ticks */
         pe->total_ticks = raw->utime_ticks + raw->stime_ticks;
 
-        /* Calculate %MEM */
-        if (g_total_mem > 0) {
+        /* Calculate %MEM (kernel tasks show 0) */
+        if (raw->is_kernel) {
+            pe->pmem = 0.0;
+        } else if (g_total_mem > 0) {
             uint64_t rss_bytes = raw->rss * PAGE_SIZE;
             pe->pmem = (double)rss_bytes * 100.0 / (double)g_total_mem;
         } else {
@@ -922,10 +921,10 @@ static void format_field_value(const proc_entry_t *pe, int field_id,
         snprintf(buf, bufsz, "%.1f", pe->pmem);
         break;
     case FLD_VIRT:
-        format_mem_task(pe->info.vsz, buf, bufsz, opt_mem_task_scale);
+        format_mem_task(pe->info.is_kernel ? 0 : pe->info.vsz, buf, bufsz, opt_mem_task_scale);
         break;
     case FLD_RES:
-        format_mem_task(pe->info.rss * PAGE_SIZE, buf, bufsz, opt_mem_task_scale);
+        format_mem_task(pe->info.is_kernel ? 0 : pe->info.rss * PAGE_SIZE, buf, bufsz, opt_mem_task_scale);
         break;
     case FLD_SHR:
         /* No SHR info available, show 0 */
@@ -941,10 +940,17 @@ static void format_field_value(const proc_entry_t *pe, int field_id,
         format_time_plus(pe->total_ticks, buf, bufsz);
         break;
     case FLD_COMMAND:
-        if (opt_cmdline && pe->info.cmdline[0])
+        if (pe->info.is_kernel) {
+            /* Kernel threads shown in brackets like Linux */
+            if (pe->info.comm[0])
+                snprintf(buf, bufsz, "[%s]", pe->info.comm);
+            else
+                snprintf(buf, bufsz, "[kernel]");
+        } else if (opt_cmdline && pe->info.cmdline[0]) {
             snprintf(buf, bufsz, "%s", pe->info.cmdline);
-        else
+        } else {
             snprintf(buf, bufsz, "%s", pe->info.comm);
+        }
         break;
     case FLD_WCHAN:
         snprintf(buf, bufsz, "-");

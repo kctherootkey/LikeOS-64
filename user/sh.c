@@ -37,6 +37,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <sys/time.h>
+#include <termios.h>
 
 #define SHELL_MAX_LINE 1024
 #define SHELL_MAX_ARGS 64
@@ -1578,20 +1579,313 @@ static void exec_command_list(cmd_entry_t *entries, int nentries) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Interactive line editor (readline-style)                             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * shell_readline - read a line with history and cursor editing
+ *
+ * Supports:
+ *   Up/Down arrows   - browse command history
+ *   Left/Right arrows - move cursor within line
+ *   Home / End        - jump to beginning / end of line
+ *   Backspace         - delete character before cursor
+ *   Delete            - delete character at cursor
+ *   Ctrl-A / Ctrl-E   - beginning / end of line
+ *   Ctrl-U            - kill to beginning of line
+ *   Ctrl-K            - kill to end of line
+ *   Ctrl-W            - kill previous word
+ *   Ctrl-L            - clear screen, redraw prompt+line
+ *   Ctrl-D            - EOF if line is empty
+ *
+ * Returns number of chars in buf (>= 0), or -1 on EOF.
+ */
+
+static void rl_redraw(const char *prompt, int plen,
+                       const char *buf, int len, int pos)
+{
+    /* Carriage return, print prompt, print buffer, clear to end, reposition */
+    write(STDOUT_FILENO, "\r", 1);
+    write(STDOUT_FILENO, prompt, plen);
+    write(STDOUT_FILENO, buf, len);
+    /* Clear everything to the right of the text */
+    write(STDOUT_FILENO, "\033[K", 3);
+    /* Move cursor back to the correct position */
+    if (len - pos > 0) {
+        char esc[32];
+        int n = snprintf(esc, sizeof(esc), "\033[%dD", len - pos);
+        write(STDOUT_FILENO, esc, n);
+    }
+}
+
+static int shell_readline(const char *prompt, char *buf, int bufsz)
+{
+    struct termios orig, raw;
+    int plen = (int)strlen(prompt);
+    int len = 0;       /* current length of buf */
+    int pos = 0;       /* cursor position in buf */
+    int hist_idx = hist_count;  /* points one past the last entry (new line) */
+    char saved_line[SHELL_MAX_LINE] = "";  /* saved current input when browsing history */
+
+    /* Print prompt */
+    write(STDOUT_FILENO, prompt, plen);
+
+    /* Enter raw mode */
+    tcgetattr(STDIN_FILENO, &orig);
+    raw = orig;
+    raw.c_lflag &= ~(ICANON | ECHO | ISIG);
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+
+    buf[0] = '\0';
+
+    while (1) {
+        unsigned char c;
+        int nread = read(STDIN_FILENO, &c, 1);
+        if (nread <= 0) {
+            /* EOF / error */
+            tcsetattr(STDIN_FILENO, TCSANOW, &orig);
+            return -1;
+        }
+
+        if (c == '\n' || c == '\r') {
+            /* Accept line */
+            write(STDOUT_FILENO, "\n", 1);
+            buf[len] = '\0';
+            tcsetattr(STDIN_FILENO, TCSANOW, &orig);
+            return len;
+        }
+
+        if (c == 4) {
+            /* Ctrl-D: EOF if line empty */
+            if (len == 0) {
+                tcsetattr(STDIN_FILENO, TCSANOW, &orig);
+                return -1;
+            }
+            continue;
+        }
+
+        if (c == 127 || c == 8) {
+            /* Backspace: delete char before cursor */
+            if (pos > 0) {
+                memmove(buf + pos - 1, buf + pos, len - pos);
+                pos--;
+                len--;
+                buf[len] = '\0';
+                rl_redraw(prompt, plen, buf, len, pos);
+            }
+            continue;
+        }
+
+        if (c == 1) {
+            /* Ctrl-A: go to beginning */
+            pos = 0;
+            rl_redraw(prompt, plen, buf, len, pos);
+            continue;
+        }
+
+        if (c == 5) {
+            /* Ctrl-E: go to end */
+            pos = len;
+            rl_redraw(prompt, plen, buf, len, pos);
+            continue;
+        }
+
+        if (c == 21) {
+            /* Ctrl-U: kill to beginning of line */
+            if (pos > 0) {
+                memmove(buf, buf + pos, len - pos);
+                len -= pos;
+                pos = 0;
+                buf[len] = '\0';
+                rl_redraw(prompt, plen, buf, len, pos);
+            }
+            continue;
+        }
+
+        if (c == 11) {
+            /* Ctrl-K: kill to end of line */
+            len = pos;
+            buf[len] = '\0';
+            rl_redraw(prompt, plen, buf, len, pos);
+            continue;
+        }
+
+        if (c == 23) {
+            /* Ctrl-W: kill previous word */
+            if (pos > 0) {
+                int old_pos = pos;
+                /* Skip trailing spaces */
+                while (pos > 0 && buf[pos - 1] == ' ') pos--;
+                /* Skip word chars */
+                while (pos > 0 && buf[pos - 1] != ' ') pos--;
+                memmove(buf + pos, buf + old_pos, len - old_pos);
+                len -= (old_pos - pos);
+                buf[len] = '\0';
+                rl_redraw(prompt, plen, buf, len, pos);
+            }
+            continue;
+        }
+
+        if (c == 12) {
+            /* Ctrl-L: clear screen, redraw */
+            write(STDOUT_FILENO, "\033[2J\033[H", 7);
+            rl_redraw(prompt, plen, buf, len, pos);
+            continue;
+        }
+
+        if (c == 27) {
+            /* Escape sequence: read next chars */
+            unsigned char seq[4];
+            if (read(STDIN_FILENO, &seq[0], 1) <= 0) continue;
+
+            if (seq[0] == '[') {
+                if (read(STDIN_FILENO, &seq[1], 1) <= 0) continue;
+
+                switch (seq[1]) {
+                case 'A':
+                    /* Up arrow: previous history entry */
+                    if (hist_idx > 0) {
+                        /* Save current line if we're just starting to browse */
+                        if (hist_idx == hist_count) {
+                            strncpy(saved_line, buf, SHELL_MAX_LINE - 1);
+                            saved_line[SHELL_MAX_LINE - 1] = '\0';
+                        }
+                        hist_idx--;
+                        strncpy(buf, hist_buf[hist_real(hist_idx)], bufsz - 1);
+                        buf[bufsz - 1] = '\0';
+                        len = (int)strlen(buf);
+                        pos = len;
+                        rl_redraw(prompt, plen, buf, len, pos);
+                    }
+                    break;
+
+                case 'B':
+                    /* Down arrow: next history entry */
+                    if (hist_idx < hist_count) {
+                        hist_idx++;
+                        if (hist_idx == hist_count) {
+                            /* Restore the saved current line */
+                            strncpy(buf, saved_line, bufsz - 1);
+                            buf[bufsz - 1] = '\0';
+                        } else {
+                            strncpy(buf, hist_buf[hist_real(hist_idx)], bufsz - 1);
+                            buf[bufsz - 1] = '\0';
+                        }
+                        len = (int)strlen(buf);
+                        pos = len;
+                        rl_redraw(prompt, plen, buf, len, pos);
+                    }
+                    break;
+
+                case 'C':
+                    /* Right arrow: move cursor right */
+                    if (pos < len) {
+                        pos++;
+                        rl_redraw(prompt, plen, buf, len, pos);
+                    }
+                    break;
+
+                case 'D':
+                    /* Left arrow: move cursor left */
+                    if (pos > 0) {
+                        pos--;
+                        rl_redraw(prompt, plen, buf, len, pos);
+                    }
+                    break;
+
+                case 'H':
+                    /* Home key */
+                    pos = 0;
+                    rl_redraw(prompt, plen, buf, len, pos);
+                    break;
+
+                case 'F':
+                    /* End key */
+                    pos = len;
+                    rl_redraw(prompt, plen, buf, len, pos);
+                    break;
+
+                case '3':
+                    /* Delete key: ESC [ 3 ~ */
+                    {
+                        unsigned char tilde;
+                        if (read(STDIN_FILENO, &tilde, 1) > 0 && tilde == '~') {
+                            if (pos < len) {
+                                memmove(buf + pos, buf + pos + 1, len - pos - 1);
+                                len--;
+                                buf[len] = '\0';
+                                rl_redraw(prompt, plen, buf, len, pos);
+                            }
+                        }
+                    }
+                    break;
+
+                case '1':
+                    /* Home key variant: ESC [ 1 ~ */
+                    {
+                        unsigned char tilde;
+                        if (read(STDIN_FILENO, &tilde, 1) > 0 && tilde == '~') {
+                            pos = 0;
+                            rl_redraw(prompt, plen, buf, len, pos);
+                        }
+                    }
+                    break;
+
+                case '4':
+                    /* End key variant: ESC [ 4 ~ */
+                    {
+                        unsigned char tilde;
+                        if (read(STDIN_FILENO, &tilde, 1) > 0 && tilde == '~') {
+                            pos = len;
+                            rl_redraw(prompt, plen, buf, len, pos);
+                        }
+                    }
+                    break;
+
+                default:
+                    break;
+                }
+            } else if (seq[0] == 'O') {
+                /* ESC O H = Home, ESC O F = End (alternate sequences) */
+                if (read(STDIN_FILENO, &seq[1], 1) > 0) {
+                    if (seq[1] == 'H') {
+                        pos = 0;
+                        rl_redraw(prompt, plen, buf, len, pos);
+                    } else if (seq[1] == 'F') {
+                        pos = len;
+                        rl_redraw(prompt, plen, buf, len, pos);
+                    }
+                }
+            }
+            continue;
+        }
+
+        /* Normal printable character: insert at cursor position */
+        if (c >= 32 && len < bufsz - 1) {
+            memmove(buf + pos + 1, buf + pos, len - pos);
+            buf[pos] = (char)c;
+            pos++;
+            len++;
+            buf[len] = '\0';
+            rl_redraw(prompt, plen, buf, len, pos);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Prompt                                                               */
 /* ------------------------------------------------------------------ */
 
-static void print_prompt(void) {
+static void get_prompt(char *prompt, int maxlen) {
     char cwd[256];
     if (getcwd(cwd, sizeof(cwd)) == NULL) {
         strcpy(cwd, "/");
     }
     if (strcmp(cwd, "/") == 0) {
-        printf("/ # ");
+        snprintf(prompt, maxlen, "/ # ");
     } else {
-        printf("%s # ", cwd);
+        snprintf(prompt, maxlen, "%s # ", cwd);
     }
-    fflush(stdout);
     ioctl(STDIN_FILENO, TIOCSGUARD, NULL);
 }
 
@@ -1605,18 +1899,17 @@ int main(void) {
     alias_load();
 
     char line[SHELL_MAX_LINE];
+    char prompt[512];
     static token_t tokens[128];
     static cmd_entry_t entries[MAX_COMMANDS];
 
     while (1) {
         bg_check_jobs();
-        print_prompt();
-        if (!fgets(line, sizeof(line), stdin)) {
+        get_prompt(prompt, sizeof(prompt));
+        int rc = shell_readline(prompt, line, sizeof(line));
+        if (rc < 0) {
+            /* EOF */
             continue;
-        }
-        size_t len = strlen(line);
-        if (len > 0 && line[len - 1] == '\n') {
-            line[len - 1] = '\0';
         }
         if (line[0] == '\0') {
             continue;
