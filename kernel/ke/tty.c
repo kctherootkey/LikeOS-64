@@ -146,12 +146,14 @@ static uint8_t g_cur_vga_fg = 15;  /* VGA_COLOR_WHITE */
 static uint8_t g_cur_vga_bg = 0;   /* VGA_COLOR_BLACK */
 static int     g_ansi_bold    = 0;
 static int     g_ansi_reverse = 0;
+static int     g_ansi_private = 0; /* DEC private mode: saw '?' after CSI */
 
 static void ansi_reset_state(void) {
     g_ansi_state = ANSI_NORMAL;
     g_ansi_nparam = 0;
     g_ansi_cur_param = 0;
     g_ansi_have_digit = 0;
+    g_ansi_private = 0;
 }
 
 static void ansi_apply_sgr(void) {
@@ -244,6 +246,11 @@ static void tty_output_console(tty_t* tty, char c) {
         return;
 
     case ANSI_CSI:
+        if (ch == '?' && !g_ansi_have_digit && g_ansi_nparam == 0) {
+            /* DEC private mode indicator: ESC [ ? ... */
+            g_ansi_private = 1;
+            return;
+        }
         if (ch >= '0' && ch <= '9') {
             g_ansi_cur_param = g_ansi_cur_param * 10 + (ch - '0');
             g_ansi_have_digit = 1;
@@ -308,6 +315,17 @@ static void tty_output_console(tty_t* tty, char c) {
             console_get_cursor_pos(&row, &col);
             col = (col >= (uint32_t)n) ? col - (uint32_t)n : 0;
             console_set_cursor_pos(row, col);
+        } else if (g_ansi_private && (ch == 'h' || ch == 'l')) {
+            /* DEC Private Mode Set/Reset: ESC [ ? Ps h / ESC [ ? Ps l */
+            int mode = (g_ansi_nparam >= 1) ? g_ansi_params[0] : 0;
+            if (mode == 25) {
+                /* DECTCEM — Text Cursor Enable Mode */
+                if (ch == 'h')
+                    console_cursor_enable();   /* show cursor */
+                else
+                    console_cursor_disable();  /* hide cursor */
+            }
+            /* Other DEC private modes silently ignored */
         }
         /* All other CSI sequences silently consumed */
         ansi_reset_state();

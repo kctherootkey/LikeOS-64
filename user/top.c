@@ -256,8 +256,8 @@ static volatile int g_winch = 0;
 #define ESC_BOLD        "\033[1m"
 #define ESC_REVERSE     "\033[7m"
 #define ESC_RESET       "\033[0m"
-#define ESC_CURSOR_HIDE ""
-#define ESC_CURSOR_SHOW ""
+#define ESC_CURSOR_HIDE "\033[?25l"
+#define ESC_CURSOR_SHOW "\033[?25h"
 
 /* Color codes */
 #define CLR_RED     "\033[31m"

@@ -251,6 +251,9 @@ static void pager(manpage_t *mp, const char *title) {
 
     int done = 0;
     while (!done) {
+        /* Hide cursor during page redraw to prevent blink artifacts */
+        printf("\033[?25l");
+
         /* Clear screen and display page */
         printf("\033[H\033[2J");
 
@@ -292,7 +295,8 @@ static void pager(manpage_t *mp, const char *title) {
             lines_shown++;
         }
 
-        /* Status line */
+        /* Status line — show cursor at prompt */
+        printf("\033[?25h");
         int pct = (mp->nlines > 0) ? ((top_line + page_size) * 100 / mp->nlines) : 100;
         if (pct > 100) pct = 100;
         printf("\033[7m Manual page %s line %d (press h for help or q to quit) %d%%\033[0m\033[K",
@@ -462,8 +466,8 @@ static void pager(manpage_t *mp, const char *title) {
     }
 
     leave_raw_mode();
-    /* Clear status line */
-    printf("\r\033[K");
+    /* Show cursor and clear status line */
+    printf("\033[?25h\r\033[K");
     fflush(stdout);
 }
 

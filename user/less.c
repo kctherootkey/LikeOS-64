@@ -617,6 +617,8 @@ static void render_line(int line_idx) {
 
 static void display(void) {
     char posbuf[32];
+    /* Hide cursor during redraw to prevent blink artifacts */
+    write_str("\033[?25l");
     for (int i = 0; i < screen_lines; i++) {
         /* Position cursor at start of row i (1-based) */
         snprintf(posbuf, sizeof(posbuf), "\033[%d;1H\033[K", i + 1);
@@ -626,6 +628,8 @@ static void display(void) {
     /* Move to status line row and erase from there to end of screen */
     snprintf(posbuf, sizeof(posbuf), "\033[%d;1H\033[J", screen_lines + 1);
     write_str(posbuf);
+    /* Show cursor again */
+    write_str("\033[?25h");
 }
 
 /* ─── Status line ─── */

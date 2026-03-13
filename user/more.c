@@ -95,7 +95,7 @@ static void write_str(const char *s) {
 }
 
 static void clear_screen(void) {
-    write_str("\033[2J\033[H");
+    write_str("\033[?25l\033[2J\033[H\033[?25h");
 }
 
 static void clear_line(void) {

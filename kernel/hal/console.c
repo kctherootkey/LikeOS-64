@@ -650,13 +650,19 @@ void console_set_cursor_pos(uint32_t row, uint32_t col) {
 
     // Hide cursor at old position
     if (cursor_enabled && cursor_shown) {
-        draw_cursor_at(cursor_x, cursor_y, 0);
+        draw_cursor_at(cursor_last_x, cursor_last_y, 0);
     }
 
     if (row >= max_rows) row = max_rows - 1;
     if (col >= max_cols) col = max_cols - 1;
     cursor_y = row;
     cursor_x = col;
+
+    // Sync cursor tracking to prevent stale position causing artifacts
+    cursor_last_x = col;
+    cursor_last_y = row;
+    cursor_shown = 0;
+    cursor_blink_ticks = 0;
 
     // Ensure viewport is at bottom for subsequent output
     g_sb.at_bottom = 1;
@@ -689,6 +695,10 @@ void console_erase_display(int mode) {
         fb_fill_rect(0, 0, text_w, scr_h, bg_color);
         cursor_x = 0;
         cursor_y = 0;
+        cursor_last_x = 0;
+        cursor_last_y = 0;
+        cursor_shown = 0;
+        cursor_blink_ticks = 0;
     } else if (mode == 0) {
         // Erase from cursor to end: rest of current line + all lines below
         uint32_t y = cursor_y * CHAR_HEIGHT;
@@ -1050,15 +1060,18 @@ void console_cursor_update(void) {
         return;
     }
     
-    // If cursor position changed, erase old and draw new
+    // If cursor position changed, output is actively happening.
+    // Just update tracking without drawing to prevent cursor flash artifacts.
     if (cursor_last_x != cursor_x || cursor_last_y != cursor_y) {
-        draw_cursor_at(cursor_last_x, cursor_last_y, 0);
+        // Erase cursor at old position if it was visible there
+        if (cursor_shown) {
+            draw_cursor_at(cursor_last_x, cursor_last_y, 0);
+            fb_flush_dirty_regions();
+        }
         cursor_last_x = cursor_x;
         cursor_last_y = cursor_y;
-        cursor_shown = 1;
+        cursor_shown = 0;
         cursor_blink_ticks = 0;
-        draw_cursor_at(cursor_x, cursor_y, 1);
-        fb_flush_dirty_regions();
         spin_unlock_irqrestore(&console_lock, flags);
         return;
     }
