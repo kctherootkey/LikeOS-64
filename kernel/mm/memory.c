@@ -1172,6 +1172,14 @@ void mm_unmap_page_in_address_space(uint64_t* pml4, uint64_t virtual_addr) {
 
 // Get physical address for virtual address
 uint64_t mm_get_physical_address(uint64_t virtual_addr) {
+    // Fast path: direct-map addresses (phys_to_virt region) are a simple
+    // subtraction — no page-table walk needed.  This also avoids breakage
+    // when the direct map uses 2MB or 1GB huge pages, which the 4KB-level
+    // page-table walker below cannot resolve.
+    if (is_direct_map_addr(virtual_addr)) {
+        return virtual_addr - PHYS_MAP_BASE;
+    }
+
     uint64_t* pte = mm_get_page_table(virtual_addr, false);
     if (mm_debug_pt) {
         kprintf("GET_PHYS: vaddr=%p pte=%p *pte=0x%lx\n", 

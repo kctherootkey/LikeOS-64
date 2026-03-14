@@ -8,6 +8,8 @@
 #include "../../include/kernel/sysfont.h"
 #include "../../include/kernel/cursor.h"
 #include "../../include/kernel/mouse.h"
+#include "../../include/kernel/pagecache.h"\n#include "../../include/kernel/dcache.h"
+#include "../../include/kernel/icache.h"
 
 void storage_fs_init(storage_fs_state_t* state) {
     if (!state) {
@@ -71,6 +73,10 @@ void storage_fs_poll(storage_fs_state_t* state) {
         if (fat32_mount(bdev, fs) == ST_OK) {
             fat32_vfs_register_root(fs);
             kprintf("FAT32: mount succeeded on %s (checking signature)\n", bdev->name);
+            // Initialize the page cache now that FAT32 is mounted
+            pagecache_init();
+            dcache_init();
+            icache_init();
             vfs_file_t* sf = 0;
             if (vfs_open("/LIKEOS.SIG", 0, &sf) == ST_OK) {
                 vfs_close(sf);

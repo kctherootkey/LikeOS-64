@@ -312,7 +312,7 @@ int fsync(int fd) {
 }
 
 void sync(void) {
-    /* LikeOS FAT32 writes are synchronous - no-op */
+    syscall0(SYS_SYNC);
 }
 
 int ftruncate(int fd, off_t length) {

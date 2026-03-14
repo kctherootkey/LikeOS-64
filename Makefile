@@ -1,6 +1,9 @@
 # LikeOS-64 UEFI Build System
 # Professional UEFI kernel build with modular directory structure
 
+# Codename for this release
+CODENAME = blessed kitty
+
 # Tools
 GCC = gcc
 LD = ld
@@ -47,9 +50,11 @@ EFI_LDS = /usr/lib/elf_x86_64_efi.lds
 # Compiler flags for kernel
 # Note: Stack protector disabled because __stack_chk_guard access can conflict
 # with identity mapping removal during boot
+BUILD_DATE := $(shell LC_ALL=C date -u '+%a %b %-d %H:%M:%S UTC %Y')
 KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-fno-stack-protector -mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
-			-I$(INCLUDE_DIR) -DXHCI_USE_INTERRUPTS=1 $(SERIAL_CFLAGS)
+			-I$(INCLUDE_DIR) -DXHCI_USE_INTERRUPTS=1 $(SERIAL_CFLAGS) \
+			-DBUILD_DATE='"$(BUILD_DATE)"'
 
 # Compiler flags for userspace programs
 USER_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
@@ -91,6 +96,9 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/block.o \
 			  $(BUILD_DIR)/xhci.o \
 			  $(BUILD_DIR)/fat32.o \
+			  $(BUILD_DIR)/pagecache.o \
+			  $(BUILD_DIR)/dcache.o \
+			  $(BUILD_DIR)/icache.o \
 			  $(BUILD_DIR)/usb.o \
 			  $(BUILD_DIR)/usb_msd.o \
 			  $(BUILD_DIR)/ps2.o \
@@ -201,6 +209,15 @@ $(BUILD_DIR)/xhci.o: $(KERNEL_DIR)/hal/xhci.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/fat32.o: $(KERNEL_DIR)/fs/fat32.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/pagecache.o: $(KERNEL_DIR)/fs/pagecache.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/dcache.o: $(KERNEL_DIR)/fs/dcache.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/icache.o: $(KERNEL_DIR)/fs/icache.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/usb.o: $(KERNEL_DIR)/hal/usb.c | $(BUILD_DIR)
@@ -592,6 +609,9 @@ $(BUILD_DIR)/nano: ports-nano | $(BUILD_DIR)
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel.lds | $(BUILD_DIR)
 	@echo "Building LikeOS-64 kernel as ELF64..."
 	$(LD) $(KERNEL_LDFLAGS) -T kernel.lds $(KERNEL_OBJS) -o $(KERNEL_ELF)
+ifndef NO_STRIP
+	$(STRIP) $(KERNEL_ELF)
+endif
 	@echo "LikeOS-64 ELF64 kernel built: $(KERNEL_ELF)"
 
 # Build UEFI bootloader
@@ -888,7 +908,7 @@ qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
 qemu-usb-gdb:
 	@echo "Rebuilding kernel with debug symbols (-g)..."
 	$(MAKE) clean
-	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" $(ISO_IMAGE) $(DATA_IMAGE)
+	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" NO_STRIP=1 $(ISO_IMAGE) $(DATA_IMAGE)
 	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
 	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
@@ -915,7 +935,7 @@ ifndef USB_DEVICE
 endif
 	@echo "Rebuilding kernel with debug symbols (-g)..."
 	$(MAKE) clean
-	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" usb-write USB_DEVICE=$(USB_DEVICE)
+	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" NO_STRIP=1 usb-write USB_DEVICE=$(USB_DEVICE)
 	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE) + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
 	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \

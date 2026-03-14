@@ -90,23 +90,26 @@ int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,
     }
     
     // Phase 2: Data transfer (if any)
-    // Use PAGE-ALIGNED DMA buffer for data phase
+    // Use PHYSICALLY CONTIGUOUS pages for the DMA buffer.
+    // The kernel heap (kcalloc_dma) only guarantees virtual contiguity — the
+    // underlying physical pages can be scattered.  For transfers > 1 page the
+    // xHCI controller writes sequentially in physical memory, so non-contiguous
+    // pages cause silent memory corruption.
     int data_st = ST_OK;
-    uint8_t* raw_data = NULL;
+    uint64_t data_phys = 0;
+    size_t   data_pages = 0;
     if (data_len > 0 && data_buf) {
-        // Allocate with extra page for alignment
-        uint32_t alloc_size = ((data_len + 4095) & ~4095U) + 4096;
-        raw_data = (uint8_t*)kcalloc_dma(1, alloc_size);
-        if (!raw_data) {
-            msd_dbg("Failed to allocate DMA buffer for data\n");
+        data_pages = ((uint32_t)data_len + 4095) / 4096;
+        data_phys  = mm_allocate_contiguous_pages(data_pages);
+        if (!data_phys) {
+            msd_dbg("Failed to allocate contiguous DMA buffer for data\n");
             kfree_dma(raw_cbw);
             kfree_dma(raw_csw);
             return ST_NOMEM;
         }
         
-        // Align to page boundary
-        uint8_t* dma_data = (uint8_t*)(((uint64_t)raw_data + 4095) & ~4095ULL);
-        msd_memset(dma_data, 0, data_len);
+        uint8_t* dma_data = (uint8_t*)phys_to_virt(data_phys);
+        msd_memset(dma_data, 0, data_pages * 4096);
         
         if (cbw->flags & CBW_FLAG_DATA_IN) {
             // Data IN
@@ -127,8 +130,8 @@ int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,
             data_st = xhci_bulk_transfer_out(ctrl, dev, dma_data, data_len, &transferred);
         }
         
-        kfree_dma(raw_data);
-        raw_data = NULL;
+        mm_free_contiguous_pages(data_phys, data_pages);
+        data_phys = 0;
         
         if (data_st != ST_OK) {
             msd_dbg("Data transfer failed: st=%d\n", data_st);
@@ -398,14 +401,15 @@ int usb_msd_block_read(block_device_t* dev, unsigned long lba, unsigned long cou
     // Serialize I/O to this device (sleeping mutex — IRQs stay enabled)
     msd_io_lock(msd);
     
-    // Read in 4KB chunks (8 sectors) for reliable USB transfers on real hardware
+    // Read in 64KB chunks (128 sectors) — matches the SCSI READ_10 limit
+    // and the upper-layer MAX_SECTORS_PER_READ for optimal USB throughput.
     uint8_t* ptr = (uint8_t*)buf;
     unsigned long remaining = count;
     unsigned long current_lba = lba;
     int result = ST_OK;
     
     while (remaining > 0) {
-        unsigned long chunk = (remaining > 8) ? 8 : remaining;
+        unsigned long chunk = (remaining > 128) ? 128 : remaining;
         
         int st = usb_msd_read(msd, (uint32_t)current_lba, (uint32_t)chunk, ptr);
         if (st != ST_OK) {
@@ -439,7 +443,7 @@ int usb_msd_block_write(block_device_t* dev, unsigned long lba, unsigned long co
     int result = ST_OK;
     
     while (remaining > 0) {
-        unsigned long chunk = (remaining > 256) ? 256 : remaining;
+        unsigned long chunk = (remaining > 128) ? 128 : remaining;
         
         int st = usb_msd_write(msd, (uint32_t)current_lba, (uint32_t)chunk, ptr);
         if (st != ST_OK) {

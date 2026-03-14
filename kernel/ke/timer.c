@@ -5,6 +5,7 @@
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/signal.h"
 #include "../../include/kernel/percpu.h"
+#include "../../include/kernel/pagecache.h"
 
 static volatile uint64_t g_ticks = 0;
 static uint32_t g_frequency = 100; // Default 100 Hz
@@ -345,6 +346,9 @@ void timer_irq_handler(void) {
         if ((g_ticks % 500) == 0) {
             sched_calc_load();
         }
+
+        // Page cache: signal periodic dirty writeback
+        pagecache_timer_tick(g_ticks);
     }
     
     // Per-CPU: manage this CPU's current task time slice

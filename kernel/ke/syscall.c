@@ -21,6 +21,8 @@
 #include "../../include/kernel/futex.h"
 #include "../../include/kernel/acpi.h"
 #include "../../include/kernel/fat32.h"
+#include "../../include/kernel/pagecache.h"
+#include "../../include/kernel/icache.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
@@ -1042,14 +1044,19 @@ static int64_t sys_uname(uint64_t buf) {
     mm_memset(&u, 0, sizeof(u));
     const char* sys = "LikeOS";
     const char* node = "r00tbox";
-    const char* rel = "0.2-preempt-smp";
-    const char* ver = "BlessedKitty";
+    const char* rel = "0.2";
+#ifdef BUILD_DATE
+    const char* ver = "preempt-smp " BUILD_DATE;
+#else
+    const char* ver = "preempt-smp";
+#endif
     const char* mach = "x86_64";
-    mm_memcpy(u.sysname, sys, 7);
-    mm_memcpy(u.nodename, node, 8);
-    mm_memcpy(u.release, rel, 16);
-    mm_memcpy(u.version, ver, 13);
-    mm_memcpy(u.machine, mach, 7);
+    // Copy strings (including null terminators), capped to field size
+    for (int i = 0; sys[i] && i < 64; i++) u.sysname[i] = sys[i];
+    for (int i = 0; node[i] && i < 64; i++) u.nodename[i] = node[i];
+    for (int i = 0; rel[i] && i < 64; i++) u.release[i] = rel[i];
+    for (int i = 0; ver[i] && i < 64; i++) u.version[i] = ver[i];
+    for (int i = 0; mach[i] && i < 64; i++) u.machine[i] = mach[i];
     if (copy_to_user((void*)buf, &u, sizeof(u)) < 0) {
         return -EFAULT;
     }
@@ -1090,7 +1097,22 @@ static int64_t sys_settimeofday(uint64_t tv_ptr, uint64_t tz) {
 }
 
 static int64_t sys_fsync(uint64_t fd) {
-    (void)fd;
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) return -EBADF;
+    vfs_file_t* file = cur->fd_table[fd];
+    fat32_file_t* ff = (fat32_file_t*)file->fs_private;
+    if (ff && ff->start_cluster >= 2) {
+        pagecache_flush_file(ff->start_cluster);
+        // Also flush dirty inode metadata (file size, timestamps)
+        if (ff->inode)
+            icache_flush((ic_inode_t *)ff->inode);
+    }
+    return 0;
+}
+
+static int64_t sys_sync(void) {
+    pagecache_sync();
     return 0;
 }
 
@@ -4481,6 +4503,9 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 
         case SYS_KLOGCTL:
             return sys_klogctl(a1, a2, a3);
+
+        case SYS_SYNC:
+            return sys_sync();
             
         default:
             return -ENOSYS;

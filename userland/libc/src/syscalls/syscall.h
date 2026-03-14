@@ -39,6 +39,7 @@
 #define SYS_TIME        215
 #define SYS_GETTIMEOFDAY 216
 #define SYS_FSYNC       217
+#define SYS_SYNC        338
 #define SYS_FTRUNCATE   218
 #define SYS_FCNTL       219
 #define SYS_IOCTL       220

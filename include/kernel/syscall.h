@@ -145,6 +145,7 @@
 #define SYS_SYSINFO         335  // Get system info (memory, uptime, loadavg)
 #define SYS_KLOGCTL         336  // Kernel ring buffer read/clear
 #define SYS_SETTIMEOFDAY    337  // Set system time (and sync to CMOS RTC)
+#define SYS_SYNC            338  // Flush all dirty caches to disk
 
 // Kernel log control operations (for SYS_KLOGCTL)
 #define SYSLOG_ACTION_READ       2

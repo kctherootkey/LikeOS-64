@@ -32,6 +32,12 @@ typedef struct {
     unsigned long dirent_cluster;
     unsigned int dirent_index;
     char name83[12]; // 8.3 name (11 chars + null)
+    // Page cache read-ahead state (embedded to avoid header dependency)
+    unsigned long ra_last_page;     // last page accessed
+    int           ra_seq_count;     // consecutive sequential accesses
+    int           ra_pages;         // current read-ahead window size
+    // Inode cache reference (opaque pointer to avoid header dependency)
+    void         *inode;            // ic_inode_t* from icache
 } fat32_file_t;
 
 // FAT32 attribute flags
@@ -76,5 +82,11 @@ typedef struct {
 
 /* Fill fs_info with current filesystem statistics.  Returns 0 on success. */
 int fat32_get_statfs(fat32_statfs_t *info);
+
+/* Page cache support: exported FAT32 internals */
+extern fat32_fs_t *g_root_fs;
+void fat32_io_lock(void);
+void fat32_io_unlock(void);
+unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster);
 
 #endif // LIKEOS_FAT32_H
