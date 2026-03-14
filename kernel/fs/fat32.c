@@ -3265,8 +3265,17 @@ static long fat32_seek_impl(vfs_file_t *f, long offset, int whence)
     
     if (new_pos < 0)
         return -1;
-    if ((unsigned long)new_pos > ff->size)
+    if (!ff->is_dir && (unsigned long)new_pos > ff->size)
         new_pos = (long)ff->size;
+    
+    // For directories, reset the readdir iterator state so that
+    // rewinddir() (lseek to 0) causes the next getdents to start over.
+    if (ff->is_dir) {
+        ff->dir_iter_cluster = ff->start_cluster;
+        ff->dir_iter_index   = 0;
+        ff->pos = 0;
+        return 0;
+    }
     
     // Update position and recalculate current cluster
     unsigned long target_pos = (unsigned long)new_pos;

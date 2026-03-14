@@ -516,6 +516,7 @@ long labs(long n) {
 }
 
 void qsort(void* base, size_t nmemb, size_t size, int (*compar)(const void*, const void*)) {
+    if (nmemb <= 1) return;
     // Simple bubble sort for now
     char* b = base;
     for (size_t i = 0; i < nmemb - 1; i++) {
