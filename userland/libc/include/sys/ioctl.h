@@ -15,6 +15,7 @@
 #define TIOCSWINSZ 0x5414
 #define TIOCGPTN   0x80045430
 #define TIOCSGUARD 0x5420
+#define TIOCLINUX  0x541C
 
 int ioctl(int fd, unsigned long request, void* argp);
 

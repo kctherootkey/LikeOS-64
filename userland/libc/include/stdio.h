@@ -12,6 +12,10 @@
 
 #define BUFSIZ 4096
 
+/* Temporary file directory */
+#define P_tmpdir "/tmp"
+#define L_tmpnam 20
+
 /* Buffering modes for setvbuf */
 #define _IONBF 0   /* unbuffered */
 #define _IOLBF 1   /* line buffered */
@@ -90,5 +94,24 @@ int sscanf(const char* str, const char* format, ...);
 
 // Error reporting
 void perror(const char* s);
+
+// Additional I/O
+#include <sys/types.h>
+ssize_t getline(char** lineptr, size_t* n, FILE* stream);
+ssize_t getdelim(char** lineptr, size_t* n, int delim, FILE* stream);
+FILE* tmpfile(void);
+int mkstemp(char* templ);
+int mkstemps(char* templ, int suffixlen);
+int remove(const char* pathname);
+int rename(const char* oldpath, const char* newpath);
+FILE* fdopen(int fd, const char *mode);
+int dprintf(int fd, const char *format, ...);
+int vdprintf(int fd, const char *format, va_list ap);
+
+/* Implement flockfile/funlockfile as no-ops (single-threaded) */
+static inline void flockfile(FILE *f) { (void)f; }
+static inline void funlockfile(FILE *f) { (void)f; }
+static inline int ftrylockfile(FILE *f) { (void)f; return 0; }
+static inline int getc_unlocked(FILE *f) { return fgetc(f); }
 
 #endif

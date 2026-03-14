@@ -10,11 +10,12 @@ PIC_CFLAGS = $(CFLAGS) -fPIC
 # Source files
 MALLOC_SRC = src/malloc/malloc.c
 STDIO_SRC = src/stdio/stdio.c
-STRING_SRC = src/string/string.c src/string/fnmatch.c
-STDLIB_SRC = src/stdlib/stdlib.c src/stdlib/getopt.c
+STRING_SRC = src/string/string.c src/string/fnmatch.c src/string/strnlen.c src/string/glob.c
+STDLIB_SRC = src/stdlib/stdlib.c src/stdlib/getopt.c src/stdlib/mkstemps.c
 CTYPE_SRC = src/ctype/ctype.c
 TIME_SRC = src/time/time.c
 DIR_SRC = src/dirent/dirent.c
+EXTRA_STDIO_SRC = src/stdio/getline.c
 SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/sched.c
 DLFCN_SRC = src/dl/dlfcn.c
 PTHREAD_SRC = src/pthread/pthread.c src/pthread/pthread_mutex.c src/pthread/pthread_cond.c src/pthread/pthread_sync.c src/pthread/pthread_tsd.c
@@ -24,7 +25,7 @@ CRT1_SRC = src/crt1.S
 
 # Static object files
 MALLOC_OBJ = $(MALLOC_SRC:.c=.o)
-STDIO_OBJ = $(STDIO_SRC:.c=.o)
+STDIO_OBJ = $(STDIO_SRC:.c=.o) $(EXTRA_STDIO_SRC:.c=.o)
 STRING_OBJ = $(STRING_SRC:.c=.o)
 STDLIB_OBJ = $(STDLIB_SRC:.c=.o)
 CTYPE_OBJ = $(CTYPE_SRC:.c=.o)

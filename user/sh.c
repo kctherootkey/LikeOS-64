@@ -1307,7 +1307,7 @@ static int run_builtin(int argc, char **argv) {
         printf("  mkdir rmdir uname ps kill find df du hexdump\n");
         printf("  sort uniq cut tr yes true false time\n");
         printf("  grep head tail wc echo printf free uptime dmesg\n");
-        printf("  which date sleep strings file top man\n");
+        printf("  which date sleep strings file top man nano\n");
         printf("  shutdown reboot poweroff halt\n");
         printf("Keyboard shortcuts:\n");
         printf("  Ctrl+D  - Debug dump\n");

@@ -56,6 +56,14 @@ static uint32_t cursor_blink_ticks = 0; // Tick counter for blinking
 static uint32_t cursor_last_x = 0;     // Last cursor X position
 static uint32_t cursor_last_y = 0;     // Last cursor Y position
 
+// Save buffer for pixels under the cursor (2 pixels wide x max 32 pixels tall)
+#define CURSOR_SAVE_W 2
+#define CURSOR_SAVE_MAX_H 32
+static uint32_t cursor_saved_pixels[CURSOR_SAVE_W * CURSOR_SAVE_MAX_H];
+static uint8_t  cursor_pixels_saved = 0; // Whether we have valid saved pixels
+static uint32_t cursor_saved_x = 0;     // Position where pixels were saved
+static uint32_t cursor_saved_y = 0;
+
 // Font - simple 8x16 bitmap font (complete character set)
 static const uint8_t font_8x16[128][16] = {
     // Space (32)
@@ -167,8 +175,8 @@ static const uint8_t font_8x16[128][16] = {
 // Character dimensions - default values for built-in font, updated when external font loaded
 #define DEFAULT_CHAR_WIDTH 8
 #define DEFAULT_CHAR_HEIGHT 16
-static uint32_t char_width = DEFAULT_CHAR_WIDTH;
-static uint32_t char_height = DEFAULT_CHAR_HEIGHT;
+uint32_t char_width = DEFAULT_CHAR_WIDTH;
+uint32_t char_height = DEFAULT_CHAR_HEIGHT;
 
 // Macros to access current character dimensions
 #define CHAR_WIDTH char_width
@@ -423,14 +431,56 @@ static void draw_cursor_at(uint32_t x, uint32_t y, uint8_t show) {
     
     uint32_t pixel_x = x * CHAR_WIDTH;
     uint32_t pixel_y = y * CHAR_HEIGHT;
+    uint32_t h = char_height;
+    if (h > CURSOR_SAVE_MAX_H) h = CURSOR_SAVE_MAX_H;
     
-    // Gray color for cursor (RGB: 128, 128, 128)
-    uint32_t cursor_color = show ? 0x00808080 : bg_color;
-    
-    // Draw a thin vertical bar (2 pixels wide for better visibility)
-    for (uint32_t row = 0; row < char_height; row++) {
-        set_pixel(pixel_x, pixel_y + row, cursor_color);
-        set_pixel(pixel_x + 1, pixel_y + row, cursor_color);
+    if (show) {
+        // Save the pixels currently under the cursor position
+        fb_double_buffer_t* fb_opt = get_fb_double_buffer();
+        for (uint32_t row = 0; row < h; row++) {
+            for (uint32_t col = 0; col < CURSOR_SAVE_W; col++) {
+                uint32_t px = pixel_x + col;
+                uint32_t py = pixel_y + row;
+                uint32_t pix;
+                if (fb_opt) {
+                    pix = fb_get_pixel(px, py);
+                } else if (fb_info->framebuffer_base) {
+                    uint32_t* framebuffer = (uint32_t*)fb_info->framebuffer_base;
+                    uint32_t offset = py * fb_info->pixels_per_scanline + px;
+                    pix = framebuffer[offset];
+                } else {
+                    pix = 0;
+                }
+                cursor_saved_pixels[row * CURSOR_SAVE_W + col] = pix;
+            }
+        }
+        cursor_saved_x = x;
+        cursor_saved_y = y;
+        cursor_pixels_saved = 1;
+        
+        // Draw the cursor (gray vertical bar, 2 pixels wide)
+        uint32_t cursor_color = 0x00808080;
+        for (uint32_t row = 0; row < h; row++) {
+            set_pixel(pixel_x, pixel_y + row, cursor_color);
+            set_pixel(pixel_x + 1, pixel_y + row, cursor_color);
+        }
+    } else {
+        // Restore the saved pixels if we have them and position matches
+        if (cursor_pixels_saved && cursor_saved_x == x && cursor_saved_y == y) {
+            for (uint32_t row = 0; row < h; row++) {
+                for (uint32_t col = 0; col < CURSOR_SAVE_W; col++) {
+                    set_pixel(pixel_x + col, pixel_y + row,
+                              cursor_saved_pixels[row * CURSOR_SAVE_W + col]);
+                }
+            }
+            cursor_pixels_saved = 0;
+        } else {
+            // Fallback: fill with bg_color (best effort)
+            for (uint32_t row = 0; row < h; row++) {
+                set_pixel(pixel_x, pixel_y + row, bg_color);
+                set_pixel(pixel_x + 1, pixel_y + row, bg_color);
+            }
+        }
     }
 }
 

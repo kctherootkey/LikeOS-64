@@ -3,7 +3,7 @@
 
 #include <sys/types.h>
 
-typedef long time_t;
+/* time_t is now defined in sys/types.h */
 
 #ifndef _STRUCT_TIMESPEC
 #define _STRUCT_TIMESPEC

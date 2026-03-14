@@ -2,6 +2,7 @@
 #define _SYS_STAT_H
 
 #include <sys/types.h>
+#include <time.h>
 
 #define S_IFMT   0170000
 #define S_IFSOCK 0140000
@@ -49,10 +50,15 @@ struct stat {
     uint64_t st_size;
     uint64_t st_blksize;
     uint64_t st_blocks;
-    uint64_t st_atime;
-    uint64_t st_mtime;
-    uint64_t st_ctime;
+    struct timespec st_atim;
+    struct timespec st_mtim;
+    struct timespec st_ctim;
 };
+
+/* POSIX compatibility macros */
+#define st_atime st_atim.tv_sec
+#define st_mtime st_mtim.tv_sec
+#define st_ctime st_ctim.tv_sec
 
 int stat(const char* path, struct stat* st);
 int lstat(const char* path, struct stat* st);

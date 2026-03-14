@@ -91,7 +91,12 @@ pid_t fork(void);
 int execve(const char* pathname, char* const argv[], char* const envp[]);
 int execv(const char* pathname, char* const argv[]);
 int execvp(const char* file, char* const argv[]);
+int execl(const char *pathname, const char *arg, ... /*, (char *)NULL */);
+int execlp(const char *file, const char *arg, ... /*, (char *)NULL */);
 void _exit(int status) __attribute__((noreturn));
+
+// Timestamps
+int futimens(int fd, const struct timespec times[2]);
 
 // File descriptor operations
 int dup(int oldfd);
@@ -107,5 +112,25 @@ int sysinfo(struct sysinfo *info);
 
 // Kernel log
 int klogctl(int type, char *bufp, int len);
+
+// pathconf / fpathconf constants
+#define PIPE_BUF        4096
+#define _PC_PIPE_BUF    4
+#define _PC_PATH_MAX    5
+#define _PC_NAME_MAX    6
+#define _PC_LINK_MAX    7
+
+long fpathconf(int fd, int name);
+long pathconf(const char *path, int name);
+long sysconf(int name);
+
+// sysconf constants
+#define _SC_PAGESIZE      30
+#define _SC_PAGE_SIZE     _SC_PAGESIZE
+#define _SC_OPEN_MAX      4
+#define _SC_CLK_TCK       2
+
+// confstr
+#define _CS_PATH  0
 
 #endif

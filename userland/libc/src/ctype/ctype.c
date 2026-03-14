@@ -44,6 +44,14 @@ int isgraph(int c) {
     return isprint(c) && c != ' ';
 }
 
+int isblank(int c) {
+    return c == ' ' || c == '\t';
+}
+
+int isascii(int c) {
+    return (unsigned int)c <= 127;
+}
+
 int toupper(int c) {
     if (islower(c)) {
         return c - ('a' - 'A');

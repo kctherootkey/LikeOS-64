@@ -1,0 +1,218 @@
+NANO(1)                          User Commands                         NANO(1)
+
+NAME
+       nano - Nano's ANOther editor, inspired by Pico
+
+SYNOPSIS
+       nano [OPTIONS] [[+LINE[,COLUMN]] FILE]...
+
+DESCRIPTION
+       nano is a small and friendly text editor.  It copies the look and feel
+       of Pico, but is free software, and implements several features that
+       Pico lacks, such as: opening multiple files, scrolling per line,
+       undo/redo, syntax coloring, line numbering, and soft-wrapping of
+       overlong lines.
+
+       When giving a filename on the command line, the cursor can be put on a
+       specific line by adding the line number with a plus sign (+) before the
+       filename, and even in a specific column by adding it with a comma.
+
+       If the first file specified is a dash (-), nano will read data from
+       standard input.
+
+OPTIONS
+       -A, --smarthome
+              Make the Home key smarter.
+
+       -B, --backup
+              When saving a file, back up the previous version of it, using
+              the current filename suffixed with a tilde (~).
+
+       -C dir, --backupdir=dir
+              Make and keep not just one backup file, but make a uniquely
+              numbered one every time a file is saved.
+
+       -E, --tabstospaces
+              Convert typed tabs to spaces.
+
+       -G, --locking
+              Use vim-style file locking when editing files.
+
+       -H, --historylog
+              Save the last hundred search strings and replacement strings
+              and executed commands, so they can be easily reused.
+
+       -I, --ignorercfiles
+              Don't look at the system's nanorc nor at the user's nanorc.
+
+       -J number, --guidestripe=number
+              Draw a vertical stripe at the given column.
+
+       -K, --rawsequences
+              Interpret escape sequences directly.
+
+       -L, --nonewlines
+              Don't automatically add a newline when a text does not end
+              with one.
+
+       -M, --trimblanks
+              Snip trailing whitespace from the wrapped line when automatic
+              hard-wrapping occurs or when text is justified.
+
+       -N, --noconvert
+              Disable automatic conversion of files from DOS/Mac format.
+
+       -P, --positionlog
+              Save the cursor position of files between editing sessions.
+
+       -Q "regex", --quotestr="regex"
+              Set the regular expression for matching the quoting part of a
+              line.
+
+       -R, --restricted
+              Restricted mode: don't allow suspending, or saving a file
+              under a different name, or appending/prepending to a file.
+
+       -S, --softwrap
+              Display over-long lines on multiple screen rows.
+
+       -T number, --tabsize=number
+              Set the size (width) of a tab to number columns.
+
+       -V, --version
+              Show the current version number and exit.
+
+       -W, --wordbounds
+              Detect word boundaries differently.
+
+       -Y name, --syntax=name
+              Use the named syntax for syntax highlighting.
+
+       -Z, --zap
+              Let an unmodified Backspace or Delete erase the marked region.
+
+       -a, --atblanks
+              When doing soft line wrapping, wrap lines at blank characters.
+
+       -b, --breaklonglines
+              Automatically hard-wrap the current line when it becomes
+              overlong.
+
+       -c, --constantshow
+              Constantly show the cursor position on the status bar.
+
+       -d, --rebinddelete
+              Interpret the Delete and Backspace keys differently.
+
+       -e, --emptyline
+              Do not use the line below the title bar.
+
+       -g, --showcursor
+              Make the cursor visible in the file browser and help viewer.
+
+       -h, --help
+              Show a summary of the available command-line options and exit.
+
+       -i, --autoindent
+              Automatically indent a newly created line to the same number
+              of tabs and/or spaces as the previous line.
+
+       -j, --jumpyscrolling
+              Scroll the buffer contents per half-screen instead of per line.
+
+       -k, --cutfromcursor
+              Make Ctrl+K cut from the cursor to end of line.
+
+       -l, --linenumbers
+              Display line numbers to the left of the text area.
+
+       -m, --mouse
+              Enable mouse support, if available.
+
+       -n, --noread
+              Treat any name given on the command line as a new file.
+
+       -o dir, --operatingdir=dir
+              Set the operating directory.
+
+       -p, --preserve
+              Preserve the XON and XOFF sequences (^Q and ^S).
+
+       -r number, --fill=number
+              Set the target width for justifying and automatic
+              hard-wrapping at this number of columns.
+
+       -s program, --speller=program
+              Use this alternative spell checker command.
+
+       -t, --saveonexit
+              Save a changed buffer without prompting.
+
+       -v, --view
+              Just view the file and disallow editing.
+
+       -w, --nowrap
+              Do not automatically hard-wrap the current line when it becomes
+              overlong. (Old short option for -b's opposite.)
+
+       -x, --nohelp
+              Don't show the two help lines at the bottom of the screen.
+
+       -y, --afterends
+              Make Ctrl+Right and Ctrl+Delete stop at word ends instead of
+              beginnings.
+
+       -%, --stateflags
+              Use the top-right corner of the screen for showing some state
+              flags.
+
+       -_, --minibar
+              Suppress the title bar and instead show information about the
+              current buffer at the bottom of the screen.
+
+TOGGLES
+       Several of the above options can be switched on and off also while
+       nano is running. See the internal help text (^G) for a list.
+
+DEFAULT SHORTCUTS
+       ^G     (F1)            Display this help text
+       ^X     (F2)            Close the current file buffer / Exit from nano
+       ^O     (F3)            Write the current file to disk
+       ^R     (F5)            Insert another file into current buffer
+
+       ^W     (F6)            Search for a string or a regular expression
+       ^\     (M-R)           Replace a string or a regular expression
+       ^K     (F9)            Cut current line and store it in cutbuffer
+       ^U     (F10)           Paste from the cutbuffer into current line
+
+       ^T                     Execute a function or an external command
+       ^J     (F4)            Justify the current paragraph
+
+       ^C     (F11)           Display the position of the cursor
+       ^_     (F13)           Go to line and column number
+
+       M-U                    Undo the last operation
+       M-E                    Redo the last undone operation
+
+FILES
+       /etc/nanorc
+              System-wide configuration file (not used on LikeOS).
+
+       ~/.nanorc
+              Per-user configuration file.
+
+NOTES
+       This is a port of GNU nano 8.3 to LikeOS.
+       Some features may be limited compared to the full Linux version.
+       UTF-8 support is not enabled.
+
+SEE ALSO
+       The nano homepage: https://nano-editor.org/
+
+       The full documentation for nano is maintained as a Texinfo manual.
+
+AUTHOR
+       Chris Allegretta and others. See the AUTHORS and THANKS files in the
+       source distribution for details.
+
+GNU nano 8.3                     March 2025                            NANO(1)

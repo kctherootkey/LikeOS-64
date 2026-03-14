@@ -14,10 +14,10 @@ static spinlock_t kb_lock = SPINLOCK_INIT("keyboard");
 
 // US QWERTY scan code to ASCII conversion table
 static char scan_code_to_ascii_table[] = {
-    0,   0,   '1', '2', '3', '4', '5', '6',    // 0x00-0x07
+    0,   27,  '1', '2', '3', '4', '5', '6',    // 0x00-0x07 (0x01 = ESC)
     '7', '8', '9', '0', '-', '=', '\b', '\t', // 0x08-0x0F
     'q', 'w', 'e', 'r', 't', 'y', 'u', 'i',  // 0x10-0x17
-    'o', 'p', '[', ']', '\n', 0,  'a', 's',  // 0x18-0x1F
+    'o', 'p', '[', ']', '\r', 0,  'a', 's',  // 0x18-0x1F
     'd', 'f', 'g', 'h', 'j', 'k', 'l', ';',  // 0x20-0x27
     '\'', '`', 0, '\\', 'z', 'x', 'c', 'v',  // 0x28-0x2F
     'b', 'n', 'm', ',', '.', '/', 0,   '*',  // 0x30-0x37
@@ -30,10 +30,10 @@ static char scan_code_to_ascii_table[] = {
 
 // Shifted characters
 static char scan_code_to_ascii_shifted[] = {
-    0,   0,   '!', '@', '#', '$', '%', '^',    // 0x00-0x07
+    0,   27,  '!', '@', '#', '$', '%', '^',    // 0x00-0x07 (0x01 = ESC)
     '&', '*', '(', ')', '_', '+', '\b', '\t', // 0x08-0x0F
     'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I',  // 0x10-0x17
-    'O', 'P', '{', '}', '\n', 0,  'A', 'S',  // 0x18-0x1F
+    'O', 'P', '{', '}', '\r', 0,  'A', 'S',  // 0x18-0x1F
     'D', 'F', 'G', 'H', 'J', 'K', 'L', ':',  // 0x20-0x27
     '"', '~', 0, '|', 'Z', 'X', 'C', 'V',    // 0x28-0x2F
     'B', 'N', 'M', '<', '>', '?', 0,   '*',  // 0x30-0x37
@@ -131,63 +131,62 @@ void keyboard_irq_handler(void) {
         if (scan_code & KEY_RELEASE)
             return;
 
-        // Map extended scan codes to ANSI escape sequences
+        // Compute xterm modifier value: 1=none, 2=Shift, 5=Ctrl, 6=Ctrl+Shift
+        int mod = 1;
+        if (kb_state.shift_pressed) mod += 1;
+        if (kb_state.ctrl_pressed)  mod += 4;
+
+        // Helper: emit \033[1;MOD X for arrow/home/end style keys
+        // or \033[NUM;MOD~ for insert/delete/pgup/pgdn style keys.
+        // When no modifier is held (mod==1), emit the plain sequences.
         tty_t *tty = tty_get_console();
         switch (scan_code) {
             case KEY_EXT_UP:
-                tty_input_char(tty, 27, 0);
-                tty_input_char(tty, '[', 0);
-                tty_input_char(tty, 'A', 0);
-                return;
             case KEY_EXT_DOWN:
-                tty_input_char(tty, 27, 0);
-                tty_input_char(tty, '[', 0);
-                tty_input_char(tty, 'B', 0);
-                return;
             case KEY_EXT_RIGHT:
-                tty_input_char(tty, 27, 0);
-                tty_input_char(tty, '[', 0);
-                tty_input_char(tty, 'C', 0);
-                return;
             case KEY_EXT_LEFT:
-                tty_input_char(tty, 27, 0);
-                tty_input_char(tty, '[', 0);
-                tty_input_char(tty, 'D', 0);
-                return;
             case KEY_EXT_HOME:
+            case KEY_EXT_END: {
+                char final_ch;
+                switch (scan_code) {
+                    case KEY_EXT_UP:    final_ch = 'A'; break;
+                    case KEY_EXT_DOWN:  final_ch = 'B'; break;
+                    case KEY_EXT_RIGHT: final_ch = 'C'; break;
+                    case KEY_EXT_LEFT:  final_ch = 'D'; break;
+                    case KEY_EXT_HOME:  final_ch = 'H'; break;
+                    default:            final_ch = 'F'; break; /* END */
+                }
                 tty_input_char(tty, 27, 0);
                 tty_input_char(tty, '[', 0);
-                tty_input_char(tty, 'H', 0);
+                if (mod > 1) {
+                    tty_input_char(tty, '1', 0);
+                    tty_input_char(tty, ';', 0);
+                    tty_input_char(tty, (char)('0' + mod), 0);
+                }
+                tty_input_char(tty, final_ch, 0);
                 return;
-            case KEY_EXT_END:
-                tty_input_char(tty, 27, 0);
-                tty_input_char(tty, '[', 0);
-                tty_input_char(tty, 'F', 0);
-                return;
+            }
             case KEY_EXT_PGUP:
-                tty_input_char(tty, 27, 0);
-                tty_input_char(tty, '[', 0);
-                tty_input_char(tty, '5', 0);
-                tty_input_char(tty, '~', 0);
-                return;
             case KEY_EXT_PGDN:
-                tty_input_char(tty, 27, 0);
-                tty_input_char(tty, '[', 0);
-                tty_input_char(tty, '6', 0);
-                tty_input_char(tty, '~', 0);
-                return;
             case KEY_EXT_INSERT:
+            case KEY_EXT_DELETE: {
+                char num_ch;
+                switch (scan_code) {
+                    case KEY_EXT_PGUP:   num_ch = '5'; break;
+                    case KEY_EXT_PGDN:   num_ch = '6'; break;
+                    case KEY_EXT_INSERT: num_ch = '2'; break;
+                    default:             num_ch = '3'; break; /* DELETE */
+                }
                 tty_input_char(tty, 27, 0);
                 tty_input_char(tty, '[', 0);
-                tty_input_char(tty, '2', 0);
+                tty_input_char(tty, num_ch, 0);
+                if (mod > 1) {
+                    tty_input_char(tty, ';', 0);
+                    tty_input_char(tty, (char)('0' + mod), 0);
+                }
                 tty_input_char(tty, '~', 0);
                 return;
-            case KEY_EXT_DELETE:
-                tty_input_char(tty, 27, 0);
-                tty_input_char(tty, '[', 0);
-                tty_input_char(tty, '3', 0);
-                tty_input_char(tty, '~', 0);
-                return;
+            }
             default:
                 return;
         }
@@ -230,6 +229,40 @@ void keyboard_irq_handler(void) {
             return;
     }
     
+    // Function keys F1-F12: emit VT/xterm escape sequences.
+    // F1-F4 use SS3 format (\033OP..\033OS), F5-F12 use CSI format (\033[N~).
+    {
+        // F-key number table: scan_code → (fkey number 1..12), 0 = not an F-key
+        int fnum = 0;
+        if (scan_code >= KEY_F1 && scan_code <= KEY_F10)
+            fnum = scan_code - KEY_F1 + 1;
+        else if (scan_code == KEY_F11)
+            fnum = 11;
+        else if (scan_code == KEY_F12)
+            fnum = 12;
+
+        if (fnum) {
+            tty_t *tty = tty_get_console();
+            tty_input_char(tty, 27, 0);  // ESC
+            if (fnum <= 4) {
+                // F1-F4: \033OP .. \033OS
+                tty_input_char(tty, 'O', 0);
+                tty_input_char(tty, (char)('P' + fnum - 1), 0);
+            } else {
+                // F5-F12: \033[N~ where N is:
+                // F5=15, F6=17, F7=18, F8=19, F9=20, F10=21, F11=23, F12=24
+                static const char *fseq[] = {
+                    "15","17","18","19","20","21","23","24"
+                };
+                const char *s = fseq[fnum - 5];
+                tty_input_char(tty, '[', 0);
+                while (*s) tty_input_char(tty, *s++, 0);
+                tty_input_char(tty, '~', 0);
+            }
+            return;
+        }
+    }
+
     // Add to buffer for processing
     keyboard_buffer_add(scan_code);
 
@@ -306,7 +339,18 @@ void keyboard_irq_handler(void) {
     uint8_t shift = kb_state.shift_pressed || kb_state.caps_lock;
     char ch = scan_code_to_ascii(scan_code, shift);
     if (ch) {
-        tty_input_char(tty_get_console(), ch, kb_state.ctrl_pressed);
+        tty_t *tty = tty_get_console();
+        // Ctrl+Space produces NUL (0x00) — standard terminal behavior.
+        if (kb_state.ctrl_pressed && ch == ' ') {
+            tty_input_char_raw(tty, 0);
+            return;
+        }
+        // Alt+key: send ESC prefix followed by the character.
+        // This is how terminals represent Meta/Alt combinations.
+        if (kb_state.alt_pressed) {
+            tty_input_char(tty, 27, 0);  // ESC
+        }
+        tty_input_char(tty, ch, kb_state.ctrl_pressed);
     }
 }
 

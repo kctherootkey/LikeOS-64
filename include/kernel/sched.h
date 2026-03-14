@@ -362,6 +362,10 @@ typedef struct task {
     // Current working directory
     char cwd[256];
     
+    // Implicit console I/O flags (O_NONBLOCK etc., for when fd 0/1/2 are
+    // not backed by a real vfs_file but use the console TTY directly).
+    uint32_t console_flags;
+
     // File descriptor table (legacy - used when files == NULL)
     struct vfs_file* fd_table[TASK_MAX_FDS];
     

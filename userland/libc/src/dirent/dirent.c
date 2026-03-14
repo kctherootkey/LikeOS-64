@@ -76,3 +76,11 @@ int closedir(DIR* dirp) {
     free(dirp);
     return close(fd);
 }
+
+void rewinddir(DIR* dirp) {
+    if (!dirp) return;
+    /* Seek the directory fd back to position 0 */
+    lseek(dirp->fd, 0, 0 /* SEEK_SET */);
+    dirp->buf_pos = 0;
+    dirp->buf_len = 0;
+}

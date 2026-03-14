@@ -578,3 +578,82 @@ int klogctl(int type, char *bufp, int len) {
     if (ret < 0) { errno = -ret; return -1; }
     return (int)ret;
 }
+
+long fpathconf(int fd, int name) {
+    (void)fd;
+    switch (name) {
+        case _PC_PIPE_BUF: return PIPE_BUF;
+        case _PC_PATH_MAX: return 4096;
+        case _PC_NAME_MAX: return 255;
+        case _PC_LINK_MAX: return 127;
+        default: errno = EINVAL; return -1;
+    }
+}
+
+long pathconf(const char *path, int name) {
+    (void)path;
+    return fpathconf(-1, name);
+}
+
+long sysconf(int name) {
+    switch (name) {
+        case _SC_PAGESIZE:  return 4096;
+        case _SC_OPEN_MAX:  return 256;
+        case _SC_CLK_TCK:   return 100;
+        default: errno = EINVAL; return -1;
+    }
+}
+
+#include <stdarg.h>
+
+int execl(const char *pathname, const char *arg, ...)
+{
+    /* Count args */
+    va_list ap;
+    int argc = 1;
+    va_start(ap, arg);
+    while (va_arg(ap, const char *) != NULL)
+        argc++;
+    va_end(ap);
+
+    /* Build argv array */
+    char *argv[argc + 1];
+    argv[0] = (char *)arg;
+    va_start(ap, arg);
+    for (int i = 1; i <= argc; i++)
+        argv[i] = va_arg(ap, char *);
+    va_end(ap);
+
+    return execv(pathname, argv);
+}
+
+int execlp(const char *file, const char *arg, ...)
+{
+    /* Count args */
+    va_list ap;
+    int argc = 1;
+    va_start(ap, arg);
+    while (va_arg(ap, const char *) != NULL)
+        argc++;
+    va_end(ap);
+
+    /* Build argv array */
+    char *argv[argc + 1];
+    argv[0] = (char *)arg;
+    va_start(ap, arg);
+    for (int i = 1; i <= argc; i++)
+        argv[i] = va_arg(ap, char *);
+    va_end(ap);
+
+    return execvp(file, argv);
+}
+
+int futimens(int fd, const struct timespec times[2])
+{
+    /* Use utimensat with AT_FDCWD-like approach */
+    /* For now, stub - nano uses this for timestamp preservation */
+    (void)fd;
+    (void)times;
+    errno = ENOSYS;
+    return -1;
+}

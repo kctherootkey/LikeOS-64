@@ -155,7 +155,201 @@ static const int magic_db_count = sizeof(magic_db) / sizeof(magic_db[0]);
 #undef M
 
 /* ── ELF detailed analysis ──────────────────────────────────────────── */
-static void describe_elf(const unsigned char *buf, int len, char *out, int outsz)
+
+/* Read a 16-bit value from buf at offset, respecting endianness (1=LE, 2=BE) */
+static unsigned int elf_read16(const unsigned char *buf, int off, int ei_data)
+{
+    if (ei_data == 1) return buf[off] | ((unsigned)buf[off+1] << 8);
+    return ((unsigned)buf[off] << 8) | buf[off+1];
+}
+
+/* Read a 32-bit value from buf at offset, respecting endianness */
+static unsigned int elf_read32(const unsigned char *buf, int off, int ei_data)
+{
+    if (ei_data == 1)
+        return buf[off] | ((unsigned)buf[off+1] << 8) |
+               ((unsigned)buf[off+2] << 16) | ((unsigned)buf[off+3] << 24);
+    return ((unsigned)buf[off] << 24) | ((unsigned)buf[off+1] << 16) |
+           ((unsigned)buf[off+2] << 8) | buf[off+3];
+}
+
+/* Read a 64-bit value from buf at offset, respecting endianness */
+static unsigned long elf_read64(const unsigned char *buf, int off, int ei_data)
+{
+    if (ei_data == 1)
+        return (unsigned long)buf[off] | ((unsigned long)buf[off+1] << 8) |
+               ((unsigned long)buf[off+2] << 16) | ((unsigned long)buf[off+3] << 24) |
+               ((unsigned long)buf[off+4] << 32) | ((unsigned long)buf[off+5] << 40) |
+               ((unsigned long)buf[off+6] << 48) | ((unsigned long)buf[off+7] << 56);
+    return ((unsigned long)buf[off] << 56) | ((unsigned long)buf[off+1] << 48) |
+           ((unsigned long)buf[off+2] << 40) | ((unsigned long)buf[off+3] << 32) |
+           ((unsigned long)buf[off+4] << 24) | ((unsigned long)buf[off+5] << 16) |
+           ((unsigned long)buf[off+6] << 8) | (unsigned long)buf[off+7];
+}
+
+/*
+ * Check whether an ELF file is stripped by scanning its section headers for
+ * a SHT_SYMTAB (type 2) entry.  If no .symtab section exists, the binary
+ * is stripped.  The filename is used to read beyond the initial buffer when
+ * section headers are located past the first 64 KB.
+ */
+static int elf_is_stripped(const unsigned char *buf, int len, const char *path)
+{
+    if (len < 64) return -1; /* too short to tell */
+
+    int ei_class = buf[4]; /* 1 = 32-bit, 2 = 64-bit */
+    int ei_data  = buf[5]; /* 1 = LE, 2 = BE */
+
+    unsigned long e_shoff;
+    unsigned int  e_shentsize, e_shnum;
+
+    if (ei_class == 2) { /* 64-bit */
+        e_shoff     = elf_read64(buf, 40, ei_data);
+        e_shentsize = elf_read16(buf, 58, ei_data);
+        e_shnum     = elf_read16(buf, 60, ei_data);
+    } else if (ei_class == 1) { /* 32-bit */
+        e_shoff     = elf_read32(buf, 32, ei_data);
+        e_shentsize = elf_read16(buf, 46, ei_data);
+        e_shnum     = elf_read16(buf, 48, ei_data);
+    } else {
+        return -1;
+    }
+
+    if (e_shoff == 0 || e_shnum == 0 || e_shentsize == 0)
+        return 1; /* no section headers at all → stripped */
+
+    /* If the entire section header table fits inside the buffer we already
+       have, scan it directly without re-reading the file. */
+    unsigned long sh_end = e_shoff + (unsigned long)e_shnum * e_shentsize;
+    if (sh_end <= (unsigned long)len) {
+        for (unsigned int i = 0; i < e_shnum; i++) {
+            unsigned long off = e_shoff + (unsigned long)i * e_shentsize;
+            unsigned int sh_type = elf_read32(buf, (int)off + 4, ei_data);
+            if (sh_type == 2) /* SHT_SYMTAB */
+                return 0; /* not stripped */
+        }
+        return 1; /* stripped */
+    }
+
+    /* Section headers are beyond our buffer – read them from file */
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+
+    int result = 1; /* assume stripped */
+    unsigned char shdr[64]; /* big enough for one Elf64_Shdr (64 bytes) */
+    for (unsigned int i = 0; i < e_shnum; i++) {
+        unsigned long off = e_shoff + (unsigned long)i * e_shentsize;
+        if (fseek(fp, (long)off, SEEK_SET) != 0) break;
+        int toread = (int)(e_shentsize < sizeof(shdr) ? e_shentsize : sizeof(shdr));
+        if ((int)fread(shdr, 1, toread, fp) < 8) break;
+        unsigned int sh_type = elf_read32(shdr, 4, ei_data);
+        if (sh_type == 2) { /* SHT_SYMTAB */
+            result = 0; /* not stripped */
+            break;
+        }
+    }
+    fclose(fp);
+    return result;
+}
+
+/*
+ * Scan ELF program headers for PT_INTERP (type 3) and PT_DYNAMIC (type 2).
+ * If PT_INTERP is found, the binary has an interpreter (dynamically linked).
+ * If PT_DYNAMIC is found without PT_INTERP, it's a shared library.
+ * interp_buf receives the interpreter path (null-terminated) when found.
+ */
+static void elf_scan_phdr(const unsigned char *buf, int len, const char *path,
+                          int *has_interp, int *has_dynamic,
+                          char *interp_buf, int interp_bufsz)
+{
+    *has_interp = 0;
+    *has_dynamic = 0;
+    interp_buf[0] = '\0';
+
+    if (len < 64) return;
+
+    int ei_class = buf[4];
+    int ei_data  = buf[5];
+
+    unsigned long e_phoff;
+    unsigned int  e_phentsize, e_phnum;
+
+    if (ei_class == 2) { /* 64-bit */
+        e_phoff     = elf_read64(buf, 32, ei_data);
+        e_phentsize = elf_read16(buf, 54, ei_data);
+        e_phnum     = elf_read16(buf, 56, ei_data);
+    } else if (ei_class == 1) { /* 32-bit */
+        e_phoff     = elf_read32(buf, 28, ei_data);
+        e_phentsize = elf_read16(buf, 42, ei_data);
+        e_phnum     = elf_read16(buf, 44, ei_data);
+    } else {
+        return;
+    }
+
+    if (e_phoff == 0 || e_phnum == 0 || e_phentsize == 0)
+        return;
+
+    /* Try to scan program headers from the buffer first */
+    unsigned long ph_end = e_phoff + (unsigned long)e_phnum * e_phentsize;
+    int need_file = (ph_end > (unsigned long)len);
+    FILE *fp = NULL;
+
+    if (need_file) {
+        fp = fopen(path, "r");
+        if (!fp) return;
+    }
+
+    unsigned char phdr[64]; /* enough for Elf64_Phdr (56 bytes) */
+    for (unsigned int i = 0; i < e_phnum; i++) {
+        unsigned long off = e_phoff + (unsigned long)i * e_phentsize;
+        const unsigned char *p;
+
+        if (!need_file && off + e_phentsize <= (unsigned long)len) {
+            p = buf + off;
+        } else if (fp) {
+            if (fseek(fp, (long)off, SEEK_SET) != 0) break;
+            int toread = (int)(e_phentsize < sizeof(phdr) ? e_phentsize : sizeof(phdr));
+            if ((int)fread(phdr, 1, toread, fp) < 8) break;
+            p = phdr;
+        } else {
+            break;
+        }
+
+        unsigned int p_type = elf_read32(p, 0, ei_data);
+
+        if (p_type == 2) /* PT_DYNAMIC */
+            *has_dynamic = 1;
+
+        if (p_type == 3) { /* PT_INTERP */
+            *has_interp = 1;
+            /* Read interpreter string */
+            unsigned long p_offset, p_filesz;
+            if (ei_class == 2) {
+                p_offset = elf_read64(p, 8, ei_data);
+                p_filesz = elf_read64(p, 32, ei_data);
+            } else {
+                p_offset = elf_read32(p, 4, ei_data);
+                p_filesz = elf_read32(p, 16, ei_data);
+            }
+            if (p_filesz > 0 && p_filesz < (unsigned long)(interp_bufsz - 1)) {
+                if (p_offset + p_filesz <= (unsigned long)len) {
+                    memcpy(interp_buf, buf + p_offset, p_filesz);
+                    interp_buf[p_filesz] = '\0';
+                } else if (fp) {
+                    if (fseek(fp, (long)p_offset, SEEK_SET) == 0) {
+                        int nr = (int)fread(interp_buf, 1, (int)p_filesz, fp);
+                        interp_buf[nr] = '\0';
+                    }
+                }
+            }
+        }
+    }
+
+    if (fp) fclose(fp);
+}
+
+static void describe_elf(const unsigned char *buf, int len, const char *path,
+                         char *out, int outsz)
 {
     if (len < 20) {
         snprintf(out, outsz, "ELF (too short)");
@@ -172,17 +366,28 @@ static void describe_elf(const unsigned char *buf, int len, char *out, int outsz
     else if (buf[5] == 2) endian = "MSB";
     else endian = "unknown-endian";
 
-    const char *type;
     int etype;
     if (buf[5] == 1)
         etype = buf[16] | (buf[17] << 8);
     else
         etype = (buf[16] << 8) | buf[17];
 
+    /* Scan program headers for PT_INTERP and PT_DYNAMIC */
+    int has_interp = 0, has_dynamic = 0;
+    char interp_path[256];
+    interp_path[0] = '\0';
+    elf_scan_phdr(buf, len, path, &has_interp, &has_dynamic,
+                  interp_path, (int)sizeof(interp_path));
+
+    /*
+     * Determine type string.  ET_DYN (3) with a PT_INTERP segment is a
+     * position-independent executable, not a shared library.
+     */
+    const char *type;
     switch (etype) {
     case 1: type = "relocatable"; break;
     case 2: type = "executable"; break;
-    case 3: type = "shared object"; break;
+    case 3: type = has_interp ? "pie executable" : "shared object"; break;
     case 4: type = "core file"; break;
     default: type = "unknown type"; break;
     }
@@ -217,11 +422,28 @@ static void describe_elf(const unsigned char *buf, int len, char *out, int outsz
     default: osabi = "UNIX"; break;
     }
 
-    int stripped = 1; /* Default to stripped; proper detection would check section headers */
+    /* Linking info */
+    const char *link_str;
+    if (has_interp || has_dynamic)
+        link_str = "dynamically linked";
+    else
+        link_str = "statically linked";
 
-    snprintf(out, outsz, "ELF %s %s %s, %s, version %d (%s)%s",
-             bits, endian, type, machine, buf[6], osabi,
-             stripped ? ", not stripped" : ", stripped");
+    /* Stripped info */
+    int stripped = elf_is_stripped(buf, len, path);
+    const char *strip_str = "";
+    if (stripped == 1)       strip_str = ", stripped";
+    else if (stripped == 0)  strip_str = ", not stripped";
+
+    if (has_interp && interp_path[0]) {
+        snprintf(out, outsz, "ELF %s %s %s, %s, version %d (%s), %s, interpreter %s%s",
+                 bits, endian, type, machine, buf[6], osabi,
+                 link_str, interp_path, strip_str);
+    } else {
+        snprintf(out, outsz, "ELF %s %s %s, %s, version %d (%s), %s%s",
+                 bits, endian, type, machine, buf[6], osabi,
+                 link_str, strip_str);
+    }
 }
 
 /* ── Text analysis ──────────────────────────────────────────────────── */
@@ -518,7 +740,7 @@ static int classify_file(const char *filename, const char *display_name)
                 /* Special handling for ELF */
                 if (buf[0] == 0x7f && buf[1] == 'E' && buf[2] == 'L' && buf[3] == 'F') {
                     char elf_desc[256];
-                    describe_elf(buf, nread, elf_desc, sizeof(elf_desc));
+                    describe_elf(buf, nread, filename, elf_desc, sizeof(elf_desc));
                     printf("%s", elf_desc);
                 } else {
                     printf("%s", m->description);

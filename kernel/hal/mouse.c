@@ -8,6 +8,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/cursor.h"
+#include "../../include/kernel/tty.h"
 
 // Global mouse state
 static mouse_state_t mouse_state = {0};
@@ -439,6 +440,9 @@ static void mouse_process_packet(void)
         if(raw_z != 0) {
             // Forward wheel to console immediately
             console_handle_mouse_wheel((int)raw_z);
+            // Also report scroll to TTY as button 64|0 (up) or 64|1 (down)
+            // SGR scroll: Cb = 64 for scroll-up, 65 for scroll-down
+            tty_mouse_report_scroll(mouse_state.x, mouse_state.y, raw_z);
         }
     }
 
@@ -499,6 +503,13 @@ static void mouse_process_packet(void)
 
     // Forward button/position events to console for scrollbar interactions
     console_handle_mouse_event(mouse_state.x, mouse_state.y, mouse_state.left_button ? 1 : 0);
+
+    // Forward mouse events to TTY for terminal mouse tracking (SGR mode)
+    // Build current and previous button bitmask: bit0=left, bit1=right, bit2=middle
+    uint8_t cur_btns = (mouse_state.left_button ? 0x01 : 0) |
+                       (mouse_state.right_button ? 0x02 : 0) |
+                       (mouse_state.middle_button ? 0x04 : 0);
+    tty_mouse_report(mouse_state.x, mouse_state.y, cur_btns, mouse_state.last_buttons);
 
     // Reset packet index for next packet
     mouse_state.packet_index = 0;

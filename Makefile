@@ -5,6 +5,7 @@
 GCC = gcc
 LD = ld
 OBJCOPY = objcopy
+STRIP = strip
 DD = dd
 QEMU = qemu-system-x86_64
 XORRISO = xorriso
@@ -277,239 +278,315 @@ userland-testlib:
 # Copy shared libraries to build directory
 $(BUILD_DIR)/ld-likeos.so: userland-rtld | $(BUILD_DIR)
 	cp userland/rtld/ld-likeos.so $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libc.so: userland-libc | $(BUILD_DIR)
 	cp userland/libc/libc.so $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libtestlib.so: userland-testlib | $(BUILD_DIR)
 	cp userland/testlib/libtestlib.so $@
+	$(STRIP) --strip-unneeded $@
 
 # Build test programs using libc
 $(BUILD_DIR)/user_test.elf: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) test_syscalls
 	cp $(USER_DIR)/test_syscalls $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/test_libc: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) test_libc
 	cp $(USER_DIR)/test_libc $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/hello: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) hello
 	cp $(USER_DIR)/hello $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/sh: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) sh
 	cp $(USER_DIR)/sh $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/ls: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) ls
 	cp $(USER_DIR)/ls $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/cat: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) cat
 	cp $(USER_DIR)/cat $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/pwd: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) pwd
 	cp $(USER_DIR)/pwd $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/stat: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) stat
 	cp $(USER_DIR)/stat $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/progerr: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) progerr
 	cp $(USER_DIR)/progerr $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/testmem: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) testmem
 	cp $(USER_DIR)/testmem $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/memstat: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) memstat
 	cp $(USER_DIR)/memstat $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/teststress: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) teststress
 	cp $(USER_DIR)/teststress $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/uname: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) uname
 	cp $(USER_DIR)/uname $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/shutdown: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) shutdown
 	cp $(USER_DIR)/shutdown $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/poweroff: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) poweroff
 	cp $(USER_DIR)/poweroff $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/ps: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) ps
 	cp $(USER_DIR)/ps $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/cp: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) cp
 	cp $(USER_DIR)/cp $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/mv: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) mv
 	cp $(USER_DIR)/mv $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/rm: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) rm
 	cp $(USER_DIR)/rm $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/mkdir: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) mkdir
 	cp $(USER_DIR)/mkdir $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/rmdir: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) rmdir
 	cp $(USER_DIR)/rmdir $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/touch: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) touch
 	cp $(USER_DIR)/touch $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/more: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) more
 	cp $(USER_DIR)/more $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/less: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) less
 	cp $(USER_DIR)/less $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/clear: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) clear
 	cp $(USER_DIR)/clear $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/env: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) env
 	cp $(USER_DIR)/env $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/kill: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) kill
 	cp $(USER_DIR)/kill $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/find: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) find
 	cp $(USER_DIR)/find $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/df: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) df
 	cp $(USER_DIR)/df $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/du: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) du
 	cp $(USER_DIR)/du $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/hexdump: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) hexdump
 	cp $(USER_DIR)/hexdump $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/sleep: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) sleep
 	cp $(USER_DIR)/sleep $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/strings: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) strings
 	cp $(USER_DIR)/strings $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/file: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) file
 	cp $(USER_DIR)/file $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/grep: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) grep
 	cp $(USER_DIR)/grep $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/wc: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) wc
 	cp $(USER_DIR)/wc $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/head: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) head
 	cp $(USER_DIR)/head $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/tail: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tail
 	cp $(USER_DIR)/tail $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/echo: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) echo
 	cp $(USER_DIR)/echo $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/printf: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) printf
 	cp $(USER_DIR)/printf $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/free: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) free
 	cp $(USER_DIR)/free $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/uptime: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) uptime
 	cp $(USER_DIR)/uptime $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/dmesg: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) dmesg
 	cp $(USER_DIR)/dmesg $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/which: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) which
 	cp $(USER_DIR)/which $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/date: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) date
 	cp $(USER_DIR)/date $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/time: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) time
 	cp $(USER_DIR)/time $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/sort: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) sort
 	cp $(USER_DIR)/sort $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/uniq: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) uniq
 	cp $(USER_DIR)/uniq $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/cut: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) cut
 	cp $(USER_DIR)/cut $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/tr: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tr
 	cp $(USER_DIR)/tr $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/yes: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) yes
 	cp $(USER_DIR)/yes $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/true: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) true
 	cp $(USER_DIR)/true $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/false: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) false
 	cp $(USER_DIR)/false $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/top: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) top
 	cp $(USER_DIR)/top $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/man: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) man
 	cp $(USER_DIR)/man $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/reboot: $(BUILD_DIR)/poweroff | $(BUILD_DIR)
 	cp $(BUILD_DIR)/poweroff $@
 
 $(BUILD_DIR)/halt: $(BUILD_DIR)/poweroff | $(BUILD_DIR)
 	cp $(BUILD_DIR)/poweroff $@
+
+# Build ncurses shared library (custom LikeOS ANSI escape implementation)
+.PHONY: ports-ncurses
+ports-ncurses: userland-libc
+	$(MAKE) -C ports/lib/ncurses-likeos
+
+$(BUILD_DIR)/ncurses.so: ports-ncurses | $(BUILD_DIR)
+	cp ports/lib/ncurses-likeos/ncurses.so $@
+	$(STRIP) --strip-unneeded $@
+
+# Build GNU nano (ported to LikeOS)
+.PHONY: ports-nano
+ports-nano: userland-libc userland-rtld ports-ncurses
+	$(MAKE) -C ports/nano-8.3 -f Makefile.likeos
+
+$(BUILD_DIR)/nano: ports-nano | $(BUILD_DIR)
+	cp ports/nano-8.3/nano $@
+	$(STRIP) --strip-unneeded $@
 
 # Build kernel ELF
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel.lds | $(BUILD_DIR)
@@ -571,7 +648,7 @@ $(ISO_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) | $(BUILD_DIR)
 	@echo "UEFI bootable ISO created: $(ISO_IMAGE)"
 
 # Create UEFI bootable FAT image (for direct use)
-$(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
+$(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/nano $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
 	@echo "Creating UEFI bootable FAT image..."
 	
 	# Create a 64MB FAT32 image
@@ -637,6 +714,7 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/false ::/bin/false
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/top ::/bin/top
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/man ::/bin/man
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/nano ::/bin/nano
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr || true
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr/local || true
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr/local/bin || true
@@ -650,6 +728,7 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/lib || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/ld-likeos.so ::/lib/ld-likeos.so
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libc.so ::/lib/libc.so
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/ncurses.so ::/lib/ncurses.so
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libtestlib.so ::/lib/libtestlib.so
 	# Add system font resource
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/res || true
@@ -665,6 +744,10 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/tmp || true
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/etc || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) /etc/services ::/etc/services
+	# Add nano system config and syntax highlighting files
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) res/nanorc ::/etc/nanorc
+	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr/share/nano || true
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) ports/nano-8.3/syntax/*.nanorc ::/usr/share/nano/
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/LIKEOS.SIG ::/LIKEOS.SIG
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/HELLO.TXT ::/HELLO.TXT
 	rm -f $(BUILD_DIR)/LIKEOS.SIG $(BUILD_DIR)/HELLO.TXT || true
@@ -689,7 +772,7 @@ qemu-fat: $(FAT_IMAGE)
 
 # Standalone USB mass storage data image (64MB FAT32) now mirrors usb-write target (UEFI bootable + signature files)
 # Provides: EFI/BOOT/BOOTX64.EFI, kernel.elf, LIKEOS.SIG, HELLO.TXT, tests
-$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
+$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/nano $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
 	@echo "Creating USB data FAT32 image (msdata.img, 64MB, UEFI bootable)..."
 	$(DD) if=/dev/zero of=$(DATA_IMAGE) bs=1M count=64
 	$(MKFS_FAT) -F32 -n "MSDATA" $(DATA_IMAGE)
@@ -760,10 +843,12 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/false ::/bin/false
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/top ::/bin/top
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/man ::/bin/man
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/nano ::/bin/nano
 	# Create /lib directory and copy shared libraries
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/lib || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/ld-likeos.so ::/lib/ld-likeos.so
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/libc.so ::/lib/libc.so
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/ncurses.so ::/lib/ncurses.so
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/libtestlib.so ::/lib/libtestlib.so
 	# Add system font resource
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/res || true
@@ -779,6 +864,10 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/tmp || true
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/etc || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) /etc/services ::/etc/services
+	# Add nano system config and syntax highlighting files
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/nanorc ::/etc/nanorc
+	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/usr/share/nano || true
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) ports/nano-8.3/syntax/*.nanorc ::/usr/share/nano/
 	# Add signature + sample files
 	echo "THIS IS A DEVICE STORING LIKEOS" > $(BUILD_DIR)/LIKEOS.SIG
 	echo "Hello from USB mass storage" > $(BUILD_DIR)/HELLO.TXT
@@ -860,7 +949,7 @@ qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)
 
 # Write ISO to USB device with GPT partition table (like Rufus)
 # Usage: make usb-write USB_DEVICE=/dev/sdX
-usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/libtestlib.so
+usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/nano $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libtestlib.so
 	@if [ -z "$(USB_DEVICE)" ]; then \
 		echo "Error: USB_DEVICE not specified. Usage: make usb-write USB_DEVICE=/dev/sdX"; \
 		echo "Available devices:"; \
@@ -902,6 +991,14 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo mkdir -p /tmp/likeos_usb_mount/etc
 	sudo mkdir -p /tmp/likeos_usb_mount/usr/local/bin
 	sudo cp /etc/services /tmp/likeos_usb_mount/etc/services
+	
+	# Add nano system config and syntax highlighting files
+	sudo cp res/nanorc /tmp/likeos_usb_mount/etc/nanorc
+	sudo mkdir -p /tmp/likeos_usb_mount/usr/share/nano
+	sudo cp ports/nano-8.3/syntax/*.nanorc /tmp/likeos_usb_mount/usr/share/nano/
+	
+	# Strip all binaries and shared libraries
+	sudo find /tmp/likeos_usb_mount/bin /tmp/likeos_usb_mount/lib /tmp/likeos_usb_mount/usr -type f -exec strip --strip-unneeded {} \; 2>/dev/null || true
 	
 	# Copy bootloader and kernel
 	sudo cp $(BOOTLOADER_EFI) /tmp/likeos_usb_mount/EFI/BOOT/BOOTX64.EFI
@@ -967,6 +1064,7 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo cp $(BUILD_DIR)/false /tmp/likeos_usb_mount/bin/false
 	sudo cp $(BUILD_DIR)/top /tmp/likeos_usb_mount/bin/top
 	sudo cp $(BUILD_DIR)/man /tmp/likeos_usb_mount/bin/man
+	sudo cp $(BUILD_DIR)/nano /tmp/likeos_usb_mount/bin/nano
 	sudo cp $(BUILD_DIR)/hello /tmp/likeos_usb_mount/usr/local/bin/hello
 	sudo cp $(BUILD_DIR)/test_libc /tmp/likeos_usb_mount/usr/local/bin/testlibc
 	sudo cp $(BUILD_DIR)/user_test.elf /tmp/likeos_usb_mount/usr/local/bin/tests
@@ -978,6 +1076,7 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	# Copy shared libraries to /lib
 	sudo cp $(BUILD_DIR)/ld-likeos.so /tmp/likeos_usb_mount/lib/ld-likeos.so
 	sudo cp $(BUILD_DIR)/libc.so /tmp/likeos_usb_mount/lib/libc.so
+	sudo cp $(BUILD_DIR)/ncurses.so /tmp/likeos_usb_mount/lib/ncurses.so
 	sudo cp $(BUILD_DIR)/libtestlib.so /tmp/likeos_usb_mount/lib/libtestlib.so
 
 	# Create signature file and sample hello on target (mirrors data image contents)
@@ -1022,6 +1121,8 @@ clean:
 	$(MAKE) -C userland/rtld clean
 	$(MAKE) -C userland/testlib clean
 	$(MAKE) -C user clean
+	$(MAKE) -C ports/lib/ncurses-likeos clean
+	$(MAKE) -C ports/nano-8.3 -f Makefile.likeos clean
 
 # Install dependencies (Ubuntu/Debian)
 deps:

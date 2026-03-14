@@ -7,6 +7,10 @@
 #define MAX_ENV_VARS 128
 #define MAX_ENV_SIZE 4096
 
+/* Multibyte character maximum - single-byte locale only */
+#define MB_CUR_MAX  1
+#define MB_LEN_MAX  1
+
 // Memory allocation
 void* malloc(size_t size);
 void* calloc(size_t nmemb, size_t size);
@@ -55,6 +59,8 @@ int abs(int n);
 long labs(long n);
 void qsort(void* base, size_t nmemb, size_t size, int (*compar)(const void*, const void*));
 void* bsearch(const void* key, const void* base, size_t nmemb, size_t size, int (*compar)(const void*, const void*));
+int mkstemp(char* templ);
+int mkstemps(char* templ, int suffixlen);
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1

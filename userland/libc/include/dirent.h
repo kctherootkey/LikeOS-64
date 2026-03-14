@@ -32,5 +32,6 @@ typedef struct {
 DIR* opendir(const char* name);
 struct dirent* readdir(DIR* dirp);
 int closedir(DIR* dirp);
+void rewinddir(DIR* dirp);
 
 #endif

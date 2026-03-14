@@ -1,0 +1,95 @@
+# Makefile.likeos - Build GNU nano 8.3 for LikeOS
+#
+# This compiles nano's source files + a minimal gnulib subset
+# and links against LikeOS libc.so + ncurses.so.
+
+CC = gcc
+LD = ld
+
+LIBC_DIR  = ../../userland/libc
+RTLD_DIR  = ../../userland/rtld
+NCURSES_DIR = ../lib/ncurses-likeos
+
+# nano source directory
+SRCDIR = src
+# gnulib directory
+LIBDIR = lib
+
+CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fno-stack-protector \
+         -mno-red-zone -ffreestanding -fPIE \
+         -DHAVE_CONFIG_H \
+         -I. \
+         -I$(LIBDIR) \
+         -I$(LIBC_DIR)/include \
+         -I$(NCURSES_DIR) \
+         -D_GNU_SOURCE
+
+# Suppress warnings from gnulib code (it's external)
+GNULIB_CFLAGS = $(CFLAGS) -Wno-unused-parameter -Wno-sign-compare \
+                -Wno-missing-field-initializers -Wno-type-limits \
+                -Wno-unused-variable -Wno-implicit-fallthrough \
+                -Wno-unused-but-set-variable -Wno-old-style-definition \
+                -DGNULIB_REGEX_SINGLE_THREAD
+
+# nano source files
+NANO_SRC = $(SRCDIR)/browser.c \
+           $(SRCDIR)/chars.c \
+           $(SRCDIR)/color.c \
+           $(SRCDIR)/cut.c \
+           $(SRCDIR)/files.c \
+           $(SRCDIR)/global.c \
+           $(SRCDIR)/help.c \
+           $(SRCDIR)/history.c \
+           $(SRCDIR)/move.c \
+           $(SRCDIR)/nano.c \
+           $(SRCDIR)/prompt.c \
+           $(SRCDIR)/rcfile.c \
+           $(SRCDIR)/search.c \
+           $(SRCDIR)/text.c \
+           $(SRCDIR)/utils.c \
+           $(SRCDIR)/winio.c
+
+# gnulib source files (minimal subset needed by nano)
+GNULIB_SRC = $(LIBDIR)/regex.c \
+             $(LIBDIR)/malloc/dynarray_resize.c \
+             $(LIBDIR)/malloc/dynarray_at_failure.c \
+             $(LIBDIR)/malloc/dynarray_emplace_enlarge.c \
+             $(LIBDIR)/malloc/dynarray_finalize.c \
+             $(LIBDIR)/malloc/dynarray_resize_clear.c
+
+# Object files
+NANO_OBJ = $(NANO_SRC:.c=.o)
+GNULIB_OBJ = $(GNULIB_SRC:.c=.o)
+
+# Link flags (PIE binary linked against libc.so + ncurses.so)
+LDFLAGS = -pie -nostdlib -T ../../user/user_dyn.lds --hash-style=gnu \
+          -z now \
+          -rpath /lib -dynamic-linker /lib/ld-likeos.so \
+          -L$(LIBC_DIR) -L$(RTLD_DIR) -L$(NCURSES_DIR)
+
+CRT1 = $(LIBC_DIR)/crt1.o
+LIBS = -lc -l:ncurses.so -l:ld-likeos.so
+
+# Output
+TARGET = nano
+
+all: $(TARGET)
+
+$(TARGET): $(CRT1) $(NANO_OBJ) $(GNULIB_OBJ)
+	$(LD) $(LDFLAGS) $(CRT1) $(NANO_OBJ) $(GNULIB_OBJ) $(LIBS) -o $@
+
+# Compile nano source files
+$(SRCDIR)/%.o: $(SRCDIR)/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Compile gnulib source files (with relaxed warnings)
+$(LIBDIR)/%.o: $(LIBDIR)/%.c
+	$(CC) $(GNULIB_CFLAGS) -c $< -o $@
+
+$(LIBDIR)/malloc/%.o: $(LIBDIR)/malloc/%.c
+	$(CC) $(GNULIB_CFLAGS) -c $< -o $@
+
+clean:
+	rm -f $(NANO_OBJ) $(GNULIB_OBJ) $(TARGET)
+
+.PHONY: all clean

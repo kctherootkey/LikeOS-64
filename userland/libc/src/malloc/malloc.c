@@ -66,7 +66,7 @@ static block_t* request_space(block_t* last, size_t size) {
 
 void* malloc(size_t size) {
     if (size == 0) {
-        return NULL;
+        size = 1;
     }
     
     size = align8(size);

@@ -456,7 +456,8 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
             sched_signal_task(cur, SIGTTIN);
             return -EIO;
         }
-        return tty_read(tty, (void*)buf, (long)count, 0);
+        int nonblock = (cur->console_flags & O_NONBLOCK) ? 1 : 0;
+        return tty_read(tty, (void*)buf, (long)count, nonblock);
     }
     if (!file) {
         return -EBADF;
@@ -473,7 +474,8 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
             sched_signal_task(cur, SIGTTIN);
             return -EIO;
         }
-        return tty_read(tty, (void*)buf, (long)count, 0);
+        int nonblock = (cur->console_flags & O_NONBLOCK) ? 1 : 0;
+        return tty_read(tty, (void*)buf, (long)count, nonblock);
     } else if (marker == 2 || marker == 3) {
         // Can't read from stdout/stderr
         return -EBADF;
@@ -1111,10 +1113,12 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
     // (implicit console fd). If fd_table has a real file/pipe, skip this.
     if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
         if (cmd == 3) { // F_GETFL
-            if (fd == STDIN_FD) return O_RDONLY;
-            return O_WRONLY;
+            uint32_t fl = (fd == STDIN_FD) ? O_RDONLY : O_WRONLY;
+            fl |= (cur->console_flags & O_NONBLOCK);
+            return fl;
         }
         if (cmd == 4) { // F_SETFL
+            cur->console_flags = (cur->console_flags & ~O_NONBLOCK) | ((uint32_t)arg & O_NONBLOCK);
             return 0;
         }
         return -EINVAL;

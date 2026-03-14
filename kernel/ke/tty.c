@@ -5,6 +5,7 @@
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/signal.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/timer.h"
 
 #define TTY_MAX_PTYS 16
 
@@ -168,6 +169,31 @@ static void ansi_apply_sgr(void) {
     }
     for (int i = 0; i < g_ansi_nparam; i++) {
         int p = g_ansi_params[i];
+        if (p == 38 && (i + 2) < g_ansi_nparam && g_ansi_params[i + 1] == 5) {
+            /* 256-color foreground: 38;5;N */
+            int n = g_ansi_params[i + 2] & 0xFF;
+            if (n < 16) {
+                /* Map 0-7 through the ANSI→VGA table, 8-15 as bright */
+                g_cur_vga_fg = (n < 8) ? ansi_to_vga_fg[n] : (ansi_to_vga_fg[n - 8] + 8);
+            } else {
+                /* Extended 256-color: approximate to nearest VGA color */
+                g_cur_vga_fg = (n < 232) ? (uint8_t)((n - 16) % 8) : ((n - 232) >= 12 ? 15 : 7);
+            }
+            if (g_ansi_bold && g_cur_vga_fg < 8) g_cur_vga_fg += 8;
+            i += 2;  /* skip the '5' and 'N' params */
+            continue;
+        }
+        if (p == 48 && (i + 2) < g_ansi_nparam && g_ansi_params[i + 1] == 5) {
+            /* 256-color background: 48;5;N */
+            int n = g_ansi_params[i + 2] & 0xFF;
+            if (n < 16) {
+                g_cur_vga_bg = (n < 8) ? ansi_to_vga_fg[n] : (ansi_to_vga_fg[n - 8] + 8);
+            } else {
+                g_cur_vga_bg = (n < 232) ? (uint8_t)((n - 16) % 8) : ((n - 232) >= 12 ? 15 : 7);
+            }
+            i += 2;
+            continue;
+        }
         if (p == 0) {
             /* Reset */
             g_cur_vga_fg = 15; /* white */
@@ -318,12 +344,28 @@ static void tty_output_console(tty_t* tty, char c) {
         } else if (g_ansi_private && (ch == 'h' || ch == 'l')) {
             /* DEC Private Mode Set/Reset: ESC [ ? Ps h / ESC [ ? Ps l */
             int mode = (g_ansi_nparam >= 1) ? g_ansi_params[0] : 0;
+            int enable = (ch == 'h') ? 1 : 0;
             if (mode == 25) {
                 /* DECTCEM — Text Cursor Enable Mode */
-                if (ch == 'h')
+                if (enable)
                     console_cursor_enable();   /* show cursor */
                 else
                     console_cursor_disable();  /* hide cursor */
+            } else if (mode == 1000) {
+                /* Normal mouse tracking */
+                g_console_tty.mouse_tracking = enable;
+                if (!enable) {
+                    g_console_tty.mouse_btn_event = 0;
+                    g_console_tty.mouse_sgr_mode = 0;
+                }
+            } else if (mode == 1002) {
+                /* Button-event mouse tracking */
+                g_console_tty.mouse_btn_event = enable;
+                if (!enable)
+                    g_console_tty.mouse_sgr_mode = 0;
+            } else if (mode == 1006) {
+                /* SGR extended mouse mode */
+                g_console_tty.mouse_sgr_mode = enable;
             }
             /* Other DEC private modes silently ignored */
         }
@@ -383,6 +425,8 @@ static void tty_set_default_termios(tty_t* tty) {
     tty->term.c_cc[VSTART] = 17; // Ctrl+Q
     tty->term.c_cc[VSTOP] = 19;  // Ctrl+S
     tty->term.c_cc[VSUSP] = 26;  // Ctrl+Z
+    tty->term.c_cc[VMIN] = 1;    // Block until at least 1 byte available
+    tty->term.c_cc[VTIME] = 0;   // No timeout
 }
 
 void tty_init(void) {
@@ -428,6 +472,184 @@ static void tty_signal_pgrp(tty_t* tty, int sig) {
     }
     sched_signal_pgrp(tty->fg_pgid, sig);
     // Wake any blocked readers so they can see they've been signaled/killed
+    tty_wake_readers(&tty->read_waiters);
+}
+
+void tty_input_char_raw(tty_t* tty, char c) {
+    if (!tty) return;
+    tty_enqueue_read(tty, c);
+    tty_wake_readers(&tty->read_waiters);
+}
+
+/* Helper: inject a string into the TTY read buffer (raw, no line discipline) */
+static void tty_inject_string(tty_t* tty, const char* s) {
+    while (*s) {
+        tty_enqueue_read(tty, *s++);
+    }
+}
+
+/* Simple integer-to-decimal helper for escape sequence generation */
+static int itoa_simple(int val, char* buf) {
+    if (val < 0) val = 0;
+    char tmp[12];
+    int len = 0;
+    if (val == 0) { tmp[len++] = '0'; }
+    else {
+        while (val > 0) {
+            tmp[len++] = '0' + (val % 10);
+            val /= 10;
+        }
+    }
+    /* reverse */
+    for (int i = 0; i < len; i++) buf[i] = tmp[len - 1 - i];
+    buf[len] = '\0';
+    return len;
+}
+
+/*
+ * tty_mouse_report - Generate SGR mouse escape sequences from mouse events.
+ * Called from the mouse IRQ handler when mouse tracking modes are enabled.
+ *
+ * pixel_x, pixel_y: mouse position in pixels
+ * buttons: current button state bitmask (bit0=left, bit1=right, bit2=middle)
+ * prev_buttons: previous button state bitmask (for detecting press/release)
+ *
+ * SGR format: \033[<Cb;Cx;CyM  (press) or \033[<Cb;Cx;Cym  (release)
+ *   Cb: 0=left, 1=middle, 2=right, +32=motion, +64=scroll
+ *   Cx, Cy: 1-based cell coordinates
+ */
+void tty_mouse_report(int pixel_x, int pixel_y, uint8_t buttons, uint8_t prev_buttons) {
+    tty_t* tty = &g_console_tty;
+
+    /* Only report if mouse tracking is enabled */
+    if (!tty->mouse_tracking && !tty->mouse_btn_event)
+        return;
+
+    /* Convert pixel coordinates to cell coordinates (1-based) */
+    uint32_t rows, cols;
+    console_get_dimensions(&rows, &cols);
+    if (rows == 0 || cols == 0) return;
+
+    /* Get character dimensions: default 8x16 but use actual from console */
+    uint32_t cw = 8, ch = 16;  /* default char size */
+    /* We use screen_width/cols and screen_height/rows for cell size */
+    /* Actually, use console char dimensions directly */
+    extern uint32_t char_width;
+    extern uint32_t char_height;
+    cw = char_width;
+    ch = char_height;
+    if (cw == 0) cw = 8;
+    if (ch == 0) ch = 16;
+
+    int cx = (pixel_x / (int)cw) + 1;  /* 1-based column */
+    int cy = (pixel_y / (int)ch) + 1;  /* 1-based row */
+    if (cx < 1) cx = 1;
+    if (cy < 1) cy = 1;
+    if (cx > (int)cols) cx = (int)cols;
+    if (cy > (int)rows) cy = (int)rows;
+
+    /* Detect button changes */
+    uint8_t pressed  = buttons & ~prev_buttons;  /* newly pressed */
+    uint8_t released = prev_buttons & ~buttons;  /* newly released */
+    int motion = (buttons == prev_buttons) && (buttons != 0);
+
+    /* Helper macro for building and injecting an SGR mouse sequence */
+    #define INJECT_SGR_MOUSE(cb_val, is_release) do { \
+        char seq[32]; \
+        int pos = 0; \
+        seq[pos++] = '\033'; \
+        seq[pos++] = '['; \
+        seq[pos++] = '<'; \
+        pos += itoa_simple(cb_val, seq + pos); \
+        seq[pos++] = ';'; \
+        pos += itoa_simple(cx, seq + pos); \
+        seq[pos++] = ';'; \
+        pos += itoa_simple(cy, seq + pos); \
+        seq[pos++] = (is_release) ? 'm' : 'M'; \
+        seq[pos] = '\0'; \
+        tty_inject_string(tty, seq); \
+    } while(0)
+
+    /* Report button presses */
+    if (pressed & 0x01) {         /* left press */
+        INJECT_SGR_MOUSE(0, 0);
+    }
+    if (pressed & 0x04) {         /* middle press */
+        INJECT_SGR_MOUSE(1, 0);
+    }
+    if (pressed & 0x02) {         /* right press */
+        INJECT_SGR_MOUSE(2, 0);
+    }
+
+    /* Report button releases */
+    if (released & 0x01) {        /* left release */
+        INJECT_SGR_MOUSE(0, 1);
+    }
+    if (released & 0x04) {        /* middle release */
+        INJECT_SGR_MOUSE(1, 1);
+    }
+    if (released & 0x02) {        /* right release */
+        INJECT_SGR_MOUSE(2, 1);
+    }
+
+    /* Report motion with button held (mode 1002: button-event tracking) */
+    if (motion && tty->mouse_btn_event) {
+        int cb = 32;  /* motion flag */
+        if (buttons & 0x01) cb |= 0;       /* left + motion */
+        else if (buttons & 0x04) cb |= 1;  /* middle + motion */
+        else if (buttons & 0x02) cb |= 2;  /* right + motion */
+        INJECT_SGR_MOUSE(cb, 0);
+    }
+
+    #undef INJECT_SGR_MOUSE
+
+    /* Wake readers waiting for input */
+    if (pressed || released || (motion && tty->mouse_btn_event))
+        tty_wake_readers(&tty->read_waiters);
+}
+
+/*
+ * tty_mouse_report_scroll - Generate SGR mouse escape for scroll wheel events.
+ * scroll_delta: negative = scroll up, positive = scroll down
+ */
+void tty_mouse_report_scroll(int pixel_x, int pixel_y, int scroll_delta) {
+    tty_t* tty = &g_console_tty;
+
+    if (!tty->mouse_tracking && !tty->mouse_btn_event)
+        return;
+
+    uint32_t rows, cols;
+    console_get_dimensions(&rows, &cols);
+    if (rows == 0 || cols == 0) return;
+
+    extern uint32_t char_width;
+    extern uint32_t char_height;
+    uint32_t cw = char_width ? char_width : 8;
+    uint32_t ch = char_height ? char_height : 16;
+
+    int cx = (pixel_x / (int)cw) + 1;
+    int cy = (pixel_y / (int)ch) + 1;
+    if (cx < 1) cx = 1;
+    if (cy < 1) cy = 1;
+    if (cx > (int)cols) cx = (int)cols;
+    if (cy > (int)rows) cy = (int)rows;
+
+    /* SGR scroll: Cb=64 for scroll-up, Cb=65 for scroll-down */
+    int cb = (scroll_delta < 0) ? 64 : 65;
+
+    char seq[32];
+    int pos = 0;
+    seq[pos++] = '\033';
+    seq[pos++] = '[';
+    seq[pos++] = '<';
+    pos += itoa_simple(cb, seq + pos);
+    seq[pos++] = ';';
+    pos += itoa_simple(cx, seq + pos);
+    seq[pos++] = ';';
+    pos += itoa_simple(cy, seq + pos);
+    seq[pos++] = 'M';
+    seq[pos] = '\0';
+    tty_inject_string(tty, seq);
     tty_wake_readers(&tty->read_waiters);
 }
 
@@ -554,6 +776,26 @@ long tty_read(tty_t* tty, void* buf, long count, int nonblock) {
     char* out = (char*)buf;
     long read = 0;
 
+    /* In non-canonical mode, honour VMIN / VTIME (POSIX semantics).
+     * VMIN=0, VTIME=0 → never block (return 0 if nothing available).
+     * VMIN=0, VTIME>0 → wait up to VTIME*100ms for a byte, then return 0.
+     * VMIN>0, VTIME=0 → block until VMIN bytes available (default). */
+    int vmin_zero = 0;
+    uint64_t vtime_deadline = 0; /* 0 = no deadline */
+    if (!(tty->term.c_lflag & ICANON) && tty->term.c_cc[VMIN] == 0) {
+        vmin_zero = 1;
+        unsigned char vtime = tty->term.c_cc[VTIME];
+        if (vtime > 0) {
+            /* VTIME is in tenths of a second; compute deadline in ticks */
+            uint32_t freq = timer_get_frequency();
+            uint64_t timeout_ticks = ((uint64_t)vtime * freq + 9) / 10;
+            vtime_deadline = timer_ticks() + timeout_ticks;
+        } else {
+            /* VMIN=0, VTIME=0: pure non-blocking */
+            nonblock = 1;
+        }
+    }
+
     while (read < count) {
         // Check if we've been killed or have a pending signal
         if (cur && (cur->state == TASK_ZOMBIE || signal_pending(cur))) {
@@ -571,6 +813,26 @@ long tty_read(tty_t* tty, void* buf, long count, int nonblock) {
         if (!tty_dequeue_read(tty, &c)) {
             if (read > 0 || nonblock) {
                 break;
+            }
+            /* VMIN=0, VTIME>0: timed wait — block with a deadline */
+            if (vtime_deadline && cur) {
+                if (timer_ticks() >= vtime_deadline) {
+                    break; /* timeout expired, return 0 */
+                }
+                cur->state = TASK_BLOCKED;
+                cur->wakeup_tick = vtime_deadline;
+                cur->wait_next = tty->read_waiters;
+                cur->wait_channel = tty;
+                tty->read_waiters = cur;
+                sched_schedule();
+                if (cur->state == TASK_ZOMBIE || cur->has_exited || signal_pending(cur)) {
+                    if (signal_pending(cur)) {
+                        return read > 0 ? read : -EINTR;
+                    }
+                    return read > 0 ? read : -EINTR;
+                }
+                /* Woke up — could be data arrival or timeout; loop to check */
+                continue;
             }
             if (cur) {
                 cur->state = TASK_BLOCKED;
@@ -599,6 +861,10 @@ long tty_read(tty_t* tty, void* buf, long count, int nonblock) {
         }
     }
 
+    /* O_NONBLOCK with no data → EAGAIN; VMIN=0 with no data → 0 */
+    if (read == 0 && nonblock && !vmin_zero) {
+        return -EAGAIN;
+    }
     return read;
 }
 

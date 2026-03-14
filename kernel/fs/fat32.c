@@ -2963,6 +2963,17 @@ static long fat32_readdir_impl(vfs_file_t* f, void* buf, long bytes)
     int lfn_seq_expected = 0;
     uint8_t lfn_checksum = 0;
 
+    // Track start of current LFN sequence so we can rewind on buffer-full.
+    // If the output buffer is exhausted at a short-name entry whose preceding
+    // LFN entries were already consumed in THIS call, the next call would lose
+    // the local LFN state and fall back to the 8.3 name.  By saving the
+    // position of the first LFN entry (the one with FAT32_LFN_LAST_ENTRY set)
+    // we can rewind there instead, so the next call re-processes the whole
+    // LFN sequence.
+    int have_lfn_start = 0;
+    unsigned long lfn_start_cluster = cluster;
+    unsigned int lfn_start_idx = idx;
+
     while (out_off + sizeof(struct linux_dirent64) + 2 < (unsigned)bytes) {
         if (cluster == 0 || cluster >= 0x0FFFFFF8) {
             ff->dir_iter_cluster = cluster;
@@ -2991,6 +3002,7 @@ static long fat32_readdir_impl(vfs_file_t* f, void* buf, long bytes)
                 lfn_buf[0] = '\0';
                 lfn_len = 0;
                 lfn_seq_expected = 0;
+                have_lfn_start = 0;
                 continue;
             }
             
@@ -3004,6 +3016,7 @@ static long fat32_readdir_impl(vfs_file_t* f, void* buf, long bytes)
                     lfn_buf[0] = '\0';
                     lfn_len = 0;
                     lfn_seq_expected = 0;
+                    have_lfn_start = 0;
                     continue;
                 }
                 
@@ -3013,6 +3026,12 @@ static long fat32_readdir_impl(vfs_file_t* f, void* buf, long bytes)
                         lfn_tmp[j] = 0;
                     lfn_seq_expected = ord;
                     lfn_checksum = l->checksum;
+                    // Remember where this LFN sequence starts so we can
+                    // rewind here if the output buffer fills up before the
+                    // corresponding short-name entry is written.
+                    lfn_start_cluster = cluster;
+                    lfn_start_idx = idx;
+                    have_lfn_start = 1;
                 }
                 
                 if (ord != lfn_seq_expected || l->checksum != lfn_checksum) {
@@ -3055,6 +3074,13 @@ static long fat32_readdir_impl(vfs_file_t* f, void* buf, long bytes)
             }
             
             // This is a short name entry
+            // For standalone short entries (no preceding LFN), record the
+            // rewind position as this entry itself.
+            if (!have_lfn_start) {
+                lfn_start_cluster = cluster;
+                lfn_start_idx = idx;
+            }
+
             // Verify LFN checksum
             if (lfn_buf[0] != '\0') {
                 uint8_t calc_checksum = fat32_lfn_checksum(ents[idx].name);
@@ -3093,8 +3119,11 @@ static long fat32_readdir_impl(vfs_file_t* f, void* buf, long bytes)
             uint64_t ino = ((uint64_t)ents[idx].fstClusHI << 16) | ents[idx].fstClusLO;
             uint8_t dtype = (ents[idx].attr & FAT32_ATTR_DIRECTORY) ? 4 : 8; /* DT_DIR=4, DT_REG=8 */
             if (!fat32_write_dirent64((char*)buf, (unsigned)bytes, &out_off, display_name, ino, dtype)) {
-                ff->dir_iter_cluster = cluster;
-                ff->dir_iter_index = idx;
+                // Buffer full – rewind to the start of the LFN sequence
+                // (or this entry itself for standalone short entries) so
+                // that the next readdir call re-processes the LFN entries.
+                ff->dir_iter_cluster = lfn_start_cluster;
+                ff->dir_iter_index = lfn_start_idx;
                 kfree(tmp);
                 return (long)out_off;
             }
@@ -3103,6 +3132,7 @@ static long fat32_readdir_impl(vfs_file_t* f, void* buf, long bytes)
             lfn_buf[0] = '\0';
             lfn_len = 0;
             lfn_seq_expected = 0;
+            have_lfn_start = 0;
         }
         kfree(tmp);
         unsigned long next = fat32_next_cluster_cached(ff->fs, cluster);

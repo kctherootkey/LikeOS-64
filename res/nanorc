@@ -1,0 +1,3 @@
+## /etc/nanorc - System-wide nano configuration for LikeOS
+## Include all available syntax highlighting definitions
+include "/usr/share/nano/*.nanorc"

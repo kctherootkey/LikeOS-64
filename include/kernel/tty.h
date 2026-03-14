@@ -32,6 +32,8 @@ typedef unsigned int speed_t;
 #define VSTART  5
 #define VSTOP   6
 #define VSUSP   7
+#define VMIN    8
+#define VTIME   9
 
 // ioctl request codes (Linux-compatible)
 #define TCGETS     0x5401
@@ -77,6 +79,12 @@ typedef struct tty {
     uint16_t read_count;
     uint8_t eof_pending;
 
+    // Mouse tracking state (DEC private modes)
+    uint8_t mouse_tracking;    // mode 1000: normal tracking
+    uint8_t mouse_btn_event;   // mode 1002: button-event tracking
+    uint8_t mouse_sgr_mode;    // mode 1006: SGR extended coordinates
+    uint8_t mouse_last_buttons; // last button state for release detection
+
     task_t* read_waiters;
 
     void (*output)(struct tty* tty, char c);
@@ -89,6 +97,11 @@ void tty_reset_termios(tty_t* tty);
 
 // Input from keyboard/pty master
 void tty_input_char(tty_t* tty, char c, int ctrl);
+void tty_input_char_raw(tty_t* tty, char c);
+
+// Mouse event reporting (called from mouse IRQ handler)
+void tty_mouse_report(int pixel_x, int pixel_y, uint8_t buttons, uint8_t prev_buttons);
+void tty_mouse_report_scroll(int pixel_x, int pixel_y, int scroll_delta);
 
 // Read/write for tty endpoints
 long tty_read(tty_t* tty, void* buf, long count, int nonblock);

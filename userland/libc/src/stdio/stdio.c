@@ -329,6 +329,44 @@ int putchar(int c) {
     return fputc(c, stdout);
 }
 
+int getc(FILE* stream) {
+    return fgetc(stream);
+}
+
+int putc(int c, FILE* stream) {
+    return fputc(c, stream);
+}
+
+FILE* fdopen(int fd, const char* mode) {
+    if (fd < 0 || !mode) return NULL;
+    
+    FILE* fp = malloc(sizeof(FILE));
+    if (!fp) return NULL;
+
+    int flags = 0;
+    switch (mode[0]) {
+        case 'r': flags = (mode[1] == '+') ? O_RDWR : O_RDONLY; break;
+        case 'w': flags = O_CREAT | O_TRUNC | ((mode[1] == '+') ? O_RDWR : O_WRONLY); break;
+        case 'a': flags = O_CREAT | O_APPEND | ((mode[1] == '+') ? O_RDWR : O_WRONLY); break;
+        default: free(fp); return NULL;
+    }
+
+    fp->fd = fd;
+    fp->buffer = malloc(BUFSIZ);
+    fp->buf_size = fp->buffer ? BUFSIZ : 0;
+    fp->buf_pos = 0;
+    fp->buf_end = 0;
+    fp->wbuf = malloc(BUFSIZ);
+    fp->wbuf_size = fp->wbuf ? BUFSIZ : 0;
+    fp->wbuf_pos = 0;
+    fp->buf_mode = _IOFBF;
+    fp->flags = flags;
+    fp->error = 0;
+    fp->eof = 0;
+    fp->ungetc_buf = -1;
+    return fp;
+}
+
 int fputs(const char* s, FILE* stream) {
     size_t len = strlen(s);
     if (fwrite(s, 1, len, stream) != len) {
@@ -998,6 +1036,180 @@ int printf(const char* format, ...) {
     va_list ap;
     va_start(ap, format);
     int ret = vfprintf(stdout, format, ap);
+    va_end(ap);
+    return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* sscanf / vsscanf - minimal implementation                           */
+/* Supports: %d, %i, %u, %x, %X, %o, %s, %c, %n, %ld, %li, %lu,    */
+/*           %lx, %hd, %hi, %hu, %hx, %hX, %[, width modifiers,     */
+/*           and the * (suppress) flag.                                */
+/* ------------------------------------------------------------------ */
+
+static int _is_space(int c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+static int _hex_val(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+int vsscanf(const char *str, const char *format, va_list ap)
+{
+    int matched = 0;
+    const char *s = str;
+
+    while (*format) {
+        if (_is_space((unsigned char)*format)) {
+            format++;
+            while (_is_space((unsigned char)*s)) s++;
+            continue;
+        }
+
+        if (*format != '%') {
+            if (*s != *format) break;
+            s++; format++;
+            continue;
+        }
+
+        format++; /* skip '%' */
+        if (*format == '%') { if (*s == '%') { s++; format++; continue; } else break; }
+
+        int suppress = 0;
+        if (*format == '*') { suppress = 1; format++; }
+
+        /* width */
+        int width = 0;
+        while (*format >= '0' && *format <= '9')
+            width = width * 10 + (*format++ - '0');
+        if (width == 0) width = -1; /* unlimited */
+
+        /* length modifier */
+        int len_mod = 0; /* 0=int, 'h'=short, 'l'=long */
+        if (*format == 'h') { len_mod = 'h'; format++; }
+        else if (*format == 'l') { len_mod = 'l'; format++; }
+
+        char spec = *format++;
+        if (!spec) break;
+
+        switch (spec) {
+        case 'd': case 'i': {
+            while (_is_space((unsigned char)*s)) s++;
+            int neg = 0;
+            if (*s == '-') { neg = 1; s++; }
+            else if (*s == '+') s++;
+            if (!(*s >= '0' && *s <= '9')) goto done;
+            long val = 0;
+            int cnt = 0;
+            while (*s >= '0' && *s <= '9' && (width < 0 || cnt < width)) {
+                val = val * 10 + (*s - '0'); s++; cnt++;
+            }
+            if (neg) val = -val;
+            if (!suppress) {
+                if (len_mod == 'h') *va_arg(ap, short *) = (short)val;
+                else if (len_mod == 'l') *va_arg(ap, long *) = val;
+                else *va_arg(ap, int *) = (int)val;
+                matched++;
+            }
+            break;
+        }
+        case 'u': {
+            while (_is_space((unsigned char)*s)) s++;
+            if (!(*s >= '0' && *s <= '9')) goto done;
+            unsigned long val = 0;
+            int cnt = 0;
+            while (*s >= '0' && *s <= '9' && (width < 0 || cnt < width)) {
+                val = val * 10 + (*s - '0'); s++; cnt++;
+            }
+            if (!suppress) {
+                if (len_mod == 'h') *va_arg(ap, unsigned short *) = (unsigned short)val;
+                else if (len_mod == 'l') *va_arg(ap, unsigned long *) = val;
+                else *va_arg(ap, unsigned int *) = (unsigned int)val;
+                matched++;
+            }
+            break;
+        }
+        case 'x': case 'X': {
+            while (_is_space((unsigned char)*s)) s++;
+            if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+            if (_hex_val((unsigned char)*s) < 0) goto done;
+            unsigned long val = 0;
+            int cnt = 0;
+            int h;
+            while ((h = _hex_val((unsigned char)*s)) >= 0 && (width < 0 || cnt < width)) {
+                val = val * 16 + h; s++; cnt++;
+            }
+            if (!suppress) {
+                if (len_mod == 'h') *va_arg(ap, unsigned short *) = (unsigned short)val;
+                else if (len_mod == 'l') *va_arg(ap, unsigned long *) = val;
+                else *va_arg(ap, unsigned int *) = (unsigned int)val;
+                matched++;
+            }
+            break;
+        }
+        case 'o': {
+            while (_is_space((unsigned char)*s)) s++;
+            if (!(*s >= '0' && *s <= '7')) goto done;
+            unsigned long val = 0;
+            int cnt = 0;
+            while (*s >= '0' && *s <= '7' && (width < 0 || cnt < width)) {
+                val = val * 8 + (*s - '0'); s++; cnt++;
+            }
+            if (!suppress) {
+                if (len_mod == 'h') *va_arg(ap, unsigned short *) = (unsigned short)val;
+                else if (len_mod == 'l') *va_arg(ap, unsigned long *) = val;
+                else *va_arg(ap, unsigned int *) = (unsigned int)val;
+                matched++;
+            }
+            break;
+        }
+        case 's': {
+            while (_is_space((unsigned char)*s)) s++;
+            if (!*s) goto done;
+            char *dest = suppress ? NULL : va_arg(ap, char *);
+            int cnt = 0;
+            while (*s && !_is_space((unsigned char)*s) && (width < 0 || cnt < width)) {
+                if (dest) dest[cnt] = *s;
+                s++; cnt++;
+            }
+            if (dest) dest[cnt] = '\0';
+            if (!suppress) matched++;
+            break;
+        }
+        case 'c': {
+            if (!*s) goto done;
+            if (width < 0) width = 1;
+            char *dest = suppress ? NULL : va_arg(ap, char *);
+            for (int i = 0; i < width && *s; i++) {
+                if (dest) dest[i] = *s;
+                s++;
+            }
+            if (!suppress) matched++;
+            break;
+        }
+        case 'n': {
+            if (!suppress) {
+                *va_arg(ap, int *) = (int)(s - str);
+            }
+            break;
+        }
+        default:
+            goto done;
+        }
+    }
+done:
+    return matched;
+}
+
+int sscanf(const char *str, const char *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    int ret = vsscanf(str, format, ap);
     va_end(ap);
     return ret;
 }
