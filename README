@@ -1,0 +1,177 @@
+LikeOS-64
+=========
+
+A modern 64-bit operating system built from scratch, featuring a Unix-like
+userland with process management, syscalls, multitasking, SMP support, and
+an interactive shell.
+
+Current state
+-------------
+
+- Real hardware support: tested on Lenovo notebook with USB boot.
+- Linux bootstrapper support: boot from Linux USB host and launch LikeOS in
+  embedded QEMU.
+- QEMU support: run with USB image targets.
+- VMware support: USB 3.1 boot.
+- VirtualBox support: xHCI (USB 3) and ICH9 chipset.
+- UEFI boot is required.
+
+Overview
+--------
+
+LikeOS-64 is a Unix-like operating system demonstrating modern OS development:
+
+- Complete userland: ring 3 processes with syscall interface.
+- Process management: preemptive multitasking scheduler.
+- SMP support: BSP and AP startup with per-CPU scheduling data.
+- UEFI bootloader: GNU-EFI based ELF64 kernel loading.
+- Filesystems: FAT32 with VFS and devfs.
+- Caching strategy: dentry cache, inode cache, and page cache.
+- Hardware drivers: xHCI USB 3.0, USB mass storage, PS/2, PCI, APIC.
+- Memory: physical/virtual memory, SLAB allocator, security protections.
+- TTY and signals: POSIX-like terminal and signal handling.
+
+Feature summary
+---------------
+
+Core OS
+~~~~~~~
+- 64-bit long mode kernel and higher-half mapping.
+- UEFI boot path with framebuffer and memory map handoff.
+- Interrupt and exception handling with IDT and PIC/APIC integration.
+
+SMP (Symmetric Multi-Processing)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- Up to 64 CPUs.
+- AP startup using INIT-SIPI-SIPI and AP trampoline.
+- Per-CPU data structures via GS base.
+- Per-CPU run queues and scheduler accounting.
+- LAPIC timer setup and SMP IPI support.
+- IOAPIC routing for multi-core delivery.
+- TLB shootdown helpers and SMP-aware locking paths.
+
+Caching strategy
+~~~~~~~~~~~~~~~~
+- Dentry cache:
+  - Name lookup cache for directory entries.
+  - Positive and negative dentry entries.
+  - Hash buckets with LRU eviction.
+- Inode cache:
+  - Metadata cache keyed by inode number.
+  - Reference counting and dirty metadata writeback.
+  - Cached cluster chain acceleration for FAT32.
+- Page cache:
+  - File data pages (4 KiB) with hash-indexed lookup.
+  - Read-ahead and sequential access optimization.
+  - CLOCK-style eviction and dirty writeback handling.
+
+Process management and userland
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- fork, execve, exit, wait4, signals, pipes.
+- User mode execution in ring 3.
+- ELF64 user binary loading.
+- Userland libc and dynamic runtime linker support.
+
+User core utilities
+~~~~~~~~~~~~~~~~~~~
+Included commands (selection):
+
+- Shell and core navigation: sh, ls, pwd, cd behavior in shell.
+- File tools: cat, cp, mv, rm, mkdir, rmdir, touch, stat, file, find.
+- Text tools: grep, wc, sort, uniq, cut, tr, head, tail, strings, hexdump, nano.
+- System tools: uname, uptime, date, time, ps, top, df, du, free, dmesg.
+- Process tools: kill, sleep.
+- Environment tools: env, which, echo, printf.
+- Power tools: shutdown, poweroff, reboot, halt.
+- Other utilities: clear, man, yes, true, false.
+- Test programs: test_syscalls, test_libc, testmem, teststress, progerr.
+
+Build
+-----
+
+Prerequisites (Ubuntu/Debian):
+
+  sudo apt update
+  sudo apt install gcc nasm xorriso mtools dosfstools ovmf gnu-efi-dev \
+                   debootstrap parted gdisk qemu-utils grub-efi-amd64-bin rsync
+
+Or:
+
+  make deps
+
+Build all:
+
+  make all
+
+Main build outputs:
+
+- build/bootloader.efi
+- build/kernel.elf
+- build/bin/* user programs
+- build/LikeOS-64.iso
+- build/LikeOS-64.img
+- build/LikeOS-64-usb.img
+- build/msdata.img
+
+Run
+---
+
+QEMU:
+
+  make clean
+  make qemu-usb
+
+Other useful targets:
+
+  make clean
+  make usb-write USB_DEVICE=/dev/sdX
+  make qemu-realusb USB_DEVICE=/dev/sdb
+
+Linux USB host mode:
+
+  make clean
+  make linux-usb
+  make linux-usb-write USB_DEVICE=/dev/sdX
+
+Project structure
+-----------------
+
+- boot/: UEFI bootloader and trampoline.
+- kernel/: kernel subsystems (ke, hal, mm, fs, io).
+- include/kernel/: public kernel headers.
+- user/: user programs (core utilities and tests).
+- userland/libc/: C library and runtime pieces.
+- host/linux-usb/: Linux host USB builder.
+- ports/: third-party ports.
+
+Implementation status
+---------------------
+
+Completed:
+- UEFI bootloader and ELF64 loading.
+- Multitasking scheduler and userland process model.
+- SMP bring-up and per-CPU kernel infrastructure.
+- Syscall layer, signals, pipes, and TTY.
+- FAT32, VFS, devfs, and caching layers.
+- xHCI USB stack and USB mass storage.
+- Framebuffer console optimizations.
+- Userland libc and core utilities set.
+
+Planned/future work:
+- Networking stack.
+- Additional writable filesystems.
+- More drivers (AHCI/NVMe/networking).
+- Expanded POSIX coverage.
+- GUI and package management improvements.
+
+Contributing
+------------
+
+Contributions are welcome for kernel subsystems, drivers, userland tools,
+performance tuning, and documentation.
+
+License
+-------
+
+This project uses the GNU General Public License version 2.
+See the COPYING file for the full license text.
