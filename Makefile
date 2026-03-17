@@ -51,7 +51,7 @@ EFI_LDS = /usr/lib/elf_x86_64_efi.lds
 # Note: Stack protector disabled because __stack_chk_guard access can conflict
 # with identity mapping removal during boot
 BUILD_DATE := $(shell LC_ALL=C date -u '+%a %b %-d %H:%M:%S UTC %Y')
-KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
+KERNEL_CFLAGS = -m64 -O1 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-fno-stack-protector -mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
 			-I$(INCLUDE_DIR) -DXHCI_USE_INTERRUPTS=1 $(SERIAL_CFLAGS) \
 			-DBUILD_DATE='"$(BUILD_DATE)"'

@@ -95,7 +95,17 @@ void fb_fill_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint3
 // SSE-optimized memory copy routines
 void sse_copy_aligned(void* dst, const void* src, size_t bytes);
 void sse_copy_unaligned(void* dst, const void* src, size_t bytes);
+void sse_copy_nt(void* dst, const void* src, size_t bytes);
 void* fast_memcpy(void* dst, const void* src, size_t bytes);
+
+// PAT-based write-combining configuration
+// Reprograms PAT MSR entry 1 to WC, then sets PWT on framebuffer 2MB pages
+int configure_pat_write_combining(uint64_t fb_phys_base, uint64_t fb_size);
+
+// Fast character drawing: writes directly to back buffer, marks dirty once
+void fb_draw_char_fast(uint32_t x, uint32_t y, const uint8_t* glyph,
+                      uint32_t font_w, uint32_t font_h, uint32_t bytes_per_row,
+                      uint32_t fg_color, uint32_t bg_color);
 
 // Debug and monitoring
 void fb_print_optimization_status(void);

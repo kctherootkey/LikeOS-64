@@ -255,7 +255,7 @@ static void tty_output_console(tty_t* tty, char c) {
             g_ansi_state = ANSI_ESC;
             return;
         }
-        console_putchar(c);
+        console_putchar_batch(c);
         return;
 
     case ANSI_ESC:
@@ -268,7 +268,7 @@ static void tty_output_console(tty_t* tty, char c) {
         }
         /* Not a CSI sequence — emit the ESC as-is and re-process char */
         ansi_reset_state();
-        console_putchar(c);
+        console_putchar_batch(c);
         return;
 
     case ANSI_CSI:
@@ -376,7 +376,7 @@ static void tty_output_console(tty_t* tty, char c) {
 
     /* Fallback */
     ansi_reset_state();
-    console_putchar(c);
+    console_putchar_batch(c);
 }
 
 static pty_t* tty_get_pty(int id) {
@@ -880,6 +880,10 @@ long tty_write(tty_t* tty, const void* buf, long count) {
     char tmp[TTY_WRITE_CHUNK];
     long written = 0;
 
+    // Enter batch mode: suppresses cursor updates on other CPUs
+    // and enables rate-limited VRAM flushing (~50fps)
+    console_batch_begin();
+
     while (written < count) {
         long chunk = count - written;
         if (chunk > TTY_WRITE_CHUNK) chunk = TTY_WRITE_CHUNK;
@@ -904,8 +908,15 @@ long tty_write(tty_t* tty, const void* buf, long count) {
         }
         spin_unlock_irqrestore(&tty_lock, flags);
 
+        // Rate-limited VRAM flush (~50fps) — skips if too recent
+        console_flush();
+
         written += chunk;
     }
+
+    // End batch mode: unconditional final flush to ensure last frame is visible
+    console_batch_end();
+
     return count;
     #undef TTY_WRITE_CHUNK
 }

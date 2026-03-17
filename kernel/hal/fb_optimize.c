@@ -12,6 +12,15 @@
 // Define missing types for kernel
 typedef unsigned long uintptr_t;
 
+// PAT MSR and memory type defines
+#define MSR_IA32_PAT        0x277
+#define PAT_TYPE_UC         0x00
+#define PAT_TYPE_WC         0x01
+#define PAT_TYPE_WT         0x04
+#define PAT_TYPE_WP         0x05
+#define PAT_TYPE_WB         0x06
+#define PAT_TYPE_UCM        0x07  // UC-
+
 // Spinlock for framebuffer access
 static spinlock_t fb_lock = SPINLOCK_INIT("framebuffer");
 
@@ -204,6 +213,87 @@ void sse_copy_unaligned(void* dst, const void* src, size_t bytes)
     }
 }
 
+// SSE non-temporal copy for write-combining memory (VRAM front buffer)
+// Uses movntdq to bypass cache - ideal for WC memory writes
+// Does NOT issue sfence - caller must sfence after all NT writes are done
+void sse_copy_nt(void* dst, const void* src, size_t bytes)
+{
+    if(!(g_double_buffer.cpu_features & CPU_FEATURE_SSE2) || bytes < 16) {
+        fast_memcpy(dst, src, bytes);
+        return;
+    }
+
+    char* d = (char*)dst;
+    const char* s = (const char*)src;
+
+    // Align destination to 16 bytes for movntdq requirement
+    size_t align_off = (16 - ((uintptr_t)d & 15)) & 15;
+    if(align_off > bytes) align_off = bytes;
+    for(size_t i = 0; i < align_off; i++) {
+        d[i] = s[i];
+    }
+    d += align_off;
+    s += align_off;
+    bytes -= align_off;
+
+    // Main NT copy: 64 bytes per iteration (4 x movntdq) for WC buffer filling
+    size_t bulk = bytes & ~63;
+    if(bulk > 0) {
+        size_t cnt = bulk;
+        const char* ls = s;
+        char* ld = d;
+        __asm__ volatile (
+            "1:\n\t"
+            "movdqu  0(%0), %%xmm0\n\t"
+            "movdqu 16(%0), %%xmm1\n\t"
+            "movdqu 32(%0), %%xmm2\n\t"
+            "movdqu 48(%0), %%xmm3\n\t"
+            "movntdq %%xmm0,  0(%1)\n\t"
+            "movntdq %%xmm1, 16(%1)\n\t"
+            "movntdq %%xmm2, 32(%1)\n\t"
+            "movntdq %%xmm3, 48(%1)\n\t"
+            "add $64, %0\n\t"
+            "add $64, %1\n\t"
+            "sub $64, %2\n\t"
+            "jnz 1b\n\t"
+            : "+r"(ls), "+r"(ld), "+r"(cnt)
+            :
+            : "memory", "xmm0", "xmm1", "xmm2", "xmm3"
+        );
+        s += bulk;
+        d += bulk;
+    }
+
+    // Handle remaining 16-byte chunks
+    size_t mid = bytes - bulk;
+    size_t mid16 = mid & ~15;
+    if(mid16 > 0) {
+        size_t cnt2 = mid16;
+        const char* ls2 = s;
+        char* ld2 = d;
+        __asm__ volatile (
+            "1:\n\t"
+            "movdqu (%0), %%xmm0\n\t"
+            "movntdq %%xmm0, (%1)\n\t"
+            "add $16, %0\n\t"
+            "add $16, %1\n\t"
+            "sub $16, %2\n\t"
+            "jnz 1b\n\t"
+            : "+r"(ls2), "+r"(ld2), "+r"(cnt2)
+            :
+            : "memory", "xmm0"
+        );
+        s += mid16;
+        d += mid16;
+    }
+
+    // Trailing bytes (< 16)
+    size_t tail = mid & 15;
+    for(size_t i = 0; i < tail; i++) {
+        d[i] = s[i];
+    }
+}
+
 // Fast memory copy with automatic alignment detection
 void* fast_memcpy(void* dst, const void* src, size_t bytes)
 {
@@ -317,6 +407,13 @@ int fb_optimize_init(framebuffer_info_t* fb_info)
 #endif
         }
     }
+    // Configure PAT for proper WC memory type on framebuffer pages
+    // This fixes the MTRR WC + PTE WB = UC problem on real hardware
+    if(configure_pat_write_combining(fb_base, fb_size) == 0) {
+#if BOOT_DEBUG
+        kprintf("  PAT write-combining configured for framebuffer\n");
+#endif
+    }
     // Enable SSE copying if available
     if(g_double_buffer.cpu_features & CPU_FEATURE_SSE2) {
         g_double_buffer.sse_copy_enabled = 1;
@@ -418,6 +515,7 @@ static int merge_dirty_regions(void)
 }
 
 // Copy a dirty region from back buffer to front buffer
+// Uses non-temporal stores for WC VRAM writes
 static void copy_region_to_front(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2)
 {
     uint32_t width = x2 - x1 + 1;
@@ -427,7 +525,7 @@ static void copy_region_to_front(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t
         uint32_t dst_offset = src_offset;
         uint32_t* src = &g_double_buffer.back_buffer[src_offset];
         uint32_t* dst = &g_double_buffer.front_buffer[dst_offset];
-        fast_memcpy(dst, src, width * sizeof(uint32_t));
+        sse_copy_nt(dst, src, width * sizeof(uint32_t));
     }
     g_double_buffer.pixels_copied += width * height;
 }
@@ -521,9 +619,11 @@ void fb_flush_dirty_regions_unlocked(void)
     }
     g_double_buffer.total_updates++;
     if(g_double_buffer.full_screen_dirty) {
-        // Copy entire screen
+        // Copy entire screen using non-temporal stores for WC VRAM
         size_t buffer_size = g_double_buffer.height * g_double_buffer.pitch * sizeof(uint32_t);
-        fast_memcpy(g_double_buffer.front_buffer, g_double_buffer.back_buffer, buffer_size);
+        sse_copy_nt(g_double_buffer.front_buffer, g_double_buffer.back_buffer, buffer_size);
+        // Ensure all NT stores are globally visible
+        __asm__ volatile("sfence" ::: "memory");
         g_double_buffer.pixels_copied += g_double_buffer.width * g_double_buffer.height;
         g_double_buffer.full_screen_dirty = 0;
         g_double_buffer.num_dirty_regions = 0;
@@ -567,6 +667,10 @@ void fb_flush_dirty_regions_unlocked(void)
             }
             copy_region_to_front(x1, y1, x2, y2);
         }
+    }
+    // Ensure all non-temporal stores are globally visible
+    if(g_double_buffer.cpu_features & CPU_FEATURE_SSE2) {
+        __asm__ volatile("sfence" ::: "memory");
     }
     // Clear dirty regions
     g_double_buffer.num_dirty_regions = 0;
@@ -716,12 +820,17 @@ void fb_fill_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint3
     if(width == 0 || height == 0) {
         return;
     }
-    // Fill rectangle
+    // Fill rectangle using fast rep stosl
     for(uint32_t row = 0; row < height; row++) {
         uint32_t offset = (y + row) * g_double_buffer.pitch + x;
-        for(uint32_t col = 0; col < width; col++) {
-            g_double_buffer.back_buffer[offset + col] = color;
-        }
+        uint32_t* dst = &g_double_buffer.back_buffer[offset];
+        uint32_t cnt = width;
+        __asm__ volatile(
+            "rep stosl"
+            : "+D"(dst), "+c"(cnt)
+            : "a"(color)
+            : "memory"
+        );
     }
     // Mark area as dirty
     fb_mark_dirty(x, y, x + width - 1, y + height - 1);
@@ -866,8 +975,13 @@ int configure_write_combining_mtrr(uint64_t fb_base, uint64_t fb_size)
     uint64_t mtrr_def_type = read_msr(MSR_MTRRdefType);
     write_msr(MSR_MTRRdefType, mtrr_def_type & ~(1ULL << 11));
     // Set up the MTRR
+    // Get MAXPHYADDR from CPUID leaf 0x80000008 for correct physical address mask
+    uint32_t eax_mp, ebx_mp, ecx_mp, edx_mp;
+    __asm__ volatile("cpuid" : "=a"(eax_mp), "=b"(ebx_mp), "=c"(ecx_mp), "=d"(edx_mp) : "a"(0x80000008));
+    uint32_t maxphyaddr = eax_mp & 0xFF;
+    if(maxphyaddr < 36) maxphyaddr = 36;  // Minimum sane value
     uint64_t phys_base = mtrr_base | MTRR_TYPE_WC;
-    uint64_t phys_mask = (~(mtrr_size - 1) & ((1ULL << 36) - 1)) | (1ULL << 11);
+    uint64_t phys_mask = (~(mtrr_size - 1) & ((1ULL << maxphyaddr) - 1)) | (1ULL << 11);
     write_msr(MSR_MTRRphysBase0 + (mtrr_index * 2), phys_base);
     write_msr(MSR_MTRRphysMask0 + (mtrr_index * 2), phys_mask);
     // Re-enable MTRRs
@@ -918,4 +1032,149 @@ int verify_write_combining(uint64_t fb_base)
         }
     }
     return -1;
+}
+
+// ============================================================================
+// PAT (Page Attribute Table) Write-Combining Configuration
+// ============================================================================
+// Reprograms PAT MSR entry 1 (PWT=1, PCD=0, PAT=0) from WT to WC,
+// then sets PWT bit on the direct-map 2MB page table entries covering the
+// framebuffer. This ensures the framebuffer VRAM is accessed with WC memory
+// type on real hardware, preventing the MTRR WC + PTE WB -> UC conflict.
+
+int configure_pat_write_combining(uint64_t fb_phys_base, uint64_t fb_size)
+{
+    if(!fb_phys_base || !fb_size) return -1;
+
+    // Step 1: Reprogram PAT MSR
+    // Default PAT: PA0=WB(06) PA1=WT(04) PA2=UC-(07) PA3=UC(00)
+    //              PA4=WB(06) PA5=WT(04) PA6=UC-(07) PA7=UC(00)
+    // We change PA1 from WT(04) to WC(01)
+    // Then pages with PWT=1, PCD=0, PAT-bit=0 will use WC
+
+    uint64_t pat_msr = read_msr(MSR_IA32_PAT);
+    // Clear PA1 (bits 15:8) and set to WC (0x01)
+    pat_msr &= ~(0xFFULL << 8);
+    pat_msr |= ((uint64_t)PAT_TYPE_WC << 8);
+
+    // Per Intel SDM Vol. 3A 11.12.4, changing PAT requires:
+    // 1. Enter no-fill cache mode (set CR0.CD)
+    // 2. Flush caches (WBINVD)
+    // 3. Flush TLBs
+    // 4. Write PAT MSR
+    // 5. Restore CR0.CD
+    // 6. Flush caches and TLBs again
+    uint64_t cr0;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0 | (1ULL << 30)));  // Set CD bit
+    __asm__ volatile("wbinvd" ::: "memory");
+    __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+
+    write_msr(MSR_IA32_PAT, pat_msr);
+
+    __asm__ volatile("wbinvd" ::: "memory");
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));  // Restore CR0
+    __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+
+    // Step 2: Set PWT bit on direct-map page table entries for the framebuffer
+    // The direct map uses 2MB pages: PML4[272] -> PDPT -> PD
+    // For 2MB PDEs: bit 3 = PWT, bit 4 = PCD, bit 12 = PAT
+    // PAT entry index = PAT*4 + PCD*2 + PWT*1
+    // We want PAT entry 1: PWT=1, PCD=0, PAT=0
+
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t pml4_phys = cr3 & PTE_ADDR_MASK;
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+
+    // PML4 entry 272 = PHYS_MAP_BASE direct map
+    uint64_t pml4e = pml4[272];
+    if(!(pml4e & PAGE_PRESENT)) {
+        return -1;
+    }
+
+    uint64_t pdpt_phys = pml4e & PTE_ADDR_MASK;
+    uint64_t* pdpt = (uint64_t*)phys_to_virt(pdpt_phys);
+
+    // Calculate 2MB-aligned range covering the framebuffer
+    uint64_t start_2mb = fb_phys_base & ~0x1FFFFFULL;
+    uint64_t end_2mb = (fb_phys_base + fb_size + 0x1FFFFFULL) & ~0x1FFFFFULL;
+    uint32_t pages_modified = 0;
+
+    for(uint64_t addr = start_2mb; addr < end_2mb; addr += 0x200000ULL) {
+        uint32_t pdpt_idx = (addr >> 30) & 0x1FF;
+        uint32_t pd_idx = (addr >> 21) & 0x1FF;
+
+        uint64_t pdpte = pdpt[pdpt_idx];
+        if(!(pdpte & PAGE_PRESENT)) continue;
+
+        uint64_t pd_phys = pdpte & PTE_ADDR_MASK;
+        uint64_t* pd = (uint64_t*)phys_to_virt(pd_phys);
+
+        // Set PWT (bit 3), clear PCD (bit 4) and PAT (bit 12 for 2MB pages)
+        // This selects PAT entry 1 = WC
+        pd[pd_idx] = (pd[pd_idx] & ~((1ULL << 4) | (1ULL << 12))) | (1ULL << 3);
+        pages_modified++;
+    }
+
+    // Flush TLBs for modified pages
+    for(uint64_t addr = start_2mb; addr < end_2mb; addr += 0x200000ULL) {
+        uint64_t virt_addr = PHYS_MAP_BASE + addr;
+        __asm__ volatile("invlpg (%0)" :: "r"(virt_addr) : "memory");
+    }
+
+#if BOOT_DEBUG
+    kprintf("  PAT: entry 1 set to WC, %u framebuffer 2MB pages updated\n", pages_modified);
+#endif
+    return 0;
+}
+
+// ============================================================================
+// Fast Character Drawing - Direct Back Buffer Access
+// ============================================================================
+// Writes glyph pixels directly to back buffer, marks dirty once per character.
+// Eliminates per-pixel spinlock acquisition and dirty-region tracking.
+
+void fb_draw_char_fast(uint32_t x, uint32_t y, const uint8_t* glyph,
+                      uint32_t font_w, uint32_t font_h, uint32_t bytes_per_row,
+                      uint32_t fg_color, uint32_t bg_color)
+{
+    if(!g_initialized || !glyph) return;
+    uint32_t* back = g_double_buffer.back_buffer;
+    uint32_t pitch = g_double_buffer.pitch;
+    uint32_t scr_w = g_double_buffer.width;
+    uint32_t scr_h = g_double_buffer.height;
+
+    // Bounds check
+    if(x + font_w > scr_w || y + font_h > scr_h) return;
+
+    if(bytes_per_row == 1 && font_w == 8) {
+        // Optimized fast path for 8-pixel-wide fonts (built-in 8x16 and many PSF)
+        // Unrolled: expand each bit of the glyph byte to a 32-bit pixel
+        for(uint32_t row = 0; row < font_h; row++) {
+            uint32_t* dst = &back[(y + row) * pitch + x];
+            uint8_t bits = glyph[row];
+            dst[0] = (bits & 0x80) ? fg_color : bg_color;
+            dst[1] = (bits & 0x40) ? fg_color : bg_color;
+            dst[2] = (bits & 0x20) ? fg_color : bg_color;
+            dst[3] = (bits & 0x10) ? fg_color : bg_color;
+            dst[4] = (bits & 0x08) ? fg_color : bg_color;
+            dst[5] = (bits & 0x04) ? fg_color : bg_color;
+            dst[6] = (bits & 0x02) ? fg_color : bg_color;
+            dst[7] = (bits & 0x01) ? fg_color : bg_color;
+        }
+    } else {
+        // Generic path for variable-width fonts
+        for(uint32_t row = 0; row < font_h; row++) {
+            uint32_t* dst = &back[(y + row) * pitch + x];
+            for(uint32_t col = 0; col < font_w; col++) {
+                uint32_t byte_idx = row * bytes_per_row + (col / 8);
+                uint8_t bit_mask = 0x80 >> (col % 8);
+                dst[col] = (glyph[byte_idx] & bit_mask) ? fg_color : bg_color;
+            }
+        }
+    }
+
+    // Mark entire character cell dirty ONCE (no spinlock per pixel)
+    fb_mark_dirty(x, y, x + font_w - 1, y + font_h - 1);
 }

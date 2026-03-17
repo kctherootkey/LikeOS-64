@@ -72,6 +72,10 @@ void console_init_fb_optimization(void);
 void console_apply_sysfont(void);  // Apply loaded system font and redraw screen
 void console_clear(void);
 void console_putchar(char c);
+void console_putchar_batch(char c);  // No VRAM flush — call console_flush() when done
+void console_flush(void);            // Rate-limited VRAM flush for batch output
+void console_batch_begin(void);      // Begin batch mode (suppresses cursor updates)
+void console_batch_end(void);        // End batch mode (unconditional final flush)
 void console_puts(const char* str);
 void console_set_color(uint8_t fg, uint8_t bg);
 void console_scroll(void);

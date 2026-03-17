@@ -819,6 +819,18 @@ void mouse_show_cursor(int show)
     }
 }
 
+// No-flush variant: update cursor in back buffer only, caller flushes later
+void mouse_show_cursor_noflush(int show)
+{
+    if(show && !mouse_state.cursor_visible) {
+        mouse_state.cursor_visible = 1;
+        mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
+    } else if(!show && mouse_state.cursor_visible) {
+        mouse_clear_cursor_full(mouse_state.x, mouse_state.y);
+        mouse_state.cursor_visible = 0;
+    }
+}
+
 // Apply a loaded cursor (must be called after cursor_load succeeded)
 void mouse_apply_cursor(void)
 {

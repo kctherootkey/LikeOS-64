@@ -11,6 +11,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/sched.h"  // For spinlock_t
 #include "../../include/kernel/sysfont.h"  // For external PSF font loading
+#include "../../include/kernel/timer.h"   // For timer_ticks() (flush rate-limiting)
 
 #define SIZE_MAX ((size_t)-1)
 #define NULL ((void*)0)
@@ -55,6 +56,11 @@ static uint8_t cursor_shown = 0;       // Current cursor visible state (for blin
 static uint32_t cursor_blink_ticks = 0; // Tick counter for blinking
 static uint32_t cursor_last_x = 0;     // Last cursor X position
 static uint32_t cursor_last_y = 0;     // Last cursor Y position
+
+// Batch output mode: suppresses cursor updates and rate-limits VRAM flushes
+static volatile int g_console_batch_active = 0;
+static uint64_t g_last_flush_tick = 0;
+#define CONSOLE_FLUSH_INTERVAL 2  // Min ticks between VRAM flushes (~20ms at 100Hz = 50fps)
 
 // Save buffer for pixels under the cursor (2 pixels wide x max 32 pixels tall)
 #define CURSOR_SAVE_W 2
@@ -485,55 +491,43 @@ static void draw_cursor_at(uint32_t x, uint32_t y, uint8_t show) {
 }
 
 // Draw a character at specific position
-static void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color, uint32_t bg_color) {
+// Optimized: writes directly to back buffer, marks dirty once per character
+static void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_clr, uint32_t bg_clr) {
     unsigned char uc = (unsigned char)c;
-    
-    // Use external PSF font if loaded, otherwise fall back to built-in font
+    const uint8_t* glyph = (void*)0;
+    uint32_t font_w, font_h, bpr;
+
     if (sysfont_is_loaded()) {
-        const uint8_t* glyph = sysfont_get_glyph(uc);
-        if (!glyph) {
-            glyph = sysfont_get_glyph('?');
-        }
-        if (glyph) {
-            uint32_t font_w = sysfont_get_width();
-            uint32_t font_h = sysfont_get_height();
-            // bytes_per_row = (width + 7) / 8 for PSF fonts
-            uint32_t bytes_per_row = (font_w + 7) / 8;
-            
-            for (uint32_t row = 0; row < font_h; row++) {
-                for (uint32_t col = 0; col < font_w; col++) {
-                    uint32_t byte_idx = row * bytes_per_row + (col / 8);
-                    uint8_t bit_mask = 0x80 >> (col % 8);
-                    uint32_t pixel_x = x + col;
-                    uint32_t pixel_y = y + row;
-                    
-                    if (glyph[byte_idx] & bit_mask) {
-                        set_pixel(pixel_x, pixel_y, fg_color);
-                    } else {
-                        set_pixel(pixel_x, pixel_y, bg_color);
-                    }
-                }
-            }
-            return;
-        }
+        glyph = sysfont_get_glyph(uc);
+        if (!glyph) glyph = sysfont_get_glyph('?');
+        font_w = sysfont_get_width();
+        font_h = sysfont_get_height();
+        bpr = (font_w + 7) / 8;
+    } else {
+        if (uc >= 128) uc = '?';
+        glyph = font_8x16[uc];
+        font_w = DEFAULT_CHAR_WIDTH;
+        font_h = DEFAULT_CHAR_HEIGHT;
+        bpr = 1;
     }
-    
-    // Fall back to built-in 8x16 font
-    if (uc >= 128) uc = '?'; // Default for unknown chars
-    
-    const uint8_t* char_bitmap = font_8x16[uc];
-    
-    for (int row = 0; row < DEFAULT_CHAR_HEIGHT; row++) {
-        uint8_t line = char_bitmap[row];
-        for (int col = 0; col < DEFAULT_CHAR_WIDTH; col++) {
-            uint32_t pixel_x = x + col;
-            uint32_t pixel_y = y + row;
-            
-            if (line & (0x80 >> col)) {
-                set_pixel(pixel_x, pixel_y, fg_color);
-            } else {
-                set_pixel(pixel_x, pixel_y, bg_color);
-            }
+    if (!glyph) return;
+
+    // Fast path: write directly to back buffer, mark dirty once
+    fb_double_buffer_t* fb_opt = get_fb_double_buffer();
+    if (fb_opt) {
+        fb_draw_char_fast(x, y, glyph, font_w, font_h, bpr, fg_clr, bg_clr);
+        return;
+    }
+
+    // Fallback: direct framebuffer pixel-by-pixel (pre-init only)
+    for (uint32_t row = 0; row < font_h; row++) {
+        for (uint32_t col = 0; col < font_w; col++) {
+            uint32_t byte_idx = row * bpr + (col / 8);
+            uint8_t bit_mask = 0x80 >> (col % 8);
+            if (glyph[byte_idx] & bit_mask)
+                set_pixel(x + col, y + row, fg_clr);
+            else
+                set_pixel(x + col, y + row, bg_clr);
         }
     }
 }
@@ -829,8 +823,8 @@ void console_clear_prompt_guard(void) {
 static void console_scroll_up(void) {
     if (!fb_info || !fb_info->framebuffer_base) return;
     
-    // Hide mouse cursor before scrolling to prevent artifacts
-    mouse_show_cursor(0);
+    // Hide mouse cursor before scrolling to prevent artifacts (no VRAM flush)
+    mouse_show_cursor_noflush(0);
     
     uint32_t screen_width = fb_info->horizontal_resolution;
     uint32_t height = fb_info->vertical_resolution;
@@ -848,8 +842,7 @@ static void console_scroll_up(void) {
         // Clear the bottom area of text region only
         fb_fill_rect(0, height - scroll_lines, text_area_width, scroll_lines, bg_color);
         
-        // Flush changes to screen
-        fb_flush_dirty_regions();
+        // Do NOT flush here - caller (or tty_write batch) is responsible
     } else {
         // Fallback to direct framebuffer access
         uint32_t* framebuffer = (uint32_t*)fb_info->framebuffer_base;
@@ -876,8 +869,8 @@ static void console_scroll_up(void) {
     cursor_y = max_rows - 1;
     cursor_x = 0;
     
-    // Show mouse cursor again after scrolling is complete
-    mouse_show_cursor(1);
+    // Show mouse cursor again after scrolling is complete (no VRAM flush)
+    mouse_show_cursor_noflush(1);
 }
 
 // Set console colors (VGA compatibility)
@@ -910,11 +903,10 @@ static void console_putchar_unlocked(char c) {
             cursor_x = 0;
             if (cursor_y >= max_rows - 1) {
                 // At bottom of screen: scroll up
-                mouse_show_cursor(0);
+                // console_scroll_up() handles mouse cursor and back-buffer ops
+                // No flush here — deferred to caller (tty_write batch or console_putchar)
                 console_scroll_up();
                 console_sync_scrollbar();
-                fb_flush_dirty_regions();
-                mouse_show_cursor(1);
             } else {
                 // Not at bottom: just move cursor down
                 cursor_y++;
@@ -936,8 +928,6 @@ static void console_putchar_unlocked(char c) {
             uint32_t text_w = (fb_info->horizontal_resolution > sb_total_w) ? (fb_info->horizontal_resolution - sb_total_w) : 0;
             uint32_t y = cursor_y * CHAR_HEIGHT;
             fb_fill_rect(0, y, text_w, CHAR_HEIGHT, bg_color);
-            fb_mark_dirty(0, y, text_w ? (text_w - 1) : 0, y + CHAR_HEIGHT - 1);
-            fb_flush_dirty_regions();
             cursor_x = 0;
         }
         return;
@@ -964,7 +954,6 @@ static void console_putchar_unlocked(char c) {
                 // The sb_append_char already stored attributes; nothing extra here.
                 cursor_x++;
             }
-            fb_flush_dirty_regions();
         } else {
         }
         return;
@@ -1002,18 +991,49 @@ static void console_putchar_unlocked(char c) {
                 cursor_last_y = cursor_y;
             }
         }
-        fb_flush_dirty_regions();
     } else {
     // Not at bottom: do nothing visually here
     }
 }
 
-// Public locked version - safe for external callers
+// Public locked version - safe for external callers (flushes after every char)
 void console_putchar(char c) {
     uint64_t flags;
     spin_lock_irqsave(&console_lock, &flags);
     console_putchar_unlocked(c);
+    fb_flush_dirty_regions();
     spin_unlock_irqrestore(&console_lock, flags);
+}
+
+// Batch version - processes character but defers VRAM flush.
+// Caller MUST call console_flush() when the batch is done.
+void console_putchar_batch(char c) {
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
+    console_putchar_unlocked(c);
+    spin_unlock_irqrestore(&console_lock, flags);
+}
+
+// Flush deferred framebuffer changes to VRAM (rate-limited during batch output)
+void console_flush(void) {
+    uint64_t now = timer_ticks();
+    if (now - g_last_flush_tick < CONSOLE_FLUSH_INTERVAL) {
+        return;  // Skip — will be flushed by next interval or batch_end
+    }
+    g_last_flush_tick = now;
+    fb_flush_dirty_regions();
+}
+
+// Begin batch output mode: suppresses cursor updates and enables rate-limiting
+void console_batch_begin(void) {
+    g_console_batch_active = 1;
+}
+
+// End batch output mode: flushes any remaining dirty content unconditionally
+void console_batch_end(void) {
+    g_console_batch_active = 0;
+    g_last_flush_tick = timer_ticks();
+    fb_flush_dirty_regions();
 }
 
 // Print a string
@@ -1026,6 +1046,7 @@ void console_puts(const char* str) {
         console_putchar_unlocked(*str);
         str++;
     }
+    fb_flush_dirty_regions();  // Single flush for entire string
     spin_unlock_irqrestore(&console_lock, flags);
 }
 
@@ -1065,7 +1086,7 @@ void console_backspace(void) {
     uint32_t px = cursor_x * CHAR_WIDTH;
     uint32_t py = cursor_y * CHAR_HEIGHT;
     draw_char(' ', px, py, fg_color, bg_color);
-    fb_flush_dirty_regions();
+    // No flush here — deferred to caller (tty_write batch or console_putchar)
 }
 
 // ================= Cursor Control Functions =================
@@ -1103,6 +1124,9 @@ void console_cursor_disable(void) {
 }
 
 void console_cursor_update(void) {
+    // Skip during batch output to prevent SMP-race mid-batch VRAM flushes
+    if (g_console_batch_active) return;
+
     uint64_t flags;
     spin_lock_irqsave(&console_lock, &flags);
     if (!cursor_enabled || !g_sb.at_bottom) {
@@ -1780,6 +1804,9 @@ int kprintf(const char* format, ...) {
     va_start(args, format);
     int result = kvprintf(format, args);
     va_end(args);
+    
+    // Flush all dirty regions once after entire formatted string is written
+    fb_flush_dirty_regions();
     
     // Also capture output to kernel log ring buffer
     // Re-format into a temp buffer for the klog
