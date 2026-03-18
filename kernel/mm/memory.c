@@ -1126,6 +1126,44 @@ bool mm_map_page_no_shootdown(uint64_t virtual_addr, uint64_t physical_addr, uin
     return true;
 }
 
+// Map device MMIO region into kernel virtual address space.
+// Used for PCI BARs that point above the bootloader's 16GB direct map.
+// Returns the virtual base address, or 0 on failure.
+uint64_t mm_map_mmio(uint64_t phys_addr, size_t num_pages) {
+    if (num_pages == 0) return 0;
+
+    uint64_t phys_base = phys_addr & ~0xFFFULL;
+
+    // Allocate a contiguous kernel virtual range from next_virtual_addr
+    uint64_t lock_flags;
+    spin_lock_irqsave(&mm_kernel_pt_lock, &lock_flags);
+    uint64_t virt_base = mm_state.next_virtual_addr;
+    mm_state.next_virtual_addr += num_pages * PAGE_SIZE;
+    spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
+
+    // Map each page as present + writable + write-through + cache-disable (UC)
+    // MMIO regions must never be cached.
+    uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_WRITE_THROUGH
+                   | PAGE_CACHE_DISABLE | PAGE_NO_EXECUTE;
+
+    for (size_t i = 0; i < num_pages; i++) {
+        uint64_t va = virt_base + i * PAGE_SIZE;
+        uint64_t pa = phys_base + i * PAGE_SIZE;
+        if (!mm_map_page(va, pa, flags)) {
+            kprintf("mm_map_mmio: failed to map VA 0x%lx -> PA 0x%lx\n", va, pa);
+            // Unmap any pages we already mapped
+            for (size_t j = 0; j < i; j++) {
+                mm_unmap_page(virt_base + j * PAGE_SIZE);
+            }
+            return 0;
+        }
+    }
+
+    kprintf("mm_map_mmio: mapped %lu pages phys 0x%lx -> virt 0x%lx\n",
+            (unsigned long)num_pages, phys_base, virt_base);
+    return virt_base + (phys_addr & 0xFFF);  // preserve sub-page offset
+}
+
 // Unmap virtual page without TLB shootdown (for batched operations)
 // Caller MUST call smp_tlb_shootdown_sync() after unmapping all pages!
 void mm_unmap_page_no_shootdown(uint64_t virtual_addr) {
