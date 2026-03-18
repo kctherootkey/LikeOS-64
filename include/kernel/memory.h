@@ -44,6 +44,12 @@ static inline bool is_direct_map_addr(uint64_t addr) {
     return (addr >= PHYS_MAP_BASE) && (addr < (PHYS_MAP_BASE + 0x400000000ULL));  // 16GB
 }
 
+// Check if a physical address is covered by the bootloader's direct map (16GB)
+#define DIRECT_MAP_LIMIT_BYTES  (16ULL * 1024 * 1024 * 1024)
+static inline bool is_phys_in_direct_map(uint64_t phys_addr) {
+    return phys_addr < DIRECT_MAP_LIMIT_BYTES;
+}
+
 // Function to get dynamic kernel heap start address
 uint64_t mm_get_kernel_heap_start(void);
 
@@ -242,6 +248,12 @@ uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create);
 uint64_t* mm_get_page_table_from_pml4(uint64_t* pml4, uint64_t virtual_addr, bool create);
 void mm_flush_tlb(uint64_t virtual_addr);
 void mm_flush_all_tlb(void);
+
+// MMIO mapping for device BARs above the direct map (> 16GB physical)
+// Maps 'num_pages' of device MMIO starting at 'phys_addr' into kernel virtual
+// address space with uncacheable (write-through + cache-disable) flags.
+// Returns the virtual address, or 0 on failure.
+uint64_t mm_map_mmio(uint64_t phys_addr, size_t num_pages);
 
 // SYSCALL/SYSRET configuration
 void mm_initialize_syscall(void);

@@ -225,6 +225,24 @@ static void acpi_parse_madt(void) {
                 break;
             }
             
+            case MADT_TYPE_LAPIC_X2: {
+                madt_x2apic_t* x2 = (madt_x2apic_t*)entry;
+                if (g_acpi_info.cpu_count < MAX_CPUS) {
+                    cpu_info_t* cpu = &g_acpi_info.cpus[g_acpi_info.cpu_count];
+                    cpu->apic_id = x2->x2apic_id;
+                    cpu->acpi_processor_id = x2->acpi_processor_uid;
+                    cpu->enabled = (x2->flags & MADT_LAPIC_ENABLED) != 0;
+                    cpu->online_capable = (x2->flags & MADT_LAPIC_ONLINE_CAPABLE) != 0;
+                    cpu->bsp = false;
+                    cpu->started = false;
+                    
+                    if (cpu->enabled || cpu->online_capable) {
+                        g_acpi_info.cpu_count++;
+                    }
+                }
+                break;
+            }
+            
             default:
                 // Ignore unknown entry types
                 break;

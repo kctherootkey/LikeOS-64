@@ -248,34 +248,75 @@ void timer_set_boot_epoch(uint64_t epoch) {
  * Takes ~2 seconds (waits for two RTC second transitions).
  */
 void timer_calibrate_frequency(void) {
+    kprintf("Timer: calibrating via CMOS RTC (g_ticks=%lu)...\n",
+            (unsigned long)g_ticks);
+
+    /*
+     * Timeout: if g_ticks doesn't advance (timer IRQ broken) or CMOS RTC
+     * seconds never change (some UEFI firmware), we'd spin forever.
+     * Use a simple iteration counter — at ~GHz speeds 500M iterations ≈ 2-3s.
+     */
+    #define CALIB_TIMEOUT 500000000ULL
+
     /* Wait for the RTC to NOT be updating */
-    while (cmos_is_updating())
+    uint64_t timeout;
+    timeout = CALIB_TIMEOUT;
+    while (cmos_is_updating() && --timeout)
         ;
+    if (!timeout) {
+        kprintf("Timer: CMOS stuck in update, skipping calibration\n");
+        return;
+    }
     uint8_t prev_sec = cmos_read(0x00);
+    kprintf("Timer: CMOS initial second = 0x%02x, waiting for change...\n",
+            prev_sec);
 
     /* Wait for the second to change (first boundary) */
+    timeout = CALIB_TIMEOUT;
     for (;;) {
-        while (cmos_is_updating())
+        while (cmos_is_updating() && --timeout)
             ;
+        if (!timeout) break;
         uint8_t cur_sec = cmos_read(0x00);
         if (cur_sec != prev_sec)
             break;
+        if (--timeout == 0) break;
+    }
+    if (!timeout) {
+        kprintf("Timer: CMOS second never changed (stuck at 0x%02x), "
+                "skipping calibration (g_ticks=%lu)\n",
+                prev_sec, (unsigned long)g_ticks);
+        return;
     }
     uint64_t t0 = g_ticks;
+    kprintf("Timer: first RTC boundary hit (g_ticks=%lu)\n",
+            (unsigned long)t0);
 
     /* Wait for the second to change again (second boundary = exactly 1s later) */
     uint8_t boundary_sec;
-    while (cmos_is_updating())
+    timeout = CALIB_TIMEOUT;
+    while (cmos_is_updating() && --timeout)
         ;
     boundary_sec = cmos_read(0x00);
+    timeout = CALIB_TIMEOUT;
     for (;;) {
-        while (cmos_is_updating())
+        while (cmos_is_updating() && --timeout)
             ;
+        if (!timeout) break;
         uint8_t cur_sec = cmos_read(0x00);
         if (cur_sec != boundary_sec)
             break;
+        if (--timeout == 0) break;
+    }
+    if (!timeout) {
+        kprintf("Timer: CMOS second stuck at 0x%02x during measurement, "
+                "skipping calibration (g_ticks=%lu)\n",
+                boundary_sec, (unsigned long)g_ticks);
+        return;
     }
     uint64_t t1 = g_ticks;
+    kprintf("Timer: second RTC boundary hit (g_ticks=%lu)\n",
+            (unsigned long)t1);
 
     uint64_t measured = t1 - t0;
     if (measured >= 10 && measured <= 10000) {
