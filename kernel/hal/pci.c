@@ -322,7 +322,7 @@ int pci_enable_msi(const pci_device_t* dev, uint8_t vector)
     cmd |= PCI_CMD_INTX_DISABLE;
     pci_cfg_write32(dev->bus, dev->device, dev->function, 0x04, cmd);
 
-    kprintf("PCI MSI: enabled for %02x:%02x.%x — vector %d, addr 0x%x, %s\n",
+    kprintf("PCI MSI: enabled for %02x:%02x.%x - vector %d, addr 0x%x, %s\n",
             dev->bus, dev->device, dev->function, vector, msi_addr,
             is_64bit ? "64-bit" : "32-bit");
     return 0;
