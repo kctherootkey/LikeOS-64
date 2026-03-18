@@ -235,3 +235,95 @@ const pci_device_t* pci_get_first_xhci(void)
     }
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+//  PCI Capability list walking
+// ---------------------------------------------------------------------------
+
+uint8_t pci_find_capability(const pci_device_t* dev, uint8_t cap_id)
+{
+    if (!dev) return 0;
+
+    // Check Status register bit 4 (Capabilities List)
+    uint32_t status = pci_cfg_read32(dev->bus, dev->device, dev->function, 0x04);
+    if (!((status >> 16) & (1 << 4)))   // Status is upper 16 bits of reg 0x04
+        return 0;
+
+    // Capabilities pointer is at config offset 0x34, low 8 bits
+    uint32_t raw = pci_cfg_read32(dev->bus, dev->device, dev->function, 0x34);
+    uint8_t ptr = (uint8_t)(raw & 0xFC);  // Must be DWORD-aligned
+
+    // Walk the linked list (max 48 entries to avoid infinite loops)
+    for (int i = 0; i < 48 && ptr != 0; i++) {
+        uint32_t cap_hdr = pci_cfg_read32(dev->bus, dev->device, dev->function, ptr);
+        uint8_t id   = (uint8_t)(cap_hdr & 0xFF);
+        uint8_t next = (uint8_t)((cap_hdr >> 8) & 0xFC);
+
+        if (id == cap_id)
+            return ptr;
+
+        ptr = next;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+//  PCI MSI setup
+// ---------------------------------------------------------------------------
+
+int pci_enable_msi(const pci_device_t* dev, uint8_t vector)
+{
+    uint8_t cap_off = pci_find_capability(dev, PCI_CAP_MSI);
+    if (cap_off == 0) {
+        kprintf("PCI MSI: no MSI capability found for %02x:%02x.%x\n",
+                dev->bus, dev->device, dev->function);
+        return -1;
+    }
+
+    // Read Message Control register (cap_off + 2, upper 16 bits of DWORD)
+    uint32_t cap_dw0 = pci_cfg_read32(dev->bus, dev->device, dev->function, cap_off);
+    uint16_t msg_ctrl = (uint16_t)(cap_dw0 >> 16);
+    int is_64bit = (msg_ctrl >> 7) & 1;   // Bit 7: 64-bit address capable
+
+    // Disable MSI while programming (clear bit 0 of Message Control)
+    cap_dw0 &= ~(1U << 16);  // Clear MSI Enable bit (bit 0 of msg_ctrl, which is bit 16 of DWORD)
+    pci_cfg_write32(dev->bus, dev->device, dev->function, cap_off, cap_dw0);
+
+    // Program Message Address (cap_off + 4)
+    // Target BSP (APIC ID 0), Fixed delivery mode
+    uint32_t msi_addr = MSI_ADDR_BASE;  // 0xFEE00000 — CPU 0, fixed
+    pci_cfg_write32(dev->bus, dev->device, dev->function, cap_off + 0x04, msi_addr);
+
+    // If 64-bit capable, zero upper address and write data at cap_off + 0x0C
+    // If 32-bit, data is at cap_off + 0x08
+    uint8_t data_off;
+    if (is_64bit) {
+        pci_cfg_write32(dev->bus, dev->device, dev->function, cap_off + 0x08, 0);
+        data_off = cap_off + 0x0C;
+    } else {
+        data_off = cap_off + 0x08;
+    }
+
+    // Program Message Data: vector number, edge-triggered, fixed delivery
+    // Data register is in the lower 16 bits of its DWORD
+    uint32_t data_dw = pci_cfg_read32(dev->bus, dev->device, dev->function, data_off);
+    data_dw = (data_dw & 0xFFFF0000) | (uint16_t)vector;
+    pci_cfg_write32(dev->bus, dev->device, dev->function, data_off, data_dw);
+
+    // Set Multiple Message Enable to 0 (allocate 1 vector) and enable MSI
+    // Re-read cap DWORD, set bit 0 of msg_ctrl (MSI Enable), clear bits 4:6 (MME = 0)
+    cap_dw0 = pci_cfg_read32(dev->bus, dev->device, dev->function, cap_off);
+    cap_dw0 &= ~(0x0070U << 16);  // Clear MME bits (bits 4-6 of msg_ctrl)
+    cap_dw0 |=  (1U << 16);       // Set MSI Enable (bit 0 of msg_ctrl)
+    pci_cfg_write32(dev->bus, dev->device, dev->function, cap_off, cap_dw0);
+
+    // Disable legacy INTx in PCI Command register (bit 10)
+    uint32_t cmd = pci_cfg_read32(dev->bus, dev->device, dev->function, 0x04);
+    cmd |= PCI_CMD_INTX_DISABLE;
+    pci_cfg_write32(dev->bus, dev->device, dev->function, 0x04, cmd);
+
+    kprintf("PCI MSI: enabled for %02x:%02x.%x — vector %d, addr 0x%x, %s\n",
+            dev->bus, dev->device, dev->function, vector, msi_addr,
+            is_64bit ? "64-bit" : "32-bit");
+    return 0;
+}

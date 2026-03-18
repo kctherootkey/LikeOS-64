@@ -288,6 +288,7 @@ void idt_init() {
     idt_set_entry(45, (uint64_t)irq13, 0x08, 0x8E);
     idt_set_entry(46, (uint64_t)irq14, 0x08, 0x8E);
     idt_set_entry(47, (uint64_t)irq15, 0x08, 0x8E);
+    idt_set_entry(48, (uint64_t)irq16, 0x08, 0x8E);  // MSI: xHCI USB
     
     // IPI vectors for SMP
     idt_set_entry(0xFC, (uint64_t)ipi_vector_0xFC, 0x08, 0x8E);  // TLB shootdown
@@ -455,6 +456,17 @@ void irq_handler(uint64_t *regs) {
     
     g_total_irq_count++;
     
+    // MSI vector for xHCI USB — vector 48 (irq == 16 after subtracting IRQ_BASE).
+    // MSI bypasses the PIC entirely; requires LAPIC EOI, not PIC EOI.
+    if (int_no == XHCI_MSI_VECTOR) {
+        extern xhci_controller_t g_xhci;
+        if (g_xhci.initialized && g_xhci.irq_enabled) {
+            xhci_irq_service(&g_xhci);
+        }
+        lapic_eoi();
+        return;  // Do NOT send PIC EOI for MSI interrupts
+    }
+
     // Check for spurious IRQ7 (from master PIC)
     if (irq == 7) {
         uint8_t isr = pic_read_isr();
@@ -524,12 +536,12 @@ void irq_handler(uint64_t *regs) {
             mouse_irq_handler();
             break;
         default: {
-            // Only call XHCI for XHCI's configured IRQ, not all unknowns
+            // Legacy INTx dispatch for XHCI (when MSI is not available)
             extern xhci_controller_t g_xhci;
-            if (g_xhci.initialized && g_xhci.irq_enabled && irq == g_xhci.irq) {
+            if (g_xhci.initialized && g_xhci.irq_enabled && !g_xhci.msi_enabled
+                && irq == g_xhci.irq) {
                 xhci_irq_service(&g_xhci);
             }
-            // Ignore other IRQs (they shouldn't fire since they're masked)
             break;
         }
     }

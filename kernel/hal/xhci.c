@@ -9,6 +9,7 @@
 
 #include "../../include/kernel/xhci.h"
 #include "../../include/kernel/usb.h"
+#include "../../include/kernel/usbhid.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/interrupt.h"
@@ -986,26 +987,48 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev) {
         return ST_ERR;
     }
     
-    // Enable interrupts
+    // Enable interrupts — prefer MSI, fall back to legacy INTx, then polling.
 #if XHCI_USE_INTERRUPTS
-    ctrl->irq = dev->interrupt_line;
-    if (ctrl->irq != 0xFF && ctrl->irq < 16) {
+    // Try MSI first (required for most modern hardware)
+    if (pci_enable_msi(dev, XHCI_MSI_VECTOR) == 0) {
+        ctrl->irq = XHCI_MSI_VECTOR;  // Store vector (not PIC IRQ) for reference
+        ctrl->msi_enabled = 1;
+
         // Configure interrupter 0
         uint64_t erdp = mm_get_physical_address((uint64_t)ctrl->event_ring->trbs);
         xhci_rt_write64(ctrl, 0x38, erdp | (1 << 3)); // ERDP with EHB
-        
+
         // Set IMOD (interrupt moderation) to 0 for immediate interrupts
         xhci_rt_write32(ctrl, 0x24, 0);
-        
+
         // Enable interrupter
         xhci_rt_write32(ctrl, 0x20, (1 << 1) | (1 << 0)); // IE | IP
-        
+
         // Enable interrupts in USBCMD
         uint32_t cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
         xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd | XHCI_CMD_INTE);
-        
-        irq_enable(ctrl->irq);
+
         ctrl->irq_enabled = 1;
+        kprintf("[XHCI] Interrupts enabled via MSI (vector %d)\n", XHCI_MSI_VECTOR);
+    } else {
+        // Fall back to legacy INTx
+        ctrl->irq = dev->interrupt_line;
+        ctrl->msi_enabled = 0;
+        if (ctrl->irq != 0xFF && ctrl->irq < 16) {
+            uint64_t erdp = mm_get_physical_address((uint64_t)ctrl->event_ring->trbs);
+            xhci_rt_write64(ctrl, 0x38, erdp | (1 << 3));
+            xhci_rt_write32(ctrl, 0x24, 0);
+            xhci_rt_write32(ctrl, 0x20, (1 << 1) | (1 << 0));
+
+            uint32_t cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
+            xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd | XHCI_CMD_INTE);
+
+            irq_enable(ctrl->irq);
+            ctrl->irq_enabled = 1;
+            kprintf("[XHCI] Interrupts enabled via legacy INTx (IRQ %d)\n", ctrl->irq);
+        } else {
+            kprintf("[XHCI] No MSI and no valid INTx line — using polled mode\n");
+        }
     }
 #endif
     
@@ -1450,7 +1473,15 @@ static void xhci_handle_transfer_event(xhci_controller_t* ctrl, xhci_trb_t* trb)
     uint8_t slot = (trb->control >> 24) & 0xFF;
     uint8_t ep_id = (trb->control >> 16) & 0x1F;
     
-    // Find pending transfer
+    // Try USB HID IRQ-context completion first.
+    // If a HID device owns this endpoint, it processes the report and
+    // re-submits the next interrupt transfer entirely in IRQ context,
+    // providing the lowest possible input latency.
+    if (usbhid_irq_completion(ctrl, slot, ep_id, cc, residue)) {
+        return;  // Consumed by HID driver
+    }
+
+    // Generic pending transfer completion (bulk/control transfers)
     if (slot > 0 && slot <= XHCI_MAX_SLOTS && ep_id < XHCI_MAX_ENDPOINTS) {
         xhci_transfer_t* xfer = ctrl->pending_xfer[slot - 1][ep_id];
         if (xfer) {
@@ -1468,9 +1499,17 @@ static void xhci_handle_port_event(xhci_controller_t* ctrl, xhci_trb_t* trb) {
         portsc = xhci_op_read32(ctrl, XHCI_OP_PORTSC_BASE + (port - 1) * 0x10);
     }
     xhci_dbg("Port status change event: Port %d, PORTSC=0x%08x\n", port, portsc);
-    
-    // NOTE: Don't clear change bits here - let xhci_port_reset handle them
-    // The reset code is polling for these bits and will clear them when ready
+
+    // If this is a Connect Status Change (CSC), flag the port for the
+    // main-loop hot-plug handler.  We don't enumerate here because
+    // enumeration requires control transfers that can't be issued from
+    // IRQ context with xhci_lock held.
+    if ((portsc & XHCI_PORTSC_CSC) && port > 0 && port <= XHCI_MAX_PORTS) {
+        ctrl->hotplug_ports |= (1U << (port - 1));
+    }
+
+    // NOTE: Don't clear change bits here - let xhci_port_reset / hotplug_poll
+    // handle them.  The reset code polls for these bits.
 }
 
 //=============================================================================
@@ -1542,6 +1581,115 @@ int xhci_poll_ports(xhci_controller_t* ctrl) {
     }
     
     return connected;
+}
+
+// Disable a device slot and release its resources.
+// xHCI spec Section 4.6.4: Disable Slot Command.
+int xhci_disable_slot(xhci_controller_t* ctrl, uint8_t slot) {
+    if (slot == 0 || slot > ctrl->max_slots) return ST_INVALID;
+
+    usb_device_t* dev = &ctrl->devices[slot - 1];
+
+    // Send Disable Slot command (slot ID in bits 31:24 of control)
+    uint32_t control = (TRB_TYPE_DISABLE_SLOT << 10) | ((uint32_t)slot << 24);
+    if (xhci_send_command(ctrl, 0, 0, control) != ST_OK) {
+        xhci_dbg("Disable slot %d: send failed\n", slot);
+        return ST_ERR;
+    }
+    xhci_wait_command(ctrl, 500);
+
+    // Clear DCBAA entry
+    ctrl->dcbaa[slot] = 0;
+
+    // Free transfer rings
+    if (dev->bulk_in_ring)  { xhci_free_ring(dev->bulk_in_ring);  dev->bulk_in_ring = NULL; }
+    if (dev->bulk_out_ring) { xhci_free_ring(dev->bulk_out_ring); dev->bulk_out_ring = NULL; }
+
+    // Clear all pending transfers for this slot
+    for (int ep = 0; ep < XHCI_MAX_ENDPOINTS; ep++) {
+        ctrl->pending_xfer[slot - 1][ep] = NULL;
+    }
+
+    // Mark device as unconfigured
+    dev->configured = 0;
+    dev->slot_id = 0;
+    dev->port = 0;
+
+    xhci_dbg("Slot %d disabled and cleaned up\n", slot);
+    return ST_OK;
+}
+
+// Hot-plug poll: called from the main loop to handle runtime USB
+// connect/disconnect events that were flagged by xhci_handle_port_event().
+//
+// Also processes the xHCI event ring as a fallback for systems where
+// interrupt delivery is broken (no MSI support, IOAPIC pin mismatch,
+// INTx routing issues on modern hardware).  Without this, transfer
+// completions and port status change events would never be seen on
+// such systems, causing HID devices to stop working after boot.
+void xhci_hotplug_poll(xhci_controller_t* ctrl) {
+    if (!ctrl || !ctrl->initialized || !ctrl->running) return;
+
+    // Always process the event ring.  This is the critical fallback for
+    // hardware where the xHCI IRQ doesn't fire (very common on real
+    // machines — INTx line is 0xFF, MSI not configured, etc.).
+    // If the IRQ *is* working, the event ring will typically be empty
+    // and this returns immediately after one cycle-bit check, so it's
+    // essentially free.
+    xhci_process_events_locked(ctrl);
+
+    // Now handle any port status changes that were flagged
+    uint32_t pending = ctrl->hotplug_ports;
+    if (!pending) return;
+    ctrl->hotplug_ports = 0;
+    __asm__ volatile("" ::: "memory");
+
+    for (uint8_t port = 1; port <= ctrl->max_ports && port <= XHCI_MAX_PORTS; port++) {
+        if (!(pending & (1U << (port - 1)))) continue;
+
+        uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
+        uint32_t portsc = xhci_op_read32(ctrl, off);
+
+        // Clear the CSC bit (RW1C) while preserving PP.
+        // CRITICAL: Do NOT include PED in the write value!  PED is RW1CS,
+        // meaning writing 1 to it CLEARS it, which disables the port and
+        // kills any active transfers on that port.
+        uint32_t clear = (portsc & XHCI_PORTSC_PP) | XHCI_PORTSC_CSC;
+        xhci_op_write32(ctrl, off, clear);
+
+        if (portsc & XHCI_PORTSC_CCS) {
+            // === Device connected ===
+            // Check if already enumerated on this port
+            int already = 0;
+            for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
+                if (ctrl->devices[i].port == port && ctrl->devices[i].configured) {
+                    already = 1;
+                    break;
+                }
+            }
+            if (!already && ctrl->num_devices < XHCI_MAX_SLOTS) {
+                kprintf("[XHCI] Hot-plug: device connected on port %d\n", port);
+                xhci_enumerate_device(ctrl, port);
+            }
+        } else {
+            // === Device disconnected ===
+            for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
+                usb_device_t* dev = &ctrl->devices[i];
+                if (dev->port == port && dev->configured) {
+                    kprintf("[XHCI] Hot-unplug: device removed from port %d (slot %d)\n",
+                            port, dev->slot_id);
+
+                    // Notify HID driver first so it stops using the device
+                    usbhid_disconnect(dev);
+
+                    // Disable the slot and free resources
+                    uint8_t slot = dev->slot_id;
+                    xhci_disable_slot(ctrl, slot);
+                    if (ctrl->num_devices > 0) ctrl->num_devices--;
+                }
+            }
+        }
+    }
 }
 
 int xhci_port_reset(xhci_controller_t* ctrl, uint8_t port) {
@@ -1932,6 +2080,15 @@ int xhci_enumerate_device(xhci_controller_t* ctrl, uint8_t port) {
                               USB_REQ_SET_CONFIG,
                               1, 0, 0, NULL) != ST_OK) {
         // Continue anyway, some devices work without this
+    }
+    
+    // Probe for USB HID devices (keyboard/mouse) before freeing config descriptor
+    // The config descriptor is still in dma_buf from the GET_DESCRIPTOR above
+    {
+        usb_config_desc_t* cfg_tmp = (usb_config_desc_t*)dma_buf;
+        uint16_t cfg_total = cfg_tmp->total_length;
+        if (cfg_total > 256) cfg_total = 256;
+        usbhid_probe(ctrl, dev, dma_buf, cfg_total);
     }
     
     // Free DMA buffer (free the raw allocation, not the aligned pointer)

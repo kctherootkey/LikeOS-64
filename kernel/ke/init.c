@@ -22,6 +22,7 @@
 #include "../../include/kernel/percpu.h"
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/lapic.h"
+#include "../../include/kernel/usbhid.h"
 
 void system_startup(boot_info_t* boot_info);
 void kernel_main(boot_info_t* boot_info);
@@ -122,6 +123,7 @@ void continue_system_startup(void) {
     irq_enable(12);
 
     xhci_boot_init(&g_xhci_boot);
+    usbhid_init();
     storage_fs_init(&g_storage_state);
 
     __asm__ volatile ("sti");
@@ -170,6 +172,8 @@ void continue_system_startup(void) {
         __asm__ volatile ("sti");
         int handled_input = shell_tick();
         xhci_boot_poll(&g_xhci_boot);
+        xhci_hotplug_poll(&g_xhci);
+        usbhid_poll();
         storage_fs_poll(&g_storage_state);
         console_cursor_update();  // Update blinking cursor
         sched_run_ready();

@@ -887,3 +887,75 @@ void mouse_apply_cursor(void)
 
     kprintf("mouse: using loaded cursor (%ux%u)\n", new_w, new_h);
 }
+
+// Inject a USB HID mouse movement/button event into the mouse subsystem.
+// This replicates the same position update, clamping, cursor redraw, and
+// event forwarding that mouse_process_packet() does for PS/2 mice.
+// Called from the USB HID driver (usbhid.c) in IRQ or process context.
+// Parameters:
+//   dx, dy       - relative displacement (signed, raw from HID report)
+//   buttons      - HID button bits (bit0=left, bit1=right, bit2=middle)
+//   wheel        - scroll wheel delta (signed, 0 = none)
+void mouse_inject_usb_movement(int dx, int dy, uint8_t buttons, int8_t wheel)
+{
+    uint64_t flags;
+    spin_lock_irqsave(&mouse_lock, &flags);
+
+    // --- Button state ---
+    mouse_state.last_buttons = (mouse_state.left_button ? MOUSE_LEFT_BUTTON : 0) |
+        (mouse_state.right_button ? MOUSE_RIGHT_BUTTON : 0) |
+        (mouse_state.middle_button ? MOUSE_MIDDLE_BUTTON : 0);
+
+    mouse_state.left_button   = (buttons & 0x01) ? 1 : 0;
+    mouse_state.right_button  = (buttons & 0x02) ? 1 : 0;
+    mouse_state.middle_button = (buttons & 0x04) ? 1 : 0;
+
+    // --- Scroll wheel ---
+    if (wheel != 0) {
+        mouse_state.scroll_delta = wheel;
+        console_handle_mouse_wheel((int)wheel);
+        tty_mouse_report_scroll(mouse_state.x, mouse_state.y, wheel);
+    }
+
+    // --- Movement ---
+    // Apply sensitivity (same formula as PS/2 path)
+    mouse_state.delta_x = (dx * mouse_state.sensitivity) / 2;
+    mouse_state.delta_y = (dy * mouse_state.sensitivity) / 2;  // USB HID Y+ = down, screen Y+ = down (no inversion needed, unlike PS/2)
+
+    mouse_state.last_x = mouse_state.x;
+    mouse_state.last_y = mouse_state.y;
+
+    mouse_state.x += mouse_state.delta_x;
+    mouse_state.y += mouse_state.delta_y;
+
+    // Clamp to screen boundaries (same as PS/2 path)
+    if (mouse_state.x < 0)
+        mouse_state.x = 0;
+    if (mouse_state.y < 0)
+        mouse_state.y = 0;
+
+    int max_x = mouse_state.screen_width - 2;
+    int max_y = mouse_state.screen_height - TIP_VISIBLE_ROWS;
+    if (max_x < 0) max_x = 0;
+    if (max_y < 0) max_y = 0;
+    if (mouse_state.x > max_x)
+        mouse_state.x = max_x;
+    if (mouse_state.y > max_y)
+        mouse_state.y = max_y;
+
+    // --- Cursor redraw ---
+    if (mouse_state.x != mouse_state.last_x || mouse_state.y != mouse_state.last_y) {
+        mouse_update_cursor_internal();
+    }
+
+    // --- Forward events (same as PS/2 path) ---
+    console_handle_mouse_event(mouse_state.x, mouse_state.y,
+                               mouse_state.left_button ? 1 : 0);
+
+    uint8_t cur_btns = (mouse_state.left_button ? 0x01 : 0) |
+                       (mouse_state.right_button ? 0x02 : 0) |
+                       (mouse_state.middle_button ? 0x04 : 0);
+    tty_mouse_report(mouse_state.x, mouse_state.y, cur_btns, mouse_state.last_buttons);
+
+    spin_unlock_irqrestore(&mouse_lock, flags);
+}

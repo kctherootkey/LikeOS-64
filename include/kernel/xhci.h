@@ -378,6 +378,7 @@ typedef struct xhci_controller {
     // IRQ info
     uint8_t irq;
     uint8_t irq_enabled;
+    uint8_t msi_enabled;  // 1 = using MSI, 0 = legacy INTx or polled
     
     // State
     uint8_t running;
@@ -392,6 +393,11 @@ typedef struct xhci_controller {
     uint64_t* scratchpad_array;
     void** scratchpad_pages;
     uint16_t num_scratchpads;
+
+    // Hot-plug: bitmask of ports with pending connect/disconnect changes.
+    // Set by xhci_handle_port_event() in IRQ context, consumed by
+    // xhci_hotplug_poll() in the main loop.
+    volatile uint32_t hotplug_ports;
 } xhci_controller_t;
 
 // Global controller instance
@@ -415,8 +421,14 @@ int xhci_poll_ports(xhci_controller_t* ctrl);
 int xhci_port_reset(xhci_controller_t* ctrl, uint8_t port);
 uint8_t xhci_port_speed(xhci_controller_t* ctrl, uint8_t port);
 
+// Hot-plug support: poll for runtime connect/disconnect events.
+// Called from the main loop.  Checks hotplug_ports bitmask set by IRQ,
+// enumerates newly connected devices, cleans up disconnected ones.
+void xhci_hotplug_poll(xhci_controller_t* ctrl);
+
 // Device management
 int xhci_enable_slot(xhci_controller_t* ctrl);
+int xhci_disable_slot(xhci_controller_t* ctrl, uint8_t slot);
 int xhci_address_device(xhci_controller_t* ctrl, uint8_t slot, uint8_t port, uint8_t speed);
 int xhci_configure_endpoint(xhci_controller_t* ctrl, uint8_t slot, uint8_t ep_num,
                             uint8_t ep_type, uint16_t max_packet, uint8_t interval);

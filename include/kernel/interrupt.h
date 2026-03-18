@@ -165,6 +165,10 @@ extern void irq44(void);
 extern void irq45(void);
 extern void irq46(void);
 extern void irq47(void);
+extern void irq16(void);  // MSI: xHCI USB (vector 48)
+
+// MSI vector assignment
+#define XHCI_MSI_VECTOR  48   // IDT vector for xHCI MSI interrupt
 
 // IPI stubs (SMP inter-processor interrupts)
 extern void ipi_vector_0xFC(void);  // TLB shootdown

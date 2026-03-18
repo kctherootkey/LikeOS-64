@@ -2,6 +2,7 @@
 // High-level interface for boot-time USB initialization and polling
 
 #include "../../include/kernel/xhci_boot.h"
+#include "../../include/kernel/usbhid.h"
 #include "../../include/kernel/pci.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/memory.h"
@@ -167,14 +168,20 @@ void xhci_boot_poll(xhci_boot_state_t* state) {
         
         // Check if we have new devices to examine
         if (ctrl->num_devices > 0) {
+            if (!state->enum_complete) {
+                state->enum_complete = 1;
+                // Drain any stale port status change events that accumulated
+                // during boot power-up and enumeration.  Without this,
+                // xhci_hotplug_poll() would re-process them and could
+                // disrupt already-configured ports.
+                ctrl->hotplug_ports = 0;
+                kprintf("[XHCI BOOT] Device enumeration complete (%d devices)\n", ctrl->num_devices);
+            }
+            
             // Check for mass storage device
             for (int i = 0; i < ctrl->num_devices; i++) {
                 usb_device_t* dev = &ctrl->devices[i];
                 if (dev->configured && dev->class_code == USB_CLASS_MASS_STORAGE) {
-                    if (!state->enum_complete) {
-                        state->enum_complete = 1;
-                        kprintf("[XHCI BOOT] Device enumeration complete (%d devices)\n", ctrl->num_devices);
-                    }
                     kprintf("[XHCI BOOT] Found USB Mass Storage device on port %d\n", dev->port);
                     
                     // Initialize MSD
@@ -187,6 +194,12 @@ void xhci_boot_poll(xhci_boot_state_t* state) {
                     }
                     return;
                 }
+            }
+            
+            // Report HID device status
+            if (usbhid_device_count() > 0) {
+                kprintf("[XHCI BOOT] USB HID: %d device(s) (kbd=%d mouse=%d)\n",
+                        usbhid_device_count(), usbhid_has_keyboard(), usbhid_has_mouse());
             }
         }
     }

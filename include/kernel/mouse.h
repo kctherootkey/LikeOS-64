@@ -129,4 +129,8 @@ void mouse_show_cursor(int show);
 void mouse_show_cursor_noflush(int show);  // Back-buffer only, no VRAM flush
 void mouse_apply_cursor(void);  // Apply loaded cursor from cursor.h
 
+// Inject a USB HID mouse movement/button/scroll event.
+// Called by the USB HID driver to feed events into the mouse subsystem.
+void mouse_inject_usb_movement(int dx, int dy, uint8_t buttons, int8_t wheel);
+
 #endif // _KERNEL_MOUSE_H_

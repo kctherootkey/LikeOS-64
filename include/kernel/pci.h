@@ -3,6 +3,7 @@
 #define LIKEOS_PCI_H
 
 #include "status.h"
+#include "types.h"
 
 #define PCI_MAX_DEVICES 256
 
@@ -29,5 +30,26 @@ unsigned int pci_cfg_read32(unsigned char bus, unsigned char dev, unsigned char 
 void pci_cfg_write32(unsigned char bus, unsigned char dev, unsigned char func, unsigned char off, unsigned int value);
 void pci_enable_busmaster_mem(const pci_device_t* dev);
 void pci_assign_unassigned_bars(void);
+
+// PCI Capability IDs
+#define PCI_CAP_MSI         0x05
+#define PCI_CAP_MSIX        0x11
+
+// PCI Command register bits
+#define PCI_CMD_INTX_DISABLE  (1 << 10)
+
+// MSI Address/Data format for x86 LAPIC
+// Address: 0xFEE00000 | (dest_apic_id << 12)
+// Data:    vector | (0 = fixed delivery, edge trigger)
+#define MSI_ADDR_BASE       0xFEE00000
+
+// Find a PCI capability by ID.  Returns the config-space offset of the
+// capability header, or 0 if not found.
+uint8_t pci_find_capability(const pci_device_t* dev, uint8_t cap_id);
+
+// Enable MSI for a PCI device.  Programs MSI address/data with the given
+// vector targeting BSP APIC ID 0, enables MSI, and disables legacy INTx.
+// Returns 0 on success, -1 if device has no MSI capability.
+int pci_enable_msi(const pci_device_t* dev, uint8_t vector);
 
 #endif // LIKEOS_PCI_H
