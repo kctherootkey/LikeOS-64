@@ -147,13 +147,22 @@ typedef struct __attribute__((packed)) {
     uint64_t lapic_address;     // 64-bit physical address
 } madt_lapic_addr_t;
 
+// MADT Local x2APIC entry (type 9)
+typedef struct __attribute__((packed)) {
+    madt_entry_header_t header;
+    uint16_t reserved;
+    uint32_t x2apic_id;        // Processor's local x2APIC ID
+    uint32_t flags;             // bit 0: enabled, bit 1: online capable
+    uint32_t acpi_processor_uid; // ACPI processor UID
+} madt_x2apic_t;
+
 // ============================================================================
 // CPU Information Structure
 // ============================================================================
 
 typedef struct {
-    uint8_t apic_id;            // APIC ID
-    uint8_t acpi_processor_id;  // ACPI processor ID
+    uint32_t apic_id;           // APIC ID (32-bit for x2APIC support)
+    uint32_t acpi_processor_id; // ACPI processor ID / UID
     bool enabled;               // CPU is enabled
     bool online_capable;        // CPU can be brought online
     bool bsp;                   // Bootstrap processor

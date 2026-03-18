@@ -28,7 +28,6 @@ static int g_ioapic_present = 0;
 
 static inline volatile uint32_t* get_ioapic_base(void) {
     if (!ioapic_base) {
-        // Convert physical MMIO address to virtual via direct map
         ioapic_base = (volatile uint32_t*)phys_to_virt(IOAPIC_DEFAULT_BASE);
     }
     return ioapic_base;
