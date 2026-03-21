@@ -8,7 +8,8 @@
 
 // Boot state tracking
 typedef struct {
-    xhci_controller_t* ctrl;
+    xhci_controller_t* ctrl;       // Primary controller (mass storage)
+    xhci_controller_t* ctrl_hid;   // Secondary controller (HID), may be NULL
     int enum_complete;
     int msd_ready;
 } xhci_boot_state_t;

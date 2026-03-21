@@ -1092,7 +1092,7 @@ static int64_t sys_settimeofday(uint64_t tv_ptr, uint64_t tz) {
     if (copy_from_user(&kv, (const void*)tv_ptr, sizeof(kv)) < 0)
         return -EFAULT;
     /* Set the wall-clock time (adjusts boot_epoch and writes CMOS RTC) */
-    timer_set_boot_epoch((uint64_t)kv.tv_sec);
+    timer_set_time((uint64_t)kv.tv_sec);
     return 0;
 }
 

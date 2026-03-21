@@ -83,6 +83,7 @@ typedef struct {
     memory_map_info_t mem_info;
     uint64_t rsdp_address;        // ACPI RSDP physical address from UEFI
     uint64_t smp_trampoline_addr; // Reserved SMP AP trampoline address (4KB aligned, < 1MB)
+    uint64_t boot_epoch;          // Unix epoch seconds at boot (from UEFI GetTime before ExitBootServices)
 } boot_info_t;
 
 // Global boot info to pass to kernel
@@ -175,6 +176,88 @@ static void serial_putdec(UINT64 val) {
         val /= 10;
     }
     serial_puts(&buf[i+1]);
+}
+
+/*
+ * is_leap_year - Check if a year is a leap year
+ */
+static int is_leap_year(int year) {
+    return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+/*
+ * days_in_month - Get the number of days in a given month
+ */
+static int days_in_month(int month, int year) {
+    static const int days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (month == 2 && is_leap_year(year))
+        return 29;
+    return days[month - 1];
+}
+
+/*
+ * efi_time_to_epoch - Convert EFI_TIME to Unix epoch seconds
+ *
+ * This is called BEFORE ExitBootServices to get the system time from UEFI
+ * since on some platforms (e.g., Intel Alder Lake with eSPI) the CMOS RTC
+ * may not be accessible after ExitBootServices.
+ */
+static UINT64 efi_time_to_epoch(EFI_TIME *t) {
+    UINT64 days = 0;
+    int year, month;
+    
+    /* Count days from 1970 to the given year */
+    for (year = 1970; year < t->Year; year++) {
+        days += is_leap_year(year) ? 366 : 365;
+    }
+    
+    /* Add days for months in the current year */
+    for (month = 1; month < t->Month; month++) {
+        days += days_in_month(month, t->Year);
+    }
+    
+    /* Add the day of month (1-based, so subtract 1) */
+    days += t->Day - 1;
+    
+    /* Convert to seconds and add hours, minutes, seconds */
+    return (days * 86400) + (t->Hour * 3600) + (t->Minute * 60) + t->Second;
+}
+
+/*
+ * read_boot_time - Read system time from UEFI before ExitBootServices
+ *
+ * This MUST be called before ExitBootServices() because UEFI Runtime
+ * Services may not be usable after that point on all platforms.
+ * The time is stored in g_boot_info.boot_epoch as Unix epoch seconds.
+ */
+static void read_boot_time(void) {
+    EFI_TIME time;
+    EFI_STATUS status;
+    
+    status = uefi_call_wrapper(RT->GetTime, 2, &time, NULL);
+    if (EFI_ERROR(status)) {
+        serial_puts("WARNING: GetTime failed, using epoch 0\n");
+        g_boot_info.boot_epoch = 0;
+        return;
+    }
+    
+    g_boot_info.boot_epoch = efi_time_to_epoch(&time);
+    
+    serial_puts("Boot time: ");
+    serial_putdec(time.Year);
+    serial_putc('-');
+    serial_putdec(time.Month);
+    serial_putc('-');
+    serial_putdec(time.Day);
+    serial_putc(' ');
+    serial_putdec(time.Hour);
+    serial_putc(':');
+    serial_putdec(time.Minute);
+    serial_putc(':');
+    serial_putdec(time.Second);
+    serial_puts(" UTC -> epoch ");
+    serial_putdec(g_boot_info.boot_epoch);
+    serial_putc('\n');
 }
 
 // Memory type names for debug output
@@ -1195,6 +1278,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
     
     setup_higher_half_paging(kernel_phys_addr, kernel_size_total);
+    
+    // Read system time from UEFI BEFORE ExitBootServices
+    // This is critical for platforms where CMOS RTC is not accessible after boot
+    // (e.g., Intel Alder Lake with eSPI where I/O ports 0x70/0x71 return 0xFF)
+    read_boot_time();
     
     Print(L"About to exit boot services. Kernel entry: 0x%lx\r\n", elf_header->e_entry);
     Print(L"Trampoline at: 0x%lx\r\n", trampoline_addr);

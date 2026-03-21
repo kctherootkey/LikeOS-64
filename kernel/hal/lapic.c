@@ -32,6 +32,7 @@ static bool lapic_x2apic_mode = false;
 static volatile uint32_t* lapic_base = NULL;
 static uint64_t lapic_phys_base = LAPIC_DEFAULT_BASE;
 static uint64_t lapic_timer_freq = 0;  // Ticks per second after calibration
+static uint64_t tsc_freq_hz = 0;      // TSC frequency in Hz (0 if unknown)
 
 // ============================================================================
 // MSR Access
@@ -57,6 +58,12 @@ static inline void cpuid(uint32_t leaf, uint32_t* eax, uint32_t* ebx, uint32_t* 
     __asm__ volatile("cpuid"
         : "=a"(*eax), "=b"(*ebx), "=c"(*ecx), "=d"(*edx)
         : "a"(leaf), "c"(0));
+}
+
+static inline uint64_t rdtsc(void) {
+    uint32_t low, high;
+    __asm__ volatile("rdtsc" : "=a"(low), "=d"(high));
+    return ((uint64_t)high << 32) | low;
 }
 
 // ============================================================================
@@ -93,6 +100,30 @@ static void pit_delay_us(uint32_t us) {
 static void pit_delay_ms(uint32_t ms) {
     for (uint32_t i = 0; i < ms; i++) {
         pit_delay_us(1000);
+    }
+}
+
+// TSC-based microsecond delay (exported for use by smp.c etc.)
+// Falls back to PIT if TSC frequency is not known.
+void lapic_delay_us(uint32_t us) {
+    if (tsc_freq_hz > 0) {
+        uint64_t tsc_target = ((uint64_t)us * tsc_freq_hz) / 1000000ULL;
+        uint64_t tsc_start = rdtsc();
+        while ((rdtsc() - tsc_start) < tsc_target)
+            __asm__ volatile("pause");
+    } else {
+        pit_delay_us(us);
+    }
+}
+
+void lapic_delay_ms(uint32_t ms) {
+    if (tsc_freq_hz > 0) {
+        uint64_t tsc_target = ((uint64_t)ms * tsc_freq_hz) / 1000ULL;
+        uint64_t tsc_start = rdtsc();
+        while ((rdtsc() - tsc_start) < tsc_target)
+            __asm__ volatile("pause");
+    } else {
+        pit_delay_ms(ms);
     }
 }
 
@@ -292,65 +323,96 @@ void lapic_init(void) {
 // ============================================================================
 
 void lapic_timer_calibrate(void) {
-    // Calibrate LAPIC timer by counting LAPIC ticks over a known PIT ch2 interval.
-    // We use a 100ms window (10x the old 10ms) to reduce the multiplication
-    // factor and improve accuracy.  PIT channel 2 (one-shot, ports 0x42/0x43/0x61)
-    // is independent of channel 0 (IRQ0) and works reliably in all environments.
-    //
-    // IMPORTANT: This must be called on the BSP *before* starting APs so the
-    // result is cached and APs never need to calibrate (no contention).
+    uint32_t eax, ebx, ecx, edx;
     
+    // =========================================================================
+    // Method 1: CPUID leaf 0x15 — TSC frequency → TSC-timed LAPIC calibration
+    //
+    // CPUID 0x15: EAX = denominator, EBX = numerator, ECX = crystal freq (Hz)
+    // TSC_freq = crystal * numerator / denominator
+    //
+    // If crystal (ECX) == 0, derive it from CPUID 0x16 (base MHz).
+    //
+    // Once we know the TSC frequency, we use rdtsc to time exactly 100ms
+    // while the LAPIC timer counts down.  This completely bypasses the PIT.
+    // =========================================================================
+    cpuid(0, &eax, &ebx, &ecx, &edx);
+    uint32_t max_leaf = eax;
+
+    if (max_leaf >= 0x15) {
+        uint32_t denom, numer, crystal;
+        cpuid(0x15, &denom, &numer, &crystal, &edx);
+
+        if (denom != 0 && numer != 0) {
+            // Try to get crystal frequency
+            if (crystal == 0 && max_leaf >= 0x16) {
+                uint32_t base_mhz;
+                cpuid(0x16, &base_mhz, &ebx, &ecx, &edx);
+                if (base_mhz > 0) {
+                    // TSC_freq = base_mhz * 1e6, crystal = TSC_freq * denom / numer
+                    crystal = (uint32_t)(((uint64_t)base_mhz * 1000000ULL * denom) / numer);
+                }
+            }
+
+            if (crystal > 0) {
+                // We know TSC frequency: tsc_freq = crystal * numer / denom
+                uint64_t tsc_freq = ((uint64_t)crystal * numer) / denom;
+                
+                // Store TSC frequency globally for TSC-based delay functions
+                tsc_freq_hz = tsc_freq;
+                
+                smp_dbg("LAPIC: CPUID 0x15: crystal=%u Hz, TSC freq=%lu Hz\n",
+                        crystal, tsc_freq);
+                
+                if (tsc_freq > 0) {
+                    // Use TSC to time exactly 100ms of LAPIC timer counting
+                    uint64_t tsc_target = tsc_freq / 10;  // 100ms worth of TSC ticks
+                    
+                    lapic_write(LAPIC_TIMER_DCR, LAPIC_TIMER_DIV_16);
+                    lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED | LAPIC_TIMER_ONESHOT);
+                    lapic_write(LAPIC_TIMER_ICR, 0xFFFFFFFF);
+                    
+                    uint64_t tsc_start = rdtsc();
+                    while ((rdtsc() - tsc_start) < tsc_target)
+                        __asm__ volatile("pause");
+                    
+                    uint32_t elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CCR);
+                    lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
+                    
+                    lapic_timer_freq = (uint64_t)elapsed * 10;
+                    
+                    smp_dbg("LAPIC: TSC-calibrated: elapsed=%u in 100ms, timer_freq=%lu Hz\n",
+                            elapsed, lapic_timer_freq);
+                    
+                    if (lapic_timer_freq >= 100000 && lapic_timer_freq <= 500000000) {
+                        return;  // Good calibration
+                    }
+                    smp_dbg("LAPIC: TSC-based result out of range, falling back to PIT\n");
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Method 2 (fallback): PIT channel 2 direct measurement
+    // Used when CPUID 0x15 is not available (e.g., QEMU, older CPUs)
+    // =========================================================================
     smp_dbg("LAPIC: Calibrating timer via PIT ch2 (100ms)...\n");
     
-    // Set up LAPIC timer with divide by 16
     lapic_write(LAPIC_TIMER_DCR, LAPIC_TIMER_DIV_16);
-    
-    // Set initial count to max and start timer in one-shot mode (masked)
     lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED | LAPIC_TIMER_ONESHOT);
     lapic_write(LAPIC_TIMER_ICR, 0xFFFFFFFF);
     
-    // Wait 100ms using PIT channel 2
     pit_delay_ms(100);
     
-    // Read how many LAPIC ticks elapsed
     uint32_t elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CCR);
-    
-    // Stop timer
     lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
     
-    // Calculate frequency: elapsed ticks in 100ms → ticks per second
     lapic_timer_freq = (uint64_t)elapsed * 10;
     
-    smp_dbg("LAPIC: Timer frequency = %lu Hz (elapsed=%u in 100ms)\n", 
+    smp_dbg("LAPIC: PIT-calibrated: timer_freq=%lu Hz (elapsed=%u in 100ms)\n", 
             lapic_timer_freq, elapsed);
     
-    // Sanity check: a reasonable LAPIC timer frequency (with div 16) should be
-    // at least 100 kHz and no more than ~1 GHz.  If the PIT delay was too short
-    // (e.g. port 0x61 OUT2 stuck high on some UEFI firmware), the elapsed count
-    // will be far too low.  In that case, retry once with a longer single delay.
-    if (lapic_timer_freq < 100000) {
-        smp_dbg("LAPIC: WARNING: frequency too low (%lu Hz), retrying with single 50ms PIT delay...\n",
-                lapic_timer_freq);
-        
-        // Retry: single 50ms PIT delay (max PIT ticks = 59659, fits in 16 bits)
-        lapic_write(LAPIC_TIMER_DCR, LAPIC_TIMER_DIV_16);
-        lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED | LAPIC_TIMER_ONESHOT);
-        lapic_write(LAPIC_TIMER_ICR, 0xFFFFFFFF);
-        
-        // Use a single 50ms PIT delay instead of 100x 1ms
-        pit_delay_us(50000);
-        
-        elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CCR);
-        lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
-        
-        // 50ms → multiply by 20 to get per-second
-        lapic_timer_freq = (uint64_t)elapsed * 20;
-        
-        smp_dbg("LAPIC: Retry frequency = %lu Hz (elapsed=%u in 50ms)\n",
-                lapic_timer_freq, elapsed);
-    }
-    
-    // If still too low, use a hardcoded safe default (1 MHz is conservative)
     if (lapic_timer_freq < 100000) {
         smp_dbg("LAPIC: WARNING: calibration failed, using 1 MHz fallback\n");
         lapic_timer_freq = 1000000;
@@ -381,6 +443,10 @@ void lapic_timer_stop(void) {
 
 uint64_t lapic_timer_get_frequency(void) {
     return lapic_timer_freq;
+}
+
+uint64_t lapic_get_tsc_freq(void) {
+    return tsc_freq_hz;
 }
 
 // ============================================================================

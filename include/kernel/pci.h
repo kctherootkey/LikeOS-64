@@ -25,6 +25,7 @@ void pci_init(void);
 int  pci_enumerate(void); // returns number of devices recorded
 const pci_device_t* pci_get_devices(int* count);
 const pci_device_t* pci_get_first_xhci(void);
+const pci_device_t* pci_get_xhci(int index);  // Get Nth xHCI controller (0-based)
 // Raw config access helpers (temporary exposure for early drivers)
 unsigned int pci_cfg_read32(unsigned char bus, unsigned char dev, unsigned char func, unsigned char off);
 void pci_cfg_write32(unsigned char bus, unsigned char dev, unsigned char func, unsigned char off, unsigned int value);
@@ -48,7 +49,7 @@ void pci_assign_unassigned_bars(void);
 uint8_t pci_find_capability(const pci_device_t* dev, uint8_t cap_id);
 
 // Enable MSI for a PCI device.  Programs MSI address/data with the given
-// vector targeting BSP APIC ID 0, enables MSI, and disables legacy INTx.
+// vector targeting the BSP's APIC ID, enables MSI, and disables legacy INTx.
 // Returns 0 on success, -1 if device has no MSI capability.
 int pci_enable_msi(const pci_device_t* dev, uint8_t vector);
 

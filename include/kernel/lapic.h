@@ -123,8 +123,13 @@ void lapic_eoi(void);
 // LAPIC Timer Functions
 // ============================================================================
 
-// Calibrate LAPIC timer using PIT
+// Calibrate LAPIC timer using CPUID+TSC (preferred) or PIT (fallback)
 void lapic_timer_calibrate(void);
+
+// Accurate delay functions (use TSC when available, PIT fallback)
+// Call lapic_timer_calibrate() first to enable TSC-based delays.
+void lapic_delay_us(uint32_t us);
+void lapic_delay_ms(uint32_t ms);
 
 // Start LAPIC timer in periodic mode
 // frequency: desired interrupt frequency in Hz
@@ -135,6 +140,9 @@ void lapic_timer_stop(void);
 
 // Get LAPIC timer ticks per second (after calibration)
 uint64_t lapic_timer_get_frequency(void);
+
+// Get TSC frequency in Hz (0 if unknown)
+uint64_t lapic_get_tsc_freq(void);
 
 // ============================================================================
 // Inter-Processor Interrupt (IPI) Functions

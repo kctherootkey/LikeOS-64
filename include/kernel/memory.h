@@ -140,6 +140,7 @@ typedef struct {
     memory_map_info_t mem_info;
     uint64_t rsdp_address;        // ACPI RSDP physical address from UEFI
     uint64_t smp_trampoline_addr; // Reserved SMP AP trampoline address (4KB aligned, < 1MB)
+    uint64_t boot_epoch;          // Unix epoch seconds at boot (from UEFI GetTime before ExitBootServices)
 } boot_info_t;
 
 // Memory regions

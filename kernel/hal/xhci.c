@@ -24,10 +24,11 @@
     #define xhci_dbg(fmt, ...) ((void)0)
 #endif
 
-// Global controller instance
-xhci_controller_t g_xhci;
+// Global controller instances
+xhci_controller_t g_xhci;       // Primary (mass storage)
+xhci_controller_t g_xhci_hid;   // Secondary (HID devices, if present)
 
-// Spinlock for xHCI controller access
+// Spinlock for xHCI controller access (shared by all controllers)
 static spinlock_t xhci_lock = SPINLOCK_INIT("xhci");
 
 // Process events while holding xhci_lock with IRQs disabled.
@@ -726,8 +727,9 @@ int xhci_halt(xhci_controller_t* ctrl) {
 // Controller Initialization
 //=============================================================================
 
-int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev) {
+int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev, uint8_t msi_vector) {
     xhci_memset(ctrl, 0, sizeof(*ctrl));
+    ctrl->irq = msi_vector;  // Store desired MSI vector for later use
     
     // Store PCI IDs for quirk detection
     ctrl->pci_vendor = dev->vendor_id;
@@ -1002,11 +1004,31 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev) {
         return ST_ERR;
     }
     
+    // After halting and resetting the controller, USB 3.x ports may be stuck
+    // in PLS=Disabled (4) instead of RxDetect (5).  Transition them back to
+    // RxDetect so attached devices can be re-detected.  USB 2.0 ports don't
+    // need this — they auto-detect on their own.
+    for (uint8_t p = 1; p <= ctrl->max_ports; p++) {
+        uint32_t portsc = xhci_op_read32(ctrl, XHCI_OP_PORTSC_BASE + (p - 1) * 0x10);
+        uint8_t pls = (portsc >> 5) & 0xF;
+        
+        // PLS=4 (Disabled) on a powered port with no connection: kick to RxDetect
+        if ((portsc & XHCI_PORTSC_PP) && !(portsc & XHCI_PORTSC_CCS) && pls == 4) {
+            // Write PLS=5 (RxDetect) with LWS (Link State Write Strobe) set.
+            // Preserve PP, clear status change bits (write-1-to-clear).
+            uint32_t val = (portsc & ~(XHCI_PORTSC_PLS_MASK | XHCI_PORTSC_PED |
+                                       XHCI_PORTSC_WPR_MASK)) |
+                           (5 << 5) | XHCI_PORTSC_LWS;
+            xhci_op_write32(ctrl, XHCI_OP_PORTSC_BASE + (p - 1) * 0x10, val);
+        }
+    }
+    // Allow time for ports to transition and devices to reconnect
+    delay_ms(100);
+
     // Enable interrupts — prefer MSI, fall back to legacy INTx, then polling.
 #if XHCI_USE_INTERRUPTS
     // Try MSI first (required for most modern hardware)
-    if (pci_enable_msi(dev, XHCI_MSI_VECTOR) == 0) {
-        ctrl->irq = XHCI_MSI_VECTOR;  // Store vector (not PIC IRQ) for reference
+    if (pci_enable_msi(dev, ctrl->irq) == 0) {
         ctrl->msi_enabled = 1;
 
         // Configure interrupter 0
@@ -1024,7 +1046,7 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev) {
         xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd | XHCI_CMD_INTE);
 
         ctrl->irq_enabled = 1;
-        kprintf("[XHCI] Interrupts enabled via MSI (vector %d)\n", XHCI_MSI_VECTOR);
+        kprintf("[XHCI] Interrupts enabled via MSI (vector %d)\n", ctrl->irq);
     } else {
         // Fall back to legacy INTx
         ctrl->irq = dev->interrupt_line;

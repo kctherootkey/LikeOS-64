@@ -6,6 +6,7 @@
 #include "../../include/kernel/pci.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/memory.h"
+#include "../../include/kernel/interrupt.h"
 
 // Boot state tracking
 static int g_init_attempted = 0;
@@ -54,40 +55,11 @@ static int xhci_verify_controller_state(xhci_controller_t* ctrl) {
     return ST_OK;
 }
 
-// Log extended capability information (for debugging)
-static void xhci_log_ext_caps(xhci_controller_t* ctrl) {
-    if (!ctrl->ext_caps_base) {
-        kprintf("[XHCI BOOT] No extended capabilities\n");
-        return;
-    }
-    
-    // Look for ALL Supported Protocol capabilities (ID=2)
-    // There can be multiple: one for USB 2.0 ports and one for USB 3.0 ports
-    uint32_t protocol_offset = 0;
-    while ((protocol_offset = xhci_find_ext_cap(ctrl, XHCI_EXT_CAP_PROTOCOL, protocol_offset)) != 0) {
-        // xhci_find_ext_cap returns offset from ctrl->base, not absolute address
-        volatile uint32_t* cap_ptr = (volatile uint32_t*)(ctrl->base + protocol_offset);
-        uint32_t cap_data = cap_ptr[0];
-        uint8_t minor_rev = (cap_data >> 16) & 0xFF;
-        uint8_t major_rev = (cap_data >> 24) & 0xFF;
-        
-        // Port offset and count are in DWORD 2 (offset +8 bytes)
-        uint32_t port_info = cap_ptr[2];
-        uint8_t port_offset = port_info & 0xFF;
-        uint8_t port_count = (port_info >> 8) & 0xFF;
-        
-        kprintf("[XHCI BOOT] Protocol: USB %d.%d, ports %d-%d\n",
-                major_rev, minor_rev, port_offset, port_offset + port_count - 1);
-        
-        // Move to next capability (offset is in DWORDs)
-        protocol_offset += 4;  // Move past current capability to search for next
-    }
-}
-
 void xhci_boot_init(xhci_boot_state_t* state) {
     if (!state) return;
     
     state->ctrl = NULL;
+    state->ctrl_hid = NULL;
     state->enum_complete = 0;
     state->msd_ready = 0;
     
@@ -96,8 +68,8 @@ void xhci_boot_init(xhci_boot_state_t* state) {
     
     kprintf("[XHCI BOOT] Starting USB initialization...\n");
     
-    // Find xHCI controller via PCI
-    const pci_device_t* xhci_pci = pci_get_first_xhci();
+    // Find first xHCI controller via PCI
+    const pci_device_t* xhci_pci = pci_get_xhci(0);
     if (!xhci_pci) {
         kprintf("[XHCI BOOT] No xHCI controller found\n");
         return;
@@ -111,39 +83,62 @@ void xhci_boot_init(xhci_boot_state_t* state) {
         bar0_full = xhci_pci->bar[0] & ~0xFULL;
     }
     
-    kprintf("[XHCI BOOT] Found xHCI at PCI %02x:%02x.%x, BAR0=0x%llx\n",
+    kprintf("[XHCI BOOT] Controller 0 at PCI %02x:%02x.%x (0x%04x:0x%04x), BAR0=0x%llx\n",
             xhci_pci->bus, xhci_pci->device, xhci_pci->function,
-            bar0_full);
+            xhci_pci->vendor_id, xhci_pci->device_id, bar0_full);
     
-    // Check vendor/device ID for known quirks
-    uint16_t vendor_id = xhci_pci->vendor_id;
-    uint16_t device_id = xhci_pci->device_id;
-    kprintf("[XHCI BOOT] Vendor: 0x%04x, Device: 0x%04x\n", vendor_id, device_id);
-    
-    // Initialize the global xHCI controller
-    // This now includes BIOS handoff
-    int st = xhci_init(&g_xhci, xhci_pci);
+    // Initialize the primary xHCI controller
+    int st = xhci_init(&g_xhci, xhci_pci, XHCI_MSI_VECTOR);
     if (st != ST_OK) {
-        kprintf("[XHCI BOOT] Controller initialization failed: %d\n", st);
+        kprintf("[XHCI BOOT] Controller 0 initialization failed: %d\n", st);
         return;
     }
     
     state->ctrl = &g_xhci;
-    
-    // Log extended capabilities (debug)
-    xhci_log_ext_caps(&g_xhci);
     
     // Power up all ports - required for VirtualBox and some real hardware
     xhci_power_ports(&g_xhci);
     
     // Verify controller state after initialization
     if (xhci_verify_controller_state(&g_xhci) != ST_OK) {
-        kprintf("[XHCI BOOT] Warning: Controller state verification failed\n");
-        // Don't fail - some controllers may have quirks
+        kprintf("[XHCI BOOT] Warning: Controller 0 state verification failed\n");
     }
     
-    kprintf("[XHCI BOOT] Controller initialized successfully (version %x.%02x)\n",
-            g_xhci.hci_version >> 8, g_xhci.hci_version & 0xFF);
+    kprintf("[XHCI BOOT] Controller 0 ready (version %x.%02x, %d ports)\n",
+            g_xhci.hci_version >> 8, g_xhci.hci_version & 0xFF,
+            g_xhci.max_ports);
+    
+    // Check for a second xHCI controller (common on laptops where internal
+    // HID devices like keyboard/touchpad are on a separate controller)
+    const pci_device_t* xhci_pci2 = pci_get_xhci(1);
+    if (xhci_pci2) {
+        uint64_t bar0_full2;
+        if ((xhci_pci2->bar[0] & 0x6) == 0x4) {
+            bar0_full2 = ((uint64_t)xhci_pci2->bar[1] << 32) | (xhci_pci2->bar[0] & ~0xFULL);
+        } else {
+            bar0_full2 = xhci_pci2->bar[0] & ~0xFULL;
+        }
+        
+        kprintf("[XHCI BOOT] Controller 1 at PCI %02x:%02x.%x (0x%04x:0x%04x), BAR0=0x%llx\n",
+                xhci_pci2->bus, xhci_pci2->device, xhci_pci2->function,
+                xhci_pci2->vendor_id, xhci_pci2->device_id, bar0_full2);
+        
+        st = xhci_init(&g_xhci_hid, xhci_pci2, XHCI_MSI_VECTOR_2);
+        if (st == ST_OK) {
+            state->ctrl_hid = &g_xhci_hid;
+            xhci_power_ports(&g_xhci_hid);
+            
+            if (xhci_verify_controller_state(&g_xhci_hid) != ST_OK) {
+                kprintf("[XHCI BOOT] Warning: Controller 1 state verification failed\n");
+            }
+            
+            kprintf("[XHCI BOOT] Controller 1 ready (version %x.%02x, %d ports)\n",
+                    g_xhci_hid.hci_version >> 8, g_xhci_hid.hci_version & 0xFF,
+                    g_xhci_hid.max_ports);
+        } else {
+            kprintf("[XHCI BOOT] Controller 1 initialization failed: %d\n", st);
+        }
+    }
 }
 
 
@@ -162,12 +157,25 @@ void xhci_boot_poll(xhci_boot_state_t* state) {
     // the IRQ handler and any concurrent transfer polling on other CPUs).
     xhci_process_events_locked(ctrl);
     
+    // Also process events on the secondary controller if present
+    if (state->ctrl_hid) {
+        xhci_process_events_locked(state->ctrl_hid);
+    }
+    
     // Keep polling ports until we have a mass storage device or reach max devices
     if (!state->msd_ready) {
         xhci_poll_ports(ctrl);
         
-        // Check if we have new devices to examine
-        if (ctrl->num_devices > 0) {
+        // Also poll the secondary controller for HID devices
+        if (state->ctrl_hid) {
+            xhci_poll_ports(state->ctrl_hid);
+        }
+        
+        // Check if we have new devices to examine (on either controller)
+        int total_devices = ctrl->num_devices;
+        if (state->ctrl_hid) total_devices += state->ctrl_hid->num_devices;
+        
+        if (total_devices > 0) {
             if (!state->enum_complete) {
                 state->enum_complete = 1;
                 // Drain any stale port status change events that accumulated
@@ -175,10 +183,11 @@ void xhci_boot_poll(xhci_boot_state_t* state) {
                 // xhci_hotplug_poll() would re-process them and could
                 // disrupt already-configured ports.
                 ctrl->hotplug_ports = 0;
-                kprintf("[XHCI BOOT] Device enumeration complete (%d devices)\n", ctrl->num_devices);
+                if (state->ctrl_hid) state->ctrl_hid->hotplug_ports = 0;
+                kprintf("[XHCI BOOT] Device enumeration complete (%d devices)\n", total_devices);
             }
             
-            // Check for mass storage device
+            // Check for mass storage device on primary controller
             for (int i = 0; i < ctrl->num_devices; i++) {
                 usb_device_t* dev = &ctrl->devices[i];
                 if (dev->configured && dev->class_code == USB_CLASS_MASS_STORAGE) {
@@ -192,7 +201,27 @@ void xhci_boot_poll(xhci_boot_state_t* state) {
                     } else {
                         kprintf("[XHCI BOOT] MSD init failed: %d\n", st);
                     }
-                    return;
+                    break;
+                }
+            }
+            
+            // Also check secondary controller for mass storage (in case
+            // the USB stick is on the other controller)
+            if (!state->msd_ready && state->ctrl_hid) {
+                for (int i = 0; i < state->ctrl_hid->num_devices; i++) {
+                    usb_device_t* dev = &state->ctrl_hid->devices[i];
+                    if (dev->configured && dev->class_code == USB_CLASS_MASS_STORAGE) {
+                        kprintf("[XHCI BOOT] Found USB Mass Storage device on ctrl1 port %d\n", dev->port);
+                        
+                        int st = usb_msd_init(&g_msd_device, dev, state->ctrl_hid);
+                        if (st == ST_OK) {
+                            state->msd_ready = 1;
+                            kprintf("[XHCI BOOT] USB Mass Storage ready\n");
+                        } else {
+                            kprintf("[XHCI BOOT] MSD init failed: %d\n", st);
+                        }
+                        break;
+                    }
                 }
             }
             
