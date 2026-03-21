@@ -196,7 +196,8 @@ IRQ 12, 44              ; PS/2 mouse
 IRQ 13, 45              ; FPU
 IRQ 14, 46              ; Primary ATA
 IRQ 15, 47              ; Secondary ATA
-IRQ 16, 48              ; MSI: xHCI USB (vector 0x30)
+IRQ 16, 48              ; MSI: xHCI USB controller 0 (vector 0x30)
+IRQ 17, 49              ; MSI: xHCI USB controller 1 (vector 0x31)
 
 ; ============================================================================
 ; IPI (Inter-Processor Interrupt) Handlers for SMP

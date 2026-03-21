@@ -12,7 +12,7 @@
 // ============================================================================
 
 // Set to 1 to enable verbose ACPI/PERCPU/SMP/LAPIC boot messages
-#define SMP_DEBUG 1
+#define SMP_DEBUG 0
 
 #if SMP_DEBUG
 #define smp_dbg(fmt, ...) kprintf(fmt, ##__VA_ARGS__)

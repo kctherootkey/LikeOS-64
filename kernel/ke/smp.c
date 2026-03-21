@@ -47,31 +47,6 @@ static uint8_t* g_ap_stacks[MAX_CPUS] = {0};
 static volatile int g_ap_ready = 0;
 
 // ============================================================================
-// Delay Functions
-// ============================================================================
-
-static void pit_delay_us(uint32_t us) {
-    uint32_t ticks = (us * 1193182ULL) / 1000000;
-    if (ticks == 0) ticks = 1;
-    if (ticks > 65535) ticks = 65535;
-    
-    outb(0x61, (inb(0x61) & 0xFD) | 0x01);
-    outb(0x43, 0xB0);
-    outb(0x42, ticks & 0xFF);
-    outb(0x42, (ticks >> 8) & 0xFF);
-    
-    while ((inb(0x61) & 0x20) == 0) {
-        __asm__ volatile("pause" ::: "memory");
-    }
-}
-
-static void pit_delay_ms(uint32_t ms) {
-    for (uint32_t i = 0; i < ms; i++) {
-        pit_delay_us(1000);
-    }
-}
-
-// ============================================================================
 // AP Entry Point
 // ============================================================================
 
@@ -340,14 +315,14 @@ void smp_boot_aps(void) {
         // Send INIT IPI
         lapic_send_init(cpu->apic_id);
         
-        // Wait 10ms
-        pit_delay_ms(10);
+        // Wait 10ms (use TSC-based delay — PIT is unreliable on some hardware)
+        lapic_delay_ms(10);
         
         // Send first SIPI (vector = page number)
         lapic_send_sipi(cpu->apic_id, g_ap_trampoline_addr >> 12);
         
         // Wait 200us
-        pit_delay_us(200);
+        lapic_delay_us(200);
         
         // If AP hasn't started, send second SIPI
         if (!__atomic_load_n(&g_ap_ready, __ATOMIC_SEQ_CST)) {
@@ -356,7 +331,7 @@ void smp_boot_aps(void) {
             // Wait for AP to start (with timeout)
             uint32_t timeout = AP_STARTUP_TIMEOUT_MS;
             while (!__atomic_load_n(&g_ap_ready, __ATOMIC_SEQ_CST) && timeout > 0) {
-                pit_delay_ms(1);
+                lapic_delay_ms(1);
                 timeout--;
             }
         }
@@ -367,7 +342,7 @@ void smp_boot_aps(void) {
         } else {
             // Give it a bit more time - there's a race between AP setting g_ap_ready
             // and BSP checking it
-            pit_delay_ms(50);
+            lapic_delay_ms(50);
             if (__atomic_load_n(&g_ap_ready, __ATOMIC_SEQ_CST)) {
                 cpu->started = true;
                 ap_index++;

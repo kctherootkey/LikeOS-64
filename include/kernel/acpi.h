@@ -337,4 +337,7 @@ void acpi_reset(void);
 // Initialize power management (call after acpi_init)
 void acpi_pm_init(void);
 
+// Find an ACPI table by its 4-character signature
+acpi_sdt_header_t* acpi_find_table(const char* signature);
+
 #endif // _KERNEL_ACPI_H_

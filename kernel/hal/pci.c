@@ -2,6 +2,7 @@
 #include "../../include/kernel/pci.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/lapic.h"
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
@@ -227,10 +228,17 @@ const pci_device_t* pci_get_devices(int* count)
 
 const pci_device_t* pci_get_first_xhci(void)
 {
+    return pci_get_xhci(0);
+}
+
+const pci_device_t* pci_get_xhci(int index)
+{
+    int found = 0;
     for(int i = 0; i < g_pci_count; i++) {
         const pci_device_t *p = &g_pci_devices[i];
         if(p->class_code == 0x0C && p->subclass == 0x03 && p->prog_if == 0x30) {
-            return p; /* XHCI */
+            if (found == index) return p;
+            found++;
         }
     }
     return 0;
@@ -290,8 +298,10 @@ int pci_enable_msi(const pci_device_t* dev, uint8_t vector)
     pci_cfg_write32(dev->bus, dev->device, dev->function, cap_off, cap_dw0);
 
     // Program Message Address (cap_off + 4)
-    // Target BSP (APIC ID 0), Fixed delivery mode
-    uint32_t msi_addr = MSI_ADDR_BASE;  // 0xFEE00000 — CPU 0, fixed
+    // Use CPUID-based APIC ID — safe to call before lapic_init(), unlike
+    // lapic_get_id() which needs x2APIC mode detection to be set up first.
+    uint32_t bsp_apic_id = lapic_get_id_cpuid();
+    uint32_t msi_addr = MSI_ADDR_BASE | ((bsp_apic_id & 0xFF) << 12);
     pci_cfg_write32(dev->bus, dev->device, dev->function, cap_off + 0x04, msi_addr);
 
     // If 64-bit capable, zero upper address and write data at cap_off + 0x0C
@@ -322,8 +332,8 @@ int pci_enable_msi(const pci_device_t* dev, uint8_t vector)
     cmd |= PCI_CMD_INTX_DISABLE;
     pci_cfg_write32(dev->bus, dev->device, dev->function, 0x04, cmd);
 
-    kprintf("PCI MSI: enabled for %02x:%02x.%x - vector %d, addr 0x%x, %s\n",
-            dev->bus, dev->device, dev->function, vector, msi_addr,
+    kprintf("PCI MSI: enabled for %02x:%02x.%x - vector %d, addr 0x%x (APIC %d), %s\n",
+            dev->bus, dev->device, dev->function, vector, msi_addr, bsp_apic_id,
             is_64bit ? "64-bit" : "32-bit");
     return 0;
 }

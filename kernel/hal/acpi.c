@@ -98,7 +98,7 @@ static acpi_rsdp_t* acpi_find_rsdp(uint64_t rsdp_hint) {
 // ============================================================================
 
 // Find an ACPI table by signature
-static acpi_sdt_header_t* acpi_find_table(const char* signature) {
+acpi_sdt_header_t* acpi_find_table(const char* signature) {
     if (!g_acpi_info.rsdp_found || g_acpi_info.rsdp_phys_addr == 0) {
         return NULL;
     }

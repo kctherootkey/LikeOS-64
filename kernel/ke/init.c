@@ -32,6 +32,7 @@ static storage_fs_state_t g_storage_state;
 static boot_info_t* g_boot_info;
 static uint64_t g_rsdp_address;           // Saved RSDP address (copied before identity unmap)
 static uint64_t g_smp_trampoline_address; // Saved SMP trampoline address from bootloader
+static uint64_t g_boot_epoch_saved;       // Saved boot epoch from UEFI GetTime
 
 void kernel_main(boot_info_t* boot_info) {
     g_boot_info = boot_info;
@@ -83,7 +84,10 @@ void system_startup(boot_info_t* boot_info) {
     
     // Save SMP trampoline address from bootloader
     g_smp_trampoline_address = boot_info->smp_trampoline_addr;
-    
+
+    // Save boot epoch from UEFI GetTime (before identity unmap)
+    g_boot_epoch_saved = boot_info->boot_epoch;
+
     // Switch to a kernel stack in higher-half space before removing identity mapping
     // The current stack is in low memory (set up by bootloader)
     // This function does NOT return - it switches stacks and calls continue_system_startup
@@ -143,6 +147,10 @@ void continue_system_startup(void) {
     smp_boot_aps();
     kprintf("SMP: %u CPU(s) online\n", smp_get_cpu_count());
 
+    // Set boot epoch from UEFI GetTime (works on systems where CMOS RTC is
+    // inaccessible after ExitBootServices, e.g., Dell Alder Lake with eSPI)
+    timer_set_boot_epoch(g_boot_epoch_saved);
+    
     timer_init(100);
 
     // Use LAPIC timer when available — it was already calibrated in smp_init()
@@ -173,6 +181,7 @@ void continue_system_startup(void) {
         int handled_input = shell_tick();
         xhci_boot_poll(&g_xhci_boot);
         xhci_hotplug_poll(&g_xhci);
+        xhci_hotplug_poll(&g_xhci_hid);
         usbhid_poll();
         storage_fs_poll(&g_storage_state);
         console_cursor_update();  // Update blinking cursor

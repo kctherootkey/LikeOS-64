@@ -288,7 +288,8 @@ void idt_init() {
     idt_set_entry(45, (uint64_t)irq13, 0x08, 0x8E);
     idt_set_entry(46, (uint64_t)irq14, 0x08, 0x8E);
     idt_set_entry(47, (uint64_t)irq15, 0x08, 0x8E);
-    idt_set_entry(48, (uint64_t)irq16, 0x08, 0x8E);  // MSI: xHCI USB
+    idt_set_entry(48, (uint64_t)irq16, 0x08, 0x8E);  // MSI: xHCI USB controller 0
+    idt_set_entry(49, (uint64_t)irq17, 0x08, 0x8E);  // MSI: xHCI USB controller 1
     
     // IPI vectors for SMP
     idt_set_entry(0xFC, (uint64_t)ipi_vector_0xFC, 0x08, 0x8E);  // TLB shootdown
@@ -465,6 +466,16 @@ void irq_handler(uint64_t *regs) {
         }
         lapic_eoi();
         return;  // Do NOT send PIC EOI for MSI interrupts
+    }
+
+    // MSI vector for second xHCI USB controller — vector 49.
+    if (int_no == XHCI_MSI_VECTOR_2) {
+        extern xhci_controller_t g_xhci_hid;
+        if (g_xhci_hid.initialized && g_xhci_hid.irq_enabled) {
+            xhci_irq_service(&g_xhci_hid);
+        }
+        lapic_eoi();
+        return;
     }
 
     // Check for spurious IRQ7 (from master PIC)
