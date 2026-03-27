@@ -1,10 +1,20 @@
-// LikeOS-64 - ACPI Implementation
+// LikeOS-64 - ACPI Implementation using ACPICA Reference Implementation
 // RSDP, RSDT/XSDT, and MADT parsing for CPU enumeration
+// AML evaluation delegated to ACPICA
+
+// ACPICA headers (must be included before kernel acpi.h to avoid macro conflicts)
+#include "acpica/include/acpi.h"
 
 #include "../../include/kernel/acpi.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/memory.h"
-#include "../../include/kernel/smp.h"
+
+#define ACPI_DEBUG 0
+#if ACPI_DEBUG
+#define acpi_dbg(fmt, ...) kprintf(fmt, ##__VA_ARGS__)
+#else
+#define acpi_dbg(fmt, ...) do {} while(0)
+#endif
 
 // ============================================================================
 // Global ACPI State
@@ -12,289 +22,203 @@
 
 static acpi_info_t g_acpi_info = {0};
 
+// ACPICA RSDP address setter (defined in oslikeos.c)
+extern void acpica_set_rsdp(uint64_t phys_addr);
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
 
-static int my_memcmp(const void* a, const void* b, size_t n) {
-    const uint8_t* p1 = (const uint8_t*)a;
-    const uint8_t* p2 = (const uint8_t*)b;
-    for (size_t i = 0; i < n; i++) {
-        if (p1[i] != p2[i]) {
-            return p1[i] - p2[i];
-        }
-    }
-    return 0;
+static void my_memset(void* dst, int val, size_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    for (size_t i = 0; i < n; i++) d[i] = (uint8_t)val;
 }
 
-// Validate checksum of ACPI table
-static bool acpi_validate_checksum(void* table, size_t length) {
-    uint8_t* ptr = (uint8_t*)table;
-    uint8_t sum = 0;
-    for (size_t i = 0; i < length; i++) {
-        sum += ptr[i];
-    }
-    return sum == 0;
+static void my_memcpy(void* dst, const void* src, size_t n) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    for (size_t i = 0; i < n; i++) d[i] = s[i];
 }
 
-// ============================================================================
-// RSDP Discovery
-// ============================================================================
-
-// Search for RSDP in a memory range
-static acpi_rsdp_t* acpi_find_rsdp_in_range(uint64_t start, uint64_t end) {
-    // RSDP is always aligned to 16 bytes
-    for (uint64_t addr = start; addr < end; addr += 16) {
-        void* ptr = phys_to_virt(addr);
-        if (my_memcmp(ptr, ACPI_SIG_RSDP, 8) == 0) {
-            acpi_rsdp_t* rsdp = (acpi_rsdp_t*)ptr;
-            // Validate ACPI 1.0 checksum (first 20 bytes)
-            if (acpi_validate_checksum(rsdp, 20)) {
-                // For ACPI 2.0+, also validate extended checksum
-                if (rsdp->revision >= 2) {
-                    if (!acpi_validate_checksum(rsdp, rsdp->length)) {
-                        continue;
-                    }
-                }
-                return rsdp;
-            }
-        }
-    }
-    return NULL;
+static int my_strlen(const char* s) {
+    int len = 0;
+    while (s[len]) len++;
+    return len;
 }
 
-// Find RSDP from UEFI hint or by searching BIOS areas
-static acpi_rsdp_t* acpi_find_rsdp(uint64_t rsdp_hint) {
-    acpi_rsdp_t* rsdp = NULL;
-    
-    // If we have a hint (e.g., from UEFI), try that first
-    if (rsdp_hint != 0) {
-        void* ptr = phys_to_virt(rsdp_hint);
-        if (my_memcmp(ptr, ACPI_SIG_RSDP, 8) == 0) {
-            rsdp = (acpi_rsdp_t*)ptr;
-            if (acpi_validate_checksum(rsdp, 20)) {
-                smp_dbg("ACPI: RSDP found at hint address 0x%lx\n", rsdp_hint);
-                return rsdp;
-            }
-        }
-    }
-    
-    // Search EBDA (Extended BIOS Data Area) - first 1KB at segment in [0x40:0x0E]
-    // This area might not be accessible with UEFI, skip if unavailable
-    
-    // Search BIOS ROM area: 0xE0000 - 0xFFFFF
-    rsdp = acpi_find_rsdp_in_range(0xE0000, 0x100000);
-    if (rsdp) {
-        smp_dbg("ACPI: RSDP found in BIOS ROM area at 0x%lx\n", 
-                (uint64_t)rsdp - PHYS_MAP_BASE);
-        return rsdp;
-    }
-    
-    return NULL;
+static void my_strncpy(char* dst, const char* src, int n) {
+    int i;
+    for (i = 0; i < n - 1 && src[i]; i++) dst[i] = src[i];
+    dst[i] = 0;
 }
 
 // ============================================================================
-// ACPI Table Access
-// ============================================================================
-
-// Find an ACPI table by signature
-acpi_sdt_header_t* acpi_find_table(const char* signature) {
-    if (!g_acpi_info.rsdp_found || g_acpi_info.rsdp_phys_addr == 0) {
-        return NULL;
-    }
-    
-    // Use the saved RSDP physical address
-    acpi_rsdp_t* rsdp = (acpi_rsdp_t*)phys_to_virt(g_acpi_info.rsdp_phys_addr);
-    
-    if (g_acpi_info.acpi_revision >= 2 && rsdp->xsdt_address != 0) {
-        // Use XSDT (64-bit entries)
-        acpi_xsdt_t* xsdt = (acpi_xsdt_t*)phys_to_virt(rsdp->xsdt_address);
-        if (!acpi_validate_checksum(xsdt, xsdt->header.length)) {
-            smp_dbg("ACPI: XSDT checksum invalid\n");
-            return NULL;
-        }
-        
-        size_t entry_count = (xsdt->header.length - sizeof(acpi_sdt_header_t)) / sizeof(uint64_t);
-        for (size_t i = 0; i < entry_count; i++) {
-            acpi_sdt_header_t* header = (acpi_sdt_header_t*)phys_to_virt(xsdt->entries[i]);
-            if (my_memcmp(header->signature, signature, 4) == 0) {
-                if (acpi_validate_checksum(header, header->length)) {
-                    return header;
-                }
-            }
-        }
-    } else {
-        // Use RSDT (32-bit entries)
-        acpi_rsdt_t* rsdt = (acpi_rsdt_t*)phys_to_virt(rsdp->rsdt_address);
-        if (!acpi_validate_checksum(rsdt, rsdt->header.length)) {
-            smp_dbg("ACPI: RSDT checksum invalid\n");
-            return NULL;
-        }
-        
-        size_t entry_count = (rsdt->header.length - sizeof(acpi_sdt_header_t)) / sizeof(uint32_t);
-        for (size_t i = 0; i < entry_count; i++) {
-            acpi_sdt_header_t* header = (acpi_sdt_header_t*)phys_to_virt(rsdt->entries[i]);
-            if (my_memcmp(header->signature, signature, 4) == 0) {
-                if (acpi_validate_checksum(header, header->length)) {
-                    return header;
-                }
-            }
-        }
-    }
-    
-    return NULL;
-}
-
-// ============================================================================
-// MADT Parsing
+// MADT Parsing (raw table walk - not AML, kept from original)
 // ============================================================================
 
 static void acpi_parse_madt(void) {
-    acpi_madt_t* madt = (acpi_madt_t*)acpi_find_table(ACPI_SIG_MADT);
-    if (!madt) {
+    ACPI_TABLE_HEADER *hdr = NULL;
+    ACPI_STATUS status = AcpiGetTable(ACPI_SIG_MADT, 1, &hdr);
+    if (ACPI_FAILURE(status) || !hdr) {
         kprintf("ACPI: MADT not found\n");
         return;
     }
-    
-    smp_dbg("ACPI: MADT found, length=%u\n", madt->header.length);
-    
-    // Save LAPIC address
+
+    acpi_madt_t* madt = (acpi_madt_t*)hdr;
+    acpi_dbg("ACPI: MADT found, length=%u\n", madt->header.length);
+
     g_acpi_info.lapic_address = madt->lapic_address;
-    
-    // Check for dual-8259
     g_acpi_info.dual_8259_present = (madt->flags & 1) != 0;
-    
-    // Parse MADT entries
+
     uint8_t* ptr = (uint8_t*)madt + sizeof(acpi_madt_t);
     uint8_t* end = (uint8_t*)madt + madt->header.length;
-    
+
     while (ptr < end) {
         madt_entry_header_t* entry = (madt_entry_header_t*)ptr;
-        
-        if (entry->length == 0) {
-            break;  // Prevent infinite loop
-        }
-        
+        if (entry->length == 0) break;
+
         switch (entry->type) {
-            case MADT_TYPE_LAPIC: {
-                madt_lapic_t* lapic = (madt_lapic_t*)entry;
-                if (g_acpi_info.cpu_count < MAX_CPUS) {
-                    cpu_info_t* cpu = &g_acpi_info.cpus[g_acpi_info.cpu_count];
-                    cpu->apic_id = lapic->apic_id;
-                    cpu->acpi_processor_id = lapic->acpi_processor_id;
-                    cpu->enabled = (lapic->flags & MADT_LAPIC_ENABLED) != 0;
-                    cpu->online_capable = (lapic->flags & MADT_LAPIC_ONLINE_CAPABLE) != 0;
-                    cpu->bsp = false;  // Will be set later
-                    cpu->started = false;
-                    
-                    if (cpu->enabled || cpu->online_capable) {
-                        g_acpi_info.cpu_count++;
-                    }
-                }
-                break;
+        case MADT_TYPE_LAPIC: {
+            madt_lapic_t* lapic = (madt_lapic_t*)entry;
+            if (g_acpi_info.cpu_count < MAX_CPUS) {
+                cpu_info_t* cpu = &g_acpi_info.cpus[g_acpi_info.cpu_count];
+                cpu->apic_id = lapic->apic_id;
+                cpu->acpi_processor_id = lapic->acpi_processor_id;
+                cpu->enabled = (lapic->flags & MADT_LAPIC_ENABLED) != 0;
+                cpu->online_capable = (lapic->flags & MADT_LAPIC_ONLINE_CAPABLE) != 0;
+                cpu->bsp = false;
+                cpu->started = false;
+                if (cpu->enabled || cpu->online_capable)
+                    g_acpi_info.cpu_count++;
             }
-            
-            case MADT_TYPE_IOAPIC: {
-                madt_ioapic_t* ioapic = (madt_ioapic_t*)entry;
-                if (g_acpi_info.ioapic_count < MAX_IOAPICS) {
-                    ioapic_info_t* info = &g_acpi_info.ioapics[g_acpi_info.ioapic_count];
-                    info->id = ioapic->ioapic_id;
-                    info->address = ioapic->ioapic_address;
-                    info->gsi_base = ioapic->gsi_base;
-                    g_acpi_info.ioapic_count++;
-                }
-                break;
-            }
-            
-            case MADT_TYPE_ISO: {
-                madt_iso_t* iso = (madt_iso_t*)entry;
-                if (g_acpi_info.irq_override_count < MAX_IRQ_OVERRIDES) {
-                    irq_override_t* override = &g_acpi_info.irq_overrides[g_acpi_info.irq_override_count];
-                    override->bus_irq = iso->source;
-                    override->gsi = iso->gsi;
-                    override->polarity = iso->flags & MPS_INTI_POLARITY_MASK;
-                    override->trigger_mode = (iso->flags & MPS_INTI_TRIGGER_MASK) >> 2;
-                    g_acpi_info.irq_override_count++;
-                }
-                break;
-            }
-            
-            case MADT_TYPE_LAPIC_ADDR: {
-                madt_lapic_addr_t* addr = (madt_lapic_addr_t*)entry;
-                g_acpi_info.lapic_address = addr->lapic_address;
-                break;
-            }
-            
-            case MADT_TYPE_LAPIC_X2: {
-                madt_x2apic_t* x2 = (madt_x2apic_t*)entry;
-                if (g_acpi_info.cpu_count < MAX_CPUS) {
-                    cpu_info_t* cpu = &g_acpi_info.cpus[g_acpi_info.cpu_count];
-                    cpu->apic_id = x2->x2apic_id;
-                    cpu->acpi_processor_id = x2->acpi_processor_uid;
-                    cpu->enabled = (x2->flags & MADT_LAPIC_ENABLED) != 0;
-                    cpu->online_capable = (x2->flags & MADT_LAPIC_ONLINE_CAPABLE) != 0;
-                    cpu->bsp = false;
-                    cpu->started = false;
-                    
-                    if (cpu->enabled || cpu->online_capable) {
-                        g_acpi_info.cpu_count++;
-                    }
-                }
-                break;
-            }
-            
-            default:
-                // Ignore unknown entry types
-                break;
+            break;
         }
-        
+        case MADT_TYPE_IOAPIC: {
+            madt_ioapic_t* ioapic = (madt_ioapic_t*)entry;
+            if (g_acpi_info.ioapic_count < MAX_IOAPICS) {
+                ioapic_info_t* info = &g_acpi_info.ioapics[g_acpi_info.ioapic_count];
+                info->id = ioapic->ioapic_id;
+                info->address = ioapic->ioapic_address;
+                info->gsi_base = ioapic->gsi_base;
+                g_acpi_info.ioapic_count++;
+            }
+            break;
+        }
+        case MADT_TYPE_ISO: {
+            madt_iso_t* iso = (madt_iso_t*)entry;
+            if (g_acpi_info.irq_override_count < MAX_IRQ_OVERRIDES) {
+                irq_override_t* override = &g_acpi_info.irq_overrides[g_acpi_info.irq_override_count];
+                override->bus_irq = iso->source;
+                override->gsi = iso->gsi;
+                override->polarity = iso->flags & MPS_INTI_POLARITY_MASK;
+                override->trigger_mode = (iso->flags & MPS_INTI_TRIGGER_MASK) >> 2;
+                g_acpi_info.irq_override_count++;
+            }
+            break;
+        }
+        case MADT_TYPE_LAPIC_ADDR: {
+            madt_lapic_addr_t* addr = (madt_lapic_addr_t*)entry;
+            g_acpi_info.lapic_address = addr->lapic_address;
+            break;
+        }
+        case MADT_TYPE_LAPIC_X2: {
+            madt_x2apic_t* x2 = (madt_x2apic_t*)entry;
+            if (g_acpi_info.cpu_count < MAX_CPUS) {
+                cpu_info_t* cpu = &g_acpi_info.cpus[g_acpi_info.cpu_count];
+                cpu->apic_id = x2->x2apic_id;
+                cpu->acpi_processor_id = x2->acpi_processor_uid;
+                cpu->enabled = (x2->flags & MADT_LAPIC_ENABLED) != 0;
+                cpu->online_capable = (x2->flags & MADT_LAPIC_ONLINE_CAPABLE) != 0;
+                cpu->bsp = false;
+                cpu->started = false;
+                if (cpu->enabled || cpu->online_capable)
+                    g_acpi_info.cpu_count++;
+            }
+            break;
+        }
+        default:
+            break;
+        }
         ptr += entry->length;
     }
 }
 
 // ============================================================================
-// Public API
+// ACPI Initialization (ACPICA-based)
 // ============================================================================
 
 int acpi_init(uint64_t rsdp_hint) {
-    smp_dbg("ACPI: Initializing...\n");
-    
-    // Find RSDP
-    acpi_rsdp_t* rsdp = acpi_find_rsdp(rsdp_hint);
-    if (!rsdp) {
-        kprintf("ACPI: RSDP not found!\n");
+    ACPI_STATUS status;
+
+    acpi_dbg("ACPI: Initializing via ACPICA...\n");
+
+    // Pass RSDP address to OSL
+    acpica_set_rsdp(rsdp_hint);
+
+    g_acpi_info.rsdp_found = true;
+    g_acpi_info.rsdp_phys_addr = rsdp_hint;
+
+    // Detect ACPI revision from RSDP
+    if (rsdp_hint) {
+        acpi_rsdp_t* rsdp = (acpi_rsdp_t*)phys_to_virt(rsdp_hint);
+        g_acpi_info.acpi_revision = rsdp->revision;
+    }
+
+    // Initialize ACPICA subsystem
+    status = AcpiInitializeSubsystem();
+    if (ACPI_FAILURE(status)) {
+        kprintf("ACPI: AcpiInitializeSubsystem failed: %d\n", (int)status);
         return -1;
     }
-    
-    g_acpi_info.rsdp_found = true;
-    g_acpi_info.acpi_revision = rsdp->revision;
-    
-    // Save the RSDP physical address for later use
-    // Convert virtual back to physical
-    g_acpi_info.rsdp_phys_addr = virt_to_phys((void*)rsdp);
-    
-    smp_dbg("ACPI: Revision %u, OEM: %.6s\n", rsdp->revision, rsdp->oem_id);
-    
-    if (rsdp->revision >= 2) {
-        smp_dbg("ACPI: XSDT at 0x%lx\n", rsdp->xsdt_address);
+
+    // Initialize table manager and load RSDP/RSDT/XSDT
+    status = AcpiInitializeTables(NULL, 32, FALSE);
+    if (ACPI_FAILURE(status)) {
+        kprintf("ACPI: AcpiInitializeTables failed: %d\n", (int)status);
+        return -1;
     }
-    smp_dbg("ACPI: RSDT at 0x%x\n", rsdp->rsdt_address);
-    
-    // Parse MADT for CPU information
+
+    // Load all ACPI tables (DSDT, SSDTs, etc.)
+    status = AcpiLoadTables();
+    if (ACPI_FAILURE(status)) {
+        kprintf("ACPI: AcpiLoadTables failed: %d\n", (int)status);
+        return -1;
+    }
+
+    // Enable ACPI subsystem  
+    status = AcpiEnableSubsystem(ACPI_FULL_INITIALIZATION);
+    if (ACPI_FAILURE(status)) {
+        kprintf("ACPI: AcpiEnableSubsystem failed: %d\n", (int)status);
+        // Non-fatal — continue without hardware enable
+    } else {
+        kprintf("ACPI: EnableSub ok\n");
+    }
+
+    // Initialize ACPI objects (run _INI methods, etc.)
+    status = AcpiInitializeObjects(ACPI_FULL_INITIALIZATION);
+    if (ACPI_FAILURE(status)) {
+        kprintf("ACPI: InitObjects failed: %d\n", (int)status);
+    } else {
+        kprintf("ACPI: InitObjects ok\n");
+    }
+
+    // Parse MADT for CPU/IOAPIC information
     acpi_parse_madt();
-    
-    // Determine BSP (first CPU with lowest APIC ID that's enabled, or use LAPIC ID)
+
+    // Determine BSP
     if (g_acpi_info.cpu_count > 0) {
-        // Mark BSP (assume CPU 0 is BSP for now; ideally read from LAPIC)
         g_acpi_info.cpus[0].bsp = true;
         g_acpi_info.cpus[0].started = true;
         g_acpi_info.bsp_apic_id = g_acpi_info.cpus[0].apic_id;
     }
-    
+
     acpi_print_info();
-    
     return 0;
 }
+
+// ============================================================================
+// Public API — Getters
+// ============================================================================
 
 acpi_info_t* acpi_get_info(void) {
     return &g_acpi_info;
@@ -305,9 +229,7 @@ uint32_t acpi_get_cpu_count(void) {
 }
 
 cpu_info_t* acpi_get_cpu(uint32_t index) {
-    if (index >= g_acpi_info.cpu_count) {
-        return NULL;
-    }
+    if (index >= g_acpi_info.cpu_count) return NULL;
     return &g_acpi_info.cpus[index];
 }
 
@@ -320,78 +242,766 @@ uint64_t acpi_get_lapic_address(void) {
 }
 
 ioapic_info_t* acpi_get_ioapic(uint32_t index) {
-    if (index >= g_acpi_info.ioapic_count) {
-        return NULL;
-    }
+    if (index >= g_acpi_info.ioapic_count) return NULL;
     return &g_acpi_info.ioapics[index];
 }
 
 irq_override_t* acpi_get_irq_override(uint8_t isa_irq) {
     for (uint32_t i = 0; i < g_acpi_info.irq_override_count; i++) {
-        if (g_acpi_info.irq_overrides[i].bus_irq == isa_irq) {
+        if (g_acpi_info.irq_overrides[i].bus_irq == isa_irq)
             return &g_acpi_info.irq_overrides[i];
-        }
     }
     return NULL;
 }
 
 uint32_t acpi_irq_to_gsi(uint8_t isa_irq) {
     irq_override_t* override = acpi_get_irq_override(isa_irq);
-    if (override) {
-        return override->gsi;
-    }
-    // No override, identity mapping
+    if (override) return override->gsi;
     return isa_irq;
 }
 
 void acpi_print_info(void) {
-    smp_dbg("ACPI: LAPIC address = 0x%lx\n", g_acpi_info.lapic_address);
-    smp_dbg("ACPI: %u CPU(s) found:\n", g_acpi_info.cpu_count);
-    
+    acpi_dbg("ACPI: LAPIC address = 0x%lx\n", g_acpi_info.lapic_address);
+    acpi_dbg("ACPI: %u CPU(s) found:\n", g_acpi_info.cpu_count);
     for (uint32_t i = 0; i < g_acpi_info.cpu_count; i++) {
-        cpu_info_t* cpu = &g_acpi_info.cpus[i];
-        smp_dbg("  CPU %u: APIC ID=%u, %s%s%s\n",
-                i, cpu->apic_id,
-                cpu->enabled ? "enabled" : "disabled",
-                cpu->bsp ? ", BSP" : "",
-                cpu->online_capable ? ", online-capable" : "");
+        acpi_dbg("  CPU %u: APIC ID=%u, %s%s%s\n",
+                i, g_acpi_info.cpus[i].apic_id,
+                g_acpi_info.cpus[i].enabled ? "enabled" : "disabled",
+                g_acpi_info.cpus[i].bsp ? ", BSP" : "",
+                g_acpi_info.cpus[i].online_capable ? ", online-capable" : "");
     }
-    
-    smp_dbg("ACPI: %u I/O APIC(s) found:\n", g_acpi_info.ioapic_count);
+    acpi_dbg("ACPI: %u I/O APIC(s) found:\n", g_acpi_info.ioapic_count);
     for (uint32_t i = 0; i < g_acpi_info.ioapic_count; i++) {
-        ioapic_info_t* ioapic = &g_acpi_info.ioapics[i];
-        smp_dbg("  I/O APIC %u: ID=%u, addr=0x%x, GSI base=%u\n",
-                i, ioapic->id, ioapic->address, ioapic->gsi_base);
+        acpi_dbg("  I/O APIC %u: ID=%u, addr=0x%x, GSI base=%u\n",
+                i, g_acpi_info.ioapics[i].id,
+                g_acpi_info.ioapics[i].address,
+                g_acpi_info.ioapics[i].gsi_base);
     }
-    
     if (g_acpi_info.irq_override_count > 0) {
-        smp_dbg("ACPI: %u IRQ override(s):\n", g_acpi_info.irq_override_count);
+        acpi_dbg("ACPI: %u IRQ override(s):\n", g_acpi_info.irq_override_count);
         for (uint32_t i = 0; i < g_acpi_info.irq_override_count; i++) {
-            irq_override_t* ovr = &g_acpi_info.irq_overrides[i];
-            smp_dbg("  IRQ %u -> GSI %u (pol=%u, trig=%u)\n",
-                    ovr->bus_irq, ovr->gsi, ovr->polarity, ovr->trigger_mode);
+            acpi_dbg("  IRQ %u -> GSI %u (pol=%u, trig=%u)\n",
+                    g_acpi_info.irq_overrides[i].bus_irq,
+                    g_acpi_info.irq_overrides[i].gsi,
+                    g_acpi_info.irq_overrides[i].polarity,
+                    g_acpi_info.irq_overrides[i].trigger_mode);
         }
     }
-    
-    if (g_acpi_info.dual_8259_present) {
-        smp_dbg("ACPI: PC-AT compatible dual-8259 present\n");
+    if (g_acpi_info.dual_8259_present)
+        acpi_dbg("ACPI: PC-AT compatible dual-8259 present\n");
+}
+
+// ============================================================================
+// ACPI Table Access — delegates to ACPICA
+// ============================================================================
+
+acpi_sdt_header_t* acpi_find_table(const char* signature) {
+    return acpi_find_table_index(signature, 0);
+}
+
+acpi_sdt_header_t* acpi_find_table_index(const char* signature, uint32_t index) {
+    ACPI_TABLE_HEADER *hdr = NULL;
+    ACPI_STATUS status = AcpiGetTable((char*)signature, index + 1, &hdr);
+    if (ACPI_FAILURE(status) || !hdr)
+        return NULL;
+    return (acpi_sdt_header_t*)hdr;
+}
+
+uint32_t acpi_get_table_count(const char* signature) {
+    uint32_t count = 0;
+    while (acpi_find_table_index(signature, count) != NULL)
+        count++;
+    return count;
+}
+
+int acpi_get_table_aml(const char* signature, uint32_t index,
+                       const uint8_t** aml, uint32_t* aml_len)
+{
+    if (!aml || !aml_len) return -1;
+    acpi_sdt_header_t* table = acpi_find_table_index(signature, index);
+    if (!table) return -1;
+    *aml = (const uint8_t*)table + sizeof(acpi_sdt_header_t);
+    *aml_len = table->length - sizeof(acpi_sdt_header_t);
+    return 0;
+}
+
+// ============================================================================
+// AML Value helpers (stub implementations for API compat)
+// ============================================================================
+
+void aml_bump_init(aml_bump_alloc_t* alloc) {
+    if (!alloc) return;
+    alloc->pool = (uint8_t*)kalloc(AML_BUMP_POOL_SIZE);
+    alloc->used = 0;
+    alloc->capacity = alloc->pool ? AML_BUMP_POOL_SIZE : 0;
+}
+
+void aml_bump_destroy(aml_bump_alloc_t* alloc) {
+    if (alloc && alloc->pool) { kfree(alloc->pool); alloc->pool = NULL; }
+}
+
+void* aml_bump_alloc(aml_bump_alloc_t* alloc, uint32_t size) {
+    if (!alloc || !alloc->pool || alloc->used + size > alloc->capacity) return NULL;
+    void* p = alloc->pool + alloc->used;
+    alloc->used += size;
+    return p;
+}
+
+void aml_value_init(aml_value_t* val) {
+    if (val) my_memset(val, 0, sizeof(*val));
+}
+
+void aml_value_copy(aml_value_t* dst, const aml_value_t* src,
+                    aml_bump_alloc_t* alloc) {
+    (void)alloc;
+    if (dst && src) my_memcpy(dst, src, sizeof(*dst));
+}
+
+uint64_t aml_value_to_integer(const aml_value_t* val) {
+    if (!val) return 0;
+    if (val->type == AML_VALUE_INTEGER) return val->integer;
+    return 0;
+}
+
+// ============================================================================
+// AML Device Discovery — via AcpiGetDevices
+// ============================================================================
+
+typedef struct {
+    const char* hid;
+    acpi_aml_device_info_t* out;
+    int max_out;
+    int count;
+} find_devices_ctx_t;
+
+static ACPI_STATUS
+find_devices_callback(ACPI_HANDLE Object, UINT32 NestingLevel, void *Context,
+                      void **ReturnValue)
+{
+    find_devices_ctx_t* ctx = (find_devices_ctx_t*)Context;
+    ACPI_DEVICE_INFO *info = NULL;
+    ACPI_STATUS status;
+    ACPI_BUFFER path_buf = {ACPI_ALLOCATE_BUFFER, NULL};
+    (void)NestingLevel;
+    (void)ReturnValue;
+
+    if (ctx->count >= ctx->max_out)
+        return AE_CTRL_TERMINATE;
+
+    status = AcpiGetObjectInfo(Object, &info);
+    if (ACPI_FAILURE(status) || !info)
+        return AE_OK;
+
+    status = AcpiGetName(Object, ACPI_FULL_PATHNAME, &path_buf);
+    if (ACPI_FAILURE(status)) {
+        AcpiOsFree(info);
+        return AE_OK;
     }
+
+    acpi_aml_device_info_t* dev = &ctx->out[ctx->count];
+    my_memset(dev, 0, sizeof(*dev));
+
+    // Copy path
+    my_strncpy(dev->path, (char*)path_buf.Pointer, ACPI_AML_MAX_PATH);
+
+    // Copy HID
+    if (info->Valid & ACPI_VALID_HID)
+        my_strncpy(dev->hid, info->HardwareId.String, ACPI_AML_MAX_HID);
+
+    // Copy CID (first compatible ID)
+    if (info->Valid & ACPI_VALID_CID && info->CompatibleIdList.Count > 0)
+        my_strncpy(dev->cid, info->CompatibleIdList.Ids[0].String, ACPI_AML_MAX_HID);
+
+    // Check for control methods
+    ACPI_HANDLE tmp;
+    dev->has_ps0 = (AcpiGetHandle(Object, "_PS0", &tmp) == AE_OK) ? 1 : 0;
+    dev->has_ps3 = (AcpiGetHandle(Object, "_PS3", &tmp) == AE_OK) ? 1 : 0;
+    dev->has_sta = (AcpiGetHandle(Object, "_STA", &tmp) == AE_OK) ? 1 : 0;
+    dev->has_crs = (AcpiGetHandle(Object, "_CRS", &tmp) == AE_OK) ? 1 : 0;
+    dev->has_dep = (AcpiGetHandle(Object, "_DEP", &tmp) == AE_OK) ? 1 : 0;
+
+    AcpiOsFree(path_buf.Pointer);
+    AcpiOsFree(info);
+
+    ctx->count++;
+    return AE_OK;
+}
+
+int acpi_aml_find_devices_by_hid(const char* hid,
+                                 acpi_aml_device_info_t* out,
+                                 int max_out)
+{
+    find_devices_ctx_t ctx;
+    if (!out || max_out <= 0) return 0;
+
+    ctx.hid = hid;
+    ctx.out = out;
+    ctx.max_out = max_out;
+    ctx.count = 0;
+
+    AcpiGetDevices((char*)hid, find_devices_callback, &ctx, NULL);
+    return ctx.count;
+}
+
+// ============================================================================
+// _STA Evaluation
+// ============================================================================
+
+uint32_t acpi_aml_eval_sta(const char* device_path) {
+    ACPI_HANDLE handle;
+    ACPI_STATUS status;
+    ACPI_BUFFER buf = {ACPI_ALLOCATE_BUFFER, NULL};
+    uint32_t sta_value = 0x0F;  // Default: present + enabled + functioning + visible
+
+    if (!device_path) return 0x0F;
+
+    status = AcpiGetHandle(NULL, (char*)device_path, &handle);
+    if (ACPI_FAILURE(status))
+        return 0x0F;  // Not found = assume present
+
+    status = AcpiEvaluateObject(handle, "_STA", NULL, &buf);
+    if (status == AE_NOT_FOUND)
+        return 0x0F;  // No _STA = assume present & enabled
+
+    if (ACPI_SUCCESS(status) && buf.Pointer) {
+        ACPI_OBJECT *obj = (ACPI_OBJECT*)buf.Pointer;
+        if (obj->Type == ACPI_TYPE_INTEGER)
+            sta_value = (uint32_t)obj->Integer.Value;
+        AcpiOsFree(buf.Pointer);
+    }
+
+    return sta_value;
+}
+
+// ============================================================================
+// _DEP Evaluation
+// ============================================================================
+
+int acpi_aml_eval_dep(const char* device_path,
+                      char dep_paths[][ACPI_AML_MAX_PATH],
+                      int max_deps)
+{
+    ACPI_HANDLE handle;
+    ACPI_STATUS status;
+    ACPI_BUFFER buf = {ACPI_ALLOCATE_BUFFER, NULL};
+    int count = 0;
+
+    if (!device_path || !dep_paths || max_deps <= 0) return 0;
+
+    status = AcpiGetHandle(NULL, (char*)device_path, &handle);
+    if (ACPI_FAILURE(status)) return 0;
+
+    status = AcpiEvaluateObject(handle, "_DEP", NULL, &buf);
+    if (ACPI_FAILURE(status) || !buf.Pointer) {
+        if (buf.Pointer) AcpiOsFree(buf.Pointer);
+        return 0;
+    }
+
+    ACPI_OBJECT *obj = (ACPI_OBJECT*)buf.Pointer;
+    if (obj->Type == ACPI_TYPE_PACKAGE) {
+        for (UINT32 i = 0; i < obj->Package.Count && count < max_deps; i++) {
+            ACPI_OBJECT *elem = &obj->Package.Elements[i];
+            if (elem->Type == ACPI_TYPE_LOCAL_REFERENCE && elem->Reference.Handle) {
+                ACPI_BUFFER name_buf = {ACPI_ALLOCATE_BUFFER, NULL};
+                if (AcpiGetName(elem->Reference.Handle, ACPI_FULL_PATHNAME,
+                                &name_buf) == AE_OK) {
+                    my_strncpy(dep_paths[count], (char*)name_buf.Pointer,
+                               ACPI_AML_MAX_PATH);
+                    AcpiOsFree(name_buf.Pointer);
+                    count++;
+                }
+            }
+        }
+    }
+
+    AcpiOsFree(buf.Pointer);
+    return count;
+}
+
+// ============================================================================
+// _CRS Evaluation and Resource Parsing
+// ============================================================================
+
+static ACPI_STATUS
+crs_walk_callback(ACPI_RESOURCE *Resource, void *Context)
+{
+    acpi_crs_result_t* result = (acpi_crs_result_t*)Context;
+
+    switch (Resource->Type) {
+    case ACPI_RESOURCE_TYPE_FIXED_MEMORY32:
+        if (result->mmio_base == 0) {
+            result->mmio_base = Resource->Data.FixedMemory32.Address;
+            result->mmio_len = Resource->Data.FixedMemory32.AddressLength;
+        }
+        break;
+
+    case ACPI_RESOURCE_TYPE_ADDRESS32: {
+        ACPI_RESOURCE_ADDRESS32 *a32 = &Resource->Data.Address32;
+        if (a32->ResourceType == ACPI_MEMORY_RANGE && result->mmio_base == 0) {
+            result->mmio_base = a32->Address.Minimum;
+            result->mmio_len = a32->Address.AddressLength;
+        }
+        break;
+    }
+
+    case ACPI_RESOURCE_TYPE_ADDRESS64: {
+        ACPI_RESOURCE_ADDRESS64 *a64 = &Resource->Data.Address64;
+        if (a64->ResourceType == ACPI_MEMORY_RANGE && result->mmio_base == 0) {
+            result->mmio_base = a64->Address.Minimum;
+            result->mmio_len = (uint32_t)a64->Address.AddressLength;
+        }
+        break;
+    }
+
+    case ACPI_RESOURCE_TYPE_EXTENDED_IRQ: {
+        ACPI_RESOURCE_EXTENDED_IRQ *irq = &Resource->Data.ExtendedIrq;
+        result->irq_triggering = (irq->Triggering == ACPI_EDGE_SENSITIVE) ? 1 : 0;
+        result->irq_polarity = (irq->Polarity == ACPI_ACTIVE_LOW) ? 1 : 0;
+        result->irq_sharing = irq->Shareable ? 1 : 0;
+        for (UINT8 j = 0; j < irq->InterruptCount &&
+             result->irq_count < ACPI_CRS_MAX_IRQS; j++) {
+            result->irqs[result->irq_count++] = irq->Interrupts[j];
+        }
+        break;
+    }
+
+    case ACPI_RESOURCE_TYPE_SERIAL_BUS: {
+        ACPI_RESOURCE_I2C_SERIALBUS *i2c;
+        if (Resource->Data.CommonSerialBus.Type != ACPI_RESOURCE_SERIAL_TYPE_I2C)
+            break;
+        if (result->i2c_device_count >= ACPI_CRS_MAX_I2C_DEVICES)
+            break;
+        i2c = &Resource->Data.I2cSerialBus;
+        {
+            uint8_t idx = result->i2c_device_count;
+            result->i2c_devices[idx].slave_addr = i2c->SlaveAddress;
+            result->i2c_devices[idx].connection_speed = i2c->ConnectionSpeed;
+            result->i2c_devices[idx].addr_mode =
+                (i2c->AccessMode == ACPI_I2C_10BIT_MODE) ? 1 : 0;
+            result->i2c_device_count++;
+        }
+        break;
+    }
+
+    case ACPI_RESOURCE_TYPE_END_TAG:
+        return AE_OK;
+
+    default:
+        break;
+    }
+
+    return AE_OK;
+}
+
+int acpi_aml_eval_crs(const char* device_path, acpi_crs_result_t* result) {
+    ACPI_HANDLE handle;
+    ACPI_STATUS status;
+
+    if (!device_path || !result) return -1;
+    my_memset(result, 0, sizeof(*result));
+
+    status = AcpiGetHandle(NULL, (char*)device_path, &handle);
+    if (ACPI_FAILURE(status)) {
+        kprintf("[CRS] %s not found(%d)\n", device_path, (int)status);
+        return -1;
+    }
+
+    // Check _CRS exists + try eval + walk — one diagnostic line
+    {
+        ACPI_HANDLE crs_h;
+        ACPI_STATUS ck = AcpiGetHandle(handle, "_CRS", &crs_h);
+        ACPI_BUFFER eb = {ACPI_ALLOCATE_BUFFER, NULL};
+        ACPI_STATUS ev = AcpiEvaluateObject(handle, "_CRS", NULL, &eb);
+        int blen = 0;
+        if (ACPI_SUCCESS(ev) && eb.Pointer) {
+            ACPI_OBJECT *o = (ACPI_OBJECT*)eb.Pointer;
+            if (o->Type == ACPI_TYPE_BUFFER) blen = (int)o->Buffer.Length;
+            AcpiOsFree(eb.Pointer);
+        }
+        kprintf("[CRS] %s exist=%d eval=%d blen=%d\n",
+                device_path, (int)ck, (int)ev, blen);
+    }
+
+    status = AcpiWalkResources(handle, "_CRS", crs_walk_callback, result);
+    if (ACPI_FAILURE(status)) {
+        kprintf("[CRS] %s walk fail=%d\n", device_path, (int)status);
+        return -1;
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// _DSM Call (Device Specific Method)
+// ============================================================================
+
+int acpi_aml_call_dsm(const char* device_path,
+                      const uint8_t uuid[16],
+                      uint64_t revision,
+                      uint64_t func_index,
+                      aml_value_t* result)
+{
+    ACPI_HANDLE handle;
+    ACPI_STATUS status;
+    ACPI_OBJECT_LIST arg_list;
+    ACPI_OBJECT args[4];
+    ACPI_BUFFER ret_buf = {ACPI_ALLOCATE_BUFFER, NULL};
+
+    if (!device_path || !uuid) return -1;
+    if (result) aml_value_init(result);
+
+    status = AcpiGetHandle(NULL, (char*)device_path, &handle);
+    if (ACPI_FAILURE(status)) return -1;
+
+    // Arg0: UUID buffer (16 bytes, byte-swapped as per ACPI spec)
+    uint8_t uuid_buf[16];
+    // ACPI UUID byte order: first 3 components swapped, rest as-is
+    uuid_buf[0] = uuid[3]; uuid_buf[1] = uuid[2];
+    uuid_buf[2] = uuid[1]; uuid_buf[3] = uuid[0];
+    uuid_buf[4] = uuid[5]; uuid_buf[5] = uuid[4];
+    uuid_buf[6] = uuid[7]; uuid_buf[7] = uuid[6];
+    my_memcpy(&uuid_buf[8], &uuid[8], 8);
+
+    args[0].Type = ACPI_TYPE_BUFFER;
+    args[0].Buffer.Length = 16;
+    args[0].Buffer.Pointer = uuid_buf;
+
+    // Arg1: Revision
+    args[1].Type = ACPI_TYPE_INTEGER;
+    args[1].Integer.Value = revision;
+
+    // Arg2: Function Index
+    args[2].Type = ACPI_TYPE_INTEGER;
+    args[2].Integer.Value = func_index;
+
+    // Arg3: Empty package
+    args[3].Type = ACPI_TYPE_PACKAGE;
+    args[3].Package.Count = 0;
+    args[3].Package.Elements = NULL;
+
+    arg_list.Count = 4;
+    arg_list.Pointer = args;
+
+    status = AcpiEvaluateObject(handle, "_DSM", &arg_list, &ret_buf);
+    if (ACPI_FAILURE(status)) return -1;
+
+    if (result && ret_buf.Pointer) {
+        ACPI_OBJECT *obj = (ACPI_OBJECT*)ret_buf.Pointer;
+        if (obj->Type == ACPI_TYPE_INTEGER) {
+            result->type = AML_VALUE_INTEGER;
+            result->integer = obj->Integer.Value;
+        } else if (obj->Type == ACPI_TYPE_BUFFER) {
+            result->type = AML_VALUE_BUFFER;
+            // Note: caller must not use buffer after this function returns
+            // since we free it here. For simplicity, just return integer 0.
+            result->type = AML_VALUE_INTEGER;
+            result->integer = 0;
+            if (obj->Buffer.Length >= 1)
+                result->integer = obj->Buffer.Pointer[0];
+        }
+    }
+
+    if (ret_buf.Pointer)
+        AcpiOsFree(ret_buf.Pointer);
+    return 0;
+}
+
+// ============================================================================
+// PCI-to-ACPI Path Mapping
+// ============================================================================
+
+typedef struct {
+    uint32_t target_adr;
+    char* out_path;
+    int out_size;
+    int found;
+} find_pci_ctx_t;
+
+static ACPI_STATUS
+find_pci_callback(ACPI_HANDLE Object, UINT32 NestingLevel, void *Context,
+                  void **ReturnValue)
+{
+    find_pci_ctx_t* ctx = (find_pci_ctx_t*)Context;
+    ACPI_STATUS status;
+    uint64_t adr_val = 0;
+    ACPI_BUFFER name_buf = {ACPI_ALLOCATE_BUFFER, NULL};
+    (void)NestingLevel;
+    (void)ReturnValue;
+
+    if (ctx->found) return AE_CTRL_TERMINATE;
+
+    // Try to get _ADR via public API
+    {
+        ACPI_BUFFER buf = {ACPI_ALLOCATE_BUFFER, NULL};
+        status = AcpiEvaluateObject(Object, "_ADR", NULL, &buf);
+        if (ACPI_FAILURE(status)) return AE_OK;
+        if (buf.Pointer) {
+            ACPI_OBJECT *obj = (ACPI_OBJECT*)buf.Pointer;
+            if (obj->Type == ACPI_TYPE_INTEGER)
+                adr_val = obj->Integer.Value;
+            AcpiOsFree(buf.Pointer);
+        } else {
+            return AE_OK;
+        }
+    }
+
+    if ((uint32_t)adr_val == ctx->target_adr) {
+        status = AcpiGetName(Object, ACPI_FULL_PATHNAME, &name_buf);
+        if (ACPI_SUCCESS(status) && name_buf.Pointer) {
+            my_strncpy(ctx->out_path, (char*)name_buf.Pointer, ctx->out_size);
+            AcpiOsFree(name_buf.Pointer);
+            ctx->found = 1;
+            return AE_CTRL_TERMINATE;
+        }
+    }
+
+    return AE_OK;
+}
+
+int acpi_find_pci_acpi_path(uint8_t bus, uint8_t device, uint8_t function,
+                            char* out_path, int out_size)
+{
+    find_pci_ctx_t ctx;
+    ACPI_STATUS status;
+
+    (void)bus;
+    if (!out_path || out_size <= 0) return -1;
+
+    ctx.target_adr = ((uint32_t)device << 16) | function;
+    ctx.out_path = out_path;
+    ctx.out_size = out_size;
+    ctx.found = 0;
+
+    // Walk entire namespace looking for matching _ADR
+    status = AcpiWalkNamespace(ACPI_TYPE_DEVICE, ACPI_ROOT_OBJECT,
+                               ACPI_UINT32_MAX, find_pci_callback,
+                               NULL, &ctx, NULL);
+    (void)status;
+
+    if (ctx.found) return 0;
+
+    // Fallback: for Intel LPSS I2C, try I2Cn naming convention
+    {
+        char i2c_name[16];
+        for (int n = 0; n < 8; n++) {
+            ACPI_HANDLE handle;
+
+            // Build candidate name like "\\_SB.PC00.I2Cn"
+            // Try finding I2Cn anywhere in namespace
+            i2c_name[0] = 'I';
+            i2c_name[1] = '2';
+            i2c_name[2] = 'C';
+            i2c_name[3] = '0' + (char)n;
+            i2c_name[4] = 0;
+
+            // Walk namespace for this name
+            ACPI_HANDLE root;
+            AcpiGetHandle(NULL, "\\_SB", &root);
+            if (!root) break;
+
+            // Use AcpiGetDevices with NULL HID to find all, then match name
+            // Simpler: try common paths
+            char paths_to_try[4][32] = {
+                "\\_SB.PC00.",
+                "\\_SB.PCI0.",
+                "\\_SB.",
+                "\\."
+            };
+            int matched = 0;
+            for (int p = 0; p < 4 && !matched; p++) {
+                char full[64];
+                int plen = my_strlen(paths_to_try[p]);
+                my_memcpy(full, paths_to_try[p], plen);
+                my_memcpy(full + plen, i2c_name, 5);
+                if (AcpiGetHandle(NULL, full, &handle) == AE_OK) {
+                    int fmatch = 0;
+                    if (device == 0x15 && function == (uint8_t)n && n <= 3)
+                        fmatch = 1;
+                    else if (device == 0x19 && function == (uint8_t)(n - 4) && n >= 4)
+                        fmatch = 1;
+                    if (fmatch) {
+                        my_strncpy(out_path, full, out_size);
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+
+    return -1;
+}
+
+// ============================================================================
+// Power On Device with Dependencies
+// ============================================================================
+
+static int acpi_eval_method_on_path(const char* path, const char* method) {
+    ACPI_HANDLE handle;
+    ACPI_STATUS status;
+
+    status = AcpiGetHandle(NULL, (char*)path, &handle);
+    if (ACPI_FAILURE(status)) return -1;
+
+    status = AcpiEvaluateObject(handle, (char*)method, NULL, NULL);
+    return ACPI_SUCCESS(status) ? 0 : -1;
+}
+
+int acpi_power_on_device_with_deps(const char* device_path)
+{
+    char dep_paths[ACPI_DEP_MAX_DEPS][ACPI_AML_MAX_PATH];
+    int dep_count;
+    int dep_failures = 0;
+
+    if (!device_path) return ACPI_FW_STATUS_NOT_FOUND;
+
+    // Step 1: Evaluate _DEP
+    dep_count = acpi_aml_eval_dep(device_path, dep_paths, ACPI_DEP_MAX_DEPS);
+
+    // Step 2: Power on dependencies
+    for (int i = 0; i < dep_count; i++) {
+        if (acpi_eval_method_on_path(dep_paths[i], "_PS0") == 0) {
+            kprintf("[ACPI-PWR] dep %s _PS0 ok\n", dep_paths[i]);
+        } else if (acpi_eval_method_on_path(dep_paths[i], "_ON") == 0) {
+            kprintf("[ACPI-PWR] dep %s _ON ok\n", dep_paths[i]);
+        } else {
+            dep_failures++;
+        }
+    }
+
+    // Step 3: Power on _PR0 power resources (evaluate _PR0 package)
+    {
+        ACPI_HANDLE handle;
+        ACPI_BUFFER buf = {ACPI_ALLOCATE_BUFFER, NULL};
+        ACPI_STATUS status = AcpiGetHandle(NULL, (char*)device_path, &handle);
+        if (ACPI_SUCCESS(status)) {
+            status = AcpiEvaluateObject(handle, "_PR0", NULL, &buf);
+            if (ACPI_SUCCESS(status) && buf.Pointer) {
+                ACPI_OBJECT *obj = (ACPI_OBJECT*)buf.Pointer;
+                if (obj->Type == ACPI_TYPE_PACKAGE) {
+                    for (UINT32 i = 0; i < obj->Package.Count; i++) {
+                        ACPI_OBJECT *elem = &obj->Package.Elements[i];
+                        if (elem->Type == ACPI_TYPE_LOCAL_REFERENCE &&
+                            elem->Reference.Handle) {
+                            ACPI_BUFFER nb = {ACPI_ALLOCATE_BUFFER, NULL};
+                            if (AcpiGetName(elem->Reference.Handle,
+                                            ACPI_FULL_PATHNAME, &nb) == AE_OK) {
+                                char pr_path[ACPI_AML_MAX_PATH];
+                                my_strncpy(pr_path, (char*)nb.Pointer,
+                                           ACPI_AML_MAX_PATH);
+                                AcpiOsFree(nb.Pointer);
+                                if (acpi_eval_method_on_path(pr_path, "_ON") == 0)
+                                    kprintf("[ACPI-PWR] pr0 %s _ON ok\n", pr_path);
+                            }
+                        }
+                    }
+                }
+                AcpiOsFree(buf.Pointer);
+            }
+        }
+    }
+
+    // Step 4: Check _STA
+    uint32_t dev_sta = acpi_aml_eval_sta(device_path);
+    kprintf("[ACPI-PWR] %s _STA=0x%x\n", device_path, dev_sta);
+
+    // Step 5: Call _PS0 on target device
+    {
+        int ps0_rc = acpi_eval_method_on_path(device_path, "_PS0");
+        kprintf("[ACPI-PWR] %s _PS0=%s dep=%d/%d\n",
+                device_path, ps0_rc == 0 ? "ok" : "fail/absent",
+                dep_count - dep_failures, dep_count);
+    }
+
+    return ACPI_FW_STATUS_OK;
+}
+
+// ============================================================================
+// Firmware Power On by HID
+// ============================================================================
+
+int acpi_fw_power_on_device(const char* hid, acpi_aml_device_info_t* out)
+{
+    acpi_aml_device_info_t info;
+    int found;
+
+    if (!hid || !hid[0]) return ACPI_FW_STATUS_NOT_FOUND;
+
+    found = acpi_aml_find_devices_by_hid(hid, &info, 1);
+    if (found <= 0) return ACPI_FW_STATUS_NOT_FOUND;
+
+    if (out) my_memcpy(out, &info, sizeof(info));
+
+    int rc = acpi_power_on_device_with_deps(info.path);
+    return rc;
+}
+
+// ============================================================================
+// Firmware Power On by PCI BDF
+// ============================================================================
+
+int acpi_fw_power_on_pci_device(uint8_t bus, uint8_t device, uint8_t function)
+{
+    char acpi_path[ACPI_AML_MAX_PATH];
+    int rc;
+
+    rc = acpi_find_pci_acpi_path(bus, device, function,
+                                 acpi_path, sizeof(acpi_path));
+    if (rc != 0) {
+        kprintf("[ACPI-PCI] no ACPI path for PCI %02x:%02x.%x\n",
+                bus, device, function);
+        return ACPI_FW_STATUS_NOT_FOUND;
+    }
+
+    kprintf("[ACPI-PCI] PCI %02x:%02x.%x => %s\n",
+            bus, device, function, acpi_path);
+    return acpi_power_on_device_with_deps(acpi_path);
+}
+
+// ============================================================================
+// Execute a named method on a device
+// ============================================================================
+
+int acpi_aml_exec_device_method(const char* device_path,
+                                const char* method_name,
+                                uint64_t* ret_value)
+{
+    ACPI_HANDLE handle;
+    ACPI_STATUS status;
+    ACPI_BUFFER buf = {ACPI_ALLOCATE_BUFFER, NULL};
+
+    if (!device_path || !method_name) return -1;
+
+    status = AcpiGetHandle(NULL, (char*)device_path, &handle);
+    if (ACPI_FAILURE(status)) return -1;
+
+    status = AcpiEvaluateObject(handle, (char*)method_name, NULL, &buf);
+    if (ACPI_FAILURE(status)) return -1;
+
+    if (ret_value && buf.Pointer) {
+        ACPI_OBJECT *obj = (ACPI_OBJECT*)buf.Pointer;
+        if (obj->Type == ACPI_TYPE_INTEGER)
+            *ret_value = obj->Integer.Value;
+        else
+            *ret_value = 0;
+    }
+
+    if (buf.Pointer) AcpiOsFree(buf.Pointer);
+    return 0;
 }
 
 // ============================================================================
 // ACPI Power Management — S5 (poweroff) and reset
 // ============================================================================
 
-static uint32_t g_pm1a_cnt_blk = 0;   // PM1a control block I/O port
-static uint32_t g_pm1b_cnt_blk = 0;   // PM1b control block I/O port
-static uint16_t g_slp_typa = 0;       // SLP_TYPa value for S5
-static uint16_t g_slp_typb = 0;       // SLP_TYPb value for S5
+static uint32_t g_pm1a_cnt_blk = 0;
+static uint32_t g_pm1b_cnt_blk = 0;
+static uint16_t g_slp_typa = 0;
+static uint16_t g_slp_typb = 0;
 static uint8_t  g_reset_reg_space = 0;
 static uint64_t g_reset_reg_addr = 0;
 static uint8_t  g_reset_value = 0;
 static int      g_pm_initialized = 0;
 
-// I/O port access helpers
 static inline void acpi_outw(uint16_t port, uint16_t val) {
     __asm__ volatile("outw %0, %1" :: "a"(val), "Nd"(port));
 }
@@ -406,54 +1016,40 @@ static inline uint16_t acpi_inw(uint16_t port) {
     return val;
 }
 
-// Parse DSDT/SSDT for \_S5 object to get SLP_TYP values
 static int acpi_parse_s5(uint8_t *aml, uint32_t length) {
-    // Search for the byte sequence: '_' 'S' '5' '_'
     for (uint32_t i = 0; i + 4 < length; i++) {
         if (aml[i] == '_' && aml[i+1] == 'S' && aml[i+2] == '5' && aml[i+3] == '_') {
-            // Found \_S5 name — skip to the package
-            // Look for PackageOp (0x12) within a small window after the name
             for (uint32_t j = i + 4; j < i + 32 && j + 5 < length; j++) {
                 if (aml[j] == 0x12) {
-                    // PackageOp found: skip PkgLength and NumElements
                     uint32_t k = j + 1;
-                    // Decode PkgLength (simple 1-byte form)
                     uint8_t pkg_lead = aml[k];
                     if (pkg_lead & 0xC0) {
-                        // Multi-byte PkgLength
                         int extra = (pkg_lead >> 6) & 3;
                         k += 1 + extra;
                     } else {
                         k += 1;
                     }
-                    // NumElements byte
                     k++;
-                    // Now read SLP_TYPa — could be BytePrefix (0x0A) + byte, or raw byte
                     if (k < length) {
                         if (aml[k] == 0x0A && k + 1 < length) {
-                            g_slp_typa = aml[k + 1];
-                            k += 2;
+                            g_slp_typa = aml[k + 1]; k += 2;
                         } else {
-                            g_slp_typa = aml[k];
-                            k += 1;
+                            g_slp_typa = aml[k]; k += 1;
                         }
                     }
-                    // SLP_TYPb
                     if (k < length) {
                         if (aml[k] == 0x0A && k + 1 < length) {
-                            g_slp_typb = aml[k + 1];
-                            k += 2;
+                            g_slp_typb = aml[k + 1]; k += 2;
                         } else {
-                            g_slp_typb = aml[k];
-                            k += 1;
+                            g_slp_typb = aml[k]; k += 1;
                         }
                     }
-                    return 1; // Success
+                    return 1;
                 }
             }
         }
     }
-    return 0; // Not found
+    return 0;
 }
 
 void acpi_pm_init(void) {
@@ -463,24 +1059,21 @@ void acpi_pm_init(void) {
         return;
     }
 
-    // Read PM1a/PM1b control block I/O port addresses directly from FADT
     g_pm1a_cnt_blk = fadt->pm1a_control_block;
     g_pm1b_cnt_blk = fadt->pm1b_control_block;
 
-    // Save reset register info
     if (fadt->header.length >= 129) {
         g_reset_reg_space = fadt->reset_reg_addr_space;
         g_reset_reg_addr = fadt->reset_reg_address;
         g_reset_value = fadt->reset_value;
     }
 
-    // Find the DSDT to parse \_S5 for sleep type values
+    // Use ACPICA to get DSDT for S5 parsing
     uint64_t dsdt_addr = 0;
-    if (fadt->header.length >= 148 && fadt->x_dsdt != 0) {
+    if (fadt->header.length >= 148 && fadt->x_dsdt != 0)
         dsdt_addr = fadt->x_dsdt;
-    } else {
+    else
         dsdt_addr = fadt->dsdt;
-    }
 
     if (dsdt_addr) {
         acpi_sdt_header_t *dsdt = (acpi_sdt_header_t *)phys_to_virt(dsdt_addr);
@@ -491,7 +1084,7 @@ void acpi_pm_init(void) {
                     g_slp_typa, g_slp_typb);
         } else {
             kprintf("ACPI PM: \\_S5 not found in DSDT, using defaults\n");
-            g_slp_typa = 5;  // Common default for S5
+            g_slp_typa = 5;
             g_slp_typb = 0;
         }
     }
@@ -504,65 +1097,46 @@ void acpi_pm_init(void) {
 void acpi_poweroff(void) {
     if (!g_pm_initialized) {
         kprintf("ACPI: power management not initialized, trying QEMU exit\n");
-        // QEMU debug exit (ISA debug port)
         acpi_outw(0x604, 0x2000);
-        // If that didn't work, halt
         for (;;) __asm__ volatile("cli; hlt");
     }
 
     kprintf("ACPI: powering off...\n");
-
-    // Disable all interrupts
     __asm__ volatile("cli");
 
-    // Write SLP_TYPa | SLP_EN to PM1a control register
     uint16_t val = ACPI_PM1_SLP_TYP(g_slp_typa) | ACPI_PM1_SLP_EN;
     acpi_outw((uint16_t)g_pm1a_cnt_blk, val);
 
-    // If PM1b exists, write there too
     if (g_pm1b_cnt_blk) {
         val = ACPI_PM1_SLP_TYP(g_slp_typb) | ACPI_PM1_SLP_EN;
         acpi_outw((uint16_t)g_pm1b_cnt_blk, val);
     }
 
-    // If ACPI poweroff failed, try QEMU debug port
     acpi_outw(0x604, 0x2000);
-
-    // Should not reach here
     for (;;) __asm__ volatile("hlt");
 }
 
 void acpi_reset(void) {
     kprintf("ACPI: resetting system...\n");
-
-    // Disable all interrupts
     __asm__ volatile("cli");
 
-    // Method 1: ACPI reset register (ACPI 2.0+)
     if (g_reset_reg_addr != 0) {
-        if (g_reset_reg_space == 1) {
-            // System I/O space
+        if (g_reset_reg_space == 1)
             acpi_outb((uint16_t)g_reset_reg_addr, g_reset_value);
-        }
-        // Small delay
         for (volatile int i = 0; i < 1000000; i++);
     }
 
-    // Method 2: Keyboard controller reset (8042)
-    // Pulse the CPU reset line via the keyboard controller
+    // Keyboard controller reset
     uint8_t good = 0x02;
-    while (good & 0x02) {
+    while (good & 0x02)
         __asm__ volatile("inb $0x64, %0" : "=a"(good));
-    }
     __asm__ volatile("outb %0, $0x64" :: "a"((uint8_t)0xFE));
 
-    // Small delay
     for (volatile int i = 0; i < 1000000; i++);
 
-    // Method 3: Triple fault — load a null IDT and trigger an interrupt
+    // Triple fault
     struct { uint16_t limit; uint64_t base; } __attribute__((packed)) null_idt = {0, 0};
     __asm__ volatile("lidt %0; int $3" :: "m"(null_idt));
 
-    // Should never reach here
     for (;;) __asm__ volatile("hlt");
 }

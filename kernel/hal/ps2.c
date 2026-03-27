@@ -63,7 +63,18 @@ int ps2_init(void) {
         for(volatile int d=0; d<100000; ++d) { __asm__ __volatile__("nop"); }
     }
     if(attempt==2) {
-        kprintf("PS2: controller not present (cfg read failed)\n");
+        kprintf("PS2: no i8042 controller detected\n");
+        // Dell/eSPI fallback: the Embedded Controller may have disabled
+        // the keyboard port when we sent 0xAD.  Try to re-enable it so
+        // that IRQ1 still delivers scancodes via the EC.
+        write_cmd(0xAE);   // enable first port
+        write_data(0xF4);  // enable scanning
+        uint8_t fb_ack = 0;
+        if (read_data(&fb_ack) == 0 && fb_ack == 0xFA) {
+            kprintf("PS2: EC keyboard enabled via fallback (ack=0x%02x)\n", fb_ack);
+            return 0;
+        }
+        kprintf("PS2: EC fallback did not respond (ack=0x%02x)\n", fb_ack);
         return -1;
     }
     uint8_t original_cfg = cfg;

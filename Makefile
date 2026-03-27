@@ -61,10 +61,29 @@ EFI_LDS = /usr/lib/elf_x86_64_efi.lds
 # Note: Stack protector disabled because __stack_chk_guard access can conflict
 # with identity mapping removal during boot
 BUILD_DATE := $(shell LC_ALL=C date -u '+%a %b %-d %H:%M:%S UTC %Y')
-KERNEL_CFLAGS = -m64 -O1 -ffreestanding -nostdlib -nostdinc -fno-builtin \
+KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-fno-stack-protector -mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
-			-I$(INCLUDE_DIR) -DXHCI_USE_INTERRUPTS=1 $(SERIAL_CFLAGS) \
+			-I$(INCLUDE_DIR) -I$(KERNEL_DIR)/hal/acpica/include \
+			-D__LIKEOS__ -DACPI_USE_BUILTIN_STDARG \
+			-U__linux__ -U_LINUX -Ulinux \
+			-DXHCI_USE_INTERRUPTS=1 $(SERIAL_CFLAGS) \
 			-DBUILD_DATE='"$(BUILD_DATE)"'
+
+# Extra flags for ACPICA sources (suppress upstream warnings)
+# -U__linux__ -U_LINUX: prevent ACPICA from selecting aclinux.h (GCC defines
+#   __linux__ even with -ffreestanding; we want our aclikeos.h instead).
+ACPICA_CFLAGS = $(KERNEL_CFLAGS) -DACPI_USE_BUILTIN_STDARG \
+			-U__linux__ -U_LINUX -Ulinux \
+			-Wno-unused-parameter -Wno-unused-variable \
+			-Wno-implicit-fallthrough -Wno-sign-compare -Wno-missing-field-initializers \
+			-Wno-type-limits -Wno-override-init
+
+# ACPICA source files (auto-discovered, excluding debugger/disassembler/dump)
+ACPICA_DIR = $(KERNEL_DIR)/hal/acpica
+ACPICA_SRCS = $(shell find $(ACPICA_DIR) -name '*.c' \
+			-not -path '*/debugger/*' -not -path '*/disassembler/*' \
+			-not -name 'rsdump.c' -not -name 'rsdumpinfo.c' | sort)
+ACPICA_OBJS = $(patsubst $(ACPICA_DIR)/%.c,$(BUILD_DIR)/acpica/%.o,$(ACPICA_SRCS))
 
 # Compiler flags for userspace programs
 USER_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
@@ -124,10 +143,12 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/signal.o \
 			  $(BUILD_DIR)/lapic.o \
 			  $(BUILD_DIR)/acpi.o \
+			  $(ACPICA_OBJS) \
 			  $(BUILD_DIR)/percpu.o \
 			  $(BUILD_DIR)/smp.o \
 			  $(BUILD_DIR)/ap_trampoline.o \
-			  $(BUILD_DIR)/futex.o
+			  $(BUILD_DIR)/futex.o \
+			  $(BUILD_DIR)/i2c_hid.o
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -243,6 +264,9 @@ $(BUILD_DIR)/usbhid.o: $(KERNEL_DIR)/hal/usbhid.c | $(BUILD_DIR)
 $(BUILD_DIR)/ps2.o: $(KERNEL_DIR)/hal/ps2.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/i2c_hid.o: $(KERNEL_DIR)/hal/i2c_hid.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/ioapic.o: $(KERNEL_DIR)/hal/ioapic.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
@@ -278,6 +302,11 @@ $(BUILD_DIR)/lapic.o: $(KERNEL_DIR)/hal/lapic.c | $(BUILD_DIR)
 
 $(BUILD_DIR)/acpi.o: $(KERNEL_DIR)/hal/acpi.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# Pattern rule for all ACPICA source files
+$(BUILD_DIR)/acpica/%.o: $(ACPICA_DIR)/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(GCC) $(ACPICA_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/percpu.o: $(KERNEL_DIR)/ke/percpu.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@

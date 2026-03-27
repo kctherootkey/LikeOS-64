@@ -256,6 +256,13 @@ void mm_flush_all_tlb(void);
 // Returns the virtual address, or 0 on failure.
 uint64_t mm_map_mmio(uint64_t phys_addr, size_t num_pages);
 
+// Device MMIO mapping for PCI/SoC BARs.
+// If the physical range is already covered by the kernel direct map, this
+// rewrites the direct-map PTEs in place to use uncacheable attributes so we
+// do not create a conflicting WB+UC alias for the same registers.
+// If the range is outside the direct map, it falls back to mm_map_mmio().
+uint64_t mm_map_device_mmio(uint64_t phys_addr, size_t num_pages);
+
 // SYSCALL/SYSRET configuration
 void mm_initialize_syscall(void);
 

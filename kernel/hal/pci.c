@@ -71,28 +71,46 @@ void pci_init(void)
     g_pci_count = 0;
 }
 
-// Very simple BAR allocator: assigns incremental 1MB windows starting at 0xF2000000 downward for any 32/64-bit memory BAR that is zero/unassigned.
-// Not spec-complete; just enough so devices like xHCI get a decodable MMIO region under 4GB.
-static unsigned long g_next_bar_base = 0xF2000000UL; /* leave 0xF1000000 for earlier manual uses */
+// BAR allocator: assigns from the PCI host bridge memory windows, growing
+// downward.  On Intel Arrow Lake / Meteor Lake:
+//   32-bit window: 0x70000000-0xBFFFFFFF
+//   64-bit window: ~0x5000000000-0x501C2FFFFF (above 4 GB)
+// Linux pci_assign_unassigned_bus_resources() assigns 64-bit BARs from the
+// 64-bit window (e.g. 0x501C2DD000 for LPSS I2C).
+static unsigned long g_next_bar_base   = 0xBF000000UL;
+static unsigned long g_next_bar64_base = 0x501C300000UL;
+
+static unsigned long round_up_pow2(unsigned long size)
+{
+    if(size == 0)
+        return 0x1000;
+    if(size & (size - 1)) {
+        unsigned long p = 1;
+        while(p < size)
+            p <<= 1;
+        return p;
+    }
+    return size;
+}
+
 static unsigned long alloc_bar_region(unsigned long size)
 {
-    /* Align base downward by size */
-    if(size == 0) {
-        size = 0x1000;
-    }
-    if(size & (size - 1)) { /* round to power of two */
-        unsigned long p = 1;
-        while(p < size) {
-            p <<= 1;
-        }
-        size = p;
-    }
-    if(g_next_bar_base < size) {
-        return 0; /* out of space */
-    }
+    size = round_up_pow2(size);
+    if(g_next_bar_base < size)
+        return 0;
     g_next_bar_base -= size;
     g_next_bar_base &= ~(size - 1);
     return g_next_bar_base;
+}
+
+static unsigned long alloc_bar64_region(unsigned long size)
+{
+    size = round_up_pow2(size);
+    if(g_next_bar64_base < size)
+        return 0;
+    g_next_bar64_base -= size;
+    g_next_bar64_base &= ~(size - 1);
+    return g_next_bar64_base;
 }
 
 void pci_assign_unassigned_bars(void)
@@ -138,7 +156,13 @@ void pci_assign_unassigned_bars(void)
                 if(size == 0 || size > (1UL << 24)) {
                     size = 1UL << 16; /* clamp */
                 }
-                unsigned long base = alloc_bar_region(size);
+                /* Use 64-bit window for Intel serial bus controllers
+                   (class 0x0C, subclass 0x80 — covers all LPSS I2C/UART).
+                   Everything else gets 32-bit addresses. */
+                int use64 = is64 && p->vendor_id == 0x8086 &&
+                            p->class_code == 0x0C && p->subclass == 0x80;
+                unsigned long base = use64 ? alloc_bar64_region(size)
+                                           : alloc_bar_region(size);
                 if(base) {
                     unsigned int low = (unsigned int)((base & 0xFFFFFFFFUL) | (mask & 0xF));
                     pci_cfg_write32(p->bus, p->device, p->function, off, low);
