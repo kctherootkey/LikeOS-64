@@ -23,6 +23,7 @@
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/usbhid.h"
+#include "../../include/kernel/i2c_hid.h"
 
 void system_startup(boot_info_t* boot_info);
 void kernel_main(boot_info_t* boot_info);
@@ -126,8 +127,16 @@ void continue_system_startup(void) {
     mouse_init();
     irq_enable(12);
 
+    // ACPI must be ready before LPSS/I2C-HID probing so targeted firmware
+    // discovery can inspect the controller and HID device nodes.
+    acpi_init(g_rsdp_address);
+    acpi_pm_init();
+
     xhci_boot_init(&g_xhci_boot);
     usbhid_init();
+    int i2c_nctrl = i2c_hid_init();
+    kprintf("[INIT] I2C init done (rc=%d)\n", i2c_nctrl);
+
     storage_fs_init(&g_storage_state);
 
     __asm__ volatile ("sti");
@@ -135,10 +144,7 @@ void continue_system_startup(void) {
     sched_init();
 
     // Initialize SMP support
-    // This sets up per-CPU data and detects available CPUs via ACPI
-    // Pass RSDP address from UEFI bootloader for proper ACPI table discovery
-    acpi_init(g_rsdp_address);
-    acpi_pm_init();
+    // ACPI was initialized earlier so LPSS/I2C-HID probing can use it.
     percpu_init();
     smp_init(g_smp_trampoline_address);
     
@@ -183,6 +189,7 @@ void continue_system_startup(void) {
         xhci_hotplug_poll(&g_xhci);
         xhci_hotplug_poll(&g_xhci_hid);
         usbhid_poll();
+        i2c_hid_poll();
         storage_fs_poll(&g_storage_state);
         console_cursor_update();  // Update blinking cursor
         sched_run_ready();

@@ -957,6 +957,34 @@ uint64_t* mm_get_page_table(uint64_t virtual_addr, bool create) {
         kprintf("PT: PD at %p, entry[%lu]=%p\n", pd, pd_index, (void*)pd[pd_index]);
     }
     
+    // Check for 2MB large page (PAGE_SIZE_FLAG set in PDE)
+    if ((pd[pd_index] & PAGE_PRESENT) && (pd[pd_index] & PAGE_SIZE_FLAG)) {
+        if (!create) {
+            return NULL;  // Can't split without create
+        }
+        // Split 2MB page into 512 4KB pages so individual pages can be remapped
+        uint64_t large_phys = pd[pd_index] & 0x000FFFFFFFE00000ULL; // 2MB-aligned phys
+        // Inherit all flags except PAGE_SIZE_FLAG (bit 7 = PAT in 4KB PTEs, but
+        // for 2MB pages bit 7 = PS; original 2MB PAT is bit 12 which we ignore
+        // since the bootloader sets WB caching by default)
+        uint64_t pte_flags = pd[pd_index] & 0x8000000000000E7FULL; // NX + bits 0-6,9-11
+        pte_flags &= ~PAGE_SIZE_FLAG; // clear bit 7 (PS -> PAT for 4KB, keep 0)
+        uint64_t split_pt = allocate_pt_page();
+        if (!split_pt) {
+            return NULL;
+        }
+        uint64_t* split_pt_virt = (uint64_t*)phys_to_virt(split_pt);
+        for (int k = 0; k < 512; k++) {
+            split_pt_virt[k] = (large_phys + (uint64_t)k * PAGE_SIZE) | pte_flags;
+        }
+        // Replace 2MB PDE with pointer to new 4KB page table
+        pd[pd_index] = split_pt | PAGE_PRESENT | PAGE_WRITABLE;
+        if (mm_debug_pt) {
+            kprintf("PT: Split 2MB page pd[%lu] phys=0x%lx into 4KB pages, PT at 0x%lx\n",
+                    pd_index, large_phys, split_pt);
+        }
+    }
+
     uint64_t pt_phys = pd[pd_index] & PTE_ADDR_MASK;
     uint64_t* pt = (pd[pd_index] & PAGE_PRESENT) ? (uint64_t*)phys_to_virt(pt_phys) : NULL;
     if (!pt && create) {
@@ -1137,8 +1165,10 @@ uint64_t mm_map_mmio(uint64_t phys_addr, size_t num_pages) {
     // Allocate a contiguous kernel virtual range from next_virtual_addr
     uint64_t lock_flags;
     spin_lock_irqsave(&mm_kernel_pt_lock, &lock_flags);
+    uint64_t cursor_before = mm_state.next_virtual_addr;
     uint64_t virt_base = mm_state.next_virtual_addr;
     mm_state.next_virtual_addr += num_pages * PAGE_SIZE;
+    uint64_t cursor_after = mm_state.next_virtual_addr;
     spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
 
     // Map each page as present + writable + write-through + cache-disable (UC)
@@ -1159,9 +1189,50 @@ uint64_t mm_map_mmio(uint64_t phys_addr, size_t num_pages) {
         }
     }
 
-    kprintf("mm_map_mmio: mapped %lu pages phys 0x%lx -> virt 0x%lx\n",
-            (unsigned long)num_pages, phys_base, virt_base);
+            kprintf("mm_map_mmio: 0x%lx->0x%lx pa 0x%lx va 0x%lx np %lu\n",
+                cursor_before, cursor_after, phys_base, virt_base,
+                (unsigned long)num_pages);
     return virt_base + (phys_addr & 0xFFF);  // preserve sub-page offset
+}
+
+uint64_t mm_map_device_mmio(uint64_t phys_addr, size_t num_pages) {
+    if (num_pages == 0) {
+        return 0;
+    }
+
+    uint64_t phys_base = phys_addr & ~0xFFFULL;
+    uint64_t phys_last = phys_base + ((uint64_t)num_pages - 1) * PAGE_SIZE;
+    uint64_t page_offset = phys_addr & 0xFFFULL;
+    uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_WRITE_THROUGH
+                   | PAGE_CACHE_DISABLE | PAGE_GLOBAL | PAGE_NO_EXECUTE;
+
+    if (phys_last < phys_base) {
+        return 0;
+    }
+
+    if (is_phys_in_direct_map(phys_last)) {
+        uint64_t virt_base = (uint64_t)phys_to_virt(phys_base);
+
+        for (size_t i = 0; i < num_pages; i++) {
+            uint64_t va = virt_base + i * PAGE_SIZE;
+            uint64_t pa = phys_base + i * PAGE_SIZE;
+            if (!mm_map_page(va, pa, flags)) {
+                kprintf("mm_map_device_mmio: failed to remap direct-map VA 0x%lx -> PA 0x%lx\n",
+                        va, pa);
+                return 0;
+            }
+        }
+
+        if (sched_is_smp()) {
+            smp_tlb_shootdown_sync();
+        }
+
+        kprintf("mm_map_device_mmio: remapped direct map pa 0x%lx va 0x%lx np %lu\n",
+                phys_base, virt_base, (unsigned long)num_pages);
+        return virt_base + page_offset;
+    }
+
+    return mm_map_mmio(phys_addr, num_pages);
 }
 
 // Unmap virtual page without TLB shootdown (for batched operations)

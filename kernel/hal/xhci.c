@@ -765,17 +765,12 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev, uint8_t msi_vect
         return ST_ERR;
     }
     
-    // Convert physical MMIO address to virtual.
-    // The bootloader's direct map only covers 0-16 GB of physical memory.
-    // Real hardware (especially modern Intel) may place 64-bit BARs far above
-    // that range, so we must explicitly map the MMIO region in that case.
-    if (is_phys_in_direct_map(bar0_phys)) {
-        ctrl->base = (uint64_t)phys_to_virt(bar0_phys);
-    } else {
-        // BAR is above the direct map — create an explicit MMIO mapping.
-        // xHCI MMIO regions are typically ≤ 64 KB; 16 pages (64 KB) is safe.
+    // Convert the BAR to a UC MMIO mapping. If the BAR is already inside the
+    // direct map, remap those direct-map pages in place instead of using the
+    // write-back alias.
+    {
         #define XHCI_MMIO_PAGES 16
-        uint64_t mapped = mm_map_mmio(bar0_phys, XHCI_MMIO_PAGES);
+        uint64_t mapped = mm_map_device_mmio(bar0_phys, XHCI_MMIO_PAGES);
         if (!mapped) {
             kprintf("[XHCI] ERROR: Failed to map BAR0 0x%llx into virtual memory\n",
                     (unsigned long long)bar0_phys);

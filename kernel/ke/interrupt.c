@@ -8,6 +8,7 @@
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/percpu.h"
 #include "../../include/kernel/smp.h"
+#include "../../include/kernel/i2c_hid.h"
 
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_descriptor idt_desc;
@@ -475,6 +476,13 @@ void irq_handler(uint64_t *regs) {
             xhci_irq_service(&g_xhci_hid);
         }
         lapic_eoi();
+        return;
+    }
+
+    // MSI/IOAPIC vectors for I2C LPSS controllers (vectors 50-53)
+    if (int_no >= 50 && int_no <= 53) {
+        i2c_hid_irq_handler((uint8_t)int_no);
+        // i2c_hid_irq_handler calls lapic_eoi() internally
         return;
     }
 

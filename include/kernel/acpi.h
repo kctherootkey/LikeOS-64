@@ -10,14 +10,29 @@
 #define MAX_CPUS            64
 
 // ============================================================================
-// ACPI Table Signatures
+// ACPI Table Signatures (guarded — ACPICA may define these)
 // ============================================================================
+#ifndef ACPI_SIG_RSDP
 #define ACPI_SIG_RSDP       "RSD PTR "
+#endif
+#ifndef ACPI_SIG_RSDT
 #define ACPI_SIG_RSDT       "RSDT"
+#endif
+#ifndef ACPI_SIG_XSDT
 #define ACPI_SIG_XSDT       "XSDT"
+#endif
+#ifndef ACPI_SIG_MADT
 #define ACPI_SIG_MADT       "APIC"
+#endif
+#ifndef ACPI_SIG_FADT
 #define ACPI_SIG_FADT       "FACP"
+#endif
+#ifndef ACPI_SIG_HPET
 #define ACPI_SIG_HPET       "HPET"
+#endif
+#ifndef ACPI_SIG_SSDT
+#define ACPI_SIG_SSDT       "SSDT"
+#endif
 
 // ============================================================================
 // ACPI Table Structures
@@ -226,6 +241,108 @@ typedef struct {
 } acpi_info_t;
 
 // ============================================================================
+// ACPI AML Device Discovery
+// ============================================================================
+
+#define ACPI_AML_MAX_PATH    64
+#define ACPI_AML_MAX_HID     16
+
+typedef struct {
+    char path[ACPI_AML_MAX_PATH];
+    char hid[ACPI_AML_MAX_HID];
+    char cid[ACPI_AML_MAX_HID];
+    char power_path[ACPI_AML_MAX_PATH];
+    uint8_t has_ps0;
+    uint8_t has_ps3;
+    uint8_t has_sta;
+    uint8_t has_crs;
+    uint8_t has_dep;
+    uint8_t from_ssdt;
+} acpi_aml_device_info_t;
+
+#define ACPI_FW_STATUS_OK            0
+#define ACPI_FW_STATUS_NOT_FOUND    -1
+#define ACPI_FW_STATUS_NO_PS0       -2
+#define ACPI_FW_STATUS_UNSUPPORTED  -3
+#define ACPI_FW_STATUS_FAILED       -4
+
+// ============================================================================
+// AML Tagged Value Type System
+// ============================================================================
+
+#define AML_VALUE_INTEGER   0
+#define AML_VALUE_BUFFER    1
+#define AML_VALUE_PACKAGE   2
+#define AML_VALUE_STRING    3
+#define AML_VALUE_REFERENCE 4
+#define AML_VALUE_UNINITIALIZED 5
+
+#define AML_VALUE_MAX_STRING   256
+#define AML_VALUE_MAX_BUFFER   4096
+#define AML_VALUE_MAX_PACKAGE  64
+
+// Forward declaration
+struct aml_value;
+
+typedef struct aml_value {
+    uint8_t type;
+    union {
+        uint64_t integer;
+        struct {
+            uint8_t  *data;
+            uint32_t  len;
+        } buffer;
+        struct {
+            struct aml_value *elements;
+            uint32_t count;
+        } package;
+        char string[AML_VALUE_MAX_STRING];
+        struct {
+            uint32_t index;         // For package/buffer index references
+            struct aml_value *owner; // The package/buffer this indexes into
+        } reference;
+    };
+} aml_value_t;
+
+// Bump allocator for temporary AML value storage during method execution
+#define AML_BUMP_POOL_SIZE  (32 * 1024)  // 32 KB per method frame
+
+typedef struct {
+    uint8_t *pool;
+    uint32_t used;
+    uint32_t capacity;
+} aml_bump_alloc_t;
+
+// ============================================================================
+// ACPI _CRS Resource Parsing Results
+// ============================================================================
+
+#define ACPI_CRS_MAX_I2C_DEVICES  8
+#define ACPI_CRS_MAX_IRQS         4
+
+typedef struct {
+    uint64_t mmio_base;
+    uint32_t mmio_len;
+    uint32_t irqs[ACPI_CRS_MAX_IRQS];
+    uint8_t  irq_count;
+    uint8_t  irq_triggering;    // 0=level, 1=edge
+    uint8_t  irq_polarity;      // 0=active-high, 1=active-low
+    uint8_t  irq_sharing;       // 0=exclusive, 1=shared
+    struct {
+        uint16_t slave_addr;
+        uint32_t connection_speed;
+        uint8_t  addr_mode;     // 0=7-bit, 1=10-bit
+    } i2c_devices[ACPI_CRS_MAX_I2C_DEVICES];
+    uint8_t  i2c_device_count;
+} acpi_crs_result_t;
+
+// ============================================================================
+// ACPI _DEP Dependency Results
+// ============================================================================
+
+#define ACPI_DEP_MAX_DEPS  8
+
+// ============================================================================
 // ACPI Functions
 // ============================================================================
 
@@ -339,5 +456,89 @@ void acpi_pm_init(void);
 
 // Find an ACPI table by its 4-character signature
 acpi_sdt_header_t* acpi_find_table(const char* signature);
+
+// Find the Nth ACPI table matching a 4-character signature.
+acpi_sdt_header_t* acpi_find_table_index(const char* signature, uint32_t index);
+
+// Count ACPI tables matching a 4-character signature.
+uint32_t acpi_get_table_count(const char* signature);
+
+// Get the AML payload of the Nth table matching a signature.
+// Returns 0 on success, <0 on failure.
+int acpi_get_table_aml(const char* signature, uint32_t index,
+                       const uint8_t** aml, uint32_t* aml_len);
+
+// Scan DSDT and SSDTs for devices exposing a given _HID.
+// If hid is NULL or empty, all devices with a parsed _HID are returned.
+// Returns the number of devices written to out[] (up to max_out).
+int acpi_aml_find_devices_by_hid(const char* hid,
+                                 acpi_aml_device_info_t* out,
+                                 int max_out);
+
+// Resolve a device by _HID, locate the nearest firmware _PS0 method on the
+// device or an ancestor scope, and execute a minimal AML subset if possible.
+// Returns one of ACPI_FW_STATUS_*.
+int acpi_fw_power_on_device(const char* hid, acpi_aml_device_info_t* out);
+
+// Find the ACPI device with _ADR matching the given PCI device/function,
+// then execute its _PS0 method. Returns one of ACPI_FW_STATUS_*.
+int acpi_fw_power_on_pci_device(uint8_t bus, uint8_t device, uint8_t function);
+
+// ============================================================================
+// ACPI Enhanced Evaluation Functions (aml_value_t based)
+// ============================================================================
+
+// Initialize / destroy bump allocator for AML value storage
+void aml_bump_init(aml_bump_alloc_t* alloc);
+void aml_bump_destroy(aml_bump_alloc_t* alloc);
+void* aml_bump_alloc(aml_bump_alloc_t* alloc, uint32_t size);
+
+// Initialize an aml_value_t to uninitialized
+void aml_value_init(aml_value_t* val);
+// Deep copy
+void aml_value_copy(aml_value_t* dst, const aml_value_t* src,
+                    aml_bump_alloc_t* alloc);
+// Get integer from any value type (coerce)
+uint64_t aml_value_to_integer(const aml_value_t* val);
+
+// Evaluate _STA on a device. Returns status bits (0x0F if _STA absent).
+// Bit 0: Present, Bit 1: Enabled, Bit 3: Functioning, Bit 4: UI visible.
+uint32_t acpi_aml_eval_sta(const char* device_path);
+
+// Evaluate _DEP on a device. Returns dependency device paths.
+// dep_paths: array of path buffers, max_deps: array size.
+// Returns number of dependencies found (0 if _DEP absent).
+int acpi_aml_eval_dep(const char* device_path,
+                      char dep_paths[][ACPI_AML_MAX_PATH],
+                      int max_deps);
+
+// Evaluate _CRS on a device. Parses resource descriptors into result struct.
+// Returns 0 on success, <0 on failure.
+int acpi_aml_eval_crs(const char* device_path, acpi_crs_result_t* result);
+
+// Call _DSM on a device with given UUID, revision, function index, and arg.
+// result: output value. Returns 0 on success, <0 on failure.
+int acpi_aml_call_dsm(const char* device_path,
+                      const uint8_t uuid[16],
+                      uint64_t revision,
+                      uint64_t func_index,
+                      aml_value_t* result);
+
+// Find the ACPI namespace path for a PCI device by BDF coordinates.
+// Searches for Device with _ADR matching (dev << 16 | func).
+// Returns 0 on success, stores path in out_path.
+int acpi_find_pci_acpi_path(uint8_t bus, uint8_t device, uint8_t function,
+                            char* out_path, int out_size);
+
+// Power on a device and all its _DEP dependencies (full sequence).
+// Evaluates _DEP, powers each dependency, then powers the target device.
+// Returns ACPI_FW_STATUS_*.
+int acpi_power_on_device_with_deps(const char* device_path);
+
+// Execute a named method on a device path (e.g., "_PS0", "_RST").
+// Returns 0 on success, <0 on failure.
+int acpi_aml_exec_device_method(const char* device_path,
+                                const char* method_name,
+                                uint64_t* ret_value);
 
 #endif // _KERNEL_ACPI_H_
