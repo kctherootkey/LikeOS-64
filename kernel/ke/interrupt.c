@@ -64,6 +64,16 @@ extern void irq12();
 extern void irq13();
 extern void irq14();
 extern void irq15();
+extern void irq16();
+extern void irq17();
+extern void irq18();
+extern void irq19();
+extern void irq20();
+extern void irq21();
+extern void irq22();
+extern void irq23();
+extern void irq24();
+extern void irq25();
 
 extern void isr0();
 extern void isr1();
@@ -292,6 +302,18 @@ void idt_init() {
     idt_set_entry(48, (uint64_t)irq16, 0x08, 0x8E);  // MSI: xHCI USB controller 0
     idt_set_entry(49, (uint64_t)irq17, 0x08, 0x8E);  // MSI: xHCI USB controller 1
     
+    // I2C LPSS interrupt vectors
+    idt_set_entry(50, (uint64_t)irq18, 0x08, 0x8E);  // I2C LPSS 0
+    idt_set_entry(51, (uint64_t)irq19, 0x08, 0x8E);  // I2C LPSS 1
+    idt_set_entry(52, (uint64_t)irq20, 0x08, 0x8E);  // I2C LPSS 2
+    idt_set_entry(53, (uint64_t)irq21, 0x08, 0x8E);  // I2C LPSS 3
+    
+    // GPIO interrupt vectors for I2C HID
+    idt_set_entry(54, (uint64_t)irq22, 0x08, 0x8E);  // GPIO 0
+    idt_set_entry(55, (uint64_t)irq23, 0x08, 0x8E);  // GPIO 1
+    idt_set_entry(56, (uint64_t)irq24, 0x08, 0x8E);  // GPIO 2
+    idt_set_entry(57, (uint64_t)irq25, 0x08, 0x8E);  // GPIO 3
+    
     // IPI vectors for SMP
     idt_set_entry(0xFC, (uint64_t)ipi_vector_0xFC, 0x08, 0x8E);  // TLB shootdown
     idt_set_entry(0xFD, (uint64_t)ipi_vector_0xFD, 0x08, 0x8E);  // Halt CPU
@@ -483,6 +505,13 @@ void irq_handler(uint64_t *regs) {
     if (int_no >= 50 && int_no <= 53) {
         i2c_hid_irq_handler((uint8_t)int_no);
         // i2c_hid_irq_handler calls lapic_eoi() internally
+        return;
+    }
+
+    // GPIO interrupt vectors for I2C HID devices (vectors 54-57)
+    if (int_no >= 54 && int_no <= 57) {
+        i2c_hid_gpio_irq_handler((uint8_t)int_no);
+        // i2c_hid_gpio_irq_handler calls lapic_eoi() internally
         return;
     }
 

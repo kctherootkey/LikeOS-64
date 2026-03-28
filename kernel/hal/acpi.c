@@ -443,6 +443,29 @@ int acpi_aml_find_devices_by_hid(const char* hid,
     return ctx.count;
 }
 
+// Walk direct children (depth = 1) of the given ACPI path and populate info.
+int acpi_aml_find_children(const char* parent_path,
+                           acpi_aml_device_info_t* out,
+                           int max_out)
+{
+    if (!parent_path || !out || max_out <= 0) return 0;
+
+    ACPI_HANDLE parent;
+    ACPI_STATUS status = AcpiGetHandle(NULL, (char*)parent_path, &parent);
+    if (ACPI_FAILURE(status)) return 0;
+
+    find_devices_ctx_t ctx;
+    ctx.hid = NULL;
+    ctx.out = out;
+    ctx.max_out = max_out;
+    ctx.count = 0;
+
+    // Walk depth=1 under the parent to get immediate children only
+    AcpiWalkNamespace(ACPI_TYPE_DEVICE, parent, 1,
+                      find_devices_callback, NULL, &ctx, NULL);
+    return ctx.count;
+}
+
 // ============================================================================
 // _STA Evaluation
 // ============================================================================
@@ -533,6 +556,12 @@ crs_walk_callback(ACPI_RESOURCE *Resource, void *Context)
             result->mmio_base = Resource->Data.FixedMemory32.Address;
             result->mmio_len = Resource->Data.FixedMemory32.AddressLength;
         }
+        if (result->mmio_range_count < ACPI_CRS_MAX_MMIO_RANGES) {
+            uint8_t idx = result->mmio_range_count;
+            result->mmio_ranges[idx].base = Resource->Data.FixedMemory32.Address;
+            result->mmio_ranges[idx].length = Resource->Data.FixedMemory32.AddressLength;
+            result->mmio_range_count++;
+        }
         break;
 
     case ACPI_RESOURCE_TYPE_ADDRESS32: {
@@ -540,6 +569,13 @@ crs_walk_callback(ACPI_RESOURCE *Resource, void *Context)
         if (a32->ResourceType == ACPI_MEMORY_RANGE && result->mmio_base == 0) {
             result->mmio_base = a32->Address.Minimum;
             result->mmio_len = a32->Address.AddressLength;
+        }
+        if (a32->ResourceType == ACPI_MEMORY_RANGE &&
+            result->mmio_range_count < ACPI_CRS_MAX_MMIO_RANGES) {
+            uint8_t idx = result->mmio_range_count;
+            result->mmio_ranges[idx].base = a32->Address.Minimum;
+            result->mmio_ranges[idx].length = a32->Address.AddressLength;
+            result->mmio_range_count++;
         }
         break;
     }
@@ -549,6 +585,13 @@ crs_walk_callback(ACPI_RESOURCE *Resource, void *Context)
         if (a64->ResourceType == ACPI_MEMORY_RANGE && result->mmio_base == 0) {
             result->mmio_base = a64->Address.Minimum;
             result->mmio_len = (uint32_t)a64->Address.AddressLength;
+        }
+        if (a64->ResourceType == ACPI_MEMORY_RANGE &&
+            result->mmio_range_count < ACPI_CRS_MAX_MMIO_RANGES) {
+            uint8_t idx = result->mmio_range_count;
+            result->mmio_ranges[idx].base = a64->Address.Minimum;
+            result->mmio_ranges[idx].length = (uint32_t)a64->Address.AddressLength;
+            result->mmio_range_count++;
         }
         break;
     }
@@ -579,6 +622,32 @@ crs_walk_callback(ACPI_RESOURCE *Resource, void *Context)
             result->i2c_devices[idx].addr_mode =
                 (i2c->AccessMode == ACPI_I2C_10BIT_MODE) ? 1 : 0;
             result->i2c_device_count++;
+        }
+        break;
+    }
+
+    case ACPI_RESOURCE_TYPE_GPIO: {
+        ACPI_RESOURCE_GPIO *gpio = &Resource->Data.Gpio;
+        if (gpio->ConnectionType == ACPI_RESOURCE_GPIO_TYPE_INT &&
+            gpio->PinTableLength > 0 && gpio->PinTable &&
+            !result->gpio_int.valid) {
+            result->gpio_int.pin = gpio->PinTable[0];
+            result->gpio_int.triggering =
+                (gpio->Triggering == ACPI_EDGE_SENSITIVE) ? 1 : 0;
+            result->gpio_int.polarity =
+                (gpio->Polarity == ACPI_ACTIVE_LOW) ? 1 :
+                (gpio->Polarity == ACPI_ACTIVE_BOTH) ? 2 : 0;
+            result->gpio_int.sharing = gpio->Shareable ? 1 : 0;
+            result->gpio_int.valid = 1;
+            if (gpio->ResourceSource.StringPtr) {
+                const char *src = gpio->ResourceSource.StringPtr;
+                int i = 0;
+                while (src[i] && i < ACPI_CRS_GPIO_SOURCE_LEN - 1) {
+                    result->gpio_int.resource_source[i] = src[i];
+                    i++;
+                }
+                result->gpio_int.resource_source[i] = '\0';
+            }
         }
         break;
     }
