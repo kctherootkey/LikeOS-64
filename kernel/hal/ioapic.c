@@ -63,7 +63,12 @@ int ioapic_configure_legacy_irq(uint8_t gsi, uint8_t vector, uint8_t polarity, u
             return -1;
         }
     }
-    if (gsi > 23) { // support only legacy range for now
+
+    // Read max supported GSI from IOAPIC version register
+    uint32_t ver = ioapic_read(IOAPIC_REG_VER);
+    uint32_t max_redir = (ver >> 16) & 0xFF;
+    if (gsi > max_redir) {
+        kprintf("IOAPIC: GSI %u exceeds max_redir %u\n", gsi, max_redir);
         return -2;
     }
     

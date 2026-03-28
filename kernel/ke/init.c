@@ -137,6 +137,12 @@ void continue_system_startup(void) {
     int i2c_nctrl = i2c_hid_init();
     kprintf("[INIT] I2C init done (rc=%d)\n", i2c_nctrl);
 
+    /*if (i2c_nctrl != 0) {
+        kprintf("[INIT] DEBUG HALT — inspect I2C log\n");
+        __asm__ volatile("cli");
+        for (;;) __asm__ volatile("hlt");
+    }*/
+
     storage_fs_init(&g_storage_state);
 
     __asm__ volatile ("sti");

@@ -901,6 +901,15 @@ void mouse_inject_usb_movement(int dx, int dy, uint8_t buttons, int8_t wheel)
     uint64_t flags;
     spin_lock_irqsave(&mouse_lock, &flags);
 
+    // Auto-enable the mouse subsystem on first USB/I2C event.
+    // PS/2 init sets enabled=1, but when there's no PS/2 mouse
+    // (e.g. Dell laptops with only an I2C touchpad) enabled stays 0
+    // and mouse_update_cursor_internal() silently returns without
+    // drawing anything.
+    if (!mouse_state.enabled) {
+        mouse_state.enabled = 1;
+    }
+
     // --- Button state ---
     mouse_state.last_buttons = (mouse_state.left_button ? MOUSE_LEFT_BUTTON : 0) |
         (mouse_state.right_button ? MOUSE_RIGHT_BUTTON : 0) |

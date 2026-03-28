@@ -199,6 +199,18 @@ IRQ 15, 47              ; Secondary ATA
 IRQ 16, 48              ; MSI: xHCI USB controller 0 (vector 0x30)
 IRQ 17, 49              ; MSI: xHCI USB controller 1 (vector 0x31)
 
+; I2C LPSS interrupt vectors (50-53)
+IRQ 18, 50              ; I2C LPSS controller 0
+IRQ 19, 51              ; I2C LPSS controller 1
+IRQ 20, 52              ; I2C LPSS controller 2
+IRQ 21, 53              ; I2C LPSS controller 3
+
+; GPIO interrupt vectors for I2C HID (54-57)
+IRQ 22, 54              ; GPIO interrupt 0
+IRQ 23, 55              ; GPIO interrupt 1
+IRQ 24, 56              ; GPIO interrupt 2
+IRQ 25, 57              ; GPIO interrupt 3
+
 ; ============================================================================
 ; IPI (Inter-Processor Interrupt) Handlers for SMP
 ; These are high-vector interrupts sent between CPUs via LAPIC

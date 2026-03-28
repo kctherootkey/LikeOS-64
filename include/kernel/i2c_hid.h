@@ -213,6 +213,112 @@
 #define LPSS_RESETS_IDMA         (1 << 2)    // iDMA reset released
 
 // ============================================================================
+// Intel PCH GPIO Community Registers (via P2SB sideband)
+// ============================================================================
+
+// Community-level register offsets (from community MMIO base)
+#define GPIO_PADBAR              0x0C    // Pad Base Address (RO, gives pad config start)
+#define GPIO_MISCCFG             0x10    // GPDMINTSEL[31:24] = IOAPIC IRQ line
+
+// PAD_CFG_DW0 bit fields (per-pad, at PADBAR + pad_index * 0x10)
+#define GPIO_PAD_CFG_DW0         0x00    // Offset from pad base
+#define GPIO_PAD_CFG_DW1         0x04    // Offset from pad base
+#define GPIO_PAD_STRIDE          0x10    // 16 bytes per pad
+
+// DW0 bit positions
+#define GPIO_DW0_RXEVCFG_SHIFT   25      // RX Level/Edge Config (bits 26:25)
+#define GPIO_DW0_RXEVCFG_MASK    (3u << 25)
+#define GPIO_DW0_RXEVCFG_LEVEL   (0u << 25)
+#define GPIO_DW0_RXEVCFG_EDGE    (1u << 25)
+#define GPIO_DW0_RXEVCFG_DISABLE (2u << 25)
+#define GPIO_DW0_RXEVCFG_BOTH    (3u << 25)
+#define GPIO_DW0_RXINV           (1u << 23)  // RX Invert
+#define GPIO_DW0_GPIROUTIOXAPIC  (1u << 20)  // Route to IOxAPIC
+#define GPIO_DW0_GPIROUTSCI      (1u << 19)  // Route to SCI
+#define GPIO_DW0_GPIROUTSMI      (1u << 18)  // Route to SMI
+#define GPIO_DW0_GPIROUTNMI      (1u << 17)  // Route to NMI
+#define GPIO_DW0_PMODE_MASK      (3u << 12)  // Pad Mode (0=GPIO)
+#define GPIO_DW0_GPIOTXDIS       (1u << 8)   // TX disable
+#define GPIO_DW0_GPIORXDIS       (1u << 9)   // RX disable
+#define GPIO_DW0_GPIORXSTATE     (1u << 1)   // RX pad state (read-only)
+#define GPIO_DW0_GPIOTXSTATE     (1u << 0)   // TX pad state
+
+// DW1 bit positions
+#define GPIO_DW1_INTSEL_SHIFT    0       // Interrupt Select (bits 7:0)
+#define GPIO_DW1_INTSEL_MASK     0xFF
+
+// MISCCFG fields
+#define GPIO_MISCCFG_GPDMINTSEL_SHIFT  24
+#define GPIO_MISCCFG_GPDMINTSEL_MASK   (0xFFu << 24)
+
+// P2SB (D31:F1) PCI config
+#define P2SB_PCI_BUS             0
+#define P2SB_PCI_DEV             31
+#define P2SB_PCI_FUNC            1
+#define P2SB_SBREG_BAR           0x10    // BAR0 (64-bit)
+#define P2SB_SBREG_BARH          0x14
+#define P2SB_P2SBC               0xE0    // P2SB Control (bit 8 = HIDE)
+#define P2SB_HIDE_BIT            (1u << 8)
+
+// GPIO IRQ vector base (vectors 54-57 for up to 4 GPIO communities)
+#define GPIO_IRQ_VECTOR_BASE     54
+
+// Maximum GPIO communities to track
+#define GPIO_MAX_COMMUNITIES     8
+#define GPIO_MAX_GROUPS_PER_COMM 6
+#define GPIO_MAX_PLATFORMS       8
+#define GPIO_NOMAP               (-1)
+
+// ============================================================================
+// Platform GPIO lookup tables (like Linux pinctrl-intel)
+// ============================================================================
+
+// Per-group definition from hardware spec
+typedef struct {
+    uint8_t  reg_num;    // GPI_IS register index within community
+    uint16_t base;       // Starting sequential pin number
+    uint8_t  size;       // Number of pads in this group (max 32)
+    int16_t  gpio_base;  // ACPI GPIO number base (or GPIO_NOMAP)
+} gpio_padgroup_def_t;
+
+// Per-community definition
+typedef struct {
+    uint16_t pin_base;   // First sequential pin
+    uint16_t npins;      // Total pins in community
+    uint8_t  ngpps;      // Number of padgroups
+    gpio_padgroup_def_t gpps[GPIO_MAX_GROUPS_PER_COMM];
+} gpio_community_def_t;
+
+// Per-platform definition (register offsets + community/group layout)
+typedef struct {
+    const char *acpi_hids[4]; // Null-terminated list of ACPI _HID matches
+    uint16_t gpi_is_offset;   // GPI_IS register base within community MMIO
+    uint16_t gpi_ie_offset;   // GPI_IE register base
+    uint16_t hostsw_own_offset; // HOSTSW_OWN register base
+    uint8_t  ncommunities;
+    gpio_community_def_t communities[GPIO_MAX_COMMUNITIES];
+} gpio_platform_def_t;
+
+// Runtime GPIO group (within a community)
+typedef struct {
+    uint16_t pad_cfg_offset;     // PAD_CFG register offset from community base
+    uint8_t  pad_count;          // Number of pads in this group
+    uint8_t  gpi_reg_index;      // GPI_IS register index (reg_num)
+    int16_t  gpio_base;          // ACPI GPIO number base
+} gpio_group_t;
+
+// Runtime GPIO community descriptor
+typedef struct {
+    volatile uint32_t *base;     // MMIO base (virtual, mapped)
+    uint64_t           phys;     // Physical base address
+    uint8_t            irq_line; // GPDMINTSEL value (IOAPIC GSI)
+    uint8_t            num_groups;
+    uint16_t           pin_base; // First sequential pin in this community
+    uint16_t           pin_count;// Total sequential pins
+    gpio_group_t       groups[GPIO_MAX_GROUPS_PER_COMM];
+} gpio_community_t;
+
+// ============================================================================
 // HID over I2C Protocol Definitions (Microsoft spec v1.0)
 // ============================================================================
 
@@ -235,14 +341,25 @@ typedef struct __attribute__((packed)) {
 } i2c_hid_desc_t;
 
 // HID-over-I2C opcodes (written to wCommandRegister)
-#define I2C_HID_OPCODE_RESET       0x0001
-#define I2C_HID_OPCODE_GET_REPORT  0x0002
-#define I2C_HID_OPCODE_SET_REPORT  0x0003
-#define I2C_HID_OPCODE_SET_POWER   0x0008
+// Wire format: [cmdReg_lo, cmdReg_hi, reportID|powerState, opcode]
+// As a 16-bit LE value: opcode goes in high byte (bits 8-11),
+// reportID/powerState in low byte (bits 0-3).
+#define I2C_HID_OPCODE_RESET       0x0100
+#define I2C_HID_OPCODE_GET_REPORT  0x0200
+#define I2C_HID_OPCODE_SET_REPORT  0x0300
+#define I2C_HID_OPCODE_GET_IDLE    0x0400
+#define I2C_HID_OPCODE_SET_IDLE    0x0500
+#define I2C_HID_OPCODE_GET_PROTOCOL 0x0600
+#define I2C_HID_OPCODE_SET_PROTOCOL 0x0700
+#define I2C_HID_OPCODE_SET_POWER   0x0800
 
-// Power states for SET_POWER
+// Power states for SET_POWER (go in low byte, bits 0-1)
 #define I2C_HID_POWER_ON           0x0000
-#define I2C_HID_POWER_SLEEP        0x0100
+#define I2C_HID_POWER_SLEEP        0x0001
+
+// Protocol modes for SET_PROTOCOL
+#define I2C_HID_PROTOCOL_BOOT      0x0000
+#define I2C_HID_PROTOCOL_REPORT    0x0001
 
 // Common HID descriptor register addresses (tried during probe)
 #define I2C_HID_DESC_REG_0001      0x0001
@@ -278,7 +395,10 @@ typedef struct {
     uint8_t          report_id;        // Report ID for this report (0 if none)
     uint8_t          has_report_id;    // Device uses report IDs
     uint8_t          dev_type;         // I2C_HID_DEV_*
-    // Button field
+    // Tip Switch (Digitizer usage 0x42) — finger touching surface
+    i2c_hid_field_t  tip_switch;
+    uint8_t          has_tip_switch;
+    // Button field (Button usage page 0x09)
     i2c_hid_field_t  buttons;
     // X movement/position
     i2c_hid_field_t  x;
@@ -287,6 +407,9 @@ typedef struct {
     // Scroll wheel (optional)
     i2c_hid_field_t  wheel;
     uint8_t          has_wheel;
+    // Contact Count (Digitizer usage 0x54) — number of active contacts
+    i2c_hid_field_t  contact_count;
+    uint8_t          has_contact_count;
     // Total report size in bytes (excluding report ID byte)
     uint16_t         report_bytes;
 } i2c_hid_report_info_t;
@@ -316,6 +439,7 @@ typedef struct {
     volatile uint8_t   rx_ready;    // RX data available (set by ISR)
     volatile uint8_t   xfer_error;  // Transfer error (set by ISR)
     volatile uint32_t  abort_source; // TX_ABRT_SOURCE captured by ISR
+    uint16_t           current_target; // Last programmed target addr (0xFFFF = none)
 } i2c_dw_controller_t;
 
 // I2C HID device instance
@@ -330,7 +454,22 @@ typedef struct {
     i2c_hid_report_info_t mouse_report; // For mouse/touchpad
     uint8_t              prev_buttons;
     uint8_t              active;        // Device is active
+    uint8_t              input_mode_rid; // Report ID for Input Mode feature (0=none)
+    uint8_t              input_mode_size; // Total feature report size in bytes
+    char                 acpi_path[64]; // ACPI device path (e.g. "_SB.PC00.I2C3.TPD0")
     uint8_t              input_buf[I2C_HID_MAX_REPORT_SIZE];
+    // GPIO interrupt binding (from ACPI _CRS GpioInt)
+    uint16_t             gpio_pin;         // GPIO pad number
+    uint8_t              gpio_community;   // GPIO community index (0-5)
+    uint8_t              gpio_gpi_group;   // GPI register group index
+    uint8_t              gpio_gpi_bit;     // Bit within GPI register
+    uint8_t              gpio_irq_vector;  // IDT vector for GPIO interrupt
+    uint8_t              gpio_irq_active;  // 1 = GPIO interrupt configured
+    volatile uint8_t     gpio_irq_pending; // Set by ISR, cleared by reader
+    uint32_t             gpio_pad_offset;  // PAD_CFG MMIO offset for re-verification
+    uint32_t             gpio_pad_dw0;     // Expected PAD_CFG_DW0 (critical bits)
+    uint16_t             error_count;      // Consecutive I2C transfer errors
+    uint32_t             backoff_until;    // Poll counter to skip until (error backoff)
 } i2c_hid_device_t;
 
 // ============================================================================
@@ -345,6 +484,9 @@ void i2c_hid_poll(void);
 
 // Interrupt handler for I2C controller (called from IDT stub)
 void i2c_hid_irq_handler(uint8_t vector);
+
+// GPIO interrupt handler for HID device (called from IDT stub)
+void i2c_hid_gpio_irq_handler(uint8_t vector);
 
 // Query device status
 int i2c_hid_has_touchpad(void);

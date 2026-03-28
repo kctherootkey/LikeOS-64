@@ -18,6 +18,7 @@
 #include "../../include/kernel/mouse.h"
 #include "../../include/kernel/ioapic.h"
 #include "../../include/kernel/lapic.h"
+#include "../../include/kernel/sched.h"
 
 // ============================================================================
 // Private data
@@ -29,6 +30,220 @@ static int g_i2c_controller_count = 0;
 static i2c_hid_device_t g_i2c_hid_devices[I2C_HID_MAX_DEVICES];
 static int g_i2c_hid_device_count = 0;
 
+// GPIO interrupt state
+static gpio_community_t g_gpio_communities[GPIO_MAX_COMMUNITIES];
+static int g_gpio_community_count = 0;
+static uint64_t g_sbreg_bar = 0;     // P2SB sideband register BAR (physical)
+static const gpio_platform_def_t *g_gpio_platform = NULL; // Detected platform
+static uint8_t g_gpio_ioapic_polarity = 0; // From GPIO controller _CRS (0=high, 1=low)
+static uint8_t g_gpio_ioapic_trigger  = 0; // From GPIO controller _CRS (0=level, 1=edge)
+
+// ============================================================================
+// Intel GPIO platform tables (derived from Linux pinctrl-intel drivers)
+// Each INTEL_GPP(reg_num, base, last, gpio_base) defines a padgroup:
+//   reg_num   = GPI_IS register index within community
+//   base      = first sequential pin
+//   last      = last sequential pin (size = last - base + 1)
+//   gpio_base = ACPI GpioInt pin number base (or GPIO_NOMAP)
+// ============================================================================
+
+#define GPP(rn, b, e, gb) { .reg_num = (rn), .base = (b), .size = (uint8_t)((e)-(b)+1), .gpio_base = (gb) }
+
+static const gpio_platform_def_t g_gpio_platforms[] = {
+    // Meteor Lake-P (INTC105E, INTC1083)
+    {
+        .acpi_hids = { "INTC105E", "INTC1083", NULL },
+        .gpi_is_offset = 0x200, .gpi_ie_offset = 0x210,
+        .hostsw_own_offset = 0x140,
+        .ncommunities = 5,
+        .communities = {
+            { .pin_base = 0, .npins = 53, .ngpps = 3, .gpps = {
+                GPP(0, 0, 4, 0),        // CPU
+                GPP(1, 5, 28, 32),       // GPP_V
+                GPP(2, 29, 52, 64),      // GPP_C
+            }},
+            { .pin_base = 53, .npins = 50, .ngpps = 2, .gpps = {
+                GPP(0, 53, 77, 96),      // GPP_A
+                GPP(1, 78, 102, 128),    // GPP_E
+            }},
+            { .pin_base = 103, .npins = 81, .ngpps = 4, .gpps = {
+                GPP(0, 103, 128, 160),   // GPP_H
+                GPP(1, 129, 154, 192),   // GPP_F
+                GPP(2, 155, 169, 224),   // SPI0
+                GPP(3, 170, 183, 256),   // vGPIO_3
+            }},
+            { .pin_base = 184, .npins = 20, .ngpps = 2, .gpps = {
+                GPP(0, 184, 191, 288),   // GPP_S
+                GPP(1, 192, 203, 320),   // JTAG
+            }},
+            { .pin_base = 204, .npins = 85, .ngpps = 4, .gpps = {
+                GPP(0, 204, 228, 352),   // GPP_B
+                GPP(1, 229, 253, 384),   // GPP_D
+                GPP(2, 254, 285, 416),   // vGPIO_0
+                GPP(3, 286, 288, 448),   // vGPIO_1
+            }},
+        },
+    },
+    // Meteor Lake-S (INTC1082)
+    {
+        .acpi_hids = { "INTC1082", NULL },
+        .gpi_is_offset = 0x200, .gpi_ie_offset = 0x210,
+        .hostsw_own_offset = 0x110,
+        .ncommunities = 3,
+        .communities = {
+            { .pin_base = 0, .npins = 74, .ngpps = 3, .gpps = {
+                GPP(0, 0, 27, 0),        // GPP_A
+                GPP(1, 28, 46, 32),      // vGPIO_0
+                GPP(2, 47, 73, 64),      // GPP_C
+            }},
+            { .pin_base = 74, .npins = 46, .ngpps = 3, .gpps = {
+                GPP(0, 74, 93, 96),      // GPP_B
+                GPP(1, 94, 95, 128),     // vGPIO_3
+                GPP(2, 96, 119, 160),    // GPP_D
+            }},
+            { .pin_base = 120, .npins = 28, .ngpps = 2, .gpps = {
+                GPP(0, 120, 135, 192),   // JTAG_CPU
+                GPP(1, 136, 147, 224),   // vGPIO_4
+            }},
+        },
+    },
+    // Tiger Lake-LP (INT34C5, INTC1055)
+    {
+        .acpi_hids = { "INT34C5", "INTC1055", NULL },
+        .gpi_is_offset = 0x100, .gpi_ie_offset = 0x120,
+        .hostsw_own_offset = 0x0b0,
+        .ncommunities = 4,
+        .communities = {
+            { .pin_base = 0, .npins = 67, .ngpps = 3, .gpps = {
+                GPP(0, 0, 25, 0),        // GPP_B
+                GPP(1, 26, 41, 32),      // GPP_T
+                GPP(2, 42, 66, 64),      // GPP_A
+            }},
+            { .pin_base = 67, .npins = 104, .ngpps = 5, .gpps = {
+                GPP(0, 67, 74, 96),      // GPP_S
+                GPP(1, 75, 98, 128),     // GPP_H
+                GPP(2, 99, 119, 160),    // GPP_D
+                GPP(3, 120, 143, 192),   // GPP_U
+                GPP(4, 144, 170, 224),   // vGPIO
+            }},
+            { .pin_base = 171, .npins = 89, .ngpps = 5, .gpps = {
+                GPP(0, 171, 194, 256),   // GPP_C
+                GPP(1, 195, 219, 288),   // GPP_F
+                GPP(2, 220, 225, GPIO_NOMAP), // HVCMOS
+                GPP(3, 226, 250, 320),   // GPP_E
+                GPP(4, 251, 259, GPIO_NOMAP), // JTAG
+            }},
+            { .pin_base = 260, .npins = 17, .ngpps = 2, .gpps = {
+                GPP(0, 260, 267, 352),   // GPP_R
+                GPP(1, 268, 276, GPIO_NOMAP), // SPI
+            }},
+        },
+    },
+    // Tiger Lake-H (INT34C6)
+    {
+        .acpi_hids = { "INT34C6", NULL },
+        .gpi_is_offset = 0x100, .gpi_ie_offset = 0x120,
+        .hostsw_own_offset = 0x0c0,
+        .ncommunities = 5,
+        .communities = {
+            { .pin_base = 0, .npins = 79, .ngpps = 4, .gpps = {
+                GPP(0, 0, 24, 0),        // GPP_A
+                GPP(1, 25, 44, 32),      // GPP_R
+                GPP(2, 45, 70, 64),      // GPP_B
+                GPP(3, 71, 78, 96),      // vGPIO_0
+            }},
+            { .pin_base = 79, .npins = 102, .ngpps = 5, .gpps = {
+                GPP(0, 79, 104, 128),    // GPP_D
+                GPP(1, 105, 128, 160),   // GPP_C
+                GPP(2, 129, 136, 192),   // GPP_S
+                GPP(3, 137, 153, 224),   // GPP_G
+                GPP(4, 154, 180, 256),   // vGPIO
+            }},
+            { .pin_base = 181, .npins = 37, .ngpps = 2, .gpps = {
+                GPP(0, 181, 193, 288),   // GPP_E
+                GPP(1, 194, 217, 320),   // GPP_F
+            }},
+            { .pin_base = 218, .npins = 49, .ngpps = 3, .gpps = {
+                GPP(0, 218, 241, 352),   // GPP_H
+                GPP(1, 242, 251, 384),   // GPP_J
+                GPP(2, 252, 266, 416),   // GPP_K
+            }},
+            { .pin_base = 267, .npins = 24, .ngpps = 2, .gpps = {
+                GPP(0, 267, 281, 448),   // GPP_I
+                GPP(1, 282, 290, GPIO_NOMAP), // JTAG
+            }},
+        },
+    },
+    // Alder Lake-N (INTC1057)
+    {
+        .acpi_hids = { "INTC1057", NULL },
+        .gpi_is_offset = 0x100, .gpi_ie_offset = 0x120,
+        .hostsw_own_offset = 0x0b0,
+        .ncommunities = 4,
+        .communities = {
+            { .pin_base = 0, .npins = 67, .ngpps = 3, .gpps = {
+                GPP(0, 0, 25, 0),        // GPP_B
+                GPP(1, 26, 41, 32),      // GPP_T
+                GPP(2, 42, 66, 64),      // GPP_A
+            }},
+            { .pin_base = 67, .npins = 102, .ngpps = 5, .gpps = {
+                GPP(0, 67, 74, 96),      // GPP_S
+                GPP(1, 75, 94, 128),     // GPP_I
+                GPP(2, 95, 118, 160),    // GPP_H
+                GPP(3, 119, 139, 192),   // GPP_D
+                GPP(4, 140, 168, 224),   // vGPIO
+            }},
+            { .pin_base = 169, .npins = 80, .ngpps = 4, .gpps = {
+                GPP(0, 169, 192, 256),   // GPP_C
+                GPP(1, 193, 217, 288),   // GPP_F
+                GPP(2, 218, 223, GPIO_NOMAP), // HVCMOS
+                GPP(3, 224, 248, 320),   // GPP_E
+            }},
+            { .pin_base = 249, .npins = 8, .ngpps = 1, .gpps = {
+                GPP(0, 249, 256, 352),   // GPP_R
+            }},
+        },
+    },
+    // Alder Lake-S (INTC1056, INTC1085)
+    {
+        .acpi_hids = { "INTC1056", "INTC1085", NULL },
+        .gpi_is_offset = 0x200, .gpi_ie_offset = 0x220,
+        .hostsw_own_offset = 0x150,
+        .ncommunities = 5,
+        .communities = {
+            { .pin_base = 0, .npins = 95, .ngpps = 5, .gpps = {
+                GPP(0, 0, 24, 0),        // GPP_I
+                GPP(1, 25, 47, 32),      // GPP_R
+                GPP(2, 48, 59, 64),      // GPP_J
+                GPP(3, 60, 86, 96),      // vGPIO
+                GPP(4, 87, 94, 128),     // vGPIO_0
+            }},
+            { .pin_base = 95, .npins = 56, .ngpps = 3, .gpps = {
+                GPP(0, 95, 118, 160),    // GPP_B
+                GPP(1, 119, 126, 192),   // GPP_G
+                GPP(2, 127, 150, 224),   // GPP_H
+            }},
+            { .pin_base = 151, .npins = 49, .ngpps = 3, .gpps = {
+                GPP(0, 151, 159, GPIO_NOMAP), // SPI0
+                GPP(1, 160, 175, 256),   // GPP_A
+                GPP(2, 176, 199, 288),   // GPP_C
+            }},
+            { .pin_base = 200, .npins = 70, .ngpps = 4, .gpps = {
+                GPP(0, 200, 207, 320),   // GPP_S
+                GPP(1, 208, 230, 352),   // GPP_E
+                GPP(2, 231, 245, 384),   // GPP_K
+                GPP(3, 246, 269, 416),   // GPP_F
+            }},
+            { .pin_base = 270, .npins = 34, .ngpps = 2, .gpps = {
+                GPP(0, 270, 294, 448),   // GPP_D
+                GPP(1, 295, 303, GPIO_NOMAP), // JTAG
+            }},
+        },
+    },
+};
+
+#define GPIO_NUM_PLATFORMS (sizeof(g_gpio_platforms) / sizeof(g_gpio_platforms[0]))
+
 // LPSS I2C uses the DesignWare block at 0x000-0x1FF and LPSS private regs at
 // 0x200-0x2FF. One 4KB page covers the entire window we access here.
 
@@ -37,6 +252,9 @@ static int g_i2c_hid_device_count = 0;
 // Polling rate limiter (poll every N calls to reduce bus traffic)
 static uint64_t g_poll_counter = 0;
 #define I2C_HID_POLL_DIVISOR 1  // Poll every call (main loop is already ~100 Hz)
+
+// Diagnostic counter: how many times ISR set gpio_irq_pending
+static volatile uint32_t g_isr_fire_count = 0;
 
 // ============================================================================
 // Utility functions
@@ -465,6 +683,7 @@ static int dw_i2c_init_controller(i2c_dw_controller_t *ctrl) {
             ctrl->bus_id, ctrl->rx_fifo_depth, ctrl->tx_fifo_depth);
 
     ctrl->active = 1;
+    ctrl->current_target = 0xFFFF;  // Force first set_target to program TAR
     return 0;
 }
 
@@ -514,8 +733,19 @@ static int dw_i2c_wait_idle(i2c_dw_controller_t *ctrl, int timeout_us) {
     return -1;
 }
 
-// Set target address and enable controller
+// Set target address and enable controller.
+// Like Linux i2c-designware-master.c: skip the disable/enable cycle
+// when the target address hasn't changed.  The disable/enable sends
+// an ABORT on the bus and takes ~300µs; at 100 reads/sec (LEVEL mode)
+// that's 30ms/sec wasted + bus disruption that causes silent data loss.
 static int dw_i2c_set_target(i2c_dw_controller_t *ctrl, uint16_t addr) {
+    if (ctrl->current_target == addr) {
+        // Same address — just clear stale status, no bus disruption
+        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+        (void)dw_read(ctrl, DW_IC_CLR_INTR);
+        return 0;
+    }
+
     dw_i2c_disable(ctrl);
 
     // Clear any stale abort status
@@ -526,6 +756,7 @@ static int dw_i2c_set_target(i2c_dw_controller_t *ctrl, uint16_t addr) {
     dw_write(ctrl, DW_IC_TAR, addr & 0x7F);
 
     dw_i2c_enable(ctrl);
+    ctrl->current_target = addr;
     return 0;
 }
 
@@ -537,7 +768,9 @@ static int dw_i2c_xfer(i2c_dw_controller_t *ctrl, uint16_t addr,
                         const uint8_t *wbuf, int wlen,
                         uint8_t *rbuf, int rlen) {
     int rc;
+    int retry = 0;
 
+retry_xfer:
     dw_i2c_set_target(ctrl, addr);
 
     // ---- Write phase ----
@@ -608,9 +841,20 @@ abort:
         // Drain RX FIFO
         while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
             (void)dw_read(ctrl, DW_IC_DATA_CMD);
-        // Brief delay for bus recovery
-        i2c_delay_us(100);
-        (void)abort_src;  // suppress unused warning
+        // Reset controller state machine (Linux i2c-designware does this
+        // after every abort to clear the hardware FIFO and bus state)
+        dw_i2c_disable(ctrl);
+        i2c_delay_us(1000);  // 1ms — give device firmware time to reset
+        dw_i2c_enable(ctrl);
+        ctrl->current_target = 0xFFFF;  // Force re-program after reset
+        ctrl->abort_source = abort_src;  // Save for caller diagnostics
+        // Retry once on any error (NACK, ARB_LOST, or pure timeout).
+        // Pure timeout (abort_src==0) can be transient if the bus was
+        // momentarily busy.
+        if (retry < 1) {
+            retry++;
+            goto retry_xfer;
+        }
         return -1;
     }
 }
@@ -1278,6 +1522,8 @@ static int i2c_hid_set_power(i2c_hid_device_t *dev, uint16_t power_state) {
         (uint8_t)(opcode & 0xFF),
         (uint8_t)((opcode >> 8) & 0xFF)
     };
+    kprintf("[I2C-HID] SET_POWER wire: [%02x %02x %02x %02x]\n",
+            buf[0], buf[1], buf[2], buf[3]);
     return dw_i2c_write(dev->ctrl, dev->i2c_addr, buf, 4);
 }
 
@@ -1290,6 +1536,8 @@ static int i2c_hid_reset(i2c_hid_device_t *dev) {
         (uint8_t)(opcode & 0xFF),
         (uint8_t)((opcode >> 8) & 0xFF)
     };
+    kprintf("[I2C-HID] RESET wire: [%02x %02x %02x %02x]\n",
+            buf[0], buf[1], buf[2], buf[3]);
     int rc = dw_i2c_write(dev->ctrl, dev->i2c_addr, buf, 4);
     if (rc < 0) return rc;
 
@@ -1297,14 +1545,111 @@ static int i2c_hid_reset(i2c_hid_device_t *dev) {
     // The device will pull INT low and send a reset-completion 2-byte message
     i2c_delay_us(100000);  // 100ms
 
-    // Read and discard the reset-completion response
-    uint8_t resp[2];
+    // Read and discard the reset-completion response.
+    // MUST read wMaxInputLength bytes (not just 2) — the device expects
+    // the host to clock out the full buffer, otherwise INT# stays asserted.
+    uint16_t drain_len = dev->desc.wMaxInputLength;
+    if (drain_len < 2) drain_len = 2;
+    if (drain_len > I2C_HID_MAX_REPORT_SIZE) drain_len = I2C_HID_MAX_REPORT_SIZE;
+    uint8_t resp[I2C_HID_MAX_REPORT_SIZE];
     if (dev->ctrl->use_interrupts)
-        dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0, resp, 2);
+        dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0, resp, drain_len);
     else
-        dw_i2c_xfer(dev->ctrl, dev->i2c_addr, NULL, 0, resp, 2);
+        dw_i2c_xfer(dev->ctrl, dev->i2c_addr, NULL, 0, resp, drain_len);
+
+    uint16_t rst_len = (uint16_t)resp[0] | ((uint16_t)resp[1] << 8);
+    kprintf("[I2C-HID] RESET completion: len=%u [%02x %02x %02x %02x]\n",
+            rst_len, resp[0], resp[1], resp[2], resp[3]);
 
     return 0;
+}
+
+static int i2c_hid_set_idle(i2c_hid_device_t *dev, uint8_t duration,
+                             uint8_t report_id) {
+    uint16_t cmd_reg = dev->desc.wCommandRegister;
+    // Low byte: reportID, high byte: opcode 0x05
+    // Duration goes in a 3rd byte appended to the data register
+    // For the simple 4-byte form: low byte = reportID, opcode in high byte
+    uint16_t opcode = I2C_HID_OPCODE_SET_IDLE | report_id;
+    uint8_t buf[6] = {
+        (uint8_t)(cmd_reg & 0xFF),
+        (uint8_t)((cmd_reg >> 8) & 0xFF),
+        (uint8_t)(opcode & 0xFF),
+        (uint8_t)((opcode >> 8) & 0xFF),
+        (uint8_t)(dev->desc.wDataRegister & 0xFF),
+        (uint8_t)((dev->desc.wDataRegister >> 8) & 0xFF),
+    };
+    // SET_IDLE with duration in wData register: 6 bytes total
+    // But if duration is 0 (infinite) and reportID is 0, the simple
+    // 4-byte command form works too.
+    int len = (duration == 0) ? 4 : 6;
+    kprintf("[I2C-HID] SET_IDLE wire: [%02x %02x %02x %02x] dur=%u rid=%u\n",
+            buf[0], buf[1], buf[2], buf[3], duration, report_id);
+    return dw_i2c_write(dev->ctrl, dev->i2c_addr, buf, len);
+}
+
+static int i2c_hid_set_protocol(i2c_hid_device_t *dev, uint16_t protocol) {
+    uint16_t cmd_reg = dev->desc.wCommandRegister;
+    uint16_t opcode = I2C_HID_OPCODE_SET_PROTOCOL | protocol;
+    uint8_t buf[4] = {
+        (uint8_t)(cmd_reg & 0xFF),
+        (uint8_t)((cmd_reg >> 8) & 0xFF),
+        (uint8_t)(opcode & 0xFF),
+        (uint8_t)((opcode >> 8) & 0xFF)
+    };
+    kprintf("[I2C-HID] SET_PROTOCOL wire: [%02x %02x %02x %02x] proto=%u\n",
+            buf[0], buf[1], buf[2], buf[3], protocol);
+    return dw_i2c_write(dev->ctrl, dev->i2c_addr, buf, 4);
+}
+
+// SET_REPORT: send a feature/output report to the device.
+// report_type: 1=Input, 2=Output, 3=Feature
+// report_id:   the report ID
+// data/data_len: report payload (NOT including report ID)
+static int i2c_hid_set_report(i2c_hid_device_t *dev, uint8_t report_type,
+                               uint8_t report_id, const uint8_t *data,
+                               int data_len) {
+    uint16_t cmd_reg  = dev->desc.wCommandRegister;
+    uint16_t data_reg = dev->desc.wDataRegister;
+
+    // Command register word:
+    //   low byte  = reportID (bits 0-3) | reportType (bits 4-5)
+    //   high byte = opcode (SET_REPORT = 0x03)
+    uint8_t cmd_lo = (report_id & 0x0F) | ((report_type & 0x03) << 4);
+    uint8_t cmd_hi = 0x03;  // SET_REPORT opcode
+
+    // Data register payload length:
+    // 2 (length field) + 1 (reportID) + data_len
+    uint16_t payload_len = 2 + 1 + (uint16_t)data_len;
+
+    // Total wire message:
+    // [cmdReg_lo, cmdReg_hi, cmd_lo, cmd_hi,
+    //  dataReg_lo, dataReg_hi, len_lo, len_hi, reportID, data...]
+    int total = 4 + 2 + 2 + 1 + data_len;  // 9 + data_len
+    if (total > 64) return -1;  // Safety limit
+
+    uint8_t wire[64];
+    wire[0] = (uint8_t)(cmd_reg & 0xFF);
+    wire[1] = (uint8_t)((cmd_reg >> 8) & 0xFF);
+    wire[2] = cmd_lo;
+    wire[3] = cmd_hi;
+    wire[4] = (uint8_t)(data_reg & 0xFF);
+    wire[5] = (uint8_t)((data_reg >> 8) & 0xFF);
+    wire[6] = (uint8_t)(payload_len & 0xFF);
+    wire[7] = (uint8_t)((payload_len >> 8) & 0xFF);
+    wire[8] = report_id;
+    for (int i = 0; i < data_len; i++)
+        wire[9 + i] = data[i];
+
+    kprintf("[I2C-HID] SET_REPORT wire(%d): "
+            "[%02x %02x %02x %02x %02x %02x %02x %02x %02x",
+            total, wire[0], wire[1], wire[2], wire[3],
+            wire[4], wire[5], wire[6], wire[7], wire[8]);
+    for (int i = 0; i < data_len && i < 4; i++)
+        kprintf(" %02x", wire[9 + i]);
+    kprintf("]\n");
+
+    return dw_i2c_write(dev->ctrl, dev->i2c_addr, wire, total);
 }
 
 // ============================================================================
@@ -1312,200 +1657,525 @@ static int i2c_hid_reset(i2c_hid_device_t *dev) {
 // ============================================================================
 
 // Parse a HID report descriptor to determine device type and report layout
+// ============================================================================
+// HID Usage Definitions (usage_page << 16 | usage)
+// ============================================================================
+
+#define HID_GD_MOUSE          0x00010002
+#define HID_GD_X              0x00010030
+#define HID_GD_Y              0x00010031
+#define HID_GD_WHEEL          0x00010038
+#define HID_DG_TOUCHSCREEN    0x000D0004
+#define HID_DG_TOUCHPAD       0x000D0005
+#define HID_DG_TIPSWITCH      0x000D0042
+#define HID_DG_INPUTMODE      0x000D0052
+#define HID_DG_CONTACTCOUNT   0x000D0054
+#define HID_UP_BUTTON         0x0009
+
+// Parsed field entry (used locally during descriptor parsing)
+typedef struct {
+    uint32_t usage;         // (usage_page << 16) | usage_id
+    uint16_t bit_offset;    // Bit position in report (after report ID byte)
+    uint16_t bit_size;      // Size in bits for this single field
+    int32_t  logical_min;
+    int32_t  logical_max;
+    uint8_t  flags;         // bit 0 = constant, bit 2 = relative
+    uint8_t  report_type;   // 0 = Input, 2 = Feature
+    uint8_t  report_id;
+    uint8_t  app_type;      // 0 = unknown, 1 = touchpad/touchscreen, 2 = mouse
+} hid_parsed_field_t;
+
+#define HID_FIELD_MAX   128
+#define HID_USAGE_MAX   16
+
+// ============================================================================
+// Linux-style HID Report Descriptor Parser
+//
+// Phase 1: Walk the descriptor building a flat field table.  Every
+//          non-constant Input/Feature field gets an entry with its full
+//          32-bit usage, bit offset, size, and logical range.
+//
+// Phase 2: Resolve specific usages from the table:
+//          - TIP_SWITCH  for finger-down detection
+//          - X, Y        for coordinates (within each contact slot)
+//          - CONTACT_CNT for multi-touch count
+//          - BUTTON      for physical clicks
+//          - INPUT_MODE  feature for SET_REPORT
+//
+// This avoids fragile collection-depth heuristics: the app_type tag on
+// each field is used only to prefer Touchpad fields over Mouse fields
+// when both are present.
+// ============================================================================
+
 static void i2c_hid_parse_report_desc(i2c_hid_device_t *dev) {
     uint8_t *rd = dev->report_desc;
     uint16_t rd_len = dev->report_desc_len;
 
-    // Parser state
-    uint16_t usage_page = 0;
-    uint16_t usage = 0;
-    uint8_t  report_id = 0;
-    int32_t  logical_min = 0;
-    int32_t  logical_max = 0;
-    uint32_t report_size = 0;
-    uint32_t report_count = 0;
-    uint16_t bit_offset = 0;     // Running bit offset for current report
-    uint8_t  collection_depth = 0;
-    uint8_t  in_mouse_collection = 0;
-    uint8_t  in_touchpad_collection = 0;
-    (void)0;  // device type tracked via in_*_collection flags
+    // Flat field table — built in Phase 1, resolved in Phase 2
+    hid_parsed_field_t fields[HID_FIELD_MAX];
+    int field_count = 0;
 
-    // We track the first mouse/touchpad report found
-    int mouse_found = 0;
+    // ---- Parser global state ----
+    uint16_t usage_page   = 0;
+    int32_t  logical_min  = 0;
+    int32_t  logical_max  = 0;
+    uint32_t report_size  = 0;
+    uint32_t report_count = 0;
+    uint8_t  report_id    = 0;
+
+    // Per-type bit offset tracking (Input and Feature have separate bit streams)
+    uint16_t input_bit_offset = 0;
+    uint16_t feat_bit_offset  = 0;
+    uint8_t  input_last_rid   = 0xFF;  // sentinel
+    uint8_t  feat_last_rid    = 0xFF;
+
+    // ---- Local state (reset after each Main item) ----
+    uint16_t usage_stack[HID_USAGE_MAX];
+    int      usage_count     = 0;
+    uint16_t usage_min       = 0;
+    uint16_t usage_max       = 0;
+    int      has_usage_range = 0;
+
+    // ---- Collection tracking (for app_type classification) ----
+    uint8_t  collection_depth = 0;
+    uint8_t  app_type         = 0;   // 0=unknown, 1=touchpad, 2=mouse
+    uint8_t  app_stack[16];
+    int      app_stack_depth  = 0;
+
+    // ================================================================
+    //  Phase 1 — walk descriptor, populate field table
+    // ================================================================
 
     uint16_t pos = 0;
     while (pos < rd_len) {
         uint8_t prefix = rd[pos];
 
-        // Long items (prefix == 0xFE)
+        // Long items (prefix == 0xFE) — skip
         if (prefix == 0xFE) {
             if (pos + 2 >= rd_len) break;
-            uint8_t data_size = rd[pos + 1];
-            pos += 3 + data_size;
+            pos += 3 + rd[pos + 1];
             continue;
         }
 
         // Short items
         uint8_t bSize = prefix & 0x03;
         uint8_t bType = (prefix >> 2) & 0x03;
-        uint8_t bTag = (prefix >> 4) & 0x0F;
+        uint8_t bTag  = (prefix >> 4) & 0x0F;
         int size = (bSize == 3) ? 4 : bSize;
 
         if (pos + 1 + size > rd_len) break;
 
-        // Get item data (up to 4 bytes, signed extension for some items)
-        int32_t data_signed = 0;
+        // Extract item data
         uint32_t data_unsigned = 0;
-        if (size >= 1) data_unsigned = rd[pos + 1];
+        int32_t  data_signed   = 0;
+        if (size >= 1) data_unsigned  = rd[pos + 1];
         if (size >= 2) data_unsigned |= (uint32_t)rd[pos + 2] << 8;
         if (size >= 3) data_unsigned |= (uint32_t)rd[pos + 3] << 16;
         if (size >= 4) data_unsigned |= (uint32_t)rd[pos + 4] << 24;
 
-        // Sign-extend for signed items
-        if (size == 1) data_signed = (int8_t)(data_unsigned & 0xFF);
+        if (size == 1)      data_signed = (int8_t)(data_unsigned & 0xFF);
         else if (size == 2) data_signed = (int16_t)(data_unsigned & 0xFFFF);
-        else if (size == 4) data_signed = (int32_t)data_unsigned;
-        else data_signed = (int32_t)data_unsigned;
+        else                data_signed = (int32_t)data_unsigned;
 
         switch (bType) {
-            case 0: // Main
-                switch (bTag) {
-                    case 0x08: // Input
-                    {
-                        uint8_t is_const = data_unsigned & 0x01;
-                        uint8_t is_relative = (data_unsigned & 0x04) ? 1 : 0;
+        case 0: // Main
+            switch (bTag) {
+            case 0x08: // Input
+            case 0x0B: // Feature
+            {
+                uint8_t is_const    = data_unsigned & 0x01;
+                uint8_t is_relative = (data_unsigned & 0x04) ? 1 : 0;
+                uint8_t rtype       = (bTag == 0x0B) ? 2 : 0;
 
-                        if (!is_const && (in_mouse_collection || in_touchpad_collection) && !mouse_found) {
-                            i2c_hid_report_info_t *ri = &dev->mouse_report;
-                            ri->report_id = report_id;
-                            ri->has_report_id = (report_id != 0);
-                            ri->dev_type = in_touchpad_collection ? I2C_HID_DEV_TOUCHPAD : I2C_HID_DEV_MOUSE;
+                // Select the correct per-type bit offset
+                uint16_t *cur_offset;
+                uint8_t  *cur_rid;
+                if (rtype == 0) {
+                    cur_offset = &input_bit_offset;
+                    cur_rid    = &input_last_rid;
+                } else {
+                    cur_offset = &feat_bit_offset;
+                    cur_rid    = &feat_last_rid;
+                }
+                if (report_id != *cur_rid) {
+                    *cur_offset = 0;
+                    *cur_rid    = report_id;
+                }
 
-                            // Identify the field by usage
-                            if (usage_page == 0x09) {
-                                // Buttons (Usage Page: Button)
-                                ri->buttons.report_id = report_id;
-                                ri->buttons.bit_offset = bit_offset;
-                                ri->buttons.bit_size = report_size * report_count;
-                                ri->buttons.count = report_count;
-                                ri->buttons.logical_min = logical_min;
-                                ri->buttons.logical_max = logical_max;
-                            } else if (usage_page == 0x01 && usage == 0x30) {
-                                // X (Generic Desktop: X)
-                                ri->x.report_id = report_id;
-                                ri->x.bit_offset = bit_offset;
-                                ri->x.bit_size = report_size;
-                                ri->x.count = 1;
-                                ri->x.logical_min = logical_min;
-                                ri->x.logical_max = logical_max;
-                                ri->x.is_relative = is_relative;
-                            } else if (usage_page == 0x01 && usage == 0x31) {
-                                // Y (Generic Desktop: Y)
-                                ri->y.report_id = report_id;
-                                ri->y.bit_offset = bit_offset;
-                                ri->y.bit_size = report_size;
-                                ri->y.count = 1;
-                                ri->y.logical_min = logical_min;
-                                ri->y.logical_max = logical_max;
-                                ri->y.is_relative = is_relative;
-                            } else if (usage_page == 0x01 && usage == 0x38) {
-                                // Wheel (Generic Desktop: Wheel)
-                                ri->wheel.report_id = report_id;
-                                ri->wheel.bit_offset = bit_offset;
-                                ri->wheel.bit_size = report_size;
-                                ri->wheel.count = 1;
-                                ri->wheel.logical_min = logical_min;
-                                ri->wheel.logical_max = logical_max;
-                                ri->wheel.is_relative = 1;
-                                ri->has_wheel = 1;
-                            }
+                // Detect Input Mode feature inline (before field table,
+                // so it works even if the table overflows).
+                if (rtype == 2 && !is_const && usage_count > 0 &&
+                    (((uint32_t)usage_page << 16) | usage_stack[0])
+                        == HID_DG_INPUTMODE &&
+                    dev->input_mode_rid == 0) {
+                    dev->input_mode_rid  = report_id;
+                    dev->input_mode_size =
+                        (uint8_t)((report_size * report_count + 7) / 8);
+                    kprintf("[I2C-HID] Found Input Mode feature: "
+                            "reportID=%u size=%u bits\n",
+                            report_id, report_size * report_count);
+                }
+
+                // Record non-constant fields into the table.
+                // Expand per-item only when there's a usage range or
+                // multiple local usages; otherwise collapse into one
+                // entry to avoid blowing through the table limit.
+                if (!is_const) {
+                    if (has_usage_range) {
+                        // Usage Min/Max range — one entry per item
+                        for (uint32_t i = 0; i < report_count &&
+                                              field_count < HID_FIELD_MAX; i++) {
+                            uint16_t u = (uint16_t)(usage_min + i);
+                            if (u > usage_max) u = usage_max;
+                            hid_parsed_field_t *f = &fields[field_count++];
+                            f->usage       = ((uint32_t)usage_page << 16) | u;
+                            f->bit_offset  = *cur_offset +
+                                             (uint16_t)(i * report_size);
+                            f->bit_size    = (uint16_t)report_size;
+                            f->logical_min = logical_min;
+                            f->logical_max = logical_max;
+                            f->flags       = (is_relative ? 4 : 0);
+                            f->report_type = rtype;
+                            f->report_id   = report_id;
+                            f->app_type    = app_type;
                         }
-                        bit_offset += report_size * report_count;
-                        usage = 0;  // Reset local usage
-                        break;
+                    } else if (usage_count > 1) {
+                        // Multiple distinct usages — one entry per usage
+                        for (uint32_t i = 0; i < report_count &&
+                                              field_count < HID_FIELD_MAX; i++) {
+                            uint16_t u = ((int)i < usage_count)
+                                             ? usage_stack[i]
+                                             : usage_stack[usage_count - 1];
+                            hid_parsed_field_t *f = &fields[field_count++];
+                            f->usage       = ((uint32_t)usage_page << 16) | u;
+                            f->bit_offset  = *cur_offset +
+                                             (uint16_t)(i * report_size);
+                            f->bit_size    = (uint16_t)report_size;
+                            f->logical_min = logical_min;
+                            f->logical_max = logical_max;
+                            f->flags       = (is_relative ? 4 : 0);
+                            f->report_type = rtype;
+                            f->report_id   = report_id;
+                            f->app_type    = app_type;
+                        }
+                    } else if (field_count < HID_FIELD_MAX) {
+                        // Single usage (or none) — collapse entire item
+                        // into one entry covering all report_count values.
+                        uint16_t u = (usage_count > 0) ? usage_stack[0] : 0;
+                        hid_parsed_field_t *f = &fields[field_count++];
+                        f->usage       = ((uint32_t)usage_page << 16) | u;
+                        f->bit_offset  = *cur_offset;
+                        f->bit_size    = (uint16_t)report_size;
+                        f->logical_min = logical_min;
+                        f->logical_max = logical_max;
+                        f->flags       = (is_relative ? 4 : 0);
+                        f->report_type = rtype;
+                        f->report_id   = report_id;
+                        f->app_type    = app_type;
                     }
-                    case 0x0A: // Collection
-                        collection_depth++;
-                        if (usage_page == 0x01 && usage == 0x02) {
-                            in_mouse_collection = collection_depth;
-                        }
-                        if (usage_page == 0x0D && (usage == 0x05 || usage == 0x04)) {
-                            // Touchpad or Touchscreen
-                            in_touchpad_collection = collection_depth;
-                        }
-                        usage = 0;
-                        break;
-                    case 0x0C: // End Collection
-                        if (in_mouse_collection == collection_depth) {
-                            in_mouse_collection = 0;
-                            if (dev->mouse_report.x.bit_size > 0)
-                                mouse_found = 1;
-                        }
-                        if (in_touchpad_collection == collection_depth) {
-                            in_touchpad_collection = 0;
-                            if (dev->mouse_report.x.bit_size > 0)
-                                mouse_found = 1;
-                        }
-                        if (collection_depth > 0) collection_depth--;
-                        break;
                 }
-                break;
 
-            case 1: // Global
-                switch (bTag) {
-                    case 0x00: usage_page = (uint16_t)data_unsigned; break;
-                    case 0x01: logical_min = data_signed; break;
-                    case 0x02: logical_max = data_signed; break;
-                    case 0x07: report_size = data_unsigned; break;
-                    case 0x08: // Report ID
-                        report_id = (uint8_t)data_unsigned;
-                        bit_offset = 0;  // Reset bit offset for new report
-                        break;
-                    case 0x09: report_count = data_unsigned; break;
-                }
-                break;
+                // Always advance bit offset (including const/padding)
+                *cur_offset += (uint16_t)(report_size * report_count);
 
-            case 2: // Local
-                switch (bTag) {
-                    case 0x00: usage = (uint16_t)data_unsigned; break;
-                }
+                // Reset local state after Main item
+                usage_count     = 0;
+                has_usage_range = 0;
+                usage_min = usage_max = 0;
                 break;
+            }
+            case 0x0A: // Collection
+            {
+                collection_depth++;
+                uint16_t coll_usage = (usage_count > 0) ? usage_stack[0] : 0;
+                uint32_t coll_u32   = ((uint32_t)usage_page << 16) | coll_usage;
+
+                // Push parent app_type
+                if (app_stack_depth < 16)
+                    app_stack[app_stack_depth++] = app_type;
+
+                // Detect application type from collection usage
+                if (coll_u32 == HID_DG_TOUCHPAD ||
+                    coll_u32 == HID_DG_TOUCHSCREEN)
+                    app_type = 1;
+                else if (coll_u32 == HID_GD_MOUSE)
+                    app_type = 2;
+                // else: inherit parent app_type
+
+                // Reset local state
+                usage_count     = 0;
+                has_usage_range = 0;
+                break;
+            }
+            case 0x0C: // End Collection
+            {
+                if (app_stack_depth > 0)
+                    app_type = app_stack[--app_stack_depth];
+                else
+                    app_type = 0;
+                if (collection_depth > 0) collection_depth--;
+                break;
+            }
+            default:
+                usage_count     = 0;
+                has_usage_range = 0;
+                break;
+            }
+            break;
+
+        case 1: // Global
+            switch (bTag) {
+            case 0x00: usage_page   = (uint16_t)data_unsigned; break;
+            case 0x01: logical_min  = data_signed; break;
+            case 0x02: logical_max  = data_signed; break;
+            case 0x07: report_size  = data_unsigned; break;
+            case 0x08: // Report ID
+                report_id = (uint8_t)data_unsigned;
+                break;
+            case 0x09: report_count = data_unsigned; break;
+            }
+            break;
+
+        case 2: // Local
+            switch (bTag) {
+            case 0x00: // Usage
+                if (usage_count < HID_USAGE_MAX)
+                    usage_stack[usage_count++] = (uint16_t)data_unsigned;
+                break;
+            case 0x01: // Usage Minimum
+                usage_min = (uint16_t)data_unsigned;
+                has_usage_range = 1;
+                break;
+            case 0x02: // Usage Maximum
+                usage_max = (uint16_t)data_unsigned;
+                has_usage_range = 1;
+                break;
+            }
+            break;
         }
 
         pos += 1 + size;
     }
 
-    // Determine device type based on what was found
-    if (mouse_found) {
-        dev->dev_type = dev->mouse_report.dev_type;
-        // Calculate total report size
-        uint16_t max_bit = 0;
-        if (dev->mouse_report.buttons.bit_offset + dev->mouse_report.buttons.bit_size > max_bit)
-            max_bit = dev->mouse_report.buttons.bit_offset + dev->mouse_report.buttons.bit_size;
-        if (dev->mouse_report.x.bit_offset + dev->mouse_report.x.bit_size > max_bit)
-            max_bit = dev->mouse_report.x.bit_offset + dev->mouse_report.x.bit_size;
-        if (dev->mouse_report.y.bit_offset + dev->mouse_report.y.bit_size > max_bit)
-            max_bit = dev->mouse_report.y.bit_offset + dev->mouse_report.y.bit_size;
-        if (dev->mouse_report.has_wheel &&
-            dev->mouse_report.wheel.bit_offset + dev->mouse_report.wheel.bit_size > max_bit)
-            max_bit = dev->mouse_report.wheel.bit_offset + dev->mouse_report.wheel.bit_size;
-        dev->mouse_report.report_bytes = (max_bit + 7) / 8;
+    // ================================================================
+    //  Phase 2 — resolve specific usages from the field table
+    // ================================================================
 
-        kprintf("[I2C-HID] Parsed %s report: ID=%d  buttons@%u(%u bits)  "
-                "X@%u(%u bits%s)  Y@%u(%u bits%s)  wheel=%s  total=%u bytes\n",
-                dev->dev_type == I2C_HID_DEV_TOUCHPAD ? "touchpad" : "mouse",
-                dev->mouse_report.report_id,
-                dev->mouse_report.buttons.bit_offset, dev->mouse_report.buttons.bit_size,
-                dev->mouse_report.x.bit_offset, dev->mouse_report.x.bit_size,
-                dev->mouse_report.x.is_relative ? ",rel" : ",abs",
-                dev->mouse_report.y.bit_offset, dev->mouse_report.y.bit_size,
-                dev->mouse_report.y.is_relative ? ",rel" : ",abs",
-                dev->mouse_report.has_wheel ? "yes" : "no",
-                dev->mouse_report.report_bytes);
-    } else {
-        dev->dev_type = I2C_HID_DEV_UNKNOWN;
-        kprintf("[I2C-HID] Could not determine device type from report descriptor\n");
+    // --- Input Mode feature (0x000D0052) ---
+    for (int i = 0; i < field_count; i++) {
+        if (fields[i].report_type == 2 && fields[i].usage == HID_DG_INPUTMODE
+            && dev->input_mode_rid == 0) {
+            dev->input_mode_rid  = fields[i].report_id;
+            dev->input_mode_size = (uint8_t)((fields[i].bit_size + 7) / 8);
+            kprintf("[I2C-HID] Found Input Mode feature: "
+                    "reportID=%u size=%u bits\n",
+                    fields[i].report_id, fields[i].bit_size);
+            break;
+        }
     }
+
+    // --- Find TIP_SWITCH fields (each marks a contact slot) ---
+    int tip_idx[8];
+    int tip_count      = 0;
+    uint8_t tp_rid     = 0;
+    int tp_found       = 0;
+
+    // First pass: prefer touchpad app_type (== 1)
+    for (int i = 0; i < field_count; i++) {
+        if (fields[i].report_type != 0)         continue;
+        if (fields[i].usage != HID_DG_TIPSWITCH) continue;
+        if (fields[i].app_type != 1)             continue;
+        if (!tp_found) { tp_rid = fields[i].report_id; tp_found = 1; }
+        if (fields[i].report_id == tp_rid && tip_count < 8)
+            tip_idx[tip_count++] = i;
+    }
+
+    // Second pass: any TIP_SWITCH
+    if (!tp_found) {
+        for (int i = 0; i < field_count; i++) {
+            if (fields[i].report_type != 0)         continue;
+            if (fields[i].usage != HID_DG_TIPSWITCH) continue;
+            if (!tp_found) { tp_rid = fields[i].report_id; tp_found = 1; }
+            if (fields[i].report_id == tp_rid && tip_count < 8)
+                tip_idx[tip_count++] = i;
+        }
+    }
+
+    // Fallback: find a report with GD_X (mouse-only device)
+    if (!tp_found) {
+        for (int i = 0; i < field_count; i++) {
+            if (fields[i].report_type == 0 && fields[i].usage == HID_GD_X) {
+                tp_rid   = fields[i].report_id;
+                tp_found = 1;
+                break;
+            }
+        }
+    }
+
+    if (!tp_found) {
+        dev->dev_type = I2C_HID_DEV_UNKNOWN;
+        kprintf("[I2C-HID] Could not determine device type from "
+                "report descriptor (%d fields parsed)\n", field_count);
+        return;
+    }
+
+    // --- Populate mouse_report from resolved fields ---
+    i2c_hid_report_info_t *ri = &dev->mouse_report;
+    i2c_memset(ri, 0, sizeof(*ri));
+    ri->report_id     = tp_rid;
+    ri->has_report_id = (tp_rid != 0);
+    ri->dev_type      = (tip_count > 0) ? I2C_HID_DEV_TOUCHPAD
+                                        : I2C_HID_DEV_MOUSE;
+    dev->dev_type     = ri->dev_type;
+
+    // Contact 0 TIP_SWITCH
+    if (tip_count > 0) {
+        int ti = tip_idx[0];
+        ri->tip_switch.report_id  = fields[ti].report_id;
+        ri->tip_switch.bit_offset = fields[ti].bit_offset;
+        ri->tip_switch.bit_size   = fields[ti].bit_size;
+        ri->tip_switch.logical_min = 0;
+        ri->tip_switch.logical_max = 1;
+        ri->has_tip_switch = 1;
+    }
+
+    // Contact 0 X, Y — fields between first and second TIP_SWITCH
+    int c0_start = (tip_count > 0) ? tip_idx[0] : 0;
+    int c0_end   = (tip_count > 1) ? tip_idx[1] : field_count;
+    for (int i = c0_start; i < c0_end; i++) {
+        if (fields[i].report_type != 0)        continue;
+        if (fields[i].report_id != tp_rid)     continue;
+        if (fields[i].usage == HID_GD_X && ri->x.bit_size == 0) {
+            ri->x.report_id   = fields[i].report_id;
+            ri->x.bit_offset  = fields[i].bit_offset;
+            ri->x.bit_size    = fields[i].bit_size;
+            ri->x.logical_min = fields[i].logical_min;
+            ri->x.logical_max = fields[i].logical_max;
+            ri->x.is_relative = (fields[i].flags & 0x04) ? 1 : 0;
+        } else if (fields[i].usage == HID_GD_Y && ri->y.bit_size == 0) {
+            ri->y.report_id   = fields[i].report_id;
+            ri->y.bit_offset  = fields[i].bit_offset;
+            ri->y.bit_size    = fields[i].bit_size;
+            ri->y.logical_min = fields[i].logical_min;
+            ri->y.logical_max = fields[i].logical_max;
+            ri->y.is_relative = (fields[i].flags & 0x04) ? 1 : 0;
+        }
+    }
+
+    // Fallback: search all fields for X/Y (mouse-only descriptor)
+    if (ri->x.bit_size == 0 || ri->y.bit_size == 0) {
+        for (int i = 0; i < field_count; i++) {
+            if (fields[i].report_type != 0)    continue;
+            if (fields[i].report_id != tp_rid) continue;
+            if (fields[i].usage == HID_GD_X && ri->x.bit_size == 0) {
+                ri->x.report_id   = fields[i].report_id;
+                ri->x.bit_offset  = fields[i].bit_offset;
+                ri->x.bit_size    = fields[i].bit_size;
+                ri->x.logical_min = fields[i].logical_min;
+                ri->x.logical_max = fields[i].logical_max;
+                ri->x.is_relative = (fields[i].flags & 0x04) ? 1 : 0;
+            } else if (fields[i].usage == HID_GD_Y && ri->y.bit_size == 0) {
+                ri->y.report_id   = fields[i].report_id;
+                ri->y.bit_offset  = fields[i].bit_offset;
+                ri->y.bit_size    = fields[i].bit_size;
+                ri->y.logical_min = fields[i].logical_min;
+                ri->y.logical_max = fields[i].logical_max;
+                ri->y.is_relative = (fields[i].flags & 0x04) ? 1 : 0;
+            }
+        }
+    }
+
+    // Contact Count (0x000D0054)
+    for (int i = 0; i < field_count; i++) {
+        if (fields[i].report_type != 0)    continue;
+        if (fields[i].report_id != tp_rid) continue;
+        if (fields[i].usage == HID_DG_CONTACTCOUNT) {
+            ri->contact_count.report_id  = fields[i].report_id;
+            ri->contact_count.bit_offset = fields[i].bit_offset;
+            ri->contact_count.bit_size   = fields[i].bit_size;
+            ri->contact_count.logical_min = fields[i].logical_min;
+            ri->contact_count.logical_max = fields[i].logical_max;
+            ri->has_contact_count = 1;
+            break;
+        }
+    }
+
+    // Button — prefer touchpad app_type (== 1) over mouse (== 2)
+    int btn_idx = -1;
+    for (int i = 0; i < field_count; i++) {
+        if (fields[i].report_type != 0)        continue;
+        if (fields[i].report_id != tp_rid)     continue;
+        if ((fields[i].usage >> 16) != HID_UP_BUTTON) continue;
+        if (btn_idx < 0 || fields[i].app_type == 1) {
+            btn_idx = i;
+            if (fields[i].app_type == 1) break;  // best match
+        }
+    }
+    if (btn_idx >= 0) {
+        // Count consecutive button fields for combined extraction
+        uint16_t bstart = fields[btn_idx].bit_offset;
+        uint16_t bbits  = fields[btn_idx].bit_size;
+        for (int j = btn_idx + 1; j < field_count; j++) {
+            if (fields[j].report_type != 0)        break;
+            if (fields[j].report_id != tp_rid)     break;
+            if ((fields[j].usage >> 16) != HID_UP_BUTTON) break;
+            if (fields[j].bit_offset != bstart + bbits)    break;
+            bbits += fields[j].bit_size;
+        }
+        ri->buttons.report_id  = fields[btn_idx].report_id;
+        ri->buttons.bit_offset = bstart;
+        ri->buttons.bit_size   = bbits;
+        ri->buttons.count      = bbits / fields[btn_idx].bit_size;
+        ri->buttons.logical_min = 0;
+        ri->buttons.logical_max = 1;
+    }
+
+    // Wheel (0x00010038) — only useful for mouse devices
+    for (int i = 0; i < field_count; i++) {
+        if (fields[i].report_type != 0)    continue;
+        if (fields[i].report_id != tp_rid) continue;
+        if (fields[i].usage == HID_GD_WHEEL) {
+            ri->wheel.report_id   = fields[i].report_id;
+            ri->wheel.bit_offset  = fields[i].bit_offset;
+            ri->wheel.bit_size    = fields[i].bit_size;
+            ri->wheel.logical_min = fields[i].logical_min;
+            ri->wheel.logical_max = fields[i].logical_max;
+            ri->wheel.is_relative = 1;
+            ri->has_wheel = 1;
+            break;
+        }
+    }
+
+    // Calculate total report size from highest bit position
+    uint16_t max_bit = 0;
+    for (int i = 0; i < field_count; i++) {
+        if (fields[i].report_type == 0 && fields[i].report_id == tp_rid) {
+            uint16_t end = fields[i].bit_offset + fields[i].bit_size;
+            if (end > max_bit) max_bit = end;
+        }
+    }
+    ri->report_bytes = (max_bit + 7) / 8;
+
+    kprintf("[I2C-HID] Parsed %s report (Linux-style, %d fields): "
+            "ID=%d  tip@%u(%u)  buttons@%u(%u bits)  "
+            "X@%u(%u bits%s)  Y@%u(%u bits%s)  "
+            "cc@%u(%u)  wheel=%s  total=%u bytes\n",
+            ri->dev_type == I2C_HID_DEV_TOUCHPAD ? "touchpad" : "mouse",
+            field_count, ri->report_id,
+            ri->tip_switch.bit_offset, ri->tip_switch.bit_size,
+            ri->buttons.bit_offset, ri->buttons.bit_size,
+            ri->x.bit_offset, ri->x.bit_size,
+            ri->x.is_relative ? ",rel" : ",abs",
+            ri->y.bit_offset, ri->y.bit_size,
+            ri->y.is_relative ? ",rel" : ",abs",
+            ri->has_contact_count ? ri->contact_count.bit_offset : 0,
+            ri->has_contact_count ? ri->contact_count.bit_size : 0,
+            ri->has_wheel ? "yes" : "no",
+            ri->report_bytes);
+
+    kprintf("[I2C-HID]   X range: %d..%d  Y range: %d..%d\n",
+            ri->x.logical_min, ri->x.logical_max,
+            ri->y.logical_min, ri->y.logical_max);
 }
 
 // ============================================================================
@@ -1570,6 +2240,53 @@ static int i2c_hid_init_device(i2c_hid_device_t *dev) {
     i2c_hid_set_power(dev, I2C_HID_POWER_ON);
     i2c_delay_us(10000);
 
+    // SET_IDLE(0) — infinite idle: only report when data changes
+    i2c_hid_set_idle(dev, 0, 0);
+    i2c_delay_us(1000);
+
+    // SET_PROTOCOL — ensure Report Protocol mode (not Boot Protocol)
+    i2c_hid_set_protocol(dev, I2C_HID_PROTOCOL_REPORT);
+    i2c_delay_us(1000);
+
+    // SET_REPORT (Feature): Enable touchpad Input Mode (value = 3)
+    // Windows Precision Touchpads require this to switch from mouse
+    // emulation to native touchpad reports with coordinates.
+    if (dev->input_mode_rid != 0) {
+        uint8_t mode_val = 0x03;  // Touchpad collection mode
+        int sr_rc = i2c_hid_set_report(dev, 3, dev->input_mode_rid,
+                                        &mode_val, 1);
+        kprintf("[I2C-HID] SET_REPORT input mode=3 rid=%u rc=%d\n",
+                dev->input_mode_rid, sr_rc);
+        i2c_delay_us(10000);  // 10ms for mode switch
+    } else {
+        kprintf("[I2C-HID] No Input Mode feature found in report desc\n");
+    }
+
+    // Drain any pending reports left over from reset / init.
+    {
+        uint16_t drain_max = dev->desc.wMaxInputLength;
+        if (drain_max > I2C_HID_MAX_REPORT_SIZE)
+            drain_max = I2C_HID_MAX_REPORT_SIZE;
+        if (drain_max < 2) drain_max = 2;
+        uint8_t drain_buf[I2C_HID_MAX_REPORT_SIZE];
+        for (int drain = 0; drain < 10; drain++) {
+            int drc;
+            if (dev->ctrl->use_interrupts)
+                drc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr,
+                                       NULL, 0, drain_buf, drain_max);
+            else
+                drc = dw_i2c_xfer(dev->ctrl, dev->i2c_addr,
+                                   NULL, 0, drain_buf, drain_max);
+            if (drc < 0) break;
+            uint16_t dlen = (uint16_t)drain_buf[0] |
+                            ((uint16_t)drain_buf[1] << 8);
+            kprintf("[I2C-HID] drain[%d]: len=%u [%02x %02x %02x %02x]\n",
+                    drain, dlen, drain_buf[0], drain_buf[1],
+                    drain_buf[2], drain_buf[3]);
+            if (dlen <= 2) break;
+        }
+    }
+
     dev->active = 1;
 
     kprintf("[I2C-HID] Device I2C%d:0x%02x initialized as %s "
@@ -1608,6 +2325,25 @@ static int32_t extract_field(const uint8_t *data, uint16_t bit_offset,
     return value;
 }
 
+// Extract an unsigned integer from a bit field (no sign extension).
+// Used for tip_switch, buttons, contact_count — fields that are always >= 0.
+static uint32_t extract_field_unsigned(const uint8_t *data,
+                                        uint16_t bit_offset,
+                                        uint16_t bit_size) {
+    if (bit_size == 0 || bit_size > 32) return 0;
+
+    uint32_t value = 0;
+    for (uint16_t i = 0; i < bit_size; i++) {
+        uint16_t bit_pos  = bit_offset + i;
+        uint16_t byte_pos = bit_pos / 8;
+        uint8_t  bit_idx  = bit_pos % 8;
+        if (data[byte_pos] & (1 << bit_idx))
+            value |= (1u << i);
+    }
+
+    return value;
+}
+
 // Process a mouse/touchpad input report using parsed field info
 static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
                                     const uint8_t *data, int data_len) {
@@ -1617,52 +2353,100 @@ static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
 
     int data_bits = data_len * 8;
 
-    // Bounds-check field positions
-    if ((int)(ri->buttons.bit_offset + ri->buttons.bit_size) > data_bits) return;
+    // Bounds-check X and Y field positions
     if ((int)(ri->x.bit_offset + ri->x.bit_size) > data_bits) return;
     if ((int)(ri->y.bit_offset + ri->y.bit_size) > data_bits) return;
 
-    // Extract fields
-    uint8_t buttons = (uint8_t)extract_field(data, ri->buttons.bit_offset,
-                                              ri->buttons.bit_size);
-    int32_t x = extract_field(data, ri->x.bit_offset, ri->x.bit_size);
-    int32_t y = extract_field(data, ri->y.bit_offset, ri->y.bit_size);
+    // Extract fields — use UNSIGNED extraction for boolean/flags,
+    // signed extraction for coordinates (which may be relative/negative).
+    uint8_t buttons = 0;
+    if (ri->buttons.bit_size > 0 &&
+        (int)(ri->buttons.bit_offset + ri->buttons.bit_size) <= data_bits)
+        buttons = (uint8_t)extract_field_unsigned(data, ri->buttons.bit_offset,
+                                                       ri->buttons.bit_size);
+    int32_t x, y;
+    if (ri->x.is_relative) {
+        // Relative mode — signed, dx/dy can be negative
+        x = extract_field(data, ri->x.bit_offset, ri->x.bit_size);
+        y = extract_field(data, ri->y.bit_offset, ri->y.bit_size);
+    } else {
+        // Absolute touchpad coords are always >= 0 (0..logical_max).
+        // Signed extraction sign-extends values >= 2^(bits-1), e.g.
+        // 2500 in a 12-bit field becomes -1596 → massive cursor jump.
+        x = (int32_t)extract_field_unsigned(data, ri->x.bit_offset, ri->x.bit_size);
+        y = (int32_t)extract_field_unsigned(data, ri->y.bit_offset, ri->y.bit_size);
+    }
     int8_t wheel = 0;
-    if (ri->has_wheel) {
+    if (ri->has_wheel && ri->dev_type != I2C_HID_DEV_TOUCHPAD) {
+        // Precision touchpads don't have a real scroll wheel;
+        // any parsed wheel field is from a mouse-compat sub-collection
+        // and would read garbage from the touchpad data format.
         int32_t w = extract_field(data, ri->wheel.bit_offset, ri->wheel.bit_size);
         wheel = (int8_t)(w > 127 ? 127 : (w < -128 ? -128 : w));
     }
 
+    // Tip switch: finger touching the surface (digitizer usage 0x42)
+    uint8_t touching = 0;
+    if (ri->has_tip_switch &&
+        (int)(ri->tip_switch.bit_offset + ri->tip_switch.bit_size) <= data_bits)
+        touching = (uint8_t)extract_field_unsigned(data, ri->tip_switch.bit_offset,
+                                                        ri->tip_switch.bit_size);
+
+    // Multi-touch rejection: if contact_count > 1, another finger or
+    // palm landed on the pad.  Contact 0 might be a palm at a wildly
+    // different position → huge cursor jump.  Skip the report and
+    // treat it as a lift (touching=0) so the accumulators reset.
+    // Two-finger scrolling / gestures are not supported yet, and
+    // this is the single most common cause of cursor jumps.
+    if (ri->has_contact_count) {
+        uint32_t cc = extract_field_unsigned(data,
+            ri->contact_count.bit_offset, ri->contact_count.bit_size);
+        if (cc > 1)
+            touching = 0;  // pretend lift → reset accumulators
+    }
+
     // For absolute touchpad data, convert to relative deltas
     if (!ri->x.is_relative) {
-        // Scale absolute coordinates to screen-relative deltas
+        // Convert absolute touchpad coordinates to USB-mouse-like
+        // relative deltas.  USB mice report int8_t dx/dy in the
+        // range ±1..±5 for normal moves.  The mouse subsystem
+        // applies sensitivity*2 (default: 4*2/2 = ×2), so we must
+        // produce values in that same small range.
+        //
+        // Touchpad resolution is ~2500 × 1760.  A normal slow swipe
+        // generates raw deltas of 2–80 per report.  We use fractional
+        // accumulators: accumulate raw deltas and emit integer units
+        // only when the remainder exceeds the divisor.  This preserves
+        // slow sub-pixel movements that integer division would lose.
         static int32_t last_abs_x = -1, last_abs_y = -1;
         static uint8_t last_touch = 0;
+        static int accum_x = 0, accum_y = 0;
 
-        // Touchpads typically have a "tip switch" or button set when finger is down
-        uint8_t touching = buttons & 0x01;
-
+        int dx = 0, dy = 0;
         if (touching && last_touch && last_abs_x >= 0) {
-            // Calculate relative delta from absolute position change
-            int32_t range_x = ri->x.logical_max - ri->x.logical_min;
-            int32_t range_y = ri->y.logical_max - ri->y.logical_min;
-            if (range_x <= 0) range_x = 4096;
-            if (range_y <= 0) range_y = 4096;
+            accum_x += (int)(x - last_abs_x);
+            accum_y += (int)(y - last_abs_y);
 
-            // Scale: absolute range → reasonable pixel movement
-            int dx = (int)((x - last_abs_x) * 1024 / range_x);
-            int dy = (int)((y - last_abs_y) * 768 / range_y);
+            dx = accum_x / 4;
+            dy = accum_y / 4;
+            accum_x -= dx * 4;
+            accum_y -= dy * 4;
 
-            // Clamp to reasonable range
-            if (dx > 50) dx = 50;
-            if (dx < -50) dx = -50;
-            if (dy > 50) dy = 50;
-            if (dy < -50) dy = -50;
-
-            // For touchpad, use button 0 as click, not tip-down
-            uint8_t mouse_btns = (buttons >> 1) & 0x07;  // buttons 1-3 are actual clicks
-            mouse_inject_usb_movement(dx, dy, mouse_btns, wheel);
+            if (dx > 127) dx = 127;
+            if (dx < -127) dx = -127;
+            if (dy > 127) dy = 127;
+            if (dy < -127) dy = -127;
+        } else {
+            accum_x = 0;
+            accum_y = 0;
         }
+
+        // Inject on movement OR button change — the old check
+        // (dx||dy only) silently dropped all clicks when the
+        // finger was stationary on the pad.
+        if (dx != 0 || dy != 0 || buttons != dev->prev_buttons)
+            mouse_inject_usb_movement(dx, dy, buttons & 0x07, wheel);
+        dev->prev_buttons = buttons;
 
         last_abs_x = touching ? x : -1;
         last_abs_y = touching ? y : -1;
@@ -1688,11 +2472,24 @@ static int i2c_hid_read_input(i2c_hid_device_t *dev) {
     if (max_len > I2C_HID_MAX_REPORT_SIZE) max_len = I2C_HID_MAX_REPORT_SIZE;
     if (max_len < 2) return -1;
 
-    // Read from input register
-    int rc = dw_i2c_read_reg16(dev->ctrl, dev->i2c_addr,
-                                dev->desc.wInputRegister,
-                                dev->input_buf, max_len);
-    if (rc < 0) return -1;
+    // Use raw I2C read (no register address write), matching Linux
+    // i2c_hid_get_input() → i2c_master_recv().  The device already knows
+    // we want the input report because it asserted INT#.
+    int rc;
+    if (dev->ctrl->use_interrupts)
+        rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr,
+                              NULL, 0, dev->input_buf, max_len);
+    else
+        rc = dw_i2c_xfer(dev->ctrl, dev->i2c_addr,
+                          NULL, 0, dev->input_buf, max_len);
+    if (rc < 0) {
+        kprintf("[I2C-HID] read err: abort_src=0x%x status=0x%x raw=0x%x addr=0x%x\n",
+                dev->ctrl->abort_source,
+                dw_read(dev->ctrl, DW_IC_STATUS),
+                dw_read(dev->ctrl, DW_IC_RAW_INTR_STAT),
+                dev->i2c_addr);
+        return -1;
+    }
 
     // First 2 bytes are the length field
     uint16_t report_len = (uint16_t)dev->input_buf[0] |
@@ -1702,8 +2499,8 @@ static int i2c_hid_read_input(i2c_hid_device_t *dev) {
     if (report_len == 0 || report_len == 0xFFFF || report_len <= 2)
         return 0;
 
-    // Sanity check
-    if (report_len > max_len) return -1;
+    // Sanity check — treat oversized length as "no data" not bus error
+    if (report_len > max_len) return 0;
 
     uint8_t *report_data = &dev->input_buf[2];
     int report_data_len = report_len - 2;
@@ -1789,7 +2586,9 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
                             uint8_t *rbuf, int rlen)
 {
     int timeout;
+    int retry = 0;
 
+retry_xfer:
     dw_i2c_set_target(ctrl, addr);
 
     // Clear state flags
@@ -1799,20 +2598,25 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
     ctrl->xfer_error = 0;
     ctrl->abort_source = 0;
 
+    // Ensure bus is idle before starting a new transfer.
+    // With set_target skip (no disable/enable), the previous transfer's
+    // STOP may still be in-flight.  Wait for master to be inactive.
+    dw_i2c_wait_idle(ctrl, 10000);
+
     // ---- Write phase ----
     for (int i = 0; i < wlen; i++) {
         uint32_t cmd = (uint32_t)wbuf[i];
         if (i == wlen - 1 && rlen == 0)
             cmd |= DW_IC_DATA_CMD_STOP;
 
-        // Wait for TX FIFO space (quick poll — FIFO is typically 64 deep)
-        for (timeout = 0; timeout < 50000; timeout++) {
+        // Wait for TX FIFO space
+        for (timeout = 0; timeout < 200000; timeout++) {
             if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_TFNF)
                 break;
             if (ctrl->xfer_error) goto abort;
             i2c_delay_us(1);
         }
-        if (timeout >= 50000) goto abort;
+        if (timeout >= 200000) goto abort;
 
         dw_write(ctrl, DW_IC_DATA_CMD, cmd);
     }
@@ -1847,7 +2651,7 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
 
             // Wait for RX data via interrupt or poll fallback
             ctrl->rx_ready = 0;
-            for (timeout = 0; timeout < 100000; timeout++) {
+            for (timeout = 0; timeout < 200000; timeout++) {
                 if (ctrl->xfer_error) {
                     dw_write(ctrl, DW_IC_INTR_MASK, 0);
                     goto abort;
@@ -1857,11 +2661,15 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
                     break;
                 if (ctrl->rx_ready)
                     break;
-                // Brief pause, but much shorter than full polling
-                // because the interrupt will unblock us fast in practice
+                // Direct abort check — catches TX_ABRT even if MSI
+                // delivery is delayed (no dependency on ISR)
+                if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT) {
+                    dw_write(ctrl, DW_IC_INTR_MASK, 0);
+                    goto abort;
+                }
                 i2c_delay_us(1);
             }
-            if (timeout >= 100000) {
+            if (timeout >= 200000) {
                 dw_write(ctrl, DW_IC_INTR_MASK, 0);
                 goto abort;
             }
@@ -1886,14 +2694,637 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
 
 abort:
     {
+        uint32_t abort_src = dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
+        // If the I2C ISR already read and cleared TX_ABRT_SOURCE (race
+        // between ISR and this handler), use the ISR-saved value.
+        if (abort_src == 0 && ctrl->xfer_error)
+            abort_src = ctrl->abort_source;
         (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
         (void)dw_read(ctrl, DW_IC_CLR_INTR);
         dw_write(ctrl, DW_IC_INTR_MASK, 0);
         while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
             (void)dw_read(ctrl, DW_IC_DATA_CMD);
-        i2c_delay_us(100);
+        // Reset controller state machine (Linux i2c-designware does this
+        // after every abort to clear the hardware FIFO and bus state)
+        dw_i2c_disable(ctrl);
+        i2c_delay_us(1000);  // 1ms — give device firmware time to reset
+        dw_i2c_enable(ctrl);
+        ctrl->current_target = 0xFFFF;  // Force re-program after reset
+        ctrl->abort_source = abort_src;  // Save for caller diagnostics
+        // Retry once on NACK, ARB_LOST, or pure timeout (abort_src==0
+        // means the hardware didn't report an error but we timed out
+        // waiting for RX data — transient, worth one retry).
+        if (retry < 1) {
+            retry++;
+            goto retry_xfer;
+        }
         return -1;
     }
+}
+
+// ============================================================================
+// GPIO Interrupt Support (like Linux pinctrl-intel + i2c-hid-acpi)
+// ============================================================================
+
+// Read P2SB SBREG_BAR: unhide P2SB D31:F1, read BAR, re-hide.
+// Returns physical base address of P2SB sideband register window, or 0.
+static uint64_t p2sb_get_sbreg_bar(void)
+{
+    uint64_t bar = 0;
+
+    // Unhide P2SB via ECAM (preferred) and CF8
+    if (g_ecam_bus0_va) {
+        ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
+                     P2SB_P2SBC, 0);
+        i2c_delay_us(1000);
+
+        uint32_t vid = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+                                   P2SB_PCI_FUNC, 0x00);
+        if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
+            // Ensure MSE is enabled
+            uint32_t cmd = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+                                       P2SB_PCI_FUNC, 0x04);
+            if (!(cmd & 0x02))
+                ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
+                             0x04, cmd | 0x02);
+
+            uint32_t bar_lo = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+                                          P2SB_PCI_FUNC, P2SB_SBREG_BAR);
+            uint32_t bar_hi = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+                                          P2SB_PCI_FUNC, P2SB_SBREG_BARH);
+            bar = ((uint64_t)bar_hi << 32) | (bar_lo & ~0xFULL);
+        }
+
+        // Re-hide P2SB
+        ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
+                     P2SB_P2SBC, P2SB_HIDE_BIT);
+    }
+
+    // CF8/CFC fallback
+    if (!bar) {
+        pci_cfg_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
+                        P2SB_P2SBC, 0);
+        i2c_delay_us(1000);
+
+        uint32_t vid = pci_cfg_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+                                      P2SB_PCI_FUNC, 0x00);
+        if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
+            uint32_t cmd = pci_cfg_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+                                          P2SB_PCI_FUNC, 0x04);
+            if (!(cmd & 0x02))
+                pci_cfg_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
+                                0x04, cmd | 0x02);
+
+            uint32_t bar_lo = pci_cfg_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+                                             P2SB_PCI_FUNC, P2SB_SBREG_BAR);
+            uint32_t bar_hi = pci_cfg_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+                                             P2SB_PCI_FUNC, P2SB_SBREG_BARH);
+            bar = ((uint64_t)bar_hi << 32) | (bar_lo & ~0xFULL);
+        }
+
+        pci_cfg_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
+                        P2SB_P2SBC, P2SB_HIDE_BIT);
+    }
+
+    return bar;
+}
+
+// Read a 32-bit register from a GPIO community's MMIO space
+static inline uint32_t gpio_comm_read32(gpio_community_t *comm, uint32_t offset)
+{
+    volatile uint32_t *addr = (volatile uint32_t *)
+        ((volatile uint8_t *)comm->base + offset);
+    return *addr;
+}
+
+// Write a 32-bit register in a GPIO community's MMIO space
+static inline void gpio_comm_write32(gpio_community_t *comm, uint32_t offset,
+                                     uint32_t value)
+{
+    volatile uint32_t *addr = (volatile uint32_t *)
+        ((volatile uint8_t *)comm->base + offset);
+    *addr = value;
+}
+
+// Detect GPIO platform by checking which known ACPI _HID matches the GPIO
+// controller. Uses acpi_aml_find_devices_by_hid to search for each platform's
+// HIDs. There is only one GPIO controller per Intel PCH, so finding any device
+// with a matching _HID is sufficient.
+// Returns pointer to matching platform table, or NULL if unknown.
+static const gpio_platform_def_t *gpio_detect_platform(const char *gpio_path)
+{
+    (void)gpio_path;
+
+    for (unsigned i = 0; i < GPIO_NUM_PLATFORMS; i++) {
+        for (int h = 0; g_gpio_platforms[i].acpi_hids[h]; h++) {
+            acpi_aml_device_info_t devs[1];
+            int ndev = acpi_aml_find_devices_by_hid(
+                g_gpio_platforms[i].acpi_hids[h], devs, 1);
+            if (ndev > 0) {
+                kprintf("[GPIO] Detected platform via _HID %s (path=%s)\n",
+                        g_gpio_platforms[i].acpi_hids[h], devs[0].path);
+                return &g_gpio_platforms[i];
+            }
+        }
+    }
+
+    kprintf("[GPIO] No matching platform table for GPIO controller\n");
+    return NULL;
+}
+
+// Resolve an ACPI GpioInt pin number to hardware location using platform tables.
+// Returns 0 on success, -1 if pin not found.
+// Sets *out_community_idx, *out_pad_offset (pad index in community),
+// *out_gpi_reg (GPI_IS register index), *out_gpi_bit (bit within register).
+static int gpio_resolve_acpi_pin(uint16_t acpi_pin,
+                                 int *out_community_idx,
+                                 uint16_t *out_pad_index,
+                                 uint8_t *out_gpi_reg,
+                                 uint8_t *out_gpi_bit)
+{
+    if (!g_gpio_platform) return -1;
+
+    for (int ci = 0; ci < g_gpio_platform->ncommunities; ci++) {
+        const gpio_community_def_t *cdef = &g_gpio_platform->communities[ci];
+        uint16_t pad_offset_in_comm = 0;
+
+        for (int gi = 0; gi < cdef->ngpps; gi++) {
+            const gpio_padgroup_def_t *grp = &cdef->gpps[gi];
+
+            if (grp->gpio_base != GPIO_NOMAP &&
+                acpi_pin >= (uint16_t)grp->gpio_base &&
+                acpi_pin < (uint16_t)grp->gpio_base + grp->size) {
+                uint8_t offset_in_group = (uint8_t)(acpi_pin - grp->gpio_base);
+                *out_community_idx = ci;
+                *out_pad_index = pad_offset_in_comm + offset_in_group;
+                *out_gpi_reg = grp->reg_num;
+                *out_gpi_bit = offset_in_group;
+                return 0;
+            }
+            pad_offset_in_comm += grp->size;
+        }
+    }
+    return -1;
+}
+
+// Discover GPIO communities from the ACPI GPIO controller's _CRS.
+// Each MMIO range in _CRS = one GPIO community.
+// Uses platform tables for group structure if platform is known.
+// Returns number of communities found.
+static int gpio_discover_communities(const char *gpio_ctrl_path)
+{
+    acpi_crs_result_t crs;
+    i2c_memset(&crs, 0, sizeof(crs));
+
+    if (acpi_aml_eval_crs(gpio_ctrl_path, &crs) != 0) {
+        kprintf("[GPIO] Failed to evaluate _CRS on %s\n", gpio_ctrl_path);
+        return 0;
+    }
+
+    kprintf("[GPIO] %s: %d MMIO ranges, %d IRQs\n",
+            gpio_ctrl_path, crs.mmio_range_count, crs.irq_count);
+
+    // Detect platform from ACPI _HID
+    g_gpio_platform = gpio_detect_platform(gpio_ctrl_path);
+
+    // The IRQ resource gives us the IOAPIC GSI for this GPIO controller
+    uint32_t gpio_gsi = 0;
+    if (crs.irq_count > 0) {
+        gpio_gsi = crs.irqs[0];
+        g_gpio_ioapic_polarity = crs.irq_polarity;
+        g_gpio_ioapic_trigger  = crs.irq_triggering;
+        kprintf("[GPIO] IOAPIC GSI from _CRS: %u (trigger=%s, pol=%s)\n",
+                gpio_gsi,
+                crs.irq_triggering ? "edge" : "level",
+                crs.irq_polarity ? "low" : "high");
+    }
+
+    int count = 0;
+
+    for (int i = 0; i < crs.mmio_range_count && count < GPIO_MAX_COMMUNITIES; i++) {
+        uint64_t phys = crs.mmio_ranges[i].base;
+        uint32_t len = crs.mmio_ranges[i].length;
+
+        if (phys == 0 || len == 0) continue;
+
+        // Map enough pages to cover the full community MMIO region
+        uint32_t npages = (len + 0xFFF) >> 12;
+        if (npages == 0) npages = 1;
+        uint64_t va = mm_map_device_mmio(phys, npages);
+        if (!va) {
+            kprintf("[GPIO] Failed to map community %d at 0x%llx\n",
+                    i, (unsigned long long)phys);
+            continue;
+        }
+
+        gpio_community_t *comm = &g_gpio_communities[count];
+        i2c_memset(comm, 0, sizeof(*comm));
+        comm->base = (volatile uint32_t *)va;
+        comm->phys = phys;
+
+        // Read MISCCFG to get GPDMINTSEL (IOAPIC IRQ line for this community)
+        uint32_t misccfg = gpio_comm_read32(comm, GPIO_MISCCFG);
+        comm->irq_line = (misccfg & GPIO_MISCCFG_GPDMINTSEL_MASK)
+                         >> GPIO_MISCCFG_GPDMINTSEL_SHIFT;
+
+        // Override IRQ line from _CRS if available (more reliable)
+        if (gpio_gsi)
+            comm->irq_line = (uint8_t)gpio_gsi;
+
+        // Read PADBAR to find where pad configs start
+        uint32_t padbar = gpio_comm_read32(comm, GPIO_PADBAR) & 0xFFFF;
+
+        // Populate group structure from platform table if available
+        if (g_gpio_platform && count < g_gpio_platform->ncommunities) {
+            const gpio_community_def_t *cdef = &g_gpio_platform->communities[count];
+            comm->pin_base = cdef->pin_base;
+            comm->pin_count = cdef->npins;
+            comm->num_groups = cdef->ngpps;
+
+            uint16_t pad_offset = 0;
+            for (int g = 0; g < cdef->ngpps && g < GPIO_MAX_GROUPS_PER_COMM; g++) {
+                comm->groups[g].pad_cfg_offset = padbar + pad_offset * GPIO_PAD_STRIDE;
+                comm->groups[g].pad_count = cdef->gpps[g].size;
+                comm->groups[g].gpi_reg_index = cdef->gpps[g].reg_num;
+                comm->groups[g].gpio_base = cdef->gpps[g].gpio_base;
+                pad_offset += cdef->gpps[g].size;
+            }
+        } else {
+            // Unknown platform: scan hardware to estimate pad count
+            uint16_t scan_limit = 256;
+            if (padbar + scan_limit * GPIO_PAD_STRIDE > len)
+                scan_limit = (uint16_t)((len - padbar) / GPIO_PAD_STRIDE);
+
+            uint16_t npads = 0;
+            for (uint16_t p = 0; p < scan_limit; p++) {
+                uint32_t off = padbar + p * GPIO_PAD_STRIDE;
+                uint32_t dw0 = gpio_comm_read32(comm, off + GPIO_PAD_CFG_DW0);
+                uint32_t dw1 = gpio_comm_read32(comm, off + GPIO_PAD_CFG_DW1);
+                if (dw0 != 0 || dw1 != 0)
+                    npads = p + 1;
+            }
+
+            comm->pin_base = 0; // Unknown — cumulative not meaningful
+            comm->pin_count = npads;
+            comm->num_groups = 1;
+            comm->groups[0].pad_cfg_offset = padbar;
+            comm->groups[0].pad_count = (uint8_t)(npads > 255 ? 255 : npads);
+            comm->groups[0].gpi_reg_index = 0;
+            comm->groups[0].gpio_base = GPIO_NOMAP;
+        }
+
+        kprintf("[GPIO] Community %d: phys=0x%llx MISCCFG=0x%08x "
+                "GPDMINTSEL=%u PADBAR=0x%x pins=%u-%u (%u pads, %u groups)%s\n",
+                count, (unsigned long long)phys, misccfg,
+                comm->irq_line, padbar,
+                comm->pin_base,
+                comm->pin_count > 0 ? comm->pin_base + comm->pin_count - 1 : comm->pin_base,
+                comm->pin_count, comm->num_groups,
+                g_gpio_platform ? " [table]" : " [scan]");
+
+        count++;
+    }
+
+    g_gpio_community_count = count;
+    return count;
+}
+
+// Find which community contains the given ACPI GpioInt pin number.
+// Uses platform gpio_base tables to resolve the pin to a physical pad.
+//
+// Returns community index (into g_gpio_communities), or -1 if not found.
+// Also sets *out_pad_offset to the PAD_CFG MMIO offset for the pin,
+// *out_gpi_group to the GPI register index, *out_gpi_bit to the bit position.
+static int gpio_find_pin_community(uint16_t pin, uint32_t *out_pad_offset,
+                                   uint8_t *out_gpi_group, uint8_t *out_gpi_bit)
+{
+    int ci_idx = -1;
+    uint16_t pad_index = 0;
+    uint8_t gpi_reg = 0, gpi_bit = 0;
+
+    if (g_gpio_platform) {
+        // Use platform table to resolve ACPI pin → community/pad
+        if (gpio_resolve_acpi_pin(pin, &ci_idx, &pad_index,
+                                  &gpi_reg, &gpi_bit) != 0) {
+            kprintf("[GPIO] Pin %u not found in platform table\n", pin);
+            return -1;
+        }
+
+        if (ci_idx >= g_gpio_community_count) {
+            kprintf("[GPIO] Pin %u maps to community %d but only %d mapped\n",
+                    pin, ci_idx, g_gpio_community_count);
+            return -1;
+        }
+
+        gpio_community_t *comm = &g_gpio_communities[ci_idx];
+        uint32_t padbar = gpio_comm_read32(comm, GPIO_PADBAR) & 0xFFFF;
+        *out_pad_offset = padbar + pad_index * GPIO_PAD_STRIDE;
+        *out_gpi_group = gpi_reg;
+        *out_gpi_bit = gpi_bit;
+
+        kprintf("[GPIO] Pin %u: community %d pad_idx %u "
+                "offset=0x%x gpi_reg=%u bit=%u (gpio_base table)\n",
+                pin, ci_idx, pad_index, *out_pad_offset,
+                gpi_reg, gpi_bit);
+        return ci_idx;
+    }
+
+    // Fallback for unknown platforms: try sequential pin ranges
+    for (int ci = 0; ci < g_gpio_community_count; ci++) {
+        gpio_community_t *comm = &g_gpio_communities[ci];
+
+        if (pin < comm->pin_base || pin >= comm->pin_base + comm->pin_count)
+            continue;
+
+        uint16_t pad_idx = pin - comm->pin_base;
+        uint32_t padbar = gpio_comm_read32(comm, GPIO_PADBAR) & 0xFFFF;
+        *out_pad_offset = padbar + pad_idx * GPIO_PAD_STRIDE;
+        *out_gpi_group = (uint8_t)(pad_idx / 32);
+        *out_gpi_bit = (uint8_t)(pad_idx % 32);
+
+        kprintf("[GPIO] Pin %u: community %d pad %u "
+                "offset=0x%x group=%u bit=%u (fallback)\n",
+                pin, ci, pad_idx, *out_pad_offset,
+                *out_gpi_group, *out_gpi_bit);
+        return ci;
+    }
+
+    kprintf("[GPIO] Pin %u not found in any community\n", pin);
+    return -1;
+}
+
+// Configure a GPIO pad for interrupt delivery via IOAPIC (GPIO Driver Mode).
+// Like Linux intel_gpio_irq_enable() + intel_gpio_set_gpio_mode().
+static int gpio_configure_pad_interrupt(gpio_community_t *comm,
+                                        uint32_t pad_offset,
+                                        uint8_t gpi_group,
+                                        uint8_t gpi_bit,
+                                        uint8_t triggering,  // 0=level, 1=edge
+                                        uint8_t polarity)    // 0=high, 1=low, 2=both
+{
+    // 1. Set HOSTSW_OWN = 1 (GPIO Driver Mode) for this pad
+    //    This makes GPI_IS (instead of GPI_GPE_STS) track interrupt status
+    uint16_t hostsw_base = g_gpio_platform ? g_gpio_platform->hostsw_own_offset : 0x0b0;
+    uint32_t hostsw_reg = hostsw_base + gpi_group * 4;
+    uint32_t hostsw = gpio_comm_read32(comm, hostsw_reg);
+    hostsw |= (1u << gpi_bit);
+    gpio_comm_write32(comm, hostsw_reg, hostsw);
+    kprintf("[GPIO] HOSTSW_OWN[%u] = 0x%08x (set bit %u)\n",
+            gpi_group, gpio_comm_read32(comm, hostsw_reg), gpi_bit);
+
+    // 2. Configure PAD_CFG_DW0:
+    //    - Set pad mode to GPIO (PMode=0) — should already be set by BIOS
+    //    - RX buffer enabled (GPIORXDIS=0) — ensure input is active
+    //    - Set RXEVCFG for edge or level trigger
+    //    - Set RXINV if active-low
+    //    - Clear all routing bits, then set GPIROUTIOXAPIC=1
+    //      (Actually, for GPIO Driver Mode, we DON'T set GPIROUTIOXAPIC.
+    //       The interrupt goes through GPI_IS/GPI_IE → GPDMINTSEL → IOAPIC.
+    //       GPIROUTIOXAPIC is for direct per-pad IOAPIC routing which is a
+    //       different mechanism. Linux does NOT use GPIROUTIOXAPIC.)
+    uint32_t dw0 = gpio_comm_read32(comm, pad_offset + GPIO_PAD_CFG_DW0);
+    kprintf("[GPIO] PAD_CFG_DW0 before: 0x%08x\n", dw0);
+
+    // Clear routing bits (we use GPIO Driver Mode, not direct IOAPIC routing)
+    dw0 &= ~(GPIO_DW0_GPIROUTIOXAPIC | GPIO_DW0_GPIROUTSCI |
+              GPIO_DW0_GPIROUTSMI | GPIO_DW0_GPIROUTNMI);
+
+    // Ensure GPIO mode (PMode = 0)
+    dw0 &= ~GPIO_DW0_PMODE_MASK;
+
+    // Enable RX (clear RX disable)
+    dw0 &= ~GPIO_DW0_GPIORXDIS;
+
+    // Set RXEVCFG to LEVEL mode (like Linux IRQF_TRIGGER_LOW).
+    //
+    // EDGE mode is WRONG for HID-over-I2C: with RXINV=1, edge detection
+    // fires on BOTH the falling edge (INT# assert = device has data) AND
+    // the rising edge (INT# deassert = device done).  The deassert-edge
+    // triggers a read when the device has NO data, causing timeouts
+    // (abort_src=0x0).
+    //
+    // LEVEL mode fires GPI_IS as long as INT# is LOW (data ready).  Once
+    // the host reads the report, INT# goes HIGH and IS auto-clears.  The
+    // GPIO ISR masks IE before EOI, preventing re-delivery flood.
+    // gpio_reenable_ie() re-enables IE after the read completes.
+    dw0 &= ~GPIO_DW0_RXEVCFG_MASK;
+    dw0 |= GPIO_DW0_RXEVCFG_LEVEL;
+
+    // Always set RXINV for active-low (HID INT# is active-low).
+    // With RXEVCFG_LEVEL + RXINV, IS is set whenever the physical
+    // pin is LOW = INT# asserted = device has data.
+    dw0 |= GPIO_DW0_RXINV;
+
+    gpio_comm_write32(comm, pad_offset + GPIO_PAD_CFG_DW0, dw0);
+    kprintf("[GPIO] PAD_CFG_DW0 after:  0x%08x\n",
+            gpio_comm_read32(comm, pad_offset + GPIO_PAD_CFG_DW0));
+
+    // 3. Clear any pending interrupt status
+    uint16_t is_base = g_gpio_platform ? g_gpio_platform->gpi_is_offset : 0x100;
+    uint32_t is_reg = is_base + gpi_group * 4;
+    gpio_comm_write32(comm, is_reg, (1u << gpi_bit));
+
+    // 4. Enable interrupt in GPI_IE
+    uint16_t ie_base = g_gpio_platform ? g_gpio_platform->gpi_ie_offset : 0x120;
+    uint32_t ie_reg = ie_base + gpi_group * 4;
+    uint32_t ie = gpio_comm_read32(comm, ie_reg);
+    ie |= (1u << gpi_bit);
+    gpio_comm_write32(comm, ie_reg, ie);
+    kprintf("[GPIO] GPI_IE[%u] = 0x%08x (set bit %u)\n",
+            gpi_group, gpio_comm_read32(comm, ie_reg), gpi_bit);
+
+    return 0;
+}
+
+// Set up GPIO interrupt for an I2C HID device.
+// Called after parsing the device's ACPI _CRS GpioInt resource.
+// Returns 0 on success, -1 on failure.
+static int gpio_setup_hid_interrupt(i2c_hid_device_t *dev,
+                                    const acpi_crs_result_t *crs)
+{
+    if (!crs->gpio_int.valid) return -1;
+
+    uint16_t pin = crs->gpio_int.pin;
+    const char *gpio_path = crs->gpio_int.resource_source;
+
+    kprintf("[GPIO] Setting up interrupt: pin=%u trigger=%s polarity=%s "
+            "source=%s\n",
+            pin,
+            crs->gpio_int.triggering ? "edge" : "level",
+            crs->gpio_int.polarity == 0 ? "high" :
+            crs->gpio_int.polarity == 1 ? "low" : "both",
+            gpio_path);
+
+    // Step 1: Discover GPIO communities from the controller's ACPI _CRS
+    if (g_gpio_community_count == 0 && gpio_path[0]) {
+        gpio_discover_communities(gpio_path);
+    }
+
+    if (g_gpio_community_count == 0) {
+        // Fallback: try P2SB SBREG_BAR + known PortIDs
+        kprintf("[GPIO] No communities from ACPI, trying P2SB...\n");
+        g_sbreg_bar = p2sb_get_sbreg_bar();
+        if (g_sbreg_bar) {
+            kprintf("[GPIO] P2SB SBREG_BAR = 0x%llx\n",
+                    (unsigned long long)g_sbreg_bar);
+            // Try known GPIO PortIDs for Intel PCH 600/700
+            // PortIDs: 0xD1-0xD6 are typical for GPIO communities
+            static const uint8_t port_ids[] = {
+                0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6
+            };
+            for (int i = 0; i < 6 && g_gpio_community_count < GPIO_MAX_COMMUNITIES; i++) {
+                uint64_t phys = g_sbreg_bar + ((uint64_t)port_ids[i] << 16);
+                uint64_t va = mm_map_device_mmio(phys, 1);
+                if (!va) continue;
+
+                gpio_community_t *comm = &g_gpio_communities[g_gpio_community_count];
+                i2c_memset(comm, 0, sizeof(*comm));
+                comm->base = (volatile uint32_t *)va;
+                comm->phys = phys;
+
+                uint32_t misccfg = gpio_comm_read32(comm, GPIO_MISCCFG);
+                uint32_t padbar = gpio_comm_read32(comm, GPIO_PADBAR) & 0xFFFF;
+
+                // Validate: PADBAR should be a reasonable value (0x400-0xC00)
+                if (padbar < 0x400 || padbar > 0xC00) continue;
+
+                comm->irq_line = (misccfg & GPIO_MISCCFG_GPDMINTSEL_MASK)
+                                 >> GPIO_MISCCFG_GPDMINTSEL_SHIFT;
+
+                kprintf("[GPIO] P2SB PortID 0x%02x: MISCCFG=0x%08x "
+                        "GPDMINTSEL=%u PADBAR=0x%x\n",
+                        port_ids[i], misccfg, comm->irq_line, padbar);
+
+                g_gpio_community_count++;
+            }
+        }
+    }
+
+    if (g_gpio_community_count == 0) {
+        kprintf("[GPIO] No GPIO communities found\n");
+        return -1;
+    }
+
+    // Step 2: Find which community contains our pin
+    uint32_t pad_offset = 0;
+    uint8_t gpi_group = 0, gpi_bit = 0;
+    int ci = gpio_find_pin_community(pin, &pad_offset, &gpi_group, &gpi_bit);
+    if (ci < 0) return -1;
+
+    gpio_community_t *comm = &g_gpio_communities[ci];
+
+    // Step 3: Configure the pad for interrupt delivery
+    gpio_configure_pad_interrupt(comm, pad_offset, gpi_group, gpi_bit,
+                                 crs->gpio_int.triggering,
+                                 crs->gpio_int.polarity);
+
+    // Step 4: Route IOAPIC GSI → IDT vector
+    uint8_t gsi = comm->irq_line;
+    uint8_t vector = GPIO_IRQ_VECTOR_BASE;  // All GPIO communities share one vector
+
+    // Use the GPIO controller's _CRS IRQ polarity and trigger for the IOAPIC.
+    // This describes the GPIO community's interrupt output to the IOAPIC,
+    // NOT the individual pad's polarity.  Typically active-low, level-triggered.
+    uint8_t ioapic_polarity = g_gpio_ioapic_polarity ?
+                              IOAPIC_POLARITY_LOW : IOAPIC_POLARITY_HIGH;
+    uint8_t ioapic_trigger  = g_gpio_ioapic_trigger ?
+                              IOAPIC_TRIGGER_EDGE : IOAPIC_TRIGGER_LEVEL;
+
+    kprintf("[GPIO] Routing IOAPIC GSI %u -> vector %u\n", gsi, vector);
+    if (ioapic_configure_legacy_irq(gsi, vector, ioapic_polarity,
+                                    ioapic_trigger) != 0) {
+        kprintf("[GPIO] IOAPIC routing failed for GSI %u\n", gsi);
+        return -1;
+    }
+
+    // Step 5: Store GPIO state in the HID device
+    dev->gpio_pin = pin;
+    dev->gpio_community = (uint8_t)ci;
+    dev->gpio_gpi_group = gpi_group;
+    dev->gpio_gpi_bit = gpi_bit;
+    dev->gpio_irq_vector = vector;
+    dev->gpio_irq_active = 1;
+    dev->gpio_irq_pending = 0;
+    dev->gpio_pad_offset = pad_offset;
+    // Save the expected PAD_CFG_DW0 (critical bits) for runtime verification.
+    // If BIOS/SMI changes these, we can detect and repair.
+    dev->gpio_pad_dw0 = gpio_comm_read32(comm, pad_offset + GPIO_PAD_CFG_DW0);
+
+    // Step 6: Clear any pending GPI_IS from init
+    {
+        uint16_t is_base = g_gpio_platform ? g_gpio_platform->gpi_is_offset : 0x100;
+        uint32_t is_reg = is_base + gpi_group * 4;
+        gpio_comm_write32(comm, is_reg, (1u << gpi_bit));
+    }
+
+    kprintf("[GPIO] Interrupt configured: pin=%u community=%d "
+            "GSI=%u vector=%u\n", pin, ci, gsi, vector);
+    return 0;
+}
+
+// GPIO ISR: called when any GPIO community fires its IOAPIC interrupt.
+// Scans all communities for pending GPI_IS bits, clears them, and reads
+// HID reports from the associated I2C device.
+void i2c_hid_gpio_irq_handler(uint8_t vector)
+{
+    (void)vector;
+
+    for (int ci = 0; ci < g_gpio_community_count; ci++) {
+        gpio_community_t *comm = &g_gpio_communities[ci];
+        if (!comm->base) continue;
+
+        uint16_t is_base = g_gpio_platform ? g_gpio_platform->gpi_is_offset : 0x100;
+        uint16_t ie_base = g_gpio_platform ? g_gpio_platform->gpi_ie_offset : 0x120;
+
+        // Check GPI_IS for each group in this community
+        for (int grp = 0; grp < comm->num_groups; grp++) {
+            uint8_t reg_idx = comm->groups[grp].gpi_reg_index;
+            uint32_t is_reg = is_base + reg_idx * 4;
+            uint32_t ie_reg = ie_base + reg_idx * 4;
+
+            // Safety: don't read past mapped region (64KB per community)
+            if (is_reg + 4 > 0x10000 || ie_reg + 4 > 0x10000) break;
+
+            uint32_t status = gpio_comm_read32(comm, is_reg);
+            uint32_t enabled = gpio_comm_read32(comm, ie_reg);
+            uint32_t pending = status & enabled;
+
+            if (!pending) continue;
+
+            // Mask the pending bits in GPI_IE to stop level-triggered
+            // re-assertion.  The poll function will unmask after reading
+            // the device report.
+            gpio_comm_write32(comm, ie_reg, enabled & ~pending);
+
+            // Clear the status bits (write-1-to-clear)
+            gpio_comm_write32(comm, is_reg, pending);
+
+            // Flush posted MMIO writes by reading back.  Without this,
+            // the IOAPIC sees the level-triggered interrupt still asserted
+            // after EOI and immediately re-delivers — causing an ISR storm
+            // (hundreds of duplicate fires per real touchpad event).
+            (void)gpio_comm_read32(comm, ie_reg);
+
+            // Find HID devices bound to GPIO pins in this community/group
+            for (int d = 0; d < g_i2c_hid_device_count; d++) {
+                i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+                if (!dev->active || !dev->gpio_irq_active)
+                    continue;
+                if (dev->gpio_community != (uint8_t)ci)
+                    continue;
+                if (dev->gpio_gpi_group != (uint8_t)reg_idx)
+                    continue;
+                if (!(pending & (1u << dev->gpio_gpi_bit)))
+                    continue;
+
+                // Signal that an interrupt is pending
+                __sync_lock_test_and_set(&dev->gpio_irq_pending, 1);
+                __sync_fetch_and_add(&g_isr_fire_count, 1);
+            }
+        }
+    }
+
+    lapic_eoi();
 }
 
 // ============================================================================
@@ -1938,7 +3369,7 @@ int i2c_hid_init(void) {
             static const char *const hid_ids[] = { "PNP0C50", "ACPI0C50" };
             size_t ctrl_path_len = kstrlen(ctrl->acpi_path);
 
-            for (int hi = 0; hi < 2; hi++) {
+            for (int hi = 0; hi < 2 && !found_via_acpi; hi++) {
                 acpi_aml_device_info_t devs[4];
                 int ndev = acpi_aml_find_devices_by_hid(hid_ids[hi], devs, 4);
                 for (int di = 0; di < ndev; di++) {
@@ -1960,9 +3391,86 @@ int i2c_hid_init(void) {
                                 kprintf("[I2C%d] _CRS: slave 0x%02x speed=%u\n",
                                         ctrl->bus_id, addr,
                                         crs.i2c_devices[ci].connection_speed);
+                                int dev_idx = g_i2c_hid_device_count;
                                 i2c_hid_probe_device(ctrl, addr);
+                                if (dev_idx < g_i2c_hid_device_count) {
+                                    // Store ACPI path for power management
+                                    int plen = 0;
+                                    while (devs[di].path[plen] && plen < 63) plen++;
+                                    i2c_memcpy(g_i2c_hid_devices[dev_idx].acpi_path,
+                                               devs[di].path, plen);
+                                    g_i2c_hid_devices[dev_idx].acpi_path[plen] = '\0';
+                                }
+                                // Log and save GpioInt info for later interrupt setup
+                                if (crs.gpio_int.valid &&
+                                    dev_idx < g_i2c_hid_device_count) {
+                                    kprintf("[I2C%d] _CRS GpioInt: pin=%u "
+                                            "trigger=%s pol=%s src=%s\n",
+                                            ctrl->bus_id,
+                                            crs.gpio_int.pin,
+                                            crs.gpio_int.triggering ? "edge" : "level",
+                                            crs.gpio_int.polarity == 0 ? "high" :
+                                            crs.gpio_int.polarity == 1 ? "low" : "both",
+                                            crs.gpio_int.resource_source);
+                                    g_i2c_hid_devices[dev_idx].gpio_pin =
+                                        crs.gpio_int.pin;
+                                }
                                 found_via_acpi++;
                             }
+                        }
+                    }
+                }
+            }
+
+            // Fallback: walk direct children of controller ACPI node.
+            // Some devices (e.g. ITE VEN_0488) use vendor _HID with _CID=PNP0C50
+            // but AcpiGetDevices() may not match _CID on all ACPICA builds.
+            if (!found_via_acpi) {
+                acpi_aml_device_info_t children[4];
+                int nch = acpi_aml_find_children(ctrl->acpi_path, children, 4);
+                for (int di = 0; di < nch; di++) {
+                    // Only consider children that have _CRS
+                    if (!children[di].has_crs) continue;
+
+                    acpi_crs_result_t crs;
+                    if (acpi_aml_eval_crs(children[di].path, &crs) != 0)
+                        continue;
+                    if (crs.i2c_device_count == 0) continue;
+
+                    kprintf("[I2C%d] ACPI child: %s (HID=%s CID=%s)\n",
+                            ctrl->bus_id, children[di].path,
+                            children[di].hid, children[di].cid);
+
+                    for (uint8_t ci = 0; ci < crs.i2c_device_count; ci++) {
+                        uint16_t addr = crs.i2c_devices[ci].slave_addr;
+                        if (addr >= 0x08 && addr <= 0x77) {
+                            kprintf("[I2C%d] _CRS: slave 0x%02x speed=%u\n",
+                                    ctrl->bus_id, addr,
+                                    crs.i2c_devices[ci].connection_speed);
+                            int dev_idx = g_i2c_hid_device_count;
+                            i2c_hid_probe_device(ctrl, addr);
+                            if (dev_idx < g_i2c_hid_device_count) {
+                                // Store ACPI path for power management
+                                int plen = 0;
+                                while (children[di].path[plen] && plen < 63) plen++;
+                                i2c_memcpy(g_i2c_hid_devices[dev_idx].acpi_path,
+                                           children[di].path, plen);
+                                g_i2c_hid_devices[dev_idx].acpi_path[plen] = '\0';
+                            }
+                            if (crs.gpio_int.valid &&
+                                dev_idx < g_i2c_hid_device_count) {
+                                kprintf("[I2C%d] _CRS GpioInt: pin=%u "
+                                        "trigger=%s pol=%s src=%s\n",
+                                        ctrl->bus_id,
+                                        crs.gpio_int.pin,
+                                        crs.gpio_int.triggering ? "edge" : "level",
+                                        crs.gpio_int.polarity == 0 ? "high" :
+                                        crs.gpio_int.polarity == 1 ? "low" : "both",
+                                        crs.gpio_int.resource_source);
+                                g_i2c_hid_devices[dev_idx].gpio_pin =
+                                    crs.gpio_int.pin;
+                            }
+                            found_via_acpi++;
                         }
                     }
                 }
@@ -1982,7 +3490,82 @@ int i2c_hid_init(void) {
 
     // Initialize all discovered HID devices
     for (int d = 0; d < g_i2c_hid_device_count; d++) {
-        i2c_hid_init_device(&g_i2c_hid_devices[d]);
+        i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+
+        // ACPI power management: call _PS0 and resolve _DEP dependencies
+        // This is critical — without it, the device firmware may not fully
+        // initialize and will return empty input reports.
+        if (dev->acpi_path[0]) {
+            kprintf("[I2C-HID] ACPI power-on: %s\n", dev->acpi_path);
+
+            // Power on device and all _DEP dependencies (GPIO, I2C host, etc.)
+            int pw_rc = acpi_power_on_device_with_deps(dev->acpi_path);
+            kprintf("[I2C-HID] acpi_power_on_device_with_deps: rc=%d\n", pw_rc);
+
+            // Also try direct _PS0 on the device itself
+            uint64_t ps0_ret = 0;
+            int ps0_rc = acpi_aml_exec_device_method(dev->acpi_path, "_PS0",
+                                                      &ps0_ret);
+            kprintf("[I2C-HID] _PS0: rc=%d ret=%llu\n", ps0_rc,
+                    (unsigned long long)ps0_ret);
+
+            // Call _DSM function 1 (HID descriptor register address)
+            // Microsoft HID-over-I2C _DSM: 3cdff6f7-4267-4555-ad05-b30a3d8938de
+            // This may have firmware-level side effects that enable the device.
+            static const uint8_t hid_i2c_dsm_uuid[16] = {
+                0xf7, 0xf6, 0xdf, 0x3c, 0x67, 0x42, 0x55, 0x45,
+                0xad, 0x05, 0xb3, 0x0a, 0x3d, 0x89, 0x38, 0xde
+            };
+            aml_value_t dsm_result;
+            i2c_memset(&dsm_result, 0, sizeof(dsm_result));
+            int dsm_rc = acpi_aml_call_dsm(dev->acpi_path, hid_i2c_dsm_uuid,
+                                            1, 1, &dsm_result);
+            if (dsm_rc == 0) {
+                uint64_t dsm_val = aml_value_to_integer(&dsm_result);
+                kprintf("[I2C-HID] _DSM(1): rc=%d val=0x%llx\n", dsm_rc,
+                        (unsigned long long)dsm_val);
+            } else {
+                kprintf("[I2C-HID] _DSM(1): rc=%d (no _DSM)\n", dsm_rc);
+            }
+
+            i2c_delay_us(10000);  // 10ms settle after ACPI power-on
+        }
+
+        i2c_hid_init_device(dev);
+    }
+
+    // Set up GPIO interrupts for active HID devices that have GpioInt resources.
+    // This must happen AFTER device init (SET_POWER + RESET) so the device is
+    // ready to signal on the GPIO line.
+    for (int c = 0; c < g_i2c_controller_count; c++) {
+        i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
+        if (!ctrl->active || !ctrl->acpi_path[0]) continue;
+
+        // Walk direct children of the controller — works regardless of _HID
+        acpi_aml_device_info_t children[4];
+        int nch = acpi_aml_find_children(ctrl->acpi_path, children, 4);
+        for (int di = 0; di < nch; di++) {
+            if (!children[di].has_crs) continue;
+
+            acpi_crs_result_t crs;
+            i2c_memset(&crs, 0, sizeof(crs));
+            if (acpi_aml_eval_crs(children[di].path, &crs) != 0)
+                continue;
+            if (!crs.gpio_int.valid || crs.i2c_device_count == 0)
+                continue;
+
+            // Find the HID device matching this I2C address
+            for (uint8_t ci2 = 0; ci2 < crs.i2c_device_count; ci2++) {
+                uint16_t addr = crs.i2c_devices[ci2].slave_addr;
+                for (int d = 0; d < g_i2c_hid_device_count; d++) {
+                    i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+                    if (dev->ctrl == ctrl && dev->i2c_addr == addr &&
+                        dev->active) {
+                        gpio_setup_hid_interrupt(dev, &crs);
+                    }
+                }
+            }
+        }
     }
 
     if (g_i2c_hid_device_count > 0) {
@@ -1993,30 +3576,283 @@ int i2c_hid_init(void) {
     return g_i2c_controller_count;
 }
 
+// Re-enable GPI_IE for a device's pin with interrupt protection.
+//
+// The read-modify-write on the GPI_IE register must be done with local
+// interrupts disabled; otherwise the GPIO ISR can fire between the read
+// and write and mask the same IE register, only to have poll's write
+// immediately re-enable it — creating a spurious ISR cycle.
+//
+// After re-enabling IE we read GPI_IS.  If the device's bit is already
+// set (stale from a level-triggered re-assertion while IE was masked,
+// or a new edge that arrived while IE was off), we set gpio_irq_pending
+// so the next poll tick services it.  This is the safety net that
+// prevents "ISRs stop" when the IOAPIC doesn't re-deliver after the
+// signal was already high when IE was re-enabled.
+static void gpio_reenable_ie(i2c_hid_device_t *dev)
+{
+    gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
+    if (!comm->base) return;
+
+    uint16_t ie_base = g_gpio_platform ?
+                       g_gpio_platform->gpi_ie_offset : 0x120;
+    uint16_t is_base = g_gpio_platform ?
+                       g_gpio_platform->gpi_is_offset : 0x100;
+    uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
+    uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
+    uint32_t bit    = 1u << dev->gpio_gpi_bit;
+
+    uint64_t flags = local_irq_save();
+
+    // Atomic RMW: set our bit in GPI_IE
+    uint32_t ie = gpio_comm_read32(comm, ie_reg);
+    ie |= bit;
+    gpio_comm_write32(comm, ie_reg, ie);
+
+    // Safety net for LEVEL mode: after re-enabling IE, check GPI_IS.
+    // With LEVEL + RXINV, IS re-asserts immediately if pin is still LOW
+    // (device has data).  The ISR masked IE earlier, so this IS bit was
+    // latched while we were reading.  Set pending to service it on the
+    // next poll tick.  The ISR will mask IE again to prevent flood.
+    uint32_t is = gpio_comm_read32(comm, is_reg);
+    if (is & bit)
+        __sync_lock_test_and_set(&dev->gpio_irq_pending, 1);
+
+    local_irq_restore(flags);
+}
+
+// Verify GPIO pad configuration hasn't been corrupted by BIOS/SMI.
+// Checks HOSTSW_OWN, PAD_CFG_DW0 critical bits, and GPI_IE.
+// Returns 1 if a repair was made, 0 if everything was fine.
+static int gpio_verify_and_repair(i2c_hid_device_t *dev)
+{
+    gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
+    if (!comm->base) return 0;
+
+    uint32_t bit = 1u << dev->gpio_gpi_bit;
+    int repaired = 0;
+
+    // 1. Check HOSTSW_OWN — most likely to be reset by BIOS/SMI.
+    //    If cleared, GPI_IS stops tracking this pad's interrupt status
+    //    and all GPIO-driver-mode interrupts for it silently die.
+    uint16_t hostsw_base = g_gpio_platform ?
+                           g_gpio_platform->hostsw_own_offset : 0x0b0;
+    uint32_t hostsw_reg = hostsw_base + dev->gpio_gpi_group * 4;
+    uint32_t hostsw = gpio_comm_read32(comm, hostsw_reg);
+    if (!(hostsw & bit)) {
+        hostsw |= bit;
+        gpio_comm_write32(comm, hostsw_reg, hostsw);
+        repaired = 1;
+    }
+
+    // 2. Check PAD_CFG_DW0 critical bits (RXEVCFG, PMODE, GPIORXDIS, RXINV).
+    //    Mask out volatile/read-only bits (GPIORXSTATE, GPIOTXSTATE) and
+    //    bits that the ISR legitimately changes (none — ISR only touches
+    //    GPI_IE/GPI_IS, not PAD_CFG).
+    #define PAD_CFG_CRITICAL_MASK \
+        (GPIO_DW0_RXEVCFG_MASK | GPIO_DW0_PMODE_MASK | \
+         GPIO_DW0_GPIORXDIS | GPIO_DW0_RXINV)
+
+    uint32_t dw0 = gpio_comm_read32(comm,
+                        dev->gpio_pad_offset + GPIO_PAD_CFG_DW0);
+    if ((dw0 & PAD_CFG_CRITICAL_MASK) !=
+        (dev->gpio_pad_dw0 & PAD_CFG_CRITICAL_MASK)) {
+        // Restore the expected value (preserve non-critical bits)
+        dw0 = (dw0 & ~PAD_CFG_CRITICAL_MASK) |
+              (dev->gpio_pad_dw0 & PAD_CFG_CRITICAL_MASK);
+        gpio_comm_write32(comm,
+                          dev->gpio_pad_offset + GPIO_PAD_CFG_DW0, dw0);
+        repaired = 1;
+    }
+
+    #undef PAD_CFG_CRITICAL_MASK
+
+    // 3. Check GPI_IE — if our bit is not set, re-enable it.
+    uint16_t ie_base = g_gpio_platform ?
+                       g_gpio_platform->gpi_ie_offset : 0x120;
+    uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
+    uint32_t ie = gpio_comm_read32(comm, ie_reg);
+    if (!(ie & bit)) {
+        ie |= bit;
+        gpio_comm_write32(comm, ie_reg, ie);
+        repaired = 1;
+    }
+
+    if (repaired) {
+        // After repair, clear any stale IS and let the device
+        // re-trigger cleanly.
+        uint16_t is_base = g_gpio_platform ?
+                           g_gpio_platform->gpi_is_offset : 0x100;
+        uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
+        gpio_comm_write32(comm, is_reg, bit);
+    }
+
+    return repaired;
+}
+
 void i2c_hid_poll(void) {
     if (g_i2c_hid_device_count == 0) return;
 
     g_poll_counter++;
     if ((g_poll_counter % I2C_HID_POLL_DIVISOR) != 0) return;
 
-    static int debug_cnt = 0;
+    static uint64_t heartbeat_next = 200;
+    // Track last ISR-serviced tick per device for fallback logic
+    static uint64_t last_isr_tick[I2C_HID_MAX_DEVICES];
 
     for (int d = 0; d < g_i2c_hid_device_count; d++) {
         i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
         if (!dev->active) continue;
 
-        // Read up to 8 reports per poll cycle (drain pending data)
-        for (int rep = 0; rep < 8; rep++) {
-            int rc = i2c_hid_read_input(dev);
-            if (debug_cnt < 5) {
-                kprintf("[I2C-POLL] dev%d rc=%d len=%u%u\n",
-                        d, rc,
-                        (unsigned)dev->input_buf[0],
-                        (unsigned)dev->input_buf[1]);
-                debug_cnt++;
+        // ============================================================
+        // Three-level interrupt check (ISR → hardware IS → polled I2C)
+        // ============================================================
+        if (dev->gpio_irq_active) {
+            int should_read = 0;
+
+            // Level 1: ISR-driven pending flag (normal fast path)
+            uint8_t was_pending = __sync_lock_test_and_set(
+                &dev->gpio_irq_pending, 0);
+            if (was_pending) {
+                // Only refresh idle timer when the device is healthy.
+                // During error recovery (error_count > 0), keep the
+                // idle timer growing so Level 3 keeps running for
+                // pad repair and device recovery.
+                if (dev->error_count == 0)
+                    last_isr_tick[d] = g_poll_counter;
+                should_read = 1;
             }
-            if (rc <= 0)
-                break;
+
+            if (!should_read) {
+                // Level 2: Direct GPI_IS check (catches IOAPIC stuck /
+                // Remote IRR stuck / missed edge).  Cost: 1 MMIO read
+                // (~100ns) — negligible at 100Hz.
+                gpio_community_t *comm =
+                    &g_gpio_communities[dev->gpio_community];
+                if (comm->base) {
+                    uint16_t is_base = g_gpio_platform ?
+                        g_gpio_platform->gpi_is_offset : 0x100;
+                    uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
+                    uint32_t bit = 1u << dev->gpio_gpi_bit;
+                    uint32_t is_val = gpio_comm_read32(comm, is_reg);
+                    if (is_val & bit) {
+                        // Device has data but ISR didn't fire.
+                        // Mimic what the ISR does: mask IE, clear IS.
+                        uint16_t ie_base = g_gpio_platform ?
+                            g_gpio_platform->gpi_ie_offset : 0x120;
+                        uint32_t ie_reg =
+                            ie_base + dev->gpio_gpi_group * 4;
+                        uint64_t flags = local_irq_save();
+                        uint32_t ie = gpio_comm_read32(comm, ie_reg);
+                        gpio_comm_write32(comm, ie_reg, ie & ~bit);
+                        gpio_comm_write32(comm, is_reg, bit);
+                        (void)gpio_comm_read32(comm, ie_reg);
+                        local_irq_restore(flags);
+                        should_read = 1;
+                    }
+                }
+            }
+
+            if (!should_read) {
+                // Level 3: Periodic pad-config verification + polled
+                // I2C read.  Catches HOSTSW_OWN cleared by BIOS/SMI,
+                // PAD_CFG corruption, or device sleep.
+                // Cost: 3-4 MMIO reads + possibly 1 I2C transfer
+                // (~600μs).  Run every 5 ticks (~50ms) when the ISR
+                // hasn't fired recently (>10 ticks = 100ms).
+                uint64_t idle_ticks = g_poll_counter - last_isr_tick[d];
+                if (idle_ticks >= 10 &&
+                    (g_poll_counter % 5) == 0) {
+                    if (gpio_verify_and_repair(dev)) {
+                        kprintf("[I2C-HID] GPIO pad repaired "
+                                "(idle %llu ticks)\n",
+                                (unsigned long long)idle_ticks);
+                    }
+                }
+                // If idle >5s with errors, the device firmware may
+                // have crashed after an I2C abort storm.  Attempt a
+                // single read to probe whether it's alive again.
+                // No SET_POWER, no SET_REPORT — just a normal read.
+                // Rate-limited to once per 500 ticks (~5 seconds).
+                if (idle_ticks >= 500 && dev->error_count > 0 &&
+                    (g_poll_counter % 500) == 0) {
+                    should_read = 1;
+                }
+            }
+
+            if (!should_read)
+                continue;
+        }
+
+        // Before doing the I2C transfer, check if the device is still
+        // asserting INT#.  With LEVEL mode, the GPIO ISR fires while
+        // INT# is LOW, but by the time poll runs, the device may have
+        // already deasserted.  Reading with no data pending causes the
+        // controller to timeout (abort_src=0x0, status=0x6).
+        if (dev->gpio_irq_active) {
+            gpio_community_t *comm =
+                &g_gpio_communities[dev->gpio_community];
+            if (comm->base) {
+                uint32_t dw0 = gpio_comm_read32(comm,
+                    dev->gpio_pad_offset + GPIO_PAD_CFG_DW0);
+                if (dw0 & GPIO_DW0_GPIORXSTATE) {
+                    // Pin is HIGH = INT# deasserted = no data.
+                    // Skip the I2C read entirely.
+                    if (dev->gpio_irq_active)
+                        gpio_reenable_ie(dev);
+                    continue;
+                }
+            }
+        }
+
+        // Read ONE report per interrupt.  The device asserts INT# for
+        // each report; trying to read multiple causes a bus error on the
+        // extra read (NACK) when the device has nothing more to send.
+        int rc = i2c_hid_read_input(dev);
+        if (rc < 0) {
+            dev->error_count++;
+        } else {
+            dev->error_count = 0;
+        }
+
+        // ALWAYS re-enable IE after every read attempt.  The ISR
+        // masks IE atomically before EOI, so at most one ISR fires
+        // per re-enable — no storm possible.  This is how Linux
+        // handles level-triggered GPIO: unmask after every handler
+        // invocation, let the hardware re-assert if needed.
+        if (dev->gpio_irq_active)
+            gpio_reenable_ie(dev);
+    }
+
+    // Periodic heartbeat: print diagnostic status every ~2 seconds
+    if (g_poll_counter >= heartbeat_next) {
+        heartbeat_next = g_poll_counter + 200;
+        for (int d = 0; d < g_i2c_hid_device_count; d++) {
+            i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+            if (!dev->active || !dev->gpio_irq_active) continue;
+            gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
+            if (!comm->base) continue;
+            uint16_t is_base = g_gpio_platform
+                ? g_gpio_platform->gpi_is_offset : 0x100;
+            uint16_t ie_base = g_gpio_platform
+                ? g_gpio_platform->gpi_ie_offset : 0x120;
+            uint16_t hostsw_base = g_gpio_platform
+                ? g_gpio_platform->hostsw_own_offset : 0x0b0;
+            uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
+            uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
+            uint32_t hsw_reg = hostsw_base + dev->gpio_gpi_group * 4;
+            uint32_t is_val = gpio_comm_read32(comm, is_reg);
+            uint32_t ie_val = gpio_comm_read32(comm, ie_reg);
+            uint32_t hsw_val = gpio_comm_read32(comm, hsw_reg);
+            uint32_t dw0 = gpio_comm_read32(comm,
+                dev->gpio_pad_offset + GPIO_PAD_CFG_DW0);
+
+            kprintf("[I2C-HID] HB poll=%llu isr=%u err=%u pend=%u "
+                    "IE=0x%x IS=0x%x HSW=0x%x DW0=0x%x bit=%u\n",
+                    (unsigned long long)g_poll_counter,
+                    g_isr_fire_count, dev->error_count,
+                    dev->gpio_irq_pending,
+                    ie_val, is_val, hsw_val, dw0, dev->gpio_gpi_bit);
         }
     }
 }

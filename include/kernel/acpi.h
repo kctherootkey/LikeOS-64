@@ -319,10 +319,18 @@ typedef struct {
 
 #define ACPI_CRS_MAX_I2C_DEVICES  8
 #define ACPI_CRS_MAX_IRQS         4
+#define ACPI_CRS_MAX_MMIO_RANGES  8
+#define ACPI_CRS_GPIO_SOURCE_LEN  64
 
 typedef struct {
     uint64_t mmio_base;
     uint32_t mmio_len;
+    // All MMIO ranges from _CRS (for multi-community GPIO controllers etc.)
+    struct {
+        uint64_t base;
+        uint32_t length;
+    } mmio_ranges[ACPI_CRS_MAX_MMIO_RANGES];
+    uint8_t  mmio_range_count;
     uint32_t irqs[ACPI_CRS_MAX_IRQS];
     uint8_t  irq_count;
     uint8_t  irq_triggering;    // 0=level, 1=edge
@@ -334,6 +342,15 @@ typedef struct {
         uint8_t  addr_mode;     // 0=7-bit, 1=10-bit
     } i2c_devices[ACPI_CRS_MAX_I2C_DEVICES];
     uint8_t  i2c_device_count;
+    // GPIO interrupt resource (from GpioInt in ACPI _CRS)
+    struct {
+        uint16_t pin;           // GPIO pad number within community
+        uint8_t  triggering;    // 0=level, 1=edge
+        uint8_t  polarity;      // 0=active-high, 1=active-low, 2=active-both
+        uint8_t  sharing;       // 0=exclusive, 1=shared
+        uint8_t  valid;         // 1 if GpioInt resource was found
+        char     resource_source[ACPI_CRS_GPIO_SOURCE_LEN]; // GPIO controller path
+    } gpio_int;
 } acpi_crs_result_t;
 
 // ============================================================================
@@ -474,6 +491,12 @@ int acpi_get_table_aml(const char* signature, uint32_t index,
 int acpi_aml_find_devices_by_hid(const char* hid,
                                  acpi_aml_device_info_t* out,
                                  int max_out);
+
+// Walk direct children (depth = 1) of the given ACPI path.
+// Returns the number of child devices found (up to max_out).
+int acpi_aml_find_children(const char* parent_path,
+                           acpi_aml_device_info_t* out,
+                           int max_out);
 
 // Resolve a device by _HID, locate the nearest firmware _PS0 method on the
 // device or an ancestor scope, and execute a minimal AML subset if possible.
