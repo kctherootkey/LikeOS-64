@@ -5,6 +5,7 @@
 
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/serial.h"
+#include "../../include/kernel/usb_serial.h"
 #include "../../include/kernel/fb_optimize.h"
 #include "../../include/kernel/mouse.h"
 #include "../../include/kernel/scrollbar.h"
@@ -1798,30 +1799,35 @@ static int kvprintf_to_buffer(const char* format, va_list args, string_buffer_t*
 // Main printf function
 int kprintf(const char* format, ...) {
     uint64_t flags;
+    char klog_tmp[1024];
+    int klog_len = 0;
+    int result;
+
     spin_lock_irqsave(&console_lock, &flags);
     
     va_list args;
     va_start(args, format);
-    int result = kvprintf(format, args);
+    result = kvprintf(format, args);
     va_end(args);
     
     // Flush all dirty regions once after entire formatted string is written
     fb_flush_dirty_regions();
-    
-    // Also capture output to kernel log ring buffer
-    // Re-format into a temp buffer for the klog
+
+    spin_unlock_irqrestore(&console_lock, flags);
+
     if (result > 0) {
-        char klog_tmp[1024];
         va_list args2;
         va_start(args2, format);
         string_buffer_t sb2 = {klog_tmp, sizeof(klog_tmp), 0};
         kvprintf_to_buffer(format, args2, &sb2);
-        klog_tmp[sb2.pos] = '\\0';
+        klog_tmp[sb2.pos] = '\0';
         va_end(args2);
-        klog_append(klog_tmp, (int)sb2.pos);
+
+        klog_len = (int)sb2.pos;
+        klog_append(klog_tmp, klog_len);
+        usbserial_log_write(klog_tmp, (uint32_t)klog_len);
     }
-    
-    spin_unlock_irqrestore(&console_lock, flags);
+
     return result;
 }
 

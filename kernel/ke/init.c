@@ -23,6 +23,7 @@
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/usbhid.h"
+#include "../../include/kernel/usb_serial.h"
 #include "../../include/kernel/i2c_hid.h"
 
 void system_startup(boot_info_t* boot_info);
@@ -134,6 +135,7 @@ void continue_system_startup(void) {
 
     xhci_boot_init(&g_xhci_boot);
     usbhid_init();
+    usbserial_init();
     int i2c_nctrl = i2c_hid_init();
     kprintf("[INIT] I2C init done (rc=%d)\n", i2c_nctrl);
 
@@ -195,7 +197,7 @@ void continue_system_startup(void) {
         xhci_hotplug_poll(&g_xhci);
         xhci_hotplug_poll(&g_xhci_hid);
         usbhid_poll();
-        i2c_hid_poll();
+        //i2c_hid_poll();
         storage_fs_poll(&g_storage_state);
         console_cursor_update();  // Update blinking cursor
         sched_run_ready();

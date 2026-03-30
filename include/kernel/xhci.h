@@ -311,6 +311,7 @@ typedef struct usb_device {
     uint8_t err_count_out;     // Error count for bulk OUT endpoint
     
     // Transfer rings for bulk endpoints
+    xhci_ring_t* ep0_ring;
     xhci_ring_t* bulk_in_ring;
     xhci_ring_t* bulk_out_ring;
     

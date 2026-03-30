@@ -33,6 +33,14 @@ else
   QEMU_SERIAL =
 endif
 
+# USB serial logging: pass USB_SERIAL=1 on the command line to enable
+# USB CDC ACM serial detection and log mirroring on real USB boots.
+ifeq ($(USB_SERIAL),1)
+	USB_SERIAL_CFLAGS = -DUSB_SERIAL_ENABLED
+else
+	USB_SERIAL_CFLAGS =
+endif
+
 # USB HID: pass USB_HID=1 on the command line to add USB keyboard and mouse
 # to QEMU targets (qemu-usb, qemu-usb-gdb).  Enables -device usb-kbd and
 # -device usb-mouse on the xHCI controller.  Default is off.
@@ -66,7 +74,7 @@ KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-I$(INCLUDE_DIR) -I$(KERNEL_DIR)/hal/acpica/include \
 			-D__LIKEOS__ -DACPI_USE_BUILTIN_STDARG \
 			-U__linux__ -U_LINUX -Ulinux \
-			-DXHCI_USE_INTERRUPTS=1 $(SERIAL_CFLAGS) \
+			-DXHCI_USE_INTERRUPTS=1 $(SERIAL_CFLAGS) $(USB_SERIAL_CFLAGS) \
 			-DBUILD_DATE='"$(BUILD_DATE)"'
 
 # Extra flags for ACPICA sources (suppress upstream warnings)
@@ -129,6 +137,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/dcache.o \
 			  $(BUILD_DIR)/icache.o \
 			  $(BUILD_DIR)/usb.o \
+			  $(BUILD_DIR)/usb_serial.o \
 			  $(BUILD_DIR)/usb_msd.o \
 			  $(BUILD_DIR)/usbhid.o \
 			  $(BUILD_DIR)/ps2.o \
@@ -253,6 +262,9 @@ $(BUILD_DIR)/icache.o: $(KERNEL_DIR)/fs/icache.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/usb.o: $(KERNEL_DIR)/hal/usb.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/usb_serial.o: $(KERNEL_DIR)/hal/usb_serial.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/usb_msd.o: $(KERNEL_DIR)/hal/usb_msd.c | $(BUILD_DIR)
@@ -1011,7 +1023,7 @@ qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)
 	set +x || true
 
 # Write ISO to USB device with GPT partition table (like Rufus)
-# Usage: make usb-write USB_DEVICE=/dev/sdX
+# Usage: make usb-write USB_DEVICE=/dev/sdX [USB_SERIAL=1]
 usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/nano $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libtestlib.so
 	@if [ -z "$(USB_DEVICE)" ]; then \
 		echo "Error: USB_DEVICE not specified. Usage: make usb-write USB_DEVICE=/dev/sdX"; \
@@ -1212,7 +1224,7 @@ help:
 	@echo "  qemu-realusb - Run QEMU with real USB device as xHCI storage (requires USB_DEVICE=/dev/sdX)"
 	@echo "  qemu-realusb-gdb - Same as qemu-realusb but with GDB server on :1234 (requires USB_DEVICE=/dev/sdX)"
 	@echo "  qemu-usb-passthrough - Run QEMU with host USB device passthrough (experimental)"
-	@echo "  usb-write  - Write to USB device with GPT (requires USB_DEVICE=/dev/sdX)"
+	@echo "  usb-write  - Write to USB device with GPT (requires USB_DEVICE=/dev/sdX, optional USB_SERIAL=1)"
 	@echo "  linux-usb  - Build Debian-based host USB image that auto-launches LikeOS via QEMU/KVM"
 	@echo "  linux-usb-write - Write the host Linux image to USB (requires USB_DEVICE=/dev/sdX)"
 	@echo "  clean      - Clean build files"
@@ -1228,7 +1240,7 @@ help:
 	@echo "  PS/2: Optional; modern hardware may lack controller (fallback to USB HID planned)."
 	@echo "  IOAPIC: Minimal; ACPI parsing not yet implemented (polarity for IRQ1 forced low)."
 	@echo ""
-	@echo "Example USB write: make usb-write USB_DEVICE=/dev/sdb"
+	@echo "Example USB write: make usb-write USB_DEVICE=/dev/sdb USB_SERIAL=1"
 
 # Individual targets
 kernel: $(KERNEL_ELF)
