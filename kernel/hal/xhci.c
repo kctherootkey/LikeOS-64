@@ -9,6 +9,7 @@
 
 #include "../../include/kernel/xhci.h"
 #include "../../include/kernel/usb.h"
+#include "../../include/kernel/usb_serial.h"
 #include "../../include/kernel/usbhid.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
@@ -1634,6 +1635,7 @@ int xhci_disable_slot(xhci_controller_t* ctrl, uint8_t slot) {
     ctrl->dcbaa[slot] = 0;
 
     // Free transfer rings
+    if (dev->ep0_ring)      { xhci_free_ring(dev->ep0_ring);      dev->ep0_ring = NULL; }
     if (dev->bulk_in_ring)  { xhci_free_ring(dev->bulk_in_ring);  dev->bulk_in_ring = NULL; }
     if (dev->bulk_out_ring) { xhci_free_ring(dev->bulk_out_ring); dev->bulk_out_ring = NULL; }
 
@@ -1713,6 +1715,7 @@ void xhci_hotplug_poll(xhci_controller_t* ctrl) {
 
                     // Notify HID driver first so it stops using the device
                     usbhid_disconnect(dev);
+                    usbserial_disconnect(dev);
 
                     // Disable the slot and free resources
                     uint8_t slot = dev->slot_id;
@@ -1879,15 +1882,15 @@ int xhci_address_device(xhci_controller_t* ctrl, uint8_t slot, uint8_t port, uin
     udev->port = port;
     udev->speed = speed;
     udev->controller = ctrl;
-    udev->bulk_in_ring = xhci_alloc_ring();
+    udev->ep0_ring = xhci_alloc_ring();
     
-    if (!udev->bulk_in_ring) {
+    if (!udev->ep0_ring) {
         kprintf("[XHCI] Failed to allocate EP0 ring\n");
         return ST_NOMEM;
     }
     
-    uint64_t ep0_ring_phys = mm_get_physical_address((uint64_t)udev->bulk_in_ring->trbs);
-    xhci_ring_init(udev->bulk_in_ring, ep0_ring_phys);
+    uint64_t ep0_ring_phys = mm_get_physical_address((uint64_t)udev->ep0_ring->trbs);
+    xhci_ring_init(udev->ep0_ring, ep0_ring_phys);
     
     // Determine max packet size for EP0 based on speed
     uint16_t max_pkt_ep0;
@@ -1929,7 +1932,7 @@ int xhci_address_device(xhci_controller_t* ctrl, uint8_t slot, uint8_t port, uin
     // Flush all DMA structures before sending command
     xhci_flush_cache(ctrl->input_ctx_raw, input_ctx_size);
     xhci_flush_cache(dev_ctx_raw, dev_ctx_size);
-    xhci_flush_cache(udev->bulk_in_ring->trbs, sizeof(udev->bulk_in_ring->trbs));
+    xhci_flush_cache(udev->ep0_ring->trbs, sizeof(udev->ep0_ring->trbs));
     xhci_flush_cache(&ctrl->dcbaa[slot], sizeof(uint64_t));
     xhci_mb();
     
@@ -1969,6 +1972,8 @@ int xhci_address_device(xhci_controller_t* ctrl, uint8_t slot, uint8_t port, uin
     
     return ST_OK;
 }
+
+static int xhci_evaluate_context(xhci_controller_t* ctrl, uint8_t slot, uint16_t max_pkt_ep0);
 
 int xhci_enumerate_device(xhci_controller_t* ctrl, uint8_t port) {
     // Reset port
@@ -2027,6 +2032,15 @@ int xhci_enumerate_device(xhci_controller_t* ctrl, uint8_t port) {
         xhci_dbg("MaxPacketEP0: %d (raw bytes: %02x %02x %02x %02x)\n", 
                  dev->max_packet_ep0,
                  dma_buf[0], dma_buf[1], dma_buf[2], dma_buf[3]);
+
+        // Update EP0 max packet size in xHCI hardware via Evaluate Context
+        // Only needed for Full-Speed devices that start with EP0 max_pkt=8
+        // but report a larger size (typically 64) in the device descriptor
+        if (dev->speed == XHCI_SPEED_FULL && dev->max_packet_ep0 > 8) {
+            if (xhci_evaluate_context(ctrl, slot, dev->max_packet_ep0) != ST_OK) {
+                kprintf("[XHCI] Port %d: Evaluate Context failed, continuing\n", port);
+            }
+        }
     }
     
     // Get full device descriptor
@@ -2114,17 +2128,14 @@ int xhci_enumerate_device(xhci_controller_t* ctrl, uint8_t port) {
         // Continue anyway, some devices work without this
     }
     
-    // Probe for USB HID devices (keyboard/mouse) before freeing config descriptor
-    // The config descriptor is still in dma_buf from the GET_DESCRIPTOR above
+    // Probe for USB HID devices (keyboard/mouse) while the configuration
+    // descriptor is still resident in dma_buf from the GET_DESCRIPTOR above.
     {
         usb_config_desc_t* cfg_tmp = (usb_config_desc_t*)dma_buf;
         uint16_t cfg_total = cfg_tmp->total_length;
         if (cfg_total > 256) cfg_total = 256;
         usbhid_probe(ctrl, dev, dma_buf, cfg_total);
     }
-    
-    // Free DMA buffer (free the raw allocation, not the aligned pointer)
-    kfree_dma(raw_buf);
     
     // Configure bulk endpoints if found
     if (dev->bulk_in_ep && dev->bulk_out_ep) {
@@ -2137,7 +2148,17 @@ int xhci_enumerate_device(xhci_controller_t* ctrl, uint8_t port) {
                                     EP_TYPE_BULK_OUT, dev->bulk_out_max_pkt, 0) != ST_OK) {
             kprintf("[XHCI] Failed to configure bulk OUT endpoint\n");
         }
+
+        {
+            usb_config_desc_t* cfg_tmp = (usb_config_desc_t*)dma_buf;
+            uint16_t cfg_total = cfg_tmp->total_length;
+            if (cfg_total > 256) cfg_total = 256;
+            (void)usbserial_probe(ctrl, dev, dma_buf, cfg_total);
+        }
     }
+
+    // Free DMA buffer (free the raw allocation, not the aligned pointer)
+    kfree_dma(raw_buf);
     
     dev->configured = 1;
     ctrl->num_devices++;
@@ -2146,6 +2167,51 @@ int xhci_enumerate_device(xhci_controller_t* ctrl, uint8_t port) {
     kprintf("[XHCI] Port %d: USB device (VID=%04x PID=%04x class=%d)\n",
             dev->port, dev->vendor_id, dev->product_id, dev->class_code);
     
+    return ST_OK;
+}
+
+//=============================================================================
+// Evaluate Context (update EP0 max packet size for Full-Speed devices)
+//=============================================================================
+
+static int xhci_evaluate_context(xhci_controller_t* ctrl, uint8_t slot, uint16_t max_pkt_ep0) {
+    if (slot == 0 || slot > ctrl->max_slots) return ST_INVALID;
+
+    usb_device_t* dev = &ctrl->devices[slot - 1];
+
+    // Setup input context - only EP0 context needs updating
+    size_t input_ctx_size = 33 * ctrl->context_size;
+    xhci_memset(ctrl->input_ctx_raw, 0, input_ctx_size);
+
+    // Input Control Context: Add EP0 only (bit 1), no Slot context needed
+    uint32_t* input_ctrl = (uint32_t*)xhci_get_input_control_ctx(ctrl);
+    input_ctrl[0] = 0;          // Drop flags
+    input_ctrl[1] = (1 << 1);   // Add flags: EP0 (DCI 1)
+
+    // EP0 context (endpoint index 0)
+    xhci_ep_ctx_t* ep0 = xhci_get_input_ep_ctx(ctrl, 0);
+    ep0->ep_info2 = (3 << 1) |                    // CErr = 3
+                    (EP_TYPE_CONTROL << 3) |       // EP Type
+                    (max_pkt_ep0 << 16);           // New max packet size
+
+    // Flush before sending command
+    xhci_flush_cache(ctrl->input_ctx_raw, input_ctx_size);
+    xhci_mb();
+
+    // Send Evaluate Context command
+    uint32_t control = (TRB_TYPE_EVAL_CTX << 10) | (slot << 24);
+
+    if (xhci_send_command(ctrl, ctrl->input_ctx_phys, 0, control) != ST_OK) {
+        return ST_ERR;
+    }
+
+    if (xhci_wait_command(ctrl, 1000) != ST_OK) {
+        kprintf("[XHCI] Evaluate Context failed for slot %d\n", slot);
+        return ST_ERR;
+    }
+
+    xhci_dbg("Evaluate Context: slot=%d, EP0 max_pkt=%d\n", slot, max_pkt_ep0);
+    dev->max_packet_ep0 = max_pkt_ep0;
     return ST_OK;
 }
 
@@ -2242,7 +2308,9 @@ int xhci_reset_endpoint(xhci_controller_t* ctrl, uint8_t slot, uint8_t dci) {
     usb_device_t* dev = &ctrl->devices[slot - 1];
     xhci_ring_t* ring = NULL;
     
-    if (dci == dev->bulk_in_ep * 2 + 1) {
+    if (dci == 1) {
+        ring = dev->ep0_ring;
+    } else if (dci == dev->bulk_in_ep * 2 + 1) {
         ring = dev->bulk_in_ring;
     } else if (dci == dev->bulk_out_ep * 2) {
         ring = dev->bulk_out_ring;
@@ -2292,12 +2360,12 @@ int xhci_control_transfer(xhci_controller_t* ctrl, usb_device_t* dev,
                          uint8_t bmRequestType, uint8_t bRequest,
                          uint16_t wValue, uint16_t wIndex, uint16_t wLength,
                          void* data) {
-    if (!dev || !dev->bulk_in_ring) {
-        kprintf("[XHCI] Control: invalid dev=%p ring=%p\n", dev, dev ? dev->bulk_in_ring : NULL);
+    if (!dev || !dev->ep0_ring) {
+        kprintf("[XHCI] Control: invalid dev=%p ring=%p\n", dev, dev ? dev->ep0_ring : NULL);
         return ST_INVALID;
     }
     
-    xhci_ring_t* ring = dev->bulk_in_ring;  // EP0 uses bulk_in_ring
+    xhci_ring_t* ring = dev->ep0_ring;
     uint8_t slot = dev->slot_id;
     uint8_t direction = (bmRequestType & USB_RT_D2H) ? 1 : 0;
     
@@ -2336,6 +2404,10 @@ int xhci_control_transfer(xhci_controller_t* ctrl, usb_device_t* dev,
         
         if (direction) {
             data_control |= (1 << 16);  // DIR = IN
+        } else {
+            // OUT data: flush CPU cache so xHCI DMA reads current contents
+            xhci_flush_cache(data, wLength);
+            xhci_mb();
         }
         
         xhci_ring_enqueue(ring, data_phys, data_status, data_control);
@@ -2836,6 +2908,7 @@ void xhci_shutdown(xhci_controller_t* ctrl) {
     // Free device resources
     for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
         if (ctrl->dev_ctx[i]) kfree_dma(ctrl->dev_ctx[i]);
+        if (ctrl->devices[i].ep0_ring) xhci_free_ring(ctrl->devices[i].ep0_ring);
         if (ctrl->devices[i].bulk_in_ring) xhci_free_ring(ctrl->devices[i].bulk_in_ring);
         if (ctrl->devices[i].bulk_out_ring) xhci_free_ring(ctrl->devices[i].bulk_out_ring);
     }

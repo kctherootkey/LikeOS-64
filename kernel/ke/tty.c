@@ -3,6 +3,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/syscall.h"
+#include "../../include/kernel/usb_serial.h"
 #include "../../include/kernel/signal.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/timer.h"
@@ -878,7 +879,9 @@ long tty_write(tty_t* tty, const void* buf, long count) {
     // tty_lock for the entire write so two CPUs can't interleave chars.
     #define TTY_WRITE_CHUNK 256
     char tmp[TTY_WRITE_CHUNK];
+    char mirror_tmp[TTY_WRITE_CHUNK];
     long written = 0;
+    int mirror_console = (tty == tty_get_console());
 
     // Enter batch mode: suppresses cursor updates on other CPUs
     // and enables rate-limited VRAM flushing (~50fps)
@@ -895,6 +898,7 @@ long tty_write(tty_t* tty, const void* buf, long count) {
         smap_enable();
 
         uint64_t flags;
+        long mirror_len = 0;
         spin_lock_irqsave(&tty_lock, &flags);
         for (long i = 0; i < chunk; i++) {
             char c = tmp[i];
@@ -904,9 +908,16 @@ long tty_write(tty_t* tty, const void* buf, long count) {
             if (tty->term.c_iflag & IGNCR) {
                 if (c == '\r') continue;
             }
+            if (mirror_console && mirror_len < (long)sizeof(mirror_tmp)) {
+                mirror_tmp[mirror_len++] = c;
+            }
             tty->output(tty, c);
         }
         spin_unlock_irqrestore(&tty_lock, flags);
+
+        if (mirror_console && mirror_len > 0) {
+            usbserial_log_write(mirror_tmp, (uint32_t)mirror_len);
+        }
 
         // Rate-limited VRAM flush (~50fps) — skips if too recent
         console_flush();
