@@ -5,8 +5,8 @@
 // DesignWare I2C IP core, scans I2C buses for HID devices, and injects
 // mouse/touchpad input into the existing input subsystems.
 //
-// I2C transfers use polled mode (busy-wait ~1ms per transfer at 400kHz).
-// HID input reports are polled from the main kernel loop.
+// I2C transfers use standard mode (100kHz) with interrupt-driven GPIO
+// handling.  Worker threads perform I2C reads; no polling from main loop.
 
 #include "../../include/kernel/i2c_hid.h"
 #include "../../include/kernel/console.h"
@@ -19,6 +19,20 @@
 #include "../../include/kernel/ioapic.h"
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/sched.h"
+
+// Debug counters for interrupt-driven I2C HID
+static volatile uint32_t g_dbg_gpio_isr_count = 0;     // Total GPIO ISR invocations
+static volatile uint32_t g_dbg_gpio_isr_hit = 0;       // ISR found pending bit
+static volatile uint32_t g_dbg_gpio_isr_miss = 0;      // ISR: no matching pending bit
+static volatile uint32_t g_dbg_worker_wake = 0;        // Worker woke up
+static volatile uint32_t g_dbg_worker_read = 0;        // Worker did an I2C read
+static volatile uint32_t g_dbg_worker_xfer_err = 0;    // I2C transfer errors
+static volatile uint32_t g_dbg_worker_null_pkt = 0;    // Null/short packets discarded
+static volatile uint32_t g_dbg_worker_null_id = 0;     // Null report ID discarded
+static volatile uint32_t g_dbg_worker_id_mismatch = 0; // Report ID mismatch
+static volatile uint32_t g_dbg_worker_processed = 0;   // Reports processed into mouse
+static volatile uint32_t g_dbg_worker_no_finger = 0;   // Reports skipped (no finger)
+static volatile uint32_t g_dbg_ie_reenable = 0;        // GPI_IE re-enabled count
 
 // ============================================================================
 // Private data
@@ -249,13 +263,6 @@ static const gpio_platform_def_t g_gpio_platforms[] = {
 
 #define I2C_LPSS_MMIO_PAGES 1
 
-// Polling rate limiter (poll every N calls to reduce bus traffic)
-static uint64_t g_poll_counter = 0;
-#define I2C_HID_POLL_DIVISOR 1  // Poll every call (main loop is already ~100 Hz)
-
-// Diagnostic counter: how many times ISR set gpio_irq_pending
-static volatile uint32_t g_isr_fire_count = 0;
-
 // ============================================================================
 // Utility functions
 // ============================================================================
@@ -277,96 +284,6 @@ static void i2c_delay_us(int us) {
     for (volatile int i = 0; i < us * 500; i++) {
         __asm__ volatile("nop");
     }
-}
-
-
-static const char *i2c_fw_status_name(int status)
-{
-    switch (status) {
-        case ACPI_FW_STATUS_OK:
-            return "ok";
-        case ACPI_FW_STATUS_NO_PS0:
-            return "no-ps0";
-        case ACPI_FW_STATUS_FAILED:
-            return "fail";
-        case ACPI_FW_STATUS_UNSUPPORTED:
-            return "need-aml";
-        default:
-            return "none";
-    }
-}
-
-static int i2c_hid_log_acpi_hid_group(const char *tag,
-                                      const char *const *hids,
-                                      int hid_count,
-                                      int line_budget)
-{
-    int printed = 0;
-
-    for (int i = 0; i < hid_count && printed < line_budget; i++) {
-        acpi_aml_device_info_t matches[2];
-        acpi_aml_device_info_t fw_info;
-        int found;
-        int fw_status;
-
-        i2c_memset(matches, 0, sizeof(matches));
-        i2c_memset(&fw_info, 0, sizeof(fw_info));
-
-        found = acpi_aml_find_devices_by_hid(hids[i], matches, 2);
-        if (found <= 0)
-            continue;
-
-        fw_status = acpi_fw_power_on_device(hids[i], &fw_info);
-        kprintf("[I2C-ACPI] %s %s n=%d%s fw=%s hid=%s cid=%s ps0=%u sta=%u crs=%u dep=%u %s pwr=%s\n",
-                tag,
-                hids[i],
-                found,
-                found > 1 ? "+" : "",
-                i2c_fw_status_name(fw_status),
-            matches[0].hid[0] ? matches[0].hid : "-",
-            matches[0].cid[0] ? matches[0].cid : "-",
-                matches[0].has_ps0,
-                matches[0].has_sta,
-                matches[0].has_crs,
-                matches[0].has_dep,
-                matches[0].path,
-                fw_info.power_path[0] ? fw_info.power_path : "-");
-        printed++;
-    }
-
-    if (printed == 0) {
-        kprintf("[I2C-ACPI] %s none\n", tag);
-    }
-
-    return printed;
-}
-
-static void i2c_hid_probe_acpi_firmware(void)
-{
-    static const char *const lpss_i2c_hids[] = {
-        "80860F41", "808622C1", "INT33C2", "INT33C3",
-        "INT3432", "INT3433", "INT3442", "INT3443",
-        "INT3444", "INT3445", "INT3446", "INT3447",
-        "INT34B2", "INT34B3", "INT34B4", "INT34B5",
-        "INT34B6", "INT34B7", "80860AAC", "80865AAC",
-        "INTC1057", "INTC1058", "INTC1059", "INTC105A",
-        "INTC105B", "INTC105C",
-        "INTC10D0", "INTC10D1", "INTC10D2", "INTC10D3",
-        "INTC10EF", "INTC10F0", "INTC10F1", "INTC10F2",
-        "INTC10F3"
-    };
-    static const char *const hid_i2c_hids[] = {
-        "ACPI0C50", "PNP0C50"
-    };
-    int printed;
-
-    printed = i2c_hid_log_acpi_hid_group("LPSS", lpss_i2c_hids,
-                                         (int)(sizeof(lpss_i2c_hids) / sizeof(lpss_i2c_hids[0])),
-                                         4);
-    i2c_hid_log_acpi_hid_group(printed ? "HID" : "HID",
-                               hid_i2c_hids,
-                               (int)(sizeof(hid_i2c_hids) / sizeof(hid_i2c_hids[0])),
-                               2);
 }
 
 // ============================================================================
@@ -620,20 +537,20 @@ static int dw_i2c_init_controller(i2c_dw_controller_t *ctrl) {
     ctrl->tx_fifo_depth = tx_depth;
 
     // ---- Step 7: Configure controller ----
-    // Master mode, fast speed (400kHz), 7-bit addressing, restart enable
-    uint32_t ic_con = DW_IC_CON_MASTER | DW_IC_CON_SPEED_FS |
+    // Master mode, standard speed (100kHz), 7-bit addressing, restart enable
+    uint32_t ic_con = DW_IC_CON_MASTER | DW_IC_CON_SPEED_SS |
                       DW_IC_CON_RESTART_EN | DW_IC_CON_SLAVE_DISABLE;
     dw_write(ctrl, DW_IC_CON, ic_con);
 
-    // Fast mode SCL timing (conservative for ~120 MHz input clock)
-    dw_write(ctrl, DW_IC_FS_SCL_HCNT, 160);
-    dw_write(ctrl, DW_IC_FS_SCL_LCNT, 320);
+    // Standard mode SCL timing (100kHz, per PCH 600/700 datasheet defaults)
+    dw_write(ctrl, DW_IC_SS_SCL_HCNT, 500);
+    dw_write(ctrl, DW_IC_SS_SCL_LCNT, 588);
 
     // SDA hold time
     dw_write(ctrl, DW_IC_SDA_HOLD, 0x001C001C);
 
-    // Spike suppression filter
-    dw_write(ctrl, DW_IC_FS_SPKLEN, 5);
+    // Spike suppression filter (SS/FS datasheet default = 7)
+    dw_write(ctrl, DW_IC_FS_SPKLEN, 7);
 
     // FIFO thresholds
     dw_write(ctrl, DW_IC_RX_TL, 0);
@@ -695,6 +612,9 @@ static int dw_i2c_init_controller(i2c_dw_controller_t *ctrl) {
 static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
                             const uint8_t *wbuf, int wlen,
                             uint8_t *rbuf, int rlen);
+
+// Forward declaration for worker thread
+static void i2c_hid_worker_thread(void *arg);
 
 // Wait for TX FIFO to have space (not full)
 static int dw_i2c_wait_tx_not_full(i2c_dw_controller_t *ctrl, int timeout_us) {
@@ -2300,235 +2220,6 @@ static int i2c_hid_init_device(i2c_hid_device_t *dev) {
 }
 
 // ============================================================================
-// HID over I2C — Input report reading and processing
-// ============================================================================
-
-// Extract a signed integer from a bit field in a report buffer
-static int32_t extract_field(const uint8_t *data, uint16_t bit_offset,
-                              uint16_t bit_size) {
-    if (bit_size == 0 || bit_size > 32) return 0;
-
-    int32_t value = 0;
-    for (uint16_t i = 0; i < bit_size; i++) {
-        uint16_t bit_pos = bit_offset + i;
-        uint16_t byte_pos = bit_pos / 8;
-        uint8_t bit_idx = bit_pos % 8;
-        if (data[byte_pos] & (1 << bit_idx))
-            value |= (1 << i);
-    }
-
-    // Sign-extend if the top bit is set
-    if (bit_size < 32 && (value & (1 << (bit_size - 1)))) {
-        value |= ~((1 << bit_size) - 1);
-    }
-
-    return value;
-}
-
-// Extract an unsigned integer from a bit field (no sign extension).
-// Used for tip_switch, buttons, contact_count — fields that are always >= 0.
-static uint32_t extract_field_unsigned(const uint8_t *data,
-                                        uint16_t bit_offset,
-                                        uint16_t bit_size) {
-    if (bit_size == 0 || bit_size > 32) return 0;
-
-    uint32_t value = 0;
-    for (uint16_t i = 0; i < bit_size; i++) {
-        uint16_t bit_pos  = bit_offset + i;
-        uint16_t byte_pos = bit_pos / 8;
-        uint8_t  bit_idx  = bit_pos % 8;
-        if (data[byte_pos] & (1 << bit_idx))
-            value |= (1u << i);
-    }
-
-    return value;
-}
-
-// Process a mouse/touchpad input report using parsed field info
-static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
-                                    const uint8_t *data, int data_len) {
-    i2c_hid_report_info_t *ri = &dev->mouse_report;
-
-    if (ri->x.bit_size == 0) return;  // No parsed layout
-
-    int data_bits = data_len * 8;
-
-    // Bounds-check X and Y field positions
-    if ((int)(ri->x.bit_offset + ri->x.bit_size) > data_bits) return;
-    if ((int)(ri->y.bit_offset + ri->y.bit_size) > data_bits) return;
-
-    // Extract fields — use UNSIGNED extraction for boolean/flags,
-    // signed extraction for coordinates (which may be relative/negative).
-    uint8_t buttons = 0;
-    if (ri->buttons.bit_size > 0 &&
-        (int)(ri->buttons.bit_offset + ri->buttons.bit_size) <= data_bits)
-        buttons = (uint8_t)extract_field_unsigned(data, ri->buttons.bit_offset,
-                                                       ri->buttons.bit_size);
-    int32_t x, y;
-    if (ri->x.is_relative) {
-        // Relative mode — signed, dx/dy can be negative
-        x = extract_field(data, ri->x.bit_offset, ri->x.bit_size);
-        y = extract_field(data, ri->y.bit_offset, ri->y.bit_size);
-    } else {
-        // Absolute touchpad coords are always >= 0 (0..logical_max).
-        // Signed extraction sign-extends values >= 2^(bits-1), e.g.
-        // 2500 in a 12-bit field becomes -1596 → massive cursor jump.
-        x = (int32_t)extract_field_unsigned(data, ri->x.bit_offset, ri->x.bit_size);
-        y = (int32_t)extract_field_unsigned(data, ri->y.bit_offset, ri->y.bit_size);
-    }
-    int8_t wheel = 0;
-    if (ri->has_wheel && ri->dev_type != I2C_HID_DEV_TOUCHPAD) {
-        // Precision touchpads don't have a real scroll wheel;
-        // any parsed wheel field is from a mouse-compat sub-collection
-        // and would read garbage from the touchpad data format.
-        int32_t w = extract_field(data, ri->wheel.bit_offset, ri->wheel.bit_size);
-        wheel = (int8_t)(w > 127 ? 127 : (w < -128 ? -128 : w));
-    }
-
-    // Tip switch: finger touching the surface (digitizer usage 0x42)
-    uint8_t touching = 0;
-    if (ri->has_tip_switch &&
-        (int)(ri->tip_switch.bit_offset + ri->tip_switch.bit_size) <= data_bits)
-        touching = (uint8_t)extract_field_unsigned(data, ri->tip_switch.bit_offset,
-                                                        ri->tip_switch.bit_size);
-
-    // Multi-touch rejection: if contact_count > 1, another finger or
-    // palm landed on the pad.  Contact 0 might be a palm at a wildly
-    // different position → huge cursor jump.  Skip the report and
-    // treat it as a lift (touching=0) so the accumulators reset.
-    // Two-finger scrolling / gestures are not supported yet, and
-    // this is the single most common cause of cursor jumps.
-    if (ri->has_contact_count) {
-        uint32_t cc = extract_field_unsigned(data,
-            ri->contact_count.bit_offset, ri->contact_count.bit_size);
-        if (cc > 1)
-            touching = 0;  // pretend lift → reset accumulators
-    }
-
-    // For absolute touchpad data, convert to relative deltas
-    if (!ri->x.is_relative) {
-        // Convert absolute touchpad coordinates to USB-mouse-like
-        // relative deltas.  USB mice report int8_t dx/dy in the
-        // range ±1..±5 for normal moves.  The mouse subsystem
-        // applies sensitivity*2 (default: 4*2/2 = ×2), so we must
-        // produce values in that same small range.
-        //
-        // Touchpad resolution is ~2500 × 1760.  A normal slow swipe
-        // generates raw deltas of 2–80 per report.  We use fractional
-        // accumulators: accumulate raw deltas and emit integer units
-        // only when the remainder exceeds the divisor.  This preserves
-        // slow sub-pixel movements that integer division would lose.
-        static int32_t last_abs_x = -1, last_abs_y = -1;
-        static uint8_t last_touch = 0;
-        static int accum_x = 0, accum_y = 0;
-
-        int dx = 0, dy = 0;
-        if (touching && last_touch && last_abs_x >= 0) {
-            accum_x += (int)(x - last_abs_x);
-            accum_y += (int)(y - last_abs_y);
-
-            dx = accum_x / 4;
-            dy = accum_y / 4;
-            accum_x -= dx * 4;
-            accum_y -= dy * 4;
-
-            if (dx > 127) dx = 127;
-            if (dx < -127) dx = -127;
-            if (dy > 127) dy = 127;
-            if (dy < -127) dy = -127;
-        } else {
-            accum_x = 0;
-            accum_y = 0;
-        }
-
-        // Inject on movement OR button change — the old check
-        // (dx||dy only) silently dropped all clicks when the
-        // finger was stationary on the pad.
-        if (dx != 0 || dy != 0 || buttons != dev->prev_buttons)
-            mouse_inject_usb_movement(dx, dy, buttons & 0x07, wheel);
-        dev->prev_buttons = buttons;
-
-        last_abs_x = touching ? x : -1;
-        last_abs_y = touching ? y : -1;
-        last_touch = touching;
-    } else {
-        // Relative mode — direct injection
-        int dx = (int)x;
-        int dy = (int)y;
-        // Clamp large values
-        if (dx > 127) dx = 127;
-        if (dx < -127) dx = -127;
-        if (dy > 127) dy = 127;
-        if (dy < -127) dy = -127;
-        mouse_inject_usb_movement(dx, dy, buttons, wheel);
-    }
-}
-
-// Read one input report from the device
-static int i2c_hid_read_input(i2c_hid_device_t *dev) {
-    if (!dev->active) return -1;
-
-    uint16_t max_len = dev->desc.wMaxInputLength;
-    if (max_len > I2C_HID_MAX_REPORT_SIZE) max_len = I2C_HID_MAX_REPORT_SIZE;
-    if (max_len < 2) return -1;
-
-    // Use raw I2C read (no register address write), matching Linux
-    // i2c_hid_get_input() → i2c_master_recv().  The device already knows
-    // we want the input report because it asserted INT#.
-    int rc;
-    if (dev->ctrl->use_interrupts)
-        rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr,
-                              NULL, 0, dev->input_buf, max_len);
-    else
-        rc = dw_i2c_xfer(dev->ctrl, dev->i2c_addr,
-                          NULL, 0, dev->input_buf, max_len);
-    if (rc < 0) {
-        kprintf("[I2C-HID] read err: abort_src=0x%x status=0x%x raw=0x%x addr=0x%x\n",
-                dev->ctrl->abort_source,
-                dw_read(dev->ctrl, DW_IC_STATUS),
-                dw_read(dev->ctrl, DW_IC_RAW_INTR_STAT),
-                dev->i2c_addr);
-        return -1;
-    }
-
-    // First 2 bytes are the length field
-    uint16_t report_len = (uint16_t)dev->input_buf[0] |
-                          ((uint16_t)dev->input_buf[1] << 8);
-
-    // No data available
-    if (report_len == 0 || report_len == 0xFFFF || report_len <= 2)
-        return 0;
-
-    // Sanity check — treat oversized length as "no data" not bus error
-    if (report_len > max_len) return 0;
-
-    uint8_t *report_data = &dev->input_buf[2];
-    int report_data_len = report_len - 2;
-
-    if (report_data_len <= 0) return 0;
-
-    // Handle report ID
-    uint8_t report_id = 0;
-    if (dev->mouse_report.has_report_id) {
-        report_id = report_data[0];
-        report_data++;
-        report_data_len--;
-    }
-
-    // Dispatch mouse/touchpad reports
-    if (dev->dev_type == I2C_HID_DEV_MOUSE ||
-        dev->dev_type == I2C_HID_DEV_TOUCHPAD) {
-        if (dev->mouse_report.has_report_id &&
-            report_id != dev->mouse_report.report_id) {
-            return 0;  // Not our report — skip
-        }
-        i2c_hid_process_mouse(dev, report_data, report_data_len);
-    }
-
-    return 1;  // Report processed
-}
-
-// ============================================================================
 // Interrupt-Driven I2C Transfer
 // ============================================================================
 
@@ -3262,71 +2953,6 @@ static int gpio_setup_hid_interrupt(i2c_hid_device_t *dev,
     return 0;
 }
 
-// GPIO ISR: called when any GPIO community fires its IOAPIC interrupt.
-// Scans all communities for pending GPI_IS bits, clears them, and reads
-// HID reports from the associated I2C device.
-void i2c_hid_gpio_irq_handler(uint8_t vector)
-{
-    (void)vector;
-
-    for (int ci = 0; ci < g_gpio_community_count; ci++) {
-        gpio_community_t *comm = &g_gpio_communities[ci];
-        if (!comm->base) continue;
-
-        uint16_t is_base = g_gpio_platform ? g_gpio_platform->gpi_is_offset : 0x100;
-        uint16_t ie_base = g_gpio_platform ? g_gpio_platform->gpi_ie_offset : 0x120;
-
-        // Check GPI_IS for each group in this community
-        for (int grp = 0; grp < comm->num_groups; grp++) {
-            uint8_t reg_idx = comm->groups[grp].gpi_reg_index;
-            uint32_t is_reg = is_base + reg_idx * 4;
-            uint32_t ie_reg = ie_base + reg_idx * 4;
-
-            // Safety: don't read past mapped region (64KB per community)
-            if (is_reg + 4 > 0x10000 || ie_reg + 4 > 0x10000) break;
-
-            uint32_t status = gpio_comm_read32(comm, is_reg);
-            uint32_t enabled = gpio_comm_read32(comm, ie_reg);
-            uint32_t pending = status & enabled;
-
-            if (!pending) continue;
-
-            // Mask the pending bits in GPI_IE to stop level-triggered
-            // re-assertion.  The poll function will unmask after reading
-            // the device report.
-            gpio_comm_write32(comm, ie_reg, enabled & ~pending);
-
-            // Clear the status bits (write-1-to-clear)
-            gpio_comm_write32(comm, is_reg, pending);
-
-            // Flush posted MMIO writes by reading back.  Without this,
-            // the IOAPIC sees the level-triggered interrupt still asserted
-            // after EOI and immediately re-delivers — causing an ISR storm
-            // (hundreds of duplicate fires per real touchpad event).
-            (void)gpio_comm_read32(comm, ie_reg);
-
-            // Find HID devices bound to GPIO pins in this community/group
-            for (int d = 0; d < g_i2c_hid_device_count; d++) {
-                i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
-                if (!dev->active || !dev->gpio_irq_active)
-                    continue;
-                if (dev->gpio_community != (uint8_t)ci)
-                    continue;
-                if (dev->gpio_gpi_group != (uint8_t)reg_idx)
-                    continue;
-                if (!(pending & (1u << dev->gpio_gpi_bit)))
-                    continue;
-
-                // Signal that an interrupt is pending
-                __sync_lock_test_and_set(&dev->gpio_irq_pending, 1);
-                __sync_fetch_and_add(&g_isr_fire_count, 1);
-            }
-        }
-    }
-
-    lapic_eoi();
-}
-
 // ============================================================================
 // Public API
 // ============================================================================
@@ -3573,288 +3199,438 @@ int i2c_hid_init(void) {
     } else {
         kprintf("[I2C-HID] No I2C HID devices found\n");
     }
+
+    // ---- Initialize spinlocks on controllers and devices ----
+    for (int c = 0; c < g_i2c_controller_count; c++) {
+        i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
+        if (!ctrl->active) continue;
+        spinlock_init(&ctrl->lock, "i2c_ctrl");
+        ctrl->worker_running = 0;
+    }
+    for (int d = 0; d < g_i2c_hid_device_count; d++) {
+        i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+        spinlock_init(&dev->dev_lock, "i2c_hid_dev");
+        dev->work_pending = 0;
+        // Use the device struct address itself as the unique wake channel
+        dev->worker_channel = (void *)dev;
+    }
+
+    // ---- Spawn one worker thread per controller that has active HID devices ----
+    for (int c = 0; c < g_i2c_controller_count; c++) {
+        i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
+        if (!ctrl->active) continue;
+
+        // Check if any active HID device lives on this controller
+        int has_dev = 0;
+        for (int d = 0; d < g_i2c_hid_device_count; d++) {
+            if (g_i2c_hid_devices[d].ctrl == ctrl && g_i2c_hid_devices[d].active) {
+                has_dev = 1;
+                break;
+            }
+        }
+        if (!has_dev) continue;
+
+        void *stack = kalloc(8192);
+        if (!stack) {
+            kprintf("[I2C-HID] Failed to allocate worker stack for I2C%d\n",
+                    ctrl->bus_id);
+            continue;
+        }
+        ctrl->worker_running = 1;
+        sched_add_task(i2c_hid_worker_thread, ctrl, stack, 8192);
+        kprintf("[I2C-HID] Worker thread created for I2C%d\n", ctrl->bus_id);
+    }
+
     return g_i2c_controller_count;
 }
 
-// Re-enable GPI_IE for a device's pin with interrupt protection.
-//
-// The read-modify-write on the GPI_IE register must be done with local
-// interrupts disabled; otherwise the GPIO ISR can fire between the read
-// and write and mask the same IE register, only to have poll's write
-// immediately re-enable it — creating a spurious ISR cycle.
-//
-// After re-enabling IE we read GPI_IS.  If the device's bit is already
-// set (stale from a level-triggered re-assertion while IE was masked,
-// or a new edge that arrived while IE was off), we set gpio_irq_pending
-// so the next poll tick services it.  This is the safety net that
-// prevents "ISRs stop" when the IOAPIC doesn't re-deliver after the
-// signal was already high when IE was re-enabled.
-static void gpio_reenable_ie(i2c_hid_device_t *dev)
+// ============================================================================
+// Input Report Processing (bit-field extraction + mouse injection)
+// ============================================================================
+
+// Extract a signed field from a HID input report at arbitrary bit offset/size
+static int32_t extract_field(const uint8_t *data, uint16_t bit_offset,
+                             uint16_t bit_size)
 {
-    gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
-    if (!comm->base) return;
-
-    uint16_t ie_base = g_gpio_platform ?
-                       g_gpio_platform->gpi_ie_offset : 0x120;
-    uint16_t is_base = g_gpio_platform ?
-                       g_gpio_platform->gpi_is_offset : 0x100;
-    uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
-    uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
-    uint32_t bit    = 1u << dev->gpio_gpi_bit;
-
-    uint64_t flags = local_irq_save();
-
-    // Atomic RMW: set our bit in GPI_IE
-    uint32_t ie = gpio_comm_read32(comm, ie_reg);
-    ie |= bit;
-    gpio_comm_write32(comm, ie_reg, ie);
-
-    // Safety net for LEVEL mode: after re-enabling IE, check GPI_IS.
-    // With LEVEL + RXINV, IS re-asserts immediately if pin is still LOW
-    // (device has data).  The ISR masked IE earlier, so this IS bit was
-    // latched while we were reading.  Set pending to service it on the
-    // next poll tick.  The ISR will mask IE again to prevent flood.
-    uint32_t is = gpio_comm_read32(comm, is_reg);
-    if (is & bit)
-        __sync_lock_test_and_set(&dev->gpio_irq_pending, 1);
-
-    local_irq_restore(flags);
+    if (bit_size == 0 || bit_size > 32) return 0;
+    uint32_t val = 0;
+    for (uint16_t i = 0; i < bit_size; i++) {
+        uint16_t bit = bit_offset + i;
+        if (data[bit / 8] & (1u << (bit % 8)))
+            val |= (1u << i);
+    }
+    // Sign-extend if MSB is set
+    if (val & (1u << (bit_size - 1)))
+        val |= ~((1u << bit_size) - 1);
+    return (int32_t)val;
 }
 
-// Verify GPIO pad configuration hasn't been corrupted by BIOS/SMI.
-// Checks HOSTSW_OWN, PAD_CFG_DW0 critical bits, and GPI_IE.
-// Returns 1 if a repair was made, 0 if everything was fine.
-static int gpio_verify_and_repair(i2c_hid_device_t *dev)
+// Extract an unsigned field from a HID input report
+static uint32_t extract_field_unsigned(const uint8_t *data, uint16_t bit_offset,
+                                       uint16_t bit_size)
 {
-    gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
-    if (!comm->base) return 0;
-
-    uint32_t bit = 1u << dev->gpio_gpi_bit;
-    int repaired = 0;
-
-    // 1. Check HOSTSW_OWN — most likely to be reset by BIOS/SMI.
-    //    If cleared, GPI_IS stops tracking this pad's interrupt status
-    //    and all GPIO-driver-mode interrupts for it silently die.
-    uint16_t hostsw_base = g_gpio_platform ?
-                           g_gpio_platform->hostsw_own_offset : 0x0b0;
-    uint32_t hostsw_reg = hostsw_base + dev->gpio_gpi_group * 4;
-    uint32_t hostsw = gpio_comm_read32(comm, hostsw_reg);
-    if (!(hostsw & bit)) {
-        hostsw |= bit;
-        gpio_comm_write32(comm, hostsw_reg, hostsw);
-        repaired = 1;
+    if (bit_size == 0 || bit_size > 32) return 0;
+    uint32_t val = 0;
+    for (uint16_t i = 0; i < bit_size; i++) {
+        uint16_t bit = bit_offset + i;
+        if (data[bit / 8] & (1u << (bit % 8)))
+            val |= (1u << i);
     }
-
-    // 2. Check PAD_CFG_DW0 critical bits (RXEVCFG, PMODE, GPIORXDIS, RXINV).
-    //    Mask out volatile/read-only bits (GPIORXSTATE, GPIOTXSTATE) and
-    //    bits that the ISR legitimately changes (none — ISR only touches
-    //    GPI_IE/GPI_IS, not PAD_CFG).
-    #define PAD_CFG_CRITICAL_MASK \
-        (GPIO_DW0_RXEVCFG_MASK | GPIO_DW0_PMODE_MASK | \
-         GPIO_DW0_GPIORXDIS | GPIO_DW0_RXINV)
-
-    uint32_t dw0 = gpio_comm_read32(comm,
-                        dev->gpio_pad_offset + GPIO_PAD_CFG_DW0);
-    if ((dw0 & PAD_CFG_CRITICAL_MASK) !=
-        (dev->gpio_pad_dw0 & PAD_CFG_CRITICAL_MASK)) {
-        // Restore the expected value (preserve non-critical bits)
-        dw0 = (dw0 & ~PAD_CFG_CRITICAL_MASK) |
-              (dev->gpio_pad_dw0 & PAD_CFG_CRITICAL_MASK);
-        gpio_comm_write32(comm,
-                          dev->gpio_pad_offset + GPIO_PAD_CFG_DW0, dw0);
-        repaired = 1;
-    }
-
-    #undef PAD_CFG_CRITICAL_MASK
-
-    // 3. Check GPI_IE — if our bit is not set, re-enable it.
-    uint16_t ie_base = g_gpio_platform ?
-                       g_gpio_platform->gpi_ie_offset : 0x120;
-    uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
-    uint32_t ie = gpio_comm_read32(comm, ie_reg);
-    if (!(ie & bit)) {
-        ie |= bit;
-        gpio_comm_write32(comm, ie_reg, ie);
-        repaired = 1;
-    }
-
-    if (repaired) {
-        // After repair, clear any stale IS and let the device
-        // re-trigger cleanly.
-        uint16_t is_base = g_gpio_platform ?
-                           g_gpio_platform->gpi_is_offset : 0x100;
-        uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
-        gpio_comm_write32(comm, is_reg, bit);
-    }
-
-    return repaired;
+    return val;
 }
 
-void i2c_hid_poll(void) {
-    if (g_i2c_hid_device_count == 0) return;
+// Process a mouse/touchpad input report and inject into the mouse subsystem
+static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
+                                   const uint8_t *report, uint16_t report_len)
+{
+    i2c_hid_report_info_t *info = &dev->mouse_report;
+    if (info->dev_type != I2C_HID_DEV_MOUSE &&
+        info->dev_type != I2C_HID_DEV_TOUCHPAD)
+        return;
 
-    g_poll_counter++;
-    if ((g_poll_counter % I2C_HID_POLL_DIVISOR) != 0) return;
+    // Determine if finger is on surface
+    int finger_down = 1;
+    uint32_t contacts = 0, tip = 0;
+    if (info->has_contact_count) {
+        contacts = extract_field_unsigned(report,
+            info->contact_count.bit_offset, info->contact_count.bit_size);
+        if (contacts == 0) finger_down = 0;
+    }
+    if (info->has_tip_switch) {
+        tip = extract_field_unsigned(report,
+            info->tip_switch.bit_offset, info->tip_switch.bit_size);
+        if (!tip) finger_down = 0;
+    }
 
-    static uint64_t heartbeat_next = 200;
-    // Track last ISR-serviced tick per device for fallback logic
-    static uint64_t last_isr_tick[I2C_HID_MAX_DEVICES];
+    // When finger lifts, reset absolute position tracking
+    if (!finger_down) {
+        g_dbg_worker_no_finger++;
+        dev->has_prev_pos = 0;
+        return;
+    }
+
+    uint8_t buttons = 0;
+    if (info->buttons.bit_size > 0) {
+        uint32_t btn_raw = extract_field_unsigned(report,
+            info->buttons.bit_offset, info->buttons.bit_size);
+        buttons = (uint8_t)(btn_raw & 0x07);
+    }
+
+    int8_t wheel = 0;
+    if (info->has_wheel && info->wheel.bit_size > 0) {
+        wheel = (int8_t)extract_field(report,
+            info->wheel.bit_offset, info->wheel.bit_size);
+    }
+
+    int32_t dx, dy;
+
+    if (info->x.is_relative) {
+        // Relative mode (mice): use values directly as deltas
+        dx = extract_field(report, info->x.bit_offset, info->x.bit_size);
+        dy = extract_field(report, info->y.bit_offset, info->y.bit_size);
+    } else {
+        // Absolute mode (touchpads): compute deltas from previous position
+        int32_t abs_x = (int32_t)extract_field_unsigned(report,
+            info->x.bit_offset, info->x.bit_size);
+        int32_t abs_y = (int32_t)extract_field_unsigned(report,
+            info->y.bit_offset, info->y.bit_size);
+
+        if (!dev->has_prev_pos) {
+            // First touch — record position, no movement
+            dev->prev_x = abs_x;
+            dev->prev_y = abs_y;
+            dev->has_prev_pos = 1;
+            // Still send button events if any
+            if (buttons != dev->prev_buttons) {
+                mouse_inject_usb_movement(0, 0, buttons, wheel);
+                dev->prev_buttons = buttons;
+            }
+            return;
+        }
+
+        dx = abs_x - dev->prev_x;
+        dy = abs_y - dev->prev_y;
+        dev->prev_x = abs_x;
+        dev->prev_y = abs_y;
+    }
+
+    mouse_inject_usb_movement(dx, dy, buttons, wheel);
+    dev->prev_buttons = buttons;
+    g_dbg_worker_processed++;
+
+    // Log every 50th processed report
+    if ((g_dbg_worker_processed % 50) == 1) {
+        kprintf("[I2C-DBG] #%u dx=%d dy=%d btn=0x%x "
+                "isr=%u hit=%u miss=%u wake=%u read=%u proc=%u "
+                "nofing=%u xferr=%u null=%u nid=%u idmm=%u ie=%u\n",
+                g_dbg_worker_processed, dx, dy, buttons,
+                g_dbg_gpio_isr_count, g_dbg_gpio_isr_hit,
+                g_dbg_gpio_isr_miss, g_dbg_worker_wake,
+                g_dbg_worker_read, g_dbg_worker_processed,
+                g_dbg_worker_no_finger, g_dbg_worker_xfer_err,
+                g_dbg_worker_null_pkt, g_dbg_worker_null_id,
+                g_dbg_worker_id_mismatch, g_dbg_ie_reenable);
+    }
+}
+
+// Read one input report from the device and process it
+static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
+{
+    uint16_t max_len = dev->desc.wMaxInputLength;
+    if (max_len == 0 || max_len > I2C_HID_MAX_REPORT_SIZE)
+        max_len = I2C_HID_MAX_REPORT_SIZE;
+
+    uint8_t buf[I2C_HID_MAX_REPORT_SIZE];
+    i2c_memset(buf, 0, max_len);
+
+    // Raw I2C read: the device sends the input report automatically
+    int rc;
+    if (dev->ctrl->use_interrupts)
+        rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr,
+                              NULL, 0, buf, max_len);
+    else
+        rc = dw_i2c_xfer(dev->ctrl, dev->i2c_addr,
+                          NULL, 0, buf, max_len);
+
+    g_dbg_worker_read++;
+
+    if (rc < 0) {
+        dev->error_count++;
+        g_dbg_worker_xfer_err++;
+        kprintf("[I2C-DBG] xfer ERR #%u dev=0x%02x errcnt=%u "
+                "abort=0x%x\n",
+                g_dbg_worker_xfer_err, dev->i2c_addr,
+                dev->error_count, dev->ctrl->abort_source);
+        return;
+    }
+    dev->error_count = 0;
+
+    // First 2 bytes are the HID-over-I2C length prefix (LE)
+    uint16_t pkt_len = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+
+    // Discard null-size packets
+    if (pkt_len == 0 || pkt_len == 0xFFFF || pkt_len <= 2) {
+        g_dbg_worker_null_pkt++;
+        return;
+    }
+
+    // Clamp to buffer
+    if (pkt_len > max_len) pkt_len = max_len;
+
+    // Data starts after the 2-byte length prefix
+    const uint8_t *data = buf + 2;
+    uint16_t data_len = pkt_len - 2;
+
+    // If device uses report IDs, first data byte is report ID
+    uint8_t report_id = 0;
+    const uint8_t *report_data = data;
+    uint16_t report_data_len = data_len;
+
+    if (dev->mouse_report.has_report_id) {
+        if (data_len < 1) return;
+        report_id = data[0];
+
+        // Discard null report IDs
+        if (report_id == 0) {
+            g_dbg_worker_null_id++;
+            return;
+        }
+
+        report_data = data + 1;
+        report_data_len = data_len - 1;
+
+        // Only process if report ID matches our mouse/touchpad report
+        if (report_id != dev->mouse_report.report_id) {
+            g_dbg_worker_id_mismatch++;
+            return;
+        }
+    }
+
+    if (report_data_len == 0) return;
+
+    i2c_hid_process_mouse(dev, report_data, report_data_len);
+}
+
+// ============================================================================
+// Worker Thread (Threaded IRQ Bottom-Half)
+// ============================================================================
+
+// Per-controller worker thread: blocks until woken by GPIO ISR, then reads
+// input reports from all pending devices on this controller.
+static void i2c_hid_worker_thread(void *arg)
+{
+    i2c_dw_controller_t *ctrl = (i2c_dw_controller_t *)arg;
+
+    kprintf("[I2C-HID] Worker thread running for I2C%d\n", ctrl->bus_id);
+
+    while (ctrl->worker_running) {
+        // Set BLOCKED *before* checking for work — prevents lost wakes.
+        // If the GPIO ISR fires between here and the check below,
+        // sched_wake_channel() will find us BLOCKED and set us READY,
+        // so sched_schedule() will return immediately.
+        task_t *self = sched_current();
+        self->wait_channel = (void *)ctrl;
+        self->state = TASK_BLOCKED;
+        __asm__ volatile("" ::: "memory");
+
+        int any_pending = 0;
+        for (int d = 0; d < g_i2c_hid_device_count; d++) {
+            i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+            if (dev->ctrl == ctrl && dev->active && dev->work_pending) {
+                any_pending = 1;
+                break;
+            }
+        }
+
+        if (!any_pending) {
+            sched_schedule();
+            continue;
+        }
+
+        // Work available — restore running state before processing
+        self->state = TASK_RUNNING;
+        self->wait_channel = NULL;
+
+        // Process all pending devices on this controller
+        for (int d = 0; d < g_i2c_hid_device_count; d++) {
+            i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+            if (dev->ctrl != ctrl || !dev->active || !dev->work_pending)
+                continue;
+
+            // Acquire controller lock to serialize I2C bus access.
+            // Use irqsave — keeps IRQs disabled so the DW I2C ISR
+            // cannot race with the transfer loop's direct register polls.
+            uint64_t flags;
+            spin_lock_irqsave(&ctrl->lock, &flags);
+
+            // Read and process the input report
+            i2c_hid_read_and_process(dev);
+
+            spin_unlock_irqrestore(&ctrl->lock, flags);
+
+            // Clear work_pending (after read, before re-enabling IE)
+            uint64_t dflags;
+            spin_lock_irqsave(&dev->dev_lock, &dflags);
+            dev->work_pending = 0;
+            spin_unlock_irqrestore(&dev->dev_lock, dflags);
+
+            // Re-enable GPI_IE for this device's pin so the next
+            // interrupt can fire.
+            if (dev->gpio_irq_active && dev->gpio_community < g_gpio_community_count) {
+                gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
+                uint16_t ie_base = g_gpio_platform ?
+                    g_gpio_platform->gpi_ie_offset : 0x120;
+                uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
+
+                uint64_t gflags;
+                gflags = local_irq_save();
+                uint32_t ie_before = gpio_comm_read32(comm, ie_reg);
+                uint32_t ie_after = ie_before | (1u << dev->gpio_gpi_bit);
+                gpio_comm_write32(comm, ie_reg, ie_after);
+
+                // Also read back GPI_IS to see if interrupt is already pending
+                uint16_t is_base = g_gpio_platform ?
+                    g_gpio_platform->gpi_is_offset : 0x100;
+                uint32_t is_reg_off = is_base + dev->gpio_gpi_group * 4;
+                uint32_t is_after = gpio_comm_read32(comm, is_reg_off);
+                local_irq_restore(gflags);
+
+                g_dbg_ie_reenable++;
+            }
+        }
+
+        // Throttle: the touchpad's level-triggered INT# re-asserts
+        // almost instantly after each read, so without a delay the
+        // worker spins at ~5000 reads/s for a ~100 Hz device
+        // (36%+ null packets, bus stress, eventual controller lockup).
+        // 2 ms keeps >100 Hz mouse updates while giving the bus and
+        // device firmware breathing room between transfers.
+        i2c_delay_us(2000);
+    }
+
+    kprintf("[I2C-HID] Worker thread exiting for I2C%d\n", ctrl->bus_id);
+}
+
+// ============================================================================
+// GPIO Interrupt Service Routine
+// ============================================================================
+
+void i2c_hid_gpio_irq_handler(uint8_t vector)
+{
+    g_dbg_gpio_isr_count++;
+
+    if (!g_gpio_platform) {
+        lapic_eoi();
+        return;
+    }
+
+    uint16_t is_base = g_gpio_platform->gpi_is_offset;
+    uint16_t ie_base = g_gpio_platform->gpi_ie_offset;
+    int found_any = 0;
 
     for (int d = 0; d < g_i2c_hid_device_count; d++) {
         i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
-        if (!dev->active) continue;
+        if (!dev->active || !dev->gpio_irq_active)
+            continue;
+        if (dev->gpio_irq_vector != vector)
+            continue;
+        if (dev->gpio_community >= g_gpio_community_count)
+            continue;
 
-        // ============================================================
-        // Three-level interrupt check (ISR → hardware IS → polled I2C)
-        // ============================================================
-        if (dev->gpio_irq_active) {
-            int should_read = 0;
+        gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
+        uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
+        uint32_t is_val = gpio_comm_read32(comm, is_reg);
+        uint32_t ie_reg_off = ie_base + dev->gpio_gpi_group * 4;
+        uint32_t ie_cur = gpio_comm_read32(comm, ie_reg_off);
 
-            // Level 1: ISR-driven pending flag (normal fast path)
-            uint8_t was_pending = __sync_lock_test_and_set(
-                &dev->gpio_irq_pending, 0);
-            if (was_pending) {
-                // Only refresh idle timer when the device is healthy.
-                // During error recovery (error_count > 0), keep the
-                // idle timer growing so Level 3 keeps running for
-                // pad repair and device recovery.
-                if (dev->error_count == 0)
-                    last_isr_tick[d] = g_poll_counter;
-                should_read = 1;
+        if (!(is_val & (1u << dev->gpio_gpi_bit))) {
+            // IS bit not set for our pin
+            g_dbg_gpio_isr_miss++;
+            if ((g_dbg_gpio_isr_miss % 100) == 1) {
+                kprintf("[I2C-ISR] miss #%u vec=%u IS=0x%x IE=0x%x "
+                        "bit=%u wp=%d\n",
+                        g_dbg_gpio_isr_miss, vector, is_val, ie_cur,
+                        dev->gpio_gpi_bit, dev->work_pending);
             }
-
-            if (!should_read) {
-                // Level 2: Direct GPI_IS check (catches IOAPIC stuck /
-                // Remote IRR stuck / missed edge).  Cost: 1 MMIO read
-                // (~100ns) — negligible at 100Hz.
-                gpio_community_t *comm =
-                    &g_gpio_communities[dev->gpio_community];
-                if (comm->base) {
-                    uint16_t is_base = g_gpio_platform ?
-                        g_gpio_platform->gpi_is_offset : 0x100;
-                    uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
-                    uint32_t bit = 1u << dev->gpio_gpi_bit;
-                    uint32_t is_val = gpio_comm_read32(comm, is_reg);
-                    if (is_val & bit) {
-                        // Device has data but ISR didn't fire.
-                        // Mimic what the ISR does: mask IE, clear IS.
-                        uint16_t ie_base = g_gpio_platform ?
-                            g_gpio_platform->gpi_ie_offset : 0x120;
-                        uint32_t ie_reg =
-                            ie_base + dev->gpio_gpi_group * 4;
-                        uint64_t flags = local_irq_save();
-                        uint32_t ie = gpio_comm_read32(comm, ie_reg);
-                        gpio_comm_write32(comm, ie_reg, ie & ~bit);
-                        gpio_comm_write32(comm, is_reg, bit);
-                        (void)gpio_comm_read32(comm, ie_reg);
-                        local_irq_restore(flags);
-                        should_read = 1;
-                    }
-                }
-            }
-
-            if (!should_read) {
-                // Level 3: Periodic pad-config verification + polled
-                // I2C read.  Catches HOSTSW_OWN cleared by BIOS/SMI,
-                // PAD_CFG corruption, or device sleep.
-                // Cost: 3-4 MMIO reads + possibly 1 I2C transfer
-                // (~600μs).  Run every 5 ticks (~50ms) when the ISR
-                // hasn't fired recently (>10 ticks = 100ms).
-                uint64_t idle_ticks = g_poll_counter - last_isr_tick[d];
-                if (idle_ticks >= 10 &&
-                    (g_poll_counter % 5) == 0) {
-                    if (gpio_verify_and_repair(dev)) {
-                        kprintf("[I2C-HID] GPIO pad repaired "
-                                "(idle %llu ticks)\n",
-                                (unsigned long long)idle_ticks);
-                    }
-                }
-                // If idle >5s with errors, the device firmware may
-                // have crashed after an I2C abort storm.  Attempt a
-                // single read to probe whether it's alive again.
-                // No SET_POWER, no SET_REPORT — just a normal read.
-                // Rate-limited to once per 500 ticks (~5 seconds).
-                if (idle_ticks >= 500 && dev->error_count > 0 &&
-                    (g_poll_counter % 500) == 0) {
-                    should_read = 1;
-                }
-            }
-
-            if (!should_read)
-                continue;
+            continue;
         }
 
-        // Before doing the I2C transfer, check if the device is still
-        // asserting INT#.  With LEVEL mode, the GPIO ISR fires while
-        // INT# is LOW, but by the time poll runs, the device may have
-        // already deasserted.  Reading with no data pending causes the
-        // controller to timeout (abort_src=0x0, status=0x6).
-        if (dev->gpio_irq_active) {
-            gpio_community_t *comm =
-                &g_gpio_communities[dev->gpio_community];
-            if (comm->base) {
-                uint32_t dw0 = gpio_comm_read32(comm,
-                    dev->gpio_pad_offset + GPIO_PAD_CFG_DW0);
-                if (dw0 & GPIO_DW0_GPIORXSTATE) {
-                    // Pin is HIGH = INT# deasserted = no data.
-                    // Skip the I2C read entirely.
-                    if (dev->gpio_irq_active)
-                        gpio_reenable_ie(dev);
-                    continue;
-                }
-            }
-        }
+        found_any = 1;
+        g_dbg_gpio_isr_hit++;
 
-        // Read ONE report per interrupt.  The device asserts INT# for
-        // each report; trying to read multiple causes a bus error on the
-        // extra read (NACK) when the device has nothing more to send.
-        int rc = i2c_hid_read_input(dev);
-        if (rc < 0) {
-            dev->error_count++;
-        } else {
-            dev->error_count = 0;
-        }
+        // Clear the pending interrupt status (write-1-to-clear)
+        gpio_comm_write32(comm, is_reg, (1u << dev->gpio_gpi_bit));
 
-        // ALWAYS re-enable IE after every read attempt.  The ISR
-        // masks IE atomically before EOI, so at most one ISR fires
-        // per re-enable — no storm possible.  This is how Linux
-        // handles level-triggered GPIO: unmask after every handler
-        // invocation, let the hardware re-assert if needed.
-        if (dev->gpio_irq_active)
-            gpio_reenable_ie(dev);
-    }
+        // Mask GPI_IE for this pin to prevent re-fire until worker processes it
+        uint32_t ie_val = ie_cur & ~(1u << dev->gpio_gpi_bit);
+        gpio_comm_write32(comm, ie_reg_off, ie_val);
 
-    // Periodic heartbeat: print diagnostic status every ~2 seconds
-    if (g_poll_counter >= heartbeat_next) {
-        heartbeat_next = g_poll_counter + 200;
-        for (int d = 0; d < g_i2c_hid_device_count; d++) {
-            i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
-            if (!dev->active || !dev->gpio_irq_active) continue;
-            gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
-            if (!comm->base) continue;
-            uint16_t is_base = g_gpio_platform
-                ? g_gpio_platform->gpi_is_offset : 0x100;
-            uint16_t ie_base = g_gpio_platform
-                ? g_gpio_platform->gpi_ie_offset : 0x120;
-            uint16_t hostsw_base = g_gpio_platform
-                ? g_gpio_platform->hostsw_own_offset : 0x0b0;
-            uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
-            uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
-            uint32_t hsw_reg = hostsw_base + dev->gpio_gpi_group * 4;
-            uint32_t is_val = gpio_comm_read32(comm, is_reg);
-            uint32_t ie_val = gpio_comm_read32(comm, ie_reg);
-            uint32_t hsw_val = gpio_comm_read32(comm, hsw_reg);
-            uint32_t dw0 = gpio_comm_read32(comm,
-                dev->gpio_pad_offset + GPIO_PAD_CFG_DW0);
+        // Set work_pending flag (spinlock-protected)
+        spin_lock(&dev->dev_lock);
+        dev->work_pending = 1;
+        spin_unlock(&dev->dev_lock);
 
-            kprintf("[I2C-HID] HB poll=%llu isr=%u err=%u pend=%u "
-                    "IE=0x%x IS=0x%x HSW=0x%x DW0=0x%x bit=%u\n",
-                    (unsigned long long)g_poll_counter,
-                    g_isr_fire_count, dev->error_count,
-                    dev->gpio_irq_pending,
-                    ie_val, is_val, hsw_val, dw0, dev->gpio_gpi_bit);
+        // Wake the worker thread for this controller
+        sched_wake_channel((void *)dev->ctrl);
+
+        // Log every 50th hit
+        if ((g_dbg_gpio_isr_hit % 50) == 1) {
+            kprintf("[I2C-ISR] hit #%u vec=%u IS=0x%x->clr "
+                    "IE 0x%x->0x%x bit=%u\n",
+                    g_dbg_gpio_isr_hit, vector, is_val,
+                    ie_cur, ie_val, dev->gpio_gpi_bit);
         }
     }
+
+    if (!found_any) {
+        // ISR fired but no device had a pending bit — spurious
+        if ((g_dbg_gpio_isr_count % 100) == 1) {
+            kprintf("[I2C-ISR] spurious #%u vec=%u\n",
+                    g_dbg_gpio_isr_count, vector);
+        }
+    }
+
+    lapic_eoi();
 }
 
 int i2c_hid_has_touchpad(void) {
@@ -3870,3 +3646,4 @@ int i2c_hid_has_touchpad(void) {
 int i2c_hid_device_count(void) {
     return g_i2c_hid_device_count;
 }
+

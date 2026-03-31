@@ -15,6 +15,7 @@
 
 #include "types.h"
 #include "pci.h"
+#include "sched.h"
 
 // ============================================================================
 // Intel LPSS Serial IO I2C PCI Device IDs
@@ -440,6 +441,8 @@ typedef struct {
     volatile uint8_t   xfer_error;  // Transfer error (set by ISR)
     volatile uint32_t  abort_source; // TX_ABRT_SOURCE captured by ISR
     uint16_t           current_target; // Last programmed target addr (0xFFFF = none)
+    spinlock_t         lock;        // Protects I2C bus access (worker thread serialization)
+    volatile int       worker_running; // Worker thread alive flag
 } i2c_dw_controller_t;
 
 // I2C HID device instance
@@ -470,6 +473,13 @@ typedef struct {
     uint32_t             gpio_pad_dw0;     // Expected PAD_CFG_DW0 (critical bits)
     uint16_t             error_count;      // Consecutive I2C transfer errors
     uint32_t             backoff_until;    // Poll counter to skip until (error backoff)
+    spinlock_t           dev_lock;         // Protects device flags (ISR ↔ worker)
+    volatile int         work_pending;     // Set by GPIO ISR, cleared by worker
+    void                *worker_channel;   // Sleep/wake channel for worker thread
+    // Absolute touchpad position tracking (for abs→delta conversion)
+    int32_t              prev_x;           // Previous absolute X
+    int32_t              prev_y;           // Previous absolute Y
+    uint8_t              has_prev_pos;     // 1 if prev_x/prev_y are valid
 } i2c_hid_device_t;
 
 // ============================================================================
@@ -478,9 +488,6 @@ typedef struct {
 
 // Initialize all detected Intel LPSS I2C controllers and probe for HID devices
 int i2c_hid_init(void);
-
-// Poll all active I2C HID devices for input (call from main loop)
-void i2c_hid_poll(void);
 
 // Interrupt handler for I2C controller (called from IDT stub)
 void i2c_hid_irq_handler(uint8_t vector);
