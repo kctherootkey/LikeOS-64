@@ -3483,6 +3483,7 @@ static void i2c_hid_worker_thread(void *arg)
         }
 
         if (!any_pending) {
+            g_dbg_worker_wake++;
             sched_schedule();
             continue;
         }
@@ -3508,44 +3509,48 @@ static void i2c_hid_worker_thread(void *arg)
 
             spin_unlock_irqrestore(&ctrl->lock, flags);
 
-            // Clear work_pending (after read, before re-enabling IE)
+            // Clear work_pending BEFORE the delay so the ISR can set
+            // it again only after we re-enable IE.
             uint64_t dflags;
             spin_lock_irqsave(&dev->dev_lock, &dflags);
             dev->work_pending = 0;
             spin_unlock_irqrestore(&dev->dev_lock, dflags);
-
-            // Re-enable GPI_IE for this device's pin so the next
-            // interrupt can fire.
-            if (dev->gpio_irq_active && dev->gpio_community < g_gpio_community_count) {
-                gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
-                uint16_t ie_base = g_gpio_platform ?
-                    g_gpio_platform->gpi_ie_offset : 0x120;
-                uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
-
-                uint64_t gflags;
-                gflags = local_irq_save();
-                uint32_t ie_before = gpio_comm_read32(comm, ie_reg);
-                uint32_t ie_after = ie_before | (1u << dev->gpio_gpi_bit);
-                gpio_comm_write32(comm, ie_reg, ie_after);
-
-                // Also read back GPI_IS to see if interrupt is already pending
-                uint16_t is_base = g_gpio_platform ?
-                    g_gpio_platform->gpi_is_offset : 0x100;
-                uint32_t is_reg_off = is_base + dev->gpio_gpi_group * 4;
-                uint32_t is_after = gpio_comm_read32(comm, is_reg_off);
-                local_irq_restore(gflags);
-
-                g_dbg_ie_reenable++;
-            }
         }
 
-        // Throttle: the touchpad's level-triggered INT# re-asserts
-        // almost instantly after each read, so without a delay the
-        // worker spins at ~5000 reads/s for a ~100 Hz device
-        // (36%+ null packets, bus stress, eventual controller lockup).
-        // 2 ms keeps >100 Hz mouse updates while giving the bus and
-        // device firmware breathing room between transfers.
-        i2c_delay_us(2000);
+        // ---- Rate-limit: wait with IE masked ----
+        // The touchpad's level-triggered INT# re-asserts instantly
+        // after each read.  If we re-enabled IE immediately, the ISR
+        // would fire before we can block, creating a tight ~500 Hz
+        // polling loop that stresses the I2C bus into eventual lockup.
+        //
+        // Keep IE masked during this gap so no ISR fires.  8 ms gives
+        // the bus and device firmware breathing room and yields a
+        // natural ~100 Hz read rate (matching the touchpad report rate).
+        i2c_delay_us(8000);
+
+        // NOW re-enable GPI_IE — any pending INT# assertion will
+        // fire the ISR which sets work_pending and wakes us.
+        for (int d = 0; d < g_i2c_hid_device_count; d++) {
+            i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+            if (dev->ctrl != ctrl || !dev->active)
+                continue;
+            if (!dev->gpio_irq_active || dev->gpio_community >= g_gpio_community_count)
+                continue;
+
+            gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
+            uint16_t ie_base = g_gpio_platform ?
+                g_gpio_platform->gpi_ie_offset : 0x120;
+            uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
+
+            uint64_t gflags;
+            gflags = local_irq_save();
+            uint32_t ie_val = gpio_comm_read32(comm, ie_reg);
+            gpio_comm_write32(comm, ie_reg,
+                              ie_val | (1u << dev->gpio_gpi_bit));
+            local_irq_restore(gflags);
+
+            g_dbg_ie_reenable++;
+        }
     }
 
     kprintf("[I2C-HID] Worker thread exiting for I2C%d\n", ctrl->bus_id);
