@@ -616,6 +616,10 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
 // Forward declaration for worker thread
 static void i2c_hid_worker_thread(void *arg);
 
+// Forward declaration for length-first I2C HID read
+static int i2c_hid_read_length_first(i2c_hid_device_t *dev,
+                                     uint8_t *buf, uint16_t buf_size);
+
 // Wait for TX FIFO to have space (not full)
 static int dw_i2c_wait_tx_not_full(i2c_dw_controller_t *ctrl, int timeout_us) {
     for (int i = 0; i < timeout_us; i++) {
@@ -1465,21 +1469,32 @@ static int i2c_hid_reset(i2c_hid_device_t *dev) {
     // The device will pull INT low and send a reset-completion 2-byte message
     i2c_delay_us(100000);  // 100ms
 
-    // Read and discard the reset-completion response.
-    // MUST read wMaxInputLength bytes (not just 2) — the device expects
-    // the host to clock out the full buffer, otherwise INT# stays asserted.
-    uint16_t drain_len = dev->desc.wMaxInputLength;
-    if (drain_len < 2) drain_len = 2;
-    if (drain_len > I2C_HID_MAX_REPORT_SIZE) drain_len = I2C_HID_MAX_REPORT_SIZE;
-    uint8_t resp[I2C_HID_MAX_REPORT_SIZE];
-    if (dev->ctrl->use_interrupts)
-        dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0, resp, drain_len);
-    else
-        dw_i2c_xfer(dev->ctrl, dev->i2c_addr, NULL, 0, resp, drain_len);
+    // Read and discard the reset-completion response using length-first
+    // protocol: read 2-byte header, then actual report length.
+    uint16_t resp_buf_size = dev->input_buf_size;
+    if (resp_buf_size < I2C_HID_LENGTH_HDR_SIZE)
+        resp_buf_size = I2C_HID_LENGTH_HDR_SIZE;
+    uint8_t *resp = dev->input_buf;
+    if (!resp) {
+        // Fallback: stack buffer for minimal drain during early init
+        uint8_t resp_stack[I2C_HID_LENGTH_HDR_SIZE];
+        if (dev->ctrl->use_interrupts)
+            dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
+                             resp_stack, I2C_HID_LENGTH_HDR_SIZE);
+        else
+            dw_i2c_xfer(dev->ctrl, dev->i2c_addr, NULL, 0,
+                         resp_stack, I2C_HID_LENGTH_HDR_SIZE);
+        uint16_t rst_len = (uint16_t)resp_stack[0] | ((uint16_t)resp_stack[1] << 8);
+        kprintf("[I2C-HID] RESET completion (minimal): len=%u [%02x %02x]\n",
+                rst_len, resp_stack[0], resp_stack[1]);
+        return 0;
+    }
 
+    int drain_rc = i2c_hid_read_length_first(dev, resp, resp_buf_size);
     uint16_t rst_len = (uint16_t)resp[0] | ((uint16_t)resp[1] << 8);
-    kprintf("[I2C-HID] RESET completion: len=%u [%02x %02x %02x %02x]\n",
-            rst_len, resp[0], resp[1], resp[2], resp[3]);
+    kprintf("[I2C-HID] RESET completion: len=%u rc=%d [%02x %02x %02x %02x]\n",
+            rst_len, drain_rc, resp[0], resp[1],
+            resp_buf_size > 2 ? resp[2] : 0, resp_buf_size > 3 ? resp[3] : 0);
 
     return 0;
 }
@@ -2124,6 +2139,28 @@ static int i2c_hid_init_device(i2c_hid_device_t *dev) {
     i2c_hid_fetch_descriptor(dev->ctrl, dev->i2c_addr,
                               dev->hid_desc_reg, &dev->desc);
 
+    // Allocate dynamic input buffer based on wMaxInputLength
+    {
+        uint16_t alloc_len = dev->desc.wMaxInputLength;
+        if (alloc_len < I2C_HID_LENGTH_HDR_SIZE)
+            alloc_len = I2C_HID_LENGTH_HDR_SIZE;
+        if (dev->input_buf) {
+            slab_free(dev->input_buf);
+            dev->input_buf = NULL;
+        }
+        dev->input_buf = (uint8_t *)slab_alloc(alloc_len);
+        if (!dev->input_buf) {
+            kprintf("[I2C-HID] Failed to allocate input buffer (%u bytes)\n",
+                    alloc_len);
+            return -1;
+        }
+        dev->input_buf_size = alloc_len;
+        i2c_memset(dev->input_buf, 0, alloc_len);
+        kprintf("[I2C-HID] Allocated input buffer: %u bytes "
+                "(wMaxInputLength=%u)\n",
+                alloc_len, dev->desc.wMaxInputLength);
+    }
+
     // Read report descriptor
     dev->report_desc_len = dev->desc.wReportDescLength;
     if (dev->report_desc_len > 0 && dev->report_desc_len <= 4096) {
@@ -2183,26 +2220,17 @@ static int i2c_hid_init_device(i2c_hid_device_t *dev) {
     }
 
     // Drain any pending reports left over from reset / init.
-    {
-        uint16_t drain_max = dev->desc.wMaxInputLength;
-        if (drain_max > I2C_HID_MAX_REPORT_SIZE)
-            drain_max = I2C_HID_MAX_REPORT_SIZE;
-        if (drain_max < 2) drain_max = 2;
-        uint8_t drain_buf[I2C_HID_MAX_REPORT_SIZE];
+    if (dev->input_buf && dev->input_buf_size >= I2C_HID_LENGTH_HDR_SIZE) {
         for (int drain = 0; drain < 10; drain++) {
-            int drc;
-            if (dev->ctrl->use_interrupts)
-                drc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr,
-                                       NULL, 0, drain_buf, drain_max);
-            else
-                drc = dw_i2c_xfer(dev->ctrl, dev->i2c_addr,
-                                   NULL, 0, drain_buf, drain_max);
+            int drc = i2c_hid_read_length_first(dev, dev->input_buf,
+                                                 dev->input_buf_size);
             if (drc < 0) break;
-            uint16_t dlen = (uint16_t)drain_buf[0] |
-                            ((uint16_t)drain_buf[1] << 8);
+            uint16_t dlen = (uint16_t)dev->input_buf[0] |
+                            ((uint16_t)dev->input_buf[1] << 8);
             kprintf("[I2C-HID] drain[%d]: len=%u [%02x %02x %02x %02x]\n",
-                    drain, dlen, drain_buf[0], drain_buf[1],
-                    drain_buf[2], drain_buf[3]);
+                    drain, dlen, dev->input_buf[0], dev->input_buf[1],
+                    drc > 2 ? dev->input_buf[2] : 0,
+                    drc > 3 ? dev->input_buf[3] : 0);
             if (dlen <= 2) break;
         }
     }
@@ -3373,24 +3401,63 @@ static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
     }
 }
 
+// Read from I2C HID device using 2-byte length-first protocol.
+// Reads the 2-byte length prefix first, then reads exactly the reported
+// number of bytes.  This avoids over-reading wMaxInputLength when the
+// actual report is shorter.
+// Returns bytes placed in buf (>= 2), or <0 on I2C error.
+static int i2c_hid_read_length_first(i2c_hid_device_t *dev,
+                                     uint8_t *buf, uint16_t buf_size)
+{
+    uint8_t hdr[I2C_HID_LENGTH_HDR_SIZE];
+    int rc;
+
+    // Step 1: Read 2-byte length prefix
+    if (dev->ctrl->use_interrupts)
+        rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
+                              hdr, I2C_HID_LENGTH_HDR_SIZE);
+    else
+        rc = dw_i2c_xfer(dev->ctrl, dev->i2c_addr, NULL, 0,
+                          hdr, I2C_HID_LENGTH_HDR_SIZE);
+    if (rc < 0) return rc;
+
+    uint16_t pkt_len = (uint16_t)hdr[0] | ((uint16_t)hdr[1] << 8);
+
+    // Null / invalid / header-only packet — return just the header
+    if (pkt_len == 0 || pkt_len == 0xFFFF || pkt_len <= I2C_HID_LENGTH_HDR_SIZE) {
+        buf[0] = hdr[0];
+        buf[1] = hdr[1];
+        return I2C_HID_LENGTH_HDR_SIZE;
+    }
+
+    // Clamp to caller's buffer
+    if (pkt_len > buf_size)
+        pkt_len = buf_size;
+
+    // Step 2: Read the full report (device re-sends from the beginning)
+    if (dev->ctrl->use_interrupts)
+        rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
+                              buf, pkt_len);
+    else
+        rc = dw_i2c_xfer(dev->ctrl, dev->i2c_addr, NULL, 0,
+                          buf, pkt_len);
+    if (rc < 0) return rc;
+
+    return (int)pkt_len;
+}
+
 // Read one input report from the device and process it
 static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
 {
-    uint16_t max_len = dev->desc.wMaxInputLength;
-    if (max_len == 0 || max_len > I2C_HID_MAX_REPORT_SIZE)
-        max_len = I2C_HID_MAX_REPORT_SIZE;
+    uint16_t buf_size = dev->input_buf_size;
+    if (buf_size < I2C_HID_LENGTH_HDR_SIZE || !dev->input_buf)
+        return;
 
-    uint8_t buf[I2C_HID_MAX_REPORT_SIZE];
-    i2c_memset(buf, 0, max_len);
+    uint8_t *buf = dev->input_buf;
+    i2c_memset(buf, 0, buf_size);
 
-    // Raw I2C read: the device sends the input report automatically
-    int rc;
-    if (dev->ctrl->use_interrupts)
-        rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr,
-                              NULL, 0, buf, max_len);
-    else
-        rc = dw_i2c_xfer(dev->ctrl, dev->i2c_addr,
-                          NULL, 0, buf, max_len);
+    // Read using 2-byte length-first protocol
+    int rc = i2c_hid_read_length_first(dev, buf, buf_size);
 
     g_dbg_worker_read++;
 
@@ -3415,7 +3482,7 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
     }
 
     // Clamp to buffer
-    if (pkt_len > max_len) pkt_len = max_len;
+    if (pkt_len > buf_size) pkt_len = buf_size;
 
     // Data starts after the 2-byte length prefix
     const uint8_t *data = buf + 2;
