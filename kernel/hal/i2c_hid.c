@@ -19,6 +19,7 @@
 #include "../../include/kernel/ioapic.h"
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/timer.h"
 
 // Debug counters for interrupt-driven I2C HID
 static volatile uint32_t g_dbg_gpio_isr_count = 0;     // Total GPIO ISR invocations
@@ -33,6 +34,12 @@ static volatile uint32_t g_dbg_worker_id_mismatch = 0; // Report ID mismatch
 static volatile uint32_t g_dbg_worker_processed = 0;   // Reports processed into mouse
 static volatile uint32_t g_dbg_worker_no_finger = 0;   // Reports skipped (no finger)
 static volatile uint32_t g_dbg_ie_reenable = 0;        // GPI_IE re-enabled count
+static volatile uint32_t g_dbg_i2c_isr_count = 0;      // Total I2C controller ISR invocations
+static volatile uint32_t g_dbg_xfer_abort_count = 0;   // Total xfer abort events
+static volatile uint32_t g_dbg_xfer_retry_count = 0;   // Total xfer retries
+static volatile uint32_t g_dbg_xfer_total = 0;         // Total xfer calls
+static volatile uint32_t g_dbg_xfer_ok = 0;            // Successful xfers
+static volatile uint64_t g_dbg_last_print_uptime = 0;  // Last periodic debug print time
 
 // ============================================================================
 // Private data
@@ -698,12 +705,17 @@ retry_xfer:
     dw_i2c_set_target(ctrl, addr);
 
     // ---- Write phase ----
+    // Push slave address (implicit) + register bytes.
+    // Do NOT issue STOP here when a read phase follows — the bus must
+    // stay active so the read phase can begin with a RESTART.
+    // Only issue STOP on the last write byte for write-only transfers.
     for (int i = 0; i < wlen; i++) {
         uint32_t cmd = (uint32_t)wbuf[i];
 
         // If this is the last write byte AND there's no read phase, send STOP
         if (i == wlen - 1 && rlen == 0)
             cmd |= DW_IC_DATA_CMD_STOP;
+        // No STOP when rlen > 0: RESTART will bridge write→read
 
         rc = dw_i2c_wait_tx_not_full(ctrl, 50000);
         if (rc < 0) goto abort;
@@ -712,12 +724,18 @@ retry_xfer:
     }
 
     // ---- Read phase ----
+    // RESTART replaces STOP between write and read — bus remains active.
+    // The controller sends ACK for every byte except the last, where
+    // STOP is issued (hardware sends NACK + STOP on the final byte).
     int rx_remain = rlen;
     int rx_idx = 0;
     int tx_issued = 0;
 
     while (rx_remain > 0 || tx_issued < rlen) {
-        // Issue read commands (fill TX FIFO with read requests)
+        // Issue read commands into the command queue.
+        // First read gets RESTART (transitions from write to read
+        // on the same slave address without releasing the bus).
+        // Last read gets STOP (controller sends NACK then STOP).
         while (tx_issued < rlen) {
             uint32_t cmd = DW_IC_DATA_CMD_READ;
 
@@ -725,7 +743,7 @@ retry_xfer:
             if (tx_issued == 0 && wlen > 0)
                 cmd |= DW_IC_DATA_CMD_RESTART;
 
-            // STOP on last read
+            // NACK + STOP on last read byte
             if (tx_issued == rlen - 1)
                 cmd |= DW_IC_DATA_CMD_STOP;
 
@@ -2263,6 +2281,7 @@ void i2c_hid_irq_handler(uint8_t vector) {
 
         // Read and clear interrupt status
         uint32_t stat = dw_read(ctrl, DW_IC_INTR_STAT);
+        g_dbg_i2c_isr_count++;
 
         if (stat & DW_IC_INTR_TX_ABRT) {
             ctrl->abort_source = dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
@@ -2307,7 +2326,9 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
     int timeout;
     int retry = 0;
 
-retry_xfer:
+    g_dbg_xfer_total++;
+
+//retry_xfer:
     dw_i2c_set_target(ctrl, addr);
 
     // Clear state flags
@@ -2323,10 +2344,15 @@ retry_xfer:
     dw_i2c_wait_idle(ctrl, 10000);
 
     // ---- Write phase ----
+    // Push slave address (implicit) + register bytes.
+    // Do NOT issue STOP here when a read phase follows — the bus must
+    // stay active so the read phase can begin with a RESTART.
+    // Only issue STOP on the last write byte for write-only transfers.
     for (int i = 0; i < wlen; i++) {
         uint32_t cmd = (uint32_t)wbuf[i];
         if (i == wlen - 1 && rlen == 0)
             cmd |= DW_IC_DATA_CMD_STOP;
+        // No STOP when rlen > 0: RESTART will bridge write→read
 
         // Wait for TX FIFO space
         for (timeout = 0; timeout < 200000; timeout++) {
@@ -2341,6 +2367,9 @@ retry_xfer:
     }
 
     // ---- Read phase with interrupt-driven RX ----
+    // RESTART replaces STOP between write and read — bus remains active.
+    // The controller sends ACK for every byte except the last, where
+    // STOP is issued (hardware sends NACK + STOP on the final byte).
     int rx_idx = 0;
     int tx_issued = 0;
 
@@ -2350,7 +2379,10 @@ retry_xfer:
                  DW_IC_INTR_RX_FULL | DW_IC_INTR_TX_ABRT | DW_IC_INTR_STOP_DET);
 
         while (rx_idx < rlen) {
-            // Issue read commands
+            // Issue read commands into the command queue.
+            // First read gets RESTART (transitions from write to read
+            // on the same slave address without releasing the bus).
+            // Last read gets STOP (controller sends NACK then STOP).
             while (tx_issued < rlen) {
                 uint32_t cmd = DW_IC_DATA_CMD_READ;
                 if (tx_issued == 0 && wlen > 0)
@@ -2409,34 +2441,110 @@ retry_xfer:
 
     // Wait for bus idle
     dw_i2c_wait_idle(ctrl, 10000);
+    g_dbg_xfer_ok++;
     return 0;
 
 abort:
     {
+        // 1. Read abort reason (must read before clearing)
         uint32_t abort_src = dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
         // If the I2C ISR already read and cleared TX_ABRT_SOURCE (race
         // between ISR and this handler), use the ISR-saved value.
         if (abort_src == 0 && ctrl->xfer_error)
             abort_src = ctrl->abort_source;
-        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-        (void)dw_read(ctrl, DW_IC_CLR_INTR);
+
+        // 2. Disable all interrupts for this transfer
         dw_write(ctrl, DW_IC_INTR_MASK, 0);
+
+        // 3. Disable controller — waits for IC_ENABLE_STATUS to confirm.
+        //    This flushes the TX FIFO and triggers STOP on the bus.
+        dw_write(ctrl, DW_IC_ENABLE, 0);
+        for (int w = 0; w < 10000; w++) {
+            if ((dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN) == 0)
+                break;
+            // Fallback: IC_ENABLE readback 0 means disabled
+            if (dw_read(ctrl, DW_IC_ENABLE) == 0)
+                break;
+            i2c_delay_us(1);
+        }
+
+        // 4. Clear all pending interrupts
+        (void)dw_read(ctrl, DW_IC_CLR_INTR);
+
+        // 5. Clear abort flag explicitly
+        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+
+        // 6. Flush RX FIFO — discard any stale data
         while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
             (void)dw_read(ctrl, DW_IC_DATA_CMD);
-        // Reset controller state machine (Linux i2c-designware does this
-        // after every abort to clear the hardware FIFO and bus state)
-        dw_i2c_disable(ctrl);
-        i2c_delay_us(1000);  // 1ms — give device firmware time to reset
-        dw_i2c_enable(ctrl);
-        ctrl->current_target = 0xFFFF;  // Force re-program after reset
-        ctrl->abort_source = abort_src;  // Save for caller diagnostics
-        // Retry once on NACK, ARB_LOST, or pure timeout (abort_src==0
-        // means the hardware didn't report an error but we timed out
-        // waiting for RX data — transient, worth one retry).
-        if (retry < 1) {
-            retry++;
-            goto retry_xfer;
+
+        // 6b. Issue an explicit STOP on the bus.  Re-enable the controller
+        //     briefly, push a dummy read command with STOP, then disable
+        //     again.  This ensures the bus is released even if the abort
+        //     did not generate an automatic STOP condition.
+        dw_write(ctrl, DW_IC_ENABLE, 1);
+        for (int w = 0; w < 5000; w++) {
+            if (dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN)
+                break;
+            if (dw_read(ctrl, DW_IC_ENABLE) == 1)
+                break;
+            i2c_delay_us(1);
         }
+        dw_write(ctrl, DW_IC_DATA_CMD, DW_IC_DATA_CMD_STOP);
+        i2c_delay_us(200);  // Let STOP propagate on the bus
+        dw_write(ctrl, DW_IC_ENABLE, 0);
+        for (int w = 0; w < 10000; w++) {
+            if ((dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN) == 0)
+                break;
+            if (dw_read(ctrl, DW_IC_ENABLE) == 0)
+                break;
+            i2c_delay_us(1);
+        }
+        // Clear any status from the STOP command
+        (void)dw_read(ctrl, DW_IC_CLR_INTR);
+        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+
+        // 7. Re-init key registers (controller must be disabled to write these)
+        dw_write(ctrl, DW_IC_TAR, addr & 0x7F);
+        dw_write(ctrl, DW_IC_CON, DW_IC_CON_MASTER | DW_IC_CON_SPEED_SS |
+                                  DW_IC_CON_RESTART_EN | DW_IC_CON_SLAVE_DISABLE);
+
+        // 8. Re-enable controller
+        dw_write(ctrl, DW_IC_ENABLE, 1);
+        for (int w = 0; w < 10000; w++) {
+            if (dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN)
+                break;
+            if (dw_read(ctrl, DW_IC_ENABLE) == 1)
+                break;
+            i2c_delay_us(1);
+        }
+
+        // 9. Save error state for caller diagnostics
+        ctrl->current_target = addr;  // TAR was just re-programmed
+        ctrl->abort_source = abort_src;
+        ctrl->xfer_error = 0;
+        ctrl->irq_pending = 0;
+        ctrl->tx_complete = 0;
+        ctrl->rx_ready = 0;
+
+        g_dbg_xfer_abort_count++;
+
+        kprintf("[I2C-XFER] ABORT bus=%u addr=0x%02x abort_src=0x%08x "
+                "rx=%d/%d tx=%d/%d retry=%d "
+                "isr=%u gpio_isr=%u hit=%u miss=%u\n",
+                ctrl->bus_id, addr, abort_src,
+                rx_idx, rlen, tx_issued, rlen, retry,
+                g_dbg_i2c_isr_count, g_dbg_gpio_isr_count,
+                g_dbg_gpio_isr_hit, g_dbg_gpio_isr_miss);
+
+        // 10. Retry once on NACK, ARB_LOST, or pure timeout (abort_src==0
+        //     means the hardware didn't report an error but we timed out
+        //     waiting for RX data — transient, worth one retry).
+        /*if (retry < 1) {
+            retry++;
+            g_dbg_xfer_retry_count++;
+            goto retry_xfer;
+        }*/
         return -1;
     }
 }
@@ -3550,6 +3658,30 @@ static void i2c_hid_worker_thread(void *arg)
         }
 
         if (!any_pending) {
+            // Periodic debug print (every 1 second) even when idle
+            uint64_t now = timer_get_uptime();
+            if (now > g_dbg_last_print_uptime) {
+                g_dbg_last_print_uptime = now;
+                kprintf("[I2C-DBG] t=%llu "
+                        "i2c_isr=%u gpio_isr=%u hit=%u miss=%u "
+                        "wake=%u read=%u proc=%u nofing=%u "
+                        "xfer: tot=%u ok=%u err=%u abort=%u retry=%u "
+                        "null=%u nid=%u idmm=%u ie=%u\n",
+                        (unsigned long long)now,
+                        g_dbg_i2c_isr_count, g_dbg_gpio_isr_count,
+                        g_dbg_gpio_isr_hit, g_dbg_gpio_isr_miss,
+                        g_dbg_worker_wake, g_dbg_worker_read,
+                        g_dbg_worker_processed, g_dbg_worker_no_finger,
+                        g_dbg_xfer_total, g_dbg_xfer_ok,
+                        g_dbg_worker_xfer_err, g_dbg_xfer_abort_count,
+                        g_dbg_xfer_retry_count,
+                        g_dbg_worker_null_pkt, g_dbg_worker_null_id,
+                        g_dbg_worker_id_mismatch, g_dbg_ie_reenable);
+            }
+            // Set wakeup_tick so the timer IRQ wakes us after ~1 second
+            // even if no GPIO interrupt fires. Without this, the thread
+            // stays BLOCKED forever when idle and never prints.
+            self->wakeup_tick = timer_ticks() + timer_get_frequency();
             g_dbg_worker_wake++;
             sched_schedule();
             continue;
