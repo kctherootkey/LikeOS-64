@@ -367,8 +367,8 @@ typedef struct __attribute__((packed)) {
 #define I2C_HID_DESC_REG_0020      0x0020
 #define I2C_HID_DESC_REG_0030      0x0030
 
-// Max input report size we support
-#define I2C_HID_MAX_REPORT_SIZE    256
+// Minimum length-header read size (2 bytes for HID-over-I2C length prefix)
+#define I2C_HID_LENGTH_HDR_SIZE    2
 
 // ============================================================================
 // Minimal HID Report Descriptor Parser structures
@@ -460,7 +460,8 @@ typedef struct {
     uint8_t              input_mode_rid; // Report ID for Input Mode feature (0=none)
     uint8_t              input_mode_size; // Total feature report size in bytes
     char                 acpi_path[64]; // ACPI device path (e.g. "_SB.PC00.I2C3.TPD0")
-    uint8_t              input_buf[I2C_HID_MAX_REPORT_SIZE];
+    uint8_t             *input_buf;        // Dynamically allocated (wMaxInputLength)
+    uint16_t             input_buf_size;    // Size of input_buf in bytes
     // GPIO interrupt binding (from ACPI _CRS GpioInt)
     uint16_t             gpio_pin;         // GPIO pad number
     uint8_t              gpio_community;   // GPIO community index (0-5)
