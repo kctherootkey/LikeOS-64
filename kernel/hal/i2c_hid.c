@@ -5,7 +5,7 @@
 // DesignWare I2C IP core, scans I2C buses for HID devices, and injects
 // mouse/touchpad input into the existing input subsystems.
 //
-// I2C transfers use standard mode (100kHz) with interrupt-driven GPIO
+// I2C transfers use fast mode (400kHz) with interrupt-driven GPIO
 // handling.  Worker threads perform I2C reads; no polling from main loop.
 
 #include "../../include/kernel/i2c_hid.h"
@@ -544,14 +544,20 @@ static int dw_i2c_init_controller(i2c_dw_controller_t *ctrl) {
     ctrl->tx_fifo_depth = tx_depth;
 
     // ---- Step 7: Configure controller ----
-    // Master mode, standard speed (100kHz), 7-bit addressing, restart enable
-    uint32_t ic_con = DW_IC_CON_MASTER | DW_IC_CON_SPEED_SS |
+    // Master mode, fast speed (400kHz), 7-bit addressing, restart enable
+    uint32_t ic_con = DW_IC_CON_MASTER | DW_IC_CON_SPEED_FS |
                       DW_IC_CON_RESTART_EN | DW_IC_CON_SLAVE_DISABLE;
     dw_write(ctrl, DW_IC_CON, ic_con);
 
-    // Standard mode SCL timing (100kHz, per PCH 600/700 datasheet defaults)
+    // Standard mode SCL timing (100kHz fallback, not used in FS mode)
     dw_write(ctrl, DW_IC_SS_SCL_HCNT, 500);
     dw_write(ctrl, DW_IC_SS_SCL_LCNT, 588);
+
+    // Fast mode SCL timing (400kHz, derived from IC_CLK ~110MHz)
+    // tHIGH = (HCNT + SPKLEN + 7) / IC_CLK >= 0.6µs
+    // tLOW  = (LCNT + 1)            / IC_CLK >= 1.3µs
+    dw_write(ctrl, DW_IC_FS_SCL_HCNT, 80);
+    dw_write(ctrl, DW_IC_FS_SCL_LCNT, 186);
 
     // SDA hold time
     dw_write(ctrl, DW_IC_SDA_HOLD, 0x001C001C);
@@ -665,28 +671,27 @@ static int dw_i2c_wait_idle(i2c_dw_controller_t *ctrl, int timeout_us) {
 }
 
 // Set target address and enable controller.
-// Like Linux i2c-designware-master.c: skip the disable/enable cycle
-// when the target address hasn't changed.  The disable/enable sends
-// an ABORT on the bus and takes ~300µs; at 100 reads/sec (LEVEL mode)
-// that's 30ms/sec wasted + bus disruption that causes silent data loss.
+// Always disable → set TAR → re-enable for a clean bus state.
+// This matches Linux i2c-designware-master.c i2c_dw_xfer_init().
 static int dw_i2c_set_target(i2c_dw_controller_t *ctrl, uint16_t addr) {
-    if (ctrl->current_target == addr) {
-        // Same address — just clear stale status, no bus disruption
-        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-        (void)dw_read(ctrl, DW_IC_CLR_INTR);
-        return 0;
-    }
-
     dw_i2c_disable(ctrl);
 
-    // Clear any stale abort status
+    // Clear any stale abort/interrupt status
     (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
     (void)dw_read(ctrl, DW_IC_CLR_INTR);
+
+    // Flush RX FIFO — discard stale data from previous transfer
+    while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
+        (void)dw_read(ctrl, DW_IC_DATA_CMD);
 
     // Set target address (7-bit)
     dw_write(ctrl, DW_IC_TAR, addr & 0x7F);
 
     dw_i2c_enable(ctrl);
+
+    // Clear interrupts again after enable (like Linux)
+    (void)dw_read(ctrl, DW_IC_CLR_INTR);
+
     ctrl->current_target = addr;
     return 0;
 }
@@ -2845,226 +2850,193 @@ void i2c_hid_irq_handler(uint8_t vector) {
 
 // Interrupt-driven write-then-read transfer
 // Uses interrupts to wait for TX/RX completion instead of busy-waiting
+// ============================================================================
+// Interrupt-driven I2C transfer — modeled after Linux i2c-designware-master.c
+//
+// Key design principles from Linux:
+// 1. Always disable + set TAR + re-enable before each transfer (clean bus)
+// 2. Wait for bus-not-busy before starting
+// 3. ISR reads+saves abort_source before clearing TX_ABRT
+// 4. Feed read commands respecting TX FIFO level (DW_IC_TXFLR) and
+//    RX FIFO available space (rx_fifo_depth - DW_IC_RXFLR)
+// 5. On abort: just disable, clear interrupts, return error
+//    (no dummy STOP, no IC_CON re-init — next transfer's disable handles it)
+// 6. Retry with a settle delay, not immediately
+// ============================================================================
 static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
                             const uint8_t *wbuf, int wlen,
                             uint8_t *rbuf, int rlen)
 {
     int timeout;
     int retry = 0;
+    int rx_idx = 0;
+    int tx_issued = 0;
 
     g_dbg_xfer_total++;
 
 retry_xfer:
+    rx_idx = 0;
+    tx_issued = 0;
+
+    // ---- Step 1: Wait for bus not busy (like Linux i2c_dw_wait_bus_not_busy) ----
+    // Check DW_IC_STATUS: MST_ACTIVITY should be clear.
+    // If the bus is stuck from a previous abort, this will detect it.
+    for (timeout = 0; timeout < 25000; timeout++) {
+        uint32_t st = dw_read(ctrl, DW_IC_STATUS);
+        if (!(st & DW_IC_STATUS_MST_ACTIVITY))
+            break;
+        i2c_delay_us(1);
+    }
+
+    // ---- Step 2: Init transfer (like Linux i2c_dw_xfer_init) ----
+    // Disable → set TAR → enable → clear interrupts
     dw_i2c_set_target(ctrl, addr);
 
-    // Clear state flags
+    // Clear transfer state AFTER set_target (which clears HW state)
     ctrl->irq_pending = 0;
     ctrl->tx_complete = 0;
     ctrl->rx_ready = 0;
     ctrl->xfer_error = 0;
-    ctrl->abort_source = 0;
+    // Note: do NOT clear ctrl->abort_source here — it's set by the ISR
+    // and we read it in the abort handler. The ISR writes it atomically
+    // on TX_ABRT before we ever check it.
 
-    // Ensure bus is idle before starting a new transfer.
-    // With set_target skip (no disable/enable), the previous transfer's
-    // STOP may still be in-flight.  Wait for master to be inactive.
-    dw_i2c_wait_idle(ctrl, 10000);
+    // ---- Step 3: Unmask IOAPIC for this transfer ----
+    if (ctrl->irq_gsi)
+        ioapic_unmask_gsi((uint8_t)ctrl->irq_gsi);
 
-    // ---- Write phase ----
-    // Push slave address (implicit) + register bytes.
-    // Do NOT issue STOP here when a read phase follows — the bus must
-    // stay active so the read phase can begin with a RESTART.
-    // Only issue STOP on the last write byte for write-only transfers.
+    // Enable interrupts: RX_FULL, TX_ABRT, STOP_DET
+    // (like Linux DW_IC_INTR_DEFAULT_MASK)
+    dw_write(ctrl, DW_IC_INTR_MASK,
+             DW_IC_INTR_RX_FULL | DW_IC_INTR_TX_ABRT | DW_IC_INTR_STOP_DET);
+
+    // ---- Step 4: Write phase ----
     for (int i = 0; i < wlen; i++) {
         uint32_t cmd = (uint32_t)wbuf[i];
+        // STOP only on last write byte of write-only transfer
         if (i == wlen - 1 && rlen == 0)
             cmd |= DW_IC_DATA_CMD_STOP;
-        // No STOP when rlen > 0: RESTART will bridge write→read
 
-        // Wait for TX FIFO space
-        for (timeout = 0; timeout < 200000; timeout++) {
-            if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_TFNF)
-                break;
+        // Wait for TX FIFO space (check TXFLR, not just TFNF)
+        for (timeout = 0; timeout < 50000; timeout++) {
             if (ctrl->xfer_error) goto abort;
+            if (dw_read(ctrl, DW_IC_TXFLR) < ctrl->tx_fifo_depth)
+                break;
             i2c_delay_us(1);
         }
-        if (timeout >= 200000) goto abort;
+        if (timeout >= 50000) goto abort;
 
         dw_write(ctrl, DW_IC_DATA_CMD, cmd);
     }
 
-    // ---- Read phase with interrupt-driven RX ----
-    // RESTART replaces STOP between write and read — bus remains active.
-    // The controller sends ACK for every byte except the last, where
-    // STOP is issued (hardware sends NACK + STOP on the final byte).
-    int rx_idx = 0;
-    int tx_issued = 0;
+    // ---- Step 5: Read phase (like Linux i2c_dw_xfer_msg + i2c_dw_read) ----
+    // Feed read commands respecting both TX and RX FIFO limits.
+    // Linux checks: tx_limit = tx_fifo_depth - TXFLR
+    //               rx_limit = rx_fifo_depth - RXFLR
+    while (rx_idx < rlen) {
+        // Issue read commands, respecting FIFO limits
+        while (tx_issued < rlen) {
+            uint32_t tx_limit = ctrl->tx_fifo_depth - dw_read(ctrl, DW_IC_TXFLR);
+            uint32_t rx_limit = ctrl->rx_fifo_depth - dw_read(ctrl, DW_IC_RXFLR);
 
-    if (rlen > 0) {
-        // Unmask IOAPIC entry for this transfer (masked when idle to
-        // prevent ISR storm from Intel LPSS DW interrupt output quirk).
-        if (ctrl->irq_gsi)
-            ioapic_unmask_gsi((uint8_t)ctrl->irq_gsi);
+            if (tx_limit == 0 || rx_limit == 0)
+                break;
 
-        // Enable RX_FULL and TX_ABRT interrupts
-        dw_write(ctrl, DW_IC_INTR_MASK,
-                 DW_IC_INTR_RX_FULL | DW_IC_INTR_TX_ABRT | DW_IC_INTR_STOP_DET);
+            uint32_t cmd = DW_IC_DATA_CMD_READ;
+            if (tx_issued == 0 && wlen > 0)
+                cmd |= DW_IC_DATA_CMD_RESTART;
+            if (tx_issued == rlen - 1)
+                cmd |= DW_IC_DATA_CMD_STOP;
 
-        while (rx_idx < rlen) {
-            // Issue read commands into the command queue.
-            // First read gets RESTART (transitions from write to read
-            // on the same slave address without releasing the bus).
-            // Last read gets STOP (controller sends NACK then STOP).
-            while (tx_issued < rlen) {
-                uint32_t cmd = DW_IC_DATA_CMD_READ;
-                if (tx_issued == 0 && wlen > 0)
-                    cmd |= DW_IC_DATA_CMD_RESTART;
-                if (tx_issued == rlen - 1)
-                    cmd |= DW_IC_DATA_CMD_STOP;
+            dw_write(ctrl, DW_IC_DATA_CMD, cmd);
+            tx_issued++;
 
-                if (!(dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_TFNF))
-                    break;
-
-                dw_write(ctrl, DW_IC_DATA_CMD, cmd);
-                tx_issued++;
-
-                if (tx_issued - rx_idx >= (int)ctrl->tx_fifo_depth - 1)
-                    break;
-            }
-
-            // Wait for RX data via interrupt or poll fallback
-            ctrl->rx_ready = 0;
-            for (timeout = 0; timeout < 200000; timeout++) {
-                if (ctrl->xfer_error) {
-                    dw_write(ctrl, DW_IC_INTR_MASK, 0);
-                    goto abort;
-                }
-                // Check RX FIFO directly (in case interrupt was coalesced)
-                if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
-                    break;
-                if (ctrl->rx_ready)
-                    break;
-                // Direct abort check — catches TX_ABRT even if MSI
-                // delivery is delayed (no dependency on ISR)
-                if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT) {
-                    dw_write(ctrl, DW_IC_INTR_MASK, 0);
-                    goto abort;
-                }
-                i2c_delay_us(1);
-            }
-            if (timeout >= 200000) {
-                dw_write(ctrl, DW_IC_INTR_MASK, 0);
-                goto abort;
-            }
-
-            // Drain RX FIFO
-            while (rx_idx < rlen &&
-                   (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)) {
-                uint32_t data = dw_read(ctrl, DW_IC_DATA_CMD);
-                if (rbuf)
-                    rbuf[rx_idx] = (uint8_t)(data & 0xFF);
-                rx_idx++;
-            }
+            // Don't queue more than rx_fifo_depth outstanding reads
+            if (tx_issued - rx_idx >= (int)ctrl->rx_fifo_depth)
+                break;
         }
 
-        // Disable interrupts after transfer
-        dw_write(ctrl, DW_IC_INTR_MASK, 0);
+        // Wait for RX data — check both ISR flag and hardware status
+        for (timeout = 0; timeout < 50000; timeout++) {
+            if (ctrl->xfer_error)
+                goto abort;
+            if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
+                break;
+            if (ctrl->rx_ready)
+                break;
+            i2c_delay_us(1);
+        }
+        if (timeout >= 50000)
+            goto abort;
 
-        // Re-mask IOAPIC to prevent ISR storm while idle
-        if (ctrl->irq_gsi)
-            ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
+        // Drain RX FIFO (like Linux i2c_dw_read using RXFLR)
+        ctrl->rx_ready = 0;
+        uint32_t rx_valid = dw_read(ctrl, DW_IC_RXFLR);
+        while (rx_idx < rlen && rx_valid > 0) {
+            uint32_t data = dw_read(ctrl, DW_IC_DATA_CMD);
+            if (rbuf)
+                rbuf[rx_idx] = (uint8_t)(data & 0xFF);
+            rx_idx++;
+            rx_valid--;
+        }
     }
 
-    // Wait for bus idle
-    dw_i2c_wait_idle(ctrl, 10000);
+    // ---- Step 6: Wait for STOP_DET / bus idle ----
+    for (timeout = 0; timeout < 25000; timeout++) {
+        uint32_t st = dw_read(ctrl, DW_IC_STATUS);
+        if (!(st & DW_IC_STATUS_MST_ACTIVITY))
+            break;
+        i2c_delay_us(1);
+    }
+
+    // ---- Step 7: Disable interrupts, mask IOAPIC ----
+    dw_write(ctrl, DW_IC_INTR_MASK, 0);
+    if (ctrl->irq_gsi)
+        ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
+
     g_dbg_xfer_ok++;
     return 0;
 
 abort:
     {
-        // 1. Read abort reason (must read before clearing)
-        uint32_t abort_src = dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
-        // If the I2C ISR already read and cleared TX_ABRT_SOURCE (race
-        // between ISR and this handler), use the ISR-saved value.
-        if (abort_src == 0 && ctrl->xfer_error)
-            abort_src = ctrl->abort_source;
-
-        // 2. Disable all interrupts for this transfer
-        dw_write(ctrl, DW_IC_INTR_MASK, 0);
-
-        // 3. Disable controller — waits for IC_ENABLE_STATUS to confirm.
-        //    This flushes the TX FIFO and triggers STOP on the bus.
-        dw_write(ctrl, DW_IC_ENABLE, 0);
-        for (int w = 0; w < 10000; w++) {
-            if ((dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN) == 0)
-                break;
-            // Fallback: IC_ENABLE readback 0 means disabled
-            if (dw_read(ctrl, DW_IC_ENABLE) == 0)
-                break;
-            i2c_delay_us(1);
+        // ---- Abort handling (like Linux i2c_dw_xfer error path) ----
+        // Read abort source: prefer ISR-saved value (ISR reads before clearing),
+        // fall back to direct register read (may be stale if ISR already cleared).
+        uint32_t abort_src = ctrl->abort_source;
+        if (abort_src == 0) {
+            // ISR hasn't seen it yet, or no TX_ABRT — read directly
+            abort_src = dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
         }
 
-        // 4. Clear all pending interrupts
-        (void)dw_read(ctrl, DW_IC_CLR_INTR);
+        // Disable all interrupts
+        dw_write(ctrl, DW_IC_INTR_MASK, 0);
 
-        // 5. Clear abort flag explicitly
+        // Re-mask IOAPIC
+        if (ctrl->irq_gsi)
+            ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
+
+        // Disable controller — this flushes TX FIFO and generates STOP.
+        // Like Linux: just __i2c_dw_disable(). No dummy STOP, no IC_CON re-init.
+        dw_i2c_disable(ctrl);
+
+        // Clear all pending interrupt and abort status
+        (void)dw_read(ctrl, DW_IC_CLR_INTR);
         (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
 
-        // 6. Flush RX FIFO — discard any stale data
+        // Flush RX FIFO
         while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
             (void)dw_read(ctrl, DW_IC_DATA_CMD);
 
-        // 6b. Issue an explicit STOP on the bus.  Re-enable the controller
-        //     briefly, push a dummy read command with STOP, then disable
-        //     again.  This ensures the bus is released even if the abort
-        //     did not generate an automatic STOP condition.
-        dw_write(ctrl, DW_IC_ENABLE, 1);
-        for (int w = 0; w < 5000; w++) {
-            if (dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN)
-                break;
-            if (dw_read(ctrl, DW_IC_ENABLE) == 1)
-                break;
-            i2c_delay_us(1);
-        }
-        dw_write(ctrl, DW_IC_DATA_CMD, DW_IC_DATA_CMD_STOP);
-        i2c_delay_us(200);  // Let STOP propagate on the bus
-        dw_write(ctrl, DW_IC_ENABLE, 0);
-        for (int w = 0; w < 10000; w++) {
-            if ((dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN) == 0)
-                break;
-            if (dw_read(ctrl, DW_IC_ENABLE) == 0)
-                break;
-            i2c_delay_us(1);
-        }
-        // Clear any status from the STOP command
-        (void)dw_read(ctrl, DW_IC_CLR_INTR);
-        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-
-        // 7. Re-init key registers (controller must be disabled to write these)
-        dw_write(ctrl, DW_IC_TAR, addr & 0x7F);
-        dw_write(ctrl, DW_IC_CON, DW_IC_CON_MASTER | DW_IC_CON_SPEED_SS |
-                                  DW_IC_CON_RESTART_EN | DW_IC_CON_SLAVE_DISABLE);
-
-        // 8. Re-enable controller
-        dw_write(ctrl, DW_IC_ENABLE, 1);
-        for (int w = 0; w < 10000; w++) {
-            if (dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN)
-                break;
-            if (dw_read(ctrl, DW_IC_ENABLE) == 1)
-                break;
-            i2c_delay_us(1);
-        }
-
-        // 9. Save error state for caller diagnostics
-        ctrl->current_target = addr;  // TAR was just re-programmed
-        ctrl->abort_source = abort_src;
+        // Reset state
         ctrl->xfer_error = 0;
         ctrl->irq_pending = 0;
         ctrl->tx_complete = 0;
         ctrl->rx_ready = 0;
+        ctrl->abort_source = 0;
 
         g_dbg_xfer_abort_count++;
 
-        kprintf("[I2C-XFER] ABORT bus=%u addr=0x%02x abort_src=0x%08x "
+        kprintf("[I2C-XFER] ABORT bus=%u addr=0x%02x abort_src=0x%x "
                 "rx=%d/%d tx=%d/%d retry=%d "
                 "isr=%u gpio_isr=%u hit=%u miss=%u\n",
                 ctrl->bus_id, addr, abort_src,
@@ -3072,16 +3044,13 @@ abort:
                 g_dbg_i2c_isr_count, g_dbg_gpio_isr_count,
                 g_dbg_gpio_isr_hit, g_dbg_gpio_isr_miss);
 
-        // Re-mask IOAPIC to prevent ISR storm while idle
-        if (ctrl->irq_gsi)
-            ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
-
-        // 10. Retry once on NACK, ARB_LOST, or pure timeout (abort_src==0
-        //     means the hardware didn't report an error but we timed out
-        //     waiting for RX data — transient, worth one retry).
+        // Retry with a settle delay.  On NACK or ARB_LOST the slave
+        // needs time to release the bus.  200µs matches the I2C spec
+        // bus-free time for fast mode (1.3µs) with generous margin.
         if (retry < 1) {
             retry++;
             g_dbg_xfer_retry_count++;
+            i2c_delay_us(500);
             goto retry_xfer;
         }
         return -1;
