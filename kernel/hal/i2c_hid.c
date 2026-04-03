@@ -2920,6 +2920,10 @@ retry_xfer:
         // Wait for TX FIFO space (check TXFLR, not just TFNF)
         for (timeout = 0; timeout < 50000; timeout++) {
             if (ctrl->xfer_error) goto abort;
+            // Poll RAW_INTR_STAT for TX_ABRT — catches aborts even when
+            // the CPU has IRQs disabled (spin_lock_irqsave in worker).
+            if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT)
+                goto abort;
             if (dw_read(ctrl, DW_IC_TXFLR) < ctrl->tx_fifo_depth)
                 break;
             i2c_delay_us(1);
@@ -2959,6 +2963,10 @@ retry_xfer:
         // Wait for RX data — check both ISR flag and hardware status
         for (timeout = 0; timeout < 50000; timeout++) {
             if (ctrl->xfer_error)
+                goto abort;
+            // Poll RAW_INTR_STAT for TX_ABRT — catches aborts even when
+            // the CPU has IRQs disabled (spin_lock_irqsave in worker).
+            if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT)
                 goto abort;
             if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
                 break;
