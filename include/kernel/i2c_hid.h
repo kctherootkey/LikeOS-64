@@ -476,6 +476,7 @@ typedef struct {
     uint32_t             gpio_pad_dw0;     // Expected PAD_CFG_DW0 (critical bits)
     uint16_t             error_count;      // Consecutive I2C transfer errors
     uint32_t             backoff_until;    // Poll counter to skip until (error backoff)
+    uint8_t              silent_verify_done; // One-shot passive verify attempted after abort
     spinlock_t           dev_lock;         // Protects device flags (ISR ↔ worker)
     volatile int         work_pending;     // Set by GPIO ISR, cleared by worker
     void                *worker_channel;   // Sleep/wake channel for worker thread
