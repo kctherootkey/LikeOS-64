@@ -3022,6 +3022,8 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
 
 abort:
     {
+        int complete_read = 0;
+        uint16_t pkt_len = 0;
         // ---- Abort handling (like Linux i2c_dw_xfer error path) ----
         // Read abort source: prefer ISR-saved value (ISR reads before clearing),
         // fall back to direct register read (may be stale if ISR already cleared).
@@ -3039,6 +3041,29 @@ abort:
         // Re-mask IOAPIC
         if (ctrl->irq_gsi)
             ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
+
+        // For HID input reads, some devices terminate the transfer early after
+        // delivering the complete length-prefixed packet. Drain anything the
+        // controller already received before tearing it down and accept the
+        // transfer if the packet is complete.
+        while (rbuf && wlen == 0 && rx_idx < rlen &&
+               (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)) {
+            uint32_t data = dw_read(ctrl, DW_IC_DATA_CMD);
+            rbuf[rx_idx++] = (uint8_t)(data & 0xFF);
+        }
+
+        if (rbuf && wlen == 0 && rx_idx >= I2C_HID_LENGTH_HDR_SIZE) {
+            pkt_len = (uint16_t)rbuf[0] | ((uint16_t)rbuf[1] << 8);
+            if (pkt_len == 0 || pkt_len == 0xFFFF ||
+                pkt_len <= I2C_HID_LENGTH_HDR_SIZE) {
+                complete_read = 1;
+            } else {
+                if (pkt_len > (uint16_t)rlen)
+                    pkt_len = (uint16_t)rlen;
+                if (rx_idx >= (int)pkt_len)
+                    complete_read = 1;
+            }
+        }
 
         // Disable controller — this flushes TX FIFO and generates STOP.
         // Like Linux: just __i2c_dw_disable(). No dummy STOP, no IC_CON re-init.
@@ -3069,6 +3094,11 @@ abort:
         ctrl->abort_source = 0;
 
         g_dbg_xfer_abort_count++;
+
+        if (complete_read) {
+            g_dbg_xfer_ok++;
+            return 0;
+        }
 
         kprintf("[I2C-XFER] ABORT bus=%u addr=0x%02x abort_src=0x%x "
                 "rx=%d/%d tx=%d/%d "
@@ -3971,6 +4001,28 @@ static void i2c_hid_reset_pointer_tracking(i2c_hid_device_t *dev)
     dev->has_prev_contact_id = 0;
 }
 
+static uint32_t i2c_hid_backoff_delay_ticks(uint16_t error_count)
+{
+    uint32_t hz = (uint32_t)timer_get_frequency();
+    uint32_t delay = hz / 50;
+
+    if (delay == 0)
+        delay = 1;
+
+    if (error_count > 4)
+        error_count = 4;
+
+    while (error_count > 1 && delay < hz / 4) {
+        delay <<= 1;
+        error_count--;
+    }
+
+    if (delay > hz / 4)
+        delay = hz / 4;
+
+    return delay;
+}
+
 // Process a mouse/touchpad input report and inject into the mouse subsystem
 static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
                                    const uint8_t *report, uint16_t report_len)
@@ -4028,6 +4080,8 @@ static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
     } else {
         uint32_t contact_id = 0;
         int contact_changed = 0;
+        int32_t dx_limit;
+        int32_t dy_limit;
         // Absolute mode (touchpads): compute deltas from previous position
         int32_t abs_x = (int32_t)extract_field_unsigned(report,
             info->x.bit_offset, info->x.bit_size);
@@ -4070,6 +4124,22 @@ static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
 
         dx = abs_x - dev->prev_x;
         dy = abs_y - dev->prev_y;
+
+        dx_limit = (info->x.logical_max - info->x.logical_min) / 8;
+        dy_limit = (info->y.logical_max - info->y.logical_min) / 8;
+        if (dx_limit < 64)
+            dx_limit = 64;
+        if (dy_limit < 64)
+            dy_limit = 64;
+
+        if (dx < -dx_limit || dx > dx_limit ||
+            dy < -dy_limit || dy > dy_limit) {
+            dev->prev_x = abs_x;
+            dev->prev_y = abs_y;
+            dev->has_prev_pos = 1;
+            return;
+        }
+
         dev->prev_x = abs_x;
         dev->prev_y = abs_y;
     }
@@ -4155,8 +4225,13 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
     g_dbg_worker_read++;
 
     if (rc < 0) {
+        uint32_t now_ticks;
         i2c_hid_reset_pointer_tracking(dev);
         dev->error_count++;
+        dev->silent_verify_done = 0;
+        now_ticks = (uint32_t)timer_ticks();
+        dev->backoff_until = now_ticks +
+            i2c_hid_backoff_delay_ticks(dev->error_count);
         g_dbg_worker_xfer_err++;
         kprintf("[I2C-DBG] xfer ERR #%u dev=0x%02x errcnt=%u "
                 "abort=0x%x\n",
@@ -4165,6 +4240,8 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
         return;
     }
     dev->error_count = 0;
+    dev->backoff_until = 0;
+    dev->silent_verify_done = 0;
 
     // First 2 bytes are the HID-over-I2C length prefix (LE)
     uint16_t pkt_len = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
@@ -4234,6 +4311,8 @@ static void i2c_hid_worker_thread(void *arg)
     kprintf("[I2C-HID] Worker thread running for I2C%d\n", ctrl->bus_id);
 
     while (ctrl->worker_running) {
+        uint64_t next_wake_tick = timer_ticks() + timer_get_frequency();
+
         // Set BLOCKED *before* checking for work — prevents lost wakes.
         // If the GPIO ISR fires between here and the check below,
         // sched_wake_channel() will find us BLOCKED and set us READY,
@@ -4268,9 +4347,60 @@ static void i2c_hid_worker_thread(void *arg)
                 uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
                 uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
                 uint32_t bit = 1u << dev->gpio_gpi_bit;
-                uint64_t gflags = local_irq_save();
-                uint32_t ie_val = gpio_comm_read32(comm, ie_reg);
-                int line_asserted = gpio_hid_line_asserted(dev);
+                uint32_t now_ticks = (uint32_t)timer_ticks();
+                uint64_t gflags;
+                uint32_t ie_val;
+                uint32_t is_val;
+                int line_asserted;
+
+                gflags = local_irq_save();
+                ie_val = gpio_comm_read32(comm, ie_reg);
+                is_val = gpio_comm_read32(comm, is_reg);
+                line_asserted = gpio_hid_line_asserted(dev);
+
+                if ((int32_t)(dev->backoff_until - now_ticks) > 0) {
+                    if (!(ie_val & bit)) {
+                        gpio_comm_write32(comm, is_reg, bit);
+                        gpio_comm_write32(comm, ie_reg, ie_val | bit);
+                        g_dbg_ie_reenable++;
+                    }
+                    local_irq_restore(gflags);
+                    if ((uint64_t)dev->backoff_until < next_wake_tick)
+                        next_wake_tick = dev->backoff_until;
+                    continue;
+                }
+
+                if (dev->error_count > 0) {
+                    if (line_asserted || (is_val & bit)) {
+                        gpio_comm_write32(comm, is_reg, bit);
+                        gpio_comm_write32(comm, ie_reg, ie_val | bit);
+                        spin_lock(&dev->dev_lock);
+                        dev->work_pending = 1;
+                        spin_unlock(&dev->dev_lock);
+                        local_irq_restore(gflags);
+                        g_dbg_ie_reenable++;
+                        any_pending = 1;
+                        break;
+                    }
+
+                    if (!dev->silent_verify_done) {
+                        spin_lock(&dev->dev_lock);
+                        dev->work_pending = 1;
+                        dev->silent_verify_done = 1;
+                        spin_unlock(&dev->dev_lock);
+                        local_irq_restore(gflags);
+                        any_pending = 1;
+                        break;
+                    }
+
+                    if (!(ie_val & bit)) {
+                        gpio_comm_write32(comm, is_reg, bit);
+                        gpio_comm_write32(comm, ie_reg, ie_val | bit);
+                        g_dbg_ie_reenable++;
+                    }
+                    local_irq_restore(gflags);
+                    continue;
+                }
 
                 if (line_asserted) {
                     gpio_comm_write32(comm, is_reg, bit);
@@ -4318,7 +4448,7 @@ static void i2c_hid_worker_thread(void *arg)
             // Set wakeup_tick so the timer IRQ wakes us after ~1 second
             // even if no GPIO interrupt fires. Without this, the thread
             // stays BLOCKED forever when idle and never prints.
-            self->wakeup_tick = timer_ticks() + timer_get_frequency();
+            self->wakeup_tick = next_wake_tick;
             g_dbg_worker_wake++;
             sched_schedule();
             continue;
@@ -4379,8 +4509,14 @@ static void i2c_hid_worker_thread(void *arg)
             uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
 
             uint64_t gflags;
+            uint32_t now_ticks;
             gflags = local_irq_save();
             uint32_t ie_val = gpio_comm_read32(comm, ie_reg);
+            now_ticks = (uint32_t)timer_ticks();
+            if ((int32_t)(dev->backoff_until - now_ticks) > 0) {
+                local_irq_restore(gflags);
+                continue;
+            }
             gpio_comm_write32(comm, ie_reg,
                               ie_val | (1u << dev->gpio_gpi_bit));
             local_irq_restore(gflags);
@@ -4447,6 +4583,7 @@ void i2c_hid_gpio_irq_handler(uint8_t vector)
 
         found_any = 1;
         g_dbg_gpio_isr_hit++;
+        dev->silent_verify_done = 0;
 
         // Clear the pending interrupt status (write-1-to-clear)
         gpio_comm_write32(comm, is_reg, bit);
