@@ -2119,6 +2119,7 @@ static int i2c_hid_set_report(i2c_hid_device_t *dev, uint8_t report_type,
 #define HID_DG_TOUCHSCREEN    0x000D0004
 #define HID_DG_TOUCHPAD       0x000D0005
 #define HID_DG_TIPSWITCH      0x000D0042
+#define HID_DG_CONTACTID      0x000D0051
 #define HID_DG_INPUTMODE      0x000D0052
 #define HID_DG_CONTACTCOUNT   0x000D0054
 #define HID_UP_BUTTON         0x0009
@@ -2496,7 +2497,14 @@ static void i2c_hid_parse_report_desc(i2c_hid_device_t *dev) {
     for (int i = c0_start; i < c0_end; i++) {
         if (fields[i].report_type != 0)        continue;
         if (fields[i].report_id != tp_rid)     continue;
-        if (fields[i].usage == HID_GD_X && ri->x.bit_size == 0) {
+        if (fields[i].usage == HID_DG_CONTACTID && ri->contact_id.bit_size == 0) {
+            ri->contact_id.report_id   = fields[i].report_id;
+            ri->contact_id.bit_offset  = fields[i].bit_offset;
+            ri->contact_id.bit_size    = fields[i].bit_size;
+            ri->contact_id.logical_min = fields[i].logical_min;
+            ri->contact_id.logical_max = fields[i].logical_max;
+            ri->has_contact_id = 1;
+        } else if (fields[i].usage == HID_GD_X && ri->x.bit_size == 0) {
             ri->x.report_id   = fields[i].report_id;
             ri->x.bit_offset  = fields[i].bit_offset;
             ri->x.bit_size    = fields[i].bit_size;
@@ -2518,7 +2526,14 @@ static void i2c_hid_parse_report_desc(i2c_hid_device_t *dev) {
         for (int i = 0; i < field_count; i++) {
             if (fields[i].report_type != 0)    continue;
             if (fields[i].report_id != tp_rid) continue;
-            if (fields[i].usage == HID_GD_X && ri->x.bit_size == 0) {
+            if (fields[i].usage == HID_DG_CONTACTID && ri->contact_id.bit_size == 0) {
+                ri->contact_id.report_id   = fields[i].report_id;
+                ri->contact_id.bit_offset  = fields[i].bit_offset;
+                ri->contact_id.bit_size    = fields[i].bit_size;
+                ri->contact_id.logical_min = fields[i].logical_min;
+                ri->contact_id.logical_max = fields[i].logical_max;
+                ri->has_contact_id = 1;
+            } else if (fields[i].usage == HID_GD_X && ri->x.bit_size == 0) {
                 ri->x.report_id   = fields[i].report_id;
                 ri->x.bit_offset  = fields[i].bit_offset;
                 ri->x.bit_size    = fields[i].bit_size;
@@ -2872,13 +2887,10 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
                             uint8_t *rbuf, int rlen)
 {
     int timeout;
-    int retry = 0;
     int rx_idx = 0;
     int tx_issued = 0;
 
     g_dbg_xfer_total++;
-
-retry_xfer:
     rx_idx = 0;
     tx_issued = 0;
 
@@ -3059,22 +3071,13 @@ abort:
         g_dbg_xfer_abort_count++;
 
         kprintf("[I2C-XFER] ABORT bus=%u addr=0x%02x abort_src=0x%x "
-                "rx=%d/%d tx=%d/%d retry=%d "
+                "rx=%d/%d tx=%d/%d "
                 "isr=%u gpio_isr=%u hit=%u miss=%u\n",
                 ctrl->bus_id, addr, abort_src,
-                rx_idx, rlen, tx_issued, rlen, retry,
+                rx_idx, rlen, tx_issued, rlen,
                 g_dbg_i2c_isr_count, g_dbg_gpio_isr_count,
                 g_dbg_gpio_isr_hit, g_dbg_gpio_isr_miss);
 
-        // Retry with a settle delay.  On NACK or ARB_LOST the slave
-        // needs time to release the bus.  200µs matches the I2C spec
-        // bus-free time for fast mode (1.3µs) with generous margin.
-        if (retry < 1) {
-            retry++;
-            g_dbg_xfer_retry_count++;
-            i2c_delay_us(500);
-            goto retry_xfer;
-        }
         return -1;
     }
 }
@@ -3161,6 +3164,23 @@ static inline void gpio_comm_write32(gpio_community_t *comm, uint32_t offset,
     volatile uint32_t *addr = (volatile uint32_t *)
         ((volatile uint8_t *)comm->base + offset);
     *addr = value;
+}
+
+static int gpio_hid_line_asserted(const i2c_hid_device_t *dev)
+{
+    if (!dev->gpio_irq_active || dev->gpio_community >= g_gpio_community_count)
+        return 0;
+
+    gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
+    uint32_t dw0 = gpio_comm_read32(comm, dev->gpio_pad_offset + GPIO_PAD_CFG_DW0);
+
+    if (dw0 & GPIO_DW0_GPIORXDIS)
+        return 0;
+
+    if (dw0 & GPIO_DW0_RXINV)
+        return (dw0 & GPIO_DW0_GPIORXSTATE) == 0;
+
+    return (dw0 & GPIO_DW0_GPIORXSTATE) != 0;
 }
 
 // Detect GPIO platform by checking which known ACPI _HID matches the GPIO
@@ -3945,6 +3965,12 @@ static uint32_t extract_field_unsigned(const uint8_t *data, uint16_t bit_offset,
     return val;
 }
 
+static void i2c_hid_reset_pointer_tracking(i2c_hid_device_t *dev)
+{
+    dev->has_prev_pos = 0;
+    dev->has_prev_contact_id = 0;
+}
+
 // Process a mouse/touchpad input report and inject into the mouse subsystem
 static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
                                    const uint8_t *report, uint16_t report_len)
@@ -3955,7 +3981,7 @@ static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
         return;
 
     if (info->report_bytes && report_len < info->report_bytes) {
-        dev->has_prev_pos = 0;
+        i2c_hid_reset_pointer_tracking(dev);
         return;
     }
 
@@ -3976,7 +4002,7 @@ static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
     // When finger lifts, reset absolute position tracking
     if (!finger_down) {
         g_dbg_worker_no_finger++;
-        dev->has_prev_pos = 0;
+        i2c_hid_reset_pointer_tracking(dev);
         return;
     }
 
@@ -4000,16 +4026,33 @@ static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
         dx = extract_field(report, info->x.bit_offset, info->x.bit_size);
         dy = extract_field(report, info->y.bit_offset, info->y.bit_size);
     } else {
+        uint32_t contact_id = 0;
+        int contact_changed = 0;
         // Absolute mode (touchpads): compute deltas from previous position
         int32_t abs_x = (int32_t)extract_field_unsigned(report,
             info->x.bit_offset, info->x.bit_size);
         int32_t abs_y = (int32_t)extract_field_unsigned(report,
             info->y.bit_offset, info->y.bit_size);
 
+        if (info->has_contact_id && info->contact_id.bit_size > 0) {
+            contact_id = extract_field_unsigned(report,
+                info->contact_id.bit_offset, info->contact_id.bit_size);
+            contact_changed = !dev->has_prev_contact_id ||
+                              contact_id != dev->prev_contact_id;
+        }
+
         if (abs_x < info->x.logical_min || abs_x > info->x.logical_max ||
             abs_y < info->y.logical_min || abs_y > info->y.logical_max) {
-            dev->has_prev_pos = 0;
+            i2c_hid_reset_pointer_tracking(dev);
             return;
+        }
+
+        if (contact_changed)
+            dev->has_prev_pos = 0;
+
+        if (info->has_contact_id && info->contact_id.bit_size > 0) {
+            dev->prev_contact_id = contact_id;
+            dev->has_prev_contact_id = 1;
         }
 
         if (!dev->has_prev_pos) {
@@ -4112,7 +4155,7 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
     g_dbg_worker_read++;
 
     if (rc < 0) {
-        dev->has_prev_pos = 0;
+        i2c_hid_reset_pointer_tracking(dev);
         dev->error_count++;
         g_dbg_worker_xfer_err++;
         kprintf("[I2C-DBG] xfer ERR #%u dev=0x%02x errcnt=%u "
@@ -4128,7 +4171,7 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
 
     // Discard null-size packets
     if (pkt_len == 0 || pkt_len == 0xFFFF || pkt_len <= 2) {
-        dev->has_prev_pos = 0;
+        i2c_hid_reset_pointer_tracking(dev);
         g_dbg_worker_null_pkt++;
         return;
     }
@@ -4147,14 +4190,14 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
 
     if (dev->mouse_report.has_report_id) {
         if (data_len < 1) {
-            dev->has_prev_pos = 0;
+            i2c_hid_reset_pointer_tracking(dev);
             return;
         }
         report_id = data[0];
 
         // Discard null report IDs
         if (report_id == 0) {
-            dev->has_prev_pos = 0;
+            i2c_hid_reset_pointer_tracking(dev);
             g_dbg_worker_null_id++;
             return;
         }
@@ -4164,14 +4207,14 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
 
         // Only process if report ID matches our mouse/touchpad report
         if (report_id != dev->mouse_report.report_id) {
-            dev->has_prev_pos = 0;
+            i2c_hid_reset_pointer_tracking(dev);
             g_dbg_worker_id_mismatch++;
             return;
         }
     }
 
     if (report_data_len == 0) {
-        dev->has_prev_pos = 0;
+        i2c_hid_reset_pointer_tracking(dev);
         return;
     }
 
@@ -4206,6 +4249,48 @@ static void i2c_hid_worker_thread(void *arg)
             if (dev->ctrl == ctrl && dev->active && dev->work_pending) {
                 any_pending = 1;
                 break;
+            }
+        }
+
+        if (!any_pending) {
+            for (int d = 0; d < g_i2c_hid_device_count; d++) {
+                i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+                if (dev->ctrl != ctrl || !dev->active || !dev->gpio_irq_active)
+                    continue;
+                if (dev->gpio_community >= g_gpio_community_count)
+                    continue;
+
+                gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
+                uint16_t ie_base = g_gpio_platform ?
+                    g_gpio_platform->gpi_ie_offset : 0x120;
+                uint16_t is_base = g_gpio_platform ?
+                    g_gpio_platform->gpi_is_offset : 0x100;
+                uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
+                uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
+                uint32_t bit = 1u << dev->gpio_gpi_bit;
+                uint64_t gflags = local_irq_save();
+                uint32_t ie_val = gpio_comm_read32(comm, ie_reg);
+                int line_asserted = gpio_hid_line_asserted(dev);
+
+                if (line_asserted) {
+                    gpio_comm_write32(comm, is_reg, bit);
+                    gpio_comm_write32(comm, ie_reg, ie_val | bit);
+                    spin_lock(&dev->dev_lock);
+                    dev->work_pending = 1;
+                    spin_unlock(&dev->dev_lock);
+                    local_irq_restore(gflags);
+                    g_dbg_ie_reenable++;
+                    any_pending = 1;
+                    break;
+                }
+
+                if (!(ie_val & bit)) {
+                    gpio_comm_write32(comm, is_reg, bit);
+                    gpio_comm_write32(comm, ie_reg, ie_val | bit);
+                    g_dbg_ie_reenable++;
+                }
+
+                local_irq_restore(gflags);
             }
         }
 
@@ -4338,8 +4423,9 @@ void i2c_hid_gpio_irq_handler(uint8_t vector)
         uint32_t is_val = gpio_comm_read32(comm, is_reg);
         uint32_t ie_reg_off = ie_base + dev->gpio_gpi_group * 4;
         uint32_t ie_cur = gpio_comm_read32(comm, ie_reg_off);
+        uint32_t bit = 1u << dev->gpio_gpi_bit;
 
-        if (!(is_val & (1u << dev->gpio_gpi_bit))) {
+        if (!(is_val & bit)) {
             // IS bit not set for our pin
             g_dbg_gpio_isr_miss++;
             if ((g_dbg_gpio_isr_miss % 100) == 1) {
@@ -4351,14 +4437,22 @@ void i2c_hid_gpio_irq_handler(uint8_t vector)
             continue;
         }
 
+        if (!gpio_hid_line_asserted(dev)) {
+            gpio_comm_write32(comm, is_reg, bit);
+            gpio_comm_write32(comm, ie_reg_off, ie_cur | bit);
+            g_dbg_gpio_isr_miss++;
+            g_dbg_ie_reenable++;
+            continue;
+        }
+
         found_any = 1;
         g_dbg_gpio_isr_hit++;
 
         // Clear the pending interrupt status (write-1-to-clear)
-        gpio_comm_write32(comm, is_reg, (1u << dev->gpio_gpi_bit));
+        gpio_comm_write32(comm, is_reg, bit);
 
         // Mask GPI_IE for this pin to prevent re-fire until worker processes it
-        uint32_t ie_val = ie_cur & ~(1u << dev->gpio_gpi_bit);
+        uint32_t ie_val = ie_cur & ~bit;
         gpio_comm_write32(comm, ie_reg_off, ie_val);
 
         // Set work_pending flag (spinlock-protected)
