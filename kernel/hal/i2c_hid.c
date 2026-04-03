@@ -2806,8 +2806,8 @@ void i2c_hid_irq_handler(uint8_t vector) {
         g_dbg_i2c_isr_count++;
 
         // Spurious: DW output stuck HIGH with INTR_MASK=0 (LPSS quirk).
-        // Mask the IOAPIC entry to stop the storm; the transfer function
-        // will unmask before the next active transfer.
+        // Keep the IOAPIC entry masked; HID transfers poll the controller
+        // directly and do not rely on the DW interrupt line.
         if (stat == 0) {
             ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
             lapic_eoi();
@@ -2836,8 +2836,12 @@ void i2c_hid_irq_handler(uint8_t vector) {
             ctrl->irq_pending = 1;
         }
 
-        // Clear remaining interrupts
-        (void)dw_read(ctrl, DW_IC_CLR_INTR);
+        if (stat & DW_IC_INTR_RX_OVER)
+            (void)dw_read(ctrl, DW_IC_CLR_RX_OVER);
+        if (stat & DW_IC_INTR_TX_OVER)
+            (void)dw_read(ctrl, DW_IC_CLR_TX_OVER);
+        if (stat & DW_IC_INTR_ACTIVITY)
+            (void)dw_read(ctrl, DW_IC_CLR_ACTIVITY);
 
         // Signal EOI
         lapic_eoi();
@@ -2901,14 +2905,13 @@ retry_xfer:
     // and we read it in the abort handler. The ISR writes it atomically
     // on TX_ABRT before we ever check it.
 
-    // ---- Step 3: Unmask IOAPIC for this transfer ----
+    // ---- Step 3: Keep the DW controller IRQ path masked ----
+    // HID traffic is IRQ-driven by the GPIO line.  For the DW engine itself,
+    // poll STATUS/RAW_INTR_STAT directly.  Leaving the controller IRQ enabled
+    // races the transfer loop and the ISR can clear TX_ABRT state underneath us.
     if (ctrl->irq_gsi)
-        ioapic_unmask_gsi((uint8_t)ctrl->irq_gsi);
-
-    // Enable interrupts: RX_FULL, TX_ABRT, STOP_DET
-    // (like Linux DW_IC_INTR_DEFAULT_MASK)
-    dw_write(ctrl, DW_IC_INTR_MASK,
-             DW_IC_INTR_RX_FULL | DW_IC_INTR_TX_ABRT | DW_IC_INTR_STOP_DET);
+        ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
+    dw_write(ctrl, DW_IC_INTR_MASK, 0);
 
     // ---- Step 4: Write phase ----
     for (int i = 0; i < wlen; i++) {
@@ -3016,6 +3019,8 @@ abort:
             abort_src = dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
         }
 
+        uint32_t raw_stat;
+
         // Disable all interrupts
         dw_write(ctrl, DW_IC_INTR_MASK, 0);
 
@@ -3027,9 +3032,18 @@ abort:
         // Like Linux: just __i2c_dw_disable(). No dummy STOP, no IC_CON re-init.
         dw_i2c_disable(ctrl);
 
-        // Clear all pending interrupt and abort status
-        (void)dw_read(ctrl, DW_IC_CLR_INTR);
-        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+        // Clear only the interrupt sources we may have observed.
+        raw_stat = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+        if (raw_stat & DW_IC_INTR_TX_ABRT)
+            (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+        if (raw_stat & DW_IC_INTR_STOP_DET)
+            (void)dw_read(ctrl, DW_IC_CLR_STOP_DET);
+        if (raw_stat & DW_IC_INTR_RX_OVER)
+            (void)dw_read(ctrl, DW_IC_CLR_RX_OVER);
+        if (raw_stat & DW_IC_INTR_TX_OVER)
+            (void)dw_read(ctrl, DW_IC_CLR_TX_OVER);
+        if (raw_stat & DW_IC_INTR_ACTIVITY)
+            (void)dw_read(ctrl, DW_IC_CLR_ACTIVITY);
 
         // Flush RX FIFO
         while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
@@ -3940,6 +3954,11 @@ static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
         info->dev_type != I2C_HID_DEV_TOUCHPAD)
         return;
 
+    if (info->report_bytes && report_len < info->report_bytes) {
+        dev->has_prev_pos = 0;
+        return;
+    }
+
     // Determine if finger is on surface
     int finger_down = 1;
     uint32_t contacts = 0, tip = 0;
@@ -3986,6 +4005,12 @@ static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
             info->x.bit_offset, info->x.bit_size);
         int32_t abs_y = (int32_t)extract_field_unsigned(report,
             info->y.bit_offset, info->y.bit_size);
+
+        if (abs_x < info->x.logical_min || abs_x > info->x.logical_max ||
+            abs_y < info->y.logical_min || abs_y > info->y.logical_max) {
+            dev->has_prev_pos = 0;
+            return;
+        }
 
         if (!dev->has_prev_pos) {
             // First touch — record position, no movement
