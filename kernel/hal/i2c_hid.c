@@ -4058,33 +4058,42 @@ static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
 static int i2c_hid_read_length_first(i2c_hid_device_t *dev,
                                      uint8_t *buf, uint16_t buf_size)
 {
-    uint8_t hdr[I2C_HID_LENGTH_HDR_SIZE];
     int rc;
+    uint16_t pkt_len;
 
-    // Step 1: Read 2-byte length prefix
+    // For normal input reads, fetch the whole advertised buffer in one I2C
+    // transaction. Doing a 2-byte probe followed by a second full read doubles
+    // bus traffic and can mix packet state between transfers.
+    if (buf_size > I2C_HID_LENGTH_HDR_SIZE) {
+        rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
+                              buf, buf_size);
+        if (rc < 0) return rc;
+
+        pkt_len = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+
+        if (pkt_len == 0 || pkt_len == 0xFFFF ||
+            pkt_len <= I2C_HID_LENGTH_HDR_SIZE)
+            return I2C_HID_LENGTH_HDR_SIZE;
+
+        if (pkt_len > buf_size)
+            pkt_len = buf_size;
+
+        return (int)pkt_len;
+    }
+
+    // Minimal fallback for callers that only provide a 2-byte buffer.
     rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
-                          hdr, I2C_HID_LENGTH_HDR_SIZE);
+                          buf, I2C_HID_LENGTH_HDR_SIZE);
     if (rc < 0) return rc;
 
-    uint16_t pkt_len = (uint16_t)hdr[0] | ((uint16_t)hdr[1] << 8);
+    pkt_len = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
 
     // Null / invalid / header-only packet — return just the header
     if (pkt_len == 0 || pkt_len == 0xFFFF || pkt_len <= I2C_HID_LENGTH_HDR_SIZE) {
-        buf[0] = hdr[0];
-        buf[1] = hdr[1];
         return I2C_HID_LENGTH_HDR_SIZE;
     }
 
-    // Clamp to caller's buffer
-    if (pkt_len > buf_size)
-        pkt_len = buf_size;
-
-    // Step 2: Read the full report (device re-sends from the beginning)
-    rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
-                          buf, pkt_len);
-    if (rc < 0) return rc;
-
-    return (int)pkt_len;
+    return I2C_HID_LENGTH_HDR_SIZE;
 }
 
 // Read one input report from the device and process it
@@ -4103,6 +4112,7 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
     g_dbg_worker_read++;
 
     if (rc < 0) {
+        dev->has_prev_pos = 0;
         dev->error_count++;
         g_dbg_worker_xfer_err++;
         kprintf("[I2C-DBG] xfer ERR #%u dev=0x%02x errcnt=%u "
@@ -4118,6 +4128,7 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
 
     // Discard null-size packets
     if (pkt_len == 0 || pkt_len == 0xFFFF || pkt_len <= 2) {
+        dev->has_prev_pos = 0;
         g_dbg_worker_null_pkt++;
         return;
     }
@@ -4135,11 +4146,15 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
     uint16_t report_data_len = data_len;
 
     if (dev->mouse_report.has_report_id) {
-        if (data_len < 1) return;
+        if (data_len < 1) {
+            dev->has_prev_pos = 0;
+            return;
+        }
         report_id = data[0];
 
         // Discard null report IDs
         if (report_id == 0) {
+            dev->has_prev_pos = 0;
             g_dbg_worker_null_id++;
             return;
         }
@@ -4149,12 +4164,16 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
 
         // Only process if report ID matches our mouse/touchpad report
         if (report_id != dev->mouse_report.report_id) {
+            dev->has_prev_pos = 0;
             g_dbg_worker_id_mismatch++;
             return;
         }
     }
 
-    if (report_data_len == 0) return;
+    if (report_data_len == 0) {
+        dev->has_prev_pos = 0;
+        return;
+    }
 
     i2c_hid_process_mouse(dev, report_data, report_data_len);
 }
