@@ -399,6 +399,9 @@ typedef struct {
     // Tip Switch (Digitizer usage 0x42) — finger touching surface
     i2c_hid_field_t  tip_switch;
     uint8_t          has_tip_switch;
+    // Contact Identifier (Digitizer usage 0x51) — stable finger identity
+    i2c_hid_field_t  contact_id;
+    uint8_t          has_contact_id;
     // Button field (Button usage page 0x09)
     i2c_hid_field_t  buttons;
     // X movement/position
@@ -480,6 +483,8 @@ typedef struct {
     int32_t              prev_x;           // Previous absolute X
     int32_t              prev_y;           // Previous absolute Y
     uint8_t              has_prev_pos;     // 1 if prev_x/prev_y are valid
+    uint32_t             prev_contact_id;  // Previous stable contact identifier
+    uint8_t              has_prev_contact_id; // 1 if prev_contact_id is valid
 } i2c_hid_device_t;
 
 // ============================================================================
