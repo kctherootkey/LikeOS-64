@@ -105,6 +105,10 @@
 // Initialize the Local APIC on the current CPU
 void lapic_init(void);
 
+// Detect x2APIC mode early (before lapic_init) so lapic_read/write/eoi work.
+// Call before any driver that may trigger hardware interrupts.
+void lapic_early_detect(void);
+
 // Read/write LAPIC registers
 uint32_t lapic_read(uint32_t reg);
 void lapic_write(uint32_t reg, uint32_t value);

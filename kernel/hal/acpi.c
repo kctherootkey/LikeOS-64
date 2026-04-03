@@ -1185,6 +1185,110 @@ void acpi_poweroff(void) {
     for (;;) __asm__ volatile("hlt");
 }
 
+// ============================================================================
+// PCI Interrupt Routing (_PRT) Lookup
+// ============================================================================
+
+int acpi_pci_lookup_irq(const char* bridge_path,
+                        uint8_t pci_device, uint8_t pci_pin,
+                        uint32_t* out_gsi)
+{
+    ACPI_HANDLE handle;
+    ACPI_STATUS status;
+
+    if (!bridge_path || !out_gsi) return -1;
+
+    status = AcpiGetHandle(NULL, (char*)bridge_path, &handle);
+    if (ACPI_FAILURE(status)) {
+        kprintf("[PRT] bridge %s not found (%d)\n", bridge_path, (int)status);
+        return -1;
+    }
+
+    // Get _PRT routing table
+    ACPI_BUFFER buf = { ACPI_ALLOCATE_BUFFER, NULL };
+    status = AcpiGetIrqRoutingTable(handle, &buf);
+    if (ACPI_FAILURE(status)) {
+        kprintf("[PRT] %s _PRT failed (%d)\n", bridge_path, (int)status);
+        return -2;
+    }
+
+    // Walk the routing table entries.
+    // Address encodes the device number: high word of high dword = device,
+    // function is 0xFFFF (any).  Format: (device << 16) | 0xFFFF.
+    UINT64 match_addr = ((UINT64)pci_device << 16) | 0xFFFFULL;
+
+    ACPI_PCI_ROUTING_TABLE *entry = (ACPI_PCI_ROUTING_TABLE *)buf.Pointer;
+    int found = 0;
+
+    // Dump all _PRT entries for diagnostics (first call only)
+    {
+        static int prt_dumped = 0;
+        if (!prt_dumped) {
+            prt_dumped = 1;
+            ACPI_PCI_ROUTING_TABLE *e = entry;
+            int n = 0;
+            while (e && e->Length > 0 && n < 64) {
+                kprintf("[PRT]   #%d addr=0x%llx pin=%u src='%s' idx=%u\n",
+                        n, (unsigned long long)e->Address, e->Pin,
+                        e->Source[0] ? e->Source : "(hw)",
+                        e->SourceIndex);
+                e = (ACPI_PCI_ROUTING_TABLE *)((char *)e + e->Length);
+                n++;
+            }
+        }
+    }
+
+    while (entry && entry->Length > 0) {
+        if (entry->Address == match_addr && entry->Pin == pci_pin) {
+            if (entry->Source[0] == '\0') {
+                // Hardwired GSI (no link device) — most common on modern PCH
+                *out_gsi = entry->SourceIndex;
+                found = 1;
+            } else {
+                // Link device (e.g. LNKA) — evaluate _CRS to get GSI
+                ACPI_HANDLE link;
+                if (ACPI_SUCCESS(AcpiGetHandle(handle, entry->Source, &link)) ||
+                    ACPI_SUCCESS(AcpiGetHandle(NULL, entry->Source, &link))) {
+                    ACPI_BUFFER lbuf = { ACPI_ALLOCATE_BUFFER, NULL };
+                    if (ACPI_SUCCESS(AcpiGetCurrentResources(link, &lbuf))) {
+                        ACPI_RESOURCE *res = (ACPI_RESOURCE *)lbuf.Pointer;
+                        while (res && res->Type != ACPI_RESOURCE_TYPE_END_TAG) {
+                            if (res->Type == ACPI_RESOURCE_TYPE_IRQ &&
+                                res->Data.Irq.InterruptCount > 0) {
+                                *out_gsi = res->Data.Irq.Interrupts[0];
+                                found = 1;
+                                break;
+                            }
+                            if (res->Type == ACPI_RESOURCE_TYPE_EXTENDED_IRQ &&
+                                res->Data.ExtendedIrq.InterruptCount > 0) {
+                                *out_gsi = res->Data.ExtendedIrq.Interrupts[0];
+                                found = 1;
+                                break;
+                            }
+                            res = ACPI_NEXT_RESOURCE(res);
+                        }
+                        AcpiOsFree(lbuf.Pointer);
+                    }
+                }
+            }
+            break;
+        }
+        entry = (ACPI_PCI_ROUTING_TABLE *)((char *)entry + entry->Length);
+    }
+
+    AcpiOsFree(buf.Pointer);
+
+    if (found) {
+        kprintf("[PRT] %s dev=%u pin=%u -> GSI %u\n",
+                bridge_path, pci_device, pci_pin, *out_gsi);
+        return 0;
+    }
+
+    kprintf("[PRT] %s dev=%u pin=%u: no matching entry\n",
+            bridge_path, pci_device, pci_pin);
+    return -3;
+}
+
 void acpi_reset(void) {
     kprintf("ACPI: resetting system...\n");
     __asm__ volatile("cli");

@@ -133,6 +133,11 @@ void continue_system_startup(void) {
     acpi_init(g_rsdp_address);
     acpi_pm_init();
 
+    // Detect x2APIC mode early so lapic_eoi() works for all drivers.
+    // Without this, MMIO-based EOI is a no-op in x2APIC mode and
+    // interrupts get stuck in the LAPIC ISR (blocking same-priority vectors).
+    lapic_early_detect();
+
     xhci_boot_init(&g_xhci_boot);
     usbhid_init();
     usbserial_init();

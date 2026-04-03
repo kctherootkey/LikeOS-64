@@ -16,3 +16,10 @@ typedef unsigned int  uint32_t;
 // vector: IDT vector to deliver
 int ioapic_configure_legacy_irq(uint8_t gsi, uint8_t vector, uint8_t polarity, uint8_t trigger_mode);
 int ioapic_detect(void); // returns 0 if present
+
+// Read / write individual IOAPIC redirection table entries
+void ioapic_write_rte(uint8_t gsi, uint32_t low, uint32_t high);
+void ioapic_read_rte(uint8_t gsi, uint32_t *low, uint32_t *high);
+void ioapic_mask_gsi(uint8_t gsi);
+void ioapic_unmask_gsi(uint8_t gsi);
+uint32_t ioapic_max_gsi(void);
