@@ -564,4 +564,14 @@ int acpi_aml_exec_device_method(const char* device_path,
                                 const char* method_name,
                                 uint64_t* ret_value);
 
+// Look up PCI interrupt routing via ACPI _PRT on the parent bridge.
+// bridge_path: ACPI path of PCI root bridge (e.g. "\\_SB_.PC00")
+// pci_device: PCI device number (0-31)
+// pci_pin: PCI interrupt pin (0=INTA, 1=INTB, 2=INTC, 3=INTD)
+// out_gsi: receives the IOAPIC GSI number on success
+// Returns 0 on success, <0 on failure.
+int acpi_pci_lookup_irq(const char* bridge_path,
+                        uint8_t pci_device, uint8_t pci_pin,
+                        uint32_t* out_gsi);
+
 #endif // _KERNEL_ACPI_H_

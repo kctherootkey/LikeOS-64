@@ -166,6 +166,13 @@ void lapic_write(uint32_t reg, uint32_t value) {
 // LAPIC Core Functions
 // ============================================================================
 
+void lapic_early_detect(void) {
+    uint64_t msr = rdmsr(MSR_APIC_BASE);
+    if (msr & MSR_APIC_BASE_X2APIC)
+        lapic_x2apic_mode = true;
+    lapic_phys_base = msr & 0xFFFFFFFFFFFFF000ULL;
+}
+
 bool lapic_is_available(void) {
     uint32_t eax, ebx, ecx, edx;
     cpuid(1, &eax, &ebx, &ecx, &edx);

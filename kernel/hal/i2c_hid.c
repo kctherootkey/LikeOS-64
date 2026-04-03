@@ -701,8 +701,13 @@ static int dw_i2c_xfer(i2c_dw_controller_t *ctrl, uint16_t addr,
     int rc;
     int retry = 0;
 
+    g_dbg_xfer_total++;
+
 retry_xfer:
     dw_i2c_set_target(ctrl, addr);
+
+    // Ensure bus is idle before starting a new transfer.
+    dw_i2c_wait_idle(ctrl, 10000);
 
     // ---- Write phase ----
     // Push slave address (implicit) + register bytes.
@@ -773,28 +778,94 @@ retry_xfer:
 
     // Wait for bus idle
     dw_i2c_wait_idle(ctrl, 10000);
+    g_dbg_xfer_ok++;
     return 0;
 
 abort:
     {
+        // 1. Read abort reason (must read before clearing)
         uint32_t abort_src = dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
-        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+
+        // 2. Disable controller — waits for IC_ENABLE_STATUS to confirm.
+        //    This flushes the TX FIFO and triggers STOP on the bus.
+        dw_write(ctrl, DW_IC_ENABLE, 0);
+        for (int w = 0; w < 10000; w++) {
+            if ((dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN) == 0)
+                break;
+            if (dw_read(ctrl, DW_IC_ENABLE) == 0)
+                break;
+            i2c_delay_us(1);
+        }
+
+        // 3. Clear all pending interrupts
         (void)dw_read(ctrl, DW_IC_CLR_INTR);
-        // Drain RX FIFO
+
+        // 4. Clear abort flag explicitly
+        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+
+        // 5. Flush RX FIFO — discard any stale data
         while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
             (void)dw_read(ctrl, DW_IC_DATA_CMD);
-        // Reset controller state machine (Linux i2c-designware does this
-        // after every abort to clear the hardware FIFO and bus state)
-        dw_i2c_disable(ctrl);
-        i2c_delay_us(1000);  // 1ms — give device firmware time to reset
-        dw_i2c_enable(ctrl);
-        ctrl->current_target = 0xFFFF;  // Force re-program after reset
-        ctrl->abort_source = abort_src;  // Save for caller diagnostics
-        // Retry once on any error (NACK, ARB_LOST, or pure timeout).
-        // Pure timeout (abort_src==0) can be transient if the bus was
-        // momentarily busy.
+
+        // 6. Issue an explicit STOP on the bus.  Re-enable the controller
+        //    briefly, push a dummy read command with STOP, then disable
+        //    again.  This ensures the bus is released even if the abort
+        //    did not generate an automatic STOP condition.
+        dw_write(ctrl, DW_IC_ENABLE, 1);
+        for (int w = 0; w < 5000; w++) {
+            if (dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN)
+                break;
+            if (dw_read(ctrl, DW_IC_ENABLE) == 1)
+                break;
+            i2c_delay_us(1);
+        }
+        dw_write(ctrl, DW_IC_DATA_CMD, DW_IC_DATA_CMD_STOP);
+        i2c_delay_us(200);  // Let STOP propagate on the bus
+        dw_write(ctrl, DW_IC_ENABLE, 0);
+        for (int w = 0; w < 10000; w++) {
+            if ((dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN) == 0)
+                break;
+            if (dw_read(ctrl, DW_IC_ENABLE) == 0)
+                break;
+            i2c_delay_us(1);
+        }
+        // Clear any status from the STOP command
+        (void)dw_read(ctrl, DW_IC_CLR_INTR);
+        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+
+        // 7. Re-init key registers (controller must be disabled to write these)
+        dw_write(ctrl, DW_IC_TAR, addr & 0x7F);
+        dw_write(ctrl, DW_IC_CON, DW_IC_CON_MASTER | DW_IC_CON_SPEED_SS |
+                                  DW_IC_CON_RESTART_EN | DW_IC_CON_SLAVE_DISABLE);
+
+        // 8. Re-enable controller
+        dw_write(ctrl, DW_IC_ENABLE, 1);
+        for (int w = 0; w < 10000; w++) {
+            if (dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN)
+                break;
+            if (dw_read(ctrl, DW_IC_ENABLE) == 1)
+                break;
+            i2c_delay_us(1);
+        }
+
+        // 9. Save error state for caller diagnostics
+        ctrl->current_target = addr;  // TAR was just re-programmed
+        ctrl->abort_source = abort_src;
+
+        g_dbg_xfer_abort_count++;
+
+        kprintf("[I2C-XFER] ABORT bus=%u addr=0x%02x abort_src=0x%08x "
+                "rx=%d/%d tx=%d/%d retry=%d "
+                "isr=%u gpio_isr=%u hit=%u miss=%u\n",
+                ctrl->bus_id, addr, abort_src,
+                rx_idx, rlen, tx_issued, rlen, retry,
+                g_dbg_i2c_isr_count, g_dbg_gpio_isr_count,
+                g_dbg_gpio_isr_hit, g_dbg_gpio_isr_miss);
+
+        // 10. Retry once on NACK, ARB_LOST, or pure timeout
         if (retry < 1) {
             retry++;
+            g_dbg_xfer_retry_count++;
             goto retry_xfer;
         }
         return -1;
@@ -1173,6 +1244,545 @@ static int path_already_listed(char paths[][ACPI_AML_MAX_PATH], int n,
     return 0;
 }
 
+// ============================================================================
+// VT-d Interrupt Remapping — disable if active
+//
+// On Arrow Lake (PCH 600/700), Dell UEFI firmware may leave VT-d interrupt
+// remapping enabled.  When IR is active the IOAPIC RTEs are in "remapped
+// format" (different bit layout) which makes normal RTE programming fail.
+// We parse the ACPI DMAR table, find each DRHD VT-d engine, and disable
+// interrupt remapping so the IOAPIC operates in compatibility mode.
+// ============================================================================
+
+#define VTD_CAP      0x008
+#define VTD_ECAP     0x010
+#define VTD_GCMD     0x018
+#define VTD_GSTS     0x01C
+#define VTD_ECAP_IR  (1ULL << 3)
+#define VTD_GCMD_IRE (1u << 25)
+#define VTD_GSTS_IRES (1u << 25)
+#define VTD_GCMD_TE  (1u << 31)
+#define VTD_GSTS_TES (1u << 31)
+#define VTD_GCMD_QIE (1u << 26)
+#define VTD_GSTS_QIES (1u << 26)
+
+static int g_vtd_ir_disabled = 0;
+
+static void vtd_disable_interrupt_remapping(void)
+{
+    acpi_sdt_header_t *dmar = acpi_find_table("DMAR");
+    if (!dmar) {
+        kprintf("[VT-d] No DMAR table\n");
+        g_vtd_ir_disabled = 1;
+        return;
+    }
+
+    uint32_t dmar_len = dmar->length;
+    uint8_t *data = (uint8_t *)dmar;
+    // DMAR header: 36-byte SDT header + 1 width + 1 flags + 10 reserved = 48
+    uint32_t offset = 48;
+
+    while (offset + 4 <= dmar_len) {
+        uint16_t type, slen;
+        i2c_memcpy(&type, data + offset, 2);
+        i2c_memcpy(&slen, data + offset + 2, 2);
+        if (slen < 4 || offset + slen > dmar_len) break;
+
+        if (type == 0) {  // DRHD
+            uint64_t base_addr;
+            i2c_memcpy(&base_addr, data + offset + 8, 8);
+
+            uint64_t va = mm_map_device_mmio(base_addr, 1);
+            if (!va) { offset += slen; continue; }
+
+            volatile uint8_t *r = (volatile uint8_t *)va;
+            uint64_t ecap = *(volatile uint64_t *)(r + VTD_ECAP);
+
+            if (!(ecap & VTD_ECAP_IR)) {
+                kprintf("[VT-d] DRHD 0x%llx: no IR cap\n",
+                        (unsigned long long)base_addr);
+                offset += slen;
+                continue;
+            }
+
+            uint32_t gsts = *(volatile uint32_t *)(r + VTD_GSTS);
+            if (gsts & VTD_GSTS_IRES) {
+                kprintf("[VT-d] DRHD 0x%llx: IR active, disabling\n",
+                        (unsigned long long)base_addr);
+                // Construct GCMD from current GSTS (one-shot bits):
+                // preserve TE (translation enable) and QIE, clear IRE
+                uint32_t gcmd = 0;
+                if (gsts & VTD_GSTS_TES) gcmd |= VTD_GCMD_TE;
+                if (gsts & VTD_GSTS_QIES) gcmd |= VTD_GCMD_QIE;
+                // Do NOT set VTD_GCMD_IRE → this disables IR
+                *(volatile uint32_t *)(r + VTD_GCMD) = gcmd;
+
+                for (int w = 0; w < 100000; w++) {
+                    gsts = *(volatile uint32_t *)(r + VTD_GSTS);
+                    if (!(gsts & VTD_GSTS_IRES)) break;
+                    i2c_delay_us(1);
+                }
+                if (gsts & VTD_GSTS_IRES)
+                    kprintf("[VT-d] WARNING: IR disable timed out\n");
+                else
+                    kprintf("[VT-d] IR disabled on DRHD 0x%llx\n",
+                            (unsigned long long)base_addr);
+            } else {
+                kprintf("[VT-d] DRHD 0x%llx: IR not active\n",
+                        (unsigned long long)base_addr);
+            }
+        }
+        offset += slen;
+    }
+    g_vtd_ir_disabled = 1;
+}
+
+// ============================================================================
+// IOAPIC interrupt probe for I2C controllers
+//
+// Intel PCH 600/700 Serial IO (D21) uses "direct" IOAPIC entries (GSI 24+),
+// NOT PIRQ routing.  The firmware (FSP) programs the PCH ITSS to wire each
+// controller's interrupt output to a specific IOAPIC pin.  Neither _PRT,
+// _CRS, INTLINE, nor MSI exposes which pin was assigned.
+//
+// We discover the pin empirically: enable the DW core's TX_EMPTY interrupt
+// (which fires immediately because the FIFO is empty), then sweep IOAPIC
+// entries 24-119.  When we unmask the correct entry the interrupt reaches
+// the CPU and our ISR sets a flag.
+//
+// Diagnostic strategy:
+// - Read ITSS IPC0-3 via P2SB PCR to learn actual polarity config
+// - Dump all non-default IOAPIC RTEs before masking (firmware breadcrumbs)
+// - Write PCI INTLINE to potentially activate ITSS direct routing
+// - Sweep with 4 combos: {active-HIGH, active-LOW} × {level, edge}
+// - Check LAPIC ISR/IRR after each RTE to detect "stuck" delivery
+// ============================================================================
+
+// Local rdmsr/wrmsr for pre-init diagnostics (lapic_init not yet called)
+static inline uint64_t i2c_rdmsr(uint32_t msr) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline void i2c_wrmsr(uint32_t msr, uint64_t val) {
+    uint32_t lo = (uint32_t)val;
+    uint32_t hi = (uint32_t)(val >> 32);
+    __asm__ volatile("wrmsr" :: "c"(msr), "a"(lo), "d"(hi));
+}
+#define IA32_APIC_BASE_MSR       0x1B
+#define X2APIC_MSR_BASE_LOCAL    0x800
+#define X2APIC_SVR_MSR           (X2APIC_MSR_BASE_LOCAL + (0x0F0 >> 4))  // 0x80F
+#define X2APIC_TPR_MSR           (X2APIC_MSR_BASE_LOCAL + (0x080 >> 4))  // 0x808
+#define X2APIC_ID_MSR            (X2APIC_MSR_BASE_LOCAL + (0x020 >> 4))  // 0x802
+#define X2APIC_EOI_MSR           (X2APIC_MSR_BASE_LOCAL + (0x0B0 >> 4))  // 0x80B
+
+// ITSS sideband port and register offsets (PCH 600/700 / Arrow Lake)
+#define ITSS_PORT_ID       0xC4
+#define ITSS_IPC0          0x3200   // Interrupt Polarity Control 0 (IRQ 0-31)
+#define ITSS_IPC1          0x3204   // Interrupt Polarity Control 1 (IRQ 32-63)
+#define ITSS_IPC2          0x3208   // Interrupt Polarity Control 2 (IRQ 64-95)
+#define ITSS_IPC3          0x320C   // Interrupt Polarity Control 3 (IRQ 96-119)
+#define ITSS_PIR0          0x3140   // PCI Interrupt Route 0 (D31)
+#define ITSS_MMC           0x3334   // Master Message Control
+
+static volatile int g_i2c_probe_mode = 0;       // 1 = probe in progress
+static volatile uint32_t g_i2c_probe_hit = 0;   // set by ISR during probe
+static int g_i2c_claimed_gsi[I2C_DW_MAX_CONTROLLERS]; // GSIs already assigned
+static int g_i2c_claimed_gsi_count = 0;
+
+// Read a 32-bit ITSS PCR register via P2SB sideband.
+// Returns 0xFFFFFFFF on failure (P2SB not accessible).
+// The ITSS region is mapped UC via mm_map_device_mmio on first access.
+static uint64_t g_itss_va = 0;  // UC-mapped VA of ITSS port region
+
+static uint32_t itss_pcr_read32(uint32_t offset)
+{
+    // Map the ITSS sideband region on first use
+    if (!g_itss_va) {
+        // Get SBREG_BAR if not cached
+        if (!g_sbreg_bar) {
+            if (g_ecam_bus0_va) {
+                // Try unhide first
+                ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
+                             P2SB_P2SBC, 0);
+                i2c_delay_us(500);
+                uint32_t vid = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+                                           P2SB_PCI_FUNC, 0x00);
+                if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
+                    uint32_t cmd = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+                                               P2SB_PCI_FUNC, 0x04);
+                    if (!(cmd & 0x02))
+                        ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
+                                     0x04, cmd | 0x02);
+                }
+                // Read BAR even if HIDE is sticky (BAR often readable regardless)
+                uint32_t bl = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+                                          P2SB_PCI_FUNC, P2SB_SBREG_BAR);
+                uint32_t bh = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+                                          P2SB_PCI_FUNC, P2SB_SBREG_BARH);
+                uint64_t bar = ((uint64_t)bh << 32) | (bl & ~0xFULL);
+                kprintf("[ITSS] P2SB VID=0x%x BAR raw lo=0x%x hi=0x%x => 0x%llx\n",
+                        vid, bl, bh, (unsigned long long)bar);
+                // Accept if BAR looks like a valid physical address (non-zero,
+                // not all-F, and above 1GB typical for PCH SBREG)
+                if (bar && bar != 0xFFFFFFFFFFFFFFF0ULL && bar >= 0x40000000ULL)
+                    g_sbreg_bar = bar;
+                // Re-hide
+                ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
+                             P2SB_P2SBC, P2SB_HIDE_BIT);
+            }
+        }
+        if (!g_sbreg_bar) {
+            kprintf("[ITSS] No SBREG_BAR, cannot read ITSS IPC\n");
+            return 0xFFFFFFFF;
+        }
+        // Map the ITSS port region (64KB) as UC via mm_map_device_mmio.
+        // SBREG_BAR + (PortID << 16) gives the 64KB window for this port.
+        uint64_t itss_pa = g_sbreg_bar + ((uint64_t)ITSS_PORT_ID << 16);
+        g_itss_va = mm_map_device_mmio(itss_pa, 16);  // 16 pages = 64KB
+        if (!g_itss_va) {
+            kprintf("[ITSS] mm_map_device_mmio failed for 0x%llx\n",
+                    (unsigned long long)itss_pa);
+            return 0xFFFFFFFF;
+        }
+        kprintf("[ITSS] P2SB SBREG_BAR=0x%llx ITSS mapped at VA=0x%llx\n",
+                (unsigned long long)g_sbreg_bar,
+                (unsigned long long)g_itss_va);
+    }
+
+    if (offset > 0xFFFF) return 0xFFFFFFFF;
+    return *(volatile uint32_t *)((volatile uint8_t *)g_itss_va + offset);
+}
+
+// Dump ITSS IPC registers and firmware IOAPIC state for diagnostics.
+static void probe_dump_diagnostics(uint32_t max_gsi)
+{
+    // ---- ITSS IPC polarity registers ----
+    uint32_t ipc0 = itss_pcr_read32(ITSS_IPC0);
+    uint32_t ipc1 = itss_pcr_read32(ITSS_IPC1);
+    uint32_t ipc2 = itss_pcr_read32(ITSS_IPC2);
+    uint32_t ipc3 = itss_pcr_read32(ITSS_IPC3);
+    kprintf("[ITSS] IPC0=0x%08x IPC1=0x%08x IPC2=0x%08x IPC3=0x%08x\n",
+            ipc0, ipc1, ipc2, ipc3);
+    // Bit=1 means "active-HIGH polarity disabled" → signal is active-LOW
+    // Bit=0 means signal is active-HIGH (default for IRQ 24+)
+    kprintf("[ITSS] IPC decode: IRQ24-31 pol=%s, IRQ32-63 pol=%s\n",
+            (ipc0 >> 24) ? "mixed" : "all-HIGH",
+            ipc1 ? "mixed/LOW" : "all-HIGH");
+
+    // ---- ITSS MMC and PIR0 ----
+    uint32_t mmc = itss_pcr_read32(ITSS_MMC);
+    uint32_t pir0 = itss_pcr_read32(ITSS_PIR0);
+    kprintf("[ITSS] MMC=0x%04x PIR0=0x%04x\n", mmc & 0xFFFF, pir0 & 0xFFFF);
+
+    // ---- IOAPIC RTE dump: show all entries 16-63 that are not fully masked+zero ----
+    kprintf("[IOAPIC] Firmware RTE dump (entries 16-%u):\n",
+            max_gsi > 63 ? 63 : max_gsi);
+    for (uint32_t g = 16; g <= max_gsi && g <= 63; g++) {
+        uint32_t lo, hi;
+        ioapic_read_rte((uint8_t)g, &lo, &hi);
+        // Skip fully masked default entries (masked + vector 0)
+        if ((lo & 0x1FFFF) == 0x10000 && hi == 0) continue;  // masked, vec=0
+        if (lo == 0 && hi == 0) continue;
+        kprintf("  GSI %u: lo=0x%08x hi=0x%08x [vec=%u del=%u pol=%s trig=%s %s dest=%u]\n",
+                g, lo, hi,
+                lo & 0xFF,            // vector
+                (lo >> 8) & 7,        // delivery mode
+                (lo & (1u<<13)) ? "low" : "high",
+                (lo & (1u<<15)) ? "level" : "edge",
+                (lo & (1u<<16)) ? "MASKED" : "unmask",
+                (hi >> 24) & 0xFF);   // destination
+    }
+}
+
+static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
+{
+    uint32_t max_gsi = ioapic_max_gsi();
+    if (max_gsi < 24) return -1;
+
+    // Ensure VT-d IR is disabled so IOAPIC RTEs use compatibility format
+    if (!g_vtd_ir_disabled)
+        vtd_disable_interrupt_remapping();
+
+    // Dump firmware state before we touch anything
+    probe_dump_diagnostics(max_gsi);
+
+    // Ensure interrupts are enabled (needed for ISR to fire)
+    uint64_t rflags;
+    __asm__ volatile("pushf; pop %0" : "=r"(rflags));
+    if (!(rflags & 0x200)) {
+        __asm__ volatile("sti");
+        kprintf("[I2C%d] probe: enabled IF\n", ctrl->bus_id);
+    }
+
+    // Ensure LAPIC is ready to deliver IOAPIC fixed interrupts.
+    // lapic_init() hasn't run yet, so we must configure via raw MSR.
+    uint64_t apic_base_val = i2c_rdmsr(IA32_APIC_BASE_MSR);
+    int probe_x2apic = (apic_base_val >> 10) & 1;
+    uint32_t bsp_apic_id = 0;  // physical APIC ID of BSP for RTE destination
+    if (probe_x2apic) {
+        bsp_apic_id = (uint32_t)i2c_rdmsr(X2APIC_ID_MSR);
+        uint32_t svr_val   = (uint32_t)i2c_rdmsr(X2APIC_SVR_MSR);
+        uint32_t tpr_val   = (uint32_t)i2c_rdmsr(X2APIC_TPR_MSR);
+        kprintf("[I2C%d] LAPIC pre-init: ID=%u SVR=0x%x TPR=0x%x\n",
+                ctrl->bus_id, bsp_apic_id, svr_val, tpr_val);
+
+        // SVR bit 8 must be set for the LAPIC to deliver fixed interrupts.
+        // ExtINT/PIC via LINT0 works even when disabled, but IOAPIC doesn't.
+        if (!(svr_val & (1u << 8))) {
+            i2c_wrmsr(X2APIC_SVR_MSR, (uint64_t)(svr_val | (1u << 8) | 0xFF));
+            kprintf("[I2C%d] LAPIC: software-enabled (SVR was 0x%x)\n",
+                    ctrl->bus_id, svr_val);
+        }
+        // TPR must be 0 to allow delivery of vector 50 (priority 3)
+        if (tpr_val > 0) {
+            i2c_wrmsr(X2APIC_TPR_MSR, 0);
+            kprintf("[I2C%d] LAPIC: TPR cleared (was 0x%x)\n",
+                    ctrl->bus_id, tpr_val);
+        }
+    }
+
+    // Mask every unclaimed RTE 24-max so no stale entry fires during sweep
+    for (uint32_t g = 24; g <= max_gsi; g++) {
+        int claimed = 0;
+        for (int k = 0; k < g_i2c_claimed_gsi_count; k++)
+            if (g_i2c_claimed_gsi[k] == (int)g) { claimed = 1; break; }
+        if (!claimed)
+            ioapic_mask_gsi((uint8_t)g);
+    }
+
+    // Drain any stuck ISR entries so same-priority vectors can be delivered.
+    // (e.g., xHCI vec 49 stuck because lapic_eoi() used MMIO pre-detect)
+    if (probe_x2apic) {
+        for (int eoi_drain = 0; eoi_drain < 16; eoi_drain++) {
+            int any = 0;
+            for (int r = 0; r < 8; r++) {
+                uint32_t isr = (uint32_t)i2c_rdmsr(
+                    X2APIC_MSR_BASE_LOCAL + ((LAPIC_ISR_BASE + r * 0x10) >> 4));
+                if (isr) { any = 1; break; }
+            }
+            if (!any) break;
+            i2c_wrmsr(X2APIC_EOI_MSR, 0);
+        }
+    }
+
+    // Enable probe mode in the ISR
+    g_i2c_probe_mode = 1;
+    g_i2c_probe_hit = 0;
+
+    // The init function disables the controller after verifying it works
+    // (IC_ENABLE=0).  We must re-enable it so TX_EMPTY asserts on the
+    // physical interrupt output pin.
+    {
+        uint32_t en = dw_read(ctrl, DW_IC_ENABLE);
+        if (!(en & 1)) {
+            dw_write(ctrl, DW_IC_ENABLE, 1);
+            i2c_delay_us(2000);  // let clocks stabilize
+            kprintf("[I2C%d] probe: re-enabled DW core (was IC_ENABLE=0x%x)\n",
+                    ctrl->bus_id, en);
+        }
+    }
+
+    // Make the DW core assert its interrupt output by enabling TX_EMPTY.
+    // TX FIFO is empty after init, so the interrupt is asserted immediately.
+    (void)dw_read(ctrl, DW_IC_CLR_INTR);
+    dw_write(ctrl, DW_IC_INTR_MASK, DW_IC_INTR_TX_EMPTY);
+
+    // Diagnostic: verify the DW core thinks it is asserting an interrupt
+    uint32_t diag_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+    uint32_t diag_stat = dw_read(ctrl, DW_IC_INTR_STAT);
+    kprintf("[I2C%d] probe: RAW_INTR=0x%x INTR_STAT=0x%x (expect 0x10)\n",
+            ctrl->bus_id, diag_raw, diag_stat);
+
+    // If TX_EMPTY still not asserted, try harder: disable/re-enable core,
+    // reset TX threshold to 0, clear all status.
+    if (!(diag_raw & DW_IC_INTR_TX_EMPTY)) {
+        kprintf("[I2C%d] probe: TX_EMPTY not asserted, resetting core...\n",
+                ctrl->bus_id);
+        dw_write(ctrl, DW_IC_ENABLE, 0);
+        i2c_delay_us(2000);
+        dw_write(ctrl, DW_IC_TX_TL, 0);
+        dw_write(ctrl, DW_IC_INTR_MASK, 0);
+        (void)dw_read(ctrl, DW_IC_CLR_INTR);
+        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+        dw_write(ctrl, DW_IC_ENABLE, 1);
+        i2c_delay_us(5000);
+        (void)dw_read(ctrl, DW_IC_CLR_INTR);
+        dw_write(ctrl, DW_IC_INTR_MASK, DW_IC_INTR_TX_EMPTY);
+        diag_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+        diag_stat = dw_read(ctrl, DW_IC_INTR_STAT);
+        kprintf("[I2C%d] probe: after reset: RAW_INTR=0x%x INTR_STAT=0x%x "
+                "IC_ENABLE=0x%x STATUS=0x%x\n",
+                ctrl->bus_id, diag_raw, diag_stat,
+                dw_read(ctrl, DW_IC_ENABLE),
+                dw_read(ctrl, DW_IC_STATUS));
+    }
+
+    int found_gsi = -1;
+
+    // Pre-compute LAPIC IRR access for fallback detection
+    uint32_t vec_reg_sw = (uint32_t)vector / 32;
+    uint32_t vec_bit_sw = 1u << ((uint32_t)vector % 32);
+    uint32_t irr_msr_sw = X2APIC_MSR_BASE_LOCAL +
+                           ((LAPIC_IRR_BASE + vec_reg_sw * 0x10) >> 4);
+    uint32_t isr_msr_sw = X2APIC_MSR_BASE_LOCAL +
+                           ((LAPIC_ISR_BASE + vec_reg_sw * 0x10) >> 4);
+
+    // Read actual IPC polarity for the gsi range to decide sweep order.
+    // IPC bit=1 → AHPOLDIS → signal is active-LOW to IOAPIC.
+    // IPC bit=0 → signal is active-HIGH to IOAPIC (default for IRQ 24+).
+    uint32_t ipc0 = itss_pcr_read32(ITSS_IPC0);
+    uint32_t ipc1 = itss_pcr_read32(ITSS_IPC1);
+
+    // Sweep with 4 combinations: {pol-high, pol-low} × {level, edge}.
+    // PCH 600/700 defaults: IRQ 24+ active-HIGH, level-triggered.
+    // But firmware may have changed IPC or the device may use edge mode.
+    static const struct {
+        uint32_t pol_bit;   // bit 13 of RTE low word
+        uint32_t trig_bit;  // bit 15 of RTE low word
+        const char *name;
+    } combos[] = {
+        { 0,        (1u<<15), "high/level" },
+        { (1u<<13), (1u<<15), "low/level"  },
+        { 0,        0,        "high/edge"  },
+        { (1u<<13), 0,        "low/edge"   },
+    };
+
+    for (int ci = 0; ci < 4 && found_gsi < 0; ci++) {
+        for (uint32_t gsi = 24; gsi <= max_gsi && found_gsi < 0; gsi++) {
+            // Skip GSIs already claimed by a previous controller
+            int claimed = 0;
+            for (int k = 0; k < g_i2c_claimed_gsi_count; k++)
+                if (g_i2c_claimed_gsi[k] == (int)gsi) { claimed = 1; break; }
+            if (claimed) continue;
+
+            g_i2c_probe_hit = 0;
+
+            // Re-enable DW interrupt output (ISR disables IC_INTR_MASK
+            // to deassert the level-triggered line before EOI).
+            dw_write(ctrl, DW_IC_INTR_MASK, DW_IC_INTR_TX_EMPTY);
+
+            // Program RTE: fixed delivery to BSP (physical dest mode)
+            uint32_t low = (uint32_t)vector   // IDT vector
+                         | (0u << 8)           // fixed delivery
+                         | (0u << 11)          // physical dest
+                         | combos[ci].pol_bit  // polarity
+                         | combos[ci].trig_bit;// trigger mode
+            // bit 16 = 0 → unmasked
+            uint32_t high = (bsp_apic_id & 0xFF) << 24;  // dest = BSP LAPIC ID
+
+            ioapic_write_rte((uint8_t)gsi, low, high);
+
+            // Give time for the interrupt to propagate
+            // (DW core → ITSS → IOAPIC → LAPIC → ISR)
+            for (volatile int d = 0; d < 8000; d++)
+                __asm__ volatile("pause");
+
+            if (g_i2c_probe_hit) {
+                found_gsi = (int)gsi;
+                kprintf("[I2C%d] IOAPIC probe HIT: GSI %u vector %u (%s)\n",
+                        ctrl->bus_id, gsi, vector, combos[ci].name);
+            } else if (probe_x2apic) {
+                // Fallback: check LAPIC IRR/ISR directly via x2APIC MSR.
+                // If the interrupt reached the LAPIC but the ISR didn't fire
+                // (e.g. LAPIC state issue), we can still detect the correct GSI.
+                uint32_t irr = (uint32_t)i2c_rdmsr(irr_msr_sw);
+                uint32_t isr = (uint32_t)i2c_rdmsr(isr_msr_sw);
+                if ((irr | isr) & vec_bit_sw) {
+                    found_gsi = (int)gsi;
+                    kprintf("[I2C%d] IOAPIC probe HIT (LAPIC IRR/ISR): GSI %u "
+                            "vector %u (%s) IRR=0x%x ISR=0x%x\n",
+                            ctrl->bus_id, gsi, vector, combos[ci].name,
+                            irr, isr);
+                    // Clear the stuck ISR/IRR by sending EOI
+                    if (isr & vec_bit_sw)
+                        i2c_wrmsr(X2APIC_EOI_MSR, 0);
+                }
+            }
+
+            // Mask this entry regardless (if found, we'll reprogram later)
+            ioapic_mask_gsi((uint8_t)gsi);
+        }
+    }
+
+    // If sweep failed, do a final diagnostic: try GSI 24-39 with the
+    // actual IPC polarity and check LAPIC ISR/IRR to see if the interrupt
+    // is arriving at the LAPIC but not being delivered to the CPU.
+    // Detect x2APIC locally (lapic_init hasn't run yet at this init stage).
+    if (found_gsi < 0) {
+        kprintf("[I2C%d] probe: sweep failed, checking LAPIC ISR/IRR...\n",
+                ctrl->bus_id);
+        uint32_t vec_reg = (uint32_t)vector / 32;
+        uint32_t vec_bit = 1u << ((uint32_t)vector % 32);
+
+        // Check IA32_APIC_BASE MSR bit 10 for x2APIC mode
+        uint64_t apic_base_msr = i2c_rdmsr(IA32_APIC_BASE_MSR);
+        int x2apic = (apic_base_msr >> 10) & 1;
+        kprintf("[I2C%d] LAPIC diag: IA32_APIC_BASE=0x%llx x2APIC=%d\n",
+                ctrl->bus_id, (unsigned long long)apic_base_msr, x2apic);
+
+        for (uint32_t gsi = 24; gsi <= 39 && gsi <= max_gsi; gsi++) {
+            dw_write(ctrl, DW_IC_INTR_MASK, DW_IC_INTR_TX_EMPTY);
+
+            // Determine polarity from IPC: active-HIGH unless AHPOLDIS set
+            uint32_t ahpoldis;
+            if (gsi < 32) ahpoldis = (ipc0 >> gsi) & 1;
+            else          ahpoldis = (ipc1 >> (gsi - 32)) & 1;
+            uint32_t pol = ahpoldis ? (1u << 13) : 0;
+
+            uint32_t low = (uint32_t)vector | pol | (1u << 15);
+            ioapic_write_rte((uint8_t)gsi, low, (bsp_apic_id & 0xFF) << 24);
+
+            for (volatile int d = 0; d < 8000; d++)
+                __asm__ volatile("pause");
+
+            // Read LAPIC ISR/IRR — use MSR if x2APIC, else lapic_read()
+            uint32_t isr_val, irr_val;
+            if (x2apic) {
+                uint32_t isr_msr = X2APIC_MSR_BASE_LOCAL +
+                                   ((LAPIC_ISR_BASE + vec_reg * 0x10) >> 4);
+                uint32_t irr_msr = X2APIC_MSR_BASE_LOCAL +
+                                   ((LAPIC_IRR_BASE + vec_reg * 0x10) >> 4);
+                isr_val = (uint32_t)i2c_rdmsr(isr_msr);
+                irr_val = (uint32_t)i2c_rdmsr(irr_msr);
+            } else {
+                uint32_t isr_off = LAPIC_ISR_BASE + vec_reg * 0x10;
+                uint32_t irr_off = LAPIC_IRR_BASE + vec_reg * 0x10;
+                isr_val = lapic_read(isr_off);
+                irr_val = lapic_read(irr_off);
+            }
+
+            if ((isr_val & vec_bit) || (irr_val & vec_bit)) {
+                kprintf("[I2C%d] GSI %u: LAPIC vec %u set ISR=0x%x IRR=0x%x "
+                        "(pol=%s) — interrupt REACHED LAPIC\n",
+                        ctrl->bus_id, gsi, vector, isr_val, irr_val,
+                        ahpoldis ? "low" : "high");
+            }
+            ioapic_mask_gsi((uint8_t)gsi);
+        }
+    }
+
+    // Disable DW interrupt output and clear pending
+    dw_write(ctrl, DW_IC_INTR_MASK, 0);
+    (void)dw_read(ctrl, DW_IC_CLR_INTR);
+
+    // Disable controller again (set_target will re-enable for real transfers)
+    dw_write(ctrl, DW_IC_ENABLE, 0);
+    i2c_delay_us(1000);
+
+    g_i2c_probe_mode = 0;
+
+    // Restore IF to original state
+    if (!(rflags & 0x200))
+        __asm__ volatile("cli");
+
+    if (found_gsi < 0)
+        kprintf("[I2C%d] IOAPIC probe: no GSI found (swept 24-%u, 4 combos)\n",
+                ctrl->bus_id, max_gsi);
+
+    return found_gsi;
+}
+
 static int detect_i2c_controllers(void) {
     int count = 0;
     const pci_device_t *devices;
@@ -1373,14 +1983,185 @@ static int detect_i2c_controllers(void) {
         // does: assert reset, deassert reset, set remap addr.
         // Plus DW core configuration (speed, FIFO, etc).
         if (dw_i2c_init_controller(ctrl) == 0) {
-            uint8_t msi_vector = I2C_MSI_VECTOR_BASE + (uint8_t)count;
-            if (pci_enable_msi(pci_dev, msi_vector) == 0) {
-                ctrl->irq_vector = msi_vector;
+            uint8_t vector = I2C_MSI_VECTOR_BASE + (uint8_t)count;
+            int irq_ok = 0;
+
+            // Dump PCI capability list via ECAM for diagnostics
+            {
+                uint32_t sts = ecam_read32(bus_nr, dev_nr, func_nr, 0x04);
+                kprintf("[I2C%d] PCI STS=0x%04x CMD=0x%04x caplist=%d\n",
+                        ci, (sts >> 16) & 0xFFFF, sts & 0xFFFF,
+                        (int)((sts >> 16) & (1 << 4)) != 0);
+                if ((sts >> 16) & (1 << 4)) {
+                    uint8_t ptr = (uint8_t)(ecam_read32(bus_nr, dev_nr, func_nr, 0x34) & 0xFC);
+                    for (int ci2 = 0; ci2 < 48 && ptr; ci2++) {
+                        uint32_t hdr = ecam_read32(bus_nr, dev_nr, func_nr, ptr);
+                        uint8_t cap_id = (uint8_t)(hdr & 0xFF);
+                        kprintf("[I2C%d]   CAP @ 0x%02x: id=0x%02x\n",
+                                ci, ptr, cap_id);
+                        ptr = (uint8_t)((hdr >> 8) & 0xFC);
+                    }
+                }
+            }
+
+            // Try MSI first (cap 0x05)
+            if (pci_enable_msi(pci_dev, vector) == 0) {
+                kprintf("[I2C%d] MSI vector %u enabled\n", ci, vector);
+                irq_ok = 1;
+            }
+
+            // MSI unavailable — try ACPI _CRS on the controller's own
+            // ACPI device node.  Intel LPSS Serial I/O controllers on
+            // Arrow Lake (and similar PCHs) are absent from the root
+            // bridge's _PRT; instead the BIOS puts an Extended IRQ
+            // resource directly in the controller's _CRS.
+            if (!irq_ok && ctrl->acpi_path[0]) {
+                acpi_crs_result_t crs;
+                if (acpi_aml_eval_crs(ctrl->acpi_path, &crs) == 0 &&
+                    crs.irq_count > 0) {
+                    uint32_t gsi = crs.irqs[0];
+                    uint8_t pol = crs.irq_polarity
+                                  ? IOAPIC_POLARITY_LOW : IOAPIC_POLARITY_HIGH;
+                    uint8_t trig = crs.irq_triggering
+                                   ? IOAPIC_TRIGGER_EDGE : IOAPIC_TRIGGER_LEVEL;
+                    kprintf("[I2C%d] _CRS GSI %u (pol=%u trig=%u)\n",
+                            ci, gsi, pol, trig);
+                    if (ioapic_configure_legacy_irq((uint8_t)gsi, vector,
+                                                    pol, trig) == 0) {
+                        kprintf("[I2C%d] IOAPIC GSI %u -> vector %u\n",
+                                ci, gsi, vector);
+                        irq_ok = 1;
+                    }
+                }
+            }
+
+            // Fall back to IOAPIC via ACPI _PRT on the parent bridge.
+            // Re-read INTPIN from config space (BIOS may program it even
+            // though the PCH datasheet default is 0).
+            if (!irq_ok && ctrl->acpi_path[0]) {
+                char bridge[64];
+                if (acpi_parent_path(ctrl->acpi_path, bridge, sizeof(bridge)) == 0) {
+                    // Read INTPIN fresh via ECAM — the cached pci_device_t
+                    // may have been read via legacy CF8/CFC before BIOS
+                    // finished programming.
+                    uint32_t ireg = ecam_read32(bus_nr, dev_nr, func_nr, 0x3C);
+                    uint8_t pin = (uint8_t)((ireg >> 8) & 0xFF);
+                    uint32_t gsi = 0;
+
+                    kprintf("[I2C%d] PCI INTPIN=%u (fresh ECAM read)\n",
+                            ci, pin);
+
+                    if (pin >= 1 && pin <= 4 &&
+                        acpi_pci_lookup_irq(bridge, dev_nr, pin - 1, &gsi) == 0) {
+                        if (ioapic_configure_legacy_irq((uint8_t)gsi, vector,
+                                                        IOAPIC_POLARITY_LOW,
+                                                        IOAPIC_TRIGGER_LEVEL) == 0) {
+                            kprintf("[I2C%d] IOAPIC GSI %u -> vector %u (PRT pin %u)\n",
+                                    ci, gsi, vector, pin);
+                            irq_ok = 1;
+                        }
+                    }
+
+                    // If INTPIN=0, try each pin (INTA-INTD) against _PRT.
+                    // Some BIOS leave INTPIN=0 but the _PRT still has an
+                    // entry for the device slot.
+                    if (!irq_ok && pin == 0) {
+                        for (uint8_t try_pin = 0; try_pin < 4 && !irq_ok; try_pin++) {
+                            gsi = 0;
+                            if (acpi_pci_lookup_irq(bridge, dev_nr, try_pin, &gsi) == 0) {
+                                if (ioapic_configure_legacy_irq((uint8_t)gsi, vector,
+                                                                IOAPIC_POLARITY_LOW,
+                                                                IOAPIC_TRIGGER_LEVEL) == 0) {
+                                    kprintf("[I2C%d] IOAPIC GSI %u -> vector %u (PRT scan pin %u)\n",
+                                            ci, gsi, vector, try_pin);
+                                    irq_ok = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Last resort: PCI interrupt_line as direct IOAPIC GSI.
+            // On Intel PCH, BIOS often programs INTLINE with the IOAPIC
+            // GSI even when INTPIN=0.  Try using it directly.
+            if (!irq_ok) {
+                uint32_t ireg = ecam_read32(bus_nr, dev_nr, func_nr, 0x3C);
+                uint8_t intline = (uint8_t)(ireg & 0xFF);
+                uint8_t pin = (uint8_t)((ireg >> 8) & 0xFF);
+
+                if (intline != 0 && intline != 0xFF) {
+                    kprintf("[I2C%d] PCI INTx fallback: line=%u pin=%u\n",
+                            ci, intline, pin);
+                    if (ioapic_configure_legacy_irq(intline, vector,
+                                                    IOAPIC_POLARITY_LOW,
+                                                    IOAPIC_TRIGGER_LEVEL) == 0) {
+                        kprintf("[I2C%d] IOAPIC GSI %u -> vector %u\n",
+                                ci, intline, vector);
+                        irq_ok = 1;
+                    }
+                }
+            }
+
+            if (irq_ok) {
+                ctrl->irq_vector = vector;
+                kprintf("[I2C%d] PCI IRQ configured (vector %u)\n", ci, vector);
+            } else {
+                // All standard methods failed (MSI, _CRS, _PRT, INTLINE).
+                // On Arrow Lake PCH 600/700 the LPSS I2C controllers at D21
+                // use direct IOAPIC entries (GSI 24+) programmed by the
+                // firmware through the ITSS.  Neither _PRT nor _CRS exposes
+                // the mapping; Linux relies on VT-d IR.
+                //
+                // Experiment: Write PCI INTLINE with a chosen GSI before
+                // probing. On some PCH revisions the ITSS uses INTLINE to
+                // determine which IOAPIC entry the device's interrupt
+                // routes to. If INTLINE=0 (Dell default), no routing
+                // occurs and the probe sweep will never fire.
+                uint8_t chosen_gsi = (uint8_t)(25 + count);
+                uint32_t ireg_before = ecam_read32(bus_nr, dev_nr, func_nr, 0x3C);
+                ecam_write32(bus_nr, dev_nr, func_nr, 0x3C,
+                             (ireg_before & 0xFFFFFF00u) | chosen_gsi);
+                uint32_t ireg_after = ecam_read32(bus_nr, dev_nr, func_nr, 0x3C);
+                kprintf("[I2C%d] PCI INTLINE: 0x%x -> 0x%x (wrote GSI %u)\n",
+                        ci, ireg_before & 0xFF, ireg_after & 0xFF, chosen_gsi);
+
+                // Probe the IOAPIC: enable the DW core's TX_EMPTY interrupt
+                // and sweep entries 24-119 to find which one fires.
+                kprintf("[I2C%d] Probing IOAPIC for direct GSI (vector %u)...\n",
+                        ci, vector);
+                int gsi = probe_ioapic_i2c_gsi(ctrl, vector);
+                if (gsi >= 0) {
+                    // Found it — configure the IOAPIC entry permanently.
+                    // PCH ITSS IPC default for IRQ 24+: active-HIGH.
+                    if (ioapic_configure_legacy_irq((uint8_t)gsi, vector,
+                                                    IOAPIC_POLARITY_HIGH,
+                                                    IOAPIC_TRIGGER_LEVEL) == 0) {
+                        kprintf("[I2C%d] IOAPIC GSI %d -> vector %u (probed)\n",
+                                ci, gsi, vector);
+                        ctrl->irq_vector = vector;
+                        ctrl->irq_gsi = (uint32_t)gsi;
+                        irq_ok = 1;
+                        // Mask the IOAPIC entry — only unmask during active
+                        // transfers.  The DW core's interrupt output stays
+                        // HIGH even with IC_INTR_MASK=0 (Intel LPSS quirk),
+                        // which causes a 60 kHz ISR storm if left unmasked.
+                        ioapic_mask_gsi((uint8_t)gsi);
+                        // Record this GSI so the next probe doesn't mask it
+                        if (g_i2c_claimed_gsi_count < I2C_DW_MAX_CONTROLLERS)
+                            g_i2c_claimed_gsi[g_i2c_claimed_gsi_count++] = gsi;
+                    }
+                }
+            }
+
+            if (irq_ok) {
                 ctrl->use_interrupts = 1;
-                kprintf("[I2C%d] MSI vector %u enabled\n", ci, msi_vector);
+                // Start with interrupts masked; the transfer routine
+                // enables specific interrupts per-transfer.
                 dw_write(ctrl, DW_IC_INTR_MASK, 0);
                 (void)dw_read(ctrl, DW_IC_CLR_INTR);
             } else {
+                kprintf("[I2C%d] WARNING: no interrupt source, using polled mode\n", ci);
                 ctrl->use_interrupts = 0;
             }
             count++;
@@ -2271,6 +3052,30 @@ static int i2c_hid_init_device(i2c_hid_device_t *dev) {
 
 // ISR: called from irq_handler when an I2C MSI/IOAPIC interrupt fires
 void i2c_hid_irq_handler(uint8_t vector) {
+    // ---- Probe mode: just record that the vector fired and exit ----
+    if (g_i2c_probe_mode) {
+        g_i2c_probe_hit = 1;
+        // Clear interrupt source on all active controllers so the
+        // level-triggered line deasserts before we EOI.
+        for (int c = 0; c < g_i2c_controller_count; c++) {
+            i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
+            if (ctrl->active && ctrl->base) {
+                dw_write(ctrl, DW_IC_INTR_MASK, 0);
+                (void)dw_read(ctrl, DW_IC_CLR_INTR);
+            }
+        }
+        // EOI: use x2APIC MSR directly since lapic_init() hasn't run yet
+        // and lapic_eoi() would use MMIO which is a no-op in x2APIC mode.
+        {
+            uint64_t ab = i2c_rdmsr(IA32_APIC_BASE_MSR);
+            if ((ab >> 10) & 1)
+                i2c_wrmsr(X2APIC_EOI_MSR, 0);
+            else
+                lapic_eoi();
+        }
+        return;
+    }
+
     // Find which controller this vector belongs to
     for (int c = 0; c < g_i2c_controller_count; c++) {
         i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
@@ -2282,6 +3087,15 @@ void i2c_hid_irq_handler(uint8_t vector) {
         // Read and clear interrupt status
         uint32_t stat = dw_read(ctrl, DW_IC_INTR_STAT);
         g_dbg_i2c_isr_count++;
+
+        // Spurious: DW output stuck HIGH with INTR_MASK=0 (LPSS quirk).
+        // Mask the IOAPIC entry to stop the storm; the transfer function
+        // will unmask before the next active transfer.
+        if (stat == 0) {
+            ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
+            lapic_eoi();
+            return;
+        }
 
         if (stat & DW_IC_INTR_TX_ABRT) {
             ctrl->abort_source = dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
@@ -2328,7 +3142,7 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
 
     g_dbg_xfer_total++;
 
-//retry_xfer:
+retry_xfer:
     dw_i2c_set_target(ctrl, addr);
 
     // Clear state flags
@@ -2374,6 +3188,11 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
     int tx_issued = 0;
 
     if (rlen > 0) {
+        // Unmask IOAPIC entry for this transfer (masked when idle to
+        // prevent ISR storm from Intel LPSS DW interrupt output quirk).
+        if (ctrl->use_interrupts && ctrl->irq_gsi)
+            ioapic_unmask_gsi((uint8_t)ctrl->irq_gsi);
+
         // Enable RX_FULL and TX_ABRT interrupts
         dw_write(ctrl, DW_IC_INTR_MASK,
                  DW_IC_INTR_RX_FULL | DW_IC_INTR_TX_ABRT | DW_IC_INTR_STOP_DET);
@@ -2437,6 +3256,10 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
 
         // Disable interrupts after transfer
         dw_write(ctrl, DW_IC_INTR_MASK, 0);
+
+        // Re-mask IOAPIC to prevent ISR storm while idle
+        if (ctrl->use_interrupts && ctrl->irq_gsi)
+            ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
     }
 
     // Wait for bus idle
@@ -2537,14 +3360,18 @@ abort:
                 g_dbg_i2c_isr_count, g_dbg_gpio_isr_count,
                 g_dbg_gpio_isr_hit, g_dbg_gpio_isr_miss);
 
+        // Re-mask IOAPIC to prevent ISR storm while idle
+        if (ctrl->use_interrupts && ctrl->irq_gsi)
+            ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
+
         // 10. Retry once on NACK, ARB_LOST, or pure timeout (abort_src==0
         //     means the hardware didn't report an error but we timed out
         //     waiting for RX data — transient, worth one retry).
-        /*if (retry < 1) {
+        if (retry < 1) {
             retry++;
             g_dbg_xfer_retry_count++;
             goto retry_xfer;
-        }*/
+        }
         return -1;
     }
 }

@@ -2,6 +2,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/ioapic.h"
 #include "../../include/kernel/interrupt.h" // for idt vector constants if needed
+#include "../../include/kernel/lapic.h"     // for lapic_get_id_cpuid
 #include "../../include/kernel/memory.h"    // for phys_to_virt
 #include "../../include/kernel/sched.h"     // for sched_is_smp()
 
@@ -28,7 +29,17 @@ static int g_ioapic_present = 0;
 
 static inline volatile uint32_t* get_ioapic_base(void) {
     if (!ioapic_base) {
-        ioapic_base = (volatile uint32_t*)phys_to_virt(IOAPIC_DEFAULT_BASE);
+        /* IOAPIC uses indirect registers (IOREGSEL/IOWIN) that require UC access.
+           mm_map_device_mmio remaps the direct-map PTE with PWT+PCD (UC-). */
+        void *va = mm_map_device_mmio(IOAPIC_DEFAULT_BASE, 1);
+        if (va) {
+            ioapic_base = (volatile uint32_t*)va;
+            kprintf("IOAPIC: UC-remapped 0x%lx -> VA %p\n",
+                    IOAPIC_DEFAULT_BASE, va);
+        } else {
+            ioapic_base = (volatile uint32_t*)phys_to_virt(IOAPIC_DEFAULT_BASE);
+            kprintf("IOAPIC: WARNING — UC remap failed, using WB direct-map\n");
+        }
     }
     return ioapic_base;
 }
@@ -88,12 +99,12 @@ int ioapic_configure_legacy_irq(uint8_t gsi, uint8_t vector, uint8_t polarity, u
         // Destination field (high dword bits 24-31) = 0xFF (all CPUs)
         high = 0xFF000000;
     } else {
-        // Single CPU: fixed delivery to CPU 0
+        // Single CPU: fixed delivery to BSP
         // Delivery mode = 000 (fixed)
         low |= (IOAPIC_DELMODE_FIXED << 8);
         // Destination mode = 0 (physical)
-        // Destination = 0 (CPU 0)
-        high = 0;
+        // Use CPUID-based APIC ID (works before lapic_init)
+        high = (lapic_get_id_cpuid() & 0xFF) << 24;
     }
     
     // Polarity (bit 13)
@@ -114,4 +125,34 @@ int ioapic_configure_legacy_irq(uint8_t gsi, uint8_t vector, uint8_t polarity, u
             (polarity==IOAPIC_POLARITY_LOW)?"low":"high",
             (trigger_mode==IOAPIC_TRIGGER_LEVEL)?"level":"edge",
             sched_is_smp() ? "lowest-priority" : "fixed");    return 0;
+}
+
+void ioapic_write_rte(uint8_t gsi, uint32_t low, uint32_t high) {
+    ioapic_write(IOAPIC_REG_REDIR(gsi) + 1, high);
+    ioapic_write(IOAPIC_REG_REDIR(gsi), low);
+}
+
+void ioapic_read_rte(uint8_t gsi, uint32_t *low, uint32_t *high) {
+    if (low) *low = ioapic_read(IOAPIC_REG_REDIR(gsi));
+    if (high) *high = ioapic_read(IOAPIC_REG_REDIR(gsi) + 1);
+}
+
+void ioapic_mask_gsi(uint8_t gsi) {
+    uint32_t low = ioapic_read(IOAPIC_REG_REDIR(gsi));
+    low |= (1u << 16);
+    ioapic_write(IOAPIC_REG_REDIR(gsi), low);
+}
+
+void ioapic_unmask_gsi(uint8_t gsi) {
+    uint32_t low = ioapic_read(IOAPIC_REG_REDIR(gsi));
+    low &= ~(1u << 16);
+    ioapic_write(IOAPIC_REG_REDIR(gsi), low);
+}
+
+uint32_t ioapic_max_gsi(void) {
+    if (!g_ioapic_present) {
+        if (ioapic_detect() != 0) return 0;
+    }
+    uint32_t ver = ioapic_read(IOAPIC_REG_VER);
+    return (ver >> 16) & 0xFF;
 }
