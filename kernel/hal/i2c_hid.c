@@ -691,202 +691,17 @@ static int dw_i2c_set_target(i2c_dw_controller_t *ctrl, uint16_t addr) {
     return 0;
 }
 
-// Write bytes to I2C device, then read bytes (write-then-read transaction)
-// wbuf/wlen: bytes to write first (register address, commands, etc.)
-// rbuf/rlen: bytes to read back (0 for write-only)
-// Returns 0 on success, <0 on error
-static int dw_i2c_xfer(i2c_dw_controller_t *ctrl, uint16_t addr,
-                        const uint8_t *wbuf, int wlen,
-                        uint8_t *rbuf, int rlen) {
-    int rc;
-    int retry = 0;
-
-    g_dbg_xfer_total++;
-
-retry_xfer:
-    dw_i2c_set_target(ctrl, addr);
-
-    // Ensure bus is idle before starting a new transfer.
-    dw_i2c_wait_idle(ctrl, 10000);
-
-    // ---- Write phase ----
-    // Push slave address (implicit) + register bytes.
-    // Do NOT issue STOP here when a read phase follows — the bus must
-    // stay active so the read phase can begin with a RESTART.
-    // Only issue STOP on the last write byte for write-only transfers.
-    for (int i = 0; i < wlen; i++) {
-        uint32_t cmd = (uint32_t)wbuf[i];
-
-        // If this is the last write byte AND there's no read phase, send STOP
-        if (i == wlen - 1 && rlen == 0)
-            cmd |= DW_IC_DATA_CMD_STOP;
-        // No STOP when rlen > 0: RESTART will bridge write→read
-
-        rc = dw_i2c_wait_tx_not_full(ctrl, 50000);
-        if (rc < 0) goto abort;
-
-        dw_write(ctrl, DW_IC_DATA_CMD, cmd);
-    }
-
-    // ---- Read phase ----
-    // RESTART replaces STOP between write and read — bus remains active.
-    // The controller sends ACK for every byte except the last, where
-    // STOP is issued (hardware sends NACK + STOP on the final byte).
-    int rx_remain = rlen;
-    int rx_idx = 0;
-    int tx_issued = 0;
-
-    while (rx_remain > 0 || tx_issued < rlen) {
-        // Issue read commands into the command queue.
-        // First read gets RESTART (transitions from write to read
-        // on the same slave address without releasing the bus).
-        // Last read gets STOP (controller sends NACK then STOP).
-        while (tx_issued < rlen) {
-            uint32_t cmd = DW_IC_DATA_CMD_READ;
-
-            // If this was a write-then-read, RESTART before first read
-            if (tx_issued == 0 && wlen > 0)
-                cmd |= DW_IC_DATA_CMD_RESTART;
-
-            // NACK + STOP on last read byte
-            if (tx_issued == rlen - 1)
-                cmd |= DW_IC_DATA_CMD_STOP;
-
-            rc = dw_i2c_wait_tx_not_full(ctrl, 10000);
-            if (rc < 0) goto abort;
-
-            dw_write(ctrl, DW_IC_DATA_CMD, cmd);
-            tx_issued++;
-
-            // Don't overfill TX FIFO — leave room for RX reads
-            if (tx_issued - rx_idx >= (int)ctrl->tx_fifo_depth - 1)
-                break;
-        }
-
-        // Collect received bytes
-        while (rx_idx < tx_issued) {
-            rc = dw_i2c_wait_rx_not_empty(ctrl, 50000);
-            if (rc < 0) goto abort;
-
-            uint32_t data = dw_read(ctrl, DW_IC_DATA_CMD);
-            if (rbuf && rx_idx < rlen)
-                rbuf[rx_idx] = (uint8_t)(data & 0xFF);
-            rx_idx++;
-            rx_remain--;
-        }
-    }
-
-    // Wait for bus idle
-    dw_i2c_wait_idle(ctrl, 10000);
-    g_dbg_xfer_ok++;
-    return 0;
-
-abort:
-    {
-        // 1. Read abort reason (must read before clearing)
-        uint32_t abort_src = dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
-
-        // 2. Disable controller — waits for IC_ENABLE_STATUS to confirm.
-        //    This flushes the TX FIFO and triggers STOP on the bus.
-        dw_write(ctrl, DW_IC_ENABLE, 0);
-        for (int w = 0; w < 10000; w++) {
-            if ((dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN) == 0)
-                break;
-            if (dw_read(ctrl, DW_IC_ENABLE) == 0)
-                break;
-            i2c_delay_us(1);
-        }
-
-        // 3. Clear all pending interrupts
-        (void)dw_read(ctrl, DW_IC_CLR_INTR);
-
-        // 4. Clear abort flag explicitly
-        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-
-        // 5. Flush RX FIFO — discard any stale data
-        while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
-            (void)dw_read(ctrl, DW_IC_DATA_CMD);
-
-        // 6. Issue an explicit STOP on the bus.  Re-enable the controller
-        //    briefly, push a dummy read command with STOP, then disable
-        //    again.  This ensures the bus is released even if the abort
-        //    did not generate an automatic STOP condition.
-        dw_write(ctrl, DW_IC_ENABLE, 1);
-        for (int w = 0; w < 5000; w++) {
-            if (dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN)
-                break;
-            if (dw_read(ctrl, DW_IC_ENABLE) == 1)
-                break;
-            i2c_delay_us(1);
-        }
-        dw_write(ctrl, DW_IC_DATA_CMD, DW_IC_DATA_CMD_STOP);
-        i2c_delay_us(200);  // Let STOP propagate on the bus
-        dw_write(ctrl, DW_IC_ENABLE, 0);
-        for (int w = 0; w < 10000; w++) {
-            if ((dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN) == 0)
-                break;
-            if (dw_read(ctrl, DW_IC_ENABLE) == 0)
-                break;
-            i2c_delay_us(1);
-        }
-        // Clear any status from the STOP command
-        (void)dw_read(ctrl, DW_IC_CLR_INTR);
-        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-
-        // 7. Re-init key registers (controller must be disabled to write these)
-        dw_write(ctrl, DW_IC_TAR, addr & 0x7F);
-        dw_write(ctrl, DW_IC_CON, DW_IC_CON_MASTER | DW_IC_CON_SPEED_SS |
-                                  DW_IC_CON_RESTART_EN | DW_IC_CON_SLAVE_DISABLE);
-
-        // 8. Re-enable controller
-        dw_write(ctrl, DW_IC_ENABLE, 1);
-        for (int w = 0; w < 10000; w++) {
-            if (dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN)
-                break;
-            if (dw_read(ctrl, DW_IC_ENABLE) == 1)
-                break;
-            i2c_delay_us(1);
-        }
-
-        // 9. Save error state for caller diagnostics
-        ctrl->current_target = addr;  // TAR was just re-programmed
-        ctrl->abort_source = abort_src;
-
-        g_dbg_xfer_abort_count++;
-
-        kprintf("[I2C-XFER] ABORT bus=%u addr=0x%02x abort_src=0x%08x "
-                "rx=%d/%d tx=%d/%d retry=%d "
-                "isr=%u gpio_isr=%u hit=%u miss=%u\n",
-                ctrl->bus_id, addr, abort_src,
-                rx_idx, rlen, tx_issued, rlen, retry,
-                g_dbg_i2c_isr_count, g_dbg_gpio_isr_count,
-                g_dbg_gpio_isr_hit, g_dbg_gpio_isr_miss);
-
-        // 10. Retry once on NACK, ARB_LOST, or pure timeout
-        if (retry < 1) {
-            retry++;
-            g_dbg_xfer_retry_count++;
-            goto retry_xfer;
-        }
-        return -1;
-    }
-}
-
 // Convenience: write-only transfer
 static int dw_i2c_write(i2c_dw_controller_t *ctrl, uint16_t addr,
                          const uint8_t *buf, int len) {
-    if (ctrl->use_interrupts)
-        return dw_i2c_xfer_irq(ctrl, addr, buf, len, NULL, 0);
-    return dw_i2c_xfer(ctrl, addr, buf, len, NULL, 0);
+    return dw_i2c_xfer_irq(ctrl, addr, buf, len, NULL, 0);
 }
 
 // Convenience: read with 2-byte register address prefix
 static int dw_i2c_read_reg16(i2c_dw_controller_t *ctrl, uint16_t addr,
                               uint16_t reg, uint8_t *buf, int len) {
     uint8_t regbuf[2] = { (uint8_t)(reg & 0xFF), (uint8_t)((reg >> 8) & 0xFF) };
-    if (ctrl->use_interrupts)
-        return dw_i2c_xfer_irq(ctrl, addr, regbuf, 2, buf, len);
-    return dw_i2c_xfer(ctrl, addr, regbuf, 2, buf, len);
+    return dw_i2c_xfer_irq(ctrl, addr, regbuf, 2, buf, len);
 }
 
 // ============================================================================
@@ -1245,99 +1060,6 @@ static int path_already_listed(char paths[][ACPI_AML_MAX_PATH], int n,
 }
 
 // ============================================================================
-// VT-d Interrupt Remapping — disable if active
-//
-// On Arrow Lake (PCH 600/700), Dell UEFI firmware may leave VT-d interrupt
-// remapping enabled.  When IR is active the IOAPIC RTEs are in "remapped
-// format" (different bit layout) which makes normal RTE programming fail.
-// We parse the ACPI DMAR table, find each DRHD VT-d engine, and disable
-// interrupt remapping so the IOAPIC operates in compatibility mode.
-// ============================================================================
-
-#define VTD_CAP      0x008
-#define VTD_ECAP     0x010
-#define VTD_GCMD     0x018
-#define VTD_GSTS     0x01C
-#define VTD_ECAP_IR  (1ULL << 3)
-#define VTD_GCMD_IRE (1u << 25)
-#define VTD_GSTS_IRES (1u << 25)
-#define VTD_GCMD_TE  (1u << 31)
-#define VTD_GSTS_TES (1u << 31)
-#define VTD_GCMD_QIE (1u << 26)
-#define VTD_GSTS_QIES (1u << 26)
-
-static int g_vtd_ir_disabled = 0;
-
-static void vtd_disable_interrupt_remapping(void)
-{
-    acpi_sdt_header_t *dmar = acpi_find_table("DMAR");
-    if (!dmar) {
-        kprintf("[VT-d] No DMAR table\n");
-        g_vtd_ir_disabled = 1;
-        return;
-    }
-
-    uint32_t dmar_len = dmar->length;
-    uint8_t *data = (uint8_t *)dmar;
-    // DMAR header: 36-byte SDT header + 1 width + 1 flags + 10 reserved = 48
-    uint32_t offset = 48;
-
-    while (offset + 4 <= dmar_len) {
-        uint16_t type, slen;
-        i2c_memcpy(&type, data + offset, 2);
-        i2c_memcpy(&slen, data + offset + 2, 2);
-        if (slen < 4 || offset + slen > dmar_len) break;
-
-        if (type == 0) {  // DRHD
-            uint64_t base_addr;
-            i2c_memcpy(&base_addr, data + offset + 8, 8);
-
-            uint64_t va = mm_map_device_mmio(base_addr, 1);
-            if (!va) { offset += slen; continue; }
-
-            volatile uint8_t *r = (volatile uint8_t *)va;
-            uint64_t ecap = *(volatile uint64_t *)(r + VTD_ECAP);
-
-            if (!(ecap & VTD_ECAP_IR)) {
-                kprintf("[VT-d] DRHD 0x%llx: no IR cap\n",
-                        (unsigned long long)base_addr);
-                offset += slen;
-                continue;
-            }
-
-            uint32_t gsts = *(volatile uint32_t *)(r + VTD_GSTS);
-            if (gsts & VTD_GSTS_IRES) {
-                kprintf("[VT-d] DRHD 0x%llx: IR active, disabling\n",
-                        (unsigned long long)base_addr);
-                // Construct GCMD from current GSTS (one-shot bits):
-                // preserve TE (translation enable) and QIE, clear IRE
-                uint32_t gcmd = 0;
-                if (gsts & VTD_GSTS_TES) gcmd |= VTD_GCMD_TE;
-                if (gsts & VTD_GSTS_QIES) gcmd |= VTD_GCMD_QIE;
-                // Do NOT set VTD_GCMD_IRE → this disables IR
-                *(volatile uint32_t *)(r + VTD_GCMD) = gcmd;
-
-                for (int w = 0; w < 100000; w++) {
-                    gsts = *(volatile uint32_t *)(r + VTD_GSTS);
-                    if (!(gsts & VTD_GSTS_IRES)) break;
-                    i2c_delay_us(1);
-                }
-                if (gsts & VTD_GSTS_IRES)
-                    kprintf("[VT-d] WARNING: IR disable timed out\n");
-                else
-                    kprintf("[VT-d] IR disabled on DRHD 0x%llx\n",
-                            (unsigned long long)base_addr);
-            } else {
-                kprintf("[VT-d] DRHD 0x%llx: IR not active\n",
-                        (unsigned long long)base_addr);
-            }
-        }
-        offset += slen;
-    }
-    g_vtd_ir_disabled = 1;
-}
-
-// ============================================================================
 // IOAPIC interrupt probe for I2C controllers
 //
 // Intel PCH 600/700 Serial IO (D21) uses "direct" IOAPIC entries (GSI 24+),
@@ -1499,10 +1221,6 @@ static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
 {
     uint32_t max_gsi = ioapic_max_gsi();
     if (max_gsi < 24) return -1;
-
-    // Ensure VT-d IR is disabled so IOAPIC RTEs use compatibility format
-    if (!g_vtd_ir_disabled)
-        vtd_disable_interrupt_remapping();
 
     // Dump firmware state before we touch anything
     probe_dump_diagnostics(max_gsi);
@@ -2155,14 +1873,12 @@ static int detect_i2c_controllers(void) {
             }
 
             if (irq_ok) {
-                ctrl->use_interrupts = 1;
                 // Start with interrupts masked; the transfer routine
                 // enables specific interrupts per-transfer.
                 dw_write(ctrl, DW_IC_INTR_MASK, 0);
                 (void)dw_read(ctrl, DW_IC_CLR_INTR);
             } else {
-                kprintf("[I2C%d] WARNING: no interrupt source, using polled mode\n", ci);
-                ctrl->use_interrupts = 0;
+                kprintf("[I2C%d] WARNING: no interrupt source found\n", ci);
             }
             count++;
         }
@@ -2277,11 +1993,7 @@ static int i2c_hid_reset(i2c_hid_device_t *dev) {
     if (!resp) {
         // Fallback: stack buffer for minimal drain during early init
         uint8_t resp_stack[I2C_HID_LENGTH_HDR_SIZE];
-        if (dev->ctrl->use_interrupts)
-            dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
-                             resp_stack, I2C_HID_LENGTH_HDR_SIZE);
-        else
-            dw_i2c_xfer(dev->ctrl, dev->i2c_addr, NULL, 0,
+        dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
                          resp_stack, I2C_HID_LENGTH_HDR_SIZE);
         uint16_t rst_len = (uint16_t)resp_stack[0] | ((uint16_t)resp_stack[1] << 8);
         kprintf("[I2C-HID] RESET completion (minimal): len=%u [%02x %02x]\n",
@@ -3079,7 +2791,7 @@ void i2c_hid_irq_handler(uint8_t vector) {
     // Find which controller this vector belongs to
     for (int c = 0; c < g_i2c_controller_count; c++) {
         i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
-        if (!ctrl->active || !ctrl->use_interrupts)
+        if (!ctrl->active)
             continue;
         if (ctrl->irq_vector != vector)
             continue;
@@ -3190,7 +2902,7 @@ retry_xfer:
     if (rlen > 0) {
         // Unmask IOAPIC entry for this transfer (masked when idle to
         // prevent ISR storm from Intel LPSS DW interrupt output quirk).
-        if (ctrl->use_interrupts && ctrl->irq_gsi)
+        if (ctrl->irq_gsi)
             ioapic_unmask_gsi((uint8_t)ctrl->irq_gsi);
 
         // Enable RX_FULL and TX_ABRT interrupts
@@ -3258,7 +2970,7 @@ retry_xfer:
         dw_write(ctrl, DW_IC_INTR_MASK, 0);
 
         // Re-mask IOAPIC to prevent ISR storm while idle
-        if (ctrl->use_interrupts && ctrl->irq_gsi)
+        if (ctrl->irq_gsi)
             ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
     }
 
@@ -3361,7 +3073,7 @@ abort:
                 g_dbg_gpio_isr_hit, g_dbg_gpio_isr_miss);
 
         // Re-mask IOAPIC to prevent ISR storm while idle
-        if (ctrl->use_interrupts && ctrl->irq_gsi)
+        if (ctrl->irq_gsi)
             ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
 
         // 10. Retry once on NACK, ARB_LOST, or pure timeout (abort_src==0
@@ -4348,11 +4060,7 @@ static int i2c_hid_read_length_first(i2c_hid_device_t *dev,
     int rc;
 
     // Step 1: Read 2-byte length prefix
-    if (dev->ctrl->use_interrupts)
-        rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
-                              hdr, I2C_HID_LENGTH_HDR_SIZE);
-    else
-        rc = dw_i2c_xfer(dev->ctrl, dev->i2c_addr, NULL, 0,
+    rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
                           hdr, I2C_HID_LENGTH_HDR_SIZE);
     if (rc < 0) return rc;
 
@@ -4370,11 +4078,7 @@ static int i2c_hid_read_length_first(i2c_hid_device_t *dev,
         pkt_len = buf_size;
 
     // Step 2: Read the full report (device re-sends from the beginning)
-    if (dev->ctrl->use_interrupts)
-        rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
-                              buf, pkt_len);
-    else
-        rc = dw_i2c_xfer(dev->ctrl, dev->i2c_addr, NULL, 0,
+    rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
                           buf, pkt_len);
     if (rc < 0) return rc;
 

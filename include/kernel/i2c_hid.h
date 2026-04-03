@@ -434,7 +434,6 @@ typedef struct {
     char               acpi_path[64]; // ACPI device path (e.g. "\\_SB.PCI0.I2C0")
     uint32_t           irq_gsi;     // ACPI GSI for this controller (from _CRS)
     uint8_t            irq_vector;  // IDT vector assigned for this controller
-    uint8_t            use_interrupts; // 1 if interrupt mode active
     volatile uint8_t   irq_pending; // Set by ISR, cleared by handler
     volatile uint8_t   tx_complete; // TX complete flag (set by ISR)
     volatile uint8_t   rx_ready;    // RX data available (set by ISR)
