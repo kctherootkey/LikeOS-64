@@ -83,6 +83,7 @@
 #define DW_IC_CLR_STOP_DET        0x60
 #define DW_IC_CLR_START_DET       0x64
 #define DW_IC_CLR_GEN_CALL        0x68
+#define DW_IC_CLR_RESTART_DET     0xA8
 #define DW_IC_ENABLE              0x6C    // Enable
 #define DW_IC_STATUS              0x70    // Status
 #define DW_IC_TXFLR               0x74    // TX FIFO level
@@ -92,6 +93,7 @@
 #define DW_IC_SDA_SETUP           0x94    // SDA setup time
 #define DW_IC_ENABLE_STATUS       0x9C    // Enable status
 #define DW_IC_FS_SPKLEN           0xA0    // SS and FS spike suppression limit
+#define DW_IC_SMBUS_INTR_MASK     0xCC    // SMBus interrupt mask
 #define DW_IC_COMP_PARAM_1        0xF4    // Component parameter
 #define DW_IC_COMP_VERSION        0xF8    // Component version
 #define DW_IC_COMP_TYPE           0xFC    // Component type (expect 0x44570140)
@@ -174,6 +176,7 @@
 #define DW_IC_CON_10BITADDR_MSTR  (1 << 4)
 #define DW_IC_CON_RESTART_EN      (1 << 5)    // Enable restart
 #define DW_IC_CON_SLAVE_DISABLE   (1 << 6)    // Disable slave mode
+#define DW_IC_CON_BUS_CLEAR_CTRL  (1 << 11)   // Preserve HW bus-clear when advertised
 
 // IC_DATA_CMD bits
 #define DW_IC_DATA_CMD_READ       (1 << 8)    // Read from slave
@@ -201,9 +204,17 @@
 #define DW_IC_INTR_STOP_DET      (1 << 9)
 #define DW_IC_INTR_START_DET     (1 << 10)
 #define DW_IC_INTR_GEN_CALL      (1 << 11)
+#define DW_IC_INTR_RESTART_DET   (1 << 12)
+#define DW_IC_INTR_MST_ON_HOLD   (1 << 13)
 
 // IC_ENABLE_STATUS bits
 #define DW_IC_EN_STATUS_IC_EN    (1 << 0)
+
+// IC_ENABLE bits
+#define DW_IC_ENABLE_ABORT       (1 << 1)
+
+// Additional IC_STATUS bits
+#define DW_IC_STATUS_MST_HOLD_TX_FIFO_EMPTY (1 << 7)
 
 // Expected component type magic
 #define DW_IC_COMP_TYPE_VALUE    0x44570140
@@ -442,7 +453,17 @@ typedef struct {
     volatile uint8_t   rx_ready;    // RX data available (set by ISR)
     volatile uint8_t   xfer_error;  // Transfer error (set by ISR)
     volatile uint32_t  abort_source; // TX_ABRT_SOURCE captured by ISR
+    volatile uint32_t  last_abort_source; // Most recent TX_ABRT_SOURCE seen by transfer path
     uint16_t           current_target; // Last programmed target addr (0xFFFF = none)
+    uint32_t           configured_bus_speed; // Active bus speed in Hz
+    uint16_t           ss_hcnt;
+    uint16_t           ss_lcnt;
+    uint16_t           fs_hcnt;
+    uint16_t           fs_lcnt;
+    uint32_t           ss_sda_hold;
+    uint32_t           fs_sda_hold;
+    uint8_t            have_ss_timing;
+    uint8_t            have_fs_timing;
     spinlock_t         lock;        // Protects I2C bus access (worker thread serialization)
     volatile int       worker_running; // Worker thread alive flag
 } i2c_dw_controller_t;
@@ -476,7 +497,8 @@ typedef struct {
     uint32_t             gpio_pad_dw0;     // Expected PAD_CFG_DW0 (critical bits)
     uint16_t             error_count;      // Consecutive I2C transfer errors
     uint32_t             backoff_until;    // Poll counter to skip until (error backoff)
-    uint8_t              silent_verify_done; // One-shot passive verify attempted after abort
+    uint32_t             silent_verify_after; // Next scheduled passive verify tick
+    uint8_t              silent_verify_attempts; // Exponential backoff level for passive verify
     spinlock_t           dev_lock;         // Protects device flags (ISR ↔ worker)
     volatile int         work_pending;     // Set by GPIO ISR, cleared by worker
     void                *worker_channel;   // Sleep/wake channel for worker thread
