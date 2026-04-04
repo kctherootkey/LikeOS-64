@@ -1058,6 +1058,45 @@ int acpi_aml_exec_device_method(const char* device_path,
     return 0;
 }
 
+int acpi_aml_exec_device_method_pkg3(const char* device_path,
+                                     const char* method_name,
+                                     uint64_t out_values[3])
+{
+    ACPI_HANDLE handle;
+    ACPI_STATUS status;
+    ACPI_BUFFER buf = {ACPI_ALLOCATE_BUFFER, NULL};
+    int rc = -1;
+
+    if (!device_path || !method_name || !out_values)
+        return -1;
+
+    status = AcpiGetHandle(NULL, (char*)device_path, &handle);
+    if (ACPI_FAILURE(status))
+        return -1;
+
+    status = AcpiEvaluateObject(handle, (char*)method_name, NULL, &buf);
+    if (ACPI_FAILURE(status))
+        return -1;
+
+    if (buf.Pointer) {
+        ACPI_OBJECT *obj = (ACPI_OBJECT*)buf.Pointer;
+        if (obj->Type == ACPI_TYPE_PACKAGE && obj->Package.Count >= 3) {
+            ACPI_OBJECT *elems = obj->Package.Elements;
+            if (elems[0].Type == ACPI_TYPE_INTEGER &&
+                elems[1].Type == ACPI_TYPE_INTEGER &&
+                elems[2].Type == ACPI_TYPE_INTEGER) {
+                out_values[0] = elems[0].Integer.Value;
+                out_values[1] = elems[1].Integer.Value;
+                out_values[2] = elems[2].Integer.Value;
+                rc = 0;
+            }
+        }
+        AcpiOsFree(buf.Pointer);
+    }
+
+    return rc;
+}
+
 // ============================================================================
 // ACPI Power Management — S5 (poweroff) and reset
 // ============================================================================

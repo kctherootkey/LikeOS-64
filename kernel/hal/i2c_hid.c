@@ -41,6 +41,13 @@ static volatile uint32_t g_dbg_xfer_total = 0;         // Total xfer calls
 static volatile uint32_t g_dbg_xfer_ok = 0;            // Successful xfers
 static volatile uint64_t g_dbg_last_print_uptime = 0;  // Last periodic debug print time
 
+#define I2C_SPEED_STANDARD_HZ 100000U
+#define I2C_SPEED_FAST_HZ     400000U
+
+static void dw_i2c_cache_acpi_timings(i2c_dw_controller_t *ctrl);
+static void dw_i2c_program_bus_timing(i2c_dw_controller_t *ctrl,
+                                      uint32_t speed_hz);
+
 // ============================================================================
 // Private data
 // ============================================================================
@@ -431,6 +438,30 @@ static void ecam_write16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, u
 // ============================================================================
 
 static int dw_i2c_disable(i2c_dw_controller_t *ctrl) {
+    uint32_t raw_intr = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+    uint32_t status = dw_read(ctrl, DW_IC_STATUS);
+    uint32_t enable = dw_read(ctrl, DW_IC_ENABLE);
+
+    // Linux handles a DW master that is still holding the bus with an empty
+    // TX FIFO by requesting a hardware abort before disable. Without this,
+    // disabling mid-hold can strand the controller and all later pure reads
+    // devolve into abort_src=0x0 with no further GPIO activity.
+    if ((raw_intr & DW_IC_INTR_MST_ON_HOLD) ||
+        (status & DW_IC_STATUS_MST_HOLD_TX_FIFO_EMPTY)) {
+        if (!(enable & 1)) {
+            dw_write(ctrl, DW_IC_ENABLE, 1);
+            i2c_delay_us(25);
+            enable = 1;
+        }
+
+        dw_write(ctrl, DW_IC_ENABLE, enable | DW_IC_ENABLE_ABORT);
+        for (int i = 0; i < 100; i++) {
+            if (!(dw_read(ctrl, DW_IC_ENABLE) & DW_IC_ENABLE_ABORT))
+                break;
+            i2c_delay_us(10);
+        }
+    }
+
     dw_write(ctrl, DW_IC_ENABLE, 0);
 
     // On Arrow Lake, IC_ENABLE_STATUS (0x9C) reads as SRAM garbage when
@@ -472,10 +503,85 @@ static int dw_i2c_enable(i2c_dw_controller_t *ctrl) {
     return 0;
 }
 
+static int dw_i2c_wait_bus_not_busy(i2c_dw_controller_t *ctrl, int timeout_us);
+
+static void dw_i2c_clear_pending_irqs(i2c_dw_controller_t *ctrl)
+{
+    uint32_t raw_stat = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+
+    if (raw_stat & DW_IC_INTR_TX_ABRT)
+        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+    if (raw_stat & DW_IC_INTR_STOP_DET)
+        (void)dw_read(ctrl, DW_IC_CLR_STOP_DET);
+    if (raw_stat & DW_IC_INTR_START_DET)
+        (void)dw_read(ctrl, DW_IC_CLR_START_DET);
+    if (raw_stat & DW_IC_INTR_RESTART_DET)
+        (void)dw_read(ctrl, DW_IC_CLR_RESTART_DET);
+    if (raw_stat & DW_IC_INTR_RX_OVER)
+        (void)dw_read(ctrl, DW_IC_CLR_RX_OVER);
+    if (raw_stat & DW_IC_INTR_RX_UNDER)
+        (void)dw_read(ctrl, DW_IC_CLR_RX_UNDER);
+    if (raw_stat & DW_IC_INTR_TX_OVER)
+        (void)dw_read(ctrl, DW_IC_CLR_TX_OVER);
+    if (raw_stat & DW_IC_INTR_ACTIVITY)
+        (void)dw_read(ctrl, DW_IC_CLR_ACTIVITY);
+    (void)dw_read(ctrl, DW_IC_CLR_INTR);
+}
+
+static void dw_i2c_recover_aborted_xfer(i2c_dw_controller_t *ctrl)
+{
+    uint32_t status;
+    uint32_t enable;
+    uint32_t raw_stat;
+
+    dw_write(ctrl, DW_IC_INTR_MASK, 0);
+
+    status = dw_read(ctrl, DW_IC_STATUS);
+    enable = dw_read(ctrl, DW_IC_ENABLE);
+    raw_stat = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+
+    if ((enable & 1) &&
+        ((raw_stat & (DW_IC_INTR_TX_ABRT | DW_IC_INTR_MST_ON_HOLD |
+                      DW_IC_INTR_STOP_DET)) ||
+         (status & (DW_IC_STATUS_ACTIVITY | DW_IC_STATUS_MST_ACTIVITY |
+                    DW_IC_STATUS_MST_HOLD_TX_FIFO_EMPTY)))) {
+        dw_write(ctrl, DW_IC_ENABLE, 1 | DW_IC_ENABLE_ABORT);
+        for (int i = 0; i < 2500; i++) {
+            uint32_t cur_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+            uint32_t cur_status = dw_read(ctrl, DW_IC_STATUS);
+            uint32_t cur_enable = dw_read(ctrl, DW_IC_ENABLE);
+
+            if (cur_raw & DW_IC_INTR_STOP_DET) {
+                (void)dw_read(ctrl, DW_IC_CLR_STOP_DET);
+                break;
+            }
+
+            if (!(cur_enable & DW_IC_ENABLE_ABORT) &&
+                !(cur_status & (DW_IC_STATUS_ACTIVITY |
+                                DW_IC_STATUS_MST_ACTIVITY |
+                                DW_IC_STATUS_MST_HOLD_TX_FIFO_EMPTY))) {
+                break;
+            }
+
+            i2c_delay_us(10);
+        }
+    }
+
+    dw_i2c_disable(ctrl);
+    dw_i2c_wait_bus_not_busy(ctrl, 25000);
+    dw_i2c_clear_pending_irqs(ctrl);
+
+    while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
+        (void)dw_read(ctrl, DW_IC_DATA_CMD);
+
+    ctrl->current_target = 0xFFFF;
+}
+
 static int dw_i2c_init_controller(i2c_dw_controller_t *ctrl) {
     volatile uint8_t *priv = (volatile uint8_t *)ctrl->base + 0x200;
     uint32_t bar_lo = (uint32_t)(ctrl->bar_phys & 0xFFFFFFFF);
     uint32_t bar_hi = (uint32_t)(ctrl->bar_phys >> 32);
+    uint32_t ic_con_existing;
     int dw_alive = 0;
 
     // ---- intel_lpss_init_dev() equivalent ----
@@ -544,26 +650,17 @@ static int dw_i2c_init_controller(i2c_dw_controller_t *ctrl) {
     ctrl->tx_fifo_depth = tx_depth;
 
     // ---- Step 7: Configure controller ----
-    // Master mode, fast speed (400kHz), 7-bit addressing, restart enable
-    uint32_t ic_con = DW_IC_CON_MASTER | DW_IC_CON_SPEED_FS |
-                      DW_IC_CON_RESTART_EN | DW_IC_CON_SLAVE_DISABLE;
-    dw_write(ctrl, DW_IC_CON, ic_con);
-
-    // Standard mode SCL timing (100kHz fallback, not used in FS mode)
-    dw_write(ctrl, DW_IC_SS_SCL_HCNT, 500);
-    dw_write(ctrl, DW_IC_SS_SCL_LCNT, 588);
-
-    // Fast mode SCL timing (400kHz, derived from IC_CLK ~110MHz)
-    // tHIGH = (HCNT + SPKLEN + 7) / IC_CLK >= 0.6µs
-    // tLOW  = (LCNT + 1)            / IC_CLK >= 1.3µs
-    dw_write(ctrl, DW_IC_FS_SCL_HCNT, 80);
-    dw_write(ctrl, DW_IC_FS_SCL_LCNT, 186);
-
-    // SDA hold time
-    dw_write(ctrl, DW_IC_SDA_HOLD, 0x001C001C);
+    ic_con_existing = dw_read(ctrl, DW_IC_CON);
+    (void)ic_con_existing;
+    dw_i2c_program_bus_timing(ctrl, I2C_SPEED_STANDARD_HZ);
 
     // Spike suppression filter (SS/FS datasheet default = 7)
     dw_write(ctrl, DW_IC_FS_SPKLEN, 7);
+
+    // Firmware can leave the SMBus sideband interrupt block armed.
+    // Linux explicitly masks it during init to avoid unrelated interrupt
+    // status from perturbing the controller state machine.
+    dw_write(ctrl, DW_IC_SMBUS_INTR_MASK, 0);
 
     // FIFO thresholds
     dw_write(ctrl, DW_IC_RX_TL, 0);
@@ -633,6 +730,124 @@ static void i2c_hid_worker_thread(void *arg);
 static int i2c_hid_read_length_first(i2c_hid_device_t *dev,
                                      uint8_t *buf, uint16_t buf_size);
 
+// Forward declaration for effective HID input read length
+static uint16_t i2c_hid_input_read_len(const i2c_hid_device_t *dev);
+
+// Forward declaration for passive verify backoff
+static uint32_t i2c_hid_silent_verify_delay_ticks(uint8_t attempts);
+
+static uint16_t dw_i2c_clamp_count(uint64_t value, uint16_t fallback)
+{
+    if (value == 0 || value > 0xFFFF)
+        return fallback;
+    return (uint16_t)value;
+}
+
+static uint32_t dw_i2c_clamp_hold(uint64_t value, uint32_t fallback)
+{
+    if (value == 0 || value > 0xFFFFFFFFULL)
+        return fallback;
+    return (uint32_t)value;
+}
+
+static void dw_i2c_cache_acpi_timings(i2c_dw_controller_t *ctrl)
+{
+    uint64_t values[3];
+
+    if (!ctrl->acpi_path[0])
+        return;
+
+    if (acpi_aml_exec_device_method_pkg3(ctrl->acpi_path, "SSCN", values) == 0) {
+        ctrl->ss_hcnt = dw_i2c_clamp_count(values[0], 500);
+        ctrl->ss_lcnt = dw_i2c_clamp_count(values[1], 588);
+        ctrl->ss_sda_hold = dw_i2c_clamp_hold(values[2], 0x001C001C);
+        ctrl->have_ss_timing = 1;
+        kprintf("[I2C%d] ACPI SSCN h=%u l=%u hold=0x%x\n",
+                ctrl->bus_id, ctrl->ss_hcnt, ctrl->ss_lcnt,
+                ctrl->ss_sda_hold);
+    }
+
+    if (acpi_aml_exec_device_method_pkg3(ctrl->acpi_path, "FMCN", values) == 0) {
+        ctrl->fs_hcnt = dw_i2c_clamp_count(values[0], 160);
+        ctrl->fs_lcnt = dw_i2c_clamp_count(values[1], 320);
+        ctrl->fs_sda_hold = dw_i2c_clamp_hold(values[2], 0x001C001C);
+        ctrl->have_fs_timing = 1;
+        kprintf("[I2C%d] ACPI FMCN h=%u l=%u hold=0x%x\n",
+                ctrl->bus_id, ctrl->fs_hcnt, ctrl->fs_lcnt,
+                ctrl->fs_sda_hold);
+    }
+}
+
+static void dw_i2c_program_bus_timing(i2c_dw_controller_t *ctrl,
+                                      uint32_t speed_hz)
+{
+    uint16_t ss_hcnt = ctrl->have_ss_timing ? ctrl->ss_hcnt : 500;
+    uint16_t ss_lcnt = ctrl->have_ss_timing ? ctrl->ss_lcnt : 588;
+    uint16_t fs_hcnt = ctrl->have_fs_timing ? ctrl->fs_hcnt : 160;
+    uint16_t fs_lcnt = ctrl->have_fs_timing ? ctrl->fs_lcnt : 320;
+    uint32_t ic_con_existing = dw_read(ctrl, DW_IC_CON);
+    uint32_t speed_bits = DW_IC_CON_SPEED_SS;
+    uint32_t sda_hold = ctrl->have_ss_timing ? ctrl->ss_sda_hold : 0x001C001C;
+
+    if (speed_hz > I2C_SPEED_STANDARD_HZ) {
+        speed_bits = DW_IC_CON_SPEED_FS;
+        sda_hold = ctrl->have_fs_timing ? ctrl->fs_sda_hold : 0x001C001C;
+        ctrl->configured_bus_speed = I2C_SPEED_FAST_HZ;
+    } else {
+        ctrl->configured_bus_speed = I2C_SPEED_STANDARD_HZ;
+    }
+
+    dw_write(ctrl, DW_IC_CON,
+             DW_IC_CON_MASTER | speed_bits |
+             DW_IC_CON_RESTART_EN | DW_IC_CON_SLAVE_DISABLE |
+             (ic_con_existing & DW_IC_CON_BUS_CLEAR_CTRL));
+    dw_write(ctrl, DW_IC_SS_SCL_HCNT, ss_hcnt);
+    dw_write(ctrl, DW_IC_SS_SCL_LCNT, ss_lcnt);
+    dw_write(ctrl, DW_IC_FS_SCL_HCNT, fs_hcnt);
+    dw_write(ctrl, DW_IC_FS_SCL_LCNT, fs_lcnt);
+    dw_write(ctrl, DW_IC_SDA_HOLD, sda_hold);
+}
+
+static int dw_i2c_apply_bus_speed(i2c_dw_controller_t *ctrl,
+                                  uint32_t speed_hz,
+                                  const char *reason)
+{
+    uint32_t target_speed = speed_hz;
+
+    if (target_speed == 0)
+        target_speed = ctrl->have_fs_timing ? I2C_SPEED_FAST_HZ :
+                       I2C_SPEED_STANDARD_HZ;
+    else if (target_speed > I2C_SPEED_STANDARD_HZ)
+        target_speed = I2C_SPEED_FAST_HZ;
+    else
+        target_speed = I2C_SPEED_STANDARD_HZ;
+
+    if (ctrl->configured_bus_speed == target_speed)
+        return 0;
+
+    if (dw_i2c_wait_bus_not_busy(ctrl, 20000) < 0)
+        dw_i2c_disable(ctrl);
+
+    dw_i2c_disable(ctrl);
+    (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+    (void)dw_read(ctrl, DW_IC_CLR_INTR);
+    dw_i2c_program_bus_timing(ctrl, target_speed);
+    ctrl->current_target = 0xFFFF;
+
+    kprintf("[I2C%d] bus timing: %s speed=%u ss=%u/%u fs=%u/%u hold=0x%x\n",
+            ctrl->bus_id,
+            reason ? reason : "apply",
+            ctrl->configured_bus_speed,
+            ctrl->have_ss_timing ? ctrl->ss_hcnt : 500,
+            ctrl->have_ss_timing ? ctrl->ss_lcnt : 588,
+            ctrl->have_fs_timing ? ctrl->fs_hcnt : 160,
+            ctrl->have_fs_timing ? ctrl->fs_lcnt : 320,
+            (ctrl->configured_bus_speed > I2C_SPEED_STANDARD_HZ) ?
+                (ctrl->have_fs_timing ? ctrl->fs_sda_hold : 0x001C001C) :
+                (ctrl->have_ss_timing ? ctrl->ss_sda_hold : 0x001C001C));
+    return 0;
+}
+
 // Wait for TX FIFO to have space (not full)
 static int dw_i2c_wait_tx_not_full(i2c_dw_controller_t *ctrl, int timeout_us) {
     for (int i = 0; i < timeout_us; i++) {
@@ -658,6 +873,17 @@ static int dw_i2c_wait_rx_not_empty(i2c_dw_controller_t *ctrl, int timeout_us) {
     return -1;
 }
 
+static int dw_i2c_wait_bus_not_busy(i2c_dw_controller_t *ctrl, int timeout_us)
+{
+    for (int i = 0; i < timeout_us; i++) {
+        uint32_t status = dw_read(ctrl, DW_IC_STATUS);
+        if (!(status & DW_IC_STATUS_ACTIVITY))
+            return 0;
+        i2c_delay_us(1);
+    }
+    return -1;
+}
+
 // Wait for all bus activity to complete
 static int dw_i2c_wait_idle(i2c_dw_controller_t *ctrl, int timeout_us) {
     for (int i = 0; i < timeout_us; i++) {
@@ -674,6 +900,12 @@ static int dw_i2c_wait_idle(i2c_dw_controller_t *ctrl, int timeout_us) {
 // Always disable → set TAR → re-enable for a clean bus state.
 // This matches Linux i2c-designware-master.c i2c_dw_xfer_init().
 static int dw_i2c_set_target(i2c_dw_controller_t *ctrl, uint16_t addr) {
+    if (dw_i2c_wait_bus_not_busy(ctrl, 20000) < 0)
+        dw_i2c_disable(ctrl);
+
+    if (dw_i2c_wait_bus_not_busy(ctrl, 20000) < 0)
+        return -1;
+
     dw_i2c_disable(ctrl);
 
     // Clear any stale abort/interrupt status
@@ -691,6 +923,7 @@ static int dw_i2c_set_target(i2c_dw_controller_t *ctrl, uint16_t addr) {
 
     // Clear interrupts again after enable (like Linux)
     (void)dw_read(ctrl, DW_IC_CLR_INTR);
+    (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
 
     ctrl->current_target = addr;
     return 0;
@@ -1603,6 +1836,7 @@ static int detect_i2c_controllers(void) {
                 n_acpi++;
             }
         }
+
     }
 
     kprintf("[I2C] %d controller(s)\n", n_ctrl);
@@ -1624,6 +1858,7 @@ static int detect_i2c_controllers(void) {
         if (ctrl_info[ci].acpi_path[0])
             i2c_memcpy(ctrl->acpi_path, ctrl_info[ci].acpi_path,
                        sizeof(ctrl->acpi_path));
+        dw_i2c_cache_acpi_timings(ctrl);
 
         // ====================================================================
         // Follow the Linux intel-lpss PCI probe sequence exactly:
@@ -1639,7 +1874,6 @@ static int detect_i2c_controllers(void) {
         // Linux does NOT touch D0I3C, PG_CONFIG, or any other
         // vendor-specific PCI config registers during probe.
         // ====================================================================
-
         // ---- Step 1: Read BAR0 from config space ----
         // Linux PCI core reads BARs during enumeration (before any driver).
         // pci_assign_unassigned_bars() already assigned 64-bit BARs from the
@@ -1919,8 +2153,13 @@ static int i2c_hid_fetch_descriptor(i2c_dw_controller_t *ctrl, uint16_t addr,
 }
 
 // Try to discover an I2C HID device at a given address
-static int i2c_hid_probe_device(i2c_dw_controller_t *ctrl, uint16_t addr) {
+static int i2c_hid_probe_device(i2c_dw_controller_t *ctrl,
+                                uint16_t addr,
+                                uint32_t connection_speed) {
     if (g_i2c_hid_device_count >= I2C_HID_MAX_DEVICES)
+        return -1;
+
+    if (dw_i2c_apply_bus_speed(ctrl, connection_speed, "probe") < 0)
         return -1;
 
     i2c_hid_device_t *dev = &g_i2c_hid_devices[g_i2c_hid_device_count];
@@ -1957,32 +2196,34 @@ static int i2c_hid_probe_device(i2c_dw_controller_t *ctrl, uint16_t addr) {
 // HID over I2C — Commands
 // ============================================================================
 
-static int i2c_hid_set_power(i2c_hid_device_t *dev, uint16_t power_state) {
+static int i2c_hid_write_simple_command(i2c_hid_device_t *dev,
+                                        uint16_t opcode,
+                                        uint8_t arg,
+                                        const char *name)
+{
     uint16_t cmd_reg = dev->desc.wCommandRegister;
-    uint16_t opcode = I2C_HID_OPCODE_SET_POWER | power_state;
     uint8_t buf[4] = {
         (uint8_t)(cmd_reg & 0xFF),
         (uint8_t)((cmd_reg >> 8) & 0xFF),
-        (uint8_t)(opcode & 0xFF),
-        (uint8_t)((opcode >> 8) & 0xFF)
+        arg,
+        (uint8_t)(opcode >> 8)
     };
-    kprintf("[I2C-HID] SET_POWER wire: [%02x %02x %02x %02x]\n",
-            buf[0], buf[1], buf[2], buf[3]);
+
+    kprintf("[I2C-HID] %s wire: [%02x %02x %02x %02x]\n",
+            name, buf[0], buf[1], buf[2], buf[3]);
+
     return dw_i2c_write(dev->ctrl, dev->i2c_addr, buf, 4);
 }
 
+static int i2c_hid_set_power(i2c_hid_device_t *dev, uint16_t power_state) {
+    return i2c_hid_write_simple_command(dev, I2C_HID_OPCODE_SET_POWER,
+                                        (uint8_t)power_state,
+                                        "SET_POWER");
+}
+
 static int i2c_hid_reset(i2c_hid_device_t *dev) {
-    uint16_t cmd_reg = dev->desc.wCommandRegister;
-    uint16_t opcode = I2C_HID_OPCODE_RESET;
-    uint8_t buf[4] = {
-        (uint8_t)(cmd_reg & 0xFF),
-        (uint8_t)((cmd_reg >> 8) & 0xFF),
-        (uint8_t)(opcode & 0xFF),
-        (uint8_t)((opcode >> 8) & 0xFF)
-    };
-    kprintf("[I2C-HID] RESET wire: [%02x %02x %02x %02x]\n",
-            buf[0], buf[1], buf[2], buf[3]);
-    int rc = dw_i2c_write(dev->ctrl, dev->i2c_addr, buf, 4);
+    int rc = i2c_hid_write_simple_command(dev, I2C_HID_OPCODE_RESET, 0,
+                                          "RESET");
     if (rc < 0) return rc;
 
     // Wait for reset to complete (spec says up to 5 seconds, typically <100ms)
@@ -2017,40 +2258,19 @@ static int i2c_hid_reset(i2c_hid_device_t *dev) {
 
 static int i2c_hid_set_idle(i2c_hid_device_t *dev, uint8_t duration,
                              uint8_t report_id) {
-    uint16_t cmd_reg = dev->desc.wCommandRegister;
-    // Low byte: reportID, high byte: opcode 0x05
-    // Duration goes in a 3rd byte appended to the data register
-    // For the simple 4-byte form: low byte = reportID, opcode in high byte
-    uint16_t opcode = I2C_HID_OPCODE_SET_IDLE | report_id;
-    uint8_t buf[6] = {
-        (uint8_t)(cmd_reg & 0xFF),
-        (uint8_t)((cmd_reg >> 8) & 0xFF),
-        (uint8_t)(opcode & 0xFF),
-        (uint8_t)((opcode >> 8) & 0xFF),
-        (uint8_t)(dev->desc.wDataRegister & 0xFF),
-        (uint8_t)((dev->desc.wDataRegister >> 8) & 0xFF),
-    };
-    // SET_IDLE with duration in wData register: 6 bytes total
-    // But if duration is 0 (infinite) and reportID is 0, the simple
-    // 4-byte command form works too.
-    int len = (duration == 0) ? 4 : 6;
-    kprintf("[I2C-HID] SET_IDLE wire: [%02x %02x %02x %02x] dur=%u rid=%u\n",
-            buf[0], buf[1], buf[2], buf[3], duration, report_id);
-    return dw_i2c_write(dev->ctrl, dev->i2c_addr, buf, len);
+    if (duration != 0) {
+        kprintf("[I2C-HID] SET_IDLE duration=%u unsupported\n", duration);
+        return -1;
+    }
+
+    return i2c_hid_write_simple_command(dev, I2C_HID_OPCODE_SET_IDLE,
+                                        report_id, "SET_IDLE");
 }
 
 static int i2c_hid_set_protocol(i2c_hid_device_t *dev, uint16_t protocol) {
-    uint16_t cmd_reg = dev->desc.wCommandRegister;
-    uint16_t opcode = I2C_HID_OPCODE_SET_PROTOCOL | protocol;
-    uint8_t buf[4] = {
-        (uint8_t)(cmd_reg & 0xFF),
-        (uint8_t)((cmd_reg >> 8) & 0xFF),
-        (uint8_t)(opcode & 0xFF),
-        (uint8_t)((opcode >> 8) & 0xFF)
-    };
-    kprintf("[I2C-HID] SET_PROTOCOL wire: [%02x %02x %02x %02x] proto=%u\n",
-            buf[0], buf[1], buf[2], buf[3], protocol);
-    return dw_i2c_write(dev->ctrl, dev->i2c_addr, buf, 4);
+    return i2c_hid_write_simple_command(dev, I2C_HID_OPCODE_SET_PROTOCOL,
+                                        (uint8_t)protocol,
+                                        "SET_PROTOCOL");
 }
 
 // SET_REPORT: send a feature/output report to the device.
@@ -2752,9 +2972,10 @@ static int i2c_hid_init_device(i2c_hid_device_t *dev) {
 
     // Drain any pending reports left over from reset / init.
     if (dev->input_buf && dev->input_buf_size >= I2C_HID_LENGTH_HDR_SIZE) {
+        uint16_t drain_len = i2c_hid_input_read_len(dev);
         for (int drain = 0; drain < 10; drain++) {
             int drc = i2c_hid_read_length_first(dev, dev->input_buf,
-                                                 dev->input_buf_size);
+                                                 drain_len);
             if (drc < 0) break;
             uint16_t dlen = (uint16_t)dev->input_buf[0] |
                             ((uint16_t)dev->input_buf[1] << 8);
@@ -2906,16 +3127,15 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
 
     // ---- Step 2: Init transfer (like Linux i2c_dw_xfer_init) ----
     // Disable → set TAR → enable → clear interrupts
-    dw_i2c_set_target(ctrl, addr);
+    if (dw_i2c_set_target(ctrl, addr) < 0)
+        return -1;
 
     // Clear transfer state AFTER set_target (which clears HW state)
     ctrl->irq_pending = 0;
     ctrl->tx_complete = 0;
     ctrl->rx_ready = 0;
     ctrl->xfer_error = 0;
-    // Note: do NOT clear ctrl->abort_source here — it's set by the ISR
-    // and we read it in the abort handler. The ISR writes it atomically
-    // on TX_ABRT before we ever check it.
+    ctrl->abort_source = 0;
 
     // ---- Step 3: Keep the DW controller IRQ path masked ----
     // HID traffic is IRQ-driven by the GPIO line.  For the DW engine itself,
@@ -2948,20 +3168,29 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
         dw_write(ctrl, DW_IC_DATA_CMD, cmd);
     }
 
-    // ---- Step 5: Read phase (like Linux i2c_dw_xfer_msg + i2c_dw_read) ----
-    // Feed read commands respecting both TX and RX FIFO limits.
-    // Linux checks: tx_limit = tx_fifo_depth - TXFLR
-    //               rx_limit = rx_fifo_depth - RXFLR
+    // ---- Step 5: Read phase ----
+    // Keep a bounded requested/received window like FreeBSD ig4iic_read().
+    // The controller still needs enough queued read commands to avoid going
+    // idle mid-transaction, so do not collapse this to a tiny hand-fed window.
     while (rx_idx < rlen) {
-        // Issue read commands, respecting FIFO limits
-        while (tx_issued < rlen) {
-            uint32_t tx_limit = ctrl->tx_fifo_depth - dw_read(ctrl, DW_IC_TXFLR);
-            uint32_t rx_limit = ctrl->rx_fifo_depth - dw_read(ctrl, DW_IC_RXFLR);
+        int outstanding = tx_issued - rx_idx;
+        int burst = (int)ctrl->tx_fifo_depth - (int)dw_read(ctrl, DW_IC_TXFLR);
+        int lowat = 0;
 
-            if (tx_limit == 0 || rx_limit == 0)
-                break;
+        if (burst < 0)
+            burst = 0;
 
+        if (outstanding < (int)ctrl->rx_fifo_depth) {
+            int rx_space = (int)ctrl->rx_fifo_depth - outstanding;
+            if (burst > rx_space)
+                burst = rx_space;
+        } else {
+            burst = 0;
+        }
+
+        while (burst > 0 && tx_issued < rlen) {
             uint32_t cmd = DW_IC_DATA_CMD_READ;
+
             if (tx_issued == 0 && wlen > 0)
                 cmd |= DW_IC_DATA_CMD_RESTART;
             if (tx_issued == rlen - 1)
@@ -2969,48 +3198,41 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
 
             dw_write(ctrl, DW_IC_DATA_CMD, cmd);
             tx_issued++;
-
-            // Don't queue more than rx_fifo_depth outstanding reads
-            if (tx_issued - rx_idx >= (int)ctrl->rx_fifo_depth)
-                break;
+            burst--;
         }
 
-        // Wait for RX data — check both ISR flag and hardware status
-        for (timeout = 0; timeout < 50000; timeout++) {
-            if (ctrl->xfer_error)
-                goto abort;
-            // Poll RAW_INTR_STAT for TX_ABRT — catches aborts even when
-            // the CPU has IRQs disabled (spin_lock_irqsave in worker).
-            if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT)
-                goto abort;
-            if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
-                break;
-            if (ctrl->rx_ready)
-                break;
-            i2c_delay_us(1);
-        }
-        if (timeout >= 50000)
-            goto abort;
+        if (tx_issued != rlen && (tx_issued - rx_idx) > 2)
+            lowat = 2;
 
-        // Drain RX FIFO (like Linux i2c_dw_read using RXFLR)
-        ctrl->rx_ready = 0;
-        uint32_t rx_valid = dw_read(ctrl, DW_IC_RXFLR);
-        while (rx_idx < rlen && rx_valid > 0) {
-            uint32_t data = dw_read(ctrl, DW_IC_DATA_CMD);
-            if (rbuf)
-                rbuf[rx_idx] = (uint8_t)(data & 0xFF);
-            rx_idx++;
-            rx_valid--;
+        while (rx_idx < tx_issued - lowat) {
+            uint32_t rx_valid;
+
+            for (timeout = 0; timeout < 50000; timeout++) {
+                if (ctrl->xfer_error)
+                    goto abort;
+                if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT)
+                    goto abort;
+                if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
+                    break;
+                i2c_delay_us(1);
+            }
+            if (timeout >= 50000)
+                goto abort;
+
+            rx_valid = dw_read(ctrl, DW_IC_RXFLR);
+            while (rx_idx < tx_issued && rx_valid > 0) {
+                uint32_t data = dw_read(ctrl, DW_IC_DATA_CMD);
+                if (rbuf)
+                    rbuf[rx_idx] = (uint8_t)(data & 0xFF);
+                rx_idx++;
+                rx_valid--;
+            }
         }
     }
 
     // ---- Step 6: Wait for STOP_DET / bus idle ----
-    for (timeout = 0; timeout < 25000; timeout++) {
-        uint32_t st = dw_read(ctrl, DW_IC_STATUS);
-        if (!(st & DW_IC_STATUS_MST_ACTIVITY))
-            break;
-        i2c_delay_us(1);
-    }
+    if (dw_i2c_wait_bus_not_busy(ctrl, 25000) < 0)
+        goto abort;
 
     // ---- Step 7: Disable interrupts, mask IOAPIC ----
     dw_write(ctrl, DW_IC_INTR_MASK, 0);
@@ -3032,8 +3254,7 @@ abort:
             // ISR hasn't seen it yet, or no TX_ABRT — read directly
             abort_src = dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
         }
-
-        uint32_t raw_stat;
+    ctrl->last_abort_source = abort_src;
 
         // Disable all interrupts
         dw_write(ctrl, DW_IC_INTR_MASK, 0);
@@ -3065,26 +3286,10 @@ abort:
             }
         }
 
-        // Disable controller — this flushes TX FIFO and generates STOP.
-        // Like Linux: just __i2c_dw_disable(). No dummy STOP, no IC_CON re-init.
-        dw_i2c_disable(ctrl);
-
-        // Clear only the interrupt sources we may have observed.
-        raw_stat = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
-        if (raw_stat & DW_IC_INTR_TX_ABRT)
-            (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-        if (raw_stat & DW_IC_INTR_STOP_DET)
-            (void)dw_read(ctrl, DW_IC_CLR_STOP_DET);
-        if (raw_stat & DW_IC_INTR_RX_OVER)
-            (void)dw_read(ctrl, DW_IC_CLR_RX_OVER);
-        if (raw_stat & DW_IC_INTR_TX_OVER)
-            (void)dw_read(ctrl, DW_IC_CLR_TX_OVER);
-        if (raw_stat & DW_IC_INTR_ACTIVITY)
-            (void)dw_read(ctrl, DW_IC_CLR_ACTIVITY);
-
-        // Flush RX FIFO
-        while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
-            (void)dw_read(ctrl, DW_IC_DATA_CMD);
+        // FreeBSD's ig4 path requests a controller abort and waits for the
+        // transfer to quiesce before it allows the next START. Doing the same
+        // here avoids rearming GPIO against a half-aborted DW engine.
+        dw_i2c_recover_aborted_xfer(ctrl);
 
         // Reset state
         ctrl->xfer_error = 0;
@@ -3096,6 +3301,7 @@ abort:
         g_dbg_xfer_abort_count++;
 
         if (complete_read) {
+            ctrl->last_abort_source = abort_src;
             g_dbg_xfer_ok++;
             return 0;
         }
@@ -3104,7 +3310,7 @@ abort:
                 "rx=%d/%d tx=%d/%d "
                 "isr=%u gpio_isr=%u hit=%u miss=%u\n",
                 ctrl->bus_id, addr, abort_src,
-                rx_idx, rlen, tx_issued, rlen,
+            rx_idx, rlen, tx_issued, rlen,
                 g_dbg_i2c_isr_count, g_dbg_gpio_isr_count,
                 g_dbg_gpio_isr_hit, g_dbg_gpio_isr_miss);
 
@@ -3734,7 +3940,8 @@ int i2c_hid_init(void) {
                                         ctrl->bus_id, addr,
                                         crs.i2c_devices[ci].connection_speed);
                                 int dev_idx = g_i2c_hid_device_count;
-                                i2c_hid_probe_device(ctrl, addr);
+                                i2c_hid_probe_device(ctrl, addr,
+                                             crs.i2c_devices[ci].connection_speed);
                                 if (dev_idx < g_i2c_hid_device_count) {
                                     // Store ACPI path for power management
                                     int plen = 0;
@@ -3790,7 +3997,8 @@ int i2c_hid_init(void) {
                                     ctrl->bus_id, addr,
                                     crs.i2c_devices[ci].connection_speed);
                             int dev_idx = g_i2c_hid_device_count;
-                            i2c_hid_probe_device(ctrl, addr);
+                                i2c_hid_probe_device(ctrl, addr,
+                                         crs.i2c_devices[ci].connection_speed);
                             if (dev_idx < g_i2c_hid_device_count) {
                                 // Store ACPI path for power management
                                 int plen = 0;
@@ -3825,7 +4033,7 @@ int i2c_hid_init(void) {
             for (uint16_t addr = 0x08; addr <= 0x77; addr++) {
                 if (dw_i2c_probe_addr(ctrl, addr) != 0)
                     continue;
-                i2c_hid_probe_device(ctrl, addr);
+                i2c_hid_probe_device(ctrl, addr, 0);
             }
         }
     }
@@ -4023,6 +4231,43 @@ static uint32_t i2c_hid_backoff_delay_ticks(uint16_t error_count)
     return delay;
 }
 
+static uint16_t i2c_hid_input_read_len(const i2c_hid_device_t *dev)
+{
+    uint16_t read_len = dev->input_buf_size;
+
+    if (read_len < I2C_HID_LENGTH_HDR_SIZE)
+        read_len = I2C_HID_LENGTH_HDR_SIZE;
+
+    return read_len;
+}
+
+static uint32_t i2c_hid_silent_verify_delay_ticks(uint8_t attempts)
+{
+    uint32_t hz = (uint32_t)timer_get_frequency();
+    uint32_t delay;
+
+    if (hz == 0)
+        return 1;
+
+    delay = hz;
+
+    if (attempts > 3)
+        attempts = 3;
+
+    while (attempts > 0 && delay < hz * 8) {
+        delay <<= 1;
+        attempts--;
+    }
+
+    if (delay > hz * 8)
+        delay = hz * 8;
+
+    if (delay == 0)
+        delay = 1;
+
+    return delay;
+}
+
 // Process a mouse/touchpad input report and inject into the mouse subsystem
 static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
                                    const uint8_t *report, uint16_t report_len)
@@ -4212,7 +4457,7 @@ static int i2c_hid_read_length_first(i2c_hid_device_t *dev,
 // Read one input report from the device and process it
 static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
 {
-    uint16_t buf_size = dev->input_buf_size;
+    uint16_t buf_size = i2c_hid_input_read_len(dev);
     if (buf_size < I2C_HID_LENGTH_HDR_SIZE || !dev->input_buf)
         return;
 
@@ -4228,20 +4473,22 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
         uint32_t now_ticks;
         i2c_hid_reset_pointer_tracking(dev);
         dev->error_count++;
-        dev->silent_verify_done = 0;
         now_ticks = (uint32_t)timer_ticks();
         dev->backoff_until = now_ticks +
             i2c_hid_backoff_delay_ticks(dev->error_count);
+        dev->silent_verify_after = 0;
+        dev->silent_verify_attempts = 0;
         g_dbg_worker_xfer_err++;
         kprintf("[I2C-DBG] xfer ERR #%u dev=0x%02x errcnt=%u "
                 "abort=0x%x\n",
                 g_dbg_worker_xfer_err, dev->i2c_addr,
-                dev->error_count, dev->ctrl->abort_source);
+                dev->error_count, dev->ctrl->last_abort_source);
         return;
     }
     dev->error_count = 0;
     dev->backoff_until = 0;
-    dev->silent_verify_done = 0;
+    dev->silent_verify_after = 0;
+    dev->silent_verify_attempts = 0;
 
     // First 2 bytes are the HID-over-I2C length prefix (LE)
     uint16_t pkt_len = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
@@ -4352,6 +4599,7 @@ static void i2c_hid_worker_thread(void *arg)
                 uint32_t ie_val;
                 uint32_t is_val;
                 int line_asserted;
+                uint32_t verify_after;
 
                 gflags = local_irq_save();
                 ie_val = gpio_comm_read32(comm, ie_reg);
@@ -4371,33 +4619,44 @@ static void i2c_hid_worker_thread(void *arg)
                 }
 
                 if (dev->error_count > 0) {
-                    if (line_asserted || (is_val & bit)) {
+                    if (line_asserted) {
                         gpio_comm_write32(comm, is_reg, bit);
-                        gpio_comm_write32(comm, ie_reg, ie_val | bit);
+                        dev->silent_verify_after = 0;
+                        dev->silent_verify_attempts = 0;
                         spin_lock(&dev->dev_lock);
                         dev->work_pending = 1;
                         spin_unlock(&dev->dev_lock);
                         local_irq_restore(gflags);
-                        g_dbg_ie_reenable++;
                         any_pending = 1;
                         break;
                     }
 
-                    if (!dev->silent_verify_done) {
-                        spin_lock(&dev->dev_lock);
-                        dev->work_pending = 1;
-                        dev->silent_verify_done = 1;
-                        spin_unlock(&dev->dev_lock);
-                        local_irq_restore(gflags);
-                        any_pending = 1;
-                        break;
-                    }
+                    if (is_val & bit)
+                        gpio_comm_write32(comm, is_reg, bit);
 
                     if (!(ie_val & bit)) {
-                        gpio_comm_write32(comm, is_reg, bit);
                         gpio_comm_write32(comm, ie_reg, ie_val | bit);
                         g_dbg_ie_reenable++;
                     }
+
+                    verify_after = dev->silent_verify_after;
+                    if (verify_after == 0) {
+                        verify_after = now_ticks +
+                            i2c_hid_silent_verify_delay_ticks(dev->silent_verify_attempts);
+                        dev->silent_verify_after = verify_after;
+                    }
+
+                    if ((int32_t)(verify_after - now_ticks) <= 0) {
+                        dev->error_count = 0;
+                        dev->backoff_until = 0;
+                        dev->silent_verify_after = 0;
+                        dev->silent_verify_attempts = 0;
+                        local_irq_restore(gflags);
+                        continue;
+                    }
+
+                    if ((uint64_t)verify_after < next_wake_tick)
+                        next_wake_tick = verify_after;
                     local_irq_restore(gflags);
                     continue;
                 }
@@ -4517,6 +4776,10 @@ static void i2c_hid_worker_thread(void *arg)
                 local_irq_restore(gflags);
                 continue;
             }
+            if (dev->error_count > 0) {
+                local_irq_restore(gflags);
+                continue;
+            }
             gpio_comm_write32(comm, ie_reg,
                               ie_val | (1u << dev->gpio_gpi_bit));
             local_irq_restore(gflags);
@@ -4583,7 +4846,8 @@ void i2c_hid_gpio_irq_handler(uint8_t vector)
 
         found_any = 1;
         g_dbg_gpio_isr_hit++;
-        dev->silent_verify_done = 0;
+        dev->silent_verify_after = 0;
+        dev->silent_verify_attempts = 0;
 
         // Clear the pending interrupt status (write-1-to-clear)
         gpio_comm_write32(comm, is_reg, bit);

@@ -564,6 +564,12 @@ int acpi_aml_exec_device_method(const char* device_path,
                                 const char* method_name,
                                 uint64_t* ret_value);
 
+// Execute a named method that returns a 3-integer package.
+// Returns 0 on success, <0 on failure.
+int acpi_aml_exec_device_method_pkg3(const char* device_path,
+                                     const char* method_name,
+                                     uint64_t out_values[3]);
+
 // Look up PCI interrupt routing via ACPI _PRT on the parent bridge.
 // bridge_path: ACPI path of PCI root bridge (e.g. "\\_SB_.PC00")
 // pci_device: PCI device number (0-31)
