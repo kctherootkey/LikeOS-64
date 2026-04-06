@@ -1,12 +1,16 @@
 // LikeOS-64 - HID over I2C Driver
 // Intel DesignWare I2C controller + Microsoft HID-over-I2C protocol
 //
-// Discovers Intel LPSS Serial IO I2C controllers via PCI, initializes the
-// DesignWare I2C IP core, scans I2C buses for HID devices, and injects
-// mouse/touchpad input into the existing input subsystems.
+// Discovers Intel LPSS Serial IO I2C controllers via PCI (with ACPI
+// fallback), powers them on via ACPI _PS0, and initializes the DesignWare
+// I2C IP core in standard (100 kHz) or fast (400 kHz) mode using ACPI
+// SSCN/FMCN timing.  HID devices are located through ACPI namespace
+// enumeration (PNP0C50 / ACPI0C50) and their reports are parsed for
+// single-finger touchpad input injected into the mouse subsystem.
 //
-// I2C transfers use fast mode (400kHz) with interrupt-driven GPIO
-// handling.  Worker threads perform I2C reads; no polling from main loop.
+// GPIO-level interrupts wake per-controller worker threads that perform
+// I2C reads.  Transfers include TX_ABRT recovery with bounded retries
+// and exponential backoff.
 
 #include "../../include/kernel/i2c_hid.h"
 #include "../../include/kernel/console.h"
@@ -21,7 +25,19 @@
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/timer.h"
 
-// Debug counters for interrupt-driven I2C HID
+// ---- Debug verbosity control ----
+// Set I2C_DEBUG to 1 for full diagnostic output (ISR stats, transfer logs,
+// periodic GPIO/IOAPIC state dumps, per-report tracing).  Default 0 keeps
+// only essential init/error messages.
+#define I2C_DEBUG 0
+#if I2C_DEBUG
+#define i2c_dbg(fmt, ...) kprintf(fmt, ##__VA_ARGS__)
+#else
+#define i2c_dbg(fmt, ...) do {} while(0)
+#endif
+
+// Debug counters for interrupt-driven I2C HID (always present; cheap to
+// update even when I2C_DEBUG == 0 — they feed the i2c_dbg() prints).
 static volatile uint32_t g_dbg_gpio_isr_count = 0;     // Total GPIO ISR invocations
 static volatile uint32_t g_dbg_gpio_isr_hit = 0;       // ISR found pending bit
 static volatile uint32_t g_dbg_gpio_isr_miss = 0;      // ISR: no matching pending bit
@@ -40,6 +56,8 @@ static volatile uint32_t g_dbg_xfer_retry_count = 0;   // Total xfer retries
 static volatile uint32_t g_dbg_xfer_total = 0;         // Total xfer calls
 static volatile uint32_t g_dbg_xfer_ok = 0;            // Successful xfers
 static volatile uint64_t g_dbg_last_print_uptime = 0;  // Last periodic debug print time
+static volatile uint32_t g_dbg_gpio_line_deassert = 0; // ISR: line deasserted
+static volatile uint32_t g_dbg_verify_proactive = 0;   // Proactive verify reads
 
 #define I2C_SPEED_STANDARD_HZ 100000U
 #define I2C_SPEED_FAST_HZ     400000U
@@ -356,7 +374,7 @@ static int ecam_init_bus0(void)
 {
     acpi_sdt_header_t *mcfg = acpi_find_table("MCFG");
     if (!mcfg) {
-        kprintf("[I2C-ECAM] no MCFG table\n");
+        i2c_dbg("[I2C-ECAM] no MCFG table\n");
         return -1;
     }
 
@@ -369,18 +387,18 @@ static int ecam_init_bus0(void)
     uint8_t start_bus = data[10];
     uint8_t end_bus   = data[11];
 
-    kprintf("[I2C-ECAM] MCFG base=0x%llx seg=%u bus=%u-%u\n",
+    i2c_dbg("[I2C-ECAM] MCFG base=0x%llx seg=%u bus=%u-%u\n",
             (unsigned long long)base_phys, seg, start_bus, end_bus);
 
     if (start_bus > 0 || base_phys == 0) {
-        kprintf("[I2C-ECAM] bus 0 not in range or base invalid\n");
+        i2c_dbg("[I2C-ECAM] bus 0 not in range or base invalid\n");
         return -1;
     }
 
     // Map bus 0: 32 devs * 8 funcs * 4 KB = 1 MB = 256 pages
     uint64_t va = mm_map_device_mmio(base_phys, 256);
     if (!va) {
-        kprintf("[I2C-ECAM] mm_map_device_mmio failed\n");
+        i2c_dbg("[I2C-ECAM] mm_map_device_mmio failed\n");
         return -1;
     }
     g_ecam_bus0_va = (volatile uint8_t *)va;
@@ -607,7 +625,7 @@ static int dw_i2c_init_controller(i2c_dw_controller_t *ctrl) {
     for (int attempt = 0; attempt < 100; attempt++) {
         uint32_t ct = dw_read(ctrl, DW_IC_COMP_TYPE);
         if (ct == DW_IC_COMP_TYPE_VALUE) {
-            kprintf("[I2C%d] DW core alive (attempt %d)\n",
+            i2c_dbg("[I2C%d] DW core alive (attempt %d)\n",
                     ctrl->bus_id, attempt);
             dw_alive = 1;
             break;
@@ -677,7 +695,7 @@ static int dw_i2c_init_controller(i2c_dw_controller_t *ctrl) {
     (void)dw_read(ctrl, DW_IC_CLR_TX_OVER);
 
     // Dump status while disabled
-    kprintf("[I2C%d] After config (disabled): IC_CON=0x%x IC_ENABLE=0x%x "
+    i2c_dbg("[I2C%d] After config (disabled): IC_CON=0x%x IC_ENABLE=0x%x "
             "STATUS=0x%x EN_ST=0x%x RAW_INTR=0x%x\n",
             ctrl->bus_id,
             dw_read(ctrl, DW_IC_CON),
@@ -698,7 +716,7 @@ static int dw_i2c_init_controller(i2c_dw_controller_t *ctrl) {
     uint32_t en_en_st = dw_read(ctrl, DW_IC_ENABLE_STATUS);
     uint32_t en_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
     uint32_t en_enable = dw_read(ctrl, DW_IC_ENABLE);
-    kprintf("[I2C%d] After enable: IC_ENABLE=0x%x STATUS=0x%x EN_ST=0x%x "
+    i2c_dbg("[I2C%d] After enable: IC_ENABLE=0x%x STATUS=0x%x EN_ST=0x%x "
             "RAW_INTR=0x%x\n",
             ctrl->bus_id, en_enable, en_status, en_en_st, en_raw);
 
@@ -762,7 +780,7 @@ static void dw_i2c_cache_acpi_timings(i2c_dw_controller_t *ctrl)
         ctrl->ss_lcnt = dw_i2c_clamp_count(values[1], 588);
         ctrl->ss_sda_hold = dw_i2c_clamp_hold(values[2], 0x001C001C);
         ctrl->have_ss_timing = 1;
-        kprintf("[I2C%d] ACPI SSCN h=%u l=%u hold=0x%x\n",
+        i2c_dbg("[I2C%d] ACPI SSCN h=%u l=%u hold=0x%x\n",
                 ctrl->bus_id, ctrl->ss_hcnt, ctrl->ss_lcnt,
                 ctrl->ss_sda_hold);
     }
@@ -772,7 +790,7 @@ static void dw_i2c_cache_acpi_timings(i2c_dw_controller_t *ctrl)
         ctrl->fs_lcnt = dw_i2c_clamp_count(values[1], 320);
         ctrl->fs_sda_hold = dw_i2c_clamp_hold(values[2], 0x001C001C);
         ctrl->have_fs_timing = 1;
-        kprintf("[I2C%d] ACPI FMCN h=%u l=%u hold=0x%x\n",
+        i2c_dbg("[I2C%d] ACPI FMCN h=%u l=%u hold=0x%x\n",
                 ctrl->bus_id, ctrl->fs_hcnt, ctrl->fs_lcnt,
                 ctrl->fs_sda_hold);
     }
@@ -834,7 +852,7 @@ static int dw_i2c_apply_bus_speed(i2c_dw_controller_t *ctrl,
     dw_i2c_program_bus_timing(ctrl, target_speed);
     ctrl->current_target = 0xFFFF;
 
-    kprintf("[I2C%d] bus timing: %s speed=%u ss=%u/%u fs=%u/%u hold=0x%x\n",
+    i2c_dbg("[I2C%d] bus timing: %s speed=%u ss=%u/%u fs=%u/%u hold=0x%x\n",
             ctrl->bus_id,
             reason ? reason : "apply",
             ctrl->configured_bus_speed,
@@ -981,7 +999,7 @@ static int dw_i2c_probe_addr(i2c_dw_controller_t *ctrl, uint16_t addr) {
 }
 
 static void dw_i2c_scan_bus(i2c_dw_controller_t *ctrl) {
-    kprintf("[I2C%d] Scanning bus for devices...\n", ctrl->bus_id);
+    i2c_dbg("[I2C%d] Scanning bus for devices...\n", ctrl->bus_id);
     int found = 0;
 
     for (uint16_t addr = 0x08; addr <= 0x77; addr++) {
@@ -1095,7 +1113,7 @@ static volatile uint8_t *pmc_map_pwrmbase(void)
             uint32_t vid_e = ecam_read32(0, PMC_PCI_DEV, PMC_PCI_FUNC, 0x00);
             uint32_t vid_c = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
                                             PMC_PCI_FUNC, 0x00);
-            kprintf("[I2C-PMC] P2SB ECAM unhide: PMC vid ecam=0x%x cf8=0x%x\n",
+            i2c_dbg("[I2C-PMC] P2SB ECAM unhide: PMC vid ecam=0x%x cf8=0x%x\n",
                     vid_e, vid_c);
             uint32_t vid = (vid_e != 0xFFFFFFFF) ? vid_e : vid_c;
             if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
@@ -1135,7 +1153,7 @@ static volatile uint8_t *pmc_map_pwrmbase(void)
             uint32_t vid = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
                                           PMC_PCI_FUNC, 0x00);
             if (!g_ecam_bus0_va)  // only log if ECAM path didn't already
-                kprintf("[I2C-PMC] P2SB CF8 unhide: PMC vid=0x%x\n", vid);
+                i2c_dbg("[I2C-PMC] P2SB CF8 unhide: PMC vid=0x%x\n", vid);
             if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
                 uint32_t cmd = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
                                               PMC_PCI_FUNC, PMC_PCI_CMD);
@@ -1210,7 +1228,7 @@ static volatile uint8_t *pmc_map_pwrmbase(void)
     }
 
     if (!phys) {
-        kprintf("[I2C-PMC] not found (all strategies failed)\n");
+        i2c_dbg("[I2C-PMC] not found (all strategies failed)\n");
         return 0;
     }
 
@@ -1218,12 +1236,12 @@ static volatile uint8_t *pmc_map_pwrmbase(void)
     // at offsets 0x1E24, 0x1E44 etc.
     uint64_t va = mm_map_device_mmio(phys, 8);
     if (!va) {
-        kprintf("[I2C-PMC] map failed for 0x%llx\n", (unsigned long long)phys);
+        i2c_dbg("[I2C-PMC] map failed for 0x%llx\n", (unsigned long long)phys);
         return 0;
     }
 
 
-    kprintf("[I2C-PMC] PWRMBASE=0x%llx\n", (unsigned long long)phys);
+    i2c_dbg("[I2C-PMC] PWRMBASE=0x%llx\n", (unsigned long long)phys);
     return (volatile uint8_t *)va;
 }
 
@@ -1251,7 +1269,7 @@ static int pmc_check_i2c_enabled(volatile uint8_t *pmc, int i2c_index)
     uint32_t ppasr0 = *(volatile uint32_t *)(pmc + PMC_PPASR0);
     int sio_pg_ack = (ppasr0 >> 14) & 1;
 
-    kprintf("[I2C-PMC] I2C%d fdis=0x%x ppasr0=0x%x(%s)\n",
+    i2c_dbg("[I2C-PMC] I2C%d fdis=0x%x ppasr0=0x%x(%s)\n",
             i2c_index, fdis2, ppasr0,
             sio_pg_ack ? "ACTIVE" : "GATED");
     return 0;
@@ -1381,7 +1399,7 @@ static uint32_t itss_pcr_read32(uint32_t offset)
                 uint32_t bh = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
                                           P2SB_PCI_FUNC, P2SB_SBREG_BARH);
                 uint64_t bar = ((uint64_t)bh << 32) | (bl & ~0xFULL);
-                kprintf("[ITSS] P2SB VID=0x%x BAR raw lo=0x%x hi=0x%x => 0x%llx\n",
+                i2c_dbg("[ITSS] P2SB VID=0x%x BAR raw lo=0x%x hi=0x%x => 0x%llx\n",
                         vid, bl, bh, (unsigned long long)bar);
                 // Accept if BAR looks like a valid physical address (non-zero,
                 // not all-F, and above 1GB typical for PCH SBREG)
@@ -1393,7 +1411,7 @@ static uint32_t itss_pcr_read32(uint32_t offset)
             }
         }
         if (!g_sbreg_bar) {
-            kprintf("[ITSS] No SBREG_BAR, cannot read ITSS IPC\n");
+            i2c_dbg("[ITSS] No SBREG_BAR, cannot read ITSS IPC\n");
             return 0xFFFFFFFF;
         }
         // Map the ITSS port region (64KB) as UC via mm_map_device_mmio.
@@ -1401,11 +1419,11 @@ static uint32_t itss_pcr_read32(uint32_t offset)
         uint64_t itss_pa = g_sbreg_bar + ((uint64_t)ITSS_PORT_ID << 16);
         g_itss_va = mm_map_device_mmio(itss_pa, 16);  // 16 pages = 64KB
         if (!g_itss_va) {
-            kprintf("[ITSS] mm_map_device_mmio failed for 0x%llx\n",
+            i2c_dbg("[ITSS] mm_map_device_mmio failed for 0x%llx\n",
                     (unsigned long long)itss_pa);
             return 0xFFFFFFFF;
         }
-        kprintf("[ITSS] P2SB SBREG_BAR=0x%llx ITSS mapped at VA=0x%llx\n",
+        i2c_dbg("[ITSS] P2SB SBREG_BAR=0x%llx ITSS mapped at VA=0x%llx\n",
                 (unsigned long long)g_sbreg_bar,
                 (unsigned long long)g_itss_va);
     }
@@ -1414,6 +1432,7 @@ static uint32_t itss_pcr_read32(uint32_t offset)
     return *(volatile uint32_t *)((volatile uint8_t *)g_itss_va + offset);
 }
 
+#if I2C_DEBUG
 // Dump ITSS IPC registers and firmware IOAPIC state for diagnostics.
 static void probe_dump_diagnostics(uint32_t max_gsi)
 {
@@ -1422,21 +1441,21 @@ static void probe_dump_diagnostics(uint32_t max_gsi)
     uint32_t ipc1 = itss_pcr_read32(ITSS_IPC1);
     uint32_t ipc2 = itss_pcr_read32(ITSS_IPC2);
     uint32_t ipc3 = itss_pcr_read32(ITSS_IPC3);
-    kprintf("[ITSS] IPC0=0x%08x IPC1=0x%08x IPC2=0x%08x IPC3=0x%08x\n",
+    i2c_dbg("[ITSS] IPC0=0x%08x IPC1=0x%08x IPC2=0x%08x IPC3=0x%08x\n",
             ipc0, ipc1, ipc2, ipc3);
     // Bit=1 means "active-HIGH polarity disabled" → signal is active-LOW
     // Bit=0 means signal is active-HIGH (default for IRQ 24+)
-    kprintf("[ITSS] IPC decode: IRQ24-31 pol=%s, IRQ32-63 pol=%s\n",
+    i2c_dbg("[ITSS] IPC decode: IRQ24-31 pol=%s, IRQ32-63 pol=%s\n",
             (ipc0 >> 24) ? "mixed" : "all-HIGH",
             ipc1 ? "mixed/LOW" : "all-HIGH");
 
     // ---- ITSS MMC and PIR0 ----
     uint32_t mmc = itss_pcr_read32(ITSS_MMC);
     uint32_t pir0 = itss_pcr_read32(ITSS_PIR0);
-    kprintf("[ITSS] MMC=0x%04x PIR0=0x%04x\n", mmc & 0xFFFF, pir0 & 0xFFFF);
+    i2c_dbg("[ITSS] MMC=0x%04x PIR0=0x%04x\n", mmc & 0xFFFF, pir0 & 0xFFFF);
 
     // ---- IOAPIC RTE dump: show all entries 16-63 that are not fully masked+zero ----
-    kprintf("[IOAPIC] Firmware RTE dump (entries 16-%u):\n",
+    i2c_dbg("[IOAPIC] Firmware RTE dump (entries 16-%u):\n",
             max_gsi > 63 ? 63 : max_gsi);
     for (uint32_t g = 16; g <= max_gsi && g <= 63; g++) {
         uint32_t lo, hi;
@@ -1444,7 +1463,7 @@ static void probe_dump_diagnostics(uint32_t max_gsi)
         // Skip fully masked default entries (masked + vector 0)
         if ((lo & 0x1FFFF) == 0x10000 && hi == 0) continue;  // masked, vec=0
         if (lo == 0 && hi == 0) continue;
-        kprintf("  GSI %u: lo=0x%08x hi=0x%08x [vec=%u del=%u pol=%s trig=%s %s dest=%u]\n",
+        i2c_dbg("  GSI %u: lo=0x%08x hi=0x%08x [vec=%u del=%u pol=%s trig=%s %s dest=%u]\n",
                 g, lo, hi,
                 lo & 0xFF,            // vector
                 (lo >> 8) & 7,        // delivery mode
@@ -1454,21 +1473,24 @@ static void probe_dump_diagnostics(uint32_t max_gsi)
                 (hi >> 24) & 0xFF);   // destination
     }
 }
+#endif /* I2C_DEBUG */
 
 static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
 {
     uint32_t max_gsi = ioapic_max_gsi();
     if (max_gsi < 24) return -1;
 
+#if I2C_DEBUG
     // Dump firmware state before we touch anything
     probe_dump_diagnostics(max_gsi);
+#endif
 
     // Ensure interrupts are enabled (needed for ISR to fire)
     uint64_t rflags;
     __asm__ volatile("pushf; pop %0" : "=r"(rflags));
     if (!(rflags & 0x200)) {
         __asm__ volatile("sti");
-        kprintf("[I2C%d] probe: enabled IF\n", ctrl->bus_id);
+        i2c_dbg("[I2C%d] probe: enabled IF\n", ctrl->bus_id);
     }
 
     // Ensure LAPIC is ready to deliver IOAPIC fixed interrupts.
@@ -1480,20 +1502,20 @@ static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
         bsp_apic_id = (uint32_t)i2c_rdmsr(X2APIC_ID_MSR);
         uint32_t svr_val   = (uint32_t)i2c_rdmsr(X2APIC_SVR_MSR);
         uint32_t tpr_val   = (uint32_t)i2c_rdmsr(X2APIC_TPR_MSR);
-        kprintf("[I2C%d] LAPIC pre-init: ID=%u SVR=0x%x TPR=0x%x\n",
+        i2c_dbg("[I2C%d] LAPIC pre-init: ID=%u SVR=0x%x TPR=0x%x\n",
                 ctrl->bus_id, bsp_apic_id, svr_val, tpr_val);
 
         // SVR bit 8 must be set for the LAPIC to deliver fixed interrupts.
         // ExtINT/PIC via LINT0 works even when disabled, but IOAPIC doesn't.
         if (!(svr_val & (1u << 8))) {
             i2c_wrmsr(X2APIC_SVR_MSR, (uint64_t)(svr_val | (1u << 8) | 0xFF));
-            kprintf("[I2C%d] LAPIC: software-enabled (SVR was 0x%x)\n",
+            i2c_dbg("[I2C%d] LAPIC: software-enabled (SVR was 0x%x)\n",
                     ctrl->bus_id, svr_val);
         }
         // TPR must be 0 to allow delivery of vector 50 (priority 3)
         if (tpr_val > 0) {
             i2c_wrmsr(X2APIC_TPR_MSR, 0);
-            kprintf("[I2C%d] LAPIC: TPR cleared (was 0x%x)\n",
+            i2c_dbg("[I2C%d] LAPIC: TPR cleared (was 0x%x)\n",
                     ctrl->bus_id, tpr_val);
         }
     }
@@ -1534,7 +1556,7 @@ static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
         if (!(en & 1)) {
             dw_write(ctrl, DW_IC_ENABLE, 1);
             i2c_delay_us(2000);  // let clocks stabilize
-            kprintf("[I2C%d] probe: re-enabled DW core (was IC_ENABLE=0x%x)\n",
+            i2c_dbg("[I2C%d] probe: re-enabled DW core (was IC_ENABLE=0x%x)\n",
                     ctrl->bus_id, en);
         }
     }
@@ -1547,13 +1569,13 @@ static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
     // Diagnostic: verify the DW core thinks it is asserting an interrupt
     uint32_t diag_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
     uint32_t diag_stat = dw_read(ctrl, DW_IC_INTR_STAT);
-    kprintf("[I2C%d] probe: RAW_INTR=0x%x INTR_STAT=0x%x (expect 0x10)\n",
+    i2c_dbg("[I2C%d] probe: RAW_INTR=0x%x INTR_STAT=0x%x (expect 0x10)\n",
             ctrl->bus_id, diag_raw, diag_stat);
 
     // If TX_EMPTY still not asserted, try harder: disable/re-enable core,
     // reset TX threshold to 0, clear all status.
     if (!(diag_raw & DW_IC_INTR_TX_EMPTY)) {
-        kprintf("[I2C%d] probe: TX_EMPTY not asserted, resetting core...\n",
+        i2c_dbg("[I2C%d] probe: TX_EMPTY not asserted, resetting core...\n",
                 ctrl->bus_id);
         dw_write(ctrl, DW_IC_ENABLE, 0);
         i2c_delay_us(2000);
@@ -1567,7 +1589,7 @@ static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
         dw_write(ctrl, DW_IC_INTR_MASK, DW_IC_INTR_TX_EMPTY);
         diag_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
         diag_stat = dw_read(ctrl, DW_IC_INTR_STAT);
-        kprintf("[I2C%d] probe: after reset: RAW_INTR=0x%x INTR_STAT=0x%x "
+        i2c_dbg("[I2C%d] probe: after reset: RAW_INTR=0x%x INTR_STAT=0x%x "
                 "IC_ENABLE=0x%x STATUS=0x%x\n",
                 ctrl->bus_id, diag_raw, diag_stat,
                 dw_read(ctrl, DW_IC_ENABLE),
@@ -1636,7 +1658,7 @@ static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
 
             if (g_i2c_probe_hit) {
                 found_gsi = (int)gsi;
-                kprintf("[I2C%d] IOAPIC probe HIT: GSI %u vector %u (%s)\n",
+                i2c_dbg("[I2C%d] IOAPIC probe HIT: GSI %u vector %u (%s)\n",
                         ctrl->bus_id, gsi, vector, combos[ci].name);
             } else if (probe_x2apic) {
                 // Fallback: check LAPIC IRR/ISR directly via x2APIC MSR.
@@ -1646,7 +1668,7 @@ static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
                 uint32_t isr = (uint32_t)i2c_rdmsr(isr_msr_sw);
                 if ((irr | isr) & vec_bit_sw) {
                     found_gsi = (int)gsi;
-                    kprintf("[I2C%d] IOAPIC probe HIT (LAPIC IRR/ISR): GSI %u "
+                    i2c_dbg("[I2C%d] IOAPIC probe HIT (LAPIC IRR/ISR): GSI %u "
                             "vector %u (%s) IRR=0x%x ISR=0x%x\n",
                             ctrl->bus_id, gsi, vector, combos[ci].name,
                             irr, isr);
@@ -1666,7 +1688,7 @@ static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
     // is arriving at the LAPIC but not being delivered to the CPU.
     // Detect x2APIC locally (lapic_init hasn't run yet at this init stage).
     if (found_gsi < 0) {
-        kprintf("[I2C%d] probe: sweep failed, checking LAPIC ISR/IRR...\n",
+        i2c_dbg("[I2C%d] probe: sweep failed, checking LAPIC ISR/IRR...\n",
                 ctrl->bus_id);
         uint32_t vec_reg = (uint32_t)vector / 32;
         uint32_t vec_bit = 1u << ((uint32_t)vector % 32);
@@ -1674,7 +1696,7 @@ static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
         // Check IA32_APIC_BASE MSR bit 10 for x2APIC mode
         uint64_t apic_base_msr = i2c_rdmsr(IA32_APIC_BASE_MSR);
         int x2apic = (apic_base_msr >> 10) & 1;
-        kprintf("[I2C%d] LAPIC diag: IA32_APIC_BASE=0x%llx x2APIC=%d\n",
+        i2c_dbg("[I2C%d] LAPIC diag: IA32_APIC_BASE=0x%llx x2APIC=%d\n",
                 ctrl->bus_id, (unsigned long long)apic_base_msr, x2apic);
 
         for (uint32_t gsi = 24; gsi <= 39 && gsi <= max_gsi; gsi++) {
@@ -1709,7 +1731,7 @@ static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
             }
 
             if ((isr_val & vec_bit) || (irr_val & vec_bit)) {
-                kprintf("[I2C%d] GSI %u: LAPIC vec %u set ISR=0x%x IRR=0x%x "
+                i2c_dbg("[I2C%d] GSI %u: LAPIC vec %u set ISR=0x%x IRR=0x%x "
                         "(pol=%s) — interrupt REACHED LAPIC\n",
                         ctrl->bus_id, gsi, vector, isr_val, irr_val,
                         ahpoldis ? "low" : "high");
@@ -1733,7 +1755,7 @@ static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
         __asm__ volatile("cli");
 
     if (found_gsi < 0)
-        kprintf("[I2C%d] IOAPIC probe: no GSI found (swept 24-%u, 4 combos)\n",
+        i2c_dbg("[I2C%d] IOAPIC probe: no GSI found (swept 24-%u, 4 combos)\n",
                 ctrl->bus_id, max_gsi);
 
     return found_gsi;
@@ -1782,7 +1804,7 @@ static int detect_i2c_controllers(void) {
                                 devices[i].function,
                                 ci->acpi_path, sizeof(ci->acpi_path));
 
-        kprintf("[I2C] PCI %02x:%02x.%x DEV_%04x -> %s\n",
+        i2c_dbg("[I2C] PCI %02x:%02x.%x DEV_%04x -> %s\n",
                 devices[i].bus, devices[i].device, devices[i].function,
                 devices[i].device_id,
                 ci->acpi_path[0] ? ci->acpi_path : "(no ACPI)");
@@ -1830,7 +1852,7 @@ static int detect_i2c_controllers(void) {
                 ci->pci = pdev;
                 i2c_memcpy(ci->acpi_path, parent, sizeof(ci->acpi_path));
                 i2c_memcpy(ctrl_paths[n_acpi], parent, ACPI_AML_MAX_PATH);
-                kprintf("[I2C] ACPI child %s -> ctrl %s (%02x:%02x.%x)\n",
+                i2c_dbg("[I2C] ACPI child %s -> ctrl %s (%02x:%02x.%x)\n",
                         devs[d].path, parent, 0, dev_a, fn_a);
                 n_ctrl++;
                 n_acpi++;
@@ -1889,7 +1911,7 @@ static int detect_i2c_controllers(void) {
             bar0_phys = bar0_low & ~0xFULL;
         }
 
-        kprintf("[I2C%d] BAR=0x%llx\n", ci, (unsigned long long)bar0_phys);
+        i2c_dbg("[I2C%d] BAR=0x%llx\n", ci, (unsigned long long)bar0_phys);
 
         if (bar0_phys == 0) {
             kprintf("[I2C%d] ERROR: BAR0 not configured\n", ci);
@@ -1904,7 +1926,7 @@ static int detect_i2c_controllers(void) {
         //              _PS0) ----
         {
             int ps0_rc = acpi_fw_power_on_pci_device(bus_nr, dev_nr, func_nr);
-            kprintf("[I2C%d] ACPI power-on rc=%d\n", ci, ps0_rc);
+            i2c_dbg("[I2C%d] ACPI power-on rc=%d\n", ci, ps0_rc);
         }
 
         // ---- Step 3: PMCSR → D0 ----
@@ -1916,14 +1938,14 @@ static int detect_i2c_controllers(void) {
                               PCI_PMCSR_PME_STATUS;
             ecam_write16(bus_nr, dev_nr, func_nr, pm_cap + 4, new_pm);
             i2c_delay_us(50000);
-            kprintf("[I2C%d] PMCSR 0x%x->0x%x\n", ci, old_pm,
+            i2c_dbg("[I2C%d] PMCSR 0x%x->0x%x\n", ci, old_pm,
                     ecam_read16(bus_nr, dev_nr, func_nr, pm_cap + 4));
         }
 
         // ---- Step 4: Enable Memory Space + Bus Master ----
         {
             uint32_t cmd = ecam_read32(bus_nr, dev_nr, func_nr, 0x04);
-            kprintf("[I2C%d] CMD 0x%x->0x%x\n", ci, cmd, cmd | 0x6);
+            i2c_dbg("[I2C%d] CMD 0x%x->0x%x\n", ci, cmd, cmd | 0x6);
             ecam_write32(bus_nr, dev_nr, func_nr, 0x04, cmd | 0x6);
         }
 
@@ -1946,7 +1968,7 @@ static int detect_i2c_controllers(void) {
             // Dump PCI capability list via ECAM for diagnostics
             {
                 uint32_t sts = ecam_read32(bus_nr, dev_nr, func_nr, 0x04);
-                kprintf("[I2C%d] PCI STS=0x%04x CMD=0x%04x caplist=%d\n",
+                i2c_dbg("[I2C%d] PCI STS=0x%04x CMD=0x%04x caplist=%d\n",
                         ci, (sts >> 16) & 0xFFFF, sts & 0xFFFF,
                         (int)((sts >> 16) & (1 << 4)) != 0);
                 if ((sts >> 16) & (1 << 4)) {
@@ -1954,7 +1976,7 @@ static int detect_i2c_controllers(void) {
                     for (int ci2 = 0; ci2 < 48 && ptr; ci2++) {
                         uint32_t hdr = ecam_read32(bus_nr, dev_nr, func_nr, ptr);
                         uint8_t cap_id = (uint8_t)(hdr & 0xFF);
-                        kprintf("[I2C%d]   CAP @ 0x%02x: id=0x%02x\n",
+                        i2c_dbg("[I2C%d]   CAP @ 0x%02x: id=0x%02x\n",
                                 ci, ptr, cap_id);
                         ptr = (uint8_t)((hdr >> 8) & 0xFC);
                     }
@@ -1963,7 +1985,7 @@ static int detect_i2c_controllers(void) {
 
             // Try MSI first (cap 0x05)
             if (pci_enable_msi(pci_dev, vector) == 0) {
-                kprintf("[I2C%d] MSI vector %u enabled\n", ci, vector);
+                i2c_dbg("[I2C%d] MSI vector %u enabled\n", ci, vector);
                 irq_ok = 1;
             }
 
@@ -1981,11 +2003,11 @@ static int detect_i2c_controllers(void) {
                                   ? IOAPIC_POLARITY_LOW : IOAPIC_POLARITY_HIGH;
                     uint8_t trig = crs.irq_triggering
                                    ? IOAPIC_TRIGGER_EDGE : IOAPIC_TRIGGER_LEVEL;
-                    kprintf("[I2C%d] _CRS GSI %u (pol=%u trig=%u)\n",
+                    i2c_dbg("[I2C%d] _CRS GSI %u (pol=%u trig=%u)\n",
                             ci, gsi, pol, trig);
                     if (ioapic_configure_legacy_irq((uint8_t)gsi, vector,
                                                     pol, trig) == 0) {
-                        kprintf("[I2C%d] IOAPIC GSI %u -> vector %u\n",
+                        i2c_dbg("[I2C%d] IOAPIC GSI %u -> vector %u\n",
                                 ci, gsi, vector);
                         irq_ok = 1;
                     }
@@ -2005,7 +2027,7 @@ static int detect_i2c_controllers(void) {
                     uint8_t pin = (uint8_t)((ireg >> 8) & 0xFF);
                     uint32_t gsi = 0;
 
-                    kprintf("[I2C%d] PCI INTPIN=%u (fresh ECAM read)\n",
+                    i2c_dbg("[I2C%d] PCI INTPIN=%u (fresh ECAM read)\n",
                             ci, pin);
 
                     if (pin >= 1 && pin <= 4 &&
@@ -2013,7 +2035,7 @@ static int detect_i2c_controllers(void) {
                         if (ioapic_configure_legacy_irq((uint8_t)gsi, vector,
                                                         IOAPIC_POLARITY_LOW,
                                                         IOAPIC_TRIGGER_LEVEL) == 0) {
-                            kprintf("[I2C%d] IOAPIC GSI %u -> vector %u (PRT pin %u)\n",
+                            i2c_dbg("[I2C%d] IOAPIC GSI %u -> vector %u (PRT pin %u)\n",
                                     ci, gsi, vector, pin);
                             irq_ok = 1;
                         }
@@ -2029,7 +2051,7 @@ static int detect_i2c_controllers(void) {
                                 if (ioapic_configure_legacy_irq((uint8_t)gsi, vector,
                                                                 IOAPIC_POLARITY_LOW,
                                                                 IOAPIC_TRIGGER_LEVEL) == 0) {
-                                    kprintf("[I2C%d] IOAPIC GSI %u -> vector %u (PRT scan pin %u)\n",
+                                    i2c_dbg("[I2C%d] IOAPIC GSI %u -> vector %u (PRT scan pin %u)\n",
                                             ci, gsi, vector, try_pin);
                                     irq_ok = 1;
                                 }
@@ -2048,12 +2070,12 @@ static int detect_i2c_controllers(void) {
                 uint8_t pin = (uint8_t)((ireg >> 8) & 0xFF);
 
                 if (intline != 0 && intline != 0xFF) {
-                    kprintf("[I2C%d] PCI INTx fallback: line=%u pin=%u\n",
+                    i2c_dbg("[I2C%d] PCI INTx fallback: line=%u pin=%u\n",
                             ci, intline, pin);
                     if (ioapic_configure_legacy_irq(intline, vector,
                                                     IOAPIC_POLARITY_LOW,
                                                     IOAPIC_TRIGGER_LEVEL) == 0) {
-                        kprintf("[I2C%d] IOAPIC GSI %u -> vector %u\n",
+                        i2c_dbg("[I2C%d] IOAPIC GSI %u -> vector %u\n",
                                 ci, intline, vector);
                         irq_ok = 1;
                     }
@@ -2080,12 +2102,12 @@ static int detect_i2c_controllers(void) {
                 ecam_write32(bus_nr, dev_nr, func_nr, 0x3C,
                              (ireg_before & 0xFFFFFF00u) | chosen_gsi);
                 uint32_t ireg_after = ecam_read32(bus_nr, dev_nr, func_nr, 0x3C);
-                kprintf("[I2C%d] PCI INTLINE: 0x%x -> 0x%x (wrote GSI %u)\n",
+                i2c_dbg("[I2C%d] PCI INTLINE: 0x%x -> 0x%x (wrote GSI %u)\n",
                         ci, ireg_before & 0xFF, ireg_after & 0xFF, chosen_gsi);
 
                 // Probe the IOAPIC: enable the DW core's TX_EMPTY interrupt
                 // and sweep entries 24-119 to find which one fires.
-                kprintf("[I2C%d] Probing IOAPIC for direct GSI (vector %u)...\n",
+                i2c_dbg("[I2C%d] Probing IOAPIC for direct GSI (vector %u)...\n",
                         ci, vector);
                 int gsi = probe_ioapic_i2c_gsi(ctrl, vector);
                 if (gsi >= 0) {
@@ -2094,7 +2116,7 @@ static int detect_i2c_controllers(void) {
                     if (ioapic_configure_legacy_irq((uint8_t)gsi, vector,
                                                     IOAPIC_POLARITY_HIGH,
                                                     IOAPIC_TRIGGER_LEVEL) == 0) {
-                        kprintf("[I2C%d] IOAPIC GSI %d -> vector %u (probed)\n",
+                        i2c_dbg("[I2C%d] IOAPIC GSI %d -> vector %u (probed)\n",
                                 ci, gsi, vector);
                         ctrl->irq_vector = vector;
                         ctrl->irq_gsi = (uint32_t)gsi;
@@ -2209,7 +2231,7 @@ static int i2c_hid_write_simple_command(i2c_hid_device_t *dev,
         (uint8_t)(opcode >> 8)
     };
 
-    kprintf("[I2C-HID] %s wire: [%02x %02x %02x %02x]\n",
+    i2c_dbg("[I2C-HID] %s wire: [%02x %02x %02x %02x]\n",
             name, buf[0], buf[1], buf[2], buf[3]);
 
     return dw_i2c_write(dev->ctrl, dev->i2c_addr, buf, 4);
@@ -2242,14 +2264,14 @@ static int i2c_hid_reset(i2c_hid_device_t *dev) {
         dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
                          resp_stack, I2C_HID_LENGTH_HDR_SIZE);
         uint16_t rst_len = (uint16_t)resp_stack[0] | ((uint16_t)resp_stack[1] << 8);
-        kprintf("[I2C-HID] RESET completion (minimal): len=%u [%02x %02x]\n",
+        i2c_dbg("[I2C-HID] RESET completion (minimal): len=%u [%02x %02x]\n",
                 rst_len, resp_stack[0], resp_stack[1]);
         return 0;
     }
 
     int drain_rc = i2c_hid_read_length_first(dev, resp, resp_buf_size);
     uint16_t rst_len = (uint16_t)resp[0] | ((uint16_t)resp[1] << 8);
-    kprintf("[I2C-HID] RESET completion: len=%u rc=%d [%02x %02x %02x %02x]\n",
+    i2c_dbg("[I2C-HID] RESET completion: len=%u rc=%d [%02x %02x %02x %02x]\n",
             rst_len, drain_rc, resp[0], resp[1],
             resp_buf_size > 2 ? resp[2] : 0, resp_buf_size > 3 ? resp[3] : 0);
 
@@ -2259,7 +2281,7 @@ static int i2c_hid_reset(i2c_hid_device_t *dev) {
 static int i2c_hid_set_idle(i2c_hid_device_t *dev, uint8_t duration,
                              uint8_t report_id) {
     if (duration != 0) {
-        kprintf("[I2C-HID] SET_IDLE duration=%u unsupported\n", duration);
+        i2c_dbg("[I2C-HID] SET_IDLE duration=%u unsupported\n", duration);
         return -1;
     }
 
@@ -2312,13 +2334,13 @@ static int i2c_hid_set_report(i2c_hid_device_t *dev, uint8_t report_type,
     for (int i = 0; i < data_len; i++)
         wire[9 + i] = data[i];
 
-    kprintf("[I2C-HID] SET_REPORT wire(%d): "
+    i2c_dbg("[I2C-HID] SET_REPORT wire(%d): "
             "[%02x %02x %02x %02x %02x %02x %02x %02x %02x",
             total, wire[0], wire[1], wire[2], wire[3],
             wire[4], wire[5], wire[6], wire[7], wire[8]);
     for (int i = 0; i < data_len && i < 4; i++)
-        kprintf(" %02x", wire[9 + i]);
-    kprintf("]\n");
+        i2c_dbg(" %02x", wire[9 + i]);
+    i2c_dbg("]\n");
 
     return dw_i2c_write(dev->ctrl, dev->i2c_addr, wire, total);
 }
@@ -2483,7 +2505,7 @@ static void i2c_hid_parse_report_desc(i2c_hid_device_t *dev) {
                     dev->input_mode_rid  = report_id;
                     dev->input_mode_size =
                         (uint8_t)((report_size * report_count + 7) / 8);
-                    kprintf("[I2C-HID] Found Input Mode feature: "
+                    i2c_dbg("[I2C-HID] Found Input Mode feature: "
                             "reportID=%u size=%u bits\n",
                             report_id, report_size * report_count);
                 }
@@ -2639,7 +2661,7 @@ static void i2c_hid_parse_report_desc(i2c_hid_device_t *dev) {
             && dev->input_mode_rid == 0) {
             dev->input_mode_rid  = fields[i].report_id;
             dev->input_mode_size = (uint8_t)((fields[i].bit_size + 7) / 8);
-            kprintf("[I2C-HID] Found Input Mode feature: "
+            i2c_dbg("[I2C-HID] Found Input Mode feature: "
                     "reportID=%u size=%u bits\n",
                     fields[i].report_id, fields[i].bit_size);
             break;
@@ -2686,7 +2708,7 @@ static void i2c_hid_parse_report_desc(i2c_hid_device_t *dev) {
 
     if (!tp_found) {
         dev->dev_type = I2C_HID_DEV_UNKNOWN;
-        kprintf("[I2C-HID] Could not determine device type from "
+        i2c_dbg("[I2C-HID] Could not determine device type from "
                 "report descriptor (%d fields parsed)\n", field_count);
         return;
     }
@@ -2881,7 +2903,7 @@ static int i2c_hid_init_device(i2c_hid_device_t *dev) {
     // Reset device
     rc = i2c_hid_reset(dev);
     if (rc < 0) {
-        kprintf("[I2C-HID] RESET failed for I2C%d:0x%02x\n",
+        i2c_dbg("[I2C-HID] RESET failed for I2C%d:0x%02x\n",
                 dev->ctrl->bus_id, dev->i2c_addr);
         // Continue anyway — some devices work without reset
     }
@@ -2907,7 +2929,7 @@ static int i2c_hid_init_device(i2c_hid_device_t *dev) {
         }
         dev->input_buf_size = alloc_len;
         i2c_memset(dev->input_buf, 0, alloc_len);
-        kprintf("[I2C-HID] Allocated input buffer: %u bytes "
+        i2c_dbg("[I2C-HID] Allocated input buffer: %u bytes "
                 "(wMaxInputLength=%u)\n",
                 alloc_len, dev->desc.wMaxInputLength);
     }
@@ -2921,13 +2943,13 @@ static int i2c_hid_init_device(i2c_hid_device_t *dev) {
                                     dev->desc.wReportDescRegister,
                                     dev->report_desc, dev->report_desc_len);
             if (rc < 0) {
-                kprintf("[I2C-HID] Failed to read report descriptor\n");
+                i2c_dbg("[I2C-HID] Failed to read report descriptor\n");
                 slab_free(dev->report_desc);
                 dev->report_desc = NULL;
                 // Try to use device as generic mouse/keyboard based on vendor
                 if (dev->desc.wVendorID == 0x0488) {
                     dev->dev_type = I2C_HID_DEV_TOUCHPAD;
-                    kprintf("[I2C-HID] Assuming ITE Tech touchpad (VID 0x0488)\n");
+                    i2c_dbg("[I2C-HID] Assuming ITE Tech touchpad (VID 0x0488)\n");
                 }
             } else {
                 // Parse report descriptor
@@ -2940,7 +2962,7 @@ static int i2c_hid_init_device(i2c_hid_device_t *dev) {
     if (dev->dev_type == I2C_HID_DEV_UNKNOWN) {
         if (dev->desc.wVendorID == 0x0488) {
             dev->dev_type = I2C_HID_DEV_TOUCHPAD;
-            kprintf("[I2C-HID] Guessing ITE Tech (0x0488) = touchpad\n");
+            i2c_dbg("[I2C-HID] Guessing ITE Tech (0x0488) = touchpad\n");
         }
     }
 
@@ -2963,11 +2985,11 @@ static int i2c_hid_init_device(i2c_hid_device_t *dev) {
         uint8_t mode_val = 0x03;  // Touchpad collection mode
         int sr_rc = i2c_hid_set_report(dev, 3, dev->input_mode_rid,
                                         &mode_val, 1);
-        kprintf("[I2C-HID] SET_REPORT input mode=3 rid=%u rc=%d\n",
+        i2c_dbg("[I2C-HID] SET_REPORT input mode=3 rid=%u rc=%d\n",
                 dev->input_mode_rid, sr_rc);
         i2c_delay_us(10000);  // 10ms for mode switch
     } else {
-        kprintf("[I2C-HID] No Input Mode feature found in report desc\n");
+        i2c_dbg("[I2C-HID] No Input Mode feature found in report desc\n");
     }
 
     // Drain any pending reports left over from reset / init.
@@ -2979,7 +3001,7 @@ static int i2c_hid_init_device(i2c_hid_device_t *dev) {
             if (drc < 0) break;
             uint16_t dlen = (uint16_t)dev->input_buf[0] |
                             ((uint16_t)dev->input_buf[1] << 8);
-            kprintf("[I2C-HID] drain[%d]: len=%u [%02x %02x %02x %02x]\n",
+            i2c_dbg("[I2C-HID] drain[%d]: len=%u [%02x %02x %02x %02x]\n",
                     drain, dlen, dev->input_buf[0], dev->input_buf[1],
                     drc > 2 ? dev->input_buf[2] : 0,
                     drc > 3 ? dev->input_buf[3] : 0);
@@ -3306,7 +3328,7 @@ abort:
             return 0;
         }
 
-        kprintf("[I2C-XFER] ABORT bus=%u addr=0x%02x abort_src=0x%x "
+        i2c_dbg("[I2C-XFER] ABORT bus=%u addr=0x%02x abort_src=0x%x "
                 "rx=%d/%d tx=%d/%d "
                 "isr=%u gpio_isr=%u hit=%u miss=%u\n",
                 ctrl->bus_id, addr, abort_src,
@@ -3434,14 +3456,14 @@ static const gpio_platform_def_t *gpio_detect_platform(const char *gpio_path)
             int ndev = acpi_aml_find_devices_by_hid(
                 g_gpio_platforms[i].acpi_hids[h], devs, 1);
             if (ndev > 0) {
-                kprintf("[GPIO] Detected platform via _HID %s (path=%s)\n",
+                i2c_dbg("[GPIO] Detected platform via _HID %s (path=%s)\n",
                         g_gpio_platforms[i].acpi_hids[h], devs[0].path);
                 return &g_gpio_platforms[i];
             }
         }
     }
 
-    kprintf("[GPIO] No matching platform table for GPIO controller\n");
+    i2c_dbg("[GPIO] No matching platform table for GPIO controller\n");
     return NULL;
 }
 
@@ -3490,11 +3512,11 @@ static int gpio_discover_communities(const char *gpio_ctrl_path)
     i2c_memset(&crs, 0, sizeof(crs));
 
     if (acpi_aml_eval_crs(gpio_ctrl_path, &crs) != 0) {
-        kprintf("[GPIO] Failed to evaluate _CRS on %s\n", gpio_ctrl_path);
+        i2c_dbg("[GPIO] Failed to evaluate _CRS on %s\n", gpio_ctrl_path);
         return 0;
     }
 
-    kprintf("[GPIO] %s: %d MMIO ranges, %d IRQs\n",
+    i2c_dbg("[GPIO] %s: %d MMIO ranges, %d IRQs\n",
             gpio_ctrl_path, crs.mmio_range_count, crs.irq_count);
 
     // Detect platform from ACPI _HID
@@ -3506,7 +3528,7 @@ static int gpio_discover_communities(const char *gpio_ctrl_path)
         gpio_gsi = crs.irqs[0];
         g_gpio_ioapic_polarity = crs.irq_polarity;
         g_gpio_ioapic_trigger  = crs.irq_triggering;
-        kprintf("[GPIO] IOAPIC GSI from _CRS: %u (trigger=%s, pol=%s)\n",
+        i2c_dbg("[GPIO] IOAPIC GSI from _CRS: %u (trigger=%s, pol=%s)\n",
                 gpio_gsi,
                 crs.irq_triggering ? "edge" : "level",
                 crs.irq_polarity ? "low" : "high");
@@ -3525,7 +3547,7 @@ static int gpio_discover_communities(const char *gpio_ctrl_path)
         if (npages == 0) npages = 1;
         uint64_t va = mm_map_device_mmio(phys, npages);
         if (!va) {
-            kprintf("[GPIO] Failed to map community %d at 0x%llx\n",
+            i2c_dbg("[GPIO] Failed to map community %d at 0x%llx\n",
                     i, (unsigned long long)phys);
             continue;
         }
@@ -3586,7 +3608,7 @@ static int gpio_discover_communities(const char *gpio_ctrl_path)
             comm->groups[0].gpio_base = GPIO_NOMAP;
         }
 
-        kprintf("[GPIO] Community %d: phys=0x%llx MISCCFG=0x%08x "
+        i2c_dbg("[GPIO] Community %d: phys=0x%llx MISCCFG=0x%08x "
                 "GPDMINTSEL=%u PADBAR=0x%x pins=%u-%u (%u pads, %u groups)%s\n",
                 count, (unsigned long long)phys, misccfg,
                 comm->irq_line, padbar,
@@ -3619,12 +3641,12 @@ static int gpio_find_pin_community(uint16_t pin, uint32_t *out_pad_offset,
         // Use platform table to resolve ACPI pin → community/pad
         if (gpio_resolve_acpi_pin(pin, &ci_idx, &pad_index,
                                   &gpi_reg, &gpi_bit) != 0) {
-            kprintf("[GPIO] Pin %u not found in platform table\n", pin);
+            i2c_dbg("[GPIO] Pin %u not found in platform table\n", pin);
             return -1;
         }
 
         if (ci_idx >= g_gpio_community_count) {
-            kprintf("[GPIO] Pin %u maps to community %d but only %d mapped\n",
+            i2c_dbg("[GPIO] Pin %u maps to community %d but only %d mapped\n",
                     pin, ci_idx, g_gpio_community_count);
             return -1;
         }
@@ -3635,7 +3657,7 @@ static int gpio_find_pin_community(uint16_t pin, uint32_t *out_pad_offset,
         *out_gpi_group = gpi_reg;
         *out_gpi_bit = gpi_bit;
 
-        kprintf("[GPIO] Pin %u: community %d pad_idx %u "
+        i2c_dbg("[GPIO] Pin %u: community %d pad_idx %u "
                 "offset=0x%x gpi_reg=%u bit=%u (gpio_base table)\n",
                 pin, ci_idx, pad_index, *out_pad_offset,
                 gpi_reg, gpi_bit);
@@ -3655,14 +3677,14 @@ static int gpio_find_pin_community(uint16_t pin, uint32_t *out_pad_offset,
         *out_gpi_group = (uint8_t)(pad_idx / 32);
         *out_gpi_bit = (uint8_t)(pad_idx % 32);
 
-        kprintf("[GPIO] Pin %u: community %d pad %u "
+        i2c_dbg("[GPIO] Pin %u: community %d pad %u "
                 "offset=0x%x group=%u bit=%u (fallback)\n",
                 pin, ci, pad_idx, *out_pad_offset,
                 *out_gpi_group, *out_gpi_bit);
         return ci;
     }
 
-    kprintf("[GPIO] Pin %u not found in any community\n", pin);
+    i2c_dbg("[GPIO] Pin %u not found in any community\n", pin);
     return -1;
 }
 
@@ -3682,7 +3704,7 @@ static int gpio_configure_pad_interrupt(gpio_community_t *comm,
     uint32_t hostsw = gpio_comm_read32(comm, hostsw_reg);
     hostsw |= (1u << gpi_bit);
     gpio_comm_write32(comm, hostsw_reg, hostsw);
-    kprintf("[GPIO] HOSTSW_OWN[%u] = 0x%08x (set bit %u)\n",
+    i2c_dbg("[GPIO] HOSTSW_OWN[%u] = 0x%08x (set bit %u)\n",
             gpi_group, gpio_comm_read32(comm, hostsw_reg), gpi_bit);
 
     // 2. Configure PAD_CFG_DW0:
@@ -3696,7 +3718,7 @@ static int gpio_configure_pad_interrupt(gpio_community_t *comm,
     //       GPIROUTIOXAPIC is for direct per-pad IOAPIC routing which is a
     //       different mechanism. Linux does NOT use GPIROUTIOXAPIC.)
     uint32_t dw0 = gpio_comm_read32(comm, pad_offset + GPIO_PAD_CFG_DW0);
-    kprintf("[GPIO] PAD_CFG_DW0 before: 0x%08x\n", dw0);
+    i2c_dbg("[GPIO] PAD_CFG_DW0 before: 0x%08x\n", dw0);
 
     // Clear routing bits (we use GPIO Driver Mode, not direct IOAPIC routing)
     dw0 &= ~(GPIO_DW0_GPIROUTIOXAPIC | GPIO_DW0_GPIROUTSCI |
@@ -3729,7 +3751,7 @@ static int gpio_configure_pad_interrupt(gpio_community_t *comm,
     dw0 |= GPIO_DW0_RXINV;
 
     gpio_comm_write32(comm, pad_offset + GPIO_PAD_CFG_DW0, dw0);
-    kprintf("[GPIO] PAD_CFG_DW0 after:  0x%08x\n",
+    i2c_dbg("[GPIO] PAD_CFG_DW0 after:  0x%08x\n",
             gpio_comm_read32(comm, pad_offset + GPIO_PAD_CFG_DW0));
 
     // 3. Clear any pending interrupt status
@@ -3743,7 +3765,7 @@ static int gpio_configure_pad_interrupt(gpio_community_t *comm,
     uint32_t ie = gpio_comm_read32(comm, ie_reg);
     ie |= (1u << gpi_bit);
     gpio_comm_write32(comm, ie_reg, ie);
-    kprintf("[GPIO] GPI_IE[%u] = 0x%08x (set bit %u)\n",
+    i2c_dbg("[GPIO] GPI_IE[%u] = 0x%08x (set bit %u)\n",
             gpi_group, gpio_comm_read32(comm, ie_reg), gpi_bit);
 
     return 0;
@@ -3760,7 +3782,7 @@ static int gpio_setup_hid_interrupt(i2c_hid_device_t *dev,
     uint16_t pin = crs->gpio_int.pin;
     const char *gpio_path = crs->gpio_int.resource_source;
 
-    kprintf("[GPIO] Setting up interrupt: pin=%u trigger=%s polarity=%s "
+    i2c_dbg("[GPIO] Setting up interrupt: pin=%u trigger=%s polarity=%s "
             "source=%s\n",
             pin,
             crs->gpio_int.triggering ? "edge" : "level",
@@ -3775,10 +3797,10 @@ static int gpio_setup_hid_interrupt(i2c_hid_device_t *dev,
 
     if (g_gpio_community_count == 0) {
         // Fallback: try P2SB SBREG_BAR + known PortIDs
-        kprintf("[GPIO] No communities from ACPI, trying P2SB...\n");
+        i2c_dbg("[GPIO] No communities from ACPI, trying P2SB...\n");
         g_sbreg_bar = p2sb_get_sbreg_bar();
         if (g_sbreg_bar) {
-            kprintf("[GPIO] P2SB SBREG_BAR = 0x%llx\n",
+            i2c_dbg("[GPIO] P2SB SBREG_BAR = 0x%llx\n",
                     (unsigned long long)g_sbreg_bar);
             // Try known GPIO PortIDs for Intel PCH 600/700
             // PortIDs: 0xD1-0xD6 are typical for GPIO communities
@@ -3804,7 +3826,7 @@ static int gpio_setup_hid_interrupt(i2c_hid_device_t *dev,
                 comm->irq_line = (misccfg & GPIO_MISCCFG_GPDMINTSEL_MASK)
                                  >> GPIO_MISCCFG_GPDMINTSEL_SHIFT;
 
-                kprintf("[GPIO] P2SB PortID 0x%02x: MISCCFG=0x%08x "
+                i2c_dbg("[GPIO] P2SB PortID 0x%02x: MISCCFG=0x%08x "
                         "GPDMINTSEL=%u PADBAR=0x%x\n",
                         port_ids[i], misccfg, comm->irq_line, padbar);
 
@@ -3814,7 +3836,7 @@ static int gpio_setup_hid_interrupt(i2c_hid_device_t *dev,
     }
 
     if (g_gpio_community_count == 0) {
-        kprintf("[GPIO] No GPIO communities found\n");
+        i2c_dbg("[GPIO] No GPIO communities found\n");
         return -1;
     }
 
@@ -3843,7 +3865,7 @@ static int gpio_setup_hid_interrupt(i2c_hid_device_t *dev,
     uint8_t ioapic_trigger  = g_gpio_ioapic_trigger ?
                               IOAPIC_TRIGGER_EDGE : IOAPIC_TRIGGER_LEVEL;
 
-    kprintf("[GPIO] Routing IOAPIC GSI %u -> vector %u\n", gsi, vector);
+    i2c_dbg("[GPIO] Routing IOAPIC GSI %u -> vector %u\n", gsi, vector);
     if (ioapic_configure_legacy_irq(gsi, vector, ioapic_polarity,
                                     ioapic_trigger) != 0) {
         kprintf("[GPIO] IOAPIC routing failed for GSI %u\n", gsi);
@@ -3882,7 +3904,7 @@ static int gpio_setup_hid_interrupt(i2c_hid_device_t *dev,
 int i2c_hid_init(void) {
     kprintf("[I2C-HID] Initializing I2C HID subsystem\n");
 #ifdef BUILD_DATE
-    kprintf("[I2C-HID] Build: %s\n", BUILD_DATE);
+    i2c_dbg("[I2C-HID] Build: %s\n", BUILD_DATE);
 #endif
 
     i2c_memset(g_i2c_controllers, 0, sizeof(g_i2c_controllers));
@@ -3928,7 +3950,7 @@ int i2c_hid_init(void) {
                     if (devs[di].path[ctrl_path_len] != '.')
                         continue;
 
-                    kprintf("[I2C%d] ACPI child: %s (HID=%s)\n",
+                    i2c_dbg("[I2C%d] ACPI child: %s (HID=%s)\n",
                             ctrl->bus_id, devs[di].path, hid_ids[hi]);
 
                     acpi_crs_result_t crs;
@@ -3936,7 +3958,7 @@ int i2c_hid_init(void) {
                         for (uint8_t ci = 0; ci < crs.i2c_device_count; ci++) {
                             uint16_t addr = crs.i2c_devices[ci].slave_addr;
                             if (addr >= 0x08 && addr <= 0x77) {
-                                kprintf("[I2C%d] _CRS: slave 0x%02x speed=%u\n",
+                                i2c_dbg("[I2C%d] _CRS: slave 0x%02x speed=%u\n",
                                         ctrl->bus_id, addr,
                                         crs.i2c_devices[ci].connection_speed);
                                 int dev_idx = g_i2c_hid_device_count;
@@ -3953,7 +3975,7 @@ int i2c_hid_init(void) {
                                 // Log and save GpioInt info for later interrupt setup
                                 if (crs.gpio_int.valid &&
                                     dev_idx < g_i2c_hid_device_count) {
-                                    kprintf("[I2C%d] _CRS GpioInt: pin=%u "
+                                    i2c_dbg("[I2C%d] _CRS GpioInt: pin=%u "
                                             "trigger=%s pol=%s src=%s\n",
                                             ctrl->bus_id,
                                             crs.gpio_int.pin,
@@ -3986,14 +4008,14 @@ int i2c_hid_init(void) {
                         continue;
                     if (crs.i2c_device_count == 0) continue;
 
-                    kprintf("[I2C%d] ACPI child: %s (HID=%s CID=%s)\n",
+                    i2c_dbg("[I2C%d] ACPI child: %s (HID=%s CID=%s)\n",
                             ctrl->bus_id, children[di].path,
                             children[di].hid, children[di].cid);
 
                     for (uint8_t ci = 0; ci < crs.i2c_device_count; ci++) {
                         uint16_t addr = crs.i2c_devices[ci].slave_addr;
                         if (addr >= 0x08 && addr <= 0x77) {
-                            kprintf("[I2C%d] _CRS: slave 0x%02x speed=%u\n",
+                            i2c_dbg("[I2C%d] _CRS: slave 0x%02x speed=%u\n",
                                     ctrl->bus_id, addr,
                                     crs.i2c_devices[ci].connection_speed);
                             int dev_idx = g_i2c_hid_device_count;
@@ -4009,7 +4031,7 @@ int i2c_hid_init(void) {
                             }
                             if (crs.gpio_int.valid &&
                                 dev_idx < g_i2c_hid_device_count) {
-                                kprintf("[I2C%d] _CRS GpioInt: pin=%u "
+                                i2c_dbg("[I2C%d] _CRS GpioInt: pin=%u "
                                         "trigger=%s pol=%s src=%s\n",
                                         ctrl->bus_id,
                                         crs.gpio_int.pin,
@@ -4046,17 +4068,17 @@ int i2c_hid_init(void) {
         // This is critical — without it, the device firmware may not fully
         // initialize and will return empty input reports.
         if (dev->acpi_path[0]) {
-            kprintf("[I2C-HID] ACPI power-on: %s\n", dev->acpi_path);
+            i2c_dbg("[I2C-HID] ACPI power-on: %s\n", dev->acpi_path);
 
             // Power on device and all _DEP dependencies (GPIO, I2C host, etc.)
             int pw_rc = acpi_power_on_device_with_deps(dev->acpi_path);
-            kprintf("[I2C-HID] acpi_power_on_device_with_deps: rc=%d\n", pw_rc);
+            i2c_dbg("[I2C-HID] acpi_power_on_device_with_deps: rc=%d\n", pw_rc);
 
             // Also try direct _PS0 on the device itself
             uint64_t ps0_ret = 0;
             int ps0_rc = acpi_aml_exec_device_method(dev->acpi_path, "_PS0",
                                                       &ps0_ret);
-            kprintf("[I2C-HID] _PS0: rc=%d ret=%llu\n", ps0_rc,
+            i2c_dbg("[I2C-HID] _PS0: rc=%d ret=%llu\n", ps0_rc,
                     (unsigned long long)ps0_ret);
 
             // Call _DSM function 1 (HID descriptor register address)
@@ -4072,10 +4094,10 @@ int i2c_hid_init(void) {
                                             1, 1, &dsm_result);
             if (dsm_rc == 0) {
                 uint64_t dsm_val = aml_value_to_integer(&dsm_result);
-                kprintf("[I2C-HID] _DSM(1): rc=%d val=0x%llx\n", dsm_rc,
+                i2c_dbg("[I2C-HID] _DSM(1): rc=%d val=0x%llx\n", dsm_rc,
                         (unsigned long long)dsm_val);
             } else {
-                kprintf("[I2C-HID] _DSM(1): rc=%d (no _DSM)\n", dsm_rc);
+                i2c_dbg("[I2C-HID] _DSM(1): rc=%d (no _DSM)\n", dsm_rc);
             }
 
             i2c_delay_us(10000);  // 10ms settle after ACPI power-on
@@ -4395,7 +4417,7 @@ static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
 
     // Log every 50th processed report
     if ((g_dbg_worker_processed % 50) == 1) {
-        kprintf("[I2C-DBG] #%u dx=%d dy=%d btn=0x%x "
+        i2c_dbg("[I2C-DBG] #%u dx=%d dy=%d btn=0x%x "
                 "isr=%u hit=%u miss=%u wake=%u read=%u proc=%u "
                 "nofing=%u xferr=%u null=%u nid=%u idmm=%u ie=%u\n",
                 g_dbg_worker_processed, dx, dy, buttons,
@@ -4479,7 +4501,7 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
         dev->silent_verify_after = 0;
         dev->silent_verify_attempts = 0;
         g_dbg_worker_xfer_err++;
-        kprintf("[I2C-DBG] xfer ERR #%u dev=0x%02x errcnt=%u "
+        i2c_dbg("[I2C-DBG] xfer ERR #%u dev=0x%02x errcnt=%u "
                 "abort=0x%x\n",
                 g_dbg_worker_xfer_err, dev->i2c_addr,
                 dev->error_count, dev->ctrl->last_abort_source);
@@ -4688,7 +4710,7 @@ static void i2c_hid_worker_thread(void *arg)
             uint64_t now = timer_get_uptime();
             if (now > g_dbg_last_print_uptime) {
                 g_dbg_last_print_uptime = now;
-                kprintf("[I2C-DBG] t=%llu "
+                i2c_dbg("[I2C-DBG] t=%llu "
                         "i2c_isr=%u gpio_isr=%u hit=%u miss=%u "
                         "wake=%u read=%u proc=%u nofing=%u "
                         "xfer: tot=%u ok=%u err=%u abort=%u retry=%u "
@@ -4788,7 +4810,7 @@ static void i2c_hid_worker_thread(void *arg)
         }
     }
 
-    kprintf("[I2C-HID] Worker thread exiting for I2C%d\n", ctrl->bus_id);
+    i2c_dbg("[I2C-HID] Worker thread exiting for I2C%d\n", ctrl->bus_id);
 }
 
 // ============================================================================
@@ -4828,7 +4850,7 @@ void i2c_hid_gpio_irq_handler(uint8_t vector)
             // IS bit not set for our pin
             g_dbg_gpio_isr_miss++;
             if ((g_dbg_gpio_isr_miss % 100) == 1) {
-                kprintf("[I2C-ISR] miss #%u vec=%u IS=0x%x IE=0x%x "
+                i2c_dbg("[I2C-ISR] miss #%u vec=%u IS=0x%x IE=0x%x "
                         "bit=%u wp=%d\n",
                         g_dbg_gpio_isr_miss, vector, is_val, ie_cur,
                         dev->gpio_gpi_bit, dev->work_pending);
@@ -4866,7 +4888,7 @@ void i2c_hid_gpio_irq_handler(uint8_t vector)
 
         // Log every 50th hit
         if ((g_dbg_gpio_isr_hit % 50) == 1) {
-            kprintf("[I2C-ISR] hit #%u vec=%u IS=0x%x->clr "
+            i2c_dbg("[I2C-ISR] hit #%u vec=%u IS=0x%x->clr "
                     "IE 0x%x->0x%x bit=%u\n",
                     g_dbg_gpio_isr_hit, vector, is_val,
                     ie_cur, ie_val, dev->gpio_gpi_bit);
@@ -4876,7 +4898,7 @@ void i2c_hid_gpio_irq_handler(uint8_t vector)
     if (!found_any) {
         // ISR fired but no device had a pending bit — spurious
         if ((g_dbg_gpio_isr_count % 100) == 1) {
-            kprintf("[I2C-ISR] spurious #%u vec=%u\n",
+            i2c_dbg("[I2C-ISR] spurious #%u vec=%u\n",
                     g_dbg_gpio_isr_count, vector);
         }
     }

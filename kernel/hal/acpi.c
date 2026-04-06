@@ -191,7 +191,7 @@ int acpi_init(uint64_t rsdp_hint) {
         kprintf("ACPI: AcpiEnableSubsystem failed: %d\n", (int)status);
         // Non-fatal — continue without hardware enable
     } else {
-        kprintf("ACPI: EnableSub ok\n");
+        acpi_dbg("ACPI: EnableSub ok\n");
     }
 
     // Initialize ACPI objects (run _INI methods, etc.)
@@ -199,7 +199,7 @@ int acpi_init(uint64_t rsdp_hint) {
     if (ACPI_FAILURE(status)) {
         kprintf("ACPI: InitObjects failed: %d\n", (int)status);
     } else {
-        kprintf("ACPI: InitObjects ok\n");
+        acpi_dbg("ACPI: InitObjects ok\n");
     }
 
     // Parse MADT for CPU/IOAPIC information
@@ -671,7 +671,7 @@ int acpi_aml_eval_crs(const char* device_path, acpi_crs_result_t* result) {
 
     status = AcpiGetHandle(NULL, (char*)device_path, &handle);
     if (ACPI_FAILURE(status)) {
-        kprintf("[CRS] %s not found(%d)\n", device_path, (int)status);
+        acpi_dbg("[CRS] %s not found(%d)\n", device_path, (int)status);
         return -1;
     }
 
@@ -687,13 +687,13 @@ int acpi_aml_eval_crs(const char* device_path, acpi_crs_result_t* result) {
             if (o->Type == ACPI_TYPE_BUFFER) blen = (int)o->Buffer.Length;
             AcpiOsFree(eb.Pointer);
         }
-        kprintf("[CRS] %s exist=%d eval=%d blen=%d\n",
+        acpi_dbg("[CRS] %s exist=%d eval=%d blen=%d\n",
                 device_path, (int)ck, (int)ev, blen);
     }
 
     status = AcpiWalkResources(handle, "_CRS", crs_walk_callback, result);
     if (ACPI_FAILURE(status)) {
-        kprintf("[CRS] %s walk fail=%d\n", device_path, (int)status);
+        acpi_dbg("[CRS] %s walk fail=%d\n", device_path, (int)status);
         return -1;
     }
 
@@ -929,9 +929,9 @@ int acpi_power_on_device_with_deps(const char* device_path)
     // Step 2: Power on dependencies
     for (int i = 0; i < dep_count; i++) {
         if (acpi_eval_method_on_path(dep_paths[i], "_PS0") == 0) {
-            kprintf("[ACPI-PWR] dep %s _PS0 ok\n", dep_paths[i]);
+            acpi_dbg("[ACPI-PWR] dep %s _PS0 ok\n", dep_paths[i]);
         } else if (acpi_eval_method_on_path(dep_paths[i], "_ON") == 0) {
-            kprintf("[ACPI-PWR] dep %s _ON ok\n", dep_paths[i]);
+            acpi_dbg("[ACPI-PWR] dep %s _ON ok\n", dep_paths[i]);
         } else {
             dep_failures++;
         }
@@ -959,7 +959,7 @@ int acpi_power_on_device_with_deps(const char* device_path)
                                            ACPI_AML_MAX_PATH);
                                 AcpiOsFree(nb.Pointer);
                                 if (acpi_eval_method_on_path(pr_path, "_ON") == 0)
-                                    kprintf("[ACPI-PWR] pr0 %s _ON ok\n", pr_path);
+                                    acpi_dbg("[ACPI-PWR] pr0 %s _ON ok\n", pr_path);
                             }
                         }
                     }
@@ -971,12 +971,12 @@ int acpi_power_on_device_with_deps(const char* device_path)
 
     // Step 4: Check _STA
     uint32_t dev_sta = acpi_aml_eval_sta(device_path);
-    kprintf("[ACPI-PWR] %s _STA=0x%x\n", device_path, dev_sta);
+    acpi_dbg("[ACPI-PWR] %s _STA=0x%x\n", device_path, dev_sta);
 
     // Step 5: Call _PS0 on target device
     {
         int ps0_rc = acpi_eval_method_on_path(device_path, "_PS0");
-        kprintf("[ACPI-PWR] %s _PS0=%s dep=%d/%d\n",
+        acpi_dbg("[ACPI-PWR] %s _PS0=%s dep=%d/%d\n",
                 device_path, ps0_rc == 0 ? "ok" : "fail/absent",
                 dep_count - dep_failures, dep_count);
     }
@@ -1016,12 +1016,12 @@ int acpi_fw_power_on_pci_device(uint8_t bus, uint8_t device, uint8_t function)
     rc = acpi_find_pci_acpi_path(bus, device, function,
                                  acpi_path, sizeof(acpi_path));
     if (rc != 0) {
-        kprintf("[ACPI-PCI] no ACPI path for PCI %02x:%02x.%x\n",
+        acpi_dbg("[ACPI-PCI] no ACPI path for PCI %02x:%02x.%x\n",
                 bus, device, function);
         return ACPI_FW_STATUS_NOT_FOUND;
     }
 
-    kprintf("[ACPI-PCI] PCI %02x:%02x.%x => %s\n",
+    acpi_dbg("[ACPI-PCI] PCI %02x:%02x.%x => %s\n",
             bus, device, function, acpi_path);
     return acpi_power_on_device_with_deps(acpi_path);
 }
@@ -1188,17 +1188,17 @@ void acpi_pm_init(void) {
         uint8_t *aml = (uint8_t *)dsdt + sizeof(acpi_sdt_header_t);
         uint32_t aml_len = dsdt->length - sizeof(acpi_sdt_header_t);
         if (acpi_parse_s5(aml, aml_len)) {
-            kprintf("ACPI PM: S5 sleep type: SLP_TYPa=%u SLP_TYPb=%u\n",
+            acpi_dbg("ACPI PM: S5 sleep type: SLP_TYPa=%u SLP_TYPb=%u\n",
                     g_slp_typa, g_slp_typb);
         } else {
-            kprintf("ACPI PM: \\_S5 not found in DSDT, using defaults\n");
+            acpi_dbg("ACPI PM: \\_S5 not found in DSDT, using defaults\n");
             g_slp_typa = 5;
             g_slp_typb = 0;
         }
     }
 
     g_pm_initialized = 1;
-    kprintf("ACPI PM: initialized (PM1a=0x%x, PM1b=0x%x, reset=0x%lx)\n",
+    acpi_dbg("ACPI PM: initialized (PM1a=0x%x, PM1b=0x%x, reset=0x%lx)\n",
             g_pm1a_cnt_blk, g_pm1b_cnt_blk, (unsigned long)g_reset_reg_addr);
 }
 
@@ -1239,7 +1239,7 @@ int acpi_pci_lookup_irq(const char* bridge_path,
 
     status = AcpiGetHandle(NULL, (char*)bridge_path, &handle);
     if (ACPI_FAILURE(status)) {
-        kprintf("[PRT] bridge %s not found (%d)\n", bridge_path, (int)status);
+        acpi_dbg("[PRT] bridge %s not found (%d)\n", bridge_path, (int)status);
         return -1;
     }
 
@@ -1247,7 +1247,7 @@ int acpi_pci_lookup_irq(const char* bridge_path,
     ACPI_BUFFER buf = { ACPI_ALLOCATE_BUFFER, NULL };
     status = AcpiGetIrqRoutingTable(handle, &buf);
     if (ACPI_FAILURE(status)) {
-        kprintf("[PRT] %s _PRT failed (%d)\n", bridge_path, (int)status);
+        acpi_dbg("[PRT] %s _PRT failed (%d)\n", bridge_path, (int)status);
         return -2;
     }
 
@@ -1267,7 +1267,7 @@ int acpi_pci_lookup_irq(const char* bridge_path,
             ACPI_PCI_ROUTING_TABLE *e = entry;
             int n = 0;
             while (e && e->Length > 0 && n < 64) {
-                kprintf("[PRT]   #%d addr=0x%llx pin=%u src='%s' idx=%u\n",
+                acpi_dbg("[PRT]   #%d addr=0x%llx pin=%u src='%s' idx=%u\n",
                         n, (unsigned long long)e->Address, e->Pin,
                         e->Source[0] ? e->Source : "(hw)",
                         e->SourceIndex);
@@ -1318,12 +1318,12 @@ int acpi_pci_lookup_irq(const char* bridge_path,
     AcpiOsFree(buf.Pointer);
 
     if (found) {
-        kprintf("[PRT] %s dev=%u pin=%u -> GSI %u\n",
+        acpi_dbg("[PRT] %s dev=%u pin=%u -> GSI %u\n",
                 bridge_path, pci_device, pci_pin, *out_gsi);
         return 0;
     }
 
-    kprintf("[PRT] %s dev=%u pin=%u: no matching entry\n",
+    acpi_dbg("[PRT] %s dev=%u pin=%u: no matching entry\n",
             bridge_path, pci_device, pci_pin);
     return -3;
 }
