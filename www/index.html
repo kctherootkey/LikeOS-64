@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LikeOS Home Site</title>
+<style>
+  /* Reset and base */
+  *, *::before, *::after {
+    box-sizing: border-box;
+  }
+  body {
+    background-color: #ffffff;
+    color: #000000;
+    font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+    margin: 0;
+    padding: 0;
+    line-height: 1.6;
+  }
+  a:link { color: #0000ff; }
+  a:visited { color: #00a000; }
+  a:hover { color: #0066cc; }
+
+  /* Main container */
+  .container {
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 20px 24px;
+  }
+
+  /* Logo section */
+  .logo-section {
+    text-align: center;
+    margin-bottom: 10px;
+  }
+  .logo-section img {
+    max-width: 300px;
+    width: 80%;
+    height: auto;
+  }
+
+  /* Title */
+  .fancy-title {
+    text-align: center;
+    font-size: 1.3em;
+    margin: 0.4em 0 0.6em 0;
+    font-weight: normal;
+    color: #333;
+  }
+
+  /* Horizontal rule */
+  hr {
+    border: none;
+    border-top: 1px solid #999;
+    margin: 1.2em 0;
+  }
+
+  /* Welcome text */
+  p {
+    margin-bottom: 0.6em;
+  }
+
+  /* Release block */
+  .release-block {
+    text-align: center;
+    margin: 1em 0;
+  }
+  .release-name {
+    font-size: 1.5em;
+    font-weight: bold;
+  }
+
+  /* Feature list */
+  ul {
+    margin-top: 0.4em;
+    padding-left: 2em;
+  }
+  ul li {
+    margin-bottom: 0.3em;
+  }
+
+  /* Canonical URL */
+  .canonical {
+    margin: 0.8em 0;
+  }
+
+  /* Footer area */
+  .footer-comments {
+    font-style: italic;
+  }
+  .footer-updated {
+    font-style: italic;
+  }
+  .footer-copyright {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    font-size: 0.85em;
+    gap: 0.5em;
+  }
+  .footer-copyright .left {
+    flex: 1 1 auto;
+  }
+
+  /* Responsive adjustments */
+  @media (max-width: 600px) {
+    .container {
+      padding: 14px 16px;
+    }
+    .logo-section img {
+      max-width: 220px;
+    }
+    .fancy-title {
+      font-size: 1.1em;
+    }
+    .release-name {
+      font-size: 1.3em;
+    }
+    .footer-copyright {
+      flex-direction: column;
+    }
+  }
+
+  @media (min-width: 601px) and (max-width: 1024px) {
+    .container {
+      max-width: 700px;
+      padding: 20px 28px;
+    }
+    .logo-section img {
+      max-width: 260px;
+    }
+  }
+</style>
+<!-- Copyright (c) 2026 Nikolaos Rangos. -->
+</head>
+
+<body>
+
+<div class="container">
+
+  <!-- Logo -->
+  <div class="logo-section">
+    <img src="likeos-logo.png" alt="LikeOS">
+  </div>
+
+  <!-- Fancy title -->
+  <h3 class="fancy-title">
+    A Modern 64-Bit Operating System Built from Scratch
+  </h3>
+
+  <hr>
+
+  <!-- Welcome -->
+  <p>
+    Welcome to the <b>LikeOS</b> home page.
+    LikeOS is a modern 64-bit operating system built entirely from scratch, demonstrating
+    contemporary OS development with a complete Unix-like userland.
+  </p>
+
+  <p>
+    <b>LikeOS</b> was written by Nikolaos Rangos.
+  </p>
+
+  <!-- Current release -->
+  <div class="release-block">
+    Current development release:
+    <p>
+      <span class="release-name">LikeOS 0.2</span>
+    </p>
+  </div>
+
+  <p>
+    Version 0.2 has these key features:
+  </p>
+  <ul>
+    <li>64-bit long mode kernel with higher-half mapping.</li>
+    <li>UEFI boot path with framebuffer and memory map handoff.</li>
+    <li>Interrupt and exception handling with IDT and PIC/APIC integration.</li>
+    <li>SMP support for up to 64 CPUs with AP startup using INIT-SIPI-SIPI.</li>
+    <li>Per-CPU data structures, run queues, and scheduler accounting.</li>
+    <li>LAPIC timer setup, IOAPIC routing, TLB shootdown, and SMP-aware locking.</li>
+    <li>Preemptive multitasking scheduler with fork, execve, exit, wait4, signals, and pipes.</li>
+    <li>User mode execution in ring 3 with ELF64 binary loading.</li>
+    <li>FAT32 filesystem with VFS and devfs layers.</li>
+    <li>Dentry cache, inode cache, and page cache with read-ahead and CLOCK-style eviction.</li>
+    <li>xHCI USB 3.0 stack and USB mass storage driver.</li>
+    <li>PS/2, PCI, and APIC hardware drivers.</li>
+    <li>Physical and virtual memory management with SLAB allocator and security protections.</li>
+    <li>POSIX-like TTY and signal handling.</li>
+    <li>Userland libc with dynamic runtime linker support.</li>
+    <li>Framebuffer console optimizations.</li>
+    <li>Core utilities: sh, ls, cat, cp, mv, rm, grep, find, nano, top, ps, and many more.</li>
+    <li>Real hardware support on Lenovo notebook, VMware, VirtualBox, and QEMU.</li>
+  </ul>
+
+  <hr>
+
+  <!-- Canonical URL -->
+  <p class="canonical">
+    Canonical URL: <a href="https://likeos.systemtrap.com">https://likeos.systemtrap.com</a>
+  </p>
+
+  <hr>
+
+  <!-- Introduction / About -->
+  <p>
+    <b>LikeOS</b> is a Unix-like operating system designed to demonstrate modern OS development
+    from the ground up. It features a complete userland with process management, syscalls,
+    preemptive multitasking, symmetric multi-processing (SMP), and an interactive shell.
+    The system boots via UEFI, runs on (some) real hardware as well as virtual machines (QEMU,
+    VMware, VirtualBox), and includes a rich set of core utilities and a C library with
+    dynamic linking support.
+  </p>
+
+  <p>
+    The author, Nikolaos Rangos, can be reached at
+    <a href="mailto:niko@systemtrap.com">niko@systemtrap.com</a>.
+  </p>
+
+  <p>
+    The git repository is available at:
+    <a href="https://github.com/kctherootkey/LikeOS-64">https://github.com/kctherootkey/LikeOS-64</a>
+  </p>
+
+  <p>
+    LikeOS is released under the <b>GNU General Public License version 2</b>.
+    See the COPYING file in the repository for the full license text.
+  </p>
+
+  <hr>
+
+  <!-- Current development version -->
+  <p>
+    The current development version is available on GitHub:<br>
+    <a href="https://github.com/kctherootkey/LikeOS-64">https://github.com/kctherootkey/LikeOS-64</a>
+  </p>
+
+  <hr>
+
+  <!-- Footer comments -->
+  <p class="footer-comments">
+    Send comments or questions about <b>LikeOS</b> to the author at
+    <a href="mailto:niko@systemtrap.com">niko@systemtrap.com</a>&nbsp;
+    after checking the
+    <a href="https://github.com/kctherootkey/LikeOS-64/blob/master/README"><b>README</b></a>.
+  </p>
+
+  <p class="footer-updated">
+    This page last updated <b>April 10<sup>th</sup>, 2026</b>.
+  </p>
+
+  <hr>
+
+  <div class="footer-copyright">
+    <div class="left">
+      Web page copyright &copy; 2026 Nikolaos Rangos.<br>
+      LikeOS software copyright &copy; 2026 Nikolaos Rangos.
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
