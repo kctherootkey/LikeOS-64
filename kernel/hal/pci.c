@@ -117,6 +117,15 @@ void pci_assign_unassigned_bars(void)
 {
     for(int i = 0; i < g_pci_count; i++) {
         pci_device_t *p = &g_pci_devices[i];
+
+        /* Skip bridges — their config registers at 0x10-0x24 are NOT
+           standard BARs.  Writing 0xFFFFFFFF to probe size on an ISA/eSPI
+           bridge (D31:F0) corrupts PCH IO decode and kills ALL legacy
+           fixed IO (ports 0x60, 0x61, 0x64, 0x71, etc.).  PCI-to-PCI
+           bridges also have non-standard layouts starting at 0x18. */
+        if (p->class_code == 0x06)   /* Bridge device */
+            continue;
+
         for(int bar = 0; bar < 6; ++bar) {
             unsigned int off = 0x10 + bar * 4;
             unsigned int val = pci_cfg_read32(p->bus, p->device, p->function, off);

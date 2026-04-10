@@ -10,6 +10,10 @@
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/i2c_hid.h"
 
+// ACPI SCI dispatch (from oslikeos.c)
+extern int acpi_sci_dispatch(void);
+#define ACPI_SCI_VECTOR  58
+
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_descriptor idt_desc;
 static struct tss_entry tss;  // BSP TSS
@@ -74,6 +78,7 @@ extern void irq22();
 extern void irq23();
 extern void irq24();
 extern void irq25();
+extern void irq26();  // ACPI SCI
 
 extern void isr0();
 extern void isr1();
@@ -146,7 +151,10 @@ void pic_send_eoi(uint8_t irq) {
             // potentially swallowing a keyboard or mouse IRQ.
             // Fix: read the PIC ISR and only ACK the PIC when the
             // corresponding IRQ bit is actually in-service.
-            if (this_cpu_id() == 0) {
+            // Note: before percpu_init(), GS base is 0 and this_cpu_id()
+            // would fault.  If GS is unset we are always the BSP (CPU 0).
+            uint32_t cpu = read_gs_base_msr() ? this_cpu_id() : 0;
+            if (cpu == 0) {
                 if (irq < 8) {
                     uint8_t isr = pic_read_isr();
                     if (isr & (1u << irq)) {
@@ -313,6 +321,7 @@ void idt_init() {
     idt_set_entry(55, (uint64_t)irq23, 0x08, 0x8E);  // GPIO 1
     idt_set_entry(56, (uint64_t)irq24, 0x08, 0x8E);  // GPIO 2
     idt_set_entry(57, (uint64_t)irq25, 0x08, 0x8E);  // GPIO 3
+    idt_set_entry(58, (uint64_t)irq26, 0x08, 0x8E);  // ACPI SCI
     
     // IPI vectors for SMP
     idt_set_entry(0xFC, (uint64_t)ipi_vector_0xFC, 0x08, 0x8E);  // TLB shootdown
@@ -515,13 +524,22 @@ void irq_handler(uint64_t *regs) {
         return;
     }
 
+    // ACPI SCI interrupt (vector 58) — level-triggered via IOAPIC
+    if (int_no == ACPI_SCI_VECTOR) {
+        acpi_sci_dispatch();
+        lapic_eoi();
+        return;
+    }
+
     // Check for spurious IRQ7 (from master PIC)
     if (irq == 7) {
         uint8_t isr = pic_read_isr();
         if ((isr & 0x80) == 0) {
-            // Spurious IRQ7 - do NOT send any EOI
-            // ExtINT delivery does not set LAPIC ISR bits, so no LAPIC EOI either
+            // Spurious IRQ7 — PIC ISR bit not set, but LAPIC ISR IS set
+            // when delivered via LINT0 ExtINT (virtual wire).  Must clear it.
             g_spurious_irq_count++;
+            if (g_lapic_active || lapic_is_available())
+                lapic_eoi();
             return;
         }
     }
@@ -530,10 +548,12 @@ void irq_handler(uint64_t *regs) {
     if (irq == 15) {
         uint8_t isr = pic2_read_isr();
         if ((isr & 0x80) == 0) {
-            // Spurious IRQ15 - only send EOI to master (for cascade)
-            // ExtINT delivery does not set LAPIC ISR bits, so no LAPIC EOI
+            // Spurious IRQ15 — send EOI to master PIC (cascade) and LAPIC.
+            // LAPIC ISR bit IS set via LINT0 ExtINT delivery.
             g_spurious_irq_count++;
-            outb(PIC1_CMD, 0x20);  // EOI to master only
+            outb(PIC1_CMD, 0x20);  // EOI to master only (no slave — spurious)
+            if (g_lapic_active || lapic_is_available())
+                lapic_eoi();
             return;
         }
     }

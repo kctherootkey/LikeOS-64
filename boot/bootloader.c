@@ -1287,6 +1287,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     Print(L"About to exit boot services. Kernel entry: 0x%lx\r\n", elf_header->e_entry);
     Print(L"Trampoline at: 0x%lx\r\n", trampoline_addr);
 
+    // Diagnostic: probe legacy IO ports BEFORE ExitBootServices
+    // to determine if they ever work on this eSPI platform.
+    {
+        UINT8 p60 = inb(0x60), p64 = inb(0x64);
+        UINT8 p61 = inb(0x61), p71 = inb(0x71);
+        Print(L"Pre-EBS IO: 0x60=%02x 0x64=%02x 0x61=%02x 0x71=%02x\r\n",
+              p60, p64, p61, p71);
+        // Also output to serial so it appears in USB serial log
+        serial_puts("Pre-EBS IO: 0x60=");
+        serial_puthex(p60); serial_puts(" 0x64=");
+        serial_puthex(p64); serial_puts(" 0x61=");
+        serial_puthex(p61); serial_puts(" 0x71=");
+        serial_puthex(p71); serial_puts("\n");
+    }
+
     // Step 3: Exit boot services
     status = uefi_call_wrapper(BS->ExitBootServices, 2, ImageHandle, map_key);
     if (EFI_ERROR(status)) {

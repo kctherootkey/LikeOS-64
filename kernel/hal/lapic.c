@@ -230,8 +230,18 @@ void lapic_enable(void) {
     
     // Enable LAPIC and set spurious vector
     uint32_t svr = lapic_read(LAPIC_SVR);
+    uint32_t svr_old = svr;
     svr |= LAPIC_SVR_ENABLE;
     svr = (svr & 0xFFFFFF00) | LAPIC_SPURIOUS_VECTOR;
+    // Clear Suppress EOI Broadcast (bit 12) — UEFI firmware on x2APIC
+    // platforms often sets this.  With it enabled, LAPIC EOI never clears
+    // IOAPIC Remote IRR, so level-triggered interrupts (ACPI SCI) fire
+    // exactly once and then stop.  Clearing it restores normal EOI
+    // broadcast to IOAPIC for proper level-triggered operation.
+    svr &= ~LAPIC_SVR_SUPPRESS_EOI_BC;
+    if (svr_old & LAPIC_SVR_SUPPRESS_EOI_BC)
+        kprintf("LAPIC: cleared Suppress EOI Broadcast (SVR 0x%x -> 0x%x)\n",
+                svr_old, svr);
     lapic_write(LAPIC_SVR, svr);
 }
 
@@ -499,7 +509,7 @@ void lapic_send_init(uint32_t apic_id) {
         // INIT assert
         x2apic_write_icr(apic_id, LAPIC_ICR_INIT | LAPIC_ICR_PHYSICAL |
                           LAPIC_ICR_ASSERT | LAPIC_ICR_LEVEL);
-        pit_delay_ms(10);
+        lapic_delay_ms(10);
         // x2APIC: INIT de-assert is not needed (only used by old P6/P4 xAPIC)
         return;
     }
@@ -509,7 +519,7 @@ void lapic_send_init(uint32_t apic_id) {
                 LAPIC_ICR_ASSERT | LAPIC_ICR_LEVEL);
     
     lapic_ipi_wait();
-    pit_delay_ms(10);
+    lapic_delay_ms(10);
     
     // Deassert (level triggered) — xAPIC only
     lapic_write(LAPIC_ICR_HIGH, apic_id << 24);

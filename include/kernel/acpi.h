@@ -539,6 +539,10 @@ int acpi_aml_eval_dep(const char* device_path,
 // Returns 0 on success, <0 on failure.
 int acpi_aml_eval_crs(const char* device_path, acpi_crs_result_t* result);
 
+// Activate a PNP device by reading _CRS and passing it to _SRS.
+// This is what Linux's PNP subsystem does to enable devices.
+int acpi_aml_activate_dev(const char* device_path);
+
 // Call _DSM on a device with given UUID, revision, function index, and arg.
 // result: output value. Returns 0 on success, <0 on failure.
 int acpi_aml_call_dsm(const char* device_path,
@@ -557,6 +561,17 @@ int acpi_find_pci_acpi_path(uint8_t bus, uint8_t device, uint8_t function,
 // Evaluates _DEP, powers each dependency, then powers the target device.
 // Returns ACPI_FW_STATUS_*.
 int acpi_power_on_device_with_deps(const char* device_path);
+
+// Service pending ACPI/EC events once. Useful for firmware-driven device
+// bring-up paths that require SCI/GPE work before legacy I/O responds.
+void acpi_service_events(void);
+
+// Return the GSI used for ACPI SCI, or 0 if not yet installed.
+uint32_t acpi_get_sci_gsi(void);
+
+// Evaluate an EC query method directly (for example _Q66) when firmware uses
+// a state machine that can require repeated method execution.
+int acpi_ec_eval_qxx(uint8_t qval);
 
 // Execute a named method on a device path (e.g., "_PS0", "_RST").
 // Returns 0 on success, <0 on failure.
