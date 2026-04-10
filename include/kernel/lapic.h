@@ -42,6 +42,7 @@
 
 // Spurious Vector Register bits
 #define LAPIC_SVR_ENABLE    0x100   // APIC Software Enable
+#define LAPIC_SVR_SUPPRESS_EOI_BC  0x1000  // Suppress EOI Broadcast (bit 12)
 
 // LVT Timer modes
 #define LAPIC_TIMER_ONESHOT     0x00000000  // One-shot mode

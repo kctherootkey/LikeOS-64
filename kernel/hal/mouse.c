@@ -556,18 +556,22 @@ void mouse_init(void)
     }
     (void)bg_count; // count reserved for potential diagnostics
 
+    // Drain any stale bytes from the output buffer before issuing mouse commands.
+    mouse_flush_output();
+
     // Enable PS/2 mouse port
     mouse_wait_input();
     outb(PS2_COMMAND_PORT, PS2_CMD_ENABLE_PORT2);
+    mouse_flush_output();
 
-    // Test if mouse port is available
+    // Test mouse port — non-fatal on failure (stale bytes from eSPI can
+    // cause spurious results; the mouse reset below is the real gate).
     mouse_wait_input();
     outb(PS2_COMMAND_PORT, PS2_CMD_TEST_PORT2);
     uint8_t test_result = mouse_read_data();
-
-    if(test_result != 0x00) {
-        kprintf("ERROR: PS/2 mouse port test failed (result: 0x%02X)\n", test_result);
-        return;
+    if (test_result != 0x00) {
+        kprintf("PS2 mouse: port test returned 0x%02x, continuing\n", test_result);
+        mouse_flush_output();
     }
 
     // Detect mouse type and capabilities (may leave extra bytes in buffer depending on emulation)

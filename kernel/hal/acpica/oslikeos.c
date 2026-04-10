@@ -510,16 +510,59 @@ AcpiOsWaitEventsComplete(void)
 }
 
 /*
- * Interrupt Handling (stub — we don't use ACPI SCI in this kernel)
+ * Interrupt Handling — ACPI SCI support
+ *
+ * ACPICA calls AcpiOsInstallInterruptHandler during AcpiEnableSubsystem()
+ * to register the SCI (System Control Interrupt) handler.  We save the
+ * callback and wire it into the kernel's IDT via IOAPIC.
+ *
+ * The SCI is typically GSI 9 (level-triggered, active-high) on Intel
+ * platforms.  It must be routed through IOAPIC, not the legacy PIC.
  */
+
+#include <kernel/ioapic.h>
+#include <kernel/lapic.h>
+
+// SCI vector in the IDT — pick an unused vector
+#define ACPI_SCI_VECTOR  58
+
+// Saved ACPICA SCI handler
+static ACPI_OSD_HANDLER acpi_sci_handler;
+static void            *acpi_sci_context;
+static UINT32           acpi_sci_gsi;
+
 UINT32
 AcpiOsInstallInterruptHandler(UINT32 InterruptNumber,
                               ACPI_OSD_HANDLER ServiceRoutine,
                               void *Context)
 {
-    (void)InterruptNumber;
-    (void)ServiceRoutine;
-    (void)Context;
+    if (!ServiceRoutine)
+        return (AE_BAD_PARAMETER);
+
+    acpi_sci_handler = ServiceRoutine;
+    acpi_sci_context = Context;
+    acpi_sci_gsi     = InterruptNumber;
+
+    kprintf("ACPI SCI: installing handler for GSI %d -> vector %d\n",
+            InterruptNumber, ACPI_SCI_VECTOR);
+
+    // Route SCI through IOAPIC: level-triggered, active-high (Dell Arrow Lake)
+    int rc = ioapic_configure_legacy_irq((uint8_t)InterruptNumber,
+                                          ACPI_SCI_VECTOR,
+                                          IOAPIC_POLARITY_HIGH,
+                                          IOAPIC_TRIGGER_LEVEL);
+    if (rc) {
+        kprintf("ACPI SCI: IOAPIC route failed (%d), trying active-low\n", rc);
+        // Some platforms use active-low level-triggered
+        ioapic_configure_legacy_irq((uint8_t)InterruptNumber,
+                                     ACPI_SCI_VECTOR,
+                                     IOAPIC_POLARITY_LOW,
+                                     IOAPIC_TRIGGER_LEVEL);
+    }
+
+    // Mask the PIC line — IOAPIC delivers now
+    irq_disable((uint8_t)InterruptNumber);
+
     return (AE_OK);
 }
 
@@ -527,9 +570,45 @@ ACPI_STATUS
 AcpiOsRemoveInterruptHandler(UINT32 InterruptNumber,
                              ACPI_OSD_HANDLER ServiceRoutine)
 {
-    (void)InterruptNumber;
     (void)ServiceRoutine;
+    if (InterruptNumber == acpi_sci_gsi) {
+        ioapic_mask_gsi((uint8_t)InterruptNumber);
+        acpi_sci_handler = NULL;
+        acpi_sci_context = NULL;
+    }
     return (AE_OK);
+}
+
+// Called from the kernel's irq_handler dispatch for the SCI vector.
+// Returns 1 if handled, 0 otherwise.
+static int acpi_sci_count = 0;
+int acpi_sci_dispatch(void)
+{
+    if (acpi_sci_handler) {
+        acpi_sci_count++;
+        if (acpi_sci_count <= 10)
+            kprintf("ACPI SCI: dispatch #%d\n", acpi_sci_count);
+        acpi_sci_handler(acpi_sci_context);
+        return 1;
+    }
+    return 0;
+}
+
+// Return the GSI used for ACPI SCI, or 0 if not yet installed.
+uint32_t acpi_get_sci_gsi(void)
+{
+    return acpi_sci_gsi;
+}
+
+// Manually invoke ACPICA's SCI handler to process pending GPE/PM events.
+// Use when SCI interrupt delivery may not work (x2APIC IOAPIC routing issues).
+void acpi_poll_events(void)
+{
+    if (acpi_sci_handler) {
+        UINT32 result = acpi_sci_handler(acpi_sci_context);
+        if (result)
+            kprintf("ACPI SCI: polled, result=%d\n", result);
+    }
 }
 
 /*

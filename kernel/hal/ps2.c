@@ -1,105 +1,159 @@
 // LikeOS-64 - PS/2 Controller (8042) Initialization
+// Minimal init: BIOS/UEFI firmware already configured i8042 emulation on
+// the eSPI bus.  We set up CTR for keyboard + mouse and program IOAPIC.
+// No PNP _SRS (triggers EC GPE storms), no self-test (leaks stale 0x55
+// on eSPI), no ECAM/PCH decode (preserved by pci.c bridge-skip fix).
+
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/ps2.h"
-#include "../../include/kernel/interrupt.h" // for inb/outb
+#include "../../include/kernel/interrupt.h"
+#include "../../include/kernel/ioapic.h"
 
-#define PS2_DATA   0x60
-#define PS2_STATUS 0x64
-#define PS2_CMD    0x64
+#define PS2_DATA    0x60
+#define PS2_STATUS  0x64
+#define PS2_CMD     0x64
 
-// Status bits
-#define PS2_STATUS_OUT_FULL 0x01
-#define PS2_STATUS_IN_FULL  0x02
+#define STR_OBF      0x01
+#define STR_IBF      0x02
 
-static int wait_input_clear(void) {
-    for (int i=0; i<50000; ++i) {
-        if ((inb(PS2_STATUS) & PS2_STATUS_IN_FULL) == 0)
+#define CTR_KBDINT   0x01
+#define CTR_AUXINT   0x02
+#define CTR_KBDDIS   0x10
+#define CTR_AUXDIS   0x20
+#define CTR_XLATE    0x40
+
+#define CTL_TIMEOUT   10000
+#define BUFFER_SIZE   16
+
+#define CMD_CTL_RCTR  0x0120   // Read  CTR (cmd 0x20, read 1)
+#define CMD_CTL_WCTR  0x1060   // Write CTR (cmd 0x60, write 1)
+
+#define KBD_VECTOR    33       // IRQ1  -> vector 33
+#define AUX_VECTOR    44       // IRQ12 -> vector 44
+
+static inline void udelay50(void)
+{
+    for (int i = 0; i < 50; i++)
+        __asm__ volatile("outb %%al, $0x80" ::: "memory");
+}
+
+static int i8042_wait_write(void)
+{
+    for (int i = 0; i < CTL_TIMEOUT; i++) {
+        if (!(inb(PS2_STATUS) & STR_IBF))
             return 0;
+        udelay50();
     }
     return -1;
 }
-static int wait_output_full(void) {
-    for (int i=0; i<50000; ++i) {
-        if (inb(PS2_STATUS) & PS2_STATUS_OUT_FULL)
+
+static int i8042_wait_read(void)
+{
+    for (int i = 0; i < CTL_TIMEOUT; i++) {
+        if (inb(PS2_STATUS) & STR_OBF)
             return 0;
+        udelay50();
     }
     return -1;
 }
-static void flush_output(void) {
-    for (int i=0; i<16; ++i) {
-        if (inb(PS2_STATUS) & PS2_STATUS_OUT_FULL) {
-            (void)inb(PS2_DATA);
-        } else break;
+
+static int i8042_flush(void)
+{
+    int count = 0;
+    while (inb(PS2_STATUS) & STR_OBF) {
+        if (count++ >= BUFFER_SIZE)
+            return -1;
+        udelay50();
+        (void)inb(PS2_DATA);
     }
-}
-static int write_cmd(uint8_t cmd) {
-    if (wait_input_clear() != 0) return -1;
-    outb(PS2_CMD, cmd);
-    return 0;
-}
-static int write_data(uint8_t data) {
-    if (wait_input_clear() != 0) return -1;
-    outb(PS2_DATA, data);
-    return 0;
-}
-static int read_data(uint8_t *out) {
-    if (wait_output_full() != 0) return -1;
-    *out = inb(PS2_DATA);
     return 0;
 }
 
-int ps2_init(void) {
+static int i8042_command(uint8_t *param, int command)
+{
+    int error;
+
+    error = i8042_wait_write();
+    if (error) return error;
+
+    outb(PS2_CMD, command & 0xff);
+
+    for (int i = 0; i < ((command >> 12) & 0xf); i++) {
+        error = i8042_wait_write();
+        if (error) return error;
+        outb(PS2_DATA, param[i]);
+    }
+
+    for (int i = 0; i < ((command >> 8) & 0xf); i++) {
+        error = i8042_wait_read();
+        if (error) return error;
+        param[i] = inb(PS2_DATA);
+    }
+
+    return 0;
+}
+
+int ps2_init(void)
+{
     kprintf("PS2: initializing controller...\n");
-    // Disable both ports
-    write_cmd(0xAD); // disable first
-    write_cmd(0xA7); // disable second
-    flush_output();
-    // Attempt to read config byte (retry once if first attempt fails)
-    uint8_t cfg=0; int attempt=0; int rc;
-    for(attempt=0; attempt<2; ++attempt) {
-        rc = write_cmd(0x20);
-        if(rc==0 && read_data(&cfg)==0) break;
-        // brief delay before retry
-        for(volatile int d=0; d<100000; ++d) { __asm__ __volatile__("nop"); }
-    }
-    if(attempt==2) {
-        kprintf("PS2: no i8042 controller detected\n");
-        // Dell/eSPI fallback: the Embedded Controller may have disabled
-        // the keyboard port when we sent 0xAD.  Try to re-enable it so
-        // that IRQ1 still delivers scancodes via the EC.
-        write_cmd(0xAE);   // enable first port
-        write_data(0xF4);  // enable scanning
-        uint8_t fb_ack = 0;
-        if (read_data(&fb_ack) == 0 && fb_ack == 0xFA) {
-            kprintf("PS2: EC keyboard enabled via fallback (ack=0x%02x)\n", fb_ack);
-            return 0;
-        }
-        kprintf("PS2: EC fallback did not respond (ack=0x%02x)\n", fb_ack);
+
+    i8042_flush();
+
+    uint8_t status = inb(PS2_STATUS);
+    if (status == 0xFF) {
+        kprintf("PS2: no controller found\n");
         return -1;
     }
-    uint8_t original_cfg = cfg;
-    cfg &= ~0x03; // clear IRQ1, IRQ12 enable bits
-    cfg &= ~(1<<6); // clear translation during tests
-    // Write config
-    write_cmd(0x60);
-    write_data(cfg);
-    // Controller self-test
-    write_cmd(0xAA);
-    uint8_t self=0;
-    if (read_data(&self)!=0 || self!=0x55) { kprintf("PS2: self-test failed (0x%02x)\n", self); }
-    // Test first port
-    write_cmd(0xAB);
-    uint8_t t1=0xFF; read_data(&t1);
-    if (t1!=0x00) { kprintf("PS2: first port test failed (0x%02x)\n", t1); }
-    // Re-enable first port
-    write_cmd(0xAE);
-    // Restore config with IRQ1 on, keep translation disabled (or enable if bit needed)
-    cfg = original_cfg | 0x01; // enable first port IRQ
-    write_cmd(0x60);
-    write_data(cfg);
-    // Enable scanning (send 0xF4 to device)
-    write_data(0xF4);
-    uint8_t ack=0; read_data(&ack); // expect 0xFA
-    kprintf("PS2: initialized (ack=0x%02x, cfg=0x%02x)\n", ack, cfg);
+    kprintf("PS2: status=0x%02x\n", status);
+
+    // Read CTR twice for stability
+    uint8_t ctr[2];
+    int n = 0;
+    do {
+        if (n >= 10) return -1;
+        if (n != 0) udelay50();
+        if (i8042_command(&ctr[n % 2], CMD_CTL_RCTR))
+            return -1;
+        n++;
+    } while (n < 2 || ctr[0] != ctr[1]);
+
+    uint8_t i8042_ctr = ctr[0];
+    kprintf("PS2: CTR=0x%02x\n", i8042_ctr);
+
+    // Disable ports + interrupts during setup, force translation ON
+    i8042_ctr |= (CTR_KBDDIS | CTR_AUXDIS);
+    i8042_ctr &= ~(CTR_KBDINT | CTR_AUXINT);
+    i8042_ctr |= CTR_XLATE;
+    if (i8042_command(&i8042_ctr, CMD_CTL_WCTR))
+        return -1;
+
+    i8042_flush();
+
+    // Enable both ports + interrupts
+    i8042_ctr &= ~(CTR_KBDDIS | CTR_AUXDIS);
+    i8042_ctr |= (CTR_KBDINT | CTR_AUXINT);
+    if (i8042_command(&i8042_ctr, CMD_CTL_WCTR))
+        return -1;
+
+    // IOAPIC routing for keyboard and mouse
+    if (ioapic_configure_legacy_irq(1, KBD_VECTOR,
+                                     IOAPIC_POLARITY_HIGH,
+                                     IOAPIC_TRIGGER_EDGE) == 0) {
+        irq_disable(1);
+    } else {
+        irq_enable(1);
+    }
+
+    if (ioapic_configure_legacy_irq(12, AUX_VECTOR,
+                                     IOAPIC_POLARITY_HIGH,
+                                     IOAPIC_TRIGGER_EDGE) == 0) {
+        irq_disable(12);
+    } else {
+        irq_enable(12);
+    }
+
+    i8042_flush();
+
+    kprintf("PS2: initialized (CTR=0x%02x)\n", i8042_ctr);
     return 0;
 }

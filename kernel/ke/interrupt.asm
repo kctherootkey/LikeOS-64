@@ -211,6 +211,9 @@ IRQ 23, 55              ; GPIO interrupt 1
 IRQ 24, 56              ; GPIO interrupt 2
 IRQ 25, 57              ; GPIO interrupt 3
 
+; ACPI SCI interrupt vector (58)
+IRQ 26, 58              ; ACPI SCI (System Control Interrupt)
+
 ; ============================================================================
 ; IPI (Inter-Processor Interrupt) Handlers for SMP
 ; These are high-vector interrupts sent between CPUs via LAPIC

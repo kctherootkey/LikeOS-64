@@ -24,7 +24,6 @@
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/usbhid.h"
 #include "../../include/kernel/usb_serial.h"
-#include "../../include/kernel/i2c_hid.h"
 
 void system_startup(boot_info_t* boot_info);
 void kernel_main(boot_info_t* boot_info);
@@ -119,17 +118,12 @@ void continue_system_startup(void) {
         fb_flush_dirty_regions();
     }
 
-    ps2_init();
-    keyboard_init();
     irq_enable(0);
-    irq_enable(1);
     irq_enable(2);
 
-    mouse_init();
-    irq_enable(12);
-
-    // ACPI must be ready before LPSS/I2C-HID probing so targeted firmware
-    // discovery can inspect the controller and HID device nodes.
+    // ACPI must be ready before PS/2 PNP detection
+    // so targeted firmware discovery can inspect the controller and HID
+    // device nodes.
     acpi_init(g_rsdp_address);
     acpi_pm_init();
 
@@ -141,29 +135,36 @@ void continue_system_startup(void) {
     xhci_boot_init(&g_xhci_boot);
     usbhid_init();
     usbserial_init();
-    int i2c_nctrl = i2c_hid_init();
-    kprintf("[INIT] I2C init done (rc=%d)\n", i2c_nctrl);
+
+    ps2_init();
+    keyboard_init();
+    mouse_init();
 
     storage_fs_init(&g_storage_state);
 
-    __asm__ volatile ("sti");
-
     sched_init();
 
+    // Mask ACPI SCI permanently — level-triggered EC GPE 0x66 fires
+    // continuously on this platform, causing an interrupt storm that
+    // blocks init progress.  We don't need EC events (battery/thermal)
+    // for PS/2 keyboard/mouse operation.
+    uint32_t sci_gsi = acpi_get_sci_gsi();
+    if (sci_gsi)
+        ioapic_mask_gsi((uint8_t)sci_gsi);
+
     // Initialize SMP support
-    // ACPI was initialized earlier so LPSS/I2C-HID probing can use it.
     percpu_init();
     smp_init(g_smp_trampoline_address);
-    
+
     // Boot Application Processors (APs)
-    // After this, all CPUs are running and SMP is fully initialized
     smp_boot_aps();
     kprintf("SMP: %u CPU(s) online\n", smp_get_cpu_count());
 
-    // Set boot epoch from UEFI GetTime (works on systems where CMOS RTC is
-    // inaccessible after ExitBootServices, e.g., Dell Alder Lake with eSPI)
     timer_set_boot_epoch(g_boot_epoch_saved);
-    
+
+    // Enable interrupts (SCI stays masked — no EC event storm).
+    __asm__ volatile ("sti");
+
     timer_init(100);
 
     // Use LAPIC timer when available — it was already calibrated in smp_init()
