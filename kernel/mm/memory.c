@@ -666,42 +666,44 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     // mark_usable_uefi_regions.  reserve_bootloader_mapped_pages was SUPPOSED
     // to re-reserve them, but this was unreliable — writes to the refcount
     // array silently went to recycled pages, breaking COW.
+    //
+    // CRITICAL: The pages MUST be physically contiguous because we access them
+    // as a flat array via phys_to_virt(first_phys).  If there are gaps (e.g.
+    // reserved pages between free pages), mm_memset and later accesses would
+    // hit unrelated physical pages, corrupting whatever they back.
     // =========================================================================
     {
         uint64_t refcount_pages = (mm_state.refcount_array_size + PAGE_SIZE - 1) / PAGE_SIZE;
-        uint64_t first_phys = mm_allocate_physical_page();
-        if (!first_phys) {
-            kprintf("FATAL: Cannot allocate refcount array!\n");
-            // Fallback to old placement (broken but won't crash immediately)
-            mm_state.page_refcounts = (uint16_t*)((uint64_t)mm_state.physical_bitmap + mm_state.bitmap_size);
-            mm_memset(mm_state.page_refcounts, 0, mm_state.refcount_array_size);
+
+        // Find a contiguous run of free pages in the bitmap.
+        uint64_t run_start = (uint64_t)-1;
+        uint64_t run_len = 0;
+        for (uint64_t p = 0; p < mm_state.total_pages; p++) {
+            if (!is_page_allocated(p)) {
+                if (run_len == 0) run_start = p;
+                run_len++;
+                if (run_len == refcount_pages) break;
+            } else {
+                run_len = 0;
+            }
+        }
+
+        if (run_len < refcount_pages) {
+            kprintf("FATAL: Cannot find %lu contiguous free pages for refcount array!\n",
+                    refcount_pages);
+            mm_state.page_refcounts = NULL;
         } else {
-            // Try to allocate contiguous pages.  The allocator runs linearly
-            // through the bitmap, so pages are usually contiguous.
-            bool contiguous = true;
-            for (uint64_t i = 1; i < refcount_pages; i++) {
-                uint64_t p = mm_allocate_physical_page();
-                if (p != first_phys + i * PAGE_SIZE) {
-                    contiguous = false;
-                    // Still usable — we just need the first page for the base
-                    // All further pages are allocated (tracked), we just can't
-                    // use them as a contiguous block via direct map.
-                }
+            // Mark all pages in the contiguous run as allocated
+            for (uint64_t i = 0; i < refcount_pages; i++) {
+                set_page_bit(run_start + i);
+                mm_state.free_pages--;
             }
-            
-            if (!contiguous) {
-                // Fallback: allocate a SINGLE large chunk from the bitmap
-                // by finding contiguous free pages manually
-                // For now, use the first page's direct-map base.
-                // This works because the allocator gives sequential pages
-                // on a freshly-initialized system.
-                kprintf("  WARNING: refcount pages not contiguous, using first_phys base\n");
-            }
-            
+            uint64_t first_phys = mm_state.memory_start + run_start * PAGE_SIZE;
+
             mm_state.page_refcounts = (uint16_t*)phys_to_virt(first_phys);
             mm_memset(mm_state.page_refcounts, 0, mm_state.refcount_array_size);
-            
-            kprintf("  Page refcounts at: %p (phys 0x%lx, %lu pages)\n",
+
+            kprintf("  Page refcounts at: %p (phys 0x%lx, %lu contiguous pages)\n",
                    mm_state.page_refcounts, first_phys, refcount_pages);
         }
     }
@@ -1273,8 +1275,8 @@ uint64_t mm_map_device_mmio(uint64_t phys_addr, size_t num_pages) {
             smp_tlb_shootdown_sync();
         }
 
-        kprintf("mm_map_device_mmio: remapped direct map pa 0x%lx va 0x%lx np %lu\n",
-                phys_base, virt_base, (unsigned long)num_pages);
+        //kprintf("mm_map_device_mmio: remapped direct map pa 0x%lx va 0x%lx np %lu\n",
+        //        phys_base, virt_base, (unsigned long)num_pages);
         return virt_base + page_offset;
     }
 
@@ -1315,7 +1317,16 @@ void mm_unmap_page_in_address_space(uint64_t* pml4, uint64_t virtual_addr) {
         // Free the physical page - mask out flags (bits 0-11) AND upper reserved/NX bits
         uint64_t phys = *pte & 0x000FFFFFFFFFF000ULL;
         if (phys) {
-            mm_free_physical_page(phys);
+            if (*pte & PAGE_USER) {
+                // User page: use refcount to properly handle shared/COW pages.
+                // mm_decref_page returns true when the last reference is dropped
+                // (or if the page was never ref-tracked, i.e. refcount==0).
+                if (mm_decref_page(phys)) {
+                    mm_free_physical_page(phys);
+                }
+            } else {
+                mm_free_physical_page(phys);
+            }
         }
         *pte = 0;
         // Flush TLB if this is the current address space
@@ -2526,7 +2537,11 @@ uint64_t* mm_clone_address_space_with_shared(uint64_t* src_pml4,
                             if (is_in_shared_range(vaddr, shared_regions, num_shared)) {
                                 // Shared region - map same physical page, keep original flags
                                 new_pt[l] = src_pt[l];
-                                // Increment refcount for shared page
+                                // Increment refcount for BOTH parent and child references
+                                // (same logic as COW: if never tracked, init to 1 for parent)
+                                if (mm_get_page_refcount(phys_page) == 0) {
+                                    mm_incref_page(phys_page);
+                                }
                                 mm_incref_page(phys_page);
                             } else {
                                 // Not shared - use COW

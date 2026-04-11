@@ -1570,7 +1570,6 @@ static int64_t sys_brk(uint64_t new_brk) {
     if (new_brk > cur->brk) {
         uint64_t old_page = PAGE_ALIGN(cur->brk);
         uint64_t new_page = PAGE_ALIGN(new_brk);
-        
         // Map new pages
         for (uint64_t addr = old_page; addr < new_page; addr += PAGE_SIZE) {
             uint64_t phys = mm_allocate_physical_page();
@@ -1581,6 +1580,7 @@ static int64_t sys_brk(uint64_t new_brk) {
                 }
                 return (int64_t)cur->brk;  // Return unchanged brk
             }
+
             // Zero page via direct map
             mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
             
