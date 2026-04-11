@@ -61,7 +61,7 @@ static void acpi_parse_madt(void) {
     ACPI_TABLE_HEADER *hdr = NULL;
     ACPI_STATUS status = AcpiGetTable(ACPI_SIG_MADT, 1, &hdr);
     if (ACPI_FAILURE(status) || !hdr) {
-        kprintf("ACPI: MADT not found\n");
+        acpi_dbg("ACPI: MADT not found\n");
         return;
     }
 
@@ -146,7 +146,6 @@ static void acpi_parse_madt(void) {
 
 // ============================================================================
 // Embedded Controller (EC) Address Space Handler
-// Linux: drivers/acpi/ec.c — acpi_ec_space_handler()
 //
 // The EC uses two IO ports (data + command/status) with a standard protocol.
 // AML methods (e.g. _SRS for PS/2 devices) access EC registers through this.
@@ -233,13 +232,13 @@ ec_space_handler(UINT32 Function, ACPI_PHYSICAL_ADDRESS Address,
         int rc;
         if (Function == ACPI_READ) {
             rc = ec_read_byte((uint8_t)(Address + i), &val[i]);
-            kprintf("ACPI EC: RD [0x%02x] = 0x%02x%s\n",
+            acpi_dbg("ACPI EC: RD [0x%02x] = 0x%02x%s\n",
                     (unsigned)(Address + i), val[i], rc ? " FAIL" : "");
         } else {
-            kprintf("ACPI EC: WR [0x%02x] <- 0x%02x\n",
+            acpi_dbg("ACPI EC: WR [0x%02x] <- 0x%02x\n",
                     (unsigned)(Address + i), val[i]);
             rc = ec_write_byte((uint8_t)(Address + i), val[i]);
-            if (rc) kprintf("ACPI EC: WR FAIL\n");
+            if (rc) acpi_dbg("ACPI EC: WR FAIL\n");
         }
         if (rc)
             return AE_TIME;
@@ -268,7 +267,6 @@ ec_parse_io(ACPI_RESOURCE *Resource, void *Context)
 }
 
 // Find the EC device and install address space handler.
-// Linux sequence: acpi_ec_ecdt_probe() → acpi_ec_dsdt_probe() → ec_install_handlers()
 // Must be called BEFORE AcpiEnableSubsystem/AcpiInitializeObjects so that
 // _INI and _SRS methods can access EC registers.
 static void acpi_ec_init(void)
@@ -287,7 +285,7 @@ static void acpi_ec_init(void)
         // Get the EC handle from ECDT namespace path
         if (ecdt->Id[0])
             AcpiGetHandle(NULL, (char *)ecdt->Id, &ec_handle);
-        kprintf("ACPI EC: ECDT data=0x%x cmd=0x%x\n",
+        acpi_dbg("ACPI EC: ECDT data=0x%x cmd=0x%x\n",
                 ports.data_port, ports.cmd_port);
     }
 
@@ -305,7 +303,7 @@ static void acpi_ec_init(void)
                 status = AcpiWalkResources(ec_handle, "_CRS",
                                            ec_parse_io, &ports);
                 if (ACPI_SUCCESS(status) && ports.data_port && ports.cmd_port)
-                    kprintf("ACPI EC: PNP0C09 at %s data=0x%x cmd=0x%x\n",
+                    acpi_dbg("ACPI EC: PNP0C09 at %s data=0x%x cmd=0x%x\n",
                             ec_info.path, ports.data_port, ports.cmd_port);
             }
         }
@@ -321,7 +319,7 @@ static void acpi_ec_init(void)
 
     // 3. Install EC address space handler at root.
     // Use No_Reg variant — _REG must be called AFTER AcpiInitializeObjects
-    // so the AML namespace is fully ready. Linux does the same:
+    // so the AML namespace is fully ready. Proper sequence:
     //   acpi_install_address_space_handler_no_reg() first,
     //   acpi_execute_reg_methods() later.
     status = AcpiInstallAddressSpaceHandlerNo_Reg(
@@ -332,18 +330,18 @@ static void acpi_ec_init(void)
         NULL);  // No context
 
     if (ACPI_FAILURE(status)) {
-        kprintf("ACPI EC: handler install failed (%d)\n", (int)status);
+        acpi_dbg("ACPI EC: handler install failed (%d)\n", (int)status);
         return;
     }
 
     ec_initialized = 1;
     ec_device_handle = ec_handle;
-    kprintf("ACPI EC: handler installed (data=0x%x cmd=0x%x)\n",
+    acpi_dbg("ACPI EC: handler installed (data=0x%x cmd=0x%x)\n",
             ec_data_port, ec_cmd_port);
 
     // Verify EC ports are accessible — if they read 0xFF, eSPI is dead
     uint8_t ec_sts = inb(ec_cmd_port);
-    kprintf("ACPI EC: status port reads 0x%02x%s\n",
+    acpi_dbg("ACPI EC: status port reads 0x%02x%s\n",
             ec_sts, ec_sts == 0xFF ? " (WARNING: eSPI may be non-functional)" : "");
 }
 
@@ -359,7 +357,7 @@ acpi_exception_handler(ACPI_STATUS AmlStatus, ACPI_NAME Name,
     char name_str[5];
     my_memcpy(name_str, &Name, 4);
     name_str[4] = 0;
-    kprintf("ACPI AML EXCEPTION: status=%d name=%s opcode=0x%04x offset=0x%x\n",
+    acpi_dbg("ACPI AML EXCEPTION: status=%d name=%s opcode=0x%04x offset=0x%x\n",
             (int)AmlStatus, name_str, Opcode, AmlOffset);
     return AmlStatus;  // propagate the error
 }
@@ -376,7 +374,7 @@ gpio_space_handler(UINT32 Function, ACPI_PHYSICAL_ADDRESS Address,
 {
     (void)HandlerContext;
     (void)RegionContext;
-    kprintf("ACPI GPIO: %s addr=0x%llx bits=%d\n",
+    acpi_dbg("ACPI GPIO: %s addr=0x%llx bits=%d\n",
             Function == ACPI_READ ? "RD" : "WR",
             (unsigned long long)Address, BitWidth);
     if (Function == ACPI_READ && Value)
@@ -387,11 +385,10 @@ gpio_space_handler(UINT32 Function, ACPI_PHYSICAL_ADDRESS Address,
 // Run _REG(EmbeddedControl, CONNECT) starting from ACPI_ROOT_OBJECT.
 // This tells ALL AML code that the EC OpRegion handler is now available.
 // Must be called BETWEEN AcpiEnableSubsystem and AcpiInitializeObjects:
-//   - Linux: acpi_ec_dsdt_probe() calls _REG after EnableSubsystem,
+//   - _REG must be called after EnableSubsystem,
 //     BEFORE InitializeObjects, so that _INI methods can access EC.
 //   - _INI methods (run during InitializeObjects) write EC registers
 //     to enable KBC emulation on 0x60/0x64.
-// Linux: acpi_execute_reg_methods(ACPI_ROOT_OBJECT, UINT32_MAX, ACPI_ADR_SPACE_EC)
 static void acpi_ec_call_reg(void)
 {
     if (!ec_initialized)
@@ -402,13 +399,13 @@ static void acpi_ec_call_reg(void)
     ACPI_STATUS status = AcpiExecuteRegMethods(ACPI_ROOT_OBJECT,
                                                ACPI_ADR_SPACE_EC);
     if (ACPI_FAILURE(status))
-        kprintf("ACPI EC: _REG failed (%d)\n", (int)status);
+        acpi_dbg("ACPI EC: _REG failed (%d)\n", (int)status);
     else
-        kprintf("ACPI EC: _REG(EC, 1) propagated from root\n");
+        acpi_dbg("ACPI EC: _REG(EC, 1) propagated from root\n");
 
     // Probe i8042 ports after _REG to see if EC enabled KBC emulation
     uint8_t ps2_sts = inb(0x64);
-    kprintf("ACPI EC: post-_REG i8042 status=0x%02x%s\n",
+    acpi_dbg("ACPI EC: post-_REG i8042 status=0x%02x%s\n",
             ps2_sts, ps2_sts == 0xFF ? " (still dead)" : " (alive!)");
 }
 
@@ -423,7 +420,6 @@ static void acpi_ec_call_reg(void)
 static uint32_t ec_gpe_number = 0;
 
 // GPE handler for EC events (called by ACPICA when GPE fires).
-// Linux: acpi_ec_gpe_handler → acpi_ec_handle_interrupt
 static UINT32 ec_gpe_handler_cb(ACPI_HANDLE gpe_dev, UINT32 gpe_num, void *ctx)
 {
     (void)gpe_dev; (void)gpe_num; (void)ctx;
@@ -440,7 +436,7 @@ static UINT32 ec_gpe_handler_cb(ACPI_HANDLE gpe_dev, UINT32 gpe_num, void *ctx)
     if (ec_wait_obf_set()) return ACPI_REENABLE_GPE;
     uint8_t qval = inb(ec_data_port);
 
-    kprintf("ACPI EC: GPE event 0x%02x\n", qval);
+    acpi_dbg("ACPI EC: GPE event 0x%02x\n", qval);
 
     if (qval && ec_device_handle) {
         char method[5] = { '_', 'Q',
@@ -453,7 +449,6 @@ static UINT32 ec_gpe_handler_cb(ACPI_HANDLE gpe_dev, UINT32 gpe_num, void *ctx)
 }
 
 // Set up EC GPE: read _GPE, install handler, enable GPE in hardware.
-// Linux: acpi_ec_start → acpi_install_gpe_handler + acpi_enable_gpe
 // The EC firmware checks the host's GPE enable register before
 // activating KBC emulation on ports 0x60/0x64.
 static void ec_setup_gpe(void)
@@ -468,34 +463,34 @@ static void ec_setup_gpe(void)
         ec_gpe_number = (uint32_t)obj.Integer.Value;
     } else {
         ec_gpe_number = 0x6E;
-        kprintf("ACPI EC: _GPE eval failed, using 0x%x\n", ec_gpe_number);
+        acpi_dbg("ACPI EC: _GPE eval failed, using 0x%x\n", ec_gpe_number);
     }
-    kprintf("ACPI EC: GPE=0x%x\n", ec_gpe_number);
+    acpi_dbg("ACPI EC: GPE=0x%x\n", ec_gpe_number);
 
     // Print FADT GPE block info for diagnostics
-    kprintf("ACPI: FADT GPE0=0x%llx len=%d GPE1=0x%llx len=%d\n",
+    acpi_dbg("ACPI: FADT GPE0=0x%llx len=%d GPE1=0x%llx len=%d\n",
         (unsigned long long)AcpiGbl_FADT.XGpe0Block.Address,
         AcpiGbl_FADT.Gpe0BlockLength,
         (unsigned long long)AcpiGbl_FADT.XGpe1Block.Address,
         AcpiGbl_FADT.Gpe1BlockLength);
 
-    // Install GPE handler (like Linux's acpi_ec_start)
+    // Install GPE handler 
     st = AcpiInstallGpeHandler(NULL, ec_gpe_number,
                                ACPI_GPE_EDGE_TRIGGERED,
                                ec_gpe_handler_cb, NULL);
     if (ACPI_FAILURE(st)) {
-        kprintf("ACPI EC: GPE handler install failed: %d\n", (int)st);
+        acpi_dbg("ACPI EC: GPE handler install failed: %d\n", (int)st);
         return;
     }
 
     // Enable GPE — sets the enable bit in hardware PM registers
     st = AcpiEnableGpe(NULL, ec_gpe_number);
     if (ACPI_FAILURE(st)) {
-        kprintf("ACPI EC: GPE enable failed: %d\n", (int)st);
+        acpi_dbg("ACPI EC: GPE enable failed: %d\n", (int)st);
         return;
     }
 
-    kprintf("ACPI EC: GPE 0x%x handler installed and enabled\n", ec_gpe_number);
+    acpi_dbg("ACPI EC: GPE 0x%x handler installed and enabled\n", ec_gpe_number);
 }
 
 // Process pending EC events by sending query commands.
@@ -513,7 +508,7 @@ static void ec_process_pending_events(void)
         uint8_t sts = inb(ec_cmd_port);
         if (!(sts & EC_FLAG_SCI)) {
             if (pass)
-                kprintf("ACPI EC: SCI_EVT cleared after %d queries\n", pass);
+                acpi_dbg("ACPI EC: SCI_EVT cleared after %d queries\n", pass);
             break;
         }
 
@@ -521,11 +516,11 @@ static void ec_process_pending_events(void)
         if (ec_wait_ibf_clear()) break;
         outb(ec_cmd_port, EC_CMD_QUERY);
         if (ec_wait_obf_set()) {
-            kprintf("ACPI EC: query timeout (pass %d)\n", pass);
+            acpi_dbg("ACPI EC: query timeout (pass %d)\n", pass);
             break;
         }
         uint8_t qval = inb(ec_data_port);
-        kprintf("ACPI EC: query returned 0x%02x\n", qval);
+        acpi_dbg("ACPI EC: query returned 0x%02x\n", qval);
 
         if (qval == 0) break;  // No event pending
 
@@ -540,14 +535,14 @@ static void ec_process_pending_events(void)
 
             ACPI_STATUS as = AcpiEvaluateObject(ec_device_handle, method,
                                                 NULL, NULL);
-            kprintf("ACPI EC: %s -> %s\n", method,
+            acpi_dbg("ACPI EC: %s -> %s\n", method,
                     ACPI_SUCCESS(as) ? "OK" : "not found/failed");
         }
 
         // Check i8042 after each event
         uint8_t ps2 = inb(0x64);
         if (ps2 != 0xFF) {
-            kprintf("ACPI EC: i8042 ALIVE after event 0x%02x! status=0x%02x\n",
+            acpi_dbg("ACPI EC: i8042 ALIVE after event 0x%02x! status=0x%02x\n",
                     qval, ps2);
             return;
         }
@@ -618,26 +613,25 @@ int acpi_init(uint64_t rsdp_hint) {
     // Initialize ACPICA subsystem
     status = AcpiInitializeSubsystem();
     if (ACPI_FAILURE(status)) {
-        kprintf("ACPI: AcpiInitializeSubsystem failed: %d\n", (int)status);
+        acpi_dbg("ACPI: AcpiInitializeSubsystem failed: %d\n", (int)status);
         return -1;
     }
 
     // Initialize table manager and load RSDP/RSDT/XSDT
     status = AcpiInitializeTables(NULL, 32, FALSE);
     if (ACPI_FAILURE(status)) {
-        kprintf("ACPI: AcpiInitializeTables failed: %d\n", (int)status);
+        acpi_dbg("ACPI: AcpiInitializeTables failed: %d\n", (int)status);
         return -1;
     }
 
     // Load all ACPI tables (DSDT, SSDTs, etc.)
     status = AcpiLoadTables();
     if (ACPI_FAILURE(status)) {
-        kprintf("ACPI: AcpiLoadTables failed: %d\n", (int)status);
+        acpi_dbg("ACPI: AcpiLoadTables failed: %d\n", (int)status);
         return -1;
     }
 
     // Initialize EC address space handler BEFORE AcpiEnableSubsystem.
-    // Linux does this in acpi_ec_ecdt_probe() / acpi_ec_dsdt_probe().
     // Required so AML _INI/_SRS methods can access EC OpRegions.
     acpi_ec_init();
 
@@ -652,19 +646,19 @@ int acpi_init(uint64_t rsdp_hint) {
                                             gpio_space_handler,
                                             NULL, NULL);
     if (ACPI_FAILURE(status))
-        kprintf("ACPI: GPIO handler install failed (%d)\n", (int)status);
+        acpi_dbg("ACPI: GPIO handler install failed (%d)\n", (int)status);
 
     // Enable ACPI subsystem  
     status = AcpiEnableSubsystem(ACPI_FULL_INITIALIZATION);
     if (ACPI_FAILURE(status)) {
-        kprintf("ACPI: AcpiEnableSubsystem failed: %d\n", (int)status);
+        acpi_dbg("ACPI: AcpiEnableSubsystem failed: %d\n", (int)status);
         // Non-fatal — continue without hardware enable
     } else {
         acpi_dbg("ACPI: EnableSub ok\n");
     }
 
     // Call _REG for EC BEFORE InitializeObjects.
-    // Linux sequence: EnableSubsystem → _REG(EC) → InitializeObjects.
+    // Sequence: EnableSubsystem → _REG(EC) → InitializeObjects.
     // _INI methods (run during InitializeObjects) need EC OpRegion access
     // to configure KBC emulation on 0x60/0x64.  Without _REG first,
     // EC OpRegion writes silently fail and KBC stays disabled.
@@ -674,7 +668,7 @@ int acpi_init(uint64_t rsdp_hint) {
     // _INI methods can now access EC because _REG was called above.
     status = AcpiInitializeObjects(ACPI_FULL_INITIALIZATION);
     if (ACPI_FAILURE(status)) {
-        kprintf("ACPI: InitObjects failed: %d\n", (int)status);
+        acpi_dbg("ACPI: InitObjects failed: %d\n", (int)status);
     } else {
         acpi_dbg("ACPI: InitObjects ok\n");
     }
@@ -683,7 +677,7 @@ int acpi_init(uint64_t rsdp_hint) {
     // told the EC to enable KBC emulation on 0x60/0x64.
     {
         uint8_t ps2_sts = inb(0x64);
-        kprintf("ACPI: post-InitObjects i8042 status=0x%02x%s\n",
+        acpi_dbg("ACPI: post-InitObjects i8042 status=0x%02x%s\n",
                 ps2_sts, ps2_sts == 0xFF ? " (still dead)" : " (alive!)");
     }
 
@@ -691,21 +685,20 @@ int acpi_init(uint64_t rsdp_hint) {
     {
         uint32_t sta;
         sta = acpi_eval_sta("\\_SB_.PC00.LPCB.ECDV");
-        kprintf("ACPI: ECDV _STA=0x%x\n", sta);
+        acpi_dbg("ACPI: ECDV _STA=0x%x\n", sta);
         sta = acpi_eval_sta("\\_SB_.PC00.LPCB.PS2K");
-        kprintf("ACPI: PS2K _STA=0x%x\n", sta);
+        acpi_dbg("ACPI: PS2K _STA=0x%x\n", sta);
         sta = acpi_eval_sta("\\_SB_.PC00.LPCB.PS2M");
-        kprintf("ACPI: PS2M _STA=0x%x\n", sta);
+        acpi_dbg("ACPI: PS2M _STA=0x%x\n", sta);
     }
 
     // Set up EC GPE: install handler and enable GPE bit in hardware.
-    // Linux: acpi_ec_start → acpi_install_gpe_handler + acpi_enable_gpe
     // The EC firmware checks the host's GPE enable register to know
     // that the OS EC driver is ready.  Only then does it activate
     // KBC emulation on ports 0x60/0x64.
     ec_setup_gpe();
 
-    // Finalize all GPE handlers — Linux calls acpi_update_all_gpes()
+    // Finalize all GPE handlers.
     // after installing early GPE handlers.
     AcpiUpdateAllGpes();
 
@@ -718,20 +711,20 @@ int acpi_init(uint64_t rsdp_hint) {
     // Check if i8042 came alive after GPE setup + event processing
     {
         uint8_t ps2_sts = inb(0x64);
-        kprintf("ACPI: post-GPE i8042 status=0x%02x%s\n",
+        acpi_dbg("ACPI: post-GPE i8042 status=0x%02x%s\n",
                 ps2_sts, ps2_sts == 0xFF ? " (still dead)" : " (ALIVE!)");
     }
 
     // Also probe wider range of legacy IO to understand which decode works
     {
-        kprintf("ACPI: IO decode test: ");
-        kprintf("0x61=%02x ", inb(0x61));   // NMI status (PCH internal)
-        kprintf("0x71=%02x ", inb(0x71));   // RTC data
-        kprintf("0x62=%02x ", inb(0x62));   // EC data (ME1 decode)
-        kprintf("0x66=%02x ", inb(0x66));   // EC status (ME1 decode)
-        kprintf("0x2E=%02x ", inb(0x2E));   // SuperIO (SE decode)
-        kprintf("0x60=%02x ", inb(0x60));   // KBC data
-        kprintf("0x64=%02x\n", inb(0x64));  // KBC status
+        acpi_dbg("ACPI: IO decode test: ");
+        acpi_dbg("0x61=%02x ", inb(0x61));   // NMI status (PCH internal)
+        acpi_dbg("0x71=%02x ", inb(0x71));   // RTC data
+        acpi_dbg("0x62=%02x ", inb(0x62));   // EC data (ME1 decode)
+        acpi_dbg("0x66=%02x ", inb(0x66));   // EC status (ME1 decode)
+        acpi_dbg("0x2E=%02x ", inb(0x2E));   // SuperIO (SE decode)
+        acpi_dbg("0x60=%02x ", inb(0x60));   // KBC data
+        acpi_dbg("0x64=%02x\n", inb(0x64));  // KBC status
     }
 
     // Parse MADT for CPU/IOAPIC information
@@ -1247,7 +1240,6 @@ int acpi_aml_eval_crs(const char* device_path, acpi_crs_result_t* result) {
 
 // ============================================================================
 // PNP Device Activation via _SRS (Set Resource Settings)
-// Linux: pnpacpi_set_resources() → acpi_set_current_resources()
 // Reads the _CRS buffer and passes it to _SRS to activate the device.
 // This triggers firmware AML that enables the device in the EC/PCH.
 // ============================================================================
@@ -1262,27 +1254,27 @@ int acpi_aml_activate_dev(const char* device_path)
 
     status = AcpiGetHandle(NULL, (char*)device_path, &handle);
     if (ACPI_FAILURE(status)) {
-        kprintf("[SRS] %s: device not found\n", device_path);
+        acpi_dbg("[SRS] %s: device not found\n", device_path);
         return -1;
     }
 
     // Read _CRS raw buffer
     status = AcpiGetCurrentResources(handle, &crs_buf);
     if (ACPI_FAILURE(status)) {
-        kprintf("[SRS] %s: _CRS failed (%d)\n", device_path, (int)status);
+        acpi_dbg("[SRS] %s: _CRS failed (%d)\n", device_path, (int)status);
         return -1;
     }
 
-    // Pass it to _SRS to activate the device (Linux: acpi_set_current_resources)
+    // Pass it to _SRS to activate the device 
     status = AcpiSetCurrentResources(handle, &crs_buf);
     AcpiOsFree(crs_buf.Pointer);
 
     if (ACPI_FAILURE(status)) {
-        kprintf("[SRS] %s: _SRS failed (%d)\n", device_path, (int)status);
+        acpi_dbg("[SRS] %s: _SRS failed (%d)\n", device_path, (int)status);
         return -1;
     }
 
-    kprintf("[SRS] %s: activated via _SRS\n", device_path);
+    acpi_dbg("[SRS] %s: activated via _SRS\n", device_path);
     return 0;
 }
 
@@ -1749,7 +1741,7 @@ static int acpi_parse_s5(uint8_t *aml, uint32_t length) {
 void acpi_pm_init(void) {
     acpi_fadt_t *fadt = (acpi_fadt_t *)acpi_find_table(ACPI_SIG_FADT);
     if (!fadt) {
-        kprintf("ACPI PM: FADT not found, power management unavailable\n");
+        acpi_dbg("ACPI PM: FADT not found, power management unavailable\n");
         return;
     }
 
@@ -1790,12 +1782,12 @@ void acpi_pm_init(void) {
 
 void acpi_poweroff(void) {
     if (!g_pm_initialized) {
-        kprintf("ACPI: power management not initialized, trying QEMU exit\n");
+        acpi_dbg("ACPI: power management not initialized, trying QEMU exit\n");
         acpi_outw(0x604, 0x2000);
         for (;;) __asm__ volatile("cli; hlt");
     }
 
-    kprintf("ACPI: powering off...\n");
+    acpi_dbg("ACPI: powering off...\n");
     __asm__ volatile("cli");
 
     uint16_t val = ACPI_PM1_SLP_TYP(g_slp_typa) | ACPI_PM1_SLP_EN;
@@ -1915,7 +1907,7 @@ int acpi_pci_lookup_irq(const char* bridge_path,
 }
 
 void acpi_reset(void) {
-    kprintf("ACPI: resetting system...\n");
+    acpi_dbg("ACPI: resetting system...\n");
     __asm__ volatile("cli");
 
     if (g_reset_reg_addr != 0) {

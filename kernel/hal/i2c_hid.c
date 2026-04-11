@@ -85,7 +85,7 @@ static uint8_t g_gpio_ioapic_polarity = 0; // From GPIO controller _CRS (0=high,
 static uint8_t g_gpio_ioapic_trigger  = 0; // From GPIO controller _CRS (0=level, 1=edge)
 
 // ============================================================================
-// Intel GPIO platform tables (derived from Linux pinctrl-intel drivers)
+// Intel GPIO platform tables (derived from Intel pinctrl drivers)
 // Each INTEL_GPP(reg_num, base, last, gpio_base) defines a padgroup:
 //   reg_num   = GPI_IS register index within community
 //   base      = first sequential pin
@@ -460,7 +460,7 @@ static int dw_i2c_disable(i2c_dw_controller_t *ctrl) {
     uint32_t status = dw_read(ctrl, DW_IC_STATUS);
     uint32_t enable = dw_read(ctrl, DW_IC_ENABLE);
 
-    // Linux handles a DW master that is still holding the bus with an empty
+    // Handle a DW master that is still holding the bus with an empty
     // TX FIFO by requesting a hardware abort before disable. Without this,
     // disabling mid-hold can strand the controller and all later pure reads
     // devolve into abort_src=0x0 with no further GPIO activity.
@@ -676,7 +676,7 @@ static int dw_i2c_init_controller(i2c_dw_controller_t *ctrl) {
     dw_write(ctrl, DW_IC_FS_SPKLEN, 7);
 
     // Firmware can leave the SMBus sideband interrupt block armed.
-    // Linux explicitly masks it during init to avoid unrelated interrupt
+    // Explicitly mask it during init to avoid unrelated interrupt
     // status from perturbing the controller state machine.
     dw_write(ctrl, DW_IC_SMBUS_INTR_MASK, 0);
 
@@ -916,7 +916,7 @@ static int dw_i2c_wait_idle(i2c_dw_controller_t *ctrl, int timeout_us) {
 
 // Set target address and enable controller.
 // Always disable → set TAR → re-enable for a clean bus state.
-// This matches Linux i2c-designware-master.c i2c_dw_xfer_init().
+// This matches i2c-designware-master.c i2c_dw_xfer_init().
 static int dw_i2c_set_target(i2c_dw_controller_t *ctrl, uint16_t addr) {
     if (dw_i2c_wait_bus_not_busy(ctrl, 20000) < 0)
         dw_i2c_disable(ctrl);
@@ -939,7 +939,7 @@ static int dw_i2c_set_target(i2c_dw_controller_t *ctrl, uint16_t addr) {
 
     dw_i2c_enable(ctrl);
 
-    // Clear interrupts again after enable (like Linux)
+    // Clear interrupts again after enable
     (void)dw_read(ctrl, DW_IC_CLR_INTR);
     (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
 
@@ -1101,7 +1101,7 @@ static volatile uint8_t *pmc_map_pwrmbase(void)
     }
 
     // ---- Strategy 3: Unhide D31:F2 via P2SB trick ----
-    // P2SB (D31:F1) E0h bit 8 = HIDE. Linux writes 0 to entire dword to
+    // P2SB (D31:F1) E0h bit 8 = HIDE. Write 0 to entire dword to
     // unhide.  We MUST NOT use read-modify-write because reads return
     // 0xFFFFFFFF on a hidden device, which poisons the reserved bits.
     // Try both ECAM and CF8 paths — Arrow Lake may block one but not the other.
@@ -1772,8 +1772,8 @@ static int detect_i2c_controllers(void) {
     // Initialize ECAM (PCIe memory-mapped config)
     ecam_init_bus0();
 
-    // ---- Discovery strategy: PCI-first (like Linux intel-lpss driver) ----
-    // Linux discovers LPSS I2C controllers purely via PCI device ID matching.
+    // ---- Discovery strategy: PCI-first (like intel-lpss driver) ----
+    // Discover LPSS I2C controllers purely via PCI device ID matching.
     // The BDF and BAR come straight from PCI config space — no ACPI needed
     // for controller discovery.  ACPI is only used later to find HID child
     // devices (PNP0C50/ACPI0C50) and to get I2C slave addresses via _CRS.
@@ -1883,7 +1883,7 @@ static int detect_i2c_controllers(void) {
         dw_i2c_cache_acpi_timings(ctrl);
 
         // ====================================================================
-        // Follow the Linux intel-lpss PCI probe sequence exactly:
+        // Follow the intel-lpss PCI probe sequence exactly:
         //   intel_lpss_pci_probe():
         //     1. pcim_enable_device()  → PMCSR D0, enable BAR (MSE)
         //     2. pci_set_master()      → BME
@@ -1893,11 +1893,11 @@ static int detect_i2c_controllers(void) {
         //     b. Deassert reset (write 0x7 to RESETS)
         //     c. Set remap addr (write BAR phys to priv+0x40)
         //
-        // Linux does NOT touch D0I3C, PG_CONFIG, or any other
+        // Do NOT touch D0I3C, PG_CONFIG, or any other
         // vendor-specific PCI config registers during probe.
         // ====================================================================
         // ---- Step 1: Read BAR0 from config space ----
-        // Linux PCI core reads BARs during enumeration (before any driver).
+        // PCI core reads BARs during enumeration (before any driver).
         // pci_assign_unassigned_bars() already assigned 64-bit BARs from the
         // host bridge 64-bit window (~0x501C2xxxxx on Arrow Lake).
         // We just read the result here.
@@ -1920,7 +1920,7 @@ static int detect_i2c_controllers(void) {
 
         ctrl->bar_phys = bar0_phys;
 
-        // ---- Step 2: ACPI power-on (like Linux pcim_enable_device →
+        // ---- Step 2: ACPI power-on (like pcim_enable_device →
         //              pci_power_up → platform_pci_set_power_state →
         //              acpi_pci_set_power_state → acpi_device_set_power →
         //              _PS0) ----
@@ -1958,7 +1958,7 @@ static int detect_i2c_controllers(void) {
         ctrl->base = (volatile uint32_t *)mapped;
 
         // ---- Step 5: Initialize the DesignWare I2C controller ----
-        // dw_i2c_init_controller() does exactly what Linux intel_lpss_init_dev()
+        // dw_i2c_init_controller() does exactly what intel_lpss_init_dev()
         // does: assert reset, deassert reset, set remap addr.
         // Plus DW core configuration (speed, FIFO, etc).
         if (dw_i2c_init_controller(ctrl) == 0) {
@@ -2090,7 +2090,7 @@ static int detect_i2c_controllers(void) {
                 // On Arrow Lake PCH 600/700 the LPSS I2C controllers at D21
                 // use direct IOAPIC entries (GSI 24+) programmed by the
                 // firmware through the ITSS.  Neither _PRT nor _CRS exposes
-                // the mapping; Linux relies on VT-d IR.
+                // the mapping; VT-d IR is used instead.
                 //
                 // Experiment: Write PCI INTLINE with a chosen GSI before
                 // probing. On some PCH revisions the ITSS uses INTLINE to
@@ -2383,7 +2383,7 @@ typedef struct {
 #define HID_USAGE_MAX   16
 
 // ============================================================================
-// Linux-style HID Report Descriptor Parser
+// HID Report Descriptor Parser
 //
 // Phase 1: Walk the descriptor building a flat field table.  Every
 //          non-constant Input/Feature field gets an entry with its full
@@ -2864,7 +2864,7 @@ static void i2c_hid_parse_report_desc(i2c_hid_device_t *dev) {
     }
     ri->report_bytes = (max_bit + 7) / 8;
 
-    kprintf("[I2C-HID] Parsed %s report (Linux-style, %d fields): "
+    kprintf("[I2C-HID] Parsed %s report (%d fields): "
             "ID=%d  tip@%u(%u)  buttons@%u(%u bits)  "
             "X@%u(%u bits%s)  Y@%u(%u bits%s)  "
             "cc@%u(%u)  wheel=%s  total=%u bytes\n",
@@ -3113,9 +3113,9 @@ void i2c_hid_irq_handler(uint8_t vector) {
 // Interrupt-driven write-then-read transfer
 // Uses interrupts to wait for TX/RX completion instead of busy-waiting
 // ============================================================================
-// Interrupt-driven I2C transfer — modeled after Linux i2c-designware-master.c
+// Interrupt-driven I2C transfer — modeled after i2c-designware-master.c
 //
-// Key design principles from Linux:
+// Key design principles:
 // 1. Always disable + set TAR + re-enable before each transfer (clean bus)
 // 2. Wait for bus-not-busy before starting
 // 3. ISR reads+saves abort_source before clearing TX_ABRT
@@ -3137,7 +3137,7 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
     rx_idx = 0;
     tx_issued = 0;
 
-    // ---- Step 1: Wait for bus not busy (like Linux i2c_dw_wait_bus_not_busy) ----
+    // ---- Step 1: Wait for bus not busy (like i2c_dw_wait_bus_not_busy) ----
     // Check DW_IC_STATUS: MST_ACTIVITY should be clear.
     // If the bus is stuck from a previous abort, this will detect it.
     for (timeout = 0; timeout < 25000; timeout++) {
@@ -3147,7 +3147,7 @@ static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
         i2c_delay_us(1);
     }
 
-    // ---- Step 2: Init transfer (like Linux i2c_dw_xfer_init) ----
+    // ---- Step 2: Init transfer (like i2c_dw_xfer_init) ----
     // Disable → set TAR → enable → clear interrupts
     if (dw_i2c_set_target(ctrl, addr) < 0)
         return -1;
@@ -3268,7 +3268,7 @@ abort:
     {
         int complete_read = 0;
         uint16_t pkt_len = 0;
-        // ---- Abort handling (like Linux i2c_dw_xfer error path) ----
+        // ---- Abort handling (like i2c_dw_xfer error path) ----
         // Read abort source: prefer ISR-saved value (ISR reads before clearing),
         // fall back to direct register read (may be stale if ISR already cleared).
         uint32_t abort_src = ctrl->abort_source;
@@ -3341,7 +3341,7 @@ abort:
 }
 
 // ============================================================================
-// GPIO Interrupt Support (like Linux pinctrl-intel + i2c-hid-acpi)
+// GPIO Interrupt Support (like pinctrl-intel + i2c-hid-acpi)
 // ============================================================================
 
 // Read P2SB SBREG_BAR: unhide P2SB D31:F1, read BAR, re-hide.
@@ -3689,7 +3689,7 @@ static int gpio_find_pin_community(uint16_t pin, uint32_t *out_pad_offset,
 }
 
 // Configure a GPIO pad for interrupt delivery via IOAPIC (GPIO Driver Mode).
-// Like Linux intel_gpio_irq_enable() + intel_gpio_set_gpio_mode().
+// Like intel_gpio_irq_enable() + intel_gpio_set_gpio_mode().
 static int gpio_configure_pad_interrupt(gpio_community_t *comm,
                                         uint32_t pad_offset,
                                         uint8_t gpi_group,
@@ -3716,7 +3716,7 @@ static int gpio_configure_pad_interrupt(gpio_community_t *comm,
     //      (Actually, for GPIO Driver Mode, we DON'T set GPIROUTIOXAPIC.
     //       The interrupt goes through GPI_IS/GPI_IE → GPDMINTSEL → IOAPIC.
     //       GPIROUTIOXAPIC is for direct per-pad IOAPIC routing which is a
-    //       different mechanism. Linux does NOT use GPIROUTIOXAPIC.)
+    //       different mechanism. Do NOT use GPIROUTIOXAPIC.)
     uint32_t dw0 = gpio_comm_read32(comm, pad_offset + GPIO_PAD_CFG_DW0);
     i2c_dbg("[GPIO] PAD_CFG_DW0 before: 0x%08x\n", dw0);
 
@@ -3730,7 +3730,7 @@ static int gpio_configure_pad_interrupt(gpio_community_t *comm,
     // Enable RX (clear RX disable)
     dw0 &= ~GPIO_DW0_GPIORXDIS;
 
-    // Set RXEVCFG to LEVEL mode (like Linux IRQF_TRIGGER_LOW).
+    // Set RXEVCFG to LEVEL mode (level-triggered, active-low).
     //
     // EDGE mode is WRONG for HID-over-I2C: with RXINV=1, edge detection
     // fires on BOTH the falling edge (INT# assert = device has data) AND

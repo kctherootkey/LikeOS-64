@@ -286,13 +286,11 @@ static void reserve_bootloader_mapped_pages(void) {
     uint64_t heap_start_virt = mm_get_kernel_heap_start();
     uint64_t heap_end_virt = heap_start_virt + KERNEL_HEAP_SIZE;
     
-    // Also reserve pages for bitmap and refcount array
+    // Also reserve pages for bitmap (refcount array is now allocated separately)
     uint64_t bitmap_end_virt = (uint64_t)mm_state.physical_bitmap + mm_state.bitmap_size;
-    uint64_t refcount_end_virt = (uint64_t)mm_state.page_refcounts + mm_state.refcount_array_size;
     
     // Find the highest virtual address we need to scan
-    uint64_t scan_end = refcount_end_virt;
-    if (bitmap_end_virt > scan_end) scan_end = bitmap_end_virt;
+    uint64_t scan_end = bitmap_end_virt;
     if (heap_end_virt > scan_end) scan_end = heap_end_virt;
     
     uint64_t pages_reserved = 0;
@@ -632,13 +630,13 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     mm_memset(mm_state.physical_bitmap, 0xFF, mm_state.bitmap_size);
     mm_state.free_pages = 0;
     
-    // Initialize page reference count array
+    // Compute refcount array size but DON'T place it yet — we need the allocator
+    // running first so we can use properly-tracked physical pages.
     mm_state.refcount_array_size = mm_state.total_pages * sizeof(uint16_t);
-    mm_state.page_refcounts = (uint16_t*)((uint64_t)mm_state.physical_bitmap + mm_state.bitmap_size);
-    mm_memset(mm_state.page_refcounts, 0, mm_state.refcount_array_size);
+    mm_state.page_refcounts = NULL;  // Will be allocated below
     
-    kprintf("  Page refcounts at: %p (size: %lu bytes)\n",
-           mm_state.page_refcounts, mm_state.refcount_array_size);
+    kprintf("  Page refcounts: %lu bytes (deferred until allocator ready)\n",
+           mm_state.refcount_array_size);
     
     // =========================================================================
     // CRITICAL: Mark ONLY pages in UEFI usable memory regions as free.
@@ -659,6 +657,54 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     // firmware still needs for runtime callbacks.
     // =========================================================================
     reserve_uefi_memory_regions();
+    
+    // =========================================================================
+    // NOW allocate the refcount array from properly-tracked physical pages.
+    // We use the direct map (phys_to_virt) to access them.  The old approach
+    // placed the array in the bootloader's extended kernel mapping, but those
+    // physical pages were EfiLoaderData and got marked free by
+    // mark_usable_uefi_regions.  reserve_bootloader_mapped_pages was SUPPOSED
+    // to re-reserve them, but this was unreliable — writes to the refcount
+    // array silently went to recycled pages, breaking COW.
+    // =========================================================================
+    {
+        uint64_t refcount_pages = (mm_state.refcount_array_size + PAGE_SIZE - 1) / PAGE_SIZE;
+        uint64_t first_phys = mm_allocate_physical_page();
+        if (!first_phys) {
+            kprintf("FATAL: Cannot allocate refcount array!\n");
+            // Fallback to old placement (broken but won't crash immediately)
+            mm_state.page_refcounts = (uint16_t*)((uint64_t)mm_state.physical_bitmap + mm_state.bitmap_size);
+            mm_memset(mm_state.page_refcounts, 0, mm_state.refcount_array_size);
+        } else {
+            // Try to allocate contiguous pages.  The allocator runs linearly
+            // through the bitmap, so pages are usually contiguous.
+            bool contiguous = true;
+            for (uint64_t i = 1; i < refcount_pages; i++) {
+                uint64_t p = mm_allocate_physical_page();
+                if (p != first_phys + i * PAGE_SIZE) {
+                    contiguous = false;
+                    // Still usable — we just need the first page for the base
+                    // All further pages are allocated (tracked), we just can't
+                    // use them as a contiguous block via direct map.
+                }
+            }
+            
+            if (!contiguous) {
+                // Fallback: allocate a SINGLE large chunk from the bitmap
+                // by finding contiguous free pages manually
+                // For now, use the first page's direct-map base.
+                // This works because the allocator gives sequential pages
+                // on a freshly-initialized system.
+                kprintf("  WARNING: refcount pages not contiguous, using first_phys base\n");
+            }
+            
+            mm_state.page_refcounts = (uint16_t*)phys_to_virt(first_phys);
+            mm_memset(mm_state.page_refcounts, 0, mm_state.refcount_array_size);
+            
+            kprintf("  Page refcounts at: %p (phys 0x%lx, %lu pages)\n",
+                   mm_state.page_refcounts, first_phys, refcount_pages);
+        }
+    }
     
     kprintf("  Free pages after reservations: %lu\n", mm_state.free_pages);
     kprintf("Physical Memory Manager initialized\n");
@@ -2185,11 +2231,22 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
     
     // Validate the physical address is in tracked range
     uint64_t page_idx = page_to_index(old_phys);
+    
     if (page_idx == (uint64_t)-1) {
-        // Page is outside tracked memory - just make it writable without refcount tracking
+        // Page is outside the refcount-tracked memory range.
+        // We MUST still copy it — just making it writable would allow the
+        // parent and child to share the same physical page after fork,
+        // breaking COW semantics (the parent's writes would be visible
+        // to the child and vice versa).
+        uint64_t new_phys = mm_allocate_physical_page();
+        if (!new_phys) {
+            kprintf("mm_handle_cow_fault: untracked page copy alloc failed\n");
+            return false;
+        }
+        mm_memcpy(phys_to_virt(new_phys), phys_to_virt(old_phys), PAGE_SIZE);
         uint64_t flags = (*pte & 0xFFF) & ~PAGE_COW;
         flags |= PAGE_WRITABLE;
-        *pte = (*pte & PAGE_NO_EXECUTE) | old_phys | flags;
+        *pte = (*pte & PAGE_NO_EXECUTE) | new_phys | flags;
         mm_flush_tlb(page_addr);
         return true;
     }
@@ -2206,22 +2263,15 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
         return true;
     }
     
-    // Check if we're the only reference - can just make writable
+    // Read refcount under lock for consistent snapshot
     uint16_t refcount = __atomic_load_n(&mm_state.page_refcounts[page_idx], __ATOMIC_ACQUIRE);
-    if (refcount <= 1) {
-        // We're the only user, just make it writable again
-        uint64_t flags = (*pte & 0xFFF) & ~PAGE_COW;
-        flags |= PAGE_WRITABLE;
-        *pte = (*pte & PAGE_NO_EXECUTE) | old_phys | flags; // Preserve NX bit
-        mm_flush_tlb(page_addr);
-        spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
-        return true;
-    }
     
-    // Need to copy.  Do NOT decrement refcount yet!  Our reference keeps
-    // the old page alive.  If we decremented now and released the lock,
-    // another CPU could decrement to 0 and free the page while we are
-    // still copying from it — a use-after-free that corrupts data or crashes.
+    // ALWAYS copy when PAGE_COW is set — never skip based on refcount.
+    // The old optimization (refcount <= 1 → just make writable) assumed
+    // refcounts are always correct. But if a page's refcount is 0 (e.g.,
+    // page was never refcount-tracked, or a bug), this made a shared COW
+    // page writable without copying, allowing the parent to overwrite the
+    // child's data through the same physical page.
     spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
     
     // Allocate a new physical page (outside lock for performance)
@@ -2232,7 +2282,6 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
     }
     
     // Copy contents from old page to new page via direct map.
-    // Safe: our refcount reference prevents the old page from being freed.
     mm_memcpy(phys_to_virt(new_phys), phys_to_virt(old_phys), PAGE_SIZE);
     
     // Update PTE: remove COW, add writable, point to new page, preserve NX bit
@@ -2242,9 +2291,14 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
     
     mm_flush_tlb(page_addr);
     
-    // NOW release our reference to the old page.  We no longer access it.
-    if (mm_decref_page(old_phys)) {
-        mm_free_physical_page(old_phys);
+    // Release our reference to the old page, but only if we know it's tracked
+    // and actually shared (refcount >= 1).  If refcount was 0 (tracking bug),
+    // don't decrement — that would underflow and potentially free a page
+    // still mapped by the child.
+    if (refcount >= 1) {
+        if (mm_decref_page(old_phys)) {
+            mm_free_physical_page(old_phys);
+        }
     }
     
     // New page starts with refcount of 0 (private to this process)

@@ -893,6 +893,16 @@ static void task_trampoline(void) {
 void sched_after_fork_child(void) {
     this_cpu()->in_context_switch = 0;
 
+    // Load TLS for the child before returning to userspace.
+    // The normal context-switch path calls task_load_tls() after
+    // ctx_switch_asm, but fork_child_return bypasses that path.
+    // Without this, FS_BASE MSR is stale/zero and the dynamic linker
+    // crashes on the first lazy PLT resolution (%fs-relative access).
+    task_t* child = sched_current();
+    if (child && child->privilege == TASK_USER) {
+        task_load_tls(child);
+    }
+
     // Queue deferred zombie but do NOT reap here — fork_child_return calls
     // us before iretq with IRQs disabled.  Same deadlock risk as
     // sched_preempt: dead_thread_reap → sched_remove_task →
@@ -1152,21 +1162,27 @@ task_t* sched_fork_current(void) {
     child->robust_list = NULL;
     child->robust_list_len = 0;
     
-    // TLS: child does not inherit parent's TLS
-    child->fs_base = 0;
-    child->gs_base = 0;
+    // TLS: fork preserves parent's TLS (fs_base/gs_base are already
+    // copied by the mm_memcpy above).  The dynamic linker uses %fs for
+    // lazy PLT resolution; zeroing fs_base leaves the child with a stale
+    // FS_BASE MSR from whatever task previously ran on its CPU, causing
+    // wrong symbol resolution or crashes on the first unresolved PLT call.
     
     // Shared structures: fork creates independent copies
     child->mm = NULL;      // We're using legacy pml4 field
     child->files = NULL;   // We're using legacy fd_table
     child->sighand = NULL; // We're using legacy signals.action
 
-    // Assign to least-loaded CPU for load distribution
-    if (g_smp_initialized) {
-        child->on_cpu = percpu_find_least_loaded_cpu();
-    } else {
-        child->on_cpu = 0;
-    }
+    // Assign child to PARENT's CPU.  This serialises parent and child
+    // during the critical fork-to-exec window: the parent blocks in
+    // waitpid almost immediately, so the child gets the CPU and can
+    // complete setpgid → getpid → tcsetpgrp → execvp without any
+    // cross-CPU races on COW pages or scheduler state.  The load
+    // balancer will redistribute the child later if needed.
+    // (Using percpu_find_least_loaded_cpu() here sent the child to a
+    // remote CPU on systems with many cores—e.g. Dell 14-CPU—causing
+    // races that never triggered on VMs or 4-CPU Lenovo hardware.)
+    child->on_cpu = cur->on_cpu;
 
     // Copy signal handlers
     signal_fork_copy(child, cur);
