@@ -3310,13 +3310,8 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
         }
     }
     
-    // Assign to least-loaded CPU
-    extern int g_smp_initialized;
-    if (g_smp_initialized) {
-        child->on_cpu = percpu_find_least_loaded_cpu();
-    } else {
-        child->on_cpu = 0;
-    }
+    // Assign child to parent's CPU (same rationale as sched_fork_current)
+    child->on_cpu = cur->on_cpu;
     
     // Set up child's kernel stack to return to userspace
     uint64_t user_rip = cur->syscall_rip;

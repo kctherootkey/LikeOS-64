@@ -906,7 +906,7 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev, uint8_t msi_vect
     ctrl->input_ctx = (xhci_input_ctx_t*)ctrl->input_ctx_raw;  // For compatibility
     ctrl->input_ctx_phys = mm_get_physical_address((uint64_t)ctrl->input_ctx_raw);
     
-    // Configure operational registers - follow Linux kernel order:
+    // Configure operational registers:
     // 1. Set max slots (CONFIG)
     // 2. Write CRCR (Command Ring Control Register) 
     // 3. Write DCBAAP (Device Context Base Address Array Pointer)
@@ -924,7 +924,7 @@ int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev, uint8_t msi_vect
         kprintf("[XHCI] ERROR: Controller not ready (CNR=1)!\n");
     }
     
-    // Step 2: Write CRCR FIRST (before DCBAAP) - Linux kernel order
+    // Step 2: Write CRCR FIRST (before DCBAAP)
     // The command ring pointer must be 64-byte aligned
     // Bit 0 = RCS (Ring Cycle State) = 1
     uint64_t crcr_before = xhci_op_read64(ctrl, XHCI_OP_CRCR);
