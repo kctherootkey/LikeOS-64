@@ -275,6 +275,14 @@ void e1000_irq_handler(void) {
         return;
     }
 
+    // Feed entropy from NIC interrupt timing
+    {
+        extern void entropy_add_interrupt_timing(uint64_t extra);
+        uint32_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        entropy_add_interrupt_timing(((uint64_t)hi << 32) | lo);
+    }
+
     e1000_dev_t* dev = &g_e1000;
     uint32_t icr = e1000_read(dev, E1000_ICR);
 

@@ -45,6 +45,11 @@ static short fd_poll_one(int fd, short events) {
         return (short)sock_poll(SOCKET_FD_IDX(entry), events);
     }
 
+    // UNIX socket fd marker
+    if (IS_UNIX_SOCKET_FD(entry)) {
+        return (short)unix_poll((int)(uintptr_t)entry, events);
+    }
+
     // Epoll fd marker
     if (IS_EPOLL_FD(entry)) {
         // Epoll fds are not themselves pollable in a meaningful way

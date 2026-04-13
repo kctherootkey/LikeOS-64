@@ -5,6 +5,7 @@
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/tty.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/random.h"
 
 // Global keyboard state
 static keyboard_state_t kb_state = {0};
@@ -116,6 +117,9 @@ uint8_t keyboard_buffer_has_data(void) {
 // Keyboard interrupt handler
 void keyboard_irq_handler(void) {
     uint8_t scan_code = keyboard_read_scan_code();
+
+    // Feed keyboard timing entropy
+    entropy_add_interrupt_timing((uint64_t)scan_code);
 
     // Handle extended key prefix (0xE0)
     if (scan_code == KEY_EXTENDED_PREFIX) {

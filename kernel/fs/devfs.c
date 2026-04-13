@@ -5,12 +5,15 @@
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/dirent.h"
 #include "../../include/kernel/timer.h"
+#include "../../include/kernel/random.h"
 
 #define DEVFS_TYPE_TTY       1
 #define DEVFS_TYPE_PTY_MASTER 2
 #define DEVFS_TYPE_PTY_SLAVE  3
 #define DEVFS_TYPE_DIR        4
 #define DEVFS_TYPE_PTS_DIR    5
+#define DEVFS_TYPE_RANDOM     6
+#define DEVFS_TYPE_URANDOM    7
 
 typedef struct {
     vfs_file_t vfs;
@@ -140,6 +143,20 @@ int devfs_open_for_task(const char* path, int flags, vfs_file_t** out, task_t* c
     if (is_path(path, "/dev/ptmx")) {
         return devfs_open_pty_master(NULL, out);
     }
+    if (is_path(path, "/dev/random")) {
+        devfs_file_t* df = devfs_alloc_file();
+        if (!df) return ST_NOMEM;
+        df->type = DEVFS_TYPE_RANDOM;
+        *out = &df->vfs;
+        return ST_OK;
+    }
+    if (is_path(path, "/dev/urandom")) {
+        devfs_file_t* df = devfs_alloc_file();
+        if (!df) return ST_NOMEM;
+        df->type = DEVFS_TYPE_URANDOM;
+        *out = &df->vfs;
+        return ST_OK;
+    }
     if (is_prefix(path, "/dev/pts/")) {
         int id = 0;
         const char* p = path + 9;
@@ -177,7 +194,8 @@ int devfs_stat(const char* path, struct kstat* st) {
         st->st_ctime = now;
         return ST_OK;
     }
-    if (is_path(path, "/dev/tty") || is_path(path, "/dev/console") || is_path(path, "/dev/tty0") || is_path(path, "/dev/ptmx")) {
+    if (is_path(path, "/dev/tty") || is_path(path, "/dev/console") || is_path(path, "/dev/tty0") || is_path(path, "/dev/ptmx") ||
+        is_path(path, "/dev/random") || is_path(path, "/dev/urandom")) {
         st->st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
         st->st_nlink = 1;
         st->st_atime = now;
@@ -217,6 +235,14 @@ long devfs_read(vfs_file_t* f, void* buf, long bytes) {
     if (df->type == DEVFS_TYPE_PTY_MASTER) {
         return tty_pty_master_read(df->pty_id, buf, bytes, 0);
     }
+    if (df->type == DEVFS_TYPE_RANDOM) {
+        int ret = random_get_bytes(buf, (size_t)bytes, 1);
+        return ret < 0 ? -EIO : (long)ret;
+    }
+    if (df->type == DEVFS_TYPE_URANDOM) {
+        int ret = random_get_bytes(buf, (size_t)bytes, 0);
+        return ret < 0 ? -EIO : (long)ret;
+    }
     return -EINVAL;
 }
 
@@ -229,6 +255,11 @@ long devfs_write(vfs_file_t* f, const void* buf, long bytes) {
     }
     if (df->type == DEVFS_TYPE_PTY_MASTER) {
         return tty_pty_master_write(df->pty_id, buf, bytes);
+    }
+    if (df->type == DEVFS_TYPE_RANDOM || df->type == DEVFS_TYPE_URANDOM) {
+        // Writing to /dev/random mixes data into entropy pool
+        random_add_entropy(buf, (size_t)bytes);
+        return bytes;
     }
     return -EINVAL;
 }
@@ -274,6 +305,8 @@ long devfs_readdir(vfs_file_t* f, void* buf, long bytes) {
         devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "tty0", 3, 2);
         devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "ptmx", 4, 2);
         devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "pts", 5, 4);
+        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "random", 6, 2);
+        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "urandom", 7, 2);
         df->dir_pos = 1;
         return (long)out_off;
     }
@@ -336,7 +369,8 @@ int devfs_fstat(vfs_file_t* f, struct kstat* st) {
     if (!f || f->ops != &g_devfs_ops || !st) return -EINVAL;
     devfs_file_t* df = (devfs_file_t*)f->fs_private;
     if (!df) return -EINVAL;
-    if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_MASTER || df->type == DEVFS_TYPE_PTY_SLAVE) {
+    if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_MASTER || df->type == DEVFS_TYPE_PTY_SLAVE ||
+        df->type == DEVFS_TYPE_RANDOM || df->type == DEVFS_TYPE_URANDOM) {
         st->st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
         st->st_nlink = 1;
         st->st_size = 0;

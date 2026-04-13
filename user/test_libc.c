@@ -21,6 +21,8 @@
 #include <sys/vfs.h>
 #include <sys/sysinfo.h>
 #include <sys/klog.h>
+#include <sys/un.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -4117,6 +4119,363 @@ int main(int argc, char** argv) {
     {
         ssize_t sf = sendfile(-1, -1, NULL, 100);
         test_result("sendfile: bad fds returns -1", sf == -1);
+    }
+
+    // ========================================
+    // /dev/urandom and /dev/random Tests
+    // ========================================
+    printf("\n--- /dev/urandom and /dev/random ---\n");
+
+    // Test 1: Read 32 bytes from /dev/urandom
+    {
+        int fd = open("/dev/urandom", O_RDONLY);
+        test_result("urandom: open succeeds", fd >= 0);
+        if (fd >= 0) {
+            unsigned char buf[32];
+            memset(buf, 0, sizeof(buf));
+            ssize_t n = read(fd, buf, 32);
+            test_result("urandom: read 32 bytes", n == 32);
+
+            // Check not all zeros
+            int nonzero = 0;
+            for (int i = 0; i < 32; i++) {
+                if (buf[i] != 0) nonzero = 1;
+            }
+            test_result("urandom: data is non-zero", nonzero);
+            close(fd);
+        }
+    }
+
+    // Test 2: Two reads from /dev/urandom differ
+    {
+        int fd = open("/dev/urandom", O_RDONLY);
+        if (fd >= 0) {
+            unsigned char buf1[16], buf2[16];
+            read(fd, buf1, 16);
+            read(fd, buf2, 16);
+            test_result("urandom: two reads differ", memcmp(buf1, buf2, 16) != 0);
+            close(fd);
+        }
+    }
+
+    // Test 3: Read 4096 bytes from /dev/urandom
+    {
+        int fd = open("/dev/urandom", O_RDONLY);
+        if (fd >= 0) {
+            unsigned char buf[4096];
+            ssize_t n = read(fd, buf, 4096);
+            test_result("urandom: read 4096 bytes", n == 4096);
+            close(fd);
+        }
+    }
+
+    // Test 4: /dev/random also works
+    {
+        int fd = open("/dev/random", O_RDONLY);
+        test_result("random: open succeeds", fd >= 0);
+        if (fd >= 0) {
+            unsigned char buf[16];
+            ssize_t n = read(fd, buf, 16);
+            test_result("random: read 16 bytes", n == 16);
+            close(fd);
+        }
+    }
+
+    // Test 5: Write to /dev/urandom (adds entropy)
+    {
+        int fd = open("/dev/urandom", O_WRONLY);
+        if (fd >= 0) {
+            unsigned char entropy[] = "test entropy data";
+            ssize_t n = write(fd, entropy, sizeof(entropy));
+            test_result("urandom: write succeeds", n == (ssize_t)sizeof(entropy));
+            close(fd);
+        }
+    }
+
+    // ========================================
+    // AF_UNIX Socketpair Tests
+    // ========================================
+    printf("\n--- AF_UNIX Socketpair ---\n");
+
+    // Test 1: socketpair creation
+    {
+        int sv[2] = {-1, -1};
+        int ret = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        test_result("unix socketpair: create", ret == 0 && sv[0] >= 0 && sv[1] >= 0);
+
+        if (ret == 0) {
+            // Test 2: send/recv through socketpair
+            const char* msg = "hello unix";
+            ssize_t sent = write(sv[0], msg, strlen(msg));
+            test_result("unix socketpair: write", sent == (ssize_t)strlen(msg));
+
+            char buf[64];
+            memset(buf, 0, sizeof(buf));
+            ssize_t rcvd = read(sv[1], buf, sizeof(buf));
+            test_result("unix socketpair: read", rcvd == (ssize_t)strlen(msg));
+            test_result("unix socketpair: data matches", strcmp(buf, "hello unix") == 0);
+
+            // Test 3: bidirectional
+            const char* reply = "world";
+            write(sv[1], reply, strlen(reply));
+            memset(buf, 0, sizeof(buf));
+            rcvd = read(sv[0], buf, sizeof(buf));
+            test_result("unix socketpair: bidirectional", rcvd == (ssize_t)strlen(reply) && strcmp(buf, "world") == 0);
+
+            // Test 4: close one end, other gets EOF
+            close(sv[0]);
+            memset(buf, 0, sizeof(buf));
+            rcvd = read(sv[1], buf, sizeof(buf));
+            test_result("unix socketpair: close->EOF", rcvd == 0);
+
+            close(sv[1]);
+        }
+    }
+
+    // Test 5: AF_UNIX SOCK_DGRAM socketpair
+    {
+        int sv[2] = {-1, -1};
+        int ret = socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+        test_result("unix dgram socketpair: create", ret == 0);
+        if (ret == 0) {
+            const char* msg = "dgram test";
+            write(sv[0], msg, strlen(msg));
+            char buf[64];
+            memset(buf, 0, sizeof(buf));
+            ssize_t n = read(sv[1], buf, sizeof(buf));
+            test_result("unix dgram socketpair: transfer", n == (ssize_t)strlen(msg) && strcmp(buf, "dgram test") == 0);
+            close(sv[0]);
+            close(sv[1]);
+        }
+    }
+
+    // ========================================
+    // AF_UNIX Client/Server Tests
+    // ========================================
+    printf("\n--- AF_UNIX Client/Server ---\n");
+
+    {
+        int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        test_result("unix server: socket create", server_fd >= 0);
+
+        if (server_fd >= 0) {
+            struct sockaddr_un addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sun_family = AF_UNIX;
+            strcpy(addr.sun_path, "/tmp/test_unix.sock");
+
+            int ret = bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
+            test_result("unix server: bind", ret == 0);
+
+            ret = listen(server_fd, 5);
+            test_result("unix server: listen", ret == 0);
+
+            // Fork: child connects, parent accepts
+            pid_t pid = fork();
+            if (pid == 0) {
+                // Child: connect and send data
+                close(server_fd);
+                int cli = socket(AF_UNIX, SOCK_STREAM, 0);
+                if (cli >= 0) {
+                    struct sockaddr_un saddr;
+                    memset(&saddr, 0, sizeof(saddr));
+                    saddr.sun_family = AF_UNIX;
+                    strcpy(saddr.sun_path, "/tmp/test_unix.sock");
+                    connect(cli, (struct sockaddr*)&saddr, sizeof(saddr));
+                    write(cli, "from child", 10);
+                    char buf[64];
+                    read(cli, buf, sizeof(buf));
+                    close(cli);
+                }
+                _exit(0);
+            } else if (pid > 0) {
+                // Parent: accept and verify
+                int cli_fd = accept(server_fd, NULL, NULL);
+                test_result("unix server: accept", cli_fd >= 0);
+                if (cli_fd >= 0) {
+                    char buf[64];
+                    memset(buf, 0, sizeof(buf));
+                    ssize_t n = read(cli_fd, buf, sizeof(buf));
+                    test_result("unix server: recv from client", n == 10 && memcmp(buf, "from child", 10) == 0);
+                    write(cli_fd, "reply", 5);
+                    close(cli_fd);
+                }
+                int status;
+                waitpid(pid, &status, 0);
+            }
+            close(server_fd);
+        }
+    }
+
+    // ========================================
+    // UDP Loopback on 127.0.0.1 Tests
+    // ========================================
+    printf("\n--- UDP Loopback 127.0.0.1 ---\n");
+
+    {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        test_result("udp loopback: socket create", sock >= 0);
+
+        if (sock >= 0) {
+            struct sockaddr_in bind_addr;
+            memset(&bind_addr, 0, sizeof(bind_addr));
+            bind_addr.sin_family = AF_INET;
+            bind_addr.sin_port = htons(19999);
+            bind_addr.sin_addr.s_addr = htonl(0x7F000001);  // 127.0.0.1
+
+            int ret = bind(sock, (struct sockaddr*)&bind_addr, sizeof(bind_addr));
+            test_result("udp loopback: bind 127.0.0.1:19999", ret == 0);
+
+            if (ret == 0) {
+                struct sockaddr_in dest;
+                memset(&dest, 0, sizeof(dest));
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(19999);
+                dest.sin_addr.s_addr = htonl(0x7F000001);
+
+                const char* msg = "loopback test";
+                ssize_t sent = sendto(sock, msg, strlen(msg), 0,
+                                      (struct sockaddr*)&dest, sizeof(dest));
+                test_result("udp loopback: sendto", sent == (ssize_t)strlen(msg));
+
+                if (sent > 0) {
+                    char buf[64];
+                    memset(buf, 0, sizeof(buf));
+                    ssize_t rcvd = recvfrom(sock, buf, sizeof(buf), 0, NULL, NULL);
+                    test_result("udp loopback: recvfrom", rcvd == (ssize_t)strlen(msg));
+                    test_result("udp loopback: data matches", memcmp(buf, msg, strlen(msg)) == 0);
+                }
+            }
+            close(sock);
+        }
+    }
+
+    // ========================================
+    // Loopback Interface Detection
+    // ========================================
+    printf("\n--- Loopback Interface ---\n");
+
+    {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock >= 0) {
+            struct ifreq ifr;
+            memset(&ifr, 0, sizeof(ifr));
+            strcpy(ifr.ifr_name, "lo");
+
+            int ret = ioctl(sock, SIOCGIFFLAGS, &ifr);
+            test_result("loopback: SIOCGIFFLAGS succeeds", ret == 0);
+            if (ret == 0) {
+                test_result("loopback: IFF_LOOPBACK set", (ifr.ifr_flags & IFF_LOOPBACK) != 0);
+                test_result("loopback: IFF_UP set", (ifr.ifr_flags & IFF_UP) != 0);
+            }
+
+            memset(&ifr, 0, sizeof(ifr));
+            strcpy(ifr.ifr_name, "lo");
+            ret = ioctl(sock, SIOCGIFADDR, &ifr);
+            test_result("loopback: SIOCGIFADDR succeeds", ret == 0);
+            if (ret == 0) {
+                struct sockaddr_in* sin = (struct sockaddr_in*)&ifr.ifr_addr;
+                test_result("loopback: IP is 127.0.0.1",
+                            ntohl(sin->sin_addr.s_addr) == 0x7F000001);
+            }
+
+            memset(&ifr, 0, sizeof(ifr));
+            strcpy(ifr.ifr_name, "lo");
+            ret = ioctl(sock, SIOCGIFMTU, &ifr);
+            test_result("loopback: SIOCGIFMTU succeeds", ret == 0);
+            if (ret == 0) {
+                test_result("loopback: MTU is 65535", ifr.ifr_mtu == 65535);
+            }
+
+            close(sock);
+        }
+    }
+
+    // ========================================
+    // Routing Ioctl Tests
+    // ========================================
+    printf("\n--- Routing Ioctls ---\n");
+
+    {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock >= 0) {
+            // Add a test route and delete it
+            struct {
+                struct sockaddr rt_dst;
+                struct sockaddr rt_gateway;
+                struct sockaddr rt_genmask;
+                short rt_flags;
+                int rt_metric;
+                char* rt_dev;
+            } rt;
+            memset(&rt, 0, sizeof(rt));
+            struct sockaddr_in* dst = (struct sockaddr_in*)&rt.rt_dst;
+            struct sockaddr_in* gw = (struct sockaddr_in*)&rt.rt_gateway;
+            struct sockaddr_in* mask = (struct sockaddr_in*)&rt.rt_genmask;
+
+            dst->sin_family = AF_INET;
+            dst->sin_addr.s_addr = htonl(0xC0A86400);  // 192.168.100.0
+            gw->sin_family = AF_INET;
+            gw->sin_addr.s_addr = htonl(0x0A000001);   // 10.0.0.1
+            mask->sin_family = AF_INET;
+            mask->sin_addr.s_addr = htonl(0xFFFFFF00);  // 255.255.255.0
+            rt.rt_flags = 0x0003;  // RTF_UP | RTF_GATEWAY
+
+            int ret = ioctl(sock, SIOCADDRT, &rt);
+            test_result("route: SIOCADDRT", ret == 0);
+
+            ret = ioctl(sock, SIOCDELRT, &rt);
+            test_result("route: SIOCDELRT", ret == 0);
+
+            close(sock);
+        }
+    }
+
+    // ========================================
+    // IFCONF includes loopback
+    // ========================================
+    printf("\n--- IFCONF with loopback ---\n");
+
+    {
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock >= 0) {
+            struct ifreq ifr_buf[8];
+            struct ifconf ifc;
+            memset(&ifc, 0, sizeof(ifc));
+            ifc.ifc_len = sizeof(ifr_buf);
+            ifc.ifc_buf = (char*)ifr_buf;
+
+            int ret = ioctl(sock, SIOCGIFCONF, &ifc);
+            test_result("ifconf: SIOCGIFCONF succeeds", ret == 0);
+
+            int found_lo = 0;
+            int n_ifs = ifc.ifc_len / (int)sizeof(struct ifreq);
+            for (int i = 0; i < n_ifs; i++) {
+                if (strcmp(ifr_buf[i].ifr_name, "lo") == 0)
+                    found_lo = 1;
+            }
+            test_result("ifconf: lo interface present", found_lo);
+            close(sock);
+        }
+    }
+
+    // ========================================
+    // DNS Resolve Tests
+    // ========================================
+    printf("\n--- DNS Resolve ---\n");
+
+    // Test 1: Resolve numeric IP
+    {
+        uint32_t ip = 0;
+        int ret = dns_resolve("192.168.1.1", &ip);
+        test_result("dns: numeric IP resolve", ret == 0 && ip == 0xC0A80101);
+    }
+
+    // Test 2: Resolve "localhost"
+    {
+        uint32_t ip = 0;
+        int ret = dns_resolve("localhost", &ip);
+        test_result("dns: localhost resolves to 127.0.0.1", ret == 0 && ip == 0x7F000001);
     }
 
     // ========================================

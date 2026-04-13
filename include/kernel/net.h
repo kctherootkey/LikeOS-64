@@ -313,6 +313,9 @@ typedef struct __attribute__((packed)) {
 
 #define AF_INET         2
 #define PF_INET         AF_INET
+#define AF_UNIX         1
+#define AF_LOCAL        AF_UNIX
+#define PF_UNIX         AF_UNIX
 
 #define SOL_SOCKET      1
 #define SO_REUSEADDR    2
@@ -510,8 +513,10 @@ void net_timer_tick(void);
 // ============================================================================
 #define SOCKET_FD_BASE      0x10000UL
 #define EPOLL_FD_BASE       0x20000UL
+#define UNIX_SOCKET_FD_BASE 0x30000UL
 #define MAX_EPOLL_INSTANCES 32
 #define MAX_EPOLL_ENTRIES   64
+#define MAX_UNIX_SOCKETS    64
 
 #define IS_SOCKET_FD(ptr)   ((uintptr_t)(ptr) >= SOCKET_FD_BASE && \
                              (uintptr_t)(ptr) < SOCKET_FD_BASE + NET_MAX_SOCKETS)
@@ -522,6 +527,11 @@ void net_timer_tick(void);
                              (uintptr_t)(ptr) < EPOLL_FD_BASE + MAX_EPOLL_INSTANCES)
 #define EPOLL_FD_IDX(ptr)   ((int)((uintptr_t)(ptr) - EPOLL_FD_BASE))
 #define MAKE_EPOLL_FD(idx)  ((struct vfs_file*)(EPOLL_FD_BASE + (unsigned)(idx)))
+
+#define IS_UNIX_SOCKET_FD(ptr)  ((uintptr_t)(ptr) >= UNIX_SOCKET_FD_BASE && \
+                                 (uintptr_t)(ptr) < UNIX_SOCKET_FD_BASE + MAX_UNIX_SOCKETS)
+#define UNIX_SOCKET_FD_IDX(ptr) ((int)((uintptr_t)(ptr) - UNIX_SOCKET_FD_BASE))
+#define MAKE_UNIX_SOCKET_FD(idx) ((struct vfs_file*)(UNIX_SOCKET_FD_BASE + (unsigned)(idx)))
 
 // ============================================================================
 // Scatter/Gather I/O (sendmsg/recvmsg)
@@ -769,5 +779,85 @@ int  net_ioctl(unsigned long request, void* argp);
 // Sendfile (kernel-side)
 // ============================================================================
 int  sock_sendfile(int out_fd, int in_fd, int64_t* offset, size_t count);
+
+// ============================================================================
+// Routing Table
+// ============================================================================
+#define RTF_UP      0x0001
+#define RTF_GATEWAY 0x0002
+#define RTF_HOST    0x0004
+#define RTF_REJECT  0x0200
+
+void route_init(void);
+int  route_add(uint32_t dst_net, uint32_t netmask, uint32_t gateway,
+               net_device_t* dev, uint32_t metric, uint16_t flags);
+int  route_del(uint32_t dst_net, uint32_t netmask, uint32_t gateway);
+net_device_t* route_lookup(uint32_t dst_ip, uint32_t* next_hop_out);
+net_device_t* net_get_loopback(void);
+
+// ============================================================================
+// UNIX Domain Socket Address
+// ============================================================================
+#define UNIX_PATH_MAX 108
+
+struct sockaddr_un {
+    sa_family_t sun_family;         // AF_UNIX
+    char sun_path[UNIX_PATH_MAX];   // Pathname
+};
+
+// UNIX domain socket (kernel internal)
+typedef struct unix_socket {
+    int active;
+    int type;                       // SOCK_STREAM or SOCK_DGRAM
+    int bound;
+    int listening;
+    int connected;
+    int closed;
+    int nonblock;
+    int error;
+    char path[UNIX_PATH_MAX];       // Bind path (or empty for abstract)
+    struct unix_socket* peer;       // Connected peer
+    struct unix_socket* parent;     // Listener (for accepted sockets)
+
+    // Data buffer (bidirectional ring buffer)
+    uint8_t buf[8192];
+    int head;
+    int tail;
+    volatile int ready;             // Data available
+    volatile int peer_closed;       // Peer has closed
+
+    // Accept queue (for listening sockets)
+    struct unix_socket* accept_queue[16];
+    int accept_head;
+    int accept_tail;
+    int backlog;
+    volatile int accept_ready;
+
+    spinlock_t lock;
+    int ref_count;
+} unix_socket_t;
+
+// UNIX domain socket API
+int  unix_create(int type);
+int  unix_bind(int usockfd, const struct sockaddr_un* addr);
+int  unix_listen(int usockfd, int backlog);
+int  unix_accept(int usockfd, struct sockaddr_un* addr, socklen_t* addrlen);
+int  unix_connect(int usockfd, const struct sockaddr_un* addr);
+int  unix_send(int usockfd, const void* buf, size_t len, int flags);
+int  unix_recv(int usockfd, void* buf, size_t len, int flags);
+int  unix_close(int usockfd);
+int  unix_socketpair(int type, int sv[2]);
+int  unix_shutdown(int usockfd, int how);
+unix_socket_t* unix_get(int usockfd);
+int  unix_poll(int usockfd, short events);
+
+// ============================================================================
+// DNS Resolver
+// ============================================================================
+int  dns_resolve(const char* hostname, uint32_t* ip_out);
+void dns_init(void);
+void dns_rx(const uint8_t* data, uint16_t len);
+
+#define DNS_CLIENT_PORT 5353
 
 #endif // _KERNEL_NET_H_

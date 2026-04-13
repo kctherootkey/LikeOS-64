@@ -168,7 +168,11 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/tcp.o \
 			  $(BUILD_DIR)/dhcp.o \
 			  $(BUILD_DIR)/socket.o \
-			  $(BUILD_DIR)/poll.o
+			  $(BUILD_DIR)/poll.o \
+			  $(BUILD_DIR)/random.o \
+			  $(BUILD_DIR)/route.o \
+			  $(BUILD_DIR)/dns.o \
+			  $(BUILD_DIR)/unix_socket.o
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -322,6 +326,18 @@ $(BUILD_DIR)/socket.o: $(KERNEL_DIR)/net/socket.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/poll.o: $(KERNEL_DIR)/net/poll.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/random.o: $(KERNEL_DIR)/hal/random.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/route.o: $(KERNEL_DIR)/net/route.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/dns.o: $(KERNEL_DIR)/net/dns.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/unix_socket.o: $(KERNEL_DIR)/net/unix_socket.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ioapic.o: $(KERNEL_DIR)/hal/ioapic.c | $(BUILD_DIR)

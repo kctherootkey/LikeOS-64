@@ -177,6 +177,7 @@
 #define SYS_EPOLL_WAIT      366
 #define SYS_EPOLL_PWAIT     367
 #define SYS_DUP3            368
+#define SYS_DNS_RESOLVE     369
 
 // Kernel log control operations (for SYS_KLOGCTL)
 #define SYSLOG_ACTION_READ       2
@@ -302,6 +303,7 @@ typedef struct k_sysinfo {
 #define EAFNOSUPPORT    97  // Address family not supported
 #define EADDRINUSE      98  // Address already in use
 #define ENETDOWN       100  // Network is down
+#define ENETUNREACH    101  // Network is unreachable
 #define ECONNABORTED   103  // Connection aborted
 #define ECONNRESET     104  // Connection reset by peer
 #define EISCONN        106  // Already connected

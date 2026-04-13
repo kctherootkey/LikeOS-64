@@ -165,6 +165,7 @@
 #define SYS_EPOLL_WAIT  366
 #define SYS_EPOLL_PWAIT 367
 #define SYS_DUP3        368
+#define SYS_DNS_RESOLVE 369
 
 // Kernel log control operations
 #define SYSLOG_ACTION_READ       2

@@ -3,6 +3,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/timer.h"
+#include "../../include/kernel/random.h"
 
 // DHCP Message types
 #define DHCP_DISCOVER   1
@@ -241,6 +242,15 @@ void dhcp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
             kprintf(" gw %d.%d.%d.%d\n",
                     (router >> 24) & 0xFF, (router >> 16) & 0xFF,
                     (router >> 8) & 0xFF, router & 0xFF);
+
+            // Add routes: connected subnet + default gateway
+            if (subnet != 0) {
+                uint32_t net_addr = offered & subnet;
+                route_add(net_addr, subnet, 0, dev, 0, RTF_UP);
+            }
+            if (router != 0) {
+                route_add(0, 0, router, dev, 0, RTF_UP | RTF_GATEWAY);
+            }
         } else if (msg_type == DHCP_NAK) {
             kprintf("[DHCP] NAK received, restarting\n");
             dhcp_state = DHCP_STATE_IDLE;
@@ -255,7 +265,7 @@ void dhcp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
 
 // Start DHCP discovery
 int dhcp_discover(net_device_t* dev) {
-    dhcp_xid = timer_ticks() * 0x1234 + 0x5678;
+    dhcp_xid = random_u32();
     dhcp_state = DHCP_STATE_DISCOVERING;
     dhcp_offered_ip = 0;
     dhcp_server_ip = 0;

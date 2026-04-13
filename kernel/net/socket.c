@@ -10,6 +10,7 @@
 #include "../../include/kernel/pipe.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/tty.h"
+#include "../../include/kernel/random.h"
 
 // Socket table
 static net_socket_t sockets[NET_MAX_SOCKETS];
@@ -25,6 +26,21 @@ void socket_init(void) {
 }
 
 static uint16_t alloc_ephemeral_port(void) {
+    // Randomized ephemeral port allocation
+    for (int attempt = 0; attempt < 128; attempt++) {
+        uint16_t port = 49152 + (uint16_t)(random_u32() % 16384);
+        // Check for collision with bound sockets
+        int in_use = 0;
+        for (int i = 0; i < NET_MAX_SOCKETS; i++) {
+            if (sockets[i].active && sockets[i].bound &&
+                net_ntohs(sockets[i].local_addr.sin_port) == port) {
+                in_use = 1;
+                break;
+            }
+        }
+        if (!in_use) return port;
+    }
+    // Fallback: sequential
     uint16_t port = next_ephemeral_port++;
     if (next_ephemeral_port > 65535)
         next_ephemeral_port = 49152;
@@ -775,6 +791,43 @@ int sock_ioctl_net(int sockfd, unsigned long request, void* argp) {
 }
 
 // ============================================================================
+// net_find_dev_by_name - Find a device by interface name (includes loopback)
+// ============================================================================
+static net_device_t* net_find_dev_by_name(const char* name) {
+    // Check loopback first
+    net_device_t* lo = net_get_loopback();
+    if (lo) {
+        const char* n = lo->name;
+        int match = 1;
+        for (int j = 0; j < IFNAMSIZ; j++) {
+            if (name[j] != n[j]) { match = 0; break; }
+            if (!n[j]) break;
+        }
+        if (match) return lo;
+    }
+    // Check registered devices
+    for (int i = 0; i < net_device_count(); i++) {
+        net_device_t* d = net_get_device(i);
+        if (!d) continue;
+        const char* n = d->name;
+        int match = 1;
+        for (int j = 0; j < IFNAMSIZ; j++) {
+            if (name[j] != n[j]) { match = 0; break; }
+            if (!n[j]) break;
+        }
+        if (match) return d;
+    }
+    return NULL;
+}
+
+// ============================================================================
+// net_dev_is_loopback - Check if device is the loopback interface
+// ============================================================================
+static int net_dev_is_loopback(net_device_t* dev) {
+    return dev == net_get_loopback();
+}
+
+// ============================================================================
 // net_ioctl - Handle interface-level network ioctls
 // ============================================================================
 int net_ioctl(unsigned long request, void* argp) {
@@ -784,15 +837,31 @@ int net_ioctl(unsigned long request, void* argp) {
     case SIOCGIFCONF: {
         struct ifconf* ifc = (struct ifconf*)argp;
         int count = net_device_count();
-        int needed = count * (int)sizeof(struct ifreq);
+        int total = count + (net_get_loopback() ? 1 : 0);
+        int needed = total * (int)sizeof(struct ifreq);
         if (ifc->ifc_len < needed || !ifc->ifc_buf) {
             ifc->ifc_len = needed;
             return 0;
         }
+        int idx = 0;
+        // Add loopback first
+        net_device_t* lo = net_get_loopback();
+        if (lo) {
+            struct ifreq* ifr = &ifc->ifc_req[idx];
+            for (int j = 0; j < IFNAMSIZ; j++) ifr->ifr_name[j] = 0;
+            const char* n = lo->name;
+            for (int j = 0; n[j] && j < IFNAMSIZ - 1; j++)
+                ifr->ifr_name[j] = n[j];
+            struct sockaddr_in* sin = (struct sockaddr_in*)&ifr->ifr_addr;
+            sin->sin_family = AF_INET;
+            sin->sin_addr.s_addr = net_htonl(lo->ip_addr);
+            sin->sin_port = 0;
+            idx++;
+        }
         for (int i = 0; i < count; i++) {
             net_device_t* dev = net_get_device(i);
             if (!dev) continue;
-            struct ifreq* ifr = &ifc->ifc_req[i];
+            struct ifreq* ifr = &ifc->ifc_req[idx];
             for (int j = 0; j < IFNAMSIZ; j++) ifr->ifr_name[j] = 0;
             const char* n = dev->name;
             for (int j = 0; n[j] && j < IFNAMSIZ - 1; j++)
@@ -801,27 +870,20 @@ int net_ioctl(unsigned long request, void* argp) {
             sin->sin_family = AF_INET;
             sin->sin_addr.s_addr = net_htonl(dev->ip_addr);
             sin->sin_port = 0;
+            idx++;
         }
-        ifc->ifc_len = count * (int)sizeof(struct ifreq);
+        ifc->ifc_len = idx * (int)sizeof(struct ifreq);
         return 0;
     }
 
     case SIOCGIFFLAGS: {
         struct ifreq* ifr = (struct ifreq*)argp;
-        net_device_t* dev = NULL;
-        for (int i = 0; i < net_device_count(); i++) {
-            net_device_t* d = net_get_device(i);
-            if (!d) continue;
-            const char* n = d->name;
-            int match = 1;
-            for (int j = 0; j < IFNAMSIZ; j++) {
-                if (ifr->ifr_name[j] != n[j]) { match = 0; break; }
-                if (!n[j]) break;
-            }
-            if (match) { dev = d; break; }
-        }
+        net_device_t* dev = net_find_dev_by_name(ifr->ifr_name);
         if (!dev) return -ENOENT;
-        ifr->ifr_flags = IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST;
+        if (net_dev_is_loopback(dev))
+            ifr->ifr_flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
+        else
+            ifr->ifr_flags = IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST;
         return 0;
     }
 
@@ -830,18 +892,7 @@ int net_ioctl(unsigned long request, void* argp) {
 
     case SIOCGIFADDR: {
         struct ifreq* ifr = (struct ifreq*)argp;
-        net_device_t* dev = NULL;
-        for (int i = 0; i < net_device_count(); i++) {
-            net_device_t* d = net_get_device(i);
-            if (!d) continue;
-            const char* n = d->name;
-            int match = 1;
-            for (int j = 0; j < IFNAMSIZ; j++) {
-                if (ifr->ifr_name[j] != n[j]) { match = 0; break; }
-                if (!n[j]) break;
-            }
-            if (match) { dev = d; break; }
-        }
+        net_device_t* dev = net_find_dev_by_name(ifr->ifr_name);
         if (!dev) return -ENOENT;
         struct sockaddr_in* sin = (struct sockaddr_in*)&ifr->ifr_addr;
         sin->sin_family = AF_INET;
@@ -852,18 +903,7 @@ int net_ioctl(unsigned long request, void* argp) {
 
     case SIOCSIFADDR: {
         struct ifreq* ifr = (struct ifreq*)argp;
-        net_device_t* dev = NULL;
-        for (int i = 0; i < net_device_count(); i++) {
-            net_device_t* d = net_get_device(i);
-            if (!d) continue;
-            const char* n = d->name;
-            int match = 1;
-            for (int j = 0; j < IFNAMSIZ; j++) {
-                if (ifr->ifr_name[j] != n[j]) { match = 0; break; }
-                if (!n[j]) break;
-            }
-            if (match) { dev = d; break; }
-        }
+        net_device_t* dev = net_find_dev_by_name(ifr->ifr_name);
         if (!dev) return -ENOENT;
         struct sockaddr_in* sin = (struct sockaddr_in*)&ifr->ifr_addr;
         dev->ip_addr = net_ntohl(sin->sin_addr.s_addr);
@@ -872,18 +912,7 @@ int net_ioctl(unsigned long request, void* argp) {
 
     case SIOCGIFNETMASK: {
         struct ifreq* ifr = (struct ifreq*)argp;
-        net_device_t* dev = NULL;
-        for (int i = 0; i < net_device_count(); i++) {
-            net_device_t* d = net_get_device(i);
-            if (!d) continue;
-            const char* n = d->name;
-            int match = 1;
-            for (int j = 0; j < IFNAMSIZ; j++) {
-                if (ifr->ifr_name[j] != n[j]) { match = 0; break; }
-                if (!n[j]) break;
-            }
-            if (match) { dev = d; break; }
-        }
+        net_device_t* dev = net_find_dev_by_name(ifr->ifr_name);
         if (!dev) return -ENOENT;
         struct sockaddr_in* sin = (struct sockaddr_in*)&ifr->ifr_netmask;
         sin->sin_family = AF_INET;
@@ -894,18 +923,7 @@ int net_ioctl(unsigned long request, void* argp) {
 
     case SIOCSIFNETMASK: {
         struct ifreq* ifr = (struct ifreq*)argp;
-        net_device_t* dev = NULL;
-        for (int i = 0; i < net_device_count(); i++) {
-            net_device_t* d = net_get_device(i);
-            if (!d) continue;
-            const char* n = d->name;
-            int match = 1;
-            for (int j = 0; j < IFNAMSIZ; j++) {
-                if (ifr->ifr_name[j] != n[j]) { match = 0; break; }
-                if (!n[j]) break;
-            }
-            if (match) { dev = d; break; }
-        }
+        net_device_t* dev = net_find_dev_by_name(ifr->ifr_name);
         if (!dev) return -ENOENT;
         struct sockaddr_in* sin = (struct sockaddr_in*)&ifr->ifr_netmask;
         dev->netmask = net_ntohl(sin->sin_addr.s_addr);
@@ -914,18 +932,7 @@ int net_ioctl(unsigned long request, void* argp) {
 
     case SIOCGIFBRDADDR: {
         struct ifreq* ifr = (struct ifreq*)argp;
-        net_device_t* dev = NULL;
-        for (int i = 0; i < net_device_count(); i++) {
-            net_device_t* d = net_get_device(i);
-            if (!d) continue;
-            const char* n = d->name;
-            int match = 1;
-            for (int j = 0; j < IFNAMSIZ; j++) {
-                if (ifr->ifr_name[j] != n[j]) { match = 0; break; }
-                if (!n[j]) break;
-            }
-            if (match) { dev = d; break; }
-        }
+        net_device_t* dev = net_find_dev_by_name(ifr->ifr_name);
         if (!dev) return -ENOENT;
         struct sockaddr_in* sin = (struct sockaddr_in*)&ifr->ifr_broadaddr;
         sin->sin_family = AF_INET;
@@ -939,18 +946,7 @@ int net_ioctl(unsigned long request, void* argp) {
 
     case SIOCGIFMTU: {
         struct ifreq* ifr = (struct ifreq*)argp;
-        net_device_t* dev = NULL;
-        for (int i = 0; i < net_device_count(); i++) {
-            net_device_t* d = net_get_device(i);
-            if (!d) continue;
-            const char* n = d->name;
-            int match = 1;
-            for (int j = 0; j < IFNAMSIZ; j++) {
-                if (ifr->ifr_name[j] != n[j]) { match = 0; break; }
-                if (!n[j]) break;
-            }
-            if (match) { dev = d; break; }
-        }
+        net_device_t* dev = net_find_dev_by_name(ifr->ifr_name);
         if (!dev) return -ENOENT;
         ifr->ifr_mtu = dev->mtu;
         return 0;
@@ -958,18 +954,7 @@ int net_ioctl(unsigned long request, void* argp) {
 
     case SIOCSIFMTU: {
         struct ifreq* ifr = (struct ifreq*)argp;
-        net_device_t* dev = NULL;
-        for (int i = 0; i < net_device_count(); i++) {
-            net_device_t* d = net_get_device(i);
-            if (!d) continue;
-            const char* n = d->name;
-            int match = 1;
-            for (int j = 0; j < IFNAMSIZ; j++) {
-                if (ifr->ifr_name[j] != n[j]) { match = 0; break; }
-                if (!n[j]) break;
-            }
-            if (match) { dev = d; break; }
-        }
+        net_device_t* dev = net_find_dev_by_name(ifr->ifr_name);
         if (!dev) return -ENOENT;
         if (ifr->ifr_mtu < 68 || ifr->ifr_mtu > 9000) return -EINVAL;
         dev->mtu = (uint16_t)ifr->ifr_mtu;
@@ -978,18 +963,7 @@ int net_ioctl(unsigned long request, void* argp) {
 
     case SIOCGIFHWADDR: {
         struct ifreq* ifr = (struct ifreq*)argp;
-        net_device_t* dev = NULL;
-        for (int i = 0; i < net_device_count(); i++) {
-            net_device_t* d = net_get_device(i);
-            if (!d) continue;
-            const char* n = d->name;
-            int match = 1;
-            for (int j = 0; j < IFNAMSIZ; j++) {
-                if (ifr->ifr_name[j] != n[j]) { match = 0; break; }
-                if (!n[j]) break;
-            }
-            if (match) { dev = d; break; }
-        }
+        net_device_t* dev = net_find_dev_by_name(ifr->ifr_name);
         if (!dev) return -ENOENT;
         ifr->ifr_hwaddr.sa_family = 1;  // ARPHRD_ETHER
         for (int j = 0; j < ETH_ALEN; j++)
@@ -999,18 +973,16 @@ int net_ioctl(unsigned long request, void* argp) {
 
     case SIOCGIFINDEX: {
         struct ifreq* ifr = (struct ifreq*)argp;
-        for (int i = 0; i < net_device_count(); i++) {
-            net_device_t* d = net_get_device(i);
-            if (!d) continue;
-            const char* n = d->name;
-            int match = 1;
-            for (int j = 0; j < IFNAMSIZ; j++) {
-                if (ifr->ifr_name[j] != n[j]) { match = 0; break; }
-                if (!n[j]) break;
+        net_device_t* dev = net_find_dev_by_name(ifr->ifr_name);
+        if (!dev) return -ENOENT;
+        if (net_dev_is_loopback(dev)) {
+            ifr->ifr_ifindex = 1;  // lo is always index 1
+        } else {
+            for (int i = 0; i < net_device_count(); i++) {
+                if (net_get_device(i) == dev) { ifr->ifr_ifindex = i + 2; break; }
             }
-            if (match) { ifr->ifr_ifindex = i + 1; return 0; }
         }
-        return -ENOENT;
+        return 0;
     }
 
     case SIOCGIFNAME: {
@@ -1053,7 +1025,7 @@ int net_ioctl(unsigned long request, void* argp) {
 
     case SIOCGIFCOUNT: {
         int* countp = (int*)argp;
-        *countp = net_device_count();
+        *countp = net_device_count() + (net_get_loopback() ? 1 : 0);
         return 0;
     }
 
@@ -1089,9 +1061,37 @@ int net_ioctl(unsigned long request, void* argp) {
     case SIOCDARP:
         return 0;  // Accept but no-op (ARP entries expire naturally)
 
-    // Routing ioctls - stub
-    case SIOCADDRT:
-    case SIOCDELRT:
+    // Routing ioctls
+    case SIOCADDRT: {
+        if (!argp) return -EFAULT;
+        smap_disable();
+        struct rtentry* rt = (struct rtentry*)argp;
+        struct sockaddr_in* dst = (struct sockaddr_in*)&rt->rt_dst;
+        struct sockaddr_in* gw = (struct sockaddr_in*)&rt->rt_gateway;
+        struct sockaddr_in* mask = (struct sockaddr_in*)&rt->rt_genmask;
+        uint32_t dst_ip = net_ntohl(dst->sin_addr.s_addr);
+        uint32_t gw_ip = net_ntohl(gw->sin_addr.s_addr);
+        uint32_t netmask = net_ntohl(mask->sin_addr.s_addr);
+        uint16_t flags = (uint16_t)rt->rt_flags;
+        smap_enable();
+
+        net_device_t* rdev = net_get_default_device();
+        return route_add(dst_ip, netmask, gw_ip, rdev, 0, flags);
+    }
+    case SIOCDELRT: {
+        if (!argp) return -EFAULT;
+        smap_disable();
+        struct rtentry* rt = (struct rtentry*)argp;
+        struct sockaddr_in* dst = (struct sockaddr_in*)&rt->rt_dst;
+        struct sockaddr_in* gw = (struct sockaddr_in*)&rt->rt_gateway;
+        struct sockaddr_in* mask = (struct sockaddr_in*)&rt->rt_genmask;
+        uint32_t dst_ip = net_ntohl(dst->sin_addr.s_addr);
+        uint32_t gw_ip = net_ntohl(gw->sin_addr.s_addr);
+        uint32_t netmask = net_ntohl(mask->sin_addr.s_addr);
+        (void)netmask;
+        smap_enable();
+        return route_del(dst_ip, netmask, gw_ip);
+    }
     case SIOCRTMSG:
         return -EOPNOTSUPP;
 
