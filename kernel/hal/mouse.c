@@ -9,6 +9,7 @@
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/cursor.h"
 #include "../../include/kernel/tty.h"
+#include "../../include/kernel/ioapic.h"
 
 // Global mouse state
 static mouse_state_t mouse_state = {0};
@@ -148,6 +149,13 @@ static void mouse_write_command(uint8_t cmd, uint8_t data)
     outb(PS2_DATA_PORT, cmd);
 
     if(data != 0xFF) { // 0xFF means no data byte
+        // Consume ACK for the command byte before sending data.
+        // Without this, the ACK stays in the output buffer and
+        // desynchronises subsequent reads (especially with IRQ12
+        // masked during init, where nothing else drains it).
+        mouse_wait_output();
+        (void)inb(PS2_DATA_PORT);
+
         mouse_wait_input();
         outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_PORT2);
 
@@ -556,6 +564,14 @@ void mouse_init(void)
     }
     (void)bg_count; // count reserved for potential diagnostics
 
+    // Mask IRQ12 at the IOAPIC for the duration of polled init.
+    // The PS/2 controller has CTR_AUXINT set, so every response byte
+    // (ACK, BAT, device-ID) triggers IRQ12.  The IRQ handler would
+    // consume those bytes before mouse_read_data() can poll them,
+    // causing timeouts (visible as delayed init in QEMU) and, if the
+    // user moves the mouse, complete init failure.
+    ioapic_mask_gsi(12);
+
     // Drain any stale bytes from the output buffer before issuing mouse commands.
     mouse_flush_output();
 
@@ -619,10 +635,17 @@ void mouse_init(void)
     }
     if(enable_ack != MOUSE_ACK) {
         kprintf("ERROR: Mouse failed to enable reporting (final resp: 0x%02X)\n", enable_ack);
+        mouse_flush_output();
+        ioapic_unmask_gsi(12);
         return;
     }
 
     mouse_state.enabled = 1;
+
+    // Drain any leftover bytes, then unmask IRQ12 so the handler
+    // can process real movement packets from now on.
+    mouse_flush_output();
+    ioapic_unmask_gsi(12);
 
     kprintf("Mouse initialized successfully\n");
     kprintf("  Position: (%d, %d)\n", mouse_state.x, mouse_state.y);
