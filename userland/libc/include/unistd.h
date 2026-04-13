@@ -101,6 +101,7 @@ int futimens(int fd, const struct timespec times[2]);
 // File descriptor operations
 int dup(int oldfd);
 int dup2(int oldfd, int newfd);
+int dup3(int oldfd, int newfd, int flags);
 
 // Memory
 void* sbrk(intptr_t increment);

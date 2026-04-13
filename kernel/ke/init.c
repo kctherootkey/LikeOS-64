@@ -24,6 +24,7 @@
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/usbhid.h"
 #include "../../include/kernel/usb_serial.h"
+#include "../../include/kernel/net.h"
 
 void system_startup(boot_info_t* boot_info);
 void kernel_main(boot_info_t* boot_info);
@@ -141,6 +142,9 @@ void continue_system_startup(void) {
     mouse_init();
 
     storage_fs_init(&g_storage_state);
+
+    // Initialize networking (E1000 NIC driver, protocol stack, DHCP)
+    net_init();
 
     sched_init();
 

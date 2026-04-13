@@ -17,6 +17,40 @@
 #define TIOCSGUARD 0x5420
 #define TIOCLINUX  0x541C
 
+// Network interface ioctls (Linux-compatible)
+#define SIOCGIFCONF     0x8912
+#define SIOCGIFFLAGS    0x8913
+#define SIOCSIFFLAGS    0x8914
+#define SIOCGIFADDR     0x8915
+#define SIOCSIFADDR     0x8916
+#define SIOCGIFDSTADDR  0x8917
+#define SIOCSIFDSTADDR  0x8918
+#define SIOCGIFBRDADDR  0x8919
+#define SIOCSIFBRDADDR  0x891A
+#define SIOCGIFNETMASK  0x891B
+#define SIOCSIFNETMASK  0x891C
+#define SIOCGIFMETRIC   0x891D
+#define SIOCSIFMETRIC   0x891E
+#define SIOCGIFMTU      0x8921
+#define SIOCSIFMTU      0x8922
+#define SIOCSIFHWADDR   0x8924
+#define SIOCGIFHWADDR   0x8927
+#define SIOCGIFINDEX    0x8933
+#define SIOCGIFNAME     0x8910
+#define SIOCGIFCOUNT    0x8938
+#define SIOCGIFTXQLEN   0x8942
+#define SIOCSIFTXQLEN   0x8943
+
+// ARP ioctls
+#define SIOCGARP        0x8954
+#define SIOCSARP        0x8955
+#define SIOCDARP        0x8953
+
+// Routing ioctls
+#define SIOCADDRT       0x890B
+#define SIOCDELRT       0x890C
+#define SIOCRTMSG       0x890D
+
 int ioctl(int fd, unsigned long request, void* argp);
 
 #endif

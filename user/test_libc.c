@@ -21,6 +21,13 @@
 #include <sys/vfs.h>
 #include <sys/sysinfo.h>
 #include <sys/klog.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <sys/select.h>
+#include <sys/epoll.h>
+#include <net/if.h>
 
 // Futex helper declarations (from sched.c)
 int futex_wait(int* uaddr, int val, const struct timespec* timeout);
@@ -3574,6 +3581,542 @@ int main(int argc, char** argv) {
         /* Test NULL buffer with READ_ALL should fail */
         ret = klogctl(SYSLOG_ACTION_READ_ALL, NULL, 100);
         test_result("klogctl(READ_ALL, NULL) returns -1", ret == -1);
+    }
+
+    // ========================================
+    // Socket / Networking Tests
+    // ========================================
+    printf("\n--- Socket Tests ---\n");
+    {
+        // Test socket creation (UDP)
+        int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        test_result("socket(AF_INET, SOCK_DGRAM) >= 0", udp_fd >= 0);
+
+        // Test socket creation (TCP)
+        int tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
+        test_result("socket(AF_INET, SOCK_STREAM) >= 0", tcp_fd >= 0);
+
+        // Test invalid domain
+        int bad_fd = socket(99, SOCK_STREAM, 0);
+        test_result("socket(99, SOCK_STREAM) == -1 (EAFNOSUPPORT)", bad_fd == -1);
+
+        // Test invalid type
+        bad_fd = socket(AF_INET, 99, 0);
+        test_result("socket(AF_INET, 99) == -1 (bad type)", bad_fd == -1);
+
+        // Test bind (UDP)
+        if (udp_fd >= 0) {
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(12345);
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            int ret = bind(udp_fd, (struct sockaddr*)&addr, sizeof(addr));
+            test_result("bind(udp, port 12345) == 0", ret == 0);
+
+            // Test getsockname after bind
+            struct sockaddr_in got_addr;
+            socklen_t got_len = sizeof(got_addr);
+            ret = getsockname(udp_fd, (struct sockaddr*)&got_addr, &got_len);
+            test_result("getsockname(udp) == 0", ret == 0);
+            test_result("getsockname port == 12345", ntohs(got_addr.sin_port) == 12345);
+        }
+
+        // Test bind (TCP)
+        if (tcp_fd >= 0) {
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(12346);
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            int ret = bind(tcp_fd, (struct sockaddr*)&addr, sizeof(addr));
+            test_result("bind(tcp, port 12346) == 0", ret == 0);
+        }
+
+        // Test listen (TCP)
+        if (tcp_fd >= 0) {
+            int ret = listen(tcp_fd, 5);
+            test_result("listen(tcp, 5) == 0", ret == 0);
+        }
+
+        // Test listen on UDP should fail
+        if (udp_fd >= 0) {
+            int ret = listen(udp_fd, 5);
+            test_result("listen(udp) == -1 (EOPNOTSUPP)", ret == -1);
+        }
+
+        // Test setsockopt SO_REUSEADDR
+        {
+            int opt_fd = socket(AF_INET, SOCK_DGRAM, 0);
+            if (opt_fd >= 0) {
+                int optval = 1;
+                int ret = setsockopt(opt_fd, SOL_SOCKET, SO_REUSEADDR,
+                                     &optval, sizeof(optval));
+                test_result("setsockopt(SO_REUSEADDR) == 0", ret == 0);
+
+                // Test getsockopt SO_ERROR
+                int error_val = -1;
+                socklen_t error_len = sizeof(error_val);
+                ret = getsockopt(opt_fd, SOL_SOCKET, SO_ERROR,
+                                 &error_val, &error_len);
+                test_result("getsockopt(SO_ERROR) == 0", ret == 0);
+                test_result("SO_ERROR value == 0 (no error)", error_val == 0);
+
+                shutdown(opt_fd, SHUT_RDWR);
+            }
+        }
+
+        // Test htons/ntohs byte order
+        test_result("htons(0x1234) byte swap", htons(0x1234) == 0x3412);
+        test_result("ntohs(htons(80)) == 80", ntohs(htons(80)) == 80);
+        test_result("ntohl(htonl(0x12345678)) round-trip",
+                     ntohl(htonl(0x12345678)) == 0x12345678);
+
+        // Test inet_addr
+        {
+            in_addr_t a = inet_addr("10.0.2.15");
+            test_result("inet_addr(\"10.0.2.15\") != -1", a != (in_addr_t)-1);
+            test_result("inet_addr round-trip",
+                        ntohl(a) == ((10U << 24) | (0U << 16) | (2U << 8) | 15U));
+
+            in_addr_t bad = inet_addr("not.an.ip");
+            test_result("inet_addr(\"not.an.ip\") == -1", bad == (in_addr_t)-1);
+        }
+
+        // Test inet_ntoa
+        {
+            struct in_addr ia;
+            ia.s_addr = inet_addr("192.168.1.100");
+            char* str = inet_ntoa(ia);
+            test_result("inet_ntoa(192.168.1.100)", strcmp(str, "192.168.1.100") == 0);
+        }
+
+        // Test invalid sockfd operations
+        {
+            int ret = bind(-1, NULL, 0);
+            test_result("bind(-1) == -1 (EBADF)", ret == -1);
+
+            ret = listen(-1, 5);
+            test_result("listen(-1) == -1 (EBADF)", ret == -1);
+
+            char buf[32];
+            ssize_t n = recv(-1, buf, sizeof(buf), 0);
+            test_result("recv(-1) == -1 (EBADF)", n == -1);
+
+            n = send(-1, "test", 4, 0);
+            test_result("send(-1) == -1 (EBADF)", n == -1);
+        }
+
+        // Test getpeername on unconnected socket
+        {
+            int s = socket(AF_INET, SOCK_DGRAM, 0);
+            if (s >= 0) {
+                struct sockaddr_in peer;
+                socklen_t plen = sizeof(peer);
+                int ret = getpeername(s, (struct sockaddr*)&peer, &plen);
+                test_result("getpeername(unconnected) == -1 (ENOTCONN)", ret == -1);
+                shutdown(s, SHUT_RDWR);
+            }
+        }
+
+        // Cleanup
+        if (udp_fd >= 0) shutdown(udp_fd, SHUT_RDWR);
+        if (tcp_fd >= 0) shutdown(tcp_fd, SHUT_RDWR);
+    }
+
+    // ========================================
+    // Extended Networking Syscalls Tests
+    // ========================================
+    printf("\n--- Extended Networking Syscalls ---\n");
+
+    // Test socketpair
+    {
+        int sv[2] = {-1, -1};
+        int ret = socketpair(AF_INET, SOCK_DGRAM, 0, sv);
+        test_result("socketpair returns 0", ret == 0);
+        test_result("socketpair sv[0] >= 0", sv[0] >= 0);
+        test_result("socketpair sv[1] >= 0", sv[1] >= 0);
+        if (ret == 0) {
+            // Test sending data through the pair
+            const char *msg = "hello";
+            ssize_t n = send(sv[0], msg, 5, 0);
+            test_result("socketpair send returns 5", n == 5);
+            char buf[16] = {0};
+            n = recv(sv[1], buf, sizeof(buf), 0);
+            test_result("socketpair recv returns 5", n == 5);
+            test_result("socketpair data matches", memcmp(buf, "hello", 5) == 0);
+            close(sv[0]);
+            close(sv[1]);
+        }
+    }
+
+    // Test close/dup/dup2/dup3 on socket fds
+    {
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        test_result("socket returns valid fd", s >= 3);
+        if (s >= 0) {
+            int d = dup(s);
+            test_result("dup(socket) returns valid fd", d >= 3 && d != s);
+            if (d >= 0) close(d);
+
+            int d2 = dup2(s, 100);
+            test_result("dup2(socket, 100) returns 100", d2 == 100);
+            if (d2 >= 0) close(d2);
+
+            int d3 = dup3(s, 101, 0);
+            test_result("dup3(socket, 101, 0) returns 101", d3 == 101);
+            if (d3 >= 0) close(d3);
+
+            close(s);
+        }
+    }
+
+    // Test fcntl on socket (F_GETFL / F_SETFL O_NONBLOCK)
+    {
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s >= 0) {
+            int fl = fcntl(s, F_GETFL, 0);
+            test_result("fcntl(socket, F_GETFL) >= 0", fl >= 0);
+
+            int ret = fcntl(s, F_SETFL, fl | O_NONBLOCK);
+            test_result("fcntl(socket, F_SETFL, O_NONBLOCK) == 0", ret == 0);
+
+            fl = fcntl(s, F_GETFL, 0);
+            test_result("fcntl confirms O_NONBLOCK set", (fl & O_NONBLOCK) != 0);
+            close(s);
+        }
+    }
+
+    // Test ioctl SIOCGIFMTU / SIOCGIFFLAGS / SIOCGIFHWADDR
+    {
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s >= 0) {
+            struct ifreq ifr;
+            memset(&ifr, 0, sizeof(ifr));
+            // Try "eth0" - E1000 device
+            memcpy(ifr.ifr_name, "eth0", 5);
+
+            int ret = ioctl(s, SIOCGIFMTU, &ifr);
+            if (ret == 0) {
+                test_result("ioctl SIOCGIFMTU returns MTU > 0", ifr.ifr_mtu > 0);
+            } else {
+                test_result("ioctl SIOCGIFMTU (no eth0, skip)", 1);
+            }
+
+            memset(&ifr, 0, sizeof(ifr));
+            memcpy(ifr.ifr_name, "eth0", 5);
+            ret = ioctl(s, SIOCGIFFLAGS, &ifr);
+            if (ret == 0) {
+                test_result("ioctl SIOCGIFFLAGS has IFF_UP", (ifr.ifr_flags & IFF_UP) != 0);
+            } else {
+                test_result("ioctl SIOCGIFFLAGS (no eth0, skip)", 1);
+            }
+
+            memset(&ifr, 0, sizeof(ifr));
+            memcpy(ifr.ifr_name, "eth0", 5);
+            ret = ioctl(s, SIOCGIFHWADDR, &ifr);
+            if (ret == 0) {
+                // Check MAC is not all zeros
+                int nonzero = 0;
+                for (int i = 0; i < 6; i++)
+                    if (ifr.ifr_hwaddr.sa_data[i] != 0) nonzero = 1;
+                test_result("ioctl SIOCGIFHWADDR has non-zero MAC", nonzero);
+            } else {
+                test_result("ioctl SIOCGIFHWADDR (no eth0, skip)", 1);
+            }
+
+            close(s);
+        }
+    }
+
+    // Test poll on stdin (should return immediately with timeout=0)
+    {
+        struct pollfd pfd;
+        pfd.fd = STDIN_FILENO;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int ret = poll(&pfd, 1, 0);  // immediate timeout
+        test_result("poll(stdin, timeout=0) >= 0", ret >= 0);
+    }
+
+    // Test poll on socket
+    {
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s >= 0) {
+            struct pollfd pfd;
+            pfd.fd = s;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            int ret = poll(&pfd, 1, 0);
+            test_result("poll(udp_socket, POLLOUT, 0) >= 0", ret >= 0);
+            if (ret > 0) {
+                test_result("poll returns POLLOUT for UDP socket", (pfd.revents & POLLOUT) != 0);
+            }
+            close(s);
+        }
+    }
+
+    // Test select with timeout=0 (immediate)
+    {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(STDIN_FILENO, &rfds);
+        struct timeval tv = {0, 0};
+        int ret = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+        test_result("select(stdin, timeout=0) >= 0", ret >= 0);
+    }
+
+    // Test epoll create/ctl/wait
+    {
+        int epfd = epoll_create1(0);
+        test_result("epoll_create1(0) returns valid fd", epfd >= 3);
+        if (epfd >= 0) {
+            int s = socket(AF_INET, SOCK_DGRAM, 0);
+            if (s >= 0) {
+                struct epoll_event ev;
+                ev.events = EPOLLIN | EPOLLOUT;
+                ev.data.fd = s;
+                int ret = epoll_ctl(epfd, EPOLL_CTL_ADD, s, &ev);
+                test_result("epoll_ctl ADD returns 0", ret == 0);
+
+                struct epoll_event events[4];
+                ret = epoll_wait(epfd, events, 4, 0);
+                test_result("epoll_wait(timeout=0) >= 0", ret >= 0);
+
+                ret = epoll_ctl(epfd, EPOLL_CTL_DEL, s, NULL);
+                test_result("epoll_ctl DEL returns 0", ret == 0);
+
+                close(s);
+            }
+            close(epfd);
+        }
+    }
+
+    // Test accept4 (should fail on non-listening socket)
+    {
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s >= 0) {
+            int ret = accept4(s, NULL, NULL, 0);
+            test_result("accept4(non-listening) returns -1", ret == -1);
+            close(s);
+        }
+    }
+
+    // Test sendmsg / recvmsg via socketpair
+    {
+        int sv[2] = {-1, -1};
+        if (socketpair(AF_INET, SOCK_DGRAM, 0, sv) == 0) {
+            char data[] = "msghdr test";
+            struct iovec iov;
+            iov.iov_base = data;
+            iov.iov_len = sizeof(data) - 1;
+            struct msghdr msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
+            ssize_t n = sendmsg(sv[0], &msg, 0);
+            test_result("sendmsg returns > 0", n > 0);
+
+            char rbuf[32] = {0};
+            struct iovec riov;
+            riov.iov_base = rbuf;
+            riov.iov_len = sizeof(rbuf);
+            struct msghdr rmsg;
+            memset(&rmsg, 0, sizeof(rmsg));
+            rmsg.msg_iov = &riov;
+            rmsg.msg_iovlen = 1;
+            n = recvmsg(sv[1], &rmsg, 0);
+            test_result("recvmsg returns > 0", n > 0);
+            test_result("recvmsg data matches", memcmp(rbuf, "msghdr test", 11) == 0);
+
+            close(sv[0]);
+            close(sv[1]);
+        }
+    }
+
+    // ========================================
+    // sendfile Tests
+    // ========================================
+    printf("\n--- sendfile Tests ---\n");
+
+    // Test 1: sendfile from file to file
+    {
+        // Create a source file with known content
+        int src = open("/tmp_sf_src.txt", O_WRONLY | O_CREAT | O_TRUNC);
+        test_result("sendfile: create source file", src >= 0);
+        if (src >= 0) {
+            const char* data = "Hello sendfile world! This is test data for sendfile.";
+            ssize_t nw = write(src, data, strlen(data));
+            test_result("sendfile: write source data", nw == (ssize_t)strlen(data));
+            close(src);
+
+            // Open source for reading and dest for writing
+            int in_fd = open("/tmp_sf_src.txt", O_RDONLY);
+            int out_fd = open("/tmp_sf_dst.txt", O_WRONLY | O_CREAT | O_TRUNC);
+            test_result("sendfile: open source for read", in_fd >= 0);
+            test_result("sendfile: open dest for write", out_fd >= 0);
+
+            if (in_fd >= 0 && out_fd >= 0) {
+                ssize_t sf = sendfile(out_fd, in_fd, NULL, strlen(data));
+                test_result("sendfile: file-to-file returns correct count",
+                            sf == (ssize_t)strlen(data));
+                close(in_fd);
+                close(out_fd);
+
+                // Verify destination content
+                int vfd = open("/tmp_sf_dst.txt", O_RDONLY);
+                if (vfd >= 0) {
+                    char rbuf[128] = {0};
+                    ssize_t nr = read(vfd, rbuf, sizeof(rbuf));
+                    test_result("sendfile: dest has correct length",
+                                nr == (ssize_t)strlen(data));
+                    test_result("sendfile: dest content matches",
+                                memcmp(rbuf, data, strlen(data)) == 0);
+                    close(vfd);
+                }
+            } else {
+                if (in_fd >= 0) close(in_fd);
+                if (out_fd >= 0) close(out_fd);
+            }
+
+            // Cleanup
+            unlink("/tmp_sf_src.txt");
+            unlink("/tmp_sf_dst.txt");
+        }
+    }
+
+    // Test 2: sendfile with offset parameter
+    {
+        int src = open("/tmp_sf_off.txt", O_WRONLY | O_CREAT | O_TRUNC);
+        if (src >= 0) {
+            const char* data = "AAAAABBBBBCCCCC";  // 15 bytes
+            write(src, data, 15);
+            close(src);
+
+            int in_fd = open("/tmp_sf_off.txt", O_RDONLY);
+            int out_fd = open("/tmp_sf_off_d.txt", O_WRONLY | O_CREAT | O_TRUNC);
+            if (in_fd >= 0 && out_fd >= 0) {
+                // Send 5 bytes starting at offset 5 (the "BBBBB" part)
+                int64_t off = 5;
+                ssize_t sf = sendfile(out_fd, in_fd, &off, 5);
+                test_result("sendfile: with offset returns 5", sf == 5);
+                test_result("sendfile: offset updated to 10", off == 10);
+
+                // Verify file position was NOT changed (offset mode)
+                off_t pos = lseek(in_fd, 0, 1);  // SEEK_CUR
+                test_result("sendfile: file position unchanged", pos == 0);
+
+                close(in_fd);
+                close(out_fd);
+
+                // Verify we got "BBBBB"
+                int vfd = open("/tmp_sf_off_d.txt", O_RDONLY);
+                if (vfd >= 0) {
+                    char rbuf[16] = {0};
+                    read(vfd, rbuf, sizeof(rbuf));
+                    test_result("sendfile: offset data is BBBBB",
+                                memcmp(rbuf, "BBBBB", 5) == 0);
+                    close(vfd);
+                }
+            } else {
+                if (in_fd >= 0) close(in_fd);
+                if (out_fd >= 0) close(out_fd);
+            }
+            unlink("/tmp_sf_off.txt");
+            unlink("/tmp_sf_off_d.txt");
+        }
+    }
+
+    // Test 3: sendfile from file to socket (via socketpair)
+    {
+        int src = open("/tmp_sf_sock.txt", O_WRONLY | O_CREAT | O_TRUNC);
+        if (src >= 0) {
+            const char* data = "socket sendfile data";
+            write(src, data, strlen(data));
+            close(src);
+
+            int sv[2] = {-1, -1};
+            int in_fd = open("/tmp_sf_sock.txt", O_RDONLY);
+            int sp_ok = socketpair(AF_INET, SOCK_DGRAM, 0, sv);
+            test_result("sendfile-to-socket: setup ok",
+                        in_fd >= 0 && sp_ok == 0);
+            if (in_fd >= 0 && sp_ok == 0) {
+                ssize_t sf = sendfile(sv[0], in_fd, NULL, strlen(data));
+                test_result("sendfile: file-to-socket returns correct count",
+                            sf == (ssize_t)strlen(data));
+
+                if (sf > 0) {
+                    char rbuf[64] = {0};
+                    ssize_t nr = recv(sv[1], rbuf, sizeof(rbuf), 0);
+                    test_result("sendfile: socket recv gets data",
+                                nr == (ssize_t)strlen(data));
+                    test_result("sendfile: socket data matches",
+                                memcmp(rbuf, data, strlen(data)) == 0);
+                }
+            }
+            if (in_fd >= 0) close(in_fd);
+            if (sv[0] >= 0) close(sv[0]);
+            if (sv[1] >= 0) close(sv[1]);
+            unlink("/tmp_sf_sock.txt");
+        }
+    }
+
+    // Test 4: sendfile from file to pipe
+    {
+        int src = open("/tmp_sf_pipe.txt", O_WRONLY | O_CREAT | O_TRUNC);
+        if (src >= 0) {
+            const char* data = "pipe sendfile!";
+            write(src, data, strlen(data));
+            close(src);
+
+            int pfd[2];
+            int in_fd = open("/tmp_sf_pipe.txt", O_RDONLY);
+            int pipe_ok = pipe(pfd);
+            test_result("sendfile-to-pipe: setup ok",
+                        in_fd >= 0 && pipe_ok == 0);
+            if (in_fd >= 0 && pipe_ok == 0) {
+                ssize_t sf = sendfile(pfd[1], in_fd, NULL, strlen(data));
+                test_result("sendfile: file-to-pipe returns correct count",
+                            sf == (ssize_t)strlen(data));
+
+                if (sf > 0) {
+                    char rbuf[64] = {0};
+                    ssize_t nr = read(pfd[0], rbuf, sizeof(rbuf));
+                    test_result("sendfile: pipe read gets data",
+                                nr == (ssize_t)strlen(data));
+                    test_result("sendfile: pipe data matches",
+                                memcmp(rbuf, data, strlen(data)) == 0);
+                }
+            }
+            if (in_fd >= 0) close(in_fd);
+            if (pipe_ok == 0) { close(pfd[0]); close(pfd[1]); }
+            unlink("/tmp_sf_pipe.txt");
+        }
+    }
+
+    // Test 5: sendfile with count=0 returns 0
+    {
+        int src = open("/tmp_sf_zero.txt", O_WRONLY | O_CREAT | O_TRUNC);
+        if (src >= 0) {
+            write(src, "x", 1);
+            close(src);
+            int in_fd = open("/tmp_sf_zero.txt", O_RDONLY);
+            int out_fd = open("/tmp_sf_zero_d.txt", O_WRONLY | O_CREAT | O_TRUNC);
+            if (in_fd >= 0 && out_fd >= 0) {
+                ssize_t sf = sendfile(out_fd, in_fd, NULL, 0);
+                test_result("sendfile: count=0 returns 0", sf == 0);
+            }
+            if (in_fd >= 0) close(in_fd);
+            if (out_fd >= 0) close(out_fd);
+            unlink("/tmp_sf_zero.txt");
+            unlink("/tmp_sf_zero_d.txt");
+        }
+    }
+
+    // Test 6: sendfile with invalid fds returns -1
+    {
+        ssize_t sf = sendfile(-1, -1, NULL, 100);
+        test_result("sendfile: bad fds returns -1", sf == -1);
     }
 
     // ========================================

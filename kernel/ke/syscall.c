@@ -23,6 +23,7 @@
 #include "../../include/kernel/fat32.h"
 #include "../../include/kernel/pagecache.h"
 #include "../../include/kernel/icache.h"
+#include "../../include/kernel/net.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
@@ -701,6 +702,24 @@ static int64_t sys_close(uint64_t fd) {
         return 0;
     }
 
+    // Check for socket fd markers
+    if (IS_SOCKET_FD(file)) {
+        int idx = SOCKET_FD_IDX(file);
+        cur->fd_table[fd] = NULL;
+        return sock_close(idx);
+    }
+
+    // Check for epoll fd markers
+    if (IS_EPOLL_FD(file)) {
+        int idx = EPOLL_FD_IDX(file);
+        cur->fd_table[fd] = NULL;
+        // Mark epoll instance as inactive
+        extern epoll_instance_t epoll_instances[];
+        if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
+            epoll_instances[idx].active = 0;
+        return 0;
+    }
+
     if (pipe_is_end(file)) {
         pipe_close_end((pipe_end_t*)file);
         cur->fd_table[fd] = NULL;
@@ -1132,21 +1151,36 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
     vfs_file_t* file = cur->fd_table[fd];
 
     // Handle console markers: only when fd_table entry is NULL
-    // (implicit console fd). If fd_table has a real file/pipe, skip this.
     if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
-        if (cmd == 3) { // F_GETFL
+        if (cmd == F_GETFL) {
             uint32_t fl = (fd == STDIN_FD) ? O_RDONLY : O_WRONLY;
             fl |= (cur->console_flags & O_NONBLOCK);
             return fl;
         }
-        if (cmd == 4) { // F_SETFL
+        if (cmd == F_SETFL) {
             cur->console_flags = (cur->console_flags & ~O_NONBLOCK) | ((uint32_t)arg & O_NONBLOCK);
             return 0;
         }
+        if (cmd == F_GETFD) return 0;
+        if (cmd == F_SETFD) return 0;
         return -EINVAL;
     }
 
     if (!file) return -EBADF;
+
+    // Socket fd markers
+    if (IS_SOCKET_FD(file)) {
+        int idx = SOCKET_FD_IDX(file);
+        return sock_fcntl_net(idx, (int)cmd, (unsigned long)arg);
+    }
+
+    // Epoll fd markers
+    if (IS_EPOLL_FD(file)) {
+        if (cmd == F_GETFD) return 0;
+        if (cmd == F_SETFD) return 0;
+        if (cmd == F_GETFL) return O_RDWR;
+        return -EINVAL;
+    }
 
     if (pipe_is_end(file)) {
         pipe_end_t* end = (pipe_end_t*)file;
@@ -1180,6 +1214,13 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp) {
     if (fd < TASK_MAX_FDS) {
         file = cur->fd_table[fd];
     }
+
+    // Socket fd markers - route to network ioctl handler
+    if (file && IS_SOCKET_FD(file)) {
+        int idx = SOCKET_FD_IDX(file);
+        return sock_ioctl_net(idx, (unsigned long)req, (void*)argp);
+    }
+
     if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
         tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
         return tty_ioctl(tty, (unsigned long)req, (void*)argp, cur);
@@ -2212,7 +2253,6 @@ static int64_t sys_dup(uint64_t oldfd) {
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
     
-    // Find lowest available fd (start at 3 to preserve stdin/stdout/stderr semantics)
     int newfd = -1;
     for (int i = 3; i < TASK_MAX_FDS; i++) {
         if (cur->fd_table[i] == NULL) {
@@ -2221,59 +2261,37 @@ static int64_t sys_dup(uint64_t oldfd) {
         }
     }
     
-    if (newfd < 0) {
-        return -EMFILE;
-    }
+    if (newfd < 0) return -EMFILE;
     
-    // Handle stdin/stdout/stderr specially - they're virtual console fds
     if (oldfd == STDIN_FD || oldfd == STDOUT_FD || oldfd == STDERR_FD) {
-        // For console fds, we create a "marker" that indicates this is a console dup
-        // We'll use a special value - actually, let's just return the new fd
-        // and handle reads/writes to it by checking if fd_table entry is NULL
-        // For simplicity, return success and treat NULL entries for low fds as console
-        // Actually, let's store a sentinel value or just treat the dup'd fd as console too
-        // Simplest: just return the new fd number and let the caller use it
-        // Since we're returning a new fd >= 3, we need write/read to handle it
-        // For now, return the newfd and we'll make console fds work differently
-        
-        // Better approach: stdin/stdout/stderr always work, duping them gives
-        // a new fd that also refers to console. Store NULL but mark it somehow.
-        // Actually easiest: return a new fd number and make sys_write/sys_read
-        // check if fd < 3 OR fd_table[fd] == NULL and fd was duped from console
-        
-        // For MVP: just return the newfd and have the user code work with it
-        // We can't easily track "this fd is a console dup" without extra state
-        // So let's return an error for now indicating dup of console not supported
-        // OR we can be clever: store a magic pointer value for console
-        
-        // Let's use approach: store (vfs_file_t*)1, (vfs_file_t*)2 as markers
-        // and check for these in read/write
-        if (oldfd == STDIN_FD) {
-            cur->fd_table[newfd] = (vfs_file_t*)1;  // Magic: stdin marker
-        } else if (oldfd == STDOUT_FD) {
-            cur->fd_table[newfd] = (vfs_file_t*)2;  // Magic: stdout marker  
-        } else {
-            cur->fd_table[newfd] = (vfs_file_t*)3;  // Magic: stderr marker
-        }
+        cur->fd_table[newfd] = (vfs_file_t*)(oldfd + 1);
         return newfd;
     }
     
-    if (oldfd >= TASK_MAX_FDS || cur->fd_table[oldfd] == NULL) {
-        return -EBADF;
-    }
+    if (oldfd >= TASK_MAX_FDS || cur->fd_table[oldfd] == NULL) return -EBADF;
     
-    // Check for magic console markers
     uint64_t marker = (uint64_t)cur->fd_table[oldfd];
     if (marker >= 1 && marker <= 3) {
-        cur->fd_table[newfd] = cur->fd_table[oldfd];  // Copy the marker
+        cur->fd_table[newfd] = cur->fd_table[oldfd];
+        return newfd;
+    }
+
+    if (IS_SOCKET_FD(cur->fd_table[oldfd])) {
+        int idx = SOCKET_FD_IDX(cur->fd_table[oldfd]);
+        net_socket_t* s = sock_get(idx);
+        if (s) s->ref_count++;
+        cur->fd_table[newfd] = cur->fd_table[oldfd];
+        return newfd;
+    }
+
+    if (IS_EPOLL_FD(cur->fd_table[oldfd])) {
+        cur->fd_table[newfd] = cur->fd_table[oldfd];
         return newfd;
     }
 
     if (pipe_is_end(cur->fd_table[oldfd])) {
         pipe_end_t* new_end = pipe_dup_end((pipe_end_t*)cur->fd_table[oldfd]);
-        if (!new_end) {
-            return -ENOMEM;
-        }
+        if (!new_end) return -ENOMEM;
         cur->fd_table[newfd] = (vfs_file_t*)new_end;
         return newfd;
     }
@@ -2286,61 +2304,56 @@ static int64_t sys_dup(uint64_t oldfd) {
 static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd) {
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
+    if (newfd >= TASK_MAX_FDS) return -EBADF;
+    if (oldfd == newfd) return newfd;
     
-    if (newfd >= TASK_MAX_FDS) {
-        return -EBADF;
-    }
-    
-    if (oldfd == newfd) {
-        return newfd;
-    }
-    
-    // Close newfd if it was open (but not if it's a console fd 0-2)
+    // Close newfd if open
     if (newfd >= 3 && cur->fd_table[newfd]) {
-        uint64_t marker = (uint64_t)cur->fd_table[newfd];
-        if (marker >= 1 && marker <= 3) {
-            // It's a console dup marker, just overwrite
-        } else if (pipe_is_end(cur->fd_table[newfd])) {
-            pipe_close_end((pipe_end_t*)cur->fd_table[newfd]);
-        } else {
-            vfs_close(cur->fd_table[newfd]);
-        }
+        sys_close(newfd);
     }
     
-    // Handle stdin/stdout/stderr specially - they're virtual console fds
     if (oldfd == STDIN_FD || oldfd == STDOUT_FD || oldfd == STDERR_FD) {
-        if (oldfd == STDIN_FD) {
-            cur->fd_table[newfd] = (vfs_file_t*)1;  // Magic: stdin marker
-        } else if (oldfd == STDOUT_FD) {
-            cur->fd_table[newfd] = (vfs_file_t*)2;  // Magic: stdout marker
-        } else {
-            cur->fd_table[newfd] = (vfs_file_t*)3;  // Magic: stderr marker
-        }
+        cur->fd_table[newfd] = (vfs_file_t*)(oldfd + 1);
         return newfd;
     }
     
-    if (oldfd >= TASK_MAX_FDS || cur->fd_table[oldfd] == NULL) {
-        return -EBADF;
-    }
+    if (oldfd >= TASK_MAX_FDS || cur->fd_table[oldfd] == NULL) return -EBADF;
     
-    // Check for magic console markers
     uint64_t marker = (uint64_t)cur->fd_table[oldfd];
     if (marker >= 1 && marker <= 3) {
-        cur->fd_table[newfd] = cur->fd_table[oldfd];  // Copy the marker
+        cur->fd_table[newfd] = cur->fd_table[oldfd];
+        return newfd;
+    }
+
+    if (IS_SOCKET_FD(cur->fd_table[oldfd])) {
+        int idx = SOCKET_FD_IDX(cur->fd_table[oldfd]);
+        net_socket_t* s = sock_get(idx);
+        if (s) s->ref_count++;
+        cur->fd_table[newfd] = cur->fd_table[oldfd];
+        return newfd;
+    }
+
+    if (IS_EPOLL_FD(cur->fd_table[oldfd])) {
+        cur->fd_table[newfd] = cur->fd_table[oldfd];
         return newfd;
     }
 
     if (pipe_is_end(cur->fd_table[oldfd])) {
         pipe_end_t* new_end = pipe_dup_end((pipe_end_t*)cur->fd_table[oldfd]);
-        if (!new_end) {
-            return -ENOMEM;
-        }
+        if (!new_end) return -ENOMEM;
         cur->fd_table[newfd] = (vfs_file_t*)new_end;
         return newfd;
     }
     
     cur->fd_table[newfd] = vfs_dup(cur->fd_table[oldfd]);
     return newfd;
+}
+
+// SYS_DUP3 - duplicate file descriptor with flags
+static int64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags) {
+    if (oldfd == newfd) return -EINVAL;
+    (void)flags;  // O_CLOEXEC accepted but not enforced
+    return sys_dup2(oldfd, newfd);
 }
 
 // SYS_GETPID - get process ID (thread group ID)
@@ -4191,6 +4204,141 @@ static int64_t sys_klogctl(uint64_t type, uint64_t bufp, uint64_t len) {
     }
 }
 
+// Helper: extract socket index from a process fd (via fd_table marker)
+static int sock_idx_from_fd(uint64_t fd) {
+    task_t* cur = sched_current();
+    if (!cur || fd >= TASK_MAX_FDS) return -EBADF;
+    void* entry = cur->fd_table[fd];
+    if (!entry) return -EBADF;
+    if (!IS_SOCKET_FD(entry)) return -ENOTSOCK;
+    return SOCKET_FD_IDX(entry);
+}
+
+// Helper: extract epoll index from a process fd
+static int epoll_idx_from_fd(uint64_t fd) {
+    task_t* cur = sched_current();
+    if (!cur || fd >= TASK_MAX_FDS) return -EBADF;
+    void* entry = cur->fd_table[fd];
+    if (!entry) return -EBADF;
+    if (!IS_EPOLL_FD(entry)) return -EBADF;
+    return EPOLL_FD_IDX(entry);
+}
+
+// ---------------------------------------------------------------------------
+// Noinline helpers for syscalls with large stack-allocated buffers.
+// Keeping these out of syscall_handler_inner prevents the compiler from
+// reserving stack space for ALL local arrays at function entry, which was
+// blowing past the 8 KB kernel stack.
+// ---------------------------------------------------------------------------
+
+__attribute__((noinline))
+static int64_t sys_select_wrapper(uint64_t a1, uint64_t a2, uint64_t a3,
+                                  uint64_t a4, uint64_t a5) {
+    fd_set kr, kw, ke;
+    fd_set* rp = NULL, *wp = NULL, *ep = NULL;
+    if (a2 && validate_user_ptr(a2, sizeof(fd_set))) { copy_from_user(&kr, (void*)a2, sizeof(fd_set)); rp = &kr; }
+    if (a3 && validate_user_ptr(a3, sizeof(fd_set))) { copy_from_user(&kw, (void*)a3, sizeof(fd_set)); wp = &kw; }
+    if (a4 && validate_user_ptr(a4, sizeof(fd_set))) { copy_from_user(&ke, (void*)a4, sizeof(fd_set)); ep = &ke; }
+    uint64_t timeout_ticks = (uint64_t)-1;
+    if (a5 && validate_user_ptr(a5, 16)) {
+        uint64_t tv_sec = 0, tv_usec = 0;
+        copy_from_user(&tv_sec, (void*)a5, 8);
+        copy_from_user(&tv_usec, (void*)(a5 + 8), 8);
+        timeout_ticks = tv_sec * 100 + tv_usec / 10000;
+        if (tv_sec == 0 && tv_usec == 0) timeout_ticks = 0;
+    }
+    int ret = sys_select_internal((int)a1, rp, wp, ep, timeout_ticks);
+    if (rp && a2) copy_to_user((void*)a2, rp, sizeof(fd_set));
+    if (wp && a3) copy_to_user((void*)a3, wp, sizeof(fd_set));
+    if (ep && a4) copy_to_user((void*)a4, ep, sizeof(fd_set));
+    return ret;
+}
+
+__attribute__((noinline))
+static int64_t sys_pselect6_wrapper(uint64_t a1, uint64_t a2, uint64_t a3,
+                                    uint64_t a4, uint64_t a5) {
+    fd_set kr, kw, ke;
+    fd_set* rp = NULL, *wp = NULL, *ep = NULL;
+    if (a2 && validate_user_ptr(a2, sizeof(fd_set))) { copy_from_user(&kr, (void*)a2, sizeof(fd_set)); rp = &kr; }
+    if (a3 && validate_user_ptr(a3, sizeof(fd_set))) { copy_from_user(&kw, (void*)a3, sizeof(fd_set)); wp = &kw; }
+    if (a4 && validate_user_ptr(a4, sizeof(fd_set))) { copy_from_user(&ke, (void*)a4, sizeof(fd_set)); ep = &ke; }
+    uint64_t timeout_ticks = (uint64_t)-1;
+    if (a5 && validate_user_ptr(a5, 16)) {
+        uint64_t tv_sec = 0;
+        long tv_nsec = 0;
+        copy_from_user(&tv_sec, (void*)a5, 8);
+        copy_from_user(&tv_nsec, (void*)(a5 + 8), 8);
+        timeout_ticks = tv_sec * 100 + (uint64_t)tv_nsec / 10000000;
+        if (tv_sec == 0 && tv_nsec == 0) timeout_ticks = 0;
+    }
+    int ret = sys_select_internal((int)a1, rp, wp, ep, timeout_ticks);
+    if (rp && a2) copy_to_user((void*)a2, rp, sizeof(fd_set));
+    if (wp && a3) copy_to_user((void*)a3, wp, sizeof(fd_set));
+    if (ep && a4) copy_to_user((void*)a4, ep, sizeof(fd_set));
+    return ret;
+}
+
+__attribute__((noinline))
+static int64_t sys_poll_wrapper(uint64_t a1, uint64_t a2, uint64_t a3) {
+    int nfds = (int)a2;
+    if (nfds < 0 || nfds > 256) return -EINVAL;
+    size_t sz = (size_t)nfds * sizeof(struct pollfd);
+    if (!validate_user_ptr(a1, sz)) return -EFAULT;
+    struct pollfd kfds[256];
+    copy_from_user(kfds, (void*)a1, sz);
+    int timeout_ms = (int)(int64_t)a3;
+    uint64_t timeout_ticks;
+    if (timeout_ms < 0) timeout_ticks = (uint64_t)-1;
+    else if (timeout_ms == 0) timeout_ticks = 0;
+    else timeout_ticks = (uint64_t)timeout_ms / 10;
+    int ret = sys_poll_internal(kfds, nfds, timeout_ticks);
+    copy_to_user((void*)a1, kfds, sz);
+    return ret;
+}
+
+__attribute__((noinline))
+static int64_t sys_ppoll_wrapper(uint64_t a1, uint64_t a2, uint64_t a3) {
+    int nfds = (int)a2;
+    if (nfds < 0 || nfds > 256) return -EINVAL;
+    size_t sz = (size_t)nfds * sizeof(struct pollfd);
+    if (!validate_user_ptr(a1, sz)) return -EFAULT;
+    struct pollfd kfds[256];
+    copy_from_user(kfds, (void*)a1, sz);
+    uint64_t timeout_ticks = (uint64_t)-1;
+    if (a3 && validate_user_ptr(a3, 16)) {
+        uint64_t tv_sec = 0;
+        long tv_nsec = 0;
+        copy_from_user(&tv_sec, (void*)a3, 8);
+        copy_from_user(&tv_nsec, (void*)(a3 + 8), 8);
+        timeout_ticks = tv_sec * 100 + (uint64_t)tv_nsec / 10000000;
+        if (tv_sec == 0 && tv_nsec == 0) timeout_ticks = 0;
+    }
+    int ret = sys_poll_internal(kfds, nfds, timeout_ticks);
+    copy_to_user((void*)a1, kfds, sz);
+    return ret;
+}
+
+__attribute__((noinline))
+static int64_t sys_epoll_wait_wrapper(uint64_t a1, uint64_t a2, uint64_t a3,
+                                      uint64_t a4) {
+    int ep_idx = epoll_idx_from_fd(a1);
+    if (ep_idx < 0) return ep_idx;
+    int maxevents = (int)a3;
+    if (maxevents <= 0 || maxevents > 256) return -EINVAL;
+    size_t sz = (size_t)maxevents * sizeof(struct epoll_event);
+    if (!validate_user_ptr(a2, sz)) return -EFAULT;
+    struct epoll_event kevs[256];
+    int timeout_ms = (int)(int64_t)a4;
+    uint64_t timeout_ticks;
+    if (timeout_ms < 0) timeout_ticks = (uint64_t)-1;
+    else if (timeout_ms == 0) timeout_ticks = 0;
+    else timeout_ticks = (uint64_t)timeout_ms / 10;
+    int ret = epoll_wait_internal(ep_idx, kevs, maxevents, timeout_ticks);
+    if (ret > 0)
+        copy_to_user((void*)a2, kevs, (size_t)ret * sizeof(struct epoll_event));
+    return ret;
+}
+
 // Main syscall dispatcher (inner function)
 static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2, 
                         uint64_t a3, uint64_t a4, uint64_t a5) {
@@ -4501,6 +4649,313 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 
         case SYS_SYNC:
             return sys_sync();
+
+        // ====== Socket syscalls ======
+        case SYS_SOCKET: {
+            int real_type = (int)a2 & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+            int sock_idx = sock_create((int)a1, real_type, (int)a3);
+            if (sock_idx < 0) return sock_idx;
+            // Allocate a process fd pointing to the socket
+            task_t* cur = sched_current();
+            if (!cur) { sock_close(sock_idx); return -EFAULT; }
+            for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
+                if (cur->fd_table[_fd] == NULL) {
+                    cur->fd_table[_fd] = MAKE_SOCKET_FD(sock_idx);
+                    if ((int)a2 & SOCK_NONBLOCK) {
+                        net_socket_t* _s = sock_get(sock_idx);
+                        if (_s) _s->nonblock = 1;
+                    }
+                    return _fd;
+                }
+            }
+            sock_close(sock_idx);
+            return -EMFILE;
+        }
+
+        case SYS_BIND: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            struct sockaddr_in kaddr;
+            if (!validate_user_ptr(a2, sizeof(struct sockaddr_in))) return -EFAULT;
+            copy_from_user(&kaddr, (const void*)a2, sizeof(struct sockaddr_in));
+            return sock_bind(idx, &kaddr);
+        }
+
+        case SYS_LISTEN: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            return sock_listen(idx, (int)a2);
+        }
+
+        case SYS_ACCEPT: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            struct sockaddr_in kaddr;
+            socklen_t kaddrlen = sizeof(struct sockaddr_in);
+            int new_sock_idx = sock_accept(idx, &kaddr, &kaddrlen);
+            if (new_sock_idx < 0) return new_sock_idx;
+            // Allocate fd for the new accepted socket
+            task_t* cur = sched_current();
+            if (!cur) { sock_close(new_sock_idx); return -EFAULT; }
+            for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
+                if (cur->fd_table[_fd] == NULL) {
+                    cur->fd_table[_fd] = MAKE_SOCKET_FD(new_sock_idx);
+                    if (a2 && a3) {
+                        if (validate_user_ptr(a2, sizeof(struct sockaddr_in)))
+                            copy_to_user((void*)a2, &kaddr, sizeof(struct sockaddr_in));
+                        if (validate_user_ptr(a3, sizeof(socklen_t)))
+                            copy_to_user((void*)a3, &kaddrlen, sizeof(socklen_t));
+                    }
+                    return _fd;
+                }
+            }
+            sock_close(new_sock_idx);
+            return -EMFILE;
+        }
+
+        case SYS_CONNECT: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            struct sockaddr_in kaddr;
+            if (!validate_user_ptr(a2, sizeof(struct sockaddr_in))) return -EFAULT;
+            copy_from_user(&kaddr, (const void*)a2, sizeof(struct sockaddr_in));
+            return sock_connect(idx, &kaddr);
+        }
+
+        case SYS_SENDTO: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            if (!validate_user_ptr(a2, a3)) return -EFAULT;
+            struct sockaddr_in kaddr;
+            const struct sockaddr_in* dest = NULL;
+            if (a5 && validate_user_ptr(a5, sizeof(struct sockaddr_in))) {
+                copy_from_user(&kaddr, (const void*)a5, sizeof(struct sockaddr_in));
+                dest = &kaddr;
+            }
+            return sock_sendto(idx, (const void*)a2, (size_t)a3, (int)a4, dest, dest ? sizeof(struct sockaddr_in) : 0);
+        }
+
+        case SYS_RECVFROM: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            if (!validate_user_ptr(a2, a3)) return -EFAULT;
+            struct sockaddr_in kaddr;
+            socklen_t kaddrlen = sizeof(struct sockaddr_in);
+            int ret = sock_recvfrom(idx, (void*)a2, (size_t)a3, (int)a4, &kaddr, &kaddrlen);
+            if (ret >= 0 && a5 && validate_user_ptr(a5, sizeof(struct sockaddr_in)))
+                copy_to_user((void*)a5, &kaddr, sizeof(struct sockaddr_in));
+            return ret;
+        }
+
+        case SYS_SEND: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            if (!validate_user_ptr(a2, a3)) return -EFAULT;
+            return sock_send(idx, (const void*)a2, (size_t)a3, (int)a4);
+        }
+
+        case SYS_RECV: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            if (!validate_user_ptr(a2, a3)) return -EFAULT;
+            return sock_recv(idx, (void*)a2, (size_t)a3, (int)a4);
+        }
+
+        case SYS_SHUTDOWN: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            return sock_shutdown(idx, (int)a2);
+        }
+
+        case SYS_SETSOCKOPT: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            if (a4 && a5 > 0 && !validate_user_ptr(a4, a5)) return -EFAULT;
+            return sock_setsockopt(idx, (int)a2, (int)a3, (const void*)a4, (socklen_t)a5);
+        }
+
+        case SYS_GETSOCKOPT: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            socklen_t koptlen = 0;
+            if (a5 && validate_user_ptr(a5, sizeof(socklen_t)))
+                copy_from_user(&koptlen, (const void*)a5, sizeof(socklen_t));
+            if (a4 && koptlen > 0 && !validate_user_ptr(a4, koptlen)) return -EFAULT;
+            int ret = sock_getsockopt(idx, (int)a2, (int)a3, (void*)a4, &koptlen);
+            if (ret == 0 && a5 && validate_user_ptr(a5, sizeof(socklen_t)))
+                copy_to_user((void*)a5, &koptlen, sizeof(socklen_t));
+            return ret;
+        }
+
+        case SYS_GETPEERNAME: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            struct sockaddr_in kaddr;
+            socklen_t kaddrlen = sizeof(struct sockaddr_in);
+            int ret = sock_getpeername(idx, &kaddr, &kaddrlen);
+            if (ret == 0 && a2 && validate_user_ptr(a2, sizeof(struct sockaddr_in)))
+                copy_to_user((void*)a2, &kaddr, sizeof(struct sockaddr_in));
+            if (ret == 0 && a3 && validate_user_ptr(a3, sizeof(socklen_t)))
+                copy_to_user((void*)a3, &kaddrlen, sizeof(socklen_t));
+            return ret;
+        }
+
+        case SYS_GETSOCKNAME: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            struct sockaddr_in kaddr;
+            socklen_t kaddrlen = sizeof(struct sockaddr_in);
+            int ret = sock_getsockname(idx, &kaddr, &kaddrlen);
+            if (ret == 0 && a2 && validate_user_ptr(a2, sizeof(struct sockaddr_in)))
+                copy_to_user((void*)a2, &kaddr, sizeof(struct sockaddr_in));
+            if (ret == 0 && a3 && validate_user_ptr(a3, sizeof(socklen_t)))
+                copy_to_user((void*)a3, &kaddrlen, sizeof(socklen_t));
+            return ret;
+        }
+
+        case SYS_SOCKETPAIR: {
+            if (!validate_user_ptr(a4, 2 * sizeof(int))) return -EFAULT;
+            int sv[2];
+            int ret = sock_socketpair((int)a1, (int)a2, (int)a3, sv);
+            if (ret < 0) return ret;
+            // Allocate two process fds
+            task_t* cur = sched_current();
+            if (!cur) { sock_close(sv[0]); sock_close(sv[1]); return -EFAULT; }
+            int ufd[2] = {-1, -1};
+            for (int _fd = 3; _fd < TASK_MAX_FDS && (ufd[0] < 0 || ufd[1] < 0); _fd++) {
+                if (cur->fd_table[_fd] == NULL) {
+                    if (ufd[0] < 0) ufd[0] = _fd;
+                    else ufd[1] = _fd;
+                }
+            }
+            if (ufd[0] < 0 || ufd[1] < 0) {
+                sock_close(sv[0]); sock_close(sv[1]);
+                return -EMFILE;
+            }
+            cur->fd_table[ufd[0]] = MAKE_SOCKET_FD(sv[0]);
+            cur->fd_table[ufd[1]] = MAKE_SOCKET_FD(sv[1]);
+            copy_to_user((void*)a4, ufd, 2 * sizeof(int));
+            return 0;
+        }
+
+        case SYS_ACCEPT4: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            struct sockaddr_in kaddr;
+            socklen_t kaddrlen = sizeof(struct sockaddr_in);
+            int new_sock_idx = sock_accept4(idx, &kaddr, &kaddrlen, (int)a4);
+            if (new_sock_idx < 0) return new_sock_idx;
+            task_t* cur = sched_current();
+            if (!cur) { sock_close(new_sock_idx); return -EFAULT; }
+            for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
+                if (cur->fd_table[_fd] == NULL) {
+                    cur->fd_table[_fd] = MAKE_SOCKET_FD(new_sock_idx);
+                    if (a2 && a3) {
+                        if (validate_user_ptr(a2, sizeof(struct sockaddr_in)))
+                            copy_to_user((void*)a2, &kaddr, sizeof(struct sockaddr_in));
+                        if (validate_user_ptr(a3, sizeof(socklen_t)))
+                            copy_to_user((void*)a3, &kaddrlen, sizeof(socklen_t));
+                    }
+                    return _fd;
+                }
+            }
+            sock_close(new_sock_idx);
+            return -EMFILE;
+        }
+
+        case SYS_SENDMSG: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            if (!validate_user_ptr(a2, sizeof(struct msghdr))) return -EFAULT;
+            struct msghdr kmsg;
+            copy_from_user(&kmsg, (const void*)a2, sizeof(struct msghdr));
+            return sock_sendmsg(idx, &kmsg, (int)a3);
+        }
+
+        case SYS_RECVMSG: {
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
+            if (!validate_user_ptr(a2, sizeof(struct msghdr))) return -EFAULT;
+            struct msghdr kmsg;
+            copy_from_user(&kmsg, (const void*)a2, sizeof(struct msghdr));
+            int ret = sock_recvmsg(idx, &kmsg, (int)a3);
+            if (ret >= 0)
+                copy_to_user((void*)a2, &kmsg, sizeof(struct msghdr));
+            return ret;
+        }
+
+        case SYS_SENDFILE: {
+            int64_t koffset = 0;
+            int64_t* koffp = NULL;
+            if (a3) {
+                if (!validate_user_ptr(a3, sizeof(int64_t))) return -EFAULT;
+                copy_from_user(&koffset, (void*)a3, sizeof(int64_t));
+                koffp = &koffset;
+            }
+            int ret = sock_sendfile((int)a1, (int)a2, koffp, (size_t)a4);
+            if (a3 && ret >= 0) {
+                copy_to_user((void*)a3, &koffset, sizeof(int64_t));
+            }
+            return ret;
+        }
+
+        case SYS_SELECT:
+            return sys_select_wrapper(a1, a2, a3, a4, a5);
+
+        case SYS_PSELECT6:
+            return sys_pselect6_wrapper(a1, a2, a3, a4, a5);
+
+        case SYS_POLL:
+            return sys_poll_wrapper(a1, a2, a3);
+
+        case SYS_PPOLL:
+            return sys_ppoll_wrapper(a1, a2, a3);
+
+        case SYS_EPOLL_CREATE: {
+            int ep_idx = epoll_create_internal(0);
+            if (ep_idx < 0) return ep_idx;
+            task_t* cur = sched_current();
+            if (!cur) return -EFAULT;
+            for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
+                if (cur->fd_table[_fd] == NULL) {
+                    cur->fd_table[_fd] = MAKE_EPOLL_FD(ep_idx);
+                    return _fd;
+                }
+            }
+            return -EMFILE;
+        }
+
+        case SYS_EPOLL_CREATE1: {
+            int ep_idx = epoll_create_internal((int)a1);
+            if (ep_idx < 0) return ep_idx;
+            task_t* cur = sched_current();
+            if (!cur) return -EFAULT;
+            for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
+                if (cur->fd_table[_fd] == NULL) {
+                    cur->fd_table[_fd] = MAKE_EPOLL_FD(ep_idx);
+                    return _fd;
+                }
+            }
+            return -EMFILE;
+        }
+
+        case SYS_EPOLL_CTL: {
+            int ep_idx = epoll_idx_from_fd(a1);
+            if (ep_idx < 0) return ep_idx;
+            struct epoll_event kev;
+            if (a4 && validate_user_ptr(a4, sizeof(struct epoll_event)))
+                copy_from_user(&kev, (void*)a4, sizeof(struct epoll_event));
+            return epoll_ctl_internal(ep_idx, (int)a2, (int)a3, a4 ? &kev : NULL);
+        }
+
+        case SYS_EPOLL_WAIT:
+            return sys_epoll_wait_wrapper(a1, a2, a3, a4);
+
+        case SYS_EPOLL_PWAIT:
+            return sys_epoll_wait_wrapper(a1, a2, a3, a4);
+
+        case SYS_DUP3:
+            return sys_dup3(a1, a2, a3);
             
         default:
             return -ENOSYS;

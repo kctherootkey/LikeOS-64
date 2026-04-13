@@ -8,6 +8,7 @@
 #include <kernel/console.h>
 #include <kernel/vfs.h>
 #include <kernel/pipe.h>
+#include <kernel/net.h>
 #include <kernel/smp.h>
 
 // ============================================================================
@@ -497,6 +498,16 @@ uint64_t elf_exec_replace(const char* path, char* const argv[],
             uint64_t marker = (uint64_t)cur->fd_table[i];
             if (marker >= 1 && marker <= 3) {
                 cur->fd_table[i] = NULL;
+            } else if (IS_SOCKET_FD(cur->fd_table[i])) {
+                int idx = SOCKET_FD_IDX(cur->fd_table[i]);
+                cur->fd_table[i] = NULL;
+                sock_close(idx);
+            } else if (IS_EPOLL_FD(cur->fd_table[i])) {
+                int idx = EPOLL_FD_IDX(cur->fd_table[i]);
+                cur->fd_table[i] = NULL;
+                extern epoll_instance_t epoll_instances[];
+                if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
+                    epoll_instances[idx].active = 0;
             } else if (pipe_is_end(cur->fd_table[i])) {
                 pipe_close_end((pipe_end_t*)cur->fd_table[i]);
                 cur->fd_table[i] = NULL;
