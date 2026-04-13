@@ -46,11 +46,16 @@ static uint32_t dhcp_xid = 0;
 static uint32_t dhcp_server_ip = 0;
 static uint32_t dhcp_offered_ip = 0;
 
+// Offset of the variable-length options[] field inside dhcp_packet_t.
+// sizeof(dhcp_packet_t) includes a fixed 312-byte options array, but real
+// DHCP packets may be shorter.  All size checks must use this constant.
+#define DHCP_FIXED_HDR  240
+
 // Build DHCP packet with given message type
 static int dhcp_build_packet(net_device_t* dev, uint8_t msg_type,
                               uint32_t requested_ip, uint32_t server_ip,
                               uint8_t* buf, int buflen) {
-    if (buflen < (int)sizeof(dhcp_packet_t) + 64) return -1;
+    if (buflen < DHCP_FIXED_HDR + 4) return -1;  // need at least header + minimal options
 
     dhcp_packet_t* dhcp = (dhcp_packet_t*)buf;
     for (int i = 0; i < buflen; i++) buf[i] = 0;
@@ -88,21 +93,19 @@ static int dhcp_build_packet(net_device_t* dev, uint8_t msg_type,
         if (requested_ip != 0) {
             opt[pos++] = DHCP_OPT_REQ_IP;
             opt[pos++] = 4;
-            uint32_t rip = net_htonl(requested_ip);
-            opt[pos++] = (rip >> 24) & 0xFF;
-            opt[pos++] = (rip >> 16) & 0xFF;
-            opt[pos++] = (rip >> 8) & 0xFF;
-            opt[pos++] = rip & 0xFF;
+            opt[pos++] = (requested_ip >> 24) & 0xFF;
+            opt[pos++] = (requested_ip >> 16) & 0xFF;
+            opt[pos++] = (requested_ip >> 8) & 0xFF;
+            opt[pos++] = requested_ip & 0xFF;
         }
         // Server identifier
         if (server_ip != 0) {
             opt[pos++] = DHCP_OPT_SERVER_ID;
             opt[pos++] = 4;
-            uint32_t sid = net_htonl(server_ip);
-            opt[pos++] = (sid >> 24) & 0xFF;
-            opt[pos++] = (sid >> 16) & 0xFF;
-            opt[pos++] = (sid >> 8) & 0xFF;
-            opt[pos++] = sid & 0xFF;
+            opt[pos++] = (server_ip >> 24) & 0xFF;
+            opt[pos++] = (server_ip >> 16) & 0xFF;
+            opt[pos++] = (server_ip >> 8) & 0xFF;
+            opt[pos++] = server_ip & 0xFF;
         }
     }
 
@@ -116,7 +119,7 @@ static int dhcp_build_packet(net_device_t* dev, uint8_t msg_type,
     // End
     opt[pos++] = DHCP_OPT_END;
 
-    return sizeof(dhcp_packet_t) + pos;
+    return DHCP_FIXED_HDR + pos;
 }
 
 // Send a DHCP packet via UDP broadcast
@@ -181,7 +184,10 @@ static void dhcp_parse_options(const uint8_t* options, int optlen,
 
 // Process received DHCP packet (called from udp_rx for port 68)
 void dhcp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
-    if (len < sizeof(dhcp_packet_t)) return;
+
+    // Minimum: fixed DHCP header up to (and including) magic_cookie + at least
+    // 1 byte of options.
+    if (len < DHCP_FIXED_HDR + 1) return;
 
     const dhcp_packet_t* dhcp = (const dhcp_packet_t*)data;
 
@@ -190,8 +196,8 @@ void dhcp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
     if (net_ntohl(dhcp->xid) != dhcp_xid) return;
     if (net_ntohl(dhcp->magic_cookie) != DHCP_MAGIC_COOKIE) return;
 
-    // Parse options
-    int optlen = len - sizeof(dhcp_packet_t);
+    // Parse options (variable-length tail after the fixed header)
+    int optlen = (int)len - DHCP_FIXED_HDR;
     if (optlen <= 0) return;
 
     uint8_t msg_type = 0;

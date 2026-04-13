@@ -169,6 +169,10 @@ void continue_system_startup(void) {
     // Enable interrupts (SCI stays masked — no EC event storm).
     __asm__ volatile ("sti");
 
+    // Send DHCP DISCOVER now that interrupts are enabled and the E1000
+    // can actually receive the OFFER response.
+    net_start_dhcp();
+
     timer_init(100);
 
     // Use LAPIC timer when available — it was already calibrated in smp_init()

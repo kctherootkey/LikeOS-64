@@ -123,7 +123,40 @@
 #define E1000_TIPG_IPGR2    (10 << 20)
 
 // ============================================================================
-// Extended RX Descriptor (Read format)
+// Legacy RX Descriptor (used by 82540EM, 82545EM, and compatible with 82574L)
+// ============================================================================
+typedef struct __attribute__((packed)) {
+    uint64_t buffer_addr;       // Physical address of receive buffer
+    uint16_t length;            // Packet length
+    uint16_t checksum;          // Packet checksum
+    uint8_t  status;            // Descriptor status
+    uint8_t  errors;            // Descriptor errors
+    uint16_t special;           // VLAN tag / special
+} e1000_rx_desc_legacy_t;
+
+// Legacy RX Status bits
+#define E1000_RXD_STAT_DD       (1 << 0)    // Descriptor Done
+#define E1000_RXD_STAT_EOP      (1 << 1)    // End of Packet
+
+// Legacy TX Descriptor
+typedef struct __attribute__((packed)) {
+    uint64_t buffer_addr;       // Physical address of transmit buffer
+    uint16_t length;            // Data length
+    uint8_t  cso;               // Checksum Offset
+    uint8_t  cmd;               // Command
+    uint8_t  status;            // Status (DD at bit 0)
+    uint8_t  css;               // Checksum Start
+    uint16_t special;           // Special / VLAN
+} e1000_tx_desc_legacy_t;
+
+// Legacy TX Command bits
+#define E1000_TXD_CMD_EOP       (1 << 0)    // End of Packet
+#define E1000_TXD_CMD_IFCS      (1 << 1)    // Insert FCS
+#define E1000_TXD_CMD_RS        (1 << 3)    // Report Status
+#define E1000_TXD_STAT_DD       (1 << 0)    // Descriptor Done
+
+// ============================================================================
+// Extended RX Descriptor (Read format) — for 82574L only
 // ============================================================================
 typedef struct __attribute__((packed)) {
     uint64_t buffer_addr;       // Address of the receive buffer
@@ -205,15 +238,15 @@ typedef struct {
     uint64_t mmio_phys;             // Physical address of BAR0
     uint32_t mmio_size;             // Size of MMIO region
 
-    // RX ring
-    e1000_rx_desc_ext_t* rx_descs;  // RX descriptor ring (DMA)
+    // RX ring (legacy descriptors — compatible with all e1000 variants)
+    e1000_rx_desc_legacy_t* rx_descs;  // RX descriptor ring (DMA)
     uint64_t rx_descs_phys;         // Physical address of RX ring
     uint8_t* rx_bufs[E1000_NUM_RX_DESC]; // RX packet buffers
     uint64_t rx_bufs_phys[E1000_NUM_RX_DESC];
     uint16_t rx_tail;               // Software RX tail
 
-    // TX ring
-    e1000_tx_desc_ext_t* tx_descs;  // TX descriptor ring (DMA)
+    // TX ring (legacy descriptors)
+    e1000_tx_desc_legacy_t* tx_descs;  // TX descriptor ring (DMA)
     uint64_t tx_descs_phys;         // Physical address of TX ring
     uint8_t* tx_bufs[E1000_NUM_TX_DESC]; // TX packet buffers
     uint64_t tx_bufs_phys[E1000_NUM_TX_DESC];
