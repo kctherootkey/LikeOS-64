@@ -15,7 +15,12 @@
 
 // Address families
 #define AF_UNSPEC       0
+#define AF_UNIX         1
+#define AF_LOCAL        AF_UNIX
 #define AF_INET         2
+#define PF_UNSPEC       AF_UNSPEC
+#define PF_UNIX         AF_UNIX
+#define PF_LOCAL        AF_LOCAL
 #define PF_INET         AF_INET
 
 // Socket option levels

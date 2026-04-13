@@ -4,17 +4,126 @@
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/syscall.h"
+#include "../../include/kernel/random.h"
 
 // TCP connection table
 static tcp_conn_t tcp_connections[TCP_MAX_CONNECTIONS];
 static spinlock_t tcp_lock = SPINLOCK_INIT("tcp");
 
-// Simple pseudo-random ISN generator
-static uint32_t tcp_isn_counter = 0;
+// ISN secret key (generated once at init, 128-bit for SipHash-2-4)
+static uint8_t tcp_isn_secret[16];
 
-static uint32_t tcp_generate_isn(void) {
-    tcp_isn_counter += timer_ticks() * 1000 + 12345;
-    return tcp_isn_counter;
+// SYN cookie secret (separate from ISN secret)
+static uint8_t tcp_syncookie_secret[16];
+
+// RFC 6528: ISN = hash(secret, src_ip, dst_ip, src_port, dst_port) + time_counter
+// Time counter advances ~64K per second
+static uint32_t tcp_generate_isn(uint32_t src_ip, uint32_t dst_ip,
+                                  uint16_t src_port, uint16_t dst_port) {
+    uint8_t data[12];
+    data[0]  = (uint8_t)(src_ip >> 24);
+    data[1]  = (uint8_t)(src_ip >> 16);
+    data[2]  = (uint8_t)(src_ip >> 8);
+    data[3]  = (uint8_t)(src_ip);
+    data[4]  = (uint8_t)(dst_ip >> 24);
+    data[5]  = (uint8_t)(dst_ip >> 16);
+    data[6]  = (uint8_t)(dst_ip >> 8);
+    data[7]  = (uint8_t)(dst_ip);
+    data[8]  = (uint8_t)(src_port >> 8);
+    data[9]  = (uint8_t)(src_port);
+    data[10] = (uint8_t)(dst_port >> 8);
+    data[11] = (uint8_t)(dst_port);
+
+    uint64_t hash = siphash_2_4(tcp_isn_secret, data, 12);
+
+    // Time component: advance ~64K per second (timer is 100Hz, so ticks/4 * 256)
+    uint32_t time_comp = (uint32_t)((timer_ticks() / 4) << 8);
+
+    return (uint32_t)hash + time_comp;
+}
+
+// ============================================================================
+// SYN Cookies - RFC 4987
+// ============================================================================
+// Encode MSS option as 3-bit index
+static const uint16_t syncookie_mss_table[8] = {
+    536, 1024, 1460, 1480, 4312, 8960, 1440, 1452
+};
+
+static int mss_to_index(uint16_t mss) {
+    int best = 0;
+    for (int i = 0; i < 8; i++) {
+        if (syncookie_mss_table[i] <= mss &&
+            syncookie_mss_table[i] >= syncookie_mss_table[best])
+            best = i;
+    }
+    return best;
+}
+
+static uint32_t tcp_syncookie_generate(uint32_t src_ip, uint32_t dst_ip,
+                                        uint16_t src_port, uint16_t dst_port,
+                                        uint32_t seq, uint16_t mss) {
+    uint8_t data[16];
+    uint32_t time_slot = (uint32_t)(timer_ticks() / 600); // ~6 second slots
+
+    data[0]  = (uint8_t)(src_ip >> 24);
+    data[1]  = (uint8_t)(src_ip >> 16);
+    data[2]  = (uint8_t)(src_ip >> 8);
+    data[3]  = (uint8_t)(src_ip);
+    data[4]  = (uint8_t)(dst_ip >> 24);
+    data[5]  = (uint8_t)(dst_ip >> 16);
+    data[6]  = (uint8_t)(dst_ip >> 8);
+    data[7]  = (uint8_t)(dst_ip);
+    data[8]  = (uint8_t)(src_port >> 8);
+    data[9]  = (uint8_t)(src_port);
+    data[10] = (uint8_t)(dst_port >> 8);
+    data[11] = (uint8_t)(dst_port);
+    data[12] = (uint8_t)(time_slot >> 24);
+    data[13] = (uint8_t)(time_slot >> 16);
+    data[14] = (uint8_t)(time_slot >> 8);
+    data[15] = (uint8_t)(time_slot);
+
+    uint64_t hash = siphash_2_4(tcp_syncookie_secret, data, 16);
+    int mss_idx = mss_to_index(mss);
+    // Cookie = hash[31:3] | mss_idx[2:0]
+    return ((uint32_t)(hash) & ~7U) | (uint32_t)mss_idx;
+}
+
+static int tcp_syncookie_validate(uint32_t src_ip, uint32_t dst_ip,
+                                   uint16_t src_port, uint16_t dst_port,
+                                   uint32_t cookie, uint16_t* mss_out) {
+    int mss_idx = cookie & 7;
+
+    // Try current and previous time slots
+    for (int delta = 0; delta <= 1; delta++) {
+        uint8_t data[16];
+        uint32_t time_slot = (uint32_t)(timer_ticks() / 600) - (uint32_t)delta;
+
+        data[0]  = (uint8_t)(src_ip >> 24);
+        data[1]  = (uint8_t)(src_ip >> 16);
+        data[2]  = (uint8_t)(src_ip >> 8);
+        data[3]  = (uint8_t)(src_ip);
+        data[4]  = (uint8_t)(dst_ip >> 24);
+        data[5]  = (uint8_t)(dst_ip >> 16);
+        data[6]  = (uint8_t)(dst_ip >> 8);
+        data[7]  = (uint8_t)(dst_ip);
+        data[8]  = (uint8_t)(src_port >> 8);
+        data[9]  = (uint8_t)(src_port);
+        data[10] = (uint8_t)(dst_port >> 8);
+        data[11] = (uint8_t)(dst_port);
+        data[12] = (uint8_t)(time_slot >> 24);
+        data[13] = (uint8_t)(time_slot >> 16);
+        data[14] = (uint8_t)(time_slot >> 8);
+        data[15] = (uint8_t)(time_slot);
+
+        uint64_t hash = siphash_2_4(tcp_syncookie_secret, data, 16);
+        uint32_t expected = ((uint32_t)(hash) & ~7U) | (uint32_t)mss_idx;
+        if (expected == cookie) {
+            if (mss_out) *mss_out = syncookie_mss_table[mss_idx];
+            return 1; // Valid
+        }
+    }
+    return 0; // Invalid
 }
 
 void tcp_init(void) {
@@ -22,6 +131,9 @@ void tcp_init(void) {
         tcp_connections[i].active = 0;
         tcp_connections[i].state = TCP_STATE_CLOSED;
     }
+    // Generate ISN and SYN cookie secrets from CSPRNG
+    random_get_bytes(tcp_isn_secret, sizeof(tcp_isn_secret), 0);
+    random_get_bytes(tcp_syncookie_secret, sizeof(tcp_syncookie_secret), 0);
 }
 
 static tcp_conn_t* tcp_alloc_conn(void) {
@@ -192,7 +304,7 @@ tcp_conn_t* tcp_connect(net_device_t* dev, uint32_t dst_ip,
     conn->remote_ip = dst_ip;
     conn->local_port = src_port;
     conn->remote_port = dst_port;
-    conn->iss = tcp_generate_isn();
+    conn->iss = tcp_generate_isn(dev->ip_addr, dst_ip, src_port, dst_port);
     conn->snd_una = conn->iss;
     conn->snd_nxt = conn->iss + 1;
     conn->snd_wnd = TCP_WINDOW_SIZE;
@@ -386,6 +498,18 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t le
         // Check for listener
         tcp_conn_t* listener = tcp_find_listener(dst_port);
         if (listener && (tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK)) {
+            // Check if accept queue is full — use SYN cookies if so
+            int queue_used = (listener->accept_tail - listener->accept_head + 16) % 16;
+            if (queue_used >= listener->backlog) {
+                // Accept queue full: respond with SYN cookie instead of allocating state
+                uint32_t cookie = tcp_syncookie_generate(
+                    src_ip, local_ip, src_port, dst_port, seq, TCP_MSS);
+                tcp_send_segment(dev, local_ip, src_ip, dst_port, src_port,
+                                 cookie, seq + 1,
+                                 TCP_SYN | TCP_ACK, TCP_WINDOW_SIZE, NULL, 0);
+                return;
+            }
+
             // New connection on listening socket
             uint64_t flags;
             spin_lock_irqsave(&tcp_lock, &flags);
@@ -393,6 +517,12 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t le
             tcp_conn_t* new_conn = tcp_alloc_conn();
             if (!new_conn) {
                 spin_unlock_irqrestore(&tcp_lock, flags);
+                // Fallback to SYN cookie
+                uint32_t cookie = tcp_syncookie_generate(
+                    src_ip, local_ip, src_port, dst_port, seq, TCP_MSS);
+                tcp_send_segment(dev, local_ip, src_ip, dst_port, src_port,
+                                 cookie, seq + 1,
+                                 TCP_SYN | TCP_ACK, TCP_WINDOW_SIZE, NULL, 0);
                 return;
             }
 
@@ -401,7 +531,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t le
             new_conn->remote_ip = src_ip;
             new_conn->local_port = dst_port;
             new_conn->remote_port = src_port;
-            new_conn->iss = tcp_generate_isn();
+            new_conn->iss = tcp_generate_isn(local_ip, src_ip, dst_port, src_port);
             new_conn->irs = seq;
             new_conn->snd_una = new_conn->iss;
             new_conn->snd_nxt = new_conn->iss + 1;
@@ -418,6 +548,50 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t le
                              new_conn->iss, new_conn->rcv_nxt,
                              TCP_SYN | TCP_ACK, TCP_WINDOW_SIZE, NULL, 0);
             return;
+        }
+
+        // SYN cookie validation: ACK for unknown connection with a listener
+        if (listener && (tcp_flags & TCP_ACK) && !(tcp_flags & TCP_SYN)) {
+            uint32_t cookie = ack - 1; // The ISN we sent was cookie, client ACKs cookie+1
+            uint16_t cookie_mss = 0;
+            if (tcp_syncookie_validate(src_ip, local_ip, src_port, dst_port,
+                                       cookie, &cookie_mss)) {
+                // Valid SYN cookie - create connection directly in ESTABLISHED state
+                uint64_t flags;
+                spin_lock_irqsave(&tcp_lock, &flags);
+
+                tcp_conn_t* new_conn = tcp_alloc_conn();
+                if (!new_conn) {
+                    spin_unlock_irqrestore(&tcp_lock, flags);
+                    return;
+                }
+
+                new_conn->dev = dev;
+                new_conn->local_ip = local_ip;
+                new_conn->remote_ip = src_ip;
+                new_conn->local_port = dst_port;
+                new_conn->remote_port = src_port;
+                new_conn->iss = cookie;
+                new_conn->irs = seq - 1;
+                new_conn->snd_una = cookie + 1;
+                new_conn->snd_nxt = cookie + 1;
+                new_conn->rcv_nxt = seq;
+                new_conn->snd_wnd = window;
+                new_conn->rcv_wnd = TCP_WINDOW_SIZE;
+                new_conn->state = TCP_STATE_ESTABLISHED;
+                new_conn->parent = listener;
+
+                // Enqueue to listener accept queue
+                int next_tail = (listener->accept_tail + 1) % 16;
+                if (next_tail != listener->accept_head) {
+                    listener->accept_queue[listener->accept_tail] = new_conn;
+                    listener->accept_tail = next_tail;
+                    listener->accept_ready = 1;
+                }
+
+                spin_unlock_irqrestore(&tcp_lock, flags);
+                return;
+            }
         }
 
         // No connection and no listener - send RST

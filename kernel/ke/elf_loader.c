@@ -502,6 +502,10 @@ uint64_t elf_exec_replace(const char* path, char* const argv[],
                 int idx = SOCKET_FD_IDX(cur->fd_table[i]);
                 cur->fd_table[i] = NULL;
                 sock_close(idx);
+            } else if (IS_UNIX_SOCKET_FD(cur->fd_table[i])) {
+                int ufd = (int)(uintptr_t)cur->fd_table[i];
+                cur->fd_table[i] = NULL;
+                unix_close(ufd);
             } else if (IS_EPOLL_FD(cur->fd_table[i])) {
                 int idx = EPOLL_FD_IDX(cur->fd_table[i]);
                 cur->fd_table[i] = NULL;

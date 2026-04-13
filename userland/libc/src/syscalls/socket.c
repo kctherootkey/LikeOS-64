@@ -196,3 +196,9 @@ int dup3(int oldfd, int newfd, int flags) {
     if (ret < 0) { errno = (int)-ret; return -1; }
     return (int)ret;
 }
+
+int dns_resolve(const char *hostname, uint32_t *ip_out) {
+    long ret = syscall2(SYS_DNS_RESOLVE, (long)hostname, (long)ip_out);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return 0;
+}

@@ -59,6 +59,12 @@ void udp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t le
         return;
     }
 
+    // Check for DNS client port
+    if (dst_port == DNS_CLIENT_PORT && src_port == 53) {
+        dns_rx(payload, payload_len);
+        return;
+    }
+
     // Deliver to socket layer
     udp_deliver_to_socket(src_ip, src_port, dst_port, payload, payload_len);
 }

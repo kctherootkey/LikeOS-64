@@ -8,6 +8,7 @@
 #include "../../include/kernel/pagecache.h"
 #include "../../include/kernel/acpi.h"
 #include "../../include/kernel/lapic.h"
+#include "../../include/kernel/random.h"
 
 static volatile uint64_t g_ticks = 0;
 static uint32_t g_frequency = 100; // Default 100 Hz
@@ -636,7 +637,10 @@ void timer_irq_handler(void) {
     
     if (is_bsp) {
         g_ticks++;
-        
+
+        // Feed entropy from timer jitter
+        entropy_add_timer_jitter();
+
         // Wake any tasks whose sleep timer has expired and check signal timers
         // This handles alarm(), itimer, and wakes sleeping tasks
         sched_wake_expired_sleepers(g_ticks);

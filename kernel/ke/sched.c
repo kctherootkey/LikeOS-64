@@ -1202,6 +1202,10 @@ task_t* sched_fork_current(void) {
                 net_socket_t* s = sock_get(idx);
                 if (s) s->ref_count++;
                 child->fd_table[i] = cur->fd_table[i];
+            } else if (IS_UNIX_SOCKET_FD(cur->fd_table[i])) {
+                unix_socket_t* us = unix_get((int)(uintptr_t)cur->fd_table[i]);
+                if (us) us->ref_count++;
+                child->fd_table[i] = cur->fd_table[i];
             } else if (IS_EPOLL_FD(cur->fd_table[i])) {
                 child->fd_table[i] = cur->fd_table[i];
             } else if (pipe_is_end(cur->fd_table[i])) {
@@ -1420,6 +1424,10 @@ void sched_mark_task_exited(task_t* task, int status) {
                     int idx = SOCKET_FD_IDX(task->fd_table[i]);
                     task->fd_table[i] = NULL;
                     sock_close(idx);
+                } else if (IS_UNIX_SOCKET_FD(task->fd_table[i])) {
+                    int ufd = (int)(uintptr_t)task->fd_table[i];
+                    task->fd_table[i] = NULL;
+                    unix_close(ufd);
                 } else if (IS_EPOLL_FD(task->fd_table[i])) {
                     int idx = EPOLL_FD_IDX(task->fd_table[i]);
                     task->fd_table[i] = NULL;
@@ -2319,6 +2327,10 @@ files_struct_t* files_struct_clone(files_struct_t* src) {
                 net_socket_t* s = sock_get(idx);
                 if (s) s->ref_count++;
                 files->fd_table[i] = src->fd_table[i];
+            } else if (IS_UNIX_SOCKET_FD(src->fd_table[i])) {
+                unix_socket_t* us = unix_get((int)(uintptr_t)src->fd_table[i]);
+                if (us) us->ref_count++;
+                files->fd_table[i] = src->fd_table[i];
             } else if (IS_EPOLL_FD(src->fd_table[i])) {
                 files->fd_table[i] = src->fd_table[i];
             } else if (pipe_is_end(src->fd_table[i])) {
@@ -2358,6 +2370,10 @@ void files_struct_put(files_struct_t* files) {
                     int idx = SOCKET_FD_IDX(files->fd_table[i]);
                     files->fd_table[i] = NULL;
                     sock_close(idx);
+                } else if (IS_UNIX_SOCKET_FD(files->fd_table[i])) {
+                    int ufd = (int)(uintptr_t)files->fd_table[i];
+                    files->fd_table[i] = NULL;
+                    unix_close(ufd);
                 } else if (IS_EPOLL_FD(files->fd_table[i])) {
                     int idx = EPOLL_FD_IDX(files->fd_table[i]);
                     files->fd_table[i] = NULL;

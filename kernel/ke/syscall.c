@@ -484,6 +484,16 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
         return -EBADF;
     }
     
+    // UNIX socket fd - read via unix_recv
+    if (IS_UNIX_SOCKET_FD(file)) {
+        return unix_recv((int)(uintptr_t)file, (void*)buf, (size_t)count, 0);
+    }
+
+    // Network socket fd - read via sock_recv
+    if (IS_SOCKET_FD(file)) {
+        return sock_recv(SOCKET_FD_IDX(file), (void*)buf, (size_t)count, 0);
+    }
+
     if (pipe_is_end(file)) {
         if (!validate_user_ptr(buf, count)) {
             return -EFAULT;
@@ -550,6 +560,16 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
         return -EBADF;
     }
     
+    // UNIX socket fd - write via unix_send
+    if (IS_UNIX_SOCKET_FD(file)) {
+        return unix_send((int)(uintptr_t)file, (const void*)buf, (size_t)count, 0);
+    }
+
+    // Network socket fd - write via sock_send
+    if (IS_SOCKET_FD(file)) {
+        return sock_send(SOCKET_FD_IDX(file), (const void*)buf, (size_t)count, 0);
+    }
+
     if (pipe_is_end(file)) {
         if (!validate_user_ptr(buf, count)) {
             return -EFAULT;
@@ -707,6 +727,13 @@ static int64_t sys_close(uint64_t fd) {
         int idx = SOCKET_FD_IDX(file);
         cur->fd_table[fd] = NULL;
         return sock_close(idx);
+    }
+
+    // Check for UNIX socket fd markers
+    if (IS_UNIX_SOCKET_FD(file)) {
+        int ufd = (int)(uintptr_t)file;
+        cur->fd_table[fd] = NULL;
+        return unix_close(ufd);
     }
 
     // Check for epoll fd markers
@@ -1172,6 +1199,24 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
     if (IS_SOCKET_FD(file)) {
         int idx = SOCKET_FD_IDX(file);
         return sock_fcntl_net(idx, (int)cmd, (unsigned long)arg);
+    }
+
+    // UNIX socket fd markers
+    if (IS_UNIX_SOCKET_FD(file)) {
+        unix_socket_t* us = unix_get((int)(uintptr_t)file);
+        if (!us) return -EBADF;
+        if (cmd == F_GETFL) {
+            uint32_t fl = O_RDWR;
+            if (us->nonblock) fl |= O_NONBLOCK;
+            return fl;
+        }
+        if (cmd == F_SETFL) {
+            us->nonblock = ((uint32_t)arg & O_NONBLOCK) ? 1 : 0;
+            return 0;
+        }
+        if (cmd == F_GETFD) return 0;
+        if (cmd == F_SETFD) return 0;
+        return -EINVAL;
     }
 
     // Epoll fd markers
@@ -2284,6 +2329,13 @@ static int64_t sys_dup(uint64_t oldfd) {
         return newfd;
     }
 
+    if (IS_UNIX_SOCKET_FD(cur->fd_table[oldfd])) {
+        unix_socket_t* us = unix_get((int)(uintptr_t)cur->fd_table[oldfd]);
+        if (us) us->ref_count++;
+        cur->fd_table[newfd] = cur->fd_table[oldfd];
+        return newfd;
+    }
+
     if (IS_EPOLL_FD(cur->fd_table[oldfd])) {
         cur->fd_table[newfd] = cur->fd_table[oldfd];
         return newfd;
@@ -2329,6 +2381,13 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd) {
         int idx = SOCKET_FD_IDX(cur->fd_table[oldfd]);
         net_socket_t* s = sock_get(idx);
         if (s) s->ref_count++;
+        cur->fd_table[newfd] = cur->fd_table[oldfd];
+        return newfd;
+    }
+
+    if (IS_UNIX_SOCKET_FD(cur->fd_table[oldfd])) {
+        unix_socket_t* us = unix_get((int)(uintptr_t)cur->fd_table[oldfd]);
+        if (us) us->ref_count++;
         cur->fd_table[newfd] = cur->fd_table[oldfd];
         return newfd;
     }
@@ -4214,6 +4273,16 @@ static int sock_idx_from_fd(uint64_t fd) {
     return SOCKET_FD_IDX(entry);
 }
 
+// Helper: check if process fd is a UNIX socket and return the raw UNIX socket fd
+static int unix_sock_fd_from_fd(uint64_t fd) {
+    task_t* cur = sched_current();
+    if (!cur || fd >= TASK_MAX_FDS) return -EBADF;
+    void* entry = cur->fd_table[fd];
+    if (!entry) return -EBADF;
+    if (!IS_UNIX_SOCKET_FD(entry)) return -ENOTSOCK;
+    return (int)(uintptr_t)entry;  // Return the raw UNIX socket FD marker
+}
+
 // Helper: extract epoll index from a process fd
 static int epoll_idx_from_fd(uint64_t fd) {
     task_t* cur = sched_current();
@@ -4653,6 +4722,24 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         // ====== Socket syscalls ======
         case SYS_SOCKET: {
             int real_type = (int)a2 & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+            if ((int)a1 == AF_UNIX) {
+                int ufd = unix_create(real_type);
+                if (ufd < 0) return ufd;
+                task_t* cur = sched_current();
+                if (!cur) { unix_close(ufd); return -EFAULT; }
+                for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
+                    if (cur->fd_table[_fd] == NULL) {
+                        cur->fd_table[_fd] = (void*)(uintptr_t)ufd;
+                        if ((int)a2 & SOCK_NONBLOCK) {
+                            unix_socket_t* _s = unix_get(ufd);
+                            if (_s) _s->nonblock = 1;
+                        }
+                        return _fd;
+                    }
+                }
+                unix_close(ufd);
+                return -EMFILE;
+            }
             int sock_idx = sock_create((int)a1, real_type, (int)a3);
             if (sock_idx < 0) return sock_idx;
             // Allocate a process fd pointing to the socket
@@ -4673,6 +4760,13 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         }
 
         case SYS_BIND: {
+            int ufd = unix_sock_fd_from_fd(a1);
+            if (ufd >= 0) {
+                if (!validate_user_ptr(a2, sizeof(struct sockaddr_un))) return -EFAULT;
+                struct sockaddr_un kaddr;
+                copy_from_user(&kaddr, (const void*)a2, sizeof(struct sockaddr_un));
+                return unix_bind(ufd, &kaddr);
+            }
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
             struct sockaddr_in kaddr;
@@ -4682,12 +4776,37 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         }
 
         case SYS_LISTEN: {
+            int ufd = unix_sock_fd_from_fd(a1);
+            if (ufd >= 0) return unix_listen(ufd, (int)a2);
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
             return sock_listen(idx, (int)a2);
         }
 
         case SYS_ACCEPT: {
+            int ufd = unix_sock_fd_from_fd(a1);
+            if (ufd >= 0) {
+                struct sockaddr_un kaddr;
+                socklen_t kaddrlen = sizeof(struct sockaddr_un);
+                int new_ufd = unix_accept(ufd, &kaddr, &kaddrlen);
+                if (new_ufd < 0) return new_ufd;
+                task_t* cur = sched_current();
+                if (!cur) { unix_close(new_ufd); return -EFAULT; }
+                for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
+                    if (cur->fd_table[_fd] == NULL) {
+                        cur->fd_table[_fd] = (void*)(uintptr_t)new_ufd;
+                        if (a2 && a3) {
+                            if (validate_user_ptr(a2, sizeof(struct sockaddr_un)))
+                                copy_to_user((void*)a2, &kaddr, sizeof(struct sockaddr_un));
+                            if (validate_user_ptr(a3, sizeof(socklen_t)))
+                                copy_to_user((void*)a3, &kaddrlen, sizeof(socklen_t));
+                        }
+                        return _fd;
+                    }
+                }
+                unix_close(new_ufd);
+                return -EMFILE;
+            }
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
             struct sockaddr_in kaddr;
@@ -4714,6 +4833,13 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         }
 
         case SYS_CONNECT: {
+            int ufd = unix_sock_fd_from_fd(a1);
+            if (ufd >= 0) {
+                if (!validate_user_ptr(a2, sizeof(struct sockaddr_un))) return -EFAULT;
+                struct sockaddr_un kaddr;
+                copy_from_user(&kaddr, (const void*)a2, sizeof(struct sockaddr_un));
+                return unix_connect(ufd, &kaddr);
+            }
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
             struct sockaddr_in kaddr;
@@ -4723,6 +4849,11 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         }
 
         case SYS_SENDTO: {
+            int ufd = unix_sock_fd_from_fd(a1);
+            if (ufd >= 0) {
+                if (!validate_user_ptr(a2, a3)) return -EFAULT;
+                return unix_send(ufd, (const void*)a2, (size_t)a3, (int)a4);
+            }
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
             if (!validate_user_ptr(a2, a3)) return -EFAULT;
@@ -4736,6 +4867,11 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         }
 
         case SYS_RECVFROM: {
+            int ufd = unix_sock_fd_from_fd(a1);
+            if (ufd >= 0) {
+                if (!validate_user_ptr(a2, a3)) return -EFAULT;
+                return unix_recv(ufd, (void*)a2, (size_t)a3, (int)a4);
+            }
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
             if (!validate_user_ptr(a2, a3)) return -EFAULT;
@@ -4748,6 +4884,11 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         }
 
         case SYS_SEND: {
+            int ufd = unix_sock_fd_from_fd(a1);
+            if (ufd >= 0) {
+                if (!validate_user_ptr(a2, a3)) return -EFAULT;
+                return unix_send(ufd, (const void*)a2, (size_t)a3, (int)a4);
+            }
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
             if (!validate_user_ptr(a2, a3)) return -EFAULT;
@@ -4755,6 +4896,11 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         }
 
         case SYS_RECV: {
+            int ufd = unix_sock_fd_from_fd(a1);
+            if (ufd >= 0) {
+                if (!validate_user_ptr(a2, a3)) return -EFAULT;
+                return unix_recv(ufd, (void*)a2, (size_t)a3, (int)a4);
+            }
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
             if (!validate_user_ptr(a2, a3)) return -EFAULT;
@@ -4762,6 +4908,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         }
 
         case SYS_SHUTDOWN: {
+            int ufd = unix_sock_fd_from_fd(a1);
+            if (ufd >= 0) return unix_shutdown(ufd, (int)a2);
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
             return sock_shutdown(idx, (int)a2);
@@ -4815,6 +4963,29 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 
         case SYS_SOCKETPAIR: {
             if (!validate_user_ptr(a4, 2 * sizeof(int))) return -EFAULT;
+            if ((int)a1 == AF_UNIX) {
+                int real_type = (int)a2 & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
+                int usv[2];
+                int ret = unix_socketpair(real_type, usv);
+                if (ret < 0) return ret;
+                task_t* cur = sched_current();
+                if (!cur) { unix_close(usv[0]); unix_close(usv[1]); return -EFAULT; }
+                int pfd[2] = {-1, -1};
+                for (int _fd = 3; _fd < TASK_MAX_FDS && (pfd[0] < 0 || pfd[1] < 0); _fd++) {
+                    if (cur->fd_table[_fd] == NULL) {
+                        if (pfd[0] < 0) pfd[0] = _fd;
+                        else pfd[1] = _fd;
+                    }
+                }
+                if (pfd[0] < 0 || pfd[1] < 0) {
+                    unix_close(usv[0]); unix_close(usv[1]);
+                    return -EMFILE;
+                }
+                cur->fd_table[pfd[0]] = (void*)(uintptr_t)usv[0];
+                cur->fd_table[pfd[1]] = (void*)(uintptr_t)usv[1];
+                copy_to_user((void*)a4, pfd, 2 * sizeof(int));
+                return 0;
+            }
             int sv[2];
             int ret = sock_socketpair((int)a1, (int)a2, (int)a3, sv);
             if (ret < 0) return ret;
@@ -4839,6 +5010,33 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         }
 
         case SYS_ACCEPT4: {
+            int ufd = unix_sock_fd_from_fd(a1);
+            if (ufd >= 0) {
+                struct sockaddr_un kaddr;
+                socklen_t kaddrlen = sizeof(struct sockaddr_un);
+                int new_ufd = unix_accept(ufd, &kaddr, &kaddrlen);
+                if (new_ufd < 0) return new_ufd;
+                task_t* cur = sched_current();
+                if (!cur) { unix_close(new_ufd); return -EFAULT; }
+                for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
+                    if (cur->fd_table[_fd] == NULL) {
+                        cur->fd_table[_fd] = (void*)(uintptr_t)new_ufd;
+                        if ((int)a4 & SOCK_NONBLOCK) {
+                            unix_socket_t* _s = unix_get(new_ufd);
+                            if (_s) _s->nonblock = 1;
+                        }
+                        if (a2 && a3) {
+                            if (validate_user_ptr(a2, sizeof(struct sockaddr_un)))
+                                copy_to_user((void*)a2, &kaddr, sizeof(struct sockaddr_un));
+                            if (validate_user_ptr(a3, sizeof(socklen_t)))
+                                copy_to_user((void*)a3, &kaddrlen, sizeof(socklen_t));
+                        }
+                        return _fd;
+                    }
+                }
+                unix_close(new_ufd);
+                return -EMFILE;
+            }
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
             struct sockaddr_in kaddr;
@@ -4956,6 +5154,27 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 
         case SYS_DUP3:
             return sys_dup3(a1, a2, a3);
+
+        case SYS_DNS_RESOLVE: {
+            if (!validate_user_ptr(a1, 1)) return -EFAULT;
+            if (!validate_user_ptr(a2, sizeof(uint32_t))) return -EFAULT;
+            // Copy hostname from user space (max 255 chars)
+            char khost[256];
+            int i = 0;
+            const char* uhost = (const char*)a1;
+            while (i < 255) {
+                khost[i] = uhost[i];
+                if (!khost[i]) break;
+                i++;
+            }
+            khost[255] = '\0';
+            uint32_t ip = 0;
+            int ret = dns_resolve(khost, &ip);
+            if (ret == 0) {
+                copy_to_user((void*)a2, &ip, sizeof(uint32_t));
+            }
+            return ret;
+        }
             
         default:
             return -ENOSYS;
