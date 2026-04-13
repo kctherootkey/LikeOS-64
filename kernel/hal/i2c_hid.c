@@ -11,6 +11,13 @@
 // GPIO-level interrupts wake per-controller worker threads that perform
 // I2C reads.  Transfers include TX_ABRT recovery with bounded retries
 // and exponential backoff.
+//
+// The current I2C driver is not functioning properly. It frequently
+// encounters transfer and abort errors, and eventually the mouse becomes
+// unresponsive when running on Dell hardware. Fortunately, the Dell
+// platform supports a legacy PS/2 mouse, so the I2C driver is not
+// strictly required at this time. We may revisit and address the issue
+// in the future if it becomes necessary.
 
 #include "../../include/kernel/i2c_hid.h"
 #include "../../include/kernel/console.h"

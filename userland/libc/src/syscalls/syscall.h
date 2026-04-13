@@ -135,6 +135,37 @@
 #define SYS_KLOGCTL         336
 #define SYS_SETTIMEOFDAY    337
 
+// Socket syscalls
+#define SYS_SOCKET      340
+#define SYS_BIND        341
+#define SYS_LISTEN      342
+#define SYS_ACCEPT      343
+#define SYS_CONNECT     344
+#define SYS_SENDTO      345
+#define SYS_RECVFROM    346
+#define SYS_SEND        347
+#define SYS_RECV        348
+#define SYS_SHUTDOWN    349
+#define SYS_SETSOCKOPT  350
+#define SYS_GETSOCKOPT  351
+#define SYS_GETPEERNAME 352
+#define SYS_GETSOCKNAME 353
+#define SYS_SOCKETPAIR  354
+#define SYS_ACCEPT4     355
+#define SYS_SENDMSG     356
+#define SYS_RECVMSG     357
+#define SYS_SENDFILE    358
+#define SYS_SELECT      359
+#define SYS_PSELECT6    360
+#define SYS_POLL        361
+#define SYS_PPOLL       362
+#define SYS_EPOLL_CREATE  363
+#define SYS_EPOLL_CREATE1 364
+#define SYS_EPOLL_CTL   365
+#define SYS_EPOLL_WAIT  366
+#define SYS_EPOLL_PWAIT 367
+#define SYS_DUP3        368
+
 // Kernel log control operations
 #define SYSLOG_ACTION_READ       2
 #define SYSLOG_ACTION_READ_ALL   3

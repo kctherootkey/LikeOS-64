@@ -1,0 +1,651 @@
+// LikeOS-64 TCP (Transmission Control Protocol)
+#include "../../include/kernel/net.h"
+#include "../../include/kernel/console.h"
+#include "../../include/kernel/slab.h"
+#include "../../include/kernel/timer.h"
+#include "../../include/kernel/syscall.h"
+
+// TCP connection table
+static tcp_conn_t tcp_connections[TCP_MAX_CONNECTIONS];
+static spinlock_t tcp_lock = SPINLOCK_INIT("tcp");
+
+// Simple pseudo-random ISN generator
+static uint32_t tcp_isn_counter = 0;
+
+static uint32_t tcp_generate_isn(void) {
+    tcp_isn_counter += timer_ticks() * 1000 + 12345;
+    return tcp_isn_counter;
+}
+
+void tcp_init(void) {
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_connections[i].active = 0;
+        tcp_connections[i].state = TCP_STATE_CLOSED;
+    }
+}
+
+static tcp_conn_t* tcp_alloc_conn(void) {
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        if (!tcp_connections[i].active) {
+            tcp_conn_t* conn = &tcp_connections[i];
+            conn->active = 1;
+            conn->state = TCP_STATE_CLOSED;
+            conn->error = 0;
+            conn->rx_ready = 0;
+            conn->tx_ready = 1;
+            conn->accept_ready = 0;
+            conn->connect_done = 0;
+            conn->accept_head = 0;
+            conn->accept_tail = 0;
+            conn->backlog = 0;
+            conn->parent = NULL;
+            conn->retransmit_count = 0;
+            conn->retransmit_tick = 0;
+            conn->time_wait_tick = 0;
+            conn->lock = (spinlock_t)SPINLOCK_INIT("tcp_conn");
+
+            // Allocate RX/TX buffers
+            conn->rx_buf = (uint8_t*)slab_alloc(TCP_RX_BUF_SIZE);
+            conn->tx_buf = (uint8_t*)slab_alloc(TCP_TX_BUF_SIZE);
+            if (!conn->rx_buf || !conn->tx_buf) {
+                if (conn->rx_buf) slab_free(conn->rx_buf);
+                if (conn->tx_buf) slab_free(conn->tx_buf);
+                conn->active = 0;
+                return NULL;
+            }
+            conn->rx_buf_size = TCP_RX_BUF_SIZE;
+            conn->tx_buf_size = TCP_TX_BUF_SIZE;
+            conn->rx_head = 0;
+            conn->rx_tail = 0;
+            conn->tx_head = 0;
+            conn->tx_tail = 0;
+
+            return conn;
+        }
+    }
+    return NULL;
+}
+
+static void tcp_free_conn(tcp_conn_t* conn) {
+    if (conn->rx_buf) slab_free(conn->rx_buf);
+    if (conn->tx_buf) slab_free(conn->tx_buf);
+    conn->rx_buf = NULL;
+    conn->tx_buf = NULL;
+    conn->active = 0;
+    conn->state = TCP_STATE_CLOSED;
+}
+
+// Find connection by 4-tuple
+static tcp_conn_t* tcp_find_conn(uint32_t local_ip, uint16_t local_port,
+                                  uint32_t remote_ip, uint16_t remote_port) {
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_conn_t* c = &tcp_connections[i];
+        if (c->active && c->state != TCP_STATE_LISTEN &&
+            c->local_port == local_port && c->remote_port == remote_port &&
+            (c->local_ip == local_ip || c->local_ip == 0) &&
+            c->remote_ip == remote_ip) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+// Find listening socket on port
+static tcp_conn_t* tcp_find_listener(uint16_t local_port) {
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_conn_t* c = &tcp_connections[i];
+        if (c->active && c->state == TCP_STATE_LISTEN &&
+            c->local_port == local_port) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+// Ring buffer helpers
+static uint32_t ring_used(uint32_t head, uint32_t tail, uint32_t size) {
+    return (tail - head + size) % size;
+}
+
+static uint32_t ring_free(uint32_t head, uint32_t tail, uint32_t size) {
+    return size - 1 - ring_used(head, tail, size);
+}
+
+// ============================================================================
+// Send TCP Segment
+// ============================================================================
+int tcp_send_segment(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
+                     uint16_t src_port, uint16_t dst_port,
+                     uint32_t seq, uint32_t ack,
+                     uint8_t flags, uint16_t window,
+                     const uint8_t* data, uint16_t data_len) {
+    uint16_t tcp_len = sizeof(tcp_header_t) + data_len;
+    uint8_t pkt[NET_MTU_DEFAULT];
+    if (tcp_len > NET_MTU_DEFAULT) return -1;
+
+    tcp_header_t* tcp = (tcp_header_t*)pkt;
+    tcp->src_port = net_htons(src_port);
+    tcp->dst_port = net_htons(dst_port);
+    tcp->seq_num = net_htonl(seq);
+    tcp->ack_num = net_htonl(ack);
+    tcp->data_offset = (sizeof(tcp_header_t) / 4) << 4;
+    tcp->flags = flags;
+    tcp->window = net_htons(window);
+    tcp->checksum = 0;
+    tcp->urgent_ptr = 0;
+
+    // Copy data
+    for (uint16_t i = 0; i < data_len; i++)
+        pkt[sizeof(tcp_header_t) + i] = data[i];
+
+    // Compute TCP checksum (over pseudo-header + TCP header + data)
+    uint8_t pseudo[12 + NET_MTU_DEFAULT];
+    uint32_t s = net_htonl(src_ip);
+    uint32_t d = net_htonl(dst_ip);
+    pseudo[0] = (s >> 24) & 0xFF; pseudo[1] = (s >> 16) & 0xFF;
+    pseudo[2] = (s >> 8) & 0xFF;  pseudo[3] = s & 0xFF;
+    pseudo[4] = (d >> 24) & 0xFF; pseudo[5] = (d >> 16) & 0xFF;
+    pseudo[6] = (d >> 8) & 0xFF;  pseudo[7] = d & 0xFF;
+    pseudo[8] = 0;
+    pseudo[9] = IP_PROTO_TCP;
+    pseudo[10] = (tcp_len >> 8) & 0xFF;
+    pseudo[11] = tcp_len & 0xFF;
+    for (uint16_t i = 0; i < tcp_len; i++)
+        pseudo[12 + i] = pkt[i];
+
+    tcp->checksum = ipv4_checksum(pseudo, 12 + tcp_len);
+
+    return ipv4_send(dev, dst_ip, IP_PROTO_TCP, pkt, tcp_len);
+}
+
+static void tcp_send_ack(tcp_conn_t* conn) {
+    tcp_send_segment(conn->dev, conn->local_ip, conn->remote_ip,
+                     conn->local_port, conn->remote_port,
+                     conn->snd_nxt, conn->rcv_nxt,
+                     TCP_ACK, (uint16_t)conn->rcv_wnd,
+                     NULL, 0);
+}
+
+static void tcp_send_rst(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
+                         uint16_t src_port, uint16_t dst_port,
+                         uint32_t seq, uint32_t ack) {
+    tcp_send_segment(dev, src_ip, dst_ip, src_port, dst_port,
+                     seq, ack, TCP_RST | TCP_ACK, 0, NULL, 0);
+}
+
+// ============================================================================
+// TCP Connect (active open)
+// ============================================================================
+tcp_conn_t* tcp_connect(net_device_t* dev, uint32_t dst_ip,
+                        uint16_t src_port, uint16_t dst_port) {
+    uint64_t flags;
+    spin_lock_irqsave(&tcp_lock, &flags);
+
+    tcp_conn_t* conn = tcp_alloc_conn();
+    if (!conn) {
+        spin_unlock_irqrestore(&tcp_lock, flags);
+        return NULL;
+    }
+
+    conn->dev = dev;
+    conn->local_ip = dev->ip_addr;
+    conn->remote_ip = dst_ip;
+    conn->local_port = src_port;
+    conn->remote_port = dst_port;
+    conn->iss = tcp_generate_isn();
+    conn->snd_una = conn->iss;
+    conn->snd_nxt = conn->iss + 1;
+    conn->snd_wnd = TCP_WINDOW_SIZE;
+    conn->rcv_wnd = TCP_WINDOW_SIZE;
+    conn->state = TCP_STATE_SYN_SENT;
+    conn->retransmit_tick = timer_ticks() + TCP_SYN_RETRANSMIT_TICKS;
+    conn->retransmit_count = 0;
+
+    spin_unlock_irqrestore(&tcp_lock, flags);
+
+    // Send SYN
+    tcp_send_segment(dev, dev->ip_addr, dst_ip, src_port, dst_port,
+                     conn->iss, 0, TCP_SYN, TCP_WINDOW_SIZE, NULL, 0);
+
+    return conn;
+}
+
+// ============================================================================
+// TCP Listen (passive open)
+// ============================================================================
+tcp_conn_t* tcp_listen(net_device_t* dev, uint32_t local_ip,
+                       uint16_t local_port, int backlog) {
+    uint64_t flags;
+    spin_lock_irqsave(&tcp_lock, &flags);
+
+    tcp_conn_t* conn = tcp_alloc_conn();
+    if (!conn) {
+        spin_unlock_irqrestore(&tcp_lock, flags);
+        return NULL;
+    }
+
+    conn->dev = dev;
+    conn->local_ip = local_ip;
+    conn->local_port = local_port;
+    conn->remote_ip = 0;
+    conn->remote_port = 0;
+    conn->state = TCP_STATE_LISTEN;
+    conn->backlog = backlog > 16 ? 16 : backlog;
+
+    spin_unlock_irqrestore(&tcp_lock, flags);
+    return conn;
+}
+
+// ============================================================================
+// TCP Accept (from listener)
+// ============================================================================
+tcp_conn_t* tcp_accept(tcp_conn_t* listener) {
+    if (!listener || listener->state != TCP_STATE_LISTEN) return NULL;
+
+    uint64_t flags;
+    spin_lock_irqsave(&listener->lock, &flags);
+
+    if (listener->accept_head == listener->accept_tail) {
+        spin_unlock_irqrestore(&listener->lock, flags);
+        return NULL;  // Nothing to accept
+    }
+
+    tcp_conn_t* conn = listener->accept_queue[listener->accept_head];
+    listener->accept_head = (listener->accept_head + 1) % 16;
+    if (listener->accept_head == listener->accept_tail)
+        listener->accept_ready = 0;
+
+    spin_unlock_irqrestore(&listener->lock, flags);
+    return conn;
+}
+
+// ============================================================================
+// TCP Close
+// ============================================================================
+int tcp_close(tcp_conn_t* conn) {
+    if (!conn) return -1;
+
+    uint64_t flags;
+    spin_lock_irqsave(&conn->lock, &flags);
+
+    switch (conn->state) {
+    case TCP_STATE_ESTABLISHED:
+    case TCP_STATE_SYN_RECEIVED:
+        // Send FIN
+        tcp_send_segment(conn->dev, conn->local_ip, conn->remote_ip,
+                         conn->local_port, conn->remote_port,
+                         conn->snd_nxt, conn->rcv_nxt,
+                         TCP_FIN | TCP_ACK, (uint16_t)conn->rcv_wnd, NULL, 0);
+        conn->snd_nxt++;
+        conn->state = TCP_STATE_FIN_WAIT_1;
+        spin_unlock_irqrestore(&conn->lock, flags);
+        break;
+
+    case TCP_STATE_CLOSE_WAIT:
+        // Send FIN
+        tcp_send_segment(conn->dev, conn->local_ip, conn->remote_ip,
+                         conn->local_port, conn->remote_port,
+                         conn->snd_nxt, conn->rcv_nxt,
+                         TCP_FIN | TCP_ACK, (uint16_t)conn->rcv_wnd, NULL, 0);
+        conn->snd_nxt++;
+        conn->state = TCP_STATE_LAST_ACK;
+        spin_unlock_irqrestore(&conn->lock, flags);
+        break;
+
+    case TCP_STATE_LISTEN:
+    case TCP_STATE_SYN_SENT:
+        conn->state = TCP_STATE_CLOSED;
+        spin_unlock_irqrestore(&conn->lock, flags);
+        tcp_free_conn(conn);
+        break;
+
+    default:
+        spin_unlock_irqrestore(&conn->lock, flags);
+        break;
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// TCP Send Data
+// ============================================================================
+int tcp_send_data(tcp_conn_t* conn, const uint8_t* data, uint16_t len) {
+    if (!conn || conn->state != TCP_STATE_ESTABLISHED) return -1;
+
+    uint64_t flags;
+    spin_lock_irqsave(&conn->lock, &flags);
+
+    // Copy to TX buffer
+    uint32_t avail = ring_free(conn->tx_head, conn->tx_tail, conn->tx_buf_size);
+    if (len > avail) len = (uint16_t)avail;
+    if (len == 0) {
+        conn->tx_ready = 0;
+        spin_unlock_irqrestore(&conn->lock, flags);
+        return 0;
+    }
+
+    for (uint16_t i = 0; i < len; i++) {
+        conn->tx_buf[conn->tx_tail] = data[i];
+        conn->tx_tail = (conn->tx_tail + 1) % conn->tx_buf_size;
+    }
+
+    // Send data in segments
+    uint32_t to_send = ring_used(conn->tx_head, conn->tx_tail, conn->tx_buf_size);
+    while (to_send > 0) {
+        uint16_t seg_len = to_send > TCP_MSS ? TCP_MSS : (uint16_t)to_send;
+        uint8_t seg[TCP_MSS];
+
+        for (uint16_t i = 0; i < seg_len; i++) {
+            seg[i] = conn->tx_buf[(conn->tx_head + i) % conn->tx_buf_size];
+        }
+
+        tcp_send_segment(conn->dev, conn->local_ip, conn->remote_ip,
+                         conn->local_port, conn->remote_port,
+                         conn->snd_nxt, conn->rcv_nxt,
+                         TCP_ACK | TCP_PSH, (uint16_t)conn->rcv_wnd,
+                         seg, seg_len);
+
+        conn->snd_nxt += seg_len;
+        conn->tx_head = (conn->tx_head + seg_len) % conn->tx_buf_size;
+        to_send -= seg_len;
+    }
+
+    conn->retransmit_tick = timer_ticks() + TCP_RETRANSMIT_TICKS;
+    conn->retransmit_count = 0;
+
+    spin_unlock_irqrestore(&conn->lock, flags);
+    return len;
+}
+
+// ============================================================================
+// TCP Receive Processing
+// ============================================================================
+void tcp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t len) {
+    if (len < sizeof(tcp_header_t)) return;
+
+    const tcp_header_t* tcp = (const tcp_header_t*)data;
+    uint16_t src_port = net_ntohs(tcp->src_port);
+    uint16_t dst_port = net_ntohs(tcp->dst_port);
+    uint32_t seq = net_ntohl(tcp->seq_num);
+    uint32_t ack = net_ntohl(tcp->ack_num);
+    uint8_t  tcp_flags = tcp->flags;
+    uint16_t window = net_ntohs(tcp->window);
+    uint8_t  data_offset = (tcp->data_offset >> 4) * 4;
+
+    if (data_offset > len) return;
+    const uint8_t* payload = data + data_offset;
+    uint16_t payload_len = len - data_offset;
+
+    uint32_t local_ip = dev->ip_addr;
+
+    // Find existing connection
+    tcp_conn_t* conn = tcp_find_conn(local_ip, dst_port, src_ip, src_port);
+
+    if (!conn) {
+        // Check for listener
+        tcp_conn_t* listener = tcp_find_listener(dst_port);
+        if (listener && (tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK)) {
+            // New connection on listening socket
+            uint64_t flags;
+            spin_lock_irqsave(&tcp_lock, &flags);
+
+            tcp_conn_t* new_conn = tcp_alloc_conn();
+            if (!new_conn) {
+                spin_unlock_irqrestore(&tcp_lock, flags);
+                return;
+            }
+
+            new_conn->dev = dev;
+            new_conn->local_ip = local_ip;
+            new_conn->remote_ip = src_ip;
+            new_conn->local_port = dst_port;
+            new_conn->remote_port = src_port;
+            new_conn->iss = tcp_generate_isn();
+            new_conn->irs = seq;
+            new_conn->snd_una = new_conn->iss;
+            new_conn->snd_nxt = new_conn->iss + 1;
+            new_conn->rcv_nxt = seq + 1;
+            new_conn->snd_wnd = window;
+            new_conn->rcv_wnd = TCP_WINDOW_SIZE;
+            new_conn->state = TCP_STATE_SYN_RECEIVED;
+            new_conn->parent = listener;
+
+            spin_unlock_irqrestore(&tcp_lock, flags);
+
+            // Send SYN+ACK
+            tcp_send_segment(dev, local_ip, src_ip, dst_port, src_port,
+                             new_conn->iss, new_conn->rcv_nxt,
+                             TCP_SYN | TCP_ACK, TCP_WINDOW_SIZE, NULL, 0);
+            return;
+        }
+
+        // No connection and no listener - send RST
+        if (!(tcp_flags & TCP_RST)) {
+            if (tcp_flags & TCP_ACK) {
+                tcp_send_rst(dev, local_ip, src_ip, dst_port, src_port, ack, 0);
+            } else {
+                tcp_send_rst(dev, local_ip, src_ip, dst_port, src_port,
+                             0, seq + payload_len + ((tcp_flags & TCP_SYN) ? 1 : 0));
+            }
+        }
+        return;
+    }
+
+    uint64_t flags;
+    spin_lock_irqsave(&conn->lock, &flags);
+
+    // Process by state
+    switch (conn->state) {
+    case TCP_STATE_SYN_SENT:
+        if ((tcp_flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
+            if (ack == conn->snd_nxt) {
+                conn->irs = seq;
+                conn->rcv_nxt = seq + 1;
+                conn->snd_una = ack;
+                conn->snd_wnd = window;
+                conn->state = TCP_STATE_ESTABLISHED;
+                conn->connect_done = 1;
+
+                // Send ACK
+                tcp_send_segment(conn->dev, conn->local_ip, conn->remote_ip,
+                                 conn->local_port, conn->remote_port,
+                                 conn->snd_nxt, conn->rcv_nxt,
+                                 TCP_ACK, (uint16_t)conn->rcv_wnd, NULL, 0);
+            }
+        } else if (tcp_flags & TCP_RST) {
+            conn->state = TCP_STATE_CLOSED;
+            conn->error = ECONNREFUSED;
+            conn->connect_done = 1;
+        }
+        break;
+
+    case TCP_STATE_SYN_RECEIVED:
+        if (tcp_flags & TCP_ACK) {
+            if (ack == conn->snd_nxt) {
+                conn->snd_una = ack;
+                conn->snd_wnd = window;
+                conn->state = TCP_STATE_ESTABLISHED;
+
+                // Enqueue in parent's accept queue
+                if (conn->parent) {
+                    tcp_conn_t* p = conn->parent;
+                    uint64_t pflags;
+                    spin_lock_irqsave(&p->lock, &pflags);
+                    int next = (p->accept_tail + 1) % 16;
+                    if (next != p->accept_head) {
+                        p->accept_queue[p->accept_tail] = conn;
+                        p->accept_tail = next;
+                        p->accept_ready = 1;
+                    }
+                    spin_unlock_irqrestore(&p->lock, pflags);
+                }
+            }
+        }
+        if (tcp_flags & TCP_RST) {
+            conn->state = TCP_STATE_CLOSED;
+            spin_unlock_irqrestore(&conn->lock, flags);
+            tcp_free_conn(conn);
+            return;
+        }
+        break;
+
+    case TCP_STATE_ESTABLISHED:
+        if (tcp_flags & TCP_RST) {
+            conn->state = TCP_STATE_CLOSED;
+            conn->error = ECONNRESET;
+            conn->rx_ready = 1;
+            break;
+        }
+
+        // Process ACK
+        if (tcp_flags & TCP_ACK) {
+            if (ack > conn->snd_una && ack <= conn->snd_nxt) {
+                conn->snd_una = ack;
+                conn->snd_wnd = window;
+                conn->retransmit_count = 0;
+                conn->retransmit_tick = timer_ticks() + TCP_RETRANSMIT_TICKS;
+                conn->tx_ready = 1;
+            }
+        }
+
+        // Process data
+        if (payload_len > 0 && seq == conn->rcv_nxt) {
+            // Copy to receive buffer
+            uint32_t avail = ring_free(conn->rx_head, conn->rx_tail, conn->rx_buf_size);
+            uint32_t copy = payload_len;
+            if (copy > avail) copy = avail;
+
+            for (uint32_t i = 0; i < copy; i++) {
+                conn->rx_buf[conn->rx_tail] = payload[i];
+                conn->rx_tail = (conn->rx_tail + 1) % conn->rx_buf_size;
+            }
+            conn->rcv_nxt += copy;
+            conn->rx_ready = 1;
+
+            // Send ACK
+            tcp_send_ack(conn);
+        }
+
+        // Process FIN
+        if (tcp_flags & TCP_FIN) {
+            conn->rcv_nxt = seq + payload_len + 1;
+            conn->state = TCP_STATE_CLOSE_WAIT;
+            conn->rx_ready = 1;  // Wake up reader (EOF)
+
+            tcp_send_ack(conn);
+        }
+        break;
+
+    case TCP_STATE_FIN_WAIT_1:
+        if (tcp_flags & TCP_ACK) {
+            if (ack == conn->snd_nxt) {
+                if (tcp_flags & TCP_FIN) {
+                    conn->rcv_nxt = seq + payload_len + 1;
+                    conn->state = TCP_STATE_TIME_WAIT;
+                    conn->time_wait_tick = timer_ticks() + TCP_TIME_WAIT_TICKS;
+                    tcp_send_ack(conn);
+                } else {
+                    conn->state = TCP_STATE_FIN_WAIT_2;
+                }
+            }
+        }
+        if ((tcp_flags & TCP_FIN) && conn->state == TCP_STATE_FIN_WAIT_1) {
+            conn->rcv_nxt = seq + payload_len + 1;
+            conn->state = TCP_STATE_CLOSING;
+            tcp_send_ack(conn);
+        }
+        break;
+
+    case TCP_STATE_FIN_WAIT_2:
+        if (tcp_flags & TCP_FIN) {
+            conn->rcv_nxt = seq + payload_len + 1;
+            conn->state = TCP_STATE_TIME_WAIT;
+            conn->time_wait_tick = timer_ticks() + TCP_TIME_WAIT_TICKS;
+            tcp_send_ack(conn);
+        }
+        break;
+
+    case TCP_STATE_CLOSING:
+        if ((tcp_flags & TCP_ACK) && ack == conn->snd_nxt) {
+            conn->state = TCP_STATE_TIME_WAIT;
+            conn->time_wait_tick = timer_ticks() + TCP_TIME_WAIT_TICKS;
+        }
+        break;
+
+    case TCP_STATE_LAST_ACK:
+        if ((tcp_flags & TCP_ACK) && ack == conn->snd_nxt) {
+            conn->state = TCP_STATE_CLOSED;
+            spin_unlock_irqrestore(&conn->lock, flags);
+            tcp_free_conn(conn);
+            return;
+        }
+        break;
+
+    case TCP_STATE_TIME_WAIT:
+        // Re-send ACK for any FIN
+        if (tcp_flags & TCP_FIN) {
+            tcp_send_ack(conn);
+            conn->time_wait_tick = timer_ticks() + TCP_TIME_WAIT_TICKS;
+        }
+        break;
+
+    default:
+        break;
+    }
+
+    spin_unlock_irqrestore(&conn->lock, flags);
+}
+
+// ============================================================================
+// TCP Timer (called from net_timer_tick, ~100Hz)
+// ============================================================================
+void tcp_timer_tick(void) {
+    uint64_t now = timer_ticks();
+
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_conn_t* conn = &tcp_connections[i];
+        if (!conn->active) continue;
+
+        // TIME_WAIT expiry
+        if (conn->state == TCP_STATE_TIME_WAIT && now >= conn->time_wait_tick) {
+            conn->state = TCP_STATE_CLOSED;
+            tcp_free_conn(conn);
+            continue;
+        }
+
+        // Retransmission timeout
+        if (conn->state == TCP_STATE_SYN_SENT && now >= conn->retransmit_tick) {
+            if (conn->retransmit_count >= TCP_MAX_RETRANSMITS) {
+                conn->state = TCP_STATE_CLOSED;
+                conn->error = ETIMEDOUT;
+                conn->connect_done = 1;
+                tcp_free_conn(conn);
+                continue;
+            }
+            // Retransmit SYN
+            tcp_send_segment(conn->dev, conn->local_ip, conn->remote_ip,
+                             conn->local_port, conn->remote_port,
+                             conn->iss, 0, TCP_SYN, TCP_WINDOW_SIZE, NULL, 0);
+            conn->retransmit_count++;
+            conn->retransmit_tick = now + TCP_SYN_RETRANSMIT_TICKS;
+        }
+
+        // Data retransmission (ESTABLISHED, data pending ACK)
+        if (conn->state == TCP_STATE_ESTABLISHED &&
+            conn->snd_una < conn->snd_nxt && now >= conn->retransmit_tick) {
+            if (conn->retransmit_count >= TCP_MAX_RETRANSMITS) {
+                conn->state = TCP_STATE_CLOSED;
+                conn->error = ETIMEDOUT;
+                conn->rx_ready = 1;
+                tcp_free_conn(conn);
+                continue;
+            }
+            // Retransmit (simple: re-send from snd_una, limited to MSS)
+            // For simplicity, just send an ACK to nudge the peer
+            tcp_send_ack(conn);
+            conn->retransmit_count++;
+            conn->retransmit_tick = now + TCP_RETRANSMIT_TICKS;
+        }
+    }
+}

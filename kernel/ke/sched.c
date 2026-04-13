@@ -44,6 +44,7 @@
 #include "../../include/kernel/percpu.h"
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/futex.h"
+#include "../../include/kernel/net.h"
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
@@ -1196,6 +1197,13 @@ task_t* sched_fork_current(void) {
             uint64_t marker = (uint64_t)cur->fd_table[i];
             if (marker >= 1 && marker <= 3) {
                 child->fd_table[i] = cur->fd_table[i];
+            } else if (IS_SOCKET_FD(cur->fd_table[i])) {
+                int idx = SOCKET_FD_IDX(cur->fd_table[i]);
+                net_socket_t* s = sock_get(idx);
+                if (s) s->ref_count++;
+                child->fd_table[i] = cur->fd_table[i];
+            } else if (IS_EPOLL_FD(cur->fd_table[i])) {
+                child->fd_table[i] = cur->fd_table[i];
             } else if (pipe_is_end(cur->fd_table[i])) {
                 pipe_end_t* new_end = pipe_dup_end((pipe_end_t*)cur->fd_table[i]);
                 child->fd_table[i] = (vfs_file_t*)new_end;
@@ -1408,6 +1416,16 @@ void sched_mark_task_exited(task_t* task, int status) {
                 uint64_t marker = (uint64_t)task->fd_table[i];
                 if (marker >= 1 && marker <= 3) {
                     task->fd_table[i] = NULL;
+                } else if (IS_SOCKET_FD(task->fd_table[i])) {
+                    int idx = SOCKET_FD_IDX(task->fd_table[i]);
+                    task->fd_table[i] = NULL;
+                    sock_close(idx);
+                } else if (IS_EPOLL_FD(task->fd_table[i])) {
+                    int idx = EPOLL_FD_IDX(task->fd_table[i]);
+                    task->fd_table[i] = NULL;
+                    extern epoll_instance_t epoll_instances[];
+                    if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
+                        epoll_instances[idx].active = 0;
                 } else if (pipe_is_end(task->fd_table[i])) {
                     pipe_close_end((pipe_end_t*)task->fd_table[i]);
                     task->fd_table[i] = NULL;
@@ -2296,6 +2314,13 @@ files_struct_t* files_struct_clone(files_struct_t* src) {
             if (marker >= 1 && marker <= 3) {
                 // Stdin/stdout/stderr markers
                 files->fd_table[i] = src->fd_table[i];
+            } else if (IS_SOCKET_FD(src->fd_table[i])) {
+                int idx = SOCKET_FD_IDX(src->fd_table[i]);
+                net_socket_t* s = sock_get(idx);
+                if (s) s->ref_count++;
+                files->fd_table[i] = src->fd_table[i];
+            } else if (IS_EPOLL_FD(src->fd_table[i])) {
+                files->fd_table[i] = src->fd_table[i];
             } else if (pipe_is_end(src->fd_table[i])) {
                 // Pipe end - duplicate it
                 pipe_end_t* new_end = pipe_dup_end((pipe_end_t*)src->fd_table[i]);
@@ -2329,6 +2354,16 @@ void files_struct_put(files_struct_t* files) {
                 uint64_t marker = (uint64_t)files->fd_table[i];
                 if (marker >= 1 && marker <= 3) {
                     files->fd_table[i] = NULL;
+                } else if (IS_SOCKET_FD(files->fd_table[i])) {
+                    int idx = SOCKET_FD_IDX(files->fd_table[i]);
+                    files->fd_table[i] = NULL;
+                    sock_close(idx);
+                } else if (IS_EPOLL_FD(files->fd_table[i])) {
+                    int idx = EPOLL_FD_IDX(files->fd_table[i]);
+                    files->fd_table[i] = NULL;
+                    extern epoll_instance_t epoll_instances[];
+                    if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
+                        epoll_instances[idx].active = 0;
                 } else if (pipe_is_end(files->fd_table[i])) {
                     pipe_close_end((pipe_end_t*)files->fd_table[i]);
                 } else {

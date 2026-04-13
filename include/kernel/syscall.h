@@ -147,6 +147,37 @@
 #define SYS_SETTIMEOFDAY    337  // Set system time (and sync to CMOS RTC)
 #define SYS_SYNC            338  // Flush all dirty caches to disk
 
+// Socket syscalls (using 340+ to avoid conflicts)
+#define SYS_SOCKET          340
+#define SYS_BIND            341
+#define SYS_LISTEN          342
+#define SYS_ACCEPT          343
+#define SYS_CONNECT         344
+#define SYS_SENDTO          345
+#define SYS_RECVFROM        346
+#define SYS_SEND            347
+#define SYS_RECV            348
+#define SYS_SHUTDOWN        349
+#define SYS_SETSOCKOPT      350
+#define SYS_GETSOCKOPT      351
+#define SYS_GETPEERNAME     352
+#define SYS_GETSOCKNAME     353
+#define SYS_SOCKETPAIR      354
+#define SYS_ACCEPT4         355
+#define SYS_SENDMSG         356
+#define SYS_RECVMSG         357
+#define SYS_SENDFILE        358
+#define SYS_SELECT          359
+#define SYS_PSELECT6        360
+#define SYS_POLL            361
+#define SYS_PPOLL           362
+#define SYS_EPOLL_CREATE    363
+#define SYS_EPOLL_CREATE1   364
+#define SYS_EPOLL_CTL       365
+#define SYS_EPOLL_WAIT      366
+#define SYS_EPOLL_PWAIT     367
+#define SYS_DUP3            368
+
 // Kernel log control operations (for SYS_KLOGCTL)
 #define SYSLOG_ACTION_READ       2
 #define SYSLOG_ACTION_READ_ALL   3
@@ -195,6 +226,22 @@ typedef struct k_sysinfo {
 #define O_TRUNC         0x0200
 #define O_APPEND        0x0400
 #define O_NONBLOCK      0x0800
+#define O_CLOEXEC       0x80000
+
+// Socket creation flags (OR'd into type)
+#define SOCK_NONBLOCK   O_NONBLOCK
+#define SOCK_CLOEXEC    O_CLOEXEC
+
+// fcntl commands
+#define F_DUPFD         0
+#define F_GETFD         1
+#define F_SETFD         2
+#define F_GETFL         3
+#define F_SETFL         4
+#define F_DUPFD_CLOEXEC 1030
+#ifndef FD_CLOEXEC
+#define FD_CLOEXEC      1
+#endif
 
 // mmap protection flags
 #define PROT_NONE       0x0
@@ -246,6 +293,24 @@ typedef struct k_sysinfo {
 #define ENOSYS          38  // Function not implemented
 #define ENOTEMPTY       39  // Directory not empty
 #define ETIMEDOUT      110  // Connection timed out
+#define ENOTSOCK        88  // Socket operation on non-socket
+#define EDESTADDRREQ    89  // Destination address required
+#define EPROTOTYPE      91  // Protocol wrong type for socket
+#define ENOPROTOOPT     92  // Protocol not available
+#define ESOCKTNOSUPPORT 94  // Socket type not supported
+#define EOPNOTSUPP      95  // Operation not supported
+#define EAFNOSUPPORT    97  // Address family not supported
+#define EADDRINUSE      98  // Address already in use
+#define ENETDOWN       100  // Network is down
+#define ECONNABORTED   103  // Connection aborted
+#define ECONNRESET     104  // Connection reset by peer
+#define EISCONN        106  // Already connected
+#define ENOTCONN       107  // Not connected
+#define ECONNREFUSED   111  // Connection refused
+#define EINPROGRESS    115  // Operation now in progress
+#define ERANGE          34  // Math result not representable
+#define ELOOP           40  // Too many symbolic links
+#define ENFILE          23  // File table overflow
 
 // Syscall handler prototype
 int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,

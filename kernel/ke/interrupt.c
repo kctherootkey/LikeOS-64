@@ -9,6 +9,8 @@
 #include "../../include/kernel/percpu.h"
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/i2c_hid.h"
+#include "../../include/kernel/net.h"
+#include "../../include/kernel/e1000.h"
 
 // ACPI SCI dispatch (from oslikeos.c)
 extern int acpi_sci_dispatch(void);
@@ -79,6 +81,7 @@ extern void irq23();
 extern void irq24();
 extern void irq25();
 extern void irq26();  // ACPI SCI
+extern void irq27();  // E1000 NIC MSI
 
 extern void isr0();
 extern void isr1();
@@ -322,6 +325,7 @@ void idt_init() {
     idt_set_entry(56, (uint64_t)irq24, 0x08, 0x8E);  // GPIO 2
     idt_set_entry(57, (uint64_t)irq25, 0x08, 0x8E);  // GPIO 3
     idt_set_entry(58, (uint64_t)irq26, 0x08, 0x8E);  // ACPI SCI
+    idt_set_entry(59, (uint64_t)irq27, 0x08, 0x8E);  // MSI: E1000 NIC
     
     // IPI vectors for SMP
     idt_set_entry(0xFC, (uint64_t)ipi_vector_0xFC, 0x08, 0x8E);  // TLB shootdown
@@ -531,6 +535,12 @@ void irq_handler(uint64_t *regs) {
         return;
     }
 
+    // E1000 NIC MSI interrupt (vector 59)
+    if (int_no == E1000_MSI_VECTOR) {
+        e1000_irq_handler();
+        return;  // e1000_irq_handler calls lapic_eoi()
+    }
+
     // Check for spurious IRQ7 (from master PIC)
     if (irq == 7) {
         uint8_t isr = pic_read_isr();
@@ -564,6 +574,7 @@ void irq_handler(uint64_t *regs) {
             g_irq0_count++;
             
             timer_irq_handler();
+            net_timer_tick();
             // Send EOI before preemption to avoid missing ticks
             pic_send_eoi(irq);
             

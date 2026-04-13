@@ -157,7 +157,18 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/smp.o \
 			  $(BUILD_DIR)/ap_trampoline.o \
 			  $(BUILD_DIR)/futex.o \
-			  $(BUILD_DIR)/i2c_hid.o
+			  $(BUILD_DIR)/i2c_hid.o \
+			  $(BUILD_DIR)/net.o \
+			  $(BUILD_DIR)/e1000.o \
+			  $(BUILD_DIR)/ethernet.o \
+			  $(BUILD_DIR)/arp.o \
+			  $(BUILD_DIR)/ipv4.o \
+			  $(BUILD_DIR)/icmp.o \
+			  $(BUILD_DIR)/udp.o \
+			  $(BUILD_DIR)/tcp.o \
+			  $(BUILD_DIR)/dhcp.o \
+			  $(BUILD_DIR)/socket.o \
+			  $(BUILD_DIR)/poll.o
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -277,6 +288,40 @@ $(BUILD_DIR)/ps2.o: $(KERNEL_DIR)/hal/ps2.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/i2c_hid.o: $(KERNEL_DIR)/hal/i2c_hid.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# Networking stack
+$(BUILD_DIR)/net.o: $(KERNEL_DIR)/net/net.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/e1000.o: $(KERNEL_DIR)/net/e1000.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ethernet.o: $(KERNEL_DIR)/net/ethernet.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/arp.o: $(KERNEL_DIR)/net/arp.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ipv4.o: $(KERNEL_DIR)/net/ipv4.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/icmp.o: $(KERNEL_DIR)/net/icmp.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/udp.o: $(KERNEL_DIR)/net/udp.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tcp.o: $(KERNEL_DIR)/net/tcp.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/dhcp.o: $(KERNEL_DIR)/net/dhcp.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/socket.o: $(KERNEL_DIR)/net/socket.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/poll.o: $(KERNEL_DIR)/net/poll.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ioapic.o: $(KERNEL_DIR)/hal/ioapic.c | $(BUILD_DIR)
@@ -953,10 +998,11 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 
 # Run with ISO boot plus attached xHCI controller and USB mass storage device
 qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
-	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage..."
+	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage + E1000 networking..."
 	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
-		-device usb-storage,drive=usbdisk $(QEMU_USB_HID) -machine type=pc,accel=kvm:tcg
+		-device usb-storage,drive=usbdisk $(QEMU_USB_HID) -machine type=pc,accel=kvm:tcg \
+		-device e1000,netdev=net0 -netdev user,id=net0
 
 # Run with ISO boot plus xHCI + USB mass storage, with GDB support and debug symbols
 # Connect with: gdb build/kernel.elf -ex "target remote :1234"
@@ -979,7 +1025,8 @@ endif
 	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE)..."
 	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
-		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg
+		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg \
+		-device e1000,netdev=net0 -netdev user,id=net0
 
 # Run with real USB device as xHCI USB mass storage, with GDB support and debug symbols
 # Usage: make qemu-realusb-gdb USB_DEVICE=/dev/sdb [SERIAL=1]
@@ -996,6 +1043,7 @@ endif
 	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg \
+		-device e1000,netdev=net0 -netdev user,id=net0 \
 		-s -S -monitor telnet:127.0.0.1:5555,server,nowait -d int 2> /tmp/qemu_int_log
 
 # Extended USB passthrough target: attach tablet + optional host devices (edit vendor/product)
