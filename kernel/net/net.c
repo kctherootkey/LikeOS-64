@@ -112,7 +112,7 @@ void net_init(void) {
     // Probe for NIC hardware
     e1000_init();
 
-    // If we have a NIC, start DHCP
+    // If we have a NIC, initialize DHCP state (discover sent later after sti)
     net_device_t* dev = net_get_default_device();
     if (dev) {
         kprintf("NET: %s: MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -121,8 +121,14 @@ void net_init(void) {
                 dev->mac_addr[3], dev->mac_addr[4], dev->mac_addr[5]);
 
         dhcp_init();
-        dhcp_discover(dev);
     } else {
         kprintf("NET: No network devices found\n");
+    }
+}
+
+void net_start_dhcp(void) {
+    net_device_t* dev = net_get_default_device();
+    if (dev && !dhcp_configured()) {
+        dhcp_discover(dev);
     }
 }

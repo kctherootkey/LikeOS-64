@@ -400,6 +400,7 @@ typedef struct net_socket {
 // Network Device Registry API
 // ============================================================================
 void net_init(void);
+void net_start_dhcp(void);
 int  net_register(net_device_t* dev);
 net_device_t* net_get_device(int index);
 net_device_t* net_get_default_device(void);

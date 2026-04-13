@@ -8,10 +8,11 @@
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/lapic.h"
+#include "../../include/kernel/ioapic.h"
 
 // Global e1000 device (single NIC support)
 static e1000_dev_t g_e1000;
-static int g_e1000_initialized = 0;
+int g_e1000_initialized = 0;
 
 // ============================================================================
 // MMIO helpers
@@ -97,8 +98,8 @@ static void e1000_reset(e1000_dev_t* dev) {
 // Initialize RX Ring with Extended Descriptors
 // ============================================================================
 static int e1000_init_rx(e1000_dev_t* dev) {
-    // Allocate descriptor ring
-    uint32_t rx_ring_size = sizeof(e1000_rx_desc_ext_t) * E1000_NUM_RX_DESC;
+    // Allocate descriptor ring (legacy RX descriptors)
+    uint32_t rx_ring_size = sizeof(e1000_rx_desc_legacy_t) * E1000_NUM_RX_DESC;
     uint32_t rx_ring_pages = (rx_ring_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
     uint64_t rx_phys = mm_allocate_contiguous_pages(rx_ring_pages);
@@ -107,7 +108,7 @@ static int e1000_init_rx(e1000_dev_t* dev) {
         return -1;
     }
 
-    dev->rx_descs = (e1000_rx_desc_ext_t*)phys_to_virt(rx_phys);
+    dev->rx_descs = (e1000_rx_desc_legacy_t*)phys_to_virt(rx_phys);
     dev->rx_descs_phys = rx_phys;
 
     // Zero descriptors
@@ -124,9 +125,9 @@ static int e1000_init_rx(e1000_dev_t* dev) {
         dev->rx_bufs[i] = (uint8_t*)phys_to_virt(buf_phys);
         dev->rx_bufs_phys[i] = buf_phys;
 
-        // Set up extended RX descriptor (read format)
-        dev->rx_descs[i].read.buffer_addr = buf_phys;
-        dev->rx_descs[i].read.reserved = 0;
+        // Set up legacy RX descriptor
+        dev->rx_descs[i].buffer_addr = buf_phys;
+        dev->rx_descs[i].status = 0;
     }
 
     // Program RX ring registers
@@ -135,13 +136,6 @@ static int e1000_init_rx(e1000_dev_t* dev) {
     e1000_write(dev, E1000_RDLEN, rx_ring_size);
     e1000_write(dev, E1000_RDH, 0);
     e1000_write(dev, E1000_RDT, E1000_NUM_RX_DESC - 1);
-
-    // Enable extended RX descriptors if supported (82574L)
-    if (dev->device_id == E1000_DEV_82574L) {
-        uint32_t rfctl = e1000_read(dev, E1000_RFCTL);
-        rfctl |= (1 << 15);  // EXSTEN - Extended Status Enable
-        e1000_write(dev, E1000_RFCTL, rfctl);
-    }
 
     // Configure receive control
     uint32_t rctl = E1000_RCTL_EN       // Enable receiver
@@ -159,7 +153,7 @@ static int e1000_init_rx(e1000_dev_t* dev) {
 // Initialize TX Ring with Extended Descriptors
 // ============================================================================
 static int e1000_init_tx(e1000_dev_t* dev) {
-    uint32_t tx_ring_size = sizeof(e1000_tx_desc_ext_t) * E1000_NUM_TX_DESC;
+    uint32_t tx_ring_size = sizeof(e1000_tx_desc_legacy_t) * E1000_NUM_TX_DESC;
     uint32_t tx_ring_pages = (tx_ring_size + PAGE_SIZE - 1) / PAGE_SIZE;
 
     uint64_t tx_phys = mm_allocate_contiguous_pages(tx_ring_pages);
@@ -168,7 +162,7 @@ static int e1000_init_tx(e1000_dev_t* dev) {
         return -1;
     }
 
-    dev->tx_descs = (e1000_tx_desc_ext_t*)phys_to_virt(tx_phys);
+    dev->tx_descs = (e1000_tx_desc_legacy_t*)phys_to_virt(tx_phys);
     dev->tx_descs_phys = tx_phys;
 
     // Zero descriptors
@@ -220,12 +214,9 @@ static int e1000_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     uint16_t tail = dev->tx_tail;
 
     // Check if descriptor is available (DD bit set means hardware is done with it)
-    volatile e1000_tx_desc_ext_data_t* desc = &dev->tx_descs[tail].data;
-    if (tail != 0 || dev->tx_descs[tail].data.olinfo_status != 0) {
-        // For non-first descriptor, check DD bit
-        if (!(desc->olinfo_status & E1000_TXD_EXT_STAT_DD) &&
-            desc->cmd_type_len != 0) {
-            // Descriptor still in use
+    volatile e1000_tx_desc_legacy_t* desc = &dev->tx_descs[tail];
+    if (tail != 0 || desc->cmd != 0) {
+        if (!(desc->status & E1000_TXD_STAT_DD) && desc->cmd != 0) {
             ndev->tx_errors++;
             return -1;
         }
@@ -235,15 +226,14 @@ static int e1000_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     for (uint16_t i = 0; i < len; i++)
         dev->tx_bufs[tail][i] = data[i];
 
-    // Set up extended TX descriptor (data format)
+    // Set up legacy TX descriptor
     desc->buffer_addr = dev->tx_bufs_phys[tail];
-    desc->cmd_type_len = (uint32_t)len
-                       | E1000_TXD_EXT_CMD_EOP
-                       | E1000_TXD_EXT_CMD_IFCS
-                       | E1000_TXD_EXT_CMD_RS
-                       | E1000_TXD_EXT_CMD_DEXT
-                       | E1000_TXD_EXT_DTYP_DATA;
-    desc->olinfo_status = ((uint32_t)len << E1000_TXD_EXT_PAYLEN_SHIFT);
+    desc->length = len;
+    desc->cso = 0;
+    desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_IFCS | E1000_TXD_CMD_RS;
+    desc->status = 0;
+    desc->css = 0;
+    desc->special = 0;
 
     // Memory barrier before advancing tail
     __asm__ volatile("mfence" ::: "memory");
@@ -286,6 +276,12 @@ void e1000_irq_handler(void) {
     e1000_dev_t* dev = &g_e1000;
     uint32_t icr = e1000_read(dev, E1000_ICR);
 
+    if (icr == 0) {
+        // Spurious - no cause bits set
+        lapic_eoi();
+        return;
+    }
+
     if (icr & E1000_ICR_LSC) {
         // Link status change
         uint32_t status = e1000_read(dev, E1000_STATUS);
@@ -294,24 +290,24 @@ void e1000_irq_handler(void) {
     }
 
     if (icr & (E1000_ICR_RXT0 | E1000_ICR_RXDMT0 | E1000_ICR_RXO)) {
-        // Process received packets
+        // Process received packets (legacy descriptors)
         uint16_t tail = (dev->rx_tail + 1) % E1000_NUM_RX_DESC;
 
         while (1) {
-            volatile e1000_rx_desc_ext_wb_t* desc = &dev->rx_descs[tail].wb;
-            if (!(desc->status_error & E1000_RXD_EXT_STAT_DD))
+            volatile e1000_rx_desc_legacy_t* desc = &dev->rx_descs[tail];
+            if (!(desc->status & E1000_RXD_STAT_DD))
                 break;
 
             uint16_t len = desc->length;
-            if ((desc->status_error & E1000_RXD_EXT_STAT_EOP) && len > 0 && len <= E1000_RX_BUF_SIZE) {
+            if ((desc->status & E1000_RXD_STAT_EOP) && len > 0 && len <= E1000_RX_BUF_SIZE) {
                 net_rx_packet(&dev->net_dev, dev->rx_bufs[tail], len);
             } else {
                 dev->net_dev.rx_errors++;
             }
 
-            // Reset descriptor for reuse (read format)
-            dev->rx_descs[tail].read.buffer_addr = dev->rx_bufs_phys[tail];
-            dev->rx_descs[tail].read.reserved = 0;
+            // Reset descriptor for reuse
+            desc->buffer_addr = dev->rx_bufs_phys[tail];
+            desc->status = 0;
 
             dev->rx_tail = tail;
             e1000_write(dev, E1000_RDT, tail);
@@ -445,6 +441,10 @@ void e1000_init(void) {
             kprintf("E1000: MSI not available, using legacy IRQ %d\n",
                     dev->pci_dev->interrupt_line);
             dev->msi_vector = 0;
+            // Route legacy PCI IRQ through IOAPIC (PCI INTx is active-low, level-triggered)
+            uint8_t irq = dev->pci_dev->interrupt_line;
+            uint8_t vector = 32 + irq;  // IRQ 11 -> vector 43
+            ioapic_configure_legacy_irq(irq, vector, IOAPIC_POLARITY_LOW, IOAPIC_TRIGGER_LEVEL);
         } else {
             kprintf("E1000: MSI enabled (vector %d)\n", dev->msi_vector);
         }

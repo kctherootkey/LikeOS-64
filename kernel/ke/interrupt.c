@@ -615,6 +615,14 @@ void irq_handler(uint64_t *regs) {
             mouse_irq_handler();
             break;
         default: {
+            // Legacy INTx dispatch for E1000 NIC (when MSI is not available)
+            extern int g_e1000_initialized;
+            if (g_e1000_initialized && irq == 11) {
+                e1000_irq_handler();
+                // e1000_irq_handler calls lapic_eoi() which also
+                // signals EOI to IOAPIC for level-triggered entries.
+                return;  // skip pic_send_eoi — IRQ goes through IOAPIC
+            }
             // Legacy INTx dispatch for XHCI (when MSI is not available)
             extern xhci_controller_t g_xhci;
             if (g_xhci.initialized && g_xhci.irq_enabled && !g_xhci.msi_enabled
