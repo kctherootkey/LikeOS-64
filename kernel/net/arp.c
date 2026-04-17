@@ -100,6 +100,25 @@ int arp_resolve(net_device_t* dev, uint32_t ip, uint8_t mac_out[ETH_ALEN]) {
     return -1;
 }
 
+// Cache-only lookup (no ARP request sent on miss).
+// Returns 0 on hit, -1 on miss.
+int arp_cache_lookup(uint32_t ip, uint8_t mac_out[ETH_ALEN]) {
+    uint64_t flags;
+    spin_lock_irqsave(&arp_lock, &flags);
+
+    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+        if (arp_table[i].valid && arp_table[i].ip == ip) {
+            for (int m = 0; m < ETH_ALEN; m++)
+                mac_out[m] = arp_table[i].mac[m];
+            spin_unlock_irqrestore(&arp_lock, flags);
+            return 0;
+        }
+    }
+
+    spin_unlock_irqrestore(&arp_lock, flags);
+    return -1;
+}
+
 // Send ARP request
 void arp_request(net_device_t* dev, uint32_t target_ip) {
     uint8_t pkt[sizeof(arp_header_t)];
