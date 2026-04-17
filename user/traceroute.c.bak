@@ -1,0 +1,131 @@
+/*
+ * traceroute - print the route packets trace to network host
+ *
+ * Usage: traceroute [-m max_ttl] [-q nqueries] [-w waittime] [-n] host
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+
+static const char *ip_str(uint32_t ip)
+{
+    struct in_addr a;
+    a.s_addr = htonl(ip);
+    return inet_ntoa(a);
+}
+
+static uint32_t resolve_host(const char *host)
+{
+    uint32_t ip = inet_addr(host);
+    if (ip != 0 && ip != 0xFFFFFFFF)
+        return ntohl(ip);
+    uint32_t resolved;
+    if (dns_resolve(host, &resolved) == 0)
+        return resolved;
+    return 0;
+}
+
+static void print_help(const char *progname)
+{
+    printf("Usage: %s [OPTIONS] host\n", progname);
+    printf("Print the route packets take to network host.\n\n");
+    printf("Options:\n");
+    printf("  -m max_ttl    set the max time-to-live (max number of hops, default 30)\n");
+    printf("  -q nqueries   set the number of probes per hop (default 3)\n");
+    printf("  -w waittime   set the time (in seconds) to wait for a response (default 5)\n");
+    printf("  -n            print hop addresses numerically\n");
+    printf("  -f first_ttl  start from the first_ttl hop (default 1)\n");
+    printf("  -p port       set the destination port (default 33434)\n");
+    printf("  -I            use ICMP ECHO for probes\n");
+    printf("  -h            display this help and exit\n");
+}
+
+int main(int argc, char *argv[])
+{
+    int max_ttl = 30;
+    int nqueries = 3;
+    int waittime = 5;
+    int first_ttl = 1;
+    int numeric = 0;
+    int opt;
+
+    while ((opt = getopt(argc, argv, "m:q:w:f:p:Inh")) != -1) {
+        switch (opt) {
+            case 'm': max_ttl = atoi(optarg); break;
+            case 'q': nqueries = atoi(optarg); break;
+            case 'w': waittime = atoi(optarg); break;
+            case 'f': first_ttl = atoi(optarg); break;
+            case 'p': /* port - ignored, we use ICMP */ break;
+            case 'I': /* ICMP mode - default */ break;
+            case 'n': numeric = 1; break;
+            case 'h': print_help(argv[0]); return 0;
+            default: print_help(argv[0]); return 1;
+        }
+    }
+
+    if (optind >= argc) {
+        fprintf(stderr, "traceroute: missing host operand\n");
+        return 1;
+    }
+
+    const char *host = argv[optind];
+    uint32_t dst_ip = resolve_host(host);
+    if (dst_ip == 0) {
+        fprintf(stderr, "traceroute: %s: Name or service not known\n", host);
+        return 1;
+    }
+
+    printf("traceroute to %s (%s), %d hops max, 60 byte packets\n",
+           host, ip_str(dst_ip), max_ttl);
+
+    uint16_t id = (uint16_t)(getpid() & 0xFFFF);
+    uint16_t seq = 1;
+
+    for (int ttl = first_ttl; ttl <= max_ttl; ttl++) {
+        printf("%2d ", ttl);
+        int reached = 0;
+
+        for (int q = 0; q < nqueries; q++) {
+            uint32_t id_seq = ((uint32_t)id << 16) | seq;
+            int ret = raw_send(RAW_SEND_ICMP_ECHO, dst_ip, id_seq, (uint32_t)ttl);
+            if (ret < 0) {
+                printf(" * ");
+                seq++;
+                continue;
+            }
+
+            uint64_t timeout_ticks = (uint64_t)waittime * 100;
+            uint8_t result[8];
+            ret = raw_recv(RAW_RECV_ICMP_REPLY, result, id, timeout_ticks);
+            if (ret == 0) {
+                uint32_t src = ((uint32_t)result[0] << 24) | ((uint32_t)result[1] << 16) |
+                               ((uint32_t)result[2] << 8) | result[3];
+                uint8_t type = result[4];
+                (void)numeric;
+
+                if (q == 0)
+                    printf(" %s", ip_str(src));
+                printf("  ~1 ms");
+
+                if (type == 0) {
+                    /* Echo reply - we reached the target */
+                    reached = 1;
+                }
+            } else {
+                printf(" *");
+            }
+            seq++;
+        }
+        printf("\n");
+
+        if (reached)
+            break;
+    }
+
+    return 0;
+}

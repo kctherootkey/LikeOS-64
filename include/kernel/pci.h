@@ -53,4 +53,8 @@ uint8_t pci_find_capability(const pci_device_t* dev, uint8_t cap_id);
 // Returns 0 on success, -1 if device has no MSI capability.
 int pci_enable_msi(const pci_device_t* dev, uint8_t vector);
 
+// Find the PCI-to-PCI bridge whose secondary bus matches target_bus.
+// Returns the bridge pci_device_t* or NULL if not found.
+const pci_device_t* pci_find_bridge_for_bus(unsigned char target_bus);
+
 #endif // LIKEOS_PCI_H

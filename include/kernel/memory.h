@@ -18,6 +18,7 @@
 #define USER_SPACE_END          0x00007FFFFFFFFFFFULL  // End of user space (canonical low half)
 #define USER_STACK_TOP          0x00007FFFFFF00000ULL  // User stack top (grows down)
 #define USER_STACK_SIZE         (2 * 1024 * 1024)       // 2MB default user stack
+#define KERNEL_STACK_SIZE       (16 * 1024)             // 16KB kernel stack per task
 
 // Kernel space virtual address constants  
 #define KERNEL_OFFSET           0xFFFFFFFF80000000ULL  // Higher-half kernel base

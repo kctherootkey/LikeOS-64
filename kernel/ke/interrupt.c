@@ -19,7 +19,7 @@ extern int acpi_sci_dispatch(void);
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_descriptor idt_desc;
 static struct tss_entry tss;  // BSP TSS
-static uint8_t interrupt_stack[8192] __attribute__((aligned(16)));
+static uint8_t interrupt_stack[16384] __attribute__((aligned(16)));
 
 // IST (Interrupt Stack Table) stacks for critical exceptions that need
 // guaranteed separate stacks (double fault, NMI, machine check).
@@ -39,7 +39,7 @@ static uint8_t bsp_ist3_stack[IST_STACK_SIZE] __attribute__((aligned(16)));  // 
 // Per-CPU TSS for SMP (index 0 = BSP, 1..MAX_CPUS-1 = APs)
 #define MAX_CPUS_TSS 64
 static struct tss_entry ap_tss[MAX_CPUS_TSS] __attribute__((aligned(16)));
-static uint8_t ap_interrupt_stacks[MAX_CPUS_TSS][8192] __attribute__((aligned(16)));
+static uint8_t ap_interrupt_stacks[MAX_CPUS_TSS][16384] __attribute__((aligned(16)));
 
 // Per-AP IST stacks
 static uint8_t ap_ist1_stacks[MAX_CPUS_TSS][IST_STACK_SIZE] __attribute__((aligned(16)));  // Double Fault
@@ -514,6 +514,18 @@ void irq_handler(uint64_t *regs) {
         return;
     }
 
+    // Legacy INTx dispatch for E1000 NIC (when MSI is not available).
+    // Must be checked BEFORE the I2C LPSS range (vectors 50-53) because
+    // the E1000's IOAPIC GSI may map to a vector in that range.
+    {
+        extern int g_e1000_initialized;
+        extern int g_e1000_legacy_irq;
+        if (g_e1000_initialized && g_e1000_legacy_irq >= 0 && irq == g_e1000_legacy_irq) {
+            e1000_irq_handler();
+            return;  // e1000_irq_handler calls lapic_eoi()
+        }
+    }
+
     // MSI/IOAPIC vectors for I2C LPSS controllers (vectors 50-53)
     if (int_no >= 50 && int_no <= 53) {
         i2c_hid_irq_handler((uint8_t)int_no);
@@ -615,14 +627,6 @@ void irq_handler(uint64_t *regs) {
             mouse_irq_handler();
             break;
         default: {
-            // Legacy INTx dispatch for E1000 NIC (when MSI is not available)
-            extern int g_e1000_initialized;
-            if (g_e1000_initialized && irq == 11) {
-                e1000_irq_handler();
-                // e1000_irq_handler calls lapic_eoi() which also
-                // signals EOI to IOAPIC for level-triggered entries.
-                return;  // skip pic_send_eoi — IRQ goes through IOAPIC
-            }
             // Legacy INTx dispatch for XHCI (when MSI is not available)
             extern xhci_controller_t g_xhci;
             if (g_xhci.initialized && g_xhci.irq_enabled && !g_xhci.msi_enabled

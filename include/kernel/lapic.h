@@ -149,6 +149,12 @@ uint64_t lapic_timer_get_frequency(void);
 // Get TSC frequency in Hz (0 if unknown)
 uint64_t lapic_get_tsc_freq(void);
 
+// True when the hypervisor provides a reliable guest-wide TSC.
+bool lapic_tsc_is_reliable(void);
+
+// Set TSC frequency in Hz (called after RTC-based calibration)
+void lapic_set_tsc_freq(uint64_t hz);
+
 // ============================================================================
 // Inter-Processor Interrupt (IPI) Functions
 // ============================================================================

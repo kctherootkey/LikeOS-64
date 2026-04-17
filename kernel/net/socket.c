@@ -1323,3 +1323,114 @@ int sock_sendfile(int out_fd, int in_fd, int64_t* offset, size_t count) {
 
     return total > 0 ? (int)total : err;
 }
+
+// ============================================================================
+// Network info queries for userspace commands (netstat, ifconfig, etc.)
+// ============================================================================
+
+// Get TCP connection info
+int net_get_tcp_connections(net_tcp_info_t* entries, int max_entries) {
+    extern tcp_conn_t tcp_connections[TCP_MAX_CONNECTIONS];
+    int count = 0;
+    for (int i = 0; i < TCP_MAX_CONNECTIONS && count < max_entries; i++) {
+        tcp_conn_t* c = &tcp_connections[i];
+        if (!c->active) continue;
+        entries[count].local_ip = c->local_ip;
+        entries[count].local_port = c->local_port;
+        entries[count].remote_ip = c->remote_ip;
+        entries[count].remote_port = c->remote_port;
+        entries[count].state = c->state;
+        // Calculate queue sizes
+        uint32_t rx_used = 0;
+        if (c->rx_buf) {
+            if (c->rx_head >= c->rx_tail)
+                rx_used = c->rx_head - c->rx_tail;
+            else
+                rx_used = c->rx_buf_size - c->rx_tail + c->rx_head;
+        }
+        entries[count].rx_queue = rx_used;
+        uint32_t tx_used = 0;
+        if (c->tx_buf) {
+            if (c->tx_head >= c->tx_tail)
+                tx_used = c->tx_head - c->tx_tail;
+            else
+                tx_used = c->tx_buf_size - c->tx_tail + c->tx_head;
+        }
+        entries[count].tx_queue = tx_used;
+        count++;
+    }
+    return count;
+}
+
+// Get UDP socket info
+int net_get_udp_sockets(net_udp_info_t* entries, int max_entries) {
+    int count = 0;
+    for (int i = 0; i < NET_MAX_SOCKETS && count < max_entries; i++) {
+        net_socket_t* s = &sockets[i];
+        if (!s->active || s->type != SOCK_DGRAM) continue;
+        entries[count].local_ip = net_ntohl(s->local_addr.sin_addr.s_addr);
+        entries[count].local_port = net_ntohs(s->local_addr.sin_port);
+        entries[count].remote_ip = net_ntohl(s->remote_addr.sin_addr.s_addr);
+        entries[count].remote_port = net_ntohs(s->remote_addr.sin_port);
+        int rx_count = s->udp_rx_tail - s->udp_rx_head;
+        if (rx_count < 0) rx_count += 16;
+        entries[count].rx_queue = (uint32_t)rx_count;
+        count++;
+    }
+    return count;
+}
+
+// Get interface info
+int net_get_iface_info(net_iface_info_t* entries, int max_entries) {
+    int count = 0;
+    // Loopback first
+    net_device_t* lo = net_get_loopback();
+    if (lo && count < max_entries) {
+        const char* n = lo->name;
+        int j = 0;
+        while (n[j] && j < 15) { entries[count].name[j] = n[j]; j++; }
+        entries[count].name[j] = '\0';
+        for (int m = 0; m < 6; m++) entries[count].mac[m] = lo->mac_addr[m];
+        entries[count].mtu = lo->mtu;
+        entries[count].ip_addr = lo->ip_addr;
+        entries[count].netmask = lo->netmask;
+        entries[count].gateway = lo->gateway;
+        entries[count].dns_server = lo->dns_server;
+        entries[count].flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
+        entries[count].pad = 0;
+        entries[count].rx_packets = lo->rx_packets;
+        entries[count].tx_packets = lo->tx_packets;
+        entries[count].rx_bytes = lo->rx_bytes;
+        entries[count].tx_bytes = lo->tx_bytes;
+        entries[count].rx_errors = lo->rx_errors;
+        entries[count].tx_errors = lo->tx_errors;
+        entries[count].rx_dropped = lo->rx_dropped;
+        count++;
+    }
+    // Hardware devices
+    for (int i = 0; i < net_device_count() && count < max_entries; i++) {
+        net_device_t* dev = net_get_device(i);
+        if (!dev) continue;
+        const char* n = dev->name;
+        int j = 0;
+        while (n[j] && j < 15) { entries[count].name[j] = n[j]; j++; }
+        entries[count].name[j] = '\0';
+        for (int m = 0; m < 6; m++) entries[count].mac[m] = dev->mac_addr[m];
+        entries[count].mtu = dev->mtu;
+        entries[count].ip_addr = dev->ip_addr;
+        entries[count].netmask = dev->netmask;
+        entries[count].gateway = dev->gateway;
+        entries[count].dns_server = dev->dns_server;
+        entries[count].flags = IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST;
+        entries[count].pad = 0;
+        entries[count].rx_packets = dev->rx_packets;
+        entries[count].tx_packets = dev->tx_packets;
+        entries[count].rx_bytes = dev->rx_bytes;
+        entries[count].tx_bytes = dev->tx_bytes;
+        entries[count].rx_errors = dev->rx_errors;
+        entries[count].tx_errors = dev->tx_errors;
+        entries[count].rx_dropped = dev->rx_dropped;
+        count++;
+    }
+    return count;
+}

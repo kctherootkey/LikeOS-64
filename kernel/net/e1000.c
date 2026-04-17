@@ -9,10 +9,12 @@
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/ioapic.h"
+#include "../../include/kernel/acpi.h"
 
 // Global e1000 device (single NIC support)
 static e1000_dev_t g_e1000;
 int g_e1000_initialized = 0;
+int g_e1000_legacy_irq = -1;  // Legacy IRQ number (-1 = not using legacy)
 
 // ============================================================================
 // MMIO helpers
@@ -438,13 +440,52 @@ void e1000_init(void) {
         dev->msi_vector = E1000_MSI_VECTOR;
         int msi_ret = pci_enable_msi(dev->pci_dev, dev->msi_vector);
         if (msi_ret < 0) {
-            kprintf("E1000: MSI not available, using legacy IRQ %d\n",
-                    dev->pci_dev->interrupt_line);
             dev->msi_vector = 0;
-            // Route legacy PCI IRQ through IOAPIC (PCI INTx is active-low, level-triggered)
             uint8_t irq = dev->pci_dev->interrupt_line;
-            uint8_t vector = 32 + irq;  // IRQ 11 -> vector 43
-            ioapic_configure_legacy_irq(irq, vector, IOAPIC_POLARITY_LOW, IOAPIC_TRIGGER_LEVEL);
+
+            // If PCI interrupt_line is invalid (0xFF or beyond IOAPIC range),
+            // use ACPI _PRT to discover the real GSI
+            if (irq == 0xFF || irq > 23) {
+                uint32_t gsi = 0;
+                uint8_t pin = dev->pci_dev->interrupt_pin;
+                if (pin >= 1 && pin <= 4) pin--;  // PCI pin 1-4 -> ACPI pin 0-3
+
+                // For devices behind PCI-to-PCI bridges, we must:
+                // 1. Find the bridge on bus 0 that owns this secondary bus
+                // 2. Apply PCI interrupt pin swizzling
+                // 3. Look up the bridge device (not the NIC) in the root _PRT
+                uint8_t lookup_dev = dev->pci_dev->device;
+                uint8_t lookup_pin = pin;
+
+                if (dev->pci_dev->bus != 0) {
+                    const pci_device_t *bridge = pci_find_bridge_for_bus(dev->pci_dev->bus);
+                    if (bridge) {
+                        // PCI spec pin swizzle: pin = (pin + device_number) % 4
+                        lookup_pin = (pin + dev->pci_dev->device) % 4;
+                        lookup_dev = bridge->device;
+
+                    }
+                }
+
+                if (acpi_pci_lookup_irq("\\\\_SB_.PCI0",
+                                        lookup_dev, lookup_pin,
+                                        &gsi) == 0 && gsi >= 1 && gsi <= 23) {
+                    irq = (uint8_t)gsi;
+                    kprintf("E1000: ACPI _PRT resolved IRQ -> GSI %u\n", gsi);
+                } else {
+                    kprintf("E1000: WARNING: no valid IRQ (line=%d, ACPI lookup failed)\n",
+                            dev->pci_dev->interrupt_line);
+                    kprintf("E1000: Interrupts may not work (polling not supported)\n");
+                }
+            }
+
+            kprintf("E1000: Using legacy IRQ %d\n", irq);
+            g_e1000_legacy_irq = irq;
+
+            if (irq <= 23) {
+                uint8_t vector = 32 + irq;
+                ioapic_configure_legacy_irq(irq, vector, IOAPIC_POLARITY_LOW, IOAPIC_TRIGGER_LEVEL);
+            }
         } else {
             kprintf("E1000: MSI enabled (vector %d)\n", dev->msi_vector);
         }

@@ -1,0 +1,269 @@
+DIG(1)                           User Commands                          DIG(1)
+
+NAME
+       dig - DNS lookup utility
+
+SYNOPSIS
+       dig [@server] [-b address] [-c class] [-f filename] [-k filename]
+           [-m] [-p port#] [-q name] [-t type] [-x addr]
+           [-y [hmac:]name:key] [-4] [-6] [name] [type] [class]
+           [queryopt...]
+
+       dig [-h]
+
+       dig [global-queryopt...] [query...]
+
+DESCRIPTION
+       dig (domain information groper) is a flexible tool for
+       interrogating DNS name servers. It performs DNS lookups and
+       displays the answers that are returned from the name server(s)
+       that were queried. Most DNS administrators use dig to
+       troubleshoot DNS problems because of its flexibility, ease
+       of use and clarity of output.
+
+       Unless it is told to query a specific name server, dig will
+       try each of the servers listed in /etc/resolv.conf. On LikeOS,
+       the kernel's built-in DNS resolver is used.
+
+       When no command line arguments or options are given, dig will
+       perform a NS query for "." (the root).
+
+SIMPLE USAGE
+       A typical invocation of dig looks like:
+
+              dig @server name type
+
+       where:
+
+       server is the name or IP address of the name server to query.
+              When the supplied server argument is a hostname, dig
+              resolves that name before querying the name server.
+
+       name   is the name of the resource record that is to be looked
+              up.
+
+       type   is the type of query required — ANY, A, MX, SIG, etc.
+              type can be any valid query type. If no type argument
+              is supplied, dig will perform a lookup for an A record.
+
+OPTIONS
+       -b address
+              Set the source IP address of the query.
+
+       -c class
+              Set the query class. The default class is IN; other
+              classes are HS for Hesiod records or CH for Chaosnet
+              records.
+
+       -f filename
+              Batch mode: dig reads a list of lookup requests to
+              process from the given file. Each line in the file
+              should be organized in the same way they would be
+              presented as queries.
+
+       -k filename
+              Name of the file containing the TSIG key.
+
+       -m     Enable memory usage debugging.
+
+       -p port#
+              Send the query to a non-standard port on the server
+              (default is 53).
+
+       -q name
+              The domain name to query. This is useful to distinguish
+              the name from other arguments.
+
+       -t type
+              The resource record type to query. It can be any valid
+              query type which is supported in BIND 9. The default
+              query type is "A", unless the -x option is supplied.
+
+       -x addr
+              Simplified reverse lookups, for mapping addresses to
+              names. addr is an IPv4 address in dotted-decimal
+              notation.
+
+       -y [hmac:]keyname:secret
+              Sign the queries using TSIG with the given
+              authentication key. Not supported on LikeOS.
+
+       -4     Use IPv4 only.
+
+       -6     Use IPv6 only (not supported on LikeOS).
+
+       -h     Print a brief summary of command-line arguments and
+              options.
+
+QUERY OPTIONS
+       dig provides a number of query options which affect the way
+       in which lookups are made and the results displayed. Some of
+       these set or reset flag bits in the query header, some
+       determine which sections of the answer get printed, and others
+       determine the timeout and retry strategies.
+
+       Each query option is identified by a keyword preceded by a
+       plus sign (+). Some keywords set or reset an option. These
+       may be preceded by the string "no" to negate the meaning of
+       that keyword.
+
+       +[no]tcp, +[no]vc
+              Use [do not use] TCP when querying name servers.
+
+       +[no]ignore
+              Ignore truncation in UDP responses instead of retrying
+              with TCP.
+
+       +domain=somename
+              Set the search list to contain the single domain
+              somename.
+
+       +[no]search
+              Use [do not use] the search list defined by the
+              searchlist or domain directive in resolv.conf.
+
+       +[no]aaonly, +[no]aaflag
+              A synonym for +[no]aaonly (obsolete).
+
+       +[no]adflag
+              Set [do not set] the AD (authentic data) bit in the
+              query.
+
+       +[no]cdflag
+              Set [do not set] the CD (checking disabled) bit in
+              the query.
+
+       +[no]cl
+              Display [do not display] the CLASS when printing the
+              record.
+
+       +[no]ttlid
+              Display [do not display] the TTL when printing the
+              record.
+
+       +[no]recurse
+              Toggle the setting of the RD (recursion desired) bit
+              in the query.
+
+       +[no]nssearch
+              When this option is set, dig attempts to find the
+              authoritative name servers for the zone containing the
+              name being looked up and display the SOA record.
+
+       +[no]trace
+              Toggle tracing of the delegation path from the root
+              name servers for the name being looked up.
+
+       +[no]cmd
+              Toggles the printing of the initial comment in the
+              output.
+
+       +[no]short
+              Provide a terse answer. The default is to print the
+              answer in a verbose form.
+
+       +[no]identify
+              Show [or do not show] the IP address and port number
+              that supplied the answer when +short is enabled.
+
+       +[no]comments
+              Toggle the display of comment lines in the output.
+
+       +[no]stats
+              Toggle the printing of statistics.
+
+       +[no]qr
+              Print [do not print] the query as it is sent.
+
+       +[no]question
+              Print [do not print] the question section of a query
+              when an answer is returned.
+
+       +[no]answer
+              Display [do not display] the answer section of a
+              reply.
+
+       +[no]authority
+              Display [do not display] the authority section of a
+              reply.
+
+       +[no]additional
+              Display [do not display] the additional section of a
+              reply.
+
+       +[no]all
+              Set or clear all display flags.
+
+       +time=T
+              Sets the timeout for a query to T seconds. The
+              default timeout is 5 seconds.
+
+       +tries=T
+              Sets the number of times to try UDP queries to
+              server to T instead of the default, 3.
+
+       +retry=T
+              Sets the number of times to retry UDP queries to
+              T. The default is 2.
+
+       +ndots=D
+              Set the number of dots (D) that have to appear in
+              name for it to be considered absolute.
+
+       +bufsize=B
+              Set the UDP message buffer size advertised using
+              EDNS0 to B bytes.
+
+       +[no]edns[=#]
+              Specify the EDNS version to query with.
+
+       +[no]multiline
+              Print records like the SOA records in a verbose
+              multi-line format.
+
+       +[no]onesoa
+              Print only one (starting) SOA record when performing
+              an AXFR.
+
+       +[no]fail
+              Do not try the next server if you receive a SERVFAIL.
+
+       +[no]besteffort
+              Attempt to display the contents of messages which are
+              malformed.
+
+       +[no]dnssec
+              Requests DNSSEC records be sent by setting the DNSSEC
+              OK bit (DO) in the OPT record in the additional
+              section of the query.
+
+       +[no]nsid
+              Include an EDNS name server ID request when sending a
+              query.
+
+EXAMPLES
+       dig example.com
+              Look up the A record of example.com.
+
+       dig example.com MX
+              Look up the MX records.
+
+       dig @8.8.8.8 example.com
+              Query Google's DNS server.
+
+       dig example.com +short
+              Display only the answer.
+
+       dig -x 8.8.8.8
+              Reverse lookup.
+
+       dig example.com +noall +answer
+              Show only the answer section.
+
+       dig -f queries.txt
+              Batch mode from file.
+
+SEE ALSO
+       host(1), nslookup(1)
+
+LikeOS                                                                DIG(1)

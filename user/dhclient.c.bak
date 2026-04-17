@@ -1,0 +1,91 @@
+/*
+ * dhclient - DHCP client
+ *
+ * Usage: dhclient [OPTIONS] [interface]
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <getopt.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+
+static const char *ip_str(uint32_t ip)
+{
+    struct in_addr a;
+    a.s_addr = htonl(ip);
+    return inet_ntoa(a);
+}
+
+static void print_help(const char *progname)
+{
+    printf("Usage: %s [OPTIONS] [interface]\n", progname);
+    printf("Dynamic Host Configuration Protocol Client.\n\n");
+    printf("Options:\n");
+    printf("  -r             release the current lease\n");
+    printf("  -x             stop the running DHCP client\n");
+    printf("  -1             try once to get a lease\n");
+    printf("  -v             enable verbose output\n");
+    printf("  -s server      send messages to server address\n");
+    printf("  -n             do not configure any interfaces\n");
+    printf("  -q             quiet (suppress output)\n");
+    printf("  -h             display this help and exit\n");
+}
+
+int main(int argc, char *argv[])
+{
+    int release = 0;
+    int verbose = 0;
+    int quiet = 0;
+    int opt;
+
+    while ((opt = getopt(argc, argv, "rx1vs:nqh")) != -1) {
+        switch (opt) {
+            case 'r': release = 1; break;
+            case 'x': release = 1; break;
+            case '1': /* try once - default behavior */ break;
+            case 'v': verbose = 1; break;
+            case 's': /* server - not used */ break;
+            case 'n': /* no configure - not used */ break;
+            case 'q': quiet = 1; break;
+            case 'h': print_help(argv[0]); return 0;
+            default: print_help(argv[0]); return 1;
+        }
+    }
+
+    if (release) {
+        if (!quiet) printf("Releasing DHCP lease...\n");
+        int ret = dhcp_control(DHCP_CMD_RELEASE);
+        if (ret < 0) {
+            if (!quiet) fprintf(stderr, "dhclient: release failed\n");
+            return 1;
+        }
+        if (!quiet) printf("DHCP lease released.\n");
+        return 0;
+    }
+
+    /* Default: renew/obtain lease */
+    if (!quiet && verbose) printf("Sending DHCP request...\n");
+
+    int ret = dhcp_control(DHCP_CMD_RENEW);
+    if (ret < 0) {
+        if (!quiet) fprintf(stderr, "dhclient: DHCP request failed\n");
+        return 1;
+    }
+
+    /* Show current config */
+    if (!quiet) {
+        net_iface_info_t ifaces[4];
+        int n = net_getinfo(NET_GET_IFACE_INFO, ifaces, 4);
+        for (int i = 0; i < n; i++) {
+            if (ifaces[i].ip != 0 && !(ifaces[i].flags & 0x0008)) {
+                printf("bound to %s -- renewal in 3600 seconds.\n",
+                       ip_str(ifaces[i].ip));
+                break;
+            }
+        }
+    }
+
+    return 0;
+}

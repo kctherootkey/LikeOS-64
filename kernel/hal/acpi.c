@@ -673,6 +673,24 @@ int acpi_init(uint64_t rsdp_hint) {
         acpi_dbg("ACPI: InitObjects ok\n");
     }
 
+    // Tell firmware we are using IOAPIC mode (not legacy PIC).
+    // This sets the DSDT variable PICM=1 so that _PRT methods
+    // return hardwired IOAPIC GSIs instead of PIC link devices.
+    {
+        ACPI_OBJECT_LIST pic_args;
+        ACPI_OBJECT pic_arg;
+        pic_arg.Type = ACPI_TYPE_INTEGER;
+        pic_arg.Integer.Value = 1;   // 1 = APIC/IOAPIC mode
+        pic_args.Count = 1;
+        pic_args.Pointer = &pic_arg;
+        ACPI_STATUS ps = AcpiEvaluateObject(NULL, "\\_PIC", &pic_args, NULL);
+        if (ACPI_SUCCESS(ps)) {
+            kprintf("ACPI: _PIC(1) -> IOAPIC mode selected\n");
+        } else {
+            acpi_dbg("ACPI: _PIC not found (status %d), assuming hardwired\n", (int)ps);
+        }
+    }
+
     // Probe i8042 again after _INI methods have run — they may have
     // told the EC to enable KBC emulation on 0x60/0x64.
     {
@@ -1837,24 +1855,6 @@ int acpi_pci_lookup_irq(const char* bridge_path,
     ACPI_PCI_ROUTING_TABLE *entry = (ACPI_PCI_ROUTING_TABLE *)buf.Pointer;
     int found = 0;
 
-    // Dump all _PRT entries for diagnostics (first call only)
-    {
-        static int prt_dumped = 0;
-        if (!prt_dumped) {
-            prt_dumped = 1;
-            ACPI_PCI_ROUTING_TABLE *e = entry;
-            int n = 0;
-            while (e && e->Length > 0 && n < 64) {
-                acpi_dbg("[PRT]   #%d addr=0x%llx pin=%u src='%s' idx=%u\n",
-                        n, (unsigned long long)e->Address, e->Pin,
-                        e->Source[0] ? e->Source : "(hw)",
-                        e->SourceIndex);
-                e = (ACPI_PCI_ROUTING_TABLE *)((char *)e + e->Length);
-                n++;
-            }
-        }
-    }
-
     while (entry && entry->Length > 0) {
         if (entry->Address == match_addr && entry->Pin == pci_pin) {
             if (entry->Source[0] == '\0') {
@@ -1863,9 +1863,11 @@ int acpi_pci_lookup_irq(const char* bridge_path,
                 found = 1;
             } else {
                 // Link device (e.g. LNKA) — evaluate _CRS to get GSI
-                ACPI_HANDLE link;
-                if (ACPI_SUCCESS(AcpiGetHandle(handle, entry->Source, &link)) ||
-                    ACPI_SUCCESS(AcpiGetHandle(NULL, entry->Source, &link))) {
+                ACPI_HANDLE link = NULL;
+                if (!ACPI_SUCCESS(AcpiGetHandle(handle, entry->Source, &link)))
+                    AcpiGetHandle(NULL, entry->Source, &link);
+
+                if (link) {
                     ACPI_BUFFER lbuf = { ACPI_ALLOCATE_BUFFER, NULL };
                     if (ACPI_SUCCESS(AcpiGetCurrentResources(link, &lbuf))) {
                         ACPI_RESOURCE *res = (ACPI_RESOURCE *)lbuf.Pointer;
@@ -1885,6 +1887,73 @@ int acpi_pci_lookup_irq(const char* bridge_path,
                             res = ACPI_NEXT_RESOURCE(res);
                         }
                         AcpiOsFree(lbuf.Pointer);
+                    }
+
+                    // If _CRS returned 0 (unconfigured link), try _PRS + _SRS
+                    // to activate the link device with a valid IRQ
+                    if (found && *out_gsi == 0) {
+                        found = 0;  // reject GSI 0 (PIT timer)
+                        ACPI_BUFFER pbuf = { ACPI_ALLOCATE_BUFFER, NULL };
+                        if (ACPI_SUCCESS(AcpiGetPossibleResources(link, &pbuf))) {
+                            ACPI_RESOURCE *pres = (ACPI_RESOURCE *)pbuf.Pointer;
+                            uint32_t chosen_irq = 0;
+                            while (pres && pres->Type != ACPI_RESOURCE_TYPE_END_TAG) {
+                                if (pres->Type == ACPI_RESOURCE_TYPE_IRQ &&
+                                    pres->Data.Irq.InterruptCount > 0) {
+                                    // Pick first IRQ >= 1 from the possible list
+                                    for (int k = 0; k < pres->Data.Irq.InterruptCount; k++) {
+                                        if (pres->Data.Irq.Interrupts[k] >= 1) {
+                                            chosen_irq = pres->Data.Irq.Interrupts[k];
+                                            break;
+                                        }
+                                    }
+                                    break;
+                                }
+                                if (pres->Type == ACPI_RESOURCE_TYPE_EXTENDED_IRQ &&
+                                    pres->Data.ExtendedIrq.InterruptCount > 0) {
+                                    for (int k = 0; k < (int)pres->Data.ExtendedIrq.InterruptCount; k++) {
+                                        if (pres->Data.ExtendedIrq.Interrupts[k] >= 1) {
+                                            chosen_irq = pres->Data.ExtendedIrq.Interrupts[k];
+                                            break;
+                                        }
+                                    }
+                                    break;
+                                }
+                                pres = ACPI_NEXT_RESOURCE(pres);
+                            }
+
+                            if (chosen_irq > 0) {
+                                // Build a resource buffer to program via _SRS
+                                // Use a small static buffer: IRQ descriptor + end tag
+                                uint8_t srs_buf[32];
+                                ACPI_RESOURCE *sr = (ACPI_RESOURCE *)srs_buf;
+                                sr->Type = ACPI_RESOURCE_TYPE_IRQ;
+                                sr->Length = (UINT16)(sizeof(ACPI_RESOURCE) - sizeof(sr->Data) + sizeof(sr->Data.Irq));
+                                sr->Data.Irq.InterruptCount = 1;
+                                sr->Data.Irq.Triggering = ACPI_LEVEL_SENSITIVE;
+                                sr->Data.Irq.Polarity = ACPI_ACTIVE_LOW;
+                                sr->Data.Irq.Shareable = ACPI_SHARED;
+                                sr->Data.Irq.Interrupts[0] = (UINT8)chosen_irq;
+                                sr->Data.Irq.DescriptorLength = 2;
+                                // End tag
+                                ACPI_RESOURCE *et = ACPI_NEXT_RESOURCE(sr);
+                                et->Type = ACPI_RESOURCE_TYPE_END_TAG;
+                                et->Length = (UINT16)(sizeof(ACPI_RESOURCE) - sizeof(et->Data) + sizeof(et->Data.EndTag));
+                                et->Data.EndTag.Checksum = 0;
+
+                                ACPI_BUFFER sbuf;
+                                sbuf.Pointer = srs_buf;
+                                sbuf.Length = (char *)ACPI_NEXT_RESOURCE(et) - (char *)srs_buf;
+
+                                if (ACPI_SUCCESS(AcpiSetCurrentResources(link, &sbuf))) {
+                                    *out_gsi = chosen_irq;
+                                    found = 1;
+                                    acpi_dbg("[PRT] Activated link '%s' -> IRQ %u\n",
+                                            entry->Source, chosen_irq);
+                                }
+                            }
+                            AcpiOsFree(pbuf.Pointer);
+                        }
                     }
                 }
             }
@@ -1929,4 +1998,15 @@ void acpi_reset(void) {
     __asm__ volatile("lidt %0; int $3" :: "m"(null_idt));
 
     for (;;) __asm__ volatile("hlt");
+}
+
+/* Read ACPI PM Timer (3.579545 MHz, chipset-based global counter).
+ * Returns the 32-bit (or 24-bit) free-running counter value.
+ * Returns 0 if PM Timer is not available. */
+uint32_t acpi_read_pmtimer(void) {
+    uint32_t ticks = 0;
+    ACPI_STATUS status = AcpiGetTimer(&ticks);
+    if (ACPI_FAILURE(status))
+        return 0;
+    return ticks;
 }

@@ -127,6 +127,8 @@ void continue_system_startup(void) {
     // device nodes.
     acpi_init(g_rsdp_address);
     acpi_pm_init();
+    timer_init_hpet();     // Prefer HPET for precise wall-clock timing if available
+    timer_init_pmtimer();  // Probe ACPI PM Timer for sub-tick interpolation
 
     // Detect x2APIC mode early so lapic_eoi() works for all drivers.
     // Without this, MMIO-based EOI is a no-op in x2APIC mode and

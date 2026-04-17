@@ -1,0 +1,131 @@
+ROUTE(8)                       System Manager's Manual                    ROUTE(8)
+
+NAME
+       route - show / manipulate the IP routing table
+
+SYNOPSIS
+       route [-nNvee] [-FC] [family]
+       route [-v] [-FC] add [-net|-host] target [netmask Nm] [gw Gw]
+             [metric N] [mss M] [window W] [irtt I] [reject] [mod]
+             [dyn] [reinstate] [[dev] If]
+       route [-v] [-FC] del [-net|-host] target [gw Gw] [netmask Nm]
+             [metric M] [[dev] If]
+       route [-V|--version] [-h|--help]
+
+DESCRIPTION
+       Route manipulates the kernel's IP routing tables. Its primary
+       use is to set up static routes to specific hosts or networks
+       via an interface after it has been configured with the
+       ifconfig(8) program.
+
+       When the add or del options are used, route modifies the routing
+       tables. Without these options, route displays the current
+       contents of the routing tables.
+
+OPTIONS
+       -A family
+              Use the specified address family (e.g. use -A inet6 for
+              IPv6 routes). Only "inet" is supported on LikeOS.
+
+       -F     Operate on the kernel FIB (Forwarding Information Base)
+              routing tables. This is the default.
+
+       -C     Operate on the kernel's routing cache. Not specially
+              handled on LikeOS.
+
+       -v     Select verbose operation.
+
+       -n     Show numerical addresses instead of trying to determine
+              symbolic host names. This is useful if you are trying
+              to determine why the route to your nameserver has vanished.
+
+       -e     Use netstat(8)-format for displaying the routing table.
+              -ee will generate a very long line with all parameters
+              from the routing table.
+
+       -N     Try to resolve hardware names.
+
+       -4     Display IPv4 routes (default).
+
+       -6     Display IPv6 routes (not supported).
+
+       -V, --version
+              Display the version of route and exit.
+
+       -h, --help
+              Display help text and exit.
+
+   ROUTE MODIFICATION
+       del    Delete a route.
+
+       add    Add a new route.
+
+       target The destination network or host. You can provide IP
+              addresses in dotted decimal or host/network names.
+
+       -net   The target is a network.
+
+       -host  The target is a host.
+
+       netmask NM
+              When adding a network route, the netmask to be used.
+
+       gw GW  Route packets via a gateway.
+              NOTE: The specified gateway must be reachable first. This
+              usually means that you have to set up a static route to
+              the gateway beforehand.
+
+       metric M
+              Set the metric field in the routing table (used by
+              routing daemons) to M.
+
+       mss M  Set the TCP Maximum Segment Size (MSS) for connections
+              over this route to M bytes.
+
+       window W
+              Set the TCP window size for connections over this route
+              to W bytes.
+
+       irtt I Set the initial round trip time (irtt) for TCP
+              connections over this route to I milliseconds.
+
+       reject Install a blocking route, which will force a route
+              lookup to fail. This is used to mask out networks
+              before using the default route.
+
+       mod, dyn, reinstate
+              Install a modified, dynamic, or reinstated route.
+
+       dev If Force the route to be associated with the specified
+              device. If dev If is the last option on the command
+              line, the word dev may be omitted.
+
+EXAMPLES
+       route
+              Display the routing table.
+
+       route -n
+              Display the routing table numerically.
+
+       route add default gw 192.168.1.1
+              Add a default gateway.
+
+       route add -net 10.0.0.0 netmask 255.0.0.0 gw 192.168.1.1
+              Add a route to the 10.0.0.0/8 network.
+
+       route add -host 192.168.1.100 dev eth0
+              Add a host route via eth0.
+
+       route del default
+              Delete the default route.
+
+       route del -net 10.0.0.0 netmask 255.0.0.0
+              Delete the route to 10.0.0.0/8.
+
+       route add -net 172.16.0.0 netmask 255.240.0.0 reject
+              Add a reject route.
+
+SEE ALSO
+       ifconfig(8), netstat(8), arp(8)
+
+LikeOS                                                              ROUTE(8)

@@ -295,3 +295,55 @@ void dhcp_init(void) {
 int dhcp_configured(void) {
     return dhcp_state == DHCP_STATE_BOUND;
 }
+
+int dhcp_get_status(void) {
+    return dhcp_state;
+}
+
+int dhcp_release(net_device_t* dev) {
+    if (dhcp_state != DHCP_STATE_BOUND) return -1;
+    
+    // Build and send DHCP RELEASE
+    uint8_t pkt[576];
+    int pktlen = dhcp_build_packet(dev, DHCP_RELEASE, dev->ip_addr,
+                                    dhcp_server_ip, pkt, sizeof(pkt));
+    if (pktlen > 0) {
+        // DHCP RELEASE is unicast to server
+        udp_send(dev, dhcp_server_ip, DHCP_CLIENT_PORT, DHCP_SERVER_PORT,
+                 pkt, (uint16_t)pktlen);
+    }
+    
+    // Clear network configuration
+    dev->ip_addr = 0;
+    dev->netmask = 0;
+    dev->gateway = 0;
+    dev->dns_server = 0;
+    dhcp_state = DHCP_STATE_IDLE;
+    dhcp_offered_ip = 0;
+    
+    kprintf("[DHCP] Released IP lease\n");
+    return 0;
+}
+
+int dhcp_renew(net_device_t* dev) {
+    if (dhcp_state != DHCP_STATE_BOUND) {
+        // Not bound - do full discovery
+        return dhcp_discover(dev);
+    }
+    
+    // Send DHCP REQUEST to renew
+    dhcp_state = DHCP_STATE_REQUESTING;
+    uint8_t pkt[576];
+    int pktlen = dhcp_build_packet(dev, DHCP_REQUEST,
+                                    dhcp_offered_ip, dhcp_server_ip,
+                                    pkt, sizeof(pkt));
+    if (pktlen > 0) {
+        kprintf("[DHCP] Renewing lease for %d.%d.%d.%d\n",
+                (dhcp_offered_ip >> 24) & 0xFF,
+                (dhcp_offered_ip >> 16) & 0xFF,
+                (dhcp_offered_ip >> 8) & 0xFF,
+                dhcp_offered_ip & 0xFF);
+        dhcp_send(dev, pkt, pktlen);
+    }
+    return pktlen > 0 ? 0 : -1;
+}

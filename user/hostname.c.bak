@@ -1,0 +1,146 @@
+/*
+ * hostname - show or set the system hostname
+ *
+ * Usage: hostname [OPTIONS] [name]
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+
+static void print_help(const char *progname)
+{
+    printf("Usage: %s [OPTIONS] [name]\n", progname);
+    printf("Show or set the system hostname.\n\n");
+    printf("Options:\n");
+    printf("  -a, --alias            display the alias name of the host\n");
+    printf("  -d, --domain           display the DNS domain name\n");
+    printf("  -f, --fqdn, --long     display the FQDN (Fully Qualified Domain Name)\n");
+    printf("  -F, --file FILE        read the hostname from FILE\n");
+    printf("  -i, --ip-address       display the IP address(es) of the host\n");
+    printf("  -I, --all-ip-addresses display all IP addresses of the host\n");
+    printf("  -s, --short            display the short hostname\n");
+    printf("  -V, --version          display version information and exit\n");
+    printf("  -h, --help             display this help and exit\n");
+}
+
+int main(int argc, char *argv[])
+{
+    static struct option long_options[] = {
+        {"alias",           no_argument,       0, 'a'},
+        {"domain",          no_argument,       0, 'd'},
+        {"fqdn",            no_argument,       0, 'f'},
+        {"long",            no_argument,       0, 'f'},
+        {"file",            required_argument, 0, 'F'},
+        {"ip-address",      no_argument,       0, 'i'},
+        {"all-ip-addresses",no_argument,       0, 'I'},
+        {"short",           no_argument,       0, 's'},
+        {"version",         no_argument,       0, 'V'},
+        {"help",            no_argument,       0, 'h'},
+        {0, 0, 0, 0}
+    };
+
+    int opt;
+    int show_short = 0, show_domain = 0, show_fqdn = 0;
+    int show_ip = 0, show_all_ip = 0, show_alias = 0;
+    const char *file = NULL;
+
+    while ((opt = getopt_long(argc, argv, "adfF:iIsVh", long_options, NULL)) != -1) {
+        switch (opt) {
+            case 'a': show_alias = 1; break;
+            case 'd': show_domain = 1; break;
+            case 'f': show_fqdn = 1; break;
+            case 'F': file = optarg; break;
+            case 'i': show_ip = 1; break;
+            case 'I': show_all_ip = 1; break;
+            case 's': show_short = 1; break;
+            case 'V':
+                printf("hostname (LikeOS coreutils) 0.1\n");
+                return 0;
+            case 'h':
+                print_help(argv[0]);
+                return 0;
+            default:
+                print_help(argv[0]);
+                return 1;
+        }
+    }
+
+    /* Set hostname from file */
+    if (file) {
+        FILE *fp = fopen(file, "r");
+        if (!fp) {
+            fprintf(stderr, "hostname: cannot open '%s': No such file or directory\n", file);
+            return 1;
+        }
+        char buf[256];
+        if (fgets(buf, sizeof(buf), fp)) {
+            /* Strip newline */
+            size_t len = strlen(buf);
+            while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
+                buf[--len] = '\0';
+            if (sethostname(buf, len) < 0) {
+                fprintf(stderr, "hostname: sethostname: Operation not permitted\n");
+                fclose(fp);
+                return 1;
+            }
+        }
+        fclose(fp);
+        return 0;
+    }
+
+    /* Set hostname from argument */
+    if (optind < argc && !show_short && !show_domain && !show_fqdn &&
+        !show_ip && !show_all_ip && !show_alias) {
+        const char *name = argv[optind];
+        if (sethostname(name, strlen(name)) < 0) {
+            fprintf(stderr, "hostname: sethostname: Operation not permitted\n");
+            return 1;
+        }
+        return 0;
+    }
+
+    /* Get hostname */
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) < 0) {
+        fprintf(stderr, "hostname: gethostname failed\n");
+        return 1;
+    }
+
+    if (show_short) {
+        char *dot = strchr(hostname, '.');
+        if (dot) *dot = '\0';
+        printf("%s\n", hostname);
+    } else if (show_domain) {
+        char *dot = strchr(hostname, '.');
+        if (dot)
+            printf("%s\n", dot + 1);
+        else
+            printf("\n");
+    } else if (show_fqdn) {
+        printf("%s\n", hostname);
+    } else if (show_ip || show_all_ip) {
+        /* Show interface IPs */
+        net_iface_info_t ifaces[8];
+        int n = net_getinfo(NET_GET_IFACE_INFO, ifaces, 8);
+        for (int i = 0; i < n; i++) {
+            if (ifaces[i].ip != 0) {
+                struct in_addr a;
+                a.s_addr = htonl(ifaces[i].ip);
+                printf("%s\n", inet_ntoa(a));
+                if (show_ip) break;
+            }
+        }
+    } else if (show_alias) {
+        /* No alias support, just print hostname */
+        printf("%s\n", hostname);
+    } else {
+        printf("%s\n", hostname);
+    }
+
+    return 0;
+}

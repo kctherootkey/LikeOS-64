@@ -16,6 +16,10 @@ void udp_init(void) {
     // Nothing to initialize
 }
 
+// Static send buffer to avoid large stack allocations
+static uint8_t udp_send_buf[NET_MTU_DEFAULT];
+static spinlock_t udp_send_lock = SPINLOCK_INIT("udp_tx");
+
 // Send UDP datagram
 int udp_send(net_device_t* dev, uint32_t dst_ip,
              uint16_t src_port, uint16_t dst_port,
@@ -23,10 +27,12 @@ int udp_send(net_device_t* dev, uint32_t dst_ip,
     if (!dev) return -1;
 
     uint16_t udp_len = sizeof(udp_header_t) + len;
-    uint8_t pkt[NET_MTU_DEFAULT];
     if (udp_len > NET_MTU_DEFAULT) return -1;
 
-    udp_header_t* udp = (udp_header_t*)pkt;
+    uint64_t flags;
+    spin_lock_irqsave(&udp_send_lock, &flags);
+
+    udp_header_t* udp = (udp_header_t*)udp_send_buf;
     udp->src_port = net_htons(src_port);
     udp->dst_port = net_htons(dst_port);
     udp->length = net_htons(udp_len);
@@ -34,9 +40,11 @@ int udp_send(net_device_t* dev, uint32_t dst_ip,
 
     // Copy payload
     for (uint16_t i = 0; i < len; i++)
-        pkt[sizeof(udp_header_t) + i] = data[i];
+        udp_send_buf[sizeof(udp_header_t) + i] = data[i];
 
-    return ipv4_send(dev, dst_ip, IP_PROTO_UDP, pkt, udp_len);
+    int ret = ipv4_send(dev, dst_ip, IP_PROTO_UDP, udp_send_buf, udp_len);
+    spin_unlock_irqrestore(&udp_send_lock, flags);
+    return ret;
 }
 
 // Process received UDP datagram

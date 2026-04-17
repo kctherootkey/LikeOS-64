@@ -9,6 +9,22 @@
 // Broadcast MAC address
 const uint8_t eth_broadcast_addr[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
+// Hostname (settable from userspace)
+static char g_hostname[64] = "r00tbox";
+
+void net_set_hostname(const char* name) {
+    int i = 0;
+    while (name[i] && i < 63) {
+        g_hostname[i] = name[i];
+        i++;
+    }
+    g_hostname[i] = '\0';
+}
+
+const char* net_get_hostname(void) {
+    return g_hostname;
+}
+
 // Network device registry
 static net_device_t* net_devices[NET_MAX_DEVICES];
 static int net_device_num = 0;
@@ -55,15 +71,36 @@ void net_rx_packet(net_device_t* dev, const uint8_t* data, uint16_t len) {
 static net_device_t lo_device;
 static int lo_initialized = 0;
 
+// Deferred loopback processing to avoid re-entrant lock deadlocks
+// (icmp_send_lock → ipv4_send_lock → loopback_send → ipv4_rx → icmp_rx → deadlock)
+static uint8_t lo_pending_buf[NET_MTU_DEFAULT + 64];
+static uint16_t lo_pending_len = 0;
+static net_device_t* lo_pending_dev = NULL;
+
 static int loopback_send(net_device_t* dev, const uint8_t* data, uint16_t len) {
-    // Feed packets back into the IP layer
-    // The data is a raw IPv4 packet (no Ethernet framing)
+    // Buffer packet for deferred processing — caller may hold locks
     dev->tx_packets++;
     dev->tx_bytes += len;
     dev->rx_packets++;
     dev->rx_bytes += len;
-    ipv4_rx(dev, data, len);
+    if (len <= sizeof(lo_pending_buf)) {
+        for (uint16_t i = 0; i < len; i++)
+            lo_pending_buf[i] = data[i];
+        lo_pending_len = len;
+        lo_pending_dev = dev;
+    }
     return 0;
+}
+
+// Process deferred loopback packets (call only when no network locks are held)
+void loopback_process_pending(void) {
+    while (lo_pending_len > 0 && lo_pending_dev) {
+        uint16_t len = lo_pending_len;
+        net_device_t* dev = lo_pending_dev;
+        lo_pending_len = 0;
+        lo_pending_dev = NULL;
+        ipv4_rx(dev, lo_pending_buf, len);
+    }
 }
 
 static int loopback_link_status(net_device_t* dev) {

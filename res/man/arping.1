@@ -1,0 +1,99 @@
+ARPING(8)                      System Manager's Manual                  ARPING(8)
+
+NAME
+       arping - send ARP REQUEST to a neighbour host
+
+SYNOPSIS
+       arping [-AbDfhqUV] [-c count] [-w deadline] [-i interval]
+              [-s source] [-I interface] {destination}
+
+DESCRIPTION
+       Ping destination on device interface by ARP packets, using
+       source address source.
+
+       arping is used to discover hosts on directly attached networks.
+       Since ARP is a non-routable protocol, this only works for hosts
+       on the same physical network (or broadcast domain).
+
+OPTIONS
+       -A     The same as -U, but uses ARP REPLY packets instead of
+              ARP REQUEST. This is used to update other hosts' ARP
+              caches after a failover.
+
+       -b     Send only MAC level broadcasts. Normally arping starts
+              from sending broadcast, and switches to unicast after
+              reply received.
+
+       -c count
+              Stop after sending count ARP REQUEST packets. With
+              deadline option (-w), instead wait for count ARP REPLY
+              packets, or until the timeout expires.
+
+       -D     Duplicate address detection mode. Used in IPv4LL.
+              The exit code is 0 if the address is not in use
+              (no reply received), and 1 if the address is already
+              in use.
+
+       -f     Finish after the first reply confirming that target is
+              alive. Good for scripts that want to check host
+              reachability.
+
+       -h     Display help message and exit.
+
+       -I interface
+              Name of network device where to send ARP REQUEST
+              packets.
+
+       -i interval
+              Specify an interval, in seconds, between packets
+              (default is 1).
+
+       -q     Quiet output. Nothing is displayed.
+
+       -s source
+              IP source address to use in ARP packets. If this option
+              is absent, the source address is:
+              - In DAD mode (-D): 0.0.0.0
+              - Otherwise: the IP address of the interface
+
+       -U     Unsolicited ARP mode. Updates neighbours' ARP caches.
+              No replies are expected.
+
+       -V     Print version of the program and exit.
+
+       -w deadline
+              Specify a timeout, in seconds, before arping exits
+              regardless of how many packets have been sent or
+              received.
+
+EXIT STATUS
+       The exit status is 0 if at least one reply was received. If
+       no replies are received, the exit status is 1.
+
+       In DAD mode (-D), the exit status is 0 if no reply was
+       received (address is available), and 1 if a reply was received
+       (address is already in use).
+
+EXAMPLES
+       arping -I eth0 192.168.1.1
+              Send ARP requests to 192.168.1.1 via eth0.
+
+       arping -c 3 192.168.1.1
+              Send 3 ARP requests.
+
+       arping -D -I eth0 192.168.1.100
+              Check if 192.168.1.100 is in use (DAD).
+
+       arping -f 192.168.1.1
+              Quit on first reply.
+
+       arping -U -s 192.168.1.100 -I eth0 192.168.1.100
+              Send gratuitous ARP to update neighbours.
+
+       arping -w 5 -c 10 host
+              Send 10 probes with 5-second deadline.
+
+SEE ALSO
+       ping(8), arp(8), ifconfig(8)
+
+LikeOS                                                             ARPING(8)

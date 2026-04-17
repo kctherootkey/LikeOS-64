@@ -24,6 +24,7 @@
 #include "../../include/kernel/pagecache.h"
 #include "../../include/kernel/icache.h"
 #include "../../include/kernel/net.h"
+#include "../../include/kernel/lapic.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
@@ -1073,7 +1074,7 @@ static int64_t sys_setgroups(uint64_t size, uint64_t list) {
 }
 
 static int64_t sys_gethostname(uint64_t name, uint64_t len) {
-    const char* host = "r00tbox";
+    const char* host = net_get_hostname();
     size_t hlen = 0;
     while (host[hlen]) hlen++;
     if (!validate_user_ptr(name, len)) return -EFAULT;
@@ -1089,7 +1090,7 @@ static int64_t sys_uname(uint64_t buf) {
     k_utsname_t u;
     mm_memset(&u, 0, sizeof(u));
     const char* sys = "LikeOS";
-    const char* node = "r00tbox";
+    const char* node = net_get_hostname();
     const char* rel = "0.2";
 #ifdef BUILD_DATE
     const char* ver = "preempt-smp " BUILD_DATE;
@@ -1120,11 +1121,16 @@ static int64_t sys_time(uint64_t tloc) {
 static int64_t sys_gettimeofday(uint64_t tv, uint64_t tz) {
     (void)tz;
     if (!validate_user_ptr(tv, sizeof(k_timeval_t))) return -EFAULT;
-    uint64_t ticks = timer_ticks();
-    uint32_t freq = timer_get_frequency();
     k_timeval_t kv;
-    kv.tv_sec = (long)timer_get_epoch();
-    kv.tv_usec = (long)((ticks % freq) * (1000000 / freq));
+    // Use timer_get_precise_us() which atomically reads g_ticks and the
+    // ACPI PM Timer via a seqlock, eliminating the race where a BSP tick
+    // fires between reading the two values and corrupts the sub-tick delta.
+    uint64_t total_us = timer_get_precise_us();
+    uint64_t boot_epoch = timer_get_boot_epoch();
+
+    kv.tv_sec = (long)(boot_epoch + total_us / 1000000ULL);
+    kv.tv_usec = (long)(total_us % 1000000ULL);
+
     if (copy_to_user((void*)tv, &kv, sizeof(kv)) < 0) {
         return -EFAULT;
     }
@@ -3021,24 +3027,21 @@ static int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr) {
     }
     
     struct k_timespec tp;
-    uint64_t ticks = timer_ticks();
-    
-    uint32_t freq = timer_get_frequency();
+    uint64_t total_us = timer_get_precise_us();
+
+    uint64_t total_secs = total_us / 1000000ULL;
+    uint64_t frac_ns = (total_us % 1000000ULL) * 1000ULL;
+
     switch (clk_id) {
         case 0:  // CLOCK_REALTIME
-            tp.tv_sec = timer_get_epoch();
-            tp.tv_nsec = (uint64_t)(ticks % freq) * 1000000000ULL / freq;
+            tp.tv_sec = timer_get_boot_epoch() + total_secs;
+            tp.tv_nsec = frac_ns;
             break;
         case 1:  // CLOCK_MONOTONIC
-            // Monotonic = uptime from boot
-            tp.tv_sec = ticks / freq;
-            tp.tv_nsec = (uint64_t)(ticks % freq) * 1000000000ULL / freq;
-            break;
         case 2:  // CLOCK_PROCESS_CPUTIME_ID
         case 3:  // CLOCK_THREAD_CPUTIME_ID
-            // Simplified: return same as monotonic for now
-            tp.tv_sec = ticks / freq;
-            tp.tv_nsec = (uint64_t)(ticks % freq) * 1000000000ULL / freq;
+            tp.tv_sec = total_secs;
+            tp.tv_nsec = frac_ns;
             break;
         default:
             return -EINVAL;
@@ -3167,14 +3170,14 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
     }
     
     // Allocate kernel stack for child
-    uint8_t* k_stack_mem = (uint8_t*)kalloc(8192);
+    uint8_t* k_stack_mem = (uint8_t*)kalloc(KERNEL_STACK_SIZE);
     if (!k_stack_mem) {
         kfree(child);
         return -ENOMEM;
     }
     // Zero the kernel stack to prevent stale data issues
-    mm_memset(k_stack_mem, 0, 8192);
-    uint64_t k_stack_top = ((uint64_t)(k_stack_mem + 8192)) & ~0xFUL;
+    mm_memset(k_stack_mem, 0, KERNEL_STACK_SIZE);
+    uint64_t k_stack_top = ((uint64_t)(k_stack_mem + KERNEL_STACK_SIZE)) & ~0xFUL;
     
     // Initialize child from parent
     mm_memcpy(child, cur, sizeof(task_t));
@@ -5158,20 +5161,228 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         case SYS_DNS_RESOLVE: {
             if (!validate_user_ptr(a1, 1)) return -EFAULT;
             if (!validate_user_ptr(a2, sizeof(uint32_t))) return -EFAULT;
-            // Copy hostname from user space (max 255 chars)
+            // Copy hostname from user space (max 255 chars).
+            // Copy page-by-page to avoid faulting across page boundaries.
             char khost[256];
-            int i = 0;
-            const char* uhost = (const char*)a1;
-            while (i < 255) {
-                khost[i] = uhost[i];
-                if (!khost[i]) break;
-                i++;
+            size_t off = 0;
+            khost[0] = '\0';
+            smap_disable();
+            while (off < 255) {
+                uintptr_t addr = a1 + off;
+                // Check that the page containing this byte is mapped
+                if (!mm_is_page_mapped(addr)) break;
+                // Copy up to end of this page (or remaining buffer)
+                size_t page_end = (addr | 0xFFF) + 1;
+                size_t chunk = page_end - addr;
+                if (off + chunk > 255) chunk = 255 - off;
+                for (size_t j = 0; j < chunk; j++) {
+                    khost[off] = ((const char*)a1)[off];
+                    if (khost[off] == '\0') goto dns_str_done;
+                    off++;
+                }
             }
-            khost[255] = '\0';
+            dns_str_done:
+            smap_enable();
+            khost[off] = '\0';
+            if (off == 0) return -EFAULT;
             uint32_t ip = 0;
             int ret = dns_resolve(khost, &ip);
             if (ret == 0) {
                 copy_to_user((void*)a2, &ip, sizeof(uint32_t));
+            }
+            return ret;
+        }
+
+        case SYS_SETHOSTNAME: {
+            if (!validate_user_ptr(a1, 1)) return -EFAULT;
+            size_t len = (size_t)a2;
+            if (len == 0 || len > 63) return -EINVAL;
+            char khost[64];
+            if (copy_from_user(khost, (const void*)a1, len) < 0) return -EFAULT;
+            khost[len] = '\0';
+            net_set_hostname(khost);
+            return 0;
+        }
+
+        case SYS_NET_GETINFO: {
+            int subcmd = (int)a1;
+            if (!validate_user_ptr(a2, 1)) return -EFAULT;
+            int max_entries = (int)a3;
+            if (max_entries <= 0) return -EINVAL;
+
+            switch (subcmd) {
+            case NET_GET_ARP_TABLE: {
+                size_t sz = (size_t)max_entries * sizeof(net_arp_info_t);
+                if (!validate_user_ptr(a2, sz)) return -EFAULT;
+                net_arp_info_t kbuf[64];
+                int n = max_entries > 64 ? 64 : max_entries;
+                int count = net_get_arp_table(kbuf, n);
+                copy_to_user((void*)a2, kbuf, (size_t)count * sizeof(net_arp_info_t));
+                return count;
+            }
+            case NET_GET_ROUTE_TABLE: {
+                size_t sz = (size_t)max_entries * sizeof(net_route_info_t);
+                if (!validate_user_ptr(a2, sz)) return -EFAULT;
+                net_route_info_t kbuf[32];
+                int n = max_entries > 32 ? 32 : max_entries;
+                int count = net_get_route_table(kbuf, n);
+                copy_to_user((void*)a2, kbuf, (size_t)count * sizeof(net_route_info_t));
+                return count;
+            }
+            case NET_GET_TCP_CONNECTIONS: {
+                size_t sz = (size_t)max_entries * sizeof(net_tcp_info_t);
+                if (!validate_user_ptr(a2, sz)) return -EFAULT;
+                net_tcp_info_t kbuf[64];
+                int n = max_entries > 64 ? 64 : max_entries;
+                int count = net_get_tcp_connections(kbuf, n);
+                copy_to_user((void*)a2, kbuf, (size_t)count * sizeof(net_tcp_info_t));
+                return count;
+            }
+            case NET_GET_UDP_SOCKETS: {
+                size_t sz = (size_t)max_entries * sizeof(net_udp_info_t);
+                if (!validate_user_ptr(a2, sz)) return -EFAULT;
+                net_udp_info_t kbuf[64];
+                int n = max_entries > 64 ? 64 : max_entries;
+                int count = net_get_udp_sockets(kbuf, n);
+                copy_to_user((void*)a2, kbuf, (size_t)count * sizeof(net_udp_info_t));
+                return count;
+            }
+            case NET_GET_IFACE_STATS: {
+                size_t sz = (size_t)max_entries * sizeof(net_iface_info_t);
+                if (!validate_user_ptr(a2, sz)) return -EFAULT;
+                net_iface_info_t kbuf[8];
+                int n = max_entries > 8 ? 8 : max_entries;
+                int count = net_get_iface_info(kbuf, n);
+                copy_to_user((void*)a2, kbuf, (size_t)count * sizeof(net_iface_info_t));
+                return count;
+            }
+            case NET_DNS_QUERY: {
+                if (!validate_user_ptr(a2, sizeof(dns_query_buf_t))) return -EFAULT;
+                dns_query_buf_t kbuf;
+                copy_from_user(&kbuf, (void*)a2, sizeof(dns_query_buf_t));
+                kbuf.name[255] = '\0';
+                int rlen = dns_query_raw(kbuf.name, kbuf.qtype,
+                                         kbuf.response, 512);
+                kbuf.response_len = rlen;
+                copy_to_user((void*)a2, &kbuf, sizeof(dns_query_buf_t));
+                return rlen > 0 ? 0 : rlen;
+            }
+            default:
+                return -EINVAL;
+            }
+        }
+
+        case SYS_DHCP_CONTROL: {
+            int subcmd = (int)a1;
+            net_device_t* dev = net_get_default_device();
+            if (!dev) return -ENETDOWN;
+            switch (subcmd) {
+            case DHCP_CMD_DISCOVER:
+                return dhcp_discover(dev);
+            case DHCP_CMD_RELEASE:
+                return dhcp_release(dev);
+            case DHCP_CMD_RENEW:
+                return dhcp_renew(dev);
+            case DHCP_CMD_STATUS:
+                return dhcp_get_status();
+            default:
+                return -EINVAL;
+            }
+        }
+
+        case SYS_RAW_SEND: {
+            // a1 = subcmd (1=ICMP echo, 2=ARP request)
+            // a2 = dst_ip, a3 = id/seq packed, a4 = ttl, a5 = data_ptr (optional)
+            int subcmd = (int)a1;
+            net_device_t* dev = net_get_default_device();
+            if (!dev) return -ENETDOWN;
+            if (subcmd == 1) {
+                // ICMP echo: a2=dst_ip, a3=id<<16|seq, a4=ttl
+                uint32_t dst_ip = (uint32_t)a2;
+                uint16_t id = (uint16_t)(a3 >> 16);
+                uint16_t seq = (uint16_t)(a3 & 0xFFFF);
+                uint8_t ttl = (uint8_t)a4;
+                if (ttl == 0) ttl = 64;
+                // 56 bytes of padding data
+                uint8_t pad[56];
+                for (int pi = 0; pi < 56; pi++) pad[pi] = (uint8_t)pi;
+                int send_ret = icmp_send_echo(dev, dst_ip, id, seq, pad, 56, ttl);
+                loopback_process_pending();
+                return send_ret;
+            } else if (subcmd == 2) {
+                // ARP request: a2=target_ip
+                uint32_t target_ip = (uint32_t)a2;
+                return arp_send_request(dev, target_ip);
+            }
+            return -EINVAL;
+        }
+
+        case SYS_RAW_RECV: {
+            // a1 = subcmd (1=ICMP reply, 2=ARP reply)
+            // a2 = ptr to result struct, a3 = expected_id or target_ip, a4 = timeout_ticks
+            int subcmd = (int)a1;
+            if (subcmd == 1) {
+                // ICMP reply
+                if (!validate_user_ptr(a2, 24)) return -EFAULT;
+                uint32_t src_ip = 0;
+                uint8_t type = 0, code = 0, recv_ttl = 0;
+                uint16_t seq = 0;
+                uint16_t expected_id = (uint16_t)(a3 >> 16);
+                uint16_t expected_seq = (uint16_t)(a3 & 0xFFFF);
+                uint64_t timeout = a4 ? a4 : 500; // default 5s at 100Hz
+                uint64_t rtt_us = 0;
+                int ret = icmp_recv_reply(&src_ip, expected_id, &type, &code, &seq, timeout, &rtt_us, expected_seq, &recv_ttl);
+                if (ret == 0) {
+                    // Pack result: [src_ip(4), type(1), code(1), seq(2), rtt_us(8), ttl(1), pad(7)]
+                    uint8_t result[24];
+                    for (int i = 0; i < 24; i++) result[i] = 0;
+                    result[0] = (src_ip >> 24) & 0xFF;
+                    result[1] = (src_ip >> 16) & 0xFF;
+                    result[2] = (src_ip >> 8) & 0xFF;
+                    result[3] = src_ip & 0xFF;
+                    result[4] = type;
+                    result[5] = code;
+                    result[6] = (seq >> 8) & 0xFF;
+                    result[7] = seq & 0xFF;
+                    // Pack RTT in microseconds (little-endian uint64_t)
+                    for (int i = 0; i < 8; i++)
+                        result[8 + i] = (rtt_us >> (i * 8)) & 0xFF;
+                    result[16] = recv_ttl;
+                    copy_to_user((void*)a2, result, 24);
+                }
+                return ret;
+            } else if (subcmd == 2) {
+                // ARP reply
+                if (!validate_user_ptr(a2, 6)) return -EFAULT;
+                uint32_t target_ip = (uint32_t)a3;
+                uint64_t timeout = a4 ? a4 : 500;
+                uint8_t mac[6];
+                int ret = arp_recv_reply(target_ip, mac, timeout);
+                if (ret == 0) {
+                    copy_to_user((void*)a2, mac, 6);
+                }
+                return ret;
+            }
+            return -EINVAL;
+        }
+
+        case SYS_DNS_RESOLVE_REVERSE: {
+            // a1 = IP address in network byte order
+            // a2 = pointer to output hostname buffer (user)
+            // a3 = max length of output buffer
+            uint32_t ip_nbo = (uint32_t)a1;
+            int maxlen = (int)a3;
+            if (maxlen <= 0 || maxlen > 256) return -EINVAL;
+            if (!validate_user_ptr(a2, (size_t)maxlen)) return -EFAULT;
+
+            char kbuf[256];
+            int ret = dns_resolve_reverse(ip_nbo, kbuf, sizeof(kbuf));
+            if (ret == 0) {
+                // Copy result to user space
+                size_t slen = 0;
+                while (kbuf[slen]) slen++;
+                if ((int)(slen + 1) > maxlen) return -ENAMETOOLONG;
+                copy_to_user((void*)a2, kbuf, slen + 1);
             }
             return ret;
         }

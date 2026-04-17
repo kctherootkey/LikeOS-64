@@ -160,3 +160,32 @@ int route_get_table(rt_entry_t* entries, int max_entries) {
     spin_unlock_irqrestore(&route_lock, fl);
     return count;
 }
+
+// Get route table for userspace
+int net_get_route_table(net_route_info_t* entries, int max_entries) {
+    uint64_t fl;
+    spin_lock_irqsave(&route_lock, &fl);
+
+    int count = 0;
+    for (int i = 0; i < MAX_ROUTES && count < max_entries; i++) {
+        if (!route_table[i].active) continue;
+        entries[count].dst_net = route_table[i].dst_net;
+        entries[count].netmask = route_table[i].netmask;
+        entries[count].gateway = route_table[i].gateway;
+        entries[count].flags = route_table[i].flags;
+        entries[count].metric = (uint16_t)route_table[i].metric;
+        if (route_table[i].dev && route_table[i].dev->name) {
+            const char* n = route_table[i].dev->name;
+            int j = 0;
+            while (n[j] && j < 15) { entries[count].dev_name[j] = n[j]; j++; }
+            entries[count].dev_name[j] = '\0';
+        } else {
+            entries[count].dev_name[0] = '*';
+            entries[count].dev_name[1] = '\0';
+        }
+        count++;
+    }
+
+    spin_unlock_irqrestore(&route_lock, fl);
+    return count;
+}

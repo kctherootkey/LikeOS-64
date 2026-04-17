@@ -1,0 +1,169 @@
+DHCLIENT(8)                    System Manager's Manual                DHCLIENT(8)
+
+NAME
+       dhclient - Dynamic Host Configuration Protocol Client
+
+SYNOPSIS
+       dhclient [-4|-6] [-S] [-N] [-T] [-P] [-p port-number]
+                [-d] [-e VAR=value] [-q] [-1] [-r] [-x]
+                [-lf lease-file] [-pf pid-file] [-cf config-file]
+                [-sf script-file] [-s server-addr] [-g relay]
+                [-n] [-nc] [-nw] [-w] [-B] [-I dhcp-client-identifier]
+                [-H host-name] [-F fqdn] [-V vendor-class-identifier]
+                [-R request-option-list] [-timeout timeout]
+                [-v] [--version] [if0 [...ifN]]
+
+DESCRIPTION
+       The Internet Systems Consortium DHCP Client, dhclient, provides
+       a means for configuring one or more network interfaces using
+       the Dynamic Host Configuration Protocol and the BOOTP Protocol.
+
+       The DHCP protocol allows a host to contact a central server
+       which maintains a list of IP addresses which may be assigned
+       on one or more subnets. A DHCP client may request an address
+       from this pool, and then use it on a temporary basis for
+       communication on network.
+
+OPTIONS
+       -4     Use the DHCPv4 protocol to obtain an IPv4 address and
+              configuration parameters (default).
+
+       -6     Use the DHCPv6 protocol (not supported on LikeOS).
+
+       -S     Use Information-request to get only stateless
+              configuration parameters (i.e., without address). This
+              implies -6 (not supported).
+
+       -N     Restore normal address query for DHCPv6. This implies
+              -6 (not supported).
+
+       -T     Ask for IPv6 temporary addresses (RFC 4941). This
+              implies -6 (not supported).
+
+       -P     Enable IPv6 prefix delegation (RFC 3633). This implies
+              -6 (not supported).
+
+       -p port-number
+              The UDP port number on which the DHCP client should
+              listen and transmit. Default is port 68.
+
+       -d     Force dhclient to run as a foreground process. Normally,
+              dhclient will run in the foreground until it has
+              configured an interface at which time it will revert
+              to running in the background.
+
+       -e VAR=value
+              Define additional environment variables for the
+              script that configures interfaces.
+
+       -q     Be quiet at startup, suppress all terminal output
+              except for error messages.
+
+       -1     Try to get a lease once. On failure, exit with code 2.
+              In DHCPv6 this sets the max duration of the initial
+              exchange to timeout (from -timeout).
+
+       -r     Release the current lease and de-configure the
+              interface before exiting. After releasing the lease,
+              dhclient exits. This is the opposite of the default
+              behavior, which is to obtain a lease.
+
+       -x     Stop the running DHCP client without releasing the
+              current lease. Kills the existing dhclient process.
+
+       -lf lease-file
+              Path to the lease database file. Default is system
+              dependent.
+
+       -pf pid-file
+              Path to the process ID file.
+
+       -cf config-file
+              Path to the dhclient configuration file.
+
+       -sf script-file
+              Path to the network configuration script invoked by
+              dhclient when it gets a lease.
+
+       -s server-addr
+              Specify the server IP address or fully qualified domain
+              name to transmit DHCP messages to.
+
+       -g relay
+              Set giaddr field of all packets to the relay IP address.
+              This is useful for testing.
+
+       -n     Do not configure any interfaces. Most useful combined
+              with the -w flag.
+
+       -nc    Do not drop capabilities. Normally, if dhclient was
+              compiled with libcap-ng support, dhclient drops most
+              capabilities immediately upon startup.
+
+       -nw    Become a daemon process immediately (nowait) rather
+              than waiting until an IP address has been acquired.
+
+       -w     Continue running even if no broadcast interfaces
+              were found. Normally will exit if it isn't able to
+              identify any network interfaces to configure.
+
+       -B     Set the BOOTP broadcast flag in request packets so
+              servers will always broadcast replies.
+
+       -I dhcp-client-identifier
+              Specify the dhcp-client-identifier option to send to
+              the DHCP server.
+
+       -H host-name
+              Specify the host-name option to send to the DHCP
+              server. The host-name string only includes the client's
+              hostname prefix.
+
+       -F fqdn.fqdn
+              Specify the fqdn.fqdn option to send to the DHCP
+              server. This option cannot be used with the -H option.
+
+       -V vendor-class-identifier
+              Specify the vendor-class-identifier option to send to
+              the DHCP server.
+
+       -R request-option-list
+              Specify the list of options the client is to request
+              from the server. The option list must be a single
+              string consisting of option names separated by commas.
+
+       -timeout timeout
+              Specify the time after which dhclient will decide that
+              it's not going to be able to contact a server.
+
+       -v     Enable verbose log messages.
+
+       --version
+              Print version number and exit.
+
+EXAMPLES
+       dhclient
+              Obtain a DHCP lease on all interfaces.
+
+       dhclient eth0
+              Obtain a DHCP lease on eth0.
+
+       dhclient -r
+              Release the current lease.
+
+       dhclient -x
+              Stop dhclient without releasing the lease.
+
+       dhclient -v eth0
+              Obtain a lease with verbose output.
+
+       dhclient -1 eth0
+              Try once to get a lease.
+
+       dhclient -H myhost eth0
+              Request a lease with hostname "myhost".
+
+SEE ALSO
+       ifconfig(8), route(8)
+
+LikeOS                                                            DHCLIENT(8)

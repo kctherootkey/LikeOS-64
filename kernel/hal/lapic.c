@@ -33,6 +33,16 @@ static volatile uint32_t* lapic_base = NULL;
 static uint64_t lapic_phys_base = LAPIC_DEFAULT_BASE;
 static uint64_t lapic_timer_freq = 0;  // Ticks per second after calibration
 static uint64_t tsc_freq_hz = 0;      // TSC frequency in Hz (0 if unknown)
+static bool tsc_reliable = false;
+
+#define VMWARE_HYPERVISOR_PORT   0x5658
+#define VMWARE_HYPERVISOR_MAGIC  0x564D5868U
+#define VMWARE_CMD_GETHZ         45U
+#define CPUID_VMWARE_INFO_LEAF   0x40000000U
+
+#define VMWARE_SIG_EBX           0x61774D56U
+#define VMWARE_SIG_ECX           0x4D566572U
+#define VMWARE_SIG_EDX           0x65726177U
 
 // ============================================================================
 // MSR Access
@@ -64,6 +74,39 @@ static inline uint64_t rdtsc(void) {
     uint32_t low, high;
     __asm__ volatile("rdtsc" : "=a"(low), "=d"(high));
     return ((uint64_t)high << 32) | low;
+}
+
+static inline bool vmware_hypervisor_present(void) {
+    uint32_t eax, ebx, ecx, edx;
+
+    cpuid(1, &eax, &ebx, &ecx, &edx);
+    if ((ecx & (1U << 31)) == 0) {
+        return false;
+    }
+
+    cpuid(CPUID_VMWARE_INFO_LEAF, &eax, &ebx, &ecx, &edx);
+    return ebx == VMWARE_SIG_EBX && ecx == VMWARE_SIG_ECX && edx == VMWARE_SIG_EDX;
+}
+
+static inline uint64_t vmware_get_tsc_freq_hz(void) {
+    uint32_t lo, hi, cmd;
+
+    lo = VMWARE_HYPERVISOR_MAGIC;
+    hi = 0xFFFFFFFFU;
+    cmd = VMWARE_CMD_GETHZ;
+
+    __asm__ volatile(
+        "movw %[port], %%dx\n\t"
+        "inl (%%dx), %%eax"
+        : "+a"(lo), "+b"(hi), "+c"(cmd)
+        : [port] "i"(VMWARE_HYPERVISOR_PORT), "d"(0)
+        : "cc", "memory");
+
+    if (hi == 0xFFFFFFFFU) {
+        return 0;
+    }
+
+    return ((uint64_t)hi << 32) | lo;
 }
 
 // ============================================================================
@@ -341,6 +384,36 @@ void lapic_init(void) {
 
 void lapic_timer_calibrate(void) {
     uint32_t eax, ebx, ecx, edx;
+
+    if (vmware_hypervisor_present()) {
+        uint64_t vmware_tsc_freq = vmware_get_tsc_freq_hz();
+        if (vmware_tsc_freq > 0) {
+            tsc_freq_hz = vmware_tsc_freq;
+            tsc_reliable = true;
+            smp_dbg("LAPIC: VMware hypervisor TSC freq=%lu Hz\n", vmware_tsc_freq);
+
+            lapic_write(LAPIC_TIMER_DCR, LAPIC_TIMER_DIV_16);
+            lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED | LAPIC_TIMER_ONESHOT);
+            lapic_write(LAPIC_TIMER_ICR, 0xFFFFFFFF);
+
+            uint64_t tsc_start = rdtsc();
+            uint64_t tsc_target = vmware_tsc_freq / 10;
+            while ((rdtsc() - tsc_start) < tsc_target)
+                __asm__ volatile("pause");
+
+            uint32_t elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CCR);
+            lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
+
+            lapic_timer_freq = (uint64_t)elapsed * 10;
+            smp_dbg("LAPIC: VMware TSC-calibrated timer_freq=%lu Hz\n", lapic_timer_freq);
+
+            if (lapic_timer_freq >= 100000 && lapic_timer_freq <= 500000000) {
+                return;
+            }
+
+            smp_dbg("LAPIC: VMware TSC calibration out of range, falling back\n");
+        }
+    }
     
     // =========================================================================
     // Method 1: CPUID leaf 0x15 — TSC frequency → TSC-timed LAPIC calibration
@@ -412,7 +485,8 @@ void lapic_timer_calibrate(void) {
 
     // =========================================================================
     // Method 2 (fallback): PIT channel 2 direct measurement
-    // Used when CPUID 0x15 is not available (e.g., QEMU, older CPUs)
+    // Used when CPUID 0x15 is not available (e.g., QEMU, older CPUs, VMware)
+    // Also measure TSC frequency by reading rdtsc around the PIT delay.
     // =========================================================================
     smp_dbg("LAPIC: Calibrating timer via PIT ch2 (100ms)...\n");
     
@@ -464,6 +538,14 @@ uint64_t lapic_timer_get_frequency(void) {
 
 uint64_t lapic_get_tsc_freq(void) {
     return tsc_freq_hz;
+}
+
+bool lapic_tsc_is_reliable(void) {
+    return tsc_reliable;
+}
+
+void lapic_set_tsc_freq(uint64_t hz) {
+    tsc_freq_hz = hz;
 }
 
 // ============================================================================

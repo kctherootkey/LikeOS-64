@@ -1,0 +1,134 @@
+IFCONFIG(8)                    System Manager's Manual                   IFCONFIG(8)
+
+NAME
+       ifconfig - configure a network interface
+
+SYNOPSIS
+       ifconfig [-a] [-s] [-v] [interface]
+       ifconfig interface [aftype] options | address ...
+
+DESCRIPTION
+       Ifconfig is used to configure the kernel-resident network
+       interfaces. It is used at boot time to set up interfaces as
+       necessary. After that, it is usually only needed when debugging
+       or when system tuning is needed.
+
+       If no arguments are given, ifconfig displays the status of the
+       currently active interfaces. If a single interface argument is
+       given, it displays the status of the given interface only; if a
+       single -a argument is given, it displays the status of all
+       interfaces, even those that are down.
+
+OPTIONS
+       -a     Display all interfaces which are currently available,
+              even if down.
+
+       -s     Display a short list (like netstat -i).
+
+       -v     Be more verbose for some error conditions.
+
+       interface
+              The name of the interface. This is usually a driver name
+              followed by a unit number, for example eth0 for the
+              first Ethernet interface. If your kernel supports alias
+              interfaces, you can specify them with suffix :N.
+
+       up     This flag causes the interface to be activated.
+
+       down   This flag causes the driver for this interface to be
+              shut down.
+
+       [-]arp Enable or disable the use of the ARP protocol on this
+              interface.
+
+       [-]promisc
+              Enable or disable the promiscuous mode of the interface.
+
+       [-]allmulti
+              Enable or disable all-multicast mode. When set, all
+              multicast packets on the network will be received by
+              the interface.
+
+       [-]multicast
+              Set the multicast flag on the interface.
+
+       metric N
+              Set the interface metric.
+
+       mtu N  Set the Maximum Transfer Unit (MTU) of an interface.
+
+       dstaddr addr
+              Set the remote IP address for a point-to-point link.
+
+       netmask addr
+              Set the IP network mask for this interface.
+
+       add addr/prefixlen
+              Add an IPv6 address to an interface (not supported).
+
+       del addr/prefixlen
+              Remove an IPv6 address from an interface (not supported).
+
+       broadcast [addr]
+              If the address argument is given, set the protocol
+              broadcast address for this interface. Otherwise, set (or
+              clear) the IFF_BROADCAST flag for the interface.
+
+       [-]broadcast
+              Set or clear the IFF_BROADCAST flag.
+
+       pointopoint [addr]
+              Enable point-to-point mode on the interface, with the
+              specified remote address.
+
+       [-]pointopoint
+              Set or clear the IFF_POINTOPOINT flag.
+
+       hw class address
+              Set the hardware address of this interface, if the
+              device driver supports this operation. The keyword must
+              be followed by the name of the hardware class and the
+              printable ASCII equivalent of the hardware address.
+              Hardware classes currently supported include "ether".
+
+       txqueuelen length
+              Set the length of the transmit queue of the device.
+
+       inet addr
+              IPv4 address prefix.
+
+       inet6 addr
+              IPv6 address prefix (not supported).
+
+       tunnel options (not supported)
+              Create or modify per-device tunnel.
+
+EXAMPLES
+       ifconfig
+              Display active interfaces.
+
+       ifconfig -a
+              Display all interfaces including down.
+
+       ifconfig eth0
+              Display status of eth0.
+
+       ifconfig eth0 192.168.1.100 netmask 255.255.255.0 up
+              Configure eth0 with an IP address and bring it up.
+
+       ifconfig eth0 mtu 9000
+              Set MTU to 9000 (jumbo frames).
+
+       ifconfig eth0 down
+              Bring eth0 down.
+
+       ifconfig eth0 promisc
+              Enable promiscuous mode on eth0.
+
+       ifconfig eth0 hw ether 00:11:22:33:44:55
+              Set hardware address.
+
+SEE ALSO
+       route(8), netstat(8), arp(8), hostname(1)
+
+LikeOS                                                             IFCONFIG(8)

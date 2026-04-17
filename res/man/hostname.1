@@ -1,0 +1,95 @@
+HOSTNAME(1)                      User Commands                     HOSTNAME(1)
+
+NAME
+       hostname - show or set the system hostname
+
+SYNOPSIS
+       hostname [-adfhinsVvy] [-F file] [hostname]
+
+DESCRIPTION
+       Hostname is used to display the system's DNS name, and to display
+       or set its hostname.  When called without any arguments, the
+       program displays the current hostname.
+
+       When called with one argument or with the -F option, the hostname
+       is set to the specified value.  Only the superuser can set the
+       hostname.
+
+       Note that the hostname is usually set once at system startup by
+       reading the contents of a file or by a DHCP client.
+
+OPTIONS
+       -a, --alias
+              Display the alias name of the host (if used). This option
+              is provided for compatibility; on LikeOS this displays the
+              same as the hostname.
+
+       -d, --domain
+              Display the DNS domain name. This is the part after the
+              first dot in the FQDN.
+
+       -f, --fqdn, --long
+              Display the FQDN (Fully Qualified Domain Name). A FQDN
+              consists of the short hostname and the DNS domain name,
+              separated by a dot.
+
+       -F, --file FILE
+              Read the hostname to be set from the specified FILE.
+              Comments (lines starting with '#') are ignored.
+
+       -h, --help
+              Display usage information and exit.
+
+       -i, --ip-address
+              Display the network address(es) of the hostname. Note
+              that this only works if the hostname can be resolved.
+
+       -I, --all-ip-addresses
+              Display all network addresses of the host. This enumerates
+              all configured addresses on all network interfaces. The
+              loopback interface and IPv6 link-local addresses are
+              omitted.
+
+       -n, --node
+              Display the DECnet node name. On LikeOS this is the same
+              as the hostname (provided for compatibility).
+
+       -s, --short
+              Display the short hostname. This is the hostname cut at
+              the first dot.
+
+       -v, --verbose
+              Be verbose and tell what's going on.
+
+       -V, --version
+              Print version information on standard output and exit
+              successfully.
+
+       -y, --yp, --nis
+              Display the NIS/YP domain name. If a parameter is given,
+              root can also set a new NIS domain (not supported on
+              LikeOS).
+
+EXAMPLES
+       hostname
+              Display the current hostname.
+
+       hostname myhost
+              Set the hostname to "myhost".
+
+       hostname -f
+              Display the fully qualified domain name.
+
+       hostname -F /etc/hostname
+              Set the hostname by reading it from /etc/hostname.
+
+       hostname -i
+              Display the IP address associated with the hostname.
+
+       hostname -I
+              Display all configured IP addresses.
+
+SEE ALSO
+       uname(1), ifconfig(8)
+
+LikeOS                                                             HOSTNAME(1)

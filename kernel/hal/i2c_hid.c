@@ -4183,14 +4183,14 @@ int i2c_hid_init(void) {
         }
         if (!has_dev) continue;
 
-        void *stack = kalloc(8192);
+        void *stack = kalloc(16384);
         if (!stack) {
             kprintf("[I2C-HID] Failed to allocate worker stack for I2C%d\n",
                     ctrl->bus_id);
             continue;
         }
         ctrl->worker_running = 1;
-        sched_add_task(i2c_hid_worker_thread, ctrl, stack, 8192);
+        sched_add_task(i2c_hid_worker_thread, ctrl, stack, 16384);
         kprintf("[I2C-HID] Worker thread created for I2C%d\n", ctrl->bus_id);
     }
 
