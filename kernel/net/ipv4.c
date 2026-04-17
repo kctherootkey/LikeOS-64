@@ -89,6 +89,26 @@ int ipv4_send(net_device_t* dev, uint32_t dst_ip, uint8_t protocol,
     uint16_t total_len = sizeof(ipv4_header_t) + len;
     if (total_len > out_dev->mtu) return -1;
 
+    // Resolve MAC address BEFORE taking the send-buffer lock so we can
+    // block briefly while waiting for an ARP reply without holding a
+    // spinlock.
+    uint8_t dst_mac[ETH_ALEN];
+    if (dst_ip == 0xFFFFFFFF) {
+        // Broadcast
+        for (int i = 0; i < ETH_ALEN; i++) dst_mac[i] = 0xFF;
+    } else if (arp_resolve(out_dev, next_hop, dst_mac) < 0) {
+        // ARP request was sent — sleep until an interrupt (NIC or timer)
+        // delivers the reply, then re-check the cache.
+        uint64_t arp_deadline = timer_ticks() + 300;  // 3 s timeout
+        while (timer_ticks() < arp_deadline) {
+            __asm__ volatile("sti; hlt");  // enable IRQs + wait for one
+            if (arp_cache_lookup(next_hop, dst_mac) == 0)
+                goto arp_done;
+        }
+        return -1;  // ARP timeout
+    }
+arp_done:
+
     uint64_t iflags;
     spin_lock_irqsave(&ipv4_send_lock, &iflags);
 
@@ -109,18 +129,6 @@ int ipv4_send(net_device_t* dev, uint32_t dst_ip, uint8_t protocol,
 
     for (uint16_t i = 0; i < len; i++)
         ipv4_send_buf[sizeof(ipv4_header_t) + i] = payload[i];
-
-    // Determine next-hop IP for ARP resolution (already determined by route_lookup)
-    // Resolve MAC address
-    uint8_t dst_mac[ETH_ALEN];
-    if (dst_ip == 0xFFFFFFFF) {
-        // Broadcast
-        for (int i = 0; i < ETH_ALEN; i++) dst_mac[i] = 0xFF;
-    } else if (arp_resolve(out_dev, next_hop, dst_mac) < 0) {
-        // ARP request sent, packet dropped (caller should retry)
-        spin_unlock_irqrestore(&ipv4_send_lock, iflags);
-        return -1;
-    }
 
     int ret = eth_send(out_dev, dst_mac, ETH_P_IP, ipv4_send_buf, total_len);
     spin_unlock_irqrestore(&ipv4_send_lock, iflags);
@@ -183,6 +191,21 @@ int ipv4_send_ttl(net_device_t* dev, uint32_t dst_ip, uint8_t protocol,
     uint16_t total_len = sizeof(ipv4_header_t) + len;
     if (total_len > out_dev->mtu) return -1;
 
+    // Resolve MAC address before taking the send-buffer lock (same as ipv4_send)
+    uint8_t dst_mac[ETH_ALEN];
+    if (dst_ip == 0xFFFFFFFF) {
+        for (int i = 0; i < ETH_ALEN; i++) dst_mac[i] = 0xFF;
+    } else if (arp_resolve(out_dev, next_hop, dst_mac) < 0) {
+        uint64_t arp_deadline = timer_ticks() + 300;
+        while (timer_ticks() < arp_deadline) {
+            __asm__ volatile("sti; hlt");
+            if (arp_cache_lookup(next_hop, dst_mac) == 0)
+                goto arp_done_ttl;
+        }
+        return -1;
+    }
+arp_done_ttl:
+
     uint64_t iflags;
     spin_lock_irqsave(&ipv4_send_lock, &iflags);
 
@@ -202,14 +225,6 @@ int ipv4_send_ttl(net_device_t* dev, uint32_t dst_ip, uint8_t protocol,
 
     for (uint16_t i = 0; i < len; i++)
         ipv4_send_buf[sizeof(ipv4_header_t) + i] = payload[i];
-
-    uint8_t dst_mac[ETH_ALEN];
-    if (dst_ip == 0xFFFFFFFF) {
-        for (int i = 0; i < ETH_ALEN; i++) dst_mac[i] = 0xFF;
-    } else if (arp_resolve(out_dev, next_hop, dst_mac) < 0) {
-        spin_unlock_irqrestore(&ipv4_send_lock, iflags);
-        return -1;
-    }
 
     int ret = eth_send(out_dev, dst_mac, ETH_P_IP, ipv4_send_buf, total_len);
     spin_unlock_irqrestore(&ipv4_send_lock, iflags);

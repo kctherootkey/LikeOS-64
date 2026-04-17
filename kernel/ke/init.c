@@ -197,6 +197,15 @@ void continue_system_startup(void) {
     // This takes ~2 seconds but keeps wall-clock time accurate.
     timer_calibrate_frequency();
 
+    // Wait for DHCP to complete before starting the shell so that DNS
+    // and routing are ready for the very first user command.
+    {
+        uint64_t dhcp_deadline = timer_ticks() + 500;  // 5 seconds at 100 Hz
+        while (!dhcp_configured() && timer_ticks() < dhcp_deadline) {
+            __asm__ volatile("hlt");  // sleep until next interrupt
+        }
+    }
+
     shell_init();
     storage_fs_set_ready(&g_storage_state);
 

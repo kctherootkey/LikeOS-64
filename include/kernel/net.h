@@ -418,6 +418,7 @@ void eth_rx(net_device_t* dev, const uint8_t* frame, uint16_t len);
 // ============================================================================
 void arp_init(void);
 int  arp_resolve(net_device_t* dev, uint32_t ip, uint8_t mac_out[ETH_ALEN]);
+int  arp_cache_lookup(uint32_t ip, uint8_t mac_out[ETH_ALEN]);
 void arp_rx(net_device_t* dev, const uint8_t* data, uint16_t len);
 void arp_request(net_device_t* dev, uint32_t target_ip);
 void arp_add_entry(uint32_t ip, const uint8_t mac[ETH_ALEN]);
