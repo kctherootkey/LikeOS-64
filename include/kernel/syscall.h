@@ -178,6 +178,26 @@
 #define SYS_EPOLL_PWAIT     367
 #define SYS_DUP3            368
 #define SYS_DNS_RESOLVE     369
+#define SYS_SETHOSTNAME     370
+#define SYS_NET_GETINFO     371  // Get network info (ARP table, route table, connections)
+#define SYS_DHCP_CONTROL    372  // DHCP client control (discover, release, renew)
+#define SYS_RAW_SEND        373  // Send raw IP/ICMP/ARP packet
+#define SYS_RAW_RECV        374  // Receive raw IP/ICMP/ARP packet
+#define SYS_DNS_RESOLVE_REVERSE 375  // Reverse DNS lookup (PTR)
+
+// NET_GETINFO sub-commands
+#define NET_GET_ARP_TABLE       1
+#define NET_GET_ROUTE_TABLE     2
+#define NET_GET_TCP_CONNECTIONS 3
+#define NET_GET_UDP_SOCKETS     4
+#define NET_GET_IFACE_STATS     5
+#define NET_DNS_QUERY           6
+
+// DHCP_CONTROL sub-commands
+#define DHCP_CMD_DISCOVER   1
+#define DHCP_CMD_RELEASE    2
+#define DHCP_CMD_RENEW      3
+#define DHCP_CMD_STATUS     4
 
 // Kernel log control operations (for SYS_KLOGCTL)
 #define SYSLOG_ACTION_READ       2

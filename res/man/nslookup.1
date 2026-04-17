@@ -1,0 +1,179 @@
+NSLOOKUP(1)                      User Commands                    NSLOOKUP(1)
+
+NAME
+       nslookup - query Internet name servers interactively
+
+SYNOPSIS
+       nslookup [-option] [name | -] [server]
+
+DESCRIPTION
+       Nslookup is a program to query Internet domain name servers.
+       Nslookup has two modes: interactive and non-interactive.
+       Interactive mode allows the user to query name servers for
+       information about various hosts and domains or to print a list
+       of hosts in a domain. Non-interactive mode is used to print
+       just the name and requested information for a host or domain.
+
+   NON-INTERACTIVE MODE
+       Non-interactive mode is invoked when the name or Internet
+       address of the host to be looked up is given as the first
+       argument. The optional second argument specifies the host name
+       or address of a name server.
+
+   INTERACTIVE MODE
+       Interactive mode is entered in the following cases:
+
+       a) when no arguments are given (the default name server will
+          be used)
+
+       b) when the first argument is a hyphen (-) and the second
+          argument is the host name or Internet address of a name
+          server.
+
+   INTERACTIVE COMMANDS
+       host [server]
+              Look up information for host using the current default
+              server or using server, if specified.
+
+       server domain
+              Change the default server to domain; use the current
+              default server to look up the address.
+
+       lserver domain
+              Change the default server to domain; use the initial
+              server to look up the address.
+
+       exit   Exits the program.
+
+       set keyword[=value]
+              This command is used to change state information that
+              affects the lookups. Valid keywords are:
+
+              all    Prints the current values of the frequently used
+                     options to set. Information about the current
+                     default server and host is also printed.
+
+              class=value
+                     Change the query class to one of:
+                        IN   the Internet class
+                        CH   the Chaos class
+                        HS   the Hesiod class
+                        ANY  wildcard
+
+              [no]debug
+                     Turn on or off the display of the full response
+                     packets and any intermediate response packets
+                     when searching.
+
+              [no]d2
+                     Turn debugging mode on or off. This prints
+                     everything that debug prints plus the raw query
+                     and reply packets.
+
+              domain=name
+                     Sets the search list to contain the single
+                     domain name.
+
+              [no]search
+                     If the lookup request contains at least one
+                     period but doesn't end with a trailing period,
+                     append the domain names in the domain search
+                     list to the request until an answer is received.
+
+              port=value
+                     Change the default TCP/UDP name server port to
+                     value. The default value is 53.
+
+              querytype=value / type=value
+                     Change the type of the information query. The
+                     default is A (IPv4 address). Possible values
+                     include: A, AAAA, ANY, CNAME, HINFO, MX, NS,
+                     PTR, SOA, SRV, TXT.
+
+              [no]recurse
+                     Tell the name server to query other servers if
+                     it does not have the information.
+
+              retry=number
+                     Set the number of retries to number.
+
+              timeout=number
+                     Change the initial timeout interval for waiting
+                     for a reply to number seconds.
+
+              [no]vc
+                     Use or do not use a virtual circuit (TCP) when
+                     sending requests to the server.
+
+              [no]fail
+                     Try or do not try the next nameserver if a
+                     nameserver responds with SERVFAIL.
+
+OPTIONS
+       Options can be given on the command line if they precede the
+       host name (or hyphen):
+
+       -type=TYPE / -query=TYPE / -querytype=TYPE
+              Set the query type (A, AAAA, MX, NS, SOA, etc.).
+
+       -class=CLASS
+              Set the query class (default IN).
+
+       -timeout=N
+              Set the timeout in seconds.
+
+       -retry=N
+              Set the number of retries.
+
+       -port=N
+              Set the server port.
+
+       -domain=NAME
+              Set the search domain.
+
+       -[no]debug
+              Enable or disable debugging.
+
+       -[no]d2
+              Enable or disable exhaustive debugging.
+
+       -[no]search
+              Enable or disable use of the search list.
+
+       -[no]recurse
+              Enable or disable recursive queries.
+
+       -[no]vc
+              Enable or disable TCP for queries.
+
+       -[no]fail
+              Enable or disable trying next server on SERVFAIL.
+
+EXAMPLES
+       nslookup example.com
+              Look up the A record for example.com.
+
+       nslookup example.com 8.8.8.8
+              Look up example.com using Google DNS server.
+
+       nslookup -type=MX example.com
+              Query MX records for example.com.
+
+       nslookup -
+              Enter interactive mode.
+
+       nslookup
+              Enter interactive mode with default server.
+
+   INTERACTIVE SESSION EXAMPLE
+              > set type=NS
+              > example.com
+              > server 8.8.8.8
+              > example.com
+              > set all
+              > exit
+
+SEE ALSO
+       dig(1), host(1)
+
+LikeOS                                                           NSLOOKUP(1)

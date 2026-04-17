@@ -7,7 +7,7 @@
 #include "../../include/kernel/random.h"
 
 // TCP connection table
-static tcp_conn_t tcp_connections[TCP_MAX_CONNECTIONS];
+tcp_conn_t tcp_connections[TCP_MAX_CONNECTIONS];
 static spinlock_t tcp_lock = SPINLOCK_INIT("tcp");
 
 // ISN secret key (generated once at init, 128-bit for SipHash-2-4)

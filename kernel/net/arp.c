@@ -2,6 +2,7 @@
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/slab.h"
+#include "../../include/kernel/sched.h"
 #include "../../include/kernel/timer.h"
 
 // ============================================================================
@@ -120,6 +121,11 @@ void arp_request(net_device_t* dev, uint32_t target_ip) {
     eth_send(dev, eth_broadcast_addr, ETH_P_ARP, pkt, sizeof(arp_header_t));
 }
 
+// Blocking ARP request/reply for arping
+static volatile uint32_t arp_reply_ip = 0;
+static volatile uint8_t arp_reply_mac[ETH_ALEN];
+static volatile int arp_reply_ready = 0;
+
 // Process received ARP packet
 void arp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
     if (len < sizeof(arp_header_t)) return;
@@ -158,4 +164,59 @@ void arp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
 
         eth_send(dev, arp->sender_mac, ETH_P_ARP, reply, sizeof(arp_header_t));
     }
+
+    // Wake anyone waiting for an ARP reply
+    if (opcode == ARP_OP_REPLY) {
+        arp_reply_ip = sender_ip;
+        for (int i = 0; i < ETH_ALEN; i++)
+            arp_reply_mac[i] = arp->sender_mac[i];
+        arp_reply_ready = 1;
+        sched_wake_channel((void*)&arp_reply_ready);
+    }
+}
+
+// Get ARP table entries for userspace
+int net_get_arp_table(net_arp_info_t* entries, int max_entries) {
+    uint64_t flags;
+    spin_lock_irqsave(&arp_lock, &flags);
+    int count = 0;
+    for (int i = 0; i < ARP_TABLE_SIZE && count < max_entries; i++) {
+        if (arp_table[i].valid) {
+            entries[count].ip = arp_table[i].ip;
+            for (int m = 0; m < ETH_ALEN; m++)
+                entries[count].mac[m] = arp_table[i].mac[m];
+            entries[count].valid = 1;
+            entries[count].pad = 0;
+            count++;
+        }
+    }
+    spin_unlock_irqrestore(&arp_lock, flags);
+    return count;
+}
+
+// Blocking ARP request/reply for arping
+int arp_send_request(net_device_t* dev, uint32_t target_ip) {
+    arp_reply_ready = 0;
+    arp_reply_ip = 0;
+    arp_request(dev, target_ip);
+    return 0;
+}
+
+int arp_recv_reply(uint32_t target_ip, uint8_t mac_out[6], uint64_t timeout_ticks) {
+    uint64_t start = timer_ticks();
+    task_t* cur = sched_current();
+    while (!arp_reply_ready || arp_reply_ip != target_ip) {
+        if (timer_ticks() - start > timeout_ticks) return -1;
+
+        cur->state = TASK_BLOCKED;
+        cur->wait_channel = (void*)&arp_reply_ready;
+        cur->wakeup_tick = start + timeout_ticks;
+        sched_schedule();
+        cur->wait_channel = NULL;
+        cur->wakeup_tick = 0;
+    }
+    for (int i = 0; i < ETH_ALEN; i++)
+        mac_out[i] = arp_reply_mac[i];
+    arp_reply_ready = 0;
+    return 0;
 }

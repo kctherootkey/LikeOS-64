@@ -1,0 +1,158 @@
+PING(8)                        System Manager's Manual                       PING(8)
+
+NAME
+       ping - send ICMP ECHO_REQUEST to network hosts
+
+SYNOPSIS
+       ping [-aAbBdDfhLnOqrRUvV] [-c count] [-F flowlabel] [-i interval]
+            [-I interface] [-l preload] [-m mark] [-M pmtudisc_opt]
+            [-N nodeinfo_option] [-w deadline] [-W timeout] [-p pattern]
+            [-Q tos] [-s packetsize] [-S sndbuf] [-t ttl] destination
+
+DESCRIPTION
+       ping uses the ICMP protocol's mandatory ECHO_REQUEST datagram to
+       elicit an ICMP ECHO_RESPONSE from a host or gateway.
+       ECHO_REQUEST datagrams ("pings") have an IP and ICMP header,
+       followed by an arbitrary amount of "pad" bytes used to fill out
+       the packet.
+
+       ping works with both IPv4 and IPv6. Using the related
+       specification notation, IPv6 can also be explicitly selected:
+       -4 (IPv4) or -6 (IPv6, not supported).
+
+OPTIONS
+       -4     Use IPv4 only (default).
+
+       -6     Use IPv6 only (not supported on LikeOS).
+
+       -a     Audible. Ring the bell on each successful reply.
+
+       -A     Adaptive ping. Interpacket interval adapts to round-trip
+              time so that effectively not more than one (or more, if
+              preload is set) unanswered probe is present in the
+              network. Minimal interval is 200msec.
+
+       -b     Allow pinging a broadcast address.
+
+       -B     Do not allow ping to change source address of probes.
+              The address is bound to one selected when ping starts.
+
+       -c count
+              Stop after sending count ECHO_REQUEST packets. With
+              deadline option, ping waits for count ECHO_REPLY packets,
+              until the timeout expires.
+
+       -d     Set the SO_DEBUG option on the socket being used.
+
+       -D     Print timestamp (unix time + microseconds) before each
+              line.
+
+       -f     Flood ping. For every ECHO_REQUEST sent a period "." is
+              printed, while for every ECHO_REPLY received a backspace
+              is printed. This provides a rapid display of how many
+              packets are being dropped. Only the super-user may use
+              this option. This can be very hard on a network and
+              should be used with caution.
+
+       -F flow label
+              IPv6 only. Allocate and set 20 bit flow label on echo
+              request packets (not supported).
+
+       -h     Display help and exit.
+
+       -i interval
+              Wait interval seconds between sending each packet. The
+              default is to wait for one second between each packet,
+              except in flood mode.
+
+       -I interface
+              Set source address to specified interface address or
+              device name. When pinging IPv6 link-local addresses,
+              this option is required.
+
+       -l preload
+              If preload is specified, ping sends that many packets
+              not waiting for reply. Only the super-user may select
+              preload more than 3.
+
+       -L     Suppress loopback of multicast packets.
+
+       -m mark
+              Use mark to tag the packets going out.
+
+       -M pmtudisc_opt
+              Select Path MTU Discovery strategy. pmtudisc_option may
+              be either "do" (prohibit fragmentation), "want" (do PMTU
+              discovery, fragment locally when packet size is large),
+              or "dont" (do not set DF flag).
+
+       -n     Numeric output only. No attempt will be made to lookup
+              symbolic names for host addresses.
+
+       -O     Report outstanding ICMP ECHO reply before sending next
+              packet.
+
+       -p pattern
+              Specify up to 16 "pad" bytes to fill out the packet you
+              send. This is useful for diagnosing data-dependent
+              problems in a network.
+
+       -q     Quiet output. Nothing is displayed except the summary
+              lines at startup time and when finished.
+
+       -Q tos Set Quality of Service-related bits in ICMP datagrams.
+              tos can be either decimal or hex number.
+
+       -r     Bypass the normal routing tables and send directly to a
+              host on an attached interface.
+
+       -R     Record route. Includes the RECORD_ROUTE option in the
+              ECHO_REQUEST packet and displays the route buffer on
+              returned packets.
+
+       -s packetsize
+              Specifies the number of data bytes to be sent. The
+              default is 56, which translates into 64 ICMP data bytes
+              when combined with the 8 bytes of ICMP header data.
+
+       -S sndbuf
+              Set socket sndbuf. If not specified, it is selected to
+              buffer not more than one packet.
+
+       -t ttl
+              Set the IP Time to Live.
+
+       -U     Print full user-to-user latency (the old behaviour).
+              Normally ping prints network round trip time, which can
+              be different f.e. due to DNS resolution.
+
+       -v     Verbose output.
+
+       -V     Show version and exit.
+
+       -w deadline
+              Specify a timeout, in seconds, before ping exits
+              regardless of how many packets have been sent or
+              received.
+
+       -W timeout
+              Time to wait for a response, in seconds. This option
+              only affects timeout in absence of any responses.
+
+EXAMPLES
+       ping -c 5 192.168.1.1
+              Send 5 pings to 192.168.1.1.
+
+       ping -f -c 1000 10.0.0.1
+              Flood ping 10.0.0.1 with 1000 packets.
+
+       ping -i 0.2 -s 1400 host
+              Send 1400-byte pings every 200ms.
+
+       ping -t 64 -w 10 host
+              Ping with TTL 64 and 10-second deadline.
+
+SEE ALSO
+       traceroute(8), ifconfig(8), netstat(8)
+
+LikeOS                                                                PING(8)

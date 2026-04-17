@@ -1,0 +1,181 @@
+NETSTAT(8)                     System Manager's Manual                   NETSTAT(8)
+
+NAME
+       netstat - Print network connections, routing tables, interface
+       statistics, masquerade connections, and multicast memberships
+
+SYNOPSIS
+       netstat [address_family_options] [--tcp|-t] [--udp|-u] [--raw|-w]
+              [--unix|-x] [--listening|-l] [--all|-a] [--numeric|-n]
+              [--numeric-hosts] [--numeric-ports] [--numeric-users]
+              [--symbolic|-N] [--extend|-e[e]] [--timers|-o] [--program|-p]
+              [--verbose|-v] [--continuous|-c] [--wide|-W]
+
+       netstat {--route|-r} [address_family_options] [--extend|-e[e]]
+              [--verbose|-v] [--numeric|-n] [--numeric-hosts]
+              [--numeric-ports] [--numeric-users] [--continuous|-c]
+
+       netstat {--interfaces|-i} [--all|-a] [--extend|-e[e]]
+              [--verbose|-v] [--program|-p] [--numeric|-n]
+              [--numeric-hosts] [--numeric-ports] [--numeric-users]
+              [--continuous|-c]
+
+       netstat {--groups|-g} [--numeric|-n] [--numeric-hosts]
+              [--numeric-ports] [--numeric-users] [--continuous|-c]
+
+       netstat {--masquerade|-M} [--extend|-e] [--numeric|-n]
+              [--numeric-hosts] [--numeric-ports] [--numeric-users]
+              [--continuous|-c]
+
+       netstat {--statistics|-s} [--tcp|-t] [--udp|-u] [--raw|-w]
+
+       netstat {--version|-V}
+       netstat {--help|-h}
+
+DESCRIPTION
+       Netstat prints information about the Linux networking subsystem.
+       The type of information printed is controlled by the first
+       argument.
+
+   (none)
+       By default, netstat displays a list of open sockets. If you
+       don't specify any address families, then the active sockets of
+       all configured address families will be printed.
+
+   --route, -r
+       Display the kernel routing tables. See the description in
+       route(8) for details.
+
+   --groups, -g
+       Display multicast group membership information for IPv4 and
+       IPv6.
+
+   --interfaces, -i
+       Display a table of all network interfaces.
+
+   --masquerade, -M
+       Display a list of masqueraded connections.
+
+   --statistics, -s
+       Display summary statistics for each protocol.
+
+OPTIONS
+       --verbose, -v
+              Tell the user what is going on by being verbose. Especially
+              print some useful information about unconfigured address
+              families.
+
+       --wide, -W
+              Do not truncate IP addresses by using output as wide as
+              needed.
+
+       --numeric, -n
+              Show numerical addresses instead of trying to determine
+              symbolic host, port or user names.
+
+       --numeric-hosts
+              Shows numerical host addresses but does not affect the
+              resolution of port or user names.
+
+       --numeric-ports
+              Shows numerical port numbers but does not affect the
+              resolution of host or user names.
+
+       --numeric-users
+              Shows numerical user IDs but does not affect the
+              resolution of host or port names.
+
+       --protocol=family, -A
+              Specifies the address families for which connections are
+              to be shown. family is a comma separated list of address
+              family keywords like inet, inet6, unix, etc.
+
+       -c, --continuous
+              This will cause netstat to print the selected information
+              every second continuously.
+
+       -e, --extend
+              Display additional information. Use this option twice for
+              maximum detail.
+
+       -o, --timers
+              Include information related to networking timers.
+
+       -p, --program
+              Show the PID and name of the program to which each
+              socket belongs.
+
+       -l, --listening
+              Show only listening sockets. (These are omitted by
+              default.)
+
+       -a, --all
+              Show both listening and non-listening sockets. With the
+              --interfaces option, show interfaces that are not up.
+
+       -F     Print routing information from the FIB.
+
+       -C     Print routing information from the route cache.
+
+       -4, --inet
+              Show IPv4 connections only.
+
+       -6, --inet6
+              Show IPv6 connections only (not supported).
+
+       -t, --tcp
+              Show TCP connections.
+
+       -u, --udp
+              Show UDP connections.
+
+       -w, --raw
+              Show RAW socket connections.
+
+       -x, --unix
+              Show Unix domain socket connections (not supported).
+
+       -N, --symbolic
+              Display symbolic host/port/user names.
+
+       -M, --masquerade
+              Display masqueraded connections.
+
+       -s, --statistics
+              Display summary statistics for each protocol.
+
+       -g, --groups
+              Display multicast group membership information.
+
+       -V, --version
+              Display version information.
+
+       -h, --help
+              Display help information.
+
+EXAMPLES
+       netstat
+              Display all active connections.
+
+       netstat -tlnp
+              Display listening TCP connections numerically with programs.
+
+       netstat -rn
+              Display the routing table numerically.
+
+       netstat -i
+              Display network interface statistics.
+
+       netstat -s
+              Display protocol statistics.
+
+       netstat -an
+              Display all connections numerically.
+
+       netstat -c
+              Continuously display connections.
+
+SEE ALSO
+       route(8), ifconfig(8), arp(8)
+
+LikeOS                                                             NETSTAT(8)

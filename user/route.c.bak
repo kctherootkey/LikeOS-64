@@ -1,0 +1,180 @@
+/*
+ * route - show / manipulate the IP routing table
+ *
+ * Usage: route [-n] [add|del] [-net|-host] target [netmask NM] [gw GW] [dev IF]
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <net/route.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
+static const char *ip_str(uint32_t ip)
+{
+    struct in_addr a;
+    a.s_addr = htonl(ip);
+    return inet_ntoa(a);
+}
+
+static void show_route_table(int numeric)
+{
+    (void)numeric;
+    net_route_info_t routes[32];
+    int n = net_getinfo(NET_GET_ROUTE_TABLE, routes, 32);
+
+    printf("Kernel IP routing table\n");
+    printf("%-16s %-16s %-16s %-6s Metric Ref Use Iface\n",
+           "Destination", "Gateway", "Genmask", "Flags");
+
+    for (int i = 0; i < n; i++) {
+        char flags[8] = "U";
+        int fi = 1;
+        if (routes[i].flags & 0x0002) flags[fi++] = 'G';
+        if (routes[i].flags & 0x0004) flags[fi++] = 'H';
+        flags[fi] = '\0';
+
+        printf("%-16s %-16s %-16s %-6s %-6d %-3d %-3d %s\n",
+               routes[i].dest == 0 ? "default" : ip_str(routes[i].dest),
+               routes[i].gateway == 0 ? "*" : ip_str(routes[i].gateway),
+               ip_str(routes[i].netmask),
+               flags, 0, 0, 0, routes[i].device);
+    }
+}
+
+static void print_help(void)
+{
+    printf("Usage: route [-n] [-e] [-A family]\n");
+    printf("       route [-n] add [-net|-host] target [netmask NM] [gw GW] [dev IF]\n");
+    printf("       route [-n] del [-net|-host] target [netmask NM] [gw GW] [dev IF]\n");
+    printf("\nOptions:\n");
+    printf("  -n           show numerical addresses instead of hostnames\n");
+    printf("  -e           use netstat-format for displaying\n");
+    printf("  add          add a new route\n");
+    printf("  del          delete a route\n");
+    printf("  -net         the target is a network\n");
+    printf("  -host        the target is a host\n");
+    printf("  netmask NM   specify the netmask of the route\n");
+    printf("  gw GW        route packets via a gateway\n");
+    printf("  dev IF       force the route to be associated with the specified device\n");
+}
+
+int main(int argc, char *argv[])
+{
+    int numeric = 0;
+    int i = 1;
+
+    /* Parse leading options */
+    while (i < argc && argv[i][0] == '-') {
+        if (strcmp(argv[i], "-n") == 0) { numeric = 1; i++; }
+        else if (strcmp(argv[i], "-e") == 0) { i++; }
+        else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_help(); return 0;
+        }
+        else break;
+    }
+
+    /* No add/del: show table */
+    if (i >= argc) {
+        show_route_table(numeric);
+        return 0;
+    }
+
+    int adding = 0, deleting = 0;
+    if (strcmp(argv[i], "add") == 0) { adding = 1; i++; }
+    else if (strcmp(argv[i], "del") == 0 || strcmp(argv[i], "delete") == 0) { deleting = 1; i++; }
+    else {
+        show_route_table(numeric);
+        return 0;
+    }
+
+    /* Parse -net / -host */
+    int is_host = 0;
+    if (i < argc && strcmp(argv[i], "-net") == 0) { i++; }
+    else if (i < argc && strcmp(argv[i], "-host") == 0) { is_host = 1; i++; }
+
+    if (i >= argc) {
+        fprintf(stderr, "route: need target\n");
+        return 1;
+    }
+
+    /* Target */
+    const char *target = argv[i++];
+    const char *netmask_str = NULL;
+    const char *gw_str = NULL;
+    const char *dev = NULL;
+
+    while (i < argc) {
+        if (strcmp(argv[i], "netmask") == 0 && i + 1 < argc) {
+            netmask_str = argv[i + 1]; i += 2;
+        } else if (strcmp(argv[i], "gw") == 0 && i + 1 < argc) {
+            gw_str = argv[i + 1]; i += 2;
+        } else if (strcmp(argv[i], "dev") == 0 && i + 1 < argc) {
+            dev = argv[i + 1]; i += 2;
+        } else {
+            i++;
+        }
+    }
+
+    /* Build rtentry */
+    struct rtentry rt;
+    memset(&rt, 0, sizeof(rt));
+
+    struct sockaddr_in *dst = (struct sockaddr_in *)&rt.rt_dst;
+    dst->sin_family = AF_INET;
+    if (strcmp(target, "default") == 0)
+        dst->sin_addr.s_addr = 0;
+    else
+        dst->sin_addr.s_addr = inet_addr(target);
+
+    if (gw_str) {
+        struct sockaddr_in *gw = (struct sockaddr_in *)&rt.rt_gateway;
+        gw->sin_family = AF_INET;
+        gw->sin_addr.s_addr = inet_addr(gw_str);
+        rt.rt_flags |= 0x0002; /* RTF_GATEWAY */
+    }
+
+    struct sockaddr_in *mask = (struct sockaddr_in *)&rt.rt_genmask;
+    mask->sin_family = AF_INET;
+    if (netmask_str)
+        mask->sin_addr.s_addr = inet_addr(netmask_str);
+    else if (is_host)
+        mask->sin_addr.s_addr = inet_addr("255.255.255.255");
+    else if (strcmp(target, "default") == 0)
+        mask->sin_addr.s_addr = 0;
+    else
+        mask->sin_addr.s_addr = inet_addr("255.255.255.0");
+
+    rt.rt_flags |= 0x0001; /* RTF_UP */
+    if (is_host) rt.rt_flags |= 0x0004; /* RTF_HOST */
+    rt.rt_dev = dev ? (char *)dev : NULL;
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "route: socket: Cannot create socket\n");
+        return 1;
+    }
+
+    int ret;
+    if (adding)
+        ret = ioctl(fd, SIOCADDRT, &rt);
+    else
+        ret = ioctl(fd, SIOCDELRT, &rt);
+
+    close(fd);
+
+    if (ret < 0) {
+        fprintf(stderr, "route: %s: %s\n",
+                adding ? "SIOCADDRT" : "SIOCDELRT",
+                "Operation failed");
+        return 1;
+    }
+
+    return 0;
+}

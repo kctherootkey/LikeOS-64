@@ -530,12 +530,12 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4,
     task_t* t = (task_t*)kalloc(sizeof(task_t));
     if (!t) return NULL;
 
-    uint8_t* k_stack_mem = (uint8_t*)kalloc(8192);
+    uint8_t* k_stack_mem = (uint8_t*)kalloc(KERNEL_STACK_SIZE);
     if (!k_stack_mem) { kfree(t); return NULL; }
     // Zero the kernel stack to prevent stale data issues
-    mm_memset(k_stack_mem, 0, 8192);
+    mm_memset(k_stack_mem, 0, KERNEL_STACK_SIZE);
 
-    uint64_t k_stack_top = ((uint64_t)(k_stack_mem + 8192)) & ~0xFUL;
+    uint64_t k_stack_top = ((uint64_t)(k_stack_mem + KERNEL_STACK_SIZE)) & ~0xFUL;
     uint64_t* k_sp = (uint64_t*)k_stack_top;
 
     // IRET frame
@@ -1116,15 +1116,15 @@ task_t* sched_fork_current(void) {
     }
     if (!child_pml4) { kfree(child); return NULL; }
 
-    uint8_t* k_stack_mem = (uint8_t*)kalloc(8192);
+    uint8_t* k_stack_mem = (uint8_t*)kalloc(KERNEL_STACK_SIZE);
     if (!k_stack_mem) {
         mm_destroy_address_space(child_pml4);
         kfree(child);
         return NULL;
     }
     // Zero the kernel stack to prevent stale data issues
-    mm_memset(k_stack_mem, 0, 8192);
-    uint64_t k_stack_top = ((uint64_t)(k_stack_mem + 8192)) & ~0xFUL;
+    mm_memset(k_stack_mem, 0, KERNEL_STACK_SIZE);
+    uint64_t k_stack_top = ((uint64_t)(k_stack_mem + KERNEL_STACK_SIZE)) & ~0xFUL;
 
     // Copy parent
     mm_memcpy(child, cur, sizeof(task_t));

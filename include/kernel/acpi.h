@@ -595,4 +595,8 @@ int acpi_pci_lookup_irq(const char* bridge_path,
                         uint8_t pci_device, uint8_t pci_pin,
                         uint32_t* out_gsi);
 
+// Read the ACPI PM Timer (3.579545 MHz, global chipset counter).
+// Returns current counter value, or 0 if PM Timer unavailable.
+uint32_t acpi_read_pmtimer(void);
+
 #endif // _KERNEL_ACPI_H_

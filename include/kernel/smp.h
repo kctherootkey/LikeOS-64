@@ -30,7 +30,7 @@
 #define AP_TRAMPOLINE_ADDR_DEFAULT  0x8000
 
 // AP stack size
-#define AP_STACK_SIZE           8192
+#define AP_STACK_SIZE           16384
 
 // Timeout for AP startup (in milliseconds)
 #define AP_STARTUP_TIMEOUT_MS   200

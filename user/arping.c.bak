@@ -1,0 +1,120 @@
+/*
+ * arping - send ARP REQUEST to a neighbour host
+ *
+ * Usage: arping [-c count] [-w timeout] [-I interface] [-s source] destination
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <getopt.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+
+static const char *ip_str(uint32_t ip)
+{
+    struct in_addr a;
+    a.s_addr = htonl(ip);
+    return inet_ntoa(a);
+}
+
+static void print_help(const char *progname)
+{
+    printf("Usage: %s [OPTIONS] destination\n", progname);
+    printf("Send ARP REQUEST to a neighbour host.\n\n");
+    printf("Options:\n");
+    printf("  -c count       stop after sending count requests\n");
+    printf("  -w timeout     how long to wait for a reply (seconds, default 5)\n");
+    printf("  -I interface   network interface\n");
+    printf("  -s source      source address\n");
+    printf("  -f             quit on first reply\n");
+    printf("  -q             quiet output\n");
+    printf("  -D             duplicate address detection mode\n");
+    printf("  -h             display this help and exit\n");
+}
+
+int main(int argc, char *argv[])
+{
+    int count = -1;
+    int timeout = 5;
+    int quit_first = 0;
+    int quiet = 0;
+    int opt;
+
+    while ((opt = getopt(argc, argv, "c:w:I:s:fqDh")) != -1) {
+        switch (opt) {
+            case 'c': count = atoi(optarg); break;
+            case 'w': timeout = atoi(optarg); break;
+            case 'I': /* interface - not used */ break;
+            case 's': /* source - not used */ break;
+            case 'f': quit_first = 1; break;
+            case 'q': quiet = 1; break;
+            case 'D': /* DAD mode */ break;
+            case 'h': print_help(argv[0]); return 0;
+            default: print_help(argv[0]); return 1;
+        }
+    }
+
+    if (optind >= argc) {
+        fprintf(stderr, "arping: missing destination\n");
+        return 1;
+    }
+
+    const char *dest = argv[optind];
+    uint32_t dst_ip = ntohl(inet_addr(dest));
+    if (dst_ip == 0) {
+        fprintf(stderr, "arping: invalid destination: %s\n", dest);
+        return 1;
+    }
+
+    /* Get our interface info */
+    net_iface_info_t ifaces[4];
+    int ni = net_getinfo(NET_GET_IFACE_INFO, ifaces, 4);
+    const char *ifname = "eth0";
+    const char *src_str = "0.0.0.0";
+    for (int i = 0; i < ni; i++) {
+        if (ifaces[i].ip != 0 && !(ifaces[i].flags & 0x0008)) {
+            ifname = ifaces[i].name;
+            src_str = ip_str(ifaces[i].ip);
+            break;
+        }
+    }
+
+    printf("ARPING %s from %s %s\n", dest, src_str, ifname);
+
+    int sent = 0, received = 0;
+
+    for (int seq = 0; count < 0 || seq < count; seq++) {
+        int ret = raw_send(RAW_SEND_ARP_REQUEST, dst_ip, 0, 0);
+        if (ret < 0) {
+            if (!quiet) fprintf(stderr, "arping: send failed\n");
+            sent++;
+            sleep(1);
+            continue;
+        }
+        sent++;
+
+        uint64_t timeout_ticks = (uint64_t)timeout * 100;
+        uint8_t mac[6];
+        ret = raw_recv(RAW_RECV_ARP_REPLY, mac, dst_ip, timeout_ticks);
+        if (ret == 0) {
+            received++;
+            if (!quiet) {
+                printf("Unicast reply from %s [%02X:%02X:%02X:%02X:%02X:%02X]\n",
+                       dest, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            }
+            if (quit_first) break;
+        } else {
+            if (!quiet) printf("Timeout\n");
+        }
+
+        if (count < 0 || seq + 1 < count)
+            sleep(1);
+    }
+
+    printf("Sent %d probes (%d broadcast(s))\n", sent, sent);
+    printf("Received %d response(s)\n", received);
+
+    return received > 0 ? 0 : 1;
+}

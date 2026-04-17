@@ -4,6 +4,7 @@
 #include <sys/epoll.h>
 #include <poll.h>
 #include <errno.h>
+#include <netdb.h>
 #include "syscall.h"
 
 int socket(int domain, int type, int protocol) {
@@ -201,4 +202,44 @@ int dns_resolve(const char *hostname, uint32_t *ip_out) {
     long ret = syscall2(SYS_DNS_RESOLVE, (long)hostname, (long)ip_out);
     if (ret < 0) { errno = (int)-ret; return -1; }
     return 0;
+}
+
+int dns_resolve_reverse(uint32_t ip_nbo, char *out, int maxlen) {
+    long ret = syscall3(SYS_DNS_RESOLVE_REVERSE, (long)ip_nbo, (long)out, (long)maxlen);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return 0;
+}
+
+int sethostname(const char *name, size_t len) {
+    long ret = syscall2(SYS_SETHOSTNAME, (long)name, (long)len);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return 0;
+}
+
+int net_getinfo(int subcmd, void *buf, int max_entries) {
+    long ret = syscall3(SYS_NET_GETINFO, subcmd, (long)buf, max_entries);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int dhcp_control(int subcmd) {
+    long ret = syscall1(SYS_DHCP_CONTROL, subcmd);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int raw_send(int subcmd, uint32_t dst, uint32_t id_seq, uint32_t ttl) {
+    long ret = syscall4(SYS_RAW_SEND, subcmd, dst, id_seq, ttl);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int raw_recv(int subcmd, void *result, uint32_t param, uint64_t timeout) {
+    long ret = syscall4(SYS_RAW_RECV, subcmd, (long)result, param, timeout);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return (int)ret;
+}
+
+int dns_query(dns_query_buf_t *buf) {
+    return net_getinfo(NET_DNS_QUERY, buf, 1);
 }

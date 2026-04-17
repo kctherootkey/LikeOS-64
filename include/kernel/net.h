@@ -428,13 +428,15 @@ void arp_add_entry(uint32_t ip, const uint8_t mac[ETH_ALEN]);
 void ipv4_init(void);
 int  ipv4_send(net_device_t* dev, uint32_t dst_ip, uint8_t protocol,
                const uint8_t* payload, uint16_t len);
+int  ipv4_send_ttl(net_device_t* dev, uint32_t dst_ip, uint8_t protocol,
+                   const uint8_t* payload, uint16_t len, uint8_t ttl);
 void ipv4_rx(net_device_t* dev, const uint8_t* data, uint16_t len);
 uint16_t ipv4_checksum(const void* data, uint16_t len);
 
 // ============================================================================
 // ICMP API
 // ============================================================================
-void icmp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t len);
+void icmp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t len, uint8_t rx_ttl);
 
 // ============================================================================
 // UDP API
@@ -795,6 +797,7 @@ int  route_add(uint32_t dst_net, uint32_t netmask, uint32_t gateway,
 int  route_del(uint32_t dst_net, uint32_t netmask, uint32_t gateway);
 net_device_t* route_lookup(uint32_t dst_ip, uint32_t* next_hop_out);
 net_device_t* net_get_loopback(void);
+void loopback_process_pending(void);
 
 // ============================================================================
 // UNIX Domain Socket Address
@@ -856,9 +859,108 @@ int  unix_poll(int usockfd, short events);
 // DNS Resolver
 // ============================================================================
 int  dns_resolve(const char* hostname, uint32_t* ip_out);
+int  dns_resolve_reverse(uint32_t ip_nbo, char* out, int maxlen);
+int  dns_query_raw(const char* name, uint16_t qtype,
+                   uint8_t* response, int max_len);
 void dns_init(void);
 void dns_rx(const uint8_t* data, uint16_t len);
 
 #define DNS_CLIENT_PORT 5353
+
+// ============================================================================
+// Userspace-visible info structures (for SYS_NET_GETINFO)
+// ============================================================================
+
+// ARP table entry (userland view)
+typedef struct net_arp_info {
+    uint32_t ip;                // Host byte order
+    uint8_t  mac[6];
+    uint8_t  valid;
+    uint8_t  pad;
+} net_arp_info_t;
+
+// Route table entry (userland view)
+typedef struct net_route_info {
+    uint32_t dst_net;           // Host byte order
+    uint32_t netmask;           // Host byte order
+    uint32_t gateway;           // Host byte order
+    uint16_t flags;
+    uint16_t metric;
+    char     dev_name[16];
+} net_route_info_t;
+
+// TCP connection info (userland view)
+typedef struct net_tcp_info {
+    uint32_t local_ip;
+    uint16_t local_port;
+    uint32_t remote_ip;
+    uint16_t remote_port;
+    int      state;
+    uint32_t rx_queue;
+    uint32_t tx_queue;
+} net_tcp_info_t;
+
+// UDP socket info (userland view)
+typedef struct net_udp_info {
+    uint32_t local_ip;
+    uint16_t local_port;
+    uint32_t remote_ip;
+    uint16_t remote_port;
+    uint32_t rx_queue;
+} net_udp_info_t;
+
+// Interface statistics (userland view)
+typedef struct net_iface_info {
+    char     name[16];
+    uint8_t  mac[6];
+    uint16_t mtu;
+    uint32_t ip_addr;
+    uint32_t netmask;
+    uint32_t gateway;
+    uint32_t dns_server;
+    uint16_t flags;
+    uint16_t pad;
+    uint64_t rx_packets;
+    uint64_t tx_packets;
+    uint64_t rx_bytes;
+    uint64_t tx_bytes;
+    uint64_t rx_errors;
+    uint64_t tx_errors;
+    uint64_t rx_dropped;
+} net_iface_info_t;
+
+// Raw DNS query buffer (shared with userspace)
+typedef struct dns_query_buf {
+    char     name[256];
+    uint16_t qtype;
+    uint16_t pad;
+    int      response_len;
+    uint8_t  response[512];
+} dns_query_buf_t;
+
+// ============================================================================
+// Extended kernel API for userspace networking commands
+// ============================================================================
+int  net_get_arp_table(net_arp_info_t* entries, int max_entries);
+int  net_get_route_table(net_route_info_t* entries, int max_entries);
+int  net_get_tcp_connections(net_tcp_info_t* entries, int max_entries);
+int  net_get_udp_sockets(net_udp_info_t* entries, int max_entries);
+int  net_get_iface_info(net_iface_info_t* entries, int max_entries);
+int  dhcp_release(net_device_t* dev);
+int  dhcp_renew(net_device_t* dev);
+int  dhcp_get_status(void);
+
+// Raw ICMP send/receive for ping, traceroute, arping
+int  icmp_send_echo(net_device_t* dev, uint32_t dst_ip, uint16_t id,
+                    uint16_t seq, const uint8_t* data, uint16_t len, uint8_t ttl);
+int  icmp_recv_reply(uint32_t* src_ip, uint16_t expected_id,
+                     uint8_t* type_out, uint8_t* code_out,
+                     uint16_t* seq_out, uint64_t timeout_ticks,
+                     uint64_t* rtt_us_out, uint16_t expected_seq,
+                     uint8_t* ttl_out);
+int  arp_send_request(net_device_t* dev, uint32_t target_ip);
+int  arp_recv_reply(uint32_t target_ip, uint8_t mac_out[6], uint64_t timeout_ticks);
+void net_set_hostname(const char* name);
+const char* net_get_hostname(void);
 
 #endif // _KERNEL_NET_H_

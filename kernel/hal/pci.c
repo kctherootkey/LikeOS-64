@@ -277,6 +277,24 @@ const pci_device_t* pci_get_xhci(int index)
     return 0;
 }
 
+const pci_device_t* pci_find_bridge_for_bus(unsigned char target_bus)
+{
+    if (target_bus == 0) return 0;  // Bus 0 has no parent bridge
+    for (int i = 0; i < g_pci_count; i++) {
+        const pci_device_t *p = &g_pci_devices[i];
+        // PCI-to-PCI bridge: class 0x06, subclass 0x04
+        if (p->class_code == 0x06 && p->subclass == 0x04) {
+            // Config register 0x18: primary(7:0), secondary(15:8), subordinate(23:16)
+            unsigned int buses = pci_cfg_read32(p->bus, p->device, p->function, 0x18);
+            unsigned char secondary = (buses >> 8) & 0xFF;
+            unsigned char subordinate = (buses >> 16) & 0xFF;
+            if (target_bus >= secondary && target_bus <= subordinate)
+                return p;
+        }
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 //  PCI Capability list walking
 // ---------------------------------------------------------------------------

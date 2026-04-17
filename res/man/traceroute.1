@@ -1,0 +1,166 @@
+TRACEROUTE(8)                  System Manager's Manual               TRACEROUTE(8)
+
+NAME
+       traceroute - print the route packets trace to network host
+
+SYNOPSIS
+       traceroute [-46dFITUnreAV] [-f first_ttl] [-g gate,...]
+                  [-i device] [-m max_ttl] [-p port] [-s src_addr]
+                  [-q nqueries] [-N squeries] [-t tos]
+                  [-l flow_label] [-w MAX,HERE,NEAR] [-z sendwait]
+                  [-UL] [-D] [-P proto] [--sport=port] [--fwmark=mark]
+                  [-M method] [-O mod_options] [--mtu] [--back]
+                  host [packet_len]
+
+DESCRIPTION
+       traceroute tracks the route packets taken from an IP network on
+       their way to a given host. It utilizes the IP protocol's time
+       to live (TTL) field and attempts to elicit an ICMP
+       TIME_EXCEEDED response from each gateway along the path to the
+       host.
+
+       traceroute6 is equivalent to traceroute -6.
+
+       The only required parameter is the name or IP address of the
+       destination host. The optional packet_len parameter gives the
+       length of the probe packet (default 60 bytes).
+
+OPTIONS
+       -4     Use IPv4 (default).
+
+       -6     Use IPv6 (not supported on LikeOS).
+
+       -d     Enable socket level debugging (SO_DEBUG).
+
+       -F     Set the "Don't Fragment" bit. This is useful for
+              determining the path MTU.
+
+       -f first_ttl
+              Specifies with what TTL to start. Defaults to 1.
+
+       -g gateway
+              Tells traceroute to add an IP source routing option
+              to the outgoing packet that tells the network to route
+              the packet through the specified gateway (most routers
+              have disabled source routing for security reasons).
+
+       -I     Use ICMP ECHO for probes (default on LikeOS).
+
+       -T     Use TCP SYN for probes (not supported).
+
+       -i device
+              Specifies the interface through which traceroute should
+              send packets.
+
+       -m max_ttl
+              Specifies the maximum number of hops (max time-to-live
+              value) traceroute will probe. The default is 30.
+
+       -N squeries
+              Specifies the number of probe packets sent out
+              simultaneously. Sending several probes concurrently can
+              speed up traceroute considerably. The default value is
+              16.
+
+       -n     Do not try to map IP addresses to host names when
+              displaying them.
+
+       -p port
+              For UDP tracing, specifies the destination port base
+              traceroute will use (default is 33434).
+
+       -t tos For IPv4, set the Type of Service (TOS) and Precedence
+              value.
+
+       -l flow_label
+              Use specified flow_label for IPv6 packets (not
+              supported).
+
+       -w MAX,HERE,NEAR
+              Determines how long to wait for a response to a probe.
+              Three values separated by comma (or a single value
+              which will be used as MAX). MAX specifies the maximum
+              time (in seconds, default 5.0) to wait. HERE specifies
+              a factor to multiply the round trip time of an already
+              received response from the same hop (default 3.0). NEAR
+              specifies a similar factor for a response from some next
+              hop (default 10.0).
+
+       -q nqueries
+              Sets the number of probe packets per hop. The default
+              is 3.
+
+       -r     Bypass the normal routing tables and send directly to a
+              host on an attached network.
+
+       -s source_addr
+              Chooses an alternative source address.
+
+       -z sendwait
+              Minimal time interval between probes (default 0). If
+              the value is more than 10, then it specifies a number
+              in milliseconds, else it is a number of seconds.
+
+       -e     Show ICMP extensions (RFC 4884).
+
+       -A     Perform AS path lookups in routing registries and print
+              results directly after the corresponding addresses (not
+              supported).
+
+       -V     Print the version and exit.
+
+       -U     Use UDP to particular port for tracerouting (instead of
+              increasing the port per each probe). Default port is
+              53 (dns).
+
+       -UL    Use UDPLITE for tracerouting (default port is 53).
+
+       -D     Use DCCP Request for probes (not supported).
+
+       -P protocol
+              Use raw packet of the specified protocol for tracerouting.
+
+       -M method
+              Use specified method for traceroute operations. Default
+              traditional udp method has name "default", icmp
+              (-I) and tcp (-T) have names "icmp" and "tcp"
+              respectively.
+
+       -O mod_options
+              Use module-specific option.
+
+       --sport=port
+              Use specified source port for outgoing packets.
+
+       --fwmark=mark
+              Set the firewall mark for outgoing packets (not
+              supported).
+
+       --mtu  Discover MTU along the path being traced.
+
+       --back Print the number of backward hops when it seems
+              different with the forward direction.
+
+       -h, --help
+              Display help and exit.
+
+EXAMPLES
+       traceroute host
+              Trace route to host with default settings.
+
+       traceroute -n 8.8.8.8
+              Trace to 8.8.8.8 without DNS resolution.
+
+       traceroute -m 15 -q 1 host
+              Max 15 hops, 1 probe per hop.
+
+       traceroute -I -f 5 host
+              Use ICMP, start from hop 5.
+
+       traceroute -w 2 host
+              Wait max 2 seconds per probe.
+
+SEE ALSO
+       ping(8), netstat(8), route(8)
+
+LikeOS                                                          TRACEROUTE(8)

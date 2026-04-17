@@ -1,0 +1,126 @@
+HOST(1)                          User Commands                         HOST(1)
+
+NAME
+       host - DNS lookup utility
+
+SYNOPSIS
+       host [-aCdilrsTwv] [-c class] [-N ndots] [-R number]
+            [-t type] [-W wait] [-m flag] [-4] [-6] {name} [server]
+
+DESCRIPTION
+       host is a simple utility for performing DNS lookups. It is
+       normally used to convert names to IP addresses and vice versa.
+       When no arguments or options are given, host prints a short
+       summary of its command line arguments and options.
+
+       name is the domain name that is to be looked up. It can also
+       be a dotted-decimal IPv4 address or a colon-delimited IPv6
+       address, in which case host will by default perform a reverse
+       lookup for that address. server is an optional argument which
+       is either the name or IP address of the name server that host
+       should query instead of the server or servers listed in
+       /etc/resolv.conf.
+
+OPTIONS
+       -a     is equivalent to setting -v and asking host to make a
+              query of type ANY.
+
+       -C     When used in conjunction with the -t soa option, queries
+              will be sent to the authoritative name servers for the
+              specified zone. The SOA records that each name server
+              has for the zone will be displayed (not supported on
+              LikeOS).
+
+       -c class
+              Make a DNS query of class class. This can be used to
+              lookup Hesiod or Chaosnet class resource records. The
+              default class is IN (Internet).
+
+       -d     Print verbose output. This is equivalent to the -v
+              option.
+
+       -i     Use the obsolete IP6.INT domain for reverse lookups of
+              IPv6 addresses, rather than the current default IP6.ARPA.
+
+       -l     List zone: The host command performs a zone transfer of
+              zone name and prints out the NS, PTR and address records
+              (A/AAAA). Not supported on LikeOS.
+
+       -N ndots
+              The number of dots that have to be in name for it to be
+              considered absolute. The default value is that defined
+              using the ndots statement in /etc/resolv.conf, or 1 if
+              no ndots statement is present.
+
+       -R number
+              The number of UDP retries for a lookup. number indicates
+              how many times host will repeat a query that does not
+              get answered. The default number of retries is 1.
+
+       -r     Make non-recursive queries. Setting this option clears
+              the RD (recursion desired) bit in the query which host
+              makes.
+
+       -s     Tell host not to send the query to the next nameserver
+              if any server responds with a SERVFAIL response.
+
+       -T     By default, host uses UDP when making queries.
+              The -T option makes it use a TCP connection when
+              querying the name server.
+
+       -t type
+              Selects the query type. type can be any recognized
+              query type: CNAME, NS, SOA, TXT, DNSKEY, AXFR, etc.
+              When no query type is specified, host automatically
+              selects an appropriate query type. By default, it looks
+              for A, AAAA, and MX records.
+
+       -v     Generate verbose output. This is equivalent to -d.
+              Verbose output shows the full response message in
+              dig-like format.
+
+       -w     Wait forever: The query timeout is set to the maximum
+              possible.
+
+       -W wait
+              Wait for wait seconds for the query to complete. If
+              wait is less than one, the wait interval is set to one
+              second. The default is 5.
+
+       -m flag
+              Set memory usage debugging: the flag can be record,
+              usage, or trace.
+
+       -4     Use IPv4 query transport only.
+
+       -6     Use IPv6 query transport only (not supported on LikeOS).
+
+EXAMPLES
+       host example.com
+              Look up the address of example.com.
+
+       host -t MX example.com
+              Look up MX records.
+
+       host -t NS example.com
+              Look up nameservers.
+
+       host -a example.com
+              Show all record types (verbose ANY).
+
+       host 8.8.8.8
+              Reverse lookup.
+
+       host -v example.com
+              Verbose output (dig-like format).
+
+       host -t SOA example.com 8.8.8.8
+              Query SOA using Google DNS.
+
+       host -W 10 example.com
+              Wait up to 10 seconds.
+
+SEE ALSO
+       dig(1), nslookup(1)
+
+LikeOS                                                               HOST(1)

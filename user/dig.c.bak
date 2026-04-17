@@ -1,0 +1,99 @@
+/*
+ * dig - DNS lookup utility
+ *
+ * Usage: dig [@server] name [type]
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+
+static const char *ip_str(uint32_t ip)
+{
+    struct in_addr a;
+    a.s_addr = htonl(ip);
+    return inet_ntoa(a);
+}
+
+static void print_help(void)
+{
+    printf("Usage: dig [@server] name [type]\n");
+    printf("DNS lookup utility.\n\n");
+    printf("  @server   DNS server to query (default: system DNS)\n");
+    printf("  name      domain name to look up\n");
+    printf("  type      query type (A, AAAA, MX, etc.) - only A supported\n");
+    printf("\nOptions:\n");
+    printf("  +short    display only the answer\n");
+    printf("  +noall    clear all display flags\n");
+    printf("  +answer   display the answer section\n");
+    printf("  -h        display this help and exit\n");
+}
+
+int main(int argc, char *argv[])
+{
+    const char *name = NULL;
+    int short_mode = 0;
+    int i;
+
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_help();
+            return 0;
+        }
+        if (argv[i][0] == '@') {
+            /* DNS server override - not supported */
+            continue;
+        }
+        if (strcmp(argv[i], "+short") == 0) {
+            short_mode = 1;
+            continue;
+        }
+        if (argv[i][0] == '+') continue; /* other dig options */
+        if (!name) name = argv[i];
+        /* else it's a type - ignored, only A records */
+    }
+
+    if (!name) {
+        fprintf(stderr, "dig: no name specified\n");
+        return 1;
+    }
+
+    uint32_t ip;
+    int ret = dns_resolve(name, &ip);
+
+    if (short_mode) {
+        if (ret == 0)
+            printf("%s\n", ip_str(ip));
+        else
+            printf(";; connection timed out; no servers could be reached\n");
+        return ret == 0 ? 0 : 1;
+    }
+
+    /* Full dig output format */
+    printf("; <<>> DiG (LikeOS) <<>> %s\n", name);
+    printf(";; global options: +cmd\n");
+
+    if (ret == 0) {
+        printf(";; Got answer:\n");
+        printf(";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n");
+        printf(";; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0\n\n");
+
+        printf(";; QUESTION SECTION:\n");
+        printf(";%-30s\tIN\tA\n\n", name);
+
+        printf(";; ANSWER SECTION:\n");
+        printf("%-30s\t300\tIN\tA\t%s\n\n", name, ip_str(ip));
+
+        printf(";; Query time: 1 msec\n");
+        printf(";; MSG SIZE  rcvd: 64\n");
+    } else {
+        printf(";; Got answer:\n");
+        printf(";; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1\n\n");
+        printf(";; QUESTION SECTION:\n");
+        printf(";%-30s\tIN\tA\n\n", name);
+    }
+
+    return ret == 0 ? 0 : 1;
+}

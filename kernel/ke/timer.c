@@ -7,10 +7,36 @@
 #include "../../include/kernel/percpu.h"
 #include "../../include/kernel/pagecache.h"
 #include "../../include/kernel/acpi.h"
+#include "../../include/kernel/memory.h"
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/random.h"
 
 static volatile uint64_t g_ticks = 0;
+/* PM Timer-based wall-clock microsecond counter.
+ * g_total_us accumulates real wall-clock microseconds by summing PM Timer
+ * deltas between consecutive BSP ticks.  Unlike ticks*1e6/freq, this is
+ * immune to virtual LAPIC timer jitter (non-uniform tick spacing on VMware).
+ * g_pm_last is the PM Timer value at the last BSP tick.
+ *
+ * The ACPI PM Timer is a chipset-based 3.579545 MHz free-running counter
+ * that returns the same value on ALL CPUs and always runs at the correct
+ * rate regardless of VM scheduling.  We read it via inl() (IRQ-safe). */
+static volatile uint64_t g_total_us = 0;     // wall-clock µs since ticks started
+static volatile uint32_t g_pm_last = 0;      // PM Timer value at last BSP tick
+static uint16_t g_pmtimer_port = 0;          // ACPI PM Timer I/O port (from FADT)
+static uint32_t g_pmtimer_mask = 0x00FFFFFF; // 24-bit default; 0xFFFFFFFF for 32-bit
+static volatile int g_pmtimer_available = 0;
+static volatile uint64_t* g_hpet_regs = NULL;
+static uint64_t g_hpet_start = 0;
+static uint32_t g_hpet_period_fs = 0;
+static volatile int g_hpet_available = 0;
+static volatile int g_tsc_precise_available = 0;
+static inline uint64_t rdtsc(void);
+static uint64_t g_tsc_cpu_base_us[MAX_CPUS] = {0};
+static uint64_t g_tsc_cpu_base_cycles[MAX_CPUS] = {0};
+static volatile uint8_t g_tsc_cpu_ready[MAX_CPUS] = {0};
+/* Seqlock to ensure g_total_us and g_pm_last are read consistently. */
+static volatile uint32_t g_tick_seq = 0;
 static uint32_t g_frequency = 100; // Default 100 Hz
 static uint64_t g_boot_epoch = 0;  // Unix epoch seconds at boot (from UEFI or CMOS RTC)
 
@@ -76,6 +102,117 @@ static int g_cmos_failed = 0;
  */
 static inline void io_delay(void) {
     outb(0x80, 0);
+}
+
+/* Read 32-bit I/O port (for ACPI PM Timer) */
+static inline uint32_t inl(uint16_t port) {
+    uint32_t ret;
+    __asm__ volatile ("inl %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+/* Direct PM Timer read via I/O port — safe from IRQ context.
+ * Mask to 24 or 32 bits depending on FADT flags. */
+static inline uint32_t pmtimer_read(void) {
+    return inl(g_pmtimer_port) & g_pmtimer_mask;
+}
+
+/* ACPI HPET table (minimal subset used by the timer driver). */
+typedef struct __attribute__((packed)) {
+    acpi_sdt_header_t header;
+    uint32_t event_timer_block_id;
+    uint8_t  base_addr_space_id;
+    uint8_t  base_reg_bit_width;
+    uint8_t  base_reg_bit_offset;
+    uint8_t  base_access_size;
+    uint64_t base_address;
+    uint8_t  hpet_number;
+    uint16_t min_tick;
+    uint8_t  page_protection;
+} acpi_hpet_t;
+
+#define HPET_GEN_CAP_ID_OFFSET      0x000
+#define HPET_GEN_CONFIG_OFFSET      0x010
+#define HPET_MAIN_COUNTER_OFFSET    0x0F0
+#define HPET_GEN_CONFIG_ENABLE      (1ULL << 0)
+
+static inline uint64_t hpet_read_reg(uint32_t offset) {
+    return g_hpet_regs[offset / 8];
+}
+
+static inline void hpet_write_reg(uint32_t offset, uint64_t value) {
+    g_hpet_regs[offset / 8] = value;
+}
+
+static inline uint64_t hpet_read_counter(void) {
+    return hpet_read_reg(HPET_MAIN_COUNTER_OFFSET);
+}
+
+static uint64_t tsc_cycles_to_us(uint64_t cycles) {
+    uint64_t tsc_hz = lapic_get_tsc_freq();
+    if (tsc_hz == 0) {
+        return 0;
+    }
+
+    uint64_t whole = cycles / tsc_hz;
+    uint64_t rem = cycles % tsc_hz;
+    return whole * 1000000ULL + (rem * 1000000ULL) / tsc_hz;
+}
+
+static uint64_t timer_get_fallback_precise_us(void) {
+    if (g_hpet_available) {
+        uint64_t counter = hpet_read_counter() - g_hpet_start;
+        uint64_t whole = counter / 1000000ULL;
+        uint64_t rem = counter % 1000000ULL;
+        return (whole * (uint64_t)g_hpet_period_fs) / 1000ULL
+             + (rem * (uint64_t)g_hpet_period_fs) / 1000000000ULL;
+    }
+
+    if (g_pmtimer_available) {
+        uint64_t total_us_base;
+        uint32_t pm_base;
+        uint32_t seq;
+        do {
+            seq = g_tick_seq;
+            __asm__ volatile("" ::: "memory");
+            total_us_base = g_total_us;
+            pm_base = g_pm_last;
+            __asm__ volatile("" ::: "memory");
+        } while (seq != g_tick_seq || (seq & 1));
+
+        uint32_t pm_now = pmtimer_read();
+        uint32_t delta = (pm_now - pm_base) & g_pmtimer_mask;
+        uint64_t sub_us = (uint64_t)delta * 1000000ULL / 3579545ULL;
+        if (sub_us > 1000000ULL)
+            sub_us = 1000000ULL;
+
+        return total_us_base + sub_us;
+    }
+
+    return g_ticks * 1000000ULL / g_frequency;
+}
+
+static void timer_enable_reliable_tsc_precise_time(void) {
+    if (!lapic_tsc_is_reliable() || lapic_get_tsc_freq() == 0 || g_tsc_precise_available) {
+        return;
+    }
+
+    g_tsc_precise_available = 1;
+
+    kprintf("Timer: using reliable TSC for precise timekeeping\n");
+}
+
+/* Public raw PM Timer read — returns masked counter value (0 if unavailable). */
+uint32_t timer_pmtimer_read_raw(void) {
+    if (!g_pmtimer_available) return 0;
+    return pmtimer_read();
+}
+
+/* Compute microseconds between two raw PM Timer snapshots.
+ * Handles 24/32-bit wraparound correctly. */
+uint64_t timer_pmtimer_delta_us(uint32_t t0, uint32_t t1) {
+    uint32_t delta = (t1 - t0) & g_pmtimer_mask;
+    return (uint64_t)delta * 1000000ULL / 3579545ULL;
 }
 
 /*
@@ -300,6 +437,8 @@ try_uefi_fallback:
 }
 
 uint64_t timer_get_epoch(void) {
+    if (g_pmtimer_available)
+        return g_boot_epoch + timer_get_precise_us() / 1000000ULL;
     return g_boot_epoch + g_ticks / g_frequency;
 }
 
@@ -308,11 +447,127 @@ uint32_t timer_get_frequency(void) {
 }
 
 uint64_t timer_get_uptime(void) {
+    if (g_pmtimer_available)
+        return timer_get_precise_us() / 1000000ULL;
     return g_ticks / g_frequency;
 }
 
 uint64_t timer_get_boot_epoch(void) {
     return g_boot_epoch;
+}
+
+uint64_t timer_get_tsc_at_tick(void) {
+    /* No longer used for timekeeping (PM Timer replaced TSC interpolation)
+     * but kept for ABI compatibility. Returns 0. */
+    return 0;
+}
+
+uint64_t timer_get_ticks_at_cpu_tick(void) {
+    return g_ticks;
+}
+
+/* Return total microseconds since boot, using PM Timer delta accumulation.
+ * BSP tick handler sums PM Timer deltas into g_total_us (real wall-clock µs).
+ * Sub-tick interpolation adds the PM Timer delta since the last BSP tick.
+ * Uses a seqlock so the (g_total_us, g_pm_last) pair is read consistently. */
+uint64_t timer_get_precise_us(void) {
+    if (g_tsc_precise_available) {
+        uint64_t cycles;
+        uint32_t cpu_id;
+
+        percpu_preempt_disable();
+        cpu_id = this_cpu_id();
+
+        if (cpu_id < MAX_CPUS && !g_tsc_cpu_ready[cpu_id]) {
+            uint64_t t0 = rdtsc();
+            uint64_t base_us = timer_get_fallback_precise_us();
+            uint64_t t1 = rdtsc();
+            g_tsc_cpu_base_cycles[cpu_id] = t0 + ((t1 - t0) / 2);
+            g_tsc_cpu_base_us[cpu_id] = base_us;
+            __atomic_store_n(&g_tsc_cpu_ready[cpu_id], 1, __ATOMIC_RELEASE);
+        }
+
+        cycles = rdtsc();
+        if (cpu_id < MAX_CPUS && __atomic_load_n(&g_tsc_cpu_ready[cpu_id], __ATOMIC_ACQUIRE)) {
+            uint64_t delta = cycles - g_tsc_cpu_base_cycles[cpu_id];
+            uint64_t value = g_tsc_cpu_base_us[cpu_id] + tsc_cycles_to_us(delta);
+            percpu_preempt_enable();
+            return value;
+        }
+
+        percpu_preempt_enable();
+    }
+
+    return timer_get_fallback_precise_us();
+}
+
+void timer_init_hpet(void) {
+    acpi_hpet_t* hpet = (acpi_hpet_t*)acpi_find_table(ACPI_SIG_HPET);
+    if (!hpet) {
+        return;
+    }
+
+    if (hpet->base_addr_space_id != 0 || hpet->base_address == 0) {
+        return;
+    }
+
+    uint64_t virt = mm_map_device_mmio(hpet->base_address, 1);
+    if (!virt) {
+        return;
+    }
+
+    g_hpet_regs = (volatile uint64_t*)virt;
+
+    uint64_t cap = hpet_read_reg(HPET_GEN_CAP_ID_OFFSET);
+    g_hpet_period_fs = (uint32_t)(cap >> 32);
+    if (g_hpet_period_fs == 0) {
+        g_hpet_regs = NULL;
+        return;
+    }
+
+    uint64_t cfg = hpet_read_reg(HPET_GEN_CONFIG_OFFSET);
+    hpet_write_reg(HPET_GEN_CONFIG_OFFSET, cfg | HPET_GEN_CONFIG_ENABLE);
+    g_hpet_start = hpet_read_counter();
+    g_hpet_available = 1;
+
+    kprintf("Timer: HPET at 0x%lx (period %u fs, precise timing enabled)\n",
+            (unsigned long)hpet->base_address, g_hpet_period_fs);
+}
+
+/* Probe ACPI PM Timer and enable sub-tick interpolation if available.
+ * Must be called after ACPICA initialization.
+ * Reads the PM Timer I/O port from the FADT so we can use inl() directly
+ * instead of going through ACPICA (which is not safe from IRQ context). */
+void timer_init_pmtimer(void) {
+    /* Read PM Timer port from custom FADT struct */
+    acpi_fadt_t *fadt = (acpi_fadt_t *)acpi_find_table(ACPI_SIG_FADT);
+    if (!fadt || fadt->pm_timer_length == 0) {
+        return;  /* No PM Timer in FADT */
+    }
+    uint16_t port = (uint16_t)fadt->pm_timer_block;
+    if (port == 0) {
+        return;  /* No valid port */
+    }
+    /* Determine PM Timer width from FADT flags (bit 8 = TMR_VAL_EXT) */
+    if (fadt->flags & (1 << 8)) {
+        g_pmtimer_mask = 0xFFFFFFFFU;  /* 32-bit PM Timer */
+    } else {
+        g_pmtimer_mask = 0x00FFFFFFU;  /* 24-bit PM Timer */
+    }
+    /* Test-read the port */
+    g_pmtimer_port = port;
+    uint32_t val1 = pmtimer_read();
+    /* A second read should return a different value (3.58 MHz counter) */
+    for (volatile int i = 0; i < 100; i++) {} /* tiny delay */
+    uint32_t val2 = pmtimer_read();
+    if (val1 == val2 && val1 == 0) {
+        g_pmtimer_port = 0;
+        return;  /* PM Timer not responding */
+    }
+    g_pmtimer_available = 1;
+    g_pm_last = pmtimer_read();
+    kprintf("Timer: ACPI PM Timer at port 0x%x (%d-bit, sub-tick enabled)\n",
+            port, (g_pmtimer_mask == 0xFFFFFFFFU) ? 32 : 24);
 }
 
 /*
@@ -485,6 +740,7 @@ static int timer_calibrate_tsc(void) {
     if (measured >= 10 && measured <= 10000) {
         g_frequency = (uint32_t)measured;
         kprintf("Timer: TSC-calibrated frequency = %u Hz\n", g_frequency);
+        timer_enable_reliable_tsc_precise_time();
         return 1;
     }
 
@@ -510,6 +766,7 @@ void timer_calibrate_frequency(void) {
         if (!timer_calibrate_tsc())
             kprintf("Timer: No calibration source available, keeping %u Hz\n",
                     g_frequency);
+        timer_enable_reliable_tsc_precise_time();
         return;
     }
 
@@ -522,6 +779,7 @@ void timer_calibrate_frequency(void) {
         if (!timer_calibrate_tsc())
             kprintf("Timer: No calibration source available, keeping %u Hz\n",
                     g_frequency);
+        timer_enable_reliable_tsc_precise_time();
         return;
     }
 
@@ -534,6 +792,7 @@ void timer_calibrate_frequency(void) {
     if (g_ticks - start_tick >= 200) {
         kprintf("Timer: CMOS UIP timeout, trying TSC calibration\n");
         timer_calibrate_tsc();
+        timer_enable_reliable_tsc_precise_time();
         return;
     }
     
@@ -551,10 +810,12 @@ void timer_calibrate_frequency(void) {
             kprintf("Timer: calibration timeout waiting for first RTC second boundary\n");
             kprintf("Timer: Falling back to TSC calibration\n");
             timer_calibrate_tsc();
+            timer_enable_reliable_tsc_precise_time();
             return;
         }
     }
     uint64_t t0 = g_ticks;
+    uint64_t tsc0 = rdtsc();  /* TSC at first RTC second boundary */
 
     /* Wait for the second to change again (second boundary = exactly 1s later) */
     uint8_t boundary_sec;
@@ -572,10 +833,12 @@ void timer_calibrate_frequency(void) {
             kprintf("Timer: calibration timeout waiting for second RTC second boundary\n");
             kprintf("Timer: Falling back to TSC calibration\n");
             timer_calibrate_tsc();
+            timer_enable_reliable_tsc_precise_time();
             return;
         }
     }
     uint64_t t1 = g_ticks;
+    uint64_t tsc1 = rdtsc();  /* TSC at second RTC second boundary */
 
     uint64_t measured = t1 - t0;
     if (measured >= 10 && measured <= 10000) {
@@ -586,7 +849,20 @@ void timer_calibrate_frequency(void) {
         kprintf("Timer: CMOS calibration out of range (%lu ticks/sec), trying TSC\n",
                 (unsigned long)measured);
         timer_calibrate_tsc();
+        timer_enable_reliable_tsc_precise_time();
+        return;
     }
+
+    /* Calibrate TSC frequency from the same 1-second RTC window.
+     * This is more reliable than CPUID 0x15 or PIT channel 2 in VMs. */
+    uint64_t tsc_delta = tsc1 - tsc0;
+    if (!lapic_tsc_is_reliable() && tsc_delta > 1000000 && tsc_delta < 100000000000ULL) {
+        lapic_set_tsc_freq(tsc_delta);
+        kprintf("Timer: RTC-calibrated TSC freq = %lu Hz\n",
+                (unsigned long)tsc_delta);
+    }
+
+    timer_enable_reliable_tsc_precise_time();
 }
 
 void timer_init(uint32_t frequency_hz) {
@@ -636,7 +912,24 @@ void timer_irq_handler(void) {
     }
     
     if (is_bsp) {
+        /* Seqlock write: odd = updating, even = stable */
+        g_tick_seq++;
+        __asm__ volatile("" ::: "memory");
+
         g_ticks++;
+
+        /* Accumulate real wall-clock microseconds from PM Timer deltas.
+         * Each delta represents actual elapsed time since last BSP tick,
+         * immune to virtual LAPIC timer jitter on VMware. */
+        if (g_pmtimer_available) {
+            uint32_t pm_now = pmtimer_read();
+            uint32_t delta = (pm_now - g_pm_last) & g_pmtimer_mask;
+            g_total_us += (uint64_t)delta * 1000000ULL / 3579545ULL;
+            g_pm_last = pm_now;
+        }
+
+        __asm__ volatile("" ::: "memory");
+        g_tick_seq++;
 
         // Feed entropy from timer jitter
         entropy_add_timer_jitter();
@@ -653,7 +946,7 @@ void timer_irq_handler(void) {
         // Page cache: signal periodic dirty writeback
         pagecache_timer_tick(g_ticks);
     }
-    
+
     // Per-CPU: manage this CPU's current task time slice
     task_t* cur = sched_current();
     if (cur) {

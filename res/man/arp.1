@@ -1,0 +1,118 @@
+ARP(8)                         System Manager's Manual                     ARP(8)
+
+NAME
+       arp - manipulate the system ARP cache
+
+SYNOPSIS
+       arp [-vn] [-H type] [-i if] -a [hostname]
+       arp [-v] [-i if] -d hostname [pub]
+       arp [-v] [-H type] [-i if] -s hostname hw_addr [temp] [nopub|pub|trail]
+       arp [-vnD] [-H type] [-i if] -f [filename]
+
+DESCRIPTION
+       Arp manipulates or displays the kernel's IPv4 network neighbour
+       cache. It can add entries to the table, delete one, or display
+       the current content.
+
+       ARP stands for Address Resolution Protocol, which is used to
+       find the media access control address of a network neighbour
+       for a given IPv4 Address.
+
+OPTIONS
+       -a [hostname], --all [hostname]
+              Display entries of the specified hosts or all hosts if
+              no hostname is given. Output uses BSD format.
+
+       -e     Display entries in default (Linux) style with fixed
+              columns.
+
+       -d hostname, --delete hostname
+              Remove an ARP cache entry for the given hostname.
+
+       -D, --use-device
+              Instead of a hw_addr, the given argument is the name
+              of an interface. arp will use the MAC of that interface
+              for the table entry. This is best used in combination
+              with -s to set up a proxy ARP entry.
+
+       -H type, -t type
+              When setting or reading the ARP cache, this selects
+              which class of entries it should look for. The default
+              value is "ether" (IEEE 802.3 10Mbps Ethernet).
+
+       -i If, --device If
+              Select an interface. When dumping the ARP cache only
+              entries matching the specified interface will be printed.
+
+       -s hostname hw_addr, --set hostname
+              Manually create an ARP address mapping entry for host
+              hostname with hardware address set to hw_addr. The
+              format of the hardware address is dependent on the
+              hardware class, but for Ethernet it is 6 hex bytes
+              separated by colons.
+
+              The following modifiers may optionally follow hw_addr:
+
+              temp   The entry will not be permanently stored.
+
+              pub    The entry will be published (proxy ARP).
+
+              nopub  The entry will not be published.
+
+              trail  Trailer encapsulation (historical, not used).
+
+       -f [filename], --file [filename]
+              Similar to -s, but this time the address info is taken
+              from the file. The name of the data file is very often
+              /etc/ethers, but this is not official. If no filename
+              is specified /etc/ethers is used as default.
+
+              The file format is simple; it only contains ASCII text
+              lines with a hostname and a hardware address separated
+              by whitespace, optionally followed by "temp" or "pub".
+
+       -n, --numeric
+              Shows numerical addresses instead of trying to determine
+              symbolic host names.
+
+       -v, --verbose
+              Tell the user what is going on by being verbose.
+
+       -V, --version
+              Display version information.
+
+       -h, --help
+              Display a help message and exit.
+
+EXAMPLES
+       arp
+              Display the ARP cache in default format.
+
+       arp -a
+              Display the ARP cache in BSD format.
+
+       arp -n
+              Display the ARP cache with numerical addresses.
+
+       arp -d 192.168.1.1
+              Delete the entry for 192.168.1.1.
+
+       arp -s 192.168.1.1 00:11:22:33:44:55
+              Create a permanent ARP entry.
+
+       arp -s 192.168.1.1 00:11:22:33:44:55 temp
+              Create a temporary ARP entry.
+
+       arp -D -s 192.168.1.1 eth0 pub
+              Create a proxy ARP entry using eth0's MAC.
+
+       arp -i eth0
+              Display ARP entries for eth0 only.
+
+       arp -f /etc/ethers
+              Read entries from /etc/ethers.
+
+SEE ALSO
+       route(8), ifconfig(8), netstat(8), arping(8)
+
+LikeOS                                                                ARP(8)
