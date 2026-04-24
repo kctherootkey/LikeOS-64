@@ -57,6 +57,8 @@
 #define E1000_CTRL_FD       (1 << 0)    // Full Duplex
 #define E1000_CTRL_ASDE     (1 << 5)    // Auto-Speed Detection Enable
 #define E1000_CTRL_SLU      (1 << 6)    // Set Link Up
+#define E1000_CTRL_FRCSPD   (1 << 11)   // Force Speed
+#define E1000_CTRL_FRCDPX   (1 << 12)   // Force Duplex
 #define E1000_CTRL_RST      (1 << 26)   // Device Reset
 #define E1000_CTRL_VME      (1 << 30)   // VLAN Mode Enable
 #define E1000_CTRL_PHY_RST  (1 << 31)   // PHY Reset
