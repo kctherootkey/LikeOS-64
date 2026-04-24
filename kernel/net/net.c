@@ -1,6 +1,11 @@
 // LikeOS-64 Network Subsystem - Device Registry and Initialization
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/e1000.h"
+#include "../../include/kernel/e1000e.h"
+#include "../../include/kernel/rtl8139.h"
+#include "../../include/kernel/pcnet32.h"
+#include "../../include/kernel/ne2k.h"
+#include "../../include/kernel/vmxnet3.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/memory.h"
@@ -148,6 +153,11 @@ void net_init(void) {
 
     // Probe for NIC hardware
     e1000_init();
+    e1000e_init();
+    rtl8139_init();
+    pcnet32_init();
+    ne2k_init();
+    vmxnet3_init();
 
     // If we have a NIC, initialize DHCP state (discover sent later after sti)
     net_device_t* dev = net_get_default_device();

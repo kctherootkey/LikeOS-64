@@ -104,12 +104,7 @@ static inline void io_delay(void) {
     outb(0x80, 0);
 }
 
-/* Read 32-bit I/O port (for ACPI PM Timer) */
-static inline uint32_t inl(uint16_t port) {
-    uint32_t ret;
-    __asm__ volatile ("inl %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
+/* inl() is provided by <kernel/interrupt.h>. */
 
 /* Direct PM Timer read via I/O port — safe from IRQ context.
  * Mask to 24 or 32 bits depending on FADT flags. */
