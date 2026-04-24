@@ -593,15 +593,12 @@ void mouse_init(void)
     // Detect mouse type and capabilities (may leave extra bytes in buffer depending on emulation)
     mouse_state.mouse_type = mouse_detect_type();
 
-    // Apply defaults and stream mode explicitly to satisfy some VMs (e.g., VirtualBox)
-    mouse_write_command(MOUSE_CMD_SET_DEFAULTS, 0xFF); // expect ACK
-    uint8_t resp = mouse_read_data();
-    if(resp != MOUSE_ACK) {
-        kprintf("Mouse: SET_DEFAULTS unexpected resp=0x%02X (continuing)\n", resp);
-    }
+    // Re-apply the IntelliMouse detection sequence after SET_DEFAULTS
+    // would reset the mouse to 3-byte mode.  Instead, just set stream
+    // mode (0xEA) which preserves the IntelliMouse 4-byte mode.
     mouse_flush_output();
     mouse_write_command(MOUSE_CMD_SET_STREAM_MODE, 0xFF); // expect ACK
-    resp = mouse_read_data();
+    uint8_t resp = mouse_read_data();
     if(resp != MOUSE_ACK) {
         kprintf("Mouse: SET_STREAM_MODE unexpected resp=0x%02X (continuing)\n", resp);
     }

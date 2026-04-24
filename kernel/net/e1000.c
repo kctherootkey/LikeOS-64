@@ -10,6 +10,7 @@
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/ioapic.h"
 #include "../../include/kernel/acpi.h"
+#include "../../include/kernel/timer.h"
 
 // Global e1000 device (single NIC support)
 static e1000_dev_t g_e1000;
@@ -73,26 +74,44 @@ static void e1000_read_mac(e1000_dev_t* dev) {
 }
 
 // ============================================================================
+// PM Timer-based microsecond delay (available early — timer_init_pmtimer()
+// runs before net_init()).  Falls back to a pause loop if PM Timer is absent.
+// ============================================================================
+static void e1000_delay_us(uint32_t us) {
+    uint32_t t0 = timer_pmtimer_read_raw();
+    if (t0 == 0) {
+        // PM Timer unavailable — rough fallback
+        for (volatile uint32_t i = 0; i < us * 4; i++)
+            __asm__ volatile("pause");
+        return;
+    }
+    while (timer_pmtimer_delta_us(t0, timer_pmtimer_read_raw()) < us)
+        __asm__ volatile("pause");
+}
+
+// ============================================================================
 // Device Reset
 // ============================================================================
 static void e1000_reset(e1000_dev_t* dev) {
     // Disable interrupts
     e1000_write(dev, E1000_IMC, 0xFFFFFFFF);
 
-    // Reset device
-    uint32_t ctrl = e1000_read(dev, E1000_CTRL);
-    ctrl |= E1000_CTRL_RST;
-    e1000_write(dev, E1000_CTRL, ctrl);
-
-    // Wait for reset to complete
-    for (volatile int i = 0; i < 100000; i++) {
-        __asm__ volatile("pause");
-    }
-
-    // Disable interrupts again after reset
-    e1000_write(dev, E1000_IMC, 0xFFFFFFFF);
-
     // Read and clear pending interrupts
+    (void)e1000_read(dev, E1000_ICR);
+
+    // Soft reset: disable RX and TX without a full CTRL.RST.
+    // CTRL.RST causes VirtualBox's E1000 emulation to break the RX
+    // path — TX works but no packets are ever received.  The UEFI
+    // firmware already performed the hardware reset and PHY
+    // negotiation, so a soft init is sufficient.
+    e1000_write(dev, E1000_RCTL, 0);  // Disable receiver
+    e1000_write(dev, E1000_TCTL, 0);  // Disable transmitter
+
+    // Wait for in-flight DMA to drain (10 ms via PM Timer)
+    e1000_delay_us(10000);
+
+    // Disable interrupts again (in case RX/TX raised something)
+    e1000_write(dev, E1000_IMC, 0xFFFFFFFF);
     (void)e1000_read(dev, E1000_ICR);
 }
 
@@ -410,9 +429,10 @@ void e1000_init(void) {
                 dev->mac_addr[0], dev->mac_addr[1], dev->mac_addr[2],
                 dev->mac_addr[3], dev->mac_addr[4], dev->mac_addr[5]);
 
-        // Set link up
+        // Set link up — only add SLU; preserve UEFI speed/duplex settings
+        // to avoid triggering a PHY re-negotiation that drops the link.
         uint32_t ctrl = e1000_read(dev, E1000_CTRL);
-        ctrl |= E1000_CTRL_SLU | E1000_CTRL_ASDE;
+        ctrl |= E1000_CTRL_SLU;
         ctrl &= ~E1000_CTRL_PHY_RST;
         e1000_write(dev, E1000_CTRL, ctrl);
 
@@ -441,46 +461,85 @@ void e1000_init(void) {
         int msi_ret = pci_enable_msi(dev->pci_dev, dev->msi_vector);
         if (msi_ret < 0) {
             dev->msi_vector = 0;
-            uint8_t irq = dev->pci_dev->interrupt_line;
 
-            // If PCI interrupt_line is invalid (0xFF or beyond IOAPIC range),
-            // use ACPI _PRT to discover the real GSI
-            if (irq == 0xFF || irq > 23) {
-                uint32_t gsi = 0;
-                uint8_t pin = dev->pci_dev->interrupt_pin;
-                if (pin >= 1 && pin <= 4) pin--;  // PCI pin 1-4 -> ACPI pin 0-3
+            // ALWAYS resolve the IOAPIC GSI from ACPI _PRT first when the
+            // IOAPIC is in use.  PCI config-space `interrupt_line` reflects
+            // the legacy 8259 PIC IRQ assigned by the BIOS — it is NOT the
+            // IOAPIC GSI in APIC mode.  On QEMU/VMware the e1000 happens
+            // to land on GSI 11 so the legacy line value matches by
+            // coincidence; on VirtualBox with the ICH9 chipset INTA of
+            // device 3 is routed via PIRQ to a GSI in the 16-23 range,
+            // and trusting `interrupt_line` would program the wrong
+            // IOAPIC redirection entry — exactly the symptom we observed
+            // (TX works, no RX interrupt ever delivered).
+            uint8_t irq = 0xFF;
+            uint32_t gsi = 0;
+            uint8_t pin = dev->pci_dev->interrupt_pin;
+            if (pin >= 1 && pin <= 4) {
+                uint8_t acpi_pin = pin - 1;  // PCI pin 1-4 -> ACPI pin 0-3
 
                 // For devices behind PCI-to-PCI bridges, we must:
                 // 1. Find the bridge on bus 0 that owns this secondary bus
                 // 2. Apply PCI interrupt pin swizzling
                 // 3. Look up the bridge device (not the NIC) in the root _PRT
                 uint8_t lookup_dev = dev->pci_dev->device;
-                uint8_t lookup_pin = pin;
+                uint8_t lookup_pin = acpi_pin;
 
                 if (dev->pci_dev->bus != 0) {
                     const pci_device_t *bridge = pci_find_bridge_for_bus(dev->pci_dev->bus);
                     if (bridge) {
-                        // PCI spec pin swizzle: pin = (pin + device_number) % 4
-                        lookup_pin = (pin + dev->pci_dev->device) % 4;
+                        lookup_pin = (acpi_pin + dev->pci_dev->device) % 4;
                         lookup_dev = bridge->device;
-
                     }
                 }
 
                 if (acpi_pci_lookup_irq("\\\\_SB_.PCI0",
                                         lookup_dev, lookup_pin,
-                                        &gsi) == 0 && gsi >= 1 && gsi <= 23) {
+                                        &gsi) == 0 && gsi <= 23) {
                     irq = (uint8_t)gsi;
-                    kprintf("E1000: ACPI _PRT resolved IRQ -> GSI %u\n", gsi);
+                    kprintf("E1000: ACPI _PRT resolved INT%c -> GSI %u\n",
+                            'A' + acpi_pin, gsi);
+                }
+            }
+
+            // Fallback: trust PCI config-space interrupt_line (only valid
+            // on systems where the BIOS happens to program the same value
+            // the IOAPIC uses, e.g. QEMU/VMware/most legacy setups).
+            if (irq == 0xFF) {
+                irq = dev->pci_dev->interrupt_line;
+                if (irq != 0xFF && irq <= 23) {
+                    kprintf("E1000: ACPI _PRT lookup failed, falling back to "
+                            "PCI interrupt_line = %d\n", irq);
                 } else {
-                    kprintf("E1000: WARNING: no valid IRQ (line=%d, ACPI lookup failed)\n",
+                    kprintf("E1000: WARNING: no valid IRQ (line=%d, _PRT failed)\n",
                             dev->pci_dev->interrupt_line);
-                    kprintf("E1000: Interrupts may not work (polling not supported)\n");
+                    kprintf("E1000: Interrupts will not work\n");
                 }
             }
 
             kprintf("E1000: Using legacy IRQ %d\n", irq);
             g_e1000_legacy_irq = irq;
+
+            // VirtualBox's UEFI firmware leaves PCI Command bit 10 (INTx
+            // Disable) SET on the emulated 82540EM, which prevents the
+            // device from ever asserting its interrupt pin.  TX still
+            // works (it doesn't need the IRQ) but no RX/LSC/etc. interrupt
+            // is ever delivered to the IOAPIC.  Explicitly clear bit 10
+            // for the legacy IRQ path so the wire actually toggles.
+            // (QEMU and VMware leave the bit clear, so this is a no-op
+            // there.)
+            {
+                uint32_t cmd = pci_cfg_read32(dev->pci_dev->bus,
+                                              dev->pci_dev->device,
+                                              dev->pci_dev->function, 0x04);
+                if (cmd & PCI_CMD_INTX_DISABLE) {
+                    cmd &= ~PCI_CMD_INTX_DISABLE;
+                    pci_cfg_write32(dev->pci_dev->bus,
+                                    dev->pci_dev->device,
+                                    dev->pci_dev->function, 0x04, cmd);
+                    kprintf("E1000: cleared PCI Command INTx Disable bit\n");
+                }
+            }
 
             if (irq <= 23) {
                 uint8_t vector = 32 + irq;
@@ -490,13 +549,42 @@ void e1000_init(void) {
             kprintf("E1000: MSI enabled (vector %d)\n", dev->msi_vector);
         }
 
+        // Mark the driver as initialised BEFORE enabling device interrupts.
+        // The IRQ dispatcher (kernel/ke/interrupt.c) only routes the legacy
+        // IRQ to e1000_irq_handler() when g_e1000_initialized != 0; if the
+        // device fires an interrupt (LSC, etc.) before this flag is set the
+        // dispatcher falls through to other handlers (e.g. the I2C LPSS
+        // range covers vectors 50-53, which is exactly where GSI 19 lands
+        // on VirtualBox ICH9), causing them to access non-existent
+        // hardware and lock up the system in a level-triggered IRQ storm.
+        // We populate the minimum state e1000_irq_handler() touches.
+        dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("e1000");
+        dev->net_dev.rx_packets = 0;
+        dev->net_dev.tx_packets = 0;
+        dev->net_dev.rx_bytes = 0;
+        dev->net_dev.tx_bytes = 0;
+        dev->net_dev.rx_errors = 0;
+        dev->net_dev.tx_errors = 0;
+        dev->net_dev.rx_dropped = 0;
+        g_e1000_initialized = 1;
+
         // Enable interrupts: RXT0, TXDW, LSC
         e1000_write(dev, E1000_IMS,
                     E1000_ICR_RXT0 | E1000_ICR_TXDW | E1000_ICR_LSC |
                     E1000_ICR_RXDMT0 | E1000_ICR_RXO);
 
-        // Check link status
+        // Check link status.  After a CTRL.RST, VirtualBox's E1000
+        // emulation can take several seconds to bring the link back up.
+        // Use PM Timer for accurate timing (up to 5 seconds).
         uint32_t status = e1000_read(dev, E1000_STATUS);
+        if (!(status & E1000_STATUS_LU)) {
+            uint32_t t0 = timer_pmtimer_read_raw();
+            while (timer_pmtimer_delta_us(t0, timer_pmtimer_read_raw()) < 5000000) {
+                e1000_delay_us(50000);  // check every 50 ms
+                status = e1000_read(dev, E1000_STATUS);
+                if (status & E1000_STATUS_LU) break;
+            }
+        }
         dev->link_up = (status & E1000_STATUS_LU) ? 1 : 0;
         kprintf("E1000: Link %s\n", dev->link_up ? "UP" : "DOWN");
 
@@ -512,16 +600,9 @@ void e1000_init(void) {
         dev->net_dev.send = e1000_send;
         dev->net_dev.link_status = e1000_link_status;
         dev->net_dev.driver_data = dev;
-        dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("e1000");
-        dev->net_dev.rx_packets = 0;
-        dev->net_dev.tx_packets = 0;
-        dev->net_dev.rx_bytes = 0;
-        dev->net_dev.tx_bytes = 0;
-        dev->net_dev.rx_errors = 0;
-        dev->net_dev.tx_errors = 0;
-        dev->net_dev.rx_dropped = 0;
-
-        g_e1000_initialized = 1;
+        // Note: lock and statistics counters are initialised earlier (before
+        // we enable device interrupts) so the IRQ handler always sees a
+        // valid net_device_t.
 
         // Register with network subsystem
         net_register(&dev->net_dev);
