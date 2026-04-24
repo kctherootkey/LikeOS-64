@@ -17,6 +17,30 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
+static inline void outw(uint16_t port, uint16_t val) {
+    __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint16_t inw(uint16_t port) {
+    uint16_t ret;
+    __asm__ volatile ("inw %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+static inline void outl(uint16_t port, uint32_t val) {
+    __asm__ volatile ("outl %0, %1" : : "a"(val), "Nd"(port));
+}
+
+static inline uint32_t inl(uint16_t port) {
+    uint32_t ret;
+    __asm__ volatile ("inl %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+static inline void io_wait(void) {
+    outb(0x80, 0);
+}
+
 // IDT entry structure for 64-bit long mode
 struct idt_entry {
     uint16_t offset_low;    // Lower 16 bits of handler address
@@ -168,11 +192,15 @@ extern void irq47(void);
 extern void irq16(void);  // MSI: xHCI USB controller 0 (vector 48)
 extern void irq17(void);  // MSI: xHCI USB controller 1 (vector 49)
 extern void irq27(void);  // MSI: E1000 NIC (vector 59)
+extern void irq28(void);  // MSI: e1000e NIC (vector 60)
+extern void irq29(void);  // MSI: vmxnet3 NIC (vector 61)
 
 // MSI vector assignment
 #define XHCI_MSI_VECTOR    48   // IDT vector for xHCI USB controller 0
 #define XHCI_MSI_VECTOR_2  49   // IDT vector for xHCI USB controller 1
 #define E1000_MSI_VECTOR   59   // IDT vector for E1000 NIC
+#define E1000E_MSI_VECTOR  60   // IDT vector for e1000e (82574L/82583V) NIC
+#define VMXNET3_MSI_VECTOR 61   // IDT vector for vmxnet3 paravirt NIC
 
 // IPI stubs (SMP inter-processor interrupts)
 extern void ipi_vector_0xFC(void);  // TLB shootdown

@@ -1,5 +1,9 @@
 // LikeOS-64 Intel E1000 NIC Driver
-// Supports: 82540EM (QEMU), 82545EM (VMware), 82574L (VirtualBox)
+// Supports the e1000-class parts:
+//   - 82540EM  (QEMU `-device e1000`, VBox "Intel PRO/1000 MT Desktop")
+//   - 82543GC  (QEMU `-device e1000-82543gc`, VBox "Intel PRO/1000 T Server")
+//   - 82544GC  (QEMU `-device e1000-82544gc`)
+//   - 82545EM  (VMware, VBox "Intel PRO/1000 MT Server")
 
 #ifndef _KERNEL_E1000_H_
 #define _KERNEL_E1000_H_
@@ -13,9 +17,12 @@
 // PCI Device IDs
 // ============================================================================
 #define E1000_VENDOR_ID         0x8086
-#define E1000_DEV_82540EM       0x100E  // QEMU default
-#define E1000_DEV_82545EM       0x100F  // VMware
-#define E1000_DEV_82574L        0x10D3  // VirtualBox
+#define E1000_DEV_82540EM       0x100E  // QEMU `-device e1000`, VBox MT Desktop
+#define E1000_DEV_82543GC       0x1004  // QEMU `-device e1000-82543gc`, VBox T Server
+#define E1000_DEV_82544GC       0x100C  // QEMU `-device e1000-82544gc`
+#define E1000_DEV_82545EM       0x100F  // VMware, VBox MT Server
+// Note: 82574L (PCI 0x10D3) is NOT handled here — it is an e1000e-class
+// part (QEMU `-device e1000e`) and lives in the separate e1000e driver.
 #define E1000_DEV_I217_LM       0x153A  // Optional
 
 // ============================================================================
@@ -125,7 +132,8 @@
 #define E1000_TIPG_IPGR2    (10 << 20)
 
 // ============================================================================
-// Legacy RX Descriptor (used by 82540EM, 82545EM, and compatible with 82574L)
+// Legacy RX Descriptor (used by 82540EM and 82545EM; the e1000e parts can
+// also operate in this legacy mode, which is what the e1000e driver uses.)
 // ============================================================================
 typedef struct __attribute__((packed)) {
     uint64_t buffer_addr;       // Physical address of receive buffer
@@ -158,7 +166,7 @@ typedef struct __attribute__((packed)) {
 #define E1000_TXD_STAT_DD       (1 << 0)    // Descriptor Done
 
 // ============================================================================
-// Extended RX Descriptor (Read format) — for 82574L only
+// Extended RX Descriptor (Read format) — e1000e-class parts only
 // ============================================================================
 typedef struct __attribute__((packed)) {
     uint64_t buffer_addr;       // Address of the receive buffer

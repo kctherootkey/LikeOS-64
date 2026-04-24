@@ -82,6 +82,8 @@ extern void irq24();
 extern void irq25();
 extern void irq26();  // ACPI SCI
 extern void irq27();  // E1000 NIC MSI
+extern void irq28();  // e1000e NIC MSI
+extern void irq29();  // vmxnet3 NIC MSI
 
 extern void isr0();
 extern void isr1();
@@ -326,6 +328,8 @@ void idt_init() {
     idt_set_entry(57, (uint64_t)irq25, 0x08, 0x8E);  // GPIO 3
     idt_set_entry(58, (uint64_t)irq26, 0x08, 0x8E);  // ACPI SCI
     idt_set_entry(59, (uint64_t)irq27, 0x08, 0x8E);  // MSI: E1000 NIC
+    idt_set_entry(60, (uint64_t)irq28, 0x08, 0x8E);  // MSI: e1000e NIC (82574L/82583V)
+    idt_set_entry(61, (uint64_t)irq29, 0x08, 0x8E);  // MSI: vmxnet3 paravirt NIC
     
     // IPI vectors for SMP
     idt_set_entry(0xFC, (uint64_t)ipi_vector_0xFC, 0x08, 0x8E);  // TLB shootdown
@@ -492,7 +496,69 @@ void irq_handler(uint64_t *regs) {
     uint8_t irq = (uint8_t)(int_no - 32);
     
     g_total_irq_count++;
-    
+
+    // Legacy INTx dispatch for E1000 / e1000e NICs (when MSI is not
+    // available, e.g. VirtualBox).  These MUST be checked BEFORE any
+    // fixed-vector branches below, because the IOAPIC may map the NIC's
+    // PCI INTA pin to a GSI whose vector collides with one we reserve
+    // for an MSI device (e.g. VBox routes 82545EM INTA -> GSI 17 ->
+    // vector 49, which is XHCI_MSI_VECTOR_2).  The level-triggered NIC
+    // line would otherwise be ACK'd by the wrong handler and assert
+    // forever, hanging the system in an IRQ storm.
+    {
+        extern int g_e1000_initialized;
+        extern int g_e1000_legacy_irq;
+        if (g_e1000_initialized && g_e1000_legacy_irq >= 0 && irq == g_e1000_legacy_irq) {
+            e1000_irq_handler();
+            return;  // e1000_irq_handler calls lapic_eoi()
+        }
+    }
+    {
+        extern int g_e1000e_initialized;
+        extern int g_e1000e_legacy_irq;
+        extern void e1000e_irq_handler(void);
+        if (g_e1000e_initialized && g_e1000e_legacy_irq >= 0 && irq == g_e1000e_legacy_irq) {
+            e1000e_irq_handler();
+            return;  // e1000e_irq_handler calls lapic_eoi()
+        }
+    }
+    {
+        extern int g_rtl8139_initialized;
+        extern int g_rtl8139_legacy_irq;
+        extern void rtl8139_irq_handler(void);
+        if (g_rtl8139_initialized && g_rtl8139_legacy_irq >= 0 && irq == g_rtl8139_legacy_irq) {
+            rtl8139_irq_handler();
+            return;  // rtl8139_irq_handler calls lapic_eoi()
+        }
+    }
+    {
+        extern int g_pcnet_initialized;
+        extern int g_pcnet_legacy_irq;
+        extern void pcnet32_irq_handler(void);
+        if (g_pcnet_initialized && g_pcnet_legacy_irq >= 0 && irq == g_pcnet_legacy_irq) {
+            pcnet32_irq_handler();
+            return;  // pcnet32_irq_handler calls lapic_eoi()
+        }
+    }
+    {
+        extern int g_ne2k_initialized;
+        extern int g_ne2k_legacy_irq;
+        extern void ne2k_irq_handler(void);
+        if (g_ne2k_initialized && g_ne2k_legacy_irq >= 0 && irq == g_ne2k_legacy_irq) {
+            ne2k_irq_handler();
+            return;  // ne2k_irq_handler calls lapic_eoi()
+        }
+    }
+    {
+        extern int g_vmxnet3_initialized;
+        extern int g_vmxnet3_legacy_irq;
+        extern void vmxnet3_irq_handler(void);
+        if (g_vmxnet3_initialized && g_vmxnet3_legacy_irq >= 0 && irq == g_vmxnet3_legacy_irq) {
+            vmxnet3_irq_handler();
+            return;  // vmxnet3_irq_handler calls lapic_eoi()
+        }
+    }
+
     // MSI vector for xHCI USB — vector 48 (irq == 16 after subtracting IRQ_BASE).
     // MSI bypasses the PIC entirely; requires LAPIC EOI, not PIC EOI.
     if (int_no == XHCI_MSI_VECTOR) {
@@ -514,17 +580,7 @@ void irq_handler(uint64_t *regs) {
         return;
     }
 
-    // Legacy INTx dispatch for E1000 NIC (when MSI is not available).
-    // Must be checked BEFORE the I2C LPSS range (vectors 50-53) because
-    // the E1000's IOAPIC GSI may map to a vector in that range.
-    {
-        extern int g_e1000_initialized;
-        extern int g_e1000_legacy_irq;
-        if (g_e1000_initialized && g_e1000_legacy_irq >= 0 && irq == g_e1000_legacy_irq) {
-            e1000_irq_handler();
-            return;  // e1000_irq_handler calls lapic_eoi()
-        }
-    }
+    // (Legacy NIC dispatch was moved above — see top of irq_handler.)
 
     // MSI/IOAPIC vectors for I2C LPSS controllers (vectors 50-53)
     if (int_no >= 50 && int_no <= 53) {
@@ -551,6 +607,20 @@ void irq_handler(uint64_t *regs) {
     if (int_no == E1000_MSI_VECTOR) {
         e1000_irq_handler();
         return;  // e1000_irq_handler calls lapic_eoi()
+    }
+
+    // e1000e NIC MSI interrupt (vector 60)
+    if (int_no == E1000E_MSI_VECTOR) {
+        extern void e1000e_irq_handler(void);
+        e1000e_irq_handler();
+        return;  // e1000e_irq_handler calls lapic_eoi()
+    }
+
+    // vmxnet3 paravirt NIC MSI interrupt (vector 61)
+    if (int_no == VMXNET3_MSI_VECTOR) {
+        extern void vmxnet3_irq_handler(void);
+        vmxnet3_irq_handler();
+        return;  // vmxnet3_irq_handler calls lapic_eoi()
     }
 
     // Check for spurious IRQ7 (from master PIC)

@@ -160,6 +160,11 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/i2c_hid.o \
 			  $(BUILD_DIR)/net.o \
 			  $(BUILD_DIR)/e1000.o \
+			  $(BUILD_DIR)/e1000e.o \
+			  $(BUILD_DIR)/rtl8139.o \
+			  $(BUILD_DIR)/pcnet32.o \
+			  $(BUILD_DIR)/ne2k.o \
+			  $(BUILD_DIR)/vmxnet3.o \
 			  $(BUILD_DIR)/ethernet.o \
 			  $(BUILD_DIR)/arp.o \
 			  $(BUILD_DIR)/ipv4.o \
@@ -298,7 +303,22 @@ $(BUILD_DIR)/i2c_hid.o: $(KERNEL_DIR)/hal/i2c_hid.c | $(BUILD_DIR)
 $(BUILD_DIR)/net.o: $(KERNEL_DIR)/net/net.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/e1000.o: $(KERNEL_DIR)/net/e1000.c | $(BUILD_DIR)
+$(BUILD_DIR)/e1000.o: $(KERNEL_DIR)/net/nic/e1000.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/e1000e.o: $(KERNEL_DIR)/net/nic/e1000e.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/rtl8139.o: $(KERNEL_DIR)/net/nic/rtl8139.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/pcnet32.o: $(KERNEL_DIR)/net/nic/pcnet32.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/ne2k.o: $(KERNEL_DIR)/net/nic/ne2k.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vmxnet3.o: $(KERNEL_DIR)/net/nic/vmxnet3.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ethernet.o: $(KERNEL_DIR)/net/ethernet.c | $(BUILD_DIR)
@@ -1097,12 +1117,18 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	@echo "Data image created (UEFI + signature files + tests): $(DATA_IMAGE)"
 
 # Run with ISO boot plus attached xHCI controller and USB mass storage device
+#
+# Optional NIC selection: override the QEMU `-device` model with NIC_DEVICE,
+# e.g. `make qemu-usb NIC_DEVICE=e1000e` or `NIC_DEVICE=rtl8139`.
+# Defaults to e1000 (Intel 82540EM).
+NIC_DEVICE ?= e1000
+
 qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
-	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage + E1000 networking..."
+	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage + $(NIC_DEVICE) networking..."
 	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
 		-device usb-storage,drive=usbdisk $(QEMU_USB_HID) -machine type=pc,accel=kvm:tcg \
-		-device e1000,netdev=net0 -netdev user,id=net0
+		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
 
 # Run with ISO boot plus xHCI + USB mass storage, with GDB support and debug symbols
 # Connect with: gdb build/kernel.elf -ex "target remote :1234"
@@ -1110,26 +1136,28 @@ qemu-usb-gdb:
 	@echo "Rebuilding kernel with debug symbols (-g)..."
 	$(MAKE) clean
 	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" NO_STRIP=1 $(ISO_IMAGE) $(DATA_IMAGE)
-	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage + GDB server on :1234..."
+	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage + $(NIC_DEVICE) + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
 	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
-		-device usb-storage,drive=usbdisk $(QEMU_USB_HID) -machine type=pc,accel=kvm:tcg -s -S -monitor telnet:127.0.0.1:5555,server,nowait -d int 2> /tmp/qemu_int_log
+		-device usb-storage,drive=usbdisk $(QEMU_USB_HID) -machine type=pc,accel=kvm:tcg \
+		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0 \
+		-s -S -monitor telnet:127.0.0.1:5555,server,nowait -d int 2> /tmp/qemu_int_log
 
 # Run with real USB device (like /dev/sdb) as xHCI USB mass storage - boots from USB only
-# Usage: make qemu-realusb USB_DEVICE=/dev/sdb [SERIAL=1]
+# Usage: make qemu-realusb USB_DEVICE=/dev/sdb [SERIAL=1] [NIC_DEVICE=e1000e]
 qemu-realusb:
 ifndef USB_DEVICE
 	$(error USB_DEVICE is not set. Usage: make qemu-realusb USB_DEVICE=/dev/sdb)
 endif
-	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE)..."
+	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC)..."
 	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg \
-		-device e1000,netdev=net0 -netdev user,id=net0
+		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
 
 # Run with real USB device as xHCI USB mass storage, with GDB support and debug symbols
-# Usage: make qemu-realusb-gdb USB_DEVICE=/dev/sdb [SERIAL=1]
+# Usage: make qemu-realusb-gdb USB_DEVICE=/dev/sdb [SERIAL=1] [NIC_DEVICE=e1000e]
 # Connect with: gdb build/kernel.elf -ex "target remote :1234"
 qemu-realusb-gdb:
 ifndef USB_DEVICE
@@ -1138,12 +1166,12 @@ endif
 	@echo "Rebuilding kernel with debug symbols (-g)..."
 	$(MAKE) clean
 	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" NO_STRIP=1 usb-write USB_DEVICE=$(USB_DEVICE)
-	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE) + GDB server on :1234..."
+	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC) + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
 	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg \
-		-device e1000,netdev=net0 -netdev user,id=net0 \
+		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0 \
 		-s -S -monitor telnet:127.0.0.1:5555,server,nowait -d int 2> /tmp/qemu_int_log
 
 # Extended USB passthrough target: attach tablet + optional host devices (edit vendor/product)

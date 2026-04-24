@@ -1,16 +1,21 @@
 // LikeOS-64 Intel E1000 NIC Driver
-// Supports QEMU (82540EM), VMware (82545EM), VirtualBox (82574L)
-#include "../../include/kernel/e1000.h"
-#include "../../include/kernel/net.h"
-#include "../../include/kernel/pci.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/interrupt.h"
-#include "../../include/kernel/slab.h"
-#include "../../include/kernel/lapic.h"
-#include "../../include/kernel/ioapic.h"
-#include "../../include/kernel/acpi.h"
-#include "../../include/kernel/timer.h"
+// Supports the e1000-class parts:
+//   - 82540EM  (QEMU `-device e1000`, VirtualBox "Intel PRO/1000 MT Desktop")
+//   - 82545EM  (VMware default, VirtualBox "Intel PRO/1000 MT Server" and
+//               "Intel PRO/1000 T Server")
+// Note: The 82574L (PCI 0x10D3) is an e1000e-class part and is handled
+// by the separate e1000e driver in this directory, not here.
+#include "../../../include/kernel/e1000.h"
+#include "../../../include/kernel/net.h"
+#include "../../../include/kernel/pci.h"
+#include "../../../include/kernel/memory.h"
+#include "../../../include/kernel/console.h"
+#include "../../../include/kernel/interrupt.h"
+#include "../../../include/kernel/slab.h"
+#include "../../../include/kernel/lapic.h"
+#include "../../../include/kernel/ioapic.h"
+#include "../../../include/kernel/acpi.h"
+#include "../../../include/kernel/timer.h"
 
 // Global e1000 device (single NIC support)
 static e1000_dev_t g_e1000;
@@ -394,14 +399,18 @@ void e1000_init(void) {
         if (devs[i].vendor_id != E1000_VENDOR_ID) continue;
 
         uint16_t did = devs[i].device_id;
-        if (did != E1000_DEV_82540EM && did != E1000_DEV_82545EM &&
-            did != E1000_DEV_82574L && did != E1000_DEV_I217_LM)
+        if (did != E1000_DEV_82540EM &&
+            did != E1000_DEV_82543GC &&
+            did != E1000_DEV_82544GC &&
+            did != E1000_DEV_82545EM &&
+            did != E1000_DEV_I217_LM)
             continue;
 
         const char* name = "E1000";
         if (did == E1000_DEV_82540EM) name = "82540EM";
+        else if (did == E1000_DEV_82543GC) name = "82543GC";
+        else if (did == E1000_DEV_82544GC) name = "82544GC";
         else if (did == E1000_DEV_82545EM) name = "82545EM";
-        else if (did == E1000_DEV_82574L) name = "82574L";
         else if (did == E1000_DEV_I217_LM) name = "I217-LM";
 
         kprintf("E1000: Found %s (PCI %02x:%02x.%x)\n",

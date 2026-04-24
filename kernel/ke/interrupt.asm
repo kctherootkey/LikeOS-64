@@ -217,6 +217,12 @@ IRQ 26, 58              ; ACPI SCI (System Control Interrupt)
 ; E1000 NIC MSI vector (59)
 IRQ 27, 59              ; MSI: E1000 NIC
 
+; e1000e NIC (82574L/82583V) MSI vector (60)
+IRQ 28, 60              ; MSI: e1000e NIC
+
+; vmxnet3 paravirt NIC MSI vector (61)
+IRQ 29, 61              ; MSI: vmxnet3 NIC
+
 ; ============================================================================
 ; IPI (Inter-Processor Interrupt) Handlers for SMP
 ; These are high-vector interrupts sent between CPUs via LAPIC
