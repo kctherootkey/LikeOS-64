@@ -17,6 +17,34 @@
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/timer.h"
 
+// ============================================================================
+// Supported PCI device IDs.  All NE2000-PCI clones present the same
+// RTL8029-style register layout.
+// ============================================================================
+typedef struct { uint16_t vid, did; const char* name; } ne2k_id_t;
+
+static const ne2k_id_t ne2k_pci_ids[] = {
+    { 0x10EC, 0x8029, "Realtek RTL8029"     },  // QEMU -device ne2k_pci
+    { 0x1050, 0x0940, "Winbond 89C940"      },
+    { 0x11F6, 0x1401, "Compex RL2000"       },
+    { 0x8E2E, 0x3000, "KTI ET32P2"          },
+    { 0x4A14, 0x5000, "NetVin NV5000SC"     },
+    { 0x1106, 0x0926, "Via 86C926"          },
+    { 0x10BD, 0x0E34, "SureCom NE34"        },
+    { 0x1050, 0x5A5A, "Holtek HT80232"      },
+    { 0x12C3, 0x0058, "Quic 5DPC"           },
+    { 0x12C3, 0x5598, "Quic 5DPC v2"        },
+    { 0x8C4A, 0x1980, "Winbond W89C940"     },
+    { 0,      0,      NULL                   },
+};
+
+static const ne2k_id_t* ne2k_lookup(uint16_t vid, uint16_t did) {
+    for (const ne2k_id_t* e = ne2k_pci_ids; e->name; e++) {
+        if (e->vid == vid && e->did == did) return e;
+    }
+    return NULL;
+}
+
 // Single-NIC state (mirrors rtl8139 / pcnet32)
 static ne2k_dev_t g_ne2k;
 int g_ne2k_initialized = 0;
@@ -331,11 +359,11 @@ void ne2k_init(void) {
     const pci_device_t* devs = pci_get_devices(&count);
 
     for (int i = 0; i < count; i++) {
-        if (devs[i].vendor_id != NE2K_VENDOR_ID) continue;
-        if (devs[i].device_id != NE2K_DEV_RTL8029) continue;
+        const ne2k_id_t* match = ne2k_lookup(devs[i].vendor_id, devs[i].device_id);
+        if (!match) continue;
 
-        kprintf("NE2K: Found RTL8029(AS) (PCI %02x:%02x.%x)\n",
-                devs[i].bus, devs[i].device, devs[i].function);
+        kprintf("NE2K: Found %s (PCI %02x:%02x.%x)\n",
+                match->name, devs[i].bus, devs[i].device, devs[i].function);
 
         ne2k_dev_t* dev = &g_ne2k;
         dev->pci_dev = &devs[i];

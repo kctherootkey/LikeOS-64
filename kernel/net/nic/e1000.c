@@ -17,6 +17,66 @@
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/timer.h"
 
+// ============================================================================
+// Supported PCI device IDs for the entire 8254x PCI/PCI-X family
+// (82540, 82541, 82543, 82544, 82545, 82546, 82547).  8257x PCIe parts
+// are handled by the separate e1000e driver.
+// ============================================================================
+typedef struct { uint16_t did; const char* name; } e1000_id_t;
+
+static const e1000_id_t e1000_pci_ids[] = {
+    // 82540
+    { 0x100E, "82540EM"          },   // QEMU -device e1000, VBox MT Desktop
+    { 0x1015, "82540EM LOM"      },
+    { 0x1016, "82540EP LOM"      },
+    { 0x1017, "82540EP"          },
+    { 0x101E, "82540EP LP"       },
+    // 82541
+    { 0x1013, "82541EI"          },
+    { 0x1018, "82541EI Mobile"   },
+    { 0x1076, "82541GI"          },
+    { 0x1077, "82541GI Mobile"   },
+    { 0x1078, "82541ER"          },
+    { 0x1079, "82546GB Quad Copper" },
+    { 0x107C, "82541PI"          },
+    // 82543
+    { 0x1004, "82543GC Copper"   },   // QEMU -device e1000-82543gc
+    { 0x1003, "82543GC Fiber"    },
+    // 82544
+    { 0x1008, "82544EI Copper"   },
+    { 0x1009, "82544EI Fiber"    },
+    { 0x100C, "82544GC Copper"   },   // QEMU -device e1000-82544gc
+    { 0x100D, "82544GC LOM"      },
+    // 82545
+    { 0x100F, "82545EM Copper"   },   // VMware, VBox MT Server
+    { 0x1011, "82545EM Fiber"    },
+    { 0x1026, "82545GM Copper"   },
+    { 0x1027, "82545GM Fiber"    },
+    { 0x1028, "82545GM SerDes"   },
+    // 82546
+    { 0x1010, "82546EB Copper"   },
+    { 0x1012, "82546EB Fiber"    },
+    { 0x101D, "82546EB Quad Copper" },
+    { 0x1079, "82546GB Quad Copper (2)" },
+    { 0x107A, "82546GB Fiber"    },
+    { 0x107B, "82546GB SerDes"   },
+    { 0x108A, "82546GB Copper"   },
+    { 0x1099, "82546GB Quad Copper KSP3" },
+    { 0x10B5, "82546GB Quad Copper" },
+    // 82547
+    { 0x1019, "82547EI"          },
+    { 0x101A, "82547EI Mobile"   },
+    { 0x1075, "82547GI"          },
+    { 0,      NULL               },
+};
+
+static const e1000_id_t* e1000_lookup(uint16_t did) {
+    for (const e1000_id_t* e = e1000_pci_ids; e->name; e++) {
+        if (e->did == did) return e;
+    }
+    return NULL;
+}
+
 // Global e1000 device (single NIC support)
 static e1000_dev_t g_e1000;
 int g_e1000_initialized = 0;
@@ -399,19 +459,9 @@ void e1000_init(void) {
         if (devs[i].vendor_id != E1000_VENDOR_ID) continue;
 
         uint16_t did = devs[i].device_id;
-        if (did != E1000_DEV_82540EM &&
-            did != E1000_DEV_82543GC &&
-            did != E1000_DEV_82544GC &&
-            did != E1000_DEV_82545EM &&
-            did != E1000_DEV_I217_LM)
-            continue;
-
-        const char* name = "E1000";
-        if (did == E1000_DEV_82540EM) name = "82540EM";
-        else if (did == E1000_DEV_82543GC) name = "82543GC";
-        else if (did == E1000_DEV_82544GC) name = "82544GC";
-        else if (did == E1000_DEV_82545EM) name = "82545EM";
-        else if (did == E1000_DEV_I217_LM) name = "I217-LM";
+        const e1000_id_t* match = e1000_lookup(did);
+        if (!match) continue;
+        const char* name = match->name;
 
         kprintf("E1000: Found %s (PCI %02x:%02x.%x)\n",
                 name, devs[i].bus, devs[i].device, devs[i].function);
