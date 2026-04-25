@@ -558,6 +558,15 @@ void irq_handler(uint64_t *regs) {
             return;  // vmxnet3_irq_handler calls lapic_eoi()
         }
     }
+    {
+        extern int g_eepro100_initialized;
+        extern int g_eepro100_legacy_irq;
+        extern void eepro100_irq_handler(void);
+        if (g_eepro100_initialized && g_eepro100_legacy_irq >= 0 && irq == g_eepro100_legacy_irq) {
+            eepro100_irq_handler();
+            return;  // eepro100_irq_handler calls lapic_eoi()
+        }
+    }
 
     // MSI vector for xHCI USB — vector 48 (irq == 16 after subtracting IRQ_BASE).
     // MSI bypasses the PIC entirely; requires LAPIC EOI, not PIC EOI.

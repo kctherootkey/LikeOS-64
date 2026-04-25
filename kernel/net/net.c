@@ -6,6 +6,7 @@
 #include "../../include/kernel/pcnet32.h"
 #include "../../include/kernel/ne2k.h"
 #include "../../include/kernel/vmxnet3.h"
+#include "../../include/kernel/eepro100.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/memory.h"
@@ -158,6 +159,7 @@ void net_init(void) {
     pcnet32_init();
     ne2k_init();
     vmxnet3_init();
+    eepro100_init();
 
     // If we have a NIC, initialize DHCP state (discover sent later after sti)
     net_device_t* dev = net_get_default_device();
