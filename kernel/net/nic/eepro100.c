@@ -530,19 +530,66 @@ static int e100_map_csr(eepro100_dev_t* d) {
 }
 
 // ============================================================================
-// Resolve PCI device-id to a human-readable model name (for boot log).
-// All variants share one of three QEMU device IDs but the model name we
-// print should reflect what the user asked for at the QEMU command line —
-// without subsystem-id sniffing we can only narrow it to the device-id
-// group, so that's what we do.
+// Supported PCI device IDs for the Intel 8255x family.  All variants
+// are covered by 3 base IDs (0x1229 = 82557/8/9, 0x1209 =
+// 82550/1/9ER/82562, 0x2449 = 82801) plus a long tail of OEM/embedded
+// IDs used in various server boards, blades and chipset LOMs.
 // ============================================================================
-static const char* e100_model_name(uint16_t did) {
-    switch (did) {
-    case EEPRO100_DEV_82557:    return "i82557/82558/82559";
-    case EEPRO100_DEV_82551IT:  return "i82550/82551/82559ER/82562";
-    case EEPRO100_DEV_82801:    return "i82801";
-    default:                    return "Intel 8255x";
+typedef struct { uint16_t did; const char* name; } eepro100_id_t;
+
+static const eepro100_id_t eepro100_pci_ids[] = {
+    { 0x1029, "i82559 InBusiness" },
+    { 0x1030, "i82559"            },
+    { 0x1031, "PRO/100 VE (ICH3)" },
+    { 0x1032, "PRO/100 VE (ICH3) #2" },
+    { 0x1033, "PRO/100 VM (ICH3)" },
+    { 0x1034, "PRO/100 VM (ICH3) #2" },
+    { 0x1035, "82801CAM (ICH3)"   },
+    { 0x1036, "82801CAM (ICH3) #2" },
+    { 0x1037, "82801CAM (ICH3) #3" },
+    { 0x1038, "PRO/100 VM (ICH3-M)" },
+    { 0x1039, "PRO/100 VE (ICH4)" },
+    { 0x103A, "PRO/100 VE (ICH4)" },
+    { 0x103B, "PRO/100 VM (ICH4)" },
+    { 0x103C, "PRO/100 VM (ICH4)" },
+    { 0x103D, "PRO/100 VE (ICH4)" },
+    { 0x103E, "PRO/100 VM (ICH4)" },
+    { 0x1050, "PRO/100 VM (ICH5)" },
+    { 0x1051, "PRO/100 VE (ICH5)" },
+    { 0x1052, "PRO/100 VE (ICH5)" },
+    { 0x1053, "PRO/100 VM (ICH5)" },
+    { 0x1054, "PRO/100 VM (ICH5)" },
+    { 0x1055, "PRO/100 VM (ICH5)" },
+    { 0x1056, "PRO/100 VE (ICH5)" },
+    { 0x1057, "PRO/100 VE (ICH5)" },
+    { 0x1059, "82551QM"           },
+    { 0x1064, "PRO/100 VE (ICH6)" },
+    { 0x1065, "PRO/100 VE (ICH6)" },
+    { 0x1066, "PRO/100 VE (ICH6)" },
+    { 0x1067, "PRO/100 VE (ICH6)" },
+    { 0x1068, "PRO/100 VE (ICH6)" },
+    { 0x1069, "PRO/100 VE (ICH6)" },
+    { 0x106A, "PRO/100 VE (ICH6)" },
+    { 0x106B, "PRO/100 VE (ICH6)" },
+    { 0x1091, "PRO/100 VE (ICH7)" },
+    { 0x1092, "PRO/100 VE (ICH7)" },
+    { 0x1093, "PRO/100 VE (ICH7)" },
+    { 0x1094, "PRO/100 VE (ICH7)" },
+    { 0x1095, "PRO/100 VE (ICH7)" },
+    { 0x1209, "i82550/82551/82559ER/82562" },
+    { 0x1229, "i82557/82558/82559"        },
+    { 0x2449, "i82801 (ICH)"              },
+    { 0x2459, "i82801DB (ICH4)"           },
+    { 0x245D, "i82801EB (ICH5)"           },
+    { 0x27DC, "i82801G (ICH7)"            },
+    { 0,      NULL                         },
+};
+
+static const eepro100_id_t* eepro100_lookup(uint16_t did) {
+    for (const eepro100_id_t* e = eepro100_pci_ids; e->name; e++) {
+        if (e->did == did) return e;
     }
+    return NULL;
 }
 
 // ============================================================================
@@ -555,11 +602,10 @@ void eepro100_init(void) {
     for (int i = 0; i < count; i++) {
         if (devs[i].vendor_id != EEPRO100_VENDOR_ID) continue;
         uint16_t did = devs[i].device_id;
-        if (did != EEPRO100_DEV_82557
-         && did != EEPRO100_DEV_82551IT
-         && did != EEPRO100_DEV_82801) continue;
+        const eepro100_id_t* match = eepro100_lookup(did);
+        if (!match) continue;
 
-        const char* name = e100_model_name(did);
+        const char* name = match->name;
         kprintf("eepro100: Found %s (PCI %02x:%02x.%x)\n",
                 name, devs[i].bus, devs[i].device, devs[i].function);
 

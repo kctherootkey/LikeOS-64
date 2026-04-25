@@ -28,6 +28,141 @@
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/timer.h"
 
+// ============================================================================
+// Supported PCI device IDs.  Compiled from publicly documented
+// drivers/net/ethernet/intel/e1000e/hw.h (E1000_DEV_ID_*).  Covers the
+// entire 8257x family plus 80003ES2LAN, ICH8/9/10, and the PCH (LPT, SPT,
+// CNP, ICP, CMP, TGP, ADP, MTP, RPL) I217/I218/I219 LOM parts that ship
+// in virtually every Intel-based business laptop and desktop board from
+// 2012 onwards (including the Lenovo ThinkPad P50's I219-LM at 0x156F).
+// ============================================================================
+typedef struct { uint16_t did; const char* name; } e1000e_id_t;
+
+static const e1000e_id_t e1000e_pci_ids[] = {
+    // ---- 82571 family ----
+    { 0x105E, "82571EB Copper (dual)" },
+    { 0x105F, "82571EB Fiber (dual)"  },
+    { 0x1060, "82571EB SerDes (dual)" },
+    { 0x10A4, "82571EB Quad Copper"   },
+    { 0x10A5, "82571EB Quad Fiber"    },
+    { 0x10BC, "82571EB Quad LP"       },
+    { 0x10D9, "82571EB SerDes Dual"   },
+    { 0x10DA, "82571EB SerDes Quad"   },
+    { 0x10D5, "82571PT Quad LP"       },
+    // ---- 82572 family ----
+    { 0x107D, "82572EI Copper"        },
+    { 0x107E, "82572EI Fiber"         },
+    { 0x107F, "82572EI SerDes"        },
+    { 0x10B9, "82572EI"               },
+    // ---- 82573 family ----
+    { 0x108B, "82573V"                },
+    { 0x108C, "82573E"                },
+    { 0x109A, "82573L"                },
+    // ---- 82574 / 82583 ----
+    { 0x10D3, "82574L"                },  // QEMU -device e1000e
+    { 0x10F6, "82574LA"               },
+    { 0x150C, "82583V"                },
+    // ---- 80003ES2LAN ----
+    { 0x1096, "80003ES2LAN Copper Dual" },
+    { 0x1098, "80003ES2LAN SerDes Dual" },
+    { 0x10BA, "80003ES2LAN Copper"      },
+    { 0x10BB, "80003ES2LAN SerDes"      },
+    // ---- ICH8 ----
+    { 0x1049, "ICH8 IGP M Amt"        },
+    { 0x104A, "ICH8 IGP Amt"          },
+    { 0x104B, "ICH8 IGP C"            },
+    { 0x104C, "ICH8 IFE"              },
+    { 0x104D, "ICH8 IGP M"            },
+    { 0x10C4, "ICH8 IFE GT"           },
+    { 0x10C5, "ICH8 IFE G"            },
+    // ---- ICH9 ----
+    { 0x10BD, "ICH9 IGP Amt"          },
+    { 0x10BF, "ICH9 IGP M"            },
+    { 0x10CB, "ICH9 IGP M V"          },
+    { 0x10CC, "ICH9 IGP M Amt"        },
+    { 0x10CD, "ICH9 BM LM"            },
+    { 0x10CE, "ICH9 BM LF"            },
+    { 0x10E5, "ICH9 BM"               },
+    { 0x294C, "ICH9 IGP C"            },
+    { 0x10F5, "ICH9 IGP M Amt (2)"    },
+    { 0x10BD, "ICH9 IGP Amt"          },
+    // ---- ICH10 ----
+    { 0x10C0, "ICH10 D BM LM"         },
+    { 0x10C2, "ICH10 D BM LF"         },
+    { 0x10C3, "ICH10 D BM V"          },
+    { 0x10DF, "ICH10 R BM LM"         },
+    { 0x10F0, "ICH10 D BM LM (2)"     },
+    // ---- PCH (Pineview) ----
+    { 0x10EA, "PCH M HV LM"           },
+    { 0x10EB, "PCH M HV LC"           },
+    { 0x10EF, "PCH D HV DM"           },
+    { 0x10F0, "PCH D HV DC"           },
+    // ---- PCH2 (CougarPoint) ----
+    { 0x1502, "PCH2 LV LM"            },
+    { 0x1503, "PCH2 LV V"             },
+    // ---- LPT / I217 (Lynx Point, Haswell PCH) ----
+    { 0x153A, "I217-LM"               },
+    { 0x153B, "I217-V"                },
+    // ---- LPT-LP / I218 (Lynx Point LP, Haswell-ULT PCH) ----
+    { 0x155A, "I218-LM"               },
+    { 0x1559, "I218-V"                },
+    { 0x15A0, "I218-LM (2)"           },
+    { 0x15A1, "I218-V  (2)"           },
+    { 0x15A2, "I218-LM (3)"           },
+    { 0x15A3, "I218-V  (3)"           },
+    // ---- SPT / I219 (Sunrise Point, Skylake PCH) ----  ← ThinkPad P50
+    { 0x156F, "I219-LM (SPT)"         },
+    { 0x1570, "I219-V  (SPT)"         },
+    { 0x15B7, "I219-LM (SPT-H)"       },
+    { 0x15B8, "I219-V  (SPT-H)"       },
+    { 0x15B9, "I219-LM (SPT-LP)"      },
+    // ---- CNP / I219 (Cannon/Coffee Lake PCH) ----
+    { 0x15BB, "I219-LM (CNP)"         },
+    { 0x15BC, "I219-V  (CNP)"         },
+    { 0x15BD, "I219-LM (CNP-H)"       },
+    { 0x15BE, "I219-V  (CNP-H)"       },
+    { 0x15DF, "I219-LM (CNP-LP)"      },
+    { 0x15E0, "I219-V  (CNP-LP)"      },
+    { 0x15E1, "I219-LM (CNP-2)"       },
+    { 0x15E2, "I219-V  (CNP-2)"       },
+    // ---- ICP / I219 (Ice Lake / Comet Lake PCH) ----
+    { 0x15D6, "I219-V  (ICP)"         },
+    { 0x15D7, "I219-LM (ICP)"         },
+    { 0x15D8, "I219-V  (ICP-2)"       },
+    { 0x15E3, "I219-LM (ICP-2)"       },
+    // ---- CMP / I219 (Comet Lake PCH) ----
+    { 0x0D4E, "I219-LM (CMP)"         },
+    { 0x0D4F, "I219-V  (CMP)"         },
+    { 0x0D4C, "I219-LM (CMP-2)"       },
+    { 0x0D4D, "I219-V  (CMP-2)"       },
+    { 0x0D53, "I219-LM (CMP-LP)"      },
+    { 0x0D55, "I219-V  (CMP-LP)"      },
+    // ---- TGP / I219 (Tiger Lake PCH) ----
+    { 0x15F9, "I219-LM (TGP-LP)"      },
+    { 0x15FA, "I219-V  (TGP-LP)"      },
+    { 0x15FB, "I219-LM (TGP-H)"       },
+    { 0x15FC, "I219-V  (TGP-H)"       },
+    // ---- ADP / RPL / MTP / LNL (Alder/Raptor/Meteor/Lunar Lake PCH) ----
+    { 0x1A1C, "I219-LM (ADP)"         },
+    { 0x1A1D, "I219-V  (ADP)"         },
+    { 0x1A1E, "I219-LM (ADP-N)"       },
+    { 0x1A1F, "I219-V  (ADP-N)"       },
+    { 0x550A, "I219-LM (RPL)"         },
+    { 0x550B, "I219-V  (RPL)"         },
+    { 0x550C, "I219-LM (RPL-2)"       },
+    { 0x550D, "I219-V  (RPL-2)"       },
+    { 0x57A0, "I219-LM (MTP)"         },
+    { 0x57A1, "I219-V  (MTP)"         },
+    { 0,      NULL                    },
+};
+
+static const e1000e_id_t* e1000e_lookup(uint16_t did) {
+    for (const e1000e_id_t* e = e1000e_pci_ids; e->name; e++) {
+        if (e->did == did) return e;
+    }
+    return NULL;
+}
+
 // Single-NIC global (mirrors the e1000 driver layout).
 static e1000e_dev_t g_e1000e;
 int g_e1000e_initialized = 0;
@@ -374,12 +509,9 @@ void e1000e_init(void) {
         if (devs[i].vendor_id != E1000E_VENDOR_ID) continue;
 
         uint16_t did = devs[i].device_id;
-        if (did != E1000E_DEV_82574L && did != E1000E_DEV_82583V)
-            continue;
-
-        const char* name = "e1000e";
-        if (did == E1000E_DEV_82574L) name = "82574L";
-        else if (did == E1000E_DEV_82583V) name = "82583V";
+        const e1000e_id_t* match = e1000e_lookup(did);
+        if (!match) continue;
+        const char* name = match->name;
 
         kprintf("E1000E: Found %s (PCI %02x:%02x.%x)\n",
                 name, devs[i].bus, devs[i].device, devs[i].function);

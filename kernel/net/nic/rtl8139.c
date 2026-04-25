@@ -17,6 +17,44 @@
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/timer.h"
 
+// ============================================================================
+// Supported PCI device IDs.  All entries expose the same
+// RTL8139-compatible register layout (RTL8139C/C+/D, plus numerous
+// OEM rebrands).
+// ============================================================================
+typedef struct { uint16_t vid, did; const char* name; } rtl8139_id_t;
+
+static const rtl8139_id_t rtl8139_pci_ids[] = {
+    { 0x10EC, 0x8139, "Realtek RTL8139"      },  // QEMU -device rtl8139
+    { 0x10EC, 0x8138, "Realtek RTL8139B mPCI" },
+    { 0x1113, 0x1211, "SMC EZ Card 1211TX"   },
+    { 0x1500, 0x1360, "Delta 8139"           },
+    { 0x4033, 0x1360, "Addtron 8139"         },
+    { 0x1186, 0x1300, "D-Link DFE-538TX"     },
+    { 0x1186, 0x1340, "D-Link DFE-690TXD"    },
+    { 0x13D1, 0xAB06, "AbocOM FE2500"        },
+    { 0x1259, 0xA117, "AT-2550FX"            },
+    { 0x1259, 0xA11E, "AT-2550FT"            },
+    { 0x14EA, 0xAB06, "Planex FNW-3603-TX"   },
+    { 0x14EA, 0xAB07, "Planex FNW-3800-TX"   },
+    { 0x11DB, 0x1234, "Sega Dreamcast BBA"   },
+    { 0x1432, 0x9130, "Edimax RTL8139"       },
+    { 0x02AC, 0x1012, "SpeedStream"          },
+    { 0x018A, 0x0106, "LevelOne FPC-0106TX"  },
+    { 0x126C, 0x1211, "Nortel BayStack 21"   },
+    { 0x1743, 0x8139, "Peppercon ROL/F-100"  },
+    { 0x021B, 0x8139, "Hawking PN672TX"      },
+    { 0x16EC, 0xAB06, "USRobotics USR997902" },
+    { 0,      0,      NULL                    },
+};
+
+static const rtl8139_id_t* rtl8139_lookup(uint16_t vid, uint16_t did) {
+    for (const rtl8139_id_t* e = rtl8139_pci_ids; e->name; e++) {
+        if (e->vid == vid && e->did == did) return e;
+    }
+    return NULL;
+}
+
 // Global single-NIC state
 static rtl8139_dev_t g_rtl8139;
 int g_rtl8139_initialized = 0;
@@ -311,11 +349,11 @@ void rtl8139_init(void) {
     const pci_device_t* devs = pci_get_devices(&count);
 
     for (int i = 0; i < count; i++) {
-        if (devs[i].vendor_id != RTL8139_VENDOR_ID) continue;
-        if (devs[i].device_id != RTL8139_DEV_RTL8139) continue;
+        const rtl8139_id_t* match = rtl8139_lookup(devs[i].vendor_id, devs[i].device_id);
+        if (!match) continue;
 
-        kprintf("RTL8139: Found RTL8139 (PCI %02x:%02x.%x)\n",
-                devs[i].bus, devs[i].device, devs[i].function);
+        kprintf("RTL8139: Found %s (PCI %02x:%02x.%x)\n",
+                match->name, devs[i].bus, devs[i].device, devs[i].function);
 
         rtl8139_dev_t* dev = &g_rtl8139;
         dev->pci_dev = &devs[i];

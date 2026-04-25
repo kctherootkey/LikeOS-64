@@ -21,6 +21,25 @@
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/timer.h"
 
+// ============================================================================
+// Supported PCI device IDs for the AMD PCnet-PCI family.
+// ============================================================================
+typedef struct { uint16_t vid, did; const char* name; } pcnet_id_t;
+
+static const pcnet_id_t pcnet_pci_ids[] = {
+    { 0x1022, 0x2000, "AMD PCnet-PCI / Am79C97x" },  // QEMU -device pcnet
+    { 0x1022, 0x2001, "AMD PCnet-Home"           },
+    { 0x1023, 0x2000, "Trident PCnet (rebrand)"  },
+    { 0,      0,      NULL                        },
+};
+
+static const pcnet_id_t* pcnet_lookup(uint16_t vid, uint16_t did) {
+    for (const pcnet_id_t* e = pcnet_pci_ids; e->name; e++) {
+        if (e->vid == vid && e->did == did) return e;
+    }
+    return NULL;
+}
+
 static pcnet_dev_t g_pcnet;
 int g_pcnet_initialized = 0;
 int g_pcnet_legacy_irq = -1;
@@ -414,11 +433,11 @@ void pcnet32_init(void) {
     const pci_device_t* devs = pci_get_devices(&count);
 
     for (int i = 0; i < count; i++) {
-        if (devs[i].vendor_id != PCNET_VENDOR_ID) continue;
-        if (devs[i].device_id != PCNET_DEV_LANCE) continue;
+        const pcnet_id_t* match = pcnet_lookup(devs[i].vendor_id, devs[i].device_id);
+        if (!match) continue;
 
-        kprintf("PCnet32: Found Am79C97x / pcnet (PCI %02x:%02x.%x)\n",
-                devs[i].bus, devs[i].device, devs[i].function);
+        kprintf("PCnet32: Found %s (PCI %02x:%02x.%x)\n",
+                match->name, devs[i].bus, devs[i].device, devs[i].function);
 
         pcnet_dev_t* dev = &g_pcnet;
         dev->pci_dev = &devs[i];
