@@ -109,6 +109,7 @@
 #define E1000_TCTL_EN       (1 << 1)    // Transmitter Enable
 #define E1000_TCTL_PSP      (1 << 3)    // Pad Short Packets
 #define E1000_TCTL_CT_SHIFT 4           // Collision Threshold
+#define E1000_TCTL_COLD     (0x3ff << E1000_TCTL_COLD_SHIFT)
 #define E1000_TCTL_COLD_SHIFT 12        // Collision Distance
 #define E1000_TCTL_RTLC     (1 << 24)   // Re-transmit on Late Collision
 
