@@ -336,10 +336,22 @@ static int e1000_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
 // ============================================================================
 // E1000 Link Status (net_device_t callback)
 // ============================================================================
+// Polled by userland (ifconfig etc.).  Also acts as a hot-plug fallback
+// when the LSC IRQ has not yet fired: detects the edge against the
+// cached dev->link_up, prints UP/DOWN, and on a DOWN edge invalidates
+// the DHCP lease so the next dhclient invocation does a full DISCOVER
+// against the new network instead of a (stale) unicast renewal.
 static int e1000_link_status(net_device_t* ndev) {
     e1000_dev_t* dev = (e1000_dev_t*)ndev->driver_data;
     uint32_t status = e1000_read(dev, E1000_STATUS);
-    return (status & E1000_STATUS_LU) ? 1 : 0;
+    int now_up = (status & E1000_STATUS_LU) ? 1 : 0;
+    int was_up = dev->link_up;
+    if (now_up != was_up) {
+        dev->link_up = now_up;
+        kprintf("E1000: Link %s\n", now_up ? "UP" : "DOWN");
+        if (!now_up) dhcp_invalidate(ndev);
+    }
+    return now_up;
 }
 
 // ============================================================================

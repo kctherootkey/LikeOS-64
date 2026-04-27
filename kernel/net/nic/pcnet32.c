@@ -326,12 +326,23 @@ static int pcnet_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
 // ============================================================================
 // Link status callback — read BCR9 / BCR4 link-up bit
 // ============================================================================
+// Polled-only: PCnet32's interrupt set has no link-change cause we wire,
+// so hot-plug detection happens here.  Edge logic mirrors the IRQ-driven
+// NICs: print UP/DOWN once, and on a DOWN edge invalidate the DHCP lease
+// so the next dhclient does a full DISCOVER against the new network.
 static int pcnet_link_status(net_device_t* ndev) {
     pcnet_dev_t* dev = (pcnet_dev_t*)ndev->driver_data;
     // BCR4 bit 6 = LNKST (link status).  On QEMU's pcnet emulation this
     // is permanently asserted whenever a netdev is plugged in.
     uint32_t bcr4 = pcnet_read_bcr(dev, 4);
-    return (bcr4 & (1 << 6)) ? 1 : 0;
+    int now_up = (bcr4 & (1 << 6)) ? 1 : 0;
+    int was_up = dev->link_up;
+    if (now_up != was_up) {
+        dev->link_up = now_up;
+        kprintf("PCnet32: Link %s\n", now_up ? "UP" : "DOWN");
+        if (!now_up) dhcp_invalidate(ndev);
+    }
+    return now_up;
 }
 
 // ============================================================================

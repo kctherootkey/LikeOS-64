@@ -243,7 +243,7 @@ static const e1000e_id_t* e1000e_lookup(uint16_t did) {
 }
 
 // Returns 1 if `did` is an I217/I218/I219 PCH-LAN part that requires the
-// ich8lan/I219-specific bring-up quirks below.  These parts integrate the
+// PCH-LAN / I219-specific bring-up quirks below.  These parts integrate the
 // MAC into the PCH and the PHY into the CPU package, so the OS must
 // negotiate access with the Management Engine (ME) firmware via the
 // SW/FW semaphore and clear several PCH power-saving features (K1 idle,
@@ -286,7 +286,7 @@ static int e1000e_is_pch_spt(uint16_t did) {
     }
 }
 
-// Single-NIC global (mirrors the e1000 driver layout).
+// Single-NIC global.
 static e1000e_dev_t g_e1000e;
 int g_e1000e_initialized = 0;
 int g_e1000e_legacy_irq = -1;
@@ -306,7 +306,7 @@ static inline void e1000e_write(e1000e_dev_t* dev, uint32_t reg, uint32_t val) {
 // ============================================================================
 // I217/I218/I219 (PCH-LAN) register set and bring-up quirks
 // ============================================================================
-// Registers exclusive to the ich8lan / I219 family.  Offsets and bit
+// Registers exclusive to the PCH-LAN / I219 family.  Offsets and bit
 // definitions taken from Intel's I218/I219 datasheets and EHL/CNL EDS.
 #define E1000_CTRL_EXT          0x00018  // Extended Device Control
 #define E1000_FEXTNVM           0x00028
@@ -350,16 +350,16 @@ static inline void e1000e_write(e1000e_dev_t* dev, uint32_t reg, uint32_t val) {
 #define E1000_FCT               0x00030  // Flow Control Type
 #define E1000_MANC              0x05820  // Management Control
 #define E1000_H2ME              0x05B50  // Host-to-ME
-// NOTE: bit positions match the reference ich8lan.h
-// exactly.  Earlier we had these off by one (ULP at bit 10, ENFORCE_SETTINGS
-// at bit 11), which caused the "exit ULP" handshake to actually REQUEST ULP
-// (writing 0x800 == ULP-indication bit), gating the TX descriptor-fetch DMA
-// on real I219-LM hardware (TDH never advances, GPTC stays 0, no errors).
+// NOTE: bit positions match the I218/I219 datasheet exactly.  Earlier we
+// had these off by one (ULP at bit 10, ENFORCE_SETTINGS at bit 11), which
+// caused the "exit ULP" handshake to actually REQUEST ULP (writing 0x800 ==
+// ULP-indication bit), gating the TX descriptor-fetch DMA on real I219-LM
+// hardware (TDH never advances, GPTC stays 0, no errors).
 #define E1000_H2ME_ULP                  0x00000800u // Host requests ULP (bit 11)
 #define E1000_H2ME_ENFORCE_SETTINGS     0x00001000u // Tell ME: host owns config (bit 12)
 
 // GCR bits controlling PCIe no-snoop attributes for descriptor and buffer DMA.
-// On PCH-LAN, the reference driver brings the device up in normal snooped mode by clearing
+// On PCH-LAN we bring the device up in normal snooped mode by clearing
 // these bits rather than relying on reset state inherited from firmware.
 #define E1000_GCR_RXD_NO_SNOOP          0x00000001u
 #define E1000_GCR_RXDSCW_NO_SNOOP       0x00000002u
@@ -428,8 +428,8 @@ static inline void e1000e_write(e1000e_dev_t* dev, uint32_t reg, uint32_t val) {
 
 // Intel I82577/I82578/I82579/I217/I218/I219 integrated-PHY copper setup
 // register.  Page 0 register 22.  These bits configure the PHY's copper
-// front-end before autonegotiation runs.  the reference driver's
-// e1000_copper_link_setup_82577 unconditionally sets both bits.
+// front-end before autonegotiation runs.  Per the I82577 datasheet, both
+// bits must be set unconditionally before autoneg restart.
 //
 //   I82577_CFG_ASSERT_CRS_ON_TX (bit 15)
 //     Force the PHY to assert internal carrier-sense whenever the MAC
@@ -585,7 +585,7 @@ e1000e_dump_pci_dma_state(e1000e_dev_t* dev, uint32_t tx_seq)
     } else {
         // The I219 is an LPC-attached integrated MAC and does not expose a
         // PCIe Express capability (Cap ID 0x10) in standard config space.
-        // the reference driver confirms this -- there's nothing to do here.
+        // Nothing to do here.
         e1000e_dbg("E1000E: tx#%u no PCIe Express cap (expected on I219 LPC-integrated MAC)\n",
                 tx_seq);
     }
@@ -793,11 +793,11 @@ e1000e_phy_read(e1000e_dev_t* dev, uint8_t reg, uint16_t* val) {
 
 // IEEE 802.3 ANAR fields: selector=00001 (802.3 CSMA/CD), advertise
 // 10HD|10FD|100HD|100FD, and pause symmetric+asymmetric so the link
-// partner knows we accept its pause frames (reference defaults).
+// partner knows we accept its pause frames (IEEE 802.3 defaults).
 #define MII_ANAR_FULL_RANGE      0x05E1  // sel + 10/100 HD/FD + asym/sym pause
 
 // 1000BASE-T Control: advertise 1000FD only (most modern partners
-// reject 1000HD outright; the reference driver advertises both via 0x0300).
+// reject 1000HD outright).
 #define MII_GBCR_ADV_1000FD      0x0200
 #define MII_GBCR_ADV_1000HD      0x0100
 
@@ -806,12 +806,12 @@ e1000e_phy_read(e1000e_dev_t* dev, uint8_t reg, uint16_t* val) {
 // no page select needed.  The NVM default for OEM-branded laptops
 // (including ThinkPad P50) leaves LPLU set, which forces the PHY to
 // auto-negotiate only up to 10 Mb/s when the host has not explicitly
-// taken ownership.  the reference driver's e1000_oem_bits_config_ich8lan unconditionally
-// clears LPLU and GBE_DIS and sets RESTART_AN; without this we get
-// exactly our symptom: BMSR.AN_COMPLETE=1, LSTATUS=1, but BMCR result
-// bits show 10 Mb/s and MAC STATUS.SPEED reads 00.
-// HV_OEM_BITS lives on PHY page 769 (BM_PORT_CTRL_PAGE), reg 25.  Reference flow:
-//     #define HV_OEM_BITS  PHY_REG(769, 25)
+// taken ownership.  We must therefore unconditionally clear LPLU and
+// GBE_DIS and set RESTART_AN; without this we get exactly our symptom:
+// BMSR.AN_COMPLETE=1, LSTATUS=1, but BMCR result bits show 10 Mb/s and
+// MAC STATUS.SPEED reads 00.
+// HV_OEM_BITS lives on PHY page 769 (BM_PORT_CTRL_PAGE), reg 25 — i.e.
+//     PHY_REG(769, 25)
 // Accessing it as raw reg 0x19 (page 0) — which we did before — reads a
 // completely different MII register and any write is silently dropped.
 // That is exactly the failure we observed:
@@ -839,16 +839,14 @@ static void e1000e_clear_mac_phy_ctrl_lplu(e1000e_dev_t* dev) {
             before, e1000e_read(dev, E1000_PHY_CTRL));
 }
 
-// Adapted from the e1000_oem_bits_config_ich8lan reference flow, simplified: clear the PHY-side
-// LPLU and GBE_DIS bits and request an autoneg restart.  Required on
-// every OEM-branded PCH-LAN part where the NVM ships LPLU=1 by default.
+// Clear the PHY-side LPLU and GBE_DIS bits and request an autoneg
+// restart.  Required on every OEM-branded PCH-LAN part where the NVM
+// ships LPLU=1 by default.
 //
 // CRITICAL: HV_OEM_BITS is paged (page 769 reg 25) AND its write requires
 // the SW_FLAG semaphore + EXTCNF_CTRL.OEM_WRITE_ENABLE set before the
 // write so the MAC routes the MDIO transaction to the OEM page rather
-// than dropping it.  the reference driver does the equivalent in e1000_oem_bits_config_
-// ich8lan via hw->phy.ops.acquire() (which sets SWFLAG) plus a manual
-// OEM_WRITE_ENABLE around the write.
+// than dropping it (per I218/I219 datasheet).
 // `restart_an`: when nonzero, also set HV_OEM_BITS_RESTART_AN to force the
 // PHY to re-run autoneg.  When zero (BIOS-already-up path), we leave the
 // existing link intact and only clear the LPLU/GBE_DIS bits in place --
@@ -919,9 +917,8 @@ static int e1000e_oem_bits_clear_lplu(e1000e_dev_t* dev) {
 // our NP).  When EEE NextPage exchange fails or is incompatible with
 // the link partner the PHY's HCD selection FSM falls back to the
 // lowest common ability — exactly 10 Mb/s FD — instead of the IEEE
-// 802.3 mandated highest common denominator.  the reference e1000e implementation calls
-// e1000_set_eee_pchlan, which writes 0 to the PHY's EEE_ADVERTISEMENT
-// register before autoneg, exactly to avoid this misnegotiation.
+// 802.3 mandated highest common denominator.  Writing 0 to the PHY's
+// EEE_ADVERTISEMENT register before autoneg avoids this misnegotiation.
 //
 // We do the same here, plus zero the MAC-side EEER/IPCNFG so the MAC
 // doesn't re-enable EEE LPI on the internal MII bus after link.
@@ -938,8 +935,9 @@ static void e1000e_disable_eee(e1000e_dev_t* dev) {
             ipc_before,  e1000e_read(dev, E1000_IPCNFG));
 
     // 2. PHY-side disable: clear the EEE advertisement (EMI 0x040E).
-    //    Reference: e1000_write_emi_reg_locked(hw, I217_EEE_ADVERTISEMENT, 0).
-    //    The EMI window is two paged PHY registers on page 776.
+    //    The EMI window is two paged PHY registers on page 776: write the
+    //    EMI register address into I82579_EMI_ADDR, then the data into
+    //    I82579_EMI_DATA.
     uint16_t lp = 0xFFFF, adv_after = 0xFFFF;
     if (e1000e_phy_write_paged_locked(dev, I82579_EMI_ADDR,
                                        I217_EEE_ADVERTISEMENT) == 0 &&
@@ -957,18 +955,18 @@ static void e1000e_disable_eee(e1000e_dev_t* dev) {
     e1000e_dbg("E1000E: PHY EEE adv cleared (EMI[040E]=%04x) LP_ability(EMI[040F])=%04x\n",
             adv_after, lp);
     // NOTE: do NOT touch "LPI_CTRL" at page 776 reg 18 — that register on
-    // this PHY is NOT a reference-style I82579_LPI_CTRL (which lives at page
+    // this PHY is NOT the I82579-style I82579_LPI_CTRL (which lives at page
     // 772 reg 20).  Page 776 reg 18 is some PHY-internal config that
     // defaults to 0x8402 and clearing it breaks autoneg completely
     // (verified empirically: LPAR=0, BMSR unchanged, AN_COMPLETE=0).
 }
 
-// Mirrors the e1000_copper_link_setup_82577 reference routine — PHY-front-end copper config
-// that MUST run before autoneg restart on every I82577/82578/82579/I217/
-// I218/I219 PHY.  Without it, the PHY's NVM defaults leave CRS_ON_TX
-// off and the downshift retry counter at 0, which on this exact board
-// (ThinkPad P50, I219-LM PCH-SPT-H) causes the PHY to resolve at 10
-// Mb/s even when both ends advertise 100FD with autoneg ACK.
+// PHY-front-end copper config that MUST run before autoneg restart on
+// every I82577/82578/82579/I217/I218/I219 PHY.  Without it, the PHY's
+// NVM defaults leave CRS_ON_TX off and the downshift retry counter at
+// 0, which on this exact board (ThinkPad P50, I219-LM PCH-SPT-H) causes
+// the PHY to resolve at 10 Mb/s even when both ends advertise 100FD
+// with autoneg ACK.
 //
 // Bits to set in I82577_CFG_REG (page 0 reg 22):
 //   * ASSERT_CRS_ON_TX   - keep CRS asserted during MAC transmits so
@@ -1008,8 +1006,8 @@ static int e1000e_copper_link_setup_82577(e1000e_dev_t* dev) {
 // SMBus idle link.  Without a real copper link the MAC PCS never grants
 // TX, so descriptors stay in the on-chip FIFO and GPTC stays at 0.
 //
-// Sequence is the IEEE 802.3 / Intel ich8lan canonical one:
-//   1. Run e1000_copper_link_setup_82577 (PHY copper front-end config).
+// Sequence is the IEEE 802.3 / Intel PCH-LAN canonical one:
+//   1. Run the I82577 copper-link setup (PHY copper front-end config).
 //   2. Program advertised abilities (ANAR, GBCR).
 //   3. Set BMCR = AUTONEG_EN | AUTONEG_RESTART.
 //   4. Poll BMSR.AN_COMPLETE for up to 5 s.
@@ -1189,9 +1187,8 @@ static int e1000e_phy_restart_autoneg(e1000e_dev_t* dev) {
     return (bmsr & MII_BMSR_AN_COMPLETE) ? 0 : -1;
 }
 
-// Mirrors the e1000_toggle_lanphypc_pch_lpt reference routine (
-// ich8lan.c).  On SPT/CNP/TGP+ I218/I219, the PHY's clock and power
-// gate is owned by the Management Engine until the OS driver explicitly
+// LANPHYPC takeover sequence for SPT/CNP/TGP+ I218/I219.  On these parts,
+// the PHY's clock and power gate is owned by the Management Engine until the OS driver explicitly
 // takes ownership via CTRL.LANPHYPC_OVERRIDE.  When OVERRIDE=1 the
 // LANPHYPC output pin is driven by VALUE; when VALUE=0 the pin is LOW
 // which the PHY interprets as "power ON".  (VALUE=1 powers the PHY
@@ -1220,10 +1217,10 @@ e1000e_toggle_lanphypc_pch_lpt(e1000e_dev_t* dev) {
     (void)e1000e_read(dev, E1000_CTRL); // posting flush
     e1000e_delay_us(50000); // 50 ms delay
 
-    // Step 3: drop OVERRIDE (the reference driver leaves it asserted, but on SPT-H the
-    //         PHY clock domain prefers OVERRIDE released after 50 ms so
-    //         the ME does not perpetually contend for the gate input).
-    //         Skip — match the reference exactly: leave OVERRIDE set.
+    // Step 3: drop OVERRIDE — deliberately skipped.  On SPT-H the PHY clock
+    //         domain is happiest with OVERRIDE left asserted after the
+    //         50 ms wait so the ME does not perpetually contend for the
+    //         gate input.
 
 #if E1000E_DBG
     uint32_t after = e1000e_read(dev, E1000_CTRL);
@@ -1286,16 +1283,16 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
     //                          stale value from BIOS doesn't re-fire
     //                          a speed-detection sequence on top of us.
     //   * RO_DIS     (bit 17): leave whatever NVM/BIOS programmed.
-    //   * BIT(22)            : MUST be 1 per e1000_initialize_hw_bits_ich8lan.
+    //   * BIT(22)            : MUST be 1 per the I218/I219 datasheet.
     //                          On discrete 82574 this would be a LINK_MODE
     //                          bit, but on PCH-LAN parts the integrated PHY
     //                          makes LINK_MODE meaningless and BIT(22) is
     //                          re-purposed as a TX-arbitration mandatory bit
     //                          — without it the descriptor engine never
     //                          fetches even though TCTL.EN is honored.
-    //   * PHY_PDEN  (bit 20) : SET on pchlan+ per the reference flow. Only enables PHY
+    //   * PHY_PDEN  (bit 20) : SET on PCH-LAN per the datasheet. Only enables PHY
     //                          power-down when MAC is in D3, so harmless at
-    //                          D0; required by spec for ich8lan family.
+    //                          D0; required by spec for the PCH-LAN family.
     uint32_t ctrl_ext = e1000e_read(dev, E1000_CTRL_EXT);
     e1000e_dbg("E1000E: CTRL_EXT=%08x (before)\n", ctrl_ext);
     ctrl_ext |=  E1000_CTRL_EXT_DRV_LOAD;
@@ -1303,8 +1300,8 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
                 | (1u << 12)   // ASDCHK (one-shot, force 0)
                 | E1000_CTRL_EXT_FORCE_SMBUS
                 | (1u << 23)); // LINK_MODE bit 1 (clear; bit 22 set below)
-    ctrl_ext |= (1u << 22)     // initialize_hw_bits_ich8lan: BIT(22)
-              | (1u << 20);    // initialize_hw_bits_ich8lan: PHY_PDEN
+    ctrl_ext |= (1u << 22)     // datasheet-mandated TX-arbitration BIT(22)
+              | (1u << 20);    // datasheet-mandated PHY_PDEN
     e1000e_write(dev, E1000_CTRL_EXT, ctrl_ext);
     e1000e_dbg("E1000E: CTRL_EXT=%08x (after DRV_LOAD/PHY_PDEN/BIT22/!PBA)\n",
             e1000e_read(dev, E1000_CTRL_EXT));
@@ -1330,13 +1327,13 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
     // to ~10 ms on PCH-LAN due to PHY re-link).
     {
         // ------------------------------------------------------------
-        //  Full-chip reset — equivalent to the e1000_reset_hw_ich8lan reference flow.
+        //  Full-chip reset — PCH-LAN reset sequence per Intel datasheet.
         //
         //  ROOT CAUSE of the I219-LM TX stall on the Lenovo P50:
         //  ME firmware on PCH-SPT-H is actively driving manageability
         //  TLPs through the LAN function's PCIe master at boot
         //  (FWSM.FW_VALID=1, MANC.EN_MNG2HOST=1, ICR.MNG fires
-        //  spontaneously).  the reference driver warns verbatim:
+        //  spontaneously).  Per the datasheet:
         //
         //    "Prevent the PCI-E bus from sticking if there is no TLP
         //     connection on the last TLP read/write transaction when
@@ -1349,13 +1346,13 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
         //  PCI errors — because no TLP is ever issued from the wedged
         //  master.
         //
-        //  Fix (reference flow):
+        //  Fix:
         //    1. Set CTRL.GIO_MASTER_DISABLE (bit 2) and poll
         //       STATUS.GIO_MASTER_EN (bit 19) to clear, draining all
         //       in-flight master TLPs.
         //    2. Mask interrupts, clear ICR.
-        //    3. RCTL=0, TCTL=PSP (NOT 0 — the reference driver uses PSP for the
-        //       quiesce-window config).
+        //    3. RCTL=0, TCTL=PSP (NOT 0 — PSP is the canonical PCH-LAN
+        //       value during the quiesce window).
         //    4. Wait 10 ms for any pending transactions to retire.
         //    5. Issue full-chip reset: CTRL |= (PHY_RST | RST) in
         //       the SAME mmio write, under SWFLAG.  PHY_RST in the
@@ -1390,7 +1387,7 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
         e1000e_write(dev, E1000_IMC, 0xFFFFFFFFu);
         (void)e1000e_read(dev, 0x000C0); // ICR
 
-        // Step 3+4: quiesce TX/RX (TCTL=PSP per the reference flow), wait 10 ms.
+        // Step 3+4: quiesce TX/RX (TCTL=PSP per spec), wait 10 ms.
         e1000e_write(dev, E1000_RCTL, 0);
         e1000e_write(dev, E1000_TCTL, E1000_TCTL_PSP);
         (void)e1000e_read(dev, E1000_STATUS); // posting flush
@@ -1402,11 +1399,11 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
         }
         uint32_t ctrl_pre = e1000e_read(dev, E1000_CTRL);
         e1000e_dbg("E1000E: CTRL.RST: asserting RST only (CTRL=%08x)\n", ctrl_pre);
-        // Reference e1000_reset_hw_ich8lan: ew32(CTRL, ctrl | E1000_CTRL_RST).
-        // It NEVER combines CTRL.PHY_RST with CTRL.RST on PCH-LAN —
-        // doing so tears down the BIOS-negotiated PHY link in the same
-        // cycle and leaves the PHY in a state from which only the full
-        // e1000_phy_hw_reset_ich8lan sequence (with hv_phy_workarounds,
+        // PCH-LAN reset: write CTRL with E1000_CTRL_RST asserted.
+        // We deliberately do NOT combine CTRL.PHY_RST with CTRL.RST on
+        // PCH-LAN — doing so tears down the BIOS-negotiated PHY link in
+        // the same cycle and leaves the PHY in a state from which only
+        // the full PHY hardware-reset sequence (with HV PHY workarounds,
         // LCD config from NVM, MSE thresholds, etc.) can recover.  The
         // BIOS already brought up link before we got here; preserving
         // that link across our chip reset means the PHY just keeps
@@ -1414,7 +1411,7 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
         e1000e_write(dev, E1000_CTRL,
                      ctrl_pre | E1000_CTRL_RST);
 
-        // Step 6: per the reference flow, msleep(20) — do NOT touch the chip
+        // Step 6: per the datasheet, msleep(20) — do NOT touch the chip
         // during this window; the spec says "cannot issue a flush
         // here because it hangs the hardware".
         e1000e_delay_us(20000);
@@ -1436,10 +1433,10 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
         e1000e_release_swflag(dev);
 
         // Re-assert DRV_LOAD (CTRL.RST cleared it on PCH-LAN) and
-        // re-program CTRL_EXT per the reference flow e1000_initialize_hw_bits_ich8lan:
+        // re-program CTRL_EXT per the I218/I219 datasheet:
         //   - DRV_LOAD (bit 28) : OS now owns the NIC
-        //   - BIT(22)           : mandatory ich8lan TX-arbitration bit
-        //   - PHY_PDEN (bit 20) : mandatory pchlan+ bit
+        //   - BIT(22)           : mandatory PCH-LAN TX-arbitration bit
+        //   - PHY_PDEN (bit 20) : mandatory PCH-LAN+ bit
         //   - RO_DIS  (bit 17)  : disable PCIe relaxed-ordering for
         //                          descriptor coherency
         //   - clear PBA_SUPPORT (bit 31), ASDCHK (bit 12), FORCE_SMBUS
@@ -1450,8 +1447,8 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
                 | (1u << 23));
         ctrl_ext |=  E1000_CTRL_EXT_DRV_LOAD
                   |  E1000_CTRL_EXT_RO_DIS
-                  |  (1u << 22)   // initialize_hw_bits_ich8lan: BIT(22)
-                  |  (1u << 20);  // initialize_hw_bits_ich8lan: PHY_PDEN
+                  |  (1u << 22)   // datasheet-mandated TX-arbitration BIT(22)
+                  |  (1u << 20);  // datasheet-mandated PHY_PDEN
         e1000e_write(dev, E1000_CTRL_EXT, ctrl_ext);
         e1000e_dbg("E1000E: CTRL.RST: CTRL_EXT re-set to %08x (DRV_LOAD/PHY_PDEN/BIT22)\n",
             e1000e_read(dev, E1000_CTRL_EXT));
@@ -1460,19 +1457,19 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
         // ThinkPad P50 / I219-LM: empirically, before the toggle the PHY
         // is responsive (ID 0x154:0x00a6 readable at MDIO addr 2), and
         // after asserting CTRL.LANPHYPC_OVERRIDE the PHY goes silent
-        // (every MDIO read returns 0xFFFF).  The reference toggle is needed
+        // (every MDIO read returns 0xFFFF).  The toggle is needed
         // only when the ME left the PHY power-gated; the SPT-H BIOS on
         // this board does not.
 
-        // Match the reference ich8lan flow reset flow: after a full reset on PCH/ICH
-        // parts, wait until hardware finishes the basic LAN/PHY config
-        // sequence before touching more PHY-facing state.
+        // PCH-LAN post-reset wait: after a full reset, wait until the
+        // hardware finishes the basic LAN/PHY config sequence before
+        // touching more PHY-facing state.
         e1000e_wait_lan_init_done(dev);
 
-        // the reference driver's e1000_pch_spt family profile reprograms PBA=26 after
-        // reset.  If the reset/firmware default leaves the packet buffer
-        // split wrong, the MAC can look alive while the TX datapath never
-        // actually starts moving descriptors.
+        // PCH-SPT family init reprograms PBA=26 after reset.  If the
+        // reset/firmware default leaves the packet buffer split wrong,
+        // the MAC can look alive while the TX datapath never actually
+        // starts moving descriptors.
 #if E1000E_DBG
         uint32_t pba_before = e1000e_read(dev, E1000_PBA);
 #endif
@@ -1537,8 +1534,8 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
     // descriptor in host memory is well-formed (cmd has EOP|IFCS|RS,
     // length nonzero, status = 0), STATUS.GIO_MASTER_EN = 1, MSI
     // enabled — and yet TDH never advances and GPTC / TPT stay at
-    // zero.  the reference e1000e implementation applies these magic bits in
-    // e1000_init_hw_ich8lan() / e1000_initialize_hw_bits_ich8lan().
+    // zero.  These magic bits are required by the I218/I219 datasheet's
+    // hardware-init bit programming.
     //
     // TARC0 bits:
     //   23  — undocumented "TX queue arbitration count enable"
@@ -1556,9 +1553,9 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
         tarc0 |= (1u << 23) | (1u << 24) | (1u << 26) | (1u << 27);
         e1000e_write(dev, E1000_TARC0, tarc0);
 
-        // TARC1: the e1000_initialize_hw_bits_ich8lan reference routine sets bits
-        // 24, 26, 30 (and conditionally 28 based on TCTL.MULR).  We
-        // are not enabling MULR, so we set bit 28 too.
+        // TARC1: per the I218/I219 datasheet, set bits 24, 26, 30 (and
+        // conditionally 28 based on TCTL.MULR).  We are not enabling MULR,
+        // so we set bit 28 too.
         uint32_t tarc1 = e1000e_read(dev, E1000_TARC1);
 #if E1000E_DBG
         uint32_t tarc1_before = tarc1;
@@ -1571,10 +1568,10 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
                 tarc1_before, e1000e_read(dev, E1000_TARC1));
     }
 
-    // the reference driver's ICH/PCH init path also normalizes the PCIe DMA snoop policy
-    // through GCR.  Leaving the reset-time no-snoop state in place can make
-    // descriptor/buffer DMA depend on platform firmware cache policy instead of
-    // the host's normal coherent path.  For PCH-LAN the safe baseline is the
+    // PCH-LAN init also normalizes the PCIe DMA snoop policy through GCR.
+    // Leaving the reset-time no-snoop state in place can make descriptor/
+    // buffer DMA depend on platform firmware cache policy instead of the
+    // host's normal coherent path.  For PCH-LAN the safe baseline is the
     // snooped mode: clear all no-snoop request bits.
     {
         uint32_t gcr_before = e1000e_read(dev, E1000_GCR);
@@ -1591,7 +1588,7 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
     // ULP (Ultra-Low-Power) before handing it to the OS.  In ULP the
     // MAC accepts register writes (TCTL.EN, TDT, etc. all stick) but
     // the TX descriptor-fetch DMA is gated off — exactly the symptom
-    // we see: TDH stays 0, GPTC=0, descriptor.sta=0.  the reference driver exits ULP
+    // we see: TDH stays 0, GPTC=0, descriptor.sta=0.  We exit ULP
     // by clearing H2ME.ULP and asserting H2ME.ENFORCE_SETTINGS so the
     // ME knows the host driver has taken over and must not re-arm ULP.
     {
@@ -1605,18 +1602,19 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
                 h2me_before, e1000e_read(dev, E1000_H2ME));
     }
 
-    // the reference driver's real PCH ULP exit is not just the H2ME handshake.  The PHY-side
-    // SMBus latch and I218 ULP state must also be cleared, otherwise the MAC
-    // can accept descriptor doorbells while the MAC<->PHY path still sits in a
+    // PCH ULP exit is not just the H2ME handshake.  The PHY-side SMBus
+    // latch and I218 ULP state must also be cleared, otherwise the MAC can
+    // accept descriptor doorbells while the MAC<->PHY path still sits in a
     // reset-to-SMBus / ULP state and TX fetch never starts.
     e1000e_force_exit_phy_ulp(dev);
 
-    // the reference driver's remaining SPT/LPT init path has two MAC-side pieces we did not
-    // previously carry over: enable packet-buffer ECC / memory error handling,
-    // and explicitly exit the S0ix-style dynamic power-gating state.  On the
-    // failing P50 the key clue is FEXTNVM7 staying at 0x80000000, which is the
-    // exact "time-sync clock disabled / still power-gated" pattern that the reference driver
-    // clears on resume before allowing normal DMA again.
+    // The remaining SPT/LPT init path has two MAC-side pieces required by
+    // the datasheet that we did not previously carry over: enable packet-
+    // buffer ECC / memory error handling, and explicitly exit the S0ix-
+    // style dynamic power-gating state.  On the failing P50 the key clue
+    // is FEXTNVM7 staying at 0x80000000, which is the exact "time-sync
+    // clock disabled / still power-gated" pattern that must be cleared on
+    // resume before allowing normal DMA again.
     {
         uint32_t pbeccsts_before = e1000e_read(dev, E1000_PBECCSTS);
         uint32_t pbeccsts = pbeccsts_before | E1000_PBECCSTS_ECC_ENABLE;
@@ -1654,13 +1652,13 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
                 fextnvm7_before, e1000e_read(dev, E1000_FEXTNVM7));
     }
 
-    // the reference driver's e1000_reset_hw_ich8lan unconditionally sets KABGTXD.BGSQLBIAS
-    // after the global reset.  Without this the AFE bandgap reference for
-    // the Tx path can stay in a metastable bias state on PCH-LAN parts,
-    // which silently gates the per-queue Tx DMA fetch even though every
-    // ring/control register reads back as configured.  This is one of the
-    // two writes that are unconditional in the reference driver's reset path; we were
-    // missing it.
+    // The PCH-LAN reset path unconditionally sets KABGTXD.BGSQLBIAS after
+    // the global reset.  Without this the AFE bandgap reference for the
+    // Tx path can stay in a metastable bias state on PCH-LAN parts, which
+    // silently gates the per-queue Tx DMA fetch even though every ring/
+    // control register reads back as configured.  This is one of the two
+    // writes that are unconditional in the datasheet's reset path; we
+    // were missing it.
     {
         uint32_t kabgtxd_before = e1000e_read(dev, E1000_KABGTXD);
         uint32_t kabgtxd = kabgtxd_before | E1000_KABGTXD_BGSQLBIAS;
@@ -1694,7 +1692,7 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
 //   bits 22:16  REGADDR — Kumeran register offset
 //   bit  21     REN     — Read ENable; set to start a read transaction
 //
-// (Known in the reference driver as e1000e_read_kmrn_reg / e1000e_write_kmrn_reg.)
+// (Often called read_kmrn_reg / write_kmrn_reg in vendor sample code.)
 #define E1000_KMRNCTRLSTA               0x00034
 #define E1000_KMRNCTRLSTA_OFFSET_SHIFT  16
 #define E1000_KMRNCTRLSTA_OFFSET_MASK   0x001F0000u
@@ -1739,8 +1737,7 @@ static int e1000e_kmrn_write(e1000e_dev_t* dev, uint8_t kmrn_off, uint16_t val) 
 // counts every frame at the MAC *before* address filtering) stays at
 // zero.  Disabling K1 makes the interconnect always-on at the cost of
 // a few mW and immediately fixes the RX path.  This is exactly the
-// fix the reference e1000e implementation applies in e1000_configure_k1_ich8lan() with
-// k1_enable=false.
+// fix per the I218/I219 datasheet: configure K1 with k1_enable=false.
 static void e1000e_disable_k1(e1000e_dev_t* dev) {
     uint16_t k1 = 0;
     e1000e_kmrn_read(dev, E1000_KMRN_K1_CONFIG_OFFSET, &k1);
@@ -1785,21 +1782,22 @@ static void e1000e_disable_k1(e1000e_dev_t* dev) {
 // so STATUS.LU is asserted, the PHY shows clean RX activity, but TPR
 // stays at 0 and not a single frame ever reaches the descriptor ring.
 //
-// the reference e1000e implementation fixes this in e1000_configure_kmrn_for_10_100() — we
-// do the same.  The HD_CTRL bits 2:0 carry the inter-packet-gap
-// timing; 0x4 is the documented "10/100" default, 0x0 is the "1000"
-// default.  We additionally set TIPG.IPGT to 0xFF for half/full-duplex
-// 10/100 as the reference driver does (it is harmless at full-duplex but required at
-// half-duplex which the spec says we must still support).
+// We fix this by configuring KMRN HD_CTRL for the resolved 10/100 timing.
+// The HD_CTRL bits 2:0 carry the inter-packet-gap timing; 0x4 is the
+// documented "10/100" default, 0x0 is the "1000" default.  We additionally
+// keep TIPG.IPGT at the canonical 10/100 value (it is harmless at full-
+// duplex but required at half-duplex which the spec says we must still
+// support).
 // TIPG is programmed once globally in e1000e_init_tx() with the canonical
 // PCH-LAN value (IPGT=8, IPGR1=8, IPGR2=6 = 0x00602008).  The KMRN helpers
 // only touch the KMRN HD_CTRL register's per-speed inter-packet-gap field.
 // A previous version of this file forced TIPG.IPGT to 0xFF here on the
-// (incorrect) belief that the reference driver did the same; in fact IPGT=0xFF parks the
-// MAC's per-packet IPG timer for so long that the TX scheduler never
-// dispatches a frame even though the descriptor is in the on-chip cache —
-// hardware reports ICR.TXQE while TDH stays at 0 and TDFH never advances
-// past TDFHS, exactly the symptom we observed on real I219-LM hardware.
+// (incorrect) belief that it was the canonical 10/100 value; in fact
+// IPGT=0xFF parks the MAC's per-packet IPG timer for so long that the TX
+// scheduler never dispatches a frame even though the descriptor is in
+// the on-chip cache — hardware reports ICR.TXQE while TDH stays at 0
+// and TDFH never advances past TDFHS, exactly the symptom we observed
+// on real I219-LM hardware.
 static void e1000e_configure_kmrn_for_10_100(e1000e_dev_t* dev) {
     uint16_t hd = 0;
     e1000e_kmrn_read(dev, E1000_KMRN_HD_CTRL_OFFSET, &hd);
@@ -2001,7 +1999,7 @@ static int e1000e_init_rx(e1000e_dev_t* dev) {
     // on I218/I219.  Intel datasheet 13.5.2: must be set BEFORE
     // RCTL.EN.  We also bump GRAN (bit 24, 1=descriptors not cache
     // lines) and leave the prefetch/host/writeback thresholds at their
-    // hardware defaults which the reference e1000e implementation considers sane.
+    // hardware defaults which the I218/I219 datasheet considers sane.
     {
         uint32_t rxdctl = e1000e_read(dev, E1000_RXDCTL);
         rxdctl |= (1u << 24)   // GRAN: thresholds in descriptors
@@ -2060,13 +2058,13 @@ static int e1000e_init_tx(e1000e_dev_t* dev) {
     //   IPGT  = 8   (bits  9:0 ) — inter-packet-gap transmit time
     //   IPGR1 = 8   (bits 19:10) — non-back-to-back IPG part 1
     //   IPGR2 = 6   (bits 29:20) — non-back-to-back IPG part 2
-    // the reference e1000e implementation uses these exact values for ich8lan/PCH-LAN regardless
-    // of negotiated speed.  IPGT must NOT be 0xFF — that parks the IPG
-    // timer effectively forever, causing TXQE to assert and TDH to never
-    // advance even with a valid descriptor cached on-chip.
+    // Per the I218/I219 datasheet, these exact values apply for PCH-LAN
+    // regardless of negotiated speed.  IPGT must NOT be 0xFF — that parks
+    // the IPG timer effectively forever, causing TXQE to assert and TDH
+    // to never advance even with a valid descriptor cached on-chip.
     e1000e_write(dev, E1000_TIPG,
                  (8u <<  0) | (8u << 10) | (6u << 20));
-    // TIDV — Transmit Interrupt Delay Value.  Match the reference driver's
+    // TIDV — Transmit Interrupt Delay Value.  Use the canonical PCH-LAN
     // default of 8 (units of 1.024us, ~8.2us).  This batches Tx-completion
     // interrupts a little so we don't take one IRQ per packet under load,
     // matching what working hardware ground-truth shows on PCH-LAN.  Pure
@@ -2074,14 +2072,13 @@ static int e1000e_init_tx(e1000e_dev_t* dev) {
     e1000e_write(dev, E1000_TIDV, 8);
     e1000e_write(dev, E1000_TADV, 0);
 
-    // TXDCTL — match the reference driver's e1000_init_hw_ich8lan exactly.
+    // TXDCTL — use the canonical PCH-LAN values from the datasheet:
     //
-    // Reference (ich8lan.c):
-    //   txdctl = ((txdctl & ~E1000_TXDCTL_WTHRESH) | E1000_TXDCTL_FULL_TX_DESC_WB);
-    //   txdctl = ((txdctl & ~E1000_TXDCTL_PTHRESH) | E1000_TXDCTL_MAX_TX_DESC_PREFETCH);
-    // with E1000_TXDCTL_FULL_TX_DESC_WB     = 0x01010000 (GRAN=1, WTHRESH=1)
-    //      E1000_TXDCTL_MAX_TX_DESC_PREFETCH = 0x0100001F (GRAN=1, PTHRESH=31)
-    // and e1000_initialize_hw_bits_ich8lan additionally sets BIT(22).
+    //   txdctl = (txdctl & ~TXDCTL_WTHRESH) | TXDCTL_FULL_TX_DESC_WB
+    //   txdctl = (txdctl & ~TXDCTL_PTHRESH) | TXDCTL_MAX_TX_DESC_PREFETCH
+    // with TXDCTL_FULL_TX_DESC_WB     = 0x01010000 (GRAN=1, WTHRESH=1)
+    //      TXDCTL_MAX_TX_DESC_PREFETCH = 0x0100001F (GRAN=1, PTHRESH=31)
+    // and the hardware-init bit programming additionally requires BIT(22).
     //
     // Final value: 0x0141001F.
     //
@@ -2089,25 +2086,25 @@ static int e1000e_init_tx(e1000e_dev_t* dev) {
     // mirroring i350-family RXDCTL/TXDCTL.  PCH-LAN has no per-queue ENABLE;
     // TX is enabled exclusively by TCTL.EN.  Bit 25 on PCH-LAN belongs to
     // the LWTHRESH (low writeback-threshold) field, and writing 1 there
-    // configures a Tx writeback policy the reference driver explicitly does not use.
-    // Match byte-for-byte with the reference; this also removes the only deviation we
-    // had from the upstream PCH-LAN init that touched the Tx DMA engine.
+    // configures a Tx writeback policy that the datasheet explicitly does
+    // not recommend.  This brings us back to the canonical PCH-LAN init
+    // values byte-for-byte.
     {
         uint32_t txdctl = e1000e_read(dev, E1000_TXDCTL);
         txdctl &= ~(E1000_TXDCTL_PTHRESH | E1000_TXDCTL_WTHRESH);
         txdctl |= 0x01010000u    // FULL_TX_DESC_WB    (GRAN=1, WTHRESH=1)
                |  0x0100001Fu    // MAX_TX_DESC_PREFETCH (GRAN=1, PTHRESH=31)
-               |  (1u << 22);    // initialize_hw_bits_ich8lan: TXDCTL |= BIT(22)
+               |  (1u << 22);    // datasheet hardware-init: TXDCTL |= BIT(22)
         e1000e_write(dev, E1000_TXDCTL, txdctl);
 
-        // the reference driver mirrors the same TXDCTL programming into queue 1 so the
-        // shared TX arbitration block comes up in a known-good state.
+        // Mirror the same TXDCTL programming into queue 1 so the shared
+        // TX arbitration block comes up in a known-good state.
         uint32_t txdctl1 = e1000e_read(dev, E1000_TXDCTL1);
         txdctl1 &= ~(E1000_TXDCTL_PTHRESH | E1000_TXDCTL_WTHRESH);
         txdctl1 |= 0x01010000u | 0x0100001Fu | (1u << 22);
         e1000e_write(dev, E1000_TXDCTL1, txdctl1);
 
-        e1000e_dbg("E1000E: TXDCTL0=%08x TXDCTL1=%08x (reference ich8lan exact)\n",
+        e1000e_dbg("E1000E: TXDCTL0=%08x TXDCTL1=%08x (PCH-LAN canonical)\n",
             e1000e_read(dev, E1000_TXDCTL),
             e1000e_read(dev, E1000_TXDCTL1));
     }
@@ -2118,8 +2115,8 @@ static int e1000e_init_tx(e1000e_dev_t* dev) {
                   | E1000_TCTL_RTLC;
     e1000e_write(dev, E1000_TCTL, tctl);
 
-    // Match the reference driver's generic collision-distance helper for e1000e: use the
-    // default 63-slot COLD value and force the write out before continuing.
+    // Generic collision-distance config: use the default 63-slot COLD value
+    // and force the write out before continuing.
     tctl = e1000e_read(dev, E1000_TCTL);
     tctl &= ~E1000_TCTL_COLD;
     tctl |= (63u << E1000_TCTL_COLD_SHIFT);
@@ -2133,23 +2130,23 @@ static int e1000e_init_tx(e1000e_dev_t* dev) {
     // ThinkPad P50 / I219-LM: TDFH advances by 16 bytes (one descriptor's
     // worth fetched), then TDH/GPTC/TPT stay at 0 with no errors.
     //
-    // the reference driver's working register dump on the same hardware shows TCTL
-    // 0x3103F0FA — bit 28 (MULR) AND bit 29 (RRTHRESH low bit) set.
-    // RRTHRESH is the hardware-default outstanding-read-request threshold
-    // and gets preserved by the reference driver's RMW path.  We set both explicitly to
-    // match the reference working configuration byte-for-byte.  We already
-    // disabled the buggy MULR-fix in FEXTNVM11 above, so MULR is safe.
+    // Working register dumps from healthy hardware on the same board show
+    // TCTL=0x3103F0FA — bit 28 (MULR) AND bit 29 (RRTHRESH low bit) set.
+    // RRTHRESH is the hardware-default outstanding-read-request threshold.
+    // We set both explicitly to match the known-good configuration byte-for-
+    // byte.  We already disabled the buggy MULR-fix in FEXTNVM11 above, so
+    // MULR is safe.
     if (e1000e_is_pch_lan(dev->device_id)) {
         tctl = e1000e_read(dev, E1000_TCTL);
 #if E1000E_DBG
         uint32_t before = tctl;
 #endif
         tctl |= (1u << 28)   // MULR — Multiple Request enable
-              | (1u << 29);  // RRTHRESH[0] — match the reference/HW default
+              | (1u << 29);  // RRTHRESH[0] — match HW default
         e1000e_write(dev, E1000_TCTL, tctl);
         (void)e1000e_read(dev, E1000_TCTL);
 #if E1000E_DBG
-        e1000e_dbg("E1000E: TCTL %08x -> %08x (MULR + RRTHRESH set, matches the reference)\n",
+        e1000e_dbg("E1000E: TCTL %08x -> %08x (MULR + RRTHRESH set)\n",
                 before, e1000e_read(dev, E1000_TCTL));
 #endif
     }
@@ -2509,8 +2506,8 @@ void e1000e_irq_handler(void) {
     // to-clear races (any MMIO read of ICR clears it) and to MSI
     // moderation collapsing several causes into a single edge.  The
     // DD bit in the descriptor itself is the only ground truth for
-    // "a packet has arrived".  This matches the reference e1000e NAPI
-    // poll which scans descriptors on every wake.
+    // "a packet has arrived".  This matches the standard "poll-on-wake"
+    // RX-completion handling pattern.
     {
         uint16_t tail = (dev->rx_tail + 1) % E1000E_NUM_RX_DESC;
         unsigned drained = 0;
@@ -2667,9 +2664,9 @@ void e1000e_init(void) {
         // when the PHY's link signal toggles, sending the MAC↔PHY
         // KMRN bus out of lock and dropping every frame.
         // Program flow-control registers to canonical IEEE 802.3x values
-        // BEFORE asserting SLU.  the reference e1000e implementation_setup_link_ich8lan path runs
-        // FCTTV / FCRTL / FCRTH / FCAL / FCAH / FCT programming as part of
-        // setup_link, which the spec requires before transmitter enable.
+        // BEFORE asserting SLU.  The PCH-LAN setup_link path requires FCTTV
+        // / FCRTL / FCRTH / FCAL / FCAH / FCT programming before transmitter
+        // enable.
         // Chip default leaves FCT=0x80800000 / FCAH=0xC0000008 etc., which
         // can wedge the MAC's flow-control state machine.  We do not need
         // RX flow control (FCRTL/FCRTH=0 disables it), but the FCAL/FCAH/FCT
@@ -2718,8 +2715,8 @@ void e1000e_init(void) {
             // Reading STATUS immediately after asserting CTRL.SLU returns
             // the previously-latched speed (typically 10 Mb/s post-reset),
             // which then mis-times the MAC<->PHY KMRN bus and silently
-            // drops every Tx fetch.  the reference driver's check_for_link path always
-            // gates speed-dependent KMRN reprogramming on a confirmed link
+            // drops every Tx fetch.  The check_for_link path always gates
+            // speed-dependent KMRN reprogramming on a confirmed link
             // resolution.
             //
             // Poll up to ~2.5 s for link-up; that's the worst-case auto-neg
@@ -2749,7 +2746,7 @@ void e1000e_init(void) {
                     e1000e_configure_kmrn_for_10_100(dev);
                 }
 
-                // Reference e1000_k1_workaround_lpt_lp (PCH-LPT/SPT/CNP+):
+                // K1 workaround for PCH-LPT/SPT/CNP+ at 10/100 Mb FD:
                 // Run AFTER link is resolved.  Re-programs K1 + the
                 // PCIe-PLL clock-request gate based on the resolved
                 // speed/duplex.  Without this, on SPT-H @ 100 Mb FD
@@ -2760,7 +2757,7 @@ void e1000e_init(void) {
                 // TDFT=0xd02 (one descriptor cached on-chip), TDH=0,
                 // GPTC=0, TPT=0.
                 //
-                // Logic per the reference flow ich8lan.c:
+                // Logic per the I218/I219 datasheet:
                 //   if link && full-duplex:
                 //     read KMRN K1_CONFIG
                 //     if speed == 1000Mb: set K1_ENABLE

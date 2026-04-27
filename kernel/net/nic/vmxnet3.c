@@ -385,7 +385,14 @@ static int vmxnet3_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
 static int vmxnet3_link_status(net_device_t* ndev) {
     vmxnet3_dev_t* dev = (vmxnet3_dev_t*)ndev->driver_data;
     uint32_t link = vm_cmd_get(dev, VMXNET3_CMD_GET_LINK);
-    return (link & 0x1) ? 1 : 0;
+    int now_up = (link & 0x1) ? 1 : 0;
+    int was_up = dev->link_up;
+    if (now_up != was_up) {
+        dev->link_up = now_up;
+        kprintf("VMXNET3: Link %s\n", now_up ? "UP" : "DOWN");
+        if (!now_up) dhcp_invalidate(ndev);
+    }
+    return now_up;
 }
 
 // ============================================================================
@@ -505,6 +512,7 @@ void vmxnet3_irq_handler(void) {
             if (up != dev->link_up) {
                 dev->link_up = up;
                 kprintf("VMXNET3: Link %s\n", up ? "UP" : "DOWN");
+                if (!up) dhcp_invalidate(&dev->net_dev);
             }
         }
     }
