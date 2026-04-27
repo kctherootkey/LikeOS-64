@@ -61,6 +61,25 @@ int net_device_count(void) {
     return net_device_num;
 }
 
+// Called from acpi_poweroff() before writing SLP_TYP|SLP_EN.  Each NIC
+// driver may register a shutdown() callback that masks its interrupts,
+// stops bus-master DMA, and clears any Wake-on-LAN enables.  Skipping
+// this leaves PME# / WUC asserted on PCH-LAN integrated NICs (notably
+// the I219 LOM on Lenovo business laptops), which causes the chipset
+// to refuse the S5 transition: screen goes black and fans stop, but
+// the power rail stays hot until the user presses the power button.
+void net_quiesce_for_poweroff(void) {
+    // No locking — by the time we get here, IRQs have been masked by
+    // the acpi_poweroff() caller is about to mask them, and we want
+    // to run even if the registry lock is held by some stuck path.
+    for (int i = 0; i < net_device_num; i++) {
+        net_device_t* d = net_devices[i];
+        if (d && d->shutdown) {
+            d->shutdown(d);
+        }
+    }
+}
+
 // Called from timer IRQ
 void net_timer_tick(void) {
     tcp_timer_tick();
