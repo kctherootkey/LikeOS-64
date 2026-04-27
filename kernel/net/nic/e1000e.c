@@ -98,7 +98,13 @@ static void e1000e_dbg(const char* fmt, ...) {
     __builtin_va_end(ap);
 }
 #else
-static inline void e1000e_dbg(const char* fmt, ...) { (void)fmt; }
+// When debug is off, e1000e_dbg() collapses to (void)0 via a macro so the
+// variadic arguments are NEVER evaluated at the call site.  This is critical
+// because most diagnostic calls feed live MMIO reads (e1000e_read(...)) as
+// arguments — leaving those reads in the binary would defeat the purpose of
+// disabling debug.  The do-while idiom keeps the call statement-safe in
+// every context (if/else without braces, etc.).
+#define e1000e_dbg(...) do { } while (0)
 #endif
 
 // ============================================================================
@@ -535,8 +541,10 @@ static inline void e1000e_write(e1000e_dev_t* dev, uint32_t reg, uint32_t val) {
 // PMA timer-based microsecond delay forward decl
 static void e1000e_delay_us(uint32_t us);
 
-static void e1000e_dump_pci_dma_state(e1000e_dev_t* dev, uint32_t tx_seq)
+static void __attribute__((unused))
+e1000e_dump_pci_dma_state(e1000e_dev_t* dev, uint32_t tx_seq)
 {
+#if E1000E_DBG
     if (!dev || !dev->pci_dev) {
         return;
     }
@@ -581,6 +589,9 @@ static void e1000e_dump_pci_dma_state(e1000e_dev_t* dev, uint32_t tx_seq)
         e1000e_dbg("E1000E: tx#%u no PCIe Express cap (expected on I219 LPC-integrated MAC)\n",
                 tx_seq);
     }
+#else
+    (void)dev; (void)tx_seq;
+#endif
 }
 
 // Wait for the SW flag to be released by ME firmware so we can safely
@@ -736,10 +747,18 @@ static void e1000e_force_exit_phy_ulp(e1000e_dev_t* dev) {
 
     e1000e_write(dev, E1000_CTRL_EXT, ctrl_ext_restore & ~E1000_CTRL_EXT_FORCE_SMBUS);
 
+#if E1000E_DBG
     uint32_t fextnvm7_before = e1000e_read(dev, E1000_FEXTNVM7);
     e1000e_write(dev, E1000_FEXTNVM7,
                  fextnvm7_before & ~E1000_FEXTNVM7_DISABLE_SMB_PERST);
     uint32_t fextnvm7_after = e1000e_read(dev, E1000_FEXTNVM7);
+#else
+    {
+        uint32_t fextnvm7_tmp = e1000e_read(dev, E1000_FEXTNVM7);
+        e1000e_write(dev, E1000_FEXTNVM7,
+                     fextnvm7_tmp & ~E1000_FEXTNVM7_DISABLE_SMB_PERST);
+    }
+#endif
 
     e1000e_release_swflag(dev);
 
@@ -908,8 +927,10 @@ static int e1000e_oem_bits_clear_lplu(e1000e_dev_t* dev) {
 // doesn't re-enable EEE LPI on the internal MII bus after link.
 static void e1000e_disable_eee(e1000e_dev_t* dev) {
     // 1. MAC-side disable: clear EEER (LPI enables, FRC_AN) and IPCNFG.
+#if E1000E_DBG
     uint32_t eeer_before = e1000e_read(dev, E1000_EEER);
     uint32_t ipc_before  = e1000e_read(dev, E1000_IPCNFG);
+#endif
     e1000e_write(dev, E1000_EEER,   0);
     e1000e_write(dev, E1000_IPCNFG, 0);
     e1000e_dbg("E1000E: MAC EEE disabled EEER=%08x->%08x IPCNFG=%08x->%08x\n",
@@ -994,12 +1015,14 @@ static int e1000e_copper_link_setup_82577(e1000e_dev_t* dev) {
 //   4. Poll BMSR.AN_COMPLETE for up to 5 s.
 //   5. Read I82577_PHY_STATUS_2 for ground-truth resolved speed.
 static int e1000e_phy_restart_autoneg(e1000e_dev_t* dev) {
-    uint16_t bmcr_before = 0, bmsr_before = 0;
-    uint16_t anar_before = 0, gbcr_before = 0;
-    (void)e1000e_phy_read_at(dev, E1000E_PHY_ADDR, MII_BMCR, &bmcr_before);
+    uint16_t bmsr_before = 0;
     (void)e1000e_phy_read_at(dev, E1000E_PHY_ADDR, MII_BMSR, &bmsr_before);
+#if E1000E_DBG
+    uint16_t bmcr_before = 0, anar_before = 0, gbcr_before = 0;
+    (void)e1000e_phy_read_at(dev, E1000E_PHY_ADDR, MII_BMCR, &bmcr_before);
     (void)e1000e_phy_read_at(dev, E1000E_PHY_ADDR, MII_ANAR, &anar_before);
     (void)e1000e_phy_read_at(dev, E1000E_PHY_ADDR, MII_GBCR, &gbcr_before);
+#endif
 
     // CRITICAL on real hardware: if the BIOS already brought up link
     // before we got here (BMSR.LSTATUS=1 AND BMSR.AN_COMPLETE=1), do
@@ -1019,6 +1042,7 @@ static int e1000e_phy_restart_autoneg(e1000e_dev_t* dev) {
         // its own internal MII transmitter, but leave the PHY alone.
         e1000e_clear_mac_phy_ctrl_lplu(dev);
 
+#if E1000E_DBG
         // Read PSS2 ground truth speed for the diagnostic line.
         uint16_t pss2 = 0;
         (void)e1000e_phy_read_at(dev, E1000E_PHY_ADDR, I82577_PHY_STATUS_2, &pss2);
@@ -1032,6 +1056,7 @@ static int e1000e_phy_restart_autoneg(e1000e_dev_t* dev) {
                 pss2, phy_speed_str,
                 (pss2 & I82577_PHY_STATUS2_MDIX) ? 1 : 0,
                 (pss2 & I82577_PHY_STATUS2_REV_POLARITY) ? 1 : 0);
+#endif
 
         // CRITICAL on Lenovo P50 / I219-LM: BIOS leaves the PHY's OEM
         // bits at 0x544 (LPLU=1, GBE_DIS=1, RESTART_AN=1) post-handoff.
@@ -1087,15 +1112,21 @@ static int e1000e_phy_restart_autoneg(e1000e_dev_t* dev) {
     }
 
     uint16_t bmsr = 0;
+#if E1000E_DBG
     int ms_waited = 0;
+#endif
     for (int i = 0; i < 5000; i++) {
         e1000e_delay_us(1000);
+#if E1000E_DBG
         ms_waited = i + 1;
+#endif
         if (e1000e_phy_read_at(dev, E1000E_PHY_ADDR, MII_BMSR, &bmsr) != 0) {
             continue;
         }
         if (bmsr & MII_BMSR_AN_COMPLETE) break;
     }
+
+#if E1000E_DBG
     // BMSR.LSTATUS is latched-low; re-read so we see the live state.
     uint16_t bmsr2 = 0;
     (void)e1000e_phy_read_at(dev, E1000E_PHY_ADDR, MII_BMSR, &bmsr2);
@@ -1153,6 +1184,7 @@ static int e1000e_phy_restart_autoneg(e1000e_dev_t* dev) {
             pss2, phy_speed_str,
             (pss2 & I82577_PHY_STATUS2_MDIX) ? 1 : 0,
             (pss2 & I82577_PHY_STATUS2_REV_POLARITY) ? 1 : 0);
+#endif // E1000E_DBG
 
     return (bmsr & MII_BMSR_AN_COMPLETE) ? 0 : -1;
 }
@@ -1165,13 +1197,17 @@ static int e1000e_phy_restart_autoneg(e1000e_dev_t* dev) {
 // which the PHY interprets as "power ON".  (VALUE=1 powers the PHY
 // DOWN — getting that wrong manifests as "link LED was on at boot, goes
 // off during driver init and stays off".)
-static void e1000e_toggle_lanphypc_pch_lpt(e1000e_dev_t* dev) {
+static void __attribute__((unused))
+e1000e_toggle_lanphypc_pch_lpt(e1000e_dev_t* dev) {
+#if E1000E_DBG
     uint32_t before = e1000e_read(dev, E1000_CTRL);
-    uint32_t mac_reg;
+    uint32_t mac_reg = before;
+#else
+    uint32_t mac_reg = e1000e_read(dev, E1000_CTRL);
+#endif
 
     // Step 1: drop both OVERRIDE and VALUE so we don't glitch the gate
     //         to "off" while flipping OVERRIDE.
-    mac_reg = before;
     mac_reg &= ~E1000_CTRL_LANPHYPC_OVERRIDE;
     mac_reg &= ~E1000_CTRL_LANPHYPC_VALUE;
     e1000e_write(dev, E1000_CTRL, mac_reg);
@@ -1189,9 +1225,11 @@ static void e1000e_toggle_lanphypc_pch_lpt(e1000e_dev_t* dev) {
     //         the ME does not perpetually contend for the gate input).
     //         Skip — match the reference exactly: leave OVERRIDE set.
 
+#if E1000E_DBG
     uint32_t after = e1000e_read(dev, E1000_CTRL);
     e1000e_dbg("E1000E: LANPHYPC toggled CTRL %08x -> %08x (OVERRIDE=1 VALUE=0 = PHY power ON)\n",
             before, after);
+#endif
 }
 
 static void e1000e_wait_lan_init_done(e1000e_dev_t* dev) {
@@ -1435,7 +1473,9 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
         // reset.  If the reset/firmware default leaves the packet buffer
         // split wrong, the MAC can look alive while the TX datapath never
         // actually starts moving descriptors.
+#if E1000E_DBG
         uint32_t pba_before = e1000e_read(dev, E1000_PBA);
+#endif
         e1000e_write(dev, E1000_PBA, 26);
         e1000e_dbg("E1000E: PBA %08x -> %08x\n",
             pba_before, e1000e_read(dev, E1000_PBA));
@@ -1510,7 +1550,9 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
     //   28  clear — gates TX entirely on some I219 steppings
     {
         uint32_t tarc0 = e1000e_read(dev, E1000_TARC0);
+#if E1000E_DBG
         uint32_t tarc0_before = tarc0;
+#endif
         tarc0 |= (1u << 23) | (1u << 24) | (1u << 26) | (1u << 27);
         e1000e_write(dev, E1000_TARC0, tarc0);
 
@@ -1518,7 +1560,9 @@ static void e1000e_pch_lan_init(e1000e_dev_t* dev) {
         // 24, 26, 30 (and conditionally 28 based on TCTL.MULR).  We
         // are not enabling MULR, so we set bit 28 too.
         uint32_t tarc1 = e1000e_read(dev, E1000_TARC1);
+#if E1000E_DBG
         uint32_t tarc1_before = tarc1;
+#endif
         tarc1 |=  (1u << 24) | (1u << 26) | (1u << 28) | (1u << 30);
         e1000e_write(dev, E1000_TARC1, tarc1);
 
@@ -1700,7 +1744,9 @@ static int e1000e_kmrn_write(e1000e_dev_t* dev, uint8_t kmrn_off, uint16_t val) 
 static void e1000e_disable_k1(e1000e_dev_t* dev) {
     uint16_t k1 = 0;
     e1000e_kmrn_read(dev, E1000_KMRN_K1_CONFIG_OFFSET, &k1);
+#if E1000E_DBG
     uint16_t before = k1;
+#endif
     k1 &= ~E1000_KMRN_K1_ENABLE;
     e1000e_kmrn_write(dev, E1000_KMRN_K1_CONFIG_OFFSET, k1);
 
@@ -1720,8 +1766,10 @@ static void e1000e_disable_k1(e1000e_dev_t* dev) {
 
     e1000e_write(dev, E1000_CTRL_EXT, ext & ~E1000_CTRL_EXT_SPD_BYPS);
 
+#if E1000E_DBG
     uint16_t after = 0;
     e1000e_kmrn_read(dev, E1000_KMRN_K1_CONFIG_OFFSET, &after);
+#endif
     e1000e_dbg("E1000E: K1 disabled (KMRN[0x07]: %04x -> %04x)\n", before, after);
 }
 
@@ -1755,13 +1803,17 @@ static void e1000e_disable_k1(e1000e_dev_t* dev) {
 static void e1000e_configure_kmrn_for_10_100(e1000e_dev_t* dev) {
     uint16_t hd = 0;
     e1000e_kmrn_read(dev, E1000_KMRN_HD_CTRL_OFFSET, &hd);
+#if E1000E_DBG
     uint16_t before = hd;
+#endif
     hd &= ~0x0007u;                       // clear inter-packet-gap field
     hd |=  E1000_KMRN_HD_CTRL_10_100_DEFAULT;
     e1000e_kmrn_write(dev, E1000_KMRN_HD_CTRL_OFFSET, hd);
 
+#if E1000E_DBG
     uint16_t after = 0;
     e1000e_kmrn_read(dev, E1000_KMRN_HD_CTRL_OFFSET, &after);
+#endif
     e1000e_dbg("E1000E: KMRN HD_CTRL for 10/100 (KMRN[0x10]: %04x -> %04x)\n",
             before, after);
 }
@@ -1769,13 +1821,17 @@ static void e1000e_configure_kmrn_for_10_100(e1000e_dev_t* dev) {
 static void e1000e_configure_kmrn_for_1000(e1000e_dev_t* dev) {
     uint16_t hd = 0;
     e1000e_kmrn_read(dev, E1000_KMRN_HD_CTRL_OFFSET, &hd);
+#if E1000E_DBG
     uint16_t before = hd;
+#endif
     hd &= ~0x0007u;
     hd |=  E1000_KMRN_HD_CTRL_1000_DEFAULT;
     e1000e_kmrn_write(dev, E1000_KMRN_HD_CTRL_OFFSET, hd);
 
+#if E1000E_DBG
     uint16_t after = 0;
     e1000e_kmrn_read(dev, E1000_KMRN_HD_CTRL_OFFSET, &after);
+#endif
     e1000e_dbg("E1000E: KMRN HD_CTRL for 1000 (KMRN[0x10]: %04x -> %04x)\n",
             before, after);
 }
@@ -1841,6 +1897,7 @@ static void e1000e_delay_us(uint32_t us) {
 static void e1000e_make_dma_pages_uncached(uint64_t phys_base,
                                            uint32_t page_count,
                                            const char* tag) {
+    (void)tag;
     if (!phys_base || page_count == 0) {
         return;
     }
@@ -2084,13 +2141,17 @@ static int e1000e_init_tx(e1000e_dev_t* dev) {
     // disabled the buggy MULR-fix in FEXTNVM11 above, so MULR is safe.
     if (e1000e_is_pch_lan(dev->device_id)) {
         tctl = e1000e_read(dev, E1000_TCTL);
+#if E1000E_DBG
         uint32_t before = tctl;
+#endif
         tctl |= (1u << 28)   // MULR — Multiple Request enable
               | (1u << 29);  // RRTHRESH[0] — match the reference/HW default
         e1000e_write(dev, E1000_TCTL, tctl);
         (void)e1000e_read(dev, E1000_TCTL);
+#if E1000E_DBG
         e1000e_dbg("E1000E: TCTL %08x -> %08x (MULR + RRTHRESH set, matches the reference)\n",
                 before, e1000e_read(dev, E1000_TCTL));
+#endif
     }
 
     if (e1000e_is_pch_spt(dev->device_id)) {
@@ -2154,6 +2215,7 @@ static int e1000e_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     ndev->tx_packets++;
     ndev->tx_bytes += len;
 
+#if E1000E_DBG
     // Diagnostic: after each of the first 8 transmits, snapshot the MAC
     // RX stat counters.  Most of these registers are read-to-clear, so
     // each line shows what arrived since the previous dump — which for
@@ -2292,6 +2354,7 @@ static int e1000e_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
                     tx_dump_count, ims);
         }
     }
+#endif // E1000E_DBG
 
     return 0;
 }
@@ -2324,6 +2387,7 @@ void e1000e_irq_handler(void) {
     e1000e_dev_t* dev = &g_e1000e;
     uint32_t icr = e1000e_read(dev, E1000_ICR);
 
+#if E1000E_DBG
     // Count every IRQ entry so we can tell from userland (via the tx
     // diagnostic dump) whether the MAC is asserting interrupts at all.
     static uint32_t irq_total = 0;
@@ -2337,6 +2401,7 @@ void e1000e_irq_handler(void) {
                     irq_with_cause, icr, irq_total);
         }
     }
+#endif
     // NOTE: do not early-return on icr==0.  We still need to scan the
     // RX ring (DD bit) below in case the MAC posted MSI for a batch
     // whose descriptor became visible after our ICR read cleared it.
@@ -2395,12 +2460,16 @@ void e1000e_irq_handler(void) {
             drained++;
         }
 
+#if E1000E_DBG
         static uint32_t rx_log = 0;
         if (drained && rx_log < 8) {
             rx_log++;
             e1000e_dbg("E1000E: RX drained %u pkt(s) (icr=%08x rdt=%u)\n",
                     drained, icr, dev->rx_tail);
         }
+#else
+        (void)drained; (void)icr;
+#endif
     }
 
     // TXDW is observed via DD bit in send(); nothing else to do here.
@@ -2627,7 +2696,9 @@ void e1000e_init(void) {
                     (st_spd & 0x1) /* FD */) {
                     uint16_t k1cfg = 0;
                     e1000e_kmrn_read(dev, E1000_KMRN_K1_CONFIG_OFFSET, &k1cfg);
+#if E1000E_DBG
                     uint16_t k1cfg_before = k1cfg;
+#endif
                     if (spd == 0x2) {
                         k1cfg |=  E1000_KMRN_K1_ENABLE;
                         e1000e_kmrn_write(dev, E1000_KMRN_K1_CONFIG_OFFSET, k1cfg);
@@ -2791,6 +2862,7 @@ void e1000e_init(void) {
         dev->link_up = (status & E1000_STATUS_LU) ? 1 : 0;
         kprintf("E1000E: Link %s\n", dev->link_up ? "UP" : "DOWN");
 
+#if E1000E_DBG
         // One-shot diagnostic dump — printed BEFORE we unmask interrupts
         // so it always appears in the log even if an IRQ storm follows.
         {
@@ -2802,6 +2874,7 @@ void e1000e_init(void) {
             e1000e_dbg("E1000E: STATUS=%08x CTRL_EXT=%08x RCTL=%08x RDH=%u RDT=%u\n",
                     s, cext, rctl, rdh, rdt);
         }
+#endif
 
         // (Stats dump moved to e1000e_send() so we see counters at the
         // time DHCP DISCOVER actually goes on the wire, not 2s into
