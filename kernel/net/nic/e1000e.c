@@ -2436,6 +2436,59 @@ static int e1000e_link_status(net_device_t* ndev) {
     return dev->link_up;
 }
 
+// Quiesce the NIC ahead of an ACPI S5 transition.  PCH-LAN integrated
+// I218 / I219 controllers will hold PME# asserted (and the platform
+// will refuse to fully power down — screen black, fans off, but rail
+// still hot) if any of the following are still live when SLP_EN is
+// written:
+//   * IMS — any unmasked interrupt cause
+//   * RCTL.EN / TCTL.EN — receiver / transmitter still enabled
+//   * WUC.APME / WUFC — Wake-on-LAN advertised to the platform
+//   * PCI Command.BME — bus-master DMA still active
+//   * CTRL_EXT.DRV_LOAD — OS-ownership flag asserted to the ME
+// Per the I218/I219 datasheet, all of these must be cleared before the
+// chipset will release the platform to G2/S5.
+static void e1000e_shutdown(net_device_t* ndev) {
+    e1000e_dev_t* dev = (e1000e_dev_t*)ndev->driver_data;
+    if (!dev || !dev->mmio_base) return;
+
+    // Mask every interrupt cause and ack any pending ones.
+    e1000e_write(dev, E1000_IMC, 0xFFFFFFFFu);
+    (void)e1000e_read(dev, E1000_ICR);
+
+    // Disable the receiver and transmitter so no further DMA descriptors
+    // are fetched after this point.
+    uint32_t rctl = e1000e_read(dev, E1000_RCTL);
+    e1000e_write(dev, E1000_RCTL, rctl & ~E1000_RCTL_EN);
+    uint32_t tctl = e1000e_read(dev, E1000_TCTL);
+    e1000e_write(dev, E1000_TCTL, tctl & ~E1000_TCTL_EN);
+
+    // Clear Wake-on-LAN: WUC.APME (offset 0x05800, bit 0) advertises
+    // PME# capability to the platform; WUFC (0x05808) selects which
+    // packet patterns assert the wake.  Zeroing both is mandatory for
+    // a clean S5 on integrated PCH-LAN.
+    e1000e_write(dev, 0x05808u /* WUFC */, 0);
+    e1000e_write(dev, 0x05800u /* WUC  */, 0);
+
+    // Tell the management engine we are no longer the owning driver.
+    // Per the PCH-LAN spec, with DRV_LOAD deasserted the firmware will
+    // run its own platform shutdown path and not wait for further OS
+    // intervention before allowing the S5 transition.
+    uint32_t ctrl_ext = e1000e_read(dev, E1000_CTRL_EXT);
+    ctrl_ext &= ~(1u << 28); // DRV_LOAD
+    e1000e_write(dev, E1000_CTRL_EXT, ctrl_ext);
+
+    // Drop PCI bus-mastering so any remaining in-flight TLPs are
+    // discarded by the root complex rather than landing in memory
+    // after the OS has handed off to the firmware.
+    if (dev->pci_dev) {
+        const pci_device_t* pdev = dev->pci_dev;
+        uint32_t cmd = pci_cfg_read32(pdev->bus, pdev->device, pdev->function, 0x04);
+        cmd &= ~0x0004u; // clear Bus Master Enable
+        pci_cfg_write32(pdev->bus, pdev->device, pdev->function, 0x04, cmd);
+    }
+}
+
 // ============================================================================
 // IRQ Handler
 // ============================================================================
@@ -2977,6 +3030,7 @@ void e1000e_init(void) {
         dev->net_dev.dns_server = 0;
         dev->net_dev.send = e1000e_send;
         dev->net_dev.link_status = e1000e_link_status;
+        dev->net_dev.shutdown = e1000e_shutdown;
         dev->net_dev.driver_data = dev;
 
         net_register(&dev->net_dev);

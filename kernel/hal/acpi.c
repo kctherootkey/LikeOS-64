@@ -1798,26 +1798,63 @@ void acpi_pm_init(void) {
             g_pm1a_cnt_blk, g_pm1b_cnt_blk, (unsigned long)g_reset_reg_addr);
 }
 
+// Quiesce all NICs before S5: clear bus-master / wake-enable / interrupt
+// enables on every probed PCI network device.  On real hardware (notably
+// PCH-LAN integrated I219 LOMs on Lenovo business laptops) the firmware
+// will refuse the S5 transition if the NIC still has APME / WUC bits
+// asserted or PCI command.MSE | command.BME live, leaving the platform
+// in a "screen-off, fans-off, but power-rail-still-hot" half-state from
+// which only a manual power-button press recovers.
+//
+// Implemented as a weak hook here — the network subsystem provides the
+// strong override that walks its registered devices.
+__attribute__((weak)) void net_quiesce_for_poweroff(void) { }
+
 void acpi_poweroff(void) {
-    if (!g_pm_initialized) {
-        acpi_dbg("ACPI: power management not initialized, trying QEMU exit\n");
-        acpi_outw(0x604, 0x2000);
-        for (;;) __asm__ volatile("cli; hlt");
-    }
-
     acpi_dbg("ACPI: powering off...\n");
-    __asm__ volatile("cli");
 
-    uint16_t val = ACPI_PM1_SLP_TYP(g_slp_typa) | ACPI_PM1_SLP_EN;
-    acpi_outw((uint16_t)g_pm1a_cnt_blk, val);
+    // Quiesce all NICs first: stop bus-master DMA, mask interrupts, clear
+    // any wake-on-LAN enables.  Without this the platform's S5 path can
+    // be blocked by an asserted PME# from the NIC.
+    net_quiesce_for_poweroff();
 
-    if (g_pm1b_cnt_blk) {
-        val = ACPI_PM1_SLP_TYP(g_slp_typb) | ACPI_PM1_SLP_EN;
-        acpi_outw((uint16_t)g_pm1b_cnt_blk, val);
+    // Preferred path: ACPICA's full sleep API.  This evaluates _PTS(5)
+    // (Prepare-To-Sleep) which on real hardware runs the EC / ME / BIOS
+    // handshakes that allow the chipset to actually transition to G2/S5
+    // — the hand-rolled SLP_EN-poke path below skips _PTS entirely and
+    // leaves PCH-based laptops half-powered (screen black, fans off,
+    // but power LED still lit).  AcpiEnterSleepState() then disables
+    // GPEs, clears wake status, and writes the SLP_TYP/SLP_EN sequence
+    // to PM1a/PM1b in the order required by the ACPI spec.
+    ACPI_STATUS st = AcpiEnterSleepStatePrep(ACPI_STATE_S5);
+    if (ACPI_SUCCESS(st)) {
+        __asm__ volatile("cli");
+        st = AcpiEnterSleepState(ACPI_STATE_S5);
+        if (ACPI_SUCCESS(st)) {
+            for (;;) __asm__ volatile("hlt");
+        }
+        acpi_dbg("ACPI: AcpiEnterSleepState(S5) failed: %d\n", (int)st);
+    } else {
+        acpi_dbg("ACPI: AcpiEnterSleepStatePrep(S5) failed: %d\n", (int)st);
     }
 
+    // Fallback path #1: hand-rolled SLP_EN write using FADT-extracted
+    // PM1 control block plus DSDT-parsed _S5 sleep type.
+    if (g_pm_initialized) {
+        __asm__ volatile("cli");
+
+        uint16_t val = ACPI_PM1_SLP_TYP(g_slp_typa) | ACPI_PM1_SLP_EN;
+        acpi_outw((uint16_t)g_pm1a_cnt_blk, val);
+
+        if (g_pm1b_cnt_blk) {
+            val = ACPI_PM1_SLP_TYP(g_slp_typb) | ACPI_PM1_SLP_EN;
+            acpi_outw((uint16_t)g_pm1b_cnt_blk, val);
+        }
+    }
+
+    // Fallback path #2: QEMU/Bochs ACPI shutdown port.
     acpi_outw(0x604, 0x2000);
-    for (;;) __asm__ volatile("hlt");
+    for (;;) __asm__ volatile("cli; hlt");
 }
 
 // ============================================================================

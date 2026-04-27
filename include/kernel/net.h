@@ -71,6 +71,7 @@ typedef struct net_device net_device_t;
 
 typedef int (*net_send_fn)(net_device_t* dev, const uint8_t* data, uint16_t len);
 typedef int (*net_link_status_fn)(net_device_t* dev);
+typedef void (*net_shutdown_fn)(net_device_t* dev);
 
 struct net_device {
     const char* name;
@@ -82,6 +83,12 @@ struct net_device {
     uint32_t dns_server;        // DNS server (host byte order)
     net_send_fn send;
     net_link_status_fn link_status;
+    // Optional: called from acpi_poweroff() to quiesce the NIC before S5
+    // (mask interrupts, clear bus-master, disable Wake-on-LAN).  Without
+    // this, PME# / WUC / live bus-master DMA can block the chipset's S5
+    // transition on real hardware (screen black, fans off, but power
+    // rail still hot — must press the power button to fully shut down).
+    net_shutdown_fn shutdown;
     void* driver_data;
     spinlock_t lock;
 
@@ -405,6 +412,10 @@ int  net_register(net_device_t* dev);
 net_device_t* net_get_device(int index);
 net_device_t* net_get_default_device(void);
 int  net_device_count(void);
+
+// Called from acpi_poweroff() before the S5 transition.  Walks the device
+// registry and invokes each NIC's optional shutdown() callback.
+void net_quiesce_for_poweroff(void);
 
 // ============================================================================
 // Ethernet Layer API
