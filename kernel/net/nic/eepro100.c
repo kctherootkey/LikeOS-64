@@ -399,19 +399,32 @@ static int eepro100_send(net_device_t* ndev, const uint8_t* data, uint16_t len) 
 // Link status callback — ask the PHY's BMSR via the MDI window.  For QEMU
 // this always reports link-up while a netdev is attached.
 // ============================================================================
+// Polled-only: this chip has no link-change interrupt, so all hot-plug
+// detection happens here on each call.  Edge logic mirrors the IRQ-
+// driven NICs: print UP/DOWN once, and on a DOWN edge invalidate the
+// DHCP lease so the next dhclient does a full DISCOVER against the new
+// network.
 static int eepro100_link_status(net_device_t* ndev) {
     eepro100_dev_t* d = (eepro100_dev_t*)ndev->driver_data;
     // MDI Read | PHY 1 | reg 1 (BMSR)
     uint32_t mdi = (2u << 26) | (1u << 21) | (1u << 16);
     e100_w32(d, EEPRO100_SCB_MDI, mdi);
+    int now_up = 0;
     for (int i = 0; i < 1000; i++) {
         uint32_t r = e100_r32(d, EEPRO100_SCB_MDI);
         if (r & (1u << 28)) {           // R bit (operation ready)
-            return (r & (1u << 2)) ? 1 : 0;   // BMSR.Link Status = bit 2
+            now_up = (r & (1u << 2)) ? 1 : 0;   // BMSR.Link Status = bit 2
+            break;
         }
         e100_delay_us(10);
     }
-    return 0;
+    int was_up = d->link_up;
+    if (now_up != was_up) {
+        d->link_up = now_up;
+        kprintf("eepro100: Link %s\n", now_up ? "UP" : "DOWN");
+        if (!now_up) dhcp_invalidate(ndev);
+    }
+    return now_up;
 }
 
 // ============================================================================

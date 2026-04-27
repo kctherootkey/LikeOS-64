@@ -231,7 +231,14 @@ static int rtl8139_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
 static int rtl8139_link_status(net_device_t* ndev) {
     rtl8139_dev_t* dev = (rtl8139_dev_t*)ndev->driver_data;
     // MSR.LINKB is INVERSE: 1 means link DOWN.
-    return (rtl_read8(dev, RTL_MSR) & RTL_MSR_LINKB) ? 0 : 1;
+    int now_up = (rtl_read8(dev, RTL_MSR) & RTL_MSR_LINKB) ? 0 : 1;
+    int was_up = dev->link_up;
+    if (now_up != was_up) {
+        dev->link_up = now_up;
+        kprintf("RTL8139: Link %s\n", now_up ? "UP" : "DOWN");
+        if (!now_up) dhcp_invalidate(ndev);
+    }
+    return now_up;
 }
 
 // ============================================================================
@@ -302,8 +309,13 @@ void rtl8139_irq_handler(void) {
     rtl_write16(dev, RTL_ISR, isr);
 
     if (isr & (RTL_INT_PUN | RTL_INT_LENCHG)) {
-        dev->link_up = (rtl_read8(dev, RTL_MSR) & RTL_MSR_LINKB) ? 0 : 1;
-        kprintf("RTL8139: Link %s\n", dev->link_up ? "UP" : "DOWN");
+        int now_up = (rtl_read8(dev, RTL_MSR) & RTL_MSR_LINKB) ? 0 : 1;
+        int was_up = dev->link_up;
+        dev->link_up = now_up;
+        if (now_up != was_up) {
+            kprintf("RTL8139: Link %s\n", now_up ? "UP" : "DOWN");
+            if (!now_up) dhcp_invalidate(&dev->net_dev);
+        }
     }
 
     if (isr & RTL_INT_ROK) {
