@@ -64,6 +64,11 @@ typedef struct {
     const pci_device_t* pci_dev;
     uint8_t msi_vector;
     int link_up;
+    // Hot-plug support: set by IRQ when LSC fires; consumed in
+    // process context (e1000e_link_status / e1000e_send) to perform
+    // the heavy edge handling (re-clear OEM bits, etc.) that is not
+    // safe from interrupt context.
+    volatile int link_change_pending;
     uint16_t device_id;
 
     // Network device for registration
