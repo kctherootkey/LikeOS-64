@@ -371,8 +371,20 @@ void e1000_irq_handler(void) {
     if (icr & E1000_ICR_LSC) {
         // Link status change
         uint32_t status = e1000_read(dev, E1000_STATUS);
-        dev->link_up = (status & E1000_STATUS_LU) ? 1 : 0;
-        kprintf("E1000: Link %s\n", dev->link_up ? "UP" : "DOWN");
+        int now_up = (status & E1000_STATUS_LU) ? 1 : 0;
+        int was_up = dev->link_up;
+        dev->link_up = now_up;
+        if (now_up != was_up) {
+            kprintf("E1000: Link %s\n", now_up ? "UP" : "DOWN");
+            if (!now_up) {
+                // Link dropped: invalidate the DHCP lease so the next
+                // dhclient invocation does a full DISCOVER instead of
+                // unicast-renewing against the previous network's
+                // server (which is unreachable when bridged<->NAT or
+                // the cable moved to a different switch).
+                dhcp_invalidate(&dev->net_dev);
+            }
+        }
     }
 
     if (icr & (E1000_ICR_RXT0 | E1000_ICR_RXDMT0 | E1000_ICR_RXO)) {
