@@ -2408,6 +2408,16 @@ static void e1000e_link_state_poll(e1000e_dev_t* dev) {
     if (now_up != was_up) {
         dev->link_up = now_up;
         kprintf("E1000E: Link %s\n", now_up ? "UP" : "DOWN");
+        if (!now_up) {
+            // Link went down: invalidate any DHCP lease.  The network
+            // we get back may be different (cable moved to another
+            // switch, hypervisor toggled bridged<->NAT, ...) so the
+            // cached IP/gateway/DHCP-server are no longer trustworthy.
+            // Clearing them now makes the next dhclient invocation
+            // do a full DISCOVER instead of a unicast renewal aimed
+            // at the previous network's server.
+            dhcp_invalidate(&dev->net_dev);
+        }
     }
 
     if (now_up) {

@@ -950,6 +950,10 @@ int  net_get_iface_info(net_iface_info_t* entries, int max_entries);
 int  dhcp_release(net_device_t* dev);
 int  dhcp_renew(net_device_t* dev);
 int  dhcp_get_status(void);
+// Invalidate the cached lease without sending a RELEASE.  Called by
+// link drivers on a link-DOWN edge so the next dhcp_renew() will
+// perform a full DISCOVER instead of a (now-stale) unicast renewal.
+void dhcp_invalidate(net_device_t* dev);
 
 // Raw ICMP send/receive for ping, traceroute, arping
 int  icmp_send_echo(net_device_t* dev, uint32_t dst_ip, uint16_t id,

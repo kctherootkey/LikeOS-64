@@ -347,3 +347,37 @@ int dhcp_renew(net_device_t* dev) {
     }
     return pktlen > 0 ? 0 : -1;
 }
+
+// Invalidate the cached lease.  Called by link drivers on a link-DOWN
+// edge: the network we are attached to may have changed (cable moved
+// to a different switch, VM hypervisor switched bridged<->NAT, etc.),
+// so the previously bound IP/gateway/server are no longer valid.
+// Clearing dev->ip_addr makes user-space dhclient correctly wait for a
+// fresh ACK instead of treating the stale address as a successful
+// renewal, and forcing dhcp_state back to IDLE makes the next
+// dhcp_renew() perform a full DISCOVER instead of a (doomed) unicast
+// renewal aimed at the previous network's DHCP server.
+void dhcp_invalidate(net_device_t* dev) {
+    if (!dev) return;
+
+    // Tear down routes that depended on the old binding before we
+    // forget the values.  Connected-subnet route was added with
+    // (offered & subnet, subnet, 0); default route was added with
+    // (0, 0, router).
+    if (dev->netmask != 0) {
+        uint32_t net_addr = dev->ip_addr & dev->netmask;
+        (void)route_del(net_addr, dev->netmask, 0);
+    }
+    if (dev->gateway != 0) {
+        (void)route_del(0, 0, dev->gateway);
+    }
+
+    dev->ip_addr = 0;
+    dev->netmask = 0;
+    dev->gateway = 0;
+    dev->dns_server = 0;
+
+    dhcp_state = DHCP_STATE_IDLE;
+    dhcp_offered_ip = 0;
+    dhcp_server_ip = 0;
+}
