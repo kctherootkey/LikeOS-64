@@ -567,6 +567,24 @@ void irq_handler(uint64_t *regs) {
             return;  // eepro100_irq_handler calls lapic_eoi()
         }
     }
+    {
+        extern int g_igb_initialized;
+        extern int g_igb_legacy_irq;
+        extern void igb_irq_handler(void);
+        if (g_igb_initialized && g_igb_legacy_irq >= 0 && irq == g_igb_legacy_irq) {
+            igb_irq_handler();
+            return;  // igb_irq_handler calls lapic_eoi()
+        }
+    }
+    {
+        extern int g_tulip_initialized;
+        extern int g_tulip_legacy_irq;
+        extern void tulip_irq_handler(void);
+        if (g_tulip_initialized && g_tulip_legacy_irq >= 0 && irq == g_tulip_legacy_irq) {
+            tulip_irq_handler();
+            return;  // tulip_irq_handler calls lapic_eoi()
+        }
+    }
 
     // MSI vector for xHCI USB — vector 48 (irq == 16 after subtracting IRQ_BASE).
     // MSI bypasses the PIC entirely; requires LAPIC EOI, not PIC EOI.
