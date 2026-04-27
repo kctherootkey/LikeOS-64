@@ -345,6 +345,25 @@ static int pcnet_link_status(net_device_t* ndev) {
     return now_up;
 }
 
+// Quiesce the controller ahead of an ACPI S5 transition.  Per the Am79C97x
+// datasheet, asserting CSR0.STOP halts both the RX and TX engines, masks
+// all interrupt sources, and aborts any pending bus-master DMA at the
+// next quiescent point.  Then drop the PCI Command.BME bit so any TLP
+// that escaped the in-controller stop is dropped at the root complex.
+static void pcnet_shutdown(net_device_t* ndev) {
+    pcnet_dev_t* dev = (pcnet_dev_t*)ndev->driver_data;
+    if (!dev || !dev->io_base) return;
+
+    pcnet_write_csr(dev, CSR0, CSR0_STOP);
+
+    if (dev->pci_dev) {
+        const pci_device_t* pdev = dev->pci_dev;
+        uint32_t cmd = pci_cfg_read32(pdev->bus, pdev->device, pdev->function, 0x04);
+        cmd &= ~0x0004u; // clear Bus Master Enable
+        pci_cfg_write32(pdev->bus, pdev->device, pdev->function, 0x04, cmd);
+    }
+}
+
 // ============================================================================
 // Drain RX descriptors that are now owned by software
 // ============================================================================
@@ -599,6 +618,7 @@ void pcnet32_init(void) {
         dev->net_dev.dns_server = 0;
         dev->net_dev.send = pcnet_send;
         dev->net_dev.link_status = pcnet_link_status;
+        dev->net_dev.shutdown = pcnet_shutdown;
         dev->net_dev.driver_data = dev;
 
         net_register(&dev->net_dev);
