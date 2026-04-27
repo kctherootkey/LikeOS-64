@@ -2182,8 +2182,19 @@ static int e1000e_init_tx(e1000e_dev_t* dev) {
 // ============================================================================
 // Send (net_device_t callback)
 // ============================================================================
+// Forward declaration: defined alongside e1000e_link_status() below.
+static void e1000e_link_state_poll(e1000e_dev_t* dev);
+
 static int e1000e_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     e1000e_dev_t* dev = (e1000e_dev_t*)ndev->driver_data;
+
+    // Always service the link state on the TX path.  After a cable
+    // replug we must re-clear LPLU on the PHY or the descriptor will
+    // be fetched but the buffer payload will never be pulled across
+    // the MII interface (silent TX drop).  Polling unconditionally
+    // (rather than gating on link_change_pending) closes the race
+    // where userland calls send() before the LSC IRQ has been taken.
+    e1000e_link_state_poll(dev);
 
     if (len > E1000E_RX_BUF_SIZE) return -1;
 
@@ -2362,10 +2373,60 @@ static int e1000e_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
 // ============================================================================
 // Link Status (net_device_t callback)
 // ============================================================================
+//
+// Cable hot-plug support.  When the cable is unplugged, the PHY drops
+// link and the MAC's LSC interrupt fires; STATUS.LU goes to 0.  When
+// the cable is replugged, the PHY runs a fresh autoneg cycle and on
+// PCH-LAN parts the post-autoneg state may re-apply LPLU / GBE_DIS
+// (the OEM NVM defaults on Lenovo ThinkPad NVMs are LPLU=1, GBE_DIS=1)
+// — even though we cleared those bits at init time.  LPLU=1 with link
+// UP throttles the MII data path: the MAC fetches the TX descriptor
+// but the buffer payload is never pulled across the MAC<->PHY interface,
+// so TX appears to "succeed" while no frame ever leaves the wire.
+//
+// We must therefore re-clear the LPLU / GBE_DIS bits on every observed
+// link-down -> link-up edge.  This is too heavy to do from the LSC IRQ
+// handler (the OEM-bits write needs the SW_FLAG semaphore, paged PHY
+// access, and ms-scale delays), so the IRQ only sets a pending flag
+// and the real edge handler runs in process context the next time
+// either the link_status callback or the send path is invoked.
+static void e1000e_link_state_poll(e1000e_dev_t* dev) {
+    uint32_t status = e1000e_read(dev, E1000_STATUS);
+    int now_up = (status & E1000_STATUS_LU) ? 1 : 0;
+    int was_up = dev->link_up;
+
+    int pending = dev->link_change_pending;
+    dev->link_change_pending = 0;
+
+    // Detect edge two ways: by direct STATUS.LU comparison (covers the
+    // case where LSC is masked / hasn't fired yet) AND via the IRQ-set
+    // pending flag (covers the case where the IRQ already updated
+    // dev->link_up before we got here).
+    int edge = (now_up != was_up) || pending;
+    if (!edge) return;
+
+    if (now_up != was_up) {
+        dev->link_up = now_up;
+        kprintf("E1000E: Link %s\n", now_up ? "UP" : "DOWN");
+    }
+
+    if (now_up) {
+        // Cable was just (re-)plugged and the PHY just finished a
+        // fresh autoneg.  Re-clear the LPLU / GBE_DIS gates so the
+        // MII data path is not throttled.  Do NOT request an autoneg
+        // restart — link is already up and a restart would drop it.
+        e1000e_clear_mac_phy_ctrl_lplu(dev);
+        (void)e1000e_oem_bits_clear_lplu_ex(dev, 0);
+    }
+}
+
 static int e1000e_link_status(net_device_t* ndev) {
     e1000e_dev_t* dev = (e1000e_dev_t*)ndev->driver_data;
-    uint32_t status = e1000e_read(dev, E1000_STATUS);
-    return (status & E1000_STATUS_LU) ? 1 : 0;
+    // Always poll: the LSC IRQ may not have fired yet (or may have
+    // been collapsed into another cause), and STATUS.LU is the only
+    // ground truth.  Cheap — single MMIO read in the no-change case.
+    e1000e_link_state_poll(dev);
+    return dev->link_up;
 }
 
 // ============================================================================
@@ -2421,7 +2482,13 @@ void e1000e_irq_handler(void) {
             e1000e_dbg("E1000E: LSC interrupt storm — masking LSC\n");
         }
         uint32_t status = e1000e_read(dev, E1000_STATUS);
+        int prev_up = dev->link_up;
         dev->link_up = (status & E1000_STATUS_LU) ? 1 : 0;
+        if (prev_up != dev->link_up) {
+            // Note for the process-context edge handler: on down->up
+            // we must re-clear LPLU/GBE_DIS or TX will silently drop.
+            dev->link_change_pending = 1;
+        }
         if (lsc_count <= 4) {
             kprintf("E1000E: Link %s\n", dev->link_up ? "UP" : "DOWN");
         }
@@ -2880,14 +2947,16 @@ void e1000e_init(void) {
         // time DHCP DISCOVER actually goes on the wire, not 2s into
         // boot when nothing has been transmitted yet.)
 
-        // Unmask only the RX/TX interrupts we actually need.  LSC is
-        // intentionally NOT enabled on PCH-LAN parts (I217/I218/I219):
-        // their link can bounce continuously after init and would flood
-        // the CPU with link-status interrupts.  Userland still gets the
-        // truth via the link_status callback (polled).
+        // Unmask RX/TX and LSC.  LSC is required for prompt cable
+        // hot-plug detection.  PCH-LAN parts can bounce link rapidly
+        // during init; the IRQ handler throttles LSC and disables it
+        // after 16 events in quick succession to prevent CPU starvation.
+        // The link_status / send paths poll STATUS.LU directly as a
+        // fall-back so userland still sees the truth even if LSC ends
+        // up disabled.
         uint32_t ims = E1000_ICR_RXT0 | E1000_ICR_TXDW |
-                       E1000_ICR_RXDMT0 | E1000_ICR_RXO;
-        if (!e1000e_is_pch_lan(did)) ims |= E1000_ICR_LSC;
+                       E1000_ICR_RXDMT0 | E1000_ICR_RXO |
+                       E1000_ICR_LSC;
         e1000e_write(dev, E1000_IMS, ims);
 
         // net_device_t setup
