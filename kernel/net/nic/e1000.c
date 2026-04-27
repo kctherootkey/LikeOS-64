@@ -354,6 +354,37 @@ static int e1000_link_status(net_device_t* ndev) {
     return now_up;
 }
 
+// Quiesce the controller ahead of an ACPI S5 transition.  Per the
+// 8254x family datasheet, leaving IMS / RCTL.EN / TCTL.EN / WUC.APME
+// asserted at sleep time can cause the chipset to keep PME# alive and
+// hold the platform in a half-powered state.  Mask all interrupts,
+// halt RX/TX, clear Wake-on-LAN, and drop PCI bus-master so any
+// in-flight DMA is dropped by the root complex.
+static void e1000_shutdown(net_device_t* ndev) {
+    e1000_dev_t* dev = (e1000_dev_t*)ndev->driver_data;
+    if (!dev || !dev->mmio_base) return;
+
+    e1000_write(dev, E1000_IMC, 0xFFFFFFFFu);
+    (void)e1000_read(dev, E1000_ICR);
+
+    uint32_t rctl = e1000_read(dev, E1000_RCTL);
+    e1000_write(dev, E1000_RCTL, rctl & ~E1000_RCTL_EN);
+    uint32_t tctl = e1000_read(dev, E1000_TCTL);
+    e1000_write(dev, E1000_TCTL, tctl & ~E1000_TCTL_EN);
+
+    // WUC (Wake Up Control) at 0x05800, WUFC (Wake Up Filter Control) at
+    // 0x05808 — clearing both deasserts PME# capability.
+    e1000_write(dev, 0x05808u /* WUFC */, 0);
+    e1000_write(dev, 0x05800u /* WUC  */, 0);
+
+    if (dev->pci_dev) {
+        const pci_device_t* pdev = dev->pci_dev;
+        uint32_t cmd = pci_cfg_read32(pdev->bus, pdev->device, pdev->function, 0x04);
+        cmd &= ~0x0004u; // clear Bus Master Enable
+        pci_cfg_write32(pdev->bus, pdev->device, pdev->function, 0x04, cmd);
+    }
+}
+
 // ============================================================================
 // E1000 IRQ Handler
 // ============================================================================
@@ -682,6 +713,7 @@ void e1000_init(void) {
         dev->net_dev.dns_server = 0;
         dev->net_dev.send = e1000_send;
         dev->net_dev.link_status = e1000_link_status;
+        dev->net_dev.shutdown = e1000_shutdown;
         dev->net_dev.driver_data = dev;
         // Note: lock and statistics counters are initialised earlier (before
         // we enable device interrupts) so the IRQ handler always sees a

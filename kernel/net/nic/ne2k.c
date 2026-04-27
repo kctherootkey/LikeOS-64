@@ -214,6 +214,29 @@ static int ne2k_link_status(net_device_t* ndev) {
     return 1;
 }
 
+// Quiesce the controller ahead of an ACPI S5 transition.  The DP8390
+// core itself has no Wake-on-LAN support, so we only need to mask
+// interrupts, stop the chip, and drop PCI bus-master so the root
+// complex discards any in-flight DMA after the OS has handed off to
+// the firmware.
+static void ne2k_shutdown(net_device_t* ndev) {
+    ne2k_dev_t* dev = (ne2k_dev_t*)ndev->driver_data;
+    if (!dev || !dev->io_base) return;
+
+    // Page 0, abort any in-flight remote DMA, stop the chip.
+    ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STP);
+    // IMR = 0 (mask all), ISR = 0xFF (W1C all pending causes).
+    ne_w8(dev, NE_P0_IMR, 0x00);
+    ne_w8(dev, NE_P0_ISR, 0xFF);
+
+    if (dev->pci_dev) {
+        const pci_device_t* pdev = dev->pci_dev;
+        uint32_t cmd = pci_cfg_read32(pdev->bus, pdev->device, pdev->function, 0x04);
+        cmd &= ~0x0004u; // clear Bus Master Enable
+        pci_cfg_write32(pdev->bus, pdev->device, pdev->function, 0x04, cmd);
+    }
+}
+
 // ============================================================================
 // Drain RX ring — read packets between BNRY+1 and CURR
 // ============================================================================
@@ -524,6 +547,7 @@ void ne2k_init(void) {
         dev->net_dev.dns_server = 0;
         dev->net_dev.send = ne2k_send;
         dev->net_dev.link_status = ne2k_link_status;
+        dev->net_dev.shutdown = ne2k_shutdown;
         dev->net_dev.driver_data = dev;
 
         net_register(&dev->net_dev);

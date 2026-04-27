@@ -395,6 +395,31 @@ static int vmxnet3_link_status(net_device_t* ndev) {
     return now_up;
 }
 
+// Quiesce the controller ahead of an ACPI S5 transition.  The vmxnet3
+// control plane exposes explicit QUIESCE_DEV and RESET_DEV commands;
+// QUIESCE halts RX/TX rings and stops the device from issuing further
+// DMA, RESET puts the device into the post-power-on state.  Combined
+// with masking BAR0 IMR[0] and dropping PCI bus-master, the hypervisor
+// (or the platform when running on bare-metal-style passthrough) will
+// not see any pending PCI activity at sleep time.
+static void vmxnet3_shutdown(net_device_t* ndev) {
+    vmxnet3_dev_t* dev = (vmxnet3_dev_t*)ndev->driver_data;
+    if (!dev || !dev->bar1) return;
+
+    if (dev->bar0) {
+        vm_w32(dev->bar0, VMXNET3_REG_IMR + 0 * 8, 1); // mask vector 0
+    }
+    vm_cmd_set(dev, VMXNET3_CMD_QUIESCE_DEV);
+    vm_cmd_set(dev, VMXNET3_CMD_RESET_DEV);
+
+    if (dev->pci_dev) {
+        const pci_device_t* pdev = dev->pci_dev;
+        uint32_t cmd = pci_cfg_read32(pdev->bus, pdev->device, pdev->function, 0x04);
+        cmd &= ~0x0004u; // clear Bus Master Enable
+        pci_cfg_write32(pdev->bus, pdev->device, pdev->function, 0x04, cmd);
+    }
+}
+
 // ============================================================================
 // Drain the RX completion ring
 // ============================================================================
@@ -688,6 +713,7 @@ void vmxnet3_init(void) {
         dev->net_dev.dns_server = 0;
         dev->net_dev.send = vmxnet3_send;
         dev->net_dev.link_status = vmxnet3_link_status;
+        dev->net_dev.shutdown = vmxnet3_shutdown;
         dev->net_dev.driver_data = dev;
 
         net_register(&dev->net_dev);

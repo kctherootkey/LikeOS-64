@@ -427,6 +427,30 @@ static int eepro100_link_status(net_device_t* ndev) {
     return now_up;
 }
 
+// Quiesce the controller ahead of an ACPI S5 transition.  Per the 8255x
+// datasheet, masking the SCB interrupt byte and issuing a PORT software
+// reset returns the chip to the post-reset state with RU/CU idle, all
+// causes acked, and DMA halted.  Then drop PCI Command.BME so the root
+// complex discards anything still in flight.
+static void eepro100_shutdown(net_device_t* ndev) {
+    eepro100_dev_t* d = (eepro100_dev_t*)ndev->driver_data;
+    if (!d) return;
+    if (!d->mmio_base && !d->io_base) return;
+
+    // Mask all interrupt sources (SCB INTMASK bit 0 = M = mask all).
+    e100_w8(d, EEPRO100_SCB_INTMASK, 0x01);
+
+    // PORT software reset — idles RU and CU, halts DMA, clears causes.
+    e100_w32(d, EEPRO100_SCB_PORT, EEPRO100_PORT_SOFT_RESET);
+
+    if (d->pci_dev) {
+        const pci_device_t* pdev = d->pci_dev;
+        uint32_t cmd = pci_cfg_read32(pdev->bus, pdev->device, pdev->function, 0x04);
+        cmd &= ~0x0004u; // clear Bus Master Enable
+        pci_cfg_write32(pdev->bus, pdev->device, pdev->function, 0x04, cmd);
+    }
+}
+
 // ============================================================================
 // Drain RX RFDs that the chip has filled in
 // ============================================================================
@@ -782,6 +806,7 @@ void eepro100_init(void) {
         d->net_dev.dns_server  = 0;
         d->net_dev.send        = eepro100_send;
         d->net_dev.link_status = eepro100_link_status;
+        d->net_dev.shutdown    = eepro100_shutdown;
         d->net_dev.driver_data = d;
 
         net_register(&d->net_dev);

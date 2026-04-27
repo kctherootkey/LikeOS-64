@@ -241,6 +241,38 @@ static int rtl8139_link_status(net_device_t* ndev) {
     return now_up;
 }
 
+// Quiesce the controller ahead of an ACPI S5 transition.  Per the
+// RTL8139 datasheet, leaving CR.RE/CR.TE asserted, IMR populated, or
+// CONFIG1.PMEn / CONFIG3.LWAKE / CONFIG5 wake bits set can hold PME#
+// active and prevent a clean platform power-down.  Mask interrupts,
+// clear all wake bits (CONFIG3/CONFIG5 are write-protected unless
+// 9346CR is in EEPROM-config mode), halt RX/TX, and drop bus-master.
+static void rtl8139_shutdown(net_device_t* ndev) {
+    rtl8139_dev_t* dev = (rtl8139_dev_t*)ndev->driver_data;
+    if (!dev || !dev->io_base) return;
+
+    // Mask all interrupts and ack any pending ISR bits.
+    rtl_write16(dev, RTL_IMR, 0x0000);
+    rtl_write16(dev, RTL_ISR, 0xFFFF);
+
+    // Unlock CONFIG registers (9346CR @ 0x50: 0xC0 = config-write mode).
+    rtl_write8(dev, 0x50, 0xC0);
+    rtl_write8(dev, RTL_CONFIG1, 0x00);   // PMEn=0, LWACT=0
+    rtl_write8(dev, RTL_CONFIG3, 0x00);   // Magic/LinkUp/etc wake = 0
+    rtl_write8(dev, RTL_CONFIG4, 0x00);   // LWPTN/LWPME = 0
+    rtl_write8(dev, 0x50, 0x00);          // Re-lock CONFIG
+
+    // Halt RX and TX engines.
+    rtl_write8(dev, RTL_CR, 0x00);
+
+    if (dev->pci_dev) {
+        const pci_device_t* pdev = dev->pci_dev;
+        uint32_t cmd = pci_cfg_read32(pdev->bus, pdev->device, pdev->function, 0x04);
+        cmd &= ~0x0004u; // clear Bus Master Enable
+        pci_cfg_write32(pdev->bus, pdev->device, pdev->function, 0x04, cmd);
+    }
+}
+
 // ============================================================================
 // Drain the RX ring buffer
 // ============================================================================
@@ -525,6 +557,7 @@ void rtl8139_init(void) {
         dev->net_dev.dns_server = 0;
         dev->net_dev.send = rtl8139_send;
         dev->net_dev.link_status = rtl8139_link_status;
+        dev->net_dev.shutdown = rtl8139_shutdown;
         dev->net_dev.driver_data = dev;
 
         net_register(&dev->net_dev);
