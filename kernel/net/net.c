@@ -7,6 +7,8 @@
 #include "../../include/kernel/ne2k.h"
 #include "../../include/kernel/vmxnet3.h"
 #include "../../include/kernel/eepro100.h"
+#include "../../include/kernel/igb.h"
+#include "../../include/kernel/tulip.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/memory.h"
@@ -179,6 +181,8 @@ void net_init(void) {
     ne2k_init();
     vmxnet3_init();
     eepro100_init();
+    igb_init();
+    tulip_init();
 
     // If we have a NIC, initialize DHCP state (discover sent later after sti)
     net_device_t* dev = net_get_default_device();

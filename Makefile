@@ -166,6 +166,8 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/ne2k.o \
 			  $(BUILD_DIR)/vmxnet3.o \
 			  $(BUILD_DIR)/eepro100.o \
+			  $(BUILD_DIR)/igb.o \
+			  $(BUILD_DIR)/tulip.o \
 			  $(BUILD_DIR)/ethernet.o \
 			  $(BUILD_DIR)/arp.o \
 			  $(BUILD_DIR)/ipv4.o \
@@ -323,6 +325,12 @@ $(BUILD_DIR)/vmxnet3.o: $(KERNEL_DIR)/net/nic/vmxnet3.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/eepro100.o: $(KERNEL_DIR)/net/nic/eepro100.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/igb.o: $(KERNEL_DIR)/net/nic/igb.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/tulip.o: $(KERNEL_DIR)/net/nic/tulip.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ethernet.o: $(KERNEL_DIR)/net/ethernet.c | $(BUILD_DIR)
