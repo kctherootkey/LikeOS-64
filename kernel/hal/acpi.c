@@ -1699,8 +1699,13 @@ int acpi_aml_exec_device_method_pkg3(const char* device_path,
 
 static uint32_t g_pm1a_cnt_blk = 0;
 static uint32_t g_pm1b_cnt_blk = 0;
+static ACPI_GENERIC_ADDRESS g_pm1a_cnt_gas = {0};
+static ACPI_GENERIC_ADDRESS g_pm1b_cnt_gas = {0};
 static uint16_t g_slp_typa = 0;
 static uint16_t g_slp_typb = 0;
+static uint32_t g_smi_cmd_port = 0;
+static uint8_t  g_acpi_enable = 0;
+static uint8_t  g_pm1_cnt_len = 0;
 static uint8_t  g_reset_reg_space = 0;
 static uint64_t g_reset_reg_addr = 0;
 static uint8_t  g_reset_value = 0;
@@ -1714,10 +1719,183 @@ static inline void acpi_outb(uint16_t port, uint8_t val) {
     __asm__ volatile("outb %0, %1" :: "a"(val), "Nd"(port));
 }
 
+static inline void acpi_outl(uint16_t port, uint32_t val) {
+    __asm__ volatile("outl %0, %1" :: "a"(val), "Nd"(port));
+}
+
+static inline uint8_t acpi_inb(uint16_t port) {
+    uint8_t val;
+    __asm__ volatile("inb %1, %0" : "=a"(val) : "Nd"(port));
+    return val;
+}
+
 static inline uint16_t acpi_inw(uint16_t port) {
     uint16_t val;
     __asm__ volatile("inw %1, %0" : "=a"(val) : "Nd"(port));
     return val;
+}
+
+static inline uint32_t acpi_inl(uint16_t port) {
+    uint32_t val;
+    __asm__ volatile("inl %1, %0" : "=a"(val) : "Nd"(port));
+    return val;
+}
+
+static void acpi_copy_gas(ACPI_GENERIC_ADDRESS* dst, const uint8_t raw[12]) {
+    my_memset(dst, 0, sizeof(*dst));
+    my_memcpy(dst, raw, sizeof(*dst));
+}
+
+static int acpi_gas_is_usable(const ACPI_GENERIC_ADDRESS* gas) {
+    return gas && gas->Address != 0;
+}
+
+static uint8_t acpi_gas_access_bits(const ACPI_GENERIC_ADDRESS* gas,
+                                    uint8_t legacy_len)
+{
+    if (gas) {
+        switch (gas->AccessWidth) {
+            case 1: return 8;
+            case 2: return 16;
+            case 3: return 32;
+            case 4: return 64;
+            default:
+                break;
+        }
+        if (gas->BitWidth)
+            return gas->BitWidth;
+    }
+    if (legacy_len == 1) return 8;
+    if (legacy_len >= 4) return 32;
+    return 16;
+}
+
+static uint64_t acpi_gas_map_and_get_ptr(const ACPI_GENERIC_ADDRESS* gas,
+                                         uint8_t access_bits,
+                                         volatile uint8_t** out_ptr)
+{
+    uint64_t page_base = PAGE_ALIGN_DOWN(gas->Address);
+    uint64_t offset = gas->Address - page_base;
+    size_t width_bytes = (access_bits <= 8) ? 1 :
+                         (access_bits <= 16) ? 2 :
+                         (access_bits <= 32) ? 4 : 8;
+    size_t num_pages = PAGE_ALIGN(offset + width_bytes) / PAGE_SIZE;
+    uint64_t mapped = mm_map_device_mmio(page_base, num_pages);
+    if (!mapped) {
+        *out_ptr = NULL;
+        return 0;
+    }
+    *out_ptr = (volatile uint8_t*)(mapped + offset);
+    return mapped;
+}
+
+static uint64_t acpi_gas_read(const ACPI_GENERIC_ADDRESS* gas,
+                              uint8_t legacy_len)
+{
+    if (!acpi_gas_is_usable(gas))
+        return 0;
+
+    uint8_t access_bits = acpi_gas_access_bits(gas, legacy_len);
+    if (gas->SpaceId == ACPI_ADR_SPACE_SYSTEM_IO) {
+        uint16_t port = (uint16_t)gas->Address;
+        if (access_bits <= 8) return acpi_inb(port);
+        if (access_bits <= 16) return acpi_inw(port);
+        return acpi_inl(port);
+    }
+
+    if (gas->SpaceId == ACPI_ADR_SPACE_SYSTEM_MEMORY) {
+        volatile uint8_t* ptr;
+        if (!acpi_gas_map_and_get_ptr(gas, access_bits, &ptr) || !ptr)
+            return 0;
+        if (access_bits <= 8) return *(volatile uint8_t*)ptr;
+        if (access_bits <= 16) return *(volatile uint16_t*)ptr;
+        if (access_bits <= 32) return *(volatile uint32_t*)ptr;
+        return *(volatile uint64_t*)ptr;
+    }
+
+    return 0;
+}
+
+static void acpi_gas_write(const ACPI_GENERIC_ADDRESS* gas,
+                           uint8_t legacy_len,
+                           uint64_t value)
+{
+    if (!acpi_gas_is_usable(gas))
+        return;
+
+    uint8_t access_bits = acpi_gas_access_bits(gas, legacy_len);
+    if (gas->SpaceId == ACPI_ADR_SPACE_SYSTEM_IO) {
+        uint16_t port = (uint16_t)gas->Address;
+        if (access_bits <= 8) {
+            acpi_outb(port, (uint8_t)value);
+            (void)acpi_inb(port);
+            return;
+        }
+        if (access_bits <= 16) {
+            acpi_outw(port, (uint16_t)value);
+            (void)acpi_inw(port);
+            return;
+        }
+        acpi_outl(port, (uint32_t)value);
+        (void)acpi_inl(port);
+        return;
+    }
+
+    if (gas->SpaceId == ACPI_ADR_SPACE_SYSTEM_MEMORY) {
+        volatile uint8_t* ptr;
+        if (!acpi_gas_map_and_get_ptr(gas, access_bits, &ptr) || !ptr)
+            return;
+        if (access_bits <= 8) {
+            *(volatile uint8_t*)ptr = (uint8_t)value;
+        } else if (access_bits <= 16) {
+            *(volatile uint16_t*)ptr = (uint16_t)value;
+        } else if (access_bits <= 32) {
+            *(volatile uint32_t*)ptr = (uint32_t)value;
+        } else {
+            *(volatile uint64_t*)ptr = (uint64_t)value;
+        }
+        __asm__ volatile("mfence" ::: "memory");
+        (void)acpi_gas_read(gas, legacy_len);
+    }
+}
+
+static uint64_t acpi_build_sleep_control(const ACPI_GENERIC_ADDRESS* gas,
+                                         uint8_t legacy_len,
+                                         uint8_t sleep_type,
+                                         int set_sleep_enable)
+{
+    uint64_t current = acpi_gas_read(gas, legacy_len);
+    uint64_t value = current & ~((uint64_t)0x1C00u | ACPI_PM1_SLP_EN);
+    value |= ACPI_PM1_SLP_TYP(sleep_type);
+    if (set_sleep_enable)
+        value |= ACPI_PM1_SLP_EN;
+    return value;
+}
+
+static void acpi_enable_via_fadt(void) {
+    if (!g_smi_cmd_port || !g_acpi_enable)
+        return;
+
+    acpi_outb((uint16_t)g_smi_cmd_port, g_acpi_enable);
+    for (int i = 0; i < 1000000; i++) {
+        if (g_pm1a_cnt_blk && (acpi_inw((uint16_t)g_pm1a_cnt_blk) & 0x0001))
+            break;
+        __asm__ volatile("pause");
+    }
+}
+
+static void acpi_ensure_enabled(void) {
+    UINT32 sci_enabled = 0;
+    ACPI_STATUS st = AcpiReadBitRegister(ACPI_BITREG_SCI_ENABLE, &sci_enabled);
+    if (ACPI_SUCCESS(st) && sci_enabled)
+        return;
+
+    st = AcpiEnable();
+    if (ACPI_SUCCESS(st))
+        return;
+
+    acpi_dbg("ACPI PM: AcpiEnable failed (%d), using FADT enable path\n", (int)st);
+    acpi_enable_via_fadt();
 }
 
 static int acpi_parse_s5(uint8_t *aml, uint32_t length) {
@@ -1765,6 +1943,25 @@ void acpi_pm_init(void) {
 
     g_pm1a_cnt_blk = fadt->pm1a_control_block;
     g_pm1b_cnt_blk = fadt->pm1b_control_block;
+    g_smi_cmd_port = fadt->smi_command_port;
+    g_acpi_enable = fadt->acpi_enable;
+    g_pm1_cnt_len = fadt->pm1_control_length;
+
+    if (fadt->header.length >= 196)
+        acpi_copy_gas(&g_pm1a_cnt_gas, fadt->x_pm1a_control_block);
+    if (fadt->header.length >= 208)
+        acpi_copy_gas(&g_pm1b_cnt_gas, fadt->x_pm1b_control_block);
+
+    if (!acpi_gas_is_usable(&g_pm1a_cnt_gas) && g_pm1a_cnt_blk) {
+        g_pm1a_cnt_gas.SpaceId = ACPI_ADR_SPACE_SYSTEM_IO;
+        g_pm1a_cnt_gas.Address = g_pm1a_cnt_blk;
+        g_pm1a_cnt_gas.BitWidth = g_pm1_cnt_len ? (uint8_t)(g_pm1_cnt_len * 8) : 16;
+    }
+    if (!acpi_gas_is_usable(&g_pm1b_cnt_gas) && g_pm1b_cnt_blk) {
+        g_pm1b_cnt_gas.SpaceId = ACPI_ADR_SPACE_SYSTEM_IO;
+        g_pm1b_cnt_gas.Address = g_pm1b_cnt_blk;
+        g_pm1b_cnt_gas.BitWidth = g_pm1_cnt_len ? (uint8_t)(g_pm1_cnt_len * 8) : 16;
+    }
 
     if (fadt->header.length >= 129) {
         g_reset_reg_space = fadt->reset_reg_addr_space;
@@ -1772,30 +1969,43 @@ void acpi_pm_init(void) {
         g_reset_value = fadt->reset_value;
     }
 
-    // Use ACPICA to get DSDT for S5 parsing
-    uint64_t dsdt_addr = 0;
-    if (fadt->header.length >= 148 && fadt->x_dsdt != 0)
-        dsdt_addr = fadt->x_dsdt;
-    else
-        dsdt_addr = fadt->dsdt;
+    ACPI_STATUS st = AcpiGetSleepTypeData(ACPI_STATE_S5,
+                                          (UINT8*)&g_slp_typa,
+                                          (UINT8*)&g_slp_typb);
+    if (ACPI_SUCCESS(st)) {
+        acpi_dbg("ACPI PM: ACPICA S5 sleep type: SLP_TYPa=%u SLP_TYPb=%u\n",
+                 g_slp_typa, g_slp_typb);
+    } else {
+        acpi_dbg("ACPI PM: AcpiGetSleepTypeData(S5) failed: %d\n", (int)st);
 
-    if (dsdt_addr) {
-        acpi_sdt_header_t *dsdt = (acpi_sdt_header_t *)phys_to_virt(dsdt_addr);
-        uint8_t *aml = (uint8_t *)dsdt + sizeof(acpi_sdt_header_t);
-        uint32_t aml_len = dsdt->length - sizeof(acpi_sdt_header_t);
-        if (acpi_parse_s5(aml, aml_len)) {
-            acpi_dbg("ACPI PM: S5 sleep type: SLP_TYPa=%u SLP_TYPb=%u\n",
-                    g_slp_typa, g_slp_typb);
-        } else {
-            acpi_dbg("ACPI PM: \\_S5 not found in DSDT, using defaults\n");
-            g_slp_typa = 5;
-            g_slp_typb = 0;
+        // Use ACPICA to get DSDT for S5 parsing
+        uint64_t dsdt_addr = 0;
+        if (fadt->header.length >= 148 && fadt->x_dsdt != 0)
+            dsdt_addr = fadt->x_dsdt;
+        else
+            dsdt_addr = fadt->dsdt;
+
+        if (dsdt_addr) {
+            acpi_sdt_header_t *dsdt = (acpi_sdt_header_t *)phys_to_virt(dsdt_addr);
+            uint8_t *aml = (uint8_t *)dsdt + sizeof(acpi_sdt_header_t);
+            uint32_t aml_len = dsdt->length - sizeof(acpi_sdt_header_t);
+            if (acpi_parse_s5(aml, aml_len)) {
+                acpi_dbg("ACPI PM: fallback S5 sleep type: SLP_TYPa=%u SLP_TYPb=%u\n",
+                         g_slp_typa, g_slp_typb);
+            } else {
+                acpi_dbg("ACPI PM: \\_S5 not found in DSDT, using defaults\n");
+                g_slp_typa = 5;
+                g_slp_typb = 0;
+            }
         }
     }
 
     g_pm_initialized = 1;
-    acpi_dbg("ACPI PM: initialized (PM1a=0x%x, PM1b=0x%x, reset=0x%lx)\n",
-            g_pm1a_cnt_blk, g_pm1b_cnt_blk, (unsigned long)g_reset_reg_addr);
+    acpi_dbg("ACPI PM: initialized (PM1a=0x%x, PM1b=0x%x, xPM1a=0x%llx, xPM1b=0x%llx, reset=0x%lx)\n",
+            g_pm1a_cnt_blk, g_pm1b_cnt_blk,
+            (unsigned long long)g_pm1a_cnt_gas.Address,
+            (unsigned long long)g_pm1b_cnt_gas.Address,
+            (unsigned long)g_reset_reg_addr);
 }
 
 // Quiesce all NICs before S5: clear bus-master / wake-enable / interrupt
@@ -1818,37 +2028,102 @@ void acpi_poweroff(void) {
     // be blocked by an asserted PME# from the NIC.
     net_quiesce_for_poweroff();
 
-    // Preferred path: ACPICA's full sleep API.  This evaluates _PTS(5)
-    // (Prepare-To-Sleep) which on real hardware runs the EC / ME / BIOS
-    // handshakes that allow the chipset to actually transition to G2/S5
-    // — the hand-rolled SLP_EN-poke path below skips _PTS entirely and
-    // leaves PCH-based laptops half-powered (screen black, fans off,
-    // but power LED still lit).  AcpiEnterSleepState() then disables
-    // GPEs, clears wake status, and writes the SLP_TYP/SLP_EN sequence
-    // to PM1a/PM1b in the order required by the ACPI spec.
+    acpi_ensure_enabled();
+
+    // Run _PTS(5) first so EC / firmware prepare-for-sleep methods still
+    // execute on real hardware.  On the P50 this already generates the EC
+    // transactions seen in the shutdown log.  The direct PM1 write below is
+    // then used as the actual S5 transition so we are not dependent on
+    // AcpiEnterSleepState() completing on this platform.
     ACPI_STATUS st = AcpiEnterSleepStatePrep(ACPI_STATE_S5);
-    if (ACPI_SUCCESS(st)) {
-        __asm__ volatile("cli");
-        st = AcpiEnterSleepState(ACPI_STATE_S5);
-        if (ACPI_SUCCESS(st)) {
-            for (;;) __asm__ volatile("hlt");
-        }
-        acpi_dbg("ACPI: AcpiEnterSleepState(S5) failed: %d\n", (int)st);
-    } else {
+    if (ACPI_FAILURE(st)) {
         acpi_dbg("ACPI: AcpiEnterSleepStatePrep(S5) failed: %d\n", (int)st);
     }
 
-    // Fallback path #1: hand-rolled SLP_EN write using FADT-extracted
-    // PM1 control block plus DSDT-parsed _S5 sleep type.
+    // Known-good S5 path: write SLP_TYP first, then SLP_TYP|SLP_EN.
+    // This mirrors ACPICA's legacy PM1 sequence without depending on the
+    // rest of AcpiEnterSleepState() to return on this machine.
     if (g_pm_initialized) {
+        uint64_t pm1a = 0;
+        uint64_t pm1b = 0;
+        uint64_t pm1a_before = 0;
+        uint64_t pm1b_before = 0;
+        UINT32 sci_enabled = 0;
+        ACPI_STATUS sci_st = AcpiReadBitRegister(ACPI_BITREG_SCI_ENABLE,
+                                                 &sci_enabled);
+
+        (void)AcpiWriteBitRegister(ACPI_BITREG_WAKE_STATUS, ACPI_CLEAR_STATUS);
+        (void)AcpiDisableAllGpes();
+        (void)AcpiHwClearAcpiStatus();
+        (void)AcpiEnableAllWakeupGpes();
+
+        pm1a_before = acpi_gas_read(&g_pm1a_cnt_gas, g_pm1_cnt_len);
+        if (acpi_gas_is_usable(&g_pm1b_cnt_gas))
+            pm1b_before = acpi_gas_read(&g_pm1b_cnt_gas, g_pm1_cnt_len);
+
+        acpi_dbg("ACPI PM: final S5 handoff SCI_EN=%u (status=%d) PM1a=0x%llx PM1b=0x%llx len=%u SLP_TYPa=%u SLP_TYPb=%u PM1a_before=0x%llx PM1b_before=0x%llx\n",
+                 (unsigned)sci_enabled,
+                 (int)sci_st,
+                 (unsigned long long)g_pm1a_cnt_gas.Address,
+                 (unsigned long long)g_pm1b_cnt_gas.Address,
+                 (unsigned)g_pm1_cnt_len,
+                 (unsigned)g_slp_typa,
+                 (unsigned)g_slp_typb,
+                 (unsigned long long)pm1a_before,
+                 (unsigned long long)pm1b_before);
+
         __asm__ volatile("cli");
 
-        uint16_t val = ACPI_PM1_SLP_TYP(g_slp_typa) | ACPI_PM1_SLP_EN;
-        acpi_outw((uint16_t)g_pm1a_cnt_blk, val);
+        st = AcpiEnterSleepState(ACPI_STATE_S5);
+        if (ACPI_FAILURE(st)) {
+            acpi_dbg("ACPI: AcpiEnterSleepState(S5) failed: %d; using direct PM1 fallback\n",
+                     (int)st);
+        } else {
+            acpi_dbg("ACPI: AcpiEnterSleepState(S5) returned; using direct PM1 fallback\n");
+        }
 
-        if (g_pm1b_cnt_blk) {
-            val = ACPI_PM1_SLP_TYP(g_slp_typb) | ACPI_PM1_SLP_EN;
-            acpi_outw((uint16_t)g_pm1b_cnt_blk, val);
+        pm1a = acpi_build_sleep_control(&g_pm1a_cnt_gas, g_pm1_cnt_len,
+                                        (uint8_t)g_slp_typa, 0);
+        if (acpi_gas_is_usable(&g_pm1b_cnt_gas))
+            pm1b = acpi_build_sleep_control(&g_pm1b_cnt_gas, g_pm1_cnt_len,
+                                            (uint8_t)g_slp_typb, 0);
+
+        acpi_dbg("ACPI PM: S5 write #1 PM1a=0x%llx PM1b=0x%llx\n",
+                 (unsigned long long)pm1a,
+                 (unsigned long long)pm1b);
+
+        acpi_gas_write(&g_pm1a_cnt_gas, g_pm1_cnt_len, pm1a);
+        if (acpi_gas_is_usable(&g_pm1b_cnt_gas))
+            acpi_gas_write(&g_pm1b_cnt_gas, g_pm1_cnt_len, pm1b);
+
+        pm1a |= ACPI_PM1_SLP_EN;
+        acpi_dbg("ACPI PM: S5 write #2 PM1a=0x%llx\n",
+                 (unsigned long long)pm1a);
+
+        acpi_gas_write(&g_pm1a_cnt_gas, g_pm1_cnt_len, pm1a);
+
+        if (acpi_gas_is_usable(&g_pm1b_cnt_gas)) {
+            pm1b |= ACPI_PM1_SLP_EN;
+            acpi_dbg("ACPI PM: S5 write #2 PM1b=0x%llx\n",
+                     (unsigned long long)pm1b);
+            acpi_gas_write(&g_pm1b_cnt_gas, g_pm1_cnt_len, pm1b);
+        }
+
+        if (g_slp_typa >= 4) {
+            acpi_dbg("ACPI PM: still running after S5 write, stalling before retry\n");
+            AcpiOsStall(10 * ACPI_USEC_PER_SEC);
+
+            acpi_dbg("ACPI PM: S5 retry write PM1a=0x%llx\n",
+                     (unsigned long long)ACPI_PM1_SLP_EN);
+            acpi_gas_write(&g_pm1a_cnt_gas, g_pm1_cnt_len, ACPI_PM1_SLP_EN);
+
+            if (acpi_gas_is_usable(&g_pm1b_cnt_gas)) {
+                acpi_dbg("ACPI PM: S5 retry write PM1b=0x%llx\n",
+                         (unsigned long long)ACPI_PM1_SLP_EN);
+                acpi_gas_write(&g_pm1b_cnt_gas, g_pm1_cnt_len,
+                               ACPI_PM1_SLP_EN);
+            }
+
         }
     }
 
