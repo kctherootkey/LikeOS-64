@@ -2474,8 +2474,70 @@ static void e1000e_shutdown(net_device_t* ndev) {
     // Per the PCH-LAN spec, with DRV_LOAD deasserted the firmware will
     // run its own platform shutdown path and not wait for further OS
     // intervention before allowing the S5 transition.
+    if (dev->pci_dev && e1000e_is_pch_lan(dev->pci_dev->device_id)) {
+        // Drain the MAC master before D3 so no DMA/TLP remains outstanding
+        // when ownership is returned to the firmware side.
+        uint32_t ctrl = e1000e_read(dev, E1000_CTRL);
+        e1000e_write(dev, E1000_CTRL, ctrl | (1u << 2));
+        for (int waited_us = 0; waited_us < 100000; waited_us += 100) {
+            if (!(e1000e_read(dev, E1000_STATUS) & (1u << 19))) {
+                break;
+            }
+            e1000e_delay_us(100);
+        }
+
+        // Reverse the PCH-LAN power-gating exit that init applies in D0.
+        // Leaving these clocks and MAC-side gates forced on into the S5
+        // handoff can keep the integrated LAN function warm after the rest
+        // of the platform has already started to power down.
+        uint32_t pbeccsts = e1000e_read(dev, E1000_PBECCSTS);
+        e1000e_write(dev, E1000_PBECCSTS,
+                     pbeccsts & ~E1000_PBECCSTS_ECC_ENABLE);
+
+        ctrl = e1000e_read(dev, E1000_CTRL);
+        e1000e_write(dev, E1000_CTRL, ctrl & ~E1000_CTRL_MEHE);
+
+        uint32_t dpgfr = e1000e_read(dev, E1000_DPGFR);
+        e1000e_write(dev, E1000_DPGFR, dpgfr | (1u << 2));
+
+        uint32_t pch_ctrl_ext = e1000e_read(dev, E1000_CTRL_EXT);
+        pch_ctrl_ext |= E1000_CTRL_EXT_DPG_EN |
+                        E1000_CTRL_EXT_DMA_DYN_CLK_EN;
+        e1000e_write(dev, E1000_CTRL_EXT, pch_ctrl_ext);
+
+        uint32_t fextnvm7 = e1000e_read(dev, E1000_FEXTNVM7);
+        fextnvm7 |= E1000_FEXTNVM7_DISABLE_TSYNC_CLK;
+        fextnvm7 &= ~(E1000_FEXTNVM7_ENABLE_TSYNC_INTR |
+                      E1000_FEXTNVM7_SIDE_CLK_UNGATE);
+        e1000e_write(dev, E1000_FEXTNVM7, fextnvm7);
+
+        // Undo the bring-up ownership handshake so the firmware/ME can
+        // park the integrated PHY in its shutdown state instead of keeping
+        // the link side powered on our behalf.
+        uint32_t h2me = e1000e_read(dev, E1000_H2ME);
+        h2me &= ~E1000_H2ME_ENFORCE_SETTINGS;
+        h2me |= E1000_H2ME_ULP;
+        e1000e_write(dev, E1000_H2ME, h2me);
+
+        if (e1000e_acquire_swflag(dev) == 0) {
+            uint16_t ulp_cfg = 0;
+            if (e1000e_phy_read_paged_locked(dev, E1000_I218_ULP_CONFIG1,
+                                             &ulp_cfg) == 0) {
+                ulp_cfg &= ~(E1000_I218_ULP_CONFIG1_WOL_HOST |
+                             E1000_I218_ULP_CONFIG1_INBAND_EXIT);
+                ulp_cfg |= E1000_I218_ULP_CONFIG1_RESET_TO_SMBUS |
+                           E1000_I218_ULP_CONFIG1_EN_ULP_LANPHYPC;
+                (void)e1000e_phy_write_paged_locked(dev, E1000_I218_ULP_CONFIG1,
+                                                    ulp_cfg);
+                (void)e1000e_phy_write_paged_locked(dev, E1000_I218_ULP_CONFIG1,
+                    (uint16_t)(ulp_cfg | E1000_I218_ULP_CONFIG1_START));
+            }
+            e1000e_release_swflag(dev);
+        }
+    }
+
     uint32_t ctrl_ext = e1000e_read(dev, E1000_CTRL_EXT);
-    ctrl_ext &= ~(1u << 28); // DRV_LOAD
+    ctrl_ext &= ~E1000_CTRL_EXT_DRV_LOAD;
     e1000e_write(dev, E1000_CTRL_EXT, ctrl_ext);
 
     // Drop PCI bus-mastering so any remaining in-flight TLPs are
@@ -2483,8 +2545,22 @@ static void e1000e_shutdown(net_device_t* ndev) {
     // after the OS has handed off to the firmware.
     if (dev->pci_dev) {
         const pci_device_t* pdev = dev->pci_dev;
+
+        uint8_t pm_cap = pci_find_capability(pdev, 0x01);
+        if (pm_cap) {
+            uint32_t pmcsr_dw = pci_cfg_read32(pdev->bus, pdev->device, pdev->function,
+                                               (uint8_t)(pm_cap + 4));
+            uint16_t pmcsr = (uint16_t)(pmcsr_dw & 0xFFFFu);
+            pmcsr &= ~((uint16_t)0x0100u);  // PME Enable
+            pmcsr |= 0x8000u;               // clear PME Status if latched
+            pmcsr = (uint16_t)((pmcsr & ~0x0003u) | 0x0003u); // D3hot
+            pmcsr_dw = (pmcsr_dw & 0xFFFF0000u) | pmcsr;
+            pci_cfg_write32(pdev->bus, pdev->device, pdev->function,
+                            (uint8_t)(pm_cap + 4), pmcsr_dw);
+        }
+
         uint32_t cmd = pci_cfg_read32(pdev->bus, pdev->device, pdev->function, 0x04);
-        cmd &= ~0x0004u; // clear Bus Master Enable
+        cmd &= ~0x0006u; // clear Bus Master Enable and Memory Space Enable
         pci_cfg_write32(pdev->bus, pdev->device, pdev->function, 0x04, cmd);
     }
 }
