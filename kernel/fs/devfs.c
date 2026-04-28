@@ -236,11 +236,15 @@ long devfs_read(vfs_file_t* f, void* buf, long bytes) {
         return tty_pty_master_read(df->pty_id, buf, bytes, 0);
     }
     if (df->type == DEVFS_TYPE_RANDOM) {
+        smap_disable();
         int ret = random_get_bytes(buf, (size_t)bytes, 1);
+        smap_enable();
         return ret < 0 ? -EIO : (long)ret;
     }
     if (df->type == DEVFS_TYPE_URANDOM) {
+        smap_disable();
         int ret = random_get_bytes(buf, (size_t)bytes, 0);
+        smap_enable();
         return ret < 0 ? -EIO : (long)ret;
     }
     return -EINVAL;
@@ -258,7 +262,9 @@ long devfs_write(vfs_file_t* f, const void* buf, long bytes) {
     }
     if (df->type == DEVFS_TYPE_RANDOM || df->type == DEVFS_TYPE_URANDOM) {
         // Writing to /dev/random mixes data into entropy pool
+        smap_disable();
         random_add_entropy(buf, (size_t)bytes);
+        smap_enable();
         return bytes;
     }
     return -EINVAL;

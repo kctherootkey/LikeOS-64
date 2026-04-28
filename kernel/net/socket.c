@@ -295,8 +295,10 @@ int sock_sendto(int sockfd, const void* buf, size_t len, int flags,
             extern void udp_deliver_to_socket(uint32_t src_ip, uint16_t src_port,
                                               uint16_t dst_port,
                                               const uint8_t* data, uint16_t len);
+            smap_disable();
             udp_deliver_to_socket(dst_ip, src_port, dst_port,
                                  (const uint8_t*)buf, send_len);
+            smap_enable();
             return (int)send_len;
         }
 
@@ -309,8 +311,10 @@ int sock_sendto(int sockfd, const void* buf, size_t len, int flags,
             s->bound = 1;
         }
 
+        smap_disable();
         int ret = udp_send(dev, dst_ip, src_port, dst_port,
                            (const uint8_t*)buf, send_len);
+        smap_enable();
         return ret < 0 ? ret : (int)send_len;
     }
 
@@ -352,8 +356,10 @@ int sock_recvfrom(int sockfd, void* buf, size_t len, int flags,
         uint16_t data_len = s->udp_rx_queue[idx].len;
         if (data_len > len) data_len = (uint16_t)len;
 
+        smap_disable();
         for (uint16_t i = 0; i < data_len; i++)
             ((uint8_t*)buf)[i] = s->udp_rx_queue[idx].data[i];
+        smap_enable();
 
         if (src_addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
             *src_addr = s->udp_rx_queue[idx].from;
@@ -386,7 +392,9 @@ int sock_send(int sockfd, const void* buf, size_t len, int flags) {
         if (s->tcp->state != TCP_STATE_ESTABLISHED) return -EPIPE;
 
         uint16_t send_len = len > TCP_MSS ? TCP_MSS : (uint16_t)len;
+        smap_disable();
         int ret = tcp_send_data(s->tcp, (const uint8_t*)buf, send_len);
+        smap_enable();
         return ret;
     }
 
@@ -434,9 +442,11 @@ int sock_recv(int sockfd, void* buf, size_t len, int flags) {
         uint32_t copy = avail;
         if (copy > len) copy = (uint32_t)len;
 
+        smap_disable();
         for (uint32_t i = 0; i < copy; i++) {
             ((uint8_t*)buf)[i] = conn->rx_buf[(conn->rx_head + i) % conn->rx_buf_size];
         }
+        smap_enable();
         conn->rx_head = (conn->rx_head + copy) % conn->rx_buf_size;
 
         if (conn->rx_head == conn->rx_tail)
@@ -657,6 +667,7 @@ int sock_sendmsg(int sockfd, const struct msghdr* msg, int flags) {
 
     // Calculate total length from iovec
     size_t total = 0;
+    smap_disable();
     for (int i = 0; i < msg->msg_iovlen; i++)
         total += msg->msg_iov[i].iov_len;
 
@@ -677,8 +688,12 @@ int sock_sendmsg(int sockfd, const struct msghdr* msg, int flags) {
 
     // Use sendto with optional address
     const struct sockaddr_in* dest = NULL;
-    if (msg->msg_name && msg->msg_namelen >= sizeof(struct sockaddr_in))
-        dest = (const struct sockaddr_in*)msg->msg_name;
+    struct sockaddr_in dest_copy;
+    if (msg->msg_name && msg->msg_namelen >= sizeof(struct sockaddr_in)) {
+        dest_copy = *(const struct sockaddr_in*)msg->msg_name;
+        dest = &dest_copy;
+    }
+    smap_enable();
 
     return sock_sendto(sockfd, buf, total, flags, dest,
                        dest ? sizeof(struct sockaddr_in) : 0);
@@ -692,8 +707,10 @@ int sock_recvmsg(int sockfd, struct msghdr* msg, int flags) {
 
     // Calculate total iovec capacity
     size_t total = 0;
+    smap_disable();
     for (int i = 0; i < msg->msg_iovlen; i++)
         total += msg->msg_iov[i].iov_len;
+    smap_enable();
 
     if (total == 0) return 0;
 
@@ -706,6 +723,7 @@ int sock_recvmsg(int sockfd, struct msghdr* msg, int flags) {
     if (ret < 0) return ret;
 
     // Scatter into iovecs
+    smap_disable();
     size_t off = 0;
     for (int i = 0; i < msg->msg_iovlen && off < (size_t)ret; i++) {
         size_t chunk = msg->msg_iov[i].iov_len;
@@ -720,6 +738,7 @@ int sock_recvmsg(int sockfd, struct msghdr* msg, int flags) {
         *(struct sockaddr_in*)msg->msg_name = src_addr;
         msg->msg_namelen = sizeof(struct sockaddr_in);
     }
+    smap_enable();
     msg->msg_flags = 0;
     msg->msg_controllen = 0;
 

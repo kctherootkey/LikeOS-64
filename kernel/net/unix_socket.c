@@ -1,5 +1,6 @@
 // LikeOS-64 UNIX Domain Sockets
 #include "../../include/kernel/net.h"
+#include "../../include/kernel/memory.h"
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/syscall.h"
@@ -252,7 +253,9 @@ int unix_send(int usockfd, const void* buf, size_t len, int flags) {
             next = (peer->tail + 1) % (int)sizeof(peer->buf);
             if (next == peer->head) break;
         }
+        smap_disable();
         peer->buf[peer->tail] = src[i];
+        smap_enable();
         peer->tail = next;
         sent++;
     }
@@ -288,7 +291,9 @@ int unix_recv(int usockfd, void* buf, size_t len, int flags) {
     int received = 0;
     for (size_t i = 0; i < len; i++) {
         if (us->head == us->tail) break;
+        smap_disable();
         dst[i] = us->buf[us->head];
+        smap_enable();
         us->head = (us->head + 1) % (int)sizeof(us->buf);
         received++;
     }

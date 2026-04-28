@@ -1269,7 +1269,38 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp) {
     // Socket fd markers - route to network ioctl handler
     if (file && IS_SOCKET_FD(file)) {
         int idx = SOCKET_FD_IDX(file);
-        return sock_ioctl_net(idx, (unsigned long)req, (void*)argp);
+        size_t arg_len = 0;
+        switch (req) {
+        case SIOCGIFCONF:
+            arg_len = sizeof(struct ifconf);
+            break;
+        case SIOCGIFFLAGS:
+        case SIOCSIFFLAGS:
+        case SIOCGIFADDR:
+        case SIOCSIFADDR:
+        case SIOCGIFNETMASK:
+        case SIOCSIFNETMASK:
+        case SIOCGIFBRDADDR:
+        case SIOCSIFBRDADDR:
+        case SIOCGIFMTU:
+        case SIOCSIFMTU:
+        case SIOCGIFHWADDR:
+        case SIOCGIFINDEX:
+        case SIOCGIFNAME:
+            arg_len = sizeof(struct ifreq);
+            break;
+        default:
+            arg_len = 0;
+            break;
+        }
+        if (arg_len > 0) {
+            if (!argp) return -EFAULT;
+            if (!validate_user_ptr(argp, arg_len)) return -EFAULT;
+        }
+        smap_disable();
+        int64_t ret = sock_ioctl_net(idx, (unsigned long)req, (void*)argp);
+        smap_enable();
+        return ret;
     }
 
     if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
@@ -4921,18 +4952,38 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         case SYS_SETSOCKOPT: {
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
-            if (a4 && a5 > 0 && !validate_user_ptr(a4, a5)) return -EFAULT;
-            return sock_setsockopt(idx, (int)a2, (int)a3, (const void*)a4, (socklen_t)a5);
+            socklen_t koptlen = (socklen_t)a5;
+            uint8_t koptbuf[sizeof(uint64_t)] = {0};
+            if (koptlen > 0) {
+                size_t copy_len = koptlen;
+                if (!a4) return -EFAULT;
+                if (!validate_user_ptr(a4, copy_len)) return -EFAULT;
+                if (copy_len > sizeof(koptbuf)) copy_len = sizeof(koptbuf);
+                int copy_rc = copy_from_user(koptbuf, (const void*)a4, copy_len);
+                if (copy_rc < 0) return copy_rc;
+            }
+            return sock_setsockopt(idx, (int)a2, (int)a3,
+                                   koptlen > 0 ? (const void*)koptbuf : NULL,
+                                   koptlen);
         }
 
         case SYS_GETSOCKOPT: {
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
             socklen_t koptlen = 0;
+            uint8_t koptbuf[sizeof(uint64_t)] = {0};
             if (a5 && validate_user_ptr(a5, sizeof(socklen_t)))
                 copy_from_user(&koptlen, (const void*)a5, sizeof(socklen_t));
-            if (a4 && koptlen > 0 && !validate_user_ptr(a4, koptlen)) return -EFAULT;
-            int ret = sock_getsockopt(idx, (int)a2, (int)a3, (void*)a4, &koptlen);
+            if (koptlen > 0) {
+                if (!a4) return -EFAULT;
+                if (!validate_user_ptr(a4, koptlen)) return -EFAULT;
+                if (koptlen > sizeof(koptbuf)) koptlen = sizeof(koptbuf);
+            }
+            int ret = sock_getsockopt(idx, (int)a2, (int)a3,
+                                      koptlen > 0 ? (void*)koptbuf : NULL,
+                                      &koptlen);
+            if (ret == 0 && a4 && koptlen > 0)
+                copy_to_user((void*)a4, koptbuf, koptlen);
             if (ret == 0 && a5 && validate_user_ptr(a5, sizeof(socklen_t)))
                 copy_to_user((void*)a5, &koptlen, sizeof(socklen_t));
             return ret;
