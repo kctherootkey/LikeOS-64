@@ -85,7 +85,7 @@ void keyboard_activate(void) {
             break;
         }
         if (status & KEYBOARD_STATUS_AUXDATA) {
-            break;a
+            break;
         }
         (void)inb(KEYBOARD_DATA_PORT);
     }
