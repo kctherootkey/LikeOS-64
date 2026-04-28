@@ -10,6 +10,7 @@
 #include "../../include/kernel/cursor.h"
 #include "../../include/kernel/tty.h"
 #include "../../include/kernel/ioapic.h"
+#include "../../include/kernel/keyboard.h"
 
 // Global mouse state
 static mouse_state_t mouse_state = {0};
@@ -137,6 +138,21 @@ static void mouse_flush_output(void)
             break;
         }
     }
+}
+
+static uint8_t mouse_read_controller_config(void)
+{
+    mouse_wait_input();
+    outb(PS2_COMMAND_PORT, PS2_CMD_READ_CONFIG);
+    return mouse_read_data();
+}
+
+static void mouse_write_controller_config(uint8_t config)
+{
+    mouse_wait_input();
+    outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_CONFIG);
+    mouse_wait_input();
+    outb(PS2_DATA_PORT, config);
 }
 
 // Write command to mouse via PS/2 controller
@@ -527,6 +543,7 @@ static void mouse_process_packet(void)
 void mouse_init(void)
 {
     kprintf("Initializing PS/2 mouse...\n");
+    uint8_t controller_config = 0;
 
     // Initialize mouse state
     mouse_state.x = 400; // Start in center of screen (assuming 800x600)
@@ -564,13 +581,24 @@ void mouse_init(void)
     }
     (void)bg_count; // count reserved for potential diagnostics
 
-    // Mask IRQ12 at the IOAPIC for the duration of polled init.
-    // The PS/2 controller has CTR_AUXINT set, so every response byte
-    // (ACK, BAT, device-ID) triggers IRQ12.  The IRQ handler would
-    // consume those bytes before mouse_read_data() can poll them,
-    // causing timeouts (visible as delayed init in QEMU) and, if the
-    // user moves the mouse, complete init failure.
+    // Quiesce both PS/2 IRQ lines for the duration of polled mouse init.
+    // VMware can inject keyboard bytes while the mouse setup code is
+    // polling the shared data port; if those bytes get consumed as mouse
+    // responses, the controller can come out of init in a broken state.
+    // Early boot keypresses do not need to be preserved, so keep the
+    // keyboard side disabled until the mouse path is fully configured.
+    ioapic_mask_gsi(1);
     ioapic_mask_gsi(12);
+
+    mouse_flush_output();
+    controller_config = mouse_read_controller_config();
+
+    uint8_t ctrl = controller_config;
+    ctrl |= PS2_CTR_KBDDIS;
+    ctrl &= ~PS2_CTR_KBDINT;
+    ctrl |= PS2_CTR_AUXDIS;
+    ctrl &= ~PS2_CTR_AUXINT;
+    mouse_write_controller_config(ctrl);
 
     // Drain any stale bytes from the output buffer before issuing mouse commands.
     mouse_flush_output();
@@ -604,45 +632,54 @@ void mouse_init(void)
     }
     mouse_flush_output();
 
-    // Enable mouse data reporting (robust ACK handling)
-    mouse_write_command(MOUSE_CMD_ENABLE_REPORTING, 0xFF);
-    uint8_t enable_ack = 0x00;
-    int tries = 0;
-    for(tries=0; tries<4; ++tries) {
-        enable_ack = mouse_read_data();
-        // Some emulators may leave a stray device ID (0x00 or 0x03) before ACK
-        if(enable_ack == MOUSE_ACK) {
-            break;
-        }
-        if(enable_ack == 0x00 || enable_ack == 0x03) {
-            kprintf("Mouse: ignoring stray ID 0x%02X before ACK\n", enable_ack);
-            continue; // read next
-        }
-        if(enable_ack == MOUSE_NACK) {
-            kprintf("Mouse: NACK on enable, resending...\n");
-            mouse_write_command(MOUSE_CMD_ENABLE_REPORTING, 0xFF);
-            continue;
-        }
-        if(enable_ack == MOUSE_ERROR) {
-            kprintf("ERROR: Mouse reported error (0xFC) during enable\n");
-            break;
-        }
-        // Unknown byte - continue reading a few more times
-        kprintf("Mouse: unexpected byte 0x%02X during enable sequence\n", enable_ack);
-    }
-    if(enable_ack != MOUSE_ACK) {
-        kprintf("ERROR: Mouse failed to enable reporting (final resp: 0x%02X)\n", enable_ack);
-        mouse_flush_output();
-        ioapic_unmask_gsi(12);
-        return;
-    }
-
-    mouse_state.enabled = 1;
-
-    // Drain any leftover bytes, then unmask IRQ12 so the handler
-    // can process real movement packets from now on.
+    // Drain any leftover bytes before making IRQ12 live.
     mouse_flush_output();
+
+    ctrl = controller_config;
+    ctrl |= PS2_CTR_KBDDIS;
+    ctrl &= ~PS2_CTR_KBDINT;
+    ctrl &= ~PS2_CTR_AUXDIS;
+    ctrl |= PS2_CTR_AUXINT;
+    mouse_write_controller_config(ctrl);
+
     ioapic_unmask_gsi(12);
+
+    // Only allow streaming packets after the controller-side AUX IRQ path is
+    // live; otherwise an early movement byte can sit in OBF with no IRQ edge
+    // and block both PS/2 devices behind it.
+    mouse_state.enabled = 1;
+    mouse_state.packet_index = 0;
+    mouse_state.expecting_ack = 1;
+    mouse_write_command(MOUSE_CMD_ENABLE_REPORTING, 0xFF);
+
+    // If interrupts are not yet flowing, poll a short time for the ACK.
+    for(int i = 0; i < 100000 && mouse_state.expecting_ack; ++i) {
+        uint8_t status = inb(PS2_STATUS_PORT);
+        if(status & PS2_STATUS_OUTPUT_FULL) {
+            if(!(status & PS2_STATUS_AUXDATA)) {
+                (void)inb(PS2_DATA_PORT);
+                continue;
+            }
+
+            uint8_t data = inb(PS2_DATA_PORT);
+            if(data == MOUSE_ACK) {
+                mouse_state.expecting_ack = 0;
+            }
+        }
+    }
+
+    if(mouse_state.expecting_ack) {
+        kprintf("Mouse: enable-reporting ACK pending, continuing\n");
+    }
+
+    mouse_flush_output();
+    keyboard_reset_state();
+
+    ctrl = controller_config;
+    ctrl &= ~PS2_CTR_AUXDIS;
+    ctrl |= PS2_CTR_AUXINT;
+    mouse_write_controller_config(ctrl);
+    ioapic_unmask_gsi(1);
 
     kprintf("Mouse initialized successfully\n");
     kprintf("  Position: (%d, %d)\n", mouse_state.x, mouse_state.y);

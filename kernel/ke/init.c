@@ -208,6 +208,7 @@ void continue_system_startup(void) {
 
     shell_init();
     storage_fs_set_ready(&g_storage_state);
+    keyboard_activate();
 
     while (1) {
         __asm__ volatile ("sti");

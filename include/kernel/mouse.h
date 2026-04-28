@@ -22,8 +22,15 @@
 // PS/2 Status register bits
 #define PS2_STATUS_OUTPUT_FULL  0x01
 #define PS2_STATUS_INPUT_FULL   0x02
+#define PS2_STATUS_AUXDATA      0x20
 #define PS2_STATUS_TIMEOUT      0x40
 #define PS2_STATUS_PARITY_ERROR 0x80
+
+// PS/2 controller config-register bits shared by ps2.c and mouse.c
+#define PS2_CTR_KBDINT          0x01
+#define PS2_CTR_AUXINT          0x02
+#define PS2_CTR_KBDDIS          0x10
+#define PS2_CTR_AUXDIS          0x20
 
 // Mouse commands
 #define MOUSE_CMD_ENABLE_REPORTING  0xF4

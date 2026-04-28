@@ -129,9 +129,13 @@ int ps2_init(void)
 
     i8042_flush();
 
-    // Enable both ports + interrupts
-    i8042_ctr &= ~(CTR_KBDDIS | CTR_AUXDIS);
-    i8042_ctr |= (CTR_KBDINT | CTR_AUXINT);
+    // Bring up the keyboard path only here. Leave AUX disabled until
+    // mouse_init() completes its polled reset/protocol sequence so real
+    // movement cannot race the mouse command/ACK exchange during boot.
+    i8042_ctr &= ~CTR_KBDDIS;
+    i8042_ctr |= CTR_KBDINT;
+    i8042_ctr |= CTR_AUXDIS;
+    i8042_ctr &= ~CTR_AUXINT;
     if (i8042_command(&i8042_ctr, CMD_CTL_WCTR))
         return -1;
 

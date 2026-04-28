@@ -9,6 +9,8 @@
 // Keyboard ports
 #define KEYBOARD_DATA_PORT 0x60
 #define KEYBOARD_STATUS_PORT 0x64
+#define KEYBOARD_STATUS_OUTPUT_FULL 0x01
+#define KEYBOARD_STATUS_AUXDATA 0x20
 
 // Keyboard scan codes (US QWERTY layout)
 #define KEY_ESC 0x01
@@ -69,6 +71,8 @@ typedef struct {
 
 // Function prototypes
 void keyboard_init(void);
+void keyboard_activate(void);
+void keyboard_reset_state(void);
 void keyboard_handler(void);
 uint8_t keyboard_read_scan_code(void);
 char scan_code_to_ascii(uint8_t scan_code, uint8_t shift);

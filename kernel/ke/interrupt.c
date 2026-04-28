@@ -12,6 +12,23 @@
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/e1000.h"
 
+#define PS2_STATUS_PORT         0x64
+#define PS2_STATUS_OUTPUT_FULL  0x01
+#define PS2_STATUS_AUXDATA      0x20
+
+static inline int ps2_output_is_aux(void)
+{
+    uint8_t status = inb(PS2_STATUS_PORT);
+    return (status & (PS2_STATUS_OUTPUT_FULL | PS2_STATUS_AUXDATA)) ==
+        (PS2_STATUS_OUTPUT_FULL | PS2_STATUS_AUXDATA);
+}
+
+static inline int ps2_output_is_keyboard(void)
+{
+    uint8_t status = inb(PS2_STATUS_PORT);
+    return (status & PS2_STATUS_OUTPUT_FULL) && !(status & PS2_STATUS_AUXDATA);
+}
+
 // ACPI SCI dispatch (from oslikeos.c)
 extern int acpi_sci_dispatch(void);
 #define ACPI_SCI_VECTOR  58
@@ -714,14 +731,22 @@ void irq_handler(uint64_t *regs) {
         }
         case 33:
             g_irq1_count++;
-            keyboard_irq_handler();
+            if (ps2_output_is_aux()) {
+                mouse_irq_handler();
+            } else {
+                keyboard_irq_handler();
+            }
             break;
         case 34:
             // IRQ2 is cascade - should never fire, just ACK it
             break;
         case 44:
             g_irq12_count++;
-            mouse_irq_handler();
+            if (ps2_output_is_keyboard()) {
+                keyboard_irq_handler();
+            } else {
+                mouse_irq_handler();
+            }
             break;
         default: {
             // Legacy INTx dispatch for XHCI (when MSI is not available)

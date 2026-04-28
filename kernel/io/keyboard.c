@@ -9,9 +9,22 @@
 
 // Global keyboard state
 static keyboard_state_t kb_state = {0};
+static uint8_t kb_input_ready = 0;
 
 // Spinlock for keyboard buffer protection
 static spinlock_t kb_lock = SPINLOCK_INIT("keyboard");
+
+static void keyboard_reset_state_internal(void)
+{
+    kb_state.shift_pressed = 0;
+    kb_state.ctrl_pressed = 0;
+    kb_state.alt_pressed = 0;
+    kb_state.caps_lock = 0;
+    kb_state.e0_prefix = 0;
+    kb_state.buffer_start = 0;
+    kb_state.buffer_end = 0;
+    kb_state.buffer_count = 0;
+}
 
 // US QWERTY scan code to ASCII conversion table
 static char scan_code_to_ascii_table[] = {
@@ -50,18 +63,41 @@ static char scan_code_to_ascii_shifted[] = {
 // Initialize keyboard
 void keyboard_init(void) {
     // Clear keyboard state
-    kb_state.shift_pressed = 0;
-    kb_state.ctrl_pressed = 0;
-    kb_state.alt_pressed = 0;
-    kb_state.caps_lock = 0;
-    kb_state.buffer_start = 0;
-    kb_state.buffer_end = 0;
-    kb_state.buffer_count = 0;
+    keyboard_reset_state_internal();
+    kb_input_ready = 0;
     
     // Enable keyboard IRQ (will be done in main kernel)
     // irq_enable(IRQ_KEYBOARD);
     
     kprintf("Keyboard initialized\n");
+}
+
+void keyboard_activate(void) {
+    uint64_t flags;
+
+    spin_lock_irqsave(&kb_lock, &flags);
+    keyboard_reset_state_internal();
+    spin_unlock_irqrestore(&kb_lock, flags);
+
+    for (int i = 0; i < 32; ++i) {
+        uint8_t status = inb(KEYBOARD_STATUS_PORT);
+        if (!(status & KEYBOARD_STATUS_OUTPUT_FULL)) {
+            break;
+        }
+        if (status & KEYBOARD_STATUS_AUXDATA) {
+            break;a
+        }
+        (void)inb(KEYBOARD_DATA_PORT);
+    }
+
+    kb_input_ready = 1;
+}
+
+void keyboard_reset_state(void) {
+    uint64_t flags;
+    spin_lock_irqsave(&kb_lock, &flags);
+    keyboard_reset_state_internal();
+    spin_unlock_irqrestore(&kb_lock, flags);
 }
 
 // Read scan code from keyboard
@@ -120,6 +156,10 @@ void keyboard_irq_handler(void) {
 
     // Feed keyboard timing entropy
     entropy_add_interrupt_timing((uint64_t)scan_code);
+
+    if (!kb_input_ready) {
+        return;
+    }
 
     // Handle extended key prefix (0xE0)
     if (scan_code == KEY_EXTENDED_PREFIX) {
