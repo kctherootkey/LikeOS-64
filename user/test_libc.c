@@ -1664,10 +1664,9 @@ int main(int argc, char** argv) {
     // Test 6: Time slice fairness measurement
     //
     // Strategy: use shared memory with a barrier so both parent and child
-    // start spinning at the same time.  The parent sets a "stop" flag after
-    // 200ms; both processes count iterations only while the stop flag is
-    // clear.  This eliminates skew from fork() overhead and COW faults
-    // and measures only the steady-state scheduling fairness.
+    // start spinning at the same time, then have both processes run the
+    // same timed loop.  This avoids comparing a pure spin loop against a
+    // loop that also pays repeated clock_gettime() overhead.
     printf("\n[TEST] Time slice measurement\n");
     {
         volatile unsigned long *shared = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
@@ -1675,46 +1674,54 @@ int main(int argc, char** argv) {
         if (shared != MAP_FAILED) {
             // Layout: [0]=child counter  [1]=parent counter
             //         [2]=barrier (both set their bit, spin until ==3)
-            //         [3]=stop flag
             shared[0] = 0;
             shared[1] = 0;
             shared[2] = 0;  // barrier
-            shared[3] = 0;  // stop
 
             pid_t child = fork();
             if (child == 0) {
+                struct timespec start_time, now;
+
                 // Signal ready and wait for parent
                 __atomic_or_fetch((volatile unsigned long *)&shared[2], 1, __ATOMIC_SEQ_CST);
                 while (__atomic_load_n((volatile unsigned long *)&shared[2], __ATOMIC_SEQ_CST) != 3)
                     ;  // spin-wait for barrier
 
-                // Count until parent says stop
-                unsigned long cnt = 0;
-                while (!__atomic_load_n((volatile unsigned long *)&shared[3], __ATOMIC_ACQUIRE)) {
-                    cnt++;
-                }
-                __atomic_store_n((volatile unsigned long *)&shared[0], cnt, __ATOMIC_RELEASE);
-                _exit(0);
-            } else if (child > 0) {
-                // Signal ready and wait for child
-                __atomic_or_fetch((volatile unsigned long *)&shared[2], 2, __ATOMIC_SEQ_CST);
-                while (__atomic_load_n((volatile unsigned long *)&shared[2], __ATOMIC_SEQ_CST) != 3)
-                    ;  // spin-wait for barrier
-
-                // Both are running — spin for 200ms then set the stop flag
-                struct timespec start_time, now;
                 clock_gettime(CLOCK_MONOTONIC, &start_time);
+
+                // Count for 200ms, sampling time at the same cadence as parent
                 unsigned long cnt = 0;
                 while (1) {
                     cnt++;
-                    if ((cnt & 0xFFF) == 0) {  // check clock every 4096 iters
+                    if ((cnt & 0xFFF) == 0) {
                         clock_gettime(CLOCK_MONOTONIC, &now);
                         long elapsed_ms = (now.tv_sec - start_time.tv_sec) * 1000 +
                                          (now.tv_nsec - start_time.tv_nsec) / 1000000;
                         if (elapsed_ms >= 200) break;
                     }
                 }
-                __atomic_store_n((volatile unsigned long *)&shared[3], 1, __ATOMIC_RELEASE);
+                __atomic_store_n((volatile unsigned long *)&shared[0], cnt, __ATOMIC_RELEASE);
+                _exit(0);
+            } else if (child > 0) {
+                struct timespec start_time, now;
+
+                // Signal ready and wait for child
+                __atomic_or_fetch((volatile unsigned long *)&shared[2], 2, __ATOMIC_SEQ_CST);
+                while (__atomic_load_n((volatile unsigned long *)&shared[2], __ATOMIC_SEQ_CST) != 3)
+                    ;  // spin-wait for barrier
+
+                // Both are running — do the same timed loop as the child
+                clock_gettime(CLOCK_MONOTONIC, &start_time);
+                unsigned long cnt = 0;
+                while (1) {
+                    cnt++;
+                    if ((cnt & 0xFFF) == 0) {
+                        clock_gettime(CLOCK_MONOTONIC, &now);
+                        long elapsed_ms = (now.tv_sec - start_time.tv_sec) * 1000 +
+                                         (now.tv_nsec - start_time.tv_nsec) / 1000000;
+                        if (elapsed_ms >= 200) break;
+                    }
+                }
                 __atomic_store_n((volatile unsigned long *)&shared[1], cnt, __ATOMIC_RELEASE);
 
                 waitpid(child, NULL, 0);
@@ -1727,15 +1734,14 @@ int main(int argc, char** argv) {
                 test_result("child got CPU time", child_cnt > 1000);
                 test_result("parent got CPU time", parent_cnt > 1000);
 
-                // On SMP both may get a full CPU each, so iteration counts
-                // can legitimately differ by the overhead of clock_gettime
-                // calls in the parent loop.  A 20:1 ratio would indicate
-                // real starvation; anything below that is acceptable.
+                // This is a starvation check, not a strict scheduler benchmark.
+                // Virtualized environments can still produce noticeable skew,
+                // so only fail on clearly one-sided CPU distribution.
                 if (child_cnt > 0 && parent_cnt > 0) {
                     unsigned long ratio = (child_cnt > parent_cnt) ?
                                          child_cnt / parent_cnt : parent_cnt / child_cnt;
                     printf("  Fairness ratio: %lu\n", ratio);
-                    test_result("time slice roughly fair", ratio < 20);
+                    test_result("time slice roughly fair", ratio < 8);
                 } else {
                     test_result("time slice roughly fair", 0);
                 }
