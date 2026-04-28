@@ -354,6 +354,7 @@ static void pcnet_shutdown(net_device_t* ndev) {
     pcnet_dev_t* dev = (pcnet_dev_t*)ndev->driver_data;
     if (!dev || !dev->io_base) return;
 
+    pcnet_write_csr(dev, CSR3, 0xFFFF);
     pcnet_write_csr(dev, CSR0, CSR0_STOP);
 
     if (dev->pci_dev) {
