@@ -406,6 +406,9 @@ static void vmxnet3_shutdown(net_device_t* ndev) {
     vmxnet3_dev_t* dev = (vmxnet3_dev_t*)ndev->driver_data;
     if (!dev || !dev->bar1) return;
 
+    if (dev->shared) {
+        dev->shared->devRead.intrConf.intrCtrl = VMXNET3_IC_DISABLE_ALL;
+    }
     if (dev->bar0) {
         vm_w32(dev->bar0, VMXNET3_REG_IMR + 0 * 8, 1); // mask vector 0
     }
