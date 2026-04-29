@@ -210,6 +210,15 @@ int dns_resolve_reverse(uint32_t ip_nbo, char *out, int maxlen) {
     return 0;
 }
 
+// LikeOS extension: install a resolver server. Used by the libc
+// /etc/resolv.conf reader and by `dhclient` for manual overrides.
+// `ifname` may be NULL/empty for "all interfaces"; ip_nbo==0 clears.
+int set_dns_server(const char *ifname, uint32_t ip_nbo) {
+    long ret = syscall2(SYS_SET_DNS_SERVER, (long)ifname, (long)ip_nbo);
+    if (ret < 0) { errno = (int)-ret; return -1; }
+    return 0;
+}
+
 int sethostname(const char *name, size_t len) {
     long ret = syscall2(SYS_SETHOSTNAME, (long)name, (long)len);
     if (ret < 0) { errno = (int)-ret; return -1; }

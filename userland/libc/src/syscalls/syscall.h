@@ -172,6 +172,7 @@
 #define SYS_RAW_SEND    373
 #define SYS_RAW_RECV    374
 #define SYS_DNS_RESOLVE_REVERSE 375
+#define SYS_SET_DNS_SERVER 376
 
 // NET_GETINFO sub-commands
 #define NET_GET_ARP_TABLE       1

@@ -4953,7 +4953,7 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
             socklen_t koptlen = (socklen_t)a5;
-            uint8_t koptbuf[sizeof(uint64_t)] = {0};
+            uint8_t koptbuf[256] = {0};
             if (koptlen > 0) {
                 size_t copy_len = koptlen;
                 if (!a4) return -EFAULT;
@@ -4971,7 +4971,7 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
             int idx = sock_idx_from_fd(a1);
             if (idx < 0) return idx;
             socklen_t koptlen = 0;
-            uint8_t koptbuf[sizeof(uint64_t)] = {0};
+            uint8_t koptbuf[256] = {0};
             if (a5 && validate_user_ptr(a5, sizeof(socklen_t)))
                 copy_from_user(&koptlen, (const void*)a5, sizeof(socklen_t));
             if (koptlen > 0) {
@@ -5436,6 +5436,46 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
                 copy_to_user((void*)a2, kbuf, slen + 1);
             }
             return ret;
+        }
+
+        case SYS_SET_DNS_SERVER: {
+            // a1 = ifname (user, NUL-terminated, may be NULL/empty for "all")
+            // a2 = IPv4 address in network byte order (0 to clear)
+            // RFC 3493: install resolver server.  Used by the userland
+            // /etc/resolv.conf parser at boot before DHCP completes, and
+            // by `dhclient` for manual overrides.
+            uint32_t ip_nbo = (uint32_t)a2;
+            char ifname[16] = {0};
+            int have_name = 0;
+            if (a1) {
+                if (!validate_user_ptr(a1, 1)) return -EFAULT;
+                copy_from_user(ifname, (void*)a1, sizeof(ifname) - 1);
+                ifname[sizeof(ifname) - 1] = 0;
+                if (ifname[0]) have_name = 1;
+            }
+            int updated = 0;
+            for (int i = 0; i < 16; i++) {
+                net_device_t* d = net_get_device(i);
+                if (!d) continue;
+                if (have_name) {
+                    int match = 1;
+                    for (int k = 0; k < 16; k++) {
+                        if (d->name[k] != ifname[k]) { match = 0; break; }
+                        if (!ifname[k]) break;
+                    }
+                    if (!match) continue;
+                }
+                d->dns_server = ip_nbo;
+                updated++;
+            }
+            // Loopback too, so test_libc on loopback still has a resolver.
+            net_device_t* lo = net_get_loopback();
+            if (lo && (!have_name ||
+                       (ifname[0] == 'l' && ifname[1] == 'o' && ifname[2] == 0))) {
+                lo->dns_server = ip_nbo;
+                updated++;
+            }
+            return updated > 0 ? 0 : -ENODEV;
         }
             
         default:

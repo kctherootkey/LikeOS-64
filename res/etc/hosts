@@ -1,0 +1,5 @@
+# /etc/hosts — LikeOS-64 static name database (RFC 952 / RFC 1123 syntax).
+# Format:  IPv4-address  canonical-name  [aliases...]
+
+127.0.0.1   localhost localhost.localdomain
+127.0.0.1   r00tbox

@@ -85,6 +85,12 @@ void net_quiesce_for_poweroff(void) {
 // Called from timer IRQ
 void net_timer_tick(void) {
     tcp_timer_tick();
+    static uint64_t dhcp_last = 0;
+    uint64_t now = timer_ticks();
+    if (now - dhcp_last >= 100) {   // ~1 Hz at 100Hz timer
+        dhcp_last = now;
+        dhcp_tick();
+    }
 }
 
 // Called by NIC driver on packet receive
@@ -195,6 +201,7 @@ void net_init(void) {
     udp_init();
     tcp_init();
     socket_init();
+    igmp_init();
 
     // Initialize routing table
     route_init();

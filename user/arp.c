@@ -88,13 +88,20 @@ static void show_arp_table(int bsd_style, int numeric, const char *filter_iface,
     if (filter_host) {
         filter_ip = ntohl(inet_addr(filter_host));
         if (filter_ip == 0) {
-            /* Try DNS resolve */
-            uint32_t resolved;
-            if (dns_resolve(filter_host, &resolved) == 0)
-                filter_ip = resolved;
-            else {
-                fprintf(stderr, "arp: %s: Unknown host\n", filter_host);
-                return;
+            /* Consult /etc/hosts (and built-in localhost) before DNS. */
+            struct hostent *he = gethostbyname(filter_host);
+            if (he && he->h_addr_list && he->h_addr_list[0] && he->h_length == 4) {
+                uint32_t a;
+                memcpy(&a, he->h_addr_list[0], 4);
+                filter_ip = ntohl(a);
+            } else {
+                uint32_t resolved;
+                if (dns_resolve(filter_host, &resolved) == 0)
+                    filter_ip = resolved;
+                else {
+                    fprintf(stderr, "arp: %s: Unknown host\n", filter_host);
+                    return;
+                }
             }
         }
     }
@@ -141,14 +148,19 @@ static int delete_entry(const char *hostname, const char *iface,
     sin->sin_addr.s_addr = inet_addr(hostname);
 
     if (sin->sin_addr.s_addr == 0xFFFFFFFF) {
-        /* Try DNS */
-        uint32_t resolved;
-        if (dns_resolve(hostname, &resolved) == 0)
-            sin->sin_addr.s_addr = htonl(resolved);
-        else {
-            fprintf(stderr, "arp: %s: Unknown host\n", hostname);
-            close(fd);
-            return -1;
+        /* Consult /etc/hosts (and built-in localhost) before DNS. */
+        struct hostent *he = gethostbyname(hostname);
+        if (he && he->h_addr_list && he->h_addr_list[0] && he->h_length == 4) {
+            memcpy(&sin->sin_addr.s_addr, he->h_addr_list[0], 4);
+        } else {
+            uint32_t resolved;
+            if (dns_resolve(hostname, &resolved) == 0)
+                sin->sin_addr.s_addr = htonl(resolved);
+            else {
+                fprintf(stderr, "arp: %s: Unknown host\n", hostname);
+                close(fd);
+                return -1;
+            }
         }
     }
 
@@ -181,13 +193,19 @@ static int set_entry(const char *hostname, const char *hw_addr,
     sin->sin_addr.s_addr = inet_addr(hostname);
 
     if (sin->sin_addr.s_addr == 0xFFFFFFFF) {
-        uint32_t resolved;
-        if (dns_resolve(hostname, &resolved) == 0)
-            sin->sin_addr.s_addr = htonl(resolved);
-        else {
-            fprintf(stderr, "arp: %s: Unknown host\n", hostname);
-            close(fd);
-            return -1;
+        /* Consult /etc/hosts (and built-in localhost) before DNS. */
+        struct hostent *he = gethostbyname(hostname);
+        if (he && he->h_addr_list && he->h_addr_list[0] && he->h_length == 4) {
+            memcpy(&sin->sin_addr.s_addr, he->h_addr_list[0], 4);
+        } else {
+            uint32_t resolved;
+            if (dns_resolve(hostname, &resolved) == 0)
+                sin->sin_addr.s_addr = htonl(resolved);
+            else {
+                fprintf(stderr, "arp: %s: Unknown host\n", hostname);
+                close(fd);
+                return -1;
+            }
         }
     }
 

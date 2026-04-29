@@ -160,9 +160,28 @@ typedef struct __attribute__((packed)) {
 #define ICMP_ECHO_REPLY     0
 #define ICMP_ECHO_REQUEST   8
 #define ICMP_DEST_UNREACH   3
+#define ICMP_REDIRECT       5
 #define ICMP_TIME_EXCEEDED  11
+#define ICMP_PARAM_PROBLEM  12
+#define ICMP_TIMESTAMP      13
+#define ICMP_TIMESTAMP_REPLY 14
+#define ICMP_ADDRMASK       17
+#define ICMP_ADDRMASK_REPLY 18
 #define ICMP_PORT_UNREACH   3   // Code for destination unreachable
+#define ICMP_NET_UNREACH    0   // codes for DEST_UNREACH
+#define ICMP_HOST_UNREACH   1
+#define ICMP_PROTO_UNREACH  2
 #define ICMP_FRAG_NEEDED    4
+#define ICMP_SRC_QUENCH     4   // type, deprecated per RFC 6633
+
+// PMTU cache (32-entry LRU)
+#define PMTU_CACHE_SIZE     32
+typedef struct {
+    uint32_t dst_ip;
+    uint16_t mtu;
+    uint16_t pad;
+    uint64_t last_use;
+} pmtu_entry_t;
 
 // ============================================================================
 // UDP Header
@@ -221,19 +240,82 @@ typedef struct __attribute__((packed)) {
 #define TCP_MAX_RETRANSMITS     5
 #define TCP_SYN_RETRANSMIT_TICKS 300    // 3 seconds
 #define TCP_MAX_OPTIONS         40
-#define TCP_MAX_INFLIGHT        8
+#define TCP_MAX_INFLIGHT        32
 
 // TCP options
 #define TCP_OPT_END             0
 #define TCP_OPT_NOP             1
 #define TCP_OPT_MSS             2
 #define TCP_OPT_MSS_LEN         4
+#define TCP_OPT_WSCALE          3
+#define TCP_OPT_WSCALE_LEN      3
+#define TCP_OPT_SACK_PERM       4
+#define TCP_OPT_SACK_PERM_LEN   2
+#define TCP_OPT_SACK            5       // variable length: 2 + 8*n
+#define TCP_OPT_TIMESTAMP       8
+#define TCP_OPT_TIMESTAMP_LEN   10
+
+// Out-of-order receive queue (per-conn)
+#define TCP_MAX_OOO             16
+#define TCP_MAX_SACK_BLOCKS     4
+
+// TCP-level sockopts (IPPROTO_TCP)
+#define TCP_NODELAY             1
+#define TCP_MAXSEG              2
+#define TCP_CORK                3
+#define TCP_KEEPIDLE            4
+#define TCP_KEEPINTVL           5
+#define TCP_KEEPCNT             6
+#define TCP_INFO                11
+
+// tcp_info option flag bits (returned in tcpi_options)
+#define TCPI_OPT_TIMESTAMPS     1
+#define TCPI_OPT_SACK           2
+#define TCPI_OPT_WSCALE         4
+#define TCPI_OPT_ECN            8
+
+// Public TCP_INFO struct (matches conventional layout for portability)
+struct tcp_info {
+    uint8_t  tcpi_state;
+    uint8_t  tcpi_ca_state;
+    uint8_t  tcpi_retransmits;
+    uint8_t  tcpi_probes;
+    uint8_t  tcpi_backoff;
+    uint8_t  tcpi_options;
+    uint8_t  tcpi_snd_wscale_rcv_wscale; // packed: hi=snd, lo=rcv
+    uint8_t  tcpi_pad0;
+    uint32_t tcpi_rto;          // microseconds
+    uint32_t tcpi_ato;
+    uint32_t tcpi_snd_mss;
+    uint32_t tcpi_rcv_mss;
+    uint32_t tcpi_unacked;
+    uint32_t tcpi_sacked;
+    uint32_t tcpi_lost;
+    uint32_t tcpi_retrans;
+    uint32_t tcpi_fackets;
+    uint32_t tcpi_last_data_sent;
+    uint32_t tcpi_last_ack_sent;
+    uint32_t tcpi_last_data_recv;
+    uint32_t tcpi_last_ack_recv;
+    uint32_t tcpi_pmtu;
+    uint32_t tcpi_rcv_ssthresh;
+    uint32_t tcpi_rtt;          // microseconds (smoothed)
+    uint32_t tcpi_rttvar;       // microseconds
+    uint32_t tcpi_snd_ssthresh;
+    uint32_t tcpi_snd_cwnd;     // segments
+    uint32_t tcpi_advmss;
+    uint32_t tcpi_reordering;
+    uint32_t tcpi_rcv_rtt;
+    uint32_t tcpi_rcv_space;
+    uint32_t tcpi_total_retrans;
+};
 
 typedef struct tcp_inflight_segment {
     uint32_t seq;
     uint16_t len;
     uint8_t flags;
     uint8_t retransmit_count;
+    uint64_t send_us;           // Send timestamp (for RTT measurement, RFC 6298)
     uint8_t data[TCP_MSS];
 } tcp_inflight_segment_t;
 
@@ -298,6 +380,78 @@ typedef struct tcp_conn {
     volatile int tx_ready;      // Space available in tx_buf
     volatile int accept_ready;  // Connection pending in accept_queue
     volatile int connect_done;  // Connect completed (or failed)
+
+    // RFC 6298 RTT/RTO state
+    uint32_t srtt_us;           // Smoothed RTT in microseconds (0 = no sample yet)
+    uint32_t rttvar_us;         // RTT variation in microseconds
+    uint32_t rto_us;            // Retransmission timeout in microseconds
+    uint8_t  rto_backoff;       // Karn-style exponential backoff exponent
+
+    // RFC 5681 NewReno congestion control
+    uint32_t cwnd;              // Congestion window (in segments)
+    uint32_t ssthresh;          // Slow-start threshold (segments)
+    uint32_t dup_acks;          // Duplicate ACK counter (fast retransmit)
+    uint32_t total_retrans;
+
+    // TCP_NODELAY / Nagle
+    int      nodelay;
+
+    // Keepalive (RFC 1122 / SO_KEEPALIVE)
+    int      keepalive;
+    uint32_t keepidle_ticks;
+    uint32_t keepintvl_ticks;
+    uint32_t keepcnt;
+    uint32_t keep_probes_sent;
+    uint64_t keep_next_tick;
+    uint64_t last_rx_tick;
+
+    // RFC 7323 TCP Timestamps (TSopt, kind=8 len=10)
+    uint8_t  ts_enabled;        // negotiated successfully
+    uint32_t ts_recent;         // most recent TSval received in-window
+    uint32_t ts_recent_age;     // tick when ts_recent was set (for PAWS)
+    uint32_t ts_offset;         // per-conn TSval offset (RFC 7323 Appx A;
+                                // hides absolute boot time and gives each
+                                // 4-tuple an independent TS clock origin)
+
+    // RFC 7323 Window Scaling (kind=3 len=3)
+    uint8_t  ws_enabled;        // negotiated
+    uint8_t  snd_wscale;        // scaling for our send window (peer's advertised)
+    uint8_t  rcv_wscale;        // scaling we apply to our advertised window
+
+    // RFC 2018 SACK
+    uint8_t  sack_ok;           // both sides advertised SACK Permitted
+    uint8_t  sack_block_count;  // number of valid OOO blocks for SACK gen
+    struct {
+        uint32_t left;
+        uint32_t right;
+    } sack_blocks[TCP_MAX_SACK_BLOCKS];
+
+    // Out-of-order receive queue (small per-conn buffer; data dropped if full)
+    struct {
+        uint32_t seq;
+        uint16_t len;
+        uint8_t  data[TCP_MSS];
+    } ooo[TCP_MAX_OOO];
+    uint8_t  ooo_count;
+
+    // Delayed ACK (RFC 1122 §4.2.3.2): defer up to 200ms / every 2nd seg
+    uint8_t  delayed_ack_pending;
+    uint8_t  segs_since_ack;
+    uint64_t delayed_ack_deadline;
+
+    // TCP_CORK (coalesce short writes)
+    uint8_t  cork;
+    uint64_t cork_deadline;
+
+    // FIN_WAIT_2 timeout (60s) — RFC 1122 says SHOULD discard
+    uint64_t fin_wait_2_deadline;
+
+    // Urgent (URG) - RFC 793 / RFC 6093
+    uint8_t  urgent_valid;       // we have an OOB byte queued (in band)
+    uint8_t  urgent_byte;        // last received OOB byte (when !oobinline)
+    uint32_t snd_up;             // outgoing urgent pointer (seq of OOB)
+    uint32_t rcv_up;             // most recent received urgent ptr (sequence)
+    uint8_t  snd_urg_pending;    // we owe an URG segment
 } tcp_conn_t;
 
 // ============================================================================
@@ -349,16 +503,80 @@ typedef struct __attribute__((packed)) {
 #define PF_UNIX         AF_UNIX
 
 #define SOL_SOCKET      1
+#define SOL_IP          0
+#define SOL_TCP         6
+#define SOL_UDP         17
 #define SO_REUSEADDR    2
-#define SO_KEEPALIVE    9
-#define SO_RCVTIMEO     20
-#define SO_SNDTIMEO     21
+#define SO_TYPE         3
 #define SO_ERROR        4
+#define SO_BROADCAST    6
 #define SO_SNDBUF       7
 #define SO_RCVBUF       8
+#define SO_KEEPALIVE    9
+#define SO_OOBINLINE    10
+#define SO_LINGER       13
+#define SO_REUSEPORT    15
+#define SO_RCVTIMEO     20
+#define SO_SNDTIMEO     21
+#define SO_BINDTODEVICE 25
 
+// IP-level sockopts (SOL_IP)
+#define IP_TOS                  1
+#define IP_TTL                  2
+#define IP_HDRINCL              3
+#define IP_MULTICAST_IF         32
+#define IP_MULTICAST_TTL        33
+#define IP_MULTICAST_LOOP       34
+#define IP_ADD_MEMBERSHIP       35
+#define IP_DROP_MEMBERSHIP      36
+#define IP_PKTINFO              8
+#define IP_RECVTTL              12
+#define IP_RECVTOS              13
+#define IP_MTU_DISCOVER         10
+#define IP_OPTIONS              4
+
+// cmsghdr (RFC 2292)
+struct cmsghdr {
+    uint32_t    cmsg_len;
+    int         cmsg_level;
+    int         cmsg_type;
+};
+#define CMSG_ALIGN(len) (((len) + sizeof(long) - 1) & ~(sizeof(long) - 1))
+#define CMSG_DATA(cmsg) ((unsigned char*)((cmsg) + 1))
+#define CMSG_LEN(len)   (CMSG_ALIGN(sizeof(struct cmsghdr)) + (len))
+#define CMSG_SPACE(len) (CMSG_ALIGN(sizeof(struct cmsghdr)) + CMSG_ALIGN(len))
+#define CMSG_FIRSTHDR(mhdr) \
+    ((mhdr)->msg_controllen >= sizeof(struct cmsghdr) ? \
+     (struct cmsghdr*)(mhdr)->msg_control : (struct cmsghdr*)0)
+#define CMSG_NXTHDR(mhdr, cmsg) \
+    (((unsigned char*)(cmsg) + CMSG_ALIGN((cmsg)->cmsg_len) + sizeof(struct cmsghdr) > \
+      (unsigned char*)(mhdr)->msg_control + (mhdr)->msg_controllen) ? \
+     (struct cmsghdr*)0 : \
+     (struct cmsghdr*)((unsigned char*)(cmsg) + CMSG_ALIGN((cmsg)->cmsg_len)))
+
+struct linger {
+    int l_onoff;
+    int l_linger;
+};
+
+struct in_addr_fwd { uint32_t s_addr; };  /* internal forward */
+
+struct ip_mreq {
+    struct in_addr_fwd imr_multiaddr;   // multicast group address
+    struct in_addr_fwd imr_interface;   // local interface address (any = 0)
+};
+
+struct in_pktinfo {
+    int                ipi_ifindex;
+    struct in_addr_fwd ipi_spec_dst;
+    struct in_addr_fwd ipi_addr;
+};
+
+#define IPPROTO_IP      0
+#define IPPROTO_ICMP    1
 #define IPPROTO_TCP     6
 #define IPPROTO_UDP     17
+#define IPPROTO_RAW     255
 
 #define SHUT_RD         0
 #define SHUT_WR         1
@@ -366,6 +584,16 @@ typedef struct __attribute__((packed)) {
 
 #define INADDR_ANY      0
 #define INADDR_BROADCAST 0xFFFFFFFF
+
+// recv/send flags
+#define MSG_PEEK        0x02
+#define MSG_DONTWAIT    0x40
+#define MSG_WAITALL     0x100
+#define MSG_TRUNC       0x20
+#define MSG_CTRUNC      0x08
+#define MSG_OOB         0x01
+#define MSG_NOSIGNAL    0x4000
+#define MSG_TRUNC       0x20
 
 #define NET_MAX_SOCKETS 128
 
@@ -413,6 +641,10 @@ typedef struct net_socket {
         uint8_t data[NET_RX_BUF_SIZE];
         uint16_t len;
         struct sockaddr_in from;
+        uint32_t dst_ip;        // Local destination IP (for IP_PKTINFO)
+        uint8_t  ttl;           // Received TTL  (for IP_RECVTTL)
+        uint8_t  tos;           // Received TOS  (for IP_RECVTOS)
+        uint32_t ifindex;       // Interface index (for IP_PKTINFO)
     } udp_rx_queue[16];
     int udp_rx_head;
     int udp_rx_tail;
@@ -420,7 +652,28 @@ typedef struct net_socket {
 
     // Socket options
     int reuse_addr;
+    int reuse_port;
+    int broadcast;
+    int oobinline;
+    int sndbuf_size;
+    int rcvbuf_size;
+    int linger_onoff;
+    int linger_seconds;
+    char bindtodevice[16];
     uint64_t rcv_timeout_ticks; // 0 = infinite
+
+    // IP-level options
+    uint8_t ip_ttl;
+    uint8_t ip_tos;
+    uint8_t ip_hdrincl;
+    uint8_t ip_recvpktinfo;
+    uint8_t ip_recvttl;
+    uint8_t ip_recvtos;
+    uint8_t mcast_ttl;
+    uint8_t mcast_loop;
+    uint32_t mcast_if;
+#define NET_MAX_MCAST_GROUPS 8
+    uint32_t mcast_groups[NET_MAX_MCAST_GROUPS];   // host byte order; 0 = empty slot
 
     spinlock_t lock;
     int active;
@@ -457,6 +710,33 @@ int  arp_cache_lookup(uint32_t ip, uint8_t mac_out[ETH_ALEN]);
 void arp_rx(net_device_t* dev, const uint8_t* data, uint16_t len);
 void arp_request(net_device_t* dev, uint32_t target_ip);
 void arp_add_entry(uint32_t ip, const uint8_t mac[ETH_ALEN]);
+// RFC 5227 ARP probe (DAD): sends 3 probes ~200ms apart with sender_ip=0,
+// returns 0 if no collision detected, -1 if a reply for `ip` was seen.
+int  arp_probe(net_device_t* dev, uint32_t ip);
+// Send a gratuitous ARP reply to announce the given IP on the LAN.
+void arp_gratuitous(net_device_t* dev, uint32_t ip);
+void arp_del_entry(uint32_t ip);
+
+// ============================================================================
+// IGMPv2 (RFC 2236) — minimal: send membership reports on join, leaves on drop
+// ============================================================================
+void igmp_init(void);
+int  igmp_join(net_device_t* dev, uint32_t group);    // group in host byte order
+int  igmp_leave(net_device_t* dev, uint32_t group);
+void igmp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t len);
+
+// ============================================================================
+// Raw socket dispatch (called from ipv4_rx for SOCK_RAW)
+// ============================================================================
+void raw_socket_deliver(uint32_t src_ip, uint32_t dst_ip, uint8_t protocol,
+                        const uint8_t* ip_packet, uint16_t total_len);
+
+// Post an asynchronous error (e.g. from ICMP) onto a UDP/TCP socket bound to
+// the given 4-tuple.  proto is IP_PROTO_TCP or IP_PROTO_UDP.
+void sock_post_icmp_error(uint8_t proto,
+                          uint32_t src_ip, uint16_t src_port,
+                          uint32_t dst_ip, uint16_t dst_port,
+                          int error);
 
 // ============================================================================
 // IPv4 API
@@ -466,6 +746,13 @@ int  ipv4_send(net_device_t* dev, uint32_t dst_ip, uint8_t protocol,
                const uint8_t* payload, uint16_t len);
 int  ipv4_send_ttl(net_device_t* dev, uint32_t dst_ip, uint8_t protocol,
                    const uint8_t* payload, uint16_t len, uint8_t ttl);
+// Full control: TTL + TOS, used by SOCK_RAW / per-socket IP_TTL/IP_TOS.
+int  ipv4_send_full(net_device_t* dev, uint32_t dst_ip, uint8_t protocol,
+                    const uint8_t* payload, uint16_t len,
+                    uint8_t ttl, uint8_t tos);
+// Send caller-supplied IP packet verbatim (SOCK_RAW with IP_HDRINCL).
+int  ipv4_send_raw(net_device_t* dev, uint32_t dst_ip,
+                   const uint8_t* full_ip_packet, uint16_t total_len);
 void ipv4_rx(net_device_t* dev, const uint8_t* data, uint16_t len);
 uint16_t ipv4_checksum(const void* data, uint16_t len);
 
@@ -477,19 +764,28 @@ int  icmp_send_error_packet(net_device_t* dev, uint32_t dst_ip,
                             uint8_t type, uint8_t code,
                             const uint8_t* quoted_ip_packet,
                             uint16_t quoted_len, uint32_t aux_data);
+// Dispatch an inbound ICMP error to the matching socket / TCP conn.
+void icmp_dispatch_error(uint8_t icmp_type, uint8_t icmp_code,
+                         const uint8_t* inner_ip, uint16_t inner_len,
+                         uint16_t mtu_hint);
+
+// PMTU cache (RFC 1191)
+void     pmtu_set(uint32_t dst_ip, uint16_t mtu);
+uint16_t pmtu_get(uint32_t dst_ip);    // returns 0 if no entry
 
 // ============================================================================
 // UDP API
 // ============================================================================
 void udp_init(void);
 void udp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
-            const uint8_t* data, uint16_t len);
+            const uint8_t* data, uint16_t len, uint8_t ttl, uint8_t tos);
 int  udp_send(net_device_t* dev, uint32_t dst_ip,
               uint16_t src_port, uint16_t dst_port,
               const uint8_t* data, uint16_t len);
 void udp_deliver_to_socket(uint32_t src_ip, uint16_t src_port,
                            uint32_t dst_ip, uint16_t dst_port,
-                           const uint8_t* data, uint16_t len);
+                           const uint8_t* data, uint16_t len,
+                           uint8_t ttl, uint8_t tos, net_device_t* dev);
 
 // ============================================================================
 // TCP API
@@ -498,18 +794,25 @@ void tcp_init(void);
 void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
             const uint8_t* data, uint16_t len);
 int  tcp_send_data(tcp_conn_t* conn, const uint8_t* data, uint16_t len);
+int  tcp_send_oob(tcp_conn_t* conn, uint8_t byte);
+int  tcp_at_mark(tcp_conn_t* conn);
+void tcp_handle_pmtu(uint32_t local_ip, uint16_t local_port,
+                     uint32_t remote_ip, uint16_t remote_port,
+                     uint16_t new_mtu);
 tcp_conn_t* tcp_connect(net_device_t* dev, uint32_t local_ip, uint32_t dst_ip,
                         uint16_t src_port, uint16_t dst_port);
 tcp_conn_t* tcp_listen(net_device_t* dev, uint32_t local_ip,
                        uint16_t local_port, int backlog);
 tcp_conn_t* tcp_accept(tcp_conn_t* listener);
 int  tcp_close(tcp_conn_t* conn);
+void tcp_abort(tcp_conn_t* conn);   // Send RST and free (SO_LINGER l_onoff=0)
 void tcp_timer_tick(void);
 int  tcp_send_segment(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                       uint16_t src_port, uint16_t dst_port,
                       uint32_t seq, uint32_t ack,
                       uint8_t flags, uint16_t window,
                       const uint8_t* data, uint16_t data_len);
+void tcp_fill_info(tcp_conn_t* conn, struct tcp_info* info);
 
 // ============================================================================
 // DHCP API
@@ -990,6 +1293,7 @@ int  net_get_udp_sockets(net_udp_info_t* entries, int max_entries);
 int  net_get_iface_info(net_iface_info_t* entries, int max_entries);
 int  dhcp_release(net_device_t* dev);
 int  dhcp_renew(net_device_t* dev);
+void dhcp_tick(void);
 int  dhcp_get_status(void);
 // Invalidate the cached lease without sending a RELEASE.  Called by
 // link drivers on a link-DOWN edge so the next dhcp_renew() will

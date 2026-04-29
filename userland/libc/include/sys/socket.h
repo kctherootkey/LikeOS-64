@@ -25,15 +25,29 @@
 
 // Socket option levels
 #define SOL_SOCKET      1
+#define SOL_IP          0
+#define SOL_TCP         6
+#define SOL_UDP         17
 
-// Socket options
+// Socket options (SOL_SOCKET)
 #define SO_REUSEADDR    2
+#define SO_TYPE         3
 #define SO_ERROR        4
-#define SO_KEEPALIVE    9
+#define SO_BROADCAST    6
 #define SO_SNDBUF       7
 #define SO_RCVBUF       8
+#define SO_KEEPALIVE    9
+#define SO_OOBINLINE    10
+#define SO_LINGER       13
+#define SO_REUSEPORT    15
 #define SO_RCVTIMEO     20
 #define SO_SNDTIMEO     21
+#define SO_BINDTODEVICE 25
+
+struct linger {
+    int l_onoff;
+    int l_linger;
+};
 
 // Shutdown modes
 #define SHUT_RD         0
@@ -68,6 +82,26 @@ struct msghdr {
     size_t        msg_controllen;
     int           msg_flags;
 };
+
+// Ancillary data records — RFC 2292 §4.2.
+struct cmsghdr {
+    socklen_t cmsg_len;
+    int       cmsg_level;
+    int       cmsg_type;
+};
+
+#define CMSG_ALIGN(n)   (((n) + sizeof(long) - 1) & ~(sizeof(long) - 1))
+#define CMSG_DATA(c)    ((unsigned char*)((struct cmsghdr*)(c) + 1))
+#define CMSG_LEN(l)     (CMSG_ALIGN(sizeof(struct cmsghdr)) + (l))
+#define CMSG_SPACE(l)   (CMSG_ALIGN(sizeof(struct cmsghdr)) + CMSG_ALIGN(l))
+#define CMSG_FIRSTHDR(m) \
+    ((m)->msg_controllen >= sizeof(struct cmsghdr) \
+        ? (struct cmsghdr*)(m)->msg_control : (struct cmsghdr*)0)
+#define CMSG_NXTHDR(m, c) \
+    (((unsigned char*)(c) + CMSG_ALIGN((c)->cmsg_len) + sizeof(struct cmsghdr) > \
+      (unsigned char*)(m)->msg_control + (m)->msg_controllen) \
+        ? (struct cmsghdr*)0 \
+        : (struct cmsghdr*)((unsigned char*)(c) + CMSG_ALIGN((c)->cmsg_len)))
 
 // Socket syscall wrappers
 int socket(int domain, int type, int protocol);

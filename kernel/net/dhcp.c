@@ -21,6 +21,11 @@
 #define DHCP_OPT_HOSTNAME       12
 #define DHCP_OPT_REQ_IP         50
 #define DHCP_OPT_LEASE_TIME     51
+#define DHCP_OPT_T1             58
+#define DHCP_OPT_T2             59
+#define DHCP_OPT_DOMAIN_NAME    15
+#define DHCP_OPT_CLASSLESS_ROUTES 121   // RFC 3442
+#define DHCP_OPT_DOMAIN_SEARCH    119   // RFC 3397
 #define DHCP_OPT_MSG_TYPE       53
 #define DHCP_OPT_SERVER_ID      54
 #define DHCP_OPT_PARAM_LIST     55
@@ -35,16 +40,23 @@
 #define DHCP_BOOTREPLY      2
 #define DHCP_MAGIC_COOKIE   0x63825363
 
-// DHCP states
+// DHCP states (RFC 2131 §4.4)
 #define DHCP_STATE_IDLE         0
 #define DHCP_STATE_DISCOVERING  1
 #define DHCP_STATE_REQUESTING   2
 #define DHCP_STATE_BOUND        3
+#define DHCP_STATE_RENEWING     4
+#define DHCP_STATE_REBINDING    5
 
 static int dhcp_state = DHCP_STATE_IDLE;
 static uint32_t dhcp_xid = 0;
 static uint32_t dhcp_server_ip = 0;
 static uint32_t dhcp_offered_ip = 0;
+static uint64_t dhcp_lease_start_ticks = 0;     // 100Hz
+static uint32_t dhcp_lease_seconds = 0;
+static uint32_t dhcp_t1_seconds = 0;            // RFC 2131 §4.4.5: lease/2
+static uint32_t dhcp_t2_seconds = 0;            // 0.875 * lease
+static net_device_t* dhcp_bound_dev = NULL;
 
 // Offset of the variable-length options[] field inside dhcp_packet_t.
 // sizeof(dhcp_packet_t) includes a fixed 312-byte options array, but real
@@ -132,7 +144,9 @@ static int dhcp_send(net_device_t* dev, uint8_t* pkt, int pktlen) {
 static void dhcp_parse_options(const uint8_t* options, int optlen,
                                uint8_t* msg_type, uint32_t* subnet,
                                uint32_t* router, uint32_t* dns,
-                               uint32_t* server_id, uint32_t* lease) {
+                               uint32_t* server_id, uint32_t* lease,
+                               uint32_t* t1, uint32_t* t2,
+                               const uint8_t** classless, int* classless_len) {
     int i = 0;
     while (i < optlen) {
         uint8_t opt = options[i++];
@@ -177,6 +191,24 @@ static void dhcp_parse_options(const uint8_t* options, int optlen,
                                    ((uint32_t)options[i+2] << 8) |
                                    options[i+3];
             break;
+        case DHCP_OPT_T1:
+            if (len >= 4 && t1) *t1 = ((uint32_t)options[i] << 24) |
+                                      ((uint32_t)options[i+1] << 16) |
+                                      ((uint32_t)options[i+2] << 8) |
+                                      options[i+3];
+            break;
+        case DHCP_OPT_T2:
+            if (len >= 4 && t2) *t2 = ((uint32_t)options[i] << 24) |
+                                      ((uint32_t)options[i+1] << 16) |
+                                      ((uint32_t)options[i+2] << 8) |
+                                      options[i+3];
+            break;
+        case DHCP_OPT_CLASSLESS_ROUTES:
+            if (classless && classless_len) {
+                *classless = &options[i];
+                *classless_len = len;
+            }
+            break;
         }
         i += len;
     }
@@ -202,8 +234,12 @@ void dhcp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
 
     uint8_t msg_type = 0;
     uint32_t subnet = 0, router = 0, dns = 0, server_id = 0, lease = 0;
+    uint32_t t1 = 0, t2 = 0;
+    const uint8_t* classless = NULL;
+    int classless_len = 0;
     dhcp_parse_options(dhcp->options, optlen, &msg_type, &subnet, &router,
-                       &dns, &server_id, &lease);
+                       &dns, &server_id, &lease, &t1, &t2,
+                       &classless, &classless_len);
 
     uint32_t offered = net_ntohl(dhcp->yiaddr);
 
@@ -231,6 +267,8 @@ void dhcp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
         break;
 
     case DHCP_STATE_REQUESTING:
+    case DHCP_STATE_RENEWING:
+    case DHCP_STATE_REBINDING:
         if (msg_type == DHCP_ACK && offered != 0) {
             // Configure the network device
             dev->ip_addr = offered;
@@ -238,6 +276,13 @@ void dhcp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
             dev->gateway = router;
             dev->dns_server = dns;
             dhcp_state = DHCP_STATE_BOUND;
+            dhcp_bound_dev = dev;
+            dhcp_lease_seconds = lease ? lease : 3600;
+            dhcp_t1_seconds = t1 ? t1 : (dhcp_lease_seconds / 2);
+            // RFC 2131 §4.4.5: T2 = 0.875 * lease
+            dhcp_t2_seconds = t2 ? t2 :
+                              ((dhcp_lease_seconds * 7) / 8);
+            dhcp_lease_start_ticks = timer_ticks();
 
             kprintf("[DHCP] Bound to %d.%d.%d.%d",
                     (offered >> 24) & 0xFF, (offered >> 16) & 0xFF,
@@ -245,16 +290,39 @@ void dhcp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
             kprintf(" mask %d.%d.%d.%d",
                     (subnet >> 24) & 0xFF, (subnet >> 16) & 0xFF,
                     (subnet >> 8) & 0xFF, subnet & 0xFF);
-            kprintf(" gw %d.%d.%d.%d\n",
+            kprintf(" gw %d.%d.%d.%d lease=%us\n",
                     (router >> 24) & 0xFF, (router >> 16) & 0xFF,
-                    (router >> 8) & 0xFF, router & 0xFF);
+                    (router >> 8) & 0xFF, router & 0xFF,
+                    (unsigned)dhcp_lease_seconds);
 
             // Add routes: connected subnet + default gateway
             if (subnet != 0) {
                 uint32_t net_addr = offered & subnet;
                 route_add(net_addr, subnet, 0, dev, 0, RTF_UP);
             }
-            if (router != 0) {
+            // RFC 3442: classless routes (option 121) override option 3
+            // when present.  Each entry: width + dest + gateway.
+            if (classless && classless_len > 0) {
+                int i = 0;
+                while (i < classless_len) {
+                    uint8_t w = classless[i++];
+                    if (w > 32) break;
+                    uint8_t obytes = (w + 7) / 8;
+                    if (i + obytes + 4 > classless_len) break;
+                    uint32_t dst = 0;
+                    for (uint8_t k = 0; k < obytes; k++)
+                        dst |= ((uint32_t)classless[i + k]) << (24 - 8*k);
+                    i += obytes;
+                    uint32_t gw = ((uint32_t)classless[i] << 24) |
+                                  ((uint32_t)classless[i+1] << 16) |
+                                  ((uint32_t)classless[i+2] << 8) |
+                                   classless[i+3];
+                    i += 4;
+                    uint32_t mask = w ? (0xFFFFFFFFU << (32 - w)) : 0;
+                    route_add(dst, mask, gw, dev, 0,
+                              RTF_UP | (gw ? RTF_GATEWAY : 0));
+                }
+            } else if (router != 0) {
                 route_add(0, 0, router, dev, 0, RTF_UP | RTF_GATEWAY);
             }
         } else if (msg_type == DHCP_NAK) {
@@ -380,4 +448,48 @@ void dhcp_invalidate(net_device_t* dev) {
     dhcp_state = DHCP_STATE_IDLE;
     dhcp_offered_ip = 0;
     dhcp_server_ip = 0;
+}
+
+// RFC 2131 §4.4.5: lease lifecycle.  Called periodically (e.g. once per
+// second) by net_timer_tick.  Drives unicast renewal at T1, broadcast at T2,
+// full re-discovery at lease expiry.
+void dhcp_tick(void) {
+    if (dhcp_state != DHCP_STATE_BOUND &&
+        dhcp_state != DHCP_STATE_RENEWING &&
+        dhcp_state != DHCP_STATE_REBINDING) return;
+    if (!dhcp_bound_dev || dhcp_lease_seconds == 0) return;
+
+    uint64_t now = timer_ticks();
+    uint64_t elapsed = (now - dhcp_lease_start_ticks) / 100;   // 100 Hz → s
+
+    if (elapsed >= dhcp_lease_seconds) {
+        // Lease expired — fall back to DISCOVER
+        kprintf("[DHCP] Lease expired, restarting\n");
+        dhcp_bound_dev->ip_addr = 0;
+        dhcp_state = DHCP_STATE_IDLE;
+        dhcp_discover(dhcp_bound_dev);
+        return;
+    }
+    if (elapsed >= dhcp_t2_seconds && dhcp_state != DHCP_STATE_REBINDING) {
+        kprintf("[DHCP] T2 reached, broadcasting REQUEST\n");
+        dhcp_state = DHCP_STATE_REBINDING;
+        uint8_t pkt[576];
+        int n = dhcp_build_packet(dhcp_bound_dev, DHCP_REQUEST,
+                                  dhcp_offered_ip, 0, pkt, sizeof(pkt));
+        if (n > 0) dhcp_send(dhcp_bound_dev, pkt, n);
+        return;
+    }
+    if (elapsed >= dhcp_t1_seconds && dhcp_state == DHCP_STATE_BOUND) {
+        kprintf("[DHCP] T1 reached, unicast RENEW\n");
+        dhcp_state = DHCP_STATE_RENEWING;
+        uint8_t pkt[576];
+        int n = dhcp_build_packet(dhcp_bound_dev, DHCP_REQUEST,
+                                  dhcp_offered_ip, dhcp_server_ip,
+                                  pkt, sizeof(pkt));
+        // Unicast to current server per RFC 2131 §4.3.6
+        if (n > 0)
+            udp_send(dhcp_bound_dev, dhcp_server_ip,
+                     DHCP_CLIENT_PORT, DHCP_SERVER_PORT,
+                     pkt, (uint16_t)n);
+    }
 }

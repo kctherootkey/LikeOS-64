@@ -18,6 +18,7 @@ DIR_SRC = src/dirent/dirent.c
 EXTRA_STDIO_SRC = src/stdio/getline.c
 SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/sched.c src/syscalls/socket.c
 DLFCN_SRC = src/dl/dlfcn.c
+NET_SRC = src/net/inet.c src/net/getaddrinfo.c src/net/getifaddrs.c src/net/netdb_extra.c
 PTHREAD_SRC = src/pthread/pthread.c src/pthread/pthread_mutex.c src/pthread/pthread_cond.c src/pthread/pthread_sync.c src/pthread/pthread_tsd.c
 PTHREAD_ASM = src/pthread/clone.S
 CRT0_SRC = src/crt0.S
@@ -33,13 +34,15 @@ TIME_OBJ = $(TIME_SRC:.c=.o)
 DIR_OBJ = $(DIR_SRC:.c=.o)
 SYSCALLS_OBJ = $(SYSCALLS_SRC:.c=.o)
 DLFCN_OBJ = $(DLFCN_SRC:.c=.o)
+NET_OBJ = $(NET_SRC:.c=.o)
 PTHREAD_OBJ = $(PTHREAD_SRC:.c=.o) $(PTHREAD_ASM:.S=.o)
 CRT0_OBJ = $(CRT0_SRC:.S=.o)
 CRT1_OBJ = $(CRT1_SRC:.S=.o)
 
 # All static objects (libc – everything except pthread)
 LIBC_OBJ = $(MALLOC_OBJ) $(STDIO_OBJ) $(STRING_OBJ) $(STDLIB_OBJ) \
-           $(CTYPE_OBJ) $(TIME_OBJ) $(DIR_OBJ) $(SYSCALLS_OBJ)
+           $(CTYPE_OBJ) $(TIME_OBJ) $(DIR_OBJ) $(SYSCALLS_OBJ) \
+           $(NET_OBJ)
 
 ALL_OBJ = $(LIBC_OBJ) $(PTHREAD_OBJ)
 

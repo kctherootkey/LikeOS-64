@@ -42,6 +42,13 @@ static uint32_t resolve_host(const char *host)
     uint32_t ip = inet_addr(host);
     if (ip != 0 && ip != 0xFFFFFFFF)
         return ntohl(ip);
+    /* Consult /etc/hosts (and built-in localhost) before DNS. */
+    struct hostent *he = gethostbyname(host);
+    if (he && he->h_addr_list && he->h_addr_list[0] && he->h_length == 4) {
+        uint32_t a;
+        memcpy(&a, he->h_addr_list[0], 4);
+        return ntohl(a);
+    }
     uint32_t resolved;
     if (dns_resolve(host, &resolved) == 0)
         return resolved;

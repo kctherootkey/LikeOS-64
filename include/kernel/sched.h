@@ -414,6 +414,7 @@ void sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack
 task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint64_t user_stack, uint64_t kernel_stack);
 void sched_tick(void);
 void sched_schedule(void);    // Core preemptive scheduler - switch to next ready task
+void sched_yield_in_kernel(void); // In-kernel cooperative yield (no syscall)
 void sched_run_ready(void);
 task_t* sched_current(void);
 int sched_has_user_tasks(void);  // Check if any user tasks are running

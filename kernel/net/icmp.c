@@ -4,6 +4,7 @@
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/random.h"
+#include "../../include/kernel/syscall.h"
 
 // Static send buffer to avoid large stack allocations
 static uint8_t icmp_send_buf[NET_MTU_DEFAULT];
@@ -143,6 +144,68 @@ void icmp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t l
         spin_unlock_irqrestore(&icmp_send_lock, flags);
     }
 
+    // RFC 791 §3.2.2.8 Timestamp Request — reply with kernel time
+    if (icmp->type == ICMP_TIMESTAMP && icmp->code == 0 && len >= 20) {
+        uint64_t flags;
+        spin_lock_irqsave(&icmp_send_lock, &flags);
+        for (uint16_t i = 0; i < len; i++) icmp_send_buf[i] = data[i];
+        icmp_header_t* r = (icmp_header_t*)icmp_send_buf;
+        r->type = ICMP_TIMESTAMP_REPLY;
+        r->code = 0;
+        r->checksum = 0;
+        // Receive + transmit timestamps. RFC 792 p.16: when the sender cannot
+        // supply standard time (ms past midnight UT) the high-order bit MUST
+        // be set to indicate a non-standard value. We have no wall clock and
+        // exposing raw uptime would disclose boot time to any remote prober
+        // (CVE-1999-0524 class), so we report a per-boot randomly offset
+        // counter with the non-standard-time bit set.
+        static uint32_t icmp_ts_offset = 0;
+        static int      icmp_ts_offset_set = 0;
+        if (!icmp_ts_offset_set) {
+            icmp_ts_offset = random_u32();
+            icmp_ts_offset_set = 1;
+        }
+        uint32_t ts_ms = ((uint32_t)(timer_ticks() * 10) + icmp_ts_offset)
+                         | 0x80000000U; // non-standard time flag (RFC 792)
+        uint8_t* p = icmp_send_buf + 12; // skip type/code/cksum/id/seq + orig TS
+        p[0] = (uint8_t)(ts_ms >> 24); p[1] = (uint8_t)(ts_ms >> 16);
+        p[2] = (uint8_t)(ts_ms >> 8);  p[3] = (uint8_t)ts_ms;
+        p[4] = p[0]; p[5] = p[1]; p[6] = p[2]; p[7] = p[3];
+        r->checksum = ipv4_checksum(icmp_send_buf, len);
+        ipv4_send(dev, src_ip, IP_PROTO_ICMP, icmp_send_buf, len);
+        spin_unlock_irqrestore(&icmp_send_lock, flags);
+    }
+
+    // RFC 950 §3.1 Address Mask Request — reply with our netmask
+    if (icmp->type == ICMP_ADDRMASK && icmp->code == 0 && len >= 12 && dev) {
+        uint64_t flags;
+        spin_lock_irqsave(&icmp_send_lock, &flags);
+        for (uint16_t i = 0; i < len; i++) icmp_send_buf[i] = data[i];
+        icmp_header_t* r = (icmp_header_t*)icmp_send_buf;
+        r->type = ICMP_ADDRMASK_REPLY;
+        r->code = 0;
+        r->checksum = 0;
+        uint32_t mask = dev->netmask;
+        icmp_send_buf[8]  = (uint8_t)(mask >> 24); icmp_send_buf[9]  = (uint8_t)(mask >> 16);
+        icmp_send_buf[10] = (uint8_t)(mask >> 8);  icmp_send_buf[11] = (uint8_t)mask;
+        r->checksum = ipv4_checksum(icmp_send_buf, len);
+        ipv4_send(dev, src_ip, IP_PROTO_ICMP, icmp_send_buf, len);
+        spin_unlock_irqrestore(&icmp_send_lock, flags);
+    }
+
+    // RFC 1191 PMTUD: DEST_UNREACH/FRAG_NEEDED carries next-hop MTU in id+seq.
+    // Also dispatch any ICMP error to a matching socket.
+    if (icmp->type == ICMP_DEST_UNREACH || icmp->type == ICMP_TIME_EXCEEDED ||
+        icmp->type == ICMP_PARAM_PROBLEM) {
+        const uint8_t* inner = data + sizeof(icmp_header_t);
+        uint16_t ilen = (len > sizeof(icmp_header_t)) ?
+                        (uint16_t)(len - sizeof(icmp_header_t)) : 0;
+        uint16_t mtu_hint = 0;
+        if (icmp->type == ICMP_DEST_UNREACH && icmp->code == ICMP_FRAG_NEEDED)
+            mtu_hint = net_ntohs(icmp->sequence);   // RFC 1191 places MTU in low 16 bits
+        icmp_dispatch_error(icmp->type, icmp->code, inner, ilen, mtu_hint);
+    }
+
     // Store reply for userspace (echo reply, dest unreachable, time exceeded)
     if (icmp->type == ICMP_ECHO_REPLY ||
         icmp->type == ICMP_DEST_UNREACH ||
@@ -258,4 +321,52 @@ int icmp_recv_reply(uint32_t* src_ip, uint16_t expected_id,
         }
         return 0;
     }
+}
+
+// ============================================================================
+// RFC 792 §3.2.1 — Dispatch an inbound ICMP error to its originating socket.
+// inner_ip points to the quoted IP header (always 8 bytes of L4 follows).
+// ============================================================================
+void icmp_dispatch_error(uint8_t icmp_type, uint8_t icmp_code,
+                         const uint8_t* inner_ip, uint16_t inner_len,
+                         uint16_t mtu_hint) {
+    if (inner_len < sizeof(ipv4_header_t) + 8) return;
+    const ipv4_header_t* ip = (const ipv4_header_t*)inner_ip;
+    uint8_t ihl = (ip->version_ihl & 0x0F) * 4;
+    if (ihl < sizeof(ipv4_header_t) || inner_len < ihl + 8) return;
+
+    uint32_t orig_src = net_ntohl(ip->src_addr);
+    uint32_t orig_dst = net_ntohl(ip->dst_addr);
+    uint8_t  proto    = ip->protocol;
+    const uint8_t* l4 = inner_ip + ihl;
+    uint16_t orig_sport = (uint16_t)((l4[0] << 8) | l4[1]);
+    uint16_t orig_dport = (uint16_t)((l4[2] << 8) | l4[3]);
+
+    // Map ICMP type/code to errno
+    int err = 0;
+    switch (icmp_type) {
+    case ICMP_DEST_UNREACH:
+        switch (icmp_code) {
+        case ICMP_NET_UNREACH:   err = ENETUNREACH; break;
+        case ICMP_HOST_UNREACH:  err = EHOSTUNREACH; break;
+        case ICMP_PROTO_UNREACH: err = ENOPROTOOPT; break;
+        case ICMP_PORT_UNREACH:  err = ECONNREFUSED; break;
+        case ICMP_FRAG_NEEDED:
+            // PMTUD: clamp PMTU cache; do NOT report as connection error
+            if (mtu_hint >= 68) {
+                pmtu_set(orig_dst, mtu_hint);
+                if (proto == IP_PROTO_TCP)
+                    tcp_handle_pmtu(orig_src, orig_sport,
+                                    orig_dst, orig_dport, mtu_hint);
+            }
+            return;
+        default:                 err = EHOSTUNREACH; break;
+        }
+        break;
+    case ICMP_TIME_EXCEEDED: err = EHOSTUNREACH; break;
+    case ICMP_PARAM_PROBLEM: err = EPROTO; break;
+    default: return;
+    }
+
+    sock_post_icmp_error(proto, orig_src, orig_sport, orig_dst, orig_dport, err);
 }

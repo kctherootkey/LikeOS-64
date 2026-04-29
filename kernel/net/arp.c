@@ -239,3 +239,76 @@ int arp_recv_reply(uint32_t target_ip, uint8_t mac_out[6], uint64_t timeout_tick
     arp_reply_ready = 0;
     return 0;
 }
+
+// ============================================================================
+// Static / programmatic delete (used by `arp -d` and tests).
+// ============================================================================
+void arp_del_entry(uint32_t ip) {
+    uint64_t flags;
+    spin_lock_irqsave(&arp_lock, &flags);
+    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+        if (arp_table[i].valid && arp_table[i].ip == ip) {
+            arp_table[i].valid = 0;
+        }
+    }
+    spin_unlock_irqrestore(&arp_lock, flags);
+}
+
+// ============================================================================
+// RFC 5227 ARP probe (DAD).  Sends 3 probes ~200ms apart with sender_ip=0.
+// Returns 0 if no collision (no reply for `ip` seen), -1 on collision.
+// ============================================================================
+int arp_probe(net_device_t* dev, uint32_t ip) {
+    if (!dev) return -1;
+
+    arp_reply_ready = 0;
+    arp_reply_ip = 0;
+
+    uint8_t pkt[sizeof(arp_header_t)];
+    arp_header_t* arp = (arp_header_t*)pkt;
+    arp->hw_type = net_htons(ARP_HW_ETHER);
+    arp->proto_type = net_htons(ETH_P_IP);
+    arp->hw_len = ETH_ALEN;
+    arp->proto_len = 4;
+    arp->opcode = net_htons(ARP_OP_REQUEST);
+    for (int i = 0; i < ETH_ALEN; i++) {
+        arp->sender_mac[i] = dev->mac_addr[i];
+        arp->target_mac[i] = 0x00;
+    }
+    arp->sender_ip = 0;             // RFC 5227: probe uses 0.0.0.0 as sender
+    arp->target_ip = net_htonl(ip);
+
+    for (int probe = 0; probe < 3; probe++) {
+        eth_send(dev, eth_broadcast_addr, ETH_P_ARP, pkt, sizeof(arp_header_t));
+        // Wait ~200ms (20 ticks at 100Hz) for any reply.
+        uint64_t deadline = timer_ticks() + 20;
+        while (timer_ticks() < deadline) {
+            if (arp_reply_ready && arp_reply_ip == ip)
+                return -1;
+            __asm__ volatile("pause");
+        }
+    }
+    return 0;
+}
+
+// ============================================================================
+// Gratuitous ARP: announce ownership of `ip` to the LAN with a reply that
+// has both sender_ip and target_ip set to `ip`.
+// ============================================================================
+void arp_gratuitous(net_device_t* dev, uint32_t ip) {
+    if (!dev) return;
+    uint8_t pkt[sizeof(arp_header_t)];
+    arp_header_t* arp = (arp_header_t*)pkt;
+    arp->hw_type = net_htons(ARP_HW_ETHER);
+    arp->proto_type = net_htons(ETH_P_IP);
+    arp->hw_len = ETH_ALEN;
+    arp->proto_len = 4;
+    arp->opcode = net_htons(ARP_OP_REPLY);
+    for (int i = 0; i < ETH_ALEN; i++) {
+        arp->sender_mac[i] = dev->mac_addr[i];
+        arp->target_mac[i] = 0xFF;
+    }
+    arp->sender_ip = net_htonl(ip);
+    arp->target_ip = net_htonl(ip);
+    eth_send(dev, eth_broadcast_addr, ETH_P_ARP, pkt, sizeof(arp_header_t));
+}

@@ -123,13 +123,20 @@ int main(int argc, char *argv[])
     const char *dest = argv[optind];
     uint32_t dst_ip = ntohl(inet_addr(dest));
     if (dst_ip == 0) {
-        /* Try to resolve */
-        uint32_t resolved;
-        if (dns_resolve(dest, &resolved) == 0)
-            dst_ip = resolved;
-        else {
-            fprintf(stderr, "arping: %s: Name or service not known\n", dest);
-            return 1;
+        /* Consult /etc/hosts (and built-in localhost) before DNS. */
+        struct hostent *he = gethostbyname(dest);
+        if (he && he->h_addr_list && he->h_addr_list[0] && he->h_length == 4) {
+            uint32_t a;
+            memcpy(&a, he->h_addr_list[0], 4);
+            dst_ip = ntohl(a);
+        } else {
+            uint32_t resolved;
+            if (dns_resolve(dest, &resolved) == 0)
+                dst_ip = resolved;
+            else {
+                fprintf(stderr, "arping: %s: Name or service not known\n", dest);
+                return 1;
+            }
         }
     }
 

@@ -20,6 +20,33 @@ void udp_init(void) {
 static uint8_t udp_send_buf[65535 - sizeof(ipv4_header_t)];
 static spinlock_t udp_send_lock = SPINLOCK_INIT("udp_tx");
 
+// Compute UDP checksum (RFC 768): pseudo-header + UDP header + payload.
+// Returns the wire value: 0xFFFF substituted for 0 since 0 means "no checksum".
+static uint16_t udp_compute_checksum(uint32_t src_ip, uint32_t dst_ip,
+                                     const uint8_t* udp_msg, uint16_t udp_len) {
+    udp_pseudo_header_t ph;
+    ph.src_addr = net_htonl(src_ip);
+    ph.dst_addr = net_htonl(dst_ip);
+    ph.zero = 0;
+    ph.protocol = IP_PROTO_UDP;
+    ph.udp_length = net_htons(udp_len);
+
+    // One's-complement sum over pseudo-header || udp_msg.
+    uint32_t sum = 0;
+    const uint16_t* p = (const uint16_t*)&ph;
+    for (size_t i = 0; i < sizeof(ph) / 2; i++) sum += p[i];
+    p = (const uint16_t*)udp_msg;
+    uint16_t whole = (uint16_t)(udp_len & ~1U);
+    for (uint16_t i = 0; i < whole / 2; i++) sum += p[i];
+    if (udp_len & 1) {
+        uint16_t tail = (uint16_t)udp_msg[udp_len - 1];
+        sum += tail; // low byte; high byte zero (per RFC 1071)
+    }
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    uint16_t cs = (uint16_t)~sum;
+    return cs ? cs : 0xFFFF;
+}
+
 // Send UDP datagram
 int udp_send(net_device_t* dev, uint32_t dst_ip,
              uint16_t src_port, uint16_t dst_port,
@@ -36,11 +63,18 @@ int udp_send(net_device_t* dev, uint32_t dst_ip,
     udp->src_port = net_htons(src_port);
     udp->dst_port = net_htons(dst_port);
     udp->length = net_htons((uint16_t)udp_len);
-    udp->checksum = 0;  // UDP checksum optional in IPv4
+    udp->checksum = 0;
 
     // Copy payload
     for (uint16_t i = 0; i < len; i++)
         udp_send_buf[sizeof(udp_header_t) + i] = data[i];
+
+    // Compute checksum (RFC 768).  Source IP is the outgoing iface IP;
+    // for loopback / unset, fall back to dst_ip so the pseudo-header is
+    // consistent with what the receiver will recompute.
+    uint32_t src_ip = dev->ip_addr ? dev->ip_addr : dst_ip;
+    udp->checksum = udp_compute_checksum(src_ip, dst_ip, udp_send_buf,
+                                         (uint16_t)udp_len);
 
     int ret = ipv4_send(dev, dst_ip, IP_PROTO_UDP, udp_send_buf, udp_len);
     spin_unlock_irqrestore(&udp_send_lock, flags);
@@ -49,7 +83,7 @@ int udp_send(net_device_t* dev, uint32_t dst_ip,
 
 // Process received UDP datagram
 void udp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
-            const uint8_t* data, uint16_t len) {
+            const uint8_t* data, uint16_t len, uint8_t ttl, uint8_t tos) {
     if (len < sizeof(udp_header_t)) return;
 
     const udp_header_t* udp = (const udp_header_t*)data;
@@ -58,6 +92,37 @@ void udp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
     uint16_t udp_len = net_ntohs(udp->length);
 
     if (udp_len > len || udp_len < sizeof(udp_header_t)) return;
+
+    // RFC 768 checksum verify (a value of 0 means "sender disabled checksum").
+    if (udp->checksum != 0) {
+        uint16_t saved = udp->checksum;
+        ((udp_header_t*)data)->checksum = 0;
+        uint16_t expected = 0;
+        // Recompute over the wire-form datagram, restore.
+        // We must use a temporary buffer because `data` may be const-mapped;
+        // here we already cast away const above.
+        uint32_t sum = 0;
+        udp_pseudo_header_t ph;
+        ph.src_addr = net_htonl(src_ip);
+        ph.dst_addr = net_htonl(dst_ip);
+        ph.zero = 0;
+        ph.protocol = IP_PROTO_UDP;
+        ph.udp_length = net_htons(udp_len);
+        const uint16_t* p = (const uint16_t*)&ph;
+        for (size_t i = 0; i < sizeof(ph)/2; i++) sum += p[i];
+        p = (const uint16_t*)data;
+        uint16_t whole = (uint16_t)(udp_len & ~1U);
+        for (uint16_t i = 0; i < whole/2; i++) sum += p[i];
+        if (udp_len & 1) sum += (uint16_t)data[udp_len - 1];
+        while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+        expected = (uint16_t)~sum;
+        if (expected == 0) expected = 0xFFFF;
+        ((udp_header_t*)data)->checksum = saved;
+        if (expected != saved) {
+            // Bad checksum — silently drop per RFC 768.
+            return;
+        }
+    }
 
     const uint8_t* payload = data + sizeof(udp_header_t);
     uint16_t payload_len = udp_len - sizeof(udp_header_t);
@@ -103,13 +168,14 @@ void udp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
         return;
     }
 
-    udp_deliver_to_socket(src_ip, src_port, dst_ip, dst_port, payload, payload_len);
+    udp_deliver_to_socket(src_ip, src_port, dst_ip, dst_port, payload, payload_len, ttl, tos, dev);
 }
 
 // Deliver UDP data to a bound socket
 void udp_deliver_to_socket(uint32_t src_ip, uint16_t src_port,
                            uint32_t dst_ip, uint16_t dst_port,
-                           const uint8_t* data, uint16_t len) {
+                           const uint8_t* data, uint16_t len,
+                           uint8_t ttl, uint8_t tos, net_device_t* dev) {
     // This is called from the socket layer's perspective
     // Find socket bound to dst_port and enqueue data
     extern net_socket_t* sock_find_udp(uint16_t port, uint32_t dst_ip);
@@ -135,6 +201,18 @@ void udp_deliver_to_socket(uint32_t src_ip, uint16_t src_port,
     sk->udp_rx_queue[sk->udp_rx_tail].from.sin_family = AF_INET;
     sk->udp_rx_queue[sk->udp_rx_tail].from.sin_port = net_htons(src_port);
     sk->udp_rx_queue[sk->udp_rx_tail].from.sin_addr.s_addr = net_htonl(src_ip);
+    sk->udp_rx_queue[sk->udp_rx_tail].dst_ip = dst_ip;
+    sk->udp_rx_queue[sk->udp_rx_tail].ttl = ttl;
+    sk->udp_rx_queue[sk->udp_rx_tail].tos = tos;
+    sk->udp_rx_queue[sk->udp_rx_tail].ifindex = 0;
+    if (dev) {
+        for (int idx = 0; idx < 16; idx++) {
+            if (net_get_device(idx) == dev) {
+                sk->udp_rx_queue[sk->udp_rx_tail].ifindex = (uint32_t)idx;
+                break;
+            }
+        }
+    }
 
     sk->udp_rx_tail = next;
     sk->udp_rx_ready = 1;

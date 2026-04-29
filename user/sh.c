@@ -38,6 +38,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <termios.h>
+#include <netdb.h>
 
 #define SHELL_MAX_LINE 1024
 #define SHELL_MAX_ARGS 64
@@ -1895,6 +1896,10 @@ static void get_prompt(char *prompt, int maxlen) {
 
 int main(void) {
     setenv("PATH", "/bin:/usr/local/bin", 1);
+    /* Read /etc/resolv.conf and program the kernel resolver before
+     * any DNS-using program (dig, ping, dhclient -x, ...) runs. DHCP
+     * option 6 will overwrite per-interface settings later. */
+    res_init();
     hist_load();
     alias_load();
 

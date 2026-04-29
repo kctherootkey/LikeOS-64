@@ -184,6 +184,7 @@
 #define SYS_RAW_SEND        373  // Send raw IP/ICMP/ARP packet
 #define SYS_RAW_RECV        374  // Receive raw IP/ICMP/ARP packet
 #define SYS_DNS_RESOLVE_REVERSE 375  // Reverse DNS lookup (PTR)
+#define SYS_SET_DNS_SERVER  376  // Install resolver server (RFC 3493 stub)
 
 // NET_GETINFO sub-commands
 #define NET_GET_ARP_TABLE       1
@@ -311,6 +312,7 @@ typedef struct k_sysinfo {
 #define ENOSPC          28  // No space left on device
 #define EROFS           30  // Read-only file system
 #define ENAMETOOLONG    36  // File name too long
+#define ENODEV          19  // No such device
 #define ENOSYS          38  // Function not implemented
 #define ENOTEMPTY       39  // Directory not empty
 #define ETIMEDOUT      110  // Connection timed out
@@ -322,6 +324,8 @@ typedef struct k_sysinfo {
 #define EOPNOTSUPP      95  // Operation not supported
 #define EAFNOSUPPORT    97  // Address family not supported
 #define EADDRINUSE      98  // Address already in use
+#define EADDRNOTAVAIL   99  // Cannot assign requested address
+#define ENOBUFS        105  // No buffer space available
 #define ENETDOWN       100  // Network is down
 #define ENETUNREACH    101  // Network is unreachable
 #define ECONNABORTED   103  // Connection aborted
@@ -330,6 +334,9 @@ typedef struct k_sysinfo {
 #define ENOTCONN       107  // Not connected
 #define ECONNREFUSED   111  // Connection refused
 #define EINPROGRESS    115  // Operation now in progress
+#define EHOSTDOWN      112  // Host is down
+#define EHOSTUNREACH   113  // No route to host
+#define EPROTO          71  // Protocol error
 #define ERANGE          34  // Math result not representable
 #define ELOOP           40  // Too many symbolic links
 #define ENFILE          23  // File table overflow

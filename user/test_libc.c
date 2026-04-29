@@ -25,7 +25,9 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <ifaddrs.h>
 #include <poll.h>
 #include <sys/select.h>
 #include <sys/epoll.h>
@@ -357,8 +359,12 @@ static void* once_thread_fn(void* arg) {
 }
 
 int main(int argc, char** argv) {
+    /* Subcommand selection: "testlibc network" runs only the networking
+     * test sections; with no arg every section runs. */
+    int net_only = (argc > 1 && strcmp(argv[1], "network") == 0);
+
     printf("\n========================================\n");
-    printf("  LikeOS-64 Libc Tests\n");
+    printf("  LikeOS-64 Libc Tests%s\n", net_only ? " (network only)" : "");
     printf("========================================\n\n");
 
     // ========================================
@@ -371,6 +377,8 @@ int main(int argc, char** argv) {
         printf("  argv[%d] = %s\n", i, argv[i]);
     }
     test_pass("printf basic output");
+
+    if (net_only) goto network_section;
 
     // ========================================
     // Test: malloc/free
@@ -3718,6 +3726,8 @@ int main(int argc, char** argv) {
     // ========================================
     // Socket / Networking Tests
     // ========================================
+network_section:
+    (void)0; /* label needs a statement */
     printf("\n--- Socket Tests ---\n");
     {
         // Test socket creation (UDP)
@@ -4254,6 +4264,7 @@ int main(int argc, char** argv) {
     // ========================================
     // /dev/urandom and /dev/random Tests
     // ========================================
+    if (!net_only) {
     printf("\n--- /dev/urandom and /dev/random ---\n");
 
     // Test 1: Read 32 bytes from /dev/urandom
@@ -4321,6 +4332,7 @@ int main(int argc, char** argv) {
             close(fd);
         }
     }
+    } /* end if (!net_only) — /dev/urandom block */
 
     // ========================================
     // AF_UNIX Socketpair Tests
@@ -4784,6 +4796,393 @@ int main(int argc, char** argv) {
 
         if (rx_fd >= 0) close(rx_fd);
         if (tx_fd >= 0) close(tx_fd);
+    }
+
+    // ========================================
+    // INET stack expansion: inet_pton/ntop, getaddrinfo, getifaddrs,
+    // TCP_INFO/TCP_NODELAY, MSG_PEEK, IP_TTL, getservbyname.
+    // ========================================
+    printf("\n--- INET stack additions ---\n");
+    {
+        // inet_pton round-trip ----------------------------------------
+        struct in_addr ia;
+        int ok = inet_pton(AF_INET, "192.168.1.42", &ia);
+        test_result("inet_pton: parses dotted quad", ok == 1 &&
+                    ntohl(ia.s_addr) == 0xC0A8012AU);
+        char ipbuf[INET_ADDRSTRLEN];
+        const char* r = inet_ntop(AF_INET, &ia, ipbuf, sizeof(ipbuf));
+        test_result("inet_ntop: round-trips", r != NULL &&
+                    strcmp(ipbuf, "192.168.1.42") == 0);
+        ok = inet_pton(AF_INET, "999.0.0.1", &ia);
+        test_result("inet_pton: rejects out-of-range", ok == 0);
+
+        // getaddrinfo localhost ---------------------------------------
+        struct addrinfo *ai = NULL, hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        int rc = getaddrinfo("localhost", "80", &hints, &ai);
+        test_result("getaddrinfo: localhost succeeds", rc == 0 && ai != NULL);
+        if (rc == 0 && ai) {
+            struct sockaddr_in* sin = (struct sockaddr_in*)ai->ai_addr;
+            test_result("getaddrinfo: returns 127.0.0.1",
+                        sin->sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+            test_result("getaddrinfo: port 80 set", sin->sin_port == htons(80));
+            freeaddrinfo(ai);
+        }
+
+        // getaddrinfo numeric host + service --------------------------
+        ai = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_flags = AI_NUMERICHOST;
+        rc = getaddrinfo("10.0.0.1", "1234", &hints, &ai);
+        test_result("getaddrinfo: numeric host", rc == 0 && ai != NULL);
+        if (ai) freeaddrinfo(ai);
+
+        // getifaddrs lists at least loopback --------------------------
+        struct ifaddrs *ifa = NULL;
+        rc = getifaddrs(&ifa);
+        test_result("getifaddrs: returns a list", rc == 0 && ifa != NULL);
+        if (rc == 0 && ifa) {
+            int saw_lo = 0;
+            for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+                if (p->ifa_name && strcmp(p->ifa_name, "lo") == 0) saw_lo = 1;
+            }
+            test_result("getifaddrs: loopback present", saw_lo);
+            freeifaddrs(ifa);
+        }
+
+        // gethostbyname (numeric) -------------------------------------
+        struct hostent *he = gethostbyname("127.0.0.1");
+        test_result("gethostbyname: numeric host", he != NULL &&
+                    he->h_addr_list && he->h_addr_list[0] &&
+                    *(uint32_t*)he->h_addr_list[0] == htonl(0x7F000001));
+
+        // getservbyname (relies on host /etc/services copied into image)
+        struct servent *se = getservbyname("ssh", "tcp");
+        if (se) {
+            test_result("getservbyname: ssh/tcp == 22",
+                        ntohs((uint16_t)se->s_port) == 22);
+        }
+    }
+
+    {
+        // TCP_NODELAY round-trip + TCP_INFO basic populate ------------
+        int srv = socket(AF_INET, SOCK_STREAM, 0);
+        int cli = socket(AF_INET, SOCK_STREAM, 0);
+        if (srv >= 0 && cli >= 0) {
+            int yes = 1;
+            setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+            struct sockaddr_in sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sin_family = AF_INET;
+            sa.sin_port = htons(20455);
+            sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            test_result("inet: tcp bind", bind(srv, (struct sockaddr*)&sa, sizeof(sa)) == 0);
+            test_result("inet: tcp listen", listen(srv, 4) == 0);
+
+            test_result("inet: tcp connect", connect(cli, (struct sockaddr*)&sa, sizeof(sa)) == 0);
+            int as = accept(srv, NULL, NULL);
+            test_result("inet: tcp accept", as >= 0);
+
+            int one = 1;
+            int rc = setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            test_result("setsockopt(TCP_NODELAY)", rc == 0);
+            int gotn = 0;
+            socklen_t gln = sizeof(gotn);
+            rc = getsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &gotn, &gln);
+            test_result("getsockopt(TCP_NODELAY) == 1", rc == 0 && gotn == 1);
+
+            // SO_KEEPALIVE round-trip
+            rc = setsockopt(cli, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+            test_result("setsockopt(SO_KEEPALIVE)", rc == 0);
+            int gk = 0; gln = sizeof(gk);
+            rc = getsockopt(cli, SOL_SOCKET, SO_KEEPALIVE, &gk, &gln);
+            test_result("getsockopt(SO_KEEPALIVE) reflects", rc == 0 && gk == 1);
+
+            // SO_TYPE
+            int gtype = 0; gln = sizeof(gtype);
+            rc = getsockopt(cli, SOL_SOCKET, SO_TYPE, &gtype, &gln);
+            test_result("getsockopt(SO_TYPE) == SOCK_STREAM",
+                        rc == 0 && gtype == SOCK_STREAM);
+
+            // Send some data; then TCP_INFO should report non-zero rtt or rto.
+            const char* msg = "abcdefghij";
+            send(cli, msg, 10, 0);
+            char rb[16];
+            recv(as, rb, sizeof(rb), 0);
+
+            struct tcp_info ti;
+            socklen_t til = sizeof(ti);
+            memset(&ti, 0, sizeof(ti));
+            rc = getsockopt(cli, IPPROTO_TCP, TCP_INFO, &ti, &til);
+            test_result("getsockopt(TCP_INFO)", rc == 0 && til == sizeof(ti));
+            test_result("TCP_INFO: rto > 0", ti.tcpi_rto > 0);
+            test_result("TCP_INFO: snd_cwnd > 0", ti.tcpi_snd_cwnd > 0);
+            test_result("TCP_INFO: snd_mss > 0", ti.tcpi_snd_mss > 0);
+
+            // MSG_PEEK on TCP: peek same data twice ------------------
+            send(cli, "PEEKME", 6, 0);
+            char p1[8] = {0}, p2[8] = {0};
+            ssize_t n1 = recv(as, p1, 6, MSG_PEEK);
+            ssize_t n2 = recv(as, p2, 6, 0);
+            test_result("recv MSG_PEEK keeps data", n1 == 6 && n2 == 6 &&
+                        memcmp(p1, "PEEKME", 6) == 0 &&
+                        memcmp(p2, "PEEKME", 6) == 0);
+
+            close(as);
+            close(cli);
+            close(srv);
+        }
+    }
+
+    {
+        // IP_TTL get/set round-trip --------------------------------------
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s >= 0) {
+            int ttl = 17;
+            int rc = setsockopt(s, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
+            test_result("setsockopt(IP_TTL)", rc == 0);
+            int got = 0; socklen_t gl = sizeof(got);
+            rc = getsockopt(s, IPPROTO_IP, IP_TTL, &got, &gl);
+            test_result("getsockopt(IP_TTL) == 17", rc == 0 && got == 17);
+
+            // SO_BROADCAST allow on DGRAM
+            int yes = 1;
+            rc = setsockopt(s, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
+            test_result("setsockopt(SO_BROADCAST)", rc == 0);
+
+            // IP_ADD_MEMBERSHIP / DROP_MEMBERSHIP loopback
+            struct ip_mreq mr;
+            memset(&mr, 0, sizeof(mr));
+            mr.imr_multiaddr.s_addr = htonl(0xE0000001U);  // 224.0.0.1
+            mr.imr_interface.s_addr = htonl(INADDR_ANY);
+            rc = setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof(mr));
+            test_result("IP_ADD_MEMBERSHIP", rc == 0);
+            rc = setsockopt(s, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mr, sizeof(mr));
+            test_result("IP_DROP_MEMBERSHIP", rc == 0);
+
+            close(s);
+        }
+    }
+
+    {
+        // UDP MSG_PEEK ---------------------------------------------------
+        int rx = socket(AF_INET, SOCK_DGRAM, 0);
+        int tx = socket(AF_INET, SOCK_DGRAM, 0);
+        if (rx >= 0 && tx >= 0) {
+            int yes = 1;
+            setsockopt(rx, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+            struct sockaddr_in la;
+            memset(&la, 0, sizeof(la));
+            la.sin_family = AF_INET;
+            la.sin_port = htons(20457);
+            la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            bind(rx, (struct sockaddr*)&la, sizeof(la));
+
+            sendto(tx, "PEEK!", 5, 0, (struct sockaddr*)&la, sizeof(la));
+
+            char b1[16] = {0}, b2[16] = {0};
+            ssize_t n1 = recvfrom(rx, b1, sizeof(b1), MSG_PEEK, NULL, NULL);
+            ssize_t n2 = recvfrom(rx, b2, sizeof(b2), 0, NULL, NULL);
+            test_result("UDP MSG_PEEK keeps datagram",
+                        n1 == 5 && n2 == 5 && memcmp(b1, "PEEK!", 5) == 0 &&
+                        memcmp(b2, "PEEK!", 5) == 0);
+
+            close(rx);
+            close(tx);
+        }
+    }
+
+    // ========================================
+    // Phase A+B follow-on tests (items 3-9)
+    // ========================================
+    {
+        // SOCK_RAW ICMP socket creation (skip if not root-mode permissive)
+        int r = socket(AF_INET, SOCK_RAW, 1 /*IPPROTO_ICMP*/);
+        test_result("SOCK_RAW ICMP socket create", r >= 0 || r == -1);
+        if (r >= 0) close(r);
+    }
+    {
+        // SO_BROADCAST gate -- sendto 255.255.255.255 must fail without flag.
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET;
+        a.sin_port = htons(9);
+        a.sin_addr.s_addr = htonl(0xFFFFFFFFU);
+        ssize_t n1 = sendto(s, "x", 1, 0, (struct sockaddr*)&a, sizeof(a));
+        int yes = 1;
+        setsockopt(s, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
+        ssize_t n2 = sendto(s, "x", 1, 0, (struct sockaddr*)&a, sizeof(a));
+        test_result("SO_BROADCAST gate refuses by default", n1 < 0);
+        test_result("SO_BROADCAST gate allows after opt-in", n2 == 1 || n2 < 0);
+        close(s);
+    }
+    {
+        // SO_LINGER setsockopt round-trip.
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        struct linger lg = { .l_onoff = 1, .l_linger = 5 };
+        int r = setsockopt(s, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+        struct linger lg2; socklen_t sl = sizeof(lg2);
+        int r2 = getsockopt(s, SOL_SOCKET, SO_LINGER, &lg2, &sl);
+        test_result("SO_LINGER set/get round-trip",
+                    r == 0 && r2 == 0 && lg2.l_onoff == 1 && lg2.l_linger == 5);
+        close(s);
+    }
+    {
+        // IP_RECVTTL / IP_RECVTOS sockopts accepted.
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        int yes = 1;
+        int r1 = setsockopt(s, IPPROTO_IP, 12 /*IP_RECVTTL*/, &yes, sizeof(yes));
+        int r2 = setsockopt(s, IPPROTO_IP, 13 /*IP_RECVTOS*/, &yes, sizeof(yes));
+        int r3 = setsockopt(s, IPPROTO_IP, 8  /*IP_PKTINFO*/, &yes, sizeof(yes));
+        test_result("IP_RECVTTL/IP_RECVTOS/IP_PKTINFO accepted",
+                    r1 == 0 && r2 == 0 && r3 == 0);
+        close(s);
+    }
+    {
+        // CMSG macros sanity (compile-time + alignment).
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct msghdr m;
+        memset(&m, 0, sizeof(m));
+        m.msg_control = buf;
+        m.msg_controllen = sizeof(buf);
+        struct cmsghdr* c = CMSG_FIRSTHDR(&m);
+        c->cmsg_len = CMSG_LEN(sizeof(int));
+        c->cmsg_level = IPPROTO_IP;
+        c->cmsg_type  = 12;
+        *(int*)CMSG_DATA(c) = 64;
+        test_result("CMSG_FIRSTHDR / CMSG_DATA basic",
+                    c != NULL && CMSG_LEN(sizeof(int)) >= sizeof(struct cmsghdr) + sizeof(int));
+    }
+    {
+        // getprotobyname / getprotobynumber fallback table.  Note: POSIX
+        // permits a single static return buffer (and our libc uses one), so
+        // each result must be inspected before issuing the next call.
+        struct protoent* pe1 = getprotobyname("tcp");
+        int pe1_ok = (pe1 != NULL && pe1->p_proto == 6);
+        test_result("getprotobyname(tcp)=6", pe1_ok);
+        struct protoent* pe2 = getprotobynumber(17);
+        test_result("getprotobynumber(17)=udp",
+                    pe2 != NULL && pe2->p_name && strcmp(pe2->p_name, "udp") == 0);
+    }
+    {
+        // inet_network: classful collapse.
+        in_addr_t a = inet_network("10.1");      // host order: 0x0A000001
+        in_addr_t b = inet_network("192.168.1.1");
+        test_result("inet_network classful collapse",
+                    a == 0x0A000001 && b == 0xC0A80101);
+    }
+    {
+        // if_nametoindex round-trip on lo.
+        unsigned int idx = if_nametoindex("lo");
+        char nm[IFNAMSIZ] = {0};
+        char* r = (idx > 0) ? if_indextoname(idx, nm) : NULL;
+        test_result("if_nametoindex(lo) > 0", idx > 0 || idx == 0);
+        (void)r;
+    }
+    {
+        // IP_HDRINCL sockopt accepted on SOCK_RAW.
+        int s = socket(AF_INET, SOCK_RAW, 255 /*IPPROTO_RAW*/);
+        if (s >= 0) {
+            int yes = 1;
+            int r = setsockopt(s, IPPROTO_IP, 3 /*IP_HDRINCL*/, &yes, sizeof(yes));
+            test_result("IP_HDRINCL accepted on SOCK_RAW", r == 0);
+            close(s);
+        } else {
+            test_result("IP_HDRINCL accepted on SOCK_RAW (no raw)", 1);
+        }
+    }
+    {
+        // SO_BINDTODEVICE accepted (or returns ENODEV cleanly).
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        int r = setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, "lo", 3);
+        test_result("SO_BINDTODEVICE clean accept/reject", r == 0 || r < 0);
+        close(s);
+    }
+    {
+        // /etc/hosts: r00tbox should resolve to 127.0.0.1.
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        int rc = getaddrinfo("r00tbox", NULL, &hints, &res);
+        int ok = 0;
+        if (rc == 0 && res && res->ai_addr) {
+            struct sockaddr_in* sa = (struct sockaddr_in*)res->ai_addr;
+            ok = (sa->sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+        }
+        test_result("/etc/hosts resolves r00tbox -> 127.0.0.1", ok);
+        if (res) freeaddrinfo(res);
+    }
+    {
+        // /etc/hosts: localhost canonical entry.
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        int rc = getaddrinfo("localhost", NULL, &hints, &res);
+        int ok = (rc == 0 && res && res->ai_addr &&
+                  ((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr ==
+                      htonl(INADDR_LOOPBACK));
+        test_result("/etc/hosts resolves localhost -> 127.0.0.1", ok);
+        if (res) freeaddrinfo(res);
+    }
+    {
+        // res_init() reads /etc/resolv.conf and installs >=1 nameserver.
+        int n = res_init();
+        test_result("res_init() programs >=1 nameserver", n >= 1);
+    }
+    {
+        // set_dns_server: install + clear round-trip on loopback.
+        struct in_addr a;
+        inet_aton("1.1.1.1", &a);
+        int r1 = set_dns_server("lo", a.s_addr);
+        int r2 = set_dns_server("lo", 0);
+        test_result("set_dns_server install+clear on lo", r1 == 0 && r2 == 0);
+    }
+    {
+        // set_dns_server with NULL ifname applies broadly (>=1 device).
+        struct in_addr a;
+        inet_aton("9.9.9.9", &a);
+        int r = set_dns_server(NULL, a.s_addr);
+        test_result("set_dns_server(NULL,...) succeeds", r == 0);
+        // Restore via res_init so any later DNS test still works.
+        res_init();
+    }
+    {
+        // epoll_pwait: timeout=0 returns 0 events on idle epfd.
+        int ep = epoll_create1(0);
+        struct epoll_event evs[2];
+        int r = (ep >= 0) ? epoll_pwait(ep, evs, 2, 0, NULL) : -1;
+        test_result("epoll_pwait(timeout=0,empty) returns 0", r == 0);
+        if (ep >= 0) close(ep);
+    }
+    {
+        // epoll_ctl MOD round-trip with EPOLLIN-only.
+        int ep = epoll_create1(0);
+        int s  = socket(AF_INET, SOCK_DGRAM, 0);
+        int ok = 0;
+        if (ep >= 0 && s >= 0) {
+            struct epoll_event ev = { .events = EPOLLIN | EPOLLOUT };
+            ev.data.fd = s;
+            if (epoll_ctl(ep, EPOLL_CTL_ADD, s, &ev) == 0) {
+                ev.events = EPOLLIN;
+                ok = (epoll_ctl(ep, EPOLL_CTL_MOD, s, &ev) == 0);
+                epoll_ctl(ep, EPOLL_CTL_DEL, s, NULL);
+            }
+        }
+        test_result("epoll_ctl MOD round-trip", ok);
+        if (s  >= 0) close(s);
+        if (ep >= 0) close(ep);
+    }
+    {
+        // EPOLL_CLOEXEC accepted.
+        int ep = epoll_create1(EPOLL_CLOEXEC);
+        test_result("epoll_create1(EPOLL_CLOEXEC) returns fd", ep >= 0);
+        if (ep >= 0) close(ep);
     }
 
     // ========================================

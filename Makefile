@@ -180,6 +180,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/random.o \
 			  $(BUILD_DIR)/route.o \
 			  $(BUILD_DIR)/dns.o \
+			  $(BUILD_DIR)/igmp.o \
 			  $(BUILD_DIR)/unix_socket.o
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
@@ -367,6 +368,9 @@ $(BUILD_DIR)/route.o: $(KERNEL_DIR)/net/route.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/dns.o: $(KERNEL_DIR)/net/dns.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/igmp.o: $(KERNEL_DIR)/net/igmp.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/unix_socket.o: $(KERNEL_DIR)/net/unix_socket.c | $(BUILD_DIR)
@@ -984,6 +988,8 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/tmp || true
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/etc || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) /etc/services ::/etc/services
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) res/etc/hosts ::/etc/hosts
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) res/etc/resolv.conf ::/etc/resolv.conf
 	# Add nano system config and syntax highlighting files
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) res/nanorc ::/etc/nanorc
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr/share/nano || true
@@ -1116,6 +1122,8 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/tmp || true
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/etc || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) /etc/services ::/etc/services
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/etc/hosts ::/etc/hosts
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/etc/resolv.conf ::/etc/resolv.conf
 	# Add nano system config and syntax highlighting files
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/nanorc ::/etc/nanorc
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/usr/share/nano || true
@@ -1254,6 +1262,8 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo mkdir -p /tmp/likeos_usb_mount/etc
 	sudo mkdir -p /tmp/likeos_usb_mount/usr/local/bin
 	sudo cp /etc/services /tmp/likeos_usb_mount/etc/services
+	sudo cp res/etc/hosts /tmp/likeos_usb_mount/etc/hosts
+	sudo cp res/etc/resolv.conf /tmp/likeos_usb_mount/etc/resolv.conf
 	
 	# Add nano system config and syntax highlighting files
 	sudo cp res/nanorc /tmp/likeos_usb_mount/etc/nanorc

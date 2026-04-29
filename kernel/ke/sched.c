@@ -597,6 +597,17 @@ void sched_tick(void) {
     // Statistics only – time slice management is in timer_irq_handler
 }
 
+// In-kernel cooperative yield.  Mirrors sys_yield() but callable directly
+// from kernel-mode busy-wait loops (e.g. loopback recv loops) where waiting
+// only on timer preemption can starve a peer task pinned to the same CPU.
+void sched_yield_in_kernel(void) {
+    task_t* cur = sched_current();
+    if (!cur) return;
+    cur->remaining_ticks = 0;
+    cur->state = TASK_READY;
+    sched_schedule();
+}
+
 // Core scheduling function – select next task from local run queue and switch.
 // Caller must set current task's state before calling (TASK_BLOCKED, TASK_ZOMBIE,
 // TASK_READY, etc.).

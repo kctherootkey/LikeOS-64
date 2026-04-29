@@ -41,4 +41,15 @@ struct ifconf {
     };
 };
 
+// Interface name<->index helpers (RFC 3493 §4)
+struct if_nameindex {
+    unsigned int if_index;
+    char*        if_name;
+};
+
+unsigned int if_nametoindex(const char* ifname);
+char*        if_indextoname(unsigned int ifindex, char* ifname);
+struct if_nameindex* if_nameindex(void);
+void         if_freenameindex(struct if_nameindex* ptr);
+
 #endif /* _NET_IF_H */

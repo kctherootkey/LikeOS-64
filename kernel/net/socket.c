@@ -11,6 +11,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/tty.h"
 #include "../../include/kernel/random.h"
+#include "../../include/kernel/sched.h"
 
 // Socket table
 static net_socket_t sockets[NET_MAX_SOCKETS];
@@ -69,9 +70,9 @@ net_socket_t* sock_find_udp(uint16_t port, uint32_t dst_ip) {
 // Returns socket descriptor (index into socket table) or negative errno
 // ============================================================================
 int sock_create(int domain, int type, int protocol) {
-    (void)protocol;
     if (domain != AF_INET) return -EAFNOSUPPORT;
-    if (type != SOCK_STREAM && type != SOCK_DGRAM) return -ESOCKTNOSUPPORT;
+    if (type != SOCK_STREAM && type != SOCK_DGRAM && type != SOCK_RAW)
+        return -ESOCKTNOSUPPORT;
 
     uint64_t flags;
     spin_lock_irqsave(&socket_lock, &flags);
@@ -80,30 +81,22 @@ int sock_create(int domain, int type, int protocol) {
     for (int i = 0; i < NET_MAX_SOCKETS; i++) {
         if (!sockets[i].active) {
             net_socket_t* s = &sockets[i];
+            // Zero the entire struct first so any new fields default to 0.
+            for (size_t b = 0; b < sizeof(*s); b++) ((uint8_t*)s)[b] = 0;
             s->type = type;
-            s->protocol = (type == SOCK_STREAM) ? IPPROTO_TCP : IPPROTO_UDP;
+            if (type == SOCK_STREAM)      s->protocol = IPPROTO_TCP;
+            else if (type == SOCK_DGRAM)  s->protocol = IPPROTO_UDP;
+            else                          s->protocol = (uint8_t)protocol;
             s->domain = domain;
-            s->bound = 0;
-            s->listening = 0;
-            s->connected = 0;
-            s->closed = 0;
-            s->nonblock = 0;
-            s->error = 0;
-            s->tcp = NULL;
-            s->udp_rx_head = 0;
-            s->udp_rx_tail = 0;
-            s->udp_rx_ready = 0;
-            s->reuse_addr = 0;
-            s->rcv_timeout_ticks = 0;
             s->ref_count = 1;
             s->active = 1;
+            // Sensible defaults
+            s->ip_ttl = 64;
+            s->mcast_ttl = 1;
+            s->mcast_loop = 1;
+            s->sndbuf_size = 65536;
+            s->rcvbuf_size = 65536;
             s->lock = (spinlock_t)SPINLOCK_INIT("sock");
-
-            // Zero addresses
-            for (int j = 0; j < (int)sizeof(struct sockaddr_in); j++) {
-                ((uint8_t*)&s->local_addr)[j] = 0;
-                ((uint8_t*)&s->remote_addr)[j] = 0;
-            }
             s->local_addr.sin_family = AF_INET;
             s->remote_addr.sin_family = AF_INET;
 
@@ -185,7 +178,7 @@ int sock_accept(int sockfd, struct sockaddr_in* addr, socklen_t* addrlen) {
         if (s->nonblock) return -EAGAIN;
         if (deadline && timer_ticks() >= deadline) return -ETIMEDOUT;
         loopback_process_pending();
-        __asm__ volatile("pause");
+        sched_yield_in_kernel();
     }
 
     // Create a new socket for the accepted connection
@@ -264,7 +257,7 @@ int sock_connect(int sockfd, const struct sockaddr_in* addr) {
         if (s->nonblock) return -EINPROGRESS;
         if (deadline && timer_ticks() >= deadline) return -ETIMEDOUT;
         loopback_process_pending();
-        __asm__ volatile("pause");
+        sched_yield_in_kernel();
     }
 
     if (conn->error) {
@@ -288,6 +281,29 @@ int sock_sendto(int sockfd, const void* buf, size_t len, int flags,
     if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS) return -EBADF;
     net_socket_t* s = &sockets[sockfd];
     if (!s->active) return -EBADF;
+    // Surface any pending async error (e.g. ICMP port-unreach) once
+    if (s->error) {
+        int e = s->error; s->error = 0; return -e;
+    }
+
+    // SOCK_RAW: caller may supply a full IP packet (IP_HDRINCL) or a payload.
+    if (s->type == SOCK_RAW) {
+        const struct sockaddr_in* target = dest_addr ? dest_addr : &s->remote_addr;
+        uint32_t dst_ip = net_ntohl(target->sin_addr.s_addr);
+        uint32_t next_hop = dst_ip;
+        net_device_t* dev = route_lookup(dst_ip, &next_hop);
+        if (!dev) dev = net_get_default_device();
+        if (!dev) return -ENETDOWN;
+        if (s->ip_hdrincl) {
+            // Caller-supplied IP header — forward as-is via raw L3 send hook
+            extern int ipv4_send_raw(net_device_t*, uint32_t,
+                                     const uint8_t*, uint16_t);
+            return ipv4_send_raw(dev, dst_ip, (const uint8_t*)buf, (uint16_t)len);
+        }
+        return ipv4_send_full(dev, dst_ip, (uint8_t)s->protocol,
+                              (const uint8_t*)buf, (uint16_t)len,
+                              s->ip_ttl ? s->ip_ttl : 64, s->ip_tos);
+    }
 
     if (s->type == SOCK_DGRAM) {
         const struct sockaddr_in* target = dest_addr ? dest_addr : &s->remote_addr;
@@ -299,11 +315,42 @@ int sock_sendto(int sockfd, const void* buf, size_t len, int flags,
         if (len > 0xFFFFU - 28U)
             return -EINVAL;
 
+        // SO_BROADCAST gate: refuse class-D/limited bcast if not enabled
+        int is_bcast = (dst_ip == 0xFFFFFFFFU);
+        int is_dirbcast = 0;
+        if (!is_bcast) {
+            // Directed broadcast == host-portion all-ones for some local subnet
+            for (int dn = 0; dn < 8; dn++) {
+                net_device_t* dd = net_get_device(dn);
+                if (!dd) continue;
+                if (dd->ip_addr && dd->netmask &&
+                    ((dst_ip | dd->netmask) == 0xFFFFFFFFU) &&
+                    ((dst_ip & dd->netmask) == (dd->ip_addr & dd->netmask))) {
+                    is_dirbcast = 1; break;
+                }
+            }
+        }
+        if ((is_bcast || is_dirbcast) && !s->broadcast)
+            return -EACCES;
+
         uint32_t next_hop = dst_ip;
         net_device_t* dev = route_lookup(dst_ip, &next_hop);
         if (!dev)
             dev = net_get_default_device();
         if (!dev) return -ENETDOWN;
+
+        // SO_BINDTODEVICE: if specified, override route choice
+        if (s->bindtodevice[0]) {
+            for (int dn = 0; dn < 8; dn++) {
+                net_device_t* dd = net_get_device(dn);
+                if (!dd) continue;
+                int match = 1;
+                for (int k = 0; k < 16 && s->bindtodevice[k]; k++) {
+                    if (dd->name[k] != s->bindtodevice[k]) { match = 0; break; }
+                }
+                if (match) { dev = dd; break; }
+            }
+        }
 
         if (!s->bound) {
             s->local_addr.sin_port = net_htons(alloc_ephemeral_port());
@@ -330,21 +377,22 @@ int sock_sendto(int sockfd, const void* buf, size_t len, int flags,
 // ============================================================================
 int sock_recvfrom(int sockfd, void* buf, size_t len, int flags,
                   struct sockaddr_in* src_addr, socklen_t* addrlen) {
-    (void)flags;
     if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS) return -EBADF;
     net_socket_t* s = &sockets[sockfd];
     if (!s->active) return -EBADF;
+    int peek = (flags & MSG_PEEK) != 0;
+    int dontwait = (flags & MSG_DONTWAIT) != 0;
 
-    if (s->type == SOCK_DGRAM) {
+    if (s->type == SOCK_DGRAM || s->type == SOCK_RAW) {
         // Wait for data
         uint64_t deadline = s->rcv_timeout_ticks ?
             timer_ticks() + s->rcv_timeout_ticks : 0;
 
         while (!s->udp_rx_ready) {
-            if (s->nonblock) return -EAGAIN;
+            if (s->nonblock || dontwait) return -EAGAIN;
             if (deadline && timer_ticks() >= deadline) return -ETIMEDOUT;
             loopback_process_pending();
-            __asm__ volatile("pause");
+            sched_yield_in_kernel();
         }
 
         uint64_t sflags;
@@ -370,9 +418,11 @@ int sock_recvfrom(int sockfd, void* buf, size_t len, int flags,
             *addrlen = sizeof(struct sockaddr_in);
         }
 
-        s->udp_rx_head = (s->udp_rx_head + 1) % 16;
-        if (s->udp_rx_head == s->udp_rx_tail)
-            s->udp_rx_ready = 0;
+        if (!peek) {
+            s->udp_rx_head = (s->udp_rx_head + 1) % 16;
+            if (s->udp_rx_head == s->udp_rx_tail)
+                s->udp_rx_ready = 0;
+        }
 
         spin_unlock_irqrestore(&s->lock, sflags);
         return data_len;
@@ -415,7 +465,7 @@ int sock_send(int sockfd, const void* buf, size_t len, int flags) {
 
             if (s->nonblock) return -EAGAIN;
             loopback_process_pending();
-            __asm__ volatile("pause");
+            sched_yield_in_kernel();
         }
     }
 
@@ -428,10 +478,12 @@ int sock_send(int sockfd, const void* buf, size_t len, int flags) {
 // sock_recv - Receive data on connected socket (TCP)
 // ============================================================================
 int sock_recv(int sockfd, void* buf, size_t len, int flags) {
-    (void)flags;
     if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS) return -EBADF;
     net_socket_t* s = &sockets[sockfd];
     if (!s->active) return -EBADF;
+    int peek = (flags & MSG_PEEK) != 0;
+    int dontwait = (flags & MSG_DONTWAIT) != 0;
+    int waitall = (flags & MSG_WAITALL) != 0;
 
     if (s->type == SOCK_STREAM) {
         if (!s->tcp) return -ENOTCONN;
@@ -439,21 +491,23 @@ int sock_recv(int sockfd, void* buf, size_t len, int flags) {
         tcp_conn_t* conn = s->tcp;
         uint64_t deadline = s->rcv_timeout_ticks ?
             timer_ticks() + s->rcv_timeout_ticks : 0;
-
+        size_t total = 0;
+again:
         // Wait for data
         while (!conn->rx_ready && conn->state == TCP_STATE_ESTABLISHED) {
-            if (s->nonblock) return -EAGAIN;
-            if (deadline && timer_ticks() >= deadline) return -ETIMEDOUT;
+            if (s->nonblock || dontwait) return total ? (int)total : -EAGAIN;
+            if (deadline && timer_ticks() >= deadline)
+                return total ? (int)total : -ETIMEDOUT;
             loopback_process_pending();
-            __asm__ volatile("pause");
+            sched_yield_in_kernel();
         }
 
-        if (conn->error) return -conn->error;
+        if (conn->error) return total ? (int)total : -conn->error;
 
         // Connection closed - return 0 (EOF)
         if (conn->state == TCP_STATE_CLOSE_WAIT ||
             conn->state == TCP_STATE_CLOSED) {
-            if (conn->rx_head == conn->rx_tail) return 0;
+            if (conn->rx_head == conn->rx_tail) return (int)total;
         }
 
         // Copy from rx buffer
@@ -462,20 +516,25 @@ int sock_recv(int sockfd, void* buf, size_t len, int flags) {
 
         uint32_t avail = (conn->rx_tail - conn->rx_head + conn->rx_buf_size) % conn->rx_buf_size;
         uint32_t copy = avail;
-        if (copy > len) copy = (uint32_t)len;
+        if (copy > (len - total)) copy = (uint32_t)(len - total);
 
         smap_disable();
         for (uint32_t i = 0; i < copy; i++) {
-            ((uint8_t*)buf)[i] = conn->rx_buf[(conn->rx_head + i) % conn->rx_buf_size];
+            ((uint8_t*)buf)[total + i] = conn->rx_buf[(conn->rx_head + i) % conn->rx_buf_size];
         }
         smap_enable();
-        conn->rx_head = (conn->rx_head + copy) % conn->rx_buf_size;
-
-        if (conn->rx_head == conn->rx_tail)
-            conn->rx_ready = 0;
+        if (!peek) {
+            conn->rx_head = (conn->rx_head + copy) % conn->rx_buf_size;
+            if (conn->rx_head == conn->rx_tail)
+                conn->rx_ready = 0;
+        }
 
         spin_unlock_irqrestore(&conn->lock, cflags);
-        return (int)copy;
+        total += copy;
+        if (waitall && !peek && total < len &&
+            conn->state == TCP_STATE_ESTABLISHED)
+            goto again;
+        return (int)total;
     }
 
     // UDP recv (connected, no src addr)
@@ -507,7 +566,23 @@ int sock_close(int sockfd) {
     }
 
     if (s->tcp) {
-        tcp_close(s->tcp);
+        // SO_LINGER: l_onoff=1, l_linger=0 → abort with RST (RFC 1122 §4.2.2.13)
+        if (s->linger_onoff && s->linger_seconds == 0) {
+            tcp_abort(s->tcp);
+        } else if (s->linger_onoff && s->linger_seconds > 0) {
+            // Block until tx fully drained or linger timeout expires.
+            tcp_close(s->tcp);
+            uint64_t deadline = timer_ticks() + (uint64_t)s->linger_seconds * 100;
+            while (s->tcp && s->tcp->state != TCP_STATE_CLOSED &&
+                   s->tcp->state != TCP_STATE_TIME_WAIT &&
+                   timer_ticks() < deadline) {
+                spin_unlock_irqrestore(&s->lock, flags);
+                sched_yield_in_kernel();
+                spin_lock_irqsave(&s->lock, &flags);
+            }
+        } else {
+            tcp_close(s->tcp);
+        }
         s->tcp = NULL;
     }
 
@@ -543,56 +618,308 @@ int sock_shutdown(int sockfd, int how) {
 // ============================================================================
 int sock_setsockopt(int sockfd, int level, int optname,
                     const void* optval, socklen_t optlen) {
-    (void)level;
     if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS) return -EBADF;
     net_socket_t* s = &sockets[sockfd];
     if (!s->active) return -EBADF;
 
-    switch (optname) {
-    case SO_REUSEADDR:
-        if (optlen >= sizeof(int))
-            s->reuse_addr = *(const int*)optval;
-        return 0;
-    case SO_RCVTIMEO: {
-        // Interpret as milliseconds for simplicity
-        if (optlen >= sizeof(uint64_t))
-            s->rcv_timeout_ticks = *(const uint64_t*)optval / 10;
-        else if (optlen >= sizeof(int))
-            s->rcv_timeout_ticks = (uint64_t)(*(const int*)optval) / 10;
-        return 0;
+    int ival = 0;
+    if (optval && optlen >= sizeof(int)) ival = *(const int*)optval;
+
+    if (level == SOL_SOCKET) {
+        switch (optname) {
+        case SO_REUSEADDR:    s->reuse_addr = ival; return 0;
+        case SO_REUSEPORT:    s->reuse_port = ival; return 0;
+        case SO_BROADCAST:    s->broadcast = ival; return 0;
+        case SO_OOBINLINE:    s->oobinline = ival; return 0;
+        case SO_KEEPALIVE:
+            if (s->tcp) s->tcp->keepalive = ival ? 1 : 0;
+            return 0;
+        case SO_SNDBUF:
+            if (ival > 0) s->sndbuf_size = (uint32_t)ival;
+            return 0;
+        case SO_RCVBUF:
+            if (ival > 0) s->rcvbuf_size = (uint32_t)ival;
+            return 0;
+        case SO_RCVTIMEO:
+            if (optlen >= sizeof(uint64_t))
+                s->rcv_timeout_ticks = *(const uint64_t*)optval / 10;
+            else if (optlen >= sizeof(int))
+                s->rcv_timeout_ticks = (uint64_t)ival / 10;
+            return 0;
+        case SO_SNDTIMEO:
+            return 0;  // accepted; not enforced
+        case SO_LINGER: {
+            if (optlen >= sizeof(struct linger)) {
+                const struct linger* l = (const struct linger*)optval;
+                s->linger_onoff = (uint8_t)l->l_onoff;
+                s->linger_seconds = (uint16_t)l->l_linger;
+            }
+            return 0;
+        }
+        case SO_BINDTODEVICE: {
+            socklen_t n = optlen;
+            if (n > 15) n = 15;
+            for (socklen_t i = 0; i < n; i++)
+                s->bindtodevice[i] = ((const char*)optval)[i];
+            s->bindtodevice[n] = 0;
+            return 0;
+        }
+        default:
+            return -ENOPROTOOPT;
+        }
     }
-    case SO_KEEPALIVE:
-        return 0;  // Accepted but ignored
-    default:
-        return -ENOPROTOOPT;
+
+    if (level == SOL_IP || level == IPPROTO_IP) {
+        switch (optname) {
+        case IP_TTL:               if (ival > 0 && ival < 256) s->ip_ttl = (uint8_t)ival; return 0;
+        case IP_TOS:               s->ip_tos = (uint8_t)ival; return 0;
+        case IP_HDRINCL:           s->ip_hdrincl = ival ? 1 : 0; return 0;
+        case IP_PKTINFO:           s->ip_recvpktinfo = ival ? 1 : 0; return 0;
+        case IP_RECVTTL:           s->ip_recvttl = ival ? 1 : 0; return 0;
+        case IP_RECVTOS:           s->ip_recvtos = ival ? 1 : 0; return 0;
+        case IP_MTU_DISCOVER:      return 0;  // accepted; we only do PMTUD
+        case IP_OPTIONS:           return 0;  // accepted; not emitted
+        case IP_MULTICAST_TTL:     s->mcast_ttl = (uint8_t)(ival & 0xFF); return 0;
+        case IP_MULTICAST_LOOP:    s->mcast_loop = ival ? 1 : 0; return 0;
+        case IP_MULTICAST_IF:
+            if (optlen >= sizeof(uint32_t))
+                s->mcast_if = net_ntohl(*(const uint32_t*)optval);
+            return 0;
+        case IP_ADD_MEMBERSHIP: {
+            if (optlen < sizeof(struct ip_mreq)) return -EINVAL;
+            const struct ip_mreq* mr = (const struct ip_mreq*)optval;
+            uint32_t group = net_ntohl(mr->imr_multiaddr.s_addr);
+            // Track on socket so we can leave on close.
+            int slot = -1;
+            for (int i = 0; i < NET_MAX_MCAST_GROUPS; i++) {
+                if (s->mcast_groups[i] == group) return 0;
+                if (slot < 0 && s->mcast_groups[i] == 0) slot = i;
+            }
+            if (slot < 0) return -ENOBUFS;
+            s->mcast_groups[slot] = group;
+            net_device_t* dev = net_get_default_device();
+            return igmp_join(dev, group);
+        }
+        case IP_DROP_MEMBERSHIP: {
+            if (optlen < sizeof(struct ip_mreq)) return -EINVAL;
+            const struct ip_mreq* mr = (const struct ip_mreq*)optval;
+            uint32_t group = net_ntohl(mr->imr_multiaddr.s_addr);
+            for (int i = 0; i < NET_MAX_MCAST_GROUPS; i++) {
+                if (s->mcast_groups[i] == group) {
+                    s->mcast_groups[i] = 0;
+                    net_device_t* dev = net_get_default_device();
+                    return igmp_leave(dev, group);
+                }
+            }
+            return -EADDRNOTAVAIL;
+        }
+        default:
+            return -ENOPROTOOPT;
+        }
     }
+
+    if (level == SOL_TCP || level == IPPROTO_TCP) {
+        if (s->type != SOCK_STREAM) return -ENOPROTOOPT;
+        switch (optname) {
+        case TCP_NODELAY:
+            if (s->tcp) s->tcp->nodelay = ival ? 1 : 0;
+            return 0;
+        case TCP_KEEPIDLE:
+            if (s->tcp && ival > 0) s->tcp->keepidle_ticks = (uint32_t)ival * 100;
+            return 0;
+        case TCP_KEEPINTVL:
+            if (s->tcp && ival > 0) s->tcp->keepintvl_ticks = (uint32_t)ival * 100;
+            return 0;
+        case TCP_KEEPCNT:
+            if (s->tcp && ival > 0) s->tcp->keepcnt = (uint8_t)ival;
+            return 0;
+        case TCP_MAXSEG:
+            return 0;
+        default:
+            return -ENOPROTOOPT;
+        }
+    }
+
+    return -ENOPROTOOPT;
 }
 
 int sock_getsockopt(int sockfd, int level, int optname,
                     void* optval, socklen_t* optlen) {
-    (void)level;
     if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS) return -EBADF;
     net_socket_t* s = &sockets[sockfd];
     if (!s->active) return -EBADF;
 
-    switch (optname) {
-    case SO_ERROR: {
-        if (*optlen >= sizeof(int)) {
-            *(int*)optval = s->error;
-            s->error = 0;
-            *optlen = sizeof(int);
+    if (level == SOL_SOCKET) {
+        switch (optname) {
+        case SO_ERROR:
+            if (*optlen >= sizeof(int)) {
+                *(int*)optval = s->error;
+                s->error = 0;
+                *optlen = sizeof(int);
+            }
+            return 0;
+        case SO_TYPE:
+            if (*optlen >= sizeof(int)) {
+                *(int*)optval = s->type;
+                *optlen = sizeof(int);
+            }
+            return 0;
+        case SO_REUSEADDR:
+        case SO_REUSEPORT:
+        case SO_BROADCAST:
+        case SO_OOBINLINE: {
+            int v = (optname == SO_REUSEADDR) ? s->reuse_addr :
+                    (optname == SO_REUSEPORT) ? s->reuse_port :
+                    (optname == SO_BROADCAST) ? s->broadcast : s->oobinline;
+            if (*optlen >= sizeof(int)) {
+                *(int*)optval = v;
+                *optlen = sizeof(int);
+            }
+            return 0;
         }
-        return 0;
-    }
-    case SO_REUSEADDR: {
-        if (*optlen >= sizeof(int)) {
-            *(int*)optval = s->reuse_addr;
-            *optlen = sizeof(int);
+        case SO_KEEPALIVE:
+            if (*optlen >= sizeof(int)) {
+                *(int*)optval = (s->tcp && s->tcp->keepalive) ? 1 : 0;
+                *optlen = sizeof(int);
+            }
+            return 0;
+        case SO_SNDBUF:
+            if (*optlen >= sizeof(int)) {
+                *(int*)optval = (int)s->sndbuf_size;
+                *optlen = sizeof(int);
+            }
+            return 0;
+        case SO_RCVBUF:
+            if (*optlen >= sizeof(int)) {
+                *(int*)optval = (int)s->rcvbuf_size;
+                *optlen = sizeof(int);
+            }
+            return 0;
+        case SO_LINGER:
+            if (*optlen >= sizeof(struct linger)) {
+                struct linger* l = (struct linger*)optval;
+                l->l_onoff = s->linger_onoff;
+                l->l_linger = s->linger_seconds;
+                *optlen = sizeof(struct linger);
+            }
+            return 0;
+        default:
+            return -ENOPROTOOPT;
         }
-        return 0;
     }
-    default:
-        return -ENOPROTOOPT;
+
+    if (level == SOL_IP || level == IPPROTO_IP) {
+        switch (optname) {
+        case IP_TTL:
+            if (*optlen >= sizeof(int)) {
+                *(int*)optval = s->ip_ttl;
+                *optlen = sizeof(int);
+            }
+            return 0;
+        case IP_TOS:
+            if (*optlen >= sizeof(int)) {
+                *(int*)optval = s->ip_tos;
+                *optlen = sizeof(int);
+            }
+            return 0;
+        case IP_HDRINCL:
+            if (*optlen >= sizeof(int)) {
+                *(int*)optval = s->ip_hdrincl;
+                *optlen = sizeof(int);
+            }
+            return 0;
+        case IP_MULTICAST_TTL:
+            if (*optlen >= sizeof(int)) {
+                *(int*)optval = s->mcast_ttl;
+                *optlen = sizeof(int);
+            }
+            return 0;
+        case IP_MULTICAST_LOOP:
+            if (*optlen >= sizeof(int)) {
+                *(int*)optval = s->mcast_loop;
+                *optlen = sizeof(int);
+            }
+            return 0;
+        default:
+            return -ENOPROTOOPT;
+        }
+    }
+
+    if (level == SOL_TCP || level == IPPROTO_TCP) {
+        if (s->type != SOCK_STREAM) return -ENOPROTOOPT;
+        switch (optname) {
+        case TCP_NODELAY:
+            if (*optlen >= sizeof(int)) {
+                *(int*)optval = (s->tcp && s->tcp->nodelay) ? 1 : 0;
+                *optlen = sizeof(int);
+            }
+            return 0;
+        case TCP_INFO:
+            if (!s->tcp) return -ENOTCONN;
+            if (*optlen < sizeof(struct tcp_info)) return -EINVAL;
+            tcp_fill_info(s->tcp, (struct tcp_info*)optval);
+            *optlen = sizeof(struct tcp_info);
+            return 0;
+        case TCP_KEEPIDLE:
+            if (*optlen >= sizeof(int) && s->tcp) {
+                *(int*)optval = (int)(s->tcp->keepidle_ticks / 100);
+                *optlen = sizeof(int);
+            }
+            return 0;
+        case TCP_KEEPINTVL:
+            if (*optlen >= sizeof(int) && s->tcp) {
+                *(int*)optval = (int)(s->tcp->keepintvl_ticks / 100);
+                *optlen = sizeof(int);
+            }
+            return 0;
+        case TCP_KEEPCNT:
+            if (*optlen >= sizeof(int) && s->tcp) {
+                *(int*)optval = (int)s->tcp->keepcnt;
+                *optlen = sizeof(int);
+            }
+            return 0;
+        default:
+            return -ENOPROTOOPT;
+        }
+    }
+
+    return -ENOPROTOOPT;
+}
+
+// ============================================================================
+// raw_socket_deliver - hand a copy of an inbound IPv4 packet to every
+// SOCK_RAW socket whose protocol matches (or IPPROTO_RAW).  Called by ipv4_rx
+// before the normal demux.
+// ============================================================================
+void raw_socket_deliver(uint32_t src_ip, uint32_t dst_ip, uint8_t protocol,
+                        const uint8_t* packet, uint16_t total_len) {
+    (void)dst_ip;
+    for (int i = 0; i < NET_MAX_SOCKETS; i++) {
+        net_socket_t* s = &sockets[i];
+        if (!s->active || s->type != SOCK_RAW) continue;
+        if (s->protocol != protocol && s->protocol != IPPROTO_RAW) continue;
+
+        uint64_t flags;
+        spin_lock_irqsave(&s->lock, &flags);
+
+        int next = (s->udp_rx_tail + 1) % 16;
+        if (next == s->udp_rx_head) {
+            spin_unlock_irqrestore(&s->lock, flags);
+            continue;  // queue full, drop
+        }
+        uint16_t copy = total_len;
+        if (copy > sizeof(s->udp_rx_queue[0].data))
+            copy = sizeof(s->udp_rx_queue[0].data);
+        for (uint16_t b = 0; b < copy; b++)
+            s->udp_rx_queue[s->udp_rx_tail].data[b] = packet[b];
+        s->udp_rx_queue[s->udp_rx_tail].len = copy;
+        s->udp_rx_queue[s->udp_rx_tail].from.sin_family = AF_INET;
+        s->udp_rx_queue[s->udp_rx_tail].from.sin_port = 0;
+        s->udp_rx_queue[s->udp_rx_tail].from.sin_addr.s_addr = net_htonl(src_ip);
+        s->udp_rx_tail = next;
+        s->udp_rx_ready = 1;
+
+        spin_unlock_irqrestore(&s->lock, flags);
     }
 }
 
@@ -631,6 +958,37 @@ net_socket_t* sock_get(int sockfd) {
     if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS) return NULL;
     net_socket_t* s = &sockets[sockfd];
     return s->active ? s : NULL;
+}
+
+// ============================================================================
+// sock_post_icmp_error — set error on a socket matching the 4-tuple
+// ============================================================================
+void sock_post_icmp_error(uint8_t proto,
+                          uint32_t src_ip, uint16_t src_port,
+                          uint32_t dst_ip, uint16_t dst_port,
+                          int error) {
+    int wanted_type = (proto == IP_PROTO_TCP) ? SOCK_STREAM : SOCK_DGRAM;
+    for (int i = 0; i < NET_MAX_SOCKETS; i++) {
+        net_socket_t* s = &sockets[i];
+        if (!s->active || s->type != wanted_type) continue;
+        // local side: src_ip/src_port from the original outbound packet
+        if (net_ntohs(s->local_addr.sin_port) != src_port) continue;
+        if (s->local_addr.sin_addr.s_addr != 0 &&
+            net_ntohl(s->local_addr.sin_addr.s_addr) != src_ip)
+            continue;
+        if (s->connected) {
+            if (net_ntohs(s->remote_addr.sin_port) != dst_port) continue;
+            if (net_ntohl(s->remote_addr.sin_addr.s_addr) != dst_ip) continue;
+        }
+        s->error = error;
+        s->udp_rx_ready = 1;     // wake any blocked recv
+        if (proto == IP_PROTO_TCP && s->tcp) {
+            s->tcp->error = error;
+            s->tcp->rx_ready = 1;
+            s->tcp->tx_ready = 1;
+            s->tcp->connect_done = 1;
+        }
+    }
 }
 
 // ============================================================================
@@ -743,6 +1101,9 @@ int sock_sendmsg(int sockfd, const struct msghdr* msg, int flags) {
 // ============================================================================
 int sock_recvmsg(int sockfd, struct msghdr* msg, int flags) {
     if (!msg) return -EINVAL;
+    if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS) return -EBADF;
+    net_socket_t* s = &sockets[sockfd];
+    if (!s->active) return -EBADF;
 
     // Calculate total iovec capacity
     size_t total = 0;
@@ -758,6 +1119,22 @@ int sock_recvmsg(int sockfd, struct msghdr* msg, int flags) {
 
     struct sockaddr_in src_addr;
     socklen_t addrlen = sizeof(src_addr);
+
+    // For DGRAM/RAW, capture per-packet metadata BEFORE recvfrom dequeues
+    uint32_t pkt_dst_ip = 0;
+    uint8_t  pkt_ttl = 0, pkt_tos = 0;
+    uint32_t pkt_ifindex = 0;
+    int      have_meta = 0;
+    if ((s->type == SOCK_DGRAM || s->type == SOCK_RAW) &&
+        s->udp_rx_head != s->udp_rx_tail) {
+        int idx = s->udp_rx_head;
+        pkt_dst_ip = s->udp_rx_queue[idx].dst_ip;
+        pkt_ttl    = s->udp_rx_queue[idx].ttl;
+        pkt_tos    = s->udp_rx_queue[idx].tos;
+        pkt_ifindex = s->udp_rx_queue[idx].ifindex;
+        have_meta = 1;
+    }
+
     int ret = sock_recvfrom(sockfd, buf, total, flags, &src_addr, &addrlen);
     if (ret < 0) return ret;
 
@@ -777,9 +1154,52 @@ int sock_recvmsg(int sockfd, struct msghdr* msg, int flags) {
         *(struct sockaddr_in*)msg->msg_name = src_addr;
         msg->msg_namelen = sizeof(struct sockaddr_in);
     }
-    smap_enable();
+
+    // RFC 2292 ancillary data
+    size_t cmsg_avail = msg->msg_controllen;
+    size_t cmsg_used  = 0;
     msg->msg_flags = 0;
-    msg->msg_controllen = 0;
+    if (have_meta && msg->msg_control && cmsg_avail > 0) {
+        unsigned char* cp = (unsigned char*)msg->msg_control;
+        if (s->ip_recvpktinfo &&
+            cmsg_used + CMSG_SPACE(sizeof(struct in_pktinfo)) <= cmsg_avail) {
+            struct cmsghdr* c = (struct cmsghdr*)(cp + cmsg_used);
+            c->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+            c->cmsg_level = IPPROTO_IP;
+            c->cmsg_type  = IP_PKTINFO;
+            struct in_pktinfo pi = {0};
+            pi.ipi_ifindex = (int)pkt_ifindex;
+            pi.ipi_addr.s_addr = net_htonl(pkt_dst_ip);
+            pi.ipi_spec_dst.s_addr = net_htonl(pkt_dst_ip);
+            for (size_t k = 0; k < sizeof(pi); k++)
+                CMSG_DATA(c)[k] = ((unsigned char*)&pi)[k];
+            cmsg_used += CMSG_SPACE(sizeof(struct in_pktinfo));
+        }
+        if (s->ip_recvttl &&
+            cmsg_used + CMSG_SPACE(sizeof(int)) <= cmsg_avail) {
+            struct cmsghdr* c = (struct cmsghdr*)(cp + cmsg_used);
+            c->cmsg_len = CMSG_LEN(sizeof(int));
+            c->cmsg_level = IPPROTO_IP;
+            c->cmsg_type  = IP_RECVTTL;
+            int v = pkt_ttl;
+            for (size_t k = 0; k < sizeof(v); k++)
+                CMSG_DATA(c)[k] = ((unsigned char*)&v)[k];
+            cmsg_used += CMSG_SPACE(sizeof(int));
+        }
+        if (s->ip_recvtos &&
+            cmsg_used + CMSG_SPACE(sizeof(int)) <= cmsg_avail) {
+            struct cmsghdr* c = (struct cmsghdr*)(cp + cmsg_used);
+            c->cmsg_len = CMSG_LEN(sizeof(int));
+            c->cmsg_level = IPPROTO_IP;
+            c->cmsg_type  = IP_RECVTOS;
+            int v = pkt_tos;
+            for (size_t k = 0; k < sizeof(v); k++)
+                CMSG_DATA(c)[k] = ((unsigned char*)&v)[k];
+            cmsg_used += CMSG_SPACE(sizeof(int));
+        }
+    }
+    msg->msg_controllen = cmsg_used;
+    smap_enable();
 
     return ret;
 }
