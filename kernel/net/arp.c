@@ -4,6 +4,7 @@
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/timer.h"
+#include "../../include/kernel/skb.h"
 
 // ============================================================================
 // ARP Table
@@ -21,10 +22,128 @@ typedef struct {
 static arp_entry_t arp_table[ARP_TABLE_SIZE];
 static spinlock_t arp_lock = SPINLOCK_INIT("arp");
 
+// ============================================================================
+// ARP Pending-skb queue
+//
+// When the IPv4 send path encounters an ARP cache miss, it builds the
+// outgoing IP datagram into an sk_buff and hands it to arp_queue_pending().
+// arp_request() is fired in the background and the IP-layer call returns
+// immediately, so no upper-layer lock is ever held across an ARP wait.
+//
+// When arp_add_entry() learns a (ip, mac) binding -- either from an ARP
+// reply, a gratuitous ARP, or eth_rx snooping the source of an inbound
+// IPv4 frame -- arp_drain_pending() walks the pending list, dequeues every
+// entry destined for that ip, and transmits each via eth_send() with the
+// pending-list lock dropped.
+// ============================================================================
+#define ARP_PENDING_MAX     128
+#define ARP_PENDING_TIMEOUT 100   // 1 s at 100 Hz; entries older than this
+                                  // are dropped on the next learn / probe.
+
+typedef struct arp_pending {
+    int            in_use;
+    uint32_t       next_hop_ip;   // host order
+    net_device_t*  dev;
+    sk_buff_t*     skb;           // owns reference; data = full IPv4 datagram
+    uint64_t       enqueued_tick;
+} arp_pending_t;
+
+static arp_pending_t arp_pending_pool[ARP_PENDING_MAX];
+static spinlock_t    arp_pending_lock = SPINLOCK_INIT("arp_pending");
+
 void arp_init(void) {
     for (int i = 0; i < ARP_TABLE_SIZE; i++) {
         arp_table[i].valid = 0;
     }
+    for (int i = 0; i < ARP_PENDING_MAX; i++) {
+        arp_pending_pool[i].in_use = 0;
+        arp_pending_pool[i].skb = NULL;
+    }
+}
+
+// Take ownership of `skb` and queue it for transmit once we learn the
+// MAC for `next_hop_ip`.  Returns 0 on success (skb consumed) or -1 if the
+// pending pool is full (caller still owns skb and must drop it).
+int arp_queue_pending(net_device_t* dev, uint32_t next_hop_ip, sk_buff_t* skb) {
+    if (!dev || !skb) return -1;
+
+    uint64_t now = timer_ticks();
+    uint64_t flags;
+    spin_lock_irqsave(&arp_pending_lock, &flags);
+
+    // First pass: find a free slot, opportunistically GC expired entries.
+    int slot = -1;
+    sk_buff_t* expired_skbs[ARP_PENDING_MAX];
+    int        expired_count = 0;
+    for (int i = 0; i < ARP_PENDING_MAX; i++) {
+        if (arp_pending_pool[i].in_use &&
+            now - arp_pending_pool[i].enqueued_tick > ARP_PENDING_TIMEOUT) {
+            expired_skbs[expired_count++] = arp_pending_pool[i].skb;
+            arp_pending_pool[i].in_use = 0;
+            arp_pending_pool[i].skb = NULL;
+        }
+        if (slot < 0 && !arp_pending_pool[i].in_use) slot = i;
+    }
+    if (slot < 0) {
+        spin_unlock_irqrestore(&arp_pending_lock, flags);
+        // Drop expired skbs (collected above) outside the lock.
+        for (int i = 0; i < expired_count; i++) skb_put(expired_skbs[i]);
+        return -1;
+    }
+    arp_pending_pool[slot].in_use        = 1;
+    arp_pending_pool[slot].next_hop_ip   = next_hop_ip;
+    arp_pending_pool[slot].dev           = dev;
+    arp_pending_pool[slot].skb           = skb;
+    arp_pending_pool[slot].enqueued_tick = now;
+    spin_unlock_irqrestore(&arp_pending_lock, flags);
+
+    for (int i = 0; i < expired_count; i++) skb_put(expired_skbs[i]);
+
+    // Fire an ARP request in the background; safe to call without holding
+    // arp_pending_lock because arp_request only touches dev and emits a frame.
+    arp_request(dev, next_hop_ip);
+    return 0;
+}
+
+// Drain pending skbs whose next_hop matches `ip`, transmitting each via
+// eth_send.  Called from arp_add_entry() on every learned binding.
+static void arp_drain_pending(uint32_t ip, const uint8_t mac[ETH_ALEN]) {
+    sk_buff_t*   ready_skbs[ARP_PENDING_MAX];
+    net_device_t* ready_devs[ARP_PENDING_MAX];
+    int          ready_count = 0;
+    sk_buff_t*   expired_skbs[ARP_PENDING_MAX];
+    int          expired_count = 0;
+
+    uint64_t now = timer_ticks();
+    uint64_t flags;
+    spin_lock_irqsave(&arp_pending_lock, &flags);
+    for (int i = 0; i < ARP_PENDING_MAX; i++) {
+        if (!arp_pending_pool[i].in_use) continue;
+        if (now - arp_pending_pool[i].enqueued_tick > ARP_PENDING_TIMEOUT) {
+            expired_skbs[expired_count++] = arp_pending_pool[i].skb;
+            arp_pending_pool[i].in_use = 0;
+            arp_pending_pool[i].skb = NULL;
+            continue;
+        }
+        if (arp_pending_pool[i].next_hop_ip == ip) {
+            ready_skbs[ready_count] = arp_pending_pool[i].skb;
+            ready_devs[ready_count] = arp_pending_pool[i].dev;
+            ready_count++;
+            arp_pending_pool[i].in_use = 0;
+            arp_pending_pool[i].skb = NULL;
+        }
+    }
+    spin_unlock_irqrestore(&arp_pending_lock, flags);
+
+    // Transmit ready skbs without holding arp_pending_lock.  Each skb
+    // already contains the full IPv4 datagram; we only prepend an Ethernet
+    // header via eth_send.
+    for (int i = 0; i < ready_count; i++) {
+        sk_buff_t* skb = ready_skbs[i];
+        eth_send(ready_devs[i], mac, ETH_P_IP, skb->data, skb->len);
+        skb_put(skb);
+    }
+    for (int i = 0; i < expired_count; i++) skb_put(expired_skbs[i]);
 }
 
 void arp_add_entry(uint32_t ip, const uint8_t mac[ETH_ALEN]) {
@@ -32,45 +151,44 @@ void arp_add_entry(uint32_t ip, const uint8_t mac[ETH_ALEN]) {
     spin_lock_irqsave(&arp_lock, &flags);
 
     // Check for existing entry
+    int found = 0;
     for (int i = 0; i < ARP_TABLE_SIZE; i++) {
         if (arp_table[i].valid && arp_table[i].ip == ip) {
             for (int m = 0; m < ETH_ALEN; m++)
                 arp_table[i].mac[m] = mac[m];
             arp_table[i].timestamp = timer_ticks();
-            spin_unlock_irqrestore(&arp_lock, flags);
-            return;
+            found = 1;
+            break;
         }
     }
-
-    // Find free entry
-    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-        if (!arp_table[i].valid) {
-            arp_table[i].ip = ip;
-            for (int m = 0; m < ETH_ALEN; m++)
-                arp_table[i].mac[m] = mac[m];
-            arp_table[i].timestamp = timer_ticks();
-            arp_table[i].valid = 1;
-            spin_unlock_irqrestore(&arp_lock, flags);
-            return;
+    if (!found) {
+        // Find free entry
+        int slot = -1;
+        for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+            if (!arp_table[i].valid) { slot = i; break; }
         }
-    }
-
-    // Table full - evict oldest
-    int oldest = 0;
-    uint64_t oldest_time = arp_table[0].timestamp;
-    for (int i = 1; i < ARP_TABLE_SIZE; i++) {
-        if (arp_table[i].timestamp < oldest_time) {
-            oldest_time = arp_table[i].timestamp;
-            oldest = i;
+        if (slot < 0) {
+            // Table full - evict oldest
+            slot = 0;
+            uint64_t oldest_time = arp_table[0].timestamp;
+            for (int i = 1; i < ARP_TABLE_SIZE; i++) {
+                if (arp_table[i].timestamp < oldest_time) {
+                    oldest_time = arp_table[i].timestamp;
+                    slot = i;
+                }
+            }
         }
+        arp_table[slot].ip = ip;
+        for (int m = 0; m < ETH_ALEN; m++)
+            arp_table[slot].mac[m] = mac[m];
+        arp_table[slot].timestamp = timer_ticks();
+        arp_table[slot].valid = 1;
     }
-    arp_table[oldest].ip = ip;
-    for (int m = 0; m < ETH_ALEN; m++)
-        arp_table[oldest].mac[m] = mac[m];
-    arp_table[oldest].timestamp = timer_ticks();
-    arp_table[oldest].valid = 1;
 
     spin_unlock_irqrestore(&arp_lock, flags);
+
+    // Drain any pending skbs waiting on this IP (no arp_lock held).
+    arp_drain_pending(ip, mac);
 }
 
 // Lookup MAC for an IP. Returns 0 on success, -1 if not cached.

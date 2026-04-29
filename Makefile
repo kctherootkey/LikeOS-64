@@ -181,7 +181,9 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/route.o \
 			  $(BUILD_DIR)/dns.o \
 			  $(BUILD_DIR)/igmp.o \
-			  $(BUILD_DIR)/unix_socket.o
+			  $(BUILD_DIR)/unix_socket.o \
+			  $(BUILD_DIR)/skb.o \
+			  $(BUILD_DIR)/softirq.o
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -374,6 +376,12 @@ $(BUILD_DIR)/igmp.o: $(KERNEL_DIR)/net/igmp.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/unix_socket.o: $(KERNEL_DIR)/net/unix_socket.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/skb.o: $(KERNEL_DIR)/net/skb.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/softirq.o: $(KERNEL_DIR)/net/softirq.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ioapic.o: $(KERNEL_DIR)/hal/ioapic.c | $(BUILD_DIR)

@@ -3,10 +3,11 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/random.h"
 #include "../../include/kernel/timer.h"
+#include "../../include/kernel/skb.h"
 
-// Static send buffer to avoid large stack allocations (kernel stack is only 8KB)
-static uint8_t ipv4_send_buf[NET_MTU_DEFAULT + sizeof(ipv4_header_t)];
-static spinlock_t ipv4_send_lock = SPINLOCK_INIT("ipv4_tx");
+// TX path uses per-fragment sk_buff allocations from the size-classed pool;
+// no global TX spinlock is held across the lower-layer send.  See
+// include/kernel/skb.h for the deadlock + TLB-IPI rationale.
 
 // ============================================================================
 // RFC 1191 Path-MTU Discovery cache (LRU)
@@ -197,27 +198,27 @@ static int ipv4_send_common(net_device_t* dev, uint32_t dst_ip, uint8_t protocol
     }
 
     uint8_t dst_mac[ETH_ALEN];
+    int dst_mac_known = 0;
     int is_mcast = (dst_ip >= 0xE0000000U && dst_ip < 0xF0000000U);
     if (out_dev != net_get_loopback()) {
         if (dst_ip == 0xFFFFFFFF) {
             for (int i = 0; i < ETH_ALEN; i++) dst_mac[i] = 0xFF;
+            dst_mac_known = 1;
         } else if (is_mcast) {
             // RFC 1112: multicast MAC = 01:00:5e + low 23 bits of group.
             dst_mac[0] = 0x01; dst_mac[1] = 0x00; dst_mac[2] = 0x5E;
             dst_mac[3] = (uint8_t)((dst_ip >> 16) & 0x7F);
             dst_mac[4] = (uint8_t)((dst_ip >> 8) & 0xFF);
             dst_mac[5] = (uint8_t)(dst_ip & 0xFF);
-        } else if (arp_resolve(out_dev, next_hop, dst_mac) < 0) {
-            uint64_t arp_deadline = timer_ticks() + 300;
-            while ((uint64_t)timer_ticks() < arp_deadline) {
-                __asm__ volatile("sti; hlt");
-                if (arp_cache_lookup(next_hop, dst_mac) == 0)
-                    goto arp_done_common;
-            }
-            return -1;
+            dst_mac_known = 1;
+        } else if (arp_resolve(out_dev, next_hop, dst_mac) == 0) {
+            dst_mac_known = 1;
         }
+        // ARP miss: arp_resolve already fired arp_request().  We will queue
+        // each per-fragment skb via arp_queue_pending() below; the queued
+        // skb is transmitted from arp_drain_pending() once the reply lands.
+        // No upper-layer lock is held across this path, so no busy-wait.
     }
-arp_done_common:
 
     uint16_t mtu = out_dev == net_get_loopback() ? NET_MTU_DEFAULT : out_dev->mtu;
     if (mtu < sizeof(ipv4_header_t) + 8) return -1;
@@ -240,12 +241,13 @@ arp_done_common:
         frag_flags |= (uint16_t)((offset / 8) & IPV4_FRAG_OFFSET_MASK);
 
         uint16_t total_len = (uint16_t)(sizeof(ipv4_header_t) + chunk);
-        if (total_len > sizeof(ipv4_send_buf)) return -1;
 
-        uint64_t iflags;
-        spin_lock_irqsave(&ipv4_send_lock, &iflags);
+        sk_buff_t* skb = skb_alloc(total_len);
+        if (!skb) return -1;
+        skb->dev = out_dev;
 
-        ipv4_header_t* ip = (ipv4_header_t*)ipv4_send_buf;
+        uint8_t* buf = skb_append(skb, total_len);
+        ipv4_header_t* ip = (ipv4_header_t*)buf;
         ip->version_ihl = 0x45;
         ip->tos = tos;
         ip->total_length = net_htons(total_len);
@@ -259,15 +261,27 @@ arp_done_common:
         ip->checksum = ipv4_checksum(ip, sizeof(ipv4_header_t));
 
         for (uint16_t i = 0; i < chunk; i++)
-            ipv4_send_buf[sizeof(ipv4_header_t) + i] = payload[offset + i];
+            buf[sizeof(ipv4_header_t) + i] = payload[offset + i];
 
         int ret;
-        if (out_dev == net_get_loopback())
-            ret = out_dev->send(out_dev, ipv4_send_buf, total_len);
-        else
-            ret = eth_send(out_dev, dst_mac, ETH_P_IP, ipv4_send_buf, total_len);
-
-        spin_unlock_irqrestore(&ipv4_send_lock, iflags);
+        if (out_dev == net_get_loopback()) {
+            ret = out_dev->send(out_dev, skb->data, skb->len);
+            skb_put(skb);
+        } else if (dst_mac_known) {
+            ret = eth_send(out_dev, dst_mac, ETH_P_IP, skb->data, skb->len);
+            skb_put(skb);
+        } else {
+            // ARP not yet resolved -- transfer skb ownership to ARP pending
+            // queue.  arp_drain_pending() will transmit it once the reply
+            // arrives.  Treat as success so upper layers (TCP/UDP/ICMP) do
+            // not retry immediately.
+            if (arp_queue_pending(out_dev, next_hop, skb) < 0) {
+                // Pool full: drop and surface error so caller can retry.
+                skb_put(skb);
+                return -1;
+            }
+            ret = 0;
+        }
         if (ret < 0) return ret;
         offset = (uint16_t)(offset + chunk);
     }
@@ -339,7 +353,20 @@ int ipv4_send_raw(net_device_t* dev, uint32_t dst_ip,
     } else if (dst_ip == 0xFFFFFFFFU) {
         for (int i = 0; i < ETH_ALEN; i++) dst_mac[i] = 0xFF;
     } else {
-        if (arp_resolve(out_dev, next_hop, dst_mac) < 0) return -1;
+        if (arp_resolve(out_dev, next_hop, dst_mac) < 0) {
+            // Defer raw frame via ARP pending queue; copy into an skb so we
+            // can hand off ownership.
+            sk_buff_t* skb = skb_alloc(total_len);
+            if (!skb) return -1;
+            skb->dev = out_dev;
+            uint8_t* buf = skb_append(skb, total_len);
+            for (uint16_t i = 0; i < total_len; i++) buf[i] = full_ip_packet[i];
+            if (arp_queue_pending(out_dev, next_hop, skb) < 0) {
+                skb_put(skb);
+                return -1;
+            }
+            return 0;
+        }
     }
 
     return eth_send(out_dev, dst_mac, ETH_P_IP, full_ip_packet, total_len);

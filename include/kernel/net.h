@@ -707,6 +707,13 @@ void eth_rx(net_device_t* dev, const uint8_t* frame, uint16_t len);
 void arp_init(void);
 int  arp_resolve(net_device_t* dev, uint32_t ip, uint8_t mac_out[ETH_ALEN]);
 int  arp_cache_lookup(uint32_t ip, uint8_t mac_out[ETH_ALEN]);
+// Forward decl; full type in <kernel/skb.h>
+struct sk_buff;
+// Queue an IPv4 datagram skb pending ARP resolution of next_hop_ip. Takes
+// ownership of skb on success (returns 0).  Returns -1 if the pending pool
+// is full; caller still owns skb in that case and must drop it via skb_put.
+int  arp_queue_pending(net_device_t* dev, uint32_t next_hop_ip,
+                       struct sk_buff* skb);
 void arp_rx(net_device_t* dev, const uint8_t* data, uint16_t len);
 void arp_request(net_device_t* dev, uint32_t target_ip);
 void arp_add_entry(uint32_t ip, const uint8_t mac[ETH_ALEN]);

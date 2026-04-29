@@ -11,6 +11,7 @@
 #include "../../include/kernel/i2c_hid.h"
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/e1000.h"
+#include "../../include/kernel/softirq.h"
 
 #define PS2_STATUS_PORT         0x64
 #define PS2_STATUS_OUTPUT_FULL  0x01
@@ -527,6 +528,7 @@ void irq_handler(uint64_t *regs) {
         extern int g_e1000_legacy_irq;
         if (g_e1000_initialized && g_e1000_legacy_irq >= 0 && irq == g_e1000_legacy_irq) {
             e1000_irq_handler();
+            softirq_drain();   // process queued RX skbs in deferred context
             return;  // e1000_irq_handler calls lapic_eoi()
         }
     }
@@ -536,6 +538,7 @@ void irq_handler(uint64_t *regs) {
         extern void e1000e_irq_handler(void);
         if (g_e1000e_initialized && g_e1000e_legacy_irq >= 0 && irq == g_e1000e_legacy_irq) {
             e1000e_irq_handler();
+            softirq_drain();
             return;  // e1000e_irq_handler calls lapic_eoi()
         }
     }
@@ -545,6 +548,7 @@ void irq_handler(uint64_t *regs) {
         extern void rtl8139_irq_handler(void);
         if (g_rtl8139_initialized && g_rtl8139_legacy_irq >= 0 && irq == g_rtl8139_legacy_irq) {
             rtl8139_irq_handler();
+            softirq_drain();
             return;  // rtl8139_irq_handler calls lapic_eoi()
         }
     }
@@ -554,6 +558,7 @@ void irq_handler(uint64_t *regs) {
         extern void pcnet32_irq_handler(void);
         if (g_pcnet_initialized && g_pcnet_legacy_irq >= 0 && irq == g_pcnet_legacy_irq) {
             pcnet32_irq_handler();
+            softirq_drain();
             return;  // pcnet32_irq_handler calls lapic_eoi()
         }
     }
@@ -563,6 +568,7 @@ void irq_handler(uint64_t *regs) {
         extern void ne2k_irq_handler(void);
         if (g_ne2k_initialized && g_ne2k_legacy_irq >= 0 && irq == g_ne2k_legacy_irq) {
             ne2k_irq_handler();
+            softirq_drain();
             return;  // ne2k_irq_handler calls lapic_eoi()
         }
     }
@@ -572,6 +578,7 @@ void irq_handler(uint64_t *regs) {
         extern void vmxnet3_irq_handler(void);
         if (g_vmxnet3_initialized && g_vmxnet3_legacy_irq >= 0 && irq == g_vmxnet3_legacy_irq) {
             vmxnet3_irq_handler();
+            softirq_drain();
             return;  // vmxnet3_irq_handler calls lapic_eoi()
         }
     }
@@ -581,6 +588,7 @@ void irq_handler(uint64_t *regs) {
         extern void eepro100_irq_handler(void);
         if (g_eepro100_initialized && g_eepro100_legacy_irq >= 0 && irq == g_eepro100_legacy_irq) {
             eepro100_irq_handler();
+            softirq_drain();
             return;  // eepro100_irq_handler calls lapic_eoi()
         }
     }
@@ -590,6 +598,7 @@ void irq_handler(uint64_t *regs) {
         extern void igb_irq_handler(void);
         if (g_igb_initialized && g_igb_legacy_irq >= 0 && irq == g_igb_legacy_irq) {
             igb_irq_handler();
+            softirq_drain();
             return;  // igb_irq_handler calls lapic_eoi()
         }
     }
@@ -599,6 +608,7 @@ void irq_handler(uint64_t *regs) {
         extern void tulip_irq_handler(void);
         if (g_tulip_initialized && g_tulip_legacy_irq >= 0 && irq == g_tulip_legacy_irq) {
             tulip_irq_handler();
+            softirq_drain();
             return;  // tulip_irq_handler calls lapic_eoi()
         }
     }
@@ -650,6 +660,7 @@ void irq_handler(uint64_t *regs) {
     // E1000 NIC MSI interrupt (vector 59)
     if (int_no == E1000_MSI_VECTOR) {
         e1000_irq_handler();
+        softirq_drain();
         return;  // e1000_irq_handler calls lapic_eoi()
     }
 
@@ -657,6 +668,7 @@ void irq_handler(uint64_t *regs) {
     if (int_no == E1000E_MSI_VECTOR) {
         extern void e1000e_irq_handler(void);
         e1000e_irq_handler();
+        softirq_drain();
         return;  // e1000e_irq_handler calls lapic_eoi()
     }
 
@@ -664,6 +676,7 @@ void irq_handler(uint64_t *regs) {
     if (int_no == VMXNET3_MSI_VECTOR) {
         extern void vmxnet3_irq_handler(void);
         vmxnet3_irq_handler();
+        softirq_drain();
         return;  // vmxnet3_irq_handler calls lapic_eoi()
     }
 
@@ -761,6 +774,11 @@ void irq_handler(uint64_t *regs) {
     
     // Send EOI after handling the interrupt
     pic_send_eoi(irq);
+
+    // Drain any softirqs raised by this IRQ before returning to the
+    // interrupted context.  Runs with interrupts enabled internally so it
+    // never delays TLB-shootdown IPIs.
+    softirq_drain();
 }
 
 // ============================================================================

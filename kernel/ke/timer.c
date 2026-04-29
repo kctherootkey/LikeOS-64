@@ -732,15 +732,79 @@ static int timer_calibrate_tsc(void) {
     uint64_t t1 = g_ticks;
     uint64_t measured = t1 - t0;
 
-    if (measured >= 10 && measured <= 10000) {
+    /* Sanity bounds: must be within 0.5x..2x of the configured rate.
+     * The TSC window is exactly 1 s of wall time, so a wildly different
+     * tick count means the IRQ source is misbehaving (e.g. lost ticks). */
+    uint32_t expected = g_frequency ? g_frequency : 100;
+    uint32_t lo_bound = expected / 2;
+    uint32_t hi_bound = expected * 2;
+    if (measured >= lo_bound && measured <= hi_bound) {
         g_frequency = (uint32_t)measured;
         kprintf("Timer: TSC-calibrated frequency = %u Hz\n", g_frequency);
         timer_enable_reliable_tsc_precise_time();
         return 1;
     }
 
-    kprintf("Timer: TSC calibration out of range (%lu ticks/sec), keeping %u Hz\n",
-            (unsigned long)measured, g_frequency);
+    kprintf("Timer: TSC calibration out of range (%lu ticks/sec, expected ~%u), keeping %u Hz\n",
+            (unsigned long)measured, expected, g_frequency);
+    return 0;
+}
+
+/*
+ * timer_calibrate_hpet — HPET-based calibration.
+ *
+ * HPET is a memory-mapped monotonic counter with a known period
+ * (g_hpet_period_fs). It is far more reliable than the CMOS RTC for
+ * measuring a 1-second window, especially in VirtualBox where RTC
+ * update-in-progress (UIP) transitions are frequently missed and the
+ * "1 second" boundary detection ends up spanning many real seconds.
+ *
+ * Returns 1 on success, 0 if HPET is unavailable or out of range.
+ */
+static int timer_calibrate_hpet(void) {
+    if (!g_hpet_available || g_hpet_period_fs == 0) {
+        return 0;
+    }
+
+    /* Counter increments every g_hpet_period_fs femtoseconds.
+     * Ticks per second = 1e15 / period_fs. */
+    uint64_t hpet_one_second = 1000000000000000ULL / (uint64_t)g_hpet_period_fs;
+    if (hpet_one_second == 0) {
+        return 0;
+    }
+
+    uint64_t t0 = g_ticks;
+    uint64_t hpet_start = hpet_read_counter();
+    uint64_t tsc_start = rdtsc();
+
+    /* Spin until 1 second of HPET counts has elapsed. */
+    while ((hpet_read_counter() - hpet_start) < hpet_one_second)
+        __asm__ volatile("pause");
+
+    uint64_t t1 = g_ticks;
+    uint64_t tsc_end = rdtsc();
+    uint64_t measured = t1 - t0;
+
+    uint32_t expected = g_frequency ? g_frequency : 100;
+    uint32_t lo_bound = expected / 2;
+    uint32_t hi_bound = expected * 2;
+    if (measured >= lo_bound && measured <= hi_bound) {
+        g_frequency = (uint32_t)measured;
+        kprintf("Timer: HPET-calibrated frequency = %u Hz\n", g_frequency);
+
+        /* Calibrate TSC frequency from the same 1-second HPET window. */
+        uint64_t tsc_delta = tsc_end - tsc_start;
+        if (!lapic_tsc_is_reliable() && tsc_delta > 100000000ULL && tsc_delta < 20000000000ULL) {
+            lapic_set_tsc_freq(tsc_delta);
+            kprintf("Timer: HPET-calibrated TSC freq = %lu Hz\n",
+                    (unsigned long)tsc_delta);
+        }
+        timer_enable_reliable_tsc_precise_time();
+        return 1;
+    }
+
+    kprintf("Timer: HPET calibration out of range (%lu ticks/sec, expected ~%u)\n",
+            (unsigned long)measured, expected);
     return 0;
 }
 
@@ -748,12 +812,18 @@ static int timer_calibrate_tsc(void) {
  * Calibrate the actual timer frequency by measuring ticks over a known
  * time interval.
  *
- * Method 1 (preferred): CMOS RTC second boundaries (takes ~2s)
- * Method 2 (fallback):  TSC-timed 1-second measurement (no CMOS needed)
+ * Method 1 (preferred): HPET counter (most reliable, ~1s)
+ * Method 2:             CMOS RTC second boundaries (~2s, broken on VBox)
+ * Method 3 (fallback):  TSC-timed 1-second measurement
  *
  * Must be called AFTER the timer interrupt is running (PIT or LAPIC).
  */
 void timer_calibrate_frequency(void) {
+    /* Method 1: HPET — gold standard when present. */
+    if (timer_calibrate_hpet()) {
+        return;
+    }
+
     /* If rtc_read_boot_time() already determined CMOS is broken,
      * go straight to TSC fallback — no point probing CMOS again. */
     if (g_cmos_failed) {
@@ -836,22 +906,33 @@ void timer_calibrate_frequency(void) {
     uint64_t tsc1 = rdtsc();  /* TSC at second RTC second boundary */
 
     uint64_t measured = t1 - t0;
-    if (measured >= 10 && measured <= 10000) {
+    /* Sanity bounds: configured rate ± 50 %. Some virtualized RTCs
+     * (notably VirtualBox) miss UIP transitions, so the "1 s" window
+     * between two second-boundary detections can actually be many
+     * seconds long. In that case the measured tick count is far higher
+     * than the configured rate and we must reject it — otherwise sleep()
+     * and every other tick→time conversion is scaled by the same bogus
+     * factor. */
+    uint32_t expected = g_frequency ? g_frequency : 100;
+    uint32_t lo_bound = expected / 2;
+    uint32_t hi_bound = expected * 2;
+    if (measured >= lo_bound && measured <= hi_bound) {
         /* Sane range — accept the measurement */
         g_frequency = (uint32_t)measured;
         kprintf("Timer: CMOS-calibrated frequency = %u Hz\n", g_frequency);
     } else {
-        kprintf("Timer: CMOS calibration out of range (%lu ticks/sec), trying TSC\n",
-                (unsigned long)measured);
+        kprintf("Timer: CMOS calibration out of range (%lu ticks/sec, expected ~%u), trying TSC\n",
+                (unsigned long)measured, expected);
         timer_calibrate_tsc();
         timer_enable_reliable_tsc_precise_time();
         return;
     }
 
     /* Calibrate TSC frequency from the same 1-second RTC window.
-     * This is more reliable than CPUID 0x15 or PIT channel 2 in VMs. */
+     * Only trust this if the CMOS measurement itself was within the
+     * sanity range above; otherwise the window wasn't really 1 s. */
     uint64_t tsc_delta = tsc1 - tsc0;
-    if (!lapic_tsc_is_reliable() && tsc_delta > 1000000 && tsc_delta < 100000000000ULL) {
+    if (!lapic_tsc_is_reliable() && tsc_delta > 100000000ULL && tsc_delta < 20000000000ULL) {
         lapic_set_tsc_freq(tsc_delta);
         kprintf("Timer: RTC-calibrated TSC freq = %lu Hz\n",
                 (unsigned long)tsc_delta);

@@ -13,6 +13,9 @@
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/random.h"
+#include "../../include/kernel/skb.h"
+#include "../../include/kernel/softirq.h"
+#include "../../include/kernel/percpu.h"
 
 // Broadcast MAC address
 const uint8_t eth_broadcast_addr[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -93,79 +96,104 @@ void net_timer_tick(void) {
     }
 }
 
-// Called by NIC driver on packet receive
+// Called by NIC driver on packet receive (HARD IRQ context).
+//
+// We do the bare minimum here -- allocate an skb from the size-classed
+// pool, copy the frame, enqueue it on this CPU's RX queue, and raise the
+// SOFTIRQ_NET_RX bit.  All actual parsing (eth_rx -> ip_rx -> ...) runs
+// later in softirq context with interrupts ENABLED, so we never block
+// TLB-shootdown IPIs nor risk re-entering protocol locks held by user
+// context paths.
+
+static skb_queue_t rx_queue[MAX_CPUS];
+static int         rx_queue_inited = 0;
+
+// All protocol-stack RX is funneled through CPU 0's rx_queue, regardless of
+// which CPU received the frame from hardware or which CPU originated a
+// loopback transmit.  This preserves FIFO ordering across senders that
+// migrate between CPUs (e.g. tcp_send_data() emitting multiple segments
+// across a preemption point would otherwise enqueue them on different
+// per-CPU queues, letting the protocol stack reassemble them out of order
+// and corrupt TCP byte streams).  CPU 0's ksoftirqd then sequentially
+// drives ipv4_rx / tcp_rx for the entire stack.
+//
+// The per-CPU rx_queue array is kept in case we later add RPS-style
+// flow-hashed delivery, but for now only rx_queue[NET_RX_CPU] is used.
+#define NET_RX_CPU 0
+
+// Before percpu_init(), GS base is 0; this_cpu_id() would fault.  In that
+// (BSP-only) window we are always CPU 0.
+static inline uint32_t net_safe_cpu_id(void) {
+    return read_gs_base_msr() ? this_cpu_id() : 0;
+}
+
+static inline int skb_is_loopback(sk_buff_t* skb) {
+    return skb && skb->dev && skb->dev == net_get_loopback();
+}
+
+static void net_rx_softirq(void) {
+    skb_queue_t* q = &rx_queue[NET_RX_CPU];
+    sk_buff_t* skb;
+    while ((skb = skb_queue_head(q)) != NULL) {
+        if (skb_is_loopback(skb)) {
+            // Loopback packets are raw IPv4 datagrams (no Ethernet header).
+            ipv4_rx(skb->dev, skb->data, skb->len);
+        } else {
+            eth_rx(skb->dev, skb->data, skb->len);
+        }
+        skb_put(skb);
+    }
+}
+
 void net_rx_packet(net_device_t* dev, const uint8_t* data, uint16_t len) {
     dev->rx_packets++;
     dev->rx_bytes += len;
-    eth_rx(dev, data, len);
+    if (!rx_queue_inited || len == 0) {
+        // Pre-init: drop silently (should not happen after net_init()).
+        return;
+    }
+    sk_buff_t* skb = skb_alloc(len);
+    if (!skb) {
+        dev->rx_errors++;
+        return;
+    }
+    skb->dev = dev;
+    uint8_t* p = skb_append(skb, len);
+    for (uint16_t i = 0; i < len; i++) p[i] = data[i];
+    skb_queue_tail(&rx_queue[NET_RX_CPU], skb);
+    softirq_raise_on(NET_RX_CPU, SOFTIRQ_NET_RX);
 }
 
 // Loopback device
 static net_device_t lo_device;
 static int lo_initialized = 0;
 
-// Deferred loopback processing to avoid re-entrant lock deadlocks.
-// A small queue is needed because TCP and fragmented IPv4 can emit multiple
-// packets before the blocking syscall loop gets a chance to drain them.
-#define LOOPBACK_PENDING_QUEUE_SIZE 64
-
-typedef struct {
-    uint8_t buf[NET_MTU_DEFAULT + 64];
-    uint16_t len;
-    net_device_t* dev;
-} loopback_pending_pkt_t;
-
-static loopback_pending_pkt_t lo_pending_queue[LOOPBACK_PENDING_QUEUE_SIZE];
-static uint8_t lo_pending_head = 0;
-static uint8_t lo_pending_tail = 0;
-static spinlock_t lo_pending_lock = SPINLOCK_INIT("lo_pending");
-
+// Loopback transmit: enqueue an skb on the local CPU's RX queue and raise
+// SOFTIRQ_NET_RX.  The skb carries the raw IPv4 datagram (loopback has no
+// Ethernet header); the softirq handler routes loopback skbs to ipv4_rx.
 static int loopback_send(net_device_t* dev, const uint8_t* data, uint16_t len) {
-    // Buffer packet for deferred processing — caller may hold locks
     dev->tx_packets++;
     dev->tx_bytes += len;
     dev->rx_packets++;
     dev->rx_bytes += len;
-    if (len <= sizeof(lo_pending_queue[0].buf)) {
-        uint64_t flags;
-        spin_lock_irqsave(&lo_pending_lock, &flags);
-
-        uint8_t next_tail = (uint8_t)((lo_pending_tail + 1) % LOOPBACK_PENDING_QUEUE_SIZE);
-        if (next_tail != lo_pending_head) {
-            loopback_pending_pkt_t* pkt = &lo_pending_queue[lo_pending_tail];
-            for (uint16_t i = 0; i < len; i++)
-                pkt->buf[i] = data[i];
-            pkt->len = len;
-            pkt->dev = dev;
-            lo_pending_tail = next_tail;
-        }
-
-        spin_unlock_irqrestore(&lo_pending_lock, flags);
+    if (!rx_queue_inited || len == 0) return 0;
+    sk_buff_t* skb = skb_alloc(len);
+    if (!skb) {
+        dev->rx_errors++;
+        return -1;
     }
+    skb->dev = dev;
+    uint8_t* p = skb_append(skb, len);
+    for (uint16_t i = 0; i < len; i++) p[i] = data[i];
+    skb_queue_tail(&rx_queue[NET_RX_CPU], skb);
+    softirq_raise_on(NET_RX_CPU, SOFTIRQ_NET_RX);
     return 0;
 }
 
-// Process deferred loopback packets (call only when no network locks are held)
+// Compatibility shim for legacy callers (syscall.c, socket.c).  Loopback
+// delivery is now driven by the SOFTIRQ_NET_RX handler; just drain.
 void loopback_process_pending(void) {
-    while (1) {
-        loopback_pending_pkt_t pkt;
-        int has_packet = 0;
-        uint64_t flags;
-
-        spin_lock_irqsave(&lo_pending_lock, &flags);
-        if (lo_pending_head != lo_pending_tail) {
-            loopback_pending_pkt_t* queued = &lo_pending_queue[lo_pending_head];
-            pkt = *queued;
-            lo_pending_head = (uint8_t)((lo_pending_head + 1) % LOOPBACK_PENDING_QUEUE_SIZE);
-            has_packet = 1;
-        }
-        spin_unlock_irqrestore(&lo_pending_lock, flags);
-
-        if (!has_packet)
-            break;
-
-        ipv4_rx(pkt.dev, pkt.buf, pkt.len);
-    }
+    softirq_drain();
 }
 
 static int loopback_link_status(net_device_t* dev) {
@@ -182,6 +210,15 @@ void net_init(void) {
 
     // Initialize CSPRNG first (needed by TCP, DHCP, etc.)
     random_init();
+
+    // Bring up the skb pool and per-CPU RX queues, then register the
+    // SOFTIRQ_NET_RX handler.  Must happen before any send/receive path runs.
+    skb_pool_init();
+    for (uint32_t i = 0; i < MAX_CPUS; i++) {
+        skb_queue_init(&rx_queue[i], "net_rx");
+    }
+    rx_queue_inited = 1;
+    softirq_register(SOFTIRQ_NET_RX, net_rx_softirq);
 
     // Initialize loopback device
     mm_memset(&lo_device, 0, sizeof(lo_device));

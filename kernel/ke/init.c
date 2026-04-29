@@ -168,6 +168,15 @@ void continue_system_startup(void) {
 
     timer_set_boot_epoch(g_boot_epoch_saved);
 
+    // Spawn one ksoftirqd kernel thread per CPU before enabling interrupts.
+    // These threads sleep until softirq_raise() bumps a pending vector for
+    // their CPU; the IRQ-tail drain handles the common case but ksoftirqd
+    // catches sustained load and any vectors raised from non-IRQ context.
+    {
+        extern void ksoftirqd_start_all(void);
+        ksoftirqd_start_all();
+    }
+
     // Enable interrupts (SCI stays masked — no EC event storm).
     __asm__ volatile ("sti");
 

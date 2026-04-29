@@ -5,10 +5,12 @@
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/random.h"
 #include "../../include/kernel/syscall.h"
+#include "../../include/kernel/skb.h"
 
-// Static send buffer to avoid large stack allocations
-static uint8_t icmp_send_buf[NET_MTU_DEFAULT];
-static spinlock_t icmp_send_lock = SPINLOCK_INIT("icmp_tx");
+// All TX sites use a per-call sk_buff from the size-classed pool; no shared
+// static TX buffer / TX spinlock is held across the lower-layer call, so
+// the receive path (which now runs in softirq context with IRQs enabled)
+// cannot deadlock against an in-flight echo / timestamp / addrmask reply.
 
 #define ICMP_REPLY_QUEUE_SIZE 16
 
@@ -89,13 +91,16 @@ int icmp_send_error_packet(net_device_t* dev, uint32_t dst_ip,
     if (!dev || !quoted_ip_packet) return -1;
 
     uint16_t copy_len = quoted_len;
-    if (copy_len > sizeof(icmp_send_buf) - sizeof(icmp_header_t))
-        copy_len = (uint16_t)(sizeof(icmp_send_buf) - sizeof(icmp_header_t));
+    if (copy_len > NET_MTU_DEFAULT - sizeof(icmp_header_t))
+        copy_len = (uint16_t)(NET_MTU_DEFAULT - sizeof(icmp_header_t));
+    uint16_t total = (uint16_t)(sizeof(icmp_header_t) + copy_len);
 
-    uint64_t flags;
-    spin_lock_irqsave(&icmp_send_lock, &flags);
+    sk_buff_t* skb = skb_alloc(total);
+    if (!skb) return -1;
+    skb->dev = dev;
 
-    icmp_header_t* icmp = (icmp_header_t*)icmp_send_buf;
+    uint8_t* buf = skb_append(skb, total);
+    icmp_header_t* icmp = (icmp_header_t*)buf;
     icmp->type = type;
     icmp->code = code;
     icmp->checksum = 0;
@@ -103,13 +108,12 @@ int icmp_send_error_packet(net_device_t* dev, uint32_t dst_ip,
     icmp->sequence = net_htons((uint16_t)aux_data);
 
     for (uint16_t i = 0; i < copy_len; i++)
-        icmp_send_buf[sizeof(icmp_header_t) + i] = quoted_ip_packet[i];
+        buf[sizeof(icmp_header_t) + i] = quoted_ip_packet[i];
 
-    uint16_t total = (uint16_t)(sizeof(icmp_header_t) + copy_len);
-    icmp->checksum = ipv4_checksum(icmp_send_buf, total);
+    icmp->checksum = ipv4_checksum(buf, total);
 
-    int ret = ipv4_send(dev, dst_ip, IP_PROTO_ICMP, icmp_send_buf, total);
-    spin_unlock_irqrestore(&icmp_send_lock, flags);
+    int ret = ipv4_send(dev, dst_ip, IP_PROTO_ICMP, skb->data, skb->len);
+    skb_put(skb);
     return ret;
 }
 
@@ -123,33 +127,31 @@ void icmp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t l
     if (ipv4_checksum(data, len) != 0) return;
 
     if (icmp->type == ICMP_ECHO_REQUEST && icmp->code == 0) {
-        // Send echo reply using static buffer
-        if (len > NET_MTU_DEFAULT) return;
-
-        uint64_t flags;
-        spin_lock_irqsave(&icmp_send_lock, &flags);
-
-        // Copy entire ICMP message
-        for (uint16_t i = 0; i < len; i++)
-            icmp_send_buf[i] = data[i];
-
-        // Modify header for reply
-        icmp_header_t* r = (icmp_header_t*)icmp_send_buf;
+        // Echo reply: copy entire received message and flip the type byte.
+        // Length may be up to 65535 (reassembled IPv4 datagram); skb_alloc
+        // picks the small or jumbo pool class as needed.
+        sk_buff_t* skb = skb_alloc(len);
+        if (!skb) return;
+        skb->dev = dev;
+        uint8_t* buf = skb_append(skb, len);
+        for (uint16_t i = 0; i < len; i++) buf[i] = data[i];
+        icmp_header_t* r = (icmp_header_t*)buf;
         r->type = ICMP_ECHO_REPLY;
         r->code = 0;
         r->checksum = 0;
-        r->checksum = ipv4_checksum(icmp_send_buf, len);
-
-        ipv4_send(dev, src_ip, IP_PROTO_ICMP, icmp_send_buf, len);
-        spin_unlock_irqrestore(&icmp_send_lock, flags);
+        r->checksum = ipv4_checksum(buf, len);
+        ipv4_send(dev, src_ip, IP_PROTO_ICMP, skb->data, skb->len);
+        skb_put(skb);
     }
 
     // RFC 791 §3.2.2.8 Timestamp Request — reply with kernel time
     if (icmp->type == ICMP_TIMESTAMP && icmp->code == 0 && len >= 20) {
-        uint64_t flags;
-        spin_lock_irqsave(&icmp_send_lock, &flags);
-        for (uint16_t i = 0; i < len; i++) icmp_send_buf[i] = data[i];
-        icmp_header_t* r = (icmp_header_t*)icmp_send_buf;
+        sk_buff_t* skb = skb_alloc(len);
+        if (!skb) goto skip_ts_reply;
+        skb->dev = dev;
+        uint8_t* buf = skb_append(skb, len);
+        for (uint16_t i = 0; i < len; i++) buf[i] = data[i];
+        icmp_header_t* r = (icmp_header_t*)buf;
         r->type = ICMP_TIMESTAMP_REPLY;
         r->code = 0;
         r->checksum = 0;
@@ -167,31 +169,35 @@ void icmp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t l
         }
         uint32_t ts_ms = ((uint32_t)(timer_ticks() * 10) + icmp_ts_offset)
                          | 0x80000000U; // non-standard time flag (RFC 792)
-        uint8_t* p = icmp_send_buf + 12; // skip type/code/cksum/id/seq + orig TS
+        uint8_t* p = buf + 12; // skip type/code/cksum/id/seq + orig TS
         p[0] = (uint8_t)(ts_ms >> 24); p[1] = (uint8_t)(ts_ms >> 16);
         p[2] = (uint8_t)(ts_ms >> 8);  p[3] = (uint8_t)ts_ms;
         p[4] = p[0]; p[5] = p[1]; p[6] = p[2]; p[7] = p[3];
-        r->checksum = ipv4_checksum(icmp_send_buf, len);
-        ipv4_send(dev, src_ip, IP_PROTO_ICMP, icmp_send_buf, len);
-        spin_unlock_irqrestore(&icmp_send_lock, flags);
+        r->checksum = ipv4_checksum(buf, len);
+        ipv4_send(dev, src_ip, IP_PROTO_ICMP, skb->data, skb->len);
+        skb_put(skb);
     }
+skip_ts_reply:
 
     // RFC 950 §3.1 Address Mask Request — reply with our netmask
     if (icmp->type == ICMP_ADDRMASK && icmp->code == 0 && len >= 12 && dev) {
-        uint64_t flags;
-        spin_lock_irqsave(&icmp_send_lock, &flags);
-        for (uint16_t i = 0; i < len; i++) icmp_send_buf[i] = data[i];
-        icmp_header_t* r = (icmp_header_t*)icmp_send_buf;
+        sk_buff_t* skb = skb_alloc(len);
+        if (!skb) goto skip_mask_reply;
+        skb->dev = dev;
+        uint8_t* buf = skb_append(skb, len);
+        for (uint16_t i = 0; i < len; i++) buf[i] = data[i];
+        icmp_header_t* r = (icmp_header_t*)buf;
         r->type = ICMP_ADDRMASK_REPLY;
         r->code = 0;
         r->checksum = 0;
         uint32_t mask = dev->netmask;
-        icmp_send_buf[8]  = (uint8_t)(mask >> 24); icmp_send_buf[9]  = (uint8_t)(mask >> 16);
-        icmp_send_buf[10] = (uint8_t)(mask >> 8);  icmp_send_buf[11] = (uint8_t)mask;
-        r->checksum = ipv4_checksum(icmp_send_buf, len);
-        ipv4_send(dev, src_ip, IP_PROTO_ICMP, icmp_send_buf, len);
-        spin_unlock_irqrestore(&icmp_send_lock, flags);
+        buf[8]  = (uint8_t)(mask >> 24); buf[9]  = (uint8_t)(mask >> 16);
+        buf[10] = (uint8_t)(mask >> 8);  buf[11] = (uint8_t)mask;
+        r->checksum = ipv4_checksum(buf, len);
+        ipv4_send(dev, src_ip, IP_PROTO_ICMP, skb->data, skb->len);
+        skb_put(skb);
     }
+skip_mask_reply:
 
     // RFC 1191 PMTUD: DEST_UNREACH/FRAG_NEEDED carries next-hop MTU in id+seq.
     // Also dispatch any ICMP error to a matching socket.
@@ -226,10 +232,12 @@ int icmp_send_echo(net_device_t* dev, uint32_t dst_ip, uint16_t id,
     uint16_t total = sizeof(icmp_header_t) + payload_len;
     if (total > NET_MTU_DEFAULT) return -1;
 
-    uint64_t flags;
-    spin_lock_irqsave(&icmp_send_lock, &flags);
+    sk_buff_t* skb = skb_alloc(total);
+    if (!skb) return -1;
+    skb->dev = dev;
 
-    icmp_header_t* icmp = (icmp_header_t*)icmp_send_buf;
+    uint8_t* buf = skb_append(skb, total);
+    icmp_header_t* icmp = (icmp_header_t*)buf;
     icmp->type = ICMP_ECHO_REQUEST;
     icmp->code = 0;
     icmp->identifier = net_htons(id);
@@ -238,17 +246,16 @@ int icmp_send_echo(net_device_t* dev, uint32_t dst_ip, uint16_t id,
 
     if (payload && payload_len > 0) {
         for (uint16_t i = 0; i < payload_len; i++)
-            icmp_send_buf[sizeof(icmp_header_t) + i] = payload[i];
+            buf[sizeof(icmp_header_t) + i] = payload[i];
     }
 
-    icmp->checksum = ipv4_checksum(icmp_send_buf, total);
+    icmp->checksum = ipv4_checksum(buf, total);
 
     // Record send timestamp before transmitting
     icmp_send_us = timer_get_precise_us();
 
-    // Use special send with custom TTL
-    int ret = ipv4_send_ttl(dev, dst_ip, IP_PROTO_ICMP, icmp_send_buf, total, ttl);
-    spin_unlock_irqrestore(&icmp_send_lock, flags);
+    int ret = ipv4_send_ttl(dev, dst_ip, IP_PROTO_ICMP, skb->data, skb->len, ttl);
+    skb_put(skb);
     return ret;
 }
 
@@ -281,10 +288,18 @@ int icmp_recv_reply(uint32_t* src_ip, uint16_t expected_id,
         for (int idx = icmp_reply_head; idx != icmp_reply_tail;
              idx = (idx + 1) % ICMP_REPLY_QUEUE_SIZE) {
             icmp_reply_entry_t* entry = &icmp_reply_queue[idx];
-            if (entry->type == ICMP_ECHO_REPLY &&
-                (entry->id != expected_id || entry->seq != expected_seq)) {
+            // Match by (id, seq) for every type we deliver here:
+            //   ECHO_REPLY            -> id/seq are the peer's echoed values
+            //   DEST_UNREACH /        -> id/seq were extracted from the
+            //   TIME_EXCEEDED            embedded ICMP echo header inside
+            //                            the error packet by icmp_rx().  If
+            //                            the inner packet wasn't ICMP at all
+            //                            (e.g. our own kernel returned a
+            //                            port-unreachable for an outbound
+            //                            DNS UDP query), id/seq stay 0 and
+            //                            no real ping waiter matches.
+            if (entry->id != expected_id || entry->seq != expected_seq)
                 continue;
-            }
             found = idx;
             break;
         }

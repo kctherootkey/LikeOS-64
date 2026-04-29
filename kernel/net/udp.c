@@ -2,6 +2,7 @@
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/syscall.h"
+#include "../../include/kernel/skb.h"
 
 // UDP pseudo-header for checksum
 typedef struct __attribute__((packed)) {
@@ -15,10 +16,6 @@ typedef struct __attribute__((packed)) {
 void udp_init(void) {
     // Nothing to initialize
 }
-
-// Static send buffer sized for the largest IPv4 payload the stack can emit.
-static uint8_t udp_send_buf[65535 - sizeof(ipv4_header_t)];
-static spinlock_t udp_send_lock = SPINLOCK_INIT("udp_tx");
 
 // Compute UDP checksum (RFC 768): pseudo-header + UDP header + payload.
 // Returns the wire value: 0xFFFF substituted for 0 since 0 means "no checksum".
@@ -47,7 +44,7 @@ static uint16_t udp_compute_checksum(uint32_t src_ip, uint32_t dst_ip,
     return cs ? cs : 0xFFFF;
 }
 
-// Send UDP datagram
+// Send UDP datagram.  Per-call sk_buff allocation; no shared TX spinlock.
 int udp_send(net_device_t* dev, uint32_t dst_ip,
              uint16_t src_port, uint16_t dst_port,
              const uint8_t* data, uint16_t len) {
@@ -56,28 +53,29 @@ int udp_send(net_device_t* dev, uint32_t dst_ip,
     uint32_t udp_len = sizeof(udp_header_t) + (uint32_t)len;
     if (udp_len > 65535U - sizeof(ipv4_header_t)) return -1;
 
-    uint64_t flags;
-    spin_lock_irqsave(&udp_send_lock, &flags);
+    sk_buff_t* skb = skb_alloc((uint32_t)udp_len);
+    if (!skb) return -1;
+    skb->dev = dev;
 
-    udp_header_t* udp = (udp_header_t*)udp_send_buf;
+    uint8_t* buf = skb_append(skb, (uint32_t)udp_len);
+    udp_header_t* udp = (udp_header_t*)buf;
     udp->src_port = net_htons(src_port);
     udp->dst_port = net_htons(dst_port);
     udp->length = net_htons((uint16_t)udp_len);
     udp->checksum = 0;
 
-    // Copy payload
     for (uint16_t i = 0; i < len; i++)
-        udp_send_buf[sizeof(udp_header_t) + i] = data[i];
+        buf[sizeof(udp_header_t) + i] = data[i];
 
     // Compute checksum (RFC 768).  Source IP is the outgoing iface IP;
     // for loopback / unset, fall back to dst_ip so the pseudo-header is
     // consistent with what the receiver will recompute.
     uint32_t src_ip = dev->ip_addr ? dev->ip_addr : dst_ip;
-    udp->checksum = udp_compute_checksum(src_ip, dst_ip, udp_send_buf,
+    udp->checksum = udp_compute_checksum(src_ip, dst_ip, buf,
                                          (uint16_t)udp_len);
 
-    int ret = ipv4_send(dev, dst_ip, IP_PROTO_UDP, udp_send_buf, udp_len);
-    spin_unlock_irqrestore(&udp_send_lock, flags);
+    int ret = ipv4_send(dev, dst_ip, IP_PROTO_UDP, skb->data, skb->len);
+    skb_put(skb);
     return ret;
 }
 
