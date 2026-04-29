@@ -98,11 +98,21 @@ void net_rx_packet(net_device_t* dev, const uint8_t* data, uint16_t len) {
 static net_device_t lo_device;
 static int lo_initialized = 0;
 
-// Deferred loopback processing to avoid re-entrant lock deadlocks
-// (icmp_send_lock → ipv4_send_lock → loopback_send → ipv4_rx → icmp_rx → deadlock)
-static uint8_t lo_pending_buf[NET_MTU_DEFAULT + 64];
-static uint16_t lo_pending_len = 0;
-static net_device_t* lo_pending_dev = NULL;
+// Deferred loopback processing to avoid re-entrant lock deadlocks.
+// A small queue is needed because TCP and fragmented IPv4 can emit multiple
+// packets before the blocking syscall loop gets a chance to drain them.
+#define LOOPBACK_PENDING_QUEUE_SIZE 64
+
+typedef struct {
+    uint8_t buf[NET_MTU_DEFAULT + 64];
+    uint16_t len;
+    net_device_t* dev;
+} loopback_pending_pkt_t;
+
+static loopback_pending_pkt_t lo_pending_queue[LOOPBACK_PENDING_QUEUE_SIZE];
+static uint8_t lo_pending_head = 0;
+static uint8_t lo_pending_tail = 0;
+static spinlock_t lo_pending_lock = SPINLOCK_INIT("lo_pending");
 
 static int loopback_send(net_device_t* dev, const uint8_t* data, uint16_t len) {
     // Buffer packet for deferred processing — caller may hold locks
@@ -110,23 +120,45 @@ static int loopback_send(net_device_t* dev, const uint8_t* data, uint16_t len) {
     dev->tx_bytes += len;
     dev->rx_packets++;
     dev->rx_bytes += len;
-    if (len <= sizeof(lo_pending_buf)) {
-        for (uint16_t i = 0; i < len; i++)
-            lo_pending_buf[i] = data[i];
-        lo_pending_len = len;
-        lo_pending_dev = dev;
+    if (len <= sizeof(lo_pending_queue[0].buf)) {
+        uint64_t flags;
+        spin_lock_irqsave(&lo_pending_lock, &flags);
+
+        uint8_t next_tail = (uint8_t)((lo_pending_tail + 1) % LOOPBACK_PENDING_QUEUE_SIZE);
+        if (next_tail != lo_pending_head) {
+            loopback_pending_pkt_t* pkt = &lo_pending_queue[lo_pending_tail];
+            for (uint16_t i = 0; i < len; i++)
+                pkt->buf[i] = data[i];
+            pkt->len = len;
+            pkt->dev = dev;
+            lo_pending_tail = next_tail;
+        }
+
+        spin_unlock_irqrestore(&lo_pending_lock, flags);
     }
     return 0;
 }
 
 // Process deferred loopback packets (call only when no network locks are held)
 void loopback_process_pending(void) {
-    while (lo_pending_len > 0 && lo_pending_dev) {
-        uint16_t len = lo_pending_len;
-        net_device_t* dev = lo_pending_dev;
-        lo_pending_len = 0;
-        lo_pending_dev = NULL;
-        ipv4_rx(dev, lo_pending_buf, len);
+    while (1) {
+        loopback_pending_pkt_t pkt;
+        int has_packet = 0;
+        uint64_t flags;
+
+        spin_lock_irqsave(&lo_pending_lock, &flags);
+        if (lo_pending_head != lo_pending_tail) {
+            loopback_pending_pkt_t* queued = &lo_pending_queue[lo_pending_head];
+            pkt = *queued;
+            lo_pending_head = (uint8_t)((lo_pending_head + 1) % LOOPBACK_PENDING_QUEUE_SIZE);
+            has_packet = 1;
+        }
+        spin_unlock_irqrestore(&lo_pending_lock, flags);
+
+        if (!has_packet)
+            break;
+
+        ipv4_rx(pkt.dev, pkt.buf, pkt.len);
     }
 }
 

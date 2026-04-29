@@ -17,7 +17,7 @@
 #define ETH_FRAME_MAX       1518    // Max Ethernet frame (MTU + header + FCS)
 #define NET_RX_RING_SIZE    256
 #define NET_TX_RING_SIZE    256
-#define NET_RX_BUF_SIZE     2048
+#define NET_RX_BUF_SIZE     4096
 
 // ============================================================================
 // Ethernet Constants
@@ -160,7 +160,9 @@ typedef struct __attribute__((packed)) {
 #define ICMP_ECHO_REPLY     0
 #define ICMP_ECHO_REQUEST   8
 #define ICMP_DEST_UNREACH   3
+#define ICMP_TIME_EXCEEDED  11
 #define ICMP_PORT_UNREACH   3   // Code for destination unreachable
+#define ICMP_FRAG_NEEDED    4
 
 // ============================================================================
 // UDP Header
@@ -218,6 +220,22 @@ typedef struct __attribute__((packed)) {
 #define TCP_TIME_WAIT_TICKS     6000    // 60 seconds
 #define TCP_MAX_RETRANSMITS     5
 #define TCP_SYN_RETRANSMIT_TICKS 300    // 3 seconds
+#define TCP_MAX_OPTIONS         40
+#define TCP_MAX_INFLIGHT        8
+
+// TCP options
+#define TCP_OPT_END             0
+#define TCP_OPT_NOP             1
+#define TCP_OPT_MSS             2
+#define TCP_OPT_MSS_LEN         4
+
+typedef struct tcp_inflight_segment {
+    uint32_t seq;
+    uint16_t len;
+    uint8_t flags;
+    uint8_t retransmit_count;
+    uint8_t data[TCP_MSS];
+} tcp_inflight_segment_t;
 
 // TCP connection block
 typedef struct tcp_conn {
@@ -251,6 +269,12 @@ typedef struct tcp_conn {
     // Retransmission
     uint64_t retransmit_tick;
     uint32_t retransmit_count;
+
+    // Negotiated segment sizing and outstanding transmit queue
+    uint16_t peer_mss;
+    uint16_t max_seg_size;
+    uint8_t inflight_count;
+    tcp_inflight_segment_t inflight[TCP_MAX_INFLIGHT];
 
     // TIME_WAIT timer
     uint64_t time_wait_tick;
@@ -449,26 +473,32 @@ uint16_t ipv4_checksum(const void* data, uint16_t len);
 // ICMP API
 // ============================================================================
 void icmp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t len, uint8_t rx_ttl);
+int  icmp_send_error_packet(net_device_t* dev, uint32_t dst_ip,
+                            uint8_t type, uint8_t code,
+                            const uint8_t* quoted_ip_packet,
+                            uint16_t quoted_len, uint32_t aux_data);
 
 // ============================================================================
 // UDP API
 // ============================================================================
 void udp_init(void);
-void udp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t len);
+void udp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
+            const uint8_t* data, uint16_t len);
 int  udp_send(net_device_t* dev, uint32_t dst_ip,
               uint16_t src_port, uint16_t dst_port,
               const uint8_t* data, uint16_t len);
 void udp_deliver_to_socket(uint32_t src_ip, uint16_t src_port,
-                           uint16_t dst_port,
+                           uint32_t dst_ip, uint16_t dst_port,
                            const uint8_t* data, uint16_t len);
 
 // ============================================================================
 // TCP API
 // ============================================================================
 void tcp_init(void);
-void tcp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t len);
+void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
+            const uint8_t* data, uint16_t len);
 int  tcp_send_data(tcp_conn_t* conn, const uint8_t* data, uint16_t len);
-tcp_conn_t* tcp_connect(net_device_t* dev, uint32_t dst_ip,
+tcp_conn_t* tcp_connect(net_device_t* dev, uint32_t local_ip, uint32_t dst_ip,
                         uint16_t src_port, uint16_t dst_port);
 tcp_conn_t* tcp_listen(net_device_t* dev, uint32_t local_ip,
                        uint16_t local_port, int backlog);

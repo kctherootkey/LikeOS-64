@@ -93,8 +93,8 @@ static void show_tcp(int listening_only, int show_all, int numeric, int extended
                      ip_to_str(conns[i].remote_ip), conns[i].remote_port);
         }
 
-        printf("tcp   %6d %6d %-*s %-*s %s",
-               0, 0, addrw, local, addrw, remote,
+         printf("tcp   %6u %6u %-*s %-*s %s",
+             conns[i].rx_queue, conns[i].tx_queue, addrw, local, addrw, remote,
                tcp_state_str(conns[i].state));
         if (extended) printf("  %-8s %-5s", "root", "0");
         printf("\n");
@@ -103,6 +103,7 @@ static void show_tcp(int listening_only, int show_all, int numeric, int extended
 
 static void show_udp(int show_all, int numeric, int extended, int wide)
 {
+    (void)show_all;
     (void)numeric;
     net_udp_info_t socks[64];
     int n = net_getinfo(NET_GET_UDP_SOCKS, socks, 64);
@@ -118,8 +119,8 @@ static void show_udp(int show_all, int numeric, int extended, int wide)
         char local[64];
         snprintf(local, sizeof(local), "%s:%u",
                  ip_to_str(socks[i].local_ip), socks[i].local_port);
-        printf("udp   %6d %6d %-*s %-*s",
-               0, 0, addrw, local, addrw, "0.0.0.0:*");
+         printf("udp   %6u %6d %-*s %-*s",
+             socks[i].rx_queue, 0, addrw, local, addrw, "0.0.0.0:*");
         if (extended) printf("  %-8s %-5s", "root", "0");
         printf("\n");
     }

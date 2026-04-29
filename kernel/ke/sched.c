@@ -1200,11 +1200,11 @@ task_t* sched_fork_current(void) {
             } else if (IS_SOCKET_FD(cur->fd_table[i])) {
                 int idx = SOCKET_FD_IDX(cur->fd_table[i]);
                 net_socket_t* s = sock_get(idx);
-                if (s) s->ref_count++;
+                if (s) __atomic_fetch_add(&s->ref_count, 1, __ATOMIC_ACQ_REL);
                 child->fd_table[i] = cur->fd_table[i];
             } else if (IS_UNIX_SOCKET_FD(cur->fd_table[i])) {
                 unix_socket_t* us = unix_get((int)(uintptr_t)cur->fd_table[i]);
-                if (us) us->ref_count++;
+                if (us) __atomic_fetch_add(&us->ref_count, 1, __ATOMIC_ACQ_REL);
                 child->fd_table[i] = cur->fd_table[i];
             } else if (IS_EPOLL_FD(cur->fd_table[i])) {
                 child->fd_table[i] = cur->fd_table[i];
@@ -2325,11 +2325,11 @@ files_struct_t* files_struct_clone(files_struct_t* src) {
             } else if (IS_SOCKET_FD(src->fd_table[i])) {
                 int idx = SOCKET_FD_IDX(src->fd_table[i]);
                 net_socket_t* s = sock_get(idx);
-                if (s) s->ref_count++;
+                if (s) __atomic_fetch_add(&s->ref_count, 1, __ATOMIC_ACQ_REL);
                 files->fd_table[i] = src->fd_table[i];
             } else if (IS_UNIX_SOCKET_FD(src->fd_table[i])) {
                 unix_socket_t* us = unix_get((int)(uintptr_t)src->fd_table[i]);
-                if (us) us->ref_count++;
+                if (us) __atomic_fetch_add(&us->ref_count, 1, __ATOMIC_ACQ_REL);
                 files->fd_table[i] = src->fd_table[i];
             } else if (IS_EPOLL_FD(src->fd_table[i])) {
                 files->fd_table[i] = src->fd_table[i];

@@ -83,6 +83,130 @@ static void test_result(const char* name, int condition) {
     }
 }
 
+static int get_interface_ipv4(const char* ifname, uint32_t* ip_out) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0)
+        return -1;
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name) - 1);
+
+    int ret = ioctl(sock, SIOCGIFADDR, &ifr);
+    close(sock);
+    if (ret < 0)
+        return -1;
+
+    struct sockaddr_in* sin = (struct sockaddr_in*)&ifr.ifr_addr;
+    *ip_out = ntohl(sin->sin_addr.s_addr);
+    return 0;
+}
+
+static void run_tcp_large_transfer_case(const char* prefix,
+                                        uint32_t bind_ip,
+                                        uint32_t connect_ip,
+                                        uint16_t port) {
+    char label[96];
+    enum { transfer_size = 4096 };
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    snprintf(label, sizeof(label), "%s: server socket", prefix);
+    test_result(label, server_fd >= 0);
+
+    if (server_fd < 0)
+        return;
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(bind_ip);
+
+    int optval = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+
+    int ret = bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
+    snprintf(label, sizeof(label), "%s: bind", prefix);
+    test_result(label, ret == 0);
+
+    if (ret == 0) {
+        ret = listen(server_fd, 4);
+        snprintf(label, sizeof(label), "%s: listen", prefix);
+        test_result(label, ret == 0);
+    }
+
+    if (ret == 0) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (client_fd >= 0) {
+                struct sockaddr_in dst;
+                memset(&dst, 0, sizeof(dst));
+                dst.sin_family = AF_INET;
+                dst.sin_port = htons(port);
+                dst.sin_addr.s_addr = htonl(connect_ip);
+
+                if (connect(client_fd, (struct sockaddr*)&dst, sizeof(dst)) == 0) {
+                    char sendbuf[transfer_size];
+                    for (int i = 0; i < (int)sizeof(sendbuf); i++)
+                        sendbuf[i] = (char)('a' + (i % 23));
+
+                    size_t sent = 0;
+                    while (sent < sizeof(sendbuf)) {
+                        ssize_t n = send(client_fd, sendbuf + sent,
+                                         sizeof(sendbuf) - sent, 0);
+                        if (n <= 0)
+                            break;
+                        sent += (size_t)n;
+                    }
+
+                    close(client_fd);
+                    _exit(sent == sizeof(sendbuf) ? 0 : 2);
+                }
+                close(client_fd);
+            }
+            _exit(1);
+        } else if (pid > 0) {
+            int conn_fd = accept(server_fd, NULL, NULL);
+            snprintf(label, sizeof(label), "%s: accept", prefix);
+            test_result(label, conn_fd >= 0);
+
+            if (conn_fd >= 0) {
+                char recvbuf[transfer_size];
+                char expectbuf[transfer_size];
+                for (int i = 0; i < (int)sizeof(expectbuf); i++)
+                    expectbuf[i] = (char)('a' + (i % 23));
+
+                size_t recvd = 0;
+                while (recvd < sizeof(recvbuf)) {
+                    ssize_t n = recv(conn_fd, recvbuf + recvd,
+                                     sizeof(recvbuf) - recvd, 0);
+                    if (n <= 0)
+                        break;
+                    recvd += (size_t)n;
+                }
+
+                snprintf(label, sizeof(label), "%s: recv 4096 bytes", prefix);
+                test_result(label, recvd == sizeof(recvbuf));
+
+                snprintf(label, sizeof(label), "%s: payload matches", prefix);
+                test_result(label, recvd == sizeof(recvbuf) &&
+                                   memcmp(recvbuf, expectbuf, sizeof(recvbuf)) == 0);
+                close(conn_fd);
+            }
+
+            int status = 0;
+            waitpid(pid, &status, 0);
+            snprintf(label, sizeof(label), "%s: client completed", prefix);
+            test_result(label, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        } else {
+            snprintf(label, sizeof(label), "%s: fork", prefix);
+            test_fail(label);
+        }
+    }
+
+    close(server_fd);
+}
+
 static void run_programerror_case(const char* name, const char* mode, int expected_sig) {
     pid_t child = fork();
     if (child < 0) {
@@ -4482,6 +4606,184 @@ int main(int argc, char** argv) {
         uint32_t ip = 0;
         int ret = dns_resolve("localhost", &ip);
         test_result("dns: localhost resolves to 127.0.0.1", ret == 0 && ip == 0x7F000001);
+    }
+
+    // ========================================
+    // Extended TCP Loopback Tests
+    // ========================================
+    printf("\n--- Extended TCP Loopback ---\n");
+
+    {
+        int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        test_result("tcp loopback: server socket", server_fd >= 0);
+
+        if (server_fd >= 0) {
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(20021);
+            addr.sin_addr.s_addr = htonl(0x7F000001);
+
+            int optval = 1;
+            setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+            int ret = bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
+            test_result("tcp loopback: bind", ret == 0);
+            if (ret == 0) {
+                ret = listen(server_fd, 4);
+                test_result("tcp loopback: listen", ret == 0);
+            }
+
+            if (ret == 0) {
+                pid_t pid = fork();
+                if (pid == 0) {
+                    int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+                    if (client_fd >= 0) {
+                        struct sockaddr_in dst;
+                        memset(&dst, 0, sizeof(dst));
+                        dst.sin_family = AF_INET;
+                        dst.sin_port = htons(20021);
+                        dst.sin_addr.s_addr = htonl(0x7F000001);
+                        if (connect(client_fd, (struct sockaddr*)&dst, sizeof(dst)) == 0) {
+                            char sendbuf[4096];
+                            char recvbuf[4096];
+                            for (int i = 0; i < (int)sizeof(sendbuf); i++)
+                                sendbuf[i] = (char)('A' + (i % 26));
+
+                            size_t sent = 0;
+                            while (sent < sizeof(sendbuf)) {
+                                ssize_t n = send(client_fd, sendbuf + sent,
+                                                 sizeof(sendbuf) - sent, 0);
+                                if (n <= 0) break;
+                                sent += (size_t)n;
+                            }
+
+                            size_t recvd = 0;
+                            while (recvd < sizeof(recvbuf)) {
+                                ssize_t n = recv(client_fd, recvbuf + recvd,
+                                                 sizeof(recvbuf) - recvd, 0);
+                                if (n <= 0) break;
+                                recvd += (size_t)n;
+                            }
+
+                            _exit((sent == sizeof(sendbuf) && recvd == sizeof(recvbuf) &&
+                                   memcmp(sendbuf, recvbuf, sizeof(sendbuf)) == 0) ? 0 : 2);
+                        }
+                        close(client_fd);
+                    }
+                    _exit(1);
+                } else if (pid > 0) {
+                    int conn_fd = accept(server_fd, NULL, NULL);
+                    test_result("tcp loopback: accept", conn_fd >= 0);
+                    if (conn_fd >= 0) {
+                        char recvbuf[4096];
+                        size_t recvd = 0;
+                        while (recvd < sizeof(recvbuf)) {
+                            ssize_t n = recv(conn_fd, recvbuf + recvd,
+                                             sizeof(recvbuf) - recvd, 0);
+                            if (n <= 0) break;
+                            recvd += (size_t)n;
+                        }
+                        test_result("tcp loopback: recv 4096 bytes", recvd == sizeof(recvbuf));
+
+                        size_t sent = 0;
+                        while (sent < recvd) {
+                            ssize_t n = send(conn_fd, recvbuf + sent, recvd - sent, 0);
+                            if (n <= 0) break;
+                            sent += (size_t)n;
+                        }
+                        test_result("tcp loopback: echo 4096 bytes", sent == recvd);
+                        close(conn_fd);
+                    }
+
+                    int status = 0;
+                    waitpid(pid, &status, 0);
+                    test_result("tcp loopback: client completed", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+                } else {
+                    test_fail("tcp loopback: fork");
+                }
+            }
+            close(server_fd);
+        }
+    }
+
+    {
+        int client_fd = socket(AF_INET, SOCK_STREAM, 0);
+        test_result("tcp refuse: socket", client_fd >= 0);
+        if (client_fd >= 0) {
+            struct sockaddr_in dst;
+            memset(&dst, 0, sizeof(dst));
+            dst.sin_family = AF_INET;
+            dst.sin_port = htons(20022);
+            dst.sin_addr.s_addr = htonl(0x7F000001);
+            int ret = connect(client_fd, (struct sockaddr*)&dst, sizeof(dst));
+            test_result("tcp refuse: connect fails", ret == -1);
+            close(client_fd);
+        }
+    }
+
+    // ========================================
+    // TCP Large Transfer Bind Address Tests
+    // ========================================
+    printf("\n--- TCP Bind Address Variants ---\n");
+
+    run_tcp_large_transfer_case("tcp any lo", 0x00000000, 0x7F000001, 20023);
+
+    {
+        uint32_t eth0_ip = 0;
+        if (get_interface_ipv4("eth0", &eth0_ip) == 0 && eth0_ip != 0) {
+            run_tcp_large_transfer_case("tcp any eth0", 0x00000000, eth0_ip, 20024);
+            run_tcp_large_transfer_case("tcp eth0", eth0_ip, eth0_ip, 20025);
+        } else {
+            test_result("tcp any eth0: interface/address unavailable, skip", 1);
+            test_result("tcp eth0: interface/address unavailable, skip", 1);
+        }
+    }
+
+    // ========================================
+    // IPv4 Fragmented UDP Loopback Tests
+    // ========================================
+    printf("\n--- IPv4 Fragmented UDP ---\n");
+
+    {
+        int rx_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        int tx_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        test_result("udp frag: sockets create", rx_fd >= 0 && tx_fd >= 0);
+
+        if (rx_fd >= 0 && tx_fd >= 0) {
+            struct sockaddr_in bind_addr;
+            memset(&bind_addr, 0, sizeof(bind_addr));
+            bind_addr.sin_family = AF_INET;
+            bind_addr.sin_port = htons(20031);
+            bind_addr.sin_addr.s_addr = htonl(0x7F000001);
+
+            int ret = bind(rx_fd, (struct sockaddr*)&bind_addr, sizeof(bind_addr));
+            test_result("udp frag: bind receiver", ret == 0);
+            if (ret == 0) {
+                char sendbuf[2400];
+                char recvbuf[2400];
+                for (int i = 0; i < (int)sizeof(sendbuf); i++)
+                    sendbuf[i] = (char)(i & 0x7F);
+                memset(recvbuf, 0, sizeof(recvbuf));
+
+                struct sockaddr_in dest;
+                memset(&dest, 0, sizeof(dest));
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(20031);
+                dest.sin_addr.s_addr = htonl(0x7F000001);
+
+                ssize_t sent = sendto(tx_fd, sendbuf, sizeof(sendbuf), 0,
+                                      (struct sockaddr*)&dest, sizeof(dest));
+                test_result("udp frag: send 2400 bytes", sent == (ssize_t)sizeof(sendbuf));
+                if (sent == (ssize_t)sizeof(sendbuf)) {
+                    ssize_t recvd = recvfrom(rx_fd, recvbuf, sizeof(recvbuf), 0, NULL, NULL);
+                    test_result("udp frag: recv 2400 bytes", recvd == (ssize_t)sizeof(recvbuf));
+                    test_result("udp frag: payload matches", recvd == (ssize_t)sizeof(recvbuf) && memcmp(sendbuf, recvbuf, sizeof(sendbuf)) == 0);
+                }
+            }
+        }
+
+        if (rx_fd >= 0) close(rx_fd);
+        if (tx_fd >= 0) close(tx_fd);
     }
 
     // ========================================

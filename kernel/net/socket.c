@@ -42,21 +42,26 @@ static uint16_t alloc_ephemeral_port(void) {
     }
     // Fallback: sequential
     uint16_t port = next_ephemeral_port++;
-    if (next_ephemeral_port > 65535)
+    if (next_ephemeral_port < 49152)
         next_ephemeral_port = 49152;
     return port;
 }
 
-// Find a UDP socket bound to a given port (called from udp.c)
-net_socket_t* sock_find_udp(uint16_t port) {
+// Find a UDP socket bound to a given port and destination IP (called from udp.c)
+net_socket_t* sock_find_udp(uint16_t port, uint32_t dst_ip) {
+    net_socket_t* wildcard = NULL;
     for (int i = 0; i < NET_MAX_SOCKETS; i++) {
         net_socket_t* s = &sockets[i];
         if (s->active && s->type == SOCK_DGRAM && s->bound &&
             net_ntohs(s->local_addr.sin_port) == port) {
-            return s;
+            uint32_t local_ip = net_ntohl(s->local_addr.sin_addr.s_addr);
+            if (local_ip == dst_ip)
+                return s;
+            if (local_ip == 0 && !wildcard)
+                wildcard = s;
         }
     }
-    return NULL;
+    return wildcard;
 }
 
 // ============================================================================
@@ -146,7 +151,6 @@ int sock_listen(int sockfd, int backlog) {
     if (!dev) return -ENETDOWN;
 
     uint32_t local_ip = net_ntohl(s->local_addr.sin_addr.s_addr);
-    if (local_ip == 0) local_ip = dev->ip_addr;
     uint16_t local_port = net_ntohs(s->local_addr.sin_port);
 
     tcp_conn_t* conn = tcp_listen(dev, local_ip, local_port,
@@ -180,6 +184,7 @@ int sock_accept(int sockfd, struct sockaddr_in* addr, socklen_t* addrlen) {
         if (new_conn) break;
         if (s->nonblock) return -EAGAIN;
         if (deadline && timer_ticks() >= deadline) return -ETIMEDOUT;
+        loopback_process_pending();
         __asm__ volatile("pause");
     }
 
@@ -219,7 +224,11 @@ int sock_connect(int sockfd, const struct sockaddr_in* addr) {
     if (!s->active) return -EBADF;
     if (s->connected) return -EISCONN;
 
-    net_device_t* dev = net_get_default_device();
+    uint32_t dst_ip = net_ntohl(addr->sin_addr.s_addr);
+    uint32_t next_hop = dst_ip;
+    net_device_t* dev = route_lookup(dst_ip, &next_hop);
+    if (!dev)
+        dev = net_get_default_device();
     if (!dev) return -ENETDOWN;
 
     if (!s->bound) {
@@ -238,11 +247,11 @@ int sock_connect(int sockfd, const struct sockaddr_in* addr) {
     }
 
     // TCP: initiate connection
-    uint32_t dst_ip = net_ntohl(addr->sin_addr.s_addr);
     uint16_t dst_port = net_ntohs(addr->sin_port);
     uint16_t src_port = net_ntohs(s->local_addr.sin_port);
+    uint32_t local_ip = net_ntohl(s->local_addr.sin_addr.s_addr);
 
-    tcp_conn_t* conn = tcp_connect(dev, dst_ip, src_port, dst_port);
+    tcp_conn_t* conn = tcp_connect(dev, local_ip, dst_ip, src_port, dst_port);
     if (!conn) return -ENOMEM;
 
     s->tcp = conn;
@@ -254,6 +263,7 @@ int sock_connect(int sockfd, const struct sockaddr_in* addr) {
     while (!conn->connect_done) {
         if (s->nonblock) return -EINPROGRESS;
         if (deadline && timer_ticks() >= deadline) return -ETIMEDOUT;
+        loopback_process_pending();
         __asm__ volatile("pause");
     }
 
@@ -284,25 +294,15 @@ int sock_sendto(int sockfd, const void* buf, size_t len, int flags,
         if (target->sin_port == 0 && !s->connected) return -EDESTADDRREQ;
 
         uint32_t dst_ip = net_ntohl(target->sin_addr.s_addr);
-        uint16_t src_port = net_ntohs(s->local_addr.sin_port);
         uint16_t dst_port = net_ntohs(target->sin_port);
 
-        uint16_t send_len = len > NET_MTU_DEFAULT - 28 ?
-                             NET_MTU_DEFAULT - 28 : (uint16_t)len;
+        if (len > 0xFFFFU - 28U)
+            return -EINVAL;
 
-        // Loopback shortcut: deliver directly to destination socket
-        if ((dst_ip & 0xFF000000) == 0x7F000000) {
-            extern void udp_deliver_to_socket(uint32_t src_ip, uint16_t src_port,
-                                              uint16_t dst_port,
-                                              const uint8_t* data, uint16_t len);
-            smap_disable();
-            udp_deliver_to_socket(dst_ip, src_port, dst_port,
-                                 (const uint8_t*)buf, send_len);
-            smap_enable();
-            return (int)send_len;
-        }
-
-        net_device_t* dev = net_get_default_device();
+        uint32_t next_hop = dst_ip;
+        net_device_t* dev = route_lookup(dst_ip, &next_hop);
+        if (!dev)
+            dev = net_get_default_device();
         if (!dev) return -ENETDOWN;
 
         if (!s->bound) {
@@ -310,6 +310,9 @@ int sock_sendto(int sockfd, const void* buf, size_t len, int flags,
             s->local_addr.sin_addr.s_addr = net_htonl(dev->ip_addr);
             s->bound = 1;
         }
+
+        uint16_t src_port = net_ntohs(s->local_addr.sin_port);
+        uint16_t send_len = (uint16_t)len;
 
         smap_disable();
         int ret = udp_send(dev, dst_ip, src_port, dst_port,
@@ -340,6 +343,7 @@ int sock_recvfrom(int sockfd, void* buf, size_t len, int flags,
         while (!s->udp_rx_ready) {
             if (s->nonblock) return -EAGAIN;
             if (deadline && timer_ticks() >= deadline) return -ETIMEDOUT;
+            loopback_process_pending();
             __asm__ volatile("pause");
         }
 
@@ -391,11 +395,28 @@ int sock_send(int sockfd, const void* buf, size_t len, int flags) {
         if (!s->tcp || !s->connected) return -ENOTCONN;
         if (s->tcp->state != TCP_STATE_ESTABLISHED) return -EPIPE;
 
-        uint16_t send_len = len > TCP_MSS ? TCP_MSS : (uint16_t)len;
-        smap_disable();
-        int ret = tcp_send_data(s->tcp, (const uint8_t*)buf, send_len);
-        smap_enable();
-        return ret;
+        // tcp_send_data may return 0 when the inflight queue is full.  POSIX
+        // forbids returning 0 from send() with non-zero len (callers treat it
+        // as EOF), so block until at least one byte gets queued, or report
+        // EAGAIN for nonblocking sockets.
+        uint16_t to_send = len > 0xFFFF ? 0xFFFF : (uint16_t)len;
+        if (to_send == 0) return 0;
+
+        for (;;) {
+            if (!s->tcp || !s->connected) return -ENOTCONN;
+            if (s->tcp->state != TCP_STATE_ESTABLISHED) return -EPIPE;
+
+            smap_disable();
+            int ret = tcp_send_data(s->tcp, (const uint8_t*)buf, to_send);
+            smap_enable();
+
+            if (ret < 0) return ret;
+            if (ret > 0) return ret;
+
+            if (s->nonblock) return -EAGAIN;
+            loopback_process_pending();
+            __asm__ volatile("pause");
+        }
     }
 
     // UDP send (connected)
@@ -423,6 +444,7 @@ int sock_recv(int sockfd, void* buf, size_t len, int flags) {
         while (!conn->rx_ready && conn->state == TCP_STATE_ESTABLISHED) {
             if (s->nonblock) return -EAGAIN;
             if (deadline && timer_ticks() >= deadline) return -ETIMEDOUT;
+            loopback_process_pending();
             __asm__ volatile("pause");
         }
 
@@ -471,6 +493,19 @@ int sock_close(int sockfd) {
     uint64_t flags;
     spin_lock_irqsave(&s->lock, &flags);
 
+    // Drop one reference; only tear down on the final close.  The same socket
+    // index is shared between parent and child after fork(), so a premature
+    // teardown here would yank the listener out from under a peer that is
+    // still blocked in accept() (observed: child exits, its fd cleanup closes
+    // the inherited listener fd, parent's accept() loops forever on a freed
+    // tcp_conn_t).  fork()/dup() bump ref_count without holding s->lock, so
+    // the decrement must be atomic to race-correctly with them.
+    int old = __atomic_fetch_sub(&s->ref_count, 1, __ATOMIC_ACQ_REL);
+    if (old > 1) {
+        spin_unlock_irqrestore(&s->lock, flags);
+        return 0;
+    }
+
     if (s->tcp) {
         tcp_close(s->tcp);
         s->tcp = NULL;
@@ -478,6 +513,7 @@ int sock_close(int sockfd) {
 
     s->closed = 1;
     s->active = 0;
+    s->ref_count = 0;
 
     spin_unlock_irqrestore(&s->lock, flags);
     return 0;
@@ -494,6 +530,9 @@ int sock_shutdown(int sockfd, int how) {
 
     if (s->type == SOCK_STREAM && s->tcp) {
         tcp_close(s->tcp);
+        s->tcp = NULL;
+        s->connected = 0;
+        s->listening = 0;
     }
 
     return 0;
@@ -778,7 +817,7 @@ int sock_poll(int sockfd, short events) {
             }
             // Writable if connection established and space in tx buffer
             if (events & (POLLOUT | POLLWRNORM)) {
-                if (conn->state == TCP_STATE_ESTABLISHED)
+                if (conn->state == TCP_STATE_ESTABLISHED && conn->tx_ready)
                     revents |= POLLOUT | POLLWRNORM;
             }
             // Error / hangup
@@ -1362,18 +1401,17 @@ int net_get_tcp_connections(net_tcp_info_t* entries, int max_entries) {
         // Calculate queue sizes
         uint32_t rx_used = 0;
         if (c->rx_buf) {
-            if (c->rx_head >= c->rx_tail)
-                rx_used = c->rx_head - c->rx_tail;
+            if (c->rx_tail >= c->rx_head)
+                rx_used = c->rx_tail - c->rx_head;
             else
-                rx_used = c->rx_buf_size - c->rx_tail + c->rx_head;
+                rx_used = c->rx_buf_size - c->rx_head + c->rx_tail;
         }
         entries[count].rx_queue = rx_used;
         uint32_t tx_used = 0;
-        if (c->tx_buf) {
-            if (c->tx_head >= c->tx_tail)
-                tx_used = c->tx_head - c->tx_tail;
-            else
-                tx_used = c->tx_buf_size - c->tx_tail + c->tx_head;
+        for (uint8_t seg = 0; seg < c->inflight_count; seg++) {
+            tx_used += c->inflight[seg].len;
+            if (c->inflight[seg].flags & (TCP_SYN | TCP_FIN))
+                tx_used++;
         }
         entries[count].tx_queue = tx_used;
         count++;

@@ -16,8 +16,8 @@ void udp_init(void) {
     // Nothing to initialize
 }
 
-// Static send buffer to avoid large stack allocations
-static uint8_t udp_send_buf[NET_MTU_DEFAULT];
+// Static send buffer sized for the largest IPv4 payload the stack can emit.
+static uint8_t udp_send_buf[65535 - sizeof(ipv4_header_t)];
 static spinlock_t udp_send_lock = SPINLOCK_INIT("udp_tx");
 
 // Send UDP datagram
@@ -26,8 +26,8 @@ int udp_send(net_device_t* dev, uint32_t dst_ip,
              const uint8_t* data, uint16_t len) {
     if (!dev) return -1;
 
-    uint16_t udp_len = sizeof(udp_header_t) + len;
-    if (udp_len > NET_MTU_DEFAULT) return -1;
+    uint32_t udp_len = sizeof(udp_header_t) + (uint32_t)len;
+    if (udp_len > 65535U - sizeof(ipv4_header_t)) return -1;
 
     uint64_t flags;
     spin_lock_irqsave(&udp_send_lock, &flags);
@@ -35,7 +35,7 @@ int udp_send(net_device_t* dev, uint32_t dst_ip,
     udp_header_t* udp = (udp_header_t*)udp_send_buf;
     udp->src_port = net_htons(src_port);
     udp->dst_port = net_htons(dst_port);
-    udp->length = net_htons(udp_len);
+    udp->length = net_htons((uint16_t)udp_len);
     udp->checksum = 0;  // UDP checksum optional in IPv4
 
     // Copy payload
@@ -48,7 +48,8 @@ int udp_send(net_device_t* dev, uint32_t dst_ip,
 }
 
 // Process received UDP datagram
-void udp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t len) {
+void udp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
+            const uint8_t* data, uint16_t len) {
     if (len < sizeof(udp_header_t)) return;
 
     const udp_header_t* udp = (const udp_header_t*)data;
@@ -74,17 +75,45 @@ void udp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t le
     }
 
     // Deliver to socket layer
-    udp_deliver_to_socket(src_ip, src_port, dst_port, payload, payload_len);
+    extern net_socket_t* sock_find_udp(uint16_t port, uint32_t dst_ip);
+    if (!sock_find_udp(dst_port, dst_ip)) {
+        uint8_t quoted[sizeof(ipv4_header_t) + sizeof(udp_header_t) + 8];
+        ipv4_header_t* ip = (ipv4_header_t*)quoted;
+        ip->version_ihl = 0x45;
+        ip->tos = 0;
+        ip->total_length = net_htons((uint16_t)(sizeof(ipv4_header_t) + udp_len));
+        ip->identification = 0;
+        ip->flags_fragment = 0;
+        ip->ttl = 64;
+        ip->protocol = IP_PROTO_UDP;
+        ip->checksum = 0;
+        ip->src_addr = net_htonl(src_ip);
+        ip->dst_addr = net_htonl(dst_ip);
+        ip->checksum = ipv4_checksum(ip, sizeof(ipv4_header_t));
+
+        uint16_t copy_len = udp_len;
+        if (copy_len > sizeof(quoted) - sizeof(ipv4_header_t))
+            copy_len = (uint16_t)(sizeof(quoted) - sizeof(ipv4_header_t));
+        for (uint16_t i = 0; i < copy_len; i++)
+            quoted[sizeof(ipv4_header_t) + i] = data[i];
+
+        icmp_send_error_packet(dev, src_ip, ICMP_DEST_UNREACH,
+                               ICMP_PORT_UNREACH, quoted,
+                               (uint16_t)(sizeof(ipv4_header_t) + copy_len), 0);
+        return;
+    }
+
+    udp_deliver_to_socket(src_ip, src_port, dst_ip, dst_port, payload, payload_len);
 }
 
 // Deliver UDP data to a bound socket
 void udp_deliver_to_socket(uint32_t src_ip, uint16_t src_port,
-                           uint16_t dst_port,
+                           uint32_t dst_ip, uint16_t dst_port,
                            const uint8_t* data, uint16_t len) {
     // This is called from the socket layer's perspective
     // Find socket bound to dst_port and enqueue data
-    extern net_socket_t* sock_find_udp(uint16_t port);
-    net_socket_t* sk = sock_find_udp(dst_port);
+    extern net_socket_t* sock_find_udp(uint16_t port, uint32_t dst_ip);
+    net_socket_t* sk = sock_find_udp(dst_port, dst_ip);
     if (!sk) return;
 
     uint64_t flags;

@@ -2361,14 +2361,14 @@ static int64_t sys_dup(uint64_t oldfd) {
     if (IS_SOCKET_FD(cur->fd_table[oldfd])) {
         int idx = SOCKET_FD_IDX(cur->fd_table[oldfd]);
         net_socket_t* s = sock_get(idx);
-        if (s) s->ref_count++;
+        if (s) __atomic_fetch_add(&s->ref_count, 1, __ATOMIC_ACQ_REL);
         cur->fd_table[newfd] = cur->fd_table[oldfd];
         return newfd;
     }
 
     if (IS_UNIX_SOCKET_FD(cur->fd_table[oldfd])) {
         unix_socket_t* us = unix_get((int)(uintptr_t)cur->fd_table[oldfd]);
-        if (us) us->ref_count++;
+        if (us) __atomic_fetch_add(&us->ref_count, 1, __ATOMIC_ACQ_REL);
         cur->fd_table[newfd] = cur->fd_table[oldfd];
         return newfd;
     }
@@ -2417,14 +2417,14 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd) {
     if (IS_SOCKET_FD(cur->fd_table[oldfd])) {
         int idx = SOCKET_FD_IDX(cur->fd_table[oldfd]);
         net_socket_t* s = sock_get(idx);
-        if (s) s->ref_count++;
+        if (s) __atomic_fetch_add(&s->ref_count, 1, __ATOMIC_ACQ_REL);
         cur->fd_table[newfd] = cur->fd_table[oldfd];
         return newfd;
     }
 
     if (IS_UNIX_SOCKET_FD(cur->fd_table[oldfd])) {
         unix_socket_t* us = unix_get((int)(uintptr_t)cur->fd_table[oldfd]);
-        if (us) us->ref_count++;
+        if (us) __atomic_fetch_add(&us->ref_count, 1, __ATOMIC_ACQ_REL);
         cur->fd_table[newfd] = cur->fd_table[oldfd];
         return newfd;
     }

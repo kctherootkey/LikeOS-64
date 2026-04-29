@@ -29,6 +29,11 @@
 #define RAW_RECV_ICMP_REPLY   1
 #define RAW_RECV_ARP_REPLY    2
 
+/* ICMP types returned through RAW_RECV_ICMP_REPLY */
+#define ICMP_ECHO_REPLY       0
+#define ICMP_DEST_UNREACH     3
+#define ICMP_TIME_EXCEEDED    11
+
 /* Info structures for NET_GETINFO — must match kernel include/kernel/net.h */
 typedef struct {
     uint32_t ip;
@@ -83,9 +88,14 @@ typedef struct {
     uint64_t rx_dropped;
 } net_iface_info_t;
 
-/* ICMP reply result - 8 bytes packed: src_ip(4 BE), type(1), code(1), seq(2 BE) */
-typedef struct {
-    uint8_t data[8];
+typedef struct __attribute__((packed)) {
+    uint32_t src_ip;
+    uint8_t type;
+    uint8_t code;
+    uint16_t seq;
+    uint64_t rtt_us;
+    uint8_t ttl;
+    uint8_t reserved[7];
 } icmp_reply_t;
 
 /* ARP reply result - 6 bytes MAC */

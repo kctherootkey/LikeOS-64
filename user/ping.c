@@ -109,6 +109,9 @@ static void print_help(const char *progname)
 
 static uint32_t resolve_host(const char *host)
 {
+    if (strcmp(host, "0.0.0.0") == 0)
+        return 0x7F000001;
+
     /* Try as dotted IP first */
     uint32_t ip = inet_addr(host);
     if (ip != 0 && ip != 0xFFFFFFFF)
@@ -125,6 +128,17 @@ static const char *ip_to_str(uint32_t ip)
     struct in_addr a;
     a.s_addr = htonl(ip);
     return inet_ntoa(a);
+}
+
+static const char *icmp_unreach_reason(uint8_t code)
+{
+    switch (code) {
+        case 0: return "Network unreachable";
+        case 1: return "Host unreachable";
+        case 3: return "Port unreachable";
+        case 4: return "Fragmentation needed";
+        default: return "Destination unreachable";
+    }
 }
 
 int main(int argc, char *argv[])
@@ -250,16 +264,18 @@ int main(int argc, char *argv[])
 
         /* Wait for reply */
         uint64_t timeout_ticks = (uint64_t)timeout * 100;
-        uint8_t result[24];
-        ret = raw_recv(RAW_RECV_ICMP_REPLY, result, id_seq, timeout_ticks);
+        icmp_reply_t reply;
+        ret = raw_recv(RAW_RECV_ICMP_REPLY, &reply, id_seq, timeout_ticks);
         if (ret == 0) {
             gettimeofday(&tv_recv, NULL);
             g_received++;
-            uint32_t src = ((uint32_t)result[0] << 24) | ((uint32_t)result[1] << 16) |
-                           ((uint32_t)result[2] << 8) | result[3];
-            uint8_t type = result[4];
-            /* uint8_t code = result[5]; */
-            uint16_t rseq = ((uint16_t)result[6] << 8) | result[7];
+            uint32_t src = ((reply.src_ip >> 24) & 0xFF) |
+                           ((reply.src_ip >> 8) & 0xFF00) |
+                           ((reply.src_ip << 8) & 0xFF0000) |
+                           ((reply.src_ip << 24) & 0xFF000000);
+            uint8_t type = reply.type;
+            uint8_t code = reply.code;
+            uint16_t rseq = (uint16_t)((reply.seq >> 8) | (reply.seq << 8));
 
             /* Measure RTT in the waiting thread context. */
             long rtt_us = (tv_recv.tv_sec - tv_send.tv_sec) * 1000000L +
@@ -267,7 +283,7 @@ int main(int argc, char *argv[])
             if (rtt_us < 0) rtt_us = 0;
 
             /* Received TTL from IP header */
-            uint8_t recv_ttl = result[16];
+            uint8_t recv_ttl = reply.ttl;
 
             uint32_t rtt_ms_10 = (uint32_t)rtt_us; /* in µs units */
             if (g_min_ms > rtt_ms_10) g_min_ms = rtt_ms_10;
@@ -292,8 +308,8 @@ int main(int argc, char *argv[])
                     printf("From %s icmp_seq=%u Time to live exceeded\n",
                            ip_to_str(src), rseq);
                 } else if (type == 3) {
-                    printf("From %s icmp_seq=%u Destination unreachable\n",
-                           ip_to_str(src), rseq);
+                    printf("From %s icmp_seq=%u %s\n",
+                           ip_to_str(src), rseq, icmp_unreach_reason(code));
                 }
             }
 

@@ -224,13 +224,16 @@ int main(int argc, char *argv[])
             }
 
             uint64_t timeout_ticks = (uint64_t)wait_max * 100;
-            uint8_t result[24];
-            ret = raw_recv(RAW_RECV_ICMP_REPLY, result, id_seq, timeout_ticks);
+            icmp_reply_t reply;
+            ret = raw_recv(RAW_RECV_ICMP_REPLY, &reply, id_seq, timeout_ticks);
             if (ret == 0) {
                 gettimeofday(&tv_recv, NULL);
-                uint32_t src = ((uint32_t)result[0] << 24) | ((uint32_t)result[1] << 16) |
-                               ((uint32_t)result[2] << 8) | result[3];
-                uint8_t type = result[4];
+                uint32_t src = ((reply.src_ip >> 24) & 0xFF) |
+                               ((reply.src_ip >> 8) & 0xFF00) |
+                               ((reply.src_ip << 8) & 0xFF0000) |
+                               ((reply.src_ip << 24) & 0xFF000000);
+                uint8_t type = reply.type;
+                uint8_t code = reply.code;
 
                 long rtt_us = (tv_recv.tv_sec - tv_send.tv_sec) * 1000000L +
                               (tv_recv.tv_usec - tv_send.tv_usec);
@@ -254,6 +257,9 @@ int main(int argc, char *argv[])
                 }
                 printf("  %lu.%03lu ms", (unsigned long)(rtt_us / 1000),
                        (unsigned long)(rtt_us % 1000));
+
+                if (type == ICMP_DEST_UNREACH)
+                    printf(" !%u", code);
 
                 if (type == 0) /* Echo reply - reached destination */
                     reached = 1;

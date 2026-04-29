@@ -314,8 +314,9 @@ int unix_close(int usockfd) {
     uint64_t flags;
     spin_lock_irqsave(&us->lock, &flags);
 
-    us->ref_count--;
-    if (us->ref_count > 0) {
+    // fork()/dup() bump ref_count without holding us->lock — use atomic dec.
+    int old = __atomic_fetch_sub(&us->ref_count, 1, __ATOMIC_ACQ_REL);
+    if (old > 1) {
         spin_unlock_irqrestore(&us->lock, flags);
         return 0;
     }
