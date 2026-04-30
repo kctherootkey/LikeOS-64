@@ -13,6 +13,7 @@
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/random.h"
+#include "../../include/kernel/timer.h"
 #include "../../include/kernel/skb.h"
 #include "../../include/kernel/softirq.h"
 #include "../../include/kernel/percpu.h"

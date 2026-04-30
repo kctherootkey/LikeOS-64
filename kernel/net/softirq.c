@@ -7,6 +7,7 @@
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/memory.h"
 
 static softirq_fn_t   softirq_handlers[NR_SOFTIRQ];
 static volatile uint32_t softirq_pending_mask[MAX_CPUS];
@@ -127,6 +128,13 @@ static void ksoftirqd_main(void* arg) {
         // If softirq_raise() races in between, it will set the bit; our
         // re-check sees it and we loop without sleeping.  If it raises after
         // we yield, sched_wake_channel() puts us back on the runqueue.
+        //
+        // NOTE: must call sched_schedule() directly here, NOT
+        // sched_yield_in_kernel(), because the latter unconditionally sets
+        // state = TASK_READY before scheduling and would defeat the BLOCKED
+        // marking — making ksoftirqd a 100% CPU busy-loop on every CPU,
+        // which starves other ready tasks (visible as multi-second OS-wide
+        // freezes when ksoftirqd holds runqueue locks contended cross-CPU).
         task_t* cur = sched_current();
         cur->wait_channel = (void*)&ksoftirqd_task[my_cpu];
         cur->state = TASK_BLOCKED;
@@ -136,24 +144,51 @@ static void ksoftirqd_main(void* arg) {
             cur->wait_channel = NULL;
             continue;
         }
-        sched_yield_in_kernel();
+        sched_schedule();
+        cur->wait_channel = NULL;
     }
 }
 
 void ksoftirqd_start_all(void) {
     uint32_t ncpus = smp_get_cpu_count();
     if (ncpus == 0) ncpus = 1;
+    uint32_t started = 0;
+    /* ksoftirqd runs entirely in kernel mode (calls softirq_drain,
+     * sched_yield_in_kernel) so it must be a TASK_KERNEL thread, not a
+     * user task.  sched_add_user_task requires a non-NULL pml4 and would
+     * fail unconditionally here.  Use sched_add_task with a per-thread
+     * kalloc'd kernel stack. */
+    const size_t KSOFTIRQD_STACK_SIZE = 16 * 1024;
     for (uint32_t cpu = 0; cpu < ncpus && cpu < MAX_CPUS; cpu++) {
-        task_t* t = sched_add_user_task(ksoftirqd_main,
-                                        (void*)(uintptr_t)cpu,
-                                        NULL, 0, 0);
+        void* stack = kalloc(KSOFTIRQD_STACK_SIZE);
+        if (!stack) {
+            kprintf("ksoftirqd: failed to alloc stack for CPU %u\n", cpu);
+            continue;
+        }
+        task_t* t = sched_add_task(ksoftirqd_main,
+                                   (void*)(uintptr_t)cpu,
+                                   stack, KSOFTIRQD_STACK_SIZE);
         if (!t) {
             kprintf("ksoftirqd: failed to create thread for CPU %u\n", cpu);
+            kfree(stack);
             continue;
         }
         t->on_cpu        = cpu;
         t->cpu_affinity  = (1ULL << cpu);
+        /* Name shown by ps as "[ksoftirqd/N]" (kernel-thread bracket added
+         * by ps when t->privilege == TASK_KERNEL). */
+        {
+            const char* p = "ksoftirqd/";
+            int i = 0;
+            while (p[i]) { t->comm[i] = p[i]; i++; }
+            if (cpu >= 10) {
+                t->comm[i++] = (char)('0' + (cpu / 10));
+            }
+            t->comm[i++] = (char)('0' + (cpu % 10));
+            t->comm[i] = '\0';
+        }
         ksoftirqd_task[cpu] = t;
+        started++;
     }
-    kprintf("softirq: ksoftirqd started on %u CPUs\n", ncpus);
+    kprintf("softirq: ksoftirqd started on %u of %u CPUs\n", started, ncpus);
 }

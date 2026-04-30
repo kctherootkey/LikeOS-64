@@ -297,6 +297,15 @@ static int e1000_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
 
     if (len > E1000_RX_BUF_SIZE) return -1;
 
+    // Serialize across CPUs: tx_tail, descriptor slot, and TDT MMIO write
+    // form one critical section; any two CPUs racing here would otherwise
+    // (a) read the same tx_tail, (b) write the same descriptor slot, and
+    // (c) lose one packet to the duplicate-tail-bump.  Hold IRQs disabled
+    // for the few MMIO cycles so an IRQ-tail TX (e.g. softirq sending a
+    // TCP ACK) cannot preempt user-context TX from the same CPU mid-slot.
+    uint64_t txflags;
+    spin_lock_irqsave(&dev->tx_lock, &txflags);
+
     uint16_t tail = dev->tx_tail;
 
     // Check if descriptor is available (DD bit set means hardware is done with it)
@@ -304,6 +313,7 @@ static int e1000_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     if (tail != 0 || desc->cmd != 0) {
         if (!(desc->status & E1000_TXD_STAT_DD) && desc->cmd != 0) {
             ndev->tx_errors++;
+            spin_unlock_irqrestore(&dev->tx_lock, txflags);
             return -1;
         }
     }
@@ -330,6 +340,7 @@ static int e1000_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
 
     ndev->tx_packets++;
     ndev->tx_bytes += len;
+    spin_unlock_irqrestore(&dev->tx_lock, txflags);
     return 0;
 }
 
@@ -673,6 +684,7 @@ void e1000_init(void) {
         // hardware and lock up the system in a level-triggered IRQ storm.
         // We populate the minimum state e1000_irq_handler() touches.
         dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("e1000");
+        dev->tx_lock = (spinlock_t)SPINLOCK_INIT("e1000_tx");
         dev->net_dev.rx_packets = 0;
         dev->net_dev.tx_packets = 0;
         dev->net_dev.rx_bytes = 0;

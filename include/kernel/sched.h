@@ -410,7 +410,7 @@ typedef struct task {
 } task_t;
 
 void sched_init(void);
-void sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack_size);
+task_t* sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack_size);
 task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4, uint64_t user_stack, uint64_t kernel_stack);
 void sched_tick(void);
 void sched_schedule(void);    // Core preemptive scheduler - switch to next ready task

@@ -10,6 +10,65 @@
 tcp_conn_t tcp_connections[TCP_MAX_CONNECTIONS];
 static spinlock_t tcp_lock = SPINLOCK_INIT("tcp");
 
+// Deferred-free queue for tcp_timer_tick.
+//
+// tcp_timer_tick runs in IRQ context (100Hz timer vector) on EVERY CPU
+// with IRQs disabled.  If it called tcp_free_conn directly, slab_free
+// could trigger an SMP TLB shootdown IPI that waits for ACKs from all
+// CPUs — but those CPUs may simultaneously be running their own IRQ
+// timer handler (IRQs off), unable to ACK, so the shootdown sync times
+// out and the kernel logs "TLB shootdown sync timeout (ack=N expect=N+1)".
+//
+// To avoid this, IRQ-context callers (only tcp_timer_tick) push the
+// to-be-freed conn pointer onto this small queue.  The queue is then
+// drained from softirq / process context (where IRQs are enabled around
+// handler invocations on at least one CPU, so IPIs can be serviced) by
+// tcp_reap_pending(), which calls tcp_free_conn → slab_free safely.
+static tcp_conn_t* tcp_pending_free[TCP_MAX_CONNECTIONS];
+static uint32_t    tcp_pending_free_count = 0;
+static spinlock_t  tcp_pending_free_lock = SPINLOCK_INIT("tcp_pf");
+static void tcp_free_conn(tcp_conn_t* conn);   // forward
+
+// Push a conn onto the deferred-free queue.  IRQ-safe (uses spinlock; the
+// critical section is just an array append so it is bounded and very
+// short — does NOT call slab).
+static void tcp_defer_free(tcp_conn_t* conn) {
+    uint64_t flags;
+    spin_lock_irqsave(&tcp_pending_free_lock, &flags);
+    // Idempotent: avoid pushing the same conn twice (double-free risk).
+    int already = 0;
+    for (uint32_t i = 0; i < tcp_pending_free_count; i++) {
+        if (tcp_pending_free[i] == conn) { already = 1; break; }
+    }
+    if (!already && tcp_pending_free_count < TCP_MAX_CONNECTIONS) {
+        tcp_pending_free[tcp_pending_free_count++] = conn;
+    }
+    spin_unlock_irqrestore(&tcp_pending_free_lock, flags);
+    // NOTE: do NOT raise a softirq here.  This is called from hard-IRQ
+    // context (tcp_timer_tick).  The queue is drained opportunistically
+    // from process-context entrypoints (tcp_alloc_conn, tcp_close) where
+    // slab_free is safe.  Worst-case latency is bounded by socket churn;
+    // the queue itself is bounded by TCP_MAX_CONNECTIONS.
+}
+
+// Drain the deferred-free queue.  MUST be called only from process
+// context (NOT from any IRQ handler, NOT from softirq_drain that was
+// entered from an IRQ tail).  tcp_free_conn → slab_free can issue a TLB
+// shootdown IPI that needs other CPUs to have IRQs enabled.
+void tcp_reap_pending(void) {
+    for (;;) {
+        tcp_conn_t* conn = NULL;
+        uint64_t flags;
+        spin_lock_irqsave(&tcp_pending_free_lock, &flags);
+        if (tcp_pending_free_count > 0) {
+            conn = tcp_pending_free[--tcp_pending_free_count];
+        }
+        spin_unlock_irqrestore(&tcp_pending_free_lock, flags);
+        if (!conn) break;
+        tcp_free_conn(conn);   // safe outside the pending-free lock
+    }
+}
+
 // Forward declarations needed by helpers defined before their original sites.
 static uint32_t ring_used(uint32_t head, uint32_t tail, uint32_t size);
 static uint32_t ring_free(uint32_t head, uint32_t tail, uint32_t size);
@@ -606,11 +665,35 @@ static uint64_t tcp_rto_ticks(tcp_conn_t* conn) {
     return ticks;
 }
 
-static tcp_conn_t* tcp_alloc_conn(void) {
+// Caller MUST hold tcp_lock.  Buffers MUST be pre-allocated by the caller
+// OUTSIDE tcp_lock and passed in via rx_buf / tx_buf — this function never
+// invokes the slab allocator.  This is non-negotiable: slab_alloc /
+// slab_free can trigger a TLB shootdown IPI that spins waiting for ACK
+// from every CPU; if any other CPU is spinning on tcp_lock with IRQs off
+// at that moment, it cannot service the IPI and the system hangs with
+// "TLB shootdown sync timeout".
+//
+// Returns a slot with active=0 still set; the caller is responsible for
+// filling in the 4-tuple (local_ip / local_port / remote_ip / remote_port)
+// and any state-specific fields, then calling tcp_publish_conn() to
+// atomically publish active=1 with a release barrier.  This split is
+// required because tcp_rx / tcp_find_conn / tcp_find_listener /
+// tcp_timer_tick walk the connection table WITHOUT taking tcp_lock, gating
+// every access on conn->active alone — if active=1 were set before the
+// 4-tuple was rewritten, another CPU could match the OLD 4-tuple of a
+// recycled slot and dispatch a packet to the wrong (about-to-be-rewritten)
+// connection.
+//
+// On allocation failure (table full) returns NULL; caller must slab_free
+// the buffers it pre-allocated.
+static tcp_conn_t* tcp_alloc_conn(uint8_t* rx_buf, uint8_t* tx_buf) {
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         if (!tcp_connections[i].active) {
             tcp_conn_t* conn = &tcp_connections[i];
-            conn->active = 1;
+            // Slot is currently active=0.  We hold tcp_lock so no other
+            // allocator can race us.  Initialise all per-conn state, but
+            // leave active=0 — caller publishes after 4-tuple is written.
+            conn->lock = (spinlock_t)SPINLOCK_INIT("tcp_conn");
             conn->state = TCP_STATE_CLOSED;
             conn->error = 0;
             conn->rx_ready = 0;
@@ -627,7 +710,6 @@ static tcp_conn_t* tcp_alloc_conn(void) {
             conn->peer_mss = TCP_MSS;
             conn->max_seg_size = TCP_MSS;
             conn->inflight_count = 0;
-            conn->lock = (spinlock_t)SPINLOCK_INIT("tcp_conn");
 
             // RFC 6298 initial RTO (no measurement yet)
             conn->srtt_us = 0;
@@ -672,15 +754,9 @@ static tcp_conn_t* tcp_alloc_conn(void) {
             conn->rcv_up = 0;
             conn->snd_urg_pending = 0;
 
-            // Allocate RX/TX buffers
-            conn->rx_buf = (uint8_t*)slab_alloc(TCP_RX_BUF_SIZE);
-            conn->tx_buf = (uint8_t*)slab_alloc(TCP_TX_BUF_SIZE);
-            if (!conn->rx_buf || !conn->tx_buf) {
-                if (conn->rx_buf) slab_free(conn->rx_buf);
-                if (conn->tx_buf) slab_free(conn->tx_buf);
-                conn->active = 0;
-                return NULL;
-            }
+            // Adopt pre-allocated RX/TX buffers (allocator was caller, OUTSIDE tcp_lock).
+            conn->rx_buf = rx_buf;
+            conn->tx_buf = tx_buf;
             conn->rx_buf_size = TCP_RX_BUF_SIZE;
             conn->tx_buf_size = TCP_TX_BUF_SIZE;
             conn->rx_head = 0;
@@ -688,10 +764,22 @@ static tcp_conn_t* tcp_alloc_conn(void) {
             conn->tx_head = 0;
             conn->tx_tail = 0;
 
+            // Caller will set 4-tuple, then call tcp_publish_conn(conn).
+            // Leave active=0 here.
             return conn;
         }
     }
     return NULL;
+}
+
+// Publish a freshly-allocated conn after the caller has written the
+// 4-tuple.  MUST be called with tcp_lock held (so the publish is ordered
+// w.r.t. tcp_alloc_conn / tcp_free_conn slot reuse).  The compiler barrier
+// prevents the optimiser from reordering the active=1 store before the
+// 4-tuple stores; on x86 store-store ordering is a hardware guarantee.
+static inline void tcp_publish_conn(tcp_conn_t* conn) {
+    __asm__ volatile("" ::: "memory");
+    conn->active = 1;
 }
 
 static void tcp_detach_listener_children(tcp_conn_t* listener) {
@@ -704,14 +792,62 @@ static void tcp_detach_listener_children(tcp_conn_t* listener) {
     }
 }
 
+// Release a connection slot back to the free pool.
+//
+// LOCKING: takes ONLY conn->lock.  Does NOT take tcp_lock — doing so
+// would extend a tcp_lock-held + IRQs-off section across the time we
+// spend waiting for conn->lock, and conn->lock can be held for many
+// milliseconds by tcp_send_data looping over segments doing device PIO.
+// During that window any third CPU initiating a TLB shootdown via the
+// slab allocator would time out, because every CPU spinning on tcp_lock
+// has IRQs disabled and cannot service the shootdown IPI.
+//
+// The slot-reuse race is still safe without tcp_lock here:
+//   - tcp_alloc_conn callers DO hold tcp_lock, so two simultaneous
+//     allocators cannot both claim the same slot.
+//   - We clear active=0 LAST under conn->lock, after NULLing rx_buf /
+//     tx_buf and zeroing the 4-tuple.  An allocator that subsequently
+//     sees active=0 (lock-free read inside tcp_lock) is therefore
+//     guaranteed to see the slot fully quiesced.
+//   - slab_free() is done OUTSIDE conn->lock to avoid a slab→conn
+//     lock-order inversion (slab_free itself takes a global slab lock
+//     and may trigger a TLB shootdown).
+//
+// Caller MUST NOT hold conn->lock.  Safe to call with or without
+// tcp_lock held.
 static void tcp_free_conn(tcp_conn_t* conn) {
-    if (conn->rx_buf) slab_free(conn->rx_buf);
-    if (conn->tx_buf) slab_free(conn->tx_buf);
+    uint64_t flags;
+    spin_lock_irqsave(&conn->lock, &flags);
+    // Idempotent: if already freed (active=0), do nothing.  Two CPUs may
+    // race to free the same slot (e.g. tcp_timer_tick TIME_WAIT expiry vs.
+    // tcp_connect's TIME_WAIT recycle); whichever loses the race finds
+    // active=0 and bails.
+    if (!conn->active) {
+        spin_unlock_irqrestore(&conn->lock, flags);
+        return;
+    }
+    void* old_rx = conn->rx_buf;
+    void* old_tx = conn->tx_buf;
     conn->rx_buf = NULL;
     conn->tx_buf = NULL;
     conn->parent = NULL;
-    conn->active = 0;
     conn->state = TCP_STATE_CLOSED;
+    // Zero the 4-tuple so a lock-free walker that races between our
+    // active=0 store and a future tcp_alloc_conn cannot match a stale tuple.
+    conn->local_ip = 0;
+    conn->local_port = 0;
+    conn->remote_ip = 0;
+    conn->remote_port = 0;
+    // Publish active=0 LAST under the lock so anyone re-checking active
+    // under conn->lock will see CLOSED + NULL buffers + zero tuple
+    // consistently.
+    __asm__ volatile("" ::: "memory");
+    conn->active = 0;
+    spin_unlock_irqrestore(&conn->lock, flags);
+
+    // slab_free OUTSIDE conn->lock — see comment above.
+    if (old_rx) slab_free(old_rx);
+    if (old_tx) slab_free(old_tx);
 }
 
 // Find connection by 4-tuple
@@ -792,22 +928,43 @@ static void tcp_send_rst(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
 tcp_conn_t* tcp_connect(net_device_t* dev, uint32_t local_ip, uint32_t dst_ip,
                         uint16_t src_port, uint16_t dst_port) {
     uint64_t flags;
-    spin_lock_irqsave(&tcp_lock, &flags);
 
-    // RFC 6191 / SO_REUSEADDR: recycle any TIME_WAIT slot for the same 4-tuple
+    // Drain any TIME_WAIT slots deferred by tcp_timer_tick — process
+    // context, slab_free is safe here.
+    tcp_reap_pending();
+
+    // Pre-allocate the new conn's RX/TX buffers BEFORE taking tcp_lock —
+    // slab_alloc may trigger a TLB shootdown IPI, which would deadlock if
+    // any other CPU were spinning on tcp_lock with IRQs off.
+    uint8_t* new_rx = (uint8_t*)slab_alloc(TCP_RX_BUF_SIZE);
+    uint8_t* new_tx = (uint8_t*)slab_alloc(TCP_TX_BUF_SIZE);
+    if (!new_rx || !new_tx) {
+        if (new_rx) slab_free(new_rx);
+        if (new_tx) slab_free(new_tx);
+        return NULL;
+    }
+
+    // RFC 6191 / SO_REUSEADDR: recycle any TIME_WAIT slot for the same
+    // 4-tuple.  Done WITHOUT tcp_lock — tcp_free_conn is idempotent and
+    // takes only conn->lock.  Doing this under tcp_lock would extend the
+    // tcp_lock critical section across slab_free (TLB-shootdown deadlock).
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         tcp_conn_t* tw = &tcp_connections[i];
+        // Lock-free pre-check; tcp_free_conn re-checks active under conn->lock.
         if (tw->active && tw->state == TCP_STATE_TIME_WAIT &&
             tw->local_port == src_port && tw->remote_port == dst_port &&
             tw->local_ip == local_ip && tw->remote_ip == dst_ip) {
-            tw->state = TCP_STATE_CLOSED;
             tcp_free_conn(tw);
         }
     }
 
-    tcp_conn_t* conn = tcp_alloc_conn();
+    spin_lock_irqsave(&tcp_lock, &flags);
+
+    tcp_conn_t* conn = tcp_alloc_conn(new_rx, new_tx);
     if (!conn) {
         spin_unlock_irqrestore(&tcp_lock, flags);
+        slab_free(new_rx);
+        slab_free(new_tx);
         return NULL;
     }
 
@@ -828,6 +985,8 @@ tcp_conn_t* tcp_connect(net_device_t* dev, uint32_t local_ip, uint32_t dst_ip,
     conn->retransmit_tick = timer_ticks() + TCP_SYN_RETRANSMIT_TICKS;
     conn->retransmit_count = 0;
 
+    // Publish: 4-tuple is set, now lock-free walkers may match this slot.
+    tcp_publish_conn(conn);
     spin_unlock_irqrestore(&tcp_lock, flags);
 
     // Send SYN
@@ -843,11 +1002,27 @@ tcp_conn_t* tcp_connect(net_device_t* dev, uint32_t local_ip, uint32_t dst_ip,
 tcp_conn_t* tcp_listen(net_device_t* dev, uint32_t local_ip,
                        uint16_t local_port, int backlog) {
     uint64_t flags;
+
+    // Drain deferred-free queue (process context — safe to slab_free).
+    tcp_reap_pending();
+
+    // Pre-allocate buffers BEFORE taking tcp_lock — slab_alloc may trigger
+    // a TLB shootdown IPI that would deadlock against tcp_lock holders.
+    uint8_t* new_rx = (uint8_t*)slab_alloc(TCP_RX_BUF_SIZE);
+    uint8_t* new_tx = (uint8_t*)slab_alloc(TCP_TX_BUF_SIZE);
+    if (!new_rx || !new_tx) {
+        if (new_rx) slab_free(new_rx);
+        if (new_tx) slab_free(new_tx);
+        return NULL;
+    }
+
     spin_lock_irqsave(&tcp_lock, &flags);
 
-    tcp_conn_t* conn = tcp_alloc_conn();
+    tcp_conn_t* conn = tcp_alloc_conn(new_rx, new_tx);
     if (!conn) {
         spin_unlock_irqrestore(&tcp_lock, flags);
+        slab_free(new_rx);
+        slab_free(new_tx);
         return NULL;
     }
 
@@ -860,6 +1035,8 @@ tcp_conn_t* tcp_listen(net_device_t* dev, uint32_t local_ip,
     conn->backlog = backlog > 16 ? 16 : backlog;
     conn->max_seg_size = tcp_local_mss(dev);
 
+    // Publish: 4-tuple is set, now lock-free walkers may match this slot.
+    tcp_publish_conn(conn);
     spin_unlock_irqrestore(&tcp_lock, flags);
     return conn;
 }
@@ -968,6 +1145,9 @@ int tcp_close(tcp_conn_t* conn) {
         break;
     }
 
+    // Opportunistic drain of slots deferred for free by tcp_timer_tick.
+    // We are in process context (a syscall) — slab_free is safe here.
+    tcp_reap_pending();
     return 0;
 }
 
@@ -976,11 +1156,10 @@ int tcp_close(tcp_conn_t* conn) {
 // ============================================================================
 int tcp_send_data(tcp_conn_t* conn, const uint8_t* data, uint16_t len) {
     if (!conn || conn->state != TCP_STATE_ESTABLISHED) return -1;
+    if (len == 0) return 0;
 
     uint64_t flags;
     spin_lock_irqsave(&conn->lock, &flags);
-
-    if (len == 0) return 0;
 
     uint16_t sent = 0;
     uint16_t seg_mss = tcp_effective_mss(conn);
@@ -1099,13 +1278,32 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                 return;
             }
 
-            // New connection on listening socket
+            // New connection on listening socket.
+            // Pre-allocate buffers BEFORE taking tcp_lock — slab_alloc may
+            // trigger a TLB shootdown IPI that would deadlock against
+            // tcp_lock holders.
+            uint8_t* nc_rx = (uint8_t*)slab_alloc(TCP_RX_BUF_SIZE);
+            uint8_t* nc_tx = (uint8_t*)slab_alloc(TCP_TX_BUF_SIZE);
+            if (!nc_rx || !nc_tx) {
+                if (nc_rx) slab_free(nc_rx);
+                if (nc_tx) slab_free(nc_tx);
+                // Fallback to SYN cookie
+                uint32_t cookie = tcp_syncookie_generate(
+                    src_ip, local_ip, src_port, dst_port, seq, TCP_MSS);
+                tcp_send_segment(dev, local_ip, src_ip, dst_port, src_port,
+                                 cookie, seq + 1,
+                                 TCP_SYN | TCP_ACK, TCP_WINDOW_SIZE, NULL, 0);
+                return;
+            }
+
             uint64_t flags;
             spin_lock_irqsave(&tcp_lock, &flags);
 
-            tcp_conn_t* new_conn = tcp_alloc_conn();
+            tcp_conn_t* new_conn = tcp_alloc_conn(nc_rx, nc_tx);
             if (!new_conn) {
                 spin_unlock_irqrestore(&tcp_lock, flags);
+                slab_free(nc_rx);
+                slab_free(nc_tx);
                 // Fallback to SYN cookie
                 uint32_t cookie = tcp_syncookie_generate(
                     src_ip, local_ip, src_port, dst_port, seq, TCP_MSS);
@@ -1148,6 +1346,8 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
             }
             if (pop.sack_perm) new_conn->sack_ok = 1;
 
+            // Publish: 4-tuple set, now lock-free walkers may match this slot.
+            tcp_publish_conn(new_conn);
             spin_unlock_irqrestore(&tcp_lock, flags);
 
             // Send SYN+ACK with mirrored options
@@ -1161,13 +1361,24 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
             uint16_t cookie_mss = 0;
             if (tcp_syncookie_validate(src_ip, local_ip, src_port, dst_port,
                                        cookie, &cookie_mss)) {
-                // Valid SYN cookie - create connection directly in ESTABLISHED state
+                // Valid SYN cookie - create connection directly in ESTABLISHED state.
+                // Pre-allocate buffers BEFORE taking tcp_lock (TLB-shootdown safety).
+                uint8_t* cc_rx = (uint8_t*)slab_alloc(TCP_RX_BUF_SIZE);
+                uint8_t* cc_tx = (uint8_t*)slab_alloc(TCP_TX_BUF_SIZE);
+                if (!cc_rx || !cc_tx) {
+                    if (cc_rx) slab_free(cc_rx);
+                    if (cc_tx) slab_free(cc_tx);
+                    return;
+                }
+
                 uint64_t flags;
                 spin_lock_irqsave(&tcp_lock, &flags);
 
-                tcp_conn_t* new_conn = tcp_alloc_conn();
+                tcp_conn_t* new_conn = tcp_alloc_conn(cc_rx, cc_tx);
                 if (!new_conn) {
                     spin_unlock_irqrestore(&tcp_lock, flags);
+                    slab_free(cc_rx);
+                    slab_free(cc_tx);
                     return;
                 }
 
@@ -1192,15 +1403,28 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                 new_conn->state = TCP_STATE_ESTABLISHED;
                 new_conn->parent = listener;
 
-                // Enqueue to listener accept queue
+                // Publish new_conn FIRST (4-tuple is set; lock-free walkers
+                // may now match it), THEN release tcp_lock, THEN take
+                // listener->lock for the accept_queue enqueue.  We do NOT
+                // hold tcp_lock and listener->lock simultaneously: doing so
+                // would extend the IRQ-off section across two lock
+                // acquisitions and contribute to TLB-shootdown timeouts
+                // when other CPUs are already contending listener->lock
+                // via tcp_accept().
+                tcp_publish_conn(new_conn);
+                spin_unlock_irqrestore(&tcp_lock, flags);
+
+                // Enqueue to listener accept queue under listener->lock so
+                // it serialises with tcp_accept (the reader).
+                uint64_t lflags;
+                spin_lock_irqsave(&listener->lock, &lflags);
                 int next_tail = (listener->accept_tail + 1) % 16;
                 if (next_tail != listener->accept_head) {
                     listener->accept_queue[listener->accept_tail] = new_conn;
                     listener->accept_tail = next_tail;
                     listener->accept_ready = 1;
                 }
-
-                spin_unlock_irqrestore(&tcp_lock, flags);
+                spin_unlock_irqrestore(&listener->lock, lflags);
                 return;
             }
         }
@@ -1219,6 +1443,21 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
 
     uint64_t flags;
     spin_lock_irqsave(&conn->lock, &flags);
+
+    // TOCTOU re-validate: tcp_find_conn() above ran lock-free, so between
+    // that lookup and acquiring conn->lock the slot may have been freed
+    // (active=0) or recycled with a different 4-tuple by tcp_alloc_conn on
+    // another CPU.  If anything no longer matches, drop the packet — the
+    // caller's payload pointer would otherwise be applied to the wrong
+    // connection (silent cross-stream corruption) or a freed buffer (UAF).
+    if (!conn->active ||
+        conn->local_port != dst_port ||
+        conn->remote_port != src_port ||
+        conn->remote_ip != src_ip ||
+        (conn->local_ip != local_ip && conn->local_ip != 0)) {
+        spin_unlock_irqrestore(&conn->lock, flags);
+        return;
+    }
 
     // Process by state
     switch (conn->state) {
@@ -1570,26 +1809,65 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
 // ============================================================================
 // TCP Timer (called from net_timer_tick, ~100Hz)
 // ============================================================================
+//
+// IMPORTANT: tcp_timer_tick runs from the per-CPU timer IRQ (vector 32).  At
+// 100Hz on every CPU, multiple instances can race with each other AND with
+// sock_send/sock_recv/tcp_rx running on other CPUs.  Every per-conn body
+// below mutates fields (inflight[], snd_nxt, rcv_nxt, cwnd, state, ...) that
+// are also touched by the data path under conn->lock; we MUST take the same
+// lock here or we corrupt the inflight array (torn struct copies during
+// tcp_drop_first_inflight while tcp_queue_inflight writes the next slot),
+// build retransmit packets from half-shifted segments (wrong bytes for a
+// given seq → mysterious payload mismatches on the receiver), and free
+// conn->rx_buf out from under a concurrent sock_recv.
 void tcp_timer_tick(void) {
     uint64_t now = timer_ticks();
 
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         tcp_conn_t* conn = &tcp_connections[i];
+        // Lock-free pre-check is safe: ->active is only set/cleared with the
+        // global tcp_lock held in alloc/free, and a stale read just causes
+        // us to skip an entry one tick early or pick it up one tick late.
         if (!conn->active) continue;
+
+        // CRITICAL: this function runs in IRQ context (100Hz timer vector)
+        // on EVERY CPU.  We MUST NOT spin waiting for conn->lock here:
+        // with 4 CPUs, three of them could be spin-waiting IRQ-off on the
+        // same conn->lock that a fourth CPU holds (e.g. inside
+        // tcp_send_data doing PIO).  If a fifth event (slab page release)
+        // initiates a TLB shootdown in that window, none of the spinning
+        // CPUs can ACK the IPI -> "TLB shootdown sync timeout".
+        //
+        // Use trylock and skip on contention -- the conn will be picked up
+        // on the next tick (10 ms later).  Timer work is best-effort by
+        // design; missing one tick has no correctness impact (RTO/keepalive
+        // deadlines are absolute, not deltas).
+        //
+        // We are already in IRQ context so IRQs are disabled by the CPU's
+        // IRQ delivery; no need for spin_lock_irqsave's flag save/restore.
+        if (!spin_trylock(&conn->lock)) continue;
+
+        // Re-check after acquiring the lock: another CPU may have freed it.
+        if (!conn->active) {
+            spin_unlock(&conn->lock);
+            continue;
+        }
+
+        int do_free = 0;
 
         // TIME_WAIT expiry
         if (conn->state == TCP_STATE_TIME_WAIT && now >= conn->time_wait_tick) {
             conn->state = TCP_STATE_CLOSED;
-            tcp_free_conn(conn);
-            continue;
+            do_free = 1;
+            goto unlock_conn;
         }
 
         // FIN_WAIT_2 timeout (RFC 1122 SHOULD discard after a while)
         if (conn->state == TCP_STATE_FIN_WAIT_2 &&
             conn->fin_wait_2_deadline && now >= conn->fin_wait_2_deadline) {
             conn->state = TCP_STATE_CLOSED;
-            tcp_free_conn(conn);
-            continue;
+            do_free = 1;
+            goto unlock_conn;
         }
 
         // Delayed ACK fire
@@ -1608,7 +1886,7 @@ void tcp_timer_tick(void) {
         if (conn->state == TCP_STATE_SYN_SENT && now >= conn->retransmit_tick) {
             if (conn->retransmit_count >= TCP_MAX_RETRANSMITS) {
                 tcp_fail_connection(conn, ETIMEDOUT);
-                continue;
+                goto unlock_conn;
             }
             // Retransmit SYN
             tcp_send_syn_packet(conn->dev, conn->local_ip, conn->remote_ip,
@@ -1625,7 +1903,7 @@ void tcp_timer_tick(void) {
             conn->inflight_count > 0 && now >= conn->retransmit_tick) {
             if (conn->retransmit_count >= TCP_MAX_RETRANSMITS) {
                 tcp_fail_connection(conn, ETIMEDOUT);
-                continue;
+                goto unlock_conn;
             }
 
             // RFC 6298: on RTO, ssthresh = max(flightsize/2, 2*MSS), cwnd = 1.
@@ -1678,7 +1956,7 @@ void tcp_timer_tick(void) {
             } else if (conn->keep_probes_sent > 0 && now >= conn->keep_next_tick) {
                 if (conn->keep_probes_sent >= conn->keepcnt) {
                     tcp_fail_connection(conn, ETIMEDOUT);
-                    continue;
+                    goto unlock_conn;
                 }
                 tcp_send_segment(conn->dev, conn->local_ip, conn->remote_ip,
                                  conn->local_port, conn->remote_port,
@@ -1687,6 +1965,18 @@ void tcp_timer_tick(void) {
                 conn->keep_probes_sent++;
                 conn->keep_next_tick = now + conn->keepintvl_ticks;
             }
+        }
+
+unlock_conn:
+        spin_unlock(&conn->lock);
+
+        // CANNOT call tcp_free_conn here: we are in IRQ context (IRQs off)
+        // on every CPU at 100Hz.  tcp_free_conn → slab_free → TLB
+        // shootdown IPI would deadlock against other CPUs simultaneously
+        // running their own timer-IRQ handler with IRQs disabled.  Defer
+        // to softirq/process context where IRQs are enabled.
+        if (do_free) {
+            tcp_defer_free(conn);
         }
     }
 }

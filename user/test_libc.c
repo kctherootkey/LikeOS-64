@@ -190,9 +190,10 @@ static void run_tcp_large_transfer_case(const char* prefix,
                 snprintf(label, sizeof(label), "%s: recv 4096 bytes", prefix);
                 test_result(label, recvd == sizeof(recvbuf));
 
+                int matches = (recvd == sizeof(recvbuf) &&
+                               memcmp(recvbuf, expectbuf, sizeof(recvbuf)) == 0);
                 snprintf(label, sizeof(label), "%s: payload matches", prefix);
-                test_result(label, recvd == sizeof(recvbuf) &&
-                                   memcmp(recvbuf, expectbuf, sizeof(recvbuf)) == 0);
+                test_result(label, matches);
                 close(conn_fd);
             }
 

@@ -481,12 +481,12 @@ void sched_init(void) {
     kprintf("Preemptive scheduler initialized (time slice=%d ticks)\n", SCHED_TIME_SLICE);
 }
 
-void sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack_size) {
-    if (!entry || !stack_mem || stack_size < 128) return;
+task_t* sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack_size) {
+    if (!entry || !stack_mem || stack_size < 128) return NULL;
 
     int is_idle = (entry == idle_entry);
     task_t* t = is_idle ? &g_idle_task : (task_t*)kalloc(sizeof(task_t));
-    if (!t) return;
+    if (!t) return NULL;
 
     // Set up kernel stack with return to task_trampoline
     uint64_t* sp = (uint64_t*)((uint8_t*)stack_mem + stack_size);
@@ -520,6 +520,7 @@ void sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack
         t->state = TASK_READY;
         sched_enqueue_ready(t);
     }
+    return t;
 }
 
 task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4,
