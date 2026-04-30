@@ -17,6 +17,27 @@
 static net_socket_t sockets[NET_MAX_SOCKETS];
 static spinlock_t socket_lock = SPINLOCK_INIT("socket");
 
+// IRQ-friendly blocking acquire of a TCP per-connection spinlock.
+// Mirrors tcp_lock_acquire() in tcp.c — between trylock attempts IRQs
+// are re-enabled so this CPU keeps ACKing TLB shootdown IPIs.  Avoids
+// the OS-wide multi-second freeze (`SMP: TLB shootdown sync timeout`)
+// that occurs when sock_recv spins IRQs-off on conn->lock while another
+// CPU's slab_free or sched_remove_task initiates a TLB shootdown.
+static inline void sock_conn_lock(spinlock_t* lock, uint64_t* flags_out) {
+    uint64_t f = local_irq_save();
+    while (!spin_trylock(lock)) {
+        local_irq_restore(f);
+        __asm__ volatile("pause" ::: "memory");
+        f = local_irq_save();
+    }
+    *flags_out = f;
+}
+
+static inline void sock_conn_unlock(spinlock_t* lock, uint64_t flags) {
+    spin_unlock(lock);
+    local_irq_restore(flags);
+}
+
 // Ephemeral port counter (49152-65535)
 static uint16_t next_ephemeral_port = 49152;
 
@@ -512,7 +533,7 @@ again:
 
         // Copy from rx buffer
         uint64_t cflags;
-        spin_lock_irqsave(&conn->lock, &cflags);
+        sock_conn_lock(&conn->lock, &cflags);
 
         uint32_t avail = (conn->rx_tail - conn->rx_head + conn->rx_buf_size) % conn->rx_buf_size;
         uint32_t copy = avail;
@@ -529,8 +550,9 @@ again:
                 conn->rx_ready = 0;
         }
 
-        spin_unlock_irqrestore(&conn->lock, cflags);
+        sock_conn_unlock(&conn->lock, cflags);
         total += copy;
+
         if (waitall && !peek && total < len &&
             conn->state == TCP_STATE_ESTABLISHED)
             goto again;
@@ -549,9 +571,6 @@ int sock_close(int sockfd) {
     net_socket_t* s = &sockets[sockfd];
     if (!s->active) return -EBADF;
 
-    uint64_t flags;
-    spin_lock_irqsave(&s->lock, &flags);
-
     // Drop one reference; only tear down on the final close.  The same socket
     // index is shared between parent and child after fork(), so a premature
     // teardown here would yank the listener out from under a peer that is
@@ -559,37 +578,57 @@ int sock_close(int sockfd) {
     // the inherited listener fd, parent's accept() loops forever on a freed
     // tcp_conn_t).  fork()/dup() bump ref_count without holding s->lock, so
     // the decrement must be atomic to race-correctly with them.
-    int old = __atomic_fetch_sub(&s->ref_count, 1, __ATOMIC_ACQ_REL);
-    if (old > 1) {
-        spin_unlock_irqrestore(&s->lock, flags);
+    int old = __atomic_sub_fetch(&s->ref_count, 1, __ATOMIC_ACQ_REL);
+    if (old > 0) {
         return 0;
     }
 
-    if (s->tcp) {
+    // We own the teardown path now (ref_count hit zero).  CRITICAL: do NOT
+    // hold s->lock across tcp_close/tcp_abort.  Those call tcp_send_segment
+    // (FIN packet, may queue+drain a softirq), tcp_free_conn → slab_free
+    // (initiates a TLB-shootdown IPI on freed buffer pages), and
+    // tcp_reap_pending (more slab_free).  Any of these can take many tens
+    // of microseconds.  spin_lock_irqsave(&s->lock) keeps IRQs disabled
+    // for that entire window, so this CPU cannot ACK TLB-shootdown IPIs
+    // sent by *other* CPUs (e.g. a sibling task's process-exit
+    // sched_remove_task → smp_tlb_shootdown_sync).  That is exactly the
+    // `SMP: TLB shootdown sync timeout (ack=N expect=N+1)` scenario,
+    // followed by an OS-wide multi-second freeze.
+    //
+    // Once ref_count is zero no other thread can re-enter sock_close on
+    // this slot, and fork()/dup() refuse to bump a zero ref_count.  TCP
+    // teardown takes its own conn->lock with the IRQ-friendly helper.
+    tcp_conn_t* tcp_to_teardown = s->tcp;
+    uint8_t  do_linger_block = 0;
+    uint16_t linger_secs     = 0;
+    if (tcp_to_teardown) {
         // SO_LINGER: l_onoff=1, l_linger=0 → abort with RST (RFC 1122 §4.2.2.13)
         if (s->linger_onoff && s->linger_seconds == 0) {
-            tcp_abort(s->tcp);
+            tcp_abort(tcp_to_teardown);
         } else if (s->linger_onoff && s->linger_seconds > 0) {
-            // Block until tx fully drained or linger timeout expires.
-            tcp_close(s->tcp);
-            uint64_t deadline = timer_ticks() + (uint64_t)s->linger_seconds * 100;
-            while (s->tcp && s->tcp->state != TCP_STATE_CLOSED &&
-                   s->tcp->state != TCP_STATE_TIME_WAIT &&
-                   timer_ticks() < deadline) {
-                spin_unlock_irqrestore(&s->lock, flags);
-                sched_yield_in_kernel();
-                spin_lock_irqsave(&s->lock, &flags);
-            }
+            do_linger_block = 1;
+            linger_secs = s->linger_seconds;
+            tcp_close(tcp_to_teardown);
         } else {
-            tcp_close(s->tcp);
+            tcp_close(tcp_to_teardown);
         }
-        s->tcp = NULL;
     }
 
-    s->closed = 1;
-    s->active = 0;
-    s->ref_count = 0;
+    if (do_linger_block && tcp_to_teardown) {
+        uint64_t deadline = timer_ticks() + (uint64_t)linger_secs * 100;
+        while (tcp_to_teardown->state != TCP_STATE_CLOSED &&
+               tcp_to_teardown->state != TCP_STATE_TIME_WAIT &&
+               timer_ticks() < deadline) {
+            sched_yield_in_kernel();
+        }
+    }
 
+    // Final state flip under s->lock (cheap — just stores).
+    uint64_t flags;
+    spin_lock_irqsave(&s->lock, &flags);
+    s->tcp     = NULL;
+    s->closed  = 1;
+    s->active  = 0;
     spin_unlock_irqrestore(&s->lock, flags);
     return 0;
 }

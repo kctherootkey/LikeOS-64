@@ -74,22 +74,32 @@ void softirq_drain(void) {
         return;
     }
 
-    // Only re-enable IRQs around handler execution if the CALLER had them
-    // enabled (i.e. we were invoked from task / kernel-thread context).
-    //
-    // When called from IRQ-tail (NIC IRQ -> softirq_drain), saved IF == 0.
-    // We MUST keep IRQs disabled in that case: enabling them would allow
-    // the 0xFE reschedule IPI's ipi_handler() to invoke sched_preempt()
-    // while we are still running on the per-CPU IRQ stack with a
-    // half-completed handler frame -- corrupting the IRQ stack and
-    // leaving the CPU in a state where it stops servicing subsequent
-    // IPIs (manifests as `TLB shootdown sync timeout (ack=N expect=N+1)`).
-    //
-    // Hard-IRQ-tail drains therefore run with IRQs disabled.  Any work
-    // they cannot finish quickly is left on the pending mask for the
-    // per-CPU ksoftirqd kernel thread, which DOES run in a preemptible
-    // context and will sti around handlers safely.
     int caller_had_irqs = (saved & (1ULL << 9)) != 0;
+
+    // CRITICAL: when invoked from hard-IRQ tail (caller_had_irqs == 0) we
+    // MUST NOT execute softirq handlers here.  Two failure modes:
+    //
+    //   1. Running handlers with IRQs enabled on the per-CPU IRQ stack
+    //      lets a 0xFE reschedule IPI invoke sched_preempt() with a
+    //      half-completed handler frame -- corrupts IRQ stack, CPU stops
+    //      servicing subsequent IPIs.
+    //
+    //   2. Running handlers with IRQs DISABLED holds the CPU off-IRQ for
+    //      potentially milliseconds (NET_RX softirq draining many TCP
+    //      segments, taking conn->lock, etc.).  During that window the
+    //      CPU cannot ACK TLB-shootdown IPIs from another CPU doing
+    //      slab_free() in process context -- manifests as `SMP: TLB
+    //      shootdown sync timeout (ack=N expect=N+1)` and a multi-second
+    //      OS-wide freeze.
+    //
+    // Solution: from IRQ tail, leave the pending bits set and just wake
+    // ksoftirqd on this CPU.  ksoftirqd runs in process context with
+    // IRQs enabled and is safely preemptible / yields when needed.
+    if (!caller_had_irqs) {
+        softirq_wake_local(cpu);
+        local_irq_restore_raw(saved);
+        return;
+    }
 
     softirq_in_progress[cpu] = 1;
 
@@ -98,18 +108,14 @@ void softirq_drain(void) {
                                             __ATOMIC_ACQ_REL);
         if (mask == 0) break;
 
-        if (caller_had_irqs) {
-            __asm__ volatile ("sti" ::: "memory");
-        }
+        __asm__ volatile ("sti" ::: "memory");
         for (uint32_t i = 0; i < NR_SOFTIRQ; i++) {
             if (mask & (1u << i)) {
                 softirq_fn_t h = softirq_handlers[i];
                 if (h) h();
             }
         }
-        if (caller_had_irqs) {
-            __asm__ volatile ("cli" ::: "memory");
-        }
+        __asm__ volatile ("cli" ::: "memory");
     }
 
     softirq_in_progress[cpu] = 0;

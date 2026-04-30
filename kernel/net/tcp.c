@@ -10,6 +10,38 @@
 tcp_conn_t tcp_connections[TCP_MAX_CONNECTIONS];
 static spinlock_t tcp_lock = SPINLOCK_INIT("tcp");
 
+// ---------------------------------------------------------------------------
+// IRQ-friendly blocking acquire of a per-connection spinlock.
+//
+// Plain spin_lock_irqsave() spins with IRQs disabled.  Under heavy SMP
+// contention (e.g. ksoftirqd on CPU 0 holding conn->lock to deliver a
+// burst of TCP segments while another CPU's user task tries to recv from
+// the same conn) the waiter can sit IRQs-off long enough to miss a TLB
+// shootdown IPI from a third CPU doing slab_free() — the symptom is
+// `SMP: TLB shootdown sync timeout (ack=N expect=N+1)` followed by an
+// OS-wide multi-second freeze.
+//
+// Mirrors the trylock-with-IRQ-window pattern in smp_tlb_shootdown_sync():
+// while the lock is contended, IRQs are enabled briefly between attempts
+// so this CPU can ACK any pending IPIs.  Once acquired, IRQs are disabled
+// (matching spin_lock_irqsave semantics).  Safe to use from any process
+// or softirq context — DO NOT use from hard-IRQ context, where you
+// must already be using spin_trylock-and-skip (see tcp_timer_tick).
+static inline void tcp_lock_acquire(spinlock_t* lock, uint64_t* flags_out) {
+    uint64_t f = local_irq_save();
+    while (!spin_trylock(lock)) {
+        local_irq_restore(f);
+        __asm__ volatile("pause" ::: "memory");
+        f = local_irq_save();
+    }
+    *flags_out = f;
+}
+
+static inline void tcp_lock_release(spinlock_t* lock, uint64_t flags) {
+    spin_unlock(lock);
+    local_irq_restore(flags);
+}
+
 // Deferred-free queue for tcp_timer_tick.
 //
 // tcp_timer_tick runs in IRQ context (100Hz timer vector) on EVERY CPU
@@ -817,13 +849,13 @@ static void tcp_detach_listener_children(tcp_conn_t* listener) {
 // tcp_lock held.
 static void tcp_free_conn(tcp_conn_t* conn) {
     uint64_t flags;
-    spin_lock_irqsave(&conn->lock, &flags);
+    tcp_lock_acquire(&conn->lock, &flags);
     // Idempotent: if already freed (active=0), do nothing.  Two CPUs may
     // race to free the same slot (e.g. tcp_timer_tick TIME_WAIT expiry vs.
     // tcp_connect's TIME_WAIT recycle); whichever loses the race finds
     // active=0 and bails.
     if (!conn->active) {
-        spin_unlock_irqrestore(&conn->lock, flags);
+        tcp_lock_release(&conn->lock, flags);
         return;
     }
     void* old_rx = conn->rx_buf;
@@ -843,7 +875,7 @@ static void tcp_free_conn(tcp_conn_t* conn) {
     // consistently.
     __asm__ volatile("" ::: "memory");
     conn->active = 0;
-    spin_unlock_irqrestore(&conn->lock, flags);
+    tcp_lock_release(&conn->lock, flags);
 
     // slab_free OUTSIDE conn->lock — see comment above.
     if (old_rx) slab_free(old_rx);
@@ -1048,7 +1080,7 @@ tcp_conn_t* tcp_accept(tcp_conn_t* listener) {
     if (!listener || listener->state != TCP_STATE_LISTEN) return NULL;
 
     uint64_t flags;
-    spin_lock_irqsave(&listener->lock, &flags);
+    tcp_lock_acquire(&listener->lock, &flags);
 
     if (listener->accept_head != listener->accept_tail) {
         tcp_conn_t* conn = listener->accept_queue[listener->accept_head];
@@ -1058,11 +1090,11 @@ tcp_conn_t* tcp_accept(tcp_conn_t* listener) {
         if (conn)
             conn->parent = NULL;
 
-        spin_unlock_irqrestore(&listener->lock, flags);
+        tcp_lock_release(&listener->lock, flags);
         return conn;
     }
 
-    spin_unlock_irqrestore(&listener->lock, flags);
+    tcp_lock_release(&listener->lock, flags);
 
     // Fallback: if a child connection reached an accept-ready state but was
     // not linked into the explicit accept queue, return it directly.
@@ -1093,7 +1125,7 @@ int tcp_close(tcp_conn_t* conn) {
     if (!conn) return -1;
 
     uint64_t flags;
-    spin_lock_irqsave(&conn->lock, &flags);
+    tcp_lock_acquire(&conn->lock, &flags);
 
     switch (conn->state) {
     case TCP_STATE_ESTABLISHED:
@@ -1107,7 +1139,7 @@ int tcp_close(tcp_conn_t* conn) {
             conn->snd_nxt++;
         }
         conn->state = TCP_STATE_FIN_WAIT_1;
-        spin_unlock_irqrestore(&conn->lock, flags);
+        tcp_lock_release(&conn->lock, flags);
         break;
 
     case TCP_STATE_CLOSE_WAIT:
@@ -1120,11 +1152,11 @@ int tcp_close(tcp_conn_t* conn) {
             conn->snd_nxt++;
         }
         conn->state = TCP_STATE_LAST_ACK;
-        spin_unlock_irqrestore(&conn->lock, flags);
+        tcp_lock_release(&conn->lock, flags);
         break;
 
     case TCP_STATE_LISTEN:
-        spin_unlock_irqrestore(&conn->lock, flags);
+        tcp_lock_release(&conn->lock, flags);
 
         spin_lock_irqsave(&tcp_lock, &flags);
         tcp_detach_listener_children(conn);
@@ -1136,12 +1168,12 @@ int tcp_close(tcp_conn_t* conn) {
 
     case TCP_STATE_SYN_SENT:
         conn->state = TCP_STATE_CLOSED;
-        spin_unlock_irqrestore(&conn->lock, flags);
+        tcp_lock_release(&conn->lock, flags);
         tcp_free_conn(conn);
         break;
 
     default:
-        spin_unlock_irqrestore(&conn->lock, flags);
+        tcp_lock_release(&conn->lock, flags);
         break;
     }
 
@@ -1159,7 +1191,7 @@ int tcp_send_data(tcp_conn_t* conn, const uint8_t* data, uint16_t len) {
     if (len == 0) return 0;
 
     uint64_t flags;
-    spin_lock_irqsave(&conn->lock, &flags);
+    tcp_lock_acquire(&conn->lock, &flags);
 
     uint16_t sent = 0;
     uint16_t seg_mss = tcp_effective_mss(conn);
@@ -1222,14 +1254,14 @@ int tcp_send_data(tcp_conn_t* conn, const uint8_t* data, uint16_t len) {
 
     if (sent == 0) {
         conn->tx_ready = 0;
-        spin_unlock_irqrestore(&conn->lock, flags);
+        tcp_lock_release(&conn->lock, flags);
         return 0;
     }
 
     conn->retransmit_tick = timer_ticks() + tcp_rto_ticks(conn);
     conn->retransmit_count = 0;
 
-    spin_unlock_irqrestore(&conn->lock, flags);
+    tcp_lock_release(&conn->lock, flags);
     return sent;
 }
 
@@ -1417,14 +1449,14 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                 // Enqueue to listener accept queue under listener->lock so
                 // it serialises with tcp_accept (the reader).
                 uint64_t lflags;
-                spin_lock_irqsave(&listener->lock, &lflags);
+                tcp_lock_acquire(&listener->lock, &lflags);
                 int next_tail = (listener->accept_tail + 1) % 16;
                 if (next_tail != listener->accept_head) {
                     listener->accept_queue[listener->accept_tail] = new_conn;
                     listener->accept_tail = next_tail;
                     listener->accept_ready = 1;
                 }
-                spin_unlock_irqrestore(&listener->lock, lflags);
+                tcp_lock_release(&listener->lock, lflags);
                 return;
             }
         }
@@ -1442,7 +1474,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
     }
 
     uint64_t flags;
-    spin_lock_irqsave(&conn->lock, &flags);
+    tcp_lock_acquire(&conn->lock, &flags);
 
     // TOCTOU re-validate: tcp_find_conn() above ran lock-free, so between
     // that lookup and acquiring conn->lock the slot may have been freed
@@ -1455,7 +1487,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
         conn->remote_port != src_port ||
         conn->remote_ip != src_ip ||
         (conn->local_ip != local_ip && conn->local_ip != 0)) {
-        spin_unlock_irqrestore(&conn->lock, flags);
+        tcp_lock_release(&conn->lock, flags);
         return;
     }
 
@@ -1535,7 +1567,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
         }
         if (tcp_flags & TCP_RST) {
             conn->state = TCP_STATE_CLOSED;
-            spin_unlock_irqrestore(&conn->lock, flags);
+            tcp_lock_release(&conn->lock, flags);
             tcp_free_conn(conn);
             return;
         }
@@ -1785,7 +1817,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
             conn->snd_una = ack;
             tcp_ack_inflight(conn, ack);
             conn->state = TCP_STATE_CLOSED;
-            spin_unlock_irqrestore(&conn->lock, flags);
+            tcp_lock_release(&conn->lock, flags);
             tcp_free_conn(conn);
             return;
         }
@@ -1803,7 +1835,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
         break;
     }
 
-    spin_unlock_irqrestore(&conn->lock, flags);
+    tcp_lock_release(&conn->lock, flags);
 }
 
 // ============================================================================
@@ -2023,7 +2055,7 @@ void tcp_fill_info(tcp_conn_t* conn, struct tcp_info* info) {
 int tcp_send_oob(tcp_conn_t* conn, uint8_t byte) {
     if (!conn || conn->state != TCP_STATE_ESTABLISHED) return -1;
     uint64_t flags;
-    spin_lock_irqsave(&conn->lock, &flags);
+    tcp_lock_acquire(&conn->lock, &flags);
 
     // Build TCP packet manually since urgent_ptr is in header
     uint8_t opts[TCP_MAX_OPTIONS];
@@ -2071,7 +2103,7 @@ int tcp_send_oob(tcp_conn_t* conn, uint8_t byte) {
         tcp_queue_inflight(conn, conn->snd_nxt - 1, TCP_ACK | TCP_URG | TCP_PSH,
                            &byte, 1);
     }
-    spin_unlock_irqrestore(&conn->lock, flags);
+    tcp_lock_release(&conn->lock, flags);
     return rv;
 }
 
@@ -2104,13 +2136,13 @@ void tcp_handle_pmtu(uint32_t local_ip, uint16_t local_port,
 void tcp_abort(tcp_conn_t* conn) {
     if (!conn) return;
     uint64_t flags;
-    spin_lock_irqsave(&conn->lock, &flags);
+    tcp_lock_acquire(&conn->lock, &flags);
     if (conn->state != TCP_STATE_CLOSED && conn->dev) {
         tcp_send_rst(conn->dev, conn->local_ip, conn->remote_ip,
                      conn->local_port, conn->remote_port,
                      conn->snd_nxt, conn->rcv_nxt);
     }
     conn->state = TCP_STATE_CLOSED;
-    spin_unlock_irqrestore(&conn->lock, flags);
+    tcp_lock_release(&conn->lock, flags);
     tcp_free_conn(conn);
 }
