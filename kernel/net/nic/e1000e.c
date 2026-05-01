@@ -2195,11 +2195,22 @@ static int e1000e_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
 
     if (len > E1000E_RX_BUF_SIZE) return -1;
 
+    // Serialize across CPUs: tx_tail, descriptor slot, and TDT MMIO
+    // write form one critical section; without this two CPUs can
+    // (a) read the same tx_tail, (b) write the same descriptor slot,
+    // and (c) lose one packet to the duplicate-tail-bump.  Hold IRQs
+    // disabled for the few MMIO cycles so an IRQ-tail TX (e.g. softirq
+    // sending a TCP ACK) cannot preempt user-context TX from the same
+    // CPU mid-slot.
+    uint64_t txflags;
+    spin_lock_irqsave(&dev->tx_lock, &txflags);
+
     uint16_t tail = dev->tx_tail;
     volatile e1000_tx_desc_legacy_t* desc = &dev->tx_descs[tail];
     if (tail != 0 || desc->cmd != 0) {
         if (!(desc->status & E1000_TXD_STAT_DD) && desc->cmd != 0) {
             ndev->tx_errors++;
+            spin_unlock_irqrestore(&dev->tx_lock, txflags);
             return -1;
         }
     }
@@ -2222,6 +2233,7 @@ static int e1000e_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
 
     ndev->tx_packets++;
     ndev->tx_bytes += len;
+    spin_unlock_irqrestore(&dev->tx_lock, txflags);
 
 #if E1000E_DBG
     // Diagnostic: after each of the first 8 transmits, snapshot the MAC
@@ -3042,6 +3054,7 @@ void e1000e_init(void) {
         // dispatch range and lock up the system in a level-triggered
         // IRQ storm (same problem we hit with the e1000 driver).
         dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("e1000e");
+        dev->tx_lock = (spinlock_t)SPINLOCK_INIT("e1000e_tx");
         dev->net_dev.rx_packets = 0;
         dev->net_dev.tx_packets = 0;
         dev->net_dev.rx_bytes = 0;

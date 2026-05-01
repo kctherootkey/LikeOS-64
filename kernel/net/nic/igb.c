@@ -249,12 +249,17 @@ static int igb_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     igb_dev_t* dev = (igb_dev_t*)ndev->driver_data;
     if (len > IGB_RX_BUF_SIZE) return -1;
 
+    // Serialize across CPUs: tx_tail, descriptor slot, TDT0 MMIO.
+    uint64_t txflags;
+    spin_lock_irqsave(&dev->tx_lock, &txflags);
+
     uint16_t tail = dev->tx_tail;
     volatile igb_tx_desc_t* desc = &dev->tx_descs[tail];
 
     if (tail != 0 || desc->cmd != 0) {
         if (!(desc->status & IGB_TXD_STAT_DD) && desc->cmd != 0) {
             ndev->tx_errors++;
+            spin_unlock_irqrestore(&dev->tx_lock, txflags);
             return -1;
         }
     }
@@ -277,6 +282,7 @@ static int igb_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
 
     ndev->tx_packets++;
     ndev->tx_bytes += len;
+    spin_unlock_irqrestore(&dev->tx_lock, txflags);
     return 0;
 }
 
@@ -544,6 +550,7 @@ void igb_init(void) {
 
         // Initialise net_device fields BEFORE enabling chip-side IRQs
         dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("igb");
+        dev->tx_lock = (spinlock_t)SPINLOCK_INIT("igb_tx");
         dev->net_dev.rx_packets = 0;
         dev->net_dev.tx_packets = 0;
         dev->net_dev.rx_bytes = 0;

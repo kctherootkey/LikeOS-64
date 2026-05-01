@@ -132,6 +132,7 @@ typedef struct {
     uint8_t*       tx_bufs[TULIP_NUM_TX_DESC];
     uint64_t       tx_bufs_phys[TULIP_NUM_TX_DESC];
     uint16_t       tx_cur;
+    spinlock_t     tx_lock;     // Serializes tulip_send() across CPUs
 
     uint8_t        mac_addr[ETH_ALEN];
     const pci_device_t* pci_dev;

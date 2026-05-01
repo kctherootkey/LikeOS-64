@@ -280,12 +280,17 @@ static int pcnet_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
 
     if (len > PCNET_TX_BUF_SIZE) return -1;
 
+    // Serialize across CPUs: tx_cur, descriptor slot, CSR0 RMW.
+    uint64_t txflags;
+    spin_lock_irqsave(&dev->tx_lock, &txflags);
+
     uint16_t slot = dev->tx_cur;
     volatile pcnet_tx_desc_t* desc = &dev->tx_descs[slot];
 
     if (desc->status & TXD_OWN) {
         // Hardware still owns it — TX ring is full
         ndev->tx_errors++;
+        spin_unlock_irqrestore(&dev->tx_lock, txflags);
         return -1;
     }
 
@@ -320,6 +325,7 @@ static int pcnet_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     dev->tx_cur = (slot + 1) % PCNET_NUM_TX_DESC;
     ndev->tx_packets++;
     ndev->tx_bytes += tx_len;
+    spin_unlock_irqrestore(&dev->tx_lock, txflags);
     return 0;
 }
 
@@ -589,6 +595,7 @@ void pcnet32_init(void) {
         // the dispatcher always sees a valid net_dev (same rationale as
         // the e1000 driver).
         dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("pcnet32");
+        dev->tx_lock = (spinlock_t)SPINLOCK_INIT("pcnet32_tx");
         dev->net_dev.rx_packets = 0;
         dev->net_dev.tx_packets = 0;
         dev->net_dev.rx_bytes = 0;

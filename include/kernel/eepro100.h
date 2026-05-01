@@ -155,6 +155,7 @@ typedef struct {
     uint64_t tx_blocks_phys;            // phys
     uint16_t tx_prod;                   // next slot to hand to HW
     uint16_t tx_cons;                   // next slot HW will complete
+    spinlock_t tx_lock;                 // Serializes eepro100_send() across CPUs
 
     // RX RFD ring (single contiguous DMA region)
     uint8_t* rx_blocks;

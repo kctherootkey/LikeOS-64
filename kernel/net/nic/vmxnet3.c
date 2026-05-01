@@ -342,6 +342,10 @@ static int vmxnet3_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     if (len > VMXNET3_TX_BUF_SIZE) return -1;
     uint16_t out_len = (len < 60) ? 60 : len;
 
+    // Serialize across CPUs: tx_prod/tx_gen, descriptor slot, TXPROD MMIO.
+    uint64_t txflags;
+    spin_lock_irqsave(&dev->tx_lock, &txflags);
+
     uint16_t slot = dev->tx_prod;
     vmxnet3_tx_desc_t* td = &dev->tx_ring[slot];
 
@@ -376,6 +380,7 @@ static int vmxnet3_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
 
     ndev->tx_packets++;
     ndev->tx_bytes += out_len;
+    spin_unlock_irqrestore(&dev->tx_lock, txflags);
     return 0;
 }
 
@@ -685,6 +690,7 @@ void vmxnet3_init(void) {
 
         // Initialise net_device fields BEFORE enabling device IRQs.
         dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("vmxnet3");
+        dev->tx_lock = (spinlock_t)SPINLOCK_INIT("vmxnet3_tx");
         dev->net_dev.rx_packets = 0;
         dev->net_dev.tx_packets = 0;
         dev->net_dev.rx_bytes = 0;

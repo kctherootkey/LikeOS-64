@@ -58,6 +58,7 @@ typedef struct {
     uint8_t* tx_bufs[E1000E_NUM_TX_DESC];
     uint64_t tx_bufs_phys[E1000E_NUM_TX_DESC];
     uint16_t tx_tail;
+    spinlock_t tx_lock;             // Serializes e1000e_send() across CPUs
 
     // Device info
     uint8_t mac_addr[ETH_ALEN];

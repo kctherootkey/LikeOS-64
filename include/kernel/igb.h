@@ -200,6 +200,7 @@ typedef struct {
     uint8_t* tx_bufs[IGB_NUM_TX_DESC];
     uint64_t tx_bufs_phys[IGB_NUM_TX_DESC];
     uint16_t tx_tail;
+    spinlock_t tx_lock;     // Serializes igb_send() across CPUs
 
     uint8_t mac_addr[ETH_ALEN];
     const pci_device_t* pci_dev;

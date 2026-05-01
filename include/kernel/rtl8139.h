@@ -139,6 +139,7 @@ typedef struct {
     uint8_t* tx_bufs[RTL8139_NUM_TX_DESC];
     uint64_t tx_bufs_phys[RTL8139_NUM_TX_DESC];
     uint8_t  tx_cur;        // Next descriptor to use (0..3)
+    spinlock_t tx_lock;     // Serializes rtl8139_send() across CPUs
 
     int link_up;
     uint8_t msi_vector;     // 0 if MSI not in use (RTL8139 has no MSI)

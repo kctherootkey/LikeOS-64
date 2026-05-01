@@ -359,6 +359,7 @@ typedef struct {
     uint8_t  tx_gen;        // generation we write into new TX descs
     uint16_t tx_comp_next;
     uint8_t  tx_comp_gen;   // generation we expect on TX completion
+    spinlock_t tx_lock;     // Serializes vmxnet3_send() across CPUs
     uint16_t rx_prod;
     uint8_t  rx_gen;
     uint16_t rx_comp_next;

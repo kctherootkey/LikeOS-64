@@ -340,6 +340,10 @@ static int eepro100_send(net_device_t* ndev, const uint8_t* data, uint16_t len) 
     if (len > EEPRO100_TX_BUF_SIZE) return -1;
     uint16_t out_len = (len < 60) ? 60 : len;
 
+    // Serialize across CPUs: tx_prod/tx_cons, CB ring, SCB doorbell.
+    uint64_t txflags;
+    spin_lock_irqsave(&d->tx_lock, &txflags);
+
     uint16_t slot = d->tx_prod;
     eepro100_cb_t* cb = e100_tx_cb(d, slot);
 
@@ -350,6 +354,7 @@ static int eepro100_send(net_device_t* ndev, const uint8_t* data, uint16_t len) 
             && cb->command != EEPRO100_CMD_NOP) {
             // Ring full — drop frame
             ndev->tx_errors++;
+            spin_unlock_irqrestore(&d->tx_lock, txflags);
             return -1;
         }
         if (!(e100_tx_cb(d, d->tx_cons)->status & EEPRO100_STATUS_C)
@@ -382,6 +387,7 @@ static int eepro100_send(net_device_t* ndev, const uint8_t* data, uint16_t len) 
     // CU_START with the new CB's address restarts execution from there.
     if (e100_wait_scb(d) < 0) {
         ndev->tx_errors++;
+        spin_unlock_irqrestore(&d->tx_lock, txflags);
         return -1;
     }
     e100_w32(d, EEPRO100_SCB_POINTER, (uint32_t)e100_tx_cb_phys(d, slot));
@@ -392,6 +398,7 @@ static int eepro100_send(net_device_t* ndev, const uint8_t* data, uint16_t len) 
     d->tx_prod = (slot + 1) % EEPRO100_NUM_TX_DESC;
     ndev->tx_packets++;
     ndev->tx_bytes += out_len;
+    spin_unlock_irqrestore(&d->tx_lock, txflags);
     return 0;
 }
 
@@ -770,6 +777,7 @@ void eepro100_init(void) {
         // Initialise net_device fields BEFORE enabling chip-side
         // interrupts (same rationale as e1000.c — see comment there).
         d->net_dev.lock = (spinlock_t)SPINLOCK_INIT("eepro100");
+        d->tx_lock = (spinlock_t)SPINLOCK_INIT("eepro100_tx");
         d->net_dev.rx_packets = 0;
         d->net_dev.tx_packets = 0;
         d->net_dev.rx_bytes   = 0;

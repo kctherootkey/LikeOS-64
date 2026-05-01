@@ -189,6 +189,7 @@ typedef struct {
     uint8_t* tx_bufs[PCNET_NUM_TX_DESC];
     uint64_t tx_bufs_phys[PCNET_NUM_TX_DESC];
     uint16_t tx_cur;
+    spinlock_t tx_lock;     // Serializes pcnet_send() across CPUs
 
     int link_up;
 

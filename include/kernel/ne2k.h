@@ -130,6 +130,7 @@ typedef struct {
     uint8_t  next_pkt;          // Software RX read pointer (page number)
     int      link_up;
     uint8_t  msi_vector;        // Always 0 — chip has no MSI
+    spinlock_t tx_lock;         // Serializes ne2k_send() across CPUs
 
     net_device_t net_dev;
 } ne2k_dev_t;

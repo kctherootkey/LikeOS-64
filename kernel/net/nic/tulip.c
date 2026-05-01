@@ -304,11 +304,16 @@ static int tulip_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     tulip_dev_t* dev = (tulip_dev_t*)ndev->driver_data;
     if (len > TULIP_TX_BUF_SIZE) return -1;
 
+    // Serialize across CPUs: tx_cur, descriptor slot, CSR1 poll-demand.
+    uint64_t txflags;
+    spin_lock_irqsave(&dev->tx_lock, &txflags);
+
     uint16_t slot = dev->tx_cur;
     volatile tulip_desc_t* desc = &dev->tx_descs[slot];
 
     if (desc->status & TULIP_TDES0_OWN) {
         ndev->tx_errors++;
+        spin_unlock_irqrestore(&dev->tx_lock, txflags);
         return -1;
     }
 
@@ -340,6 +345,7 @@ static int tulip_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     dev->tx_cur = (slot + 1) % TULIP_NUM_TX_DESC;
     ndev->tx_packets++;
     ndev->tx_bytes += len;
+    spin_unlock_irqrestore(&dev->tx_lock, txflags);
     return 0;
 }
 
@@ -594,6 +600,7 @@ void tulip_init(void) {
 
         // Init net_device fields BEFORE enabling chip-side IRQs
         dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("tulip");
+        dev->tx_lock = (spinlock_t)SPINLOCK_INIT("tulip_tx");
         dev->net_dev.rx_packets = 0;
         dev->net_dev.tx_packets = 0;
         dev->net_dev.rx_bytes = 0;

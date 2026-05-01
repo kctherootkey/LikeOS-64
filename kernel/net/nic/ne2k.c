@@ -182,6 +182,11 @@ static int ne2k_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     for (uint16_t i = 0; i < len; i++) buf[i] = data[i];
     for (uint16_t i = len; i < out_len; i++) buf[i] = 0;
 
+    // Serialize across CPUs: chip has a single TX buffer + CR doorbell;
+    // two concurrent senders would corrupt the in-flight frame.
+    uint64_t txflags;
+    spin_lock_irqsave(&dev->tx_lock, &txflags);
+
     // Wait until any prior transmit has finished (CR.TXP must be 0).
     for (int i = 0; i < 10000; i++) {
         if (!(ne_r8(dev, NE_CR) & NE_CR_TXP)) break;
@@ -201,6 +206,7 @@ static int ne2k_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
 
     ndev->tx_packets++;
     ndev->tx_bytes += out_len;
+    spin_unlock_irqrestore(&dev->tx_lock, txflags);
     return 0;
 }
 
@@ -520,6 +526,7 @@ void ne2k_init(void) {
 
         // Initialise net_device fields BEFORE enabling device IRQs.
         dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("ne2k");
+        dev->tx_lock = (spinlock_t)SPINLOCK_INIT("ne2k_tx");
         dev->net_dev.rx_packets = 0;
         dev->net_dev.tx_packets = 0;
         dev->net_dev.rx_bytes = 0;

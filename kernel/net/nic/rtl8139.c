@@ -187,6 +187,12 @@ static int rtl8139_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     rtl8139_dev_t* dev = (rtl8139_dev_t*)ndev->driver_data;
 
     if (len > RTL8139_TX_BUF_SIZE) return -1;
+
+    // Serialize across CPUs: tx_cur, the descriptor slot buffer, and the
+    // TSD MMIO write form one critical section.
+    uint64_t txflags;
+    spin_lock_irqsave(&dev->tx_lock, &txflags);
+
     if (len < 60) {
         // Hardware does not pad short frames in software descriptor mode.
         // We zero-pad to the 60-byte (sans-FCS) minimum here.
@@ -203,6 +209,7 @@ static int rtl8139_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     if (tsd != 0 && !(tsd & RTL_TSD_OWN)) {
         // Descriptor still busy — drop
         ndev->tx_errors++;
+        spin_unlock_irqrestore(&dev->tx_lock, txflags);
         return -1;
     }
 
@@ -222,6 +229,7 @@ static int rtl8139_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     dev->tx_cur = (slot + 1) % RTL8139_NUM_TX_DESC;
     ndev->tx_packets++;
     ndev->tx_bytes += tx_len;
+    spin_unlock_irqrestore(&dev->tx_lock, txflags);
     return 0;
 }
 
@@ -509,6 +517,7 @@ void rtl8139_init(void) {
         // dispatcher (which routes the legacy IRQ to us once the
         // initialised flag is set) always sees a valid net_dev.
         dev->net_dev.lock = (spinlock_t)SPINLOCK_INIT("rtl8139");
+        dev->tx_lock = (spinlock_t)SPINLOCK_INIT("rtl8139_tx");
         dev->net_dev.rx_packets = 0;
         dev->net_dev.tx_packets = 0;
         dev->net_dev.rx_bytes = 0;
