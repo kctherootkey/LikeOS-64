@@ -174,6 +174,7 @@ int sock_listen(int sockfd, int backlog) {
     uint64_t flags;
     spin_lock_irqsave(&s->lock, &flags);
     s->tcp = conn;
+    conn->owner_socket = s;
     s->listening = 1;
     spin_unlock_irqrestore(&s->lock, flags);
 
@@ -211,6 +212,7 @@ int sock_accept(int sockfd, struct sockaddr_in* addr, socklen_t* addrlen) {
 
     net_socket_t* ns = &sockets[newfd];
     ns->tcp = new_conn;
+    new_conn->owner_socket = ns;
     ns->connected = 1;
     ns->bound = 1;
     ns->local_addr.sin_family = AF_INET;
@@ -269,6 +271,7 @@ int sock_connect(int sockfd, const struct sockaddr_in* addr) {
     if (!conn) return -ENOMEM;
 
     s->tcp = conn;
+    conn->owner_socket = s;
 
     // Wait for connection to complete (blocking)
     uint64_t deadline = s->rcv_timeout_ticks ?
@@ -283,6 +286,7 @@ int sock_connect(int sockfd, const struct sockaddr_in* addr) {
 
     if (conn->error) {
         int err = conn->error;
+        conn->owner_socket = NULL;
         tcp_close(conn);
         s->tcp = NULL;
         return -err;
@@ -648,6 +652,13 @@ int sock_close(int sockfd) {
             linger_secs = s->linger_seconds;
         }
     }
+    // Clear the back-pointer FIRST so the timer reaper can reclaim this
+    // slot the moment it reaches CLOSED.  Safe to write here without
+    // conn->lock: we still hold s->lock so no parallel sock_close on the
+    // same fd is running, and tcp_alloc_conn / tcp_free_conn never touch
+    // owner_socket of an already-published live conn.  No one else writes
+    // it because the conn is owned by exactly one socket.
+    if (tcp_to_teardown) tcp_to_teardown->owner_socket = NULL;
     s->tcp     = NULL;
     s->closed  = 1;
     s->active  = 0;
@@ -688,7 +699,9 @@ int sock_shutdown(int sockfd, int how) {
     if (!s->active) return -EBADF;
 
     if (s->type == SOCK_STREAM && s->tcp) {
-        tcp_close(s->tcp);
+        tcp_conn_t* c = s->tcp;
+        c->owner_socket = NULL;
+        tcp_close(c);
         s->tcp = NULL;
         s->connected = 0;
         s->listening = 0;

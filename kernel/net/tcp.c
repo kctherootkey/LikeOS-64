@@ -743,6 +743,16 @@ static tcp_conn_t* tcp_alloc_conn(uint8_t* rx_buf, uint8_t* tx_buf) {
             conn->max_seg_size = TCP_MSS;
             conn->inflight_count = 0;
             conn->detached = 0;
+            // Self-pointer sentinel: "allocated, owned by tcp layer but
+            // not yet bound to a socket".  The socket layer overwrites
+            // with the real net_socket_t* at attach time (sock_listen,
+            // sock_accept, sock_connect).  sock_close sets it back to
+            // NULL.  Without this sentinel, a freshly accept()ed conn
+            // that gets a peer RST in the window between tcp_accept
+            // returning and sock_accept assigning owner_socket would be
+            // reaped by the 100Hz timer (state=CLOSED, owner_socket=NULL),
+            // leaving sock_accept with a dangling pointer.
+            conn->owner_socket = conn;
 
             // RFC 6298 initial RTO (no measurement yet)
             conn->srtt_us = 0;
@@ -2088,6 +2098,19 @@ void tcp_timer_tick(void) {
         // Safe: detached=1 means s->tcp was already cleared by sock_close
         // under s->lock, so no socket can dereference this slot.
         if (conn->detached && conn->state == TCP_STATE_CLOSED) {
+            do_free = 1;
+            goto unlock_conn;
+        }
+
+        // Back-pointer reaper: catches the orphan paths tcp_close() does
+        // NOT mark detached (ESTABLISHED→FIN_WAIT_1 / CLOSE_WAIT→LAST_ACK
+        // when the socket released its reference, then peer ACK or RST
+        // drove the conn to CLOSED).  sock_close clears owner_socket
+        // BEFORE nulling s->tcp, so owner_socket==NULL guarantees no
+        // socket holds this conn anymore.  We still gate on
+        // state==CLOSED so an in-flight tcp_rx / tcp_send_data on the
+        // same conn cannot be racing us.
+        if (!conn->owner_socket && conn->state == TCP_STATE_CLOSED) {
             do_free = 1;
             goto unlock_conn;
         }

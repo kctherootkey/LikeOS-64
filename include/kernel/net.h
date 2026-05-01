@@ -463,6 +463,24 @@ typedef struct tcp_conn {
     // permanently consume one of TCP_MAX_CONNECTIONS slots, eventually
     // starving incoming SYNs (silently dropped → accept() hang).
     uint8_t  detached;
+
+    // Back-pointer to the owning net_socket_t (typed as void* to avoid
+    // a forward-declaration cycle: net_socket_t embeds tcp_conn_t*).
+    // Lifecycle:
+    //   * tcp_alloc_conn sets it to a self-pointer sentinel (owner_socket
+    //     == conn) meaning "tcp layer owns this; not yet bound to a
+    //     socket".
+    //   * sock_listen / sock_accept / sock_connect overwrite with the
+    //     real net_socket_t* at attach time.
+    //   * sock_close clears to NULL BEFORE it nulls s->tcp.
+    // Only NULL means "no socket holds a reference".  Combined with
+    // state==CLOSED this lets the 100Hz timer reap orphans that reached
+    // CLOSED via a path tcp_close() did not mark detached
+    // (ESTABLISHED→FIN_WAIT_1→...→CLOSED while the socket was already
+    // gone, peer RST after sock_close, etc.).  The self-pointer sentinel
+    // closes the TOCTOU window between tcp_accept/connect returning and
+    // the socket layer assigning the real pointer.
+    void*    owner_socket;
 } tcp_conn_t;
 
 // ============================================================================
