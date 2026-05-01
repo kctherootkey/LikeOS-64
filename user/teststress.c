@@ -15,18 +15,35 @@ static unsigned int rand_simple(void) {
     return (seed >> 16) & 0x7FFF;
 }
 
-// Commands to run (use full paths since execve doesn't search PATH)
+// Commands to run (use full paths since execve doesn't search PATH).
+// Default mix — exercises libc/syscalls/memory.  testlibc is run WITHOUT
+// the "network" subtest here; network coverage is added in by the
+// network-mode list below (or appended to this list when teststress is
+// invoked without the "network" option, see main()).
 static const char* commands[] = {
     "/bin/ls",
-    "/testlibc",
-    "/tests",
-    "/testmem 400",
-    "/hello",
-    "/memstat",
+    "/usr/local/bin/testlibc",
+    "/usr/local/bin/tests",
+    "/usr/local/bin/testmem 250",
+    "/usr/local/bin/hello",
+    "/usr/local/bin/memstat",
     "/bin/cat /HELLO.TXT",
 };
 
 #define NUM_COMMANDS (sizeof(commands) / sizeof(commands[0]))
+
+// Network-only command set, used both as the entire mix in `teststress
+// network` and as an extension of the default mix in `teststress` (no arg).
+static const char* network_commands[] = {
+    "/usr/local/bin/testlibc network",
+    "/ping -c 3 www.google.com",
+    "/route",
+    "/netstat",
+    "/dig www.google.com",
+    "/host www.google.com",
+};
+
+#define NUM_NETWORK_COMMANDS (sizeof(network_commands) / sizeof(network_commands[0]))
 
 // Try to execute with path search
 static int try_exec(char* argv[]) {
@@ -81,13 +98,38 @@ static int parse_command(const char* cmd, char* argv[], int max_args) {
 }
 
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-    
+    // Two modes:
+    //   teststress              — default mix + every network command
+    //                             (testlibc is run WITHOUT "network").
+    //   teststress network      — only network commands, and testlibc is
+    //                             run WITH the "network" subtest.
+    int network_only = 0;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i] && argv[i][0] == 'n' && argv[i][1] == 'e' &&
+            argv[i][2] == 't' && argv[i][3] == 'w' && argv[i][4] == 'o' &&
+            argv[i][5] == 'r' && argv[i][6] == 'k' && argv[i][7] == '\0') {
+            network_only = 1;
+        }
+    }
+
+    // Build the active command pool.
+    const char* pool[NUM_COMMANDS + NUM_NETWORK_COMMANDS];
+    int pool_count = 0;
+    if (network_only) {
+        for (unsigned i = 0; i < NUM_NETWORK_COMMANDS; i++)
+            pool[pool_count++] = network_commands[i];
+    } else {
+        for (unsigned i = 0; i < NUM_COMMANDS; i++)
+            pool[pool_count++] = commands[i];
+        for (unsigned i = 0; i < NUM_NETWORK_COMMANDS; i++)
+            pool[pool_count++] = network_commands[i];
+    }
+
     int iteration = 0;
     time_t start_time = time(NULL);
     
     printf("=== STRESS TEST STARTED ===\n");
+    printf("Mode: %s\n", network_only ? "network only" : "default + network");
     printf("Running random commands for up to 10 minutes...\n");
     printf("Press Ctrl+C to stop early\n\n");
     
@@ -104,8 +146,8 @@ int main(int argc, char** argv) {
         }
         
         // Pick a random command
-        int cmd_idx = rand_simple() % NUM_COMMANDS;
-        const char* cmd = commands[cmd_idx];
+        int cmd_idx = rand_simple() % pool_count;
+        const char* cmd = pool[cmd_idx];
         
         iteration++;
         printf("[%d] Running: %s\n", iteration, cmd);

@@ -192,9 +192,34 @@ static int loopback_send(net_device_t* dev, const uint8_t* data, uint16_t len) {
 }
 
 // Compatibility shim for legacy callers (syscall.c, socket.c).  Loopback
-// delivery is now driven by the SOFTIRQ_NET_RX handler; just drain.
+// delivery is now driven by the SOFTIRQ_NET_RX handler.
+//
+// IMPORTANT: this is invoked from process context (typically a user task
+// inside sock_accept / sock_connect / sock_recvfrom polling for an
+// inbound packet).  Earlier versions of this function called
+// softirq_drain() inline, which on a process-context caller (IRQs
+// enabled) would synchronously run net_rx_softirq → ipv4_rx → tcp_rx →
+// tcp_send_segment → ipv4_send → loopback_send → ...  on the *user
+// task's* 16 KiB kernel stack — and then any hard IRQ (timer, e1000,
+// xhci completion) would nest on top.  Under fast virtualised USB
+// (qemu-usb) the polling loop iterated only a couple of times and that
+// nested chain stayed shallow; under real-USB latency (qemu-realusb)
+// the wait-loop ran for hundreds of iterations, accumulating many
+// queued loopback packets per drain, and a single timer / NIC IRQ
+// nesting on top of the deep tcp_rx chain blew through the 16 KiB
+// kernel stack — manifesting as RSP wrapping into low memory and the
+// next call landing at RIP=0x20 (or RBP=0x20 in spin_lock).
+//
+// Fix: do NOT process softirqs synchronously on the calling task's
+// stack.  Just ensure ksoftirqd on NET_RX_CPU is awake — it has its own
+// 16 KiB stack and runs in process context with bounded depth.  The
+// caller's wait-loop already does sched_yield_in_kernel() right after,
+// which lets ksoftirqd run.
 void loopback_process_pending(void) {
-    softirq_drain();
+    if (rx_queue_inited &&
+        __atomic_load_n(&rx_queue[NET_RX_CPU].len, __ATOMIC_ACQUIRE) != 0) {
+        softirq_raise_on(NET_RX_CPU, SOFTIRQ_NET_RX);
+    }
 }
 
 static int loopback_link_status(net_device_t* dev) {

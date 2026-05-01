@@ -814,6 +814,26 @@ static inline void tcp_publish_conn(tcp_conn_t* conn) {
     conn->active = 1;
 }
 
+// Reap any TIME_WAIT slots to recover capacity when the connection table
+// is exhausted.  Called WITHOUT tcp_lock — tcp_free_conn takes only
+// conn->lock and may invoke slab_free (which can fire a TLB-shootdown
+// IPI), so it must not be done under tcp_lock.  Returns the number of
+// slots freed; callers retry tcp_alloc_conn afterwards.  This bounds the
+// damage when many short-lived connections fill the table with TIME_WAIT
+// entries faster than the 60-second timer can expire them (e.g. repeated
+// loopback handshakes from teststress).
+static int tcp_reap_time_wait_slots(void) {
+    int reaped = 0;
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_conn_t* tw = &tcp_connections[i];
+        if (tw->active && tw->state == TCP_STATE_TIME_WAIT) {
+            tcp_free_conn(tw);
+            reaped++;
+        }
+    }
+    return reaped;
+}
+
 static void tcp_detach_listener_children(tcp_conn_t* listener) {
     if (!listener) return;
 
@@ -994,10 +1014,24 @@ tcp_conn_t* tcp_connect(net_device_t* dev, uint32_t local_ip, uint32_t dst_ip,
 
     tcp_conn_t* conn = tcp_alloc_conn(new_rx, new_tx);
     if (!conn) {
+        // Table full.  Drop the lock and reap *any* TIME_WAIT slot to
+        // recover capacity (RFC 6191 — a fresh SYN is allowed to evict
+        // an unrelated TIME_WAIT entry once normal capacity is exhausted).
+        // Without this, repeated short-lived loopback connections (e.g.
+        // teststress) can fill all 64 slots with TIME_WAIT entries from
+        // ephemeral source ports that the per-4-tuple recycle above
+        // cannot match — leaving subsequent connect()s to fail with
+        // -ENOMEM and starve the test's accept() peer.
         spin_unlock_irqrestore(&tcp_lock, flags);
-        slab_free(new_rx);
-        slab_free(new_tx);
-        return NULL;
+        tcp_reap_time_wait_slots();
+        spin_lock_irqsave(&tcp_lock, &flags);
+        conn = tcp_alloc_conn(new_rx, new_tx);
+        if (!conn) {
+            spin_unlock_irqrestore(&tcp_lock, flags);
+            slab_free(new_rx);
+            slab_free(new_tx);
+            return NULL;
+        }
     }
 
     conn->dev = dev;
@@ -1051,6 +1085,13 @@ tcp_conn_t* tcp_listen(net_device_t* dev, uint32_t local_ip,
     spin_lock_irqsave(&tcp_lock, &flags);
 
     tcp_conn_t* conn = tcp_alloc_conn(new_rx, new_tx);
+    if (!conn) {
+        // Table full — reap TIME_WAIT slots and retry (RFC 6191).
+        spin_unlock_irqrestore(&tcp_lock, flags);
+        tcp_reap_time_wait_slots();
+        spin_lock_irqsave(&tcp_lock, &flags);
+        conn = tcp_alloc_conn(new_rx, new_tx);
+    }
     if (!conn) {
         spin_unlock_irqrestore(&tcp_lock, flags);
         slab_free(new_rx);
@@ -1333,6 +1374,18 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
 
             tcp_conn_t* new_conn = tcp_alloc_conn(nc_rx, nc_tx);
             if (!new_conn) {
+                // Table full.  Reap TIME_WAIT slots (RFC 6191) before
+                // falling back to stateless SYN cookies — cookies disable
+                // TS/WSCALE/SACK option negotiation, so handshakes that
+                // succeed via cookies have degraded performance for the
+                // entire connection.  Reaping is done WITHOUT tcp_lock
+                // because tcp_free_conn may slab_free → TLB shootdown.
+                spin_unlock_irqrestore(&tcp_lock, flags);
+                tcp_reap_time_wait_slots();
+                spin_lock_irqsave(&tcp_lock, &flags);
+                new_conn = tcp_alloc_conn(nc_rx, nc_tx);
+            }
+            if (!new_conn) {
                 spin_unlock_irqrestore(&tcp_lock, flags);
                 slab_free(nc_rx);
                 slab_free(nc_tx);
@@ -1407,6 +1460,18 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                 spin_lock_irqsave(&tcp_lock, &flags);
 
                 tcp_conn_t* new_conn = tcp_alloc_conn(cc_rx, cc_tx);
+                if (!new_conn) {
+                    // Table full.  Reap TIME_WAIT slots and retry —
+                    // otherwise a valid SYN-cookie ACK is silently
+                    // dropped, the client's send() proceeds against a
+                    // half-open connection, and every data segment is
+                    // RST'd by the no-listener path below until the
+                    // client gives up.
+                    spin_unlock_irqrestore(&tcp_lock, flags);
+                    tcp_reap_time_wait_slots();
+                    spin_lock_irqsave(&tcp_lock, &flags);
+                    new_conn = tcp_alloc_conn(cc_rx, cc_tx);
+                }
                 if (!new_conn) {
                     spin_unlock_irqrestore(&tcp_lock, flags);
                     slab_free(cc_rx);

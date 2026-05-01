@@ -5,7 +5,8 @@ LIBC_DIR = ../userland/libc
 RTLD_DIR = ../userland/rtld
 
 CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fno-stack-protector \
-         -mno-red-zone -ffreestanding -fPIE -I$(LIBC_DIR)/include
+         -mno-red-zone -ffreestanding -fPIE -I$(LIBC_DIR)/include \
+         -fno-tree-vectorize -fno-strict-aliasing
 
 # Dynamic PIE linking against libc.so (includes pthread)
 LDFLAGS = -pie -nostdlib -T user_dyn.lds --hash-style=gnu \

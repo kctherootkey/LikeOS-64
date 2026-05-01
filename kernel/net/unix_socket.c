@@ -8,6 +8,19 @@
 // UNIX socket table
 static unix_socket_t unix_sockets[MAX_UNIX_SOCKETS];
 
+// Global table lock — serialises slot allocation, path lookup, and peer
+// linkage.  Without it, two concurrent socket(AF_UNIX,...) calls can both
+// observe the same inactive slot and race on memset/active=1, producing
+// two fds that alias the same unix_socket_t.  Subsequent close on either
+// fd then reuses the slot under the other task's feet, and a later
+// unix_send/recv dereferences a half-initialised struct (peer pointer
+// stale, lock state corrupt) — a classic UAF that surfaces as a kernel
+// `ret` to a small/garbage RIP after many iterations.
+//
+// Held only briefly across slot scans and pointer rewires; never held
+// across copy_from/to_user, slab_alloc, or busy-waits.
+static spinlock_t unix_table_lock = SPINLOCK_INIT("unix_table");
+
 // ============================================================================
 // String helpers
 // ============================================================================
@@ -34,18 +47,28 @@ unix_socket_t* unix_get(int usockfd) {
 
 // ============================================================================
 // unix_alloc - Allocate a new unix socket slot
+// Caller MUST hold unix_table_lock.  Marks the slot active=1 atomically with
+// the search so no second caller can claim the same index.
 // ============================================================================
-static int unix_alloc(void) {
+static int unix_alloc_locked(void) {
     for (int i = 0; i < MAX_UNIX_SOCKETS; i++) {
-        if (!unix_sockets[i].active) return i;
+        if (!unix_sockets[i].active) {
+            // Claim the slot before releasing the table lock.  active=1
+            // makes the slot opaque to other allocators and to
+            // unix_find_by_path (which also requires bound=1).
+            unix_sockets[i].active = 1;
+            return i;
+        }
     }
     return -1;
 }
 
 // ============================================================================
 // unix_find_by_path - Find a bound & listening socket by path
+// Caller MUST hold unix_table_lock so the returned pointer is stable
+// against concurrent close (which clears active/bound under the lock).
 // ============================================================================
-static unix_socket_t* unix_find_by_path(const char* path) {
+static unix_socket_t* unix_find_by_path_locked(const char* path) {
     for (int i = 0; i < MAX_UNIX_SOCKETS; i++) {
         if (!unix_sockets[i].active) continue;
         if (!unix_sockets[i].bound) continue;
@@ -61,11 +84,18 @@ static unix_socket_t* unix_find_by_path(const char* path) {
 int unix_create(int type) {
     if (type != SOCK_STREAM && type != SOCK_DGRAM) return -EINVAL;
 
-    int idx = unix_alloc();
-    if (idx < 0) return -ENOMEM;
+    uint64_t tflags;
+    spin_lock_irqsave(&unix_table_lock, &tflags);
+    int idx = unix_alloc_locked();
+    if (idx < 0) {
+        spin_unlock_irqrestore(&unix_table_lock, tflags);
+        return -ENOMEM;
+    }
 
     unix_socket_t* us = &unix_sockets[idx];
-    // Zero out the struct
+    // Zero out the struct, then re-establish active=1 (claimed by alloc).
+    // The zeroing is done while we still hold unix_table_lock so that no
+    // other allocator/finder can observe the half-zeroed state.
     uint8_t* p = (uint8_t*)us;
     for (int i = 0; i < (int)sizeof(unix_socket_t); i++) p[i] = 0;
 
@@ -74,6 +104,7 @@ int unix_create(int type) {
     us->ref_count = 1;
     spinlock_init(&us->lock, "unix_sock");
 
+    spin_unlock_irqrestore(&unix_table_lock, tflags);
     return MAKE_UNIX_SOCKET_FD(idx);
 }
 
@@ -86,15 +117,19 @@ int unix_bind(int usockfd, const struct sockaddr_un* addr) {
     if (us->bound) return -EINVAL;
     if (!addr || addr->sun_family != AF_UNIX) return -EINVAL;
 
-    // Check if path already in use
-    if (addr->sun_path[0] && unix_find_by_path(addr->sun_path))
+    // Path lookup + write of bound=1 must be atomic against other binds
+    // and against unix_close clearing bound — otherwise two binds can
+    // both see the path free and both succeed, producing duplicates that
+    // confuse subsequent unix_find_by_path callers.
+    uint64_t tflags;
+    spin_lock_irqsave(&unix_table_lock, &tflags);
+    if (addr->sun_path[0] && unix_find_by_path_locked(addr->sun_path)) {
+        spin_unlock_irqrestore(&unix_table_lock, tflags);
         return -EADDRINUSE;
-
-    uint64_t flags;
-    spin_lock_irqsave(&us->lock, &flags);
+    }
     uds_strcpy(us->path, addr->sun_path, UNIX_PATH_MAX);
     us->bound = 1;
-    spin_unlock_irqrestore(&us->lock, flags);
+    spin_unlock_irqrestore(&unix_table_lock, tflags);
 
     return 0;
 }
@@ -125,24 +160,47 @@ int unix_accept(int usockfd, struct sockaddr_un* addr, socklen_t* addrlen) {
     if (!us) return -EBADF;
     if (!us->listening) return -EINVAL;
 
-    // Wait for incoming connection
-    while (us->accept_head == us->accept_tail) {
+    // Wait for incoming connection.  Re-fetch the queue indices each
+    // iteration via volatile reads so the compiler can't hoist them out
+    // of the loop, and bail if the listener was closed under us.  We
+    // MUST yield rather than just pause: in the common case the task
+    // that will enqueue (a forked child running unix_connect) is on the
+    // same CPU as the listener, and a tight pause loop here will starve
+    // it forever — the test hangs with parent on accept and no child
+    // visible because the child never gets CPU.
+    for (;;) {
+        int h = *(volatile int*)&us->accept_head;
+        int t = *(volatile int*)&us->accept_tail;
+        if (h != t) break;
+        if (!*(volatile int*)&us->active) return -EBADF;
         if (us->nonblock) return -EAGAIN;
-        __asm__ volatile("pause");
-        if (!us->active) return -EBADF;
+        sched_yield_in_kernel();
     }
 
     uint64_t flags;
     spin_lock_irqsave(&us->lock, &flags);
-    unix_socket_t* client = us->accept_queue[us->accept_head];
-    us->accept_head = (us->accept_head + 1) % 16;
+    unix_socket_t* client = NULL;
+    if (us->accept_head != us->accept_tail) {
+        int h = us->accept_head;
+        if (h >= 0 && h < 16) {
+            client = us->accept_queue[h];
+            us->accept_queue[h] = NULL;
+            us->accept_head = (h + 1) % 16;
+        }
+    }
     spin_unlock_irqrestore(&us->lock, flags);
 
-    if (!client) return -EFAULT;
+    if (!client) return -EAGAIN;
 
-    // Allocate server-side socket
-    int new_idx = unix_alloc();
+    // Allocate server-side socket — must hold table lock across the slot
+    // scan + memset + active=1 publish so no concurrent unix_create can
+    // alias the same slot (the bug that caused random kernel UAF crashes
+    // after many teststress iterations).
+    uint64_t tflags;
+    spin_lock_irqsave(&unix_table_lock, &tflags);
+    int new_idx = unix_alloc_locked();
     if (new_idx < 0) {
+        spin_unlock_irqrestore(&unix_table_lock, tflags);
         client->error = ECONNREFUSED;
         client->connected = 0;
         return -ENOMEM;
@@ -158,10 +216,13 @@ int unix_accept(int usockfd, struct sockaddr_un* addr, socklen_t* addrlen) {
     server->parent = us;
     spinlock_init(&server->lock, "unix_sock");
 
-    // Link peers
+    // Link peers under the table lock so close cannot race with the
+    // bidirectional pointer write (close clears peer->peer = NULL also
+    // under unix_table_lock — see unix_close).
     server->peer = client;
     client->peer = server;
     client->connected = 1;
+    spin_unlock_irqrestore(&unix_table_lock, tflags);
 
     // Fill addr if requested
     if (addr && addrlen) {
@@ -182,8 +243,15 @@ int unix_connect(int usockfd, const struct sockaddr_un* addr) {
     if (us->connected) return -EISCONN;
     if (!addr || addr->sun_family != AF_UNIX) return -EINVAL;
 
-    unix_socket_t* listener = unix_find_by_path(addr->sun_path);
-    if (!listener || !listener->listening) return -ECONNREFUSED;
+    // Look up listener and enqueue under unix_table_lock so the listener
+    // cannot be closed (and its slot reused) between lookup and enqueue.
+    uint64_t tflags;
+    spin_lock_irqsave(&unix_table_lock, &tflags);
+    unix_socket_t* listener = unix_find_by_path_locked(addr->sun_path);
+    if (!listener || !listener->listening) {
+        spin_unlock_irqrestore(&unix_table_lock, tflags);
+        return -ECONNREFUSED;
+    }
 
     uint64_t flags;
     spin_lock_irqsave(&listener->lock, &flags);
@@ -192,6 +260,7 @@ int unix_connect(int usockfd, const struct sockaddr_un* addr) {
     int next = (listener->accept_tail + 1) % 16;
     if (next == listener->accept_head) {
         spin_unlock_irqrestore(&listener->lock, flags);
+        spin_unlock_irqrestore(&unix_table_lock, tflags);
         return -ECONNREFUSED;
     }
 
@@ -200,11 +269,16 @@ int unix_connect(int usockfd, const struct sockaddr_un* addr) {
     listener->accept_tail = next;
     listener->accept_ready = 1;
     spin_unlock_irqrestore(&listener->lock, flags);
+    spin_unlock_irqrestore(&unix_table_lock, tflags);
 
-    // Wait for acceptance (peer link to be set up)
-    while (!us->peer && !us->error) {
+    // Wait for acceptance (peer link to be set up).  Re-read peer/error
+    // each iteration via volatile so the compiler doesn't hoist.  Yield
+    // rather than pause so the listener task on another CPU (or this
+    // CPU) can actually run accept and link us.
+    while (!*(volatile void**)&us->peer && !*(volatile int*)&us->error) {
         if (us->nonblock) return -EINPROGRESS;
-        __asm__ volatile("pause");
+        if (!*(volatile int*)&us->active) return -EBADF;
+        sched_yield_in_kernel();
     }
 
     if (us->error) {
@@ -224,12 +298,25 @@ int unix_send(int usockfd, const void* buf, size_t len, int flags) {
     unix_socket_t* us = unix_get(usockfd);
     if (!us) return -EBADF;
 
+    // Snapshot peer pointer under unix_table_lock so it cannot be set
+    // to a freed-and-reused slot mid-deref.  Once we have a reference
+    // (peer->ref_count++), the slot cannot be freed under us even if
+    // unix_close clears us->peer afterwards.
+    uint64_t tflags;
+    spin_lock_irqsave(&unix_table_lock, &tflags);
     unix_socket_t* peer = us->peer;
-    if (!peer) {
+    if (!peer || !peer->active) {
+        spin_unlock_irqrestore(&unix_table_lock, tflags);
         if (us->type == SOCK_DGRAM) return -EDESTADDRREQ;
         return -ENOTCONN;
     }
-    if (peer->closed || peer->peer_closed) return -EPIPE;
+    __atomic_fetch_add(&peer->ref_count, 1, __ATOMIC_ACQ_REL);
+    spin_unlock_irqrestore(&unix_table_lock, tflags);
+
+    if (peer->closed || peer->peer_closed) {
+        __atomic_fetch_sub(&peer->ref_count, 1, __ATOMIC_ACQ_REL);
+        return -EPIPE;
+    }
 
     const uint8_t* src = (const uint8_t*)buf;
     int sent = 0;
@@ -243,11 +330,17 @@ int unix_send(int usockfd, const void* buf, size_t len, int flags) {
             // Buffer full
             if (sent > 0) break;
             spin_unlock_irqrestore(&peer->lock, irqflags);
-            if (us->nonblock) return -EAGAIN;
-            // Wait for space
+            if (us->nonblock) {
+                __atomic_fetch_sub(&peer->ref_count, 1, __ATOMIC_ACQ_REL);
+                return -EAGAIN;
+            }
+            // Wait for space — yield so the receiver gets CPU and drains.
             while ((peer->tail + 1) % (int)sizeof(peer->buf) == peer->head) {
-                if (peer->closed) return -EPIPE;
-                __asm__ volatile("pause");
+                if (peer->closed) {
+                    __atomic_fetch_sub(&peer->ref_count, 1, __ATOMIC_ACQ_REL);
+                    return -EPIPE;
+                }
+                sched_yield_in_kernel();
             }
             spin_lock_irqsave(&peer->lock, &irqflags);
             next = (peer->tail + 1) % (int)sizeof(peer->buf);
@@ -262,6 +355,11 @@ int unix_send(int usockfd, const void* buf, size_t len, int flags) {
     peer->ready = 1;
     spin_unlock_irqrestore(&peer->lock, irqflags);
 
+    // Drop the reference we took above.  If this was the last ref and
+    // peer was already closed, unix_close's deferred-free logic (or
+    // our own dec dropping ref to 0) will tear it down on next close.
+    __atomic_fetch_sub(&peer->ref_count, 1, __ATOMIC_ACQ_REL);
+
     return sent > 0 ? sent : -EAGAIN;
 }
 
@@ -275,14 +373,22 @@ int unix_recv(int usockfd, void* buf, size_t len, int flags) {
 
     uint8_t* dst = (uint8_t*)buf;
 
-    // Wait for data
-    while (us->head == us->tail) {
-        if (us->peer_closed || (us->peer && us->peer->closed))
-            return 0;  // EOF
-        if (!us->connected && us->type == SOCK_STREAM)
-            return -ENOTCONN;
+    // Wait for data.  Re-read indices and peer-state via volatile each
+    // iteration so the compiler can't hoist them out of the loop.  Also
+    // bail if our own slot is closed under us (e.g. dup'd fd in another
+    // task closed twice).
+    for (;;) {
+        int h = *(volatile int*)&us->head;
+        int t = *(volatile int*)&us->tail;
+        if (h != t) break;
+        if (!*(volatile int*)&us->active) return -EBADF;
+        if (*(volatile int*)&us->peer_closed) return 0;
+        volatile unix_socket_t* const* peer_slot = (volatile unix_socket_t* const*)&us->peer;
+        unix_socket_t* p = (unix_socket_t*)*peer_slot;
+        if (p && *(volatile int*)&p->closed) return 0;
+        if (!us->connected && us->type == SOCK_STREAM) return -ENOTCONN;
         if (us->nonblock) return -EAGAIN;
-        __asm__ volatile("pause");
+        sched_yield_in_kernel();
     }
 
     uint64_t irqflags;
@@ -311,23 +417,38 @@ int unix_close(int usockfd) {
     unix_socket_t* us = unix_get(usockfd);
     if (!us) return -EBADF;
 
-    uint64_t flags;
-    spin_lock_irqsave(&us->lock, &flags);
-
-    // fork()/dup() bump ref_count without holding us->lock — use atomic dec.
+    // fork()/dup() bump ref_count without holding any lock — use atomic
+    // dec.  Decrement with no lock first; if anyone else still holds a
+    // reference we just return.  If we are the last reference we tear
+    // down under unix_table_lock so concurrent unix_send/recv (which
+    // takes a ref under that lock) cannot deref a half-torn struct.
     int old = __atomic_fetch_sub(&us->ref_count, 1, __ATOMIC_ACQ_REL);
-    if (old > 1) {
-        spin_unlock_irqrestore(&us->lock, flags);
+    if (old > 1) return 0;
+
+    uint64_t tflags;
+    spin_lock_irqsave(&unix_table_lock, &tflags);
+
+    // If a unix_send between dec and lock acquire took a reference, it
+    // bumped ref_count back above 0.  Defer teardown to the caller that
+    // drops the last ref; we just return.
+    if (__atomic_load_n(&us->ref_count, __ATOMIC_ACQUIRE) > 0) {
+        spin_unlock_irqrestore(&unix_table_lock, tflags);
         return 0;
     }
 
+    uint64_t flags;
+    spin_lock_irqsave(&us->lock, &flags);
+
     us->closed = 1;
 
-    // Notify peer
-    if (us->peer) {
-        us->peer->peer_closed = 1;
-        us->peer->ready = 1;  // Wake up readers
-        us->peer->peer = NULL;
+    // Notify peer.  Both peer-link writes happen under unix_table_lock
+    // so a concurrent unix_send observing us->peer cannot capture the
+    // pointer just before peer is freed.
+    unix_socket_t* peer = us->peer;
+    if (peer) {
+        peer->peer_closed = 1;
+        peer->ready = 1;  // Wake up readers
+        peer->peer = NULL;
     }
 
     us->active = 0;
@@ -339,6 +460,7 @@ int unix_close(int usockfd) {
     us->tail = 0;
 
     spin_unlock_irqrestore(&us->lock, flags);
+    spin_unlock_irqrestore(&unix_table_lock, tflags);
     return 0;
 }
 
@@ -348,13 +470,21 @@ int unix_close(int usockfd) {
 int unix_socketpair(int type, int sv[2]) {
     if (type != SOCK_STREAM && type != SOCK_DGRAM) return -EINVAL;
 
-    int idx0 = unix_alloc();
-    if (idx0 < 0) return -ENOMEM;
-    unix_sockets[idx0].active = 1;  // Reserve
+    // Both slot allocations + memsets + active=1 publish must happen
+    // under unix_table_lock so no concurrent unix_create can alias the
+    // same slot.
+    uint64_t tflags;
+    spin_lock_irqsave(&unix_table_lock, &tflags);
+    int idx0 = unix_alloc_locked();
+    if (idx0 < 0) {
+        spin_unlock_irqrestore(&unix_table_lock, tflags);
+        return -ENOMEM;
+    }
 
-    int idx1 = unix_alloc();
+    int idx1 = unix_alloc_locked();
     if (idx1 < 0) {
         unix_sockets[idx0].active = 0;
+        spin_unlock_irqrestore(&unix_table_lock, tflags);
         return -ENOMEM;
     }
 
@@ -382,6 +512,7 @@ int unix_socketpair(int type, int sv[2]) {
     // Link peers
     s0->peer = s1;
     s1->peer = s0;
+    spin_unlock_irqrestore(&unix_table_lock, tflags);
 
     sv[0] = MAKE_UNIX_SOCKET_FD(idx0);
     sv[1] = MAKE_UNIX_SOCKET_FD(idx1);

@@ -1153,7 +1153,10 @@ NIC_DEVICE ?= e1000
 
 qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
 	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage + $(NIC_DEVICE) networking..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
+	@# sudo is required so SLIRP can open a raw ICMP socket on the host;
+	@# without it, external `ping` (e.g. ping 8.8.8.8) is silently dropped
+	@# while the synthetic gateway reply (10.0.2.2) still works.
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
 		-device usb-storage,drive=usbdisk $(QEMU_USB_HID) -machine type=pc,accel=kvm:tcg \
 		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
@@ -1166,7 +1169,8 @@ qemu-usb-gdb:
 	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" NO_STRIP=1 $(ISO_IMAGE) $(DATA_IMAGE)
 	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage + $(NIC_DEVICE) + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
+	@# sudo: see qemu-usb target above (SLIRP raw ICMP socket).
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
 		-device usb-storage,drive=usbdisk $(QEMU_USB_HID) -machine type=pc,accel=kvm:tcg \
 		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0 \
