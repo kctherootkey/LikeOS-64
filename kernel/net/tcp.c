@@ -5,6 +5,7 @@
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/random.h"
+#include "../../include/kernel/softirq.h"
 
 // TCP connection table
 tcp_conn_t tcp_connections[TCP_MAX_CONNECTIONS];
@@ -76,11 +77,22 @@ static void tcp_defer_free(tcp_conn_t* conn) {
         tcp_pending_free[tcp_pending_free_count++] = conn;
     }
     spin_unlock_irqrestore(&tcp_pending_free_lock, flags);
-    // NOTE: do NOT raise a softirq here.  This is called from hard-IRQ
-    // context (tcp_timer_tick).  The queue is drained opportunistically
-    // from process-context entrypoints (tcp_alloc_conn, tcp_close) where
-    // slab_free is safe.  Worst-case latency is bounded by socket churn;
-    // the queue itself is bounded by TCP_MAX_CONNECTIONS.
+    // Wake ksoftirqd to drain the queue in process context.  Without
+    // this, a workload that closes a burst of sockets and then idles
+    // (no further connect/listen/close to trigger an opportunistic
+    // drain) leaves freed-but-not-released slots on the queue forever
+    // — they appear in netstat as stuck CLOSED entries and eventually
+    // exhaust TCP_MAX_CONNECTIONS.  softirq_raise is IRQ-safe and only
+    // sets a per-CPU bit + wakes ksoftirqd if needed.
+    softirq_raise(SOFTIRQ_TIMER);
+}
+
+// Softirq handler bound to SOFTIRQ_TIMER (registered in tcp_init).
+// Runs in process / ksoftirqd context with IRQs enabled, so calling
+// tcp_free_conn → slab_free here is safe (TLB-shootdown IPIs can be
+// serviced).
+static void tcp_pending_softirq(void) {
+    tcp_reap_pending();
 }
 
 // Drain the deferred-free queue.  MUST be called only from process
@@ -649,6 +661,9 @@ void tcp_init(void) {
     // Generate ISN and SYN cookie secrets from CSPRNG
     random_get_bytes(tcp_isn_secret, sizeof(tcp_isn_secret), 0);
     random_get_bytes(tcp_syncookie_secret, sizeof(tcp_syncookie_secret), 0);
+    // Bind the deferred-free drain to a softirq vector so the timer
+    // can hand work off to ksoftirqd from hard-IRQ context.
+    softirq_register(SOFTIRQ_TIMER, tcp_pending_softirq);
 }
 
 // ============================================================================
