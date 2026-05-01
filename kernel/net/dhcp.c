@@ -460,7 +460,14 @@ void dhcp_tick(void) {
     if (!dhcp_bound_dev || dhcp_lease_seconds == 0) return;
 
     uint64_t now = timer_ticks();
-    uint64_t elapsed = (now - dhcp_lease_start_ticks) / 100;   // 100 Hz → s
+    // Timer frequency is TSC-calibrated at boot and is NOT necessarily
+    // 100 Hz (e.g. on VMware it lands elsewhere).  Hard-coding /100 here
+    // caused T1 (lease/2) to trip far earlier than wall-clock half-lease,
+    // making the client RENEW long before the lease was actually half-
+    // expired.  Use the real timer rate.
+    uint32_t hz = timer_get_frequency();
+    if (hz == 0) hz = 100;
+    uint64_t elapsed = (now - dhcp_lease_start_ticks) / hz;
 
     if (elapsed >= dhcp_lease_seconds) {
         // Lease expired — fall back to DISCOVER

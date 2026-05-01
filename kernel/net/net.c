@@ -91,7 +91,12 @@ void net_timer_tick(void) {
     tcp_timer_tick();
     static uint64_t dhcp_last = 0;
     uint64_t now = timer_ticks();
-    if (now - dhcp_last >= 100) {   // ~1 Hz at 100Hz timer
+    // Timer frequency is TSC-calibrated at boot and is NOT necessarily
+    // 100 Hz (e.g. on VMware it lands elsewhere).  Use the real rate so
+    // dhcp_tick() runs at ~1 Hz wall-time regardless of platform.
+    uint32_t hz = timer_get_frequency();
+    if (hz == 0) hz = 100;
+    if (now - dhcp_last >= hz) {
         dhcp_last = now;
         dhcp_tick();
     }
@@ -117,9 +122,30 @@ static int         rx_queue_inited = 0;
 // per-CPU queues, letting the protocol stack reassemble them out of order
 // and corrupt TCP byte streams).  CPU 0's ksoftirqd then sequentially
 // drives ipv4_rx / tcp_rx for the entire stack.
+// Hardware NIC RX is funnelled through rx_queue[NET_RX_CPU] (a single
+// CPU drains the queue, so per-conn segment ordering is preserved
+// without per-conn locks held across handler invocations).
 //
-// The per-CPU rx_queue array is kept in case we later add RPS-style
-// flow-hashed delivery, but for now only rx_queue[NET_RX_CPU] is used.
+// Loopback packets, however, are enqueued onto the *sending* CPU's own
+// rx_queue and drained by that CPU's ksoftirqd.  Two reasons:
+//
+//   1. Self-throttling: the loopback sender's CPU does the receive
+//      work, so a runaway sender on one CPU cannot DoS the others.
+//
+//   2. Wake reliability under hypervisors: pinning all loopback RX to
+//      ksoftirqd/NET_RX_CPU means a process-context caller on a
+//      different CPU must IPI CPU NET_RX_CPU and wait for *its* idle
+//      thread to be preempted out of HLT.  Under VMware the IPI
+//      latency was observed to stretch into multiple seconds when
+//      NET_RX_CPU was deeply idle, hanging accept() / connect() /
+//      recv() wait-loops in test_libc.  Draining on the local CPU
+//      (where the caller is about to sched_yield_in_kernel() anyway)
+//      makes wake-up immediate.
+//
+// Critically, EACH rx_queue is read by exactly ONE ksoftirqd (its own
+// CPU's), so this still preserves per-queue ordering — no two CPUs
+// race over the same rx_queue and a TCP connection's segments stay in
+// the order they were enqueued by their sender.
 #define NET_RX_CPU 0
 
 // Before percpu_init(), GS base is 0; this_cpu_id() would fault.  In that
@@ -133,7 +159,8 @@ static inline int skb_is_loopback(sk_buff_t* skb) {
 }
 
 static void net_rx_softirq(void) {
-    skb_queue_t* q = &rx_queue[NET_RX_CPU];
+    // Drain THIS CPU's queue only.  See the rx-queue commentary above.
+    skb_queue_t* q = &rx_queue[net_safe_cpu_id()];
     sk_buff_t* skb;
     while ((skb = skb_queue_head(q)) != NULL) {
         if (skb_is_loopback(skb)) {
@@ -161,6 +188,8 @@ void net_rx_packet(net_device_t* dev, const uint8_t* data, uint16_t len) {
     skb->dev = dev;
     uint8_t* p = skb_append(skb, len);
     for (uint16_t i = 0; i < len; i++) p[i] = data[i];
+    // Hardware NIC RX: funnel to NET_RX_CPU's queue/ksoftirqd so a
+    // single CPU processes all incoming wire packets in arrival order.
     skb_queue_tail(&rx_queue[NET_RX_CPU], skb);
     softirq_raise_on(NET_RX_CPU, SOFTIRQ_NET_RX);
 }
@@ -169,9 +198,10 @@ void net_rx_packet(net_device_t* dev, const uint8_t* data, uint16_t len) {
 static net_device_t lo_device;
 static int lo_initialized = 0;
 
-// Loopback transmit: enqueue an skb on the local CPU's RX queue and raise
-// SOFTIRQ_NET_RX.  The skb carries the raw IPv4 datagram (loopback has no
-// Ethernet header); the softirq handler routes loopback skbs to ipv4_rx.
+// Loopback transmit: enqueue an skb on the LOCAL CPU's RX queue and
+// raise SOFTIRQ_NET_RX locally.  See the rx-queue commentary at the
+// top of this file for why loopback uses per-CPU queues instead of
+// the single NET_RX_CPU queue used for hardware NIC RX.
 static int loopback_send(net_device_t* dev, const uint8_t* data, uint16_t len) {
     dev->tx_packets++;
     dev->tx_bytes += len;
@@ -186,39 +216,38 @@ static int loopback_send(net_device_t* dev, const uint8_t* data, uint16_t len) {
     skb->dev = dev;
     uint8_t* p = skb_append(skb, len);
     for (uint16_t i = 0; i < len; i++) p[i] = data[i];
-    skb_queue_tail(&rx_queue[NET_RX_CPU], skb);
-    softirq_raise_on(NET_RX_CPU, SOFTIRQ_NET_RX);
+    uint32_t my_cpu = net_safe_cpu_id();
+    skb_queue_tail(&rx_queue[my_cpu], skb);
+    softirq_raise_on(my_cpu, SOFTIRQ_NET_RX);
     return 0;
 }
 
 // Compatibility shim for legacy callers (syscall.c, socket.c).  Loopback
 // delivery is now driven by the SOFTIRQ_NET_RX handler.
 //
-// IMPORTANT: this is invoked from process context (typically a user task
-// inside sock_accept / sock_connect / sock_recvfrom polling for an
-// inbound packet).  Earlier versions of this function called
+// IMPORTANT: this is invoked from process context (typically a user
+// task inside sock_accept / sock_connect / sock_recvfrom polling for
+// an inbound packet).  Earlier versions of this function called
 // softirq_drain() inline, which on a process-context caller (IRQs
 // enabled) would synchronously run net_rx_softirq → ipv4_rx → tcp_rx →
 // tcp_send_segment → ipv4_send → loopback_send → ...  on the *user
 // task's* 16 KiB kernel stack — and then any hard IRQ (timer, e1000,
-// xhci completion) would nest on top.  Under fast virtualised USB
-// (qemu-usb) the polling loop iterated only a couple of times and that
-// nested chain stayed shallow; under real-USB latency (qemu-realusb)
-// the wait-loop ran for hundreds of iterations, accumulating many
-// queued loopback packets per drain, and a single timer / NIC IRQ
-// nesting on top of the deep tcp_rx chain blew through the 16 KiB
-// kernel stack — manifesting as RSP wrapping into low memory and the
-// next call landing at RIP=0x20 (or RBP=0x20 in spin_lock).
+// xhci completion) would nest on top, blowing the kernel stack under
+// real-USB latency (RSP wrapped to small constants like 0x20).
 //
 // Fix: do NOT process softirqs synchronously on the calling task's
-// stack.  Just ensure ksoftirqd on NET_RX_CPU is awake — it has its own
-// 16 KiB stack and runs in process context with bounded depth.  The
-// caller's wait-loop already does sched_yield_in_kernel() right after,
-// which lets ksoftirqd run.
+// stack.  Just raise NET_RX on the local CPU; ksoftirqd has its own
+// 16 KiB stack and the caller's wait-loop will sched_yield_in_kernel()
+// immediately after this returns, giving ksoftirqd a chance to run.
+//
+// We raise on the LOCAL CPU (not NET_RX_CPU) because loopback packets
+// are enqueued on per-CPU queues; the local CPU's ksoftirqd drains
+// the local queue.
 void loopback_process_pending(void) {
-    if (rx_queue_inited &&
-        __atomic_load_n(&rx_queue[NET_RX_CPU].len, __ATOMIC_ACQUIRE) != 0) {
-        softirq_raise_on(NET_RX_CPU, SOFTIRQ_NET_RX);
+    if (!rx_queue_inited) return;
+    uint32_t my_cpu = net_safe_cpu_id();
+    if (__atomic_load_n(&rx_queue[my_cpu].len, __ATOMIC_ACQUIRE) != 0) {
+        softirq_raise_on(my_cpu, SOFTIRQ_NET_RX);
     }
 }
 

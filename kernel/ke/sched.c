@@ -1695,7 +1695,7 @@ void sched_dump_tasks(void) {
     }
     spin_unlock_irqrestore(&g_task_list_lock, flags);
     kprintf("=======================================================================\n");
-    
+
     // Dump futex trace ring buffer for debugging missed wakeups
     // (only compiled in when FUTEX_TRACE_DEBUG is defined in futex.c)
     extern void futex_dump_trace(void);

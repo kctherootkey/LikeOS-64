@@ -742,6 +742,7 @@ static tcp_conn_t* tcp_alloc_conn(uint8_t* rx_buf, uint8_t* tx_buf) {
             conn->peer_mss = TCP_MSS;
             conn->max_seg_size = TCP_MSS;
             conn->inflight_count = 0;
+            conn->detached = 0;
 
             // RFC 6298 initial RTO (no measurement yet)
             conn->srtt_us = 0;
@@ -1137,22 +1138,46 @@ tcp_conn_t* tcp_accept(tcp_conn_t* listener) {
 
     tcp_lock_release(&listener->lock, flags);
 
-    // Fallback: if a child connection reached an accept-ready state but was
-    // not linked into the explicit accept queue, return it directly.
+    // Fallback: if a child connection reached an accept-ready state but
+    // was not linked into the explicit accept queue, return it directly.
+    //
+    // We accept two kinds of orphan match:
+    //   (a) conn->parent == listener — the normal stale-parent recovery.
+    //   (b) conn->parent == NULL with a 4-tuple that unambiguously
+    //       belongs to this listener (matching local_port; local_ip
+    //       matches exactly or listener is the wildcard 0.0.0.0).
+    //       This recovers conns whose parent pointer was cleared by the
+    //       SYN_RECEIVED→ESTABLISHED enqueue path after detecting that
+    //       the original parent slot had been reused for an unrelated
+    //       conn (see the validation in tcp_rx).  Without (b) such an
+    //       orphan would be invisible to accept() forever, hanging the
+    //       caller — observed sporadically under teststress network.
     uint64_t tcp_flags;
     spin_lock_irqsave(&tcp_lock, &tcp_flags);
 
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         tcp_conn_t* conn = &tcp_connections[i];
-        if (!conn->active || conn->parent != listener)
+        if (!conn->active)
+            continue;
+        if (conn->state != TCP_STATE_ESTABLISHED &&
+            conn->state != TCP_STATE_CLOSE_WAIT)
             continue;
 
-        if (conn->state == TCP_STATE_ESTABLISHED ||
-            conn->state == TCP_STATE_CLOSE_WAIT) {
-            conn->parent = NULL;
-            spin_unlock_irqrestore(&tcp_lock, tcp_flags);
-            return conn;
+        int matches = 0;
+        if (conn->parent == listener) {
+            matches = 1;
+        } else if (conn->parent == NULL &&
+                   conn->local_port == listener->local_port &&
+                   conn->remote_port != 0 &&
+                   (listener->local_ip == 0 ||
+                    conn->local_ip == listener->local_ip)) {
+            matches = 1;
         }
+        if (!matches) continue;
+
+        conn->parent = NULL;
+        spin_unlock_irqrestore(&tcp_lock, tcp_flags);
+        return conn;
     }
 
     spin_unlock_irqrestore(&tcp_lock, tcp_flags);
@@ -1213,7 +1238,27 @@ int tcp_close(tcp_conn_t* conn) {
         tcp_free_conn(conn);
         break;
 
+    case TCP_STATE_CLOSED:
+        // Connection already torn down by the protocol path (peer RST,
+        // retransmit timeout via tcp_fail_connection, etc.) but the
+        // slot is still active because tcp_fail_connection deliberately
+        // does NOT free — the owning socket may still query SO_ERROR.
+        // Now that the socket is releasing it, recover the slot.
+        // Without this, every RST'd / timed-out client connect leaks
+        // one slot until reboot, eventually exhausting
+        // TCP_MAX_CONNECTIONS and silently dropping further SYNs.
+        tcp_lock_release(&conn->lock, flags);
+        tcp_free_conn(conn);
+        break;
+
     default:
+        // Mark the conn as owner-detached so any later protocol-side
+        // transition to CLOSED (peer RST, retransmit timeout in
+        // tcp_fail_connection, FIN_WAIT_2 timeout, LAST_ACK→CLOSED)
+        // is reaped by tcp_timer_tick.  Otherwise an orphaned conn
+        // that RSTs after we already sent FIN would sit in CLOSED
+        // forever, leaking a slot.  Safe under conn->lock here.
+        conn->detached = 1;
         tcp_lock_release(&conn->lock, flags);
         break;
     }
@@ -1335,6 +1380,21 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
     // Find existing connection
     tcp_conn_t* conn = tcp_find_conn(local_ip, dst_port, src_ip, src_port);
 
+    // RFC 1122 §4.2.2.13: a fresh SYN whose 4-tuple matches an existing
+    // TIME_WAIT slot must be allowed to re-open the connection.  Without
+    // this, rapid ephemeral-port reuse under stress (teststress network
+    // loops) hits a leftover TIME_WAIT slot whose state-machine handler
+    // only re-ACKs FINs and silently drops the SYN — no SYN+ACK is sent,
+    // no SYN_RECEIVED conn is ever created, and the server's accept()
+    // hangs forever waiting for a peer that has already given up.  Free
+    // the TIME_WAIT slot here and fall through to the listener path so
+    // the SYN is processed as a brand-new connection.
+    if (conn && conn->state == TCP_STATE_TIME_WAIT &&
+        (tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK)) {
+        tcp_free_conn(conn);
+        conn = NULL;
+    }
+
     if (!conn) {
         // Check for listener
         tcp_conn_t* listener = tcp_find_listener(local_ip, dst_port);
@@ -1415,6 +1475,12 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
             new_conn->max_seg_size = new_conn->peer_mss;
             new_conn->state = TCP_STATE_SYN_RECEIVED;
             new_conn->parent = listener;
+            // Arm SYN+ACK retransmit deadline.  tcp_timer_tick now handles
+            // SYN_RECEIVED retransmit/timeout; without this, a lost client
+            // ACK leaves the slot wedged forever and hangs accept().
+            new_conn->retransmit_count = 0;
+            new_conn->retransmit_tick =
+                timer_ticks() + TCP_SYN_RETRANSMIT_TICKS;
 
             // RFC 7323/2018 — adopt peer-offered options
             if (pop.ts_present) {
@@ -1512,16 +1578,34 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                 spin_unlock_irqrestore(&tcp_lock, flags);
 
                 // Enqueue to listener accept queue under listener->lock so
-                // it serialises with tcp_accept (the reader).
+                // it serialises with tcp_accept (the reader).  Re-validate
+                // that the slot still hosts a LISTEN-state conn matching
+                // our 4-tuple expectations: between tcp_find_listener()
+                // (lock-free) above and acquiring listener->lock here, the
+                // listener may have been closed and the slot recycled as
+                // an unrelated conn (visible under stress when the table
+                // churns through TIME_WAIT reaping).  Writing into a
+                // non-listener's accept_queue silently corrupts that
+                // conn's state.  If validation fails, leave new_conn with
+                // parent=NULL so the orphan-recovery fallback in
+                // tcp_accept can still hand it to whichever LISTEN socket
+                // actually owns the local port.
                 uint64_t lflags;
                 tcp_lock_acquire(&listener->lock, &lflags);
-                int next_tail = (listener->accept_tail + 1) % 16;
-                if (next_tail != listener->accept_head) {
-                    listener->accept_queue[listener->accept_tail] = new_conn;
-                    listener->accept_tail = next_tail;
-                    listener->accept_ready = 1;
+                if (listener->active &&
+                    listener->state == TCP_STATE_LISTEN &&
+                    listener->local_port == new_conn->local_port) {
+                    int next_tail = (listener->accept_tail + 1) % 16;
+                    if (next_tail != listener->accept_head) {
+                        listener->accept_queue[listener->accept_tail] = new_conn;
+                        listener->accept_tail = next_tail;
+                        listener->accept_ready = 1;
+                    }
+                    tcp_lock_release(&listener->lock, lflags);
+                } else {
+                    tcp_lock_release(&listener->lock, lflags);
+                    new_conn->parent = NULL;
                 }
-                tcp_lock_release(&listener->lock, lflags);
                 return;
             }
         }
@@ -1598,11 +1682,30 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
             if (pop.wscale >= 0) { conn->ws_enabled = 1; conn->snd_wscale = (uint8_t)pop.wscale; }
             if (pop.sack_perm) conn->sack_ok = 1;
             conn->state = TCP_STATE_SYN_RECEIVED;
+            // Arm SYN+ACK retransmit deadline (simultaneous-open path).
+            conn->retransmit_count = 0;
+            conn->retransmit_tick =
+                timer_ticks() + TCP_SYN_RETRANSMIT_TICKS;
             tcp_send_synack_conn(conn, tcp_advertised_window(conn));
         }
         break;
 
     case TCP_STATE_SYN_RECEIVED:
+        // Duplicate SYN (no ACK) means our SYN+ACK was lost on the wire
+        // (skb_alloc failure under sustained pressure, NIC TX-ring overrun,
+        // or a real packet drop on a non-loopback path).  Without this
+        // resend, the peer keeps retransmitting SYN forever and we sit
+        // here ignoring it because nothing else in this state machine or
+        // in tcp_timer_tick retransmits the SYN+ACK for SYN_RECEIVED.
+        // The result is a wedged listener with an empty accept_queue and
+        // a child slot stuck below ESTABLISHED — observed as a sporadic
+        // accept() hang under teststress network loops.
+        if ((tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK) &&
+            seq == conn->irs) {
+            tcp_send_synack_conn(conn, tcp_advertised_window(conn));
+            tcp_lock_release(&conn->lock, flags);
+            return;
+        }
         if (tcp_flags & TCP_ACK) {
             if (ack == conn->snd_nxt) {
                 conn->snd_una = ack;
@@ -1614,19 +1717,42 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                 }
                 conn->max_seg_size = conn->peer_mss ? conn->peer_mss : TCP_MSS;
                 conn->state = TCP_STATE_ESTABLISHED;
+                // Disarm the SYN+ACK retransmit deadline armed at
+                // SYN_RECEIVED entry.  ESTABLISHED reuses retransmit_tick
+                // for inflight data RTO; leaving the SYN_RECEIVED deadline
+                // armed could trip the SYN+ACK retransmit branch on the
+                // very next timer tick before any data is in flight.
+                conn->retransmit_tick = 0;
+                conn->retransmit_count = 0;
 
-                // Enqueue in parent's accept queue
+                // Enqueue in parent's accept queue.  Re-validate under
+                // p->lock that p is still a LISTEN-state conn on the
+                // matching local port.  If the listener slot was freed
+                // and reused (stress-induced churn through TIME_WAIT
+                // reaping), p now points to an unrelated conn whose
+                // accept_queue/accept_tail/accept_ready fields are
+                // semantically meaningless and would be corrupted by
+                // the writes below.  Drop the stale link so the
+                // orphan-recovery fallback in tcp_accept can still pair
+                // this conn with the real listener by 4-tuple.
                 if (conn->parent) {
                     tcp_conn_t* p = conn->parent;
                     uint64_t pflags;
                     spin_lock_irqsave(&p->lock, &pflags);
-                    int next = (p->accept_tail + 1) % 16;
-                    if (next != p->accept_head) {
-                        p->accept_queue[p->accept_tail] = conn;
-                        p->accept_tail = next;
-                        p->accept_ready = 1;
+                    if (p->active &&
+                        p->state == TCP_STATE_LISTEN &&
+                        p->local_port == conn->local_port) {
+                        int next = (p->accept_tail + 1) % 16;
+                        if (next != p->accept_head) {
+                            p->accept_queue[p->accept_tail] = conn;
+                            p->accept_tail = next;
+                            p->accept_ready = 1;
+                        }
+                        spin_unlock_irqrestore(&p->lock, pflags);
+                    } else {
+                        spin_unlock_irqrestore(&p->lock, pflags);
+                        conn->parent = NULL;
                     }
-                    spin_unlock_irqrestore(&p->lock, pflags);
                 }
             }
         }
@@ -1952,6 +2078,20 @@ void tcp_timer_tick(void) {
 
         int do_free = 0;
 
+        // Orphan reaper: a conn whose owning socket has detached (sock_close
+        // ran tcp_close on it) and which has since reached state==CLOSED
+        // via a protocol path that doesn't free (peer RST in ESTABLISHED
+        // → tcp_fail_connection, retransmit-timeout-ETIMEDOUT,
+        // FIN_WAIT_2 timeout that races with this same tick on another
+        // CPU, etc.) has no owner left.  Without this reap the slot
+        // would sit in CLOSED forever, leaking one of TCP_MAX_CONNECTIONS.
+        // Safe: detached=1 means s->tcp was already cleared by sock_close
+        // under s->lock, so no socket can dereference this slot.
+        if (conn->detached && conn->state == TCP_STATE_CLOSED) {
+            do_free = 1;
+            goto unlock_conn;
+        }
+
         // TIME_WAIT expiry
         if (conn->state == TCP_STATE_TIME_WAIT && now >= conn->time_wait_tick) {
             conn->state = TCP_STATE_CLOSED;
@@ -1989,6 +2129,29 @@ void tcp_timer_tick(void) {
             tcp_send_syn_packet(conn->dev, conn->local_ip, conn->remote_ip,
                                 conn->local_port, conn->remote_port,
                                 conn->iss, 0, TCP_SYN, TCP_WINDOW_SIZE, conn);
+            conn->retransmit_count++;
+            conn->retransmit_tick = now + TCP_SYN_RETRANSMIT_TICKS;
+        }
+
+        // SYN+ACK retransmit for half-open server-side connections.  The
+        // SYN_RECEIVED state has no other timer in this stack, so a lost
+        // client ACK (NIC drop, slab pressure, scheduler-induced softirq
+        // starvation under teststress) would otherwise leave the slot
+        // wedged forever — the listener never sees it in its accept_queue
+        // (enqueue happens on transition to ESTABLISHED) and accept()
+        // hangs forever.  Resend the SYN+ACK up to TCP_MAX_RETRANSMITS,
+        // then drop the slot so a fresh handshake from the same peer can
+        // allocate a clean conn instead of finding the old SYN_RECEIVED
+        // and being silently dropped by tcp_find_conn (which excludes
+        // LISTEN but happily returns SYN_RECEIVED).
+        if (conn->state == TCP_STATE_SYN_RECEIVED &&
+            conn->retransmit_tick && now >= conn->retransmit_tick) {
+            if (conn->retransmit_count >= TCP_MAX_RETRANSMITS) {
+                conn->state = TCP_STATE_CLOSED;
+                do_free = 1;
+                goto unlock_conn;
+            }
+            tcp_send_synack_conn(conn, tcp_advertised_window(conn));
             conn->retransmit_count++;
             conn->retransmit_tick = now + TCP_SYN_RETRANSMIT_TICKS;
         }
@@ -2176,6 +2339,40 @@ int tcp_send_oob(tcp_conn_t* conn, uint8_t byte) {
 int tcp_at_mark(tcp_conn_t* conn) {
     if (!conn) return 0;
     return (conn->rcv_nxt == conn->rcv_up) ? 1 : 0;
+}
+
+// On-demand connection-table snapshot for the Ctrl+N debug dump.
+// Lock-free best-effort read — values may tear, but this is purely
+// diagnostic and never used for correctness.
+void tcp_dump_table(void) {
+    static const char* sn[] = {
+        "CLOSED","LISTEN","SYN_SNT","SYN_RCV","ESTAB",
+        "FIN_W1","FIN_W2","CLS_WT","CLOSING","LST_ACK","TM_WAIT"
+    };
+    kprintf("=== TCP table ===\n");
+    kprintf("slot st       laddr:lport            raddr:rport       parent  aq h/t r ar rt rcnt rnxt-snxt-suna\n");
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_conn_t* c = &tcp_connections[i];
+        if (!c->active) continue;
+        const char* s = (c->state <= TCP_STATE_TIME_WAIT) ? sn[c->state] : "???";
+        uint32_t li = c->local_ip, ri = c->remote_ip;
+        int parent_slot = -1;
+        if (c->parent) {
+            for (int j = 0; j < TCP_MAX_CONNECTIONS; j++)
+                if (c->parent == &tcp_connections[j]) { parent_slot = j; break; }
+        }
+        kprintf("%3d %-7s %u.%u.%u.%u:%u %u.%u.%u.%u:%u p=%d h=%u t=%u ar=%u rt=%llu rc=%u rnxt=%u snxt=%u suna=%u\n",
+                i, s,
+                (li>>24)&0xff,(li>>16)&0xff,(li>>8)&0xff,li&0xff, c->local_port,
+                (ri>>24)&0xff,(ri>>16)&0xff,(ri>>8)&0xff,ri&0xff, c->remote_port,
+                parent_slot,
+                (unsigned)c->accept_head, (unsigned)c->accept_tail,
+                (unsigned)c->accept_ready,
+                (unsigned long long)c->retransmit_tick,
+                (unsigned)c->retransmit_count,
+                c->rcv_nxt, c->snd_nxt, c->snd_una);
+    }
+    kprintf("=================\n");
 }
 
 // RFC 1191: clamp a connection's effective MSS when an ICMP frag-needed

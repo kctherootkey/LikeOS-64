@@ -316,6 +316,13 @@ void keyboard_irq_handler(void) {
         return;
     }
 
+    // Debug hotkey: Ctrl+N dumps the TCP connection table
+    if (kb_state.ctrl_pressed && !kb_state.alt_pressed && scan_code == 0x31) {  // 0x31 = 'n'
+        extern void tcp_dump_table(void);
+        tcp_dump_table();
+        return;
+    }
+
     // Numpad navigation keys (same scan codes as extended keys, but without E0 prefix).
     // QEMU and some hardware send these for PgUp/PgDn/Home/End/arrows/Ins/Del.
     // Handle them as navigation keys, generating ANSI escape sequences.

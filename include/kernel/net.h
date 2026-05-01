@@ -452,6 +452,17 @@ typedef struct tcp_conn {
     uint32_t snd_up;             // outgoing urgent pointer (seq of OOB)
     uint32_t rcv_up;             // most recent received urgent ptr (sequence)
     uint8_t  snd_urg_pending;    // we owe an URG segment
+
+    // Owner-detached marker.  Set by tcp_close() once the owning socket
+    // has released its reference (s->tcp = NULL).  After this point any
+    // protocol-side transition to TCP_STATE_CLOSED (peer RST,
+    // tcp_fail_connection from retransmit timeout, FIN_WAIT_2 timeout,
+    // LAST_ACK→CLOSED) means the slot has no owner left and may be
+    // reaped by tcp_timer_tick.  Without this, an orphaned conn that
+    // peer-RSTs after sock_close runs would sit in CLOSED forever and
+    // permanently consume one of TCP_MAX_CONNECTIONS slots, eventually
+    // starving incoming SYNs (silently dropped → accept() hang).
+    uint8_t  detached;
 } tcp_conn_t;
 
 // ============================================================================
@@ -821,6 +832,7 @@ int  tcp_send_segment(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                       uint8_t flags, uint16_t window,
                       const uint8_t* data, uint16_t data_len);
 void tcp_fill_info(tcp_conn_t* conn, struct tcp_info* info);
+void tcp_dump_table(void);
 
 // ============================================================================
 // DHCP API
