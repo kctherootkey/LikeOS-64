@@ -117,5 +117,6 @@ void smp_tlb_shootdown_ack(void);
 
 // Halt all other CPUs (for panic)
 void smp_halt_others(void);
+int  smp_others_halted(void);
 
 #endif // _KERNEL_SMP_H_

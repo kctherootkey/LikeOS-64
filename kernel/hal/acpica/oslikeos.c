@@ -28,6 +28,16 @@ extern void pci_cfg_write32(unsigned char bus, unsigned char dev,
 /* RSDP physical address — set by acpi_init() before ACPICA is started */
 static ACPI_PHYSICAL_ADDRESS g_acpica_rsdp_address;
 
+typedef struct acpi_os_mapping {
+    void* returned_addr;
+    uint64_t virt_base;
+    size_t num_pages;
+    struct acpi_os_mapping* next;
+} acpi_os_mapping_t;
+
+static spinlock_t g_acpi_os_map_lock = SPINLOCK_INIT("acpi_os_map");
+static acpi_os_mapping_t* g_acpi_os_mappings;
+
 void acpica_set_rsdp(uint64_t phys_addr)
 {
     g_acpica_rsdp_address = (ACPI_PHYSICAL_ADDRESS)phys_addr;
@@ -94,17 +104,81 @@ AcpiOsAllocateZeroed(ACPI_SIZE Size)
 void *
 AcpiOsMapMemory(ACPI_PHYSICAL_ADDRESS Where, ACPI_SIZE Length)
 {
-    /* LikeOS direct-maps physical memory below 16GB at PHYS_MAP_BASE.
-     * ACPI tables are always in low physical memory, so phys_to_virt works. */
-    return phys_to_virt((uint64_t)Where);
+    uint64_t phys = (uint64_t)Where;
+
+    if (Length == 0) {
+        return phys_to_virt(phys);
+    }
+
+    uint64_t last = phys + (uint64_t)Length - 1;
+    if (last >= phys && is_phys_in_direct_map(last)) {
+        return phys_to_virt(phys);
+    }
+
+    size_t num_pages = (size_t)(((phys & 0xFFFULL) + (uint64_t)Length + PAGE_SIZE - 1) / PAGE_SIZE);
+    uint64_t mapped = mm_map_device_mmio(phys, num_pages);
+    if (!mapped) {
+        return NULL;
+    }
+
+    acpi_os_mapping_t* mapping = kalloc(sizeof(*mapping));
+    if (!mapping) {
+        uint64_t virt_base = mapped & ~0xFFFULL;
+        for (size_t i = 0; i < num_pages; i++) {
+            mm_unmap_page(virt_base + i * PAGE_SIZE);
+        }
+        return NULL;
+    }
+
+    mapping->returned_addr = (void*)mapped;
+    mapping->virt_base = mapped & ~0xFFFULL;
+    mapping->num_pages = num_pages;
+
+    uint64_t flags;
+    spin_lock_irqsave(&g_acpi_os_map_lock, &flags);
+    mapping->next = g_acpi_os_mappings;
+    g_acpi_os_mappings = mapping;
+    spin_unlock_irqrestore(&g_acpi_os_map_lock, flags);
+
+    return (void*)mapped;
 }
 
 void
 AcpiOsUnmapMemory(void *Where, ACPI_SIZE Length)
 {
-    /* Direct-map: nothing to undo */
-    (void)Where;
     (void)Length;
+
+    if (!Where || is_direct_map_addr((uint64_t)Where)) {
+        return;
+    }
+
+    uint64_t flags;
+    acpi_os_mapping_t* prev = NULL;
+    acpi_os_mapping_t* mapping = NULL;
+
+    spin_lock_irqsave(&g_acpi_os_map_lock, &flags);
+    for (acpi_os_mapping_t* cur = g_acpi_os_mappings; cur; cur = cur->next) {
+        if (cur->returned_addr == Where) {
+            mapping = cur;
+            if (prev) {
+                prev->next = cur->next;
+            } else {
+                g_acpi_os_mappings = cur->next;
+            }
+            break;
+        }
+        prev = cur;
+    }
+    spin_unlock_irqrestore(&g_acpi_os_map_lock, flags);
+
+    if (!mapping) {
+        return;
+    }
+
+    for (size_t i = 0; i < mapping->num_pages; i++) {
+        mm_unmap_page(mapping->virt_base + i * PAGE_SIZE);
+    }
+    kfree(mapping);
 }
 
 ACPI_STATUS

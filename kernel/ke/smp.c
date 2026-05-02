@@ -443,7 +443,20 @@ void smp_tlb_shootdown_ack(void) {
     __atomic_add_fetch(&g_tlb_ack_count, 1, __ATOMIC_SEQ_CST);
 }
 
+// Set once the BSP has parked the other CPUs via smp_halt_others().
+// After this point, remote CPUs will never ACK IPIs again, so any further
+// TLB-shootdown sync would always time out.  We short-circuit it: a local
+// invlpg/CR3 reload by the caller is sufficient since the BSP is the only
+// CPU still executing.
+static volatile int g_smp_others_halted = 0;
+
+int smp_others_halted(void) {
+    return g_smp_others_halted;
+}
+
 void smp_tlb_shootdown_sync(void) {
+    if (g_smp_others_halted) return;
+
     uint32_t online = percpu_get_online_count();
     if (online <= 1) return;
 
@@ -506,4 +519,5 @@ void smp_tlb_shootdown_sync(void) {
 
 void smp_halt_others(void) {
     lapic_send_ipi_all_excl_self(IPI_HALT_VECTOR);
+    g_smp_others_halted = 1;
 }
