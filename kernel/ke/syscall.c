@@ -4289,7 +4289,17 @@ static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count) {
         p->nr_threads = t->group_leader ? t->group_leader->nr_threads : 1;
         p->on_cpu = t->on_cpu;
         p->exit_code = t->exit_code;
-        p->tty_nr = t->ctty ? t->ctty->id : 0;  // Use actual tty id
+        /* Encode tty_nr consistently with ps/top:
+         *   0        = no controlling terminal
+         *   1        = console (g_console_tty.id == 1, is_pty == 0)
+         *   2+       = pts/(tty_nr - 2)  (PTY slave id is 0-based, +2 avoids
+         *              collision with 0="none" and 1="console") */
+        if (!t->ctty)
+            p->tty_nr = 0;
+        else if (t->ctty->is_pty)
+            p->tty_nr = t->ctty->id + 2;
+        else
+            p->tty_nr = t->ctty->id;
         p->is_kernel = (t->privilege == TASK_KERNEL) ? 1 : 0;
         p->start_tick = t->start_tick;
         p->utime_ticks = t->utime_ticks;
