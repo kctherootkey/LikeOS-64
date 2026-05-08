@@ -16,6 +16,37 @@
 epoll_instance_t epoll_instances[MAX_EPOLL_INSTANCES];
 static spinlock_t epoll_lock = SPINLOCK_INIT("epoll");
 
+// Block the calling task until the next timer tick (or `deadline`, whichever
+// comes first).  Used by select/poll/epoll_wait between scan iterations to
+// avoid pegging a CPU at 100% while waiting on FDs that have no kernel-side
+// wake channel registration here.  Without this, tmux (which sits in
+// pselect/poll between every keystroke) keeps a vCPU busy-spinning, and on
+// hypervisors with multiple vCPUs the host CPU becomes overcommitted, making
+// the entire guest feel "very slow even on keystrokes".  10 ms granularity
+// is invisible for interactive workloads.
+static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
+                                       int have_deadline) {
+    task_t* cur = sched_current();
+    if (!cur) {
+        __asm__ volatile("pause");
+        return;
+    }
+    uint64_t now = timer_ticks();
+    uint64_t wake = now + 1;
+    if (have_deadline && deadline_ticks < wake) {
+        wake = deadline_ticks;
+    }
+    if (wake <= now) {
+        __asm__ volatile("pause");
+        return;
+    }
+    cur->wakeup_tick = wake;
+    cur->state = TASK_BLOCKED;
+    sched_schedule();
+    cur->wakeup_tick = 0;
+    if (cur->state != TASK_RUNNING) cur->state = TASK_RUNNING;
+}
+
 // ============================================================================
 // fd_poll_one - Poll a single fd for events (internal helper)
 // Returns revents mask. Works for sockets, pipes, regular files, console.
@@ -196,7 +227,7 @@ int sys_select_internal(int nfds, fd_set* readfds, fd_set* writefds,
             return 0;
         }
 
-        __asm__ volatile("pause");
+        poll_sleep_until_next_tick(deadline, timeout_ticks != (uint64_t)-1);
     }
 }
 
@@ -231,7 +262,7 @@ int sys_poll_internal(struct pollfd* fds, int nfds, uint64_t timeout_ticks) {
         if (timeout_ticks != (uint64_t)-1 && timer_ticks() >= deadline)
             return 0;
 
-        __asm__ volatile("pause");
+        poll_sleep_until_next_tick(deadline, timeout_ticks != (uint64_t)-1);
     }
 }
 
@@ -396,6 +427,6 @@ int epoll_wait_internal(int epfd_idx, struct epoll_event* events,
         if (timeout_ticks != (uint64_t)-1 && timer_ticks() >= deadline)
             return 0;
 
-        __asm__ volatile("pause");
+        poll_sleep_until_next_tick(deadline, timeout_ticks != (uint64_t)-1);
     }
 }
