@@ -70,6 +70,7 @@
 #define OPEN_MAX    256
 #define ARG_MAX     131072
 #define NGROUPS_MAX 32
+#define IOV_MAX     1024
 #define _POSIX_PATH_MAX  256
 #define _POSIX_NAME_MAX  14
 

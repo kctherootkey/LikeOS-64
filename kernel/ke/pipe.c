@@ -7,6 +7,11 @@ bool pipe_is_end(const void* ptr) {
     if (!ptr) {
         return false;
     }
+    /* Reject small marker values stashed in the fd table (e.g. KEYBOARD_FD=1,
+     * TTY_FD=2, etc.) and any non-canonical kernel pointer. */
+    uintptr_t v = (uintptr_t)ptr;
+    if (v < 0x1000) return false;
+    if (v < 0xffffffff80000000ULL && v > 0x00007fffffffffffULL) return false;
     const pipe_end_t* end = (const pipe_end_t*)ptr;
     return end->magic == PIPE_MAGIC;
 }

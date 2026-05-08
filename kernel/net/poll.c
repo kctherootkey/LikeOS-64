@@ -7,6 +7,8 @@
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/pipe.h"
 #include "../../include/kernel/vfs.h"
+#include "../../include/kernel/tty.h"
+#include "../../include/kernel/devfs.h"
 
 // ============================================================================
 // Epoll instance table
@@ -23,14 +25,17 @@ static short fd_poll_one(int fd, short events) {
     if (!cur) return POLLNVAL;
     if (fd < 0) return POLLNVAL;
 
-    // Check if it's a console fd (0-2 with NULL entry)
+    // Check if it's a console fd (0-2 with NULL entry).
+    // /dev/console is bidirectional, so any of fd 0/1/2 may be polled
+    // for both POLLIN and POLLOUT (matches real-tty semantics).
     if (fd < 3) {
         short rev = 0;
-        // stdin is readable if keyboard has data (optimistic: always readable)
-        if (fd == STDIN_FD && (events & (POLLIN | POLLRDNORM)))
-            rev |= POLLIN | POLLRDNORM;
-        // stdout/stderr are always writable
-        if ((fd == STDOUT_FD || fd == STDERR_FD) && (events & (POLLOUT | POLLWRNORM)))
+        if (events & (POLLIN | POLLRDNORM)) {
+            tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
+            if (tty && tty->read_count > 0)
+                rev |= POLLIN | POLLRDNORM;
+        }
+        if (events & (POLLOUT | POLLWRNORM))
             rev |= POLLOUT | POLLWRNORM;
         return rev;
     }
@@ -56,13 +61,17 @@ static short fd_poll_one(int fd, short events) {
         return POLLNVAL;
     }
 
-    // Console dup markers (1, 2, 3)
+    // Console dup markers (1, 2, 3) — all reference the bidirectional
+    // /dev/console device, so each is both readable and writable.
     uintptr_t marker = (uintptr_t)entry;
     if (marker >= 1 && marker <= 3) {
         short rev = 0;
-        if (marker == 1 && (events & (POLLIN | POLLRDNORM)))
-            rev |= POLLIN | POLLRDNORM;
-        if ((marker == 2 || marker == 3) && (events & (POLLOUT | POLLWRNORM)))
+        if (events & (POLLIN | POLLRDNORM)) {
+            tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
+            if (tty && tty->read_count > 0)
+                rev |= POLLIN | POLLRDNORM;
+        }
+        if (events & (POLLOUT | POLLWRNORM))
             rev |= POLLOUT | POLLWRNORM;
         return rev;
     }
@@ -84,6 +93,27 @@ static short fd_poll_one(int fd, short events) {
                 rev |= POLLERR;
         }
         return rev;
+    }
+
+    // Pty master (opened via /dev/ptmx): readable when slave wrote bytes,
+    // writable when slave is open, HUP when slave closed and buffer empty.
+    {
+        int pid = devfs_get_pty_master_id((vfs_file_t*)entry);
+        if (pid >= 0)
+            return (short)tty_pty_master_poll(pid, events);
+    }
+
+    // Tty/pty-slave (real terminal): always writable, readable when input is queued.
+    {
+        tty_t* tty = devfs_get_tty((vfs_file_t*)entry);
+        if (tty) {
+            short rev = 0;
+            if ((events & (POLLIN | POLLRDNORM)) && tty->read_count > 0)
+                rev |= POLLIN | POLLRDNORM;
+            if (events & (POLLOUT | POLLWRNORM))
+                rev |= POLLOUT | POLLWRNORM;
+            return rev;
+        }
     }
 
     // Regular file - always ready for read/write

@@ -360,7 +360,10 @@ int elf_exec(const char* path, char* const argv[], char* const envp[],
     }
 
     #define USER_STACK_TOP   0x00007FFFFFF00000ULL
-    #define USER_STACK_SIZE  (64 * 1024)
+    #define USER_STACK_SIZE  (2 * 1024 * 1024)  /* 2MB — matches memory.h. Smaller stacks (64K)
+                                                 * cause ports/lib/* (libevent, ncurses, tmux's
+                                                 * deeply-recursive parser/log paths) to overflow
+                                                 * silently and SIGSEGV on the guard region. */
 
     uint64_t sp = elf_setup_stack(pml4, USER_STACK_TOP, USER_STACK_SIZE,
                                   argv, envp, &lr, ib);
@@ -481,7 +484,7 @@ uint64_t elf_exec_replace(const char* path, char* const argv[],
     }
 
     #define USER_STACK_TOP_EXEC   0x00007FFFFFF00000ULL
-    #define USER_STACK_SIZE_EXEC  (64 * 1024)
+    #define USER_STACK_SIZE_EXEC  (2 * 1024 * 1024)  /* See note in elf_load_and_run. */
 
     uint64_t sp = elf_setup_stack(pml4, USER_STACK_TOP_EXEC, USER_STACK_SIZE_EXEC,
                                   argv, envp, &lr, ib);

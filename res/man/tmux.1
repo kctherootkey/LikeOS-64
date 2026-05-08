@@ -1,0 +1,416 @@
+TMUX(1)                     LikeOS User Commands                     TMUX(1)
+
+NAME
+       tmux - terminal multiplexer
+
+SYNOPSIS
+       tmux [-2CDhlNuVv] [-c shell-command] [-f file] [-L socket-name]
+            [-S socket-path] [-T features] [command [flags]]
+
+DESCRIPTION
+       tmux is a terminal multiplexer.  It enables a number of terminals
+       to be created, accessed, and controlled from a single screen.
+       tmux may be detached from a screen and continue running in the
+       background, then later reattached.
+
+       When tmux is started, it creates a new session with a single
+       window and displays it on screen.  A status line at the bottom
+       of the screen shows information on the current session and is
+       used to enter interactive commands.
+
+       A session is a single collection of pseudo terminals under the
+       management of tmux.  Each session has one or more windows linked
+       to it.  A window occupies the entire screen and may be split
+       into rectangular panes, each of which is a separate pseudo
+       terminal.
+
+       Any number of tmux instances may connect to the same session,
+       and any number of windows may be present in the same session.
+       Once all sessions are killed, tmux exits.
+
+       Each session is persistent and will survive accidental
+       disconnection (such as ssh(1) connection timeout) or intentional
+       detaching (with the C-b d key strokes).  tmux may be reattached
+       using:
+
+             tmux attach
+
+       In tmux, a session is displayed on screen by a client and all
+       sessions are managed by a single server.  The server and each
+       client are separate processes which communicate through a
+       socket in /tmp.
+
+OPTIONS
+       The following options are available:
+
+       -2          Force tmux to assume the terminal supports 256
+                   colours.
+
+       -C          Start in control mode (see the section on Control
+                   Mode).  Given twice (-CC) disables echo.
+
+       -c shell-command
+                   Execute shell-command using the default shell.  If
+                   necessary, the tmux server will be started to
+                   retrieve the default-shell option.  This option is
+                   for compatibility with sh(1) when tmux is used as a
+                   login shell.
+
+       -D          Do not start the tmux server as a daemon.  This also
+                   turns the exit-empty option off.  With -D, command
+                   may not be specified.
+
+       -d          Force tmux to assume the terminal does not support
+                   the colon character in escape sequences.
+
+       -f file     Specify an alternative configuration file.  By
+                   default, tmux loads the system configuration file
+                   from /etc/tmux.conf, if present, then looks for a
+                   user configuration file at ~/.tmux.conf.
+
+       -h          Show usage message.
+
+       -L socket-name
+                   tmux stores the server socket in a directory under
+                   TMUX_TMPDIR or /tmp if it is unset.  The default
+                   socket is named default; this option allows a
+                   different socket name to be specified, allowing
+                   several independent tmux servers to be run.
+
+       -l          Behave as a login shell.  This flag currently has no
+                   effect and is for compatibility with other shells
+                   when using tmux as a login shell.
+
+       -N          Do not start the server even if the command would
+                   normally do so (for example new-session or
+                   start-server).
+
+       -S socket-path
+                   Specify a full alternative path to the server
+                   socket.  If -S is specified, the default socket
+                   directory is not used and any -L flag is ignored.
+
+       -T features
+                   Set terminal features for the client.  This is a
+                   comma-separated list of feature names.  See the
+                   TERMINAL FEATURES section.
+
+       -u          Force tmux to assume the terminal supports UTF-8.
+                   In LikeOS the framebuffer console always uses
+                   UTF-8, so this is the default and -u is accepted
+                   for compatibility.
+
+       -V          Report the tmux version.
+
+       -v          Request verbose logging.  Log messages will be saved
+                   into tmux-client-PID.log and tmux-server-PID.log
+                   files in the current directory, where PID is the
+                   pid of the server or client process.  This option
+                   may be specified multiple times for increased
+                   verbosity.
+
+       command [flags]
+                   This specifies one of a set of commands used to
+                   control tmux, as described in the COMMANDS section.
+                   If no commands are specified, the new-session
+                   command is assumed.
+
+DEFAULT KEY BINDINGS
+       tmux may be controlled from an attached client by using a key
+       combination of a prefix key, C-b (Ctrl-b) by default, followed
+       by a command key.
+
+       The default command key bindings are:
+
+             C-b          Send the prefix key (C-b) through to the
+                          application.
+             C-o          Rotate the panes in the current window
+                          forwards.
+             C-z          Suspend the tmux client.
+             !            Break the current pane out of the window.
+             "            Split the current pane into two, top and
+                          bottom.
+             #            List all paste buffers.
+             $            Rename the current session.
+             %            Split the current pane into two, left and
+                          right.
+             &            Kill the current window.
+             '            Prompt for a window index to select.
+             (            Switch the attached client to the previous
+                          session.
+             )            Switch the attached client to the next
+                          session.
+             ,            Rename the current window.
+             -            Delete the most recently copied buffer of
+                          text.
+             .            Prompt for an index to move the current
+                          window.
+             0 to 9       Select windows 0 to 9.
+             :            Enter the tmux command prompt.
+             ;            Move to the previously active pane.
+             =            Choose which buffer to paste interactively
+                          from a list.
+             ?            List all key bindings.
+             D            Choose a client to detach.
+             L            Switch the attached client back to the last
+                          session.
+             [            Enter copy mode to copy text or view the
+                          history.
+             ]            Paste the most recently copied buffer of
+                          text.
+             c            Create a new window.
+             d            Detach the current client.
+             f            Prompt to search for text in open windows.
+             i            Display some information about the current
+                          window.
+             l            Move to the previously selected window.
+             m            Mark the current pane.
+             M            Clear the marked pane.
+             n            Change to the next window.
+             o            Select the next pane in the current window.
+             p            Change to the previous window.
+             q            Briefly display pane indexes.
+             r            Force redraw of the attached client.
+             s            Select a new session interactively.
+             t            Show the time.
+             w            Choose the current window interactively.
+             x            Kill the current pane.
+             z            Toggle zoom state of the current pane.
+             {            Swap the current pane with the previous one.
+             }            Swap the current pane with the next one.
+             ~            Show previous status messages.
+             Page Up      Enter copy mode and scroll one page up.
+             Up, Down,    Change to the pane above, below, to the left,
+             Left, Right  or to the right of the current pane.
+             M-1 to M-5   Arrange panes in one of the five preset
+                          layouts.
+             Space        Arrange the current window in the next
+                          preset layout.
+             M-n          Move to the next window with a bell or
+                          activity marker.
+             M-o          Rotate the panes in the current window
+                          backwards.
+             M-p          Move to the previous window with a bell or
+                          activity marker.
+             C-Up, C-Down,
+             C-Left,      Resize the current pane in steps of one
+             C-Right      cell.
+             M-Up, M-Down,
+             M-Left,      Resize the current pane in steps of five
+             M-Right      cells.
+
+COMMANDS
+       This section describes the commands supported by tmux.  Most
+       commands accept the optional -t (and sometimes -s) argument
+       with one of target-client, target-session, target-window or
+       target-pane.
+
+       The following commands are commonly used.  See the upstream
+       tmux documentation or the in-application help (C-b ?) for a
+       complete list.
+
+   Clients and Sessions
+       attach-session [-dErx] [-c working-directory] [-f flags]
+                      [-t target-session]
+             (alias: attach)
+             Create a new client in the current terminal and attach it
+             to target-session.  If used without arguments, attach
+             attempts to reattach the most recently used unattached
+             session.
+
+       detach-client [-aP] [-E shell-command] [-s target-session]
+                     [-t target-client]
+             (alias: detach)
+             Detach the current client if bound to no arguments, or
+             the specified client with -t.
+
+       has-session [-t target-session]
+             (alias: has)
+             Report an error and exit with 1 if the specified session
+             does not exist.  Otherwise exit with 0.
+
+       kill-server
+             Kill the tmux server and clients and destroy all
+             sessions.
+
+       kill-session [-aC] [-t target-session]
+             Destroy the given session, closing any windows linked to
+             it and no other sessions, and detaching all clients
+             attached to it.
+
+       list-clients [-F format] [-t target-session]
+             (alias: lsc)
+             List all clients attached to the server.
+
+       list-sessions [-F format]
+             (alias: ls)
+             List all sessions managed by the server.
+
+       new-session [-AdDEPX] [-c start-directory] [-e environment]
+                   [-F format] [-f flags] [-n window-name]
+                   [-s session-name] [-t group-name] [-x width]
+                   [-y height] [shell-command]
+             (alias: new)
+             Create a new session with name session-name.
+
+       refresh-client [-cDLRSU] [-A pane:state] [-B name:what:format]
+                      [-C XxY] [-f flags] [-l target-pane]
+                      [-t target-client] [adjustment]
+             (alias: refresh)
+             Refresh the current client.
+
+       rename-session [-t target-session] new-name
+             (alias: rename)
+             Rename the session to new-name.
+
+       switch-client [-ElnprZ] [-c target-client] [-T key-table]
+                     [-t target-session]
+             (alias: switchc)
+             Switch the current session for client target-client to
+             target-session.
+
+   Windows and Panes
+       break-pane [-dPab] [-F format] [-n window-name] [-s src-pane]
+                  [-t dst-window]
+             (alias: breakp)
+             Break src-pane off from its containing window to make it
+             the only pane in dst-window.
+
+       kill-pane [-a] [-t target-pane]
+             (alias: killp)
+             Destroy the given pane.
+
+       kill-window [-a] [-t target-window]
+             (alias: killw)
+             Kill the current window or the window at target-window.
+
+       list-panes [-as] [-F format] [-f filter] [-t target]
+             (alias: lsp)
+             List the panes in the current window or the windows in
+             the current session.
+
+       list-windows [-a] [-F format] [-f filter] [-t target-session]
+             (alias: lsw)
+             List windows in the current session or all windows on the
+             server.
+
+       new-window [-abdkPS] [-c start-directory] [-e environment]
+                  [-F format] [-n window-name] [-t target-window]
+                  [shell-command]
+             (alias: neww)
+             Create a new window.
+
+       next-window [-a] [-t target-session]
+             (alias: next)
+             Move to the next window in the session.
+
+       previous-window [-a] [-t target-session]
+             (alias: prev)
+             Move to the previous window in the session.
+
+       rename-window [-t target-window] new-name
+             (alias: renamew)
+             Rename the current window, or the window at target-window
+             if specified.
+
+       resize-pane [-DLMRTUZ] [-t target-pane] [-x width] [-y height]
+                   [adjustment]
+             (alias: resizep)
+             Resize a pane.
+
+       select-pane [-DdegLlMmRU] [-P style] [-T title] [-t target-pane]
+             (alias: selectp)
+             Make pane target-pane the active pane in its window.
+
+       select-window [-lnpT] [-t target-window]
+             (alias: selectw)
+             Select the window at target-window.
+
+       split-window [-bdfhIPvZ] [-c start-directory] [-e environment]
+                    [-F format] [-l size] [-t target-pane]
+                    [shell-command]
+             (alias: splitw)
+             Create a new pane by splitting target-pane.
+
+       swap-pane [-dDU] [-s src-pane] [-t dst-pane]
+             (alias: swapp)
+             Swap two panes.
+
+ENVIRONMENT
+       When tmux is started, it inspects the following environment
+       variables:
+
+       EDITOR    If the command specified by this variable contains
+                 the string "vi" and VISUAL is unset, vi-style key
+                 bindings are used in copy mode.  Otherwise emacs-
+                 style key bindings are used.
+
+       HOME      The user's home directory.
+
+       LC_CTYPE  The character encoding locale.  It is used to
+                 determine if the terminal supports UTF-8.
+
+       SHELL     The user's login shell.  If unset, the default shell
+                 is used.  Defaults to /bin/sh in LikeOS.
+
+       TMUX      Set by tmux when started, used to detect when tmux
+                 is run nested.  Also contains the path to the server
+                 socket.
+
+       TMUX_TMPDIR
+                 The parent directory of the directory containing the
+                 server sockets.  See the FILES section.
+
+       VISUAL    See EDITOR.
+
+FILES
+       ~/.tmux.conf      default tmux configuration file
+       /etc/tmux.conf    system-wide configuration file
+
+       Sockets are created in:
+
+             $TMUX_TMPDIR/tmux-UID/
+
+       or, if TMUX_TMPDIR is unset:
+
+             /tmp/tmux-UID/
+
+       where UID is the numeric user identifier of the user running
+       tmux.  In LikeOS the default socket path is:
+
+             /tmp/tmux-0/default
+
+LIKEOS NOTES
+       This is a port of tmux 3.6a to LikeOS-64.  The following
+       differences from a typical Unix host are worth noting:
+
+       o   LikeOS is a single-user system; the user database returns
+           a fixed entry for "root" (uid 0).  The default socket
+           directory is therefore /tmp/tmux-0.
+
+       o   tmux uses UNIX domain sockets and SCM_RIGHTS file
+           descriptor passing, both of which are implemented in the
+           LikeOS kernel.
+
+       o   The LikeOS framebuffer console always operates in UTF-8,
+           so the -u flag is the default behaviour.
+
+       o   tmux is dynamically linked against /lib/libevent.so,
+           /lib/ncurses.so, /lib/libc.so and the loader
+           /lib/ld-likeos.so.
+
+EXIT STATUS
+       The tmux utility exits 0 on success, and >0 if an error occurs.
+
+SEE ALSO
+       sh(1), nano(1), less(1), more(1)
+
+       The complete tmux documentation is available from the upstream
+       project at https://github.com/tmux/tmux/wiki
+
+AUTHORS
+       Nicholas Marriott <nicholas.marriott@gmail.com> wrote tmux.
+       This LikeOS port was prepared for the LikeOS-64 operating
+       system.
+
+LikeOS                          May 2026                          TMUX(1)

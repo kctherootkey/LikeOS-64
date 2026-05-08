@@ -20,5 +20,6 @@ int devfs_is_devfile(vfs_file_t* f);
 // Helpers for syscall layer
 const vfs_ops_t* devfs_get_ops(void);
 tty_t* devfs_get_tty(vfs_file_t* f);
+int devfs_get_pty_master_id(vfs_file_t* f);
 
 #endif

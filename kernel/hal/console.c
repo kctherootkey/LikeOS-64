@@ -43,6 +43,23 @@ static void string_putchar(char c, string_buffer_t* sb) {
 // Global console state
 static uint32_t cursor_x = 0;
 static uint32_t cursor_y = 0;
+
+// Active scroll region (DECSTBM).  -1/-1 means "not set" → full screen.
+// Inclusive 0-based row indices.
+static int g_region_top = -1;
+static int g_region_bot = -1;
+/* xenl ("eat newline glitch"): when a printable char is written into the
+ * very last column, defer the wrap.  The cursor visually stays on that
+ * cell; the wrap only happens when the *next* printable char arrives.
+ * Any explicit cursor motion clears this state.  Required by tmux for
+ * safe writes to the bottom-right corner of the screen — without it,
+ * drawing the last cell of the status bar scrolls the whole screen. */
+static int g_pending_wrap = 0;
+/* When set, bare LF in console_putchar_unlocked advances the row without
+ * resetting cursor_x.  Set by console_putchar_batch (tty output path) where
+ * OPOST/ONLCR handles the CR separately; cleared for the kprintf direct path
+ * which relies on LF implying a carriage return (ONLCR console semantics). */
+static int g_lf_no_cr = 0;
 // Static copy of framebuffer info - we copy from boot_info since boot_info is in identity-mapped memory
 static framebuffer_info_t g_fb_info_copy;
 static framebuffer_info_t* fb_info = 0;
@@ -212,7 +229,7 @@ static uint32_t max_cols = 0;
 #define VGA_COLOR_WHITE         15
 
 // Convert VGA colors to RGB
-static uint32_t vga_to_rgb(uint8_t vga_color) {
+uint32_t vga_to_rgb(uint8_t vga_color) {
     static const uint32_t vga_palette[16] = {
         0x000000, // Black
         0x0000AA, // Blue
@@ -268,6 +285,7 @@ static void sb_reset(void) {
     // Zero first line
     for (uint32_t i = 0; i < sb_capacity(); ++i) {
         g_lines[i].length = 0;
+        g_lines[i].write_pos = 0;
         g_lines[i].text[0] = '\0';
         g_lines[i].fg = VGA_COLOR_WHITE;
         g_lines[i].bg = VGA_COLOR_BLACK;
@@ -287,6 +305,7 @@ static void sb_new_line(void) {
     g_prompt_guard_len = 0;
     // Clear the new line
     g_sb.lines[g_sb.head].length = 0;
+    g_sb.lines[g_sb.head].write_pos = 0;
     g_sb.lines[g_sb.head].text[0] = '\0';
     g_sb.lines[g_sb.head].fg = current_vga_fg;
     g_sb.lines[g_sb.head].bg = current_vga_bg;
@@ -311,43 +330,53 @@ static void sb_append_char(char c) {
         return;
     }
     if (c == '\r') {
-        // carriage return: reset line length to 0 (simple behavior)
-        line->length = 0;
-        line->text[0] = '\0';
-        line->fg = current_vga_fg;
-        line->bg = current_vga_bg;
+        /* Carriage return: reset write position without erasing visible content.
+         * Subsequent writes overwrite from position 0, matching terminal
+         * overwrite semantics.  The visible length (line->length) stays until
+         * a write actually reaches or exceeds the old boundary. */
+        line->write_pos = 0;
         return;
     }
     if (c == '\t') {
         // simple tab expansion: up to next 8-char boundary using spaces
-        uint16_t next = (uint16_t)(((line->length + 8) & ~7) - line->length);
-        for (uint16_t i = 0; i < next && line->length < CONSOLE_MAX_LINE_LENGTH - 1; ++i) {
-            uint16_t idx = line->length;
+        uint16_t next = (uint16_t)(((line->write_pos + 8) & ~7) - line->write_pos);
+        for (uint16_t i = 0; i < next && line->write_pos < CONSOLE_MAX_LINE_LENGTH - 1; ++i) {
+            uint16_t idx = line->write_pos;
             line->text[idx] = ' ';
             line->fg_attrs[idx] = current_vga_fg;
             line->bg_attrs[idx] = current_vga_bg;
-            line->length++;
+            line->write_pos++;
+            if (line->write_pos > line->length) {
+                line->length = line->write_pos;
+                line->text[line->length] = '\0';
+            }
         }
-        line->text[line->length] = '\0';
         return;
     }
     if (c == '\b') {
-        if (line->length > 0) {
-            if (line->length <= g_prompt_guard_len) {
+        if (line->write_pos > 0) {
+            if (line->write_pos <= g_prompt_guard_len) {
                 return;
             }
-            line->length--;
-            line->text[line->length] = '\0';
+            line->write_pos--;
+            /* Truncate visible length to the new write position. */
+            if (line->write_pos < line->length) {
+                line->length = line->write_pos;
+                line->text[line->length] = '\0';
+            }
         }
         return;
     }
-    if (line->length < CONSOLE_MAX_LINE_LENGTH - 1) {
-        uint16_t idx = line->length;
+    if (line->write_pos < CONSOLE_MAX_LINE_LENGTH - 1) {
+        uint16_t idx = line->write_pos;
         line->text[idx] = c;
         line->fg_attrs[idx] = current_vga_fg;
         line->bg_attrs[idx] = current_vga_bg;
-        line->length++;
-        line->text[line->length] = '\0';
+        line->write_pos++;
+        if (line->write_pos > line->length) {
+            line->length = line->write_pos;
+            line->text[line->length] = '\0';
+        }
         line->fg = current_vga_fg;
         line->bg = current_vga_bg;
     }
@@ -442,6 +471,31 @@ static void draw_cursor_at(uint32_t x, uint32_t y, uint8_t show) {
     if (h > CURSOR_SAVE_MAX_H) h = CURSOR_SAVE_MAX_H;
     
     if (show) {
+        /* If there is already a cursor bar drawn at a DIFFERENT cell,
+         * restore its saved pixels before overwriting cursor_saved_pixels
+         * with the new cell's data.  Without this, every call to show at
+         * position B while save data for position A still exists would
+         * silently abandon A's bar on screen — it could never be erased
+         * because the pixel-save record was lost.  Over multiple cursor
+         * moves this accumulates ghost bars that cover character glyphs,
+         * producing the "character erased at left" symptom in tmux/nano. */
+        if (cursor_pixels_saved && (cursor_saved_x != x || cursor_saved_y != y)) {
+            uint32_t old_px = cursor_saved_x * CHAR_WIDTH;
+            uint32_t old_py = cursor_saved_y * CHAR_HEIGHT;
+            for (uint32_t row2 = 0; row2 < h; row2++) {
+                set_pixel(old_px,     old_py + row2,
+                          cursor_saved_pixels[row2 * CURSOR_SAVE_W + 0]);
+                set_pixel(old_px + 1, old_py + row2,
+                          cursor_saved_pixels[row2 * CURSOR_SAVE_W + 1]);
+            }
+            cursor_pixels_saved = 0;
+        }
+        /* If the cursor is already shown at THIS exact cell, do not
+         * re-save (we would capture bar pixels instead of character
+         * pixels, locking the bar in permanently on the next hide). */
+        if (cursor_pixels_saved && cursor_saved_x == x && cursor_saved_y == y)
+            return;
+
         // Save the pixels currently under the cursor position
         fb_double_buffer_t* fb_opt = get_fb_double_buffer();
         for (uint32_t row = 0; row < h; row++) {
@@ -472,7 +526,13 @@ static void draw_cursor_at(uint32_t x, uint32_t y, uint8_t show) {
             set_pixel(pixel_x + 1, pixel_y + row, cursor_color);
         }
     } else {
-        // Restore the saved pixels if we have them and position matches
+        // Restore the saved pixels if we have them and position matches.
+        // If not, the cursor cell has since been overdrawn by a glyph (or
+        // a different cell has scrolled into this position) — leave the
+        // screen alone.  The old "fallback to bg_color" path here erased
+        // real content whenever a draw_char invalidated the saved pixels
+        // between the cursor's show and hide phases (very common under
+        // tmux, which emits CUP+glyph bursts during redraws).
         if (cursor_pixels_saved && cursor_saved_x == x && cursor_saved_y == y) {
             for (uint32_t row = 0; row < h; row++) {
                 for (uint32_t col = 0; col < CURSOR_SAVE_W; col++) {
@@ -481,13 +541,12 @@ static void draw_cursor_at(uint32_t x, uint32_t y, uint8_t show) {
                 }
             }
             cursor_pixels_saved = 0;
-        } else {
-            // Fallback: fill with bg_color (best effort)
-            for (uint32_t row = 0; row < h; row++) {
-                set_pixel(pixel_x, pixel_y + row, bg_color);
-                set_pixel(pixel_x + 1, pixel_y + row, bg_color);
-            }
         }
+        /* If cursor_pixels_saved is 0 here, it means a glyph was drawn over
+         * the cursor bar between the last show and this hide call — the glyph
+         * already covered the 2-pixel bar.  Doing nothing is correct: no
+         * remnant bar is visible, and a bg_color fill would erase the glyph
+         * (visible as "left arrow erases a character" inside tmux/nano). */
     }
 }
 
@@ -702,11 +761,13 @@ void console_set_cursor_pos(uint32_t row, uint32_t col) {
     if (col >= max_cols) col = max_cols - 1;
     cursor_y = row;
     cursor_x = col;
+    g_pending_wrap = 0;
 
     // Sync cursor tracking to prevent stale position causing artifacts
     cursor_last_x = col;
     cursor_last_y = row;
     cursor_shown = 0;
+    cursor_pixels_saved = 0;   /* old cell may now contain a glyph */
     cursor_blink_ticks = 0;
 
     // Ensure viewport is at bottom for subsequent output
@@ -789,11 +850,25 @@ void console_erase_line(int mode) {
     if (mode == 2) {
         // Erase entire line
         fb_fill_rect(0, y, text_w, CHAR_HEIGHT, bg_color);
+        /* Truncate scrollback line completely. */
+        console_line_t* ln = sb_current_line();
+        ln->write_pos = 0;
+        ln->length = 0;
+        ln->text[0] = '\0';
     } else if (mode == 0) {
         // Erase from cursor to end
         uint32_t x = cursor_x * CHAR_WIDTH;
         if (x < text_w)
             fb_fill_rect(x, y, text_w - x, CHAR_HEIGHT, bg_color);
+        /* Truncate scrollback line to cursor_x so that EL0 after a readline
+         * reprint (\\r + shorter-content) removes the stale tail characters. */
+        console_line_t* ln = sb_current_line();
+        if (cursor_x < ln->length) {
+            ln->length = (uint16_t)cursor_x;
+            ln->text[cursor_x] = '\0';
+        }
+        if (cursor_x < ln->write_pos)
+            ln->write_pos = (uint16_t)cursor_x;
     } else if (mode == 1) {
         // Erase from start to cursor
         uint32_t x = (cursor_x + 1) * CHAR_WIDTH;
@@ -803,6 +878,175 @@ void console_erase_line(int mode) {
 
     fb_flush_dirty_regions();
 
+    spin_unlock_irqrestore(&console_lock, flags);
+}
+
+/* ----------------------------------------------------------------------
+ * VT-style line / character editing primitives.
+ * Used by terminal emulators (e.g. tmux) that drive the framebuffer
+ * console as a real VT100/xterm.  Coordinates are 0-based row/col.
+ * ---------------------------------------------------------------------- */
+
+static uint32_t console_text_width_pixels(void) {
+    if (!fb_info) return 0;
+    uint32_t sb_total_w = SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
+    return (fb_info->horizontal_resolution > sb_total_w)
+         ? (fb_info->horizontal_resolution - sb_total_w) : 0;
+}
+
+/* Scroll a rectangular region [top..bot] (rows, inclusive) up by N rows.
+ * Top N rows of the region are discarded; bottom N rows become blank.    */
+void console_scroll_region_up(int n, int top, int bot) {
+    if (!fb_info || !fb_info->framebuffer_base) return;
+    if (n <= 0) return;
+    if (top < 0) top = 0;
+    if (bot >= (int)max_rows) bot = (int)max_rows - 1;
+    if (top > bot) return;
+    int region_rows = bot - top + 1;
+    if (n > region_rows) n = region_rows;
+
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
+
+    uint32_t text_w = console_text_width_pixels();
+    if (cursor_enabled && cursor_shown)
+        draw_cursor_at(cursor_last_x, cursor_last_y, 0);
+    mouse_show_cursor_noflush(0);
+
+    uint32_t move_rows = (uint32_t)(region_rows - n);
+    if (move_rows > 0) {
+        fb_copy_rect(0, (uint32_t)(top * CHAR_HEIGHT),
+                     0, (uint32_t)((top + n) * CHAR_HEIGHT),
+                     text_w, move_rows * CHAR_HEIGHT);
+    }
+    /* Clear the freshly-vacated rows at the bottom of the region. */
+    fb_fill_rect(0, (uint32_t)((top + (int)move_rows) * CHAR_HEIGHT),
+                 text_w, (uint32_t)n * CHAR_HEIGHT, bg_color);
+
+    mouse_show_cursor_noflush(1);
+    fb_flush_dirty_regions();
+    spin_unlock_irqrestore(&console_lock, flags);
+}
+
+/* Scroll a region down by N rows.
+ * Bottom N rows discarded; top N rows become blank. */
+void console_scroll_region_down(int n, int top, int bot) {
+    if (!fb_info || !fb_info->framebuffer_base) return;
+    if (n <= 0) return;
+    if (top < 0) top = 0;
+    if (bot >= (int)max_rows) bot = (int)max_rows - 1;
+    if (top > bot) return;
+    int region_rows = bot - top + 1;
+    if (n > region_rows) n = region_rows;
+
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
+
+    uint32_t text_w = console_text_width_pixels();
+    if (cursor_enabled && cursor_shown)
+        draw_cursor_at(cursor_last_x, cursor_last_y, 0);
+    mouse_show_cursor_noflush(0);
+
+    uint32_t move_rows = (uint32_t)(region_rows - n);
+    if (move_rows > 0) {
+        fb_copy_rect(0, (uint32_t)((top + n) * CHAR_HEIGHT),
+                     0, (uint32_t)(top * CHAR_HEIGHT),
+                     text_w, move_rows * CHAR_HEIGHT);
+    }
+    fb_fill_rect(0, (uint32_t)(top * CHAR_HEIGHT),
+                 text_w, (uint32_t)n * CHAR_HEIGHT, bg_color);
+
+    mouse_show_cursor_noflush(1);
+    fb_flush_dirty_regions();
+    spin_unlock_irqrestore(&console_lock, flags);
+}
+
+/* Insert N blank lines at and below the cursor row, scrolling
+ * lines [cursor_y..bot] down within the active region. */
+void console_insert_lines(int n, int top, int bot) {
+    if (n <= 0) return;
+    if ((int)cursor_y < top || (int)cursor_y > bot) return;
+    console_scroll_region_down(n, (int)cursor_y, bot);
+}
+
+/* Delete N lines starting at the cursor row, scrolling
+ * lines below up into [cursor_y..bot]. */
+void console_delete_lines(int n, int top, int bot) {
+    if (n <= 0) return;
+    if ((int)cursor_y < top || (int)cursor_y > bot) return;
+    console_scroll_region_up(n, (int)cursor_y, bot);
+}
+
+/* Insert N blank chars at the cursor: shift current-line tail right. */
+void console_insert_chars(int n) {
+    if (!fb_info || !fb_info->framebuffer_base) return;
+    if (n <= 0) return;
+    if (n > (int)(max_cols - cursor_x)) n = (int)(max_cols - cursor_x);
+
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
+
+    uint32_t text_w = console_text_width_pixels();
+    if (cursor_enabled && cursor_shown)
+        draw_cursor_at(cursor_last_x, cursor_last_y, 0);
+
+    uint32_t y = cursor_y * CHAR_HEIGHT;
+    uint32_t x = cursor_x * CHAR_WIDTH;
+    uint32_t shift = (uint32_t)n * CHAR_WIDTH;
+    if (x + shift < text_w) {
+        fb_copy_rect(x + shift, y, x, y, text_w - x - shift, CHAR_HEIGHT);
+    }
+    fb_fill_rect(x, y, shift, CHAR_HEIGHT, bg_color);
+
+    fb_flush_dirty_regions();
+    spin_unlock_irqrestore(&console_lock, flags);
+}
+
+/* Delete N chars at the cursor: shift current-line tail left. */
+void console_delete_chars(int n) {
+    if (!fb_info || !fb_info->framebuffer_base) return;
+    if (n <= 0) return;
+    if (n > (int)(max_cols - cursor_x)) n = (int)(max_cols - cursor_x);
+
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
+
+    uint32_t text_w = console_text_width_pixels();
+    if (cursor_enabled && cursor_shown)
+        draw_cursor_at(cursor_last_x, cursor_last_y, 0);
+
+    uint32_t y = cursor_y * CHAR_HEIGHT;
+    uint32_t x = cursor_x * CHAR_WIDTH;
+    uint32_t shift = (uint32_t)n * CHAR_WIDTH;
+    if (x + shift < text_w) {
+        fb_copy_rect(x, y, x + shift, y, text_w - x - shift, CHAR_HEIGHT);
+    }
+    /* Blank the right portion that's now exposed. */
+    if (text_w > shift) {
+        fb_fill_rect(text_w - shift, y, shift, CHAR_HEIGHT, bg_color);
+    }
+
+    fb_flush_dirty_regions();
+    spin_unlock_irqrestore(&console_lock, flags);
+}
+
+/* Erase N chars starting at the cursor position, no shifting. */
+void console_erase_chars(int n) {
+    if (!fb_info || !fb_info->framebuffer_base) return;
+    if (n <= 0) return;
+    if (n > (int)(max_cols - cursor_x)) n = (int)(max_cols - cursor_x);
+
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
+
+    if (cursor_enabled && cursor_shown)
+        draw_cursor_at(cursor_last_x, cursor_last_y, 0);
+
+    uint32_t y = cursor_y * CHAR_HEIGHT;
+    uint32_t x = cursor_x * CHAR_WIDTH;
+    fb_fill_rect(x, y, (uint32_t)n * CHAR_WIDTH, CHAR_HEIGHT, bg_color);
+
+    fb_flush_dirty_regions();
     spin_unlock_irqrestore(&console_lock, flags);
 }
 
@@ -820,44 +1064,65 @@ void console_clear_prompt_guard(void) {
     g_prompt_guard_len = 0;
 }
 
-// Scroll the screen up by one line
+// Scroll the screen up by one line.  Honors active scroll region (DECSTBM):
+// when set to a sub-range of the screen, only the region scrolls so that
+// status bars / pinned chrome rows below the region are preserved.
 static void console_scroll_up(void) {
     if (!fb_info || !fb_info->framebuffer_base) return;
-    
+
+    // Region-aware path: scroll only [region_top..region_bot] if that is a
+    // proper sub-range of the screen.
+    if (g_region_top >= 0 && g_region_bot >= 0
+        && !(g_region_top == 0 && g_region_bot == (int)max_rows - 1)) {
+        int top = g_region_top, bot = g_region_bot;
+        if (top < 0) top = 0;
+        if (bot >= (int)max_rows) bot = (int)max_rows - 1;
+        if (top > bot) return;
+
+        mouse_show_cursor_noflush(0);
+
+        uint32_t sb_total_w = SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
+        uint32_t text_w = (fb_info->horizontal_resolution > sb_total_w)
+                        ? (fb_info->horizontal_resolution - sb_total_w) : 0;
+        int region_rows = bot - top + 1;
+        if (region_rows > 1) {
+            fb_copy_rect(0, (uint32_t)(top * (int)CHAR_HEIGHT),
+                         0, (uint32_t)((top + 1) * (int)CHAR_HEIGHT),
+                         text_w, (uint32_t)(region_rows - 1) * CHAR_HEIGHT);
+        }
+        fb_fill_rect(0, (uint32_t)(bot * (int)CHAR_HEIGHT),
+                     text_w, CHAR_HEIGHT, bg_color);
+
+        cursor_y = (uint32_t)bot;
+        cursor_x = 0;
+        mouse_show_cursor_noflush(1);
+        return;
+    }
+
+    // Full-screen scroll (original behavior — preserves scrollback semantics).
     // Hide mouse cursor before scrolling to prevent artifacts (no VRAM flush)
     mouse_show_cursor_noflush(0);
-    
+
     uint32_t screen_width = fb_info->horizontal_resolution;
     uint32_t height = fb_info->vertical_resolution;
     uint32_t scroll_lines = CHAR_HEIGHT;
-    
+
     // Calculate text area width (exclude scrollbar area)
     uint32_t scrollbar_total_width = SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
     uint32_t text_area_width = screen_width - scrollbar_total_width;
-    
+
     fb_double_buffer_t* fb_opt = get_fb_double_buffer();
     if (fb_opt) {
-        // Use optimized copy operation - only scroll the text area
         fb_copy_rect(0, 0, 0, scroll_lines, text_area_width, height - scroll_lines);
-        
-        // Clear the bottom area of text region only
         fb_fill_rect(0, height - scroll_lines, text_area_width, scroll_lines, bg_color);
-        
-        // Do NOT flush here - caller (or tty_write batch) is responsible
     } else {
-        // Fallback to direct framebuffer access
         uint32_t* framebuffer = (uint32_t*)fb_info->framebuffer_base;
         uint32_t pixels_per_line = fb_info->pixels_per_scanline;
-        
-        // Move all scan lines up by scroll_lines using memory copy for efficiency
-        // Only copy the text area, not the scrollbar area
         for (uint32_t y = scroll_lines; y < height; y++) {
             uint32_t* src_line = &framebuffer[y * pixels_per_line];
             uint32_t* dst_line = &framebuffer[(y - scroll_lines) * pixels_per_line];
             kmemcpy(dst_line, src_line, text_area_width * sizeof(uint32_t));
         }
-        
-        // Clear the bottom scroll_lines rows with background color (text area only)
         for (uint32_t y = height - scroll_lines; y < height; y++) {
             uint32_t* line = &framebuffer[y * pixels_per_line];
             for (uint32_t x = 0; x < text_area_width; x++) {
@@ -865,13 +1130,29 @@ static void console_scroll_up(void) {
             }
         }
     }
-    
-    // Move cursor to last line
+
     cursor_y = max_rows - 1;
     cursor_x = 0;
-    
-    // Show mouse cursor again after scrolling is complete (no VRAM flush)
     mouse_show_cursor_noflush(1);
+}
+
+// Public: set / clear the active scroll region (0-based, inclusive).
+// Pass top=0, bot=max_rows-1 (or top<0) to clear back to "full screen".
+void console_set_scroll_region(int top, int bot) {
+    if (top < 0 || bot < 0) {
+        g_region_top = -1;
+        g_region_bot = -1;
+        return;
+    }
+    if (bot >= (int)max_rows) bot = (int)max_rows - 1;
+    if (top > bot) { g_region_top = -1; g_region_bot = -1; return; }
+    g_region_top = top;
+    g_region_bot = bot;
+}
+
+void console_get_scroll_region(int *top, int *bot) {
+    if (top) *top = g_region_top;
+    if (bot) *bot = g_region_bot;
 }
 
 // Set console colors (VGA compatibility)
@@ -880,6 +1161,13 @@ void console_set_color(uint8_t fg, uint8_t bg) {
     current_vga_bg = bg;
     fg_color = vga_to_rgb(fg);
     bg_color = vga_to_rgb(bg);
+}
+
+// Set console colors as direct 24-bit RGB (truecolor SGR 38;2 / 48;2).
+// VGA color tracking left unchanged so a subsequent SGR reset still works.
+void console_set_color_rgb(uint32_t fg_rgb, uint32_t bg_rgb) {
+    fg_color = fg_rgb;
+    bg_color = bg_rgb;
 }
 
 // Print a single character
@@ -895,45 +1183,88 @@ static void console_putchar_unlocked(char c) {
     
     // Fast path drawing when at bottom; otherwise only update scrollback/scrollbar
     if (c == '\n') {
+        g_pending_wrap = 0;
         sb_append_char(c);
         if (g_sb.at_bottom) {
             // Erase cursor at old position before moving
             if (cursor_enabled && cursor_shown) {
                 draw_cursor_at(cursor_x, cursor_y, 0);
             }
-            cursor_x = 0;
-            if (cursor_y >= max_rows - 1) {
-                // At bottom of screen: scroll up
-                // console_scroll_up() handles mouse cursor and back-buffer ops
-                // No flush here — deferred to caller (tty_write batch or console_putchar)
-                console_scroll_up();
-                console_sync_scrollbar();
+            /* LF advances the row.  For the kprintf direct path (g_lf_no_cr==0)
+             * also reset cursor_x (ONLCR console semantics).  For the tty
+             * output path (g_lf_no_cr==1) leave cursor_x unchanged — the
+             * caller handles column-0 via an explicit CR or OPOST injection,
+             * and bare LF must be a pure row-advance so that full-screen apps
+             * using bare LF for row advancement within a pane work correctly. */
+            if (!g_lf_no_cr) cursor_x = 0;
+            cursor_pixels_saved = 0;
+            // Determine effective bottom: scroll region bottom if active and
+            // cursor is inside the region, else physical bottom row.
+            int eff_bot;
+            int region_active = (g_region_top >= 0 && g_region_bot >= 0
+                                 && !(g_region_top == 0
+                                      && g_region_bot == (int)max_rows - 1));
+            if (region_active && (int)cursor_y >= g_region_top
+                && (int)cursor_y <= g_region_bot) {
+                eff_bot = g_region_bot;
             } else {
-                // Not at bottom: just move cursor down
+                eff_bot = (int)max_rows - 1;
+            }
+            if ((int)cursor_y >= eff_bot) {
+                if (region_active && (int)cursor_y > g_region_bot) {
+                    // Cursor is below the scroll region (e.g. on a status row).
+                    // Do not scroll — apps should not LF off pinned rows; just
+                    // clamp the carriage return.
+                } else {
+                    // Scroll (region-aware via console_scroll_up()).
+                    console_scroll_up();
+                    console_sync_scrollbar();
+                }
+            } else {
                 cursor_y++;
             }
+            cursor_last_x = cursor_x;
+            cursor_last_y = cursor_y;
+            cursor_shown = 0;
+            cursor_blink_ticks = 0;
         } else {
             console_sync_scrollbar();
         }
         return;
     }
     if (c == '\r') {
-        sb_append_char(c);
+        /* Carriage return: move cursor to column 0.  MUST NOT erase the
+         * line visually — real terminals don't, and tmux/readline emit \r
+         * constantly for cursor positioning.  Erasing here caused blanked
+         * ls/ps output and the scattered appearance after scroll.
+         *
+         * sb_append_char('\r') resets write_pos to 0 without clearing the
+         * visible length — subsequent writes overwrite from the start of the
+         * line.  This correctly reproduces terminal overwrite semantics in
+         * the scrollback so that readline reprints of a partially-typed line
+         * produce the final visible content rather than accumulated garbage. */
+        g_pending_wrap = 0;
+        sb_append_char('\r');
         if (g_sb.at_bottom) {
-            // Erase cursor at old position before moving
             if (cursor_enabled && cursor_shown) {
                 draw_cursor_at(cursor_x, cursor_y, 0);
+                /* Reset cursor_shown here so that the \n handler (which runs
+                 * immediately after when OPOST/ONLCR expands \n->\r\n, or
+                 * when tmux sends explicit \r\n) does NOT attempt a second
+                 * hide at the new column-0 position.  Without this reset the
+                 * bg-colour fallback in draw_cursor_at erased the first
+                 * character of the current line — the "arrow key erases char"
+                 * symptom seen only inside tmux (which uses many \r\n). */
+                cursor_shown = 0;
+                cursor_pixels_saved = 0;
             }
-            // Clear current line and move to column 0
-            uint32_t sb_total_w = SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
-            uint32_t text_w = (fb_info->horizontal_resolution > sb_total_w) ? (fb_info->horizontal_resolution - sb_total_w) : 0;
-            uint32_t y = cursor_y * CHAR_HEIGHT;
-            fb_fill_rect(0, y, text_w, CHAR_HEIGHT, bg_color);
             cursor_x = 0;
+            cursor_last_x = 0;
         }
         return;
     }
     if (c == '\t') {
+        g_pending_wrap = 0;
         // Expand to spaces in buffer and draw spaces on screen
         // Determine spaces to next tab stop (8)
         console_line_t* line = sb_current_line();
@@ -943,10 +1274,21 @@ static void console_putchar_unlocked(char c) {
             uint32_t spaces = ((current_len + 8) & ~7) - current_len;
             for (uint32_t i = 0; i < spaces; ++i) {
                 if (cursor_x >= max_cols) {
-                    // wrap
+                    // wrap (region-aware: don't scroll the screen if the
+                    // cursor is below an active DECSTBM region)
+                    int region_active = (g_region_top >= 0 && g_region_bot >= 0
+                                         && !(g_region_top == 0
+                                              && g_region_bot == (int)max_rows - 1));
+                    int eff_bot = (region_active && (int)cursor_y >= g_region_top
+                                   && (int)cursor_y <= g_region_bot)
+                                ? g_region_bot : (int)max_rows - 1;
                     cursor_x = 0;
-                    if (cursor_y >= max_rows - 1) {
-                        console_scroll_up();
+                    if ((int)cursor_y >= eff_bot) {
+                        if (region_active && (int)cursor_y > g_region_bot) {
+                            /* below scroll region — do not scroll */
+                        } else {
+                            console_scroll_up();
+                        }
                     } else {
                         cursor_y++;
                     }
@@ -960,37 +1302,94 @@ static void console_putchar_unlocked(char c) {
         return;
     }
     if (c == '\b') {
-        // Backspace handled by console_backspace
-        console_backspace();
+        g_pending_wrap = 0;
+        /* VT100/ANSI BS (0x08) in the OUTPUT stream is non-destructive:
+         * it moves the cursor one position to the left without erasing the
+         * character there.  Terminal emulators (e.g. tmux) rely on bare BS
+         * to move the cursor left efficiently; destructive interpretation
+         * erases the character under the cursor, producing the "left arrow
+         * key erases characters" symptom inside tmux/nano.
+         *
+         * The shell-prompt destructive-backspace effect is achieved by the
+         * VERASE echo sequence "\b \b" (BS + space + BS): the space in the
+         * middle erases the character.  So this non-destructive BS path
+         * still produces the correct visual result for shell prompts.
+         *
+         * The public console_backspace() API (used by external callers that
+         * need the legacy destructive behaviour) is separate. */
+        if (g_sb.at_bottom) {
+            if (cursor_enabled && cursor_shown) {
+                draw_cursor_at(cursor_last_x, cursor_last_y, 0);
+                cursor_shown = 0;
+                cursor_pixels_saved = 0;
+            }
+            if (cursor_x > 0) {
+                cursor_x--;
+            } else if (cursor_y > 0) {
+                cursor_y--;
+                cursor_x = max_cols - 1;
+            }
+            cursor_last_x = cursor_x;
+            cursor_last_y = cursor_y;
+        }
         return;
     }
     // Normal printable character
     sb_append_char(c);
     if (g_sb.at_bottom) {
+        // If the previous char filled the last column, perform the
+        // deferred wrap NOW (xenl semantics: tmux relies on this so it
+        // can safely paint the bottom-right cell of the screen).
+        if (g_pending_wrap) {
+            g_pending_wrap = 0;
+            int region_active = (g_region_top >= 0 && g_region_bot >= 0
+                                 && !(g_region_top == 0
+                                      && g_region_bot == (int)max_rows - 1));
+            int eff_bot = (region_active && (int)cursor_y >= g_region_top
+                           && (int)cursor_y <= g_region_bot)
+                        ? g_region_bot : (int)max_rows - 1;
+            cursor_x = 0;
+            if ((int)cursor_y >= eff_bot) {
+                if (region_active && (int)cursor_y > g_region_bot) {
+                    /* below scroll region — do not scroll */
+                } else {
+                    console_scroll_up();
+                }
+            } else {
+                cursor_y++;
+            }
+        }
         // Draw at current cursor cell - character will overwrite cursor
         uint32_t px = cursor_x * CHAR_WIDTH;
         uint32_t py = cursor_y * CHAR_HEIGHT;
         draw_char(c, px, py, fg_color, bg_color);
-        cursor_x++;
-        // Update cursor tracking immediately so cursor_update knows position changed
+        /* Invalidate the pixel-save only when the glyph physically
+         * overwrites the cursor bar (same cell).  If the glyph is at a
+         * different cell the bar at cursor_saved_x/y is still intact and
+         * cursor_pixels_saved must remain 1 so draw_cursor_at can restore
+         * it (and so the stale-bar cleanup in draw_cursor_at show path can
+         * detect and erase it).  Clearing it here unconditionally was the
+         * root cause of ghost cursor bars left on screen after tmux drew
+         * characters at non-cursor positions. */
+        if (cursor_saved_x == cursor_x && cursor_saved_y == cursor_y)
+            cursor_pixels_saved = 0;
+        if (cursor_x + 1 >= max_cols) {
+            // Don't wrap yet — defer.  Cursor stays glued to the last
+            // column; the actual wrap happens when the next printable
+            // arrives or is forcibly cleared by a cursor-motion op.
+            cursor_x = max_cols - 1;
+            g_pending_wrap = 1;
+        } else {
+            cursor_x++;
+        }
+        // Update cursor tracking AFTER position change so cursor_update knows position changed.
+        // We did NOT draw a cursor here — we drew a glyph — so cursor_shown stays 0.
+        // The blink timer will paint a real cursor on its next tick.
         if (cursor_enabled) {
             cursor_last_x = cursor_x;
             cursor_last_y = cursor_y;
-            cursor_shown = 1;
+            cursor_shown = 0;
             cursor_blink_ticks = 0;
-        }
-        if (cursor_x >= max_cols) {
-            // Wrap to new line
-            cursor_x = 0;
-            if (cursor_y >= max_rows - 1) {
-                console_scroll_up();
-            } else {
-                cursor_y++;
-            }
-            if (cursor_enabled) {
-                cursor_last_x = cursor_x;
-                cursor_last_y = cursor_y;
-            }
         }
     } else {
     // Not at bottom: do nothing visually here
@@ -1011,7 +1410,13 @@ void console_putchar(char c) {
 void console_putchar_batch(char c) {
     uint64_t flags;
     spin_lock_irqsave(&console_lock, &flags);
+    /* Mark LF as a pure row-advance for the tty output path.  The kprintf
+     * direct path (console_putchar_unlocked called without this flag) uses
+     * ONLCR semantics (LF resets cursor_x).  The tty path handles cursor_x
+     * via an explicit CR from OPOST injection or CSI sequences. */
+    if (c == '\n') g_lf_no_cr = 1;
     console_putchar_unlocked(c);
+    g_lf_no_cr = 0;
     spin_unlock_irqrestore(&console_lock, flags);
 }
 
@@ -1030,9 +1435,115 @@ void console_batch_begin(void) {
     g_console_batch_active = 1;
 }
 
+// Return the current number of completed scrollback lines.
+// Used by the alternate-screen save/restore pair.
+uint32_t console_get_sb_total(void) {
+    return g_sb.total_filled_lines;
+}
+
+// Restore the viewport to show the content that was visible before the
+// alternate screen was entered.  saved_total must be the value returned by
+// console_get_sb_total() at the time of 1049h.  Redraws the framebuffer.
+void console_restore_alt_screen(uint32_t saved_total) {
+    uint64_t flags;
+    spin_lock_irqsave(&console_lock, &flags);
+
+    // Hide cursor before touching the screen.
+    if (cursor_enabled && cursor_shown)
+        draw_cursor_at(cursor_last_x, cursor_last_y, 0);
+    cursor_shown = 0;
+    cursor_pixels_saved = 0;
+
+    uint32_t cap = sb_capacity();
+
+    /* Roll the ring back to where it was when the alternate screen started.
+     * Lines written during the alternate screen (nano's status bar, edited
+     * content, etc.) are discarded — they were conceptually on a separate
+     * buffer.  This gives a clean slate matching real terminal behaviour:
+     * the pre-app content is restored and new shell output begins there. */
+    if (saved_total <= g_sb.total_filled_lines) {
+        uint32_t lines_to_remove = g_sb.total_filled_lines - saved_total;
+        if (lines_to_remove > cap) lines_to_remove = cap;
+        /* Rewind head and total_filled_lines.  The ring slots we abandon are
+         * simply overwritten on the next sb_new_line(). */
+        for (uint32_t i = 0; i < lines_to_remove; i++) {
+            g_sb.head = (g_sb.head == 0) ? (cap - 1) : (g_sb.head - 1);
+        }
+        g_sb.total_filled_lines = saved_total;
+    }
+
+    /* Reset the current scrollback slot to blank.  During the alt-screen
+     * session nano wrote its UI content into this slot (since CUP moves
+     * cursor_x/y but never advances g_sb.head).  The slot held a fresh
+     * blank line at the moment 1049h was processed, so blanking it here
+     * correctly restores the pre-nano state and prevents nano's status
+     * line (e.g. "[ Reading /etc/services ]") from appearing on the same
+     * screen line as the restored shell prompt. */
+    {
+        console_line_t* cur = sb_current_line();
+        cur->length = 0;
+        cur->write_pos = 0;
+        cur->text[0] = '\0';
+        cur->fg = VGA_COLOR_WHITE;
+        cur->bg = VGA_COLOR_BLACK;
+        for (uint32_t ci = 0; ci < CONSOLE_MAX_LINE_LENGTH; ci++) {
+            cur->fg_attrs[ci] = VGA_COLOR_WHITE;
+            cur->bg_attrs[ci] = VGA_COLOR_BLACK;
+        }
+    }
+
+    /* Pin the viewport to the bottom of the (now-trimmed) ring so that the
+     * restored prompt is visible and new output flows normally. */
+    uint32_t eff = sb_effective_total();
+    uint32_t max_vp = (eff > max_rows) ? (eff - max_rows) : 0;
+    g_sb.viewport_top = max_vp;
+    g_sb.at_bottom = 1;
+    g_prompt_guard_len = 0;
+
+    console_render_view();
+    fb_flush_dirty_regions();
+    spin_unlock_irqrestore(&console_lock, flags);
+}
+
 // End batch output mode: flushes any remaining dirty content unconditionally
 void console_batch_end(void) {
     g_console_batch_active = 0;
+    /* If the cursor is enabled but not currently shown (e.g. because a CUP
+     * sequence set cursor_shown=0 and no \033[?25h followed in this batch),
+     * show it now so the user sees the cursor after every key event without
+     * waiting up to 50 blink ticks. */
+    if (cursor_enabled && !cursor_shown && g_sb.at_bottom) {
+        uint64_t flags;
+        spin_lock_irqsave(&console_lock, &flags);
+        if (cursor_enabled && !cursor_shown && g_sb.at_bottom) {
+            cursor_last_x = cursor_x;
+            cursor_last_y = cursor_y;
+            cursor_blink_ticks = 0;
+            draw_cursor_at(cursor_x, cursor_y, 1);
+            cursor_shown = 1;
+        }
+        spin_unlock_irqrestore(&console_lock, flags);
+    } else if (cursor_enabled && cursor_shown) {
+        /* Cursor is already shown.  Check if cursor_x/y moved since it was
+         * last drawn (e.g. tmux sent 25h during the batch, then moved the
+         * cursor without a 25l/25h pair).  If so, hide at old position and
+         * re-draw at new position so cursor_saved_pixels always holds the
+         * character pixels, not stale bar pixels. */
+        uint64_t flags;
+        spin_lock_irqsave(&console_lock, &flags);
+        if (cursor_enabled && cursor_shown && g_sb.at_bottom &&
+            (cursor_last_x != cursor_x || cursor_last_y != cursor_y)) {
+            draw_cursor_at(cursor_last_x, cursor_last_y, 0);
+            cursor_shown = 0;
+            cursor_pixels_saved = 0;
+            cursor_last_x = cursor_x;
+            cursor_last_y = cursor_y;
+            cursor_blink_ticks = 0;
+            draw_cursor_at(cursor_x, cursor_y, 1);
+            cursor_shown = 1;
+        }
+        spin_unlock_irqrestore(&console_lock, flags);
+    }
     g_last_flush_tick = timer_ticks();
     fb_flush_dirty_regions();
 }
@@ -1094,6 +1605,17 @@ void console_backspace(void) {
 void console_cursor_enable(void) {
     uint64_t flags;
     spin_lock_irqsave(&console_lock, &flags);
+    /* If the cursor is already visible (e.g. drawn by console_batch_end),
+     * hide it first before re-saving pixels.  Without this, draw_cursor_at
+     * (show) would overwrite cursor_saved_pixels with the cursor-bar pixels
+     * rather than the character pixels.  A subsequent hide would then restore
+     * the cursor bar instead of the character, effectively erasing it — the
+     * "left arrow erases a character inside tmux" symptom. */
+    if (cursor_enabled && cursor_shown) {
+        draw_cursor_at(cursor_last_x, cursor_last_y, 0);
+        cursor_shown = 0;
+        cursor_pixels_saved = 0;
+    }
     // Update tracking to current position first
     cursor_last_x = cursor_x;
     cursor_last_y = cursor_y;

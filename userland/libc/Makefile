@@ -15,8 +15,10 @@ STDLIB_SRC = src/stdlib/stdlib.c src/stdlib/getopt.c src/stdlib/mkstemps.c
 CTYPE_SRC = src/ctype/ctype.c
 TIME_SRC = src/time/time.c
 DIR_SRC = src/dirent/dirent.c
-EXTRA_STDIO_SRC = src/stdio/getline.c
-SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/sched.c src/syscalls/socket.c
+MATH_SRC = src/math/math.c
+REGEX_SRC = src/regex/regex.c
+EXTRA_STDIO_SRC = src/stdio/getline.c src/stdio/err.c
+SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/sched.c src/syscalls/socket.c src/syscalls/uio.c src/syscalls/resource.c src/syscalls/pty_util.c
 DLFCN_SRC = src/dl/dlfcn.c
 NET_SRC = src/net/inet.c src/net/getaddrinfo.c src/net/getifaddrs.c src/net/netdb_extra.c
 PTHREAD_SRC = src/pthread/pthread.c src/pthread/pthread_mutex.c src/pthread/pthread_cond.c src/pthread/pthread_sync.c src/pthread/pthread_tsd.c
@@ -32,6 +34,8 @@ STDLIB_OBJ = $(STDLIB_SRC:.c=.o)
 CTYPE_OBJ = $(CTYPE_SRC:.c=.o)
 TIME_OBJ = $(TIME_SRC:.c=.o)
 DIR_OBJ = $(DIR_SRC:.c=.o)
+MATH_OBJ = $(MATH_SRC:.c=.o)
+REGEX_OBJ = $(REGEX_SRC:.c=.o)
 SYSCALLS_OBJ = $(SYSCALLS_SRC:.c=.o)
 DLFCN_OBJ = $(DLFCN_SRC:.c=.o)
 NET_OBJ = $(NET_SRC:.c=.o)
@@ -41,7 +45,7 @@ CRT1_OBJ = $(CRT1_SRC:.S=.o)
 
 # All static objects (libc – everything except pthread)
 LIBC_OBJ = $(MALLOC_OBJ) $(STDIO_OBJ) $(STRING_OBJ) $(STDLIB_OBJ) \
-           $(CTYPE_OBJ) $(TIME_OBJ) $(DIR_OBJ) $(SYSCALLS_OBJ) \
+           $(CTYPE_OBJ) $(TIME_OBJ) $(DIR_OBJ) $(MATH_OBJ) $(REGEX_OBJ) $(SYSCALLS_OBJ) \
            $(NET_OBJ)
 
 ALL_OBJ = $(LIBC_OBJ) $(PTHREAD_OBJ)

@@ -11,6 +11,9 @@ static char env_names[MAX_ENV_VARS][MAX_ENV_SIZE];
 static char env_values[MAX_ENV_VARS][MAX_ENV_SIZE];
 static int g_env_count = 0;
 
+/* POSIX environment vector - kept NULL until populated by program startup. */
+char **environ = (char *[]){ (char *)0 };
+
 void exit(int status) {
     fflush(stdout);
     fflush(stderr);
@@ -555,4 +558,24 @@ void* bsearch(const void* key, const void* base, size_t nmemb, size_t size, int 
     }
     
     return NULL;
+}
+
+/* system: fork+exec /bin/sh -c command. Returns child status, or -1 on
+ * fork/exec failure. NULL command merely tests for shell availability;
+ * we always have /bin/sh, so return non-zero. */
+int system(const char *command) {
+    extern int execl(const char *path, const char *arg, ...);
+    extern int waitpid(int pid, int *status, int options);
+    extern int fork(void);
+    extern void _exit(int);
+    if (!command) return 1;
+    int pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        execl("/bin/sh", "sh", "-c", command, (char *)0);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    return status;
 }

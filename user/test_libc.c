@@ -32,6 +32,8 @@
 #include <sys/select.h>
 #include <sys/epoll.h>
 #include <net/if.h>
+#include <sys/uio.h>
+#include <sys/resource.h>
 
 // Futex helper declarations (from sched.c)
 int futex_wait(int* uaddr, int val, const struct timespec* timeout);
@@ -5184,6 +5186,73 @@ network_section:
         int ep = epoll_create1(EPOLL_CLOEXEC);
         test_result("epoll_create1(EPOLL_CLOEXEC) returns fd", ep >= 0);
         if (ep >= 0) close(ep);
+    }
+
+    // ========================================
+    // Test: writev / readv (vectored I/O)
+    // ========================================
+    printf("\n[TEST] writev/readv\n");
+    {
+        int fd = open("/tmp/_uio_test", O_RDWR | O_CREAT | O_TRUNC, 0600);
+        test_result("open temp for writev", fd >= 0);
+        if (fd >= 0) {
+            struct iovec wiov[3];
+            wiov[0].iov_base = (void*)"Hello, ";
+            wiov[0].iov_len  = 7;
+            wiov[1].iov_base = (void*)"vectored ";
+            wiov[1].iov_len  = 9;
+            wiov[2].iov_base = (void*)"I/O!";
+            wiov[2].iov_len  = 4;
+            ssize_t wn = writev(fd, wiov, 3);
+            test_result("writev returns 20", wn == 20);
+            lseek(fd, 0, SEEK_SET);
+            char b1[7] = {0}, b2[9] = {0}, b3[5] = {0};
+            struct iovec riov[3];
+            riov[0].iov_base = b1; riov[0].iov_len = 7;
+            riov[1].iov_base = b2; riov[1].iov_len = 9;
+            riov[2].iov_base = b3; riov[2].iov_len = 4;
+            ssize_t rn = readv(fd, riov, 3);
+            test_result("readv returns 20", rn == 20);
+            test_result("readv data matches",
+                        memcmp(b1, "Hello, ", 7) == 0 &&
+                        memcmp(b2, "vectored ", 9) == 0 &&
+                        memcmp(b3, "I/O!", 4) == 0);
+            close(fd);
+            unlink("/tmp/_uio_test");
+        }
+    }
+
+    // ========================================
+    // Test: setsid / getpgid (session/process group)
+    // ========================================
+    printf("\n[TEST] setsid/getpgid\n");
+    {
+        pid_t pid = fork();
+        test_result("fork for setsid", pid >= 0);
+        if (pid == 0) {
+            /* Child: become a new session leader. */
+            pid_t sid = setsid();
+            pid_t self = getpid();
+            _exit((sid == self) ? 0 : 1);
+        } else if (pid > 0) {
+            int status = 0;
+            waitpid(pid, &status, 0);
+            test_result("child setsid() == getpid()",
+                        WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        }
+        pid_t pg = getpgid(0);
+        test_result("getpgid(0) returns valid pgid", pg > 0);
+    }
+
+    // ========================================
+    // Test: getrusage (RUSAGE_SELF)
+    // ========================================
+    printf("\n[TEST] getrusage\n");
+    {
+        struct rusage ru;
+        memset(&ru, 0, sizeof(ru));
+        int r = getrusage(RUSAGE_SELF, &ru);
+        test_result("getrusage(RUSAGE_SELF) == 0", r == 0);
     }
 
     // ========================================

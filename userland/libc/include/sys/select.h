@@ -7,6 +7,9 @@
 
 #define FD_SETSIZE 1024
 
+typedef unsigned long fd_mask;
+#define NFDBITS (8 * sizeof(fd_mask))
+
 typedef struct {
     unsigned long fds_bits[FD_SETSIZE / (8 * sizeof(unsigned long))];
 } fd_set;

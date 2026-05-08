@@ -986,9 +986,18 @@ void sched_reparent_children(task_t* task) {
     task_t* child = task->first_child;
     while (child) {
         task_t* nxt = child->next_sibling;
-        child->parent = &g_bootstrap_task;
-        child->next_sibling = g_bootstrap_task.first_child;
-        g_bootstrap_task.first_child = child;
+        /* Bootstrap (PID 0) never calls waitpid.  If we'd reparent a
+         * zombie to it, the zombie would live forever.  Queue it for
+         * deferred reaping instead. */
+        if (child->state == TASK_ZOMBIE) {
+            child->parent = &g_bootstrap_task;   /* keep field consistent */
+            child->next_sibling = NULL;
+            dead_thread_queue(child);
+        } else {
+            child->parent = &g_bootstrap_task;
+            child->next_sibling = g_bootstrap_task.first_child;
+            g_bootstrap_task.first_child = child;
+        }
         child = nxt;
     }
     task->first_child = NULL;
@@ -1493,6 +1502,17 @@ void sched_mark_task_exited(task_t* task, int status) {
         if (task->parent->wait_channel == task->parent) {
             sched_wake_task(task->parent);
         }
+    }
+
+    /* Orphan reaping: if this task's parent is bootstrap (PID 0), no one
+     * will ever waitpid() on it.  Mark it the same way thread zombies are
+     * marked so that the next context switch defers it for reaping.  We
+     * cannot free it here because we are still running on its stack. */
+    if (task->parent == &g_bootstrap_task && task->exit_signal != 0 &&
+        (task != task->group_leader || task->nr_threads == 0)) {
+        /* Reuse the thread-zombie path: clearing exit_signal makes
+         * sched_switch_to() route this task to dead_thread_queue. */
+        task->exit_signal = 0;
     }
 
     local_irq_restore(irq_flags);

@@ -17,6 +17,10 @@ typedef unsigned int speed_t;
 #define INLCR   0x0002
 #define IGNCR   0x0004
 
+// Output flags (must match userland libc <termios.h>)
+#define OPOST   0x0001
+#define ONLCR   0x0002
+
 // Local flags
 #define ISIG    0x0001
 #define ICANON  0x0002
@@ -116,6 +120,7 @@ int tty_pty_is_allocated(int id);
 long tty_pty_master_read(int id, void* buf, long count, int nonblock);
 long tty_pty_master_write(int id, const void* buf, long count);
 int tty_pty_master_close(int id);
+int tty_pty_master_poll(int id, int events);
 int tty_pty_slave_close(int id);
 
 #endif

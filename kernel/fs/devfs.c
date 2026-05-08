@@ -14,6 +14,8 @@
 #define DEVFS_TYPE_PTS_DIR    5
 #define DEVFS_TYPE_RANDOM     6
 #define DEVFS_TYPE_URANDOM    7
+#define DEVFS_TYPE_NULL       8
+#define DEVFS_TYPE_ZERO       9
 
 typedef struct {
     vfs_file_t vfs;
@@ -157,6 +159,20 @@ int devfs_open_for_task(const char* path, int flags, vfs_file_t** out, task_t* c
         *out = &df->vfs;
         return ST_OK;
     }
+    if (is_path(path, "/dev/null")) {
+        devfs_file_t* df = devfs_alloc_file();
+        if (!df) return ST_NOMEM;
+        df->type = DEVFS_TYPE_NULL;
+        *out = &df->vfs;
+        return ST_OK;
+    }
+    if (is_path(path, "/dev/zero")) {
+        devfs_file_t* df = devfs_alloc_file();
+        if (!df) return ST_NOMEM;
+        df->type = DEVFS_TYPE_ZERO;
+        *out = &df->vfs;
+        return ST_OK;
+    }
     if (is_prefix(path, "/dev/pts/")) {
         int id = 0;
         const char* p = path + 9;
@@ -195,7 +211,8 @@ int devfs_stat(const char* path, struct kstat* st) {
         return ST_OK;
     }
     if (is_path(path, "/dev/tty") || is_path(path, "/dev/console") || is_path(path, "/dev/tty0") || is_path(path, "/dev/ptmx") ||
-        is_path(path, "/dev/random") || is_path(path, "/dev/urandom")) {
+        is_path(path, "/dev/random") || is_path(path, "/dev/urandom") ||
+        is_path(path, "/dev/null") || is_path(path, "/dev/zero")) {
         st->st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
         st->st_nlink = 1;
         st->st_atime = now;
@@ -226,14 +243,15 @@ long devfs_read(vfs_file_t* f, void* buf, long bytes) {
     if (!f || !buf) return -EINVAL;
     devfs_file_t* df = (devfs_file_t*)f->fs_private;
     if (!df) return -EINVAL;
+    int nonblock = (f->flags & O_NONBLOCK) ? 1 : 0;
     if (df->type == DEVFS_TYPE_TTY) {
-        return tty_read(df->tty, buf, bytes, 0);
+        return tty_read(df->tty, buf, bytes, nonblock);
     }
     if (df->type == DEVFS_TYPE_PTY_SLAVE) {
-        return tty_read(df->tty, buf, bytes, 0);
+        return tty_read(df->tty, buf, bytes, nonblock);
     }
     if (df->type == DEVFS_TYPE_PTY_MASTER) {
-        return tty_pty_master_read(df->pty_id, buf, bytes, 0);
+        return tty_pty_master_read(df->pty_id, buf, bytes, nonblock);
     }
     if (df->type == DEVFS_TYPE_RANDOM) {
         smap_disable();
@@ -246,6 +264,16 @@ long devfs_read(vfs_file_t* f, void* buf, long bytes) {
         int ret = random_get_bytes(buf, (size_t)bytes, 0);
         smap_enable();
         return ret < 0 ? -EIO : (long)ret;
+    }
+    if (df->type == DEVFS_TYPE_NULL) {
+        return 0; /* always EOF */
+    }
+    if (df->type == DEVFS_TYPE_ZERO) {
+        smap_disable();
+        char* p = (char*)buf;
+        for (long i = 0; i < bytes; i++) p[i] = 0;
+        smap_enable();
+        return bytes;
     }
     return -EINVAL;
 }
@@ -265,6 +293,10 @@ long devfs_write(vfs_file_t* f, const void* buf, long bytes) {
         smap_disable();
         random_add_entropy(buf, (size_t)bytes);
         smap_enable();
+        return bytes;
+    }
+    if (df->type == DEVFS_TYPE_NULL || df->type == DEVFS_TYPE_ZERO) {
+        /* /dev/null and /dev/zero discard all writes. */
         return bytes;
     }
     return -EINVAL;
@@ -313,6 +345,8 @@ long devfs_readdir(vfs_file_t* f, void* buf, long bytes) {
         devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "pts", 5, 4);
         devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "random", 6, 2);
         devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "urandom", 7, 2);
+        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "null", 8, 2);
+        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "zero", 9, 2);
         df->dir_pos = 1;
         return (long)out_off;
     }
@@ -367,6 +401,12 @@ int devfs_ioctl(vfs_file_t* f, unsigned long req, void* argp, task_t* cur) {
             smap_enable();
             return 0;
         }
+        /* Forward all other ioctls to the slave tty (TIOCSWINSZ, TIOCGWINSZ,
+         * TCGETS, TCSETS, TIOCGPGRP, TIOCSPGRP …).  tmux calls
+         * ioctl(ptm_fd, TIOCSWINSZ, &ws) to resize each pane after a split;
+         * without this the ioctl returns ENOTTY and the server exits. */
+        tty_t* slave = tty_get_pty_slave(df->pty_id);
+        if (slave) return tty_ioctl(slave, req, argp, cur);
     }
     return -ENOTTY;
 }
@@ -393,6 +433,15 @@ tty_t* devfs_get_tty(vfs_file_t* f) {
         return df->tty;
     }
     return NULL;
+}
+
+/* Returns the pty master id for a /dev/ptmx-opened vfs_file_t,
+ * or -1 if the file is not a pty master. */
+int devfs_get_pty_master_id(vfs_file_t* f) {
+    if (!f || f->ops != &g_devfs_ops) return -1;
+    devfs_file_t* df = (devfs_file_t*)f->fs_private;
+    if (!df || df->type != DEVFS_TYPE_PTY_MASTER) return -1;
+    return df->pty_id;
 }
 
 int devfs_is_devfile(vfs_file_t* f) {

@@ -46,4 +46,13 @@ size_t strftime(char *s, size_t max, const char *format, const struct tm *tm);
 
 int nanosleep(const struct timespec *req, struct timespec *rem);
 
+char *ctime(const time_t *timep);
+char *ctime_r(const time_t *timep, char *buf);
+char *asctime(const struct tm *tm);
+char *asctime_r(const struct tm *tm, char *buf);
+void tzset(void);
+extern char *tzname[2];
+extern long timezone;
+extern int daylight;
+
 #endif

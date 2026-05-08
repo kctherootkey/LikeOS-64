@@ -278,3 +278,112 @@ char* strerror(int errnum) {
         }
     }
 }
+
+/* OpenBSD-style bounded copies. Always NUL-terminate when siz > 0
+ * and return the length the caller would have produced (i.e. truncation
+ * is signalled by a return value >= siz). */
+size_t strlcpy(char *dst, const char *src, size_t siz) {
+    const char *s = src;
+    size_t n = siz;
+    if (n != 0) {
+        while (--n != 0) {
+            if ((*dst++ = *s++) == '\0') break;
+        }
+    }
+    if (n == 0) {
+        if (siz != 0) *dst = '\0';
+        while (*s++) ;
+    }
+    return (size_t)(s - src - 1);
+}
+
+size_t strlcat(char *dst, const char *src, size_t siz) {
+    char *d = dst;
+    const char *s = src;
+    size_t n = siz;
+    size_t dlen;
+    while (n-- != 0 && *d != '\0') d++;
+    dlen = (size_t)(d - dst);
+    n = siz - dlen;
+    if (n == 0) {
+        size_t slen = 0;
+        while (src[slen]) slen++;
+        return dlen + slen;
+    }
+    while (*s != '\0') {
+        if (n != 1) { *d++ = *s; n--; }
+        s++;
+    }
+    *d = '\0';
+    return dlen + (size_t)(s - src);
+}
+
+char *strsep(char **stringp, const char *delim) {
+    char *s = *stringp;
+    char *tok;
+    const char *sp;
+    int c, sc;
+    if (s == 0) return 0;
+    for (tok = s;;) {
+        c = *s++;
+        sp = delim;
+        do {
+            if ((sc = *sp++) == c) {
+                if (c == 0) s = 0;
+                else s[-1] = 0;
+                *stringp = s;
+                return tok;
+            }
+        } while (sc != 0);
+    }
+}
+
+/* strsignal: short text description of signal number. */
+char *strsignal(int sig) {
+    static char buf[32];
+    const char *m;
+    switch (sig) {
+    case 1:  m = "Hangup"; break;
+    case 2:  m = "Interrupt"; break;
+    case 3:  m = "Quit"; break;
+    case 4:  m = "Illegal instruction"; break;
+    case 5:  m = "Trace/breakpoint trap"; break;
+    case 6:  m = "Aborted"; break;
+    case 7:  m = "Bus error"; break;
+    case 8:  m = "Floating point exception"; break;
+    case 9:  m = "Killed"; break;
+    case 10: m = "User defined signal 1"; break;
+    case 11: m = "Segmentation fault"; break;
+    case 12: m = "User defined signal 2"; break;
+    case 13: m = "Broken pipe"; break;
+    case 14: m = "Alarm clock"; break;
+    case 15: m = "Terminated"; break;
+    case 17: m = "Child exited"; break;
+    case 18: m = "Continued"; break;
+    case 19: m = "Stopped (signal)"; break;
+    case 20: m = "Stopped"; break;
+    case 21: m = "Stopped (tty input)"; break;
+    case 22: m = "Stopped (tty output)"; break;
+    case 23: m = "Urgent I/O condition"; break;
+    case 24: m = "CPU time limit exceeded"; break;
+    case 25: m = "File size limit exceeded"; break;
+    case 26: m = "Virtual timer expired"; break;
+    case 27: m = "Profiling timer expired"; break;
+    case 28: m = "Window changed"; break;
+    case 29: m = "I/O possible"; break;
+    case 30: m = "Power failure"; break;
+    case 31: m = "Bad system call"; break;
+    default: {
+        char *p = buf;
+        const char *pre = "Unknown signal ";
+        while (*pre) *p++ = *pre++;
+        if (sig < 0) { *p++ = '-'; sig = -sig; }
+        if (sig >= 100) { *p++ = '0' + (sig / 100); sig %= 100; *p++ = '0' + (sig / 10); sig %= 10; }
+        else if (sig >= 10) { *p++ = '0' + (sig / 10); sig %= 10; }
+        *p++ = '0' + sig;
+        *p = '\0';
+        return buf;
+    }
+    }
+    return (char *)m;
+}

@@ -1,0 +1,53 @@
+# Makefile.likeos - cross-build of libevent 2.1.12 as a PIC shared object
+# (libevent.so) for LikeOS-64 userland.  Uses select(2)+poll(2)+signal(3)
+# back-ends; epoll/eventfd/timerfd/signalfd/kqueue/openssl/zlib are all
+# disabled in include/event2/event-config.h.  No autoconf is involved.
+
+LIBC_DIR     := ../../../userland/libc
+RTLD_DIR     := ../../../userland/rtld
+LIKEOS_INCS  := -I$(LIBC_DIR)/include
+LIKEOS_LDS   := ../../../user/user_dyn.lds
+
+CC      := gcc
+LD      := ld
+AR      := ar
+
+CFLAGS  := -Wall -O2 -nostdlib -fno-builtin -fno-stack-protector \
+           -mno-red-zone -ffreestanding -fPIC \
+           -DHAVE_CONFIG_H -D_GNU_SOURCE \
+           -I. -I./include -I./compat \
+           $(LIKEOS_INCS) \
+           -Wno-unused-parameter -Wno-unused-function \
+           -Wno-unused-variable -Wno-pointer-sign \
+           -Wno-implicit-function-declaration \
+           -Wno-int-conversion -Wno-incompatible-pointer-types \
+           -Wno-discarded-qualifiers -Wno-strict-aliasing
+
+# Core sources required for select/poll/signal back-ends.
+CORE_SRC = \
+    event.c evthread.c buffer.c bufferevent.c bufferevent_sock.c \
+    bufferevent_filter.c bufferevent_pair.c listener.c bufferevent_ratelim.c \
+    evmap.c log.c evutil.c evutil_rand.c evutil_time.c \
+    signal.c select.c poll.c \
+    strlcpy.c
+
+# (compat/strlcpy.c is unused - we link the top-level strlcpy.c instead.)
+COMPAT_SRC =
+
+OBJS := $(CORE_SRC:.c=.pic.o)
+
+LIBEVENT_SO := libevent.so
+
+all: $(LIBEVENT_SO)
+
+%.pic.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(LIBEVENT_SO): $(OBJS)
+	$(LD) -shared -nostdlib -Bsymbolic-functions --hash-style=gnu \
+	    -soname libevent.so -o $@ $(OBJS)
+
+clean:
+	rm -f $(OBJS) $(LIBEVENT_SO)
+
+.PHONY: all clean

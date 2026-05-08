@@ -1,0 +1,120 @@
+# Makefile.likeos - cross-build of tmux 3.6a for LikeOS-64.
+#
+# Links dynamically against:
+#   - libc.so      (LikeOS-64 libc - PIE-friendly)
+#   - libevent.so  (built from ports/lib/libevent-2.1.12)
+#   - ncurses.so   (LikeOS-64 ncurses-likeos port)
+#   - ld-likeos.so (dynamic loader)
+#
+# Position-independent executable produced via the user_dyn.lds linker
+# script, matching the convention used for nano(1) and the other ports.
+
+LIBC_DIR     := ../../userland/libc
+RTLD_DIR     := ../../userland/rtld
+NCURSES_DIR  := ../lib/ncurses-likeos
+LIBEVENT_DIR := ../lib/libevent-2.1.12
+USER_LDS     := ../../user/user_dyn.lds
+BUILD_DIR    := ../../build
+
+CC := gcc
+LD := ld
+
+CFLAGS := -Wall -O2 -nostdlib -fno-builtin -fno-stack-protector \
+          -mno-red-zone -ffreestanding -fPIE \
+          -DHAVE_CONFIG_H -DTMUX_VERSION='"3.6a"' \
+          -D__LikeOS__=1 \
+          -DTMUX_CONF='"/etc/tmux.conf:~/.tmux.conf"' \
+          -I. -I./compat \
+          -I$(LIBC_DIR)/include \
+          -I$(NCURSES_DIR) \
+          -I$(LIBEVENT_DIR)/include \
+          -Wno-unused-parameter -Wno-unused-function \
+          -Wno-unused-variable -Wno-unused-but-set-variable \
+          -Wno-unused-result -Wno-pointer-sign \
+          -Wno-implicit-function-declaration \
+          -Wno-int-conversion -Wno-incompatible-pointer-types \
+          -Wno-discarded-qualifiers -Wno-strict-aliasing \
+          -Wno-format -Wno-format-extra-args \
+          -Wno-sign-compare -Wno-missing-braces \
+          -Wno-stringop-truncation -Wno-stringop-overflow \
+          -Wno-array-bounds -Wno-cast-function-type \
+          -Wno-deprecated-declarations \
+          -Wno-uninitialized -Wno-maybe-uninitialized
+
+# Core upstream sources (everything in . except platform-specific osdep-*
+# files, the in-tree fuzzer harness, the optional sixel image module, and
+# alternate forkpty-* fall-backs).  cmd-parse.c is generated from
+# cmd-parse.y by yacc(1) at the top-level Makefile.likeos rule.
+TMUX_SRC := \
+    alerts.c arguments.c attributes.c cfg.c client.c \
+    cmd-attach-session.c cmd-bind-key.c cmd-break-pane.c cmd.c \
+    cmd-capture-pane.c cmd-choose-tree.c cmd-command-prompt.c \
+    cmd-confirm-before.c cmd-copy-mode.c cmd-detach-client.c \
+    cmd-display-menu.c cmd-display-message.c cmd-display-panes.c \
+    cmd-find.c cmd-find-window.c cmd-if-shell.c cmd-join-pane.c \
+    cmd-kill-pane.c cmd-kill-server.c cmd-kill-session.c \
+    cmd-kill-window.c cmd-list-buffers.c cmd-list-clients.c \
+    cmd-list-keys.c cmd-list-panes.c cmd-list-sessions.c \
+    cmd-list-windows.c cmd-load-buffer.c cmd-lock-server.c \
+    cmd-move-window.c cmd-new-session.c cmd-new-window.c \
+    cmd-parse.c cmd-paste-buffer.c cmd-pipe-pane.c cmd-queue.c \
+    cmd-refresh-client.c cmd-rename-session.c cmd-rename-window.c \
+    cmd-resize-pane.c cmd-resize-window.c cmd-respawn-pane.c \
+    cmd-respawn-window.c cmd-rotate-window.c cmd-run-shell.c \
+    cmd-save-buffer.c cmd-select-layout.c cmd-select-pane.c \
+    cmd-select-window.c cmd-send-keys.c cmd-server-access.c \
+    cmd-set-buffer.c cmd-set-environment.c cmd-set-option.c \
+    cmd-show-environment.c cmd-show-messages.c cmd-show-options.c \
+    cmd-show-prompt-history.c cmd-source-file.c cmd-split-window.c \
+    cmd-swap-pane.c cmd-swap-window.c cmd-switch-client.c \
+    cmd-unbind-key.c cmd-wait-for.c colour.c control.c \
+    control-notify.c environ.c file.c format.c format-draw.c \
+    grid.c grid-reader.c grid-view.c hyperlinks.c input.c \
+    input-keys.c job.c key-bindings.c key-string.c layout.c \
+    layout-custom.c layout-set.c log.c menu.c mode-tree.c names.c \
+    notify.c options.c options-table.c paste.c popup.c proc.c \
+    regsub.c resize.c screen.c screen-redraw.c screen-write.c \
+    server-acl.c server.c server-client.c server-fn.c session.c \
+    spawn.c status.c style.c tmux.c tty-acs.c tty.c tty-features.c \
+    tty-keys.c tty-term.c utf8.c utf8-combined.c window-buffer.c \
+    window.c window-client.c window-clock.c window-copy.c \
+    window-customize.c window-tree.c xmalloc.c \
+    osdep-unknown.c
+
+# Compat fall-backs for routines our libc does not provide.
+COMPAT_SRC := \
+    compat/asprintf.c compat/base64.c compat/cfmakeraw.c \
+    compat/closefrom.c compat/daemon.c compat/explicit_bzero.c \
+    compat/fdforkpty.c compat/fgetln.c compat/freezero.c \
+    compat/getdtablecount.c compat/getdtablesize.c compat/getopt_long.c \
+    compat/getpeereid.c compat/getprogname.c compat/htonll.c \
+    compat/imsg.c compat/imsg-buffer.c compat/memmem.c compat/ntohll.c \
+    compat/reallocarray.c compat/recallocarray.c \
+    compat/setproctitle.c compat/strcasestr.c compat/strtonum.c \
+    compat/unvis.c compat/vis.c
+
+OBJS := $(TMUX_SRC:.c=.o) $(COMPAT_SRC:.c=.o)
+
+LIBS := -L$(LIBEVENT_DIR) -L$(NCURSES_DIR) -L$(LIBC_DIR) -L$(RTLD_DIR) \
+        -l:libevent.so -l:ncurses.so -l:libc.so -l:ld-likeos.so
+
+TMUX := tmux
+
+all: $(TMUX)
+
+%.o: %.c config.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+cmd-parse.c cmd-parse.h: cmd-parse.y
+	yacc -d -o cmd-parse.c cmd-parse.y
+
+$(TMUX): $(OBJS)
+	$(LD) -pie --no-dynamic-linker -nostdlib --hash-style=gnu \
+	    -T $(USER_LDS) -e _start \
+	    -dynamic-linker /lib/ld-likeos.so \
+	    -o $@ $(LIBC_DIR)/crt1.o $(OBJS) $(LIBS)
+
+clean:
+	rm -f $(OBJS) $(TMUX) cmd-parse.c cmd-parse.h
+
+.PHONY: all clean

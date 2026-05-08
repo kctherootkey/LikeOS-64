@@ -33,7 +33,8 @@ typedef struct {
 // Ring-buffer line
 typedef struct {
     char     text[CONSOLE_MAX_LINE_LENGTH];
-    uint16_t length;     // number of used characters in text
+    uint16_t length;     // visible length: highest write position ever reached
+    uint16_t write_pos;  // current write offset (reset to 0 by CR for overwrite)
     uint8_t  fg;         // legacy line-level fg (first char or last written)
     uint8_t  bg;         // legacy line-level bg
     // Per-character attributes to preserve color across scrolling
@@ -76,6 +77,8 @@ void console_putchar_batch(char c);  // No VRAM flush — call console_flush() w
 void console_flush(void);            // Rate-limited VRAM flush for batch output
 void console_batch_begin(void);      // Begin batch mode (suppresses cursor updates)
 void console_batch_end(void);        // End batch mode (unconditional final flush)
+uint32_t console_get_sb_total(void); // Snapshot scrollback line count (for alt-screen save)
+void console_restore_alt_screen(uint32_t saved_total); // Restore pre-alt-screen viewport
 void console_puts(const char* str);
 void console_set_color(uint8_t fg, uint8_t bg);
 void console_scroll(void);
@@ -88,6 +91,24 @@ void console_set_cursor_pos(uint32_t row, uint32_t col);
 void console_get_cursor_pos(uint32_t *row, uint32_t *col);
 void console_erase_display(int mode);   // 0=below, 1=above, 2=all
 void console_erase_line(int mode);      // 0=to end, 1=to start, 2=whole line
+
+// VT-style line / character editing (used by terminal emulators like tmux).
+void console_erase_chars(int n);                    // ECH:    erase N chars from cursor (in place)
+void console_insert_lines(int n, int top, int bot); // IL:     scroll [cursor..bot] down by N
+void console_delete_lines(int n, int top, int bot); // DL:     scroll [cursor..bot] up by N
+void console_insert_chars(int n);                   // ICH:    shift chars right from cursor
+void console_delete_chars(int n);                   // DCH:    shift chars left at cursor
+void console_scroll_region_up(int n, int top, int bot);   // SU:  scroll region [top..bot] up
+void console_scroll_region_down(int n, int top, int bot); // SD:  scroll region [top..bot] down
+
+// Active scroll region (DECSTBM).  Pass top<0 or bot<0 to clear it.
+// Coordinates are 0-based, inclusive.  Honored by the implicit \\n / wrap
+// scroll path so that pinned status rows below the region are preserved.
+void console_set_scroll_region(int top, int bot);
+void console_get_scroll_region(int *top, int *bot);
+
+// Set color using direct RGB values (used for 24-bit truecolor SGR).
+void console_set_color_rgb(uint32_t fg_rgb, uint32_t bg_rgb);
 
 // Query console dimensions (actual rows/cols based on framebuffer and font)
 void console_get_dimensions(uint32_t *rows, uint32_t *cols);

@@ -16,6 +16,21 @@
 #define TIOCGPTN   0x80045430
 #define TIOCSGUARD 0x5420
 #define TIOCLINUX  0x541C
+#define FIONREAD   0x541B
+#define FIONBIO    0x5421
+#define FIOCLEX    0x5451
+#define FIONCLEX   0x5450
+#define FIOASYNC   0x5452
+#define TIOCNOTTY  0x5422
+#define TIOCSTI    0x5412
+#define TIOCEXCL   0x540C
+#define TIOCNXCL   0x540D
+#define TIOCGETD   0x5424
+#define TIOCSETD   0x5423
+#define TIOCMGET   0x5415
+#define TIOCMSET   0x5418
+#define TIOCMBIC   0x5417
+#define TIOCMBIS   0x5416
 
 // Network interface ioctls (Linux-compatible)
 #define SIOCGIFCONF     0x8912

@@ -36,6 +36,7 @@ void abort(void) __attribute__((noreturn));
 
 // Environment
 char* getenv(const char* name);
+int system(const char *command);
 int setenv(const char* name, const char* value, int overwrite);
 int unsetenv(const char* name);
 int clearenv(void);

@@ -1308,8 +1308,11 @@ static int run_builtin(int argc, char **argv) {
         printf("  mkdir rmdir uname ps kill find df du hexdump\n");
         printf("  sort uniq cut tr yes true false time\n");
         printf("  grep head tail wc echo printf free uptime dmesg\n");
-        printf("  which date sleep strings file top man nano\n");
+        printf("  which date sleep strings file top man nano tmux\n");
         printf("  shutdown reboot poweroff halt\n");
+        printf("Networking commands:\n");
+        printf("  ifconfig ping netstat route arp traceroute arping\n");
+        printf("  dhclient dig nslookup host hostname\n");
         printf("Keyboard shortcuts:\n");
         printf("  Ctrl+D  - Debug dump\n");
         printf("  Ctrl+C  - Interrupt current process\n");
@@ -1356,6 +1359,14 @@ static int last_exit_status = 0;
  * Returns exit status.
  */
 static int exec_single(simple_cmd_t *cmd, int background) {
+    /* Snapshot tty state so we can restore it after the child exits.
+     * A child that gets killed before resetting termios (e.g. SIGKILL of
+     * nano) would otherwise leave the terminal in raw mode (OPOST off,
+     * ECHO off, ICANON off), which causes shell output to staircase
+     * (\n without \r) and silent unechoed input. */
+    struct termios saved_tio;
+    int tio_valid = (tcgetattr(STDIN_FILENO, &saved_tio) == 0);
+
     pid_t pid = fork();
     if (pid == 0) {
         /* Child: create own process group, become foreground */
@@ -1399,6 +1410,11 @@ static int exec_single(simple_cmd_t *cmd, int background) {
 
     /* Restore shell as foreground */
     tcsetpgrp(STDIN_FILENO, getpgrp());
+
+    /* Restore termios in case the child exited without doing so. */
+    if (tio_valid) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved_tio);
+    }
 
     if (WIFEXITED(status))
         return WEXITSTATUS(status);
@@ -1896,6 +1912,11 @@ static void get_prompt(char *prompt, int maxlen) {
 
 int main(void) {
     setenv("PATH", "/bin:/usr/local/bin", 1);
+    /* Default TERM so terminfo-using programs (tmux, less, ...) get a
+     * usable capability list.  All consoles on LikeOS speak the same
+     * ANSI/xterm sequences our ncurses-likeos stub emits, so xterm
+     * is a safe baseline. */
+    setenv("TERM", "xterm-256color", 0);
     /* Read /etc/resolv.conf and program the kernel resolver before
      * any DNS-using program (dig, ping, dhclient -x, ...) runs. DHCP
      * option 6 will overwrite per-interface settings later. */

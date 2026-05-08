@@ -571,7 +571,7 @@ struct cmsghdr {
     int         cmsg_type;
 };
 #define CMSG_ALIGN(len) (((len) + sizeof(long) - 1) & ~(sizeof(long) - 1))
-#define CMSG_DATA(cmsg) ((unsigned char*)((cmsg) + 1))
+#define CMSG_DATA(cmsg) ((unsigned char*)(cmsg) + CMSG_ALIGN(sizeof(struct cmsghdr)))
 #define CMSG_LEN(len)   (CMSG_ALIGN(sizeof(struct cmsghdr)) + (len))
 #define CMSG_SPACE(len) (CMSG_ALIGN(sizeof(struct cmsghdr)) + CMSG_ALIGN(len))
 #define CMSG_FIRSTHDR(mhdr) \
@@ -623,6 +623,12 @@ struct in_pktinfo {
 #define MSG_OOB         0x01
 #define MSG_NOSIGNAL    0x4000
 #define MSG_TRUNC       0x20
+
+/* SCM_RIGHTS — passing of open file descriptors via sendmsg/recvmsg
+ * SOL_SOCKET-level ancillary data.  Userspace defines the same value
+ * in <sys/socket.h>; mirrored here so kernel-internal consumers
+ * (sock_sendmsg / sock_recvmsg) don't need to pull in libc headers. */
+#define SCM_RIGHTS      0x01
 
 #define NET_MAX_SOCKETS 128
 
@@ -1220,6 +1226,23 @@ typedef struct unix_socket {
     int backlog;
     volatile int accept_ready;
 
+    // Pending in-band file descriptors (SCM_RIGHTS).
+    // Sender pushes to peer's queue with the raw fd_table entry pointer
+    // (refcount already bumped); receiver pops and installs in its own
+    // fd_table.  Each pending fd is associated with an absolute byte
+    // offset (the cumulative number of bytes that had been written into
+    // the receive ring at the time the fd was attached); recvmsg
+    // delivers the fd together with bytes up to (and not past) that
+    // boundary so stream-mode SCM_RIGHTS is correctly framed.
+    // Capacity is small because tmux sends at most one fd per imsg and
+    // drains promptly; over-flow returns -EAGAIN to caller.
+    void*    pending_fds[16];
+    uint64_t pending_fd_off[16];
+    int      pending_fd_head;
+    int      pending_fd_tail;
+    uint64_t bytes_written; /* total bytes ever pushed into recv ring */
+    uint64_t bytes_read;    /* total bytes ever consumed from recv ring */
+
     spinlock_t lock;
     int ref_count;
 } unix_socket_t;
@@ -1237,6 +1260,17 @@ int  unix_socketpair(int type, int sv[2]);
 int  unix_shutdown(int usockfd, int how);
 unix_socket_t* unix_get(int usockfd);
 int  unix_poll(int usockfd, short events);
+/* SCM_RIGHTS file-descriptor passing helpers.  push() enqueues an
+ * fd_table entry (already ref-counted by caller) onto the receiver's
+ * queue; pop() removes the head entry.  Both return 0 on success or a
+ * negative errno (EAGAIN if queue full / empty). */
+int  unix_push_fd(unix_socket_t* sock, void* entry);
+int  unix_pop_fd(unix_socket_t* sock, void** out_entry);
+/* Peek the byte offset associated with the head of the pending-fd queue,
+ * if any.  Returns 0 on success and stores the absolute byte offset (in
+ * the receiver's bytes_read coordinate system) into *out_off; returns
+ * -EAGAIN when the queue is empty. */
+int  unix_peek_fd_offset(unix_socket_t* sock, uint64_t* out_off);
 
 // ============================================================================
 // DNS Resolver

@@ -16,6 +16,9 @@ ssize_t write(int fd, const void* buf, size_t count);
 int close(int fd);
 off_t lseek(int fd, off_t offset, int whence);
 int pipe(int pipefd[2]);
+int pipe2(int pipefd[2], int flags);
+int getpagesize(void);
+int getdtablesize(void);
 
 // Access and directories
 #define F_OK 0
@@ -46,6 +49,14 @@ int tcgetpgrp(int fd);
 int tcsetpgrp(int fd, int pgrp);
 int kill(int pid, int sig);
 
+// Sessions
+pid_t setsid(void);
+pid_t getsid(pid_t pid);
+pid_t getpgid(pid_t pid);
+
+/* Process environment vector. Defined in libc; may be NULL. */
+extern char **environ;
+
 // Misc
 unsigned int alarm(unsigned int seconds);
 unsigned int sleep(unsigned int seconds);
@@ -57,6 +68,8 @@ void sync(void);
 int ftruncate(int fd, off_t length);
 int fcntl(int fd, int cmd, ...);
 int isatty(int fd);
+char *ttyname(int fd);
+int ttyname_r(int fd, char *buf, size_t len);
 int unlink(const char* path);
 int rename(const char* oldpath, const char* newpath);
 int mkdir(const char* path, unsigned int mode);

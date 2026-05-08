@@ -390,3 +390,78 @@ size_t strftime(char *s, size_t max, const char *format, const struct tm *tm)
     s[pos] = '\0';
     return pos;
 }
+
+/* asctime / ctime - format a struct tm or a time_t into a 26-byte
+ * "Wed Jun 30 21:49:08 1993\n\0" string. tzset is a no-op since we
+ * track no local timezone. */
+
+static const char _wday_name[7][4] = {
+    "Sun","Mon","Tue","Wed","Thu","Fri","Sat"
+};
+static const char _mon_name[12][4] = {
+    "Jan","Feb","Mar","Apr","May","Jun",
+    "Jul","Aug","Sep","Oct","Nov","Dec"
+};
+
+static void _put2(char *p, int n) {
+    p[0] = '0' + (n / 10) % 10;
+    p[1] = '0' + (n % 10);
+}
+
+char *asctime_r(const struct tm *tm, char *buf) {
+    if (!tm || !buf) return 0;
+    int wday = tm->tm_wday & 7;
+    int mon  = tm->tm_mon  & 15;
+    if (wday >= 7) wday = 0;
+    if (mon  >= 12) mon  = 0;
+    int year = tm->tm_year + 1900;
+    /* "Www Mmm dd hh:mm:ss yyyy\n\0" - 26 bytes */
+    buf[0] = _wday_name[wday][0];
+    buf[1] = _wday_name[wday][1];
+    buf[2] = _wday_name[wday][2];
+    buf[3] = ' ';
+    buf[4] = _mon_name[mon][0];
+    buf[5] = _mon_name[mon][1];
+    buf[6] = _mon_name[mon][2];
+    buf[7] = ' ';
+    _put2(&buf[8], tm->tm_mday);
+    buf[10] = ' ';
+    _put2(&buf[11], tm->tm_hour);
+    buf[13] = ':';
+    _put2(&buf[14], tm->tm_min);
+    buf[16] = ':';
+    _put2(&buf[17], tm->tm_sec);
+    buf[19] = ' ';
+    buf[20] = '0' + ((year / 1000) % 10);
+    buf[21] = '0' + ((year / 100)  % 10);
+    buf[22] = '0' + ((year / 10)   % 10);
+    buf[23] = '0' + (year % 10);
+    buf[24] = '\n';
+    buf[25] = '\0';
+    return buf;
+}
+
+char *asctime(const struct tm *tm) {
+    static char buf[26];
+    return asctime_r(tm, buf);
+}
+
+char *ctime_r(const time_t *t, char *buf) {
+    struct tm tm;
+    if (!t || !buf) return 0;
+    if (!localtime_r(t, &tm)) return 0;
+    return asctime_r(&tm, buf);
+}
+
+char *ctime(const time_t *t) {
+    static char buf[26];
+    return ctime_r(t, buf);
+}
+
+char *tzname[2] = { (char *)"UTC", (char *)"UTC" };
+long  timezone  = 0;
+int   daylight  = 0;
+
+void tzset(void) {
+    /* No timezone database: localtime == gmtime, name is fixed. */
+}

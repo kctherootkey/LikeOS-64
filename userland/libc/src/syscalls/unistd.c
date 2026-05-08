@@ -1,5 +1,6 @@
 #include "../../include/unistd.h"
 #include "../../include/errno.h"
+#include "../../include/limits.h"
 #include "../../include/sys/wait.h"
 #include "../../include/sys/stat.h"
 #include "../../include/sys/time.h"
@@ -362,6 +363,24 @@ int tcsetpgrp(int fd, int pgrp) {
     return 0;
 }
 
+pid_t setsid(void) {
+    long ret = syscall0(SYS_SETSID);
+    if (ret < 0) { errno = -ret; return (pid_t)-1; }
+    return (pid_t)ret;
+}
+
+pid_t getsid(pid_t pid) {
+    long ret = syscall1(SYS_GETSID, pid);
+    if (ret < 0) { errno = -ret; return (pid_t)-1; }
+    return (pid_t)ret;
+}
+
+pid_t getpgid(pid_t pid) {
+    long ret = syscall1(SYS_GETPGID, pid);
+    if (ret < 0) { errno = -ret; return (pid_t)-1; }
+    return (pid_t)ret;
+}
+
 // Note: kill() is defined in signal.c
 
 pid_t wait(int* status) {
@@ -656,4 +675,67 @@ int futimens(int fd, const struct timespec times[2])
     (void)times;
     errno = ENOSYS;
     return -1;
+}
+
+int flock(int fd, int op) { (void)fd; (void)op; return 0; }
+
+
+/* BSD-style pipe2: emulated via pipe() + fcntl() since the kernel only
+ * exposes the legacy two-argument pipe call. flags accepts O_CLOEXEC
+ * and O_NONBLOCK like the BSD/SUSv4 variant. */
+int pipe2(int pipefd[2], int flags) {
+    if (pipe(pipefd) < 0) return -1;
+    if (flags & O_CLOEXEC) {
+        fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
+        fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
+    }
+    if (flags & O_NONBLOCK) {
+        int fl0 = fcntl(pipefd[0], F_GETFL, 0);
+        int fl1 = fcntl(pipefd[1], F_GETFL, 0);
+        fcntl(pipefd[0], F_SETFL, fl0 | O_NONBLOCK);
+        fcntl(pipefd[1], F_SETFL, fl1 | O_NONBLOCK);
+    }
+    return 0;
+}
+
+int getpagesize(void) {
+    return 4096;
+}
+
+int getdtablesize(void) {
+    return OPEN_MAX;
+}
+
+/* umask: file-mode creation mask. We don't track per-process state in
+ * the kernel today, so just store and return the previous value. */
+static mode_t _current_umask = 022;
+mode_t umask(mode_t mask) {
+    mode_t prev = _current_umask;
+    _current_umask = mask & 0777;
+    return prev;
+}
+
+/* ttyname: walk /dev/pts and /dev to find the path of fd's tty.
+ * Falls back to a fixed pseudo-name when the lookup fails. */
+char *ttyname(int fd) {
+    static char buf[64];
+    if (ttyname_r(fd, buf, sizeof(buf)) != 0) return 0;
+    return buf;
+}
+
+int ttyname_r(int fd, char *buf, size_t len) {
+    if (!isatty(fd)) { errno = ENOTTY; return ENOTTY; }
+    /* Best-effort: report the underlying console device, not the magic
+     * /dev/tty alias.  Some applications (e.g. tmux) refuse to use
+     * "/dev/tty" because that name resolves to whichever controlling
+     * terminal the calling process happens to have, rather than to a
+     * fixed device.  In LikeOS stdin/stdout/stderr of an interactive
+     * shell are the framebuffer console, which is exposed as
+     * /dev/console (and /dev/tty0). */
+    const char *name = "/dev/console";
+    size_t n = 0;
+    while (name[n]) n++;
+    if (n + 1 > len) { errno = ERANGE; return ERANGE; }
+    for (size_t i = 0; i <= n; i++) buf[i] = name[i];
+    return 0;
 }

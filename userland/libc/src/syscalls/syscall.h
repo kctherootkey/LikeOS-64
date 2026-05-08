@@ -174,6 +174,13 @@
 #define SYS_DNS_RESOLVE_REVERSE 375
 #define SYS_SET_DNS_SERVER 376
 
+#define SYS_SETSID      380
+#define SYS_GETSID      381
+#define SYS_GETPGID     382
+#define SYS_GETRUSAGE   383
+#define SYS_READV       384
+#define SYS_WRITEV      385
+
 // NET_GETINFO sub-commands
 #define NET_GET_ARP_TABLE       1
 #define NET_GET_ROUTE_TABLE     2

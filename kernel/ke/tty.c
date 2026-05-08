@@ -7,6 +7,7 @@
 #include "../../include/kernel/signal.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/timer.h"
+#include "../../include/kernel/net.h"
 
 #define TTY_MAX_PTYS 16
 
@@ -43,13 +44,37 @@ static int tty_copy_from_user(void* kernel_dst, const void* user_src, size_t len
     return 0;
 }
 
+/* PTY master ring buffer.
+ *
+ * The slave-side process writes here through tty_write -> tty->output.
+ * The master-side reader (e.g. tmux) drains it through tty_pty_master_read.
+ *
+ * Sizing: must accommodate one full screen redraw of a full-screen app
+ * (top, less, nano) plus enough headroom for bursts like `dmesg` or
+ * `ps aux` (which write tens of KiB in a tight loop).  64 KiB is
+ * comfortable for any reasonable terminal size; the master reader
+ * drains at IRQ-rate so it almost never fills.
+ *
+ * On overflow we drop trailing bytes (non-blocking).  We do NOT block
+ * the slave writer on a wait queue — a slave that gets killed while
+ * blocked there would be reaped while still linked into the queue,
+ * and the next wake would walk freed memory.  With 64 KiB and no SMP
+ * race on the indices, drops are vanishingly rare for normal apps.
+ *
+ * Locking: 'lock' protects master_buf/m_head/m_tail/m_count and
+ * slave_open.  Acquired with IRQs disabled because tty_pty_master_read
+ * can be called from syscall context on one CPU while a slave write
+ * runs on another.
+ */
+#define PTY_MASTER_BUF_SIZE 262144u
 typedef struct pty {
     int id;
     tty_t slave;
-    char master_buf[1024];
-    uint16_t m_head;
-    uint16_t m_tail;
-    uint16_t m_count;
+    char master_buf[PTY_MASTER_BUF_SIZE];
+    uint32_t m_head;
+    uint32_t m_tail;
+    uint32_t m_count;
+    spinlock_t lock;
     task_t* master_read_waiters;
     int master_open;
     int slave_open;
@@ -58,29 +83,25 @@ typedef struct pty {
 static tty_t g_console_tty;
 static pty_t g_ptys[TTY_MAX_PTYS];
 
+/* Wake all tasks parked on a wait queue identified by 'waiters'.
+ *
+ * The pointer value (e.g. &tty->read_waiters or &pty->master_read_waiters)
+ * is used purely as a stable channel identifier — we no longer maintain a
+ * linked list rooted at *waiters.  Instead, sched_wake_channel walks the
+ * global task list (under g_task_list_lock) and wakes every task whose
+ * wait_channel matches this address.
+ *
+ * This avoids a use-after-free that the old linked-list design suffered
+ * from: when a task blocked here was killed (e.g. SIGKILL of nano from a
+ * second tmux pane), sched_remove_task freed the task struct without
+ * unlinking it from any custom wait queues, and the next wake walked
+ * t->wait_next through freed memory and page-faulted in tty_wake_readers.
+ *
+ * 'waiters' itself is no longer touched (kept as a parameter only so
+ * existing call sites need no change).
+ */
 static void tty_wake_readers(task_t** waiters) {
-    // Collect woken tasks first, then enqueue them after clearing the list.
-    // We must enqueue via sched_enqueue_ready (not just set TASK_READY)
-    // so they actually get placed on a run queue and scheduled on SMP.
-    task_t* woken[16];
-    int nwoken = 0;
-    task_t* t = *waiters;
-    while (t) {
-        task_t* next = t->wait_next;
-        t->wait_next = NULL;
-        t->wait_channel = NULL;
-        if (t->state == TASK_BLOCKED) {
-            t->state = TASK_READY;
-            if (nwoken < 16) {
-                woken[nwoken++] = t;
-            }
-        }
-        t = next;
-    }
-    *waiters = NULL;
-    for (int i = 0; i < nwoken; i++) {
-        sched_enqueue_ready(woken[i]);
-    }
+    sched_wake_channel((void*)waiters);
 }
 
 static void tty_enqueue_read(tty_t* tty, char c) {
@@ -97,6 +118,22 @@ static void tty_enqueue_read(tty_t* tty, char c) {
 
     spin_unlock_irqrestore(&tty_lock, flags);
 }
+
+/* Lock-free variant: caller MUST already hold tty_lock.  Used from the
+ * ANSI parser's DSR/DA reply injection, which runs under tty_write's
+ * lock and would otherwise self-deadlock the same CPU. */
+static void tty_enqueue_read_locked(tty_t* tty, char c) {
+    if (tty->read_count >= sizeof(tty->read_buf)) return;
+    tty->read_buf[tty->read_tail] = c;
+    tty->read_tail = (tty->read_tail + 1) % sizeof(tty->read_buf);
+    tty->read_count++;
+}
+
+/* Set by the ANSI parser when it injects a query reply (DSR/DA/XTWINOPS)
+ * into the read buffer.  tty_write checks this *after* releasing tty_lock
+ * and wakes blocked readers then \u2014 we must not call into the scheduler
+ * while holding tty_lock with IRQs off. */
+static volatile int g_console_reply_pending = 0;
 
 static int tty_dequeue_read(tty_t* tty, char* out) {
     uint64_t flags;
@@ -121,8 +158,14 @@ static int tty_dequeue_read(tty_t* tty, char* out) {
  * ====================================================================== */
 enum ansi_state {
     ANSI_NORMAL = 0,
-    ANSI_ESC,       /* saw ESC (0x1B) */
-    ANSI_CSI,       /* saw ESC [ */
+    ANSI_ESC,         /* saw ESC (0x1B) */
+    ANSI_CSI,         /* saw ESC [ */
+    ANSI_OSC,         /* saw ESC ] — collecting until ST or BEL */
+    ANSI_OSC_ESC,     /* saw ESC inside OSC, waiting for '\\' (ST) */
+    ANSI_DCS,         /* saw ESC P / X / ^ / _ — eat until ST */
+    ANSI_DCS_ESC,     /* saw ESC inside DCS, waiting for '\\' */
+    ANSI_CHARSET,     /* saw ESC ( ) * + — designate G0/G1/G2/G3, eat 1 byte */
+    ANSI_HASH,        /* saw ESC #  — eat 1 byte (DECALN etc.) */
 };
 
 static enum ansi_state g_ansi_state = ANSI_NORMAL;
@@ -131,6 +174,40 @@ static int  g_ansi_params[ANSI_MAX_PARAMS];
 static int  g_ansi_nparam = 0;
 static int  g_ansi_cur_param = 0;       /* accumulating current number */
 static int  g_ansi_have_digit = 0;      /* have we seen a digit for cur param? */
+/* CSI intermediate byte (>, =, !, SP, $, ?).  We must remember it because
+ * '?' marks DEC private modes, and '>' selects DA2/XTVERSION variants.
+ * Without this, e.g. \e[>c (DA2) was being treated as \e[c (DA1) which
+ * gives tmux the wrong terminal class and breaks redraw. */
+static char g_ansi_intermediate = 0;
+
+/* Forward decls used by DSR/DA reply path. */
+static void tty_inject_string(tty_t* tty, const char* s);
+static int  itoa_simple(int val, char* buf);
+
+/* Saved cursor / SGR state for DECSC (ESC 7) / SCOSC (CSI s).
+ * tmux relies on this to safely paint the status bar in a different bg color
+ * and then revert; if we don't restore SGR, the bg-color "leaks" and the
+ * implicit BCE on the next region scroll fills the new bottom row in that
+ * leaked color (which produced the "green blank line above status bar"). */
+static int g_saved_cur_row = 0;
+static int g_saved_cur_col = 0;
+static int g_saved_valid   = 0;
+static uint8_t  g_saved_vga_fg     = 15;
+static uint8_t  g_saved_vga_bg     = 0;
+static int      g_saved_bold       = 0;
+static int      g_saved_reverse    = 0;
+static int      g_saved_fg_is_rgb  = 0;
+static int      g_saved_bg_is_rgb  = 0;
+static uint32_t g_saved_fg_rgb     = 0xFFFFFFFFu;
+static uint32_t g_saved_bg_rgb     = 0x00000000u;
+
+/* Scroll region (DECSTBM).  0..max_rows-1 inclusive; -1 means "full screen". */
+static int g_scroll_top = -1;
+static int g_scroll_bot = -1;
+
+/* Scrollback line count at the point when the alternate screen was entered
+ * (mode 1049h).  Used to restore the pre-alt-screen viewport on 1049l. */
+static uint32_t g_alt_screen_sb_total = 0;
 
 /* Map ANSI SGR color index (0-7) to VGA palette index */
 static uint8_t ansi_to_vga_fg[8] = {
@@ -156,6 +233,102 @@ static void ansi_reset_state(void) {
     g_ansi_cur_param = 0;
     g_ansi_have_digit = 0;
     g_ansi_private = 0;
+    g_ansi_intermediate = 0;
+}
+
+/* True-color SGR support.  Tracks whether the current fg/bg is an explicit
+ * 24-bit RGB value rather than a VGA palette index, so we can re-issue the
+ * exact color (and so reverse-video swaps still work). */
+static int      g_fg_is_rgb = 0;
+static int      g_bg_is_rgb = 0;
+static uint32_t g_fg_rgb    = 0xFFFFFFFFu;
+static uint32_t g_bg_rgb    = 0x00000000u;
+
+/* Approximate a 256-color xterm index to the closest 16-color VGA palette
+ * entry.  Indices 0..15 map via the existing table.  16..231 form a 6x6x6
+ * RGB cube; 232..255 are a 24-step grayscale ramp. */
+static uint8_t xterm256_to_vga(int n) {
+    if (n < 0)  n = 0;
+    if (n > 255) n = 255;
+    if (n < 8)  return ansi_to_vga_fg[n];
+    if (n < 16) return ansi_to_vga_fg[n - 8] + 8;
+    if (n >= 232) {
+        /* Grayscale ramp: 0=black .. 23=white. */
+        int g = n - 232;
+        if (g < 4)  return 0;       /* VGA black           */
+        if (g < 10) return 8;       /* VGA dark grey       */
+        if (g < 18) return 7;       /* VGA light grey      */
+        return 15;                  /* VGA white           */
+    }
+    /* 6x6x6 cube: index = 16 + 36*r + 6*g + b, each 0..5. */
+    int idx = n - 16;
+    int r = idx / 36;
+    int g = (idx / 6) % 6;
+    int b = idx % 6;
+    int bright = (r > 2 || g > 2 || b > 2) ? 8 : 0;
+    uint8_t base;
+    if (r == g && g == b) {
+        if (r == 0)        base = 0;     /* black */
+        else if (r <= 2)   { base = 0; bright = 8; }  /* dark grey  */
+        else if (r <= 4)   { base = 7; bright = 0; }  /* light grey */
+        else               { base = 7; bright = 8; }  /* white      */
+    } else if (r >= g && r >= b)         base = ansi_to_vga_fg[1]; /* red */
+    else if (g >= r && g >= b)           base = ansi_to_vga_fg[2]; /* green */
+    else                                 base = ansi_to_vga_fg[4]; /* blue */
+    /* Mix-cases — pick by dominant pair. */
+    if (r >= 3 && g >= 3 && b < 3)       base = ansi_to_vga_fg[3]; /* yellow */
+    else if (r >= 3 && b >= 3 && g < 3)  base = ansi_to_vga_fg[5]; /* magenta */
+    else if (g >= 3 && b >= 3 && r < 3)  base = ansi_to_vga_fg[6]; /* cyan */
+    return base + (bright ? 8 : 0);
+}
+
+/* Forward decl: needed by save/restore helpers and by SGR apply path. */
+extern uint32_t vga_to_rgb(uint8_t v);   /* internal helper in console.c */
+
+/* Re-emit the active SGR state as concrete fg/bg pixel colors so that all
+ * subsequent draw_char and BCE-style fills (region scroll, line erase, etc.)
+ * use the right colors.  This is the single point of truth that bridges
+ * tmux/ncurses-level SGR state to the framebuffer console's bg_color. */
+static void ansi_recompute_colors(void) {
+    uint32_t fg_rgb = g_fg_is_rgb ? g_fg_rgb : vga_to_rgb(g_cur_vga_fg);
+    uint32_t bg_rgb = g_bg_is_rgb ? g_bg_rgb : vga_to_rgb(g_cur_vga_bg);
+    if (g_ansi_reverse) {
+        uint32_t t = fg_rgb; fg_rgb = bg_rgb; bg_rgb = t;
+    }
+    console_set_color_rgb(fg_rgb, bg_rgb);
+}
+
+/* Snapshot/restore the *complete* SGR state (and cursor position) for
+ * DECSC/DECRC and SCOSC/SCORC.  Real terminals save: cursor pos, SGR,
+ * charset, origin-mode, wrap.  We save what we actually track. */
+static void ansi_save_state(void) {
+    uint32_t r, c2;
+    console_get_cursor_pos(&r, &c2);
+    g_saved_cur_row   = (int)r;
+    g_saved_cur_col   = (int)c2;
+    g_saved_vga_fg    = g_cur_vga_fg;
+    g_saved_vga_bg    = g_cur_vga_bg;
+    g_saved_bold      = g_ansi_bold;
+    g_saved_reverse   = g_ansi_reverse;
+    g_saved_fg_is_rgb = g_fg_is_rgb;
+    g_saved_bg_is_rgb = g_bg_is_rgb;
+    g_saved_fg_rgb    = g_fg_rgb;
+    g_saved_bg_rgb    = g_bg_rgb;
+    g_saved_valid     = 1;
+}
+
+static void ansi_restore_state(void) {
+    if (!g_saved_valid) return;
+    console_set_cursor_pos((uint32_t)g_saved_cur_row, (uint32_t)g_saved_cur_col);
+    g_cur_vga_fg   = g_saved_vga_fg;
+    g_cur_vga_bg   = g_saved_vga_bg;
+    g_ansi_bold    = g_saved_bold;
+    g_ansi_reverse = g_saved_reverse;
+    g_fg_is_rgb    = g_saved_fg_is_rgb;
+    g_bg_is_rgb    = g_saved_bg_is_rgb;
+    g_fg_rgb       = g_saved_fg_rgb;
+    g_bg_rgb       = g_saved_bg_rgb;
+    ansi_recompute_colors();
 }
 
 static void ansi_apply_sgr(void) {
@@ -173,26 +346,38 @@ static void ansi_apply_sgr(void) {
         if (p == 38 && (i + 2) < g_ansi_nparam && g_ansi_params[i + 1] == 5) {
             /* 256-color foreground: 38;5;N */
             int n = g_ansi_params[i + 2] & 0xFF;
-            if (n < 16) {
-                /* Map 0-7 through the ANSI→VGA table, 8-15 as bright */
-                g_cur_vga_fg = (n < 8) ? ansi_to_vga_fg[n] : (ansi_to_vga_fg[n - 8] + 8);
-            } else {
-                /* Extended 256-color: approximate to nearest VGA color */
-                g_cur_vga_fg = (n < 232) ? (uint8_t)((n - 16) % 8) : ((n - 232) >= 12 ? 15 : 7);
-            }
+            g_cur_vga_fg = xterm256_to_vga(n);
             if (g_ansi_bold && g_cur_vga_fg < 8) g_cur_vga_fg += 8;
-            i += 2;  /* skip the '5' and 'N' params */
+            g_fg_is_rgb = 0;
+            i += 2;
             continue;
         }
         if (p == 48 && (i + 2) < g_ansi_nparam && g_ansi_params[i + 1] == 5) {
             /* 256-color background: 48;5;N */
             int n = g_ansi_params[i + 2] & 0xFF;
-            if (n < 16) {
-                g_cur_vga_bg = (n < 8) ? ansi_to_vga_fg[n] : (ansi_to_vga_fg[n - 8] + 8);
-            } else {
-                g_cur_vga_bg = (n < 232) ? (uint8_t)((n - 16) % 8) : ((n - 232) >= 12 ? 15 : 7);
-            }
+            g_cur_vga_bg = xterm256_to_vga(n);
+            g_bg_is_rgb = 0;
             i += 2;
+            continue;
+        }
+        if (p == 38 && (i + 4) < g_ansi_nparam && g_ansi_params[i + 1] == 2) {
+            /* True-color foreground: 38;2;R;G;B */
+            uint32_t r = (uint32_t)(g_ansi_params[i + 2] & 0xFF);
+            uint32_t g = (uint32_t)(g_ansi_params[i + 3] & 0xFF);
+            uint32_t b = (uint32_t)(g_ansi_params[i + 4] & 0xFF);
+            g_fg_rgb = (r << 16) | (g << 8) | b;
+            g_fg_is_rgb = 1;
+            i += 4;
+            continue;
+        }
+        if (p == 48 && (i + 4) < g_ansi_nparam && g_ansi_params[i + 1] == 2) {
+            /* True-color background: 48;2;R;G;B */
+            uint32_t r = (uint32_t)(g_ansi_params[i + 2] & 0xFF);
+            uint32_t g = (uint32_t)(g_ansi_params[i + 3] & 0xFF);
+            uint32_t b = (uint32_t)(g_ansi_params[i + 4] & 0xFF);
+            g_bg_rgb = (r << 16) | (g << 8) | b;
+            g_bg_is_rgb = 1;
+            i += 4;
             continue;
         }
         if (p == 0) {
@@ -201,36 +386,49 @@ static void ansi_apply_sgr(void) {
             g_cur_vga_bg = 0;  /* black */
             g_ansi_bold = 0;
             g_ansi_reverse = 0;
+            g_fg_is_rgb = 0;
+            g_bg_is_rgb = 0;
         } else if (p == 1) {
             /* Bold / bright */
             g_ansi_bold = 1;
             /* If we already have a color set, make it bright */
-            if (g_cur_vga_fg < 8)
+            if (!g_fg_is_rgb && g_cur_vga_fg < 8)
                 g_cur_vga_fg += 8;
         } else if (p == 22) {
-            /* Normal intensity */
+            /* Normal intensity — but the terminal's default foreground
+             * is white (15) on our framebuffer, so dropping a previously-
+             * unmodified default-fg from 15 to 7 (light grey) is wrong.
+             * Only down-shift bright palette entries that were explicitly
+             * set via 30-37 + bold, leaving the "default white" intact. */
+            int was_bold = g_ansi_bold;
             g_ansi_bold = 0;
-            if (g_cur_vga_fg >= 8 && g_cur_vga_fg <= 15)
+            if (was_bold && !g_fg_is_rgb && g_cur_vga_fg >= 9 && g_cur_vga_fg <= 14)
                 g_cur_vga_fg -= 8;
         } else if (p >= 30 && p <= 37) {
             /* Foreground color */
             g_cur_vga_fg = ansi_to_vga_fg[p - 30];
             if (g_ansi_bold) g_cur_vga_fg += 8;
+            g_fg_is_rgb = 0;
         } else if (p == 39) {
-            /* Default foreground */
-            g_cur_vga_fg = g_ansi_bold ? 15 : 7;
+            /* Default foreground — terminal default is white (15). */
+            g_cur_vga_fg = 15;
+            g_fg_is_rgb = 0;
         } else if (p >= 40 && p <= 47) {
             /* Background color */
             g_cur_vga_bg = ansi_to_vga_fg[p - 40];
+            g_bg_is_rgb = 0;
         } else if (p == 49) {
             /* Default background */
             g_cur_vga_bg = 0;
+            g_bg_is_rgb = 0;
         } else if (p >= 90 && p <= 97) {
             /* Bright foreground */
             g_cur_vga_fg = ansi_to_vga_fg[p - 90] + 8;
+            g_fg_is_rgb = 0;
         } else if (p >= 100 && p <= 107) {
             /* Bright background */
             g_cur_vga_bg = ansi_to_vga_fg[p - 100] + 8;
+            g_bg_is_rgb = 0;
         } else if (p == 7) {
             /* Reverse video */
             g_ansi_reverse = 1;
@@ -240,15 +438,37 @@ static void ansi_apply_sgr(void) {
         }
         /* Other SGR codes silently ignored */
     }
-    if (g_ansi_reverse)
-        console_set_color(g_cur_vga_bg, g_cur_vga_fg);
-    else
-        console_set_color(g_cur_vga_fg, g_cur_vga_bg);
+    ansi_recompute_colors();
 }
 
 static void tty_output_console(tty_t* tty, char c) {
-    (void)tty;
+    /* tty is used by DSR/DA reply injectors below. */
     unsigned char ch = (unsigned char)c;
+
+    /* VT-spec global rules that apply in *every* parser state:
+     *  - 0x1B (ESC) immediately aborts any in-progress sequence and starts
+     *    a new one.  Without this, back-to-back sequences like \e[2J\e[H
+     *    cause the second ESC to be eaten by the first sequence's
+     *    dispatcher, then the following '[' renders as the printable
+     *    character '['.  This is the source of the visible "[K", "[0m",
+     *    "[0]" leaking into rendered output.
+     *  - 0x18 (CAN) and 0x1A (SUB) cancel the current sequence with no
+     *    further action.  They must NOT be drawn.
+     * (OSC/DCS payloads are exempt: an ESC there might be the start of
+     * the ESC-\\ ST terminator; we keep their existing handling.) */
+    if (ch == 0x1B) {
+        if (g_ansi_state == ANSI_OSC || g_ansi_state == ANSI_DCS) {
+            /* Could be ST (ESC \\) — handled in those states. */
+        } else {
+            ansi_reset_state();
+            g_ansi_state = ANSI_ESC;
+            return;
+        }
+    } else if ((ch == 0x18 || ch == 0x1A) &&
+               g_ansi_state != ANSI_NORMAL) {
+        ansi_reset_state();
+        return;
+    }
 
     switch (g_ansi_state) {
     case ANSI_NORMAL:
@@ -260,22 +480,197 @@ static void tty_output_console(tty_t* tty, char c) {
         return;
 
     case ANSI_ESC:
-        if (ch == '[') {
+        switch (ch) {
+        case '[':
             g_ansi_state = ANSI_CSI;
             g_ansi_nparam = 0;
             g_ansi_cur_param = 0;
             g_ansi_have_digit = 0;
+            g_ansi_private = 0;
+            return;
+        case ']':
+            g_ansi_state = ANSI_OSC;
+            return;
+        case 'P': case 'X': case '^': case '_':
+            /* DCS / SOS / PM / APC — consume until ST. */
+            g_ansi_state = ANSI_DCS;
+            return;
+        case '(': case ')': case '*': case '+':
+            /* Designate character set — next byte selects the set; ignore. */
+            g_ansi_state = ANSI_CHARSET;
+            return;
+        case '#':
+            /* DECALN etc. — eat one more byte. */
+            g_ansi_state = ANSI_HASH;
+            return;
+        case '7':
+            /* DECSC — save cursor + SGR + attributes. */
+            ansi_save_state();
+            ansi_reset_state();
+            return;
+        case '8':
+            /* DECRC — restore cursor + SGR + attributes. */
+            ansi_restore_state();
+            ansi_reset_state();
+            return;
+        case 'D': {
+            /* IND — Index: cursor down, scroll region up at bottom. */
+            uint32_t r, col;
+            console_get_cursor_pos(&r, &col);
+            int bot = (g_scroll_bot >= 0) ? g_scroll_bot
+                                          : (int)g_console_tty.winsz.ws_row - 1;
+            int top = (g_scroll_top >= 0) ? g_scroll_top : 0;
+            if ((int)r == bot) {
+                console_scroll_region_up(1, top, bot);
+            } else {
+                console_set_cursor_pos(r + 1, col);
+            }
+            ansi_reset_state();
             return;
         }
-        /* Not a CSI sequence — emit the ESC as-is and re-process char */
+        case 'M': {
+            /* RI — Reverse Index: cursor up, scroll region down at top. */
+            uint32_t r, col;
+            console_get_cursor_pos(&r, &col);
+            int top = (g_scroll_top >= 0) ? g_scroll_top : 0;
+            int bot = (g_scroll_bot >= 0) ? g_scroll_bot
+                                          : (int)g_console_tty.winsz.ws_row - 1;
+            if ((int)r == top) {
+                console_scroll_region_down(1, top, bot);
+            } else if (r > 0) {
+                console_set_cursor_pos(r - 1, col);
+            }
+            ansi_reset_state();
+            return;
+        }
+        case 'E': {
+            /* NEL — Next Line: CR + LF. */
+            uint32_t r, col;
+            console_get_cursor_pos(&r, &col);
+            int bot = (g_scroll_bot >= 0) ? g_scroll_bot
+                                          : (int)g_console_tty.winsz.ws_row - 1;
+            int top = (g_scroll_top >= 0) ? g_scroll_top : 0;
+            if ((int)r == bot) {
+                console_scroll_region_up(1, top, bot);
+                console_set_cursor_pos((uint32_t)bot, 0);
+            } else {
+                console_set_cursor_pos(r + 1, 0);
+            }
+            ansi_reset_state();
+            return;
+        }
+        case 'c':
+            /* RIS — Reset to Initial State.  Soft reset: clear screen,
+             * home cursor, drop scroll region, clear saved state. */
+            console_set_color(15, 0);
+            g_cur_vga_fg = 15;
+            g_cur_vga_bg = 0;
+            g_ansi_bold = 0;
+            g_ansi_reverse = 0;
+            g_fg_is_rgb = 0;
+            g_bg_is_rgb = 0;
+            g_scroll_top = -1;
+            g_scroll_bot = -1;
+            console_set_scroll_region(-1, -1);
+            g_saved_valid = 0;
+            console_erase_display(2);
+            console_set_cursor_pos(0, 0);
+            ansi_reset_state();
+            return;
+        case '\\':
+            /* Stray ST outside any string — just ignore. */
+            ansi_reset_state();
+            return;
+        case '=': case '>':
+            /* DECPAM / DECPNM — keypad mode; ignore. */
+            ansi_reset_state();
+            return;
+        default:
+            /* Unknown two-byte ESC sequence — drop quietly. */
+            ansi_reset_state();
+            return;
+        }
+
+    case ANSI_CHARSET:
+    case ANSI_HASH:
+        /* Eat one byte and return to normal. */
         ansi_reset_state();
-        console_putchar_batch(c);
+        return;
+
+    case ANSI_OSC:
+        if (ch == 0x07) {            /* BEL terminates OSC */
+            ansi_reset_state();
+            return;
+        }
+        if (ch == 0x1B) {            /* possible ESC \ (ST) */
+            g_ansi_state = ANSI_OSC_ESC;
+            return;
+        }
+        /* Discard payload byte. */
+        return;
+
+    case ANSI_OSC_ESC:
+        /* Either '\\' completes ST, or any other byte continues OSC. */
+        if (ch == '\\') {
+            ansi_reset_state();
+        } else {
+            /* Not a real ST — go back to collecting OSC bytes. */
+            g_ansi_state = ANSI_OSC;
+        }
+        return;
+
+    case ANSI_DCS:
+        if (ch == 0x07) {
+            ansi_reset_state();
+            return;
+        }
+        if (ch == 0x1B) {
+            g_ansi_state = ANSI_DCS_ESC;
+            return;
+        }
+        return;
+
+    case ANSI_DCS_ESC:
+        if (ch == '\\') {
+            ansi_reset_state();
+        } else {
+            g_ansi_state = ANSI_DCS;
+        }
         return;
 
     case ANSI_CSI:
+        /* VT spec: C0 controls (BS, HT, LF, VT, FF, CR, BEL, SO, SI)
+         * arriving inside a CSI sequence are EXECUTED IN PLACE; the
+         * sequence continues.  Without this, programs that use CR/LF
+         * inside long status-line repaints ended up aborting the CSI
+         * via the default dispatcher and leaking the rest as text. */
+        if (ch == 0x08 || ch == 0x09 || ch == 0x0A || ch == 0x0B ||
+            ch == 0x0C || ch == 0x0D || ch == 0x07) {
+            console_putchar_batch((char)ch);
+            return;
+        }
         if (ch == '?' && !g_ansi_have_digit && g_ansi_nparam == 0) {
             /* DEC private mode indicator: ESC [ ? ... */
             g_ansi_private = 1;
+            g_ansi_intermediate = '?';
+            return;
+        }
+        /* Track other private/private-leading intermediate indicators
+         * (>, =, <) at the start of the parameter list. */
+        if ((ch == '>' || ch == '=' || ch == '<')
+            && !g_ansi_have_digit && g_ansi_nparam == 0) {
+            g_ansi_intermediate = ch;
+            return;
+        }
+        /* VT spec intermediate bytes (0x20\u20130x2F: SP ! " # $ % & ' ( ) * + , - . /).
+         * Per ECMA-48 these may appear AFTER parameters and must be
+         * collected; the sequence only ends on a final byte (0x40\u20130x7E).
+         * Without this, e.g. ESC[ q (set cursor style) and ESC[!p
+         * (DECSTR) leaked the trailing letter as visible text. */
+        if (ch >= 0x20 && ch <= 0x2F) {
+            /* Remember the last intermediate; we don't dispatch them
+             * individually but we must not abort the sequence. */
+            g_ansi_intermediate = (char)ch;
             return;
         }
         if (ch >= '0' && ch <= '9') {
@@ -303,74 +698,307 @@ static void tty_output_console(tty_t* tty, char c) {
             g_ansi_params[g_ansi_nparam++] = g_ansi_cur_param;
         }
 
-        if (ch == 'H' || ch == 'f') {
-            /* CUP — Cursor Position: ESC [ row ; col H  (1-based, default 1;1) */
+        /* Convenience: first param defaulting to 1 (most movement commands). */
+        #define P1_OR(def) ((g_ansi_nparam >= 1 && g_ansi_params[0] > 0) ? g_ansi_params[0] : (def))
+
+        switch (ch) {
+        case 'H': case 'f': {
+            /* CUP — Cursor Position: ESC [ row ; col H  (1-based). */
             int row = (g_ansi_nparam >= 1 && g_ansi_params[0] > 0) ? g_ansi_params[0] - 1 : 0;
             int col = (g_ansi_nparam >= 2 && g_ansi_params[1] > 0) ? g_ansi_params[1] - 1 : 0;
             console_set_cursor_pos((uint32_t)row, (uint32_t)col);
-        } else if (ch == 'J') {
-            /* ED — Erase Display: ESC [ Ps J  (0=below, 1=above, 2=all) */
+            break;
+        }
+        case 'J': {
             int mode = (g_ansi_nparam >= 1) ? g_ansi_params[0] : 0;
             console_erase_display(mode);
-        } else if (ch == 'K') {
-            /* EL — Erase Line: ESC [ Ps K  (0=to end, 1=to start, 2=whole) */
+            break;
+        }
+        case 'K': {
             int mode = (g_ansi_nparam >= 1) ? g_ansi_params[0] : 0;
             console_erase_line(mode);
-        } else if (ch == 'A') {
-            /* CUU — Cursor Up: ESC [ Ps A */
-            int n = (g_ansi_nparam >= 1 && g_ansi_params[0] > 0) ? g_ansi_params[0] : 1;
+            break;
+        }
+        case 'A': {
+            int n = P1_OR(1);
             uint32_t row, col;
             console_get_cursor_pos(&row, &col);
             row = (row >= (uint32_t)n) ? row - (uint32_t)n : 0;
             console_set_cursor_pos(row, col);
-        } else if (ch == 'B') {
-            /* CUD — Cursor Down: ESC [ Ps B */
-            int n = (g_ansi_nparam >= 1 && g_ansi_params[0] > 0) ? g_ansi_params[0] : 1;
+            break;
+        }
+        case 'B': case 'e': {
+            int n = P1_OR(1);
             uint32_t row, col;
             console_get_cursor_pos(&row, &col);
             console_set_cursor_pos(row + (uint32_t)n, col);
-        } else if (ch == 'C') {
-            /* CUF — Cursor Forward: ESC [ Ps C */
-            int n = (g_ansi_nparam >= 1 && g_ansi_params[0] > 0) ? g_ansi_params[0] : 1;
+            break;
+        }
+        case 'C': case 'a': {
+            int n = P1_OR(1);
             uint32_t row, col;
             console_get_cursor_pos(&row, &col);
             console_set_cursor_pos(row, col + (uint32_t)n);
-        } else if (ch == 'D') {
-            /* CUB — Cursor Backward: ESC [ Ps D */
-            int n = (g_ansi_nparam >= 1 && g_ansi_params[0] > 0) ? g_ansi_params[0] : 1;
+            break;
+        }
+        case 'D': {
+            int n = P1_OR(1);
             uint32_t row, col;
             console_get_cursor_pos(&row, &col);
             col = (col >= (uint32_t)n) ? col - (uint32_t)n : 0;
             console_set_cursor_pos(row, col);
-        } else if (g_ansi_private && (ch == 'h' || ch == 'l')) {
-            /* DEC Private Mode Set/Reset: ESC [ ? Ps h / ESC [ ? Ps l */
-            int mode = (g_ansi_nparam >= 1) ? g_ansi_params[0] : 0;
-            int enable = (ch == 'h') ? 1 : 0;
-            if (mode == 25) {
-                /* DECTCEM — Text Cursor Enable Mode */
-                if (enable)
-                    console_cursor_enable();   /* show cursor */
-                else
-                    console_cursor_disable();  /* hide cursor */
-            } else if (mode == 1000) {
-                /* Normal mouse tracking */
-                g_console_tty.mouse_tracking = enable;
-                if (!enable) {
-                    g_console_tty.mouse_btn_event = 0;
-                    g_console_tty.mouse_sgr_mode = 0;
-                }
-            } else if (mode == 1002) {
-                /* Button-event mouse tracking */
-                g_console_tty.mouse_btn_event = enable;
-                if (!enable)
-                    g_console_tty.mouse_sgr_mode = 0;
-            } else if (mode == 1006) {
-                /* SGR extended mouse mode */
-                g_console_tty.mouse_sgr_mode = enable;
-            }
-            /* Other DEC private modes silently ignored */
+            break;
         }
-        /* All other CSI sequences silently consumed */
+        case 'E': {
+            /* CNL — Cursor Next Line: down N, col 0. */
+            int n = P1_OR(1);
+            uint32_t row, col;
+            console_get_cursor_pos(&row, &col);
+            console_set_cursor_pos(row + (uint32_t)n, 0);
+            break;
+        }
+        case 'F': {
+            /* CPL — Cursor Preceding Line: up N, col 0. */
+            int n = P1_OR(1);
+            uint32_t row, col;
+            console_get_cursor_pos(&row, &col);
+            row = (row >= (uint32_t)n) ? row - (uint32_t)n : 0;
+            console_set_cursor_pos(row, 0);
+            break;
+        }
+        case 'G': case '`': {
+            /* CHA / HPA — Cursor Horizontal Absolute (1-based column). */
+            int col = P1_OR(1) - 1;
+            if (col < 0) col = 0;
+            uint32_t row, c2;
+            console_get_cursor_pos(&row, &c2);
+            console_set_cursor_pos(row, (uint32_t)col);
+            break;
+        }
+        case 'd': {
+            /* VPA — Vertical Position Absolute (1-based row). */
+            int row = P1_OR(1) - 1;
+            if (row < 0) row = 0;
+            uint32_t r, col;
+            console_get_cursor_pos(&r, &col);
+            console_set_cursor_pos((uint32_t)row, col);
+            break;
+        }
+        case 'L': {
+            /* IL — Insert Lines (within scroll region). */
+            int n = P1_OR(1);
+            int top = (g_scroll_top >= 0) ? g_scroll_top : 0;
+            int bot = (g_scroll_bot >= 0) ? g_scroll_bot
+                                          : (int)g_console_tty.winsz.ws_row - 1;
+            console_insert_lines(n, top, bot);
+            break;
+        }
+        case 'M': {
+            /* DL — Delete Lines (within scroll region). */
+            int n = P1_OR(1);
+            int top = (g_scroll_top >= 0) ? g_scroll_top : 0;
+            int bot = (g_scroll_bot >= 0) ? g_scroll_bot
+                                          : (int)g_console_tty.winsz.ws_row - 1;
+            console_delete_lines(n, top, bot);
+            break;
+        }
+        case '@': {
+            /* ICH — Insert Characters. */
+            console_insert_chars(P1_OR(1));
+            break;
+        }
+        case 'P': {
+            /* DCH — Delete Characters. */
+            console_delete_chars(P1_OR(1));
+            break;
+        }
+        case 'X': {
+            /* ECH — Erase Characters. */
+            console_erase_chars(P1_OR(1));
+            break;
+        }
+        case 'S': {
+            /* SU — Scroll Up within region. */
+            int n = P1_OR(1);
+            int top = (g_scroll_top >= 0) ? g_scroll_top : 0;
+            int bot = (g_scroll_bot >= 0) ? g_scroll_bot
+                                          : (int)g_console_tty.winsz.ws_row - 1;
+            console_scroll_region_up(n, top, bot);
+            break;
+        }
+        case 'T': {
+            /* SD — Scroll Down within region. */
+            int n = P1_OR(1);
+            int top = (g_scroll_top >= 0) ? g_scroll_top : 0;
+            int bot = (g_scroll_bot >= 0) ? g_scroll_bot
+                                          : (int)g_console_tty.winsz.ws_row - 1;
+            console_scroll_region_down(n, top, bot);
+            break;
+        }
+        case 'r': {
+            /* DECSTBM — Set Top and Bottom Margins (1-based, inclusive). */
+            int rows = (int)g_console_tty.winsz.ws_row;
+            if (rows <= 0) rows = 25;
+            int top = (g_ansi_nparam >= 1 && g_ansi_params[0] > 0) ? g_ansi_params[0] - 1 : 0;
+            int bot = (g_ansi_nparam >= 2 && g_ansi_params[1] > 0) ? g_ansi_params[1] - 1 : rows - 1;
+            if (top < 0) top = 0;
+            if (bot >= rows) bot = rows - 1;
+            if (top >= bot) { top = 0; bot = rows - 1; }
+            g_scroll_top = top;
+            g_scroll_bot = bot;
+            /* Make the framebuffer console honor the region for implicit
+             * scrolls from \\n and from line wrap, so pinned status rows
+             * below the region are preserved. */
+            if (top == 0 && bot == rows - 1) {
+                console_set_scroll_region(-1, -1);
+            } else {
+                console_set_scroll_region(top, bot);
+            }
+            /* DECSTBM also homes the cursor to (top, 0) — or (1,1) of origin mode. */
+            console_set_cursor_pos((uint32_t)top, 0);
+            break;
+        }
+        case 's': {
+            /* SCOSC — Save Cursor Position (only if no params; with params
+             * this would be DECSLRM which we don't support). */
+            if (g_ansi_nparam == 0) {
+                ansi_save_state();
+            }
+            break;
+        }
+        case 'u': {
+            /* SCORC — Restore Cursor Position (and SGR). */
+            ansi_restore_state();
+            break;
+        }
+        case 'n': {
+            /* DSR — Device Status Report.
+             *   \e[5n  → \e[0n  (terminal OK)
+             *   \e[6n  → \e[<row>;<col>R  (cursor pos, 1-based)
+             * Reply is enqueued lock-free because we are called under
+             * tty_lock from tty_write — see tty_enqueue_read_locked. */
+            if (g_ansi_intermediate == '?') break;
+            int p = (g_ansi_nparam >= 1) ? g_ansi_params[0] : 0;
+            if (p == 5) {
+                tty_enqueue_read_locked(tty, 0x1B);
+                tty_enqueue_read_locked(tty, '[');
+                tty_enqueue_read_locked(tty, '0');
+                tty_enqueue_read_locked(tty, 'n');
+                g_console_reply_pending = 1;
+            } else if (p == 6) {
+                uint32_t r, c2;
+                console_get_cursor_pos(&r, &c2);
+                char num[12]; int ln;
+                tty_enqueue_read_locked(tty, 0x1B);
+                tty_enqueue_read_locked(tty, '[');
+                ln = itoa_simple((int)(r + 1), num);
+                for (int i = 0; i < ln; i++) tty_enqueue_read_locked(tty, num[i]);
+                tty_enqueue_read_locked(tty, ';');
+                ln = itoa_simple((int)(c2 + 1), num);
+                for (int i = 0; i < ln; i++) tty_enqueue_read_locked(tty, num[i]);
+                tty_enqueue_read_locked(tty, 'R');
+                g_console_reply_pending = 1;
+            }
+            break;
+        }
+        case 'c': {
+            /* DA — Device Attributes.
+             *   \e[c    → DA1: \e[?1;2c  (VT100 with advanced video)
+             *   \e[>c   → DA2: \e[>41;0;0c  (xterm-class) */
+            if (g_ansi_intermediate == '?') break;
+            const char* reply = (g_ansi_intermediate == '>')
+                                ? "\033[>41;0;0c"
+                                : "\033[?1;2c";
+            for (const char* p = reply; *p; ++p) {
+                tty_enqueue_read_locked(tty, *p);
+            }
+            g_console_reply_pending = 1;
+            break;
+        }
+        case 't': {
+            /* XTWINOPS 18: report text-area size in characters. */
+            int op = (g_ansi_nparam >= 1) ? g_ansi_params[0] : 0;
+            if (op == 18) {
+                char num[12]; int ln;
+                tty_enqueue_read_locked(tty, 0x1B);
+                tty_enqueue_read_locked(tty, '[');
+                tty_enqueue_read_locked(tty, '8');
+                tty_enqueue_read_locked(tty, ';');
+                ln = itoa_simple((int)g_console_tty.winsz.ws_row, num);
+                for (int i = 0; i < ln; i++) tty_enqueue_read_locked(tty, num[i]);
+                tty_enqueue_read_locked(tty, ';');
+                ln = itoa_simple((int)g_console_tty.winsz.ws_col, num);
+                for (int i = 0; i < ln; i++) tty_enqueue_read_locked(tty, num[i]);
+                tty_enqueue_read_locked(tty, 't');
+                g_console_reply_pending = 1;
+            }
+            break;
+        }
+        case 'h': case 'l': {
+            int enable = (ch == 'h') ? 1 : 0;
+            if (g_ansi_private) {
+                int mode = (g_ansi_nparam >= 1) ? g_ansi_params[0] : 0;
+                if (mode == 25) {
+                    if (enable) console_cursor_enable();
+                    else        console_cursor_disable();
+                } else if (mode == 1000) {
+                    g_console_tty.mouse_tracking = enable;
+                    if (!enable) {
+                        g_console_tty.mouse_btn_event = 0;
+                        g_console_tty.mouse_sgr_mode = 0;
+                    }
+                } else if (mode == 1002) {
+                    g_console_tty.mouse_btn_event = enable;
+                    if (!enable)
+                        g_console_tty.mouse_sgr_mode = 0;
+                } else if (mode == 1006) {
+                    g_console_tty.mouse_sgr_mode = enable;
+                } else if (mode == 1047 || mode == 1049) {
+                    /* Alternate screen buffer.  We have no separate cell buffer,
+                     * so we emulate with scrollback viewport save/restore.
+                     * On entry: snapshot the scrollback position, clear the
+                     * screen, and home the cursor.
+                     * On exit: restore the viewport to the pre-entry content. */
+                    if (enable) {
+                        if (mode == 1049) {
+                            ansi_save_state();
+                            g_alt_screen_sb_total = console_get_sb_total();
+                        }
+                        console_erase_display(2);
+                        console_set_cursor_pos(0, 0);
+                    } else {
+                        /* Restore scrollback viewport to show pre-alt-screen
+                         * content (console_restore_alt_screen clears + redraws
+                         * the framebuffer from the saved viewport position). */
+                        if (mode == 1049) {
+                            console_restore_alt_screen(g_alt_screen_sb_total);
+                            if (g_saved_valid) {
+                                ansi_restore_state();
+                            } else {
+                                console_set_cursor_pos(0, 0);
+                            }
+                        } else {
+                            console_erase_display(2);
+                            console_set_cursor_pos(0, 0);
+                        }
+                    }
+                } else if (mode == 1048) {
+                    if (enable) {
+                        ansi_save_state();
+                    } else {
+                        ansi_restore_state();
+                    }
+                }
+                /* Other DEC private modes silently ignored. */
+            }
+            /* Non-private h/l (ANSI modes) silently ignored. */
+            break;
+        }
+        default:
+            /* All other CSI sequences silently consumed (DSR n, DA c, etc.). */
+            break;
+        }
+        #undef P1_OR
         ansi_reset_state();
         return;
     }
@@ -390,17 +1018,38 @@ static pty_t* tty_get_pty(int id) {
     return &g_ptys[id];
 }
 
+/* Bulk non-blocking enqueue into the master ring.  Returns bytes
+ * actually copied (may be less than len if the ring fills).  Wakes any
+ * blocked master reader if at least one byte was accepted. */
+static long pty_master_enqueue_bulk(pty_t* pty, const char* buf, long len) {
+    if (!pty || !buf || len <= 0) return 0;
+    uint64_t flags;
+    spin_lock_irqsave(&pty->lock, &flags);
+    uint32_t free = PTY_MASTER_BUF_SIZE - pty->m_count;
+    uint32_t to_copy = (uint32_t)len;
+    int dropped = 0;
+    if (to_copy > free) { to_copy = free; dropped = 1; }
+    for (uint32_t i = 0; i < to_copy; i++) {
+        pty->master_buf[pty->m_tail] = buf[i];
+        pty->m_tail = (pty->m_tail + 1) % PTY_MASTER_BUF_SIZE;
+    }
+    pty->m_count += to_copy;
+    spin_unlock_irqrestore(&pty->lock, flags);
+    if (to_copy > 0) {
+        tty_wake_readers(&pty->master_read_waiters);
+    }
+    return (long)to_copy;
+}
+
+/* Single-byte non-blocking enqueue.  Used by the ECHO path inside
+ * tty_input_char (master-side context: keystroke arriving from the
+ * master's tty_pty_master_write).  Drops on full — ECHO is one byte at
+ * a time so loss is benign. */
 static void pty_master_enqueue(pty_t* pty, char c) {
     if (!pty) {
         return;
     }
-    if (pty->m_count >= sizeof(pty->master_buf)) {
-        return;
-    }
-    pty->master_buf[pty->m_tail] = c;
-    pty->m_tail = (pty->m_tail + 1) % sizeof(pty->master_buf);
-    pty->m_count++;
-    tty_wake_readers(&pty->master_read_waiters);
+    pty_master_enqueue_bulk(pty, &c, 1);
 }
 
 static void tty_output_pty_slave(tty_t* tty, char c) {
@@ -413,7 +1062,12 @@ static void tty_output_pty_slave(tty_t* tty, char c) {
 
 static void tty_set_default_termios(tty_t* tty) {
     tty->term.c_iflag = ICRNL;
-    tty->term.c_oflag = 0;
+    /* Output post-processing on by default: translate bare LF to CR+LF.
+     * Without this, programs like ls/ps that emit only '\n' between
+     * lines render the next line starting at the previous column,
+     * producing the "run-on" appearance.  Apps that need raw output
+     * (tmux master, full-screen apps) clear OPOST via tcsetattr. */
+    tty->term.c_oflag = OPOST | ONLCR;
     tty->term.c_cflag = 0;
     tty->term.c_lflag = ISIG | ICANON | ECHO;
     tty->term.c_cc[VINTR] = 3;   // Ctrl+C
@@ -448,6 +1102,7 @@ void tty_init(void) {
     for (int i = 0; i < TTY_MAX_PTYS; ++i) {
         mm_memset(&g_ptys[i], 0, sizeof(pty_t));
         g_ptys[i].id = -1;
+        spinlock_init(&g_ptys[i].lock, "pty");
     }
 }
 
@@ -749,6 +1404,10 @@ void tty_input_char(tty_t* tty, char c, int ctrl) {
             tty->canon_buf[tty->canon_len++] = c;
         }
         if (tty->term.c_lflag & ECHO) {
+            if (c == '\n' && (tty->term.c_oflag & OPOST) &&
+                (tty->term.c_oflag & ONLCR)) {
+                tty->output(tty, '\r');
+            }
             tty->output(tty, c);
         }
         if (c == '\n') {
@@ -763,6 +1422,10 @@ void tty_input_char(tty_t* tty, char c, int ctrl) {
 
     tty_enqueue_read(tty, c);
     if (tty->term.c_lflag & ECHO) {
+        if (c == '\n' && (tty->term.c_oflag & OPOST) &&
+            (tty->term.c_oflag & ONLCR)) {
+            tty->output(tty, '\r');
+        }
         tty->output(tty, c);
     }
     tty_wake_readers(&tty->read_waiters);
@@ -812,19 +1475,34 @@ long tty_read(tty_t* tty, void* buf, long count, int nonblock) {
         }
         char c = 0;
         if (!tty_dequeue_read(tty, &c)) {
-            if (read > 0 || nonblock) {
+            if (read > 0)
                 break;
+            if (nonblock) {
+                /* POSIX: O_NONBLOCK with no data → EAGAIN, not EOF. */
+                return -EAGAIN;
             }
             /* VMIN=0, VTIME>0: timed wait — block with a deadline */
             if (vtime_deadline && cur) {
                 if (timer_ticks() >= vtime_deadline) {
                     break; /* timeout expired, return 0 */
                 }
-                cur->state = TASK_BLOCKED;
+                /* Park atomically wrt the producer: set BLOCKED+channel,
+                 * then re-check read_count under tty_lock.  If a producer
+                 * already enqueued a byte (and its wake fired before we
+                 * marked ourselves BLOCKED), undo the park and loop. */
+                uint64_t _f;
+                cur->wait_channel = (void*)&tty->read_waiters;
                 cur->wakeup_tick = vtime_deadline;
-                cur->wait_next = tty->read_waiters;
-                cur->wait_channel = tty;
-                tty->read_waiters = cur;
+                cur->state = TASK_BLOCKED;
+                spin_lock_irqsave(&tty_lock, &_f);
+                if (tty->read_count > 0) {
+                    cur->state = TASK_READY;
+                    cur->wait_channel = NULL;
+                    cur->wakeup_tick = 0;
+                    spin_unlock_irqrestore(&tty_lock, _f);
+                    continue;
+                }
+                spin_unlock_irqrestore(&tty_lock, _f);
                 sched_schedule();
                 if (cur->state == TASK_ZOMBIE || cur->has_exited || signal_pending(cur)) {
                     if (signal_pending(cur)) {
@@ -836,10 +1514,26 @@ long tty_read(tty_t* tty, void* buf, long count, int nonblock) {
                 continue;
             }
             if (cur) {
+                /* Park atomically wrt the producer: set BLOCKED+channel,
+                 * then re-check read_count under tty_lock to close the
+                 * lost-wakeup race window between tty_dequeue_read (which
+                 * dropped tty_lock before returning 0) and our own park.
+                 * Without this, a producer that enqueues+wakes here can
+                 * find no blocked task and we sleep forever — which is
+                 * exactly what kept ncurses-based readers (nano, top)
+                 * stuck while non-ncurses readers (less) drained the
+                 * buffer in single large reads and rarely re-blocked. */
+                uint64_t _f;
+                cur->wait_channel = (void*)&tty->read_waiters;
                 cur->state = TASK_BLOCKED;
-                cur->wait_next = tty->read_waiters;
-                cur->wait_channel = tty;
-                tty->read_waiters = cur;
+                spin_lock_irqsave(&tty_lock, &_f);
+                if (tty->read_count > 0) {
+                    cur->state = TASK_READY;
+                    cur->wait_channel = NULL;
+                    spin_unlock_irqrestore(&tty_lock, _f);
+                    continue;
+                }
+                spin_unlock_irqrestore(&tty_lock, _f);
                 sched_schedule();
                 // Check if we were killed or have a pending signal
                 if (cur->state == TASK_ZOMBIE || cur->has_exited || signal_pending(cur)) {
@@ -874,6 +1568,48 @@ long tty_write(tty_t* tty, const void* buf, long count) {
         return 0;
     }
 
+    /* PTY slave writes go to a per-pty ring buffer that has its own lock
+     * and a wait queue for blocking when full.  Holding the global
+     * tty_lock here would (a) be unnecessary because the ring is per-pty
+     * and (b) prevent the writer from sleeping when the ring is full
+     * (tty_lock is taken with IRQs off).  Use the blocking enqueue path
+     * instead so bursts like `ps aux` / `dmesg` / a top-screen redraw
+     * never silently lose bytes \u2014 dropped bytes corrupt ANSI sequences
+     * and confuse the master-side terminal emulator (e.g. tmux). */
+    if (tty->is_pty && !tty->is_master && tty->priv) {
+        pty_t* pty = (pty_t*)tty->priv;
+        const char* in = (const char*)buf;
+        long total = 0;
+        #define PTY_OUT_CHUNK 512
+        char tmpbuf[PTY_OUT_CHUNK];
+        char outbuf[PTY_OUT_CHUNK * 2]; /* worst case: every byte expands \n -> \r\n */
+        int do_opost = (tty->term.c_oflag & OPOST) && (tty->term.c_oflag & ONLCR);
+        while (total < count) {
+            long chunk = count - total;
+            if (chunk > PTY_OUT_CHUNK) chunk = PTY_OUT_CHUNK;
+            smap_disable();
+            for (long i = 0; i < chunk; i++) tmpbuf[i] = in[total + i];
+            smap_enable();
+            long out_len = 0;
+            if (do_opost) {
+                for (long i = 0; i < chunk; i++) {
+                    char c = tmpbuf[i];
+                    if (c == '\n') outbuf[out_len++] = '\r';
+                    outbuf[out_len++] = c;
+                }
+            } else {
+                for (long i = 0; i < chunk; i++) outbuf[out_len++] = tmpbuf[i];
+            }
+            (void)pty_master_enqueue_bulk(pty, outbuf, out_len);
+            /* Always advance by the user-visible chunk size: ring overflow
+             * drops bytes silently rather than blocking the writer.  See
+             * comment on PTY_MASTER_BUF_SIZE for why blocking is unsafe. */
+            total += chunk;
+        }
+        #undef PTY_OUT_CHUNK
+        return total;
+    }
+
     // Copy user buffer into a small kernel-side staging buffer so we do
     // one SMAP window per chunk instead of per character, and hold the
     // tty_lock for the entire write so two CPUs can't interleave chars.
@@ -902,11 +1638,15 @@ long tty_write(tty_t* tty, const void* buf, long count) {
         spin_lock_irqsave(&tty_lock, &flags);
         for (long i = 0; i < chunk; i++) {
             char c = tmp[i];
-            if (tty->term.c_iflag & INLCR) {
-                if (c == '\n') c = '\r';
-            }
-            if (tty->term.c_iflag & IGNCR) {
-                if (c == '\r') continue;
+            /* Output post-processing (OPOST/ONLCR): translate bare LF
+             * to CR+LF so cursor returns to column 0.  Skip when the
+             * caller has cleared OPOST (raw mode — tmux, full-screen
+             * apps), which set their own \r\n explicitly. */
+            if ((tty->term.c_oflag & OPOST) &&
+                (tty->term.c_oflag & ONLCR) && c == '\n') {
+                if (mirror_console && mirror_len < (long)sizeof(mirror_tmp))
+                    mirror_tmp[mirror_len++] = '\r';
+                tty->output(tty, '\r');
             }
             if (mirror_console && mirror_len < (long)sizeof(mirror_tmp)) {
                 mirror_tmp[mirror_len++] = c;
@@ -917,6 +1657,16 @@ long tty_write(tty_t* tty, const void* buf, long count) {
 
         if (mirror_console && mirror_len > 0) {
             usbserial_log_write(mirror_tmp, (uint32_t)mirror_len);
+        }
+
+        /* If the parser injected a DSR/DA reply into our read buffer
+         * during this chunk, wake any blocked readers now that we’ve
+         * dropped tty_lock.  Doing the wake under tty_lock is unsafe:
+         * sched_enqueue_ready may take scheduler locks and we hold
+         * tty_lock with IRQs off. */
+        if (mirror_console && g_console_reply_pending) {
+            g_console_reply_pending = 0;
+            tty_wake_readers(&tty->read_waiters);
         }
 
         // Rate-limited VRAM flush (~50fps) — skips if too recent
@@ -946,7 +1696,12 @@ int tty_ioctl(tty_t* tty, unsigned long req, void* argp, task_t* cur) {
         case TCSETSF:
             if (!argp) return -EFAULT;
             // Security: Use SMAP-aware copy from user space
-            return tty_copy_from_user(&tty->term, argp, sizeof(termios_k_t));
+            {
+                /* Only log when termios actually CHANGES, not the
+                 * spinning re-arm done by ncurses' input timing loop. */
+                int _r = tty_copy_from_user(&tty->term, argp, sizeof(termios_k_t));
+                return _r;
+            }
         case TIOCGPGRP: {
             if (!argp) return -EFAULT;
             int pgid = tty->fg_pgid;
@@ -993,6 +1748,7 @@ int tty_pty_allocate(int* out_id) {
         if (g_ptys[i].id == -1) {
             pty_t* pty = &g_ptys[i];
             mm_memset(pty, 0, sizeof(pty_t));
+            spinlock_init(&pty->lock, "pty");
             pty->id = i;
             pty->master_open = 1;
             pty->slave_open = 0;
@@ -1047,26 +1803,49 @@ long tty_pty_master_read(int id, void* buf, long count, int nonblock) {
     char* out = (char*)buf;
     long read = 0;
     while (read < count) {
-        if (pty->m_count == 0) {
-            if (read > 0 || nonblock) {
-                break;
-            }
-            if (cur) {
-                cur->state = TASK_BLOCKED;
-                cur->wait_next = pty->master_read_waiters;
-                cur->wait_channel = pty;
-                pty->master_read_waiters = cur;
-                sched_schedule();
-                continue;
-            }
+        uint64_t flags;
+        spin_lock_irqsave(&pty->lock, &flags);
+
+        /* Drain whatever is queued under the lock. */
+        while (pty->m_count > 0 && read < count) {
+            char c = pty->master_buf[pty->m_head];
+            pty->m_head = (pty->m_head + 1) % PTY_MASTER_BUF_SIZE;
+            pty->m_count--;
+            spin_unlock_irqrestore(&pty->lock, flags);
+            /* SMAP-aware write to user buffer (must be done with the lock
+             * dropped — user-space access can fault). */
+            smap_disable();
+            out[read++] = c;
+            smap_enable();
+            spin_lock_irqsave(&pty->lock, &flags);
+        }
+
+        if (read > 0) {
+            spin_unlock_irqrestore(&pty->lock, flags);
             break;
         }
-        // SMAP-aware write to user buffer
-        smap_disable();
-        out[read++] = pty->master_buf[pty->m_head];
-        smap_enable();
-        pty->m_head = (pty->m_head + 1) % sizeof(pty->master_buf);
-        pty->m_count--;
+
+        /* Slave end is closed and the master ring is empty: EOF. */
+        if (!pty->slave_open) {
+            spin_unlock_irqrestore(&pty->lock, flags);
+            break;
+        }
+        if (nonblock) {
+            spin_unlock_irqrestore(&pty->lock, flags);
+            break;
+        }
+        if (!cur) {
+            spin_unlock_irqrestore(&pty->lock, flags);
+            break;
+        }
+        if (signal_pending(cur)) {
+            spin_unlock_irqrestore(&pty->lock, flags);
+            return -EINTR;
+        }
+        cur->state = TASK_BLOCKED;
+        cur->wait_channel = (void*)&pty->master_read_waiters;
+        spin_unlock_irqrestore(&pty->lock, flags);
+        sched_schedule();
     }
     return read;
 }
@@ -1105,8 +1884,34 @@ int tty_pty_slave_close(int id) {
         return -EINVAL;
     }
     pty->slave_open = 0;
+    /* Wake any task blocked in tty_pty_master_read so it can observe
+     * EOF (read returns 0) and the master fd's poll set transitions to
+     * POLLHUP.  Without this, the last shell `exit` leaves tmux's I/O
+     * loop blocked indefinitely. */
+    tty_wake_readers(&pty->master_read_waiters);
     if (!pty->master_open) {
         pty->id = -1;
     }
     return 0;
+}
+
+/* Poll a pty master endpoint. Returns POLLIN when there are bytes
+ * queued from the slave, POLLOUT always (writes are always accepted),
+ * POLLHUP when the slave end is closed and no data remains. */
+int tty_pty_master_poll(int id, int events) {
+    pty_t* pty = tty_get_pty(id);
+    if (!pty) return 0;
+    int rev = 0;
+    uint64_t flags;
+    spin_lock_irqsave(&pty->lock, &flags);
+    uint32_t count = pty->m_count;
+    int slave_open = pty->slave_open;
+    spin_unlock_irqrestore(&pty->lock, flags);
+    if ((events & (POLLIN | POLLRDNORM)) && count > 0)
+        rev |= POLLIN | POLLRDNORM;
+    if (events & (POLLOUT | POLLWRNORM))
+        rev |= POLLOUT | POLLWRNORM;
+    if (!slave_open && count == 0)
+        rev |= POLLHUP;
+    return rev;
 }

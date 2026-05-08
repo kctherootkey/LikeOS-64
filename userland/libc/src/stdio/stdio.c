@@ -536,7 +536,18 @@ static int num_to_str(long long num, char* buf, int base, int uppercase) {
 }
 
 int vsnprintf(char* str, size_t size, const char* format, va_list ap) {
-    if (!str || size == 0) return 0;
+    /* C99: when str is NULL or size is 0, return the number of characters
+     * that would have been written (excluding the terminating NUL) had the
+     * buffer been large enough.  asprintf/vasprintf depend on this two-pass
+     * sizing behaviour. */
+    if (!str || size == 0) {
+        char tmpbuf[8192];
+        va_list ap2;
+        va_copy(ap2, ap);
+        int n = vsnprintf(tmpbuf, sizeof(tmpbuf), format, ap2);
+        va_end(ap2);
+        return n;
+    }
     size_t pos = 0;
 
     while (*format && pos < size - 1) {
@@ -1212,4 +1223,14 @@ int sscanf(const char *str, const char *format, ...)
     int ret = vsscanf(str, format, ap);
     va_end(ap);
     return ret;
+}
+
+/* fseeko / ftello - large-file aliases. We use 64-bit off_t already so
+ * these are simple wrappers around fseek / ftell. */
+int fseeko(FILE *stream, off_t offset, int whence) {
+    return fseek(stream, (long)offset, whence);
+}
+
+off_t ftello(FILE *stream) {
+    return (off_t)ftell(stream);
 }

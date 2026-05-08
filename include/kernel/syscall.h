@@ -186,6 +186,21 @@
 #define SYS_DNS_RESOLVE_REVERSE 375  // Reverse DNS lookup (PTR)
 #define SYS_SET_DNS_SERVER  376  // Install resolver server (RFC 3493 stub)
 
+// Process / session management (POSIX)
+#define SYS_SETSID          380  // Create a new session
+#define SYS_GETSID          381  // Return session ID of process
+#define SYS_GETPGID         382  // Return process-group ID of process
+#define SYS_GETRUSAGE       383  // Resource usage (RUSAGE_SELF / RUSAGE_CHILDREN)
+
+// Scatter/gather I/O (POSIX)
+#define SYS_READV           384
+#define SYS_WRITEV          385
+
+// rusage who values
+#define RUSAGE_SELF         0
+#define RUSAGE_CHILDREN     (-1)
+#define RUSAGE_THREAD       1
+
 // NET_GETINFO sub-commands
 #define NET_GET_ARP_TABLE       1
 #define NET_GET_ROUTE_TABLE     2
@@ -340,6 +355,7 @@ typedef struct k_sysinfo {
 #define ERANGE          34  // Math result not representable
 #define ELOOP           40  // Too many symbolic links
 #define ENFILE          23  // File table overflow
+#define EMSGSIZE        90  // Message too long
 
 // Syscall handler prototype
 int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,

@@ -1471,34 +1471,157 @@ char *tigetstr(const char *capname)
 {
     if (!capname) return (char *)-1;
 
-    /* nano uses tigetstr to look up keys like "kDC5", "kLFT5", etc. */
-    /* Return -1 (not found) for capabilities we don't support */
-    /* Common ones we could handle: */
-    if (strcmp(capname, "smcup") == 0) return "\033[?1049h";
-    if (strcmp(capname, "rmcup") == 0) return "\033[?1049l";
-    if (strcmp(capname, "civis") == 0) return "\033[?25l";
-    if (strcmp(capname, "cnorm") == 0) return "\033[?25h";
-    if (strcmp(capname, "clear") == 0) return "\033[2J\033[H";
-    if (strcmp(capname, "el")   == 0) return "\033[K";
-    if (strcmp(capname, "ed")   == 0) return "\033[J";
-    if (strcmp(capname, "cup")  == 0) return "\033[%i%p1%d;%p2%dH";
-    if (strcmp(capname, "bold") == 0) return "\033[1m";
-    if (strcmp(capname, "rev")  == 0) return "\033[7m";
-    if (strcmp(capname, "sgr0") == 0) return "\033[0m";
-    if (strcmp(capname, "smul") == 0) return "\033[4m";
-    if (strcmp(capname, "rmul") == 0) return "\033[24m";
+    /* ------------------------------------------------------------------
+     * Comprehensive xterm-256color-equivalent terminfo stub.
+     * tmux iterates over its full tty_term_codes table at startup; any
+     * capability we return -1 for is treated as "the terminal cannot do
+     * this", which silently disables colors, cursor positioning, line
+     * editing, scroll regions, etc.  Returning the standard ECMA-48 /
+     * xterm sequences here keeps tmux on its fast path and matches what
+     * the kernel ANSI parser already understands.
+     * ------------------------------------------------------------------ */
 
+    /* --- Cursor visibility / alt-screen ------------------------------- */
+    if (strcmp(capname, "civis") == 0) return "\033[?25l";
+    if (strcmp(capname, "cnorm") == 0) return "\033[?12l\033[?25h";
+    if (strcmp(capname, "cvvis") == 0) return "\033[?12;25h";
+    if (strcmp(capname, "smcup") == 0) return "\033[?1049h\033[22;0;0t";
+    if (strcmp(capname, "rmcup") == 0) return "\033[?1049l\033[23;0;0t";
+
+    /* --- Erase / clear ------------------------------------------------ */
+    if (strcmp(capname, "clear") == 0) return "\033[H\033[2J";
+    if (strcmp(capname, "ed")    == 0) return "\033[J";
+    if (strcmp(capname, "el")    == 0) return "\033[K";
+    if (strcmp(capname, "el1")   == 0) return "\033[1K";
+    if (strcmp(capname, "ech")   == 0) return "\033[%p1%dX";
+
+    /* --- Cursor movement --------------------------------------------- */
+    if (strcmp(capname, "cup")   == 0) return "\033[%i%p1%d;%p2%dH";
+    if (strcmp(capname, "home")  == 0) return "\033[H";
+    if (strcmp(capname, "hpa")   == 0) return "\033[%i%p1%dG";
+    if (strcmp(capname, "vpa")   == 0) return "\033[%i%p1%dd";
+    if (strcmp(capname, "cuu1")  == 0) return "\033[A";
+    if (strcmp(capname, "cud1")  == 0) return "\n";
+    if (strcmp(capname, "cuf1")  == 0) return "\033[C";
+    if (strcmp(capname, "cub1")  == 0) return "\b";
+    if (strcmp(capname, "cuu")   == 0) return "\033[%p1%dA";
+    if (strcmp(capname, "cud")   == 0) return "\033[%p1%dB";
+    if (strcmp(capname, "cuf")   == 0) return "\033[%p1%dC";
+    if (strcmp(capname, "cub")   == 0) return "\033[%p1%dD";
+    if (strcmp(capname, "cr")    == 0) return "\r";
+    if (strcmp(capname, "ind")   == 0) return "\n";
+    if (strcmp(capname, "ri")    == 0) return "\033M";
+    if (strcmp(capname, "indn")  == 0) return "\033[%p1%dS";
+    if (strcmp(capname, "rin")   == 0) return "\033[%p1%dT";
+    if (strcmp(capname, "nel")   == 0) return "\r\n";
+    if (strcmp(capname, "ht")    == 0) return "\t";
+    if (strcmp(capname, "cbt")   == 0) return "\033[Z";
+
+    /* --- Scroll region ----------------------------------------------- */
+    if (strcmp(capname, "csr")   == 0) return "\033[%i%p1%d;%p2%dr";
+
+    /* --- Line / character insert + delete ---------------------------- */
+    if (strcmp(capname, "il1")   == 0) return "\033[L";
+    if (strcmp(capname, "il")    == 0) return "\033[%p1%dL";
+    if (strcmp(capname, "dl1")   == 0) return "\033[M";
+    if (strcmp(capname, "dl")    == 0) return "\033[%p1%dM";
+    if (strcmp(capname, "ich1")  == 0) return "\033[@";
+    if (strcmp(capname, "ich")   == 0) return "\033[%p1%d@";
+    if (strcmp(capname, "dch1")  == 0) return "\033[P";
+    if (strcmp(capname, "dch")   == 0) return "\033[%p1%dP";
+
+    /* --- Save / restore cursor --------------------------------------- */
+    if (strcmp(capname, "sc")    == 0) return "\0337";
+    if (strcmp(capname, "rc")    == 0) return "\0338";
+
+    /* --- SGR / attributes -------------------------------------------- */
+    if (strcmp(capname, "bold")  == 0) return "\033[1m";
+    if (strcmp(capname, "dim")   == 0) return "\033[2m";
+    if (strcmp(capname, "sitm")  == 0) return "\033[3m";
+    if (strcmp(capname, "ritm")  == 0) return "\033[23m";
+    if (strcmp(capname, "smul")  == 0) return "\033[4m";
+    if (strcmp(capname, "rmul")  == 0) return "\033[24m";
+    if (strcmp(capname, "blink") == 0) return "\033[5m";
+    if (strcmp(capname, "rev")   == 0) return "\033[7m";
+    if (strcmp(capname, "invis") == 0) return "\033[8m";
+    if (strcmp(capname, "smso")  == 0) return "\033[7m";
+    if (strcmp(capname, "rmso")  == 0) return "\033[27m";
+    if (strcmp(capname, "sgr0")  == 0) return "\033[m";
+    /* (No "sgr" — its terminfo string requires %?/%t/%e/%; conditionals
+     * that our minimal tparm doesn't implement.  Returning -1 makes tmux
+     * fall back to issuing sgr0 + individual attribute capabilities,
+     * which is exactly what we want.) */
+
+    /* --- Color (xterm-256color style) --------------------------------
+     * We deliberately use the fully general 38;5;N / 48;5;N form here
+     * for all indices (rather than the xterm-style "%?...%t3N%e38;5;N%;"
+     * conditional) because our tparm only understands %i / %pN%d. */
+    if (strcmp(capname, "setaf") == 0) return "\033[38;5;%p1%dm";
+    if (strcmp(capname, "setab") == 0) return "\033[48;5;%p1%dm";
+    if (strcmp(capname, "setf")  == 0) return "\033[3%p1%dm";
+    if (strcmp(capname, "setb")  == 0) return "\033[4%p1%dm";
+    if (strcmp(capname, "op")    == 0) return "\033[39;49m";
+
+    /* --- Alt charset / line drawing ----------------------------------
+     * Deliberately omitted: our framebuffer console doesn't implement
+     * the DEC special graphics charset (it just consumes ESC ( N).  If
+     * we exposed smacs/rmacs/acsc, tmux would emit alphabetic codepoints
+     * meant for line-drawing and they'd render as plain letters.  Leaving
+     * these unset makes tmux fall back to its built-in ASCII art set. */
+
+    /* --- Keypad / misc ----------------------------------------------- */
+    if (strcmp(capname, "smkx")  == 0) return "\033[?1h\033=";
+    if (strcmp(capname, "rmkx")  == 0) return "\033[?1l\033>";
+    if (strcmp(capname, "is2")   == 0) return "\033[!p\033[?3;4l\033[4l\033>";
+    if (strcmp(capname, "rs1")   == 0) return "\033c\033]104\007";
+    if (strcmp(capname, "rs2")   == 0) return "\033[!p\033[?3;4l\033[4l\033>";
+
+    /* --- Cursor shape (tmux uses these via overrides) ---------------- */
+    if (strcmp(capname, "Ss")    == 0) return "\033[%p1%d q";
+    if (strcmp(capname, "Se")    == 0) return "\033[2 q";
+
+    /* --- Truecolor (xterm extensions tmux honors) -------------------- */
+    if (strcmp(capname, "RGB")   == 0) return "8";
+    if (strcmp(capname, "Tc")    == 0) return "";
+    if (strcmp(capname, "setrgbf") == 0)
+        return "\033[38;2;%p1%d;%p2%d;%p3%dm";
+    if (strcmp(capname, "setrgbb") == 0)
+        return "\033[48;2;%p1%d;%p2%d;%p3%dm";
+
+    /* --- Mouse (tmux probes these) -----------------------------------
+     * Only return the input sequence (kmous); the XM/Ms emit-side caps
+     * use %?/%t/%e/%; or %s which our tparm cannot expand. */
+    if (strcmp(capname, "kmous") == 0) return "\033[M";
+
+    /* --- Bell --------------------------------------------------------- */
+    if (strcmp(capname, "bel")   == 0) return "\007";
+    if (strcmp(capname, "flash") == 0) return "\033[?5h$<100/>\033[?5l";
+
+    /* nano uses tigetstr to look up keys like "kDC5", "kLFT5", etc. */
     /* key capabilities - return the escape sequences for them */
-    if (strcmp(capname, "kcuu1") == 0) return "\033[A";
-    if (strcmp(capname, "kcud1") == 0) return "\033[B";
-    if (strcmp(capname, "kcuf1") == 0) return "\033[C";
-    if (strcmp(capname, "kcub1") == 0) return "\033[D";
-    if (strcmp(capname, "khome") == 0) return "\033[H";
-    if (strcmp(capname, "kend")  == 0) return "\033[F";
+    if (strcmp(capname, "kcuu1") == 0) return "\033OA";
+    if (strcmp(capname, "kcud1") == 0) return "\033OB";
+    if (strcmp(capname, "kcuf1") == 0) return "\033OC";
+    if (strcmp(capname, "kcub1") == 0) return "\033OD";
+    if (strcmp(capname, "khome") == 0) return "\033OH";
+    if (strcmp(capname, "kend")  == 0) return "\033OF";
     if (strcmp(capname, "kdch1") == 0) return "\033[3~";
     if (strcmp(capname, "kich1") == 0) return "\033[2~";
     if (strcmp(capname, "knp")   == 0) return "\033[6~";
     if (strcmp(capname, "kpp")   == 0) return "\033[5~";
+    if (strcmp(capname, "kbs")   == 0) return "\b";
+    if (strcmp(capname, "kf1")   == 0) return "\033OP";
+    if (strcmp(capname, "kf2")   == 0) return "\033OQ";
+    if (strcmp(capname, "kf3")   == 0) return "\033OR";
+    if (strcmp(capname, "kf4")   == 0) return "\033OS";
+    if (strcmp(capname, "kf5")   == 0) return "\033[15~";
+    if (strcmp(capname, "kf6")   == 0) return "\033[17~";
+    if (strcmp(capname, "kf7")   == 0) return "\033[18~";
+    if (strcmp(capname, "kf8")   == 0) return "\033[19~";
+    if (strcmp(capname, "kf9")   == 0) return "\033[20~";
+    if (strcmp(capname, "kf10")  == 0) return "\033[21~";
+    if (strcmp(capname, "kf11")  == 0) return "\033[23~";
+    if (strcmp(capname, "kf12")  == 0) return "\033[24~";
 
     /* Shifted / Ctrl key variants that nano looks for */
     if (strcmp(capname, "kDC")   == 0) return "\033[3;2~";
@@ -1547,14 +1670,26 @@ int tigetnum(const char *capname)
     if (strcmp(capname, "pairs")  == 0) return COLOR_PAIRS;
     if (strcmp(capname, "cols")   == 0) return COLS;
     if (strcmp(capname, "lines")  == 0) return LINES;
+    if (strcmp(capname, "it")     == 0) return 8;   /* tab interval */
+    if (strcmp(capname, "U8")     == 0) return 1;   /* terminal is UTF-8 capable */
     return -1;
 }
 
 int tigetflag(const char *capname)
 {
     if (!capname) return -1;
-    if (strcmp(capname, "ccc") == 0)  return 0;  /* can't change colors */
-    if (strcmp(capname, "bce") == 0)  return 1;  /* back color erase */
+    if (strcmp(capname, "am")    == 0) return 1;   /* auto-margin: wrap at right */
+    if (strcmp(capname, "bce")   == 0) return 1;   /* back color erase */
+    if (strcmp(capname, "ccc")   == 0) return 0;   /* can't change colors */
+    if (strcmp(capname, "msgr")  == 0) return 1;   /* safe to move in standout */
+    if (strcmp(capname, "xenl")  == 0) return 1;   /* newline at right column ignored */
+    if (strcmp(capname, "eo")    == 0) return 1;   /* blank erases overstrike */
+    if (strcmp(capname, "mir")   == 0) return 1;   /* move in insert mode */
+    if (strcmp(capname, "msgr")  == 0) return 1;
+    if (strcmp(capname, "npc")   == 0) return 1;   /* no pad character */
+    if (strcmp(capname, "hs")    == 0) return 0;   /* no hardware status line */
+    if (strcmp(capname, "xon")   == 0) return 1;
+    if (strcmp(capname, "AX")    == 0) return 1;   /* default colors honor 39/49 */
     return -1;
 }
 
@@ -1570,6 +1705,10 @@ int del_curterm(void *oterm)
     (void)oterm;
     return OK;
 }
+
+/* Sentinel - any non-null value satisfies callers that test cur_term. */
+static char _cur_term_storage;
+void* cur_term = &_cur_term_storage;
 
 int putp(const char *str)
 {

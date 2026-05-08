@@ -54,3 +54,8 @@ const char *inet_ntop(int af, const void *src, char *dst, socklen_t size) {
     dst[p] = 0;
     return dst;
 }
+
+#include <netinet/in.h>
+const struct in6_addr in6addr_any      = IN6ADDR_ANY_INIT;
+const struct in6_addr in6addr_loopback = IN6ADDR_LOOPBACK_INIT;
+

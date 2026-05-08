@@ -467,9 +467,11 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
         return -EBADF;
     }
     
-    // Check for console dup markers (magic pointers 1, 2, 3)
+    // Check for console dup markers (magic pointers 1, 2, 3).
+    // All three reference the same bidirectional /dev/console device,
+    // so any of them can be read from (matches Unix dup-of-tty semantics).
     uint64_t marker = (uint64_t)file;
-    if (marker == 1) {
+    if (marker >= 1 && marker <= 3) {
         tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
         if (tty && tty->fg_pgid == 0) {
             tty->fg_pgid = cur->pgid;
@@ -480,9 +482,6 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
         }
         int nonblock = (cur->console_flags & O_NONBLOCK) ? 1 : 0;
         return tty_read(tty, (void*)buf, (long)count, nonblock);
-    } else if (marker == 2 || marker == 3) {
-        // Can't read from stdout/stderr
-        return -EBADF;
     }
     
     // UNIX socket fd - read via unix_recv
@@ -544,9 +543,10 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
         return -EBADF;
     }
     
-    // Check for console dup markers (magic pointers 1, 2, 3)
+    // Check for console dup markers (magic pointers 1, 2, 3).
+    // All three reference the same bidirectional /dev/console device.
     uint64_t marker = (uint64_t)file;
-    if (marker == 2 || marker == 3) {
+    if (marker >= 1 && marker <= 3) {
         tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
         if (tty && tty->fg_pgid == 0) {
             tty->fg_pgid = cur->pgid;
@@ -556,9 +556,6 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
             return -EIO;
         }
         return tty_write(tty, (const void*)buf, (long)count);
-    } else if (marker == 1) {
-        // Can't write to stdin
-        return -EBADF;
     }
     
     // UNIX socket fd - write via unix_send
@@ -1201,6 +1198,25 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
 
     if (!file) return -EBADF;
 
+    // Console markers stored in fd_table by dup2 (oldfd+1: 1=stdin, 2=stdout, 3=stderr)
+    {
+        uintptr_t mv = (uintptr_t)file;
+        if (mv >= 1 && mv <= 3) {
+            if (cmd == F_GETFL) {
+                uint32_t fl = (mv == 1) ? O_RDONLY : O_WRONLY;
+                fl |= (cur->console_flags & O_NONBLOCK);
+                return fl;
+            }
+            if (cmd == F_SETFL) {
+                cur->console_flags = (cur->console_flags & ~O_NONBLOCK) | ((uint32_t)arg & O_NONBLOCK);
+                return 0;
+            }
+            if (cmd == F_GETFD) return 0;
+            if (cmd == F_SETFD) return 0;
+            return -EINVAL;
+        }
+    }
+
     // Socket fd markers
     if (IS_SOCKET_FD(file)) {
         int idx = SOCKET_FD_IDX(file);
@@ -1244,6 +1260,8 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
             end->flags = (end->flags & ~O_NONBLOCK) | ((uint32_t)arg & O_NONBLOCK);
             return 0;
         }
+        if (cmd == F_GETFD) return 0;
+        if (cmd == F_SETFD) return 0;
         return -EINVAL;
     }
 
@@ -1251,10 +1269,14 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
         return file->flags;
     }
     if (cmd == 4) { // F_SETFL
-        // only allow changing O_APPEND
-        file->flags = (file->flags & ~O_APPEND) | (arg & O_APPEND);
+        // POSIX: F_SETFL can change O_APPEND, O_NONBLOCK, O_ASYNC, O_DIRECT,
+        // O_NOATIME.  Access mode and creation flags are ignored.
+        const uint32_t SETTABLE = O_APPEND | O_NONBLOCK;
+        file->flags = (file->flags & ~SETTABLE) | ((uint32_t)arg & SETTABLE);
         return 0;
     }
+    if (cmd == F_GETFD) return 0;
+    if (cmd == F_SETFD) return 0;
     return -EINVAL;
 }
 
@@ -1307,6 +1329,17 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp) {
         tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
         return tty_ioctl(tty, (unsigned long)req, (void*)argp, cur);
     }
+    /* Duplicated stdio markers: dup()/SCM_RIGHTS store the marker value
+     * (1, 2 or 3 = oldfd+1) into the fd_table.  These should still be
+     * routed to the controlling TTY, otherwise isatty()/tcgetattr() on
+     * a dup'd stdin/stdout/stderr would fail. */
+    if (file) {
+        uintptr_t mk = (uintptr_t)file;
+        if (mk >= 1 && mk <= 3) {
+            tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
+            return tty_ioctl(tty, (unsigned long)req, (void*)argp, cur);
+        }
+    }
     if (!file) {
         return -EBADF;
     }
@@ -1348,7 +1381,12 @@ static int64_t sys_tcgetpgrp(uint64_t fd) {
         tty = cur->ctty ? cur->ctty : tty_get_console();
     }
     if (file) {
-        tty = devfs_get_tty(file);
+        uintptr_t mk = (uintptr_t)file;
+        if (mk >= 1 && mk <= 3) {
+            tty = cur->ctty ? cur->ctty : tty_get_console();
+        } else {
+            tty = devfs_get_tty(file);
+        }
     }
     if (!tty) {
         return -ENOTTY;
@@ -1368,13 +1406,115 @@ static int64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgrp) {
         tty = cur->ctty ? cur->ctty : tty_get_console();
     }
     if (file) {
-        tty = devfs_get_tty(file);
+        uintptr_t mk = (uintptr_t)file;
+        if (mk >= 1 && mk <= 3) {
+            tty = cur->ctty ? cur->ctty : tty_get_console();
+        } else {
+            tty = devfs_get_tty(file);
+        }
     }
     if (!tty) {
         return -ENOTTY;
     }
     tty->fg_pgid = (int)pgrp;
     return 0;
+}
+
+// POSIX setsid(2) - create a new session.
+// On success the calling process becomes session leader, gets a new
+// process group, and is detached from any controlling tty.  Returns
+// the new session ID (the pid).  Returns -EPERM if the caller is
+// already a process-group leader.
+static int64_t sys_setsid(void) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (cur->pgid == (int)cur->id) {
+        return -EPERM;
+    }
+    cur->sid  = (int)cur->id;
+    cur->pgid = (int)cur->id;
+    cur->ctty = NULL;
+    return cur->id;
+}
+
+// POSIX getsid(2) - return session ID of process pid (0 = self).
+static int64_t sys_getsid(uint64_t pid) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (pid == 0) return cur->sid;
+    task_t* t = sched_find_task_by_id((uint32_t)pid);
+    if (!t) return -ESRCH;
+    return t->sid;
+}
+
+// POSIX getpgid(2) - return process-group ID of process pid (0 = self).
+static int64_t sys_getpgid(uint64_t pid) {
+    task_t* cur = sched_current();
+    if (!cur) return -EFAULT;
+    if (pid == 0) return cur->pgid;
+    task_t* t = sched_find_task_by_id((uint32_t)pid);
+    if (!t) return -ESRCH;
+    return t->pgid;
+}
+
+// POSIX getrusage(2) - resource usage.
+// We don't track per-process CPU time accurately yet; return zeros.
+struct k_rusage_compat {
+    int64_t ru_utime_sec;  int64_t ru_utime_usec;
+    int64_t ru_stime_sec;  int64_t ru_stime_usec;
+    int64_t ru_pad[14];
+};
+static int64_t sys_getrusage(uint64_t who, uint64_t uptr) {
+    (void)who;
+    if (!uptr) return -EFAULT;
+    if (!validate_user_ptr(uptr, sizeof(struct k_rusage_compat))) return -EFAULT;
+    struct k_rusage_compat ru;
+    for (size_t i = 0; i < sizeof(ru); i++) ((uint8_t*)&ru)[i] = 0;
+    if (copy_to_user((void*)uptr, &ru, sizeof(ru)) != 0) return -EFAULT;
+    return 0;
+}
+
+// POSIX writev(2) / readv(2) - scatter/gather I/O implemented as a loop
+// over write(2) / read(2).  Per POSIX the implementation is allowed to
+// process the iovecs sequentially; the only invariant is partial-write
+// semantics on errors mid-stream.  Returns total bytes transferred.
+struct k_iovec_compat { uint64_t iov_base; uint64_t iov_len; };
+
+static int64_t sys_writev(uint64_t fd, uint64_t iovp, uint64_t iovcnt) {
+    if (iovcnt > 1024) return -EINVAL;
+    if (!iovp) return -EFAULT;
+    if (!validate_user_ptr(iovp, iovcnt * sizeof(struct k_iovec_compat))) return -EFAULT;
+    int64_t total = 0;
+    for (uint64_t i = 0; i < iovcnt; i++) {
+        struct k_iovec_compat iov;
+        if (copy_from_user(&iov, (void*)(iovp + i * sizeof(iov)), sizeof(iov)) != 0)
+            return total ? total : -EFAULT;
+        if (iov.iov_len == 0) continue;
+        int64_t r = sys_write(fd, iov.iov_base, iov.iov_len);
+        if (r < 0) return total ? total : r;
+        total += r;
+        if ((uint64_t)r < iov.iov_len) break;  // short write
+    }
+    return total;
+}
+
+static int64_t sys_readv(uint64_t fd, uint64_t iovp, uint64_t iovcnt) {
+    if (iovcnt > 1024) return -EINVAL;
+    if (!iovp) return -EFAULT;
+    if (!validate_user_ptr(iovp, iovcnt * sizeof(struct k_iovec_compat))) return -EFAULT;
+    int64_t total = 0;
+    for (uint64_t i = 0; i < iovcnt; i++) {
+        struct k_iovec_compat iov;
+        if (copy_from_user(&iov, (void*)(iovp + i * sizeof(iov)), sizeof(iov)) != 0)
+            return total ? total : -EFAULT;
+        if (iov.iov_len == 0) continue;
+        int64_t r = sys_read(fd, iov.iov_base, iov.iov_len);
+        if (r < 0) return total ? total : r;
+        total += r;
+        if (r == 0) break;  // EOF
+        if ((uint64_t)r < iov.iov_len) break;  // short read
+    }
+    return total;
 }
 
 // Forward declaration for signal functions
@@ -5116,20 +5256,249 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         }
 
         case SYS_SENDMSG: {
-            int idx = sock_idx_from_fd(a1);
-            if (idx < 0) return idx;
             if (!validate_user_ptr(a2, sizeof(struct msghdr))) return -EFAULT;
             struct msghdr kmsg;
             copy_from_user(&kmsg, (const void*)a2, sizeof(struct msghdr));
+
+            // UNIX-domain path: handle SCM_RIGHTS fd-passing + iov data.
+            int ufd = unix_sock_fd_from_fd(a1);
+            if (ufd >= 0) {
+                unix_socket_t* us = unix_get(ufd);
+                if (!us) return -EBADF;
+                unix_socket_t* peer = us->peer;
+                if (!peer || !peer->active) return -ENOTCONN;
+
+                /* Process control data first so the fd arrives before
+                 * (or with) the byte that the receiver associates it
+                 * with.  The imsg framing tmux uses sends one fd per
+                 * message and the receiver pops the next pending fd
+                 * when it parses each imsg header. */
+                if (kmsg.msg_control && kmsg.msg_controllen >= sizeof(struct cmsghdr)) {
+                    size_t clen = kmsg.msg_controllen;
+                    if (clen > 256) clen = 256;
+                    unsigned char cbuf[256];
+                    if (!validate_user_ptr((uint64_t)kmsg.msg_control, clen))
+                        return -EFAULT;
+                    copy_from_user(cbuf, kmsg.msg_control, clen);
+                    size_t off = 0;
+                    task_t* cur = sched_current();
+                    if (!cur) return -EFAULT;
+                    while (off + sizeof(struct cmsghdr) <= clen) {
+                        struct cmsghdr* cmsg = (struct cmsghdr*)(cbuf + off);
+                        if (cmsg->cmsg_len < sizeof(struct cmsghdr)) break;
+                        if (off + cmsg->cmsg_len > clen) break;
+                        if (cmsg->cmsg_level == SOL_SOCKET &&
+                            cmsg->cmsg_type  == SCM_RIGHTS) {
+                            size_t hdr_align = CMSG_ALIGN(sizeof(struct cmsghdr));
+                            int n = (int)((cmsg->cmsg_len - hdr_align) / sizeof(int));
+                            int* fds = (int*)(cbuf + off + hdr_align);
+                            for (int i = 0; i < n; i++) {
+                                int sfd = fds[i];
+                                if (sfd < 0 || sfd >= TASK_MAX_FDS) continue;
+                                void* entry = cur->fd_table[sfd];
+                                if (!entry) continue;
+                                /* Bump the underlying refcount so the
+                                 * entry survives if the sender closes
+                                 * its fd before the peer reads it. */
+                                uintptr_t marker = (uintptr_t)entry;
+                                if (marker >= 1 && marker <= 3) {
+                                    /* stdio markers — opaque, no refcount */
+                                } else if (IS_SOCKET_FD(entry)) {
+                                    net_socket_t* s = sock_get(SOCKET_FD_IDX(entry));
+                                    if (s) __atomic_fetch_add(&s->ref_count, 1, __ATOMIC_ACQ_REL);
+                                } else if (IS_UNIX_SOCKET_FD(entry)) {
+                                    unix_socket_t* xs = unix_get((int)(uintptr_t)entry);
+                                    if (xs) __atomic_fetch_add(&xs->ref_count, 1, __ATOMIC_ACQ_REL);
+                                } else if (IS_EPOLL_FD(entry)) {
+                                    /* opaque marker, no per-instance ref */
+                                } else if (pipe_is_end(entry)) {
+                                    pipe_end_t* ne = pipe_dup_end((pipe_end_t*)entry);
+                                    if (ne) entry = ne;
+                                } else {
+                                    entry = vfs_dup(entry);
+                                    if (!entry) continue;
+                                }
+                                (void)unix_push_fd(peer, entry);
+                            }
+                        }
+                        off += CMSG_ALIGN(cmsg->cmsg_len);
+                    }
+                }
+
+                /* Flatten iov into a temp buffer, then unix_send. */
+                if (kmsg.msg_iovlen <= 0) return 0;
+                /* Stream sockets: process up to 4096 bytes regardless
+                 * of how many iov segments the caller passes; cap the
+                 * iov count we walk so the on-stack array is bounded. */
+                int kiovcnt = kmsg.msg_iovlen;
+                if (kiovcnt > 256) kiovcnt = 256;
+                struct iovec iov[256];
+                if (!validate_user_ptr((uint64_t)kmsg.msg_iov,
+                                       sizeof(struct iovec) * (size_t)kiovcnt))
+                    return -EFAULT;
+                copy_from_user(iov, kmsg.msg_iov,
+                               sizeof(struct iovec) * (size_t)kiovcnt);
+                size_t total = 0;
+                for (int i = 0; i < kiovcnt; i++) {
+                    if (total + iov[i].iov_len > 4096) {
+                        iov[i].iov_len = 4096 - total;
+                        total = 4096;
+                        kiovcnt = i + 1;
+                        break;
+                    }
+                    total += iov[i].iov_len;
+                }
+                if (total == 0) return 0;
+                static uint8_t sbuf[4096];
+                size_t off = 0;
+                for (int i = 0; i < kiovcnt && off < total; i++) {
+                    size_t chunk = iov[i].iov_len;
+                    if (off + chunk > total) chunk = total - off;
+                    if (!validate_user_ptr((uint64_t)iov[i].iov_base, chunk))
+                        return -EFAULT;
+                    copy_from_user(sbuf + off, iov[i].iov_base, chunk);
+                    off += chunk;
+                }
+                return unix_send(ufd, sbuf, total, 0);
+            }
+
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
             return sock_sendmsg(idx, &kmsg, (int)a3);
         }
 
         case SYS_RECVMSG: {
-            int idx = sock_idx_from_fd(a1);
-            if (idx < 0) return idx;
             if (!validate_user_ptr(a2, sizeof(struct msghdr))) return -EFAULT;
             struct msghdr kmsg;
             copy_from_user(&kmsg, (const void*)a2, sizeof(struct msghdr));
+
+            int ufd = unix_sock_fd_from_fd(a1);
+            if (ufd >= 0) {
+                unix_socket_t* us = unix_get(ufd);
+                if (!us) return -EBADF;
+
+                if (kmsg.msg_iovlen <= 0) return 0;
+                int riovcnt = kmsg.msg_iovlen;
+                if (riovcnt > 256) riovcnt = 256;
+                struct iovec iov[256];
+                if (!validate_user_ptr((uint64_t)kmsg.msg_iov,
+                                       sizeof(struct iovec) * (size_t)riovcnt))
+                    return -EFAULT;
+                copy_from_user(iov, kmsg.msg_iov,
+                               sizeof(struct iovec) * (size_t)riovcnt);
+                size_t total = 0;
+                for (int i = 0; i < riovcnt; i++) total += iov[i].iov_len;
+                if (total == 0) return 0;
+                if (total > 4096) total = 4096;
+
+                /* Stream-mode SCM_RIGHTS framing: if a pending fd is
+                 * queued at byte offset N (in the receiver's bytes_read
+                 * coordinate system), clamp this recvmsg to either:
+                 *   - bytes_read < N: deliver only N - bytes_read bytes
+                 *     (no fd this round; fd waits for the next call);
+                 *   - bytes_read == N: deliver the fd and at most up
+                 *     to the next pending fd's offset bytes.
+                 * This keeps fds aligned with the imsg frame the sender
+                 * attached them to. */
+                int deliver_fd_now = 0;
+                uint64_t fd_off = 0;
+                int has_fd = (unix_peek_fd_offset(us, &fd_off) == 0);
+                if (has_fd) {
+                    uint64_t br = us->bytes_read;
+                    if (br < fd_off) {
+                        size_t cap = (size_t)(fd_off - br);
+                        if (total > cap) total = cap;
+                    } else {
+                        deliver_fd_now = 1;
+                        /* Clamp to the offset of the *next* pending
+                         * fd, if any, so we don't accidentally pull
+                         * data past it.  Look one slot ahead. */
+                        uint64_t flags;
+                        spin_lock_irqsave(&us->lock, &flags);
+                        int nxt = (us->pending_fd_head + 1) % 16;
+                        if (nxt != us->pending_fd_tail) {
+                            uint64_t nxt_off = us->pending_fd_off[nxt];
+                            if (nxt_off > br) {
+                                size_t cap = (size_t)(nxt_off - br);
+                                if (total > cap) total = cap;
+                            }
+                        }
+                        spin_unlock_irqrestore(&us->lock, flags);
+                    }
+                }
+
+                static uint8_t rbuf[4096];
+                int got = unix_recv(ufd, rbuf, total, 0);
+                if (got < 0) return got;
+
+                size_t off = 0;
+                for (int i = 0; i < riovcnt && off < (size_t)got; i++) {
+                    size_t chunk = iov[i].iov_len;
+                    if (off + chunk > (size_t)got) chunk = (size_t)got - off;
+                    if (!validate_user_ptr((uint64_t)iov[i].iov_base, chunk))
+                        return -EFAULT;
+                    copy_to_user(iov[i].iov_base, rbuf + off, chunk);
+                    off += chunk;
+                }
+
+                /* Deliver one pending fd via SCM_RIGHTS, but only when
+                 * the byte boundary has been reached. */
+                kmsg.msg_flags = 0;
+                if (deliver_fd_now && kmsg.msg_control && kmsg.msg_controllen >=
+                        CMSG_SPACE(sizeof(int))) {
+                    void* entry = NULL;
+                    if (unix_pop_fd(us, &entry) == 0 && entry) {
+                        task_t* cur = sched_current();
+                        int newfd = -1;
+                        if (cur) {
+                            for (int i = 3; i < TASK_MAX_FDS; i++) {
+                                if (cur->fd_table[i] == NULL) {
+                                    cur->fd_table[i] = entry;
+                                    newfd = i;
+                                    break;
+                                }
+                            }
+                        }
+                        if (newfd < 0) {
+                            /* No fd slot — drop the entry's reference. */
+                            uintptr_t marker = (uintptr_t)entry;
+                            if (marker > 3 && IS_SOCKET_FD(entry)) {
+                                net_socket_t* s = sock_get(SOCKET_FD_IDX(entry));
+                                if (s) __atomic_fetch_sub(&s->ref_count, 1, __ATOMIC_ACQ_REL);
+                            } else if (marker > 3 && IS_UNIX_SOCKET_FD(entry)) {
+                                unix_socket_t* xs = unix_get((int)(uintptr_t)entry);
+                                if (xs) __atomic_fetch_sub(&xs->ref_count, 1, __ATOMIC_ACQ_REL);
+                            } else if (marker > 3 && pipe_is_end(entry)) {
+                                pipe_close_end((pipe_end_t*)entry);
+                            }
+                            kmsg.msg_flags |= MSG_CTRUNC;
+                            kmsg.msg_controllen = 0;
+                        } else {
+                            unsigned char cbuf[CMSG_SPACE(sizeof(int))];
+                            struct cmsghdr* c = (struct cmsghdr*)cbuf;
+                            c->cmsg_len   = CMSG_LEN(sizeof(int));
+                            c->cmsg_level = SOL_SOCKET;
+                            c->cmsg_type  = SCM_RIGHTS;
+                            *(int*)CMSG_DATA(c) = newfd;
+                            if (!validate_user_ptr((uint64_t)kmsg.msg_control,
+                                                   CMSG_SPACE(sizeof(int))))
+                                return -EFAULT;
+                            copy_to_user(kmsg.msg_control, cbuf,
+                                         CMSG_SPACE(sizeof(int)));
+                            kmsg.msg_controllen = CMSG_SPACE(sizeof(int));
+                        }
+                    } else {
+                        kmsg.msg_controllen = 0;
+                    }
+                } else {
+                    kmsg.msg_controllen = 0;
+                }
+                copy_to_user((void*)a2, &kmsg, sizeof(struct msghdr));
+                return got;
+            }
+
+            int idx = sock_idx_from_fd(a1);
+            if (idx < 0) return idx;
             int ret = sock_recvmsg(idx, &kmsg, (int)a3);
             if (ret >= 0)
                 copy_to_user((void*)a2, &kmsg, sizeof(struct msghdr));
@@ -5477,7 +5846,14 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
             }
             return updated > 0 ? 0 : -ENODEV;
         }
-            
+
+        case SYS_SETSID:    return sys_setsid();
+        case SYS_GETSID:    return sys_getsid(a1);
+        case SYS_GETPGID:   return sys_getpgid(a1);
+        case SYS_GETRUSAGE: return sys_getrusage(a1, a2);
+        case SYS_READV:     return sys_readv(a1, a2, a3);
+        case SYS_WRITEV:    return sys_writev(a1, a2, a3);
+
         default:
             return -ENOSYS;
     }

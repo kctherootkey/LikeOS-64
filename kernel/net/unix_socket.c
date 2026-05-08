@@ -4,6 +4,7 @@
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/syscall.h"
+#include "../../include/kernel/console.h"
 
 // UNIX socket table
 static unix_socket_t unix_sockets[MAX_UNIX_SOCKETS];
@@ -350,6 +351,7 @@ int unix_send(int usockfd, const void* buf, size_t len, int flags) {
         peer->buf[peer->tail] = src[i];
         smap_enable();
         peer->tail = next;
+        peer->bytes_written++;
         sent++;
     }
     peer->ready = 1;
@@ -401,6 +403,7 @@ int unix_recv(int usockfd, void* buf, size_t len, int flags) {
         dst[i] = us->buf[us->head];
         smap_enable();
         us->head = (us->head + 1) % (int)sizeof(us->buf);
+        us->bytes_read++;
         received++;
     }
     if (us->head == us->tail)
@@ -417,11 +420,6 @@ int unix_close(int usockfd) {
     unix_socket_t* us = unix_get(usockfd);
     if (!us) return -EBADF;
 
-    // fork()/dup() bump ref_count without holding any lock — use atomic
-    // dec.  Decrement with no lock first; if anyone else still holds a
-    // reference we just return.  If we are the last reference we tear
-    // down under unix_table_lock so concurrent unix_send/recv (which
-    // takes a ref under that lock) cannot deref a half-torn struct.
     int old = __atomic_fetch_sub(&us->ref_count, 1, __ATOMIC_ACQ_REL);
     if (old > 1) return 0;
 
@@ -572,4 +570,64 @@ int unix_poll(int usockfd, short events) {
     if (us->error) revents |= POLLERR;
 
     return revents;
+}
+
+// ============================================================================
+// SCM_RIGHTS file-descriptor passing
+// ============================================================================
+// Per-socket FIFO of pending in-band file descriptors.  Sender pushes the
+// fd_table entry (an opaque void* — could be a vfs_file_t*, a socket
+// marker, a pipe end, or a stdio marker 1..3) onto the *peer's* queue
+// after taking the appropriate reference.  Receiver pops the head entry
+// in recvmsg and installs it in its own fd_table.
+//
+// The queue is small (16) because the imsg framing tmux uses sends at
+// most one fd per message and the peer drains promptly.  When full we
+// return -EAGAIN so the sender can retry; this preserves ordering with
+// data bytes already accepted by unix_send.
+int unix_push_fd(unix_socket_t* sock, void* entry) {
+    if (!sock) return -EBADF;
+    uint64_t flags;
+    spin_lock_irqsave(&sock->lock, &flags);
+    int next = (sock->pending_fd_tail + 1) % 16;
+    if (next == sock->pending_fd_head) {
+        spin_unlock_irqrestore(&sock->lock, flags);
+        return -EAGAIN;
+    }
+    sock->pending_fds[sock->pending_fd_tail] = entry;
+    /* Associate this fd with the byte offset that immediately precedes
+     * the data the sender is about to push.  recvmsg uses this to clamp
+     * the byte count it returns so the cmsg lines up with the right
+     * imsg frame on the peer side. */
+    sock->pending_fd_off[sock->pending_fd_tail] = sock->bytes_written;
+    sock->pending_fd_tail = next;
+    spin_unlock_irqrestore(&sock->lock, flags);
+    return 0;
+}
+
+int unix_pop_fd(unix_socket_t* sock, void** out_entry) {
+    if (!sock || !out_entry) return -EINVAL;
+    uint64_t flags;
+    spin_lock_irqsave(&sock->lock, &flags);
+    if (sock->pending_fd_head == sock->pending_fd_tail) {
+        spin_unlock_irqrestore(&sock->lock, flags);
+        return -EAGAIN;
+    }
+    *out_entry = sock->pending_fds[sock->pending_fd_head];
+    sock->pending_fd_head = (sock->pending_fd_head + 1) % 16;
+    spin_unlock_irqrestore(&sock->lock, flags);
+    return 0;
+}
+
+int unix_peek_fd_offset(unix_socket_t* sock, uint64_t* out_off) {
+    if (!sock || !out_off) return -EINVAL;
+    uint64_t flags;
+    spin_lock_irqsave(&sock->lock, &flags);
+    if (sock->pending_fd_head == sock->pending_fd_tail) {
+        spin_unlock_irqrestore(&sock->lock, flags);
+        return -EAGAIN;
+    }
+    *out_off = sock->pending_fd_off[sock->pending_fd_head];
+    spin_unlock_irqrestore(&sock->lock, flags);
+    return 0;
 }

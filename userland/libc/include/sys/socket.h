@@ -67,11 +67,22 @@ struct sockaddr {
     char sa_data[14];
 };
 
+/* Generic socket-address container large enough to hold any AF. */
+struct sockaddr_storage {
+    sa_family_t ss_family;
+    char        __ss_pad1[6];
+    long        __ss_align;
+    char        __ss_pad2[112];
+};
+
 // Scatter/gather I/O
+#ifndef _STRUCT_IOVEC_DEFINED
+#define _STRUCT_IOVEC_DEFINED
 struct iovec {
     void*  iov_base;
     size_t iov_len;
 };
+#endif
 
 struct msghdr {
     void*         msg_name;
@@ -91,7 +102,7 @@ struct cmsghdr {
 };
 
 #define CMSG_ALIGN(n)   (((n) + sizeof(long) - 1) & ~(sizeof(long) - 1))
-#define CMSG_DATA(c)    ((unsigned char*)((struct cmsghdr*)(c) + 1))
+#define CMSG_DATA(c)    ((unsigned char*)(c) + CMSG_ALIGN(sizeof(struct cmsghdr)))
 #define CMSG_LEN(l)     (CMSG_ALIGN(sizeof(struct cmsghdr)) + (l))
 #define CMSG_SPACE(l)   (CMSG_ALIGN(sizeof(struct cmsghdr)) + CMSG_ALIGN(l))
 #define CMSG_FIRSTHDR(m) \
@@ -102,6 +113,10 @@ struct cmsghdr {
       (unsigned char*)(m)->msg_control + (m)->msg_controllen) \
         ? (struct cmsghdr*)0 \
         : (struct cmsghdr*)((unsigned char*)(c) + CMSG_ALIGN((c)->cmsg_len)))
+
+/* Ancillary message types (SOL_SOCKET) */
+#define SCM_RIGHTS      0x01
+#define SCM_CREDENTIALS 0x02
 
 // Socket syscall wrappers
 int socket(int domain, int type, int protocol);

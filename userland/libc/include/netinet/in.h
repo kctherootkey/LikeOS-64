@@ -55,6 +55,53 @@ struct in_pktinfo {
     struct in_addr ipi_addr;
 };
 
+/*
+ * IPv6 - the kernel does not implement IPv6 yet, but the structure
+ * definitions are required so that portable applications (libevent,
+ * tmux, etc.) compile.  Routines that try to use AF_INET6 will fail at
+ * the socket(2) layer with EAFNOSUPPORT.
+ */
+#define IPPROTO_IPV6        41
+#define IPPROTO_ICMPV6      58
+
+#define IPV6_V6ONLY         26
+#define IPV6_UNICAST_HOPS   16
+#define IPV6_MULTICAST_IF   17
+#define IPV6_MULTICAST_HOPS 18
+#define IPV6_MULTICAST_LOOP 19
+#define IPV6_JOIN_GROUP     20
+#define IPV6_LEAVE_GROUP    21
+
+struct in6_addr {
+    union {
+        uint8_t  __u6_addr8[16];
+        uint16_t __u6_addr16[8];
+        uint32_t __u6_addr32[4];
+    } __in6_u;
+#define s6_addr   __in6_u.__u6_addr8
+#define s6_addr16 __in6_u.__u6_addr16
+#define s6_addr32 __in6_u.__u6_addr32
+};
+
+struct sockaddr_in6 {
+    sa_family_t     sin6_family;    /* AF_INET6 */
+    in_port_t       sin6_port;      /* Transport layer port */
+    uint32_t        sin6_flowinfo;  /* IPv6 flow information */
+    struct in6_addr sin6_addr;      /* IPv6 address */
+    uint32_t        sin6_scope_id;  /* Scope ID (interface index) */
+};
+
+struct ipv6_mreq {
+    struct in6_addr ipv6mr_multiaddr;
+    unsigned int    ipv6mr_interface;
+};
+
+extern const struct in6_addr in6addr_any;
+extern const struct in6_addr in6addr_loopback;
+
+#define IN6ADDR_ANY_INIT      { { { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0 } } }
+#define IN6ADDR_LOOPBACK_INIT { { { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1 } } }
+
 // Byte order conversion
 static inline uint16_t htons(uint16_t x) {
     return (uint16_t)((x >> 8) | (x << 8));
