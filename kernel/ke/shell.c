@@ -44,11 +44,15 @@ void shell_redisplay_prompt(void) {
 }
 
 int shell_tick(void) {
-    task_t* cur = sched_current();
     if (g_shell_task && (g_shell_task->has_exited || g_shell_task->state == TASK_ZOMBIE)) {
-        if (cur) {
-            sched_reap_zombies(cur);
-        }
+        /* The shell task is done.  Do NOT call sched_reap_zombies here.
+         * When the shell's parent is the bootstrap task, sched_mark_task_exited
+         * clears exit_signal so that the context-switch path enqueues the task
+         * in dead_thread_queue, which calls sched_remove_task() after the CPU
+         * has safely switched away.  Calling sched_reap_zombies() here causes a
+         * second sched_remove_task() on the same task_t → double-free → page fault
+         * at task->parent (offset 0x60).  Nulling the pointer is sufficient;
+         * the kernel owns the task lifecycle from this point. */
         g_shell_task = NULL;
     }
     if (!g_shell_task) {
