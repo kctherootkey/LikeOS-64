@@ -858,17 +858,29 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         g_boot_info.fb_info.pixels_per_scanline = 80;
         g_boot_info.fb_info.bytes_per_pixel = 2;
     } else {
+#if defined(SCREEN_LARGE)
+        // Preferred resolutions in priority order: 1920x1200, 1920x1080, 1280x800, 1280x768, 1152x864, 1024x768
+        struct { UINT32 width; UINT32 height; } preferred[] = {
+            {1920, 1200},
+            {1920, 1080},
+            {1280, 800},
+            {1280, 768},
+            {1024, 768}
+        };
+#else
         // Preferred resolutions in priority order: 1280x800, 1280x768, 1024x768
         struct { UINT32 width; UINT32 height; } preferred[] = {
             {1280, 800},
             {1280, 768},
             {1024, 768}
         };
+#endif
         UINTN num_preferred = sizeof(preferred) / sizeof(preferred[0]);
         UINT32 selected_mode = gop->Mode->Mode;  // Default to current mode
         BOOLEAN found_preferred = FALSE;
         
         Print(L"Enumerating %d GOP modes for preferred resolution...\r\n", gop->Mode->MaxMode);
+        serial_puts("GOP modes:\n");
         
         // Search for preferred resolutions in priority order
         for (UINTN pref = 0; pref < num_preferred && !found_preferred; pref++) {
@@ -879,9 +891,36 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 status = uefi_call_wrapper(gop->QueryMode, 4, gop, mode, &mode_info_size, &mode_info);
                 if (EFI_ERROR(status)) continue;
                 
-                // Only consider 32-bit pixel formats (BGR or RGB)
-                if (mode_info->PixelFormat != PixelBlueGreenRedReserved8BitPerColor &&
-                    mode_info->PixelFormat != PixelRedGreenBlueReserved8BitPerColor) {
+                // Log each mode on the first preferred pass so we see everything once
+                if (pref == 0) {
+                    serial_puts("  mode "); serial_putdec(mode);
+                    serial_puts(": "); serial_putdec(mode_info->HorizontalResolution);
+                    serial_putc('x'); serial_putdec(mode_info->VerticalResolution);
+                    serial_puts(" fmt="); serial_putdec(mode_info->PixelFormat);
+                    if (mode_info->PixelFormat == 2) { // PixelBitMask
+                        serial_puts(" R="); serial_puthex(mode_info->PixelInformation.RedMask);
+                        serial_puts(" G="); serial_puthex(mode_info->PixelInformation.GreenMask);
+                        serial_puts(" B="); serial_puthex(mode_info->PixelInformation.BlueMask);
+                        serial_puts(" X="); serial_puthex(mode_info->PixelInformation.ReservedMask);
+                    }
+                    serial_putc('\n');
+                }
+                
+                // Only consider 32-bit pixel formats (BGR, RGB, or bitmask-based 32bpp).
+                // Some firmware (e.g. VMware SVGA) exposes higher resolutions only via
+                // PixelBitMask with ReservedMask=0, so the channel masks need not cover
+                // all 32 bits.  Accept any PixelBitMask mode where the three color channels
+                // are non-zero and do not overlap each other.
+                if (mode_info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor ||
+                    mode_info->PixelFormat == PixelRedGreenBlueReserved8BitPerColor) {
+                    // standard 32-bit packed formats — always acceptable
+                } else if (mode_info->PixelFormat == PixelBitMask) {
+                    UINT32 r = mode_info->PixelInformation.RedMask;
+                    UINT32 g = mode_info->PixelInformation.GreenMask;
+                    UINT32 b = mode_info->PixelInformation.BlueMask;
+                    // Require each channel to be non-zero and no two channels to overlap
+                    if (!r || !g || !b || (r & g) || (r & b) || (g & b)) continue;
+                } else {
                     continue;
                 }
                 
@@ -899,6 +938,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         
         if (!found_preferred) {
             Print(L"No preferred resolution found, using firmware default\r\n");
+            serial_puts("GOP: no preferred resolution found, using firmware default\n");
+        } else {
+            serial_puts("GOP: selected mode "); serial_putdec(selected_mode); serial_putc('\n');
         }
         
         // Set the selected mode if different from current

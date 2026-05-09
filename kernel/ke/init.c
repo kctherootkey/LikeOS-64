@@ -49,6 +49,11 @@ void system_startup(boot_info_t* boot_info) {
     console_set_color(15, 0);
 
     kprintf("64-bit Long Mode Active\n");
+    kprintf("Framebuffer: %ux%u (%u bpp, pitch %u)\n",
+            boot_info->fb_info.horizontal_resolution,
+            boot_info->fb_info.vertical_resolution,
+            boot_info->fb_info.bytes_per_pixel * 8,
+            boot_info->fb_info.pixels_per_scanline);
 
     interrupts_init();
 

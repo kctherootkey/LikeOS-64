@@ -50,6 +50,14 @@ else
   QEMU_USB_HID =
 endif
 
+# Screen size: pass SCREEN_SIZE=large for 1920x1200 preferred resolution,
+# SCREEN_SIZE=medium (or unset) for 1280x800 preferred resolution.
+ifeq ($(SCREEN_SIZE),large)
+  UEFI_SCREEN_CFLAGS = -DSCREEN_LARGE
+else
+  UEFI_SCREEN_CFLAGS =
+endif
+
 MKFS_FAT = mkfs.fat
 MTOOLS = mcopy
 
@@ -100,7 +108,8 @@ USER_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 
 # Compiler flags for UEFI bootloader
 UEFI_CFLAGS = -fno-stack-protector -fpic -fshort-wchar -mno-red-zone \
-              -maccumulate-outgoing-args $(EFI_INCLUDES) -DEFI_FUNCTION_WRAPPER
+              -maccumulate-outgoing-args $(EFI_INCLUDES) -DEFI_FUNCTION_WRAPPER \
+              $(UEFI_SCREEN_CFLAGS)
 
 # Linker flags
 KERNEL_LDFLAGS = -nostdlib -static
@@ -1483,6 +1492,8 @@ help:
 	@echo "  NO_SMP=1          - Disable SMP (omit -smp argument entirely)"
 	@echo "  USB_HID=1         - Add USB keyboard and mouse to QEMU xHCI controller"
 	@echo "  USE_USB_BOOT=1    - For qemu-usb* targets, attempt USB mass storage boot path"
+	@echo "  SCREEN_SIZE=large - Preferred bootloader resolution 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1152x864, 1024x768)"
+	@echo "  SCREEN_SIZE=medium or unset - Preferred bootloader resolution 1280x800 (fallback: 1280x768, 1024x768)"
 	@echo ""
 	@echo "Subsystem Notes:"
 	@echo "  PS/2: Optional; modern hardware may lack controller (fallback to USB HID planned)."
