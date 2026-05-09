@@ -1725,10 +1725,17 @@ int tty_ioctl(tty_t* tty, unsigned long req, void* argp, task_t* cur) {
             if (!argp) return -EFAULT;
             // Security: Use SMAP-aware copy to user space
             return tty_copy_to_user(argp, &tty->winsz, sizeof(struct winsize));
-        case TIOCSWINSZ:
+        case TIOCSWINSZ: {
             if (!argp) return -EFAULT;
-            // Security: Use SMAP-aware copy from user space
-            return tty_copy_from_user(&tty->winsz, argp, sizeof(struct winsize));
+            struct winsize old_winsz = tty->winsz;
+            int ret = tty_copy_from_user(&tty->winsz, argp, sizeof(struct winsize));
+            if (ret != 0) return ret;
+            if (tty->winsz.ws_row != old_winsz.ws_row ||
+                tty->winsz.ws_col != old_winsz.ws_col) {
+                tty_signal_pgrp(tty, SIGWINCH);
+            }
+            return 0;
+        }
         case TIOCSGUARD:
             if (tty == tty_get_console()) {
                 console_set_prompt_guard();

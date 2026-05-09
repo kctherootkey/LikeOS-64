@@ -5115,9 +5115,14 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         case SYS_GETPROCINFO:
             return sys_getprocinfo(a1, a2);
             
-        case SYS_MEMSTATS:
-            mm_print_memory_stats();
+        case SYS_MEMSTATS: {
+            if (!a1) return -EFAULT;
+            memory_stats_t stats;
+            mm_get_memory_stats(&stats);
+            if (copy_to_user((void*)a1, &stats, sizeof(stats)) != 0)
+                return -EFAULT;
             return 0;
+        }
 
         case SYS_SYSINFO:
             return sys_sysinfo(a1);

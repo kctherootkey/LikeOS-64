@@ -1313,10 +1313,7 @@ static void print_task_header(void) {
         col_pos++;
     }
 
-    printf("%s", ESC_RESET);
-    /* If we filled to g_term_cols, cursor already auto-wrapped; no \n needed */
-    if (col_pos < g_term_cols)
-        putchar('\n');
+    printf("%s\n", ESC_RESET);
 }
 
 static void print_task_row(const proc_entry_t *pe, int last_row) {
@@ -1377,9 +1374,7 @@ static void print_task_row(const proc_entry_t *pe, int last_row) {
     if (show_hlight_y && is_running && show_colors)
         printf("%s", ESC_RESET);
 
-    if (col_pos >= g_term_cols) {
-        /* Cursor already auto-wrapped to next line; no \n needed */
-    } else if (last_row) {
+    if (last_row) {
         printf("%s", ESC_CLEAR_EOL);
     } else {
         printf("%s\n", ESC_CLEAR_EOL);
