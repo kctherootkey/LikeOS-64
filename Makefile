@@ -4,6 +4,9 @@
 # Codename for this release
 CODENAME = blessed kitty
 
+# Version string: override on command line with LIKEOS_VERSION=x.y.z
+LIKEOS_VERSION ?= 0.2.1-HEAD
+
 # Tools
 GCC = gcc
 LD = ld
@@ -83,7 +86,8 @@ KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-D__LIKEOS__ -DACPI_USE_BUILTIN_STDARG \
 			-U__linux__ -U_LINUX -Ulinux \
 			-DXHCI_USE_INTERRUPTS=1 $(SERIAL_CFLAGS) $(USB_SERIAL_CFLAGS) \
-			-DBUILD_DATE='"$(BUILD_DATE)"'
+			-DBUILD_DATE='"$(BUILD_DATE)"' \
+			-DLIKEOS_VERSION='"$(LIKEOS_VERSION)"'
 
 # Extra flags for ACPICA sources (suppress upstream warnings)
 # -U__linux__ -U_LINUX: prevent ACPICA from selecting aclinux.h (GCC defines
@@ -1494,6 +1498,7 @@ help:
 	@echo "  USE_USB_BOOT=1    - For qemu-usb* targets, attempt USB mass storage boot path"
 	@echo "  SCREEN_SIZE=large - Preferred bootloader resolution 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1152x864, 1024x768)"
 	@echo "  SCREEN_SIZE=medium or unset - Preferred bootloader resolution 1280x800 (fallback: 1280x768, 1024x768)"
+	@echo "  LIKEOS_VERSION=x.y.z - Override kernel version string reported by uname (default: 0.2.1-HEAD)"
 	@echo ""
 	@echo "Subsystem Notes:"
 	@echo "  PS/2: Optional; modern hardware may lack controller (fallback to USB HID planned)."

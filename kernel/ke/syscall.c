@@ -1088,7 +1088,11 @@ static int64_t sys_uname(uint64_t buf) {
     mm_memset(&u, 0, sizeof(u));
     const char* sys = "LikeOS";
     const char* node = net_get_hostname();
+#ifdef LIKEOS_VERSION
+    const char* rel = LIKEOS_VERSION;
+#else
     const char* rel = "0.2";
+#endif
 #ifdef BUILD_DATE
     const char* ver = "preempt-smp " BUILD_DATE;
 #else
