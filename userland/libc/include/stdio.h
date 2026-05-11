@@ -89,7 +89,9 @@ int snprintf(char* str, size_t size, const char* format, ...);
 #include <stdarg.h>
 int vfprintf(FILE* stream, const char* format, va_list ap);
 int vsnprintf(char* str, size_t size, const char* format, va_list ap);
+int vasprintf(char **strp, const char* format, va_list ap);
 #endif
+int asprintf(char **strp, const char* format, ...);
 
 int scanf(const char* format, ...);
 int fscanf(FILE* stream, const char* format, ...);

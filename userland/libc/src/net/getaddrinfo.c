@@ -13,7 +13,24 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-// ---------- error strings -----------------------------------------------
+/* h_errno: set by gethostbyname() on failure */
+int h_errno = 0;
+
+void herror(const char *s) {
+    if (s && *s) fprintf(stderr, "%s: ", s);
+    fprintf(stderr, "%s\n", hstrerror(h_errno));
+}
+
+const char *hstrerror(int err) {
+    switch (err) {
+    case HOST_NOT_FOUND: return "Host not found";
+    case TRY_AGAIN:      return "Temporary failure in name resolution";
+    case NO_RECOVERY:    return "Non-recoverable failure in name resolution";
+    case NO_DATA:        return "No address associated with hostname";
+    default:             return "Unknown resolver error";
+    }
+}
+
 const char *gai_strerror(int e) {
     switch (e) {
     case 0:             return "Success";

@@ -25,6 +25,8 @@
 #include "../../include/kernel/icache.h"
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/lapic.h"
+#include "../../include/kernel/random.h"
+#include "../../include/kernel/random.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
@@ -1314,6 +1316,10 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp) {
         case SIOCGIFINDEX:
         case SIOCGIFNAME:
             arg_len = sizeof(struct ifreq);
+            break;
+        case 0x5421: /* FIONBIO */
+        case 0x541B: /* FIONREAD */
+            arg_len = sizeof(int);
             break;
         default:
             arg_len = 0;
@@ -5882,6 +5888,26 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
         case SYS_GETRUSAGE: return sys_getrusage(a1, a2);
         case SYS_READV:     return sys_readv(a1, a2, a3);
         case SYS_WRITEV:    return sys_writev(a1, a2, a3);
+
+        case SYS_GETRANDOM: {
+            void*    buf   = (void*)a1;
+            size_t   buflen = (size_t)a2;
+            /* flags: GRND_NONBLOCK=0x1, GRND_RANDOM=0x2, GRND_INSECURE=0x4 */
+            unsigned flags  = (unsigned)a3;
+            if (buflen == 0) return 0;
+            if (!validate_user_ptr((uint64_t)buf, buflen)) return -EFAULT;
+            /* GRND_RANDOM(0x2) = blocking pool; default = urandom (non-blocking) */
+            int blocking = (flags & 0x2) ? 1 : 0;
+            /* Use a kernel-side staging buffer to keep SMAP integrity */
+            uint8_t *kbuf = (uint8_t*)kalloc(buflen);
+            if (!kbuf) return -ENOMEM;
+            int n = random_get_bytes(kbuf, buflen, blocking);
+            if (n < 0) { kfree(kbuf); return (blocking == 0) ? -EAGAIN : -EIO; }
+            int cret = copy_to_user(buf, kbuf, (size_t)n);
+            kfree(kbuf);
+            if (cret < 0) return cret;
+            return (int64_t)n;
+        }
 
         default:
             return -ENOSYS;

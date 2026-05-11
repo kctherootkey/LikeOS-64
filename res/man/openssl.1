@@ -1,0 +1,170 @@
+OPENSSL(1)                  LikeOS User Commands                  OPENSSL(1)
+
+NAME
+       openssl - OpenSSL command line program
+
+SYNOPSIS
+       openssl command [options ...] [parameters ...]
+
+       openssl no-XXX [options]
+
+       openssl -help | -version
+
+DESCRIPTION
+       OpenSSL is a cryptography toolkit implementing the Secure Sockets
+       Layer (SSL) and Transport Layer Security (TLS) network protocols
+       and related cryptography standards.
+
+       The openssl program is a command line tool for using the various
+       cryptography functions of the OpenSSL crypto library.  It can be
+       used for:
+
+         o  Creation and management of private keys, public keys and
+            parameters
+         o  Public key cryptographic operations
+         o  Creation of X.509 certificates, CSRs and CRLs
+         o  Calculation of Message Digests and Message Authentication
+            Codes
+         o  Encryption and Decryption with Ciphers
+         o  SSL/TLS Client and Server Tests
+         o  Handling of S/MIME signed or encrypted mail
+         o  Timestamp requests, generation and verification
+
+COMMAND SUMMARY
+       Standard Commands:
+
+       asn1parse    Parse an ASN.1 sequence.
+       ca           Certificate Authority (CA) management.
+       ciphers      Cipher suite description determination.
+       cms          CMS (Cryptographic Message Syntax) command.
+       crl          Certificate Revocation List (CRL) management.
+       crl2pkcs7    CRL to PKCS#7 conversion.
+       dgst         Message Digest calculation.
+       dhparam      Diffie-Hellman parameter generation and management.
+       dsa          DSA data management.
+       dsaparam     DSA parameter generation and management.
+       ec           EC (Elliptic curve) key processing.
+       ecparam      EC parameter manipulation and generation.
+       enc          Encryption, decryption, and encoding.
+       errstr       Error number to error string conversion.
+       genpkey      Generation of private key or parameters.
+       genrsa       Generation of RSA private key.
+       help         Display information about a command's options.
+       info         Display diverse information built into the OpenSSL
+                    libraries.
+       kdf          Key Derivation Functions.
+       list         List algorithms and features.
+       mac          Message Authentication Code calculation.
+       ocsp         Online Certificate Status Protocol command.
+       passwd       Generation of hashed passwords.
+       pkcs12       PKCS#12 data management.
+       pkcs7        PKCS#7 data management.
+       pkcs8        PKCS#8 format private key conversion.
+       pkey         Public and private key management.
+       pkeyparam    Public key algorithm parameter management.
+       pkeyutl      Public key algorithm cryptographic operation.
+       prime        Compute prime numbers.
+       rand         Generate pseudo-random bytes.
+       rehash       Create symbolic links to certificate and CRL files.
+       req          PKCS#10 X.509 Certificate Signing Request (CSR)
+                    management.
+       rsa          RSA key management.
+       rsautl       RSA utility command (obsolete; use pkeyutl).
+       s_client     SSL/TLS client program.
+       s_server     SSL/TLS server program.
+       s_time       SSL/TLS performance timing program.
+       sess_id      SSL/TLS session data management.
+       smime        S/MIME mail processing.
+       speed        Algorithm speed measurement.
+       spkac        SPKAC printing and generating utility.
+       srp          Maintain SRP password file (obsolete).
+       storeutl     Utility to list and display objects in a store.
+       ts           Time Stamping Authority tool.
+       verify       X.509 certificate verification.
+       version      Print OpenSSL version information.
+       x509         X.509 certificate data management.
+
+       Message Digest Commands (see the dgst command for more details):
+
+       blake2b512   BLAKE2b-512 Digest
+       blake2s256   BLAKE2s-256 Digest
+       md5          MD5 Digest
+       sha1         SHA-1 Digest
+       sha224       SHA-224 Digest
+       sha256       SHA-256 Digest
+       sha384       SHA-384 Digest
+       sha512       SHA-512 Digest
+       sha3-256     SHA3-256 Digest
+       sha3-512     SHA3-512 Digest
+
+       Cipher Commands (see the enc command for more details):
+
+       aes-128-cbc  128-bit AES in CBC mode
+       aes-192-cbc  192-bit AES in CBC mode
+       aes-256-cbc  256-bit AES in CBC mode
+       aes-128-gcm  128-bit AES in GCM mode
+       aes-256-gcm  256-bit AES in GCM mode
+       des3         Triple-DES in CBC mode
+       chacha20     ChaCha20 stream cipher
+
+OPTIONS
+       -help        Print a usage message about the specified command.
+       -version     Print version information.
+
+CONFIGURATION FILE
+       Many commands use an external configuration file for some or all
+       of their arguments.  The default file is /etc/ssl/openssl.cnf.
+       The environment variable OPENSSL_CONF can be used to specify a
+       different file location or to disable loading a configuration
+       (using the empty string).
+
+ENVIRONMENT
+       OPENSSL_CONF     Location of the configuration file.
+       OPENSSL_ENGINES  Path to engines directory.
+       RANDFILE         Default seed file for the random number generator.
+       SSL_CERT_FILE    File containing trusted CA certificates.
+       SSL_CERT_DIR     Directory containing trusted CA certificates.
+
+EXAMPLES
+       Generate a 2048-bit RSA private key:
+
+         openssl genrsa -out key.pem 2048
+
+       Create a self-signed certificate:
+
+         openssl req -x509 -new -key key.pem -days 365 -out cert.pem
+
+       View a certificate:
+
+         openssl x509 -in cert.pem -text -noout
+
+       Generate a SHA-256 digest of a file:
+
+         openssl dgst -sha256 file.txt
+
+       Encrypt a file with AES-256-CBC:
+
+         openssl enc -aes-256-cbc -in plain.txt -out cipher.bin
+
+       Decrypt a file:
+
+         openssl enc -d -aes-256-cbc -in cipher.bin -out plain.txt
+
+       Connect to an HTTPS server:
+
+         openssl s_client -connect example.com:443
+
+       Generate 32 bytes of random data (hex):
+
+         openssl rand -hex 32
+
+       Check TLS connection and print certificate info:
+
+         openssl s_client -connect host:443 -showcerts </dev/null
+
+SEE ALSO
+       openssl-x509(1), openssl-req(1), openssl-genrsa(1),
+       openssl-dgst(1), openssl-enc(1), openssl-s_client(1),
+       openssl-s_server(1), openssl-verify(1), openssl-version(1)
+
+LikeOS                            2025                            OPENSSL(1)

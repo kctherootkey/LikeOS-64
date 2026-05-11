@@ -13,6 +13,7 @@ CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fno-stack-protector \
          -isystem $(LIBC_DIR)/include \
          -fno-tree-vectorize -fno-strict-aliasing \
          -D__LIKEOS__ \
+         -DHAVE_ASPRINTF \
          -Wno-unused-parameter \
          -Wno-sign-compare
 

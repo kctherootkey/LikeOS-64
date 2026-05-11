@@ -670,7 +670,7 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 
     /* Get file size and read entire file at once — avoids repeated seek+read syscalls */
     long file_size = rtld_lseek(fd, 0, SEEK_END);
-    if (file_size <= 0 || file_size > 4 * 1024 * 1024) goto fail;
+    if (file_size <= 0 || file_size > 64 * 1024 * 1024) goto fail;
     rtld_lseek(fd, 0, SEEK_SET);
 
     void *file_buf = rtld_mmap(NULL, (size_t)file_size,

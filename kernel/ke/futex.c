@@ -612,6 +612,16 @@ void exit_robust_list(task_t* task) {
     // On thread death, we walk the list and for each futex we own:
     //   1. Set FUTEX_OWNER_DIED bit (bit 30)
     //   2. Wake one waiter
+
+    // Verify the head itself is present in the current page tables before
+    // touching any of its fields.  The process may have been killed while
+    // the heap/library pages were demand-paged and some pages may not be
+    // backed yet (or already torn down).
+    if (!mm_user_addr_mapped((uint64_t)task->robust_list,
+                             sizeof(struct robust_list_head))) {
+        task->robust_list = NULL;
+        return;
+    }
     
     smap_disable();
     struct robust_list_head* head = task->robust_list;
@@ -624,7 +634,8 @@ void exit_robust_list(task_t* task) {
     if (head->list_op_pending && 
         head->list_op_pending != (struct robust_list*)head) {
         uint64_t futex_addr = (uint64_t)head->list_op_pending + head->futex_offset;
-        if (validate_user_ptr(futex_addr, sizeof(uint32_t))) {
+        if (validate_user_ptr(futex_addr, sizeof(uint32_t)) &&
+            mm_user_addr_mapped(futex_addr, sizeof(uint32_t))) {
             uint32_t* futex = (uint32_t*)futex_addr;
             // Only mark if we're the owner
             if ((*futex & FUTEX_TID_MASK) == (uint32_t)task->id) {
@@ -642,7 +653,8 @@ void exit_robust_list(task_t* task) {
         // The futex is at offset futex_offset from the list entry
         uint64_t futex_addr = (uint64_t)entry + head->futex_offset;
         
-        if (validate_user_ptr(futex_addr, sizeof(uint32_t))) {
+        if (validate_user_ptr(futex_addr, sizeof(uint32_t)) &&
+            mm_user_addr_mapped(futex_addr, sizeof(uint32_t))) {
             uint32_t* futex = (uint32_t*)futex_addr;
             // Check if we own this futex (TID in low 30 bits)
             if ((*futex & FUTEX_TID_MASK) == (uint32_t)task->id) {
@@ -654,7 +666,8 @@ void exit_robust_list(task_t* task) {
         }
         
         // Move to next entry
-        if (!validate_user_ptr((uint64_t)entry, sizeof(struct robust_list))) {
+        if (!validate_user_ptr((uint64_t)entry, sizeof(struct robust_list)) ||
+            !mm_user_addr_mapped((uint64_t)entry, sizeof(struct robust_list))) {
             break;
         }
         entry = entry->next;

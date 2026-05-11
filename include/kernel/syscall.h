@@ -196,6 +196,9 @@
 #define SYS_READV           384
 #define SYS_WRITEV          385
 
+// Entropy
+#define SYS_GETRANDOM       386
+
 // rusage who values
 #define RUSAGE_SELF         0
 #define RUSAGE_CHILDREN     (-1)

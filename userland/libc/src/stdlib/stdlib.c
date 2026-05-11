@@ -14,11 +14,28 @@ static int g_env_count = 0;
 /* POSIX environment vector - kept NULL until populated by program startup. */
 char **environ = (char *[]){ (char *)0 };
 
+/* atexit / at_quick_exit — simple fixed-size table */
+#define ATEXIT_MAX 32
+static void (*atexit_funcs[ATEXIT_MAX])(void);
+static int atexit_count = 0;
+
+int atexit(void (*func)(void)) {
+    if (atexit_count >= ATEXIT_MAX) return -1;
+    atexit_funcs[atexit_count++] = func;
+    return 0;
+}
+
+int at_quick_exit(void (*func)(void)) { return atexit(func); }
+
 void exit(int status) {
+    for (int i = atexit_count - 1; i >= 0; i--)
+        if (atexit_funcs[i]) atexit_funcs[i]();
     fflush(stdout);
     fflush(stderr);
     _exit(status);
 }
+
+void quick_exit(int status) { exit(status); }
 
 void abort(void) {
     _exit(1);
@@ -578,4 +595,13 @@ int system(const char *command) {
     int status = 0;
     if (waitpid(pid, &status, 0) < 0) return -1;
     return status;
+}
+
+/* strtoimax / strtoumax */
+#include "../../include/inttypes.h"
+intmax_t strtoimax(const char *nptr, char **endptr, int base) {
+    return (intmax_t)strtoll(nptr, endptr, base);
+}
+uintmax_t strtoumax(const char *nptr, char **endptr, int base) {
+    return (uintmax_t)strtoull(nptr, endptr, base);
 }

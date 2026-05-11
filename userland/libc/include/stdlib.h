@@ -66,4 +66,9 @@ int mkstemps(char* templ, int suffixlen);
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
 
+/* atexit / at_quick_exit */
+int atexit(void (*func)(void));
+int at_quick_exit(void (*func)(void));
+void quick_exit(int status);
+
 #endif

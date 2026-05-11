@@ -2098,6 +2098,42 @@ uint64_t* mm_get_current_address_space(void) {
     return (uint64_t*)phys_to_virt(pml4_phys);
 }
 
+// Check whether every page covering [vaddr, vaddr+len) is present in the
+// current address space (CR3).  Returns true only if all pages are mapped.
+bool mm_user_addr_mapped(uint64_t vaddr, size_t len) {
+    if (len == 0) return true;
+    uint64_t pml4_phys = get_cr3() & ~0xFFFULL;
+    uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
+
+    uint64_t start_page = vaddr & ~0xFFFULL;
+    uint64_t end_page   = (vaddr + len - 1) & ~0xFFFULL;
+
+    for (uint64_t page = start_page; page <= end_page; page += 0x1000) {
+        uint64_t pml4i = (page >> 39) & 0x1FF;
+        uint64_t pdpti = (page >> 30) & 0x1FF;
+        uint64_t pdi   = (page >> 21) & 0x1FF;
+        uint64_t pti   = (page >> 12) & 0x1FF;
+
+        uint64_t pml4e = pml4[pml4i];
+        if (!(pml4e & PAGE_PRESENT)) return false;
+
+        uint64_t* pdpt = (uint64_t*)phys_to_virt(pml4e & PTE_ADDR_MASK);
+        uint64_t pdpte = pdpt[pdpti];
+        if (!(pdpte & PAGE_PRESENT)) return false;
+        if (pdpte & PAGE_SIZE_FLAG) continue; /* 1 GB page: present */
+
+        uint64_t* pd = (uint64_t*)phys_to_virt(pdpte & PTE_ADDR_MASK);
+        uint64_t pde = pd[pdi];
+        if (!(pde & PAGE_PRESENT)) return false;
+        if (pde & PAGE_SIZE_FLAG) continue; /* 2 MB page: present */
+
+        uint64_t* pt = (uint64_t*)phys_to_virt(pde & PTE_ADDR_MASK);
+        uint64_t pte = pt[pti];
+        if (!(pte & PAGE_PRESENT)) return false;
+    }
+    return true;
+}
+
 // Map a page in a specific address space
 bool mm_map_page_in_address_space(uint64_t* pml4, uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
     uint64_t* pte = mm_get_page_table_from_pml4(pml4, virtual_addr, true);

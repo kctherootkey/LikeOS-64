@@ -1,6 +1,7 @@
 #include "../../include/stdio.h"
 #include "../../include/stdlib.h"
 #include "../../include/string.h"
+#include "../../include/errno.h"
 #include "../../include/unistd.h"
 #include "../../include/stdarg.h"
 #include "../../include/fcntl.h"
@@ -1026,6 +1027,30 @@ int sprintf(char* str, const char* format, ...) {
     return ret;
 }
 
+int vasprintf(char **strp, const char* format, va_list ap) {
+    va_list ap2;
+    va_copy(ap2, ap);
+    /* First pass: measure */
+    int n = vsnprintf(NULL, 0, format, ap2);
+    va_end(ap2);
+    if (n < 0) { *strp = NULL; return -1; }
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) { *strp = NULL; return -1; }
+    va_copy(ap2, ap);
+    vsnprintf(buf, (size_t)n + 1, format, ap2);
+    va_end(ap2);
+    *strp = buf;
+    return n;
+}
+
+int asprintf(char **strp, const char* format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    int ret = vasprintf(strp, format, ap);
+    va_end(ap);
+    return ret;
+}
+
 int vfprintf(FILE* stream, const char* format, va_list ap) {
     char buf[4096];
     int len = vsnprintf(buf, sizeof(buf), format, ap);
@@ -1233,4 +1258,9 @@ int fseeko(FILE *stream, off_t offset, int whence) {
 
 off_t ftello(FILE *stream) {
     return (off_t)ftell(stream);
+}
+
+void perror(const char *s) {
+    if (s && *s) fprintf(stderr, "%s: ", s);
+    fprintf(stderr, "%s\n", strerror(errno));
 }

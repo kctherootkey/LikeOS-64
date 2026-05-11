@@ -180,6 +180,7 @@
 #define SYS_GETRUSAGE   383
 #define SYS_READV       384
 #define SYS_WRITEV      385
+#define SYS_GETRANDOM   386
 
 // NET_GETINFO sub-commands
 #define NET_GET_ARP_TABLE       1

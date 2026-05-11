@@ -38,3 +38,17 @@ char *dlerror(void)
 {
     return _rtld_dlerror();
 }
+
+int dladdr(const void *addr, Dl_info *info)
+{
+    /* Stub: the runtime linker doesn't expose dladdr yet.
+     * Return 0 (failure) so callers fall back gracefully. */
+    (void)addr;
+    if (info) {
+        info->dli_fname = NULL;
+        info->dli_fbase = NULL;
+        info->dli_sname = NULL;
+        info->dli_saddr = NULL;
+    }
+    return 0;
+}

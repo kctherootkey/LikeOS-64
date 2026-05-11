@@ -142,6 +142,7 @@ static inline void explicit_bzero(void *s, size_t len)
 /* ------------------------------------------------------------------
  * asprintf / vasprintf
  * ------------------------------------------------------------------ */
+#ifndef HAVE_ASPRINTF
 static inline int
 vasprintf(char **strp, const char *fmt, va_list ap)
 {
@@ -165,6 +166,7 @@ asprintf(char **strp, const char *fmt, ...)
     va_end(ap);
     return n;
 }
+#endif /* HAVE_ASPRINTF */
 
 /* ------------------------------------------------------------------
  * mktemp — create a unique filename from a template ending in XXXXXX.

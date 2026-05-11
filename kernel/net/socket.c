@@ -1376,8 +1376,42 @@ int sock_poll(int sockfd, short events) {
 // ============================================================================
 // sock_ioctl_net - Handle network ioctls on a socket fd
 // ============================================================================
+
+/* Socket-level ioctl codes (same values as sys/ioctl.h in userland) */
+#define SOCK_FIONBIO    0x5421
+#define SOCK_FIONREAD   0x541B
+
 int sock_ioctl_net(int sockfd, unsigned long request, void* argp) {
-    (void)sockfd;  // Most net ioctls don't need the socket itself
+    /* Handle socket-level ioctls that operate on the socket state itself */
+    if (request == SOCK_FIONBIO) {
+        if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS) return -EBADF;
+        net_socket_t *s = &sockets[sockfd];
+        if (!s->active) return -EBADF;
+        if (!argp) return -EFAULT;
+        s->nonblock = (*((int *)argp) != 0) ? 1 : 0;
+        return 0;
+    }
+    if (request == SOCK_FIONREAD) {
+        if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS) return -EBADF;
+        net_socket_t *s = &sockets[sockfd];
+        if (!s->active) return -EBADF;
+        if (!argp) return -EFAULT;
+        int avail = 0;
+        if (s->tcp) {
+            tcp_conn_t *c = s->tcp;
+            avail = (int)((c->rx_tail - c->rx_head + c->rx_buf_size) % c->rx_buf_size);
+        } else {
+            /* UDP: sum all queued packet lengths */
+            int h = s->udp_rx_head, t = s->udp_rx_tail;
+            while (h != t) {
+                avail += s->udp_rx_queue[h].len;
+                h = (h + 1) % 16;
+            }
+        }
+        *((int *)argp) = avail;
+        return 0;
+    }
+    /* Delegate interface-level ioctls */
     return net_ioctl(request, argp);
 }
 

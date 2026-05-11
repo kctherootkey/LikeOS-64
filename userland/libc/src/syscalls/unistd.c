@@ -6,6 +6,8 @@
 #include "../../include/sys/time.h"
 #include "../../include/sys/utsname.h"
 #include "../../include/time.h"
+#include "../../include/sys/times.h"
+#include "../../include/stdarg.h"
 #include "../../include/string.h"
 #include "../../include/stdlib.h"
 #include "../../include/fcntl.h"
@@ -738,4 +740,55 @@ int ttyname_r(int fd, char *buf, size_t len) {
     if (n + 1 > len) { errno = ERANGE; return ERANGE; }
     for (size_t i = 0; i <= n; i++) buf[i] = name[i];
     return 0;
+}
+
+/* getrandom: fill buf with up to buflen cryptographically secure random
+ * bytes from the kernel entropy pool.  flags may include:
+ *   GRND_NONBLOCK (0x1) - return EAGAIN instead of blocking
+ *   GRND_RANDOM   (0x2) - draw from the blocking /dev/random pool */
+ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
+    long ret = syscall3(SYS_GETRANDOM, (long)buf, (long)buflen, (long)flags);
+    if (ret < 0) {
+        errno = (int)(-ret);
+        return -1;
+    }
+    return (ssize_t)ret;
+}
+
+/* getauxval: access ELF auxiliary vector entries.
+ * On x86-64 we have no AT_HWCAP/AT_PLATFORM mechanism exposed to
+ * userspace today, so all lookups return 0. */
+unsigned long getauxval(unsigned long type) {
+    (void)type;
+    return 0UL;
+}
+
+/* times: return process CPU-time accounting.
+ * The kernel does not yet export fine-grained CPU accounting, so we
+ * return zeroed tms fields and a monotonic tick count of 0. */
+clock_t times(struct tms *buf) {
+    if (buf) {
+        buf->tms_utime  = 0;
+        buf->tms_stime  = 0;
+        buf->tms_cutime = 0;
+        buf->tms_cstime = 0;
+    }
+    return 0;
+}
+
+/* syscall: variadic generic syscall entry point.
+ * Reads up to 6 long arguments from the va_list and dispatches via
+ * the inline syscall6 helper. */
+long syscall(long number, ...) {
+    va_list ap;
+    long a1, a2, a3, a4, a5, a6;
+    va_start(ap, number);
+    a1 = va_arg(ap, long);
+    a2 = va_arg(ap, long);
+    a3 = va_arg(ap, long);
+    a4 = va_arg(ap, long);
+    a5 = va_arg(ap, long);
+    a6 = va_arg(ap, long);
+    va_end(ap);
+    return syscall6(number, a1, a2, a3, a4, a5, a6);
 }

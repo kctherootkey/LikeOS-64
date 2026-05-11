@@ -22,5 +22,12 @@
 void* mmap(void* addr, size_t length, int prot, int flags, int fd, long offset);
 int munmap(void* addr, size_t length);
 int mprotect(void* addr, size_t len, int prot);
+int mlock(const void* addr, size_t len);
+int munlock(const void* addr, size_t len);
+int mlockall(int flags);
+int munlockall(void);
+
+#define MCL_CURRENT 1
+#define MCL_FUTURE  2
 
 #endif

@@ -50,6 +50,19 @@ int dlclose(void *handle);
  */
 char *dlerror(void);
 
+/*
+ * Translate an address to symbolic information.
+ * Returns non-zero on success, 0 on failure.
+ */
+typedef struct {
+    const char *dli_fname;  /* Pathname of shared object containing address */
+    void       *dli_fbase;  /* Base address of shared object */
+    const char *dli_sname;  /* Name of nearest symbol before address */
+    void       *dli_saddr;  /* Address of nearest symbol */
+} Dl_info;
+
+int dladdr(const void *addr, Dl_info *info);
+
 #ifdef __cplusplus
 }
 #endif

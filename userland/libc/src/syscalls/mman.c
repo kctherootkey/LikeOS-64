@@ -28,3 +28,10 @@ int mprotect(void* addr, size_t len, int prot) {
     }
     return 0;
 }
+
+/* mlock/munlock: page-locking stubs — the kernel currently does not
+ * restrict page eviction for user mappings, so these succeed trivially. */
+int mlock(const void *addr, size_t len) { (void)addr; (void)len; return 0; }
+int munlock(const void *addr, size_t len) { (void)addr; (void)len; return 0; }
+int mlockall(int flags) { (void)flags; return 0; }
+int munlockall(void) { return 0; }

@@ -76,4 +76,35 @@
     ((type*)((char*)(ptr) - __builtin_offsetof(type, member)))
 #endif
 
+/* glibc-compatible __THROW / __nothrow markers (used by host syslog.h etc.) */
+#ifndef __THROW
+# define __THROW
+#endif
+#ifndef __THROWNL
+# define __THROWNL
+#endif
+#ifndef __LEAF
+# define __LEAF
+#endif
+#ifndef __LEAF_ATTR
+# define __LEAF_ATTR
+#endif
+#ifndef __nonnull
+# define __nonnull(...)
+#endif
+#ifndef __wur
+# define __wur
+#endif
+#ifndef __REDIRECT
+# define __REDIRECT(name, proto, alias) name proto
+#endif
+#ifndef __REDIRECT_NTH
+# define __REDIRECT_NTH(name, proto, alias) name proto __THROW
+#endif
+
+/* va_list alias used by some host headers (e.g. syslog.h) */
+#ifndef __gnuc_va_list
+typedef __builtin_va_list __gnuc_va_list;
+#endif
+
 #endif /* _SYS_CDEFS_H */

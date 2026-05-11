@@ -148,4 +148,18 @@ long sysconf(int name);
 // confstr
 #define _CS_PATH  0
 
+// Entropy
+/* flags for getrandom() */
+#define GRND_NONBLOCK   0x0001u
+#define GRND_RANDOM     0x0002u
+#define GRND_INSECURE   0x0004u
+
+ssize_t getrandom(void *buf, size_t buflen, unsigned int flags);
+
+// ELF auxiliary vector
+unsigned long getauxval(unsigned long type);
+
+// Generic syscall entry point
+long syscall(long number, ...);
+
 #endif

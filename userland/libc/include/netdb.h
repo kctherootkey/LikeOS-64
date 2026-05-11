@@ -229,4 +229,11 @@ struct protoent *getprotobynumber(int proto);
 void             setprotoent(int stayopen);
 void             endprotoent(void);
 
+/* Thread-unsafe h_errno variable set by gethostbyname() etc. */
+extern int h_errno;
+
+/* herror / hstrerror for compatibility with resolv-using code */
+void        herror(const char *s);
+const char *hstrerror(int err);
+
 #endif /* _NETDB_H */

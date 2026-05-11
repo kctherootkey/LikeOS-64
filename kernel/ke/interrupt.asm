@@ -50,7 +50,7 @@ extern irq_handler
 
 ; Common ISR stub for exceptions
 isr_common_stub:
-    ; Save all registers
+    ; Save all integer registers
     push rax
     push rbx
     push rcx
@@ -66,12 +66,65 @@ isr_common_stub:
     push r13
     push r14
     push r15
-    
-    ; Call C exception handler
-    mov rdi, rsp               ; Pass pointer to register structure
+
+    ; rdi = GPR frame pointer for C handler
+    mov rdi, rsp
+
+    ; Check if we came from user mode: CS is at [rsp + 144]
+    ; Stack layout after 15 GPR pushes + 2 macro pushes:
+    ;   [rsp+0]=r15 ... [rsp+112]=rax [rsp+120]=int# [rsp+128]=err [rsp+136]=RIP [rsp+144]=CS
+    xor r15, r15
+    mov rax, [rsp + 144]
+    test rax, 3
+    jz .isr_call            ; CPL=0 → kernel mode, skip XMM save
+
+    ; User mode: save XMM0-15 on kernel stack (256 bytes, movdqu = no alignment needed)
+    sub rsp, 256
+    movdqu [rsp +   0], xmm0
+    movdqu [rsp +  16], xmm1
+    movdqu [rsp +  32], xmm2
+    movdqu [rsp +  48], xmm3
+    movdqu [rsp +  64], xmm4
+    movdqu [rsp +  80], xmm5
+    movdqu [rsp +  96], xmm6
+    movdqu [rsp + 112], xmm7
+    movdqu [rsp + 128], xmm8
+    movdqu [rsp + 144], xmm9
+    movdqu [rsp + 160], xmm10
+    movdqu [rsp + 176], xmm11
+    movdqu [rsp + 192], xmm12
+    movdqu [rsp + 208], xmm13
+    movdqu [rsp + 224], xmm14
+    movdqu [rsp + 240], xmm15
+    mov r15, 1              ; flag: XMM state saved
+
+.isr_call:
+    ; rdi still points to GPR frame (set before XMM save)
     call exception_handler
-    
-    ; Restore all registers
+
+    ; Restore XMM if we saved them
+    test r15, r15
+    jz .isr_no_xmm
+    movdqu xmm0,  [rsp +   0]
+    movdqu xmm1,  [rsp +  16]
+    movdqu xmm2,  [rsp +  32]
+    movdqu xmm3,  [rsp +  48]
+    movdqu xmm4,  [rsp +  64]
+    movdqu xmm5,  [rsp +  80]
+    movdqu xmm6,  [rsp +  96]
+    movdqu xmm7,  [rsp + 112]
+    movdqu xmm8,  [rsp + 128]
+    movdqu xmm9,  [rsp + 144]
+    movdqu xmm10, [rsp + 160]
+    movdqu xmm11, [rsp + 176]
+    movdqu xmm12, [rsp + 192]
+    movdqu xmm13, [rsp + 208]
+    movdqu xmm14, [rsp + 224]
+    movdqu xmm15, [rsp + 240]
+    add rsp, 256
+
+.isr_no_xmm:
+    ; Restore all integer registers
     pop r15
     pop r14
     pop r13
@@ -101,7 +154,7 @@ isr_common_stub:
 
 ; Common IRQ stub
 irq_common_stub:
-    ; Save all registers
+    ; Save all integer registers
     push rax
     push rbx
     push rcx
@@ -117,12 +170,63 @@ irq_common_stub:
     push r13
     push r14
     push r15
-    
-    ; Call C IRQ handler
-    mov rdi, rsp               ; Pass pointer to register structure
+
+    ; rdi = GPR frame pointer for C handler
+    mov rdi, rsp
+
+    ; Check if we came from user mode: CS is at [rsp + 144]
+    xor r15, r15
+    mov rax, [rsp + 144]
+    test rax, 3
+    jz .irq_call            ; CPL=0 → kernel mode, skip XMM save
+
+    ; User mode: save XMM0-15 on kernel stack (256 bytes, movdqu = no alignment needed)
+    sub rsp, 256
+    movdqu [rsp +   0], xmm0
+    movdqu [rsp +  16], xmm1
+    movdqu [rsp +  32], xmm2
+    movdqu [rsp +  48], xmm3
+    movdqu [rsp +  64], xmm4
+    movdqu [rsp +  80], xmm5
+    movdqu [rsp +  96], xmm6
+    movdqu [rsp + 112], xmm7
+    movdqu [rsp + 128], xmm8
+    movdqu [rsp + 144], xmm9
+    movdqu [rsp + 160], xmm10
+    movdqu [rsp + 176], xmm11
+    movdqu [rsp + 192], xmm12
+    movdqu [rsp + 208], xmm13
+    movdqu [rsp + 224], xmm14
+    movdqu [rsp + 240], xmm15
+    mov r15, 1              ; flag: XMM state saved
+
+.irq_call:
+    ; rdi still points to GPR frame (set before XMM save)
     call irq_handler
-    
-    ; Restore all registers
+
+    ; Restore XMM if we saved them
+    test r15, r15
+    jz .irq_no_xmm
+    movdqu xmm0,  [rsp +   0]
+    movdqu xmm1,  [rsp +  16]
+    movdqu xmm2,  [rsp +  32]
+    movdqu xmm3,  [rsp +  48]
+    movdqu xmm4,  [rsp +  64]
+    movdqu xmm5,  [rsp +  80]
+    movdqu xmm6,  [rsp +  96]
+    movdqu xmm7,  [rsp + 112]
+    movdqu xmm8,  [rsp + 128]
+    movdqu xmm9,  [rsp + 144]
+    movdqu xmm10, [rsp + 160]
+    movdqu xmm11, [rsp + 176]
+    movdqu xmm12, [rsp + 192]
+    movdqu xmm13, [rsp + 208]
+    movdqu xmm14, [rsp + 224]
+    movdqu xmm15, [rsp + 240]
+    add rsp, 256
+
+.irq_no_xmm:
+    ; Restore all integer registers
     pop r15
     pop r14
     pop r13
