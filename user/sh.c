@@ -1312,7 +1312,7 @@ static int run_builtin(int argc, char **argv) {
         printf("  shutdown reboot poweroff halt\n");
         printf("Networking commands:\n");
         printf("  ifconfig ping netstat route arp traceroute arping\n");
-        printf("  dhclient dig nslookup host hostname\n");
+        printf("  dhclient dig nslookup host hostname nc\n");
         printf("Keyboard shortcuts:\n");
         printf("  Ctrl+D  - Debug dump\n");
         printf("  Ctrl+C  - Interrupt current process\n");

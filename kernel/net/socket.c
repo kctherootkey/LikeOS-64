@@ -467,7 +467,11 @@ int sock_send(int sockfd, const void* buf, size_t len, int flags) {
     if (!s->active) return -EBADF;
 
     if (s->type == SOCK_STREAM) {
-        if (!s->tcp || !s->connected) return -ENOTCONN;
+        if (!s->tcp) return -ENOTCONN;
+        // Allow sends when the TCP layer is established even if sock_connect()
+        // returned EINPROGRESS (non-blocking path) before setting s->connected.
+        if (!s->connected && s->tcp->state != TCP_STATE_ESTABLISHED)
+            return -ENOTCONN;
         if (s->tcp->state != TCP_STATE_ESTABLISHED) return -EPIPE;
 
         // tcp_send_data may return 0 when the inflight queue is full.  POSIX
@@ -485,7 +489,7 @@ int sock_send(int sockfd, const void* buf, size_t len, int flags) {
             uint64_t sflags;
             spin_lock_irqsave(&s->lock, &sflags);
             tcp_conn_t* conn = s->active ? s->tcp : NULL;
-            int connected = s->connected;
+            int connected = s->connected || (conn && conn->state == TCP_STATE_ESTABLISHED);
             int nonblock = s->nonblock;
             spin_unlock_irqrestore(&s->lock, sflags);
             if (!conn || !connected) return -ENOTCONN;
@@ -850,8 +854,20 @@ int sock_getsockopt(int sockfd, int level, int optname,
         switch (optname) {
         case SO_ERROR:
             if (*optlen >= sizeof(int)) {
-                *(int*)optval = s->error;
+                int e = s->error;
+                // For non-blocking connect: conn->error holds the TCP-level
+                // result (ECONNREFUSED, ETIMEDOUT, …) while s->error stays 0.
+                // POSIX requires getsockopt(SO_ERROR) to return that error.
+                if (e == 0 && s->tcp)
+                    e = s->tcp->error;
+                *(int*)optval = e;
                 s->error = 0;
+                if (s->tcp) s->tcp->error = 0;
+                // If the non-blocking connect completed successfully, mark
+                // the socket connected so sock_send() works.
+                if (e == 0 && s->tcp &&
+                    s->tcp->state == TCP_STATE_ESTABLISHED && !s->connected)
+                    s->connected = 1;
                 *optlen = sizeof(int);
             }
             return 0;

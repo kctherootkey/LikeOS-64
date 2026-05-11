@@ -1,0 +1,42 @@
+# Makefile.likeos - Build netcat (nc) for LikeOS
+#
+# Links against LikeOS libc.so; no external library dependencies.
+
+CC = gcc
+LD = ld
+
+LIBC_DIR = ../../userland/libc
+RTLD_DIR = ../../userland/rtld
+
+CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fno-stack-protector \
+         -mno-red-zone -ffreestanding -fPIE \
+         -isystem $(LIBC_DIR)/include \
+         -fno-tree-vectorize -fno-strict-aliasing \
+         -D__LIKEOS__ \
+         -Wno-unused-parameter \
+         -Wno-sign-compare
+
+LDFLAGS = -pie -nostdlib -T ../../user/user_dyn.lds --hash-style=gnu \
+          -z now \
+          -rpath /lib -dynamic-linker /lib/ld-likeos.so \
+          -L$(LIBC_DIR) -L$(RTLD_DIR)
+
+CRT1 = $(LIBC_DIR)/crt1.o
+LIBS = -lc -l:ld-likeos.so
+
+OBJS = netcat.o socks.o atomicio.o
+
+TARGET = nc
+
+all: $(TARGET)
+
+$(TARGET): $(CRT1) $(OBJS)
+	$(LD) $(LDFLAGS) $(CRT1) $(OBJS) $(LIBS) -o $@
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -f *.o $(TARGET)
+
+.PHONY: all clean

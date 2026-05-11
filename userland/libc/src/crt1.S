@@ -42,6 +42,10 @@ _start:
     mov     %rdx, %rdi
     call    __libc_init_environ
 
+    /* Set __progname from argv[0] */
+    mov     (%r12), %rdi        /* argv[0] */
+    call    __libc_set_progname
+
     /* Restore argc, argv, envp for main(argc, argv, envp) */
     mov     %rbx, %rdi
     mov     %r12, %rsi

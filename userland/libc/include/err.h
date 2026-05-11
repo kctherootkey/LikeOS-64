@@ -20,6 +20,10 @@ void verrx(int eval, const char* fmt, va_list ap) __attribute__((noreturn));
 void vwarn(const char* fmt, va_list ap);
 void vwarnx(const char* fmt, va_list ap);
 
+/* Program name used by err/warn family.  Set automatically at startup. */
+extern const char* __progname;
+void __libc_set_progname(const char* argv0);
+
 #ifdef __cplusplus
 }
 #endif

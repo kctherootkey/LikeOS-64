@@ -439,12 +439,10 @@ static int tcp_send_segment_ex(net_device_t* dev, uint32_t src_ip, uint32_t dst_
         pkt[sizeof(tcp_header_t) + padded_options + i] = data[i];
 
     uint8_t pseudo[12 + sizeof(tcp_header_t) + TCP_MAX_OPTIONS + TCP_MSS];
-    uint32_t s = net_htonl(src_ip);
-    uint32_t d = net_htonl(dst_ip);
-    pseudo[0] = (s >> 24) & 0xFF; pseudo[1] = (s >> 16) & 0xFF;
-    pseudo[2] = (s >> 8) & 0xFF;  pseudo[3] = s & 0xFF;
-    pseudo[4] = (d >> 24) & 0xFF; pseudo[5] = (d >> 16) & 0xFF;
-    pseudo[6] = (d >> 8) & 0xFF;  pseudo[7] = d & 0xFF;
+    pseudo[0] = (src_ip >> 24) & 0xFF; pseudo[1] = (src_ip >> 16) & 0xFF;
+    pseudo[2] = (src_ip >> 8) & 0xFF;  pseudo[3] = src_ip & 0xFF;
+    pseudo[4] = (dst_ip >> 24) & 0xFF; pseudo[5] = (dst_ip >> 16) & 0xFF;
+    pseudo[6] = (dst_ip >> 8) & 0xFF;  pseudo[7] = dst_ip & 0xFF;
     pseudo[8] = 0;
     pseudo[9] = IP_PROTO_TCP;
     pseudo[10] = (tcp_len >> 8) & 0xFF;

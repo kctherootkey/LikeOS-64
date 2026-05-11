@@ -856,6 +856,15 @@ $(BUILD_DIR)/tmux: ports-tmux | $(BUILD_DIR)
 	cp ports/tmux-3.6a/tmux $@
 	$(STRIP) --strip-unneeded $@
 
+# Build netcat (nc)
+.PHONY: ports-netcat
+ports-netcat: userland-libc userland-rtld
+	$(MAKE) -C ports/netcat-OpenBSD -f Makefile.likeos
+
+$(BUILD_DIR)/nc: ports-netcat | $(BUILD_DIR)
+	cp ports/netcat-OpenBSD/nc $@
+	$(STRIP) --strip-unneeded $@
+
 # Build kernel ELF
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel.lds | $(BUILD_DIR)
 	@echo "Building LikeOS-64 kernel as ELF64..."
@@ -919,7 +928,7 @@ $(ISO_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) | $(BUILD_DIR)
 	@echo "UEFI bootable ISO created: $(ISO_IMAGE)"
 
 # Create UEFI bootable FAT image (for direct use)
-$(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/hostname $(BUILD_DIR)/ping $(BUILD_DIR)/ifconfig $(BUILD_DIR)/netstat $(BUILD_DIR)/route $(BUILD_DIR)/arp $(BUILD_DIR)/traceroute $(BUILD_DIR)/arping $(BUILD_DIR)/dhclient $(BUILD_DIR)/dig $(BUILD_DIR)/nslookup $(BUILD_DIR)/host $(BUILD_DIR)/nano $(BUILD_DIR)/tmux $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libevent.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
+$(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/hostname $(BUILD_DIR)/ping $(BUILD_DIR)/ifconfig $(BUILD_DIR)/netstat $(BUILD_DIR)/route $(BUILD_DIR)/arp $(BUILD_DIR)/traceroute $(BUILD_DIR)/arping $(BUILD_DIR)/dhclient $(BUILD_DIR)/dig $(BUILD_DIR)/nslookup $(BUILD_DIR)/host $(BUILD_DIR)/nano $(BUILD_DIR)/tmux $(BUILD_DIR)/nc $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libevent.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
 	@echo "Creating UEFI bootable FAT image..."
 	
 	# Create a 64MB FAT32 image
@@ -999,6 +1008,7 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/host ::/bin/host
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/nano ::/bin/nano
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/tmux ::/bin/tmux
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/nc ::/bin/nc
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr || true
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr/local || true
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr/local/bin || true
@@ -1059,7 +1069,7 @@ qemu-fat: $(FAT_IMAGE)
 
 # Standalone USB mass storage data image (64MB FAT32) now mirrors usb-write target (UEFI bootable + signature files)
 # Provides: EFI/BOOT/BOOTX64.EFI, kernel.elf, LIKEOS.SIG, HELLO.TXT, tests
-$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/hostname $(BUILD_DIR)/ping $(BUILD_DIR)/ifconfig $(BUILD_DIR)/netstat $(BUILD_DIR)/route $(BUILD_DIR)/arp $(BUILD_DIR)/traceroute $(BUILD_DIR)/arping $(BUILD_DIR)/dhclient $(BUILD_DIR)/dig $(BUILD_DIR)/nslookup $(BUILD_DIR)/host $(BUILD_DIR)/nano $(BUILD_DIR)/tmux $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libevent.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
+$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/hostname $(BUILD_DIR)/ping $(BUILD_DIR)/ifconfig $(BUILD_DIR)/netstat $(BUILD_DIR)/route $(BUILD_DIR)/arp $(BUILD_DIR)/traceroute $(BUILD_DIR)/arping $(BUILD_DIR)/dhclient $(BUILD_DIR)/dig $(BUILD_DIR)/nslookup $(BUILD_DIR)/host $(BUILD_DIR)/nano $(BUILD_DIR)/tmux $(BUILD_DIR)/nc $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libevent.so $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
 	@echo "Creating USB data FAT32 image (msdata.img, 64MB, UEFI bootable)..."
 	$(DD) if=/dev/zero of=$(DATA_IMAGE) bs=1M count=64
 	$(MKFS_FAT) -F32 -n "MSDATA" $(DATA_IMAGE)
@@ -1144,6 +1154,7 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/host ::/bin/host
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/nano ::/bin/nano
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/tmux ::/bin/tmux
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/nc ::/bin/nc
 	# Create /lib directory and copy shared libraries
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/lib || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/ld-likeos.so ::/lib/ld-likeos.so
@@ -1267,7 +1278,7 @@ qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)
 
 # Write ISO to USB device with GPT partition table (like Rufus)
 # Usage: make usb-write USB_DEVICE=/dev/sdX [USB_SERIAL=1]
-usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/hostname $(BUILD_DIR)/ping $(BUILD_DIR)/ifconfig $(BUILD_DIR)/netstat $(BUILD_DIR)/route $(BUILD_DIR)/arp $(BUILD_DIR)/traceroute $(BUILD_DIR)/arping $(BUILD_DIR)/dhclient $(BUILD_DIR)/dig $(BUILD_DIR)/nslookup $(BUILD_DIR)/host $(BUILD_DIR)/nano $(BUILD_DIR)/tmux $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libevent.so $(BUILD_DIR)/libtestlib.so
+usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/hostname $(BUILD_DIR)/ping $(BUILD_DIR)/ifconfig $(BUILD_DIR)/netstat $(BUILD_DIR)/route $(BUILD_DIR)/arp $(BUILD_DIR)/traceroute $(BUILD_DIR)/arping $(BUILD_DIR)/dhclient $(BUILD_DIR)/dig $(BUILD_DIR)/nslookup $(BUILD_DIR)/host $(BUILD_DIR)/nano $(BUILD_DIR)/tmux $(BUILD_DIR)/nc $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libevent.so $(BUILD_DIR)/libtestlib.so
 	@if [ -z "$(USB_DEVICE)" ]; then \
 		echo "Error: USB_DEVICE not specified. Usage: make usb-write USB_DEVICE=/dev/sdX"; \
 		echo "Available devices:"; \
@@ -1398,6 +1409,7 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo cp $(BUILD_DIR)/host /tmp/likeos_usb_mount/bin/host
 	sudo cp $(BUILD_DIR)/nano /tmp/likeos_usb_mount/bin/nano
 	sudo cp $(BUILD_DIR)/tmux /tmp/likeos_usb_mount/bin/tmux
+	sudo cp $(BUILD_DIR)/nc /tmp/likeos_usb_mount/bin/nc
 	sudo cp $(BUILD_DIR)/hello /tmp/likeos_usb_mount/usr/local/bin/hello
 	sudo cp $(BUILD_DIR)/test_libc /tmp/likeos_usb_mount/usr/local/bin/testlibc
 	sudo cp $(BUILD_DIR)/user_test.elf /tmp/likeos_usb_mount/usr/local/bin/tests
@@ -1459,6 +1471,7 @@ clean:
 	$(MAKE) -C ports/lib/libevent-2.1.12 -f Makefile.likeos clean
 	$(MAKE) -C ports/nano-8.3 -f Makefile.likeos clean
 	$(MAKE) -C ports/tmux-3.6a -f Makefile.likeos clean
+	$(MAKE) -C ports/netcat-OpenBSD -f Makefile.likeos clean
 
 # Install dependencies (Ubuntu/Debian)
 deps:

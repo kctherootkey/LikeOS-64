@@ -14,11 +14,19 @@
 
 extern char** environ;
 
-static const char* progname_fallback = "tmux";
+const char* __progname = "";
+
+void __libc_set_progname(const char* argv0) {
+    if (!argv0 || !argv0[0]) return;
+    /* Use the basename of argv[0], matching BSD err() behaviour. */
+    const char* p = argv0;
+    for (const char* q = argv0; *q; q++)
+        if (*q == '/') p = q + 1;
+    __progname = p;
+}
 
 static const char* _progname(void) {
-    /* /proc-style introspection isn't available; rely on a static fallback. */
-    return progname_fallback;
+    return (__progname && __progname[0]) ? __progname : "?";
 }
 
 void vwarn(const char* fmt, va_list ap) {
