@@ -848,6 +848,7 @@ tcp_conn_t* tcp_listen(net_device_t* dev, uint32_t local_ip,
 tcp_conn_t* tcp_accept(tcp_conn_t* listener);
 int  tcp_close(tcp_conn_t* conn);
 void tcp_abort(tcp_conn_t* conn);   // Send RST and free (SO_LINGER l_onoff=0)
+void tcp_send_window_update(tcp_conn_t* conn); // Proactive ACK after RX drain
 void tcp_timer_tick(void);
 void tcp_reap_pending(void);
 int  tcp_send_segment(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,

@@ -3,6 +3,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/skb.h"
+#include "../../include/kernel/ratelimit.h"
 
 // UDP pseudo-header for checksum
 typedef struct __attribute__((packed)) {
@@ -89,6 +90,9 @@ void udp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
     uint16_t dst_port = net_ntohs(udp->dst_port);
     uint16_t udp_len = net_ntohs(udp->length);
 
+    // Drop UDP datagrams with source port 0 (RFC 768 requires non-zero)
+    if (src_port == 0) return;
+
     if (udp_len > len || udp_len < sizeof(udp_header_t)) return;
 
     // RFC 768 checksum verify (a value of 0 means "sender disabled checksum").
@@ -140,6 +144,12 @@ void udp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
     // Deliver to socket layer
     extern net_socket_t* sock_find_udp(uint16_t port, uint32_t dst_ip);
     if (!sock_find_udp(dst_port, dst_ip)) {
+        // Rate-limit ICMP port-unreachable to prevent reflection amplification
+        uint64_t rl_flags; spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
+        int unreach_ok = net_rl_allow(&g_udp_unreach_rl);
+        spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
+        if (!unreach_ok) return;
+
         uint8_t quoted[sizeof(ipv4_header_t) + sizeof(udp_header_t) + 8];
         ipv4_header_t* ip = (ipv4_header_t*)quoted;
         ip->version_ihl = 0x45;

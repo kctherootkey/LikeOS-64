@@ -588,6 +588,28 @@ again:
         }
 
         sock_conn_unlock(&conn->lock, cflags);
+
+        /* Defensive re-wait: rx_ready fired but the ring was empty (e.g. a
+         * zero-window probe arrived on a full ring — copy=0 in tcp_rx).
+         * Returning 0 here would look like EOF to OpenSSL.  Re-enter the
+         * wait loop on a blocking ESTABLISHED socket instead. */
+        if (copy == 0 && conn->state == TCP_STATE_ESTABLISHED && !peek) {
+            uint64_t sfl;
+            spin_lock_irqsave(&s->lock, &sfl);
+            int nb2 = s->nonblock;
+            spin_unlock_irqrestore(&s->lock, sfl);
+            if (!nb2 && !dontwait)
+                goto again;
+        }
+
+        /* After draining application data, send a window-update ACK so the
+         * remote sender learns the buffer has free space.  Without this, when
+         * the RX ring filled to window=0 the sender stopped, and because it
+         * has no in-flight segments to retransmit, tcp_timer_tick never fires
+         * a probe — both sides block on sched_yield_in_kernel() indefinitely. */
+        if (copy > 0 && !peek)
+            tcp_send_window_update(conn);
+
         total += copy;
 
         if (waitall && !peek && total < len &&

@@ -25,6 +25,8 @@ PTHREAD_SRC = src/pthread/pthread.c src/pthread/pthread_mutex.c src/pthread/pthr
 PTHREAD_ASM = src/pthread/clone.S
 CRT0_SRC = src/crt0.S
 CRT1_SRC = src/crt1.S
+CRTI_SRC = src/crti.S
+CRTN_SRC = src/crtn.S
 
 # Static object files
 MALLOC_OBJ = $(MALLOC_SRC:.c=.o)
@@ -42,6 +44,8 @@ NET_OBJ = $(NET_SRC:.c=.o)
 PTHREAD_OBJ = $(PTHREAD_SRC:.c=.o) $(PTHREAD_ASM:.S=.o)
 CRT0_OBJ = $(CRT0_SRC:.S=.o)
 CRT1_OBJ = $(CRT1_SRC:.S=.o)
+CRTI_OBJ = $(CRTI_SRC:.S=.o)
+CRTN_OBJ = $(CRTN_SRC:.S=.o)
 
 # All static objects (libc – everything except pthread)
 LIBC_OBJ = $(MALLOC_OBJ) $(STDIO_OBJ) $(STRING_OBJ) $(STDLIB_OBJ) \
@@ -60,8 +64,10 @@ LIBC_A      = libc.a
 LIBC_SO     = libc.so
 CRT0        = crt0.o
 CRT1        = crt1.o
+CRTI        = crti.o
+CRTN        = crtn.o
 
-all: $(LIBC_A) $(CRT0) $(CRT1) $(LIBC_SO)
+all: $(LIBC_A) $(CRT0) $(CRT1) $(CRTI) $(CRTN) $(LIBC_SO)
 
 # ---- Static library (libc.a) — contains everything including pthread ----
 $(LIBC_A): $(ALL_OBJ)
@@ -79,6 +85,12 @@ $(CRT0): $(CRT0_OBJ)
 $(CRT1): $(CRT1_OBJ)
 	cp $< $@
 
+$(CRTI): $(CRTI_OBJ)
+	cp $< $@
+
+$(CRTN): $(CRTN_OBJ)
+	cp $< $@
+
 # ---- Pattern rules ----
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -93,7 +105,7 @@ $(CRT1): $(CRT1_OBJ)
 	$(CC) $(PIC_CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(ALL_OBJ) $(DLFCN_OBJ) $(CRT0_OBJ) $(CRT1_OBJ) $(LIBC_A) $(CRT0) $(CRT1)
+	rm -f $(ALL_OBJ) $(DLFCN_OBJ) $(CRT0_OBJ) $(CRT1_OBJ) $(CRTI_OBJ) $(CRTN_OBJ) $(LIBC_A) $(CRT0) $(CRT1) $(CRTI) $(CRTN)
 	rm -f $(LIBC_PIC) $(DLFCN_PIC) $(PTHREAD_PIC) $(LIBC_SO)
 
 .PHONY: all clean

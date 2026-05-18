@@ -16,14 +16,30 @@
 epoll_instance_t epoll_instances[MAX_EPOLL_INSTANCES];
 static spinlock_t epoll_lock = SPINLOCK_INIT("epoll");
 
-// Block the calling task until the next timer tick (or `deadline`, whichever
-// comes first).  Used by select/poll/epoll_wait between scan iterations to
-// avoid pegging a CPU at 100% while waiting on FDs that have no kernel-side
-// wake channel registration here.  Without this, tmux (which sits in
-// pselect/poll between every keystroke) keeps a vCPU busy-spinning, and on
-// hypervisors with multiple vCPUs the host CPU becomes overcommitted, making
-// the entire guest feel "very slow even on keystrokes".  10 ms granularity
-// is invisible for interactive workloads.
+// Stable address used as a wake channel for tasks sleeping in poll/select/
+// epoll_wait.  Any I/O producer (TTY key press, TCP data arrival, pipe write)
+// that should unblock a multiplexed waiter calls poll_notify_io_ready(), which
+// fires sched_wake_channel on this address.  The value of the variable itself
+// is never read; only its address matters as the channel key.
+static int g_poll_io_ready;
+
+// Wake all tasks currently parked in poll_sleep_until_next_tick.  Called from
+// every I/O path that can make a polled fd ready: TTY input, TCP receive, pipe
+// write, etc.  This replaces the old tick-granularity wakeup for interactive
+// workloads, giving sub-millisecond response to keyboard input.
+void poll_notify_io_ready(void) {
+    sched_wake_channel((void*)&g_poll_io_ready);
+}
+
+// Block the calling task until an I/O event fires or `deadline` is reached
+// (whichever comes first).  Used by select/poll/epoll_wait between scan
+// iterations to avoid busy-spinning while waiting on fds that are not yet
+// ready.  Previously this slept for exactly one timer tick (up to 10 ms),
+// which caused visible typing lag in programs like nc and openssl that use
+// poll() to multiplex stdin and a TCP socket: keystrokes fired tty_wake_readers
+// but the poll task had no wait_channel set, so it slept the full tick before
+// noticing that stdin was ready.  Now the task parks on g_poll_io_ready so any
+// I/O producer can wake it instantly.
 static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
                                        int have_deadline) {
     task_t* cur = sched_current();
@@ -40,10 +56,12 @@ static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
         __asm__ volatile("pause");
         return;
     }
+    cur->wait_channel = (void*)&g_poll_io_ready;
     cur->wakeup_tick = wake;
     cur->state = TASK_BLOCKED;
     sched_schedule();
     cur->wakeup_tick = 0;
+    cur->wait_channel = NULL;
     if (cur->state != TASK_RUNNING) cur->state = TASK_RUNNING;
 }
 

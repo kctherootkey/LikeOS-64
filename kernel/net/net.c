@@ -13,6 +13,7 @@
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/random.h"
+#include "../../include/kernel/ratelimit.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/skb.h"
 #include "../../include/kernel/softirq.h"
@@ -198,10 +199,20 @@ void net_rx_packet(net_device_t* dev, const uint8_t* data, uint16_t len) {
 static net_device_t lo_device;
 static int lo_initialized = 0;
 
-// Loopback transmit: enqueue an skb on the LOCAL CPU's RX queue and
-// raise SOFTIRQ_NET_RX locally.  See the rx-queue commentary at the
-// top of this file for why loopback uses per-CPU queues instead of
-// the single NET_RX_CPU queue used for hardware NIC RX.
+// Loopback transmit: enqueue an skb on NET_RX_CPU's RX queue (same as
+// hardware NIC RX) and raise SOFTIRQ_NET_RX there.
+//
+// Using a single shared queue (NET_RX_CPU) instead of per-CPU queues
+// guarantees FIFO ordering across CPU migrations.  The alternative
+// (per-CPU loopback queues) introduced an intermittent bug: when a sender
+// migrated CPUs across a sched_yield_in_kernel() boundary inside sock_send
+// (e.g. ssl_write data segments on CPU X, then FIN from close() on CPU Y),
+// the FIN arrived at the receiver via a different queue than the data
+// segments and could be processed first, causing CLOSE_WAIT + empty rx_buf
+// → sock_recv returning 0 (false EOF) before all data arrived.
+//
+// IPI overhead to wake NET_RX_CPU is negligible on real hardware (<10 µs).
+// If the caller is already on NET_RX_CPU no IPI is needed at all.
 static int loopback_send(net_device_t* dev, const uint8_t* data, uint16_t len) {
     dev->tx_packets++;
     dev->tx_bytes += len;
@@ -216,9 +227,15 @@ static int loopback_send(net_device_t* dev, const uint8_t* data, uint16_t len) {
     skb->dev = dev;
     uint8_t* p = skb_append(skb, len);
     for (uint16_t i = 0; i < len; i++) p[i] = data[i];
-    uint32_t my_cpu = net_safe_cpu_id();
-    skb_queue_tail(&rx_queue[my_cpu], skb);
-    softirq_raise_on(my_cpu, SOFTIRQ_NET_RX);
+    // Use NET_RX_CPU (same queue as NIC RX) so that loopback segments from
+    // a sender that migrates CPUs across preemption points always land in
+    // the same FIFO queue in send order.  Per-CPU queues broke ordering when
+    // e.g. SSL_write data segments and the subsequent FIN (from close()) were
+    // emitted from different CPUs: the FIN's queue was processed first,
+    // transitioning the peer to CLOSE_WAIT with an empty rx_buf, causing
+    // sock_recv to return 0 (false EOF) before all echo data arrived.
+    skb_queue_tail(&rx_queue[NET_RX_CPU], skb);
+    softirq_raise_on(NET_RX_CPU, SOFTIRQ_NET_RX);
     return 0;
 }
 
@@ -240,14 +257,13 @@ static int loopback_send(net_device_t* dev, const uint8_t* data, uint16_t len) {
 // 16 KiB stack and the caller's wait-loop will sched_yield_in_kernel()
 // immediately after this returns, giving ksoftirqd a chance to run.
 //
-// We raise on the LOCAL CPU (not NET_RX_CPU) because loopback packets
-// are enqueued on per-CPU queues; the local CPU's ksoftirqd drains
-// the local queue.
+// Loopback is now funnelled through NET_RX_CPU (same as NIC RX).  Raise the
+// softirq there so the packet is processed regardless of which CPU the
+// calling process is on.
 void loopback_process_pending(void) {
     if (!rx_queue_inited) return;
-    uint32_t my_cpu = net_safe_cpu_id();
-    if (__atomic_load_n(&rx_queue[my_cpu].len, __ATOMIC_ACQUIRE) != 0) {
-        softirq_raise_on(my_cpu, SOFTIRQ_NET_RX);
+    if (__atomic_load_n(&rx_queue[NET_RX_CPU].len, __ATOMIC_ACQUIRE) != 0) {
+        softirq_raise_on(NET_RX_CPU, SOFTIRQ_NET_RX);
     }
 }
 
@@ -289,6 +305,7 @@ void net_init(void) {
     lo_device.lock = (spinlock_t)SPINLOCK_INIT("lo");
     lo_initialized = 1;
 
+    ratelimit_init();
     arp_init();
     udp_init();
     tcp_init();

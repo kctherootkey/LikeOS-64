@@ -5,6 +5,8 @@
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/skb.h"
+#include "../../include/kernel/ratelimit.h"
+#include "../../include/kernel/ratelimit.h"
 
 // ============================================================================
 // ARP Table
@@ -148,9 +150,9 @@ static void arp_drain_pending(uint32_t ip, const uint8_t mac[ETH_ALEN]) {
 
 void arp_add_entry(uint32_t ip, const uint8_t mac[ETH_ALEN]) {
     uint64_t flags;
-    spin_lock_irqsave(&arp_lock, &flags);
 
-    // Check for existing entry
+    // Phase 1: check for an existing entry (update path, always allowed).
+    spin_lock_irqsave(&arp_lock, &flags);
     int found = 0;
     for (int i = 0; i < ARP_TABLE_SIZE; i++) {
         if (arp_table[i].valid && arp_table[i].ip == ip) {
@@ -161,30 +163,43 @@ void arp_add_entry(uint32_t ip, const uint8_t mac[ETH_ALEN]) {
             break;
         }
     }
-    if (!found) {
-        // Find free entry
-        int slot = -1;
-        for (int i = 0; i < ARP_TABLE_SIZE; i++) {
-            if (!arp_table[i].valid) { slot = i; break; }
-        }
-        if (slot < 0) {
-            // Table full - evict oldest
-            slot = 0;
-            uint64_t oldest_time = arp_table[0].timestamp;
-            for (int i = 1; i < ARP_TABLE_SIZE; i++) {
-                if (arp_table[i].timestamp < oldest_time) {
-                    oldest_time = arp_table[i].timestamp;
-                    slot = i;
-                }
-            }
-        }
-        arp_table[slot].ip = ip;
-        for (int m = 0; m < ETH_ALEN; m++)
-            arp_table[slot].mac[m] = mac[m];
-        arp_table[slot].timestamp = timer_ticks();
-        arp_table[slot].valid = 1;
+    spin_unlock_irqrestore(&arp_lock, flags);
+
+    if (found) {
+        arp_drain_pending(ip, mac);
+        return;
     }
 
+    // Phase 2: new entry — rate-limit to prevent ARP table flood attacks.
+    uint64_t rl_flags;
+    spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
+    int new_ok = net_rl_src_allow(&g_arp_new_rl, ip);
+    spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
+    if (!new_ok) return;
+
+    // Phase 3: insert new entry.
+    spin_lock_irqsave(&arp_lock, &flags);
+    // Find free entry
+    int slot = -1;
+    for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+        if (!arp_table[i].valid) { slot = i; break; }
+    }
+    if (slot < 0) {
+        // Table full - evict oldest
+        slot = 0;
+        uint64_t oldest_time = arp_table[0].timestamp;
+        for (int i = 1; i < ARP_TABLE_SIZE; i++) {
+            if (arp_table[i].timestamp < oldest_time) {
+                oldest_time = arp_table[i].timestamp;
+                slot = i;
+            }
+        }
+    }
+    arp_table[slot].ip = ip;
+    for (int m = 0; m < ETH_ALEN; m++)
+        arp_table[slot].mac[m] = mac[m];
+    arp_table[slot].timestamp = timer_ticks();
+    arp_table[slot].valid = 1;
     spin_unlock_irqrestore(&arp_lock, flags);
 
     // Drain any pending skbs waiting on this IP (no arp_lock held).
@@ -276,12 +291,45 @@ void arp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
     uint32_t sender_ip = net_ntohl(arp->sender_ip);
     uint32_t target_ip = net_ntohl(arp->target_ip);
 
+    // Per-source ARP rate limit
+    {
+        uint64_t rl_flags; spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
+        int arp_src_ok = net_rl_src_allow(&g_arp_src_rl, sender_ip);
+        spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
+        if (!arp_src_ok) return;
+    }
+
+    // Gratuitous ARP filter: sender_ip == target_ip means gratuitous.
+    // Only UPDATE an existing cache entry; do NOT create new entries —
+    // prevents cache poisoning of IPs we have never resolved.
+    int is_gratuitous = (sender_ip == target_ip && sender_ip != 0);
+    if (is_gratuitous) {
+        // Update existing entry only
+        uint64_t lk; spin_lock_irqsave(&arp_lock, &lk);
+        for (int i = 0; i < ARP_TABLE_SIZE; i++) {
+            if (arp_table[i].valid && arp_table[i].ip == sender_ip) {
+                for (int m = 0; m < ETH_ALEN; m++)
+                    arp_table[i].mac[m] = arp->sender_mac[m];
+                arp_table[i].timestamp = timer_ticks();
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&arp_lock, lk);
+        return;
+    }
+
     // Update ARP cache with sender info
     arp_add_entry(sender_ip, arp->sender_mac);
 
     uint16_t opcode = net_ntohs(arp->opcode);
 
     if (opcode == ARP_OP_REQUEST && target_ip == dev->ip_addr && dev->ip_addr != 0) {
+        // ARP reply rate limit
+        uint64_t rl_flags; spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
+        int reply_ok = net_rl_allow(&g_arp_reply_rl);
+        spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
+        if (!reply_ok) return;
+
         // Send ARP reply
         uint8_t reply[sizeof(arp_header_t)];
         arp_header_t* r = (arp_header_t*)reply;

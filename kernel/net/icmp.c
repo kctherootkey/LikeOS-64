@@ -6,6 +6,7 @@
 #include "../../include/kernel/random.h"
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/skb.h"
+#include "../../include/kernel/ratelimit.h"
 
 // All TX sites use a per-call sk_buff from the size-classed pool; no shared
 // static TX buffer / TX spinlock is held across the lower-layer call, so
@@ -126,7 +127,22 @@ void icmp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t l
     // Verify checksum over entire ICMP message
     if (ipv4_checksum(data, len) != 0) return;
 
+    // Drop ICMP redirect — never update routing table from unsolicited redirects
+    if (icmp->type == ICMP_REDIRECT) return;
+
+    // Drop timestamp requests (information disclosure + amplification vector)
+    if (icmp->type == ICMP_TIMESTAMP) return;
+
+    // Drop address mask requests (information disclosure)
+    if (icmp->type == ICMP_ADDRMASK) return;
+
     if (icmp->type == ICMP_ECHO_REQUEST && icmp->code == 0) {
+        // Global flood rate limit
+        uint64_t rl_flags; spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
+        int global_ok = net_rl_allow(&g_icmp_reply_rl);
+        int src_ok    = net_rl_src_allow(&g_icmp_src_rl, src_ip);
+        spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
+        if (!global_ok || !src_ok) goto skip_echo_reply;
         // Echo reply: copy entire received message and flip the type byte.
         // Length may be up to 65535 (reassembled IPv4 datagram); skb_alloc
         // picks the small or jumbo pool class as needed.
@@ -143,61 +159,7 @@ void icmp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t l
         ipv4_send(dev, src_ip, IP_PROTO_ICMP, skb->data, skb->len);
         skb_put(skb);
     }
-
-    // RFC 791 §3.2.2.8 Timestamp Request — reply with kernel time
-    if (icmp->type == ICMP_TIMESTAMP && icmp->code == 0 && len >= 20) {
-        sk_buff_t* skb = skb_alloc(len);
-        if (!skb) goto skip_ts_reply;
-        skb->dev = dev;
-        uint8_t* buf = skb_append(skb, len);
-        for (uint16_t i = 0; i < len; i++) buf[i] = data[i];
-        icmp_header_t* r = (icmp_header_t*)buf;
-        r->type = ICMP_TIMESTAMP_REPLY;
-        r->code = 0;
-        r->checksum = 0;
-        // Receive + transmit timestamps. RFC 792 p.16: when the sender cannot
-        // supply standard time (ms past midnight UT) the high-order bit MUST
-        // be set to indicate a non-standard value. We have no wall clock and
-        // exposing raw uptime would disclose boot time to any remote prober
-        // (CVE-1999-0524 class), so we report a per-boot randomly offset
-        // counter with the non-standard-time bit set.
-        static uint32_t icmp_ts_offset = 0;
-        static int      icmp_ts_offset_set = 0;
-        if (!icmp_ts_offset_set) {
-            icmp_ts_offset = random_u32();
-            icmp_ts_offset_set = 1;
-        }
-        uint32_t ts_ms = ((uint32_t)(timer_ticks() * 10) + icmp_ts_offset)
-                         | 0x80000000U; // non-standard time flag (RFC 792)
-        uint8_t* p = buf + 12; // skip type/code/cksum/id/seq + orig TS
-        p[0] = (uint8_t)(ts_ms >> 24); p[1] = (uint8_t)(ts_ms >> 16);
-        p[2] = (uint8_t)(ts_ms >> 8);  p[3] = (uint8_t)ts_ms;
-        p[4] = p[0]; p[5] = p[1]; p[6] = p[2]; p[7] = p[3];
-        r->checksum = ipv4_checksum(buf, len);
-        ipv4_send(dev, src_ip, IP_PROTO_ICMP, skb->data, skb->len);
-        skb_put(skb);
-    }
-skip_ts_reply:
-
-    // RFC 950 §3.1 Address Mask Request — reply with our netmask
-    if (icmp->type == ICMP_ADDRMASK && icmp->code == 0 && len >= 12 && dev) {
-        sk_buff_t* skb = skb_alloc(len);
-        if (!skb) goto skip_mask_reply;
-        skb->dev = dev;
-        uint8_t* buf = skb_append(skb, len);
-        for (uint16_t i = 0; i < len; i++) buf[i] = data[i];
-        icmp_header_t* r = (icmp_header_t*)buf;
-        r->type = ICMP_ADDRMASK_REPLY;
-        r->code = 0;
-        r->checksum = 0;
-        uint32_t mask = dev->netmask;
-        buf[8]  = (uint8_t)(mask >> 24); buf[9]  = (uint8_t)(mask >> 16);
-        buf[10] = (uint8_t)(mask >> 8);  buf[11] = (uint8_t)mask;
-        r->checksum = ipv4_checksum(buf, len);
-        ipv4_send(dev, src_ip, IP_PROTO_ICMP, skb->data, skb->len);
-        skb_put(skb);
-    }
-skip_mask_reply:
+skip_echo_reply:
 
     // RFC 1191 PMTUD: DEST_UNREACH/FRAG_NEEDED carries next-hop MTU in id+seq.
     // Also dispatch any ICMP error to a matching socket.

@@ -6,10 +6,15 @@
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/random.h"
 #include "../../include/kernel/softirq.h"
+#include "../../include/kernel/ratelimit.h"
 
 // TCP connection table
 tcp_conn_t tcp_connections[TCP_MAX_CONNECTIONS];
 static spinlock_t tcp_lock = SPINLOCK_INIT("tcp");
+
+// Forward decl: wake any task sleeping in poll/select/epoll_wait immediately
+// when TCP socket data (or connection state change) becomes available.
+extern void poll_notify_io_ready(void);
 
 // ---------------------------------------------------------------------------
 // IRQ-friendly blocking acquire of a per-connection spinlock.
@@ -538,6 +543,7 @@ static void tcp_fail_connection(tcp_conn_t* conn, int error) {
     conn->rx_ready = 1;
     conn->tx_ready = 1;
     conn->inflight_count = 0;
+    poll_notify_io_ready();
 }
 
 // RFC 6528: ISN = hash(secret, src_ip, dst_ip, src_port, dst_port) + time_counter
@@ -991,6 +997,30 @@ static void tcp_send_ack(tcp_conn_t* conn) {
     conn->segs_since_ack = 0;
 }
 
+// ============================================================================
+// tcp_send_window_update - Proactively advertise a newly opened receive window.
+//
+// Called from sock_recv after the application drains data from the RX ring.
+// Without this, a zero-window pause never self-recovers: when the receiver's
+// buffer fills, it advertises window=0 and the sender stops.  The sender
+// then has no in-flight segments, so the RTO retransmit path in
+// tcp_timer_tick never fires a window probe.  Both sides block on
+// sched_yield_in_kernel() indefinitely.
+//
+// Sending one ACK carrying the current (now larger) window breaks the stall
+// immediately and lets the sender resume.
+// ============================================================================
+void tcp_send_window_update(tcp_conn_t* conn) {
+    if (!conn) return;
+    uint64_t flags;
+    tcp_lock_acquire(&conn->lock, &flags);
+    if (conn->state == TCP_STATE_ESTABLISHED ||
+        conn->state == TCP_STATE_CLOSE_WAIT) {
+        tcp_send_ack(conn);
+    }
+    tcp_lock_release(&conn->lock, flags);
+}
+
 static void tcp_send_rst(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                          uint16_t src_port, uint16_t dst_port,
                          uint32_t seq, uint32_t ack) {
@@ -1377,6 +1407,10 @@ int tcp_send_data(tcp_conn_t* conn, const uint8_t* data, uint16_t len) {
 // ============================================================================
 // TCP Receive Processing
 // ============================================================================
+
+// Idle connection timeout: close ESTABLISHED connections with no data for 5 minutes
+#define TCP_IDLE_TIMEOUT_TICKS  (300 * 100)
+
 void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
             const uint8_t* data, uint16_t len) {
     if (len < sizeof(tcp_header_t)) return;
@@ -1399,6 +1433,26 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
     uint16_t payload_len = len - data_offset;
 
     uint32_t local_ip = dst_ip;
+
+    // --- Illegal flag combinations ---
+    // Null scan: no flags at all
+    if (tcp_flags == 0) return;
+    // SYN+FIN simultaneously
+    if ((tcp_flags & (TCP_SYN | TCP_FIN)) == (TCP_SYN | TCP_FIN)) return;
+    // XMAS scan: SYN+FIN+RST+PSH+URG+ACK all set
+    if ((tcp_flags & 0x3F) == 0x3F) return;
+
+    // --- Land attack: SYN with src == dst 4-tuple ---
+    if ((tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK) &&
+        src_ip == dst_ip && src_port == dst_port) return;
+
+    // --- Per-source SYN rate limit (complements SYN cookies) ---
+    if ((tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK)) {
+        uint64_t rl_flags; spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
+        int syn_ok = net_rl_src_allow(&g_tcp_syn_rl, src_ip);
+        spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
+        if (!syn_ok) return;
+    }
 
     // Find existing connection
     tcp_conn_t* conn = tcp_find_conn(local_ip, dst_port, src_ip, src_port);
@@ -1789,6 +1843,10 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
 
     case TCP_STATE_ESTABLISHED:
         if (tcp_flags & TCP_RST) {
+            // RFC 5961: validate RST seq within receive window
+            if ((int32_t)(seq - conn->rcv_nxt) < 0 ||
+                (int32_t)(seq - (conn->rcv_nxt + conn->rcv_wnd)) > 0)
+                break; // out-of-window RST, silently drop
             tcp_fail_connection(conn, ECONNRESET);
             break;
         }
@@ -1830,6 +1888,13 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
 
         // Process ACK
         if (tcp_flags & TCP_ACK) {
+            // Validate ACK is within snd_una..snd_nxt (out-of-window ACK flood)
+            if ((int32_t)(ack - conn->snd_una) < 0 ||
+                (int32_t)(ack - conn->snd_nxt) > 1) {
+                // Out-of-window ACK: send current ACK state back and drop
+                tcp_send_ack(conn);
+                break;
+            }
             // Store any peer-sent SACK blocks for the retransmit timer to use
             if (conn->sack_ok && pop.sack_count > 0) {
                 conn->sack_block_count = pop.sack_count;
@@ -1914,7 +1979,13 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                     conn->rx_tail = (conn->rx_tail + 1) % conn->rx_buf_size;
                 }
                 conn->rcv_nxt += copy;
-                conn->rx_ready = 1;
+                /* Only wake the reader when at least one byte was stored.
+                 * Setting rx_ready=1 with copy=0 (ring full, probe dropped)
+                 * causes sock_recv to return 0 — a false EOF to OpenSSL. */
+                if (copy > 0) {
+                    conn->rx_ready = 1;
+                    poll_notify_io_ready();
+                }
 
                 // Drain any contiguous OOO segments
                 int progress = 1;
@@ -1980,6 +2051,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
             conn->rcv_nxt = seq + payload_len + 1;
             conn->state = TCP_STATE_CLOSE_WAIT;
             conn->rx_ready = 1;  // Wake up reader (EOF)
+            poll_notify_io_ready();
 
             tcp_send_ack(conn);
         }
@@ -2147,6 +2219,15 @@ void tcp_timer_tick(void) {
         if (conn->state == TCP_STATE_ESTABLISHED &&
             conn->delayed_ack_pending && now >= conn->delayed_ack_deadline) {
             tcp_send_ack(conn);
+        }
+
+        // Slow-loris / idle timeout: close ESTABLISHED connections that have
+        // sent no data for TCP_IDLE_TIMEOUT_TICKS (5 minutes by default).
+        if (conn->state == TCP_STATE_ESTABLISHED &&
+            conn->last_rx_tick != 0 &&
+            (now - conn->last_rx_tick) > TCP_IDLE_TIMEOUT_TICKS) {
+            tcp_fail_connection(conn, ETIMEDOUT);
+            goto unlock_conn;
         }
 
         // TCP_CORK deadline — wake send path by clearing tx_ready oscillation

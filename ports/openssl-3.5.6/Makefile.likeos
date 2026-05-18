@@ -87,13 +87,20 @@ likeos-bin-linker: $(CONFIGURE_STAMP)
 # ----------------------------------------------------------------------------
 # Step 3 — build everything (shared libs + binary)
 # ----------------------------------------------------------------------------
+# CRTI_O / CRTN_O: injected into the shared library link so that the linker
+# can assemble a proper _init function from the .section .init fragments in
+# the object files (e.g. the OPENSSL_cpuid_setup call in x86_64cpuid.o).
+# The link order is:  crti.o  →  --whole-archive objects  →  crtn.o  →  libc
+# which produces the correct prologue/body/epilogue structure in _init.
 OPENSSL_MAKE_VARS = \
     CPPFLAGS="-I$(ABS_LIBC)/include" \
-    EX_LIBS="-L$(ABS_LIBC) -l:libc.so -L$(ABS_RTLD) -l:ld-likeos.so" \
+    CRTI_O="$(ABS_LIBC)/crti.o" \
+    EX_LIBS="$(ABS_LIBC)/crtn.o -L$(ABS_LIBC) -l:libc.so -L$(ABS_RTLD) -l:ld-likeos.so" \
     LDFLAGS="" \
     LDCMD="$(abspath .)/likeos-bin-linker"
 
-$(CONFIGURE_STAMP).built: $(CONFIGURE_STAMP) likeos-bin-linker
+$(CONFIGURE_STAMP).built: $(CONFIGURE_STAMP) likeos-bin-linker \
+                           $(ABS_LIBC)/crti.o $(ABS_LIBC)/crtn.o
 	# First invocation regenerates configdata.pm and Makefile (OpenSSL design)
 	$(MAKE) -j$(shell nproc) build_sw $(OPENSSL_MAKE_VARS) 2>&1 || \
 	  $(MAKE) -j$(shell nproc) build_sw $(OPENSSL_MAKE_VARS)

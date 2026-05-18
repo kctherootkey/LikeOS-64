@@ -102,6 +102,13 @@ static pty_t g_ptys[TTY_MAX_PTYS];
  */
 static void tty_wake_readers(task_t** waiters) {
     sched_wake_channel((void*)waiters);
+    /* Also wake any task sleeping in poll/select/epoll_wait so that it
+     * re-scans its fd set immediately instead of waiting for the next
+     * timer tick.  Without this, programs that multiplex stdin and a
+     * socket via poll() (e.g. nc, openssl) see up to one tick of lag
+     * per keystroke. */
+    extern void poll_notify_io_ready(void);
+    poll_notify_io_ready();
 }
 
 static void tty_enqueue_read(tty_t* tty, char c) {

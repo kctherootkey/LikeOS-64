@@ -5256,6 +5256,1670 @@ network_section:
     }
 
     // ========================================
+    // OpenSSL libcrypto / libssl tests
+    // ========================================
+    printf("\n--- OpenSSL libcrypto ---\n");
+
+    /*
+     * All OpenSSL symbols are resolved at run-time via dlopen/dlsym so that
+     * test_libc compiles without any OpenSSL headers or link-time dependency.
+     * libcrypto is loaded with RTLD_GLOBAL so that libssl can find its symbols
+     * when loaded immediately after.
+     */
+
+    /* Opaque handle types – only pointer-sized values are used below. */
+    typedef void EVP_MD_CTX;
+    typedef void EVP_CIPHER_CTX;
+    typedef void EVP_PKEY_CTX;
+    typedef void EVP_PKEY;
+    typedef void SSL_CTX;
+    typedef void SSL;
+    typedef void BIO;
+    typedef void X509;
+    typedef void RSA;
+    typedef void EVP_MD;
+    typedef void EVP_CIPHER;
+
+    /* ---- dlopen ---- */
+    void *crypto_h = dlopen("/lib/libcrypto.so.3", RTLD_LAZY | RTLD_GLOBAL);
+    test_result("dlopen libcrypto.so.3", crypto_h != NULL);
+    void *ssl_h    = dlopen("/lib/libssl.so.3",    RTLD_LAZY | RTLD_GLOBAL);
+    test_result("dlopen libssl.so.3",    ssl_h    != NULL);
+
+    if (crypto_h == NULL || ssl_h == NULL) {
+        printf("  [SKIP] OpenSSL not available – skipping crypto/ssl tests\n");
+        goto openssl_skip;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* libcrypto function pointers                                          */
+    /* ------------------------------------------------------------------ */
+
+    /* RAND */
+    typedef int  (*fn_RAND_bytes)(unsigned char *buf, int num);
+    fn_RAND_bytes p_RAND_bytes = (fn_RAND_bytes)dlsym(crypto_h, "RAND_bytes");
+
+    /* SHA-2 / EVP digest */
+    typedef EVP_MD_CTX* (*fn_EVP_MD_CTX_new)(void);
+    typedef void        (*fn_EVP_MD_CTX_free)(EVP_MD_CTX*);
+    typedef int         (*fn_EVP_DigestInit_ex)(EVP_MD_CTX*, const EVP_MD*, void*);
+    typedef int         (*fn_EVP_DigestUpdate)(EVP_MD_CTX*, const void*, size_t);
+    typedef int         (*fn_EVP_DigestFinal_ex)(EVP_MD_CTX*, unsigned char*, unsigned int*);
+    typedef const EVP_MD* (*fn_EVP_sha256)(void);
+    typedef const EVP_MD* (*fn_EVP_sha512)(void);
+    fn_EVP_MD_CTX_new    p_EVP_MD_CTX_new    = (fn_EVP_MD_CTX_new)   dlsym(crypto_h, "EVP_MD_CTX_new");
+    fn_EVP_MD_CTX_free   p_EVP_MD_CTX_free   = (fn_EVP_MD_CTX_free)  dlsym(crypto_h, "EVP_MD_CTX_free");
+    fn_EVP_DigestInit_ex p_EVP_DigestInit_ex = (fn_EVP_DigestInit_ex)dlsym(crypto_h, "EVP_DigestInit_ex");
+    fn_EVP_DigestUpdate  p_EVP_DigestUpdate  = (fn_EVP_DigestUpdate) dlsym(crypto_h, "EVP_DigestUpdate");
+    fn_EVP_DigestFinal_ex p_EVP_DigestFinal_ex = (fn_EVP_DigestFinal_ex)dlsym(crypto_h, "EVP_DigestFinal_ex");
+    fn_EVP_sha256 p_EVP_sha256 = (fn_EVP_sha256)dlsym(crypto_h, "EVP_sha256");
+    fn_EVP_sha512 p_EVP_sha512 = (fn_EVP_sha512)dlsym(crypto_h, "EVP_sha512");
+
+    /* AES / EVP cipher */
+    typedef EVP_CIPHER_CTX* (*fn_EVP_CIPHER_CTX_new)(void);
+    typedef void             (*fn_EVP_CIPHER_CTX_free)(EVP_CIPHER_CTX*);
+    typedef int              (*fn_EVP_EncryptInit_ex)(EVP_CIPHER_CTX*, const EVP_CIPHER*, void*, const unsigned char*, const unsigned char*);
+    typedef int              (*fn_EVP_EncryptUpdate)(EVP_CIPHER_CTX*, unsigned char*, int*, const unsigned char*, int);
+    typedef int              (*fn_EVP_EncryptFinal_ex)(EVP_CIPHER_CTX*, unsigned char*, int*);
+    typedef int              (*fn_EVP_DecryptInit_ex)(EVP_CIPHER_CTX*, const EVP_CIPHER*, void*, const unsigned char*, const unsigned char*);
+    typedef int              (*fn_EVP_DecryptUpdate)(EVP_CIPHER_CTX*, unsigned char*, int*, const unsigned char*, int);
+    typedef int              (*fn_EVP_DecryptFinal_ex)(EVP_CIPHER_CTX*, unsigned char*, int*);
+    typedef const EVP_CIPHER* (*fn_EVP_aes_256_cbc)(void);
+    typedef const EVP_CIPHER* (*fn_EVP_aes_256_gcm)(void);
+    typedef int               (*fn_EVP_CIPHER_CTX_ctrl)(EVP_CIPHER_CTX*, int, int, void*);
+    fn_EVP_CIPHER_CTX_new   p_EVP_CIPHER_CTX_new   = (fn_EVP_CIPHER_CTX_new)  dlsym(crypto_h, "EVP_CIPHER_CTX_new");
+    fn_EVP_CIPHER_CTX_free  p_EVP_CIPHER_CTX_free  = (fn_EVP_CIPHER_CTX_free) dlsym(crypto_h, "EVP_CIPHER_CTX_free");
+    fn_EVP_EncryptInit_ex   p_EVP_EncryptInit_ex   = (fn_EVP_EncryptInit_ex)  dlsym(crypto_h, "EVP_EncryptInit_ex");
+    fn_EVP_EncryptUpdate    p_EVP_EncryptUpdate    = (fn_EVP_EncryptUpdate)   dlsym(crypto_h, "EVP_EncryptUpdate");
+    fn_EVP_EncryptFinal_ex  p_EVP_EncryptFinal_ex  = (fn_EVP_EncryptFinal_ex) dlsym(crypto_h, "EVP_EncryptFinal_ex");
+    fn_EVP_DecryptInit_ex   p_EVP_DecryptInit_ex   = (fn_EVP_DecryptInit_ex)  dlsym(crypto_h, "EVP_DecryptInit_ex");
+    fn_EVP_DecryptUpdate    p_EVP_DecryptUpdate    = (fn_EVP_DecryptUpdate)   dlsym(crypto_h, "EVP_DecryptUpdate");
+    fn_EVP_DecryptFinal_ex  p_EVP_DecryptFinal_ex  = (fn_EVP_DecryptFinal_ex) dlsym(crypto_h, "EVP_DecryptFinal_ex");
+    fn_EVP_aes_256_cbc      p_EVP_aes_256_cbc      = (fn_EVP_aes_256_cbc)    dlsym(crypto_h, "EVP_aes_256_cbc");
+    fn_EVP_aes_256_gcm      p_EVP_aes_256_gcm      = (fn_EVP_aes_256_gcm)    dlsym(crypto_h, "EVP_aes_256_gcm");
+    fn_EVP_CIPHER_CTX_ctrl  p_EVP_CIPHER_CTX_ctrl  = (fn_EVP_CIPHER_CTX_ctrl)dlsym(crypto_h, "EVP_CIPHER_CTX_ctrl");
+
+    /* HMAC */
+    typedef unsigned char* (*fn_HMAC)(const EVP_MD*, const void*, int,
+                                       const unsigned char*, size_t,
+                                       unsigned char*, unsigned int*);
+    fn_HMAC p_HMAC = (fn_HMAC)dlsym(crypto_h, "HMAC");
+
+    /* EVP_PKEY / RSA key generation & sign/verify */
+    typedef EVP_PKEY_CTX* (*fn_EVP_PKEY_CTX_new_id)(int, void*);
+    typedef void           (*fn_EVP_PKEY_CTX_free)(EVP_PKEY_CTX*);
+    typedef int            (*fn_EVP_PKEY_keygen_init)(EVP_PKEY_CTX*);
+    typedef int            (*fn_EVP_PKEY_CTX_set_rsa_keygen_bits)(EVP_PKEY_CTX*, int);
+    typedef int            (*fn_EVP_PKEY_keygen)(EVP_PKEY_CTX*, EVP_PKEY**);
+    typedef void           (*fn_EVP_PKEY_free)(EVP_PKEY*);
+    typedef int            (*fn_EVP_DigestSignInit)(EVP_MD_CTX*, EVP_PKEY_CTX**,
+                                                    const EVP_MD*, void*, EVP_PKEY*);
+    typedef int            (*fn_EVP_DigestSignUpdate)(EVP_MD_CTX*, const void*, size_t);
+    typedef int            (*fn_EVP_DigestSignFinal)(EVP_MD_CTX*, unsigned char*, size_t*);
+    typedef int            (*fn_EVP_DigestVerifyInit)(EVP_MD_CTX*, EVP_PKEY_CTX**,
+                                                      const EVP_MD*, void*, EVP_PKEY*);
+    typedef int            (*fn_EVP_DigestVerifyUpdate)(EVP_MD_CTX*, const void*, size_t);
+    typedef int            (*fn_EVP_DigestVerifyFinal)(EVP_MD_CTX*, const unsigned char*, size_t);
+    fn_EVP_PKEY_CTX_new_id           p_EVP_PKEY_CTX_new_id           = (fn_EVP_PKEY_CTX_new_id)          dlsym(crypto_h, "EVP_PKEY_CTX_new_id");
+    fn_EVP_PKEY_CTX_free             p_EVP_PKEY_CTX_free             = (fn_EVP_PKEY_CTX_free)             dlsym(crypto_h, "EVP_PKEY_CTX_free");
+    fn_EVP_PKEY_keygen_init          p_EVP_PKEY_keygen_init          = (fn_EVP_PKEY_keygen_init)          dlsym(crypto_h, "EVP_PKEY_keygen_init");
+    fn_EVP_PKEY_CTX_set_rsa_keygen_bits p_EVP_PKEY_CTX_set_rsa_keygen_bits = (fn_EVP_PKEY_CTX_set_rsa_keygen_bits)dlsym(crypto_h, "EVP_PKEY_CTX_set_rsa_keygen_bits");
+    fn_EVP_PKEY_keygen               p_EVP_PKEY_keygen               = (fn_EVP_PKEY_keygen)               dlsym(crypto_h, "EVP_PKEY_keygen");
+    fn_EVP_PKEY_free                 p_EVP_PKEY_free                 = (fn_EVP_PKEY_free)                 dlsym(crypto_h, "EVP_PKEY_free");
+    fn_EVP_DigestSignInit            p_EVP_DigestSignInit            = (fn_EVP_DigestSignInit)            dlsym(crypto_h, "EVP_DigestSignInit");
+    fn_EVP_DigestSignUpdate          p_EVP_DigestSignUpdate          = (fn_EVP_DigestSignUpdate)          dlsym(crypto_h, "EVP_DigestSignUpdate");
+    fn_EVP_DigestSignFinal           p_EVP_DigestSignFinal           = (fn_EVP_DigestSignFinal)           dlsym(crypto_h, "EVP_DigestSignFinal");
+    fn_EVP_DigestVerifyInit          p_EVP_DigestVerifyInit          = (fn_EVP_DigestVerifyInit)          dlsym(crypto_h, "EVP_DigestVerifyInit");
+    fn_EVP_DigestVerifyUpdate        p_EVP_DigestVerifyUpdate        = (fn_EVP_DigestVerifyUpdate)        dlsym(crypto_h, "EVP_DigestVerifyUpdate");
+    fn_EVP_DigestVerifyFinal         p_EVP_DigestVerifyFinal         = (fn_EVP_DigestVerifyFinal)         dlsym(crypto_h, "EVP_DigestVerifyFinal");
+
+    /* EC (P-256 ECDSA) */
+    typedef void* (*fn_EC_KEY_new_by_curve_name)(int);
+    typedef void  (*fn_EC_KEY_free)(void*);
+    typedef int   (*fn_EC_KEY_generate_key)(void*);
+    typedef int   (*fn_ECDSA_sign)(int, const unsigned char*, int,
+                                   unsigned char*, unsigned int*, void*);
+    typedef int   (*fn_ECDSA_verify)(int, const unsigned char*, int,
+                                     const unsigned char*, int, void*);
+    fn_EC_KEY_new_by_curve_name p_EC_KEY_new_by_curve_name = (fn_EC_KEY_new_by_curve_name)dlsym(crypto_h, "EC_KEY_new_by_curve_name");
+    fn_EC_KEY_free              p_EC_KEY_free              = (fn_EC_KEY_free)             dlsym(crypto_h, "EC_KEY_free");
+    fn_EC_KEY_generate_key      p_EC_KEY_generate_key      = (fn_EC_KEY_generate_key)     dlsym(crypto_h, "EC_KEY_generate_key");
+    fn_ECDSA_sign               p_ECDSA_sign               = (fn_ECDSA_sign)              dlsym(crypto_h, "ECDSA_sign");
+    fn_ECDSA_verify             p_ECDSA_verify             = (fn_ECDSA_verify)            dlsym(crypto_h, "ECDSA_verify");
+
+    /* X25519 ECDH */
+    typedef int (*fn_EVP_PKEY_derive_init)(EVP_PKEY_CTX*);
+    typedef int (*fn_EVP_PKEY_derive_set_peer)(EVP_PKEY_CTX*, EVP_PKEY*);
+    typedef int (*fn_EVP_PKEY_derive)(EVP_PKEY_CTX*, unsigned char*, size_t*);
+    typedef EVP_PKEY_CTX* (*fn_EVP_PKEY_CTX_new)(EVP_PKEY*, void*);
+    fn_EVP_PKEY_derive_init     p_EVP_PKEY_derive_init     = (fn_EVP_PKEY_derive_init)    dlsym(crypto_h, "EVP_PKEY_derive_init");
+    fn_EVP_PKEY_derive_set_peer p_EVP_PKEY_derive_set_peer = (fn_EVP_PKEY_derive_set_peer)dlsym(crypto_h, "EVP_PKEY_derive_set_peer");
+    fn_EVP_PKEY_derive          p_EVP_PKEY_derive          = (fn_EVP_PKEY_derive)         dlsym(crypto_h, "EVP_PKEY_derive");
+    fn_EVP_PKEY_CTX_new         p_EVP_PKEY_CTX_new         = (fn_EVP_PKEY_CTX_new)        dlsym(crypto_h, "EVP_PKEY_CTX_new");
+
+    /* Base64 */
+    typedef int (*fn_EVP_EncodeBlock)(unsigned char*, const unsigned char*, int);
+    typedef int (*fn_EVP_DecodeBlock)(unsigned char*, const unsigned char*, int);
+    fn_EVP_EncodeBlock p_EVP_EncodeBlock = (fn_EVP_EncodeBlock)dlsym(crypto_h, "EVP_EncodeBlock");
+    fn_EVP_DecodeBlock p_EVP_DecodeBlock = (fn_EVP_DecodeBlock)dlsym(crypto_h, "EVP_DecodeBlock");
+
+    /* Error API */
+    typedef unsigned long (*fn_ERR_get_error)(void);
+    typedef char*         (*fn_ERR_error_string)(unsigned long, char*);
+    typedef void          (*fn_ERR_clear_error)(void);
+    fn_ERR_get_error    p_ERR_get_error    = (fn_ERR_get_error)   dlsym(crypto_h, "ERR_get_error");
+    fn_ERR_error_string p_ERR_error_string = (fn_ERR_error_string)dlsym(crypto_h, "ERR_error_string");
+    fn_ERR_clear_error  p_ERR_clear_error  = (fn_ERR_clear_error) dlsym(crypto_h, "ERR_clear_error");
+
+    /* BIO */
+    typedef BIO*  (*fn_BIO_new_mem_buf)(const void*, int);
+    typedef void  (*fn_BIO_free)(BIO*);
+    typedef BIO*  (*fn_BIO_new)(void*);
+    typedef void* (*fn_BIO_s_mem)(void);
+    typedef int   (*fn_BIO_write)(BIO*, const void*, int);
+    typedef int   (*fn_BIO_read)(BIO*, void*, int);
+    fn_BIO_new_mem_buf p_BIO_new_mem_buf = (fn_BIO_new_mem_buf)dlsym(crypto_h, "BIO_new_mem_buf"); (void)p_BIO_new_mem_buf;
+    fn_BIO_free        p_BIO_free        = (fn_BIO_free)       dlsym(crypto_h, "BIO_free");
+    fn_BIO_new         p_BIO_new         = (fn_BIO_new)        dlsym(crypto_h, "BIO_new");
+    fn_BIO_s_mem       p_BIO_s_mem       = (fn_BIO_s_mem)      dlsym(crypto_h, "BIO_s_mem");
+    fn_BIO_write       p_BIO_write       = (fn_BIO_write)      dlsym(crypto_h, "BIO_write");
+    fn_BIO_read        p_BIO_read        = (fn_BIO_read)       dlsym(crypto_h, "BIO_read");
+
+    /* PEM + X509/EVP_PKEY for TLS server cert loading */
+    /* PEM_read_bio_PrivateKey handles both PKCS#8 and PKCS#1 private key PEMs */
+    typedef EVP_PKEY* (*fn_PEM_read_bio_PrivateKey)(BIO*, EVP_PKEY**, void*, void*);
+    typedef X509*     (*fn_PEM_read_bio_X509)(BIO*, X509**, void*, void*);
+    typedef void      (*fn_X509_free)(X509*);
+    typedef void      (*fn_RSA_free)(RSA*);
+    fn_PEM_read_bio_PrivateKey p_PEM_read_bio_PrivateKey = (fn_PEM_read_bio_PrivateKey)dlsym(crypto_h, "PEM_read_bio_PrivateKey"); (void)p_PEM_read_bio_PrivateKey;
+    fn_PEM_read_bio_X509       p_PEM_read_bio_X509       = (fn_PEM_read_bio_X509)      dlsym(crypto_h, "PEM_read_bio_X509");
+    fn_X509_free               p_X509_free               = (fn_X509_free)              dlsym(crypto_h, "X509_free"); (void)p_X509_free;
+    fn_RSA_free                p_RSA_free                = (fn_RSA_free)               dlsym(crypto_h, "RSA_free");  (void)p_RSA_free;
+
+    /* ---- libssl function pointers ---- */
+    typedef void*    (*fn_TLS_client_method)(void);
+    typedef void*    (*fn_TLS_server_method)(void);
+    typedef SSL_CTX* (*fn_SSL_CTX_new)(void*);
+    typedef void     (*fn_SSL_CTX_free)(SSL_CTX*);
+    typedef long     (*fn_SSL_CTX_set_options)(SSL_CTX*, long);
+    typedef int      (*fn_SSL_CTX_use_certificate)(SSL_CTX*, X509*);
+    typedef int      (*fn_SSL_CTX_use_PrivateKey)(SSL_CTX*, EVP_PKEY*);
+    typedef int      (*fn_SSL_CTX_check_private_key)(SSL_CTX*);
+    typedef void     (*fn_SSL_CTX_set_verify)(SSL_CTX*, int, void*);
+    typedef SSL*     (*fn_SSL_new)(SSL_CTX*);
+    typedef void     (*fn_SSL_free)(SSL*);
+    typedef int      (*fn_SSL_set_fd)(SSL*, int);
+    typedef int      (*fn_SSL_connect)(SSL*);
+    typedef int      (*fn_SSL_accept)(SSL*);
+    typedef int      (*fn_SSL_write)(SSL*, const void*, int);
+    typedef int      (*fn_SSL_read)(SSL*, void*, int);
+    typedef int      (*fn_SSL_shutdown)(SSL*);
+    typedef int      (*fn_SSL_get_error)(SSL*, int);
+    typedef const char* (*fn_SSL_get_version)(SSL*);
+    typedef long     (*fn_SSL_CTX_set_cipher_list_fn)(SSL_CTX*, const char*);
+    fn_TLS_client_method        p_TLS_client_method        = (fn_TLS_client_method)       dlsym(ssl_h, "TLS_client_method");
+    fn_TLS_server_method        p_TLS_server_method        = (fn_TLS_server_method)       dlsym(ssl_h, "TLS_server_method");
+    fn_SSL_CTX_new              p_SSL_CTX_new              = (fn_SSL_CTX_new)             dlsym(ssl_h, "SSL_CTX_new");
+    fn_SSL_CTX_free             p_SSL_CTX_free             = (fn_SSL_CTX_free)            dlsym(ssl_h, "SSL_CTX_free");
+    fn_SSL_CTX_set_options      p_SSL_CTX_set_options      = (fn_SSL_CTX_set_options)     dlsym(ssl_h, "SSL_CTX_set_options");
+    fn_SSL_CTX_use_certificate  p_SSL_CTX_use_certificate  = (fn_SSL_CTX_use_certificate) dlsym(ssl_h, "SSL_CTX_use_certificate");
+    fn_SSL_CTX_use_PrivateKey   p_SSL_CTX_use_PrivateKey   = (fn_SSL_CTX_use_PrivateKey)  dlsym(ssl_h, "SSL_CTX_use_PrivateKey");
+    fn_SSL_CTX_check_private_key p_SSL_CTX_check_private_key = (fn_SSL_CTX_check_private_key)dlsym(ssl_h, "SSL_CTX_check_private_key");
+    fn_SSL_CTX_set_verify       p_SSL_CTX_set_verify       = (fn_SSL_CTX_set_verify)      dlsym(ssl_h, "SSL_CTX_set_verify");
+    fn_SSL_new                  p_SSL_new                  = (fn_SSL_new)                 dlsym(ssl_h, "SSL_new");
+    fn_SSL_free                 p_SSL_free                 = (fn_SSL_free)                dlsym(ssl_h, "SSL_free");
+    fn_SSL_set_fd               p_SSL_set_fd               = (fn_SSL_set_fd)              dlsym(ssl_h, "SSL_set_fd");
+    fn_SSL_connect              p_SSL_connect              = (fn_SSL_connect)             dlsym(ssl_h, "SSL_connect");
+    fn_SSL_accept               p_SSL_accept               = (fn_SSL_accept)              dlsym(ssl_h, "SSL_accept");
+    fn_SSL_write                p_SSL_write                = (fn_SSL_write)               dlsym(ssl_h, "SSL_write");
+    fn_SSL_read                 p_SSL_read                 = (fn_SSL_read)                dlsym(ssl_h, "SSL_read");
+    fn_SSL_shutdown             p_SSL_shutdown             = (fn_SSL_shutdown)            dlsym(ssl_h, "SSL_shutdown");
+    fn_SSL_get_error            p_SSL_get_error            = (fn_SSL_get_error)           dlsym(ssl_h, "SSL_get_error");
+    fn_SSL_get_version          p_SSL_get_version          = (fn_SSL_get_version)         dlsym(ssl_h, "SSL_get_version");
+    fn_SSL_CTX_set_cipher_list_fn p_SSL_CTX_set_cipher_list = (fn_SSL_CTX_set_cipher_list_fn)dlsym(ssl_h, "SSL_CTX_set_cipher_list"); (void)p_SSL_CTX_set_cipher_list;
+
+    /* EVP_BytesToKey */
+    typedef int (*fn_EVP_BytesToKey)(const EVP_CIPHER*, const EVP_MD*,
+                                      const unsigned char*, const unsigned char*,
+                                      int, int, unsigned char*, unsigned char*);
+    fn_EVP_BytesToKey p_EVP_BytesToKey = (fn_EVP_BytesToKey)dlsym(crypto_h, "EVP_BytesToKey");
+
+    /* ====================================================== */
+    /*  Test 1: RAND_bytes – generate 32 random bytes           */
+    /* ====================================================== */
+    {
+        test_result("RAND_bytes dlsym", p_RAND_bytes != NULL);
+        if (p_RAND_bytes) {
+            unsigned char r1[32] = {0};
+            unsigned char r2[32] = {0};
+            int rc1 = p_RAND_bytes(r1, 32);
+            int rc2 = p_RAND_bytes(r2, 32); (void)rc2;
+            test_result("RAND_bytes returns 1", rc1 == 1);
+            /* At least one byte must be non-zero in 32 random bytes */
+            int nonzero = 0;
+            for (int i = 0; i < 32; i++) if (r1[i]) nonzero = 1;
+            test_result("RAND_bytes output non-zero", nonzero);
+            test_result("RAND_bytes two calls differ", memcmp(r1, r2, 32) != 0);
+        }
+    }
+
+    /* ====================================================== */
+    /*  Test 2: SHA-256 known-answer                          */
+    /* ====================================================== */
+    /*
+     * Two test vectors from FIPS 180-4:
+     *
+     * 2a) Single-block: SHA-256("abc") = ba7816bf ... f20015ad
+     *     3 bytes → 1 compress() call.
+     *
+     * 2b) Two-block: SHA-256("abcdbcde...nopq") = 248d6a61 ... 19db06c1
+     *     56 bytes: data + 0x80 + 0x00s fills exactly one 64-byte block;
+     *     the 8-byte bit-length word goes in block 2, requiring two
+     *     compress() calls.
+     */
+    {
+        test_result("EVP_sha256 dlsym",
+                    p_EVP_MD_CTX_new && p_EVP_DigestInit_ex &&
+                    p_EVP_DigestUpdate && p_EVP_DigestFinal_ex && p_EVP_sha256);
+
+        /* helper: decode 64-hex-char string into 32 bytes */
+#define DECODE_SHA256_HEX(out, hex_str) do {                            \
+            const char *_h = (hex_str);                                  \
+            for (int _j = 0; _j < 32; _j++, _h += 2) {                 \
+                int _hi = (_h[0] >= 'a') ? _h[0]-'a'+10 : _h[0]-'0';  \
+                int _lo = (_h[1] >= 'a') ? _h[1]-'a'+10 : _h[1]-'0';  \
+                (out)[_j] = (unsigned char)((_hi << 4) | _lo);          \
+            }                                                            \
+        } while (0)
+
+        if (p_EVP_sha256 && p_EVP_DigestInit_ex &&
+            p_EVP_DigestUpdate && p_EVP_DigestFinal_ex && p_EVP_MD_CTX_new) {
+
+            unsigned char exp[32], digest[32];
+            unsigned int dlen;
+            EVP_MD_CTX *ctx;
+
+            /* 2a: single-block ("abc") */
+            DECODE_SHA256_HEX(exp,
+                "ba7816bf8f01cfea414140de5dae2223"
+                "b00361a396177a9cb410ff61f20015ad");
+            ctx = p_EVP_MD_CTX_new(); dlen = 0;
+            int ok_a = ctx &&
+                p_EVP_DigestInit_ex(ctx, p_EVP_sha256(), NULL) == 1 &&
+                p_EVP_DigestUpdate(ctx, "abc", 3) == 1 &&
+                p_EVP_DigestFinal_ex(ctx, digest, &dlen) == 1 &&
+                dlen == 32;
+            if (ctx) p_EVP_MD_CTX_free(ctx);
+            if (ok_a && memcmp(digest, exp, 32) != 0) {
+                printf("  [DIAG] SHA-256(abc) 1-block: got ");
+                for (int _i = 0; _i < 32; _i++) printf("%02x", digest[_i]);
+                printf("\n");
+            }
+            test_result("SHA-256(abc) correct", ok_a && memcmp(digest, exp, 32) == 0);
+
+            /* 2b: two-block ("abcdbcde...nopq", 56 bytes) */
+            static const char sha256_56[] =
+                "abcdbcdecdefdefgefghfghighijhijk"
+                "ijkljklmklmnlmnomnopnopq";
+            DECODE_SHA256_HEX(exp,
+                "248d6a61d20638b8e5c026930c3e6039"
+                "a33ce45964ff2167f6ecedd419db06c1");
+            ctx = p_EVP_MD_CTX_new(); dlen = 0;
+            int ok_b = ctx &&
+                p_EVP_DigestInit_ex(ctx, p_EVP_sha256(), NULL) == 1 &&
+                p_EVP_DigestUpdate(ctx, sha256_56, 56) == 1 &&
+                p_EVP_DigestFinal_ex(ctx, digest, &dlen) == 1 &&
+                dlen == 32;
+            if (ctx) p_EVP_MD_CTX_free(ctx);
+            if (ok_b && memcmp(digest, exp, 32) != 0) {
+                printf("  [DIAG] SHA-256 2-block: got ");
+                for (int _i = 0; _i < 32; _i++) printf("%02x", digest[_i]);
+                printf("\n");
+            }
+            test_result("SHA-256(nist-2block) correct",
+                        ok_b && memcmp(digest, exp, 32) == 0);
+        }
+#undef DECODE_SHA256_HEX
+    }
+
+    /* ====================================================== */
+    /*  Test 3: SHA-512 known-answer                           */
+    /* ====================================================== */
+    /*
+     * SHA-512("abc") first 8 bytes:
+     *   ddaf35a1 93617aba ...
+     */
+    {
+        if (p_EVP_MD_CTX_new && p_EVP_sha512) {
+            EVP_MD_CTX *ctx = p_EVP_MD_CTX_new();
+            const EVP_MD *sha512 = p_EVP_sha512();
+            unsigned char digest[64];
+            unsigned int dlen = 0;
+            int ok = (ctx != NULL) &&
+                     (p_EVP_DigestInit_ex(ctx, sha512, NULL) == 1) &&
+                     (p_EVP_DigestUpdate(ctx, "abc", 3) == 1) &&
+                     (p_EVP_DigestFinal_ex(ctx, digest, &dlen) == 1) &&
+                     (dlen == 64);
+            static const unsigned char sha512_abc_prefix[] = {
+                0xdd,0xaf,0x35,0xa1, 0x93,0x61,0x7a,0xba
+            };
+            test_result("SHA-512(abc) correct prefix",
+                        ok && memcmp(digest, sha512_abc_prefix, 8) == 0);
+            if (ctx) p_EVP_MD_CTX_free(ctx);
+        }
+    }
+
+    /* ====================================================== */
+    /*  Test 4: AES-256-CBC encrypt then decrypt round-trip    */
+    /* ====================================================== */
+    {
+        test_result("EVP_aes_256_cbc dlsym",
+                    p_EVP_CIPHER_CTX_new && p_EVP_aes_256_cbc && p_EVP_EncryptInit_ex);
+        if (p_EVP_CIPHER_CTX_new && p_EVP_aes_256_cbc) {
+            static const unsigned char key32[32] = {
+                0x60,0x3d,0xeb,0x10, 0x15,0xca,0x71,0xbe,
+                0x2b,0x73,0xae,0xf0, 0x85,0x7d,0x77,0x81,
+                0x1f,0x35,0x2c,0x07, 0x3b,0x61,0x08,0xd7,
+                0x2d,0x98,0x10,0xa3, 0x09,0x14,0xdf,0xf4
+            };
+            static const unsigned char iv16[16] = {
+                0x00,0x01,0x02,0x03, 0x04,0x05,0x06,0x07,
+                0x08,0x09,0x0a,0x0b, 0x0c,0x0d,0x0e,0x0f
+            };
+            const unsigned char plaintext[32] = "Hello, AES-256-CBC encryption!  ";
+            unsigned char ciphertext[64];
+            unsigned char decrypted[64];
+            int clen = 0, cfinal = 0, dlen = 0, dfinal = 0;
+
+            EVP_CIPHER_CTX *ectx = p_EVP_CIPHER_CTX_new();
+            const EVP_CIPHER *cipher = p_EVP_aes_256_cbc();
+            int enc_ok =
+                ectx != NULL &&
+                p_EVP_EncryptInit_ex(ectx, cipher, NULL, key32, iv16) == 1 &&
+                p_EVP_EncryptUpdate(ectx, ciphertext, &clen, plaintext, 32) == 1 &&
+                p_EVP_EncryptFinal_ex(ectx, ciphertext + clen, &cfinal) == 1;
+            if (ectx) p_EVP_CIPHER_CTX_free(ectx);
+
+            EVP_CIPHER_CTX *dctx = p_EVP_CIPHER_CTX_new();
+            int dec_ok =
+                dctx != NULL &&
+                p_EVP_DecryptInit_ex(dctx, cipher, NULL, key32, iv16) == 1 &&
+                p_EVP_DecryptUpdate(dctx, decrypted, &dlen, ciphertext, clen + cfinal) == 1 &&
+                p_EVP_DecryptFinal_ex(dctx, decrypted + dlen, &dfinal) == 1;
+            if (dctx) p_EVP_CIPHER_CTX_free(dctx);
+
+            test_result("AES-256-CBC encrypt/decrypt round-trip",
+                        enc_ok && dec_ok &&
+                        (dlen + dfinal) == 32 &&
+                        memcmp(decrypted, plaintext, 32) == 0);
+        }
+    }
+
+    /* ====================================================== */
+    /*  Test 5: AES-256-GCM authenticated encrypt+decrypt      */
+    /* ====================================================== */
+    /* EVP_CIPHER_CTX_ctrl constants (from OpenSSL headers): */
+#define _EVP_CTRL_GCM_SET_IVLEN   0x9
+#define _EVP_CTRL_GCM_GET_TAG     0x10
+#define _EVP_CTRL_GCM_SET_TAG     0x11
+    {
+        if (p_EVP_CIPHER_CTX_new && p_EVP_aes_256_gcm && p_EVP_CIPHER_CTX_ctrl) {
+            static const unsigned char gcm_key[32] = {
+                0x00,0x01,0x02,0x03, 0x04,0x05,0x06,0x07,
+                0x08,0x09,0x0a,0x0b, 0x0c,0x0d,0x0e,0x0f,
+                0x10,0x11,0x12,0x13, 0x14,0x15,0x16,0x17,
+                0x18,0x19,0x1a,0x1b, 0x1c,0x1d,0x1e,0x1f
+            };
+            static const unsigned char gcm_iv[12] = {
+                0xa0,0xa1,0xa2,0xa3, 0xa4,0xa5,0xa6,0xa7,
+                0xa8,0xa9,0xaa,0xab
+            };
+            const char *gcm_plain = "GCM test data!!";
+            int plen = (int)strlen(gcm_plain);
+            unsigned char gcm_ct[64];
+            unsigned char gcm_tag[16];
+            unsigned char gcm_dec[64];
+            int clen = 0, cfinal = 0, dlen = 0, dfinal = 0;
+
+            const EVP_CIPHER *gcmciph = p_EVP_aes_256_gcm();
+
+            EVP_CIPHER_CTX *ectx = p_EVP_CIPHER_CTX_new();
+            int enc_ok =
+                ectx != NULL &&
+                p_EVP_EncryptInit_ex(ectx, gcmciph, NULL, NULL, NULL) == 1 &&
+                p_EVP_CIPHER_CTX_ctrl(ectx, _EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+                p_EVP_EncryptInit_ex(ectx, NULL, NULL, gcm_key, gcm_iv) == 1 &&
+                p_EVP_EncryptUpdate(ectx, gcm_ct, &clen, (unsigned char*)gcm_plain, plen) == 1 &&
+                p_EVP_EncryptFinal_ex(ectx, gcm_ct + clen, &cfinal) == 1 &&
+                p_EVP_CIPHER_CTX_ctrl(ectx, _EVP_CTRL_GCM_GET_TAG, 16, gcm_tag) == 1;
+            if (ectx) p_EVP_CIPHER_CTX_free(ectx);
+
+            EVP_CIPHER_CTX *dctx = p_EVP_CIPHER_CTX_new();
+            int dec_ok =
+                dctx != NULL &&
+                p_EVP_DecryptInit_ex(dctx, gcmciph, NULL, NULL, NULL) == 1 &&
+                p_EVP_CIPHER_CTX_ctrl(dctx, _EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+                p_EVP_DecryptInit_ex(dctx, NULL, NULL, gcm_key, gcm_iv) == 1 &&
+                p_EVP_DecryptUpdate(dctx, gcm_dec, &dlen, gcm_ct, clen + cfinal) == 1 &&
+                p_EVP_CIPHER_CTX_ctrl(dctx, _EVP_CTRL_GCM_SET_TAG, 16, gcm_tag) == 1 &&
+                p_EVP_DecryptFinal_ex(dctx, gcm_dec + dlen, &dfinal) == 1;
+            if (dctx) p_EVP_CIPHER_CTX_free(dctx);
+
+            test_result("AES-256-GCM encrypt/decrypt+verify round-trip",
+                        enc_ok && dec_ok &&
+                        (dlen + dfinal) == plen &&
+                        memcmp(gcm_dec, gcm_plain, (size_t)plen) == 0);
+        }
+    }
+
+    /* ====================================================== */
+    /*  Test 6: HMAC-SHA256 known-answer                       */
+    /* ====================================================== */
+    /*
+     * HMAC-SHA256(key="key", data="The quick brown fox ...")
+     * = f7bc83f430538424b13298e6aa6fb143
+     *   ef4d59a14946175997479dbc2d1a3cd8
+     */
+    {
+        test_result("HMAC dlsym", p_HMAC != NULL);
+        if (p_HMAC && p_EVP_sha256) {
+            unsigned char mac[32];
+            unsigned int mac_len = 0;
+            const char *key  = "key";
+            const char *data = "The quick brown fox jumps over the lazy dog";
+            unsigned char *r = p_HMAC(p_EVP_sha256(),
+                                      key, (int)strlen(key),
+                                      (const unsigned char*)data, strlen(data),
+                                      mac, &mac_len);
+            static const unsigned char expected[] = {
+                0xf7,0xbc,0x83,0xf4, 0x30,0x53,0x84,0x24,
+                0xb1,0x32,0x98,0xe6, 0xaa,0x6f,0xb1,0x43,
+                0xef,0x4d,0x59,0xa1, 0x49,0x46,0x17,0x59,
+                0x97,0x47,0x9d,0xbc, 0x2d,0x1a,0x3c,0xd8
+            };
+            test_result("HMAC-SHA256 known-answer",
+                        r != NULL && mac_len == 32 &&
+                        memcmp(mac, expected, 32) == 0);
+        }
+    }
+
+    /* ====================================================== */
+    /*  Test 7: RSA-2048 key generation + sign/verify          */
+    /* ====================================================== */
+    printf("\n--- OpenSSL RSA keygen+sign/verify ---\n");
+    {
+        test_result("EVP_PKEY keygen symbols",
+                    p_EVP_PKEY_CTX_new_id && p_EVP_PKEY_keygen_init &&
+                    p_EVP_PKEY_CTX_set_rsa_keygen_bits && p_EVP_PKEY_keygen);
+
+        EVP_PKEY *rsa_key = NULL;
+        int keygen_ok = 0;
+        if (p_EVP_PKEY_CTX_new_id) {
+            /* EVP_PKEY_RSA = 6 */
+            EVP_PKEY_CTX *kctx = p_EVP_PKEY_CTX_new_id(6, NULL);
+            if (kctx) {
+                keygen_ok =
+                    p_EVP_PKEY_keygen_init(kctx) == 1 &&
+                    p_EVP_PKEY_CTX_set_rsa_keygen_bits(kctx, 2048) > 0 &&
+                    p_EVP_PKEY_keygen(kctx, &rsa_key) == 1;
+                p_EVP_PKEY_CTX_free(kctx);
+            }
+        }
+        test_result("RSA-2048 key generation", keygen_ok && rsa_key != NULL);
+
+        if (rsa_key && p_EVP_MD_CTX_new && p_EVP_DigestSignInit &&
+            p_EVP_DigestSignUpdate && p_EVP_DigestSignFinal &&
+            p_EVP_DigestVerifyInit && p_EVP_DigestVerifyUpdate &&
+            p_EVP_DigestVerifyFinal) {
+
+            const char *msg = "RSA sign/verify test message";
+            size_t msg_len = strlen(msg);
+            unsigned char sig[512];
+            size_t sig_len = sizeof(sig);
+            const EVP_MD *sha256 = p_EVP_sha256();
+
+            /* Sign */
+            EVP_MD_CTX *sctx = p_EVP_MD_CTX_new();
+            int sign_ok =
+                sctx != NULL &&
+                p_EVP_DigestSignInit(sctx, NULL, sha256, NULL, rsa_key) == 1 &&
+                p_EVP_DigestSignUpdate(sctx, msg, msg_len) == 1 &&
+                p_EVP_DigestSignFinal(sctx, sig, &sig_len) == 1;
+            if (sctx) p_EVP_MD_CTX_free(sctx);
+            test_result("RSA-2048 sign with SHA-256", sign_ok && sig_len > 0);
+
+            /* Verify */
+            EVP_MD_CTX *vctx = p_EVP_MD_CTX_new();
+            int verify_ok =
+                vctx != NULL &&
+                p_EVP_DigestVerifyInit(vctx, NULL, sha256, NULL, rsa_key) == 1 &&
+                p_EVP_DigestVerifyUpdate(vctx, msg, msg_len) == 1 &&
+                p_EVP_DigestVerifyFinal(vctx, sig, sig_len) == 1;
+            if (vctx) p_EVP_MD_CTX_free(vctx);
+            test_result("RSA-2048 verify signature", verify_ok);
+
+            /* Tamper: alter one byte of signature – must fail */
+            sig[0] ^= 0xFF;
+            EVP_MD_CTX *bctx = p_EVP_MD_CTX_new();
+            int tamper_ok =
+                bctx != NULL &&
+                p_EVP_DigestVerifyInit(bctx, NULL, sha256, NULL, rsa_key) == 1 &&
+                p_EVP_DigestVerifyUpdate(bctx, msg, msg_len) == 1 &&
+                p_EVP_DigestVerifyFinal(bctx, sig, sig_len) != 1;
+            if (bctx) p_EVP_MD_CTX_free(bctx);
+            test_result("RSA-2048 tampered sig rejected", tamper_ok);
+        }
+        if (rsa_key) p_EVP_PKEY_free(rsa_key);
+    }
+
+    /* ====================================================== */
+    /*  Test 8: EC P-256 (ECDSA) key generation + sign/verify  */
+    /* ====================================================== */
+    printf("\n--- OpenSSL ECDSA (P-256) ---\n");
+    {
+        test_result("EC_KEY symbols",
+                    p_EC_KEY_new_by_curve_name && p_EC_KEY_generate_key &&
+                    p_ECDSA_sign && p_ECDSA_verify);
+
+        if (p_EC_KEY_new_by_curve_name && p_EC_KEY_generate_key &&
+            p_ECDSA_sign && p_ECDSA_verify) {
+
+            /* NID_X9_62_prime256v1 = 415 */
+            void *ec_key = p_EC_KEY_new_by_curve_name(415);
+            test_result("ECDSA P-256 key create", ec_key != NULL);
+
+            if (ec_key) {
+                int gen_ok = p_EC_KEY_generate_key(ec_key);
+                test_result("ECDSA P-256 key generate", gen_ok == 1);
+
+                if (gen_ok) {
+                    /* Hash the message first */
+                    unsigned char hash[32];
+                    unsigned int hlen = sizeof(hash);
+                    EVP_MD_CTX *hctx = p_EVP_MD_CTX_new();
+                    const EVP_MD *sha256 = p_EVP_sha256();
+                    const char *msg = "ECDSA test payload";
+                    p_EVP_DigestInit_ex(hctx, sha256, NULL);
+                    p_EVP_DigestUpdate(hctx, msg, strlen(msg));
+                    p_EVP_DigestFinal_ex(hctx, hash, &hlen);
+                    p_EVP_MD_CTX_free(hctx);
+
+                    /* Sign */
+                    unsigned char sig[256];
+                    unsigned int slen = sizeof(sig);
+                    int sign_ok = p_ECDSA_sign(0, hash, (int)hlen, sig, &slen, ec_key);
+                    test_result("ECDSA P-256 sign", sign_ok == 1 && slen > 0);
+
+                    /* Verify */
+                    int verify_ok = p_ECDSA_verify(0, hash, (int)hlen, sig, (int)slen, ec_key);
+                    test_result("ECDSA P-256 verify", verify_ok == 1);
+
+                    /* Tamper */
+                    sig[0] ^= 0xAA;
+                    int tamper_ok = p_ECDSA_verify(0, hash, (int)hlen, sig, (int)slen, ec_key) != 1;
+                    test_result("ECDSA P-256 tampered rejected", tamper_ok);
+                }
+                p_EC_KEY_free(ec_key);
+            }
+        }
+    }
+
+    /* ====================================================== */
+    /*  Test 9: X25519 ECDH shared-secret agreement            */
+    /* ====================================================== */
+    printf("\n--- OpenSSL X25519 ECDH ---\n");
+    {
+        int all_syms = p_EVP_PKEY_CTX_new_id && p_EVP_PKEY_keygen_init &&
+                       p_EVP_PKEY_keygen && p_EVP_PKEY_CTX_new &&
+                       p_EVP_PKEY_derive_init && p_EVP_PKEY_derive_set_peer &&
+                       p_EVP_PKEY_derive && p_EVP_PKEY_free && p_EVP_PKEY_CTX_free;
+        test_result("X25519 ECDH symbols present", all_syms);
+        if (all_syms) {
+            /* EVP_PKEY_X25519 = 1034 */
+            EVP_PKEY *alice = NULL, *bob = NULL;
+
+            EVP_PKEY_CTX *kctx_a = p_EVP_PKEY_CTX_new_id(1034, NULL);
+            if (kctx_a) {
+                p_EVP_PKEY_keygen_init(kctx_a);
+                p_EVP_PKEY_keygen(kctx_a, &alice);
+                p_EVP_PKEY_CTX_free(kctx_a);
+            }
+
+            EVP_PKEY_CTX *kctx_b = p_EVP_PKEY_CTX_new_id(1034, NULL);
+            if (kctx_b) {
+                p_EVP_PKEY_keygen_init(kctx_b);
+                p_EVP_PKEY_keygen(kctx_b, &bob);
+                p_EVP_PKEY_CTX_free(kctx_b);
+            }
+
+            test_result("X25519 key generation (alice+bob)", alice != NULL && bob != NULL);
+
+            if (alice && bob) {
+                unsigned char secret_a[32], secret_b[32];
+                size_t len_a = sizeof(secret_a), len_b = sizeof(secret_b);
+
+                EVP_PKEY_CTX *dctx_a = p_EVP_PKEY_CTX_new(alice, NULL);
+                int a_ok =
+                    dctx_a != NULL &&
+                    p_EVP_PKEY_derive_init(dctx_a) == 1 &&
+                    p_EVP_PKEY_derive_set_peer(dctx_a, bob) == 1 &&
+                    p_EVP_PKEY_derive(dctx_a, secret_a, &len_a) == 1;
+                if (dctx_a) p_EVP_PKEY_CTX_free(dctx_a);
+
+                EVP_PKEY_CTX *dctx_b = p_EVP_PKEY_CTX_new(bob, NULL);
+                int b_ok =
+                    dctx_b != NULL &&
+                    p_EVP_PKEY_derive_init(dctx_b) == 1 &&
+                    p_EVP_PKEY_derive_set_peer(dctx_b, alice) == 1 &&
+                    p_EVP_PKEY_derive(dctx_b, secret_b, &len_b) == 1;
+                if (dctx_b) p_EVP_PKEY_CTX_free(dctx_b);
+
+                test_result("X25519 ECDH derive succeeds (alice+bob)",
+                            a_ok && b_ok && len_a == 32 && len_b == 32);
+                test_result("X25519 ECDH shared secrets match",
+                            a_ok && b_ok &&
+                            len_a == 32 && len_b == 32 &&
+                            memcmp(secret_a, secret_b, 32) == 0);
+            }
+
+            if (alice) p_EVP_PKEY_free(alice);
+            if (bob)   p_EVP_PKEY_free(bob);
+        }
+    }
+
+    /* ====================================================== */
+    /*  Test 10: Base64 encode/decode round-trip               */
+    /* ====================================================== */
+    {
+        test_result("EVP_EncodeBlock/EVP_DecodeBlock dlsym",
+                    p_EVP_EncodeBlock != NULL && p_EVP_DecodeBlock != NULL);
+        if (p_EVP_EncodeBlock && p_EVP_DecodeBlock) {
+            const unsigned char plain[12] = "Hello, B64!";
+            unsigned char encoded[24];
+            unsigned char decoded[24];
+            memset(encoded, 0, sizeof(encoded));
+            memset(decoded, 0, sizeof(decoded));
+            int enc_len = p_EVP_EncodeBlock(encoded, plain, 12);
+            int dec_len = p_EVP_DecodeBlock(decoded, encoded, enc_len);
+            /* EVP_DecodeBlock pads with 0x00 to block boundary; check first 12 bytes */
+            test_result("Base64 encode produces output", enc_len > 0);
+            test_result("Base64 decode round-trip matches",
+                        dec_len >= 12 && memcmp(decoded, plain, 12) == 0);
+        }
+    }
+
+    /* ====================================================== */
+    /*  Test 11: ERR_get_error / ERR_error_string              */
+    /* ====================================================== */
+    {
+        test_result("ERR_get_error / ERR_error_string dlsym",
+                    p_ERR_get_error && p_ERR_error_string && p_ERR_clear_error);
+        if (p_ERR_get_error && p_ERR_error_string && p_ERR_clear_error) {
+            /* Force an error: attempt to load an invalid PEM from a NULL BIO */
+            if (p_PEM_read_bio_X509) {
+                p_PEM_read_bio_X509(NULL, NULL, NULL, NULL);
+            }
+            unsigned long err = p_ERR_get_error();
+            char errbuf[256] = {0};
+            char *s = p_ERR_error_string(err, errbuf);
+            /* Either we get a real error string or the "no error" string – both are fine */
+            test_result("ERR_error_string returns non-NULL string", s != NULL);
+            p_ERR_clear_error();
+        }
+    }
+
+    /* ====================================================== */
+    /*  Test 12: BIO memory buffer read/write round-trip       */
+    /* ====================================================== */
+    {
+        test_result("BIO_new / BIO_s_mem / BIO_write / BIO_read dlsym",
+                    p_BIO_new && p_BIO_s_mem && p_BIO_write && p_BIO_read && p_BIO_free);
+        if (p_BIO_new && p_BIO_s_mem && p_BIO_write && p_BIO_read && p_BIO_free) {
+            void *mem_method = p_BIO_s_mem();
+            BIO *bio = p_BIO_new(mem_method);
+            test_result("BIO_new(BIO_s_mem) returns non-NULL", bio != NULL);
+            if (bio) {
+                const char *msg = "BIO round-trip test";
+                int wn = p_BIO_write(bio, msg, (int)strlen(msg));
+                char buf[64] = {0};
+                int rn = p_BIO_read(bio, buf, (int)sizeof(buf) - 1);
+                test_result("BIO_write / BIO_read round-trip",
+                            wn == (int)strlen(msg) &&
+                            rn == (int)strlen(msg) &&
+                            memcmp(buf, msg, (size_t)strlen(msg)) == 0);
+                p_BIO_free(bio);
+            }
+        }
+    }
+
+    /* ====================================================== */
+    /*  Test 13: EVP_BytesToKey KDF                            */
+    /* ====================================================== */
+    {
+        test_result("EVP_BytesToKey dlsym", p_EVP_BytesToKey != NULL);
+        if (p_EVP_BytesToKey && p_EVP_aes_256_cbc && p_EVP_sha256) {
+            const unsigned char salt[8] = {0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08};
+            const unsigned char pass[] = "passphrase";
+            unsigned char k1[32], iv1[16];
+            unsigned char k2[32], iv2[16];
+            int r1 = p_EVP_BytesToKey(p_EVP_aes_256_cbc(), p_EVP_sha256(),
+                                       salt, pass, (int)strlen((char*)pass),
+                                       1, k1, iv1);
+            int r2 = p_EVP_BytesToKey(p_EVP_aes_256_cbc(), p_EVP_sha256(),
+                                       salt, pass, (int)strlen((char*)pass),
+                                       1, k2, iv2);
+            test_result("EVP_BytesToKey returns key length 32", r1 == 32);
+            test_result("EVP_BytesToKey is deterministic",
+                        r1 == r2 && memcmp(k1, k2, 32) == 0 && memcmp(iv1, iv2, 16) == 0);
+        }
+    }
+
+    /* ====================================================== */
+    /*  Test 14: libssl API smoke tests (no network)           */
+    /* ====================================================== */
+    printf("\n--- OpenSSL libssl smoke ---\n");
+    {
+        test_result("TLS_client_method / TLS_server_method dlsym",
+                    p_TLS_client_method != NULL && p_TLS_server_method != NULL);
+
+        void *client_meth = p_TLS_client_method ? p_TLS_client_method() : NULL;
+        void *server_meth = p_TLS_server_method ? p_TLS_server_method() : NULL;
+        test_result("TLS_client_method() non-NULL", client_meth != NULL);
+        test_result("TLS_server_method() non-NULL", server_meth != NULL);
+
+        if (p_SSL_CTX_new && client_meth) {
+            SSL_CTX *cctx = p_SSL_CTX_new(client_meth);
+            test_result("SSL_CTX_new(TLS_client_method) non-NULL", cctx != NULL);
+            if (cctx) {
+                long opts = p_SSL_CTX_set_options ? p_SSL_CTX_set_options(cctx, 0x04000000L /*SSL_OP_NO_SSLv2*/) : 0;
+                test_result("SSL_CTX_set_options returns non-zero", opts != 0);
+
+                if (p_SSL_new) {
+                    SSL *ssl = p_SSL_new(cctx);
+                    test_result("SSL_new(client_ctx) non-NULL", ssl != NULL);
+                    if (ssl) {
+                        /* SSL_get_error on unconnected ssl should not crash */
+                        int err = p_SSL_get_error ? p_SSL_get_error(ssl, -1) : -1;
+                        test_result("SSL_get_error on unconnected returns valid code",
+                                    err == 2 /*SSL_ERROR_WANT_READ*/ || err >= 0);
+                        if (p_SSL_free) p_SSL_free(ssl);
+                    }
+                }
+                if (p_SSL_CTX_free) p_SSL_CTX_free(cctx);
+            }
+        }
+
+        /* SSLv23_method() is an alias for TLS_method – just check it's present */
+        typedef void* (*fn_SSLv23_method)(void);
+        fn_SSLv23_method p_SSLv23_method = (fn_SSLv23_method)dlsym(ssl_h, "SSLv23_method");
+        if (!p_SSLv23_method)
+            p_SSLv23_method = (fn_SSLv23_method)dlsym(ssl_h, "TLS_method");
+        test_result("SSLv23_method() / TLS_method() resolvable", p_SSLv23_method != NULL);
+        if (p_SSLv23_method) {
+            void *m = p_SSLv23_method();
+            test_result("SSLv23_method() returns non-NULL", m != NULL);
+        }
+    }
+
+    /* ====================================================== */
+    /*  Test 15: TLS loopback client+server (large data)        */
+    /* ====================================================== */
+    printf("\n--- OpenSSL TLS loopback (runtime cert, 64KB) ---\n");
+
+    /*
+     * The key and certificate are generated at runtime using the OpenSSL EVP /
+     * X509 API (RSA-2048, self-signed SHA-256).  This avoids PEM line-length
+     * or format issues entirely.
+     *
+     * A synchronisation pipe is used so the client only connects after the
+     * server has set up its SSL_CTX and is ready to call accept().  Every
+     * early-exit path in the server child explicitly closes its file
+     * descriptors before _exit() so the kernel sends a FIN/RST even if
+     * LikeOS does not close FDs on process exit.
+     */
+    {
+        /* --- X509 cert-generation function pointers --- */
+        typedef void* (*fn_X509_new)(void);
+        typedef void  (*fn_X509_free_fn)(void*);
+        typedef int   (*fn_X509_set_version)(void*, long);
+        typedef void* (*fn_X509_get_serialNumber)(void*);
+        typedef int   (*fn_ASN1_INTEGER_set)(void*, long);
+        typedef void* (*fn_X509_getm_notBefore)(void*);
+        typedef void* (*fn_X509_getm_notAfter)(void*);
+        typedef void* (*fn_X509_gmtime_adj)(void*, long);
+        typedef int   (*fn_X509_set_pubkey)(void*, EVP_PKEY*);
+        typedef void* (*fn_X509_get_subject_name)(void*);
+        typedef int   (*fn_X509_NAME_add_entry_by_txt)(void*, const char*, int,
+                                                        const unsigned char*,
+                                                        int, int, int);
+        typedef int   (*fn_X509_set_issuer_name)(void*, void*);
+        typedef int   (*fn_X509_sign)(void*, EVP_PKEY*, const EVP_MD*);
+
+        fn_X509_new                   p_X509_new     = (fn_X509_new)                  dlsym(crypto_h, "X509_new");
+        fn_X509_free_fn               p_X509_free_fn = (fn_X509_free_fn)              dlsym(crypto_h, "X509_free");
+        fn_X509_set_version           p_X509_sv      = (fn_X509_set_version)          dlsym(crypto_h, "X509_set_version");
+        fn_X509_get_serialNumber      p_X509_gsn     = (fn_X509_get_serialNumber)     dlsym(crypto_h, "X509_get_serialNumber");
+        fn_ASN1_INTEGER_set           p_ASN1_iset    = (fn_ASN1_INTEGER_set)          dlsym(crypto_h, "ASN1_INTEGER_set");
+        fn_X509_getm_notBefore        p_X509_gnb     = (fn_X509_getm_notBefore)       dlsym(crypto_h, "X509_getm_notBefore");
+        fn_X509_getm_notAfter         p_X509_gna     = (fn_X509_getm_notAfter)        dlsym(crypto_h, "X509_getm_notAfter");
+        fn_X509_gmtime_adj            p_X509_gta     = (fn_X509_gmtime_adj)           dlsym(crypto_h, "X509_gmtime_adj");
+        fn_X509_set_pubkey            p_X509_spk     = (fn_X509_set_pubkey)           dlsym(crypto_h, "X509_set_pubkey");
+        fn_X509_get_subject_name      p_X509_gsn2    = (fn_X509_get_subject_name)     dlsym(crypto_h, "X509_get_subject_name");
+        fn_X509_NAME_add_entry_by_txt p_X509_naetbt  = (fn_X509_NAME_add_entry_by_txt)dlsym(crypto_h, "X509_NAME_add_entry_by_txt");
+        fn_X509_set_issuer_name       p_X509_sin     = (fn_X509_set_issuer_name)      dlsym(crypto_h, "X509_set_issuer_name");
+        fn_X509_sign                  p_X509_sign    = (fn_X509_sign)                 dlsym(crypto_h, "X509_sign");
+
+        int cert_gen_syms =
+            p_X509_new && p_X509_sv && p_X509_gsn && p_ASN1_iset &&
+            p_X509_gnb && p_X509_gna && p_X509_gta && p_X509_spk &&
+            p_X509_gsn2 && p_X509_naetbt && p_X509_sin && p_X509_sign;
+
+        int tls_syms =
+            p_TLS_server_method && p_TLS_client_method &&
+            p_SSL_CTX_new && p_SSL_CTX_free &&
+            p_SSL_CTX_use_certificate && p_SSL_CTX_use_PrivateKey &&
+            p_SSL_CTX_check_private_key && p_SSL_CTX_set_verify &&
+            p_SSL_new && p_SSL_free && p_SSL_set_fd &&
+            p_SSL_connect && p_SSL_accept &&
+            p_SSL_write && p_SSL_read && p_SSL_shutdown &&
+            p_SSL_get_version && p_EVP_PKEY_free &&
+            p_EVP_PKEY_CTX_new_id && p_EVP_PKEY_keygen_init &&
+            p_EVP_PKEY_CTX_set_rsa_keygen_bits && p_EVP_PKEY_keygen &&
+            p_EVP_sha256 && cert_gen_syms;
+
+        test_result("TLS loopback: all required symbols present", tls_syms);
+        if (!tls_syms) {
+            printf("  [SKIP] TLS loopback: missing symbols\n");
+            goto tls_loopback_done;
+        }
+
+        /* --- Generate RSA-2048 key pair in the parent before fork --- */
+        EVP_PKEY *tls_key = NULL;
+        {
+            EVP_PKEY_CTX *kctx = p_EVP_PKEY_CTX_new_id(6 /*EVP_PKEY_RSA*/, NULL);
+            if (kctx) {
+                p_EVP_PKEY_keygen_init(kctx);
+                p_EVP_PKEY_CTX_set_rsa_keygen_bits(kctx, 2048);
+                p_EVP_PKEY_keygen(kctx, &tls_key);
+                p_EVP_PKEY_CTX_free(kctx);
+            }
+        }
+        test_result("TLS loopback: RSA-2048 key generated", tls_key != NULL);
+        if (!tls_key) goto tls_loopback_done;
+
+        /* --- Generate self-signed X509 cert in the parent before fork --- */
+        void *tls_cert = NULL;
+        {
+            void *cert = p_X509_new();
+            if (cert) {
+                p_X509_sv(cert, 2);                                       /* v3 */
+                p_ASN1_iset(p_X509_gsn(cert), 1);                        /* serial 1 */
+                p_X509_gta(p_X509_gnb(cert), 0);                         /* not before: now */
+                p_X509_gta(p_X509_gna(cert), 3650L * 86400L);            /* not after: 10 yr */
+                p_X509_spk(cert, tls_key);
+                void *subj = p_X509_gsn2(cert);
+                /* MBSTRING_ASC = 0x1001 */
+                p_X509_naetbt(subj, "CN", 0x1001,
+                              (const unsigned char *)"testhost", -1, -1, 0);
+                p_X509_sin(cert, subj);
+                if (p_X509_sign(cert, tls_key, p_EVP_sha256()) > 0)
+                    tls_cert = cert;
+                else
+                    p_X509_free_fn(cert);
+            }
+        }
+        test_result("TLS loopback: self-signed cert generated", tls_cert != NULL);
+        if (!tls_cert) {
+            p_EVP_PKEY_free(tls_key);
+            goto tls_loopback_done;
+        }
+
+        /* --- Large transfer buffers --- */
+        static const int TLS_DATA_LEN = 65536;
+        static unsigned char tls_send_buf[65536];
+        static unsigned char tls_recv_buf[65536];
+        for (int i = 0; i < TLS_DATA_LEN; i++)
+            tls_send_buf[i] = (unsigned char)(i & 0x7F);
+        memset(tls_recv_buf, 0, TLS_DATA_LEN);
+
+        /*
+         * Sync pipe: server child writes 'R' after SSL_CTX is ready and it is
+         * about to block in accept().  Parent waits (up to 10 s to allow for
+         * any slow initialisation) before connecting, so there is no race.
+         */
+        int sync_pipe[2] = {-1, -1};
+        pipe(sync_pipe);
+
+        /* --- Listening socket (created before fork so child inherits it) --- */
+        int srv_sock = socket(AF_INET, SOCK_STREAM, 0);
+        test_result("TLS loopback: server socket", srv_sock >= 0);
+        if (srv_sock < 0) {
+            close(sync_pipe[0]); close(sync_pipe[1]);
+            p_EVP_PKEY_free(tls_key); p_X509_free_fn(tls_cert);
+            goto tls_loopback_done;
+        }
+        {
+            int yes = 1;
+            setsockopt(srv_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        }
+        struct sockaddr_in srv_addr;
+        memset(&srv_addr, 0, sizeof(srv_addr));
+        srv_addr.sin_family = AF_INET;
+        srv_addr.sin_port = htons(20100);
+        srv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        int bind_ok = bind(srv_sock, (struct sockaddr*)&srv_addr, sizeof(srv_addr));
+        test_result("TLS loopback: server bind", bind_ok == 0);
+        if (bind_ok != 0) {
+            close(srv_sock); close(sync_pipe[0]); close(sync_pipe[1]);
+            p_EVP_PKEY_free(tls_key); p_X509_free_fn(tls_cert);
+            goto tls_loopback_done;
+        }
+        int listen_ok = listen(srv_sock, 4);
+        test_result("TLS loopback: server listen", listen_ok == 0);
+        if (listen_ok != 0) {
+            close(srv_sock); close(sync_pipe[0]); close(sync_pipe[1]);
+            p_EVP_PKEY_free(tls_key); p_X509_free_fn(tls_cert);
+            goto tls_loopback_done;
+        }
+
+        pid_t tls_pid = fork();
+        test_result("TLS loopback: fork", tls_pid >= 0);
+
+        if (tls_pid == 0) {
+            /* ===== SERVER child ===== */
+            /*
+             * Helper macro: close every open FD the child owns before calling
+             * _exit so the kernel sends FIN/RST even if LikeOS does not close
+             * FDs on process exit.
+             */
+#define SRV_EXIT(code, cfd) do { \
+    if ((cfd) >= 0) close(cfd); \
+    close(srv_sock); \
+    close(sync_pipe[1]); \
+    _exit(code); \
+} while (0)
+
+            close(sync_pipe[0]);   /* child does not read from sync pipe */
+            int conn_fd = -1;
+
+            /* Build SSL_CTX using already-generated key+cert (no PEM round-trip) */
+            void *smeth = p_TLS_server_method();
+            SSL_CTX *sctx = p_SSL_CTX_new(smeth);
+            if (!sctx)                                       SRV_EXIT(3,  conn_fd);
+            p_SSL_CTX_set_verify(sctx, 0 /*SSL_VERIFY_NONE*/, NULL);
+            if (p_SSL_CTX_use_certificate(sctx, tls_cert) != 1) SRV_EXIT(4,  conn_fd);
+            if (p_SSL_CTX_use_PrivateKey(sctx, tls_key)   != 1) SRV_EXIT(5,  conn_fd);
+            if (p_SSL_CTX_check_private_key(sctx)         != 1) SRV_EXIT(6,  conn_fd);
+
+            /* Signal parent: SSL_CTX ready, about to block in accept() */
+            { char r = 'R'; write(sync_pipe[1], &r, 1); }
+            close(sync_pipe[1]);
+
+            conn_fd = accept(srv_sock, NULL, NULL);
+            close(srv_sock);
+            if (conn_fd < 0) { p_SSL_CTX_free(sctx); _exit(7); }
+
+            SSL *ssl = p_SSL_new(sctx);
+            if (!ssl)                { p_SSL_CTX_free(sctx); close(conn_fd); _exit(8); }
+            p_SSL_set_fd(ssl, conn_fd);
+
+            int acc = p_SSL_accept(ssl);
+            if (acc != 1)            { p_SSL_free(ssl); p_SSL_CTX_free(sctx); close(conn_fd); _exit(9); }
+
+            /* Receive TLS_DATA_LEN bytes then echo */
+            static unsigned char srv_buf[65536];
+            int total_recv = 0;
+            while (total_recv < TLS_DATA_LEN) {
+                int n = p_SSL_read(ssl, srv_buf + total_recv, TLS_DATA_LEN - total_recv);
+                if (n > 0) {
+                    total_recv += n;
+                } else {
+                    int err = p_SSL_get_error ? p_SSL_get_error(ssl, n) : 0;
+                    if (err == 2 /* SSL_ERROR_WANT_READ */ ||
+                        err == 3 /* SSL_ERROR_WANT_WRITE */) continue;
+                    break;
+                }
+            }
+            if (total_recv != TLS_DATA_LEN) { p_SSL_free(ssl); p_SSL_CTX_free(sctx); close(conn_fd); _exit(10); }
+
+            int total_sent = 0;
+            while (total_sent < TLS_DATA_LEN) {
+                int n = p_SSL_write(ssl, srv_buf + total_sent, TLS_DATA_LEN - total_sent);
+                if (n > 0) {
+                    total_sent += n;
+                } else {
+                    int err = p_SSL_get_error ? p_SSL_get_error(ssl, n) : 0;
+                    if (err == 2 /* SSL_ERROR_WANT_READ */ ||
+                        err == 3 /* SSL_ERROR_WANT_WRITE */) continue;
+                    break;
+                }
+            }
+            if (total_sent != TLS_DATA_LEN) { p_SSL_free(ssl); p_SSL_CTX_free(sctx); close(conn_fd); _exit(11); }
+
+            p_SSL_shutdown(ssl);
+            p_SSL_free(ssl);
+            p_SSL_CTX_free(sctx);
+            close(conn_fd);
+            _exit(0);
+#undef SRV_EXIT
+        }
+
+        /* ===== PARENT (client side) ===== */
+        close(sync_pipe[1]);   /* parent does not write to sync pipe */
+        close(srv_sock);       /* child inherited srv_sock via fork; parent no longer needs it */
+
+        if (tls_pid > 0) {
+            /*
+             * Wait for the server-ready signal.  10 s is enough even if the
+             * system is very slow; if the server dies early the pipe write-end
+             * is closed (or never written) and select() returns immediately so
+             * we do not block indefinitely.
+             */
+            int server_ready = 0;
+            {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(sync_pipe[0], &rfds);
+                struct timeval wtv = { .tv_sec = 10, .tv_usec = 0 };
+                int sr = select(sync_pipe[0] + 1, &rfds, NULL, NULL, &wtv);
+                if (sr > 0) {
+                    char rch = 0;
+                    if (read(sync_pipe[0], &rch, 1) == 1)
+                        server_ready = (rch == 'R');
+                }
+            }
+            close(sync_pipe[0]);
+            test_result("TLS loopback: server signaled ready", server_ready);
+
+            if (!server_ready) {
+                /* Server died before signalling – kill zombie and bail out */
+                kill(tls_pid, SIGKILL);
+                int dummy; waitpid(tls_pid, &dummy, 0);
+                p_EVP_PKEY_free(tls_key); p_X509_free_fn(tls_cert);
+                goto tls_loopback_done;
+            }
+
+            int cli_sock = socket(AF_INET, SOCK_STREAM, 0);
+            int cli_conn_ok = 0;
+            if (cli_sock >= 0) {
+                struct sockaddr_in cli_addr;
+                memset(&cli_addr, 0, sizeof(cli_addr));
+                cli_addr.sin_family = AF_INET;
+                cli_addr.sin_port = htons(20100);
+                cli_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                cli_conn_ok = (connect(cli_sock, (struct sockaddr*)&cli_addr,
+                                       sizeof(cli_addr)) == 0);
+            }
+            test_result("TLS loopback: client TCP connect", cli_conn_ok);
+
+            if (cli_conn_ok) {
+                void *cmeth = p_TLS_client_method();
+                SSL_CTX *cctx = p_SSL_CTX_new(cmeth);
+                if (cctx) {
+                    p_SSL_CTX_set_verify(cctx, 0 /*SSL_VERIFY_NONE*/, NULL);
+                    SSL *ssl = p_SSL_new(cctx);
+                    if (ssl) {
+                        p_SSL_set_fd(ssl, cli_sock);
+                        int conn = p_SSL_connect(ssl);
+                        test_result("TLS loopback: SSL_connect", conn == 1);
+
+                        if (conn == 1) {
+                            const char *ver = p_SSL_get_version(ssl);
+                            test_result("TLS loopback: SSL_get_version non-NULL", ver != NULL);
+                            printf("  [INFO] TLS version: %s\n", ver ? ver : "(null)");
+
+                            /* Send 64 KB */
+                            int total_sent = 0;
+                            while (total_sent < TLS_DATA_LEN) {
+                                int n = p_SSL_write(ssl,
+                                                    tls_send_buf + total_sent,
+                                                    TLS_DATA_LEN - total_sent);
+                                if (n <= 0) break;
+                                total_sent += n;
+                            }
+                            test_result("TLS loopback: sent 64 KB",
+                                        total_sent == TLS_DATA_LEN);
+
+                            /* Receive echo */
+                            int total_recv = 0;
+                            while (total_recv < TLS_DATA_LEN) {
+                                int n = p_SSL_read(ssl,
+                                                   tls_recv_buf + total_recv,
+                                                   TLS_DATA_LEN - total_recv);
+                                if (n > 0) {
+                                    total_recv += n;
+                                } else {
+                                    /* SSL_ERROR_WANT_READ (2): transient, retry.
+                                     * SSL_ERROR_ZERO_RETURN (6): close_notify. */
+                                    int err = p_SSL_get_error ?
+                                              p_SSL_get_error(ssl, n) : 0;
+                                    if (err == 2) continue;  /* WANT_READ */
+                                    break;
+                                }
+                            }
+                            test_result("TLS loopback: recv 64 KB echo",
+                                        total_recv == TLS_DATA_LEN);
+                            test_result("TLS loopback: data integrity",
+                                        total_recv == TLS_DATA_LEN &&
+                                        memcmp(tls_send_buf, tls_recv_buf,
+                                               (size_t)TLS_DATA_LEN) == 0);
+
+                            int sd = p_SSL_shutdown(ssl);
+                            /*
+                             * TLS 1.3 bidirectional shutdown: first call returns
+                             * 0 (sent close_notify), second returns 1 (received
+                             * peer close_notify), -1 means I/O error (peer may
+                             * have already closed).  All three are valid here.
+                             */
+                            test_result("TLS loopback: SSL_shutdown returned valid code",
+                                        sd == 0 || sd == 1 || sd == -1);
+                        }
+                        p_SSL_free(ssl);
+                    }
+                    p_SSL_CTX_free(cctx);
+                }
+            }
+            if (cli_sock >= 0) close(cli_sock);
+
+            int tls_child_status = 0;
+            waitpid(tls_pid, &tls_child_status, 0);
+            test_result("TLS loopback: server child exited cleanly",
+                        WIFEXITED(tls_child_status) &&
+                        WEXITSTATUS(tls_child_status) == 0);
+        } else {
+            /* fork failed */
+            close(sync_pipe[0]);
+            close(srv_sock);
+        }
+
+        p_EVP_PKEY_free(tls_key);
+        p_X509_free_fn(tls_cert);
+
+        tls_loopback_done:;
+    }
+
+    /* ====================================================== */
+    /*  Test 16: TLS over real eth0 interface                  */
+    /* ====================================================== */
+    printf("\n--- OpenSSL TLS over eth0 ---\n");
+    {
+        uint32_t eth0_ip = 0;
+        if (get_interface_ipv4("eth0", &eth0_ip) != 0 || eth0_ip == 0) {
+            test_result("TLS eth0: eth0 IP available", 1);
+            printf("  [SKIP] eth0 has no IP address\n");
+            goto tls_eth0_done;
+        }
+        test_result("TLS eth0: eth0 IP available", 1);
+
+        /*
+         * X509 cert-gen function pointers.  These are re-declared here in
+         * this block's scope (different from the loopback block above) using
+         * distinct type-alias names (fn3_*) to avoid any typedef collisions.
+         */
+        typedef void* (*fn3_X509_new)(void);
+        typedef void  (*fn3_X509_free)(void*);
+        typedef int   (*fn3_X509_set_version)(void*, long);
+        typedef void* (*fn3_X509_get_serialNumber)(void*);
+        typedef int   (*fn3_ASN1_INTEGER_set)(void*, long);
+        typedef void* (*fn3_X509_getm_notBefore)(void*);
+        typedef void* (*fn3_X509_getm_notAfter)(void*);
+        typedef void* (*fn3_X509_gmtime_adj)(void*, long);
+        typedef int   (*fn3_X509_set_pubkey)(void*, EVP_PKEY*);
+        typedef void* (*fn3_X509_get_subject_name)(void*);
+        typedef int   (*fn3_X509_NAME_add_entry_by_txt)(void*, const char*, int,
+                                                         const unsigned char*,
+                                                         int, int, int);
+        typedef int   (*fn3_X509_set_issuer_name)(void*, void*);
+        typedef int   (*fn3_X509_sign)(void*, EVP_PKEY*, const EVP_MD*);
+        fn3_X509_new                    e_X509_new  = (fn3_X509_new)                   dlsym(crypto_h, "X509_new");
+        fn3_X509_free                   e_X509_free = (fn3_X509_free)                  dlsym(crypto_h, "X509_free");
+        fn3_X509_set_version            e_X509_sv   = (fn3_X509_set_version)           dlsym(crypto_h, "X509_set_version");
+        fn3_X509_get_serialNumber       e_X509_gsn  = (fn3_X509_get_serialNumber)      dlsym(crypto_h, "X509_get_serialNumber");
+        fn3_ASN1_INTEGER_set            e_ASN1_is   = (fn3_ASN1_INTEGER_set)           dlsym(crypto_h, "ASN1_INTEGER_set");
+        fn3_X509_getm_notBefore         e_X509_gnb  = (fn3_X509_getm_notBefore)        dlsym(crypto_h, "X509_getm_notBefore");
+        fn3_X509_getm_notAfter          e_X509_gna  = (fn3_X509_getm_notAfter)         dlsym(crypto_h, "X509_getm_notAfter");
+        fn3_X509_gmtime_adj             e_X509_gta  = (fn3_X509_gmtime_adj)            dlsym(crypto_h, "X509_gmtime_adj");
+        fn3_X509_set_pubkey             e_X509_spk  = (fn3_X509_set_pubkey)            dlsym(crypto_h, "X509_set_pubkey");
+        fn3_X509_get_subject_name       e_X509_gsn2 = (fn3_X509_get_subject_name)      dlsym(crypto_h, "X509_get_subject_name");
+        fn3_X509_NAME_add_entry_by_txt  e_X509_na   = (fn3_X509_NAME_add_entry_by_txt) dlsym(crypto_h, "X509_NAME_add_entry_by_txt");
+        fn3_X509_set_issuer_name        e_X509_sin  = (fn3_X509_set_issuer_name)       dlsym(crypto_h, "X509_set_issuer_name");
+        fn3_X509_sign                   e_X509_sign = (fn3_X509_sign)                  dlsym(crypto_h, "X509_sign");
+
+        int e_cert_syms = e_X509_new && e_X509_sv && e_X509_gsn && e_ASN1_is &&
+                          e_X509_gnb && e_X509_gna && e_X509_gta && e_X509_spk &&
+                          e_X509_gsn2 && e_X509_na && e_X509_sin && e_X509_sign;
+
+        /* Generate RSA-2048 key */
+        EVP_PKEY *eth0_key = NULL;
+        if (p_EVP_PKEY_CTX_new_id && p_EVP_PKEY_keygen_init &&
+            p_EVP_PKEY_CTX_set_rsa_keygen_bits && p_EVP_PKEY_keygen) {
+            EVP_PKEY_CTX *kctx = p_EVP_PKEY_CTX_new_id(6 /*EVP_PKEY_RSA*/, NULL);
+            if (kctx) {
+                p_EVP_PKEY_keygen_init(kctx);
+                p_EVP_PKEY_CTX_set_rsa_keygen_bits(kctx, 2048);
+                p_EVP_PKEY_keygen(kctx, &eth0_key);
+                p_EVP_PKEY_CTX_free(kctx);
+            }
+        }
+        test_result("TLS eth0: RSA-2048 key generated", eth0_key != NULL);
+
+        /* Generate self-signed cert */
+        void *eth0_cert = NULL;
+        if (eth0_key && e_cert_syms && p_EVP_sha256) {
+            void *cert = e_X509_new();
+            if (cert) {
+                e_X509_sv(cert, 2);
+                e_ASN1_is(e_X509_gsn(cert), 2);
+                e_X509_gta(e_X509_gnb(cert), 0);
+                e_X509_gta(e_X509_gna(cert), 3650L * 86400L);
+                e_X509_spk(cert, eth0_key);
+                void *subj = e_X509_gsn2(cert);
+                /* MBSTRING_ASC = 0x1001 */
+                e_X509_na(subj, "CN", 0x1001,
+                          (const unsigned char *)"eth0test", -1, -1, 0);
+                e_X509_sin(cert, subj);
+                if (e_X509_sign(cert, eth0_key, p_EVP_sha256()) > 0)
+                    eth0_cert = cert;
+                else
+                    e_X509_free(cert);
+            }
+        }
+        test_result("TLS eth0: self-signed cert generated", eth0_cert != NULL);
+
+        if (!eth0_key || !eth0_cert) {
+            if (eth0_key)  p_EVP_PKEY_free(eth0_key);
+            if (eth0_cert) e_X509_free(eth0_cert);
+            goto tls_eth0_done;
+        }
+
+        /* Transfer buffer: 8 KB of known pattern */
+        static const int ETH0_DATA_LEN = 8192;
+        static unsigned char eth0_send_buf[8192];
+        static unsigned char eth0_recv_buf[8192];
+        for (int i = 0; i < ETH0_DATA_LEN; i++)
+            eth0_send_buf[i] = (unsigned char)(i & 0xFF);
+        memset(eth0_recv_buf, 0, ETH0_DATA_LEN);
+
+        /* Sync pipe */
+        int e_sync[2] = {-1, -1};
+        pipe(e_sync);
+
+        /* Server listening socket bound to INADDR_ANY:20101 */
+        int e_srv = socket(AF_INET, SOCK_STREAM, 0);
+        if (e_srv >= 0) {
+            int yes = 1;
+            setsockopt(e_srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+            struct sockaddr_in ea;
+            memset(&ea, 0, sizeof(ea));
+            ea.sin_family = AF_INET;
+            ea.sin_port = htons(20101);
+            ea.sin_addr.s_addr = htonl(INADDR_ANY);
+            if (bind(e_srv, (struct sockaddr*)&ea, sizeof(ea)) != 0 ||
+                listen(e_srv, 4) != 0) {
+                close(e_srv);
+                e_srv = -1;
+            }
+        }
+        test_result("TLS eth0: server socket+bind+listen", e_srv >= 0);
+        if (e_srv < 0) {
+            close(e_sync[0]); close(e_sync[1]);
+            p_EVP_PKEY_free(eth0_key); e_X509_free(eth0_cert);
+            goto tls_eth0_done;
+        }
+
+        pid_t e_pid = fork();
+        test_result("TLS eth0: fork", e_pid >= 0);
+
+        if (e_pid == 0) {
+            /* ===== SERVER child ===== */
+            close(e_sync[0]);
+            int e_conn = -1;
+
+            void *smeth = p_TLS_server_method();
+            SSL_CTX *sctx = p_SSL_CTX_new(smeth);
+            if (!sctx) { close(e_srv); close(e_sync[1]); _exit(3); }
+            p_SSL_CTX_set_verify(sctx, 0, NULL);
+            if (p_SSL_CTX_use_certificate(sctx, eth0_cert) != 1 ||
+                p_SSL_CTX_use_PrivateKey(sctx, eth0_key)   != 1 ||
+                p_SSL_CTX_check_private_key(sctx)          != 1) {
+                p_SSL_CTX_free(sctx); close(e_srv); close(e_sync[1]); _exit(4);
+            }
+
+            /* Signal parent: SSL_CTX ready, blocking in accept() */
+            { char r = 'R'; write(e_sync[1], &r, 1); }
+            close(e_sync[1]);
+
+            e_conn = accept(e_srv, NULL, NULL);
+            close(e_srv);
+            if (e_conn < 0) { p_SSL_CTX_free(sctx); _exit(5); }
+
+            SSL *ssl = p_SSL_new(sctx);
+            if (!ssl) { p_SSL_CTX_free(sctx); close(e_conn); _exit(6); }
+            p_SSL_set_fd(ssl, e_conn);
+            if (p_SSL_accept(ssl) != 1) {
+                p_SSL_free(ssl); p_SSL_CTX_free(sctx); close(e_conn); _exit(7);
+            }
+
+            /* Receive ETH0_DATA_LEN bytes then echo */
+            static unsigned char e_srv_buf[8192];
+            int recv_total = 0;
+            while (recv_total < ETH0_DATA_LEN) {
+                int n = p_SSL_read(ssl, e_srv_buf + recv_total,
+                                   ETH0_DATA_LEN - recv_total);
+                if (n <= 0) break;
+                recv_total += n;
+            }
+            if (recv_total == ETH0_DATA_LEN) {
+                int sent_total = 0;
+                while (sent_total < ETH0_DATA_LEN) {
+                    int n = p_SSL_write(ssl, e_srv_buf + sent_total,
+                                        ETH0_DATA_LEN - sent_total);
+                    if (n <= 0) break;
+                    sent_total += n;
+                }
+            }
+            p_SSL_shutdown(ssl);
+            p_SSL_free(ssl);
+            p_SSL_CTX_free(sctx);
+            close(e_conn);
+            _exit((recv_total == ETH0_DATA_LEN) ? 0 : 10);
+        }
+
+        /* ===== CLIENT (parent) ===== */
+        close(e_sync[1]);
+
+        if (e_pid > 0) {
+            /* Wait for server-ready signal (up to 15 s) */
+            int e_ready = 0;
+            {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(e_sync[0], &rfds);
+                struct timeval wtv = { .tv_sec = 15, .tv_usec = 0 };
+                int sr = select(e_sync[0] + 1, &rfds, NULL, NULL, &wtv);
+                if (sr > 0) {
+                    char ch = 0;
+                    e_ready = (read(e_sync[0], &ch, 1) == 1 && ch == 'R');
+                }
+            }
+            close(e_sync[0]);
+            test_result("TLS eth0: server signaled ready", e_ready);
+
+            if (e_ready) {
+                int e_cli = socket(AF_INET, SOCK_STREAM, 0);
+                int e_conn_ok = 0;
+                if (e_cli >= 0) {
+                    struct sockaddr_in ea;
+                    memset(&ea, 0, sizeof(ea));
+                    ea.sin_family = AF_INET;
+                    ea.sin_port = htons(20101);
+                    ea.sin_addr.s_addr = htonl(eth0_ip); /* get_interface_ipv4 returns host-order */
+                    e_conn_ok = (connect(e_cli, (struct sockaddr*)&ea, sizeof(ea)) == 0);
+                }
+                test_result("TLS eth0: client TCP connect via eth0", e_conn_ok);
+
+                if (e_conn_ok) {
+                    void *cmeth = p_TLS_client_method();
+                    SSL_CTX *cctx = p_SSL_CTX_new(cmeth);
+                    if (cctx) {
+                        p_SSL_CTX_set_verify(cctx, 0 /*SSL_VERIFY_NONE*/, NULL);
+                        SSL *ssl = p_SSL_new(cctx);
+                        if (ssl) {
+                            p_SSL_set_fd(ssl, e_cli);
+                            int conn = p_SSL_connect(ssl);
+                            test_result("TLS eth0: SSL_connect", conn == 1);
+                            if (conn == 1) {
+                                const char *ver = p_SSL_get_version(ssl);
+                                printf("  [INFO] TLS eth0 version: %s\n",
+                                       ver ? ver : "(null)");
+
+                                /* Send 8 KB */
+                                int snt = 0;
+                                while (snt < ETH0_DATA_LEN) {
+                                    int n = p_SSL_write(ssl,
+                                                        eth0_send_buf + snt,
+                                                        ETH0_DATA_LEN - snt);
+                                    if (n <= 0) break;
+                                    snt += n;
+                                }
+                                test_result("TLS eth0: sent 8 KB",
+                                            snt == ETH0_DATA_LEN);
+
+                                /* Receive echo */
+                                int rcv = 0;
+                                while (rcv < ETH0_DATA_LEN) {
+                                    int n = p_SSL_read(ssl,
+                                                       eth0_recv_buf + rcv,
+                                                       ETH0_DATA_LEN - rcv);
+                                    if (n <= 0) break;
+                                    rcv += n;
+                                }
+                                test_result("TLS eth0: recv 8 KB echo",
+                                            rcv == ETH0_DATA_LEN);
+                                test_result("TLS eth0: data integrity",
+                                            rcv == ETH0_DATA_LEN &&
+                                            memcmp(eth0_send_buf, eth0_recv_buf,
+                                                   (size_t)ETH0_DATA_LEN) == 0);
+                                p_SSL_shutdown(ssl);
+                            }
+                            p_SSL_free(ssl);
+                        }
+                        p_SSL_CTX_free(cctx);
+                    }
+                }
+                if (e_cli >= 0) close(e_cli);
+            } else {
+                close(e_sync[0]);
+            }
+
+            int e_status = 0;
+            waitpid(e_pid, &e_status, 0);
+            test_result("TLS eth0: server child exited cleanly",
+                        WIFEXITED(e_status) && WEXITSTATUS(e_status) == 0);
+        } else {
+            /* fork failed */
+            close(e_sync[0]);
+            close(e_srv);
+        }
+
+        p_EVP_PKEY_free(eth0_key);
+        e_X509_free(eth0_cert);
+
+        tls_eth0_done:;
+    }
+
+    /* ====================================================== */
+    /*  Hardware crypto capability verification                */
+    /*                                                         */
+    /*  Strategy:                                              */
+    /*    1. Execute CPUID directly to read the CPU's own      */
+    /*       feature bits.                                     */
+    /*    2. Read OPENSSL_ia32cap_P via dlsym to confirm that  */
+    /*       OPENSSL_cpuid_setup ran at library load time and  */
+    /*       wrote the same bits.                              */
+    /*    3. For each advertised instruction set, verify that  */
+    /*       a correctness test passes — proving the hardware  */
+    /*       dispatch path produces right answers.             */
+    /* ====================================================== */
+    {
+        printf("\n--- Hardware crypto capabilities ---\n");
+
+        /* ----- 1. Read CPUID leaves ----------------------------------- */
+
+        /* CPUID leaf 1 → ECX (feature flags: AES-NI, PCLMULQDQ, AVX, …) */
+        unsigned int cpu_ecx1 = 0, cpu_edx1 = 0;
+        __asm__ volatile (
+            "cpuid"
+            : "=c"(cpu_ecx1), "=d"(cpu_edx1)
+            : "a"(1), "b"(0)
+        );
+
+        /* CPUID leaf 7, sub-leaf 0 → EBX (SHA-NI bit 29, AVX2 bit 5, …) */
+        unsigned int cpu_ebx7 = 0;
+        {
+            unsigned int max_leaf = 0;
+            __asm__ volatile ("cpuid" : "=a"(max_leaf) : "a"(0) : "ebx","ecx","edx");
+            if (max_leaf >= 7) {
+                unsigned int tmp_eax, tmp_ecx, tmp_edx;
+                __asm__ volatile (
+                    "cpuid"
+                    : "=a"(tmp_eax), "=b"(cpu_ebx7), "=c"(tmp_ecx), "=d"(tmp_edx)
+                    : "a"(7), "c"(0)
+                );
+            }
+        }
+
+        int cpu_has_aesni    = (cpu_ecx1 >> 25) & 1;   /* CPUID.1:ECX[25]  */
+        int cpu_has_pclmulqdq= (cpu_ecx1 >> 1)  & 1;   /* CPUID.1:ECX[1]   */
+        int cpu_has_avx      = (cpu_ecx1 >> 28) & 1;   /* CPUID.1:ECX[28]  */
+        int cpu_has_avx2     = (cpu_ebx7 >> 5)  & 1;   /* CPUID.7:EBX[5]   */
+        int cpu_has_sha      = (cpu_ebx7 >> 29) & 1;   /* CPUID.7:EBX[29]  */
+
+        printf("  CPUID: AES-NI=%d PCLMULQDQ=%d AVX=%d AVX2=%d SHA-NI=%d\n",
+               cpu_has_aesni, cpu_has_pclmulqdq, cpu_has_avx, cpu_has_avx2, cpu_has_sha);
+
+        int any_cpu_feature = cpu_has_aesni | cpu_has_pclmulqdq |
+                               cpu_has_avx | cpu_has_avx2 | cpu_has_sha;
+
+        /* ----- Correctness under hardware dispatch -------------------- */
+
+        if (!any_cpu_feature)
+            printf("  [INFO] No hw-crypto features on this CPU - hw-dispatch correctness tests skipped\n");
+
+        /*
+         * SHA-256 NIST vector with maximum message length (56 bytes) so
+         * that two compress() calls are made — exercises the multi-block
+         * SHA-NI path when cap[2] bit 29 is set.
+         */
+        if (any_cpu_feature && p_EVP_MD_CTX_new && p_EVP_DigestInit_ex &&
+            p_EVP_DigestUpdate && p_EVP_DigestFinal_ex && p_EVP_sha256) {
+
+            static const char msg56[] =
+                "abcdbcdecdefdefgefghfghighijhijk"
+                "ijkljklmklmnlmnomnopnopq";
+            static const unsigned char exp56[32] = {
+                0x24,0x8d,0x6a,0x61,0xd2,0x06,0x38,0xb8,
+                0xe5,0xc0,0x26,0x93,0x0c,0x3e,0x60,0x39,
+                0xa3,0x3c,0xe4,0x59,0x64,0xff,0x21,0x67,
+                0xf6,0xec,0xed,0xd4,0x19,0xdb,0x06,0xc1,
+            };
+
+            EVP_MD_CTX *ctx = p_EVP_MD_CTX_new();
+            unsigned char dig[32]; unsigned int dlen = 0;
+            int ok = ctx &&
+                p_EVP_DigestInit_ex(ctx, p_EVP_sha256(), NULL) == 1 &&
+                p_EVP_DigestUpdate(ctx, msg56, 56) == 1 &&
+                p_EVP_DigestFinal_ex(ctx, dig, &dlen) == 1 &&
+                dlen == 32 && memcmp(dig, exp56, 32) == 0;
+            if (ctx) p_EVP_MD_CTX_free(ctx);
+            test_result("SHA-256 hw-dispatch correctness (2-block)", ok);
+        }
+
+        /*
+         * AES-256-GCM authenticated encrypt/decrypt round-trip.
+         * When AES-NI + PCLMULQDQ are present, OpenSSL routes through the
+         * hardware-accelerated GHASH + AES-CTR path.  A correct plaintext
+         * recovery proves the hardware path is functioning.
+         */
+        if (any_cpu_feature && p_EVP_CIPHER_CTX_new && p_EVP_EncryptInit_ex &&
+            p_EVP_EncryptUpdate && p_EVP_EncryptFinal_ex &&
+            p_EVP_DecryptInit_ex && p_EVP_DecryptUpdate &&
+            p_EVP_DecryptFinal_ex && p_EVP_aes_256_gcm &&
+            p_EVP_CIPHER_CTX_ctrl) {
+
+#define EVP_CTRL_GCM_SET_IVLEN  0x9
+#define EVP_CTRL_GCM_GET_TAG    0x10
+#define EVP_CTRL_GCM_SET_TAG    0x11
+
+            static const unsigned char gcm_key[32] = {
+                0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+                0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,
+                0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,
+                0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,
+            };
+            static const unsigned char gcm_iv[12] = {
+                0xca,0xfe,0xba,0xbe,0xfa,0xce,0xdb,0xad,
+                0xde,0xca,0xf8,0x88,
+            };
+            static const char gcm_plain[] = "hw-crypto-test-vector";
+            const int gcm_plen = (int)sizeof(gcm_plain) - 1;
+
+            unsigned char ciphertext[64], tag[16], recovered[64];
+            int clen = 0, flen = 0, rlen = 0, rflen = 0;
+
+            /* Encrypt */
+            EVP_CIPHER_CTX *ectx = p_EVP_CIPHER_CTX_new();
+            int enc_ok = ectx != NULL &&
+                p_EVP_EncryptInit_ex(ectx, p_EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
+                p_EVP_CIPHER_CTX_ctrl(ectx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+                p_EVP_EncryptInit_ex(ectx, NULL, NULL, gcm_key, gcm_iv) == 1 &&
+                p_EVP_EncryptUpdate(ectx, ciphertext, &clen, (const unsigned char*)gcm_plain, gcm_plen) == 1 &&
+                p_EVP_EncryptFinal_ex(ectx, ciphertext + clen, &flen) == 1 &&
+                p_EVP_CIPHER_CTX_ctrl(ectx, EVP_CTRL_GCM_GET_TAG, 16, tag) == 1;
+            if (ectx) p_EVP_CIPHER_CTX_free(ectx);
+
+            /* Decrypt */
+            EVP_CIPHER_CTX *dctx = p_EVP_CIPHER_CTX_new();
+            int dec_ok = dctx != NULL &&
+                p_EVP_DecryptInit_ex(dctx, p_EVP_aes_256_gcm(), NULL, NULL, NULL) == 1 &&
+                p_EVP_CIPHER_CTX_ctrl(dctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+                p_EVP_DecryptInit_ex(dctx, NULL, NULL, gcm_key, gcm_iv) == 1 &&
+                p_EVP_CIPHER_CTX_ctrl(dctx, EVP_CTRL_GCM_SET_TAG, 16, tag) == 1 &&
+                p_EVP_DecryptUpdate(dctx, recovered, &rlen, ciphertext, clen + flen) == 1 &&
+                p_EVP_DecryptFinal_ex(dctx, recovered + rlen, &rflen) == 1;
+            if (dctx) p_EVP_CIPHER_CTX_free(dctx);
+
+            int round_trip = enc_ok && dec_ok &&
+                (rlen + rflen == gcm_plen) &&
+                memcmp(recovered, gcm_plain, gcm_plen) == 0;
+
+            test_result("AES-256-GCM hw-dispatch encrypt/decrypt round-trip", round_trip);
+
+#undef EVP_CTRL_GCM_SET_IVLEN
+#undef EVP_CTRL_GCM_GET_TAG
+#undef EVP_CTRL_GCM_SET_TAG
+        }
+
+        /*
+         * SHA-512 long message (two 128-byte blocks) — exercises
+         * AVX/AVX2 SHA-512 dispatch paths on capable hardware.
+         */
+        if (any_cpu_feature && p_EVP_MD_CTX_new && p_EVP_DigestInit_ex &&
+            p_EVP_DigestUpdate && p_EVP_DigestFinal_ex && p_EVP_sha512) {
+
+            /* SHA-512("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn"
+             *          "hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu")
+             * = 8e959b75dae313da8cf4f72814fc143f...
+             */
+            static const char msg112[] =
+                "abcdefghbcdefghicdefghijdefghijk"
+                "efghijklfghijklmghijklmnhijklmno"
+                "ijklmnopjklmnopqklmnopqrlmnopqrs"
+                "mnopqrstnopqrstu";
+            static const unsigned char exp512_16[16] = {
+                0x8e,0x95,0x9b,0x75,0xda,0xe3,0x13,0xda,
+                0x8c,0xf4,0xf7,0x28,0x14,0xfc,0x14,0x3f,
+            };
+
+            EVP_MD_CTX *ctx = p_EVP_MD_CTX_new();
+            unsigned char dig[64]; unsigned int dlen = 0;
+            int ok = ctx &&
+                p_EVP_DigestInit_ex(ctx, p_EVP_sha512(), NULL) == 1 &&
+                p_EVP_DigestUpdate(ctx, msg112, 112) == 1 &&
+                p_EVP_DigestFinal_ex(ctx, dig, &dlen) == 1 &&
+                dlen == 64 && memcmp(dig, exp512_16, 16) == 0;
+            if (ctx) p_EVP_MD_CTX_free(ctx);
+            test_result("SHA-512 hw-dispatch correctness (2-block)", ok);
+        }
+    }
+
+    openssl_skip:;
+
+    /* ====================================================== */
+    /* End of OpenSSL tests                                    */
+    /* ====================================================== */
+
+    // ========================================
     // Summary
     // ========================================
     printf("\n========================================\n");

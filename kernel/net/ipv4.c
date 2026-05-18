@@ -4,6 +4,7 @@
 #include "../../include/kernel/random.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/skb.h"
+#include "../../include/kernel/ratelimit.h"
 
 // TX path uses per-fragment sk_buff allocations from the size-classed pool;
 // no global TX spinlock is held across the lower-layer send.  See
@@ -53,7 +54,7 @@ uint16_t pmtu_get(uint32_t dst_ip) {
 #define IPV4_FLAG_MF            0x2000
 #define IPV4_FLAG_DF            0x4000
 #define IPV4_FRAG_OFFSET_MASK   0x1FFF
-#define IPV4_REASSEMBLY_SLOTS   4
+#define IPV4_REASSEMBLY_SLOTS   32
 #define IPV4_REASSEMBLY_TIMEOUT 300
 
 typedef struct {
@@ -157,6 +158,20 @@ static int ipv4_reassemble_fragment(net_device_t* dev, const ipv4_header_t* ip,
 
     for (uint16_t i = 0; i < payload_len; i++)
         slot->data[offset + i] = payload[i];
+
+    // Teardrop/overlap detection: if any 8-byte block covered by this
+    // fragment was already received, discard the entire slot (RFC 3128).
+    {
+        uint16_t blk_start = (uint16_t)(offset / 8);
+        uint16_t blk_end   = (uint16_t)((offset + payload_len + 7) / 8);
+        for (uint16_t blk = blk_start; blk < blk_end; blk++) {
+            if (slot->bitmap[blk] & 1U) {
+                slot->active = 0;
+                return -1;
+            }
+        }
+    }
+
     ipv4_mark_fragment(slot, offset, payload_len);
 
     if (!(frag & IPV4_FLAG_MF)) {
@@ -395,6 +410,42 @@ void ipv4_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
     uint32_t src_ip = net_ntohl(ip->src_addr);
     uint16_t frag = net_ntohs(ip->flags_fragment);
 
+    // --- Bogon / martian source filter (non-loopback interfaces only) ---
+    if (dev != net_get_loopback()) {
+        // Drop: 0.0.0.0/8
+        if ((src_ip & 0xFF000000u) == 0x00000000u) return;
+        // Drop: 127.0.0.0/8
+        if ((src_ip & 0xFF000000u) == 0x7F000000u) return;
+        // Drop: 169.254.0.0/16 (link-local — should not appear routed)
+        if ((src_ip & 0xFFFF0000u) == 0xA9FE0000u) return;
+        // Drop: 240.0.0.0/4 (reserved / class E)
+        if ((src_ip & 0xF0000000u) == 0xF0000000u) return;
+        // Drop: 255.x.x.x
+        if ((src_ip & 0xFF000000u) == 0xFF000000u) return;
+    }
+
+    // --- Source routing option drop (LSRR=131, SSRR=137) ---
+    if (ihl > 20) {
+        const uint8_t* opts = data + sizeof(ipv4_header_t);
+        uint8_t opt_end = (uint8_t)(ihl - 20);
+        for (uint8_t oi = 0; oi < opt_end; ) {
+            uint8_t opt_type = opts[oi];
+            if (opt_type == 0) break;          // EOL
+            if (opt_type == 1) { oi++; continue; }  // NOP
+            if (oi + 1 >= opt_end) break;
+            uint8_t opt_len = opts[oi + 1];
+            if (opt_len < 2 || oi + opt_len > opt_end) break;
+            if (opt_type == 131 || opt_type == 137) return; // LSRR/SSRR
+            oi = (uint8_t)(oi + opt_len);
+        }
+    }
+
+    // --- Directed broadcast anti-Smurf: drop ICMP echo to subnet broadcast ---
+    if (dev != net_get_loopback() && dev->netmask != 0) {
+        uint32_t bcast = dev->ip_addr | ~dev->netmask;
+        if (dst_ip == bcast && ip->protocol == IP_PROTO_ICMP) return;
+    }
+
     // Accept packets addressed to us, broadcast, loopback, multicast, or if we have no IP yet (DHCP)
     // On loopback device, accept all packets (we explicitly routed them there)
     int is_mcast = (dst_ip >= 0xE0000000U && dst_ip < 0xF0000000U);
@@ -411,6 +462,11 @@ void ipv4_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
     uint16_t payload_len = total_len - ihl;
 
     if ((frag & IPV4_FLAG_MF) || (frag & IPV4_FRAG_OFFSET_MASK)) {
+        // Fragment rate-limit per source IP
+        uint64_t rl_flags; spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
+        int frag_ok = net_rl_src_allow(&g_frag_src_rl, src_ip);
+        spin_unlock_irqrestore(&g_ratelimit_lock, rl_flags);
+        if (!frag_ok) return;
         ipv4_reassemble_fragment(dev, ip, src_ip, dst_ip, payload, payload_len, ip->ttl);
         return;
     }
