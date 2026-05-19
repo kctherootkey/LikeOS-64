@@ -6432,6 +6432,8 @@ network_section:
             test_result("TLS loopback: server child exited cleanly",
                         WIFEXITED(tls_child_status) &&
                         WEXITSTATUS(tls_child_status) == 0);
+            /* close the listen socket that was kept open across fork */
+            if (srv_sock >= 0) close(srv_sock);
         } else {
             /* fork failed */
             close(sync_pipe[0]);
@@ -6722,6 +6724,8 @@ network_section:
             waitpid(e_pid, &e_status, 0);
             test_result("TLS eth0: server child exited cleanly",
                         WIFEXITED(e_status) && WEXITSTATUS(e_status) == 0);
+            /* close the listen socket that was kept open across fork */
+            if (e_srv >= 0) close(e_srv);
         } else {
             /* fork failed */
             close(e_sync[0]);

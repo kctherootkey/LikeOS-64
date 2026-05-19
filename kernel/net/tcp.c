@@ -947,20 +947,79 @@ static tcp_conn_t* tcp_find_conn(uint32_t local_ip, uint16_t local_port,
     return NULL;
 }
 
-// Find listening socket on port
+// Find listening socket on port.
+//
+// When only one listener exists for the port (common case) returns it
+// immediately at O(N) cost.  When multiple listeners share the same
+// port — e.g. two concurrent teststress instances both calling bind()
+// on port 20101 — distributes incoming SYNs across them by picking the
+// listener with the fewest pending connections (accept-queue depth +
+// SYN_RECEIVED children not yet enqueued).  This prevents all connections
+// from piling up on the lowest-slot listener and starving the others.
 static tcp_conn_t* tcp_find_listener(uint32_t local_ip, uint16_t local_port) {
-    tcp_conn_t* wildcard = NULL;
+    // First pass: collect candidate counts.
+    tcp_conn_t* first_exact    = NULL;
+    tcp_conn_t* first_wildcard = NULL;
+    int         exact_count    = 0;
+    int         wildcard_count = 0;
+
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         tcp_conn_t* c = &tcp_connections[i];
-        if (c->active && c->state == TCP_STATE_LISTEN &&
-            c->local_port == local_port) {
-            if (c->local_ip == local_ip)
-                return c;
-            if (c->local_ip == 0 && !wildcard)
-                wildcard = c;
+        if (!c->active || c->state != TCP_STATE_LISTEN ||
+            c->local_port != local_port)
+            continue;
+        if (c->local_ip == local_ip) {
+            if (!first_exact) first_exact = c;
+            exact_count++;
+        } else if (c->local_ip == 0) {
+            if (!first_wildcard) first_wildcard = c;
+            wildcard_count++;
         }
     }
-    return wildcard;
+
+    // Fast path: single listener — original O(N) behaviour.
+    if (exact_count == 1)                      return first_exact;
+    if (exact_count == 0 && wildcard_count <= 1) return first_wildcard;
+    if (exact_count == 0 && wildcard_count == 0) return NULL;
+
+    // Multiple listeners on the same port.  Second pass: select the one
+    // with the smallest load (accept-queue depth + SYN_RECEIVED children
+    // in flight).  Counting in-flight children catches the race where
+    // both SYNs arrive before either 3WH completes and the accept queues
+    // are both empty — the second SYN sees the first SYN's child (already
+    // published with state=SYN_RECEIVED, parent=listener_A) and correctly
+    // routes to listener_B instead.
+    tcp_conn_t* best_exact    = NULL;
+    tcp_conn_t* best_wildcard = NULL;
+    int best_exact_load    = 0x7fffffff;
+    int best_wildcard_load = 0x7fffffff;
+
+    for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+        tcp_conn_t* c = &tcp_connections[i];
+        if (!c->active || c->state != TCP_STATE_LISTEN ||
+            c->local_port != local_port)
+            continue;
+
+        // Accept-queue occupancy.
+        int load = (int)((c->accept_tail - c->accept_head + 16u) % 16u);
+        // SYN_RECEIVED children not yet promoted to accept queue.
+        for (int j = 0; j < TCP_MAX_CONNECTIONS; j++) {
+            tcp_conn_t* ch = &tcp_connections[j];
+            if (ch->active && ch->state == TCP_STATE_SYN_RECEIVED &&
+                ch->parent == c)
+                load++;
+        }
+
+        if (c->local_ip == local_ip && load < best_exact_load) {
+            best_exact      = c;
+            best_exact_load = load;
+        } else if (c->local_ip == 0 && load < best_wildcard_load) {
+            best_wildcard      = c;
+            best_wildcard_load = load;
+        }
+    }
+
+    return best_exact ? best_exact : best_wildcard;
 }
 
 // Ring buffer helpers
@@ -1220,10 +1279,15 @@ tcp_conn_t* tcp_accept(tcp_conn_t* listener) {
         if (conn->parent == listener) {
             matches = 1;
         } else if (conn->parent == NULL &&
+                   conn->owner_socket == (void*)conn &&
                    conn->local_port == listener->local_port &&
                    conn->remote_port != 0 &&
                    (listener->local_ip == 0 ||
                     conn->local_ip == listener->local_ip)) {
+            // owner_socket == conn is the self-pointer sentinel set by
+            // tcp_alloc_conn: still unclaimed by any socket.  Once
+            // sock_accept() assigns the real net_socket_t*, owner_socket
+            // != conn and we skip the connection to prevent double-accept.
             matches = 1;
         }
         if (!matches) continue;
