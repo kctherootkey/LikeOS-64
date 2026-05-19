@@ -9,6 +9,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/sched.h"  // For sched_enable_smp()
+#include "../../include/kernel/timer.h"   // For timer_rdtsc()
 
 // ============================================================================
 // External Trampoline Symbols
@@ -558,7 +559,21 @@ void smp_tlb_shootdown_sync(void) {
     // With IRQs now enabled, this CPU can receive and ACK TLB IPIs from
     // other senders while waiting — eliminating the starvation that caused
     // the timeouts.
-    for (int i = 0; i < 10000000; i++) {
+    // Time-based deadline: 100 ms expressed in TSC cycles.
+    //
+    // The old iteration count (10 M pauses) completed in ~13 ms on fast
+    // VMware hardware — too short for a vCPU that has been descheduled for
+    // a full VMware scheduling quantum (~10 ms per slot with 8 vCPUs on
+    // 4 physical cores).  A 100 ms deadline ensures every remote vCPU is
+    // scheduled at least ~10 times during the wait, giving it ample
+    // opportunity to handle its pending IPI.
+    uint64_t tsc_freq = lapic_get_tsc_freq();
+    // tsc_100ms: TSC cycles in 100 ms.  Fall back to a conservative 1 GHz
+    // estimate if the frequency hasn't been calibrated yet.
+    uint64_t tsc_100ms = (tsc_freq != 0) ? (tsc_freq / 10) : 100000000ULL;
+    uint64_t start_tsc = timer_rdtsc();
+
+    for (;;) {
         bool all_acked = true;
         for (uint32_t c = 0; c < online; c++) {
             if (c == my_cpu) continue;
@@ -568,6 +583,7 @@ void smp_tlb_shootdown_sync(void) {
             }
         }
         if (all_acked) return;
+        if (timer_rdtsc() - start_tsc >= tsc_100ms) break;
         __asm__ volatile("pause" ::: "memory");
     }
 
