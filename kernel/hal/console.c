@@ -2367,6 +2367,14 @@ int ksprintf(char* buffer, const char* format, ...) {
 }
 
 // String printf with size limit
+int kvsnprintf(char* buffer, size_t size, const char* format, va_list args) {
+    if (size == 0) return 0;
+    string_buffer_t sb = {buffer, size, 0};
+    int result = kvprintf_to_buffer(format, args, &sb);
+    buffer[sb.pos] = '\0';
+    return result;
+}
+
 int ksnprintf(char* buffer, size_t size, const char* format, ...) {
     va_list args;
     va_start(args, format);

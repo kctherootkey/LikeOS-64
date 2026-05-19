@@ -433,14 +433,34 @@ void smp_tlb_shootdown(void) {
     lapic_send_ipi_all_excl_self(IPI_TLB_SHOOTDOWN);
 }
 
-// Atomic acknowledgment counter for synchronous TLB shootdown
-static volatile int g_tlb_ack_count = 0;
-// Spinlock to serialize TLB shootdowns: the ack counter is global, so
-// concurrent shootdowns would corrupt each other's counts.
+// Monotonic generation counter for TLB shootdowns.  Each new shootdown
+// increments this counter.  The per-CPU array records the last generation
+// each CPU has processed.  The sender waits until all remote CPUs' recorded
+// generation >= the new generation.
+//
+// Compared to a reset-to-zero count:
+//  - Late acks from a timed-out previous shootdown read the CURRENT
+//    (newer) generation and store it, so they can only help the current
+//    or future shootdown — never corrupt a stale count.
+//  - If two IPIs are coalesced (edge-triggered LAPIC drops the second
+//    because the first is still pending in the IRR), the single delivery
+//    reads the current gen (which may already be the newer one) and
+//    records it.  Because the handler performs a full CR3 reload, all PTE
+//    modifications visible at that point are flushed regardless.
+static volatile uint64_t g_tlb_gen = 0;
+static volatile uint64_t g_tlb_cpu_gen[MAX_CPUS];  // zero-initialised by BSS
+
+// Spinlock to serialize TLB shootdowns so only one sender is active at a
+// time (required: the sender iterates g_tlb_cpu_gen while holding the lock).
 static spinlock_t g_tlb_shootdown_lock = SPINLOCK_INIT("tlb_shootdown");
 
 void smp_tlb_shootdown_ack(void) {
-    __atomic_add_fetch(&g_tlb_ack_count, 1, __ATOMIC_SEQ_CST);
+    uint32_t cpu_id = this_cpu_id();
+    // Read the current generation AFTER the TLB flush (see interrupt.c).
+    // Storing gen N means "my TLB is coherent through all modifications
+    // committed before generation N was published".
+    uint64_t gen = __atomic_load_n(&g_tlb_gen, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&g_tlb_cpu_gen[cpu_id], gen, __ATOMIC_RELEASE);
 }
 
 // Set once the BSP has parked the other CPUs via smp_halt_others().
@@ -460,30 +480,19 @@ void smp_tlb_shootdown_sync(void) {
     uint32_t online = percpu_get_online_count();
     if (online <= 1) return;
 
-    int expect = (int)online - 1;
-    
-    // Must serialize: the global ack counter would be corrupted if multiple
-    // CPUs tried to do shootdowns concurrently.
+    // The lock serializes the gen-increment + IPI-send pair so each sender
+    // gets a unique, monotonically increasing generation number.  The lock
+    // is held only for those two operations; it is released BEFORE the
+    // ack-wait loop so the sender can receive TLB IPIs from other CPUs
+    // while waiting (see the unlock below).
     //
-    // CRITICAL: We need IRQs disabled while holding the lock to prevent:
+    // We must keep IRQs disabled while holding the lock to prevent the
+    // timer IRQ from preempting and abandoning the lock (lock-holder
+    // preemption deadlock).  The lock hold time is tiny (~10 ns: one
+    // atomic add + mfence + LAPIC write), so this is safe.
     //
-    // 1. Same-CPU IRQ re-entry:  Timer IRQ fires while we hold the lock.
-    //    The timer handler path (sched_preempt → dead_thread_reap →
-    //    sched_remove_task) also calls smp_tlb_shootdown_sync, which
-    //    tries to acquire the same lock → same-CPU deadlock.
-    //
-    // 2. Lock-holder preemption:  Timer IRQ preempts us while we hold
-    //    the lock.  The holder is context-switched off the CPU and can
-    //    never release it → permanent deadlock.
-    //
-    // However, we CANNOT simply cli+spin_lock: if CPU A holds the lock
-    // and sends TLB IPIs, a CPU spinning with IRQs disabled cannot ACK
-    // the IPI → CPU A's ack-wait times out.
-    //
-    // Solution: trylock loop with brief IRQ windows.  Between trylock
-    // attempts, IRQs are enabled so we can respond to TLB shootdown IPIs
-    // from the current lock holder.  Once we acquire the lock, IRQs are
-    // already disabled.
+    // While spinning on the trylock we open brief IRQ windows so this CPU
+    // can respond to TLB IPIs from the current lock holder.
     uint64_t irq_flags = local_irq_save();
     while (!spin_trylock(&g_tlb_shootdown_lock)) {
         local_irq_restore(irq_flags);
@@ -491,30 +500,88 @@ void smp_tlb_shootdown_sync(void) {
         __asm__ volatile("pause" ::: "memory");
         irq_flags = local_irq_save();
     }
-    // Lock acquired with IRQs disabled
-    
-    __atomic_store_n(&g_tlb_ack_count, 0, __ATOMIC_RELEASE);
-    
-    // Ensure all page table writes are globally visible before remote CPUs flush
+    // Lock acquired with IRQs disabled.
+
+    // Advance the global generation.  The ack handler on each remote CPU
+    // reads this value AFTER its CR3 reload and stores it in g_tlb_cpu_gen.
+    // Using __ATOMIC_SEQ_CST ensures the store is globally ordered — in
+    // particular, all preceding PTE writes (done by the caller before
+    // invoking us) are visible to any CPU that subsequently reads gen and
+    // then reloads CR3.
+    uint64_t new_gen = __atomic_add_fetch(&g_tlb_gen, 1, __ATOMIC_SEQ_CST);
+
+    // Belt-and-suspenders mfence: guarantees all non-atomic PTE writes by
+    // the caller are flushed from the store buffer before the IPI is sent.
     __asm__ volatile("mfence" ::: "memory");
-    
+
     lapic_send_ipi_all_excl_self(IPI_TLB_SHOOTDOWN);
 
-    // Wait for all remote CPUs to acknowledge (with timeout to avoid hang)
+    // CRITICAL FIX: Release the lock and re-enable IRQs BEFORE the wait loop.
+    //
+    // Previously the wait held IRQs disabled for up to ~3 ms (10 M pauses).
+    // During that window the SENDER could not receive TLB IPIs sent by other
+    // CPUs.  Those IPIs accumulated in the LAPIC IRR (coalesced to one), the
+    // other senders timed out, and the lagging CPU's per-CPU gen never
+    // advanced — producing the repeating "CPU3 gen=786 (expected>=795)"
+    // timeout messages.
+    //
+    // Why this is safe:
+    //  • smp_tlb_shootdown_sync() is never called from interrupt handlers
+    //    (confirmed: e1000e_remap_dma_region is init-time, not IRQ path;
+    //     slab_free is process context only).
+    //  • sched_preempt() explicitly does NOT call dead_thread_reap()
+    //    (see sched.c comment), so the timer-IRQ re-entrancy concern that
+    //    motivated holding the lock through the wait is not a real risk.
+    //  • With per-CPU gen tracking, concurrent senders are correct: each
+    //    gets a unique monotone gen from the atomic add; the ack handler
+    //    stores the CURRENT g_tlb_gen after CR3 reload, which satisfies all
+    //    senders whose gen <= the stored value.
+    //  • Task migration during the wait is safe: IPI handlers update
+    //    g_tlb_cpu_gen[cpu] on the hardware CPU, independent of which task
+    //    is scheduled there.  The wait loop's cpu_gen[c] reads are correct
+    //    regardless of where the waiting task runs.
+    spin_unlock(&g_tlb_shootdown_lock);
+    local_irq_restore(irq_flags);   // IRQs re-enabled for the wait loop
+
+    uint32_t my_cpu = this_cpu_id();
+
+    // Wait for every remote CPU to record gen >= new_gen in its per-CPU
+    // slot.  A CPU records new_gen (or higher) only after completing a full
+    // CR3 reload, so seeing the value here proves the TLB was flushed.
+    //
+    // Correctness under IPI coalescing: if two IPI deliveries to a CPU are
+    // merged into one (edge-triggered LAPIC), the single handler fires,
+    // reads g_tlb_gen (which may already be >= new_gen by then), reloads
+    // CR3, and records that value.  The single CR3 reload covers all PTE
+    // modifications through the recorded generation, so coherence holds.
+    //
+    // With IRQs now enabled, this CPU can receive and ACK TLB IPIs from
+    // other senders while waiting — eliminating the starvation that caused
+    // the timeouts.
     for (int i = 0; i < 10000000; i++) {
-        if (__atomic_load_n(&g_tlb_ack_count, __ATOMIC_ACQUIRE) >= expect) {
-            spin_unlock(&g_tlb_shootdown_lock);
-            local_irq_restore(irq_flags);
-            return;
+        bool all_acked = true;
+        for (uint32_t c = 0; c < online; c++) {
+            if (c == my_cpu) continue;
+            if (__atomic_load_n(&g_tlb_cpu_gen[c], __ATOMIC_ACQUIRE) < new_gen) {
+                all_acked = false;
+                break;
+            }
         }
+        if (all_acked) return;
         __asm__ volatile("pause" ::: "memory");
     }
-    
-    // Timed out — not fatal but log it
-    kprintf("SMP: TLB shootdown sync timeout (ack=%d expect=%d)\n",
-            __atomic_load_n(&g_tlb_ack_count, __ATOMIC_ACQUIRE), expect);
-    spin_unlock(&g_tlb_shootdown_lock);
-    local_irq_restore(irq_flags);
+
+    // Timed out — log which CPUs are lagging but continue (not fatal).
+    kprintf("SMP: TLB shootdown sync timeout (gen=%llu)\n",
+            (unsigned long long)new_gen);
+    for (uint32_t c = 0; c < online; c++) {
+        if (c == my_cpu) continue;
+        uint64_t cgen = __atomic_load_n(&g_tlb_cpu_gen[c], __ATOMIC_ACQUIRE);
+        if (cgen < new_gen) {
+            kprintf("  CPU%u gen=%llu (expected>=%llu)\n",
+                    c, (unsigned long long)cgen, (unsigned long long)new_gen);
+        }
+    }
 }
 
 void smp_halt_others(void) {

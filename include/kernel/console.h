@@ -128,6 +128,7 @@ int kprintf(const char* format, ...);
 int ksprintf(char* buffer, const char* format, ...);
 int ksnprintf(char* buffer, size_t size, const char* format, ...);
 int kvprintf(const char* format, va_list args);
+int kvsnprintf(char* buffer, size_t size, const char* format, va_list args);
 
 // String utility functions
 size_t kstrlen(const char* str);

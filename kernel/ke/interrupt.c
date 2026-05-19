@@ -5,6 +5,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/signal.h"
+#include "../../include/kernel/tty.h"
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/percpu.h"
 #include "../../include/kernel/smp.h"
@@ -12,6 +13,26 @@
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/e1000.h"
 #include "../../include/kernel/softirq.h"
+
+// Write a formatted message to a task's controlling TTY.
+// Falls back to kprintf (kernel console) if the task has no ctty.
+// Safe to call from exception context: PTY path is lock-free (ring buffer);
+// console TTY path holds a brief spinlock — acceptable since we're about to
+// kill the process anyway.
+static void __attribute__((format(printf, 2, 3)))
+task_tty_printf(task_t* t, const char* fmt, ...)
+{
+    char buf[256];
+    va_list args;
+    __builtin_va_start(args, fmt);
+    int len = kvsnprintf(buf, sizeof(buf), fmt, args);
+    __builtin_va_end(args);
+    tty_t* tty = t ? t->ctty : NULL;
+    if (tty)
+        tty_write(tty, buf, len);
+    else
+        kprintf("%s", buf);
+}
 
 #define PS2_STATUS_PORT         0x64
 #define PS2_STATUS_OUTPUT_FULL  0x01
@@ -396,9 +417,9 @@ void exception_handler(uint64_t *regs) {
         if (!user_mode && cr2 < 0x8000000000000000ULL) {
             task_t* cur = sched_current();
             if (cur && cur->privilege == TASK_USER) {
-                kprintf("User process %d killed by SIGSEGV (kernel access to bad user addr)\n",
+                task_tty_printf(cur, "User process %d killed by SIGSEGV (kernel access to bad user addr)\n",
                         (int)cur->id);
-                kprintf("  RIP=0x%016llx CR2=0x%016llx err=0x%llx\n", rip, cr2, err_code);
+                task_tty_printf(cur, "  RIP=0x%016llx CR2=0x%016llx err=0x%llx\n", rip, cr2, err_code);
                 sched_signal_task(cur, SIGSEGV);
                 // Enable interrupts and halt - timer will preempt us to another task
                 for (;;) { __asm__ volatile("sti; hlt"); }
@@ -412,7 +433,7 @@ void exception_handler(uint64_t *regs) {
             case 14: {
                 uint64_t cr2;
                 __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-                kprintf("User process %d killed by SIGSEGV at RIP=0x%016llx CR2=0x%016llx err=0x%llx\n",
+                task_tty_printf(cur, "User process %d killed by SIGSEGV at RIP=0x%016llx CR2=0x%016llx err=0x%llx\n",
                         cur ? (int)cur->id : -1, rip, cr2, err_code);
                 sched_signal_task(cur, SIGSEGV);
                 // NEVER return - the iret frame points to faulting code
@@ -420,42 +441,42 @@ void exception_handler(uint64_t *regs) {
                 for (;;) { __asm__ volatile("sti; hlt"); }
             }
             case 6:
-                kprintf("User process %d killed by SIGILL at RIP=0x%016llx\n",
+                task_tty_printf(cur, "User process %d killed by SIGILL at RIP=0x%016llx\n",
                         cur ? (int)cur->id : -1, rip);
                 sched_signal_task(cur, SIGILL);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             case 0:
-                kprintf("User process %d killed by SIGFPE at RIP=0x%016llx\n",
+                task_tty_printf(cur, "User process %d killed by SIGFPE at RIP=0x%016llx\n",
                         cur ? (int)cur->id : -1, rip);
                 sched_signal_task(cur, SIGFPE);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             case 3:
-                kprintf("User process %d killed by SIGTRAP at RIP=0x%016llx\n",
+                task_tty_printf(cur, "User process %d killed by SIGTRAP at RIP=0x%016llx\n",
                         cur ? (int)cur->id : -1, rip);
                 sched_signal_task(cur, SIGTRAP);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             case 4:
-                kprintf("User process %d killed by SIGFPE at RIP=0x%016llx\n",
+                task_tty_printf(cur, "User process %d killed by SIGFPE at RIP=0x%016llx\n",
                         cur ? (int)cur->id : -1, rip);
                 sched_signal_task(cur, SIGFPE);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             case 5:
-                kprintf("User process %d killed by SIGTRAP at RIP=0x%016llx\n",
+                task_tty_printf(cur, "User process %d killed by SIGTRAP at RIP=0x%016llx\n",
                         cur ? (int)cur->id : -1, rip);
                 sched_signal_task(cur, SIGTRAP);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             case 13:
-                kprintf("User process %d killed by SIGSEGV at RIP=0x%016llx (err=0x%llx)\n",
+                task_tty_printf(cur, "User process %d killed by SIGSEGV at RIP=0x%016llx (err=0x%llx)\n",
                         cur ? (int)cur->id : -1, rip, err_code);
                 sched_signal_task(cur, SIGSEGV);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             case 17:
-                kprintf("User process %d killed by SIGBUS at RIP=0x%016llx (err=0x%llx)\n",
+                task_tty_printf(cur, "User process %d killed by SIGBUS at RIP=0x%016llx (err=0x%llx)\n",
                         cur ? (int)cur->id : -1, rip, err_code);
                 sched_signal_task(cur, SIGBUS);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             default:
-                kprintf("User process %d killed by SIGABRT at RIP=0x%016llx (INT %llu)\n",
+                task_tty_printf(cur, "User process %d killed by SIGABRT at RIP=0x%016llx (INT %llu)\n",
                         cur ? (int)cur->id : -1, rip, int_no);
                 sched_signal_task(cur, SIGABRT);
                 for (;;) { __asm__ volatile("sti; hlt"); }

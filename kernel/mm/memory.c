@@ -2366,11 +2366,17 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
         return NULL;
     }
     
-    // CRITICAL: Disable interrupts during COW setup to prevent race conditions.
-    // If an interrupt caused a write to a page we just marked COW but haven't
-    // yet incremented the refcount, the COW handler would see refcount=0 and
-    // not make a copy, leaving the child with a stale reference.
-    uint64_t irq_flags = local_irq_save();
+    // CRITICAL: Disable interrupts only for the narrow window where we
+    // atomically mark each source PTE as COW and increment its refcount.
+    // Keeping the window per-PTE (rather than for the entire 4-level walk)
+    // prevents multi-millisecond IRQ-off periods that cause TLB shootdown
+    // timeouts on other CPUs.
+    //
+    // Correctness: mm_handle_cow_fault ALWAYS makes a copy when PAGE_COW is
+    // set, regardless of refcount.  Between any two PTEs (when IRQs are
+    // briefly re-enabled) a concurrent COW fault can fire on an already-
+    // processed entry without breaking coherence.  The per-PTE window only
+    // needs to protect the {mark-COW-in-src, write-child-PTE, incref} trio.
     
     // Clone user-space mappings with COW from source PML4
     // User code lives in PML4[0] around virtual address 0x400000
@@ -2431,7 +2437,11 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
                         if (!(src_pt[l] & PAGE_PRESENT)) continue;
                         
                         if (src_pt[l] & PAGE_USER) {
-                            // User page - share with COW
+                            // User page — mark both parent and child COW.
+                            // Disable IRQs for only this PTE so the
+                            // {mark-COW, incref} pair is atomic w.r.t. any
+                            // interrupt handler on this CPU.
+                            uint64_t pte_irq = local_irq_save();
                             uint64_t phys_page = src_pt[l] & 0x000FFFFFFFFFF000ULL;
                             uint64_t cow_flags = (src_pt[l] & ~PAGE_WRITABLE) | PAGE_COW;
                             src_pt[l] = cow_flags;
@@ -2442,6 +2452,7 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
                                 mm_incref_page(phys_page);
                             }
                             mm_incref_page(phys_page);
+                            local_irq_restore(pte_irq);
                         } else {
                             // Kernel page - just copy mapping
                             new_pt[l] = src_pt[l];
@@ -2452,11 +2463,8 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
         }
     }
     
-    // Flush TLB on this CPU
+    // Flush TLB on this CPU (IRQs already enabled at this point)
     mm_flush_all_tlb();
-    
-    // Restore interrupts after COW setup is complete
-    local_irq_restore(irq_flags);
     
     // CRITICAL: Flush TLB on ALL CPUs! We just marked the source (parent)
     // pages as read-only/COW. If the parent is running on another CPU with
@@ -2469,7 +2477,6 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
     return new_pml4;
     
 fail:
-    local_irq_restore(irq_flags);
     mm_destroy_address_space(new_pml4);
     return NULL;
 }
@@ -2502,11 +2509,9 @@ uint64_t* mm_clone_address_space_with_shared(uint64_t* src_pml4,
         return NULL;
     }
     
-    // CRITICAL: Disable interrupts during COW setup to prevent race conditions.
-    // If an interrupt caused a write to a page we just marked COW but haven't
-    // yet incremented the refcount, the COW handler would see refcount=0 and
-    // not make a copy, leaving the child with a stale reference.
-    uint64_t irq_flags = local_irq_save();
+    // CRITICAL: Disable interrupts only for the narrow per-PTE window where
+    // we atomically mark a source PTE as COW and increment its refcount.
+    // See mm_clone_address_space() for the detailed rationale.
     
     // Handle PML4 entries 0-255 (user space)
     for (int i = 0; i < 256; i++) {
@@ -2571,7 +2576,9 @@ uint64_t* mm_clone_address_space_with_shared(uint64_t* src_pml4,
                             uint64_t phys_page = src_pt[l] & 0x000FFFFFFFFFF000ULL;
                             
                             if (is_in_shared_range(vaddr, shared_regions, num_shared)) {
-                                // Shared region - map same physical page, keep original flags
+                                // Shared region — map same physical page.
+                                // Briefly disable IRQs for the {write-PTE, incref} pair.
+                                uint64_t pte_irq = local_irq_save();
                                 new_pt[l] = src_pt[l];
                                 // Increment refcount for BOTH parent and child references
                                 // (same logic as COW: if never tracked, init to 1 for parent)
@@ -2579,8 +2586,11 @@ uint64_t* mm_clone_address_space_with_shared(uint64_t* src_pml4,
                                     mm_incref_page(phys_page);
                                 }
                                 mm_incref_page(phys_page);
+                                local_irq_restore(pte_irq);
                             } else {
-                                // Not shared - use COW
+                                // Not shared — mark COW.
+                                // Disable IRQs for the {mark-COW-in-src, write-child-PTE, incref} trio.
+                                uint64_t pte_irq = local_irq_save();
                                 uint64_t cow_flags = (src_pt[l] & ~PAGE_WRITABLE) | PAGE_COW;
                                 src_pt[l] = cow_flags;
                                 new_pt[l] = cow_flags;
@@ -2590,6 +2600,7 @@ uint64_t* mm_clone_address_space_with_shared(uint64_t* src_pml4,
                                     mm_incref_page(phys_page);
                                 }
                                 mm_incref_page(phys_page);
+                                local_irq_restore(pte_irq);
                             }
                         } else {
                             new_pt[l] = src_pt[l];
@@ -2600,11 +2611,8 @@ uint64_t* mm_clone_address_space_with_shared(uint64_t* src_pml4,
         }
     }
     
-    // Flush TLB on this CPU
+    // Flush TLB on this CPU (IRQs already enabled at this point)
     mm_flush_all_tlb();
-    
-    // Restore interrupts after COW setup is complete
-    local_irq_restore(irq_flags);
     
     // CRITICAL: Flush TLB on ALL CPUs! We just marked the source (parent)
     // pages as read-only/COW. If the parent is running on another CPU with
@@ -2617,7 +2625,6 @@ uint64_t* mm_clone_address_space_with_shared(uint64_t* src_pml4,
     return new_pml4;
     
 fail:
-    local_irq_restore(irq_flags);
     mm_destroy_address_space(new_pml4);
     return NULL;
 }
