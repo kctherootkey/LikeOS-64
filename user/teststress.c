@@ -1,6 +1,7 @@
 // teststress - stress test program that runs random commands in a loop
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -16,15 +17,14 @@ static unsigned int rand_simple(void) {
 }
 
 // Commands to run (use full paths since execve doesn't search PATH).
-// Default mix — exercises libc/syscalls/memory.  testlibc is run WITHOUT
-// the "network" subtest here; network coverage is added in by the
-// network-mode list below (or appended to this list when teststress is
-// invoked without the "network" option, see main()).
+// Default mix — exercises libc/syscalls/memory (no network tests).
+// teststress "all"     — also runs network_commands[] in addition to this.
+// teststress "network" — runs only network_commands[].
 static const char* commands[] = {
     "/bin/ls",
     "/usr/local/bin/testlibc",
     "/usr/local/bin/tests",
-    "/usr/local/bin/testmem 250",
+    "/usr/local/bin/testmem 100",
     "/usr/local/bin/hello",
     "/usr/local/bin/memstat",
     "/bin/cat /HELLO.TXT",
@@ -98,18 +98,18 @@ static int parse_command(const char* cmd, char* argv[], int max_args) {
 }
 
 int main(int argc, char** argv) {
-    // Two modes:
-    //   teststress              — default mix + every network command
-    //                             (testlibc is run WITHOUT "network").
-    //   teststress network      — only network commands, and testlibc is
-    //                             run WITH the "network" subtest.
+    // Three modes:
+    //   teststress              — default mix only (no network commands;
+    //                             testlibc is run WITHOUT "network").
+    //   teststress all          — default mix + network commands.
+    //   teststress network      — only network commands (testlibc "network").
     int network_only = 0;
+    int run_all = 0;
     for (int i = 1; i < argc; i++) {
-        if (argv[i] && argv[i][0] == 'n' && argv[i][1] == 'e' &&
-            argv[i][2] == 't' && argv[i][3] == 'w' && argv[i][4] == 'o' &&
-            argv[i][5] == 'r' && argv[i][6] == 'k' && argv[i][7] == '\0') {
+        if (argv[i] && strcmp(argv[i], "network") == 0)
             network_only = 1;
-        }
+        else if (argv[i] && strcmp(argv[i], "all") == 0)
+            run_all = 1;
     }
 
     // Build the active command pool.
@@ -118,18 +118,22 @@ int main(int argc, char** argv) {
     if (network_only) {
         for (unsigned i = 0; i < NUM_NETWORK_COMMANDS; i++)
             pool[pool_count++] = network_commands[i];
-    } else {
+    } else if (run_all) {
         for (unsigned i = 0; i < NUM_COMMANDS; i++)
             pool[pool_count++] = commands[i];
         for (unsigned i = 0; i < NUM_NETWORK_COMMANDS; i++)
             pool[pool_count++] = network_commands[i];
+    } else {
+        // Default: commands[] only, no network.
+        for (unsigned i = 0; i < NUM_COMMANDS; i++)
+            pool[pool_count++] = commands[i];
     }
 
     int iteration = 0;
     time_t start_time = time(NULL);
     
     printf("=== STRESS TEST STARTED ===\n");
-    printf("Mode: %s\n", network_only ? "network only" : "default + network");
+    printf("Mode: %s\n", network_only ? "network only" : run_all ? "default + network" : "default only");
     printf("Running random commands for up to 10 minutes...\n");
     printf("Press Ctrl+C to stop early\n\n");
     

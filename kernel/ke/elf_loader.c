@@ -494,6 +494,9 @@ uint64_t elf_exec_replace(const char* path, char* const argv[],
     cur->brk_start     = lr.brk_start;
     cur->brk           = lr.brk_start;
     cur->user_stack_top = USER_STACK_TOP_EXEC;
+    /* Clear stale mmap_region slots inherited from parent via fork+exec. */
+    for (int i = 0; i < TASK_MAX_MMAP; i++)
+        cur->mmap_regions[i].in_use = false;
     cur->mmap_base     = USER_STACK_TOP_EXEC - (4 * 1024 * 1024);
 
     for (int i = 3; i < TASK_MAX_FDS; i++) {

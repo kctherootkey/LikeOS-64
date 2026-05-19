@@ -314,6 +314,15 @@ static dso_t *rtld_find_dso(const char *name)
 
 static dso_t *rtld_alloc_dso(void)
 {
+    /* Reuse a previously dlclose'd slot (all fields zeroed) if available. */
+    for (int i = 0; i < g_ndsos; i++) {
+        if (!g_dsos[i].name && !g_dsos[i].symtab) {
+            dso_t *d = &g_dsos[i];
+            rtld_memset(d, 0, sizeof(*d));
+            d->refcount = 1;
+            return d;
+        }
+    }
     if (g_ndsos >= MAX_DSOS) rtld_die("too many shared objects");
     dso_t *d = &g_dsos[g_ndsos++];
     rtld_memset(d, 0, sizeof(*d));
@@ -929,7 +938,10 @@ int _rtld_dlclose(void *handle)
     if (d->fini_fn) d->fini_fn();
     if (d->map_base && d->map_size)
         rtld_munmap((void *)d->map_base, d->map_size);
-    d->name = NULL; d->refcount = 0; d->base = 0;
+    /* Zero the entire DSO entry so subsequent rtld_lookup_symbol iterations
+     * skip it (symtab/strtab checks will be NULL) and stale pointers into
+     * the now-unmapped library pages can never be dereferenced. */
+    rtld_memset(d, 0, sizeof(*d));
     return 0;
 }
 

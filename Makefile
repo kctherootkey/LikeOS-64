@@ -16,6 +16,9 @@ DD = dd
 QEMU = qemu-system-x86_64
 XORRISO = xorriso
 
+# RAM for all QEMU targets (override with e.g. QEMU_MEM=2G on the command line)
+QEMU_MEM ?= 1024M
+
 # SMP configuration for QEMU targets:
 #   NUM_CPUS=N   - set number of CPUs (default: 4)
 #   NO_SMP=1     - disable SMP entirely (omit -smp argument)
@@ -1094,12 +1097,12 @@ $(USB_IMAGE): $(FAT_IMAGE) | $(BUILD_DIR)
 # Run in QEMU with UEFI firmware
 qemu: $(ISO_IMAGE)
 	@echo "Running LikeOS-64 in QEMU with UEFI firmware..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP)
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP)
 
 # Run from FAT image in QEMU
 qemu-fat: $(FAT_IMAGE)
 	@echo "Running LikeOS-64 from FAT image in QEMU with UEFI firmware..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -drive format=raw,file=$(FAT_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP)
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -drive format=raw,file=$(FAT_IMAGE) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP)
 
 # Standalone USB mass storage data image (64MB FAT32) now mirrors usb-write target (UEFI bootable + signature files)
 # Provides: EFI/BOOT/BOOTX64.EFI, kernel.elf, LIKEOS.SIG, HELLO.TXT, tests
@@ -1241,7 +1244,7 @@ qemu-usb: $(ISO_IMAGE) $(DATA_IMAGE)
 	@# sudo is required so SLIRP can open a raw ICMP socket on the host;
 	@# without it, external `ping` (e.g. ping 8.8.8.8) is silently dropped
 	@# while the synthetic gateway reply (10.0.2.2) still works.
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
 		-device usb-storage,drive=usbdisk $(QEMU_USB_HID) -machine type=pc,accel=kvm:tcg \
 		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
@@ -1255,7 +1258,7 @@ qemu-usb-gdb:
 	@echo "Running LikeOS-64 in QEMU with xHCI + USB mass storage + $(NIC_DEVICE) + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
 	@# sudo: see qemu-usb target above (SLIRP raw ICMP socket).
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=usbdisk,file=$(DATA_IMAGE),format=raw,readonly=off \
 		-device usb-storage,drive=usbdisk $(QEMU_USB_HID) -machine type=pc,accel=kvm:tcg \
 		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0 \
@@ -1268,7 +1271,7 @@ ifndef USB_DEVICE
 	$(error USB_DEVICE is not set. Usage: make qemu-realusb USB_DEVICE=/dev/sdb)
 endif
 	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC)..."
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg \
 		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
@@ -1285,7 +1288,7 @@ endif
 	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" NO_STRIP=1 usb-write USB_DEVICE=$(USB_DEVICE)
 	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC) + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m 512M $(QEMU_SERIAL) $(QEMU_SMP) \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg \
 		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0 \
@@ -1312,7 +1315,7 @@ qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)
 	if [ "$$USE_USB_BOOT" = "1" ]; then echo "Using bootable FAT image as USB device"; usbimg="$(FAT_IMAGE)"; else usbimg="$(DATA_IMAGE)"; fi; \
 	echo "Passing through devices:$$devices"; \
 	set -x; \
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m 512M $(QEMU_SERIAL) $(QEMU_SMP) -machine q35 -device qemu-xhci,id=xhci -device usb-tablet -drive if=none,id=usbdisk,file=$$usbimg,format=raw,readonly=off -device usb-storage,drive=usbdisk $$devices || echo "QEMU exited with status $$?"; \
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -cdrom $(ISO_IMAGE) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) -machine q35 -device qemu-xhci,id=xhci -device usb-tablet -drive if=none,id=usbdisk,file=$$usbimg,format=raw,readonly=off -device usb-storage,drive=usbdisk $$devices || echo "QEMU exited with status $$?"; \
 	set +x || true
 
 # Write ISO to USB device with GPT partition table (like Rufus)

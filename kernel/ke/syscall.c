@@ -2011,33 +2011,46 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length) {
 
     length = PAGE_ALIGN(length);
 
-    mmap_region_t* region = find_mmap_region(cur, addr);
-    if (!region) {
-        return -EINVAL;
+    /* Iterate through all mmap regions that overlap [addr, addr+length).
+     * This supports the common case of a single munmap call covering
+     * multiple contiguous MAP_FIXED regions (e.g. the full span of a DSO). */
+    uint64_t cur_addr = addr;
+    uint64_t end_addr = addr + length;
+    int freed_any = 0;
+
+    while (cur_addr < end_addr) {
+        mmap_region_t *region = find_mmap_region(cur, cur_addr);
+        if (!region) {
+            /* No region covers cur_addr — skip forward one page. */
+            cur_addr += PAGE_SIZE;
+            continue;
+        }
+
+        uint64_t region_end = region->start + region->length;
+        uint64_t unmap_end  = (end_addr < region_end) ? end_addr : region_end;
+
+        /* Unmap pages within [cur_addr, unmap_end). */
+        for (uint64_t va = cur_addr; va < unmap_end; va += PAGE_SIZE)
+            mm_unmap_page_in_address_space(cur->pml4, va);
+
+        /* Update or free the region record. */
+        if (cur_addr == region->start && unmap_end == region_end) {
+            region->in_use = false;
+        } else if (cur_addr == region->start) {
+            region->start  = unmap_end;
+            region->length = region_end - unmap_end;
+        } else if (unmap_end == region_end) {
+            region->length = cur_addr - region->start;
+        } else {
+            /* Mid-region split not supported; leave the region intact
+             * but still unmap the pages. */
+        }
+
+        freed_any = 1;
+        cur_addr = region_end;
     }
 
-    uint64_t region_end = region->start + region->length;
-    if (addr < region->start || addr + length > region_end) {
-        return -EINVAL;
-    }
-
-    for (uint64_t off = 0; off < length; off += PAGE_SIZE) {
-        mm_unmap_page_in_address_space(cur->pml4, addr + off);
-    }
-
-    if (addr == region->start && length == region->length) {
-        region->in_use = false;
-    } else if (addr == region->start) {
-        region->start += length;
-        region->length -= length;
-    } else if (addr + length == region_end) {
-        region->length -= length;
-    } else {
-        // Splitting regions not supported yet
-        return -EINVAL;
-    }
-
-    return 0;
+    return freed_any ? 0 : -EINVAL;
 }
 
 // SYS_PIPE - create a pipe

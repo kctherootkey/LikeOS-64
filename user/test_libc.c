@@ -362,12 +362,17 @@ static void* once_thread_fn(void* arg) {
 }
 
 int main(int argc, char** argv) {
-    /* Subcommand selection: "testlibc network" runs only the networking
-     * test sections; with no arg every section runs. */
-    int net_only = (argc > 1 && strcmp(argv[1], "network") == 0);
+    /* Subcommand selection:
+     *   (no arg)          — run all sections except network
+     *   testlibc all      — run all sections including network
+     *   testlibc network  — run only the networking sections */
+    int net_only     = (argc > 1 && strcmp(argv[1], "network") == 0);
+    int skip_network = (argc < 2 || strcmp(argv[1], "all") != 0) && !net_only;
 
     printf("\n========================================\n");
-    printf("  LikeOS-64 Libc Tests%s\n", net_only ? " (network only)" : "");
+    printf("  LikeOS-64 Libc Tests%s\n",
+           net_only     ? " (network only)" :
+           skip_network ? " (no network)"   : " (all)");
     printf("========================================\n\n");
 
     // ========================================
@@ -3729,6 +3734,7 @@ int main(int argc, char** argv) {
     // ========================================
     // Socket / Networking Tests
     // ========================================
+    if (skip_network) goto network_skip;
 network_section:
     (void)0; /* label needs a statement */
     printf("\n--- Socket Tests ---\n");
@@ -6919,6 +6925,7 @@ network_section:
     /* End of OpenSSL tests                                    */
     /* ====================================================== */
 
+network_skip:;
     // ========================================
     // Summary
     // ========================================
