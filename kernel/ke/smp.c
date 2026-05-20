@@ -568,9 +568,9 @@ void smp_tlb_shootdown_sync(void) {
     // would never get another chance to ACK within the deadline.
     uint64_t tsc_freq = lapic_get_tsc_freq();
     // Fall back to a conservative 1 GHz estimate if not calibrated yet.
-    uint64_t tsc_1ms   = (tsc_freq != 0) ? (tsc_freq / 1000) : 1000000ULL;
-    uint64_t tsc_10ms  = tsc_1ms * 10;
-    uint64_t tsc_200ms = tsc_1ms * 200;
+    uint64_t tsc_1ms    = (tsc_freq != 0) ? (tsc_freq / 1000) : 1000000ULL;
+    uint64_t tsc_10ms   = tsc_1ms * 10;
+    uint64_t tsc_1000ms = tsc_1ms * 1000;  /* VirtualBox can deschedule a vCPU for >200 ms under load */
     uint64_t start_tsc = timer_rdtsc();
     uint64_t next_retry_tsc = start_tsc + tsc_10ms;
 
@@ -586,7 +586,7 @@ void smp_tlb_shootdown_sync(void) {
         if (all_acked) return;
 
         uint64_t now = timer_rdtsc();
-        if (now - start_tsc >= tsc_200ms) break;
+        if (now - start_tsc >= tsc_1000ms) break;
 
         // Every ~10 ms, re-send the IPI unicast to each CPU that is still
         // lagging.  This recovers from two failure modes:
