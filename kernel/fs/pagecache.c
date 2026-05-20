@@ -873,6 +873,14 @@ int pagecache_flush_file(unsigned long cluster_id)
                     p->flags &= ~PC_PAGE_LOCKED;
                     continue;
                 }
+                /* BUG GUARD: writing page-cache data to root cluster would corrupt root dir */
+                if (disk_cluster == (unsigned long)fs->root_cluster) {
+                    kprintf("FAT32: BUG: pagecache flush_file to root cluster! "
+                            "cluster_id=%lu page_idx=%lu ci=%lu\n",
+                            p->cluster_id, p->page_index, cluster_index);
+                    p->flags &= ~PC_PAGE_LOCKED;
+                    continue;
+                }
 
                 unsigned long lba = pc_cluster_to_lba(fs, disk_cluster);
 
@@ -991,9 +999,16 @@ int pagecache_flush_all(void)
                     p->flags &= ~PC_PAGE_LOCKED;
                     continue;
                 }
+                /* BUG GUARD: writing page-cache data to root cluster would corrupt root dir */
+                if (disk_cluster == (unsigned long)fs->root_cluster) {
+                    kprintf("FAT32: BUG: pagecache flush_all to root cluster! "
+                            "cluster_id=%lu page_idx=%lu ci=%lu\n",
+                            p->cluster_id, p->page_index, cluster_index);
+                    p->flags &= ~PC_PAGE_LOCKED;
+                    continue;
+                }
 
                 unsigned long lba = pc_cluster_to_lba(fs, disk_cluster);
-
                 if (cluster_size == PAGE_SIZE) {
                     pc_write_sectors(fs->bdev, lba, fs->sectors_per_cluster,
                                      p->data);

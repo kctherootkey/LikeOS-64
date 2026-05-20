@@ -452,7 +452,8 @@ void sched_mark_task_exited(task_t* task, int status);
 void sched_signal_task(task_t* task, int sig);
 void sched_signal_pgrp(int pgid, int sig);
 int sched_pgid_exists(int pgid);
-void sched_dump_tasks(void);  // Debug: dump all task states
+struct tty;  // forward declaration for dump output
+void sched_dump_tasks(struct tty *tty);  // Debug: dump all task states
 
 // ============================================================================
 // THREAD GROUP MANAGEMENT

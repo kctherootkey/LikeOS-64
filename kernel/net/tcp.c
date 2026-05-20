@@ -1,6 +1,7 @@
 // LikeOS-64 TCP (Transmission Control Protocol)
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/tty.h"
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/syscall.h"
@@ -2525,13 +2526,13 @@ int tcp_at_mark(tcp_conn_t* conn) {
 // On-demand connection-table snapshot for the Ctrl+N debug dump.
 // Lock-free best-effort read — values may tear, but this is purely
 // diagnostic and never used for correctness.
-void tcp_dump_table(void) {
+void tcp_dump_table(struct tty *tty) {
     static const char* sn[] = {
         "CLOSED","LISTEN","SYN_SNT","SYN_RCV","ESTAB",
         "FIN_W1","FIN_W2","CLS_WT","CLOSING","LST_ACK","TM_WAIT"
     };
-    kprintf("=== TCP table ===\n");
-    kprintf("slot st       laddr:lport            raddr:rport       parent  aq h/t r ar rt rcnt rnxt-snxt-suna\n");
+    tty_printf(tty, "=== TCP table ===\n");
+    tty_printf(tty, "slot st       laddr:lport            raddr:rport       parent  aq h/t r ar rt rcnt rnxt-snxt-suna\n");
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         tcp_conn_t* c = &tcp_connections[i];
         if (!c->active) continue;
@@ -2542,7 +2543,7 @@ void tcp_dump_table(void) {
             for (int j = 0; j < TCP_MAX_CONNECTIONS; j++)
                 if (c->parent == &tcp_connections[j]) { parent_slot = j; break; }
         }
-        kprintf("%3d %-7s %u.%u.%u.%u:%u %u.%u.%u.%u:%u p=%d h=%u t=%u ar=%u rt=%llu rc=%u rnxt=%u snxt=%u suna=%u\n",
+        tty_printf(tty, "%3d %-7s %u.%u.%u.%u:%u %u.%u.%u.%u:%u p=%d h=%u t=%u ar=%u rt=%llu rc=%u rnxt=%u snxt=%u suna=%u\n",
                 i, s,
                 (li>>24)&0xff,(li>>16)&0xff,(li>>8)&0xff,li&0xff, c->local_port,
                 (ri>>24)&0xff,(ri>>16)&0xff,(ri>>8)&0xff,ri&0xff, c->remote_port,
@@ -2553,7 +2554,7 @@ void tcp_dump_table(void) {
                 (unsigned)c->retransmit_count,
                 c->rcv_nxt, c->snd_nxt, c->snd_una);
     }
-    kprintf("=================\n");
+    tty_printf(tty, "=================\n");
 }
 
 // RFC 1191: clamp a connection's effective MSS when an ICMP frag-needed

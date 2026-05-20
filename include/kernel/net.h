@@ -233,8 +233,8 @@ typedef struct __attribute__((packed)) {
 #define TCP_MAX_CONNECTIONS     64
 #define TCP_WINDOW_SIZE         32768
 #define TCP_MSS                 1460    // Maximum Segment Size
-#define TCP_RX_BUF_SIZE         65536
-#define TCP_TX_BUF_SIZE         65536
+#define TCP_RX_BUF_SIZE         131072
+#define TCP_TX_BUF_SIZE         131072
 #define TCP_RETRANSMIT_TICKS    200     // 2 seconds at 100Hz
 #define TCP_TIME_WAIT_TICKS     6000    // 60 seconds
 #define TCP_MAX_RETRANSMITS     5
@@ -857,7 +857,8 @@ int  tcp_send_segment(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                       uint8_t flags, uint16_t window,
                       const uint8_t* data, uint16_t data_len);
 void tcp_fill_info(tcp_conn_t* conn, struct tcp_info* info);
-void tcp_dump_table(void);
+struct tty;  // forward declaration for dump output
+void tcp_dump_table(struct tty *tty);
 
 // ============================================================================
 // DHCP API

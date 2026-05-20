@@ -603,6 +603,7 @@ static int vfs_status_to_errno(int st) {
         case ST_EXISTS:    return -EEXIST;
         case ST_BUSY:      return -EBUSY;
         case ST_AGAIN:     return -EAGAIN;
+        case ST_NOTEMPTY:  return -ENOTEMPTY;
         default:           return -EACCES;
     }
 }
@@ -3453,9 +3454,34 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
                 kfree(child);
                 return -ENOMEM;
             }
-            // Copy existing fd_table to files_struct
+            // Copy existing fd_table to files_struct, bumping refcounts so
+            // that files_struct holds independent references.  Without this,
+            // a later sys_close() frees the object while files_struct still
+            // holds the same raw pointer → vfs_close refcount underflow on
+            // process exit via files_struct_put().
             for (int i = 0; i < TASK_MAX_FDS; i++) {
-                cur->files->fd_table[i] = cur->fd_table[i];
+                void* entry = cur->fd_table[i];
+                if (!entry) { cur->files->fd_table[i] = NULL; continue; }
+                uint64_t marker = (uint64_t)entry;
+                if (marker >= 1 && marker <= 3) {
+                    cur->files->fd_table[i] = entry;
+                } else if (IS_SOCKET_FD(entry)) {
+                    int idx = SOCKET_FD_IDX(entry);
+                    net_socket_t* s = sock_get(idx);
+                    if (s) __atomic_fetch_add(&s->ref_count, 1, __ATOMIC_ACQ_REL);
+                    cur->files->fd_table[i] = entry;
+                } else if (IS_UNIX_SOCKET_FD(entry)) {
+                    unix_socket_t* us = unix_get((int)(uintptr_t)entry);
+                    if (us) __atomic_fetch_add(&us->ref_count, 1, __ATOMIC_ACQ_REL);
+                    cur->files->fd_table[i] = entry;
+                } else if (IS_EPOLL_FD(entry)) {
+                    cur->files->fd_table[i] = entry;
+                } else if (pipe_is_end(entry)) {
+                    pipe_end_t* ne = pipe_dup_end((pipe_end_t*)entry);
+                    cur->files->fd_table[i] = ne ? (void*)ne : NULL;
+                } else {
+                    cur->files->fd_table[i] = vfs_dup((vfs_file_t*)entry);
+                }
             }
             
             files_struct_get(cur->files);

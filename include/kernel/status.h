@@ -16,6 +16,7 @@ typedef enum {
     ST_AGAIN = -10, // temporary condition, try again later
     ST_BUSY = -11,
     ST_EXISTS = -12,
+    ST_NOTEMPTY = -13,
 } status_t;
 
 #endif // LIKEOS_STATUS_H

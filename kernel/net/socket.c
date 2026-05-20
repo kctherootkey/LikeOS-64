@@ -763,12 +763,24 @@ int sock_setsockopt(int sockfd, int level, int optname,
         case SO_RCVBUF:
             if (ival > 0) s->rcvbuf_size = (uint32_t)ival;
             return 0;
-        case SO_RCVTIMEO:
-            if (optlen >= sizeof(uint64_t))
-                s->rcv_timeout_ticks = *(const uint64_t*)optval / 10;
-            else if (optlen >= sizeof(int))
+        case SO_RCVTIMEO: {
+            /* struct timeval is { int64_t tv_sec, int64_t tv_usec } = 16 bytes.
+             * Kernel timer runs at 100 Hz (1 tick = 10 ms).
+             * Convert: ticks = tv_sec * 100 + tv_usec / 10000.
+             * Legacy callers passing a raw millisecond uint64_t (<16 bytes) still
+             * use the old /10 path. */
+            if (optlen >= 2 * (int)sizeof(uint64_t)) {
+                const int64_t *tv = (const int64_t *)optval;
+                int64_t sec  = tv[0] > 0 ? tv[0] : 0;
+                int64_t usec = tv[1] > 0 ? tv[1] : 0;
+                s->rcv_timeout_ticks = (uint64_t)sec * 100 + (uint64_t)usec / 10000;
+            } else if (optlen >= (int)sizeof(uint64_t)) {
+                s->rcv_timeout_ticks = *(const uint64_t *)optval / 10;
+            } else if (optlen >= (int)sizeof(int)) {
                 s->rcv_timeout_ticks = (uint64_t)ival / 10;
+            }
             return 0;
+        }
         case SO_SNDTIMEO:
             return 0;  // accepted; not enforced
         case SO_LINGER: {

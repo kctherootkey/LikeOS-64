@@ -45,6 +45,7 @@
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/futex.h"
 #include "../../include/kernel/net.h"
+#include "../../include/kernel/slab.h"
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
@@ -59,6 +60,9 @@ volatile int g_preempt_count = 0;
 // Global all-tasks linked list (linear, via task->next)
 static task_t* g_task_list_head = NULL;
 spinlock_t g_task_list_lock = SPINLOCK_INIT("task_list");
+// Approximate task count maintained atomically alongside the list.
+// Updated under g_task_list_lock but readable lock-free for pre-allocation.
+static int g_task_list_count = 0;
 
 // SMP mode flag – when true, use per-CPU current task and run queues
 int g_smp_initialized = 0;
@@ -238,6 +242,7 @@ static inline void switch_address_space(task_t* prev, task_t* next) {
 void task_list_add(task_t* t) {
     t->next = g_task_list_head;
     g_task_list_head = t;
+    __atomic_fetch_add(&g_task_list_count, 1, __ATOMIC_RELAXED);
 }
 
 static void task_list_remove(task_t* t) {
@@ -245,12 +250,14 @@ static void task_list_remove(task_t* t) {
     if (g_task_list_head == t) {
         g_task_list_head = t->next;
         t->next = NULL;
+        __atomic_fetch_sub(&g_task_list_count, 1, __ATOMIC_RELAXED);
         return;
     }
     for (task_t* prev = g_task_list_head; prev; prev = prev->next) {
         if (prev->next == t) {
             prev->next = t->next;
             t->next = NULL;
+            __atomic_fetch_sub(&g_task_list_count, 1, __ATOMIC_RELAXED);
             return;
         }
     }
@@ -1428,12 +1435,38 @@ void sched_mark_task_exited(task_t* task, int status) {
     // (task->mm and task->pml4 are intentionally kept alive here.)
     
     if (task->files) {
+        // Close fd_table entries that were opened AFTER files_struct was created
+        // (those are present in fd_table but NOT in files_struct, so files_struct_put
+        // won't close them).  Entries that WERE copied into files_struct at
+        // CLONE_FILES time have independent references there; our vfs_close here
+        // takes the refcount from 2→1 (the file stays open until files_struct_put
+        // does the final close below).
+        for (int i = 0; i < TASK_MAX_FDS; i++) {
+            if (task->fd_table[i]) {
+                uint64_t marker = (uint64_t)task->fd_table[i];
+                if (marker >= 1 && marker <= 3) {
+                    /* stdio markers — no refcount */
+                } else if (IS_SOCKET_FD(task->fd_table[i])) {
+                    int idx = SOCKET_FD_IDX(task->fd_table[i]);
+                    sock_close(idx);
+                } else if (IS_UNIX_SOCKET_FD(task->fd_table[i])) {
+                    int ufd = (int)(uintptr_t)task->fd_table[i];
+                    unix_close(ufd);
+                } else if (IS_EPOLL_FD(task->fd_table[i])) {
+                    int idx = EPOLL_FD_IDX(task->fd_table[i]);
+                    extern epoll_instance_t epoll_instances[];
+                    if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
+                        epoll_instances[idx].active = 0;
+                } else if (pipe_is_end(task->fd_table[i])) {
+                    pipe_close_end((pipe_end_t*)task->fd_table[i]);
+                } else {
+                    vfs_close(task->fd_table[i]);
+                }
+                task->fd_table[i] = NULL;
+            }
+        }
         files_struct_put(task->files);
         task->files = NULL;
-        // Clear legacy fd_table pointers (they were aliases)
-        for (int i = 0; i < TASK_MAX_FDS; i++) {
-            task->fd_table[i] = NULL;
-        }
     } else {
         // Legacy path: close file descriptors directly
         for (int i = 0; i < TASK_MAX_FDS; i++) {
@@ -1671,12 +1704,12 @@ extern volatile uint64_t g_irq0_count;
 extern volatile uint64_t g_total_irq_count;
 extern uint64_t timer_ticks(void);
 
-void sched_dump_tasks(void) {
+void sched_dump_tasks(struct tty *tty) {
     static const char* state_names[] = { "READY", "RUN", "BLOCK", "STOP", "ZOMBIE" };
-    kprintf("\n=== Debug Dump (Ctrl+D) ===\n");
-    kprintf("Ticks: %llu  IRQ0: %llu  TotalIRQ: %llu  Schedules: %llu\n",
+    tty_printf(tty, "\n=== Debug Dump (Ctrl+D) ===\n");
+    tty_printf(tty, "Ticks: %llu  IRQ0: %llu  TotalIRQ: %llu  Schedules: %llu\n",
             timer_ticks(), g_irq0_count, g_total_irq_count, g_total_schedules);
-    kprintf("FreeMem: %llu KB  CPUs: %u\n", mm_get_free_pages() * 4,
+    tty_printf(tty, "FreeMem: %llu KB  CPUs: %u\n", mm_get_free_pages() * 4,
             percpu_get_online_count());
 
     // Per-CPU run queue stats - take locks to get consistent snapshot
@@ -1689,32 +1722,61 @@ void sched_dump_tasks(void) {
             uint32_t rq_len = cpu->runqueue_length;
             uint64_t ctx_sw = cpu->context_switches;
             spin_unlock(&cpu->runqueue_lock);
-            kprintf("  CPU%u: rq_len=%u ctx_sw=%llu head_pid=%d\n",
+            tty_printf(tty, "  CPU%u: rq_len=%u ctx_sw=%llu head_pid=%d\n",
                     c, rq_len, ctx_sw, head_pid);
         }
     }
 
-    kprintf(" TID  TGID PPID  CPU  State   onRQ  #Th  Ldr  lastRIP           userRIP\n");
-    kprintf("----  ---- ----  ---  ------  ----  ---  ---  ----------------  ----------------\n");
+    tty_printf(tty, " TID  TGID PPID  CPU  State   onRQ  #Th  Ldr  lastRIP           userRIP\n");
+    tty_printf(tty, "----  ---- ----  ---  ------  ----  ---  ---  ----------------  ----------------\n");
+
+    /* Snapshot the task list while holding g_task_list_lock, then release
+     * before calling tty_printf.  tty_write on a PTY slave calls
+     * tty_wake_readers → sched_wake_channel which re-acquires
+     * g_task_list_lock — holding it here would deadlock the system. */
+    /* Allocate snapshot buffer sized to the current task count + slack for
+     * any tasks created between the count read and the lock acquisition. */
+    int snap_cap = __atomic_load_n(&g_task_list_count, __ATOMIC_RELAXED) + 16;
+    struct {
+        int id, tgid, ppid, on_cpu, on_rq, nr_threads;
+        uint64_t last_rip, user_rip;
+        uint8_t state;
+        char is_leader, marker;
+    } *snaps = slab_alloc((size_t)snap_cap * sizeof(*snaps));
+    if (!snaps) {
+        tty_printf(tty, "[sched_dump: out of memory]\n");
+        return;
+    }
+    int nsnaps = 0;
 
     uint64_t flags;
     spin_lock_irqsave(&g_task_list_lock, &flags);
     task_t* cur = sched_current();
-    for (task_t* t = g_task_list_head; t; t = t->next) {
-        const char* sn = (t->state <= TASK_ZOMBIE) ? state_names[t->state] : "???";
-        int ppid = t->parent ? t->parent->id : 0;
-        char marker = (t == cur) ? '*' : ' ';
-        uint64_t last_rip = t->preempt_frame ? t->preempt_frame->rip : 0;
-        uint64_t user_rip = t->syscall_rip;
-        int tgid = t->tgid;
-        int nr_threads = t->group_leader ? t->group_leader->nr_threads : 1;
-        char is_leader = (t == t->group_leader) ? 'L' : '-';
-        kprintf("%c%3d  %4d %4d  %3u  %-6s  %4d  %3d   %c   %016lx  %016lx\n",
-                marker, t->id, tgid, ppid, t->on_cpu, sn, t->on_rq,
-                nr_threads, is_leader, last_rip, user_rip);
+    for (task_t* t = g_task_list_head; t && nsnaps < snap_cap; t = t->next) {
+        snaps[nsnaps].id         = t->id;
+        snaps[nsnaps].tgid       = t->tgid;
+        snaps[nsnaps].ppid       = t->parent ? t->parent->id : 0;
+        snaps[nsnaps].on_cpu     = t->on_cpu;
+        snaps[nsnaps].on_rq      = t->on_rq;
+        snaps[nsnaps].nr_threads = t->group_leader ? t->group_leader->nr_threads : 1;
+        snaps[nsnaps].last_rip   = t->preempt_frame ? t->preempt_frame->rip : 0;
+        snaps[nsnaps].user_rip   = t->syscall_rip;
+        snaps[nsnaps].state      = (uint8_t)t->state;
+        snaps[nsnaps].is_leader  = (t == t->group_leader) ? 'L' : '-';
+        snaps[nsnaps].marker     = (t == cur) ? '*' : ' ';
+        nsnaps++;
     }
     spin_unlock_irqrestore(&g_task_list_lock, flags);
-    kprintf("=======================================================================\n");
+
+    for (int i = 0; i < nsnaps; i++) {
+        const char* sn = (snaps[i].state <= TASK_ZOMBIE) ? state_names[snaps[i].state] : "???";
+        tty_printf(tty, "%c%3d  %4d %4d  %3u  %-6s  %4d  %3d   %c   %016lx  %016lx\n",
+                snaps[i].marker, snaps[i].id, snaps[i].tgid, snaps[i].ppid,
+                snaps[i].on_cpu, sn, snaps[i].on_rq, snaps[i].nr_threads,
+                snaps[i].is_leader, snaps[i].last_rip, snaps[i].user_rip);
+    }
+    tty_printf(tty, "=======================================================================\n");
+    slab_free(snaps);
 
     // Dump futex trace ring buffer for debugging missed wakeups
     // (only compiled in when FUTEX_TRACE_DEBUG is defined in futex.c)

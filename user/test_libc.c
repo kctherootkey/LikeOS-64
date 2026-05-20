@@ -386,6 +386,12 @@ int main(int argc, char** argv) {
     }
     test_pass("printf basic output");
 
+    /* Per-process sandbox directory — must be initialized before any goto so
+     * that the sendfile section (inside network_section) can use _pbase too. */
+    char _pbase[32];
+    snprintf(_pbase, sizeof(_pbase), "/tmp/tl%d", (int)getpid());
+    mkdir(_pbase, 0777);
+
     if (net_only) goto network_section;
 
     // ========================================
@@ -772,7 +778,11 @@ int main(int argc, char** argv) {
     // Test: file write/create/truncate/append
     // ========================================
     printf("\n[TEST] file write (create/truncate/append)\n");
-    const char* wpath = "/WRITE.TXT";
+    /* _pbase already initialized above (before goto network_section). */
+    mkdir(_pbase, 0777);  /* idempotent: ensure directory exists for file tests */
+    char wpath[96], wpath2[96];
+    snprintf(wpath,  sizeof(wpath),  "%s/WRITE.TXT",  _pbase);
+    snprintf(wpath2, sizeof(wpath2), "%s/WRITE2.TXT", _pbase);
     const char* wmsg1 = "HelloWrite";
     int wfd = open(wpath, O_CREAT | O_TRUNC | O_WRONLY);
     test_result("open(O_CREAT|O_TRUNC|O_WRONLY) succeeds", wfd >= 0);
@@ -837,7 +847,7 @@ int main(int argc, char** argv) {
     // Test: fstat/fsync/ftruncate
     // ========================================
     printf("\n[TEST] fstat/fsync/ftruncate\n");
-    int tfd = open("/WRITE.TXT", O_WRONLY);
+    int tfd = open(wpath, O_WRONLY);
     test_result("open existing file for fstat", tfd >= 0);
     if (tfd >= 0) {
         test_result("fstat succeeds", fstat(tfd, &st) == 0);
@@ -849,7 +859,7 @@ int main(int argc, char** argv) {
         close(tfd);
     }
     // verify truncate
-    tfd = open("/WRITE.TXT", O_RDONLY);
+    tfd = open(wpath, O_RDONLY);
     if (tfd >= 0) {
         char rbuf[16];
         memset(rbuf, 0, sizeof(rbuf));
@@ -858,24 +868,27 @@ int main(int argc, char** argv) {
         close(tfd);
     }
     // rename/unlink
-    test_result("rename succeeds", rename("/WRITE.TXT", "/WRITE2.TXT") == 0);
-    test_result("unlink succeeds", unlink("/WRITE2.TXT") == 0);
+    test_result("rename succeeds", rename(wpath, wpath2) == 0);
+    test_result("unlink succeeds", unlink(wpath2) == 0);
 
     // ========================================
     // Test: mkdir/rmdir
     // ========================================
     printf("\n[TEST] mkdir/rmdir\n");
-    test_result("mkdir('/TESTDIR') succeeds", mkdir("/TESTDIR", 0777) == 0);
-    test_result("chdir('/TESTDIR') succeeds", chdir("/TESTDIR") == 0);
-    int dfd = open("/TESTDIR/FILE.TXT", O_CREAT | O_TRUNC | O_WRONLY);
+    char tdpath[96], tdfile[128];
+    snprintf(tdpath, sizeof(tdpath), "%s/TESTDIR",          _pbase);
+    snprintf(tdfile, sizeof(tdfile), "%s/TESTDIR/FILE.TXT", _pbase);
+    test_result("mkdir('/TESTDIR') succeeds", mkdir(tdpath, 0777) == 0);
+    test_result("chdir('/TESTDIR') succeeds", chdir(tdpath) == 0);
+    int dfd = open(tdfile, O_CREAT | O_TRUNC | O_WRONLY);
     test_result("create file in dir", dfd >= 0);
     if (dfd >= 0) {
         write(dfd, "X", 1);
         close(dfd);
     }
-    test_result("unlink file in dir", unlink("/TESTDIR/FILE.TXT") == 0);
+    test_result("unlink file in dir", unlink(tdfile) == 0);
     test_result("chdir('/') succeeds", chdir("/") == 0);
-    test_result("rmdir('/TESTDIR') succeeds", rmdir("/TESTDIR") == 0);
+    test_result("rmdir('/TESTDIR') succeeds", rmdir(tdpath) == 0);
 
     // ========================================
     // Test: kill
@@ -1140,7 +1153,8 @@ int main(int argc, char** argv) {
     printf("\n[TEST] Long File Name (LFN) support\n");
     
     // Test 1: Create file with long name (lowercase preserved)
-    const char* lfn_path1 = "/this_is_a_long_filename_test.txt";
+    char lfn_path1[128];
+    snprintf(lfn_path1, sizeof(lfn_path1), "%s/this_is_a_long_filename_test.txt", _pbase);
     int lfn_fd = open(lfn_path1, O_CREAT | O_TRUNC | O_WRONLY);
     test_result("create long filename", lfn_fd >= 0);
     if (lfn_fd >= 0) {
@@ -1163,14 +1177,17 @@ int main(int argc, char** argv) {
     }
     
     // Test 3: Case-insensitive access (open with different case)
-    lfn_fd = open("/THIS_IS_A_LONG_FILENAME_TEST.TXT", O_RDONLY);
+    char lfn_path1_upper[128];
+    snprintf(lfn_path1_upper, sizeof(lfn_path1_upper), "%s/THIS_IS_A_LONG_FILENAME_TEST.TXT", _pbase);
+    lfn_fd = open(lfn_path1_upper, O_RDONLY);
     test_result("case-insensitive LFN access", lfn_fd >= 0);
     if (lfn_fd >= 0) {
         close(lfn_fd);
     }
     
     // Test 4: Mixed case filename
-    const char* lfn_path2 = "/MixedCaseFileName.TXT";
+    char lfn_path2[128];
+    snprintf(lfn_path2, sizeof(lfn_path2), "%s/MixedCaseFileName.TXT", _pbase);
     lfn_fd = open(lfn_path2, O_CREAT | O_TRUNC | O_WRONLY);
     test_result("create mixed case filename", lfn_fd >= 0);
     if (lfn_fd >= 0) {
@@ -1179,18 +1196,22 @@ int main(int argc, char** argv) {
     }
     
     // Test 5: Verify case-insensitive access to mixed case file
-    lfn_fd = open("/mixedcasefilename.txt", O_RDONLY);
+    char lfn_path2_lower[128];
+    snprintf(lfn_path2_lower, sizeof(lfn_path2_lower), "%s/mixedcasefilename.txt", _pbase);
+    lfn_fd = open(lfn_path2_lower, O_RDONLY);
     test_result("case-insensitive mixed case access", lfn_fd >= 0);
     if (lfn_fd >= 0) {
         close(lfn_fd);
     }
     
     // Test 6: Long directory name
-    const char* lfn_dir = "/long_directory_name_for_testing";
+    char lfn_dir[128];
+    snprintf(lfn_dir, sizeof(lfn_dir), "%s/long_directory_name_for_testing", _pbase);
     test_result("mkdir long dirname", mkdir(lfn_dir, 0777) == 0);
-    
+
     // Test 7: Create file in long dirname
-    const char* lfn_in_dir = "/long_directory_name_for_testing/another_long_filename.dat";
+    char lfn_in_dir[192];
+    snprintf(lfn_in_dir, sizeof(lfn_in_dir), "%s/long_directory_name_for_testing/another_long_filename.dat", _pbase);
     lfn_fd = open(lfn_in_dir, O_CREAT | O_TRUNC | O_WRONLY);
     test_result("create file in LFN dir", lfn_fd >= 0);
     if (lfn_fd >= 0) {
@@ -1210,7 +1231,8 @@ int main(int argc, char** argv) {
     }
     
     // Test 9: Rename with long filename
-    const char* lfn_renamed = "/renamed_long_filename_test.txt";
+    char lfn_renamed[128];
+    snprintf(lfn_renamed, sizeof(lfn_renamed), "%s/renamed_long_filename_test.txt", _pbase);
     test_result("rename LFN file", rename(lfn_path1, lfn_renamed) == 0);
     
     // Test 10: Verify renamed file exists
@@ -1229,7 +1251,8 @@ int main(int argc, char** argv) {
     test_result("rmdir LFN dir", rmdir(lfn_dir) == 0);
     
     // Test 13: Very long filename (near max)
-    const char* very_long = "/abcdefghijklmnopqrstuvwxyz0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ.longext";
+    char very_long[192];
+    snprintf(very_long, sizeof(very_long), "%s/abcdefghijklmnopqrstuvwxyz0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ.longext", _pbase);
     lfn_fd = open(very_long, O_CREAT | O_TRUNC | O_WRONLY);
     test_result("create very long filename", lfn_fd >= 0);
     if (lfn_fd >= 0) {
@@ -1244,7 +1267,8 @@ int main(int argc, char** argv) {
     test_result("unlink very long filename", unlink(very_long) == 0);
     
     // Test 14: Filename with spaces
-    const char* space_name = "/file with spaces in name.txt";
+    char space_name[128];
+    snprintf(space_name, sizeof(space_name), "%s/file with spaces in name.txt", _pbase);
     lfn_fd = open(space_name, O_CREAT | O_TRUNC | O_WRONLY);
     test_result("create filename with spaces", lfn_fd >= 0);
     if (lfn_fd >= 0) {
@@ -1259,7 +1283,8 @@ int main(int argc, char** argv) {
     test_result("unlink filename with spaces", unlink(space_name) == 0);
     
     // Test 15: Case preservation check - create lowercase, verify lowercase display
-    const char* lowercase_file = "/lowercase_only_filename.txt";
+    char lowercase_file[128];
+    snprintf(lowercase_file, sizeof(lowercase_file), "%s/lowercase_only_filename.txt", _pbase);
     lfn_fd = open(lowercase_file, O_CREAT | O_TRUNC | O_WRONLY);
     test_result("create lowercase filename", lfn_fd >= 0);
     if (lfn_fd >= 0) {
@@ -1269,11 +1294,14 @@ int main(int argc, char** argv) {
     unlink(lowercase_file);
     
     // Test 16: Directory with mixed case
-    const char* mixed_dir = "/MyMixedCaseDirectory";
+    char mixed_dir[128], mixed_dir_lower[128];
+    snprintf(mixed_dir,       sizeof(mixed_dir),       "%s/MyMixedCaseDirectory", _pbase);
+    snprintf(mixed_dir_lower, sizeof(mixed_dir_lower), "%s/mymixedcasedirectory", _pbase);
     test_result("mkdir mixed case dir", mkdir(mixed_dir, 0777) == 0);
-    test_result("chdir mixed case dir (lowercase)", chdir("/mymixedcasedirectory") == 0);
+    test_result("chdir mixed case dir (lowercase)", chdir(mixed_dir_lower) == 0);
     test_result("chdir back to root", chdir("/") == 0);
     test_result("rmdir mixed case dir", rmdir(mixed_dir) == 0);
+    rmdir(_pbase);
 
     // ========================================
     // Test: Security - Invalid Pointer Handling
@@ -3425,29 +3453,53 @@ int main(int argc, char** argv) {
     // ========================================
     // Filesystem syscalls: mkdir, rmdir, rename, unlink, chmod, utimensat
     // ========================================
+    /* PID-isolated sandbox — prevents path collisions when two teststress
+     * instances run concurrently (observed in VMware with hardware virt). */
+    char _td[56];  /* base tmpdir: /tmp/ts<pid>  */
+    char _p_mkdir[96], _p_unlink[96], _p_no_such[96];
+    char _p_rsrc[96], _p_rdst[96];
+    char _p_chmod[96], _p_chown[96], _p_utime[96];
+    char _p_pa[96], _p_pb[112], _p_pc[128];
+    char _p_usock[96], _p_uio[96];
+    snprintf(_td,       sizeof(_td),       "/tmp/ts%d",          (int)getpid());
+    mkdir(_td, 0755); /* best-effort; EEXIST is fine */
+    snprintf(_p_mkdir,  sizeof(_p_mkdir),  "%s/mkdir_dir",       _td);
+    snprintf(_p_unlink, sizeof(_p_unlink), "%s/unlink_file",     _td);
+    snprintf(_p_no_such,sizeof(_p_no_such),"%s/no_such_file",    _td);
+    snprintf(_p_rsrc,   sizeof(_p_rsrc),   "%s/rename_src",      _td);
+    snprintf(_p_rdst,   sizeof(_p_rdst),   "%s/rename_dst",      _td);
+    snprintf(_p_chmod,  sizeof(_p_chmod),  "%s/chmod_file",      _td);
+    snprintf(_p_chown,  sizeof(_p_chown),  "%s/chown_file",      _td);
+    snprintf(_p_utime,  sizeof(_p_utime),  "%s/utime_file",      _td);
+    snprintf(_p_pa,     sizeof(_p_pa),     "%s/parent_a",        _td);
+    snprintf(_p_pb,     sizeof(_p_pb),     "%s/parent_a/b",      _td);
+    snprintf(_p_pc,     sizeof(_p_pc),     "%s/parent_a/b/c",    _td);
+    snprintf(_p_usock,  sizeof(_p_usock),  "%s/unix.sock",       _td);
+    snprintf(_p_uio,    sizeof(_p_uio),    "%s/_uio_test",       _td);
+
     printf("\n[TEST] mkdir()\n");
     {
-        int ret = mkdir("/tmp/test_mkdir_dir", 0755);
-        test_result("mkdir(/tmp/test_mkdir_dir) succeeds", ret == 0);
+        int ret = mkdir(_p_mkdir, 0755);
+        test_result("mkdir(tmpdir/mkdir_dir) succeeds", ret == 0);
 
         struct stat st;
-        ret = stat("/tmp/test_mkdir_dir", &st);
+        ret = stat(_p_mkdir, &st);
         test_result("stat new dir succeeds", ret == 0);
         test_result("new dir is a directory", ret == 0 && S_ISDIR(st.st_mode));
 
         /* mkdir on existing dir should fail with EEXIST */
-        ret = mkdir("/tmp/test_mkdir_dir", 0755);
+        ret = mkdir(_p_mkdir, 0755);
         test_result("mkdir existing dir fails", ret == -1);
         test_result("mkdir existing dir sets EEXIST", errno == EEXIST);
     }
 
     printf("\n[TEST] rmdir()\n");
     {
-        int ret = rmdir("/tmp/test_mkdir_dir");
-        test_result("rmdir(/tmp/test_mkdir_dir) succeeds", ret == 0);
+        int ret = rmdir(_p_mkdir);
+        test_result("rmdir(tmpdir/mkdir_dir) succeeds", ret == 0);
 
         /* rmdir on nonexistent dir should fail */
-        ret = rmdir("/tmp/test_mkdir_dir");
+        ret = rmdir(_p_mkdir);
         test_result("rmdir nonexistent dir fails", ret == -1);
         test_result("rmdir nonexistent dir sets ENOENT", errno == ENOENT);
 
@@ -3459,23 +3511,23 @@ int main(int argc, char** argv) {
     printf("\n[TEST] unlink()\n");
     {
         /* Create a test file first */
-        int fd = open("/tmp/test_unlink_file", O_WRONLY | O_CREAT | O_TRUNC);
-        test_result("create /tmp/test_unlink_file", fd >= 0);
+        int fd = open(_p_unlink, O_WRONLY | O_CREAT | O_TRUNC);
+        test_result("create tmpdir/unlink_file", fd >= 0);
         if (fd >= 0) {
             write(fd, "test", 4);
             close(fd);
 
-            int ret = unlink("/tmp/test_unlink_file");
-            test_result("unlink(/tmp/test_unlink_file) succeeds", ret == 0);
+            int ret = unlink(_p_unlink);
+            test_result("unlink(tmpdir/unlink_file) succeeds", ret == 0);
 
             /* Should be gone now */
             struct stat st;
-            ret = stat("/tmp/test_unlink_file", &st);
+            ret = stat(_p_unlink, &st);
             test_result("stat after unlink fails (ENOENT)", ret == -1 && errno == ENOENT);
         }
 
         /* unlink nonexistent file */
-        int ret = unlink("/tmp/no_such_file_for_test");
+        int ret = unlink(_p_no_such);
         test_result("unlink nonexistent file fails", ret == -1);
         test_result("unlink nonexistent sets ENOENT", errno == ENOENT);
     }
@@ -3483,26 +3535,26 @@ int main(int argc, char** argv) {
     printf("\n[TEST] rename()\n");
     {
         /* Create source file */
-        int fd = open("/tmp/test_rename_src", O_WRONLY | O_CREAT | O_TRUNC);
-        test_result("create /tmp/test_rename_src", fd >= 0);
+        int fd = open(_p_rsrc, O_WRONLY | O_CREAT | O_TRUNC);
+        test_result("create tmpdir/rename_src", fd >= 0);
         if (fd >= 0) {
             write(fd, "rename_test", 11);
             close(fd);
 
-            int ret = rename("/tmp/test_rename_src", "/tmp/test_rename_dst");
+            int ret = rename(_p_rsrc, _p_rdst);
             test_result("rename succeeds", ret == 0);
 
             /* Source should be gone */
             struct stat st;
-            ret = stat("/tmp/test_rename_src", &st);
+            ret = stat(_p_rsrc, &st);
             test_result("old name gone after rename", ret == -1);
 
             /* Destination should exist */
-            ret = stat("/tmp/test_rename_dst", &st);
+            ret = stat(_p_rdst, &st);
             test_result("new name exists after rename", ret == 0);
 
             /* Verify contents */
-            fd = open("/tmp/test_rename_dst", O_RDONLY);
+            fd = open(_p_rdst, O_RDONLY);
             test_result("can open renamed file", fd >= 0);
             if (fd >= 0) {
                 char buf[32];
@@ -3512,25 +3564,25 @@ int main(int argc, char** argv) {
             }
 
             /* Cleanup */
-            unlink("/tmp/test_rename_dst");
+            unlink(_p_rdst);
         }
     }
 
     printf("\n[TEST] chmod()\n");
     {
         /* chmod should succeed (returns 0 on FAT32) */
-        int fd = open("/tmp/test_chmod_file", O_WRONLY | O_CREAT | O_TRUNC);
-        test_result("create /tmp/test_chmod_file", fd >= 0);
+        int fd = open(_p_chmod, O_WRONLY | O_CREAT | O_TRUNC);
+        test_result("create tmpdir/chmod_file", fd >= 0);
         if (fd >= 0) {
             close(fd);
 
-            int ret = chmod("/tmp/test_chmod_file", 0644);
+            int ret = chmod(_p_chmod, 0644);
             test_result("chmod returns 0", ret == 0);
 
-            ret = chmod("/tmp/test_chmod_file", 0755);
+            ret = chmod(_p_chmod, 0755);
             test_result("chmod to 0755 returns 0", ret == 0);
 
-            unlink("/tmp/test_chmod_file");
+            unlink(_p_chmod);
         }
 
         /* chmod on nonexistent should succeed (kernel returns 0 regardless) */
@@ -3538,25 +3590,25 @@ int main(int argc, char** argv) {
 
     printf("\n[TEST] chown()\n");
     {
-        int fd = open("/tmp/test_chown_file", O_WRONLY | O_CREAT | O_TRUNC);
-        test_result("create /tmp/test_chown_file", fd >= 0);
+        int fd = open(_p_chown, O_WRONLY | O_CREAT | O_TRUNC);
+        test_result("create tmpdir/chown_file", fd >= 0);
         if (fd >= 0) {
             close(fd);
 
-            int ret = chown("/tmp/test_chown_file", 0, 0);
+            int ret = chown(_p_chown, 0, 0);
             test_result("chown returns 0", ret == 0);
 
-            ret = fchown(open("/tmp/test_chown_file", O_RDONLY), 0, 0);
+            ret = fchown(open(_p_chown, O_RDONLY), 0, 0);
             test_result("fchown returns 0", ret == 0);
 
-            unlink("/tmp/test_chown_file");
+            unlink(_p_chown);
         }
     }
 
     printf("\n[TEST] utimensat()\n");
     {
-        int fd = open("/tmp/test_utime_file", O_WRONLY | O_CREAT | O_TRUNC);
-        test_result("create /tmp/test_utime_file", fd >= 0);
+        int fd = open(_p_utime, O_WRONLY | O_CREAT | O_TRUNC);
+        test_result("create tmpdir/utime_file", fd >= 0);
         if (fd >= 0) {
             close(fd);
 
@@ -3565,38 +3617,38 @@ int main(int argc, char** argv) {
             times[0].tv_nsec = 0;
             times[1].tv_sec = 2000000;
             times[1].tv_nsec = 0;
-            int ret = utimensat(-100, "/tmp/test_utime_file", times, 0);
+            int ret = utimensat(-100, _p_utime, times, 0);
             test_result("utimensat returns 0", ret == 0);
 
-            unlink("/tmp/test_utime_file");
+            unlink(_p_utime);
         }
     }
 
     printf("\n[TEST] mkdir+rmdir parents\n");
     {
         /* Create nested dirs */
-        int ret = mkdir("/tmp/test_parent_a", 0755);
+        int ret = mkdir(_p_pa, 0755);
         test_result("mkdir /tmp/test_parent_a", ret == 0);
 
-        ret = mkdir("/tmp/test_parent_a/b", 0755);
+        ret = mkdir(_p_pb, 0755);
         test_result("mkdir /tmp/test_parent_a/b", ret == 0);
 
-        ret = mkdir("/tmp/test_parent_a/b/c", 0755);
+        ret = mkdir(_p_pc, 0755);
         test_result("mkdir /tmp/test_parent_a/b/c", ret == 0);
 
         /* Verify they exist */
         struct stat st;
-        ret = stat("/tmp/test_parent_a/b/c", &st);
+        ret = stat(_p_pc, &st);
         test_result("nested dir exists", ret == 0 && S_ISDIR(st.st_mode));
 
         /* Remove in reverse order */
-        ret = rmdir("/tmp/test_parent_a/b/c");
+        ret = rmdir(_p_pc);
         test_result("rmdir /tmp/test_parent_a/b/c", ret == 0);
 
-        ret = rmdir("/tmp/test_parent_a/b");
+        ret = rmdir(_p_pb);
         test_result("rmdir /tmp/test_parent_a/b", ret == 0);
 
-        ret = rmdir("/tmp/test_parent_a");
+        ret = rmdir(_p_pa);
         test_result("rmdir /tmp/test_parent_a", ret == 0);
     }
 
@@ -4090,10 +4142,22 @@ network_section:
     // ========================================
     printf("\n--- sendfile Tests ---\n");
 
+    // Per-process paths to avoid races between parallel test instances.
+    char sf_src[64], sf_dst[64], sf_off[64], sf_off_d[64];
+    char sf_sock[64], sf_pipe_f[64], sf_zero[64], sf_zero_d[64];
+    snprintf(sf_src,    sizeof(sf_src),    "%s/sf_src.txt",    _pbase);
+    snprintf(sf_dst,    sizeof(sf_dst),    "%s/sf_dst.txt",    _pbase);
+    snprintf(sf_off,    sizeof(sf_off),    "%s/sf_off.txt",    _pbase);
+    snprintf(sf_off_d,  sizeof(sf_off_d),  "%s/sf_off_d.txt",  _pbase);
+    snprintf(sf_sock,   sizeof(sf_sock),   "%s/sf_sock.txt",   _pbase);
+    snprintf(sf_pipe_f, sizeof(sf_pipe_f), "%s/sf_pipe.txt",   _pbase);
+    snprintf(sf_zero,   sizeof(sf_zero),   "%s/sf_zero.txt",   _pbase);
+    snprintf(sf_zero_d, sizeof(sf_zero_d), "%s/sf_zero_d.txt", _pbase);
+
     // Test 1: sendfile from file to file
     {
         // Create a source file with known content
-        int src = open("/tmp_sf_src.txt", O_WRONLY | O_CREAT | O_TRUNC);
+        int src = open(sf_src, O_WRONLY | O_CREAT | O_TRUNC);
         test_result("sendfile: create source file", src >= 0);
         if (src >= 0) {
             const char* data = "Hello sendfile world! This is test data for sendfile.";
@@ -4102,8 +4166,8 @@ network_section:
             close(src);
 
             // Open source for reading and dest for writing
-            int in_fd = open("/tmp_sf_src.txt", O_RDONLY);
-            int out_fd = open("/tmp_sf_dst.txt", O_WRONLY | O_CREAT | O_TRUNC);
+            int in_fd = open(sf_src, O_RDONLY);
+            int out_fd = open(sf_dst, O_WRONLY | O_CREAT | O_TRUNC);
             test_result("sendfile: open source for read", in_fd >= 0);
             test_result("sendfile: open dest for write", out_fd >= 0);
 
@@ -4115,7 +4179,7 @@ network_section:
                 close(out_fd);
 
                 // Verify destination content
-                int vfd = open("/tmp_sf_dst.txt", O_RDONLY);
+                int vfd = open(sf_dst, O_RDONLY);
                 if (vfd >= 0) {
                     char rbuf[128] = {0};
                     ssize_t nr = read(vfd, rbuf, sizeof(rbuf));
@@ -4131,21 +4195,21 @@ network_section:
             }
 
             // Cleanup
-            unlink("/tmp_sf_src.txt");
-            unlink("/tmp_sf_dst.txt");
+            unlink(sf_src);
+            unlink(sf_dst);
         }
     }
 
     // Test 2: sendfile with offset parameter
     {
-        int src = open("/tmp_sf_off.txt", O_WRONLY | O_CREAT | O_TRUNC);
+        int src = open(sf_off, O_WRONLY | O_CREAT | O_TRUNC);
         if (src >= 0) {
             const char* data = "AAAAABBBBBCCCCC";  // 15 bytes
             write(src, data, 15);
             close(src);
 
-            int in_fd = open("/tmp_sf_off.txt", O_RDONLY);
-            int out_fd = open("/tmp_sf_off_d.txt", O_WRONLY | O_CREAT | O_TRUNC);
+            int in_fd = open(sf_off, O_RDONLY);
+            int out_fd = open(sf_off_d, O_WRONLY | O_CREAT | O_TRUNC);
             if (in_fd >= 0 && out_fd >= 0) {
                 // Send 5 bytes starting at offset 5 (the "BBBBB" part)
                 int64_t off = 5;
@@ -4161,7 +4225,7 @@ network_section:
                 close(out_fd);
 
                 // Verify we got "BBBBB"
-                int vfd = open("/tmp_sf_off_d.txt", O_RDONLY);
+                int vfd = open(sf_off_d, O_RDONLY);
                 if (vfd >= 0) {
                     char rbuf[16] = {0};
                     read(vfd, rbuf, sizeof(rbuf));
@@ -4173,21 +4237,21 @@ network_section:
                 if (in_fd >= 0) close(in_fd);
                 if (out_fd >= 0) close(out_fd);
             }
-            unlink("/tmp_sf_off.txt");
-            unlink("/tmp_sf_off_d.txt");
+            unlink(sf_off);
+            unlink(sf_off_d);
         }
     }
 
     // Test 3: sendfile from file to socket (via socketpair)
     {
-        int src = open("/tmp_sf_sock.txt", O_WRONLY | O_CREAT | O_TRUNC);
+        int src = open(sf_sock, O_WRONLY | O_CREAT | O_TRUNC);
         if (src >= 0) {
             const char* data = "socket sendfile data";
             write(src, data, strlen(data));
             close(src);
 
             int sv[2] = {-1, -1};
-            int in_fd = open("/tmp_sf_sock.txt", O_RDONLY);
+            int in_fd = open(sf_sock, O_RDONLY);
             int sp_ok = socketpair(AF_INET, SOCK_DGRAM, 0, sv);
             test_result("sendfile-to-socket: setup ok",
                         in_fd >= 0 && sp_ok == 0);
@@ -4208,20 +4272,20 @@ network_section:
             if (in_fd >= 0) close(in_fd);
             if (sv[0] >= 0) close(sv[0]);
             if (sv[1] >= 0) close(sv[1]);
-            unlink("/tmp_sf_sock.txt");
+            unlink(sf_sock);
         }
     }
 
     // Test 4: sendfile from file to pipe
     {
-        int src = open("/tmp_sf_pipe.txt", O_WRONLY | O_CREAT | O_TRUNC);
+        int src = open(sf_pipe_f, O_WRONLY | O_CREAT | O_TRUNC);
         if (src >= 0) {
             const char* data = "pipe sendfile!";
             write(src, data, strlen(data));
             close(src);
 
             int pfd[2];
-            int in_fd = open("/tmp_sf_pipe.txt", O_RDONLY);
+            int in_fd = open(sf_pipe_f, O_RDONLY);
             int pipe_ok = pipe(pfd);
             test_result("sendfile-to-pipe: setup ok",
                         in_fd >= 0 && pipe_ok == 0);
@@ -4241,26 +4305,26 @@ network_section:
             }
             if (in_fd >= 0) close(in_fd);
             if (pipe_ok == 0) { close(pfd[0]); close(pfd[1]); }
-            unlink("/tmp_sf_pipe.txt");
+            unlink(sf_pipe_f);
         }
     }
 
     // Test 5: sendfile with count=0 returns 0
     {
-        int src = open("/tmp_sf_zero.txt", O_WRONLY | O_CREAT | O_TRUNC);
+        int src = open(sf_zero, O_WRONLY | O_CREAT | O_TRUNC);
         if (src >= 0) {
             write(src, "x", 1);
             close(src);
-            int in_fd = open("/tmp_sf_zero.txt", O_RDONLY);
-            int out_fd = open("/tmp_sf_zero_d.txt", O_WRONLY | O_CREAT | O_TRUNC);
+            int in_fd = open(sf_zero, O_RDONLY);
+            int out_fd = open(sf_zero_d, O_WRONLY | O_CREAT | O_TRUNC);
             if (in_fd >= 0 && out_fd >= 0) {
                 ssize_t sf = sendfile(out_fd, in_fd, NULL, 0);
                 test_result("sendfile: count=0 returns 0", sf == 0);
             }
             if (in_fd >= 0) close(in_fd);
             if (out_fd >= 0) close(out_fd);
-            unlink("/tmp_sf_zero.txt");
-            unlink("/tmp_sf_zero_d.txt");
+            unlink(sf_zero);
+            unlink(sf_zero_d);
         }
     }
 
@@ -4413,7 +4477,7 @@ network_section:
             struct sockaddr_un addr;
             memset(&addr, 0, sizeof(addr));
             addr.sun_family = AF_UNIX;
-            strcpy(addr.sun_path, "/tmp/test_unix.sock");
+            strcpy(addr.sun_path, _p_usock);
 
             int ret = bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
             test_result("unix server: bind", ret == 0);
@@ -4431,7 +4495,7 @@ network_section:
                     struct sockaddr_un saddr;
                     memset(&saddr, 0, sizeof(saddr));
                     saddr.sun_family = AF_UNIX;
-                    strcpy(saddr.sun_path, "/tmp/test_unix.sock");
+                    strcpy(saddr.sun_path, _p_usock);
                     connect(cli, (struct sockaddr*)&saddr, sizeof(saddr));
                     write(cli, "from child", 10);
                     char buf[64];
@@ -4455,6 +4519,7 @@ network_section:
                 waitpid(pid, &status, 0);
             }
             close(server_fd);
+            unlink(_p_usock);  /* remove socket file — bind fails on re-run if left */
         }
     }
 
@@ -5199,7 +5264,12 @@ network_section:
     // ========================================
     printf("\n[TEST] writev/readv\n");
     {
-        int fd = open("/tmp/_uio_test", O_RDWR | O_CREAT | O_TRUNC, 0600);
+        /* Use a locally-computed path so this test works regardless of
+         * which entry path was taken (goto network_section skips the
+         * sandbox snprintf calls above, leaving _p_uio uninitialised). */
+        char _local_uio[64];
+        snprintf(_local_uio, sizeof(_local_uio), "/tmp/uio_%d", (int)getpid());
+        int fd = open(_local_uio, O_RDWR | O_CREAT | O_TRUNC, 0600);
         test_result("open temp for writev", fd >= 0);
         if (fd >= 0) {
             struct iovec wiov[3];
@@ -5224,9 +5294,15 @@ network_section:
                         memcmp(b2, "vectored ", 9) == 0 &&
                         memcmp(b3, "I/O!", 4) == 0);
             close(fd);
-            unlink("/tmp/_uio_test");
+            unlink(_local_uio);
         }
     }
+
+    /* Cleanup sandbox — each test removes its own files, so _td should now
+     * be empty.  Removing it prevents /tmp/ from accumulating a new sub-
+     * directory every iteration and eventually requiring a FAT32 cluster
+     * expansion of the /tmp/ directory itself. */
+    rmdir(_td);
 
     // ========================================
     // Test: setsid / getpgid (session/process group)
@@ -6196,6 +6272,9 @@ network_section:
         int sync_pipe[2] = {-1, -1};
         pipe(sync_pipe);
 
+        /* Per-process port so two parallel testlibc instances don't collide. */
+        int tls_lb_port = 21100 + ((int)getpid() % 1000);
+
         /* --- Listening socket (created before fork so child inherits it) --- */
         int srv_sock = socket(AF_INET, SOCK_STREAM, 0);
         test_result("TLS loopback: server socket", srv_sock >= 0);
@@ -6211,7 +6290,7 @@ network_section:
         struct sockaddr_in srv_addr;
         memset(&srv_addr, 0, sizeof(srv_addr));
         srv_addr.sin_family = AF_INET;
-        srv_addr.sin_port = htons(20100);
+        srv_addr.sin_port = htons((uint16_t)tls_lb_port);
         srv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         int bind_ok = bind(srv_sock, (struct sockaddr*)&srv_addr, sizeof(srv_addr));
         test_result("TLS loopback: server bind", bind_ok == 0);
@@ -6351,7 +6430,7 @@ network_section:
                 struct sockaddr_in cli_addr;
                 memset(&cli_addr, 0, sizeof(cli_addr));
                 cli_addr.sin_family = AF_INET;
-                cli_addr.sin_port = htons(20100);
+                cli_addr.sin_port = htons((uint16_t)tls_lb_port);
                 cli_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
                 cli_conn_ok = (connect(cli_sock, (struct sockaddr*)&cli_addr,
                                        sizeof(cli_addr)) == 0);
@@ -6395,11 +6474,15 @@ network_section:
                                 if (n > 0) {
                                     total_recv += n;
                                 } else {
-                                    /* SSL_ERROR_WANT_READ (2): transient, retry.
-                                     * SSL_ERROR_ZERO_RETURN (6): close_notify. */
+                                    /* SSL_ERROR_WANT_READ  (2): retry (blocking BIO, OOB data).
+                                     * SSL_ERROR_WANT_WRITE (3): retry (TLS 1.3 KeyUpdate/NewSessionTicket).
+                                     * SSL_ERROR_ZERO_RETURN(6): peer close_notify — done.
+                                     * anything else        : fatal, break. */
                                     int err = p_SSL_get_error ?
                                               p_SSL_get_error(ssl, n) : 0;
-                                    if (err == 2) continue;  /* WANT_READ */
+                                    if (err == 2 || err == 3) continue;
+                                    printf("  [DBG] TLS recv loop exit: n=%d err=%d"
+                                           " total_recv=%d\n", n, err, total_recv);
                                     break;
                                 }
                             }
@@ -6552,7 +6635,10 @@ network_section:
         int e_sync[2] = {-1, -1};
         pipe(e_sync);
 
-        /* Server listening socket bound to INADDR_ANY:20101 */
+        /* Per-process port so two parallel testlibc instances don't collide. */
+        int tls_eth_port = 23100 + ((int)getpid() % 1000);
+
+        /* Server listening socket bound to INADDR_ANY:tls_eth_port */
         int e_srv = socket(AF_INET, SOCK_STREAM, 0);
         if (e_srv >= 0) {
             int yes = 1;
@@ -6560,7 +6646,7 @@ network_section:
             struct sockaddr_in ea;
             memset(&ea, 0, sizeof(ea));
             ea.sin_family = AF_INET;
-            ea.sin_port = htons(20101);
+            ea.sin_port = htons((uint16_t)tls_eth_port);
             ea.sin_addr.s_addr = htonl(INADDR_ANY);
             if (bind(e_srv, (struct sockaddr*)&ea, sizeof(ea)) != 0 ||
                 listen(e_srv, 4) != 0) {
@@ -6617,12 +6703,16 @@ network_section:
                 if (n <= 0) break;
                 recv_total += n;
             }
+            int sent_total = 0;
             if (recv_total == ETH0_DATA_LEN) {
-                int sent_total = 0;
                 while (sent_total < ETH0_DATA_LEN) {
                     int n = p_SSL_write(ssl, e_srv_buf + sent_total,
                                         ETH0_DATA_LEN - sent_total);
-                    if (n <= 0) break;
+                    if (n <= 0) {
+                        printf("  [DBG] TLS eth0 srv: SSL_write ret %d after %d bytes, errno=%d\n",
+                               n, sent_total, errno);
+                        break;
+                    }
                     sent_total += n;
                 }
             }
@@ -6630,7 +6720,9 @@ network_section:
             p_SSL_free(ssl);
             p_SSL_CTX_free(sctx);
             close(e_conn);
-            _exit((recv_total == ETH0_DATA_LEN) ? 0 : 10);
+            /* exit 0=ok, 10=recv short, 11=echo short */
+            _exit((recv_total != ETH0_DATA_LEN) ? 10 :
+                  (sent_total != ETH0_DATA_LEN) ? 11 : 0);
         }
 
         /* ===== CLIENT (parent) ===== */
@@ -6657,10 +6749,13 @@ network_section:
                 int e_cli = socket(AF_INET, SOCK_STREAM, 0);
                 int e_conn_ok = 0;
                 if (e_cli >= 0) {
+                    /* 30 s receive timeout so a dead server can't hang SSL_connect forever. */
+                    struct timeval rcv_tv = { .tv_sec = 30, .tv_usec = 0 };
+                    setsockopt(e_cli, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
                     struct sockaddr_in ea;
                     memset(&ea, 0, sizeof(ea));
                     ea.sin_family = AF_INET;
-                    ea.sin_port = htons(20101);
+                    ea.sin_port = htons((uint16_t)tls_eth_port);
                     ea.sin_addr.s_addr = htonl(eth0_ip); /* get_interface_ipv4 returns host-order */
                     e_conn_ok = (connect(e_cli, (struct sockaddr*)&ea, sizeof(ea)) == 0);
                 }
@@ -6694,13 +6789,21 @@ network_section:
                                             snt == ETH0_DATA_LEN);
 
                                 /* Receive echo */
-                                int rcv = 0;
+                                int rcv = 0, last_rcv_n = 0;
                                 while (rcv < ETH0_DATA_LEN) {
-                                    int n = p_SSL_read(ssl,
+                                    last_rcv_n = p_SSL_read(ssl,
                                                        eth0_recv_buf + rcv,
                                                        ETH0_DATA_LEN - rcv);
-                                    if (n <= 0) break;
-                                    rcv += n;
+                                    if (last_rcv_n <= 0) break;
+                                    rcv += last_rcv_n;
+                                }
+                                if (rcv < ETH0_DATA_LEN) {
+                                    int ssl_err = p_SSL_get_error ?
+                                        p_SSL_get_error(ssl, last_rcv_n) : -1;
+                                    printf("  [DBG] TLS eth0 cli: got %d/%d bytes,"
+                                           " last_n=%d ssl_err=%d errno=%d\n",
+                                           rcv, ETH0_DATA_LEN, last_rcv_n,
+                                           ssl_err, errno);
                                 }
                                 test_result("TLS eth0: recv 8 KB echo",
                                             rcv == ETH0_DATA_LEN);
@@ -6722,6 +6825,9 @@ network_section:
 
             int e_status = 0;
             waitpid(e_pid, &e_status, 0);
+            if (WIFEXITED(e_status) && WEXITSTATUS(e_status) != 0)
+                printf("  [DBG] TLS eth0 srv exit: code=%d (10=recv short, 11=echo short)\n",
+                       WEXITSTATUS(e_status));
             test_result("TLS eth0: server child exited cleanly",
                         WIFEXITED(e_status) && WEXITSTATUS(e_status) == 0);
             /* close the listen socket that was kept open across fork */

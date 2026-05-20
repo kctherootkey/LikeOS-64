@@ -559,19 +559,20 @@ void smp_tlb_shootdown_sync(void) {
     // With IRQs now enabled, this CPU can receive and ACK TLB IPIs from
     // other senders while waiting — eliminating the starvation that caused
     // the timeouts.
-    // Time-based deadline: 100 ms expressed in TSC cycles.
+    // Time-based deadline: 200 ms expressed in TSC cycles.
     //
-    // The old iteration count (10 M pauses) completed in ~13 ms on fast
-    // VMware hardware — too short for a vCPU that has been descheduled for
-    // a full VMware scheduling quantum (~10 ms per slot with 8 vCPUs on
-    // 4 physical cores).  A 100 ms deadline ensures every remote vCPU is
-    // scheduled at least ~10 times during the wait, giving it ample
-    // opportunity to handle its pending IPI.
+    // Each lagging CPU is re-IPIed every ~10 ms so that a vCPU that was
+    // descheduled (or whose initial IPI was coalesced by the edge-triggered
+    // LAPIC) receives a fresh IPI as soon as it is rescheduled.  Without
+    // retries, a vCPU that was simply off-CPU when the broadcast arrived
+    // would never get another chance to ACK within the deadline.
     uint64_t tsc_freq = lapic_get_tsc_freq();
-    // tsc_100ms: TSC cycles in 100 ms.  Fall back to a conservative 1 GHz
-    // estimate if the frequency hasn't been calibrated yet.
-    uint64_t tsc_100ms = (tsc_freq != 0) ? (tsc_freq / 10) : 100000000ULL;
+    // Fall back to a conservative 1 GHz estimate if not calibrated yet.
+    uint64_t tsc_1ms   = (tsc_freq != 0) ? (tsc_freq / 1000) : 1000000ULL;
+    uint64_t tsc_10ms  = tsc_1ms * 10;
+    uint64_t tsc_200ms = tsc_1ms * 200;
     uint64_t start_tsc = timer_rdtsc();
+    uint64_t next_retry_tsc = start_tsc + tsc_10ms;
 
     for (;;) {
         bool all_acked = true;
@@ -583,7 +584,32 @@ void smp_tlb_shootdown_sync(void) {
             }
         }
         if (all_acked) return;
-        if (timer_rdtsc() - start_tsc >= tsc_100ms) break;
+
+        uint64_t now = timer_rdtsc();
+        if (now - start_tsc >= tsc_200ms) break;
+
+        // Every ~10 ms, re-send the IPI unicast to each CPU that is still
+        // lagging.  This recovers from two failure modes:
+        //   (a) The initial broadcast was received while the vCPU had IRQs
+        //       disabled (e.g. holding a spinlock) — the LAPIC may have
+        //       dropped or coalesced it.
+        //   (b) The vCPU was descheduled by the hypervisor when the IPI
+        //       arrived and the pending-bit was lost on context-switch.
+        // A unicast re-IPI is cheap (~200 ns) and harmless: if the CPU has
+        // already ACKed, the extra IPI fires the handler which re-records
+        // the current gen (already >= new_gen), so no harm done.
+        if (now >= next_retry_tsc) {
+            for (uint32_t c = 0; c < online; c++) {
+                if (c == my_cpu) continue;
+                if (__atomic_load_n(&g_tlb_cpu_gen[c], __ATOMIC_ACQUIRE) < new_gen) {
+                    percpu_t *cp = percpu_get(c);
+                    if (cp)
+                        lapic_send_ipi(cp->apic_id, IPI_TLB_SHOOTDOWN);
+                }
+            }
+            next_retry_tsc = now + tsc_10ms;
+        }
+
         __asm__ volatile("pause" ::: "memory");
     }
 

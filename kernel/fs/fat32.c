@@ -594,6 +594,14 @@ static int fat32_alloc_cluster(fat32_fs_t *fs, unsigned long *out_cluster)
     
     /* Search all FAT entries for a free cluster */
     for (unsigned long c = 2; c < g_fat_total_entries; ++c) {
+        if (c == g_root_dir_cluster) {
+            /* Defensive guard: never allocate the root directory cluster.
+             * If it appears free (FAT[c]==0) something has already gone wrong. */
+            unsigned long root_val = fat32_next_cluster_cached(fs, c);
+            if (root_val == 0)
+                kprintf("FAT32: BUG: root cluster %lu appears free in FAT! Part of filesystem may be corrupted.\n", c);
+            continue;
+        }
         unsigned long next = fat32_next_cluster_cached(fs, c);
         if (next == 0) {
             /* Found free cluster */
@@ -623,10 +631,20 @@ static int fat32_free_chain(fat32_fs_t *fs, unsigned long start_cluster)
 {
     if (!fs || start_cluster < 2)
         return ST_OK;
+    /* Defensive guard: never free the root directory cluster. */
+    if (start_cluster == g_root_dir_cluster) {
+        kprintf("FAT32: BUG: fat32_free_chain called with root cluster %lu!\n", start_cluster);
+        return ST_INVALID;
+    }
     if (fat32_ensure_fat_loaded(fs) != ST_OK)
         return ST_IO;
     unsigned long c = start_cluster;
     while (c >= 2 && c < 0x0FFFFFF8) {
+        /* Defensive guard: abort if the chain somehow reaches the root cluster. */
+        if (c == g_root_dir_cluster) {
+            kprintf("FAT32: BUG: free_chain reached root cluster %lu (chain from %lu)!\n", c, start_cluster);
+            break;
+        }
         unsigned long next = fat32_next_cluster_cached(fs, c);
         if (fat32_fat_set(fs, c, 0) != ST_OK)
             return ST_IO;
@@ -2547,16 +2565,22 @@ static int fat32_stat_vfs_impl(const char* path, struct kstat* st)
 
 int fat32_unlink_path(const char* path)
 {
-    uint64_t flags;
-    spin_lock_irqsave(&fat32_lock, &flags);
+    /* fat32_unlink_path is always called from fat32_unlink_impl which is
+     * wrapped by fat32_io_lock() (sleeping mutex).  The old fat32_lock
+     * spinlock here was redundant AND harmful: it disabled IRQs on the
+     * calling CPU while performing multiple USB read/write operations.
+     * On VMware, the XHCI completion interrupt can land on the same vCPU
+     * that holds the spinlock, causing the USB write to stall.  A stalled
+     * write leaves the FAT table partially updated in memory but not on
+     * disk — a subsequent fat32_alloc_cluster then considers those clusters
+     * free and zeros them, silently destroying whichever file or directory
+     * owned them.  Remove the spinlock; fat32_io_lock alone is sufficient. */
 
     unsigned long parent = 0;
     char name[256];
     name[0] = '\0';
-    if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), path, &parent, name, sizeof(name)) != ST_OK) {
-        spin_unlock_irqrestore(&fat32_lock, flags);
+    if (fat32_resolve_parent(fat32_get_task_cwd_cluster(), path, &parent, name, sizeof(name)) != ST_OK)
         return ST_NOT_FOUND;
-    }
 
     unsigned attr = 0;
     unsigned long fc = 0;
@@ -2567,21 +2591,16 @@ int fat32_unlink_path(const char* path)
     unsigned int lfn_start_index = 0;
     
     if (fat32_dir_find_entry_lfn(parent, name, &attr, &fc, &size, 
-        &dir_cluster, &dir_index, &lfn_start_cluster, &lfn_start_index) != ST_OK) {
-        spin_unlock_irqrestore(&fat32_lock, flags);
+        &dir_cluster, &dir_index, &lfn_start_cluster, &lfn_start_index) != ST_OK)
         return ST_NOT_FOUND;
-    }
-    if (attr & FAT32_ATTR_DIRECTORY) {
-        spin_unlock_irqrestore(&fat32_lock, flags);
+
+    if (attr & FAT32_ATTR_DIRECTORY)
         return ST_UNSUPPORTED;
-    }
 
     // Delete all entries from LFN start to short entry
     int st = fat32_delete_entries(lfn_start_cluster, lfn_start_index, dir_cluster, dir_index);
-    if (st != ST_OK) {
-        spin_unlock_irqrestore(&fat32_lock, flags);
+    if (st != ST_OK)
         return st;
-    }
     
     if (fc >= 2) {
         pagecache_invalidate_file(fc);
@@ -2590,7 +2609,6 @@ int fat32_unlink_path(const char* path)
         fat32_free_chain(g_root_fs, fc);
     }
     dcache_invalidate_dir(parent);
-    spin_unlock_irqrestore(&fat32_lock, flags);
     return ST_OK;
 }
 
@@ -2768,34 +2786,44 @@ int fat32_rmdir_path(const char* path)
     if (!(attr & FAT32_ATTR_DIRECTORY))
         return ST_NOT_FOUND;
 
-    // Ensure directory is empty (only . and ..)
+    // Ensure directory is empty (only . and ..) — walk the full cluster chain
     unsigned cluster_size = g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+    unsigned entries_per_cluster = cluster_size / sizeof(fat32_dirent_t);
     void *buf = kalloc(cluster_size);
     if (!buf)
         return ST_NOMEM;
-    if (read_sectors(g_root_fs->bdev, cluster_to_lba(g_root_fs, fc),
-        g_root_fs->sectors_per_cluster, buf) != ST_OK) {
-        kfree(buf);
-        return ST_IO;
-    }
-    fat32_dirent_t *ents = (fat32_dirent_t *)buf;
-    unsigned entries = cluster_size / sizeof(fat32_dirent_t);
     int empty = 1;
-    for (unsigned i = 0; i < entries; ++i) {
-        if (ents[i].name[0] == 0x00)
+    int done = 0;
+    unsigned long scan = fc;
+    while (!done && scan >= 2 && scan < 0x0FFFFFF8) {
+        if (read_sectors(g_root_fs->bdev, cluster_to_lba(g_root_fs, scan),
+                         g_root_fs->sectors_per_cluster, buf) != ST_OK) {
+            kfree(buf);
+            return ST_IO;
+        }
+        fat32_dirent_t *ents = (fat32_dirent_t *)buf;
+        for (unsigned i = 0; i < entries_per_cluster; ++i) {
+            if (ents[i].name[0] == 0x00) { done = 1; break; }  // end of directory
+            if (ents[i].name[0] == 0xE5) continue;             // deleted entry
+            if ((ents[i].attr & FAT32_ATTR_LONG_NAME_MASK) == FAT32_ATTR_LONG_NAME)
+                continue;                                       // LFN fragment
+            if (ents[i].name[0] == '.' &&
+                (ents[i].name[1] == ' ' || ents[i].name[1] == '.'))
+                continue;                                       // "." or ".."
+            empty = 0;
+            done = 1;
             break;
-        if (ents[i].name[0] == 0xE5)
-            continue;
-        if ((ents[i].attr & FAT32_ATTR_LONG_NAME_MASK) == FAT32_ATTR_LONG_NAME)
-            continue;
-        if (ents[i].name[0] == '.' && (ents[i].name[1] == ' ' || ents[i].name[1] == '.'))
-            continue;
-        empty = 0;
-        break;
+        }
+        if (!done) {
+            unsigned long next = fat32_next_cluster_cached(g_root_fs, scan);
+            if (next >= 0x0FFFFFF8 || next == 0)
+                break;
+            scan = next;
+        }
     }
     kfree(buf);
     if (!empty)
-        return ST_INVALID;
+        return ST_NOTEMPTY;
 
     // Delete all entries (LFN + short entry)
     int st = fat32_delete_entries(lfn_start_cluster, lfn_start_index, dir_cluster, dir_index);
@@ -2861,7 +2889,7 @@ static long fat32_read_impl(vfs_file_t *f, void *buf, long bytes)
                                        ff->size,
                                        (struct fat32_fs *)ff->fs,
                                        ff->start_cluster);
-        if (pg) {
+        if (pg && pg->data) {
             // Cache hit (or successful disk read on miss)
             mm_memcpy(((uint8_t *)buf) + copied,
                       pg->data + page_offset, chunk);
@@ -2962,6 +2990,14 @@ static long fat32_write_impl(vfs_file_t *f, const void *buf, long bytes)
     while (remaining) {
         if (ff->current_cluster < 2) {
             ff->current_cluster = ff->start_cluster;
+        }
+        /* BUG GUARD: writing file data to root cluster would corrupt root dir */
+        if (ff->current_cluster == g_root_dir_cluster) {
+            kprintf("FAT32: BUG: write_impl current_cluster==root(%lu)! "
+                    "start=%lu dirent_clust=%lu dirent_idx=%u name=%s\n",
+                    g_root_dir_cluster, ff->start_cluster,
+                    ff->dirent_cluster, ff->dirent_index, ff->name83);
+            return written ? (long)written : ST_IO;
         }
         unsigned cluster_offset = ff->pos % cluster_size;
         unsigned avail_in_cluster = cluster_size - cluster_offset;

@@ -25,13 +25,9 @@ task_tty_printf(task_t* t, const char* fmt, ...)
     char buf[256];
     va_list args;
     __builtin_va_start(args, fmt);
-    int len = kvsnprintf(buf, sizeof(buf), fmt, args);
+    kvsnprintf(buf, sizeof(buf), fmt, args);
     __builtin_va_end(args);
-    tty_t* tty = t ? t->ctty : NULL;
-    if (tty)
-        tty_write(tty, buf, len);
-    else
-        kprintf("%s", buf);
+    tty_printf(t ? t->ctty : NULL, "%s", buf);
 }
 
 #define PS2_STATUS_PORT         0x64

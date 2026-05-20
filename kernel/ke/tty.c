@@ -82,6 +82,11 @@ typedef struct pty {
 
 static tty_t g_console_tty;
 static pty_t g_ptys[TTY_MAX_PTYS];
+/* Points to the PTY slave that received keyboard input most recently.
+ * Updated in tty_pty_master_write whenever tmux (or any app) forwards
+ * a keystroke to a pane.  Used by Ctrl+D/Ctrl+N dump hotkeys to route
+ * output into the currently active tmux pane instead of the raw console. */
+static tty_t *g_active_tty = NULL;
 
 /* Wake all tasks parked on a wait queue identified by 'waiters'.
  *
@@ -1117,6 +1122,13 @@ tty_t* tty_get_console(void) {
     return &g_console_tty;
 }
 
+/* Returns the most recently active PTY slave (the pane with keyboard focus),
+ * or the console TTY if no PTY has ever received input. */
+tty_t* tty_get_active(void) {
+    tty_t *active = __atomic_load_n(&g_active_tty, __ATOMIC_RELAXED);
+    return active ? active : &g_console_tty;
+}
+
 void tty_reset_termios(tty_t* tty) {
     if (!tty) {
         return;
@@ -1689,6 +1701,20 @@ long tty_write(tty_t* tty, const void* buf, long count) {
     #undef TTY_WRITE_CHUNK
 }
 
+void __attribute__((format(printf, 2, 3)))
+tty_printf(tty_t *tty, const char *fmt, ...)
+{
+    char buf[320];
+    va_list args;
+    __builtin_va_start(args, fmt);
+    int len = kvsnprintf(buf, sizeof(buf), fmt, args);
+    __builtin_va_end(args);
+    if (tty)
+        tty_write(tty, buf, len);
+    else
+        kprintf("%s", buf);
+}
+
 int tty_ioctl(tty_t* tty, unsigned long req, void* argp, task_t* cur) {
     if (!tty) {
         return -ENOTTY;
@@ -1869,6 +1895,10 @@ long tty_pty_master_write(int id, const void* buf, long count) {
     if (!pty || !buf || count <= 0) {
         return -EINVAL;
     }
+    /* Track the active pane: the PTY slave receiving keystrokes is the
+     * one currently in focus.  Relaxed ordering is sufficient — we only
+     * need an approximately-current pointer for the dump hotkeys. */
+    __atomic_store_n(&g_active_tty, &pty->slave, __ATOMIC_RELAXED);
     const char* in = (const char*)buf;
     for (long i = 0; i < count; ++i) {
         // SMAP-aware read from user buffer

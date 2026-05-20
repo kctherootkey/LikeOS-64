@@ -97,6 +97,7 @@ typedef struct tty {
 
 void tty_init(void);
 tty_t* tty_get_console(void);
+tty_t* tty_get_active(void);  // active PTY slave (keyboard focus), or console
 void tty_reset_termios(tty_t* tty);
 
 // Input from keyboard/pty master
@@ -110,6 +111,8 @@ void tty_mouse_report_scroll(int pixel_x, int pixel_y, int scroll_delta);
 // Read/write for tty endpoints
 long tty_read(tty_t* tty, void* buf, long count, int nonblock);
 long tty_write(tty_t* tty, const void* buf, long count);
+// Formatted write to tty, or kprintf if tty is NULL
+void tty_printf(tty_t *tty, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 int tty_ioctl(tty_t* tty, unsigned long req, void* argp, task_t* cur);
 
 // PTY helpers

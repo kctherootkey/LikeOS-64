@@ -312,14 +312,14 @@ void keyboard_irq_handler(void) {
 
     // Debug hotkey: Ctrl+D dumps all task states
     if (kb_state.ctrl_pressed && !kb_state.alt_pressed && scan_code == 0x20) {  // 0x20 = 'd'
-        sched_dump_tasks();
+        sched_dump_tasks(tty_get_active());
         return;
     }
 
     // Debug hotkey: Ctrl+N dumps the TCP connection table
     if (kb_state.ctrl_pressed && !kb_state.alt_pressed && scan_code == 0x31) {  // 0x31 = 'n'
-        extern void tcp_dump_table(void);
-        tcp_dump_table();
+        extern void tcp_dump_table(struct tty *tty);
+        tcp_dump_table(tty_get_active());
         return;
     }
 
