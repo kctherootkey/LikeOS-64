@@ -4165,6 +4165,11 @@ network_section:
     // ========================================
     printf("\n--- sendfile Tests ---\n");
 
+    /* _pbase may have been removed by rmdir() earlier in the test run
+     * (e.g. after the LFN section empties the directory).  Re-create it
+     * now so all per-process temp paths below are valid. */
+    mkdir(_pbase, 0777);
+
     // Per-process paths to avoid races between parallel test instances.
     char sf_src[64], sf_dst[64], sf_off[64], sf_off_d[64];
     char sf_sock[64], sf_pipe_f[64], sf_zero[64], sf_zero_d[64];
