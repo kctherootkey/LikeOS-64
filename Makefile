@@ -5,7 +5,7 @@
 CODENAME = blessed kitty
 
 # Version string: override on command line with LIKEOS_VERSION=x.y.z
-LIKEOS_VERSION ?= 0.2.1-HEAD
+LIKEOS_VERSION ?= 0.2.2-HEAD
 
 # Tools
 GCC = gcc
