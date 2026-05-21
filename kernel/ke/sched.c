@@ -699,8 +699,6 @@ void sched_schedule(void) {
     }
 
     task_t* prev = cur;
-    cpu->current_task = next;
-    set_current(next);
 
     next->state = TASK_RUNNING;
     next->remaining_ticks = SCHED_TIME_SLICE;
@@ -710,14 +708,22 @@ void sched_schedule(void) {
     // Release lock but keep interrupts DISABLED through the context switch.
     spin_unlock(&cpu->runqueue_lock);
 
+    // Switch address space BEFORE updating current_task.  sched_remove_task
+    // on another CPU spins on (p->current_task == task) to decide when it is
+    // safe to free the task's PML4.  If we update current_task first, the
+    // remote CPU can free prev's PML4 while CR3 still holds it on this CPU,
+    // leading to a stale PML4 kernel-text page fault when the freed page is
+    // recycled and PML4[511] is zeroed.
     switch_address_space(prev, next);
 
-    // CRITICAL: We already set cpu->current_task = next, but we are still on
-    // prev's kernel stack.  We MUST re-enable interrupts so TLB shootdown
-    // IPIs can be ACKed (otherwise we'd timeout).  However, the timer-driven
-    // preempt handler must NOT preempt us here, because it would see
-    // current_task == next and save the wrong RSP into next->sp.
-    // The per-CPU in_context_switch flag tells sched_preempt to skip us.
+    // CR3 no longer holds prev's PML4 — now safe to hand off current_task.
+    cpu->current_task = next;
+    set_current(next);
+
+    // The timer-driven preempt handler must NOT preempt us between here and
+    // ctx_switch_asm: it would see current_task == next and save the wrong
+    // RSP into next->sp.  The in_context_switch flag tells sched_preempt
+    // to skip this CPU.
     this_cpu()->in_context_switch = 1;
     __asm__ volatile("" ::: "memory");  // Compiler barrier — same-CPU store ordering is guaranteed on x86
     __asm__ volatile("sti");
@@ -806,8 +812,6 @@ void sched_run_ready(void) {
     }
 
     task_t* prev = cur;
-    cpu->current_task = next;
-    set_current(next);
 
     if (prev->state == TASK_RUNNING) prev->state = TASK_READY;
     next->state = TASK_RUNNING;
@@ -819,7 +823,13 @@ void sched_run_ready(void) {
     // (same race prevention as in sched_schedule).
     spin_unlock(&cpu->runqueue_lock);
 
+    // Switch address space before updating current_task (same rationale as
+    // sched_schedule — see the detailed comment there).
     switch_address_space(prev, next);
+
+    // CR3 no longer holds prev's PML4 — now safe to hand off current_task.
+    cpu->current_task = next;
+    set_current(next);
 
     // Same in_context_switch guard as sched_schedule (see comment there).
     this_cpu()->in_context_switch = 1;
@@ -1888,8 +1898,6 @@ void sched_preempt(interrupt_frame_t* frame) {
     next->remaining_ticks = SCHED_TIME_SLICE;
 
     task_t* prev = cur;
-    cpu->current_task = next;
-    set_current(next);
 
     if (prev->state == TASK_RUNNING) prev->state = TASK_READY;
     next->state = TASK_RUNNING;
@@ -1899,7 +1907,13 @@ void sched_preempt(interrupt_frame_t* frame) {
     // Release lock but keep interrupts disabled through the switch
     spin_unlock(&cpu->runqueue_lock);
 
+    // Switch address space before updating current_task (same rationale as
+    // sched_schedule — see the detailed comment there).
     switch_address_space(prev, next);
+
+    // CR3 no longer holds prev's PML4 — now safe to hand off current_task.
+    cpu->current_task = next;
+    set_current(next);
 
     // CRITICAL SMP FIX: Save zombie pointer in per-CPU data BEFORE the switch.
     // Do NOT queue yet — we are still on prev's kernel stack.

@@ -6372,7 +6372,12 @@ network_section:
             p_SSL_set_fd(ssl, conn_fd);
 
             int acc = p_SSL_accept(ssl);
-            if (acc != 1)            { p_SSL_free(ssl); p_SSL_CTX_free(sctx); close(conn_fd); _exit(9); }
+            if (acc != 1) {
+                int e = p_SSL_get_error ? p_SSL_get_error(ssl, acc) : -1;
+                printf("  [DBG] TLS lb srv: SSL_accept=%d err=%d errno=%d\n",
+                       acc, e, errno);
+                p_SSL_free(ssl); p_SSL_CTX_free(sctx); close(conn_fd); _exit(9);
+            }
 
             /* Receive TLS_DATA_LEN bytes then echo */
             static unsigned char srv_buf[65536];
@@ -6450,6 +6455,9 @@ network_section:
             int cli_sock = socket(AF_INET, SOCK_STREAM, 0);
             int cli_conn_ok = 0;
             if (cli_sock >= 0) {
+                /* 30 s receive timeout so a stalled handshake cannot hang forever */
+                struct timeval rcv_tv = { .tv_sec = 30, .tv_usec = 0 };
+                setsockopt(cli_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
                 struct sockaddr_in cli_addr;
                 memset(&cli_addr, 0, sizeof(cli_addr));
                 cli_addr.sin_family = AF_INET;
@@ -6469,6 +6477,11 @@ network_section:
                     if (ssl) {
                         p_SSL_set_fd(ssl, cli_sock);
                         int conn = p_SSL_connect(ssl);
+                        if (conn != 1) {
+                            int e = p_SSL_get_error ? p_SSL_get_error(ssl, conn) : -1;
+                            printf("  [DBG] TLS lb: SSL_connect=%d err=%d errno=%d\n",
+                                   conn, e, errno);
+                        }
                         test_result("TLS loopback: SSL_connect", conn == 1);
 
                         if (conn == 1) {
@@ -6535,6 +6548,9 @@ network_section:
 
             int tls_child_status = 0;
             waitpid(tls_pid, &tls_child_status, 0);
+            printf("  [DBG] TLS lb srv exit: code=%d signal=%d\n",
+                   WIFEXITED(tls_child_status) ? WEXITSTATUS(tls_child_status) : -1,
+                   WIFSIGNALED(tls_child_status) ? WTERMSIG(tls_child_status) : 0);
             test_result("TLS loopback: server child exited cleanly",
                         WIFEXITED(tls_child_status) &&
                         WEXITSTATUS(tls_child_status) == 0);
