@@ -1079,5 +1079,6 @@ void timer_irq_handler(void) {
     // Only BSP calls sched_tick for global statistics
     if (is_bsp) {
         sched_tick();
+        console_cursor_update();   /* cursor blink: called once per tick on BSP */
     }
 }

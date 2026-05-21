@@ -145,6 +145,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/vfs.o \
 			  $(BUILD_DIR)/devfs.o \
 			  $(BUILD_DIR)/tty.o \
+			  $(BUILD_DIR)/vt.o \
 			  $(BUILD_DIR)/pci.o \
 			  $(BUILD_DIR)/block.o \
 			  $(BUILD_DIR)/xhci.o \
@@ -414,6 +415,9 @@ $(BUILD_DIR)/sched.o: $(KERNEL_DIR)/ke/sched.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/tty.o: $(KERNEL_DIR)/ke/tty.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vt.o: $(KERNEL_DIR)/ke/vt.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/syscall.o: $(KERNEL_DIR)/ke/syscall.asm | $(BUILD_DIR)

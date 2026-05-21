@@ -232,7 +232,6 @@ void continue_system_startup(void) {
         xhci_hotplug_poll(&g_xhci_hid);
         usbhid_poll();
         storage_fs_poll(&g_storage_state);
-        console_cursor_update();  // Update blinking cursor
         sched_run_ready();
 
         if (!handled_input) {

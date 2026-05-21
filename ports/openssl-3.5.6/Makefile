@@ -34,1623 +34,1635 @@ PROGRAMS=apps/openssl
 SCRIPTS=apps/CA.pl apps/tsget.pl tools/c_rehash util/shlib_wrap.sh \
         util/wrap.pl
 
-DEPS=crypto/buffer/libcrypto-shlib-buffer.d \
-     crypto/bn/libcrypto-shlib-bn_sqrt.d \
-     providers/implementations/keymgmt/libdefault-lib-rsa_kmgmt.d \
-     crypto/libcrypto-shlib-init.d crypto/evp/libcrypto-lib-pbe_scrypt.d \
-     crypto/asn1/libcrypto-shlib-asn1_err.d \
-     crypto/encode_decode/libcrypto-lib-encoder_pkey.d \
-     crypto/thread/arch/libcrypto-shlib-thread_none.d \
-     crypto/aes/libcrypto-shlib-aes_ofb.d \
-     crypto/asn1/libcrypto-shlib-a_octet.d \
-     crypto/evp/libcrypto-shlib-e_rc2.d \
-     crypto/asn1/libcrypto-shlib-asn1_parse.d \
-     providers/implementations/exchange/libdefault-lib-kdf_exch.d \
-     crypto/evp/libcrypto-lib-e_aes_cbc_hmac_sha1.d \
-     ssl/record/methods/libcommon-lib-tls_pad.d \
-     crypto/libcrypto-lib-threads_none.d \
-     crypto/seed/liblegacy-lib-seed_cbc.d \
-     crypto/modes/libcrypto-shlib-ocb128.d \
-     crypto/err/libcrypto-shlib-err_prn.d \
-     crypto/modes/libcrypto-shlib-cbc128.d \
-     crypto/ocsp/libcrypto-lib-ocsp_srv.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aria.d \
-     crypto/http/libcrypto-shlib-http_client.d \
-     crypto/libcrypto-lib-params_from_text.d \
-     crypto/asn1/libcrypto-lib-tasn_typ.d \
-     crypto/seed/liblegacy-lib-seed_ofb.d \
-     crypto/store/libcrypto-lib-store_strings.d \
-     crypto/ocsp/libcrypto-shlib-ocsp_vfy.d \
-     crypto/rsa/libcrypto-shlib-rsa_x931.d \
-     providers/implementations/kdfs/libdefault-lib-scrypt.d \
-     crypto/evp/libcrypto-shlib-evp_pbe.d crypto/seed/liblegacy-lib-seed.d \
-     providers/implementations/storemgmt/libdefault-lib-file_store_any2obj.d \
-     crypto/libcrypto-shlib-getenv.d apps/openssl-bin-crl.d \
-     crypto/txt_db/libcrypto-lib-txt_db.d \
-     crypto/slh_dsa/libcrypto-lib-slh_xmss.d ssl/libssl-shlib-tls_srp.d \
-     crypto/err/libcrypto-shlib-err_all_legacy.d \
-     ssl/quic/libssl-lib-quic_sf_list.d crypto/des/libcrypto-lib-ecb3_enc.d \
-     crypto/slh_dsa/libcrypto-shlib-slh_wots.d \
-     crypto/store/libcrypto-shlib-store_meth.d \
-     crypto/libcrypto-shlib-o_str.d crypto/cms/libcrypto-shlib-cms_cd.d \
-     crypto/modes/libcrypto-lib-siv128.d \
-     crypto/evp/libcrypto-lib-e_rc4_hmac_md5.d \
-     crypto/bf/liblegacy-lib-bf_cfb64.d ssl/quic/libssl-lib-quic_rx_depack.d \
-     crypto/conf/libcrypto-lib-conf_lib.d ssl/libssl-lib-ssl_cert.d \
-     crypto/idea/libcrypto-shlib-i_cfb64.d \
-     crypto/evp/libcrypto-lib-m_sigver.d \
-     ssl/quic/libssl-shlib-quic_thread_assist.d \
-     crypto/des/liblegacy-lib-rand_key.d \
-     crypto/asn1/libcrypto-shlib-tasn_new.d \
-     crypto/ec/libcrypto-lib-ecp_oct.d \
-     crypto/camellia/libcrypto-lib-cmll_ecb.d ssl/libssl-lib-pqueue.d \
-     providers/implementations/ciphers/libcommon-lib-ciphercommon_ccm_hw.d \
-     crypto/bn/libcrypto-shlib-bn_rsa_fips186_4.d \
-     crypto/evp/libcrypto-shlib-legacy_mdc2.d \
-     crypto/siphash/libcrypto-shlib-siphash.d \
-     crypto/asn1/libcrypto-shlib-f_int.d \
-     providers/implementations/signature/libdefault-lib-mac_legacy_sig.d \
-     crypto/bn/libcrypto-shlib-bn_mod.d crypto/md5/liblegacy-lib-md5_dgst.d \
-     crypto/sm2/libcrypto-shlib-sm2_err.d \
-     crypto/conf/libcrypto-lib-conf_sap.d \
-     crypto/ec/libcrypto-shlib-ecp_smpl.d ssl/libssl-shlib-tls13_enc.d \
-     crypto/store/libcrypto-lib-store_result.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_gcm_siv.d \
-     crypto/store/libcrypto-shlib-store_err.d \
-     crypto/x509/libcrypto-lib-pcy_node.d \
-     crypto/des/libcrypto-lib-rand_key.d \
-     crypto/evp/libcrypto-shlib-legacy_ripemd.d \
-     crypto/bio/libcrypto-lib-bss_acpt.d crypto/ct/libcrypto-lib-ct_log.d \
-     crypto/libcrypto-lib-param_build.d ssl/libssl-lib-ssl_mcnf.d \
-     crypto/sha/libcrypto-lib-sha512.d crypto/cast/libcrypto-shlib-c_skey.d \
-     crypto/conf/libcrypto-lib-conf_def.d \
-     crypto/property/libcrypto-lib-property_err.d \
-     providers/implementations/encode_decode/libdefault-lib-endecoder_common.d \
-     crypto/x509/libcrypto-shlib-by_store.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_idea.d \
-     crypto/evp/libcrypto-lib-e_aes.d ssl/libssl-shlib-ssl_asn1.d \
-     crypto/evp/libcrypto-shlib-s_lib.d crypto/hpke/libcrypto-lib-hpke.d \
-     crypto/dsa/libcrypto-lib-dsa_backend.d \
-     crypto/rsa/libcrypto-lib-rsa_prn.d apps/openssl-bin-skeyutl.d \
-     crypto/cast/libcrypto-shlib-c_enc.d \
-     crypto/hashtable/libssl-shlib-hashfunc.d \
-     crypto/dh/libcrypto-shlib-dh_kdf.d \
-     crypto/x509/libcrypto-shlib-v3_no_ass.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_blowfish_hw.d \
-     crypto/cmp/libcrypto-shlib-cmp_status.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aria_gcm.d \
-     crypto/bn/libcrypto-shlib-bn_lib.d \
-     crypto/x509/libcrypto-shlib-x509cset.d \
-     crypto/x509/libcrypto-lib-x_x509.d \
-     crypto/libcrypto-lib-core_algorithm.d \
-     crypto/libcrypto-shlib-deterministic_nonce.d \
-     crypto/ripemd/liblegacy-lib-rmd_dgst.d \
-     crypto/pkcs7/libcrypto-lib-pkcs7err.d \
-     crypto/asn1/libcrypto-lib-asn1_parse.d \
-     crypto/cmp/libcrypto-lib-cmp_ctx.d ssl/rio/libssl-lib-rio_notifier.d \
-     crypto/cast/liblegacy-lib-c_skey.d crypto/sha/libcrypto-lib-sha256.d \
-     crypto/evp/libcrypto-shlib-e_sm4.d crypto/hpke/libcrypto-shlib-hpke.d \
-     ssl/statem/libssl-lib-extensions_srvr.d \
-     crypto/pem/libcrypto-lib-pem_err.d \
-     crypto/evp/libcrypto-shlib-evp_fetch.d apps/openssl-bin-version.d \
-     crypto/bn/libcrypto-lib-bn_blind.d \
-     providers/implementations/keymgmt/libdefault-lib-dsa_kmgmt.d \
-     crypto/cmp/libcrypto-lib-cmp_genm.d \
-     crypto/dh/libcrypto-lib-dh_backend.d \
-     crypto/ml_dsa/libcrypto-lib-ml_dsa_key_compress.d \
-     crypto/dh/libcrypto-lib-dh_ameth.d crypto/pem/libcrypto-lib-pem_sign.d \
-     crypto/des/libcrypto-shlib-fcrypt_b.d \
-     crypto/x509/libcrypto-lib-v3_rolespec.d \
-     crypto/cms/libcrypto-lib-cms_kari.d \
-     crypto/ec/curve448/libcrypto-lib-curve448_tables.d \
-     crypto/conf/libcrypto-shlib-conf_def.d \
-     crypto/pkcs12/libcrypto-shlib-pk12err.d \
-     crypto/cms/libcrypto-lib-cms_asn1.d ssl/libssl-shlib-s3_msg.d \
-     crypto/comp/libcrypto-shlib-c_zstd.d apps/lib/libapps-lib-engine.d \
-     crypto/bf/libcrypto-shlib-bf_skey.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_sm4_xts.d \
-     crypto/asn1/libcrypto-lib-p5_pbev2.d ssl/libssl-lib-t1_trce.d \
-     crypto/x509/libcrypto-lib-x509name.d \
-     crypto/libcrypto-shlib-initthread.d ssl/quic/libssl-shlib-qlog.d \
-     crypto/ec/libcrypto-shlib-ecdsa_ossl.d \
-     crypto/dh/libcrypto-shlib-dh_gen.d \
-     crypto/bio/libcrypto-shlib-bio_dump.d \
-     crypto/des/liblegacy-lib-ofb_enc.d providers/legacy-dso-legacyprov.d \
-     crypto/pkcs12/libcrypto-shlib-p12_npas.d \
-     crypto/dsa/libcrypto-shlib-dsa_prn.d apps/openssl-bin-prime.d \
-     crypto/asn1/libcrypto-lib-a_i2d_fp.d \
-     crypto/ess/libcrypto-shlib-ess_asn1.d \
-     crypto/rand/libcrypto-lib-prov_seed.d crypto/libcrypto-shlib-cryptlib.d \
-     providers/implementations/encode_decode/libdefault-lib-encode_key2any.d \
-     crypto/slh_dsa/libcrypto-lib-slh_dsa_hash_ctx.d \
-     crypto/pkcs7/libcrypto-lib-pk7_smime.d \
-     crypto/cms/libcrypto-shlib-cms_err.d \
-     crypto/async/libcrypto-shlib-async.d apps/openssl-bin-progs.d \
-     apps/openssl-bin-s_server.d crypto/evp/libcrypto-shlib-legacy_blake2.d \
-     crypto/libcrypto-lib-provider_predefined.d apps/openssl-bin-smime.d \
-     crypto/bn/libcrypto-shlib-bn_const.d \
-     crypto/des/libcrypto-lib-cfb64ede.d ssl/statem/libssl-lib-statem_lib.d \
-     crypto/dsa/libcrypto-lib-dsa_vrf.d crypto/evp/libcrypto-lib-evp_lib.d \
-     crypto/libcrypto-shlib-defaults.d \
-     providers/implementations/signature/libdefault-lib-ml_dsa_sig.d \
-     crypto/thread/libcrypto-lib-arch.d apps/openssl-bin-enc.d \
-     ssl/libssl-shlib-t1_enc.d crypto/idea/liblegacy-lib-i_ofb64.d \
-     crypto/sm2/libcrypto-lib-sm2_sign.d \
-     crypto/dso/libcrypto-lib-dso_openssl.d \
-     crypto/async/libcrypto-lib-async.d crypto/idea/libcrypto-shlib-i_cbc.d \
-     crypto/x509/libcrypto-shlib-v3_pci.d \
-     crypto/x509/libcrypto-shlib-t_req.d ssl/libssl-lib-ssl_utst.d \
-     crypto/asn1/libcrypto-lib-asn_mstbl.d \
-     crypto/pkcs12/libcrypto-shlib-p12_crpt.d \
-     crypto/x509/libcrypto-lib-v3_no_rev_avail.d ssl/libssl-shlib-ssl_mcnf.d \
-     crypto/stack/libcrypto-shlib-stack.d \
-     crypto/x509/libcrypto-lib-v3_asid.d \
-     providers/common/liblegacy-lib-provider_util.d \
-     crypto/hashtable/libcrypto-lib-hashfunc.d \
-     crypto/modes/libcrypto-shlib-wrap128.d \
-     crypto/conf/libcrypto-lib-conf_mall.d \
-     crypto/encode_decode/libcrypto-shlib-decoder_meth.d \
-     crypto/evp/libcrypto-lib-ec_support.d \
-     crypto/rsa/libcrypto-lib-rsa_oaep.d crypto/pem/libcrypto-lib-pem_oth.d \
-     providers/implementations/exchange/libdefault-lib-dh_exch.d \
-     providers/implementations/ciphers/libcommon-lib-ciphercommon_gcm.d \
-     crypto/x509/libcrypto-shlib-t_crl.d \
-     crypto/ec/curve448/libcrypto-lib-eddsa.d \
-     crypto/asn1/libcrypto-shlib-a_d2i_fp.d \
-     crypto/libcrypto-shlib-params_idx.d crypto/ec/libcrypto-lib-ec_curve.d \
-     ssl/quic/libssl-lib-quic_tls.d crypto/pkcs12/libcrypto-lib-p12_crt.d \
-     providers/common/der/libcommon-lib-der_wrap_gen.d \
-     crypto/sm2/libcrypto-shlib-sm2_crypt.d \
-     crypto/des/liblegacy-lib-ecb_enc.d crypto/x509/libcrypto-lib-x509_vpm.d \
-     crypto/libcrypto-lib-ctype.d \
-     crypto/slh_dsa/libcrypto-shlib-slh_dsa_hash_ctx.d \
-     crypto/ui/libcrypto-lib-ui_err.d \
-     providers/implementations/rands/libdefault-lib-drbg_ctr.d \
-     crypto/pkcs12/libcrypto-shlib-p12_attr.d \
-     crypto/thread/arch/libcrypto-shlib-thread_posix.d \
-     crypto/evp/libcrypto-shlib-p5_crpt2.d \
-     crypto/ffc/libcrypto-shlib-ffc_dh.d \
-     ssl/record/methods/libssl-shlib-tls1_meth.d \
-     providers/implementations/kdfs/libdefault-lib-sskdf.d \
-     crypto/bio/libcrypto-shlib-ossl_core_bio.d \
-     crypto/ec/libcrypto-shlib-ecp_oct.d \
-     crypto/objects/libcrypto-shlib-obj_lib.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_xts.d \
-     crypto/aes/libcrypto-shlib-aes_cfb.d \
-     crypto/encode_decode/libcrypto-lib-decoder_pkey.d \
-     crypto/dh/libcrypto-shlib-dh_meth.d \
-     crypto/ocsp/libcrypto-shlib-v3_ocsp.d \
-     crypto/des/libcrypto-lib-str2key.d crypto/libcrypto-shlib-cpuid.d \
-     ssl/record/methods/libssl-lib-tlsany_meth.d \
-     crypto/camellia/libcrypto-shlib-cmll_misc.d \
-     crypto/evp/libcrypto-shlib-bio_md.d \
-     crypto/rsa/libcrypto-shlib-rsa_crpt.d apps/openssl-bin-pkcs8.d \
-     ssl/libssl-shlib-d1_lib.d crypto/conf/libcrypto-shlib-conf_ssl.d \
-     crypto/x509/libcrypto-shlib-v3_aaa.d \
-     crypto/rsa/libcrypto-shlib-rsa_sp800_56b_gen.d \
-     crypto/ocsp/libcrypto-lib-ocsp_prn.d \
-     crypto/pkcs7/libcrypto-shlib-pk7_smime.d \
-     crypto/dsa/libcrypto-shlib-dsa_asn1.d \
-     crypto/txt_db/libcrypto-shlib-txt_db.d \
-     crypto/ec/libcrypto-shlib-ec_backend.d \
-     crypto/modes/libcrypto-lib-xts128.d crypto/libcrypto-shlib-passphrase.d \
-     crypto/modes/libcrypto-lib-ocb128.d crypto/evp/libcrypto-lib-p_legacy.d \
-     crypto/cms/libcrypto-shlib-cms_dh.d \
-     crypto/x509/libcrypto-shlib-x509_cmp.d \
-     crypto/thread/arch/libssl-shlib-thread_none.d \
-     apps/lib/libapps-lib-s_socket.d \
-     crypto/dso/libcrypto-shlib-dso_openssl.d \
-     crypto/asn1/libcrypto-lib-a_strnid.d \
-     providers/implementations/kdfs/libdefault-lib-kbkdf.d \
-     ssl/libssl-lib-tls13_enc.d crypto/x509/libcrypto-lib-x509_cmp.d \
-     ssl/quic/libssl-lib-quic_port.d crypto/asn1/libcrypto-shlib-x_pkey.d \
-     ssl/quic/libssl-shlib-cc_newreno.d \
-     crypto/rand/libcrypto-shlib-rand_uniform.d \
-     ssl/rio/libssl-lib-poll_immediate.d \
-     crypto/asn1/libcrypto-shlib-asn_moid.d \
-     providers/implementations/rands/seeding/libdefault-lib-rand_win.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_chacha20_poly1305.d \
-     crypto/pkcs7/libcrypto-shlib-bio_pk7.d \
-     crypto/pkcs12/libcrypto-lib-p12_key.d \
-     crypto/dh/libcrypto-lib-dh_check.d ssl/libssl-lib-ssl_ciph.d \
-     crypto/x509/libcrypto-lib-x_x509a.d crypto/evp/libcrypto-lib-s_lib.d \
-     crypto/asn1/libcrypto-lib-d2i_param.d \
-     crypto/evp/libcrypto-shlib-ec_support.d \
-     crypto/libcrypto-shlib-provider_child.d \
-     crypto/ui/libcrypto-lib-ui_null.d crypto/aes/libcrypto-lib-aes_misc.d \
-     crypto/bn/libcrypto-shlib-bn_word.d crypto/cmp/libcrypto-lib-cmp_http.d \
-     crypto/bn/libcrypto-shlib-bn_print.d \
-     crypto/ripemd/libcrypto-shlib-rmd_one.d \
-     crypto/camellia/libcrypto-lib-cmll_ctr.d \
-     crypto/evp/libcrypto-lib-p_lib.d crypto/bio/libcrypto-shlib-bf_prefix.d \
-     apps/lib/openssl-bin-cmp_mock_srv.d crypto/asn1/libcrypto-shlib-a_int.d \
-     crypto/dsa/libcrypto-shlib-dsa_backend.d \
-     crypto/asn1/libcrypto-shlib-p5_pbev2.d crypto/libcrypto-shlib-trace.d \
-     crypto/asn1/libcrypto-shlib-asn1_gen.d \
-     crypto/ec/libcrypto-shlib-ec_ameth.d \
-     crypto/x509/libcrypto-lib-v3_group_ac.d \
-     crypto/asn1/libcrypto-lib-nsseq.d crypto/des/libcrypto-shlib-ofb64enc.d \
-     crypto/bio/libcrypto-lib-bss_null.d \
-     crypto/bio/libcrypto-lib-bss_dgram.d \
-     crypto/rsa/libcrypto-shlib-rsa_gen.d \
-     crypto/dh/libcrypto-shlib-dh_rfc5114.d \
-     crypto/asn1/libcrypto-shlib-a_time.d ssl/quic/libssl-shlib-quic_txpim.d \
-     crypto/libssl-shlib-packet.d crypto/evp/libcrypto-shlib-kdf_lib.d \
-     providers/implementations/kem/libtemplate-lib-template_kem.d \
-     crypto/thread/arch/libcrypto-lib-thread_none.d \
-     crypto/evp/libcrypto-lib-p_verify.d crypto/evp/libcrypto-lib-evp_enc.d \
-     crypto/ripemd/liblegacy-lib-rmd_one.d \
-     providers/implementations/kdfs/libdefault-lib-hmacdrbg_kdf.d \
-     crypto/cmac/libcrypto-lib-cmac.d crypto/asn1/libcrypto-shlib-x_int64.d \
-     crypto/camellia/libcrypto-shlib-cmll_ecb.d \
-     crypto/sm4/libcrypto-shlib-sm4.d crypto/evp/libcrypto-lib-e_idea.d \
-     crypto/x509/libcrypto-shlib-v3_ncons.d \
-     crypto/ec/libcrypto-lib-ecdh_kdf.d ssl/libssl-shlib-ssl_stat.d \
-     apps/lib/libapps-lib-opt.d crypto/cast/liblegacy-lib-c_cfb64.d \
-     crypto/ct/libcrypto-shlib-ct_log.d crypto/md5/libcrypto-lib-md5_dgst.d \
-     crypto/asn1/libcrypto-shlib-asn_mstbl.d \
-     crypto/x509/libcrypto-shlib-v3_cpols.d \
-     crypto/asn1/libcrypto-lib-a_strex.d \
-     crypto/rsa/libcrypto-shlib-rsa_ossl.d \
-     crypto/des/libcrypto-shlib-cfb64enc.d \
-     ssl/quic/libssl-shlib-quic_tls_api.d crypto/libcrypto-shlib-bsearch.d \
-     crypto/cms/libcrypto-shlib-cms_rsa.d \
-     crypto/x509/libcrypto-shlib-x509_set.d \
-     crypto/x509/libcrypto-shlib-pcy_cache.d \
-     crypto/thread/libcrypto-shlib-api.d ssl/libssl-lib-ssl_lib.d \
-     crypto/x509/libcrypto-lib-x509rset.d \
-     crypto/x509/libcrypto-lib-x_ietfatt.d \
-     crypto/dso/libcrypto-shlib-dso_lib.d crypto/asn1/libcrypto-lib-x_pkey.d \
-     crypto/libcrypto-shlib-o_dir.d crypto/dh/libcrypto-lib-dh_lib.d \
-     crypto/rand/libcrypto-lib-rand_uniform.d \
-     crypto/idea/libcrypto-shlib-i_ofb64.d \
-     crypto/lhash/libcrypto-shlib-lhash.d \
-     crypto/evp/libcrypto-shlib-dsa_ctrl.d \
-     crypto/crmf/libcrypto-shlib-crmf_err.d apps/openssl-bin-genrsa.d \
-     crypto/ocsp/libcrypto-shlib-ocsp_prn.d \
-     crypto/encode_decode/libcrypto-shlib-encoder_lib.d \
-     crypto/rsa/libcrypto-shlib-rsa_mp_names.d \
-     crypto/bn/libcrypto-lib-bn_exp2.d \
-     crypto/hashtable/libcrypto-shlib-hashfunc.d \
-     ssl/record/methods/libdefault-lib-ssl3_cbc.d \
-     crypto/x509/libcrypto-shlib-v3_authattid.d \
-     ssl/quic/libssl-shlib-quic_rcidm.d crypto/evp/libcrypto-shlib-e_aria.d \
-     crypto/des/libcrypto-lib-cfb_enc.d \
-     crypto/ec/libcrypto-lib-ecx_backend.d crypto/ec/libcrypto-lib-ec_key.d \
-     crypto/x509/libcrypto-shlib-x_name.d \
-     crypto/evp/libcrypto-shlib-c_allc.d crypto/dsa/libcrypto-lib-dsa_asn1.d \
-     crypto/x509/libcrypto-shlib-v3_info.d \
-     crypto/x509/libcrypto-shlib-x_pubkey.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_cast5_hw.d \
-     crypto/cms/libcrypto-shlib-cms_dd.d \
-     crypto/x509/libcrypto-shlib-v3_genn.d crypto/evp/libcrypto-lib-encode.d \
-     crypto/asn1/libcrypto-shlib-t_spki.d crypto/bn/libcrypto-lib-bn_sqrt.d \
-     crypto/libcrypto-shlib-packet.d \
-     crypto/bio/libcrypto-shlib-bss_dgram_pair.d \
-     crypto/x509/libcrypto-shlib-pcy_node.d \
-     crypto/x509/libcrypto-shlib-v3_audit_id.d \
-     crypto/des/libcrypto-shlib-cfb64ede.d \
-     crypto/slh_dsa/libcrypto-lib-slh_wots.d crypto/libcrypto-lib-ssl_err.d \
-     crypto/ffc/libcrypto-lib-ffc_params_generate.d \
-     crypto/libcrypto-lib-o_time.d crypto/asn1/libcrypto-shlib-i2d_evp.d \
-     crypto/ec/libcrypto-shlib-ec_check.d crypto/bn/libcrypto-lib-bn_dh.d \
-     crypto/md4/libcrypto-shlib-md4_one.d \
-     providers/implementations/ciphers/libcommon-lib-ciphercommon_hw.d \
-     providers/implementations/keymgmt/libdefault-lib-ml_kem_kmgmt.d \
-     crypto/des/liblegacy-lib-ecb3_enc.d apps/openssl-bin-cms.d \
-     ssl/quic/libssl-shlib-quic_tserver.d crypto/x509/libcrypto-lib-v3_san.d \
-     crypto/cmp/libcrypto-lib-cmp_status.d \
-     crypto/cms/libcrypto-shlib-cms_pwri.d \
-     crypto/dso/libcrypto-lib-dso_win32.d \
-     crypto/x509/libcrypto-lib-v3_enum.d \
-     ssl/record/libssl-shlib-rec_layer_d1.d crypto/libcrypto-lib-sleep.d \
-     crypto/cms/libcrypto-lib-cms_dh.d crypto/x509/libcrypto-shlib-v3err.d \
-     crypto/evp/libcrypto-lib-kdf_lib.d ssl/quic/libssl-lib-quic_types.d \
-     crypto/bio/libcrypto-lib-bf_lbuf.d crypto/asn1/libcrypto-lib-a_verify.d \
-     crypto/crmf/libcrypto-shlib-crmf_lib.d \
-     crypto/ml_dsa/libcrypto-shlib-ml_dsa_key_compress.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_chacha20_poly1305_hw.d \
-     crypto/rsa/libcrypto-shlib-rsa_pk1.d \
-     crypto/ts/libcrypto-shlib-ts_rsp_verify.d \
-     crypto/ec/libcrypto-lib-ec_pmeth.d crypto/rc2/liblegacy-lib-rc2cfb64.d \
-     crypto/libcrypto-shlib-param_build.d \
-     crypto/bio/libcrypto-shlib-bss_acpt.d \
-     crypto/rand/libcrypto-shlib-rand_pool.d \
-     crypto/bio/libcrypto-lib-bf_nbio.d crypto/des/liblegacy-lib-str2key.d \
-     crypto/pkcs12/libcrypto-lib-p12_add.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_ccm_hw.d \
-     ssl/quic/libssl-lib-quic_txpim.d crypto/x509/libcrypto-shlib-v3_ist.d \
-     crypto/evp/libcrypto-lib-e_aria.d crypto/libcrypto-shlib-params_dup.d \
-     crypto/des/liblegacy-lib-ofb64enc.d ssl/rio/libssl-shlib-rio_notifier.d \
-     crypto/x509/libcrypto-lib-x509_txt.d crypto/libcrypto-lib-time.d \
-     crypto/ec/libcrypto-lib-ec_backend.d \
-     crypto/conf/libcrypto-lib-conf_mod.d crypto/seed/libcrypto-shlib-seed.d \
-     crypto/modes/libcrypto-shlib-ccm128.d \
-     crypto/bf/libcrypto-shlib-bf_ofb64.d \
-     providers/implementations/kem/libdefault-lib-mlx_kem.d \
-     crypto/evp/libcrypto-shlib-evp_lib.d crypto/idea/libcrypto-lib-i_cbc.d \
-     crypto/des/libcrypto-lib-ecb_enc.d crypto/evp/libcrypto-shlib-p5_crpt.d \
-     crypto/evp/libcrypto-lib-legacy_md5.d \
-     crypto/property/libcrypto-lib-property_parse.d \
-     crypto/slh_dsa/libcrypto-shlib-slh_xmss.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_hw.d \
-     crypto/bn/libcrypto-lib-bn_srp.d ssl/quic/libssl-shlib-quic_srt_gen.d \
-     providers/common/der/libdefault-lib-der_sm2_key.d \
-     crypto/evp/libcrypto-shlib-evp_err.d crypto/cms/libcrypto-lib-cms_att.d \
-     crypto/libcrypto-lib-asn1_dsa.d ssl/quic/libssl-shlib-quic_rstream.d \
-     crypto/x509/libcrypto-lib-v3_attrdesc.d apps/openssl-bin-dgst.d \
-     crypto/asn1/libcrypto-shlib-x_algor.d \
-     crypto/ct/libcrypto-shlib-ct_sct_ctx.d \
-     crypto/cms/libcrypto-lib-cms_pwri.d \
-     crypto/rsa/libcrypto-shlib-rsa_sp800_56b_check.d \
-     crypto/asn1/libcrypto-lib-asn1_gen.d crypto/asn1/libcrypto-lib-x_info.d \
-     crypto/asn1/libcrypto-lib-bio_ndef.d \
-     crypto/evp/libcrypto-lib-ctrl_params_translate.d \
-     crypto/ec/libcrypto-lib-ecdsa_vrf.d \
-     crypto/asn1/libcrypto-lib-a_bitstr.d crypto/ts/libcrypto-shlib-ts_lib.d \
-     providers/implementations/ciphers/libcommon-lib-ciphercommon_ccm.d \
-     crypto/libcrypto-lib-trace.d crypto/x509/libcrypto-lib-x509_r2x.d \
-     apps/openssl-bin-gendsa.d crypto/des/liblegacy-lib-des_enc.d \
-     crypto/cms/libcrypto-shlib-cms_smime.d \
-     crypto/evp/libcrypto-lib-evp_fetch.d \
-     crypto/ffc/libcrypto-shlib-ffc_params_validate.d \
-     crypto/rsa/libcrypto-lib-rsa_chk.d crypto/x509/libcrypto-shlib-v3_int.d \
-     crypto/ml_dsa/libcrypto-shlib-ml_dsa_params.d \
-     crypto/evp/libcrypto-shlib-signature.d \
-     crypto/evp/libcrypto-lib-c_allc.d crypto/rsa/libcrypto-lib-rsa_err.d \
-     crypto/evp/libcrypto-shlib-e_aes_cbc_hmac_sha256.d \
-     crypto/x509/libcrypto-shlib-v3_ia5.d \
-     providers/implementations/digests/libcommon-lib-digestcommon.d \
-     crypto/ui/libcrypto-lib-ui_util.d \
-     crypto/ml_dsa/libcrypto-lib-ml_dsa_sign.d \
-     crypto/asn1/libcrypto-shlib-tasn_dec.d apps/openssl-bin-errstr.d \
-     crypto/http/libcrypto-lib-http_lib.d ssl/libssl-lib-tls_depr.d \
-     crypto/asn1/libcrypto-lib-d2i_pu.d \
-     crypto/pkcs12/libcrypto-shlib-p12_asn.d \
-     providers/libcrypto-shlib-prov_running.d crypto/libcrypto-lib-o_init.d \
-     crypto/bio/libcrypto-shlib-bio_addr.d \
-     providers/implementations/kdfs/libdefault-lib-x942kdf.d \
-     crypto/libcrypto-shlib-context.d crypto/x509/libcrypto-shlib-v3_sda.d \
-     crypto/lhash/libcrypto-lib-lhash.d \
-     crypto/cmp/libcrypto-shlib-cmp_server.d \
-     crypto/rand/libcrypto-shlib-rand_err.d \
-     crypto/encode_decode/libcrypto-lib-decoder_lib.d \
-     crypto/comp/libcrypto-lib-comp_err.d \
-     crypto/x509/libcrypto-lib-x509_set.d \
-     crypto/rsa/libcrypto-shlib-rsa_pss.d crypto/dh/libcrypto-lib-dh_key.d \
-     ssl/quic/libssl-shlib-quic_sf_list.d \
-     crypto/bio/libcrypto-lib-bss_conn.d crypto/libcrypto-shlib-asn1_dsa.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_sm4_xts_hw.d \
-     crypto/ocsp/libcrypto-lib-ocsp_cl.d ssl/quic/libssl-shlib-quic_cfq.d \
-     crypto/evp/libcrypto-lib-bio_enc.d \
-     crypto/evp/libcrypto-lib-e_chacha20_poly1305.d \
-     providers/implementations/macs/libdefault-lib-cmac_prov.d \
-     ssl/quic/libssl-shlib-quic_engine.d crypto/md5/liblegacy-lib-md5_one.d \
-     crypto/conf/libcrypto-shlib-conf_api.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_desx.d \
-     crypto/bf/liblegacy-lib-bf_skey.d crypto/rsa/libcrypto-lib-rsa_meth.d \
-     crypto/evp/libcrypto-lib-e_rc5.d ssl/libssl-lib-d1_lib.d \
-     crypto/ess/libcrypto-shlib-ess_lib.d \
-     crypto/libcrypto-lib-provider_core.d ssl/quic/libssl-lib-quic_srtm.d \
-     crypto/pkcs7/libcrypto-lib-pk7_asn1.d \
-     crypto/ffc/libcrypto-shlib-ffc_params.d \
-     crypto/libcrypto-shlib-cpt_err.d crypto/des/libcrypto-shlib-ecb_enc.d \
-     ssl/statem/libssl-shlib-extensions_cust.d crypto/libcrypto-lib-mem.d \
-     crypto/ec/libcrypto-lib-ecp_mont.d \
-     crypto/ec/curve448/libcrypto-lib-f_generic.d \
-     crypto/evp/libcrypto-lib-pmeth_check.d \
-     providers/common/der/libcommon-lib-der_slh_dsa_gen.d \
-     crypto/x509/libcrypto-shlib-pcy_data.d \
-     crypto/x509/libcrypto-lib-v3_timespec.d \
-     crypto/asn1/libcrypto-lib-tasn_dec.d \
-     crypto/buffer/libcrypto-lib-buffer.d ssl/libssl-shlib-ssl_rsa.d \
-     crypto/bf/libcrypto-lib-bf_skey.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_cbc_hmac_sha.d \
-     crypto/sha/libcrypto-lib-sha3.d crypto/evp/libcrypto-lib-e_des.d \
-     providers/common/der/libcommon-lib-der_ec_gen.d \
-     crypto/ct/libcrypto-lib-ct_policy.d ssl/libssl-shlib-ssl_cert_comp.d \
-     crypto/modes/libcrypto-shlib-cts128.d crypto/bio/libcrypto-lib-bio_cb.d \
-     crypto/ec/libcrypto-shlib-ec_key.d crypto/des/libcrypto-shlib-fcrypt.d \
-     providers/common/libdefault-lib-securitycheck_default.d \
-     crypto/evp/libcrypto-lib-e_aes_cbc_hmac_sha256.d \
-     crypto/ec/libcrypto-shlib-ecp_mont.d \
-     crypto/asn1/libcrypto-lib-a_print.d \
-     crypto/pkcs12/libcrypto-lib-p12_utl.d \
-     crypto/dsa/libcrypto-lib-dsa_ameth.d apps/openssl-bin-storeutl.d \
-     crypto/evp/libcrypto-lib-e_seed.d crypto/evp/libcrypto-shlib-e_seed.d \
-     providers/implementations/exchange/libdefault-lib-ecdh_exch.d \
-     crypto/ripemd/libcrypto-lib-rmd_one.d \
-     providers/implementations/digests/libdefault-lib-null_prov.d \
-     crypto/sha/libcrypto-shlib-sha256.d crypto/libcrypto-lib-params.d \
-     ssl/libssl-shlib-d1_msg.d ssl/quic/libssl-lib-quic_wire_pkt.d \
-     crypto/seed/libcrypto-lib-seed_cfb.d ssl/quic/libssl-shlib-quic_fc.d \
-     crypto/x509/libcrypto-lib-v3_audit_id.d \
-     crypto/dh/libcrypto-lib-dh_asn1.d ssl/statem/libssl-shlib-statem_clnt.d \
-     crypto/x509/libcrypto-lib-x509_err.d \
-     crypto/pkcs12/libcrypto-lib-pk12err.d \
-     crypto/bio/libcrypto-shlib-bf_readbuff.d \
-     crypto/evp/libcrypto-shlib-evp_utils.d \
-     crypto/err/libcrypto-lib-err_save.d \
-     crypto/bio/libcrypto-shlib-bss_core.d crypto/seed/libcrypto-lib-seed.d \
-     providers/implementations/rands/libdefault-lib-drbg.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_cbc_hmac_sha1_hw.d \
-     crypto/md5/libcrypto-shlib-md5_dgst.d \
-     crypto/bn/libcrypto-lib-bn_rsa_fips186_4.d \
-     providers/implementations/encode_decode/libdefault-lib-encode_key2blob.d \
-     crypto/x509/libcrypto-shlib-v3_pku.d \
-     crypto/rand/libcrypto-shlib-randfile.d \
-     ssl/quic/libssl-shlib-quic_statm.d \
-     providers/common/der/libcommon-lib-der_rsa_key.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_gcm_hw.d \
-     providers/implementations/ciphers/libcommon-lib-ciphercommon.d \
-     crypto/evp/libcrypto-shlib-mac_meth.d crypto/idea/liblegacy-lib-i_ecb.d \
-     apps/lib/libapps-lib-apps.d crypto/err/libcrypto-lib-err.d \
-     crypto/asn1/libcrypto-shlib-n_pkey.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_sm4_gcm_hw.d \
-     apps/openssl-bin-s_client.d crypto/libcrypto-lib-indicator_core.d \
-     crypto/asn1/libcrypto-lib-i2d_evp.d \
-     crypto/encode_decode/libcrypto-shlib-decoder_lib.d \
-     crypto/md4/libcrypto-lib-md4_dgst.d crypto/des/libcrypto-lib-set_key.d \
-     crypto/asn1/libcrypto-shlib-nsseq.d \
-     providers/libcrypto-shlib-defltprov.d \
-     apps/lib/libapps-lib-http_server.d crypto/cms/libcrypto-lib-cms_ess.d \
-     crypto/evp/libcrypto-lib-legacy_wp.d \
-     crypto/cms/libcrypto-shlib-cms_lib.d \
-     providers/implementations/digests/libdefault-lib-md5_prov.d \
-     crypto/ec/libcrypto-lib-ec_ameth.d crypto/bio/libcrypto-shlib-bio_lib.d \
-     providers/implementations/rands/libdefault-lib-drbg_hash.d \
-     crypto/x509/libcrypto-lib-v3_utl.d crypto/md4/liblegacy-lib-md4_one.d \
-     crypto/evp/libcrypto-shlib-legacy_wp.d \
-     crypto/pem/libcrypto-shlib-pem_pkey.d \
-     crypto/x509/libcrypto-shlib-x509_v3.d ssl/quic/libssl-shlib-uint_set.d \
-     crypto/thread/libssl-shlib-arch.d crypto/x509/libcrypto-lib-pcy_map.d \
-     crypto/x509/libcrypto-lib-v3_ac_tgt.d \
-     providers/implementations/signature/libdefault-lib-sm2_sig.d \
-     crypto/x509/libcrypto-shlib-pcy_lib.d \
-     crypto/objects/libcrypto-lib-obj_dat.d \
-     providers/implementations/kdfs/liblegacy-lib-pbkdf1.d \
-     crypto/ffc/libcrypto-shlib-ffc_key_validate.d \
-     crypto/x509/libcrypto-lib-pcy_lib.d \
-     crypto/ct/libcrypto-shlib-ct_policy.d \
-     crypto/ts/libcrypto-shlib-ts_verify_ctx.d \
-     crypto/des/libcrypto-shlib-des_enc.d ssl/quic/libssl-shlib-quic_port.d \
-     crypto/rc2/libcrypto-shlib-rc2cfb64.d \
-     crypto/ess/libcrypto-lib-ess_asn1.d \
-     crypto/des/libcrypto-shlib-cbc_cksm.d crypto/bn/libcrypto-lib-bn_recp.d \
-     crypto/rc2/liblegacy-lib-rc2_cbc.d ssl/libssl-lib-d1_msg.d \
-     crypto/x509/libcrypto-lib-v3_pcia.d crypto/cast/libcrypto-lib-c_ecb.d \
-     crypto/x509/libcrypto-lib-v3_tlsf.d ssl/libssl-shlib-methods.d \
-     crypto/objects/libcrypto-shlib-obj_dat.d \
-     crypto/modes/libcrypto-shlib-cfb128.d \
-     crypto/pem/libcrypto-shlib-pem_lib.d crypto/bf/libcrypto-shlib-bf_ecb.d \
-     crypto/x509/libcrypto-shlib-v3_conf.d crypto/des/libcrypto-lib-fcrypt.d \
-     crypto/property/libcrypto-lib-property.d \
-     crypto/x509/libcrypto-shlib-x_req.d \
-     crypto/asn1/libcrypto-shlib-a_i2d_fp.d \
-     crypto/bio/libcrypto-shlib-bss_sock.d \
-     crypto/x509/libcrypto-lib-x_pubkey.d \
-     crypto/encode_decode/libcrypto-shlib-decoder_pkey.d \
-     crypto/libcrypto-shlib-quic_vlint.d \
-     crypto/bio/libcrypto-shlib-bss_null.d \
-     crypto/rsa/libcrypto-shlib-rsa_mp.d \
-     crypto/ffc/libcrypto-shlib-ffc_key_generate.d \
-     ssl/quic/libssl-lib-quic_cfq.d crypto/ocsp/libcrypto-lib-ocsp_vfy.d \
-     providers/common/der/libdefault-lib-der_sm2_gen.d \
-     ssl/statem/libssl-lib-statem_dtls.d \
-     crypto/hashtable/libcrypto-shlib-hashtable.d \
-     crypto/evp/libcrypto-shlib-e_chacha20_poly1305.d \
-     crypto/x509/libcrypto-shlib-x509_meth.d \
-     providers/implementations/encode_decode/libdefault-lib-encode_key2ms.d \
-     crypto/bn/libcrypto-shlib-bn_shift.d \
-     crypto/asn1/libcrypto-lib-p8_pkey.d crypto/legacy-dso-ctype.d \
-     crypto/lhash/libcrypto-shlib-lh_stats.d \
-     crypto/evp/libcrypto-lib-p5_crpt2.d \
-     crypto/ocsp/libcrypto-lib-ocsp_lib.d \
-     crypto/cmp/libcrypto-lib-cmp_util.d crypto/bn/libcrypto-lib-bn_exp.d \
-     crypto/rsa/libcrypto-lib-rsa_saos.d \
-     crypto/ec/libcrypto-shlib-ecdsa_vrf.d ssl/libssl-shlib-t1_trce.d \
-     crypto/bio/libcrypto-lib-bss_sock.d \
-     crypto/x509/libcrypto-lib-pcy_tree.d crypto/evp/libcrypto-lib-e_des3.d \
-     ssl/record/methods/libssl-shlib-tls_pad.d \
-     crypto/ffc/libcrypto-lib-ffc_params_validate.d \
-     crypto/x509/libcrypto-lib-v3_pcons.d ssl/quic/libssl-lib-cc_newreno.d \
-     providers/implementations/kem/libdefault-lib-rsa_kem.d \
-     crypto/des/liblegacy-lib-pcbc_enc.d \
-     crypto/evp/libcrypto-shlib-bio_b64.d \
-     crypto/pkcs12/libcrypto-lib-p12_p8d.d \
-     crypto/des/libcrypto-shlib-rand_key.d \
-     crypto/x509/libcrypto-shlib-v3_lib.d \
-     crypto/rsa/libcrypto-shlib-rsa_none.d \
-     crypto/asn1/libcrypto-lib-tasn_scn.d crypto/sha/libcrypto-shlib-sha3.d \
-     crypto/ec/libcrypto-shlib-curve25519.d \
-     crypto/ml_dsa/libcrypto-shlib-ml_dsa_key.d \
-     crypto/x509/libcrypto-lib-v3_addr.d crypto/x509/libcrypto-lib-v3_pku.d \
-     crypto/bf/libcrypto-lib-bf_ofb64.d crypto/evp/libcrypto-shlib-e_aes.d \
-     ssl/statem/libssl-shlib-statem_dtls.d \
-     crypto/rsa/libcrypto-lib-rsa_pss.d crypto/dsa/libcrypto-lib-dsa_gen.d \
-     ssl/libssl-shlib-priority_queue.d crypto/ec/libcrypto-shlib-ecx_meth.d \
-     crypto/des/libcrypto-shlib-xcbc_enc.d \
-     crypto/store/libcrypto-shlib-store_lib.d \
-     crypto/libcrypto-shlib-indicator_core.d \
-     crypto/ec/libcrypto-shlib-ec2_oct.d crypto/libcrypto-lib-o_str.d \
-     crypto/http/libcrypto-shlib-http_lib.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_seed_hw.d \
-     crypto/evp/libcrypto-shlib-evp_key.d \
-     crypto/x509/libcrypto-lib-by_file.d crypto/ts/libcrypto-shlib-ts_err.d \
-     crypto/ct/libcrypto-lib-ct_b64.d crypto/cms/libcrypto-lib-cms_sd.d \
-     crypto/http/libcrypto-lib-http_client.d \
-     crypto/encode_decode/libcrypto-lib-decoder_meth.d \
-     crypto/bn/libcrypto-lib-bn_prime.d crypto/sm2/libcrypto-lib-sm2_key.d \
-     crypto/pkcs12/libcrypto-lib-p12_kiss.d \
-     crypto/x509/libcrypto-shlib-v3_iobo.d \
-     crypto/cmp/libcrypto-lib-cmp_hdr.d crypto/x509/libcrypto-lib-v3_genn.d \
-     crypto/rsa/libcrypto-lib-rsa_lib.d crypto/libcrypto-shlib-uid.d \
-     crypto/pkcs7/libcrypto-lib-bio_pk7.d \
-     crypto/asn1/libcrypto-shlib-x_info.d crypto/bio/libcrypto-lib-bss_fd.d \
-     crypto/aes/libcrypto-lib-aes_cfb.d apps/openssl-bin-dsa.d \
-     crypto/des/liblegacy-lib-xcbc_enc.d crypto/des/libcrypto-lib-ofb64enc.d \
-     crypto/cms/libcrypto-shlib-cms_enc.d \
-     crypto/x509/libcrypto-lib-v3_ind_iss.d \
-     crypto/comp/libcrypto-lib-c_zlib.d \
-     crypto/slh_dsa/libcrypto-shlib-slh_hash.d \
-     crypto/err/libcrypto-lib-err_mark.d \
-     crypto/cmp/libcrypto-lib-cmp_client.d \
-     crypto/des/liblegacy-lib-fcrypt_b.d crypto/cast/liblegacy-lib-c_ofb64.d \
-     crypto/asn1/libcrypto-lib-a_type.d apps/openssl-bin-dhparam.d \
-     crypto/hpke/libcrypto-lib-hpke_util.d apps/openssl-bin-pkey.d \
-     ssl/quic/libssl-lib-quic_wire.d crypto/dso/libcrypto-lib-dso_vms.d \
-     crypto/ec/libcrypto-lib-ecdsa_ossl.d \
-     crypto/asn1/libcrypto-lib-asn_moid.d \
-     crypto/asn1/libcrypto-lib-a_digest.d \
-     crypto/whrlpool/liblegacy-lib-wp_dgst.d \
-     crypto/evp/libcrypto-lib-legacy_sha.d \
-     crypto/pkcs12/libcrypto-lib-p12_mutl.d crypto/bf/libcrypto-lib-bf_ecb.d \
-     crypto/libcrypto-shlib-param_build_set.d \
-     providers/implementations/digests/libdefault-lib-sha2_prov.d \
-     ssl/record/methods/libssl-shlib-dtls_meth.d \
-     crypto/x509/libcrypto-lib-v3_soa_id.d \
-     crypto/camellia/libcrypto-lib-cmll_cfb.d \
-     crypto/aes/libcrypto-lib-aes_ofb.d \
-     crypto/bio/libcrypto-lib-ossl_core_bio.d \
-     crypto/evp/libcrypto-lib-pmeth_lib.d \
-     providers/implementations/encode_decode/libdefault-lib-decode_pem2der.d \
-     crypto/x509/libcrypto-lib-v3_akid.d \
-     providers/implementations/kem/libdefault-lib-ec_kem.d \
-     ssl/quic/libssl-shlib-json_enc.d \
-     providers/implementations/encode_decode/libdefault-lib-decode_spki2typespki.d \
-     ssl/libssl-shlib-ssl_utst.d crypto/asn1/libcrypto-lib-a_octet.d \
-     crypto/x509/libcrypto-shlib-x509_att.d \
-     crypto/bn/libcrypto-shlib-bn_mpi.d \
-     crypto/evp/libcrypto-shlib-pmeth_lib.d \
-     providers/implementations/kem/libdefault-lib-ecx_kem.d \
-     crypto/ui/libcrypto-shlib-ui_lib.d \
-     crypto/ml_dsa/libcrypto-shlib-ml_dsa_matrix.d \
-     crypto/crmf/libcrypto-lib-crmf_err.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_gcm.d \
-     crypto/buffer/libcrypto-lib-buf_err.d \
-     crypto/libcrypto-shlib-threads_win.d crypto/cms/libcrypto-lib-cms_err.d \
-     crypto/evp/libcrypto-shlib-e_rc5.d crypto/evp/libcrypto-shlib-bio_enc.d \
-     crypto/des/libcrypto-shlib-str2key.d \
-     crypto/pkcs7/libcrypto-shlib-pk7_asn1.d apps/openssl-bin-nseq.d \
-     crypto/cmp/libcrypto-lib-cmp_err.d \
-     crypto/evp/libcrypto-lib-asymcipher.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_chacha20_hw.d \
-     crypto/asn1/libcrypto-lib-asn1_lib.d \
-     crypto/des/libcrypto-lib-xcbc_enc.d \
-     crypto/dsa/libcrypto-shlib-dsa_pmeth.d \
-     crypto/modes/libcrypto-lib-cts128.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_tdes.d \
-     crypto/thread/libcrypto-lib-api.d \
-     crypto/slh_dsa/libcrypto-lib-slh_fors.d \
-     crypto/asn1/libcrypto-lib-tasn_new.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aria_gcm_hw.d \
-     crypto/x509/libcrypto-shlib-v3_rolespec.d \
-     crypto/x509/libcrypto-shlib-v3_admis.d \
-     crypto/comp/libcrypto-lib-c_zstd.d \
-     crypto/x509/libcrypto-shlib-v3_pmaps.d \
-     ssl/record/methods/libssl-lib-tls_multib.d \
-     crypto/rsa/libcrypto-shlib-rsa_meth.d \
-     crypto/des/libcrypto-shlib-ofb64ede.d \
-     crypto/ec/libcrypto-lib-ec_kmeth.d \
-     crypto/slh_dsa/libcrypto-lib-slh_hypertree.d \
-     crypto/ct/libcrypto-shlib-ct_b64.d \
-     crypto/ct/libcrypto-shlib-ct_x509v3.d \
-     crypto/x509/libcrypto-shlib-by_file.d \
-     ssl/quic/libssl-lib-quic_channel.d crypto/x509/libcrypto-lib-v3_crld.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_tdes_common.d \
-     crypto/x509/libcrypto-lib-v3_bitst.d \
-     crypto/encode_decode/libcrypto-shlib-decoder_err.d \
-     crypto/asn1/libcrypto-lib-a_d2i_fp.d \
-     crypto/async/arch/libcrypto-lib-async_null.d \
-     crypto/asn1/libcrypto-lib-a_mbstr.d crypto/bn/libcrypto-shlib-bn_gf2m.d \
-     providers/implementations/kdfs/libdefault-lib-argon2.d \
-     crypto/des/libcrypto-shlib-set_key.d \
-     crypto/kdf/libcrypto-shlib-kdf_err.d crypto/evp/libcrypto-shlib-e_bf.d \
-     crypto/pem/libcrypto-lib-pem_all.d \
-     crypto/dsa/libcrypto-shlib-dsa_sign.d \
-     crypto/md4/libcrypto-lib-md4_one.d crypto/bn/libcrypto-lib-bn_nist.d \
-     crypto/conf/libcrypto-shlib-conf_sap.d \
-     crypto/evp/libcrypto-lib-evp_cnf.d \
-     crypto/evp/libcrypto-shlib-evp_pkey.d \
-     crypto/ec/curve448/libcrypto-lib-scalar.d \
-     crypto/bio/libcrypto-lib-bio_lib.d crypto/x509/libcrypto-lib-x509_ext.d \
-     crypto/rc2/liblegacy-lib-rc2_ecb.d \
-     crypto/ffc/libcrypto-lib-ffc_key_generate.d \
-     crypto/ml_dsa/libcrypto-lib-ml_dsa_sample.d \
-     providers/implementations/digests/libdefault-lib-sm3_prov.d \
-     apps/openssl-bin-req.d ssl/quic/libssl-lib-quic_record_util.d \
-     crypto/x509/libcrypto-lib-v3_no_ass.d \
-     crypto/evp/libcrypto-lib-pmeth_gn.d \
-     providers/implementations/kdfs/libdefault-lib-tls1_prf.d \
-     crypto/asn1/libcrypto-lib-evp_asn1.d \
-     crypto/rsa/libcrypto-shlib-rsa_err.d crypto/ec/libcrypto-lib-ec_print.d \
-     crypto/libcrypto-lib-cversion.d crypto/x509/libcrypto-shlib-pcy_map.d \
-     crypto/x509/libcrypto-lib-t_req.d crypto/md5/libcrypto-shlib-md5_one.d \
-     crypto/x509/libcrypto-lib-v3_purp.d \
-     crypto/ts/libcrypto-lib-ts_req_utils.d \
-     crypto/aes/libcrypto-shlib-aes_ecb.d \
-     crypto/evp/libcrypto-shlib-c_alld.d \
-     crypto/property/libcrypto-shlib-property_err.d \
-     crypto/cms/libcrypto-shlib-cms_ec.d ssl/quic/libssl-lib-quic_trace.d \
-     ssl/record/methods/libssl-shlib-tlsany_meth.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_sm4_ccm_hw.d \
-     ssl/statem/libssl-shlib-statem.d crypto/pkcs12/libcrypto-lib-p12_sbag.d \
-     crypto/ui/libcrypto-lib-ui_lib.d crypto/cms/libcrypto-lib-cms_ec.d \
-     crypto/thread/arch/libssl-shlib-thread_posix.d \
-     providers/implementations/keymgmt/libdefault-lib-ml_dsa_kmgmt.d \
-     crypto/bn/libcrypto-shlib-bn_kron.d ssl/quic/libssl-shlib-quic_method.d \
-     crypto/rsa/libcrypto-shlib-rsa_prn.d \
-     crypto/pem/libcrypto-shlib-pvkfmt.d crypto/libcrypto-shlib-mem.d \
-     crypto/hmac/libcrypto-shlib-hmac.d ssl/libssl-lib-ssl_err_legacy.d \
-     providers/libcrypto-lib-prov_running.d \
-     crypto/pem/libcrypto-shlib-pem_sign.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes.d \
-     ssl/quic/libssl-shlib-quic_trace.d providers/libcrypto-shlib-nullprov.d \
-     crypto/dsa/libcrypto-shlib-dsa_ameth.d \
-     crypto/x509/libcrypto-lib-by_dir.d \
-     crypto/pkcs7/libcrypto-shlib-pk7_mime.d \
-     crypto/rsa/libcrypto-shlib-rsa_sign.d \
-     crypto/des/libcrypto-shlib-cbc_enc.d \
-     crypto/x509/libcrypto-shlib-v3_utl.d \
-     crypto/asn1/libcrypto-shlib-tasn_utl.d \
-     crypto/asn1/libcrypto-shlib-evp_asn1.d \
-     crypto/asn1/libcrypto-shlib-a_mbstr.d \
-     crypto/bio/libcrypto-shlib-bss_fd.d crypto/dh/libcrypto-lib-dh_err.d \
-     crypto/x509/libcrypto-lib-v3_prn.d ssl/statem/libssl-shlib-extensions.d \
-     crypto/evp/libcrypto-shlib-asymcipher.d \
-     crypto/siphash/libssl-shlib-siphash.d apps/openssl-bin-s_time.d \
-     crypto/des/libcrypto-lib-pcbc_enc.d \
-     apps/lib/libapps-lib-apps_opt_printf.d \
-     crypto/libcrypto-shlib-core_fetch.d crypto/libcrypto-lib-passphrase.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_sm4_ccm.d \
-     crypto/libcrypto-shlib-provider_predefined.d \
-     crypto/ec/libcrypto-shlib-ec_oct.d \
-     providers/implementations/macs/libdefault-lib-poly1305_prov.d \
-     crypto/asn1/libcrypto-lib-a_time.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_cts.d \
-     crypto/sm4/libcrypto-lib-sm4.d crypto/bio/libcrypto-shlib-bss_log.d \
-     crypto/asn1/libcrypto-shlib-a_utf8.d \
-     crypto/x509/libcrypto-shlib-t_acert.d \
-     crypto/rsa/libcrypto-shlib-rsa_asn1.d \
-     crypto/des/liblegacy-lib-cbc_enc.d \
-     ssl/quic/libssl-shlib-quic_stream_map.d \
-     crypto/ui/libcrypto-shlib-ui_util.d \
-     providers/common/der/libcommon-lib-der_ecx_key.d \
-     crypto/libcrypto-lib-cryptlib.d \
-     crypto/x509/libcrypto-shlib-v3_no_rev_avail.d \
-     crypto/dh/libcrypto-shlib-dh_err.d crypto/asn1/libcrypto-lib-tasn_enc.d \
-     ssl/quic/libssl-shlib-quic_reactor_wait_ctx.d \
-     crypto/seed/libcrypto-shlib-seed_cbc.d \
-     crypto/aes/libcrypto-shlib-aes_misc.d \
-     crypto/bio/libcrypto-lib-bio_dump.d \
-     crypto/encode_decode/libcrypto-lib-decoder_err.d \
-     crypto/x509/libcrypto-lib-x509spki.d \
-     crypto/bio/libcrypto-lib-bio_addr.d crypto/dsa/libcrypto-lib-dsa_prn.d \
-     ssl/quic/libssl-shlib-quic_record_tx.d \
-     crypto/asn1/libcrypto-shlib-ameth_lib.d \
-     crypto/bio/libcrypto-lib-bss_bio.d crypto/x509/libcrypto-shlib-v3_prn.d \
-     crypto/seed/libcrypto-shlib-seed_cfb.d \
-     crypto/pkcs12/libcrypto-shlib-p12_kiss.d \
-     crypto/dsa/libcrypto-lib-dsa_lib.d crypto/bn/libcrypto-lib-bn_print.d \
-     crypto/evp/libcrypto-lib-p_seal.d crypto/evp/libcrypto-shlib-e_des.d \
-     crypto/ct/libcrypto-lib-ct_prn.d crypto/asn1/libcrypto-lib-t_pkey.d \
-     crypto/des/libcrypto-lib-ofb64ede.d crypto/evp/libcrypto-shlib-e_null.d \
-     crypto/bn/libcrypto-shlib-bn_rand.d \
-     ssl/quic/libssl-lib-quic_record_tx.d ssl/libssl-shlib-ssl_lib.d \
-     crypto/x509/libcrypto-shlib-x509_d2.d crypto/ffc/libcrypto-lib-ffc_dh.d \
-     ssl/quic/libssl-shlib-quic_impl.d \
-     crypto/x509/libcrypto-shlib-v3_attrdesc.d ssl/quic/libssl-lib-qlog.d \
-     crypto/pkcs12/libcrypto-shlib-p12_p8e.d \
-     crypto/cmp/libcrypto-shlib-cmp_asn.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_tdes_hw.d \
-     crypto/poly1305/libcrypto-lib-poly1305.d \
-     crypto/ml_dsa/libcrypto-shlib-ml_dsa_sample.d \
-     crypto/rsa/libcrypto-lib-rsa_pk1.d \
-     providers/implementations/exchange/libdefault-lib-ecx_exch.d \
-     crypto/des/libcrypto-shlib-ecb3_enc.d \
-     crypto/pkcs7/libcrypto-lib-pk7_lib.d \
-     crypto/bn/libcrypto-shlib-bn_recp.d \
-     crypto/ec/curve448/arch_64/libcrypto-lib-f_impl64.d \
-     crypto/cms/libcrypto-lib-cms_smime.d \
-     providers/implementations/encode_decode/libdefault-lib-decode_epki2pki.d \
-     crypto/evp/libcrypto-shlib-e_cast.d \
-     crypto/asn1/libcrypto-shlib-d2i_pu.d ssl/quic/libssl-lib-quic_sstream.d \
-     crypto/crmf/libcrypto-lib-crmf_lib.d \
-     crypto/ffc/libcrypto-shlib-ffc_backend.d \
-     ssl/rio/libssl-shlib-poll_immediate.d \
-     crypto/libcrypto-shlib-params_from_text.d ssl/libssl-shlib-tls_depr.d \
-     crypto/libcrypto-lib-sparse_array.d \
-     crypto/rsa/libcrypto-lib-rsa_sp800_56b_check.d \
-     crypto/cmp/libcrypto-shlib-cmp_client.d \
-     ssl/quic/libssl-shlib-quic_record_util.d \
-     crypto/x509/libcrypto-lib-pcy_data.d \
-     crypto/x509/libcrypto-lib-v3_cpols.d crypto/legacy-dso-cpuid.d \
-     crypto/evp/libcrypto-shlib-legacy_sha.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_rc4.d \
-     crypto/camellia/libcrypto-shlib-cmll_ofb.d \
-     crypto/bf/liblegacy-lib-bf_ofb64.d crypto/idea/libcrypto-lib-i_skey.d \
-     crypto/evp/libcrypto-shlib-ctrl_params_translate.d \
-     crypto/cmp/libcrypto-shlib-cmp_ctx.d \
-     crypto/dh/libcrypto-shlib-dh_asn1.d \
-     providers/common/der/libcommon-lib-der_digests_gen.d \
-     ssl/quic/libssl-lib-quic_record_shared.d \
-     crypto/bn/libcrypto-shlib-bn_gcd.d crypto/x509/libcrypto-lib-x_name.d \
-     crypto/rsa/libcrypto-lib-rsa_ameth.d crypto/cmp/libcrypto-lib-cmp_vfy.d \
-     crypto/libcrypto-lib-comp_methods.d crypto/ct/libcrypto-shlib-ct_err.d \
-     crypto/modes/libcrypto-shlib-xts128.d \
-     crypto/bio/libcrypto-shlib-bf_buff.d crypto/evp/libcrypto-lib-bio_b64.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_xts_fips.d \
-     crypto/evp/libcrypto-lib-dsa_ctrl.d crypto/rc2/libcrypto-lib-rc2_cbc.d \
-     crypto/ec/libcrypto-shlib-ec_mult.d \
-     crypto/ml_dsa/libcrypto-lib-ml_dsa_key.d \
-     ssl/statem/libssl-lib-extensions_clnt.d \
-     crypto/asn1/libcrypto-shlib-tasn_prn.d \
-     crypto/cms/libcrypto-lib-cms_io.d crypto/modes/libcrypto-shlib-siv128.d \
-     crypto/libcrypto-lib-init.d crypto/x509/libcrypto-lib-x509_acert.d \
-     ssl/statem/libssl-lib-extensions.d \
-     crypto/rc2/libcrypto-shlib-rc2ofb64.d \
-     crypto/pem/libcrypto-shlib-pem_pk8.d crypto/libcrypto-lib-params_dup.d \
-     crypto/cms/libcrypto-lib-cms_dd.d crypto/libssl-shlib-quic_vlint.d \
-     crypto/x509/libcrypto-lib-x509aset.d crypto/cmp/libcrypto-lib-cmp_msg.d \
-     providers/implementations/macs/libdefault-lib-gmac_prov.d \
-     crypto/x509/libcrypto-shlib-v3_purp.d crypto/bn/libcrypto-lib-bn_kron.d \
-     crypto/des/libcrypto-shlib-qud_cksm.d apps/openssl-bin-genpkey.d \
-     crypto/libcrypto-shlib-params.d ssl/quic/libssl-shlib-quic_types.d \
-     crypto/x509/libcrypto-lib-v3err.d \
-     crypto/asn1/libcrypto-shlib-f_string.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_seed.d \
-     crypto/ct/libcrypto-lib-ct_x509v3.d \
-     crypto/x509/libcrypto-shlib-x509_lu.d \
-     crypto/ui/libcrypto-shlib-ui_openssl.d \
-     crypto/bio/libcrypto-shlib-bss_dgram.d \
-     crypto/asn1/libcrypto-shlib-a_digest.d crypto/libcrypto-lib-punycode.d \
-     ssl/quic/libssl-lib-quic_stream_map.d \
-     crypto/x509/libcrypto-lib-x509_trust.d \
-     crypto/libcrypto-shlib-core_namemap.d crypto/libcrypto-shlib-ctype.d \
-     crypto/evp/libcrypto-shlib-m_null.d \
-     ssl/record/methods/libssl-lib-ssl3_meth.d \
-     crypto/ts/libcrypto-lib-ts_rsp_print.d \
-     crypto/ripemd/libcrypto-lib-rmd_dgst.d apps/openssl-bin-spkac.d \
-     crypto/dsa/libcrypto-shlib-dsa_err.d crypto/ts/libcrypto-lib-ts_lib.d \
-     crypto/dh/libcrypto-lib-dh_rfc5114.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_des.d \
-     crypto/x509/libcrypto-shlib-x509rset.d ssl/quic/libssl-lib-quic_demux.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_rc4_hmac_md5.d \
-     crypto/cms/libcrypto-shlib-cms_env.d \
-     providers/implementations/digests/libdefault-lib-md5_sha1_prov.d \
-     ssl/statem/libssl-lib-extensions_cust.d \
-     crypto/x509/libcrypto-shlib-v3_akeya.d \
-     crypto/pkcs12/libcrypto-shlib-p12_crt.d apps/openssl-bin-list.d \
-     crypto/evp/libcrypto-shlib-p_open.d \
-     crypto/dsa/libcrypto-shlib-dsa_key.d \
-     crypto/asn1/libcrypto-lib-asn1_err.d crypto/des/liblegacy-lib-set_key.d \
-     crypto/ffc/libcrypto-shlib-ffc_params_generate.d \
-     crypto/store/libcrypto-lib-store_meth.d \
-     crypto/dh/libcrypto-lib-dh_meth.d \
-     providers/implementations/digests/libdefault-lib-blake2b_prov.d \
-     ssl/record/methods/libssl-lib-tls_common.d \
-     crypto/bio/libcrypto-lib-bio_meth.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_rc4_hmac_md5_hw.d \
-     crypto/x509/libcrypto-lib-v3_skid.d \
-     crypto/conf/libcrypto-lib-conf_ssl.d crypto/bn/libcrypto-shlib-bn_add.d \
-     crypto/libssl-shlib-time.d apps/openssl-bin-kdf.d \
-     providers/implementations/encode_decode/libdefault-lib-ml_kem_codecs.d \
-     crypto/ffc/libcrypto-lib-ffc_params.d \
-     crypto/x509/libcrypto-shlib-x509_txt.d \
-     providers/common/libcommon-lib-provider_ctx.d \
-     crypto/async/libcrypto-lib-async_wait.d \
-     crypto/x509/libcrypto-lib-x509_obj.d \
-     ssl/statem/libssl-shlib-extensions_srvr.d \
-     crypto/ct/libcrypto-lib-ct_err.d \
-     providers/implementations/signature/libdefault-lib-ecdsa_sig.d \
-     crypto/siphash/libcrypto-lib-siphash.d \
-     crypto/rsa/libcrypto-shlib-rsa_schemes.d \
-     providers/implementations/keymgmt/libtemplate-lib-template_kmgmt.d \
-     providers/common/der/libcommon-lib-der_ec_key.d \
-     crypto/asn1/libcrypto-shlib-tasn_fre.d \
-     crypto/http/libcrypto-shlib-http_err.d \
-     crypto/ocsp/libcrypto-lib-ocsp_ext.d ssl/libssl-shlib-ssl_ciph.d \
-     apps/openssl-bin-mac.d crypto/asn1/libcrypto-lib-asn_mime.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_camellia.d \
-     providers/implementations/keymgmt/libdefault-lib-slh_dsa_kmgmt.d \
-     crypto/x509/libcrypto-lib-x_attrib.d \
-     crypto/slh_dsa/libcrypto-shlib-slh_dsa_key.d \
-     crypto/comp/libcrypto-shlib-c_brotli.d \
-     crypto/bf/libcrypto-shlib-bf_enc.d crypto/rsa/libcrypto-lib-rsa_asn1.d \
-     crypto/x509/libcrypto-shlib-x509name.d \
-     crypto/rsa/libcrypto-lib-rsa_none.d \
-     crypto/modes/libcrypto-shlib-gcm128.d \
-     crypto/asn1/libcrypto-lib-a_object.d \
-     crypto/rc2/liblegacy-lib-rc2ofb64.d crypto/pem/libcrypto-lib-pem_x509.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_cast5.d \
-     providers/implementations/signature/libdefault-lib-slh_dsa_sig.d \
-     crypto/slh_dsa/libcrypto-lib-slh_adrs.d \
-     crypto/libcrypto-shlib-o_fopen.d crypto/ct/libcrypto-lib-ct_sct_ctx.d \
-     ssl/libssl-lib-ssl_stat.d crypto/evp/libcrypto-shlib-e_camellia.d \
-     apps/openssl-bin-dsaparam.d \
-     crypto/thread/arch/libcrypto-shlib-thread_win.d \
-     crypto/err/libcrypto-shlib-err_all.d crypto/cms/libcrypto-lib-cms_lib.d \
-     crypto/evp/libcrypto-shlib-p_verify.d \
+DEPS=apps/openssl-bin-mac.d \
      providers/implementations/rands/libdefault-lib-seed_src.d \
-     providers/common/der/libcommon-lib-der_dsa_key.d \
-     crypto/ess/libcrypto-shlib-ess_err.d ssl/libssl-shlib-pqueue.d \
-     crypto/ec/curve448/arch_64/libcrypto-shlib-f_impl64.d \
-     crypto/ec/libcrypto-shlib-ec_curve.d \
-     crypto/aes/libcrypto-lib-aes_wrap.d crypto/cast/libcrypto-lib-c_skey.d \
-     providers/implementations/kdfs/libdefault-lib-hkdf.d \
-     providers/common/der/libdefault-lib-der_sm2_sig.d \
-     crypto/evp/libcrypto-lib-e_xcbc_d.d \
-     crypto/x509/libcrypto-shlib-v3_san.d \
-     crypto/evp/libcrypto-shlib-m_sigver.d crypto/x509/libcrypto-lib-x_req.d \
-     crypto/asn1/libcrypto-shlib-p5_scrypt.d ssl/quic/libssl-lib-quic_fc.d \
-     crypto/libcrypto-lib-der_writer.d crypto/libcrypto-shlib-info.d \
-     crypto/x509/libcrypto-shlib-v3_bitst.d \
-     crypto/x509/libcrypto-lib-v3_aaa.d crypto/des/liblegacy-lib-cbc_cksm.d \
-     crypto/md4/liblegacy-lib-md4_dgst.d crypto/libcrypto-lib-cpt_err.d \
-     crypto/ec/curve448/libcrypto-shlib-scalar.d \
-     crypto/evp/libcrypto-shlib-e_xcbc_d.d \
-     crypto/dsa/libcrypto-lib-dsa_err.d crypto/libcrypto-lib-quic_vlint.d \
-     crypto/libcrypto-shlib-sparse_array.d \
-     crypto/cmp/libcrypto-shlib-cmp_hdr.d crypto/evp/libcrypto-lib-evp_err.d \
-     crypto/libcrypto-lib-info.d apps/lib/libapps-lib-columns.d \
-     crypto/x509/libcrypto-shlib-v3_soa_id.d \
-     crypto/modes/libcrypto-lib-wrap128.d \
-     crypto/des/liblegacy-lib-cfb64enc.d \
-     crypto/asn1/libcrypto-lib-tasn_utl.d \
-     crypto/ts/libcrypto-shlib-ts_rsp_utils.d \
-     crypto/pkcs12/libcrypto-lib-p12_asn.d \
-     crypto/dsa/libcrypto-shlib-dsa_ossl.d \
-     providers/implementations/kdfs/libdefault-lib-pbkdf2.d \
-     crypto/encode_decode/libcrypto-shlib-encoder_pkey.d \
-     crypto/libcrypto-lib-provider_child.d \
-     crypto/x509/libcrypto-lib-v3_lib.d \
-     crypto/async/arch/libcrypto-shlib-async_null.d \
-     crypto/bn/libcrypto-lib-bn_rand.d ssl/statem/libssl-lib-statem_srvr.d \
-     crypto/libcrypto-lib-bsearch.d crypto/ui/libcrypto-shlib-ui_null.d \
-     providers/implementations/rands/libdefault-lib-drbg_hmac.d \
-     crypto/evp/libcrypto-shlib-evp_enc.d \
-     crypto/crmf/libcrypto-shlib-crmf_pbm.d \
-     crypto/rand/libcrypto-shlib-prov_seed.d \
-     providers/implementations/skeymgmt/libdefault-lib-aes_skmgmt.d \
-     ssl/libssl-shlib-ssl_err_legacy.d \
-     crypto/ec/libcrypto-lib-ec_deprecated.d \
-     crypto/x509/libcrypto-shlib-v3_battcons.d crypto/libcrypto-lib-uid.d \
-     crypto/ts/libcrypto-shlib-ts_req_utils.d \
-     crypto/bf/liblegacy-lib-bf_ecb.d crypto/rsa/libcrypto-lib-rsa_x931.d \
-     crypto/ec/libcrypto-shlib-ec_lib.d \
-     crypto/evp/libcrypto-lib-e_camellia.d \
-     crypto/asn1/libcrypto-shlib-bio_ndef.d ssl/libssl-shlib-ssl_sess.d \
-     crypto/evp/libcrypto-shlib-p_sign.d \
-     crypto/x509/libcrypto-shlib-x_x509.d apps/openssl-bin-pkcs7.d \
-     crypto/md4/libcrypto-shlib-md4_dgst.d crypto/x509/libcrypto-lib-t_crl.d \
-     providers/common/libdefault-lib-digest_to_nid.d \
-     crypto/crmf/libcrypto-lib-crmf_asn.d \
-     crypto/dso/libcrypto-shlib-dso_win32.d \
-     providers/implementations/rands/libdefault-lib-test_rng.d \
-     crypto/buffer/libcrypto-shlib-buf_err.d \
-     crypto/des/libcrypto-lib-cbc_cksm.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_chacha20.d \
-     crypto/encode_decode/libcrypto-lib-encoder_meth.d \
-     providers/implementations/digests/libdefault-lib-ripemd_prov.d \
-     crypto/pem/libcrypto-lib-pem_xaux.d crypto/libcrypto-lib-o_fopen.d \
-     crypto/x509/libcrypto-shlib-v3_bcons.d \
-     providers/implementations/digests/liblegacy-lib-wp_prov.d \
-     crypto/libcrypto-shlib-self_test_core.d crypto/libcrypto-shlib-o_time.d \
-     crypto/rsa/libcrypto-lib-rsa_ossl.d crypto/bn/libcrypto-lib-bn_ctx.d \
-     providers/common/libdefault-lib-securitycheck.d \
-     crypto/sm2/libcrypto-lib-sm2_crypt.d \
-     crypto/ocsp/libcrypto-shlib-ocsp_srv.d crypto/libssl-shlib-getenv.d \
-     crypto/sha/libcrypto-shlib-sha1dgst.d crypto/cms/libcrypto-lib-cms_cd.d \
-     crypto/x509/libcrypto-lib-v3_ia5.d crypto/des/libcrypto-shlib-cfb_enc.d \
-     crypto/cast/libcrypto-lib-c_ofb64.d crypto/evp/libcrypto-shlib-e_idea.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_null.d \
-     crypto/modes/libcrypto-lib-cfb128.d \
-     crypto/mdc2/liblegacy-lib-mdc2dgst.d \
-     crypto/ts/libcrypto-lib-ts_rsp_utils.d \
-     crypto/asn1/libcrypto-lib-a_utf8.d crypto/seed/libcrypto-lib-seed_cbc.d \
-     crypto/asn1/libcrypto-lib-a_utctm.d \
-     crypto/ts/libcrypto-lib-ts_req_print.d \
-     crypto/objects/libcrypto-shlib-obj_xref.d \
-     crypto/x509/libcrypto-shlib-x509_err.d \
-     crypto/seed/libcrypto-shlib-seed_ofb.d \
-     crypto/whrlpool/libcrypto-lib-wp_dgst.d \
-     crypto/hmac/libcrypto-lib-hmac.d \
-     providers/common/der/libcommon-lib-der_rsa_gen.d \
-     crypto/x509/libcrypto-lib-v3_iobo.d crypto/evp/libcrypto-shlib-p_seal.d \
-     ssl/quic/libssl-lib-quic_tls_api.d \
-     crypto/rsa/libcrypto-lib-rsa_backend.d \
-     crypto/evp/libcrypto-shlib-dh_ctrl.d \
-     crypto/cms/libcrypto-shlib-cms_kari.d \
-     crypto/ec/libcrypto-shlib-ecx_key.d \
-     providers/implementations/ciphers/libcommon-lib-ciphercommon_gcm_hw.d \
-     apps/openssl-bin-ecparam.d crypto/rsa/libcrypto-lib-rsa_sp800_56b_gen.d \
-     crypto/crmf/libcrypto-lib-crmf_pbm.d \
-     crypto/bio/libcrypto-lib-bio_sock2.d \
-     crypto/rand/libcrypto-lib-rand_lib.d ssl/quic/libssl-lib-quic_method.d \
-     crypto/slh_dsa/libcrypto-lib-slh_hash.d \
-     ssl/rio/libssl-lib-poll_builder.d crypto/evp/libcrypto-lib-evp_pbe.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_tdes_default.d \
-     crypto/evp/libcrypto-shlib-encode.d crypto/cmp/libcrypto-lib-cmp_asn.d \
-     crypto/ct/libcrypto-lib-ct_oct.d \
-     crypto/async/arch/libcrypto-shlib-async_posix.d \
-     crypto/bn/libcrypto-shlib-bn_mul.d crypto/ts/libcrypto-lib-ts_conf.d \
-     crypto/ts/libcrypto-shlib-ts_req_print.d \
-     crypto/asn1/libcrypto-lib-x_val.d \
-     crypto/x509/libcrypto-shlib-x509_acert.d \
-     crypto/ec/libcrypto-lib-eck_prn.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_des_hw.d \
-     crypto/des/liblegacy-lib-cfb_enc.d apps/lib/libapps-lib-fmt.d \
-     crypto/dso/libcrypto-shlib-dso_vms.d crypto/evp/libcrypto-lib-p_open.d \
-     crypto/encode_decode/libcrypto-lib-encoder_err.d \
-     crypto/ec/libcrypto-lib-curve25519.d crypto/cms/libcrypto-lib-cms_rsa.d \
-     crypto/dsa/libcrypto-shlib-dsa_check.d \
-     crypto/cmp/libcrypto-shlib-cmp_genm.d crypto/libcrypto-shlib-provider.d \
-     ssl/statem/libssl-shlib-extensions_clnt.d \
-     crypto/des/libcrypto-lib-cfb64enc.d \
-     crypto/asn1/libcrypto-shlib-asn1_item_list.d \
-     crypto/evp/libcrypto-lib-mac_lib.d crypto/evp/libcrypto-shlib-e_rc4.d \
-     crypto/asn1/libcrypto-lib-a_int.d crypto/pkcs12/libcrypto-lib-p12_p8e.d \
-     crypto/poly1305/libcrypto-shlib-poly1305.d \
-     crypto/slh_dsa/libcrypto-lib-slh_params.d \
-     crypto/libcrypto-lib-core_namemap.d \
-     crypto/asn1/libcrypto-shlib-asn_pack.d \
-     crypto/evp/libcrypto-shlib-e_rc4_hmac_md5.d \
-     crypto/x509/libcrypto-lib-v3_ist.d crypto/cms/libcrypto-shlib-cms_sd.d \
-     crypto/libcrypto-shlib-ebcdic.d ssl/quic/libssl-shlib-quic_reactor.d \
-     apps/openssl-bin-ca.d apps/openssl-bin-sess_id.d \
-     crypto/ocsp/libcrypto-shlib-ocsp_asn.d \
-     crypto/asn1/libcrypto-shlib-t_pkey.d \
-     crypto/pkcs12/libcrypto-shlib-p12_utl.d \
-     crypto/x509/libcrypto-lib-v3_bcons.d \
-     crypto/cast/libcrypto-shlib-c_ecb.d crypto/idea/libcrypto-lib-i_cfb64.d \
-     crypto/bio/libcrypto-shlib-bio_meth.d apps/openssl-bin-pkeyutl.d \
-     crypto/asn1/libcrypto-lib-t_bitst.d crypto/ec/libcrypto-lib-ecp_nist.d \
-     crypto/bio/libcrypto-lib-bio_print.d \
-     providers/implementations/asymciphers/libdefault-lib-rsa_enc.d \
-     crypto/asn1/libcrypto-shlib-a_sign.d \
-     providers/implementations/encode_decode/libdefault-lib-decode_der2key.d \
-     crypto/libcrypto-lib-deterministic_nonce.d \
-     crypto/x509/libcrypto-shlib-x509spki.d \
-     crypto/evp/libcrypto-lib-keymgmt_meth.d \
-     crypto/asn1/libcrypto-lib-f_string.d \
-     crypto/modes/libcrypto-shlib-ofb128.d apps/openssl-bin-rand.d \
-     crypto/ec/curve448/libcrypto-shlib-curve448_tables.d \
-     crypto/ec/libcrypto-shlib-eck_prn.d \
-     crypto/x509/libcrypto-shlib-x509_def.d \
-     crypto/cmp/libcrypto-shlib-cmp_http.d \
-     crypto/x509/libcrypto-shlib-v3_usernotice.d \
-     crypto/comp/libcrypto-shlib-comp_err.d \
-     crypto/x509/libcrypto-lib-v3_akeya.d \
-     crypto/ec/libcrypto-shlib-ecdsa_sign.d \
-     crypto/libcrypto-lib-threads_lib.d \
-     providers/implementations/macs/libdefault-lib-blake2b_mac.d \
-     crypto/x509/libcrypto-lib-x509_lu.d \
-     crypto/pkcs12/libcrypto-shlib-p12_sbag.d \
-     crypto/ocsp/libcrypto-lib-ocsp_err.d \
-     crypto/objects/libcrypto-lib-o_names.d \
-     crypto/ec/libcrypto-shlib-ec_cvt.d crypto/err/libcrypto-lib-err_prn.d \
-     crypto/asn1/libcrypto-lib-p5_scrypt.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aria_ccm_hw.d \
-     crypto/async/libcrypto-lib-async_err.d \
-     crypto/pkcs7/libcrypto-shlib-pk7_doit.d \
-     crypto/dsa/libcrypto-lib-dsa_sign.d crypto/evp/libcrypto-lib-exchange.d \
-     crypto/camellia/libcrypto-shlib-cmll_cfb.d \
-     crypto/http/libcrypto-lib-http_err.d apps/lib/libapps-lib-s_cb.d \
-     crypto/bn/libcrypto-shlib-bn_div.d crypto/des/libcrypto-lib-ofb_enc.d \
-     ssl/quic/libssl-lib-json_enc.d crypto/rc2/libcrypto-shlib-rc2_skey.d \
-     crypto/libcrypto-shlib-threads_none.d \
-     providers/implementations/rands/seeding/libdefault-lib-rand_tsc.d \
-     crypto/ec/libcrypto-lib-ec_asn1.d crypto/bio/libcrypto-shlib-bss_conn.d \
-     crypto/ml_kem/libcrypto-shlib-ml_kem.d \
-     crypto/bn/libcrypto-shlib-bn_exp2.d \
-     crypto/ec/libcrypto-lib-ecdsa_sign.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_siv.d \
-     providers/implementations/digests/libdefault-lib-blake2_prov.d \
-     crypto/evp/libcrypto-shlib-p_legacy.d \
-     crypto/thread/libcrypto-shlib-arch.d crypto/cast/liblegacy-lib-c_enc.d \
-     crypto/rand/libcrypto-lib-rand_deprecated.d \
-     crypto/modes/libcrypto-shlib-xts128gb.d \
-     crypto/cms/libcrypto-shlib-cms_asn1.d \
-     crypto/libcrypto-lib-self_test_core.d \
-     providers/implementations/encode_decode/libdefault-lib-ml_common_codecs.d \
-     crypto/asn1/libcrypto-shlib-x_sig.d \
-     crypto/ec/libcrypto-shlib-ecx_backend.d \
-     crypto/bio/libcrypto-shlib-bf_lbuf.d \
-     crypto/rand/libcrypto-lib-rand_err.d crypto/ec/libcrypto-lib-ec2_smpl.d \
-     crypto/evp/libcrypto-lib-legacy_mdc2.d \
-     crypto/asn1/libcrypto-shlib-tasn_typ.d crypto/libcrypto-shlib-sleep.d \
-     crypto/bio/libcrypto-lib-bf_readbuff.d \
-     crypto/evp/libcrypto-lib-e_null.d \
-     providers/implementations/digests/liblegacy-lib-ripemd_prov.d \
-     crypto/libcrypto-shlib-der_writer.d crypto/bn/libcrypto-lib-bn_word.d \
-     crypto/cmp/libcrypto-shlib-cmp_util.d \
-     crypto/ocsp/libcrypto-shlib-ocsp_err.d \
-     crypto/md5/libcrypto-lib-md5_sha1.d \
-     providers/implementations/macs/libdefault-lib-kmac_prov.d \
-     providers/implementations/storemgmt/libdefault-lib-file_store.d \
-     crypto/evp/libcrypto-shlib-evp_cnf.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_cbc_hmac_sha256_hw.d \
-     ssl/record/methods/libssl-shlib-ssl3_meth.d \
-     crypto/x509/libcrypto-shlib-v3_ind_iss.d ssl/libssl-lib-t1_lib.d \
-     crypto/pkcs12/libcrypto-lib-p12_attr.d \
-     crypto/asn1/libcrypto-lib-p5_pbe.d crypto/des/libcrypto-lib-des_enc.d \
-     crypto/evp/libcrypto-shlib-dh_support.d \
-     crypto/evp/libcrypto-shlib-ec_ctrl.d \
-     crypto/ec/libcrypto-shlib-ec_deprecated.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_tdes_wrap_hw.d \
-     crypto/ffc/libcrypto-lib-ffc_key_validate.d \
-     crypto/des/libcrypto-lib-fcrypt_b.d \
-     crypto/asn1/libcrypto-shlib-t_bitst.d \
-     crypto/ml_dsa/libcrypto-lib-ml_dsa_ntt.d \
-     crypto/x509/libcrypto-shlib-x509_vpm.d \
-     crypto/mdc2/libcrypto-lib-mdc2_one.d ssl/libssl-lib-t1_enc.d \
-     crypto/bn/libcrypto-lib-bn_gf2m.d \
-     providers/implementations/encode_decode/libdefault-lib-decode_msblob2key.d \
-     crypto/dh/libcrypto-shlib-dh_ameth.d \
-     crypto/bio/libcrypto-shlib-bss_bio.d \
-     providers/implementations/kdfs/liblegacy-lib-pvkkdf.d \
-     crypto/ripemd/libcrypto-shlib-rmd_dgst.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_camellia_hw.d \
-     apps/openssl-bin-speed.d crypto/x509/libcrypto-shlib-pcy_tree.d \
-     crypto/thread/arch/libcrypto-lib-thread_win.d \
-     crypto/rc2/libcrypto-shlib-rc2_cbc.d \
-     crypto/sm3/libcrypto-lib-legacy_sm3.d \
-     providers/common/libdefault-lib-provider_seeding.d \
-     crypto/libcrypto-shlib-comp_methods.d \
-     providers/implementations/ciphers/libcommon-lib-ciphercommon_block.d \
-     crypto/asn1/libcrypto-shlib-p8_pkey.d \
+     crypto/ec/curve448/arch_64/libcrypto-lib-f_impl64.d \
+     crypto/libcrypto-lib-packet.d crypto/x509/libcrypto-lib-pcy_node.d \
+     crypto/libcrypto-lib-params_dup.d ssl/libssl-lib-ssl_cert_comp.d \
+     crypto/evp/libcrypto-shlib-legacy_blake2.d \
+     crypto/dh/libcrypto-shlib-dh_meth.d crypto/cmac/libcrypto-lib-cmac.d \
+     crypto/dh/libcrypto-lib-dh_prn.d crypto/ec/libcrypto-shlib-ecdsa_ossl.d \
      crypto/ec/libcrypto-shlib-ecp_nistz256.d \
-     crypto/dso/libcrypto-lib-dso_dl.d \
-     providers/common/libdefault-lib-bio_prov.d \
-     crypto/x509/libcrypto-shlib-x_x509a.d \
-     crypto/evp/libcrypto-shlib-mac_lib.d crypto/ec/libcrypto-lib-ec_mult.d \
-     ssl/quic/libssl-lib-quic_engine.d \
-     crypto/property/libcrypto-lib-property_query.d \
-     crypto/slh_dsa/libcrypto-lib-slh_dsa.d ssl/libssl-lib-ssl_init.d \
-     crypto/x509/libcrypto-shlib-x509_trust.d \
-     crypto/rsa/libcrypto-lib-rsa_gen.d crypto/asn1/libcrypto-shlib-x_spki.d \
-     crypto/asn1/libcrypto-lib-x_bignum.d \
-     crypto/x509/libcrypto-shlib-x_all.d \
-     providers/common/libdefault-lib-capabilities.d ssl/libssl-lib-s3_msg.d \
-     crypto/evp/libcrypto-lib-ec_ctrl.d crypto/libcrypto-lib-o_dir.d \
-     crypto/x509/libcrypto-shlib-v3_tlsf.d crypto/libcrypto-shlib-punycode.d \
-     crypto/evp/libcrypto-lib-legacy_md4.d crypto/ec/libcrypto-lib-ec_cvt.d \
-     crypto/dh/libcrypto-lib-dh_gen.d crypto/evp/libcrypto-lib-names.d \
-     crypto/aes/libcrypto-shlib-aes_wrap.d ssl/libssl-lib-ssl_rsa.d \
-     crypto/libcrypto-lib-initthread.d crypto/x509/libcrypto-lib-x509_def.d \
-     crypto/libcrypto-shlib-threads_lib.d ssl/libssl-lib-ssl_cert_comp.d \
-     crypto/dh/libcrypto-shlib-dh_key.d \
-     crypto/evp/libcrypto-lib-skeymgmt_meth.d \
-     crypto/des/libcrypto-shlib-pcbc_enc.d \
-     crypto/bn/libcrypto-shlib-bn_exp.d \
-     crypto/objects/libcrypto-shlib-obj_err.d \
-     crypto/asn1/libcrypto-shlib-asn_mime.d \
-     crypto/evp/libcrypto-shlib-exchange.d \
-     crypto/x509/libcrypto-shlib-v3_skid.d ssl/libssl-shlib-t1_lib.d \
-     crypto/pkcs12/libcrypto-lib-p12_init.d \
-     crypto/ml_dsa/libcrypto-shlib-ml_dsa_ntt.d \
-     crypto/ts/libcrypto-lib-ts_verify_ctx.d \
-     crypto/evp/libcrypto-shlib-pmeth_check.d \
-     providers/implementations/rands/seeding/libdefault-lib-rand_cpu_x86.d \
-     apps/openssl-bin-passwd.d crypto/bio/libcrypto-shlib-bio_sock2.d \
-     crypto/asn1/libcrypto-shlib-bio_asn1.d \
-     crypto/idea/libcrypto-lib-i_ecb.d \
-     crypto/evp/libcrypto-shlib-legacy_md5.d \
-     crypto/ec/libcrypto-lib-ec_check.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_xts_hw.d \
-     crypto/rc2/libcrypto-lib-rc2ofb64.d crypto/x509/libcrypto-lib-x_exten.d \
-     crypto/bio/libcrypto-shlib-bio_err.d \
-     crypto/asn1/libcrypto-shlib-a_print.d \
-     crypto/x509/libcrypto-shlib-v3_attrmap.d \
-     crypto/libcrypto-lib-threads_pthread.d crypto/libcrypto-lib-cpuid.d \
-     crypto/asn1/libcrypto-shlib-a_strex.d \
-     crypto/bio/libcrypto-lib-bf_null.d crypto/idea/libcrypto-shlib-i_ecb.d \
-     crypto/bn/libcrypto-lib-bn_err.d crypto/evp/libcrypto-shlib-names.d \
-     crypto/evp/libcrypto-lib-evp_rand.d ssl/libssl-lib-ssl_conf.d \
-     crypto/dh/libcrypto-shlib-dh_prn.d \
-     crypto/x509/libcrypto-shlib-x509aset.d \
-     crypto/ocsp/libcrypto-shlib-ocsp_ext.d \
-     providers/implementations/digests/libdefault-lib-blake2s_prov.d \
-     providers/libcrypto-lib-nullprov.d crypto/ct/libcrypto-shlib-ct_vfy.d \
-     crypto/pem/libcrypto-lib-pem_pk8.d crypto/err/libcrypto-shlib-err.d \
-     crypto/async/arch/libcrypto-lib-async_win.d \
-     ssl/record/methods/libssl-shlib-tls13_meth.d \
-     crypto/bn/libcrypto-shlib-bn_mont.d \
-     crypto/pkcs12/libcrypto-shlib-p12_add.d \
-     crypto/rc2/libcrypto-shlib-rc2_ecb.d \
-     crypto/mdc2/libcrypto-shlib-mdc2dgst.d \
-     crypto/ocsp/libcrypto-lib-v3_ocsp.d \
-     providers/implementations/keymgmt/libdefault-lib-kdf_legacy_kmgmt.d \
-     ssl/record/libssl-shlib-rec_layer_s3.d \
-     crypto/asn1/libcrypto-lib-x_sig.d \
-     crypto/asn1/libcrypto-lib-asn1_item_list.d \
-     crypto/rand/libcrypto-shlib-rand_deprecated.d \
-     ssl/record/methods/libssl-shlib-tls_multib.d \
-     crypto/x509/libcrypto-shlib-x509_vfy.d \
-     crypto/bio/libcrypto-lib-bio_sock.d \
-     providers/common/libdefault-lib-provider_util.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_tdes_common.d \
-     crypto/asn1/libcrypto-lib-a_sign.d \
-     crypto/modes/libcrypto-shlib-ctr128.d apps/lib/libapps-lib-app_params.d \
-     crypto/evp/libcrypto-shlib-e_des3.d \
-     crypto/bio/libcrypto-lib-bf_prefix.d \
-     crypto/asn1/libcrypto-lib-bio_asn1.d crypto/libcrypto-shlib-cversion.d \
-     crypto/evp/libcrypto-shlib-skeymgmt_meth.d \
-     crypto/pem/libcrypto-shlib-pem_err.d \
-     crypto/libcrypto-lib-param_build_set.d \
-     crypto/slh_dsa/libcrypto-shlib-slh_hypertree.d \
-     crypto/rc2/liblegacy-lib-rc2_skey.d crypto/evp/libcrypto-lib-bio_md.d \
-     crypto/bn/libcrypto-shlib-bn_prime.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_wrp.d \
-     crypto/ml_dsa/libcrypto-shlib-ml_dsa_sign.d \
-     crypto/bn/libcrypto-lib-bn_conv.d crypto/mdc2/libcrypto-lib-mdc2dgst.d \
-     crypto/ffc/libcrypto-lib-ffc_backend.d \
-     crypto/md5/libcrypto-shlib-md5_sha1.d \
-     crypto/asn1/libcrypto-shlib-x_bignum.d \
-     crypto/bio/libcrypto-lib-bss_mem.d crypto/bf/libcrypto-lib-bf_enc.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_gcm_siv_polyval.d \
-     crypto/pem/libcrypto-shlib-pem_all.d \
-     ssl/record/libssl-lib-rec_layer_d1.d \
-     crypto/seed/liblegacy-lib-seed_ecb.d \
-     crypto/des/liblegacy-lib-cfb64ede.d \
-     crypto/x509/libcrypto-shlib-x509_ext.d ssl/quic/libssl-lib-quic_fifd.d \
-     crypto/libcrypto-shlib-mem_sec.d crypto/err/libcrypto-shlib-err_mark.d \
-     crypto/whrlpool/libcrypto-shlib-wp_dgst.d \
-     crypto/bf/libcrypto-shlib-bf_cfb64.d crypto/libcrypto-lib-ebcdic.d \
-     crypto/property/libcrypto-shlib-property.d \
-     providers/common/der/libcommon-lib-der_slh_dsa_key.d \
-     crypto/sha/libcrypto-lib-sha1dgst.d \
-     crypto/dh/libcrypto-shlib-dh_pmeth.d ssl/libssl-shlib-bio_ssl.d \
-     ssl/record/methods/libssl-lib-dtls_meth.d \
-     crypto/bn/libcrypto-lib-bn_mont.d \
-     crypto/rsa/libcrypto-shlib-rsa_pmeth.d \
-     crypto/evp/libcrypto-shlib-pmeth_gn.d \
-     crypto/rsa/libcrypto-lib-rsa_mp_names.d \
-     crypto/property/libcrypto-lib-defn_cache.d \
-     crypto/pkcs7/libcrypto-lib-pk7_mime.d \
-     crypto/dsa/libcrypto-shlib-dsa_meth.d \
-     crypto/x509/libcrypto-lib-v3_admis.d \
-     crypto/evp/libcrypto-shlib-keymgmt_lib.d \
-     crypto/ec/libcrypto-lib-ecp_nistz256.d \
-     crypto/slh_dsa/libcrypto-shlib-slh_params.d \
-     providers/implementations/keymgmt/libdefault-lib-ec_kmgmt.d \
-     crypto/seed/liblegacy-lib-seed_cfb.d crypto/bio/libcrypto-lib-bss_log.d \
-     crypto/evp/libcrypto-lib-m_null.d apps/openssl-bin-asn1parse.d \
-     crypto/err/libcrypto-lib-err_blocks.d crypto/libcrypto-lib-packet.d \
-     crypto/aria/libcrypto-lib-aria.d crypto/bio/libcrypto-shlib-bf_nbio.d \
-     crypto/pem/libcrypto-shlib-pem_info.d \
-     crypto/cmp/libcrypto-shlib-cmp_err.d ssl/quic/libssl-lib-quic_impl.d \
-     crypto/dso/libcrypto-shlib-dso_dl.d \
-     crypto/x509/libcrypto-shlib-x_ietfatt.d \
-     crypto/bn/libcrypto-lib-bn_sqr.d \
-     crypto/thread/libcrypto-shlib-internal.d \
-     crypto/asn1/libcrypto-lib-tasn_fre.d crypto/libcrypto-lib-core_fetch.d \
-     crypto/x509/libcrypto-shlib-v3_utf8.d \
-     crypto/bn/libcrypto-shlib-bn_nist.d crypto/bio/libcrypto-lib-bf_buff.d \
-     crypto/libcrypto-lib-params_idx.d crypto/x509/libcrypto-shlib-by_dir.d \
-     crypto/bio/libcrypto-shlib-bio_sock.d \
-     providers/implementations/keymgmt/libdefault-lib-mlx_kmgmt.d \
-     apps/openssl-bin-ts.d crypto/evp/libcrypto-lib-mac_meth.d \
-     crypto/pem/libcrypto-shlib-pem_xaux.d \
-     crypto/err/libcrypto-shlib-err_blocks.d \
-     crypto/rsa/libcrypto-lib-rsa_crpt.d \
-     crypto/x509/libcrypto-lib-x509cset.d \
-     ssl/quic/libssl-shlib-quic_channel.d \
-     crypto/evp/libcrypto-lib-legacy_md5_sha1.d \
-     crypto/evp/libcrypto-lib-evp_pkey.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_gcm_siv_hw.d \
-     ssl/libssl-shlib-ssl_txt.d crypto/x509/libcrypto-lib-x509_v3.d \
-     apps/openssl-bin-pkcs12.d apps/openssl-bin-verify.d \
-     crypto/evp/libcrypto-lib-e_rc2.d crypto/x509/libcrypto-lib-x509_att.d \
-     crypto/ec/curve448/libcrypto-shlib-curve448.d \
-     providers/implementations/keymgmt/libdefault-lib-ecx_kmgmt.d \
-     ssl/quic/libssl-lib-quic_reactor.d ssl/quic/libssl-lib-quic_statm.d \
-     crypto/rsa/libcrypto-lib-rsa_schemes.d ssl/libssl-shlib-ssl_conf.d \
-     ssl/record/methods/libssl-shlib-tls_common.d \
-     crypto/objects/libcrypto-shlib-o_names.d \
-     crypto/ec/libcrypto-shlib-ecp_nist.d apps/lib/libapps-lib-app_rand.d \
-     crypto/rsa/libcrypto-lib-rsa_pmeth.d crypto/bn/libcrypto-lib-rsaz_exp.d \
-     crypto/modes/libcrypto-lib-ofb128.d crypto/evp/libcrypto-lib-evp_key.d \
-     crypto/bio/libcrypto-lib-bss_file.d \
-     ssl/quic/libssl-lib-quic_record_rx.d apps/lib/libapps-lib-apps_ui.d \
-     crypto/x509/libcrypto-shlib-v3_pcons.d crypto/libssl-shlib-ctype.d \
-     crypto/err/libcrypto-shlib-err_save.d \
-     crypto/modes/libcrypto-lib-gcm128.d crypto/bn/libcrypto-shlib-bn_srp.d \
-     crypto/async/libcrypto-shlib-async_err.d \
-     crypto/rc2/libcrypto-lib-rc2_skey.d \
-     crypto/cmp/libcrypto-shlib-cmp_msg.d \
-     providers/implementations/signature/libdefault-lib-rsa_sig.d \
-     crypto/dh/libcrypto-lib-dh_group_params.d \
-     crypto/x509/libcrypto-shlib-x509_obj.d \
-     crypto/bn/libcrypto-lib-bn_intern.d crypto/sm2/libcrypto-lib-sm2_err.d \
-     ssl/quic/libssl-shlib-quic_tls.d \
-     crypto/ml_dsa/libcrypto-shlib-ml_dsa_encoders.d \
-     crypto/evp/libcrypto-lib-cmeth_lib.d \
-     crypto/bio/libcrypto-shlib-bio_cb.d \
-     crypto/asn1/libcrypto-shlib-tasn_enc.d apps/openssl-bin-rehash.d \
-     crypto/modes/libcrypto-lib-ccm128.d crypto/des/liblegacy-lib-qud_cksm.d \
-     providers/implementations/kdfs/libdefault-lib-sshkdf.d \
-     crypto/x509/libcrypto-lib-v3_utf8.d \
-     crypto/property/libcrypto-shlib-property_string.d \
-     crypto/ec/curve448/arch_32/libcrypto-lib-f_impl32.d \
-     providers/implementations/encode_decode/libdefault-lib-encode_key2text.d \
-     crypto/ec/libcrypto-lib-ec_oct.d ssl/libssl-lib-priority_queue.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_sm4.d \
-     crypto/cmp/libcrypto-lib-cmp_server.d \
-     crypto/bio/libcrypto-lib-bss_core.d \
-     crypto/property/libcrypto-lib-property_string.d \
-     crypto/x509/libcrypto-lib-t_x509.d ssl/quic/libssl-shlib-quic_obj.d \
-     crypto/slh_dsa/libcrypto-shlib-slh_fors.d \
-     crypto/x509/libcrypto-lib-x509_vfy.d \
-     providers/implementations/digests/liblegacy-lib-md4_prov.d \
-     crypto/libcrypto-lib-provider.d ssl/quic/libssl-lib-quic_obj.d \
-     crypto/asn1/libcrypto-lib-t_spki.d \
-     crypto/bn/libcrypto-shlib-rsaz_exp_x2.d \
-     crypto/ct/libcrypto-shlib-ct_sct.d crypto/bio/libcrypto-shlib-bf_null.d \
-     crypto/evp/libcrypto-shlib-digest.d crypto/x509/libcrypto-shlib-x_crl.d \
-     crypto/store/libcrypto-lib-store_err.d \
-     crypto/evp/libcrypto-lib-keymgmt_lib.d \
-     providers/implementations/signature/libdefault-lib-eddsa_sig.d \
-     crypto/ec/libcrypto-shlib-ecdh_ossl.d crypto/bn/libcrypto-shlib-bn_dh.d \
-     crypto/asn1/libcrypto-shlib-tasn_scn.d \
-     crypto/ts/libcrypto-lib-ts_rsp_verify.d \
-     crypto/x509/libcrypto-shlib-t_x509.d \
-     crypto/cast/libcrypto-shlib-c_cfb64.d \
-     crypto/ec/curve448/libcrypto-lib-curve448.d \
-     crypto/libcrypto-lib-mem_sec.d \
-     crypto/x509/libcrypto-shlib-v3_timespec.d \
-     ssl/statem/libssl-shlib-statem_srvr.d \
-     crypto/bn/libcrypto-shlib-bn_sqr.d crypto/dso/libcrypto-shlib-dso_err.d \
-     crypto/kdf/libcrypto-lib-kdf_err.d \
-     providers/implementations/kdfs/libdefault-lib-pkcs12kdf.d \
-     crypto/ocsp/libcrypto-lib-ocsp_asn.d \
-     crypto/sm2/libcrypto-shlib-sm2_sign.d \
-     crypto/objects/libcrypto-lib-obj_lib.d \
-     crypto/property/libcrypto-shlib-defn_cache.d \
-     crypto/ml_dsa/libcrypto-lib-ml_dsa_params.d \
-     providers/implementations/digests/liblegacy-lib-mdc2_prov.d \
-     crypto/dh/libcrypto-lib-dh_kdf.d crypto/ess/libcrypto-lib-ess_lib.d \
-     providers/implementations/kem/libdefault-lib-ml_kem_kem.d \
-     crypto/evp/libcrypto-lib-c_alld.d crypto/dsa/libcrypto-lib-dsa_check.d \
-     providers/implementations/rands/seeding/libdefault-lib-rand_unix.d \
-     crypto/bn/libcrypto-lib-rsaz_exp_x2.d \
-     crypto/pkcs12/libcrypto-shlib-p12_mutl.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_tdes_wrap.d \
-     ssl/quic/libssl-shlib-quic_fifd.d \
-     crypto/cmp/libcrypto-shlib-cmp_protect.d \
-     ssl/quic/libssl-lib-quic_srt_gen.d \
-     crypto/libcrypto-shlib-provider_conf.d \
-     crypto/dsa/libcrypto-shlib-dsa_gen.d \
-     crypto/x509/libcrypto-lib-v3_single_use.d \
-     crypto/pkcs7/libcrypto-shlib-pk7_lib.d crypto/libcrypto-shlib-ex_data.d \
-     crypto/evp/libcrypto-lib-p_sign.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_rc2_hw.d \
-     crypto/conf/libcrypto-shlib-conf_lib.d \
-     ssl/quic/libssl-shlib-quic_lcidm.d crypto/evp/libcrypto-lib-kem.d \
-     crypto/cms/libcrypto-lib-cms_enc.d ssl/libssl-lib-tls_srp.d \
-     crypto/store/libcrypto-shlib-store_result.d \
-     crypto/evp/libcrypto-lib-bio_ok.d crypto/libcrypto-shlib-time.d \
-     crypto/objects/libcrypto-lib-obj_err.d \
-     crypto/async/arch/libcrypto-shlib-async_win.d \
-     crypto/bn/libcrypto-lib-bn_lib.d crypto/libcrypto-lib-ex_data.d \
-     crypto/dso/libcrypto-lib-dso_err.d \
-     crypto/x509/libcrypto-lib-pcy_cache.d \
-     crypto/asn1/libcrypto-lib-x_int64.d \
-     crypto/comp/libcrypto-shlib-comp_lib.d \
-     providers/liblegacy-lib-prov_running.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_desx_hw.d \
-     providers/implementations/macs/libdefault-lib-blake2s_mac.d \
-     ssl/quic/libssl-shlib-qlog_event_helpers.d \
-     providers/implementations/encode_decode/libdefault-lib-decode_pvk2key.d \
-     crypto/asn1/libcrypto-lib-asn_pack.d \
-     crypto/rsa/libcrypto-shlib-rsa_oaep.d \
-     crypto/dh/libcrypto-shlib-dh_backend.d \
-     crypto/asn1/libcrypto-shlib-a_bitstr.d \
-     crypto/pkcs12/libcrypto-shlib-p12_init.d \
-     crypto/evp/libcrypto-shlib-legacy_md4.d \
-     crypto/comp/libcrypto-shlib-c_zlib.d \
-     ssl/record/methods/libssl-lib-tls13_meth.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_siv_hw.d \
-     crypto/comp/libcrypto-lib-c_brotli.d crypto/bn/libcrypto-shlib-bn_ctx.d \
-     crypto/aes/libcrypto-lib-aes_ecb.d providers/libcrypto-shlib-baseprov.d \
-     crypto/x509/libcrypto-shlib-x_exten.d crypto/ct/libcrypto-lib-ct_vfy.d \
-     crypto/x509/libcrypto-shlib-v3_group_ac.d \
-     crypto/rc2/libcrypto-lib-rc2cfb64.d \
-     crypto/dsa/libcrypto-shlib-dsa_lib.d \
-     crypto/idea/liblegacy-lib-i_cfb64.d crypto/rsa/libcrypto-lib-rsa_mp.d \
-     crypto/thread/arch/libcrypto-lib-thread_posix.d \
-     crypto/evp/libcrypto-lib-e_sm4.d \
-     crypto/camellia/libcrypto-lib-cmll_ofb.d ssl/quic/libssl-lib-uint_set.d \
-     crypto/bn/asm/libcrypto-lib-x86_64-gcc.d \
-     crypto/cms/libcrypto-shlib-cms_ess.d \
-     crypto/x509/libcrypto-shlib-v3_extku.d \
-     crypto/pem/libcrypto-shlib-pem_oth.d \
-     crypto/x509/libcrypto-shlib-v3_pcia.d crypto/asn1/libcrypto-lib-a_dup.d \
-     crypto/cmac/libcrypto-shlib-cmac.d crypto/ct/libcrypto-shlib-ct_prn.d \
-     crypto/property/libcrypto-shlib-property_parse.d \
-     crypto/asn1/libcrypto-shlib-d2i_param.d \
-     providers/implementations/encode_decode/libdefault-lib-ml_dsa_codecs.d \
-     crypto/bf/libcrypto-lib-bf_cfb64.d \
-     crypto/x509/libcrypto-shlib-v3_akid.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_sm4_gcm.d \
-     apps/lib/libapps-lib-app_x509.d crypto/ts/libcrypto-shlib-ts_conf.d \
-     ssl/quic/libssl-shlib-quic_record_shared.d \
-     crypto/dso/libcrypto-lib-dso_lib.d crypto/ts/libcrypto-lib-ts_asn1.d \
-     ssl/libssl-lib-ssl_asn1.d apps/lib/libapps-lib-names.d \
-     providers/implementations/asymciphers/libdefault-lib-sm2_enc.d \
-     crypto/libcrypto-shlib-o_init.d ssl/libssl-shlib-ssl_init.d \
-     crypto/evp/libcrypto-shlib-kem.d ssl/libssl-lib-bio_ssl.d \
-     crypto/slh_dsa/libcrypto-lib-slh_dsa_key.d \
-     providers/common/der/libcommon-lib-der_dsa_gen.d \
-     crypto/x509/libcrypto-lib-v3_pmaps.d \
-     crypto/property/libcrypto-shlib-property_query.d \
-     crypto/sm3/libcrypto-lib-sm3.d crypto/idea/liblegacy-lib-i_cbc.d \
-     crypto/modes/libcrypto-lib-ctr128.d crypto/ec/libcrypto-shlib-ec_err.d \
-     crypto/x509/libcrypto-lib-by_store.d \
-     crypto/encode_decode/libcrypto-shlib-encoder_err.d \
-     crypto/evp/libcrypto-lib-evp_utils.d \
-     crypto/rand/libcrypto-lib-rand_pool.d \
-     crypto/dh/libcrypto-lib-dh_pmeth.d crypto/ec/libcrypto-shlib-ec_asn1.d \
-     providers/common/der/libcommon-lib-der_ml_dsa_key.d \
-     crypto/evp/libcrypto-shlib-bio_ok.d \
-     crypto/x509/libcrypto-shlib-v3_enum.d \
-     crypto/asn1/libcrypto-shlib-d2i_pr.d crypto/bio/libcrypto-lib-bio_err.d \
-     crypto/dso/libcrypto-shlib-dso_dlfcn.d \
-     crypto/rc2/libcrypto-lib-rc2_ecb.d crypto/asn1/libcrypto-lib-x_spki.d \
-     crypto/camellia/libcrypto-lib-cmll_misc.d ssl/libssl-lib-ssl_sess.d \
-     crypto/rsa/libcrypto-shlib-rsa_saos.d \
-     crypto/lhash/libcrypto-lib-lh_stats.d \
-     crypto/ec/libcrypto-shlib-ec_pmeth.d crypto/asn1/libcrypto-lib-f_int.d \
-     crypto/sm3/libcrypto-shlib-legacy_sm3.d \
-     crypto/ui/libcrypto-lib-ui_openssl.d \
-     crypto/evp/libcrypto-shlib-cmeth_lib.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_tdes_default_hw.d \
-     crypto/asn1/libcrypto-lib-x_algor.d ssl/quic/libssl-shlib-quic_txp.d \
-     crypto/x509/libcrypto-shlib-v3_sxnet.d \
-     crypto/ec/libcrypto-shlib-ec_kmeth.d crypto/bn/libcrypto-lib-bn_mul.d \
-     ssl/quic/libssl-shlib-quic_rx_depack.d \
-     crypto/rsa/libcrypto-shlib-rsa_lib.d \
-     crypto/ec/libcrypto-shlib-ec_print.d \
-     crypto/x509/libcrypto-lib-v3_conf.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_rc2.d \
-     crypto/store/libcrypto-shlib-store_strings.d \
-     crypto/bn/asm/libcrypto-shlib-x86_64-gcc.d \
-     crypto/cms/libcrypto-shlib-cms_att.d apps/lib/libapps-lib-log.d \
-     crypto/hpke/libcrypto-shlib-hpke_util.d \
-     ssl/quic/libssl-lib-quic_lcidm.d crypto/evp/libcrypto-shlib-p_lib.d \
-     crypto/asn1/libcrypto-lib-n_pkey.d \
-     crypto/conf/libcrypto-shlib-conf_err.d \
-     crypto/ec/libcrypto-lib-ec2_oct.d ssl/libssl-lib-d1_srtp.d \
-     crypto/ec/libcrypto-lib-ecdh_ossl.d \
-     crypto/asn1/libcrypto-shlib-asn1_lib.d ssl/libssl-lib-s3_lib.d \
-     crypto/des/libcrypto-lib-cbc_enc.d crypto/evp/libcrypto-lib-dh_ctrl.d \
-     crypto/bn/libcrypto-lib-bn_shift.d crypto/ts/libcrypto-lib-ts_err.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aria_ccm.d \
-     crypto/pkcs12/libcrypto-shlib-p12_decr.d \
-     crypto/x509/libcrypto-lib-v3_battcons.d \
-     crypto/stack/libcrypto-lib-stack.d crypto/dsa/libcrypto-lib-dsa_key.d \
-     providers/common/der/libcommon-lib-der_dsa_sig.d \
-     crypto/comp/libcrypto-lib-comp_lib.d \
-     crypto/asn1/libcrypto-shlib-a_gentm.d \
-     crypto/asn1/libcrypto-shlib-a_verify.d \
-     providers/common/libcommon-lib-provider_err.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_ocb_hw.d \
-     crypto/rand/libcrypto-shlib-rand_lib.d apps/openssl-bin-fipsinstall.d \
-     crypto/aria/libcrypto-shlib-aria.d \
-     crypto/pkcs7/libcrypto-lib-pk7_attr.d \
-     crypto/modes/libcrypto-lib-xts128gb.d ssl/libssl-lib-s3_enc.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_ccm.d \
-     crypto/bn/libcrypto-lib-bn_div.d crypto/bn/libcrypto-shlib-bn_err.d \
-     crypto/conf/libcrypto-lib-conf_err.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aes_ocb.d \
-     providers/common/der/libcommon-lib-der_ml_dsa_gen.d \
-     crypto/cmp/libcrypto-shlib-cmp_vfy.d \
-     crypto/x509/libcrypto-lib-t_acert.d crypto/x509/libcrypto-lib-x_all.d \
-     ssl/statem/libssl-lib-statem_clnt.d crypto/evp/libcrypto-lib-e_bf.d \
-     crypto/bf/liblegacy-lib-bf_enc.d \
-     providers/implementations/kdfs/libdefault-lib-pbkdf2_fips.d \
-     crypto/libcrypto-lib-defaults.d crypto/evp/libcrypto-lib-kdf_meth.d \
-     crypto/store/libcrypto-lib-store_lib.d \
-     crypto/asn1/libcrypto-shlib-x_val.d ssl/libssl-shlib-s3_enc.d \
-     crypto/des/liblegacy-lib-ofb64ede.d \
-     crypto/encode_decode/libcrypto-lib-encoder_lib.d \
-     crypto/ec/curve448/libcrypto-shlib-f_generic.d \
-     crypto/asn1/libcrypto-lib-d2i_pr.d \
-     crypto/ts/libcrypto-lib-ts_rsp_sign.d \
-     crypto/md5/libcrypto-lib-md5_one.d crypto/err/libcrypto-lib-err_all.d \
-     apps/openssl-bin-ciphers.d ssl/quic/libssl-lib-quic_rstream.d \
-     crypto/seed/libcrypto-shlib-seed_ecb.d \
-     crypto/ec/curve448/libcrypto-shlib-eddsa.d \
-     crypto/evp/libcrypto-lib-legacy_blake2.d \
-     crypto/x509/libcrypto-shlib-v3_crld.d apps/openssl-bin-x509.d \
-     crypto/sha/libcrypto-shlib-sha512.d crypto/pem/libcrypto-lib-pem_info.d \
-     crypto/ec/curve448/arch_32/libcrypto-shlib-f_impl32.d \
-     crypto/evp/libcrypto-lib-legacy_ripemd.d \
-     providers/implementations/kem/libdefault-lib-kem_util.d \
-     crypto/dsa/libcrypto-lib-dsa_pmeth.d ssl/quic/libssl-lib-quic_rcidm.d \
-     crypto/sm2/libcrypto-shlib-sm2_key.d \
-     crypto/conf/libcrypto-lib-conf_api.d \
-     crypto/libcrypto-shlib-provider_core.d \
-     crypto/rsa/libcrypto-shlib-rsa_chk.d \
-     crypto/asn1/libcrypto-shlib-a_strnid.d \
-     providers/libcrypto-lib-baseprov.d crypto/libcrypto-shlib-ssl_err.d \
-     crypto/ts/libcrypto-shlib-ts_rsp_print.d \
-     providers/libcrypto-lib-defltprov.d \
-     crypto/asn1/libcrypto-lib-tasn_prn.d apps/lib/libapps-lib-app_libctx.d \
-     crypto/bn/libcrypto-shlib-bn_blind.d \
-     crypto/dsa/libcrypto-lib-dsa_ossl.d ssl/quic/libssl-shlib-quic_srtm.d \
-     ssl/libssl-shlib-d1_srtp.d crypto/idea/libcrypto-lib-i_ofb64.d \
-     ssl/libssl-lib-methods.d \
-     crypto/evp/libcrypto-shlib-e_aes_cbc_hmac_sha1.d \
-     providers/implementations/macs/libdefault-lib-hmac_prov.d \
-     crypto/x509/libcrypto-lib-v3_extku.d \
-     crypto/x509/libcrypto-shlib-v3_single_use.d \
-     crypto/x509/libcrypto-lib-x509_d2.d \
-     ssl/record/libssl-lib-rec_layer_s3.d ssl/quic/libssl-lib-quic_ackm.d \
-     ssl/quic/libssl-lib-quic_thread_assist.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_blowfish.d \
-     crypto/libcrypto-lib-threads_win.d \
-     crypto/pkcs7/libcrypto-shlib-pk7_attr.d \
-     crypto/x509/libcrypto-lib-v3_authattid.d apps/openssl-bin-rsa.d \
-     crypto/err/libcrypto-lib-err_all_legacy.d \
-     crypto/dso/libcrypto-lib-dso_dlfcn.d \
-     crypto/bn/libcrypto-shlib-rsaz_exp.d \
-     crypto/asn1/libcrypto-lib-ameth_lib.d \
-     providers/implementations/macs/libdefault-lib-siphash_prov.d \
-     ssl/quic/libssl-lib-quic_reactor_wait_ctx.d \
-     crypto/x509/libcrypto-lib-v3_usernotice.d \
-     crypto/bn/libcrypto-lib-bn_mpi.d crypto/evp/libcrypto-lib-p5_crpt.d \
-     crypto/x509/libcrypto-shlib-x509_r2x.d \
-     crypto/pem/libcrypto-lib-pem_pkey.d \
-     crypto/ocsp/libcrypto-shlib-ocsp_http.d \
-     crypto/asn1/libcrypto-lib-a_gentm.d apps/openssl-bin-ocsp.d \
-     crypto/sm3/libcrypto-shlib-sm3.d crypto/asn1/libcrypto-shlib-a_type.d \
-     providers/implementations/skeymgmt/libdefault-lib-generic.d \
-     crypto/ec/libcrypto-shlib-ecdh_kdf.d \
-     crypto/ts/libcrypto-shlib-ts_asn1.d \
-     crypto/ml_dsa/libcrypto-lib-ml_dsa_encoders.d \
-     crypto/pkcs12/libcrypto-lib-p12_npas.d \
-     crypto/pkcs12/libcrypto-lib-p12_decr.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_sm4_hw.d \
-     crypto/md5/liblegacy-lib-md5_sha1.d \
-     crypto/evp/libcrypto-shlib-legacy_md5_sha1.d \
-     crypto/ocsp/libcrypto-shlib-ocsp_cl.d \
-     crypto/slh_dsa/libcrypto-shlib-slh_dsa.d \
-     crypto/dsa/libcrypto-lib-dsa_meth.d \
-     crypto/bio/libcrypto-shlib-bio_print.d \
-     crypto/rand/libcrypto-lib-randfile.d \
-     crypto/x509/libcrypto-shlib-v3_ac_tgt.d ssl/libssl-shlib-ssl_cert.d \
-     ssl/statem/libssl-lib-statem.d \
-     providers/implementations/keymgmt/libdefault-lib-mac_legacy_kmgmt.d \
-     crypto/bn/libcrypto-lib-bn_gcd.d crypto/ec/libcrypto-lib-ec_lib.d \
-     apps/openssl-bin-pkeyparam.d \
-     providers/common/der/libcommon-lib-der_ecx_gen.d \
-     crypto/mdc2/liblegacy-lib-mdc2_one.d \
-     providers/implementations/signature/libdefault-lib-dsa_sig.d \
-     crypto/x509/libcrypto-lib-v3_sda.d crypto/dh/libcrypto-lib-dh_prn.d \
-     crypto/evp/libcrypto-shlib-pbe_scrypt.d \
-     crypto/ct/libcrypto-lib-ct_sct.d \
-     providers/implementations/digests/libdefault-lib-sha3_prov.d \
-     crypto/asn1/libcrypto-shlib-a_object.d \
-     crypto/evp/libcrypto-shlib-keymgmt_meth.d \
-     crypto/x509/libcrypto-lib-v3_info.d \
-     providers/common/der/libcommon-lib-der_ec_sig.d \
-     crypto/evp/libcrypto-lib-e_cast.d apps/openssl-bin-ec.d \
-     crypto/cast/libcrypto-lib-c_cfb64.d ssl/quic/libssl-shlib-quic_wire.d \
-     crypto/evp/libcrypto-lib-dh_support.d \
-     ssl/quic/libssl-lib-quic_tserver.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_rc4_hw.d \
-     crypto/ui/libcrypto-shlib-ui_err.d \
-     crypto/sha/libcrypto-shlib-sha1_one.d \
-     crypto/encode_decode/libcrypto-shlib-encoder_meth.d \
-     crypto/x509/libcrypto-lib-v3_pci.d \
-     crypto/pkcs7/libcrypto-lib-pk7_doit.d crypto/libcrypto-lib-getenv.d \
-     crypto/bn/libcrypto-shlib-bn_conv.d \
-     ssl/quic/libssl-lib-qlog_event_helpers.d \
-     crypto/pem/libcrypto-shlib-pem_x509.d \
-     crypto/slh_dsa/libcrypto-shlib-slh_adrs.d \
-     crypto/x509/libcrypto-shlib-v3_addr.d \
-     apps/lib/libapps-lib-engine_loader.d \
-     crypto/x509/libcrypto-lib-v3_sxnet.d \
-     crypto/x509/libcrypto-lib-v3_ncons.d crypto/libcrypto-lib-context.d \
-     crypto/x509/libcrypto-lib-x509_meth.d crypto/des/liblegacy-lib-fcrypt.d \
-     crypto/bn/libcrypto-shlib-bn_intern.d \
-     providers/implementations/rands/libdefault-lib-seed_src_jitter.d \
-     providers/implementations/ciphers/liblegacy-lib-cipher_idea_hw.d \
-     crypto/ec/libcrypto-shlib-ec2_smpl.d \
-     ssl/quic/libssl-shlib-quic_record_rx.d \
-     providers/implementations/ciphers/libdefault-lib-cipher_aria_hw.d \
-     crypto/ec/libcrypto-lib-ecx_meth.d \
-     crypto/camellia/libcrypto-shlib-cmll_ctr.d \
-     crypto/bio/libcrypto-lib-bss_dgram_pair.d apps/openssl-bin-openssl.d \
-     crypto/ml_kem/libcrypto-lib-ml_kem.d \
-     crypto/evp/libcrypto-lib-signature.d \
-     crypto/libcrypto-shlib-core_algorithm.d \
-     crypto/rsa/libcrypto-lib-rsa_sign.d \
-     ssl/quic/libssl-shlib-quic_wire_pkt.d \
-     crypto/asn1/libcrypto-shlib-a_utctm.d ssl/libssl-shlib-s3_lib.d \
-     ssl/rio/libssl-shlib-poll_builder.d \
-     ssl/statem/libssl-shlib-statem_lib.d \
-     crypto/sha/libcrypto-lib-sha1_one.d apps/openssl-bin-info.d \
-     crypto/objects/libcrypto-lib-obj_xref.d \
-     crypto/ess/libcrypto-lib-ess_err.d \
-     crypto/x509/libcrypto-shlib-v3_asid.d \
-     crypto/conf/libcrypto-shlib-conf_mall.d \
-     apps/lib/libapps-lib-app_provider.d \
-     crypto/x509/libcrypto-lib-x509_req.d \
-     crypto/ml_dsa/libcrypto-lib-ml_dsa_matrix.d \
-     crypto/seed/libcrypto-lib-seed_ecb.d \
-     crypto/pkcs7/libcrypto-shlib-pkcs7err.d \
-     crypto/thread/arch/libssl-shlib-thread_win.d \
-     ssl/record/methods/libssl-lib-tls1_meth.d \
-     ssl/quic/libssl-shlib-quic_demux.d crypto/ct/libcrypto-shlib-ct_oct.d \
-     crypto/async/arch/libcrypto-lib-async_posix.d \
-     crypto/bio/libcrypto-shlib-bss_file.d \
-     crypto/cms/libcrypto-lib-cms_env.d crypto/des/libcrypto-shlib-ofb_enc.d \
+     crypto/property/libcrypto-lib-property.d \
+     crypto/evp/libcrypto-shlib-pmeth_lib.d \
+     crypto/ec/libcrypto-shlib-eck_prn.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_sm4_ccm.d \
+     crypto/rsa/libcrypto-lib-rsa_chk.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_blowfish_hw.d \
+     crypto/x509/libcrypto-lib-v3_purp.d crypto/asn1/libcrypto-lib-n_pkey.d \
+     apps/openssl-bin-s_time.d crypto/ts/libcrypto-shlib-ts_rsp_verify.d \
+     crypto/dso/libcrypto-shlib-dso_openssl.d \
+     crypto/asn1/libcrypto-shlib-asn1_gen.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_sm4_xts_hw.d \
+     crypto/ec/libcrypto-lib-ec_deprecated.d \
      crypto/bio/libcrypto-shlib-bss_mem.d \
-     crypto/idea/libcrypto-shlib-i_skey.d ssl/quic/libssl-shlib-quic_ackm.d \
-     crypto/bn/libcrypto-lib-bn_add.d crypto/bn/libcrypto-lib-bn_mod.d \
-     crypto/asn1/libcrypto-shlib-p5_pbe.d crypto/idea/liblegacy-lib-i_skey.d \
-     crypto/seed/libcrypto-lib-seed_ofb.d crypto/cast/liblegacy-lib-c_ecb.d \
-     crypto/hashtable/libcrypto-lib-hashtable.d \
-     ssl/quic/libssl-shlib-quic_sstream.d \
-     crypto/x509/libcrypto-lib-v3_attrmap.d \
-     crypto/evp/libcrypto-shlib-evp_rand.d \
-     crypto/pkcs12/libcrypto-lib-p12_crpt.d \
-     providers/common/der/libdefault-lib-der_rsa_sig.d \
-     crypto/libcrypto-shlib-threads_pthread.d \
-     crypto/async/libcrypto-shlib-async_wait.d \
-     crypto/dsa/libcrypto-shlib-dsa_vrf.d crypto/ec/libcrypto-lib-ecp_smpl.d \
-     crypto/dh/libcrypto-shlib-dh_check.d \
-     crypto/cast/libcrypto-shlib-c_ofb64.d \
-     crypto/pkcs12/libcrypto-shlib-p12_key.d \
-     crypto/des/libcrypto-lib-qud_cksm.d crypto/pem/libcrypto-lib-pem_lib.d \
+     crypto/evp/libcrypto-shlib-p_sign.d \
+     crypto/aes/libcrypto-shlib-aes_ecb.d \
+     crypto/asn1/libcrypto-lib-tasn_enc.d \
+     crypto/whrlpool/libcrypto-lib-wp_dgst.d \
+     crypto/rsa/libcrypto-shlib-rsa_none.d \
+     crypto/modes/libcrypto-shlib-gcm128.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_ccm.d \
+     crypto/libcrypto-lib-ctype.d crypto/poly1305/libcrypto-shlib-poly1305.d \
+     crypto/conf/libcrypto-shlib-conf_api.d \
+     ssl/rio/libssl-lib-poll_builder.d \
+     crypto/async/arch/libcrypto-lib-async_win.d \
+     crypto/objects/libcrypto-lib-obj_err.d crypto/libssl-shlib-packet.d \
+     crypto/des/libcrypto-lib-xcbc_enc.d \
+     crypto/x509/libcrypto-lib-v3_timespec.d \
+     crypto/thread/libssl-shlib-arch.d crypto/ct/libcrypto-lib-ct_vfy.d \
+     crypto/dsa/libcrypto-shlib-dsa_prn.d \
+     crypto/dsa/libcrypto-shlib-dsa_gen.d \
+     crypto/x509/libcrypto-shlib-v3_sxnet.d \
+     crypto/crmf/libcrypto-lib-crmf_asn.d \
+     crypto/des/libcrypto-shlib-cfb_enc.d ssl/quic/libssl-shlib-cc_newreno.d \
      crypto/x509/libcrypto-shlib-x509_req.d \
-     crypto/cmp/libcrypto-lib-cmp_protect.d \
-     providers/implementations/kdfs/libdefault-lib-krb5kdf.d \
-     crypto/conf/libcrypto-shlib-conf_mod.d \
-     crypto/evp/libcrypto-shlib-kdf_meth.d \
-     crypto/mdc2/libcrypto-shlib-mdc2_one.d \
-     crypto/x509/libcrypto-lib-x_crl.d \
-     crypto/rsa/libcrypto-shlib-rsa_ameth.d \
-     crypto/dh/libcrypto-shlib-dh_lib.d crypto/asn1/libcrypto-shlib-a_dup.d \
-     crypto/cast/libcrypto-lib-c_enc.d \
-     crypto/crmf/libcrypto-shlib-crmf_asn.d ssl/libssl-lib-ssl_txt.d \
-     crypto/pem/libcrypto-lib-pvkfmt.d \
-     providers/implementations/keymgmt/libdefault-lib-dh_kmgmt.d \
-     apps/openssl-bin-cmp.d crypto/x509/libcrypto-lib-v3_int.d \
-     crypto/ocsp/libcrypto-lib-ocsp_http.d \
-     crypto/pkcs12/libcrypto-shlib-p12_p8d.d ssl/quic/libssl-lib-quic_txp.d \
-     crypto/ec/libcrypto-lib-ec_err.d crypto/ec/libcrypto-lib-ecx_key.d \
-     crypto/rsa/libcrypto-shlib-rsa_backend.d \
-     crypto/evp/libcrypto-lib-e_rc4.d crypto/x509/libcrypto-shlib-x_attrib.d \
-     crypto/evp/libcrypto-lib-digest.d apps/openssl-bin-crl2pkcs7.d \
-     crypto/ocsp/libcrypto-shlib-ocsp_lib.d \
-     crypto/ts/libcrypto-shlib-ts_rsp_sign.d \
-     crypto/cms/libcrypto-shlib-cms_io.d crypto/modes/libcrypto-lib-cbc128.d \
+     crypto/evp/libcrypto-shlib-p_verify.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_gcm_hw.d \
+     crypto/x509/libcrypto-shlib-v3_san.d \
+     crypto/ui/libcrypto-lib-ui_openssl.d crypto/libcrypto-lib-cpt_err.d \
+     crypto/asn1/libcrypto-lib-tasn_dec.d \
+     crypto/des/liblegacy-lib-cfb64ede.d crypto/x509/libcrypto-lib-x509_lu.d \
+     crypto/cmp/libcrypto-shlib-cmp_util.d \
+     crypto/md4/libcrypto-lib-md4_dgst.d \
+     crypto/crmf/libcrypto-lib-crmf_lib.d \
+     crypto/asn1/libcrypto-shlib-asn1_err.d \
+     crypto/slh_dsa/libcrypto-shlib-slh_dsa.d \
+     crypto/cast/libcrypto-lib-c_skey.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_camellia_hw.d \
+     crypto/dsa/libcrypto-shlib-dsa_ameth.d \
+     crypto/rsa/libcrypto-lib-rsa_lib.d crypto/asn1/libcrypto-shlib-t_pkey.d \
+     ssl/libssl-lib-ssl_cert.d crypto/err/libcrypto-shlib-err_blocks.d \
+     crypto/ts/libcrypto-shlib-ts_asn1.d \
+     crypto/evp/libcrypto-lib-pmeth_check.d \
+     crypto/ec/libcrypto-shlib-ecp_smpl.d crypto/dh/libcrypto-lib-dh_key.d \
+     ssl/quic/libssl-lib-quic_sstream.d crypto/aes/libcrypto-shlib-aes_ofb.d \
+     crypto/slh_dsa/libcrypto-lib-slh_dsa_hash_ctx.d \
+     crypto/ec/libcrypto-lib-ec_cvt.d crypto/evp/libcrypto-lib-evp_enc.d \
+     ssl/statem/libssl-lib-statem.d crypto/bio/libcrypto-shlib-bss_file.d \
+     providers/implementations/signature/libdefault-lib-ecdsa_sig.d \
+     providers/implementations/macs/libdefault-lib-gmac_prov.d \
+     crypto/seed/liblegacy-lib-seed_cfb.d crypto/des/liblegacy-lib-cfb_enc.d \
+     crypto/asn1/libcrypto-lib-a_object.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aria_hw.d \
+     apps/openssl-bin-crl.d apps/openssl-bin-list.d \
+     crypto/seed/libcrypto-lib-seed_ofb.d ssl/quic/libssl-lib-quic_tserver.d \
+     crypto/ts/libcrypto-lib-ts_rsp_print.d \
+     crypto/objects/libcrypto-shlib-obj_err.d \
+     crypto/libcrypto-lib-provider.d crypto/sm4/libcrypto-lib-sm4.d \
+     crypto/bn/libcrypto-shlib-bn_sqrt.d \
+     crypto/ec/libcrypto-lib-ecdsa_ossl.d \
+     crypto/ess/libcrypto-shlib-ess_err.d crypto/bio/libcrypto-lib-bf_nbio.d \
+     crypto/dso/libcrypto-lib-dso_lib.d crypto/libcrypto-shlib-ctype.d \
+     crypto/libcrypto-lib-getenv.d crypto/des/libcrypto-lib-rand_key.d \
+     crypto/dsa/libcrypto-lib-dsa_pmeth.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_xts_fips.d \
+     crypto/x509/libcrypto-lib-v3_rolespec.d \
+     providers/implementations/digests/libdefault-lib-blake2s_prov.d \
+     providers/implementations/rands/seeding/libdefault-lib-rand_tsc.d \
+     crypto/evp/libcrypto-lib-pmeth_lib.d \
+     crypto/des/libcrypto-lib-ecb3_enc.d crypto/des/libcrypto-lib-fcrypt.d \
+     crypto/ui/libcrypto-shlib-ui_lib.d \
+     providers/implementations/kem/libtemplate-lib-template_kem.d \
+     crypto/async/arch/libcrypto-shlib-async_null.d apps/openssl-bin-pkcs7.d \
+     crypto/cmp/libcrypto-shlib-cmp_asn.d crypto/bn/libcrypto-lib-bn_prime.d \
+     ssl/libssl-lib-ssl_mcnf.d crypto/evp/libcrypto-shlib-p_legacy.d \
+     apps/openssl-bin-gendsa.d crypto/evp/libcrypto-lib-encode.d \
+     crypto/slh_dsa/libcrypto-shlib-slh_hypertree.d \
+     crypto/x509/libcrypto-shlib-v3_timespec.d \
+     apps/lib/libapps-lib-app_params.d crypto/asn1/libcrypto-shlib-x_algor.d \
+     crypto/err/libcrypto-shlib-err_prn.d \
+     crypto/comp/libcrypto-shlib-comp_err.d \
+     crypto/asn1/libcrypto-lib-d2i_pu.d crypto/seed/libcrypto-shlib-seed.d \
+     crypto/libcrypto-lib-bsearch.d crypto/dsa/libcrypto-lib-dsa_sign.d \
+     crypto/rsa/libcrypto-shlib-rsa_prn.d crypto/cast/liblegacy-lib-c_ecb.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_des_hw.d \
+     crypto/evp/libcrypto-lib-evp_rand.d crypto/ct/libcrypto-shlib-ct_vfy.d \
+     crypto/des/liblegacy-lib-qud_cksm.d crypto/libcrypto-shlib-o_dir.d \
+     crypto/ec/libcrypto-shlib-ecp_nist.d \
+     crypto/lhash/libcrypto-shlib-lhash.d ssl/quic/libssl-lib-quic_wire.d \
+     crypto/asn1/libcrypto-lib-p5_pbev2.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_rc4_hmac_md5_hw.d \
+     crypto/cast/liblegacy-lib-c_skey.d \
+     crypto/evp/libcrypto-lib-legacy_sha.d \
+     crypto/aes/libcrypto-shlib-aes_wrap.d \
+     crypto/ec/libcrypto-shlib-ecdsa_sign.d \
+     crypto/modes/libcrypto-shlib-ocb128.d \
+     crypto/des/libcrypto-shlib-ofb_enc.d crypto/md4/liblegacy-lib-md4_one.d \
+     crypto/x509/libcrypto-lib-v3_single_use.d \
+     crypto/libcrypto-lib-core_fetch.d \
+     crypto/http/libcrypto-lib-http_client.d \
+     crypto/evp/libcrypto-shlib-mac_meth.d crypto/ec/libcrypto-lib-ecx_key.d \
+     crypto/libcrypto-lib-passphrase.d \
+     crypto/dh/libcrypto-lib-dh_group_params.d \
+     crypto/x509/libcrypto-shlib-x509_meth.d \
+     crypto/dso/libcrypto-lib-dso_dlfcn.d \
+     crypto/objects/libcrypto-lib-obj_xref.d \
+     crypto/bn/libcrypto-lib-bn_err.d crypto/sha/libcrypto-lib-sha256.d \
+     crypto/asn1/libcrypto-shlib-a_gentm.d \
+     crypto/evp/libcrypto-lib-kdf_lib.d \
+     crypto/evp/libcrypto-lib-keymgmt_meth.d crypto/evp/libcrypto-lib-kem.d \
+     crypto/des/libcrypto-lib-ofb_enc.d providers/libcrypto-lib-defltprov.d \
+     crypto/bn/libcrypto-lib-bn_mpi.d \
+     providers/implementations/keymgmt/libdefault-lib-mlx_kmgmt.d \
+     ssl/libssl-lib-ssl_stat.d crypto/bf/liblegacy-lib-bf_ofb64.d \
+     providers/implementations/encode_decode/libdefault-lib-encode_key2any.d \
+     crypto/pem/libcrypto-shlib-pem_oth.d \
+     crypto/pkcs12/libcrypto-shlib-p12_attr.d \
+     providers/common/libdefault-lib-bio_prov.d ssl/libssl-shlib-ssl_ciph.d \
+     crypto/des/libcrypto-shlib-ecb_enc.d \
+     crypto/seed/libcrypto-shlib-seed_cfb.d \
+     crypto/x509/libcrypto-shlib-v3_bcons.d \
+     crypto/pkcs7/libcrypto-shlib-bio_pk7.d \
+     crypto/cms/libcrypto-lib-cms_att.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_xts_hw.d \
+     crypto/dsa/libcrypto-lib-dsa_meth.d crypto/asn1/libcrypto-lib-x_sig.d \
+     ssl/libssl-shlib-d1_msg.d crypto/libcrypto-shlib-core_namemap.d \
+     crypto/cms/libcrypto-shlib-cms_ec.d \
+     providers/implementations/kdfs/libdefault-lib-hmacdrbg_kdf.d \
+     crypto/rc2/liblegacy-lib-rc2ofb64.d \
+     crypto/rsa/libcrypto-shlib-rsa_oaep.d \
+     crypto/evp/libcrypto-lib-evp_pkey.d ssl/quic/libssl-lib-quic_port.d \
+     ssl/libssl-shlib-t1_trce.d crypto/txt_db/libcrypto-lib-txt_db.d \
+     crypto/pkcs7/libcrypto-lib-pk7_mime.d \
+     crypto/ocsp/libcrypto-shlib-ocsp_ext.d \
+     crypto/rsa/libcrypto-lib-rsa_ossl.d \
+     crypto/cms/libcrypto-shlib-cms_pwri.d \
+     crypto/bf/libcrypto-shlib-bf_ofb64.d \
+     crypto/bn/libcrypto-shlib-bn_rsa_fips186_4.d \
+     crypto/crmf/libcrypto-lib-crmf_pbm.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_cts.d \
+     crypto/dh/libcrypto-lib-dh_err.d \
+     providers/common/libdefault-lib-capabilities.d \
+     crypto/asn1/libcrypto-lib-asn_moid.d \
+     crypto/evp/libcrypto-shlib-ec_ctrl.d \
+     crypto/dh/libcrypto-lib-dh_backend.d \
+     crypto/pkcs7/libcrypto-lib-pk7_lib.d \
+     crypto/conf/libcrypto-shlib-conf_err.d \
+     crypto/siphash/libcrypto-shlib-siphash.d \
+     crypto/asn1/libcrypto-shlib-a_octet.d \
+     crypto/bn/libcrypto-shlib-bn_gf2m.d crypto/dh/libcrypto-lib-dh_pmeth.d \
+     apps/openssl-bin-req.d apps/openssl-bin-pkeyutl.d \
+     crypto/ocsp/libcrypto-shlib-v3_ocsp.d \
+     crypto/ec/libcrypto-shlib-ec_backend.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_gcm_siv_hw.d \
+     crypto/x509/libcrypto-shlib-x_x509a.d ssl/libssl-lib-s3_lib.d \
+     crypto/bio/libcrypto-lib-bio_sock2.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_seed_hw.d \
+     crypto/evp/libcrypto-lib-e_null.d \
+     crypto/ffc/libcrypto-shlib-ffc_key_validate.d \
+     crypto/kdf/libcrypto-lib-kdf_err.d crypto/x509/libcrypto-lib-x509_obj.d \
+     crypto/evp/libcrypto-lib-dh_ctrl.d crypto/evp/libcrypto-shlib-e_rc2.d \
+     crypto/ec/curve448/libcrypto-shlib-curve448_tables.d \
+     crypto/evp/libcrypto-shlib-ctrl_params_translate.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_sm4_gcm.d \
+     ssl/libssl-shlib-ssl_txt.d crypto/ripemd/liblegacy-lib-rmd_dgst.d \
+     crypto/bn/libcrypto-shlib-bn_lib.d \
+     crypto/thread/arch/libcrypto-lib-thread_posix.d \
+     crypto/async/libcrypto-lib-async_wait.d \
+     crypto/buffer/libcrypto-shlib-buf_err.d \
+     crypto/ml_dsa/libcrypto-lib-ml_dsa_encoders.d \
+     crypto/x509/libcrypto-lib-x509_err.d \
+     crypto/pkcs12/libcrypto-shlib-p12_init.d \
+     crypto/evp/libcrypto-lib-m_null.d crypto/bn/libcrypto-lib-bn_mod.d \
+     crypto/x509/libcrypto-lib-v3_pku.d \
+     crypto/bio/libcrypto-shlib-ossl_core_bio.d \
+     apps/lib/libapps-lib-app_x509.d crypto/libcrypto-shlib-initthread.d \
+     crypto/idea/libcrypto-lib-i_ofb64.d apps/openssl-bin-ec.d \
+     crypto/x509/libcrypto-lib-v3_enum.d \
+     crypto/x509/libcrypto-lib-v3_audit_id.d \
      crypto/thread/libcrypto-lib-internal.d \
+     crypto/rand/libcrypto-lib-rand_deprecated.d \
+     crypto/encode_decode/libcrypto-lib-encoder_err.d \
+     crypto/rsa/libcrypto-lib-rsa_pss.d crypto/evp/libcrypto-lib-legacy_wp.d \
+     providers/implementations/exchange/libdefault-lib-kdf_exch.d \
+     crypto/libcrypto-shlib-punycode.d \
+     crypto/ffc/libcrypto-lib-ffc_key_generate.d \
+     crypto/asn1/libcrypto-lib-asn1_parse.d \
+     crypto/asn1/libcrypto-lib-asn1_lib.d apps/lib/libapps-lib-apps_ui.d \
+     ssl/statem/libssl-shlib-extensions_cust.d \
+     ssl/quic/libssl-shlib-quic_record_rx.d \
+     ssl/quic/libssl-shlib-quic_statm.d crypto/bn/libcrypto-lib-bn_srp.d \
+     crypto/asn1/libcrypto-lib-tasn_fre.d \
+     crypto/http/libcrypto-shlib-http_client.d \
+     crypto/seed/libcrypto-lib-seed_cfb.d crypto/pem/libcrypto-lib-pem_lib.d \
+     crypto/x509/libcrypto-lib-v3_ind_iss.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_gcm.d \
+     crypto/asn1/libcrypto-shlib-bio_ndef.d apps/openssl-bin-s_server.d \
+     crypto/asn1/libcrypto-shlib-a_d2i_fp.d \
+     crypto/x509/libcrypto-lib-v3_utl.d crypto/comp/libcrypto-shlib-c_zlib.d \
+     crypto/asn1/libcrypto-shlib-p5_pbev2.d crypto/libssl-shlib-time.d \
+     crypto/crmf/libcrypto-shlib-crmf_err.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_tdes_wrap_hw.d \
+     crypto/ts/libcrypto-shlib-ts_req_print.d \
+     crypto/pkcs12/libcrypto-lib-p12_sbag.d \
+     ssl/quic/libssl-lib-quic_record_shared.d \
+     providers/implementations/encode_decode/libdefault-lib-decode_epki2pki.d \
+     crypto/asn1/libcrypto-shlib-tasn_enc.d \
+     crypto/ocsp/libcrypto-lib-ocsp_err.d \
+     ssl/quic/libssl-lib-quic_record_rx.d \
+     crypto/asn1/libcrypto-lib-t_bitst.d \
+     crypto/ocsp/libcrypto-shlib-ocsp_cl.d crypto/evp/libcrypto-lib-p_lib.d \
+     crypto/libcrypto-shlib-comp_methods.d \
+     crypto/pkcs12/libcrypto-shlib-p12_mutl.d \
+     crypto/pem/libcrypto-shlib-pem_x509.d \
+     crypto/evp/libcrypto-shlib-e_aria.d crypto/bn/libcrypto-shlib-bn_mod.d \
+     providers/implementations/encode_decode/libdefault-lib-decode_spki2typespki.d \
+     ssl/quic/libssl-shlib-quic_rcidm.d \
+     providers/common/der/libcommon-lib-der_ml_dsa_key.d \
+     crypto/pkcs12/libcrypto-lib-p12_mutl.d \
+     crypto/evp/libcrypto-shlib-evp_fetch.d \
+     crypto/evp/libcrypto-lib-bio_b64.d providers/libcrypto-shlib-nullprov.d \
+     ssl/statem/libssl-lib-extensions_clnt.d \
+     crypto/bio/libcrypto-lib-bss_dgram.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_ccm_hw.d \
+     crypto/pem/libcrypto-lib-pem_all.d \
+     crypto/camellia/libcrypto-shlib-cmll_ecb.d \
+     crypto/ml_kem/libcrypto-lib-ml_kem.d ssl/libssl-shlib-ssl_cert_comp.d \
+     crypto/camellia/libcrypto-shlib-cmll_cfb.d \
+     crypto/err/libcrypto-lib-err_save.d crypto/bf/liblegacy-lib-bf_ecb.d \
+     crypto/asn1/libcrypto-shlib-a_print.d \
+     crypto/x509/libcrypto-lib-x509_set.d \
+     crypto/pem/libcrypto-lib-pem_xaux.d \
+     crypto/evp/libcrypto-lib-cmeth_lib.d \
+     crypto/evp/libcrypto-shlib-p_open.d crypto/des/liblegacy-lib-xcbc_enc.d \
+     ssl/record/methods/libssl-lib-tls_common.d \
+     crypto/x509/libcrypto-shlib-v3_asid.d \
+     crypto/x509/libcrypto-lib-x_name.d ssl/quic/libssl-lib-quic_lcidm.d \
+     ssl/quic/libssl-lib-quic_reactor.d \
+     crypto/dsa/libcrypto-shlib-dsa_ossl.d \
+     crypto/evp/libcrypto-shlib-evp_rand.d \
+     crypto/x509/libcrypto-shlib-pcy_tree.d \
+     ssl/quic/libssl-shlib-quic_trace.d ssl/libssl-shlib-d1_srtp.d \
+     crypto/ct/libcrypto-shlib-ct_x509v3.d \
+     crypto/ocsp/libcrypto-lib-ocsp_http.d \
+     crypto/asn1/libcrypto-shlib-tasn_prn.d \
+     crypto/async/libcrypto-shlib-async_wait.d \
+     crypto/ts/libcrypto-shlib-ts_conf.d \
+     crypto/asn1/libcrypto-lib-a_d2i_fp.d \
+     crypto/evp/libcrypto-lib-asymcipher.d \
+     crypto/ocsp/libcrypto-lib-ocsp_cl.d \
+     crypto/asn1/libcrypto-lib-asn_mime.d \
+     crypto/idea/libcrypto-shlib-i_ecb.d crypto/ec/libcrypto-lib-ecp_mont.d \
+     ssl/record/methods/libssl-lib-tls_multib.d \
+     crypto/property/libcrypto-lib-property_query.d \
+     crypto/bn/libcrypto-shlib-bn_div.d \
+     crypto/cms/libcrypto-shlib-cms_asn1.d \
+     crypto/bn/libcrypto-shlib-bn_mpi.d crypto/cmp/libcrypto-shlib-cmp_vfy.d \
+     crypto/rsa/libcrypto-shlib-rsa_lib.d \
+     crypto/evp/libcrypto-lib-m_sigver.d crypto/evp/libcrypto-shlib-c_allc.d \
+     crypto/store/libcrypto-shlib-store_strings.d \
+     crypto/libcrypto-lib-o_dir.d ssl/record/libssl-shlib-rec_layer_s3.d \
+     crypto/x509/libcrypto-shlib-v3_tlsf.d \
+     crypto/bio/libcrypto-lib-bio_sock.d \
+     crypto/libcrypto-shlib-core_algorithm.d \
+     crypto/ct/libcrypto-shlib-ct_oct.d crypto/md5/libcrypto-lib-md5_one.d \
+     ssl/statem/libssl-shlib-statem.d crypto/sm2/libcrypto-lib-sm2_sign.d \
+     providers/common/der/libcommon-lib-der_dsa_sig.d \
+     crypto/libcrypto-lib-info.d \
+     providers/common/der/libcommon-lib-der_ml_dsa_gen.d \
+     apps/lib/libapps-lib-engine.d crypto/evp/libcrypto-lib-pbe_scrypt.d \
+     crypto/bn/libcrypto-lib-bn_sqrt.d \
+     crypto/ec/curve448/libcrypto-shlib-curve448.d \
+     crypto/bio/libcrypto-shlib-bio_sock.d \
+     crypto/ffc/libcrypto-lib-ffc_params_validate.d \
+     crypto/ec/libcrypto-lib-ec2_smpl.d \
+     ssl/record/methods/libssl-lib-tls13_meth.d ssl/libssl-shlib-bio_ssl.d \
+     crypto/x509/libcrypto-lib-x_all.d crypto/asn1/libcrypto-lib-asn1_gen.d \
+     crypto/seed/liblegacy-lib-seed_cbc.d \
+     crypto/x509/libcrypto-lib-pcy_cache.d \
+     crypto/x509/libcrypto-shlib-x509_att.d \
+     crypto/asn1/libcrypto-lib-a_bitstr.d \
+     apps/lib/libapps-lib-app_provider.d crypto/des/liblegacy-lib-ofb_enc.d \
+     crypto/des/libcrypto-shlib-cbc_cksm.d \
+     crypto/bn/libcrypto-lib-rsaz_exp_x2.d \
+     crypto/evp/libcrypto-lib-dsa_ctrl.d \
+     crypto/evp/libcrypto-shlib-kdf_meth.d ssl/quic/libssl-lib-quic_tls.d \
+     crypto/idea/libcrypto-shlib-i_cbc.d \
+     crypto/rsa/libcrypto-lib-rsa_schemes.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_ocb.d \
+     crypto/bn/libcrypto-lib-bn_gcd.d crypto/x509/libcrypto-shlib-t_req.d \
+     crypto/ml_dsa/libcrypto-lib-ml_dsa_key.d \
+     crypto/ec/libcrypto-shlib-ec_deprecated.d \
+     crypto/objects/libcrypto-shlib-o_names.d \
+     crypto/async/libcrypto-shlib-async_err.d \
+     crypto/rand/libcrypto-lib-prov_seed.d \
+     crypto/aes/libcrypto-lib-aes_ofb.d crypto/ec/libcrypto-lib-ec_oct.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_siv.d \
+     crypto/rsa/libcrypto-shlib-rsa_ameth.d \
+     crypto/buffer/libcrypto-shlib-buffer.d \
+     crypto/sha/libcrypto-lib-sha512.d crypto/evp/libcrypto-shlib-kem.d \
+     crypto/libcrypto-lib-sleep.d apps/lib/libapps-lib-log.d \
+     crypto/evp/libcrypto-lib-e_rc4_hmac_md5.d \
+     crypto/slh_dsa/libcrypto-shlib-slh_fors.d \
+     crypto/asn1/libcrypto-shlib-tasn_typ.d \
+     crypto/evp/libcrypto-lib-e_camellia.d \
+     crypto/evp/libcrypto-shlib-keymgmt_lib.d \
+     crypto/mdc2/libcrypto-lib-mdc2dgst.d \
+     crypto/conf/libcrypto-lib-conf_mod.d ssl/quic/libssl-shlib-quic_txp.d \
+     crypto/x509/libcrypto-shlib-v3_attrmap.d \
+     ssl/quic/libssl-shlib-quic_rx_depack.d \
+     crypto/siphash/libcrypto-lib-siphash.d \
+     crypto/cmp/libcrypto-lib-cmp_status.d \
+     crypto/ct/libcrypto-lib-ct_sct_ctx.d apps/openssl-bin-genrsa.d \
+     providers/implementations/kem/libdefault-lib-ecx_kem.d \
+     crypto/cmp/libcrypto-lib-cmp_util.d \
+     crypto/x509/libcrypto-lib-x509name.d \
+     crypto/thread/arch/libcrypto-shlib-thread_none.d \
+     apps/openssl-bin-ciphers.d crypto/ocsp/libcrypto-shlib-ocsp_prn.d \
+     crypto/dsa/libcrypto-shlib-dsa_sign.d \
+     crypto/http/libcrypto-shlib-http_lib.d apps/openssl-bin-pkeyparam.d \
+     crypto/x509/libcrypto-shlib-x_attrib.d \
+     crypto/des/libcrypto-lib-cbc_cksm.d apps/openssl-bin-pkcs12.d \
+     crypto/libcrypto-lib-params.d crypto/evp/libcrypto-shlib-legacy_wp.d \
+     providers/implementations/kdfs/libdefault-lib-sshkdf.d \
+     crypto/pkcs12/libcrypto-lib-p12_crt.d \
+     crypto/dh/libcrypto-shlib-dh_pmeth.d \
+     crypto/camellia/libcrypto-lib-cmll_misc.d \
+     crypto/x509/libcrypto-shlib-v3_pmaps.d \
+     crypto/ec/libcrypto-shlib-ecp_mont.d \
+     providers/implementations/ciphers/libcommon-lib-ciphercommon_ccm_hw.d \
+     crypto/des/liblegacy-lib-fcrypt_b.d crypto/libcrypto-lib-mem_sec.d \
+     ssl/libssl-shlib-tls13_enc.d crypto/evp/libcrypto-shlib-c_alld.d \
+     crypto/x509/libcrypto-shlib-v3_pcia.d \
+     providers/implementations/exchange/libdefault-lib-dh_exch.d \
+     crypto/bio/libcrypto-lib-bss_acpt.d crypto/ec/libcrypto-lib-ec_pmeth.d \
+     crypto/des/liblegacy-lib-ofb64ede.d \
+     crypto/cms/libcrypto-shlib-cms_enc.d \
+     apps/lib/libapps-lib-apps_opt_printf.d \
+     crypto/x509/libcrypto-shlib-x509_trust.d \
+     crypto/cmp/libcrypto-shlib-cmp_ctx.d \
+     crypto/modes/libcrypto-shlib-ccm128.d \
+     crypto/rand/libcrypto-shlib-rand_pool.d \
+     crypto/ct/libcrypto-shlib-ct_prn.d \
+     crypto/ripemd/libcrypto-lib-rmd_dgst.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_gcm_siv.d \
+     crypto/ocsp/libcrypto-shlib-ocsp_srv.d \
+     providers/implementations/kdfs/libdefault-lib-tls1_prf.d \
+     crypto/sha/libcrypto-shlib-sha3.d \
+     crypto/hashtable/libcrypto-shlib-hashtable.d \
+     crypto/evp/libcrypto-shlib-bio_ok.d \
+     crypto/x509/libcrypto-shlib-pcy_map.d \
+     providers/implementations/signature/libdefault-lib-ml_dsa_sig.d \
+     crypto/thread/arch/libssl-shlib-thread_posix.d \
+     crypto/crmf/libcrypto-shlib-crmf_asn.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aria_gcm_hw.d \
+     crypto/dso/libcrypto-shlib-dso_vms.d ssl/libssl-shlib-ssl_stat.d \
+     crypto/x509/libcrypto-shlib-v3_soa_id.d \
+     providers/implementations/ciphers/libcommon-lib-ciphercommon_block.d \
+     apps/openssl-bin-asn1parse.d crypto/bio/libcrypto-lib-bss_log.d \
+     crypto/modes/libcrypto-shlib-cts128.d \
+     crypto/bio/libcrypto-lib-bio_meth.d crypto/libcrypto-lib-threads_none.d \
+     crypto/ec/curve448/libcrypto-lib-curve448.d \
+     crypto/comp/libcrypto-lib-c_zlib.d crypto/x509/libcrypto-lib-v3_admis.d \
+     crypto/store/libcrypto-lib-store_err.d crypto/libcrypto-lib-o_str.d \
+     ssl/record/methods/libssl-shlib-tls13_meth.d \
+     crypto/asn1/libcrypto-shlib-asn1_lib.d \
+     crypto/err/libcrypto-lib-err_mark.d crypto/asn1/libcrypto-lib-a_sign.d \
+     crypto/dh/libcrypto-lib-dh_kdf.d crypto/objects/libcrypto-lib-obj_lib.d \
+     crypto/ffc/libcrypto-shlib-ffc_params.d \
+     crypto/x509/libcrypto-shlib-v3_utf8.d crypto/libcrypto-shlib-cryptlib.d \
+     ssl/libssl-lib-d1_lib.d ssl/quic/libssl-lib-quic_demux.d \
+     crypto/x509/libcrypto-shlib-x_x509.d \
+     crypto/x509/libcrypto-lib-v3_pcons.d \
+     crypto/ui/libcrypto-shlib-ui_util.d \
+     crypto/x509/libcrypto-shlib-v3_int.d crypto/x509/libcrypto-lib-v3_ia5.d \
+     crypto/pkcs12/libcrypto-lib-p12_p8e.d \
+     crypto/modes/libcrypto-shlib-ctr128.d \
+     crypto/x509/libcrypto-shlib-pcy_lib.d \
+     crypto/asn1/libcrypto-lib-x_pkey.d crypto/bio/libcrypto-lib-bf_null.d \
+     crypto/cmp/libcrypto-lib-cmp_msg.d crypto/bn/libcrypto-shlib-bn_recp.d \
+     crypto/dh/libcrypto-shlib-dh_backend.d \
+     crypto/modes/libcrypto-shlib-wrap128.d \
+     crypto/dso/libcrypto-lib-dso_dl.d \
+     crypto/x509/libcrypto-shlib-x509_set.d \
+     crypto/x509/libcrypto-shlib-v3_conf.d apps/openssl-bin-rand.d \
+     providers/implementations/encode_decode/libdefault-lib-encode_key2ms.d \
+     ssl/libssl-shlib-priority_queue.d \
+     providers/common/der/libcommon-lib-der_dsa_key.d \
+     crypto/x509/libcrypto-shlib-v3_info.d ssl/libssl-shlib-pqueue.d \
+     crypto/dso/libcrypto-shlib-dso_dlfcn.d \
+     crypto/rand/libcrypto-lib-rand_pool.d \
+     crypto/modes/libcrypto-lib-xts128.d crypto/libcrypto-shlib-o_fopen.d \
+     ssl/quic/libssl-shlib-quic_srtm.d \
+     providers/implementations/ciphers/libcommon-lib-ciphercommon_ccm.d \
+     crypto/cmp/libcrypto-shlib-cmp_server.d \
+     crypto/x509/libcrypto-shlib-v3_admis.d \
+     crypto/ec/libcrypto-shlib-ec_pmeth.d \
+     crypto/pkcs12/libcrypto-shlib-p12_crpt.d \
+     crypto/x509/libcrypto-lib-x509_vpm.d \
+     crypto/asn1/libcrypto-shlib-a_time.d \
+     ssl/quic/libssl-shlib-quic_method.d \
+     crypto/sm3/libcrypto-lib-legacy_sm3.d ssl/libssl-shlib-ssl_rsa.d \
+     crypto/evp/libcrypto-shlib-evp_lib.d crypto/x509/libcrypto-lib-t_x509.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_ocb_hw.d \
+     crypto/evp/libcrypto-lib-c_allc.d apps/openssl-bin-rsa.d \
+     crypto/asn1/libcrypto-lib-d2i_pr.d \
+     ssl/record/methods/libssl-lib-tls1_meth.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_sm4_ccm_hw.d \
+     crypto/ec/libcrypto-shlib-ec_lib.d crypto/des/liblegacy-lib-des_enc.d \
+     crypto/libcrypto-shlib-defaults.d \
+     crypto/camellia/libcrypto-lib-cmll_ofb.d \
+     providers/implementations/signature/libdefault-lib-rsa_sig.d \
+     crypto/evp/libcrypto-lib-e_cast.d \
+     providers/implementations/kdfs/liblegacy-lib-pbkdf1.d \
+     crypto/ct/libcrypto-shlib-ct_sct_ctx.d \
+     crypto/bn/libcrypto-shlib-rsaz_exp_x2.d \
+     crypto/asn1/libcrypto-shlib-x_val.d crypto/evp/libcrypto-lib-e_idea.d \
+     crypto/ocsp/libcrypto-lib-ocsp_vfy.d ssl/quic/libssl-shlib-quic_ackm.d \
+     ssl/libssl-shlib-s3_enc.d ssl/rio/libssl-lib-poll_immediate.d \
+     crypto/thread/arch/libcrypto-shlib-thread_posix.d \
+     crypto/x509/libcrypto-shlib-v3_akeya.d \
+     crypto/asn1/libcrypto-lib-a_gentm.d crypto/ct/libcrypto-lib-ct_sct.d \
+     apps/lib/libapps-lib-app_libctx.d crypto/x509/libcrypto-shlib-t_crl.d \
+     providers/libcrypto-lib-prov_running.d \
+     crypto/bio/libcrypto-lib-bss_null.d \
+     providers/implementations/digests/libdefault-lib-blake2b_prov.d \
+     crypto/evp/libcrypto-shlib-legacy_ripemd.d \
+     crypto/x509/libcrypto-shlib-v3_bitst.d \
+     crypto/asn1/libcrypto-lib-p5_scrypt.d \
+     crypto/ec/libcrypto-lib-ecp_smpl.d \
+     crypto/ml_dsa/libcrypto-shlib-ml_dsa_sign.d \
+     apps/lib/openssl-bin-cmp_mock_srv.d \
+     crypto/idea/libcrypto-shlib-i_ofb64.d \
+     crypto/bio/libcrypto-shlib-bf_lbuf.d \
+     crypto/asn1/libcrypto-lib-bio_ndef.d \
+     crypto/bio/libcrypto-shlib-bss_dgram_pair.d apps/openssl-bin-s_client.d \
+     crypto/x509/libcrypto-lib-v3_extku.d apps/openssl-bin-pkey.d \
+     crypto/asn1/libcrypto-lib-a_strnid.d crypto/sm4/libcrypto-shlib-sm4.d \
+     providers/common/der/libdefault-lib-der_sm2_sig.d \
+     crypto/evp/libcrypto-lib-c_alld.d \
+     crypto/x509/libcrypto-lib-v3_no_rev_avail.d \
+     crypto/ts/libcrypto-shlib-ts_rsp_sign.d \
+     crypto/conf/libcrypto-lib-conf_ssl.d \
+     crypto/x509/libcrypto-lib-x_pubkey.d \
+     crypto/asn1/libcrypto-shlib-a_digest.d \
+     crypto/modes/libcrypto-lib-cts128.d crypto/x509/libcrypto-lib-v3_sda.d \
+     ssl/statem/libssl-lib-extensions_cust.d \
+     crypto/asn1/libcrypto-lib-a_digest.d \
+     crypto/evp/libcrypto-shlib-evp_pkey.d \
+     crypto/rc2/liblegacy-lib-rc2cfb64.d \
+     crypto/asn1/libcrypto-shlib-asn_pack.d \
+     crypto/cms/libcrypto-shlib-cms_att.d crypto/evp/libcrypto-lib-evp_cnf.d \
+     crypto/evp/libcrypto-lib-e_seed.d \
+     crypto/x509/libcrypto-shlib-x509_vpm.d \
+     crypto/property/libcrypto-shlib-property.d \
+     crypto/async/arch/libcrypto-shlib-async_win.d \
+     crypto/modes/libcrypto-lib-cfb128.d \
+     crypto/ec/libcrypto-lib-ec_backend.d \
+     ssl/quic/libssl-shlib-qlog_event_helpers.d ssl/libssl-lib-pqueue.d \
+     crypto/asn1/libcrypto-shlib-evp_asn1.d \
+     crypto/x509/libcrypto-shlib-pcy_node.d \
+     crypto/ec/libcrypto-shlib-ecdsa_vrf.d \
+     crypto/conf/libcrypto-lib-conf_err.d \
+     providers/common/der/libcommon-lib-der_wrap_gen.d \
+     crypto/async/libcrypto-shlib-async.d \
+     crypto/camellia/libcrypto-lib-cmll_ecb.d \
+     crypto/ui/libcrypto-lib-ui_null.d ssl/quic/libssl-shlib-quic_tls.d \
+     crypto/des/liblegacy-lib-set_key.d crypto/ui/libcrypto-lib-ui_util.d \
+     crypto/libcrypto-shlib-cversion.d \
+     providers/implementations/digests/libdefault-lib-md5_sha1_prov.d \
+     ssl/libssl-lib-tls_srp.d crypto/aes/libcrypto-shlib-aes_cfb.d \
+     crypto/asn1/libcrypto-shlib-tasn_fre.d \
+     ssl/record/methods/libssl-shlib-tlsany_meth.d \
+     crypto/ec/libcrypto-shlib-ecp_oct.d \
+     crypto/property/libcrypto-shlib-defn_cache.d \
+     crypto/asn1/libcrypto-lib-f_int.d crypto/rsa/libcrypto-shlib-rsa_mp.d \
+     crypto/modes/libcrypto-lib-ctr128.d \
+     crypto/bio/libcrypto-shlib-bss_conn.d \
+     crypto/asn1/libcrypto-lib-t_pkey.d \
+     providers/implementations/keymgmt/libdefault-lib-ecx_kmgmt.d \
+     crypto/ml_dsa/libcrypto-shlib-ml_dsa_key.d \
+     crypto/idea/libcrypto-lib-i_ecb.d crypto/aes/libcrypto-lib-aes_ecb.d \
+     crypto/libcrypto-shlib-bsearch.d crypto/x509/libcrypto-lib-x509spki.d \
+     crypto/poly1305/libcrypto-lib-poly1305.d ssl/libssl-shlib-ssl_cert.d \
+     crypto/x509/libcrypto-shlib-v3_skid.d \
+     crypto/x509/libcrypto-lib-t_acert.d \
+     crypto/asn1/libcrypto-lib-tasn_new.d \
+     crypto/des/libcrypto-lib-cfb64ede.d crypto/bn/libcrypto-shlib-bn_ctx.d \
+     crypto/cmac/libcrypto-shlib-cmac.d crypto/md5/liblegacy-lib-md5_sha1.d \
+     ssl/quic/libssl-lib-cc_newreno.d crypto/x509/libcrypto-lib-pcy_data.d \
+     crypto/property/libcrypto-lib-property_parse.d \
+     crypto/store/libcrypto-shlib-store_result.d \
+     crypto/dsa/libcrypto-shlib-dsa_err.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_chacha20_hw.d \
+     crypto/dh/libcrypto-lib-dh_asn1.d \
+     providers/implementations/digests/liblegacy-lib-md4_prov.d \
+     crypto/libcrypto-lib-threads_win.d crypto/bn/libcrypto-shlib-bn_exp.d \
+     crypto/md4/libcrypto-shlib-md4_one.d \
+     ssl/quic/libssl-lib-quic_stream_map.d \
+     crypto/x509/libcrypto-lib-v3_crld.d crypto/asn1/libcrypto-lib-a_mbstr.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_rc2_hw.d \
+     crypto/ec/libcrypto-shlib-ec_ameth.d \
+     crypto/slh_dsa/libcrypto-shlib-slh_params.d \
+     crypto/bf/libcrypto-lib-bf_cfb64.d \
+     crypto/bio/libcrypto-shlib-bss_core.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_sm4_xts.d \
+     crypto/property/libcrypto-shlib-property_parse.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_sm4.d \
+     crypto/ec/libcrypto-lib-ecdh_ossl.d crypto/async/libcrypto-lib-async.d \
+     crypto/conf/libcrypto-shlib-conf_mall.d \
+     crypto/cms/libcrypto-shlib-cms_rsa.d crypto/asn1/libcrypto-lib-t_spki.d \
+     crypto/siphash/libssl-shlib-siphash.d \
+     crypto/x509/libcrypto-lib-x509_cmp.d \
+     crypto/asn1/libcrypto-shlib-t_spki.d ssl/quic/libssl-lib-quic_srt_gen.d \
+     crypto/x509/libcrypto-lib-x509_txt.d crypto/err/libcrypto-lib-err_all.d \
+     crypto/ec/libcrypto-shlib-ec_asn1.d \
+     crypto/hashtable/libssl-shlib-hashfunc.d \
+     crypto/evp/libcrypto-shlib-e_rc5.d apps/openssl-bin-ocsp.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_tdes_hw.d \
+     crypto/x509/libcrypto-lib-v3_pmaps.d \
+     crypto/dh/libcrypto-shlib-dh_rfc5114.d \
+     crypto/asn1/libcrypto-lib-x_info.d \
+     crypto/asn1/libcrypto-shlib-asn1_item_list.d \
+     crypto/bio/libcrypto-lib-bio_lib.d crypto/cms/libcrypto-lib-cms_env.d \
+     ssl/libssl-lib-t1_trce.d crypto/evp/libcrypto-lib-ec_ctrl.d \
+     crypto/ffc/libcrypto-lib-ffc_key_validate.d \
+     crypto/evp/libcrypto-shlib-legacy_mdc2.d \
+     crypto/x509/libcrypto-shlib-x509name.d \
+     crypto/async/arch/libcrypto-lib-async_posix.d \
+     crypto/asn1/libcrypto-lib-a_octet.d \
+     crypto/evp/libcrypto-shlib-exchange.d \
+     crypto/bn/asm/libcrypto-lib-x86_64-gcc.d \
+     providers/common/der/libcommon-lib-der_rsa_key.d \
+     crypto/x509/libcrypto-shlib-v3_authattid.d \
+     crypto/md4/liblegacy-lib-md4_dgst.d crypto/x509/libcrypto-lib-v3_tlsf.d \
+     crypto/ec/libcrypto-lib-ecdh_kdf.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_rc4_hw.d \
+     crypto/ocsp/libcrypto-lib-ocsp_ext.d \
+     crypto/sm3/libcrypto-shlib-legacy_sm3.d \
+     crypto/cast/libcrypto-lib-c_cfb64.d \
+     ssl/quic/libssl-shlib-quic_reactor_wait_ctx.d \
+     providers/implementations/encode_decode/libdefault-lib-encode_key2text.d \
+     crypto/evp/libcrypto-lib-legacy_md4.d \
+     crypto/hashtable/libcrypto-lib-hashtable.d apps/openssl-bin-enc.d \
+     crypto/cms/libcrypto-lib-cms_sd.d \
+     ssl/statem/libssl-shlib-extensions_clnt.d \
+     crypto/x509/libcrypto-shlib-v3_prn.d crypto/bn/libcrypto-lib-bn_sqr.d \
+     crypto/evp/libcrypto-shlib-asymcipher.d apps/openssl-bin-info.d \
+     crypto/des/libcrypto-lib-qud_cksm.d ssl/libssl-lib-priority_queue.d \
+     crypto/evp/libcrypto-shlib-e_xcbc_d.d \
+     crypto/comp/libcrypto-shlib-comp_lib.d \
+     providers/implementations/kdfs/libdefault-lib-kbkdf.d \
+     crypto/x509/libcrypto-lib-x509cset.d \
+     crypto/cmp/libcrypto-lib-cmp_http.d \
+     crypto/asn1/libcrypto-shlib-a_mbstr.d \
+     crypto/evp/libcrypto-shlib-bio_md.d \
+     providers/implementations/rands/libdefault-lib-drbg.d \
+     ssl/record/methods/libssl-lib-dtls_meth.d \
+     crypto/libcrypto-lib-asn1_dsa.d crypto/pkcs12/libcrypto-shlib-p12_p8d.d \
+     crypto/asn1/libcrypto-shlib-a_utf8.d \
+     crypto/ec/libcrypto-shlib-ec2_smpl.d \
+     crypto/rsa/libcrypto-shlib-rsa_crpt.d \
+     crypto/store/libcrypto-lib-store_result.d \
+     crypto/bio/libcrypto-lib-ossl_core_bio.d \
+     crypto/evp/libcrypto-shlib-e_rc4_hmac_md5.d \
+     crypto/conf/libcrypto-shlib-conf_def.d \
+     providers/implementations/kem/libdefault-lib-ml_kem_kem.d \
+     crypto/libcrypto-shlib-ex_data.d crypto/seed/liblegacy-lib-seed_ecb.d \
+     ssl/libssl-lib-s3_msg.d crypto/pkcs12/libcrypto-lib-p12_init.d \
+     crypto/seed/liblegacy-lib-seed_ofb.d apps/openssl-bin-version.d \
+     crypto/des/libcrypto-lib-str2key.d \
+     crypto/rsa/libcrypto-shlib-rsa_schemes.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_gcm_siv_polyval.d \
+     crypto/bf/libcrypto-lib-bf_ofb64.d crypto/modes/libcrypto-lib-wrap128.d \
+     crypto/asn1/libcrypto-lib-d2i_param.d \
+     crypto/slh_dsa/libcrypto-shlib-slh_adrs.d \
+     ssl/record/methods/libssl-shlib-tls_pad.d \
+     crypto/bio/libcrypto-shlib-bss_bio.d \
+     crypto/x509/libcrypto-shlib-x509_obj.d \
+     crypto/ui/libcrypto-shlib-ui_err.d \
+     crypto/comp/libcrypto-shlib-c_brotli.d \
+     crypto/pkcs7/libcrypto-lib-pk7_smime.d \
+     crypto/evp/libcrypto-lib-p_legacy.d \
+     crypto/asn1/libcrypto-shlib-asn_moid.d \
+     ssl/quic/libssl-shlib-quic_lcidm.d \
+     crypto/rsa/libcrypto-shlib-rsa_backend.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_tdes_wrap.d \
+     crypto/asn1/libcrypto-shlib-x_sig.d \
+     crypto/ec/libcrypto-lib-ecdsa_sign.d crypto/bn/libcrypto-lib-bn_word.d \
+     crypto/bio/libcrypto-shlib-bss_sock.d \
+     crypto/md5/liblegacy-lib-md5_dgst.d \
+     crypto/ocsp/libcrypto-lib-ocsp_prn.d apps/openssl-bin-openssl.d \
+     crypto/dsa/libcrypto-lib-dsa_asn1.d crypto/x509/libcrypto-shlib-v3err.d \
+     crypto/evp/libcrypto-shlib-mac_lib.d \
+     crypto/ec/libcrypto-lib-ecdsa_vrf.d \
+     crypto/asn1/libcrypto-lib-asn1_item_list.d \
+     crypto/http/libcrypto-shlib-http_err.d \
+     crypto/sm2/libcrypto-shlib-sm2_key.d \
+     crypto/conf/libcrypto-lib-conf_api.d crypto/bn/libcrypto-lib-rsaz_exp.d \
+     crypto/x509/libcrypto-shlib-v3_group_ac.d \
+     crypto/rsa/libcrypto-shlib-rsa_sp800_56b_gen.d \
+     crypto/ess/libcrypto-lib-ess_err.d \
+     crypto/rand/libcrypto-shlib-rand_err.d \
+     crypto/pkcs7/libcrypto-lib-pk7_doit.d \
+     ssl/quic/libssl-shlib-quic_wire_pkt.d \
+     providers/implementations/exchange/libdefault-lib-ecdh_exch.d \
+     crypto/cmp/libcrypto-shlib-cmp_hdr.d \
+     crypto/evp/libcrypto-shlib-e_aes_cbc_hmac_sha1.d \
+     crypto/x509/libcrypto-shlib-x509_txt.d \
+     providers/implementations/keymgmt/libtemplate-lib-template_kmgmt.d \
+     crypto/bn/libcrypto-shlib-rsaz_exp.d \
+     providers/implementations/digests/libdefault-lib-blake2_prov.d \
+     ssl/quic/libssl-shlib-quic_thread_assist.d \
+     ssl/record/methods/libdefault-lib-ssl3_cbc.d \
+     crypto/pem/libcrypto-shlib-pem_lib.d crypto/cmp/libcrypto-lib-cmp_hdr.d \
+     crypto/cast/libcrypto-shlib-c_enc.d \
+     crypto/evp/libcrypto-shlib-evp_pbe.d crypto/cms/libcrypto-lib-cms_cd.d \
+     ssl/quic/libssl-shlib-uint_set.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_rc4.d \
+     providers/implementations/digests/libdefault-lib-sha3_prov.d \
+     ssl/statem/libssl-shlib-extensions_srvr.d \
+     crypto/des/liblegacy-lib-rand_key.d \
+     providers/implementations/digests/libdefault-lib-ripemd_prov.d \
+     crypto/bn/libcrypto-lib-bn_rsa_fips186_4.d \
+     crypto/bf/liblegacy-lib-bf_enc.d ssl/libssl-shlib-ssl_mcnf.d \
+     crypto/asn1/libcrypto-shlib-nsseq.d ssl/rio/libssl-lib-rio_notifier.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_chacha20.d \
+     providers/implementations/rands/libdefault-lib-drbg_hmac.d \
+     ssl/rio/libssl-shlib-poll_immediate.d crypto/evp/libcrypto-lib-e_rc4.d \
+     crypto/kdf/libcrypto-shlib-kdf_err.d \
+     providers/implementations/macs/libdefault-lib-blake2s_mac.d \
+     crypto/des/liblegacy-lib-ecb_enc.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_rc2.d \
+     crypto/bn/libcrypto-lib-bn_rand.d crypto/libcrypto-lib-threads_lib.d \
+     providers/implementations/rands/seeding/libdefault-lib-rand_unix.d \
+     crypto/pkcs12/libcrypto-lib-p12_decr.d \
+     crypto/evp/libcrypto-shlib-e_des3.d crypto/cms/libcrypto-lib-cms_dh.d \
+     crypto/evp/libcrypto-lib-names.d crypto/rsa/libcrypto-lib-rsa_saos.d \
+     crypto/ocsp/libcrypto-shlib-ocsp_asn.d \
+     crypto/pkcs12/libcrypto-shlib-p12_key.d \
+     crypto/bn/libcrypto-lib-bn_print.d crypto/dso/libcrypto-lib-dso_vms.d \
+     crypto/cmp/libcrypto-shlib-cmp_http.d ssl/libssl-shlib-methods.d \
+     apps/lib/libapps-lib-names.d \
+     ssl/quic/libssl-lib-quic_reactor_wait_ctx.d \
+     crypto/idea/liblegacy-lib-i_skey.d \
+     crypto/libcrypto-shlib-provider_conf.d \
+     crypto/ec/libcrypto-lib-ecx_meth.d \
+     providers/libcrypto-shlib-defltprov.d \
+     crypto/x509/libcrypto-shlib-x509aset.d \
+     crypto/rsa/libcrypto-lib-rsa_ameth.d crypto/bio/libcrypto-lib-bio_err.d \
+     crypto/hpke/libcrypto-shlib-hpke.d crypto/evp/libcrypto-shlib-kdf_lib.d \
+     ssl/quic/libssl-shlib-quic_fc.d crypto/libcrypto-lib-cversion.d \
+     crypto/pem/libcrypto-shlib-pem_err.d \
+     crypto/pkcs7/libcrypto-lib-pkcs7err.d \
+     crypto/des/libcrypto-shlib-ofb64ede.d \
+     providers/implementations/ciphers/libcommon-lib-ciphercommon.d \
+     crypto/x509/libcrypto-lib-v3_bitst.d \
+     crypto/x509/libcrypto-lib-v3_ac_tgt.d \
+     crypto/ripemd/liblegacy-lib-rmd_one.d crypto/libcrypto-shlib-params.d \
+     ssl/libssl-lib-ssl_utst.d crypto/bn/libcrypto-shlib-bn_dh.d \
+     crypto/x509/libcrypto-lib-x_crl.d crypto/des/libcrypto-shlib-rand_key.d \
+     crypto/cmp/libcrypto-lib-cmp_client.d \
+     crypto/evp/libcrypto-lib-skeymgmt_meth.d crypto/libcrypto-lib-context.d \
+     ssl/record/libssl-lib-rec_layer_s3.d \
+     crypto/pem/libcrypto-shlib-pem_all.d \
+     crypto/ml_dsa/libcrypto-lib-ml_dsa_params.d \
+     crypto/cms/libcrypto-lib-cms_enc.d crypto/bn/libcrypto-lib-bn_add.d \
+     crypto/x509/libcrypto-lib-v3_cpols.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_tdes.d \
+     crypto/evp/libcrypto-shlib-pmeth_gn.d crypto/evp/libcrypto-lib-p_open.d \
+     crypto/objects/libcrypto-shlib-obj_dat.d \
+     crypto/x509/libcrypto-lib-v3_group_ac.d \
+     crypto/ec/libcrypto-lib-ec_mult.d \
+     crypto/asn1/libcrypto-shlib-tasn_new.d \
+     crypto/thread/libcrypto-shlib-arch.d \
+     ssl/statem/libssl-shlib-statem_dtls.d crypto/legacy-dso-ctype.d \
+     crypto/x509/libcrypto-shlib-v3_purp.d \
+     crypto/x509/libcrypto-shlib-by_file.d ssl/libssl-shlib-ssl_utst.d \
+     providers/common/der/libdefault-lib-der_rsa_sig.d \
+     providers/implementations/rands/libdefault-lib-drbg_ctr.d \
+     crypto/rsa/libcrypto-lib-rsa_meth.d crypto/x509/libcrypto-lib-v3_addr.d \
+     crypto/whrlpool/libcrypto-shlib-wp_dgst.d \
+     crypto/bn/libcrypto-shlib-bn_mont.d \
+     crypto/slh_dsa/libcrypto-shlib-slh_hash.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_cbc_hmac_sha.d \
+     crypto/asn1/libcrypto-shlib-asn1_parse.d \
+     crypto/mdc2/liblegacy-lib-mdc2dgst.d \
+     crypto/x509/libcrypto-shlib-x509_lu.d \
+     crypto/ts/libcrypto-shlib-ts_req_utils.d \
+     crypto/property/libcrypto-lib-property_err.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_idea_hw.d \
+     crypto/pkcs12/libcrypto-shlib-p12_crt.d \
+     crypto/des/libcrypto-shlib-cfb64enc.d ssl/quic/libssl-lib-quic_srtm.d \
+     crypto/thread/libcrypto-shlib-internal.d \
+     crypto/dh/libcrypto-shlib-dh_err.d \
+     crypto/rsa/libcrypto-lib-rsa_backend.d crypto/dh/libcrypto-lib-dh_gen.d \
+     crypto/ec/curve448/libcrypto-shlib-eddsa.d \
+     crypto/err/libcrypto-shlib-err.d crypto/conf/libcrypto-lib-conf_lib.d \
+     crypto/evp/libcrypto-lib-evp_lib.d crypto/x509/libcrypto-lib-v3_akid.d \
+     crypto/sha/libcrypto-shlib-sha512.d \
+     crypto/dsa/libcrypto-shlib-dsa_meth.d crypto/asn1/libcrypto-lib-a_int.d \
+     crypto/libcrypto-shlib-o_init.d crypto/evp/libcrypto-lib-ec_support.d \
+     apps/openssl-bin-verify.d crypto/x509/libcrypto-shlib-x509_err.d \
+     providers/implementations/kdfs/libdefault-lib-pkcs12kdf.d \
+     crypto/rsa/libcrypto-shlib-rsa_pss.d apps/openssl-bin-nseq.d \
+     ssl/quic/libssl-shlib-quic_record_util.d \
+     crypto/ts/libcrypto-lib-ts_req_utils.d \
+     crypto/asn1/libcrypto-lib-tasn_typ.d \
+     crypto/camellia/libcrypto-lib-cmll_ctr.d \
+     crypto/ffc/libcrypto-lib-ffc_backend.d \
+     crypto/cmp/libcrypto-shlib-cmp_err.d crypto/rc2/libcrypto-lib-rc2_ecb.d \
+     crypto/x509/libcrypto-lib-by_dir.d \
+     crypto/x509/libcrypto-shlib-v3_no_ass.d \
+     crypto/sm3/libcrypto-shlib-sm3.d crypto/evp/libcrypto-lib-bio_enc.d \
+     crypto/evp/libcrypto-lib-digest.d \
+     providers/common/der/libcommon-lib-der_ec_key.d \
+     providers/common/libcommon-lib-provider_err.d \
+     crypto/ct/libcrypto-lib-ct_log.d \
+     providers/implementations/exchange/libdefault-lib-ecx_exch.d \
+     crypto/http/libcrypto-lib-http_lib.d \
+     crypto/dsa/libcrypto-shlib-dsa_pmeth.d \
+     crypto/bn/libcrypto-lib-bn_conv.d \
+     crypto/asn1/libcrypto-shlib-a_bitstr.d crypto/aria/libcrypto-lib-aria.d \
+     crypto/sm2/libcrypto-lib-sm2_key.d \
+     crypto/pkcs12/libcrypto-lib-p12_key.d \
+     crypto/whrlpool/liblegacy-lib-wp_dgst.d ssl/quic/libssl-lib-quic_cfq.d \
+     crypto/camellia/libcrypto-shlib-cmll_ctr.d crypto/libcrypto-lib-time.d \
+     crypto/asn1/libcrypto-shlib-p8_pkey.d \
+     crypto/lhash/libcrypto-shlib-lh_stats.d \
+     crypto/modes/libcrypto-lib-gcm128.d crypto/libcrypto-shlib-quic_vlint.d \
+     providers/common/liblegacy-lib-provider_util.d \
+     crypto/conf/libcrypto-lib-conf_mall.d \
+     crypto/x509/libcrypto-shlib-v3_aaa.d \
+     crypto/modes/libcrypto-shlib-cfb128.d \
+     crypto/evp/libcrypto-shlib-keymgmt_meth.d \
+     crypto/evp/libcrypto-lib-legacy_mdc2.d crypto/bn/libcrypto-lib-bn_exp.d \
+     crypto/evp/libcrypto-lib-e_aes.d ssl/quic/libssl-shlib-quic_wire.d \
+     crypto/camellia/libcrypto-lib-cmll_cfb.d \
+     crypto/x509/libcrypto-shlib-x509_d2.d \
+     crypto/libcrypto-lib-provider_conf.d \
+     crypto/bio/libcrypto-lib-bss_dgram_pair.d \
+     crypto/bf/libcrypto-shlib-bf_cfb64.d crypto/evp/libcrypto-lib-e_aria.d \
+     crypto/rsa/libcrypto-lib-rsa_pmeth.d \
+     crypto/evp/libcrypto-lib-legacy_blake2.d \
+     crypto/bf/liblegacy-lib-bf_skey.d crypto/rc2/libcrypto-shlib-rc2_ecb.d \
+     ssl/quic/libssl-shlib-quic_types.d apps/openssl-bin-cms.d \
+     providers/implementations/signature/libdefault-lib-dsa_sig.d \
+     crypto/libcrypto-lib-ebcdic.d crypto/md4/libcrypto-shlib-md4_dgst.d \
+     ssl/quic/libssl-shlib-quic_stream_map.d \
+     crypto/ec/libcrypto-shlib-curve25519.d \
+     crypto/des/liblegacy-lib-pcbc_enc.d ssl/quic/libssl-shlib-json_enc.d \
+     crypto/hpke/libcrypto-shlib-hpke_util.d \
+     crypto/x509/libcrypto-lib-v3_authattid.d \
+     crypto/idea/liblegacy-lib-i_ofb64.d \
+     crypto/rc2/libcrypto-shlib-rc2_cbc.d \
+     providers/implementations/macs/libdefault-lib-hmac_prov.d \
+     crypto/x509/libcrypto-shlib-t_acert.d \
+     crypto/x509/libcrypto-lib-v3_attrmap.d \
+     providers/common/libdefault-lib-securitycheck_default.d \
+     crypto/ec/libcrypto-shlib-ec_mult.d crypto/evp/libcrypto-lib-bio_md.d \
+     crypto/rsa/libcrypto-lib-rsa_none.d \
+     ssl/quic/libssl-shlib-quic_sf_list.d \
+     crypto/rsa/libcrypto-lib-rsa_crpt.d \
+     crypto/evp/libcrypto-lib-legacy_ripemd.d \
+     crypto/pem/libcrypto-lib-pem_x509.d \
+     crypto/pkcs12/libcrypto-shlib-p12_sbag.d \
+     crypto/rsa/libcrypto-lib-rsa_err.d crypto/bn/libcrypto-shlib-bn_err.d \
+     crypto/bn/libcrypto-shlib-bn_intern.d \
+     crypto/asn1/libcrypto-shlib-x_int64.d \
+     crypto/des/libcrypto-shlib-fcrypt_b.d crypto/libcrypto-lib-uid.d \
+     providers/implementations/macs/libdefault-lib-blake2b_mac.d \
+     crypto/md5/libcrypto-shlib-md5_sha1.d ssl/quic/libssl-lib-quic_ackm.d \
+     crypto/rsa/libcrypto-shlib-rsa_mp_names.d \
+     crypto/rand/libcrypto-shlib-rand_lib.d \
+     crypto/ffc/libcrypto-lib-ffc_dh.d ssl/quic/libssl-lib-uint_set.d \
+     crypto/des/libcrypto-shlib-set_key.d \
+     crypto/bio/libcrypto-shlib-bio_print.d ssl/libssl-lib-t1_lib.d \
+     crypto/camellia/libcrypto-shlib-cmll_ofb.d \
+     crypto/x509/libcrypto-shlib-v3_no_rev_avail.d \
+     crypto/rc2/libcrypto-lib-rc2_skey.d crypto/bf/libcrypto-shlib-bf_ecb.d \
+     ssl/libssl-lib-d1_msg.d crypto/bio/libcrypto-shlib-bio_dump.d \
+     crypto/libcrypto-lib-mem.d \
+     crypto/rand/libcrypto-shlib-rand_deprecated.d \
+     providers/liblegacy-lib-prov_running.d crypto/bn/libcrypto-lib-bn_mul.d \
+     crypto/slh_dsa/libcrypto-lib-slh_xmss.d \
+     crypto/des/libcrypto-shlib-xcbc_enc.d ssl/libssl-shlib-ssl_err_legacy.d \
+     crypto/evp/libcrypto-lib-kdf_meth.d ssl/quic/libssl-shlib-quic_demux.d \
+     crypto/libcrypto-shlib-init.d crypto/rand/libcrypto-lib-rand_uniform.d \
+     crypto/err/libcrypto-lib-err_prn.d crypto/cmp/libcrypto-lib-cmp_genm.d \
+     apps/openssl-bin-dhparam.d crypto/cms/libcrypto-lib-cms_lib.d \
+     crypto/pem/libcrypto-lib-pem_err.d \
+     crypto/asn1/libcrypto-shlib-t_bitst.d \
+     crypto/pkcs7/libcrypto-shlib-pkcs7err.d apps/openssl-bin-smime.d \
+     crypto/libcrypto-lib-initthread.d crypto/evp/libcrypto-lib-p_verify.d \
+     crypto/encode_decode/libcrypto-shlib-encoder_lib.d \
+     providers/implementations/digests/libdefault-lib-null_prov.d \
+     crypto/x509/libcrypto-shlib-v3_pku.d \
+     crypto/property/libcrypto-lib-property_string.d \
+     crypto/pkcs12/libcrypto-lib-p12_kiss.d \
+     crypto/ocsp/libcrypto-shlib-ocsp_err.d \
+     crypto/dh/libcrypto-shlib-dh_key.d \
+     crypto/evp/libcrypto-shlib-e_chacha20_poly1305.d \
+     crypto/x509/libcrypto-shlib-v3_extku.d ssl/libssl-lib-ssl_ciph.d \
+     crypto/bn/libcrypto-shlib-bn_print.d \
+     ssl/quic/libssl-lib-quic_wire_pkt.d crypto/libcrypto-shlib-mem_sec.d \
+     crypto/x509/libcrypto-shlib-v3_pcons.d \
+     crypto/aes/libcrypto-lib-aes_misc.d \
+     crypto/libcrypto-shlib-threads_pthread.d \
+     crypto/libcrypto-shlib-sparse_array.d \
+     crypto/evp/libcrypto-shlib-digest.d \
+     crypto/thread/arch/libcrypto-lib-thread_none.d \
+     crypto/x509/libcrypto-shlib-x509rset.d ssl/libssl-shlib-ssl_asn1.d \
+     crypto/x509/libcrypto-lib-x509_req.d \
+     crypto/x509/libcrypto-shlib-by_store.d \
+     crypto/asn1/libcrypto-shlib-p5_scrypt.d apps/openssl-bin-prime.d \
+     crypto/sm2/libcrypto-lib-sm2_crypt.d \
+     crypto/rsa/libcrypto-shlib-rsa_sign.d \
+     crypto/evp/libcrypto-lib-dh_support.d \
+     crypto/hmac/libcrypto-shlib-hmac.d \
+     crypto/async/arch/libcrypto-lib-async_null.d \
+     apps/openssl-bin-fipsinstall.d \
+     crypto/x509/libcrypto-shlib-v3_audit_id.d \
+     crypto/asn1/libcrypto-lib-a_dup.d crypto/sm2/libcrypto-shlib-sm2_err.d \
+     crypto/bn/libcrypto-lib-bn_gf2m.d crypto/bn/libcrypto-lib-bn_kron.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_null.d \
+     providers/implementations/encode_decode/libdefault-lib-decode_pvk2key.d \
+     providers/implementations/kdfs/libdefault-lib-scrypt.d \
+     crypto/conf/libcrypto-shlib-conf_lib.d ssl/libssl-shlib-s3_msg.d \
+     crypto/x509/libcrypto-lib-v3_conf.d \
+     providers/implementations/rands/libdefault-lib-drbg_hash.d \
+     ssl/quic/libssl-shlib-quic_record_shared.d \
+     crypto/ec/libcrypto-shlib-ecdh_kdf.d \
+     crypto/cmp/libcrypto-lib-cmp_protect.d \
+     providers/common/libdefault-lib-securitycheck.d \
+     crypto/encode_decode/libcrypto-shlib-encoder_err.d \
+     crypto/cms/libcrypto-shlib-cms_ess.d crypto/bn/libcrypto-lib-bn_blind.d \
+     ssl/libssl-lib-ssl_sess.d crypto/libcrypto-shlib-ebcdic.d \
+     crypto/pem/libcrypto-lib-pem_pkey.d \
+     crypto/buffer/libcrypto-lib-buffer.d \
+     ssl/statem/libssl-shlib-statem_lib.d crypto/asn1/libcrypto-lib-a_type.d \
+     ssl/libssl-shlib-ssl_conf.d crypto/ec/libcrypto-lib-ec_err.d \
+     crypto/des/libcrypto-lib-des_enc.d crypto/asn1/libcrypto-shlib-d2i_pu.d \
+     crypto/bio/libcrypto-shlib-bss_fd.d crypto/x509/libcrypto-lib-x_exten.d \
+     ssl/quic/libssl-lib-quic_channel.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_tdes_default.d \
+     crypto/err/libcrypto-shlib-err_mark.d \
+     crypto/asn1/libcrypto-lib-p5_pbe.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_cast5_hw.d \
+     ssl/libssl-shlib-tls_srp.d crypto/conf/libcrypto-lib-conf_def.d \
+     ssl/quic/libssl-lib-quic_tls_api.d \
+     crypto/encode_decode/libcrypto-lib-decoder_err.d \
+     crypto/ocsp/libcrypto-shlib-ocsp_http.d \
+     crypto/objects/libcrypto-lib-o_names.d \
+     crypto/des/libcrypto-lib-cfb64enc.d crypto/bn/libcrypto-shlib-bn_word.d \
+     crypto/evp/libcrypto-lib-s_lib.d crypto/evp/libcrypto-shlib-names.d \
+     crypto/x509/libcrypto-lib-v3_usernotice.d \
+     ssl/libssl-lib-ssl_err_legacy.d crypto/comp/libcrypto-lib-comp_lib.d \
+     crypto/x509/libcrypto-lib-x_x509.d providers/libcrypto-shlib-baseprov.d \
+     providers/implementations/digests/libdefault-lib-md5_prov.d \
+     crypto/ts/libcrypto-lib-ts_conf.d \
+     crypto/evp/libcrypto-shlib-e_camellia.d \
+     crypto/property/libcrypto-lib-defn_cache.d \
+     crypto/mdc2/libcrypto-shlib-mdc2_one.d \
+     crypto/ec/libcrypto-lib-ec_ameth.d crypto/ec/libcrypto-lib-ec_check.d \
+     crypto/x509/libcrypto-shlib-v3_rolespec.d \
+     providers/implementations/ciphers/libcommon-lib-ciphercommon_gcm_hw.d \
+     crypto/dh/libcrypto-shlib-dh_check.d crypto/ec/libcrypto-lib-eck_prn.d \
+     crypto/cast/libcrypto-shlib-c_cfb64.d \
+     crypto/des/liblegacy-lib-ofb64enc.d \
+     crypto/x509/libcrypto-shlib-x509_ext.d \
+     crypto/aes/libcrypto-lib-aes_cfb.d \
+     crypto/property/libcrypto-shlib-property_err.d \
+     providers/implementations/storemgmt/libdefault-lib-file_store.d \
+     crypto/cms/libcrypto-lib-cms_err.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aria.d \
+     crypto/x509/libcrypto-lib-x509_r2x.d \
+     providers/implementations/digests/liblegacy-lib-mdc2_prov.d \
+     crypto/x509/libcrypto-lib-x509_att.d \
+     crypto/x509/libcrypto-shlib-x_crl.d crypto/cms/libcrypto-shlib-cms_dd.d \
+     crypto/ess/libcrypto-lib-ess_lib.d crypto/thread/libcrypto-lib-arch.d \
+     crypto/libcrypto-shlib-o_str.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_desx.d \
+     crypto/bn/libcrypto-lib-bn_shift.d crypto/x509/libcrypto-lib-x_x509a.d \
+     crypto/libcrypto-lib-cryptlib.d ssl/quic/libssl-lib-quic_types.d \
+     ssl/statem/libssl-lib-extensions_srvr.d \
+     crypto/cms/libcrypto-shlib-cms_dh.d crypto/x509/libcrypto-lib-v3_utf8.d \
+     crypto/pkcs12/libcrypto-lib-pk12err.d \
+     crypto/x509/libcrypto-shlib-v3_usernotice.d \
+     crypto/des/libcrypto-lib-cfb_enc.d crypto/dsa/libcrypto-lib-dsa_ossl.d \
+     providers/implementations/encode_decode/libdefault-lib-ml_kem_codecs.d \
+     crypto/bn/libcrypto-shlib-bn_rand.d \
+     crypto/bn/libcrypto-shlib-bn_shift.d \
+     crypto/pkcs12/libcrypto-lib-p12_p8d.d \
+     crypto/asn1/libcrypto-shlib-a_int.d ssl/libssl-shlib-ssl_lib.d \
+     crypto/ec/libcrypto-shlib-ec_curve.d \
+     crypto/cms/libcrypto-shlib-cms_err.d \
+     crypto/lhash/libcrypto-lib-lh_stats.d \
+     crypto/encode_decode/libcrypto-lib-decoder_lib.d \
+     crypto/bio/libcrypto-shlib-bss_dgram.d \
+     crypto/ts/libcrypto-shlib-ts_lib.d crypto/cmp/libcrypto-lib-cmp_err.d \
+     crypto/des/libcrypto-shlib-ofb64enc.d \
+     crypto/x509/libcrypto-lib-v3_akeya.d \
+     crypto/evp/libcrypto-lib-e_chacha20_poly1305.d \
+     crypto/bio/libcrypto-lib-bss_bio.d \
+     providers/common/der/libcommon-lib-der_ecx_key.d \
+     crypto/asn1/libcrypto-shlib-a_dup.d crypto/x509/libcrypto-lib-pcy_lib.d \
+     crypto/ui/libcrypto-shlib-ui_openssl.d \
+     providers/libcrypto-lib-nullprov.d ssl/quic/libssl-lib-quic_fifd.d \
+     providers/common/der/libcommon-lib-der_dsa_gen.d \
+     crypto/dsa/libcrypto-lib-dsa_gen.d crypto/bio/libcrypto-lib-bf_lbuf.d \
+     crypto/libcrypto-lib-o_init.d crypto/modes/libcrypto-shlib-xts128.d \
+     crypto/seed/libcrypto-lib-seed_ecb.d crypto/legacy-dso-cpuid.d \
+     crypto/asn1/libcrypto-lib-tasn_prn.d \
+     providers/implementations/kdfs/libdefault-lib-pbkdf2.d \
+     crypto/conf/libcrypto-shlib-conf_ssl.d ssl/quic/libssl-lib-quic_trace.d \
+     crypto/des/liblegacy-lib-fcrypt.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_tdes_common.d \
+     crypto/libcrypto-shlib-cpt_err.d \
+     crypto/ec/curve448/arch_64/libcrypto-shlib-f_impl64.d \
+     crypto/evp/libcrypto-lib-evp_err.d \
+     crypto/pkcs12/libcrypto-shlib-p12_npas.d \
+     crypto/libcrypto-shlib-o_time.d crypto/ec/libcrypto-lib-ec_lib.d \
+     crypto/ocsp/libcrypto-lib-ocsp_srv.d crypto/lhash/libcrypto-lib-lhash.d \
+     crypto/ec/libcrypto-lib-ecp_oct.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_tdes_default_hw.d \
+     crypto/des/libcrypto-shlib-cbc_enc.d crypto/libcrypto-lib-o_fopen.d \
+     ssl/record/methods/libcommon-lib-tls_pad.d \
+     providers/implementations/digests/liblegacy-lib-wp_prov.d \
+     crypto/dh/libcrypto-lib-dh_lib.d crypto/des/libcrypto-shlib-pcbc_enc.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_camellia.d \
+     crypto/ml_dsa/libcrypto-shlib-ml_dsa_key_compress.d \
+     providers/implementations/kdfs/libdefault-lib-pbkdf2_fips.d \
+     ssl/libssl-lib-ssl_txt.d \
+     crypto/evp/libcrypto-lib-e_aes_cbc_hmac_sha256.d \
+     crypto/ct/libcrypto-shlib-ct_err.d ssl/statem/libssl-shlib-extensions.d \
+     ssl/quic/libssl-shlib-quic_engine.d \
+     providers/implementations/encode_decode/libdefault-lib-decode_msblob2key.d \
+     apps/openssl-bin-speed.d crypto/pem/libcrypto-lib-pvkfmt.d \
+     crypto/des/liblegacy-lib-cbc_cksm.d \
+     crypto/asn1/libcrypto-shlib-ameth_lib.d ssl/libssl-lib-s3_enc.d \
+     crypto/x509/libcrypto-lib-pcy_map.d \
+     crypto/x509/libcrypto-shlib-v3_crld.d \
+     ssl/quic/libssl-shlib-quic_record_tx.d \
+     crypto/bio/libcrypto-shlib-bss_null.d \
+     crypto/asn1/libcrypto-shlib-d2i_param.d \
+     crypto/rsa/libcrypto-shlib-rsa_err.d \
+     crypto/evp/libcrypto-shlib-legacy_md4.d \
+     crypto/pkcs12/libcrypto-shlib-p12_add.d apps/openssl-bin-dsa.d \
+     crypto/libcrypto-shlib-provider_child.d \
+     crypto/evp/libcrypto-shlib-evp_utils.d \
+     crypto/asn1/libcrypto-lib-bio_asn1.d \
+     crypto/err/libcrypto-lib-err_all_legacy.d \
+     crypto/libcrypto-shlib-params_idx.d crypto/idea/liblegacy-lib-i_cbc.d \
+     crypto/idea/libcrypto-lib-i_cfb64.d crypto/modes/libcrypto-lib-ofb128.d \
+     crypto/evp/libcrypto-shlib-e_idea.d \
+     crypto/dsa/libcrypto-shlib-dsa_key.d \
+     crypto/cast/libcrypto-shlib-c_skey.d \
+     crypto/bio/libcrypto-shlib-bf_null.d apps/openssl-bin-dsaparam.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_sm4_hw.d \
+     crypto/des/libcrypto-lib-ofb64ede.d \
+     ssl/record/methods/libssl-shlib-ssl3_meth.d \
+     providers/implementations/encode_decode/libdefault-lib-ml_common_codecs.d \
+     crypto/evp/libcrypto-shlib-cmeth_lib.d \
+     crypto/libcrypto-lib-self_test_core.d ssl/libssl-lib-tls13_enc.d \
+     crypto/dsa/libcrypto-lib-dsa_vrf.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aria_ccm_hw.d \
+     crypto/pkcs7/libcrypto-lib-pk7_asn1.d \
+     crypto/x509/libcrypto-lib-v3_bcons.d ssl/libssl-shlib-d1_lib.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_siv_hw.d \
+     crypto/store/libcrypto-shlib-store_err.d \
+     crypto/encode_decode/libcrypto-lib-encoder_lib.d \
+     crypto/evp/libcrypto-shlib-signature.d \
+     crypto/evp/libcrypto-shlib-pbe_scrypt.d \
+     crypto/ml_dsa/libcrypto-shlib-ml_dsa_ntt.d \
+     crypto/x509/libcrypto-shlib-pcy_data.d \
+     crypto/ec/libcrypto-shlib-ecx_key.d ssl/rio/libssl-shlib-rio_notifier.d \
+     crypto/x509/libcrypto-lib-x509_d2.d \
+     crypto/x509/libcrypto-lib-v3_sxnet.d \
+     crypto/sha/libcrypto-shlib-sha1dgst.d \
+     crypto/evp/libcrypto-lib-p5_crpt.d \
+     crypto/evp/libcrypto-shlib-p5_crpt2.d \
+     crypto/encode_decode/libcrypto-shlib-decoder_err.d \
+     crypto/des/libcrypto-lib-ofb64enc.d \
+     crypto/ts/libcrypto-shlib-ts_verify_ctx.d \
+     ssl/statem/libssl-shlib-statem_clnt.d \
+     crypto/x509/libcrypto-shlib-x_all.d apps/openssl-bin-errstr.d \
+     crypto/ts/libcrypto-lib-ts_rsp_utils.d \
+     crypto/x509/libcrypto-lib-x509_ext.d \
+     crypto/des/libcrypto-lib-fcrypt_b.d \
+     crypto/evp/libcrypto-shlib-legacy_md5_sha1.d \
+     crypto/des/libcrypto-lib-ecb_enc.d \
+     crypto/bn/asm/libcrypto-shlib-x86_64-gcc.d \
+     crypto/md5/libcrypto-lib-md5_sha1.d crypto/libcrypto-lib-trace.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_desx_hw.d \
+     providers/implementations/digests/libdefault-lib-sha2_prov.d \
+     crypto/bn/libcrypto-lib-bn_const.d \
+     crypto/store/libcrypto-lib-store_meth.d \
+     crypto/dh/libcrypto-lib-dh_check.d \
+     crypto/slh_dsa/libcrypto-shlib-slh_dsa_key.d \
+     crypto/err/libcrypto-lib-err.d apps/openssl-bin-progs.d \
+     crypto/x509/libcrypto-lib-x509_def.d crypto/rsa/libcrypto-lib-rsa_gen.d \
+     crypto/x509/libcrypto-shlib-x_exten.d \
+     crypto/ffc/libcrypto-shlib-ffc_params_generate.d \
+     crypto/asn1/libcrypto-shlib-i2d_evp.d crypto/x509/libcrypto-lib-v3err.d \
+     providers/implementations/kem/libdefault-lib-mlx_kem.d \
+     crypto/bio/libcrypto-lib-bss_sock.d \
+     ssl/quic/libssl-lib-qlog_event_helpers.d \
+     crypto/asn1/libcrypto-shlib-a_type.d \
+     crypto/ffc/libcrypto-shlib-ffc_dh.d \
+     crypto/err/libcrypto-shlib-err_save.d \
+     crypto/bn/libcrypto-shlib-bn_add.d \
+     crypto/evp/libcrypto-shlib-legacy_sha.d \
+     crypto/comp/libcrypto-lib-comp_err.d \
+     crypto/bio/libcrypto-lib-bss_core.d \
+     crypto/pem/libcrypto-shlib-pem_sign.d \
+     crypto/libcrypto-shlib-provider_predefined.d \
+     crypto/aria/libcrypto-shlib-aria.d \
+     crypto/pkcs12/libcrypto-shlib-p12_kiss.d \
+     crypto/libcrypto-shlib-deterministic_nonce.d \
+     crypto/bn/libcrypto-shlib-bn_kron.d \
+     crypto/rc2/libcrypto-shlib-rc2ofb64.d \
+     crypto/libcrypto-shlib-params_dup.d crypto/cast/libcrypto-lib-c_enc.d \
+     crypto/libcrypto-lib-indicator_core.d \
+     crypto/evp/libcrypto-lib-ctrl_params_translate.d \
+     crypto/libcrypto-lib-params_from_text.d \
+     crypto/evp/libcrypto-lib-mac_meth.d \
+     crypto/asn1/libcrypto-shlib-bio_asn1.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_idea.d \
+     crypto/cms/libcrypto-shlib-cms_lib.d \
+     crypto/rand/libcrypto-lib-rand_err.d ssl/quic/libssl-lib-qlog.d \
+     crypto/bio/libcrypto-lib-bio_cb.d crypto/cms/libcrypto-lib-cms_asn1.d \
+     crypto/evp/libcrypto-shlib-m_sigver.d \
+     crypto/cms/libcrypto-lib-cms_pwri.d ssl/libssl-lib-ssl_asn1.d \
+     crypto/dsa/libcrypto-lib-dsa_prn.d crypto/libcrypto-lib-o_time.d \
+     ssl/libssl-lib-d1_srtp.d crypto/evp/libcrypto-lib-legacy_md5_sha1.d \
+     crypto/x509/libcrypto-lib-x_req.d crypto/idea/libcrypto-shlib-i_skey.d \
+     crypto/ts/libcrypto-lib-ts_lib.d \
+     crypto/store/libcrypto-shlib-store_lib.d \
+     ssl/record/libssl-lib-rec_layer_d1.d crypto/cmp/libcrypto-lib-cmp_ctx.d \
+     crypto/slh_dsa/libcrypto-lib-slh_adrs.d \
+     crypto/x509/libcrypto-lib-v3_pcia.d \
+     crypto/libcrypto-lib-provider_core.d \
+     crypto/dsa/libcrypto-shlib-dsa_backend.d \
+     providers/implementations/kdfs/libdefault-lib-argon2.d \
+     ssl/quic/libssl-shlib-quic_port.d \
+     crypto/rsa/libcrypto-lib-rsa_sp800_56b_check.d \
+     ssl/libssl-lib-tls_depr.d crypto/dsa/libcrypto-lib-dsa_key.d \
+     crypto/evp/libcrypto-lib-signature.d crypto/bf/libcrypto-shlib-bf_enc.d \
+     crypto/x509/libcrypto-lib-x509aset.d crypto/bn/libcrypto-lib-bn_nist.d \
+     crypto/bio/libcrypto-shlib-bio_cb.d \
+     crypto/asn1/libcrypto-lib-f_string.d \
+     crypto/sm2/libcrypto-shlib-sm2_crypt.d \
+     crypto/modes/libcrypto-lib-xts128gb.d crypto/evp/libcrypto-lib-e_des3.d \
+     providers/implementations/kdfs/libdefault-lib-sskdf.d \
+     ssl/quic/libssl-lib-quic_record_util.d ssl/libssl-lib-ssl_conf.d \
+     providers/implementations/signature/libdefault-lib-mac_legacy_sig.d \
+     providers/implementations/keymgmt/libdefault-lib-kdf_legacy_kmgmt.d \
+     crypto/encode_decode/libcrypto-shlib-decoder_meth.d \
+     crypto/rsa/libcrypto-shlib-rsa_saos.d \
+     providers/implementations/ciphers/libcommon-lib-ciphercommon_hw.d \
+     crypto/dso/libcrypto-shlib-dso_lib.d apps/openssl-bin-storeutl.d \
+     crypto/cmp/libcrypto-shlib-cmp_msg.d ssl/libssl-shlib-t1_enc.d \
+     apps/openssl-bin-crl2pkcs7.d crypto/libcrypto-lib-deterministic_nonce.d \
+     crypto/ml_dsa/libcrypto-shlib-ml_dsa_matrix.d \
+     crypto/des/libcrypto-shlib-str2key.d crypto/md4/libcrypto-lib-md4_one.d \
+     crypto/seed/libcrypto-lib-seed_cbc.d \
+     crypto/des/libcrypto-shlib-des_enc.d \
+     crypto/evp/libcrypto-lib-exchange.d crypto/libcrypto-shlib-context.d \
+     crypto/ct/libcrypto-lib-ct_b64.d crypto/rsa/libcrypto-lib-rsa_sign.d \
+     crypto/bf/libcrypto-lib-bf_skey.d crypto/x509/libcrypto-lib-v3_ncons.d \
+     apps/lib/libapps-lib-apps.d crypto/asn1/libcrypto-lib-asn1_err.d \
+     crypto/rsa/libcrypto-shlib-rsa_x931.d \
+     providers/implementations/signature/libdefault-lib-sm2_sig.d \
+     crypto/x509/libcrypto-shlib-v3_single_use.d \
+     crypto/asn1/libcrypto-shlib-f_int.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_des.d \
+     crypto/rc2/liblegacy-lib-rc2_cbc.d crypto/rsa/libcrypto-lib-rsa_prn.d \
+     crypto/ec/libcrypto-shlib-ecx_meth.d ssl/quic/libssl-lib-quic_fc.d \
+     providers/common/der/libcommon-lib-der_digests_gen.d \
+     providers/common/libdefault-lib-digest_to_nid.d \
+     crypto/libcrypto-lib-core_algorithm.d \
+     crypto/bn/libcrypto-shlib-bn_prime.d \
+     crypto/store/libcrypto-lib-store_lib.d \
+     crypto/pkcs7/libcrypto-shlib-pk7_mime.d \
+     crypto/ct/libcrypto-shlib-ct_policy.d \
+     ssl/quic/libssl-shlib-quic_tserver.d \
+     crypto/asn1/libcrypto-shlib-a_i2d_fp.d \
+     crypto/dh/libcrypto-shlib-dh_prn.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_cast5.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_sm4_gcm_hw.d \
+     providers/common/der/libcommon-lib-der_ecx_gen.d \
+     crypto/evp/libcrypto-lib-p_seal.d crypto/ui/libcrypto-shlib-ui_null.d \
+     crypto/asn1/libcrypto-shlib-x_info.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aria_ccm.d \
+     crypto/rsa/libcrypto-lib-rsa_oaep.d ssl/libssl-lib-methods.d \
+     providers/implementations/digests/libcommon-lib-digestcommon.d \
+     crypto/asn1/libcrypto-lib-x_val.d \
+     crypto/slh_dsa/libcrypto-lib-slh_dsa_key.d \
+     ssl/statem/libssl-lib-statem_srvr.d crypto/bn/libcrypto-shlib-bn_sqr.d \
+     crypto/thread/arch/libcrypto-lib-thread_win.d \
+     crypto/ct/libcrypto-shlib-ct_b64.d crypto/asn1/libcrypto-shlib-x_pkey.d \
+     crypto/x509/libcrypto-shlib-x_ietfatt.d crypto/libcrypto-lib-defaults.d \
+     crypto/libcrypto-shlib-cpuid.d crypto/bio/libcrypto-shlib-bio_sock2.d \
+     crypto/pem/libcrypto-lib-pem_pk8.d ssl/quic/libssl-lib-quic_rstream.d \
+     crypto/modes/libcrypto-lib-ccm128.d \
+     ssl/quic/libssl-shlib-quic_rstream.d \
+     crypto/libcrypto-lib-provider_predefined.d \
+     crypto/dh/libcrypto-shlib-dh_gen.d crypto/x509/libcrypto-lib-v3_pci.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_rc4_hmac_md5.d \
+     crypto/asn1/libcrypto-shlib-a_sign.d \
+     crypto/ec/libcrypto-lib-curve25519.d apps/openssl-bin-passwd.d \
+     crypto/dso/libcrypto-lib-dso_err.d crypto/bn/libcrypto-shlib-bn_conv.d \
+     crypto/x509/libcrypto-shlib-pcy_cache.d \
+     crypto/x509/libcrypto-lib-v3_iobo.d crypto/evp/libcrypto-shlib-e_aes.d \
+     crypto/thread/libcrypto-shlib-api.d crypto/cms/libcrypto-lib-cms_dd.d \
+     crypto/libcrypto-lib-core_namemap.d \
+     crypto/slh_dsa/libcrypto-shlib-slh_wots.d \
+     crypto/pem/libcrypto-lib-pem_info.d crypto/ts/libcrypto-shlib-ts_err.d \
+     crypto/cms/libcrypto-shlib-cms_cd.d \
+     crypto/des/libcrypto-shlib-ecb3_enc.d \
+     crypto/cms/libcrypto-shlib-cms_env.d crypto/cast/liblegacy-lib-c_enc.d \
+     crypto/evp/libcrypto-lib-evp_pbe.d crypto/comp/libcrypto-shlib-c_zstd.d \
+     crypto/pkcs7/libcrypto-shlib-pk7_doit.d \
+     ssl/statem/libssl-lib-statem_clnt.d crypto/evp/libcrypto-lib-bio_ok.d \
+     crypto/evp/libcrypto-lib-legacy_md5.d \
+     crypto/rsa/libcrypto-shlib-rsa_pmeth.d \
+     crypto/rsa/libcrypto-shlib-rsa_sp800_56b_check.d \
+     crypto/asn1/libcrypto-shlib-a_object.d \
+     crypto/bn/libcrypto-shlib-bn_gcd.d \
+     providers/implementations/digests/libdefault-lib-sm3_prov.d \
+     crypto/rsa/libcrypto-shlib-rsa_ossl.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes.d \
+     crypto/hmac/libcrypto-lib-hmac.d crypto/des/libcrypto-shlib-qud_cksm.d \
+     crypto/x509/libcrypto-shlib-v3_ncons.d \
+     providers/implementations/skeymgmt/libdefault-lib-generic.d \
+     crypto/bio/libcrypto-lib-bio_addr.d crypto/bf/libcrypto-lib-bf_enc.d \
+     crypto/pem/libcrypto-lib-pem_oth.d crypto/cms/libcrypto-lib-cms_io.d \
+     crypto/ec/curve448/libcrypto-lib-eddsa.d \
+     crypto/bf/libcrypto-shlib-bf_skey.d \
+     providers/implementations/keymgmt/libdefault-lib-rsa_kmgmt.d \
+     crypto/crmf/libcrypto-shlib-crmf_pbm.d \
+     crypto/ct/libcrypto-lib-ct_policy.d \
+     crypto/pem/libcrypto-shlib-pem_pkey.d ssl/quic/libssl-lib-quic_obj.d \
+     crypto/ct/libcrypto-lib-ct_x509v3.d \
+     crypto/ripemd/libcrypto-lib-rmd_one.d \
+     crypto/sha/libcrypto-lib-sha1_one.d crypto/asn1/libcrypto-lib-a_print.d \
+     crypto/thread/arch/libssl-shlib-thread_none.d \
+     ssl/record/methods/libssl-shlib-dtls_meth.d \
+     providers/implementations/signature/libdefault-lib-slh_dsa_sig.d \
+     crypto/rand/libcrypto-shlib-randfile.d \
+     crypto/err/libcrypto-shlib-err_all.d \
+     crypto/ml_dsa/libcrypto-lib-ml_dsa_matrix.d \
+     crypto/x509/libcrypto-lib-x509_vfy.d \
+     providers/implementations/macs/libdefault-lib-poly1305_prov.d \
+     ssl/statem/libssl-lib-extensions.d \
+     crypto/conf/libcrypto-shlib-conf_mod.d \
+     crypto/evp/libcrypto-shlib-encode.d \
+     crypto/asn1/libcrypto-lib-a_i2d_fp.d \
+     crypto/x509/libcrypto-shlib-x509_cmp.d \
+     crypto/asn1/libcrypto-shlib-x_bignum.d \
+     crypto/ocsp/libcrypto-shlib-ocsp_lib.d \
+     crypto/bio/libcrypto-shlib-bf_buff.d crypto/ec/libcrypto-lib-ec2_oct.d \
+     crypto/ec/libcrypto-lib-ecp_nist.d crypto/libcrypto-shlib-core_fetch.d \
+     crypto/asn1/libcrypto-shlib-f_string.d crypto/libcrypto-shlib-ssl_err.d \
+     crypto/encode_decode/libcrypto-shlib-decoder_pkey.d \
+     crypto/ocsp/libcrypto-lib-v3_ocsp.d \
+     providers/implementations/macs/libdefault-lib-cmac_prov.d \
+     crypto/idea/liblegacy-lib-i_ecb.d crypto/x509/libcrypto-shlib-x_name.d \
+     crypto/x509/libcrypto-lib-pcy_tree.d \
+     crypto/ffc/libcrypto-shlib-ffc_params_validate.d \
+     crypto/x509/libcrypto-lib-by_store.d \
+     crypto/asn1/libcrypto-shlib-tasn_dec.d \
+     crypto/cms/libcrypto-lib-cms_ec.d crypto/asn1/libcrypto-lib-x_algor.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_cbc_hmac_sha1_hw.d \
+     crypto/cms/libcrypto-shlib-cms_smime.d ssl/libssl-shlib-s3_lib.d \
+     providers/implementations/encode_decode/libdefault-lib-decode_pem2der.d \
+     crypto/bn/libcrypto-lib-bn_ctx.d crypto/dsa/libcrypto-shlib-dsa_lib.d \
+     crypto/x509/libcrypto-lib-v3_int.d crypto/bn/libcrypto-shlib-bn_mul.d \
+     crypto/x509/libcrypto-lib-v3_genn.d \
+     crypto/conf/libcrypto-shlib-conf_sap.d \
+     crypto/rsa/libcrypto-shlib-rsa_gen.d \
+     crypto/md5/libcrypto-lib-md5_dgst.d \
+     crypto/ec/libcrypto-shlib-ec_kmeth.d \
+     crypto/libcrypto-shlib-threads_lib.d crypto/des/libcrypto-lib-set_key.d \
+     crypto/pkcs7/libcrypto-shlib-pk7_lib.d \
+     crypto/pkcs12/libcrypto-lib-p12_asn.d \
+     crypto/x509/libcrypto-lib-by_file.d crypto/ct/libcrypto-lib-ct_prn.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_hw.d \
+     ssl/libssl-lib-bio_ssl.d ssl/libssl-shlib-t1_lib.d \
+     crypto/encode_decode/libcrypto-lib-decoder_pkey.d \
+     crypto/bio/libcrypto-lib-bss_mem.d \
+     crypto/ffc/libcrypto-lib-ffc_params_generate.d \
+     crypto/ec/libcrypto-shlib-ec2_oct.d \
+     providers/common/der/libcommon-lib-der_rsa_gen.d \
+     crypto/evp/libcrypto-shlib-dh_support.d \
+     providers/common/der/libcommon-lib-der_ec_gen.d \
+     providers/implementations/keymgmt/libdefault-lib-ml_dsa_kmgmt.d \
+     crypto/md5/libcrypto-shlib-md5_one.d apps/lib/libapps-lib-s_socket.d \
+     providers/implementations/kem/libdefault-lib-kem_util.d \
+     crypto/modes/libcrypto-shlib-siv128.d \
+     ssl/record/methods/libssl-shlib-tls1_meth.d \
+     crypto/async/arch/libcrypto-shlib-async_posix.d \
+     crypto/libcrypto-shlib-packet.d crypto/libcrypto-shlib-threads_win.d \
+     crypto/cast/libcrypto-lib-c_ofb64.d apps/openssl-bin-spkac.d \
+     crypto/dsa/libcrypto-lib-dsa_lib.d crypto/evp/libcrypto-lib-evp_fetch.d \
+     crypto/pkcs12/libcrypto-lib-p12_utl.d crypto/evp/libcrypto-lib-e_rc2.d \
+     crypto/dsa/libcrypto-shlib-dsa_asn1.d \
+     crypto/asn1/libcrypto-lib-tasn_scn.d \
+     crypto/dsa/libcrypto-lib-dsa_backend.d ssl/quic/libssl-shlib-quic_cfq.d \
+     crypto/asn1/libcrypto-shlib-tasn_utl.d \
+     crypto/asn1/libcrypto-lib-a_utf8.d \
+     crypto/pkcs12/libcrypto-lib-p12_attr.d \
+     crypto/ripemd/libcrypto-shlib-rmd_dgst.d \
+     crypto/ml_dsa/libcrypto-lib-ml_dsa_sign.d \
+     crypto/asn1/libcrypto-lib-a_verify.d \
+     crypto/ts/libcrypto-lib-ts_verify_ctx.d \
+     crypto/modes/libcrypto-shlib-cbc128.d apps/openssl-bin-skeyutl.d \
+     crypto/libcrypto-shlib-uid.d crypto/pkcs7/libcrypto-shlib-pk7_attr.d \
+     crypto/libcrypto-shlib-der_writer.d \
+     crypto/x509/libcrypto-shlib-v3_ia5.d \
+     crypto/evp/libcrypto-shlib-e_null.d \
+     crypto/libcrypto-shlib-param_build.d \
+     providers/implementations/rands/seeding/libdefault-lib-rand_win.d \
+     crypto/ess/libcrypto-lib-ess_asn1.d \
+     crypto/ec/curve448/arch_32/libcrypto-lib-f_impl32.d \
+     crypto/ec/libcrypto-shlib-ec_key.d \
+     providers/implementations/kdfs/libdefault-lib-x942kdf.d \
+     crypto/evp/libcrypto-shlib-dsa_ctrl.d \
+     crypto/bn/libcrypto-shlib-bn_blind.d \
+     crypto/x509/libcrypto-shlib-v3_attrdesc.d \
+     crypto/comp/libcrypto-lib-c_zstd.d crypto/libssl-shlib-getenv.d \
+     ssl/quic/libssl-lib-quic_rx_depack.d \
+     crypto/bio/libcrypto-shlib-bio_meth.d crypto/libssl-shlib-quic_vlint.d \
+     providers/implementations/skeymgmt/libdefault-lib-aes_skmgmt.d \
+     crypto/x509/libcrypto-lib-v3_prn.d \
+     crypto/bio/libcrypto-shlib-bf_prefix.d \
+     crypto/bio/libcrypto-lib-bio_print.d apps/openssl-bin-dgst.d \
+     ssl/quic/libssl-shlib-quic_tls_api.d \
+     ssl/record/methods/libssl-shlib-tls_multib.d \
+     crypto/encode_decode/libcrypto-lib-decoder_meth.d \
+     crypto/x509/libcrypto-shlib-v3_ind_iss.d \
+     crypto/ec/libcrypto-lib-ec_print.d \
+     crypto/asn1/libcrypto-shlib-a_verify.d crypto/ct/libcrypto-lib-ct_oct.d \
+     crypto/idea/libcrypto-shlib-i_cfb64.d crypto/bf/libcrypto-lib-bf_ecb.d \
+     crypto/ml_kem/libcrypto-shlib-ml_kem.d \
+     crypto/slh_dsa/libcrypto-lib-slh_wots.d \
+     crypto/rc2/libcrypto-shlib-rc2cfb64.d ssl/quic/libssl-lib-quic_engine.d \
+     crypto/x509/libcrypto-lib-x_attrib.d crypto/bf/liblegacy-lib-bf_cfb64.d \
+     crypto/ui/libcrypto-lib-ui_err.d crypto/evp/libcrypto-lib-e_des.d \
+     crypto/x509/libcrypto-shlib-v3_akid.d \
+     crypto/x509/libcrypto-lib-v3_soa_id.d crypto/asn1/libcrypto-lib-nsseq.d \
+     crypto/cmp/libcrypto-shlib-cmp_protect.d \
+     crypto/thread/arch/libcrypto-shlib-thread_win.d \
+     apps/lib/libapps-lib-s_cb.d crypto/libcrypto-shlib-indicator_core.d \
+     crypto/x509/libcrypto-shlib-by_dir.d \
+     crypto/asn1/libcrypto-shlib-x_spki.d \
+     crypto/dsa/libcrypto-lib-dsa_ameth.d ssl/quic/libssl-lib-quic_sf_list.d \
+     crypto/ec/libcrypto-lib-ec_key.d crypto/rc2/libcrypto-lib-rc2cfb64.d \
+     crypto/evp/libcrypto-shlib-bio_b64.d \
+     providers/implementations/kdfs/liblegacy-lib-pvkkdf.d \
+     crypto/x509/libcrypto-shlib-v3_pci.d \
+     crypto/rsa/libcrypto-shlib-rsa_meth.d \
+     crypto/store/libcrypto-lib-store_strings.d \
+     providers/implementations/keymgmt/libdefault-lib-ec_kmgmt.d \
+     crypto/libcrypto-shlib-trace.d crypto/rc2/liblegacy-lib-rc2_ecb.d \
+     crypto/libcrypto-shlib-mem.d crypto/bn/libcrypto-lib-bn_lib.d \
+     crypto/sha/libcrypto-shlib-sha256.d \
+     crypto/ocsp/libcrypto-lib-ocsp_asn.d crypto/x509/libcrypto-lib-v3_aaa.d \
+     apps/openssl-bin-sess_id.d crypto/evp/libcrypto-lib-keymgmt_lib.d \
+     providers/legacy-dso-legacyprov.d ssl/quic/libssl-lib-quic_txp.d \
+     ssl/quic/libssl-lib-json_enc.d crypto/mdc2/libcrypto-shlib-mdc2dgst.d \
+     ssl/quic/libssl-lib-quic_statm.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_chacha20_poly1305_hw.d \
+     crypto/x509/libcrypto-shlib-x509_v3.d \
+     crypto/libcrypto-shlib-provider_core.d \
+     crypto/evp/libcrypto-lib-mac_lib.d \
+     crypto/property/libcrypto-shlib-property_query.d \
+     crypto/evp/libcrypto-shlib-m_null.d crypto/libcrypto-lib-comp_methods.d \
+     crypto/slh_dsa/libcrypto-lib-slh_params.d \
+     crypto/asn1/libcrypto-lib-a_strex.d \
+     crypto/bio/libcrypto-shlib-bss_log.d \
+     crypto/asn1/libcrypto-shlib-a_strnid.d \
+     crypto/bn/libcrypto-lib-bn_mont.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aria_gcm.d \
+     crypto/asn1/libcrypto-lib-x_int64.d \
+     crypto/x509/libcrypto-shlib-v3_iobo.d \
+     crypto/asn1/libcrypto-lib-i2d_evp.d crypto/dh/libcrypto-shlib-dh_lib.d \
+     crypto/ct/libcrypto-lib-ct_err.d crypto/modes/libcrypto-shlib-ofb128.d \
+     crypto/bio/libcrypto-lib-bf_readbuff.d apps/openssl-bin-ecparam.d \
+     crypto/asn1/libcrypto-lib-a_time.d \
+     crypto/pkcs7/libcrypto-shlib-pk7_smime.d \
+     crypto/asn1/libcrypto-lib-asn_mstbl.d \
+     crypto/des/liblegacy-lib-cfb64enc.d \
+     crypto/ess/libcrypto-shlib-ess_asn1.d \
+     crypto/pem/libcrypto-shlib-pem_xaux.d \
+     crypto/cms/libcrypto-shlib-cms_sd.d \
+     crypto/ec/libcrypto-shlib-ec_check.d crypto/libcrypto-lib-quic_vlint.d \
+     ssl/statem/libssl-shlib-statem_srvr.d crypto/seed/liblegacy-lib-seed.d \
+     crypto/rand/libcrypto-lib-rand_lib.d \
+     crypto/evp/libcrypto-shlib-evp_enc.d \
+     ssl/quic/libssl-lib-quic_record_tx.d crypto/cmp/libcrypto-lib-cmp_asn.d \
+     crypto/md5/liblegacy-lib-md5_one.d \
+     crypto/ml_dsa/libcrypto-shlib-ml_dsa_params.d \
+     crypto/ec/curve448/libcrypto-shlib-scalar.d \
+     crypto/libcrypto-shlib-info.d crypto/rc2/libcrypto-lib-rc2_cbc.d \
+     crypto/bio/libcrypto-shlib-bio_addr.d \
+     crypto/slh_dsa/libcrypto-lib-slh_fors.d \
+     crypto/bio/libcrypto-lib-bss_fd.d \
+     providers/libcrypto-shlib-prov_running.d \
+     crypto/asn1/libcrypto-shlib-p5_pbe.d \
+     crypto/x509/libcrypto-lib-x509_v3.d ssl/quic/libssl-shlib-quic_impl.d \
+     providers/implementations/rands/libdefault-lib-test_rng.d \
+     crypto/sha/libcrypto-shlib-sha1_one.d \
+     apps/lib/libapps-lib-http_server.d crypto/rsa/libcrypto-lib-rsa_asn1.d \
+     crypto/libcrypto-lib-param_build_set.d \
+     crypto/x509/libcrypto-lib-v3_skid.d apps/openssl-bin-ca.d \
+     crypto/pkcs12/libcrypto-shlib-p12_decr.d \
+     crypto/ts/libcrypto-lib-ts_rsp_verify.d \
+     providers/common/der/libdefault-lib-der_sm2_gen.d \
+     crypto/x509/libcrypto-lib-v3_asid.d \
+     crypto/dso/libcrypto-lib-dso_win32.d \
+     crypto/libcrypto-lib-threads_pthread.d \
+     crypto/x509/libcrypto-shlib-v3_sda.d crypto/bn/libcrypto-lib-bn_exp2.d \
+     crypto/ec/curve448/libcrypto-shlib-f_generic.d \
+     crypto/bn/libcrypto-lib-bn_dh.d ssl/quic/libssl-shlib-qlog.d \
+     providers/implementations/keymgmt/libdefault-lib-dsa_kmgmt.d \
+     crypto/bio/libcrypto-shlib-bf_readbuff.d \
+     crypto/ffc/libcrypto-lib-ffc_params.d \
+     crypto/bn/libcrypto-shlib-bn_exp2.d crypto/bn/libcrypto-lib-bn_div.d \
+     crypto/des/liblegacy-lib-ecb3_enc.d \
+     crypto/x509/libcrypto-shlib-v3_cpols.d \
+     crypto/ec/libcrypto-lib-ec_curve.d crypto/evp/libcrypto-lib-e_bf.d \
+     apps/openssl-bin-kdf.d crypto/bio/libcrypto-shlib-bio_lib.d \
+     ssl/libssl-lib-ssl_rsa.d \
+     crypto/encode_decode/libcrypto-shlib-encoder_meth.d \
+     crypto/pkcs7/libcrypto-shlib-pk7_asn1.d \
+     crypto/encode_decode/libcrypto-lib-encoder_pkey.d \
+     crypto/ec/libcrypto-shlib-ecx_backend.d \
+     crypto/evp/libcrypto-lib-e_sm4.d \
+     crypto/rand/libcrypto-shlib-rand_uniform.d \
+     crypto/pkcs12/libcrypto-shlib-p12_asn.d \
+     crypto/evp/libcrypto-shlib-skeymgmt_meth.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_tdes_common.d \
+     crypto/ec/libcrypto-lib-ecx_backend.d \
+     providers/implementations/keymgmt/libdefault-lib-ml_kem_kmgmt.d \
+     crypto/slh_dsa/libcrypto-lib-slh_hash.d \
+     crypto/des/liblegacy-lib-str2key.d \
+     crypto/dsa/libcrypto-shlib-dsa_check.d \
+     crypto/evp/libcrypto-shlib-e_bf.d crypto/x509/libcrypto-shlib-v3_utl.d \
+     crypto/rsa/libcrypto-shlib-rsa_asn1.d \
+     providers/implementations/storemgmt/libdefault-lib-file_store_any2obj.d \
+     crypto/dso/libcrypto-shlib-dso_win32.d \
+     crypto/evp/libcrypto-shlib-p5_crpt.d \
+     crypto/libcrypto-shlib-params_from_text.d \
+     crypto/x509/libcrypto-shlib-v3_battcons.d \
+     crypto/ts/libcrypto-shlib-ts_rsp_print.d \
+     crypto/pkcs12/libcrypto-lib-p12_npas.d \
+     crypto/http/libcrypto-lib-http_err.d \
+     crypto/evp/libcrypto-lib-e_aes_cbc_hmac_sha1.d \
+     providers/common/der/libcommon-lib-der_slh_dsa_gen.d \
+     apps/openssl-bin-genpkey.d ssl/quic/libssl-shlib-quic_fifd.d \
+     crypto/ec/libcrypto-shlib-ec_oct.d crypto/asn1/libcrypto-lib-tasn_utl.d \
+     crypto/libcrypto-shlib-sleep.d crypto/crmf/libcrypto-shlib-crmf_lib.d \
+     crypto/x509/libcrypto-shlib-v3_enum.d \
+     crypto/bn/libcrypto-shlib-bn_const.d \
+     crypto/modes/libcrypto-shlib-xts128gb.d \
+     crypto/x509/libcrypto-lib-v3_no_ass.d \
+     crypto/x509/libcrypto-shlib-v3_addr.d apps/lib/libapps-lib-columns.d \
+     providers/common/der/libdefault-lib-der_sm2_key.d \
+     crypto/mdc2/libcrypto-lib-mdc2_one.d \
+     crypto/aes/libcrypto-lib-aes_wrap.d \
+     ssl/quic/libssl-shlib-quic_srt_gen.d \
+     crypto/asn1/libcrypto-shlib-a_utctm.d \
+     crypto/slh_dsa/libcrypto-shlib-slh_xmss.d \
+     providers/implementations/macs/libdefault-lib-siphash_prov.d \
+     crypto/libcrypto-lib-sparse_array.d \
+     providers/implementations/encode_decode/libdefault-lib-endecoder_common.d \
+     crypto/asn1/libcrypto-lib-p8_pkey.d \
+     crypto/cmp/libcrypto-shlib-cmp_client.d \
+     crypto/cast/liblegacy-lib-c_ofb64.d crypto/evp/libcrypto-lib-e_xcbc_d.d \
+     crypto/x509/libcrypto-lib-t_req.d crypto/ocsp/libcrypto-lib-ocsp_lib.d \
+     ssl/libssl-lib-ssl_lib.d crypto/slh_dsa/libcrypto-lib-slh_dsa.d \
+     crypto/bio/libcrypto-lib-bss_file.d \
+     crypto/pkcs7/libcrypto-lib-bio_pk7.d \
+     crypto/x509/libcrypto-lib-x509_meth.d \
+     crypto/ts/libcrypto-shlib-ts_rsp_utils.d \
+     crypto/rc2/libcrypto-lib-rc2ofb64.d crypto/evp/libcrypto-shlib-p_seal.d \
+     crypto/hpke/libcrypto-lib-hpke.d \
+     providers/common/der/libcommon-lib-der_slh_dsa_key.d \
+     crypto/evp/libcrypto-shlib-ec_support.d \
+     crypto/sha/libcrypto-lib-sha1dgst.d \
+     crypto/cms/libcrypto-shlib-cms_kari.d \
+     crypto/dsa/libcrypto-lib-dsa_err.d \
+     crypto/ml_dsa/libcrypto-lib-ml_dsa_ntt.d \
+     ssl/record/libssl-shlib-rec_layer_d1.d \
+     crypto/ec/libcrypto-lib-ec_kmeth.d providers/libcrypto-lib-baseprov.d \
+     providers/implementations/encode_decode/libdefault-lib-encode_key2blob.d \
+     crypto/err/libcrypto-lib-err_blocks.d \
+     crypto/objects/libcrypto-shlib-obj_lib.d \
+     crypto/evp/libcrypto-lib-e_rc5.d \
+     crypto/ec/curve448/libcrypto-lib-curve448_tables.d \
+     crypto/seed/libcrypto-shlib-seed_ofb.d \
+     crypto/rsa/libcrypto-lib-rsa_x931.d \
+     crypto/cmp/libcrypto-shlib-cmp_genm.d \
+     crypto/async/libcrypto-lib-async_err.d \
+     crypto/evp/libcrypto-lib-pmeth_gn.d \
+     crypto/dh/libcrypto-lib-dh_rfc5114.d \
+     crypto/ec/libcrypto-shlib-ec_print.d crypto/thread/libcrypto-lib-api.d \
+     crypto/cms/libcrypto-lib-cms_smime.d \
+     crypto/ess/libcrypto-shlib-ess_lib.d crypto/rsa/libcrypto-lib-rsa_mp.d \
+     crypto/asn1/libcrypto-lib-x_bignum.d \
+     crypto/encode_decode/libcrypto-lib-encoder_meth.d \
+     crypto/pem/libcrypto-lib-pem_sign.d crypto/libcrypto-lib-der_writer.d \
+     crypto/ec/libcrypto-shlib-ec_cvt.d crypto/asn1/libcrypto-lib-asn_pack.d \
+     providers/implementations/ciphers/libcommon-lib-ciphercommon_gcm.d \
+     crypto/libcrypto-lib-punycode.d ssl/quic/libssl-shlib-quic_obj.d \
+     crypto/hpke/libcrypto-lib-hpke_util.d \
+     crypto/property/libcrypto-shlib-property_string.d \
+     crypto/ts/libcrypto-lib-ts_asn1.d \
+     crypto/hashtable/libcrypto-lib-hashfunc.d \
+     crypto/ml_dsa/libcrypto-shlib-ml_dsa_sample.d \
+     crypto/cast/liblegacy-lib-c_cfb64.d \
+     crypto/evp/libcrypto-shlib-evp_key.d crypto/evp/libcrypto-shlib-e_sm4.d \
+     crypto/libcrypto-lib-params_idx.d \
+     crypto/x509/libcrypto-shlib-x509_r2x.d \
+     crypto/slh_dsa/libcrypto-shlib-slh_dsa_hash_ctx.d \
+     crypto/bn/libcrypto-shlib-bn_srp.d crypto/evp/libcrypto-shlib-p_lib.d \
+     crypto/ct/libcrypto-shlib-ct_sct.d crypto/evp/libcrypto-shlib-e_des.d \
+     providers/common/der/libcommon-lib-der_ec_sig.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_seed.d \
+     crypto/bn/libcrypto-lib-bn_recp.d \
+     crypto/rsa/libcrypto-lib-rsa_mp_names.d \
+     crypto/bn/libcrypto-lib-bn_intern.d \
+     crypto/pem/libcrypto-shlib-pem_info.d \
+     crypto/des/libcrypto-lib-pcbc_enc.d crypto/x509/libcrypto-lib-v3_ist.d \
+     crypto/asn1/libcrypto-shlib-asn_mime.d crypto/ts/libcrypto-lib-ts_err.d \
+     crypto/bio/libcrypto-shlib-bss_acpt.d crypto/libcrypto-lib-ex_data.d \
+     crypto/evp/libcrypto-lib-evp_key.d crypto/asn1/libcrypto-lib-a_utctm.d \
+     crypto/x509/libcrypto-shlib-t_x509.d \
+     crypto/stack/libcrypto-shlib-stack.d \
+     crypto/pkcs12/libcrypto-lib-p12_add.d \
+     apps/lib/libapps-lib-engine_loader.d \
+     crypto/ocsp/libcrypto-shlib-ocsp_vfy.d \
+     providers/implementations/kem/libdefault-lib-rsa_kem.d \
+     crypto/evp/libcrypto-shlib-legacy_md5.d \
+     ssl/quic/libssl-shlib-quic_reactor.d \
+     crypto/x509/libcrypto-shlib-x_pubkey.d \
+     ssl/record/methods/libssl-lib-tlsany_meth.d apps/openssl-bin-rehash.d \
+     ssl/quic/libssl-lib-quic_rcidm.d \
+     crypto/x509/libcrypto-shlib-x509_acert.d \
+     crypto/asn1/libcrypto-lib-ameth_lib.d apps/openssl-bin-pkcs8.d \
+     crypto/ct/libcrypto-shlib-ct_log.d crypto/cms/libcrypto-lib-cms_ess.d \
+     crypto/comp/libcrypto-lib-c_brotli.d \
+     crypto/objects/libcrypto-lib-obj_dat.d \
+     crypto/libcrypto-shlib-passphrase.d apps/lib/libapps-lib-opt.d \
+     crypto/cast/libcrypto-shlib-c_ecb.d \
+     crypto/asn1/libcrypto-shlib-asn_mstbl.d \
+     crypto/asn1/libcrypto-shlib-a_strex.d \
+     crypto/x509/libcrypto-shlib-x509spki.d \
+     crypto/evp/libcrypto-lib-p_sign.d crypto/rsa/libcrypto-shlib-rsa_chk.d \
+     crypto/x509/libcrypto-lib-x_ietfatt.d \
+     crypto/evp/libcrypto-shlib-s_lib.d crypto/cmp/libcrypto-lib-cmp_vfy.d \
+     crypto/ec/libcrypto-lib-ec_asn1.d \
+     providers/implementations/kem/libdefault-lib-ec_kem.d \
+     crypto/x509/libcrypto-shlib-v3_genn.d \
+     crypto/x509/libcrypto-shlib-x509cset.d \
+     crypto/modes/libcrypto-lib-siv128.d \
+     crypto/bio/libcrypto-shlib-bio_err.d \
+     crypto/ffc/libcrypto-shlib-ffc_key_generate.d \
+     crypto/md5/libcrypto-shlib-md5_dgst.d \
+     crypto/asn1/libcrypto-shlib-d2i_pr.d \
+     crypto/dso/libcrypto-shlib-dso_dl.d \
+     crypto/seed/libcrypto-shlib-seed_ecb.d \
+     crypto/x509/libcrypto-shlib-v3_ac_tgt.d apps/openssl-bin-x509.d \
+     crypto/cmp/libcrypto-shlib-cmp_status.d \
+     crypto/encode_decode/libcrypto-shlib-encoder_pkey.d \
+     crypto/dsa/libcrypto-lib-dsa_check.d \
+     crypto/buffer/libcrypto-lib-buf_err.d \
+     crypto/rc2/libcrypto-shlib-rc2_skey.d \
+     crypto/x509/libcrypto-shlib-x509_def.d \
+     providers/implementations/asymciphers/libdefault-lib-rsa_enc.d \
+     crypto/x509/libcrypto-lib-v3_lib.d \
+     crypto/rand/libcrypto-shlib-prov_seed.d crypto/libcrypto-shlib-time.d \
+     crypto/x509/libcrypto-lib-v3_attrdesc.d \
+     providers/implementations/kdfs/libdefault-lib-hkdf.d \
+     crypto/pem/libcrypto-shlib-pvkfmt.d \
+     crypto/ffc/libcrypto-shlib-ffc_backend.d \
+     crypto/evp/libcrypto-shlib-e_rc4.d crypto/sha/libcrypto-lib-sha3.d \
+     crypto/conf/libcrypto-lib-conf_sap.d \
+     crypto/ec/curve448/libcrypto-lib-f_generic.d \
+     crypto/libcrypto-lib-provider_child.d \
+     crypto/evp/libcrypto-shlib-e_cast.d ssl/quic/libssl-lib-quic_impl.d \
      crypto/dh/libcrypto-shlib-dh_group_params.d \
-     crypto/libcrypto-lib-provider_conf.d crypto/bn/libcrypto-lib-bn_const.d
+     crypto/camellia/libcrypto-shlib-cmll_misc.d \
+     crypto/cms/libcrypto-lib-cms_kari.d crypto/rsa/libcrypto-lib-rsa_pk1.d \
+     crypto/ml_dsa/libcrypto-lib-ml_dsa_key_compress.d \
+     crypto/bio/libcrypto-lib-bf_buff.d \
+     crypto/seed/libcrypto-shlib-seed_cbc.d ssl/libssl-shlib-ssl_init.d \
+     crypto/seed/libcrypto-lib-seed.d crypto/x509/libcrypto-shlib-v3_ist.d \
+     crypto/x509/libcrypto-shlib-x509_vfy.d crypto/ui/libcrypto-lib-ui_lib.d \
+     crypto/asn1/libcrypto-shlib-tasn_scn.d \
+     crypto/x509/libcrypto-lib-v3_info.d \
+     crypto/txt_db/libcrypto-shlib-txt_db.d \
+     crypto/aes/libcrypto-shlib-aes_misc.d \
+     crypto/bn/libcrypto-shlib-bn_nist.d crypto/modes/libcrypto-lib-cbc128.d \
+     crypto/rc2/liblegacy-lib-rc2_skey.d \
+     crypto/ripemd/libcrypto-shlib-rmd_one.d apps/openssl-bin-ts.d \
+     crypto/x509/libcrypto-lib-v3_san.d crypto/bio/libcrypto-lib-bss_conn.d \
+     crypto/ts/libcrypto-lib-ts_rsp_sign.d \
+     crypto/sm2/libcrypto-lib-sm2_err.d \
+     crypto/des/libcrypto-shlib-cfb64ede.d \
+     crypto/ml_dsa/libcrypto-shlib-ml_dsa_encoders.d \
+     crypto/bio/libcrypto-lib-bio_dump.d \
+     crypto/pkcs12/libcrypto-shlib-pk12err.d \
+     crypto/ec/libcrypto-shlib-ecdh_ossl.d \
+     crypto/evp/libcrypto-shlib-pmeth_check.d \
+     crypto/x509/libcrypto-lib-x509_acert.d crypto/libcrypto-lib-cpuid.d \
+     crypto/des/libcrypto-lib-cbc_enc.d \
+     crypto/evp/libcrypto-shlib-e_aes_cbc_hmac_sha256.d \
+     providers/implementations/macs/libdefault-lib-kmac_prov.d \
+     crypto/libssl-shlib-ctype.d crypto/bio/libcrypto-shlib-bf_nbio.d \
+     crypto/thread/arch/libssl-shlib-thread_win.d \
+     crypto/asn1/libcrypto-lib-x_spki.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_wrp.d \
+     crypto/bio/libcrypto-lib-bf_prefix.d ssl/libssl-lib-ssl_init.d \
+     crypto/idea/libcrypto-lib-i_cbc.d crypto/evp/libcrypto-shlib-dh_ctrl.d \
+     crypto/crmf/libcrypto-lib-crmf_err.d \
+     crypto/evp/libcrypto-shlib-e_seed.d \
+     providers/implementations/encode_decode/libdefault-lib-decode_der2key.d \
+     crypto/libcrypto-shlib-param_build_set.d \
+     ssl/quic/libssl-lib-quic_txpim.d ssl/quic/libssl-shlib-quic_channel.d \
+     crypto/stack/libcrypto-lib-stack.d \
+     crypto/cmp/libcrypto-lib-cmp_server.d \
+     providers/implementations/digests/liblegacy-lib-ripemd_prov.d \
+     crypto/cast/libcrypto-lib-c_ecb.d ssl/libssl-shlib-tls_depr.d \
+     ssl/libssl-shlib-ssl_sess.d ssl/record/methods/libssl-lib-ssl3_meth.d \
+     crypto/rand/libcrypto-lib-randfile.d \
+     crypto/evp/libcrypto-shlib-evp_cnf.d \
+     crypto/evp/libcrypto-shlib-bio_enc.d \
+     providers/implementations/ciphers/liblegacy-lib-cipher_blowfish.d \
+     crypto/pem/libcrypto-shlib-pem_pk8.d \
+     crypto/cms/libcrypto-shlib-cms_io.d \
+     crypto/dsa/libcrypto-shlib-dsa_vrf.d \
+     crypto/ec/libcrypto-lib-ecp_nistz256.d \
+     providers/implementations/keymgmt/libdefault-lib-slh_dsa_kmgmt.d \
+     crypto/rsa/libcrypto-lib-rsa_sp800_56b_gen.d \
+     crypto/dh/libcrypto-shlib-dh_asn1.d \
+     crypto/hashtable/libcrypto-shlib-hashfunc.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_chacha20_poly1305.d \
+     ssl/statem/libssl-lib-statem_lib.d \
+     providers/common/libdefault-lib-provider_util.d \
+     crypto/libcrypto-shlib-provider.d crypto/dh/libcrypto-lib-dh_meth.d \
+     crypto/libcrypto-lib-param_build.d crypto/mdc2/liblegacy-lib-mdc2_one.d \
+     ssl/quic/libssl-lib-quic_method.d \
+     crypto/libcrypto-shlib-self_test_core.d \
+     crypto/libcrypto-shlib-asn1_dsa.d ssl/quic/libssl-shlib-quic_sstream.d \
+     providers/implementations/kdfs/libdefault-lib-krb5kdf.d \
+     providers/implementations/encode_decode/libdefault-lib-ml_dsa_codecs.d \
+     crypto/pkcs12/libcrypto-shlib-p12_p8e.d \
+     crypto/rsa/libcrypto-shlib-rsa_pk1.d \
+     crypto/objects/libcrypto-shlib-obj_xref.d \
+     crypto/err/libcrypto-shlib-err_all_legacy.d \
+     crypto/ml_dsa/libcrypto-lib-ml_dsa_sample.d \
+     crypto/dso/libcrypto-lib-dso_openssl.d \
+     crypto/dso/libcrypto-shlib-dso_err.d \
+     crypto/ec/curve448/libcrypto-lib-scalar.d \
+     crypto/pkcs7/libcrypto-lib-pk7_attr.d crypto/x509/libcrypto-lib-t_crl.d \
+     crypto/libcrypto-lib-ssl_err.d ssl/quic/libssl-shlib-quic_txpim.d \
+     crypto/asn1/libcrypto-lib-evp_asn1.d \
+     crypto/evp/libcrypto-lib-p5_crpt2.d ssl/libssl-lib-t1_enc.d \
+     crypto/ec/curve448/arch_32/libcrypto-shlib-f_impl32.d \
+     ssl/statem/libssl-lib-statem_dtls.d crypto/idea/libcrypto-lib-i_skey.d \
+     crypto/dh/libcrypto-shlib-dh_ameth.d \
+     crypto/asn1/libcrypto-shlib-n_pkey.d \
+     crypto/cast/libcrypto-shlib-c_ofb64.d \
+     crypto/dh/libcrypto-shlib-dh_kdf.d crypto/x509/libcrypto-lib-x509rset.d \
+     crypto/libcrypto-shlib-getenv.d crypto/sm3/libcrypto-lib-sm3.d \
+     apps/lib/libapps-lib-fmt.d \
+     providers/implementations/keymgmt/libdefault-lib-mac_legacy_kmgmt.d \
+     crypto/x509/libcrypto-shlib-v3_lib.d \
+     crypto/modes/libcrypto-lib-ocb128.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_cbc_hmac_sha256_hw.d \
+     ssl/record/methods/libssl-shlib-tls_common.d \
+     crypto/ts/libcrypto-lib-ts_req_print.d \
+     providers/implementations/rands/libdefault-lib-seed_src_jitter.d \
+     providers/implementations/signature/libdefault-lib-eddsa_sig.d \
+     providers/common/libcommon-lib-provider_ctx.d \
+     crypto/slh_dsa/libcrypto-lib-slh_hypertree.d \
+     crypto/evp/libcrypto-lib-evp_utils.d \
+     providers/implementations/asymciphers/libdefault-lib-sm2_enc.d \
+     providers/implementations/keymgmt/libdefault-lib-dh_kmgmt.d \
+     crypto/encode_decode/libcrypto-shlib-decoder_lib.d \
+     crypto/des/libcrypto-shlib-fcrypt.d \
+     providers/implementations/ciphers/libdefault-lib-cipher_aes_xts.d \
+     crypto/libcrypto-shlib-threads_none.d \
+     crypto/sm2/libcrypto-shlib-sm2_sign.d \
+     crypto/dh/libcrypto-lib-dh_ameth.d apps/lib/libapps-lib-app_rand.d \
+     crypto/des/liblegacy-lib-cbc_enc.d apps/openssl-bin-cmp.d \
+     crypto/x509/libcrypto-lib-v3_battcons.d \
+     crypto/evp/libcrypto-shlib-evp_err.d \
+     crypto/idea/liblegacy-lib-i_cfb64.d \
+     crypto/pkcs12/libcrypto-lib-p12_crpt.d \
+     ssl/quic/libssl-lib-quic_thread_assist.d \
+     providers/implementations/rands/seeding/libdefault-lib-rand_cpu_x86.d \
+     crypto/cms/libcrypto-lib-cms_rsa.d \
+     crypto/x509/libcrypto-lib-x509_trust.d crypto/libcrypto-lib-init.d \
+     crypto/pkcs12/libcrypto-shlib-p12_utl.d \
+     ssl/rio/libssl-shlib-poll_builder.d crypto/x509/libcrypto-shlib-x_req.d \
+     crypto/store/libcrypto-shlib-store_meth.d \
+     providers/common/libdefault-lib-provider_seeding.d \
+     crypto/ec/libcrypto-shlib-ec_err.d
 
 GENERATED_MANDATORY=OpenSSLConfigVersion.cmake crypto/params_idx.c \
                     exporters/OpenSSLConfigVersion.cmake \

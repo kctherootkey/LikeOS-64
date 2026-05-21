@@ -1673,12 +1673,17 @@ void console_cursor_update(void) {
         return;
     }
     
-    cursor_blink_ticks++;
-    
-    // Blink every ~50 ticks (adjust to get desired blink rate)
-    if (cursor_blink_ticks >= 50) {
-        cursor_blink_ticks = 0;
-        cursor_shown = !cursor_shown;
+    // Derive blink phase from absolute tick count and the calibrated timer
+    // frequency so the rate is real wall-clock time, immune to how often
+    // this function is called and to LAPIC calibration differences.
+    // Target: 600 ms per phase → ~0.8 Hz full blink cycle.
+    uint32_t freq = timer_get_frequency();
+    if (freq < 10) freq = 100;           /* guard against pre-calibration zero */
+    uint64_t half_ticks = ((uint64_t)freq * 600ULL) / 1000ULL;
+    int should_show = (int)(((timer_ticks() / half_ticks) & 1ULL) == 0ULL);
+
+    if ((int)cursor_shown != should_show) {
+        cursor_shown = (uint8_t)should_show;
         draw_cursor_at(cursor_x, cursor_y, cursor_shown);
         fb_flush_dirty_regions();
     }
