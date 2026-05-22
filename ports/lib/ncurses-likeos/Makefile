@@ -9,7 +9,7 @@ LIBC_DIR = $(BASEDIR)/userland/libc
 CC = gcc
 LD = ld
 
-CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fno-stack-protector \
+CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fstack-protector-strong \
          -mno-red-zone -ffreestanding -fPIC -I$(LIBC_DIR)/include -I.
 
 SRC = curses.c

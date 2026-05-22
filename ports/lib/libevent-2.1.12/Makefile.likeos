@@ -12,7 +12,7 @@ CC      := gcc
 LD      := ld
 AR      := ar
 
-CFLAGS  := -Wall -O2 -nostdlib -fno-builtin -fno-stack-protector \
+CFLAGS  := -Wall -O2 -nostdlib -fno-builtin -fstack-protector-strong \
            -mno-red-zone -ffreestanding -fPIC \
            -DHAVE_CONFIG_H -D_GNU_SOURCE \
            -I. -I./include -I./compat \

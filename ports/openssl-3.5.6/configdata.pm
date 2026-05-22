@@ -323,7 +323,7 @@ our %target = (
         "unified",
         "unix"
     ],
-    "cflags" => "-nostdlib -fno-builtin -fno-stack-protector -mno-red-zone -fPIC -include \$(SRCDIR)/os-dep/likeos.h -pthread -m64",
+    "cflags" => "-nostdlib -fno-builtin -fstack-protector-strong -mno-red-zone -fPIC -include \$(SRCDIR)/os-dep/likeos.h -pthread -m64",
     "cppflags" => "",
     "cxxflags" => "-std=c++11 -pthread -m64",
     "defines" => [],

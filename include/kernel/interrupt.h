@@ -121,6 +121,9 @@ void gdt_install_tss(void);
 
 // Exception handlers
 void exception_handler(uint64_t *regs);
+void kernel_oops(const char *reason, uint64_t *regs);
+__attribute__((noreturn, format(printf, 1, 2)))
+void panic(const char *fmt, ...);
 
 // IRQ handlers
 void irq_handler(uint64_t *regs);

@@ -3,6 +3,7 @@
 
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/types.h"
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/sched.h"  // For spinlock_t
@@ -167,6 +168,7 @@ void mm_flush_tlb(uint64_t virtual_addr) {
 // Flush all TLB entries (local CPU only)
 // Callers: boot-time NX remapping, address-space cloning (per-process)
 // — neither requires cross-CPU invalidation.
+__no_stack_protector
 void mm_flush_all_tlb(void) {
     uint64_t cr3 = get_cr3();
     set_cr3(cr3);
@@ -1080,6 +1082,7 @@ void mm_initialize_virtual_memory(void) {
 }
 
 // Remap kernel sections with proper NX permissions
+__no_stack_protector
 void mm_remap_kernel_with_nx(void) {
     kprintf("Remapping kernel with NX permissions...\n");
     
@@ -2675,6 +2678,7 @@ void smap_enable(void) {
 }
 
 // Enable SMEP and SMAP if CPU supports them
+__no_stack_protector
 void mm_enable_smep_smap(void) {
     // Check CPUID leaf 7, subleaf 0 for SMEP/SMAP support
     uint32_t eax, ebx, ecx, edx;
@@ -2775,6 +2779,7 @@ void mm_remove_identity_mapping(void) {
 }
 
 // Enable NX (No-Execute) bit support
+__no_stack_protector
 void mm_enable_nx(void) {
     uint64_t efer = rdmsr(MSR_EFER);
     efer |= (1ULL << 11);  // Set NXE (No-Execute Enable) bit

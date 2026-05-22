@@ -30,7 +30,7 @@ CFLAGS := -O2 -fPIC -DPIC \
           -nostdinc \
           -I. \
           -I$(ABS_LIBC)/include \
-          -fno-stack-protector \
+          -fstack-protector-strong \
           -mno-red-zone \
           -D__LIKEOS__ \
           -Wno-implicit-function-declaration \

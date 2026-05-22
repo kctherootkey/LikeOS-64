@@ -85,6 +85,7 @@ static inline void ap_enable_sse(void) {
     __asm__ volatile("fninit");
 }
 
+__no_stack_protector
 void ap_entry(void) {
     // CRITICAL: Enable SSE/FPU first, before any code that might use SSE
     // (such as optimized memcpy in kernel functions)

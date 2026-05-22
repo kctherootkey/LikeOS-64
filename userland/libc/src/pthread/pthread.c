@@ -157,7 +157,15 @@ static inline int __set_tls(void* addr) {
 // Initialize the main thread's TCB (called lazily)
 static void __pthread_init_main(void) {
     if (__pthread_initialized) return;
-    
+
+    /* Capture the existing %fs:0x28 canary before we change FS.
+     * The rtld has placed a non-zero canary there; any stack-protected
+     * frame entered before this call (e.g. main()) has saved that value
+     * at [rbp-8].  We must keep the same value at offset 0x28 of the new
+     * TCB so all pending epilogue checks still pass. */
+    size_t old_canary;
+    __asm__ volatile("mov %%fs:0x28, %0" : "=r"(old_canary));
+
     struct __pthread* main = &__main_thread;
     
     // Zero out
@@ -171,6 +179,7 @@ static void __pthread_init_main(void) {
     main->state = THREAD_STATE_RUNNING;
     main->detach_state = PTHREAD_CREATE_JOINABLE;
     main->stack_base = NULL;        // Main thread's stack is special
+    main->stack_guard = old_canary; // preserve canary at offset 0x28 (%fs:0x28)
     main->stack_size = 0;
     main->guard_size = 0;
     main->cancel_state = PTHREAD_CANCEL_ENABLE;
@@ -324,6 +333,7 @@ int pthread_create(pthread_t* thread, const pthread_attr_t* attr,
     tcb->state = THREAD_STATE_RUNNING;
     tcb->retval = NULL;
     tcb->stack_base = stack_base;
+    tcb->stack_guard = __get_tcb()->stack_guard; // inherit canary from creating thread
     tcb->stack_size = total_size;
     tcb->guard_size = guard_size;
     tcb->detach_state = detach_state;

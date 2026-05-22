@@ -781,7 +781,11 @@ static BOOLEAN validate_elf64(Elf64_Ehdr *elf_header) {
 }
 
 // UEFI bootloader entry point
+__attribute__((no_stack_protector))
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
+    extern void boot_init_canary(void);
+    boot_init_canary();   /* randomise __stack_chk_guard before any other call */
+
     EFI_STATUS status;
     EFI_LOADED_IMAGE *loaded_image;
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *file_system;

@@ -32,4 +32,10 @@ void entropy_add_interrupt_timing(uint64_t extra);
 // SipHash-2-4: keyed hash for TCP ISN generation (RFC 6528)
 uint64_t siphash_2_4(const uint8_t key[16], const void* data, size_t len);
 
+// Generate a single stack-protector canary value.
+// Uses ChaCha20 CSPRNG when available (after random_init()), else RDRAND/RDTSC.
+// Marked __no_stack_protector so it can be called before GS is set up.
+// Low byte is always 0x00 (NULL-byte canary convention).
+uint64_t generate_stack_canary(void);
+
 #endif // _KERNEL_RANDOM_H_

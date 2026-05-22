@@ -5,7 +5,7 @@ AS      = gcc
 LD      = ld
 
 CFLAGS  = -Wall -Wextra -O2 \
-          -fPIC -fno-builtin -fno-stack-protector \
+          -fPIC -fno-builtin -fstack-protector-strong \
           -nostdlib -nostdinc -ffreestanding \
           -mno-red-zone -mcmodel=small \
           -fvisibility=hidden
@@ -18,7 +18,7 @@ LDFLAGS = -shared -nostdlib -T rtld.lds \
           --hash-style=gnu
 
 TARGET  = ld-likeos.so
-OBJS    = rtld.o rtld_entry.o
+OBJS    = rtld.o rtld_entry.o rtld_stack_chk.o
 
 all: $(TARGET)
 
@@ -27,6 +27,9 @@ $(TARGET): $(OBJS)
 
 rtld.o: rtld.c rtld_syscall.h
 	$(CC) $(CFLAGS) -c -o $@ rtld.c
+
+rtld_stack_chk.o: rtld_stack_chk.c
+	$(CC) $(CFLAGS) -c -o $@ rtld_stack_chk.c
 
 rtld_entry.o: rtld_entry.S
 	$(AS) $(ASFLAGS) -o $@ rtld_entry.S

@@ -1,8 +1,12 @@
 CC = gcc
 AR = ar
 LD = ld
-CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fno-stack-protector \
+DEBUG ?= 0
+CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fstack-protector-strong \
          -mno-red-zone -ffreestanding -I./include
+ifeq ($(DEBUG),1)
+CFLAGS += -DSTACK_SMASH_DEBUG
+endif
 
 # PIC flags for shared-library objects
 PIC_CFLAGS = $(CFLAGS) -fPIC
@@ -22,6 +26,7 @@ SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c s
 DLFCN_SRC = src/dl/dlfcn.c
 NET_SRC = src/net/inet.c src/net/getaddrinfo.c src/net/getifaddrs.c src/net/netdb_extra.c
 PTHREAD_SRC = src/pthread/pthread.c src/pthread/pthread_mutex.c src/pthread/pthread_cond.c src/pthread/pthread_sync.c src/pthread/pthread_tsd.c
+STACK_CHK_SRC = src/stack_chk.c
 PTHREAD_ASM = src/pthread/clone.S
 SETJMP_ASM  = src/setjmp.S
 CRT0_SRC = src/crt0.S
@@ -44,6 +49,7 @@ DLFCN_OBJ = $(DLFCN_SRC:.c=.o)
 NET_OBJ = $(NET_SRC:.c=.o)
 PTHREAD_OBJ = $(PTHREAD_SRC:.c=.o) $(PTHREAD_ASM:.S=.o)
 SETJMP_OBJ  = $(SETJMP_ASM:.S=.o)
+STACK_CHK_OBJ = $(STACK_CHK_SRC:.c=.o)
 CRT0_OBJ = $(CRT0_SRC:.S=.o)
 CRT1_OBJ = $(CRT1_SRC:.S=.o)
 CRTI_OBJ = $(CRTI_SRC:.S=.o)
@@ -52,7 +58,7 @@ CRTN_OBJ = $(CRTN_SRC:.S=.o)
 # All static objects (libc – everything except pthread)
 LIBC_OBJ = $(MALLOC_OBJ) $(STDIO_OBJ) $(STRING_OBJ) $(STDLIB_OBJ) \
            $(CTYPE_OBJ) $(TIME_OBJ) $(DIR_OBJ) $(MATH_OBJ) $(REGEX_OBJ) $(SYSCALLS_OBJ) \
-           $(NET_OBJ) $(SETJMP_OBJ)
+           $(NET_OBJ) $(SETJMP_OBJ) $(STACK_CHK_OBJ)
 
 ALL_OBJ = $(LIBC_OBJ) $(PTHREAD_OBJ)
 

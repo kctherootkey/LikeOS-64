@@ -397,6 +397,11 @@ typedef struct task {
     uint64_t* clear_child_tid;      // Address to write 0 and futex-wake on exit
     uint64_t* set_child_tid;        // Address to write TID on creation
     
+    // Per-task stack canary.  The context switcher writes this value into
+    // the per-CPU GS:104 slot on every context switch so each task always
+    // sees its own canary regardless of which CPU it runs on.
+    uint64_t stack_canary;
+
     // TLS (Thread Local Storage) support
     uint64_t fs_base;               // FS segment base for user TLS
     uint64_t gs_base;               // GS segment base (usually not used by user)
@@ -468,6 +473,7 @@ void sched_signal_pgrp(int pgid, int sig);
 int sched_pgid_exists(int pgid);
 struct tty;  // forward declaration for dump output
 void sched_dump_tasks(struct tty *tty);  // Debug: dump all task states
+void sched_print_tasks(void);           // Panic-safe: dump tasks via kprintf
 
 // ============================================================================
 // THREAD GROUP MANAGEMENT

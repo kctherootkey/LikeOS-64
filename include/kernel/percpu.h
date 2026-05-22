@@ -39,7 +39,13 @@ struct percpu {
     uint64_t syscall_saved_user_r15;          // GS:80  — callee-saved
     uint64_t syscall_saved_user_rax;          // GS:88  — syscall return value
     uint64_t syscall_signal_pending;          // GS:96  — signal number if pending, 0 otherwise
-    
+
+    // Per-CPU stack canary — GCC reads this as gs:104 when compiled with
+    // -mstack-protector-guard=tls -mstack-protector-guard-reg=gs
+    // -mstack-protector-guard-offset=104
+    // Must stay at offset 104; seeded uniquely per CPU in percpu_init*().
+    uint64_t stack_canary;                    // GS:104
+
     // CPU identification
     uint32_t cpu_id;            // Logical CPU index (0 = BSP)
     uint32_t apic_id;           // LAPIC APIC ID
@@ -90,9 +96,12 @@ struct percpu {
     // on "prev"'s kernel stack — a preemption here would save the wrong RSP
     // into next->sp, permanently corrupting its saved stack pointer.
     volatile int in_context_switch;
-    
+
+    // Currently executing syscall number (-1 = not in syscall)
+    int current_syscall_nr;
+
     // Padding to ensure page alignment and cache line separation
-    uint8_t padding[PERCPU_SIZE - 240];  // Adjust based on actual struct size
+    uint8_t padding[PERCPU_SIZE - 252];  // +8 for stack_canary at GS:104
 } __attribute__((aligned(64)));
 
 typedef struct percpu percpu_t;
@@ -112,6 +121,7 @@ _Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_r14) == 72, "perc
 _Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_r15) == 80, "percpu: syscall_saved_user_r15 must be at offset 80");
 _Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_rax) == 88, "percpu: syscall_saved_user_rax must be at offset 88");
 _Static_assert(__builtin_offsetof(percpu_t, syscall_signal_pending) == 96, "percpu: syscall_signal_pending must be at offset 96");
+_Static_assert(__builtin_offsetof(percpu_t, stack_canary) == 104, "percpu: stack_canary must be at GS:104 for -mstack-protector-guard-offset=104");
 
 // ============================================================================
 // Per-CPU Access Macros

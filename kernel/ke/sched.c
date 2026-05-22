@@ -46,6 +46,7 @@
 #include "../../include/kernel/futex.h"
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/slab.h"
+#include "../../include/kernel/random.h"
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
@@ -438,6 +439,10 @@ static void task_init_common(task_t* t) {
     t->clear_child_tid = NULL;
     t->set_child_tid = NULL;
     
+    // Per-task stack canary: unique per task, loaded into GS:104 on every
+    // context switch so the task sees its own canary on any CPU.
+    t->stack_canary = generate_stack_canary();
+
     // TLS support
     t->fs_base = 0;
     t->gs_base = 0;
@@ -470,6 +475,9 @@ void sched_init(void) {
     g_bootstrap_task.privilege = TASK_KERNEL;
     g_bootstrap_task.id = 0;
     task_init_common(&g_bootstrap_task);
+    // The bootstrap task is already running: stack frames already contain the
+    // current per-CPU canary.  Inherit it so epilogue checks keep passing.
+    g_bootstrap_task.stack_canary = this_cpu()->stack_canary;
     g_bootstrap_task.on_cpu = 0;
     // Name the bootstrap/kernel task
     mm_memcpy(g_bootstrap_task.comm, "kernel", 7);
@@ -740,6 +748,10 @@ void sched_schedule(void) {
         this_cpu()->deferred_zombie = prev;
     }
 
+    // Install the incoming task's canary into the per-CPU slot so that every
+    // stack-protected frame on next's stack sees its own canary in GS:104.
+    this_cpu()->stack_canary = next->stack_canary;
+
     ctx_switch_asm(&prev->sp, next->sp);
 
     // Resumed on the new task's stack.  Always clear the guard — the task
@@ -844,6 +856,9 @@ void sched_run_ready(void) {
         }
         this_cpu()->deferred_zombie = prev;
     }
+
+    // Install the incoming task's canary into the per-CPU slot.
+    this_cpu()->stack_canary = next->stack_canary;
 
     ctx_switch_asm(&prev->sp, next->sp);
 
@@ -1794,6 +1809,28 @@ void sched_dump_tasks(struct tty *tty) {
     futex_dump_trace();
 }
 
+/* sched_print_tasks - lock-free task list dump to kprintf.
+ * Called from kernel_oops/panic where locks may be broken.
+ * Walks g_task_list_head without acquiring g_task_list_lock. */
+void sched_print_tasks(void) {
+    static const char* snames[] = { "READY", "RUN", "BLOCK", "STOP", "ZOMBIE" };
+    kprintf("Scheduler state (no lock):\n");
+    int total = 0, running = 0, blocked = 0;
+    task_t *t = g_task_list_head;
+    while (t && total < 256) {
+        const char *s = (t->state < 5) ? snames[t->state] : "?";
+        if (t->state == TASK_RUNNING) running++;
+        else if (t->state == TASK_BLOCKED) blocked++;
+        kprintf("  [%d] tgid=%d %-12s %-8s cpu=%u rip=%016llx\n",
+                t->id, t->tgid, t->comm[0] ? t->comm : "(anon)", s,
+                t->on_cpu,
+                t->preempt_frame ? t->preempt_frame->rip : t->syscall_rip);
+        t = t->next;
+        total++;
+    }
+    kprintf("  total=%d running=%d blocked=%d\n", total, running, blocked);
+}
+
 // ============================================================================
 // PREEMPTIVE SCHEDULING
 // ============================================================================
@@ -1924,6 +1961,9 @@ void sched_preempt(interrupt_frame_t* frame) {
         }
         this_cpu()->deferred_zombie = prev;
     }
+
+    // Install the incoming task's canary into the per-CPU slot.
+    this_cpu()->stack_canary = next->stack_canary;
 
     ctx_switch_asm(&prev->sp, next->sp);
 

@@ -37,7 +37,11 @@ _start:
     # Initialize libc environment from envp before entering main
     mov %rdx, %rdi         # arg1 = envp
     call __libc_init_environ
-    
+
+    # Set __progname from argv[0] for diagnostic reporting
+    mov (%r12), %rdi       # argv[0]  (r12 = argv array)
+    call __libc_set_progname
+
     # Restore argc, argv, envp for main(argc, argv, envp)
     mov %rbx, %rdi
     mov %r12, %rsi

@@ -348,3 +348,62 @@ uint64_t siphash_2_4(const uint8_t key[16], const void* data, size_t len) {
 
     return v0 ^ v1 ^ v2 ^ v3;
 }
+
+// ============================================================================
+// Stack Canary Generator
+// ============================================================================
+
+// Generate a single stack-canary value.  Thread-safe; may be called before
+// GS is live (marked __no_stack_protector).
+//
+// Priority:
+//   1. ChaCha20 CSPRNG output (after random_init / net_init)
+//   2. RDRAND (if CPUID leaf 1 ECX[30] set; avoids #UD on qemu64)
+//   3. RDTSC + address-of-local for ASLR-derived entropy
+//
+// Result: low byte forced to 0x00 (NULL-byte canary convention — string
+// overflows via strcpy/sprintf cannot reproduce a canary containing \0).
+__no_stack_protector
+uint64_t generate_stack_canary(void) {
+    uint64_t canary = 0;
+
+    /* Primary: ChaCha20 CSPRNG (available after random_init in net_init).
+     * Caller must have GS valid when taking this path (APs do, BSP doesn't
+     * reach here until after percpu_init which sets up GS first). */
+    if (g_pool.seeded) {
+        canary = random_u64();
+        goto apply_mask;
+    }
+
+    /* Early-boot fallback: RDRAND with CPUID guard (avoids #UD). */
+    {
+        uint32_t ecx = 0;
+        __asm__ volatile("cpuid" : "=c"(ecx) : "a"(1) : "ebx", "edx");
+        if (ecx & (1U << 30)) {
+            for (int i = 0; i < 10; i++) {
+                uint8_t cf = 0;
+                __asm__ volatile(
+                    "rdrand %0\n\t"
+                    "setc   %1\n\t"
+                    : "=r"(canary), "=qm"(cf) : : "cc");
+                if (cf) goto apply_mask;
+            }
+        }
+    }
+
+    /* RDRAND unavailable or transient failure — RDTSC + stack address. */
+    {
+        uint32_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        canary  = ((uint64_t)hi << 32) ^ (uint64_t)lo;
+        canary ^= (uint64_t)(uintptr_t)&canary;   /* stack ASLR entropy */
+    }
+
+apply_mask:
+    if (canary == 0 || canary == ~0ULL)
+        canary ^= 0xDEADBEEFCAFEBABEULL;
+    canary &= 0xFFFFFFFFFFFFFF00ULL;   /* NULL-byte low byte */
+    if (canary == 0)
+        canary = 0xDEADBEEFCAFEBE00ULL;
+    return canary;
+}

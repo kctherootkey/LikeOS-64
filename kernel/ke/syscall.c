@@ -2490,6 +2490,8 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr, uint64_t envp_pt
 
     // Success! Jump to the new program
     // We need to return to userspace at the new entry point with the new stack
+    // Load the new FS base (TLS / stack canary) before entering user space.
+    task_load_tls(sched_current());
     // Use inline assembly to set up IRET frame and jump
     __asm__ volatile (
         "cli\n\t"
@@ -6006,7 +6008,10 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
     // We snapshot the per-CPU values to task-local storage before enabling interrupts.
     task_t* cur = sched_current();
     percpu_t* cpu = this_cpu();
-    
+
+    /* Track current syscall number for Oops/panic reporting */
+    cpu->current_syscall_nr = (int)num;
+
     if (cur && cur->privilege == TASK_USER) {
         // Read from per-CPU storage (set by syscall_entry in assembly)
         cur->syscall_rsp = cpu->syscall_user_rsp;
@@ -6040,6 +6045,8 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
             }
         }
     }
-    
+
+    /* Clear syscall tracking on return */
+    cpu->current_syscall_nr = -1;
     return ret;
 }

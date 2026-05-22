@@ -224,6 +224,7 @@ bool lapic_is_available(void) {
 
 // Get initial APIC ID from CPUID (safe to call before lapic_init)
 // This doesn't require LAPIC MMIO access, so it works even if LAPIC isn't fully enabled
+__no_stack_protector
 uint32_t lapic_get_id_cpuid(void) {
     uint32_t eax, ebx, ecx, edx;
     cpuid(1, &eax, &ebx, &ecx, &edx);

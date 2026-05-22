@@ -4,7 +4,7 @@ LD = ld
 LIBC_DIR = ../userland/libc
 RTLD_DIR = ../userland/rtld
 
-CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fno-stack-protector \
+CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fstack-protector-strong \
          -mno-red-zone -ffreestanding -fPIE -I$(LIBC_DIR)/include \
          -fno-tree-vectorize -fno-strict-aliasing
 

@@ -6,6 +6,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/acpi.h"
 #include "../../include/kernel/smp.h"
+#include "../../include/kernel/random.h"
 
 // ============================================================================
 // Global Per-CPU Data
@@ -24,12 +25,17 @@ static percpu_t g_bsp_percpu __attribute__((aligned(4096)));
 // Per-CPU Initialization
 // ============================================================================
 
+__no_stack_protector
 void percpu_init(void) {
     smp_dbg("PERCPU: Initializing per-CPU infrastructure\n");
     
     // Initialize BSP's per-CPU data
     mm_memset(&g_bsp_percpu, 0, sizeof(percpu_t));
     g_bsp_percpu.self = &g_bsp_percpu;
+    // Seed the per-CPU canary (RDRAND/RDTSC fallback — CSPRNG not yet ready),
+    // then activate GS so stack-protected callees can read gs:104.
+    g_bsp_percpu.stack_canary = generate_stack_canary();
+    write_gs_base((uint64_t)&g_bsp_percpu);
     g_bsp_percpu.cpu_id = 0;
     g_bsp_percpu.apic_id = 0;  // Will be updated from LAPIC
     g_bsp_percpu.current_task = NULL;
@@ -48,12 +54,10 @@ void percpu_init(void) {
     g_percpu_ptrs[0] = &g_bsp_percpu;
     g_cpus_online = 1;
     
-    // Set GS base to point to BSP's per-CPU data
-    write_gs_base((uint64_t)&g_bsp_percpu);
-    
     smp_dbg("PERCPU: BSP per-CPU data at 0x%lx\n", (uint64_t)&g_bsp_percpu);
 }
 
+__no_stack_protector
 void percpu_init_cpu(uint32_t cpu_id, uint32_t apic_id) {
     percpu_t* percpu;
     
@@ -61,6 +65,11 @@ void percpu_init_cpu(uint32_t cpu_id, uint32_t apic_id) {
         // BSP - already initialized
         percpu = &g_bsp_percpu;
     } else {
+        // AP: temporarily borrow BSP's percpu so that any stack-protected
+        // function called by the allocator below can read a valid canary
+        // from GS:104.  We switch to the AP's own percpu right after.
+        write_gs_base((uint64_t)&g_bsp_percpu);
+
         // AP - allocate new per-CPU data
         percpu = percpu_alloc(cpu_id);
         if (!percpu) {
@@ -71,6 +80,9 @@ void percpu_init_cpu(uint32_t cpu_id, uint32_t apic_id) {
     
     // Initialize per-CPU fields
     percpu->self = percpu;
+    // Seed a unique CSPRNG-backed canary (GS→BSP percpu is valid here).
+    percpu->stack_canary = generate_stack_canary();
+    write_gs_base((uint64_t)percpu);
     percpu->cpu_id = cpu_id;
     percpu->apic_id = apic_id;
     percpu->current_task = NULL;
@@ -97,9 +109,6 @@ void percpu_init_cpu(uint32_t cpu_id, uint32_t apic_id) {
     percpu->context_switches = 0;
     percpu->interrupts = 0;
     percpu->timer_ticks = 0;
-    
-    // Set GS base for this CPU
-    write_gs_base((uint64_t)percpu);
     
     // Store in global array
     g_percpu_ptrs[cpu_id] = percpu;

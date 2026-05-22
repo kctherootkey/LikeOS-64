@@ -19,7 +19,7 @@ BUILD_DIR    := ../../build
 CC := gcc
 LD := ld
 
-CFLAGS := -Wall -O2 -nostdlib -fno-builtin -fno-stack-protector \
+CFLAGS := -Wall -O2 -nostdlib -fno-builtin -fstack-protector-strong \
           -mno-red-zone -ffreestanding -fPIE \
           -DHAVE_CONFIG_H -DTMUX_VERSION='"3.6a"' \
           -D__LikeOS__=1 \

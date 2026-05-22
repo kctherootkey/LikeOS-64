@@ -10,6 +10,7 @@
 #include <kernel/pipe.h>
 #include <kernel/net.h>
 #include <kernel/smp.h>
+#include <kernel/random.h>
 
 // ============================================================================
 // VALIDATION
@@ -313,6 +314,39 @@ static uint64_t elf_setup_stack(uint64_t* pml4,
 }
 
 // ============================================================================
+// Per-process initial TLS block with hardware-random stack canary
+// ============================================================================
+//
+// GCC -fstack-protector-strong emits `mov %fs:0x28,%rax` to read the canary.
+// We map one page at USER_INITIAL_TLS_VA into every new process's address
+// space and write a hardware-random 64-bit value at offset 0x28 (= fs:0x28).
+// The self-pointer at offset 0 satisfies the glibc/musl TCB convention.
+// The dynamic linker / libc may later replace this via arch_prctl(ARCH_SET_FS).
+//
+#define USER_INITIAL_TLS_VA  0x7FFFE0000000ULL  /* well clear of stack and interp */
+
+static void setup_user_tls_canary(uint64_t* pml4, task_t* task) {
+    uint64_t phys = mm_allocate_physical_page();
+    if (!phys) return;
+
+    uint8_t* kp = (uint8_t*)phys_to_virt(phys);
+    mm_memset(kp, 0, PAGE_SIZE);
+
+    /* TCB self-pointer at offset 0 (required by glibc / musl). */
+    *(uint64_t*)(kp + 0x00) = USER_INITIAL_TLS_VA;
+
+    /* Generate a per-process stack canary (ChaCha20 CSPRNG backed). */
+    *(uint64_t*)(kp + 0x28) = generate_stack_canary();   /* fs:0x28 */
+
+    uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER | PAGE_NO_EXECUTE;
+    if (!mm_map_page_in_address_space(pml4, USER_INITIAL_TLS_VA, phys, flags)) {
+        mm_free_physical_page(phys);
+        return;
+    }
+    task->fs_base = USER_INITIAL_TLS_VA;
+}
+
+// ============================================================================
 // PUBLIC: elf_exec  (launch new task)
 // ============================================================================
 
@@ -376,6 +410,9 @@ int elf_exec(const char* path, char* const argv[], char* const envp[],
     t->brk             = lr.brk_start;
     t->user_stack_top  = USER_STACK_TOP;
     t->mmap_base       = USER_STACK_TOP - (4 * 1024 * 1024);
+
+    /* Allocate per-process TLS page with random canary at fs:0x28. */
+    setup_user_tls_canary(pml4, t);
 
     task_t* cur = sched_current();
     if (cur) {
@@ -489,6 +526,10 @@ uint64_t elf_exec_replace(const char* path, char* const argv[],
     uint64_t sp = elf_setup_stack(pml4, USER_STACK_TOP_EXEC, USER_STACK_SIZE_EXEC,
                                   argv, envp, &lr, ib);
     if (!sp) { mm_destroy_address_space(pml4); return 0; }
+
+    /* Allocate a fresh per-process TLS page with a new random canary.
+     * Must be done before mm_destroy_address_space(old) frees the old TLS. */
+    setup_user_tls_canary(pml4, cur);
 
     cur->pml4          = pml4;
     cur->brk_start     = lr.brk_start;

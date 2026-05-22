@@ -1,6 +1,9 @@
 # LikeOS-64 UEFI Build System
 # Professional UEFI kernel build with modular directory structure
 
+# Pass DEBUG=1 on the command line to enable verbose stack-smash output in libc.
+DEBUG ?= 0
+
 # Codename for this release
 CODENAME = blessed kitty
 
@@ -80,11 +83,11 @@ EFI_LIBS = /usr/lib/crt0-efi-x86_64.o
 EFI_LDS = /usr/lib/elf_x86_64_efi.lds
 
 # Compiler flags for kernel
-# Note: Stack protector disabled because __stack_chk_guard access can conflict
-# with identity mapping removal during boot
 BUILD_DATE := $(shell LC_ALL=C date -u '+%a %b %-d %H:%M:%S UTC %Y')
 KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
-			-fno-stack-protector -mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
+			-fstack-protector-strong -mstack-protector-guard=tls \
+			-mstack-protector-guard-reg=gs -mstack-protector-guard-offset=104 \
+			-mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
 			-I$(INCLUDE_DIR) -I$(KERNEL_DIR)/hal/acpica/include \
 			-D__LIKEOS__ -DACPI_USE_BUILTIN_STDARG \
 			-U__linux__ -U_LINUX -Ulinux \
@@ -110,11 +113,11 @@ ACPICA_OBJS = $(patsubst $(ACPICA_DIR)/%.c,$(BUILD_DIR)/acpica/%.o,$(ACPICA_SRCS
 
 # Compiler flags for userspace programs
 USER_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
-			-fno-stack-protector -mno-red-zone -mcmodel=small -fno-pic -Wall -Wextra \
+			-fstack-protector-strong -mno-red-zone -mcmodel=small -fno-pic -Wall -Wextra \
 			-I$(USER_DIR)
 
 # Compiler flags for UEFI bootloader
-UEFI_CFLAGS = -fno-stack-protector -fpic -fshort-wchar -mno-red-zone \
+UEFI_CFLAGS = -fstack-protector-strong -mstack-protector-guard=global -fpic -fshort-wchar -mno-red-zone \
               -maccumulate-outgoing-args $(EFI_INCLUDES) -DEFI_FUNCTION_WRAPPER \
               $(UEFI_SCREEN_CFLAGS)
 
@@ -464,12 +467,12 @@ $(BUILD_DIR)/futex.o: $(KERNEL_DIR)/ke/futex.c | $(BUILD_DIR)
 # Build userland C library
 .PHONY: userland-libc
 userland-libc:
-	$(MAKE) -C userland/libc
+	$(MAKE) -C userland/libc DEBUG=$(DEBUG)
 
 # Build runtime linker
 .PHONY: userland-rtld
 userland-rtld:
-	$(MAKE) -C userland/rtld
+	$(MAKE) -C userland/rtld DEBUG=$(DEBUG)
 
 # Build test shared library
 .PHONY: userland-testlib
@@ -945,16 +948,19 @@ endif
 	@echo "LikeOS-64 ELF64 kernel built: $(KERNEL_ELF)"
 
 # Build UEFI bootloader
-$(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/trampoline.S | $(BUILD_DIR)
+$(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/boot_stack_chk.c $(BOOT_DIR)/trampoline.S | $(BUILD_DIR)
 	@echo "Building UEFI bootloader..."
 	# Compile bootloader C code
 	$(GCC) $(UEFI_CFLAGS) -c $(BOOT_DIR)/bootloader.c -o $(BUILD_DIR)/bootloader.o
+	
+	# Compile stack canary support
+	$(GCC) $(UEFI_CFLAGS) -c $(BOOT_DIR)/boot_stack_chk.c -o $(BUILD_DIR)/boot_stack_chk.o
 	
 	# Assemble trampoline code
 	$(GCC) $(UEFI_CFLAGS) -c $(BOOT_DIR)/trampoline.S -o $(BUILD_DIR)/trampoline.o
 	
 	# Link as shared object
-	$(LD) $(UEFI_LDFLAGS) $(EFI_LIBS) $(BUILD_DIR)/bootloader.o $(BUILD_DIR)/trampoline.o \
+	$(LD) $(UEFI_LDFLAGS) $(EFI_LIBS) $(BUILD_DIR)/bootloader.o $(BUILD_DIR)/boot_stack_chk.o $(BUILD_DIR)/trampoline.o \
 		-o $(BUILD_DIR)/bootloader.so \
 		/usr/lib/libgnuefi.a /usr/lib/libefi.a
 	

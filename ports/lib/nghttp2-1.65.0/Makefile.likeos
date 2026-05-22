@@ -33,7 +33,7 @@ CFLAGS := -O2 -fPIC \
           -I$(ABS_LIBC)/include \
           -DHAVE_CONFIG_H \
           -D__LIKEOS__ \
-          -fno-stack-protector \
+          -fstack-protector-strong \
           -mno-red-zone \
           -Wno-unused-parameter \
           -Wno-unused-function \

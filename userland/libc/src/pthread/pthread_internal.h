@@ -40,6 +40,7 @@ struct __pthread {
     
     // Stack information
     void* stack_base;               // mmap'd region base
+    size_t stack_guard;             // Stack canary — MUST stay at offset 0x28 (%fs:0x28)
     size_t stack_size;              // Total size including guard
     size_t guard_size;              // Guard page size
     
@@ -70,6 +71,11 @@ struct __pthread {
     // Padding to ensure alignment
     char _pad[32];
 };
+
+/* stack_guard must sit at exactly offset 0x28 so GCC's -fstack-protector
+ * finds the canary via %fs:0x28.  Tighten the layout here if this fires. */
+_Static_assert(__builtin_offsetof(struct __pthread, stack_guard) == 0x28,
+               "stack_guard must be at offset 0x28 (%fs:0x28 canary slot)");
 
 // Get current thread's TCB
 static inline struct __pthread* __pthread_self(void) {

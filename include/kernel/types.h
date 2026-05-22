@@ -27,4 +27,10 @@ typedef int bool;
 #define NULL ((void*)0)
 #endif
 
+// Disable stack-protector instrumentation on a function.
+// Use for early-boot code that runs before the kernel stack is fully set up
+// (bootloader stack era, page-table remapping, stack-switch path).
+// Mirrors Linux's __no_stack_protector annotation.
+#define __no_stack_protector __attribute__((no_stack_protector))
+
 #endif // _KERNEL_TYPES_H_

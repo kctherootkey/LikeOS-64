@@ -2497,22 +2497,45 @@ int main(int argc, char** argv) {
 
     printf("\n[TEST] arch_prctl() TLS syscall\n");
     {
-        // Test ARCH_SET_FS and ARCH_GET_FS for TLS
-        unsigned long test_tls_addr = 0x00007F0012340000UL;  // Must be canonical
-        unsigned long readback = 0;
-        
-        // Set FS base
-        int set_result = arch_prctl(ARCH_SET_FS, test_tls_addr);
-        test_result("arch_prctl(ARCH_SET_FS) succeeds", set_result == 0);
-        
-        // Get FS base back
-        int get_result = arch_prctl(ARCH_GET_FS, (unsigned long)&readback);
-        test_result("arch_prctl(ARCH_GET_FS) succeeds", get_result == 0);
-        test_result("ARCH_GET_FS returns correct value", readback == test_tls_addr);
-        printf("  Set FS base to 0x%lx, read back 0x%lx\n", test_tls_addr, readback);
-        
-        // Restore to 0 (or original value)
-        arch_prctl(ARCH_SET_FS, 0);
+        // Allocate a real mapped page to serve as the temporary TLS block.
+        // Using a hardcoded unmapped address would fault at fs:0x28 because any
+        // stack-protected function (printf, etc.) reads the canary from there.
+        void *tls_block = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (tls_block == MAP_FAILED) {
+            test_fail("arch_prctl(ARCH_SET_FS) succeeds");
+            test_fail("arch_prctl(ARCH_GET_FS) succeeds");
+            test_fail("ARCH_GET_FS returns correct value");
+        } else {
+            unsigned long test_tls_addr = (unsigned long)tls_block;
+            unsigned long orig_fs = 0;
+            unsigned long readback = 0;
+
+            // Save original FS base so we can restore it afterwards.
+            arch_prctl(ARCH_GET_FS, (unsigned long)&orig_fs);
+
+            // Copy the current stack canary into the new TLS block at offset 0x28
+            // (the slot read by every stack-protected function via fs:0x28) so
+            // that printf / test_result continue to work after the FS switch.
+            uint64_t cur_canary;
+            __asm__ volatile("mov %%fs:0x28, %0" : "=r"(cur_canary));
+            *(volatile uint64_t *)((char *)tls_block + 0x28) = cur_canary;
+
+            // Set FS base to our mapped TLS block.
+            int set_result = arch_prctl(ARCH_SET_FS, test_tls_addr);
+            test_result("arch_prctl(ARCH_SET_FS) succeeds", set_result == 0);
+
+            // Get FS base back.
+            int get_result = arch_prctl(ARCH_GET_FS, (unsigned long)&readback);
+            test_result("arch_prctl(ARCH_GET_FS) succeeds", get_result == 0);
+            test_result("ARCH_GET_FS returns correct value", readback == test_tls_addr);
+            printf("  Set FS base to 0x%lx, read back 0x%lx\n", test_tls_addr, readback);
+
+            // Restore the original FS base.
+            arch_prctl(ARCH_SET_FS, orig_fs);
+
+            munmap(tls_block, 4096);
+        }
     }
 
     printf("\n[TEST] Fork thread group isolation\n");

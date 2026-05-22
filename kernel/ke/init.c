@@ -25,6 +25,7 @@
 #include "../../include/kernel/usbhid.h"
 #include "../../include/kernel/usb_serial.h"
 #include "../../include/kernel/net.h"
+#include "../../include/kernel/types.h"
 
 void system_startup(boot_info_t* boot_info);
 void kernel_main(boot_info_t* boot_info);
@@ -36,6 +37,7 @@ static uint64_t g_rsdp_address;           // Saved RSDP address (copied before i
 static uint64_t g_smp_trampoline_address; // Saved SMP trampoline address from bootloader
 static uint64_t g_boot_epoch_saved;       // Saved boot epoch from UEFI GetTime
 
+__no_stack_protector
 void kernel_main(boot_info_t* boot_info) {
     g_boot_info = boot_info;
     console_init((framebuffer_info_t*)&boot_info->fb_info);
@@ -43,6 +45,7 @@ void kernel_main(boot_info_t* boot_info) {
     system_startup(boot_info);
 }
 
+__no_stack_protector
 void system_startup(boot_info_t* boot_info) {
     console_set_color(10, 0);
     kprintf("\nLikeOS-64 Kernel v0.2\n\n");
@@ -106,7 +109,11 @@ void system_startup(boot_info_t* boot_info) {
 
 // This function continues system startup after switching to the kernel stack
 // and removing identity mapping. Called from mm_switch_to_kernel_stack()
+__no_stack_protector
 void continue_system_startup(void) {
+    // Establish per-CPU GS base and stack canary FIRST, before any
+    // stack-protected callee runs (compiler emits gs:104 canary loads).
+    percpu_init();
     mm_initialize_syscall();
 
     pci_init();
@@ -164,7 +171,6 @@ void continue_system_startup(void) {
         ioapic_mask_gsi((uint8_t)sci_gsi);
 
     // Initialize SMP support
-    percpu_init();
     smp_init(g_smp_trampoline_address);
 
     // Boot Application Processors (APs)

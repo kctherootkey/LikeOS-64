@@ -42,7 +42,7 @@ LD := ld
 # ---------------------------------------------------------------------------
 CFLAGS := -O2 -fPIC \
           -nostdinc \
-          -fno-stack-protector \
+          -fstack-protector-strong \
           -mno-red-zone \
           -DHAVE_CONFIG_H \
           -D__LIKEOS__ \

@@ -387,11 +387,221 @@ static const char* exception_messages[] = {
     "VMM Communication Exception", "Security Exception", "Reserved"
 };
 
+/* Register frame indices — must match isr_common_stub push order in interrupt.asm.
+ * Push sequence: rax,rbx,rcx,rdx,rsi,rdi,rbp,r8,r9,r10,r11,r12,r13,r14,r15
+ * After push r15, RSP points to r15; rdi=RSP before XMM save, so regs[0]=r15. */
+#define REGS_R15    0
+#define REGS_R14    1
+#define REGS_R13    2
+#define REGS_R12    3
+#define REGS_R11    4
+#define REGS_R10    5
+#define REGS_R9     6
+#define REGS_R8     7
+#define REGS_RBP    8
+#define REGS_RDI    9
+#define REGS_RSI    10
+#define REGS_RDX    11
+#define REGS_RCX    12
+#define REGS_RBX    13
+#define REGS_RAX    14
+#define REGS_INTNO  15
+#define REGS_ERRC   16
+#define REGS_RIP    17
+#define REGS_CS     18
+#define REGS_RFLAGS 19
+#define REGS_RSP    20   /* always pushed by x86-64 CPU, even same-privilege */
+#define REGS_SS     21
+
+/* Safe kernel-address check for stack trace walking */
+static int is_kernel_addr(uint64_t addr) {
+    return addr >= 0xffff800000000000ULL && addr < 0xfffffffffffff000ULL;
+}
+
+/* Walk the RBP frame chain and print return addresses via kprintf */
+static void oops_stack_trace(uint64_t rbp, uint64_t fault_rip) {
+    kprintf("\nCall Trace:\n");
+    kprintf("  [<%016llx>] (fault RIP)\n", fault_rip);
+    int depth = 0;
+    while (is_kernel_addr(rbp) && depth < 20) {
+        uint64_t *frame = (uint64_t *)rbp;
+        uint64_t ret_addr = frame[1];   /* [rbp+8] = return address */
+        uint64_t next_rbp = frame[0];   /* [rbp+0] = saved RBP */
+        if (!ret_addr || !is_kernel_addr(ret_addr))
+            break;
+        kprintf("  [<%016llx>]\n", ret_addr);
+        if (next_rbp <= rbp)            /* prevent loops / upward drift */
+            break;
+        rbp = next_rbp;
+        depth++;
+    }
+}
+
+/* Decode page-fault error code bits into human-readable form */
+static void oops_pf_decode(uint64_t err, uint64_t cr2) {
+    kprintf("  Fault address : 0x%016llx\n", cr2);
+    kprintf("  Error code    : 0x%016llx  [%s | %s | %s%s%s]\n",
+            err,
+            (err & 1)  ? "protection-violation" : "not-present",
+            (err & 2)  ? "write"                : "read",
+            (err & 4)  ? "user-mode"            : "kernel-mode",
+            (err & 8)  ? " | reserved-bit"      : "",
+            (err & 16) ? " | insn-fetch"        : "");
+    /* Describe page permissions from PTE if address is canonical */
+    if (is_kernel_addr(cr2) || cr2 < 0x0000800000000000ULL) {
+        uint64_t cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        /* Walk PML4 → PDPT → PD → PT to show PTE flags */
+        uint64_t *pml4 = (uint64_t *)(cr3 & ~0xFFFULL);
+        uint64_t idx4  = (cr2 >> 39) & 0x1FF;
+        uint64_t idx3  = (cr2 >> 30) & 0x1FF;
+        uint64_t idx2  = (cr2 >> 21) & 0x1FF;
+        uint64_t idx1  = (cr2 >> 12) & 0x1FF;
+        if (!(pml4[idx4] & 1)) { kprintf("  PML4[%llu]: not present\n", idx4); return; }
+        uint64_t *pdpt = (uint64_t *)(pml4[idx4] & ~0xFFFULL);
+        if (!(pdpt[idx3] & 1)) { kprintf("  PDPT[%llu]: not present\n", idx3); return; }
+        if (pdpt[idx3] & (1ULL<<7)) {
+            kprintf("  1-GB page: PTE=0x%016llx  [%s%s%s%s]\n", pdpt[idx3],
+                    (pdpt[idx3]&1)?"P ":"", (pdpt[idx3]&2)?"W ":"",
+                    (pdpt[idx3]&4)?"U ":"", (pdpt[idx3]&(1ULL<<63))?"NX":"");
+            return;
+        }
+        uint64_t *pd = (uint64_t *)(pdpt[idx3] & ~0xFFFULL);
+        if (!(pd[idx2] & 1)) { kprintf("  PD[%llu]: not present\n", idx2); return; }
+        if (pd[idx2] & (1ULL<<7)) {
+            kprintf("  2-MB page: PTE=0x%016llx  [%s%s%s%s]\n", pd[idx2],
+                    (pd[idx2]&1)?"P ":"", (pd[idx2]&2)?"W ":"",
+                    (pd[idx2]&4)?"U ":"", (pd[idx2]&(1ULL<<63))?"NX":"");
+            return;
+        }
+        uint64_t *pt = (uint64_t *)(pd[idx2] & ~0xFFFULL);
+        uint64_t pte = pt[idx1];
+        kprintf("  PTE[%llu]:   0x%016llx  [%s%s%s%s]\n", idx1, pte,
+                (pte&1)?"P ":"not-present ",
+                (pte&2)?"W ":"RO ",
+                (pte&4)?"U ":"S ",
+                (pte&(1ULL<<63))?"NX":"X");
+    }
+}
+
+void kernel_oops(const char *reason, uint64_t *regs) {
+    __asm__ volatile("cli" ::: "memory");
+
+    uint64_t rip      = regs[REGS_RIP];
+    uint64_t rsp      = regs[REGS_RSP];
+    uint64_t rbp      = regs[REGS_RBP];
+    uint64_t cs       = regs[REGS_CS];
+    uint64_t rflags   = regs[REGS_RFLAGS];
+    uint64_t int_no   = regs[REGS_INTNO];
+    uint64_t err_code = regs[REGS_ERRC];
+    int user_mode     = (cs & 0x3) == 0x3;
+
+    uint64_t cr2, cr3, cr4;
+    __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+
+    console_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+
+    kprintf("\n");
+    kprintf("============================================================\n");
+    kprintf("Oops: %s\n", reason ? reason : "kernel exception");
+    kprintf("============================================================\n");
+
+    /* Exception identity */
+    const char *exc_name = (int_no < 32) ? exception_messages[int_no] : "Unknown";
+    kprintf("Exception : INT %llu  (%s)\n", int_no, exc_name);
+    kprintf("Mode      : %s\n", user_mode ? "user" : "kernel");
+
+    /* CPU / thread identification (GS may be unset during early boot) */
+    uint32_t cpu_id = 0;
+    task_t  *cur    = NULL;
+    if (read_gs_base_msr()) {
+        cpu_id = this_cpu_id();
+        cur = sched_current();
+        percpu_t *pcpu = this_cpu();
+        int syscall_nr = pcpu ? pcpu->current_syscall_nr : -1;
+        kprintf("CPU       : %u\n", cpu_id);
+        if (cur) {
+            kprintf("Process   : pid=%d tgid=%d comm=\"%s\"\n",
+                    cur->id, cur->tgid,
+                    cur->comm[0] ? cur->comm : "(anon)");
+            kprintf("Thread    : tid=%d\n", cur->id);
+        }
+        if (syscall_nr >= 0)
+            kprintf("Syscall   : nr=%d (in-progress)\n", syscall_nr);
+        else
+            kprintf("Syscall   : not in syscall\n");
+    } else {
+        kprintf("CPU       : (GS not set — early boot)\n");
+    }
+
+    /* Instruction / stack pointers */
+    kprintf("\n--- Fault Location ---\n");
+    kprintf("RIP       : 0x%016llx\n", rip);
+    kprintf("RSP       : 0x%016llx\n", rsp);
+    kprintf("RFLAGS    : 0x%016llx\n", rflags);
+    kprintf("CS        : 0x%04llx\n",  cs);
+
+    /* Page-fault specific info */
+    if (int_no == 14) {
+        kprintf("\n--- Page Fault ---\n");
+        oops_pf_decode(err_code, cr2);
+    } else if (err_code) {
+        kprintf("Error Code: 0x%016llx\n", err_code);
+    }
+
+    /* Full register dump */
+    kprintf("\n--- Registers ---\n");
+    kprintf("RAX: 0x%016llx  RBX: 0x%016llx  RCX: 0x%016llx\n",
+            regs[REGS_RAX], regs[REGS_RBX], regs[REGS_RCX]);
+    kprintf("RDX: 0x%016llx  RSI: 0x%016llx  RDI: 0x%016llx\n",
+            regs[REGS_RDX], regs[REGS_RSI], regs[REGS_RDI]);
+    kprintf("RBP: 0x%016llx  RSP: 0x%016llx\n", rbp, rsp);
+    kprintf("R8 : 0x%016llx  R9 : 0x%016llx  R10: 0x%016llx\n",
+            regs[REGS_R8],  regs[REGS_R9],  regs[REGS_R10]);
+    kprintf("R11: 0x%016llx  R12: 0x%016llx  R13: 0x%016llx\n",
+            regs[REGS_R11], regs[REGS_R12], regs[REGS_R13]);
+    kprintf("R14: 0x%016llx  R15: 0x%016llx\n",
+            regs[REGS_R14], regs[REGS_R15]);
+    kprintf("CR2: 0x%016llx  CR3: 0x%016llx  CR4: 0x%016llx\n", cr2, cr3, cr4);
+
+    /* Stack trace */
+    oops_stack_trace(rbp, rip);
+
+    /* Scheduler state */
+    kprintf("\n--- Scheduler State ---\n");
+    sched_print_tasks();
+
+    kprintf("\n============================================================\n");
+    kprintf("System halted.\n");
+    console_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+}
+
+void panic(const char *fmt, ...) {
+    __asm__ volatile("cli" ::: "memory");
+    char msg[256];
+    va_list ap;
+    __builtin_va_start(ap, fmt);
+    kvsnprintf(msg, sizeof(msg), fmt, ap);
+    __builtin_va_end(ap);
+
+    console_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+    kprintf("\n============================================================\n");
+    kprintf("KERNEL PANIC: %s\n", msg);
+    kprintf("============================================================\n");
+    console_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+
+    for (;;) {
+        __asm__ volatile("hlt");
+    }
+}
+
 void exception_handler(uint64_t *regs) {
-    uint64_t int_no = regs[15];
-    uint64_t err_code = regs[16];
-    uint64_t rip = regs[17];
-    uint64_t cs = regs[18];
+    uint64_t int_no = regs[REGS_INTNO];
+    uint64_t err_code = regs[REGS_ERRC];
+    uint64_t rip = regs[REGS_RIP];
+    uint64_t cs = regs[REGS_CS];
     int user_mode = (cs & 0x3) == 0x3;
 
     if (int_no == 14) {
@@ -479,30 +689,13 @@ void exception_handler(uint64_t *regs) {
         }
     }
 
-    console_set_color(VGA_COLOR_RED, VGA_COLOR_BLACK);
-    kprintf("=== EXCEPTION: %s (INT %llu) ===\n",
-           (int_no < 32) ? exception_messages[int_no] : "Unknown", int_no);
-    kprintf("RIP: 0x%016llx  RSP: 0x%016llx  RBP: 0x%016llx\n", rip, regs[20], regs[6]);
-    kprintf("RAX: 0x%016llx  RBX: 0x%016llx  RCX: 0x%016llx\n", regs[0], regs[3], regs[1]);
-    kprintf("RDX: 0x%016llx  RSI: 0x%016llx  RDI: 0x%016llx\n", regs[2], regs[4], regs[5]);
-
-    if (int_no == 8 || (int_no >= 10 && int_no <= 14) || int_no == 17 || int_no == 21 || int_no == 29 || int_no == 30) {
-        kprintf("Error Code: 0x%016llx\n", err_code);
-        if (int_no == 14) {
-            uint64_t cr2;
-            __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-            kprintf("Page Fault Address: 0x%016llx\n", cr2);
-        }
+    /* Kernel-mode fatal exception — print Oops and halt */
+    {
+        const char *exc_name = (int_no < 32) ? exception_messages[int_no] : "Unknown";
+        char reason[64];
+        ksnprintf(reason, sizeof(reason), "%s (INT %llu)", exc_name, int_no);
+        kernel_oops(reason, regs);
     }
-
-    uint64_t cr0, cr2, cr3;
-    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
-    __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-    kprintf("CR0: 0x%016llx  CR2: 0x%016llx  CR3: 0x%016llx\n", cr0, cr2, cr3);
-
-    console_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
-    kprintf("\nSystem halted.\n");
 
     for (;;) {
         __asm__ volatile ("hlt");
@@ -527,7 +720,7 @@ static inline uint8_t pic2_read_isr(void) {
 }
 
 void irq_handler(uint64_t *regs) {
-    uint64_t int_no = regs[15];
+    uint64_t int_no = regs[REGS_INTNO];
     uint8_t irq = (uint8_t)(int_no - 32);
     
     g_total_irq_count++;
