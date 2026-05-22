@@ -98,6 +98,23 @@ _start:
     jmp     .Lreloc_loop
 
 .Lno_dynamic:
+    /* ---- Bootstrap TLS (before any C code touches %fs:0x28) -----------
+     * rtld is compiled with -fstack-protector-strong.  Every C function
+     * prologue reads %fs:0x28.  With FS base = 0 that faults at VA 0x28.
+     * Point FS at a small static block with a self-pointer and a canary
+     * before calling _dl_main.  rtld_init_tls() will later switch FS to
+     * the real TLS and will copy this canary so pending epilogues pass. */
+    leaq    _bootstrap_tls(%rip), %rdi   /* rdi = &_bootstrap_tls        */
+    movq    %rdi, (%rdi)                 /* fs:0  = self-pointer          */
+    rdtsc                                /* edx:eax = TSC                 */
+    shlq    $32, %rdx
+    orq     %rdx, %rax
+    orq     %rbx, %rax                   /* guaranteed non-zero (rbx=SP)  */
+    movq    %rax, 0x28(%rdi)             /* fs:0x28 = bootstrap canary    */
+    movq    %rdi, %rsi                   /* rsi = TLS block address       */
+    movq    $0x1002, %rdi                /* rdi = ARCH_SET_FS             */
+    movq    $318, %rax                   /* rax = SYS_ARCH_PRCTL          */
+    syscall
     /* ---- Call _dl_main(original_sp, own_base) ---- */
     movq    %rbx, %rdi              /* arg1: original sp */
     movq    %r12, %rsi              /* arg2: own_base */
@@ -200,6 +217,16 @@ _dl_runtime_resolve:
     jmp     *%r11                   /* enter resolved function; return addr on stack */
 
     .size _dl_runtime_resolve, .-_dl_runtime_resolve
+
+/* ---- Bootstrap TLS block: used by _start before rtld_init_tls() ----
+ * Must be at least 0x30 bytes: offset 0 = self-pointer, 0x28 = canary. */
+    .section .bss
+    .align  64
+    .local  _bootstrap_tls
+    .type   _bootstrap_tls, @object
+    .size   _bootstrap_tls, 64
+_bootstrap_tls:
+    .space  64
 
 /* Mark stack as non-executable */
     .section .note.GNU-stack,"",@progbits

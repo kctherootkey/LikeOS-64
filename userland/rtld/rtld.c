@@ -582,6 +582,12 @@ static void rtld_init_tls(void)
             rtld_memcpy(tp + d->tls_offset,
                         (const void *)d->tls_image, d->tls_filesz);
     }
+    /* Preserve the bootstrap stack canary so stack-protected rtld frames
+     * that saved it in their prologue still pass the epilogue check after
+     * FS is switched to the real TLS block. */
+    uint64_t bootstrap_canary;
+    __asm__ volatile("mov %%fs:0x28, %0" : "=r"(bootstrap_canary));
+    *(uint64_t *)(tp + 0x28) = bootstrap_canary;
     rtld_arch_prctl(ARCH_SET_FS, (uint64_t)tp);
 }
 
