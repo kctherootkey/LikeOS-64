@@ -32,6 +32,11 @@ int inet_aton(const char *cp, struct in_addr *inp) {
 }
 
 int inet_pton(int af, const char *src, void *dst) {
+    if (af == AF_INET6) {
+        /* IPv6 not implemented; return 0 so callers that test for a successful
+         * parse (return == 1) correctly treat any string as non-IPv6. */
+        return 0;
+    }
     if (af != AF_INET) return -1;
     struct in_addr a;
     if (!inet_aton(src, &a)) return 0;

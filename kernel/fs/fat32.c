@@ -1752,6 +1752,44 @@ int fat32_dir_list(unsigned long cluster, void (*cb)(const char *, unsigned, uns
     return fat32_dir_list_internal(cluster, cb, 0);
 }
 
+/* Convert Unix epoch seconds to FAT32 date/time fields.
+ * Date: bits 15-9 = year-1980, 8-5 = month(1-12), 4-0 = day(1-31)
+ * Time: bits 15-11 = hours, 10-5 = minutes, 4-0 = seconds/2 */
+static void fat32_epoch_to_datetime(uint64_t epoch, uint16_t *date_out, uint16_t *time_out)
+{
+    uint32_t days      = (uint32_t)(epoch / 86400);
+    uint32_t tod       = (uint32_t)(epoch % 86400);
+    int hours          = (int)(tod / 3600);
+    int mins           = (int)((tod % 3600) / 60);
+    int secs           = (int)(tod % 60);
+
+    /* Walk years from 1970 */
+    int year = 1970;
+    while (1) {
+        int lp = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+        uint32_t yd = lp ? 366u : 365u;
+        if (days < yd) break;
+        days -= yd;
+        year++;
+    }
+    static const int mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+    int leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+    int month = 1;
+    for (; month <= 12; month++) {
+        int md = mdays[month] + (month == 2 && leap ? 1 : 0);
+        if (days < (uint32_t)md) break;
+        days -= (uint32_t)md;
+    }
+    int day = (int)days + 1;
+
+    int fat_year = year - 1980;
+    if (fat_year < 0) fat_year = 0;
+    if (fat_year > 127) fat_year = 127;
+
+    *date_out = (uint16_t)(((fat_year & 0x7F) << 9) | ((month & 0x0F) << 5) | (day & 0x1F));
+    *time_out = (uint16_t)(((hours & 0x1F) << 11) | ((mins & 0x3F) << 5) | ((secs / 2) & 0x1F));
+}
+
 /* Convert FAT32 date/time to Unix epoch seconds.
  * Date: bits 15-9 = year-1980, 8-5 = month(1-12), 4-0 = day(1-31)
  * Time: bits 15-11 = hours, 10-5 = minutes, 4-0 = seconds/2 */
@@ -2153,6 +2191,74 @@ static int fat32_rename_impl(const char* oldpath, const char* newpath);
 static int fat32_mkdir_impl(const char* path, unsigned int mode);
 static int fat32_rmdir_impl(const char* path);
 static int fat32_chdir_impl(const char* path);
+static int fat32_resolve_parent(unsigned long start_cluster, const char *path,
+    unsigned long *parent_cluster, char *name_out, unsigned name_out_len);
+
+/* fat32_utimensat_impl - Update mtime (wrtTime/wrtDate) of a file on FAT32.
+ * times[0] = atime (FAT32 has no atime field, ignored)
+ * times[1] = mtime
+ * If times is NULL, set mtime to current time (use timer_get_epoch()).
+ * tv_nsec == KRN_UTIME_OMIT: leave that timestamp unchanged.
+ * tv_nsec == KRN_UTIME_NOW: set to current time.
+ */
+static int fat32_utimensat_impl(const char *path,
+    int64_t mtime_sec, long mtime_nsec)
+{
+    if (!g_root_fs || !path) return ST_INVALID;
+
+    /* Resolve parent cluster + final component name */
+    unsigned long start_cluster = fat32_get_task_cwd_cluster();
+    const char *rpath = fat32_normalize_start(path, &start_cluster);
+
+    unsigned long parent_cluster = 0;
+    char name[FAT32_LFN_MAX];
+    if (fat32_resolve_parent(start_cluster, rpath, &parent_cluster, name, sizeof(name)) != ST_OK)
+        return ST_NOT_FOUND;
+
+    /* Find the short-name directory entry location */
+    unsigned attr = 0;
+    unsigned long fc = 0, sz = 0;
+    unsigned long dir_cluster = 0;
+    unsigned int  dir_index   = 0;
+    if (fat32_dir_find_entry_lfn(parent_cluster, name, &attr, &fc, &sz,
+            &dir_cluster, &dir_index, NULL, NULL) != ST_OK)
+        return ST_NOT_FOUND;
+
+    /* Determine the new mtime */
+    uint16_t new_date, new_time;
+    if (mtime_nsec == KRN_UTIME_OMIT) {
+        /* Caller wants to leave mtime unchanged — nothing to do */
+        return ST_OK;
+    } else if (mtime_nsec == KRN_UTIME_NOW) {
+        uint64_t now = timer_get_epoch();
+        fat32_epoch_to_datetime(now, &new_date, &new_time);
+    } else {
+        fat32_epoch_to_datetime((uint64_t)mtime_sec, &new_date, &new_time);
+    }
+
+    /* Read the cluster containing the dirent, update timestamps, write back */
+    unsigned cluster_size = g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
+    void *buf = kalloc(cluster_size);
+    if (!buf) return ST_NOMEM;
+
+    unsigned long lba = cluster_to_lba(g_root_fs, dir_cluster);
+    if (read_sectors(g_root_fs->bdev, lba, g_root_fs->sectors_per_cluster, buf) != ST_OK) {
+        kfree(buf); return ST_IO;
+    }
+
+    fat32_dirent_t *ents = (fat32_dirent_t *)buf;
+    ents[dir_index].wrtTime   = new_time;
+    ents[dir_index].wrtDate   = new_date;
+    ents[dir_index].lstAccDate = new_date;
+
+    int st = write_sectors(g_root_fs->bdev, lba, g_root_fs->sectors_per_cluster, buf);
+    kfree(buf);
+
+    /* Invalidate dentry cache so next stat re-reads from disk */
+    dcache_invalidate(parent_cluster, name);
+
+    return st;
+}
 
 // Locked wrappers: serialize all FAT32 VFS operations via the sleeping mutex
 // to protect the shared FAT cache (g_fat_cache) from SMP races.
@@ -2191,6 +2297,9 @@ static int fat32_rmdir(const char* path) {
 }
 static int fat32_chdir(const char* path) {
     fat32_io_lock(); int r = fat32_chdir_impl(path); fat32_io_unlock(); return r;
+}
+int fat32_utimensat(const char* path, int64_t mtime_sec, long mtime_nsec) {
+    fat32_io_lock(); int r = fat32_utimensat_impl(path, mtime_sec, mtime_nsec); fat32_io_unlock(); return r;
 }
 
 static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_stat_vfs, fat32_read, fat32_write, fat32_seek, fat32_readdir, fat32_truncate, fat32_unlink, fat32_rename, fat32_mkdir, fat32_rmdir, fat32_chdir, fat32_close };

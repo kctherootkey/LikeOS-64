@@ -226,6 +226,7 @@ typedef struct files_struct {
     volatile int refcount;        // Number of tasks sharing this fd table
     spinlock_t lock;              // Protects fd table operations
     struct vfs_file* fd_table[TASK_MAX_FDS];  // File descriptor array
+    uint8_t fd_flags[TASK_MAX_FDS]; // Per-fd flags (FD_CLOEXEC = 1)
 } files_struct_t;
 
 // sighand_struct - Shared signal handlers (for CLONE_SIGHAND)
@@ -368,6 +369,7 @@ typedef struct task {
 
     // File descriptor table (legacy - used when files == NULL)
     struct vfs_file* fd_table[TASK_MAX_FDS];
+    uint8_t fd_flags[TASK_MAX_FDS]; // Per-fd flags (FD_CLOEXEC = 1)
     
     // Memory management (legacy - used when mm == NULL)
     uint64_t brk;               // Current program break (heap end)
@@ -408,6 +410,18 @@ typedef struct task {
     files_struct_t* files;          // Shared file descriptors (CLONE_FILES)
     sighand_struct_t* sighand;      // Shared signal handlers (CLONE_SIGHAND)
 } task_t;
+
+/* Helper: get the fd_flags byte for fd (uses files->fd_flags if shared, else task->fd_flags) */
+static inline uint8_t task_get_fd_flags(task_t *t, unsigned fd) {
+    if (t->files) return t->files->fd_flags[fd];
+    return t->fd_flags[fd];
+}
+
+/* Helper: set the fd_flags byte for fd */
+static inline void task_set_fd_flags(task_t *t, unsigned fd, uint8_t flags) {
+    if (t->files) t->files->fd_flags[fd] = flags;
+    else t->fd_flags[fd] = flags;
+}
 
 void sched_init(void);
 task_t* sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack_size);

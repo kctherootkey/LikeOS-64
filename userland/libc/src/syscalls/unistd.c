@@ -326,7 +326,7 @@ int ftruncate(int fd, off_t length) {
 
 int fcntl(int fd, int cmd, ...) {
     long arg = 0;
-    if (cmd == F_SETFL) {
+    if (cmd == F_SETFL || cmd == F_SETFD || cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
         va_list ap;
         va_start(ap, cmd);
         arg = va_arg(ap, long);
@@ -573,6 +573,32 @@ int utimensat(int dirfd, const char* pathname, const struct timespec times[2], i
     long ret = syscall4(SYS_UTIMENSAT, dirfd, (long)pathname, (long)times, flags);
     if (ret < 0) { errno = -ret; return -1; }
     return 0;
+}
+
+#include "../../include/utime.h"
+
+int utime(const char *path, const struct utimbuf *times) {
+    struct timespec ts[2];
+    if (!times) {
+        ts[0].tv_sec = 0; ts[0].tv_nsec = UTIME_NOW;
+        ts[1].tv_sec = 0; ts[1].tv_nsec = UTIME_NOW;
+    } else {
+        ts[0].tv_sec = times->actime;  ts[0].tv_nsec = 0;
+        ts[1].tv_sec = times->modtime; ts[1].tv_nsec = 0;
+    }
+    return utimensat(AT_FDCWD, path, ts, 0);
+}
+
+int utimes(const char *path, const struct timeval tv[2]) {
+    struct timespec ts[2];
+    if (!tv) {
+        ts[0].tv_sec = 0; ts[0].tv_nsec = UTIME_NOW;
+        ts[1].tv_sec = 0; ts[1].tv_nsec = UTIME_NOW;
+    } else {
+        ts[0].tv_sec = tv[0].tv_sec; ts[0].tv_nsec = (long)tv[0].tv_usec * 1000;
+        ts[1].tv_sec = tv[1].tv_sec; ts[1].tv_nsec = (long)tv[1].tv_usec * 1000;
+    }
+    return utimensat(AT_FDCWD, path, ts, 0);
 }
 
 int reboot(int cmd) {

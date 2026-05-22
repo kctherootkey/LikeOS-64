@@ -386,6 +386,7 @@ static int alloc_fd(task_t* task) {
     // Start at 3 to skip stdin(0), stdout(1), stderr(2)
     for (int i = 3; i < TASK_MAX_FDS; i++) {
         if (task->fd_table[i] == NULL) {
+            task_set_fd_flags(task, (unsigned)i, 0); // clear FD_CLOEXEC for new slot
             return i;
         }
     }
@@ -1185,6 +1186,14 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
     if (!cur) return -EFAULT;
     if (fd >= TASK_MAX_FDS) return -EBADF;
 
+    /* F_GETFD/F_SETFD are per-descriptor-slot flags stored in fd_flags[]. */
+    if (cmd == F_GETFD)
+        return (int64_t)task_get_fd_flags(cur, (unsigned)fd);
+    if (cmd == F_SETFD) {
+        task_set_fd_flags(cur, (unsigned)fd, (uint8_t)((uint32_t)arg & FD_CLOEXEC));
+        return 0;
+    }
+
     vfs_file_t* file = cur->fd_table[fd];
 
     // Handle console markers: only when fd_table entry is NULL
@@ -1198,8 +1207,6 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
             cur->console_flags = (cur->console_flags & ~O_NONBLOCK) | ((uint32_t)arg & O_NONBLOCK);
             return 0;
         }
-        if (cmd == F_GETFD) return 0;
-        if (cmd == F_SETFD) return 0;
         return -EINVAL;
     }
 
@@ -1218,8 +1225,6 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
                 cur->console_flags = (cur->console_flags & ~O_NONBLOCK) | ((uint32_t)arg & O_NONBLOCK);
                 return 0;
             }
-            if (cmd == F_GETFD) return 0;
-            if (cmd == F_SETFD) return 0;
             return -EINVAL;
         }
     }
@@ -1243,15 +1248,11 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
             us->nonblock = ((uint32_t)arg & O_NONBLOCK) ? 1 : 0;
             return 0;
         }
-        if (cmd == F_GETFD) return 0;
-        if (cmd == F_SETFD) return 0;
         return -EINVAL;
     }
 
     // Epoll fd markers
     if (IS_EPOLL_FD(file)) {
-        if (cmd == F_GETFD) return 0;
-        if (cmd == F_SETFD) return 0;
         if (cmd == F_GETFL) return O_RDWR;
         return -EINVAL;
     }
@@ -1267,8 +1268,6 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
             end->flags = (end->flags & ~O_NONBLOCK) | ((uint32_t)arg & O_NONBLOCK);
             return 0;
         }
-        if (cmd == F_GETFD) return 0;
-        if (cmd == F_SETFD) return 0;
         return -EINVAL;
     }
 
@@ -1282,8 +1281,6 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg) {
         file->flags = (file->flags & ~SETTABLE) | ((uint32_t)arg & SETTABLE);
         return 0;
     }
-    if (cmd == F_GETFD) return 0;
-    if (cmd == F_SETFD) return 0;
     return -EINVAL;
 }
 
@@ -1641,7 +1638,50 @@ static int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group) { (v
 static int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group) { (void)fd; (void)owner; (void)group; return 0; }
 // utimensat: FAT32 timestamps are managed by the FS driver; silently succeed
 static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times, uint64_t flags) {
-    (void)dirfd; (void)pathname; (void)times; (void)flags; return 0;
+    (void)dirfd; (void)flags;
+
+    /* Reject AT_EMPTY_PATH (0x1000) - not supported */
+    if (flags & 0x1000) return -EINVAL;
+
+    /* If pathname is NULL/empty, we'd need dirfd to be a real fd — not supported */
+    if (!pathname) return -EFAULT;
+
+    char kpath[VFS_MAX_PATH];
+    size_t plen;
+    int err = user_strnlen((const char *)pathname, VFS_MAX_PATH, &plen);
+    if (err) return err;
+    err = copy_from_user(kpath, (const void *)pathname, plen + 1);
+    if (err) return err;
+
+    /* Reject devfs paths — no timestamp support there */
+    if (kpath[0] == '/' && kpath[1] == 'd' && kpath[2] == 'e' &&
+        kpath[3] == 'v' && (kpath[4] == '\0' || kpath[4] == '/'))
+        return 0;  /* silently succeed on devfs */
+
+    int64_t  mtime_sec  = 0;
+    long     mtime_nsec = KRN_UTIME_NOW;   /* default: set to now */
+
+    if (times) {
+        /* times points to struct timespec[2]: [0]=atime, [1]=mtime */
+        struct k_timespec ts[2];
+        if (!validate_user_ptr(times, sizeof(ts))) return -EFAULT;
+        err = copy_from_user(ts, (const void *)times, sizeof(ts));
+        if (err) return err;
+
+        mtime_sec  = ts[1].tv_sec;
+        mtime_nsec = (long)ts[1].tv_nsec;
+
+        /* Translate UTIME_NOW (1073741823) and UTIME_OMIT (1073741822) */
+        if (mtime_nsec == 1073741823L) mtime_nsec = KRN_UTIME_NOW;
+        else if (mtime_nsec == 1073741822L) mtime_nsec = KRN_UTIME_OMIT;
+    }
+
+    int r = fat32_utimensat(kpath, mtime_sec, mtime_nsec);
+    if (r == ST_NOT_FOUND || r == ST_INVALID) return -ENOENT;
+    if (r == ST_NOMEM) return -ENOMEM;
+    if (r == ST_IO) return -EIO;
+    if (r != ST_OK) return -EIO;
+    return 0;
 }
 
 // Userspace struct statfs layout (must match userland/libc/include/sys/vfs.h)

@@ -1,0 +1,69 @@
+# Makefile.likeos - build zlib 1.3.1 as a shared library for LikeOS-64.
+#
+# Outputs:
+#   libz.so.1.3.1  (deflate/inflate/gzip compression library)
+#   libz.so.1      (symlink — soname; copied as actual file for FAT images)
+#   libz.so        (symlink — for host build-time use)
+#
+# Strategy:
+#   Compile all 15 zlib source files with -fPIC, link as ELF shared object
+#   following the same libevent/ncurses-likeos pattern used in LikeOS ports.
+#   No configure step required — zlib's zconf.h is platform-independent.
+
+LIBC_DIR  := ../../../userland/libc
+RTLD_DIR  := ../../../userland/rtld
+BUILD_DIR := ../../../build
+
+ABS_ROOT  := $(abspath ../../..)
+ABS_LIBC  := $(ABS_ROOT)/userland/libc
+ABS_RTLD  := $(ABS_ROOT)/userland/rtld
+ABS_BUILD := $(ABS_ROOT)/build
+
+CC := gcc
+LD := ld
+
+VERSION  := 1.3.1
+SONAME   := libz.so.1
+TARGET   := libz.so.$(VERSION)
+
+CFLAGS := -O2 -fPIC -DPIC \
+          -nostdinc \
+          -I. \
+          -I$(ABS_LIBC)/include \
+          -fno-stack-protector \
+          -mno-red-zone \
+          -D__LIKEOS__ \
+          -Wno-implicit-function-declaration \
+          -Wno-int-conversion \
+          -Wno-unused-result
+
+SRCS := adler32.c compress.c crc32.c deflate.c gzclose.c gzlib.c \
+        gzread.c gzwrite.c infback.c inffast.c inflate.c inftrees.c \
+        trees.c uncompr.c zutil.c
+
+OBJS := $(SRCS:.c=.pic.o)
+
+.PHONY: all clean
+
+all: $(ABS_BUILD)/$(TARGET)
+
+%.pic.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(ABS_BUILD)/$(TARGET): $(OBJS) | $(ABS_BUILD)
+	$(LD) -shared -nostdlib -Bsymbolic-functions --hash-style=gnu \
+	    -soname $(SONAME) \
+	    -o $@ \
+	    $(OBJS)
+	# Create soname symlink in build/ (also copy actual file as libz.so.1
+	# since FAT32 images cannot store symlinks)
+	cp -f $@ $(ABS_BUILD)/$(SONAME)
+	ln -sf $(SONAME) $(ABS_BUILD)/libz.so
+	strip --strip-unneeded $@
+	strip --strip-unneeded $(ABS_BUILD)/$(SONAME)
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+
+$(ABS_BUILD):
+	mkdir -p $@

@@ -1,0 +1,155 @@
+CURL(1)                          User Commands                         CURL(1)
+
+NAME
+       curl - transfer a URL
+
+SYNOPSIS
+       curl [options] [URL...]
+
+DESCRIPTION
+       curl is a tool for transferring data from or to a server using URLs.
+       It supports HTTP, HTTPS, FTP, and many other protocols.
+
+       curl is powered by libcurl. See libcurl(3) for details.
+
+OPTIONS
+   -o, --output <file>
+       Write output to <file> instead of stdout.
+
+   -O, --remote-name
+       Write output to a local file named after the remote file.
+
+   -L, --location
+       Follow redirects. If the server reports that the requested page
+       has moved to a different location, this option will make curl
+       redo the request on the new location.
+
+   -s, --silent
+       Silent or quiet mode. Do not show progress meter or error messages.
+
+   -S, --show-error
+       When used with -s, show an error message if it fails.
+
+   -v, --verbose
+       Make curl verbose during the operation. Useful for debugging.
+
+   -I, --head
+       Fetch the headers only.
+
+   -X, --request <method>
+       Specify a custom request method to use when communicating with
+       the HTTP server. The specified request method will be used instead
+       of the method otherwise used (which defaults to GET).
+
+   -d, --data <data>
+       Sends the specified data in a POST request to the HTTP server.
+
+   -H, --header <header>
+       Extra header to include in the request when sending HTTP to a server.
+
+   -u, --user <user:password>
+       Specify the user name and password to use for server authentication.
+
+   -k, --insecure
+       Allow curl to proceed and operate even for server connections
+       otherwise considered insecure.
+
+   --cacert <file>
+       Use the specified certificate file to verify the peer.
+
+   -A, --user-agent <name>
+       Specify the User-Agent string to send to the HTTP server.
+
+   -e, --referer <URL>
+       Sends the "Referrer Page" information to the HTTP server.
+
+   --max-time <seconds>
+       Maximum time in seconds that you allow the whole operation to take.
+
+   --connect-timeout <seconds>
+       Maximum time in seconds that you allow curl to wait for the
+       connection to happen.
+
+   --retry <num>
+       Retry the request <num> times if a transient error is returned.
+
+   -b, --cookie <data|filename>
+       Send the specified data as cookies.
+
+   -c, --cookie-jar <filename>
+       Specify to which file you want curl to write all cookies after
+       a completed operation.
+
+   --http1.1
+       Use HTTP version 1.1.
+
+   --http2
+       Use HTTP version 2. (requires nghttp2 support)
+
+   -4, --ipv4
+       Resolve names to IPv4 addresses only.
+
+   -6, --ipv6
+       Resolve names to IPv6 addresses only.
+
+   -w, --write-out <format>
+       Make curl display information on stdout after a completed transfer.
+
+   --compressed
+       Request a compressed response and decompress the data.
+
+   -Z, --parallel
+       Perform transfers in parallel.
+
+   --version
+       Display curl version information and exits.
+
+   --help
+       Usage help. This lists all current command line options.
+
+EXAMPLES
+       Retrieve a web page:
+              curl https://example.com
+
+       Download a file:
+              curl -O https://example.com/file.tar.gz
+
+       POST data:
+              curl -d "name=value" https://example.com/form
+
+       Follow redirects with progress:
+              curl -L -# https://example.com/redirect
+
+       Custom header:
+              curl -H "Authorization: Bearer TOKEN" https://api.example.com
+
+FILES
+       /etc/ssl/certs/ca-certificates.crt
+              Default CA certificate bundle for peer verification.
+
+EXIT CODES
+       0      Success.
+       1      Unsupported protocol.
+       2      Failed to initialize.
+       3      URL malformat.
+       6      Could not resolve host.
+       7      Failed to connect to host.
+       22     HTTP page not retrieved (HTTP error 400 or above).
+       23     Write error.
+       26     Read error.
+       28     Operation timed out.
+       35     SSL connect error.
+       51     The remote peer's SSL certificate was not OK.
+       52     The server did not reply anything.
+       56     Failure in receiving network data.
+       60     SSL peer certificate or SSH remote key was not OK.
+       67     Login denied.
+
+SEE ALSO
+       wget(1), openssl(1)
+
+AUTHOR
+       Daniel Stenberg <daniel@haxx.se> and many contributors.
+       See https://curl.se/docs/thanks.html
+
+curl 8.14.1                      May 2025                             CURL(1)

@@ -83,6 +83,12 @@ typedef struct {
 /* Fill fs_info with current filesystem statistics.  Returns 0 on success. */
 int fat32_get_statfs(fat32_statfs_t *info);
 
+/* Update mtime of a file at path.  mtime_nsec == KRN_UTIME_NOW means
+ * set to current time; KRN_UTIME_OMIT leaves it unchanged. */
+#define KRN_UTIME_NOW   ((long)1073741823L)
+#define KRN_UTIME_OMIT  ((long)1073741822L)
+int fat32_utimensat(const char *path, int64_t mtime_sec, long mtime_nsec);
+
 /* Page cache support: exported FAT32 internals */
 extern fat32_fs_t *g_root_fs;
 void fat32_io_lock(void);

@@ -1,5 +1,6 @@
 #include "../../include/string.h"
 #include "../../include/stdlib.h"
+#include "../../include/errno.h"
 
 void* memcpy(void* dest, const void* src, size_t n) {
     unsigned char* d = dest;
@@ -423,4 +424,16 @@ char *strsignal(int sig) {
     }
     }
     return (char *)m;
+}
+
+int strerror_r(int errnum, char *buf, size_t buflen) {
+    const char *s = strerror(errnum);
+    size_t len = strlen(s);
+    if (len >= buflen) {
+        if (buflen) buf[0] = '\0';
+        errno = ERANGE;
+        return ERANGE;
+    }
+    memcpy(buf, s, len + 1);
+    return 0;
 }

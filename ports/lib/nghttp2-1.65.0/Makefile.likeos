@@ -1,0 +1,96 @@
+# Makefile.likeos - build nghttp2 1.65.0 as a shared library for LikeOS-64.
+#
+# Outputs:
+#   libnghttp2.so.14       (HTTP/2 framing library)
+#
+# Strategy:
+#   Compile all lib/*.c files with -fPIC using the configure-generated
+#   config.h (from ./configure --enable-lib-only run on the host) for
+#   platform detection, then link as an ELF shared object following the
+#   libevent/ncurses pattern used throughout LikeOS ports.
+
+LIBC_DIR  := ../../../userland/libc
+RTLD_DIR  := ../../../userland/rtld
+BUILD_DIR := ../../../build
+
+ABS_ROOT  := $(abspath ../../..)
+ABS_LIBC  := $(ABS_ROOT)/userland/libc
+ABS_RTLD  := $(ABS_ROOT)/userland/rtld
+ABS_BUILD := $(ABS_ROOT)/build
+
+CC := gcc
+LD := ld
+
+SONAME  := libnghttp2.so.14
+# Canonical versioned filename matches the package version soname library number
+TARGET  := libnghttp2.so.14
+
+CFLAGS := -O2 -fPIC \
+          -nostdinc \
+          -I. \
+          -Ilib \
+          -Ilib/includes \
+          -I$(ABS_LIBC)/include \
+          -DHAVE_CONFIG_H \
+          -D__LIKEOS__ \
+          -fno-stack-protector \
+          -mno-red-zone \
+          -Wno-unused-parameter \
+          -Wno-unused-function \
+          -Wno-unused-variable \
+          -Wno-implicit-function-declaration \
+          -Wno-int-conversion \
+          -Wno-incompatible-pointer-types \
+          -Wno-sign-compare \
+          -Wno-maybe-uninitialized
+
+# All library source files
+SRCS := \
+    lib/nghttp2_alpn.c \
+    lib/nghttp2_buf.c \
+    lib/nghttp2_callbacks.c \
+    lib/nghttp2_debug.c \
+    lib/nghttp2_extpri.c \
+    lib/nghttp2_frame.c \
+    lib/nghttp2_hd.c \
+    lib/nghttp2_hd_huffman.c \
+    lib/nghttp2_hd_huffman_data.c \
+    lib/nghttp2_helper.c \
+    lib/nghttp2_http.c \
+    lib/nghttp2_map.c \
+    lib/nghttp2_mem.c \
+    lib/nghttp2_option.c \
+    lib/nghttp2_outbound_item.c \
+    lib/nghttp2_pq.c \
+    lib/nghttp2_priority_spec.c \
+    lib/nghttp2_queue.c \
+    lib/nghttp2_ratelim.c \
+    lib/nghttp2_rcbuf.c \
+    lib/nghttp2_session.c \
+    lib/nghttp2_stream.c \
+    lib/nghttp2_submit.c \
+    lib/nghttp2_time.c \
+    lib/nghttp2_version.c \
+    lib/sfparse.c
+
+OBJS := $(SRCS:.c=.pic.o)
+
+.PHONY: all clean
+
+all: $(ABS_BUILD)/$(TARGET)
+
+lib/%.pic.o: lib/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(ABS_BUILD)/$(TARGET): $(OBJS) | $(ABS_BUILD)
+	$(LD) -shared -nostdlib -Bsymbolic-functions --hash-style=gnu \
+	    -soname $(SONAME) \
+	    -o $@ \
+	    $(OBJS)
+	strip --strip-unneeded $@
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+
+$(ABS_BUILD):
+	mkdir -p $@

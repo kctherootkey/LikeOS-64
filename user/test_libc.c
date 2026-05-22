@@ -35,6 +35,9 @@
 #include <sys/uio.h>
 #include <sys/resource.h>
 #include <dirent.h>
+#include <libgen.h>
+#include <setjmp.h>
+#include <utime.h>
 
 // Futex helper declarations (from sched.c)
 int futex_wait(int* uaddr, int val, const struct timespec* timeout);
@@ -532,6 +535,40 @@ int main(int argc, char** argv) {
     test_result("snprintf truncates correctly", strlen(sprbuf) == 9);
 
     // ========================================
+    // Test: strerror_r
+    // ========================================
+    printf("\n[TEST] strerror_r()\n");
+    {
+        char errbuf[64];
+        int sr = strerror_r(ENOENT, errbuf, sizeof(errbuf));
+        test_result("strerror_r(ENOENT) returns 0", sr == 0);
+        test_result("strerror_r(ENOENT) fills buffer", strlen(errbuf) > 0);
+        printf("  strerror_r(ENOENT) = \"%s\"\n", errbuf);
+        /* Tiny buffer: must return ERANGE and not overflow */
+        char tiny[4];
+        sr = strerror_r(ENOENT, tiny, sizeof(tiny));
+        test_result("strerror_r tiny buf returns ERANGE", sr == ERANGE);
+    }
+
+    // ========================================
+    // Test: basename
+    // ========================================
+    printf("\n[TEST] basename()\n");
+    {
+        char bp1[] = "/usr/bin/ls";
+        test_result("basename(\"/usr/bin/ls\") == \"ls\"",
+                    strcmp(basename(bp1), "ls") == 0);
+        char bp2[] = "/usr/";
+        test_result("basename(\"/usr/\") == \"usr\"",
+                    strcmp(basename(bp2), "usr") == 0);
+        char bp3[] = "hello.c";
+        test_result("basename(\"hello.c\") == \"hello.c\"",
+                    strcmp(basename(bp3), "hello.c") == 0);
+        char bp4[] = "/";
+        test_result("basename(\"/\") is non-empty", strlen(basename(bp4)) > 0);
+    }
+
+    // ========================================
     // Test: fseek/ftell/rewind
     // ========================================
     printf("\n[TEST] fseek/ftell/rewind\n");
@@ -717,6 +754,35 @@ int main(int argc, char** argv) {
 
         close(fds[0]);
         close(fds[1]);
+    }
+
+    // ========================================
+    // Test: pipe2
+    // ========================================
+    printf("\n[TEST] pipe2()\n");
+    {
+        int p2fds[2];
+        int p2rc = pipe2(p2fds, O_CLOEXEC);
+        test_result("pipe2(O_CLOEXEC) returns 0", p2rc == 0);
+        if (p2rc == 0) {
+            int fl0 = fcntl(p2fds[0], F_GETFD);
+            int fl1 = fcntl(p2fds[1], F_GETFD);
+            test_result("pipe2 read-end has FD_CLOEXEC",
+                        fl0 >= 0 && (fl0 & FD_CLOEXEC));
+            test_result("pipe2 write-end has FD_CLOEXEC",
+                        fl1 >= 0 && (fl1 & FD_CLOEXEC));
+            const char *p2msg = "pipe2 works";
+            ssize_t p2w = write(p2fds[1], p2msg, strlen(p2msg));
+            test_result("pipe2 write returns full length",
+                        p2w == (ssize_t)strlen(p2msg));
+            char p2buf[32];
+            memset(p2buf, 0, sizeof(p2buf));
+            ssize_t p2r = read(p2fds[0], p2buf, sizeof(p2buf) - 1);
+            test_result("pipe2 read matches data",
+                        p2r > 0 && strcmp(p2buf, p2msg) == 0);
+            close(p2fds[0]);
+            close(p2fds[1]);
+        }
     }
 
     // ========================================
@@ -3647,6 +3713,48 @@ int main(int argc, char** argv) {
         }
     }
 
+    printf("\n[TEST] utime()\n");
+    {
+        int fd = open(_p_utime, O_WRONLY | O_CREAT | O_TRUNC);
+        test_result("utime: create test file", fd >= 0);
+        if (fd >= 0) {
+            close(fd);
+            struct utimbuf ut;
+            ut.actime  = 1500000000; /* 2017-07-14, even seconds, post-1980 */
+            ut.modtime = 1500000000;
+            int ret = utime(_p_utime, &ut);
+            test_result("utime() returns 0", ret == 0);
+            if (ret == 0) {
+                struct stat ust;
+                stat(_p_utime, &ust);
+                test_result("utime: mtime set correctly",
+                            (long)ust.st_mtime == 1500000000);
+            }
+            unlink(_p_utime);
+        }
+    }
+
+    printf("\n[TEST] utimes()\n");
+    {
+        int fd = open(_p_utime, O_WRONLY | O_CREAT | O_TRUNC);
+        test_result("utimes: create test file", fd >= 0);
+        if (fd >= 0) {
+            close(fd);
+            struct timeval utv[2];
+            utv[0].tv_sec = 1600000000; utv[0].tv_usec = 0; /* 2020-09-13 */
+            utv[1].tv_sec = 1600000000; utv[1].tv_usec = 0;
+            int ret = utimes(_p_utime, utv);
+            test_result("utimes() returns 0", ret == 0);
+            if (ret == 0) {
+                struct stat ust;
+                stat(_p_utime, &ust);
+                test_result("utimes: mtime sec set correctly",
+                            (long)ust.st_mtime == 1600000000);
+            }
+            unlink(_p_utime);
+        }
+    }
+
     printf("\n[TEST] mkdir+rmdir parents\n");
     {
         /* Create nested dirs */
@@ -3804,6 +3912,54 @@ int main(int argc, char** argv) {
         /* Test NULL buffer with READ_ALL should fail */
         ret = klogctl(SYSLOG_ACTION_READ_ALL, NULL, 100);
         test_result("klogctl(READ_ALL, NULL) returns -1", ret == -1);
+    }
+
+    // ========================================
+    // Test: setjmp / longjmp / sigsetjmp / siglongjmp
+    // ========================================
+    printf("\n[TEST] setjmp/longjmp\n");
+    {
+        jmp_buf jb;
+        int jr = setjmp(jb);
+        if (jr == 0) {
+            test_pass("setjmp() returns 0 on first call");
+            longjmp(jb, 42);
+            test_fail("longjmp: unreachable code reached");
+        } else {
+            test_result("longjmp() delivers val to setjmp site", jr == 42);
+        }
+    }
+    {
+        /* longjmp(env, 0) must clamp to 1 per POSIX */
+        jmp_buf jb2;
+        int jr2 = setjmp(jb2);
+        if (jr2 == 0) {
+            longjmp(jb2, 0);
+        } else {
+            test_result("longjmp(env, 0) delivers 1 not 0", jr2 == 1);
+        }
+    }
+    printf("\n[TEST] sigsetjmp/siglongjmp\n");
+    {
+        sigjmp_buf sjb;
+        int sjr = sigsetjmp(sjb, 0);
+        if (sjr == 0) {
+            test_pass("sigsetjmp() returns 0 on first call");
+            siglongjmp(sjb, 99);
+            test_fail("siglongjmp: unreachable code reached");
+        } else {
+            test_result("siglongjmp() delivers val to sigsetjmp site", sjr == 99);
+        }
+    }
+    {
+        /* siglongjmp(env, 0) must clamp to 1 */
+        sigjmp_buf sjb2;
+        int sjr2 = sigsetjmp(sjb2, 0);
+        if (sjr2 == 0) {
+            siglongjmp(sjb2, 0);
+        } else {
+            test_result("siglongjmp(env, 0) delivers 1 not 0", sjr2 == 1);
+        }
     }
 
     // ========================================
@@ -4119,12 +4275,41 @@ network_section:
     }
 
     // Test accept4 (should fail on non-listening socket)
+    printf("\n[TEST] accept4()\n");
     {
         int s = socket(AF_INET, SOCK_STREAM, 0);
         if (s >= 0) {
             int ret = accept4(s, NULL, NULL, 0);
             test_result("accept4(non-listening) returns -1", ret == -1);
+            /* accept4 with SOCK_NONBLOCK on a connected socketpair end */
+            int sv4[2] = {-1, -1};
+            if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv4) == 0) {
+                /* Not a listening socket — accept4 fails, but the flag
+                 * plumbing must not crash */
+                (void)accept4(sv4[0], NULL, NULL, SOCK_NONBLOCK);
+                close(sv4[0]);
+                close(sv4[1]);
+                test_pass("accept4 with SOCK_NONBLOCK: no crash");
+            }
             close(s);
+        }
+    }
+
+    // Test MSG_NOSIGNAL: send on broken-pipe socket returns EPIPE, no signal
+    printf("\n[TEST] MSG_NOSIGNAL\n");
+    {
+        int svn[2] = {-1, -1};
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, svn) == 0) {
+            signal(SIGPIPE, SIG_IGN);
+            close(svn[1]);          /* close the peer */
+            char nbuf[1] = {'X'};
+            ssize_t ns = send(svn[0], nbuf, 1, MSG_NOSIGNAL);
+            test_result("MSG_NOSIGNAL: send to closed peer returns -1", ns == -1);
+            test_result("MSG_NOSIGNAL: errno is EPIPE", errno == EPIPE);
+            signal(SIGPIPE, SIG_DFL);
+            close(svn[0]);
+        } else {
+            test_fail("MSG_NOSIGNAL: socketpair failed");
         }
     }
 
@@ -4952,7 +5137,14 @@ network_section:
                 if (p->ifa_name && strcmp(p->ifa_name, "lo") == 0) saw_lo = 1;
             }
             test_result("getifaddrs: loopback present", saw_lo);
+            /* every entry must have a non-NULL ifa_name */
+            int all_named = 1;
+            for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+                if (!p->ifa_name) { all_named = 0; break; }
+            }
+            test_result("getifaddrs: every entry has ifa_name", all_named);
             freeifaddrs(ifa);
+            test_pass("freeifaddrs: no crash");
         }
 
         // gethostbyname (numeric) -------------------------------------

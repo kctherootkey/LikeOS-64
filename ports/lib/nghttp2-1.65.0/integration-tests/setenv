@@ -1,0 +1,14 @@
+#!/bin/sh -e
+
+libdir="/home/kcope/Dokumente/LikeOS-64/ports/lib/nghttp2-1.65.0/lib"
+if [ -d "$libdir/.libs" ]; then
+    libdir="$libdir/.libs"
+fi
+
+export CGO_CFLAGS="-I/home/kcope/Dokumente/LikeOS-64/ports/lib/nghttp2-1.65.0/lib/includes -I/home/kcope/Dokumente/LikeOS-64/ports/lib/nghttp2-1.65.0/lib/includes -g -O2"
+export CGO_CPPFLAGS=""
+export CGO_LDFLAGS="-L$libdir "
+export LD_LIBRARY_PATH="$libdir"
+export DYLD_LIBRARY_PATH="$libdir"
+export GODEBUG=cgocheck=0
+"$@"

@@ -110,6 +110,7 @@ int mkstemps(char* templ, int suffixlen);
 int remove(const char* pathname);
 int rename(const char* oldpath, const char* newpath);
 FILE* fdopen(int fd, const char *mode);
+FILE* freopen(const char *pathname, const char *mode, FILE *stream);
 int dprintf(int fd, const char *format, ...);
 int vdprintf(int fd, const char *format, va_list ap);
 

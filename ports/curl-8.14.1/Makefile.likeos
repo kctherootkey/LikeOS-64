@@ -1,0 +1,210 @@
+# Makefile.likeos — build curl 8.14.1 for LikeOS-64.
+#
+# Outputs:
+#   libcurl.so.4        (shared library, SONAME = libcurl.so.4)
+#   libcurl.so          (symlink → libcurl.so.4, for host link resolution)
+#   curl                (PIE binary, /bin/curl on the target image)
+#
+# Dependencies (must be built first):
+#   ports/openssl-3.5.6  → build/libssl.so.3, build/libcrypto.so.3
+#   ports/lib/zlib-1.3.1 → build/libz.so.1
+#   ports/lib/nghttp2-*  → build/libnghttp2.so.14
+#
+# Strategy:
+#   Compile lib/*.c + lib/vtls/(openssl + shared helpers) + src/*.c
+#   with a hand-crafted likeos_config/curl_config.h instead of autoconf.
+#   Produce libcurl.so.4 as an ELF shared object using the same
+#   libevent/ncurses pattern (ld -shared -nostdlib).
+#   Link the curl binary as a PIE using ld + user_dyn.lds + crt1.o,
+#   matching the tmux/nano port convention.
+
+CURL_SRC  := .
+LIBC_DIR  := ../../userland/libc
+RTLD_DIR  := ../../userland/rtld
+USER_LDS  := ../../user/user_dyn.lds
+BUILD_DIR := ../../build
+
+ABS_ROOT      := $(abspath ../..)
+ABS_LIBC      := $(ABS_ROOT)/userland/libc
+ABS_RTLD      := $(ABS_ROOT)/userland/rtld
+ABS_LDS       := $(ABS_ROOT)/user/user_dyn.lds
+ABS_CRT1      := $(ABS_LIBC)/crt1.o
+ABS_BUILD     := $(ABS_ROOT)/build
+ABS_OPENSSL   := $(ABS_ROOT)/ports/openssl-3.5.6
+ABS_ZLIB      := $(ABS_ROOT)/ports/lib/zlib-1.3.1
+ABS_NGHTTP2   := $(ABS_ROOT)/ports/lib/nghttp2-1.65.0
+
+CC := gcc
+LD := ld
+
+# ---------------------------------------------------------------------------
+# Common compiler flags
+# ---------------------------------------------------------------------------
+CFLAGS := -O2 -fPIC \
+          -nostdinc \
+          -fno-stack-protector \
+          -mno-red-zone \
+          -DHAVE_CONFIG_H \
+          -D__LIKEOS__ \
+          -DCURL_STATICLIB=0 \
+          -DBUILDING_LIBCURL \
+          -Ilikeos_config \
+          -Iinclude \
+          -Ilib \
+          -Ilib/curlx \
+          -I$(ABS_LIBC)/include \
+          -I$(ABS_OPENSSL)/include \
+          -I$(ABS_ZLIB) \
+          -I$(ABS_NGHTTP2)/lib/includes \
+          -Wno-unused-parameter \
+          -Wno-unused-function \
+          -Wno-unused-variable \
+          -Wno-unused-but-set-variable \
+          -Wno-implicit-function-declaration \
+          -Wno-int-conversion \
+          -Wno-incompatible-pointer-types \
+          -Wno-discarded-qualifiers \
+          -Wno-pointer-sign \
+          -Wno-sign-compare \
+          -Wno-maybe-uninitialized \
+          -Wno-format \
+          -Wno-strict-aliasing \
+          -Wno-deprecated-declarations \
+          -Wno-missing-braces \
+          -Wno-array-bounds \
+          -Wno-stringop-truncation \
+          -Wno-stringop-overflow \
+          -Wno-uninitialized
+
+# ---------------------------------------------------------------------------
+# Library source files — lib/*.c (all protocols, no LDAP/gopher/krb5 object)
+# ---------------------------------------------------------------------------
+# Exclude: ldap.c openldap.c krb5.c gopher.c (disabled in config)
+LIB_SRCS_ALL := $(wildcard lib/*.c)
+LIB_SRCS := $(filter-out lib/ldap.c lib/openldap.c lib/krb5.c lib/gopher.c, \
+               $(LIB_SRCS_ALL))
+
+# ---------------------------------------------------------------------------
+# curlx — internal utility library (lib/curlx/*.c)
+# Exclude Windows-only helpers: version_win32.c, winapi.c
+# ---------------------------------------------------------------------------
+CURLX_SRCS_ALL := $(wildcard lib/curlx/*.c)
+CURLX_SRCS := $(filter-out lib/curlx/version_win32.c lib/curlx/winapi.c, \
+                $(CURLX_SRCS_ALL))
+
+# ---------------------------------------------------------------------------
+# vauth — authentication handlers (lib/vauth/*.c)
+# Exclude: SSPI, NTLM (needs DES), Kerberos GSS, GSASL, SPNEGO
+# ---------------------------------------------------------------------------
+VAUTH_SRCS := \
+    lib/vauth/cleartext.c \
+    lib/vauth/cram.c \
+    lib/vauth/digest.c \
+    lib/vauth/oauth2.c \
+    lib/vauth/vauth.c
+
+# ---------------------------------------------------------------------------
+# VTLS sources — only OpenSSL backend + shared helpers
+# ---------------------------------------------------------------------------
+VTLS_SRCS := \
+    lib/vtls/vtls.c \
+    lib/vtls/vtls_scache.c \
+    lib/vtls/vtls_spack.c \
+    lib/vtls/openssl.c \
+    lib/vtls/hostcheck.c \
+    lib/vtls/cipher_suite.c \
+    lib/vtls/keylog.c \
+    lib/vtls/x509asn1.c
+
+# ---------------------------------------------------------------------------
+# vquic/vquic.c only — for Curl_conn_may_http3 stub (no USE_HTTP3)
+# ---------------------------------------------------------------------------
+VQUIC_SRCS := lib/vquic/vquic.c
+
+# ---------------------------------------------------------------------------
+# All library objects
+# ---------------------------------------------------------------------------
+LIBCURL_SRCS := $(LIB_SRCS) $(VTLS_SRCS) $(CURLX_SRCS) $(VAUTH_SRCS) $(VQUIC_SRCS)
+LIBCURL_OBJS := $(LIBCURL_SRCS:.c=.lib.o)
+
+# ---------------------------------------------------------------------------
+# Binary (curl tool) source files
+# ---------------------------------------------------------------------------
+CURL_BIN_SRCS := $(filter-out src/curlinfo.c, $(wildcard src/*.c))
+CURL_BIN_OBJS := $(CURL_BIN_SRCS:.c=.bin.o)
+
+# ---------------------------------------------------------------------------
+# Output names
+# ---------------------------------------------------------------------------
+SONAME      := libcurl.so.4
+TARGET_SO   := $(ABS_BUILD)/$(SONAME)
+TARGET_CURL := $(ABS_BUILD)/curl
+
+.PHONY: all clean
+
+all: $(TARGET_SO) $(TARGET_CURL)
+
+# ---------------------------------------------------------------------------
+# Compile rules
+# ---------------------------------------------------------------------------
+lib/%.lib.o: lib/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+lib/vtls/%.lib.o: lib/vtls/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+lib/curlx/%.lib.o: lib/curlx/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+lib/vauth/%.lib.o: lib/vauth/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+lib/vquic/%.lib.o: lib/vquic/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+src/%.bin.o: src/%.c
+	$(CC) $(CFLAGS) -fPIE -c $< -o $@
+
+# ---------------------------------------------------------------------------
+# Build libcurl.so.4
+# ---------------------------------------------------------------------------
+$(TARGET_SO): $(LIBCURL_OBJS) | $(ABS_BUILD)
+	$(LD) -shared -nostdlib -Bsymbolic-functions --hash-style=gnu \
+	    -soname $(SONAME) \
+	    -o $@ \
+	    $(LIBCURL_OBJS) \
+	    -L$(ABS_BUILD) \
+	    -l:libssl.so.3 \
+	    -l:libcrypto.so.3 \
+	    -l:libz.so.1 \
+	    -l:libnghttp2.so.14 \
+	    $(shell gcc -print-libgcc-file-name)
+	ln -sf $(SONAME) $(ABS_BUILD)/libcurl.so
+	strip --strip-unneeded $@
+
+# ---------------------------------------------------------------------------
+# Build curl binary (PIE)
+# ---------------------------------------------------------------------------
+$(TARGET_CURL): $(CURL_BIN_OBJS) $(TARGET_SO) | $(ABS_BUILD)
+	$(LD) -pie --no-dynamic-linker -nostdlib --hash-style=gnu \
+	    -T $(ABS_LDS) \
+	    -e _start \
+	    -dynamic-linker /lib/ld-likeos.so \
+	    -o $@ \
+	    $(ABS_CRT1) \
+	    $(CURL_BIN_OBJS) \
+	    -L$(ABS_BUILD) \
+	    -l:libcurl.so.4 \
+	    -l:libssl.so.3 \
+	    -l:libcrypto.so.3 \
+	    -l:libz.so.1 \
+	    -l:libnghttp2.so.14 \
+	    -L$(ABS_LIBC) -l:libc.so \
+	    -L$(ABS_RTLD) -l:ld-likeos.so
+	strip --strip-unneeded $@
+
+clean:
+	rm -f $(LIBCURL_OBJS) $(CURL_BIN_OBJS) $(SONAME)
+
+$(ABS_BUILD):
+	mkdir -p $@

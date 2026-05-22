@@ -555,6 +555,16 @@ $(BUILD_DIR)/netstress: userland-libc userland-rtld | $(BUILD_DIR)
 	cp $(USER_DIR)/netstress $@
 	$(STRIP) --strip-unneeded $@
 
+$(BUILD_DIR)/openssltest: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) openssltest
+	cp $(USER_DIR)/openssltest $@
+	$(STRIP) --strip-unneeded $@
+
+# Extra dependency declarations so openssltest is built before images
+$(FAT_IMAGE): $(BUILD_DIR)/openssltest
+$(DATA_IMAGE): $(BUILD_DIR)/openssltest
+usb-write: $(BUILD_DIR)/openssltest
+
 $(BUILD_DIR)/uname: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) uname
 	cp $(USER_DIR)/uname $@
@@ -901,7 +911,31 @@ $(BUILD_DIR)/libssl.so.3: ports-openssl | $(BUILD_DIR)
 $(BUILD_DIR)/libssl.so: ports-openssl | $(BUILD_DIR)
 	@# symlink created by Makefile.likeos already
 
-# Build kernel ELF
+.PHONY: ports-zlib
+ports-zlib: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C ports/lib/zlib-1.3.1 -f Makefile.likeos
+
+$(BUILD_DIR)/libz.so.1: ports-zlib | $(BUILD_DIR)
+	@# copied by Makefile.likeos already
+
+.PHONY: ports-nghttp2
+ports-nghttp2: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C ports/lib/nghttp2-1.65.0 -f Makefile.likeos
+
+$(BUILD_DIR)/libnghttp2.so.14: ports-nghttp2 | $(BUILD_DIR)
+	@# copied by Makefile.likeos already
+
+.PHONY: ports-curl
+ports-curl: userland-libc userland-rtld ports-openssl ports-zlib ports-nghttp2 | $(BUILD_DIR)
+	$(MAKE) -C ports/curl-8.14.1 -f Makefile.likeos
+
+$(BUILD_DIR)/curl: ports-curl | $(BUILD_DIR)
+	@# copied by Makefile.likeos already
+
+$(BUILD_DIR)/libcurl.so.4: ports-curl | $(BUILD_DIR)
+	@# copied by Makefile.likeos already
+
+
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel.lds | $(BUILD_DIR)
 	@echo "Building LikeOS-64 kernel as ELF64..."
 	$(LD) $(KERNEL_LDFLAGS) -T kernel.lds $(KERNEL_OBJS) -o $(KERNEL_ELF)
@@ -964,7 +998,7 @@ $(ISO_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) | $(BUILD_DIR)
 	@echo "UEFI bootable ISO created: $(ISO_IMAGE)"
 
 # Create UEFI bootable FAT image (for direct use)
-$(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/netstress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/hostname $(BUILD_DIR)/ping $(BUILD_DIR)/ifconfig $(BUILD_DIR)/netstat $(BUILD_DIR)/route $(BUILD_DIR)/arp $(BUILD_DIR)/traceroute $(BUILD_DIR)/arping $(BUILD_DIR)/dhclient $(BUILD_DIR)/dig $(BUILD_DIR)/nslookup $(BUILD_DIR)/host $(BUILD_DIR)/nano $(BUILD_DIR)/tmux $(BUILD_DIR)/nc $(BUILD_DIR)/openssl $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libevent.so $(BUILD_DIR)/libcrypto.so.3 $(BUILD_DIR)/libssl.so.3 $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
+$(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/netstress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/hostname $(BUILD_DIR)/ping $(BUILD_DIR)/ifconfig $(BUILD_DIR)/netstat $(BUILD_DIR)/route $(BUILD_DIR)/arp $(BUILD_DIR)/traceroute $(BUILD_DIR)/arping $(BUILD_DIR)/dhclient $(BUILD_DIR)/dig $(BUILD_DIR)/nslookup $(BUILD_DIR)/host $(BUILD_DIR)/nano $(BUILD_DIR)/tmux $(BUILD_DIR)/nc $(BUILD_DIR)/openssl $(BUILD_DIR)/curl $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libevent.so $(BUILD_DIR)/libcrypto.so.3 $(BUILD_DIR)/libssl.so.3 $(BUILD_DIR)/libz.so.1 $(BUILD_DIR)/libnghttp2.so.14 $(BUILD_DIR)/libcurl.so.4 $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
 	@echo "Creating UEFI bootable FAT image..."
 	
 	# Create a 64MB FAT32 image
@@ -1046,6 +1080,7 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/tmux ::/bin/tmux
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/nc ::/bin/nc
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/openssl ::/bin/openssl
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/curl ::/bin/curl
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr || true
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr/local || true
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr/local/bin || true
@@ -1056,6 +1091,7 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/memstat ::/usr/local/bin/memstat
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/teststress ::/usr/local/bin/teststress
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/netstress ::/usr/local/bin/netstress
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/openssltest ::/usr/local/bin/openssltest
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/lib || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/ld-likeos.so ::/lib/ld-likeos.so
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libc.so ::/lib/libc.so
@@ -1063,6 +1099,9 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libevent.so ::/lib/libevent.so
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libcrypto.so.3 ::/lib/libcrypto.so.3
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libssl.so.3 ::/lib/libssl.so.3
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libz.so.1 ::/lib/libz.so.1
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libnghttp2.so.14 ::/lib/libnghttp2.so.14
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libcurl.so.4 ::/lib/libcurl.so.4
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libtestlib.so ::/lib/libtestlib.so
 	# Add system font resource
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/res || true
@@ -1082,6 +1121,8 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) res/etc/resolv.conf ::/etc/resolv.conf
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/etc/ssl || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) ports/openssl-3.5.6/apps/openssl.cnf ::/etc/ssl/openssl.cnf
+	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/etc/ssl/certs || true
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) res/etc/ssl/certs/ca-certificates.crt ::/etc/ssl/certs/ca-certificates.crt
 	# Add nano system config and syntax highlighting files
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) res/nanorc ::/etc/nanorc
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/usr/share/nano || true
@@ -1110,7 +1151,7 @@ qemu-fat: $(FAT_IMAGE)
 
 # Standalone USB mass storage data image (64MB FAT32) now mirrors usb-write target (UEFI bootable + signature files)
 # Provides: EFI/BOOT/BOOTX64.EFI, kernel.elf, LIKEOS.SIG, HELLO.TXT, tests
-$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/netstress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/hostname $(BUILD_DIR)/ping $(BUILD_DIR)/ifconfig $(BUILD_DIR)/netstat $(BUILD_DIR)/route $(BUILD_DIR)/arp $(BUILD_DIR)/traceroute $(BUILD_DIR)/arping $(BUILD_DIR)/dhclient $(BUILD_DIR)/dig $(BUILD_DIR)/nslookup $(BUILD_DIR)/host $(BUILD_DIR)/nano $(BUILD_DIR)/tmux $(BUILD_DIR)/nc $(BUILD_DIR)/openssl $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libevent.so $(BUILD_DIR)/libcrypto.so.3 $(BUILD_DIR)/libssl.so.3 $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
+$(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/test_libc $(BUILD_DIR)/hello $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/netstress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/hostname $(BUILD_DIR)/ping $(BUILD_DIR)/ifconfig $(BUILD_DIR)/netstat $(BUILD_DIR)/route $(BUILD_DIR)/arp $(BUILD_DIR)/traceroute $(BUILD_DIR)/arping $(BUILD_DIR)/dhclient $(BUILD_DIR)/dig $(BUILD_DIR)/nslookup $(BUILD_DIR)/host $(BUILD_DIR)/nano $(BUILD_DIR)/tmux $(BUILD_DIR)/nc $(BUILD_DIR)/openssl $(BUILD_DIR)/curl $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libevent.so $(BUILD_DIR)/libcrypto.so.3 $(BUILD_DIR)/libssl.so.3 $(BUILD_DIR)/libz.so.1 $(BUILD_DIR)/libnghttp2.so.14 $(BUILD_DIR)/libcurl.so.4 $(BUILD_DIR)/libtestlib.so | $(BUILD_DIR)
 	@echo "Creating USB data FAT32 image (msdata.img, 64MB, UEFI bootable)..."
 	$(DD) if=/dev/zero of=$(DATA_IMAGE) bs=1M count=64
 	$(MKFS_FAT) -F32 -n "MSDATA" $(DATA_IMAGE)
@@ -1131,6 +1172,7 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/memstat ::/usr/local/bin/memstat
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/teststress ::/usr/local/bin/teststress
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/netstress ::/usr/local/bin/netstress
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/openssltest ::/usr/local/bin/openssltest
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/sh ::/bin/sh
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/ls ::/bin/ls
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/cat ::/bin/cat
@@ -1197,7 +1239,7 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/tmux ::/bin/tmux
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/nc ::/bin/nc
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/openssl ::/bin/openssl
-	# Create /lib directory and copy shared libraries
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/curl ::/bin/curl
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/lib || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/ld-likeos.so ::/lib/ld-likeos.so
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/libc.so ::/lib/libc.so
@@ -1205,6 +1247,9 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/libevent.so ::/lib/libevent.so
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/libcrypto.so.3 ::/lib/libcrypto.so.3
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/libssl.so.3 ::/lib/libssl.so.3
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/libz.so.1 ::/lib/libz.so.1
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/libnghttp2.so.14 ::/lib/libnghttp2.so.14
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/libcurl.so.4 ::/lib/libcurl.so.4
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/libtestlib.so ::/lib/libtestlib.so
 	# Add system font resource
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/res || true
@@ -1224,7 +1269,8 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/etc/resolv.conf ::/etc/resolv.conf
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/etc/ssl || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) ports/openssl-3.5.6/apps/openssl.cnf ::/etc/ssl/openssl.cnf
-	# Add nano system config and syntax highlighting files
+	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/etc/ssl/certs || true
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/etc/ssl/certs/ca-certificates.crt ::/etc/ssl/certs/ca-certificates.crt and syntax highlighting files
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/nanorc ::/etc/nanorc
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/usr/share/nano || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) ports/nano-8.3/syntax/*.nanorc ::/usr/share/nano/
@@ -1324,7 +1370,7 @@ qemu-usb-passthrough: $(ISO_IMAGE) $(DATA_IMAGE) $(FAT_IMAGE)
 
 # Write ISO to USB device with GPT partition table (like Rufus)
 # Usage: make usb-write USB_DEVICE=/dev/sdX [USB_SERIAL=1]
-usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/netstress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/hostname $(BUILD_DIR)/ping $(BUILD_DIR)/ifconfig $(BUILD_DIR)/netstat $(BUILD_DIR)/route $(BUILD_DIR)/arp $(BUILD_DIR)/traceroute $(BUILD_DIR)/arping $(BUILD_DIR)/dhclient $(BUILD_DIR)/dig $(BUILD_DIR)/nslookup $(BUILD_DIR)/host $(BUILD_DIR)/nano $(BUILD_DIR)/tmux $(BUILD_DIR)/nc $(BUILD_DIR)/openssl $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libevent.so $(BUILD_DIR)/libcrypto.so.3 $(BUILD_DIR)/libssl.so.3 $(BUILD_DIR)/libtestlib.so
+usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD_DIR)/pwd $(BUILD_DIR)/stat $(BUILD_DIR)/hello $(BUILD_DIR)/test_libc $(BUILD_DIR)/user_test.elf $(BUILD_DIR)/progerr $(BUILD_DIR)/testmem $(BUILD_DIR)/memstat $(BUILD_DIR)/teststress $(BUILD_DIR)/netstress $(BUILD_DIR)/uname $(BUILD_DIR)/shutdown $(BUILD_DIR)/poweroff $(BUILD_DIR)/reboot $(BUILD_DIR)/halt $(BUILD_DIR)/ps $(BUILD_DIR)/cp $(BUILD_DIR)/mv $(BUILD_DIR)/rm $(BUILD_DIR)/mkdir $(BUILD_DIR)/rmdir $(BUILD_DIR)/touch $(BUILD_DIR)/more $(BUILD_DIR)/less $(BUILD_DIR)/clear $(BUILD_DIR)/env $(BUILD_DIR)/kill $(BUILD_DIR)/find $(BUILD_DIR)/df $(BUILD_DIR)/du $(BUILD_DIR)/hexdump $(BUILD_DIR)/sleep $(BUILD_DIR)/strings $(BUILD_DIR)/file $(BUILD_DIR)/grep $(BUILD_DIR)/wc $(BUILD_DIR)/head $(BUILD_DIR)/tail $(BUILD_DIR)/echo $(BUILD_DIR)/printf $(BUILD_DIR)/free $(BUILD_DIR)/uptime $(BUILD_DIR)/dmesg $(BUILD_DIR)/which $(BUILD_DIR)/date $(BUILD_DIR)/time $(BUILD_DIR)/sort $(BUILD_DIR)/uniq $(BUILD_DIR)/cut $(BUILD_DIR)/tr $(BUILD_DIR)/yes $(BUILD_DIR)/true $(BUILD_DIR)/false $(BUILD_DIR)/top $(BUILD_DIR)/man $(BUILD_DIR)/hostname $(BUILD_DIR)/ping $(BUILD_DIR)/ifconfig $(BUILD_DIR)/netstat $(BUILD_DIR)/route $(BUILD_DIR)/arp $(BUILD_DIR)/traceroute $(BUILD_DIR)/arping $(BUILD_DIR)/dhclient $(BUILD_DIR)/dig $(BUILD_DIR)/nslookup $(BUILD_DIR)/host $(BUILD_DIR)/nano $(BUILD_DIR)/tmux $(BUILD_DIR)/nc $(BUILD_DIR)/openssl $(BUILD_DIR)/curl $(BUILD_DIR)/ld-likeos.so $(BUILD_DIR)/libc.so $(BUILD_DIR)/ncurses.so $(BUILD_DIR)/libevent.so $(BUILD_DIR)/libcrypto.so.3 $(BUILD_DIR)/libssl.so.3 $(BUILD_DIR)/libz.so.1 $(BUILD_DIR)/libnghttp2.so.14 $(BUILD_DIR)/libcurl.so.4 $(BUILD_DIR)/libtestlib.so
 	@if [ -z "$(USB_DEVICE)" ]; then \
 		echo "Error: USB_DEVICE not specified. Usage: make usb-write USB_DEVICE=/dev/sdX"; \
 		echo "Available devices:"; \
@@ -1370,6 +1416,8 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo cp res/etc/resolv.conf /tmp/likeos_usb_mount/etc/resolv.conf
 	sudo mkdir -p /tmp/likeos_usb_mount/etc/ssl
 	sudo cp ports/openssl-3.5.6/apps/openssl.cnf /tmp/likeos_usb_mount/etc/ssl/openssl.cnf
+	sudo mkdir -p /tmp/likeos_usb_mount/etc/ssl/certs
+	sudo cp res/etc/ssl/certs/ca-certificates.crt /tmp/likeos_usb_mount/etc/ssl/certs/ca-certificates.crt
 	
 	# Add nano system config and syntax highlighting files
 	sudo cp res/nanorc /tmp/likeos_usb_mount/etc/nanorc
@@ -1459,6 +1507,7 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo cp $(BUILD_DIR)/tmux /tmp/likeos_usb_mount/bin/tmux
 	sudo cp $(BUILD_DIR)/nc /tmp/likeos_usb_mount/bin/nc
 	sudo cp $(BUILD_DIR)/openssl /tmp/likeos_usb_mount/bin/openssl
+	sudo cp $(BUILD_DIR)/curl /tmp/likeos_usb_mount/bin/curl
 	sudo cp $(BUILD_DIR)/hello /tmp/likeos_usb_mount/usr/local/bin/hello
 	sudo cp $(BUILD_DIR)/test_libc /tmp/likeos_usb_mount/usr/local/bin/testlibc
 	sudo cp $(BUILD_DIR)/user_test.elf /tmp/likeos_usb_mount/usr/local/bin/tests
@@ -1467,12 +1516,16 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo cp $(BUILD_DIR)/memstat /tmp/likeos_usb_mount/usr/local/bin/memstat
 	sudo cp $(BUILD_DIR)/teststress /tmp/likeos_usb_mount/usr/local/bin/teststress
 	sudo cp $(BUILD_DIR)/netstress /tmp/likeos_usb_mount/usr/local/bin/netstress
+	sudo cp $(BUILD_DIR)/openssltest /tmp/likeos_usb_mount/usr/local/bin/openssltest
 	sudo cp $(BUILD_DIR)/ld-likeos.so /tmp/likeos_usb_mount/lib/ld-likeos.so
 	sudo cp $(BUILD_DIR)/libc.so /tmp/likeos_usb_mount/lib/libc.so
 	sudo cp $(BUILD_DIR)/ncurses.so /tmp/likeos_usb_mount/lib/ncurses.so
 	sudo cp $(BUILD_DIR)/libevent.so /tmp/likeos_usb_mount/lib/libevent.so
 	sudo cp $(BUILD_DIR)/libcrypto.so.3 /tmp/likeos_usb_mount/lib/libcrypto.so.3
 	sudo cp $(BUILD_DIR)/libssl.so.3 /tmp/likeos_usb_mount/lib/libssl.so.3
+	sudo cp $(BUILD_DIR)/libz.so.1 /tmp/likeos_usb_mount/lib/libz.so.1
+	sudo cp $(BUILD_DIR)/libnghttp2.so.14 /tmp/likeos_usb_mount/lib/libnghttp2.so.14
+	sudo cp $(BUILD_DIR)/libcurl.so.4 /tmp/likeos_usb_mount/lib/libcurl.so.4
 	sudo cp $(BUILD_DIR)/libtestlib.so /tmp/likeos_usb_mount/lib/libtestlib.so
 
 	# Create signature file and sample hello on target (mirrors data image contents)

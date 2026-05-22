@@ -25,6 +25,7 @@ char* strdup(const char* s);
 char* strndup(const char* s, size_t n);
 char* strtok(char* str, const char* delim);
 char* strerror(int errnum);
+int   strerror_r(int errnum, char *buf, size_t buflen);
 char* strsignal(int sig);
 size_t strnlen(const char* s, size_t maxlen);
 char* strcasestr(const char* haystack, const char* needle);

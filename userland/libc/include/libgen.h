@@ -54,8 +54,12 @@ static inline char *basename(char *path)
             last_slash = p;
     }
 
-    if (last_slash)
+    if (last_slash) {
+        /* If nothing after the slash, entire path was "/" (or "///") */
+        if (*(last_slash + 1) == '\0')
+            return last_slash;   /* last_slash still points to '/' */
         return last_slash + 1;
+    }
     return path;
 }
 

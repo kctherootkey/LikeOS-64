@@ -368,6 +368,36 @@ FILE* fdopen(int fd, const char* mode) {
     return fp;
 }
 
+FILE* freopen(const char *pathname, const char *mode, FILE *stream) {
+    if (!mode || !stream) return NULL;
+
+    /* Flush and close the underlying fd, but keep the FILE* alive */
+    fflush(stream);
+    close(stream->fd);
+    stream->fd = -1;
+
+    int flags = 0;
+    switch (mode[0]) {
+        case 'r': flags = (mode[1] == '+') ? O_RDWR : O_RDONLY; break;
+        case 'w': flags = O_CREAT | O_TRUNC | ((mode[1] == '+') ? O_RDWR : O_WRONLY); break;
+        case 'a': flags = O_CREAT | O_APPEND | ((mode[1] == '+') ? O_RDWR : O_WRONLY); break;
+        default: return NULL;
+    }
+
+    int fd = open(pathname, flags);
+    if (fd < 0) return NULL;
+
+    stream->fd = fd;
+    stream->flags = flags;
+    stream->buf_pos = 0;
+    stream->buf_end = 0;
+    stream->wbuf_pos = 0;
+    stream->error = 0;
+    stream->eof = 0;
+    stream->ungetc_buf = -1;
+    return stream;
+}
+
 int fputs(const char* s, FILE* stream) {
     size_t len = strlen(s);
     if (fwrite(s, 1, len, stream) != len) {

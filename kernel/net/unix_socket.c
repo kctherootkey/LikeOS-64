@@ -308,6 +308,9 @@ int unix_send(int usockfd, const void* buf, size_t len, int flags) {
     unix_socket_t* peer = us->peer;
     if (!peer || !peer->active) {
         spin_unlock_irqrestore(&unix_table_lock, tflags);
+        /* Peer already closed our side — return EPIPE (not ENOTCONN) */
+        if (us->peer_closed)
+            return -EPIPE;
         if (us->type == SOCK_DGRAM) return -EDESTADDRREQ;
         return -ENOTCONN;
     }
