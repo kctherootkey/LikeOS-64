@@ -3406,14 +3406,12 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
         return -ENOMEM;
     }
     
-    // Allocate kernel stack for child
-    uint8_t* k_stack_mem = (uint8_t*)kalloc(KERNEL_STACK_SIZE);
+    // Allocate kernel stack for child (guarded: not-present guard page below)
+    uint8_t* k_stack_mem = (uint8_t*)mm_alloc_guarded_kstack(KERNEL_STACK_SIZE);
     if (!k_stack_mem) {
         kfree(child);
         return -ENOMEM;
     }
-    // Zero the kernel stack to prevent stale data issues
-    mm_memset(k_stack_mem, 0, KERNEL_STACK_SIZE);
     uint64_t k_stack_top = ((uint64_t)(k_stack_mem + KERNEL_STACK_SIZE)) & ~0xFUL;
     
     // Initialize child from parent
@@ -3456,7 +3454,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
             // First time: create mm_struct from parent's legacy pml4
             cur->mm = mm_struct_create(cur->pml4);
             if (!cur->mm) {
-                kfree(k_stack_mem);
+                mm_free_guarded_kstack(k_stack_mem, KERNEL_STACK_SIZE);
                 kfree(child);
                 return -ENOMEM;
             }
@@ -3472,7 +3470,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
         // COW clone of address space
         uint64_t* child_pml4 = mm_clone_address_space(cur->pml4);
         if (!child_pml4) {
-            kfree(k_stack_mem);
+            mm_free_guarded_kstack(k_stack_mem, KERNEL_STACK_SIZE);
             kfree(child);
             return -ENOMEM;
         }
@@ -3492,7 +3490,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
                 if (!share_vm && child->pml4) {
                     mm_destroy_address_space(child->pml4);
                 }
-                kfree(k_stack_mem);
+                mm_free_guarded_kstack(k_stack_mem, KERNEL_STACK_SIZE);
                 kfree(child);
                 return -ENOMEM;
             }
@@ -3569,7 +3567,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
                 if (!share_vm && child->pml4) {
                     mm_destroy_address_space(child->pml4);
                 }
-                kfree(k_stack_mem);
+                mm_free_guarded_kstack(k_stack_mem, KERNEL_STACK_SIZE);
                 kfree(child);
                 return -ENOMEM;
             }

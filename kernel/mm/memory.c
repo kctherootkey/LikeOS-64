@@ -28,10 +28,41 @@
 /* Fill *bytes* bytes at *dest* with a repeating 32-bit *pattern*. */
 static void mm_poison_fill(void *dest, uint32_t pattern, size_t bytes)
 {
-    uint32_t *p = (uint32_t *)dest;
-    size_t n = bytes >> 2;
-    for (size_t i = 0; i < n; i++) p[i] = pattern;
-    uint8_t *t = (uint8_t *)(p + n);
+    uint8_t *ptr = (uint8_t *)dest;
+
+    /* Fast path: 8-byte-aligned destination (typical: page / slab callers) */
+    if (bytes >= 8 && ((uintptr_t)ptr & 7) == 0) {
+        uint64_t pat64 = ((uint64_t)pattern << 32) | pattern;
+        uint64_t *p64  = (uint64_t *)ptr;
+        size_t    words = bytes / 8;
+        size_t    rem   = bytes % 8;
+
+        if (words >= 64) {
+            /* rep stosq: CPU's optimised string-store path */
+            __asm__ volatile (
+                "rep stosq"
+                : "+D"(p64), "+c"(words)
+                : "a"(pat64)
+                : "memory"
+            );
+        } else {
+            /* Unrolled 4×64-bit loop for medium sizes */
+            while (words >= 4) {
+                p64[0] = pat64; p64[1] = pat64;
+                p64[2] = pat64; p64[3] = pat64;
+                p64 += 4; words -= 4;
+            }
+            while (words--) *p64++ = pat64;
+        }
+        ptr   = (uint8_t *)p64;
+        bytes = rem;
+    }
+
+    /* Fallback: 32-bit stores then byte tail for any remainder */
+    uint32_t *p32 = (uint32_t *)ptr;
+    size_t    n32 = bytes >> 2;
+    for (size_t i = 0; i < n32; i++) p32[i] = pattern;
+    uint8_t *t = (uint8_t *)(p32 + n32);
     uint8_t *b = (uint8_t *)&pattern;
     switch (bytes & 3) {
         case 3: t[2] = b[2]; /* fall-through */
@@ -58,6 +89,16 @@ static spinlock_t mm_refcount_lock = SPINLOCK_INIT("mm_refcount");
 
 // Kernel PML4 - saved at init time, used when destroying current address space
 static uint64_t g_kernel_pml4_phys = 0;
+
+// ============================================================================
+// KERNEL STACK GUARD PAGE ALLOCATOR — static state
+// ============================================================================
+#define KSTACK_MAX_RECYCLED  256
+
+static uint64_t     kstack_virt_next               = KSTACK_VIRT_BASE;
+static uint64_t     kstack_recycled[KSTACK_MAX_RECYCLED];
+static unsigned int kstack_recycled_count           = 0;
+static spinlock_t   kstack_virt_lock               = SPINLOCK_INIT("kstack_virt");
 
 // Forward declaration for page_to_index (used in COW handler before definition)
 static inline uint64_t page_to_index(uint64_t phys_addr);
@@ -1411,6 +1452,132 @@ uint64_t mm_get_physical_address(uint64_t virtual_addr) {
 bool mm_is_page_mapped(uint64_t virtual_addr) {
     uint64_t* pte = mm_get_page_table(virtual_addr, false);
     return pte && (*pte & PAGE_PRESENT);
+}
+
+// ============================================================================
+// KERNEL STACK GUARD PAGE ALLOCATOR
+// ============================================================================
+
+// Mark a single 4 KB page not-present.  If it is covered by a 2 MB large
+// mapping, mm_get_page_table(create=true) will split it into 4 KB entries
+// first so only the requested page is affected.
+void mm_mark_guard_page(uint64_t virt_addr) {
+    uint64_t page_va = virt_addr & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t lock_flags;
+
+    spin_lock_irqsave(&mm_kernel_pt_lock, &lock_flags);
+    // create=true splits 2 MB pages as needed; we then zero the PTE.
+    uint64_t* pte = mm_get_page_table(page_va, true);
+    if (pte) {
+        *pte = 0;
+    }
+    spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
+
+    mm_flush_tlb(page_va);
+    if (sched_is_smp()) {
+        smp_tlb_shootdown_sync();
+    }
+}
+
+// Allocate a kernel stack with a guard page immediately below the usable area.
+// Returns the base of the usable region, or NULL on failure.
+// usable_size must be a non-zero multiple of PAGE_SIZE.
+void* mm_alloc_guarded_kstack(size_t usable_size) {
+    if (!usable_size || (usable_size & (PAGE_SIZE - 1))) {
+        return NULL;
+    }
+
+    size_t total = PAGE_SIZE + usable_size;  /* guard page + usable pages */
+
+    // Obtain a virtual slot: prefer recycled slots to avoid exhausting the range.
+    uint64_t slot_base;
+    uint64_t irq;
+    spin_lock_irqsave(&kstack_virt_lock, &irq);
+    if (kstack_recycled_count > 0) {
+        slot_base = kstack_recycled[--kstack_recycled_count];
+    } else {
+        if (kstack_virt_next + total > KSTACK_VIRT_LIMIT) {
+            spin_unlock_irqrestore(&kstack_virt_lock, irq);
+            return NULL;
+        }
+        slot_base = kstack_virt_next;
+        kstack_virt_next += total;
+    }
+    spin_unlock_irqrestore(&kstack_virt_lock, irq);
+
+    // Guard page at slot_base is intentionally left unmapped.
+    // Map usable stack pages immediately above the guard page.
+    uint64_t stack_base = slot_base + PAGE_SIZE;
+    size_t   num_pages  = usable_size / PAGE_SIZE;
+
+    for (size_t i = 0; i < num_pages; i++) {
+        uint64_t phys = mm_allocate_physical_page();
+        if (!phys) {
+            // Allocation failed — unmap and free pages already mapped.
+            for (size_t j = 0; j < i; j++) {
+                uint64_t va   = stack_base + j * PAGE_SIZE;
+                uint64_t p    = mm_get_physical_address(va);
+                mm_unmap_page(va);
+                if (p) mm_free_physical_page(p);
+            }
+            // Return the slot to the recycle pool.
+            spin_lock_irqsave(&kstack_virt_lock, &irq);
+            if (kstack_recycled_count < KSTACK_MAX_RECYCLED) {
+                kstack_recycled[kstack_recycled_count++] = slot_base;
+            }
+            spin_unlock_irqrestore(&kstack_virt_lock, irq);
+            return NULL;
+        }
+        if (!mm_map_page(stack_base + i * PAGE_SIZE, phys,
+                         PAGE_PRESENT | PAGE_WRITABLE | PAGE_NO_EXECUTE)) {
+            mm_free_physical_page(phys);
+            for (size_t j = 0; j < i; j++) {
+                uint64_t va   = stack_base + j * PAGE_SIZE;
+                uint64_t p    = mm_get_physical_address(va);
+                mm_unmap_page(va);
+                if (p) mm_free_physical_page(p);
+            }
+            spin_lock_irqsave(&kstack_virt_lock, &irq);
+            if (kstack_recycled_count < KSTACK_MAX_RECYCLED) {
+                kstack_recycled[kstack_recycled_count++] = slot_base;
+            }
+            spin_unlock_irqrestore(&kstack_virt_lock, irq);
+            return NULL;
+        }
+    }
+
+    return (void*)stack_base;
+}
+
+// Free a kernel stack returned by mm_alloc_guarded_kstack().
+void mm_free_guarded_kstack(void* stack_base, size_t usable_size) {
+    if (!stack_base || !usable_size || (usable_size & (PAGE_SIZE - 1))) {
+        return;
+    }
+
+    uint64_t stack_va  = (uint64_t)stack_base;
+    uint64_t slot_base = stack_va - PAGE_SIZE;
+    size_t   num_pages = usable_size / PAGE_SIZE;
+
+    for (size_t i = 0; i < num_pages; i++) {
+        uint64_t va   = stack_va + i * PAGE_SIZE;
+        uint64_t phys = mm_get_physical_address(va);
+        mm_unmap_page_no_shootdown(va);
+        if (phys) mm_free_physical_page(phys);
+    }
+
+    // One shootdown covers all unmapped pages.
+    if (sched_is_smp()) {
+        smp_tlb_shootdown_sync();
+    }
+
+    // Return the slot so it can be reused.
+    uint64_t irq;
+    spin_lock_irqsave(&kstack_virt_lock, &irq);
+    if (kstack_recycled_count < KSTACK_MAX_RECYCLED) {
+        kstack_recycled[kstack_recycled_count++] = slot_base;
+    }
+    spin_unlock_irqrestore(&kstack_virt_lock, irq);
 }
 
 // KERNEL HEAP ALLOCATOR IMPLEMENTATION

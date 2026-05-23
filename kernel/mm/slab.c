@@ -25,10 +25,41 @@ extern int mm_debug_pt;
 
 static inline void slab_poison_fill(void *dest, uint32_t pattern, size_t bytes)
 {
-    uint32_t *p = (uint32_t *)dest;
-    size_t n = bytes >> 2;
-    for (size_t i = 0; i < n; i++) p[i] = pattern;
-    uint8_t *t = (uint8_t *)(p + n);
+    uint8_t *ptr = (uint8_t *)dest;
+
+    /* Fast path: 8-byte-aligned destination (typical: page / slab callers) */
+    if (bytes >= 8 && ((uintptr_t)ptr & 7) == 0) {
+        uint64_t pat64 = ((uint64_t)pattern << 32) | pattern;
+        uint64_t *p64  = (uint64_t *)ptr;
+        size_t    words = bytes / 8;
+        size_t    rem   = bytes % 8;
+
+        if (words >= 64) {
+            /* rep stosq: CPU's optimised string-store path */
+            __asm__ volatile (
+                "rep stosq"
+                : "+D"(p64), "+c"(words)
+                : "a"(pat64)
+                : "memory"
+            );
+        } else {
+            /* Unrolled 4×64-bit loop for medium sizes */
+            while (words >= 4) {
+                p64[0] = pat64; p64[1] = pat64;
+                p64[2] = pat64; p64[3] = pat64;
+                p64 += 4; words -= 4;
+            }
+            while (words--) *p64++ = pat64;
+        }
+        ptr   = (uint8_t *)p64;
+        bytes = rem;
+    }
+
+    /* Fallback: 32-bit stores then byte tail for any remainder */
+    uint32_t *p32 = (uint32_t *)ptr;
+    size_t    n32 = bytes >> 2;
+    for (size_t i = 0; i < n32; i++) p32[i] = pattern;
+    uint8_t *t = (uint8_t *)(p32 + n32);
     uint8_t *b = (uint8_t *)&pattern;
     switch (bytes & 3) {
         case 3: t[2] = b[2]; /* fall-through */

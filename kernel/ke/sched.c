@@ -546,10 +546,8 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4,
     task_t* t = (task_t*)kalloc(sizeof(task_t));
     if (!t) return NULL;
 
-    uint8_t* k_stack_mem = (uint8_t*)kalloc(KERNEL_STACK_SIZE);
+    uint8_t* k_stack_mem = (uint8_t*)mm_alloc_guarded_kstack(KERNEL_STACK_SIZE);
     if (!k_stack_mem) { kfree(t); return NULL; }
-    // Zero the kernel stack to prevent stale data issues
-    mm_memset(k_stack_mem, 0, KERNEL_STACK_SIZE);
 
     uint64_t k_stack_top = ((uint64_t)(k_stack_mem + KERNEL_STACK_SIZE)) & ~0xFUL;
     uint64_t* k_sp = (uint64_t*)k_stack_top;
@@ -1133,7 +1131,7 @@ void sched_remove_task(task_t* task) {
     // all CPUs, ensuring none are still in the context switch epilogue using
     // this task's kernel stack.
     if (task->kernel_stack_base && task->privilege == TASK_USER) {
-        kfree(task->kernel_stack_base);
+        mm_free_guarded_kstack(task->kernel_stack_base, KERNEL_STACK_SIZE);
     }
 
     kfree(task);
@@ -1169,14 +1167,12 @@ task_t* sched_fork_current(void) {
     }
     if (!child_pml4) { kfree(child); return NULL; }
 
-    uint8_t* k_stack_mem = (uint8_t*)kalloc(KERNEL_STACK_SIZE);
+    uint8_t* k_stack_mem = (uint8_t*)mm_alloc_guarded_kstack(KERNEL_STACK_SIZE);
     if (!k_stack_mem) {
         mm_destroy_address_space(child_pml4);
         kfree(child);
         return NULL;
     }
-    // Zero the kernel stack to prevent stale data issues
-    mm_memset(k_stack_mem, 0, KERNEL_STACK_SIZE);
     uint64_t k_stack_top = ((uint64_t)(k_stack_mem + KERNEL_STACK_SIZE)) & ~0xFUL;
 
     // Copy parent

@@ -54,32 +54,56 @@ extern int acpi_sci_dispatch(void);
 static struct idt_entry idt[IDT_ENTRIES];
 static struct idt_descriptor idt_desc;
 static struct tss_entry tss;  // BSP TSS
-static uint8_t interrupt_stack[16384] __attribute__((aligned(16)));
+
+// ============================================================================
+// INTERRUPT / IST STACK LAYOUT (guard pages)
+// ============================================================================
+// x86-64 stacks grow DOWNWARD.  A guard page at the LOWEST address of each
+// stack catches overflow immediately instead of silently corrupting adjacent
+// memory.  Layout per stack:
+//
+//   [base + 0          .. base + PAGE_SIZE - 1]   NOT PRESENT (guard)
+//   [base + PAGE_SIZE  .. base + TOTAL_SIZE - 1]  present + writable (usable)
+//
+// The TSS RSP0 / IST pointers are set to (base + TOTAL_SIZE) so the CPU
+// starts using the stack just below the usable region's top.
+// mm_mark_guard_page() is called on 'base' during tss_init() / tss_init_ap()
+// to make the guard page not-present.  Arrays are page-aligned so the guard
+// occupies exactly one 4 KB PTE without overlapping adjacent variables.
+
+// Usable sizes (same as before — we add one guard page on top)
+#define IRQ_USABLE_SIZE  16384
+#define IRQ_TOTAL_SIZE   (PAGE_SIZE + IRQ_USABLE_SIZE)
 
 // IST (Interrupt Stack Table) stacks for critical exceptions that need
 // guaranteed separate stacks (double fault, NMI, machine check).
 // These are per-CPU to avoid stack sharing in SMP.
-#define IST_STACK_SIZE 4096
+#define IST_USABLE_SIZE  4096
+#define IST_TOTAL_SIZE   (PAGE_SIZE + IST_USABLE_SIZE)
 
 // IST stack assignments:
 //   IST1 = Double Fault (#DF, INT 8)  - CRITICAL: prevents triple fault
 //   IST2 = NMI (INT 2)                - can interrupt at any time
 //   IST3 = Machine Check (#MC, INT 18) - similar to NMI
 
+// BSP stacks — must be page-aligned so guard page does not overlap neighbours
+static uint8_t interrupt_stack[IRQ_TOTAL_SIZE] __attribute__((aligned(PAGE_SIZE)));
+
 // BSP IST stacks
-static uint8_t bsp_ist1_stack[IST_STACK_SIZE] __attribute__((aligned(16)));  // Double Fault
-static uint8_t bsp_ist2_stack[IST_STACK_SIZE] __attribute__((aligned(16)));  // NMI
-static uint8_t bsp_ist3_stack[IST_STACK_SIZE] __attribute__((aligned(16)));  // Machine Check
+static uint8_t bsp_ist1_stack[IST_TOTAL_SIZE] __attribute__((aligned(PAGE_SIZE)));  // Double Fault
+static uint8_t bsp_ist2_stack[IST_TOTAL_SIZE] __attribute__((aligned(PAGE_SIZE)));  // NMI
+static uint8_t bsp_ist3_stack[IST_TOTAL_SIZE] __attribute__((aligned(PAGE_SIZE)));  // Machine Check
 
 // Per-CPU TSS for SMP (index 0 = BSP, 1..MAX_CPUS-1 = APs)
 #define MAX_CPUS_TSS 64
 static struct tss_entry ap_tss[MAX_CPUS_TSS] __attribute__((aligned(16)));
-static uint8_t ap_interrupt_stacks[MAX_CPUS_TSS][16384] __attribute__((aligned(16)));
+static uint8_t ap_interrupt_stacks[MAX_CPUS_TSS][IRQ_TOTAL_SIZE] __attribute__((aligned(PAGE_SIZE)));
 
-// Per-AP IST stacks
-static uint8_t ap_ist1_stacks[MAX_CPUS_TSS][IST_STACK_SIZE] __attribute__((aligned(16)));  // Double Fault
-static uint8_t ap_ist2_stacks[MAX_CPUS_TSS][IST_STACK_SIZE] __attribute__((aligned(16)));  // NMI
-static uint8_t ap_ist3_stacks[MAX_CPUS_TSS][IST_STACK_SIZE] __attribute__((aligned(16)));  // Machine Check
+// Per-AP IST stacks — IRQ_TOTAL_SIZE = 5*PAGE_SIZE, IST_TOTAL_SIZE = 2*PAGE_SIZE,
+// so every row starts at a page boundary (row stride is a multiple of PAGE_SIZE).
+static uint8_t ap_ist1_stacks[MAX_CPUS_TSS][IST_TOTAL_SIZE] __attribute__((aligned(PAGE_SIZE)));  // Double Fault
+static uint8_t ap_ist2_stacks[MAX_CPUS_TSS][IST_TOTAL_SIZE] __attribute__((aligned(PAGE_SIZE)));  // NMI
+static uint8_t ap_ist3_stacks[MAX_CPUS_TSS][IST_TOTAL_SIZE] __attribute__((aligned(PAGE_SIZE)));  // Machine Check
 
 static void my_memset(void *dest, int val, size_t len) {
     uint8_t *ptr = (uint8_t*)dest;
@@ -1068,13 +1092,22 @@ void tss_init() {
     
     // Configure IST entries for critical exceptions
     // IST1: Double Fault - MUST have separate stack to avoid triple fault
-    tss.ist1 = (uint64_t)(bsp_ist1_stack + IST_STACK_SIZE);
+    tss.ist1 = (uint64_t)(bsp_ist1_stack + IST_TOTAL_SIZE);
     // IST2: NMI - can interrupt at any time, needs guaranteed stack
-    tss.ist2 = (uint64_t)(bsp_ist2_stack + IST_STACK_SIZE);
+    tss.ist2 = (uint64_t)(bsp_ist2_stack + IST_TOTAL_SIZE);
     // IST3: Machine Check - similar to NMI
-    tss.ist3 = (uint64_t)(bsp_ist3_stack + IST_STACK_SIZE);
+    tss.ist3 = (uint64_t)(bsp_ist3_stack + IST_TOTAL_SIZE);
     
     tss.iopb_offset = sizeof(tss);
+
+    // Install guard pages on all BSP interrupt/IST stacks.
+    // The guard page is the first PAGE_SIZE bytes of each array (lowest address).
+    // Any stack overflow will immediately fault on the guard page.
+    mm_mark_guard_page((uint64_t)interrupt_stack);
+    mm_mark_guard_page((uint64_t)bsp_ist1_stack);
+    mm_mark_guard_page((uint64_t)bsp_ist2_stack);
+    mm_mark_guard_page((uint64_t)bsp_ist3_stack);
+
     kprintf("TSS initialized with IST entries\n");
 }
 
@@ -1127,11 +1160,17 @@ void tss_init_ap(uint32_t cpu_id) {
     
     // Configure IST entries for this AP - each AP MUST have its own IST stacks
     // to avoid stack corruption when handling critical exceptions on different CPUs
-    ap_tss[cpu_id].ist1 = (uint64_t)(ap_ist1_stacks[cpu_id] + IST_STACK_SIZE);  // Double Fault
-    ap_tss[cpu_id].ist2 = (uint64_t)(ap_ist2_stacks[cpu_id] + IST_STACK_SIZE);  // NMI
-    ap_tss[cpu_id].ist3 = (uint64_t)(ap_ist3_stacks[cpu_id] + IST_STACK_SIZE);  // Machine Check
+    ap_tss[cpu_id].ist1 = (uint64_t)(ap_ist1_stacks[cpu_id] + IST_TOTAL_SIZE);  // Double Fault
+    ap_tss[cpu_id].ist2 = (uint64_t)(ap_ist2_stacks[cpu_id] + IST_TOTAL_SIZE);  // NMI
+    ap_tss[cpu_id].ist3 = (uint64_t)(ap_ist3_stacks[cpu_id] + IST_TOTAL_SIZE);  // Machine Check
     
     ap_tss[cpu_id].iopb_offset = sizeof(struct tss_entry);
+
+    // Install guard pages on this AP's interrupt/IST stacks.
+    mm_mark_guard_page((uint64_t)ap_interrupt_stacks[cpu_id]);
+    mm_mark_guard_page((uint64_t)ap_ist1_stacks[cpu_id]);
+    mm_mark_guard_page((uint64_t)ap_ist2_stacks[cpu_id]);
+    mm_mark_guard_page((uint64_t)ap_ist3_stacks[cpu_id]);
     
     // Directly update the shared GDT's TSS entry (slots 5-6) without gdt_flush.
     // The GDT is already loaded via lgdt in ap_entry(); we just need to update

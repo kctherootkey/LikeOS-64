@@ -310,4 +310,33 @@ extern bool g_smap_enabled;
 void smap_disable(void);  // Execute STAC if SMAP is enabled
 void smap_enable(void);   // Execute CLAC if SMAP is enabled
 
+// ============================================================================
+// KERNEL STACK GUARD PAGE ALLOCATOR
+// ============================================================================
+// Each guarded stack slot layout (x86-64 stacks grow downward):
+//   [ slot_base + 0           .. slot_base + PAGE_SIZE - 1 ]  NOT PRESENT (guard)
+//   [ slot_base + PAGE_SIZE   .. slot_base + PAGE_SIZE + usable_size - 1 ]  usable
+//
+// Virtual range just above the slab allocator region (SLAB_VIRT_END).
+// 64 MB pool supports ~3200 fully-loaded 16 KB task stacks simultaneously.
+#define KSTACK_VIRT_BASE   0xFFFFFFFF90000000ULL   /* just above SLAB_VIRT_END */
+#define KSTACK_VIRT_LIMIT  0xFFFFFFFF94000000ULL   /* 64 MB pool              */
+
+// Allocate a kernel stack with a guard page below the usable area.
+// Returns a pointer to the first byte of the USABLE region (not the guard).
+// usable_size must be a non-zero multiple of PAGE_SIZE.
+// Returns NULL on allocation failure.
+void* mm_alloc_guarded_kstack(size_t usable_size);
+
+// Free a kernel stack previously returned by mm_alloc_guarded_kstack().
+// stack_base must be exactly the pointer returned by mm_alloc_guarded_kstack()
+// and usable_size must match the value passed at allocation time.
+void  mm_free_guarded_kstack(void* stack_base, size_t usable_size);
+
+// Mark a single 4 KB page as not-present (guard page).
+// If the page is currently covered by a 2 MB large mapping it is split into
+// 4 KB entries first so only the requested page is affected.
+// Safe to call from any context after mm_init() has returned.
+void  mm_mark_guard_page(uint64_t virt_addr);
+
 #endif // _KERNEL_MEMORY_H_
