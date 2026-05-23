@@ -1,8 +1,14 @@
 # LikeOS-64 UEFI Build System
 # Professional UEFI kernel build with modular directory structure
 
-# Pass DEBUG=1 on the command line to enable verbose stack-smash output in libc.
+# Pass DEBUG=1 on the command line to enable verbose stack-smash output in libc
+# and kernel memory poisoning (freed slabs, freed pages, uninitialized allocs).
 DEBUG ?= 0
+ifeq ($(DEBUG),1)
+  KERNEL_DEBUG_CFLAGS = -DDEBUG=1
+else
+  KERNEL_DEBUG_CFLAGS =
+endif
 
 # Codename for this release
 CODENAME = blessed kitty
@@ -93,7 +99,8 @@ KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-U__linux__ -U_LINUX -Ulinux \
 			-DXHCI_USE_INTERRUPTS=1 $(SERIAL_CFLAGS) $(USB_SERIAL_CFLAGS) \
 			-DBUILD_DATE='"$(BUILD_DATE)"' \
-			-DLIKEOS_VERSION='"$(LIKEOS_VERSION)"'
+			-DLIKEOS_VERSION='"$(LIKEOS_VERSION)"' \
+			$(KERNEL_DEBUG_CFLAGS)
 
 # Extra flags for ACPICA sources (suppress upstream warnings)
 # -U__linux__ -U_LINUX: prevent ACPICA from selecting aclinux.h (GCC defines

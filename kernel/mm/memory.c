@@ -12,6 +12,36 @@
 #define USE_SLAB_ALLOCATOR
 
 // ============================================================================
+// MEMORY POISONING
+// ============================================================================
+// Active when compiled with DEBUG=1.  Invalid accesses to freed or
+// uninitialized memory become immediately obvious.
+//
+//   POISON_FREED_PAGE  0xFEEDFACE – physical page returned to free pool
+//   POISON_UNINIT_PAGE 0xCCCCCCCC – newly allocated physical page (debug)
+//
+// Slab-level patterns (0xDEADBEEF freed object, 0xCCCCCCCC new object)
+// are defined and applied in slab.c.
+#define POISON_FREED_PAGE   0xFEEDFACEU
+#define POISON_UNINIT_PAGE  0xCCCCCCCCU
+
+/* Fill *bytes* bytes at *dest* with a repeating 32-bit *pattern*. */
+static void mm_poison_fill(void *dest, uint32_t pattern, size_t bytes)
+{
+    uint32_t *p = (uint32_t *)dest;
+    size_t n = bytes >> 2;
+    for (size_t i = 0; i < n; i++) p[i] = pattern;
+    uint8_t *t = (uint8_t *)(p + n);
+    uint8_t *b = (uint8_t *)&pattern;
+    switch (bytes & 3) {
+        case 3: t[2] = b[2]; /* fall-through */
+        case 2: t[1] = b[1]; /* fall-through */
+        case 1: t[0] = b[0]; break;
+        default: break;
+    }
+}
+
+// ============================================================================
 // SMP LOCKING
 // ============================================================================
 // Spinlock for physical memory allocator (bitmap access)
@@ -741,6 +771,16 @@ uint64_t mm_allocate_physical_page(void) {
     }
     
     spin_unlock_irqrestore(&mm_phys_lock, flags);
+
+    /* Zero or poison the page outside the lock; the page bit is already set
+     * so only we can access it. */
+    if (is_phys_in_direct_map(phys)) {
+#if DEBUG
+        mm_poison_fill(phys_to_virt(phys), POISON_UNINIT_PAGE, PAGE_SIZE);
+#else
+        mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
+#endif
+    }
     return phys;
 }
 
@@ -759,6 +799,12 @@ void mm_free_physical_page(uint64_t physical_address) {
         return; // Already free
     }
     
+    /* Always poison the page before marking it free.  We hold the lock and
+     * the page bit is still set, so no other CPU can grab the page yet. */
+    if (is_phys_in_direct_map(physical_address)) {
+        mm_poison_fill(phys_to_virt(physical_address),
+                       POISON_FREED_PAGE, PAGE_SIZE);
+    }
     clear_page_bit(page);
     mm_state.free_pages++;
     
@@ -1546,7 +1592,13 @@ void* kalloc(size_t size) {
     mm_state.heap_used += size + sizeof(heap_block_t);
     mm_state.allocation_count++;
 
-    return (uint8_t*)block + sizeof(heap_block_t);
+    void *user_ptr = (uint8_t*)block + sizeof(heap_block_t);
+#if DEBUG
+    mm_poison_fill(user_ptr, POISON_UNINIT_PAGE, size);
+#else
+    mm_memset(user_ptr, 0, size);
+#endif
+    return user_ptr;
 #endif
 }
 
@@ -1586,7 +1638,11 @@ void kfree(void* ptr) {
     // Mark as free
     block->magic = HEAP_MAGIC_FREE;
     block->is_free = 1;
-    
+
+    /* Always poison the freed payload to catch use-after-free. */
+    mm_poison_fill((uint8_t*)block + sizeof(heap_block_t),
+                   0xDEADBEEFU, block->size);
+
     // Update statistics
     mm_state.heap_used -= block->size + sizeof(heap_block_t);
     mm_state.deallocation_count++;

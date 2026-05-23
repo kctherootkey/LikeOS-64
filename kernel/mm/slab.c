@@ -12,6 +12,33 @@
 extern int mm_debug_pt;
 
 // ============================================================================
+// MEMORY POISONING
+// ============================================================================
+// Active when compiled with DEBUG=1.
+//
+//   POISON_FREED_SLAB 0xDEADBEEF – freed slab object (catches use-after-free)
+//   POISON_FREED_PAGE 0xFEEDFACE – slab page returned to physical pool
+//   POISON_UNINIT     0xCCCCCCCC – fresh alloc (caller must not rely on zeros)
+#define POISON_FREED_SLAB  0xDEADBEEFU
+#define POISON_FREED_PAGE  0xFEEDFACEU
+#define POISON_UNINIT      0xCCCCCCCCU
+
+static inline void slab_poison_fill(void *dest, uint32_t pattern, size_t bytes)
+{
+    uint32_t *p = (uint32_t *)dest;
+    size_t n = bytes >> 2;
+    for (size_t i = 0; i < n; i++) p[i] = pattern;
+    uint8_t *t = (uint8_t *)(p + n);
+    uint8_t *b = (uint8_t *)&pattern;
+    switch (bytes & 3) {
+        case 3: t[2] = b[2]; /* fall-through */
+        case 2: t[1] = b[1]; /* fall-through */
+        case 1: t[0] = b[0]; break;
+        default: break;
+    }
+}
+
+// ============================================================================
 // SMP LOCKING
 // ============================================================================
 // Global SLAB allocator lock (protects virtual address allocator and large alloc tracking)
@@ -318,7 +345,12 @@ static void slab_free_page(slab_page_t* slab) {
     // Get physical address before we unmap
     uint64_t phys_addr = slab->phys_addr;
     uint64_t virt_addr = (uint64_t)slab;
-    
+
+    /* Always poison the entire page through the virtual mapping while it is still
+     * mapped.  Any stale kernel pointer into this virtual range will read back
+     * 0xFEEDFACE, making use-after-free immediately visible. */
+    slab_poison_fill((void *)virt_addr, POISON_FREED_PAGE, PAGE_SIZE);
+
     // Unmap the virtual address (includes TLB shootdown on SMP)
     mm_unmap_page(virt_addr);
     
@@ -492,8 +524,14 @@ void* slab_alloc(size_t size) {
         header->page_count = page_count;
         header->size = size;
         header->phys_addr = phys_pages;
-        
-        return (uint8_t*)header + sizeof(large_alloc_header_t);
+
+        void *user_ptr = (uint8_t*)header + sizeof(large_alloc_header_t);
+#if DEBUG
+        slab_poison_fill(user_ptr, POISON_UNINIT, size);
+#else
+        mm_memset(user_ptr, 0, size);
+#endif
+        return user_ptr;
     }
     
     // Find appropriate size class
@@ -564,7 +602,13 @@ void* slab_alloc(size_t size) {
     
     void* result = slab_get_object(slab, obj_idx);
     spin_unlock_irqrestore(&cache->lock, flags);
-    
+
+#if DEBUG
+    slab_poison_fill(result, POISON_UNINIT, cache->object_size);
+#else
+    mm_memset(result, 0, cache->object_size);
+#endif
+
     return result;
 }
 
@@ -589,7 +633,15 @@ void slab_free(void* ptr) {
         uint64_t phys_addr = large_header->phys_addr;
         uint64_t virt_addr = (uint64_t)large_header;
         size_t alloc_bytes = page_count * PAGE_SIZE;
-        
+
+        /* Always poison the user payload before unmapping. */
+        {
+            size_t header_sz = sizeof(large_alloc_header_t);
+            slab_poison_fill((uint8_t *)virt_addr + header_sz,
+                             POISON_FREED_SLAB,
+                             alloc_bytes > header_sz ? alloc_bytes - header_sz : 0);
+        }
+
         // Unmap all pages WITHOUT individual TLB shootdowns (batched for performance)
         for (size_t i = 0; i < page_count; i++) {
             mm_unmap_page_no_shootdown(virt_addr + (i * PAGE_SIZE));
@@ -665,7 +717,11 @@ void slab_free(void* ptr) {
     
     // Was this slab full?
     bool was_full = (slab->free_count == 0);
-    
+
+    /* Always poison the object while we hold the lock.  The bitmap bit is
+     * still set so no other CPU can observe the partial write. */
+    slab_poison_fill(ptr, POISON_FREED_SLAB, cache->object_size);
+
     // Mark object as free
     bitmap_clear(slab->bitmap, obj_idx);
     slab->free_count++;
