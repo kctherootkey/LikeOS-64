@@ -615,10 +615,13 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4,
     task_list_add(t);
     spin_unlock_irqrestore(&g_task_list_lock, flags);
 
-    // Enqueue to per-CPU run queue
-    if (g_smp_initialized) {
-        sched_enqueue_ready(t);
-    }
+    // NOTE: Do NOT enqueue here.  The caller (elf_exec) must call
+    // sched_enqueue_ready(t) AFTER completing all per-task setup (e.g.
+    // setup_user_tls_canary).  Enqueueing before setup_user_tls_canary
+    // creates an SMP race: an AP can pick up the task immediately, run
+    // arch_prctl to set fs_base = &_bootstrap_tls, and then the BSP
+    // overwrites fs_base = USER_INITIAL_TLS_VA, corrupting TLS on the
+    // next context switch and causing a false stack-protector mismatch.
 
     return t;
 }

@@ -12,7 +12,7 @@
 #include "../../include/kernel/bug.h"
 
 #define SKB_SMALL_COUNT   512
-#define SKB_JUMBO_COUNT     8
+#define SKB_JUMBO_COUNT    32
 
 #define SKB_SIG_SMALL  0x534B5342u   // 'SKSB'
 #define SKB_SIG_JUMBO  0x4A4B5342u   // 'JKSB'

@@ -144,6 +144,23 @@ int sock_bind(int sockfd, const struct sockaddr_in* addr) {
     if (!s->active) return -EBADF;
     if (s->bound) return -EINVAL;
 
+    /* For non-ephemeral (explicit) ports, check for address already in use.
+     * Two UDP sockets cannot share a port unless SO_REUSEADDR is set. */
+    if (addr->sin_port != 0 && s->type == SOCK_DGRAM) {
+        uint64_t gflags;
+        spin_lock_irqsave(&socket_lock, &gflags);
+        for (int i = 0; i < NET_MAX_SOCKETS; i++) {
+            net_socket_t* o = &sockets[i];
+            if (i == sockfd || !o->active || !o->bound || o->type != SOCK_DGRAM)
+                continue;
+            if (o->local_addr.sin_port == addr->sin_port && !o->reuse_addr) {
+                spin_unlock_irqrestore(&socket_lock, gflags);
+                return -EADDRINUSE;
+            }
+        }
+        spin_unlock_irqrestore(&socket_lock, gflags);
+    }
+
     uint64_t flags;
     spin_lock_irqsave(&s->lock, &flags);
     s->local_addr = *addr;
@@ -774,15 +791,20 @@ int sock_setsockopt(int sockfd, int level, int optname,
             return 0;
         case SO_RCVTIMEO: {
             /* struct timeval is { int64_t tv_sec, int64_t tv_usec } = 16 bytes.
-             * Kernel timer runs at 100 Hz (1 tick = 10 ms).
-             * Convert: ticks = tv_sec * 100 + tv_usec / 10000.
-             * Legacy callers passing a raw millisecond uint64_t (<16 bytes) still
-             * use the old /10 path. */
+             * Use the calibrated timer frequency so the timeout is correct
+             * regardless of the actual tick rate (e.g. VMware may calibrate
+             * g_frequency != 100 Hz).
+             * Legacy callers passing a raw millisecond uint64_t (<16 bytes)
+             * still use the old /10 path (assumes 100 Hz). */
+            uint32_t hz = timer_get_frequency();
+            if (hz == 0) hz = 100;
             if (optlen >= 2 * (int)sizeof(uint64_t)) {
                 const int64_t *tv = (const int64_t *)optval;
                 int64_t sec  = tv[0] > 0 ? tv[0] : 0;
                 int64_t usec = tv[1] > 0 ? tv[1] : 0;
-                s->rcv_timeout_ticks = (uint64_t)sec * 100 + (uint64_t)usec / 10000;
+                /* usec_per_tick = 1000000 / hz; avoid division: ticks = sec*hz + usec*hz/1000000 */
+                s->rcv_timeout_ticks = (uint64_t)sec * hz +
+                                       (uint64_t)usec * hz / 1000000ULL;
             } else if (optlen >= (int)sizeof(uint64_t)) {
                 s->rcv_timeout_ticks = *(const uint64_t *)optval / 10;
             } else if (optlen >= (int)sizeof(int)) {

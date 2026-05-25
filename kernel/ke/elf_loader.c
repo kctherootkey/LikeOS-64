@@ -420,8 +420,16 @@ int elf_exec(const char* path, char* const argv[], char* const envp[],
     t->user_stack_top  = USER_STACK_TOP;
     t->mmap_base       = USER_STACK_TOP - (4 * 1024 * 1024);
 
-    /* Allocate per-process TLS page with random canary at fs:0x28. */
+    /* Allocate per-process TLS page with random canary at fs:0x28.
+     * This MUST happen before sched_enqueue_ready: on SMP an AP could
+     * pick up the task immediately after enqueue, run arch_prctl to set
+     * fs_base = &_bootstrap_tls, and then we would overwrite it here
+     * with USER_INITIAL_TLS_VA — causing a false stack-protector mismatch
+     * on the next context switch. */
     setup_user_tls_canary(pml4, t);
+
+    /* Now safe to make the task runnable: fs_base is fully initialised. */
+    sched_enqueue_ready(t);
 
     task_t* cur = sched_current();
     if (cur) {

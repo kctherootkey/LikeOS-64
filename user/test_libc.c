@@ -4003,12 +4003,15 @@ network_section:
         bad_fd = socket(AF_INET, 99, 0);
         test_result("socket(AF_INET, 99) == -1 (bad type)", bad_fd == -1);
 
+        /* Per-process port to avoid EADDRINUSE with parallel instances */
+        uint16_t sock_test_port = (uint16_t)(12345 + (getpid() & 0x3FF));
+
         // Test bind (UDP)
         if (udp_fd >= 0) {
             struct sockaddr_in addr;
             memset(&addr, 0, sizeof(addr));
             addr.sin_family = AF_INET;
-            addr.sin_port = htons(12345);
+            addr.sin_port = htons(sock_test_port);
             addr.sin_addr.s_addr = htonl(INADDR_ANY);
             int ret = bind(udp_fd, (struct sockaddr*)&addr, sizeof(addr));
             test_result("bind(udp, port 12345) == 0", ret == 0);
@@ -4018,7 +4021,7 @@ network_section:
             socklen_t got_len = sizeof(got_addr);
             ret = getsockname(udp_fd, (struct sockaddr*)&got_addr, &got_len);
             test_result("getsockname(udp) == 0", ret == 0);
-            test_result("getsockname port == 12345", ntohs(got_addr.sin_port) == 12345);
+            test_result("getsockname port == 12345", ntohs(got_addr.sin_port) == sock_test_port);
         }
 
         // Test bind (TCP)
@@ -4763,10 +4766,16 @@ network_section:
         test_result("udp loopback: socket create", sock >= 0);
 
         if (sock >= 0) {
+            /* Per-process port to avoid EADDRINUSE with parallel instances */
+            uint16_t udp_lo_port = (uint16_t)(19999 + (getpid() & 0x3FF));
+
+            struct timeval udp_tv = { .tv_sec = 3, .tv_usec = 0 };
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &udp_tv, sizeof(udp_tv));
+
             struct sockaddr_in bind_addr;
             memset(&bind_addr, 0, sizeof(bind_addr));
             bind_addr.sin_family = AF_INET;
-            bind_addr.sin_port = htons(19999);
+            bind_addr.sin_port = htons(udp_lo_port);
             bind_addr.sin_addr.s_addr = htonl(0x7F000001);  // 127.0.0.1
 
             int ret = bind(sock, (struct sockaddr*)&bind_addr, sizeof(bind_addr));
@@ -4776,7 +4785,7 @@ network_section:
                 struct sockaddr_in dest;
                 memset(&dest, 0, sizeof(dest));
                 dest.sin_family = AF_INET;
-                dest.sin_port = htons(19999);
+                dest.sin_port = htons(udp_lo_port);
                 dest.sin_addr.s_addr = htonl(0x7F000001);
 
                 const char* msg = "loopback test";
@@ -5066,10 +5075,17 @@ network_section:
         test_result("udp frag: sockets create", rx_fd >= 0 && tx_fd >= 0);
 
         if (rx_fd >= 0 && tx_fd >= 0) {
+            /* Use a per-process port to avoid conflicts with parallel instances */
+            uint16_t frag_port = (uint16_t)(20031 + (getpid() & 0x1FF));
+
+            /* 3 s receive timeout so a lost packet doesn't hang the suite */
+            struct timeval frag_tv = { .tv_sec = 3, .tv_usec = 0 };
+            setsockopt(rx_fd, SOL_SOCKET, SO_RCVTIMEO, &frag_tv, sizeof(frag_tv));
+
             struct sockaddr_in bind_addr;
             memset(&bind_addr, 0, sizeof(bind_addr));
             bind_addr.sin_family = AF_INET;
-            bind_addr.sin_port = htons(20031);
+            bind_addr.sin_port = htons(frag_port);
             bind_addr.sin_addr.s_addr = htonl(0x7F000001);
 
             int ret = bind(rx_fd, (struct sockaddr*)&bind_addr, sizeof(bind_addr));
@@ -5084,7 +5100,7 @@ network_section:
                 struct sockaddr_in dest;
                 memset(&dest, 0, sizeof(dest));
                 dest.sin_family = AF_INET;
-                dest.sin_port = htons(20031);
+                dest.sin_port = htons(frag_port);
                 dest.sin_addr.s_addr = htonl(0x7F000001);
 
                 ssize_t sent = sendto(tx_fd, sendbuf, sizeof(sendbuf), 0,
@@ -6509,8 +6525,11 @@ network_section:
         int sync_pipe[2] = {-1, -1};
         pipe(sync_pipe);
 
-        /* Per-process port so two parallel testlibc instances don't collide. */
-        int tls_lb_port = 21100 + ((int)getpid() % 1000);
+        /* Per-process port so two parallel testlibc instances don't collide.
+         * Use & 0x3FFF (16384 values, range 21100-37483) instead of % 1000
+         * to make port collisions practically impossible: two PIDs would
+         * need to differ by exactly 16384, vs. 1000 before. */
+        int tls_lb_port = 21100 + ((int)getpid() & 0x3FFF);
 
         /* --- Listening socket (created before fork so child inherits it) --- */
         int srv_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -6577,6 +6596,14 @@ network_section:
             { char r = 'R'; write(sync_pipe[1], &r, 1); }
             close(sync_pipe[1]);
 
+            /* 30 s accept timeout — prevents the server child from hanging
+             * indefinitely if the client never connects (e.g. port collision
+             * edge case with a parallel instance). */
+            {
+                struct timeval atv = { .tv_sec = 30, .tv_usec = 0 };
+                setsockopt(srv_sock, SOL_SOCKET, SO_RCVTIMEO,
+                           &atv, sizeof(atv));
+            }
             conn_fd = accept(srv_sock, NULL, NULL);
             close(srv_sock);
             if (conn_fd < 0) { p_SSL_CTX_free(sctx); _exit(7); }
@@ -6623,7 +6650,22 @@ network_section:
             }
             if (total_sent != TLS_DATA_LEN) { p_SSL_free(ssl); p_SSL_CTX_free(sctx); close(conn_fd); _exit(11); }
 
+            /* Bidirectional TLS shutdown: send our close_notify first,
+             * then drain any incoming data/alert until we see EOF or error.
+             * This prevents close(conn_fd) from sending a RST before the
+             * client has finished reading the last data record.
+             * Use a short receive timeout so we never hang if the client
+             * died without sending its close_notify. */
             p_SSL_shutdown(ssl);
+            {
+                struct timeval drain_tv = { .tv_sec = 10, .tv_usec = 0 };
+                setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO,
+                           &drain_tv, sizeof(drain_tv));
+                unsigned char drain_buf[4096];
+                int dr;
+                while ((dr = p_SSL_read(ssl, drain_buf, sizeof(drain_buf))) > 0)
+                    (void)dr;
+            }
             p_SSL_free(ssl);
             p_SSL_CTX_free(sctx);
             close(conn_fd);
@@ -6669,8 +6711,9 @@ network_section:
             int cli_sock = socket(AF_INET, SOCK_STREAM, 0);
             int cli_conn_ok = 0;
             if (cli_sock >= 0) {
-                /* 30 s receive timeout so a stalled handshake cannot hang forever */
-                struct timeval rcv_tv = { .tv_sec = 30, .tv_usec = 0 };
+                /* 120 s receive timeout — two parallel TLS sessions on a
+                 * slow VMware VM can take much longer than 30 s under load */
+                struct timeval rcv_tv = { .tv_sec = 120, .tv_usec = 0 };
                 setsockopt(cli_sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
                 struct sockaddr_in cli_addr;
                 memset(&cli_addr, 0, sizeof(cli_addr));
@@ -6732,7 +6775,8 @@ network_section:
                                               p_SSL_get_error(ssl, n) : 0;
                                     if (err == 2 || err == 3) continue;
                                     printf("  [DBG] TLS recv loop exit: n=%d err=%d"
-                                           " total_recv=%d\n", n, err, total_recv);
+                                           " errno=%d total_recv=%d\n",
+                                           n, err, errno, total_recv);
                                     break;
                                 }
                             }

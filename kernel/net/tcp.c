@@ -718,8 +718,10 @@ static uint64_t tcp_rto_ticks(tcp_conn_t* conn) {
         else
             rto <<= shift;
     }
-    // 100Hz timer => 10000us per tick
-    uint64_t ticks = rto / 10000U;
+    /* us_per_tick = 1000000 / hz; ticks = rto / us_per_tick = rto * hz / 1000000 */
+    uint32_t hz = timer_get_frequency();
+    if (hz == 0) hz = 100;
+    uint64_t ticks = (uint64_t)rto * hz / 1000000ULL;
     if (ticks < 1) ticks = 1;
     return ticks;
 }

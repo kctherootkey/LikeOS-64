@@ -1,11 +1,11 @@
 // Stack canary support for libc (-fstack-protector-strong)
-// Uses fs:0x28 (TLS slot) as the canary source — set per-process at exec time.
+// Uses fs:0x28 (TLS slot) as the canary source - set per-process at exec time.
 // __stack_chk_guard is kept for linking against objects compiled with =global.
 #include <stdint.h>
 
 uint64_t __stack_chk_guard = 0xDEADBEEFCAFEBABEULL;
 
-/* ---- raw I/O helpers (no libc — stack may be corrupt) ---- */
+/* ---- raw I/O helpers (no libc - stack may be corrupt) ---- */
 
 static __attribute__((noinline, no_stack_protector))
 void _sc_wbuf(const char *b, long n) {
@@ -31,7 +31,7 @@ void _sc_wdec(uint64_t v) {
     _sc_wbuf(buf + i, 22 - i);
 }
 
-/* Program name — set from argv[0] via __libc_set_progname() in crt0.S,
+/* Program name - set from argv[0] via __libc_set_progname() in crt0.S,
  * defined in src/stdio/err.c. */
 extern const char *__progname;
 
@@ -174,13 +174,13 @@ void __stack_chk_fail(void) {
 
     /* Diagnosis */
     if (found == 0 && expected != 0) {
-        _sc_ws("\nDiagnosis: stack slot zeroed — likely buffer overflow with NUL bytes\n");
+        _sc_ws("\nDiagnosis: stack slot zeroed - likely buffer overflow with NUL bytes\n");
     } else if (found != 0 && expected == 0) {
-        _sc_ws("\nDiagnosis: %fs:0x28 is ZERO — FS base was reset/corrupted (TLS bug)\n");
+        _sc_ws("\nDiagnosis: %fs:0x28 is ZERO - FS base was reset/corrupted (TLS bug)\n");
     } else if (found == expected) {
-        _sc_ws("\nDiagnosis: canaries match — impossible? (diff was non-zero at call site)\n");
+        _sc_ws("\nDiagnosis: canaries match - impossible? (diff was non-zero at call site)\n");
     } else {
-        _sc_ws("\nDiagnosis: canary mismatch — stack corrupted or FS base changed\n");
+        _sc_ws("\nDiagnosis: canary mismatch - stack corrupted or FS base changed\n");
         const char *pat = _sc_pattern(found);
         if (pat) {
             _sc_ws("Overflow pattern: ");
@@ -198,7 +198,7 @@ void __stack_chk_fail(void) {
     _sc_ws("==================================================\n");
 #endif
 
-    /* SYS_exit_group(127) — LikeOS syscall 312 */
+    /* SYS_exit_group(127) - LikeOS syscall 312 */
     __asm__ volatile("syscall"
         : : "a"(312L), "D"(127L) : "rcx", "r11");
     /* Fallback: halt the CPU if exit_group somehow returns */
