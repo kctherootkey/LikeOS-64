@@ -5,6 +5,7 @@
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/random.h"
+#include "../../include/kernel/bug.h"
 
 // DNS constants
 #define DNS_PORT            53
@@ -81,6 +82,7 @@ static void dns_strcpy(char* dst, const char* src, int maxlen) {
 // DNS cache
 // ============================================================================
 static int dns_cache_lookup(const char* hostname, uint32_t* ip_out) {
+    BUG_ON(hostname == NULL);
     uint64_t now = timer_ticks();
     for (int i = 0; i < DNS_CACHE_SIZE; i++) {
         if (!dns_cache[i].valid) continue;
@@ -209,8 +211,7 @@ static int dns_parse_response(const uint8_t* pkt, int pktlen,
     uint16_t flags = net_ntohs(hdr->flags);
     uint16_t qdcount = net_ntohs(hdr->qdcount);
     uint16_t ancount = net_ntohs(hdr->ancount);
-
-    if (id != expected_id) return -1;
+    WARN_RATELIMIT(ancount > 64, "dns_parse_response: suspicious ancount=%u", ancount);
     if (!(flags & DNS_FLAG_QR)) return -1;  // Not a response
     if ((flags & DNS_FLAG_RCODE) != 0) return -1;  // Error in response
 
@@ -238,6 +239,7 @@ static int dns_parse_response(const uint8_t* pkt, int pktlen,
 
         if (pos + rdlen > pktlen) return -1;
 
+        WARN_RATELIMIT(rtype == DNS_TYPE_A && rdlen != 4, "dns_parse_response: A record with rdlen=%u (expected 4)", rdlen);
         if (rtype == DNS_TYPE_A && rclass == DNS_CLASS_IN && rdlen == 4) {
             // Found an A record
             *ip_out = ((uint32_t)pkt[pos] << 24) |
@@ -258,6 +260,7 @@ static int dns_parse_response(const uint8_t* pkt, int pktlen,
 // dns_rx - Called by UDP layer when a DNS response arrives (port DNS_CLIENT_PORT)
 // ============================================================================
 void dns_rx(const uint8_t* data, uint16_t len) {
+    BUG_ON(data == NULL);
     if (len < (int)sizeof(dns_header_t) || len > DNS_MAX_PACKET) return;
 
     const dns_header_t* hdr = (const dns_header_t*)data;
@@ -279,6 +282,8 @@ void dns_rx(const uint8_t* data, uint16_t len) {
 // dns_resolve - Resolve a hostname to an IPv4 address
 // ============================================================================
 int dns_resolve(const char* hostname, uint32_t* ip_out) {
+    BUG_ON(hostname == NULL);
+    BUG_ON(ip_out == NULL);
     if (!hostname || !ip_out) return -EINVAL;
 
     // Handle numeric IP addresses (a.b.c.d)

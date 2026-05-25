@@ -16,6 +16,7 @@
 #include "../../../include/kernel/ioapic.h"
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/timer.h"
+#include "../../../include/kernel/bug.h"
 
 static vmxnet3_dev_t g_vmxnet3;
 int g_vmxnet3_initialized = 0;
@@ -320,6 +321,7 @@ static int vm_activate(vmxnet3_dev_t* dev) {
     // is read back from VMXNET3_REG_CMD (0 = success, non-zero = error).
     vm_w32(dev->bar1, VMXNET3_REG_CMD, VMXNET3_CMD_ACTIVATE_DEV);
     uint32_t status = vm_r32(dev->bar1, VMXNET3_REG_CMD);
+    WARN_ON_ONCE(status != 0);  /* VMXNET3 ACTIVATE_DEV failed - DriverShared validation error */
     if (status != 0) {
         kprintf("VMXNET3: ACTIVATE_DEV failed (status=0x%x)\n", status);
         return -1;
@@ -337,7 +339,9 @@ static int vm_activate(vmxnet3_dev_t* dev) {
 // Send a single Ethernet frame
 // ============================================================================
 static int vmxnet3_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
+    BUG_ON(ndev == NULL);
     vmxnet3_dev_t* dev = (vmxnet3_dev_t*)ndev->driver_data;
+    BUG_ON(dev == NULL);
 
     if (len > VMXNET3_TX_BUF_SIZE) return -1;
     uint16_t out_len = (len < 60) ? 60 : len;
@@ -519,6 +523,7 @@ void vmxnet3_irq_handler(void) {
     }
 
     vmxnet3_dev_t* dev = &g_vmxnet3;
+    BUG_ON(dev == NULL);
 
     // For legacy INTx, reading ICR both clears and tells us "is this
     // ours?".  For MSI, ICR reads as 0 but doing the read is harmless.

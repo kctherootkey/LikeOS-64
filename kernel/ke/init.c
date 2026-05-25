@@ -26,6 +26,8 @@
 #include "../../include/kernel/usb_serial.h"
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/types.h"
+#include "../../include/kernel/futex.h"
+#include "../../include/kernel/bug.h"
 
 void system_startup(boot_info_t* boot_info);
 void kernel_main(boot_info_t* boot_info);
@@ -39,6 +41,7 @@ static uint64_t g_boot_epoch_saved;       // Saved boot epoch from UEFI GetTime
 
 __no_stack_protector
 void kernel_main(boot_info_t* boot_info) {
+    BUG_ON(boot_info == NULL);
     g_boot_info = boot_info;
     console_init((framebuffer_info_t*)&boot_info->fb_info);
     console_init_fb_optimization();
@@ -47,6 +50,8 @@ void kernel_main(boot_info_t* boot_info) {
 
 __no_stack_protector
 void system_startup(boot_info_t* boot_info) {
+    BUG_ON(boot_info == NULL);
+    WARN_ON_ONCE(boot_info->fb_info.horizontal_resolution == 0 || boot_info->fb_info.vertical_resolution == 0);  /* UEFI framebuffer has zero resolution */
     console_set_color(10, 0);
     kprintf("\nLikeOS-64 Kernel v0.2\n\n");
     console_set_color(15, 0);
@@ -137,6 +142,7 @@ void continue_system_startup(void) {
     // ACPI must be ready before PS/2 PNP detection
     // so targeted firmware discovery can inspect the controller and HID
     // device nodes.
+    WARN_ON_ONCE(g_rsdp_address == 0);  /* RSDP not provided by bootloader: ACPI, xHCI, HPET, and timers will all fail */
     acpi_init(g_rsdp_address);
     acpi_pm_init();
     timer_init_hpet();     // Prefer HPET for precise wall-clock timing if available
@@ -160,6 +166,7 @@ void continue_system_startup(void) {
     // Initialize networking (E1000 NIC driver, protocol stack, DHCP)
     net_init();
 
+    futex_init();
     sched_init();
 
     // Mask ACPI SCI permanently — level-triggered EC GPE 0x66 fires
@@ -189,6 +196,7 @@ void continue_system_startup(void) {
     }
 
     // Enable interrupts (SCI stays masked — no EC event storm).
+    WARN_ON_ONCE(smp_get_cpu_count() < 1);  /* at least BSP must be online before STI */
     __asm__ volatile ("sti");
 
     // Send DHCP DISCOVER now that interrupts are enabled and the E1000

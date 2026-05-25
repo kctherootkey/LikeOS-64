@@ -14,6 +14,7 @@
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/icache.h"
+#include "../../include/kernel/bug.h"
 
 // ============================================================================
 // External FAT32 internals we need (declared in fat32.h)
@@ -22,6 +23,7 @@
 // Convert cluster number to LBA
 static inline unsigned long pc_cluster_to_lba(fat32_fs_t *fs, unsigned long cluster)
 {
+    WARN_ON(cluster < 2);  /* cluster number < 2 is invalid in FAT32 */
     return fs->part_lba_offset + fs->data_start_lba + (cluster - 2) * fs->sectors_per_cluster;
 }
 
@@ -124,6 +126,7 @@ static inline unsigned long pc_hash_key(unsigned long cluster_id,
 
 static inline void lru_insert_head(pc_page_t *page)
 {
+    WARN_ON(page->lru_next != NULL || page->lru_prev != NULL);  /* double lru_insert_head: page already on LRU list */
     page->lru_next = pc_lru_sentinel.lru_next;
     page->lru_prev = &pc_lru_sentinel;
     pc_lru_sentinel.lru_next->lru_prev = page;
@@ -132,6 +135,7 @@ static inline void lru_insert_head(pc_page_t *page)
 
 static inline void lru_remove(pc_page_t *page)
 {
+    WARN_ON_ONCE(!page->lru_prev && !page->lru_next);  /* lru_remove on page not linked into LRU: double-remove or corruption */
     if (page->lru_prev)
         page->lru_prev->lru_next = page->lru_next;
     if (page->lru_next)
@@ -171,6 +175,7 @@ static inline void dirty_list_remove(pc_page_t *page)
 // Allocate a pc_page_t descriptor + a physical data page.
 static pc_page_t* pc_page_alloc(void)
 {
+    might_sleep();
     pc_page_t *pg = (pc_page_t *)kalloc(sizeof(pc_page_t));
     if (!pg)
         return 0;
@@ -183,6 +188,8 @@ static pc_page_t* pc_page_alloc(void)
     }
     pg->phys_addr = phys;
     pg->data      = (uint8_t *)phys_to_virt(phys);
+    WARN_ON(phys & (PAGE_SIZE - 1));  /* allocated physical page not page-aligned */
+    WARN_ON(pg->data == NULL);  /* phys_to_virt returned NULL for valid physical page */
     return pg;
 }
 
@@ -298,6 +305,9 @@ pc_page_t* pagecache_lookup(unsigned long cluster_id, unsigned long page_index)
 
 pc_page_t* pagecache_insert(pc_page_t *page)
 {
+    BUG_ON(!page);
+    WARN_ON(page->data == NULL);       /* inserting a page with no backing data buffer */
+    WARN_ON(page->cluster_id < 2);     /* cluster_id < 2 is reserved in FAT32 - wrong page being cached */
     if (!pc_initialized || !page)
         return 0;
 
@@ -539,6 +549,8 @@ static pc_page_t* pc_coalesced_read(fat32_fs_t *fs, unsigned long cluster_id,
                                      unsigned long page_index,
                                      unsigned long file_size)
 {
+    might_sleep();
+    VM_BUG_ON(fs == NULL);
     unsigned cluster_size = fs->sectors_per_cluster * fs->bytes_per_sector;
     unsigned long file_pages = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
     unsigned long spp = PAGE_SIZE / fs->bytes_per_sector; // sectors per page
@@ -687,6 +699,8 @@ pc_page_t* pagecache_get(unsigned long cluster_id, unsigned long page_index,
                          unsigned long file_size,
                          struct fat32_fs *fs_raw, unsigned long start_cluster)
 {
+    VM_BUG_ON(fs_raw == NULL);
+    VM_BUG_ON(start_cluster < 2);
     if (!pc_initialized)
         return 0;
 
@@ -703,6 +717,7 @@ pc_page_t* pagecache_get(unsigned long cluster_id, unsigned long page_index,
     // 1. Try cache lookup (no I/O lock needed)
     pc_page_t *pg = pagecache_lookup(cluster_id, page_index);
     if (pg) {
+        WARN_ON_ONCE(!(pg->flags & PC_PAGE_VALID));  /* pagecache_lookup returned page without PC_PAGE_VALID: stale insertion */
         __sync_fetch_and_add(&pc_stat_hits, 1);
         return pg;
     }
@@ -812,6 +827,8 @@ void pagecache_mark_dirty(pc_page_t *page)
 
 int pagecache_flush_file(unsigned long cluster_id)
 {
+    might_sleep();
+    VM_BUG_ON(cluster_id < 2);
     if (!pc_initialized || cluster_id < 2)
         return 0;
 
@@ -947,6 +964,7 @@ int pagecache_flush_file(unsigned long cluster_id)
 
 int pagecache_flush_all(void)
 {
+    might_sleep();
     if (!pc_initialized)
         return 0;
 
@@ -1090,6 +1108,7 @@ int pagecache_sync(void)
 
 void pagecache_invalidate_file(unsigned long cluster_id)
 {
+    VM_BUG_ON(cluster_id < 2);
     if (!pc_initialized || cluster_id < 2)
         return;
 

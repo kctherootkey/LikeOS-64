@@ -5,6 +5,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/vfs.h"
 #include "../../include/kernel/memory.h"
+#include "../../include/kernel/bug.h"
 
 // Seek whence values
 #define SEEK_SET 0
@@ -89,6 +90,7 @@ int sysfont_load(const char* path) {
 
         // Read all glyph data
         long glyph_data_size = (long)(header.numglyph * header.bytesperglyph);
+        BUG_ON(glyph_data_size > (long)sizeof(g_glyph_buffer));  /* PSF2 glyph data exceeds static buffer (already validated above) */
         bytes_read = vfs_read(file, g_glyph_buffer, glyph_data_size);
         if (bytes_read != glyph_data_size) {
             kprintf("sysfont: failed to read PSF2 glyphs (read %ld of %ld)\n", 
@@ -186,6 +188,7 @@ const uint8_t* sysfont_get_glyph(unsigned char c) {
     if (!g_sysfont.loaded || !g_sysfont.glyphs) {
         return NULL;
     }
+    WARN_ON_ONCE(g_sysfont.bytesperglyph == 0);  /* loaded font has zero bytesperglyph: glyph lookup is broken */
     
     // Clamp to available glyphs
     if (c >= g_sysfont.numglyphs) {

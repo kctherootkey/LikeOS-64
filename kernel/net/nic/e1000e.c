@@ -75,6 +75,7 @@
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/smp.h"
 #include "../../../include/kernel/timer.h"
+#include "../../../include/kernel/bug.h"
 
 // ============================================================================
 // Debug / diagnostic logging.
@@ -640,6 +641,7 @@ static int e1000e_phy_read_at(e1000e_dev_t* dev, uint8_t phy_addr,
         e1000e_delay_us(50);
         mdic = e1000e_read(dev, E1000_MDIC);
         if (mdic & E1000_MDIC_READY) {
+            WARN_ON_ONCE(mdic & E1000_MDIC_ERROR);  /* MDIC PHY read error bit set */
             if (mdic & E1000_MDIC_ERROR) return -1;
             if (val) *val = (uint16_t)(mdic & E1000_MDIC_DATA_MASK);
             return 0;
@@ -2183,7 +2185,11 @@ static int e1000e_init_tx(e1000e_dev_t* dev) {
 static void e1000e_link_state_poll(e1000e_dev_t* dev);
 
 static int e1000e_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
+    BUG_ON(ndev == NULL);
+    BUILD_BUG_ON(sizeof(e1000_rx_desc_legacy_t) != 16);
+    BUILD_BUG_ON(sizeof(e1000_tx_desc_legacy_t) != 16);
     e1000e_dev_t* dev = (e1000e_dev_t*)ndev->driver_data;
+    BUG_ON(dev == NULL);
 
     // Always service the link state on the TX path.  After a cable
     // replug we must re-clear LPLU on the PHY or the descriptor will
@@ -2594,6 +2600,7 @@ void e1000e_irq_handler(void) {
     }
 
     e1000e_dev_t* dev = &g_e1000e;
+    BUG_ON(dev == NULL);
     uint32_t icr = e1000e_read(dev, E1000_ICR);
 
 #if E1000E_DBG

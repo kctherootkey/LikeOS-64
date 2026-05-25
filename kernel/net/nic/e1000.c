@@ -16,6 +16,7 @@
 #include "../../../include/kernel/ioapic.h"
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/timer.h"
+#include "../../../include/kernel/bug.h"
 
 // ============================================================================
 // Supported PCI device IDs for the entire 8254x PCI/PCI-X family
@@ -196,8 +197,7 @@ static int e1000_init_rx(e1000_dev_t* dev) {
 
     dev->rx_descs = (e1000_rx_desc_legacy_t*)phys_to_virt(rx_phys);
     dev->rx_descs_phys = rx_phys;
-
-    // Zero descriptors
+    WARN_ON(rx_phys & 0xF);  /* RX descriptor ring must be 16-byte aligned */
     for (uint32_t i = 0; i < rx_ring_size / 8; i++)
         ((uint64_t*)dev->rx_descs)[i] = 0;
 
@@ -250,8 +250,7 @@ static int e1000_init_tx(e1000_dev_t* dev) {
 
     dev->tx_descs = (e1000_tx_desc_legacy_t*)phys_to_virt(tx_phys);
     dev->tx_descs_phys = tx_phys;
-
-    // Zero descriptors
+    WARN_ON(tx_phys & 0xF);  /* TX descriptor ring must be 16-byte aligned */
     for (uint32_t i = 0; i < tx_ring_size / 8; i++)
         ((uint64_t*)dev->tx_descs)[i] = 0;
 
@@ -293,7 +292,11 @@ static int e1000_init_tx(e1000_dev_t* dev) {
 // E1000 Send Packet (net_device_t callback)
 // ============================================================================
 static int e1000_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
+    BUG_ON(ndev == NULL);
+    BUILD_BUG_ON(sizeof(e1000_rx_desc_legacy_t) != 16);
+    BUILD_BUG_ON(sizeof(e1000_tx_desc_legacy_t) != 16);
     e1000_dev_t* dev = (e1000_dev_t*)ndev->driver_data;
+    BUG_ON(dev == NULL);
 
     if (len > E1000_RX_BUF_SIZE) return -1;
 
@@ -414,7 +417,9 @@ void e1000_irq_handler(void) {
     }
 
     e1000_dev_t* dev = &g_e1000;
+    BUG_ON(dev == NULL);
     uint32_t icr = e1000_read(dev, E1000_ICR);
+    WARN_ON_ONCE(icr == 0xFFFFFFFF);  /* ICR all-ones: MMIO bus error */
 
     if (icr == 0) {
         // Spurious - no cause bits set

@@ -21,6 +21,7 @@
 #include "../../../include/kernel/ioapic.h"
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/timer.h"
+#include "../../../include/kernel/bug.h"
 
 static eepro100_dev_t g_eepro100;
 int g_eepro100_initialized = 0;
@@ -345,6 +346,7 @@ static int eepro100_send(net_device_t* ndev, const uint8_t* data, uint16_t len) 
     spin_lock_irqsave(&d->tx_lock, &txflags);
 
     uint16_t slot = d->tx_prod;
+    WARN_ON(slot >= EEPRO100_NUM_TX_DESC);  /* tx_prod out of TX CB ring bounds - ring wrap logic corrupted */
     eepro100_cb_t* cb = e100_tx_cb(d, slot);
 
     // If the producer is about to lap the consumer, claim back any
@@ -463,6 +465,7 @@ static void eepro100_shutdown(net_device_t* ndev) {
 // ============================================================================
 static void e100_drain_rx(eepro100_dev_t* d) {
     while (1) {
+        WARN_ON(d->rx_cur >= EEPRO100_NUM_RX_DESC);  /* rx_cur out of RX RFD ring bounds - ring wrap logic corrupted */
         eepro100_rfd_t* rfd = e100_rx_rfd(d, d->rx_cur);
         if (!(rfd->status & EEPRO100_STATUS_C)) break;
 
@@ -506,6 +509,7 @@ void eepro100_irq_handler(void) {
     }
 
     eepro100_dev_t* d = &g_eepro100;
+    BUG_ON(d == NULL);
 
     // The STAT/ACK bits (CX/FR/CNA/RNR/MDI/SWI) live in the SCBAck byte
     // (offset 1), NOT the SCBStatus byte (offset 0, which holds CUS/RUS

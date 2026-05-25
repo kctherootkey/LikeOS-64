@@ -19,6 +19,7 @@
 #include "../../../include/kernel/ioapic.h"
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/timer.h"
+#include "../../../include/kernel/bug.h"
 
 // ============================================================================
 // Supported PCI device IDs
@@ -135,6 +136,7 @@ static int igb_init_rx(igb_dev_t* dev) {
     }
     dev->rx_descs = (igb_rx_desc_t*)phys_to_virt(phys);
     dev->rx_descs_phys = phys;
+    WARN_ON(phys & 0x7F);  /* IGB RX ring must be 128-byte aligned */
 
     for (uint32_t i = 0; i < ring_bytes / 8; i++)
         ((uint64_t*)dev->rx_descs)[i] = 0;
@@ -246,7 +248,9 @@ static int igb_init_tx(igb_dev_t* dev) {
 // send / link_status / shutdown
 // ============================================================================
 static int igb_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
+    BUG_ON(ndev == NULL);
     igb_dev_t* dev = (igb_dev_t*)ndev->driver_data;
+    BUG_ON(dev == NULL);
     if (len > IGB_RX_BUF_SIZE) return -1;
 
     // Serialize across CPUs: tx_tail, descriptor slot, TDT0 MMIO.
@@ -353,7 +357,9 @@ void igb_irq_handler(void) {
     }
 
     igb_dev_t* dev = &g_igb;
+    BUG_ON(dev == NULL);
     uint32_t icr = igb_read(dev, IGB_ICR);
+    WARN_ON_ONCE(icr == 0xFFFFFFFF);  /* ICR all-ones: MMIO bus error */
     if (icr == 0) {
         lapic_eoi();
         return;

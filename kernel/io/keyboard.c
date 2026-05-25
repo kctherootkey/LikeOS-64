@@ -6,6 +6,7 @@
 #include "../../include/kernel/tty.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/random.h"
+#include "../../include/kernel/bug.h"
 
 // Global keyboard state
 static keyboard_state_t kb_state = {0};
@@ -62,6 +63,7 @@ static char scan_code_to_ascii_shifted[] = {
 
 // Initialize keyboard
 void keyboard_init(void) {
+    BUILD_BUG_ON(sizeof(scan_code_to_ascii_table) != sizeof(scan_code_to_ascii_shifted));  /* both scan tables must be same size */
     // Clear keyboard state
     keyboard_reset_state_internal();
     kb_input_ready = 0;
@@ -122,6 +124,7 @@ char scan_code_to_ascii(uint8_t scan_code, uint8_t shift) {
 void keyboard_buffer_add(uint8_t scan_code) {
     uint64_t flags;
     spin_lock_irqsave(&kb_lock, &flags);
+    WARN_ON(kb_state.buffer_count >= KEYBOARD_BUFFER_SIZE);
     if (kb_state.buffer_count < KEYBOARD_BUFFER_SIZE) {
         kb_state.buffer[kb_state.buffer_end] = scan_code;
         kb_state.buffer_end = (kb_state.buffer_end + 1) % KEYBOARD_BUFFER_SIZE;
@@ -286,6 +289,7 @@ void keyboard_irq_handler(void) {
             fnum = 12;
 
         if (fnum) {
+            WARN_ON(fnum < 1 || fnum > 12);  /* fnum out of F1-F12 range */
             tty_t *tty = tty_get_console();
             tty_input_char(tty, 27, 0);  // ESC
             if (fnum <= 4) {

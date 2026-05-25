@@ -7,6 +7,7 @@
 #include "../../include/kernel/acpi.h"
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/random.h"
+#include "../../include/kernel/bug.h"
 
 // ============================================================================
 // Global Per-CPU Data
@@ -59,6 +60,7 @@ void percpu_init(void) {
 
 __no_stack_protector
 void percpu_init_cpu(uint32_t cpu_id, uint32_t apic_id) {
+    BUG_ON(cpu_id >= MAX_CPUS);
     percpu_t* percpu;
     
     if (cpu_id == 0) {
@@ -80,6 +82,7 @@ void percpu_init_cpu(uint32_t cpu_id, uint32_t apic_id) {
     
     // Initialize per-CPU fields
     percpu->self = percpu;
+    BUG_ON((uint64_t)percpu & (PAGE_SIZE - 1));  /* percpu struct must be page-aligned */
     // Seed a unique CSPRNG-backed canary (GS→BSP percpu is valid here).
     percpu->stack_canary = generate_stack_canary();
     write_gs_base((uint64_t)percpu);
@@ -189,6 +192,7 @@ task_t* percpu_runqueue_dequeue(void) {
             cpu->runqueue_tail = NULL;
         }
         
+        WARN_ON(cpu->runqueue_length == 0);  /* runqueue_length is 0 but runqueue_head was non-NULL: list count is inconsistent */
         cpu->runqueue_length--;
         task->next = NULL;
     }

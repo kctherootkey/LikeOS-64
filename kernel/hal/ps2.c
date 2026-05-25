@@ -8,6 +8,7 @@
 #include "../../include/kernel/ps2.h"
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/ioapic.h"
+#include "../../include/kernel/bug.h"
 
 #define PS2_DATA    0x60
 #define PS2_STATUS  0x64
@@ -104,6 +105,7 @@ int ps2_init(void)
         kprintf("PS2: no controller found\n");
         return -1;
     }
+    WARN_ON_ONCE(status & STR_OBF);  /* PS/2 output buffer not empty at start of init: stale data from firmware */
     kprintf("PS2: status=0x%02x\n", status);
 
     // Read CTR twice for stability

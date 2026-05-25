@@ -16,6 +16,7 @@
 #include "../../../include/kernel/ioapic.h"
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/timer.h"
+#include "../../../include/kernel/bug.h"
 
 // ============================================================================
 // Supported PCI device IDs.  All entries expose the same
@@ -184,7 +185,9 @@ static int rtl_init_tx(rtl8139_dev_t* dev) {
 // Send a single Ethernet frame (net_device_t callback)
 // ============================================================================
 static int rtl8139_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
+    BUG_ON(ndev == NULL);
     rtl8139_dev_t* dev = (rtl8139_dev_t*)ndev->driver_data;
+    BUG_ON(dev == NULL);
 
     if (len > RTL8139_TX_BUF_SIZE) return -1;
 
@@ -204,6 +207,7 @@ static int rtl8139_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     // Wait for descriptor to be free (OWN=1 means previous DMA done).  On
     // first use TSD reads back as 0 so we treat that as "free".
     uint8_t slot = dev->tx_cur;
+    WARN_ON(slot >= RTL8139_NUM_TX_DESC);  /* tx_cur out of TX ring bounds - wrap logic corrupted */
     uint32_t tsd_off = RTL_TSD0 + slot * 4;
     uint32_t tsd = rtl_read32(dev, tsd_off);
     if (tsd != 0 && !(tsd & RTL_TSD_OWN)) {
@@ -315,6 +319,7 @@ static void rtl_drain_rx(rtl8139_dev_t* dev) {
         dev->rx_offset = (dev->rx_offset + length + 4 + 3) & ~3;
         if (dev->rx_offset >= RTL8139_RX_BUF_SIZE)
             dev->rx_offset -= RTL8139_RX_BUF_SIZE;
+        WARN_RATELIMIT(dev->rx_offset >= RTL8139_RX_BUF_TOTAL, "RTL8139: rx_offset=%u out of RX ring bounds (%u) after wrap", dev->rx_offset, RTL8139_RX_BUF_TOTAL);
 
         // CAPR is offset by 16 bytes from the buffer start (hardware quirk).
         rtl_write16(dev, RTL_CAPR, dev->rx_offset - 16);
@@ -339,6 +344,7 @@ void rtl8139_irq_handler(void) {
     }
 
     rtl8139_dev_t* dev = &g_rtl8139;
+    BUG_ON(dev == NULL);
     uint16_t isr = rtl_read16(dev, RTL_ISR);
     if (isr == 0) {
         lapic_eoi();

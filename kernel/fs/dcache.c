@@ -15,6 +15,7 @@
 #include "../../include/kernel/dcache.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/bug.h"
 
 // ============================================================================
 // Hash table bucket
@@ -53,6 +54,7 @@ static int dc_initialized = 0;
 
 void dcache_init(void)
 {
+    BUILD_BUG_ON(DC_HASH_BUCKETS == 0);
     for (int i = 0; i < DC_HASH_BUCKETS; i++) {
         dc_hash[i].head = 0;
         spinlock_init(&dc_hash[i].lock, "dcache");
@@ -106,6 +108,7 @@ static int dc_strcasecmp(const char *a, const char *b)
 
 static void dc_lru_add(dc_entry_t *e)
 {
+    VM_BUG_ON(e == NULL);
     // Add to head of LRU (most recently used)
     e->lru_next = dc_lru_sentinel.lru_next;
     e->lru_prev = &dc_lru_sentinel;
@@ -158,7 +161,8 @@ static void dc_evict_one(void)
     dc_lru_remove(victim);
     spin_unlock_irqrestore(&dc_lru_lock, lru_flags);
 
-    // Remove from hash bucket
+    /* A valid non-negative entry with cluster 1 indicates FAT32 corruption: cluster 1 is reserved */
+    WARN_ON_ONCE((victim->flags & DC_VALID) && !(victim->flags & DC_NEGATIVE) && victim->start_cluster == 1);
     unsigned long bucket = dc_bucket_index(victim->parent_cluster,
                                            victim->name_hash);
     uint64_t bucket_flags;
@@ -184,6 +188,8 @@ static void dc_evict_one(void)
 
 dc_entry_t* dcache_lookup(unsigned long parent_cluster, const char *name)
 {
+    BUG_ON(name == NULL);
+    WARN_ON_ONCE(!dc_initialized);  /* dcache_lookup called before dcache_init - init ordering bug */
     if (!dc_initialized || !name)
         return 0;
 
@@ -226,6 +232,8 @@ dc_entry_t* dcache_lookup(unsigned long parent_cluster, const char *name)
 static dc_entry_t* dc_alloc_entry(unsigned long parent_cluster, const char *name,
                                    unsigned long nh)
 {
+    might_sleep();
+    BUG_ON(name == NULL);
     // Evict if at capacity
     while (dc_entry_count >= DC_MAX_ENTRIES)
         dc_evict_one();
@@ -283,6 +291,8 @@ void dcache_insert(unsigned long parent_cluster, const char *name,
                    unsigned long dirent_cluster, unsigned int dirent_index,
                    unsigned long lfn_start_cluster, unsigned int lfn_start_index)
 {
+    BUG_ON(name == NULL);
+    BUG_ON(name != NULL && name[0] == '\0');
     if (!dc_initialized || !name || !name[0])
         return;
 
@@ -297,6 +307,8 @@ void dcache_insert(unsigned long parent_cluster, const char *name,
         return;
 
     e->start_cluster    = start_cluster;
+    WARN_ON(start_cluster != 0 && start_cluster < 2);  /* files must use cluster >= 2 (0 == root placeholder) */
+    WARN_ON(start_cluster == 1);  /* cluster 1 is reserved in FAT32 and must never appear as a file's start cluster */
     e->size             = size;
     e->attr             = attr;
     e->wrt_time         = wrt_time;
@@ -323,6 +335,7 @@ void dcache_insert(unsigned long parent_cluster, const char *name,
     spin_unlock_irqrestore(&dc_lru_lock, lru_flags);
 
     __sync_fetch_and_add(&dc_entry_count, 1);
+    WARN_ON_ONCE(dc_entry_count > DC_MAX_ENTRIES + 1);  /* dcache_insert: entry count exceeded limit after insert: eviction loop broken */
     __sync_fetch_and_add(&dc_stat_insertions, 1);
 }
 

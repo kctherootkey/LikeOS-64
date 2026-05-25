@@ -13,6 +13,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/bug.h"
 
 // ============================================================================
 // Hash table bucket
@@ -50,6 +51,7 @@ static int ic_initialized = 0;
 
 void icache_init(void)
 {
+    BUILD_BUG_ON(IC_HASH_BUCKETS == 0);
     for (int i = 0; i < IC_HASH_BUCKETS; i++) {
         ic_hash[i].head = 0;
         spinlock_init(&ic_hash[i].lock, "icache");
@@ -106,6 +108,7 @@ static void ic_evict_one(void)
 
     ic_inode_t *victim = ic_lru_sentinel.lru_prev;
     if (victim == &ic_lru_sentinel) {
+        WARN_ON_ONCE(1);  /* eviction called on empty LRU - cache accounting bug */
         spin_unlock_irqrestore(&ic_lru_lock, lru_flags);
         return; // empty
     }
@@ -121,6 +124,8 @@ static void ic_evict_one(void)
     }
     ic_lru_remove(victim);
     spin_unlock_irqrestore(&ic_lru_lock, lru_flags);
+
+    BUG_ON(victim->refcount > 0);  /* evicting inode still in use: LRU contains a referenced inode, data corruption will follow */
 
     // Remove from hash bucket
     unsigned long bucket = ic_bucket_index(victim->start_cluster);
@@ -179,6 +184,9 @@ ic_inode_t* icache_get(unsigned long start_cluster, unsigned long size,
                        unsigned long dirent_cluster, unsigned int dirent_index,
                        uint16_t wrt_time, uint16_t wrt_date)
 {
+    might_sleep();
+    VM_BUG_ON(start_cluster < 2);
+    WARN_ON(start_cluster == 1);  /* cluster 1 is reserved in FAT32 - icache_get with cluster 1 is a filesystem bug */
     if (!ic_initialized || start_cluster < 2)
         return 0;
 
@@ -199,6 +207,7 @@ ic_inode_t* icache_get(unsigned long start_cluster, unsigned long size,
             n->wrt_time = wrt_time;
             n->wrt_date = wrt_date;
             n->flags |= IC_VALID;
+            WARN_ON_ONCE(n->refcount < 0);  /* negative refcount before icache_get bump: use-after-free or icache_unref overcounted */
             __sync_fetch_and_add(&n->refcount, 1);
             // Remove from LRU if it was there (refcount was 0, now > 0)
             if (n->lru_prev || n->lru_next) {
@@ -224,6 +233,7 @@ ic_inode_t* icache_get(unsigned long start_cluster, unsigned long size,
         return 0;
     mm_memset(inode, 0, sizeof(ic_inode_t));
     inode->start_cluster = start_cluster;
+    WARN_ON(start_cluster < 2);  /* inode start_cluster must be >= 2 */
     inode->size = size;
     inode->attr = attr;
     inode->parent_cluster = parent_cluster;
@@ -256,9 +266,11 @@ ic_inode_t* icache_get(unsigned long start_cluster, unsigned long size,
 
 void icache_ref(ic_inode_t *inode)
 {
+    BUG_ON(inode == NULL);
     if (!inode)
         return;
     int old = __sync_fetch_and_add(&inode->refcount, 1);
+    WARN_ON(old < 0);  /* refcount was negative - use-after-free or corruption */
     // If was on LRU (refcount was 0), remove it
     if (old == 0 && (inode->lru_prev || inode->lru_next)) {
         uint64_t flags;
@@ -273,10 +285,13 @@ void icache_unref(ic_inode_t *inode)
     if (!inode)
         return;
     int new_rc = __sync_sub_and_fetch(&inode->refcount, 1);
+    WARN_ON(new_rc < -1);  /* refcount went below -1 - severe double-unref or corruption */
     if (new_rc <= 0) {
         // Refcount reached zero — add to LRU for possible eviction
-        if (new_rc < 0)
+        if (new_rc < 0) {
+            WARN(1, "icache_unref: refcount underflow on start_cluster=%lu", inode->start_cluster);
             inode->refcount = 0; // clamp
+        }
         uint64_t flags;
         spin_lock_irqsave(&ic_lru_lock, &flags);
         ic_lru_add(inode);

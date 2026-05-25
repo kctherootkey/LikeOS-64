@@ -11,6 +11,7 @@
 #include "../../include/kernel/pagecache.h"
 #include "../../include/kernel/dcache.h"
 #include "../../include/kernel/icache.h"
+#include "../../include/kernel/bug.h"
 
 // Spinlock for FAT32 filesystem access
 static spinlock_t fat32_lock = SPINLOCK_INIT("fat32");
@@ -30,6 +31,7 @@ static volatile uint64_t fat32_io_owner = (uint64_t)-1;  // owning task id (-1 =
 static spinlock_t  fat32_io_wait_lock = SPINLOCK_INIT("fat32_io_wait");
 
 void fat32_io_lock(void) {
+    might_sleep();
     task_t* cur = sched_current();
     uint64_t my_id = cur ? cur->id : 0;
 
@@ -61,6 +63,8 @@ void fat32_io_lock(void) {
 void fat32_io_unlock(void) {
     uint64_t flags;
     spin_lock_irqsave(&fat32_io_wait_lock, &flags);
+    WARN_ON(!fat32_io_locked);           /* unlock without prior lock */
+    WARN_ON(fat32_io_depth <= 0);        /* depth underflow: double-unlock or mismatched lock/unlock */
     if (fat32_io_depth > 1) {
         fat32_io_depth--;
         spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
@@ -416,6 +420,9 @@ static void fat32_extract_lfn(const fat32_lfn_t *entries, int count, char *out, 
 
 static int read_sectors(const block_device_t *bdev, unsigned long lba, unsigned long count, void *buf)
 {
+    BUG_ON(bdev == NULL);
+    BUG_ON(buf == NULL);
+    might_sleep();
     // Chunk large reads to work around QEMU xHCI DMA limitations
     unsigned long offset = 0;
     while (count > 0) {
@@ -466,6 +473,8 @@ static int write_sectors(const block_device_t *bdev, unsigned long lba, unsigned
 
 static unsigned long cluster_to_lba(fat32_fs_t *fs, unsigned long cluster)
 {
+    WARN_ON(cluster < 2);
+    WARN_ON(cluster >= 0x0FFFFFF8);
     return fs->part_lba_offset + fs->data_start_lba + (cluster - 2) * fs->sectors_per_cluster;
 }
 
@@ -539,6 +548,9 @@ static int fat32_ensure_fat_loaded(fat32_fs_t *fs)
 
 static int fat32_fat_set(fat32_fs_t *fs, unsigned long cluster, uint32_t value)
 {
+    WARN_ON(cluster < 2);  /* clusters 0 and 1 are FAT reserved entries - never write via fat_set */
+    WARN_ON((value & 0x0FFFFFFF) == cluster);  /* FAT self-loop: FAT[cluster] = cluster creates an infinite chain */
+    WARN_ON((value & 0x0FFFFFFF) == 1);  /* FAT entry value 1 is reserved and invalid - FAT is corrupted */
     if (!fs || cluster >= g_fat_total_entries)
         return ST_INVALID;
     
@@ -557,6 +569,7 @@ static int fat32_fat_set(fat32_fs_t *fs, unsigned long cluster, uint32_t value)
     
     /* Update in cache */
     unsigned long cache_index = cluster - g_fat_cache_start;
+    WARN_ON(cache_index >= g_fat_cache_entries);
     uint32_t *fat = (uint32_t *)g_fat_cache;
     fat[cache_index] = value & 0x0FFFFFFF;
 
@@ -587,6 +600,7 @@ static int fat32_fat_set(fat32_fs_t *fs, unsigned long cluster, uint32_t value)
 
 static int fat32_alloc_cluster(fat32_fs_t *fs, unsigned long *out_cluster)
 {
+    might_sleep();
     if (!fs || !out_cluster)
         return ST_INVALID;
     if (fat32_ensure_fat_loaded(fs) != ST_OK)
@@ -598,8 +612,7 @@ static int fat32_alloc_cluster(fat32_fs_t *fs, unsigned long *out_cluster)
             /* Defensive guard: never allocate the root directory cluster.
              * If it appears free (FAT[c]==0) something has already gone wrong. */
             unsigned long root_val = fat32_next_cluster_cached(fs, c);
-            if (root_val == 0)
-                kprintf("FAT32: BUG: root cluster %lu appears free in FAT! Part of filesystem may be corrupted.\n", c);
+            WARN_ON(root_val == 0);  /* root cluster appears free in FAT - filesystem is corrupted */
             continue;
         }
         unsigned long next = fat32_next_cluster_cached(fs, c);
@@ -619,6 +632,7 @@ static int fat32_alloc_cluster(fat32_fs_t *fs, unsigned long *out_cluster)
             if (st != ST_OK)
                 return ST_IO;
             *out_cluster = c;
+            WARN_ON(*out_cluster < 2);
             if (g_free_cluster_count != (unsigned long)-1 && g_free_cluster_count > 0)
                 g_free_cluster_count--;
             return ST_OK;
@@ -629,6 +643,7 @@ static int fat32_alloc_cluster(fat32_fs_t *fs, unsigned long *out_cluster)
 
 static int fat32_free_chain(fat32_fs_t *fs, unsigned long start_cluster)
 {
+    WARN_ON(start_cluster == 1);  /* cluster 1 is reserved and must never appear in any file's chain */
     if (!fs || start_cluster < 2)
         return ST_OK;
     /* Defensive guard: never free the root directory cluster. */
@@ -639,13 +654,16 @@ static int fat32_free_chain(fat32_fs_t *fs, unsigned long start_cluster)
     if (fat32_ensure_fat_loaded(fs) != ST_OK)
         return ST_IO;
     unsigned long c = start_cluster;
+    unsigned long loop_count = 0;
     while (c >= 2 && c < 0x0FFFFFF8) {
+        WARN_ON_ONCE(++loop_count > g_fat_total_entries);  /* FAT chain longer than total clusters: circular chain or FAT corruption */
         /* Defensive guard: abort if the chain somehow reaches the root cluster. */
         if (c == g_root_dir_cluster) {
             kprintf("FAT32: BUG: free_chain reached root cluster %lu (chain from %lu)!\n", c, start_cluster);
             break;
         }
         unsigned long next = fat32_next_cluster_cached(fs, c);
+        WARN_ON(next == c);  /* self-loop: corrupted FAT chain */
         if (fat32_fat_set(fs, c, 0) != ST_OK)
             return ST_IO;
         if (g_free_cluster_count != (unsigned long)-1)
@@ -659,6 +677,7 @@ static int fat32_free_chain(fat32_fs_t *fs, unsigned long start_cluster)
 
 static int fat32_append_cluster(fat32_fs_t *fs, unsigned long last_cluster, unsigned long *out_new)
 {
+    WARN_ON(last_cluster == 1);  /* last_cluster == 1 is the reserved FAT entry, must never appear in a file chain */
     unsigned long newc = 0;
     int st = fat32_alloc_cluster(fs, &newc);
     if (st != ST_OK)
@@ -668,6 +687,7 @@ static int fat32_append_cluster(fat32_fs_t *fs, unsigned long last_cluster, unsi
             return ST_IO;
     }
     *out_new = newc;
+    WARN_ON(newc < 2);
     return ST_OK;
 }
 
@@ -772,6 +792,8 @@ static int fat32_dir_find_entry_lfn(unsigned long start_cluster, const char *nam
     unsigned long *out_cluster, unsigned int *out_index,
     unsigned long *lfn_start_cluster, unsigned int *lfn_start_index)
 {
+    BUG_ON(name == NULL);
+    might_sleep();
     if (!g_root_fs || !name)
         return ST_INVALID;
     
@@ -1243,6 +1265,8 @@ static void fat32_init_dirent(fat32_dirent_t *ent, const char name83[11], uint8_
 
 static int fat32_load_fat_window(fat32_fs_t *fs, unsigned long start_entry)
 {
+    might_sleep();
+    BUG_ON(fs == NULL);
     /* Calculate how many sectors we need and can cache */
     unsigned long entries_per_sector = fs->bytes_per_sector / 4;
     unsigned long start_sector = start_entry / entries_per_sector;
@@ -1287,6 +1311,7 @@ static int fat32_load_fat_window(fat32_fs_t *fs, unsigned long start_entry)
 
 unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster)
 {
+    WARN_ON(cluster < 2);  /* cluster 0 and 1 are reserved in FAT32 and never valid data clusters */
     /* First time: calculate total FAT entries */
     if (g_fat_total_entries == 0) {
         unsigned long fat_total = fs->data_start_lba - fs->fat_start_lba;
@@ -1317,6 +1342,7 @@ unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster)
     }
     
     unsigned long cache_index = cluster - g_fat_cache_start;
+    WARN_ON(cache_index >= g_fat_cache_entries);
     return ((uint32_t *)g_fat_cache)[cache_index] & 0x0FFFFFFF;
 }
 
@@ -1366,6 +1392,8 @@ static int fat32_validate_bpb(const fat32_bpb_t *bpb)
 
 static int fat32_mount_at_lba(const block_device_t *bdev, unsigned long base_lba, fat32_fs_t *out)
 {
+    BUG_ON(bdev == NULL);
+    BUG_ON(out == NULL);
     // Invalidate old FAT cache (important for re-mounts or device changes)
     if (g_fat_cache) {
         kfree(g_fat_cache);
@@ -1827,6 +1855,7 @@ static int fat32_dir_find_nolock(unsigned long start_cluster, const char *name,
     unsigned *attr, unsigned long *first_cluster, unsigned long *size,
     uint16_t *out_wrt_time, uint16_t *out_wrt_date)
 {
+    BUG_ON(name == NULL);
     if (!g_root_fs || !name)
         return ST_INVALID;
 

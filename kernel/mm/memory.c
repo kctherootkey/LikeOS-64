@@ -7,6 +7,7 @@
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/sched.h"  // For spinlock_t
+#include "../../include/kernel/bug.h"
 
 // Enable SLAB allocator (comment out to use legacy fixed-size heap)
 #define USE_SLAB_ALLOCATOR
@@ -144,6 +145,7 @@ static memory_map_info_t g_uefi_memory_map = {0};
 
 // Utility functions (non-static, declared in memory.h)
 void mm_memset(void* dest, int val, size_t len) {
+    BUG_ON(dest == NULL);
     uint8_t* ptr = (uint8_t*)dest;
     uint8_t byte_val = (uint8_t)val;
     
@@ -194,6 +196,7 @@ void mm_memset(void* dest, int val, size_t len) {
 }
 
 void mm_memcpy(void* dest, const void* src, size_t len) {
+    BUG_ON(dest == NULL || src == NULL);
     uint8_t* d = (uint8_t*)dest;
     const uint8_t* s = (const uint8_t*)src;
     
@@ -227,6 +230,7 @@ static void set_cr3(uint64_t cr3) {
 
 // Flush TLB for specific address (SMP-safe: flushes on all CPUs)
 void mm_flush_tlb(uint64_t virtual_addr) {
+    WARN_ON(virtual_addr == 0);
     __asm__ volatile ("invlpg (%0)" : : "r"(virtual_addr) : "memory");
     // SMP note: cross-CPU TLB invalidation is NOT done here.
     // User pages: per-process CR3 means only the local CPU needs invlpg.
@@ -284,6 +288,7 @@ static uint64_t early_virt_to_phys(uint64_t virtual_addr) {
     
     // Get PML4 from CR3
     uint64_t pml4_phys = get_cr3() & ~0xFFF;
+    BUG_ON(pml4_phys == 0);
     uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
     
     // Check PML4 entry
@@ -563,6 +568,7 @@ static uint64_t g_alloc_hint = 0;
 // Find first free bit in bitmap
 // Uses hint to avoid rescanning already-allocated low pages
 static uint64_t find_free_page(void) {
+    BUG_ON(mm_state.physical_bitmap == NULL);
     uint64_t num_words = mm_state.bitmap_size / sizeof(uint32_t);
     uint64_t start = g_alloc_hint / 32;  // Start from hint word
     
@@ -805,8 +811,7 @@ uint64_t mm_allocate_physical_page(void) {
     mm_state.free_pages--;
     
     uint64_t phys = mm_state.memory_start + (page * PAGE_SIZE);
-    
-    // Clear refcount for newly allocated page
+    WARN_ON(phys & (PAGE_SIZE - 1));  /* allocated page is not page-aligned */
     if (mm_state.page_refcounts) {
         mm_state.page_refcounts[page] = 0;
     }
@@ -827,6 +832,7 @@ uint64_t mm_allocate_physical_page(void) {
 
 // Free a physical page (SMP-safe)
 void mm_free_physical_page(uint64_t physical_address) {
+    WARN_ON(physical_address & (PAGE_SIZE - 1));  /* freeing non-page-aligned address */
     if (physical_address < mm_state.memory_start || physical_address >= mm_state.memory_end) {
         return; // Invalid address
     }
@@ -836,6 +842,7 @@ void mm_free_physical_page(uint64_t physical_address) {
     
     uint64_t page = (physical_address - mm_state.memory_start) / PAGE_SIZE;
     if (!is_page_allocated(page)) {
+        WARN(1, "mm_free_physical_page: double-free of page at 0x%lx", physical_address);
         spin_unlock_irqrestore(&mm_phys_lock, flags);
         return; // Already free
     }

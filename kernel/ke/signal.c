@@ -7,6 +7,7 @@
 #include "../../include/kernel/status.h"
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/percpu.h"
+#include "../../include/kernel/bug.h"
 
 // NOTE: Signal delivery now uses per-CPU storage via percpu_t
 // The old global syscall_signal_pending is deprecated.
@@ -17,6 +18,7 @@ static ktimer_t g_next_timerid = 1;
 
 // Initialize signal state for a new task
 void signal_init_task(task_t* task) {
+    BUG_ON(task == NULL);
     if (!task) return;
     
     task_signal_state_t* sig = &task->signals;
@@ -55,6 +57,7 @@ void signal_init_task(task_t* task) {
 // Copy signal handlers from parent to child during fork
 // POSIX: signal dispositions are inherited across fork
 void signal_fork_copy(task_t* child, task_t* parent) {
+    BUG_ON(child == NULL || parent == NULL);
     if (!child || !parent) return;
     
     task_signal_state_t* csig = &child->signals;
@@ -93,6 +96,7 @@ void signal_fork_copy(task_t* child, task_t* parent) {
 
 // Cleanup signal state when task exits
 void signal_cleanup_task(task_t* task) {
+    BUG_ON(task == NULL);
     if (!task) return;
     
     task_signal_state_t* sig = &task->signals;
@@ -125,6 +129,9 @@ static pending_signal_t* alloc_pending_signal(void) {
 
 // Send a signal to a task
 int signal_send(task_t* task, int sig, siginfo_t* info) {
+    BUG_ON(task == NULL);
+    WARN_ON(sig <= 0 || sig >= NSIG);
+    WARN_ON_ONCE(task->has_exited || task->state == TASK_ZOMBIE);  /* sending signal to already-exited task: pending cross-CPU kill after exit */
     if (!task || sig <= 0 || sig >= NSIG) {
         return -EINVAL;
     }
@@ -197,6 +204,7 @@ int signal_send_group(int pgid, int sig, siginfo_t* info) {
 
 // Check if any unblocked signals are pending
 int signal_pending(task_t* task) {
+    BUG_ON(task == NULL);
     if (!task) return 0;
     
     task_signal_state_t* sig = &task->signals;
@@ -212,6 +220,7 @@ int signal_pending(task_t* task) {
 // Returns 1 if syscall should be restarted (all signals have SA_RESTART)
 // Returns 0 if syscall should return -EINTR (at least one signal lacks SA_RESTART)
 int signal_should_restart(task_t* task) {
+    BUG_ON(task == NULL);
     if (!task) return 0;
     
     task_signal_state_t* sig = &task->signals;
@@ -235,6 +244,7 @@ int signal_should_restart(task_t* task) {
 
 // Dequeue a pending signal (returns signal number, 0 if none)
 int signal_dequeue(task_t* task, kernel_sigset_t* mask, siginfo_t* info) {
+    BUG_ON(task == NULL);
     if (!task) return 0;
     
     task_signal_state_t* sig = &task->signals;
@@ -299,6 +309,7 @@ int signal_dequeue(task_t* task, kernel_sigset_t* mask, siginfo_t* info) {
 // Setup a signal frame on the user stack
 // Returns 0 on success, -1 on failure
 int signal_setup_frame(task_t* task, int sig, siginfo_t* info, struct k_sigaction* act) {
+    BUG_ON(task == NULL || act == NULL);
     if (!task || !act) return -1;
     
     // Get current user context from task's saved syscall registers (per-task, not globals)
@@ -308,6 +319,7 @@ int signal_setup_frame(task_t* task, int sig, siginfo_t* info, struct k_sigactio
     
     // Calculate new stack position for signal frame (16-byte aligned)
     uint64_t frame_addr = (user_rsp - sizeof(signal_frame_t)) & ~0xFULL;
+    WARN_ON(frame_addr & 0xF);  /* signal frame must be 16-byte aligned */
     
     // Validate the stack address is in user space
     if (frame_addr < 0x10000 || frame_addr >= 0x7FFFFFFFFFFF) {
@@ -420,6 +432,7 @@ int signal_setup_frame(task_t* task, int sig, siginfo_t* info, struct k_sigactio
 // interrupt_frame_t on the stack so that IRETQ returns to the signal handler.
 int signal_setup_frame_irq(task_t* task, int sig, siginfo_t* info,
                            struct k_sigaction* act, interrupt_frame_t* frame) {
+    BUG_ON(task == NULL || act == NULL || frame == NULL);
     if (!task || !act || !frame) return -1;
 
     // Get current user context from the IRETQ frame (this is what the CPU
@@ -538,6 +551,7 @@ int signal_restore_frame(task_t* task) {
     
     // Get the frame address that was saved when the frame was set up
     uint64_t frame_addr = task->signals.signal_frame_addr;
+    WARN_ON_ONCE(frame_addr == 0);  /* sigreturn with no prior signal delivery */
     
     // Validate
     if (frame_addr < 0x10000 || frame_addr >= 0x7FFFFFFFFFFF) {
@@ -602,6 +616,7 @@ int signal_restore_frame(task_t* task) {
 // Deliver pending signals to a task (called before returning to userspace)
 void signal_deliver(task_t* task) {
     if (!task || task->privilege != TASK_USER) return;
+    WARN_ON(task->state == TASK_ZOMBIE);  /* signal delivery to zombie task */
     
     task_signal_state_t* sig = &task->signals;
     siginfo_t info;

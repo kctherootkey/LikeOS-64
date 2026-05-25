@@ -10,6 +10,7 @@
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"   // spinlock_t
+#include "../../include/kernel/bug.h"
 
 // ============================================================================
 // ChaCha20 Core (RFC 7539)
@@ -405,5 +406,7 @@ apply_mask:
     canary &= 0xFFFFFFFFFFFFFF00ULL;   /* NULL-byte low byte */
     if (canary == 0)
         canary = 0xDEADBEEFCAFEBE00ULL;
+    WARN_ON(canary == 0);  /* generate_stack_canary returned zero - entropy source failed */
+    WARN_ON(canary & 0xFF);  /* generate_stack_canary: low byte must be zero (NULL-byte terminator protection) */
     return canary;
 }

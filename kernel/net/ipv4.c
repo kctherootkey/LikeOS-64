@@ -5,6 +5,7 @@
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/skb.h"
 #include "../../include/kernel/ratelimit.h"
+#include "../../include/kernel/bug.h"
 
 // TX path uses per-fragment sk_buff allocations from the size-classed pool;
 // no global TX spinlock is held across the lower-layer send.  See
@@ -75,6 +76,9 @@ static ipv4_reassembly_slot_t ipv4_reassembly[IPV4_REASSEMBLY_SLOTS];
 static void ipv4_dispatch_payload(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                                   uint8_t protocol, const uint8_t* payload,
                                   uint16_t payload_len, uint8_t ttl, uint8_t tos) {
+    BUG_ON(dev == NULL);
+    BUG_ON(payload == NULL);
+    BUILD_BUG_ON(sizeof(ipv4_header_t) != 20);
     switch (protocol) {
     case IP_PROTO_ICMP:
         icmp_rx(dev, src_ip, payload, payload_len, ttl);
@@ -86,6 +90,7 @@ static void ipv4_dispatch_payload(net_device_t* dev, uint32_t src_ip, uint32_t d
         tcp_rx(dev, src_ip, dst_ip, payload, payload_len);
         break;
     default:
+        WARN_RATELIMIT(1, "ipv4_dispatch: unknown protocol %u", protocol);
         break;
     }
 }
@@ -147,6 +152,7 @@ static int ipv4_reassemble_fragment(net_device_t* dev, const ipv4_header_t* ip,
                                     uint8_t ttl) {
     uint16_t frag = net_ntohs(ip->flags_fragment);
     uint16_t offset = (uint16_t)((frag & IPV4_FRAG_OFFSET_MASK) * 8);
+    WARN_RATELIMIT(offset > 65528, "ipv4: fragment offset %u > 65528 (malformed)", offset);
     uint16_t identification = net_ntohs(ip->identification);
     ipv4_reassembly_slot_t* slot = ipv4_get_reassembly_slot(src_ip, dst_ip,
                                                             identification, ip->protocol);
@@ -349,6 +355,8 @@ int ipv4_send_full(net_device_t* dev, uint32_t dst_ip, uint8_t protocol,
 // Send raw IPv4 frame (caller-supplied IP header). Used for SOCK_RAW + IP_HDRINCL.
 int ipv4_send_raw(net_device_t* dev, uint32_t dst_ip,
                   const uint8_t* full_ip_packet, uint16_t total_len) {
+    BUG_ON(dev == NULL);
+    BUG_ON(full_ip_packet == NULL);
     if (!dev || !full_ip_packet || total_len < sizeof(ipv4_header_t)) return -1;
     uint32_t next_hop = dst_ip;
     net_device_t* out_dev = route_lookup(dst_ip, &next_hop);
@@ -389,6 +397,8 @@ int ipv4_send_raw(net_device_t* dev, uint32_t dst_ip,
 
 // Process received IPv4 packet
 void ipv4_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
+    BUG_ON(dev == NULL);
+    BUG_ON(data == NULL);
     if (len < sizeof(ipv4_header_t)) return;
 
     const ipv4_header_t* ip = (const ipv4_header_t*)data;

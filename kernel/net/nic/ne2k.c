@@ -16,6 +16,7 @@
 #include "../../../include/kernel/ioapic.h"
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/timer.h"
+#include "../../../include/kernel/bug.h"
 
 // ============================================================================
 // Supported PCI device IDs.  All NE2000-PCI clones present the same
@@ -171,7 +172,9 @@ static void ne_read_mac(ne2k_dev_t* dev) {
 // Send a single Ethernet frame
 // ============================================================================
 static int ne2k_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
+    BUG_ON(ndev == NULL);
     ne2k_dev_t* dev = (ne2k_dev_t*)ndev->driver_data;
+    BUG_ON(dev == NULL);
 
     if (len > 1518) return -1;
 
@@ -247,6 +250,7 @@ static void ne2k_shutdown(net_device_t* ndev) {
 // Drain RX ring — read packets between BNRY+1 and CURR
 // ============================================================================
 static void ne_drain_rx(ne2k_dev_t* dev) {
+    WARN_ON(dev->next_pkt < NE_RX_PAGE_START || dev->next_pkt > NE_RX_PAGE_STOP);  /* next_pkt outside RX ring [PSTART,PSTOP] - ring pointer corrupted */
     while (1) {
         // Read CURR from page 1
         ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_PS0 | NE_CR_STA);
@@ -306,6 +310,7 @@ static void ne_drain_rx(ne2k_dev_t* dev) {
                             : (next_pkt - 1);
         ne_w8(dev, NE_P0_BNRY, new_bnry);
 
+        WARN_ON(next_pkt < NE_RX_PAGE_START || next_pkt > NE_RX_PAGE_STOP);  /* next_pkt from packet header outside RX ring bounds - chip/memory corruption */
         dev->next_pkt = next_pkt;
     }
 }
@@ -328,6 +333,7 @@ void ne2k_irq_handler(void) {
     }
 
     ne2k_dev_t* dev = &g_ne2k;
+    BUG_ON(dev == NULL);
 
     // Force page 0 so we can read ISR
     ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STA);

@@ -16,6 +16,7 @@
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/ioapic.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/bug.h"
 
 // Debug output control
 #define XHCI_DEBUG 0
@@ -47,6 +48,8 @@ void xhci_process_events_locked(xhci_controller_t* ctrl) {
 // handler from writing to a stale stack address.
 static inline void xhci_clear_pending_xfer(xhci_controller_t* ctrl, uint8_t slot, uint8_t dci) {
     uint64_t flags;
+    WARN_ON(slot == 0 || slot > XHCI_MAX_SLOTS);  /* slot 0 is reserved, slots go 1..XHCI_MAX_SLOTS */
+    WARN_ON(dci >= XHCI_MAX_ENDPOINTS);            /* endpoint DCI out of range */
     spin_lock_irqsave(&xhci_lock, &flags);
     ctrl->pending_xfer[slot - 1][dci] = NULL;
     spin_unlock_irqrestore(&xhci_lock, flags);
@@ -210,8 +213,7 @@ int xhci_ring_enqueue(xhci_ring_t* ring, uint64_t param, uint32_t status, uint32
     }
     
     uint32_t idx = ring->enqueue;
-    
-    // Set up TRB with current cycle bit
+    WARN_ON(idx >= XHCI_RING_SIZE - 1);  /* enqueue at or past link TRB slot - ring wraparound code missed the link TRB */
     ring->trbs[idx].param = param;
     ring->trbs[idx].status = status;
     ring->trbs[idx].control = (control & ~TRB_FLAG_CYCLE) | (ring->cycle ? TRB_FLAG_CYCLE : 0);
@@ -1505,8 +1507,7 @@ static void xhci_handle_transfer_event(xhci_controller_t* ctrl, xhci_trb_t* trb)
     uint32_t residue = trb->status & 0xFFFFFF;
     uint8_t slot = (trb->control >> 24) & 0xFF;
     uint8_t ep_id = (trb->control >> 16) & 0x1F;
-    
-    // Try USB HID IRQ-context completion first.
+    WARN_ON(slot == 0);  /* transfer event with slot_id==0 is invalid — slot IDs start at 1 in xHCI spec */
     // If a HID device owns this endpoint, it processes the report and
     // re-submits the next interrupt transfer entirely in IRQ context,
     // providing the lowest possible input latency.

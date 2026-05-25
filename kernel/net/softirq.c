@@ -8,6 +8,7 @@
 #include "../../include/kernel/smp.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/memory.h"
+#include "../../include/kernel/bug.h"
 
 static softirq_fn_t   softirq_handlers[NR_SOFTIRQ];
 static volatile uint32_t softirq_pending_mask[MAX_CPUS];
@@ -23,6 +24,7 @@ static inline uint32_t safe_cpu_id(void) {
 
 void softirq_register(uint32_t nr, softirq_fn_t fn) {
     if (nr >= NR_SOFTIRQ) return;
+    WARN_ON(softirq_handlers[nr] != NULL);  /* double-registration of softirq handler */
     softirq_handlers[nr] = fn;
 }
 
@@ -41,6 +43,7 @@ void softirq_raise(uint32_t nr) {
 }
 
 void softirq_raise_on(uint32_t cpu, uint32_t nr) {
+    WARN_RATELIMIT(nr >= NR_SOFTIRQ, "softirq nr %u out of range (max %u)", nr, NR_SOFTIRQ);
     if (nr >= NR_SOFTIRQ || cpu >= MAX_CPUS) return;
     __atomic_fetch_or(&softirq_pending_mask[cpu], (1u << nr), __ATOMIC_ACQ_REL);
     // sched_wake_channel works cross-CPU; the target CPU's scheduler will
@@ -158,6 +161,7 @@ static void ksoftirqd_main(void* arg) {
 void ksoftirqd_start_all(void) {
     uint32_t ncpus = smp_get_cpu_count();
     if (ncpus == 0) ncpus = 1;
+    WARN_ON_ONCE(ncpus > MAX_CPUS);  /* smp_get_cpu_count() returned more CPUs than MAX_CPUS: ACPI/SMP topology exceeds compile-time limit */
     uint32_t started = 0;
     /* ksoftirqd runs entirely in kernel mode (calls softirq_drain,
      * sched_yield_in_kernel) so it must be a TASK_KERNEL thread, not a

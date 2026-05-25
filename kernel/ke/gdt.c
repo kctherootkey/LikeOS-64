@@ -2,6 +2,7 @@
 // Global Descriptor Table setup with TSS support for 64-bit mode
 
 #include "../../include/kernel/interrupt.h"
+#include "../../include/kernel/bug.h"
 
 // GDT structure
 struct gdt_entry {
@@ -27,6 +28,7 @@ extern void gdt_flush(uint64_t);
 
 // Set GDT entry
 static void gdt_set_gate(int num, uint64_t base, uint64_t limit, uint8_t access, uint8_t gran) {
+    BUG_ON(num < 0 || num >= 8);  /* GDT index out of range */
     gdt[num].base_low = (base & 0xFFFF);
     gdt[num].base_middle = (base >> 16) & 0xFF;
     gdt[num].base_high = (base >> 24) & 0xFF;
@@ -39,6 +41,9 @@ static void gdt_set_gate(int num, uint64_t base, uint64_t limit, uint8_t access,
 
 // Set TSS entry (128-bit entry for 64-bit mode)
 static void gdt_set_tss(int num, uint64_t base, uint64_t limit) {
+    BUG_ON(num < 0 || num >= 7);  /* TSS occupies two entries; must not overflow table */
+    WARN_ON(base == 0);  /* TSS base address is NULL */
+    WARN_ON(limit == 0 || limit > 0xFFFF);  /* TSS limit out of expected range */
     // TSS descriptor is 16 bytes (128 bits) in 64-bit mode
     // We need to set up two consecutive GDT entries
     
@@ -61,6 +66,10 @@ static void gdt_set_tss(int num, uint64_t base, uint64_t limit) {
 
 // Initialize GDT with basic segments and TSS
 void gdt_init() {
+    BUILD_BUG_ON(sizeof(struct gdt_entry) != 8);
+    /* SYSRET requires: user_data at selector 0x18, user_code at 0x20 */
+    BUILD_BUG_ON(3 * 8 != 0x18);  /* user data selector must be 0x18 */
+    BUILD_BUG_ON(4 * 8 != 0x20);  /* user code selector must be 0x20 */
     gdt_pointer.limit = (sizeof(struct gdt_entry) * 8) - 1;  // Updated for 8 entries
     gdt_pointer.base = (uint64_t)&gdt;
     

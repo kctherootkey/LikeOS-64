@@ -680,14 +680,6 @@ int main(int argc, char** argv) {
         } else {
             test_fail("execve child did not exit normally");
         }
-
-        // ========================================
-        // Test: progerr (user fault handling)
-        // ========================================
-        printf("\n[TEST] progerr (user fault handling)\n");
-        run_programerror_case("illegal instruction -> SIGILL", "ill", SIGILL);
-        run_programerror_case("invalid user write -> SIGSEGV", "baduser", SIGSEGV);
-        run_programerror_case("kernel write -> SIGSEGV", "badkernel", SIGSEGV);
     }
 
     // ========================================

@@ -6,6 +6,7 @@
 #include "../../include/kernel/dirent.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/random.h"
+#include "../../include/kernel/bug.h"
 
 #define DEVFS_TYPE_TTY       1
 #define DEVFS_TYPE_PTY_MASTER 2
@@ -64,15 +65,19 @@ const vfs_ops_t* devfs_get_ops(void) {
 }
 
 static devfs_file_t* devfs_alloc_file(void) {
+    might_sleep();
     devfs_file_t* df = (devfs_file_t*)kalloc(sizeof(devfs_file_t));
     if (!df) return NULL;
     mm_memset(df, 0, sizeof(devfs_file_t));
     df->vfs.ops = &g_devfs_ops;
     df->vfs.fs_private = df;
+    WARN_ON(df->vfs.fs_private != df);
     return df;
 }
 
 static int devfs_open_tty(tty_t* tty, vfs_file_t** out) {
+    BUG_ON(tty == NULL);
+    BUG_ON(out == NULL);
     if (!tty || !out) return ST_INVALID;
     devfs_file_t* df = devfs_alloc_file();
     if (!df) return ST_NOMEM;
@@ -83,6 +88,7 @@ static int devfs_open_tty(tty_t* tty, vfs_file_t** out) {
 }
 
 static int devfs_open_dir(int type, vfs_file_t** out) {
+    BUG_ON(out == NULL);
     if (!out) return ST_INVALID;
     devfs_file_t* df = devfs_alloc_file();
     if (!df) return ST_NOMEM;
@@ -94,11 +100,13 @@ static int devfs_open_dir(int type, vfs_file_t** out) {
 }
 
 static int devfs_open_pty_master(int* out_id, vfs_file_t** out) {
+    BUG_ON(out == NULL);
     if (!out) return ST_INVALID;
     int id = -1;
     if (tty_pty_allocate(&id) != 0) {
         return ST_BUSY;
     }
+    WARN_ON(id < 0);  /* tty_pty_allocate succeeded but returned invalid id < 0 */
     devfs_file_t* df = devfs_alloc_file();
     if (!df) return ST_NOMEM;
     df->type = DEVFS_TYPE_PTY_MASTER;
@@ -182,6 +190,7 @@ int devfs_open_for_task(const char* path, int flags, vfs_file_t** out, task_t* c
             id = id * 10 + (*p - '0');
             p++;
         }
+        WARN_ON_ONCE(id >= 16);  /* PTY id >= TTY_MAX_PTYS: parsed out-of-range slave index */
         if (cur) {
             tty_t* tty = tty_get_pty_slave(id);
             if (tty && tty->fg_pgid == 0) {
@@ -243,14 +252,19 @@ long devfs_read(vfs_file_t* f, void* buf, long bytes) {
     if (!f || !buf) return -EINVAL;
     devfs_file_t* df = (devfs_file_t*)f->fs_private;
     if (!df) return -EINVAL;
+    WARN_ON(df->type < DEVFS_TYPE_TTY || df->type > DEVFS_TYPE_ZERO);
     int nonblock = (f->flags & O_NONBLOCK) ? 1 : 0;
     if (df->type == DEVFS_TYPE_TTY) {
+        WARN_ON(df->tty == NULL);
         return tty_read(df->tty, buf, bytes, nonblock);
     }
     if (df->type == DEVFS_TYPE_PTY_SLAVE) {
+        WARN_ON(df->tty == NULL);
+        WARN_ON(df->pty_id < 0);  /* PTY slave file with negative pty_id: state corruption */
         return tty_read(df->tty, buf, bytes, nonblock);
     }
     if (df->type == DEVFS_TYPE_PTY_MASTER) {
+        WARN_ON(df->pty_id < 0);
         return tty_pty_master_read(df->pty_id, buf, bytes, nonblock);
     }
     if (df->type == DEVFS_TYPE_RANDOM) {
@@ -282,10 +296,13 @@ long devfs_write(vfs_file_t* f, const void* buf, long bytes) {
     if (!f || !buf) return -EINVAL;
     devfs_file_t* df = (devfs_file_t*)f->fs_private;
     if (!df) return -EINVAL;
+    WARN_ON(df->type < DEVFS_TYPE_TTY || df->type > DEVFS_TYPE_ZERO);
     if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_SLAVE) {
+        WARN_ON(df->tty == NULL);  /* TTY/PTY-slave write with NULL tty pointer: state corruption */
         return tty_write(df->tty, buf, bytes);
     }
     if (df->type == DEVFS_TYPE_PTY_MASTER) {
+        WARN_ON(df->pty_id < 0);
         return tty_pty_master_write(df->pty_id, buf, bytes);
     }
     if (df->type == DEVFS_TYPE_RANDOM || df->type == DEVFS_TYPE_URANDOM) {
@@ -309,6 +326,7 @@ static unsigned devfs_write_dirent64(char* out, unsigned out_size, unsigned* out
     while (name[name_len] && name_len < 255) name_len++;
     unsigned reclen = (unsigned)sizeof(struct linux_dirent64) + name_len + 1;
     reclen = (reclen + 7u) & ~7u;
+    WARN_ON(reclen % 8 != 0);
     if (*out_off + reclen > out_size) return 0;
     // SMAP-aware write to user buffer
     smap_disable();
@@ -378,8 +396,10 @@ int devfs_close(vfs_file_t* f) {
     devfs_file_t* df = (devfs_file_t*)f->fs_private;
     if (df) {
         if (df->type == DEVFS_TYPE_PTY_MASTER) {
+            WARN_ON(df->pty_id < 0);
             tty_pty_master_close(df->pty_id);
         } else if (df->type == DEVFS_TYPE_PTY_SLAVE) {
+            WARN_ON(df->pty_id < 0);  /* PTY slave close with negative pty_id: state corruption */
             tty_pty_slave_close(df->pty_id);
         }
         kfree(df);
@@ -395,6 +415,7 @@ int devfs_ioctl(vfs_file_t* f, unsigned long req, void* argp, task_t* cur) {
         return tty_ioctl(df->tty, req, argp, cur);
     }
     if (df->type == DEVFS_TYPE_PTY_MASTER) {
+        WARN_ON(df->pty_id < 0);  /* PTY master ioctl with negative pty_id: state corruption */
         if (req == TIOCGPTN && argp) {
             smap_disable();
             *(int*)argp = df->pty_id;

@@ -8,6 +8,7 @@
 #include "../../include/kernel/random.h"
 #include "../../include/kernel/softirq.h"
 #include "../../include/kernel/ratelimit.h"
+#include "../../include/kernel/bug.h"
 
 // TCP connection table
 tcp_conn_t tcp_connections[TCP_MAX_CONNECTIONS];
@@ -68,12 +69,13 @@ static uint32_t    tcp_pending_free_count = 0;
 static spinlock_t  tcp_pending_free_lock = SPINLOCK_INIT("tcp_pf");
 static void tcp_free_conn(tcp_conn_t* conn);   // forward
 
-// Push a conn onto the deferred-free queue.  IRQ-safe (uses spinlock; the
+    // Push a conn onto the deferred-free queue.  IRQ-safe (uses spinlock; the
 // critical section is just an array append so it is bounded and very
 // short — does NOT call slab).
 static void tcp_defer_free(tcp_conn_t* conn) {
     uint64_t flags;
     spin_lock_irqsave(&tcp_pending_free_lock, &flags);
+    WARN_ON(tcp_pending_free_count >= TCP_MAX_CONNECTIONS);  /* deferred-free queue overflow: more items than slots exist */
     // Idempotent: avoid pushing the same conn twice (double-free risk).
     int already = 0;
     for (uint32_t i = 0; i < tcp_pending_free_count; i++) {
@@ -469,6 +471,7 @@ static int tcp_queue_inflight(tcp_conn_t* conn, uint32_t seq, uint8_t flags,
     }
 
     tcp_inflight_segment_t* seg = &conn->inflight[conn->inflight_count++];
+    WARN_ON(conn->inflight_count > TCP_MAX_INFLIGHT);
     seg->seq = seq;
     seg->len = len;
     seg->flags = flags;
@@ -480,6 +483,7 @@ static int tcp_queue_inflight(tcp_conn_t* conn, uint32_t seq, uint8_t flags,
 }
 
 static void tcp_drop_first_inflight(tcp_conn_t* conn) {
+    WARN_ON(conn->inflight_count == 0);  /* dropping from empty inflight queue: ACK accounting is off */
     if (conn->inflight_count == 0) return;
     for (uint8_t i = 1; i < conn->inflight_count; i++)
         conn->inflight[i - 1] = conn->inflight[i];
@@ -499,7 +503,10 @@ static void tcp_ack_inflight(tcp_conn_t* conn, uint32_t ack) {
 
         if (ack > seg->seq && seg->len > 0 && !(seg->flags & (TCP_SYN | TCP_FIN))) {
             uint16_t trim = (uint16_t)(ack - seg->seq);
-            if (trim > seg->len) trim = seg->len;
+            if (trim > seg->len) {
+                WARN_ON_ONCE(trim > seg->len);  /* trim larger than segment length: ACK acknowledged bytes we never sent */
+                trim = seg->len;
+            }
             for (uint16_t i = trim; i < seg->len; i++)
                 seg->data[i - trim] = seg->data[i];
             seg->seq = ack;
@@ -739,6 +746,8 @@ static uint64_t tcp_rto_ticks(tcp_conn_t* conn) {
 // On allocation failure (table full) returns NULL; caller must slab_free
 // the buffers it pre-allocated.
 static tcp_conn_t* tcp_alloc_conn(uint8_t* rx_buf, uint8_t* tx_buf) {
+    BUG_ON(rx_buf == NULL);  /* pre-allocated RX buffer must not be NULL — slab_alloc must be called before tcp_lock */
+    BUG_ON(tx_buf == NULL);  /* pre-allocated TX buffer must not be NULL — slab_alloc must be called before tcp_lock */
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         if (!tcp_connections[i].active) {
             tcp_conn_t* conn = &tcp_connections[i];
@@ -1025,11 +1034,14 @@ static tcp_conn_t* tcp_find_listener(uint32_t local_ip, uint16_t local_port) {
 
 // Ring buffer helpers
 static uint32_t ring_used(uint32_t head, uint32_t tail, uint32_t size) {
+    WARN_ON(size == 0);
     return (tail - head + size) % size;
 }
 
 static uint32_t ring_free(uint32_t head, uint32_t tail, uint32_t size) {
-    return size - 1 - ring_used(head, tail, size);
+    uint32_t used = ring_used(head, tail, size);
+    WARN_ON(used + 1 > size);  /* ring used > size-1: head/tail corrupt */
+    return size - 1 - used;
 }
 
 // ============================================================================
@@ -1046,6 +1058,8 @@ int tcp_send_segment(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
 }
 
 static void tcp_send_ack(tcp_conn_t* conn) {
+    BUG_ON(conn == NULL);
+    BUG_ON(conn->dev == NULL);
     uint8_t opts[TCP_MAX_OPTIONS];
     uint8_t olen = tcp_build_options(conn, TCP_ACK, 0, opts);
     uint16_t win = tcp_advertised_window(conn);
@@ -1393,6 +1407,8 @@ int tcp_close(tcp_conn_t* conn) {
 int tcp_send_data(tcp_conn_t* conn, const uint8_t* data, uint16_t len) {
     if (!conn || conn->state != TCP_STATE_ESTABLISHED) return -1;
     if (len == 0) return 0;
+    WARN_ON(conn->local_port == 0 || conn->remote_port == 0);  /* sending on a connection without a bound 4-tuple */
+    WARN_ON(conn->tx_buf == NULL);  /* TX ring buffer is NULL — tcp_alloc_conn invariant violated */
 
     uint64_t flags;
     tcp_lock_acquire(&conn->lock, &flags);
@@ -1531,6 +1547,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
     // hangs forever waiting for a peer that has already given up.  Free
     // the TIME_WAIT slot here and fall through to the listener path so
     // the SYN is processed as a brand-new connection.
+    WARN_ON(conn && !conn->active);  /* tcp_find_conn returned a non-active slot — race with tcp_free_conn */
     if (conn && conn->state == TCP_STATE_TIME_WAIT &&
         (tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK)) {
         tcp_free_conn(conn);

@@ -14,6 +14,7 @@
 #include "../../include/kernel/vt.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/memory.h"
+#include "../../include/kernel/bug.h"
 
 /* Forward declarations from tty.c (same kernel link unit).
  * tty_enqueue_read_locked must be called with tty_lock held (IRQs off);
@@ -149,6 +150,7 @@ static void vt_recompute_colors(struct vt_state *vt) {
 static void vt_set_cursor(struct vt_state *vt, int row, int col) {
     int rows = vt->rows > 0 ? vt->rows : 25;
     int cols = vt->cols > 0 ? vt->cols : 80;
+    WARN_ON(vt->rows == 0 || vt->cols == 0);  /* vt_set_cursor called with zero terminal dimensions */
     if (row < 0)    row = 0;
     if (col < 0)    col = 0;
     if (row >= rows) row = rows - 1;
@@ -178,6 +180,7 @@ static void vt_save_state(struct vt_state *vt) {
 }
 
 static void vt_restore_state(struct vt_state *vt) {
+    BUG_ON(vt == NULL);
     if (!vt->saved_valid) return;
     vt_set_cursor(vt, vt->saved_cur_row, vt->saved_cur_col);
     vt->cur_vga_fg  = vt->saved_vga_fg;

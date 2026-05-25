@@ -10,6 +10,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/bug.h"
 
 // Debug output control
 #define MSD_DEBUG 0
@@ -50,6 +51,8 @@ static int msd_strlen(const char* s) {
 
 int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,
                          void* data_buf, uint32_t data_len, usb_msd_csw_t* csw) {
+    BUG_ON(cbw == NULL);
+    BUG_ON(csw == NULL);
     if (!msd || !msd->usb_dev || !msd->ctrl) return ST_INVALID;
     
     xhci_controller_t* ctrl = msd->ctrl;
@@ -156,11 +159,13 @@ int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,
     
     // Validate CSW
     if (csw->signature != CSW_SIGNATURE) {
+        WARN_RATELIMIT(1, "usb_msd: CSW signature 0x%08x != expected 0x%08x: hardware/firmware bug or USB corruption", csw->signature, CSW_SIGNATURE);
         msd_dbg("Invalid CSW signature: %08x\n", csw->signature);
         return ST_IO;
     }
     
     if (csw->tag != cbw->tag) {
+        WARN_RATELIMIT(1, "usb_msd: CSW tag 0x%08x != CBW tag 0x%08x: out-of-order response or firmware bug", csw->tag, cbw->tag);
         msd_dbg("CSW tag mismatch: expected %08x, got %08x\n", cbw->tag, csw->tag);
         return ST_IO;
     }
@@ -270,6 +275,7 @@ int usb_msd_read_capacity(usb_msd_device_t* msd, uint32_t* block_count, uint32_t
 }
 
 int usb_msd_read(usb_msd_device_t* msd, uint32_t lba, uint32_t count, void* buf) {
+    BUG_ON(buf == NULL);
     usb_msd_cbw_t cbw;
     usb_msd_csw_t csw;
     

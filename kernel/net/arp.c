@@ -6,7 +6,7 @@
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/skb.h"
 #include "../../include/kernel/ratelimit.h"
-#include "../../include/kernel/ratelimit.h"
+#include "../../include/kernel/bug.h"
 
 // ============================================================================
 // ARP Table
@@ -254,6 +254,8 @@ int arp_cache_lookup(uint32_t ip, uint8_t mac_out[ETH_ALEN]) {
 
 // Send ARP request
 void arp_request(net_device_t* dev, uint32_t target_ip) {
+    BUG_ON(dev == NULL);
+    BUILD_BUG_ON(sizeof(arp_header_t) != 28);
     uint8_t pkt[sizeof(arp_header_t)];
     arp_header_t* arp = (arp_header_t*)pkt;
 
@@ -280,6 +282,8 @@ static volatile int arp_reply_ready = 0;
 
 // Process received ARP packet
 void arp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
+    BUG_ON(dev == NULL);
+    BUG_ON(data == NULL);
     if (len < sizeof(arp_header_t)) return;
 
     const arp_header_t* arp = (const arp_header_t*)data;
@@ -290,8 +294,9 @@ void arp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
 
     uint32_t sender_ip = net_ntohl(arp->sender_ip);
     uint32_t target_ip = net_ntohl(arp->target_ip);
-
-    // Per-source ARP rate limit
+    WARN_RATELIMIT((sender_ip & 0xFF000000U) == 0x7F000000U, "arp_rx: loopback sender IP");
+    WARN_RATELIMIT(arp->hw_len != ETH_ALEN || arp->proto_len != 4,
+                   "arp_rx: unexpected hw_len=%u proto_len=%u", arp->hw_len, arp->proto_len);
     {
         uint64_t rl_flags; spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
         int arp_src_ok = net_rl_src_allow(&g_arp_src_rl, sender_ip);
@@ -462,6 +467,7 @@ int arp_probe(net_device_t* dev, uint32_t ip) {
 // has both sender_ip and target_ip set to `ip`.
 // ============================================================================
 void arp_gratuitous(net_device_t* dev, uint32_t ip) {
+    BUG_ON(dev == NULL);
     if (!dev) return;
     uint8_t pkt[sizeof(arp_header_t)];
     arp_header_t* arp = (arp_header_t*)pkt;

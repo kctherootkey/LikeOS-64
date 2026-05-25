@@ -12,6 +12,7 @@
 #include "../../include/kernel/tty.h"
 #include "../../include/kernel/random.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/bug.h"
 
 // Socket table
 static net_socket_t sockets[NET_MAX_SOCKETS];
@@ -60,12 +61,16 @@ static uint16_t alloc_ephemeral_port(void) {
                 break;
             }
         }
-        if (!in_use) return port;
+        if (!in_use) {
+            WARN_ON(port < 49152 || port > 65535);  /* ephemeral port out of range */
+            return port;
+        }
     }
     // Fallback: sequential
     uint16_t port = next_ephemeral_port++;
     if (next_ephemeral_port < 49152)
         next_ephemeral_port = 49152;
+    WARN_ON(port < 49152);  /* fallback port below ephemeral range */
     return port;
 }
 
@@ -173,6 +178,7 @@ int sock_listen(int sockfd, int backlog) {
 
     uint64_t flags;
     spin_lock_irqsave(&s->lock, &flags);
+    lockdep_assert_held(&s->lock);
     s->tcp = conn;
     conn->owner_socket = s;
     s->listening = 1;
@@ -212,6 +218,8 @@ int sock_accept(int sockfd, struct sockaddr_in* addr, socklen_t* addrlen) {
 
     net_socket_t* ns = &sockets[newfd];
     ns->tcp = new_conn;
+    WARN_ON_ONCE(new_conn->state != TCP_STATE_ESTABLISHED &&
+                 new_conn->state != TCP_STATE_CLOSE_WAIT);  /* accepted connection in unexpected state: must be ESTABLISHED or CLOSE_WAIT */
     new_conn->owner_socket = ns;
     ns->connected = 1;
     ns->bound = 1;
@@ -267,6 +275,7 @@ int sock_connect(int sockfd, const struct sockaddr_in* addr) {
     uint16_t src_port = net_ntohs(s->local_addr.sin_port);
     uint32_t local_ip = net_ntohl(s->local_addr.sin_addr.s_addr);
 
+    WARN_ON(s->tcp != NULL);  /* s->tcp already set before connect: double connect or leaked connection */
     tcp_conn_t* conn = tcp_connect(dev, local_ip, dst_ip, src_port, dst_port);
     if (!conn) return -ENOMEM;
 

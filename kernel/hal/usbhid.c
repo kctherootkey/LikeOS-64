@@ -37,6 +37,7 @@
 #include "../../include/kernel/mouse.h"
 #include "../../include/kernel/tty.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/bug.h"
 
 // Debug output control
 #define USBHID_DEBUG 0
@@ -503,6 +504,10 @@ static int hid_submit_interrupt_in(usbhid_device_t* hdev) {
     // DCI for IN endpoint = endpoint_number * 2 + 1
     uint8_t dci = hdev->int_in_ep * 2 + 1;
     uint16_t max_pkt = hdev->int_in_max_pkt;
+    WARN_ON(slot == 0 || slot > XHCI_MAX_SLOTS);  /* slot 0 reserved; valid range is 1..XHCI_MAX_SLOTS */
+    WARN_ON(hdev->int_in_ep == 0);  /* EP 0 is the control endpoint — interrupt IN cannot use EP 0 */
+    WARN_ON(dci >= XHCI_MAX_ENDPOINTS);  /* DCI out of range for pending_xfer array */
+    WARN_ON(max_pkt == 0);  /* zero max_pkt: TRB_LEN(0) queues a 0-byte transfer, device will NAK forever */
 
     // Reset transfer state
     hdev->xfer.completed = 0;
@@ -544,6 +549,8 @@ static void hid_resubmit_irq(usbhid_device_t* hdev) {
     uint8_t slot = dev->slot_id;
     uint8_t dci = hdev->int_in_ep * 2 + 1;
     uint16_t max_pkt = hdev->int_in_max_pkt;
+    WARN_ON(slot == 0 || slot > XHCI_MAX_SLOTS);  /* invalid slot in IRQ resubmit path */
+    WARN_ON(hdev->int_in_ep == 0);  /* EP 0 is control — must not resubmit interrupt IN on EP 0 */
 
     // Reset transfer state for the next report
     hdev->xfer.completed = 0;
@@ -608,6 +615,7 @@ int usbhid_irq_completion(xhci_controller_t* ctrl, uint8_t slot, uint8_t ep_id,
         __asm__ volatile("" ::: "memory");
 
         uint32_t received = hdev->int_in_max_pkt - residue;
+        WARN_ON(received > hdev->int_in_max_pkt);  /* residue > max_pkt: xHCI reported more bytes than the endpoint maximum */
         if (received > USBHID_REPORT_BUF_SIZE) received = USBHID_REPORT_BUF_SIZE;
 
         hid_dbg("IRQ HID[slot=%d] report: %d bytes, cc=%d\n", slot, received, cc);
@@ -821,6 +829,7 @@ static int hid_setup_interrupt_endpoint(usbhid_device_t* hdev) {
     hid_memset(ctrl->input_ctx_raw, 0, input_ctx_size);
 
     // Input Control Context: add Slot Context and this endpoint
+    WARN_ON(dci >= 32);  /* DCI >= 32 makes (1 << dci) shift undefined behaviour and corrupts the input context add-flags bitmap */
     uint32_t* input_ctrl_ctx = (uint32_t*)ctrl->input_ctx_raw;
     input_ctrl_ctx[0] = 0;                        // Drop flags
     input_ctrl_ctx[1] = (1 << 0) | (1 << dci);   // Add: Slot + endpoint

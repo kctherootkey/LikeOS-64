@@ -3,6 +3,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/lapic.h"
+#include "../../include/kernel/bug.h"
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC
@@ -27,6 +28,8 @@ static inline unsigned int inl(unsigned short port)
 
 unsigned int pci_cfg_read32(unsigned char bus, unsigned char dev, unsigned char func, unsigned char off)
 {
+    BUG_ON(dev > 31 || func > 7);
+    WARN_ON(off & 0x3);  /* PCI config read must be 4-byte aligned */
     unsigned int address = (unsigned int)((1u << 31) |
         ((unsigned int)bus << 16) |
         ((unsigned int)dev << 11) |
@@ -42,6 +45,8 @@ unsigned int pci_cfg_read32(unsigned char bus, unsigned char dev, unsigned char 
 
 void pci_cfg_write32(unsigned char bus, unsigned char dev, unsigned char func, unsigned char off, unsigned int value)
 {
+    BUG_ON(dev > 31 || func > 7);
+    WARN_ON(off & 0x3);  /* PCI config write must be 4-byte aligned */
     unsigned int address = (unsigned int)((1u << 31) |
         ((unsigned int)bus << 16) |
         ((unsigned int)dev << 11) |
@@ -332,6 +337,7 @@ uint8_t pci_find_capability(const pci_device_t* dev, uint8_t cap_id)
 
 int pci_enable_msi(const pci_device_t* dev, uint8_t vector)
 {
+    WARN_ON(vector < 32);  /* MSI vector must be >= 32 (0-31 are CPU exceptions) */
     uint8_t cap_off = pci_find_capability(dev, PCI_CAP_MSI);
     if (cap_off == 0) {
         kprintf("PCI MSI: no MSI capability found for %02x:%02x.%x\n",

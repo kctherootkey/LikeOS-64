@@ -11,6 +11,7 @@
 #include <kernel/net.h>
 #include <kernel/smp.h>
 #include <kernel/random.h>
+#include "../../include/kernel/bug.h"
 
 // ============================================================================
 // VALIDATION
@@ -50,6 +51,7 @@ int elf_validate(const void* data, size_t size) {
 static int elf_load_segments(const void* elf_data, size_t elf_size,
                              uint64_t* pml4, uint64_t base_offset,
                              elf_load_result_t* result) {
+    BUG_ON(elf_data == NULL || pml4 == NULL || result == NULL);
     const Elf64_Ehdr* ehdr = (const Elf64_Ehdr*)elf_data;
     const uint8_t* elf_bytes = (const uint8_t*)elf_data;
 
@@ -95,6 +97,10 @@ static int elf_load_segments(const void* elf_data, size_t elf_size,
 
         // File-bounds check
         if (ph->p_offset + ph->p_filesz > elf_size) return -9;
+
+        WARN_RATELIMIT(ph->p_filesz > ph->p_memsz, "ELF: p_filesz (%lu) > p_memsz (%lu) in segment %u",
+                       (unsigned long)ph->p_filesz, (unsigned long)ph->p_memsz, i);
+        WARN_ON(ph->p_align != 0 && (ph->p_align & (ph->p_align - 1)) != 0);  /* p_align must be power-of-2 */
 
         uint64_t seg_vaddr = ph->p_vaddr + base_offset;
         uint64_t seg_end   = seg_vaddr + ph->p_memsz;
@@ -158,6 +164,7 @@ static int elf_load_segments(const void* elf_data, size_t elf_size,
         result->phdr_addr = result->load_base + ehdr->e_phoff;
 
     result->entry_point = ehdr->e_entry + base_offset;
+    WARN_ON(result->entry_point < USER_SPACE_START || result->entry_point >= USER_SPACE_END);  /* entry point outside user range */
     result->brk_start   = (result->load_end + 0xFFF) & ~0xFFFULL;
     return 0;
 }
@@ -233,12 +240,14 @@ static uint64_t elf_setup_stack(uint64_t* pml4,
                                 uint64_t stack_top, uint64_t stack_size,
                                 char* const argv[], char* const envp[],
                                 elf_load_result_t* mr, uint64_t interp_base) {
+    BUG_ON(pml4 == NULL || mr == NULL);
     if (!mm_map_user_stack(pml4, stack_top, stack_size)) return 0;
 
     int argc = 0;
     if (argv) while (argv[argc]) argc++;
     int envc = 0;
     if (envp) while (envp[envc]) envc++;
+    WARN_ON_ONCE(argc > 127 || envc > 127);  /* argc/envc exceeds av[128]/ev[128] stack buffer: execve with pathologically many args */
 
     // Auxiliary vector entries
     typedef struct { uint64_t t, v; } ax_t;

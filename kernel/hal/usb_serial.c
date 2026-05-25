@@ -6,6 +6,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/usb.h"
+#include "../../include/kernel/bug.h"
 
 #ifndef USB_SERIAL_ENABLED
 
@@ -450,6 +451,7 @@ static int usbserial_write_text(xhci_controller_t* ctrl, usb_device_t* dev,
         }
 
         txbuf[txlen++] = ch;
+        WARN_ON(txlen > sizeof(txbuf));  /* txbuf overflow: txlen exceeded txbuf capacity */
     }
 
     if (txlen != 0) {

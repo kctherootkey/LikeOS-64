@@ -10,6 +10,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/random.h"
+#include "../../include/kernel/bug.h"
 
 static volatile uint64_t g_ticks = 0;
 /* PM Timer-based wall-clock microsecond counter.
@@ -943,6 +944,7 @@ void timer_calibrate_frequency(void) {
 
 void timer_init(uint32_t frequency_hz) {
     if (frequency_hz < 19 || frequency_hz > 1193182) {
+        WARN_ON_ONCE(1);  /* timer_init: requested frequency %u out of PIT range */
         frequency_hz = 100; // Clamp to safe default
     }
     g_frequency = frequency_hz;
@@ -989,6 +991,7 @@ void timer_irq_handler(void) {
     
     if (is_bsp) {
         /* Seqlock write: odd = updating, even = stable */
+        WARN_ON_ONCE(g_tick_seq & 1);  /* seqlock is odd on BSP tick entry: previous tick never closed the write window — readers will spin forever */
         g_tick_seq++;
         __asm__ volatile("" ::: "memory");
 

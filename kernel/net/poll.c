@@ -9,6 +9,7 @@
 #include "../../include/kernel/vfs.h"
 #include "../../include/kernel/tty.h"
 #include "../../include/kernel/devfs.h"
+#include "../../include/kernel/bug.h"
 
 // ============================================================================
 // Epoll instance table
@@ -107,6 +108,7 @@ static short fd_poll_one(int fd, short events) {
     // Epoll fd marker
     if (IS_EPOLL_FD(entry)) {
         // Epoll fds are not themselves pollable in a meaningful way
+        WARN_RATELIMIT(1, "poll: epoll fd %d passed to fd_poll_one - epoll instances cannot be nested via poll()", fd);
         return POLLNVAL;
     }
 
@@ -129,6 +131,7 @@ static short fd_poll_one(int fd, short events) {
     if (pipe_is_end(entry)) {
         pipe_end_t* pe = (pipe_end_t*)entry;
         pipe_t* p = pe->pipe;
+        WARN_ON(p->used > p->size);  /* pipe ring buffer invariant violated: used > capacity */
         short rev = 0;
         if (pe->is_read) {
             if ((events & (POLLIN | POLLRDNORM)) && p->used > 0)
@@ -257,6 +260,7 @@ int sys_select_internal(int nfds, fd_set* readfds, fd_set* writefds,
 // ============================================================================
 int sys_poll_internal(struct pollfd* fds, int nfds, uint64_t timeout_ticks) {
     if (nfds < 0 || !fds) return -EINVAL;
+    WARN_ON(nfds > TASK_MAX_FDS);  /* poll() with nfds > TASK_MAX_FDS: kernel cannot have that many open fds */
 
     uint64_t deadline = 0;
     if (timeout_ticks == 0) {
@@ -357,6 +361,7 @@ int epoll_ctl_internal(int epfd_idx, int op, int fd, struct epoll_event* event) 
         for (int i = found; i < ep->nentries - 1; i++)
             ep->entries[i] = ep->entries[i + 1];
         ep->nentries--;
+        WARN_ON(ep->nentries < 0);  /* epoll nentries went negative after DEL - double-delete or accounting bug */
         break;
     }
     case EPOLL_CTL_MOD: {
@@ -439,6 +444,7 @@ int epoll_wait_internal(int epfd_idx, struct epoll_event* events,
 
         spin_unlock_irqrestore(&ep->lock, fl);
 
+        WARN_ON(count > maxevents);  /* epoll_wait returned more events than maxevents - loop bound violated */
         if (count > 0 || timeout_ticks == 0)
             return count;
 

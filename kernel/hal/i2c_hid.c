@@ -31,6 +31,7 @@
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/timer.h"
+#include "../../include/kernel/bug.h"
 
 // ---- Debug verbosity control ----
 // Set I2C_DEBUG to 1 for full diagnostic output (ISR stats, transfer logs,

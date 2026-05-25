@@ -5,6 +5,7 @@
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/bug.h"
 
 // UNIX socket table
 static unix_socket_t unix_sockets[MAX_UNIX_SOCKETS];
@@ -40,6 +41,7 @@ static void uds_strcpy(char* dst, const char* src, int maxlen) {
 // unix_get - Get unix socket by index (from FD)
 // ============================================================================
 unix_socket_t* unix_get(int usockfd) {
+    BUG_ON(usockfd < 0);
     int idx = UNIX_SOCKET_FD_IDX(usockfd);
     if (idx < 0 || idx >= MAX_UNIX_SOCKETS) return NULL;
     if (!unix_sockets[idx].active) return NULL;
@@ -295,6 +297,7 @@ int unix_connect(int usockfd, const struct sockaddr_un* addr) {
 // unix_send - Send data on a connected UNIX socket
 // ============================================================================
 int unix_send(int usockfd, const void* buf, size_t len, int flags) {
+    BUG_ON(buf == NULL && len > 0);
     (void)flags;
     unix_socket_t* us = unix_get(usockfd);
     if (!us) return -EBADF;
@@ -354,6 +357,7 @@ int unix_send(int usockfd, const void* buf, size_t len, int flags) {
         peer->buf[peer->tail] = src[i];
         smap_enable();
         peer->tail = next;
+        WARN_ON(peer->tail == peer->head && i + 1 < len);  /* unix_socket ring buffer wrapped to head mid-write: capacity calculation is wrong */
         peer->bytes_written++;
         sent++;
     }
@@ -372,6 +376,7 @@ int unix_send(int usockfd, const void* buf, size_t len, int flags) {
 // unix_recv - Receive data from a connected UNIX socket
 // ============================================================================
 int unix_recv(int usockfd, void* buf, size_t len, int flags) {
+    BUG_ON(buf == NULL && len > 0);
     (void)flags;
     unix_socket_t* us = unix_get(usockfd);
     if (!us) return -EBADF;
@@ -424,6 +429,7 @@ int unix_close(int usockfd) {
     if (!us) return -EBADF;
 
     int old = __atomic_fetch_sub(&us->ref_count, 1, __ATOMIC_ACQ_REL);
+    WARN_ON(old <= 0);  /* unix_socket ref_count underflow */
     if (old > 1) return 0;
 
     uint64_t tflags;

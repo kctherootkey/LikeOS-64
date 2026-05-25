@@ -7,6 +7,7 @@
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/skb.h"
 #include "../../include/kernel/ratelimit.h"
+#include "../../include/kernel/bug.h"
 
 // All TX sites use a per-call sk_buff from the size-classed pool; no shared
 // static TX buffer / TX spinlock is held across the lower-layer call, so
@@ -89,6 +90,8 @@ int icmp_send_error_packet(net_device_t* dev, uint32_t dst_ip,
                            uint8_t type, uint8_t code,
                            const uint8_t* quoted_ip_packet,
                            uint16_t quoted_len, uint32_t aux_data) {
+    BUG_ON(dev == NULL);
+    BUILD_BUG_ON(sizeof(icmp_header_t) != 8);
     if (!dev || !quoted_ip_packet) return -1;
 
     uint16_t copy_len = quoted_len;
@@ -120,6 +123,8 @@ int icmp_send_error_packet(net_device_t* dev, uint32_t dst_ip,
 
 // Process received ICMP packet
 void icmp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t len, uint8_t rx_ttl) {
+    BUG_ON(dev == NULL);
+    BUG_ON(data == NULL);
     if (len < sizeof(icmp_header_t)) return;
 
     const icmp_header_t* icmp = (const icmp_header_t*)data;
@@ -135,6 +140,12 @@ void icmp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t l
 
     // Drop address mask requests (information disclosure)
     if (icmp->type == ICMP_ADDRMASK) return;
+
+    WARN_RATELIMIT(icmp->type > 18 &&
+                   icmp->type != ICMP_DEST_UNREACH && icmp->type != ICMP_TIME_EXCEEDED,
+                   "icmp_rx: unknown type %u from %u.%u.%u.%u",
+                   icmp->type, (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF,
+                   (src_ip >> 8) & 0xFF, src_ip & 0xFF);
 
     if (icmp->type == ICMP_ECHO_REQUEST && icmp->code == 0) {
         // Global flood rate limit

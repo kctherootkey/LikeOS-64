@@ -7,6 +7,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"  // For spinlock_t, sched_is_smp
 #include "../../include/kernel/smp.h"    // For smp_tlb_shootdown_sync
+#include "../../include/kernel/bug.h"
 
 // External debug flag from memory.c
 extern int mm_debug_pt;
@@ -159,6 +160,7 @@ static void slab_free_virt_range(uint64_t start, size_t size) {
     
     // No coalescing possible - add as new range
     if (slab_num_free_ranges >= SLAB_MAX_FREE_RANGES) {
+        WARN_ON_ONCE(1);  /* slab virtual address range list full: address space leak */
         // Free list is full, just lose this range (unfortunate but safe)
         static int warned = 0;
         if (!warned) {
@@ -280,6 +282,7 @@ static void* slab_get_object(slab_page_t* slab, uint32_t index) {
 
 // Get object index from pointer (returns -1 if invalid)
 static int slab_get_object_index(slab_page_t* slab, void* ptr) {
+    VM_BUG_ON(slab == NULL || ptr == NULL);
     uint8_t* base = (uint8_t*)slab + sizeof(slab_page_t);
     uint8_t* obj = (uint8_t*)ptr;
     
@@ -308,6 +311,7 @@ static int slab_get_object_index(slab_page_t* slab, void* ptr) {
 
 // Allocate a new slab page for a cache
 static slab_page_t* slab_alloc_page(slab_cache_t* cache) {
+    BUG_ON(cache == NULL);
     // Allocate a physical page
     uint64_t phys_page = mm_allocate_physical_page();
     if (phys_page == 0) {
@@ -315,6 +319,8 @@ static slab_page_t* slab_alloc_page(slab_cache_t* cache) {
                 cache->object_size);
         return NULL;
     }
+    
+    WARN_ON(phys_page & (PAGE_SIZE - 1));  /* slab physical page is not page-aligned */
     
     // Allocate a virtual address for this page
     uint64_t virt_addr = slab_alloc_virt_addr();
@@ -346,6 +352,7 @@ static slab_page_t* slab_alloc_page(slab_cache_t* cache) {
     slab->object_size = cache->object_size;
     slab->total_objects = cache->objects_per_slab;
     slab->free_count = slab->total_objects;
+    WARN_ON(slab->free_count == 0);  /* newly-allocated slab has zero total_objects: calc_objects_per_slab returned 0 */
     slab->cache = cache;
     slab->next = NULL;
     slab->prev = NULL;
@@ -361,6 +368,7 @@ static slab_page_t* slab_alloc_page(slab_cache_t* cache) {
 
 // Free a slab page back to physical memory
 static void slab_free_page(slab_page_t* slab) {
+    VM_BUG_ON(slab == NULL || slab->magic != SLAB_MAGIC);
     if (!slab || slab->magic != SLAB_MAGIC) {
         kprintf("SLAB: Invalid slab page in free_page: %p\n", slab);
         return;
@@ -424,6 +432,7 @@ static void slab_move_to_list(slab_page_t* slab, slab_page_t** from_list,
 
 // Initialize the SLAB allocator
 void slab_init(void) {
+    BUILD_BUG_ON(SLAB_NUM_CLASSES <= 0);
     kprintf("Initializing SLAB allocator...\n");
     
     // Initialize all size-class caches
@@ -469,6 +478,8 @@ void slab_init(void) {
 
 // Allocate memory from SLAB allocator
 void* slab_alloc(size_t size) {
+    BUG_ON(size == 0);
+    BUG_ON(!slab_initialized);
     if (size == 0) {
         return NULL;
     }
@@ -571,6 +582,7 @@ void* slab_alloc(size_t size) {
         kprintf("SLAB: No size class for size %lu\n", (unsigned long)size);
         return NULL;
     }
+    BUG_ON(class_idx >= SLAB_NUM_CLASSES);  /* class_idx out of range after successful slab_get_size_class: slab descriptor corruption */
     
     slab_cache_t* cache = &slab_caches[class_idx];
     slab_page_t* slab = NULL;
@@ -582,6 +594,7 @@ void* slab_alloc(size_t size) {
     // Try to allocate from partial slabs first
     if (cache->partial_slabs) {
         slab = cache->partial_slabs;
+        WARN_ON(slab->free_count == 0);  /* partial slab has zero free objects: slab list classification is wrong */
         slab_global_stats.cache_hits++;
     }
     // Try empty slabs (cached for reuse)
@@ -737,6 +750,7 @@ void slab_free(void* ptr) {
     // Check if already free (double-free detection)
     if (!bitmap_is_set(slab->bitmap, obj_idx)) {
         void* ra = __builtin_return_address(0);
+        WARN(1, "SLAB: Double free at %p (caller=%p size=%u)", ptr, ra, (unsigned)cache->object_size);
         kprintf("SLAB: Double free detected at %p (caller=%p size=%u)\n",
                 ptr, ra, (unsigned)cache->object_size);
         return;
@@ -756,6 +770,7 @@ void slab_free(void* ptr) {
     // Mark object as free
     bitmap_clear(slab->bitmap, obj_idx);
     slab->free_count++;
+    VM_BUG_ON(slab->free_count > slab->total_objects);  /* free_count exceeds total - double-free or corruption */
     
     // Move slab between lists as needed
     if (was_full) {

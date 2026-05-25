@@ -4,6 +4,7 @@
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/skb.h"
 #include "../../include/kernel/ratelimit.h"
+#include "../../include/kernel/bug.h"
 
 // UDP pseudo-header for checksum
 typedef struct __attribute__((packed)) {
@@ -49,6 +50,11 @@ static uint16_t udp_compute_checksum(uint32_t src_ip, uint32_t dst_ip,
 int udp_send(net_device_t* dev, uint32_t dst_ip,
              uint16_t src_port, uint16_t dst_port,
              const uint8_t* data, uint16_t len) {
+    BUG_ON(dev == NULL);
+    BUILD_BUG_ON(sizeof(udp_header_t) != 8);
+    WARN_ON(src_port == 0);  /* UDP source port is 0 - ephemeral ports must be assigned */
+    WARN_ON(dst_port == 0);  /* UDP destination port is 0 - invalid */
+    WARN_ON(len > 65507);    /* UDP payload exceeds max (65535 - IP header - UDP header) */
     if (!dev) return -1;
 
     uint32_t udp_len = sizeof(udp_header_t) + (uint32_t)len;
@@ -83,6 +89,8 @@ int udp_send(net_device_t* dev, uint32_t dst_ip,
 // Process received UDP datagram
 void udp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
             const uint8_t* data, uint16_t len, uint8_t ttl, uint8_t tos) {
+    BUG_ON(dev == NULL);
+    BUG_ON(data == NULL);
     if (len < sizeof(udp_header_t)) return;
 
     const udp_header_t* udp = (const udp_header_t*)data;

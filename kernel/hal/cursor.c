@@ -5,6 +5,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/vfs.h"
 #include "../../include/kernel/memory.h"
+#include "../../include/kernel/bug.h"
 
 // Seek whence values
 #define SEEK_SET 0
@@ -129,6 +130,7 @@ int cursor_load(const char* path) {
     g_cursor.xhot = img_header.xhot;
     g_cursor.yhot = img_header.yhot;
     g_cursor.loaded = 1;
+    WARN_ON_ONCE(img_header.xhot >= img_header.width || img_header.yhot >= img_header.height);  /* cursor hotspot outside image bounds */
 
     kprintf("cursor: loaded %s (%ux%u, hotspot %u,%u)\n",
             path, img_header.width, img_header.height, img_header.xhot, img_header.yhot);

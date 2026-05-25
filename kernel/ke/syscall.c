@@ -26,7 +26,7 @@
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/lapic.h"
 #include "../../include/kernel/random.h"
-#include "../../include/kernel/random.h"
+#include "../../include/kernel/bug.h"
 
 // Validate user pointer is in user space
 static bool validate_user_ptr(uint64_t ptr, size_t len) {
@@ -39,6 +39,8 @@ static bool validate_user_ptr(uint64_t ptr, size_t len) {
 // SMAP-aware copy from user space to kernel space
 // Returns 0 on success, -EFAULT on failure
 static int copy_from_user(void* kernel_dst, const void* user_src, size_t len) {
+    /* Destination must be a kernel address, not user space */
+    WARN_ON((uint64_t)kernel_dst < 0x8000000000000000UL && (uint64_t)kernel_dst >= 0x1000UL);
     if (!validate_user_ptr((uint64_t)user_src, len)) {
         return -EFAULT;
     }
@@ -56,6 +58,8 @@ static int copy_from_user(void* kernel_dst, const void* user_src, size_t len) {
 // SMAP-aware copy from kernel space to user space
 // Returns 0 on success, -EFAULT on failure
 static int copy_to_user(void* user_dst, const void* kernel_src, size_t len) {
+    /* Destination must be a user-space address */
+    WARN_ON((uint64_t)user_dst >= 0x8000000000000000UL);
     if (!validate_user_ptr((uint64_t)user_dst, len)) {
         return -EFAULT;
     }
@@ -372,6 +376,7 @@ static int64_t pipe_write_from_user(pipe_end_t* end, uint64_t buf, uint64_t coun
 
     pipe->write_pos = (pipe->write_pos + to_write) % pipe->size;
     pipe->used += to_write;
+    WARN_ON(pipe->used > pipe->size);  /* pipe ring buffer overflow: used > size after write, concurrent write without lock or size miscalculation */
     
     spin_unlock_irqrestore(&pipe->lock, flags);
     
@@ -437,7 +442,9 @@ static mmap_region_t* find_mmap_region(task_t* task, uint64_t addr) {
 
 // SYS_READ - read from file descriptor
 static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
+    might_sleep();
     task_t* cur = sched_current();
+    BUG_ON(cur == NULL);
     if (!cur) return -EFAULT;
     
     // Security: Validate count to prevent excessive reads and overflow
@@ -514,7 +521,9 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
 
 // SYS_WRITE - write to file descriptor
 static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
+    might_sleep();
     task_t* cur = sched_current();
+    BUG_ON(cur == NULL);
     if (!cur) return -EFAULT;
     
     // Security: Validate count to prevent excessive writes and overflow
@@ -612,8 +621,9 @@ static int vfs_status_to_errno(int st) {
 // SYS_OPEN - open a file
 static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode) {
     (void)flags; (void)mode;  // Currently ignore flags/mode
-    
+    might_sleep();
     task_t* cur = sched_current();
+    BUG_ON(cur == NULL);
     if (!cur) return -EFAULT;
     
     if (!validate_user_ptr(pathname, 1)) {
@@ -6006,6 +6016,7 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
     // We snapshot the per-CPU values to task-local storage before enabling interrupts.
     task_t* cur = sched_current();
     percpu_t* cpu = this_cpu();
+    BUG_ON(cpu == NULL);
 
     /* Track current syscall number for Oops/panic reporting */
     cpu->current_syscall_nr = (int)num;

@@ -2,6 +2,7 @@
 #include <kernel/pipe.h>
 #include <kernel/memory.h>
 #include <kernel/sched.h>
+#include "../../include/kernel/bug.h"
 
 bool pipe_is_end(const void* ptr) {
     if (!ptr) {
@@ -17,6 +18,7 @@ bool pipe_is_end(const void* ptr) {
 }
 
 pipe_t* pipe_create(size_t size) {
+    might_sleep();
     if (size == 0) {
         return NULL;
     }
@@ -34,6 +36,8 @@ pipe_t* pipe_create(size_t size) {
     }
 
     pipe->size = size;
+    WARN_ON(pipe->size == 0);  /* pipe buffer size is zero after create */
+    WARN_ON(pipe->buffer == NULL);  /* pipe buffer is NULL after create */
     pipe->read_pos = 0;
     pipe->write_pos = 0;
     pipe->used = 0;
@@ -76,12 +80,15 @@ pipe_end_t* pipe_dup_end(pipe_end_t* end) {
     if (!end || end->magic != PIPE_MAGIC) {
         return NULL;
     }
+    WARN_ON(end->pipe == NULL);  /* dup'ing pipe_end with no backing pipe: pipe_create_end forgot to set pipe pointer */
 
     return pipe_create_end(end->pipe, end->is_read != 0);
 }
 
 void pipe_close_end(pipe_end_t* end) {
+    BUG_ON(end == NULL);
     if (!end || end->magic != PIPE_MAGIC) {
+        WARN_ON_ONCE(!end || end->magic != PIPE_MAGIC);  /* close with bad magic: double-close or corruption */
         return;
     }
 
@@ -97,10 +104,14 @@ void pipe_close_end(pipe_end_t* end) {
         if (end->is_read) {
             if (pipe->readers > 0) {
                 pipe->readers--;
+            } else {
+                WARN_ON_ONCE(1);  /* pipe readers underflow: more closes than opens */
             }
         } else {
             if (pipe->writers > 0) {
                 pipe->writers--;
+            } else {
+                WARN_ON_ONCE(1);  /* pipe writers underflow: more closes than opens */
             }
         }
 

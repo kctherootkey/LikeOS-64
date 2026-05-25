@@ -7,6 +7,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/bug.h"
 
 
 // Define missing types for kernel
@@ -518,6 +519,9 @@ static int merge_dirty_regions(void)
 // Uses non-temporal stores for WC VRAM writes
 static void copy_region_to_front(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2)
 {
+    WARN_ON(x2 >= g_double_buffer.width);   /* dirty region right edge past framebuffer width */
+    WARN_ON(y2 >= g_double_buffer.height);  /* dirty region bottom edge past framebuffer height */
+    WARN_ON(x1 > x2 || y1 > y2);           /* inverted rect: x1>x2 or y1>y2 */
     uint32_t width = x2 - x1 + 1;
     uint32_t height = y2 - y1 + 1;
     for(uint32_t y = 0; y < height; y++) {

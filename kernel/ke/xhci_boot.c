@@ -7,6 +7,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/interrupt.h"
+#include "../../include/kernel/bug.h"
 
 // Boot state tracking
 static int g_init_attempted = 0;
@@ -82,6 +83,8 @@ void xhci_boot_init(xhci_boot_state_t* state) {
     } else {
         bar0_full = xhci_pci->bar[0] & ~0xFULL;
     }
+    BUG_ON(bar0_full == 0);  /* xHCI BAR0 is zero - PCI enumeration did not assign MMIO */
+    WARN_ON(bar0_full < 0x1000);  /* xHCI BAR0 below 4K is suspicious - likely not a valid MMIO address */
     
     kprintf("[XHCI BOOT] Controller 0 at PCI %02x:%02x.%x (0x%04x:0x%04x), BAR0=0x%llx\n",
             xhci_pci->bus, xhci_pci->device, xhci_pci->function,

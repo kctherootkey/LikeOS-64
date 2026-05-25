@@ -13,6 +13,7 @@
 #include "../../include/kernel/sched.h"  // For spinlock_t
 #include "../../include/kernel/sysfont.h"  // For external PSF font loading
 #include "../../include/kernel/timer.h"   // For timer_ticks() (flush rate-limiting)
+#include "../../include/kernel/bug.h"
 
 #define SIZE_MAX ((size_t)-1)
 #define NULL ((void*)0)
@@ -230,6 +231,7 @@ static uint32_t max_cols = 0;
 
 // Convert VGA colors to RGB
 uint32_t vga_to_rgb(uint8_t vga_color) {
+    WARN_ON(vga_color >= 16);  /* VGA color index >= 16 is out of palette range */
     static const uint32_t vga_palette[16] = {
         0x000000, // Black
         0x0000AA, // Blue
@@ -564,6 +566,7 @@ static void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_clr, uint32_t 
         font_h = sysfont_get_height();
         bpr = (font_w + 7) / 8;
     } else {
+        BUILD_BUG_ON(DEFAULT_CHAR_HEIGHT > 16);  /* font_8x16[][16]: fallback glyph array has exactly 16 rows */
         if (uc >= 128) uc = '?';
         glyph = font_8x16[uc];
         font_w = DEFAULT_CHAR_WIDTH;
@@ -594,6 +597,8 @@ static void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_clr, uint32_t 
 
 // Initialize the console with framebuffer info
 void console_init(framebuffer_info_t* fb) {
+    BUG_ON(fb == NULL);
+    WARN_ON_ONCE(fb->horizontal_resolution == 0 || fb->vertical_resolution == 0);  /* console init with zero framebuffer dimensions */
     // Copy the framebuffer info to our static storage so we don't depend on
     // the boot_info structure which is in identity-mapped memory
     if (fb) {

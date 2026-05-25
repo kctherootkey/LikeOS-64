@@ -9,6 +9,7 @@
 #include "../../include/kernel/skb.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/bug.h"
 
 #define SKB_SMALL_COUNT   512
 #define SKB_JUMBO_COUNT     8
@@ -143,6 +144,7 @@ sk_buff_t* skb_alloc(uint32_t min_payload) {
     int want_jumbo = (need > SKB_SMALL_DATA);
 
     if (need > SKB_JUMBO_DATA) {
+        WARN_RATELIMIT(1, "skb_alloc: oversized request %u (jumbo max=%u)", need, SKB_JUMBO_DATA);
         skb_alloc_total_fail++;
         return NULL;
     }
@@ -172,25 +174,29 @@ sk_buff_t* skb_alloc(uint32_t min_payload) {
     }
 
     skb_reset(skb);
+    WARN_ON(skb->data < skb->head || skb->data > skb->end);  /* skb->data out of [head,end] bounds after skb_reset */
     return skb;
 }
 
 void skb_put(sk_buff_t* skb) {
     if (!skb) return;
     uint32_t old = __atomic_fetch_sub(&skb->refcount, 1, __ATOMIC_ACQ_REL);
+    WARN_ON(old == 0);           /* double-free / refcount underflow */
     if (old != 1) return;          // still referenced by someone else
     // refcount has dropped to 0 -- return to pool.
     if (skb->pool_sig == SKB_SIG_SMALL) {
         skb_push_small(skb);
     } else if (skb->pool_sig == SKB_SIG_JUMBO) {
         skb_push_jumbo(skb);
+    } else {
+        WARN_ON_ONCE(1);  /* bad pool_sig: SKB corruption - not returning to pool */
     }
-    // Bad signature: silently leak (better than corrupting freelist).
 }
 
 // ---- skb_queue ----
 
 void skb_queue_init(skb_queue_t* q, const char* name) {
+    BUG_ON(q == NULL);
     q->head = NULL;
     q->tail = NULL;
     q->len  = 0;
@@ -206,6 +212,7 @@ void skb_queue_tail(skb_queue_t* q, sk_buff_t* skb) {
     else         q->head       = skb;
     q->tail = skb;
     q->len++;
+    WARN_ON((q->head == NULL) != (q->tail == NULL));  /* head/tail asymmetry: queue corruption */
     spin_unlock_irqrestore(&q->lock, f);
 }
 
@@ -217,6 +224,7 @@ sk_buff_t* skb_queue_head(skb_queue_t* q) {
         q->head = skb->next;
         if (!q->head) q->tail = NULL;
         q->len--;
+        WARN_ON((int)q->len < 0);  /* skb queue len underflow - more dequeues than enqueues */
         skb->next = NULL;
     }
     spin_unlock_irqrestore(&q->lock, f);

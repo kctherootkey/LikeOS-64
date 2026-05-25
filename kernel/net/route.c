@@ -6,6 +6,7 @@
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/syscall.h"
+#include "../../include/kernel/bug.h"
 
 // Route flags
 #define RTF_UP      0x0001  // Route is usable
@@ -45,6 +46,9 @@ void route_init(void) {
 
 int route_add(uint32_t dst_net, uint32_t netmask, uint32_t gateway,
               net_device_t* dev, uint32_t metric, uint16_t flags) {
+    BUG_ON(dev == NULL && !(flags & RTF_REJECT));
+    /* A gateway route with gateway==0 is meaningless (would route to 0.0.0.0) */
+    WARN_ON((flags & RTF_GATEWAY) && gateway == 0);
     uint64_t fl;
     spin_lock_irqsave(&route_lock, &fl);
 

@@ -3,6 +3,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/percpu.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/bug.h"
 
 // Fallback guard symbol for any kernel object compiled with =global guard mode.
 // Active kernel code uses GS:104 (per-CPU) via -mstack-protector-guard=tls.

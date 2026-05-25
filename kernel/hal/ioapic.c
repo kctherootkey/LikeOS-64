@@ -5,6 +5,7 @@
 #include "../../include/kernel/lapic.h"     // for lapic_get_id_cpuid
 #include "../../include/kernel/memory.h"    // for phys_to_virt
 #include "../../include/kernel/sched.h"     // for sched_is_smp()
+#include "../../include/kernel/bug.h"
 
 // Default IOAPIC MMIO base (commonly 0xFEC00000). No ACPI parsing yet.
 #define IOAPIC_DEFAULT_BASE 0xFEC00000UL
@@ -45,6 +46,7 @@ static inline volatile uint32_t* get_ioapic_base(void) {
 }
 
 static inline void ioapic_write(uint8_t reg, uint32_t value) {
+    WARN_ON(reg > 0x3F);  /* IOAPIC register index out of valid range */
     volatile uint32_t* base = get_ioapic_base();
     base[0] = reg;
     base[4] = value; // data register at base+0x10 (index 4 of 32-bit array)
@@ -88,8 +90,7 @@ int ioapic_configure_legacy_irq(uint8_t gsi, uint8_t vector, uint8_t polarity, u
     uint32_t high = 0;
     
     low |= vector; // bits 0-7
-    
-    // For SMP systems, use lowest priority delivery mode (bits 8-10 = 001)
+    WARN_ON(vector < 32);  /* IOAPIC vector must be >= 32 (vectors 0-31 are CPU exceptions) */
     // This allows the APIC to distribute interrupts across CPUs
     if (sched_is_smp()) {
         // Delivery mode = 001 (lowest priority)

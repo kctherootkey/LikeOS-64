@@ -1,6 +1,7 @@
 // LikeOS-64 - Block device registry
 #include "../../include/kernel/block.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/bug.h"
 
 // Spinlock for block device list access
 static spinlock_t block_lock = SPINLOCK_INIT("block");
@@ -10,6 +11,8 @@ static int g_block_count = 0;
 
 int block_register(block_device_t* dev)
 {
+    BUG_ON(dev == NULL);
+    WARN_ON(dev->read == NULL || dev->write == NULL);  /* block_register: device missing read/write ops */
     if(!dev) {
         return ST_INVALID;
     }
@@ -29,6 +32,7 @@ int block_register(block_device_t* dev)
 
 const block_device_t* block_get(int index)
 {
+    BUG_ON(index < 0 || index >= BLOCK_MAX_DEVICES);
     uint64_t flags;
     spin_lock_irqsave(&block_lock, &flags);
 

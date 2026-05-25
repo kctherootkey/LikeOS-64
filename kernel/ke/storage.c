@@ -10,6 +10,7 @@
 #include "../../include/kernel/mouse.h"
 #include "../../include/kernel/pagecache.h"\n#include "../../include/kernel/dcache.h"
 #include "../../include/kernel/icache.h"
+#include "../../include/kernel/bug.h"
 
 void storage_fs_init(storage_fs_state_t* state) {
     if (!state) {
@@ -33,6 +34,7 @@ void storage_fs_set_ready(storage_fs_state_t* state) {
 }
 
 void storage_fs_poll(storage_fs_state_t* state) {
+    BUG_ON(state == NULL);
     if (!state || state->signature_found) {
         return;
     }
@@ -42,6 +44,7 @@ void storage_fs_poll(storage_fs_state_t* state) {
     }
 
     int nblk = block_count();
+    WARN_ON_ONCE(nblk <= 0);  /* block_count() returned 0 or negative: no block devices registered before storage_fs_poll */
     for (int bi = 0; bi < nblk && !state->signature_found; ++bi) {
         if (state->tested_mask & (1u << bi)) {
             continue;

@@ -11,6 +11,7 @@
 #include "../../include/kernel/tty.h"
 #include "../../include/kernel/ioapic.h"
 #include "../../include/kernel/keyboard.h"
+#include "../../include/kernel/bug.h"
 
 // Global mouse state
 static mouse_state_t mouse_state = {0};
@@ -521,6 +522,9 @@ static void mouse_process_packet(void)
     }
 
     // Update cursor if position changed
+    WARN_ON(mouse_state.x < 0 || mouse_state.y < 0);  /* clamp failed: negative mouse position */
+    WARN_ON(mouse_state.screen_width > 0 && mouse_state.x >= mouse_state.screen_width);   /* mouse X past screen width after clamp */
+    WARN_ON(mouse_state.screen_height > 0 && mouse_state.y >= mouse_state.screen_height); /* mouse Y past screen height after clamp */
     if(mouse_state.x != mouse_state.last_x || mouse_state.y != mouse_state.last_y) {
         mouse_update_cursor_internal();
     }
@@ -562,6 +566,7 @@ void mouse_init(void)
 
     // Get screen dimensions from framebuffer optimization system
     fb_double_buffer_t* fb_buffer = get_fb_double_buffer();
+    BUG_ON(fb_buffer == NULL);  /* mouse_init before framebuffer optimization is set up */
     mouse_state.screen_width = fb_buffer->width;
     mouse_state.screen_height = fb_buffer->height;
 
@@ -1012,6 +1017,7 @@ void mouse_inject_usb_movement(int dx, int dy, uint8_t buttons, int8_t wheel)
         mouse_state.x = max_x;
     if (mouse_state.y > max_y)
         mouse_state.y = max_y;
+    WARN_ON(mouse_state.x < 0 || mouse_state.y < 0);  /* clamp failed: negative mouse position (USB path) */
 
     // --- Cursor redraw ---
     if (mouse_state.x != mouse_state.last_x || mouse_state.y != mouse_state.last_y) {

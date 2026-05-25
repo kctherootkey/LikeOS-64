@@ -13,6 +13,7 @@
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/e1000.h"
 #include "../../include/kernel/softirq.h"
+#include "../../include/kernel/bug.h"
 
 // Write a formatted message to a task's controlling TTY.
 // Falls back to kprintf (kernel console) if the task has no ctty.
@@ -293,6 +294,7 @@ static void imcr_route_to_pic(void) {
 }
 
 void idt_set_entry(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags) {
+    BUG_ON(num >= IDT_ENTRIES);
     idt[num].offset_low = base & 0xFFFF;
     idt[num].offset_mid = (base >> 16) & 0xFFFF;
     idt[num].offset_high = (base >> 32) & 0xFFFFFFFF;
@@ -305,6 +307,8 @@ void idt_set_entry(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags) {
 // Set IDT entry with IST (Interrupt Stack Table) index
 // ist_index: 1-7 for IST1-IST7, 0 for no IST (use RSP0)
 void idt_set_entry_ist(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags, uint8_t ist_index) {
+    BUG_ON(num >= IDT_ENTRIES);
+    WARN_ON(ist_index == 0 || ist_index > 7);  /* IST index must be 1-7 for IST entries */
     idt[num].offset_low = base & 0xFFFF;
     idt[num].offset_mid = (base >> 16) & 0xFFFF;
     idt[num].offset_high = (base >> 32) & 0xFFFFFFFF;
@@ -315,6 +319,8 @@ void idt_set_entry_ist(uint8_t num, uint64_t base, uint16_t sel, uint8_t flags, 
 }
 
 void idt_init() {
+    BUILD_BUG_ON(sizeof(struct idt_entry) != 16);
+    BUILD_BUG_ON(IDT_ENTRIES != 256);
     idt_desc.limit = sizeof(idt) - 1;
     idt_desc.base = (uint64_t)&idt;
 
@@ -621,6 +627,96 @@ void panic(const char *fmt, ...) {
     }
 }
 
+#ifdef DEBUG
+static void report_userspace_crash_detailed(task_t* cur, uint64_t* regs,
+                                             int signum, const char* signame,
+                                             uint64_t cr2, uint64_t int_no)
+{
+    (void)signum;
+    uint64_t err_code = regs[REGS_ERRC];
+    uint64_t rip      = regs[REGS_RIP];
+    uint64_t rsp      = regs[REGS_RSP];
+    uint64_t rbp      = regs[REGS_RBP];
+
+    const char* reason = "unknown";
+    const char* access = "-";
+    if (int_no == 14) {
+        reason = (err_code & 1) ? "protection violation" : "page not present";
+        if      (err_code & 0x10) access = "exec";
+        else if (err_code & 0x2)  access = "write";
+        else                      access = "read";
+    } else if (int_no == 6)  { reason = "illegal instruction"; }
+    else if (int_no == 0)    { reason = "divide by zero"; }
+    else if (int_no == 4)    { reason = "integer overflow"; }
+    else if (int_no == 13)   { reason = "general protection fault"; }
+    else if (int_no == 17)   { reason = "alignment check"; }
+
+    task_tty_printf(cur, "\n========================================\n");
+    task_tty_printf(cur, "USERSPACE CRASH\n\n");
+    task_tty_printf(cur, "Process:   %s\n",  cur ? cur->comm : "?");
+    task_tty_printf(cur, "PID:       %d\n",  cur ? cur->tgid : -1);
+    task_tty_printf(cur, "Thread:    %d\n",  cur ? (int)cur->id : -1);
+    task_tty_printf(cur, "CPU:       %u\n\n", this_cpu_id());
+    task_tty_printf(cur, "Signal:    %s\n",  signame);
+    task_tty_printf(cur, "Reason:    %s\n",  reason);
+    if (int_no == 14)
+        task_tty_printf(cur, "Fault VA:  %016llx\n", cr2);
+    task_tty_printf(cur, "Access:    %s\n",  access);
+    task_tty_printf(cur, "Mode:      user\n\n");
+    task_tty_printf(cur, "RIP:       %016llx\n",   rip);
+    task_tty_printf(cur, "RSP:       %016llx\n",   rsp);
+    task_tty_printf(cur, "RBP:       %016llx\n\n", rbp);
+    task_tty_printf(cur, "Registers:\n");
+    task_tty_printf(cur, "RAX: %016llx  RBX: %016llx\n", regs[REGS_RAX], regs[REGS_RBX]);
+    task_tty_printf(cur, "RCX: %016llx  RDX: %016llx\n", regs[REGS_RCX], regs[REGS_RDX]);
+    task_tty_printf(cur, "RSI: %016llx  RDI: %016llx\n", regs[REGS_RSI], regs[REGS_RDI]);
+    task_tty_printf(cur, "R8:  %016llx  R9:  %016llx\n", regs[REGS_R8],  regs[REGS_R9]);
+    task_tty_printf(cur, "R10: %016llx  R11: %016llx\n", regs[REGS_R10], regs[REGS_R11]);
+    task_tty_printf(cur, "R12: %016llx  R13: %016llx\n", regs[REGS_R12], regs[REGS_R13]);
+    task_tty_printf(cur, "R14: %016llx  R15: %016llx\n", regs[REGS_R14], regs[REGS_R15]);
+    task_tty_printf(cur, "RFLAGS: %016llx\n", regs[REGS_RFLAGS]);
+
+    task_tty_printf(cur, "\nMemory map:\n");
+    if (cur) {
+        mmap_region_t* regions;
+        int count;
+        if (cur->mm) {
+            regions = cur->mm->mmap_regions;
+            count   = cur->mm->mmap_count;
+        } else {
+            regions = cur->mmap_regions;
+            count   = TASK_MAX_MMAP;
+        }
+        for (int i = 0; i < count; i++) {
+            mmap_region_t* r = &regions[i];
+            if (!r->in_use) continue;
+            char perms[5];
+            perms[0] = (r->prot & 0x1) ? 'r' : '-';
+            perms[1] = (r->prot & 0x2) ? 'w' : '-';
+            perms[2] = (r->prot & 0x4) ? 'x' : '-';
+            perms[3] = '-';
+            perms[4] = '\0';
+            task_tty_printf(cur, "  %016llx-%016llx %s\n",
+                            r->start, r->start + r->length, perms);
+        }
+    }
+    task_tty_printf(cur, "\nSYSTEM ACTION:\n  process terminated\n");
+    task_tty_printf(cur, "========================================\n");
+}
+#endif /* DEBUG */
+
+static void report_userspace_crash(task_t* cur, uint64_t* regs,
+                                    int signum, const char* signame,
+                                    uint64_t cr2, uint64_t int_no)
+{
+#ifdef DEBUG
+    report_userspace_crash_detailed(cur, regs, signum, signame, cr2, int_no);
+#else
+    task_tty_printf(cur, "User process %d killed by %s\n",
+                    cur ? (int)cur->id : -1, signame);
+#endif
+}
+
 void exception_handler(uint64_t *regs) {
     uint64_t int_no = regs[REGS_INTNO];
     uint64_t err_code = regs[REGS_ERRC];
@@ -647,9 +743,7 @@ void exception_handler(uint64_t *regs) {
         if (!user_mode && cr2 < 0x8000000000000000ULL) {
             task_t* cur = sched_current();
             if (cur && cur->privilege == TASK_USER) {
-                task_tty_printf(cur, "User process %d killed by SIGSEGV (kernel access to bad user addr)\n",
-                        (int)cur->id);
-                task_tty_printf(cur, "  RIP=0x%016llx CR2=0x%016llx err=0x%llx\n", rip, cr2, err_code);
+                report_userspace_crash(cur, regs, SIGSEGV, "SIGSEGV", cr2, 14);
                 sched_signal_task(cur, SIGSEGV);
                 // Enable interrupts and halt - timer will preempt us to another task
                 for (;;) { __asm__ volatile("sti; hlt"); }
@@ -663,51 +757,42 @@ void exception_handler(uint64_t *regs) {
             case 14: {
                 uint64_t cr2;
                 __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-                task_tty_printf(cur, "User process %d killed by SIGSEGV at RIP=0x%016llx CR2=0x%016llx err=0x%llx\n",
-                        cur ? (int)cur->id : -1, rip, cr2, err_code);
+                report_userspace_crash(cur, regs, SIGSEGV, "SIGSEGV", cr2, 14);
                 sched_signal_task(cur, SIGSEGV);
                 // NEVER return - the iret frame points to faulting code
                 // Enable interrupts and halt forever, timer will preempt us away
                 for (;;) { __asm__ volatile("sti; hlt"); }
             }
             case 6:
-                task_tty_printf(cur, "User process %d killed by SIGILL at RIP=0x%016llx\n",
-                        cur ? (int)cur->id : -1, rip);
+                report_userspace_crash(cur, regs, SIGILL, "SIGILL", 0, 6);
                 sched_signal_task(cur, SIGILL);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             case 0:
-                task_tty_printf(cur, "User process %d killed by SIGFPE at RIP=0x%016llx\n",
-                        cur ? (int)cur->id : -1, rip);
+                report_userspace_crash(cur, regs, SIGFPE, "SIGFPE", 0, 0);
                 sched_signal_task(cur, SIGFPE);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             case 3:
-                task_tty_printf(cur, "User process %d killed by SIGTRAP at RIP=0x%016llx\n",
-                        cur ? (int)cur->id : -1, rip);
+                report_userspace_crash(cur, regs, SIGTRAP, "SIGTRAP", 0, 3);
                 sched_signal_task(cur, SIGTRAP);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             case 4:
-                task_tty_printf(cur, "User process %d killed by SIGFPE at RIP=0x%016llx\n",
-                        cur ? (int)cur->id : -1, rip);
+                report_userspace_crash(cur, regs, SIGFPE, "SIGFPE", 0, 4);
                 sched_signal_task(cur, SIGFPE);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             case 5:
-                task_tty_printf(cur, "User process %d killed by SIGTRAP at RIP=0x%016llx\n",
-                        cur ? (int)cur->id : -1, rip);
+                report_userspace_crash(cur, regs, SIGTRAP, "SIGTRAP", 0, 5);
                 sched_signal_task(cur, SIGTRAP);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             case 13:
-                task_tty_printf(cur, "User process %d killed by SIGSEGV at RIP=0x%016llx (err=0x%llx)\n",
-                        cur ? (int)cur->id : -1, rip, err_code);
+                report_userspace_crash(cur, regs, SIGSEGV, "SIGSEGV", 0, 13);
                 sched_signal_task(cur, SIGSEGV);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             case 17:
-                task_tty_printf(cur, "User process %d killed by SIGBUS at RIP=0x%016llx (err=0x%llx)\n",
-                        cur ? (int)cur->id : -1, rip, err_code);
+                report_userspace_crash(cur, regs, SIGBUS, "SIGBUS", 0, 17);
                 sched_signal_task(cur, SIGBUS);
                 for (;;) { __asm__ volatile("sti; hlt"); }
             default:
-                task_tty_printf(cur, "User process %d killed by SIGABRT at RIP=0x%016llx (INT %llu)\n",
-                        cur ? (int)cur->id : -1, rip, int_no);
+                report_userspace_crash(cur, regs, SIGABRT, "SIGABRT", 0, int_no);
                 sched_signal_task(cur, SIGABRT);
                 for (;;) { __asm__ volatile("sti; hlt"); }
         }
@@ -1087,6 +1172,7 @@ void interrupts_init() {
 }
 
 void tss_init() {
+    BUILD_BUG_ON(IST_TOTAL_SIZE < PAGE_SIZE + 512);
     my_memset(&tss, 0, sizeof(tss));
     tss.rsp0 = (uint64_t)(interrupt_stack + sizeof(interrupt_stack));
     
@@ -1150,6 +1236,7 @@ uint64_t tss_get_kernel_stack(void) {
 // Instead, we directly update the GDT TSS entry and do LTR.
 // This is safe because APs start serially (one at a time in smp_boot_aps).
 void tss_init_ap(uint32_t cpu_id) {
+    BUG_ON(cpu_id >= MAX_CPUS_TSS);  /* cpu_id exceeds ap_tss[] array bounds: MAX_CPUS_TSS must be increased */
     if (cpu_id == 0 || cpu_id >= MAX_CPUS_TSS) {
         return;
     }

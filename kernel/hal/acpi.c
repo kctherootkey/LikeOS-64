@@ -9,6 +9,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/interrupt.h"
+#include "../../include/kernel/bug.h"
 
 #define ACPI_DEBUG 0
 #if ACPI_DEBUG
@@ -69,6 +70,7 @@ static void acpi_parse_madt(void) {
     acpi_dbg("ACPI: MADT found, length=%u\n", madt->header.length);
 
     g_acpi_info.lapic_address = madt->lapic_address;
+    WARN_ON(g_acpi_info.lapic_address & (PAGE_SIZE - 1));  /* LAPIC MMIO base not page-aligned */
     g_acpi_info.dual_8259_present = (madt->flags & 1) != 0;
 
     uint8_t* ptr = (uint8_t*)madt + sizeof(acpi_madt_t);
@@ -77,6 +79,7 @@ static void acpi_parse_madt(void) {
     while (ptr < end) {
         madt_entry_header_t* entry = (madt_entry_header_t*)ptr;
         if (entry->length == 0) break;
+        WARN_ON(entry->length < 2);  /* MADT entry length < 2 is malformed */
 
         switch (entry->type) {
         case MADT_TYPE_LAPIC: {
@@ -100,6 +103,7 @@ static void acpi_parse_madt(void) {
                 ioapic_info_t* info = &g_acpi_info.ioapics[g_acpi_info.ioapic_count];
                 info->id = ioapic->ioapic_id;
                 info->address = ioapic->ioapic_address;
+                WARN_ON(info->address & (PAGE_SIZE - 1));  /* IOAPIC MMIO base not page-aligned */
                 info->gsi_base = ioapic->gsi_base;
                 g_acpi_info.ioapic_count++;
             }

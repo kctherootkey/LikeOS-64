@@ -19,6 +19,7 @@
 #include "../../include/kernel/types.h"
 #include "../../include/kernel/syscall.h"
 #include "../../include/kernel/percpu.h"
+#include "../../include/kernel/bug.h"
 
 // ============================================================================
 // FUTEX TRACE RING BUFFER (diagnostic)
@@ -256,6 +257,7 @@ int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns) {
     // Compute hash key and bucket
     uint64_t key = futex_get_key(uaddr, false);  // Private futex
     uint32_t bucket_idx = futex_hash_fn(key);
+    BUG_ON(bucket_idx >= FUTEX_HASH_BUCKETS);
     futex_bucket_t* bucket = &futex_hash[bucket_idx];
     
     // Allocate waiter
@@ -290,6 +292,7 @@ int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns) {
     
     // Block the task
     cur->state = TASK_BLOCKED;
+    WARN_ON(cur->on_rq);  /* task is still on runqueue when going BLOCKED in futex_wait */
     cur->wait_channel = (void*)uaddr;
     
     ftrace_log_key(FT_WAIT_BLOCK, uaddr, expected_val, (uint32_t)cur->id,
@@ -298,6 +301,7 @@ int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns) {
     // Set wakeup time if timeout specified
     if (timeout_ns > 0) {
         uint64_t ticks = (timeout_ns / 10000000) + 1;  // Convert to ~10ms ticks
+        WARN_ON(ticks == 0);  /* futex timeout ticks is zero - underflow in timeout conversion */
         cur->wakeup_tick = timer_ticks() + ticks;
     }
     
@@ -344,6 +348,7 @@ int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns) {
 }
 
 int futex_wake(uint64_t uaddr, int nr_wake) {
+    BUG_ON(!futex_initialized);
     if (nr_wake <= 0) return 0;
     
     uint64_t key = futex_get_key(uaddr, false);

@@ -7,6 +7,7 @@
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/smp.h"
+#include "../../include/kernel/bug.h"
 
 // ============================================================================
 // LAPIC Base Address
@@ -182,6 +183,7 @@ static inline volatile uint32_t* get_lapic_base(void) {
 }
 
 uint32_t lapic_read(uint32_t reg) {
+    WARN_ON(reg & 0xF);  /* xAPIC registers must be 16-byte aligned */
     if (lapic_x2apic_mode) {
         // x2APIC: register MSR = 0x800 + (MMIO_offset >> 4)
         return (uint32_t)rdmsr(X2APIC_MSR_BASE + (reg >> 4));
@@ -190,6 +192,7 @@ uint32_t lapic_read(uint32_t reg) {
 }
 
 void lapic_write(uint32_t reg, uint32_t value) {
+    WARN_ON(reg & 0xF);  /* xAPIC registers must be 16-byte aligned */
     if (lapic_x2apic_mode) {
         // x2APIC: register MSR = 0x800 + (MMIO_offset >> 4)
         // NOTE: ICR is handled specially in IPI functions (single 64-bit MSR)

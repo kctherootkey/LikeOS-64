@@ -2,6 +2,7 @@
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/skb.h"
+#include "../../include/kernel/bug.h"
 
 // Build and send an Ethernet frame.  The TX buffer is a per-call sk_buff
 // from the size-classed pool, so no global TX spinlock is held across the
@@ -9,8 +10,11 @@
 // for TLB-shootdown IPIs and other priority work.
 int eth_send(net_device_t* dev, const uint8_t dst_mac[ETH_ALEN],
              uint16_t ethertype, const uint8_t* payload, uint16_t len) {
+    BUG_ON(dev == NULL);
+    BUILD_BUG_ON(ETH_HLEN != 14);
     if (!dev || !dev->send) return -1;
     if (len > dev->mtu) return -1;
+    WARN_ON(len == 0);  /* eth_send: zero-length payload */
 
     uint16_t frame_len = ETH_HLEN + len;
 
@@ -35,12 +39,17 @@ int eth_send(net_device_t* dev, const uint8_t dst_mac[ETH_ALEN],
 
 // Process received Ethernet frame
 void eth_rx(net_device_t* dev, const uint8_t* frame, uint16_t len) {
+    BUG_ON(dev == NULL);
+    BUG_ON(frame == NULL);
     if (len < ETH_HLEN) return;
 
     const eth_header_t* hdr = (const eth_header_t*)frame;
     uint16_t ethertype = net_ntohs(hdr->ethertype);
     const uint8_t* payload = frame + ETH_HLEN;
     uint16_t payload_len = len - ETH_HLEN;
+    /* Multicast source MAC is a network-layer bug: destination can be multicast, source must be unicast */
+    WARN_RATELIMIT(hdr->src[0] & 0x01, "eth_rx: multicast source MAC %02x:%02x:%02x:%02x:%02x:%02x",
+                   hdr->src[0], hdr->src[1], hdr->src[2], hdr->src[3], hdr->src[4], hdr->src[5]);
 
     switch (ethertype) {
     case ETH_P_ARP:

@@ -47,6 +47,7 @@
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/random.h"
+#include "../../include/kernel/bug.h"
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
@@ -169,6 +170,7 @@ static void dead_thread_queue(task_t* task) {
     } else {
         // Overflow – shouldn't happen unless many threads exit simultaneously.
         // Drop on the floor; leak is better than corruption.
+        WARN_ON_ONCE(g_dead_thread_count >= DEAD_THREAD_MAX);  /* dead_thread_queue overflow: too many threads exiting simultaneously */
         kprintf("WARN: dead_thread_queue overflow (pid %d dropped)\n", task->id);
     }
     spin_unlock_irqrestore(&g_dead_thread_lock, flags);
@@ -201,6 +203,8 @@ static void dead_thread_reap(void) {
 // ============================================================================
 
 static inline void switch_address_space(task_t* prev, task_t* next) {
+    BUG_ON(next == NULL);
+    WARN_ON_ONCE(next->privilege == TASK_USER && next->kernel_stack_top == 0);  /* user task has no kernel stack: syscall/interrupt would overwrite user stack */
     (void)prev;  // Not used — we check actual hardware CR3 below
     uint64_t* next_pml4 = next->pml4 ? next->pml4 : g_kernel_pml4;
 
@@ -272,10 +276,14 @@ static void task_list_remove(task_t* t) {
 // Caller MUST hold the target CPU's runqueue_lock.
 
 static void rq_enqueue_locked(percpu_t* cpu, task_t* task) {
+    lockdep_assert_held(&cpu->runqueue_lock);
+    BUG_ON(cpu == NULL);
+    BUG_ON(task == NULL);
     uint32_t cpu_id = cpu - percpu_get(0);
     
     // Prevent double-enqueue
     if (task->on_rq) {
+        WARN_ON(task->on_rq);  /* double-enqueue detected */
         kprintf("BUG: double-enqueue pid %d cpu %u\n", task->id, cpu_id);
         return;
     }
@@ -284,6 +292,7 @@ static void rq_enqueue_locked(percpu_t* cpu, task_t* task) {
         return;
     }
     if (task->state == TASK_RUNNING) {
+        WARN_ON(task->state == TASK_RUNNING);  /* enqueuing RUNNING task: CPU accounting bug */
         kprintf("BUG: enqueue RUNNING pid %d cpu %u\n", task->id, cpu_id);
         return;
     }
@@ -300,6 +309,8 @@ static void rq_enqueue_locked(percpu_t* cpu, task_t* task) {
 }
 
 static task_t* rq_dequeue_locked(percpu_t* cpu) {
+    lockdep_assert_held(&cpu->runqueue_lock);
+    BUG_ON(cpu == NULL);
     task_t* task = cpu->runqueue_head;
     if (task) {
         cpu->runqueue_head = task->rq_next;
@@ -309,8 +320,10 @@ static task_t* rq_dequeue_locked(percpu_t* cpu) {
         task->rq_next = NULL;
         task->on_rq = false;
         cpu->runqueue_length--;
+        WARN_ON((long)cpu->runqueue_length < 0);  /* runqueue underflow */
         
         if (cpu->runqueue_head == task) {
+            WARN_ON_ONCE(cpu->runqueue_head == task);  /* dequeued task still at runqueue_head: circular rq_next self-link */
             kprintf("BUG: circular list detected after dequeue pid %d!\n", task->id);
         }
     }
@@ -349,6 +362,7 @@ static void rq_remove(task_t* task) {
     task->rq_next = NULL;
     task->on_rq = false;
     cpu->runqueue_length--;
+    WARN_ON((long)cpu->runqueue_length < 0);  /* rq_remove: runqueue length underflow */
 
     spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
 }
@@ -386,6 +400,7 @@ void sched_enqueue_ready(task_t* task) {
 // ============================================================================
 
 static void task_init_common(task_t* t) {
+    BUG_ON(t == NULL);
     t->next = NULL;
     t->rq_next = NULL;
     t->on_rq = false;
@@ -497,6 +512,9 @@ void sched_init(void) {
 }
 
 task_t* sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t stack_size) {
+    BUG_ON(entry == NULL);
+    BUG_ON(stack_mem == NULL);
+    BUG_ON(stack_size < 128);
     if (!entry || !stack_mem || stack_size < 128) return NULL;
 
     int is_idle = (entry == idle_entry);
@@ -540,6 +558,7 @@ task_t* sched_add_task(task_entry_t entry, void* arg, void* stack_mem, size_t st
 
 task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4,
                             uint64_t user_stack, uint64_t kernel_stack) {
+    BUG_ON(entry == NULL || pml4 == NULL);
     (void)kernel_stack;
     if (!entry || !pml4) return NULL;
 
@@ -571,6 +590,7 @@ task_t* sched_add_user_task(task_entry_t entry, void* arg, uint64_t* pml4,
     t->state = TASK_READY;
     t->privilege = TASK_USER;
     t->id = g_next_id++;
+    WARN_ON_ONCE(g_next_id <= 0);  /* PID counter overflowed: too many tasks created or pid_t wrap-around */
     task_init_common(t);
     t->user_stack_top = user_stack;
     t->kernel_stack_top = k_stack_top;
@@ -678,6 +698,7 @@ void sched_schedule(void) {
     // current_task because the only alternative (e.g. bootstrap, sp=0)
     // was always rejected.
     if (next->sp == 0 || next->state == TASK_ZOMBIE) {
+        WARN_ON(next->state == TASK_ZOMBIE && !is_idle_task(next));  /* zombie dequeued onto CPU */
         if (!is_idle_task(next) && next->state != TASK_ZOMBIE) rq_enqueue_locked(cpu, next);
         next = cpu->idle_task;
         // idle_task might be cur (e.g. idle calling schedule) — handle below

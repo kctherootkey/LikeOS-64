@@ -4,6 +4,7 @@
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/random.h"
+#include "../../include/kernel/bug.h"
 
 // DHCP Message types
 #define DHCP_DISCOVER   1
@@ -67,6 +68,8 @@ static net_device_t* dhcp_bound_dev = NULL;
 static int dhcp_build_packet(net_device_t* dev, uint8_t msg_type,
                               uint32_t requested_ip, uint32_t server_ip,
                               uint8_t* buf, int buflen) {
+    BUG_ON(dev == NULL);
+    BUG_ON(buf == NULL);
     if (buflen < DHCP_FIXED_HDR + 4) return -1;  // need at least header + minimal options
 
     dhcp_packet_t* dhcp = (dhcp_packet_t*)buf;
@@ -216,6 +219,8 @@ static void dhcp_parse_options(const uint8_t* options, int optlen,
 
 // Process received DHCP packet (called from udp_rx for port 68)
 void dhcp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
+    BUG_ON(dev == NULL);
+    BUG_ON(data == NULL);
 
     // Minimum: fixed DHCP header up to (and including) magic_cookie + at least
     // 1 byte of options.
@@ -232,6 +237,7 @@ void dhcp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
     int optlen = (int)len - DHCP_FIXED_HDR;
     if (optlen <= 0) return;
 
+    BUILD_BUG_ON(DHCP_MAGIC_COOKIE != 0x63825363u);  /* RFC 2131 magic cookie constant */
     uint8_t msg_type = 0;
     uint32_t subnet = 0, router = 0, dns = 0, server_id = 0, lease = 0;
     uint32_t t1 = 0, t2 = 0;
@@ -276,6 +282,7 @@ void dhcp_rx(net_device_t* dev, const uint8_t* data, uint16_t len) {
             dev->gateway = router;
             dev->dns_server = dns;
             dhcp_state = DHCP_STATE_BOUND;
+            WARN_ON_ONCE(lease == 0);  /* DHCP ACK with zero lease time */
             dhcp_bound_dev = dev;
             dhcp_lease_seconds = lease ? lease : 3600;
             dhcp_t1_seconds = t1 ? t1 : (dhcp_lease_seconds / 2);

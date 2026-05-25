@@ -5,6 +5,7 @@
 #include "../../include/kernel/tty.h"
 #include "../../include/kernel/vfs.h"
 #include "../../include/kernel/syscall.h"
+#include "../../include/kernel/bug.h"
 
 static task_t* g_shell_task = NULL;
 
@@ -34,6 +35,7 @@ static int shell_spawn(void) {
 }
 
 void shell_init(void) {
+    BUG_ON(tty_get_console() == NULL);  /* shell init: console TTY not ready */
     tty_reset_termios(tty_get_console());
     shell_spawn();
     console_cursor_enable();

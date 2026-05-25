@@ -4,6 +4,7 @@
 
 #include "../../include/kernel/net.h"
 #include "../../include/kernel/console.h"
+#include "../../include/kernel/bug.h"
 
 // IGMPv2 packet
 typedef struct __attribute__((packed)) {
@@ -34,6 +35,7 @@ void igmp_init(void) {
 }
 
 static int igmp_send(net_device_t* dev, uint32_t dst_group, uint8_t type) {
+    BUG_ON(dev == NULL);
     if (!dev) return -1;
     igmp_packet_t pkt;
     pkt.type = type;
@@ -50,6 +52,8 @@ static int igmp_send(net_device_t* dev, uint32_t dst_group, uint8_t type) {
 }
 
 int igmp_join(net_device_t* dev, uint32_t group) {
+    BUG_ON(dev == NULL);
+    WARN_ON((group >> 28) != 0xE);  /* igmp_join: address not in multicast range 224.x.x.x - 239.x.x.x */
     if (!dev || (group >> 28) != 0xE) return -1;
 
     uint64_t flags;
@@ -97,6 +101,8 @@ int igmp_leave(net_device_t* dev, uint32_t group) {
 }
 
 void igmp_rx(net_device_t* dev, uint32_t src_ip, const uint8_t* data, uint16_t len) {
+    BUG_ON(dev == NULL);
+    BUG_ON(data == NULL);
     (void)src_ip;
     if (len < sizeof(igmp_packet_t)) return;
     if (ipv4_checksum(data, len) != 0) return;

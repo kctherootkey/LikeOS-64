@@ -5,6 +5,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/dirent.h"
 #include "../../include/kernel/stat.h"
+#include "../../include/kernel/bug.h"
 
 static const vfs_ops_t* g_root_ops = 0;
 static const vfs_ops_t* g_dev_ops = 0;
@@ -31,26 +32,34 @@ static int vfs_is_root_path(const char* path) {
 }
 
 int vfs_open(const char* path, int flags, vfs_file_t** out) {
+    BUG_ON(path == NULL);
+    BUG_ON(out == NULL);
     if (vfs_is_dev_path(path)) {
         if (!g_dev_ops || !g_dev_ops->open) return ST_UNSUPPORTED;
         int ret = g_dev_ops->open(path, flags, out);
         if (ret == ST_OK && *out) {
+            WARN_ON(*out == NULL);
+            WARN_ON((*out)->ops == NULL);
             (*out)->refcount = 1;
             (*out)->flags = flags;
             (*out)->is_root_dir = 0;
             (*out)->dev_injected = 0;
         }
+        WARN_ON(ret == ST_OK && *out == NULL);
         return ret;
     }
 
     if (!g_root_ops || !g_root_ops->open) return ST_UNSUPPORTED;
     int ret = g_root_ops->open(path, flags, out);
     if (ret == ST_OK && *out) {
+        WARN_ON(*out == NULL);
+        WARN_ON((*out)->ops == NULL);
         (*out)->refcount = 1;
         (*out)->flags = flags;
         (*out)->is_root_dir = vfs_is_root_path(path);
         (*out)->dev_injected = 0;
     }
+    WARN_ON(ret == ST_OK && *out == NULL);
     return ret;
 }
 
@@ -77,6 +86,8 @@ long vfs_write(vfs_file_t* f, const void* buf, long bytes) { if (!f || !f->ops |
 long vfs_seek(vfs_file_t* f, long offset, int whence) { if (!f || !f->ops || !f->ops->seek) return -1; return f->ops->seek(f, offset, whence); }
 
 long vfs_readdir(vfs_file_t* f, void* buf, long bytes) {
+    VM_BUG_ON(f == NULL);
+    VM_BUG_ON(buf == NULL);
     if (!f || !f->ops || !f->ops->readdir) return ST_UNSUPPORTED;
     
     unsigned char* out = (unsigned char*)buf;
@@ -87,6 +98,7 @@ long vfs_readdir(vfs_file_t* f, void* buf, long bytes) {
         // Calculate size for "dev" entry
         unsigned short reclen = (unsigned short)(sizeof(struct linux_dirent64) + 4); // "dev" + null
         reclen = (reclen + 7) & ~7;  // Align to 8 bytes
+        WARN_ON(reclen % 8 != 0);
         
         if (bytes >= reclen) {
             // Build entry in kernel buffer first, then copy to user
@@ -130,10 +142,13 @@ int vfs_mkdir(const char* path, unsigned int mode) { if (!g_root_ops || !g_root_
 int vfs_rmdir(const char* path) { if (!g_root_ops || !g_root_ops->rmdir) return ST_UNSUPPORTED; return g_root_ops->rmdir(path); }
 
 int vfs_close(vfs_file_t* f) {
+    BUG_ON(f == NULL);
      if (!f || !f->ops || !f->ops->close) return ST_INVALID;
     
     // Atomically decrement refcount; only the thread that transitions 1→0 closes
     int old = __sync_fetch_and_sub(&f->refcount, 1);
+    WARN_ON(old < 0);
+    WARN_ON_ONCE(old > 65536);  /* refcount suspiciously large: vfs_dup/vfs_incref without matching vfs_close */
     if (old > 1) {
         return ST_OK;
     }
@@ -142,6 +157,7 @@ int vfs_close(vfs_file_t* f) {
     // If old <= 0, someone already closed this file; undo the decrement and bail.
     if (old <= 0) {
         __sync_fetch_and_add(&f->refcount, 1);  // undo
+        WARN(1, "vfs_close refcount underflow on %p (old=%d)", f, old);
         kprintf("vfs_close: BUG refcount underflow on %p (old=%d)\n", f, old);
         return ST_INVALID;
     }
@@ -152,7 +168,9 @@ int vfs_close(vfs_file_t* f) {
 
 // Duplicate file descriptor - increment refcount
 vfs_file_t* vfs_dup(vfs_file_t* f) {
+    BUG_ON(f == NULL);
     if (!f) return NULL;
+    WARN_ON(f->refcount <= 0);  /* duplicating a file with zero/negative refcount: file was already closed */
 
     __sync_fetch_and_add(&f->refcount, 1);
     return f;
@@ -165,6 +183,7 @@ void vfs_incref(vfs_file_t* f) {
 
 size_t vfs_size(vfs_file_t* f) {
     if (!f) return 0;
+    WARN_ON(f->ops == NULL);
     // vfs_file_t is embedded as the first member of fat32_file_t
     // so we can cast directly (or use fs_private which points to same)
     fat32_file_t* ff = (fat32_file_t*)f;

@@ -10,6 +10,7 @@
 #include "../../include/kernel/interrupt.h"
 #include "../../include/kernel/sched.h"  // For sched_enable_smp()
 #include "../../include/kernel/timer.h"   // For timer_rdtsc()
+#include "../../include/kernel/bug.h"
 
 // ============================================================================
 // External Trampoline Symbols
@@ -114,6 +115,8 @@ void ap_entry(void) {
     // We're now running on an AP in long mode with kernel GDT/IDT
     // Get our CPU ID from the trampoline data
     uint32_t cpu_id = *(volatile uint32_t*)(phys_to_virt(g_ap_trampoline_addr + AP_TRAMPOLINE_CPU_OFFSET));
+    BUG_ON(cpu_id == 0);          /* AP with cpu_id==0 would alias the BSP */
+    BUG_ON(cpu_id >= MAX_CPUS);   /* AP cpu_id out of percpu array bounds */
     
     // Get our APIC ID via CPUID (safe before lapic_init)
     // We use CPUID because LAPIC MMIO access may not be safe until lapic_init()
@@ -253,6 +256,8 @@ void smp_boot_aps(void) {
     uint64_t pml4_phys;
     __asm__ volatile("mov %%cr3, %0" : "=r"(pml4_phys));
     pml4_phys &= 0x000FFFFFFFFFF000ULL;
+    BUG_ON(pml4_phys == 0);
+    BUG_ON(pml4_phys & (PAGE_SIZE - 1));  /* PML4 must be page-aligned */
     
     smp_dbg("SMP: BSP PML4 physical address = 0x%lx\n", pml4_phys);
     
@@ -279,6 +284,7 @@ void smp_boot_aps(void) {
     
     // Start each AP
     acpi_info_t* acpi_info = acpi_get_info();
+    BUG_ON(acpi_info == NULL);
     uint32_t ap_index = 1;  // Skip BSP (index 0)
     
     for (uint32_t i = 0; i < acpi_info->cpu_count && ap_index < g_cpu_count; i++) {
@@ -417,6 +423,7 @@ void smp_barrier_wait(smp_barrier_t* barrier) {
 // ============================================================================
 
 void smp_send_reschedule(uint32_t cpu_id) {
+    WARN_ON(cpu_id >= g_cpu_count);
     if (cpu_id >= g_cpu_count) {
         return;
     }

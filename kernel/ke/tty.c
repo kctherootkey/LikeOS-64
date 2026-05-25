@@ -9,6 +9,7 @@
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/timer.h"
 #include "../../include/kernel/net.h"
+#include "../../include/kernel/bug.h"
 
 #define TTY_MAX_PTYS 16
 
@@ -122,6 +123,7 @@ static void tty_enqueue_read(tty_t* tty, char c) {
     spin_lock_irqsave(&tty_lock, &flags);
 
     if (tty->read_count >= sizeof(tty->read_buf)) {
+        WARN_RATELIMIT(1, "tty_enqueue_read: input dropped (read_buf full, count=%u)", tty->read_count);
         spin_unlock_irqrestore(&tty_lock, flags);
         return;
     }
@@ -137,6 +139,7 @@ static void tty_enqueue_read(tty_t* tty, char c) {
  * and would otherwise self-deadlock the same CPU.  Non-static: also
  * referenced by vt.c (extern declaration there).                       */
 void tty_enqueue_read_locked(tty_t* tty, char c) {
+    lockdep_assert_held(&tty_lock);
     if (tty->read_count >= sizeof(tty->read_buf)) return;
     tty->read_buf[tty->read_tail] = c;
     tty->read_tail = (tty->read_tail + 1) % sizeof(tty->read_buf);
@@ -144,6 +147,7 @@ void tty_enqueue_read_locked(tty_t* tty, char c) {
 }
 
 static int tty_dequeue_read(tty_t* tty, char* out) {
+    BUG_ON(tty == NULL);
     uint64_t flags;
     spin_lock_irqsave(&tty_lock, &flags);
 
@@ -154,11 +158,13 @@ static int tty_dequeue_read(tty_t* tty, char* out) {
     *out = tty->read_buf[tty->read_head];
     tty->read_head = (tty->read_head + 1) % sizeof(tty->read_buf);
     tty->read_count--;
+    WARN_ON((int)tty->read_count < 0);  /* read_count underflow */
 
     spin_unlock_irqrestore(&tty_lock, flags);
     return 1;
 }
 static pty_t* tty_get_pty(int id) {
+    BUG_ON(id < 0 || id >= TTY_MAX_PTYS);
     if (id < 0 || id >= TTY_MAX_PTYS) {
         return NULL;
     }
@@ -184,6 +190,7 @@ static long pty_master_enqueue_bulk(pty_t* pty, const char* buf, long len) {
         pty->m_tail = (pty->m_tail + 1) % PTY_MASTER_BUF_SIZE;
     }
     pty->m_count += to_copy;
+    WARN_ON(pty->m_count > PTY_MASTER_BUF_SIZE);  /* PTY master ring buffer overflow: m_count > buffer capacity */
     spin_unlock_irqrestore(&pty->lock, flags);
     if (to_copy > 0) {
         tty_wake_readers(&pty->master_read_waiters);
@@ -471,6 +478,7 @@ void tty_mouse_report_scroll(int pixel_x, int pixel_y, int scroll_delta) {
 }
 
 void tty_input_char(tty_t* tty, char c, int ctrl) {
+    BUG_ON(tty == NULL);
     if (!tty || c == 0) {
         return;
     }
@@ -991,6 +999,7 @@ long tty_pty_master_read(int id, void* buf, long count, int nonblock) {
         while (pty->m_count > 0 && read < count) {
             char c = pty->master_buf[pty->m_head];
             pty->m_head = (pty->m_head + 1) % PTY_MASTER_BUF_SIZE;
+            WARN_ON(pty->m_head >= PTY_MASTER_BUF_SIZE);  /* m_head wrapped out of ring buffer bounds: modulo arithmetic broken */
             pty->m_count--;
             spin_unlock_irqrestore(&pty->lock, flags);
             /* SMAP-aware write to user buffer (must be done with the lock

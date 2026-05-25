@@ -1,6 +1,7 @@
 // LikeOS-64 Network Rate-Limit Infrastructure
 #include "../../include/kernel/ratelimit.h"
 #include "../../include/kernel/timer.h"
+#include "../../include/kernel/bug.h"
 
 // ============================================================================
 // Global state
@@ -53,6 +54,7 @@ void ratelimit_init(void) {
 // ============================================================================
 
 int net_rl_allow(net_rl_t* rl) {
+    BUG_ON(rl == NULL);
     uint64_t now = timer_ticks();
     uint64_t elapsed = now - rl->last_tick;
     if (elapsed > 0) {
@@ -62,6 +64,7 @@ int net_rl_allow(net_rl_t* rl) {
         if (rl->tokens > rl->burst)
             rl->tokens = rl->burst;
     }
+    WARN_ON(rl->tokens > rl->burst);  /* token bucket exceeded burst limit - replenishment clamping failed */
     if (rl->tokens == 0)
         return 0;
     rl->tokens--;
@@ -73,6 +76,9 @@ int net_rl_allow(net_rl_t* rl) {
 // ============================================================================
 
 void net_rl_src_init(net_rl_src_table_t* t, uint32_t rate_per_tick, uint32_t burst) {
+    BUG_ON(t == NULL);
+    WARN_ON(burst == 0);        /* src ratelimiter with burst==0 will drop every packet from every source */
+    WARN_ON(rate_per_tick == 0); /* src ratelimiter with rate==0: once bucket drains it never replenishes */
     t->rate  = rate_per_tick;
     t->burst = burst;
     for (int i = 0; i < NET_RL_SRC_TABLE_SIZE; i++) {
@@ -84,6 +90,7 @@ void net_rl_src_init(net_rl_src_table_t* t, uint32_t rate_per_tick, uint32_t bur
 }
 
 int net_rl_src_allow(net_rl_src_table_t* t, uint32_t src_ip) {
+    BUG_ON(t == NULL);
     if (src_ip == 0) return 0;
 
     uint64_t now = timer_ticks();
@@ -118,6 +125,7 @@ int net_rl_src_allow(net_rl_src_table_t* t, uint32_t src_ip) {
                 }
             }
         }
+        WARN_ON(slot < 0);  /* LRU eviction found no slot despite non-empty table - NET_RL_SRC_TABLE_SIZE must be > 0 */
         t->entries[slot].src_ip        = src_ip;
         t->entries[slot].last_tick     = now;
         t->entries[slot].tokens        = t->burst;

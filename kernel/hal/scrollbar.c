@@ -5,6 +5,7 @@
 #include "../../include/kernel/fb_optimize.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/bug.h"
 
 #define NULL ((void*)0)
 
@@ -421,6 +422,8 @@ void scrollbar_compute_geometry(scrollbar_t* sb) {
         ty = sb->track_y + (uint32_t)((uint64_t)sb->scroll_position * (uint64_t)track_range / (uint64_t)max_scroll);
     }
     sb->thumb_y = ty;
+    WARN_ON(sb->thumb_y < sb->track_y);  /* thumb_y below track_y: geometry overflow */
+    WARN_ON(sb->thumb_height > 0 && sb->thumb_y + sb->thumb_height > sb->track_y + sb->track_height);  /* thumb extends past track bottom */
 }
 
 void scrollbar_sync_content(scrollbar_t* sb, const scrollbar_content_t* content) {

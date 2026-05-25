@@ -18,6 +18,7 @@
 #include "../../../include/kernel/ioapic.h"
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/timer.h"
+#include "../../../include/kernel/bug.h"
 
 // ============================================================================
 // Supported PCI device IDs
@@ -301,7 +302,9 @@ static int tulip_init_tx(tulip_dev_t* dev) {
 // send / link_status / shutdown
 // ============================================================================
 static int tulip_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
+    BUG_ON(ndev == NULL);
     tulip_dev_t* dev = (tulip_dev_t*)ndev->driver_data;
+    BUG_ON(dev == NULL);
     if (len > TULIP_TX_BUF_SIZE) return -1;
 
     // Serialize across CPUs: tx_cur, descriptor slot, CSR1 poll-demand.
@@ -309,6 +312,7 @@ static int tulip_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     spin_lock_irqsave(&dev->tx_lock, &txflags);
 
     uint16_t slot = dev->tx_cur;
+    WARN_ON(slot >= TULIP_NUM_TX_DESC);  /* tx_cur out of TX ring bounds - wrap logic corrupted */
     volatile tulip_desc_t* desc = &dev->tx_descs[slot];
 
     if (desc->status & TULIP_TDES0_OWN) {
@@ -329,6 +333,7 @@ static int tulip_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     // and ethernet frames are <= 1518, so this never happens in
     // practice — but mask for safety.
     ctrl |= (uint32_t)(tx_len & 0x7FF);      // BS1 (size of buffer 1)
+    WARN_ON(tx_len >= 2048);  /* TDES1.BS1 is 11-bit — length >= 2048 would wrap to 0 and silently drop the frame */
     if (slot == TULIP_NUM_TX_DESC - 1)
         ctrl |= TULIP_TDES1_TER;
     desc->ctrl = ctrl;
@@ -410,6 +415,7 @@ void tulip_irq_handler(void) {
     }
 
     tulip_dev_t* dev = &g_tulip;
+    BUG_ON(dev == NULL);
     uint32_t sr = tulip_csr_read(dev, TULIP_CSR5);
     if (sr == 0) {
         lapic_eoi();
@@ -433,6 +439,7 @@ void tulip_irq_handler(void) {
         // Process all completed RX descriptors
         while (1) {
             uint16_t slot = dev->rx_cur;
+            WARN_RATELIMIT(slot >= TULIP_NUM_RX_DESC, "Tulip: rx_cur=%u out of RX ring bounds (%u) - ring wrap corrupted", slot, TULIP_NUM_RX_DESC);
             volatile tulip_desc_t* desc = &dev->rx_descs[slot];
             if (desc->status & TULIP_RDES0_OWN) break;
 

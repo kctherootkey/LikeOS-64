@@ -18,6 +18,7 @@
 #include "../../include/kernel/skb.h"
 #include "../../include/kernel/softirq.h"
 #include "../../include/kernel/percpu.h"
+#include "../../include/kernel/bug.h"
 
 // Broadcast MAC address
 const uint8_t eth_broadcast_addr[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -47,6 +48,7 @@ int net_register(net_device_t* dev) {
     uint64_t flags;
     spin_lock_irqsave(&net_registry_lock, &flags);
     if (net_device_num >= NET_MAX_DEVICES) {
+        WARN_ON_ONCE(net_device_num >= NET_MAX_DEVICES);  /* NET_MAX_DEVICES exhausted: too many NICs registered */
         spin_unlock_irqrestore(&net_registry_lock, flags);
         return -1;
     }
@@ -175,12 +177,15 @@ static void net_rx_softirq(void) {
 }
 
 void net_rx_packet(net_device_t* dev, const uint8_t* data, uint16_t len) {
+    BUG_ON(dev == NULL);
+    BUG_ON(data == NULL);
     dev->rx_packets++;
     dev->rx_bytes += len;
     if (!rx_queue_inited || len == 0) {
         // Pre-init: drop silently (should not happen after net_init()).
         return;
     }
+    WARN_RATELIMIT(len > 9000, "net_rx_packet: oversized frame len=%u", len);
     sk_buff_t* skb = skb_alloc(len);
     if (!skb) {
         dev->rx_errors++;

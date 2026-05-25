@@ -4,6 +4,7 @@
 #include "../../include/kernel/serial.h"
 #include "../../include/kernel/interrupt.h" // for inb/outb
 #include "../../include/kernel/sched.h"
+#include "../../include/kernel/bug.h"
 
 #define COM1_PORT 0x3F8
 
@@ -88,6 +89,7 @@ static inline void uart_wait_thr_empty(void)
     while((uart_in(UART_LSR) & LSR_THR_EMPTY) == 0) {
         if (--timeout <= 0) {
             // UART seems stuck, give up to prevent hang
+            WARN_RATELIMIT(1, "serial: TX FIFO stuck (LSR=0x%02x)", uart_in(UART_LSR));
             return;
         }
     }
@@ -101,6 +103,7 @@ void serial_write_char(char c)
     if(!g_serial_initialized) {
         serial_init();
     }
+    WARN_ON(!g_serial_available);
     if(!g_serial_available) {
         spin_unlock_irqrestore(&serial_lock, flags);
         return;
@@ -118,6 +121,7 @@ void serial_write_char(char c)
 
 void serial_write(const char* s, uint32_t len)
 {
+    BUG_ON(s == NULL && len > 0);
     uint64_t flags;
     spin_lock_irqsave(&serial_lock, &flags);
 

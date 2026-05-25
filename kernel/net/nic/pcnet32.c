@@ -20,6 +20,7 @@
 #include "../../../include/kernel/ioapic.h"
 #include "../../../include/kernel/acpi.h"
 #include "../../../include/kernel/timer.h"
+#include "../../../include/kernel/bug.h"
 
 // ============================================================================
 // Supported PCI device IDs for the AMD PCnet-PCI family.
@@ -276,7 +277,9 @@ static int pcnet_init_block(pcnet_dev_t* dev) {
 // Send a single Ethernet frame
 // ============================================================================
 static int pcnet_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
+    BUG_ON(ndev == NULL);
     pcnet_dev_t* dev = (pcnet_dev_t*)ndev->driver_data;
+    BUG_ON(dev == NULL);
 
     if (len > PCNET_TX_BUF_SIZE) return -1;
 
@@ -285,6 +288,7 @@ static int pcnet_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     spin_lock_irqsave(&dev->tx_lock, &txflags);
 
     uint16_t slot = dev->tx_cur;
+    WARN_ON(slot >= PCNET_NUM_TX_DESC);  /* tx_cur out of TX ring bounds - ring wrap logic corrupted */
     volatile pcnet_tx_desc_t* desc = &dev->tx_descs[slot];
 
     if (desc->status & TXD_OWN) {
@@ -376,6 +380,7 @@ static void pcnet_shutdown(net_device_t* ndev) {
 // ============================================================================
 static void pcnet_drain_rx(pcnet_dev_t* dev) {
     while (1) {
+        WARN_ON(dev->rx_cur >= PCNET_NUM_RX_DESC);  /* rx_cur out of RX ring bounds - ring wrap logic corrupted */
         volatile pcnet_rx_desc_t* desc = &dev->rx_descs[dev->rx_cur];
         if (desc->status & RXD_OWN)
             break;  // Hardware still owns this descriptor — nothing left
@@ -422,6 +427,7 @@ void pcnet32_irq_handler(void) {
     }
 
     pcnet_dev_t* dev = &g_pcnet;
+    BUG_ON(dev == NULL);
     uint32_t csr0 = pcnet_read_csr(dev, CSR0);
 
     if (!(csr0 & CSR0_INTR)) {
