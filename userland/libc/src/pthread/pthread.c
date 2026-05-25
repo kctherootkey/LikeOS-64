@@ -532,9 +532,22 @@ int pthread_detach(pthread_t thread) {
         return EINVAL;  // Already detached
     }
     
-    // If thread already exited, we should clean up
-    // But we can't safely do that here since we don't know
-    // if the thread is still using its stack
+    // If the thread already exited while still joinable (exited before we
+    // ran the CAS above), pthread_exit didn't enqueue the stack for cleanup.
+    // Now that we own the DETACHED transition we must do it.
+    // Use tid_futex == 0 as the authoritative "kernel has finished with
+    // this thread" signal (CLONE_CHILD_CLEARTID writes 0 on exit).
+    if (tcb->tid_futex == 0 && tcb->stack_base) {
+        __spin_lock(&__thread_list_lock);
+        tcb->prev->next = tcb->next;
+        tcb->next->prev = tcb->prev;
+        if (__thread_list_head == tcb) {
+            __thread_list_head = (tcb->next != tcb) ? tcb->next : NULL;
+        }
+        __spin_unlock(&__thread_list_lock);
+
+        __zombie_stack_add(tcb->stack_base, tcb->stack_size);
+    }
     
     return 0;
 }

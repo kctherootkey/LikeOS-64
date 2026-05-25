@@ -2660,8 +2660,10 @@ int main(int argc, char** argv) {
         ret = pthread_detach(thread);
         test_result("pthread_detach succeeds", ret == 0);
         
-        // Wait for the thread to run using proper sleep
-        usleep(100000);  // 100ms should be plenty of time
+        // Spin-wait with a generous timeout so heavy system load doesn't cause
+        // a false failure (e.g. two parallel teststress instances competing for CPU)
+        for (int waited = 0; g_detached_thread_ran == 0 && waited < 5000000; waited += 10000)
+            usleep(10000);  // 10ms slices, up to 5s total
         
         // Can't join a detached thread, but it should have run
         test_result("detached thread ran", g_detached_thread_ran == 1);

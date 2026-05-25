@@ -113,6 +113,20 @@ _sc_pattern(uint64_t c) {
 
 __attribute__((noreturn, no_stack_protector))
 void __stack_chk_fail(void) {
+    /* MUST be first: at entry, RAX = saved_canary - %fs:0x28 (epilogue
+     * check: mov [slot],%rax; sub %fs:0x28,%rax; jne __stack_chk_fail).
+     * Capture RAX before any syscall clobbers it with a return value.
+     * x86-64 function prologues never modify RAX, so this is safe. */
+    uint64_t canary_diff;
+    __asm__ volatile("mov %%rax, %0" : "=r"(canary_diff));
+
+    /* Expected canary: current %fs:0x28 at time of epilogue check. */
+    uint64_t expected;
+    __asm__ volatile("mov %%fs:0x28, %0" : "=r"(expected));
+
+    /* Actual saved canary (may be corrupted): diff + expected. */
+    uint64_t found = canary_diff + expected;
+
     /* PID / TID via direct syscall. */
     long pid, tid;
     __asm__ volatile("syscall" : "=a"(pid) : "0"(39L)  : "rcx", "r11");
@@ -131,16 +145,6 @@ void __stack_chk_fail(void) {
     uint64_t rsp, rbp;
     __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
     __asm__ volatile("mov %%rbp, %0" : "=r"(rbp));
-
-    /* Expected canary: fs:0x28 (set per-process at exec by the kernel). */
-    uint64_t expected;
-    __asm__ volatile("mov %%fs:0x28, %0" : "=r"(expected));
-
-    /* Found (possibly corrupted) canary: GCC saves it at [caller_rbp - 8]. */
-    uint64_t found = 0;
-    void *caller_frame = __builtin_frame_address(1);
-    if (caller_frame && _sc_is_user((uint64_t)caller_frame))
-        found = *(uint64_t *)((uint8_t *)caller_frame - 8);
 
     _sc_ws("\n*** USERLAND STACK SMASH DETECTED ***\n\n");
 
@@ -162,16 +166,26 @@ void __stack_chk_fail(void) {
     _sc_ws("    RBP: ");
     _sc_whex(rbp);
 
-    _sc_ws("\nExpected Canary:\n");
+    _sc_ws("\nExpected Canary (current %fs:0x28):\n");
     _sc_whex(expected);
 
-    _sc_ws("\nObserved Canary:\n");
+    _sc_ws("\nSaved Canary (stack slot, may be corrupted):\n");
     _sc_whex(found);
 
-    const char *pat = _sc_pattern(found);
-    if (pat) {
-        _sc_ws("\nPossible overflow pattern detected:\n    ");
-        _sc_ws(pat); _sc_ws("\n");
+    /* Diagnosis */
+    if (found == 0 && expected != 0) {
+        _sc_ws("\nDiagnosis: stack slot zeroed — likely buffer overflow with NUL bytes\n");
+    } else if (found != 0 && expected == 0) {
+        _sc_ws("\nDiagnosis: %fs:0x28 is ZERO — FS base was reset/corrupted (TLS bug)\n");
+    } else if (found == expected) {
+        _sc_ws("\nDiagnosis: canaries match — impossible? (diff was non-zero at call site)\n");
+    } else {
+        _sc_ws("\nDiagnosis: canary mismatch — stack corrupted or FS base changed\n");
+        const char *pat = _sc_pattern(found);
+        if (pat) {
+            _sc_ws("Overflow pattern: ");
+            _sc_ws(pat); _sc_ws("\n");
+        }
     }
 
     _sc_ws("\n");

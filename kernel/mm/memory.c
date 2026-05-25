@@ -2919,6 +2919,14 @@ void mm_enable_smep_smap(void) {
     uint64_t cr4;
     __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
     
+    // FSGSBASE: bit 0 of EBX from CPUID, enables CR4 bit 16
+    // Must set this before any WRFSBASE/RDFSBASE use (e.g. task_load_tls),
+    // otherwise #UD fires on CPUs (e.g. VMware) that expose the feature.
+    if (ebx & (1 << 0)) {
+        g_cpu_features_ext |= CPU_FEATURE_FSGSBASE;
+        cr4 |= (1ULL << 16);
+    }
+
     // SMEP: bit 7 of EBX from CPUID, enables CR4 bit 20
     if (ebx & (1 << 7)) {
         cr4 |= (1ULL << 20);
