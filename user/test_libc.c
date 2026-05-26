@@ -1193,7 +1193,8 @@ int main(int argc, char** argv) {
 
     // large write to force multi-cluster
     printf("\n[TEST] large file write (multi-cluster)\n");
-    const char* lpath = "/LARGE.TXT";
+    char lpath[64];
+    snprintf(lpath, sizeof(lpath), "%s/LARGE.TXT", _pbase);
     size_t lsize = 7000;
     char* lbuf = (char*)malloc(lsize);
     if (lbuf) {
@@ -6932,8 +6933,10 @@ network_section:
         int e_sync[2] = {-1, -1};
         pipe(e_sync);
 
-        /* Per-process port so two parallel testlibc instances don't collide. */
-        int tls_eth_port = 23100 + ((int)getpid() % 1000);
+        /* Per-process port so two parallel testlibc instances don't collide.
+         * & 0x3FFF gives 16384 possible values (vs 1000 with % 1000), making
+         * collisions between two PIDs practically impossible. */
+        int tls_eth_port = 23100 + ((int)getpid() & 0x3FFF);
 
         /* Server listening socket bound to INADDR_ANY:tls_eth_port */
         int e_srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -6980,6 +6983,13 @@ network_section:
             { char r = 'R'; write(e_sync[1], &r, 1); }
             close(e_sync[1]);
 
+            /* 30s accept() timeout — prevents the server child from hanging
+             * indefinitely if the client never connects (e.g. port collision
+             * edge case with a parallel instance). */
+            {
+                struct timeval atv = { .tv_sec = 30, .tv_usec = 0 };
+                setsockopt(e_srv, SOL_SOCKET, SO_RCVTIMEO, &atv, sizeof(atv));
+            }
             e_conn = accept(e_srv, NULL, NULL);
             close(e_srv);
             if (e_conn < 0) { p_SSL_CTX_free(sctx); _exit(5); }
@@ -7046,8 +7056,10 @@ network_section:
                 int e_cli = socket(AF_INET, SOCK_STREAM, 0);
                 int e_conn_ok = 0;
                 if (e_cli >= 0) {
-                    /* 30 s receive timeout so a dead server can't hang SSL_connect forever. */
-                    struct timeval rcv_tv = { .tv_sec = 30, .tv_usec = 0 };
+                    /* 120 s receive timeout — two parallel TLS sessions on a
+                     * QEMU VM without hardware crypto (AES-NI=0) can take
+                     * much longer than 30 s for the RSA handshake. */
+                    struct timeval rcv_tv = { .tv_sec = 120, .tv_usec = 0 };
                     setsockopt(e_cli, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
                     struct sockaddr_in ea;
                     memset(&ea, 0, sizeof(ea));

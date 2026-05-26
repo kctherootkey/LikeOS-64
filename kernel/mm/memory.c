@@ -2545,45 +2545,76 @@ bool mm_handle_cow_fault(uint64_t fault_addr) {
     
     // Read refcount under lock for consistent snapshot
     uint16_t refcount = __atomic_load_n(&mm_state.page_refcounts[page_idx], __ATOMIC_ACQUIRE);
-    
-    // ALWAYS copy when PAGE_COW is set — never skip based on refcount.
-    // The old optimization (refcount <= 1 → just make writable) assumed
-    // refcounts are always correct. But if a page's refcount is 0 (e.g.,
-    // page was never refcount-tracked, or a bug), this made a shared COW
-    // page writable without copying, allowing the parent to overwrite the
-    // child's data through the same physical page.
+
+    // SMP RACE FIX: Pin old_phys while still holding the lock.
+    // Between our lock release and the mm_memcpy below, a concurrent
+    // mm_destroy_address_space on another CPU (e.g. a fork-child that is
+    // exec'ing) could decrement old_phys's refcount to 0 and free it.
+    // If old_phys is then reallocated and zeroed as a page-table page, our
+    // subsequent mm_memcpy reads garbage and tmux's new heap page is
+    // corrupted — ultimately causing heap-metadata corruption which can
+    // manifest as a "page not present" fault when a corrupted pointer is
+    // later dereferenced.
+    //
+    // Holding an extra reference ("pin") keeps old_phys alive until we
+    // have finished copying from it.  We release the pin after the copy.
+    if (refcount > 0) {
+        mm_incref_page(old_phys);
+    }
+
     spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
-    
+
     // Allocate a new physical page (outside lock for performance)
     uint64_t new_phys = mm_allocate_physical_page();
     if (!new_phys) {
+        // Undo the pin before returning on failure
+        if (refcount > 0) {
+            if (mm_decref_page(old_phys))
+                mm_free_physical_page(old_phys);
+        }
         kprintf("mm_handle_cow_fault: Failed to allocate new page\n");
         return false;
     }
-    
+
     // Copy contents from old page to new page via direct map.
+    // old_phys is pinned (if refcount > 0), so it cannot be freed concurrently.
     mm_memcpy(phys_to_virt(new_phys), phys_to_virt(old_phys), PAGE_SIZE);
-    
+
     // Update PTE: remove COW, add writable, point to new page, preserve NX bit
     uint64_t flags = (*pte & 0xFFF) & ~PAGE_COW;
     flags |= PAGE_WRITABLE;
     *pte = (*pte & PAGE_NO_EXECUTE) | new_phys | flags;
-    
+
     mm_flush_tlb(page_addr);
-    
-    // Release our reference to the old page, but only if we know it's tracked
-    // and actually shared (refcount >= 1).  If refcount was 0 (tracking bug),
-    // don't decrement — that would underflow and potentially free a page
-    // still mapped by the child.
-    if (refcount >= 1) {
-        if (mm_decref_page(old_phys)) {
+
+    // Release the pin on old_phys (undo the mm_incref_page above).
+    // Track whether this decref itself freed old_phys so we don't
+    // attempt a second free when releasing the COW reference below.
+    bool freed = false;
+    if (refcount > 0) {
+        freed = mm_decref_page(old_phys);
+        if (freed)
             mm_free_physical_page(old_phys);
-        }
     }
-    
+
+    // Release the COW reference to old_phys, unless the pin release
+    // already freed it (which happens when all other sharers decremented
+    // during the copy window, leaving only the pin as the last reference).
+    // Guard with refcount > 0: when refcount was 0 at fault time, old_phys
+    // was already freed by the last child's mm_destroy before the fault even
+    // fired and may have since been reallocated for a different purpose.
+    // Calling mm_free_physical_page on a reallocated page passes the
+    // is_page_allocated check, poisons it with POISON_FREED_PAGE, and
+    // corrupts the new owner — causing cascading page faults and kernel
+    // stack smashes under parallel workloads.
+    if (!freed && refcount > 0) {
+        if (mm_decref_page(old_phys))
+            mm_free_physical_page(old_phys);
+    }
+
     // New page starts with refcount of 0 (private to this process)
     // We don't need to track it until it's shared via fork again
-    
+
     return true;
 }
 
@@ -2649,9 +2680,21 @@ uint64_t* mm_clone_address_space(uint64_t* src_pml4) {
                 if (src_pd[k] & PAGE_SIZE_FLAG) {
                     // 2MB huge page - share with COW if it has user flag
                     if (src_pd[k] & PAGE_USER) {
+                        uint64_t pte_irq = local_irq_save();
+                        uint64_t phys_2mb = src_pd[k] & 0x000FFFFFFFE00000ULL;
                         uint64_t cow_flags = (src_pd[k] & ~PAGE_WRITABLE) | PAGE_COW;
                         src_pd[k] = cow_flags;
                         new_pd[k] = cow_flags;
+                        // Track refcount for 2MB pages exactly like 4KB pages.
+                        // Without this, mm_destroy_address_space on the child
+                        // calls mm_decref_page which sees refcount==0 and frees
+                        // the 2MB physical page while the parent still has it
+                        // mapped — a use-after-free.
+                        if (mm_get_page_refcount(phys_2mb) == 0) {
+                            mm_incref_page(phys_2mb);
+                        }
+                        mm_incref_page(phys_2mb);
+                        local_irq_restore(pte_irq);
                     } else {
                         // Kernel page - just share
                         new_pd[k] = src_pd[k];
@@ -2783,9 +2826,17 @@ uint64_t* mm_clone_address_space_with_shared(uint64_t* src_pml4,
                             new_pd[k] = src_pd[k];
                         } else {
                             // Not shared - use COW
+                            uint64_t pte_irq = local_irq_save();
+                            uint64_t phys_2mb = src_pd[k] & 0x000FFFFFFFE00000ULL;
                             uint64_t cow_flags = (src_pd[k] & ~PAGE_WRITABLE) | PAGE_COW;
                             src_pd[k] = cow_flags;
                             new_pd[k] = cow_flags;
+                            // Fix: track refcount for 2MB COW pages (same as 4KB)
+                            if (mm_get_page_refcount(phys_2mb) == 0) {
+                                mm_incref_page(phys_2mb);
+                            }
+                            mm_incref_page(phys_2mb);
+                            local_irq_restore(pte_irq);
                         }
                     } else {
                         new_pd[k] = src_pd[k];
@@ -3152,18 +3203,23 @@ void mm_incref_page(uint64_t phys_addr) {
 bool mm_decref_page(uint64_t phys_addr) {
     uint64_t idx = page_to_index(phys_addr);
     if (idx == (uint64_t)-1) return false;
-    
-    // Check current value first to avoid underflow
+
+    // Use a CAS loop so the zero-check and the decrement are atomic together.
+    // A plain load+fetch_sub would have a TOCTOU window: two CPUs could both
+    // read current==1, both proceed to fetch_sub, and one would wrap the
+    // uint16_t refcount to 65535, permanently corrupting the count.
     uint16_t current = __atomic_load_n(&mm_state.page_refcounts[idx], __ATOMIC_ACQUIRE);
-    if (current == 0) {
-        // Page was never shared - caller should free it
-        return true;
+    while (current != 0) {
+        if (__atomic_compare_exchange_n(&mm_state.page_refcounts[idx], &current,
+                                        current - 1, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            // CAS succeeded: we decremented from `current` to `current-1`.
+            return current == 1;  // true iff we just cleared the last reference
+        }
+        // CAS failed: `current` was reloaded with the actual value; retry.
     }
-    
-    // Atomically decrement and check if we should free
-    uint16_t old = __atomic_fetch_sub(&mm_state.page_refcounts[idx], 1, __ATOMIC_SEQ_CST);
-    // old was the value before decrement, so if old == 1, new value is 0
-    return old == 1;
+    // current == 0: page was never ref-tracked (private) — caller should free it.
+    return true;
 }
 
 // Get reference count for a physical page (SMP-safe)

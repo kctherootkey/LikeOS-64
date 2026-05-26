@@ -1186,6 +1186,7 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/teststress ::/usr/local/bin/teststress
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/netstress ::/usr/local/bin/netstress
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/openssltest ::/usr/local/bin/openssltest
+	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/bin
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/sh ::/bin/sh
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/ls ::/bin/ls
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/cat ::/bin/cat
@@ -1283,7 +1284,7 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/etc/ssl || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) ports/openssl-3.5.6/apps/openssl.cnf ::/etc/ssl/openssl.cnf
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/etc/ssl/certs || true
-	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/etc/ssl/certs/ca-certificates.crt ::/etc/ssl/certs/ca-certificates.crt and syntax highlighting files
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/etc/ssl/certs/ca-certificates.crt ::/etc/ssl/certs/ca-certificates.crt
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) res/nanorc ::/etc/nanorc
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/usr/share/nano || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) ports/nano-8.3/syntax/*.nanorc ::/usr/share/nano/
