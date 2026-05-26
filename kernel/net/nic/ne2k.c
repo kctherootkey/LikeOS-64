@@ -333,7 +333,6 @@ void ne2k_irq_handler(void) {
     }
 
     ne2k_dev_t* dev = &g_ne2k;
-    BUG_ON(dev == NULL);
 
     // Force page 0 so we can read ISR
     ne_w8(dev, NE_CR, NE_CR_RD_ABORT | NE_CR_STA);

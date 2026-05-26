@@ -999,7 +999,6 @@ long tty_pty_master_read(int id, void* buf, long count, int nonblock) {
         while (pty->m_count > 0 && read < count) {
             char c = pty->master_buf[pty->m_head];
             pty->m_head = (pty->m_head + 1) % PTY_MASTER_BUF_SIZE;
-            WARN_ON(pty->m_head >= PTY_MASTER_BUF_SIZE);  /* m_head wrapped out of ring buffer bounds: modulo arithmetic broken */
             pty->m_count--;
             spin_unlock_irqrestore(&pty->lock, flags);
             /* SMAP-aware write to user buffer (must be done with the lock

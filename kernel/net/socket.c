@@ -62,7 +62,6 @@ static uint16_t alloc_ephemeral_port(void) {
             }
         }
         if (!in_use) {
-            WARN_ON(port < 49152 || port > 65535);  /* ephemeral port out of range */
             return port;
         }
     }
@@ -70,7 +69,6 @@ static uint16_t alloc_ephemeral_port(void) {
     uint16_t port = next_ephemeral_port++;
     if (next_ephemeral_port < 49152)
         next_ephemeral_port = 49152;
-    WARN_ON(port < 49152);  /* fallback port below ephemeral range */
     return port;
 }
 

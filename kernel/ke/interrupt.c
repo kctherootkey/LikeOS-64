@@ -79,8 +79,29 @@ static struct tss_entry tss;  // BSP TSS
 // IST (Interrupt Stack Table) stacks for critical exceptions that need
 // guaranteed separate stacks (double fault, NMI, machine check).
 // These are per-CPU to avoid stack sharing in SMP.
-#define IST_USABLE_SIZE  4096
+//
+// SIZING NOTE: 8 KiB usable (was 4 KiB).  IST stacks have a guard page
+// below their usable region; a #PF on that guard, taken while we are
+// already delivering #DF/NMI/MC, is a "fault during exception delivery"
+// of an exception that is itself routed via the same IST entry — Intel
+// SDM §6.15 escalates this to a shutdown / triple fault, NOT a clean
+// re-dispatch.  Our kernel_oops printer (which #DF reaches under
+// stack-overflow recovery) easily uses ~2 KiB of stack between its own
+// frame, ksnprintf, and oops_pf_decode → kprintf → console_putchar,
+// so a 4 KiB usable region was within one stack-protected nested call
+// chain of triggering the guard.  Bumping to 8 KiB gives every IST
+// handler a comfortable margin while keeping the guard page below for
+// detection of any real runaway.
+//
+// Per-CPU rows are static arrays of IST_TOTAL_SIZE; the row stride
+// MUST be a multiple of PAGE_SIZE so each AP's guard lands on its own
+// 4 KiB PTE.  4096 + 8192 = 12288 = 3·PAGE_SIZE — OK.
+#define IST_USABLE_SIZE  8192
 #define IST_TOTAL_SIZE   (PAGE_SIZE + IST_USABLE_SIZE)
+_Static_assert((IST_TOTAL_SIZE & (PAGE_SIZE - 1)) == 0,
+               "IST_TOTAL_SIZE must be a multiple of PAGE_SIZE so per-AP "
+               "stack rows are page-aligned and guard pages do not "
+               "overlap adjacent CPUs' stacks");
 
 // IST stack assignments:
 //   IST1 = Double Fault (#DF, INT 8)  - CRITICAL: prevents triple fault
@@ -100,8 +121,9 @@ static uint8_t bsp_ist3_stack[IST_TOTAL_SIZE] __attribute__((aligned(PAGE_SIZE))
 static struct tss_entry ap_tss[MAX_CPUS_TSS] __attribute__((aligned(16)));
 static uint8_t ap_interrupt_stacks[MAX_CPUS_TSS][IRQ_TOTAL_SIZE] __attribute__((aligned(PAGE_SIZE)));
 
-// Per-AP IST stacks — IRQ_TOTAL_SIZE = 5*PAGE_SIZE, IST_TOTAL_SIZE = 2*PAGE_SIZE,
-// so every row starts at a page boundary (row stride is a multiple of PAGE_SIZE).
+// Per-AP IST stacks — IRQ_TOTAL_SIZE = 5*PAGE_SIZE, IST_TOTAL_SIZE = 3*PAGE_SIZE
+// (1 guard + 8 KiB usable), so every row starts at a page boundary (the
+// _Static_assert above on IST_TOTAL_SIZE % PAGE_SIZE enforces this).
 static uint8_t ap_ist1_stacks[MAX_CPUS_TSS][IST_TOTAL_SIZE] __attribute__((aligned(PAGE_SIZE)));  // Double Fault
 static uint8_t ap_ist2_stacks[MAX_CPUS_TSS][IST_TOTAL_SIZE] __attribute__((aligned(PAGE_SIZE)));  // NMI
 static uint8_t ap_ist3_stacks[MAX_CPUS_TSS][IST_TOTAL_SIZE] __attribute__((aligned(PAGE_SIZE)));  // Machine Check

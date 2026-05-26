@@ -417,7 +417,6 @@ void e1000_irq_handler(void) {
     }
 
     e1000_dev_t* dev = &g_e1000;
-    BUG_ON(dev == NULL);
     uint32_t icr = e1000_read(dev, E1000_ICR);
     WARN_ON_ONCE(icr == 0xFFFFFFFF);  /* ICR all-ones: MMIO bus error */
 

@@ -1468,14 +1468,38 @@ bool mm_is_page_mapped(uint64_t virtual_addr) {
 // Mark a single 4 KB page not-present.  If it is covered by a 2 MB large
 // mapping, mm_get_page_table(create=true) will split it into 4 KB entries
 // first so only the requested page is affected.
+//
+// When the page was previously present and backed by a physical frame
+// owned by the kernel (this is the case for BSS-static stacks such as
+// interrupt_stack / bsp_ist*_stack / ap_interrupt_stacks / ap_ist*_stacks,
+// whose backing pages were mapped by the bootloader and reserved by
+// reserve_bootloader_mapped_pages()), the unmapped physical page would
+// otherwise leak — there is no other virtual mapping for it once we
+// zero the PTE.  We capture the old phys, complete the TLB shootdown
+// so no CPU still holds a stale translation, and then return the page
+// to the physical allocator.  For never-mapped guard slots (e.g. the
+// guard below a stack created by mm_alloc_guarded_kstack, which is
+// intentionally allocated as one extra unmapped page in the virtual
+// range), the PTE is already zero / non-present and no page is freed.
 void mm_mark_guard_page(uint64_t virt_addr) {
     uint64_t page_va = virt_addr & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t lock_flags;
+    uint64_t old_phys = 0;
 
     spin_lock_irqsave(&mm_kernel_pt_lock, &lock_flags);
     // create=true splits 2 MB pages as needed; we then zero the PTE.
     uint64_t* pte = mm_get_page_table(page_va, true);
     if (pte) {
+        /* If it was a live 4 KiB mapping, remember the backing frame so we
+         * can return it to the allocator AFTER the TLB shootdown completes.
+         * Skip if it's a 2 MiB large page — mm_get_page_table(create=true)
+         * is supposed to have split it, but be defensive: only free 4 KiB
+         * frames so we never accidentally free 2 MiB of unrelated memory.
+         * mm_get_page_table(create=true) returns the PTE, not the PDE, so
+         * a successful return here implies a 4 KiB-granular leaf entry. */
+        if (*pte & PAGE_PRESENT) {
+            old_phys = *pte & PTE_ADDR_MASK;
+        }
         *pte = 0;
     }
     spin_unlock_irqrestore(&mm_kernel_pt_lock, lock_flags);
@@ -1483,6 +1507,16 @@ void mm_mark_guard_page(uint64_t virt_addr) {
     mm_flush_tlb(page_va);
     if (sched_is_smp()) {
         smp_tlb_shootdown_sync();
+    }
+
+    /* The mapping is now gone on every CPU; the physical frame, if any,
+     * is no longer reachable from any virtual address — return it to the
+     * allocator instead of leaking it.  This is called once per guard
+     * page during boot (tss_init, tss_init_ap), so up to ~260 pages on
+     * a fully-populated 64-CPU system; without this each cold boot loses
+     * ~1 MiB to the BSS-backed stack guard pages. */
+    if (old_phys) {
+        mm_free_physical_page(old_phys);
     }
 }
 

@@ -84,12 +84,21 @@ int serial_is_available(void)
 
 static inline void uart_wait_thr_empty(void)
 {
-    /* Busy-wait until THR empty, with timeout to prevent hangs */
+    /* Busy-wait until THR empty, with timeout to prevent hangs.
+     *
+     * IMPORTANT: callers (serial_write_char / serial_write) hold
+     * serial_lock with IRQs disabled across this wait.  Do NOT issue a
+     * WARN/kprintf from inside the timeout branch — kprintf's
+     * console_putchar_unlocked path calls serial_write_char again, which
+     * tries to re-acquire serial_lock on the same CPU and deadlocks
+     * silently (the previous WARN_RATELIMIT here did exactly that, and
+     * was observed as the QEMU "system just freezes with no output"
+     * symptom under heavy load).  Just bail out quietly; a stuck UART is
+     * not worth wedging the kernel over. */
     volatile int timeout = 100000;  // ~1ms at typical CPU speeds
     while((uart_in(UART_LSR) & LSR_THR_EMPTY) == 0) {
         if (--timeout <= 0) {
-            // UART seems stuck, give up to prevent hang
-            WARN_RATELIMIT(1, "serial: TX FIFO stuck (LSR=0x%02x)", uart_in(UART_LSR));
+            // UART seems stuck — give up silently to prevent hang.
             return;
         }
     }
