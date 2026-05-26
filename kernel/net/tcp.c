@@ -1415,6 +1415,13 @@ int tcp_send_data(tcp_conn_t* conn, const uint8_t* data, uint16_t len) {
     uint64_t flags;
     tcp_lock_acquire(&conn->lock, &flags);
 
+    /* TOCTOU re-check: state may have changed to CLOSED by tcp_fail_connection
+     * on another CPU between the unlocked entry check above and here. */
+    if (conn->state != TCP_STATE_ESTABLISHED) {
+        tcp_lock_release(&conn->lock, flags);
+        return -1;
+    }
+
     uint16_t sent = 0;
     uint16_t seg_mss = tcp_effective_mss(conn);
     // Reserve room for TS option (12 bytes after NOP padding) when negotiated

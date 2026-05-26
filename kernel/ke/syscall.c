@@ -47,6 +47,20 @@ static int copy_from_user(void* kernel_dst, const void* user_src, size_t len) {
     if (!kernel_dst || len == 0) {
         return (len == 0) ? 0 : -EFAULT;
     }
+
+    /* Same kill-mid-syscall safety net as in copy_to_user — see the long
+     * comment there.  If the current task can't own user memory (zombied,
+     * exited, or pml4 freed), CR3 holds the kernel-only PML4 and any
+     * dereference of user_src would page-fault into kernel_oops.  Return
+     * -EFAULT so the caller's normal error path runs instead. */
+    {
+        task_t* cur = sched_current();
+        if (!cur || cur->privilege != TASK_USER || cur->pml4 == NULL ||
+            cur->has_exited || cur->state == TASK_ZOMBIE) {
+            return -EFAULT;
+        }
+    }
+
     // Temporarily allow supervisor access to user pages (SMAP bypass)
     smap_disable();
     mm_memcpy(kernel_dst, user_src, len);
@@ -66,6 +80,35 @@ static int copy_to_user(void* user_dst, const void* kernel_src, size_t len) {
     if (!kernel_src || len == 0) {
         return (len == 0) ? 0 : -EFAULT;
     }
+
+    /* Safety net for the "task was killed mid-syscall" race:
+     *
+     * If a user task is SIGKILL'd (or otherwise zombied) while suspended
+     * inside a syscall via sched_schedule(), its pml4 may have been freed
+     * by mm_destroy_address_space() on the killer's CPU.  The scheduler's
+     * switch_address_space() then falls back to g_kernel_pml4 on resume
+     * (cur->pml4 ? cur->pml4 : g_kernel_pml4), so CR3 holds the kernel-only
+     * PML4 with no user mappings.  The original syscall handler still has
+     * the user pointer in registers and calls copy_to_user() — which would
+     * page-fault in kernel mode on a user address (cr2 < kernel base),
+     * with current_task pointing to a kernel-thread fallback so
+     * exception_handler can't even route it to SIGSEGV: that path
+     * matches "kernel-mode + user addr + current_task is kernel thread",
+     * goes to kernel_oops, and we lose the whole system.
+     *
+     * sched_schedule()'s zombie self-check above is the primary guard;
+     * this is a backstop for any path that somehow reaches us with a
+     * current task that can't own user memory (no pml4, exited, or
+     * zombied since the syscall began).  Fail with -EFAULT — the caller
+     * just sees a normal copy failure instead of an oops. */
+    {
+        task_t* cur = sched_current();
+        if (!cur || cur->privilege != TASK_USER || cur->pml4 == NULL ||
+            cur->has_exited || cur->state == TASK_ZOMBIE) {
+            return -EFAULT;
+        }
+    }
+
     // Temporarily allow supervisor access to user pages (SMAP bypass)
     smap_disable();
     mm_memcpy(user_dst, kernel_src, len);
@@ -3227,11 +3270,35 @@ static int64_t sys_nanosleep(uint64_t req_ptr, uint64_t rem_ptr) {
         return -EFAULT;
     }
     
-    // Calculate ticks to sleep using measured timer frequency
+    // Calculate ticks to sleep using measured timer frequency.
+    //
+    // Two boundary corrections vs. the obvious floor division:
+    //
+    //   1. ROUND UP nsec→ticks.  For sub-tick requests (e.g. usleep(1500)
+    //      at 100 Hz) floor gives 0; we'd then clamp to 1 tick which is
+    //      fine, but for requests that fall between tick multiples (e.g.
+    //      15 ms at 100 Hz, floor = 1) the original code returned after
+    //      only 10 ms — less than requested.  Ceiling math fixes that.
+    //
+    //   2. ADD ONE EXTRA TICK to absorb the partial-tick uncertainty at
+    //      the start of the sleep.  timer_ticks() was read at some
+    //      unknown fraction ε ∈ [0, 1 tick) past the most recent timer
+    //      IRQ; the next timer IRQ fires after (1 tick − ε) wall time,
+    //      and subsequent IRQs are 1 tick apart.  Without the +1, a 100
+    //      ms request at 100 Hz could return after as little as 9·10 ms
+    //      = 90 ms of wall time (when ε ≈ 0).  Combined with TSC vs PIT
+    //      calibration drift in clock_gettime, this is why
+    //      "Timer accuracy under CPU load" reports 79 ms for a 100 ms
+    //      usleep and fails the >= 80 ms check.
     uint32_t freq = timer_get_frequency();
-    uint64_t ticks = req.tv_sec * freq + (uint64_t)req.tv_nsec * freq / 1000000000ULL;
-    if (ticks == 0 && (req.tv_sec > 0 || req.tv_nsec > 0)) {
-        ticks = 1;  // At least 1 tick for any non-zero sleep
+    if (freq == 0) freq = 100;
+    uint64_t total_ns = (uint64_t)req.tv_sec * 1000000000ULL + (uint64_t)req.tv_nsec;
+    uint64_t ticks = (total_ns * (uint64_t)freq + 999999999ULL) / 1000000000ULL;
+    if (ticks == 0 && total_ns > 0) {
+        ticks = 1;
+    }
+    if (ticks > 0) {
+        ticks += 1;  // Partial-tick boundary compensation (see comment above).
     }
     
     uint64_t start = timer_ticks();
@@ -6039,11 +6106,23 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2,
     
     int64_t ret = syscall_handler_inner(num, a1, a2, a3, a4, a5);
     
-    // Check for pending signals before returning to userspace
-    // Skip this for exit (task may be gone) and sigreturn (just restored context)
+    // Check for pending signals before returning to userspace.
+    // Skip for:
+    //   * SYS_EXIT       — task is already being torn down.
+    //   * SYS_RT_SIGRETURN — just restored a signal-frame context; another
+    //                        delivery here would clobber it.
+    //   * has_exited / TASK_ZOMBIE — task has already died inside the
+    //     syscall (e.g. SIGKILL from another CPU mid-syscall, or the
+    //     syscall handler called sched_mark_task_exited).  Calling
+    //     signal_deliver on a zombie tripped a WARN_ON at signal.c:619
+    //     and the subsequent code paths there are racy on a half-torn-down
+    //     task.  Just fall through; sched_schedule below will pick the
+    //     next task and we'll never return to userspace.
     if (num != SYS_EXIT && num != SYS_RT_SIGRETURN) {
         cur = sched_current();  // Re-fetch in case of fork
-        if (cur && cur->privilege == TASK_USER && signal_pending(cur)) {
+        if (cur && cur->privilege == TASK_USER &&
+            !cur->has_exited && cur->state != TASK_ZOMBIE &&
+            signal_pending(cur)) {
             // Save syscall return value so sigreturn can restore it
             cur->syscall_rax = (uint64_t)ret;
             signal_deliver(cur);

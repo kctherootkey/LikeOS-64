@@ -467,7 +467,22 @@ static void oops_stack_trace(uint64_t rbp, uint64_t fault_rip) {
     }
 }
 
-/* Decode page-fault error code bits into human-readable form */
+/* Decode page-fault error code bits into human-readable form.
+ *
+ * Walking the page tables here is delicate: CR3 and the next-level table
+ * pointers inside each PTE are PHYSICAL addresses.  The bootloader's
+ * identity mapping is torn down by mm_remove_identity_mapping(), so we
+ * MUST go through the direct map (phys_to_virt) — dereferencing the raw
+ * physical address as a virtual pointer faults, and since we are already
+ * inside the oops handler that recursive #PF turns into an infinite
+ * exception loop (the symptom the user is hitting under SMP stress).
+ *
+ * The direct map covers the first 16 GB of physical RAM.  Page tables
+ * always live inside that range (we allocate them from the kernel page
+ * allocator), but be defensive anyway and bail out if a phys addr falls
+ * outside it — keeping the oops printer working is more important than
+ * decoding the PTE bits.
+ */
 static void oops_pf_decode(uint64_t err, uint64_t cr2) {
     kprintf("  Fault address : 0x%016llx\n", cr2);
     kprintf("  Error code    : 0x%016llx  [%s | %s | %s%s%s]\n",
@@ -477,45 +492,169 @@ static void oops_pf_decode(uint64_t err, uint64_t cr2) {
             (err & 4)  ? "user-mode"            : "kernel-mode",
             (err & 8)  ? " | reserved-bit"      : "",
             (err & 16) ? " | insn-fetch"        : "");
-    /* Describe page permissions from PTE if address is canonical */
-    if (is_kernel_addr(cr2) || cr2 < 0x0000800000000000ULL) {
-        uint64_t cr3;
-        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-        /* Walk PML4 → PDPT → PD → PT to show PTE flags */
-        uint64_t *pml4 = (uint64_t *)(cr3 & ~0xFFFULL);
-        uint64_t idx4  = (cr2 >> 39) & 0x1FF;
-        uint64_t idx3  = (cr2 >> 30) & 0x1FF;
-        uint64_t idx2  = (cr2 >> 21) & 0x1FF;
-        uint64_t idx1  = (cr2 >> 12) & 0x1FF;
-        if (!(pml4[idx4] & 1)) { kprintf("  PML4[%llu]: not present\n", idx4); return; }
-        uint64_t *pdpt = (uint64_t *)(pml4[idx4] & ~0xFFFULL);
-        if (!(pdpt[idx3] & 1)) { kprintf("  PDPT[%llu]: not present\n", idx3); return; }
-        if (pdpt[idx3] & (1ULL<<7)) {
-            kprintf("  1-GB page: PTE=0x%016llx  [%s%s%s%s]\n", pdpt[idx3],
-                    (pdpt[idx3]&1)?"P ":"", (pdpt[idx3]&2)?"W ":"",
-                    (pdpt[idx3]&4)?"U ":"", (pdpt[idx3]&(1ULL<<63))?"NX":"");
-            return;
-        }
-        uint64_t *pd = (uint64_t *)(pdpt[idx3] & ~0xFFFULL);
-        if (!(pd[idx2] & 1)) { kprintf("  PD[%llu]: not present\n", idx2); return; }
-        if (pd[idx2] & (1ULL<<7)) {
-            kprintf("  2-MB page: PTE=0x%016llx  [%s%s%s%s]\n", pd[idx2],
-                    (pd[idx2]&1)?"P ":"", (pd[idx2]&2)?"W ":"",
-                    (pd[idx2]&4)?"U ":"", (pd[idx2]&(1ULL<<63))?"NX":"");
-            return;
-        }
-        uint64_t *pt = (uint64_t *)(pd[idx2] & ~0xFFFULL);
-        uint64_t pte = pt[idx1];
-        kprintf("  PTE[%llu]:   0x%016llx  [%s%s%s%s]\n", idx1, pte,
-                (pte&1)?"P ":"not-present ",
-                (pte&2)?"W ":"RO ",
-                (pte&4)?"U ":"S ",
-                (pte&(1ULL<<63))?"NX":"X");
+
+    /* Only walk canonical addresses; non-canonical CR2 means the access
+     * itself was a GP-fault-style mistake and the page tables have nothing
+     * to say about it. */
+    if (!is_kernel_addr(cr2) && cr2 >= 0x0000800000000000ULL) return;
+
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t pml4_phys = cr3 & ~0xFFFULL;
+    if (!is_phys_in_direct_map(pml4_phys)) {
+        kprintf("  (PML4 phys 0x%016llx outside direct map; skipping PTE walk)\n",
+                pml4_phys);
+        return;
     }
+
+    uint64_t *pml4 = (uint64_t *)phys_to_virt(pml4_phys);
+    uint64_t idx4  = (cr2 >> 39) & 0x1FF;
+    uint64_t idx3  = (cr2 >> 30) & 0x1FF;
+    uint64_t idx2  = (cr2 >> 21) & 0x1FF;
+    uint64_t idx1  = (cr2 >> 12) & 0x1FF;
+
+    if (!(pml4[idx4] & 1)) { kprintf("  PML4[%llu]: not present\n", idx4); return; }
+    uint64_t pdpt_phys = pml4[idx4] & ~0xFFFULL;
+    if (!is_phys_in_direct_map(pdpt_phys)) {
+        kprintf("  PDPT phys 0x%016llx outside direct map\n", pdpt_phys);
+        return;
+    }
+    uint64_t *pdpt = (uint64_t *)phys_to_virt(pdpt_phys);
+
+    if (!(pdpt[idx3] & 1)) { kprintf("  PDPT[%llu]: not present\n", idx3); return; }
+    if (pdpt[idx3] & (1ULL<<7)) {
+        kprintf("  1-GB page: PTE=0x%016llx  [%s%s%s%s]\n", pdpt[idx3],
+                (pdpt[idx3]&1)?"P ":"", (pdpt[idx3]&2)?"W ":"",
+                (pdpt[idx3]&4)?"U ":"", (pdpt[idx3]&(1ULL<<63))?"NX":"");
+        return;
+    }
+    uint64_t pd_phys = pdpt[idx3] & ~0xFFFULL;
+    if (!is_phys_in_direct_map(pd_phys)) {
+        kprintf("  PD phys 0x%016llx outside direct map\n", pd_phys);
+        return;
+    }
+    uint64_t *pd = (uint64_t *)phys_to_virt(pd_phys);
+
+    if (!(pd[idx2] & 1)) { kprintf("  PD[%llu]: not present\n", idx2); return; }
+    if (pd[idx2] & (1ULL<<7)) {
+        kprintf("  2-MB page: PTE=0x%016llx  [%s%s%s%s]\n", pd[idx2],
+                (pd[idx2]&1)?"P ":"", (pd[idx2]&2)?"W ":"",
+                (pd[idx2]&4)?"U ":"", (pd[idx2]&(1ULL<<63))?"NX":"");
+        return;
+    }
+    uint64_t pt_phys = pd[idx2] & ~0xFFFULL;
+    if (!is_phys_in_direct_map(pt_phys)) {
+        kprintf("  PT phys 0x%016llx outside direct map\n", pt_phys);
+        return;
+    }
+    uint64_t *pt = (uint64_t *)phys_to_virt(pt_phys);
+    uint64_t pte = pt[idx1];
+    kprintf("  PTE[%llu]:   0x%016llx  [%s%s%s%s]\n", idx1, pte,
+            (pte&1)?"P ":"not-present ",
+            (pte&2)?"W ":"RO ",
+            (pte&4)?"U ":"S ",
+            (pte&(1ULL<<63))?"NX":"X");
 }
+
+/* Re-entry guards and locking discipline for the oops printer
+ * ============================================================
+ *
+ * What we need from the oops path:
+ *
+ *   (1) Survive recursive faults — a bug inside the printer (e.g. the
+ *       earlier oops_pf_decode that walked page tables via raw physical
+ *       pointers) must not loop forever.
+ *
+ *   (2) Survive concurrent faults on multiple CPUs without garbling
+ *       output and without deadlocking.
+ *
+ *   (3) NEVER block waiting for another CPU.  Other CPUs may be holding
+ *       arbitrary locks (console_lock in particular) when we trigger an
+ *       oops; if we stop them via IPI *before* we print, kprintf will
+ *       deadlock acquiring a lock whose holder is now permanently parked.
+ *       That deadlock is silent (no oops output, no serial, mouse stops)
+ *       and was the actual bug behind "QEMU just hangs".
+ *
+ * The discipline below:
+ *
+ *   * Per-CPU `g_oops_in_progress` short-circuits same-CPU recursion to
+ *     a one-line halt — no further regs/PTE/locks touched.
+ *
+ *   * `g_oops_writer` is a global atomic CAS-claim: only one CPU at a
+ *     time gets to be the active oops printer.  Any other CPU that
+ *     simultaneously oopses spins waiting for the first one to finish.
+ *     (We do this *instead of* halting the others, which is what caused
+ *     the deadlock above.)
+ *
+ *   * Other CPUs are halted only AFTER all printing has completed —
+ *     see the call to smp_halt_others() at the bottom of kernel_oops.
+ *     By then console_lock is no longer needed.
+ *
+ *   * Recursion-safe printer: even the recursive-entry path uses kprintf
+ *     because console_lock itself is recursion-safe via try-acquisition
+ *     semantics in our serial path — at worst the inner line is dropped.
+ */
+static volatile uint32_t g_oops_in_progress[MAX_CPUS];
+static volatile uint32_t g_oops_writer = 0xFFFFFFFFu;   /* CPU id of active printer, or ~0 */
 
 void kernel_oops(const char *reason, uint64_t *regs) {
     __asm__ volatile("cli" ::: "memory");
+
+    /* Determine our CPU id, but don't fault doing it: percpu/GS may not be
+     * set up (early boot) or may itself be the thing that broke. */
+    uint32_t cpu_id_safe = read_gs_base_msr() ? this_cpu_id() : 0;
+    if (cpu_id_safe >= MAX_CPUS) cpu_id_safe = 0;
+
+    if (__atomic_exchange_n(&g_oops_in_progress[cpu_id_safe], 1,
+                            __ATOMIC_ACQ_REL)) {
+        /* Recursive entry on the same CPU — almost certainly a fault
+         * inside our own printers.  Don't try to print anything that
+         * touches regs again; just halt. */
+        kprintf("\n[oops: recursive entry on CPU %u — halting]\n", cpu_id_safe);
+        for (;;) __asm__ volatile("cli; hlt");
+    }
+
+    /* Claim the global oops-writer slot.  Concurrent oopses on other CPUs
+     * spin here until we're done printing; they then take over and print
+     * their own report.  This serialises output WITHOUT halting the other
+     * CPUs first (which would deadlock the printer if they were holding
+     * console_lock).  No timeout — we'd rather wait than print into a
+     * lock that the previous writer still owns.
+     *
+     * Note: this CAS is the ONLY place we synchronise with other CPUs
+     * before printing.  We never call smp_halt_others() here.  Other
+     * CPUs are halted at the very END of kernel_oops, after all kprintf
+     * calls have released console_lock for the last time. */
+    uint32_t expected = 0xFFFFFFFFu;
+    while (!__atomic_compare_exchange_n(&g_oops_writer, &expected,
+                                        cpu_id_safe,
+                                        /* weak */ 0,
+                                        __ATOMIC_ACQ_REL,
+                                        __ATOMIC_RELAXED)) {
+        if (expected == cpu_id_safe) break;   /* shouldn't happen, but be defensive */
+        expected = 0xFFFFFFFFu;
+        __asm__ volatile("pause" ::: "memory");
+    }
+
+    /* Sanity-check regs.  If it isn't a canonical kernel pointer, we
+     * cannot dereference it — print what we can and halt.  This is what
+     * was crashing recursively: the fault inside the page-table walk in
+     * oops_pf_decode caused exception_handler to re-enter kernel_oops
+     * with a regs frame on the new (recursive) fault stack, and at some
+     * point in the cascade the value we read back from -0x90(%rbp) here
+     * was no longer a valid pointer. */
+    if (!regs || !is_kernel_addr((uint64_t)regs)) {
+        kprintf("\n");
+        kprintf("============================================================\n");
+        kprintf("Oops: %s\n", reason ? reason : "kernel exception");
+        kprintf("(regs pointer invalid: %p — cannot decode register frame.\n",
+                (void *)regs);
+        kprintf(" Likely a recursive fault inside the oops handler on CPU %u.)\n",
+                cpu_id_safe);
+        kprintf("============================================================\n");
+        kprintf("System halted.\n");
+        for (;;) __asm__ volatile("cli; hlt");
+    }
 
     uint64_t rip      = regs[REGS_RIP];
     uint64_t rsp      = regs[REGS_RSP];
@@ -606,6 +745,22 @@ void kernel_oops(const char *reason, uint64_t *regs) {
     kprintf("\n============================================================\n");
     kprintf("System halted.\n");
     console_set_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK);
+
+    /* All printing done — NOW safe to stop the other CPUs.  Doing this
+     * earlier would risk console_lock being held by a CPU we just parked,
+     * causing kprintf to deadlock and the system to hang silently.
+     * Best-effort: skip if SMP isn't initialised.  Note we keep this
+     * CPU's oops-writer claim — we are about to halt forever, releasing
+     * it would just let the next faulting CPU print on top of us. */
+    if (sched_is_smp()) {
+        smp_halt_others();
+    }
+
+    /* Halt this CPU.  exception_handler's epilogue will spin on hlt
+     * with IRQs disabled too, but make it explicit here so the function
+     * is self-contained — there are kernel paths that may call
+     * kernel_oops() directly in the future. */
+    for (;;) __asm__ volatile("cli; hlt");
 }
 
 void panic(const char *fmt, ...) {

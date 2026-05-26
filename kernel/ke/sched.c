@@ -787,6 +787,24 @@ void sched_schedule(void) {
         this_cpu()->deferred_zombie = NULL;
     }
     dead_thread_reap();
+
+    // CRITICAL: if we resumed as a task that has since been zombied (e.g.
+    // SIGKILL'd from another CPU while we were blocked mid-syscall, or
+    // sched_mark_task_exited ran on our behalf), DO NOT return to the
+    // caller — the caller is a syscall handler that still holds user
+    // pointers from before the kill, and our pml4 has been freed.
+    // switch_address_space() on the next scheduler entry will set CR3 to
+    // g_kernel_pml4 (NULL pml4 fallback), and any copy_to_user attempt
+    // would fault with cr2 in user space and current_task being us —
+    // an unrecoverable kernel-mode #PF.  Re-enter the scheduler; with
+    // state==ZOMBIE we will be skipped and another task picked.
+    task_t* me = this_cpu()->current_task;
+    if (me && (me->has_exited || me->state == TASK_ZOMBIE)) {
+        for (;;) {
+            sched_schedule();   /* should never return */
+            __asm__ volatile("cli; hlt");
+        }
+    }
 }
 
 // Called from BSP main loop to check if reschedule is needed

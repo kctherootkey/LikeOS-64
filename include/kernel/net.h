@@ -230,7 +230,7 @@ typedef struct __attribute__((packed)) {
 #define TCP_STATE_TIME_WAIT     10
 
 // TCP configuration
-#define TCP_MAX_CONNECTIONS     64
+#define TCP_MAX_CONNECTIONS     128
 #define TCP_WINDOW_SIZE         32768
 #define TCP_MSS                 1460    // Maximum Segment Size
 #define TCP_RX_BUF_SIZE         131072

@@ -1984,14 +1984,17 @@ int main(int argc, char** argv) {
                 test_result("parent got CPU time", parent_cnt > 1000);
 
                     // This is a starvation check, not a strict scheduler benchmark.
-                    // Virtualized environments (especially VirtualBox under load from
-                    // parallel test instances) can produce significant skew, so only
-                    // fail on clearly pathological one-sided CPU distribution.
+                    // Virtualized environments (especially VMware/VirtualBox under
+                    // load from parallel test instances) can produce very large skew
+                    // because host vCPU stealing affects child and parent unequally
+                    // (observed ratios up to ~30 on VMware with two parallel
+                    // teststress instances).  Only fail on clearly pathological
+                    // one-sided CPU distribution, not on virtualization noise.
                     if (child_cnt > 0 && parent_cnt > 0) {
                         unsigned long ratio = (child_cnt > parent_cnt) ?
                                              child_cnt / parent_cnt : parent_cnt / child_cnt;
                         printf("  Fairness ratio: %lu\n", ratio);
-                        test_result("time slice roughly fair", ratio < 20);
+                        test_result("time slice roughly fair", ratio < 50);
                 } else {
                     test_result("time slice roughly fair", 0);
                 }
@@ -6632,10 +6635,12 @@ network_section:
                     int err = p_SSL_get_error ? p_SSL_get_error(ssl, n) : 0;
                     if (err == 2 /* SSL_ERROR_WANT_READ */ ||
                         err == 3 /* SSL_ERROR_WANT_WRITE */) continue;
+                    if (err == 5 /* SSL_ERROR_SYSCALL */ &&
+                        (errno == 11 /* EAGAIN */ || errno == 4 /* EINTR */)) continue;
                     break;
                 }
             }
-            if (total_recv != TLS_DATA_LEN) { p_SSL_free(ssl); p_SSL_CTX_free(sctx); close(conn_fd); _exit(10); }
+            if (total_recv != TLS_DATA_LEN) { p_SSL_shutdown(ssl); p_SSL_free(ssl); p_SSL_CTX_free(sctx); close(conn_fd); _exit(10); }
 
             int total_sent = 0;
             while (total_sent < TLS_DATA_LEN) {
@@ -6646,10 +6651,12 @@ network_section:
                     int err = p_SSL_get_error ? p_SSL_get_error(ssl, n) : 0;
                     if (err == 2 /* SSL_ERROR_WANT_READ */ ||
                         err == 3 /* SSL_ERROR_WANT_WRITE */) continue;
+                    if (err == 5 /* SSL_ERROR_SYSCALL */ &&
+                        (errno == 11 /* EAGAIN */ || errno == 4 /* EINTR */)) continue;
                     break;
                 }
             }
-            if (total_sent != TLS_DATA_LEN) { p_SSL_free(ssl); p_SSL_CTX_free(sctx); close(conn_fd); _exit(11); }
+            if (total_sent != TLS_DATA_LEN) { p_SSL_shutdown(ssl); p_SSL_free(ssl); p_SSL_CTX_free(sctx); close(conn_fd); _exit(11); }
 
             /* Bidirectional TLS shutdown: send our close_notify first,
              * then drain any incoming data/alert until we see EOF or error.
@@ -6709,9 +6716,26 @@ network_section:
                 goto tls_loopback_done;
             }
 
-            int cli_sock = socket(AF_INET, SOCK_STREAM, 0);
+            /* Connect can fail transiently when ksoftirqd/0 is starved under
+             * heavy SMP load from parallel teststress instances — the SYN /
+             * SYN+ACK exchange goes through the loopback rx_queue serviced
+             * exclusively by CPU 0's ksoftirqd, and a single missed window
+             * (TCP retransmit timeout ~15 s) is enough to fail the first
+             * attempt while the server child is still sitting in accept().
+             *
+             * Retry the connect with a fresh socket up to 3 times before
+             * giving up; on each retry sleep briefly to let the kernel
+             * drain its rx_queue.  The server's accept timeout (30 s)
+             * accommodates the full retry window. */
+            int cli_sock = -1;
             int cli_conn_ok = 0;
-            if (cli_sock >= 0) {
+            for (int try = 0; try < 3 && !cli_conn_ok; try++) {
+                if (try > 0) {
+                    if (cli_sock >= 0) { close(cli_sock); cli_sock = -1; }
+                    usleep(200000);  /* 200 ms — give ksoftirqd a chance to drain */
+                }
+                cli_sock = socket(AF_INET, SOCK_STREAM, 0);
+                if (cli_sock < 0) break;
                 /* 120 s receive timeout — two parallel TLS sessions on a
                  * slow VMware VM can take much longer than 30 s under load */
                 struct timeval rcv_tv = { .tv_sec = 120, .tv_usec = 0 };
