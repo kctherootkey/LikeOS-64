@@ -462,6 +462,13 @@ uint32_t xhci_sg_count_trbs(xhci_sg_list_t* sg);
 // Endpoint reset (for error recovery)
 int xhci_reset_endpoint(xhci_controller_t* ctrl, uint8_t slot, uint8_t dci);
 
+/* Clear ctrl->pending_xfer[slot-1][dci] under lock.  Used by the
+ * task-exit lock-recovery path: a task that died inside
+ * xhci_bulk_transfer_in/out leaves a pointer to its (about-to-be-freed)
+ * kernel stack in pending_xfer; the next transfer-completion IRQ would
+ * write through that dangling pointer and oops. */
+void xhci_clear_pending_xfer(xhci_controller_t* ctrl, uint8_t slot, uint8_t dci);
+
 // Extended capability and BIOS handoff
 uint32_t xhci_find_ext_cap(xhci_controller_t* ctrl, uint32_t cap_id, uint32_t start_offset);
 int xhci_bios_handoff(xhci_controller_t* ctrl);

@@ -46,7 +46,10 @@ void xhci_process_events_locked(xhci_controller_t* ctrl) {
 // Safely clear pending_xfer pointer under lock to prevent race with IRQ handler.
 // Must be called before returning from any transfer function to prevent the IRQ
 // handler from writing to a stale stack address.
-static inline void xhci_clear_pending_xfer(xhci_controller_t* ctrl, uint8_t slot, uint8_t dci) {
+// Non-static: the MSD orphan-lock-recovery path also calls this when a task
+// dies inside xhci_bulk_transfer_in/out (which leaves a stack pointer in
+// pending_xfer that will be dangling once the task's kernel stack is freed).
+void xhci_clear_pending_xfer(xhci_controller_t* ctrl, uint8_t slot, uint8_t dci) {
     uint64_t flags;
     WARN_ON(slot == 0 || slot > XHCI_MAX_SLOTS);  /* slot 0 is reserved, slots go 1..XHCI_MAX_SLOTS */
     WARN_ON(dci >= XHCI_MAX_ENDPOINTS);            /* endpoint DCI out of range */
@@ -2615,17 +2618,30 @@ int xhci_bulk_transfer_in(xhci_controller_t* ctrl, usb_device_t* dev,
                 continue;
             }
             
-            // Too many errors or non-retryable error - reset endpoint
-            if (xfer.cc == TRB_CC_STALL || dev->err_count_in >= MAX_SOFT_RETRY) {
-                xhci_dbg("Resetting IN endpoint after CC=%d, err_count=%d\n", 
-                         xfer.cc, dev->err_count_in);
-                xhci_reset_endpoint(ctrl, slot, dci);
-                dev->err_count_in = 0;
-            }
-            
+            /* On ANY non-success return we must reset the endpoint so
+             * the controller drops the orphan TD before the caller
+             * frees the DMA buffer.  Without this, the hardware can
+             * keep fetching the still-queued TRBs and DMA into a
+             * physical page that has been freed and reallocated for
+             * something else (network packet, FAT buffer, dirent
+             * cluster) — corrupting that page with whatever bytes the
+             * USB device subsequently delivers.
+             *
+             * The previous code only reset on STALL or after
+             * MAX_SOFT_RETRY; transaction errors / short-packet /
+             * other contributory CCs returned ST_IO without a reset
+             * and left the TRBs live.  In a 100 MB curl flood
+             * (≈25 000 cluster writes) one such transient error per
+             * download is enough to silently overwrite the /tmp
+             * directory cluster with leaked network/heap content. */
+            xhci_dbg("Resetting IN endpoint after CC=%d, err_count=%d\n",
+                     xfer.cc, dev->err_count_in);
+            xhci_reset_endpoint(ctrl, slot, dci);
+            dev->err_count_in = 0;
+
             return ST_IO;
         }
-        
+
         delay_us(100);  // 100 microsecond delay for ultra-fast response
     }
     
@@ -2670,7 +2686,12 @@ int xhci_bulk_transfer_in(xhci_controller_t* ctrl, usb_device_t* dev,
     kprintf("[XHCI] USBSTS=0x%x USBCMD=0x%x (HCH=%d HSE=%d)\n",
             usbsts, usbcmd, (usbsts >> 0) & 1, (usbsts >> 2) & 1);
     kprintf("[XHCI] ==========================\n");
-    
+
+    /* Timeout: the TD is still live in the ring.  Reset the endpoint
+     * before clearing pending_xfer so the queued TRBs cannot fetch
+     * the caller's about-to-be-freed DMA buffer after we return.
+     * See the matching comment in xhci_bulk_transfer_out. */
+    xhci_reset_endpoint(ctrl, slot, dci);
     xhci_clear_pending_xfer(ctrl, slot, dci);
     return ST_TIMEOUT;
 }
@@ -2732,20 +2753,32 @@ int xhci_bulk_transfer_out(xhci_controller_t* ctrl, usb_device_t* dev,
                 continue;
             }
             
-            // Too many errors or stall - reset endpoint
-            if (xfer.cc == TRB_CC_STALL || dev->err_count_out >= MAX_SOFT_RETRY) {
-                xhci_dbg("Resetting OUT endpoint after CC=%d, err_count=%d\n", 
-                         xfer.cc, dev->err_count_out);
-                xhci_reset_endpoint(ctrl, slot, dci);
-                dev->err_count_out = 0;
-            }
-            
+            /* Same orphan-TRB hazard as the IN side — see the long
+             * comment in xhci_bulk_transfer_in.  Always reset on any
+             * non-success return so the controller can no longer
+             * fetch the queued TRBs that point at the caller's about-
+             * to-be-freed DMA buffer. */
+            xhci_dbg("Resetting OUT endpoint after CC=%d, err_count=%d\n",
+                     xfer.cc, dev->err_count_out);
+            xhci_reset_endpoint(ctrl, slot, dci);
+            dev->err_count_out = 0;
+
             return ST_IO;
         }
-        
+
         delay_us(100);  // 100 microsecond delay for ultra-fast response
     }
-    
+
+    /* Timeout — by definition the controller still considers the TD
+     * live, so the queued TRBs that point at the caller's DMA buffer
+     * are still in the ring.  Reset the endpoint BEFORE clearing
+     * pending_xfer so the caller is safe to free its DMA buffer when
+     * we return.  Without this the freed page can be DMA'd over by
+     * the device when the original transfer eventually moves forward,
+     * corrupting whatever the heap allocator next put at that
+     * physical address (observed as /tmp directory cluster filled
+     * with random bytes after a 100 MB curl download). */
+    xhci_reset_endpoint(ctrl, slot, dci);
     xhci_clear_pending_xfer(ctrl, slot, dci);
     return ST_TIMEOUT;
 }

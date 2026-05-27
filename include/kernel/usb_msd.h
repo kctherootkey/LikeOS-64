@@ -105,6 +105,7 @@ typedef struct usb_msd_device {
     // real hardware, and holding a spinlock with IRQs disabled that long
     // blocks TLB shootdown ACKs and starves other CPUs.
     volatile int io_locked;          // 0 = free, 1 = held
+    volatile uint64_t io_owner;      // task id of holder (-1 = none); for orphan-lock recovery
     spinlock_t   io_wait_lock;       // protects the sleep/wake race
     
     // Block device
@@ -134,6 +135,11 @@ int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,
 // Block device interface callbacks
 int usb_msd_block_read(block_device_t* dev, unsigned long lba, unsigned long count, void* buf);
 int usb_msd_block_write(block_device_t* dev, unsigned long lba, unsigned long count, const void* buf);
+int usb_msd_block_sync(block_device_t* dev);
+int usb_msd_block_release_locks(block_device_t* dev, uint64_t task_id);
+
+/* Force-release this device's I/O mutex if it is currently owned by the given task id. */
+int usb_msd_io_release_if_owner(usb_msd_device_t* msd, uint64_t task_id);
 
 // Global MSD state
 extern usb_msd_device_t* g_msd_devices[8];

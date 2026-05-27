@@ -312,6 +312,20 @@ typedef struct task {
     bool has_exited;            // True when exit() was called
     volatile int exit_lock;     // Atomic guard for sched_mark_task_exited (0=unlocked)
     bool is_fork_child;         // True if this is a newly forked child (should return 0)
+    /* Set by sched_mark_task_exited when invoked from IRQ context (e.g.
+     * signal_deliver_irq dispatching SIG_DFL_TERM from the timer ISR).
+     * The fd-closing loop in that function can call fat32_close →
+     * pagecache_flush_file → fat32_io_lock, which is a SLEEPING mutex —
+     * calling it with IRQs disabled deadlocks the system (observed as
+     * "WARNING: might_sleep() called with IRQs disabled at pagecache.c"
+     * immediately followed by an unresponsive kernel when the user
+     * Ctrl+C's curl during a 100 MB download).
+     *
+     * When this flag is set, sched_mark_task_exited skipped the fd
+     * loop; dead_thread_reap (which runs in process context after the
+     * next context switch) calls task_close_open_files() to finish the
+     * job before sched_remove_task tears the task down. */
+    bool fds_pending_close;
     
     // User mode support
     uint64_t user_stack_top;    // User stack virtual address (for user tasks)

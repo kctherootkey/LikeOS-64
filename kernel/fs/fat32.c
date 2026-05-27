@@ -25,9 +25,10 @@ static spinlock_t fat32_lock = SPINLOCK_INIT("fat32");
 // mutex blocks the calling task via the scheduler with IRQs enabled.
 // The mutex is REENTRANT: the same task can lock it multiple times (e.g.
 // fat32_read holds the outer lock while pagecache_get takes it again internally).
-static volatile int fat32_io_locked = 0;
-static volatile int fat32_io_depth  = 0;      // recursion depth
-static volatile uint64_t fat32_io_owner = (uint64_t)-1;  // owning task id (-1 = none)
+/* Non-static so the debug dump (kernel/ke/sched.c) can print lock state. */
+volatile int fat32_io_locked = 0;
+volatile int fat32_io_depth  = 0;      // recursion depth
+volatile uint64_t fat32_io_owner = (uint64_t)-1;  // owning task id (-1 = none)
 static spinlock_t  fat32_io_wait_lock = SPINLOCK_INIT("fat32_io_wait");
 
 void fat32_io_lock(void) {
@@ -75,6 +76,31 @@ void fat32_io_unlock(void) {
     fat32_io_depth  = 0;
     spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
     sched_wake_channel((void *)&fat32_io_locked);
+}
+
+/* Force-release the FAT32 I/O mutex if it is currently owned by the given
+ * task id.  Used by the task-exit path (vfs_release_locks_for_task →
+ * dead_thread_reap) to recover from a task that was killed mid-FS-write
+ * (e.g. Ctrl+C on curl while inside fat32_write_impl).  Without this
+ * recovery the lock would stay held forever: the dying task can never
+ * call fat32_io_unlock, and every subsequent FS operation (including
+ * execve reading /bin/<cmd>) would block on it.  Confirmed via the
+ * scheduler debug dump: `FAT32 io_lock: held=1 depth=1 owner=<dead-tid>`.
+ * Returns 1 if the lock was released by this call, 0 otherwise. */
+int fat32_io_release_if_owner(uint64_t task_id) {
+    uint64_t flags;
+    int released = 0;
+    spin_lock_irqsave(&fat32_io_wait_lock, &flags);
+    if (fat32_io_locked && fat32_io_owner == task_id) {
+        fat32_io_locked = 0;
+        fat32_io_owner  = (uint64_t)-1;
+        fat32_io_depth  = 0;
+        released = 1;
+    }
+    spin_unlock_irqrestore(&fat32_io_wait_lock, flags);
+    if (released)
+        sched_wake_channel((void *)&fat32_io_locked);
+    return released;
 }
 
 #ifndef FAT32_DEBUG_ENABLED
@@ -498,7 +524,7 @@ static fat32_fs_t g_static_fs; // internal singleton instance
 static unsigned long g_cwd_cluster = 0; // 0 means root
 
 /* Cached free cluster count — avoids scanning the entire FAT every statfs call.
- * Initialised from the FSInfo sector at mount time; kept in sync by alloc/free. 
+ * Initialised from the FSInfo sector at mount time; kept in sync by alloc/free.
  * A value of (unsigned long)-1 means "not yet known, do a full scan once". */
 static unsigned long g_free_cluster_count = (unsigned long)-1;
 static unsigned long g_fsinfo_sector = 0; // absolute LBA of FSInfo sector
@@ -567,23 +593,29 @@ static int fat32_fat_set(fat32_fs_t *fs, unsigned long cluster, uint32_t value)
             return ST_IO;
     }
     
-    /* Update in cache */
+    /* Update in cache, but remember the old value so we can revert it on
+     * disk-write failure — otherwise the in-memory FAT diverges from the
+     * on-disk FAT and subsequent chain walks return clusters that no longer
+     * match what's on disk (silent filesystem corruption from the host's
+     * perspective even though LikeOS's own reads look self-consistent). */
     unsigned long cache_index = cluster - g_fat_cache_start;
     WARN_ON(cache_index >= g_fat_cache_entries);
     uint32_t *fat = (uint32_t *)g_fat_cache;
+    uint32_t old_value = fat[cache_index];
     fat[cache_index] = value & 0x0FFFFFFF;
 
     /* Calculate sector for this FAT entry and write to disk */
     unsigned long fat_byte = cluster * 4;
     unsigned long sector = fat_byte / fs->bytes_per_sector;
     unsigned long lba = fs->part_lba_offset + fs->fat_start_lba + sector;
-    
+
     /* Get the sector data from cache */
     unsigned long cache_sector = (cluster - g_fat_cache_start) * 4 / fs->bytes_per_sector;
     uint8_t *sector_data = ((uint8_t *)g_fat_cache) + cache_sector * fs->bytes_per_sector;
 
     // write updated FAT sector (first FAT)
     if (write_sectors(fs->bdev, lba, 1, sector_data) != ST_OK) {
+        fat[cache_index] = old_value;
         return ST_IO;
     }
 
@@ -591,6 +623,10 @@ static int fat32_fat_set(fat32_fs_t *fs, unsigned long cluster, uint32_t value)
     for (unsigned int f = 1; f < fs->num_fats; ++f) {
         unsigned long lba2 = fs->part_lba_offset + fs->fat_start_lba + (f * fs->fat_size_sectors) + sector;
         if (write_sectors(fs->bdev, lba2, 1, sector_data) != ST_OK) {
+            /* FAT mirrors diverged.  Cache and primary FAT both hold the
+             * new value; leave them — the primary is the authoritative copy
+             * for our reads, and reverting now would diverge the cache from
+             * the primary on disk. */
             return ST_IO;
         }
     }
@@ -617,7 +653,6 @@ static int fat32_alloc_cluster(fat32_fs_t *fs, unsigned long *out_cluster)
         }
         unsigned long next = fat32_next_cluster_cached(fs, c);
         if (next == 0) {
-            /* Found free cluster */
             if (fat32_fat_set(fs, c, 0x0FFFFFFF) != ST_OK)
                 return ST_IO;
             // zero new cluster on disk
@@ -2331,7 +2366,22 @@ int fat32_utimensat(const char* path, int64_t mtime_sec, long mtime_nsec) {
     fat32_io_lock(); int r = fat32_utimensat_impl(path, mtime_sec, mtime_nsec); fat32_io_unlock(); return r;
 }
 
-static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_stat_vfs, fat32_read, fat32_write, fat32_seek, fat32_readdir, fat32_truncate, fat32_unlink, fat32_rename, fat32_mkdir, fat32_rmdir, fat32_chdir, fat32_close };
+static int fat32_release_locks_for_task(uint64_t task_id) {
+    int released = fat32_io_release_if_owner(task_id);
+    /* Also release any per-device block-layer sleeping locks the dying
+     * task may have been holding (nested inside fat32_io_lock — e.g.
+     * usb_msd's io_locked acquired by read_sectors/write_sectors).
+     * Without this, the FAT lock recovers but every subsequent USB I/O
+     * still hangs on the orphaned MSD mutex. */
+    if (g_root_fs && g_root_fs->bdev &&
+        g_root_fs->bdev->release_locks_for_task) {
+        released |= g_root_fs->bdev->release_locks_for_task(
+            (block_device_t*)g_root_fs->bdev, task_id);
+    }
+    return released;
+}
+
+static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_stat_vfs, fat32_read, fat32_write, fat32_seek, fat32_readdir, fat32_truncate, fat32_unlink, fat32_rename, fat32_mkdir, fat32_rmdir, fat32_chdir, fat32_close, fat32_release_locks_for_task };
 
 static int fat32_resolve_parent(unsigned long start_cluster, const char *path,
     unsigned long *parent_cluster, char *name_out, unsigned name_out_len)
@@ -2415,7 +2465,11 @@ static int fat32_set_position(fat32_file_t *ff, unsigned long target_pos)
     }
     unsigned long cluster = ff->start_cluster;
     unsigned long cluster_start = 0;
-    while (cluster_start + cluster_size <= target_pos && target_pos < ff->size) {
+    /* Walk to the cluster containing target_pos.  Do NOT gate on
+     * `target_pos < ff->size`: that bug made set_position(ff, ff->size)
+     * return start_cluster for multi-cluster files (which the write path
+     * relies on when re-deriving after a boundary-aligned exit). */
+    while (cluster_start + cluster_size <= target_pos) {
         unsigned long next = fat32_next_cluster_cached(ff->fs, cluster);
         if (next >= 0x0FFFFFF8 || next == 0) {
             break;
@@ -3127,7 +3181,23 @@ static long fat32_write_impl(vfs_file_t *f, const void *buf, long bytes)
 
     while (remaining) {
         if (ff->current_cluster < 2) {
-            ff->current_cluster = ff->start_cluster;
+            /* Sentinel from a previous boundary-aligned exit (see the
+             * advance block below).  Walk the chain to the cluster that
+             * holds ff->pos, allocating a new cluster if pos is exactly
+             * at the end of the current chain. */
+            unsigned long target_idx = ff->pos / cluster_size;
+            unsigned long cluster = ff->start_cluster;
+            for (unsigned long i = 0; i < target_idx; i++) {
+                unsigned long next = fat32_next_cluster_cached(ff->fs, cluster);
+                if (next >= 0x0FFFFFF8 || next == 0) {
+                    unsigned long newc = 0;
+                    if (fat32_append_cluster(ff->fs, cluster, &newc) != ST_OK)
+                        return written ? (long)written : ST_IO;
+                    next = newc;
+                }
+                cluster = next;
+            }
+            ff->current_cluster = cluster;
         }
         /* BUG GUARD: writing file data to root cluster would corrupt root dir */
         if (ff->current_cluster == g_root_dir_cluster) {
@@ -3190,13 +3260,31 @@ static long fat32_write_impl(vfs_file_t *f, const void *buf, long bytes)
         written += chunk;
         remaining -= chunk;
 
-        if (ff->pos % cluster_size == 0 && remaining > 0) {
+        if (ff->pos % cluster_size == 0) {
+            /* Always advance current_cluster when we cross a cluster boundary,
+             * not only when there is more data in this call.  Otherwise
+             * the next write call enters with ff->pos at the boundary but
+             * ff->current_cluster still pointing at the just-filled cluster
+             * — and the next write at cluster_offset 0 silently overwrites
+             * it.  TLS over FAT32 hit this constantly because TLS records
+             * (16 KiB) are an integer divisor of the typical USB cluster
+             * size (32 KiB), so HTTPS writes regularly land exactly on a
+             * cluster boundary. */
             unsigned long next = fat32_next_cluster_cached(ff->fs, ff->current_cluster);
             if (next >= 0x0FFFFFF8 || next == 0) {
-                unsigned long newc = 0;
-                if (fat32_append_cluster(ff->fs, ff->current_cluster, &newc) != ST_OK)
-                    break;
-                ff->current_cluster = newc;
+                if (remaining > 0) {
+                    unsigned long newc = 0;
+                    if (fat32_append_cluster(ff->fs, ff->current_cluster, &newc) != ST_OK)
+                        break;
+                    ff->current_cluster = newc;
+                } else {
+                    /* Boundary hit at the very end of this write call.
+                     * Don't append a phantom trailing cluster — instead
+                     * mark current_cluster stale so the next write
+                     * re-derives it from ff->pos (extending the chain
+                     * only when there is actual data to write). */
+                    ff->current_cluster = 0;
+                }
             } else {
                 ff->current_cluster = next;
             }

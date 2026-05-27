@@ -4946,11 +4946,22 @@ network_section:
         int server_fd = socket(AF_INET, SOCK_STREAM, 0);
         test_result("tcp loopback: server socket", server_fd >= 0);
 
+        /* PID-based port so two parallel teststress instances do NOT both
+         * bind to the same address+port.  With identical 4-tuples on
+         * 127.0.0.1, the kernel's tcp_find_listener load-balances new
+         * SYNs across both listeners, which is fine for one-way transfers
+         * but the full-duplex echo round-trip below stretches retransmits
+         * under VirtualBox SMP load enough to time out — the symptom is
+         * "[FAIL] recv 4096 bytes / client completed" seen when running
+         * teststress all in two tmux panes.  Using a per-process port
+         * keeps each instance's loopback session strictly isolated. */
+        uint16_t tcp_lb_port = (uint16_t)(20021 + (getpid() & 0x1FF));
+
         if (server_fd >= 0) {
             struct sockaddr_in addr;
             memset(&addr, 0, sizeof(addr));
             addr.sin_family = AF_INET;
-            addr.sin_port = htons(20021);
+            addr.sin_port = htons(tcp_lb_port);
             addr.sin_addr.s_addr = htonl(0x7F000001);
 
             int optval = 1;
@@ -4970,7 +4981,7 @@ network_section:
                         struct sockaddr_in dst;
                         memset(&dst, 0, sizeof(dst));
                         dst.sin_family = AF_INET;
-                        dst.sin_port = htons(20021);
+                        dst.sin_port = htons(tcp_lb_port);
                         dst.sin_addr.s_addr = htonl(0x7F000001);
                         if (connect(client_fd, (struct sockaddr*)&dst, sizeof(dst)) == 0) {
                             char sendbuf[4096];

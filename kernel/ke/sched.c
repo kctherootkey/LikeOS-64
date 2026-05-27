@@ -48,6 +48,7 @@
 #include "../../include/kernel/slab.h"
 #include "../../include/kernel/random.h"
 #include "../../include/kernel/bug.h"
+#include "../../include/kernel/usb_msd.h"
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);
@@ -161,6 +162,74 @@ static inline int is_bootstrap_task(const task_t* t) {
     return t == &g_bootstrap_task;
 }
 
+/* Close every open fd on `task`.  Extracted from sched_mark_task_exited so
+ * the same code can be re-used by dead_thread_reap() when the exit-path
+ * was entered from IRQ context and had to defer the close (see the
+ * fds_pending_close flag in struct task).  Callers MUST be in process
+ * context — vfs_close → fat32_close → pagecache_flush_file may sleep on
+ * the FAT32 sleeping mutex. */
+static void task_close_open_files(task_t* task)
+{
+    if (!task) return;
+    if (task->files) {
+        for (int i = 0; i < TASK_MAX_FDS; i++) {
+            if (task->fd_table[i]) {
+                uint64_t marker = (uint64_t)task->fd_table[i];
+                if (marker >= 1 && marker <= 3) {
+                    /* stdio markers — no refcount */
+                } else if (IS_SOCKET_FD(task->fd_table[i])) {
+                    int idx = SOCKET_FD_IDX(task->fd_table[i]);
+                    sock_close(idx);
+                } else if (IS_UNIX_SOCKET_FD(task->fd_table[i])) {
+                    int ufd = (int)(uintptr_t)task->fd_table[i];
+                    unix_close(ufd);
+                } else if (IS_EPOLL_FD(task->fd_table[i])) {
+                    int idx = EPOLL_FD_IDX(task->fd_table[i]);
+                    extern epoll_instance_t epoll_instances[];
+                    if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
+                        epoll_instances[idx].active = 0;
+                } else if (pipe_is_end(task->fd_table[i])) {
+                    pipe_close_end((pipe_end_t*)task->fd_table[i]);
+                } else {
+                    vfs_close(task->fd_table[i]);
+                }
+                task->fd_table[i] = NULL;
+            }
+        }
+        files_struct_put(task->files);
+        task->files = NULL;
+    } else {
+        for (int i = 0; i < TASK_MAX_FDS; i++) {
+            if (task->fd_table[i]) {
+                uint64_t marker = (uint64_t)task->fd_table[i];
+                if (marker >= 1 && marker <= 3) {
+                    task->fd_table[i] = NULL;
+                } else if (IS_SOCKET_FD(task->fd_table[i])) {
+                    int idx = SOCKET_FD_IDX(task->fd_table[i]);
+                    task->fd_table[i] = NULL;
+                    sock_close(idx);
+                } else if (IS_UNIX_SOCKET_FD(task->fd_table[i])) {
+                    int ufd = (int)(uintptr_t)task->fd_table[i];
+                    task->fd_table[i] = NULL;
+                    unix_close(ufd);
+                } else if (IS_EPOLL_FD(task->fd_table[i])) {
+                    int idx = EPOLL_FD_IDX(task->fd_table[i]);
+                    task->fd_table[i] = NULL;
+                    extern epoll_instance_t epoll_instances[];
+                    if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
+                        epoll_instances[idx].active = 0;
+                } else if (pipe_is_end(task->fd_table[i])) {
+                    pipe_close_end((pipe_end_t*)task->fd_table[i]);
+                    task->fd_table[i] = NULL;
+                } else {
+                    vfs_close(task->fd_table[i]);
+                    task->fd_table[i] = NULL;
+                }
+            }
+        }
+    }
+}
+
 // Queue a dead thread for deferred reaping (called from sched_mark_task_exited)
 static void dead_thread_queue(task_t* task) {
     uint64_t flags;
@@ -194,6 +263,32 @@ static void dead_thread_reap(void) {
     spin_unlock_irqrestore(&g_dead_thread_lock, flags);
 
     for (int i = 0; i < count; i++) {
+        /* If sched_mark_task_exited had to defer fd-closing because it
+         * was called from IRQ context (signal_deliver_irq dispatching
+         * SIG_DFL_TERM from the timer ISR — pagecache_flush_file would
+         * otherwise sleep on the FAT32 mutex with IRQs disabled), do it
+         * now.  dead_thread_reap is called from the scheduling-tail
+         * paths in sched_schedule / sched_run_ready / sched_preempt
+         * after ctx_switch_asm, when we're back on a normal task's
+         * stack with IRQs enabled — sleeping is legal here. */
+        if (batch[i]) {
+            /* If the task was killed while holding a filesystem-private
+             * sleeping lock (e.g. SIGINT on curl while it was sleeping
+             * inside fat32_write_impl, waiting on a USB MSD completion —
+             * confirmed via the debug dump showing
+             * "FAT32 io_lock: held=1 owner=<dead-tid>"), force-release it
+             * BEFORE the deferred fd-close tries to reacquire it.  The
+             * dead owner can never run fat32_io_unlock, so without this
+             * the next fat32_close → pagecache_flush_file blocks forever
+             * and every subsequent FS op (including execve reading
+             * /bin/<cmd>) hangs. */
+            vfs_release_locks_for_task(batch[i]->id);
+
+            if (batch[i]->fds_pending_close) {
+                batch[i]->fds_pending_close = false;
+                task_close_open_files(batch[i]);
+            }
+        }
         sched_remove_task(batch[i]);
     }
 }
@@ -1134,15 +1229,30 @@ void sched_remove_task(task_t* task) {
     // Remove from per-CPU run queue
     if (task->on_rq) rq_remove(task);
 
+    /* If sched_mark_task_exited deferred fd-closing because it was called
+     * from IRQ context (signal_deliver_irq dispatching SIG_DFL_TERM from
+     * the keyboard ISR), do it now.  Without this, the FDs leak forever:
+     * dead_thread_reap only handles thread zombies (exit_signal == 0); a
+     * normal process like curl never goes through it, so its
+     * fds_pending_close flag would be ignored.  Also force-release any
+     * filesystem locks the dying task was holding (e.g. fat32_io_lock
+     * mid-write while sleeping on a USB MSD completion) — otherwise
+     * every subsequent FS op blocks forever on the orphaned mutex. */
+    vfs_release_locks_for_task(task->id);
+    if (task->fds_pending_close) {
+        task->fds_pending_close = false;
+        task_close_open_files(task);
+    }
+
     // Remove from global task list
     uint64_t flags;
     spin_lock_irqsave(&g_task_list_lock, &flags);
     task_list_remove(task);
     spin_unlock_irqrestore(&g_task_list_lock, flags);
 
-    // NOTE: File descriptors are NOT closed here.  sched_mark_task_exited()
-    // already closed all FDs (via files_struct_put or the legacy fd_table
-    // loop) and NULLed the fd_table entries.  Closing them again here would
+    // NOTE: File descriptors are NOT re-closed below.  sched_mark_task_exited()
+    // already closed all FDs in the non-deferred path (or this function did
+    // the deferred close just above).  Closing them again here would
     // double-free pipe ends / vfs_file_t objects whose memory may have been
     // reallocated.  The redundant close was the root cause of SLAB double-free
     // crashes observed on VMware SMP.
@@ -1497,69 +1607,21 @@ void sched_mark_task_exited(task_t* task, int status) {
     // first waits for the task to stop running on ALL CPUs.
     // (task->mm and task->pml4 are intentionally kept alive here.)
     
-    if (task->files) {
-        // Close fd_table entries that were opened AFTER files_struct was created
-        // (those are present in fd_table but NOT in files_struct, so files_struct_put
-        // won't close them).  Entries that WERE copied into files_struct at
-        // CLONE_FILES time have independent references there; our vfs_close here
-        // takes the refcount from 2→1 (the file stays open until files_struct_put
-        // does the final close below).
-        for (int i = 0; i < TASK_MAX_FDS; i++) {
-            if (task->fd_table[i]) {
-                uint64_t marker = (uint64_t)task->fd_table[i];
-                if (marker >= 1 && marker <= 3) {
-                    /* stdio markers — no refcount */
-                } else if (IS_SOCKET_FD(task->fd_table[i])) {
-                    int idx = SOCKET_FD_IDX(task->fd_table[i]);
-                    sock_close(idx);
-                } else if (IS_UNIX_SOCKET_FD(task->fd_table[i])) {
-                    int ufd = (int)(uintptr_t)task->fd_table[i];
-                    unix_close(ufd);
-                } else if (IS_EPOLL_FD(task->fd_table[i])) {
-                    int idx = EPOLL_FD_IDX(task->fd_table[i]);
-                    extern epoll_instance_t epoll_instances[];
-                    if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
-                        epoll_instances[idx].active = 0;
-                } else if (pipe_is_end(task->fd_table[i])) {
-                    pipe_close_end((pipe_end_t*)task->fd_table[i]);
-                } else {
-                    vfs_close(task->fd_table[i]);
-                }
-                task->fd_table[i] = NULL;
-            }
-        }
-        files_struct_put(task->files);
-        task->files = NULL;
+    /* Close all open fds.  CRITICAL: vfs_close on a regular file calls
+     * fat32_close → pagecache_flush_file, which takes the FAT32 sleeping
+     * mutex.  Sleeping is illegal with IRQs disabled — and one of the
+     * paths into this function is signal_deliver_irq dispatching
+     * SIG_DFL_TERM from the timer ISR, where IRQs are off.  Detect that
+     * case by checking the IF flag and defer the close to
+     * dead_thread_reap() (which runs in process context after the next
+     * context switch).  Without this guard, Ctrl+C'ing curl mid-download
+     * deadlocks the kernel with
+     *   "WARNING: might_sleep() called with IRQs disabled at
+     *    kernel/fs/pagecache.c:830 pagecache_flush_file()". */
+    if (irqs_disabled()) {
+        task->fds_pending_close = true;
     } else {
-        // Legacy path: close file descriptors directly
-        for (int i = 0; i < TASK_MAX_FDS; i++) {
-            if (task->fd_table[i]) {
-                uint64_t marker = (uint64_t)task->fd_table[i];
-                if (marker >= 1 && marker <= 3) {
-                    task->fd_table[i] = NULL;
-                } else if (IS_SOCKET_FD(task->fd_table[i])) {
-                    int idx = SOCKET_FD_IDX(task->fd_table[i]);
-                    task->fd_table[i] = NULL;
-                    sock_close(idx);
-                } else if (IS_UNIX_SOCKET_FD(task->fd_table[i])) {
-                    int ufd = (int)(uintptr_t)task->fd_table[i];
-                    task->fd_table[i] = NULL;
-                    unix_close(ufd);
-                } else if (IS_EPOLL_FD(task->fd_table[i])) {
-                    int idx = EPOLL_FD_IDX(task->fd_table[i]);
-                    task->fd_table[i] = NULL;
-                    extern epoll_instance_t epoll_instances[];
-                    if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
-                        epoll_instances[idx].active = 0;
-                } else if (pipe_is_end(task->fd_table[i])) {
-                    pipe_close_end((pipe_end_t*)task->fd_table[i]);
-                    task->fd_table[i] = NULL;
-                } else {
-                    vfs_close(task->fd_table[i]);
-                    task->fd_table[i] = NULL;
-                }
-            }
-        }
+        task_close_open_files(task);
     }
     
     if (task->sighand) {
@@ -1790,8 +1852,8 @@ void sched_dump_tasks(struct tty *tty) {
         }
     }
 
-    tty_printf(tty, " TID  TGID PPID  CPU  State   onRQ  #Th  Ldr  lastRIP           userRIP\n");
-    tty_printf(tty, "----  ---- ----  ---  ------  ----  ---  ---  ----------------  ----------------\n");
+    tty_printf(tty, " TID  TGID PPID  CPU  State   onRQ  #Th  Ldr  lastRIP           userRIP            waitCh\n");
+    tty_printf(tty, "----  ---- ----  ---  ------  ----  ---  ---  ----------------  ----------------  ----------------\n");
 
     /* Snapshot the task list while holding g_task_list_lock, then release
      * before calling tty_printf.  tty_write on a PTY slave calls
@@ -1803,6 +1865,7 @@ void sched_dump_tasks(struct tty *tty) {
     struct {
         int id, tgid, ppid, on_cpu, on_rq, nr_threads;
         uint64_t last_rip, user_rip;
+        void *wait_channel;
         uint8_t state;
         char is_leader, marker;
     } *snaps = slab_alloc((size_t)snap_cap * sizeof(*snaps));
@@ -1825,6 +1888,7 @@ void sched_dump_tasks(struct tty *tty) {
         snaps[nsnaps].last_rip   = t->preempt_frame ? t->preempt_frame->rip : 0;
         snaps[nsnaps].user_rip   = t->syscall_rip;
         snaps[nsnaps].state      = (uint8_t)t->state;
+        snaps[nsnaps].wait_channel = t->wait_channel;
         snaps[nsnaps].is_leader  = (t == t->group_leader) ? 'L' : '-';
         snaps[nsnaps].marker     = (t == cur) ? '*' : ' ';
         nsnaps++;
@@ -1833,12 +1897,35 @@ void sched_dump_tasks(struct tty *tty) {
 
     for (int i = 0; i < nsnaps; i++) {
         const char* sn = (snaps[i].state <= TASK_ZOMBIE) ? state_names[snaps[i].state] : "???";
-        tty_printf(tty, "%c%3d  %4d %4d  %3u  %-6s  %4d  %3d   %c   %016lx  %016lx\n",
+        tty_printf(tty, "%c%3d  %4d %4d  %3u  %-6s  %4d  %3d   %c   %016lx  %016lx  %016lx\n",
                 snaps[i].marker, snaps[i].id, snaps[i].tgid, snaps[i].ppid,
                 snaps[i].on_cpu, sn, snaps[i].on_rq, snaps[i].nr_threads,
-                snaps[i].is_leader, snaps[i].last_rip, snaps[i].user_rip);
+                snaps[i].is_leader, snaps[i].last_rip, snaps[i].user_rip,
+                (uint64_t)snaps[i].wait_channel);
     }
     tty_printf(tty, "=======================================================================\n");
+    /* Show FAT32 I/O lock state — useful to detect orphaned-lock hangs
+     * (e.g., a task killed while holding the mutex). */
+    {
+        extern volatile int      fat32_io_locked;
+        extern volatile int      fat32_io_depth;
+        extern volatile uint64_t fat32_io_owner;
+        tty_printf(tty, "FAT32 io_lock: held=%d depth=%d owner=%lld\n",
+                fat32_io_locked, fat32_io_depth, (long long)fat32_io_owner);
+    }
+    /* Show USB MSD per-device lock states — fat32_io_lock is nested over
+     * msd->io_locked; if curl dies mid-write both can orphan. */
+    {
+        extern usb_msd_device_t* g_msd_devices[8];
+        extern int g_msd_count;
+        for (int mi = 0; mi < g_msd_count && mi < 8; mi++) {
+            usb_msd_device_t* m = g_msd_devices[mi];
+            if (m) {
+                tty_printf(tty, "MSD[%d] io_lock: held=%d owner=%lld\n",
+                        mi, m->io_locked, (long long)m->io_owner);
+            }
+        }
+    }
     slab_free(snaps);
 
     // Dump futex trace ring buffer for debugging missed wakeups

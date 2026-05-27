@@ -141,6 +141,13 @@ int vfs_rename(const char* oldpath, const char* newpath) { if (!g_root_ops || !g
 int vfs_mkdir(const char* path, unsigned int mode) { if (!g_root_ops || !g_root_ops->mkdir) return ST_UNSUPPORTED; return g_root_ops->mkdir(path, mode); }
 int vfs_rmdir(const char* path) { if (!g_root_ops || !g_root_ops->rmdir) return ST_UNSUPPORTED; return g_root_ops->rmdir(path); }
 
+void vfs_release_locks_for_task(uint64_t task_id) {
+    if (g_root_ops && g_root_ops->release_locks_for_task)
+        g_root_ops->release_locks_for_task(task_id);
+    if (g_dev_ops && g_dev_ops->release_locks_for_task)
+        g_dev_ops->release_locks_for_task(task_id);
+}
+
 int vfs_close(vfs_file_t* f) {
     BUG_ON(f == NULL);
      if (!f || !f->ops || !f->ops->close) return ST_INVALID;

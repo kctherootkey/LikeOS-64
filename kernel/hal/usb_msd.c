@@ -370,16 +370,18 @@ int usb_msd_sync(usb_msd_device_t* msd) {
 // the device is busy, keeping IRQs enabled so TLB shootdowns, timer ticks,
 // and other IPIs can still be serviced.
 static void msd_io_lock(usb_msd_device_t* msd) {
+    task_t* cur = sched_current();
+    uint64_t my_id = cur ? cur->id : 0;
     while (1) {
         uint64_t flags;
         spin_lock_irqsave(&msd->io_wait_lock, &flags);
         if (!msd->io_locked) {
             msd->io_locked = 1;
+            msd->io_owner  = my_id;
             spin_unlock_irqrestore(&msd->io_wait_lock, flags);
             return;
         }
         // Device busy — sleep until the holder releases it.
-        task_t* cur = sched_current();
         if (cur) {
             cur->state = TASK_BLOCKED;
             cur->wait_channel = &msd->io_locked;
@@ -393,8 +395,51 @@ static void msd_io_unlock(usb_msd_device_t* msd) {
     uint64_t flags;
     spin_lock_irqsave(&msd->io_wait_lock, &flags);
     msd->io_locked = 0;
+    msd->io_owner  = (uint64_t)-1;
     spin_unlock_irqrestore(&msd->io_wait_lock, flags);
     sched_wake_channel(&msd->io_locked);
+}
+
+/* Force-release this device's I/O mutex if it is currently owned by the
+ * given task id.  Companion to fat32_io_release_if_owner; called when a
+ * task that was killed mid-FS-write may have died while sleeping inside
+ * usb_msd_block_read/write holding both locks.
+ *
+ * Also clears the xHCI pending_xfer entries for this MSD's bulk endpoints:
+ * the dying task may have died inside xhci_bulk_transfer_in/out, leaving
+ * a pointer to its (about-to-be-freed) kernel stack in pending_xfer.
+ * Without this, the next bulk-completion IRQ writes through the dangling
+ * pointer and the kernel oopses with a page fault in
+ * xhci_handle_transfer_event. */
+int usb_msd_io_release_if_owner(usb_msd_device_t* msd, uint64_t task_id) {
+    if (!msd) return 0;
+    uint64_t flags;
+    int released = 0;
+    spin_lock_irqsave(&msd->io_wait_lock, &flags);
+    if (msd->io_locked && msd->io_owner == task_id) {
+        msd->io_locked = 0;
+        msd->io_owner  = (uint64_t)-1;
+        released = 1;
+    }
+    spin_unlock_irqrestore(&msd->io_wait_lock, flags);
+    if (released) {
+        /* Defang any in-flight transfer events for this MSD before the
+         * dying task's kernel stack is freed.  Walk both bulk endpoints
+         * (the only ones we use). */
+        if (msd->ctrl && msd->usb_dev) {
+            uint8_t slot = msd->usb_dev->slot_id;
+            if (msd->usb_dev->bulk_in_ep) {
+                xhci_clear_pending_xfer(msd->ctrl, slot,
+                        msd->usb_dev->bulk_in_ep * 2 + 1);
+            }
+            if (msd->usb_dev->bulk_out_ep) {
+                xhci_clear_pending_xfer(msd->ctrl, slot,
+                        msd->usb_dev->bulk_out_ep * 2);
+            }
+        }
+        sched_wake_channel(&msd->io_locked);
+    }
+    return released;
 }
 
 int usb_msd_block_read(block_device_t* dev, unsigned long lba, unsigned long count, void* buf) {
@@ -468,16 +513,22 @@ int usb_msd_block_write(block_device_t* dev, unsigned long lba, unsigned long co
 
 int usb_msd_block_sync(block_device_t* dev) {
     usb_msd_device_t* msd = (usb_msd_device_t*)dev->driver_data;
-    
+
     if (!msd || !msd->ready) {
         return ST_NO_DEVICE;
     }
-    
+
     // Serialize I/O to this device (sleeping mutex — IRQs stay enabled)
     msd_io_lock(msd);
     int result = usb_msd_sync(msd);
     msd_io_unlock(msd);
     return result;
+}
+
+int usb_msd_block_release_locks(block_device_t* dev, uint64_t task_id) {
+    usb_msd_device_t* msd = (usb_msd_device_t*)dev->driver_data;
+    if (!msd) return 0;
+    return usb_msd_io_release_if_owner(msd, task_id);
 }
 
 //=============================================================================
@@ -494,6 +545,7 @@ int usb_msd_init(usb_msd_device_t* msd, usb_device_t* dev, xhci_controller_t* ct
     
     // Initialize per-device sleeping I/O mutex for SMP safety
     msd->io_locked = 0;
+    msd->io_owner  = (uint64_t)-1;
     spinlock_init(&msd->io_wait_lock, "msd_io_wait");
     
     msd_dbg("Initializing MSD device...\n");
@@ -559,6 +611,7 @@ int usb_msd_init(usb_msd_device_t* msd, usb_device_t* dev, xhci_controller_t* ct
     msd->blk.read = usb_msd_block_read;
     msd->blk.write = usb_msd_block_write;
     msd->blk.sync = usb_msd_block_sync;
+    msd->blk.release_locks_for_task = usb_msd_block_release_locks;
     msd->blk.driver_data = msd;
     
     // Register block device

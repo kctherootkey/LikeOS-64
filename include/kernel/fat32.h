@@ -93,6 +93,10 @@ int fat32_utimensat(const char *path, int64_t mtime_sec, long mtime_nsec);
 extern fat32_fs_t *g_root_fs;
 void fat32_io_lock(void);
 void fat32_io_unlock(void);
+/* If the FAT32 I/O mutex is currently held by the given task id, force-release
+ * it and wake any waiters.  Used by the task-exit path (via the VFS layer) to
+ * recover from a task killed mid-write while inside the FS. */
+int fat32_io_release_if_owner(uint64_t task_id);
 unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster);
 
 #endif // LIKEOS_FAT32_H

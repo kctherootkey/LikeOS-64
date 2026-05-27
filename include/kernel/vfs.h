@@ -28,6 +28,11 @@ typedef struct {
     int (*rmdir)(const char* path);
     int (*chdir)(const char* path);
     int (*close)(vfs_file_t* f);
+    /* Force-release any per-filesystem locks owned by the given task.
+     * Called from the scheduler's dead-thread reaper when a task that was
+     * killed (e.g. via SIGINT) may have died inside a syscall while holding
+     * filesystem-private locks.  Optional; may be NULL. */
+    int (*release_locks_for_task)(uint64_t task_id);
 } vfs_ops_t;
 
 struct vfs_file {
@@ -62,5 +67,10 @@ int vfs_close(vfs_file_t* f);
 size_t vfs_size(vfs_file_t* f);
 vfs_file_t* vfs_dup(vfs_file_t* f);  // Increment refcount and return same pointer
 void vfs_incref(vfs_file_t* f);      // Increment refcount
+
+/* Force-release any filesystem-private locks owned by the given task id.
+ * Used by the scheduler's dead-thread reaper to recover from tasks killed
+ * mid-syscall while holding such locks. */
+void vfs_release_locks_for_task(uint64_t task_id);
 
 #endif // LIKEOS_VFS_H
