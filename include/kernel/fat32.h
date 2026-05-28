@@ -38,6 +38,14 @@ typedef struct {
     int           ra_pages;         // current read-ahead window size
     // Inode cache reference (opaque pointer to avoid header dependency)
     void         *inode;            // ic_inode_t* from icache
+    /* Dirent-update batching.  fat32_write_impl used to call
+     * fat32_update_dirent() (a full read-modify-write of the parent
+     * directory's cluster = ~64 KB of USB traffic) on EVERY write that
+     * extended the file size.  Setting this flag instead defers the
+     * persist to fat32_close (or an explicit fsync) — for a streaming
+     * 100 MB curl/dd download that drops dirent traffic from ~3 GB
+     * back to a single ~32 KB write at close. */
+    int           dirent_dirty;
 } fat32_file_t;
 
 // FAT32 attribute flags

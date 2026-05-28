@@ -575,6 +575,16 @@ $(FAT_IMAGE): $(BUILD_DIR)/openssltest
 $(DATA_IMAGE): $(BUILD_DIR)/openssltest
 usb-write: $(BUILD_DIR)/openssltest
 
+$(BUILD_DIR)/usbtest: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) usbtest
+	cp $(USER_DIR)/usbtest $@
+	$(STRIP) --strip-unneeded $@
+
+# Extra dependency declarations so usbtest is built before images
+$(FAT_IMAGE): $(BUILD_DIR)/usbtest
+$(DATA_IMAGE): $(BUILD_DIR)/usbtest
+usb-write: $(BUILD_DIR)/usbtest
+
 $(BUILD_DIR)/uname: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) uname
 	cp $(USER_DIR)/uname $@
@@ -1105,6 +1115,7 @@ $(FAT_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/teststress ::/usr/local/bin/teststress
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/netstress ::/usr/local/bin/netstress
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/openssltest ::/usr/local/bin/openssltest
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/usbtest ::/usr/local/bin/usbtest
 	MTOOLS_SKIP_CHECK=1 mmd -i $(FAT_IMAGE) ::/lib || true
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/ld-likeos.so ::/lib/ld-likeos.so
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(FAT_IMAGE) $(BUILD_DIR)/libc.so ::/lib/libc.so
@@ -1186,6 +1197,7 @@ $(DATA_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD_DIR)/user_test.elf $(BUIL
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/teststress ::/usr/local/bin/teststress
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/netstress ::/usr/local/bin/netstress
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/openssltest ::/usr/local/bin/openssltest
+	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/usbtest ::/usr/local/bin/usbtest
 	MTOOLS_SKIP_CHECK=1 mmd -i $(DATA_IMAGE) ::/bin
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/sh ::/bin/sh
 	MTOOLS_SKIP_CHECK=1 mcopy -i $(DATA_IMAGE) $(BUILD_DIR)/ls ::/bin/ls
@@ -1531,6 +1543,7 @@ usb-write: $(ISO_IMAGE) $(BUILD_DIR)/sh $(BUILD_DIR)/ls $(BUILD_DIR)/cat $(BUILD
 	sudo cp $(BUILD_DIR)/teststress /tmp/likeos_usb_mount/usr/local/bin/teststress
 	sudo cp $(BUILD_DIR)/netstress /tmp/likeos_usb_mount/usr/local/bin/netstress
 	sudo cp $(BUILD_DIR)/openssltest /tmp/likeos_usb_mount/usr/local/bin/openssltest
+	sudo cp $(BUILD_DIR)/usbtest /tmp/likeos_usb_mount/usr/local/bin/usbtest
 	sudo cp $(BUILD_DIR)/ld-likeos.so /tmp/likeos_usb_mount/lib/ld-likeos.so
 	sudo cp $(BUILD_DIR)/libc.so /tmp/likeos_usb_mount/lib/libc.so
 	sudo cp $(BUILD_DIR)/ncurses.so /tmp/likeos_usb_mount/lib/ncurses.so
