@@ -27,16 +27,16 @@ static spinlock_t msd_lock = SPINLOCK_INIT("usb_msd");
 usb_msd_device_t* g_msd_devices[8] = {0};
 int g_msd_count = 0;
 
-// Memory helpers
-static void msd_memset(void* dst, int val, size_t n) {
-    uint8_t* p = (uint8_t*)dst;
-    while (n--) *p++ = (uint8_t)val;
+// Memory helpers — forward to the rep-movs-backed kernel routines so big
+// DMA-buffer copies (up to 128 KB per BOT transfer) don't go through a
+// byte-at-a-time loop.  At ~30 MB/s a 64 KB byte-loop adds ~2 ms per
+// transfer — i.e. it was its own bottleneck on the curl-download path.
+static inline void msd_memset(void* dst, int val, size_t n) {
+    mm_memset(dst, val, n);
 }
 
-static void msd_memcpy(void* dst, const void* src, size_t n) {
-    uint8_t* d = (uint8_t*)dst;
-    const uint8_t* s = (const uint8_t*)src;
-    while (n--) *d++ = *s++;
+static inline void msd_memcpy(void* dst, const void* src, size_t n) {
+    mm_memcpy(dst, src, n);
 }
 
 static int msd_strlen(const char* s) {
@@ -425,9 +425,23 @@ int usb_msd_io_release_if_owner(usb_msd_device_t* msd, uint64_t task_id) {
     if (released) {
         /* Defang any in-flight transfer events for this MSD before the
          * dying task's kernel stack is freed.  Walk both bulk endpoints
-         * (the only ones we use). */
+         * (the only ones we use).  Clearing pending_xfer alone is not
+         * enough — the xHCI still has the dead task's TRBs queued on the
+         * endpoint ring and will not advance to subsequent TRBs until
+         * they complete.  Reset each endpoint to drop the orphan TD and
+         * reposition the dequeue pointer so the NEXT bulk_transfer call
+         * (typically by `echo`/curl run after the killed curl) can
+         * actually make progress instead of timing out. */
         if (msd->ctrl && msd->usb_dev) {
             uint8_t slot = msd->usb_dev->slot_id;
+            /* Clear pending_xfer FIRST so any in-flight transfer-event
+             * IRQ harmlessly skips the write (no dangling-pointer fault).
+             * Don't call xhci_reset_endpoint here: with an endpoint in
+             * RUNNING state and the controller still draining queued
+             * TRBs, the Reset EP command can time out — and the next
+             * bulk_transfer's own error path already calls
+             * xhci_reset_endpoint() when it sees the orphan TRBs cause
+             * a transaction error.  We just need to defang the IRQ. */
             if (msd->usb_dev->bulk_in_ep) {
                 xhci_clear_pending_xfer(msd->ctrl, slot,
                         msd->usb_dev->bulk_in_ep * 2 + 1);
@@ -452,15 +466,16 @@ int usb_msd_block_read(block_device_t* dev, unsigned long lba, unsigned long cou
     // Serialize I/O to this device (sleeping mutex — IRQs stay enabled)
     msd_io_lock(msd);
     
-    // Read in 64KB chunks (128 sectors) — matches the SCSI READ_10 limit
-    // and the upper-layer MAX_SECTORS_PER_READ for optimal USB throughput.
+    // Read in 128 KB chunks (256 sectors) — large enough to amortize the
+    // CBW + CSW round-trip overhead per SCSI READ_10/WRITE_10 transaction
+    // while staying within typical mm_allocate_contiguous_pages limits.
     uint8_t* ptr = (uint8_t*)buf;
     unsigned long remaining = count;
     unsigned long current_lba = lba;
     int result = ST_OK;
     
     while (remaining > 0) {
-        unsigned long chunk = (remaining > 128) ? 128 : remaining;
+        unsigned long chunk = (remaining > 256) ? 256 : remaining;
         
         int st = usb_msd_read(msd, (uint32_t)current_lba, (uint32_t)chunk, ptr);
         if (st != ST_OK) {
@@ -494,7 +509,7 @@ int usb_msd_block_write(block_device_t* dev, unsigned long lba, unsigned long co
     int result = ST_OK;
     
     while (remaining > 0) {
-        unsigned long chunk = (remaining > 128) ? 128 : remaining;
+        unsigned long chunk = (remaining > 256) ? 256 : remaining;
         
         int st = usb_msd_write(msd, (uint32_t)current_lba, (uint32_t)chunk, ptr);
         if (st != ST_OK) {

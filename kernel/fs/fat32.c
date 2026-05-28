@@ -3227,29 +3227,72 @@ static long fat32_write_impl(vfs_file_t *f, const void *buf, long bytes)
             smap_enable();
             pagecache_mark_dirty(pg);
         } else {
-            // Page not cached — do a direct read-modify-write to disk.
-            // (We don't populate the cache on writes to avoid excessive memory
-            //  use for write-only workloads.)
-            void *tmp = kalloc(cluster_size);
+            /* Page not cached — write to disk.  Touch ONLY the sectors that
+             * this chunk lands in, not the entire cluster.  Previous code did
+             * a full-cluster read-modify-write on every 4 KiB user write,
+             * which for a 32 KiB cluster amplified 100 MiB of curl writes
+             * into >1.6 GiB of USB traffic (8 KB read + 32 KB write per 4 KB
+             * user write).  By writing only the affected sectors, an aligned
+             * 4 KiB user write becomes a single 4 KiB sector-batch write
+             * with no preceding read — a ~16× reduction in USB transfers
+             * for streaming downloads. */
+            unsigned sector_size = ff->fs->bytes_per_sector;
+            unsigned first_sector = cluster_offset / sector_size;
+            unsigned last_byte    = cluster_offset + chunk;
+            unsigned last_sector  = (last_byte + sector_size - 1) / sector_size;
+            unsigned num_sectors  = last_sector - first_sector;
+            unsigned head_off     = cluster_offset % sector_size;
+            int head_partial = (head_off != 0);
+            int tail_partial = (last_byte % sector_size) != 0;
+            /* Compute, per-side, whether the partial bytes lie WITHIN the
+             * current file (and therefore must be preserved with a read)
+             * or PAST current EOF (and may be safely zero-filled).  The
+             * previous broad `appending = pos+chunk>size` check was wrong
+             * for partial-sector writes where the head bytes [sector_start,
+             * cluster_offset) live BELOW pos and were already written by
+             * an earlier write — zero-filling them silently overwrote that
+             * data (caught by the writev/readv testcase: write 1 places
+             * "Hello, " at [0..7); write 2 at offset 7 saw head_partial
+             * true and zeroed bytes [0..7), trashing "Hello, "). */
+            unsigned long file_offset_first =
+                (unsigned long)(ff->pos - cluster_offset) +
+                (unsigned long)first_sector * sector_size;
+            unsigned long file_offset_last_sec =
+                (unsigned long)(ff->pos - cluster_offset) +
+                (unsigned long)(last_sector - 1) * sector_size;
+            int head_in_file = head_partial && file_offset_first < ff->size;
+            int tail_in_file = tail_partial && file_offset_last_sec < ff->size;
+            unsigned long base_lba =
+                cluster_to_lba(ff->fs, ff->current_cluster) + first_sector;
+            unsigned tmp_bytes = num_sectors * sector_size;
+
+            void *tmp = kalloc(tmp_bytes);
             if (!tmp) {
                 return written ? (long)written : ST_NOMEM;
             }
 
-            if (read_sectors(ff->fs->bdev,
-                cluster_to_lba(ff->fs, ff->current_cluster),
-                ff->fs->sectors_per_cluster, tmp) != ST_OK) {
-                kfree(tmp);
-                return written ? (long)written : ST_IO;
+            if (head_in_file || tail_in_file) {
+                /* At least one partial-sector edge lies within existing
+                 * file data — read the sector range to preserve it. */
+                if (read_sectors(ff->fs->bdev, base_lba, num_sectors, tmp) != ST_OK) {
+                    kfree(tmp);
+                    return written ? (long)written : ST_IO;
+                }
+            } else if (head_partial || tail_partial) {
+                /* Partial sectors but the gaps are past EOF — zero so the
+                 * on-disk content is well-defined (visible if the file
+                 * later grows). */
+                mm_memset(tmp, 0, tmp_bytes);
             }
+            /* Fully-aligned case (no partial sectors): the upcoming memcpy
+             * fills every byte of tmp; no read or memset needed. */
 
             smap_disable();
-            mm_memcpy(((uint8_t *)tmp) + cluster_offset,
+            mm_memcpy(((uint8_t *)tmp) + head_off,
                       ((const uint8_t *)buf) + written, chunk);
             smap_enable();
 
-            if (write_sectors(ff->fs->bdev,
-                cluster_to_lba(ff->fs, ff->current_cluster),
-                ff->fs->sectors_per_cluster, tmp) != ST_OK) {
+            if (write_sectors(ff->fs->bdev, base_lba, num_sectors, tmp) != ST_OK) {
                 kfree(tmp);
                 return written ? (long)written : ST_IO;
             }

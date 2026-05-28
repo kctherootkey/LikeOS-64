@@ -554,12 +554,16 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
     
     // Calculate how much virtual memory we need to map
     // Must cover:
-    //   - Kernel code/data: ~1-2MB
-    //   - Kernel heap: 8MB
-    //   - Physical page bitmap: total_pages/8 bytes (e.g. 500KB for 16GB RAM)
-    //   - Page refcount array: total_pages*2 bytes (e.g. 8MB for 16GB RAM)
-    // For 16GB RAM, need ~18MB. For 32GB+, need more. Use 64MB to be safe.
-    UINT64 min_virtual_size = 64 * 1024 * 1024; // 64MB
+    //   - Kernel code/data/BSS (BSS includes static arrays like
+    //     tcp_connections[] — at 128 conns × 128 inflight segs × 1480 B
+    //     ≈ 24 MB, plus other per-conn ring buffers, BSS alone is ~70 MB)
+    //   - Kernel heap: 8 MB
+    //   - Physical page bitmap: total_pages/8 bytes (e.g. 500 KB for 16 GB RAM)
+    //   - Page refcount array: total_pages*2 bytes (e.g. 8 MB for 16 GB RAM)
+    // Use 128 MB to give plenty of headroom — 64 MB was just barely large
+    // enough for the previous BSS and overflowed the moment the TCP inflight
+    // ring grew, leaving the bitmap (placed at heap_end) unmapped.
+    UINT64 min_virtual_size = 128 * 1024 * 1024; // 128 MB
     UINT64 total_pages_needed = min_virtual_size / 4096; // Convert to 4KB pages
     
     Print(L"Mapping %lu MB (%lu pages) of virtual memory starting at 0x%lx...\r\n", 

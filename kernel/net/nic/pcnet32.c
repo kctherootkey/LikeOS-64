@@ -301,10 +301,9 @@ static int pcnet_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     // Pad short frames to 60 bytes (chip's auto-pad covers this too, but
     // doing it in software is cheap and works regardless of CSR4 settings).
     uint16_t tx_len = (len < 60) ? 60 : len;
-    for (uint16_t i = 0; i < len; i++)
-        dev->tx_bufs[slot][i] = data[i];
-    for (uint16_t i = len; i < tx_len; i++)
-        dev->tx_bufs[slot][i] = 0;
+    // rep movs — was a byte loop under tx_lock IRQs-off.
+    mm_memcpy(dev->tx_bufs[slot], data, len);
+    if (tx_len > len) mm_memset(dev->tx_bufs[slot] + len, 0, tx_len - len);
 
     desc->tbadr = (uint32_t)dev->tx_bufs_phys[slot];
     desc->bcnt = (int16_t)(-(int32_t)tx_len);   // ones-complement of length

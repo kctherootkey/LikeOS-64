@@ -353,9 +353,9 @@ static int vmxnet3_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     uint16_t slot = dev->tx_prod;
     vmxnet3_tx_desc_t* td = &dev->tx_ring[slot];
 
-    // Copy payload into the slot buffer
-    for (uint16_t i = 0; i < len; i++) dev->tx_bufs[slot][i] = data[i];
-    for (uint16_t i = len; i < out_len; i++) dev->tx_bufs[slot][i] = 0;
+    // Copy payload into the slot buffer (rep movs — was a byte loop)
+    mm_memcpy(dev->tx_bufs[slot], data, len);
+    if (out_len > len) mm_memset(dev->tx_bufs[slot] + len, 0, out_len - len);
 
     td->addr = dev->tx_bufs_phys[slot];
     // val1 (LE bitfields, low->high): len[0:13] | gen[14] | rsvd[15] |

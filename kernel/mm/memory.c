@@ -690,8 +690,10 @@ void mm_initialize_physical_memory(uint64_t memory_size) {
     mm_state.total_pages = (mm_state.memory_end - mm_state.memory_start) / PAGE_SIZE;
     mm_state.bitmap_size = PAGE_ALIGN((mm_state.total_pages + 7) / 8);
     
-    // Place bitmap in kernel virtual space (after heap)
-    // The bootloader mapped 32MB of virtual space starting at kernel_end
+    // Place bitmap in kernel virtual space (after heap).
+    // The bootloader maps min_virtual_size (currently 128 MB) of virtual
+    // space starting at the kernel base — must cover BSS + heap + bitmap
+    // + page refcount array.
     mm_state.physical_bitmap = (uint32_t*)(heap_start_virt + KERNEL_HEAP_SIZE);
     
     kprintf("  Memory range: 0x%lx - 0x%lx (%lu MB)\n", 

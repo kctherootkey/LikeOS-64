@@ -1,54 +1,86 @@
 #include "../../include/string.h"
 #include "../../include/stdlib.h"
 #include "../../include/errno.h"
+#include "../../include/stdint.h"
+
+/* String-primitive replacements: previously these were the obvious
+ * byte-at-a-time C loops.  EVERY userspace program (OpenSSL's TLS record
+ * processing, libcurl's buffer shuffling, libc's stdio buffering,
+ * printf/sprintf, fread/fwrite) goes through these — and a streaming
+ * 100 MB curl download hits them tens of millions of times.  Compared to
+ * a `rep movsb`/`rep stosb` (1-2 cycles per cache line on any modern x86
+ * via ERMSB), the byte-loop is ~10x slower AND defeats the CPU's
+ * store-buffer / write-combining.  This single change was the single
+ * biggest factor in the 300 KB/s ceiling we'd been chasing through the
+ * TCP stack and USB write path. */
 
 void* memcpy(void* dest, const void* src, size_t n) {
-    unsigned char* d = dest;
-    const unsigned char* s = src;
-    while (n--) {
-        *d++ = *s++;
-    }
-    return dest;
+    void* ret = dest;
+    __asm__ volatile (
+        "rep movsb"
+        : "+D"(dest), "+S"(src), "+c"(n)
+        :
+        : "memory"
+    );
+    return ret;
 }
 
 void* memmove(void* dest, const void* src, size_t n) {
-    unsigned char* d = dest;
-    const unsigned char* s = src;
-    
-    if (d < s) {
-        while (n--) {
-            *d++ = *s++;
-        }
+    void* ret = dest;
+    if ((uintptr_t)dest < (uintptr_t)src || (uintptr_t)dest >= (uintptr_t)src + n) {
+        /* No overlap, or dest is below src — forward copy is safe. */
+        __asm__ volatile (
+            "rep movsb"
+            : "+D"(dest), "+S"(src), "+c"(n)
+            :
+            : "memory"
+        );
     } else {
-        d += n;
-        s += n;
-        while (n--) {
-            *--d = *--s;
-        }
+        /* Overlapping with dest > src — copy backward. */
+        unsigned char* d = (unsigned char*)dest + n - 1;
+        const unsigned char* s = (const unsigned char*)src + n - 1;
+        __asm__ volatile (
+            "std\n\t"
+            "rep movsb\n\t"
+            "cld"
+            : "+D"(d), "+S"(s), "+c"(n)
+            :
+            : "memory"
+        );
     }
-    return dest;
+    return ret;
 }
 
 void* memset(void* s, int c, size_t n) {
-    unsigned char* p = s;
-    while (n--) {
-        *p++ = (unsigned char)c;
-    }
-    return s;
+    void* ret = s;
+    unsigned long val = (unsigned char)c;
+    __asm__ volatile (
+        "rep stosb"
+        : "+D"(s), "+c"(n)
+        : "a"(val)
+        : "memory"
+    );
+    return ret;
 }
 
 int memcmp(const void* s1, const void* s2, size_t n) {
+    if (n == 0) return 0;
+    /* `repe cmpsb` stops on the first mismatch or when ecx reaches 0.
+     * After it stops, ZF indicates equality; *(rdi-1) and *(rsi-1) are the
+     * last bytes compared. */
     const unsigned char* p1 = s1;
     const unsigned char* p2 = s2;
-    
-    while (n--) {
-        if (*p1 != *p2) {
-            return *p1 - *p2;
-        }
-        p1++;
-        p2++;
-    }
-    return 0;
+    int result;
+    __asm__ volatile (
+        "repe cmpsb"
+        : "+D"(p1), "+S"(p2), "+c"(n)
+        :
+        : "memory", "cc"
+    );
+    if (n == 0 && *(p1 - 1) == *(p2 - 1))
+        return 0;
+    result = (int)*(p1 - 1) - (int)*(p2 - 1);
+    return result;
 }
 
 void* memchr(const void* s, int c, size_t n) {

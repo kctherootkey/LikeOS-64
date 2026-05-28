@@ -193,7 +193,10 @@ void net_rx_packet(net_device_t* dev, const uint8_t* data, uint16_t len) {
     }
     skb->dev = dev;
     uint8_t* p = skb_append(skb, len);
-    for (uint16_t i = 0; i < len; i++) p[i] = data[i];
+    /* rep-movs-backed bulk copy — was a byte-at-a-time loop running in
+     * hard-IRQ context per packet, costing ~1500 dependent stores at
+     * IRQ-disabled time per frame and capping receive packet rate. */
+    mm_memcpy(p, data, len);
     // Hardware NIC RX: funnel to NET_RX_CPU's queue/ksoftirqd so a
     // single CPU processes all incoming wire packets in arrival order.
     skb_queue_tail(&rx_queue[NET_RX_CPU], skb);
@@ -231,7 +234,7 @@ static int loopback_send(net_device_t* dev, const uint8_t* data, uint16_t len) {
     }
     skb->dev = dev;
     uint8_t* p = skb_append(skb, len);
-    for (uint16_t i = 0; i < len; i++) p[i] = data[i];
+    mm_memcpy(p, data, len);
     // Use NET_RX_CPU (same queue as NIC RX) so that loopback segments from
     // a sender that migrates CPUs across preemption points always land in
     // the same FIFO queue in send order.  Per-CPU queues broke ordering when

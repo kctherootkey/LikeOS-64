@@ -231,16 +231,34 @@ typedef struct __attribute__((packed)) {
 
 // TCP configuration
 #define TCP_MAX_CONNECTIONS     128
-#define TCP_WINDOW_SIZE         32768
+/* Initial advertised receive window — placed in the unscaled 16-bit
+ * window field of SYN/SYN+ACK (RFC 7323 §2.2 forbids window scaling
+ * before the handshake completes), and as the seed for conn->rcv_wnd
+ * before tcp_advertised_window() takes over.  Use the max 16-bit value
+ * so the peer's initial slow-start has full headroom up to the actual
+ * RX buffer size; after the handshake, WSCALE makes our effective
+ * window even larger. */
+#define TCP_WINDOW_SIZE         65535
 #define TCP_MSS                 1460    // Maximum Segment Size
-#define TCP_RX_BUF_SIZE         131072
+#define TCP_RX_BUF_SIZE         131072  // Initial per-conn RX ring (grows on demand)
+/* Max size the per-conn RX ring can grow to via auto-tuning.  Throughput
+ * is BDP-capped at rx_buf_size / RTT — at 481 ms RTT (e.g. VMware NAT to
+ * a transcontinental peer) 128 KB caps at ~280 KB/s while 2 MB raises
+ * the ceiling to ~4.2 MB/s.  Only connections that actually hit the
+ * window grow this large; idle conns keep the 128 KB initial buffer. */
+#define TCP_RX_BUF_MAX          (2 * 1024 * 1024)
 #define TCP_TX_BUF_SIZE         131072
 #define TCP_RETRANSMIT_TICKS    200     // 2 seconds at 100Hz
 #define TCP_TIME_WAIT_TICKS     6000    // 60 seconds
 #define TCP_MAX_RETRANSMITS     5
 #define TCP_SYN_RETRANSMIT_TICKS 300    // 3 seconds
 #define TCP_MAX_OPTIONS         40
-#define TCP_MAX_INFLIGHT        32
+/* Maximum un-ACKed segments per connection.  The previous value of 32
+ * hard-capped throughput at ~32 * MSS / RTT independent of cwnd or peer
+ * window — i.e. at a 30 ms RTT the absolute ceiling was ~1.5 MB/s, far
+ * below the BDP for any modern broadband link.  128 segments × 1460 B
+ * × (1 / 30 ms) ≈ 6 MB/s sustained for a transcontinental download. */
+#define TCP_MAX_INFLIGHT        128
 
 // TCP options
 #define TCP_OPT_END             0
@@ -391,6 +409,7 @@ typedef struct tcp_conn {
     uint32_t cwnd;              // Congestion window (in segments)
     uint32_t ssthresh;          // Slow-start threshold (segments)
     uint32_t dup_acks;          // Duplicate ACK counter (fast retransmit)
+    uint32_t ca_ack_counter;    // Per-conn congestion-avoidance ack counter (1/cwnd per ACK)
     uint32_t total_retrans;
 
     // TCP_NODELAY / Nagle

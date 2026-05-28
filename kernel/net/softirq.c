@@ -46,11 +46,16 @@ void softirq_raise_on(uint32_t cpu, uint32_t nr) {
     WARN_RATELIMIT(nr >= NR_SOFTIRQ, "softirq nr %u out of range (max %u)", nr, NR_SOFTIRQ);
     if (nr >= NR_SOFTIRQ || cpu >= MAX_CPUS) return;
     __atomic_fetch_or(&softirq_pending_mask[cpu], (1u << nr), __ATOMIC_ACQ_REL);
-    // sched_wake_channel works cross-CPU; the target CPU's scheduler will
-    // pick up the runnable ksoftirqd on its next preemption.  Latency is at
-    // most one scheduler tick (10 ms at 100 Hz), but the IRQ-tail drain on
-    // any CPU also picks up bits from cpu==target if it later runs there.
+    /* Wake ksoftirqd on the target CPU and force a reschedule there.
+     * Without the IPI, ksoftirqd just sits in the target CPU's run queue
+     * until the next 10 ms timer tick picks it up — which throttles
+     * network RX to ~100 pkt/s (the agent's analysis identified this
+     * as a primary cause of the 300 KB/s ceiling).  The IPI makes the
+     * target CPU exit halt/userspace immediately and run the scheduler. */
     softirq_wake_local(cpu);
+    if (cpu != safe_cpu_id() && smp_is_enabled()) {
+        smp_send_reschedule(cpu);
+    }
 }
 
 // Returns the previous IF state (1 if IRQs were enabled, 0 otherwise) and

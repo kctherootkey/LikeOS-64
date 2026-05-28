@@ -150,9 +150,8 @@ static int rtl_init_rx(rtl8139_dev_t* dev) {
     dev->rx_buf_phys = phys;
     dev->rx_offset = 0;
 
-    // Zero the buffer
-    for (uint32_t i = 0; i < RTL8139_RX_BUF_TOTAL; i++)
-        dev->rx_buf[i] = 0;
+    // Zero the buffer (rep stos — was a byte loop).
+    mm_memset(dev->rx_buf, 0, RTL8139_RX_BUF_TOTAL);
 
     // Point hardware at it
     rtl_write32(dev, RTL_RBSTART, (uint32_t)phys);
@@ -217,9 +216,8 @@ static int rtl8139_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
         return -1;
     }
 
-    // Copy payload into the slot buffer
-    for (uint16_t i = 0; i < len; i++)
-        dev->tx_bufs[slot][i] = data[i];
+    // Copy payload into the slot buffer (rep movs — was a byte loop).
+    mm_memcpy(dev->tx_bufs[slot], data, len);
 
     uint16_t tx_len = (len < 60) ? 60 : len;
 

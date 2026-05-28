@@ -1571,12 +1571,25 @@ void sched_mark_task_exited(task_t* task, int status) {
     exit_robust_list(task);
     
     // Handle clear_child_tid (CLONE_CHILD_CLEARTID)
-    // This writes 0 to the address and wakes any futex waiters
+    // This writes 0 to the address and wakes any futex waiters.
     if (task->clear_child_tid) {
-        smap_disable();
-        *(volatile int*)task->clear_child_tid = 0;
-        smap_enable();
-        
+        /* The write is to a USER-SPACE address in the dying task's
+         * address space.  sched_mark_task_exited can be called
+         * cross-CPU (e.g. SIGINT from the keyboard IRQ on CPU 0
+         * killing a curl thread that lives in a different mm on
+         * CPU 5).  In that case the current CPU's CR3 is the
+         * sender's (or the kernel) PML4 and the user address is
+         * not mapped — writing it page-faults the kernel.
+         * mm_user_addr_mapped uses current CR3, so it correctly
+         * reports false in the cross-CPU case and we skip the write.
+         * pthread_join still wakes via futex_wake_for_task below
+         * (which uses the dying task's PML4 to compute the key). */
+        if (mm_user_addr_mapped((uint64_t)task->clear_child_tid, sizeof(int))) {
+            smap_disable();
+            *(volatile int*)task->clear_child_tid = 0;
+            smap_enable();
+        }
+
         // Wake any threads waiting on this futex (pthread_join uses this).
         // Use futex_wake_for_task with the dying task's PML4, because
         // sched_mark_task_exited can be called cross-CPU (e.g. SIGKILL

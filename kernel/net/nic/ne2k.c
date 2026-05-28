@@ -182,8 +182,8 @@ static int ne2k_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
     // CRC bytes for us).  Assemble in a small stack buffer.
     uint8_t buf[1518];
     uint16_t out_len = (len < 60) ? 60 : len;
-    for (uint16_t i = 0; i < len; i++) buf[i] = data[i];
-    for (uint16_t i = len; i < out_len; i++) buf[i] = 0;
+    mm_memcpy(buf, data, len);
+    if (out_len > len) mm_memset(buf + len, 0, out_len - len);
 
     // Serialize across CPUs: chip has a single TX buffer + CR doorbell;
     // two concurrent senders would corrupt the in-flight frame.

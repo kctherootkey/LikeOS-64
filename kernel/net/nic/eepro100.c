@@ -368,8 +368,8 @@ static int eepro100_send(net_device_t* ndev, const uint8_t* data, uint16_t len) 
 
     // Copy payload into the slot's inline buffer
     uint8_t* buf = e100_tx_payload(d, slot);
-    for (uint16_t i = 0; i < len; i++) buf[i] = data[i];
-    for (uint16_t i = len; i < out_len; i++) buf[i] = 0;
+    mm_memcpy(buf, data, len);
+    if (out_len > len) mm_memset(buf + len, 0, out_len - len);
 
     // Build the CmdTx CB.  Simplified mode: tbd_addr = 0xFFFFFFFF means
     // "data follows the CB header" (which it does — see e100_tx_payload).

@@ -413,6 +413,50 @@ static uint16_t tcp_advertised_window(tcp_conn_t* conn) {
     return (uint16_t)shifted;
 }
 
+/* Linux-style TCP receive buffer auto-tuning.
+ *
+ * Throughput is BDP-limited: max_rate = rx_buf_size / RTT.  A fixed
+ * 128 KB rx ring caps a 481 ms transcontinental flow at ~280 KB/s.
+ * Grow on demand instead of pre-allocating big buffers for every
+ * connection: only connections that actually fill their ring (peer is
+ * sending faster than we drain) pay the larger memory cost.
+ *
+ * Doubles the ring size up to TCP_RX_BUF_MAX.  Caller must hold
+ * conn->lock.  Returns 1 if the ring was grown, 0 otherwise.
+ */
+static int tcp_grow_rx_buf(tcp_conn_t* conn) {
+    if (!conn || !conn->rx_buf) return 0;
+    if (conn->rx_buf_size >= TCP_RX_BUF_MAX) return 0;
+
+    uint32_t new_size = conn->rx_buf_size * 2;
+    if (new_size > TCP_RX_BUF_MAX) new_size = TCP_RX_BUF_MAX;
+
+    uint8_t* new_buf = (uint8_t*)slab_alloc(new_size);
+    if (!new_buf) return 0;     // OOM — keep current buffer
+
+    /* Linearize the ring contents from rx_head..rx_tail into the new
+     * buffer starting at offset 0.  Handles the wrap case as two memcpys. */
+    uint32_t used = (conn->rx_tail - conn->rx_head + conn->rx_buf_size) % conn->rx_buf_size;
+    if (used > 0) {
+        if (conn->rx_head + used <= conn->rx_buf_size) {
+            mm_memcpy(new_buf, conn->rx_buf + conn->rx_head, used);
+        } else {
+            uint32_t first = conn->rx_buf_size - conn->rx_head;
+            mm_memcpy(new_buf, conn->rx_buf + conn->rx_head, first);
+            mm_memcpy(new_buf + first, conn->rx_buf, used - first);
+        }
+    }
+
+    uint8_t* old_buf = conn->rx_buf;
+    conn->rx_buf = new_buf;
+    conn->rx_buf_size = new_size;
+    conn->rx_head = 0;
+    conn->rx_tail = used;
+
+    slab_free(old_buf);
+    return 1;
+}
+
 static int tcp_send_segment_ex(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                                uint16_t src_port, uint16_t dst_port,
                                uint32_t seq, uint32_t ack,
@@ -552,6 +596,10 @@ static void tcp_fail_connection(tcp_conn_t* conn, int error) {
     conn->tx_ready = 1;
     conn->inflight_count = 0;
     poll_notify_io_ready();
+    /* Wake any sock_recv blocked on this conn's rx_ready channel.  Otherwise
+     * a connection that fails (RST, timeout) leaves the reader sleeping
+     * forever instead of returning the error. */
+    sched_wake_channel((void*)&conn->rx_ready);
 }
 
 // RFC 6528: ISN = hash(secret, src_ip, dst_ip, src_port, dst_port) + time_counter
@@ -795,9 +843,16 @@ static tcp_conn_t* tcp_alloc_conn(uint8_t* rx_buf, uint8_t* tx_buf) {
             conn->cwnd = 10;
             conn->ssthresh = 0xFFFFFFFFu;
             conn->dup_acks = 0;
+            conn->ca_ack_counter = 0;
             conn->total_retrans = 0;
 
-            conn->nodelay = 0;
+            /* Disable Nagle by default.  Nagle + 200 ms delayed-ACK on the
+             * peer side causes the classic "Nagle deadlock" — a small first
+             * segment (e.g. a TLS ClientHello split across two libc write()
+             * calls) sits queued waiting for an ACK that the peer defers,
+             * producing the multi-second delay observed before the server
+             * response. */
+            conn->nodelay = 1;
             conn->keepalive = 0;
             conn->keepidle_ticks = 7200 * 100; // 2 hours
             conn->keepintvl_ticks = 75 * 100;  // 75 s
@@ -2029,11 +2084,15 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                     conn->cwnd++;
                     if (conn->cwnd > 65535U) conn->cwnd = 65535U;
                 } else {
-                    static uint32_t ca_counter = 0;
-                    ca_counter++;
-                    if (ca_counter >= conn->cwnd) {
+                    /* Per-conn counter — previously this was a file-scope
+                     * static, which let parallel flows clobber each
+                     * other's congestion-avoidance accounting (one flow
+                     * could "earn" cwnd growth driven entirely by another
+                     * flow's ACKs). */
+                    conn->ca_ack_counter++;
+                    if (conn->ca_ack_counter >= conn->cwnd) {
                         conn->cwnd++;
-                        ca_counter = 0;
+                        conn->ca_ack_counter = 0;
                     }
                 }
             } else if (ack == conn->snd_una && payload_len == 0 &&
@@ -2065,9 +2124,18 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                 uint32_t avail = ring_free(conn->rx_head, conn->rx_tail, conn->rx_buf_size);
                 uint32_t copy = payload_len;
                 if (copy > avail) copy = avail;
-                for (uint32_t i = 0; i < copy; i++) {
-                    conn->rx_buf[conn->rx_tail] = payload[i];
-                    conn->rx_tail = (conn->rx_tail + 1) % conn->rx_buf_size;
+                /* Bulk-copy into the rx ring, splitting at the buffer wrap.
+                 * Previously this was a per-byte loop under conn->lock —
+                 * ~1460 dependent stores per segment, and the same pattern
+                 * repeats in the OOO drain below. */
+                if (copy > 0) {
+                    uint32_t first = conn->rx_buf_size - conn->rx_tail;
+                    if (first > copy) first = copy;
+                    mm_memcpy(conn->rx_buf + conn->rx_tail, payload, first);
+                    if (copy > first) {
+                        mm_memcpy(conn->rx_buf, payload + first, copy - first);
+                    }
+                    conn->rx_tail = (conn->rx_tail + copy) % conn->rx_buf_size;
                 }
                 conn->rcv_nxt += copy;
                 /* Only wake the reader when at least one byte was stored.
@@ -2076,6 +2144,24 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                 if (copy > 0) {
                     conn->rx_ready = 1;
                     poll_notify_io_ready();
+                    /* Wake any sock_recv parked on this conn's rx_ready
+                     * channel.  Without this the reader only checked
+                     * rx_ready once per timer tick — capping per-conn
+                     * receive throughput at ~146 KB/s. */
+                    sched_wake_channel((void*)&conn->rx_ready);
+                }
+
+                /* Receive-buffer auto-tuning: if we just stored data into a
+                 * ring that's now > 50% full, peer is filling faster than
+                 * we drain.  Double the ring size (up to TCP_RX_BUF_MAX) so
+                 * the BDP-limited throughput ceiling (rx_buf / RTT) keeps
+                 * pace with the connection's actual demand.  Connections
+                 * that never fill the buffer keep the small initial size. */
+                uint32_t ring_used = (conn->rx_tail - conn->rx_head +
+                                      conn->rx_buf_size) % conn->rx_buf_size;
+                if (ring_used * 2 > conn->rx_buf_size &&
+                    conn->rx_buf_size < TCP_RX_BUF_MAX) {
+                    tcp_grow_rx_buf(conn);
                 }
 
                 // Drain any contiguous OOO segments
@@ -2110,7 +2196,11 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                     tcp_send_ack(conn);
                 } else if (!conn->delayed_ack_pending) {
                     conn->delayed_ack_pending = 1;
-                    conn->delayed_ack_deadline = timer_ticks() + 20; // ~200ms @ 100Hz
+                    /* 40 ms — matches typical TCP_DELACK_MAX in modern
+                     * stacks.  200 ms (the previous value) compounds with
+                     * Nagle on the sending side and stalls TLS handshakes
+                     * by half a second per round-trip. */
+                    conn->delayed_ack_deadline = timer_ticks() + 4;
                 }
             } else if ((int32_t)(seq - conn->rcv_nxt) > 0 && payload_len <= TCP_MSS) {
                 // Out-of-order: insert sorted, dedup
@@ -2143,6 +2233,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
             conn->state = TCP_STATE_CLOSE_WAIT;
             conn->rx_ready = 1;  // Wake up reader (EOF)
             poll_notify_io_ready();
+            sched_wake_channel((void*)&conn->rx_ready);
 
             tcp_send_ack(conn);
         }
@@ -2558,7 +2649,16 @@ void tcp_dump_table(struct tty *tty) {
         "FIN_W1","FIN_W2","CLS_WT","CLOSING","LST_ACK","TM_WAIT"
     };
     tty_printf(tty, "=== TCP table ===\n");
-    tty_printf(tty, "slot st       laddr:lport            raddr:rport       parent  aq h/t r ar rt rcnt rnxt-snxt-suna\n");
+    /* Field legend:
+     *   rc/tr      = retransmit_count / total_retrans (cumulative)
+     *   cw/ss      = our cwnd / ssthresh (segments)
+     *   if         = our inflight segments (send side)
+     *   snd_wnd    = peer's advertised window to us (bytes)
+     *   rcv_buf    = current rx ring size (auto-tuned)
+     *   rcv_adv    = bytes of OUR rx-buf free space (= peer's effective window after WSCALE)
+     *   ws=R/S     = rcv/snd window-scale shift (0/0 caps window at 65535)
+     *   srtt/rto   = smoothed RTT / current RTO (microseconds) */
+    tty_printf(tty, "slot st       laddr:lport            raddr:rport       p= ar rc tr cw ss if snd_wnd rcv_buf rcv_adv ws ts sack srtt rto rnxt-snxt-suna\n");
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         tcp_conn_t* c = &tcp_connections[i];
         if (!c->active) continue;
@@ -2569,15 +2669,26 @@ void tcp_dump_table(struct tty *tty) {
             for (int j = 0; j < TCP_MAX_CONNECTIONS; j++)
                 if (c->parent == &tcp_connections[j]) { parent_slot = j; break; }
         }
-        tty_printf(tty, "%3d %-7s %u.%u.%u.%u:%u %u.%u.%u.%u:%u p=%d h=%u t=%u ar=%u rt=%llu rc=%u rnxt=%u snxt=%u suna=%u\n",
+        uint32_t used = (c->rx_tail - c->rx_head + c->rx_buf_size) % c->rx_buf_size;
+        uint32_t free_b = c->rx_buf_size - used;
+        tty_printf(tty,
+                "%3d %-7s %u.%u.%u.%u:%u %u.%u.%u.%u:%u p=%d ar=%u rc=%u tr=%u cw=%u ss=%u if=%u snd_wnd=%u rcv_buf=%u rcv_adv=%u ws=%d/%d ts=%d sack=%d srtt=%u rto=%u rnxt=%u snxt=%u suna=%u\n",
                 i, s,
                 (li>>24)&0xff,(li>>16)&0xff,(li>>8)&0xff,li&0xff, c->local_port,
                 (ri>>24)&0xff,(ri>>16)&0xff,(ri>>8)&0xff,ri&0xff, c->remote_port,
                 parent_slot,
-                (unsigned)c->accept_head, (unsigned)c->accept_tail,
                 (unsigned)c->accept_ready,
-                (unsigned long long)c->retransmit_tick,
                 (unsigned)c->retransmit_count,
+                (unsigned)c->total_retrans,
+                (unsigned)c->cwnd,
+                (unsigned)c->ssthresh,
+                (unsigned)c->inflight_count,
+                (unsigned)c->snd_wnd,
+                (unsigned)c->rx_buf_size,
+                (unsigned)free_b,
+                (int)c->rcv_wscale, (int)c->snd_wscale,
+                (int)c->ts_enabled, (int)c->sack_ok,
+                (unsigned)c->srtt_us, (unsigned)c->rto_us,
                 c->rcv_nxt, c->snd_nxt, c->snd_una);
     }
     tty_printf(tty, "=================\n");

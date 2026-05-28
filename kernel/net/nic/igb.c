@@ -268,8 +268,9 @@ static int igb_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
         }
     }
 
-    for (uint16_t i = 0; i < len; i++)
-        dev->tx_bufs[tail][i] = data[i];
+    // rep movs — was a byte loop under tx_lock IRQs-off, throttling
+    // ACK emission and feeding back into receiver flow control.
+    mm_memcpy(dev->tx_bufs[tail], data, len);
 
     desc->buffer_addr = dev->tx_bufs_phys[tail];
     desc->length = len;

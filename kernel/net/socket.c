@@ -572,7 +572,32 @@ again:
             if (deadline && timer_ticks() >= deadline)
                 return total ? (int)total : -ETIMEDOUT;
             loopback_process_pending();
-            sched_yield_in_kernel();
+
+            /* Park on &conn->rx_ready instead of busy-yielding.  The previous
+             * yield-based loop only checked rx_ready once per timer tick
+             * (~10 ms at 100 Hz), capping throughput at ~146 KB/s for a
+             * 1460-byte MSS.  tcp_rx now sched_wake_channel(&conn->rx_ready)
+             * the moment data is delivered, eliminating the tick-quantum
+             * latency.  Standard double-check pattern to avoid the race
+             * where the waker fires between our check and our block. */
+            task_t* cur = sched_current();
+            if (cur) {
+                cur->wait_channel = (void*)&conn->rx_ready;
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+                cur->state = TASK_BLOCKED;
+                __atomic_thread_fence(__ATOMIC_SEQ_CST);
+                /* Re-check after marking blocked.  If the waker fired
+                 * between the first check and now, rx_ready / state will
+                 * already reflect the new value — unblock and loop. */
+                if (conn->rx_ready ||
+                    conn->state != TCP_STATE_ESTABLISHED) {
+                    cur->state = TASK_RUNNING;
+                    cur->wait_channel = NULL;
+                    continue;
+                }
+            }
+            sched_schedule();
+            if (cur) cur->wait_channel = NULL;
         }
 
         if (conn->error) return total ? (int)total : -conn->error;
@@ -600,9 +625,19 @@ again:
         uint32_t copy = avail;
         if (copy > (len - total)) copy = (uint32_t)(len - total);
 
+        /* Bulk-copy from the rx ring to user buffer, split at the wrap
+         * boundary.  The previous per-byte loop ran with the lock held
+         * and added per-segment latency to every read(). */
         smap_disable();
-        for (uint32_t i = 0; i < copy; i++) {
-            ((uint8_t*)buf)[total + i] = conn->rx_buf[(conn->rx_head + i) % conn->rx_buf_size];
+        if (copy > 0) {
+            uint32_t first = conn->rx_buf_size - conn->rx_head;
+            if (first > copy) first = copy;
+            mm_memcpy((uint8_t*)buf + total,
+                      conn->rx_buf + conn->rx_head, first);
+            if (copy > first) {
+                mm_memcpy((uint8_t*)buf + total + first,
+                          conn->rx_buf, copy - first);
+            }
         }
         smap_enable();
         if (!peek) {

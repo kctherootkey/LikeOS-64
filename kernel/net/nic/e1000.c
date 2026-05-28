@@ -321,9 +321,10 @@ static int e1000_send(net_device_t* ndev, const uint8_t* data, uint16_t len) {
         }
     }
 
-    // Copy data to TX buffer
-    for (uint16_t i = 0; i < len; i++)
-        dev->tx_bufs[tail][i] = data[i];
+    // Copy data to TX buffer (rep movs — was a byte loop under tx_lock
+    // IRQs-off, which also throttled ACK emission and fed back into
+    // receiver flow control).
+    mm_memcpy(dev->tx_bufs[tail], data, len);
 
     // Set up legacy TX descriptor
     desc->buffer_addr = dev->tx_bufs_phys[tail];
