@@ -14,6 +14,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"
 #include "../../include/kernel/bug.h"
+#include "../../include/kernel/dcache.h"
 
 // ============================================================================
 // Hash table bucket
@@ -386,6 +387,11 @@ int icache_flush(ic_inode_t *inode)
     fat32_io_unlock();
     kfree(buf);
     inode->flags &= ~IC_DIRTY;
+    /* The dcache caches size from the on-disk dirent at lookup time.
+     * After mutating that dirent the dcache must be invalidated or
+     * subsequent stat() lookups will return the stale pre-flush size. */
+    if (inode->parent_cluster)
+        dcache_invalidate_dir(inode->parent_cluster);
     return 0;
 }
 

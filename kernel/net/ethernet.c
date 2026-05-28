@@ -3,6 +3,7 @@
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/skb.h"
 #include "../../include/kernel/bug.h"
+#include "../../include/kernel/memory.h"
 
 // Build and send an Ethernet frame.  The TX buffer is a per-call sk_buff
 // from the size-classed pool, so no global TX spinlock is held across the
@@ -24,13 +25,11 @@ int eth_send(net_device_t* dev, const uint8_t dst_mac[ETH_ALEN],
 
     uint8_t* p = skb_append(skb, frame_len);
     eth_header_t* hdr = (eth_header_t*)p;
-    for (int i = 0; i < ETH_ALEN; i++) {
-        hdr->dst[i] = dst_mac[i];
-        hdr->src[i] = dev->mac_addr[i];
-    }
+    mm_memcpy(hdr->dst, dst_mac, ETH_ALEN);
+    mm_memcpy(hdr->src, dev->mac_addr, ETH_ALEN);
     hdr->ethertype = net_htons(ethertype);
-    for (uint16_t i = 0; i < len; i++)
-        p[ETH_HLEN + i] = payload[i];
+    if (len)
+        mm_memcpy(p + ETH_HLEN, payload, len);
 
     int ret = dev->send(dev, skb->data, skb->len);
     skb_put(skb);

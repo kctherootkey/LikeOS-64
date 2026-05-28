@@ -287,6 +287,7 @@ static void rtl8139_shutdown(net_device_t* ndev) {
 // Drain the RX ring buffer
 // ============================================================================
 static void rtl_drain_rx(rtl8139_dev_t* dev) {
+    int processed_any = 0;
     while (!(rtl_read8(dev, RTL_CR) & RTL_CR_BUFE)) {
         // Each packet in the ring is laid out as:
         //   [0..1]  status (16-bit, little-endian)
@@ -319,7 +320,13 @@ static void rtl_drain_rx(rtl8139_dev_t* dev) {
             dev->rx_offset -= RTL8139_RX_BUF_SIZE;
         WARN_RATELIMIT(dev->rx_offset >= RTL8139_RX_BUF_TOTAL, "RTL8139: rx_offset=%u out of RX ring bounds (%u) after wrap", dev->rx_offset, RTL8139_RX_BUF_TOTAL);
 
-        // CAPR is offset by 16 bytes from the buffer start (hardware quirk).
+        processed_any = 1;
+    }
+
+    // Batched CAPR write: tell the chip once per drain pass where we've
+    // read up to, instead of after every packet.  CAPR is offset by 16
+    // bytes from the buffer start (hardware quirk).
+    if (processed_any) {
         rtl_write16(dev, RTL_CAPR, dev->rx_offset - 16);
     }
 }
@@ -447,7 +454,7 @@ void rtl8139_init(void) {
         // so we can read past the buffer end into our pad area.
         rtl_write32(dev, RTL_RCR,
                     RTL_RCR_APM | RTL_RCR_AB | RTL_RCR_AM |
-                    RTL_RCR_WRAP | RTL_RCR_RBLEN_8K |
+                    RTL_RCR_WRAP | RTL_RCR_RBLEN_64K |
                     RTL_RCR_MXDMA_UNLIM);
 
         // Configure TX: max DMA burst 1024 B, normal IFG.

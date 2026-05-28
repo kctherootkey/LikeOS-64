@@ -6,6 +6,7 @@
 #include "../../include/kernel/skb.h"
 #include "../../include/kernel/ratelimit.h"
 #include "../../include/kernel/bug.h"
+#include "../../include/kernel/memory.h"
 
 // TX path uses per-fragment sk_buff allocations from the size-classed pool;
 // no global TX spinlock is held across the lower-layer send.  See
@@ -281,8 +282,8 @@ static int ipv4_send_common(net_device_t* dev, uint32_t dst_ip, uint8_t protocol
         ip->dst_addr = net_htonl(dst_ip);
         ip->checksum = ipv4_checksum(ip, sizeof(ipv4_header_t));
 
-        for (uint16_t i = 0; i < chunk; i++)
-            buf[sizeof(ipv4_header_t) + i] = payload[offset + i];
+        if (chunk)
+            mm_memcpy(buf + sizeof(ipv4_header_t), payload + offset, chunk);
 
         int ret;
         if (out_dev == net_get_loopback()) {

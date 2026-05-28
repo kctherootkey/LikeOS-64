@@ -156,12 +156,18 @@ typedef struct __attribute__((packed)) {
 // ============================================================================
 // Driver constants
 // ============================================================================
-#define PCNET_NUM_RX_DESC   16          // log2 = 4 → rlen = 4 << 4 = 0x40
+/* PCnet RLEN field encodes ring length as log2; valid range 0..9
+ * (1..512 entries).  16 entries was too tight for sustained downloads:
+ * one missed timer tick of softirq drain causes RX overrun and the
+ * peer cwnd-halves.  Bumped to 256 (log2=8) which still leaves the
+ * driver well under the hardware max while absorbing realistic
+ * peer-cwnd bursts. */
+#define PCNET_NUM_RX_DESC   256         // log2 = 8 → rlen = 8 << 4 = 0x80
 #define PCNET_NUM_TX_DESC   16
 #define PCNET_RX_BUF_SIZE   2048
 #define PCNET_TX_BUF_SIZE   2048
 
-#define PCNET_RX_LEN_LOG2   4
+#define PCNET_RX_LEN_LOG2   8
 #define PCNET_TX_LEN_LOG2   4
 
 // ============================================================================

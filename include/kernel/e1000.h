@@ -237,7 +237,14 @@ typedef union {
 // ============================================================================
 // E1000 Ring Configuration
 // ============================================================================
-#define E1000_NUM_RX_DESC   256
+/* RX descriptor ring depth.  256 was too small for sustained downloads:
+ * a peer with a large cwnd can dispatch a burst of ~200 packets in a
+ * single transmission window, and if softirq processing falls behind by
+ * even one timer tick the ring overflows, the NIC drops, and the peer's
+ * TCP enters fast-retransmit / cwnd-halve — visible as the periodic
+ * dips from ~1.8 MB/s back to ~500 KB/s during a steady download.
+ * 1024 covers multi-MB cwnd worth of in-flight without dropping. */
+#define E1000_NUM_RX_DESC   1024
 #define E1000_NUM_TX_DESC   256
 #define E1000_RX_BUF_SIZE   2048
 

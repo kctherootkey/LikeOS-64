@@ -449,6 +449,8 @@ void e1000_irq_handler(void) {
     if (icr & (E1000_ICR_RXT0 | E1000_ICR_RXDMT0 | E1000_ICR_RXO)) {
         // Process received packets (legacy descriptors)
         uint16_t tail = (dev->rx_tail + 1) % E1000_NUM_RX_DESC;
+        uint16_t last_processed = dev->rx_tail;
+        int      processed_any  = 0;
 
         while (1) {
             volatile e1000_rx_desc_legacy_t* desc = &dev->rx_descs[tail];
@@ -466,10 +468,20 @@ void e1000_irq_handler(void) {
             desc->buffer_addr = dev->rx_bufs_phys[tail];
             desc->status = 0;
 
-            dev->rx_tail = tail;
-            e1000_write(dev, E1000_RDT, tail);
+            last_processed = tail;
+            processed_any  = 1;
 
             tail = (tail + 1) % E1000_NUM_RX_DESC;
+        }
+
+        /* Batch the RDT MMIO write: instead of one PCIe round-trip per
+         * descriptor (~1 µs each — ~1 ms/s of IRQ-context MMIO at line
+         * rate), write RDT once at the end of the drain loop with the
+         * last descriptor we processed.  This is the standard pattern
+         * mature drivers use. */
+        if (processed_any) {
+            dev->rx_tail = last_processed;
+            e1000_write(dev, E1000_RDT, last_processed);
         }
     }
 

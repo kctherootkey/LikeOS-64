@@ -180,7 +180,11 @@ typedef struct __attribute__((packed)) {
 #define IGB_TXD_CMD_RS      (1u << 3)
 #define IGB_TXD_STAT_DD     (1u << 0)
 
-#define IGB_NUM_RX_DESC     256
+/* Same reasoning as e1000: 256 is too tight when softirq falls behind
+ * by one timer tick during a peer-cwnd burst — overruns trigger the
+ * peer's fast-retransmit and cwnd-halve, capping sustained throughput.
+ * 1024 absorbs multi-MB worth of in-flight without dropping. */
+#define IGB_NUM_RX_DESC     1024
 #define IGB_NUM_TX_DESC     256
 #define IGB_RX_BUF_SIZE     2048
 

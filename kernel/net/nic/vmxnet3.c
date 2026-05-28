@@ -436,6 +436,8 @@ static void vmxnet3_shutdown(net_device_t* ndev) {
 // Drain the RX completion ring
 // ============================================================================
 static void vm_drain_rx(vmxnet3_dev_t* dev) {
+    uint16_t last_rxd_idx = 0;
+    int      processed_any = 0;
     while (1) {
         vmxnet3_rx_comp_desc_t* cd = &dev->rx_comp_ring[dev->rx_comp_next];
 
@@ -468,9 +470,9 @@ static void vm_drain_rx(vmxnet3_dev_t* dev) {
                 (VMXNET3_RX_BUF_SIZE & 0x3FFF) |
                 ((uint32_t)dev->rx_gen << 31);
             dev->rx_ring[rxd_idx].reserved = 0;
+            last_rxd_idx  = rxd_idx;
+            processed_any = 1;
         }
-        // Tell HW we've replenished a buffer (RXPROD = last filled index)
-        vm_w32(dev->bar0, VMXNET3_REG_RXPROD, rxd_idx);
 
         // Advance comp ring pointer; flip expected gen on wrap
         dev->rx_comp_next++;
@@ -484,6 +486,13 @@ static void vm_drain_rx(vmxnet3_dev_t* dev) {
         // written, which we keep in dev->rx_gen).
         if (rxd_idx == VMXNET3_NUM_RX_DESC - 1)
             dev->rx_gen ^= 1;
+    }
+
+    // Batched doorbell: tell HW once per drain pass which descriptor we
+    // just refilled.  Replacing the per-packet RXPROD write with a single
+    // MMIO at the end of the loop removes one PCIe round-trip per packet.
+    if (processed_any) {
+        vm_w32(dev->bar0, VMXNET3_REG_RXPROD, last_rxd_idx);
     }
 }
 

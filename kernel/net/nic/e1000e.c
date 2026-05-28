@@ -2659,6 +2659,8 @@ void e1000e_irq_handler(void) {
     // RX-completion handling pattern.
     {
         uint16_t tail = (dev->rx_tail + 1) % E1000E_NUM_RX_DESC;
+        uint16_t last_processed = dev->rx_tail;
+        int      processed_any  = 0;
         unsigned drained = 0;
 
         while (1) {
@@ -2676,11 +2678,16 @@ void e1000e_irq_handler(void) {
             desc->buffer_addr = dev->rx_bufs_phys[tail];
             desc->status = 0;
 
-            dev->rx_tail = tail;
-            e1000e_write(dev, E1000_RDT, tail);
+            last_processed = tail;
+            processed_any  = 1;
 
             tail = (tail + 1) % E1000E_NUM_RX_DESC;
             drained++;
+        }
+
+        if (processed_any) {
+            dev->rx_tail = last_processed;
+            e1000e_write(dev, E1000_RDT, last_processed);
         }
 
 #if E1000E_DBG

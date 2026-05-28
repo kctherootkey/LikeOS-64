@@ -661,13 +661,31 @@ again:
                 goto again;
         }
 
-        /* After draining application data, send a window-update ACK so the
-         * remote sender learns the buffer has free space.  Without this, when
-         * the RX ring filled to window=0 the sender stopped, and because it
-         * has no in-flight segments to retransmit, tcp_timer_tick never fires
-         * a probe — both sides block on sched_yield_in_kernel() indefinitely. */
-        if (copy > 0 && !peek)
-            tcp_send_window_update(conn);
+        /* Recv-side window-update ACK is only STRICTLY required when
+         * the peer is window-paused (our last-advertised window was
+         * so small that the peer has nothing to send → no incoming
+         * data → no piggy-backed window update from tcp_rx's normal
+         * every-2-segments ACK path).
+         *
+         * During a sustained download peer fills our buffer and the
+         * data ACKs that tcp_rx emits already carry our current
+         * window: emitting an additional ACK per recv() just makes
+         * the peer's TCP work harder, re-acquires conn->lock (which
+         * blocks new RX from tcp_rx for the duration of the NIC TX
+         * + IP/Eth encap), and burns NIC TX bandwidth.
+         *
+         * Heuristic: peer is "paused-ish" only when the last-advertised
+         * window was below one MSS (peer cannot send a full segment
+         * and is waiting for a window update).  In every other case
+         * the next data segment from the peer will trigger a data ACK
+         * with the latest window automatically. */
+        if (copy > 0 && !peek) {
+            uint32_t mss = conn->peer_mss ? conn->peer_mss : TCP_MSS;
+            if (conn->rcv_adv_last_bytes < mss) {
+                tcp_send_window_update(conn);
+                /* rcv_adv_last_bytes is updated inside tcp_send_ack() */
+            }
+        }
 
         total += copy;
 

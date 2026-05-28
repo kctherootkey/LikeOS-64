@@ -379,6 +379,8 @@ void igb_irq_handler(void) {
 
     if (icr & (IGB_ICR_RXT0 | IGB_ICR_RXDMT0 | IGB_ICR_RXO | IGB_ICR_RXQ0)) {
         uint16_t tail = (dev->rx_tail + 1) % IGB_NUM_RX_DESC;
+        uint16_t last_processed = dev->rx_tail;
+        int      processed_any  = 0;
         while (1) {
             volatile igb_rx_desc_t* desc = &dev->rx_descs[tail];
             uint32_t st = desc->wb.status_error;
@@ -396,10 +398,15 @@ void igb_irq_handler(void) {
             desc->read.pkt_addr = dev->rx_bufs_phys[tail];
             desc->read.hdr_addr = 0;
 
-            dev->rx_tail = tail;
-            igb_write(dev, IGB_RDT0, tail);
+            last_processed = tail;
+            processed_any  = 1;
 
             tail = (tail + 1) % IGB_NUM_RX_DESC;
+        }
+
+        if (processed_any) {
+            dev->rx_tail = last_processed;
+            igb_write(dev, IGB_RDT0, last_processed);
         }
     }
 

@@ -109,7 +109,12 @@ typedef struct __attribute__((packed,aligned(16))) {
     uint32_t buf2;       // RDES3 (next desc / second buffer)
 } tulip_desc_t;
 
-#define TULIP_NUM_RX_DESC   32
+/* Tulip uses linked descriptors; no architectural cap on count.
+ * 32 was tight for sustained downloads — bumped to 128 to absorb
+ * peer-cwnd bursts without RX overrun and the associated fast-
+ * retransmit / cwnd-halve cycle.  The descriptor + 2 KB buffer pair
+ * is small (~2 KB each), so 128 entries is ~256 KB of pinned RX. */
+#define TULIP_NUM_RX_DESC   128
 #define TULIP_NUM_TX_DESC   32
 #define TULIP_RX_BUF_SIZE   2048
 #define TULIP_TX_BUF_SIZE   2048

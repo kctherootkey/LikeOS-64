@@ -274,7 +274,22 @@ typedef struct __attribute__((packed)) {
 #define TCP_OPT_TIMESTAMP_LEN   10
 
 // Out-of-order receive queue (per-conn)
-#define TCP_MAX_OOO             16
+/* Out-of-order receive buffer size.  This caps how much in-flight peer
+ * data we can hold when an earlier segment is lost — and therefore how
+ * accurately our SACK can describe the receive state.  Too small a value
+ * forces the peer into RTO (cwnd → 1, restart slow-start) rather than
+ * SACK-driven fast-retransmit (cwnd halved, continue), with catastrophic
+ * effect on cwnd-limited downloads.
+ *
+ * Diagnostic data showed bursts of >300 dup-ACKs in a row on a 1.5 MB/s
+ * download — peer's RTO firing because our SACK only covered the first
+ * 16 OOO segments out of ~55 in its in-flight window.  Bumping to 64
+ * covers up to a ~93 KB in-flight burst per loss event, which is enough
+ * for any cwnd we are likely to see at modest RTTs.
+ *
+ * Memory cost: each entry is ~1466 B inline in tcp_conn_t.  At 64 × 128
+ * conns we use ~12 MB of BSS just for the OOO arrays. */
+#define TCP_MAX_OOO             64
 #define TCP_MAX_SACK_BLOCKS     4
 
 // TCP-level sockopts (IPPROTO_TCP)
@@ -411,6 +426,14 @@ typedef struct tcp_conn {
     uint32_t dup_acks;          // Duplicate ACK counter (fast retransmit)
     uint32_t ca_ack_counter;    // Per-conn congestion-avoidance ack counter (1/cwnd per ACK)
     uint32_t total_retrans;
+    /* Receive-side silly-window avoidance (RFC 813).  Holds the number of
+     * bytes of receive buffer space we last advertised to the peer.  We
+     * only emit a window-update ACK from sock_recv when the newly opened
+     * window has grown by at least max(MSS, rx_buf_size/4) bytes since
+     * the last advertisement.  Without this, every recv() syscall
+     * generates a TX ACK — ~6000 per 100 MB download — each costing a
+     * full NIC TX, locking conn->lock, and serialising further RX. */
+    uint32_t rcv_adv_last_bytes;
 
     // TCP_NODELAY / Nagle
     int      nodelay;

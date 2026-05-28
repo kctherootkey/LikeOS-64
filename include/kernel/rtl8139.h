@@ -115,8 +115,12 @@
 // ============================================================================
 // Driver constants
 // ============================================================================
-// Use 8K + 16 RX buffer (smallest, fits in 4 pages)
-#define RTL8139_RX_BUF_SIZE     (8192 + 16)
+/* RTL8139 supports 8K, 16K, 32K, or 64K RX ring via RCR_RBLEN.  8K was
+ * sized for low-volume traffic; under sustained downloads a peer-cwnd
+ * burst can fill the ring faster than softirq drains, causing the NIC
+ * to drop and the peer's TCP to fast-retransmit / cwnd-halve.  Use
+ * the max (64K) — 65 KB pinned is negligible. */
+#define RTL8139_RX_BUF_SIZE     (65536 + 16)
 #define RTL8139_RX_BUF_PAD      1500   // Extra slack for WRAP-mode reads
 #define RTL8139_RX_BUF_TOTAL    (RTL8139_RX_BUF_SIZE + RTL8139_RX_BUF_PAD)
 #define RTL8139_NUM_TX_DESC     4

@@ -484,11 +484,11 @@ static int tcp_send_segment_ex(net_device_t* dev, uint32_t src_ip, uint32_t dst_
     tcp->urgent_ptr = 0;
 
     uint8_t* opt_dst = pkt + sizeof(tcp_header_t);
-    for (uint8_t i = 0; i < padded_options; i++) opt_dst[i] = 0;
-    for (uint8_t i = 0; i < options_len; i++) opt_dst[i] = options[i];
+    if (padded_options) mm_memset(opt_dst, 0, padded_options);
+    if (options_len)    mm_memcpy(opt_dst, options, options_len);
 
-    for (uint16_t i = 0; i < data_len; i++)
-        pkt[sizeof(tcp_header_t) + padded_options + i] = data[i];
+    if (data_len)
+        mm_memcpy(pkt + sizeof(tcp_header_t) + padded_options, data, data_len);
 
     uint8_t pseudo[12 + sizeof(tcp_header_t) + TCP_MAX_OPTIONS + TCP_MSS];
     pseudo[0] = (src_ip >> 24) & 0xFF; pseudo[1] = (src_ip >> 16) & 0xFF;
@@ -499,8 +499,7 @@ static int tcp_send_segment_ex(net_device_t* dev, uint32_t src_ip, uint32_t dst_
     pseudo[9] = IP_PROTO_TCP;
     pseudo[10] = (tcp_len >> 8) & 0xFF;
     pseudo[11] = tcp_len & 0xFF;
-    for (uint16_t i = 0; i < tcp_len; i++)
-        pseudo[12 + i] = pkt[i];
+    mm_memcpy(pseudo + 12, pkt, tcp_len);
 
     tcp->checksum = ipv4_checksum(pseudo, (uint16_t)(12 + tcp_len));
 
@@ -845,6 +844,7 @@ static tcp_conn_t* tcp_alloc_conn(uint8_t* rx_buf, uint8_t* tx_buf) {
             conn->dup_acks = 0;
             conn->ca_ack_counter = 0;
             conn->total_retrans = 0;
+            conn->rcv_adv_last_bytes = 0;
 
             /* Disable Nagle by default.  Nagle + 200 ms delayed-ACK on the
              * peer side causes the classic "Nagle deadlock" — a small first
@@ -1126,6 +1126,38 @@ static void tcp_send_ack(tcp_conn_t* conn) {
                         TCP_ACK, win, NULL, 0, opts, olen);
     conn->delayed_ack_pending = 0;
     conn->segs_since_ack = 0;
+    /* Remember what we advertised so sock_recv's RFC 813 silly-window
+     * threshold is based on the most recent advertisement, not stale. */
+    conn->rcv_adv_last_bytes = (uint32_t)((conn->rx_buf_size -
+        ((conn->rx_tail - conn->rx_head + conn->rx_buf_size) %
+         conn->rx_buf_size)));
+}
+
+/* tcp_queue_ack_locked() — used by tcp_rx to *defer* an ACK transmit.
+ *
+ * tcp_rx runs the entire RX state machine under conn->lock.  Calling
+ * tcp_send_ack() inline transmits the ACK synchronously: build packet,
+ * checksum, ipv4_send, eth_send, NIC tx_lock + MMIO doorbell — all with
+ * conn->lock held.  Meanwhile sock_recv waits on conn->lock to drain
+ * the rx ring.  At ~250 ACKs/sec and ~10-20 µs per ACK TX, this adds a
+ * few ms/sec of lock-held time on the RX softirq, which feeds back
+ * directly into how quickly the application can read data and how
+ * quickly we can ACK the next segment.
+ *
+ * This function just updates the conn state.  The caller (tcp_rx) sets
+ * a local ack_pending flag and, AFTER releasing conn->lock, snapshots
+ * the ACK params and calls tcp_send_segment_ex directly.  Multiple
+ * tcp_queue_ack_locked() calls during one tcp_rx collapse into a
+ * single trailing ACK (cumulative — peer cares only about the latest
+ * rcv_nxt). */
+static void tcp_queue_ack_locked(tcp_conn_t* conn) {
+    BUG_ON(conn == NULL);
+    BUG_ON(conn->dev == NULL);
+    conn->delayed_ack_pending = 0;
+    conn->segs_since_ack = 0;
+    conn->rcv_adv_last_bytes = (uint32_t)((conn->rx_buf_size -
+        ((conn->rx_tail - conn->rx_head + conn->rx_buf_size) %
+         conn->rx_buf_size)));
 }
 
 // ============================================================================
@@ -1846,6 +1878,12 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
     }
 
     uint64_t flags;
+    /* Deferred-ACK pattern: instead of calling tcp_send_ack() inline
+     * (which transmits under conn->lock), tcp_rx queues with
+     * tcp_queue_ack_locked() and snapshots the params just before
+     * tcp_lock_release().  The actual NIC TX happens AFTER release.
+     * Multiple queue calls collapse into a single trailing ACK. */
+    int      ack_pending = 0;
     tcp_lock_acquire(&conn->lock, &flags);
 
     // TOCTOU re-validate: tcp_find_conn() above ran lock-free, so between
@@ -1892,7 +1930,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                 if (pop.sack_perm) conn->sack_ok = 1;
 
                 // Send ACK (now with TS option if negotiated, scaled window)
-                tcp_send_ack(conn);
+                tcp_queue_ack_locked(conn); ack_pending = 1;
             }
         } else if (tcp_flags & TCP_RST) {
             tcp_fail_connection(conn, ECONNREFUSED);
@@ -2003,7 +2041,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
         // (only if seg has data and we have a ts_recent).
         if (conn->ts_enabled && pop.ts_present) {
             if ((int32_t)(pop.tsval - conn->ts_recent) < 0 && payload_len > 0) {
-                tcp_send_ack(conn);
+                tcp_queue_ack_locked(conn); ack_pending = 1;
                 break;
             }
             // Update ts_recent if seg covers ts_recent's ack point
@@ -2038,7 +2076,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
             if ((int32_t)(ack - conn->snd_una) < 0 ||
                 (int32_t)(ack - conn->snd_nxt) > 1) {
                 // Out-of-window ACK: send current ACK state back and drop
-                tcp_send_ack(conn);
+                tcp_queue_ack_locked(conn); ack_pending = 1;
                 break;
             }
             // Store any peer-sent SACK blocks for the retransmit timer to use
@@ -2142,13 +2180,18 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                  * Setting rx_ready=1 with copy=0 (ring full, probe dropped)
                  * causes sock_recv to return 0 — a false EOF to OpenSSL. */
                 if (copy > 0) {
+                    /* Only fire the (expensive) sched_wake_channel scan
+                     * — which walks the entire task list under
+                     * g_task_list_lock IRQ-off — when rx_ready actually
+                     * transitions 0→1.  If the reader is already
+                     * scheduled / running, repeating the wake per
+                     * segment was burning 5-20 µs per packet under two
+                     * spinlocks for no observable benefit. */
+                    int was_ready = conn->rx_ready;
                     conn->rx_ready = 1;
                     poll_notify_io_ready();
-                    /* Wake any sock_recv parked on this conn's rx_ready
-                     * channel.  Without this the reader only checked
-                     * rx_ready once per timer tick — capping per-conn
-                     * receive throughput at ~146 KB/s. */
-                    sched_wake_channel((void*)&conn->rx_ready);
+                    if (!was_ready)
+                        sched_wake_channel((void*)&conn->rx_ready);
                 }
 
                 /* Receive-buffer auto-tuning: if we just stored data into a
@@ -2189,11 +2232,22 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                     }
                 }
 
-                // RFC 1122 §4.2.3.2: delayed ACK — defer up to 200ms or every 2nd seg
+                /* Stretch-ACK: ACK every 4th segment instead of every 2nd
+                 * during sustained in-order bulk receive.  Each ACK fires
+                 * a full TX pipeline (skb_alloc × 2, NIC tx_lock + MMIO
+                 * doorbell, multiple mm_memcpys) HELD UNDER conn->lock,
+                 * which also blocks sock_recv on the user side from
+                 * draining the rx ring.  At 1000 pkt/s with ACK-every-2
+                 * that's 500 lock-held ACK builds/sec × ~40 µs each =
+                 * a hard ceiling of ~1.7 MB/s on single-CPU receive.
+                 * RFC 5681 §4.2 allows the stretch as long as the
+                 * delay is bounded by the delayed-ACK timer below.
+                 * OOO segments and PSH still force an immediate ACK to
+                 * avoid hurting interactive / handshake latency. */
                 conn->segs_since_ack++;
-                if (conn->segs_since_ack >= 2 || conn->ooo_count > 0 ||
+                if (conn->segs_since_ack >= 4 || conn->ooo_count > 0 ||
                     (tcp_flags & TCP_PSH)) {
-                    tcp_send_ack(conn);
+                    tcp_queue_ack_locked(conn); ack_pending = 1;
                 } else if (!conn->delayed_ack_pending) {
                     conn->delayed_ack_pending = 1;
                     /* 40 ms — matches typical TCP_DELACK_MAX in modern
@@ -2220,10 +2274,10 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                     conn->ooo_count++;
                 }
                 // Send immediate dup-ACK with SACK info (helps fast retransmit)
-                tcp_send_ack(conn);
+                tcp_queue_ack_locked(conn); ack_pending = 1;
             } else {
                 // Already-received data — duplicate ACK
-                tcp_send_ack(conn);
+                tcp_queue_ack_locked(conn); ack_pending = 1;
             }
         }
 
@@ -2235,7 +2289,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
             poll_notify_io_ready();
             sched_wake_channel((void*)&conn->rx_ready);
 
-            tcp_send_ack(conn);
+            tcp_queue_ack_locked(conn); ack_pending = 1;
         }
         break;
 
@@ -2248,7 +2302,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                     conn->rcv_nxt = seq + payload_len + 1;
                     conn->state = TCP_STATE_TIME_WAIT;
                     conn->time_wait_tick = timer_ticks() + TCP_TIME_WAIT_TICKS;
-                    tcp_send_ack(conn);
+                    tcp_queue_ack_locked(conn); ack_pending = 1;
                 } else {
                     conn->state = TCP_STATE_FIN_WAIT_2;
                     conn->fin_wait_2_deadline = timer_ticks() + 6000; // 60s
@@ -2258,7 +2312,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
         if ((tcp_flags & TCP_FIN) && conn->state == TCP_STATE_FIN_WAIT_1) {
             conn->rcv_nxt = seq + payload_len + 1;
             conn->state = TCP_STATE_CLOSING;
-            tcp_send_ack(conn);
+            tcp_queue_ack_locked(conn); ack_pending = 1;
         }
         break;
 
@@ -2267,7 +2321,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
             conn->rcv_nxt = seq + payload_len + 1;
             conn->state = TCP_STATE_TIME_WAIT;
             conn->time_wait_tick = timer_ticks() + TCP_TIME_WAIT_TICKS;
-            tcp_send_ack(conn);
+            tcp_queue_ack_locked(conn); ack_pending = 1;
         }
         break;
 
@@ -2294,7 +2348,7 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
     case TCP_STATE_TIME_WAIT:
         // Re-send ACK for any FIN
         if (tcp_flags & TCP_FIN) {
-            tcp_send_ack(conn);
+            tcp_queue_ack_locked(conn); ack_pending = 1;
             conn->time_wait_tick = timer_ticks() + TCP_TIME_WAIT_TICKS;
         }
         break;
@@ -2303,7 +2357,38 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
         break;
     }
 
+    /* Snapshot the deferred ACK params UNDER conn->lock, then release
+     * the lock, then transmit.  This removes the NIC TX (skb build +
+     * checksum + tx_lock + MMIO doorbell) from the conn->lock-held
+     * critical section, so sock_recv can drain the rx ring in parallel
+     * with the ACK going out. */
+    uint8_t  snap_opts[TCP_MAX_OPTIONS];
+    uint8_t  snap_olen = 0;
+    uint16_t snap_win  = 0;
+    uint32_t snap_seq  = 0;
+    uint32_t snap_ack  = 0;
+    net_device_t* snap_dev = NULL;
+    uint32_t snap_lip = 0, snap_rip = 0;
+    uint16_t snap_lp  = 0, snap_rp  = 0;
+    if (ack_pending) {
+        snap_olen = tcp_build_options(conn, TCP_ACK, 0, snap_opts);
+        snap_win  = tcp_advertised_window(conn);
+        snap_seq  = conn->snd_nxt;
+        snap_ack  = conn->rcv_nxt;
+        snap_dev  = conn->dev;
+        snap_lip  = conn->local_ip;
+        snap_rip  = conn->remote_ip;
+        snap_lp   = conn->local_port;
+        snap_rp   = conn->remote_port;
+    }
+
     tcp_lock_release(&conn->lock, flags);
+
+    if (ack_pending) {
+        tcp_send_segment_ex(snap_dev, snap_lip, snap_rip, snap_lp, snap_rp,
+                            snap_seq, snap_ack, TCP_ACK, snap_win,
+                            NULL, 0, snap_opts, snap_olen);
+    }
 }
 
 // ============================================================================

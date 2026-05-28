@@ -88,8 +88,15 @@
 // whole DriverShared blob with "Device configuration ... is invalid"
 // otherwise.  We don't actually use ring 2, but the host still validates
 // its size, so it gets the minimum legal value.
+/* Bigger RX ring matters more here than for e1000 — vmxnet3 is the
+ * paravirt NIC used in VMware, where the host can hand the guest a
+ * burst of packets in a single VM-exit batch.  32 entries was tight
+ * enough that any softirq pause caused RX overruns and the peer's TCP
+ * to cwnd-halve.  vmxnet3 hardware supports up to 4096; 1024 is plenty
+ * and matches the e1000 / igb config.  Ring 2 stays minimal (we don't
+ * actually use it; host just validates the size is legal). */
 #define VMXNET3_NUM_TX_DESC     32
-#define VMXNET3_NUM_RX_DESC     32
+#define VMXNET3_NUM_RX_DESC     1024
 #define VMXNET3_NUM_RX2_DESC    32
 #define VMXNET3_NUM_TX_COMP     VMXNET3_NUM_TX_DESC
 #define VMXNET3_NUM_RX_COMP     (VMXNET3_NUM_RX_DESC + VMXNET3_NUM_RX2_DESC)

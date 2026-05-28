@@ -2316,7 +2316,9 @@ static long fat32_write_impl(vfs_file_t* f, const void* buf, long bytes);
 static long fat32_seek_impl(vfs_file_t* f, long offset, int whence);
 static long fat32_readdir_impl(vfs_file_t* f, void* buf, long bytes);
 static int fat32_truncate_impl(vfs_file_t* f, unsigned long size);
-static int fat32_close(vfs_file_t* f);  // close doesn't touch disk/cache
+/* close() acquires fat32_io_lock now since it does disk I/O (deferred
+ * dirent update + FAT flush).  Forward decl of the locked wrapper. */
+static int fat32_close(vfs_file_t* f);
 static int fat32_unlink_impl(const char* path);
 static int fat32_rename_impl(const char* oldpath, const char* newpath);
 static int fat32_mkdir_impl(const char* path, unsigned int mode);
@@ -2448,6 +2450,22 @@ static int fat32_release_locks_for_task(uint64_t task_id) {
     return released;
 }
 
+static int fat32_close_impl(vfs_file_t *f);
+static int fat32_close(vfs_file_t *f) {
+    /* close() now does disk I/O (deferred dirent update + FAT-sector
+     * flush) so it needs the same lock the other ops hold.  Without
+     * this, the read-modify-write inside fat32_update_dirent races
+     * against concurrent fat32_open / fat32_read / fat32_write on
+     * other CPUs, and the dirent we just modified can be re-read by
+     * a sibling operation that then writes back its own version,
+     * silently dropping our update — observed as "ls shows old size
+     * after curl re-downloaded over an existing file". */
+    fat32_io_lock();
+    int r = fat32_close_impl(f);
+    fat32_io_unlock();
+    return r;
+}
+
 static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_stat_vfs, fat32_read, fat32_write, fat32_seek, fat32_readdir, fat32_truncate, fat32_unlink, fat32_rename, fat32_mkdir, fat32_rmdir, fat32_chdir, fat32_close, fat32_release_locks_for_task };
 
 static int fat32_resolve_parent(unsigned long start_cluster, const char *path,
@@ -2517,6 +2535,13 @@ static int fat32_update_dirent(fat32_file_t *ff)
     ent->fileSize = (uint32_t)ff->size;
     int st = write_sectors(ff->fs->bdev, lba, ff->fs->sectors_per_cluster, buf);
     kfree(buf);
+    /* The dentry cache holds (start_cluster, size, ...) snapshotted from
+     * the on-disk dirent at lookup time.  After mutating that dirent we
+     * must invalidate the parent's dcache entries so the next stat()
+     * re-reads from disk; otherwise ls keeps showing the pre-truncate
+     * size even though the dirent on disk is correct. */
+    if (ff->parent_cluster)
+        dcache_invalidate_dir(ff->parent_cluster);
     return st;
 }
 
@@ -3887,7 +3912,7 @@ static long fat32_seek_impl(vfs_file_t *f, long offset, int whence)
     return (long)ff->pos;
 }
 
-static int fat32_close(vfs_file_t *f)
+static int fat32_close_impl(vfs_file_t *f)
 {
     if (!f)
         return ST_INVALID;

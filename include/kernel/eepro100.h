@@ -123,7 +123,13 @@ typedef struct __attribute__((packed)) {
 // ============================================================================
 // Driver constants
 // ============================================================================
-#define EEPRO100_NUM_RX_DESC    16
+/* eepro100 uses linked RFDs; no architectural cap on ring length.
+ * 16 was too tight under sustained downloads — a missed softirq tick
+ * during a peer-cwnd burst caused RX overruns and the peer's TCP to
+ * fast-retransmit / cwnd-halve, capping throughput.  256 entries
+ * costs ~(256 × (16 + 1518)) ≈ 400 KB pinned but absorbs real-world
+ * bursts comfortably. */
+#define EEPRO100_NUM_RX_DESC    256
 #define EEPRO100_NUM_TX_DESC    16          // Round-robin CB ring
 #define EEPRO100_RX_BUF_SIZE    1518        // Max Ethernet frame
 #define EEPRO100_TX_BUF_SIZE    1600        // Generous for any CmdTx frame
