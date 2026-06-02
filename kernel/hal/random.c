@@ -240,6 +240,9 @@ void entropy_add_interrupt_timing(uint64_t extra) {
 
 int random_get_bytes(void* buf, size_t len, int blocking) {
     if (!buf || len == 0) return 0;
+    /* blocking path waits with IRQs enabled (unlocks + pause); not safe
+     * to call with IRQs disabled when blocking is requested. */
+    if (blocking) might_sleep();
 
     uint64_t flags;
     spin_lock_irqsave(&g_pool.lock, &flags);

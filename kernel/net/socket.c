@@ -258,6 +258,8 @@ int sock_accept(int sockfd, struct sockaddr_in* addr, socklen_t* addrlen) {
 // sock_connect - Connect to remote host (TCP or set UDP default dest)
 // ============================================================================
 int sock_connect(int sockfd, const struct sockaddr_in* addr) {
+    might_sleep();
+    BUG_ON(addr == NULL);
     if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS) return -EBADF;
     net_socket_t* s = &sockets[sockfd];
     if (!s->active) return -EBADF;
@@ -485,6 +487,8 @@ int sock_recvfrom(int sockfd, void* buf, size_t len, int flags,
 // sock_send - Send data on connected socket (TCP)
 // ============================================================================
 int sock_send(int sockfd, const void* buf, size_t len, int flags) {
+    might_sleep();
+    BUG_ON(buf == NULL && len > 0);
     (void)flags;
     if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS) return -EBADF;
     net_socket_t* s = &sockets[sockfd];
@@ -541,6 +545,8 @@ int sock_send(int sockfd, const void* buf, size_t len, int flags) {
 // sock_recv - Receive data on connected socket (TCP)
 // ============================================================================
 int sock_recv(int sockfd, void* buf, size_t len, int flags) {
+    might_sleep();
+    BUG_ON(buf == NULL && len > 0);
     if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS) return -EBADF;
     net_socket_t* s = &sockets[sockfd];
     if (!s->active) return -EBADF;

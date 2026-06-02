@@ -172,6 +172,9 @@ void xhci_free_ring(xhci_ring_t* ring) {
 }
 
 void xhci_ring_init(xhci_ring_t* ring, uint64_t phys) {
+    BUG_ON(ring == NULL);
+    BUG_ON(phys == 0);
+    BUILD_BUG_ON(sizeof(xhci_trb_t) != 16);
     xhci_memset(ring->trbs, 0, sizeof(ring->trbs));
     ring->enqueue = 0;
     ring->dequeue = 0;
@@ -190,8 +193,9 @@ void xhci_ring_init(xhci_ring_t* ring, uint64_t phys) {
 // Enqueue a TRB to the ring, handling link TRB wraparound
 // Returns index of enqueued TRB, or -1 on error
 int xhci_ring_enqueue(xhci_ring_t* ring, uint64_t param, uint32_t status, uint32_t control) {
+    BUG_ON(ring == NULL);
     static int wrap_count = 0;
-    
+
     // Check if we're at the link TRB
     if (ring->enqueue >= XHCI_RING_SIZE - 1) {
         // We need to process the Link TRB. The Link TRB has TC (Toggle Cycle) set,
@@ -236,6 +240,7 @@ int xhci_ring_enqueue(xhci_ring_t* ring, uint64_t param, uint32_t status, uint32
 // On x86, stores to WB memory are ordered before MMIO (UC) writes,
 // and DMA is cache-coherent, so mfence is unnecessary.
 void xhci_ring_doorbell(xhci_controller_t* ctrl, uint8_t slot, uint8_t ep) {
+    BUG_ON(ctrl == NULL);
     __asm__ volatile("" ::: "memory");
     xhci_db_write32(ctrl, slot, ep);
 }
@@ -1291,6 +1296,8 @@ static volatile uint8_t g_cmd_cc = 0;
 static volatile uint32_t g_cmd_slot = 0;
 
 int xhci_send_command(xhci_controller_t* ctrl, uint64_t param, uint32_t status, uint32_t control) {
+    BUG_ON(ctrl == NULL);
+    BUG_ON(ctrl->base == 0);
     uint64_t flags;
     spin_lock_irqsave(&xhci_lock, &flags);
 
@@ -1339,6 +1346,7 @@ int xhci_send_command(xhci_controller_t* ctrl, uint64_t param, uint32_t status, 
 }
 
 int xhci_wait_command(xhci_controller_t* ctrl, uint32_t timeout_ms) {
+    BUG_ON(ctrl == NULL);
     for (uint32_t i = 0; i < timeout_ms * 10; i++) {  // 10x iterations with 100us delays
         // Process events (either from interrupt or polling)
         xhci_process_events_locked(ctrl);
@@ -2558,6 +2566,7 @@ static int xhci_queue_bulk_trbs_ex(xhci_ring_t* ring, uint64_t buf_phys,
 
 int xhci_bulk_transfer_in(xhci_controller_t* ctrl, usb_device_t* dev,
                           void* buf, uint32_t len, uint32_t* transferred) {
+    BUG_ON(ctrl == NULL);
     if (!dev || !dev->bulk_in_ring || !dev->bulk_in_ep) return ST_INVALID;
     
     xhci_ring_t* ring = dev->bulk_in_ring;

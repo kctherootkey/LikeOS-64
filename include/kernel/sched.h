@@ -326,7 +326,16 @@ typedef struct task {
      * next context switch) calls task_close_open_files() to finish the
      * job before sched_remove_task tears the task down. */
     bool fds_pending_close;
-    
+
+    /* Guard against double-queueing into g_dead_threads.  Set by
+     * dead_thread_queue under g_dead_thread_lock; cleared by
+     * dead_thread_reap before it calls sched_remove_task.  Without it,
+     * a thread (exit_signal==0) queued via the deferred_zombie path can
+     * be re-queued by sched_reparent_children when its parent is torn
+     * down before dead_thread_reap got to it — the second reap reads
+     * already-kfree'd slab memory and faults inside vfs_release_locks_for_task. */
+    bool on_dead_queue;
+
     // User mode support
     uint64_t user_stack_top;    // User stack virtual address (for user tasks)
     uint64_t kernel_stack_top;  // Kernel stack for syscalls/interrupts (for user tasks)

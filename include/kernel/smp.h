@@ -119,4 +119,13 @@ void smp_tlb_shootdown_ack(void);
 void smp_halt_others(void);
 int  smp_others_halted(void);
 
+/* NMI-based "where is that CPU stuck?" diagnostic.
+ *
+ * Called from the NMI handler (exception_handler INT 2) on every CPU.
+ * Returns 1 if this NMI was a probe armed by another CPU via
+ * smp_tlb_shootdown_sync's timeout path — the handler should record the
+ * captured state into the per-CPU buffer and iretq.  Returns 0 if it's
+ * a real NMI (caller should fall through to kernel_oops). */
+int smp_nmi_capture_record(uint64_t* regs);
+
 #endif // _KERNEL_SMP_H_

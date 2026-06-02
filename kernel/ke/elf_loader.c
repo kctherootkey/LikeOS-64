@@ -18,6 +18,8 @@
 // ============================================================================
 
 int elf_validate(const void* data, size_t size) {
+    BUILD_BUG_ON(sizeof(Elf64_Ehdr) != 64);
+    BUILD_BUG_ON(sizeof(Elf64_Phdr) != 56);
     if (!data || size < sizeof(Elf64_Ehdr)) return -1;
 
     const Elf64_Ehdr* ehdr = (const Elf64_Ehdr*)data;
@@ -361,6 +363,8 @@ static void setup_user_tls_canary(uint64_t* pml4, task_t* task) {
 
 int elf_exec(const char* path, char* const argv[], char* const envp[],
              task_t** out_task) {
+    might_sleep();
+    BUG_ON(out_task == NULL);
     if (!path) return -1;
 
     vfs_file_t* file = NULL;

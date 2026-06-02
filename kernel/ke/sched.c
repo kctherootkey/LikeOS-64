@@ -232,10 +232,23 @@ static void task_close_open_files(task_t* task)
 
 // Queue a dead thread for deferred reaping (called from sched_mark_task_exited)
 static void dead_thread_queue(task_t* task) {
+    if (!task) return;
     uint64_t flags;
     spin_lock_irqsave(&g_dead_thread_lock, &flags);
+    /* Reject duplicate insertions.  Two paths can both try to queue the
+     * same zombie thread: (1) the deferred_zombie hand-off in
+     * sched_schedule/sched_run_ready/sched_preempt when the thread exits
+     * on its own CPU, and (2) sched_reparent_children when the thread's
+     * parent is being torn down before dead_thread_reap got around to
+     * processing the first queue entry.  Without this guard the second
+     * reap pass would kfree() then dereference an already-freed task_t. */
+    if (task->on_dead_queue) {
+        spin_unlock_irqrestore(&g_dead_thread_lock, flags);
+        return;
+    }
     if (g_dead_thread_count < DEAD_THREAD_MAX) {
         g_dead_threads[g_dead_thread_count++] = task;
+        task->on_dead_queue = true;
     } else {
         // Overflow – shouldn't happen unless many threads exit simultaneously.
         // Drop on the floor; leak is better than corruption.
@@ -258,6 +271,11 @@ static void dead_thread_reap(void) {
     count = g_dead_thread_count;
     for (int i = 0; i < count; i++) {
         batch[i] = g_dead_threads[i];
+        /* Clear the queued flag while still under the lock.  After this
+         * point a concurrent dead_thread_queue() for the same task would
+         * succeed — which is the correct behavior, because we are about
+         * to free this task and any later reference is a bug elsewhere. */
+        if (batch[i]) batch[i]->on_dead_queue = false;
     }
     g_dead_thread_count = 0;
     spin_unlock_irqrestore(&g_dead_thread_lock, flags);
@@ -845,6 +863,15 @@ void sched_schedule(void) {
     cpu->current_task = next;
     set_current(next);
 
+    /* Install the incoming task's canary into GS:104 BEFORE re-enabling
+     * interrupts.  If we did this after `sti`, the post-`sti` window
+     * would have current_task == next but GS:104 still holding prev's
+     * canary.  Any IRQ handler or nested stack-protected callee entered
+     * in that window would save prev's canary in its prologue, then see
+     * next's canary in its epilogue once we get around to updating
+     * GS:104, triggering a spurious __stack_chk_fail. */
+    this_cpu()->stack_canary = next->stack_canary;
+
     // The timer-driven preempt handler must NOT preempt us between here and
     // ctx_switch_asm: it would see current_task == next and save the wrong
     // RSP into next->sp.  The in_context_switch flag tells sched_preempt
@@ -865,11 +892,23 @@ void sched_schedule(void) {
         this_cpu()->deferred_zombie = prev;
     }
 
-    // Install the incoming task's canary into the per-CPU slot so that every
-    // stack-protected frame on next's stack sees its own canary in GS:104.
-    this_cpu()->stack_canary = next->stack_canary;
-
-    ctx_switch_asm(&prev->sp, next->sp);
+    /* SMP double-run guard.  Zero next->sp BEFORE switching to it.  A task
+     * whose sp == 0 is "committed to a CPU" and the sp==0 checks above make
+     * every other CPU refuse to resume it.  ctx_switch_asm restores a valid
+     * sp for `prev` at the instant it saves prev's frame, so a task only
+     * becomes resumable again once it is fully off its kernel stack.
+     *
+     * Without this, a task T that blocks on CPU B is woken on CPU A during
+     * the window between sched_schedule releasing runqueue_lock and
+     * ctx_switch_asm saving T's context — A reads T's STALE saved sp and
+     * resumes T while B is still executing on T's kernel stack.  Both CPUs
+     * write the same stack; the saved trap frame near kernel_stack_top is
+     * corrupted and the next return-to-user iretq consumes garbage
+     * (observed as a userspace crash with RIP=0 and kernel register/RSP
+     * values leaked into user mode). */
+    uint64_t* next_sp = next->sp;
+    next->sp = 0;
+    ctx_switch_asm(&prev->sp, next_sp);
 
     // Resumed on the new task's stack.  Always clear the guard — the task
     // we just resumed could have been suspended from any scheduling path.
@@ -978,6 +1017,13 @@ void sched_run_ready(void) {
     cpu->current_task = next;
     set_current(next);
 
+    /* Install the incoming task's canary into GS:104 BEFORE re-enabling
+     * interrupts.  Same rationale as sched_schedule() — preventing a
+     * post-`sti` window where current_task == next but GS:104 still
+     * has prev's canary, which would cause any IRQ-context stack-
+     * protected callee to save prev's canary and then later mismatch. */
+    this_cpu()->stack_canary = next->stack_canary;
+
     // Same in_context_switch guard as sched_schedule (see comment there).
     this_cpu()->in_context_switch = 1;
     __asm__ volatile("" ::: "memory");
@@ -992,10 +1038,12 @@ void sched_run_ready(void) {
         this_cpu()->deferred_zombie = prev;
     }
 
-    // Install the incoming task's canary into the per-CPU slot.
-    this_cpu()->stack_canary = next->stack_canary;
-
-    ctx_switch_asm(&prev->sp, next->sp);
+    /* SMP double-run guard — zero next->sp before switching; see the
+     * detailed comment in sched_schedule().  Prevents another CPU from
+     * resuming a task while this CPU is still on its kernel stack. */
+    uint64_t* next_sp = next->sp;
+    next->sp = 0;
+    ctx_switch_asm(&prev->sp, next_sp);
 
     // Resumed on the new task's stack.  Always clear the guard.
     this_cpu()->in_context_switch = 0;
@@ -2090,6 +2138,15 @@ void sched_preempt(interrupt_frame_t* frame) {
     cpu->current_task = next;
     set_current(next);
 
+    /* Install the incoming task's canary into GS:104 IMMEDIATELY after
+     * publishing current_task = next, so there is no window where
+     * current_task and GS:104 disagree.  IRQs are still off here
+     * (sched_preempt was entered from a hardware interrupt), so the
+     * window only matters if any code between this point and
+     * ctx_switch_asm reads the canary — but keeping them in lockstep
+     * is the simplest invariant. */
+    this_cpu()->stack_canary = next->stack_canary;
+
     // CRITICAL SMP FIX: Save zombie pointer in per-CPU data BEFORE the switch.
     // Do NOT queue yet — we are still on prev's kernel stack.
     // Flush any leftover deferred_zombie first (see sched_schedule comment).
@@ -2100,10 +2157,12 @@ void sched_preempt(interrupt_frame_t* frame) {
         this_cpu()->deferred_zombie = prev;
     }
 
-    // Install the incoming task's canary into the per-CPU slot.
-    this_cpu()->stack_canary = next->stack_canary;
-
-    ctx_switch_asm(&prev->sp, next->sp);
+    /* SMP double-run guard — zero next->sp before switching; see the
+     * detailed comment in sched_schedule().  Prevents another CPU from
+     * resuming a task while this CPU is still on its kernel stack. */
+    uint64_t* next_sp = next->sp;
+    next->sp = 0;
+    ctx_switch_asm(&prev->sp, next_sp);
 
     // Resumed from timer preemption. IF is left at 0 — the interrupt
     // epilogue (iretq in irq_common_stub) restores the correct RFLAGS
@@ -2799,8 +2858,16 @@ static unsigned long calc_load(unsigned long load, unsigned long exp, unsigned l
 // Called periodically from timer IRQ (every 5 seconds = 500 ticks at 100Hz)
 void sched_calc_load(void) {
     // Count runnable tasks (TASK_READY or TASK_RUNNING, excluding idle/pid0)
+    //
+    // MUST use spin_lock_irqsave: g_task_list_lock is taken from the timer IRQ
+    // (sched_wake_expired_sleepers) and from process context elsewhere.  Holding
+    // it with IRQs enabled lets the timer fire on this CPU and self-deadlock when
+    // the handler tries to re-acquire it.  Although sched_calc_load currently
+    // runs only from the timer (IRQs already off), use irqsave for consistency
+    // and to stay correct if it is ever called from process context.
     int nr_active = 0;
-    spin_lock(&g_task_list_lock);
+    uint64_t tl_flags;
+    spin_lock_irqsave(&g_task_list_lock, &tl_flags);
     task_t* t = g_task_list_head;
     while (t) {
         if (t->id != 0 && !t->has_exited &&
@@ -2809,7 +2876,7 @@ void sched_calc_load(void) {
             int is_idle = 0;
             if (g_smp_initialized) {
                 // Check if this is any CPU's idle task (check by comm)
-                if (t->comm[0] == 'i' && t->comm[1] == 'd' && 
+                if (t->comm[0] == 'i' && t->comm[1] == 'd' &&
                     t->comm[2] == 'l' && t->comm[3] == 'e')
                     is_idle = 1;
             }
@@ -2818,7 +2885,7 @@ void sched_calc_load(void) {
         }
         t = t->next;
     }
-    spin_unlock(&g_task_list_lock);
+    spin_unlock_irqrestore(&g_task_list_lock, tl_flags);
 
     uint64_t flags;
     spin_lock_irqsave(&g_loadavg_lock, &flags);
@@ -2839,27 +2906,37 @@ void sched_get_loadavg(unsigned long loads[3]) {
 
 int sched_get_nr_running(void) {
     int count = 0;
-    spin_lock(&g_task_list_lock);
+    // MUST use spin_lock_irqsave: this runs in process context (e.g. via the
+    // sysinfo path) with IRQs enabled.  g_task_list_lock is also taken from the
+    // timer IRQ (sched_wake_expired_sleepers / sched_calc_load).  Holding it
+    // with IRQs on lets the timer fire on this CPU and self-deadlock when the
+    // handler spins to re-acquire it — a wedged CPU stops scheduling entirely.
+    uint64_t flags;
+    spin_lock_irqsave(&g_task_list_lock, &flags);
     task_t* t = g_task_list_head;
     while (t) {
         if (!t->has_exited && (t->state == TASK_READY || t->state == TASK_RUNNING))
             count++;
         t = t->next;
     }
-    spin_unlock(&g_task_list_lock);
+    spin_unlock_irqrestore(&g_task_list_lock, flags);
     return count;
 }
 
 int sched_get_nr_procs(void) {
     int count = 0;
-    spin_lock(&g_task_list_lock);
+    // MUST use spin_lock_irqsave — same reason as sched_get_nr_running above.
+    // Reachable from the sysinfo() syscall in process context with IRQs on,
+    // while the timer IRQ also acquires g_task_list_lock.
+    uint64_t flags;
+    spin_lock_irqsave(&g_task_list_lock, &flags);
     task_t* t = g_task_list_head;
     while (t) {
         if (!t->has_exited)
             count++;
         t = t->next;
     }
-    spin_unlock(&g_task_list_lock);
+    spin_unlock_irqrestore(&g_task_list_lock, flags);
     return count;
 }
 

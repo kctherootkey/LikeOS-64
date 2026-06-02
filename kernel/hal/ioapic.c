@@ -139,12 +139,14 @@ void ioapic_read_rte(uint8_t gsi, uint32_t *low, uint32_t *high) {
 }
 
 void ioapic_mask_gsi(uint8_t gsi) {
+    BUG_ON(!g_ioapic_present);
     uint32_t low = ioapic_read(IOAPIC_REG_REDIR(gsi));
     low |= (1u << 16);
     ioapic_write(IOAPIC_REG_REDIR(gsi), low);
 }
 
 void ioapic_unmask_gsi(uint8_t gsi) {
+    BUG_ON(!g_ioapic_present);
     uint32_t low = ioapic_read(IOAPIC_REG_REDIR(gsi));
     low &= ~(1u << 16);
     ioapic_write(IOAPIC_REG_REDIR(gsi), low);

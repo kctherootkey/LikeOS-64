@@ -1,15 +1,18 @@
 // LikeOS-64 Inode Cache
 //
-// Caches per-file metadata indexed by start_cluster.
-// Reference counted: open handles hold refs, inodes stay cached after close.
-// Per-inode I/O locks enable concurrent cached reads without the global
-// fat32_io_lock.
+// Caches per-file metadata indexed by the FS-native inode identifier (FAT32
+// start cluster, EXT4 inode number).  Reference counted: open handles hold
+// refs; inodes stay cached after close.  Per-inode I/O locks enable
+// concurrent cached reads without the FS-wide I/O lock.
 //
 // Hash table with per-bucket spinlocks.  LRU list for evicting
 // zero-refcount inodes when the cache is full.
+//
+// All FS-specific I/O dispatches through vfs_superblock_t->ops, so this file
+// references no FAT32 (or EXT4) symbols directly.
 
 #include "../../include/kernel/icache.h"
-#include "../../include/kernel/fat32.h"
+#include "../../include/kernel/vfs_sb.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/sched.h"
@@ -187,7 +190,7 @@ ic_inode_t* icache_get(unsigned long start_cluster, unsigned long size,
 {
     might_sleep();
     VM_BUG_ON(start_cluster < 2);
-    WARN_ON(start_cluster == 1);  /* cluster 1 is reserved in FAT32 - icache_get with cluster 1 is a filesystem bug */
+    WARN_ON(start_cluster == 1);  /* block-id 1 is reserved in FAT32; treated as invalid generically */
     if (!ic_initialized || start_cluster < 2)
         return 0;
 
@@ -328,64 +331,15 @@ int icache_flush(ic_inode_t *inode)
 {
     if (!inode || !(inode->flags & IC_DIRTY))
         return 0;
-    if (inode->dirent_cluster < 2)
-        return 0;
-
-    extern fat32_fs_t *g_root_fs;
-    if (!g_root_fs)
+    if (!g_root_sb)
         return -1;
 
-    unsigned cluster_size = g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector;
-    void *buf = kalloc(cluster_size);
-    if (!buf)
-        return -1;
+    /* Dispatch through the generic superblock op; the FS driver knows how
+     * its inode metadata is laid out on disk.  Returns 0 on success. */
+    int rc = vfs_sb_write_inode(g_root_sb, inode);
+    if (rc != 0)
+        return rc;
 
-    fat32_io_lock();
-
-    // Read the directory cluster containing this inode's dirent
-    unsigned long lba = g_root_fs->part_lba_offset + g_root_fs->data_start_lba +
-                        (inode->dirent_cluster - 2) * g_root_fs->sectors_per_cluster;
-    if (g_root_fs->bdev->read((block_device_t *)g_root_fs->bdev, lba,
-                               g_root_fs->sectors_per_cluster, buf) != 0) {
-        fat32_io_unlock();
-        kfree(buf);
-        return -1;
-    }
-
-    // Update the dirent
-    typedef struct {
-        uint8_t  name[11];
-        uint8_t  attr;
-        uint8_t  ntRes;
-        uint8_t  crtTimeTenth;
-        uint16_t crtTime;
-        uint16_t crtDate;
-        uint16_t lstAccDate;
-        uint16_t fstClusHI;
-        uint16_t wrtTime;
-        uint16_t wrtDate;
-        uint16_t fstClusLO;
-        uint32_t fileSize;
-    } __attribute__((packed)) fat32_dirent_raw_t;
-
-    fat32_dirent_raw_t *ents = (fat32_dirent_raw_t *)buf;
-    unsigned max_entries = cluster_size / sizeof(fat32_dirent_raw_t);
-
-    if (inode->dirent_index < max_entries) {
-        fat32_dirent_raw_t *de = &ents[inode->dirent_index];
-        de->fileSize = (uint32_t)inode->size;
-        de->wrtTime = inode->wrt_time;
-        de->wrtDate = inode->wrt_date;
-
-        // Write back
-        if (g_root_fs->bdev->write) {
-            g_root_fs->bdev->write((block_device_t *)g_root_fs->bdev, lba,
-                                    g_root_fs->sectors_per_cluster, buf);
-        }
-    }
-
-    fat32_io_unlock();
-    kfree(buf);
     inode->flags &= ~IC_DIRTY;
     /* The dcache caches size from the on-disk dirent at lookup time.
      * After mutating that dirent the dcache must be invalidated or
@@ -497,10 +451,11 @@ void icache_invalidate_all(void)
 #define CC_MAX_CAP    (1024 * 1024)   // 1M entries ~ 8MB (generous)
 
 // Extend chain_map from chain_len up to (and including) index `target_idx`.
-// Caller must hold fat32_io_lock (needed for fat32_next_cluster_cached).
+// Caller must hold the FS-wide I/O lock (sb->ops->lock_io()) because
+// sb->ops->next_block() touches the on-disk allocator state.
 // Returns 1 on success, 0 on failure (past end of chain or alloc failure).
 static int ic_chain_extend(ic_inode_t *inode, unsigned long target_idx,
-                           fat32_fs_t *fs)
+                           vfs_superblock_t *sb)
 {
     // Seed with start_cluster if empty
     if (inode->chain_len == 0) {
@@ -515,10 +470,11 @@ static int ic_chain_extend(ic_inode_t *inode, unsigned long target_idx,
         inode->chain_len = 1;
     }
 
+    unsigned long eoc = vfs_sb_end_of_chain(sb);
     while (inode->chain_len <= target_idx) {
         unsigned long last = inode->chain[inode->chain_len - 1];
-        unsigned long next = fat32_next_cluster_cached(fs, last);
-        if (next >= 0x0FFFFFF8 || next == 0)
+        unsigned long next = vfs_sb_next_block(sb, last);
+        if (next == 0 || next >= eoc)
             return 0; // end of chain
 
         // Grow array if needed
@@ -545,21 +501,21 @@ static int ic_chain_extend(ic_inode_t *inode, unsigned long target_idx,
 }
 
 unsigned long icache_chain_get(unsigned long start_cluster, unsigned long idx,
-                               struct fat32_fs *fs_raw)
+                               struct vfs_superblock *sb)
 {
-    if (!ic_initialized || start_cluster < 2 || !fs_raw)
+    if (!ic_initialized || start_cluster < 2 || !sb)
         return 0;
 
-    fat32_fs_t *fs = (fat32_fs_t *)fs_raw;
+    unsigned long eoc = vfs_sb_end_of_chain(sb);
 
     // Look up the inode
     ic_inode_t *inode = icache_lookup(start_cluster);
     if (!inode) {
-        // No cached inode — fall back to linear walk
+        // No cached inode — fall back to linear walk via sb ops.
         unsigned long cur = start_cluster;
         for (unsigned long i = 0; i < idx; i++) {
-            unsigned long next = fat32_next_cluster_cached(fs, cur);
-            if (next >= 0x0FFFFFF8 || next == 0)
+            unsigned long next = vfs_sb_next_block(sb, cur);
+            if (next == 0 || next >= eoc)
                 return 0;
             cur = next;
         }
@@ -570,9 +526,9 @@ unsigned long icache_chain_get(unsigned long start_cluster, unsigned long idx,
     if (idx < inode->chain_len)
         return inode->chain[idx];
 
-    // Slow path: extend the chain under fat32_io_lock (caller should already
-    // hold it, but ic_chain_extend only reads the FAT cache which is fine).
-    if (!ic_chain_extend(inode, idx, fs))
+    // Slow path: extend the chain.  Caller is expected to hold the FS-wide
+    // I/O lock; ic_chain_extend only reads through sb ops.
+    if (!ic_chain_extend(inode, idx, sb))
         return 0;
 
     return inode->chain[idx];

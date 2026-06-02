@@ -284,6 +284,8 @@ void dns_rx(const uint8_t* data, uint16_t len) {
 int dns_resolve(const char* hostname, uint32_t* ip_out) {
     BUG_ON(hostname == NULL);
     BUG_ON(ip_out == NULL);
+    BUILD_BUG_ON(sizeof(dns_header_t) != 12);
+    might_sleep();
     if (!hostname || !ip_out) return -EINVAL;
 
     // Handle numeric IP addresses (a.b.c.d)

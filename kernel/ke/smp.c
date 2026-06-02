@@ -479,6 +479,138 @@ void smp_tlb_shootdown_ack(void) {
 // CPU still executing.
 static volatile int g_smp_others_halted = 0;
 
+// ============================================================================
+// NMI-based "where is that CPU stuck?" diagnostic
+//
+// When smp_tlb_shootdown_sync() times out waiting for a CPU to ACK, that CPU
+// is almost certainly spinning in a cli'd kernel section and cannot service
+// fixed-delivery IPIs.  NMIs ignore the IF flag, so we can still get a
+// snapshot of where the CPU actually is by sending an NMI and having the
+// receiving CPU's INT 2 handler record its RIP, RSP, syscall_nr, and
+// current task into a per-CPU buffer.  The sender then prints what it
+// captured.  No locks: the handler writes to its own slot only, the sender
+// only reads after the armed→captured handshake completes.
+// ============================================================================
+
+typedef struct {
+    volatile int armed;       /* 0=idle, 1=sender armed, 2=handler captured */
+    uint64_t     rip;
+    uint64_t     rsp;
+    uint64_t     rflags;
+    int          syscall_nr;
+    int          preempt_count;
+    int          interrupt_nesting;
+    int          tid;
+    char         comm[16];
+} smp_nmi_capture_t;
+
+static smp_nmi_capture_t g_nmi_capture[MAX_CPUS];
+
+/* Match interrupt.c's REGS_* layout.  These are file-local constants so
+ * smp.c doesn't have to include the private header. */
+#define SMP_REGS_RIP    17
+#define SMP_REGS_RSP    20  /* iret frame: rip,cs,rflags,rsp,ss */
+#define SMP_REGS_RFLAGS 19
+#define SMP_REGS_CS     18
+
+int smp_nmi_capture_record(uint64_t* regs) {
+    /* CRITICAL: this runs on the IST2 stack from the NMI vector, BEFORE
+     * isr_common_stub does any swapgs (it doesn't).  If the NMI
+     * interrupted user mode, GS_BASE is still the user task's TLS base
+     * and any %gs: access — including this_cpu_id() and this_cpu() —
+     * would dereference user memory.  In musl/glibc, gs_base is often 0
+     * or unmapped near 0, so the %gs:104 read used by the stack
+     * protector or the %gs:128 read used by this_cpu_id() would #PF.
+     * That nested fault is then routed by exception_handler's INT 14
+     * path as a user-mode SIGSEGV, silently killing whichever user task
+     * was running on the NMI target — observed as "one tmux pane stops
+     * printing while the other keeps going."
+     *
+     * Defensive policy: if CS in the iret frame is user (CPL=3), do not
+     * touch per-CPU state at all and just absorb the NMI.  We can't
+     * usefully capture a stuck-CPU diagnostic from a CPU that was
+     * actively running user code anyway.
+     *
+     * Similarly: even in kernel mode, if armed != 1 (no probe pending
+     * for this CPU, or already captured by a previous NMI), absorb
+     * rather than fall through to kernel_oops.  Spurious platform NMIs
+     * (VMware snapshot signals, perfctr overflow, watchdogs) would
+     * otherwise convert into a silent system kill via smp_halt_others. */
+
+    uint64_t cs = regs[SMP_REGS_CS];
+    if ((cs & 3) == 3) {
+        /* NMI interrupted user mode — refuse to touch %gs: and absorb. */
+        return 1;
+    }
+
+    /* Kernel mode: safe to use the kernel GS base.  Use the per-CPU
+     * armed flag as the "this NMI is mine" signal. */
+    uint32_t cpu = this_cpu_id();
+    if (cpu >= MAX_CPUS) return 1;   /* absorb rather than oops on garbage */
+
+    smp_nmi_capture_t* c = &g_nmi_capture[cpu];
+    int armed = __atomic_load_n(&c->armed, __ATOMIC_ACQUIRE);
+
+    if (armed == 1) {
+        c->rip    = regs[SMP_REGS_RIP];
+        c->rsp    = regs[SMP_REGS_RSP];
+        c->rflags = regs[SMP_REGS_RFLAGS];
+
+        percpu_t* p = this_cpu();
+        c->preempt_count     = p ? p->preempt_count : 0;
+        c->interrupt_nesting = p ? p->interrupt_nesting : 0;
+        c->syscall_nr        = p ? p->current_syscall_nr : -1;
+
+        task_t* t = p ? p->current_task : NULL;
+        c->tid = t ? t->id : -1;
+        if (t) {
+            int i;
+            for (i = 0; i < 15 && t->comm[i]; i++) c->comm[i] = t->comm[i];
+            c->comm[i] = 0;
+        } else {
+            c->comm[0] = 0;
+        }
+        __atomic_store_n(&c->armed, 2, __ATOMIC_RELEASE);
+    }
+    /* For armed==0 (no probe pending) or armed==2 (already captured by a
+     * prior NMI in this probe round), silently absorb.  We trade the
+     * ability to oops on a "real" platform NMI for not converting
+     * spurious NMIs into smp_halt_others. */
+    return 1;
+}
+
+/* Sender side: probe one lagging CPU.  Returns 1 if capture succeeded and
+ * fills *out; 0 if the NMI never landed (CPU is wedged so badly even NMI
+ * doesn't deliver — e.g. SHUTDOWN/INIT or stuck in a triple-fault loop). */
+static int smp_nmi_probe(uint32_t cpu, smp_nmi_capture_t* out) {
+    if (cpu >= MAX_CPUS) return 0;
+    smp_nmi_capture_t* c = &g_nmi_capture[cpu];
+
+    /* Reset and arm. */
+    c->armed = 0;
+    __atomic_store_n(&c->armed, 1, __ATOMIC_RELEASE);
+
+    percpu_t* p = percpu_get(cpu);
+    if (!p) { c->armed = 0; return 0; }
+    lapic_send_nmi(p->apic_id);
+
+    /* NMI delivery is essentially synchronous, but be generous: spin
+     * ~50 ms before giving up.  We poll with pause; this thread is not
+     * holding any lock at this point (sync's main lock was released
+     * before the wait loop). */
+    uint64_t tsc_freq  = lapic_get_tsc_freq();
+    uint64_t tsc_50ms  = (tsc_freq ? tsc_freq : 1000000000ULL) / 20;
+    uint64_t deadline  = timer_rdtsc() + tsc_50ms;
+    while (timer_rdtsc() < deadline) {
+        if (__atomic_load_n(&c->armed, __ATOMIC_ACQUIRE) == 2) {
+            *out = *c;
+            return 1;
+        }
+        __asm__ volatile("pause" ::: "memory");
+    }
+    return 0;
+}
+
 int smp_others_halted(void) {
     return g_smp_others_halted;
 }
@@ -621,7 +753,10 @@ void smp_tlb_shootdown_sync(void) {
         __asm__ volatile("pause" ::: "memory");
     }
 
-    // Timed out — log which CPUs are lagging but continue (not fatal).
+    // Timed out — log which CPUs are lagging and NMI-probe each one so we
+    // see WHERE it is stuck (RIP/RSP/task/syscall_nr).  NMIs ignore the
+    // target's IF flag, so even a CPU spinning in a cli'd section will
+    // service the INT 2 handler and record its state into g_nmi_capture.
     kprintf("SMP: TLB shootdown sync timeout (gen=%llu)\n",
             (unsigned long long)new_gen);
     for (uint32_t c = 0; c < online; c++) {
@@ -630,6 +765,21 @@ void smp_tlb_shootdown_sync(void) {
         if (cgen < new_gen) {
             kprintf("  CPU%u gen=%llu (expected>=%llu)\n",
                     c, (unsigned long long)cgen, (unsigned long long)new_gen);
+
+            smp_nmi_capture_t cap;
+            if (smp_nmi_probe(c, &cap)) {
+                kprintf("    NMI: RIP=%016llx RSP=%016llx RFLAGS=%016llx\n",
+                        (unsigned long long)cap.rip,
+                        (unsigned long long)cap.rsp,
+                        (unsigned long long)cap.rflags);
+                kprintf("    NMI: task=%s tid=%d syscall_nr=%d "
+                        "preempt=%d in_irq_nest=%d\n",
+                        cap.comm[0] ? cap.comm : "?",
+                        cap.tid, cap.syscall_nr,
+                        cap.preempt_count, cap.interrupt_nesting);
+            } else {
+                kprintf("    NMI: probe failed (no capture within 50 ms)\n");
+            }
         }
     }
 }

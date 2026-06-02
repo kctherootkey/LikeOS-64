@@ -199,6 +199,8 @@ static int ipv4_reassemble_fragment(net_device_t* dev, const ipv4_header_t* ip,
 static int ipv4_send_common(net_device_t* dev, uint32_t dst_ip, uint8_t protocol,
                             const uint8_t* payload, uint16_t len, uint8_t ttl,
                             uint8_t tos) {
+    BUILD_BUG_ON(sizeof(ipv4_header_t) != 20);
+    WARN_ON(payload == NULL && len > 0);
     uint32_t next_hop = dst_ip;
     net_device_t* out_dev = route_lookup(dst_ip, &next_hop);
     if (!out_dev) {

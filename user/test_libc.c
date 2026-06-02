@@ -73,22 +73,84 @@ static void handle_sigalrm(int sig) {
     g_sigalrm_hit = 1;
 }
 
-static void test_pass(const char* name) {
+/* Test reporting.
+ *
+ * The macros below are wrappers around the __test_*_impl() functions that
+ * capture context the caller would otherwise have to thread through by hand:
+ *
+ *   - file and line via __FILE__ / __LINE__
+ *   - the source text of the failing expression via the # stringification
+ *     operator (so "[FAIL] foo (... "ret == 0" was false ...)" tells you
+ *     exactly which assertion failed without grepping the source)
+ *   - the post-evaluation errno, so a failing syscall self-reports the
+ *     reason (ECONNREFUSED, ENOMEM, EADDRINUSE, ...)
+ *
+ * All existing call sites (test_pass(name), test_fail(name),
+ * test_result(name, cond)) continue to work unchanged. */
+static void __test_pass_impl(const char* name) {
     tests_passed++;
     printf("  [PASS] %s\n", name);
 }
 
-static void test_fail(const char* name) {
+static void __test_fail_impl(const char* name, const char* file, int line,
+                              int saved_errno) {
     tests_failed++;
-    printf("  [FAIL] %s\n", name);
+    if (saved_errno != 0) {
+        printf("  [FAIL] %s (at %s:%d; errno=%d: %s)\n",
+               name, file, line, saved_errno, strerror(saved_errno));
+    } else {
+        printf("  [FAIL] %s (at %s:%d)\n", name, file, line);
+    }
 }
 
-static void test_result(const char* name, int condition) {
+static void __test_result_impl(const char* name, int condition,
+                                const char* expr, const char* file, int line,
+                                int saved_errno) {
     if (condition) {
-        test_pass(name);
+        __test_pass_impl(name);
     } else {
-        test_fail(name);
+        tests_failed++;
+        if (saved_errno != 0) {
+            printf("  [FAIL] %s (at %s:%d: \"%s\" was false; errno=%d: %s)\n",
+                   name, file, line, expr, saved_errno, strerror(saved_errno));
+        } else {
+            printf("  [FAIL] %s (at %s:%d: \"%s\" was false)\n",
+                   name, file, line, expr);
+        }
     }
+}
+
+#define test_pass(name)         __test_pass_impl(name)
+#define test_fail(name)         __test_fail_impl((name), __FILE__, __LINE__, errno)
+#define test_result(name, cond)                                                \
+    do {                                                                       \
+        int __test_ok = !!(cond);                                              \
+        __test_result_impl((name), __test_ok, #cond,                           \
+                           __FILE__, __LINE__, errno);                         \
+    } while (0)
+
+/* Bind a socket to an ephemeral port on the given local IP (host byte
+ * order).  Returns the assigned port number (host byte order) on
+ * success, 0 on failure.
+ *
+ * Use this in place of bind() to a fixed port number whenever the test
+ * only needs "some local port" rather than a specific one.  Fixed-port
+ * binds collide across two parallel teststress instances even with
+ * SO_REUSEADDR — UDP delivery only goes to the first matching socket,
+ * so the second instance's recvfrom hangs forever.  Ephemeral ports
+ * + getsockname avoid the collision class entirely. */
+static uint16_t bind_to_ephemeral(int fd, uint32_t local_ip) {
+    struct sockaddr_in la;
+    memset(&la, 0, sizeof(la));
+    la.sin_family = AF_INET;
+    la.sin_port = 0;
+    la.sin_addr.s_addr = htonl(local_ip);
+    if (bind(fd, (struct sockaddr*)&la, sizeof(la)) < 0)
+        return 0;
+    socklen_t la_len = sizeof(la);
+    if (getsockname(fd, (struct sockaddr*)&la, &la_len) < 0)
+        return 0;
+    return ntohs(la.sin_port);
 }
 
 static int get_interface_ipv4(const char* ifname, uint32_t* ip_out) {
@@ -135,6 +197,15 @@ static void run_tcp_large_transfer_case(const char* prefix,
     int ret = bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
     snprintf(label, sizeof(label), "%s: bind", prefix);
     test_result(label, ret == 0);
+
+    /* If caller asked for an ephemeral port (port == 0), read back the
+     * one the kernel assigned so the forked child can connect to it.
+     * The child inherits this updated `port` variable via fork(). */
+    if (ret == 0 && port == 0) {
+        socklen_t alen = sizeof(addr);
+        if (getsockname(server_fd, (struct sockaddr*)&addr, &alen) == 0)
+            port = ntohs(addr.sin_port);
+    }
 
     if (ret == 0) {
         ret = listen(server_fd, 4);
@@ -671,8 +742,31 @@ int main(int argc, char** argv) {
         printf("  [CHILD] execve failed: errno=%d\n", errno);
         _exit(1);
     } else {
+        printf("  [PARENT] fork() returned exec_child=%d, my pid=%d\n",
+               exec_child, getpid());
         int status = 0;
+        errno = 0;
         pid_t waited = waitpid(exec_child, &status, 0);
+        int saved_errno = errno;
+        printf("  [PARENT] waitpid(%d,...) returned %d, errno=%d, status=0x%x\n",
+               exec_child, waited, saved_errno, status);
+        if (waited != exec_child) {
+            /* Try a few diagnostic follow-ups so the next failure dump
+             * tells us *why* waitpid said ECHILD instead of just *that*
+             * it did. */
+            int s2 = 0;
+            errno = 0;
+            pid_t any = waitpid(-1, &s2, WNOHANG);
+            int any_errno = errno;
+            printf("  [PARENT] follow-up waitpid(-1, WNOHANG) = %d, "
+                   "errno=%d, status=0x%x\n", any, any_errno, s2);
+            errno = 0;
+            int kill_rc = kill(exec_child, 0);
+            int kill_errno = errno;
+            printf("  [PARENT] kill(%d, 0) = %d, errno=%d "
+                   "(0=exists, ESRCH=gone, EPERM=exists-but-not-ours)\n",
+                   exec_child, kill_rc, kill_errno);
+        }
         test_result("waitpid() returns execve child PID", waited == exec_child);
         if (WIFEXITED(status)) {
             int exit_status = WEXITSTATUS(status);
@@ -4028,15 +4122,11 @@ network_section:
             test_result("getsockname port == 12345", ntohs(got_addr.sin_port) == sock_test_port);
         }
 
-        // Test bind (TCP)
+        // Test bind (TCP) — ephemeral port so parallel teststress runs
+        // don't collide on a fixed number.
         if (tcp_fd >= 0) {
-            struct sockaddr_in addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sin_family = AF_INET;
-            addr.sin_port = htons(12346);
-            addr.sin_addr.s_addr = htonl(INADDR_ANY);
-            int ret = bind(tcp_fd, (struct sockaddr*)&addr, sizeof(addr));
-            test_result("bind(tcp, port 12346) == 0", ret == 0);
+            uint16_t tcp_bind_port = bind_to_ephemeral(tcp_fd, INADDR_ANY);
+            test_result("bind(tcp, ephemeral) == 0", tcp_bind_port != 0);
         }
 
         // Test listen (TCP)
@@ -5066,13 +5156,16 @@ network_section:
     // ========================================
     printf("\n--- TCP Bind Address Variants ---\n");
 
-    run_tcp_large_transfer_case("tcp any lo", 0x00000000, 0x7F000001, 20023);
+    /* port == 0 → kernel picks an ephemeral port; the helper re-reads it
+     * via getsockname so the child connect()s to the right one.  This
+     * avoids fixed-port collisions across parallel teststress instances. */
+    run_tcp_large_transfer_case("tcp any lo", 0x00000000, 0x7F000001, 0);
 
     {
         uint32_t eth0_ip = 0;
         if (get_interface_ipv4("eth0", &eth0_ip) == 0 && eth0_ip != 0) {
-            run_tcp_large_transfer_case("tcp any eth0", 0x00000000, eth0_ip, 20024);
-            run_tcp_large_transfer_case("tcp eth0", eth0_ip, eth0_ip, 20025);
+            run_tcp_large_transfer_case("tcp any eth0", 0x00000000, eth0_ip, 0);
+            run_tcp_large_transfer_case("tcp eth0", eth0_ip, eth0_ip, 0);
         } else {
             test_result("tcp any eth0: interface/address unavailable, skip", 1);
             test_result("tcp eth0: interface/address unavailable, skip", 1);
@@ -5217,12 +5310,16 @@ network_section:
             int yes = 1;
             setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
+            /* Ephemeral local port so parallel teststress instances don't
+             * collide on a fixed port. */
+            uint16_t inet_port = bind_to_ephemeral(srv, INADDR_LOOPBACK);
+            test_result("inet: tcp bind", inet_port != 0);
+
             struct sockaddr_in sa;
             memset(&sa, 0, sizeof(sa));
             sa.sin_family = AF_INET;
-            sa.sin_port = htons(20455);
+            sa.sin_port = htons(inet_port);
             sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            test_result("inet: tcp bind", bind(srv, (struct sockaddr*)&sa, sizeof(sa)) == 0);
             test_result("inet: tcp listen", listen(srv, 4) == 0);
 
             test_result("inet: tcp connect", connect(cli, (struct sockaddr*)&sa, sizeof(sa)) == 0);
@@ -5315,23 +5412,32 @@ network_section:
         int rx = socket(AF_INET, SOCK_DGRAM, 0);
         int tx = socket(AF_INET, SOCK_DGRAM, 0);
         if (rx >= 0 && tx >= 0) {
-            int yes = 1;
-            setsockopt(rx, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+            /* Ephemeral bind so two parallel teststress instances don't
+             * collide on a fixed port (UDP delivery only goes to the
+             * first matching socket → second instance's recvfrom hangs
+             * forever).  RCVTIMEO so a lost datagram fails the test
+             * loudly instead of blocking the rest of the suite. */
+            uint16_t peek_port = bind_to_ephemeral(rx, INADDR_LOOPBACK);
+            struct timeval peek_tv = { .tv_sec = 3, .tv_usec = 0 };
+            setsockopt(rx, SOL_SOCKET, SO_RCVTIMEO, &peek_tv, sizeof(peek_tv));
+
             struct sockaddr_in la;
             memset(&la, 0, sizeof(la));
             la.sin_family = AF_INET;
-            la.sin_port = htons(20457);
+            la.sin_port = htons(peek_port);
             la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            bind(rx, (struct sockaddr*)&la, sizeof(la));
+            test_result("UDP MSG_PEEK: bind ephemeral", peek_port != 0);
 
-            sendto(tx, "PEEK!", 5, 0, (struct sockaddr*)&la, sizeof(la));
+            if (peek_port != 0) {
+                sendto(tx, "PEEK!", 5, 0, (struct sockaddr*)&la, sizeof(la));
 
-            char b1[16] = {0}, b2[16] = {0};
-            ssize_t n1 = recvfrom(rx, b1, sizeof(b1), MSG_PEEK, NULL, NULL);
-            ssize_t n2 = recvfrom(rx, b2, sizeof(b2), 0, NULL, NULL);
-            test_result("UDP MSG_PEEK keeps datagram",
-                        n1 == 5 && n2 == 5 && memcmp(b1, "PEEK!", 5) == 0 &&
-                        memcmp(b2, "PEEK!", 5) == 0);
+                char b1[16] = {0}, b2[16] = {0};
+                ssize_t n1 = recvfrom(rx, b1, sizeof(b1), MSG_PEEK, NULL, NULL);
+                ssize_t n2 = recvfrom(rx, b2, sizeof(b2), 0, NULL, NULL);
+                test_result("UDP MSG_PEEK keeps datagram",
+                            n1 == 5 && n2 == 5 && memcmp(b1, "PEEK!", 5) == 0 &&
+                            memcmp(b2, "PEEK!", 5) == 0);
+            }
 
             close(rx);
             close(tx);

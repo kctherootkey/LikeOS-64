@@ -1,13 +1,21 @@
 // LikeOS-64 Unified Page Cache
-// Caches file data pages indexed by (start_cluster, page_index).
-// Uses CLOCK eviction, write-back dirty tracking, and sequential read-ahead.
-// SMP-safe with per-bucket spinlocks.
+//
+// Caches file data pages indexed by (inode_id, page_index).  `inode_id` is the
+// filesystem's native inode identifier (FAT32 start cluster, EXT4 inode no.);
+// the cache treats it as an opaque key.  All disk translation (block_to_lba,
+// block-chain walking, dirty writeback) goes through vfs_superblock_t->ops,
+// so this file has no FS-specific knowledge.
+//
+// CLOCK eviction on a global LRU ring.  Write-back dirty tracking.
+// Sequential read-ahead.  SMP-safe with per-bucket spinlocks.
 
 #ifndef _KERNEL_PAGECACHE_H_
 #define _KERNEL_PAGECACHE_H_
 
 #include "types.h"
 #include "sched.h"
+
+struct vfs_superblock;          /* forward — see vfs_sb.h                    */
 
 // ============================================================================
 // Configuration
@@ -97,15 +105,14 @@ void pagecache_init(void);
 pc_page_t* pagecache_lookup(unsigned long cluster_id, unsigned long page_index);
 
 // Fetch a page: lookup + read-from-disk on miss.
-// Caller must provide the FAT32 fs pointer and the file's cluster chain
-// state so we can read the correct disk sector on miss.
+// Caller provides the filesystem superblock (for block translation +
+// chain walking) and the file's first block_id (`start_cluster`).
 // `file_size` is the file size in bytes (to avoid reading past EOF).
 // Returns page with data, or NULL on error.
 // This is the primary entry point for cached reads.
-struct fat32_fs;  // forward declaration
 pc_page_t* pagecache_get(unsigned long cluster_id, unsigned long page_index,
                          unsigned long file_size,
-                         struct fat32_fs* fs, unsigned long start_cluster);
+                         struct vfs_superblock* sb, unsigned long start_cluster);
 
 // Insert a page into the cache (used internally and by write path).
 // The caller provides a page with data already filled in.
@@ -118,7 +125,8 @@ pc_page_t* pagecache_insert(pc_page_t* page);
 void pagecache_mark_dirty(pc_page_t* page);
 
 // Flush all dirty pages for a specific file (cluster_id) to disk.
-// Called on close, fsync. Acquires fat32_io_lock internally.
+// Called on close, fsync.  Acquires the FS-wide I/O lock through the
+// globally-registered superblock (g_root_sb) internally.
 int pagecache_flush_file(unsigned long cluster_id);
 
 // Flush all dirty pages globally. Called by periodic writeback timer.
@@ -155,7 +163,7 @@ void pagecache_invalidate_all(void);
 // `current_page` is the page just accessed.
 void pagecache_readahead(pc_readahead_t* ra, unsigned long cluster_id,
                          unsigned long current_page, unsigned long file_size,
-                         struct fat32_fs* fs, unsigned long start_cluster);
+                         struct vfs_superblock* sb, unsigned long start_cluster);
 
 // --- Statistics ---
 

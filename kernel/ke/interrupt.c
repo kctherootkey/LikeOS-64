@@ -470,6 +470,43 @@ static int is_kernel_addr(uint64_t addr) {
     return addr >= 0xffff800000000000ULL && addr < 0xfffffffffffff000ULL;
 }
 
+/* Dump 32 bytes centered on RIP (16 before, 16 starting at RIP) so the
+ * faulting instruction can be disassembled post-mortem with
+ *     printf '<bytes>' | x86_64-objdump -D -b binary -m i386:x86-64 \
+ *         -M intel --adjust-vma=<rip-16> /dev/stdin
+ * or recompiled into a hex blob and dropped on top of the unstripped
+ * kernel ELF.  Best-effort: skip pages whose presence we cannot verify
+ * without risking a recursive #PF inside the oops handler. */
+static void oops_rip_bytes(uint64_t rip) {
+    if (!is_kernel_addr(rip))
+        return;
+    uint64_t start = rip - 16;
+    /* Bail out if [start, start+32) straddles a not-present page.
+     * Probe the first and last bytes via the same PT-walk used by
+     * oops_pf_decode — but cheaper: just check the PTE is present.
+     * Walking via the direct map is safe because the bootloader-mapped
+     * range covers physical RAM that holds the page tables. */
+    /* mm_user_addr_mapped walks the active CR3 PT; it is safe to call on
+     * kernel addresses too — returns false on any not-present entry. */
+    if (!mm_user_addr_mapped(start, 32))
+        return;
+
+    kprintf("\n--- Bytes around RIP (RIP-16 .. RIP+15) ---\n");
+    const uint8_t *p = (const uint8_t *)start;
+    /* Two rows of 16 bytes each.  Mark the byte at RIP with [..]. */
+    for (int row = 0; row < 2; row++) {
+        kprintf("  %016llx:", (unsigned long long)(start + row * 16));
+        for (int col = 0; col < 16; col++) {
+            uint64_t addr = start + row * 16 + col;
+            if (addr == rip)
+                kprintf(" [%02x]", p[row * 16 + col]);
+            else
+                kprintf(" %02x", p[row * 16 + col]);
+        }
+        kprintf("\n");
+    }
+}
+
 /* Walk the RBP frame chain and print return addresses via kprintf */
 static void oops_stack_trace(uint64_t rbp, uint64_t fault_rip) {
     kprintf("\nCall Trace:\n");
@@ -757,6 +794,9 @@ void kernel_oops(const char *reason, uint64_t *regs) {
             regs[REGS_R14], regs[REGS_R15]);
     kprintf("CR2: 0x%016llx  CR3: 0x%016llx  CR4: 0x%016llx\n", cr2, cr3, cr4);
 
+    /* Faulting-instruction bytes (post-mortem disassembly) */
+    oops_rip_bytes(rip);
+
     /* Stack trace */
     oops_stack_trace(rbp, rip);
 
@@ -840,6 +880,12 @@ static void report_userspace_crash_detailed(task_t* cur, uint64_t* regs,
         task_tty_printf(cur, "Fault VA:  %016llx\n", cr2);
     task_tty_printf(cur, "Access:    %s\n",  access);
     task_tty_printf(cur, "Mode:      user\n\n");
+    /* err_code is the smoking gun for #GP / #PF.  For #GP: zero ⇒
+     * instruction-level cause (SSE alignment, non-canonical operand,
+     * privileged instruction); non-zero ⇒ segment selector index +
+     * EXT/IDT/TI bits.  For #PF: bit 0 P, bit 1 W, bit 2 U, bit 3 RSVD,
+     * bit 4 I/D, bit 5 PK, bit 15 SGX. */
+    task_tty_printf(cur, "err_code:  %016llx\n", err_code);
     task_tty_printf(cur, "RIP:       %016llx\n",   rip);
     task_tty_printf(cur, "RSP:       %016llx\n",   rsp);
     task_tty_printf(cur, "RBP:       %016llx\n\n", rbp);
@@ -853,7 +899,55 @@ static void report_userspace_crash_detailed(task_t* cur, uint64_t* regs,
     task_tty_printf(cur, "R14: %016llx  R15: %016llx\n", regs[REGS_R14], regs[REGS_R15]);
     task_tty_printf(cur, "RFLAGS: %016llx\n", regs[REGS_RFLAGS]);
 
-    task_tty_printf(cur, "\nMemory map:\n");
+    /* User-segment / TLS state.  If FS_BASE or GS_BASE got clobbered to a
+     * non-canonical value, every TLS load via %fs: from userspace would
+     * #GP — and #GP just after sysret is exactly the symptom of a bad
+     * FS_BASE.  Reading these MSRs is privileged and safe in kernel. */
+    {
+        uint64_t fs_base = 0, gs_base = 0, kgs_base = 0;
+        uint32_t lo, hi;
+        __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000100u));
+        fs_base = ((uint64_t)hi << 32) | lo;
+        __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000101u));
+        gs_base = ((uint64_t)hi << 32) | lo;
+        __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000102u));
+        kgs_base = ((uint64_t)hi << 32) | lo;
+        task_tty_printf(cur, "FS_BASE:        %016llx%s\n", fs_base,
+                        ((fs_base >> 47) != 0 && (fs_base >> 47) != 0x1FFFFULL)
+                            ? "  (NON-CANONICAL!)" : "");
+        task_tty_printf(cur, "GS_BASE:        %016llx\n", gs_base);
+        task_tty_printf(cur, "KERNEL_GS_BASE: %016llx\n", kgs_base);
+        if (cur)
+            task_tty_printf(cur, "task->fs_base:  %016llx\n", cur->fs_base);
+    }
+
+    /* Bytes around RIP for post-mortem disassembly.  Guarded by
+     * mm_user_addr_mapped so we don't take a nested #PF inside the
+     * crash handler.  Goes via task_tty_printf so output lands in the
+     * same terminal as the rest of the report. */
+    if ((rip >> 47) == 0 && mm_user_addr_mapped(rip - 16, 32)) {
+        const uint8_t *p = (const uint8_t *)(rip - 16);
+        task_tty_printf(cur,
+                "\nBytes around RIP (RIP-16 .. RIP+15):\n");
+        for (int row = 0; row < 2; row++) {
+            uint64_t base = rip - 16 + row * 16;
+            task_tty_printf(cur,
+                    "  %016llx: %02x %02x %02x %02x %02x %02x %02x %02x"
+                    " %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                    base,
+                    p[row*16+ 0], p[row*16+ 1], p[row*16+ 2], p[row*16+ 3],
+                    p[row*16+ 4], p[row*16+ 5], p[row*16+ 6], p[row*16+ 7],
+                    p[row*16+ 8], p[row*16+ 9], p[row*16+10], p[row*16+11],
+                    p[row*16+12], p[row*16+13], p[row*16+14], p[row*16+15]);
+        }
+        task_tty_printf(cur,
+                "  (the byte at RIP is at offset 16 of the first row)\n");
+    } else {
+        task_tty_printf(cur,
+                "\nBytes around RIP: <not safely readable>\n");
+    }
+
+    task_tty_printf(cur, "\nMemory map (mmap regions tracked by syscall layer):\n");
     if (cur) {
         mmap_region_t* regions;
         int count;
@@ -875,6 +969,67 @@ static void report_userspace_crash_detailed(task_t* cur, uint64_t* regs,
             perms[4] = '\0';
             task_tty_printf(cur, "  %016llx-%016llx %s\n",
                             r->start, r->start + r->length, perms);
+        }
+    }
+
+    /* Page-table walk of the faulting address — gives the definitive
+     * mapping state (present / writable / user / NX) for cr2.
+     *
+     * Goes through task_tty_printf so it lands in the same terminal as
+     * the rest of the crash report.  The PTY-slave write path is a
+     * non-blocking ring enqueue and the faulting (slave-side) thread
+     * does not normally hold pty->lock, so this is safe from #PF
+     * context.
+     *
+     * Each level checks _PAGE_PSE (bit 7): a PDPT entry with PSE is a
+     * 1 GB huge page (terminal), not a PD pointer; a PD entry with PSE
+     * is a 2 MB huge page (terminal), not a PT pointer.  Walking
+     * "through" a huge entry would treat the mapped data page as a
+     * page table and dereference garbage physical addresses → nested
+     * fault → triple fault → silent freeze. */
+    if (int_no == 14 && cur && cur->pml4) {
+        uint64_t va    = cr2 & ~0xFFFULL;
+        uint64_t pml4i = (va >> 39) & 0x1FF;
+        uint64_t pdpti = (va >> 30) & 0x1FF;
+        uint64_t pdi   = (va >> 21) & 0x1FF;
+        uint64_t pti   = (va >> 12) & 0x1FF;
+        uint64_t pml4e = cur->pml4[pml4i];
+        task_tty_printf(cur, "\nPage table walk for VA %016llx:\n", cr2);
+        task_tty_printf(cur, "  PML4[%lu] = %016llx %s\n",
+                        pml4i, pml4e,
+                        (pml4e & 1) ? "present" : "NOT PRESENT");
+        if (pml4e & 1) {
+            uint64_t  pdpt_phys = pml4e & 0x000FFFFFFFFFF000ULL;
+            uint64_t *pdpt      = (uint64_t*)phys_to_virt(pdpt_phys);
+            uint64_t  pdpte     = pdpt[pdpti];
+            int       pdpt_huge = (pdpte & 0x80) != 0;
+            task_tty_printf(cur, "  PDPT[%lu] = %016llx %s%s\n",
+                            pdpti, pdpte,
+                            (pdpte & 1) ? "present" : "NOT PRESENT",
+                            pdpt_huge ? " 1G-huge" : "");
+            if ((pdpte & 1) && !pdpt_huge) {
+                uint64_t  pd_phys = pdpte & 0x000FFFFFFFFFF000ULL;
+                uint64_t *pd      = (uint64_t*)phys_to_virt(pd_phys);
+                uint64_t  pde     = pd[pdi];
+                int       pd_huge = (pde & 0x80) != 0;
+                task_tty_printf(cur, "  PD[%lu]   = %016llx %s%s\n",
+                                pdi, pde,
+                                (pde & 1) ? "present" : "NOT PRESENT",
+                                pd_huge ? " 2M-huge" : "");
+                if ((pde & 1) && !pd_huge) {
+                    uint64_t  pt_phys = pde & 0x000FFFFFFFFFF000ULL;
+                    uint64_t *pt      = (uint64_t*)phys_to_virt(pt_phys);
+                    uint64_t  pte     = pt[pti];
+                    task_tty_printf(cur,
+                            "  PT[%lu]   = %016llx %s%s%s%s%s\n",
+                            pti, pte,
+                            (pte & 1)            ? " present"  : " NOT-PRESENT",
+                            (pte & 2)            ? " W"        : " R-only",
+                            (pte & 4)            ? " U"        : " S-only",
+                            (pte & 0x200)        ? " COW"      : "",
+                            (pte & (1ULL << 63)) ? " NX"       : "");
+                }
+            }
         }
     }
     task_tty_printf(cur, "\nSYSTEM ACTION:\n  process terminated\n");
@@ -900,6 +1055,16 @@ void exception_handler(uint64_t *regs) {
     uint64_t rip = regs[REGS_RIP];
     uint64_t cs = regs[REGS_CS];
     int user_mode = (cs & 0x3) == 0x3;
+
+    /* INT 2 (NMI): if this NMI is a diagnostic probe armed by another CPU
+     * via smp_tlb_shootdown_sync's timeout path, record this CPU's state
+     * and return.  Only real, un-armed NMIs fall through to the
+     * kernel_oops path below. */
+    if (int_no == 2) {
+        if (smp_nmi_capture_record(regs))
+            return;
+        /* Real NMI in kernel mode: fall through. */
+    }
 
     if (int_no == 14) {
         uint64_t cr2;
@@ -1006,9 +1171,11 @@ static inline uint8_t pic2_read_isr(void) {
 }
 
 void irq_handler(uint64_t *regs) {
+    BUG_ON(regs == NULL);
     uint64_t int_no = regs[REGS_INTNO];
+    WARN_RATELIMIT(int_no >= 256, "irq_handler: bogus int_no=%lu", int_no);
     uint8_t irq = (uint8_t)(int_no - 32);
-    
+
     g_total_irq_count++;
 
     // Legacy INTx dispatch for E1000 / e1000e NICs (when MSI is not

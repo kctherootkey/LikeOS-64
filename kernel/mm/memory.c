@@ -835,6 +835,7 @@ uint64_t mm_allocate_physical_page(void) {
 // Free a physical page (SMP-safe)
 void mm_free_physical_page(uint64_t physical_address) {
     WARN_ON(physical_address & (PAGE_SIZE - 1));  /* freeing non-page-aligned address */
+    VM_BUG_ON(physical_address == 0);
     if (physical_address < mm_state.memory_start || physical_address >= mm_state.memory_end) {
         return; // Invalid address
     }
@@ -1236,6 +1237,8 @@ void mm_remap_kernel_with_nx(void) {
 
 // Map virtual page to physical page (SMP-safe)
 bool mm_map_page(uint64_t virtual_addr, uint64_t physical_addr, uint64_t flags) {
+    VM_BUG_ON(virtual_addr & (PAGE_SIZE - 1));
+    VM_BUG_ON(physical_addr & (PAGE_SIZE - 1));
     uint64_t lock_flags;
     spin_lock_irqsave(&mm_kernel_pt_lock, &lock_flags);
 
@@ -2371,6 +2374,17 @@ uint64_t* mm_get_current_address_space(void) {
 // current address space (CR3).  Returns true only if all pages are mapped.
 bool mm_user_addr_mapped(uint64_t vaddr, size_t len) {
     if (len == 0) return true;
+
+    /* Reject ranges that wrap past the top of the 64-bit address space.
+     * Without this, a caller passing e.g. rip-16 where rip is small (the
+     * crash handler's "Bytes around RIP" dump when a user task jumped to a
+     * NULL/low address) yields vaddr = 0xfffffffffffffff0.  Then
+     * (vaddr + len - 1) overflows, end_page wraps below start_page, the
+     * page-walk loop never runs, and the function wrongly returns true —
+     * the caller then dereferences the unmapped wrap address and the kernel
+     * itself takes a #PF while reporting a recoverable userspace crash. */
+    if (vaddr + len < vaddr) return false;
+
     uint64_t pml4_phys = get_cr3() & ~0xFFFULL;
     uint64_t* pml4 = (uint64_t*)phys_to_virt(pml4_phys);
 

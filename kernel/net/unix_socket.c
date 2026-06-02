@@ -85,6 +85,7 @@ static unix_socket_t* unix_find_by_path_locked(const char* path) {
 // unix_create - Create a new UNIX domain socket
 // ============================================================================
 int unix_create(int type) {
+    might_sleep();
     if (type != SOCK_STREAM && type != SOCK_DGRAM) return -EINVAL;
 
     uint64_t tflags;
@@ -297,6 +298,7 @@ int unix_connect(int usockfd, const struct sockaddr_un* addr) {
 // unix_send - Send data on a connected UNIX socket
 // ============================================================================
 int unix_send(int usockfd, const void* buf, size_t len, int flags) {
+    might_sleep();
     BUG_ON(buf == NULL && len > 0);
     (void)flags;
     unix_socket_t* us = unix_get(usockfd);
@@ -376,6 +378,7 @@ int unix_send(int usockfd, const void* buf, size_t len, int flags) {
 // unix_recv - Receive data from a connected UNIX socket
 // ============================================================================
 int unix_recv(int usockfd, void* buf, size_t len, int flags) {
+    might_sleep();
     BUG_ON(buf == NULL && len > 0);
     (void)flags;
     unix_socket_t* us = unix_get(usockfd);

@@ -258,6 +258,7 @@ int pci_enumerate(void)
 
 const pci_device_t* pci_get_devices(int* count)
 {
+    BUG_ON(count == NULL);
     if(count) {
         *count = g_pci_count;
     }
@@ -337,6 +338,7 @@ uint8_t pci_find_capability(const pci_device_t* dev, uint8_t cap_id)
 
 int pci_enable_msi(const pci_device_t* dev, uint8_t vector)
 {
+    BUG_ON(dev == NULL);
     WARN_ON(vector < 32);  /* MSI vector must be >= 32 (0-31 are CPU exceptions) */
     uint8_t cap_off = pci_find_capability(dev, PCI_CAP_MSI);
     if (cap_off == 0) {

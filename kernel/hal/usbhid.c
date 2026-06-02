@@ -586,6 +586,7 @@ static void hid_resubmit_irq(usbhid_device_t* hdev) {
 // 0 otherwise (fall through to the generic pending_xfer path).
 int usbhid_irq_completion(xhci_controller_t* ctrl, uint8_t slot, uint8_t ep_id,
                            uint8_t cc, uint32_t residue) {
+    WARN_RATELIMIT(ctrl == NULL, "usbhid_irq_completion: NULL controller");
     if (!g_hid_initialized || g_hid_device_count == 0)
         return 0;
 
@@ -965,6 +966,8 @@ void usbhid_init(void) {
 //   Protocol = 0x01 (Keyboard) or 0x02 (Mouse)
 int usbhid_probe(xhci_controller_t* ctrl, usb_device_t* dev,
                   uint8_t* config_desc, uint16_t config_len) {
+    might_sleep();
+    BUILD_BUG_ON(sizeof(usb_config_desc_t) < 9);
     if (!ctrl || !dev || !config_desc || config_len < 9) return ST_INVALID;
     if (!g_hid_initialized) usbhid_init();
 

@@ -162,6 +162,12 @@ void lapic_set_tsc_freq(uint64_t hz);
 // Send IPI to a specific CPU by APIC ID
 void lapic_send_ipi(uint32_t apic_id, uint32_t vector);
 
+/* Send an NMI to the given APIC ID.  NMIs ignore the target CPU's IF flag,
+ * so they fire even while the target is spinning in a cli'd kernel section.
+ * Used by smp_tlb_shootdown_sync's timeout path to capture where a wedged
+ * CPU is stuck. */
+void lapic_send_nmi(uint32_t apic_id);
+
 // Send INIT IPI to a CPU
 void lapic_send_init(uint32_t apic_id);
 

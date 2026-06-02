@@ -28,6 +28,10 @@ static uint32_t g_cursor_pixels[CURSOR_MAX_WIDTH * CURSOR_MAX_HEIGHT];
 // Load an Xcursor format cursor file from the VFS
 // We look for the smallest image size (typically 24x24) for best fit
 int cursor_load(const char* path) {
+    BUG_ON(path == NULL);
+    BUILD_BUG_ON(sizeof(xcursor_header_t) != 16);
+    BUILD_BUG_ON(sizeof(xcursor_toc_t) != 12);
+    might_sleep();   /* vfs_open / vfs_read */
     vfs_file_t* file = 0;
     int ret;
     long bytes_read;

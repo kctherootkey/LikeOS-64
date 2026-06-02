@@ -3981,12 +3981,17 @@ static int64_t sys_arch_prctl(uint64_t code, uint64_t addr) {
     
     switch (code) {
         case ARCH_SET_FS: {
-            // Reject non-canonical addresses — wrmsr to MSR_FS_BASE
-            // will #GP if bits 63:48 are not a sign-extension of bit 47.
-            uint64_t top = addr >> 47;
-            if (addr != 0 && top != 0 && top != 0x1FFFF) {
+            /* Reject any address whose top bit (bit 47) is 1.  A user
+             * task may only set FS to USER-space addresses.  Canonical
+             * checking alone (allowing top == 0x1FFFF, i.e. kernel half)
+             * would let user code point FS at an arbitrary kernel VA,
+             * which then poisons every libc stack-canary read
+             * (`mov %fs:0x28, %rax`) and any other FS-relative TLS
+             * access.  The resulting #PF can land in kernel mode if
+             * triggered while the kernel is between SWAPGS / sysret —
+             * a wild fault that is almost impossible to reproduce. */
+            if (addr != 0 && (addr >> 47) != 0)
                 return -EINVAL;
-            }
             task_set_fs_base(cur, addr);
             // Apply immediately
             task_load_tls(cur);
@@ -4003,11 +4008,14 @@ static int64_t sys_arch_prctl(uint64_t code, uint64_t addr) {
             return 0;
         
         case ARCH_SET_GS: {
-            // Reject non-canonical addresses
-            uint64_t top = addr >> 47;
-            if (addr != 0 && top != 0 && top != 0x1FFFF) {
+            /* Reject kernel addresses (top bit set) — same rationale as
+             * ARCH_SET_FS above.  Even though task_load_tls today does
+             * not push gs_base into MSR_GS_BASE (the kernel manages %gs
+             * exclusively for per-CPU data), the field is exposed by
+             * ARCH_GET_GS and could be picked up by future code; refuse
+             * the bad value at the API boundary. */
+            if (addr != 0 && (addr >> 47) != 0)
                 return -EINVAL;
-            }
             cur->gs_base = addr;
             return 0;
         }
@@ -4984,8 +4992,13 @@ static int unix_do_recvmsg(int ufd, struct msghdr *kmsg) {
 }
 
 // Main syscall dispatcher (inner function)
-static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2, 
+static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
                         uint64_t a3, uint64_t a4, uint64_t a5) {
+    /* All syscalls run in process context with IRQs enabled — any path
+     * that allocates, blocks on I/O, or sleeps must be reachable.  If
+     * we ever enter with IRQs off it means a kernel caller bypassed the
+     * syscall entry stub; almost every syscall would deadlock. */
+    WARN_ON_ONCE(irqs_disabled());
     switch (num) {
         case SYS_READ:
             return sys_read(a1, a2, a3);

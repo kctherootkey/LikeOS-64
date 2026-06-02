@@ -3,9 +3,16 @@
 
 # Pass DEBUG=1 on the command line to enable verbose stack-smash output in libc
 # and kernel memory poisoning (freed slabs, freed pages, uninitialized allocs).
+# DEBUG=1 also implies NO_STRIP=1 and adds -g3 so RIP-around-fault byte dumps
+# can be disassembled post-mortem (objdump -d build/kernel.elf).
 DEBUG ?= 0
 ifeq ($(DEBUG),1)
-  KERNEL_DEBUG_CFLAGS = -DDEBUG=1
+  KERNEL_DEBUG_CFLAGS = -DDEBUG=1 -g3 -gdwarf-4
+  # Force preservation of the symbol table when DEBUG is set.  Without this
+  # the post-mortem byte dump emitted by the oops handler is useless because
+  # we cannot resolve RIP back to a function name.  Use `override` so a
+  # stray `NO_STRIP=` on the command line cannot quietly turn symbols off.
+  override NO_STRIP := 1
 else
   KERNEL_DEBUG_CFLAGS =
 endif

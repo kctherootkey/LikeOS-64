@@ -1,12 +1,15 @@
 // LikeOS-64 Inode Cache
 //
 // Caches per-file metadata (size, attributes, dirent location) indexed by
-// start_cluster — FAT32's de-facto inode number.
+// the filesystem's native inode identifier.  For FAT32 that is the file's
+// first cluster; for EXT4 it is the inode-table index.  The cache treats
+// the key as an opaque `unsigned long` and never dereferences any FS-
+// specific state — all I/O dispatches through vfs_superblock_t->ops.
 //
 // Each cached inode carries a reference count: open file handles hold refs,
 // and the inode stays cached even after all handles close (for quick reopen).
 // A per-inode lock enables concurrent reads to different cached files
-// without requiring the global fat32_io_lock.
+// without requiring the global per-FS I/O lock.
 //
 // SMP-safe with per-bucket spinlocks and per-inode locks.
 
@@ -15,6 +18,8 @@
 
 #include "types.h"
 #include "sched.h"
+
+struct vfs_superblock;          /* forward — see vfs_sb.h                    */
 
 // ============================================================================
 // Configuration
@@ -38,17 +43,23 @@
 // ============================================================================
 
 typedef struct ic_inode {
-    // Key
-    unsigned long   start_cluster;      // File's first cluster (inode number)
+    // Key — FS-native inode identifier (FAT32: start cluster; EXT4: inode no.).
+    unsigned long   start_cluster;
 
-    // Cached metadata
+    // Generic cached metadata
     unsigned long   size;               // File size in bytes
-    unsigned int    attr;               // FAT32 attributes
-    unsigned long   parent_cluster;     // Parent directory cluster
-    unsigned long   dirent_cluster;     // Cluster containing the short dirent
-    unsigned int    dirent_index;       // Index of short dirent in that cluster
-    uint16_t        wrt_time;           // FAT32 write time
-    uint16_t        wrt_date;           // FAT32 write date
+    unsigned int    attr;               // FS-defined attribute bits (opaque to caches)
+    unsigned long   parent_cluster;     // Parent directory's inode identifier
+    uint16_t        wrt_time;           // FS-defined mtime encoding (opaque)
+    uint16_t        wrt_date;
+
+    /* FS-private metadata location.  For FAT32 the on-disk dirent lives at
+     * (dirent_cluster, dirent_index); for other filesystems these may
+     * encode an inode-table block + offset, or be unused entirely.  The
+     * caches only pass these to sb->ops->write_inode(); they never
+     * interpret them. */
+    unsigned long   dirent_cluster;
+    unsigned int    dirent_index;
 
     // Reference counting
     volatile int    refcount;           // Number of open file handles
@@ -57,16 +68,16 @@ typedef struct ic_inode {
     uint32_t        flags;
 
     // Per-inode lock: allows concurrent cached reads to different files
-    // without the global fat32_io_lock.
+    // without holding the FS-wide I/O lock.
     volatile int    io_locked;
     spinlock_t      io_wait_lock;
 
-    // Cluster chain cache — linearized array of cluster numbers.
-    // chain[0] = start_cluster, chain[1] = next, etc.
-    // Lazily populated on demand.  Avoids O(N) chain walks.
-    unsigned long  *chain;              // Cluster number array
-    unsigned long   chain_len;          // Number of valid entries
-    unsigned long   chain_cap;          // Allocated capacity
+    // Block-chain cache — linearized array of FS-native block_ids that hold
+    // this inode's data.  chain[0] = start_cluster, chain[1] = next, etc.
+    // Lazily populated on demand to avoid O(N) chain walks.
+    unsigned long  *chain;
+    unsigned long   chain_len;
+    unsigned long   chain_cap;
 
     // Hash chain (per-bucket singly-linked)
     struct ic_inode* hash_next;
@@ -123,15 +134,14 @@ void icache_invalidate_all(void);
 void icache_io_lock(ic_inode_t *inode);
 void icache_io_unlock(ic_inode_t *inode);
 
-// --- Cluster chain cache ---
+// --- Block chain cache ---
 
-// Get the cluster number at chain index `idx` for a file identified by
-// start_cluster.  Looks up the inode and lazily extends its cached chain.
-// Returns the cluster number, or 0 if past end-of-chain / error.
-// `fs` is needed to walk the FAT on a cache miss.
-struct fat32_fs;  // forward declaration
+// Get the FS-native block_id at chain index `idx` for a file identified by
+// start_cluster.  Looks up the inode and lazily extends its cached chain
+// via sb->ops->next_block().  Returns the block_id, or 0 if past
+// end-of-chain / error.
 unsigned long icache_chain_get(unsigned long start_cluster, unsigned long idx,
-                               struct fat32_fs *fs);
+                               struct vfs_superblock *sb);
 
 // Invalidate (discard) the chain cache for a file.
 // Call on truncate or unlink.

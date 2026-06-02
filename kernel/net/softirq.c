@@ -23,6 +23,7 @@ static inline uint32_t safe_cpu_id(void) {
 }
 
 void softirq_register(uint32_t nr, softirq_fn_t fn) {
+    BUG_ON(fn == NULL);
     if (nr >= NR_SOFTIRQ) return;
     WARN_ON(softirq_handlers[nr] != NULL);  /* double-registration of softirq handler */
     softirq_handlers[nr] = fn;
@@ -110,6 +111,7 @@ void softirq_drain(void) {
     }
 
     softirq_in_progress[cpu] = 1;
+    BUG_ON(cpu >= MAX_CPUS);
 
     for (;;) {
         uint32_t mask = __atomic_exchange_n(&softirq_pending_mask[cpu], 0,
@@ -134,6 +136,7 @@ void softirq_drain(void) {
 
 static void ksoftirqd_main(void* arg) {
     uint32_t my_cpu = (uint32_t)(uintptr_t)arg;
+    BUG_ON(my_cpu >= MAX_CPUS);
 
     for (;;) {
         softirq_drain();
@@ -164,6 +167,7 @@ static void ksoftirqd_main(void* arg) {
 }
 
 void ksoftirqd_start_all(void) {
+    might_sleep();
     uint32_t ncpus = smp_get_cpu_count();
     if (ncpus == 0) ncpus = 1;
     WARN_ON_ONCE(ncpus > MAX_CPUS);  /* smp_get_cpu_count() returned more CPUs than MAX_CPUS: ACPI/SMP topology exceeds compile-time limit */

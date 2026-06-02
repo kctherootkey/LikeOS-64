@@ -316,7 +316,13 @@ int signal_setup_frame(task_t* task, int sig, siginfo_t* info, struct k_sigactio
     uint64_t user_rsp = task->syscall_rsp;
     uint64_t user_rip = task->syscall_rip;
     uint64_t user_rflags = task->syscall_rflags;
-    
+
+    // Capture the handler entry point NOW, before the SA_RESETHAND reset below
+    // zeroes act->sa_handler.  Reading act->sa_handler after that reset would
+    // set the resume RIP to SIG_DFL (== 0) and dispatch the signal to user
+    // RIP 0 — an instant SIGSEGV (exec at VA 0) instead of running the handler.
+    uint64_t handler = (uint64_t)act->sa_handler;
+
     // Calculate new stack position for signal frame (16-byte aligned)
     uint64_t frame_addr = (user_rsp - sizeof(signal_frame_t)) & ~0xFULL;
     WARN_ON(frame_addr & 0xF);  /* signal frame must be 16-byte aligned */
@@ -404,8 +410,8 @@ int signal_setup_frame(task_t* task, int sig, siginfo_t* info, struct k_sigactio
     
     // Also update task's saved values
     task->syscall_rsp = frame_addr;
-    task->syscall_rip = (uint64_t)act->sa_handler;
-    
+    task->syscall_rip = handler;  // captured before SA_RESETHAND reset above
+
     // CRITICAL: Disable interrupts before modifying per-CPU syscall return context
     // This prevents a race where a timer interrupt could cause a context switch
     __asm__ volatile("cli" ::: "memory");
@@ -415,7 +421,7 @@ int signal_setup_frame(task_t* task, int sig, siginfo_t* info, struct k_sigactio
     // RIP = handler address
     percpu_t* cpu = this_cpu();
     cpu->syscall_user_rsp = frame_addr;
-    cpu->syscall_saved_user_rip = (uint64_t)act->sa_handler;
+    cpu->syscall_saved_user_rip = handler;  // captured before SA_RESETHAND reset above
     
     // Set signal pending flag - this tells syscall.asm to use signal return path
     // The value is the signal number which will be loaded into RDI
@@ -440,6 +446,12 @@ int signal_setup_frame_irq(task_t* task, int sig, siginfo_t* info,
     uint64_t user_rsp    = frame->rsp;
     uint64_t user_rip    = frame->rip;
     uint64_t user_rflags = frame->rflags;
+
+    // Capture the handler entry point NOW, before the SA_RESETHAND reset below
+    // zeroes act->sa_handler.  Reading it after the reset would set the IRETQ
+    // frame's RIP to SIG_DFL (== 0) and return to user RIP 0 — an instant
+    // SIGSEGV (exec at VA 0) instead of running the handler.
+    uint64_t handler = (uint64_t)act->sa_handler;
 
     // Calculate new stack position for signal frame (16-byte aligned)
     uint64_t frame_addr = (user_rsp - sizeof(signal_frame_t)) & ~0xFULL;
@@ -523,7 +535,7 @@ int signal_setup_frame_irq(task_t* task, int sig, siginfo_t* info,
 
     // Also update task's saved syscall values so sigreturn works correctly
     task->syscall_rsp = frame_addr;
-    task->syscall_rip = (uint64_t)act->sa_handler;
+    task->syscall_rip = handler;  // captured before SA_RESETHAND reset above
     task->syscall_rflags = user_rflags;
     task->syscall_rbp = frame->rbp;
     task->syscall_rbx = frame->rbx;
@@ -535,7 +547,7 @@ int signal_setup_frame_irq(task_t* task, int sig, siginfo_t* info,
 
     // Modify the IRETQ frame directly so that when the interrupt returns
     // via iretq, execution goes to the signal handler with correct state.
-    frame->rip = (uint64_t)act->sa_handler;
+    frame->rip = handler;  // captured before SA_RESETHAND reset above
     frame->rsp = frame_addr;  // Signal frame on user stack
     frame->rdi = (uint64_t)sig;  // First argument: signal number
     // CS, SS, RFLAGS stay the same (user mode, same flags)

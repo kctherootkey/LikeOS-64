@@ -49,6 +49,9 @@ int route_add(uint32_t dst_net, uint32_t netmask, uint32_t gateway,
     BUG_ON(dev == NULL && !(flags & RTF_REJECT));
     /* A gateway route with gateway==0 is meaningless (would route to 0.0.0.0) */
     WARN_ON((flags & RTF_GATEWAY) && gateway == 0);
+    /* dst_net must be on the network boundary — bits outside netmask must be 0,
+     * otherwise the LPM lookup mask-and-compare can never match. */
+    WARN_ON((dst_net & ~netmask) != 0);
     uint64_t fl;
     spin_lock_irqsave(&route_lock, &fl);
 
@@ -151,6 +154,8 @@ net_device_t* route_lookup(uint32_t dst_ip, uint32_t* next_hop_out) {
 
 // Get route table entries (for /proc/net/route style display or ioctl)
 int route_get_table(rt_entry_t* entries, int max_entries) {
+    BUG_ON(entries == NULL);
+    BUG_ON(max_entries < 0);
     uint64_t fl;
     spin_lock_irqsave(&route_lock, &fl);
 
@@ -167,6 +172,8 @@ int route_get_table(rt_entry_t* entries, int max_entries) {
 
 // Get route table for userspace
 int net_get_route_table(net_route_info_t* entries, int max_entries) {
+    BUG_ON(entries == NULL);
+    BUG_ON(max_entries < 0);
     uint64_t fl;
     spin_lock_irqsave(&route_lock, &fl);
 

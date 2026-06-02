@@ -5,8 +5,9 @@
 #include "status.h"
 #include "block.h"
 #include "vfs.h"
+#include "vfs_sb.h"
 
-typedef struct {
+typedef struct fat32_fs {
     const block_device_t* bdev;
     unsigned long fat_start_lba;
     unsigned long data_start_lba;
@@ -16,6 +17,11 @@ typedef struct {
     unsigned int root_cluster;
     unsigned int num_fats;
     unsigned long fat_size_sectors;
+    /* VFS-layer superblock.  sb.fs_private points back at this fat32_fs_t,
+     * and sb.ops dispatches the generic cache <-> FS calls
+     * (block_to_lba / next_block / write_inode / lock_io ...).  The
+     * caches reach the FS only through this struct. */
+    vfs_superblock_t sb;
 } fat32_fs_t;
 
 typedef struct {

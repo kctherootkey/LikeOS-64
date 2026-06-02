@@ -53,6 +53,8 @@ int usb_msd_bot_transfer(usb_msd_device_t* msd, usb_msd_cbw_t* cbw,
                          void* data_buf, uint32_t data_len, usb_msd_csw_t* csw) {
     BUG_ON(cbw == NULL);
     BUG_ON(csw == NULL);
+    BUILD_BUG_ON(CBW_SIZE != 31);
+    BUILD_BUG_ON(CSW_SIZE != 13);
     if (!msd || !msd->usb_dev || !msd->ctrl) return ST_INVALID;
     
     xhci_controller_t* ctrl = msd->ctrl;
@@ -457,8 +459,10 @@ int usb_msd_io_release_if_owner(usb_msd_device_t* msd, uint64_t task_id) {
 }
 
 int usb_msd_block_read(block_device_t* dev, unsigned long lba, unsigned long count, void* buf) {
+    BUG_ON(dev == NULL);
+    BUG_ON(buf == NULL && count > 0);
     usb_msd_device_t* msd = (usb_msd_device_t*)dev->driver_data;
-    
+
     if (!msd || !msd->ready) {
         return ST_NO_DEVICE;
     }
@@ -494,8 +498,10 @@ int usb_msd_block_read(block_device_t* dev, unsigned long lba, unsigned long cou
 }
 
 int usb_msd_block_write(block_device_t* dev, unsigned long lba, unsigned long count, const void* buf) {
+    BUG_ON(dev == NULL);
+    BUG_ON(buf == NULL && count > 0);
     usb_msd_device_t* msd = (usb_msd_device_t*)dev->driver_data;
-    
+
     if (!msd || !msd->ready) {
         return ST_NO_DEVICE;
     }

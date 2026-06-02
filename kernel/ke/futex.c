@@ -235,10 +235,11 @@ void futex_init(void) {
 }
 
 int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns) {
+    might_sleep();
     if (!validate_user_ptr(uaddr, sizeof(uint32_t))) {
         return -EFAULT;
     }
-    
+
     task_t* cur = sched_current();
     if (!cur) return -ESRCH;
     

@@ -535,6 +535,9 @@ static int e1000_map_bar(e1000_dev_t* dev) {
 // E1000 Initialization
 // ============================================================================
 void e1000_init(void) {
+    might_sleep();
+    BUILD_BUG_ON(sizeof(e1000_rx_desc_legacy_t) != 16);
+    BUILD_BUG_ON(sizeof(e1000_tx_desc_legacy_t) != 16);
     int count;
     const pci_device_t* devs = pci_get_devices(&count);
 

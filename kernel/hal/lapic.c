@@ -582,11 +582,26 @@ void lapic_send_ipi(uint32_t apic_id, uint32_t vector) {
     }
     // xAPIC: Set destination in high ICR
     lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
-    
+
     // Send IPI: fixed delivery, physical destination, edge triggered
     lapic_write(LAPIC_ICR_LOW, vector | LAPIC_ICR_FIXED | LAPIC_ICR_PHYSICAL |
                 LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE);
-    
+
+    lapic_ipi_wait();
+}
+
+/* NMI delivery: no vector — the receiving CPU dispatches to its INT 2
+ * handler (IST2) regardless of its current IF flag.  Used to probe a CPU
+ * that has stopped acknowledging fixed-delivery IPIs. */
+void lapic_send_nmi(uint32_t apic_id) {
+    if (lapic_x2apic_mode) {
+        x2apic_write_icr(apic_id, LAPIC_ICR_NMI | LAPIC_ICR_PHYSICAL |
+                          LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE);
+        return;
+    }
+    lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
+    lapic_write(LAPIC_ICR_LOW, LAPIC_ICR_NMI | LAPIC_ICR_PHYSICAL |
+                LAPIC_ICR_ASSERT | LAPIC_ICR_EDGE);
     lapic_ipi_wait();
 }
 

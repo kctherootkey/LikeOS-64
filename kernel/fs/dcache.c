@@ -1,9 +1,14 @@
 // LikeOS-64 Dentry Cache
 //
-// Caches the results of FAT32 directory lookups keyed by
-// (parent_cluster, case-insensitive name hash).
+// Caches the results of directory lookups keyed by
+// (parent_inode_id, case-insensitive name hash).  parent_inode_id is
+// the filesystem's native parent identifier — FAT32 parent cluster,
+// EXT4 parent inode number — treated here as an opaque `unsigned long`.
+// The cache only stores results returned by the filesystem driver and
+// never interprets the on-disk format itself; FS-specific metadata
+// like dirent location is opaque to this layer.
 //
-// This eliminates redundant directory cluster scanning for repeated
+// This eliminates redundant directory scanning for repeated
 // open()/stat()/access() calls on the same path.  Negative dentries
 // cache "not found" results to accelerate $PATH resolution where most
 // candidate paths miss.
@@ -161,7 +166,9 @@ static void dc_evict_one(void)
     dc_lru_remove(victim);
     spin_unlock_irqrestore(&dc_lru_lock, lru_flags);
 
-    /* A valid non-negative entry with cluster 1 indicates FAT32 corruption: cluster 1 is reserved */
+    /* Valid non-negative entry whose inode-id is 1 indicates filesystem
+     * corruption — on FAT32 cluster 1 is reserved; other filesystems also
+     * treat 0/1 as out-of-band. */
     WARN_ON_ONCE((victim->flags & DC_VALID) && !(victim->flags & DC_NEGATIVE) && victim->start_cluster == 1);
     unsigned long bucket = dc_bucket_index(victim->parent_cluster,
                                            victim->name_hash);
@@ -308,7 +315,7 @@ void dcache_insert(unsigned long parent_cluster, const char *name,
 
     e->start_cluster    = start_cluster;
     WARN_ON(start_cluster != 0 && start_cluster < 2);  /* files must use cluster >= 2 (0 == root placeholder) */
-    WARN_ON(start_cluster == 1);  /* cluster 1 is reserved in FAT32 and must never appear as a file's start cluster */
+    WARN_ON(start_cluster == 1);  /* inode-id 1 is reserved (FAT32 cluster 1); never a valid file id */
     e->size             = size;
     e->attr             = attr;
     e->wrt_time         = wrt_time;
@@ -318,7 +325,11 @@ void dcache_insert(unsigned long parent_cluster, const char *name,
     e->lfn_start_cluster = lfn_start_cluster;
     e->lfn_start_index  = lfn_start_index;
     e->flags            = DC_VALID;
-    if (attr & 0x10) // FAT32_ATTR_DIRECTORY
+    /* Bit 0x10 == directory in the FS-defined attribute encoding.  The
+     * dcache itself only needs to know "is this a directory" to set the
+     * DC_DIRECTORY hint; the FS driver chooses an encoding that places
+     * the directory bit at 0x10 when registering entries. */
+    if (attr & 0x10)
         e->flags |= DC_DIRECTORY;
 
     // Insert into hash bucket

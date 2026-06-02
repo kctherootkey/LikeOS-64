@@ -661,7 +661,10 @@ void slab_free(void* ptr) {
     if (!ptr) {
         return;
     }
-    
+    /* Detect double-free of a stack address or a never-allocated pointer:
+     * any kernel slab pointer must live in the canonical kernel range. */
+    WARN_ON_ONCE((uintptr_t)ptr < 0xFFFF800000000000ULL);
+
     if (!slab_initialized) {
         kprintf("SLAB: Free before init: %p\n", ptr);
         return;
@@ -866,6 +869,10 @@ void* slab_realloc(void* ptr, size_t new_size) {
 
 // Allocate and zero memory
 void* slab_calloc(size_t count, size_t size) {
+    /* Integer-overflow guard for count * size — multiplied result must
+     * not wrap, else the caller gets a too-small allocation followed by
+     * a write past the end (heap corruption). */
+    WARN_ON(size != 0 && count > (((size_t)-1) / size));
     size_t total_size = count * size;
     void* ptr = slab_alloc(total_size);
     if (ptr) {

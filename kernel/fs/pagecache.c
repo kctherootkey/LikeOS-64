@@ -1,13 +1,17 @@
 // LikeOS-64 Unified Page Cache
 //
-// Caches file data pages indexed by (start_cluster, page_index).
-// CLOCK eviction algorithm on a global LRU ring.
-// Per-bucket spinlocks for the hash table; global spinlock for LRU/dirty lists.
-// Dirty write-back: periodic timer + flush on close/sync.
-// Sequential read-ahead with adaptive window sizing.
+// Caches file data pages indexed by (inode_id, page_index).  inode_id is the
+// FS-native identifier (FAT32 start cluster, EXT4 inode number); the cache
+// stores it as an opaque key.  All disk translation (block_to_lba, chain
+// walking, writeback) goes through vfs_superblock_t->ops, so this file has
+// no FAT32 (or EXT4) knowledge.
+//
+// CLOCK eviction on a global LRU ring.  Per-bucket spinlocks for the hash
+// table; global spinlock for LRU/dirty lists.  Dirty writeback on the
+// timer + close/sync.  Sequential read-ahead with adaptive window sizing.
 
 #include "../../include/kernel/pagecache.h"
-#include "../../include/kernel/fat32.h"
+#include "../../include/kernel/vfs_sb.h"
 #include "../../include/kernel/memory.h"
 #include "../../include/kernel/console.h"
 #include "../../include/kernel/block.h"
@@ -16,18 +20,7 @@
 #include "../../include/kernel/icache.h"
 #include "../../include/kernel/bug.h"
 
-// ============================================================================
-// External FAT32 internals we need (declared in fat32.h)
-// ============================================================================
-
-// Convert cluster number to LBA
-static inline unsigned long pc_cluster_to_lba(fat32_fs_t *fs, unsigned long cluster)
-{
-    WARN_ON(cluster < 2);  /* cluster number < 2 is invalid in FAT32 */
-    return fs->part_lba_offset + fs->data_start_lba + (cluster - 2) * fs->sectors_per_cluster;
-}
-
-// Read sectors from block device (chunked, like fat32.c's read_sectors)
+// Read sectors from block device (chunked).
 #define PC_MAX_SECTORS_PER_READ 128
 
 static int pc_read_sectors(const block_device_t *bdev, unsigned long lba,
@@ -210,27 +203,24 @@ static void pc_page_free(pc_page_t *pg)
 // Walk cluster chain to get the cluster at page_index
 // ============================================================================
 
-// Returns the cluster number that contains the data for page_index
-// (considering the cluster size of the filesystem).
-// A page is 4096 bytes.  A cluster may be 4096, 8192, 16384, etc.
-// pages_per_cluster = cluster_size / PAGE_SIZE.
-// cluster_index = page_index / pages_per_cluster.
-// sub_index = page_index % pages_per_cluster (sector offset within cluster).
+// Returns the FS-native block_id (cluster number on FAT32) that contains
+// the data for page_index, given the file's first block_id and the
+// filesystem's block size.
 //
-// Uses the inode cache's cluster chain map for O(1) lookups when available.
-// Falls back to linear FAT chain walk if no inode is cached.
-// Returns 0 on error.
-static unsigned long pc_walk_chain(fat32_fs_t *fs, unsigned long start_cluster,
-                                   unsigned long cluster_index)
+// A page is 4096 bytes; a block may be 4096, 8192, 16384 ... or smaller.
+// pages_per_block = block_size / PAGE_SIZE.
+// block_index = page_index / pages_per_block.
+// sub_index   = page_index % pages_per_block.
+//
+// Uses the icache's chain cache for O(1) lookups; falls back to linear
+// chain walk via sb->ops->next_block().  Returns 0 on error / past EOF.
+static unsigned long pc_walk_chain(vfs_superblock_t *sb,
+                                   unsigned long start_block,
+                                   unsigned long block_index)
 {
-    // Try the inode chain cache first (O(1) lookup)
-    unsigned long result = icache_chain_get(start_cluster, cluster_index,
-                                            (struct fat32_fs *)fs);
-    if (result != 0 && result < 0x0FFFFFF8)
+    unsigned long result = icache_chain_get(start_block, block_index, sb);
+    if (result != 0 && result < vfs_sb_end_of_chain(sb))
         return result;
-
-    // Fallback: linear walk (icache_chain_get already does this internally,
-    // so reaching here means the chain truly ends before cluster_index)
     return 0;
 }
 
@@ -410,56 +400,57 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
             pg->flags |= PC_PAGE_LOCKED;
             spin_unlock_irqrestore(&pc_lru_lock, lru_flags);
 
-            // Flush this single dirty page inline.
-            extern fat32_fs_t *g_root_fs;
-            fat32_fs_t *flush_fs = g_root_fs;
+            // Flush this single dirty page inline through the generic sb
+            // ops.  Everything FS-specific (cluster math, FAT chain walk)
+            // lives behind block_to_lba() / next_block().
             int flush_ok = 0;
-            if (flush_fs) {
-                unsigned cs = flush_fs->sectors_per_cluster * flush_fs->bytes_per_sector;
-                fat32_io_lock();
-                if (cs >= PAGE_SIZE) {
-                    unsigned ppc = cs / PAGE_SIZE;
-                    if (ppc == 0) ppc = 1;
-                    unsigned long ci = pg->page_index / ppc;
-                    unsigned long sp = pg->page_index % ppc;
-                    unsigned long dc = pc_walk_chain(flush_fs, pg->cluster_id, ci);
-                    if (dc >= 2 && dc < 0x0FFFFFF8) {
-                        unsigned long lba = pc_cluster_to_lba(flush_fs, dc);
-                        if (cs == PAGE_SIZE) {
-                            pc_write_sectors(flush_fs->bdev, lba,
-                                             flush_fs->sectors_per_cluster, pg->data);
+            if (g_root_sb) {
+                vfs_superblock_t *sb = g_root_sb;
+                const block_device_t *bdev = vfs_sb_bdev(sb);
+                unsigned long bs   = vfs_sb_block_size(sb);
+                unsigned long ss   = vfs_sb_sector_size(sb);
+                unsigned long secs_per_block = bs / ss;
+                unsigned long eoc = vfs_sb_end_of_chain(sb);
+                vfs_sb_lock_io(sb);
+                if (bs >= PAGE_SIZE) {
+                    unsigned long ppb = bs / PAGE_SIZE;
+                    if (ppb == 0) ppb = 1;
+                    unsigned long ci = pg->page_index / ppb;
+                    unsigned long sp = pg->page_index % ppb;
+                    unsigned long dc = pc_walk_chain(sb, pg->cluster_id, ci);
+                    if (dc >= 2 && dc < eoc) {
+                        unsigned long lba = vfs_sb_block_to_lba(sb, dc);
+                        if (bs == PAGE_SIZE) {
+                            pc_write_sectors(bdev, lba, secs_per_block, pg->data);
                         } else {
-                            void *tmp = kalloc(cs);
+                            void *tmp = kalloc(bs);
                             if (tmp) {
-                                pc_read_sectors(flush_fs->bdev, lba,
-                                                flush_fs->sectors_per_cluster, tmp);
+                                pc_read_sectors(bdev, lba, secs_per_block, tmp);
                                 mm_memcpy((uint8_t *)tmp + sp * PAGE_SIZE,
                                           pg->data, PAGE_SIZE);
-                                pc_write_sectors(flush_fs->bdev, lba,
-                                                 flush_fs->sectors_per_cluster, tmp);
+                                pc_write_sectors(bdev, lba, secs_per_block, tmp);
                                 kfree(tmp);
                             }
                         }
                         flush_ok = 1;
                     }
                 } else {
-                    unsigned cpp = PAGE_SIZE / cs;
-                    unsigned long fco = pg->page_index * cpp;
-                    unsigned long cur = pc_walk_chain(flush_fs, pg->cluster_id, fco);
+                    unsigned long bpp = PAGE_SIZE / bs;
+                    unsigned long fco = pg->page_index * bpp;
+                    unsigned long cur = pc_walk_chain(sb, pg->cluster_id, fco);
                     unsigned off = 0;
                     flush_ok = 1;
-                    for (unsigned c = 0; c < cpp; c++) {
-                        if (cur == 0 || cur >= 0x0FFFFFF8) break;
-                        unsigned long lba = pc_cluster_to_lba(flush_fs, cur);
-                        pc_write_sectors(flush_fs->bdev, lba,
-                                         flush_fs->sectors_per_cluster,
+                    for (unsigned long c = 0; c < bpp; c++) {
+                        if (cur == 0 || cur >= eoc) break;
+                        unsigned long lba = vfs_sb_block_to_lba(sb, cur);
+                        pc_write_sectors(bdev, lba, secs_per_block,
                                          pg->data + off);
-                        off += cs;
-                        if (c + 1 < cpp)
-                            cur = fat32_next_cluster_cached(flush_fs, cur);
+                        off += bs;
+                        if (c + 1 < bpp)
+                            cur = vfs_sb_next_block(sb, cur);
                     }
                 }
-                fat32_io_unlock();
+                vfs_sb_unlock_io(sb);
             }
             if (flush_ok) {
                 pg->flags &= ~PC_PAGE_DIRTY;
@@ -540,20 +531,24 @@ void pagecache_reclaim_if_needed(void)
 #define PC_COALESCE_MAX 16
 
 // Try to read page_index (and up to PC_COALESCE_MAX-1 subsequent pages)
-// in a single I/O if their clusters are physically contiguous on disk.
-// Must be called under fat32_io_lock.
-// Returns the requested page on success, NULL if the first page's clusters
-// are not contiguous (caller should fall back to per-cluster reads).
-static pc_page_t* pc_coalesced_read(fat32_fs_t *fs, unsigned long cluster_id,
+// in a single I/O if their underlying FS blocks are physically contiguous
+// on disk.  Must be called under sb->ops->lock_io().
+// Returns the requested page on success, NULL if the first page's blocks
+// are not contiguous (caller should fall back to per-block reads).
+static pc_page_t* pc_coalesced_read(vfs_superblock_t *sb,
+                                     unsigned long cluster_id,
                                      unsigned long start_cluster,
                                      unsigned long page_index,
                                      unsigned long file_size)
 {
     might_sleep();
-    VM_BUG_ON(fs == NULL);
-    unsigned cluster_size = fs->sectors_per_cluster * fs->bytes_per_sector;
+    VM_BUG_ON(sb == NULL);
+    const block_device_t *bdev = vfs_sb_bdev(sb);
+    unsigned long bs  = vfs_sb_block_size(sb);
+    unsigned long ss  = vfs_sb_sector_size(sb);
+    unsigned long eoc = vfs_sb_end_of_chain(sb);
     unsigned long file_pages = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
-    unsigned long spp = PAGE_SIZE / fs->bytes_per_sector; // sectors per page
+    unsigned long spp = PAGE_SIZE / ss;            // sectors per page
 
     unsigned long run_start_lba = 0;
     unsigned long run_sectors   = 0;
@@ -562,44 +557,40 @@ static pc_page_t* pc_coalesced_read(fat32_fs_t *fs, unsigned long cluster_id,
     for (unsigned long pi = page_index;
          pi < file_pages && run_count < PC_COALESCE_MAX; pi++) {
 
-        // After the first page, stop at already-cached pages
         if (pi != page_index && pagecache_lookup(cluster_id, pi))
             break;
 
         unsigned long page_lba;
 
-        if (cluster_size >= PAGE_SIZE) {
-            // One cluster ≥ one page — sub-page addressing within cluster
-            unsigned ppc = cluster_size / PAGE_SIZE;
-            if (!ppc) ppc = 1;
-            unsigned long ci  = pi / ppc;
-            unsigned long sub = pi % ppc;
-            unsigned long cl  = pc_walk_chain(fs, start_cluster, ci);
-            if (!cl || cl >= 0x0FFFFFF8) break;
-            page_lba = pc_cluster_to_lba(fs, cl) + sub * spp;
+        if (bs >= PAGE_SIZE) {
+            unsigned long ppb = bs / PAGE_SIZE;
+            if (!ppb) ppb = 1;
+            unsigned long ci  = pi / ppb;
+            unsigned long sub = pi % ppb;
+            unsigned long cl  = pc_walk_chain(sb, start_cluster, ci);
+            if (!cl || cl >= eoc) break;
+            page_lba = vfs_sb_block_to_lba(sb, cl) + sub * spp;
         } else {
-            // Multiple clusters per page — verify intra-page contiguity
-            unsigned cpp = PAGE_SIZE / cluster_size;
-            unsigned long fci = pi * cpp;
-            unsigned long fc  = pc_walk_chain(fs, start_cluster, fci);
-            if (!fc || fc >= 0x0FFFFFF8) break;
+            unsigned long bpp = PAGE_SIZE / bs;
+            unsigned long fci = pi * bpp;
+            unsigned long fc  = pc_walk_chain(sb, start_cluster, fci);
+            if (!fc || fc >= eoc) break;
             int ok = 1;
-            for (unsigned c = 1; c < cpp; c++) {
-                unsigned long nc = pc_walk_chain(fs, start_cluster, fci + c);
+            for (unsigned long c = 1; c < bpp; c++) {
+                unsigned long nc = pc_walk_chain(sb, start_cluster, fci + c);
                 if (nc != fc + c) { ok = 0; break; }
             }
             if (!ok) {
-                if (run_count == 0) return 0; // first page fragmented
-                break; // stop coalescing, use what we have
+                if (run_count == 0) return 0;
+                break;
             }
-            page_lba = pc_cluster_to_lba(fs, fc);
+            page_lba = vfs_sb_block_to_lba(sb, fc);
         }
 
-        // Check contiguity with the run so far
         if (run_count == 0) {
             run_start_lba = page_lba;
         } else if (page_lba != run_start_lba + run_sectors) {
-            break; // gap — stop
+            break;
         }
 
         run_sectors += spp;
@@ -615,7 +606,7 @@ static pc_page_t* pc_coalesced_read(fat32_fs_t *fs, unsigned long cluster_id,
         if (!pg) return 0;
         pg->cluster_id = cluster_id;
         pg->page_index = page_index;
-        if (pc_read_sectors(fs->bdev, run_start_lba, run_sectors, pg->data) != 0) {
+        if (pc_read_sectors(bdev, run_start_lba, run_sectors, pg->data) != 0) {
             pc_page_free(pg);
             return 0;
         }
@@ -631,15 +622,14 @@ static pc_page_t* pc_coalesced_read(fat32_fs_t *fs, unsigned long cluster_id,
     }
 
     // --- Multi-page path: one big I/O, then distribute into pages ---
-    unsigned long total_bytes = run_sectors * fs->bytes_per_sector;
+    unsigned long total_bytes = run_sectors * ss;
     void *buf = kalloc(total_bytes);
     if (!buf) {
-        // Can't allocate big buffer — fall back to single page
         pc_page_t *pg = pc_page_alloc();
         if (!pg) return 0;
         pg->cluster_id = cluster_id;
         pg->page_index = page_index;
-        if (pc_read_sectors(fs->bdev, run_start_lba, spp, pg->data) != 0) {
+        if (pc_read_sectors(bdev, run_start_lba, spp, pg->data) != 0) {
             pc_page_free(pg);
             return 0;
         }
@@ -654,7 +644,7 @@ static pc_page_t* pc_coalesced_read(fat32_fs_t *fs, unsigned long cluster_id,
         return r;
     }
 
-    if (pc_read_sectors(fs->bdev, run_start_lba, run_sectors, buf) != 0) {
+    if (pc_read_sectors(bdev, run_start_lba, run_sectors, buf) != 0) {
         kfree(buf);
         return 0;
     }
@@ -697,15 +687,11 @@ static pc_page_t* pc_coalesced_read(fat32_fs_t *fs, unsigned long cluster_id,
 
 pc_page_t* pagecache_get(unsigned long cluster_id, unsigned long page_index,
                          unsigned long file_size,
-                         struct fat32_fs *fs_raw, unsigned long start_cluster)
+                         struct vfs_superblock *sb, unsigned long start_cluster)
 {
-    VM_BUG_ON(fs_raw == NULL);
+    VM_BUG_ON(sb == NULL);
     VM_BUG_ON(start_cluster < 2);
-    if (!pc_initialized)
-        return 0;
-
-    fat32_fs_t *fs = (fat32_fs_t *)fs_raw;
-    if (!fs || start_cluster < 2)
+    if (!pc_initialized || !sb || start_cluster < 2)
         return 0;
 
     // Check memory pressure first and do deferred writeback
@@ -717,7 +703,7 @@ pc_page_t* pagecache_get(unsigned long cluster_id, unsigned long page_index,
     // 1. Try cache lookup (no I/O lock needed)
     pc_page_t *pg = pagecache_lookup(cluster_id, page_index);
     if (pg) {
-        WARN_ON_ONCE(!(pg->flags & PC_PAGE_VALID));  /* pagecache_lookup returned page without PC_PAGE_VALID: stale insertion */
+        WARN_ON_ONCE(!(pg->flags & PC_PAGE_VALID));  /* lookup returned a page without PC_PAGE_VALID: stale insertion */
         __sync_fetch_and_add(&pc_stat_hits, 1);
         return pg;
     }
@@ -725,65 +711,65 @@ pc_page_t* pagecache_get(unsigned long cluster_id, unsigned long page_index,
     // 2. Cache miss — need to read from disk
     __sync_fetch_and_add(&pc_stat_misses, 1);
 
-    // Check if page_index is within file bounds
     unsigned long file_pages = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
     if (page_index >= file_pages)
         return 0;
 
-    // Check memory pressure — evict if needed before allocating
     pagecache_reclaim_if_needed();
 
-    // 3. Try coalesced read: reads up to 64KB of contiguous pages in one
-    //    USB transfer for massively improved sequential I/O performance.
-    fat32_io_lock();
-    pc_page_t *result = pc_coalesced_read(fs, cluster_id, start_cluster,
+    // 3. Try coalesced read: up to 64KB of contiguous pages in one transfer.
+    vfs_sb_lock_io(sb);
+    pc_page_t *result = pc_coalesced_read(sb, cluster_id, start_cluster,
                                            page_index, file_size);
     if (result) {
-        fat32_io_unlock();
+        vfs_sb_unlock_io(sb);
         return result;
     }
 
-    // 4. Fallback for fragmented files (cluster_size < PAGE_SIZE with
-    //    non-contiguous clusters within a single page).
+    // 4. Fallback for fragmented files (block_size < PAGE_SIZE with
+    //    non-contiguous blocks inside a single page).
     {
-        unsigned cluster_size = fs->sectors_per_cluster * fs->bytes_per_sector;
-        unsigned clusters_per_page = PAGE_SIZE / cluster_size;
-        if (clusters_per_page == 0) clusters_per_page = 1;
-        unsigned long first_ci = page_index * clusters_per_page;
+        const block_device_t *bdev = vfs_sb_bdev(sb);
+        unsigned long bs  = vfs_sb_block_size(sb);
+        unsigned long ss  = vfs_sb_sector_size(sb);
+        unsigned long eoc = vfs_sb_end_of_chain(sb);
+        unsigned long blocks_per_page = PAGE_SIZE / bs;
+        if (blocks_per_page == 0) blocks_per_page = 1;
+        unsigned long first_ci = page_index * blocks_per_page;
 
         pc_page_t *new_pg = pc_page_alloc();
         if (!new_pg) {
-            fat32_io_unlock();
+            vfs_sb_unlock_io(sb);
             return 0;
         }
         new_pg->cluster_id = cluster_id;
         new_pg->page_index = page_index;
 
-        unsigned long cur_cluster = pc_walk_chain(fs, start_cluster, first_ci);
-        if (cur_cluster == 0 || cur_cluster >= 0x0FFFFFF8) {
-            fat32_io_unlock();
+        unsigned long cur_block = pc_walk_chain(sb, start_cluster, first_ci);
+        if (cur_block == 0 || cur_block >= eoc) {
+            vfs_sb_unlock_io(sb);
             pc_page_free(new_pg);
             return 0;
         }
 
-        // Read each cluster individually (scattered I/O for fragmented files)
+        unsigned long secs_per_block = bs / ss;
         unsigned offset = 0;
-        for (unsigned c = 0; c < clusters_per_page; c++) {
-            if (cur_cluster == 0 || cur_cluster >= 0x0FFFFFF8)
+        for (unsigned long c = 0; c < blocks_per_page; c++) {
+            if (cur_block == 0 || cur_block >= eoc)
                 break;
-            unsigned long lba = pc_cluster_to_lba(fs, cur_cluster);
-            int st = pc_read_sectors(fs->bdev, lba, fs->sectors_per_cluster,
+            unsigned long lba = vfs_sb_block_to_lba(sb, cur_block);
+            int st = pc_read_sectors(bdev, lba, secs_per_block,
                                      new_pg->data + offset);
             if (st != 0) {
-                fat32_io_unlock();
+                vfs_sb_unlock_io(sb);
                 pc_page_free(new_pg);
                 return 0;
             }
-            offset += cluster_size;
-            if (c + 1 < clusters_per_page)
-                cur_cluster = fat32_next_cluster_cached(fs, cur_cluster);
+            offset += bs;
+            if (c + 1 < blocks_per_page)
+                cur_block = vfs_sb_next_block(sb, cur_block);
         }
-        fat32_io_unlock();
+        vfs_sb_unlock_io(sb);
 
         if (offset < PAGE_SIZE)
             mm_memset(new_pg->data + offset, 0, PAGE_SIZE - offset);
@@ -862,95 +848,90 @@ int pagecache_flush_file(unsigned long cluster_id)
         if (batch_count == 0)
             break;
 
-        // Flush the batch under fat32_io_lock
-        fat32_io_lock();
+        // Flush the batch under the FS-wide I/O lock via sb ops.
+        vfs_superblock_t *sb = g_root_sb;
+        if (!sb) {
+            for (int i = 0; i < batch_count; i++)
+                batch[i]->flags &= ~PC_PAGE_LOCKED;
+            break;
+        }
+        const block_device_t *bdev = vfs_sb_bdev(sb);
+        unsigned long bs            = vfs_sb_block_size(sb);
+        unsigned long ss            = vfs_sb_sector_size(sb);
+        unsigned long secs_per_block = bs / ss;
+        unsigned long eoc           = vfs_sb_end_of_chain(sb);
+        unsigned long reserved_meta = vfs_sb_reserved_meta_block(sb);
+
+        vfs_sb_lock_io(sb);
         for (int i = 0; i < batch_count; i++) {
             pc_page_t *p = batch[i];
-            // Find the fs pointer — we need it from the global root_fs.
-            // Since all files are on the same FAT32 volume, use g_root_fs.
-            extern fat32_fs_t *g_root_fs;
-            fat32_fs_t *fs = g_root_fs;
-            if (!fs) {
-                p->flags &= ~PC_PAGE_LOCKED;
-                continue;
-            }
 
-            unsigned cluster_size = fs->sectors_per_cluster * fs->bytes_per_sector;
+            if (bs >= PAGE_SIZE) {
+                unsigned long ppb = bs / PAGE_SIZE;
+                if (ppb == 0) ppb = 1;
 
-            if (cluster_size >= PAGE_SIZE) {
-                unsigned pages_per_cluster = cluster_size / PAGE_SIZE;
-                if (pages_per_cluster == 0) pages_per_cluster = 1;
+                unsigned long block_index = p->page_index / ppb;
+                unsigned long sub_page    = p->page_index % ppb;
 
-                unsigned long cluster_index = p->page_index / pages_per_cluster;
-                unsigned long sub_page      = p->page_index % pages_per_cluster;
-
-                unsigned long disk_cluster = pc_walk_chain(fs, p->cluster_id,
-                                                           cluster_index);
-                if (disk_cluster == 0 || disk_cluster >= 0x0FFFFFF8) {
+                unsigned long disk_block = pc_walk_chain(sb, p->cluster_id,
+                                                          block_index);
+                if (disk_block == 0 || disk_block >= eoc) {
                     p->flags &= ~PC_PAGE_LOCKED;
                     continue;
                 }
-                /* BUG GUARD: writing page-cache data to root cluster would corrupt root dir */
-                if (disk_cluster == (unsigned long)fs->root_cluster) {
-                    kprintf("FAT32: BUG: pagecache flush_file to root cluster! "
-                            "cluster_id=%lu page_idx=%lu ci=%lu\n",
-                            p->cluster_id, p->page_index, cluster_index);
+                /* Guard against the FS-reserved metadata block (FAT32 root
+                 * cluster) — writing user-data here would corrupt the root
+                 * directory. */
+                if (reserved_meta && disk_block == reserved_meta) {
+                    kprintf("pagecache: BUG: flush_file to reserved meta block! "
+                            "inode_id=%lu page_idx=%lu bi=%lu\n",
+                            p->cluster_id, p->page_index, block_index);
                     p->flags &= ~PC_PAGE_LOCKED;
                     continue;
                 }
 
-                unsigned long lba = pc_cluster_to_lba(fs, disk_cluster);
+                unsigned long lba = vfs_sb_block_to_lba(sb, disk_block);
 
-                if (cluster_size == PAGE_SIZE) {
-                    // Write the page directly as one cluster
-                    pc_write_sectors(fs->bdev, lba, fs->sectors_per_cluster,
-                                     p->data);
+                if (bs == PAGE_SIZE) {
+                    pc_write_sectors(bdev, lba, secs_per_block, p->data);
                 } else {
-                    // Read-modify-write: read full cluster, overlay our page,
-                    // write back
-                    void *tmp = kalloc(cluster_size);
+                    void *tmp = kalloc(bs);
                     if (tmp) {
-                        pc_read_sectors(fs->bdev, lba, fs->sectors_per_cluster,
-                                        tmp);
+                        pc_read_sectors(bdev, lba, secs_per_block, tmp);
                         mm_memcpy((uint8_t *)tmp + sub_page * PAGE_SIZE,
                                   p->data, PAGE_SIZE);
-                        pc_write_sectors(fs->bdev, lba, fs->sectors_per_cluster,
-                                         tmp);
+                        pc_write_sectors(bdev, lba, secs_per_block, tmp);
                         kfree(tmp);
                     }
                 }
             } else {
-                // Multiple clusters per page (cluster_size < PAGE_SIZE).
-                unsigned clusters_per_page = PAGE_SIZE / cluster_size;
-                unsigned long first_cluster_offset =
-                    p->page_index * clusters_per_page;
+                unsigned long bpp = PAGE_SIZE / bs;
+                unsigned long first_block_offset = p->page_index * bpp;
 
-                unsigned long cur_cluster = pc_walk_chain(fs, p->cluster_id,
-                                                          first_cluster_offset);
+                unsigned long cur_block = pc_walk_chain(sb, p->cluster_id,
+                                                         first_block_offset);
                 unsigned offset = 0;
-                for (unsigned c = 0; c < clusters_per_page; c++) {
-                    if (cur_cluster == 0 || cur_cluster >= 0x0FFFFFF8)
+                for (unsigned long c = 0; c < bpp; c++) {
+                    if (cur_block == 0 || cur_block >= eoc)
                         break;
-                    unsigned long lba = pc_cluster_to_lba(fs, cur_cluster);
-                    pc_write_sectors(fs->bdev, lba, fs->sectors_per_cluster,
+                    unsigned long lba = vfs_sb_block_to_lba(sb, cur_block);
+                    pc_write_sectors(bdev, lba, secs_per_block,
                                      p->data + offset);
-                    offset += cluster_size;
-                    if (c + 1 < clusters_per_page)
-                        cur_cluster = fat32_next_cluster_cached(fs, cur_cluster);
+                    offset += bs;
+                    if (c + 1 < bpp)
+                        cur_block = vfs_sb_next_block(sb, cur_block);
                 }
             }
 
-            // Clear dirty flag
             p->flags &= ~(PC_PAGE_DIRTY | PC_PAGE_LOCKED);
             wrote++;
             __sync_fetch_and_add(&pc_stat_writebacks, 1);
 
-            // Remove from dirty list
             spin_lock_irqsave(&pc_dirty_lock, &flags);
             dirty_list_remove(p);
             spin_unlock_irqrestore(&pc_dirty_lock, flags);
         }
-        fat32_io_unlock();
+        vfs_sb_unlock_io(sb);
 
     } while (batch_count == FLUSH_BATCH); // loop if we filled the batch
 
@@ -990,76 +971,73 @@ int pagecache_flush_all(void)
         if (batch_count == 0)
             break;
 
-        // Flush under fat32_io_lock
-        extern fat32_fs_t *g_root_fs;
-        fat32_fs_t *fs = g_root_fs;
-        if (!fs) {
+        vfs_superblock_t *sb = g_root_sb;
+        if (!sb) {
             for (int i = 0; i < batch_count; i++)
                 batch[i]->flags &= ~PC_PAGE_LOCKED;
             break;
         }
+        const block_device_t *bdev   = vfs_sb_bdev(sb);
+        unsigned long bs              = vfs_sb_block_size(sb);
+        unsigned long ss              = vfs_sb_sector_size(sb);
+        unsigned long secs_per_block  = bs / ss;
+        unsigned long eoc             = vfs_sb_end_of_chain(sb);
+        unsigned long reserved_meta   = vfs_sb_reserved_meta_block(sb);
 
-        fat32_io_lock();
+        vfs_sb_lock_io(sb);
         for (int i = 0; i < batch_count; i++) {
             pc_page_t *p = batch[i];
-            unsigned cluster_size = fs->sectors_per_cluster * fs->bytes_per_sector;
 
-            if (cluster_size >= PAGE_SIZE) {
-                unsigned pages_per_cluster = cluster_size / PAGE_SIZE;
-                if (pages_per_cluster == 0) pages_per_cluster = 1;
+            if (bs >= PAGE_SIZE) {
+                unsigned long ppb = bs / PAGE_SIZE;
+                if (ppb == 0) ppb = 1;
 
-                unsigned long cluster_index = p->page_index / pages_per_cluster;
-                unsigned long sub_page      = p->page_index % pages_per_cluster;
+                unsigned long block_index = p->page_index / ppb;
+                unsigned long sub_page    = p->page_index % ppb;
 
-                unsigned long disk_cluster = pc_walk_chain(fs, p->cluster_id,
-                                                           cluster_index);
-                if (disk_cluster == 0 || disk_cluster >= 0x0FFFFFF8) {
+                unsigned long disk_block = pc_walk_chain(sb, p->cluster_id,
+                                                          block_index);
+                if (disk_block == 0 || disk_block >= eoc) {
                     p->flags &= ~PC_PAGE_LOCKED;
                     continue;
                 }
-                /* BUG GUARD: writing page-cache data to root cluster would corrupt root dir */
-                if (disk_cluster == (unsigned long)fs->root_cluster) {
-                    kprintf("FAT32: BUG: pagecache flush_all to root cluster! "
-                            "cluster_id=%lu page_idx=%lu ci=%lu\n",
-                            p->cluster_id, p->page_index, cluster_index);
+                if (reserved_meta && disk_block == reserved_meta) {
+                    kprintf("pagecache: BUG: flush_all to reserved meta block! "
+                            "inode_id=%lu page_idx=%lu bi=%lu\n",
+                            p->cluster_id, p->page_index, block_index);
                     p->flags &= ~PC_PAGE_LOCKED;
                     continue;
                 }
 
-                unsigned long lba = pc_cluster_to_lba(fs, disk_cluster);
-                if (cluster_size == PAGE_SIZE) {
-                    pc_write_sectors(fs->bdev, lba, fs->sectors_per_cluster,
-                                     p->data);
+                unsigned long lba = vfs_sb_block_to_lba(sb, disk_block);
+                if (bs == PAGE_SIZE) {
+                    pc_write_sectors(bdev, lba, secs_per_block, p->data);
                 } else {
-                    void *tmp = kalloc(cluster_size);
+                    void *tmp = kalloc(bs);
                     if (tmp) {
-                        pc_read_sectors(fs->bdev, lba, fs->sectors_per_cluster,
-                                        tmp);
+                        pc_read_sectors(bdev, lba, secs_per_block, tmp);
                         mm_memcpy((uint8_t *)tmp + sub_page * PAGE_SIZE,
                                   p->data, PAGE_SIZE);
-                        pc_write_sectors(fs->bdev, lba, fs->sectors_per_cluster,
-                                         tmp);
+                        pc_write_sectors(bdev, lba, secs_per_block, tmp);
                         kfree(tmp);
                     }
                 }
             } else {
-                // Multiple clusters per page (cluster_size < PAGE_SIZE).
-                unsigned clusters_per_page = PAGE_SIZE / cluster_size;
-                unsigned long first_cluster_offset =
-                    p->page_index * clusters_per_page;
+                unsigned long bpp = PAGE_SIZE / bs;
+                unsigned long first_block_offset = p->page_index * bpp;
 
-                unsigned long cur_cluster = pc_walk_chain(fs, p->cluster_id,
-                                                          first_cluster_offset);
+                unsigned long cur_block = pc_walk_chain(sb, p->cluster_id,
+                                                         first_block_offset);
                 unsigned offset = 0;
-                for (unsigned c = 0; c < clusters_per_page; c++) {
-                    if (cur_cluster == 0 || cur_cluster >= 0x0FFFFFF8)
+                for (unsigned long c = 0; c < bpp; c++) {
+                    if (cur_block == 0 || cur_block >= eoc)
                         break;
-                    unsigned long lba = pc_cluster_to_lba(fs, cur_cluster);
-                    pc_write_sectors(fs->bdev, lba, fs->sectors_per_cluster,
+                    unsigned long lba = vfs_sb_block_to_lba(sb, cur_block);
+                    pc_write_sectors(bdev, lba, secs_per_block,
                                      p->data + offset);
-                    offset += cluster_size;
-                    if (c + 1 < clusters_per_page)
-                        cur_cluster = fat32_next_cluster_cached(fs, cur_cluster);
+                    offset += bs;
+                    if (c + 1 < bpp)
+                        cur_block = vfs_sb_next_block(sb, cur_block);
                 }
             }
 
@@ -1072,7 +1050,7 @@ int pagecache_flush_all(void)
             dirty_list_remove(p);
             spin_unlock_irqrestore(&pc_dirty_lock, df);
         }
-        fat32_io_unlock();
+        vfs_sb_unlock_io(sb);
 
     } while (batch_count == FLUSH_ALL_BATCH);
 
@@ -1092,12 +1070,14 @@ int pagecache_sync(void)
     extern int icache_flush_all(void);
     wrote += icache_flush_all();
 
-    // Call block device sync if available
-    extern fat32_fs_t *g_root_fs;
-    if (g_root_fs && g_root_fs->bdev && g_root_fs->bdev->sync) {
-        fat32_io_lock();
-        g_root_fs->bdev->sync((block_device_t *)g_root_fs->bdev);
-        fat32_io_unlock();
+    // Call block device sync if available, via the generic superblock.
+    if (g_root_sb) {
+        const block_device_t *bdev = vfs_sb_bdev(g_root_sb);
+        if (bdev && bdev->sync) {
+            vfs_sb_lock_io(g_root_sb);
+            bdev->sync((block_device_t *)bdev);
+            vfs_sb_unlock_io(g_root_sb);
+        }
     }
     return wrote;
 }
@@ -1243,7 +1223,7 @@ void pagecache_invalidate_all(void)
 
 void pagecache_readahead(pc_readahead_t *ra, unsigned long cluster_id,
                          unsigned long current_page, unsigned long file_size,
-                         struct fat32_fs *fs_raw, unsigned long start_cluster)
+                         struct vfs_superblock *sb, unsigned long start_cluster)
 {
     if (!ra || !pc_initialized)
         return;
@@ -1281,7 +1261,7 @@ void pagecache_readahead(pc_readahead_t *ra, unsigned long cluster_id,
 
         // Fetch the page (will do disk I/O on miss)
         pc_page_t *pg = pagecache_get(cluster_id, ahead_page, file_size,
-                                       fs_raw, start_cluster);
+                                       sb, start_cluster);
         if (pg) {
             pg->flags |= PC_PAGE_READAHEAD;
             __sync_fetch_and_add(&pc_stat_readahead, 1);

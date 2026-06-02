@@ -448,6 +448,9 @@ static int igb_map_bar(igb_dev_t* dev) {
 // Driver entry point
 // ============================================================================
 void igb_init(void) {
+    might_sleep();
+    BUILD_BUG_ON(sizeof(igb_rx_desc_t) != 16);
+    BUILD_BUG_ON(sizeof(igb_tx_desc_t) != 16);
     int count;
     const pci_device_t* devs = pci_get_devices(&count);
 

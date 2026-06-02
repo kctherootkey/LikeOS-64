@@ -103,6 +103,150 @@ int fat32_io_release_if_owner(uint64_t task_id) {
     return released;
 }
 
+/* ========================================================================
+ * VFS superblock dispatch — generic cache <-> FAT32 plumbing.
+ *
+ * The dcache / icache / pagecache reach FAT32 only through these ops.
+ * Forward-declare the helpers FAT32 needs to implement them; the actual
+ * bodies live further down in this file. */
+#include "../../include/kernel/vfs_sb.h"
+#include "../../include/kernel/icache.h"
+
+static unsigned long cluster_to_lba(fat32_fs_t *fs, unsigned long cluster);
+unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster);
+static int fat32_sb_write_inode(vfs_superblock_t *sb, ic_inode_t *ino);
+
+/* Sentinel that FAT32 chain-walk returns at end-of-file.  Anything >= this
+ * value (and 0) is treated as "no more blocks" by the cache code. */
+#define FAT32_EOC_MARKER 0x0FFFFFF8UL
+
+static unsigned long fat32_sb_block_size(vfs_superblock_t *sb)
+{
+    fat32_fs_t *fs = (fat32_fs_t *)sb->fs_private;
+    return (unsigned long)fs->sectors_per_cluster * fs->bytes_per_sector;
+}
+static const block_device_t *fat32_sb_bdev(vfs_superblock_t *sb)
+{
+    fat32_fs_t *fs = (fat32_fs_t *)sb->fs_private;
+    return fs->bdev;
+}
+static unsigned long fat32_sb_sector_size(vfs_superblock_t *sb)
+{
+    fat32_fs_t *fs = (fat32_fs_t *)sb->fs_private;
+    return fs->bytes_per_sector;
+}
+static unsigned long fat32_sb_block_to_lba(vfs_superblock_t *sb,
+                                           unsigned long block_id)
+{
+    fat32_fs_t *fs = (fat32_fs_t *)sb->fs_private;
+    if (block_id < 2 || block_id >= FAT32_EOC_MARKER)
+        return 0;
+    return cluster_to_lba(fs, block_id);
+}
+static unsigned long fat32_sb_end_of_chain(vfs_superblock_t *sb)
+{
+    (void)sb;
+    return FAT32_EOC_MARKER;
+}
+static unsigned long fat32_sb_next_block(vfs_superblock_t *sb,
+                                         unsigned long cur_block)
+{
+    fat32_fs_t *fs = (fat32_fs_t *)sb->fs_private;
+    return fat32_next_cluster_cached(fs, cur_block);
+}
+static void fat32_sb_lock_io(vfs_superblock_t *sb)   { (void)sb; fat32_io_lock(); }
+static void fat32_sb_unlock_io(vfs_superblock_t *sb) { (void)sb; fat32_io_unlock(); }
+
+static unsigned long fat32_sb_reserved_meta_block(vfs_superblock_t *sb)
+{
+    fat32_fs_t *fs = (fat32_fs_t *)sb->fs_private;
+    return (unsigned long)fs->root_cluster;
+}
+
+static const vfs_sb_ops_t fat32_sb_ops = {
+    .block_size          = fat32_sb_block_size,
+    .bdev                = fat32_sb_bdev,
+    .sector_size         = fat32_sb_sector_size,
+    .block_to_lba        = fat32_sb_block_to_lba,
+    .end_of_chain_marker = fat32_sb_end_of_chain,
+    .next_block          = fat32_sb_next_block,
+    .write_inode         = fat32_sb_write_inode,
+    .lock_io             = fat32_sb_lock_io,
+    .unlock_io           = fat32_sb_unlock_io,
+    .reserved_meta_block = fat32_sb_reserved_meta_block,
+};
+
+/* Wire up sb on a freshly-mounted fat32_fs_t and register it as the
+ * filesystem-independent root.  Caches see only g_root_sb from here on. */
+static void fat32_sb_attach(fat32_fs_t *fs)
+{
+    fs->sb.ops        = &fat32_sb_ops;
+    fs->sb.fs_private = fs;
+    g_root_sb         = &fs->sb;
+}
+
+/* fat32_sb_write_inode: persist ic_inode_t's size + mtime into the on-disk
+ * dirent at (dirent_cluster, dirent_index).  Called by icache_flush via the
+ * generic vfs_sb dispatch — icache itself has no FAT32 knowledge. */
+static int fat32_sb_write_inode(vfs_superblock_t *sb, ic_inode_t *inode)
+{
+    if (!inode || inode->dirent_cluster < 2)
+        return 0;
+    fat32_fs_t *fs = (fat32_fs_t *)sb->fs_private;
+    if (!fs)
+        return -1;
+
+    unsigned cluster_size = fs->sectors_per_cluster * fs->bytes_per_sector;
+    void *buf = kalloc(cluster_size);
+    if (!buf)
+        return -1;
+
+    fat32_io_lock();
+
+    unsigned long lba = fs->part_lba_offset + fs->data_start_lba +
+                        (inode->dirent_cluster - 2) * fs->sectors_per_cluster;
+    if (fs->bdev->read((block_device_t *)fs->bdev, lba,
+                       fs->sectors_per_cluster, buf) != 0) {
+        fat32_io_unlock();
+        kfree(buf);
+        return -1;
+    }
+
+    typedef struct {
+        uint8_t  name[11];
+        uint8_t  attr;
+        uint8_t  ntRes;
+        uint8_t  crtTimeTenth;
+        uint16_t crtTime;
+        uint16_t crtDate;
+        uint16_t lstAccDate;
+        uint16_t fstClusHI;
+        uint16_t wrtTime;
+        uint16_t wrtDate;
+        uint16_t fstClusLO;
+        uint32_t fileSize;
+    } __attribute__((packed)) fat32_dirent_raw_t;
+
+    fat32_dirent_raw_t *ents = (fat32_dirent_raw_t *)buf;
+    unsigned max_entries = cluster_size / sizeof(fat32_dirent_raw_t);
+
+    if (inode->dirent_index < max_entries) {
+        fat32_dirent_raw_t *de = &ents[inode->dirent_index];
+        de->fileSize = (uint32_t)inode->size;
+        de->wrtTime  = inode->wrt_time;
+        de->wrtDate  = inode->wrt_date;
+        if (fs->bdev->write) {
+            fs->bdev->write((block_device_t *)fs->bdev, lba,
+                            fs->sectors_per_cluster, buf);
+        }
+    }
+
+    fat32_io_unlock();
+    kfree(buf);
+    return 0;
+}
+/* ====================================================================== */
+
 #ifndef FAT32_DEBUG_ENABLED
 #define FAT32_DEBUG_ENABLED 0
 #endif
@@ -520,6 +664,11 @@ static unsigned long g_fat_first_sectors = 0; // first FAT size in sectors
 #define FAT_CACHE_MAX_BYTES (1024 * 1024) // 1MB max FAT cache
 #define FAT_CACHE_MAX_ENTRIES (FAT_CACHE_MAX_BYTES / 4) // 262144 entries
 fat32_fs_t* g_root_fs = 0;
+/* Filesystem-independent root superblock pointer.  Set by fat32_mount() once
+ * the FAT32 sb-ops table is wired up; consumed by the dcache / icache /
+ * pagecache for all back-into-FS dispatch.  Lives in this TU so the FAT32
+ * driver owns its publication; ext4_mount() will overwrite it the same way. */
+vfs_superblock_t* g_root_sb = 0;
 static fat32_fs_t g_static_fs; // internal singleton instance
 static unsigned long g_cwd_cluster = 0; // 0 means root
 
@@ -1534,6 +1683,7 @@ static int fat32_mount_at_lba(const block_device_t *bdev, unsigned long base_lba
     out->part_lba_offset = base_lba;
     g_root_dir_cluster = out->root_cluster;
     g_root_fs = out;
+    fat32_sb_attach(out);   /* publish vfs_superblock_t for the caches */
     if (!g_root_dir_cache)
         g_root_dir_cache = kalloc(out->sectors_per_cluster * out->bytes_per_sector);
     if (g_root_dir_cache) {
@@ -3171,7 +3321,7 @@ static long fat32_read_impl(vfs_file_t *f, void *buf, long bytes)
 
         pc_page_t *pg = pagecache_get(ff->start_cluster, page_idx,
                                        ff->size,
-                                       (struct fat32_fs *)ff->fs,
+                                       &ff->fs->sb,
                                        ff->start_cluster);
         if (pg && pg->data) {
             // Cache hit (or successful disk read on miss)
@@ -3185,7 +3335,7 @@ static long fat32_read_impl(vfs_file_t *f, void *buf, long bytes)
             ra_state.ra_pages         = ff->ra_pages;
             pagecache_readahead(&ra_state, ff->start_cluster, page_idx,
                                 ff->size,
-                                (struct fat32_fs *)ff->fs,
+                                &ff->fs->sb,
                                 ff->start_cluster);
             ff->ra_last_page = ra_state.last_page_index;
             ff->ra_seq_count = ra_state.sequential_count;
@@ -4005,6 +4155,7 @@ int fat32_vfs_register_root(fat32_fs_t *fs)
     if (!fs)
         return ST_INVALID;
     g_root_fs = fs;
+    fat32_sb_attach(fs);
     return vfs_register_root(&fat32_vfs_ops);
 }
 
