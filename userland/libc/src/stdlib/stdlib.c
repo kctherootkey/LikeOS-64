@@ -41,6 +41,56 @@ void abort(void) {
     _exit(1);
 }
 
+/* basename()/dirname() — POSIX pathname helpers.
+ *
+ * <libgen.h> also defines these as static inline for code that includes it,
+ * but they must exist as real EXPORTED symbols in libc.so for code that
+ * references them externally — e.g. curl's lib/mime.c, which is compiled with
+ * HAVE_BASENAME but without HAVE_LIBGEN_H, so it calls basename() expecting
+ * the system libc to provide it.  Behaviour matches the libgen.h inlines.
+ * Both may modify the input string. */
+char *basename(char *path) {
+    static char dot[] = ".";
+    if (!path || !*path)
+        return dot;
+
+    /* Strip trailing slashes (but keep a lone "/"). */
+    char *end = path + __builtin_strlen(path) - 1;
+    while (end > path && *end == '/')
+        *end-- = '\0';
+
+    char *last_slash = (char *)0;
+    for (char *p = path; *p; p++)
+        if (*p == '/')
+            last_slash = p;
+
+    if (last_slash) {
+        if (*(last_slash + 1) == '\0')
+            return last_slash;   /* path was "/" (or "///") */
+        return last_slash + 1;
+    }
+    return path;
+}
+
+char *dirname(char *path) {
+    static char dot[] = ".";
+    if (!path || !*path)
+        return dot;
+
+    char *last_slash = (char *)0;
+    for (char *p = path; *p; p++)
+        if (*p == '/')
+            last_slash = p;
+
+    if (!last_slash)
+        return dot;
+    if (last_slash == path)
+        return "/";
+
+    *last_slash = '\0';
+    return path;
+}
+
 int atoi(const char* nptr) {
     return (int)atol(nptr);
 }
