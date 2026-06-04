@@ -32,7 +32,7 @@ LikeOS-64 is a Unix-like operating system demonstrating modern OS development:
 - Hardware drivers: xHCI USB 3.0, USB mass storage, PS/2, PCI, APIC.
 - Memory: physical/virtual memory, SLAB allocator, stack canaries, and
   security protections.
-- Virtual terminals, TTY, and signals: multiple VTs with POSIX-like terminal
+- Virtual terminals, TTY, and signals: VTs with POSIX-like terminal
   and signal handling.
 - Diagnostics: kernel and user crashlog printing with BUG_ON/WARN_ON asserts.
 
@@ -164,18 +164,18 @@ Run
 
 QEMU:
 
-  make clean
+  make distclean
   make qemu-usb
 
 Other useful targets:
 
-  make clean
+  make distclean
   make usb-write USB_DEVICE=/dev/sdX
   make qemu-realusb USB_DEVICE=/dev/sdb
 
 Linux USB host mode:
 
-  make clean
+  make distclean
   make linux-usb
   make linux-usb-write USB_DEVICE=/dev/sdX
 
