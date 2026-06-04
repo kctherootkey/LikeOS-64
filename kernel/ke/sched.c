@@ -121,7 +121,17 @@ static spinlock_t g_dead_thread_lock = SPINLOCK_INIT("dead_threads");
 // Bootstrap and BSP idle tasks (statically allocated)
 static task_t g_bootstrap_task;
 static task_t g_idle_task;
-static uint8_t g_idle_stack[4096] __attribute__((aligned(16)));
+/* The idle task runs in ring 0, and because the IRQ entry stub does NOT
+ * switch stacks when it interrupts CPL==0 code, every interrupt taken while a
+ * CPU sits in its idle hlt loop runs its ENTIRE handler chain on this stack:
+ * timer_irq_handler → sched_wake_expired_sleepers → sched_load_balance →
+ * sched_preempt → ctx_switch, plus softirq_drain() (the full network RX path —
+ * exactly what a long download generates), plus a possibly-nested reschedule
+ * IPI.  The old 4 KB was far too small for that chain and had no guard page,
+ * so an overflow silently corrupted adjacent heap (manifesting as a context
+ * switch resuming through a clobbered pointer with current_task still == the
+ * idle task).  Match the real per-task kernel-stack size. */
+static uint8_t g_idle_stack[KERNEL_STACK_SIZE] __attribute__((aligned(16)));
 
 // Per-AP idle tasks (dynamically allocated in sched_init_ap)
 #define MAX_AP_IDLE 64
@@ -2239,8 +2249,12 @@ void sched_init_ap(uint32_t cpu_id) {
 
     percpu_t* cpu = this_cpu();
 
-    // Allocate idle task + stack for this AP
-    g_ap_idle_stacks[cpu_id] = (uint8_t*)kalloc(4096);
+    // Allocate idle task + stack for this AP.  The AP idle loop runs IRQ +
+    // softirq (network RX) + scheduler chains on this stack in ring 0 (the IRQ
+    // stub does not switch stacks for CPL==0), so it needs the same size and
+    // guard page as a real task kernel stack — a 4 KB unguarded stack
+    // silently overflowed under load (see g_idle_stack comment).
+    g_ap_idle_stacks[cpu_id] = (uint8_t*)mm_alloc_guarded_kstack(KERNEL_STACK_SIZE);
     if (!g_ap_idle_stacks[cpu_id]) {
         kprintf("sched_init_ap: failed to allocate idle stack for CPU %u\n", cpu_id);
         return;
@@ -2248,14 +2262,14 @@ void sched_init_ap(uint32_t cpu_id) {
 
     task_t* idle = (task_t*)kalloc(sizeof(task_t));
     if (!idle) {
-        kfree(g_ap_idle_stacks[cpu_id]);
+        mm_free_guarded_kstack(g_ap_idle_stacks[cpu_id], KERNEL_STACK_SIZE);
         g_ap_idle_stacks[cpu_id] = NULL;
         kprintf("sched_init_ap: failed to allocate idle task for CPU %u\n", cpu_id);
         return;
     }
 
     // Set up idle task kernel stack
-    uint64_t* sp = (uint64_t*)(g_ap_idle_stacks[cpu_id] + 4096);
+    uint64_t* sp = (uint64_t*)(g_ap_idle_stacks[cpu_id] + KERNEL_STACK_SIZE);
     sp = (uint64_t*)((uint64_t)sp & ~0xFUL);
     *(--sp) = (uint64_t)task_trampoline;
     *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
@@ -2270,6 +2284,19 @@ void sched_init_ap(uint32_t cpu_id) {
     idle->privilege = TASK_KERNEL;
     idle->id = g_next_id++;
     task_init_common(idle);
+    /* The AP idle task is "already running": we set it current just below and
+     * the AP falls straight into the idle loop on its own kernel stack.  Those
+     * initial frames are therefore built with %gs:104 == this CPU's PER-CPU
+     * canary, NOT the fresh random canary task_init_common() just assigned.
+     * Inherit the per-CPU canary so that when the idle task is later resumed
+     * through a normal context switch — which installs idle->stack_canary into
+     * %gs:104 — the bringup frames' epilogue checks still match.  This mirrors
+     * the bootstrap-task handling in sched_init().  Without it the first
+     * preempt of an AP idle task trips a spurious __stack_chk_fail, seen as a
+     * rare "KERNEL STACK SMASH" on a kernel idle/N task under heavy SMP load
+     * (two different but valid canaries: frame holds the per-CPU value, GS:104
+     * holds the random per-task value). */
+    idle->stack_canary = cpu->stack_canary;
     idle->on_cpu = cpu_id;
     // Name the AP idle task (Linux-like: kernel idle/N)
     {

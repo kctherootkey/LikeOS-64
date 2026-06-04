@@ -275,6 +275,17 @@ void loopback_process_pending(void) {
     }
 }
 
+/* Read-only diagnostic accessors used by the Ctrl+N TCP/net dump
+ * (tcp_dump_table).  No locks, no side effects. */
+uint32_t net_rx_queue_len(uint32_t cpu) {
+    if (cpu >= MAX_CPUS || !rx_queue_inited) return 0;
+    return __atomic_load_n(&rx_queue[cpu].len, __ATOMIC_ACQUIRE);
+}
+
+int net_rx_cpu(void) {
+    return NET_RX_CPU;
+}
+
 static int loopback_link_status(net_device_t* dev) {
     (void)dev;
     return 1; // Always up

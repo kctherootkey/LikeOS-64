@@ -2213,9 +2213,24 @@ static void sys_exit(uint64_t status) {
     if (cur) {
         sched_mark_task_exited(cur, (int)status);
     }
-    sched_schedule();
+    /* Switch away for good.  sched_schedule() normally never returns for an
+     * exited task — it switches to another task (or idle) and this frame is
+     * abandoned.  But it CAN return in rare scheduler edge cases (e.g. the
+     * idle task was momentarily unselectable on this CPU, so the zombie is
+     * left as current_task).  In that case we must NOT park in `cli; hlt`:
+     * a CPU halted with interrupts disabled can no longer ack TLB-shootdown
+     * IPIs, which permanently wedges every other CPU spinning in
+     * smp_tlb_shootdown_sync() — observed as endless
+     * "TLB shootdown sync timeout (gen=...)" with this CPU's gen frozen and
+     * a diagnostic NMI sampling it stuck at this very loop.
+     *
+     * Keep interrupts ENABLED and retry: with IRQs on, the TLB-shootdown IPI
+     * is serviced (unblocking the rest of the system) and the timer's
+     * sched_preempt() evacuates this zombie to the idle task via its own
+     * idle fallback, so we are switched off this CPU at the next tick. */
     for (;;) {
-        __asm__ volatile ("cli; hlt");
+        sched_schedule();
+        __asm__ volatile ("sti; hlt");
     }
 }
 

@@ -47,6 +47,25 @@ int futex_wake(int* uaddr, int count);
 static int tests_passed = 0;
 static int tests_failed = 0;
 
+/* Names of failed tests, recorded so the end-of-run summary can list them in
+ * one contiguous block emitted by the parent alone.  Individual "[FAIL] ..."
+ * lines are printed inline as tests run, but under SMP a forked child writing
+ * to fd 1 can interleave with the parent's write() and split the "[FAIL]"
+ * token mid-line, so a grep for "[FAIL]" misses it even though tests_failed
+ * (and therefore the process exit code) is non-zero.  The summary list below
+ * is written when no children are running, so it is never garbled. */
+#define MAX_FAILED_NAMES 512
+static char failed_names[MAX_FAILED_NAMES][96];
+static int  failed_names_count = 0;
+
+static void record_failure(const char* name) {
+    if (failed_names_count < MAX_FAILED_NAMES) {
+        snprintf(failed_names[failed_names_count], sizeof(failed_names[0]),
+                 "%s", name ? name : "(unnamed)");
+    }
+    failed_names_count++;  /* count past the cap too, so the total is honest */
+}
+
 static volatile int g_sigusr1_hit = 0;
 static volatile int g_sigusr2_hit = 0;
 static volatile int g_last_signal = 0;
@@ -95,6 +114,7 @@ static void __test_pass_impl(const char* name) {
 static void __test_fail_impl(const char* name, const char* file, int line,
                               int saved_errno) {
     tests_failed++;
+    record_failure(name);
     if (saved_errno != 0) {
         printf("  [FAIL] %s (at %s:%d; errno=%d: %s)\n",
                name, file, line, saved_errno, strerror(saved_errno));
@@ -110,6 +130,7 @@ static void __test_result_impl(const char* name, int condition,
         __test_pass_impl(name);
     } else {
         tests_failed++;
+        record_failure(name);
         if (saved_errno != 0) {
             printf("  [FAIL] %s (at %s:%d: \"%s\" was false; errno=%d: %s)\n",
                    name, file, line, expr, saved_errno, strerror(saved_errno));
@@ -7501,6 +7522,15 @@ network_skip:;
         printf("  ALL TESTS PASSED!\n");
     } else {
         printf("  SOME TESTS FAILED!\n");
+        /* List every failed test in one contiguous block.  Use a marker that
+         * differs from the inline "[FAIL]" token so it is easy to grep for
+         * even if inline lines were garbled by concurrent SMP console writes. */
+        int shown = failed_names_count < MAX_FAILED_NAMES
+                        ? failed_names_count : MAX_FAILED_NAMES;
+        for (int i = 0; i < shown; i++)
+            printf("  >> FAILED: %s\n", failed_names[i]);
+        if (failed_names_count > shown)
+            printf("  >> (+%d more not listed)\n", failed_names_count - shown);
     }
     printf("========================================\n");
 

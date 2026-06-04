@@ -1996,8 +1996,21 @@ void tcp_rx(net_device_t* dev, uint32_t src_ip, uint32_t dst_ip,
                 // the writes below.  Drop the stale link so the
                 // orphan-recovery fallback in tcp_accept can still pair
                 // this conn with the real listener by 4-tuple.
-                if (conn->parent) {
-                    tcp_conn_t* p = conn->parent;
+                /* Read conn->parent ONCE into a local.  The previous code
+                 * read it twice — once for the NULL test, once for the
+                 * deref below — which is a TOCTOU race: another CPU can set
+                 * conn->parent = NULL between the two reads (e.g.
+                 * tcp_detach_listener_children() when the listener is
+                 * closed, tcp_free_conn(), or the TIME_WAIT reaper), none of
+                 * which serialise against this conn->lock.  The compiler
+                 * reloaded the field, so the NULL test passed but the deref
+                 * used NULL, computing &((tcp_conn_t*)0)->lock == 0x2e520 and
+                 * page-faulting inside spin_lock_irqsave (observed as a
+                 * kernel #PF in ksoftirqd's tcp_rx promotion path).  A stale
+                 * but non-NULL parent is still handled — it is re-validated
+                 * under p->lock below. */
+                tcp_conn_t* p = conn->parent;
+                if (p) {
                     uint64_t pflags;
                     spin_lock_irqsave(&p->lock, &pflags);
                     if (p->active &&
@@ -2757,7 +2770,7 @@ void tcp_dump_table(struct tty *tty) {
         uint32_t used = (c->rx_tail - c->rx_head + c->rx_buf_size) % c->rx_buf_size;
         uint32_t free_b = c->rx_buf_size - used;
         tty_printf(tty,
-                "%3d %-7s %u.%u.%u.%u:%u %u.%u.%u.%u:%u p=%d ar=%u rc=%u tr=%u cw=%u ss=%u if=%u snd_wnd=%u rcv_buf=%u rcv_adv=%u ws=%d/%d ts=%d sack=%d srtt=%u rto=%u rnxt=%u snxt=%u suna=%u\n",
+                "%3d %-7s %u.%u.%u.%u:%u %u.%u.%u.%u:%u p=%d ar=%u rc=%u tr=%u cw=%u ss=%u if=%u snd_wnd=%u rcv_buf=%u rcv_adv=%u ws=%d/%d ts=%d sack=%d srtt=%u rto=%u rnxt=%u snxt=%u suna=%u rxh=%u rxt=%u rxrdy=%d used=%u ooo=%u txrdy=%d\n",
                 i, s,
                 (li>>24)&0xff,(li>>16)&0xff,(li>>8)&0xff,li&0xff, c->local_port,
                 (ri>>24)&0xff,(ri>>16)&0xff,(ri>>8)&0xff,ri&0xff, c->remote_port,
@@ -2774,7 +2787,30 @@ void tcp_dump_table(struct tty *tty) {
                 (int)c->rcv_wscale, (int)c->snd_wscale,
                 (int)c->ts_enabled, (int)c->sack_ok,
                 (unsigned)c->srtt_us, (unsigned)c->rto_us,
-                c->rcv_nxt, c->snd_nxt, c->snd_una);
+                c->rcv_nxt, c->snd_nxt, c->snd_una,
+                (unsigned)c->rx_head, (unsigned)c->rx_tail, (int)c->rx_ready,
+                (unsigned)used, (unsigned)c->ooo_count, (int)c->tx_ready);
+    }
+
+    /* Network-RX / softirq state — to localise a loopback delivery stall:
+     *   - an ESTAB conn above with used>0 && rxrdy=0  => recv lost wakeup
+     *     (data sits in the ring but sock_recv is asleep).
+     *   - rx_q>0 with the NET_RX softirq bit pending and ksoftirqd not
+     *     RUNNING => softirq lost wakeup (the packet never reaches tcp_rx).
+     * (ksoftirqd_state matches the scheduler dump's State column.) */
+    extern uint32_t net_rx_queue_len(uint32_t cpu);
+    extern int      net_rx_cpu(void);
+    extern uint32_t softirq_pending_get(uint32_t cpu);
+    extern int      ksoftirqd_state_get(uint32_t cpu);
+    extern uint32_t percpu_get_online_count(void);
+    uint32_t ncpu = percpu_get_online_count();
+    if (ncpu > 64) ncpu = 64;
+    tty_printf(tty, "--- net rx (NET_RX_CPU=%d) ---\n", net_rx_cpu());
+    for (uint32_t cpu = 0; cpu < ncpu; cpu++) {
+        tty_printf(tty,
+                "  CPU%u rx_q=%u softirq_pending=0x%x ksoftirqd_state=%d\n",
+                cpu, net_rx_queue_len(cpu), softirq_pending_get(cpu),
+                ksoftirqd_state_get(cpu));
     }
     tty_printf(tty, "=================\n");
 }

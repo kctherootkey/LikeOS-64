@@ -48,6 +48,42 @@ static inline int ps2_output_is_keyboard(void)
     return (status & PS2_STATUS_OUTPUT_FULL) && !(status & PS2_STATUS_AUXDATA);
 }
 
+/* Fully drain the shared i8042 output buffer.
+ *
+ * The PS/2 keyboard (IRQ1) and mouse (IRQ12) share one byte of output
+ * buffer behind port 0x60, and the IOAPIC delivers both lines EDGE
+ * triggered: an interrupt fires only on the OBF (output-buffer-full)
+ * 0->1 transition.  If a second byte is latched into the buffer in the
+ * window between our read of 0x60 and the controller re-arming, no new
+ * edge is generated.  OBF stays high, no further IRQ1/IRQ12 ever fires,
+ * and ALL keyboard/mouse input is dead until something reads 0x60 again.
+ * Nothing polls it, so the wedge is permanent — the classic symptom is a
+ * keyboard that stops responding while the timer-driven cursor keeps
+ * blinking.  Reading a single byte per IRQ (the old behaviour) walks
+ * straight into this trap whenever two bytes arrive close together
+ * (easy under SMP, or when mouse motion races a keystroke).
+ *
+ * Loop until OBF clears, dispatching each byte to the correct handler by
+ * its AUXB source bit.  Both keyboard_irq_handler() and mouse_irq_handler()
+ * read exactly one byte from 0x60, so every iteration makes progress.  The
+ * bound is a safety net against a wedged/absent controller that reports OBF
+ * (or 0xFF) forever; a real PS/2 device never has anywhere near 64 bytes
+ * queued at human input rates. */
+static void ps2_drain_output(void)
+{
+    for (int i = 0; i < 64; i++) {
+        uint8_t status = inb(PS2_STATUS_PORT);
+        if (status == 0xFF)                          /* controller gone */
+            break;
+        if (!(status & PS2_STATUS_OUTPUT_FULL))      /* buffer empty */
+            break;
+        if (status & PS2_STATUS_AUXDATA)
+            mouse_irq_handler();                     /* consumes one byte */
+        else
+            keyboard_irq_handler();                  /* consumes one byte */
+    }
+}
+
 // ACPI SCI dispatch (from oslikeos.c)
 extern int acpi_sci_dispatch(void);
 #define ACPI_SCI_VECTOR  58
@@ -478,6 +514,12 @@ static int is_kernel_addr(uint64_t addr) {
  * kernel ELF.  Best-effort: skip pages whose presence we cannot verify
  * without risking a recursive #PF inside the oops handler. */
 static void oops_rip_bytes(uint64_t rip) {
+#ifndef DEBUG
+    /* The raw faulting-instruction bytes are only useful with the DWARF
+     * symbols / unstripped ELF that DEBUG=1 keeps; a CRASH_VERBOSE-only
+     * (production-like) build cannot disassemble them, so skip the dump. */
+    (void)rip;
+#else
     if (!is_kernel_addr(rip))
         return;
     uint64_t start = rip - 16;
@@ -505,6 +547,7 @@ static void oops_rip_bytes(uint64_t rip) {
         }
         kprintf("\n");
     }
+#endif /* DEBUG */
 }
 
 /* Walk the RBP frame chain and print return addresses via kprintf */
@@ -844,7 +887,7 @@ void panic(const char *fmt, ...) {
     }
 }
 
-#ifdef DEBUG
+#ifdef CRASH_VERBOSE
 static void report_userspace_crash_detailed(task_t* cur, uint64_t* regs,
                                              int signum, const char* signame,
                                              uint64_t cr2, uint64_t int_no)
@@ -921,10 +964,14 @@ static void report_userspace_crash_detailed(task_t* cur, uint64_t* regs,
             task_tty_printf(cur, "task->fs_base:  %016llx\n", cur->fs_base);
     }
 
-    /* Bytes around RIP for post-mortem disassembly.  Guarded by
-     * mm_user_addr_mapped so we don't take a nested #PF inside the
-     * crash handler.  Goes via task_tty_printf so output lands in the
-     * same terminal as the rest of the report. */
+    /* Bytes around RIP for post-mortem disassembly.  Only emitted in a full
+     * DEBUG build: without the DWARF symbols and unstripped ELF that DEBUG=1
+     * preserves, the raw bytes cannot be mapped back to source and are just
+     * noise — so a CRASH_VERBOSE-only (production-like) build skips them.
+     * Guarded by mm_user_addr_mapped so we don't take a nested #PF inside the
+     * crash handler.  Goes via task_tty_printf so output lands in the same
+     * terminal as the rest of the report. */
+#ifdef DEBUG
     if ((rip >> 47) == 0 && mm_user_addr_mapped(rip - 16, 32)) {
         const uint8_t *p = (const uint8_t *)(rip - 16);
         task_tty_printf(cur,
@@ -946,6 +993,7 @@ static void report_userspace_crash_detailed(task_t* cur, uint64_t* regs,
         task_tty_printf(cur,
                 "\nBytes around RIP: <not safely readable>\n");
     }
+#endif /* DEBUG */
 
     task_tty_printf(cur, "\nMemory map (mmap regions tracked by syscall layer):\n");
     if (cur) {
@@ -1035,13 +1083,13 @@ static void report_userspace_crash_detailed(task_t* cur, uint64_t* regs,
     task_tty_printf(cur, "\nSYSTEM ACTION:\n  process terminated\n");
     task_tty_printf(cur, "========================================\n");
 }
-#endif /* DEBUG */
+#endif /* CRASH_VERBOSE */
 
 static void report_userspace_crash(task_t* cur, uint64_t* regs,
                                     int signum, const char* signame,
                                     uint64_t cr2, uint64_t int_no)
 {
-#ifdef DEBUG
+#ifdef CRASH_VERBOSE
     report_userspace_crash_detailed(cur, regs, signum, signame, cr2, int_no);
 #else
     task_tty_printf(cur, "User process %d killed by %s\n",
@@ -1407,22 +1455,16 @@ void irq_handler(uint64_t *regs) {
         }
         case 33:
             g_irq1_count++;
-            if (ps2_output_is_aux()) {
-                mouse_irq_handler();
-            } else {
-                keyboard_irq_handler();
-            }
+            /* Drain fully: a single read per IRQ can lose the edge and
+             * permanently wedge keyboard+mouse input (see ps2_drain_output). */
+            ps2_drain_output();
             break;
         case 34:
             // IRQ2 is cascade - should never fire, just ACK it
             break;
         case 44:
             g_irq12_count++;
-            if (ps2_output_is_keyboard()) {
-                keyboard_irq_handler();
-            } else {
-                mouse_irq_handler();
-            }
+            ps2_drain_output();
             break;
         default: {
             // Legacy INTx dispatch for XHCI (when MSI is not available)

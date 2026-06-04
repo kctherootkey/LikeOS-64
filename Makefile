@@ -6,13 +6,34 @@
 # DEBUG=1 also implies NO_STRIP=1 and adds -g3 so RIP-around-fault byte dumps
 # can be disassembled post-mortem (objdump -d build/kernel.elf).
 DEBUG ?= 0
+
+# Pass CRASH_VERBOSE=1 to enable the detailed userspace + kernel crash reports
+# (full register dump, decoded fault reason, page-table walk of the faulting
+# VA, mmap region list, segment/MSR state, ...) in a build that is otherwise
+# stripped and has NO memory poisoning — i.e. a production-like build.  This
+# is the knob for debugging crashes that only reproduce in production.
+#
+# It deliberately does NOT enable the "bytes around RIP" hexdumps: those are
+# only useful alongside the DWARF symbols and unstripped ELF that DEBUG=1
+# provides, so they stay gated behind DEBUG.
+#
+# DEBUG=1 implies CRASH_VERBOSE=1 (a debug build is a superset).
+CRASH_VERBOSE ?= 0
 ifeq ($(DEBUG),1)
-  KERNEL_DEBUG_CFLAGS = -DDEBUG=1 -g3 -gdwarf-4
+  override CRASH_VERBOSE := 1
+endif
+
+ifeq ($(DEBUG),1)
+  KERNEL_DEBUG_CFLAGS = -DDEBUG=1 -DCRASH_VERBOSE=1 -g3 -gdwarf-4
   # Force preservation of the symbol table when DEBUG is set.  Without this
   # the post-mortem byte dump emitted by the oops handler is useless because
   # we cannot resolve RIP back to a function name.  Use `override` so a
   # stray `NO_STRIP=` on the command line cannot quietly turn symbols off.
   override NO_STRIP := 1
+else ifeq ($(CRASH_VERBOSE),1)
+  # Production-like build: verbose crash reports, but stripped, no -g3, no
+  # symbol-table preservation and no memory poisoning.
+  KERNEL_DEBUG_CFLAGS = -DCRASH_VERBOSE=1
 else
   KERNEL_DEBUG_CFLAGS =
 endif
@@ -21,7 +42,7 @@ endif
 CODENAME = blessed kitty
 
 # Version string: override on command line with LIKEOS_VERSION=x.y.z
-LIKEOS_VERSION ?= 0.2.2-HEAD
+LIKEOS_VERSION ?= 0.2.3-HEAD
 
 # Tools
 GCC = gcc
@@ -1612,6 +1633,7 @@ distclean: clean
 	$(MAKE) -C ports/tmux-3.6a -f Makefile.likeos clean
 	$(MAKE) -C ports/netcat-OpenBSD -f Makefile.likeos clean
 	$(MAKE) -C ports/openssl-3.5.6 -f Makefile.likeos clean
+	$(MAKE) -C ports/curl-8.14.1 -f Makefile.likeos clean
 
 # Install dependencies (Ubuntu/Debian)
 deps:
@@ -1653,6 +1675,9 @@ help:
 	@echo "  SCREEN_SIZE=large - Preferred bootloader resolution 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1152x864, 1024x768)"
 	@echo "  SCREEN_SIZE=medium or unset - Preferred bootloader resolution 1280x800 (fallback: 1280x768, 1024x768)"
 	@echo "  LIKEOS_VERSION=x.y.z - Override kernel version string reported by uname (default: 0.2.1-HEAD)"
+	@echo "  CRASH_VERBOSE=1   - Emit detailed userspace and kernel crash reports (registers, fault decode, page-table walk) in an otherwise stripped, non-poisoned production-like build."
+	@echo "  DEBUG=1           - Full debug build: kernel memory poisoning, DWARF symbols, unstripped kernel, libc stack-smash detail, and the RIP byte dumps (implies CRASH_VERBOSE=1)."
+	@echo "  NO_STRIP=1        - Keep the kernel symbol table (do not strip kernel.elf) so a crash trace can be resolved to function names with nm/objdump (implied by DEBUG=1)."
 	@echo ""
 	@echo "Subsystem Notes:"
 	@echo "  PS/2: Optional; modern hardware may lack controller (fallback to USB HID planned)."

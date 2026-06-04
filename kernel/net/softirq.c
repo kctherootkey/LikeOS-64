@@ -59,6 +59,20 @@ void softirq_raise_on(uint32_t cpu, uint32_t nr) {
     }
 }
 
+/* Read-only diagnostic accessors used by the Ctrl+N TCP/net dump
+ * (tcp_dump_table) to detect a softirq lost wakeup.  No locks, no
+ * side effects. */
+uint32_t softirq_pending_get(uint32_t cpu) {
+    if (cpu >= MAX_CPUS) return 0;
+    return softirq_pending_mask[cpu];
+}
+
+int ksoftirqd_state_get(uint32_t cpu) {
+    if (cpu >= MAX_CPUS) return -1;
+    task_t* t = ksoftirqd_task[cpu];
+    return t ? (int)t->state : -1;
+}
+
 // Returns the previous IF state (1 if IRQs were enabled, 0 otherwise) and
 // disables IRQs.
 static inline uint64_t local_irq_save_raw(void) {
