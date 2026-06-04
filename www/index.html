@@ -165,12 +165,12 @@
   <div class="release-block">
     Current development release:
     <p>
-      <span class="release-name">LikeOS 0.2</span>
+      <span class="release-name">LikeOS 0.2.3-HEAD</span>
     </p>
   </div>
 
   <p>
-    Version 0.2 has these key features:
+    Version 0.2.3 has these key features:
   </p>
   <ul>
     <li>64-bit long mode kernel with higher-half mapping.</li>
@@ -185,12 +185,14 @@
     <li>Dentry cache, inode cache, and page cache with read-ahead and CLOCK-style eviction.</li>
     <li>xHCI USB 3.0 stack and USB mass storage driver.</li>
     <li>PS/2, PCI, and APIC hardware drivers.</li>
-    <li>Physical and virtual memory management with SLAB allocator and security protections.</li>
-    <li>POSIX-like TTY and signal handling.</li>
+    <li>TCP/IP networking stack with BSD-style sockets and multiple NIC drivers.</li>
+    <li>Physical and virtual memory management with SLAB allocator, stack canaries, and security protections.</li>
+    <li>Virtual terminals (VTs) with POSIX-like TTY and signal handling.</li>
     <li>Userland libc with dynamic runtime linker support.</li>
     <li>Framebuffer console optimizations.</li>
     <li>Core utilities: sh, ls, cat, cp, mv, rm, grep, find, nano, top, ps, and many more.</li>
-    <li>Real hardware support on Lenovo notebook, VMware, VirtualBox, and QEMU.</li>
+    <li>Ported applications: nano, tmux, netcat, openssl, curl.</li>
+    <li>Real hardware support on Lenovo and Dell notebooks, VMware, VirtualBox, and QEMU.</li>
   </ul>
 
   <hr>
@@ -246,7 +248,7 @@
   </p>
 
   <p class="footer-updated">
-    This page last updated <b>April 10<sup>th</sup>, 2026</b>.
+    This page last updated <b>June 4<sup>th</sup>, 2026</b>.
   </p>
 
   <hr>

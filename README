@@ -8,13 +8,14 @@ an interactive shell.
 Current state
 -------------
 
-- Real hardware support: tested on Lenovo notebook with USB boot.
-- Linux bootstrapper support: boot from Linux USB host and launch LikeOS in
-  embedded QEMU.
+- Real hardware support: tested on Lenovo and Dell notebooks with USB boot.
 - QEMU support: run with USB image targets.
 - VMware support: USB 3.1 boot.
 - VirtualBox support: xHCI (USB 3) and ICH9 chipset.
 - UEFI boot is required.
+- Linux bootstrapper support: boot from a Linux USB host and launch LikeOS in
+  embedded QEMU. Note: not strictly required -- the supported targets are VMs
+  and real hardware, both of which run LikeOS independently of Linux.
 
 Overview
 --------
@@ -27,9 +28,13 @@ LikeOS-64 is a Unix-like operating system demonstrating modern OS development:
 - UEFI bootloader: GNU-EFI based ELF64 kernel loading.
 - Filesystems: FAT32 with VFS and devfs.
 - Caching strategy: dentry cache, inode cache, and page cache.
+- Networking: TCP/IP stack with BSD-style sockets and multiple NIC drivers.
 - Hardware drivers: xHCI USB 3.0, USB mass storage, PS/2, PCI, APIC.
-- Memory: physical/virtual memory, SLAB allocator, security protections.
-- TTY and signals: POSIX-like terminal and signal handling.
+- Memory: physical/virtual memory, SLAB allocator, stack canaries, and
+  security protections.
+- Virtual terminals, TTY, and signals: multiple VTs with POSIX-like terminal
+  and signal handling.
+- Diagnostics: kernel and user crashlog printing with BUG_ON/WARN_ON asserts.
 
 Feature summary
 ---------------
@@ -49,6 +54,17 @@ SMP (Symmetric Multi-Processing)
 - LAPIC timer setup and SMP IPI support.
 - IOAPIC routing for multi-core delivery.
 - TLB shootdown helpers and SMP-aware locking paths.
+
+Networking
+~~~~~~~~~~
+- TCP/IP stack: Ethernet, ARP, IPv4, ICMP, IGMP, UDP, and TCP.
+- BSD-style socket layer, plus Unix domain sockets.
+- DHCP client, DNS resolver, and routing table.
+- Softirq-based packet processing with rate limiting.
+- NIC drivers: Intel e1000/e1000e/igb, eepro100, AMD PCnet32, NE2000,
+  Realtek RTL8139, DEC Tulip, and VMware vmxnet3.
+- Networking utilities: ifconfig, route, arp, ping, traceroute, netstat,
+  dhclient, host, dig, nslookup, hostname, and arping.
 
 Caching strategy
 ~~~~~~~~~~~~~~~~
@@ -72,6 +88,24 @@ Process management and userland
 - ELF64 user binary loading.
 - Userland libc and dynamic runtime linker support.
 
+Virtual terminals and TTY
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+- POSIX-like TTY line discipline and job-control signals.
+- Per-task TTY output routing for clean crashlog and diagnostics printing.
+
+Security and hardening
+~~~~~~~~~~~~~~~~~~~~~~~
+- Stack canaries (stack-smashing protection) in kernel and userland.
+- User/kernel address-space separation and ring 3 isolation.
+- Page-level memory protections.
+
+Reliability and diagnostics
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- Proper crashlog printing for both kernel and user faults.
+- In-kernel assertion framework: BUG_ON, WARN_ON, WARN_ON_ONCE,
+  VM_BUG_ON/VM_WARN_ON, and BUILD_BUG_ON.
+- Non-fatal warnings continue execution; fatal bugs print a full crash dump.
+
 User core utilities
 ~~~~~~~~~~~~~~~~~~~
 Included commands (selection):
@@ -83,8 +117,20 @@ Included commands (selection):
 - Process tools: kill, sleep.
 - Environment tools: env, which, echo, printf.
 - Power tools: shutdown, poweroff, reboot, halt.
+- Network tools: ifconfig, route, arp, ping, traceroute, netstat, dhclient,
+  host, dig, nslookup, hostname, arping.
 - Other utilities: clear, man, yes, true, false.
 - Test programs: test_syscalls, test_libc, testmem, teststress, progerr.
+
+Ported applications
+~~~~~~~~~~~~~~~~~~~
+Third-party software ported to LikeOS-64 (under ports/):
+
+- nano: text editor.
+- tmux: terminal multiplexer.
+- netcat (OpenBSD): networking utility.
+- openssl: TLS/crypto toolkit and library.
+- curl: data transfer client (HTTP/HTTPS, etc.).
 
 Build
 -----
@@ -151,16 +197,18 @@ Completed:
 - UEFI bootloader and ELF64 loading.
 - Multitasking scheduler and userland process model.
 - SMP bring-up and per-CPU kernel infrastructure.
-- Syscall layer, signals, pipes, and TTY.
+- Syscall layer, signals, pipes, virtual terminals, and TTY.
 - FAT32, VFS, devfs, and caching layers.
 - xHCI USB stack and USB mass storage.
+- TCP/IP networking stack, sockets, and multiple NIC drivers.
+- Stack canaries and crashlog/assertion (BUG_ON/WARN_ON) infrastructure.
 - Framebuffer console optimizations.
 - Userland libc and core utilities set.
+- Ported applications: nano, tmux, netcat, openssl, curl.
 
 Planned/future work:
-- Networking stack.
 - Additional writable filesystems.
-- More drivers (AHCI/NVMe/networking).
+- More drivers (AHCI/NVMe).
 - Expanded POSIX coverage.
 - GUI and package management improvements.
 
