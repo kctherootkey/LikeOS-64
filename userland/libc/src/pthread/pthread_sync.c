@@ -4,9 +4,9 @@
  * Read-write locks, spinlocks, and barriers.
  */
 
-#include "../../include/pthread.h"
-#include "../../include/sched.h"
-#include "../../include/errno.h"
+#include <pthread.h>
+#include <sched.h>
+#include <errno.h>
 #include "../syscalls/syscall.h"
 #include "pthread_internal.h"
 

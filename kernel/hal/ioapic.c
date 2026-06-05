@@ -1,11 +1,11 @@
 // LikeOS-64 - Minimal IOAPIC support
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/ioapic.h"
-#include "../../include/kernel/interrupt.h" // for idt vector constants if needed
-#include "../../include/kernel/lapic.h"     // for lapic_get_id_cpuid
-#include "../../include/kernel/memory.h"    // for phys_to_virt
-#include "../../include/kernel/sched.h"     // for sched_is_smp()
-#include "../../include/kernel/bug.h"
+#include <kernel/console.h>
+#include <kernel/ioapic.h>
+#include <kernel/interrupt.h> // for idt vector constants if needed
+#include <kernel/lapic.h>     // for lapic_get_id_cpuid
+#include <kernel/memory.h>    // for phys_to_virt
+#include <kernel/sched.h>     // for sched_is_smp()
+#include <kernel/bug.h>
 
 // Default IOAPIC MMIO base (commonly 0xFEC00000). No ACPI parsing yet.
 #define IOAPIC_DEFAULT_BASE 0xFEC00000UL

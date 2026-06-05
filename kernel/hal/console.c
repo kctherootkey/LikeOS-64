@@ -3,17 +3,17 @@
 
 #define BOOT_DEBUG 0
 
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/serial.h"
-#include "../../include/kernel/usb_serial.h"
-#include "../../include/kernel/fb_optimize.h"
-#include "../../include/kernel/mouse.h"
-#include "../../include/kernel/scrollbar.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/sched.h"  // For spinlock_t
-#include "../../include/kernel/sysfont.h"  // For external PSF font loading
-#include "../../include/kernel/timer.h"   // For timer_ticks() (flush rate-limiting)
-#include "../../include/kernel/bug.h"
+#include <kernel/console.h>
+#include <kernel/serial.h>
+#include <kernel/usb_serial.h>
+#include <kernel/fb_optimize.h>
+#include <kernel/mouse.h>
+#include <kernel/scrollbar.h>
+#include <kernel/memory.h>
+#include <kernel/sched.h>  // For spinlock_t
+#include <kernel/sysfont.h>  // For external PSF font loading
+#include <kernel/timer.h>   // For timer_ticks() (flush rate-limiting)
+#include <kernel/bug.h>
 
 #define SIZE_MAX ((size_t)-1)
 #define NULL ((void*)0)

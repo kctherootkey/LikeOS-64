@@ -1,5 +1,5 @@
-#include "../../include/fnmatch.h"
-#include "../../include/string.h"
+#include <fnmatch.h>
+#include <string.h>
 
 static int match_class(const char **pp, char c, int casefold)
 {

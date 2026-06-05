@@ -1,10 +1,10 @@
-#include "../../include/stdio.h"
-#include "../../include/stdlib.h"
-#include "../../include/string.h"
-#include "../../include/errno.h"
-#include "../../include/unistd.h"
-#include "../../include/stdarg.h"
-#include "../../include/fcntl.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <stdarg.h>
+#include <fcntl.h>
 
 // Standard file streams - with buffering
 static unsigned char __stdin_rbuf[BUFSIZ];

@@ -5,8 +5,8 @@
  * implementations operate on the bit-pattern of `double` directly so
  * they need no FP register tricks beyond what GCC emits inline.
  */
-#include "../../include/math.h"
-#include "../../include/stdint.h"
+#include <math.h>
+#include <stdint.h>
 
 /* Bit-twiddling helpers --------------------------------------------------- */
 static inline uint64_t d2u(double x) {

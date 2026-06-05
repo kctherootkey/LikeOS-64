@@ -1,9 +1,9 @@
 // LikeOS-64 - Minimal PCI enumeration
-#include "../../include/kernel/pci.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/lapic.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/pci.h>
+#include <kernel/console.h>
+#include <kernel/sched.h>
+#include <kernel/lapic.h>
+#include <kernel/bug.h>
 
 #define PCI_CONFIG_ADDRESS 0xCF8
 #define PCI_CONFIG_DATA    0xCFC

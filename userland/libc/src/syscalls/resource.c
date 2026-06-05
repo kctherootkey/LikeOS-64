@@ -5,9 +5,9 @@
  * stubs reporting "no limit" since the kernel does not enforce per-task
  * resource limits.
  */
-#include "../../include/sys/resource.h"
-#include "../../include/string.h"
-#include "../../include/errno.h"
+#include <sys/resource.h>
+#include <string.h>
+#include <errno.h>
 #include "syscall.h"
 
 int getrusage(int who, struct rusage* usage) {

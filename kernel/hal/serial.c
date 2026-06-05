@@ -1,10 +1,10 @@
 // LikeOS-64 HAL - 16550 UART Serial Console (COM1)
 // Minimal polled driver for logging to QEMU -serial stdio
 
-#include "../../include/kernel/serial.h"
-#include "../../include/kernel/interrupt.h" // for inb/outb
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/serial.h>
+#include <kernel/interrupt.h> // for inb/outb
+#include <kernel/sched.h>
+#include <kernel/bug.h>
 
 #define COM1_PORT 0x3F8
 

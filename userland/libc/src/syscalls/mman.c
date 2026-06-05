@@ -1,5 +1,5 @@
-#include "../../include/sys/mman.h"
-#include "../../include/errno.h"
+#include <sys/mman.h>
+#include <errno.h>
 #include "syscall.h"
 
 void* mmap(void* addr, size_t length, int prot, int flags, int fd, long offset) {

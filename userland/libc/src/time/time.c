@@ -1,6 +1,6 @@
-#include "../../include/time.h"
-#include "../../include/string.h"
-#include "../../include/stdio.h"
+#include <time.h>
+#include <string.h>
+#include <stdio.h>
 #include <stddef.h>
 
 /* Days per month (non-leap, then leap) */

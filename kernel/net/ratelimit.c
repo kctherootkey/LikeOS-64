@@ -1,7 +1,7 @@
 // LikeOS-64 Network Rate-Limit Infrastructure
-#include "../../include/kernel/ratelimit.h"
-#include "../../include/kernel/timer.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/ratelimit.h>
+#include <kernel/timer.h>
+#include <kernel/bug.h>
 
 // ============================================================================
 // Global state

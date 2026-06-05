@@ -1,9 +1,9 @@
-#include "../../include/stdlib.h"
-#include "../../include/unistd.h"
-#include "../../include/ctype.h"
-#include "../../include/string.h"
-#include "../../include/errno.h"
-#include "../../include/stdio.h"
+#include <stdlib.h>
+#include <unistd.h>
+#include <ctype.h>
+#include <string.h>
+#include <errno.h>
+#include <stdio.h>
 
 // Simple environment variable storage
 
@@ -648,7 +648,7 @@ int system(const char *command) {
 }
 
 /* strtoimax / strtoumax */
-#include "../../include/inttypes.h"
+#include <inttypes.h>
 intmax_t strtoimax(const char *nptr, char **endptr, int base) {
     return (intmax_t)strtoll(nptr, endptr, base);
 }

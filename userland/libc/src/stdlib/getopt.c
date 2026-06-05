@@ -1,6 +1,6 @@
-#include "../../include/getopt.h"
-#include "../../include/string.h"
-#include "../../include/stdio.h"
+#include <getopt.h>
+#include <string.h>
+#include <stdio.h>
 #include <stddef.h>
 
 char *optarg = NULL;

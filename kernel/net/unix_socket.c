@@ -1,11 +1,11 @@
 // LikeOS-64 UNIX Domain Sockets
-#include "../../include/kernel/net.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/slab.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/syscall.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/net.h>
+#include <kernel/memory.h>
+#include <kernel/slab.h>
+#include <kernel/sched.h>
+#include <kernel/syscall.h>
+#include <kernel/console.h>
+#include <kernel/bug.h>
 
 // UNIX socket table
 static unix_socket_t unix_sockets[MAX_UNIX_SOCKETS];

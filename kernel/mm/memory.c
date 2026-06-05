@@ -1,13 +1,13 @@
 // LikeOS-64 Memory Management - Implementation
 // Complete Physical Memory Manager, Virtual Memory Manager, and Kernel Heap Allocator
 
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/types.h"
-#include "../../include/kernel/smp.h"
-#include "../../include/kernel/slab.h"
-#include "../../include/kernel/sched.h"  // For spinlock_t
-#include "../../include/kernel/bug.h"
+#include <kernel/memory.h>
+#include <kernel/console.h>
+#include <kernel/types.h>
+#include <kernel/smp.h>
+#include <kernel/slab.h>
+#include <kernel/sched.h>  // For spinlock_t
+#include <kernel/bug.h>
 
 // Enable SLAB allocator (comment out to use legacy fixed-size heap)
 #define USE_SLAB_ALLOCATOR

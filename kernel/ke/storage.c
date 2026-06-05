@@ -1,16 +1,17 @@
-#include "../../include/kernel/storage.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/vfs.h"
-#include "../../include/kernel/xhci.h"
-#include "../../include/kernel/usb_msd.h"
-#include "../../include/kernel/shell.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/sysfont.h"
-#include "../../include/kernel/cursor.h"
-#include "../../include/kernel/mouse.h"
-#include "../../include/kernel/pagecache.h"\n#include "../../include/kernel/dcache.h"
-#include "../../include/kernel/icache.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/storage.h>
+#include <kernel/console.h>
+#include <kernel/vfs.h>
+#include <kernel/xhci.h>
+#include <kernel/usb_msd.h>
+#include <kernel/shell.h>
+#include <kernel/memory.h>
+#include <kernel/sysfont.h>
+#include <kernel/cursor.h>
+#include <kernel/mouse.h>
+#include <kernel/pagecache.h>
+#include <kernel/dcache.h>
+#include <kernel/icache.h>
+#include <kernel/bug.h>
 
 void storage_fs_init(storage_fs_state_t* state) {
     if (!state) {

@@ -1,15 +1,15 @@
 // LikeOS-64 Poll / Select / Epoll Implementation
 // Multiplexed I/O for sockets, pipes, and regular file descriptors
 
-#include "../../include/kernel/net.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/syscall.h"
-#include "../../include/kernel/timer.h"
-#include "../../include/kernel/pipe.h"
-#include "../../include/kernel/vfs.h"
-#include "../../include/kernel/tty.h"
-#include "../../include/kernel/devfs.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/net.h>
+#include <kernel/sched.h>
+#include <kernel/syscall.h>
+#include <kernel/timer.h>
+#include <kernel/pipe.h>
+#include <kernel/vfs.h>
+#include <kernel/tty.h>
+#include <kernel/devfs.h>
+#include <kernel/bug.h>
 
 // ============================================================================
 // Epoll instance table

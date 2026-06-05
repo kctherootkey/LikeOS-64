@@ -9,18 +9,18 @@
 // 32-bit"), which works on every member of the family.  The chip has only
 // legacy INTx — no MSI/MSI-X.
 
-#include "../../../include/kernel/pcnet32.h"
-#include "../../../include/kernel/net.h"
-#include "../../../include/kernel/pci.h"
-#include "../../../include/kernel/memory.h"
-#include "../../../include/kernel/console.h"
-#include "../../../include/kernel/interrupt.h"
-#include "../../../include/kernel/slab.h"
-#include "../../../include/kernel/lapic.h"
-#include "../../../include/kernel/ioapic.h"
-#include "../../../include/kernel/acpi.h"
-#include "../../../include/kernel/timer.h"
-#include "../../../include/kernel/bug.h"
+#include <kernel/pcnet32.h>
+#include <kernel/net.h>
+#include <kernel/pci.h>
+#include <kernel/memory.h>
+#include <kernel/console.h>
+#include <kernel/interrupt.h>
+#include <kernel/slab.h>
+#include <kernel/lapic.h>
+#include <kernel/ioapic.h>
+#include <kernel/acpi.h>
+#include <kernel/timer.h>
+#include <kernel/bug.h>
 
 // ============================================================================
 // Supported PCI device IDs for the AMD PCnet-PCI family.

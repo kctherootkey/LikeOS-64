@@ -5,12 +5,12 @@
  * (errx/warnx omit the strerror suffix).  The err* variants exit with the
  * supplied status after printing.
  */
-#include "../../include/err.h"
-#include "../../include/stdio.h"
-#include "../../include/stdlib.h"
-#include "../../include/string.h"
-#include "../../include/errno.h"
-#include "../../include/unistd.h"
+#include <err.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
 
 extern char** environ;
 

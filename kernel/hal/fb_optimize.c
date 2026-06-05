@@ -3,11 +3,11 @@
 
 #define BOOT_DEBUG 0
 
-#include "../../include/kernel/fb_optimize.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/fb_optimize.h>
+#include <kernel/memory.h>
+#include <kernel/console.h>
+#include <kernel/sched.h>
+#include <kernel/bug.h>
 
 
 // Define missing types for kernel

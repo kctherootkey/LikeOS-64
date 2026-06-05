@@ -1,11 +1,11 @@
-#include "../../include/kernel/shell.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/elf.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/tty.h"
-#include "../../include/kernel/vfs.h"
-#include "../../include/kernel/syscall.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/shell.h>
+#include <kernel/console.h>
+#include <kernel/elf.h>
+#include <kernel/sched.h>
+#include <kernel/tty.h>
+#include <kernel/vfs.h>
+#include <kernel/syscall.h>
+#include <kernel/bug.h>
 
 static task_t* g_shell_task = NULL;
 

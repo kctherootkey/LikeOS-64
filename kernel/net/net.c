@@ -1,24 +1,24 @@
 // LikeOS-64 Network Subsystem - Device Registry and Initialization
-#include "../../include/kernel/net.h"
-#include "../../include/kernel/e1000.h"
-#include "../../include/kernel/e1000e.h"
-#include "../../include/kernel/rtl8139.h"
-#include "../../include/kernel/pcnet32.h"
-#include "../../include/kernel/ne2k.h"
-#include "../../include/kernel/vmxnet3.h"
-#include "../../include/kernel/eepro100.h"
-#include "../../include/kernel/igb.h"
-#include "../../include/kernel/tulip.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/slab.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/random.h"
-#include "../../include/kernel/ratelimit.h"
-#include "../../include/kernel/timer.h"
-#include "../../include/kernel/skb.h"
-#include "../../include/kernel/softirq.h"
-#include "../../include/kernel/percpu.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/net.h>
+#include <kernel/e1000.h>
+#include <kernel/e1000e.h>
+#include <kernel/rtl8139.h>
+#include <kernel/pcnet32.h>
+#include <kernel/ne2k.h>
+#include <kernel/vmxnet3.h>
+#include <kernel/eepro100.h>
+#include <kernel/igb.h>
+#include <kernel/tulip.h>
+#include <kernel/console.h>
+#include <kernel/slab.h>
+#include <kernel/memory.h>
+#include <kernel/random.h>
+#include <kernel/ratelimit.h>
+#include <kernel/timer.h>
+#include <kernel/skb.h>
+#include <kernel/softirq.h>
+#include <kernel/percpu.h>
+#include <kernel/bug.h>
 
 // Broadcast MAC address
 const uint8_t eth_broadcast_addr[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};

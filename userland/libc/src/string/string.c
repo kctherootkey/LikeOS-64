@@ -1,7 +1,7 @@
-#include "../../include/string.h"
-#include "../../include/stdlib.h"
-#include "../../include/errno.h"
-#include "../../include/stdint.h"
+#include <string.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <stdint.h>
 
 /* String-primitive replacements: previously these were the obvious
  * byte-at-a-time C loops.  EVERY userspace program (OpenSSL's TLS record

@@ -11,10 +11,10 @@
  * full POSIX BRE/ERE semantics will simply see substring matches.
  */
 
-#include "../../include/regex.h"
-#include "../../include/string.h"
-#include "../../include/stdlib.h"
-#include "../../include/ctype.h"
+#include <regex.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 
 struct re_dfa_t {
     char *pattern;

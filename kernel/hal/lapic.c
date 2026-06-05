@@ -2,12 +2,12 @@
 // Per-CPU interrupt controller, timer, and IPI support
 // Supports both xAPIC (MMIO) and x2APIC (MSR) modes
 
-#include "../../include/kernel/lapic.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/interrupt.h"
-#include "../../include/kernel/smp.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/lapic.h>
+#include <kernel/console.h>
+#include <kernel/memory.h>
+#include <kernel/interrupt.h>
+#include <kernel/smp.h>
+#include <kernel/bug.h>
 
 // ============================================================================
 // LAPIC Base Address

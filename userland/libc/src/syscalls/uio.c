@@ -4,8 +4,8 @@
  * sequentially; partial-transfer semantics on errors mid-stream are
  * documented under POSIX.1-2017 §readv/writev "RETURN VALUE".
  */
-#include "../../include/sys/uio.h"
-#include "../../include/errno.h"
+#include <sys/uio.h>
+#include <errno.h>
 #include "syscall.h"
 
 ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {

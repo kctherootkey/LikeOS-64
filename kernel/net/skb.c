@@ -6,10 +6,10 @@
 // fast path.  Free-list manipulation is protected by a per-class spinlock
 // held only long enough to swing one `next` pointer.
 
-#include "../../include/kernel/skb.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/skb.h>
+#include <kernel/console.h>
+#include <kernel/sched.h>
+#include <kernel/bug.h>
 
 #define SKB_SMALL_COUNT   512
 #define SKB_JUMBO_COUNT    64

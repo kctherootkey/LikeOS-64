@@ -1,10 +1,10 @@
 // LikeOS-64 DHCP Client
-#include "../../include/kernel/net.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/slab.h"
-#include "../../include/kernel/timer.h"
-#include "../../include/kernel/random.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/net.h>
+#include <kernel/console.h>
+#include <kernel/slab.h>
+#include <kernel/timer.h>
+#include <kernel/random.h>
+#include <kernel/bug.h>
 
 // DHCP Message types
 #define DHCP_DISCOVER   1

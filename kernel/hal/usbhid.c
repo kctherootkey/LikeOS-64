@@ -27,17 +27,17 @@
 //   - Intel xHCI specification 1.2 (for interrupt endpoint handling)
 //   - Intel Integrated Sensor Hub - detected and skipped gracefully
 
-#include "../../include/kernel/usbhid.h"
-#include "../../include/kernel/xhci.h"
-#include "../../include/kernel/usb.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/interrupt.h"
-#include "../../include/kernel/keyboard.h"
-#include "../../include/kernel/mouse.h"
-#include "../../include/kernel/tty.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/usbhid.h>
+#include <kernel/xhci.h>
+#include <kernel/usb.h>
+#include <kernel/memory.h>
+#include <kernel/console.h>
+#include <kernel/interrupt.h>
+#include <kernel/keyboard.h>
+#include <kernel/mouse.h>
+#include <kernel/tty.h>
+#include <kernel/sched.h>
+#include <kernel/bug.h>
 
 // Debug output control
 #define USBHID_DEBUG 0

@@ -1,13 +1,13 @@
 // LikeOS-64 - Per-CPU Data Implementation
 // Per-CPU variable management and GS segment setup
 
-#include "../../include/kernel/percpu.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/acpi.h"
-#include "../../include/kernel/smp.h"
-#include "../../include/kernel/random.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/percpu.h>
+#include <kernel/console.h>
+#include <kernel/memory.h>
+#include <kernel/acpi.h>
+#include <kernel/smp.h>
+#include <kernel/random.h>
+#include <kernel/bug.h>
 
 // ============================================================================
 // Global Per-CPU Data

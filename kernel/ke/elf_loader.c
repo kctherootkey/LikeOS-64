@@ -11,7 +11,7 @@
 #include <kernel/net.h>
 #include <kernel/smp.h>
 #include <kernel/random.h>
-#include "../../include/kernel/bug.h"
+#include <kernel/bug.h>
 
 // ============================================================================
 // VALIDATION

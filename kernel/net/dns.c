@@ -1,11 +1,11 @@
 // LikeOS-64 DNS Resolver
-#include "../../include/kernel/net.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/syscall.h"
-#include "../../include/kernel/slab.h"
-#include "../../include/kernel/timer.h"
-#include "../../include/kernel/random.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/net.h>
+#include <kernel/console.h>
+#include <kernel/syscall.h>
+#include <kernel/slab.h>
+#include <kernel/timer.h>
+#include <kernel/random.h>
+#include <kernel/bug.h>
 
 // DNS constants
 #define DNS_PORT            53

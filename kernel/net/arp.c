@@ -1,12 +1,12 @@
 // LikeOS-64 ARP (Address Resolution Protocol)
-#include "../../include/kernel/net.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/slab.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/timer.h"
-#include "../../include/kernel/skb.h"
-#include "../../include/kernel/ratelimit.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/net.h>
+#include <kernel/console.h>
+#include <kernel/slab.h>
+#include <kernel/sched.h>
+#include <kernel/timer.h>
+#include <kernel/skb.h>
+#include <kernel/ratelimit.h>
+#include <kernel/bug.h>
 
 // ============================================================================
 // ARP Table

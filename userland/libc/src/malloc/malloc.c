@@ -1,7 +1,7 @@
-#include "../../include/stdlib.h"
-#include "../../include/string.h"
-#include "../../include/unistd.h"
-#include "../../include/errno.h"
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
 
 // Simple block header for tracking allocations
 typedef struct block {

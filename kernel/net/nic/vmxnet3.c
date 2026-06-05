@@ -5,18 +5,18 @@
 // run with a single TX queue and a single RX queue.  Interrupts are
 // delivered as legacy INTx.
 
-#include "../../../include/kernel/vmxnet3.h"
-#include "../../../include/kernel/net.h"
-#include "../../../include/kernel/pci.h"
-#include "../../../include/kernel/memory.h"
-#include "../../../include/kernel/console.h"
-#include "../../../include/kernel/interrupt.h"
-#include "../../../include/kernel/slab.h"
-#include "../../../include/kernel/lapic.h"
-#include "../../../include/kernel/ioapic.h"
-#include "../../../include/kernel/acpi.h"
-#include "../../../include/kernel/timer.h"
-#include "../../../include/kernel/bug.h"
+#include <kernel/vmxnet3.h>
+#include <kernel/net.h>
+#include <kernel/pci.h>
+#include <kernel/memory.h>
+#include <kernel/console.h>
+#include <kernel/interrupt.h>
+#include <kernel/slab.h>
+#include <kernel/lapic.h>
+#include <kernel/ioapic.h>
+#include <kernel/acpi.h>
+#include <kernel/timer.h>
+#include <kernel/bug.h>
 
 static vmxnet3_dev_t g_vmxnet3;
 int g_vmxnet3_initialized = 0;

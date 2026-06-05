@@ -2,9 +2,9 @@
 // send Leave Group on drop, respond to General Query with reports for joined
 // groups.  Does not maintain timers per group; queries get an immediate reply.
 
-#include "../../include/kernel/net.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/net.h>
+#include <kernel/console.h>
+#include <kernel/bug.h>
 
 // IGMPv2 packet
 typedef struct __attribute__((packed)) {

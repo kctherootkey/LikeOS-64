@@ -5,18 +5,18 @@
 // "remote DMA" register file, and a single 32-port I/O window (BAR0).
 // Emulated by QEMU as `-device ne2k_pci`.
 
-#include "../../../include/kernel/ne2k.h"
-#include "../../../include/kernel/net.h"
-#include "../../../include/kernel/pci.h"
-#include "../../../include/kernel/memory.h"
-#include "../../../include/kernel/console.h"
-#include "../../../include/kernel/interrupt.h"
-#include "../../../include/kernel/slab.h"
-#include "../../../include/kernel/lapic.h"
-#include "../../../include/kernel/ioapic.h"
-#include "../../../include/kernel/acpi.h"
-#include "../../../include/kernel/timer.h"
-#include "../../../include/kernel/bug.h"
+#include <kernel/ne2k.h>
+#include <kernel/net.h>
+#include <kernel/pci.h>
+#include <kernel/memory.h>
+#include <kernel/console.h>
+#include <kernel/interrupt.h>
+#include <kernel/slab.h>
+#include <kernel/lapic.h>
+#include <kernel/ioapic.h>
+#include <kernel/acpi.h>
+#include <kernel/timer.h>
+#include <kernel/bug.h>
 
 // ============================================================================
 // Supported PCI device IDs.  All NE2000-PCI clones present the same

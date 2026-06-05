@@ -1,11 +1,11 @@
 // LikeOS-64 Mouse Cursor Loader
 // Loads Xcursor format cursor files for mouse pointer display
 
-#include "../../include/kernel/cursor.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/vfs.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/cursor.h>
+#include <kernel/console.h>
+#include <kernel/vfs.h>
+#include <kernel/memory.h>
+#include <kernel/bug.h>
 
 // Seek whence values
 #define SEEK_SET 0

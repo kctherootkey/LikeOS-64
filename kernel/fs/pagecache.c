@@ -10,15 +10,15 @@
 // table; global spinlock for LRU/dirty lists.  Dirty writeback on the
 // timer + close/sync.  Sequential read-ahead with adaptive window sizing.
 
-#include "../../include/kernel/pagecache.h"
-#include "../../include/kernel/vfs_sb.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/block.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/timer.h"
-#include "../../include/kernel/icache.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/pagecache.h>
+#include <kernel/vfs_sb.h>
+#include <kernel/memory.h>
+#include <kernel/console.h>
+#include <kernel/block.h>
+#include <kernel/sched.h>
+#include <kernel/timer.h>
+#include <kernel/icache.h>
+#include <kernel/bug.h>
 
 // Read sectors from block device (chunked).
 #define PC_MAX_SECTORS_PER_READ 128

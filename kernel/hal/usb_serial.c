@@ -1,12 +1,12 @@
 // LikeOS-64 - USB serial logging backend
 
-#include "../../include/kernel/usb_serial.h"
+#include <kernel/usb_serial.h>
 
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/usb.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/console.h>
+#include <kernel/memory.h>
+#include <kernel/sched.h>
+#include <kernel/usb.h>
+#include <kernel/bug.h>
 
 #ifndef USB_SERIAL_ENABLED
 

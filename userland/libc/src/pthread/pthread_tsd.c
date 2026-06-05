@@ -6,8 +6,8 @@
  * pthread_getspecific, pthread_setspecific.
  */
 
-#include "../../include/pthread.h"
-#include "../../include/errno.h"
+#include <pthread.h>
+#include <errno.h>
 #include "pthread_internal.h"
 
 extern int errno;

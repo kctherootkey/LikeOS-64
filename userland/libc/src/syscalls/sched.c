@@ -1,7 +1,7 @@
 // LikeOS-64 Scheduling and SMP syscall wrappers
-#include "../../include/sched.h"
-#include "../../include/unistd.h"
-#include "../../include/errno.h"
+#include <sched.h>
+#include <unistd.h>
+#include <errno.h>
 #include "syscall.h"
 
 extern int errno;

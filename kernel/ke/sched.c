@@ -30,25 +30,25 @@
 // not yet available.  We use a simple legacy path until sched_enable_smp()
 // is called by smp_init().
 
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/interrupt.h"
-#include "../../include/kernel/types.h"
-#include "../../include/kernel/vfs.h"
-#include "../../include/kernel/pipe.h"
-#include "../../include/kernel/tty.h"
-#include "../../include/kernel/signal.h"
-#include "../../include/kernel/timer.h"
-#include "../../include/kernel/syscall.h"
-#include "../../include/kernel/percpu.h"
-#include "../../include/kernel/smp.h"
-#include "../../include/kernel/futex.h"
-#include "../../include/kernel/net.h"
-#include "../../include/kernel/slab.h"
-#include "../../include/kernel/random.h"
-#include "../../include/kernel/bug.h"
-#include "../../include/kernel/usb_msd.h"
+#include <kernel/sched.h>
+#include <kernel/console.h>
+#include <kernel/memory.h>
+#include <kernel/interrupt.h>
+#include <kernel/types.h>
+#include <kernel/vfs.h>
+#include <kernel/pipe.h>
+#include <kernel/tty.h>
+#include <kernel/signal.h>
+#include <kernel/timer.h>
+#include <kernel/syscall.h>
+#include <kernel/percpu.h>
+#include <kernel/smp.h>
+#include <kernel/futex.h>
+#include <kernel/net.h>
+#include <kernel/slab.h>
+#include <kernel/random.h>
+#include <kernel/bug.h>
+#include <kernel/usb_msd.h>
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);

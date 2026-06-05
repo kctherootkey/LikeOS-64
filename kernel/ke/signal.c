@@ -1,13 +1,13 @@
 // LikeOS-64 Kernel Signal Implementation
-#include "../../include/kernel/signal.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/timer.h"
-#include "../../include/kernel/status.h"
-#include "../../include/kernel/syscall.h"
-#include "../../include/kernel/percpu.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/signal.h>
+#include <kernel/sched.h>
+#include <kernel/memory.h>
+#include <kernel/console.h>
+#include <kernel/timer.h>
+#include <kernel/status.h>
+#include <kernel/syscall.h>
+#include <kernel/percpu.h>
+#include <kernel/bug.h>
 
 // NOTE: Signal delivery now uses per-CPU storage via percpu_t
 // The old global syscall_signal_pending is deprecated.

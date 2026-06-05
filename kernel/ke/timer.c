@@ -1,16 +1,16 @@
 // LikeOS-64 Timer Driver
-#include "../../include/kernel/timer.h"
-#include "../../include/kernel/interrupt.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/signal.h"
-#include "../../include/kernel/percpu.h"
-#include "../../include/kernel/pagecache.h"
-#include "../../include/kernel/acpi.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/lapic.h"
-#include "../../include/kernel/random.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/timer.h>
+#include <kernel/interrupt.h>
+#include <kernel/console.h>
+#include <kernel/sched.h>
+#include <kernel/signal.h>
+#include <kernel/percpu.h>
+#include <kernel/pagecache.h>
+#include <kernel/acpi.h>
+#include <kernel/memory.h>
+#include <kernel/lapic.h>
+#include <kernel/random.h>
+#include <kernel/bug.h>
 
 static volatile uint64_t g_ticks = 0;
 /* PM Timer-based wall-clock microsecond counter.

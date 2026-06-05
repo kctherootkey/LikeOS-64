@@ -1,17 +1,17 @@
 // LikeOS-64 I/O Subsystem - Mouse Driver
 // PS/2 mouse input handling and cursor management
 
-#include "../../include/kernel/mouse.h"
-#include "../../include/kernel/interrupt.h"
-#include "../../include/kernel/fb_optimize.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/cursor.h"
-#include "../../include/kernel/tty.h"
-#include "../../include/kernel/ioapic.h"
-#include "../../include/kernel/keyboard.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/mouse.h>
+#include <kernel/interrupt.h>
+#include <kernel/fb_optimize.h>
+#include <kernel/memory.h>
+#include <kernel/console.h>
+#include <kernel/sched.h>
+#include <kernel/cursor.h>
+#include <kernel/tty.h>
+#include <kernel/ioapic.h>
+#include <kernel/keyboard.h>
+#include <kernel/bug.h>
 
 // Global mouse state
 static mouse_state_t mouse_state = {0};

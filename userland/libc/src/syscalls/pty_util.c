@@ -6,14 +6,14 @@
  * tty of the calling process via setsid + ioctl(TIOCSCTTY) and rebinds
  * stdin/stdout/stderr to it.
  */
-#include "../../include/util.h"
-#include "../../include/unistd.h"
-#include "../../include/fcntl.h"
-#include "../../include/string.h"
-#include "../../include/errno.h"
-#include "../../include/termios.h"
-#include "../../include/sys/ioctl.h"
-#include "../../include/stdio.h"
+#include <util.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <errno.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+#include <stdio.h>
 
 int openpty(int* amaster, int* aslave, char* name,
             const struct termios* termp, const struct winsize* winp)

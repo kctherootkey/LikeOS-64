@@ -1,10 +1,10 @@
 // LikeOS-64 UDP (User Datagram Protocol)
-#include "../../include/kernel/net.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/syscall.h"
-#include "../../include/kernel/skb.h"
-#include "../../include/kernel/ratelimit.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/net.h>
+#include <kernel/console.h>
+#include <kernel/syscall.h>
+#include <kernel/skb.h>
+#include <kernel/ratelimit.h>
+#include <kernel/bug.h>
 
 // UDP pseudo-header for checksum
 typedef struct __attribute__((packed)) {

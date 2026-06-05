@@ -1,24 +1,24 @@
-#include "../../include/unistd.h"
-#include "../../include/errno.h"
-#include "../../include/limits.h"
-#include "../../include/sys/wait.h"
-#include "../../include/sys/stat.h"
-#include "../../include/sys/time.h"
-#include "../../include/sys/utsname.h"
-#include "../../include/time.h"
-#include "../../include/sys/times.h"
-#include "../../include/stdarg.h"
-#include "../../include/string.h"
-#include "../../include/stdlib.h"
-#include "../../include/fcntl.h"
-#include "../../include/stdarg.h"
-#include "../../include/signal.h"
-#include "../../include/sys/reboot.h"
-#include "../../include/sys/vfs.h"
-#include "../../include/termios.h"
-#include "../../include/sys/ioctl.h"
-#include "../../include/sys/sysinfo.h"
-#include "../../include/sys/klog.h"
+#include <unistd.h>
+#include <errno.h>
+#include <limits.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/utsname.h>
+#include <time.h>
+#include <sys/times.h>
+#include <stdarg.h>
+#include <string.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <signal.h>
+#include <sys/reboot.h>
+#include <sys/vfs.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+#include <sys/sysinfo.h>
+#include <sys/klog.h>
 #include "syscall.h"
 
 int errno = 0;
@@ -575,7 +575,7 @@ int utimensat(int dirfd, const char* pathname, const struct timespec times[2], i
     return 0;
 }
 
-#include "../../include/utime.h"
+#include <utime.h>
 
 int utime(const char *path, const struct utimbuf *times) {
     struct timespec ts[2];

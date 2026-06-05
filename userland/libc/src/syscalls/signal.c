@@ -1,9 +1,9 @@
-#include "../../include/signal.h"
-#include "../../include/errno.h"
-#include "../../include/unistd.h"
-#include "../../include/time.h"
+#include <signal.h>
+#include <errno.h>
+#include <unistd.h>
+#include <time.h>
 #include "syscall.h"
-#include "../../include/string.h"
+#include <string.h>
 
 #define _NSIG_WORDS (sizeof(sigset_t))
 

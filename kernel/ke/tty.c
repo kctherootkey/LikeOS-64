@@ -1,15 +1,15 @@
 // LikeOS-64 TTY/PTY subsystem
-#include "../../include/kernel/tty.h"
-#include "../../include/kernel/vt.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/syscall.h"
-#include "../../include/kernel/usb_serial.h"
-#include "../../include/kernel/signal.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/timer.h"
-#include "../../include/kernel/net.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/tty.h>
+#include <kernel/vt.h>
+#include <kernel/console.h>
+#include <kernel/memory.h>
+#include <kernel/syscall.h>
+#include <kernel/usb_serial.h>
+#include <kernel/signal.h>
+#include <kernel/sched.h>
+#include <kernel/timer.h>
+#include <kernel/net.h>
+#include <kernel/bug.h>
 
 #define TTY_MAX_PTYS 16
 

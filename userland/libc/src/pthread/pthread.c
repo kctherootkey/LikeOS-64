@@ -5,13 +5,13 @@
  * Uses clone() with thread flags and futex for join synchronization.
  */
 
-#include "../../include/pthread.h"
-#include "../../include/sys/mman.h"
-#include "../../include/sched.h"
-#include "../../include/errno.h"
-#include "../../include/stdlib.h"
-#include "../../include/string.h"
-#include "../../include/unistd.h"
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sched.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 #include "../syscalls/syscall.h"
 #include "pthread_internal.h"
 

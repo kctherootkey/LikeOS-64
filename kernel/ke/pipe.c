@@ -2,7 +2,7 @@
 #include <kernel/pipe.h>
 #include <kernel/memory.h>
 #include <kernel/sched.h>
-#include "../../include/kernel/bug.h"
+#include <kernel/bug.h>
 
 bool pipe_is_end(const void* ptr) {
     if (!ptr) {

@@ -11,10 +11,10 @@
 //   - Dirty-row tracking: marks which rows changed; vt_flush_dirty() re-renders from cell buffer
 //   - DSR / DA / XTWINOPS terminal query replies
 
-#include "../../include/kernel/vt.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/vt.h>
+#include <kernel/console.h>
+#include <kernel/memory.h>
+#include <kernel/bug.h>
 
 /* Forward declarations from tty.c (same kernel link unit).
  * tty_enqueue_read_locked must be called with tty_lock held (IRQs off);

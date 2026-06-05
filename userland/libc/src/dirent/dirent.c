@@ -1,9 +1,9 @@
-#include "../../include/dirent.h"
-#include "../../include/unistd.h"
-#include "../../include/fcntl.h"
-#include "../../include/errno.h"
-#include "../../include/string.h"
-#include "../../include/stdlib.h"
+#include <dirent.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <string.h>
+#include <stdlib.h>
 
 struct linux_dirent64 {
     uint64_t d_ino;

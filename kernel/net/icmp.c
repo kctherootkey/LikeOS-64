@@ -1,13 +1,13 @@
 // LikeOS-64 ICMP (Internet Control Message Protocol)
-#include "../../include/kernel/net.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/timer.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/random.h"
-#include "../../include/kernel/syscall.h"
-#include "../../include/kernel/skb.h"
-#include "../../include/kernel/ratelimit.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/net.h>
+#include <kernel/console.h>
+#include <kernel/timer.h>
+#include <kernel/sched.h>
+#include <kernel/random.h>
+#include <kernel/syscall.h>
+#include <kernel/skb.h>
+#include <kernel/ratelimit.h>
+#include <kernel/bug.h>
 
 // All TX sites use a per-call sk_buff from the size-classed pool; no shared
 // static TX buffer / TX spinlock is held across the lower-layer call, so

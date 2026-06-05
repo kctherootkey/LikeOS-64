@@ -1,13 +1,13 @@
 // LikeOS-64 - xHCI Boot Integration
 // High-level interface for boot-time USB initialization and polling
 
-#include "../../include/kernel/xhci_boot.h"
-#include "../../include/kernel/usbhid.h"
-#include "../../include/kernel/pci.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/interrupt.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/xhci_boot.h>
+#include <kernel/usbhid.h>
+#include <kernel/pci.h>
+#include <kernel/console.h>
+#include <kernel/memory.h>
+#include <kernel/interrupt.h>
+#include <kernel/bug.h>
 
 // Boot state tracking
 static int g_init_attempted = 0;

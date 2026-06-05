@@ -62,20 +62,20 @@
 //   Set E1000E_DBG to 1 (just below the includes) to enable the full
 //   verbose register-dump / state-trace firehose used during bring-up.
 // ---------------------------------------------------------------------------
-#include "../../../include/kernel/e1000e.h"
-#include "../../../include/kernel/e1000.h"
-#include "../../../include/kernel/net.h"
-#include "../../../include/kernel/pci.h"
-#include "../../../include/kernel/memory.h"
-#include "../../../include/kernel/console.h"
-#include "../../../include/kernel/interrupt.h"
-#include "../../../include/kernel/slab.h"
-#include "../../../include/kernel/lapic.h"
-#include "../../../include/kernel/ioapic.h"
-#include "../../../include/kernel/acpi.h"
-#include "../../../include/kernel/smp.h"
-#include "../../../include/kernel/timer.h"
-#include "../../../include/kernel/bug.h"
+#include <kernel/e1000e.h>
+#include <kernel/e1000.h>
+#include <kernel/net.h>
+#include <kernel/pci.h>
+#include <kernel/memory.h>
+#include <kernel/console.h>
+#include <kernel/interrupt.h>
+#include <kernel/slab.h>
+#include <kernel/lapic.h>
+#include <kernel/ioapic.h>
+#include <kernel/acpi.h>
+#include <kernel/smp.h>
+#include <kernel/timer.h>
+#include <kernel/bug.h>
 
 // ============================================================================
 // Debug / diagnostic logging.

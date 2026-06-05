@@ -1,18 +1,18 @@
 // LikeOS-64 Socket Layer
 // Provides kernel-side socket abstraction for syscall layer
 
-#include "../../include/kernel/net.h"
-#include "../../include/kernel/console.h"
-#include "../../include/kernel/slab.h"
-#include "../../include/kernel/syscall.h"
-#include "../../include/kernel/timer.h"
-#include "../../include/kernel/vfs.h"
-#include "../../include/kernel/pipe.h"
-#include "../../include/kernel/memory.h"
-#include "../../include/kernel/tty.h"
-#include "../../include/kernel/random.h"
-#include "../../include/kernel/sched.h"
-#include "../../include/kernel/bug.h"
+#include <kernel/net.h>
+#include <kernel/console.h>
+#include <kernel/slab.h>
+#include <kernel/syscall.h>
+#include <kernel/timer.h>
+#include <kernel/vfs.h>
+#include <kernel/pipe.h>
+#include <kernel/memory.h>
+#include <kernel/tty.h>
+#include <kernel/random.h>
+#include <kernel/sched.h>
+#include <kernel/bug.h>
 
 // Socket table
 static net_socket_t sockets[NET_MAX_SOCKETS];
