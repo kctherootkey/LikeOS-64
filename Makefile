@@ -1629,6 +1629,8 @@ clean:
 distclean: clean
 	$(MAKE) -C ports/lib/ncurses-likeos clean
 	$(MAKE) -C ports/lib/libevent-2.1.12 -f Makefile.likeos clean
+	$(MAKE) -C ports/lib/zlib-1.3.1 -f Makefile.likeos clean
+	$(MAKE) -C ports/lib/nghttp2-1.65.0 -f Makefile.likeos clean
 	$(MAKE) -C ports/nano-8.3 -f Makefile.likeos clean
 	$(MAKE) -C ports/tmux-3.6a -f Makefile.likeos clean
 	$(MAKE) -C ports/netcat-OpenBSD -f Makefile.likeos clean
