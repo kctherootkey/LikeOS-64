@@ -4,11 +4,11 @@
 // No PNP _SRS (triggers EC GPE storms), no self-test (leaks stale 0x55
 // on eSPI), no ECAM/PCH decode (preserved by pci.c bridge-skip fix).
 
-#include <kernel/console.h>
-#include <kernel/ps2.h>
-#include <kernel/interrupt.h>
-#include <kernel/ioapic.h>
-#include <kernel/bug.h>
+#include <kernel/io/console.h>
+#include <kernel/dev/hid/ps2.h>
+#include <kernel/ke/interrupt.h>
+#include <kernel/hal/ioapic.h>
+#include <kernel/uapi/bug.h>
 
 #define PS2_DATA    0x60
 #define PS2_STATUS  0x64

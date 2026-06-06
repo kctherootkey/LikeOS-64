@@ -4,8 +4,8 @@
 #ifndef _KERNEL_SMP_H_
 #define _KERNEL_SMP_H_
 
-#include "types.h"
-#include "percpu.h"
+#include <kernel/uapi/types.h>
+#include <kernel/ke/percpu.h>
 
 // ============================================================================
 // SMP Debug

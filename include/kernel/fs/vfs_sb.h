@@ -33,8 +33,8 @@
 #ifndef _KERNEL_VFS_SB_H_
 #define _KERNEL_VFS_SB_H_
 
-#include "types.h"
-#include "block.h"
+#include <kernel/uapi/types.h>
+#include <kernel/dev/block/block.h>
 
 struct ic_inode;        /* forward — see icache.h                            */
 struct vfs_superblock;

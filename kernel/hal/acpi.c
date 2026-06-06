@@ -5,11 +5,11 @@
 // ACPICA headers (must be included before kernel acpi.h to avoid macro conflicts)
 #include "acpica/include/acpi.h"
 
-#include <kernel/acpi.h>
-#include <kernel/console.h>
-#include <kernel/memory.h>
-#include <kernel/interrupt.h>
-#include <kernel/bug.h>
+#include <kernel/hal/acpi.h>
+#include <kernel/io/console.h>
+#include <kernel/mm/memory.h>
+#include <kernel/ke/interrupt.h>
+#include <kernel/uapi/bug.h>
 
 #define ACPI_DEBUG 0
 #if ACPI_DEBUG

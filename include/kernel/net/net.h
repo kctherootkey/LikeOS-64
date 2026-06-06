@@ -4,8 +4,8 @@
 #ifndef _KERNEL_NET_H_
 #define _KERNEL_NET_H_
 
-#include "types.h"
-#include "sched.h"  // spinlock_t
+#include <kernel/uapi/types.h>
+#include <kernel/ke/sched.h>  // spinlock_t
 
 // ============================================================================
 // Network Configuration
@@ -784,7 +784,7 @@ void eth_rx(net_device_t* dev, const uint8_t* frame, uint16_t len);
 void arp_init(void);
 int  arp_resolve(net_device_t* dev, uint32_t ip, uint8_t mac_out[ETH_ALEN]);
 int  arp_cache_lookup(uint32_t ip, uint8_t mac_out[ETH_ALEN]);
-// Forward decl; full type in <kernel/skb.h>
+// Forward decl; full type in <kernel/net/skb.h>
 struct sk_buff;
 // Queue an IPv4 datagram skb pending ARP resolution of next_hop_ip. Takes
 // ownership of skb on success (returns 0).  Returns -1 if the pending pool

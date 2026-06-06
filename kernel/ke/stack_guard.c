@@ -1,9 +1,9 @@
 // LikeOS-64 Stack Canary Support — kernel smash reporter
 
-#include <kernel/console.h>
-#include <kernel/percpu.h>
-#include <kernel/sched.h>
-#include <kernel/bug.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/percpu.h>
+#include <kernel/ke/sched.h>
+#include <kernel/uapi/bug.h>
 
 // Fallback guard symbol for any kernel object compiled with =global guard mode.
 // Active kernel code uses GS:104 (per-CPU) via -mstack-protector-guard=tls.

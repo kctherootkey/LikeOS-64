@@ -3,9 +3,9 @@
 #ifndef LIKEOS_XHCI_H
 #define LIKEOS_XHCI_H
 
-#include "types.h"
-#include "status.h"
-#include "pci.h"
+#include <kernel/uapi/types.h>
+#include <kernel/uapi/status.h>
+#include <kernel/hal/pci.h>
 
 // xHCI Capability Register offsets
 #define XHCI_CAP_CAPLENGTH      0x00

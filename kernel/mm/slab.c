@@ -2,12 +2,12 @@
 // Dynamic kernel heap using size-class caches for efficient allocation
 // Maps physical pages to kernel virtual address space
 
-#include <kernel/slab.h>
-#include <kernel/memory.h>
-#include <kernel/console.h>
-#include <kernel/sched.h>  // For spinlock_t, sched_is_smp
-#include <kernel/smp.h>    // For smp_tlb_shootdown_sync
-#include <kernel/bug.h>
+#include <kernel/mm/slab.h>
+#include <kernel/mm/memory.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/sched.h>  // For spinlock_t, sched_is_smp
+#include <kernel/ke/smp.h>    // For smp_tlb_shootdown_sync
+#include <kernel/uapi/bug.h>
 
 // External debug flag from memory.c
 extern int mm_debug_pt;

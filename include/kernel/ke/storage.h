@@ -4,8 +4,8 @@
 #ifndef _KERNEL_STORAGE_H_
 #define _KERNEL_STORAGE_H_
 
-#include "fat32.h"
-#include "block.h"
+#include <kernel/fs/fat32.h>
+#include <kernel/dev/block/block.h>
 
 typedef struct {
     int signature_found;

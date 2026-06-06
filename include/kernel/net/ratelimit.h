@@ -7,8 +7,8 @@
 #ifndef _KERNEL_RATELIMIT_H_
 #define _KERNEL_RATELIMIT_H_
 
-#include "types.h"
-#include "sched.h"   // spinlock_t
+#include <kernel/uapi/types.h>
+#include <kernel/ke/sched.h>   // spinlock_t
 
 // ============================================================================
 // Simple token-bucket limiter

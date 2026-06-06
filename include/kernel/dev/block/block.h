@@ -2,8 +2,8 @@
 #ifndef LIKEOS_BLOCK_H
 #define LIKEOS_BLOCK_H
 
-#include "status.h"
-#include "types.h"
+#include <kernel/uapi/status.h>
+#include <kernel/uapi/types.h>
 
 #define BLOCK_MAX_DEVICES 8
 

@@ -5,8 +5,8 @@
 #ifndef _KERNEL_SLAB_H_
 #define _KERNEL_SLAB_H_
 
-#include "types.h"
-#include "sched.h"  // For spinlock_t
+#include <kernel/uapi/types.h>
+#include <kernel/ke/sched.h>  // For spinlock_t
 
 // Configuration
 #define SLAB_MIN_SIZE           32          // Minimum allocation size (32 bytes)

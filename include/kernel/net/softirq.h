@@ -19,7 +19,7 @@
 #ifndef LIKEOS_SOFTIRQ_H
 #define LIKEOS_SOFTIRQ_H
 
-#include "types.h"
+#include <kernel/uapi/types.h>
 
 // Softirq vector numbers (must stay <= 31; we use a uint32_t bitmask).
 enum {

@@ -4,7 +4,7 @@
 #ifndef _KERNEL_CURSOR_H_
 #define _KERNEL_CURSOR_H_
 
-#include "console.h"
+#include <kernel/io/console.h>
 
 // Xcursor file header (magic "Xcur")
 #define XCURSOR_MAGIC       0x72756358  // "Xcur" in little-endian

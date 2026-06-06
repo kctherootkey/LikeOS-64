@@ -2,7 +2,7 @@
 #ifndef _KERNEL_TIMER_H_
 #define _KERNEL_TIMER_H_
 
-#include "types.h"
+#include <kernel/uapi/types.h>
 
 // PIT ports
 #define PIT_CHANNEL0_DATA   0x40

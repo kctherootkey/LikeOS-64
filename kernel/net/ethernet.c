@@ -1,9 +1,9 @@
 // LikeOS-64 Ethernet Frame Layer
-#include <kernel/net.h>
-#include <kernel/console.h>
-#include <kernel/skb.h>
-#include <kernel/bug.h>
-#include <kernel/memory.h>
+#include <kernel/net/net.h>
+#include <kernel/io/console.h>
+#include <kernel/net/skb.h>
+#include <kernel/uapi/bug.h>
+#include <kernel/mm/memory.h>
 
 // Build and send an Ethernet frame.  The TX buffer is a per-call sk_buff
 // from the size-classed pool, so no global TX spinlock is held across the

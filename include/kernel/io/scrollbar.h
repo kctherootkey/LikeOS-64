@@ -4,7 +4,7 @@
 #ifndef _KERNEL_SCROLLBAR_H_
 #define _KERNEL_SCROLLBAR_H_
 
-#include "console.h"
+#include <kernel/io/console.h>
 
 // Scrollbar visual states
 #define SCROLLBAR_STATE_NORMAL  0

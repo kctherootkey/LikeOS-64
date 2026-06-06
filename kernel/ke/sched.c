@@ -30,25 +30,25 @@
 // not yet available.  We use a simple legacy path until sched_enable_smp()
 // is called by smp_init().
 
-#include <kernel/sched.h>
-#include <kernel/console.h>
-#include <kernel/memory.h>
-#include <kernel/interrupt.h>
-#include <kernel/types.h>
-#include <kernel/vfs.h>
-#include <kernel/pipe.h>
-#include <kernel/tty.h>
-#include <kernel/signal.h>
-#include <kernel/timer.h>
-#include <kernel/syscall.h>
-#include <kernel/percpu.h>
-#include <kernel/smp.h>
-#include <kernel/futex.h>
-#include <kernel/net.h>
-#include <kernel/slab.h>
-#include <kernel/random.h>
-#include <kernel/bug.h>
-#include <kernel/usb_msd.h>
+#include <kernel/ke/sched.h>
+#include <kernel/io/console.h>
+#include <kernel/mm/memory.h>
+#include <kernel/ke/interrupt.h>
+#include <kernel/uapi/types.h>
+#include <kernel/fs/vfs.h>
+#include <kernel/ke/pipe.h>
+#include <kernel/io/tty.h>
+#include <kernel/ke/signal.h>
+#include <kernel/ke/timer.h>
+#include <kernel/ke/syscall.h>
+#include <kernel/ke/percpu.h>
+#include <kernel/ke/smp.h>
+#include <kernel/ke/futex.h>
+#include <kernel/net/net.h>
+#include <kernel/mm/slab.h>
+#include <kernel/dev/rand/random.h>
+#include <kernel/uapi/bug.h>
+#include <kernel/dev/usb/usb_msd.h>
 
 extern void user_mode_iret_trampoline(void);
 extern void ctx_switch_asm(uint64_t** old_sp, uint64_t* new_sp);

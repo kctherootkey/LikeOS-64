@@ -13,9 +13,9 @@
 #ifndef LIKEOS_I2C_HID_H
 #define LIKEOS_I2C_HID_H
 
-#include "types.h"
-#include "pci.h"
-#include "sched.h"
+#include <kernel/uapi/types.h>
+#include <kernel/hal/pci.h>
+#include <kernel/ke/sched.h>
 
 // ============================================================================
 // Intel LPSS Serial IO I2C PCI Device IDs

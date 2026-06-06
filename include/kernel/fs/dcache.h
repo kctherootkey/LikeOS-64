@@ -12,8 +12,8 @@
 #ifndef _KERNEL_DCACHE_H_
 #define _KERNEL_DCACHE_H_
 
-#include "types.h"
-#include "sched.h"
+#include <kernel/uapi/types.h>
+#include <kernel/ke/sched.h>
 
 // ============================================================================
 // Configuration

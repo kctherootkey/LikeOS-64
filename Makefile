@@ -194,7 +194,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/usb.o \
 			  $(BUILD_DIR)/usb_serial.o \
 			  $(BUILD_DIR)/usb_msd.o \
-			  $(BUILD_DIR)/usbhid.o \
+			  $(BUILD_DIR)/usb_hid.o \
 			  $(BUILD_DIR)/ps2.o \
 			  $(BUILD_DIR)/ioapic.o \
 			  $(BUILD_DIR)/timer.o \
@@ -271,16 +271,16 @@ $(BUILD_DIR)/xhci_boot.o: $(KERNEL_DIR)/ke/xhci_boot.c | $(BUILD_DIR)
 $(BUILD_DIR)/storage.o: $(KERNEL_DIR)/ke/storage.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/console.o: $(KERNEL_DIR)/hal/console.c | $(BUILD_DIR)
+$(BUILD_DIR)/console.o: $(KERNEL_DIR)/io/console.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/sysfont.o: $(KERNEL_DIR)/hal/sysfont.c | $(BUILD_DIR)
+$(BUILD_DIR)/sysfont.o: $(KERNEL_DIR)/io/sysfont.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/cursor.o: $(KERNEL_DIR)/hal/cursor.c | $(BUILD_DIR)
+$(BUILD_DIR)/cursor.o: $(KERNEL_DIR)/io/cursor.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/fb_optimize.o: $(KERNEL_DIR)/hal/fb_optimize.c | $(BUILD_DIR)
+$(BUILD_DIR)/fb_optimize.o: $(KERNEL_DIR)/dev/video/fb_optimize.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/interrupt.o: $(KERNEL_DIR)/ke/interrupt.asm | $(BUILD_DIR)
@@ -295,13 +295,13 @@ $(BUILD_DIR)/gdt.o: $(KERNEL_DIR)/ke/gdt.asm | $(BUILD_DIR)
 $(BUILD_DIR)/gdt_c.o: $(KERNEL_DIR)/ke/gdt.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/keyboard.o: $(KERNEL_DIR)/io/keyboard.c | $(BUILD_DIR)
+$(BUILD_DIR)/keyboard.o: $(KERNEL_DIR)/dev/input/keyboard.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/serial.o: $(KERNEL_DIR)/hal/serial.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/mouse.o: $(KERNEL_DIR)/hal/mouse.c | $(BUILD_DIR)
+$(BUILD_DIR)/mouse.o: $(KERNEL_DIR)/dev/input/mouse.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/memory.o: $(KERNEL_DIR)/mm/memory.c | $(BUILD_DIR)
@@ -313,7 +313,7 @@ $(BUILD_DIR)/stack_switch.o: $(KERNEL_DIR)/mm/stack_switch.asm | $(BUILD_DIR)
 $(BUILD_DIR)/slab.o: $(KERNEL_DIR)/mm/slab.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/scrollbar.o: $(KERNEL_DIR)/hal/scrollbar.c | $(BUILD_DIR)
+$(BUILD_DIR)/scrollbar.o: $(KERNEL_DIR)/io/scrollbar.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/vfs.o: $(KERNEL_DIR)/fs/vfs.c | $(BUILD_DIR)
@@ -325,10 +325,10 @@ $(BUILD_DIR)/devfs.o: $(KERNEL_DIR)/fs/devfs.c | $(BUILD_DIR)
 $(BUILD_DIR)/pci.o: $(KERNEL_DIR)/hal/pci.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/block.o: $(KERNEL_DIR)/hal/block.c | $(BUILD_DIR)
+$(BUILD_DIR)/block.o: $(KERNEL_DIR)/dev/block/block.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/xhci.o: $(KERNEL_DIR)/hal/xhci.c | $(BUILD_DIR)
+$(BUILD_DIR)/xhci.o: $(KERNEL_DIR)/dev/usb/xhci.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/fat32.o: $(KERNEL_DIR)/fs/fat32.c | $(BUILD_DIR)
@@ -343,53 +343,53 @@ $(BUILD_DIR)/dcache.o: $(KERNEL_DIR)/fs/dcache.c | $(BUILD_DIR)
 $(BUILD_DIR)/icache.o: $(KERNEL_DIR)/fs/icache.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/usb.o: $(KERNEL_DIR)/hal/usb.c | $(BUILD_DIR)
+$(BUILD_DIR)/usb.o: $(KERNEL_DIR)/dev/usb/usb.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/usb_serial.o: $(KERNEL_DIR)/hal/usb_serial.c | $(BUILD_DIR)
+$(BUILD_DIR)/usb_serial.o: $(KERNEL_DIR)/dev/usb/usb_serial.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/usb_msd.o: $(KERNEL_DIR)/hal/usb_msd.c | $(BUILD_DIR)
+$(BUILD_DIR)/usb_msd.o: $(KERNEL_DIR)/dev/usb/usb_msd.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/usbhid.o: $(KERNEL_DIR)/hal/usbhid.c | $(BUILD_DIR)
+$(BUILD_DIR)/usb_hid.o: $(KERNEL_DIR)/dev/hid/usb_hid.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/ps2.o: $(KERNEL_DIR)/hal/ps2.c | $(BUILD_DIR)
+$(BUILD_DIR)/ps2.o: $(KERNEL_DIR)/dev/hid/ps2.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/i2c_hid.o: $(KERNEL_DIR)/hal/i2c_hid.c | $(BUILD_DIR)
+$(BUILD_DIR)/i2c_hid.o: $(KERNEL_DIR)/dev/hid/i2c_hid.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # Networking stack
 $(BUILD_DIR)/net.o: $(KERNEL_DIR)/net/net.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/e1000.o: $(KERNEL_DIR)/net/nic/e1000.c | $(BUILD_DIR)
+$(BUILD_DIR)/e1000.o: $(KERNEL_DIR)/dev/nic/e1000.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/e1000e.o: $(KERNEL_DIR)/net/nic/e1000e.c | $(BUILD_DIR)
+$(BUILD_DIR)/e1000e.o: $(KERNEL_DIR)/dev/nic/e1000e.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/rtl8139.o: $(KERNEL_DIR)/net/nic/rtl8139.c | $(BUILD_DIR)
+$(BUILD_DIR)/rtl8139.o: $(KERNEL_DIR)/dev/nic/rtl8139.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/pcnet32.o: $(KERNEL_DIR)/net/nic/pcnet32.c | $(BUILD_DIR)
+$(BUILD_DIR)/pcnet32.o: $(KERNEL_DIR)/dev/nic/pcnet32.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/ne2k.o: $(KERNEL_DIR)/net/nic/ne2k.c | $(BUILD_DIR)
+$(BUILD_DIR)/ne2k.o: $(KERNEL_DIR)/dev/nic/ne2k.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vmxnet3.o: $(KERNEL_DIR)/net/nic/vmxnet3.c | $(BUILD_DIR)
+$(BUILD_DIR)/vmxnet3.o: $(KERNEL_DIR)/dev/nic/vmxnet3.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/eepro100.o: $(KERNEL_DIR)/net/nic/eepro100.c | $(BUILD_DIR)
+$(BUILD_DIR)/eepro100.o: $(KERNEL_DIR)/dev/nic/eepro100.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/igb.o: $(KERNEL_DIR)/net/nic/igb.c | $(BUILD_DIR)
+$(BUILD_DIR)/igb.o: $(KERNEL_DIR)/dev/nic/igb.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/tulip.o: $(KERNEL_DIR)/net/nic/tulip.c | $(BUILD_DIR)
+$(BUILD_DIR)/tulip.o: $(KERNEL_DIR)/dev/nic/tulip.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ethernet.o: $(KERNEL_DIR)/net/ethernet.c | $(BUILD_DIR)
@@ -419,7 +419,7 @@ $(BUILD_DIR)/socket.o: $(KERNEL_DIR)/net/socket.c | $(BUILD_DIR)
 $(BUILD_DIR)/poll.o: $(KERNEL_DIR)/net/poll.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/random.o: $(KERNEL_DIR)/hal/random.c | $(BUILD_DIR)
+$(BUILD_DIR)/random.o: $(KERNEL_DIR)/dev/rand/random.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/route.o: $(KERNEL_DIR)/net/route.c | $(BUILD_DIR)
@@ -452,10 +452,10 @@ $(BUILD_DIR)/timer.o: $(KERNEL_DIR)/ke/timer.c | $(BUILD_DIR)
 $(BUILD_DIR)/sched.o: $(KERNEL_DIR)/ke/sched.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/tty.o: $(KERNEL_DIR)/ke/tty.c | $(BUILD_DIR)
+$(BUILD_DIR)/tty.o: $(KERNEL_DIR)/io/tty.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/vt.o: $(KERNEL_DIR)/ke/vt.c | $(BUILD_DIR)
+$(BUILD_DIR)/vt.o: $(KERNEL_DIR)/io/vt.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/syscall.o: $(KERNEL_DIR)/ke/syscall.asm | $(BUILD_DIR)

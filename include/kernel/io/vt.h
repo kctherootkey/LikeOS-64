@@ -17,8 +17,8 @@
 #ifndef _KERNEL_VT_H_
 #define _KERNEL_VT_H_
 
-#include "types.h"
-#include "tty.h"
+#include <kernel/uapi/types.h>
+#include <kernel/io/tty.h>
 
 /* ---- Cell buffer --------------------------------------------------- */
 

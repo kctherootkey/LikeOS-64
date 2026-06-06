@@ -4,7 +4,7 @@
 #ifndef _KERNEL_LAPIC_H_
 #define _KERNEL_LAPIC_H_
 
-#include "types.h"
+#include <kernel/uapi/types.h>
 
 // ============================================================================
 // LAPIC Register Offsets (from LAPIC base address)

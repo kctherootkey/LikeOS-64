@@ -12,14 +12,14 @@
 //   - Robust futex support for pthread_mutex_t with PTHREAD_MUTEX_ROBUST
 // ============================================================================
 
-#include <kernel/futex.h>
-#include <kernel/sched.h>
-#include <kernel/memory.h>
-#include <kernel/timer.h>
-#include <kernel/types.h>
-#include <kernel/syscall.h>
-#include <kernel/percpu.h>
-#include <kernel/bug.h>
+#include <kernel/ke/futex.h>
+#include <kernel/ke/sched.h>
+#include <kernel/mm/memory.h>
+#include <kernel/ke/timer.h>
+#include <kernel/uapi/types.h>
+#include <kernel/ke/syscall.h>
+#include <kernel/ke/percpu.h>
+#include <kernel/uapi/bug.h>
 
 // ============================================================================
 // FUTEX TRACE RING BUFFER (diagnostic)

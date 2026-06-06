@@ -3,8 +3,8 @@
 #ifndef LIKEOS_XHCI_BOOT_H
 #define LIKEOS_XHCI_BOOT_H
 
-#include "xhci.h"
-#include "usb_msd.h"
+#include <kernel/dev/usb/xhci.h>
+#include <kernel/dev/usb/usb_msd.h>
 
 // Boot state tracking
 typedef struct {

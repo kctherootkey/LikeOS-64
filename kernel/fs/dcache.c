@@ -17,10 +17,10 @@
 // A global LRU doubly-linked list provides eviction ordering when
 // the cache exceeds DC_MAX_ENTRIES.
 
-#include <kernel/dcache.h>
-#include <kernel/memory.h>
-#include <kernel/console.h>
-#include <kernel/bug.h>
+#include <kernel/fs/dcache.h>
+#include <kernel/mm/memory.h>
+#include <kernel/io/console.h>
+#include <kernel/uapi/bug.h>
 
 // ============================================================================
 // Hash table bucket

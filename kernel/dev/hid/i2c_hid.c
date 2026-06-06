@@ -19,19 +19,19 @@
 // strictly required at this time. We may revisit and address the issue
 // in the future if it becomes necessary.
 
-#include <kernel/i2c_hid.h>
-#include <kernel/console.h>
-#include <kernel/interrupt.h>
-#include <kernel/memory.h>
-#include <kernel/slab.h>
-#include <kernel/pci.h>
-#include <kernel/acpi.h>
-#include <kernel/mouse.h>
-#include <kernel/ioapic.h>
-#include <kernel/lapic.h>
-#include <kernel/sched.h>
-#include <kernel/timer.h>
-#include <kernel/bug.h>
+#include <kernel/dev/hid/i2c_hid.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/interrupt.h>
+#include <kernel/mm/memory.h>
+#include <kernel/mm/slab.h>
+#include <kernel/hal/pci.h>
+#include <kernel/hal/acpi.h>
+#include <kernel/dev/input/mouse.h>
+#include <kernel/hal/ioapic.h>
+#include <kernel/hal/lapic.h>
+#include <kernel/ke/sched.h>
+#include <kernel/ke/timer.h>
+#include <kernel/uapi/bug.h>
 
 // ---- Debug verbosity control ----
 // Set I2C_DEBUG to 1 for full diagnostic output (ISR stats, transfer logs,

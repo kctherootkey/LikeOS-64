@@ -1,7 +1,7 @@
 #ifndef _KERNEL_STAT_H_
 #define _KERNEL_STAT_H_
 
-#include "types.h"
+#include <kernel/uapi/types.h>
 
 // File type and mode bits (minimal)
 #define S_IFMT   0170000

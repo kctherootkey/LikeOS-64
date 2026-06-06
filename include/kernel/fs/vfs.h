@@ -2,8 +2,8 @@
 #ifndef LIKEOS_VFS_H
 #define LIKEOS_VFS_H
 
-#include "status.h"
-#include "stat.h"
+#include <kernel/uapi/status.h>
+#include <kernel/uapi/stat.h>
 
 // Basic types (avoid hosted headers in freestanding build)
 typedef unsigned long size_t;

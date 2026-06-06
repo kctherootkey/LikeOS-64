@@ -2,7 +2,7 @@
 #ifndef _KERNEL_DIRENT_H_
 #define _KERNEL_DIRENT_H_
 
-#include "types.h"
+#include <kernel/uapi/types.h>
 
 // Directory entry types
 #define DT_UNKNOWN 0

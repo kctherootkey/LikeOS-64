@@ -1,14 +1,14 @@
 // LikeOS-64 TCP (Transmission Control Protocol)
-#include <kernel/net.h>
-#include <kernel/console.h>
-#include <kernel/tty.h>
-#include <kernel/slab.h>
-#include <kernel/timer.h>
-#include <kernel/syscall.h>
-#include <kernel/random.h>
-#include <kernel/softirq.h>
-#include <kernel/ratelimit.h>
-#include <kernel/bug.h>
+#include <kernel/net/net.h>
+#include <kernel/io/console.h>
+#include <kernel/io/tty.h>
+#include <kernel/mm/slab.h>
+#include <kernel/ke/timer.h>
+#include <kernel/ke/syscall.h>
+#include <kernel/dev/rand/random.h>
+#include <kernel/net/softirq.h>
+#include <kernel/net/ratelimit.h>
+#include <kernel/uapi/bug.h>
 
 // TCP connection table
 tcp_conn_t tcp_connections[TCP_MAX_CONNECTIONS];

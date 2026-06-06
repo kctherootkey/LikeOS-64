@@ -8,10 +8,10 @@
 #ifndef _KERNEL_E1000_H_
 #define _KERNEL_E1000_H_
 
-#include "types.h"
-#include "pci.h"
-#include "net.h"
-#include "sched.h"
+#include <kernel/uapi/types.h>
+#include <kernel/hal/pci.h>
+#include <kernel/net/net.h>
+#include <kernel/ke/sched.h>
 
 // ============================================================================
 // PCI Device IDs

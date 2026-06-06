@@ -4,7 +4,7 @@
 #ifndef _KERNEL_SYSFONT_H_
 #define _KERNEL_SYSFONT_H_
 
-#include "console.h"
+#include <kernel/io/console.h>
 
 // PSF1 header structure (legacy format)
 typedef struct {

@@ -1,11 +1,11 @@
 // LikeOS-64 - Minimal VFS implementation
-#include <kernel/vfs.h>
-#include <kernel/fat32.h>
-#include <kernel/memory.h>
-#include <kernel/console.h>
-#include <kernel/dirent.h>
-#include <kernel/stat.h>
-#include <kernel/bug.h>
+#include <kernel/fs/vfs.h>
+#include <kernel/fs/fat32.h>
+#include <kernel/mm/memory.h>
+#include <kernel/io/console.h>
+#include <kernel/uapi/dirent.h>
+#include <kernel/uapi/stat.h>
+#include <kernel/uapi/bug.h>
 
 static const vfs_ops_t* g_root_ops = 0;
 static const vfs_ops_t* g_dev_ops = 0;

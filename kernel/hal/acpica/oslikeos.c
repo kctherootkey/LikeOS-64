@@ -12,11 +12,11 @@
 #include "accommon.h"
 
 /* LikeOS kernel headers */
-#include <kernel/memory.h>
-#include <kernel/console.h>
-#include <kernel/interrupt.h>
-#include <kernel/sched.h>
-#include <kernel/timer.h>
+#include <kernel/mm/memory.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/interrupt.h>
+#include <kernel/ke/sched.h>
+#include <kernel/ke/timer.h>
 
 /* Forward declarations for PCI config access (kernel/hal/pci.c) */
 extern unsigned int pci_cfg_read32(unsigned char bus, unsigned char dev,
@@ -594,8 +594,8 @@ AcpiOsWaitEventsComplete(void)
  * platforms.  It must be routed through IOAPIC, not the legacy PIC.
  */
 
-#include <kernel/ioapic.h>
-#include <kernel/lapic.h>
+#include <kernel/hal/ioapic.h>
+#include <kernel/hal/lapic.h>
 
 // SCI vector in the IDT — pick an unused vector
 #define ACPI_SCI_VECTOR  58

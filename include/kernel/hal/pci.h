@@ -2,8 +2,8 @@
 #ifndef LIKEOS_PCI_H
 #define LIKEOS_PCI_H
 
-#include "status.h"
-#include "types.h"
+#include <kernel/uapi/status.h>
+#include <kernel/uapi/types.h>
 
 #define PCI_MAX_DEVICES 256
 

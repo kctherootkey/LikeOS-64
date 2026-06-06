@@ -2,16 +2,16 @@
 // Supports static (ET_EXEC) and dynamic/PIE (ET_DYN) executables.
 // When PT_INTERP is present, loads the dynamic linker (ld-likeos.so) and
 // passes control to it with an auxiliary vector on the stack.
-#include <kernel/elf.h>
-#include <kernel/memory.h>
-#include <kernel/sched.h>
-#include <kernel/console.h>
-#include <kernel/vfs.h>
-#include <kernel/pipe.h>
-#include <kernel/net.h>
-#include <kernel/smp.h>
-#include <kernel/random.h>
-#include <kernel/bug.h>
+#include <kernel/ke/elf.h>
+#include <kernel/mm/memory.h>
+#include <kernel/ke/sched.h>
+#include <kernel/io/console.h>
+#include <kernel/fs/vfs.h>
+#include <kernel/ke/pipe.h>
+#include <kernel/net/net.h>
+#include <kernel/ke/smp.h>
+#include <kernel/dev/rand/random.h>
+#include <kernel/uapi/bug.h>
 
 // ============================================================================
 // VALIDATION

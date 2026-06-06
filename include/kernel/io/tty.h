@@ -2,8 +2,8 @@
 #ifndef _KERNEL_TTY_H_
 #define _KERNEL_TTY_H_
 
-#include "types.h"
-#include "sched.h"
+#include <kernel/uapi/types.h>
+#include <kernel/ke/sched.h>
 
 // Termios-like types
 typedef unsigned int tcflag_t;

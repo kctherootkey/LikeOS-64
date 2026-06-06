@@ -4,7 +4,7 @@
 #ifndef _KERNEL_INTERRUPT_H_
 #define _KERNEL_INTERRUPT_H_
 
-#include "console.h"
+#include <kernel/io/console.h>
 
 // I/O port functions
 static inline void outb(uint16_t port, uint8_t val) {

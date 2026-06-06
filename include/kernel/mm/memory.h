@@ -4,7 +4,7 @@
 #ifndef MEMORY_H
 #define MEMORY_H
 
-#include "types.h"
+#include <kernel/uapi/types.h>
 
 // Memory constants
 #define PAGE_SIZE               0x1000      // 4KB pages

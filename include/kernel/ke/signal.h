@@ -2,7 +2,7 @@
 #ifndef _KERNEL_SIGNAL_H_
 #define _KERNEL_SIGNAL_H_
 
-#include "types.h"
+#include <kernel/uapi/types.h>
 
 // Forward declarations
 struct task;

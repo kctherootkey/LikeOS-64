@@ -11,13 +11,13 @@
 // All FS-specific I/O dispatches through vfs_superblock_t->ops, so this file
 // references no FAT32 (or EXT4) symbols directly.
 
-#include <kernel/icache.h>
-#include <kernel/vfs_sb.h>
-#include <kernel/memory.h>
-#include <kernel/console.h>
-#include <kernel/sched.h>
-#include <kernel/bug.h>
-#include <kernel/dcache.h>
+#include <kernel/fs/icache.h>
+#include <kernel/fs/vfs_sb.h>
+#include <kernel/mm/memory.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/sched.h>
+#include <kernel/uapi/bug.h>
+#include <kernel/fs/dcache.h>
 
 // ============================================================================
 // Hash table bucket

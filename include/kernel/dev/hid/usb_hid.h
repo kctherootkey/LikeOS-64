@@ -11,10 +11,10 @@
 #ifndef LIKEOS_USBHID_H
 #define LIKEOS_USBHID_H
 
-#include "types.h"
-#include "status.h"
-#include "xhci.h"
-#include "usb.h"
+#include <kernel/uapi/types.h>
+#include <kernel/uapi/status.h>
+#include <kernel/dev/usb/xhci.h>
+#include <kernel/dev/usb/usb.h>
 
 // ============================================================================
 // USB HID Class Codes (USB HID 1.11, Section 4.1)

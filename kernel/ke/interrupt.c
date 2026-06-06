@@ -1,19 +1,19 @@
 // LikeOS-64 Interrupt Management
-#include <kernel/interrupt.h>
-#include <kernel/xhci.h>
-#include <kernel/timer.h>
-#include <kernel/memory.h>
-#include <kernel/sched.h>
-#include <kernel/signal.h>
-#include <kernel/tty.h>
-#include <kernel/lapic.h>
-#include <kernel/percpu.h>
-#include <kernel/smp.h>
-#include <kernel/i2c_hid.h>
-#include <kernel/net.h>
-#include <kernel/e1000.h>
-#include <kernel/softirq.h>
-#include <kernel/bug.h>
+#include <kernel/ke/interrupt.h>
+#include <kernel/dev/usb/xhci.h>
+#include <kernel/ke/timer.h>
+#include <kernel/mm/memory.h>
+#include <kernel/ke/sched.h>
+#include <kernel/ke/signal.h>
+#include <kernel/io/tty.h>
+#include <kernel/hal/lapic.h>
+#include <kernel/ke/percpu.h>
+#include <kernel/ke/smp.h>
+#include <kernel/dev/hid/i2c_hid.h>
+#include <kernel/net/net.h>
+#include <kernel/dev/nic/e1000.h>
+#include <kernel/net/softirq.h>
+#include <kernel/uapi/bug.h>
 
 // Write a formatted message to a task's controlling TTY.
 // Falls back to kprintf (kernel console) if the task has no ctty.

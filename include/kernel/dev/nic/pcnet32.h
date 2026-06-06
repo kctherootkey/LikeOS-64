@@ -11,10 +11,10 @@
 #ifndef _KERNEL_PCNET32_H_
 #define _KERNEL_PCNET32_H_
 
-#include "types.h"
-#include "pci.h"
-#include "net.h"
-#include "sched.h"
+#include <kernel/uapi/types.h>
+#include <kernel/hal/pci.h>
+#include <kernel/net/net.h>
+#include <kernel/ke/sched.h>
 
 // ============================================================================
 // PCI IDs

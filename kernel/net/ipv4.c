@@ -1,12 +1,12 @@
 // LikeOS-64 IPv4 Layer
-#include <kernel/net.h>
-#include <kernel/console.h>
-#include <kernel/random.h>
-#include <kernel/timer.h>
-#include <kernel/skb.h>
-#include <kernel/ratelimit.h>
-#include <kernel/bug.h>
-#include <kernel/memory.h>
+#include <kernel/net/net.h>
+#include <kernel/io/console.h>
+#include <kernel/dev/rand/random.h>
+#include <kernel/ke/timer.h>
+#include <kernel/net/skb.h>
+#include <kernel/net/ratelimit.h>
+#include <kernel/uapi/bug.h>
+#include <kernel/mm/memory.h>
 
 // TX path uses per-fragment sk_buff allocations from the size-classed pool;
 // no global TX spinlock is held across the lower-layer send.  See

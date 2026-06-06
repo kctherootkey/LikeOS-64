@@ -2,7 +2,7 @@
 #ifndef _KERNEL_SYSCALL_H_
 #define _KERNEL_SYSCALL_H_
 
-#include "types.h"
+#include <kernel/uapi/types.h>
 
 // Syscall numbers - Linux-compatible where possible
 #define SYS_READ        0

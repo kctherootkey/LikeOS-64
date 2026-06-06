@@ -4,7 +4,7 @@
 #ifndef _KERNEL_RANDOM_H_
 #define _KERNEL_RANDOM_H_
 
-#include "types.h"
+#include <kernel/uapi/types.h>
 
 // Initialize the CSPRNG (call early in boot, before networking)
 void random_init(void);

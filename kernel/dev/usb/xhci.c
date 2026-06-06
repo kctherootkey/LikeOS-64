@@ -7,16 +7,16 @@
 // 3. Use interrupt-driven completion with synchronous wait API
 // 4. Clear, simple state machine for transfers
 
-#include <kernel/xhci.h>
-#include <kernel/usb.h>
-#include <kernel/usb_serial.h>
-#include <kernel/usbhid.h>
-#include <kernel/memory.h>
-#include <kernel/console.h>
-#include <kernel/interrupt.h>
-#include <kernel/ioapic.h>
-#include <kernel/sched.h>
-#include <kernel/bug.h>
+#include <kernel/dev/usb/xhci.h>
+#include <kernel/dev/usb/usb.h>
+#include <kernel/dev/usb/usb_serial.h>
+#include <kernel/dev/hid/usb_hid.h>
+#include <kernel/mm/memory.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/interrupt.h>
+#include <kernel/hal/ioapic.h>
+#include <kernel/ke/sched.h>
+#include <kernel/uapi/bug.h>
 
 // Debug output control
 #define XHCI_DEBUG 0

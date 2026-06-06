@@ -4,7 +4,7 @@
 #ifndef _KERNEL_MOUSE_H_
 #define _KERNEL_MOUSE_H_
 
-#include "console.h"
+#include <kernel/io/console.h>
 
 // PS/2 Controller ports (shared with keyboard)
 #define PS2_DATA_PORT    0x60

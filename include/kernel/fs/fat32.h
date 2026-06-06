@@ -2,10 +2,10 @@
 #ifndef LIKEOS_FAT32_H
 #define LIKEOS_FAT32_H
 
-#include "status.h"
-#include "block.h"
-#include "vfs.h"
-#include "vfs_sb.h"
+#include <kernel/uapi/status.h>
+#include <kernel/dev/block/block.h>
+#include <kernel/fs/vfs.h>
+#include <kernel/fs/vfs_sb.h>
 
 typedef struct fat32_fs {
     const block_device_t* bdev;

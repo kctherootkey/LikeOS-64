@@ -6,11 +6,11 @@
 // 2. Transfer data (if any) via bulk IN or OUT
 // 3. Receive Command Status Wrapper (CSW) via bulk IN
 
-#include <kernel/usb_msd.h>
-#include <kernel/memory.h>
-#include <kernel/console.h>
-#include <kernel/sched.h>
-#include <kernel/bug.h>
+#include <kernel/dev/usb/usb_msd.h>
+#include <kernel/mm/memory.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/sched.h>
+#include <kernel/uapi/bug.h>
 
 // Debug output control
 #define MSD_DEBUG 0

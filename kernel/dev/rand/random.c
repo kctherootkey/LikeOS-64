@@ -6,11 +6,11 @@
 //   - /dev/random (blocking) and /dev/urandom (non-blocking) support
 //   - SipHash-2-4 for TCP ISN generation (RFC 6528)
 
-#include <kernel/random.h>
-#include <kernel/timer.h>
-#include <kernel/console.h>
-#include <kernel/sched.h>   // spinlock_t
-#include <kernel/bug.h>
+#include <kernel/dev/rand/random.h>
+#include <kernel/ke/timer.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/sched.h>   // spinlock_t
+#include <kernel/uapi/bug.h>
 
 // ============================================================================
 // ChaCha20 Core (RFC 7539)

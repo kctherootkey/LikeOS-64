@@ -4,7 +4,7 @@
 #ifndef _KERNEL_FB_OPTIMIZE_H_
 #define _KERNEL_FB_OPTIMIZE_H_
 
-#include "console.h"
+#include <kernel/io/console.h>
 
 // CPU Feature flags
 #define CPU_FEATURE_SSE2    (1 << 0)

@@ -1,9 +1,9 @@
 // LikeOS-64 - USB Core Utilities
 // Generic USB helper functions
 
-#include <kernel/usb.h>
-#include <kernel/console.h>
-#include <kernel/bug.h>
+#include <kernel/dev/usb/usb.h>
+#include <kernel/io/console.h>
+#include <kernel/uapi/bug.h>
 
 // USB class name lookup
 const char* usb_class_name(uint8_t class_code) {

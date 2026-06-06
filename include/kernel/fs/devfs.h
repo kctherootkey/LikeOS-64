@@ -1,9 +1,9 @@
 #ifndef _KERNEL_DEVFS_H_
 #define _KERNEL_DEVFS_H_
 
-#include "vfs.h"
-#include "stat.h"
-#include "tty.h"
+#include <kernel/fs/vfs.h>
+#include <kernel/uapi/stat.h>
+#include <kernel/io/tty.h>
 
 int devfs_init(void);
 int devfs_open(const char* path, int flags, vfs_file_t** out);

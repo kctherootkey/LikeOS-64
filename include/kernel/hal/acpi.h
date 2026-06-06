@@ -4,7 +4,7 @@
 #ifndef _KERNEL_ACPI_H_
 #define _KERNEL_ACPI_H_
 
-#include "types.h"
+#include <kernel/uapi/types.h>
 
 // Maximum number of CPUs supported
 #define MAX_CPUS            64

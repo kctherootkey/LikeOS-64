@@ -1,11 +1,11 @@
 // LikeOS-64 Hardware Abstraction Layer - Visual Scrollbar Implementation
 // Linux Gnome Chrome-style scrollbar rendering system
 
-#include <kernel/scrollbar.h>
-#include <kernel/fb_optimize.h>
-#include <kernel/memory.h>
-#include <kernel/sched.h>
-#include <kernel/bug.h>
+#include <kernel/io/scrollbar.h>
+#include <kernel/dev/video/fb_optimize.h>
+#include <kernel/mm/memory.h>
+#include <kernel/ke/sched.h>
+#include <kernel/uapi/bug.h>
 
 #define NULL ((void*)0)
 

@@ -2,7 +2,7 @@
 #ifndef LIKEOS_USB_H
 #define LIKEOS_USB_H
 
-#include "types.h"
+#include <kernel/uapi/types.h>
 
 // USB descriptor types
 #define USB_DESC_DEVICE         1

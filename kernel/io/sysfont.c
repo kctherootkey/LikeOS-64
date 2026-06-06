@@ -1,11 +1,11 @@
 // LikeOS-64 System Font Loader
 // Loads PSF (PC Screen Font) fonts for console display
 
-#include <kernel/sysfont.h>
-#include <kernel/console.h>
-#include <kernel/vfs.h>
-#include <kernel/memory.h>
-#include <kernel/bug.h>
+#include <kernel/io/sysfont.h>
+#include <kernel/io/console.h>
+#include <kernel/fs/vfs.h>
+#include <kernel/mm/memory.h>
+#include <kernel/uapi/bug.h>
 
 // Seek whence values
 #define SEEK_SET 0

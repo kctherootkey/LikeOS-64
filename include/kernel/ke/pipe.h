@@ -2,8 +2,8 @@
 #ifndef _KERNEL_PIPE_H_
 #define _KERNEL_PIPE_H_
 
-#include "types.h"
-#include "sched.h"
+#include <kernel/uapi/types.h>
+#include <kernel/ke/sched.h>
 
 #define PIPE_MAGIC 0x50495045U  // "PIPE"
 

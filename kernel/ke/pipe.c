@@ -1,8 +1,8 @@
 // LikeOS-64 Pipe Implementation
-#include <kernel/pipe.h>
-#include <kernel/memory.h>
-#include <kernel/sched.h>
-#include <kernel/bug.h>
+#include <kernel/ke/pipe.h>
+#include <kernel/mm/memory.h>
+#include <kernel/ke/sched.h>
+#include <kernel/uapi/bug.h>
 
 bool pipe_is_end(const void* ptr) {
     if (!ptr) {

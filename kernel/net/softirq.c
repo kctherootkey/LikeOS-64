@@ -2,13 +2,13 @@
 //
 // See include/kernel/softirq.h for design rationale.
 
-#include <kernel/softirq.h>
-#include <kernel/percpu.h>
-#include <kernel/sched.h>
-#include <kernel/smp.h>
-#include <kernel/console.h>
-#include <kernel/memory.h>
-#include <kernel/bug.h>
+#include <kernel/net/softirq.h>
+#include <kernel/ke/percpu.h>
+#include <kernel/ke/sched.h>
+#include <kernel/ke/smp.h>
+#include <kernel/io/console.h>
+#include <kernel/mm/memory.h>
+#include <kernel/uapi/bug.h>
 
 static softirq_fn_t   softirq_handlers[NR_SOFTIRQ];
 static volatile uint32_t softirq_pending_mask[MAX_CPUS];

@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-// TCP-level (IPPROTO_TCP) sockopts — must match include/kernel/net.h.
+// TCP-level (IPPROTO_TCP) sockopts — must match include/kernel/net/net.h.
 #define TCP_NODELAY     1
 #define TCP_MAXSEG      2
 #define TCP_KEEPIDLE    4

@@ -1,11 +1,11 @@
-#include <kernel/shell.h>
-#include <kernel/console.h>
-#include <kernel/elf.h>
-#include <kernel/sched.h>
-#include <kernel/tty.h>
-#include <kernel/vfs.h>
-#include <kernel/syscall.h>
-#include <kernel/bug.h>
+#include <kernel/ke/shell.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/elf.h>
+#include <kernel/ke/sched.h>
+#include <kernel/io/tty.h>
+#include <kernel/fs/vfs.h>
+#include <kernel/ke/syscall.h>
+#include <kernel/uapi/bug.h>
 
 static task_t* g_shell_task = NULL;
 

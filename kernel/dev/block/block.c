@@ -1,7 +1,7 @@
 // LikeOS-64 - Block device registry
-#include <kernel/block.h>
-#include <kernel/sched.h>
-#include <kernel/bug.h>
+#include <kernel/dev/block/block.h>
+#include <kernel/ke/sched.h>
+#include <kernel/uapi/bug.h>
 
 // Spinlock for block device list access
 static spinlock_t block_lock = SPINLOCK_INIT("block");

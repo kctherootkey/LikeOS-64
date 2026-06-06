@@ -18,7 +18,7 @@
 // ---------------------------------------------------------------------------
 // The 82574L register layout is largely backwards-compatible with the classic
 // e1000 (82540EM/82545EM): we reuse the legacy RX/TX descriptor formats and
-// the same MMIO offsets defined in <kernel/e1000.h>.  The extra PCIe / MSI-X
+// the same MMIO offsets defined in <kernel/dev/nic/e1000.h>.  The extra PCIe / MSI-X
 // facilities that distinguish e1000e proper from e1000 are NOT used here —
 // the legacy programming model is sufficient for our purposes (UEFI desktop
 // systems, hypervisor emulation, business-laptop LOMs) and matches the
@@ -62,20 +62,20 @@
 //   Set E1000E_DBG to 1 (just below the includes) to enable the full
 //   verbose register-dump / state-trace firehose used during bring-up.
 // ---------------------------------------------------------------------------
-#include <kernel/e1000e.h>
-#include <kernel/e1000.h>
-#include <kernel/net.h>
-#include <kernel/pci.h>
-#include <kernel/memory.h>
-#include <kernel/console.h>
-#include <kernel/interrupt.h>
-#include <kernel/slab.h>
-#include <kernel/lapic.h>
-#include <kernel/ioapic.h>
-#include <kernel/acpi.h>
-#include <kernel/smp.h>
-#include <kernel/timer.h>
-#include <kernel/bug.h>
+#include <kernel/dev/nic/e1000e.h>
+#include <kernel/dev/nic/e1000.h>
+#include <kernel/net/net.h>
+#include <kernel/hal/pci.h>
+#include <kernel/mm/memory.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/interrupt.h>
+#include <kernel/mm/slab.h>
+#include <kernel/hal/lapic.h>
+#include <kernel/hal/ioapic.h>
+#include <kernel/hal/acpi.h>
+#include <kernel/ke/smp.h>
+#include <kernel/ke/timer.h>
+#include <kernel/uapi/bug.h>
 
 // ============================================================================
 // Debug / diagnostic logging.

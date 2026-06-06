@@ -4,9 +4,9 @@
 #ifndef _KERNEL_PERCPU_H_
 #define _KERNEL_PERCPU_H_
 
-#include "types.h"
-#include "sched.h"
-#include "interrupt.h"
+#include <kernel/uapi/types.h>
+#include <kernel/ke/sched.h>
+#include <kernel/ke/interrupt.h>
 
 // Maximum CPUs supported
 #define MAX_CPUS    64

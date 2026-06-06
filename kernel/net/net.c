@@ -1,24 +1,24 @@
 // LikeOS-64 Network Subsystem - Device Registry and Initialization
-#include <kernel/net.h>
-#include <kernel/e1000.h>
-#include <kernel/e1000e.h>
-#include <kernel/rtl8139.h>
-#include <kernel/pcnet32.h>
-#include <kernel/ne2k.h>
-#include <kernel/vmxnet3.h>
-#include <kernel/eepro100.h>
-#include <kernel/igb.h>
-#include <kernel/tulip.h>
-#include <kernel/console.h>
-#include <kernel/slab.h>
-#include <kernel/memory.h>
-#include <kernel/random.h>
-#include <kernel/ratelimit.h>
-#include <kernel/timer.h>
-#include <kernel/skb.h>
-#include <kernel/softirq.h>
-#include <kernel/percpu.h>
-#include <kernel/bug.h>
+#include <kernel/net/net.h>
+#include <kernel/dev/nic/e1000.h>
+#include <kernel/dev/nic/e1000e.h>
+#include <kernel/dev/nic/rtl8139.h>
+#include <kernel/dev/nic/pcnet32.h>
+#include <kernel/dev/nic/ne2k.h>
+#include <kernel/dev/nic/vmxnet3.h>
+#include <kernel/dev/nic/eepro100.h>
+#include <kernel/dev/nic/igb.h>
+#include <kernel/dev/nic/tulip.h>
+#include <kernel/io/console.h>
+#include <kernel/mm/slab.h>
+#include <kernel/mm/memory.h>
+#include <kernel/dev/rand/random.h>
+#include <kernel/net/ratelimit.h>
+#include <kernel/ke/timer.h>
+#include <kernel/net/skb.h>
+#include <kernel/net/softirq.h>
+#include <kernel/ke/percpu.h>
+#include <kernel/uapi/bug.h>
 
 // Broadcast MAC address
 const uint8_t eth_broadcast_addr[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};

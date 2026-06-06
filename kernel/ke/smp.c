@@ -1,16 +1,16 @@
 // LikeOS-64 - SMP (Symmetric Multi-Processing) Implementation
 // AP startup, CPU synchronization, and SMP management
 
-#include <kernel/smp.h>
-#include <kernel/acpi.h>
-#include <kernel/lapic.h>
-#include <kernel/percpu.h>
-#include <kernel/console.h>
-#include <kernel/memory.h>
-#include <kernel/interrupt.h>
-#include <kernel/sched.h>  // For sched_enable_smp()
-#include <kernel/timer.h>   // For timer_rdtsc()
-#include <kernel/bug.h>
+#include <kernel/ke/smp.h>
+#include <kernel/hal/acpi.h>
+#include <kernel/hal/lapic.h>
+#include <kernel/ke/percpu.h>
+#include <kernel/io/console.h>
+#include <kernel/mm/memory.h>
+#include <kernel/ke/interrupt.h>
+#include <kernel/ke/sched.h>  // For sched_enable_smp()
+#include <kernel/ke/timer.h>   // For timer_rdtsc()
+#include <kernel/uapi/bug.h>
 
 // ============================================================================
 // External Trampoline Symbols

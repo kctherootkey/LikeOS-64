@@ -6,8 +6,8 @@
 #ifndef _KERNEL_FUTEX_H_
 #define _KERNEL_FUTEX_H_
 
-#include "types.h"
-#include "sched.h"
+#include <kernel/uapi/types.h>
+#include <kernel/ke/sched.h>
 
 // Number of hash buckets for futex wait queues
 #define FUTEX_HASH_BUCKETS 256

@@ -2,7 +2,7 @@
 #ifndef _KERNEL_ELF_H_
 #define _KERNEL_ELF_H_
 
-#include <kernel/types.h>
+#include <kernel/uapi/types.h>
 
 // ELF Magic
 #define ELFMAG0     0x7F

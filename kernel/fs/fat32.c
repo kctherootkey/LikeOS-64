@@ -1,17 +1,17 @@
 // LikeOS-64 - FAT32 implementation with Long File Name (LFN) support
-#include <kernel/fat32.h>
-#include <kernel/console.h>
-#include <kernel/vfs.h>
-#include <kernel/memory.h>
-#include <kernel/block.h>
-#include <kernel/syscall.h>
-#include <kernel/dirent.h>
-#include <kernel/sched.h>
-#include <kernel/timer.h>
-#include <kernel/pagecache.h>
-#include <kernel/dcache.h>
-#include <kernel/icache.h>
-#include <kernel/bug.h>
+#include <kernel/fs/fat32.h>
+#include <kernel/io/console.h>
+#include <kernel/fs/vfs.h>
+#include <kernel/mm/memory.h>
+#include <kernel/dev/block/block.h>
+#include <kernel/ke/syscall.h>
+#include <kernel/uapi/dirent.h>
+#include <kernel/ke/sched.h>
+#include <kernel/ke/timer.h>
+#include <kernel/fs/pagecache.h>
+#include <kernel/fs/dcache.h>
+#include <kernel/fs/icache.h>
+#include <kernel/uapi/bug.h>
 
 // Spinlock for FAT32 filesystem access
 static spinlock_t fat32_lock = SPINLOCK_INIT("fat32");
@@ -109,8 +109,8 @@ int fat32_io_release_if_owner(uint64_t task_id) {
  * The dcache / icache / pagecache reach FAT32 only through these ops.
  * Forward-declare the helpers FAT32 needs to implement them; the actual
  * bodies live further down in this file. */
-#include <kernel/vfs_sb.h>
-#include <kernel/icache.h>
+#include <kernel/fs/vfs_sb.h>
+#include <kernel/fs/icache.h>
 
 static unsigned long cluster_to_lba(fat32_fs_t *fs, unsigned long cluster);
 unsigned long fat32_next_cluster_cached(fat32_fs_t *fs, unsigned long cluster);

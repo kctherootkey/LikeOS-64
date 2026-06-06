@@ -1,16 +1,16 @@
 // LikeOS-64 Timer Driver
-#include <kernel/timer.h>
-#include <kernel/interrupt.h>
-#include <kernel/console.h>
-#include <kernel/sched.h>
-#include <kernel/signal.h>
-#include <kernel/percpu.h>
-#include <kernel/pagecache.h>
-#include <kernel/acpi.h>
-#include <kernel/memory.h>
-#include <kernel/lapic.h>
-#include <kernel/random.h>
-#include <kernel/bug.h>
+#include <kernel/ke/timer.h>
+#include <kernel/ke/interrupt.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/sched.h>
+#include <kernel/ke/signal.h>
+#include <kernel/ke/percpu.h>
+#include <kernel/fs/pagecache.h>
+#include <kernel/hal/acpi.h>
+#include <kernel/mm/memory.h>
+#include <kernel/hal/lapic.h>
+#include <kernel/dev/rand/random.h>
+#include <kernel/uapi/bug.h>
 
 static volatile uint64_t g_ticks = 0;
 /* PM Timer-based wall-clock microsecond counter.
@@ -105,7 +105,7 @@ static inline void io_delay(void) {
     outb(0x80, 0);
 }
 
-/* inl() is provided by <kernel/interrupt.h>. */
+/* inl() is provided by <kernel/ke/interrupt.h>. */
 
 /* Direct PM Timer read via I/O port — safe from IRQ context.
  * Mask to 24 or 32 bits depending on FADT flags. */

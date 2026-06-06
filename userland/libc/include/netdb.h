@@ -14,7 +14,7 @@
 #define NET_GET_IFACE_INFO    5
 #define NET_DNS_QUERY         6
 
-/* DHCP_CONTROL sub-commands — must match kernel include/kernel/syscall.h */
+/* DHCP_CONTROL sub-commands — must match kernel include/kernel/ke/syscall.h */
 #define DHCP_CMD_DISCOVER     1
 #define DHCP_CMD_RELEASE      2
 #define DHCP_CMD_RENEW        3
@@ -34,7 +34,7 @@
 #define ICMP_DEST_UNREACH     3
 #define ICMP_TIME_EXCEEDED    11
 
-/* Info structures for NET_GETINFO — must match kernel include/kernel/net.h */
+/* Info structures for NET_GETINFO — must match kernel include/kernel/net/net.h */
 typedef struct {
     uint32_t ip;
     uint8_t  mac[6];

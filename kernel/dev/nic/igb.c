@@ -8,18 +8,18 @@
 // asserted.  We use legacy INTx for IRQ delivery (no MSI vector slot
 // is reserved for igb).
 
-#include <kernel/igb.h>
-#include <kernel/net.h>
-#include <kernel/pci.h>
-#include <kernel/memory.h>
-#include <kernel/console.h>
-#include <kernel/interrupt.h>
-#include <kernel/slab.h>
-#include <kernel/lapic.h>
-#include <kernel/ioapic.h>
-#include <kernel/acpi.h>
-#include <kernel/timer.h>
-#include <kernel/bug.h>
+#include <kernel/dev/nic/igb.h>
+#include <kernel/net/net.h>
+#include <kernel/hal/pci.h>
+#include <kernel/mm/memory.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/interrupt.h>
+#include <kernel/mm/slab.h>
+#include <kernel/hal/lapic.h>
+#include <kernel/hal/ioapic.h>
+#include <kernel/hal/acpi.h>
+#include <kernel/ke/timer.h>
+#include <kernel/uapi/bug.h>
 
 // ============================================================================
 // Supported PCI device IDs

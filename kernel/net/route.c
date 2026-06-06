@@ -3,10 +3,10 @@
 // Static routing table with longest-prefix-match lookup.
 // Populated by DHCP and ioctl (SIOCADDRT/SIOCDELRT).
 
-#include <kernel/net.h>
-#include <kernel/console.h>
-#include <kernel/syscall.h>
-#include <kernel/bug.h>
+#include <kernel/net/net.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/syscall.h>
+#include <kernel/uapi/bug.h>
 
 // Route flags
 #define RTF_UP      0x0001  // Route is usable

@@ -3,9 +3,9 @@
 #ifndef LIKEOS_USB_SERIAL_H
 #define LIKEOS_USB_SERIAL_H
 
-#include "types.h"
-#include "status.h"
-#include "xhci.h"
+#include <kernel/uapi/types.h>
+#include <kernel/uapi/status.h>
+#include <kernel/dev/usb/xhci.h>
 
 void usbserial_init(void);
 int usbserial_probe(xhci_controller_t* ctrl, usb_device_t* dev,

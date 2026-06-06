@@ -44,8 +44,8 @@
 #ifndef LIKEOS_SKB_H
 #define LIKEOS_SKB_H
 
-#include "types.h"
-#include "sched.h"   // spinlock_t
+#include <kernel/uapi/types.h>
+#include <kernel/ke/sched.h>   // spinlock_t
 
 struct net_device;
 typedef struct net_device net_device_t;

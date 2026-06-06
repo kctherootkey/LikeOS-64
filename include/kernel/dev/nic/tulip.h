@@ -12,10 +12,10 @@
 #ifndef _KERNEL_TULIP_H_
 #define _KERNEL_TULIP_H_
 
-#include "types.h"
-#include "pci.h"
-#include "net.h"
-#include "sched.h"
+#include <kernel/uapi/types.h>
+#include <kernel/hal/pci.h>
+#include <kernel/net/net.h>
+#include <kernel/ke/sched.h>
 
 #define TULIP_VENDOR_DEC          0x1011
 #define TULIP_DEV_DC21040         0x0002

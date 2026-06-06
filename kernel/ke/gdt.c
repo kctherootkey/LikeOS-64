@@ -1,8 +1,8 @@
 // LikeOS-64 Kernel Executive - GDT Management
 // Global Descriptor Table setup with TSS support for 64-bit mode
 
-#include <kernel/interrupt.h>
-#include <kernel/bug.h>
+#include <kernel/ke/interrupt.h>
+#include <kernel/uapi/bug.h>
 
 // GDT structure
 struct gdt_entry {

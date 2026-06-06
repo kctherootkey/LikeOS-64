@@ -2,9 +2,9 @@
 #ifndef _KERNEL_SCHED_H_
 #define _KERNEL_SCHED_H_
 
-#include "types.h"
-#include "vfs.h"
-#include "signal.h"
+#include <kernel/uapi/types.h>
+#include <kernel/fs/vfs.h>
+#include <kernel/ke/signal.h>
 
 // Forward declaration
 struct vfs_file;

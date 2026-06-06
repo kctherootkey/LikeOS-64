@@ -25,8 +25,8 @@
 #ifndef _KERNEL_BUG_H_
 #define _KERNEL_BUG_H_
 
-#include "types.h"
-#include "console.h"    /* kprintf() */
+#include <kernel/uapi/types.h>
+#include <kernel/io/console.h>    /* kprintf() */
 
 // panic() is declared in interrupt.h; forward-declared here so bug.h can be
 // included without dragging in the full interrupt header.

@@ -2,11 +2,11 @@
 #ifndef LIKEOS_USB_MSD_H
 #define LIKEOS_USB_MSD_H
 
-#include "types.h"
-#include "status.h"
-#include "xhci.h"
-#include "block.h"
-#include "sched.h"
+#include <kernel/uapi/types.h>
+#include <kernel/uapi/status.h>
+#include <kernel/dev/usb/xhci.h>
+#include <kernel/dev/block/block.h>
+#include <kernel/ke/sched.h>
 
 // USB Mass Storage class codes
 #define USB_CLASS_MASS_STORAGE      0x08

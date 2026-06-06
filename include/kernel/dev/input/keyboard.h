@@ -4,7 +4,7 @@
 #ifndef _KERNEL_KEYBOARD_H_
 #define _KERNEL_KEYBOARD_H_
 
-#include "console.h"
+#include <kernel/io/console.h>
 
 // Keyboard ports
 #define KEYBOARD_DATA_PORT 0x60

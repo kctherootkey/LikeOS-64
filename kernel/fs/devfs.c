@@ -1,12 +1,12 @@
 // LikeOS-64 - devfs (device filesystem)
-#include <kernel/devfs.h>
-#include <kernel/memory.h>
-#include <kernel/console.h>
-#include <kernel/syscall.h>
-#include <kernel/dirent.h>
-#include <kernel/timer.h>
-#include <kernel/random.h>
-#include <kernel/bug.h>
+#include <kernel/fs/devfs.h>
+#include <kernel/mm/memory.h>
+#include <kernel/io/console.h>
+#include <kernel/ke/syscall.h>
+#include <kernel/uapi/dirent.h>
+#include <kernel/ke/timer.h>
+#include <kernel/dev/rand/random.h>
+#include <kernel/uapi/bug.h>
 
 #define DEVFS_TYPE_TTY       1
 #define DEVFS_TYPE_PTY_MASTER 2
