@@ -3,10 +3,10 @@
 # back-ends; epoll/eventfd/timerfd/signalfd/kqueue/openssl/zlib are all
 # disabled in include/event2/event-config.h.  No autoconf is involved.
 
-LIBC_DIR     := ../../../userland/libc
-RTLD_DIR     := ../../../userland/rtld
+LIBC_DIR     := ../../../user/lib/libc
+RTLD_DIR     := ../../../user/lib/rtld
 LIKEOS_INCS  := -I$(LIBC_DIR)/include
-LIKEOS_LDS   := ../../../user/user_dyn.lds
+LIKEOS_LDS   := ../../../user/bin/user_dyn.lds
 
 CC      := gcc
 LD      := ld

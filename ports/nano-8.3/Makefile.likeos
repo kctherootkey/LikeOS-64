@@ -6,8 +6,8 @@
 CC = gcc
 LD = ld
 
-LIBC_DIR  = ../../userland/libc
-RTLD_DIR  = ../../userland/rtld
+LIBC_DIR  = ../../user/lib/libc
+RTLD_DIR  = ../../user/lib/rtld
 NCURSES_DIR = ../lib/ncurses-likeos
 
 # nano source directory
@@ -62,7 +62,7 @@ NANO_OBJ = $(NANO_SRC:.c=.o)
 GNULIB_OBJ = $(GNULIB_SRC:.c=.o)
 
 # Link flags (PIE binary linked against libc.so + ncurses.so)
-LDFLAGS = -pie -nostdlib -T ../../user/user_dyn.lds --hash-style=gnu \
+LDFLAGS = -pie -nostdlib -T ../../user/bin/user_dyn.lds --hash-style=gnu \
           -z now \
           -rpath /lib -dynamic-linker /lib/ld-likeos.so \
           -L$(LIBC_DIR) -L$(RTLD_DIR) -L$(NCURSES_DIR)

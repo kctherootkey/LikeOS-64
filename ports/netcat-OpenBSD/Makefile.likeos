@@ -5,8 +5,8 @@
 CC = gcc
 LD = ld
 
-LIBC_DIR = ../../userland/libc
-RTLD_DIR = ../../userland/rtld
+LIBC_DIR = ../../user/lib/libc
+RTLD_DIR = ../../user/lib/rtld
 
 CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fstack-protector-strong \
          -mno-red-zone -ffreestanding -fPIE \
@@ -17,7 +17,7 @@ CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fstack-protector-strong \
          -Wno-unused-parameter \
          -Wno-sign-compare
 
-LDFLAGS = -pie -nostdlib -T ../../user/user_dyn.lds --hash-style=gnu \
+LDFLAGS = -pie -nostdlib -T ../../user/bin/user_dyn.lds --hash-style=gnu \
           -z now \
           -rpath /lib -dynamic-linker /lib/ld-likeos.so \
           -L$(LIBC_DIR) -L$(RTLD_DIR)

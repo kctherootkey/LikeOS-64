@@ -4,7 +4,7 @@
 # Based on ncurses 6.5 API (source in ../ncurses-6.5/).
 
 BASEDIR = ../../..
-LIBC_DIR = $(BASEDIR)/userland/libc
+LIBC_DIR = $(BASEDIR)/user/lib/libc
 
 CC = gcc
 LD = ld

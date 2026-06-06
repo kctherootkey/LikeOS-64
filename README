@@ -185,8 +185,8 @@ Project structure
 - boot/: UEFI bootloader and trampoline.
 - kernel/: kernel subsystems (ke, hal, mm, fs, io).
 - include/kernel/: public kernel headers.
-- user/: user programs (core utilities and tests).
-- userland/libc/: C library and runtime pieces.
+- user/bin/: user programs (core utilities and tests).
+- user/lib/libc/: C library and runtime pieces.
 - host/linux-usb/: Linux host USB builder.
 - ports/: third-party ports.
 

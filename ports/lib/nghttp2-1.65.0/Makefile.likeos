@@ -9,13 +9,13 @@
 #   platform detection, then link as an ELF shared object following the
 #   libevent/ncurses pattern used throughout LikeOS ports.
 
-LIBC_DIR  := ../../../userland/libc
-RTLD_DIR  := ../../../userland/rtld
+LIBC_DIR  := ../../../user/lib/libc
+RTLD_DIR  := ../../../user/lib/rtld
 BUILD_DIR := ../../../build
 
 ABS_ROOT  := $(abspath ../../..)
-ABS_LIBC  := $(ABS_ROOT)/userland/libc
-ABS_RTLD  := $(ABS_ROOT)/userland/rtld
+ABS_LIBC  := $(ABS_ROOT)/user/lib/libc
+ABS_RTLD  := $(ABS_ROOT)/user/lib/rtld
 ABS_BUILD := $(ABS_ROOT)/build
 
 CC := gcc

@@ -19,15 +19,15 @@
 #   matching the tmux/nano port convention.
 
 CURL_SRC  := .
-LIBC_DIR  := ../../userland/libc
-RTLD_DIR  := ../../userland/rtld
-USER_LDS  := ../../user/user_dyn.lds
+LIBC_DIR  := ../../user/lib/libc
+RTLD_DIR  := ../../user/lib/rtld
+USER_LDS  := ../../user/bin/user_dyn.lds
 BUILD_DIR := ../../build
 
 ABS_ROOT      := $(abspath ../..)
-ABS_LIBC      := $(ABS_ROOT)/userland/libc
-ABS_RTLD      := $(ABS_ROOT)/userland/rtld
-ABS_LDS       := $(ABS_ROOT)/user/user_dyn.lds
+ABS_LIBC      := $(ABS_ROOT)/user/lib/libc
+ABS_RTLD      := $(ABS_ROOT)/user/lib/rtld
+ABS_LDS       := $(ABS_ROOT)/user/bin/user_dyn.lds
 ABS_CRT1      := $(ABS_LIBC)/crt1.o
 ABS_BUILD     := $(ABS_ROOT)/build
 ABS_OPENSSL   := $(ABS_ROOT)/ports/openssl-3.5.6

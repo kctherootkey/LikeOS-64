@@ -1,8 +1,8 @@
 CC = gcc
 LD = ld
 
-LIBC_DIR = ../userland/libc
-RTLD_DIR = ../userland/rtld
+LIBC_DIR = ../lib/libc
+RTLD_DIR = ../lib/rtld
 
 CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fstack-protector-strong \
          -mno-red-zone -ffreestanding -fPIE -I$(LIBC_DIR)/include \
@@ -19,10 +19,14 @@ CRT1 = $(LIBC_DIR)/crt1.o
 # Shared libraries to link against (ld-likeos.so provides _rtld_* symbols for dlfcn)
 LIBS = -lc -l:ld-likeos.so
 
-# Programs
-PROGRAMS = test_syscalls test_libc hello sh ls cat pwd stat progerr testmem memstat teststress uname shutdown poweroff ps cp mv rm mkdir rmdir touch more less clear env kill find df du hexdump sleep strings file grep wc head tail echo printf free uptime dmesg which date time sort uniq cut tr yes true false top man hostname ping ifconfig netstat route arp traceroute arping dhclient dig nslookup host netstress openssltest usbtest
+# Programs (sources live alongside this Makefile in user/bin/)
+PROGRAMS = hello sh ls cat pwd stat progerr memstat uname shutdown poweroff ps cp mv rm mkdir rmdir touch more less clear env kill find df du hexdump sleep strings file grep wc head tail echo printf free uptime dmesg which date time sort uniq cut tr yes true false top man hostname ping ifconfig netstat route arp traceroute arping dhclient dig nslookup host
 
-all: $(PROGRAMS) reboot halt
+# Test programs (sources live in user/bin/tests/, built as tests/<name>)
+TESTS = test_syscalls test_libc testmem teststress netstress openssltest usbtest
+TEST_BINS = $(addprefix tests/,$(TESTS))
+
+all: $(PROGRAMS) $(TEST_BINS) reboot halt
 
 # Generic link rule: crt1.o + program.o → PIE binary linked against libc.so + libpthread.so
 define LINK_RULE
@@ -31,6 +35,7 @@ $(1): $(CRT1) $(1).o
 endef
 
 $(foreach prog,$(PROGRAMS),$(eval $(call LINK_RULE,$(prog))))
+$(foreach prog,$(TEST_BINS),$(eval $(call LINK_RULE,$(prog))))
 
 # reboot and halt are copies of poweroff (determines action from argv[0])
 reboot: poweroff
@@ -46,6 +51,6 @@ halt: poweroff
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f *.o $(PROGRAMS) reboot halt
+	rm -f *.o $(PROGRAMS) reboot halt tests/*.o $(TEST_BINS)
 
 .PHONY: all clean

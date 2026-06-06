@@ -26,7 +26,7 @@ our %config = (
     "CPPDEFINES" => [],
     "CPPFLAGS" => [],
     "CPPINCLUDES" => [
-        "/home/kcope/Dokumente/LikeOS-64/userland/libc/include"
+        "/home/kcope/Dokumente/LikeOS-64/user/lib/libc/include"
     ],
     "CXX" => "g++",
     "CXXFLAGS" => [
@@ -244,7 +244,7 @@ our %config = (
         "OPENSSL_SYS_LIKEOS"
     ],
     "openssldir" => "/etc/ssl",
-    "options" => "--prefix=/usr --openssldir=/etc/ssl --libdir=lib -I/home/kcope/Dokumente/LikeOS-64/userland/libc/include no-acvp-tests no-afalgeng no-asan no-async no-brotli no-brotli-dynamic no-buildtest-c++ no-capieng no-crypto-mdebug no-crypto-mdebug-backtrace no-demos no-deprecated no-devcryptoeng no-dynamic-engine no-ec_nistp_64_gcc_128 no-egd no-engine no-external-tests no-fips no-fips-jitter no-fips-post no-fips-securitychecks no-fuzz-afl no-fuzz-libfuzzer no-h3demo no-hqinterop no-jitter no-ktls no-loadereng no-md2 no-msan no-padlockeng no-pie no-rc5 no-sctp no-srp no-ssl3 no-ssl3-method no-sslkeylog no-tests no-tfo no-tls-deprecated-ec no-trace no-ubsan no-unit-test no-uplink no-weak-ssl-ciphers no-winstore no-zlib no-zlib-dynamic no-zstd no-zstd-dynamic",
+    "options" => "--prefix=/usr --openssldir=/etc/ssl --libdir=lib -I/home/kcope/Dokumente/LikeOS-64/user/lib/libc/include no-acvp-tests no-afalgeng no-asan no-async no-brotli no-brotli-dynamic no-buildtest-c++ no-capieng no-crypto-mdebug no-crypto-mdebug-backtrace no-demos no-deprecated no-devcryptoeng no-dynamic-engine no-ec_nistp_64_gcc_128 no-egd no-engine no-external-tests no-fips no-fips-jitter no-fips-post no-fips-securitychecks no-fuzz-afl no-fuzz-libfuzzer no-h3demo no-hqinterop no-jitter no-ktls no-loadereng no-md2 no-msan no-padlockeng no-pie no-rc5 no-sctp no-srp no-ssl3 no-ssl3-method no-sslkeylog no-tests no-tfo no-tls-deprecated-ec no-trace no-ubsan no-unit-test no-uplink no-weak-ssl-ciphers no-winstore no-zlib no-zlib-dynamic no-zstd no-zstd-dynamic",
     "patch" => "6",
     "perl_archname" => "x86_64-linux-gnu-thread-multi",
     "perl_cmd" => "/usr/bin/perl",
@@ -263,7 +263,7 @@ our %config = (
         "no-ssl3",
         "no-ssl3-method",
         "no-deprecated",
-        "-I/home/kcope/Dokumente/LikeOS-64/userland/libc/include"
+        "-I/home/kcope/Dokumente/LikeOS-64/user/lib/libc/include"
     ],
     "perlenv" => {
         "AR" => undef,

@@ -109,7 +109,7 @@ BUILD_DIR = build
 KERNEL_DIR = kernel
 INCLUDE_DIR = include
 BOOT_DIR = boot
-USER_DIR = user
+USER_DIR = user/bin
 
 # UEFI/GNU-EFI paths
 EFI_INCLUDES = -I/usr/include/efi -I/usr/include/efi/x86_64
@@ -502,40 +502,40 @@ $(BUILD_DIR)/futex.o: $(KERNEL_DIR)/ke/futex.c | $(BUILD_DIR)
 # Build userland C library
 .PHONY: userland-libc
 userland-libc:
-	$(MAKE) -C userland/libc DEBUG=$(DEBUG)
+	$(MAKE) -C user/lib/libc DEBUG=$(DEBUG)
 
 # Build runtime linker
 .PHONY: userland-rtld
 userland-rtld:
-	$(MAKE) -C userland/rtld DEBUG=$(DEBUG)
+	$(MAKE) -C user/lib/rtld DEBUG=$(DEBUG)
 
 # Build test shared library
 .PHONY: userland-testlib
 userland-testlib:
-	$(MAKE) -C userland/testlib
+	$(MAKE) -C user/lib/testlib
 
 # Copy shared libraries to build directory
 $(BUILD_DIR)/ld-likeos.so: userland-rtld | $(BUILD_DIR)
-	cp userland/rtld/ld-likeos.so $@
+	cp user/lib/rtld/ld-likeos.so $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libc.so: userland-libc | $(BUILD_DIR)
-	cp userland/libc/libc.so $@
+	cp user/lib/libc/libc.so $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libtestlib.so: userland-testlib | $(BUILD_DIR)
-	cp userland/testlib/libtestlib.so $@
+	cp user/lib/testlib/libtestlib.so $@
 	$(STRIP) --strip-unneeded $@
 
 # Build test programs using libc
 $(BUILD_DIR)/user_test.elf: userland-libc userland-rtld | $(BUILD_DIR)
-	$(MAKE) -C $(USER_DIR) test_syscalls
-	cp $(USER_DIR)/test_syscalls $@
+	$(MAKE) -C $(USER_DIR) tests/test_syscalls
+	cp $(USER_DIR)/tests/test_syscalls $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/test_libc: userland-libc userland-rtld | $(BUILD_DIR)
-	$(MAKE) -C $(USER_DIR) test_libc
-	cp $(USER_DIR)/test_libc $@
+	$(MAKE) -C $(USER_DIR) tests/test_libc
+	cp $(USER_DIR)/tests/test_libc $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/hello: userland-libc userland-rtld | $(BUILD_DIR)
@@ -574,8 +574,8 @@ $(BUILD_DIR)/progerr: userland-libc userland-rtld | $(BUILD_DIR)
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/testmem: userland-libc userland-rtld | $(BUILD_DIR)
-	$(MAKE) -C $(USER_DIR) testmem
-	cp $(USER_DIR)/testmem $@
+	$(MAKE) -C $(USER_DIR) tests/testmem
+	cp $(USER_DIR)/tests/testmem $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/memstat: userland-libc userland-rtld | $(BUILD_DIR)
@@ -584,18 +584,18 @@ $(BUILD_DIR)/memstat: userland-libc userland-rtld | $(BUILD_DIR)
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/teststress: userland-libc userland-rtld | $(BUILD_DIR)
-	$(MAKE) -C $(USER_DIR) teststress
-	cp $(USER_DIR)/teststress $@
+	$(MAKE) -C $(USER_DIR) tests/teststress
+	cp $(USER_DIR)/tests/teststress $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/netstress: userland-libc userland-rtld | $(BUILD_DIR)
-	$(MAKE) -C $(USER_DIR) netstress
-	cp $(USER_DIR)/netstress $@
+	$(MAKE) -C $(USER_DIR) tests/netstress
+	cp $(USER_DIR)/tests/netstress $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/openssltest: userland-libc userland-rtld | $(BUILD_DIR)
-	$(MAKE) -C $(USER_DIR) openssltest
-	cp $(USER_DIR)/openssltest $@
+	$(MAKE) -C $(USER_DIR) tests/openssltest
+	cp $(USER_DIR)/tests/openssltest $@
 	$(STRIP) --strip-unneeded $@
 
 # Extra dependency declarations so openssltest is built before images
@@ -604,8 +604,8 @@ $(DATA_IMAGE): $(BUILD_DIR)/openssltest
 usb-write: $(BUILD_DIR)/openssltest
 
 $(BUILD_DIR)/usbtest: userland-libc userland-rtld | $(BUILD_DIR)
-	$(MAKE) -C $(USER_DIR) usbtest
-	cp $(USER_DIR)/usbtest $@
+	$(MAKE) -C $(USER_DIR) tests/usbtest
+	cp $(USER_DIR)/tests/usbtest $@
 	$(STRIP) --strip-unneeded $@
 
 # Extra dependency declarations so usbtest is built before images
@@ -1621,10 +1621,10 @@ linux-usb-write: linux-usb
 # Clean build files
 clean:
 	rm -rf $(BUILD_DIR)
-	$(MAKE) -C userland/libc clean
-	$(MAKE) -C userland/rtld clean
-	$(MAKE) -C userland/testlib clean
-	$(MAKE) -C user clean
+	$(MAKE) -C user/lib/libc clean
+	$(MAKE) -C user/lib/rtld clean
+	$(MAKE) -C user/lib/testlib clean
+	$(MAKE) -C $(USER_DIR) clean
 
 distclean: clean
 	$(MAKE) -C ports/lib/ncurses-likeos clean

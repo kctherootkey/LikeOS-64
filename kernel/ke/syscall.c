@@ -1737,7 +1737,7 @@ static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times, 
     return 0;
 }
 
-// Userspace struct statfs layout (must match userland/libc/include/sys/vfs.h)
+// Userspace struct statfs layout (must match user/lib/libc/include/sys/vfs.h)
 typedef struct {
     unsigned long f_type;
     unsigned long f_bsize;
