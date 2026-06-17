@@ -59,6 +59,9 @@
 #define EXT4_FEATURE_INCOMPAT_INLINE_DATA 0x8000
 #define EXT4_FEATURE_INCOMPAT_CSUM_SEED   0x2000
 
+/* s_feature_compat bits */
+#define EXT4_FEATURE_COMPAT_HAS_JOURNAL  0x0004
+
 /* s_feature_ro_compat bits */
 #define EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER 0x0001
 #define EXT4_FEATURE_RO_COMPAT_LARGE_FILE   0x0002
@@ -231,6 +234,74 @@ typedef struct ext4_dir_entry_2 {
 } __attribute__((packed)) ext4_dir_entry_2;
 
 /* ===================================================================
+ * Journal (jbd2) on-disk format.
+ *
+ * IMPORTANT: unlike the ext4 filesystem structures above (which are
+ * little-endian and read directly on x86-64), the jbd2 journal is stored
+ * **big-endian** on disk.  Every multi-byte field below must be byte-swapped
+ * before use (see the be16/be32 helpers in ext4.c).
+ * =================================================================== */
+
+#define JBD2_MAGIC_NUMBER          0xc03b3998U
+
+/* journal_header_t h_blocktype values */
+#define JBD2_DESCRIPTOR_BLOCK      1
+#define JBD2_COMMIT_BLOCK          2
+#define JBD2_SUPERBLOCK_V1         3
+#define JBD2_SUPERBLOCK_V2         4
+#define JBD2_REVOKE_BLOCK          5
+
+/* journal s_feature_incompat bits */
+#define JBD2_FEATURE_INCOMPAT_REVOKE        0x00000001
+#define JBD2_FEATURE_INCOMPAT_64BIT         0x00000002
+#define JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT  0x00000004
+#define JBD2_FEATURE_INCOMPAT_CSUM_V2       0x00000008
+#define JBD2_FEATURE_INCOMPAT_CSUM_V3       0x00000010
+#define JBD2_FEATURE_INCOMPAT_FAST_COMMIT   0x00000020
+
+/* journal_block_tag t_flags bits */
+#define JBD2_FLAG_ESCAPE     1   /* on-disk block escaped (had jbd2 magic)   */
+#define JBD2_FLAG_SAME_UUID  2   /* no 16-byte UUID follows this tag         */
+#define JBD2_FLAG_DELETED    4
+#define JBD2_FLAG_LAST_TAG   8   /* last tag in this descriptor block        */
+
+/* Common header at the start of every journal log block (BE). */
+typedef struct journal_header_s {
+    uint32_t h_magic;            /* JBD2_MAGIC_NUMBER                         */
+    uint32_t h_blocktype;        /* JBD2_*_BLOCK                              */
+    uint32_t h_sequence;         /* transaction ID this block belongs to      */
+} __attribute__((packed)) journal_header_t;
+
+/* Journal superblock — lives in journal log block 0 (BE).  Only the early
+ * fields are needed for replay; tail (uuid users / checksum) is ignored. */
+typedef struct journal_superblock_s {
+    journal_header_t s_header;          /* 0x00 (blocktype = SUPERBLOCK_V1/2) */
+    uint32_t s_blocksize;               /* 0x0C journal block size (== fs bs) */
+    uint32_t s_maxlen;                  /* 0x10 total blocks in the journal   */
+    uint32_t s_first;                   /* 0x14 first block of log info (=1)   */
+    uint32_t s_sequence;                /* 0x18 first commit ID expected      */
+    uint32_t s_start;                   /* 0x1C log start block (0 => clean)   */
+    uint32_t s_errno;                   /* 0x20                               */
+    uint32_t s_feature_compat;          /* 0x24                               */
+    uint32_t s_feature_incompat;        /* 0x28 JBD2_FEATURE_INCOMPAT_*       */
+    uint32_t s_feature_ro_compat;       /* 0x2C                               */
+    uint8_t  s_uuid[16];                /* 0x30                               */
+} __attribute__((packed)) journal_superblock_t;
+
+_Static_assert(__builtin_offsetof(journal_superblock_t, s_maxlen)  == 0x10, "jsb s_maxlen");
+_Static_assert(__builtin_offsetof(journal_superblock_t, s_sequence)== 0x18, "jsb s_sequence");
+_Static_assert(__builtin_offsetof(journal_superblock_t, s_start)   == 0x1C, "jsb s_start");
+_Static_assert(__builtin_offsetof(journal_superblock_t, s_feature_incompat) == 0x28, "jsb incompat");
+
+/* Revoke block: journal_header_t followed by r_count (BE, total used bytes in
+ * the block including the header) and then an array of 4- or 8-byte block
+ * numbers (8 when JBD2_FEATURE_INCOMPAT_64BIT). */
+typedef struct jbd2_revoke_header_s {
+    journal_header_t r_header;          /* blocktype = REVOKE_BLOCK           */
+    uint32_t r_count;                   /* used bytes incl. this header       */
+} __attribute__((packed)) jbd2_revoke_header_t;
+
+/* ===================================================================
  * Block-id encoding for the generic cache chain (see file header)
  * =================================================================== */
 #define EXT4_BID_TAG        (1UL << 63)
@@ -277,6 +348,14 @@ typedef struct ext4_fs {
     ext4_super_block sb_copy;           /* cached superblock                 */
     /* VFS-layer superblock published to g_root_sb; sb.fs_private = this.    */
     vfs_superblock_t sb;
+    /* PJ: journaled-writes (ordered mode) state.  j_enabled gates it all.   */
+    int            j_enabled;           /* journal writes active this mount  */
+    unsigned long  j_sb_pbn;            /* physical block of journal sblock  */
+    unsigned long  j_first;             /* journal s_first (first log block) */
+    unsigned long  j_maxlen;            /* journal s_maxlen (log block count)*/
+    uint32_t       j_sequence;          /* next transaction sequence to use  */
+    uint8_t        j_uuid[16];          /* journal uuid (descriptor tags)    */
+    uint8_t       *j_sb_buf;            /* cached journal superblock (RMW)   */
 } ext4_fs_t;
 
 typedef struct ext4_file {

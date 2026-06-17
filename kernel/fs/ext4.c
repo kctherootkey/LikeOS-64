@@ -66,6 +66,84 @@ unsigned long ext4_get_cwd_ino(void) { return g_ext4_cwd_ino; }
 void ext4_set_cwd_ino(unsigned long ino) { g_ext4_cwd_ino = ino ? ino : EXT4_ROOT_INO; }
 
 /* ===================================================================
+ * PJ: journaled-writes transaction (ordered mode).
+ *
+ * A transaction spans one top-level operation: it begins on the outermost
+ * ext4_io_lock() and commits on the matching outermost ext4_io_unlock().
+ * While active, ext4_write_block() buffers the *structural* metadata it would
+ * write (inode tables, directory blocks, allocation bitmaps) into s_txn
+ * instead of writing it in place; commit then journals the whole set
+ * atomically (descriptor + blocks + commit) and checkpoints it to the final
+ * locations.  Data blocks are written in place during the op (ordered mode),
+ * so committed metadata never references unwritten data.  Serialized entirely
+ * by ext4_io_lock, so no extra locking is needed for s_txn.
+ * =================================================================== */
+static struct {
+    int            active;
+    unsigned       n, cap;
+    unsigned long *blk;     /* final physical block number of each entry   */
+    uint8_t      **data;    /* block_size bytes each (reused across txns)   */
+} s_txn;
+
+static inline int ext4_txn_active(void) { return s_txn.active; }
+static int  ext4_write_block_direct(ext4_fs_t *fs, unsigned long pbn, const void *buf);
+static void ext4_txn_flush(ext4_fs_t *fs);   /* defined with the journal code */
+static void ext4_journal_clean(ext4_fs_t *fs);/* mark journal empty on sync     */
+
+/* Begin a transaction (called on the outermost ext4_io_lock acquire). */
+static void ext4_txn_begin(void)
+{
+    if (!g_ext4_fs || !g_ext4_fs->j_enabled)
+        return;
+    s_txn.active = 1;
+    s_txn.n      = 0;
+}
+
+/* Buffer (or overwrite) a metadata block in the running transaction. */
+static void ext4_txn_capture(ext4_fs_t *fs, unsigned long pbn, const void *buf)
+{
+    for (unsigned i = 0; i < s_txn.n; i++)
+        if (s_txn.blk[i] == pbn) {                /* re-dirtied in same op   */
+            mm_memcpy(s_txn.data[i], buf, fs->block_size);
+            return;
+        }
+    if (s_txn.n == s_txn.cap) {                   /* grow the pointer arrays */
+        unsigned nc = s_txn.cap ? s_txn.cap * 2 : 16;
+        unsigned long *nb = (unsigned long *)kalloc(nc * sizeof(unsigned long));
+        uint8_t **nd = (uint8_t **)kalloc(nc * sizeof(uint8_t *));
+        if (!nb || !nd) {                         /* OOM: degrade to direct  */
+            if (nb) kfree(nb);
+            if (nd) kfree(nd);
+            WARN_ON_ONCE(1);
+            ext4_write_block_direct(fs, pbn, buf);
+            return;
+        }
+        for (unsigned i = 0; i < s_txn.n; i++) { nb[i] = s_txn.blk[i]; nd[i] = s_txn.data[i]; }
+        for (unsigned i = s_txn.n; i < nc; i++) nd[i] = 0;   /* alloc on demand */
+        if (s_txn.blk)  kfree(s_txn.blk);
+        if (s_txn.data) kfree(s_txn.data);
+        s_txn.blk = nb; s_txn.data = nd; s_txn.cap = nc;
+    }
+    if (!s_txn.data[s_txn.n])
+        s_txn.data[s_txn.n] = (uint8_t *)kalloc(fs->block_size);
+    if (!s_txn.data[s_txn.n]) { WARN_ON_ONCE(1); ext4_write_block_direct(fs, pbn, buf); return; }
+    mm_memcpy(s_txn.data[s_txn.n], buf, fs->block_size);
+    s_txn.blk[s_txn.n] = pbn;
+    s_txn.n++;
+}
+
+/* Read-your-writes: serve a block from the running transaction if buffered. */
+static int ext4_txn_lookup(ext4_fs_t *fs, unsigned long pbn, void *buf)
+{
+    for (unsigned i = 0; i < s_txn.n; i++)
+        if (s_txn.blk[i] == pbn) {
+            mm_memcpy(buf, s_txn.data[i], fs->block_size);
+            return 1;
+        }
+    return 0;
+}
+
+/* ===================================================================
  * Reentrant sleeping I/O mutex (identical discipline to fat32_io_lock).
  * =================================================================== */
 volatile int ext4_io_locked = 0;
@@ -85,6 +163,7 @@ void ext4_io_lock(void)
             ext4_io_locked = 1;
             ext4_io_owner  = my_id;
             ext4_io_depth  = 1;
+            ext4_txn_begin();           /* outermost acquire starts a txn */
             spin_unlock_irqrestore(&ext4_io_wait_lock, flags);
             return;
         }
@@ -104,6 +183,13 @@ void ext4_io_lock(void)
 
 void ext4_io_unlock(void)
 {
+    /* On the outermost release, commit the operation's transaction while the
+     * lock is still held (depth==1, we are still the owner).  Done before the
+     * spinlock since the flush sleeps on disk I/O.  Reads ext4_io_depth
+     * lock-free: only the owning task mutates its own depth. */
+    if (ext4_io_depth == 1 && s_txn.active)
+        ext4_txn_flush(g_ext4_fs);
+
     uint64_t flags;
     spin_lock_irqsave(&ext4_io_wait_lock, &flags);
     WARN_ON(!ext4_io_locked);
@@ -129,6 +215,11 @@ int ext4_io_release_if_owner(uint64_t task_id)
         ext4_io_locked = 0;
         ext4_io_owner  = (uint64_t)-1;
         ext4_io_depth  = 0;
+        /* The dead task may have been mid-operation: discard its uncommitted
+         * transaction.  Nothing was journaled or checkpointed, so the fs stays
+         * at its pre-operation state (atomicity).  Buffers are kept for reuse. */
+        s_txn.active = 0;
+        s_txn.n      = 0;
         released = 1;
     }
     spin_unlock_irqrestore(&ext4_io_wait_lock, flags);
@@ -204,6 +295,10 @@ static int ext4_read_block(ext4_fs_t *fs, unsigned long pbn, void *buf)
 {
     if (pbn == 0)
         return ST_INVALID;
+    /* Read-your-writes: an active transaction's buffered (not-yet-checkpointed)
+     * metadata is the authoritative copy until commit. */
+    if (s_txn.active && ext4_txn_lookup(fs, pbn, buf))
+        return ST_OK;
     for (int i = 0; i < EXT4_MBC_ENTRIES; i++) {
         if (s_mbc[i].pbn == pbn && s_mbc[i].data) {
             mm_memcpy(buf, s_mbc[i].data, fs->block_size);
@@ -1047,8 +1142,10 @@ static int ext4_write_sectors(const block_device_t *bdev, unsigned long lba,
     return ST_OK;
 }
 
-/* Write a metadata block to disk, keeping any cached copy coherent. */
-static int ext4_write_block(ext4_fs_t *fs, unsigned long pbn, const void *buf)
+/* Write a metadata block straight to its final location, keeping any cached
+ * copy coherent.  Bypasses the journal — used for checkpointing and outside
+ * of transactions. */
+static int ext4_write_block_direct(ext4_fs_t *fs, unsigned long pbn, const void *buf)
 {
     if (pbn == 0)
         return ST_INVALID;
@@ -1062,6 +1159,20 @@ static int ext4_write_block(ext4_fs_t *fs, unsigned long pbn, const void *buf)
             break;
         }
     return ST_OK;
+}
+
+/* Write a metadata block.  Inside an active journaled transaction this only
+ * buffers the block (it is journaled + checkpointed atomically at commit);
+ * otherwise it goes straight to its final location. */
+static int ext4_write_block(ext4_fs_t *fs, unsigned long pbn, const void *buf)
+{
+    if (pbn == 0)
+        return ST_INVALID;
+    if (s_txn.active && fs && fs->j_enabled) {
+        ext4_txn_capture(fs, pbn, buf);
+        return ST_OK;
+    }
+    return ext4_write_block_direct(fs, pbn, buf);
 }
 
 static int ext4_write_super(ext4_fs_t *fs)
@@ -2122,8 +2233,14 @@ static int ext4_fsync(vfs_file_t *f)
         if (ef->inode) icache_flush((ic_inode_t *)ef->inode);
     }
     if (g_ext4_fs) ext4_flush_meta(g_ext4_fs);
+    /* Commit this op's captured metadata now, then mark the journal clean: an
+     * explicit sync is a consistency point, so a reboot after it should not
+     * replay.  (ext4_txn_flush sets s_txn inactive, so the unlock below does
+     * not re-commit.) */
+    ext4_txn_flush(g_ext4_fs);
     if (g_ext4_fs && g_ext4_fs->bdev && g_ext4_fs->bdev->sync)
         g_ext4_fs->bdev->sync((block_device_t *)g_ext4_fs->bdev);
+    ext4_journal_clean(g_ext4_fs);
     ext4_io_unlock();
     return 0;
 }
@@ -2277,6 +2394,453 @@ static unsigned long ext4_locate_partition(const block_device_t *bdev)
     return found;
 }
 
+/* ===================================================================
+ * Journal replay (jbd2 recovery) — PJ, replay-on-mount half.
+ *
+ * Closes the integrity hole where mount accepted the RECOVER incompat flag but
+ * ignored it.  When the filesystem was not cleanly unmounted, jbd2 left
+ * committed-but-not-yet-checkpointed transactions in the journal (inode #8);
+ * we replay them to their final on-disk locations before any write touches the
+ * filesystem.  Three passes over the circular log (classic jbd2 algorithm):
+ *   SCAN   - find end_txn: the sequence just past the last COMMIT block.
+ *   REVOKE - collect (block -> highest seq revoked) so superseded copies are
+ *            not replayed.
+ *   REPLAY - copy every committed descriptor tag's block to its final location
+ *            unless a revoke at >= its sequence supersedes it.
+ *
+ * The jbd2 journal is BIG-ENDIAN on disk (unlike ext4 itself).  Scope note:
+ * block/commit/tag checksums are NOT verified (our images use ^metadata_csum);
+ * replay is gated on the jbd2 magic + a contiguous run of sequence numbers,
+ * which is correct for cleanly-written journals.  Checksum verification,
+ * ASYNC_COMMIT and fast-commit handling are deferred (P6).
+ * =================================================================== */
+
+static inline uint16_t be16(uint16_t v) { return __builtin_bswap16(v); }
+static inline uint32_t be32(uint32_t v) { return __builtin_bswap32(v); }
+
+/* Circular-log advance: log blocks live in [s_first, s_maxlen). */
+static unsigned long jlog_advance(unsigned long cur, unsigned long n,
+                                  unsigned long first, unsigned long maxlen)
+{
+    unsigned long span = (maxlen > first) ? (maxlen - first) : 0;
+    if (span == 0) return cur;
+    return first + (((cur - first) + n) % span);
+}
+
+/* Read journal log block `lbno` (journal-file logical block) into buf. */
+static int jlog_read(ext4_fs_t *fs, unsigned long lbno, void *buf)
+{
+    unsigned long pbn = ext4_block_map(fs, fs->journal_inum, lbno);
+    if (pbn == 0)
+        return ST_IO;   /* the journal file must be fully allocated */
+    return ext4_read_block(fs, pbn, buf);
+}
+
+/* Write journal log block `lbno` (raw, bypassing the metadata cache and the
+ * transaction capture — these go to the on-disk journal, not final FS blocks). */
+static int jlog_write(ext4_fs_t *fs, unsigned long lbno, const void *buf)
+{
+    unsigned long pbn = ext4_block_map(fs, fs->journal_inum, lbno);
+    if (pbn == 0)
+        return ST_IO;
+    return ext4_write_sectors(fs->bdev,
+                              fs->part_lba_offset + pbn * fs->sectors_per_block,
+                              fs->sectors_per_block, buf);
+}
+
+/* Revoke table: dynamic array of {block, highest-revoked-seq}. */
+typedef struct { unsigned long block; uint32_t seq; } jrev_ent_t;
+typedef struct { jrev_ent_t *v; unsigned n, cap; } jrev_tbl_t;
+
+static void jrev_add(jrev_tbl_t *t, unsigned long block, uint32_t seq)
+{
+    for (unsigned i = 0; i < t->n; i++)
+        if (t->v[i].block == block) {            /* keep the latest revoke   */
+            if (seq > t->v[i].seq) t->v[i].seq = seq;
+            return;
+        }
+    if (t->n == t->cap) {
+        unsigned ncap = t->cap ? t->cap * 2 : 64;
+        jrev_ent_t *nv = (jrev_ent_t *)kalloc(ncap * sizeof(jrev_ent_t));
+        if (!nv) { WARN_ON_ONCE(1); return; }     /* drop: at worst over-replay */
+        if (t->v) { mm_memcpy(nv, t->v, t->n * sizeof(jrev_ent_t)); kfree(t->v); }
+        t->v = nv; t->cap = ncap;
+    }
+    t->v[t->n].block = block;
+    t->v[t->n].seq   = seq;
+    t->n++;
+}
+
+/* A block is superseded (skip replay) if revoked at a seq >= the txn seq. */
+static int jrev_test(const jrev_tbl_t *t, unsigned long block, uint32_t seq)
+{
+    for (unsigned i = 0; i < t->n; i++)
+        if (t->v[i].block == block && t->v[i].seq >= seq)
+            return 1;
+    return 0;
+}
+
+#define EXT4_JPASS_SCAN   0
+#define EXT4_JPASS_REVOKE 1
+#define EXT4_JPASS_REPLAY 2
+
+/* One pass over the committed log.  SCAN sets *end_txn (sequence past the last
+ * commit); REVOKE/REPLAY are bounded by it.  Returns ST_OK or an I/O error. */
+static int ext4_journal_pass(ext4_fs_t *fs, const journal_superblock_t *jsb,
+                             int pass, uint32_t *end_txn, jrev_tbl_t *revtbl,
+                             unsigned long *out_replayed)
+{
+    unsigned long first  = be32(jsb->s_first);
+    unsigned long maxlen = be32(jsb->s_maxlen);
+    uint32_t jincompat   = be32(jsb->s_feature_incompat);
+    int      is64    = (jincompat & JBD2_FEATURE_INCOMPAT_64BIT) != 0;
+    int      csum3   = (jincompat & JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0;
+    unsigned tag_sz  = csum3 ? 16u : (is64 ? 12u : 8u);
+
+    unsigned long next_log = be32(jsb->s_start);
+    uint32_t      next_seq = be32(jsb->s_sequence);
+    unsigned long replayed = 0;
+    int rc = ST_OK;
+
+    uint8_t *blk  = (uint8_t *)kalloc(fs->block_size);
+    uint8_t *data = (uint8_t *)kalloc(fs->block_size);
+    if (!blk || !data) { if (blk) kfree(blk); if (data) kfree(data); return ST_NOMEM; }
+
+    for (;;) {
+        if (pass != EXT4_JPASS_SCAN && next_seq >= *end_txn)
+            break;                                 /* all committed txns done */
+        if (jlog_read(fs, next_log, blk) != ST_OK) { rc = ST_IO; break; }
+        const journal_header_t *h = (const journal_header_t *)blk;
+        if (be32(h->h_magic) != JBD2_MAGIC_NUMBER) break;   /* end of log     */
+        if (be32(h->h_sequence) != next_seq)       break;   /* stale: end     */
+
+        uint32_t bt = be32(h->h_blocktype);
+        if (bt == JBD2_DESCRIPTOR_BLOCK) {
+            unsigned      off      = sizeof(journal_header_t);
+            unsigned long data_idx = 0;
+            while (off + tag_sz <= fs->block_size) {
+                const uint8_t *tag = blk + off;
+                uint32_t blocknr = be32(*(const uint32_t *)(tag + 0));
+                uint32_t flags   = csum3 ? be32(*(const uint32_t *)(tag + 4))
+                                         : be16(*(const uint16_t *)(tag + 6));
+                unsigned long target = blocknr;
+                if (is64)                              /* high 32 at +8 (both)*/
+                    target |= ((unsigned long)be32(*(const uint32_t *)(tag + 8)) << 32);
+
+                if (pass == EXT4_JPASS_REPLAY) {
+                    /* The journalled copy is 1 + data_idx blocks past the
+                     * descriptor in the log. */
+                    unsigned long dl = jlog_advance(next_log, 1 + data_idx, first, maxlen);
+                    if (jlog_read(fs, dl, data) != ST_OK) { rc = ST_IO; goto out; }
+                    if (flags & JBD2_FLAG_ESCAPE) {     /* restore escaped magic */
+                        uint32_t m = __builtin_bswap32(JBD2_MAGIC_NUMBER);
+                        mm_memcpy(data, &m, 4);
+                    }
+                    if (target == 0) {
+                        WARN_ON_ONCE(1);               /* tag targets block 0 */
+                    } else if (!jrev_test(revtbl, target, next_seq)) {
+                        if (ext4_write_block(fs, target, data) != ST_OK) { rc = ST_IO; goto out; }
+                        replayed++;
+                    }
+                }
+                data_idx++;
+                off += tag_sz;
+                if (!(flags & JBD2_FLAG_SAME_UUID))
+                    off += 16;                         /* a UUID follows tag  */
+                if (flags & JBD2_FLAG_LAST_TAG)
+                    break;
+            }
+            next_log = jlog_advance(next_log, 1 + data_idx, first, maxlen);
+        } else if (bt == JBD2_COMMIT_BLOCK) {
+            next_seq++;                                /* transaction boundary */
+            if (pass == EXT4_JPASS_SCAN)
+                *end_txn = next_seq;
+            next_log = jlog_advance(next_log, 1, first, maxlen);
+        } else if (bt == JBD2_REVOKE_BLOCK) {
+            if (pass == EXT4_JPASS_REVOKE) {
+                const jbd2_revoke_header_t *rh = (const jbd2_revoke_header_t *)blk;
+                unsigned used = be32(rh->r_count);
+                if (used > fs->block_size) used = fs->block_size;
+                unsigned rsz = is64 ? 8u : 4u;
+                unsigned p = sizeof(jbd2_revoke_header_t);
+                while (p + rsz <= used) {
+                    unsigned long rb = be32(*(const uint32_t *)(blk + p));
+                    if (is64)
+                        rb |= ((unsigned long)be32(*(const uint32_t *)(blk + p + 4)) << 32);
+                    jrev_add(revtbl, rb, next_seq);
+                    p += rsz;
+                }
+            }
+            next_log = jlog_advance(next_log, 1, first, maxlen);
+        } else {
+            break;                                     /* unknown type: end   */
+        }
+    }
+out:
+    kfree(blk);
+    kfree(data);
+    if (out_replayed) *out_replayed = replayed;
+    return rc;
+}
+
+/* Replay the journal of `fs`.  Safe to call on every mount that has a journal:
+ * it reads the journal superblock and no-ops silently when the log is clean
+ * (s_start == 0).  This makes the journal's own log-tail pointer the source of
+ * truth for "needs recovery", independent of the ext4 RECOVER flag — the two
+ * live in different sectors and a device write-back cache can persist one
+ * without the other across a crash (observed: VMware kept the committed
+ * journal but not the RECOVER bit, so a RECOVER-only gate missed the replay).
+ * Sets *did_work = 1 iff blocks were actually replayed (caller must then drop
+ * its metadata caches).  Returns ST_OK on success including the no-op cases. */
+static int ext4_journal_recover(ext4_fs_t *fs, int *did_work)
+{
+    if (did_work) *did_work = 0;
+    if (fs->journal_inum == 0)
+        return ST_OK;
+    uint8_t *jblk = (uint8_t *)kalloc(fs->block_size);
+    if (!jblk) return ST_NOMEM;
+
+    /* The journal superblock is journal log block 0. */
+    unsigned long sb_pbn = ext4_block_map(fs, fs->journal_inum, 0);
+    if (sb_pbn == 0 || ext4_read_block(fs, sb_pbn, jblk) != ST_OK) {
+        kfree(jblk); return ST_IO;
+    }
+    journal_superblock_t *jsb = (journal_superblock_t *)jblk;
+    if (be32(jsb->s_header.h_magic) != JBD2_MAGIC_NUMBER) {
+        kprintf("ext4: bad journal superblock magic\n");
+        kfree(jblk); return ST_INVALID;
+    }
+    uint32_t sbt = be32(jsb->s_header.h_blocktype);
+    if (sbt != JBD2_SUPERBLOCK_V1 && sbt != JBD2_SUPERBLOCK_V2) {
+        kprintf("ext4: unexpected journal sb blocktype %u\n", sbt);
+        kfree(jblk); return ST_INVALID;
+    }
+    if (be32(jsb->s_blocksize) != fs->block_size) {
+        kprintf("ext4: journal blocksize %u != fs %u (unsupported)\n",
+                be32(jsb->s_blocksize), fs->block_size);
+        kfree(jblk); return ST_UNSUPPORTED;
+    }
+
+    uint32_t jincompat = be32(jsb->s_feature_incompat);
+    uint32_t known = JBD2_FEATURE_INCOMPAT_REVOKE | JBD2_FEATURE_INCOMPAT_64BIT
+                   | JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3
+                   | JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT | JBD2_FEATURE_INCOMPAT_FAST_COMMIT;
+    if (jincompat & ~known)
+        kprintf("ext4: journal unknown incompat 0x%x; attempting replay anyway\n",
+                jincompat & ~known);
+    if (jincompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3
+                     | JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT | JBD2_FEATURE_INCOMPAT_FAST_COMMIT))
+        kprintf("ext4: journal csum/async/fast-commit not verified (tolerant replay)\n");
+
+    /* Always report the journal state at mount so a "did it recover?" question
+     * is never a guess.  s_start is the log tail: 0 == clean (nothing to
+     * replay), non-zero == a committed-but-uncheckpointed transaction exists. */
+    uint32_t jstart = be32(jsb->s_start);
+    kprintf("ext4: journal state s_start=%u seq=%u recover_flag=%d\n",
+            jstart, be32(jsb->s_sequence),
+            (fs->feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER) ? 1 : 0);
+    if (jstart == 0) {
+        kfree(jblk); return ST_OK;        /* clean log: nothing to replay     */
+    }
+    kprintf("ext4: replaying journal (s_start=%u)...\n", jstart);
+
+    /* Pass 1 — scan to the end of the committed log. */
+    uint32_t   end_txn = be32(jsb->s_sequence);
+    jrev_tbl_t revtbl  = { 0, 0, 0 };
+    int rc = ext4_journal_pass(fs, jsb, EXT4_JPASS_SCAN, &end_txn, &revtbl, 0);
+    if (rc != ST_OK) { kfree(jblk); return rc; }
+    if (end_txn == be32(jsb->s_sequence)) {
+        kprintf("ext4: journal has no committed transactions; nothing to replay\n");
+        kfree(jblk); return ST_OK;
+    }
+
+    /* Pass 2 — collect revoke records (only if the journal uses them). */
+    if (jincompat & JBD2_FEATURE_INCOMPAT_REVOKE) {
+        rc = ext4_journal_pass(fs, jsb, EXT4_JPASS_REVOKE, &end_txn, &revtbl, 0);
+        if (rc != ST_OK) { if (revtbl.v) kfree(revtbl.v); kfree(jblk); return rc; }
+    }
+
+    /* Pass 3 — replay committed blocks to their final locations. */
+    unsigned long replayed = 0;
+    rc = ext4_journal_pass(fs, jsb, EXT4_JPASS_REPLAY, &end_txn, &revtbl, &replayed);
+    if (revtbl.v) kfree(revtbl.v);
+    if (rc != ST_OK) { kfree(jblk); return rc; }
+
+    /* Mark the journal empty: s_start = 0, s_sequence = end_txn. */
+    jsb->s_start    = __builtin_bswap32(0);
+    jsb->s_sequence = __builtin_bswap32(end_txn);
+    if (ext4_write_block(fs, sb_pbn, jblk) != ST_OK) { kfree(jblk); return ST_IO; }
+    if (fs->bdev && fs->bdev->sync)
+        fs->bdev->sync((block_device_t *)fs->bdev);   /* persist before RECOVER clears */
+
+    kprintf("ext4: journal replay complete (%lu block(s) recovered, end_txn=%u)\n",
+            replayed, end_txn);
+    if (did_work && replayed > 0) *did_work = 1;
+    kfree(jblk);
+    return ST_OK;
+}
+
+/* ===================================================================
+ * PJ: journaled writes (ordered mode) — commit one transaction.
+ *
+ * Called from ext4_io_unlock on the outermost release with the lock still
+ * held.  Atomically journals the buffered structural metadata then checkpoints
+ * it to the final locations.  Ordering (each step durable before the next via
+ * bdev->sync) is what makes a crash at any point recoverable:
+ *   1. set RECOVER on the ext4 superblock (so any journalled commit is honored)
+ *   2. point the journal superblock at this transaction (s_start, s_sequence)
+ *   3. write descriptor + data blocks + commit block into the journal
+ *   4. checkpoint the blocks to their final locations
+ *   5. empty the journal (s_start=0) and clear RECOVER
+ * A crash before the commit block (step 3) leaves an uncommitted txn that the
+ * scan pass ignores; a crash between commit and checkpoint is redone by replay.
+ * Data blocks are already in place (written during the op), so "ordered".
+ * =================================================================== */
+static void ext4_txn_flush(ext4_fs_t *fs)
+{
+    if (!s_txn.active)
+        return;
+    s_txn.active = 0;                 /* capture off: writes below go direct */
+    unsigned n = s_txn.n;
+    s_txn.n = 0;
+    if (n == 0)
+        return;                       /* read-only op: nothing to commit     */
+
+    if (!fs || !fs->j_enabled || !fs->j_sb_buf) {   /* journaling off: direct */
+        for (unsigned i = 0; i < n; i++)
+            ext4_write_block_direct(fs, s_txn.blk[i], s_txn.data[i]);
+        return;
+    }
+
+    unsigned long first  = fs->j_first;
+    unsigned long maxlen = fs->j_maxlen;
+    uint32_t      seq    = fs->j_sequence;
+    unsigned long span   = (maxlen > first) ? (maxlen - first) : 0;
+    if (n + 2 > span) {               /* transaction too big for the journal */
+        WARN_ON_ONCE(1);
+        for (unsigned i = 0; i < n; i++)
+            ext4_write_block_direct(fs, s_txn.blk[i], s_txn.data[i]);
+        if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+        return;
+    }
+
+    journal_superblock_t *jsb = (journal_superblock_t *)fs->j_sb_buf;
+    int      is64  = (be32(jsb->s_feature_incompat) & JBD2_FEATURE_INCOMPAT_64BIT) != 0;
+    unsigned tagsz = is64 ? 12u : 8u;
+
+    /* 1. mark needs-recovery, durably, before writing any committed journal.
+     * Only written when not already set: the journal now stays dirty between
+     * operations (cleaned lazily on sync / next-mount recovery), so RECOVER
+     * persists for the whole dirty period instead of toggling every commit. */
+    if (!(fs->sb_copy.s_feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER)) {
+        fs->sb_copy.s_feature_incompat |= EXT4_FEATURE_INCOMPAT_RECOVER;
+        fs->feature_incompat           |= EXT4_FEATURE_INCOMPAT_RECOVER;
+        ext4_write_super(fs);
+        if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+    }
+
+    /* 2. point the journal at this transaction (it starts at s_first). */
+    jsb->s_start    = __builtin_bswap32((uint32_t)first);
+    jsb->s_sequence = __builtin_bswap32(seq);
+    jlog_write(fs, 0, fs->j_sb_buf);
+    if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+
+    /* 3. descriptor block + data blocks, then the commit block. */
+    uint8_t *db  = (uint8_t *)kalloc(fs->block_size);
+    uint8_t *cpy = (uint8_t *)kalloc(fs->block_size);
+    if (!db || !cpy) {                /* OOM: degrade to direct, clear RECOVER */
+        if (db) kfree(db);
+        if (cpy) kfree(cpy);
+        for (unsigned i = 0; i < n; i++)
+            ext4_write_block_direct(fs, s_txn.blk[i], s_txn.data[i]);
+        if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+        jsb->s_start = 0; jsb->s_sequence = __builtin_bswap32(seq + 1);
+        jlog_write(fs, 0, fs->j_sb_buf);
+        fs->sb_copy.s_feature_incompat &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
+        fs->feature_incompat           &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
+        ext4_write_super(fs);
+        if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+        fs->j_sequence = seq + 1;
+        return;
+    }
+    mm_memset(db, 0, fs->block_size);
+    journal_header_t *dh = (journal_header_t *)db;
+    dh->h_magic     = __builtin_bswap32(JBD2_MAGIC_NUMBER);
+    dh->h_blocktype = __builtin_bswap32(JBD2_DESCRIPTOR_BLOCK);
+    dh->h_sequence  = __builtin_bswap32(seq);
+    unsigned off = sizeof(journal_header_t);
+    for (unsigned i = 0; i < n; i++) {
+        unsigned long tgt = s_txn.blk[i];
+        uint16_t flags = 0;
+        if (i > 0)     flags |= JBD2_FLAG_SAME_UUID;   /* uuid only after tag0 */
+        if (i == n - 1) flags |= JBD2_FLAG_LAST_TAG;
+        uint32_t fw;
+        mm_memcpy(&fw, s_txn.data[i], 4);
+        int escape = (fw == __builtin_bswap32(JBD2_MAGIC_NUMBER));
+        if (escape) flags |= JBD2_FLAG_ESCAPE;
+        uint8_t *tag = db + off;
+        *(uint32_t *)(tag + 0) = __builtin_bswap32((uint32_t)(tgt & 0xFFFFFFFFUL));
+        *(uint16_t *)(tag + 4) = 0;                    /* t_checksum (no csum) */
+        *(uint16_t *)(tag + 6) = __builtin_bswap16(flags);
+        if (is64)
+            *(uint32_t *)(tag + 8) = __builtin_bswap32((uint32_t)(tgt >> 32));
+        off += tagsz;
+        if (!(flags & JBD2_FLAG_SAME_UUID)) {          /* journal uuid follows */
+            mm_memcpy(db + off, fs->j_uuid, 16);
+            off += 16;
+        }
+        /* journalled copy of the block (escaped if it began with the magic) */
+        mm_memcpy(cpy, s_txn.data[i], fs->block_size);
+        if (escape) { uint32_t z = 0; mm_memcpy(cpy, &z, 4); }
+        jlog_write(fs, first + 1 + i, cpy);
+    }
+    jlog_write(fs, first, db);                         /* the descriptor      */
+    mm_memset(cpy, 0, fs->block_size);                 /* commit block        */
+    journal_header_t *ch = (journal_header_t *)cpy;
+    ch->h_magic     = __builtin_bswap32(JBD2_MAGIC_NUMBER);
+    ch->h_blocktype = __builtin_bswap32(JBD2_COMMIT_BLOCK);
+    ch->h_sequence  = __builtin_bswap32(seq);
+    jlog_write(fs, first + 1 + n, cpy);
+    if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);  /* commit durable */
+    kfree(db);
+    kfree(cpy);
+
+    /* 4. checkpoint the (unescaped) blocks to their final locations. */
+    for (unsigned i = 0; i < n; i++)
+        ext4_write_block_direct(fs, s_txn.blk[i], s_txn.data[i]);
+    if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+
+    /* 5. DO NOT empty the journal here.  Leave s_start pointing at this (now
+     * checkpointed) transaction so an unclean reboot replays it — idempotently,
+     * since checkpointing already put the blocks at their final locations.  The
+     * journal is cleaned only on an explicit sync or by the next mount's
+     * recovery (jbd2's lazy-checkpoint behaviour).  This is what makes recovery
+     * actually fire after a crash instead of almost always finding s_start=0.
+     * The next commit overwrites this slot (its step 2 advances s_sequence
+     * first, so a crash between commits never mis-replays a stale slot). */
+    fs->j_sequence = seq + 1;
+}
+
+/* Clean the journal: mark it empty (s_start=0) and drop needs-recovery.  Called
+ * on explicit sync and from a clean unmount path — NOT per commit.  After this,
+ * a reboot finds a clean fs and does not replay. */
+static void ext4_journal_clean(ext4_fs_t *fs)
+{
+    if (!fs || !fs->j_enabled || !fs->j_sb_buf)
+        return;
+    if (!(fs->sb_copy.s_feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER))
+        return;                                   /* already clean */
+    journal_superblock_t *jsb = (journal_superblock_t *)fs->j_sb_buf;
+    jsb->s_start    = 0;
+    jsb->s_sequence = __builtin_bswap32(fs->j_sequence);
+    jlog_write(fs, 0, fs->j_sb_buf);
+    if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+    fs->sb_copy.s_feature_incompat &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
+    fs->feature_incompat           &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
+    ext4_write_super(fs);
+    if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+}
+
 int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
 {
     if (!bdev || !out)
@@ -2362,6 +2926,81 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
     if (ext4_load_gdt(out) != ST_OK) {
         kprintf("ext4: failed to load group descriptor table\n");
         return ST_IO;
+    }
+
+    /* Journal replay: apply any committed transactions left in the journal
+     * BEFORE any write touches the filesystem.  Triggered by the journal's own
+     * log-tail pointer (s_start != 0), NOT just the ext4 RECOVER flag — those
+     * are separate sectors and a device write-back cache can persist the
+     * journal commit without the RECOVER bit across a crash (seen on VMware),
+     * so a RECOVER-only gate silently misses real recovery work. */
+    if (out->journal_inum != 0) {
+        int replayed = 0;
+        int rr = ext4_journal_recover(out, &replayed);
+        if (rr == ST_OK) {
+            if (replayed) {
+                /* Replay rewrote final metadata under us; drop caches that
+                 * were populated before/by replay so later reads see the
+                 * recovered state. */
+                ext4_mbc_invalidate();
+                s_ic_ino = 0;
+                ext4_load_gdt(out);     /* GDT blocks may have been replayed   */
+            }
+            /* Clear RECOVER (if it was set) now the journal is clean again. */
+            if (out->feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER) {
+                out->feature_incompat            &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
+                out->sb_copy.s_feature_incompat  &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
+                ext4_write_super(out);
+                if (out->bdev && out->bdev->sync)
+                    out->bdev->sync((block_device_t *)out->bdev);
+            }
+        } else {
+            /* Leave RECOVER set so the next mount retries (replay is
+             * idempotent).  Warn loudly: this matches today's behaviour of
+             * mounting a dirty journal, no worse, and recoverable on reboot. */
+            kprintf("ext4: WARNING journal replay failed (%d); RECOVER left set\n", rr);
+            WARN_ON_ONCE(1);
+        }
+    }
+
+    /* PJ: set up journaled writes (ordered mode).  Disabled unless the journal
+     * exists, matches our block size, and uses only features we can WRITE
+     * correctly (no csum/async/fast-commit — those need csums we don't yet
+     * compute, P6).  Must run after recovery so j_sequence reflects the
+     * post-recovery journal state. */
+    out->j_enabled = 0;
+    out->j_sb_buf  = 0;
+    if ((out->feature_compat & EXT4_FEATURE_COMPAT_HAS_JOURNAL) && out->journal_inum != 0) {
+        out->j_sb_buf = (uint8_t *)kalloc(out->block_size);
+        unsigned long jpbn = out->j_sb_buf ? ext4_block_map(out, out->journal_inum, 0) : 0;
+        if (out->j_sb_buf && jpbn &&
+            ext4_read_block(out, jpbn, out->j_sb_buf) == ST_OK) {
+            journal_superblock_t *jsb = (journal_superblock_t *)out->j_sb_buf;
+            uint32_t jmag = be32(jsb->s_header.h_magic);
+            uint32_t jbt  = be32(jsb->s_header.h_blocktype);
+            uint32_t jinc = be32(jsb->s_feature_incompat);
+            uint32_t jbad = JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3
+                          | JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT | JBD2_FEATURE_INCOMPAT_FAST_COMMIT;
+            if (jmag == JBD2_MAGIC_NUMBER &&
+                (jbt == JBD2_SUPERBLOCK_V1 || jbt == JBD2_SUPERBLOCK_V2) &&
+                be32(jsb->s_blocksize) == out->block_size && !(jinc & jbad)) {
+                out->j_first    = be32(jsb->s_first);
+                out->j_maxlen   = be32(jsb->s_maxlen);
+                out->j_sequence = be32(jsb->s_sequence);
+                if (out->j_sequence == 0) out->j_sequence = 1;  /* jbd2 seq >= 1 */
+                mm_memcpy(out->j_uuid, jsb->s_uuid, 16);
+                out->j_sb_pbn = jpbn;
+                if (out->j_maxlen > out->j_first + 3)
+                    out->j_enabled = 1;
+            }
+        }
+        if (out->j_enabled) {
+            kprintf("ext4: journaled writes ON (ordered; journal %lu blocks, next seq %u)\n",
+                    out->j_maxlen, out->j_sequence);
+        } else {
+            kprintf("ext4: journaled writes OFF (no usable journal / unsupported journal features)\n");
+            if (out->j_sb_buf) { kfree(out->j_sb_buf); out->j_sb_buf = 0; }
+        }
     }
     return ST_OK;
 }
