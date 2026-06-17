@@ -784,6 +784,339 @@ static BOOLEAN validate_elf64(Elf64_Ehdr *elf_header) {
     return TRUE;
 }
 
+/* ===========================================================================
+ *  Minimal read-only ext4 reader for booting from a single GPT USB disk
+ * ---------------------------------------------------------------------------
+ *  Loads /boot/kernel.elf straight from the ext4 root partition via
+ *  EFI_BLOCK_IO.  This is the only supported boot path: the kernel always
+ *  lives on the ext4 root, never on the FAT ESP (which carries the bootloader
+ *  alone).  Standalone: uses only BS->AllocatePool and blkio->ReadBlocks (no
+ *  kernel allocator, no caches).
+ *
+ *  On-disk fields are read by byte offset (little-endian) to avoid struct
+ *  packing concerns in the freestanding EFI environment.  Mirrors the read
+ *  logic in kernel/fs/ext4.c (superblock, group desc, inode, extent + classic
+ *  indirect mapping, linear directory scan).
+ * =========================================================================== */
+
+#define E4_SUPER_MAGIC      0xEF53
+#define E4_ROOT_INO         2
+#define E4_EXT_MAGIC        0xF30A
+#define E4_NDIR_BLOCKS      12
+#define E4_EXTENTS_FL       0x00080000u
+#define E4_INCOMPAT_64BIT   0x0080u
+
+static UINT16 e4_rd16(const UINT8 *p) { return (UINT16)(p[0] | (p[1] << 8)); }
+static UINT32 e4_rd32(const UINT8 *p) {
+    return (UINT32)p[0] | ((UINT32)p[1] << 8) | ((UINT32)p[2] << 16) | ((UINT32)p[3] << 24);
+}
+
+typedef struct {
+    EFI_BLOCK_IO_PROTOCOL *blk;
+    UINT32  media_id;
+    UINT32  dev_bs;             /* device logical block size (Media->BlockSize) */
+    UINT32  block_size;         /* ext4 block size                             */
+    UINT32  spb;               /* device sectors per ext4 block                */
+    UINT32  inodes_per_group;
+    UINT32  inode_size;
+    UINT32  desc_size;          /* group descriptor size (32 or 64)            */
+    UINT64  gdt_block;          /* first block of the group descriptor table   */
+    UINT8  *scratch;            /* one ext4-block scratch buffer               */
+    UINT8  *node;               /* one ext4-block extent-node buffer           */
+} e4_ctx;
+
+/* Read `count` device sectors starting at device LBA `lba`. */
+static EFI_STATUS e4_read_dev(e4_ctx *c, UINT64 lba, UINT32 count, VOID *buf) {
+    return uefi_call_wrapper(c->blk->ReadBlocks, 5, c->blk, c->media_id,
+                             (EFI_LBA)lba, (UINTN)count * c->dev_bs, buf);
+}
+
+/* Read one ext4 filesystem block (block_size bytes) into buf. */
+static EFI_STATUS e4_read_block(e4_ctx *c, UINT64 fsblock, VOID *buf) {
+    return e4_read_dev(c, fsblock * c->spb, c->spb, buf);
+}
+
+/* Read an inode's raw bytes (inode_size) into out. */
+static EFI_STATUS e4_read_inode(e4_ctx *c, UINT32 ino, UINT8 *out) {
+    if (ino == 0) return EFI_NOT_FOUND;
+    UINT32 group = (ino - 1) / c->inodes_per_group;
+    UINT32 index = (ino - 1) % c->inodes_per_group;
+
+    /* Group descriptor lives at gdt_block + (group*desc_size)/block_size. */
+    UINT64 gd_byte = (UINT64)group * c->desc_size;
+    UINT64 gd_blk  = c->gdt_block + gd_byte / c->block_size;
+    UINT32 gd_off  = (UINT32)(gd_byte % c->block_size);
+    if (EFI_ERROR(e4_read_block(c, gd_blk, c->scratch))) return EFI_DEVICE_ERROR;
+
+    UINT64 itbl = e4_rd32(c->scratch + gd_off + 8);          /* bg_inode_table_lo */
+    if (c->desc_size >= 64)
+        itbl |= (UINT64)e4_rd32(c->scratch + gd_off + 40) << 32; /* _hi */
+
+    UINT64 byte = (UINT64)index * c->inode_size;
+    UINT64 iblk = itbl + byte / c->block_size;
+    UINT32 ioff = (UINT32)(byte % c->block_size);
+    if (EFI_ERROR(e4_read_block(c, iblk, c->scratch))) return EFI_DEVICE_ERROR;
+
+    UINT32 n = c->inode_size; if (n > 256) n = 256;
+    for (UINT32 i = 0; i < n; i++) out[i] = c->scratch[ioff + i];
+    return EFI_SUCCESS;
+}
+
+/* Map a file logical block index to a physical block number (0 == hole). */
+static UINT64 e4_bmap(e4_ctx *c, const UINT8 *inode, UINT64 lidx) {
+    UINT32 flags = e4_rd32(inode + 32);
+    const UINT8 *iblock = inode + 40;       /* i_block[15] (60 bytes) */
+
+    if (flags & E4_EXTENTS_FL) {
+        UINT8 nodebuf[60];
+        const UINT8 *node = iblock;
+        for (UINT32 i = 0; i < 60; i++) nodebuf[i] = iblock[i];
+        node = nodebuf;
+        for (;;) {
+            if (e4_rd16(node + 0) != E4_EXT_MAGIC) return 0;
+            UINT16 entries = e4_rd16(node + 2);
+            UINT16 depth   = e4_rd16(node + 6);
+            if (depth == 0) {
+                for (UINT16 e = 0; e < entries; e++) {
+                    const UINT8 *ex = node + 12 + (UINT32)e * 12;
+                    UINT32 ee_block = e4_rd32(ex + 0);
+                    UINT16 ee_len   = e4_rd16(ex + 4);
+                    UINT16 len = ee_len > 32768 ? (UINT16)(ee_len - 32768) : ee_len;
+                    if (lidx >= ee_block && lidx < (UINT64)ee_block + len) {
+                        UINT64 start = (UINT64)e4_rd32(ex + 8)
+                                     | ((UINT64)e4_rd16(ex + 6) << 32);
+                        return start + (lidx - ee_block);
+                    }
+                }
+                return 0;       /* hole / not present */
+            }
+            /* interior node: pick the index entry whose ei_block <= lidx */
+            UINT32 child_lo = 0; UINT32 child_hi = 0; int found = 0;
+            for (UINT16 e = 0; e < entries; e++) {
+                const UINT8 *ix = node + 12 + (UINT32)e * 12;
+                UINT32 ei_block = e4_rd32(ix + 0);
+                if ((UINT64)ei_block <= lidx) {
+                    child_lo = e4_rd32(ix + 4);
+                    child_hi = e4_rd16(ix + 8);
+                    found = 1;
+                } else break;
+            }
+            if (!found) return 0;
+            UINT64 child = (UINT64)child_lo | ((UINT64)child_hi << 32);
+            if (EFI_ERROR(e4_read_block(c, child, c->node))) return 0;
+            node = c->node;
+        }
+    }
+
+    /* classic ext2/3 indirect mapping */
+    UINT32 ppb = c->block_size / 4;     /* pointers per block */
+    if (lidx < E4_NDIR_BLOCKS)
+        return e4_rd32(iblock + (UINT32)lidx * 4);
+    lidx -= E4_NDIR_BLOCKS;
+    if (lidx < ppb) {                   /* single indirect */
+        UINT64 ind = e4_rd32(iblock + 12 * 4);
+        if (!ind) return 0;
+        if (EFI_ERROR(e4_read_block(c, ind, c->node))) return 0;
+        return e4_rd32(c->node + lidx * 4);
+    }
+    lidx -= ppb;
+    if (lidx < (UINT64)ppb * ppb) {     /* double indirect */
+        UINT64 dind = e4_rd32(iblock + 13 * 4);
+        if (!dind) return 0;
+        if (EFI_ERROR(e4_read_block(c, dind, c->node))) return 0;
+        UINT64 mid = e4_rd32(c->node + (lidx / ppb) * 4);
+        if (!mid) return 0;
+        if (EFI_ERROR(e4_read_block(c, mid, c->node))) return 0;
+        return e4_rd32(c->node + (lidx % ppb) * 4);
+    }
+    return 0;                           /* triple indirect: not needed for boot */
+}
+
+static UINT64 e4_isize(const UINT8 *inode) {
+    return (UINT64)e4_rd32(inode + 4) | ((UINT64)e4_rd32(inode + 108) << 32);
+}
+
+static int e4_name_eq(const UINT8 *p, UINT8 nlen, const char *s) {
+    UINT32 i = 0;
+    for (; i < nlen; i++) { if (s[i] == 0 || (char)p[i] != s[i]) return 0; }
+    return s[i] == 0;
+}
+
+/* Find `name` in directory inode; return child inode number or 0. */
+static UINT32 e4_dir_lookup(e4_ctx *c, const UINT8 *dir_inode, const char *name) {
+    UINT64 size = e4_isize(dir_inode);
+    UINT64 nblocks = (size + c->block_size - 1) / c->block_size;
+    for (UINT64 b = 0; b < nblocks; b++) {
+        UINT64 pbn = e4_bmap(c, dir_inode, b);
+        if (!pbn) continue;
+        if (EFI_ERROR(e4_read_block(c, pbn, c->scratch))) continue;
+        UINT32 off = 0;
+        while (off + 8 <= c->block_size) {
+            UINT32 child = e4_rd32(c->scratch + off + 0);
+            UINT16 rlen  = e4_rd16(c->scratch + off + 4);
+            UINT8  nlen  = c->scratch[off + 6];
+            if (rlen < 8) break;             /* corrupt: avoid infinite loop */
+            if (child != 0 && nlen != 0 &&
+                e4_name_eq(c->scratch + off + 8, nlen, name))
+                return child;
+            off += rlen;
+        }
+    }
+    return 0;
+}
+
+/* Resolve an absolute path to an inode number (0 on failure). */
+static UINT32 e4_resolve(e4_ctx *c, const char *path, UINT8 *inode_out) {
+    UINT32 ino = E4_ROOT_INO;
+    if (EFI_ERROR(e4_read_inode(c, ino, inode_out))) return 0;
+    const char *p = path;
+    while (*p == '/') p++;
+    char comp[256];
+    while (*p) {
+        UINT32 ci = 0;
+        while (*p && *p != '/' && ci < sizeof(comp) - 1) comp[ci++] = *p++;
+        comp[ci] = 0;
+        while (*p == '/') p++;
+        if (ci == 0) continue;
+        UINT32 child = e4_dir_lookup(c, inode_out, comp);
+        if (!child) return 0;
+        if (EFI_ERROR(e4_read_inode(c, child, inode_out))) return 0;
+        ino = child;
+    }
+    return ino;
+}
+
+/* Identify an ext4 partition among all EFI_BLOCK_IO handles and load
+ * /boot/kernel.elf into a freshly allocated pool buffer. */
+static EFI_STATUS try_load_kernel_ext4(VOID **out_buf, UINTN *out_size) {
+    EFI_GUID blk_guid = BLOCK_IO_PROTOCOL;
+    EFI_HANDLE *handles = NULL;
+    UINTN nhandles = 0;
+    EFI_STATUS st = uefi_call_wrapper(BS->LocateHandleBuffer, 5, ByProtocol,
+                                      &blk_guid, NULL, &nhandles, &handles);
+    if (EFI_ERROR(st) || !handles) return EFI_NOT_FOUND;
+
+    EFI_STATUS result = EFI_NOT_FOUND;
+    for (UINTN h = 0; h < nhandles && EFI_ERROR(result); h++) {
+        EFI_BLOCK_IO_PROTOCOL *blk = NULL;
+        if (EFI_ERROR(uefi_call_wrapper(BS->HandleProtocol, 3, handles[h],
+                                        &blk_guid, (VOID **)&blk)))
+            continue;
+        if (!blk || !blk->Media || !blk->Media->MediaPresent) continue;
+        UINT32 dev_bs = blk->Media->BlockSize;
+        if (dev_bs == 0 || dev_bs > 4096) continue;
+
+        /* Read enough to cover the superblock at byte offset 1024. */
+        UINT32 probe_bytes = dev_bs > 2048 ? dev_bs : 2048;
+        UINT8 *probe = NULL;
+        if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                        probe_bytes, (VOID **)&probe)))
+            continue;
+        UINT32 probe_sectors = probe_bytes / dev_bs;
+        if (EFI_ERROR(uefi_call_wrapper(blk->ReadBlocks, 5, blk,
+                                        blk->Media->MediaId, (EFI_LBA)0,
+                                        (UINTN)probe_bytes, probe))) {
+            uefi_call_wrapper(BS->FreePool, 1, probe);
+            continue;
+        }
+        (void)probe_sectors;
+        const UINT8 *sb = probe + 1024;
+        if (e4_rd16(sb + 56) != E4_SUPER_MAGIC) {
+            uefi_call_wrapper(BS->FreePool, 1, probe);
+            continue;
+        }
+
+        /* Build the context from the superblock. */
+        e4_ctx c;
+        c.blk = blk;
+        c.media_id = blk->Media->MediaId;
+        c.dev_bs = dev_bs;
+        c.block_size = 1024u << e4_rd32(sb + 24);          /* s_log_block_size */
+        c.inodes_per_group = e4_rd32(sb + 40);
+        c.inode_size = e4_rd16(sb + 88);
+        if (c.inode_size < 128) c.inode_size = 128;
+        UINT32 incompat = e4_rd32(sb + 96);
+        c.desc_size = 32;
+        if (incompat & E4_INCOMPAT_64BIT) {
+            UINT16 ds = e4_rd16(sb + 254);
+            c.desc_size = ds >= 32 ? ds : 32;
+        }
+        UINT32 first_data = e4_rd32(sb + 20);              /* s_first_data_block */
+        if (c.block_size == 0 || c.dev_bs == 0 ||
+            c.block_size < c.dev_bs || (c.block_size % c.dev_bs) != 0) {
+            uefi_call_wrapper(BS->FreePool, 1, probe);
+            continue;
+        }
+        c.spb = c.block_size / c.dev_bs;
+        c.gdt_block = (UINT64)first_data + 1;
+        uefi_call_wrapper(BS->FreePool, 1, probe);
+
+        /* Allocate the two reusable ext4-block scratch buffers. */
+        c.scratch = NULL; c.node = NULL;
+        if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                        c.block_size, (VOID **)&c.scratch)) ||
+            EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                        c.block_size, (VOID **)&c.node))) {
+            if (c.scratch) uefi_call_wrapper(BS->FreePool, 1, c.scratch);
+            if (c.node)    uefi_call_wrapper(BS->FreePool, 1, c.node);
+            continue;
+        }
+
+        /* Resolve the kernel from its single canonical location. */
+        static const char *paths[] = { "/boot/kernel.elf" };
+        UINT8 inode[256];
+        for (UINTN pi = 0; pi < sizeof(paths) / sizeof(paths[0]); pi++) {
+            UINT32 ino = e4_resolve(&c, paths[pi], inode);
+            if (!ino) continue;
+            UINT64 size = e4_isize(inode);
+            if (size == 0 || size > 0x10000000ULL) continue;   /* sanity: <256MB */
+
+            /* Allocate rounded up to whole blocks so bulk reads of full blocks
+             * never overflow (the ELF loader only consumes `size` bytes). */
+            UINT64 nblk = (size + c.block_size - 1) / c.block_size;
+            UINTN  alloc = (UINTN)(nblk * c.block_size);
+            VOID *kbuf = NULL;
+            if (EFI_ERROR(uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                            alloc, &kbuf)) || !kbuf)
+                continue;
+            /* Read contiguous physical block runs in a single ReadBlocks call
+             * instead of one transfer per 4 KB block — turns a ~1.3 MB kernel
+             * load from ~300 USB transactions into a handful. */
+            int ok = 1;
+            UINT64 b = 0;
+            while (b < nblk) {
+                UINT8 *dst = (UINT8 *)kbuf + b * c.block_size;
+                UINT64 pbn = e4_bmap(&c, inode, b);
+                if (!pbn) {                                  /* sparse hole */
+                    for (UINT64 z = 0; z < c.block_size; z++) dst[z] = 0;
+                    b++;
+                    continue;
+                }
+                UINT64 run = 1;
+                while (b + run < nblk && run < 1024) {        /* cap run at 4 MB */
+                    if (e4_bmap(&c, inode, b + run) != pbn + run) break;
+                    run++;
+                }
+                if (EFI_ERROR(e4_read_dev(&c, pbn * c.spb,
+                                          (UINT32)(run * c.spb), dst))) { ok = 0; break; }
+                b += run;
+            }
+            if (!ok) { uefi_call_wrapper(BS->FreePool, 1, kbuf); continue; }
+
+            *out_buf = kbuf;
+            *out_size = (UINTN)size;
+            result = EFI_SUCCESS;
+            break;
+        }
+
+        uefi_call_wrapper(BS->FreePool, 1, c.scratch);
+        uefi_call_wrapper(BS->FreePool, 1, c.node);
+    }
+
+    uefi_call_wrapper(BS->FreePool, 1, handles);
+    return result;
+}
+
 // UEFI bootloader entry point
 __attribute__((no_stack_protector))
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
@@ -791,15 +1124,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     boot_init_canary();   /* randomise __stack_chk_guard before any other call */
 
     EFI_STATUS status;
-    EFI_LOADED_IMAGE *loaded_image;
-    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *file_system;
-    EFI_FILE_PROTOCOL *root_dir, *kernel_file;
-    EFI_FILE_INFO *file_info;
-    UINTN info_size, kernel_size;
+    UINTN kernel_size;
     VOID *kernel_buffer;
     Elf64_Ehdr *elf_header;
     Elf64_Phdr *program_headers;
-    kernel_entry_t kernel_entry;
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
     
     // Initialize GNU-EFI library
@@ -817,43 +1145,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     //dump_memory_map();
     //for (;;) {}
     
-    // Get loaded image protocol
-    status = uefi_call_wrapper(BS->HandleProtocol, 3, ImageHandle, 
-                               &LoadedImageProtocol, (VOID**)&loaded_image);
-    if (EFI_ERROR(status)) {
-        Print(L"ERROR: Could not get loaded image protocol: %r\r\n", status);
-        Print(L"System halted. Press any key to continue...\r\n");
-        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
-        EFI_INPUT_KEY key;
-        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
-        return status;
-    }
-    
-    // Get file system protocol
-    status = uefi_call_wrapper(BS->HandleProtocol, 3, loaded_image->DeviceHandle, 
-                               &FileSystemProtocol, (VOID**)&file_system);
-    if (EFI_ERROR(status)) {
-        Print(L"ERROR: Could not get file system protocol: %r\r\n", status);
-        Print(L"System halted. Press any key to continue...\r\n");
-        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
-        EFI_INPUT_KEY key;
-        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
-        return status;
-    }
-    
-    // Open root directory
-    status = uefi_call_wrapper(file_system->OpenVolume, 2, file_system, &root_dir);
-    if (EFI_ERROR(status)) {
-        Print(L"ERROR: Could not open root directory: %r\r\n", status);
-        Print(L"System halted. Press any key to continue...\r\n");
-        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
-        EFI_INPUT_KEY key;
-        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
-        return status;
-    }
-    
-    Print(L"Loading kernel.elf...\r\n");
-    
+    Print(L"Loading /boot/kernel.elf from ext4 root...\r\n");
+
     // Get Graphics Output Protocol for framebuffer info
     status = uefi_call_wrapper(BS->LocateProtocol, 3, &GraphicsOutputProtocol, NULL, (VOID**)&gop);
     if (EFI_ERROR(status)) {
@@ -986,88 +1279,29 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         Print(L"Resolution: %dx%d, BPP: %d\r\n", g_boot_info.fb_info.horizontal_resolution, g_boot_info.fb_info.vertical_resolution, g_boot_info.fb_info.bytes_per_pixel);
     }
     
-    // Open kernel file (now ELF format)
-    status = uefi_call_wrapper(root_dir->Open, 5, root_dir, &kernel_file, 
-                               L"kernel.elf", EFI_FILE_MODE_READ, 0);
-    if (EFI_ERROR(status)) {
-        Print(L"ERROR: Could not open kernel.elf: %r\r\n", status);
-        uefi_call_wrapper(root_dir->Close, 1, root_dir);
+    /* Load the kernel directly from the ext4 root partition (single GPT USB
+     * disk).  This is the only supported path — there is no FAT fallback. */
+    kernel_buffer = NULL;
+    kernel_size = 0;
+    status = try_load_kernel_ext4(&kernel_buffer, &kernel_size);
+    if (EFI_ERROR(status) || !kernel_buffer) {
+        Print(L"ERROR: Could not load /boot/kernel.elf from ext4 root: %r\r\n", status);
+        serial_puts("boot: FATAL - ext4 kernel load failed (no FAT fallback)\n");
         Print(L"System halted. Press any key to continue...\r\n");
         uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
         EFI_INPUT_KEY key;
         uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
-        return status;
+        return EFI_ERROR(status) ? status : EFI_NOT_FOUND;
     }
-    
-    // Get file size
-    info_size = sizeof(EFI_FILE_INFO) + 256;
-    status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, info_size, (VOID**)&file_info);
-    if (EFI_ERROR(status)) {
-        Print(L"ERROR: Could not allocate memory for file info: %r\r\n", status);
-        uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
-        uefi_call_wrapper(root_dir->Close, 1, root_dir);
-        Print(L"System halted. Press any key to continue...\r\n");
-        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
-        EFI_INPUT_KEY key;
-        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
-        return status;
-    }
-    
-    status = uefi_call_wrapper(kernel_file->GetInfo, 4, kernel_file, 
-                               &GenericFileInfo, &info_size, file_info);
-    if (EFI_ERROR(status)) {
-        Print(L"ERROR: Could not get file info: %r\r\n", status);
-        uefi_call_wrapper(BS->FreePool, 1, file_info);
-        uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
-        uefi_call_wrapper(root_dir->Close, 1, root_dir);
-        Print(L"System halted. Press any key to continue...\r\n");
-        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
-        EFI_INPUT_KEY key;
-        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
-        return status;
-    }
-    
-    kernel_size = (UINTN)file_info->FileSize;
-    Print(L"ELF kernel size: %d bytes\r\n", kernel_size);
-    
-    // Allocate memory for the entire ELF file
-    status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, kernel_size, &kernel_buffer);
-    if (EFI_ERROR(status)) {
-        Print(L"ERROR: Could not allocate memory for ELF file: %r\r\n", status);
-        uefi_call_wrapper(BS->FreePool, 1, file_info);
-        uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
-        uefi_call_wrapper(root_dir->Close, 1, root_dir);
-        Print(L"System halted. Press any key to continue...\r\n");
-        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
-        EFI_INPUT_KEY key;
-        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
-        return status;
-    }
-    
-    // Read entire ELF file into memory
-    status = uefi_call_wrapper(kernel_file->Read, 3, kernel_file, &kernel_size, kernel_buffer);
-    if (EFI_ERROR(status)) {
-        Print(L"ERROR: Could not read kernel file: %r\r\n", status);
-        uefi_call_wrapper(BS->FreePool, 1, kernel_buffer);
-        uefi_call_wrapper(BS->FreePool, 1, file_info);
-        uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
-        uefi_call_wrapper(root_dir->Close, 1, root_dir);
-        Print(L"System halted. Press any key to continue...\r\n");
-        uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
-        EFI_INPUT_KEY key;
-        uefi_call_wrapper(ST->ConIn->ReadKeyStroke, 2, ST->ConIn, &key);
-        return status;
-    }
-    
+    Print(L"Loaded kernel from ext4 root partition (%d bytes)\r\n", (int)kernel_size);
+    serial_puts("boot: kernel loaded from ext4 root partition\n");
+
     // Parse ELF header
     elf_header = (Elf64_Ehdr*)kernel_buffer;
     
     if (!validate_elf64(elf_header)) {
         Print(L"ERROR: Invalid ELF64 file\r\n");
         uefi_call_wrapper(BS->FreePool, 1, kernel_buffer);
-        uefi_call_wrapper(BS->FreePool, 1, file_info);
-        uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
-        uefi_call_wrapper(root_dir->Close, 1, root_dir);
         Print(L"System halted. Press any key to continue...\r\n");
         uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
         EFI_INPUT_KEY key;
@@ -1103,9 +1337,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             if (EFI_ERROR(status)) {
                 Print(L"ERROR: Could not allocate memory: %r\r\n", status);
                 uefi_call_wrapper(BS->FreePool, 1, kernel_buffer);
-                uefi_call_wrapper(BS->FreePool, 1, file_info);
-                uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
-                uefi_call_wrapper(root_dir->Close, 1, root_dir);
                 Print(L"System halted. Press any key to continue...\r\n");
                 uefi_call_wrapper(ST->ConIn->Reset, 2, ST->ConIn, FALSE);
                 EFI_INPUT_KEY key;
@@ -1146,11 +1377,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     Print(L"Kernel loaded successfully!\r\n");
     Print(L"Setting up paging and exiting UEFI...\r\n");
     
-    // Clean up
-    uefi_call_wrapper(BS->FreePool, 1, file_info);
-    uefi_call_wrapper(kernel_file->Close, 1, kernel_file);
-    uefi_call_wrapper(root_dir->Close, 1, root_dir);
-    
+    // NOTE: deliberately do NOT free kernel_buffer here.  elf_header points
+    // into it and elf_header->e_entry is dereferenced below (after
+    // ExitBootServices) to jump to the kernel; freeing it would let the pool
+    // be reused and zero the entry point.  ExitBootServices follows almost
+    // immediately and the kernel reclaims all memory, so the buffer is not
+    // leaked in any meaningful sense.
+
     // Get memory map for exit boot services
     UINTN memory_map_size = 0;
     EFI_MEMORY_DESCRIPTOR *memory_map = NULL;

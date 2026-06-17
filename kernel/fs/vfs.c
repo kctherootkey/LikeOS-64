@@ -81,6 +81,90 @@ int vfs_chdir(const char* path) {
     return g_root_ops->chdir(path);
 }
 
+/* Pick the filesystem that owns a path: devfs for /dev*, otherwise the root.
+ * (Single-root today; a future mount table would resolve the mountpoint here,
+ * leaving every caller below unchanged.) */
+static const vfs_ops_t* vfs_ops_for_path(const char* path) {
+    return vfs_is_dev_path(path) ? g_dev_ops : g_root_ops;
+}
+
+/* ---- UNIX-semantics wrappers ------------------------------------------------
+ * Each dispatches to the owning filesystem's op and supplies a legacy fallback
+ * when that op is NULL, so the syscall layer stays filesystem-agnostic. */
+
+int vfs_lstat(const char* path, struct kstat* st) {
+    const vfs_ops_t* o = vfs_ops_for_path(path);
+    if (!o) return ST_UNSUPPORTED;
+    if (o->lstat) return o->lstat(path, st);
+    if (o->stat)  return o->stat(path, st);   /* no symlinks: lstat == stat */
+    return ST_UNSUPPORTED;
+}
+
+int vfs_symlink(const char* target, const char* linkpath) {
+    const vfs_ops_t* o = vfs_ops_for_path(linkpath);
+    if (!o || !o->symlink) return ST_UNSUPPORTED;
+    return o->symlink(target, linkpath);
+}
+
+int vfs_readlink(const char* path, char* buf, unsigned long bufsz) {
+    const vfs_ops_t* o = vfs_ops_for_path(path);
+    if (!o || !o->readlink) return ST_INVALID;   /* not a symlink here */
+    return o->readlink(path, buf, bufsz);
+}
+
+int vfs_link(const char* oldpath, const char* newpath) {
+    /* A hard link's two ends share an inode, so both live on one filesystem;
+     * route by the new name's owning fs. */
+    const vfs_ops_t* o = vfs_ops_for_path(newpath);
+    if (!o || !o->link) return ST_UNSUPPORTED;
+    return o->link(oldpath, newpath);
+}
+
+int vfs_chmod(const char* path, unsigned int mode) {
+    const vfs_ops_t* o = vfs_ops_for_path(path);
+    if (!o) return ST_UNSUPPORTED;
+    if (!o->chmod) return ST_OK;                 /* fs has no permission bits */
+    return o->chmod(path, mode);
+}
+
+int vfs_chown(const char* path, int uid, int gid) {
+    const vfs_ops_t* o = vfs_ops_for_path(path);
+    if (!o) return ST_UNSUPPORTED;
+    if (!o->chown) return ST_OK;                 /* fs has no ownership */
+    return o->chown(path, uid, gid);
+}
+
+int vfs_fchmod(vfs_file_t* f, unsigned int mode) {
+    if (!f || !f->ops) return ST_INVALID;
+    if (!f->ops->fchmod) return ST_OK;
+    return f->ops->fchmod(f, mode);
+}
+
+int vfs_fchown(vfs_file_t* f, int uid, int gid) {
+    if (!f || !f->ops) return ST_INVALID;
+    if (!f->ops->fchown) return ST_OK;
+    return f->ops->fchown(f, uid, gid);
+}
+
+int vfs_utimensat(const char* path, int64_t mtime_sec, long mtime_nsec) {
+    const vfs_ops_t* o = vfs_ops_for_path(path);
+    if (!o) return ST_UNSUPPORTED;
+    if (!o->utimensat) return ST_OK;             /* fs manages times itself */
+    return o->utimensat(path, mtime_sec, mtime_nsec);
+}
+
+int vfs_statfs(const char* path, struct vfs_statfs* out) {
+    const vfs_ops_t* o = vfs_ops_for_path(path);
+    if (!o || !o->statfs) return ST_UNSUPPORTED;
+    return o->statfs(out);
+}
+
+int vfs_fstatfs(vfs_file_t* f, struct vfs_statfs* out) {
+    if (!f || !f->ops) return ST_INVALID;
+    if (!f->ops->statfs) return ST_UNSUPPORTED;
+    return f->ops->statfs(out);
+}
+
 long vfs_read(vfs_file_t* f, void* buf, long bytes) { if (!f || !f->ops || !f->ops->read) return ST_INVALID; return f->ops->read(f, buf, bytes); }
 long vfs_write(vfs_file_t* f, const void* buf, long bytes) { if (!f || !f->ops || !f->ops->write) return ST_INVALID; return f->ops->write(f, buf, bytes); }
 long vfs_seek(vfs_file_t* f, long offset, int whence) { if (!f || !f->ops || !f->ops->seek) return -1; return f->ops->seek(f, offset, whence); }

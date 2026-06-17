@@ -2616,7 +2616,42 @@ static int fat32_close(vfs_file_t *f) {
     return r;
 }
 
-static const vfs_ops_t fat32_vfs_ops = { fat32_open, fat32_stat_vfs, fat32_read, fat32_write, fat32_seek, fat32_readdir, fat32_truncate, fat32_unlink, fat32_rename, fat32_mkdir, fat32_rmdir, fat32_chdir, fat32_close, fat32_release_locks_for_task };
+/* fsync: flush this file's cached data pages and dirty inode metadata. */
+static int fat32_fsync(vfs_file_t *f) {
+    if (!f) return 0;
+    fat32_file_t *ff = (fat32_file_t *)f->fs_private;
+    if (ff && ff->start_cluster >= 2) {
+        pagecache_flush_file(ff->start_cluster);
+        if (ff->inode)
+            icache_flush((ic_inode_t *)ff->inode);
+    }
+    return 0;
+}
+
+/* Fill the generic statfs struct from the FAT32-native one. */
+static int fat32_statfs_op(struct vfs_statfs *out) {
+    if (!out) return ST_INVALID;
+    fat32_statfs_t k;
+    mm_memset(&k, 0, sizeof(k));
+    if (fat32_get_statfs(&k) != 0) return ST_IO;
+    out->f_type = k.f_type; out->f_bsize = k.f_bsize; out->f_frsize = k.f_frsize;
+    out->f_blocks = k.f_blocks; out->f_bfree = k.f_bfree; out->f_bavail = k.f_bavail;
+    out->f_files = k.f_files; out->f_ffree = k.f_ffree; out->f_fsid = k.f_fsid;
+    out->f_namelen = k.f_namelen;
+    return ST_OK;
+}
+
+/* FAT32 has no symlinks, hard links, permission bits or ownership, so those
+ * ops stay NULL — the vfs_* wrappers then apply the legacy fallbacks (chmod/
+ * chown succeed silently, symlink/link report unsupported, lstat == stat). */
+static const vfs_ops_t fat32_vfs_ops = {
+    fat32_open, fat32_stat_vfs, fat32_read, fat32_write, fat32_seek, fat32_readdir,
+    fat32_truncate, fat32_unlink, fat32_rename, fat32_mkdir, fat32_rmdir, fat32_chdir,
+    fat32_close, fat32_release_locks_for_task, fat32_fsync,
+    /* lstat */ 0, /* symlink */ 0, /* readlink */ 0, /* link */ 0,
+    /* chmod */ 0, /* chown */ 0, /* fchmod */ 0, /* fchown */ 0,
+    fat32_utimensat, fat32_statfs_op,
+};
 
 static int fat32_resolve_parent(unsigned long start_cluster, const char *path,
     unsigned long *parent_cluster, char *name_out, unsigned name_out_len)

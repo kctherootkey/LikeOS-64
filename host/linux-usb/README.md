@@ -5,12 +5,12 @@ A minimal Debian-based environment that boots from USB, starts X11, and immediat
 ## What it does
 - Boots via GRUB EFI into a lightweight Debian userspace.
 - Skips the shell and auto-starts an X11 session on tty1.
-- Runs QEMU with `-enable-kvm`, full-screen, loading `LikeOS-64.iso` bundled on the stick.
+- Runs QEMU with `-enable-kvm`, full-screen, loading the `likeos-ext4.img` GPT disk bundled on the stick.
 
 ## Build
 
 ```bash
-make iso              # builds build/LikeOS-64.iso
+make                  # builds build/likeos-ext4.img (the ext4 GPT disk)
 make linux-usb        # builds build/linux-usb/linux-usb.img
 ```
 
@@ -30,7 +30,7 @@ This runs `dd` to copy the prepared image. **All data on the device is overwritt
 - User `likeos` (passwordless sudo) owns the X session.
 - Systemd unit `likeos-autostart.service` launches `/usr/local/bin/likeos-startx` on tty1.
 - `.xinitrc` runs `/usr/local/bin/likeos-qemu` which starts QEMU full-screen.
-- The LikeOS ISO is copied into `/usr/local/share/likeos/LikeOS-64.iso` inside the image; override at runtime with `HOBBY_ISO=/path/to.iso`.
+- The LikeOS ext4 GPT disk is copied into `/usr/local/share/likeos/likeos-ext4.img` inside the image; override at runtime with `HOBBY_DISK_IMG=/path/to.img`.
 
 ## Requirements
 Host build tools: `debootstrap`, `parted`, `gdisk`, `qemu-utils`, `grub-efi-amd64-bin`, `rsync`, plus the existing LikeOS build deps. Install via `make deps` on Debian/Ubuntu.

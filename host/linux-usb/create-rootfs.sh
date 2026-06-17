@@ -10,8 +10,7 @@ ROOTFS_DIR="$BUILD_DIR/rootfs"
 MNT_ROOT="$BUILD_DIR/mnt-root"
 MNT_EFI="$BUILD_DIR/mnt-efi"
 IMAGE_PATH="$BUILD_DIR/linux-usb.img"
-ISO_PATH="$PROJECT_ROOT/build/LikeOS-64.iso"
-DATA_IMG_PATH="$PROJECT_ROOT/build/msdata.img"
+DISK_PATH="$PROJECT_ROOT/build/likeos-ext4.img"
 DEBIAN_CODENAME="bookworm"
 IMAGE_SIZE_MB=${IMAGE_SIZE_MB:-}
 EFI_SIZE_MB=${EFI_SIZE_MB:-256}
@@ -25,7 +24,7 @@ usage() {
     cat <<EOF
 Usage: IMAGE_SIZE_MB=4096 EFI_SIZE_MB=512 DEBIAN_MIRROR=http://deb.debian.org/debian $0
 Builds: $IMAGE_PATH (bootable USB image)
-Requires: build/LikeOS-64.iso to exist.
+Requires: build/likeos-ext4.img to exist (build it first with: make).
 EOF
 }
 
@@ -36,12 +35,8 @@ for tool in "${REQUIRED_TOOLS[@]}"; do
     fi
 done
 
-if [ ! -f "$ISO_PATH" ]; then
-    echo "LikeOS ISO missing at $ISO_PATH. Build it first (make iso)." >&2
-    exit 1
-fi
-if [ ! -f "$DATA_IMG_PATH" ]; then
-    echo "LikeOS data image missing at $DATA_IMG_PATH. Build it first (make data-image)." >&2
+if [ ! -f "$DISK_PATH" ]; then
+    echo "LikeOS ext4 GPT disk missing at $DISK_PATH. Build it first (make)." >&2
     exit 1
 fi
 
@@ -73,11 +68,10 @@ if [ ! -f "$ROOTFS_DIR/.bootstrapped" ]; then
     sudo touch "$ROOTFS_DIR/.bootstrapped"
 fi
 
-# 2) Inject overlay files and LikeOS ISO
+# 2) Inject overlay files and the LikeOS ext4 GPT disk
 sudo rsync -a "$OVERLAY_DIR/" "$ROOTFS_DIR/"
 sudo mkdir -p "$ROOTFS_DIR/usr/local/share/likeos"
-sudo cp "$ISO_PATH" "$ROOTFS_DIR/usr/local/share/likeos/LikeOS-64.iso"
-sudo cp "$DATA_IMG_PATH" "$ROOTFS_DIR/usr/local/share/likeos/msdata.img"
+sudo cp "$DISK_PATH" "$ROOTFS_DIR/usr/local/share/likeos/likeos-ext4.img"
 
 # 3) Configure inside chroot
 sudo chroot "$ROOTFS_DIR" /bin/bash <<'EOF'
@@ -133,13 +127,13 @@ EOF
 # 3b) Compute minimal image size if not provided
 if [ -z "${IMAGE_SIZE_MB}" ]; then
     ROOT_MB=$(sudo du -s --block-size=1M "$ROOTFS_DIR" | awk '{print $1}')
-    ISO_MB=$(du -s --block-size=1M "$ISO_PATH" | awk '{print $1}')
-    CALC_MB=$((ROOT_MB + ISO_MB + EFI_SIZE_MB + MARGIN_MB))
+    DISK_MB=$(du -s --block-size=1M "$DISK_PATH" | awk '{print $1}')
+    CALC_MB=$((ROOT_MB + DISK_MB + EFI_SIZE_MB + MARGIN_MB))
     if [ $CALC_MB -lt $MIN_IMAGE_MB ]; then
         CALC_MB=$MIN_IMAGE_MB
     fi
     IMAGE_SIZE_MB=$CALC_MB
-    echo "Auto-sizing image: root=${ROOT_MB}MB iso=${ISO_MB}MB efi=${EFI_SIZE_MB}MB margin=${MARGIN_MB}MB -> IMAGE_SIZE_MB=${IMAGE_SIZE_MB}"
+    echo "Auto-sizing image: root=${ROOT_MB}MB disk=${DISK_MB}MB efi=${EFI_SIZE_MB}MB margin=${MARGIN_MB}MB -> IMAGE_SIZE_MB=${IMAGE_SIZE_MB}"
 else
     echo "Using provided IMAGE_SIZE_MB=${IMAGE_SIZE_MB}"
 fi

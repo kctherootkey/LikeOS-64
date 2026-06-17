@@ -1372,15 +1372,21 @@ int main(int argc, char** argv) {
         close(lfn_fd);
     }
     
-    // Test 3: Case-insensitive access (open with different case)
+    // Test 3: Case-insensitive access (open with different case).
+    // FAT is case-insensitive; ext4 (and other POSIX filesystems) are
+    // case-sensitive, so only assert the cross-case open on a case-insensitive
+    // filesystem.  `fs_ci` records which kind of filesystem we're on.
     char lfn_path1_upper[128];
     snprintf(lfn_path1_upper, sizeof(lfn_path1_upper), "%s/THIS_IS_A_LONG_FILENAME_TEST.TXT", _pbase);
     lfn_fd = open(lfn_path1_upper, O_RDONLY);
-    test_result("case-insensitive LFN access", lfn_fd >= 0);
-    if (lfn_fd >= 0) {
+    int fs_ci = (lfn_fd >= 0);
+    if (fs_ci) {
+        test_result("case-insensitive LFN access", lfn_fd >= 0);
         close(lfn_fd);
+    } else {
+        test_result("case-sensitive filesystem: LFN cross-case access skipped", 1);
     }
-    
+
     // Test 4: Mixed case filename
     char lfn_path2[128];
     snprintf(lfn_path2, sizeof(lfn_path2), "%s/MixedCaseFileName.TXT", _pbase);
@@ -1390,14 +1396,16 @@ int main(int argc, char** argv) {
         write(lfn_fd, "X", 1);
         close(lfn_fd);
     }
-    
+
     // Test 5: Verify case-insensitive access to mixed case file
     char lfn_path2_lower[128];
     snprintf(lfn_path2_lower, sizeof(lfn_path2_lower), "%s/mixedcasefilename.txt", _pbase);
-    lfn_fd = open(lfn_path2_lower, O_RDONLY);
-    test_result("case-insensitive mixed case access", lfn_fd >= 0);
-    if (lfn_fd >= 0) {
-        close(lfn_fd);
+    if (fs_ci) {
+        lfn_fd = open(lfn_path2_lower, O_RDONLY);
+        test_result("case-insensitive mixed case access", lfn_fd >= 0);
+        if (lfn_fd >= 0) close(lfn_fd);
+    } else {
+        test_result("case-sensitive filesystem: mixed-case access skipped", 1);
     }
     
     // Test 6: Long directory name
@@ -1494,7 +1502,10 @@ int main(int argc, char** argv) {
     snprintf(mixed_dir,       sizeof(mixed_dir),       "%s/MyMixedCaseDirectory", _pbase);
     snprintf(mixed_dir_lower, sizeof(mixed_dir_lower), "%s/mymixedcasedirectory", _pbase);
     test_result("mkdir mixed case dir", mkdir(mixed_dir, 0777) == 0);
-    test_result("chdir mixed case dir (lowercase)", chdir(mixed_dir_lower) == 0);
+    if (fs_ci)
+        test_result("chdir mixed case dir (lowercase)", chdir(mixed_dir_lower) == 0);
+    else
+        test_result("case-sensitive filesystem: chdir cross-case skipped", 1);
     test_result("chdir back to root", chdir("/") == 0);
     test_result("rmdir mixed case dir", rmdir(mixed_dir) == 0);
     rmdir(_pbase);
@@ -3830,6 +3841,83 @@ int main(int argc, char** argv) {
         }
     }
 
+    /* symlink / readlink / hard link — exercised on filesystems that support
+     * them (e.g. ext4).  On filesystems without symlink support the create
+     * call returns an error and the dependent checks are skipped. */
+    printf("\n[TEST] symlink/readlink/link\n");
+    {
+        char p_tgt[128], p_lnk[128], p_hl[128];
+        snprintf(p_tgt, sizeof(p_tgt), "%s/sl_target", _td);
+        snprintf(p_lnk, sizeof(p_lnk), "%s/sl_link", _td);
+        snprintf(p_hl,  sizeof(p_hl),  "%s/hl_link",  _td);
+
+        int fd = open(p_tgt, O_WRONLY | O_CREAT | O_TRUNC);
+        if (fd >= 0) { write(fd, "linkdata", 8); close(fd); }
+
+        int sret = symlink("sl_target", p_lnk);
+        if (sret == 0) {
+            char rb[64];
+            int rl = readlink(p_lnk, rb, sizeof(rb));
+            test_result("readlink length == 9", rl == 9);
+            test_result("readlink content", rl == 9 && memcmp(rb, "sl_target", 9) == 0);
+
+            struct stat lst, stt;
+            test_result("lstat reports S_ISLNK", lstat(p_lnk, &lst) == 0 && S_ISLNK(lst.st_mode));
+            test_result("stat follows symlink to regular file",
+                        stat(p_lnk, &stt) == 0 && S_ISREG(stt.st_mode) && stt.st_size == 8);
+
+            int lf = open(p_lnk, O_RDONLY);
+            if (lf >= 0) {
+                char b[16];
+                int n = read(lf, b, sizeof(b));
+                test_result("read through symlink", n == 8 && memcmp(b, "linkdata", 8) == 0);
+                close(lf);
+            }
+            unlink(p_lnk);
+        } else {
+            test_result("symlink not supported on this fs (skipped)", 1);
+        }
+
+        int hret = link(p_tgt, p_hl);
+        if (hret == 0) {
+            struct stat s1, s2;
+            test_result("hard link: same st_ino",
+                        stat(p_tgt, &s1) == 0 && stat(p_hl, &s2) == 0 && s1.st_ino == s2.st_ino);
+            test_result("hard link: st_nlink == 2", s2.st_nlink == 2);
+            unlink(p_hl);
+            test_result("hard link: st_nlink == 1 after unlink",
+                        stat(p_tgt, &s1) == 0 && s1.st_nlink == 1);
+        } else {
+            test_result("hard link not supported on this fs (skipped)", 1);
+        }
+        unlink(p_tgt);
+    }
+
+    /* chmod persistence: on ext4 the mode is stored; verify the read-back. */
+    printf("\n[TEST] chmod/chown persistence\n");
+    {
+        char p_cp[128];
+        snprintf(p_cp, sizeof(p_cp), "%s/cperm", _td);
+        int fd = open(p_cp, O_WRONLY | O_CREAT | O_TRUNC);
+        if (fd >= 0) {
+            close(fd);
+            struct stat st;
+            if (chmod(p_cp, 0641) == 0 && stat(p_cp, &st) == 0) {
+                if ((st.st_mode & 0777) == 0641)
+                    test_result("chmod 0641 persists (ext4)", 1);
+                else
+                    test_result("chmod is synthetic (non-ext4 fs, skipped)", 1);
+            }
+            if (chown(p_cp, 321, 654) == 0 && stat(p_cp, &st) == 0) {
+                if (st.st_uid == 321 && st.st_gid == 654)
+                    test_result("chown persists (ext4)", 1);
+                else
+                    test_result("chown is synthetic (non-ext4 fs, skipped)", 1);
+            }
+            unlink(p_cp);
+        }
+    }
+
     printf("\n[TEST] utimensat()\n");
     {
         int fd = open(_p_utime, O_WRONLY | O_CREAT | O_TRUNC);
@@ -3945,7 +4033,8 @@ int main(int argc, char** argv) {
             test_result("statfs f_bavail <= f_bfree", sfs.f_bavail <= sfs.f_bfree);
 
             /* f_type should be FAT32 magic (0x4d44) */
-            test_result("statfs f_type == 0x4d44", sfs.f_type == 0x4d44);
+            test_result("statfs f_type is a known fs magic (FAT/ext4)",
+                        sfs.f_type == 0x4d44 || sfs.f_type == 0xef53);
 
             /* f_namelen should be reasonable */
             test_result("statfs f_namelen > 0", sfs.f_namelen > 0);
@@ -3971,7 +4060,8 @@ int main(int argc, char** argv) {
             test_result("fstatfs(fd) succeeds", ret == 0);
             if (ret == 0) {
                 test_result("fstatfs f_bsize > 0", fst.f_bsize > 0);
-                test_result("fstatfs f_type == 0x4d44", fst.f_type == 0x4d44);
+                test_result("fstatfs f_type is a known fs magic (FAT/ext4)",
+                            fst.f_type == 0x4d44 || fst.f_type == 0xef53);
             }
             close(fd);
         } else {

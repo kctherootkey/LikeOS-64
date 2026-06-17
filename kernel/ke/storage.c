@@ -11,6 +11,7 @@
 #include <kernel/fs/pagecache.h>
 #include <kernel/fs/dcache.h>
 #include <kernel/fs/icache.h>
+#include <kernel/fs/ext4.h>
 #include <kernel/uapi/bug.h>
 
 void storage_fs_init(storage_fs_state_t* state) {
@@ -71,6 +72,35 @@ void storage_fs_poll(storage_fs_state_t* state) {
                 /* quiet: ready poll log removed */
             }
             continue;
+        }
+
+        /* Probe ext4 first (the new default root).  ext4_mount returns
+         * ST_NOT_FOUND on a non-ext4 device, in which case we fall through
+         * to the existing FAT32 path unchanged (regression-safe). */
+        static ext4_fs_t s_ext4_root;
+        if (ext4_mount(bdev, &s_ext4_root) == ST_OK) {
+            ext4_vfs_register_root(&s_ext4_root);
+            kprintf("EXT4: mount succeeded on %s (checking signature)\n", bdev->name);
+            pagecache_init();
+            dcache_init();
+            icache_init();
+            vfs_file_t* sf = 0;
+            if (vfs_open("/LIKEOS.SIG", 0, &sf) == ST_OK) {
+                vfs_close(sf);
+                state->signature_found = 1;
+                kprintf("EXT4: signature /LIKEOS.SIG found on %s (root storage selected)\n", bdev->name);
+                if (sysfont_load("/res/Lat15-Fixed16.psf") == 0) {
+                    console_apply_sysfont();
+                }
+                if (cursor_load("/res/left_ptr") == 0) {
+                    mouse_apply_cursor();
+                }
+            } else {
+                kprintf("EXT4: signature not found on %s\n", bdev->name);
+                state->tested_mask |= (1u << bi);
+            }
+            shell_redisplay_prompt();
+            continue;   /* ext4-formatted device handled; skip FAT32 */
         }
 
         fat32_fs_t* fs = &state->fs_instances[bi];

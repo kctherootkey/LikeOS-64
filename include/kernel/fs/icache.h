@@ -37,6 +37,8 @@ struct vfs_superblock;          /* forward — see vfs_sb.h                    *
 
 #define IC_VALID            0x01    // Inode is valid
 #define IC_DIRTY            0x02    // Metadata modified, needs writeback
+#define IC_DEAD             0x04    // Removed from cache while still referenced;
+                                    // freed by the last icache_unref()
 
 // ============================================================================
 // Structures

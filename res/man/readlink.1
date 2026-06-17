@@ -1,0 +1,53 @@
+READLINK(1)                      User Commands                      READLINK(1)
+
+NAME
+       readlink - print resolved symbolic links or canonical file names
+
+SYNOPSIS
+       readlink [OPTION]... FILE...
+
+DESCRIPTION
+       Print the value of a symbolic link or canonical file name.
+
+       -f, --canonicalize
+              canonicalize by following every symlink in every component of
+              the given name recursively; all but the last component must
+              exist
+
+       -e, --canonicalize-existing
+              canonicalize by following every symlink in every component of
+              the given name recursively, all components must exist
+
+       -m, --canonicalize-missing
+              canonicalize by following every symlink in every component of
+              the given name recursively, without requirements on components
+              existence
+
+       -n, --no-newline
+              do not output the trailing delimiter
+
+       -q, --quiet
+
+       -s, --silent
+              suppress most error messages (on by default)
+
+       -v, --verbose
+              report error messages
+
+       -z, --zero
+              end each output line with NUL, not newline
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+EXIT STATUS
+       0      if the link (or canonical name) was printed
+
+       1      if a file could not be read or canonicalized
+
+SEE ALSO
+       readlink(2), ln(1), chmod(1)
+
+LikeOS coreutils                                                   READLINK(1)

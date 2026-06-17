@@ -1306,6 +1306,7 @@ static int run_builtin(int argc, char **argv) {
         printf("External commands (in /bin or /usr/local/bin):\n");
         printf("  ls cat pwd stat clear env more less touch cp mv rm\n");
         printf("  mkdir rmdir uname ps kill find df du hexdump\n");
+        printf("  ln chmod readlink\n");
         printf("  sort uniq cut tr yes true false time\n");
         printf("  grep head tail wc echo printf free uptime dmesg\n");
         printf("  which date sleep strings file top man nano tmux\n");

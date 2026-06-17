@@ -20,7 +20,6 @@
 #include <kernel/ke/smp.h>
 #include <kernel/ke/futex.h>
 #include <kernel/hal/acpi.h>
-#include <kernel/fs/fat32.h>
 #include <kernel/fs/pagecache.h>
 #include <kernel/fs/icache.h>
 #include <kernel/net/net.h>
@@ -889,19 +888,28 @@ static int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf) {
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
     if (!validate_user_ptr(pathname, 1)) return -EFAULT;
-    
+
     // Copy user path to kernel buffer first
     char kpath[VFS_MAX_PATH];
     int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
     if (cret != 0) return cret;
-    
-    if (kpath[0] == '/') {
-        return sys_stat_common(kpath, stat_buf, 0);
-    }
+
+    const char* p = kpath;
     char full[VFS_MAX_PATH];
-    int ret = build_at_path(cur, AT_FDCWD, kpath, full, sizeof(full));
-    if (ret != 0) return ret;
-    return sys_stat_common(full, stat_buf, 0);
+    if (kpath[0] != '/') {
+        int ret = build_at_path(cur, AT_FDCWD, kpath, full, sizeof(full));
+        if (ret != 0) return ret;
+        p = full;
+    }
+    /* lstat must NOT follow a final symlink.  vfs_lstat dispatches to the
+     * filesystem's no-follow stat; on a filesystem without symlinks it
+     * transparently falls back to plain stat. */
+    if (!validate_user_ptr(stat_buf, sizeof(struct kstat))) return -EFAULT;
+    struct kstat st; mm_memset(&st, 0, sizeof(st));
+    int r = vfs_lstat(p, &st);
+    if (r != ST_OK) return (r == ST_NOT_FOUND) ? -ENOENT : -EINVAL;
+    if (copy_to_user((void*)stat_buf, &st, sizeof(st)) != 0) return -EFAULT;
+    return 0;
 }
 
 static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf) {
@@ -1206,18 +1214,29 @@ static int64_t sys_settimeofday(uint64_t tv_ptr, uint64_t tz) {
     return 0;
 }
 
+/* True for descriptors not backed by a real vfs_file_t: the stdio console dup
+ * markers (1-3), pipe ends, and network / UNIX sockets.  These carry no on-disk
+ * metadata, so fchmod/fchown/fsync are no-ops on them — and, importantly, their
+ * "pointer" must never be dereferenced as a vfs_file_t. */
+static int fd_is_special(vfs_file_t* file) {
+    uint64_t marker = (uint64_t)file;
+    if (marker >= 1 && marker <= 3) return 1;
+    if (IS_UNIX_SOCKET_FD(file))    return 1;
+    if (IS_SOCKET_FD(file))         return 1;
+    if (pipe_is_end(file))          return 1;
+    return 0;
+}
+
 static int64_t sys_fsync(uint64_t fd) {
     task_t* cur = sched_current();
     if (!cur) return -EFAULT;
     if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) return -EBADF;
     vfs_file_t* file = cur->fd_table[fd];
-    fat32_file_t* ff = (fat32_file_t*)file->fs_private;
-    if (ff && ff->start_cluster >= 2) {
-        pagecache_flush_file(ff->start_cluster);
-        // Also flush dirty inode metadata (file size, timestamps)
-        if (ff->inode)
-            icache_flush((ic_inode_t *)ff->inode);
-    }
+    if (fd_is_special(file)) return 0;   /* nothing to flush */
+    /* Dispatch to the file's own filesystem; a filesystem with nothing to
+     * flush leaves the op NULL and fsync is a no-op. */
+    if (file->ops && file->ops->fsync)
+        return file->ops->fsync(file);
     return 0;
 }
 
@@ -1677,19 +1696,70 @@ static int64_t sys_rmdir(uint64_t pathname) {
     int st = vfs_rmdir(kpath);
     if (st == ST_OK) return 0;
     if (st == ST_NOT_FOUND) return -ENOENT;
+    if (st == ST_NOTEMPTY) return -ENOTEMPTY;
     if (st == ST_NOMEM) return -ENOMEM;
     if (st == ST_IO) return -EIO;
     return -EINVAL;
 }
-static int64_t sys_link(uint64_t oldpath, uint64_t newpath) { (void)oldpath; (void)newpath; return -ENOSYS; }
-static int64_t sys_symlink(uint64_t target, uint64_t linkpath) { (void)target; (void)linkpath; return -ENOSYS; }
-static int64_t sys_readlink(uint64_t pathname, uint64_t buf, uint64_t bufsiz) { (void)pathname; (void)buf; (void)bufsiz; return -ENOSYS; }
-// chmod/fchmod/chown/fchown: FAT32 has no permissions/ownership; silently succeed
-static int64_t sys_chmod(uint64_t pathname, uint64_t mode) { (void)pathname; (void)mode; return 0; }
-static int64_t sys_fchmod(uint64_t fd, uint64_t mode) { (void)fd; (void)mode; return 0; }
-static int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group) { (void)pathname; (void)owner; (void)group; return 0; }
-static int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group) { (void)fd; (void)owner; (void)group; return 0; }
-// utimensat: FAT32 timestamps are managed by the FS driver; silently succeed
+static int64_t sys_link(uint64_t oldpath, uint64_t newpath) {
+    char kold[VFS_MAX_PATH], knew[VFS_MAX_PATH];
+    int c = copy_user_path((const char*)oldpath, kold, sizeof(kold)); if (c) return c;
+    c = copy_user_path((const char*)newpath, knew, sizeof(knew)); if (c) return c;
+    int r = vfs_link(kold, knew);
+    if (r == ST_OK) return 0;
+    if (r == ST_UNSUPPORTED) return -EPERM;   /* filesystem has no hard links  */
+    return vfs_status_to_errno(r);
+}
+static int64_t sys_symlink(uint64_t target, uint64_t linkpath) {
+    char ktarget[VFS_MAX_PATH], klink[VFS_MAX_PATH];
+    int c = copy_user_path((const char*)target, ktarget, sizeof(ktarget)); if (c) return c;
+    c = copy_user_path((const char*)linkpath, klink, sizeof(klink)); if (c) return c;
+    int r = vfs_symlink(ktarget, klink);
+    if (r == ST_OK) return 0;
+    if (r == ST_UNSUPPORTED) return -EPERM;   /* filesystem has no symlinks    */
+    return vfs_status_to_errno(r);
+}
+static int64_t sys_readlink(uint64_t pathname, uint64_t buf, uint64_t bufsiz) {
+    char kpath[VFS_MAX_PATH];
+    int c = copy_user_path((const char*)pathname, kpath, sizeof(kpath)); if (c) return c;
+    if (bufsiz == 0) return -EINVAL;
+    if (!validate_user_ptr(buf, 1)) return -EFAULT;
+    char kbuf[256];
+    unsigned long n = bufsiz; if (n > sizeof(kbuf)) n = sizeof(kbuf);
+    int r = vfs_readlink(kpath, kbuf, n);     /* <0 on error / not-a-symlink   */
+    if (r < 0) return vfs_status_to_errno(r);
+    if (copy_to_user((void*)buf, kbuf, (size_t)r) != 0) return -EFAULT;
+    return r;                                 /* byte count (no NUL)           */
+}
+/* chmod/chown persist on filesystems with UNIX perms; on one without them the
+ * vfs layer succeeds silently (ST_OK) so legacy behavior is preserved. */
+static int64_t sys_chmod(uint64_t pathname, uint64_t mode) {
+    char kpath[VFS_MAX_PATH];
+    int c = copy_user_path((const char*)pathname, kpath, sizeof(kpath)); if (c) return c;
+    int r = vfs_chmod(kpath, (unsigned)mode);
+    return (r == ST_OK) ? 0 : vfs_status_to_errno(r);
+}
+static int64_t sys_fchmod(uint64_t fd, uint64_t mode) {
+    task_t* cur = sched_current();
+    if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd]) return -EBADF;
+    if (fd_is_special(cur->fd_table[fd])) return 0;   /* no perms to change */
+    int r = vfs_fchmod(cur->fd_table[fd], (unsigned)mode);
+    return (r == ST_OK) ? 0 : vfs_status_to_errno(r);
+}
+static int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group) {
+    char kpath[VFS_MAX_PATH];
+    int c = copy_user_path((const char*)pathname, kpath, sizeof(kpath)); if (c) return c;
+    int r = vfs_chown(kpath, (int)owner, (int)group);   /* -1 => leave unchanged */
+    return (r == ST_OK) ? 0 : vfs_status_to_errno(r);
+}
+static int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group) {
+    task_t* cur = sched_current();
+    if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd]) return -EBADF;
+    if (fd_is_special(cur->fd_table[fd])) return 0;   /* no ownership to change */
+    int r = vfs_fchown(cur->fd_table[fd], (int)owner, (int)group);
+    return (r == ST_OK) ? 0 : vfs_status_to_errno(r);
+}
+// utimensat: set a path's modification time via the owning filesystem.
 static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times, uint64_t flags) {
     (void)dirfd; (void)flags;
 
@@ -1706,13 +1776,11 @@ static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times, 
     err = copy_from_user(kpath, (const void *)pathname, plen + 1);
     if (err) return err;
 
-    /* Reject devfs paths — no timestamp support there */
-    if (kpath[0] == '/' && kpath[1] == 'd' && kpath[2] == 'e' &&
-        kpath[3] == 'v' && (kpath[4] == '\0' || kpath[4] == '/'))
-        return 0;  /* silently succeed on devfs */
-
     int64_t  mtime_sec  = 0;
-    long     mtime_nsec = KRN_UTIME_NOW;   /* default: set to now */
+    /* The UTIME_NOW / UTIME_OMIT sentinels (1073741823 / 1073741822) match the
+     * VFS_UTIME_* protocol values, so the userspace nsec passes straight
+     * through; default (no times given) means "set to now". */
+    long     mtime_nsec = VFS_UTIME_NOW;
 
     if (times) {
         /* times points to struct timespec[2]: [0]=atime, [1]=mtime */
@@ -1723,13 +1791,11 @@ static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times, 
 
         mtime_sec  = ts[1].tv_sec;
         mtime_nsec = (long)ts[1].tv_nsec;
-
-        /* Translate UTIME_NOW (1073741823) and UTIME_OMIT (1073741822) */
-        if (mtime_nsec == 1073741823L) mtime_nsec = KRN_UTIME_NOW;
-        else if (mtime_nsec == 1073741822L) mtime_nsec = KRN_UTIME_OMIT;
     }
 
-    int r = fat32_utimensat(kpath, mtime_sec, mtime_nsec);
+    /* vfs_utimensat routes to the owning filesystem (devfs has no timestamps,
+     * so it succeeds silently). */
+    int r = vfs_utimensat(kpath, mtime_sec, mtime_nsec);
     if (r == ST_NOT_FOUND || r == ST_INVALID) return -ENOENT;
     if (r == ST_NOMEM) return -ENOMEM;
     if (r == ST_IO) return -EIO;
@@ -1765,28 +1831,26 @@ static int64_t sys_statfs(uint64_t u_path, uint64_t u_buf) {
     err = copy_from_user(kpath, (const void*)u_path, plen + 1);
     if (err) return err;
 
-    // devfs has no meaningful statfs - return ENOSYS
-    if (kpath[0] == '/' && kpath[1] == 'd' && kpath[2] == 'e' &&
-        kpath[3] == 'v' && (kpath[4] == '\0' || kpath[4] == '/'))
-        return -ENOSYS;
+    /* Route to the filesystem owning the path (devfs reports unsupported). */
+    struct vfs_statfs vsf;
+    mm_memset(&vsf, 0, sizeof(vsf));
+    int r = vfs_statfs(kpath, &vsf);
+    if (r == ST_UNSUPPORTED) return -ENOSYS;
+    if (r != ST_OK) return -EIO;
 
-    fat32_statfs_t kinfo;
-    err = fat32_get_statfs(&kinfo);
-    if (err) return err;
-
-    // Translate kernel struct to userspace layout
+    // Translate the generic struct to userspace layout
     user_statfs_t uinfo;
     mm_memset(&uinfo, 0, sizeof(uinfo));
-    uinfo.f_type    = kinfo.f_type;
-    uinfo.f_bsize   = kinfo.f_bsize;
-    uinfo.f_blocks  = kinfo.f_blocks;
-    uinfo.f_bfree   = kinfo.f_bfree;
-    uinfo.f_bavail  = kinfo.f_bavail;
-    uinfo.f_files   = kinfo.f_files;
-    uinfo.f_ffree   = kinfo.f_ffree;
-    uinfo.f_fsid    = kinfo.f_fsid;
-    uinfo.f_namelen = kinfo.f_namelen;
-    uinfo.f_frsize  = kinfo.f_frsize;
+    uinfo.f_type    = vsf.f_type;
+    uinfo.f_bsize   = vsf.f_bsize;
+    uinfo.f_blocks  = vsf.f_blocks;
+    uinfo.f_bfree   = vsf.f_bfree;
+    uinfo.f_bavail  = vsf.f_bavail;
+    uinfo.f_files   = vsf.f_files;
+    uinfo.f_ffree   = vsf.f_ffree;
+    uinfo.f_fsid    = vsf.f_fsid;
+    uinfo.f_namelen = vsf.f_namelen;
+    uinfo.f_frsize  = vsf.f_frsize;
     uinfo.f_flags   = 0;
 
     return copy_to_user((void*)u_buf, &uinfo, sizeof(uinfo));
@@ -1801,23 +1865,29 @@ static int64_t sys_fstatfs(uint64_t fd, uint64_t u_buf) {
     task_t* cur = sched_current();
     if (!cur || !cur->fd_table[fd]) return -EBADF;
 
-    // All real file descriptors sit on the FAT32 root FS
-    fat32_statfs_t kinfo;
-    int err = fat32_get_statfs(&kinfo);
-    if (err) return err;
+    /* Stats of the filesystem the descriptor's file lives on.  Descriptors not
+     * backed by a real file (stdio/pipe/socket) have no filesystem of their
+     * own, so report the root filesystem instead of dereferencing them. */
+    struct vfs_statfs vsf;
+    mm_memset(&vsf, 0, sizeof(vsf));
+    vfs_file_t* file = cur->fd_table[fd];
+    int r = fd_is_special(file) ? vfs_statfs("/", &vsf)
+                                : vfs_fstatfs(file, &vsf);
+    if (r == ST_UNSUPPORTED) return -ENOSYS;
+    if (r != ST_OK) return -EIO;
 
     user_statfs_t uinfo;
     mm_memset(&uinfo, 0, sizeof(uinfo));
-    uinfo.f_type    = kinfo.f_type;
-    uinfo.f_bsize   = kinfo.f_bsize;
-    uinfo.f_blocks  = kinfo.f_blocks;
-    uinfo.f_bfree   = kinfo.f_bfree;
-    uinfo.f_bavail  = kinfo.f_bavail;
-    uinfo.f_files   = kinfo.f_files;
-    uinfo.f_ffree   = kinfo.f_ffree;
-    uinfo.f_fsid    = kinfo.f_fsid;
-    uinfo.f_namelen = kinfo.f_namelen;
-    uinfo.f_frsize  = kinfo.f_frsize;
+    uinfo.f_type    = vsf.f_type;
+    uinfo.f_bsize   = vsf.f_bsize;
+    uinfo.f_blocks  = vsf.f_blocks;
+    uinfo.f_bfree   = vsf.f_bfree;
+    uinfo.f_bavail  = vsf.f_bavail;
+    uinfo.f_files   = vsf.f_files;
+    uinfo.f_ffree   = vsf.f_ffree;
+    uinfo.f_fsid    = vsf.f_fsid;
+    uinfo.f_namelen = vsf.f_namelen;
+    uinfo.f_frsize  = vsf.f_frsize;
     uinfo.f_flags   = 0;
 
     return copy_to_user((void*)u_buf, &uinfo, sizeof(uinfo));

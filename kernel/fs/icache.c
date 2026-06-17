@@ -288,19 +288,31 @@ void icache_unref(ic_inode_t *inode)
 {
     if (!inode)
         return;
-    int new_rc = __sync_sub_and_fetch(&inode->refcount, 1);
-    WARN_ON(new_rc < -1);  /* refcount went below -1 - severe double-unref or corruption */
-    if (new_rc <= 0) {
-        // Refcount reached zero — add to LRU for possible eviction
-        if (new_rc < 0) {
-            WARN(1, "icache_unref: refcount underflow on start_cluster=%lu", inode->start_cluster);
-            inode->refcount = 0; // clamp
-        }
-        uint64_t flags;
-        spin_lock_irqsave(&ic_lru_lock, &flags);
-        ic_lru_add(inode);
-        spin_unlock_irqrestore(&ic_lru_lock, flags);
+    /* Decrement and decide the inode's fate under the LRU lock so the free
+     * decision is serialised with icache_remove(), which may have detached
+     * this inode (IC_DEAD) while it was still referenced. */
+    uint64_t flags;
+    spin_lock_irqsave(&ic_lru_lock, &flags);
+    int new_rc = --inode->refcount;
+    if (new_rc < 0) {
+        WARN(1, "icache_unref: refcount underflow on start_cluster=%lu", inode->start_cluster);
+        inode->refcount = 0;
+        new_rc = 0;
     }
+    if (new_rc == 0) {
+        if (inode->flags & IC_DEAD) {
+            /* Detached earlier (e.g. unlink of an open file); this was the
+             * last reference, so free it now. */
+            spin_unlock_irqrestore(&ic_lru_lock, flags);
+            if (inode->chain)
+                kfree(inode->chain);
+            kfree(inode);
+            return;
+        }
+        /* Stays cached at refcount 0 for quick reopen; track in the LRU. */
+        ic_lru_add(inode);
+    }
+    spin_unlock_irqrestore(&ic_lru_lock, flags);
 }
 
 // ============================================================================
@@ -393,18 +405,26 @@ void icache_remove(unsigned long start_cluster)
     while (*pp) {
         ic_inode_t *n = *pp;
         if (n->start_cluster == start_cluster) {
+            /* Detach from the hash so no new lookup/ref can find it (the key
+             * may be reused for a freshly allocated inode). */
             *pp = n->hash_next;
             spin_unlock_irqrestore(&ic_hash[bucket].lock, flags);
+            __sync_fetch_and_sub(&ic_entry_count, 1);
 
             uint64_t lru_flags;
             spin_lock_irqsave(&ic_lru_lock, &lru_flags);
             ic_lru_remove(n);
+            n->flags |= IC_DEAD;
+            /* Only the hash was holding the inode if no handle references it
+             * (refcount 0); otherwise the last icache_unref() frees it. */
+            int rc = n->refcount;
             spin_unlock_irqrestore(&ic_lru_lock, lru_flags);
 
-            if (n->chain)
-                kfree(n->chain);
-            kfree(n);
-            __sync_fetch_and_sub(&ic_entry_count, 1);
+            if (rc <= 0) {
+                if (n->chain)
+                    kfree(n->chain);
+                kfree(n);
+            }
             return;
         }
         pp = &(*pp)->hash_next;

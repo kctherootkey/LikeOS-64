@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ISO_PATH=${HOBBY_ISO:-/usr/local/share/likeos/LikeOS-64.iso}
-USB_IMG=${HOBBY_USB_IMG:-/usr/local/share/likeos/msdata.img}
+DISK_IMG=${HOBBY_DISK_IMG:-/usr/local/share/likeos/likeos-ext4.img}
 
 # Calculate RAM: free memory - 256MB, minimum 256MB, default to 512MB if calculation fails
 calculate_ram() {
@@ -40,28 +39,25 @@ LOGFILE=$LOGDIR/likeos-qemu.log
 RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 MONITOR_SOCK=$RUNTIME_DIR/likeos-qemu.monitor
 
-if [ ! -f "$ISO_PATH" ]; then
-    echo "LikeOS ISO not found at $ISO_PATH" >&2
-    exit 1
-fi
-if [ ! -f "$USB_IMG" ]; then
-    echo "USB image not found at $USB_IMG" >&2
+if [ ! -f "$DISK_IMG" ]; then
+    echo "LikeOS ext4 GPT disk not found at $DISK_IMG" >&2
     exit 1
 fi
 
 mkdir -p "$LOGDIR" "$RUNTIME_DIR" || true
 chmod 700 "$RUNTIME_DIR" || true
 
+# Boot the single ext4 GPT USB disk: UEFI runs the ESP bootloader, which then
+# loads /boot/kernel.elf from the ext4 root partition.
 QEMU_ARGS=(
     -m "$RAM_MB"
     -smp "$SMP"
     -bios /usr/share/ovmf/OVMF.fd
-    -cdrom "$ISO_PATH"
     -vga std
     -device qemu-xhci,id=xhci
     -device usb-tablet
-    -drive if=none,id=usbdisk,file="$USB_IMG",format=raw,readonly=off
-    -device usb-storage,drive=usbdisk
+    -drive if=none,id=ext4disk,file="$DISK_IMG",format=raw,readonly=off
+    -device usb-storage,drive=ext4disk,bootindex=0
     -serial mon:stdio
     -monitor unix:$MONITOR_SOCK,server,nowait
     -display "$VIDEO"

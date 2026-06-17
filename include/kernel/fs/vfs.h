@@ -12,7 +12,29 @@ typedef unsigned long uintptr_t;
 
 #define VFS_MAX_PATH 256
 
+/* utimensat() nanosecond sentinels shared between the syscall layer and the
+ * filesystem drivers' utimensat op (values match the userspace UTIME_NOW /
+ * UTIME_OMIT constants so no translation is needed). */
+#define VFS_UTIME_NOW   ((long)1073741823L)
+#define VFS_UTIME_OMIT  ((long)1073741822L)
+
 typedef struct vfs_file vfs_file_t;
+
+/* Whole-filesystem statistics, filled by the statfs op.  Mirrors the fields
+ * the statfs/fstatfs syscalls expose to userspace, but is filesystem-agnostic
+ * so the syscall layer never references a specific driver's struct. */
+struct vfs_statfs {
+    unsigned long f_type;     /* filesystem type magic                       */
+    unsigned long f_bsize;    /* optimal transfer block size                 */
+    unsigned long f_frsize;   /* fragment size                               */
+    unsigned long f_blocks;   /* total data blocks                           */
+    unsigned long f_bfree;    /* free blocks                                 */
+    unsigned long f_bavail;   /* free blocks available to unprivileged users */
+    unsigned long f_files;    /* total file nodes                            */
+    unsigned long f_ffree;    /* free file nodes                             */
+    unsigned long f_fsid;     /* filesystem id (not meaningful here)         */
+    unsigned long f_namelen;  /* maximum filename length                     */
+};
 
 typedef struct {
     int (*open)(const char* path, int flags, vfs_file_t** out);
@@ -33,6 +55,40 @@ typedef struct {
      * killed (e.g. via SIGINT) may have died inside a syscall while holding
      * filesystem-private locks.  Optional; may be NULL. */
     int (*release_locks_for_task)(uint64_t task_id);
+    /* Flush a file's dirty data + metadata to disk (fsync).  Optional; when
+     * NULL the syscall layer treats the flush as a no-op for this fs.  Lets
+     * a filesystem whose cache key differs from the raw FAT32 start_cluster
+     * (e.g. ext4) flush correctly. */
+    int (*fsync)(vfs_file_t* f);
+
+    /* ---- Optional UNIX-semantics operations -------------------------------
+     * A filesystem lacking a given capability leaves the slot NULL; the
+     * matching vfs_* wrapper then applies a legacy fallback (see vfs.c) so the
+     * syscall layer never needs to know which filesystem is mounted. */
+
+    /* Like stat(), but does NOT follow a final symlink.  NULL => no symlinks
+     * on this fs, so the wrapper falls back to stat(). */
+    int (*lstat)(const char* path, struct kstat* st);
+    /* Create a symbolic link `linkpath` -> `target`.  NULL => unsupported. */
+    int (*symlink)(const char* target, const char* linkpath);
+    /* Read a symlink's target into buf (no NUL).  Returns byte count (>=0) or
+     * a negative ST_ code.  NULL => path is not a symlink on this fs. */
+    int (*readlink)(const char* path, char* buf, unsigned long bufsz);
+    /* Create a hard link `newpath` -> `oldpath`.  NULL => unsupported. */
+    int (*link)(const char* oldpath, const char* newpath);
+    /* Change a path's permission bits.  NULL => fs has no perms (succeed). */
+    int (*chmod)(const char* path, unsigned int mode);
+    /* Change a path's owner/group (-1 leaves a field unchanged).  NULL =>
+     * fs has no ownership (succeed). */
+    int (*chown)(const char* path, int uid, int gid);
+    /* chmod/chown addressed by an open handle.  NULL => succeed. */
+    int (*fchmod)(vfs_file_t* f, unsigned int mode);
+    int (*fchown)(vfs_file_t* f, int uid, int gid);
+    /* Set a path's modification time (see VFS_UTIME_NOW / VFS_UTIME_OMIT).
+     * NULL => fs manages times itself (succeed). */
+    int (*utimensat)(const char* path, int64_t mtime_sec, long mtime_nsec);
+    /* Fill whole-filesystem statistics.  NULL => unsupported. */
+    int (*statfs)(struct vfs_statfs* out);
 } vfs_ops_t;
 
 struct vfs_file {
@@ -64,6 +120,20 @@ int vfs_rename(const char* oldpath, const char* newpath);
 int vfs_mkdir(const char* path, unsigned int mode);
 int vfs_rmdir(const char* path);
 int vfs_close(vfs_file_t* f);
+/* UNIX-semantics wrappers — dispatch to the mounted filesystem's op (path ops
+ * to the root fs, fd ops to the file's own fs) with a legacy fallback when the
+ * op is NULL.  The syscall layer calls only these, never a driver directly. */
+int vfs_lstat(const char* path, struct kstat* st);
+int vfs_symlink(const char* target, const char* linkpath);
+int vfs_readlink(const char* path, char* buf, unsigned long bufsz);
+int vfs_link(const char* oldpath, const char* newpath);
+int vfs_chmod(const char* path, unsigned int mode);
+int vfs_chown(const char* path, int uid, int gid);
+int vfs_fchmod(vfs_file_t* f, unsigned int mode);
+int vfs_fchown(vfs_file_t* f, int uid, int gid);
+int vfs_utimensat(const char* path, int64_t mtime_sec, long mtime_nsec);
+int vfs_statfs(const char* path, struct vfs_statfs* out);
+int vfs_fstatfs(vfs_file_t* f, struct vfs_statfs* out);
 size_t vfs_size(vfs_file_t* f);
 vfs_file_t* vfs_dup(vfs_file_t* f);  // Increment refcount and return same pointer
 void vfs_incref(vfs_file_t* f);      // Increment refcount

@@ -154,10 +154,11 @@ Main build outputs:
 - build/bootloader.efi
 - build/kernel.elf
 - build/bin/* user programs
-- build/LikeOS-64.iso
-- build/LikeOS-64.img
-- build/LikeOS-64-usb.img
-- build/msdata.img
+- build/likeos-ext4.img   single bootable GPT USB disk:
+                          P1 = FAT EFI System Partition (bootloader only),
+                          P2 = ext4 root (/boot/kernel.elf + the whole userland).
+                          The bootloader loads the kernel straight from ext4;
+                          there is no FAT data filesystem anywhere else.
 
 Run
 ---
@@ -165,7 +166,8 @@ Run
 QEMU:
 
   make distclean
-  make qemu-usb
+  make qemu          # plain boot from the ext4 GPT disk
+  make qemu-usb      # same, plus SLIRP networking (sudo)
 
 Other useful targets:
 
