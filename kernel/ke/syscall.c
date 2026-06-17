@@ -1522,6 +1522,7 @@ static int64_t sys_fsync(uint64_t fd) {
 
 static int64_t sys_sync(void) {
     pagecache_sync();
+    vfs_sync();          /* flush fs metadata + clean the journal (no-op on FAT32) */
     return 0;
 }
 
@@ -4851,7 +4852,20 @@ static int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd, uint64
     
     // Only root (PID 1 shell or PID 0) can reboot - we don't have UID so check PID <= 2
     // In a simple OS, just allow it from any process for now
-    
+
+    // Flush filesystems (pagecache + journal) before going down so a journalled
+    // root isn't left dirty (which would force a replay on the next boot).
+    switch ((uint32_t)cmd) {
+        case LINUX_REBOOT_CMD_RESTART:
+        case LINUX_REBOOT_CMD_HALT:
+        case LINUX_REBOOT_CMD_POWER_OFF:
+        case LINUX_REBOOT_CMD_RESTART2:
+            sys_sync();
+            break;
+        default:
+            break;
+    }
+
     switch ((uint32_t)cmd) {
         case LINUX_REBOOT_CMD_RESTART:
             kprintf("[REBOOT] System is going down for reboot NOW!\n");

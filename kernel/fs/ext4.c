@@ -45,6 +45,170 @@ _Static_assert(__builtin_offsetof(ext4_inode, i_flags) == 0x20, "i_flags offset"
 _Static_assert(__builtin_offsetof(ext4_inode, i_block) == 0x28, "i_block offset");
 _Static_assert(__builtin_offsetof(ext4_inode, i_size_high) == 0x6C, "i_size_high offset");
 _Static_assert(__builtin_offsetof(ext4_group_desc, bg_inode_table_lo) == 8, "bg_inode_table_lo offset");
+_Static_assert(sizeof(ext4_super_block) == 1024, "ext4_super_block must be 1024 bytes");
+_Static_assert(__builtin_offsetof(ext4_super_block, s_checksum_type) == 0x175, "s_checksum_type offset");
+_Static_assert(__builtin_offsetof(ext4_super_block, s_checksum_seed) == 0x270, "s_checksum_seed offset");
+_Static_assert(__builtin_offsetof(ext4_super_block, s_checksum) == 0x3FC, "s_checksum offset");
+_Static_assert(__builtin_offsetof(ext4_group_desc, bg_checksum) == 0x1E, "bg_checksum offset");
+_Static_assert(__builtin_offsetof(ext4_inode, i_checksum_hi) == 0x82, "i_checksum_hi offset");
+
+/* ===================================================================
+ * P6: metadata_csum (crc32c, Castagnoli) — checksum machinery.
+ *
+ * Step 1 is read-side VERIFICATION only: compute the checksums the way the
+ * reference does and WARN (once) if an on-disk value disagrees, so the crc32c
+ * implementation + seed derivation can be proven against a real image before
+ * any write-side code relies on them.  Nothing here rejects or mutates.
+ * =================================================================== */
+
+/* crc32c (reflected polynomial 0x82F63B78).  No implicit pre/post inversion —
+ * the caller supplies the seed explicitly (matching the reference's usage). */
+static uint32_t ext4_crc32c(uint32_t crc, const void *buf, unsigned long len)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len--) {
+        crc ^= *p++;
+        for (int i = 0; i < 8; i++)
+            crc = (crc >> 1) ^ (0x82F63B78u & (0u - (crc & 1u)));
+    }
+    return crc;
+}
+
+/* Superblock checksum: crc32c(~0, sb, bytes-before-s_checksum). */
+static uint32_t ext4_sb_csum(const ext4_super_block *sb)
+{
+    return ext4_crc32c(0xFFFFFFFFu, sb,
+                       __builtin_offsetof(ext4_super_block, s_checksum));
+}
+
+/* Group-descriptor checksum (metadata_csum form): seed over the LE group
+ * number, then the descriptor with the 2-byte bg_checksum field skipped,
+ * truncated to 16 bits. */
+static uint16_t ext4_gd_csum(const ext4_fs_t *fs, uint32_t group,
+                             const ext4_group_desc *gd)
+{
+    const unsigned off = __builtin_offsetof(ext4_group_desc, bg_checksum);
+    const uint16_t zero = 0;
+    uint32_t le_group = group;                 /* x86 is little-endian */
+    uint32_t crc = ext4_crc32c(fs->csum_seed, &le_group, sizeof(le_group));
+    crc = ext4_crc32c(crc, gd, off);           /* up to bg_checksum         */
+    crc = ext4_crc32c(crc, &zero, 2);          /* the zeroed bg_checksum     */
+    if (fs->desc_size > off + 2)               /* rest after the csum field  */
+        crc = ext4_crc32c(crc, (const uint8_t *)gd + off + 2,
+                          fs->desc_size - (off + 2));
+    return (uint16_t)(crc & 0xFFFF);
+}
+
+/* Inode checksum over the full on-disk inode bytes `raw` (length inode_size),
+ * with the two embedded checksum fields treated as zero.  Returns the 32-bit
+ * value; the low 16 bits go in l_i_checksum_lo (i_osd2+8), the high 16 in
+ * i_checksum_hi (only when the inode is large enough to hold it). */
+#define EXT4_INO_CSUM_LO_OFF   0x7C   /* l_i_checksum_lo within i_osd2[8]   */
+#define EXT4_INO_CSUM_HI_OFF   0x82   /* i_checksum_hi                      */
+#define EXT4_GOOD_OLD_ISIZE    128
+static uint32_t ext4_inode_csum(const ext4_fs_t *fs, unsigned long ino,
+                                const uint8_t *raw)
+{
+    uint32_t le_ino = (uint32_t)ino;
+    uint32_t gen;
+    mm_memcpy(&gen, raw + __builtin_offsetof(ext4_inode, i_generation), 4);
+    const uint16_t zero = 0;
+    uint32_t crc = ext4_crc32c(fs->csum_seed, &le_ino, sizeof(le_ino));
+    crc = ext4_crc32c(crc, &gen, sizeof(gen));
+    /* body up to l_i_checksum_lo, then a zeroed lo, then up to the old size */
+    crc = ext4_crc32c(crc, raw, EXT4_INO_CSUM_LO_OFF);
+    crc = ext4_crc32c(crc, &zero, 2);
+    crc = ext4_crc32c(crc, raw + EXT4_INO_CSUM_LO_OFF + 2,
+                      EXT4_GOOD_OLD_ISIZE - (EXT4_INO_CSUM_LO_OFF + 2));
+    if (fs->inode_size > EXT4_GOOD_OLD_ISIZE) {
+        uint16_t extra;
+        mm_memcpy(&extra, raw + __builtin_offsetof(ext4_inode, i_extra_isize), 2);
+        /* [old_size, i_checksum_hi) */
+        crc = ext4_crc32c(crc, raw + EXT4_GOOD_OLD_ISIZE,
+                          EXT4_INO_CSUM_HI_OFF - EXT4_GOOD_OLD_ISIZE);
+        int has_hi = (extra >= (EXT4_INO_CSUM_HI_OFF + 2) - EXT4_GOOD_OLD_ISIZE);
+        if (has_hi)
+            crc = ext4_crc32c(crc, &zero, 2);   /* zeroed hi */
+        else
+            crc = ext4_crc32c(crc, raw + EXT4_INO_CSUM_HI_OFF, 2);
+        crc = ext4_crc32c(crc, raw + EXT4_INO_CSUM_HI_OFF + 2,
+                          fs->inode_size - (EXT4_INO_CSUM_HI_OFF + 2));
+    }
+    return crc;
+}
+
+/* ===================================================================
+ * P6 Step 2: metadata_csum WRITE side — stamp the checksums computed above into
+ * the on-disk metadata just before it is written.  Every helper is a no-op
+ * unless the filesystem has metadata_csum, so a ^metadata_csum image is written
+ * byte-for-byte as before.
+ * =================================================================== */
+
+/* Per-inode checksum seed (csum_seed folded with the inode number + its
+ * generation).  Shared by the inode and directory-leaf checksums. */
+static uint32_t ext4_inode_csum_seed(const ext4_fs_t *fs, unsigned long ino, uint32_t gen)
+{
+    uint32_t le_ino = (uint32_t)ino;
+    uint32_t crc = ext4_crc32c(fs->csum_seed, &le_ino, sizeof(le_ino));
+    return ext4_crc32c(crc, &gen, sizeof(gen));
+}
+
+/* Stamp the inode checksum into the full on-disk inode bytes `raw`
+ * (fs->inode_size long) for inode `ino`.  Mirrors the field-presence rules of
+ * ext4_inode_csum (the hi half only when the inode is large enough to hold it). */
+static void ext4_inode_csum_set(const ext4_fs_t *fs, unsigned long ino, uint8_t *raw)
+{
+    if (!fs->has_metadata_csum) return;
+    uint32_t csum = ext4_inode_csum(fs, ino, raw);
+    *(uint16_t *)(raw + EXT4_INO_CSUM_LO_OFF) = (uint16_t)(csum & 0xFFFF);
+    if (fs->inode_size > EXT4_GOOD_OLD_ISIZE) {
+        uint16_t extra;
+        mm_memcpy(&extra, raw + __builtin_offsetof(ext4_inode, i_extra_isize), 2);
+        if (extra >= (EXT4_INO_CSUM_HI_OFF + 2) - EXT4_GOOD_OLD_ISIZE)
+            *(uint16_t *)(raw + EXT4_INO_CSUM_HI_OFF) = (uint16_t)(csum >> 16);
+    }
+}
+
+/* Lay out and checksum the 12-byte tail of a linear directory leaf block.  With
+ * metadata_csum every dir block ends with a fake entry (inode=0, rec_len=12,
+ * file_type=0xDE) whose last 4 bytes hold crc32c of the block before the tail.
+ * `gen` is the directory inode's i_generation. */
+#define EXT4_DIR_TAIL_SIZE 12
+static void ext4_dir_csum_set(const ext4_fs_t *fs, unsigned long dir_ino,
+                              uint32_t gen, uint8_t *blk)
+{
+    if (!fs->has_metadata_csum) return;
+    uint8_t *tail = blk + fs->block_size - EXT4_DIR_TAIL_SIZE;
+    tail[0] = tail[1] = tail[2] = tail[3] = 0;       /* det_reserved_zero1 (inode=0)  */
+    tail[4] = EXT4_DIR_TAIL_SIZE; tail[5] = 0;       /* det_rec_len = 12              */
+    tail[6] = 0;                                     /* det_reserved_zero2            */
+    tail[7] = 0xDE;                                  /* det_reserved_ft (csum marker) */
+    uint32_t seed = ext4_inode_csum_seed(fs, dir_ino, gen);
+    uint32_t csum = ext4_crc32c(seed, blk, fs->block_size - EXT4_DIR_TAIL_SIZE);
+    *(uint32_t *)(tail + 8) = csum;                  /* det_checksum                  */
+}
+
+/* Recompute the block / inode bitmap checksums (kept in the group descriptor)
+ * after the bitmap buffer `bm` for group `g` is modified.  The descriptor is
+ * flushed later by ext4_write_gd, which also recomputes bg_checksum over it.
+ * The csum spans clusters_per_group/8 (== blocks_per_group/8, no bigalloc) /
+ * (inodes_per_group+7)/8 bytes, exactly as the reference. */
+static void ext4_block_bitmap_csum_set(ext4_fs_t *fs, unsigned g, const uint8_t *bm)
+{
+    if (!fs->has_metadata_csum) return;
+    uint32_t csum = ext4_crc32c(fs->csum_seed, bm, fs->blocks_per_group / 8);
+    fs->gdt[g].bg_block_bitmap_csum_lo = (uint16_t)(csum & 0xFFFF);
+    if (fs->desc_size >= 64)
+        fs->gdt[g].bg_block_bitmap_csum_hi = (uint16_t)(csum >> 16);
+}
+static void ext4_inode_bitmap_csum_set(ext4_fs_t *fs, unsigned g, const uint8_t *bm)
+{
+    if (!fs->has_metadata_csum) return;
+    uint32_t csum = ext4_crc32c(fs->csum_seed, bm, (fs->inodes_per_group + 7) / 8);
+    fs->gdt[g].bg_inode_bitmap_csum_lo = (uint16_t)(csum & 0xFFFF);
+    if (fs->desc_size >= 64)
+        fs->gdt[g].bg_inode_bitmap_csum_hi = (uint16_t)(csum >> 16);
+}
 
 /* Small byte compare (no mm_memcmp in the kernel).  Returns 0 if equal. */
 static int ext4_memcmp(const void *a, const void *b, unsigned long n)
@@ -401,6 +565,31 @@ static int ext4_read_inode_loc(ext4_fs_t *fs, unsigned long ino,
         return ST_NOMEM;
     st = ext4_read_block(fs, blk, buf);
     if (st != ST_OK) { kfree(buf); return st; }
+
+    /* P6 (verify-only): confirm the inode's metadata_csum using the full
+     * on-disk bytes still in `buf` (the struct copy below truncates them).
+     * Warn-once; never reject. */
+    if (fs->has_metadata_csum) {
+        const uint8_t *rp = buf + off;
+        uint32_t got = ext4_inode_csum(fs, ino, rp);
+        uint16_t slo; mm_memcpy(&slo, rp + EXT4_INO_CSUM_LO_OFF, 2);
+        uint32_t want = slo, mask = 0xFFFFu;
+        if (fs->inode_size > EXT4_GOOD_OLD_ISIZE) {
+            uint16_t extra;
+            mm_memcpy(&extra, rp + __builtin_offsetof(ext4_inode, i_extra_isize), 2);
+            if (extra >= (EXT4_INO_CSUM_HI_OFF + 2) - EXT4_GOOD_OLD_ISIZE) {
+                uint16_t shi; mm_memcpy(&shi, rp + EXT4_INO_CSUM_HI_OFF, 2);
+                want |= (uint32_t)shi << 16; mask = 0xFFFFFFFFu;
+            }
+        }
+        static int warned = 0;
+        if ((got & mask) != want && !warned) {
+            warned = 1;
+            kprintf("ext4: WARN inode %lu metadata_csum mismatch "
+                    "(disk 0x%x computed 0x%x) [warn-once]\n",
+                    ino, want, got & mask);
+        }
+    }
 
     mm_memset(out, 0, sizeof(*out));
     unsigned copy = fs->inode_size < sizeof(*out) ? fs->inode_size : sizeof(*out);
@@ -1181,6 +1370,8 @@ static int ext4_write_block(ext4_fs_t *fs, unsigned long pbn, const void *buf)
 
 static int ext4_write_super(ext4_fs_t *fs)
 {
+    if (fs->has_metadata_csum)
+        fs->sb_copy.s_checksum = ext4_sb_csum(&fs->sb_copy);
     unsigned ss = fs->bdev->sector_size ? fs->bdev->sector_size : 512;
     unsigned long lba = fs->part_lba_offset + EXT4_SUPERBLOCK_OFFSET / ss;
     unsigned sects = (sizeof(ext4_super_block) + ss - 1) / ss;
@@ -1213,6 +1404,10 @@ static int ext4_write_gd(ext4_fs_t *fs, unsigned int group)
         return ST_NOMEM;
     int st = ext4_read_block(fs, blk, buf);
     if (st != ST_OK) { kfree(buf); return st; }
+    /* bitmap csums (in the descriptor) are already current; stamp bg_checksum
+     * over the final descriptor bytes. */
+    if (fs->has_metadata_csum)
+        fs->gdt[group].bg_checksum = ext4_gd_csum(fs, group, &fs->gdt[group]);
     unsigned copy = fs->desc_size < sizeof(ext4_group_desc)
                   ? fs->desc_size : sizeof(ext4_group_desc);
     mm_memcpy(buf + off, &fs->gdt[group], copy);
@@ -1257,10 +1452,30 @@ static int ext4_write_inode_struct(ext4_fs_t *fs, unsigned long ino,
     if (st != ST_OK) { kfree(buf); return st; }
     unsigned copy = fs->inode_size < sizeof(ext4_inode) ? fs->inode_size : sizeof(ext4_inode);
     mm_memcpy(buf + off, in, copy);
+    ext4_inode_csum_set(fs, ino, buf + off);   /* over the full on-disk inode */
     st = ext4_write_block(fs, blk, buf);
     kfree(buf);
     if (ino == s_ic_ino) s_ic_ino = 0;   /* parsed-inode cache now stale */
     return st;
+}
+
+/* bg_itable_unused: count of never-used inodes at the tail of the group's inode
+ * table.  e2fsck honours it on metadata_csum / uninit_bg images (it skips that
+ * tail during scanning), so allocating an inode past the tracked region must
+ * shrink the count or e2fsck flags the freshly used inode as "in the unused
+ * range" (and disagrees with the inode bitmap). */
+static unsigned ext4_itable_unused(const ext4_fs_t *fs, unsigned g)
+{
+    unsigned v = fs->gdt[g].bg_itable_unused_lo;
+    if (fs->desc_size >= 64)
+        v |= (unsigned)fs->gdt[g].bg_itable_unused_hi << 16;
+    return v;
+}
+static void ext4_itable_unused_set(ext4_fs_t *fs, unsigned g, unsigned v)
+{
+    fs->gdt[g].bg_itable_unused_lo = (uint16_t)(v & 0xFFFF);
+    if (fs->desc_size >= 64)
+        fs->gdt[g].bg_itable_unused_hi = (uint16_t)(v >> 16);
 }
 
 /* Allocate one free inode (preferring the parent's group). Returns 0 on fail. */
@@ -1279,6 +1494,15 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino, i
             unsigned long ino = (unsigned long)g * fs->inodes_per_group + i + 1;
             if (ino < fs->first_ino && ino != EXT4_ROOT_INO) continue;
             ext4_bm_set(bm, i);
+            ext4_inode_bitmap_csum_set(fs, g, bm);
+            /* shrink bg_itable_unused if we used an inode past the tracked front
+             * region (mirrors the reference's ext4_new_inode). */
+            if (fs->has_metadata_csum) {
+                unsigned off1 = i + 1;   /* 1-based offset within the group */
+                unsigned used_front = fs->inodes_per_group - ext4_itable_unused(fs, g);
+                if (off1 > used_front)
+                    ext4_itable_unused_set(fs, g, fs->inodes_per_group - off1);
+            }
             if (ext4_write_block(fs, bblk, bm) != ST_OK) { kfree(bm); return 0; }
             fs->gdt[g].bg_free_inodes_count_lo--;
             if (is_dir) fs->gdt[g].bg_used_dirs_count_lo++;
@@ -1302,6 +1526,7 @@ static void ext4_free_inode(ext4_fs_t *fs, unsigned long ino, int is_dir)
     unsigned long bblk = ext4_gd_inode_bitmap(fs, g);
     if (ext4_read_block(fs, bblk, bm) == ST_OK && ext4_bm_test(bm, i)) {
         ext4_bm_clear(bm, i);
+        ext4_inode_bitmap_csum_set(fs, g, bm);
         ext4_write_block(fs, bblk, bm);
         fs->gdt[g].bg_free_inodes_count_lo++;
         if (is_dir && fs->gdt[g].bg_used_dirs_count_lo) fs->gdt[g].bg_used_dirs_count_lo--;
@@ -1322,6 +1547,7 @@ static void ext4_free_block(ext4_fs_t *fs, unsigned long pbn)
     unsigned long bblk = ext4_gd_block_bitmap(fs, g);
     if (ext4_read_block(fs, bblk, bm) == ST_OK && ext4_bm_test(bm, i)) {
         ext4_bm_clear(bm, i);
+        ext4_block_bitmap_csum_set(fs, g, bm);
         ext4_write_block(fs, bblk, bm);
         fs->gdt[g].bg_free_blocks_count_lo++;
         fs->sb_copy.s_free_blocks_count_lo++;
@@ -1391,6 +1617,7 @@ static unsigned ext4_alloc_blocks_for_file(ext4_fs_t *fs, ext4_inode *in,
             allocated++; group_alloc++;
         }
         if (group_alloc) {
+            ext4_block_bitmap_csum_set(fs, g, bm);
             ext4_write_block(fs, bblk, bm);
             fs->gdt[g].bg_free_blocks_count_lo -= group_alloc;
             fs->sb_copy.s_free_blocks_count_lo -= group_alloc;
@@ -1444,6 +1671,10 @@ static int ext4_dir_add(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
     unsigned long dsize = ext4_inode_size(&din);
     unsigned long nblocks = dsize / fs->block_size;
     unsigned need = ext4_dirent_len(name_len);
+    /* With metadata_csum the last 12 bytes of every leaf hold the checksum tail
+     * (a fake entry) and must never be allocated into. */
+    unsigned tail = fs->has_metadata_csum ? EXT4_DIR_TAIL_SIZE : 0;
+    unsigned scan_limit = fs->block_size - tail;
 
     uint8_t *blk = (uint8_t *)kalloc(fs->block_size);
     if (!blk) return ST_NOMEM;
@@ -1453,10 +1684,10 @@ static int ext4_dir_add(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
         if (pbn == 0) continue;
         if (ext4_read_block(fs, pbn, blk) != ST_OK) continue;
         unsigned off = 0;
-        while (off + 8 <= fs->block_size) {
+        while (off + 8 <= scan_limit) {
             ext4_dir_entry_2 *de = (ext4_dir_entry_2 *)(blk + off);
             unsigned rec = de->rec_len;
-            if (rec < 8 || off + rec > fs->block_size) break;
+            if (rec < 8 || off + rec > scan_limit) break;
             unsigned used = (de->inode == 0) ? 0 : ext4_dirent_len(de->name_len);
             if (rec - used >= need) {
                 ext4_dir_entry_2 *ne;
@@ -1472,6 +1703,7 @@ static int ext4_dir_add(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
                 ne->name_len = (uint8_t)name_len;
                 ne->file_type = (uint8_t)ftype;
                 mm_memcpy(ne->name, name, name_len);
+                ext4_dir_csum_set(fs, dir_ino, din.i_generation, blk);
                 int st = ext4_write_block(fs, pbn, blk);
                 kfree(blk);
                 return st;
@@ -1499,10 +1731,11 @@ static int ext4_dir_add(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
     mm_memset(blk, 0, fs->block_size);
     ext4_dir_entry_2 *ne = (ext4_dir_entry_2 *)blk;
     ne->inode = (uint32_t)child_ino;
-    ne->rec_len = (uint16_t)fs->block_size;
+    ne->rec_len = (uint16_t)(fs->block_size - tail);
     ne->name_len = (uint8_t)name_len;
     ne->file_type = (uint8_t)ftype;
     mm_memcpy(ne->name, name, name_len);
+    ext4_dir_csum_set(fs, dir_ino, din.i_generation, blk);
     int st = ext4_write_block(fs, pbn, blk);
     kfree(blk);
     if (st != ST_OK) return st;
@@ -1522,6 +1755,7 @@ static int ext4_dir_del(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
     if (ext4_read_inode_loc(fs, dir_ino, &din, 0, 0) != ST_OK)
         return ST_IO;
     unsigned long nblocks = ext4_inode_size(&din) / fs->block_size;
+    unsigned scan_limit = fs->block_size - (fs->has_metadata_csum ? EXT4_DIR_TAIL_SIZE : 0);
     uint8_t *blk = (uint8_t *)kalloc(fs->block_size);
     if (!blk) return ST_NOMEM;
 
@@ -1530,10 +1764,10 @@ static int ext4_dir_del(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
         if (pbn == 0) continue;
         if (ext4_read_block(fs, pbn, blk) != ST_OK) continue;
         unsigned off = 0, prev = (unsigned)-1;
-        while (off + 8 <= fs->block_size) {
+        while (off + 8 <= scan_limit) {
             ext4_dir_entry_2 *de = (ext4_dir_entry_2 *)(blk + off);
             unsigned rec = de->rec_len;
-            if (rec < 8 || off + rec > fs->block_size) break;
+            if (rec < 8 || off + rec > scan_limit) break;
             if (de->inode != 0 && de->name_len == name_len &&
                 ext4_memcmp(de->name, name, name_len) == 0) {
                 if (out_child) *out_child = de->inode;
@@ -1544,6 +1778,7 @@ static int ext4_dir_del(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
                 } else {
                     de->inode = 0;   /* first entry in block: just blank it */
                 }
+                ext4_dir_csum_set(fs, dir_ino, din.i_generation, blk);
                 int st = ext4_write_block(fs, pbn, blk);
                 kfree(blk);
                 return st;
@@ -1788,16 +2023,19 @@ static int ext4_unlink_impl(const char *path)
 }
 
 /* Fill a fresh directory block with "." (self) and ".." (parent) entries. */
-static void ext4_init_dir_block(uint8_t *blk, unsigned long self_ino,
-                                unsigned long parent_ino, unsigned bs)
+static void ext4_init_dir_block(ext4_fs_t *fs, uint8_t *blk, unsigned long self_ino,
+                                unsigned long parent_ino, uint32_t gen)
 {
+    unsigned bs = fs->block_size;
+    unsigned tail = fs->has_metadata_csum ? EXT4_DIR_TAIL_SIZE : 0;
     mm_memset(blk, 0, bs);
     ext4_dir_entry_2 *dot = (ext4_dir_entry_2 *)blk;
     dot->inode = (uint32_t)self_ino; dot->rec_len = 12;
     dot->name_len = 1; dot->file_type = EXT4_FT_DIR; dot->name[0] = '.';
     ext4_dir_entry_2 *dd = (ext4_dir_entry_2 *)(blk + 12);
-    dd->inode = (uint32_t)parent_ino; dd->rec_len = (uint16_t)(bs - 12);
+    dd->inode = (uint32_t)parent_ino; dd->rec_len = (uint16_t)(bs - 12 - tail);
     dd->name_len = 2; dd->file_type = EXT4_FT_DIR; dd->name[0] = '.'; dd->name[1] = '.';
+    ext4_dir_csum_set(fs, self_ino, gen, blk);   /* lay out + checksum the tail */
 }
 
 /* Return 1 if the directory contains only "." and "..". */
@@ -1915,7 +2153,7 @@ static int ext4_mkdir_impl(const char *path, unsigned mode)
     uint8_t *blk = (uint8_t *)kalloc(fs->block_size);
     if (!blk) { ext4_free_blocks_from(fs, &in, 0); ext4_free_inode(fs, nino, 1);
                 ext4_flush_meta(fs); return ST_NOMEM; }
-    ext4_init_dir_block(blk, nino, parent, fs->block_size);
+    ext4_init_dir_block(fs, blk, nino, parent, in.i_generation);
     ext4_write_block(fs, pbn, blk);       /* dir block is metadata           */
     kfree(blk);
     s_ic_ino = 0;
@@ -2292,6 +2530,23 @@ static int ext4_fsync(vfs_file_t *f)
     return 0;
 }
 
+/* Whole-filesystem sync (the sync(2) op, not tied to a file): flush deferred
+ * metadata, commit any in-flight transaction, push the device, then mark the
+ * journal clean so a reboot right after sync() does not replay.  Mirrors
+ * ext4_fsync minus the per-file pagecache/icache flush. */
+static int ext4_sync_op(void)
+{
+    if (!g_ext4_fs) return 0;
+    ext4_io_lock();
+    ext4_flush_meta(g_ext4_fs);
+    ext4_txn_flush(g_ext4_fs);
+    if (g_ext4_fs->bdev && g_ext4_fs->bdev->sync)
+        g_ext4_fs->bdev->sync((block_device_t *)g_ext4_fs->bdev);
+    ext4_journal_clean(g_ext4_fs);
+    ext4_io_unlock();
+    return 0;
+}
+
 /* ---- Locked wrappers (serialise via the reentrant sleeping mutex) ---- */
 static int  ext4_open(const char *path, int flags, vfs_file_t **out)
 { ext4_io_lock(); int r = ext4_open_impl(path, flags, out); ext4_io_unlock(); return r; }
@@ -2396,6 +2651,7 @@ static const vfs_ops_t ext4_vfs_ops = {
     ext4_lstat, ext4_symlink, ext4_readlink, ext4_link,
     ext4_chmod, ext4_chown, ext4_fchmod_op, ext4_fchown_op,
     ext4_utimensat, ext4_statfs_op, ext4_fstat_op, ext4_setid_clean_op,
+    ext4_sync_op,
 };
 
 /* ===================================================================
@@ -2428,10 +2684,12 @@ static int ext4_probe_offset(const block_device_t *bdev, unsigned long part_lba)
  * first partition is the FAT ESP. */
 static unsigned long ext4_locate_partition(const block_device_t *bdev)
 {
-    if (ext4_probe_offset(bdev, 0))
-        return 0;
-
     unsigned ss = bdev->sector_size ? bdev->sector_size : 512;
+    if (ext4_probe_offset(bdev, 0)) {
+        kprintf("ext4: locate -> whole-device (ext4 magic at LBA0+1024)\n");
+        return 0;
+    }
+
     uint8_t *hdr = (uint8_t *)kalloc(ss);
     if (!hdr) return (unsigned long)-1;
     unsigned long found = (unsigned long)-1;
@@ -2950,7 +3208,6 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
         kfree(raw);
         return ST_NOT_FOUND;
     }
-
     mm_memset(out, 0, sizeof(*out));
     mm_memcpy(&out->sb_copy, sb, sizeof(out->sb_copy));
     out->bdev = bdev;
@@ -2984,6 +3241,23 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
         ((out->blocks_count - out->first_data_block + out->blocks_per_group - 1)
          / out->blocks_per_group);
 
+    /* P6: metadata_csum seed + (verify-only) superblock checksum.  The seed is
+     * s_checksum_seed when the CSUM_SEED feature is set, else crc32c(~0, uuid). */
+    out->has_metadata_csum =
+        (out->feature_ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) != 0;
+    if (out->feature_incompat & EXT4_FEATURE_INCOMPAT_CSUM_SEED)
+        out->csum_seed = sb->s_checksum_seed;
+    else
+        out->csum_seed = ext4_crc32c(0xFFFFFFFFu, sb->s_uuid, sizeof(sb->s_uuid));
+    if (out->has_metadata_csum) {
+        uint32_t got = ext4_sb_csum(sb), want = sb->s_checksum;
+        if (got != want)
+            kprintf("ext4: WARN superblock metadata_csum mismatch "
+                    "(disk 0x%x computed 0x%x)\n", want, got);
+        else
+            kprintf("ext4: metadata_csum on; superblock csum verified\n");
+    }
+
     kfree(raw);
 
     /* Reject incompat features we cannot safely read. */
@@ -3006,6 +3280,20 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
     if (ext4_load_gdt(out) != ST_OK) {
         kprintf("ext4: failed to load group descriptor table\n");
         return ST_IO;
+    }
+
+    /* P6 (verify-only): confirm every group descriptor's metadata_csum, which
+     * exercises the csum_seed derivation.  Warn with a count; never reject. */
+    if (out->has_metadata_csum) {
+        unsigned bad = 0;
+        for (unsigned int g = 0; g < out->groups_count; g++)
+            if (ext4_gd_csum(out, g, &out->gdt[g]) != out->gdt[g].bg_checksum)
+                bad++;
+        if (bad)
+            kprintf("ext4: WARN %u/%u group-desc metadata_csum mismatch\n",
+                    bad, out->groups_count);
+        else
+            kprintf("ext4: all %u group-desc csums verified\n", out->groups_count);
     }
 
     /* Journal replay: apply any committed transactions left in the journal

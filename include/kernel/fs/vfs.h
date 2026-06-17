@@ -98,6 +98,11 @@ typedef struct {
      * clears it whenever the mode changes.  NULL => fs has no set-id bits, so
      * the wrapper reports "clean" and the write path never tries to strip. */
     int (*setid_clean)(vfs_file_t* f, int mark);
+    /* Flush ALL of this filesystem's pending state to disk (the sync(2) op):
+     * deferred metadata, any in-flight journal transaction, and — for a
+     * journalled fs — mark the journal clean so a reboot right after does not
+     * replay.  Optional; NULL => the wrapper treats a whole-fs sync as a no-op. */
+    int (*sync)(void);
 } vfs_ops_t;
 
 struct vfs_file {
@@ -149,6 +154,9 @@ int vfs_fstat(vfs_file_t* f, struct kstat* st);
  * fs lacking the op); vfs_mark_setid_clean() records that state after a strip. */
 int vfs_setid_clean(vfs_file_t* f);
 void vfs_mark_setid_clean(vfs_file_t* f);
+/* Flush the root filesystem's pending metadata + journal to disk (sync(2)).
+ * No-op when the root fs provides no sync op.  fs-independent. */
+int vfs_sync(void);
 size_t vfs_size(vfs_file_t* f);
 vfs_file_t* vfs_dup(vfs_file_t* f);  // Increment refcount and return same pointer
 void vfs_incref(vfs_file_t* f);      // Increment refcount

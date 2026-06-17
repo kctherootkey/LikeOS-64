@@ -88,6 +88,13 @@ static const vfs_ops_t* vfs_ops_for_path(const char* path) {
     return vfs_is_dev_path(path) ? g_dev_ops : g_root_ops;
 }
 
+/* Flush the root filesystem's pending metadata + journal (sync(2)).  No-op when
+ * the root fs has no sync op (e.g. FAT32, which has no journal to clean). */
+int vfs_sync(void) {
+    if (!g_root_ops || !g_root_ops->sync) return ST_OK;
+    return g_root_ops->sync();
+}
+
 /* ---- UNIX-semantics wrappers ------------------------------------------------
  * Each dispatches to the owning filesystem's op and supplies a legacy fallback
  * when that op is NULL, so the syscall layer stays filesystem-agnostic. */

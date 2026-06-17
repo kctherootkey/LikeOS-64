@@ -260,6 +260,13 @@ ESP_MB       ?= 64
 # ext4 root partition size in MB.  Leave empty to auto-size to the staged
 # content (+50% slack, min 64M); override e.g. EXT4_MB=512 to force a size.
 EXT4_MB      ?=
+# mkfs.ext4 feature flags.  metadata_csum is ON by default: the driver maintains
+# every metadata checksum on WRITE (P6 Step 2 — verified e2fsck-clean 2026-06-17).
+# 64bit stays off (32-byte group descriptors), the verified configuration.
+# Overrides:
+#   make EXT4_MKFS_FEATURES=                       (also enable 64bit / 64-byte descs)
+#   make EXT4_MKFS_FEATURES=^metadata_csum,^64bit  (legacy no-csum image)
+EXT4_MKFS_FEATURES ?= ^64bit
 LINUX_USB_DIR = host/linux-usb
 LINUX_USB_BUILD_DIR = $(BUILD_DIR)/linux-usb
 LINUX_USB_IMAGE = $(LINUX_USB_BUILD_DIR)/linux-usb.img
@@ -1115,7 +1122,8 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	fi; \
 	echo "Building ext4 root: $${ext4_mb}M (staged $$(du -sh $(EXT4_STAGING) | cut -f1))"; \
 	rm -f $(EXT4_ROOT_IMG); \
-	fakeroot mkfs.ext4 -F -q -b 4096 -O ^metadata_csum,^64bit -E root_owner=0:0 \
+	feat="$(EXT4_MKFS_FEATURES)"; \
+	fakeroot mkfs.ext4 -F -q -b 4096 $${feat:+-O $$feat} -E root_owner=0:0 \
 		-d $(EXT4_STAGING) $(EXT4_ROOT_IMG) $${ext4_mb}M; \
 	e2fsck -fn $(EXT4_ROOT_IMG) || true; \
 	rm -f $(EXT4_ESP_IMG); \

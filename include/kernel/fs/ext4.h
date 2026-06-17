@@ -143,8 +143,13 @@ typedef struct ext4_super_block {
     uint16_t s_min_extra_isize;         /* 0x15C */
     uint16_t s_want_extra_isize;        /* 0x15E */
     uint32_t s_flags;                   /* 0x160 */
-    uint8_t  s_padding[1024 - 0x164];   /* fill to 1024 bytes              */
-} __attribute__((packed)) ext4_super_block;
+    uint8_t  s_pad_0164[0x175 - 0x164]; /* raid/mmp/raid_stripe (unused)   */
+    uint8_t  s_checksum_type;           /* 0x175  1 => crc32c              */
+    uint8_t  s_pad_0176[0x270 - 0x176]; /* error/snapshot/mount opts (unused) */
+    uint32_t s_checksum_seed;           /* 0x270  crc32c(~0, s_uuid)       */
+    uint8_t  s_pad_0274[0x3FC - 0x274]; /* quota/encrypt/... (unused)      */
+    uint32_t s_checksum;                /* 0x3FC  crc32c of SB[0..0x3FC)   */
+} __attribute__((packed)) ext4_super_block;  /* exactly 1024 bytes */
 
 typedef struct ext4_group_desc {
     uint32_t bg_block_bitmap_lo;
@@ -348,6 +353,10 @@ typedef struct ext4_fs {
     ext4_super_block sb_copy;           /* cached superblock                 */
     /* VFS-layer superblock published to g_root_sb; sb.fs_private = this.    */
     vfs_superblock_t sb;
+    /* P6: metadata_csum (crc32c).  has_metadata_csum gates all csum work;
+     * csum_seed is crc32c(~0, s_uuid) (or s_checksum_seed if CSUM_SEED).    */
+    int            has_metadata_csum;
+    uint32_t       csum_seed;
     /* PJ: journaled-writes (ordered mode) state.  j_enabled gates it all.   */
     int            j_enabled;           /* journal writes active this mount  */
     unsigned long  j_sb_pbn;            /* physical block of journal sblock  */
