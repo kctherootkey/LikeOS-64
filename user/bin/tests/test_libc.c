@@ -7598,6 +7598,99 @@ network_section:
 
 network_skip:;
     // ========================================
+    // P5: permission enforcement.  Drop to a non-root uid in a child and
+    // confirm the kernel denies access to root-owned objects (root, running
+    // these tests, is unaffected — it bypasses the checks).
+    // ========================================
+    printf("\n[TEST] permission enforcement (non-root)\n");
+    if (getuid() != 0) {
+        printf("  [SKIP] not running as root; cannot test privilege drop\n");
+    } else {
+        char pf[96], pd[96], inside[112];
+        snprintf(pf, sizeof(pf), "%s/rootonly.txt", _pbase);
+        snprintf(pd, sizeof(pd), "%s/rootdir",      _pbase);
+        snprintf(inside, sizeof(inside), "%s/rootdir/x", _pbase);
+
+        int sfd = open(pf, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (sfd >= 0) { write(sfd, "secret\n", 7); close(sfd); }
+        chmod(pf, 0600);                 /* 0600, owned by root */
+        mkdir(pd, 0700);                 /* 0700, owned by root */
+        test_result("setup: root made 0600 file + 0700 dir", sfd >= 0);
+
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* child: drop to a non-root gid then uid, then probe */
+            setgid(1000);
+            if (setuid(1000) != 0) _exit(40);
+            if (getuid() != 1000)  _exit(41);
+            int fails = 0;
+            int r = open(pf, O_RDONLY);
+            if (r >= 0) { close(r); fails |= 1; } else if (errno != EACCES) fails |= 1;
+            if (access(pf, R_OK) == 0) fails |= 2;
+            int r2 = open(inside, O_WRONLY | O_CREAT, 0644);
+            if (r2 >= 0) { close(r2); fails |= 4; }
+            if (chmod(pf, 0644) == 0) fails |= 8;
+            _exit(fails);
+        } else if (pid > 0) {
+            int status = 0;
+            waitpid(pid, &status, 0);
+            int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            test_result("non-root: setuid(1000) succeeded",          code >= 0 && code != 40 && code != 41);
+            test_result("non-root: open(0600 root file) denied",     code >= 0 && (code & 1) == 0);
+            test_result("non-root: access(R_OK) denied",             code >= 0 && (code & 2) == 0);
+            test_result("non-root: create in 0700 root dir denied",  code >= 0 && (code & 4) == 0);
+            test_result("non-root: chmod root file denied (EPERM)",  code >= 0 && (code & 8) == 0);
+        } else {
+            test_fail("permission test: fork failed");
+        }
+        unlink(pf);
+        rmdir(pd);
+
+        /* Sticky bit (1777, like /tmp) + set-id stripping on write.  Fresh
+         * child with its own exit-code scheme (sentinel 99) to avoid clashes. */
+        char sdir[160], sroot[160], smine[160], suf[160];
+        snprintf(sdir,  sizeof(sdir),  "%s/stickyd", _pbase);
+        snprintf(sroot, sizeof(sroot), "%s/stickyd/rootf", _pbase);
+        snprintf(smine, sizeof(smine), "%s/stickyd/minef", _pbase);
+        snprintf(suf,   sizeof(suf),   "%s/suidf", _pbase);
+        mkdir(sdir, 0777); chmod(sdir, 01777);          /* sticky, world-writable */
+        int rf = open(sroot, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (rf >= 0) { write(rf, "r\n", 2); close(rf); } /* root-owned file in it  */
+        int uf = open(suf, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+        if (uf >= 0) { write(uf, "x\n", 2); close(uf); }
+        chown(suf, 1000, 1000);                          /* owned by the non-root uid */
+        chmod(suf, 04755);                               /* setuid bit, set by root */
+
+        pid_t pid2 = fork();
+        if (pid2 == 0) {
+            setgid(1000);
+            if (setuid(1000) != 0) _exit(99);
+            int f = 0;
+            int m = open(smine, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (m < 0) f |= 1; else close(m);            /* may create own entry   */
+            if (unlink(sroot) == 0) f |= 2;              /* may NOT remove root's  */
+            else if (errno != EACCES) f |= 2;
+            if (unlink(smine) != 0) f |= 4;              /* may remove its own     */
+            int w = open(suf, O_WRONLY);                 /* owns it → may write    */
+            if (w >= 0) { write(w, "y\n", 2); close(w); } else f |= 8;
+            struct stat sb;
+            if (stat(suf, &sb) != 0 || (sb.st_mode & S_ISUID)) f |= 16; /* bit gone */
+            _exit(f);
+        } else if (pid2 > 0) {
+            int status = 0; waitpid(pid2, &status, 0);
+            int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            int ok = code >= 0 && code != 99;
+            test_result("non-root: create own entry in sticky dir allowed", ok && (code & 1) == 0);
+            test_result("non-root: remove root's entry in sticky dir denied", ok && (code & 2) == 0);
+            test_result("non-root: remove own entry in sticky dir allowed", ok && (code & 4) == 0);
+            test_result("non-root: write strips the setuid bit", ok && (code & 8) == 0 && (code & 16) == 0);
+        } else {
+            test_fail("sticky/setid test: fork failed");
+        }
+        unlink(sroot); unlink(smine); unlink(suf); rmdir(sdir);
+    }
+
+    // ========================================
     // Summary
     // ========================================
     printf("\n========================================\n");

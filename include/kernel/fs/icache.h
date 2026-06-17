@@ -39,6 +39,9 @@ struct vfs_superblock;          /* forward — see vfs_sb.h                    *
 #define IC_DIRTY            0x02    // Metadata modified, needs writeback
 #define IC_DEAD             0x04    // Removed from cache while still referenced;
                                     // freed by the last icache_unref()
+#define IC_SETID_CLEAN      0x08    // No set-user/-group-ID bits left to strip on
+                                    // a non-privileged modify (write-path fast
+                                    // path); cleared whenever the mode changes.
 
 // ============================================================================
 // Structures

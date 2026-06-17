@@ -165,6 +165,21 @@ int vfs_fstatfs(vfs_file_t* f, struct vfs_statfs* out) {
     return f->ops->statfs(out);
 }
 
+int vfs_fstat(vfs_file_t* f, struct kstat* st) {
+    if (!f || !f->ops) return ST_INVALID;
+    if (!f->ops->fstat) return ST_UNSUPPORTED;   /* fs can't report fd owner */
+    return f->ops->fstat(f, st);
+}
+
+int vfs_setid_clean(vfs_file_t* f) {
+    if (f && f->ops && f->ops->setid_clean) return f->ops->setid_clean(f, 0);
+    return 1;   /* fs has no set-id bits: report clean so writes never strip */
+}
+
+void vfs_mark_setid_clean(vfs_file_t* f) {
+    if (f && f->ops && f->ops->setid_clean) f->ops->setid_clean(f, 1);
+}
+
 long vfs_read(vfs_file_t* f, void* buf, long bytes) { if (!f || !f->ops || !f->ops->read) return ST_INVALID; return f->ops->read(f, buf, bytes); }
 long vfs_write(vfs_file_t* f, const void* buf, long bytes) { if (!f || !f->ops || !f->ops->write) return ST_INVALID; return f->ops->write(f, buf, bytes); }
 long vfs_seek(vfs_file_t* f, long offset, int whence) { if (!f || !f->ops || !f->ops->seek) return -1; return f->ops->seek(f, offset, whence); }

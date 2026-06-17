@@ -5,6 +5,7 @@
 #include <kernel/uapi/types.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/ke/signal.h>
+#include <kernel/ke/cred.h>
 
 // Forward declaration
 struct vfs_file;
@@ -340,6 +341,12 @@ typedef struct task {
     uint64_t user_stack_top;    // User stack virtual address (for user tasks)
     uint64_t kernel_stack_top;  // Kernel stack for syscalls/interrupts (for user tasks)
     void* kernel_stack_base;    // Kernel stack allocation base (for freeing)
+
+    // Process credentials (P5): real/effective/saved uid+gid, fs ids, groups.
+    // Inherited across fork/clone via the task-struct memcpy; fresh tasks
+    // inherit the spawning task's creds (kernel tasks privileged), so none is
+    // silently born root.  Enforcement (P5b) consults cred.euid/egid/fsuid/etc.
+    cred_t cred;
 
     // Job control / session
     int pgid;

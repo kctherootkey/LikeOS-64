@@ -182,6 +182,30 @@ int setegid(int gid) {
     return 0;
 }
 
+int setresuid(int ruid, int euid, int suid) {
+    long ret = syscall3(SYS_SETRESUID, ruid, euid, suid);
+    if (ret < 0) { errno = -ret; return -1; }
+    return 0;
+}
+
+int setresgid(int rgid, int egid, int sgid) {
+    long ret = syscall3(SYS_SETRESGID, rgid, egid, sgid);
+    if (ret < 0) { errno = -ret; return -1; }
+    return 0;
+}
+
+int getresuid(int* ruid, int* euid, int* suid) {
+    long ret = syscall3(SYS_GETRESUID, (long)ruid, (long)euid, (long)suid);
+    if (ret < 0) { errno = -ret; return -1; }
+    return 0;
+}
+
+int getresgid(int* rgid, int* egid, int* sgid) {
+    long ret = syscall3(SYS_GETRESGID, (long)rgid, (long)egid, (long)sgid);
+    if (ret < 0) { errno = -ret; return -1; }
+    return 0;
+}
+
 int getgroups(int size, int* list) {
     long ret = syscall2(SYS_GETGROUPS, size, (long)list);
     if (ret < 0) { errno = -ret; return -1; }

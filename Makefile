@@ -213,6 +213,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/smp.o \
 			  $(BUILD_DIR)/ap_trampoline.o \
 			  $(BUILD_DIR)/futex.o \
+			  $(BUILD_DIR)/cred.o \
 			  $(BUILD_DIR)/i2c_hid.o \
 			  $(BUILD_DIR)/net.o \
 			  $(BUILD_DIR)/e1000.o \
@@ -530,6 +531,9 @@ $(BUILD_DIR)/ap_trampoline.o: $(KERNEL_DIR)/ke/ap_trampoline.S | $(BUILD_DIR)
 	nasm -f elf64 $< -o $@
 
 $(BUILD_DIR)/futex.o: $(KERNEL_DIR)/ke/futex.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/cred.o: $(KERNEL_DIR)/ke/cred.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 # Build userland C library

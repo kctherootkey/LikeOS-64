@@ -809,6 +809,8 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino, i
 static int  ext4_create_inode(ext4_fs_t *fs, unsigned long ino, unsigned mode,
                               unsigned uid, unsigned gid);
 static void ext4_free_inode(ext4_fs_t *fs, unsigned long ino, int is_dir);
+static void ext4_init_owner(unsigned puid, unsigned pgid, unsigned pmode, int is_dir,
+                            unsigned *uid, unsigned *gid, unsigned *mode);
 static int  ext4_dir_add(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
                          unsigned name_len, unsigned long child_ino, unsigned ftype);
 static void ext4_free_blocks_from(ext4_fs_t *fs, ext4_inode *in, unsigned long from);
@@ -830,15 +832,17 @@ static int ext4_open_impl(const char *path, int flags, vfs_file_t **out)
         if (ext4_resolve_parent(fs, path, &parent, nm, sizeof(nm)) != ST_OK)
             return ST_NOT_FOUND;
         unsigned nl = 0; while (nm[nl]) nl++;
-        /* Inherit owner from the parent directory (interim until Phase 5). */
-        unsigned puid = 0, pgid = 0;
+        /* Owner/group of the new file per the reference (the creating process). */
+        unsigned puid = 0, pgid = 0, pmode = 0;
         ext4_inode pin0;
         if (ext4_read_inode_loc(fs, parent, &pin0, 0, 0) == ST_OK) {
-            puid = pin0.i_uid; pgid = pin0.i_gid;
+            puid = pin0.i_uid; pgid = pin0.i_gid; pmode = pin0.i_mode;
         }
+        unsigned nuid = puid, ngid = pgid, nmode = S_IFREG | 0644;
+        ext4_init_owner(puid, pgid, pmode, 0, &nuid, &ngid, &nmode);
         unsigned long newino = ext4_alloc_inode(fs, parent, 0);
         if (newino == 0) return ST_NOMEM;
-        if (ext4_create_inode(fs, newino, S_IFREG | 0644, puid, pgid) != ST_OK) {
+        if (ext4_create_inode(fs, newino, nmode, nuid, ngid) != ST_OK) {
             ext4_free_inode(fs, newino, 0); return ST_IO;
         }
         if (ext4_dir_add(fs, parent, nm, nl, newino, EXT4_FT_REG_FILE) != ST_OK) {
@@ -1574,8 +1578,39 @@ static int ext4_resolve_parent(ext4_fs_t *fs, const char *path,
     return ext4_resolve(fs, pdir, parent_ino);
 }
 
-/* Initialise + write a brand-new regular-file inode (owner inherited from the
- * parent directory until a process-credential model exists — Phase 5). */
+/* Decide a new inode's owner/group/mode the way the reference does
+ * (inode_init_owner), so behaviour matches exactly:
+ *   - the creating process owns the inode (its fs-uid);
+ *   - if the parent directory is set-group-ID, the new inode takes the parent's
+ *     group, AND a new directory also inherits the set-group-ID bit; a new
+ *     non-directory that is group-executable + set-group-ID, created by an
+ *     unprivileged process that is not in the parent's group, has its
+ *     set-group-ID bit dropped (no privilege escalation via group);
+ *   - otherwise the group is the creator's fs-gid.
+ * With no current task (early/kernel-time creation) inherit the parent's ids so
+ * the boot-time, all-root tree is built exactly as before. */
+static void ext4_init_owner(unsigned puid, unsigned pgid, unsigned pmode, int is_dir,
+                            unsigned *uid, unsigned *gid, unsigned *mode)
+{
+    task_t *cur = sched_current();
+    if (!cur) { *uid = puid; *gid = pgid; return; }
+    *uid = (unsigned)cur->cred.fsuid;
+    if (pmode & S_ISGID) {
+        *gid = pgid;
+        if (is_dir) {
+            *mode |= S_ISGID;                       /* dirs always inherit it   */
+        } else if (cur->cred.fsuid != 0 &&
+                   (*mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP) &&
+                   !cred_in_group(&cur->cred, pgid)) {
+            *mode &= ~(unsigned)S_ISGID;            /* not a member: strip sgid */
+        }
+    } else {
+        *gid = (unsigned)cur->cred.fsgid;
+    }
+}
+
+/* Initialise + write a brand-new regular-file inode (owner/group/mode decided by
+ * ext4_init_owner — the creating process, per the reference). */
 static int ext4_create_inode(ext4_fs_t *fs, unsigned long ino, unsigned mode,
                              unsigned uid, unsigned gid)
 {
@@ -1844,19 +1879,24 @@ static int ext4_mkdir_impl(const char *path, unsigned mode)
     if (ext4_dir_lookup(fs, parent, name, nl, &existing, 0) == ST_OK)
         return ST_EXISTS;
 
-    /* Inherit owner from the parent directory (interim until Phase 5). */
-    unsigned puid = 0, pgid = 0;
+    /* Owner/group of the new directory per the reference (the creating process;
+     * a set-group-ID parent passes its group down and the new dir inherits the
+     * set-group-ID bit via ext4_init_owner). */
+    unsigned puid = 0, pgid = 0, pmode = 0;
     ext4_inode pin0;
     if (ext4_read_inode_loc(fs, parent, &pin0, 0, 0) == ST_OK) {
-        puid = pin0.i_uid; pgid = pin0.i_gid;
+        puid = pin0.i_uid; pgid = pin0.i_gid; pmode = pin0.i_mode;
     }
+    unsigned nuid = puid, ngid = pgid;
+    unsigned nmode = S_IFDIR | (mode ? (mode & 0777) : 0755);
+    ext4_init_owner(puid, pgid, pmode, 1, &nuid, &ngid, &nmode);
     unsigned long nino = ext4_alloc_inode(fs, parent, 1);
     if (nino == 0) return ST_NOMEM;
 
     ext4_inode in; mm_memset(&in, 0, sizeof(in));
-    in.i_mode = (uint16_t)(S_IFDIR | (mode ? (mode & 0777) : 0755));
-    in.i_uid = (uint16_t)puid;
-    in.i_gid = (uint16_t)pgid;
+    in.i_mode = (uint16_t)nmode;
+    in.i_uid = (uint16_t)nuid;
+    in.i_gid = (uint16_t)ngid;
     in.i_links_count = 2;                 /* "." + the entry in parent       */
     in.i_flags = EXT4_INODE_EXTENTS_FL;
     uint32_t now = (uint32_t)timer_get_epoch();
@@ -2045,14 +2085,16 @@ int ext4_symlink(const char *target, const char *linkpath)
     unsigned tlen = 0; while (target[tlen]) tlen++;
     if (tlen >= fs->block_size) { ext4_io_unlock(); return ST_INVALID; }
 
-    unsigned puid = 0, pgid = 0; ext4_inode pin;
-    if (ext4_read_inode_loc(fs, parent, &pin, 0, 0) == ST_OK) { puid = pin.i_uid; pgid = pin.i_gid; }
+    unsigned puid = 0, pgid = 0, pmode = 0; ext4_inode pin;
+    if (ext4_read_inode_loc(fs, parent, &pin, 0, 0) == ST_OK) { puid = pin.i_uid; pgid = pin.i_gid; pmode = pin.i_mode; }
+    unsigned nuid = puid, ngid = pgid, nmode = S_IFLNK | 0777;
+    ext4_init_owner(puid, pgid, pmode, 0, &nuid, &ngid, &nmode);
 
     unsigned long nino = ext4_alloc_inode(fs, parent, 0);
     if (nino == 0) { ext4_io_unlock(); return ST_NOMEM; }
     ext4_inode in; mm_memset(&in, 0, sizeof(in));
-    in.i_mode = (uint16_t)(S_IFLNK | 0777);
-    in.i_uid = (uint16_t)puid; in.i_gid = (uint16_t)pgid;
+    in.i_mode = (uint16_t)nmode;
+    in.i_uid = (uint16_t)nuid; in.i_gid = (uint16_t)ngid;
     in.i_links_count = 1;
     in.i_size_lo = tlen;
     uint32_t now = (uint32_t)timer_get_epoch();
@@ -2148,6 +2190,11 @@ static int ext4_set_mode_locked(ext4_fs_t *fs, unsigned long ino, unsigned mode)
     in.i_mode = (uint16_t)((in.i_mode & S_IFMT) | (mode & 07777));
     in.i_ctime = (uint32_t)timer_get_epoch();
     s_ic_ino = 0;
+    /* A mode change can re-add a set-id bit: invalidate the per-inode strip
+     * hint (S_NOSEC analog) for every handle, so the next non-root modify
+     * re-evaluates.  Peek the cache without taking a ref. */
+    ic_inode_t *ic = icache_lookup(EXT4_BID_ENC(ino, 0));
+    if (ic) ic->flags &= ~(uint32_t)IC_SETID_CLEAN;
     return ext4_write_inode_struct(fs, ino, &in) == ST_OK ? ST_OK : ST_IO;
 }
 
@@ -2308,6 +2355,39 @@ static int ext4_statfs_op(struct vfs_statfs *out)
     return ST_OK;
 }
 
+/* Fill a kstat for an open ext4 handle (real mode/uid/gid) — backs the fd-based
+ * permission checks (fchmod/fchown ownership). */
+static int ext4_fstat_op(vfs_file_t *f, struct kstat *st)
+{
+    if (!f || !st || !g_ext4_fs) return ST_INVALID;
+    ext4_file_t *ef = (ext4_file_t *)f->fs_private;
+    if (!ef) return ST_INVALID;
+    ext4_io_lock();
+    int r = ext4_stat_fill(g_ext4_fs, ef->ino, st);
+    ext4_io_unlock();
+    return r;
+}
+
+/* Per-inode set-id-strip hint (S_NOSEC analog).  Lives on the shared icache
+ * entry, so every handle to the inode sees the same state.  Cheap: just a flag
+ * bit, no I/O or io_lock — a race only costs a redundant strip evaluation. */
+static int ext4_setid_clean_op(vfs_file_t *f, int mark)
+{
+    ext4_file_t *ef = (ext4_file_t *)(f ? f->fs_private : 0);
+    ic_inode_t *ic = ef ? (ic_inode_t *)ef->inode : 0;
+    if (!ic) {
+        /* No shared inode entry to carry the hint.  A regular file only lands
+         * here if icache_get() failed at open (OOM): report "not clean" so the
+         * strip still runs every modify (it reads the mode directly) — safe,
+         * just unamortised.  Directories/special files have no inode by design
+         * and must never be stripped (e.g. a set-group-ID dir), so: clean. */
+        if (mark) return 1;                  /* nowhere to record it */
+        return (ef && !ef->is_dir) ? 0 : 1;
+    }
+    if (mark) { ic->flags |= (uint32_t)IC_SETID_CLEAN; return 1; }
+    return (ic->flags & IC_SETID_CLEAN) ? 1 : 0;
+}
+
 static const vfs_ops_t ext4_vfs_ops = {
     ext4_open, ext4_stat_vfs, ext4_read, ext4_write, ext4_seek, ext4_readdir,
     ext4_truncate, ext4_unlink, ext4_rename, ext4_mkdir, ext4_rmdir, ext4_chdir,
@@ -2315,7 +2395,7 @@ static const vfs_ops_t ext4_vfs_ops = {
     /* UNIX-semantics ops */
     ext4_lstat, ext4_symlink, ext4_readlink, ext4_link,
     ext4_chmod, ext4_chown, ext4_fchmod_op, ext4_fchown_op,
-    ext4_utimensat, ext4_statfs_op,
+    ext4_utimensat, ext4_statfs_op, ext4_fstat_op, ext4_setid_clean_op,
 };
 
 /* ===================================================================

@@ -41,6 +41,10 @@ int seteuid(int uid);
 int setgid(int gid);
 int setegid(int gid);
 int setgroups(int size, const int* list);
+int setresuid(int ruid, int euid, int suid);
+int setresgid(int rgid, int egid, int sgid);
+int getresuid(int* ruid, int* euid, int* suid);
+int getresgid(int* rgid, int* egid, int* sgid);
 
 // Process groups / terminal
 int setpgid(int pid, int pgid);

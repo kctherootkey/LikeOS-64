@@ -181,6 +181,10 @@
 #define SYS_READV       384
 #define SYS_WRITEV      385
 #define SYS_GETRANDOM   386
+#define SYS_SETRESUID   387
+#define SYS_GETRESUID   388
+#define SYS_SETRESGID   389
+#define SYS_GETRESGID   390
 
 // NET_GETINFO sub-commands
 #define NET_GET_ARP_TABLE       1

@@ -199,6 +199,12 @@
 // Entropy
 #define SYS_GETRANDOM       386
 
+// Credentials (real/effective/saved set+get)
+#define SYS_SETRESUID       387
+#define SYS_GETRESUID       388
+#define SYS_SETRESGID       389
+#define SYS_GETRESGID       390
+
 // rusage who values
 #define RUSAGE_SELF         0
 #define RUSAGE_CHILDREN     (-1)
@@ -248,6 +254,8 @@ typedef struct k_sysinfo {
 
 // Special dirfd value for *at() syscalls
 #define AT_FDCWD        -100
+// faccessat: check using the effective IDs instead of the real IDs
+#define AT_EACCESS      0x200
 
 // File descriptor limits
 #define MAX_FDS         1024

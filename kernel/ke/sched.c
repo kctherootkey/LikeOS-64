@@ -557,6 +557,22 @@ static void task_init_common(task_t* t) {
     t->stime_ticks = 0;
     t->cwd[0] = '/';
     t->cwd[1] = 0;
+    // Credentials policy (mirrors the conventional inheritance model):
+    //   - kernel tasks (bootstrap/idle/kernel threads) run with privileged
+    //     (root) credentials — they execute kernel code with full access;
+    //   - a fresh USER task inherits the credentials of the task that spawned
+    //     it (so it is NEVER silently born privileged).
+    // The primordial boot task (no creator yet) is the sole root origin.
+    // fork()/clone() do not pass through here — they copy the parent task
+    // wholesale (cred included), which is the inheritance path for normal
+    // process creation.
+    if (t->privilege == TASK_USER) {
+        task_t* creator = sched_current();
+        if (creator) t->cred = creator->cred;   // inherit the spawning task
+        else         cred_init_root(&t->cred);   // no creator yet (early boot)
+    } else {
+        cred_init_root(&t->cred);                // privileged kernel context
+    }
     for (int i = 0; i < TASK_MAX_FDS; i++) t->fd_table[i] = NULL;
     t->brk_start = 0;
     t->brk = 0;

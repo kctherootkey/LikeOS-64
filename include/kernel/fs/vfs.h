@@ -89,6 +89,15 @@ typedef struct {
     int (*utimensat)(const char* path, int64_t mtime_sec, long mtime_nsec);
     /* Fill whole-filesystem statistics.  NULL => unsupported. */
     int (*statfs)(struct vfs_statfs* out);
+    /* Fill a kstat for an open handle (real mode/uid/gid).  NULL => the caller
+     * cannot determine the owner (used by fd-based permission checks). */
+    int (*fstat)(vfs_file_t* f, struct kstat* st);
+    /* Per-INODE "no set-id bits left to strip" hint (analog of the reference's
+     * S_NOSEC), shared across every handle to the inode.  mark==0 queries
+     * (returns nonzero if clean); mark!=0 records the inode as clean.  The fs
+     * clears it whenever the mode changes.  NULL => fs has no set-id bits, so
+     * the wrapper reports "clean" and the write path never tries to strip. */
+    int (*setid_clean)(vfs_file_t* f, int mark);
 } vfs_ops_t;
 
 struct vfs_file {
@@ -134,6 +143,12 @@ int vfs_fchown(vfs_file_t* f, int uid, int gid);
 int vfs_utimensat(const char* path, int64_t mtime_sec, long mtime_nsec);
 int vfs_statfs(const char* path, struct vfs_statfs* out);
 int vfs_fstatfs(vfs_file_t* f, struct vfs_statfs* out);
+int vfs_fstat(vfs_file_t* f, struct kstat* st);
+/* Per-inode set-id-strip fast-path (S_NOSEC analog).  vfs_setid_clean() returns
+ * nonzero when the inode is known to have no set-id bits to strip (and for any
+ * fs lacking the op); vfs_mark_setid_clean() records that state after a strip. */
+int vfs_setid_clean(vfs_file_t* f);
+void vfs_mark_setid_clean(vfs_file_t* f);
 size_t vfs_size(vfs_file_t* f);
 vfs_file_t* vfs_dup(vfs_file_t* f);  // Increment refcount and return same pointer
 void vfs_incref(vfs_file_t* f);      // Increment refcount
