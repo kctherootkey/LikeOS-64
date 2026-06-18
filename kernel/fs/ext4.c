@@ -386,6 +386,105 @@ static int ext4_txn_lookup(ext4_fs_t *fs, unsigned long pbn, void *buf)
 }
 
 /* ===================================================================
+ * P7: deferred-checkpoint circular journal log.
+ *
+ * Instead of checkpointing (writing committed metadata to its final location)
+ * synchronously after every op — which cost a sync per op — committed
+ * transactions accumulate as an "epoch" in the journal log and are checkpointed
+ * lazily (when the log/pending set fills, on fsync/sync, or when an op frees a
+ * block that still has a journal copy).  This drops the steady-state cost toward
+ * ONE device sync per op (the commit), amortising the 2-sync checkpoint over the
+ * whole epoch.
+ *
+ * s_ckpt is the in-memory authoritative copy of every metadata block written but
+ * not yet checkpointed this epoch (latest content per block).  It serves two
+ * roles: (1) read-your-writes — until checkpoint, a block's final disk location
+ * still holds pre-epoch content, so reads must come from here; (2) the source
+ * for the eventual checkpoint writeback.  Bounded by EXT4_CKPT_MAX_BLOCKS.
+ *
+ * Revoke records are NOT needed: the only journalled blocks our driver ever
+ * frees are directory blocks (rmdir); freeing any block that still has a journal
+ * copy sets s_force_ckpt, which checkpoints + empties the log right after the op,
+ * so no stale journal copy of a freed/reused block can ever be replayed.
+ * Serialized entirely by ext4_io_lock, like s_txn.
+ * =================================================================== */
+#define EXT4_CKPT_MAX_BLOCKS 256          /* pending unique-block cap (memory)  */
+/* Max journal LOG blocks per epoch before forcing a checkpoint.  This bounds how
+ * much a crash must replay (recovery writes ~one block per log block, and each is
+ * a slow uncached device write) — i.e. it trades a little sync amortisation for a
+ * fast boot after a crash.  Tunable: raise for fewer syncs/op (longer crash
+ * recovery), lower for snappier recovery.  At 32: ~1.25 syncs/op, recovery of a
+ * full epoch is ~30 writes.  (Steady state was 2 syncs/op before this; 3 before
+ * that.)  Clean shutdowns checkpoint everything and never replay. */
+#define EXT4_EPOCH_MAX_BLOCKS 32
+static struct {
+    unsigned       n, cap;
+    unsigned long *blk;     /* final physical block number of each entry   */
+    uint8_t      **data;    /* block_size bytes each                        */
+} s_ckpt;
+static unsigned long s_jhead;             /* next free journal log block        */
+static int           s_epoch_open;        /* committed, un-checkpointed txns?    */
+static uint32_t      s_epoch_seq;         /* sequence of the epoch's first txn   */
+static int           s_force_ckpt;        /* a journalled block was freed        */
+static void ext4_checkpoint(ext4_fs_t *fs);
+
+/* Merge one block into the epoch pending set (latest content wins). */
+static void ext4_ckpt_merge(ext4_fs_t *fs, unsigned long pbn, const void *buf)
+{
+    for (unsigned i = 0; i < s_ckpt.n; i++)
+        if (s_ckpt.blk[i] == pbn) {
+            mm_memcpy(s_ckpt.data[i], buf, fs->block_size);
+            return;
+        }
+    if (s_ckpt.n == s_ckpt.cap) {
+        unsigned nc = s_ckpt.cap ? s_ckpt.cap * 2 : 32;
+        unsigned long *nb = (unsigned long *)kalloc(nc * sizeof(unsigned long));
+        uint8_t **nd = (uint8_t **)kalloc(nc * sizeof(uint8_t *));
+        if (!nb || !nd) {                 /* OOM: checkpoint now to drain, then
+                                           * write this block direct as a fallback */
+            if (nb) kfree(nb);
+            if (nd) kfree(nd);
+            WARN_ON_ONCE(1);
+            ext4_write_block_direct(fs, pbn, buf);
+            return;
+        }
+        for (unsigned i = 0; i < s_ckpt.n; i++) { nb[i] = s_ckpt.blk[i]; nd[i] = s_ckpt.data[i]; }
+        for (unsigned i = s_ckpt.n; i < nc; i++) nd[i] = 0;
+        if (s_ckpt.blk)  kfree(s_ckpt.blk);
+        if (s_ckpt.data) kfree(s_ckpt.data);
+        s_ckpt.blk = nb; s_ckpt.data = nd; s_ckpt.cap = nc;
+    }
+    if (!s_ckpt.data[s_ckpt.n])
+        s_ckpt.data[s_ckpt.n] = (uint8_t *)kalloc(fs->block_size);
+    if (!s_ckpt.data[s_ckpt.n]) { WARN_ON_ONCE(1); ext4_write_block_direct(fs, pbn, buf); return; }
+    mm_memcpy(s_ckpt.data[s_ckpt.n], buf, fs->block_size);
+    s_ckpt.blk[s_ckpt.n] = pbn;
+    s_ckpt.n++;
+}
+
+/* Read-your-writes across the epoch: serve a committed-but-not-checkpointed
+ * block (its final disk location is still stale until checkpoint). */
+static int ext4_ckpt_lookup(ext4_fs_t *fs, unsigned long pbn, void *buf)
+{
+    for (unsigned i = 0; i < s_ckpt.n; i++)
+        if (s_ckpt.blk[i] == pbn) {
+            mm_memcpy(buf, s_ckpt.data[i], fs->block_size);
+            return 1;
+        }
+    return 0;
+}
+
+/* Does `pbn` still have an outstanding journal copy (current op or epoch)?  If
+ * so, freeing it requires a checkpoint before the block can be reused, else a
+ * crash could replay the stale copy over the block's new use. */
+static int ext4_blk_journalled(unsigned long pbn)
+{
+    for (unsigned i = 0; i < s_txn.n;  i++) if (s_txn.blk[i]  == pbn) return 1;
+    for (unsigned i = 0; i < s_ckpt.n; i++) if (s_ckpt.blk[i] == pbn) return 1;
+    return 0;
+}
+
+/* ===================================================================
  * Reentrant sleeping I/O mutex (identical discipline to fat32_io_lock).
  * =================================================================== */
 volatile int ext4_io_locked = 0;
@@ -459,9 +558,12 @@ int ext4_io_release_if_owner(uint64_t task_id)
         ext4_io_depth  = 0;
         /* The dead task may have been mid-operation: discard its uncommitted
          * transaction.  Nothing was journaled or checkpointed, so the fs stays
-         * at its pre-operation state (atomicity).  Buffers are kept for reuse. */
+         * at its pre-operation state (atomicity).  Any committed epoch (s_ckpt +
+         * log) is durable and stays — it is checkpointed/replayed normally.
+         * Buffers are kept for reuse. */
         s_txn.active = 0;
         s_txn.n      = 0;
+        s_force_ckpt = 0;        /* the freeing op was discarded with s_txn      */
         released = 1;
     }
     spin_unlock_irqrestore(&ext4_io_wait_lock, flags);
@@ -537,9 +639,12 @@ static int ext4_read_block(ext4_fs_t *fs, unsigned long pbn, void *buf)
 {
     if (pbn == 0)
         return ST_INVALID;
-    /* Read-your-writes: an active transaction's buffered (not-yet-checkpointed)
-     * metadata is the authoritative copy until commit. */
+    /* Read-your-writes: the current op's buffer wins, then the epoch's committed-
+     * but-not-yet-checkpointed metadata (whose final disk location is still
+     * stale), then the cache, then disk. */
     if (s_txn.active && ext4_txn_lookup(fs, pbn, buf))
+        return ST_OK;
+    if (s_ckpt.n && ext4_ckpt_lookup(fs, pbn, buf))
         return ST_OK;
     for (int i = 0; i < EXT4_MBC_ENTRIES; i++) {
         if (s_mbc[i].pbn == pbn && s_mbc[i].data) {
@@ -1696,6 +1801,12 @@ static void ext4_free_inode(ext4_fs_t *fs, unsigned long ino, int is_dir)
 static void ext4_free_block(ext4_fs_t *fs, unsigned long pbn)
 {
     if (pbn < fs->first_data_block) return;
+    /* If this block still has an outstanding journal copy (e.g. an rmdir freeing
+     * a directory block written earlier this epoch), force a checkpoint after
+     * the op so the stale copy can never be replayed over the block's next use.
+     * This is why no jbd2 revoke records are needed (see the s_ckpt comment). */
+    if (ext4_blk_journalled(pbn))
+        s_force_ckpt = 1;
     unsigned g = (unsigned)((pbn - fs->first_data_block) / fs->blocks_per_group);
     if (g >= fs->groups_count) return;
     unsigned long i = (pbn - fs->first_data_block) % fs->blocks_per_group;
@@ -3329,21 +3440,58 @@ static int ext4_journal_recover(ext4_fs_t *fs, int *did_work)
     return ST_OK;
 }
 
+/* Checkpoint the open epoch: write every pending (committed-but-not-yet-final)
+ * metadata block to its final location, make it durable, then mark the journal
+ * log empty (s_start=0).  TWO device syncs, amortised over the whole epoch.
+ * Ordering: the final writes are made durable BEFORE s_start=0, so a crash mid-
+ * checkpoint replays the epoch again (idempotent), and a crash after s_start=0
+ * finds the final data already durable.  Leaves RECOVER set (only
+ * ext4_journal_clean clears it) — s_start=0 alone makes recovery a no-op.
+ * Called with s_txn inactive, so the writeback goes direct. */
+static void ext4_checkpoint(ext4_fs_t *fs)
+{
+    if (!fs || !fs->j_enabled || !fs->j_sb_buf || !s_epoch_open)
+        return;
+    for (unsigned i = 0; i < s_ckpt.n; i++)         /* 1. pending -> final     */
+        ext4_write_block_direct(fs, s_ckpt.blk[i], s_ckpt.data[i]);
+    if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+
+    journal_superblock_t *jsb = (journal_superblock_t *)fs->j_sb_buf;
+    jsb->s_start    = 0;                             /* 2. empty the log        */
+    jsb->s_sequence = __builtin_bswap32(fs->j_sequence);
+    ext4_jsb_csum_set(fs->j_sb_buf, fs->j_csum3);
+    jlog_write(fs, 0, fs->j_sb_buf);
+    if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+
+    s_ckpt.n     = 0;                                /* 3. epoch closed         */
+    s_epoch_open = 0;
+    s_jhead      = fs->j_first;
+}
+
 /* ===================================================================
- * PJ: journaled writes (ordered mode) — commit one transaction.
+ * PJ/P7: journaled writes (ordered mode), deferred-checkpoint circular log.
  *
- * Called from ext4_io_unlock on the outermost release with the lock still
- * held.  Atomically journals the buffered structural metadata then checkpoints
- * it to the final locations.  Ordering (each step durable before the next via
- * bdev->sync) is what makes a crash at any point recoverable:
- *   1. set RECOVER on the ext4 superblock (so any journalled commit is honored)
- *   2. point the journal superblock at this transaction (s_start, s_sequence)
- *   3. write descriptor + data blocks + commit block into the journal
- *   4. checkpoint the blocks to their final locations
- *   5. empty the journal (s_start=0) and clear RECOVER
- * A crash before the commit block (step 3) leaves an uncommitted txn that the
- * scan pass ignores; a crash between commit and checkpoint is redone by replay.
- * Data blocks are already in place (written during the op), so "ordered".
+ * Called from ext4_io_unlock on the outermost release with the lock held.  Each
+ * op's buffered metadata (s_txn) is journalled to the log head and made durable
+ * with ONE device sync, then recorded in the in-memory epoch pending set
+ * (s_ckpt) — it is NOT checkpointed to its final location yet.  Steady-state
+ * cost is therefore one sync per op; the 2-sync checkpoint (ext4_checkpoint) is
+ * amortised over a whole epoch and runs only when the log/pending set fills, an
+ * op frees a still-journalled block (s_force_ckpt), or on fsync/sync.
+ *
+ * Crash safety: recovery reads s_start (the epoch start, == j_first, made
+ * durable by the epoch's first commit sync) and replays every committed txn in
+ * sequence order until the chain breaks (torn/absent commit, validated by the
+ * csum-v3 commit + descriptor + tag csums).  Because checkpoint is deferred, the
+ * committed metadata lives only in the log until then, so reads consult s_ckpt
+ * (read-your-writes) — critically, the allocator reads bitmaps from there, so it
+ * never double-allocates a block the epoch already used.  Monotonic sequences +
+ * never letting an epoch wrap (we checkpoint before the head reaches j_maxlen)
+ * mean a stale older epoch left in the log can never extend the new chain.
+ * Data blocks are written in place during the op and flushed by the commit sync
+ * ("ordered").  No jbd2 revoke records: the only journalled blocks we free are
+ * directory blocks, and freeing any still-journalled block forces a checkpoint
+ * (s_force_ckpt) that empties the log before the block can be reused.
  * =================================================================== */
 static void ext4_txn_flush(ext4_fs_t *fs)
 {
@@ -3373,21 +3521,27 @@ static void ext4_txn_flush(ext4_fs_t *fs)
 
     /* All tags + the lone tag0 uuid + (csum v3) the descriptor tail must fit in
      * one descriptor block — we don't chain descriptors.  Plus the whole txn
-     * (descriptor + n data + commit) must fit the log.  Either overflow → fall
-     * back to direct in-place writes (no journal protection, but correct). */
+     * (descriptor + n data + commit) must fit the log.  Either overflow → drain
+     * the epoch, then fall back to direct in-place writes for this op. */
     unsigned desc_need = sizeof(journal_header_t) + n * tagsz + 16 + (csum3 ? 4u : 0u);
     if (n + 2 > span || desc_need > fs->block_size) {
         WARN_ON_ONCE(1);
+        ext4_checkpoint(fs);
         for (unsigned i = 0; i < n; i++)
             ext4_write_block_direct(fs, s_txn.blk[i], s_txn.data[i]);
         if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
         return;
     }
 
-    /* 1. mark needs-recovery, durably, before writing any committed journal.
-     * Only written when not already set: the journal now stays dirty between
-     * operations (cleaned lazily on sync / next-mount recovery), so RECOVER
-     * persists for the whole dirty period instead of toggling every commit. */
+    /* Make room: checkpoint the current epoch first (resets s_jhead = j_first)
+     * if this txn would run off the log end, exceed the per-epoch log-block bound
+     * (keeps crash recovery fast), or exceed the pending-set memory cap. */
+    if (s_jhead + (n + 2) > maxlen ||
+        (s_jhead - first) + (n + 2) > EXT4_EPOCH_MAX_BLOCKS ||
+        s_ckpt.n + n > EXT4_CKPT_MAX_BLOCKS)
+        ext4_checkpoint(fs);
+
+    /* 1. mark needs-recovery, durably, once per dirty period (amortised). */
     if (!(fs->sb_copy.s_feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER)) {
         fs->sb_copy.s_feature_incompat |= EXT4_FEATURE_INCOMPAT_RECOVER;
         fs->feature_incompat           |= EXT4_FEATURE_INCOMPAT_RECOVER;
@@ -3395,30 +3549,30 @@ static void ext4_txn_flush(ext4_fs_t *fs)
         if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
     }
 
-    /* 2. point the journal at this transaction (it starts at s_first). */
-    jsb->s_start    = __builtin_bswap32((uint32_t)first);
-    jsb->s_sequence = __builtin_bswap32(seq);
-    ext4_jsb_csum_set(fs->j_sb_buf, csum3);
-    jlog_write(fs, 0, fs->j_sb_buf);
-    if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+    unsigned long pos = s_jhead;     /* descriptor @pos, data @pos+1.., commit @pos+1+n */
 
-    /* 3. descriptor block + data blocks, then the commit block. */
+    /* 2. On the epoch's FIRST txn, point the journal sb at the epoch start
+     * (== j_first; the log is contiguous from there).  Written but NOT synced
+     * here — folded into the step-3 commit sync.  Later txns leave s_start /
+     * s_sequence unchanged (recovery follows the sequence chain forward). */
+    if (!s_epoch_open) {
+        s_epoch_seq = seq;
+        jsb->s_start    = __builtin_bswap32((uint32_t)first);
+        jsb->s_sequence = __builtin_bswap32(seq);
+        ext4_jsb_csum_set(fs->j_sb_buf, csum3);
+        jlog_write(fs, 0, fs->j_sb_buf);
+    }
+
+    /* 3. descriptor block + data blocks, then the commit block, at the head. */
     uint8_t *db  = (uint8_t *)kalloc(fs->block_size);
     uint8_t *cpy = (uint8_t *)kalloc(fs->block_size);
-    if (!db || !cpy) {                /* OOM: degrade to direct, clear RECOVER */
+    if (!db || !cpy) {                /* OOM: drain epoch + direct for this op */
         if (db) kfree(db);
         if (cpy) kfree(cpy);
+        ext4_checkpoint(fs);
         for (unsigned i = 0; i < n; i++)
             ext4_write_block_direct(fs, s_txn.blk[i], s_txn.data[i]);
         if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
-        jsb->s_start = 0; jsb->s_sequence = __builtin_bswap32(seq + 1);
-        ext4_jsb_csum_set(fs->j_sb_buf, csum3);
-        jlog_write(fs, 0, fs->j_sb_buf);
-        fs->sb_copy.s_feature_incompat &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
-        fs->feature_incompat           &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
-        ext4_write_super(fs);
-        if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
-        fs->j_sequence = seq + 1;
         return;
     }
     mm_memset(db, 0, fs->block_size);
@@ -3461,7 +3615,7 @@ static void ext4_txn_flush(ext4_fs_t *fs)
             mm_memcpy(db + off, fs->j_uuid, 16);
             off += 16;
         }
-        jlog_write(fs, first + 1 + i, cpy);
+        jlog_write(fs, pos + 1 + i, cpy);
     }
     /* csum v3: the descriptor's TAIL csum covers the whole block (tags + their
      * per-block csums) with the tail field zeroed — stamp it after the loop. */
@@ -3470,7 +3624,7 @@ static void ext4_txn_flush(ext4_fs_t *fs)
         *dt = 0;
         *dt = __builtin_bswap32(ext4_crc32c(fs->j_csum_seed, db, fs->block_size));
     }
-    jlog_write(fs, first, db);                         /* the descriptor      */
+    jlog_write(fs, pos, db);                            /* the descriptor      */
     mm_memset(cpy, 0, fs->block_size);                 /* commit block        */
     journal_header_t *ch = (journal_header_t *)cpy;
     ch->h_magic     = __builtin_bswap32(JBD2_MAGIC_NUMBER);
@@ -3481,42 +3635,46 @@ static void ext4_txn_flush(ext4_fs_t *fs)
         *cc = 0;                                       /* h_chksum[0] zeroed   */
         *cc = __builtin_bswap32(ext4_crc32c(fs->j_csum_seed, cpy, fs->block_size));
     }
-    jlog_write(fs, first + 1 + n, cpy);
+    jlog_write(fs, pos + 1 + n, cpy);
     if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);  /* commit durable */
     kfree(db);
     kfree(cpy);
 
-    /* 4. checkpoint the (unescaped) blocks to their final locations. */
+    /* 4. record the committed txn in the epoch pending set (no checkpoint yet)
+     * and advance the log head + sequence. */
     for (unsigned i = 0; i < n; i++)
-        ext4_write_block_direct(fs, s_txn.blk[i], s_txn.data[i]);
-    if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
-
-    /* 5. DO NOT empty the journal here.  Leave s_start pointing at this (now
-     * checkpointed) transaction so an unclean reboot replays it — idempotently,
-     * since checkpointing already put the blocks at their final locations.  The
-     * journal is cleaned only on an explicit sync or by the next mount's
-     * recovery (jbd2's lazy-checkpoint behaviour).  This is what makes recovery
-     * actually fire after a crash instead of almost always finding s_start=0.
-     * The next commit overwrites this slot (its step 2 advances s_sequence
-     * first, so a crash between commits never mis-replays a stale slot). */
+        ext4_ckpt_merge(fs, s_txn.blk[i], s_txn.data[i]);
+    s_jhead      = pos + n + 2;
+    s_epoch_open = 1;
     fs->j_sequence = seq + 1;
+
+    /* 5. If this op freed a block that still had a journal copy, checkpoint now
+     * so that stale copy can never be replayed over the block's reuse. */
+    if (s_force_ckpt) {
+        ext4_checkpoint(fs);
+        s_force_ckpt = 0;
+    }
 }
 
-/* Clean the journal: mark it empty (s_start=0) and drop needs-recovery.  Called
- * on explicit sync and from a clean unmount path — NOT per commit.  After this,
- * a reboot finds a clean fs and does not replay. */
+/* Clean the journal: checkpoint any open epoch to its final locations, mark the
+ * log empty (s_start=0) and drop needs-recovery.  Called on explicit sync /
+ * fsync / shutdown — NOT per commit.  After this the on-disk fs is fully
+ * consistent and a reboot finds a clean fs that does not replay. */
 static void ext4_journal_clean(ext4_fs_t *fs)
 {
     if (!fs || !fs->j_enabled || !fs->j_sb_buf)
         return;
+    ext4_checkpoint(fs);              /* flush pending epoch -> final, s_start=0 */
     if (!(fs->sb_copy.s_feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER))
         return;                                   /* already clean */
     journal_superblock_t *jsb = (journal_superblock_t *)fs->j_sb_buf;
-    jsb->s_start    = 0;
-    jsb->s_sequence = __builtin_bswap32(fs->j_sequence);
-    ext4_jsb_csum_set(fs->j_sb_buf, fs->j_csum3);
-    jlog_write(fs, 0, fs->j_sb_buf);
-    if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+    if (jsb->s_start != 0) {                       /* ensure log empty on disk   */
+        jsb->s_start    = 0;
+        jsb->s_sequence = __builtin_bswap32(fs->j_sequence);
+        ext4_jsb_csum_set(fs->j_sb_buf, fs->j_csum3);
+        jlog_write(fs, 0, fs->j_sb_buf);
+        if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+    }
     fs->sb_copy.s_feature_incompat &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
     fs->feature_incompat           &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
     ext4_write_super(fs);
@@ -3696,6 +3854,40 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
         }
     }
 
+    /* Resync the superblock free counts to the (authoritative, journalled) group
+     * descriptors.  The per-group counts are journalled and recovered exactly,
+     * but the superblock totals are written eagerly/direct by ext4_flush_meta and
+     * are NOT journalled, so after a crash the on-disk superblock total can drift
+     * from the recovered bitmaps (e2fsck: "free blocks count wrong").  Summing the
+     * GDT (which matches the bitmaps) makes them consistent again — self-healing
+     * on every mount; a clean fs already matches so nothing is written. */
+    {
+        int is64 = (out->feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) != 0;
+        uint64_t fb = 0; uint32_t fi = 0;
+        for (unsigned g = 0; g < out->groups_count; g++) {
+            uint32_t gb = out->gdt[g].bg_free_blocks_count_lo;
+            uint32_t gi = out->gdt[g].bg_free_inodes_count_lo;
+            if (is64) {
+                gb |= (uint32_t)out->gdt[g].bg_free_blocks_count_hi << 16;
+                gi |= (uint32_t)out->gdt[g].bg_free_inodes_count_hi << 16;
+            }
+            fb += gb; fi += gi;
+        }
+        uint32_t fb_lo = (uint32_t)fb, fb_hi = (uint32_t)(fb >> 32);
+        if (out->sb_copy.s_free_blocks_count_lo != fb_lo ||
+            out->sb_copy.s_free_blocks_count_hi != fb_hi ||
+            out->sb_copy.s_free_inodes_count    != fi) {
+            out->sb_copy.s_free_blocks_count_lo = fb_lo;
+            out->sb_copy.s_free_blocks_count_hi = fb_hi;
+            out->sb_copy.s_free_inodes_count    = fi;
+            ext4_write_super(out);
+            if (out->bdev && out->bdev->sync)
+                out->bdev->sync((block_device_t *)out->bdev);
+            kprintf("ext4: resynced superblock free counts (blocks=%lu inodes=%u)\n",
+                    (unsigned long)fb, fi);
+        }
+    }
+
     /* PJ: set up journaled writes (ordered mode).  Disabled unless the journal
      * exists, matches our block size, and uses only features we can WRITE
      * correctly.  We stamp jbd2 csum v3, so a csum-v3 journal is supported; csum
@@ -3733,6 +3925,14 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
                 out->j_csum_seed = ext4_crc32c(0xFFFFFFFFu, out->j_uuid, 16);
                 if (out->j_maxlen > out->j_first + 3)
                     out->j_enabled = 1;
+                /* P7: deferred-checkpoint epoch state.  The log is empty here
+                 * (recovery, run earlier, left s_start=0), so the first epoch
+                 * starts writing at j_first. */
+                s_jhead      = out->j_first;
+                s_epoch_open = 0;
+                s_ckpt.n     = 0;
+                s_force_ckpt = 0;
+                s_epoch_seq  = 0;
 
                 /* Make the journal a well-formed csum-v3 journal on a
                  * metadata_csum fs, like the Linux kernel does on first rw mount.
