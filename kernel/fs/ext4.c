@@ -1937,6 +1937,349 @@ static void ext4_free_blocks_from(ext4_fs_t *fs, ext4_inode *in, unsigned long f
     in->i_blocks_lo = (in->i_blocks_lo >= fsub) ? (in->i_blocks_lo - fsub) : 0;
 }
 
+/* ===================================================================
+ * Extended attributes (xattr) — storage layer.
+ *
+ * STAGE 1a: in-inode ("ibody") attributes only — those stored in the inode's
+ * slack space [128 + i_extra_isize, s_inode_size).  This region is covered by
+ * the inode metadata_csum (already computed correctly), so there is no separate
+ * on-disk hash/checksum to get byte-exact here.  The external xattr block (with
+ * its own hash + crc32c) is a later increment; get/list already leave a hook for
+ * it.  Values stored in a separate inode (e_value_inum != 0) are not produced by
+ * us and are treated as absent on read.
+ * =================================================================== */
+
+/* xattr set flags (match the userspace XATTR_CREATE / XATTR_REPLACE). */
+#define EXT4_XATTR_CREATE   1     /* fail with EEXIST if the attr exists      */
+#define EXT4_XATTR_REPLACE  2     /* fail with ENODATA if it does not exist   */
+
+/* Map a namespace prefix to its e_name_index; *suffix/*suffix_len receive the
+ * part after the prefix.  Returns 0 for an unknown/unsupported namespace. */
+static int ext4_xattr_name_index(const char *full, const char **suffix, unsigned *slen)
+{
+    static const struct { const char *p; int idx; } pre[] = {
+        { "user.",                   EXT4_XATTR_INDEX_USER },
+        { "system.posix_acl_access", EXT4_XATTR_INDEX_POSIX_ACL_ACCESS },
+        { "system.posix_acl_default",EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT },
+        { "trusted.",                EXT4_XATTR_INDEX_TRUSTED },
+        { "security.",               EXT4_XATTR_INDEX_SECURITY },
+        { "system.",                 EXT4_XATTR_INDEX_SYSTEM },
+    };
+    for (unsigned k = 0; k < sizeof(pre)/sizeof(pre[0]); k++) {
+        const char *p = pre[k].p; const char *f = full;
+        while (*p && *p == *f) { p++; f++; }
+        if (*p) continue;                         /* prefix didn't fully match */
+        /* posix_acl_* are whole names (no suffix); the others are prefixes. */
+        int whole = (pre[k].idx == EXT4_XATTR_INDEX_POSIX_ACL_ACCESS ||
+                     pre[k].idx == EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT);
+        if (whole && *f) continue;                /* must match exactly        */
+        *suffix = f;
+        unsigned n = 0; while (f[n]) n++;
+        *slen = n;
+        return pre[k].idx;
+    }
+    return 0;
+}
+
+/* The namespace prefix for an index (for listxattr output).  NULL if unknown. */
+static const char *ext4_xattr_prefix(int idx)
+{
+    switch (idx) {
+        case EXT4_XATTR_INDEX_USER:                return "user.";
+        case EXT4_XATTR_INDEX_POSIX_ACL_ACCESS:    return "system.posix_acl_access";
+        case EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT:   return "system.posix_acl_default";
+        case EXT4_XATTR_INDEX_TRUSTED:             return "trusted.";
+        case EXT4_XATTR_INDEX_SECURITY:            return "security.";
+        case EXT4_XATTR_INDEX_SYSTEM:              return "system.";
+        default:                                   return 0;
+    }
+}
+
+/* In-memory attribute used while rebuilding a region (parse -> modify -> serialize). */
+#define EXT4_XA_MAX_ATTRS  32
+#define EXT4_XA_MAX_NAME   255
+typedef struct {
+    uint8_t  index;
+    uint8_t  name_len;
+    char     name[EXT4_XA_MAX_NAME];
+    uint32_t value_size;
+    uint8_t *value;                 /* kalloc'd (value_size bytes) or NULL    */
+} ext4_xa_attr;
+typedef struct { ext4_xa_attr a[EXT4_XA_MAX_ATTRS]; unsigned n; } ext4_xa_list;
+
+static void ext4_xa_list_free(ext4_xa_list *L)
+{
+    for (unsigned i = 0; i < L->n; i++)
+        if (L->a[i].value) { kfree(L->a[i].value); L->a[i].value = 0; }
+    L->n = 0;
+}
+
+/* Parse the entries of one xattr region into L.  `first` points at the first
+ * entry, `end` bounds both entries and (inline) values, `value_base` is what
+ * e_value_offs is measured from (the block start for a block; `first` for an
+ * ibody region). */
+static int ext4_xa_parse(ext4_xa_list *L, const uint8_t *first, const uint8_t *end,
+                         const uint8_t *value_base)
+{
+    const uint8_t *p = first;
+    while (p + sizeof(ext4_xattr_entry) <= end) {
+        const ext4_xattr_entry *e = (const ext4_xattr_entry *)p;
+        uint32_t first4; mm_memcpy(&first4, p, 4);
+        if (first4 == 0) break;                   /* zero terminator           */
+        if (e->e_name_len == 0) break;
+        const uint8_t *nm = p + sizeof(ext4_xattr_entry);
+        if (nm + e->e_name_len > end) break;       /* malformed: stop          */
+        if (L->n < EXT4_XA_MAX_ATTRS) {   /* e_name_len is u8 <= EXT4_XA_MAX_NAME */
+            ext4_xa_attr *a = &L->a[L->n];
+            a->index = e->e_name_index;
+            a->name_len = e->e_name_len;
+            mm_memcpy(a->name, nm, e->e_name_len);
+            a->value_size = e->e_value_size;
+            a->value = 0;
+            if (e->e_value_inum == 0 && e->e_value_size > 0) {
+                const uint8_t *v = value_base + e->e_value_offs;
+                if (v >= first && v + e->e_value_size <= end) {
+                    a->value = (uint8_t *)kalloc(e->e_value_size);
+                    if (a->value) mm_memcpy(a->value, v, e->e_value_size);
+                }
+            }
+            L->n++;
+        }
+        p = nm + ((e->e_name_len + EXT4_XATTR_ROUND) & ~EXT4_XATTR_ROUND);
+    }
+    return ST_OK;
+}
+
+/* Bytes a list needs when serialized into a region (header + entries + 4-byte
+ * terminator + 4-byte-aligned values).  `hdr_size` is 4 for ibody, 32 for a
+ * block. */
+static unsigned long ext4_xa_serial_size(const ext4_xa_list *L, unsigned hdr_size)
+{
+    unsigned long ent = 0, val = 0;
+    for (unsigned i = 0; i < L->n; i++) {
+        ent += EXT4_XATTR_LEN(L->a[i].name_len);
+        val += EXT4_XATTR_SIZE(L->a[i].value_size);
+    }
+    return hdr_size + ent + 4 /*terminator*/ + val;
+}
+
+/* Find an attribute in L by (index,name); returns its index in L or -1. */
+static int ext4_xa_find(const ext4_xa_list *L, int index, const char *name, unsigned nlen)
+{
+    for (unsigned i = 0; i < L->n; i++) {
+        if (L->a[i].index != index || L->a[i].name_len != nlen) continue;
+        unsigned k = 0; while (k < nlen && L->a[i].name[k] == name[k]) k++;
+        if (k == nlen) return (int)i;
+    }
+    return -1;
+}
+
+/* Serialize L into an ibody region [region, region+size).  Entries grow forward
+ * after the 4-byte ibody header; values grow backward from region+size.  Returns
+ * ST_OK, or ST_NOSPC if it does not fit.  e_hash is left 0 (ibody entries are not
+ * part of any shareable-block hash; the inode csum covers the region). */
+static int ext4_xa_serialize_ibody(uint8_t *region, unsigned long size, const ext4_xa_list *L)
+{
+    if (L->n == 0) {                              /* no attrs: clear the region */
+        mm_memset(region, 0, size);
+        return ST_OK;
+    }
+    if (ext4_xa_serial_size(L, sizeof(ext4_xattr_ibody_header)) > size)
+        return ST_NOSPC;
+    mm_memset(region, 0, size);
+    ext4_xattr_ibody_header *h = (ext4_xattr_ibody_header *)region;
+    h->h_magic = EXT4_XATTR_MAGIC;
+    uint8_t *ifirst = region + sizeof(ext4_xattr_ibody_header);
+    uint8_t *ep = ifirst;
+    unsigned long vpos = size;                    /* value offsets are from ifirst */
+    for (unsigned i = 0; i < L->n; i++) {
+        const ext4_xa_attr *a = &L->a[i];
+        unsigned vlen = EXT4_XATTR_SIZE(a->value_size);
+        vpos -= vlen;                             /* place value (region-relative) */
+        if (a->value_size && a->value)
+            mm_memcpy(region + vpos, a->value, a->value_size);
+        ext4_xattr_entry *e = (ext4_xattr_entry *)ep;
+        e->e_name_len   = a->name_len;
+        e->e_name_index = a->index;
+        e->e_value_offs = (uint16_t)(vpos - (unsigned long)(ifirst - region)); /* from ifirst */
+        e->e_value_inum = 0;
+        e->e_value_size = a->value_size;
+        e->e_hash       = 0;
+        mm_memcpy(e->e_name, a->name, a->name_len);
+        ep += EXT4_XATTR_LEN(a->name_len);
+    }
+    return ST_OK;
+}
+
+/* Locate the ibody xattr region of inode `ino` within its inode-table block.
+ * Returns ST_OK with *blk/*off (the block + inode offset), *rstart (offset of
+ * the region within the block) and *rsize (region length).  *rsize==0 if the
+ * inode has no usable ibody xattr space. */
+static int ext4_xattr_ibody_region(ext4_fs_t *fs, unsigned long ino, ext4_inode *in,
+                                   unsigned long *blk, unsigned *off,
+                                   unsigned *rstart, unsigned *rsize)
+{
+    int st = ext4_read_inode_loc(fs, ino, in, blk, off);
+    if (st != ST_OK) return st;
+    unsigned extra = in->i_extra_isize;
+    unsigned start = *off + EXT4_GOOD_OLD_INODE_SIZE + extra;
+    unsigned endb  = *off + fs->inode_size;
+    if (fs->inode_size <= EXT4_GOOD_OLD_INODE_SIZE ||
+        extra < 4 || start + sizeof(ext4_xattr_ibody_header) >= endb) {
+        *rstart = 0; *rsize = 0;
+    } else {
+        *rstart = start; *rsize = endb - start;
+    }
+    return ST_OK;
+}
+
+/* getxattr: copy the value of (index,name) into buf (or return its size if
+ * buf==NULL / size==0).  Returns the value size, ST_NOT_FOUND, or ST_INVALID
+ * (buffer too small => -ERANGE handled by the caller). */
+static int ext4_xattr_get_ino(ext4_fs_t *fs, unsigned long ino, int index,
+                              const char *name, unsigned nlen,
+                              void *buf, unsigned long bufsz)
+{
+    ext4_inode in; unsigned long blk; unsigned off, rstart, rsize;
+    int st = ext4_xattr_ibody_region(fs, ino, &in, &blk, &off, &rstart, &rsize);
+    if (st != ST_OK) return st;
+    int found_size = ST_NODATA;
+    if (rsize) {
+        uint8_t *bbuf = (uint8_t *)kalloc(fs->block_size);
+        if (!bbuf) return ST_NOMEM;
+        if (ext4_read_block(fs, blk, bbuf) == ST_OK) {
+            uint8_t *region = bbuf + rstart;
+            uint32_t mag; mm_memcpy(&mag, region, 4);
+            if (mag == EXT4_XATTR_MAGIC) {
+                uint8_t *ifirst = region + sizeof(ext4_xattr_ibody_header);
+                uint8_t *rend = bbuf + off + fs->inode_size;
+                static ext4_xa_list L; L.n = 0;
+                ext4_xa_parse(&L, ifirst, rend, ifirst);
+                int i = ext4_xa_find(&L, index, name, nlen);
+                if (i >= 0) {
+                    unsigned vs = L.a[i].value_size;
+                    if (bufsz == 0 || buf == 0) found_size = (int)vs;
+                    else if (vs > bufsz)        found_size = ST_RANGE;     /* ERANGE */
+                    else { if (vs && L.a[i].value) mm_memcpy(buf, L.a[i].value, vs);
+                           found_size = (int)vs; }
+                }
+                ext4_xa_list_free(&L);
+            }
+        }
+        kfree(bbuf);
+    }
+    /* (external xattr block lookup goes here in the next increment) */
+    return found_size;
+}
+
+/* listxattr: write NUL-separated full names into buf (or return total size if
+ * buf==NULL/size==0).  Returns total bytes, or ST_INVALID (=> -ERANGE). */
+static int ext4_xattr_list_ino(ext4_fs_t *fs, unsigned long ino, char *buf, unsigned long bufsz)
+{
+    ext4_inode in; unsigned long blk; unsigned off, rstart, rsize;
+    int st = ext4_xattr_ibody_region(fs, ino, &in, &blk, &off, &rstart, &rsize);
+    if (st != ST_OK) return st;
+    unsigned long total = 0;
+    int erange = 0;
+    if (rsize) {
+        uint8_t *bbuf = (uint8_t *)kalloc(fs->block_size);
+        if (!bbuf) return ST_NOMEM;
+        if (ext4_read_block(fs, blk, bbuf) == ST_OK) {
+            uint8_t *region = bbuf + rstart;
+            uint32_t mag; mm_memcpy(&mag, region, 4);
+            if (mag == EXT4_XATTR_MAGIC) {
+                uint8_t *ifirst = region + sizeof(ext4_xattr_ibody_header);
+                uint8_t *rend = bbuf + off + fs->inode_size;
+                static ext4_xa_list L; L.n = 0;
+                ext4_xa_parse(&L, ifirst, rend, ifirst);
+                for (unsigned i = 0; i < L.n; i++) {
+                    const char *pre = ext4_xattr_prefix(L.a[i].index);
+                    if (!pre) continue;
+                    unsigned plen = 0; while (pre[plen]) plen++;
+                    unsigned full = plen + L.a[i].name_len + 1; /* + NUL */
+                    if (buf && bufsz) {
+                        if (total + full > bufsz) { erange = 1; }
+                        else {
+                            mm_memcpy(buf + total, pre, plen);
+                            mm_memcpy(buf + total + plen, L.a[i].name, L.a[i].name_len);
+                            buf[total + plen + L.a[i].name_len] = '\0';
+                        }
+                    }
+                    total += full;
+                }
+                ext4_xa_list_free(&L);
+            }
+        }
+        kfree(bbuf);
+    }
+    if (erange) return ST_RANGE;         /* -ERANGE */
+    return (int)total;
+}
+
+/* setxattr/removexattr (value==NULL && size==0 with EXT4_XATTR_REPLACE-less means
+ * set empty; the dedicated remove path passes remove=1).  Writes the rebuilt
+ * ibody region back with a recomputed inode csum, journalled.  Returns ST_OK or
+ * an ST_ error (ST_EXISTS, ST_NOT_FOUND, ST_NOSPC, ...). */
+static int ext4_xattr_set_ino(ext4_fs_t *fs, unsigned long ino, int index,
+                              const char *name, unsigned nlen,
+                              const void *value, unsigned long size, int flags, int remove)
+{
+    if (nlen == 0 || nlen > EXT4_XA_MAX_NAME) return ST_INVALID;
+    ext4_inode in; unsigned long blk; unsigned off, rstart, rsize;
+    int st = ext4_xattr_ibody_region(fs, ino, &in, &blk, &off, &rstart, &rsize);
+    if (st != ST_OK) return st;
+    if (rsize == 0) return remove ? ST_NODATA : ST_NOSPC;     /* no ibody space */
+
+    uint8_t *bbuf = (uint8_t *)kalloc(fs->block_size);
+    if (!bbuf) return ST_NOMEM;
+    if (ext4_read_block(fs, blk, bbuf) != ST_OK) { kfree(bbuf); return ST_IO; }
+
+    uint8_t *region = bbuf + rstart;
+    uint8_t *ifirst = region + sizeof(ext4_xattr_ibody_header);
+    uint8_t *rend = bbuf + off + fs->inode_size;
+    static ext4_xa_list L; L.n = 0;
+    uint32_t mag; mm_memcpy(&mag, region, 4);
+    if (mag == EXT4_XATTR_MAGIC)
+        ext4_xa_parse(&L, ifirst, rend, ifirst);
+
+    int idx = ext4_xa_find(&L, index, name, nlen);
+    int rc = ST_OK;
+    if (remove) {
+        if (idx < 0) { rc = ST_NODATA; goto out; }
+        if (L.a[idx].value) kfree(L.a[idx].value);
+        for (unsigned i = idx; i + 1 < L.n; i++) L.a[i] = L.a[i+1];
+        L.n--;
+    } else {
+        if (idx >= 0 && (flags & EXT4_XATTR_CREATE)) { rc = ST_EXISTS; goto out; }
+        if (idx < 0  && (flags & EXT4_XATTR_REPLACE)){ rc = ST_NODATA; goto out; }
+        uint8_t *nv = 0;
+        if (size) { nv = (uint8_t *)kalloc(size); if (!nv) { rc = ST_NOMEM; goto out; }
+                    mm_memcpy(nv, value, size); }
+        if (idx >= 0) {                          /* replace value in place      */
+            if (L.a[idx].value) kfree(L.a[idx].value);
+            L.a[idx].value = nv; L.a[idx].value_size = (uint32_t)size;
+        } else {                                 /* add a new attribute         */
+            if (L.n >= EXT4_XA_MAX_ATTRS) { if (nv) kfree(nv); rc = ST_NOSPC; goto out; }
+            ext4_xa_attr *a = &L.a[L.n++];
+            a->index = (uint8_t)index; a->name_len = (uint8_t)nlen;
+            mm_memcpy(a->name, name, nlen);
+            a->value = nv; a->value_size = (uint32_t)size;
+        }
+    }
+
+    if (ext4_xa_serialize_ibody(region, rsize, &L) != ST_OK) {
+        rc = ST_NOSPC;                            /* too big for the inode slack */
+        goto out;
+    }
+    ext4_inode_csum_set(fs, ino, bbuf + off);     /* re-stamp the inode csum     */
+    if (ext4_write_block(fs, blk, bbuf) != ST_OK) rc = ST_IO;
+    ext4_inode_cache_drop(ino);
+out:
+    ext4_xa_list_free(&L);
+    kfree(bbuf);
+    return rc;
+}
+
 /* ---- directory entry insert / remove ---- */
 static inline unsigned ext4_dirent_len(unsigned name_len) { return (8 + name_len + 3) & ~3u; }
 
@@ -2958,6 +3301,116 @@ static int ext4_setid_clean_op(vfs_file_t *f, int mark)
     return (ic->flags & IC_SETID_CLEAN) ? 1 : 0;
 }
 
+/* ---- xattr VFS ops ----  Each takes the I/O lock (which begins a journalled
+ * transaction); the set/remove paths refuse cleanly on a read-only/errored fs.
+ * The full attribute name is parsed into a namespace index + suffix here. */
+static int ext4_xattr_resolve(const char *path, int nofollow, unsigned long *ino)
+{
+    return ext4_resolve_ex(g_ext4_fs, g_ext4_cwd_ino, path, !nofollow, ino, 0);
+}
+static int ext4_getxattr_op(const char *path, int nofollow, const char *name,
+                            void *val, unsigned long size)
+{
+    if (!g_ext4_fs || !path || !name) return ST_INVALID;
+    const char *suf; unsigned slen;
+    int idx = ext4_xattr_name_index(name, &suf, &slen);
+    if (idx == 0 || slen == 0) return ST_NODATA;
+    ext4_io_lock();
+    unsigned long ino;
+    int r = ext4_xattr_resolve(path, nofollow, &ino);
+    if (r == ST_OK) r = ext4_xattr_get_ino(g_ext4_fs, ino, idx, suf, slen, val, size);
+    ext4_io_unlock();
+    return r;
+}
+static int ext4_setxattr_op(const char *path, int nofollow, const char *name,
+                            const void *val, unsigned long size, int flags)
+{
+    if (!g_ext4_fs || !path || !name) return ST_INVALID;
+    if (ext4_is_ro()) return ST_ROFS;
+    const char *suf; unsigned slen;
+    int idx = ext4_xattr_name_index(name, &suf, &slen);
+    if (idx == 0 || slen == 0) return ST_UNSUPPORTED;
+    ext4_io_lock();
+    unsigned long ino;
+    int r = ext4_xattr_resolve(path, nofollow, &ino);
+    if (r == ST_OK) r = ext4_xattr_set_ino(g_ext4_fs, ino, idx, suf, slen, val, size, flags, 0);
+    ext4_io_unlock();
+    return r;
+}
+static int ext4_listxattr_op(const char *path, int nofollow, char *list, unsigned long size)
+{
+    if (!g_ext4_fs || !path) return ST_INVALID;
+    ext4_io_lock();
+    unsigned long ino;
+    int r = ext4_xattr_resolve(path, nofollow, &ino);
+    if (r == ST_OK) r = ext4_xattr_list_ino(g_ext4_fs, ino, list, size);
+    ext4_io_unlock();
+    return r;
+}
+static int ext4_removexattr_op(const char *path, int nofollow, const char *name)
+{
+    if (!g_ext4_fs || !path || !name) return ST_INVALID;
+    if (ext4_is_ro()) return ST_ROFS;
+    const char *suf; unsigned slen;
+    int idx = ext4_xattr_name_index(name, &suf, &slen);
+    if (idx == 0 || slen == 0) return ST_NODATA;
+    ext4_io_lock();
+    unsigned long ino;
+    int r = ext4_xattr_resolve(path, nofollow, &ino);
+    if (r == ST_OK) r = ext4_xattr_set_ino(g_ext4_fs, ino, idx, suf, slen, 0, 0, 0, 1);
+    ext4_io_unlock();
+    return r;
+}
+static ext4_file_t *ext4_ef(vfs_file_t *f)
+{
+    if (!f || f->ops != &ext4_vfs_ops || !f->fs_private) return 0;
+    return (ext4_file_t *)f->fs_private;
+}
+static int ext4_fgetxattr_op(vfs_file_t *f, const char *name, void *val, unsigned long size)
+{
+    ext4_file_t *ef = ext4_ef(f); if (!ef || !name || !g_ext4_fs) return ST_INVALID;
+    const char *suf; unsigned slen;
+    int idx = ext4_xattr_name_index(name, &suf, &slen);
+    if (idx == 0 || slen == 0) return ST_NODATA;
+    ext4_io_lock();
+    int r = ext4_xattr_get_ino(g_ext4_fs, ef->ino, idx, suf, slen, val, size);
+    ext4_io_unlock();
+    return r;
+}
+static int ext4_fsetxattr_op(vfs_file_t *f, const char *name, const void *val,
+                             unsigned long size, int flags)
+{
+    ext4_file_t *ef = ext4_ef(f); if (!ef || !name || !g_ext4_fs) return ST_INVALID;
+    if (ext4_is_ro()) return ST_ROFS;
+    const char *suf; unsigned slen;
+    int idx = ext4_xattr_name_index(name, &suf, &slen);
+    if (idx == 0 || slen == 0) return ST_UNSUPPORTED;
+    ext4_io_lock();
+    int r = ext4_xattr_set_ino(g_ext4_fs, ef->ino, idx, suf, slen, val, size, flags, 0);
+    ext4_io_unlock();
+    return r;
+}
+static int ext4_flistxattr_op(vfs_file_t *f, char *list, unsigned long size)
+{
+    ext4_file_t *ef = ext4_ef(f); if (!ef || !g_ext4_fs) return ST_INVALID;
+    ext4_io_lock();
+    int r = ext4_xattr_list_ino(g_ext4_fs, ef->ino, list, size);
+    ext4_io_unlock();
+    return r;
+}
+static int ext4_fremovexattr_op(vfs_file_t *f, const char *name)
+{
+    ext4_file_t *ef = ext4_ef(f); if (!ef || !name || !g_ext4_fs) return ST_INVALID;
+    if (ext4_is_ro()) return ST_ROFS;
+    const char *suf; unsigned slen;
+    int idx = ext4_xattr_name_index(name, &suf, &slen);
+    if (idx == 0 || slen == 0) return ST_NODATA;
+    ext4_io_lock();
+    int r = ext4_xattr_set_ino(g_ext4_fs, ef->ino, idx, suf, slen, 0, 0, 0, 1);
+    ext4_io_unlock();
+    return r;
+}
+
 static const vfs_ops_t ext4_vfs_ops = {
     ext4_open, ext4_stat_vfs, ext4_read, ext4_write, ext4_seek, ext4_readdir,
     ext4_truncate, ext4_unlink, ext4_rename, ext4_mkdir, ext4_rmdir, ext4_chdir,
@@ -2967,6 +3420,9 @@ static const vfs_ops_t ext4_vfs_ops = {
     ext4_chmod, ext4_chown, ext4_fchmod_op, ext4_fchown_op,
     ext4_utimensat, ext4_statfs_op, ext4_fstat_op, ext4_setid_clean_op,
     ext4_sync_op,
+    /* xattr ops */
+    ext4_getxattr_op, ext4_setxattr_op, ext4_listxattr_op, ext4_removexattr_op,
+    ext4_fgetxattr_op, ext4_fsetxattr_op, ext4_flistxattr_op, ext4_fremovexattr_op,
 };
 
 /* ===================================================================

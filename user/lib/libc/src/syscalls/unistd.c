@@ -19,6 +19,7 @@
 #include <sys/ioctl.h>
 #include <sys/sysinfo.h>
 #include <sys/klog.h>
+#include <sys/xattr.h>
 #include "syscall.h"
 
 int errno = 0;
@@ -841,4 +842,67 @@ long syscall(long number, ...) {
     a6 = va_arg(ap, long);
     va_end(ap);
     return syscall6(number, a1, a2, a3, a4, a5, a6);
+}
+
+/* ---- extended attributes (sys/xattr.h) ---- */
+int setxattr(const char *path, const char *name, const void *value, size_t size, int flags) {
+    long r = syscall5(SYS_SETXATTR, (long)path, (long)name, (long)value, (long)size, (long)flags);
+    if (r < 0) { errno = -r; return -1; }
+    return 0;
+}
+int lsetxattr(const char *path, const char *name, const void *value, size_t size, int flags) {
+    long r = syscall5(SYS_SETXATTR, (long)path, (long)name, (long)value, (long)size,
+                      (long)(flags | XATTR_SYS_NOFOLLOW));
+    if (r < 0) { errno = -r; return -1; }
+    return 0;
+}
+int fsetxattr(int fd, const char *name, const void *value, size_t size, int flags) {
+    long r = syscall5(SYS_FSETXATTR, fd, (long)name, (long)value, (long)size, (long)flags);
+    if (r < 0) { errno = -r; return -1; }
+    return 0;
+}
+ssize_t getxattr(const char *path, const char *name, void *value, size_t size) {
+    long r = syscall5(SYS_GETXATTR, (long)path, (long)name, (long)value, (long)size, 0);
+    if (r < 0) { errno = -r; return -1; }
+    return r;
+}
+ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size) {
+    long r = syscall5(SYS_GETXATTR, (long)path, (long)name, (long)value, (long)size, 1);
+    if (r < 0) { errno = -r; return -1; }
+    return r;
+}
+ssize_t fgetxattr(int fd, const char *name, void *value, size_t size) {
+    long r = syscall4(SYS_FGETXATTR, fd, (long)name, (long)value, (long)size);
+    if (r < 0) { errno = -r; return -1; }
+    return r;
+}
+ssize_t listxattr(const char *path, char *list, size_t size) {
+    long r = syscall4(SYS_LISTXATTR, (long)path, (long)list, (long)size, 0);
+    if (r < 0) { errno = -r; return -1; }
+    return r;
+}
+ssize_t llistxattr(const char *path, char *list, size_t size) {
+    long r = syscall4(SYS_LISTXATTR, (long)path, (long)list, (long)size, 1);
+    if (r < 0) { errno = -r; return -1; }
+    return r;
+}
+ssize_t flistxattr(int fd, char *list, size_t size) {
+    long r = syscall3(SYS_FLISTXATTR, fd, (long)list, (long)size);
+    if (r < 0) { errno = -r; return -1; }
+    return r;
+}
+int removexattr(const char *path, const char *name) {
+    long r = syscall3(SYS_REMOVEXATTR, (long)path, (long)name, 0);
+    if (r < 0) { errno = -r; return -1; }
+    return 0;
+}
+int lremovexattr(const char *path, const char *name) {
+    long r = syscall3(SYS_REMOVEXATTR, (long)path, (long)name, 1);
+    if (r < 0) { errno = -r; return -1; }
+    return 0;
+}
+int fremovexattr(int fd, const char *name) {
+    long r = syscall2(SYS_FREMOVEXATTR, fd, (long)name);
+    if (r < 0) { errno = -r; return -1; }
+    return 0;
 }

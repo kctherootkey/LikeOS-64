@@ -249,6 +249,64 @@ typedef struct ext4_dir_entry_2 {
 } __attribute__((packed)) ext4_dir_entry_2;
 
 /* ===================================================================
+ * Extended attributes (xattr) — little-endian, like the rest of ext4.
+ *
+ * Attributes live in the inode's slack space ("ibody": from
+ * 128 + i_extra_isize up to s_inode_size) and/or one external block pointed
+ * to by i_file_acl.  Both regions hold: a header, then fixed 16-byte entries
+ * growing FORWARD (each immediately followed by its non-NUL name, the whole
+ * thing 4-byte aligned), a zero terminator entry, and the values growing
+ * BACKWARD from the region end (each value 4-byte aligned).  e_value_offs is
+ * measured from the block start for a block, or from the first entry (IFIRST)
+ * for an ibody region.
+ * =================================================================== */
+#define EXT4_XATTR_MAGIC          0xEA020000u
+#define EXT4_XATTR_PAD            4
+#define EXT4_XATTR_ROUND          (EXT4_XATTR_PAD - 1)
+/* e_name_index namespace prefixes */
+#define EXT4_XATTR_INDEX_USER                 1
+#define EXT4_XATTR_INDEX_POSIX_ACL_ACCESS     2
+#define EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT    3
+#define EXT4_XATTR_INDEX_TRUSTED              4
+#define EXT4_XATTR_INDEX_SECURITY             6
+#define EXT4_XATTR_INDEX_SYSTEM               7
+
+/* External xattr block header (32 bytes) at the start of the i_file_acl block. */
+typedef struct ext4_xattr_header {
+    uint32_t h_magic;       /* EXT4_XATTR_MAGIC                            */
+    uint32_t h_refcount;    /* reference count (1 = not shared)           */
+    uint32_t h_blocks;      /* disk blocks used (1)                       */
+    uint32_t h_hash;        /* hash over all entries                      */
+    uint32_t h_checksum;    /* crc32c(seed, le64(blknr) + block)          */
+    uint32_t h_reserved[3];
+} __attribute__((packed)) ext4_xattr_header;
+
+/* In-inode xattr region header (just the magic, at 128 + i_extra_isize). */
+typedef struct ext4_xattr_ibody_header {
+    uint32_t h_magic;       /* EXT4_XATTR_MAGIC                            */
+} __attribute__((packed)) ext4_xattr_ibody_header;
+
+/* One attribute entry: 16-byte fixed part, then e_name[e_name_len]. */
+typedef struct ext4_xattr_entry {
+    uint8_t  e_name_len;
+    uint8_t  e_name_index;
+    uint16_t e_value_offs;  /* value offset (base differs ibody vs block) */
+    uint32_t e_value_inum;  /* inode holding the value (0 = inline)       */
+    uint32_t e_value_size;
+    uint32_t e_hash;        /* hash of name + value                       */
+    char     e_name[];
+} __attribute__((packed)) ext4_xattr_entry;
+
+/* entry stride (fixed part + name, padded to 4) and value stride (padded to 4) */
+#define EXT4_XATTR_LEN(name_len) \
+    (((name_len) + EXT4_XATTR_ROUND + (unsigned)sizeof(ext4_xattr_entry)) & ~EXT4_XATTR_ROUND)
+#define EXT4_XATTR_SIZE(size) \
+    (((size) + EXT4_XATTR_ROUND) & ~EXT4_XATTR_ROUND)
+
+_Static_assert(sizeof(ext4_xattr_header) == 32, "ext4_xattr_header size");
+_Static_assert(sizeof(ext4_xattr_entry) == 16, "ext4_xattr_entry size");
+
+/* ===================================================================
  * Journal (jbd2) on-disk format.
  *
  * IMPORTANT: unlike the ext4 filesystem structures above (which are

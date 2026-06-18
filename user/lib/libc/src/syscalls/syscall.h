@@ -185,6 +185,15 @@
 #define SYS_GETRESUID   388
 #define SYS_SETRESGID   389
 #define SYS_GETRESGID   390
+#define SYS_SETXATTR    391   /* (path, name, val, size, flags|0x40000000=nofollow) */
+#define SYS_GETXATTR    392   /* (path, name, val, size, nofollow) */
+#define SYS_LISTXATTR   393   /* (path, list, size, nofollow) */
+#define SYS_REMOVEXATTR 394   /* (path, name, nofollow) */
+#define SYS_FSETXATTR   395   /* (fd, name, val, size, flags) */
+#define SYS_FGETXATTR   396   /* (fd, name, val, size) */
+#define SYS_FLISTXATTR  397   /* (fd, list, size) */
+#define SYS_FREMOVEXATTR 398  /* (fd, name) */
+#define XATTR_SYS_NOFOLLOW 0x40000000  /* OR'd into setxattr flags for lsetxattr */
 
 // NET_GETINFO sub-commands
 #define NET_GET_ARP_TABLE       1

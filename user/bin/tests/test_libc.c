@@ -38,6 +38,7 @@
 #include <libgen.h>
 #include <setjmp.h>
 #include <utime.h>
+#include <sys/xattr.h>
 
 // Futex helper declarations (from sched.c)
 int futex_wait(int* uaddr, int val, const struct timespec* timeout);
@@ -1084,6 +1085,91 @@ int main(int argc, char** argv) {
     test_result("unlink file in dir", unlink(tdfile) == 0);
     test_result("chdir('/') succeeds", chdir("/") == 0);
     test_result("rmdir('/TESTDIR') succeeds", rmdir(tdpath) == 0);
+
+    // ========================================
+    // Test: extended attributes (xattr)
+    // ========================================
+    printf("\n[TEST] xattr (extended attributes)\n");
+    {
+        /* Per-PID path under _pbase so parallel testlibc instances never collide. */
+        char xpath[96];
+        snprintf(xpath, sizeof(xpath), "%s/xattr.dat", _pbase);
+        int xfd = open(xpath, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+        if (xfd >= 0) { write(xfd, "hello", 5); close(xfd); }
+        test_result("xattr: create target file", xfd >= 0);
+
+        /* Probe support so the FAT32 regression run (no xattrs => EOPNOTSUPP)
+         * skips this block cleanly instead of failing. */
+        errno = 0;
+        int xr = setxattr(xpath, "user.probe", "x", 1, 0);
+        int xsup = !(xr == -1 && errno == EOPNOTSUPP);
+        if (xr == 0) removexattr(xpath, "user.probe");
+
+        if (xfd >= 0 && !xsup) {
+            printf("  (xattr unsupported on this filesystem - skipping)\n");
+        } else if (xfd >= 0) {
+            char xbuf[128], xlist[256];
+            ssize_t xn;
+
+            test_result("setxattr user.color=blue",
+                        setxattr(xpath, "user.color", "blue", 4, 0) == 0);
+
+            test_result("getxattr size query == 4",
+                        getxattr(xpath, "user.color", NULL, 0) == 4);
+
+            memset(xbuf, 0, sizeof(xbuf));
+            xn = getxattr(xpath, "user.color", xbuf, sizeof(xbuf));
+            test_result("getxattr value == blue", xn == 4 && memcmp(xbuf, "blue", 4) == 0);
+
+            test_result("setxattr user.x=1", setxattr(xpath, "user.x", "1", 1, 0) == 0);
+
+            errno = 0;
+            test_result("setxattr CREATE on existing -> EEXIST",
+                        setxattr(xpath, "user.color", "red", 3, XATTR_CREATE) == -1
+                        && errno == EEXIST);
+
+            test_result("setxattr REPLACE user.color=green",
+                        setxattr(xpath, "user.color", "green", 5, XATTR_REPLACE) == 0);
+            memset(xbuf, 0, sizeof(xbuf));
+            xn = getxattr(xpath, "user.color", xbuf, sizeof(xbuf));
+            test_result("getxattr value == green", xn == 5 && memcmp(xbuf, "green", 5) == 0);
+
+            memset(xlist, 0, sizeof(xlist));
+            xn = listxattr(xpath, xlist, sizeof(xlist));
+            int xseen_color = 0, xseen_x = 0;
+            for (char *p = xlist; xn > 0 && p < xlist + xn; p += strlen(p) + 1) {
+                if (strcmp(p, "user.color") == 0) xseen_color = 1;
+                if (strcmp(p, "user.x") == 0)     xseen_x = 1;
+            }
+            test_result("listxattr contains user.color and user.x", xseen_color && xseen_x);
+
+            errno = 0;
+            test_result("getxattr missing -> ENODATA",
+                        getxattr(xpath, "user.nope", xbuf, sizeof(xbuf)) == -1
+                        && errno == ENODATA);
+
+            test_result("removexattr user.color", removexattr(xpath, "user.color") == 0);
+            errno = 0;
+            test_result("getxattr removed -> ENODATA",
+                        getxattr(xpath, "user.color", xbuf, sizeof(xbuf)) == -1
+                        && errno == ENODATA);
+            errno = 0;
+            test_result("removexattr missing -> ENODATA",
+                        removexattr(xpath, "user.color") == -1 && errno == ENODATA);
+
+            /* fd-based variants */
+            int xfd2 = open(xpath, O_RDWR);
+            if (xfd2 >= 0) {
+                test_result("fsetxattr user.fd=yes",
+                            fsetxattr(xfd2, "user.fd", "yes", 3, 0) == 0);
+                memset(xbuf, 0, sizeof(xbuf));
+                xn = fgetxattr(xfd2, "user.fd", xbuf, sizeof(xbuf));
+                test_result("fgetxattr value == yes", xn == 3 && memcmp(xbuf, "yes", 3) == 0);
+                close(xfd2);
+            }
+        }
+        unlink(xpath);
+    }
 
     // ========================================
     // Test: kill

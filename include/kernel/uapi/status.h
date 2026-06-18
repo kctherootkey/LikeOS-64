@@ -18,6 +18,9 @@ typedef enum {
     ST_EXISTS = -12,
     ST_NOTEMPTY = -13,
     ST_ROFS = -14,    // read-only filesystem (e.g. latched after a csum error)
+    ST_NOSPC = -15,   // no space left (e.g. xattr value too big for the inode)
+    ST_NODATA = -16,  // no such attribute (xattr) — maps to ENODATA
+    ST_RANGE = -17,   // result buffer too small (xattr) — maps to ERANGE
 } status_t;
 
 #endif // LIKEOS_STATUS_H

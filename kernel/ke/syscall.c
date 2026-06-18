@@ -667,6 +667,10 @@ static int vfs_status_to_errno(int st) {
         case ST_AGAIN:     return -EAGAIN;
         case ST_NOTEMPTY:  return -ENOTEMPTY;
         case ST_ROFS:      return -EROFS;
+        case ST_NOSPC:     return -ENOSPC;
+        case ST_NODATA:    return -ENODATA;
+        case ST_RANGE:     return -ERANGE;
+        case ST_UNSUPPORTED: return -EOPNOTSUPP;
         default:           return -EACCES;
     }
 }
@@ -2270,6 +2274,160 @@ static int64_t sys_fstatfs(uint64_t fd, uint64_t u_buf) {
     uinfo.f_flags   = 0;
 
     return copy_to_user((void*)u_buf, &uinfo, sizeof(uinfo));
+}
+
+/* ===================================================================
+ * Extended attributes (xattr).  The path ops take a trailing nofollow flag so
+ * libc's l*-variants reuse the same syscall number.  Values/lists are bounced
+ * through a kernel buffer capped at one block.  Permission model (root bypasses;
+ * only non-root is checked): get/list need ancestor search; set/remove need
+ * write on the target, and trusted.* is root-only.
+ * =================================================================== */
+#define XATTR_MAX_VALUE 4096        /* one block; covers ibody + future block   */
+
+static int xattr_copy_name(uint64_t u_name, char* kname /*[256]*/) {
+    if (!validate_user_ptr(u_name, 1)) return -EFAULT;
+    size_t nl; int e = user_strnlen((const char*)u_name, 255, &nl);
+    if (e) return e;
+    e = copy_from_user(kname, (const void*)u_name, nl + 1);
+    if (e) return e;
+    kname[nl] = '\0';
+    return 0;
+}
+static int xattr_has_prefix(const char* s, const char* pfx) {
+    while (*pfx) { if (*s++ != *pfx++) return 0; }
+    return 1;
+}
+
+/* The syscall ABI here passes at most 5 args, so setxattr's nofollow is carried
+ * in a private high bit of `flags` (libc's lsetxattr sets it). */
+#define XATTR_SYS_NOFOLLOW 0x40000000
+static int64_t sys_setxattr(uint64_t u_path, uint64_t u_name, uint64_t u_val,
+                            uint64_t size, uint64_t flags) {
+    int nofollow = (flags & XATTR_SYS_NOFOLLOW) ? 1 : 0;
+    flags &= ~(uint64_t)XATTR_SYS_NOFOLLOW;
+    task_t* cur = sched_current(); if (!cur) return -EFAULT;
+    char kpath[VFS_MAX_PATH]; int c = copy_user_path((const char*)u_path, kpath, sizeof(kpath)); if (c) return c;
+    char kname[256]; c = xattr_copy_name(u_name, kname); if (c) return c;
+    if (size > XATTR_MAX_VALUE) return -ENOSPC;
+    uint8_t* kval = 0;
+    if (size) {
+        if (!validate_user_ptr(u_val, size)) return -EFAULT;
+        kval = (uint8_t*)kalloc(size); if (!kval) return -ENOMEM;
+        if (copy_from_user(kval, (const void*)u_val, size)) { kfree(kval); return -EFAULT; }
+    }
+    if (cur->cred.euid != 0) {
+        if (xattr_has_prefix(kname, "trusted.")) { if (kval) kfree(kval); return -EPERM; }
+        int pr = perm_check_path(cur, kpath, MAY_WRITE);
+        if (pr < 0) { if (kval) kfree(kval); return pr; }
+    }
+    int r = vfs_setxattr(kpath, (int)nofollow, kname, kval, size, (int)flags);
+    if (kval) kfree(kval);
+    return (r >= 0) ? 0 : vfs_status_to_errno(r);
+}
+
+static int64_t sys_getxattr(uint64_t u_path, uint64_t u_name, uint64_t u_val,
+                            uint64_t size, uint64_t nofollow) {
+    task_t* cur = sched_current(); if (!cur) return -EFAULT;
+    char kpath[VFS_MAX_PATH]; int c = copy_user_path((const char*)u_path, kpath, sizeof(kpath)); if (c) return c;
+    char kname[256]; c = xattr_copy_name(u_name, kname); if (c) return c;
+    if (cur->cred.euid != 0) { int tr = perm_traverse(kpath); if (tr < 0) return tr; }
+    if (size == 0) {                              /* query value size */
+        int r = vfs_getxattr(kpath, (int)nofollow, kname, 0, 0);
+        return (r >= 0) ? r : vfs_status_to_errno(r);
+    }
+    unsigned long cap = size > XATTR_MAX_VALUE ? XATTR_MAX_VALUE : size;
+    uint8_t* kbuf = (uint8_t*)kalloc(cap); if (!kbuf) return -ENOMEM;
+    int r = vfs_getxattr(kpath, (int)nofollow, kname, kbuf, cap);
+    if (r >= 0 && copy_to_user((void*)u_val, kbuf, r)) { kfree(kbuf); return -EFAULT; }
+    kfree(kbuf);
+    return (r >= 0) ? r : vfs_status_to_errno(r);
+}
+
+static int64_t sys_listxattr(uint64_t u_path, uint64_t u_list, uint64_t size, uint64_t nofollow) {
+    task_t* cur = sched_current(); if (!cur) return -EFAULT;
+    char kpath[VFS_MAX_PATH]; int c = copy_user_path((const char*)u_path, kpath, sizeof(kpath)); if (c) return c;
+    if (cur->cred.euid != 0) { int tr = perm_traverse(kpath); if (tr < 0) return tr; }
+    if (size == 0) {
+        int r = vfs_listxattr(kpath, (int)nofollow, 0, 0);
+        return (r >= 0) ? r : vfs_status_to_errno(r);
+    }
+    unsigned long cap = size > XATTR_MAX_VALUE ? XATTR_MAX_VALUE : size;
+    char* kbuf = (char*)kalloc(cap); if (!kbuf) return -ENOMEM;
+    int r = vfs_listxattr(kpath, (int)nofollow, kbuf, cap);
+    if (r >= 0 && copy_to_user((void*)u_list, kbuf, r)) { kfree(kbuf); return -EFAULT; }
+    kfree(kbuf);
+    return (r >= 0) ? r : vfs_status_to_errno(r);
+}
+
+static int64_t sys_removexattr(uint64_t u_path, uint64_t u_name, uint64_t nofollow) {
+    task_t* cur = sched_current(); if (!cur) return -EFAULT;
+    char kpath[VFS_MAX_PATH]; int c = copy_user_path((const char*)u_path, kpath, sizeof(kpath)); if (c) return c;
+    char kname[256]; c = xattr_copy_name(u_name, kname); if (c) return c;
+    if (cur->cred.euid != 0) {
+        if (xattr_has_prefix(kname, "trusted.")) return -EPERM;
+        int pr = perm_check_path(cur, kpath, MAY_WRITE);
+        if (pr < 0) return pr;
+    }
+    int r = vfs_removexattr(kpath, (int)nofollow, kname);
+    return (r >= 0) ? 0 : vfs_status_to_errno(r);
+}
+
+static int64_t sys_fsetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val, uint64_t size, uint64_t flags) {
+    task_t* cur = sched_current();
+    if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd]) return -EBADF;
+    char kname[256]; int c = xattr_copy_name(u_name, kname); if (c) return c;
+    if (size > XATTR_MAX_VALUE) return -ENOSPC;
+    if (cur->cred.euid != 0 && xattr_has_prefix(kname, "trusted.")) return -EPERM;
+    uint8_t* kval = 0;
+    if (size) {
+        if (!validate_user_ptr(u_val, size)) return -EFAULT;
+        kval = (uint8_t*)kalloc(size); if (!kval) return -ENOMEM;
+        if (copy_from_user(kval, (const void*)u_val, size)) { kfree(kval); return -EFAULT; }
+    }
+    int r = vfs_fsetxattr(cur->fd_table[fd], kname, kval, size, (int)flags);
+    if (kval) kfree(kval);
+    return (r >= 0) ? 0 : vfs_status_to_errno(r);
+}
+
+static int64_t sys_fgetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val, uint64_t size) {
+    task_t* cur = sched_current();
+    if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd]) return -EBADF;
+    char kname[256]; int c = xattr_copy_name(u_name, kname); if (c) return c;
+    if (size == 0) {
+        int r = vfs_fgetxattr(cur->fd_table[fd], kname, 0, 0);
+        return (r >= 0) ? r : vfs_status_to_errno(r);
+    }
+    unsigned long cap = size > XATTR_MAX_VALUE ? XATTR_MAX_VALUE : size;
+    uint8_t* kbuf = (uint8_t*)kalloc(cap); if (!kbuf) return -ENOMEM;
+    int r = vfs_fgetxattr(cur->fd_table[fd], kname, kbuf, cap);
+    if (r >= 0 && copy_to_user((void*)u_val, kbuf, r)) { kfree(kbuf); return -EFAULT; }
+    kfree(kbuf);
+    return (r >= 0) ? r : vfs_status_to_errno(r);
+}
+
+static int64_t sys_flistxattr(uint64_t fd, uint64_t u_list, uint64_t size) {
+    task_t* cur = sched_current();
+    if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd]) return -EBADF;
+    if (size == 0) {
+        int r = vfs_flistxattr(cur->fd_table[fd], 0, 0);
+        return (r >= 0) ? r : vfs_status_to_errno(r);
+    }
+    unsigned long cap = size > XATTR_MAX_VALUE ? XATTR_MAX_VALUE : size;
+    char* kbuf = (char*)kalloc(cap); if (!kbuf) return -ENOMEM;
+    int r = vfs_flistxattr(cur->fd_table[fd], kbuf, cap);
+    if (r >= 0 && copy_to_user((void*)u_list, kbuf, r)) { kfree(kbuf); return -EFAULT; }
+    kfree(kbuf);
+    return (r >= 0) ? r : vfs_status_to_errno(r);
+}
+
+static int64_t sys_fremovexattr(uint64_t fd, uint64_t u_name) {
+    task_t* cur = sched_current();
+    if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd]) return -EBADF;
+    char kname[256]; int c = xattr_copy_name(u_name, kname); if (c) return c;
+    if (cur->cred.euid != 0 && xattr_has_prefix(kname, "trusted.")) return -EPERM;
+    int r = vfs_fremovexattr(cur->fd_table[fd], kname);
+    return (r >= 0) ? 0 : vfs_status_to_errno(r);
 }
 
 static int normalize_path(const char* base, const char* path, char* out, size_t out_size) {
@@ -5628,6 +5786,14 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
             return sys_setresgid(a1, a2, a3);
         case SYS_GETRESGID:
             return sys_getresgid(a1, a2, a3);
+        case SYS_SETXATTR:     return sys_setxattr(a1, a2, a3, a4, a5);
+        case SYS_GETXATTR:     return sys_getxattr(a1, a2, a3, a4, a5);
+        case SYS_LISTXATTR:    return sys_listxattr(a1, a2, a3, a4);
+        case SYS_REMOVEXATTR:  return sys_removexattr(a1, a2, a3);
+        case SYS_FSETXATTR:    return sys_fsetxattr(a1, a2, a3, a4, a5);
+        case SYS_FGETXATTR:    return sys_fgetxattr(a1, a2, a3, a4);
+        case SYS_FLISTXATTR:   return sys_flistxattr(a1, a2, a3);
+        case SYS_FREMOVEXATTR: return sys_fremovexattr(a1, a2);
 
         case SYS_GETHOSTNAME:
             return sys_gethostname(a1, a2);

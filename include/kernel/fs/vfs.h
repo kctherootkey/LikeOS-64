@@ -103,6 +103,19 @@ typedef struct {
      * journalled fs — mark the journal clean so a reboot right after does not
      * replay.  Optional; NULL => the wrapper treats a whole-fs sync as a no-op. */
     int (*sync)(void);
+    /* Extended attributes.  Path ops take a `nofollow` flag (1 => operate on a
+     * final symlink itself).  `name` is the full attribute name (e.g. "user.x").
+     * get/list return the value/list size (or its size when buf is NULL/0), set
+     * takes XATTR_CREATE/REPLACE flags.  Negative ST_ on error; NULL op => the
+     * filesystem has no xattrs (the wrapper reports -EOPNOTSUPP). */
+    int (*getxattr)(const char* path, int nofollow, const char* name, void* val, unsigned long size);
+    int (*setxattr)(const char* path, int nofollow, const char* name, const void* val, unsigned long size, int flags);
+    int (*listxattr)(const char* path, int nofollow, char* list, unsigned long size);
+    int (*removexattr)(const char* path, int nofollow, const char* name);
+    int (*fgetxattr)(vfs_file_t* f, const char* name, void* val, unsigned long size);
+    int (*fsetxattr)(vfs_file_t* f, const char* name, const void* val, unsigned long size, int flags);
+    int (*flistxattr)(vfs_file_t* f, char* list, unsigned long size);
+    int (*fremovexattr)(vfs_file_t* f, const char* name);
 } vfs_ops_t;
 
 struct vfs_file {
@@ -154,6 +167,17 @@ int vfs_fstat(vfs_file_t* f, struct kstat* st);
  * fs lacking the op); vfs_mark_setid_clean() records that state after a strip. */
 int vfs_setid_clean(vfs_file_t* f);
 void vfs_mark_setid_clean(vfs_file_t* f);
+
+/* Extended attributes (see the vfs_ops_t xattr ops).  Return the value/list
+ * size or a negative ST_ code; an fs without xattrs returns ST_UNSUPPORTED. */
+int vfs_getxattr(const char* path, int nofollow, const char* name, void* val, unsigned long size);
+int vfs_setxattr(const char* path, int nofollow, const char* name, const void* val, unsigned long size, int flags);
+int vfs_listxattr(const char* path, int nofollow, char* list, unsigned long size);
+int vfs_removexattr(const char* path, int nofollow, const char* name);
+int vfs_fgetxattr(vfs_file_t* f, const char* name, void* val, unsigned long size);
+int vfs_fsetxattr(vfs_file_t* f, const char* name, const void* val, unsigned long size, int flags);
+int vfs_flistxattr(vfs_file_t* f, char* list, unsigned long size);
+int vfs_fremovexattr(vfs_file_t* f, const char* name);
 /* Flush the root filesystem's pending metadata + journal to disk (sync(2)).
  * No-op when the root fs provides no sync op.  fs-independent. */
 int vfs_sync(void);

@@ -187,6 +187,44 @@ void vfs_mark_setid_clean(vfs_file_t* f) {
     if (f && f->ops && f->ops->setid_clean) f->ops->setid_clean(f, 1);
 }
 
+/* ---- extended attributes ---- (fs without xattrs => ST_UNSUPPORTED => EOPNOTSUPP) */
+int vfs_getxattr(const char* path, int nofollow, const char* name, void* val, unsigned long size) {
+    const vfs_ops_t* o = vfs_ops_for_path(path);
+    if (!o || !o->getxattr) return ST_UNSUPPORTED;
+    return o->getxattr(path, nofollow, name, val, size);
+}
+int vfs_setxattr(const char* path, int nofollow, const char* name, const void* val, unsigned long size, int flags) {
+    const vfs_ops_t* o = vfs_ops_for_path(path);
+    if (!o || !o->setxattr) return ST_UNSUPPORTED;
+    return o->setxattr(path, nofollow, name, val, size, flags);
+}
+int vfs_listxattr(const char* path, int nofollow, char* list, unsigned long size) {
+    const vfs_ops_t* o = vfs_ops_for_path(path);
+    if (!o || !o->listxattr) return ST_UNSUPPORTED;
+    return o->listxattr(path, nofollow, list, size);
+}
+int vfs_removexattr(const char* path, int nofollow, const char* name) {
+    const vfs_ops_t* o = vfs_ops_for_path(path);
+    if (!o || !o->removexattr) return ST_UNSUPPORTED;
+    return o->removexattr(path, nofollow, name);
+}
+int vfs_fgetxattr(vfs_file_t* f, const char* name, void* val, unsigned long size) {
+    if (!f || !f->ops || !f->ops->fgetxattr) return ST_UNSUPPORTED;
+    return f->ops->fgetxattr(f, name, val, size);
+}
+int vfs_fsetxattr(vfs_file_t* f, const char* name, const void* val, unsigned long size, int flags) {
+    if (!f || !f->ops || !f->ops->fsetxattr) return ST_UNSUPPORTED;
+    return f->ops->fsetxattr(f, name, val, size, flags);
+}
+int vfs_flistxattr(vfs_file_t* f, char* list, unsigned long size) {
+    if (!f || !f->ops || !f->ops->flistxattr) return ST_UNSUPPORTED;
+    return f->ops->flistxattr(f, list, size);
+}
+int vfs_fremovexattr(vfs_file_t* f, const char* name) {
+    if (!f || !f->ops || !f->ops->fremovexattr) return ST_UNSUPPORTED;
+    return f->ops->fremovexattr(f, name);
+}
+
 long vfs_read(vfs_file_t* f, void* buf, long bytes) { if (!f || !f->ops || !f->ops->read) return ST_INVALID; return f->ops->read(f, buf, bytes); }
 long vfs_write(vfs_file_t* f, const void* buf, long bytes) { if (!f || !f->ops || !f->ops->write) return ST_INVALID; return f->ops->write(f, buf, bytes); }
 long vfs_seek(vfs_file_t* f, long offset, int whence) { if (!f || !f->ops || !f->ops->seek) return -1; return f->ops->seek(f, offset, whence); }

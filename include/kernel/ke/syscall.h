@@ -204,6 +204,16 @@
 #define SYS_GETRESUID       388
 #define SYS_SETRESGID       389
 #define SYS_GETRESGID       390
+/* Extended attributes.  Each path op takes a trailing nofollow flag so the
+ * libc l*-variants reuse the same number; fd (f*) variants are 395-398. */
+#define SYS_SETXATTR        391  // (path, name, val, size, flags|0x40000000=nofollow)
+#define SYS_GETXATTR        392  // (path, name, val, size, nofollow)
+#define SYS_LISTXATTR       393  // (path, list, size, nofollow)
+#define SYS_REMOVEXATTR     394  // (path, name, nofollow)
+#define SYS_FSETXATTR       395  // (fd, name, val, size, flags)
+#define SYS_FGETXATTR       396  // (fd, name, val, size)
+#define SYS_FLISTXATTR      397  // (fd, list, size)
+#define SYS_FREMOVEXATTR    398  // (fd, name)
 
 // rusage who values
 #define RUSAGE_SELF         0
@@ -341,6 +351,7 @@ typedef struct k_sysinfo {
 #define ENODEV          19  // No such device
 #define ENOSYS          38  // Function not implemented
 #define ENOTEMPTY       39  // Directory not empty
+#define ENODATA         61  // No data available (xattr: no such attribute)
 #define ETIMEDOUT      110  // Connection timed out
 #define ENOTSOCK        88  // Socket operation on non-socket
 #define EDESTADDRREQ    89  // Destination address required

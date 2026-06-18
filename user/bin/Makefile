@@ -23,7 +23,7 @@ LIBS = -lc -l:ld-likeos.so
 PROGRAMS = hello sh ls cat pwd stat progerr memstat uname shutdown poweroff ps cp mv rm mkdir rmdir touch more less clear env kill find df du hexdump sleep strings file grep wc head tail echo printf free uptime dmesg which date time sort uniq cut tr yes true false top man hostname ping ifconfig netstat route arp traceroute arping dhclient dig nslookup host ln chmod readlink
 
 # Test programs (sources live in user/bin/tests/, built as tests/<name>)
-TESTS = test_syscalls test_libc testmem teststress netstress openssltest usbtest
+TESTS = test_syscalls test_libc testmem teststress netstress openssltest usbtest xattrtest
 TEST_BINS = $(addprefix tests/,$(TESTS))
 
 all: $(PROGRAMS) $(TEST_BINS) reboot halt
