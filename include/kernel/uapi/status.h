@@ -17,6 +17,7 @@ typedef enum {
     ST_BUSY = -11,
     ST_EXISTS = -12,
     ST_NOTEMPTY = -13,
+    ST_ROFS = -14,    // read-only filesystem (e.g. latched after a csum error)
 } status_t;
 
 #endif // LIKEOS_STATUS_H

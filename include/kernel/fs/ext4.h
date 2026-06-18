@@ -46,6 +46,14 @@
 #define EXT4_TIND_BLOCK           14
 #define EXT4_N_BLOCKS             15
 
+/* s_state bits (superblock "is the fs clean?" word). */
+#define EXT4_VALID_FS             0x0001    /* cleanly unmounted             */
+#define EXT4_ERROR_FS             0x0002    /* errors detected               */
+/* s_errors: what to do when an error is detected (the errors= policy). */
+#define EXT4_ERRORS_CONTINUE      1         /* carry on                      */
+#define EXT4_ERRORS_RO            2         /* remount read-only             */
+#define EXT4_ERRORS_PANIC         3         /* panic                         */
+
 /* s_feature_incompat bits */
 #define EXT4_FEATURE_INCOMPAT_COMPRESSION 0x0001
 #define EXT4_FEATURE_INCOMPAT_FILETYPE    0x0002
@@ -145,7 +153,9 @@ typedef struct ext4_super_block {
     uint32_t s_flags;                   /* 0x160 */
     uint8_t  s_pad_0164[0x175 - 0x164]; /* raid/mmp/raid_stripe (unused)   */
     uint8_t  s_checksum_type;           /* 0x175  1 => crc32c              */
-    uint8_t  s_pad_0176[0x270 - 0x176]; /* error/snapshot/mount opts (unused) */
+    uint8_t  s_pad_0176[0x194 - 0x176]; /* encrypt/snapshot (unused)       */
+    uint32_t s_error_count;             /* 0x194  # of errors seen         */
+    uint8_t  s_pad_0198[0x270 - 0x198]; /* first/last-error records (unused) */
     uint32_t s_checksum_seed;           /* 0x270  crc32c(~0, s_uuid)       */
     uint8_t  s_pad_0274[0x3FC - 0x274]; /* quota/encrypt/... (unused)      */
     uint32_t s_checksum;                /* 0x3FC  crc32c of SB[0..0x3FC)   */
@@ -256,6 +266,9 @@ typedef struct ext4_dir_entry_2 {
 #define JBD2_SUPERBLOCK_V2         4
 #define JBD2_REVOKE_BLOCK          5
 
+/* journal s_feature_compat bits */
+#define JBD2_FEATURE_COMPAT_CHECKSUM        0x00000001  /* deprecated v1 csum    */
+
 /* journal s_feature_incompat bits */
 #define JBD2_FEATURE_INCOMPAT_REVOKE        0x00000001
 #define JBD2_FEATURE_INCOMPAT_64BIT         0x00000002
@@ -264,11 +277,30 @@ typedef struct ext4_dir_entry_2 {
 #define JBD2_FEATURE_INCOMPAT_CSUM_V3       0x00000010
 #define JBD2_FEATURE_INCOMPAT_FAST_COMMIT   0x00000020
 
+/* journal s_checksum_type values (journal sb offset 0x50).  jbd2 + e2fsck reject
+ * a csum v2/v3 journal whose s_checksum_type != crc32c. */
+#define JBD2_CRC32C_CHKSUM                  4
+#define JBD2_SB_CSUM_TYPE_OFF              0x50
+
 /* journal_block_tag t_flags bits */
 #define JBD2_FLAG_ESCAPE     1   /* on-disk block escaped (had jbd2 magic)   */
 #define JBD2_FLAG_SAME_UUID  2   /* no 16-byte UUID follows this tag         */
 #define JBD2_FLAG_DELETED    4
 #define JBD2_FLAG_LAST_TAG   8   /* last tag in this descriptor block        */
+
+/* csum v2/v3 checksum field locations within a journal log block (all BE
+ * crc32c).  The per-block TAG csum lives inside each descriptor tag (offset
+ * +4/16-bit for v2, +12/32-bit for v3); the descriptor/revoke TAIL csum is the
+ * last 4 bytes of the block.  See the jbd2 on-disk format. */
+#define JBD2_COMMIT_CSUM_OFF   0x10    /* commit_header.h_chksum[0]           */
+#define JBD2_SB_CSUM_OFF       0xFC    /* journal_superblock_s.s_checksum     */
+#define JBD2_SB_CSUM_LEN       1024    /* bytes the sb checksum covers        */
+/* csum v3 (16-byte) descriptor tag field offsets. */
+#define JBD2_TAG3_FLAGS_OFF    4       /* t_flags  (32-bit)                   */
+#define JBD2_TAG3_BLKHI_OFF    8       /* t_blocknr_high (32-bit, 64bit only) */
+#define JBD2_TAG3_CSUM_OFF     12      /* t_checksum (32-bit)                 */
+#define JBD2_TAG3_SIZE         16
+#define JBD2_TAG_V2_CSUM_OFF   4       /* v2 tag t_checksum (16-bit)          */
 
 /* Common header at the start of every journal log block (BE). */
 typedef struct journal_header_s {
@@ -347,7 +379,10 @@ typedef struct ext4_fs {
     uint32_t       feature_ro_compat;
     uint32_t       feature_compat;
     uint32_t       journal_inum;
-    int            read_only;           /* mounted read-only (P1: always 1)  */
+    int            read_only;           /* mounted read-only; also the error latch:
+                                         * set to 1 by ext4_fs_error under
+                                         * errors=remount-ro to block further writes */
+    int            errors_behavior;     /* EXT4_ERRORS_* policy from s_errors */
     int            meta_dirty;          /* GDT/superblock free counts pending writeback */
     struct ext4_group_desc *gdt;        /* cached group descriptor table     */
     ext4_super_block sb_copy;           /* cached superblock                 */
@@ -365,6 +400,9 @@ typedef struct ext4_fs {
     uint32_t       j_sequence;          /* next transaction sequence to use  */
     uint8_t        j_uuid[16];          /* journal uuid (descriptor tags)    */
     uint8_t       *j_sb_buf;            /* cached journal superblock (RMW)   */
+    int            j_csum3;             /* journal uses jbd2 csum v3         */
+    uint32_t       j_csum_seed;         /* crc32c(~0, j_uuid) for tag/desc/  */
+                                        /* commit csums (NOT the sb csum)    */
 } ext4_fs_t;
 
 typedef struct ext4_file {

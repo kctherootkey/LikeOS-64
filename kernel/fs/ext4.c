@@ -49,6 +49,7 @@ _Static_assert(sizeof(ext4_super_block) == 1024, "ext4_super_block must be 1024 
 _Static_assert(__builtin_offsetof(ext4_super_block, s_checksum_type) == 0x175, "s_checksum_type offset");
 _Static_assert(__builtin_offsetof(ext4_super_block, s_checksum_seed) == 0x270, "s_checksum_seed offset");
 _Static_assert(__builtin_offsetof(ext4_super_block, s_checksum) == 0x3FC, "s_checksum offset");
+_Static_assert(__builtin_offsetof(ext4_super_block, s_error_count) == 0x194, "s_error_count offset");
 _Static_assert(__builtin_offsetof(ext4_group_desc, bg_checksum) == 0x1E, "bg_checksum offset");
 _Static_assert(__builtin_offsetof(ext4_inode, i_checksum_hi) == 0x82, "i_checksum_hi offset");
 
@@ -210,6 +211,74 @@ static void ext4_inode_bitmap_csum_set(ext4_fs_t *fs, unsigned g, const uint8_t 
         fs->gdt[g].bg_inode_bitmap_csum_hi = (uint16_t)(csum >> 16);
 }
 
+/* ---- read-side VERIFICATION (enforcement): recompute and compare ---- */
+
+/* bg_flags bits: an uninitialized group's bitmap is not laid out on disk yet, so
+ * its stored csum is over the would-be-initialized image — skip verification. */
+#define EXT4_BG_INODE_UNINIT 0x0001
+#define EXT4_BG_BLOCK_UNINIT 0x0002
+
+/* Verify a directory leaf's metadata_csum tail.  Returns 1 if OK, or if there is
+ * nothing to verify: an fs without metadata_csum, or a block that does NOT end
+ * with a dirent-checksum tail (the fake entry inode=0/rec_len=12/ft=0xDE).  The
+ * latter guard means an htree dx node (different tail layout), which our linear
+ * reader may encounter, is left to e2fsck instead of false-positiving. */
+static int ext4_dir_csum_ok(const ext4_fs_t *fs, unsigned long dir_ino,
+                            uint32_t gen, const uint8_t *blk)
+{
+    if (!fs->has_metadata_csum) return 1;
+    const uint8_t *tail = blk + fs->block_size - EXT4_DIR_TAIL_SIZE;
+    uint32_t tino; mm_memcpy(&tino, tail, 4);
+    uint16_t trec; mm_memcpy(&trec, tail + 4, 2);
+    if (tino != 0 || trec != EXT4_DIR_TAIL_SIZE || tail[6] != 0 || tail[7] != 0xDE)
+        return 1;                                  /* not a dirent csum tail    */
+    uint32_t want; mm_memcpy(&want, tail + 8, 4);
+    uint32_t seed = ext4_inode_csum_seed(fs, dir_ino, gen);
+    return ext4_crc32c(seed, blk, fs->block_size - EXT4_DIR_TAIL_SIZE) == want;
+}
+
+/* Verify a block/inode bitmap buffer against the csum kept in its group
+ * descriptor.  Returns 1 if OK (no metadata_csum, or an uninitialized group). */
+static int ext4_block_bitmap_csum_ok(const ext4_fs_t *fs, unsigned g, const uint8_t *bm)
+{
+    if (!fs->has_metadata_csum) return 1;
+    if (fs->gdt[g].bg_flags & EXT4_BG_BLOCK_UNINIT) return 1;
+    uint32_t csum = ext4_crc32c(fs->csum_seed, bm, fs->blocks_per_group / 8);
+    uint32_t want = fs->gdt[g].bg_block_bitmap_csum_lo;
+    if (fs->desc_size >= 64) want |= (uint32_t)fs->gdt[g].bg_block_bitmap_csum_hi << 16;
+    else                     csum &= 0xFFFFu;
+    return csum == want;
+}
+static int ext4_inode_bitmap_csum_ok(const ext4_fs_t *fs, unsigned g, const uint8_t *bm)
+{
+    if (!fs->has_metadata_csum) return 1;
+    if (fs->gdt[g].bg_flags & EXT4_BG_INODE_UNINIT) return 1;
+    uint32_t csum = ext4_crc32c(fs->csum_seed, bm, (fs->inodes_per_group + 7) / 8);
+    uint32_t want = fs->gdt[g].bg_inode_bitmap_csum_lo;
+    if (fs->desc_size >= 64) want |= (uint32_t)fs->gdt[g].bg_inode_bitmap_csum_hi << 16;
+    else                     csum &= 0xFFFFu;
+    return csum == want;
+}
+
+/* Verify an EXTERNAL extent-tree block (depth>0 index/leaf node) against its
+ * 4-byte et_checksum tail.  The tail sits right after eh_max entries
+ * (EXT4_EXTENT_TAIL_OFFSET); the csum spans the block up to it, seeded by the
+ * owning inode (ino+generation).  The inline depth-0 root in the inode body has
+ * no tail (the inode csum covers it), so this is only for read-in child blocks.
+ * Returns 1 if OK (no metadata_csum, or a malformed header left to other guards). */
+static int ext4_extent_block_csum_ok(const ext4_fs_t *fs, unsigned long ino,
+                                      uint32_t gen, const uint8_t *blk)
+{
+    if (!fs->has_metadata_csum) return 1;
+    const ext4_extent_header *eh = (const ext4_extent_header *)blk;
+    unsigned long off = sizeof(ext4_extent_header)
+                      + (unsigned long)eh->eh_max * sizeof(ext4_extent);
+    if (off + 4 > fs->block_size) return 1;     /* malformed eh_max — not ours  */
+    uint32_t want; mm_memcpy(&want, blk + off, 4);
+    uint32_t seed = ext4_inode_csum_seed(fs, ino, gen);
+    return ext4_crc32c(seed, blk, off) == want;
+}
+
 /* Small byte compare (no mm_memcmp in the kernel).  Returns 0 if equal. */
 static int ext4_memcmp(const void *a, const void *b, unsigned long n)
 {
@@ -222,6 +291,12 @@ static int ext4_memcmp(const void *a, const void *b, unsigned long n)
 
 /* The single mounted ext4 root (Phase 1 supports one ext4 filesystem). */
 ext4_fs_t *g_ext4_fs = 0;
+
+/* Refuse a mutating op up front when the fs is read-only / error-latched.  The
+ * block-write chokepoints (ext4_write_block_direct / ext4_write_impl) already
+ * prevent corruption; this just returns a clean -EROFS at entry instead of
+ * letting an op do partial work and fail partway. */
+static inline int ext4_is_ro(void) { return g_ext4_fs && g_ext4_fs->read_only; }
 
 /* Global current-directory inode (mirrors FAT32's g_cwd_cluster approach). */
 static unsigned long g_ext4_cwd_ino = EXT4_ROOT_INO;
@@ -253,6 +328,9 @@ static inline int ext4_txn_active(void) { return s_txn.active; }
 static int  ext4_write_block_direct(ext4_fs_t *fs, unsigned long pbn, const void *buf);
 static void ext4_txn_flush(ext4_fs_t *fs);   /* defined with the journal code */
 static void ext4_journal_clean(ext4_fs_t *fs);/* mark journal empty on sync     */
+/* P6 enforcement: record a metadata-corruption error + apply the errors=
+ * policy (remount-ro latch / panic / continue).  Defined after ext4_write_super. */
+static void ext4_fs_error(ext4_fs_t *fs, const char *what, unsigned long ino);
 
 /* Begin a transaction (called on the outermost ext4_io_lock acquire). */
 static void ext4_txn_begin(void)
@@ -566,9 +644,10 @@ static int ext4_read_inode_loc(ext4_fs_t *fs, unsigned long ino,
     st = ext4_read_block(fs, blk, buf);
     if (st != ST_OK) { kfree(buf); return st; }
 
-    /* P6 (verify-only): confirm the inode's metadata_csum using the full
-     * on-disk bytes still in `buf` (the struct copy below truncates them).
-     * Warn-once; never reject. */
+    /* P6 enforcement: verify the inode's metadata_csum using the full on-disk
+     * bytes still in `buf` (the struct copy below truncates them).  A mismatch
+     * means the inode is corrupt — refuse to hand it back (ST_IO => -EIO) and
+     * mark the filesystem errored, exactly like the reference's -EFSBADCRC. */
     if (fs->has_metadata_csum) {
         const uint8_t *rp = buf + off;
         uint32_t got = ext4_inode_csum(fs, ino, rp);
@@ -582,12 +661,12 @@ static int ext4_read_inode_loc(ext4_fs_t *fs, unsigned long ino,
                 want |= (uint32_t)shi << 16; mask = 0xFFFFFFFFu;
             }
         }
-        static int warned = 0;
-        if ((got & mask) != want && !warned) {
-            warned = 1;
-            kprintf("ext4: WARN inode %lu metadata_csum mismatch "
-                    "(disk 0x%x computed 0x%x) [warn-once]\n",
-                    ino, want, got & mask);
+        if ((got & mask) != want) {
+            kprintf("ext4: inode %lu metadata_csum mismatch "
+                    "(disk 0x%x computed 0x%x)\n", ino, want, got & mask);
+            kfree(buf);
+            ext4_fs_error(fs, "inode checksum mismatch", ino);
+            return ST_IO;
         }
     }
 
@@ -639,8 +718,8 @@ static inline unsigned long ext4_inode_size(const ext4_inode *in)
 
 /* Walk an extent tree to map logical block `lidx` -> physical block.
  * Returns 0 for a hole / past-EOF / error. */
-static unsigned long ext4_extent_map(ext4_fs_t *fs, const ext4_inode *in,
-                                     unsigned long lidx)
+static unsigned long ext4_extent_map(ext4_fs_t *fs, unsigned long ino,
+                                     const ext4_inode *in, unsigned long lidx)
 {
     const uint8_t *node = in->i_block;     /* root lives inline in the inode */
     uint8_t *heap = 0;
@@ -687,6 +766,10 @@ static unsigned long ext4_extent_map(ext4_fs_t *fs, const ext4_inode *in,
             }
             if (ext4_read_block(fs, child, heap) != ST_OK)
                 break;
+            if (!ext4_extent_block_csum_ok(fs, ino, in->i_generation, heap)) {
+                ext4_fs_error(fs, "extent block checksum mismatch", ino);
+                break;   /* corrupt index/leaf node: treat as unmapped */
+            }
             node = heap;   /* descend */
         }
     }
@@ -754,7 +837,7 @@ static unsigned long ext4_block_map(ext4_fs_t *fs, unsigned long ino,
     if (!in)
         return 0;
     if (in->i_flags & EXT4_INODE_EXTENTS_FL)
-        return ext4_extent_map(fs, in, lidx);
+        return ext4_extent_map(fs, ino, in, lidx);
     return ext4_indirect_map(fs, in, lidx);
 }
 
@@ -868,6 +951,7 @@ static int ext4_dir_lookup(ext4_fs_t *fs, unsigned long dir_ino,
         return ST_NOT_FOUND;
     unsigned long dsize = ext4_inode_size(din);
     unsigned long nblocks = (dsize + fs->block_size - 1) / fs->block_size;
+    uint32_t gen = din->i_generation;   /* for the leaf csum (din may be evicted below) */
 
     uint8_t *blk = (uint8_t *)kalloc(fs->block_size);
     if (!blk)
@@ -879,6 +963,11 @@ static int ext4_dir_lookup(ext4_fs_t *fs, unsigned long dir_ino,
             continue;   /* sparse dir block (rare) */
         if (ext4_read_block(fs, pbn, blk) != ST_OK)
             continue;
+        if (!ext4_dir_csum_ok(fs, dir_ino, gen, blk)) {
+            kfree(blk);
+            ext4_fs_error(fs, "directory leaf checksum mismatch", dir_ino);
+            return ST_IO;
+        }
         unsigned off = 0;
         while (off + 8 <= fs->block_size) {
             ext4_dir_entry_2 *de = (ext4_dir_entry_2 *)(blk + off);
@@ -954,8 +1043,11 @@ static int ext4_resolve_ex(ext4_fs_t *fs, unsigned long start_ino,
             continue;
         }
         unsigned long child; unsigned ftype = 0;
-        if (ext4_dir_lookup(fs, cur, comp, ci, &child, &ftype) != ST_OK)
-            return ST_NOT_FOUND;
+        int lr = ext4_dir_lookup(fs, cur, comp, ci, &child, &ftype);
+        if (lr != ST_OK)                          /* a corrupt directory leaf
+                                                     returns ST_IO; propagate it
+                                                     rather than masking ENOENT  */
+            return lr;
 
         const ext4_inode *cin = ext4_get_inode_cached(fs, child);
         if (!cin) return ST_IO;
@@ -972,7 +1064,8 @@ static int ext4_resolve_ex(ext4_fs_t *fs, unsigned long start_ino,
         }
         if (!is_last) {
             const ext4_inode *d = ext4_get_inode_cached(fs, cur);
-            if (!d || (d->i_mode & S_IFMT) != S_IFDIR) return ST_NOT_FOUND;
+            if (!d) return ST_IO;                 /* unreadable/corrupt component */
+            if ((d->i_mode & S_IFMT) != S_IFDIR) return ST_NOT_FOUND;
         }
     }
     *out_ino = cur;
@@ -1012,8 +1105,14 @@ static int ext4_open_impl(const char *path, int flags, vfs_file_t **out)
     ext4_fs_t *fs = g_ext4_fs;
 
     unsigned long ino = 0;
-    if (ext4_resolve(fs, path, &ino) != ST_OK) {
-        /* Not found — create it if requested. */
+    int rr = ext4_resolve(fs, path, &ino);
+    if (rr != ST_OK) {
+        /* A genuine I/O / corruption error (e.g. a bad inode metadata_csum)
+         * must surface as -EIO, not be masked as "not found" — and must not
+         * trigger O_CREAT, since the path may exist but simply be unreadable. */
+        if (rr != ST_NOT_FOUND)
+            return rr;
+        /* Genuinely absent — create it if requested. */
         if (!(flags & O_CREAT))
             return ST_NOT_FOUND;
         unsigned long parent = 0;
@@ -1048,7 +1147,8 @@ static int ext4_open_impl(const char *path, int flags, vfs_file_t **out)
     unsigned mode = in.i_mode;
 
     /* O_TRUNC on an existing regular file: discard its data. */
-    if ((flags & O_TRUNC) && (mode & S_IFMT) == S_IFREG && ext4_inode_size(&in) > 0) {
+    if ((flags & O_TRUNC) && (mode & S_IFMT) == S_IFREG && ext4_inode_size(&in) > 0
+        && !ext4_is_ro()) {
         ext4_free_blocks_from(fs, &in, 0);
         in.i_size_lo = 0; in.i_size_high = 0;
         in.i_mtime = in.i_ctime = (uint32_t)timer_get_epoch();
@@ -1111,8 +1211,9 @@ static int ext4_stat_vfs_impl(const char *path, struct kstat *st)
     if (!st || !path || !g_ext4_fs)
         return ST_INVALID;
     unsigned long ino = 0;
-    if (ext4_resolve(g_ext4_fs, path, &ino) != ST_OK)
-        return ST_NOT_FOUND;
+    int rr = ext4_resolve(g_ext4_fs, path, &ino);
+    if (rr != ST_OK)                              /* propagate ST_IO, not ENOENT */
+        return rr;
     return ext4_stat_fill(g_ext4_fs, ino, st);
 }
 
@@ -1213,6 +1314,7 @@ static long ext4_readdir_impl(vfs_file_t *f, void *buf, long bytes)
     if (!din)
         return ST_IO;
     unsigned long dsize = ext4_inode_size(din);
+    uint32_t gen = din->i_generation;   /* for the leaf csum (din may be evicted below) */
 
     uint8_t *blk = (uint8_t *)kalloc(fs->block_size);
     if (!blk)
@@ -1230,6 +1332,11 @@ static long ext4_readdir_impl(vfs_file_t *f, void *buf, long bytes)
         if (ext4_read_block(fs, pbn, blk) != ST_OK) {
             ef->dir_pos = (b + 1) * fs->block_size;
             continue;
+        }
+        if (!ext4_dir_csum_ok(fs, ef->ino, gen, blk)) {
+            kfree(blk);
+            ext4_fs_error(fs, "directory leaf checksum mismatch", ef->ino);
+            return ST_IO;
         }
         int block_done = 0;
         while (in_blk + 8 <= fs->block_size) {
@@ -1295,8 +1402,9 @@ static int ext4_chdir_impl(const char *path)
     if (!path || !g_ext4_fs)
         return ST_INVALID;
     unsigned long ino = 0;
-    if (ext4_resolve(g_ext4_fs, path, &ino) != ST_OK)
-        return ST_NOT_FOUND;
+    int rr = ext4_resolve(g_ext4_fs, path, &ino);
+    if (rr != ST_OK)                              /* propagate ST_IO, not ENOENT */
+        return rr;
     const ext4_inode *in = ext4_get_inode_cached(g_ext4_fs, ino);
     if (!in || (in->i_mode & S_IFMT) != S_IFDIR)
         return -ENOTDIR;
@@ -1342,6 +1450,8 @@ static int ext4_write_block_direct(ext4_fs_t *fs, unsigned long pbn, const void 
 {
     if (pbn == 0)
         return ST_INVALID;
+    if (fs->read_only)            /* error latch / read-only mount: refuse writes */
+        return ST_ROFS;
     unsigned long lba = fs->part_lba_offset + pbn * fs->sectors_per_block;
     int st = ext4_write_sectors(fs->bdev, lba, fs->sectors_per_block, buf);
     if (st != ST_OK)
@@ -1376,6 +1486,43 @@ static int ext4_write_super(ext4_fs_t *fs)
     unsigned long lba = fs->part_lba_offset + EXT4_SUPERBLOCK_OFFSET / ss;
     unsigned sects = (sizeof(ext4_super_block) + ss - 1) / ss;
     return ext4_write_sectors(fs->bdev, lba, sects, &fs->sb_copy);
+}
+
+/* Central metadata-corruption handler — the ext4_error() analog.  Records the
+ * error in the superblock (clears the "clean" bit, sets the error bit, bumps the
+ * count) and persists it, then applies the errors= policy: remount read-only
+ * (latch fs->read_only so all further writes are refused), panic, or continue.
+ * The specific failed op still returns -EIO to its caller; this governs the
+ * filesystem-wide reaction.  Idempotent: re-entry after the fs is already
+ * errored re-records but does not re-apply the (one-shot) policy.  ext4_write_super
+ * is intentionally NOT gated by the read-only latch so this can persist the mark. */
+static void ext4_fs_error(ext4_fs_t *fs, const char *what, unsigned long ino)
+{
+    if (!fs) return;
+    int first = !(fs->sb_copy.s_state & EXT4_ERROR_FS);
+    if (ino) kprintf("ext4: ERROR: %s (inode %lu)\n", what, ino);
+    else     kprintf("ext4: ERROR: %s\n", what);
+
+    fs->sb_copy.s_state &= ~(uint16_t)EXT4_VALID_FS;
+    fs->sb_copy.s_state |=  (uint16_t)EXT4_ERROR_FS;
+    fs->sb_copy.s_error_count++;
+    ext4_write_super(fs);                       /* best-effort; ungated by latch */
+    if (fs->bdev && fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+
+    if (!first) return;                         /* policy already applied once   */
+    switch (fs->errors_behavior) {
+        case EXT4_ERRORS_PANIC:
+            kprintf("ext4: errors=panic -> halting\n");
+            for (;;) __asm__ volatile("cli; hlt");
+        case EXT4_ERRORS_CONTINUE:
+            kprintf("ext4: errors=continue -> filesystem left writable\n");
+            break;
+        case EXT4_ERRORS_RO:
+        default:
+            fs->read_only = 1;                  /* latch: refuse further writes  */
+            kprintf("ext4: remounting filesystem read-only\n");
+            break;
+    }
 }
 
 static int ext4_write_gd(ext4_fs_t *fs, unsigned int group);
@@ -1489,6 +1636,10 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino, i
         if (fs->gdt[g].bg_free_inodes_count_lo == 0) continue;
         unsigned long bblk = ext4_gd_inode_bitmap(fs, g);
         if (ext4_read_block(fs, bblk, bm) != ST_OK) continue;
+        if (!ext4_inode_bitmap_csum_ok(fs, g, bm)) {
+            ext4_fs_error(fs, "inode bitmap checksum mismatch", 0);
+            kfree(bm); return 0;
+        }
         for (unsigned i = 0; i < fs->inodes_per_group; i++) {
             if (ext4_bm_test(bm, i)) continue;
             unsigned long ino = (unsigned long)g * fs->inodes_per_group + i + 1;
@@ -1524,14 +1675,20 @@ static void ext4_free_inode(ext4_fs_t *fs, unsigned long ino, int is_dir)
     uint8_t *bm = (uint8_t *)kalloc(fs->block_size);
     if (!bm) return;
     unsigned long bblk = ext4_gd_inode_bitmap(fs, g);
-    if (ext4_read_block(fs, bblk, bm) == ST_OK && ext4_bm_test(bm, i)) {
-        ext4_bm_clear(bm, i);
-        ext4_inode_bitmap_csum_set(fs, g, bm);
-        ext4_write_block(fs, bblk, bm);
-        fs->gdt[g].bg_free_inodes_count_lo++;
-        if (is_dir && fs->gdt[g].bg_used_dirs_count_lo) fs->gdt[g].bg_used_dirs_count_lo--;
-        fs->sb_copy.s_free_inodes_count++;
-        fs->meta_dirty = 1;
+    if (ext4_read_block(fs, bblk, bm) == ST_OK) {
+        if (!ext4_inode_bitmap_csum_ok(fs, g, bm)) {
+            ext4_fs_error(fs, "inode bitmap checksum mismatch", 0);
+            kfree(bm); return;
+        }
+        if (ext4_bm_test(bm, i)) {
+            ext4_bm_clear(bm, i);
+            ext4_inode_bitmap_csum_set(fs, g, bm);
+            ext4_write_block(fs, bblk, bm);
+            fs->gdt[g].bg_free_inodes_count_lo++;
+            if (is_dir && fs->gdt[g].bg_used_dirs_count_lo) fs->gdt[g].bg_used_dirs_count_lo--;
+            fs->sb_copy.s_free_inodes_count++;
+            fs->meta_dirty = 1;
+        }
     }
     kfree(bm);
 }
@@ -1545,13 +1702,19 @@ static void ext4_free_block(ext4_fs_t *fs, unsigned long pbn)
     uint8_t *bm = (uint8_t *)kalloc(fs->block_size);
     if (!bm) return;
     unsigned long bblk = ext4_gd_block_bitmap(fs, g);
-    if (ext4_read_block(fs, bblk, bm) == ST_OK && ext4_bm_test(bm, i)) {
-        ext4_bm_clear(bm, i);
-        ext4_block_bitmap_csum_set(fs, g, bm);
-        ext4_write_block(fs, bblk, bm);
-        fs->gdt[g].bg_free_blocks_count_lo++;
-        fs->sb_copy.s_free_blocks_count_lo++;
-        fs->meta_dirty = 1;
+    if (ext4_read_block(fs, bblk, bm) == ST_OK) {
+        if (!ext4_block_bitmap_csum_ok(fs, g, bm)) {
+            ext4_fs_error(fs, "block bitmap checksum mismatch", 0);
+            kfree(bm); return;
+        }
+        if (ext4_bm_test(bm, i)) {
+            ext4_bm_clear(bm, i);
+            ext4_block_bitmap_csum_set(fs, g, bm);
+            ext4_write_block(fs, bblk, bm);
+            fs->gdt[g].bg_free_blocks_count_lo++;
+            fs->sb_copy.s_free_blocks_count_lo++;
+            fs->meta_dirty = 1;
+        }
     }
     ext4_mbc_drop(pbn);   /* avoid stale cache if this block is reallocated */
     kfree(bm);
@@ -1604,6 +1767,10 @@ static unsigned ext4_alloc_blocks_for_file(ext4_fs_t *fs, ext4_inode *in,
         if (fs->gdt[g].bg_free_blocks_count_lo == 0) continue;
         unsigned long bblk = ext4_gd_block_bitmap(fs, g);
         if (ext4_read_block(fs, bblk, bm) != ST_OK) continue;
+        if (!ext4_block_bitmap_csum_ok(fs, g, bm)) {
+            ext4_fs_error(fs, "block bitmap checksum mismatch", 0);
+            kfree(bm); return allocated;
+        }
         unsigned long base = fs->first_data_block + (unsigned long)g * fs->blocks_per_group;
         unsigned group_alloc = 0;
         int append_fail = 0;
@@ -1683,6 +1850,11 @@ static int ext4_dir_add(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
         unsigned long pbn = ext4_block_map(fs, dir_ino, b);
         if (pbn == 0) continue;
         if (ext4_read_block(fs, pbn, blk) != ST_OK) continue;
+        if (!ext4_dir_csum_ok(fs, dir_ino, din.i_generation, blk)) {
+            kfree(blk);
+            ext4_fs_error(fs, "directory leaf checksum mismatch", dir_ino);
+            return ST_IO;
+        }
         unsigned off = 0;
         while (off + 8 <= scan_limit) {
             ext4_dir_entry_2 *de = (ext4_dir_entry_2 *)(blk + off);
@@ -1763,6 +1935,11 @@ static int ext4_dir_del(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
         unsigned long pbn = ext4_block_map(fs, dir_ino, b);
         if (pbn == 0) continue;
         if (ext4_read_block(fs, pbn, blk) != ST_OK) continue;
+        if (!ext4_dir_csum_ok(fs, dir_ino, din.i_generation, blk)) {
+            kfree(blk);
+            ext4_fs_error(fs, "directory leaf checksum mismatch", dir_ino);
+            return ST_IO;
+        }
         unsigned off = 0, prev = (unsigned)-1;
         while (off + 8 <= scan_limit) {
             ext4_dir_entry_2 *de = (ext4_dir_entry_2 *)(blk + off);
@@ -1849,6 +2026,7 @@ static void ext4_init_owner(unsigned puid, unsigned pgid, unsigned pmode, int is
 static int ext4_create_inode(ext4_fs_t *fs, unsigned long ino, unsigned mode,
                              unsigned uid, unsigned gid)
 {
+    if (ext4_is_ro()) return ST_ROFS;
     ext4_inode in;
     mm_memset(&in, 0, sizeof(in));
     in.i_mode = (uint16_t)mode;
@@ -1873,6 +2051,7 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
     if (bytes < 0) return ST_INVALID;
     if (bytes == 0) return 0;
     ext4_fs_t *fs = ef->fs;
+    if (fs->read_only) return ST_ROFS;   /* error latch / read-only mount */
 
     unsigned long end = ef->pos + (unsigned long)bytes;
     ext4_inode in;
@@ -1954,6 +2133,7 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 
 static int ext4_truncate_impl(vfs_file_t *f, unsigned long size)
 {
+    if (ext4_is_ro()) return ST_ROFS;
     if (!f) return ST_INVALID;
     ext4_file_t *ef = (ext4_file_t *)f->fs_private;
     if (!ef || !ef->fs) return ST_INVALID;
@@ -1985,6 +2165,7 @@ static int ext4_truncate_impl(vfs_file_t *f, unsigned long size)
 
 static int ext4_unlink_impl(const char *path)
 {
+    if (ext4_is_ro()) return ST_ROFS;
     if (!path || !g_ext4_fs) return ST_INVALID;
     ext4_fs_t *fs = g_ext4_fs;
     unsigned long parent = 0;
@@ -2051,6 +2232,11 @@ static int ext4_dir_is_empty(ext4_fs_t *fs, unsigned long dir_ino)
         unsigned long pbn = ext4_block_map(fs, dir_ino, b);
         if (pbn == 0) continue;
         if (ext4_read_block(fs, pbn, blk) != ST_OK) continue;
+        if (!ext4_dir_csum_ok(fs, dir_ino, din.i_generation, blk)) {
+            kfree(blk);
+            ext4_fs_error(fs, "directory leaf checksum mismatch", dir_ino);
+            return 0;   /* corrupt -> treat as "not empty": refuse the rmdir */
+        }
         unsigned off = 0;
         while (off + 8 <= fs->block_size) {
             ext4_dir_entry_2 *de = (ext4_dir_entry_2 *)(blk + off);
@@ -2072,11 +2258,17 @@ static int ext4_dir_is_empty(ext4_fs_t *fs, unsigned long dir_ino)
 static void ext4_dir_set_dotdot(ext4_fs_t *fs, unsigned long dir_ino,
                                 unsigned long new_parent)
 {
+    const ext4_inode *di = ext4_get_inode_cached(fs, dir_ino);
+    uint32_t gen = di ? di->i_generation : 0;
     unsigned long pbn = ext4_block_map(fs, dir_ino, 0);
     if (pbn == 0) return;
     uint8_t *blk = (uint8_t *)kalloc(fs->block_size);
     if (!blk) return;
     if (ext4_read_block(fs, pbn, blk) == ST_OK) {
+        if (!ext4_dir_csum_ok(fs, dir_ino, gen, blk)) {
+            ext4_fs_error(fs, "directory leaf checksum mismatch", dir_ino);
+            kfree(blk); return;
+        }
         unsigned off = 0;
         while (off + 8 <= fs->block_size) {
             ext4_dir_entry_2 *de = (ext4_dir_entry_2 *)(blk + off);
@@ -2084,6 +2276,7 @@ static void ext4_dir_set_dotdot(ext4_fs_t *fs, unsigned long dir_ino,
             if (rec < 8 || off + rec > fs->block_size) break;
             if (de->name_len == 2 && de->name[0] == '.' && de->name[1] == '.') {
                 de->inode = (uint32_t)new_parent;
+                ext4_dir_csum_set(fs, dir_ino, gen, blk);   /* re-stamp the tail */
                 ext4_write_block(fs, pbn, blk);
                 break;
             }
@@ -2107,6 +2300,7 @@ static void ext4_adjust_links(ext4_fs_t *fs, unsigned long ino, int delta)
 
 static int ext4_mkdir_impl(const char *path, unsigned mode)
 {
+    if (ext4_is_ro()) return ST_ROFS;
     if (!path || !g_ext4_fs) return ST_INVALID;
     ext4_fs_t *fs = g_ext4_fs;
     unsigned long parent = 0; char name[256];
@@ -2171,6 +2365,7 @@ static int ext4_mkdir_impl(const char *path, unsigned mode)
 
 static int ext4_rmdir_impl(const char *path)
 {
+    if (ext4_is_ro()) return ST_ROFS;
     if (!path || !g_ext4_fs) return ST_INVALID;
     ext4_fs_t *fs = g_ext4_fs;
     unsigned long parent = 0; char name[256];
@@ -2203,6 +2398,7 @@ static int ext4_rmdir_impl(const char *path)
 
 static int ext4_rename_impl(const char *oldp, const char *newp)
 {
+    if (ext4_is_ro()) return ST_ROFS;
     if (!oldp || !newp || !g_ext4_fs) return ST_INVALID;
     ext4_fs_t *fs = g_ext4_fs;
     unsigned long op = 0, np = 0; char oname[256], nname[256];
@@ -2261,11 +2457,13 @@ static int ext4_rename_impl(const char *oldp, const char *newp)
 
 int ext4_utimensat(const char *path, int64_t mtime_sec, long mtime_nsec)
 {
+    if (ext4_is_ro()) return ST_ROFS;
     if (!path || !g_ext4_fs) return ST_INVALID;
     ext4_io_lock();
     ext4_fs_t *fs = g_ext4_fs;
     unsigned long ino = 0;
-    if (ext4_resolve(fs, path, &ino) != ST_OK) { ext4_io_unlock(); return ST_NOT_FOUND; }
+    int rr = ext4_resolve(fs, path, &ino);
+    if (rr != ST_OK) { ext4_io_unlock(); return rr; } /* propagate ST_IO, not ENOENT */
     ext4_inode in;
     if (ext4_read_inode_loc(fs, ino, &in, 0, 0) != ST_OK) { ext4_io_unlock(); return ST_IO; }
     uint32_t now = (uint32_t)timer_get_epoch();
@@ -2310,6 +2508,7 @@ int ext4_get_statfs(unsigned long *f_bsize, unsigned long *f_blocks,
 
 int ext4_symlink(const char *target, const char *linkpath)
 {
+    if (ext4_is_ro()) return ST_ROFS;
     if (!target || !linkpath || !g_ext4_fs) return ST_INVALID;
     ext4_fs_t *fs = g_ext4_fs;
     ext4_io_lock();
@@ -2393,6 +2592,7 @@ int ext4_readlink(const char *path, char *buf, unsigned long bufsiz)
 
 int ext4_link(const char *oldpath, const char *newpath)
 {
+    if (ext4_is_ro()) return ST_ROFS;
     if (!oldpath || !newpath || !g_ext4_fs) return ST_INVALID;
     ext4_fs_t *fs = g_ext4_fs;
     ext4_io_lock();
@@ -2449,6 +2649,7 @@ static int ext4_set_owner_locked(ext4_fs_t *fs, unsigned long ino, int uid, int 
 
 int ext4_chmod(const char *path, unsigned mode)
 {
+    if (ext4_is_ro()) return ST_ROFS;
     if (!path || !g_ext4_fs) return ST_INVALID;
     ext4_fs_t *fs = g_ext4_fs;
     ext4_io_lock();
@@ -2461,6 +2662,7 @@ int ext4_chmod(const char *path, unsigned mode)
 
 int ext4_chown(const char *path, int uid, int gid)
 {
+    if (ext4_is_ro()) return ST_ROFS;
     if (!path || !g_ext4_fs) return ST_INVALID;
     ext4_fs_t *fs = g_ext4_fs;
     ext4_io_lock();
@@ -2481,6 +2683,7 @@ unsigned long ext4_file_ino(struct vfs_file *f)
 
 int ext4_fchmod_ino(unsigned long ino, unsigned mode)
 {
+    if (ext4_is_ro()) return ST_ROFS;
     if (!ino || !g_ext4_fs) return ST_INVALID;
     ext4_io_lock();
     int r = ext4_set_mode_locked(g_ext4_fs, ino, mode);
@@ -2490,6 +2693,7 @@ int ext4_fchmod_ino(unsigned long ino, unsigned mode)
 
 int ext4_fchown_ino(unsigned long ino, int uid, int gid)
 {
+    if (ext4_is_ro()) return ST_ROFS;
     if (!ino || !g_ext4_fs) return ST_INVALID;
     ext4_io_lock();
     int r = ext4_set_owner_locked(g_ext4_fs, ino, uid, gid);
@@ -2746,11 +2950,16 @@ static unsigned long ext4_locate_partition(const block_device_t *bdev)
  *   REPLAY - copy every committed descriptor tag's block to its final location
  *            unless a revoke at >= its sequence supersedes it.
  *
- * The jbd2 journal is BIG-ENDIAN on disk (unlike ext4 itself).  Scope note:
- * block/commit/tag checksums are NOT verified (our images use ^metadata_csum);
- * replay is gated on the jbd2 magic + a contiguous run of sequence numbers,
- * which is correct for cleanly-written journals.  Checksum verification,
- * ASYNC_COMMIT and fast-commit handling are deferred (P6).
+ * The jbd2 journal is BIG-ENDIAN on disk (unlike ext4 itself).  On a csum v2/v3
+ * journal ALL three log checksums are verified on replay — the descriptor-block
+ * TAIL csum (ext4_jdesc_csum_ok), each per-block TAG csum (ext4_jblock_csum),
+ * and the per-transaction COMMIT-block csum (ext4_jcommit_csum_ok) — so a torn
+ * or bit-rotted transaction is never applied (a bad descriptor/commit stops
+ * replay there; a bad single block is not written).  The WRITE side stamps the
+ * matching csum v3 (see ext4_txn_flush), so journaled writes are now enabled on
+ * csum-v3 journals.  Replay is otherwise gated on the jbd2 magic + a contiguous
+ * run of sequence numbers, correct for cleanly-written journals.  ASYNC_COMMIT
+ * and fast-commit are still not specially handled (deferred, P6).
  * =================================================================== */
 
 static inline uint16_t be16(uint16_t v) { return __builtin_bswap16(v); }
@@ -2818,6 +3027,68 @@ static int jrev_test(const jrev_tbl_t *t, unsigned long block, uint32_t seq)
     return 0;
 }
 
+/* jbd2 csum v2/v3 seed = crc32c(~0, journal_uuid).  Folds with the BE
+ * transaction sequence for the per-block TAG csum; used directly for the
+ * descriptor-tail and commit-block csums.  (The journal SUPERBLOCK csum is
+ * different: seed ~0 over the whole 1024-byte sb — see ext4_jsb_csum_set.) */
+static inline uint32_t ext4_jcsum_seed(const journal_superblock_t *jsb)
+{
+    return ext4_crc32c(0xFFFFFFFFu, jsb->s_uuid, sizeof(jsb->s_uuid));
+}
+
+/* Per-block TAG checksum (csum v2/v3): crc32c(seed, BE(seq)) folded with the
+ * journalled (escaped) block bytes.  v3 stores the full 32 bits in the tag,
+ * v2 the low 16.  Computed over the exact bytes written to the log, so callers
+ * must verify BEFORE un-escaping (and stamp AFTER escaping). */
+static uint32_t ext4_jblock_csum(uint32_t seed, uint32_t seq,
+                                 const void *blk, unsigned bs)
+{
+    uint32_t seq_be = __builtin_bswap32(seq);
+    uint32_t c = ext4_crc32c(seed, &seq_be, sizeof(seq_be));
+    return ext4_crc32c(c, blk, bs);
+}
+
+/* Descriptor/revoke TAIL checksum (csum v2/v3): the last 4 bytes hold
+ * crc32c(seed, whole block) computed with that tail field zeroed. */
+static int ext4_jdesc_csum_ok(uint32_t seed, uint8_t *blk, unsigned bs)
+{
+    uint32_t *ptail = (uint32_t *)(blk + bs - 4);
+    uint32_t raw = *ptail;
+    *ptail = 0;
+    uint32_t calc = ext4_crc32c(seed, blk, bs);
+    *ptail = raw;
+    return be32(raw) == calc;
+}
+
+/* jbd2 csum v2/v3 commit-block checksum (big-endian on disk).  The commit block
+ * is valid iff crc32c(seed, block) with h_chksum[0] zeroed equals the stored
+ * value.  h_chksum[0] sits at offset 0x10 (12-byte journal_header +
+ * h_chksum_type/size/pad = 4).  A torn or bit-rotted commit fails this, so on a
+ * csum journal we stop replay there instead of applying an incomplete
+ * transaction.  FAIL-SAFE: a false negative only stops replay earlier (fs stays
+ * consistent, as if the crash happened a txn sooner). */
+static int ext4_jcommit_csum_ok(uint32_t seed, uint8_t *blk, unsigned bs)
+{
+    uint32_t *pchk = (uint32_t *)(blk + JBD2_COMMIT_CSUM_OFF);
+    uint32_t raw = *pchk;                       /* stored be32 csum             */
+    *pchk = 0;
+    uint32_t calc = ext4_crc32c(seed, blk, bs);
+    *pchk = raw;                                /* restore the buffer           */
+    return be32(raw) == calc;
+}
+
+/* Stamp the journal SUPERBLOCK checksum (csum v2/v3): s_checksum @0xFC =
+ * crc32c(~0, first 1024 bytes with that field zeroed).  Note the ~0 seed (the
+ * uuid is inside the summed region), unlike the tag/desc/commit csums.  No-op
+ * unless `enabled`.  `jsbbuf` is a full-block buffer. */
+static void ext4_jsb_csum_set(uint8_t *jsbbuf, int enabled)
+{
+    if (!enabled) return;
+    uint32_t *pc = (uint32_t *)(jsbbuf + JBD2_SB_CSUM_OFF);
+    *pc = 0;
+    *pc = __builtin_bswap32(ext4_crc32c(0xFFFFFFFFu, jsbbuf, JBD2_SB_CSUM_LEN));
+}
+
 #define EXT4_JPASS_SCAN   0
 #define EXT4_JPASS_REVOKE 1
 #define EXT4_JPASS_REPLAY 2
@@ -2833,7 +3104,10 @@ static int ext4_journal_pass(ext4_fs_t *fs, const journal_superblock_t *jsb,
     uint32_t jincompat   = be32(jsb->s_feature_incompat);
     int      is64    = (jincompat & JBD2_FEATURE_INCOMPAT_64BIT) != 0;
     int      csum3   = (jincompat & JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0;
+    int      csum2   = (jincompat & JBD2_FEATURE_INCOMPAT_CSUM_V2) != 0;
+    int      csum_any = csum2 || csum3;           /* descriptor/commit csums    */
     unsigned tag_sz  = csum3 ? 16u : (is64 ? 12u : 8u);
+    uint32_t jseed   = ext4_jcsum_seed(jsb);
 
     unsigned long next_log = be32(jsb->s_start);
     uint32_t      next_seq = be32(jsb->s_sequence);
@@ -2854,29 +3128,52 @@ static int ext4_journal_pass(ext4_fs_t *fs, const journal_superblock_t *jsb,
 
         uint32_t bt = be32(h->h_blocktype);
         if (bt == JBD2_DESCRIPTOR_BLOCK) {
+            /* csum v2/v3: verify the descriptor TAIL csum before trusting any
+             * tag.  A bad tail means a torn/corrupt descriptor — stop here, so
+             * the tag walk never advances next_log off garbage. */
+            if (csum_any && !ext4_jdesc_csum_ok(jseed, blk, fs->block_size)) {
+                if (pass == EXT4_JPASS_SCAN)
+                    kprintf("ext4: journal descriptor csum bad at seq %u; "
+                            "stopping replay there\n", next_seq);
+                break;
+            }
             unsigned      off      = sizeof(journal_header_t);
             unsigned long data_idx = 0;
             while (off + tag_sz <= fs->block_size) {
                 const uint8_t *tag = blk + off;
                 uint32_t blocknr = be32(*(const uint32_t *)(tag + 0));
-                uint32_t flags   = csum3 ? be32(*(const uint32_t *)(tag + 4))
+                uint32_t flags   = csum3 ? be32(*(const uint32_t *)(tag + JBD2_TAG3_FLAGS_OFF))
                                          : be16(*(const uint16_t *)(tag + 6));
                 unsigned long target = blocknr;
                 if (is64)                              /* high 32 at +8 (both)*/
-                    target |= ((unsigned long)be32(*(const uint32_t *)(tag + 8)) << 32);
+                    target |= ((unsigned long)be32(*(const uint32_t *)(tag + JBD2_TAG3_BLKHI_OFF)) << 32);
 
                 if (pass == EXT4_JPASS_REPLAY) {
                     /* The journalled copy is 1 + data_idx blocks past the
                      * descriptor in the log. */
                     unsigned long dl = jlog_advance(next_log, 1 + data_idx, first, maxlen);
                     if (jlog_read(fs, dl, data) != ST_OK) { rc = ST_IO; goto out; }
+                    /* Per-block TAG csum (csum v2/v3) is over the journalled
+                     * (escaped) bytes — verify BEFORE restoring the magic. */
+                    int tagbad = 0;
+                    if (csum_any) {
+                        uint32_t want = ext4_jblock_csum(jseed, next_seq, data, fs->block_size);
+                        int ok = csum3
+                            ? (be32(*(const uint32_t *)(tag + JBD2_TAG3_CSUM_OFF)) == want)
+                            : (be16(*(const uint16_t *)(tag + JBD2_TAG_V2_CSUM_OFF)) == (uint16_t)want);
+                        if (!ok) {
+                            kprintf("ext4: journal block tag csum bad (block %lu, "
+                                    "seq %u); not applying that block\n", target, next_seq);
+                            tagbad = 1;
+                        }
+                    }
                     if (flags & JBD2_FLAG_ESCAPE) {     /* restore escaped magic */
                         uint32_t m = __builtin_bswap32(JBD2_MAGIC_NUMBER);
                         mm_memcpy(data, &m, 4);
                     }
                     if (target == 0) {
                         WARN_ON_ONCE(1);               /* tag targets block 0 */
-                    } else if (!jrev_test(revtbl, target, next_seq)) {
+                    } else if (!tagbad && !jrev_test(revtbl, target, next_seq)) {
                         if (ext4_write_block(fs, target, data) != ST_OK) { rc = ST_IO; goto out; }
                         replayed++;
                     }
@@ -2890,6 +3187,14 @@ static int ext4_journal_pass(ext4_fs_t *fs, const journal_superblock_t *jsb,
             }
             next_log = jlog_advance(next_log, 1 + data_idx, first, maxlen);
         } else if (bt == JBD2_COMMIT_BLOCK) {
+            if (csum_any && !ext4_jcommit_csum_ok(jseed, blk, fs->block_size)) {
+                /* Torn/corrupt commit on a csum journal: this transaction never
+                 * completed, so it — and everything after — must NOT be replayed. */
+                if (pass == EXT4_JPASS_SCAN)
+                    kprintf("ext4: journal commit csum bad at seq %u; "
+                            "stopping replay there\n", next_seq);
+                break;
+            }
             next_seq++;                                /* transaction boundary */
             if (pass == EXT4_JPASS_SCAN)
                 *end_txn = next_seq;
@@ -2966,9 +3271,11 @@ static int ext4_journal_recover(ext4_fs_t *fs, int *did_work)
     if (jincompat & ~known)
         kprintf("ext4: journal unknown incompat 0x%x; attempting replay anyway\n",
                 jincompat & ~known);
-    if (jincompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3
-                     | JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT | JBD2_FEATURE_INCOMPAT_FAST_COMMIT))
-        kprintf("ext4: journal csum/async/fast-commit not verified (tolerant replay)\n");
+    if (jincompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3))
+        kprintf("ext4: journal csum-v%d: descriptor/tag/commit csums verified on replay\n",
+                (jincompat & JBD2_FEATURE_INCOMPAT_CSUM_V3) ? 3 : 2);
+    if (jincompat & (JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT | JBD2_FEATURE_INCOMPAT_FAST_COMMIT))
+        kprintf("ext4: journal async/fast-commit not specially handled (tolerant replay)\n");
 
     /* Always report the journal state at mount so a "did it recover?" question
      * is never a guess.  s_start is the log tail: 0 == clean (nothing to
@@ -3004,9 +3311,13 @@ static int ext4_journal_recover(ext4_fs_t *fs, int *did_work)
     if (revtbl.v) kfree(revtbl.v);
     if (rc != ST_OK) { kfree(jblk); return rc; }
 
-    /* Mark the journal empty: s_start = 0, s_sequence = end_txn. */
+    /* Mark the journal empty: s_start = 0, s_sequence = end_txn.  On a csum
+     * journal the superblock carries its own checksum (seed ~0 over 1024 bytes),
+     * so restamp it after editing or Linux/e2fsck will reject the journal sb. */
     jsb->s_start    = __builtin_bswap32(0);
     jsb->s_sequence = __builtin_bswap32(end_txn);
+    ext4_jsb_csum_set(jblk, (jincompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2
+                                        | JBD2_FEATURE_INCOMPAT_CSUM_V3)) != 0);
     if (ext4_write_block(fs, sb_pbn, jblk) != ST_OK) { kfree(jblk); return ST_IO; }
     if (fs->bdev && fs->bdev->sync)
         fs->bdev->sync((block_device_t *)fs->bdev);   /* persist before RECOVER clears */
@@ -3054,17 +3365,24 @@ static void ext4_txn_flush(ext4_fs_t *fs)
     unsigned long maxlen = fs->j_maxlen;
     uint32_t      seq    = fs->j_sequence;
     unsigned long span   = (maxlen > first) ? (maxlen - first) : 0;
-    if (n + 2 > span) {               /* transaction too big for the journal */
+
+    journal_superblock_t *jsb = (journal_superblock_t *)fs->j_sb_buf;
+    int      is64  = (be32(jsb->s_feature_incompat) & JBD2_FEATURE_INCOMPAT_64BIT) != 0;
+    int      csum3 = fs->j_csum3;                  /* stamp jbd2 csum v3 if set  */
+    unsigned tagsz = csum3 ? JBD2_TAG3_SIZE : (is64 ? 12u : 8u);
+
+    /* All tags + the lone tag0 uuid + (csum v3) the descriptor tail must fit in
+     * one descriptor block — we don't chain descriptors.  Plus the whole txn
+     * (descriptor + n data + commit) must fit the log.  Either overflow → fall
+     * back to direct in-place writes (no journal protection, but correct). */
+    unsigned desc_need = sizeof(journal_header_t) + n * tagsz + 16 + (csum3 ? 4u : 0u);
+    if (n + 2 > span || desc_need > fs->block_size) {
         WARN_ON_ONCE(1);
         for (unsigned i = 0; i < n; i++)
             ext4_write_block_direct(fs, s_txn.blk[i], s_txn.data[i]);
         if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
         return;
     }
-
-    journal_superblock_t *jsb = (journal_superblock_t *)fs->j_sb_buf;
-    int      is64  = (be32(jsb->s_feature_incompat) & JBD2_FEATURE_INCOMPAT_64BIT) != 0;
-    unsigned tagsz = is64 ? 12u : 8u;
 
     /* 1. mark needs-recovery, durably, before writing any committed journal.
      * Only written when not already set: the journal now stays dirty between
@@ -3080,6 +3398,7 @@ static void ext4_txn_flush(ext4_fs_t *fs)
     /* 2. point the journal at this transaction (it starts at s_first). */
     jsb->s_start    = __builtin_bswap32((uint32_t)first);
     jsb->s_sequence = __builtin_bswap32(seq);
+    ext4_jsb_csum_set(fs->j_sb_buf, csum3);
     jlog_write(fs, 0, fs->j_sb_buf);
     if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
 
@@ -3093,6 +3412,7 @@ static void ext4_txn_flush(ext4_fs_t *fs)
             ext4_write_block_direct(fs, s_txn.blk[i], s_txn.data[i]);
         if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
         jsb->s_start = 0; jsb->s_sequence = __builtin_bswap32(seq + 1);
+        ext4_jsb_csum_set(fs->j_sb_buf, csum3);
         jlog_write(fs, 0, fs->j_sb_buf);
         fs->sb_copy.s_feature_incompat &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
         fs->feature_incompat           &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
@@ -3109,28 +3429,46 @@ static void ext4_txn_flush(ext4_fs_t *fs)
     unsigned off = sizeof(journal_header_t);
     for (unsigned i = 0; i < n; i++) {
         unsigned long tgt = s_txn.blk[i];
-        uint16_t flags = 0;
+        uint32_t flags = 0;
         if (i > 0)     flags |= JBD2_FLAG_SAME_UUID;   /* uuid only after tag0 */
         if (i == n - 1) flags |= JBD2_FLAG_LAST_TAG;
         uint32_t fw;
         mm_memcpy(&fw, s_txn.data[i], 4);
         int escape = (fw == __builtin_bswap32(JBD2_MAGIC_NUMBER));
         if (escape) flags |= JBD2_FLAG_ESCAPE;
+
+        /* The journalled (escaped) copy must exist before the tag csum, which is
+         * computed over the exact bytes written to the log. */
+        mm_memcpy(cpy, s_txn.data[i], fs->block_size);
+        if (escape) { uint32_t z = 0; mm_memcpy(cpy, &z, 4); }
+
         uint8_t *tag = db + off;
         *(uint32_t *)(tag + 0) = __builtin_bswap32((uint32_t)(tgt & 0xFFFFFFFFUL));
-        *(uint16_t *)(tag + 4) = 0;                    /* t_checksum (no csum) */
-        *(uint16_t *)(tag + 6) = __builtin_bswap16(flags);
-        if (is64)
-            *(uint32_t *)(tag + 8) = __builtin_bswap32((uint32_t)(tgt >> 32));
+        if (csum3) {                                   /* 16-byte csum-v3 tag  */
+            *(uint32_t *)(tag + JBD2_TAG3_FLAGS_OFF) = __builtin_bswap32(flags);
+            *(uint32_t *)(tag + JBD2_TAG3_BLKHI_OFF) =
+                is64 ? __builtin_bswap32((uint32_t)(tgt >> 32)) : 0;
+            uint32_t tc = ext4_jblock_csum(fs->j_csum_seed, seq, cpy, fs->block_size);
+            *(uint32_t *)(tag + JBD2_TAG3_CSUM_OFF) = __builtin_bswap32(tc);
+        } else {                                       /* classic 8/12-byte tag*/
+            *(uint16_t *)(tag + 4) = 0;                /* t_checksum (no csum) */
+            *(uint16_t *)(tag + 6) = __builtin_bswap16((uint16_t)flags);
+            if (is64)
+                *(uint32_t *)(tag + 8) = __builtin_bswap32((uint32_t)(tgt >> 32));
+        }
         off += tagsz;
         if (!(flags & JBD2_FLAG_SAME_UUID)) {          /* journal uuid follows */
             mm_memcpy(db + off, fs->j_uuid, 16);
             off += 16;
         }
-        /* journalled copy of the block (escaped if it began with the magic) */
-        mm_memcpy(cpy, s_txn.data[i], fs->block_size);
-        if (escape) { uint32_t z = 0; mm_memcpy(cpy, &z, 4); }
         jlog_write(fs, first + 1 + i, cpy);
+    }
+    /* csum v3: the descriptor's TAIL csum covers the whole block (tags + their
+     * per-block csums) with the tail field zeroed — stamp it after the loop. */
+    if (csum3) {
+        uint32_t *dt = (uint32_t *)(db + fs->block_size - 4);
+        *dt = 0;
+        *dt = __builtin_bswap32(ext4_crc32c(fs->j_csum_seed, db, fs->block_size));
     }
     jlog_write(fs, first, db);                         /* the descriptor      */
     mm_memset(cpy, 0, fs->block_size);                 /* commit block        */
@@ -3138,6 +3476,11 @@ static void ext4_txn_flush(ext4_fs_t *fs)
     ch->h_magic     = __builtin_bswap32(JBD2_MAGIC_NUMBER);
     ch->h_blocktype = __builtin_bswap32(JBD2_COMMIT_BLOCK);
     ch->h_sequence  = __builtin_bswap32(seq);
+    if (csum3) {                                       /* h_chksum_type/size=0 */
+        uint32_t *cc = (uint32_t *)(cpy + JBD2_COMMIT_CSUM_OFF);
+        *cc = 0;                                       /* h_chksum[0] zeroed   */
+        *cc = __builtin_bswap32(ext4_crc32c(fs->j_csum_seed, cpy, fs->block_size));
+    }
     jlog_write(fs, first + 1 + n, cpy);
     if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);  /* commit durable */
     kfree(db);
@@ -3171,6 +3514,7 @@ static void ext4_journal_clean(ext4_fs_t *fs)
     journal_superblock_t *jsb = (journal_superblock_t *)fs->j_sb_buf;
     jsb->s_start    = 0;
     jsb->s_sequence = __builtin_bswap32(fs->j_sequence);
+    ext4_jsb_csum_set(fs->j_sb_buf, fs->j_csum3);
     jlog_write(fs, 0, fs->j_sb_buf);
     if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
     fs->sb_copy.s_feature_incompat &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
@@ -3230,6 +3574,16 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
                                             : sb->s_first_ino;
     out->journal_inum = sb->s_journal_inum;
     out->read_only = 0;   /* Phase 2: writes enabled */
+    /* errors= policy for runtime corruption (ext4_fs_error).  Linux applies a
+     * mount-time default of remount-ro on metadata corruption regardless of the
+     * on-disk s_errors hint (mke2fs stamps s_errors=continue by default), since
+     * leaving a corrupt filesystem writable risks compounding the damage.  We do
+     * the same: default to the safe remount-ro, honouring only an explicit panic
+     * request from the superblock.  A deliberate errors=continue would require a
+     * mount option, which we don't parse yet. */
+    out->errors_behavior =
+        (sb->s_errors == EXT4_ERRORS_PANIC) ? EXT4_ERRORS_PANIC
+                                            : EXT4_ERRORS_RO;
 
     if (out->feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT)
         out->desc_size = sb->s_desc_size ? sb->s_desc_size : 64;
@@ -3251,10 +3605,16 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
         out->csum_seed = ext4_crc32c(0xFFFFFFFFu, sb->s_uuid, sizeof(sb->s_uuid));
     if (out->has_metadata_csum) {
         uint32_t got = ext4_sb_csum(sb), want = sb->s_checksum;
-        if (got != want)
-            kprintf("ext4: WARN superblock metadata_csum mismatch "
-                    "(disk 0x%x computed 0x%x)\n", want, got);
-        else
+        if (got != want) {
+            /* The superblock is corrupt — we can't trust its geometry for
+             * writes.  Degrade to a read-only mount (don't refuse to boot / panic
+             * the root fs) and mark it errored in-memory so e2fsck is run. */
+            kprintf("ext4: ERROR superblock metadata_csum mismatch "
+                    "(disk 0x%x computed 0x%x) -> mounting read-only\n", want, got);
+            out->sb_copy.s_state &= ~(uint16_t)EXT4_VALID_FS;
+            out->sb_copy.s_state |=  (uint16_t)EXT4_ERROR_FS;
+            out->read_only = 1;
+        } else
             kprintf("ext4: metadata_csum on; superblock csum verified\n");
     }
 
@@ -3289,10 +3649,15 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
         for (unsigned int g = 0; g < out->groups_count; g++)
             if (ext4_gd_csum(out, g, &out->gdt[g]) != out->gdt[g].bg_checksum)
                 bad++;
-        if (bad)
-            kprintf("ext4: WARN %u/%u group-desc metadata_csum mismatch\n",
-                    bad, out->groups_count);
-        else
+        if (bad) {
+            /* A corrupt group descriptor would mis-place bitmaps / inode tables —
+             * degrade to read-only and mark errored rather than write through it. */
+            kprintf("ext4: ERROR %u/%u group-desc metadata_csum mismatch "
+                    "-> mounting read-only\n", bad, out->groups_count);
+            out->sb_copy.s_state &= ~(uint16_t)EXT4_VALID_FS;
+            out->sb_copy.s_state |=  (uint16_t)EXT4_ERROR_FS;
+            out->read_only = 1;
+        } else
             kprintf("ext4: all %u group-desc csums verified\n", out->groups_count);
     }
 
@@ -3333,11 +3698,16 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
 
     /* PJ: set up journaled writes (ordered mode).  Disabled unless the journal
      * exists, matches our block size, and uses only features we can WRITE
-     * correctly (no csum/async/fast-commit — those need csums we don't yet
-     * compute, P6).  Must run after recovery so j_sequence reflects the
-     * post-recovery journal state. */
+     * correctly.  We stamp jbd2 csum v3, so a csum-v3 journal is supported; csum
+     * v2, async-commit and fast-commit remain unsupported on the write side and
+     * fall back to direct writes.  On a metadata_csum fs whose journal is still
+     * plain (mke2fs ships it that way — the kernel upgrades it on first rw mount)
+     * we upgrade it to csum-v3 here, matching Linux, so our own images get
+     * csum-protected journaling.  Must run after recovery so j_sequence reflects
+     * the post-recovery journal state (and the log is clean before any upgrade). */
     out->j_enabled = 0;
     out->j_sb_buf  = 0;
+    out->j_csum3   = 0;
     if ((out->feature_compat & EXT4_FEATURE_COMPAT_HAS_JOURNAL) && out->journal_inum != 0) {
         out->j_sb_buf = (uint8_t *)kalloc(out->block_size);
         unsigned long jpbn = out->j_sb_buf ? ext4_block_map(out, out->journal_inum, 0) : 0;
@@ -3347,7 +3717,7 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
             uint32_t jmag = be32(jsb->s_header.h_magic);
             uint32_t jbt  = be32(jsb->s_header.h_blocktype);
             uint32_t jinc = be32(jsb->s_feature_incompat);
-            uint32_t jbad = JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3
+            uint32_t jbad = JBD2_FEATURE_INCOMPAT_CSUM_V2
                           | JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT | JBD2_FEATURE_INCOMPAT_FAST_COMMIT;
             if (jmag == JBD2_MAGIC_NUMBER &&
                 (jbt == JBD2_SUPERBLOCK_V1 || jbt == JBD2_SUPERBLOCK_V2) &&
@@ -3358,13 +3728,56 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
                 if (out->j_sequence == 0) out->j_sequence = 1;  /* jbd2 seq >= 1 */
                 mm_memcpy(out->j_uuid, jsb->s_uuid, 16);
                 out->j_sb_pbn = jpbn;
+                out->j_csum3  = (jinc & JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0;
+                /* seed for tag/descriptor/commit csums = crc32c(~0, journal uuid) */
+                out->j_csum_seed = ext4_crc32c(0xFFFFFFFFu, out->j_uuid, 16);
                 if (out->j_maxlen > out->j_first + 3)
                     out->j_enabled = 1;
+
+                /* Make the journal a well-formed csum-v3 journal on a
+                 * metadata_csum fs, like the Linux kernel does on first rw mount.
+                 * Fires when the journal is still plain OR was left half-upgraded
+                 * (CSUM_V3 set but s_checksum_type unset — jbd2/e2fsck reject
+                 * that).  Only with a CLEAN log (s_start==0, true after recovery /
+                 * on a clean image) — flipping journal features mid-log would
+                 * corrupt replay — and only on a writable mount.  Sets CSUM_V3 +
+                 * s_checksum_type=crc32c, clears the deprecated v1 compat-checksum,
+                 * and restamps the journal-sb csum (seed ~0).  On persist failure,
+                 * fully restore the in-memory sb so later commits never write a
+                 * half-upgraded superblock. */
+                int type_ok = (out->j_sb_buf[JBD2_SB_CSUM_TYPE_OFF] == JBD2_CRC32C_CHKSUM);
+                if (out->j_enabled && out->has_metadata_csum && !out->read_only &&
+                    be32(jsb->s_start) == 0 && (!out->j_csum3 || !type_ok)) {
+                    int was_v3 = out->j_csum3;
+                    uint32_t o_inc  = jsb->s_feature_incompat;   /* be, for revert  */
+                    uint32_t o_comp = jsb->s_feature_compat;
+                    uint8_t  o_type = out->j_sb_buf[JBD2_SB_CSUM_TYPE_OFF];
+
+                    jsb->s_feature_incompat = __builtin_bswap32(jinc | JBD2_FEATURE_INCOMPAT_CSUM_V3);
+                    jsb->s_feature_compat   = __builtin_bswap32(
+                        be32(jsb->s_feature_compat) & ~JBD2_FEATURE_COMPAT_CHECKSUM);
+                    out->j_sb_buf[JBD2_SB_CSUM_TYPE_OFF] = JBD2_CRC32C_CHKSUM;
+                    ext4_jsb_csum_set(out->j_sb_buf, 1);
+
+                    if (jlog_write(out, 0, out->j_sb_buf) == ST_OK) {
+                        if (out->bdev && out->bdev->sync)
+                            out->bdev->sync((block_device_t *)out->bdev);
+                        out->j_csum3 = 1;
+                        kprintf("ext4: %s journal to csum-v3 (metadata_csum fs)\n",
+                                was_v3 ? "fixed s_checksum_type on" : "upgraded plain");
+                    } else {
+                        jsb->s_feature_incompat = o_inc;
+                        jsb->s_feature_compat   = o_comp;
+                        out->j_sb_buf[JBD2_SB_CSUM_TYPE_OFF] = o_type;
+                        ext4_jsb_csum_set(out->j_sb_buf, was_v3);  /* restore prior */
+                    }
+                }
             }
         }
         if (out->j_enabled) {
-            kprintf("ext4: journaled writes ON (ordered; journal %lu blocks, next seq %u)\n",
-                    out->j_maxlen, out->j_sequence);
+            kprintf("ext4: journaled writes ON (ordered; journal %lu blocks, next seq %u%s)\n",
+                    out->j_maxlen, out->j_sequence,
+                    out->j_csum3 ? ", csum-v3" : "");
         } else {
             kprintf("ext4: journaled writes OFF (no usable journal / unsupported journal features)\n");
             if (out->j_sb_buf) { kfree(out->j_sb_buf); out->j_sb_buf = 0; }

@@ -666,6 +666,7 @@ static int vfs_status_to_errno(int st) {
         case ST_BUSY:      return -EBUSY;
         case ST_AGAIN:     return -EAGAIN;
         case ST_NOTEMPTY:  return -ENOTEMPTY;
+        case ST_ROFS:      return -EROFS;
         default:           return -EACCES;
     }
 }
@@ -1061,7 +1062,9 @@ static int64_t sys_stat_common(const char* path, uint64_t stat_buf, int validate
     if (tr < 0) return tr;
     int ret = vfs_stat(path, &st);
     if (ret != ST_OK) {
-        return (ret == ST_NOT_FOUND) ? -ENOENT : -EINVAL;
+        if (ret == ST_NOT_FOUND) return -ENOENT;
+        if (ret == ST_IO)        return -EIO;   /* corrupt metadata, not absent */
+        return -EINVAL;
     }
     // Security: Use SMAP-aware copy to user
     if (copy_to_user((void*)stat_buf, &st, sizeof(st)) != 0) {
@@ -1216,7 +1219,9 @@ static int64_t sys_access(uint64_t pathname, uint64_t mode) {
     struct kstat st;
     int ret = vfs_stat(path, &st);
     if (ret != ST_OK) {
-        return (ret == ST_NOT_FOUND) ? -ENOENT : -EINVAL;
+        if (ret == ST_NOT_FOUND) return -ENOENT;
+        if (ret == ST_IO)        return -EIO;   /* corrupt metadata, not absent */
+        return -EINVAL;
     }
     int want = (int)(mode & 7);
     if (want == 0) return 0;   /* F_OK: exists and reachable */
@@ -1253,7 +1258,9 @@ static int64_t sys_faccessat(uint64_t dirfd, uint64_t pathname, uint64_t mode, u
     struct kstat st;
     int st_ret = vfs_stat(full, &st);
     if (st_ret != ST_OK) {
-        return (st_ret == ST_NOT_FOUND) ? -ENOENT : -EINVAL;
+        if (st_ret == ST_NOT_FOUND) return -ENOENT;
+        if (st_ret == ST_IO)        return -EIO;   /* corrupt metadata, not absent */
+        return -EINVAL;
     }
     int want = (int)(mode & 7);     /* R_OK/W_OK/X_OK == MAY_READ/WRITE/EXEC */
     if (want == 0) return 0;        /* F_OK: exists and reachable */
@@ -1302,6 +1309,7 @@ static int64_t sys_chdir(uint64_t pathname) {
     struct kstat st;
     int vret = vfs_stat(full, &st);
     if (vret == ST_NOT_FOUND) return -ENOENT;
+    if (vret == ST_IO) return -EIO;            /* corrupt metadata, not "not a dir" */
     if (vret != ST_OK) return -ENOTDIR;
     if ((st.st_mode & S_IFMT) != S_IFDIR) return -ENOTDIR;
     /* P5: entering a directory requires search on it and on every ancestor. */
