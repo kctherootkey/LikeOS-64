@@ -217,6 +217,80 @@ static void htree_tests(const char *dir) {
     CHECK(rmdir(dir) == 0, "rmdir emptied htree directory");
 }
 
+/* --------------------------------------------------------- deep extent tree ---- */
+/* Force a file into a multi-extent (depth>0) extent tree, then verify data,
+ * partial truncate (partial tree free) and delete (full recursive free).
+ *
+ * The driver allocates contiguously, so a normal file is one extent however big.
+ * To fragment a file we INTERLEAVE single-block appends to two files: the
+ * sequential allocator hands file A blocks P, P+2, P+4, ... (file B takes the odd
+ * ones), so A ends up with one non-contiguous extent per append.  >4 extents
+ * overflows the inline root (grows the tree to depth 1); EXT_FRAG here exceeds one
+ * external leaf (340 extents) so it also exercises adding a second leaf.  (Deeper
+ * trees / depth 2 are validated off-target; this proves the path end-to-end on a
+ * real fs.)  Run e2fsck -fn afterwards. */
+#define EXT_FRAG 400
+#define EXT_BS   4096
+static void extent_tests(const char *base) {
+    char pa[256], pb[256];
+    snprintf(pa, sizeof(pa), "%s.fragA", base);
+    snprintf(pb, sizeof(pb), "%s.fragB", base);
+    unlink(pa); unlink(pb);
+    printf("[extent] %s : %d interleaved 1-block appends -> deep extent tree\n", pa, EXT_FRAG);
+
+    int fa = open(pa, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    int fb = open(pb, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fa < 0 || fb < 0) {
+        printf("  FAIL: cannot create frag test files (errno=%d)\n", errno); fails++;
+        if (fa >= 0) close(fa);
+        if (fb >= 0) close(fb);
+        return;
+    }
+
+    static char blk[EXT_BS];
+    int wrote = 0;
+    for (int i = 0; i < EXT_FRAG; i++) {
+        memset(blk, 0, EXT_BS);
+        *(int *)blk = i;                       /* tag block i of A */
+        if (write(fa, blk, EXT_BS) == EXT_BS) wrote++;
+        memset(blk, 'B', 32);                  /* interleaver block into B */
+        if (write(fb, blk, EXT_BS) != EXT_BS) break;
+    }
+    CHECK(wrote == EXT_FRAG, "wrote all blocks to a fragmented file (grows the extent tree)");
+
+    struct stat st;
+    CHECK(stat(pa, &st) == 0 && (long)st.st_size == (long)EXT_FRAG * EXT_BS,
+          "fragmented file size correct");
+
+    /* Read every block back: proves the deep extent tree maps each logical block. */
+    int rdok = 1;
+    if (lseek(fa, 0, SEEK_SET) != 0) rdok = 0;
+    for (int i = 0; i < EXT_FRAG && rdok; i++) {
+        if (read(fa, blk, EXT_BS) != EXT_BS || *(int *)blk != i) rdok = 0;
+    }
+    CHECK(rdok, "every block reads back correctly through the deep extent tree");
+
+    /* Partial truncate: keep the first half (exercises partial tree free). */
+    int half = EXT_FRAG / 2;
+    CHECK(ftruncate(fa, (long)half * EXT_BS) == 0, "ftruncate to half");
+    CHECK(stat(pa, &st) == 0 && (long)st.st_size == (long)half * EXT_BS, "size correct after truncate");
+    rdok = 1;
+    if (lseek(fa, 0, SEEK_SET) != 0) rdok = 0;
+    for (int i = 0; i < half && rdok; i++) {
+        if (read(fa, blk, EXT_BS) != EXT_BS || *(int *)blk != i) rdok = 0;
+    }
+    CHECK(rdok, "kept blocks intact after partial truncate");
+    /* Reading past the new EOF must return 0 bytes. */
+    CHECK(read(fa, blk, EXT_BS) == 0, "read past truncated EOF returns 0");
+
+    close(fa); close(fb);
+
+    /* Full delete: recursive free of the remaining tree (+ its index/leaf blocks). */
+    CHECK(unlink(pa) == 0, "unlink fragmented file (full extent-tree free)");
+    CHECK(unlink(pb) == 0, "unlink interleaver file");
+    CHECK(stat(pa, &st) != 0, "fragmented file gone after unlink");
+}
+
 int main(int argc, char **argv) {
     const char *base = (argc > 1) ? argv[1] : "/tmp/ext4test";
     char datpath[256], dirpath[256];
@@ -225,6 +299,7 @@ int main(int argc, char **argv) {
 
     xattr_tests(datpath);
     htree_tests(dirpath);
+    extent_tests(base);
 
     printf("[ext4test] %s (%d failure%s)\n", fails ? "FAILED" : "OK",
            fails, fails == 1 ? "" : "s");
