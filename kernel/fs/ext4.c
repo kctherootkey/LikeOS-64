@@ -2576,12 +2576,497 @@ out:
 /* ---- directory entry insert / remove ---- */
 static inline unsigned ext4_dirent_len(unsigned name_len) { return (8 + name_len + 3) & ~3u; }
 
+/* ===================================================================
+ * htree (hash-indexed directory) write support.
+ *
+ * On-disk an htree dir keeps its real entries in plain leaf blocks (read by the
+ * linear scanner in ext4_dir_lookup) plus an index: block 0 is a dx_root
+ * (dot/dotdot + dx_root_info + a sorted {hash,logical-block} array), and for
+ * deep trees, interior dx_node blocks.  We hash the name, descend the index to
+ * the target leaf, insert there, and on a full leaf split it and propagate a new
+ * index entry upward (growing the tree from depth 0 to 1 when the root fills).
+ *
+ * The dirhash (verified byte-exact against e2fsprogs) and the dx checksum are
+ * the e2fsck gates; both are below.  A single index node holds up to ~510 leaf
+ * pointers, so depth 1 covers far more entries than this system will ever put in
+ * one directory; a full interior node (needing a node split / depth 2) returns
+ * ST_NOSPC rather than build an unverified structure.
+ * =================================================================== */
+
+#define EXT4_HASH_LEGACY        0
+#define EXT4_HASH_HALF_MD4      1
+#define EXT4_HASH_TEA           2
+#define EXT4_HASH_LEGACY_UNS    3
+#define EXT4_HASH_HALF_MD4_UNS  4
+#define EXT4_HASH_TEA_UNS       5
+#define EXT4_HTREE_EOF          0x7fffffffUL
+
+typedef struct { uint32_t reserved_zero; uint8_t hash_version; uint8_t info_length;
+                 uint8_t indirect_levels; uint8_t unused_flags;
+               } __attribute__((packed)) ext4_dx_root_info;
+typedef struct { uint32_t hash; uint32_t block; } __attribute__((packed)) ext4_dx_entry;
+typedef struct { uint16_t limit; uint16_t count; } __attribute__((packed)) ext4_dx_countlimit;
+typedef struct { uint32_t dt_reserved; uint32_t dt_checksum; } __attribute__((packed)) ext4_dx_tail;
+
+/* ---- the directory hash (mirrors e2fsprogs lib/ext2fs/dirhash.c) ---- */
+#define EXT4_DX_DELTA 0x9E3779B9
+static void ext4_dx_tea(uint32_t buf[4], const uint32_t in[4])
+{
+    uint32_t sum = 0, b0 = buf[0], b1 = buf[1];
+    uint32_t a = in[0], b = in[1], c = in[2], d = in[3];
+    for (int n = 0; n < 16; n++) {
+        sum += EXT4_DX_DELTA;
+        b0 += ((b1 << 4) + a) ^ (b1 + sum) ^ ((b1 >> 5) + b);
+        b1 += ((b0 << 4) + c) ^ (b0 + sum) ^ ((b0 >> 5) + d);
+    }
+    buf[0] += b0; buf[1] += b1;
+}
+#define DXF(x,y,z) ((z) ^ ((x) & ((y) ^ (z))))
+#define DXG(x,y,z) (((x) & (y)) + (((x) ^ (y)) & (z)))
+#define DXH(x,y,z) ((x) ^ (y) ^ (z))
+#define DXR(f,a,b,c,d,x,s) (a += f(b,c,d) + (x), a = (a << (s)) | (a >> (32 - (s))))
+static void ext4_dx_md4(uint32_t buf[4], const uint32_t in[8])
+{
+    uint32_t a = buf[0], b = buf[1], c = buf[2], d = buf[3];
+    DXR(DXF,a,b,c,d, in[0],     3); DXR(DXF,d,a,b,c, in[1],     7);
+    DXR(DXF,c,d,a,b, in[2],    11); DXR(DXF,b,c,d,a, in[3],    19);
+    DXR(DXF,a,b,c,d, in[4],     3); DXR(DXF,d,a,b,c, in[5],     7);
+    DXR(DXF,c,d,a,b, in[6],    11); DXR(DXF,b,c,d,a, in[7],    19);
+    DXR(DXG,a,b,c,d, in[1]+0x5A827999, 3);  DXR(DXG,d,a,b,c, in[3]+0x5A827999, 5);
+    DXR(DXG,c,d,a,b, in[5]+0x5A827999, 9);  DXR(DXG,b,c,d,a, in[7]+0x5A827999,13);
+    DXR(DXG,a,b,c,d, in[0]+0x5A827999, 3);  DXR(DXG,d,a,b,c, in[2]+0x5A827999, 5);
+    DXR(DXG,c,d,a,b, in[4]+0x5A827999, 9);  DXR(DXG,b,c,d,a, in[6]+0x5A827999,13);
+    DXR(DXH,a,b,c,d, in[3]+0x6ED9EBA1, 3);  DXR(DXH,d,a,b,c, in[7]+0x6ED9EBA1, 9);
+    DXR(DXH,c,d,a,b, in[2]+0x6ED9EBA1,11);  DXR(DXH,b,c,d,a, in[6]+0x6ED9EBA1,15);
+    DXR(DXH,a,b,c,d, in[1]+0x6ED9EBA1, 3);  DXR(DXH,d,a,b,c, in[5]+0x6ED9EBA1, 9);
+    DXR(DXH,c,d,a,b, in[0]+0x6ED9EBA1,11);  DXR(DXH,b,c,d,a, in[4]+0x6ED9EBA1,15);
+    buf[0] += a; buf[1] += b; buf[2] += c; buf[3] += d;
+}
+static void ext4_dx_str2hb(const char *msg, int len, uint32_t *buf, int num, int sg)
+{
+    uint32_t pad = (uint32_t)len | ((uint32_t)len << 8); pad |= pad << 16;
+    uint32_t val = pad;
+    if (len > num * 4) len = num * 4;
+    for (int i = 0; i < len; i++) {
+        int c = sg ? (int)(signed char)msg[i] : (int)(unsigned char)msg[i];
+        val = (uint32_t)c + (val << 8);
+        if ((i % 4) == 3) { *buf++ = val; val = pad; num--; }
+    }
+    if (--num >= 0) *buf++ = val;
+    while (--num >= 0) *buf++ = pad;
+}
+static uint32_t ext4_dx_hack(const char *name, int len, int sg)
+{
+    uint32_t h0 = 0x12a3fe2d, h1 = 0x37abe8f9;
+    while (len--) {
+        int c = sg ? (int)(signed char)*name : (int)(unsigned char)*name;
+        name++;
+        uint32_t h = h1 + (h0 ^ (uint32_t)(c * 7152373));
+        if (h & 0x80000000u) h -= 0x7fffffff;
+        h1 = h0; h0 = h;
+    }
+    return h0 << 1;
+}
+/* Major hash for placement; *minor optional.  Uses the fs hash seed if set. */
+static uint32_t ext4_dx_hash(const ext4_fs_t *fs, int version,
+                             const char *name, int len, uint32_t *minor_out)
+{
+    uint32_t buf[4] = { 0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476 };
+    int has_seed = 0;
+    for (int i = 0; i < 4; i++) if (fs->sb_copy.s_hash_seed[i]) { has_seed = 1; break; }
+    if (has_seed) for (int i = 0; i < 4; i++) buf[i] = fs->sb_copy.s_hash_seed[i];
+    uint32_t hash = 0, minor = 0; uint32_t in[8]; const char *p = name; int l = len;
+    switch (version) {
+    case EXT4_HASH_LEGACY_UNS:  hash = ext4_dx_hack(name, len, 0); break;
+    case EXT4_HASH_LEGACY:      hash = ext4_dx_hack(name, len, 1); break;
+    case EXT4_HASH_HALF_MD4_UNS:
+    case EXT4_HASH_HALF_MD4:
+        while (l > 0) { ext4_dx_str2hb(p, l, in, 8, version == EXT4_HASH_HALF_MD4);
+                        ext4_dx_md4(buf, in); l -= 32; p += 32; }
+        hash = buf[1]; minor = buf[2]; break;
+    case EXT4_HASH_TEA_UNS:
+    case EXT4_HASH_TEA:
+        while (l > 0) { ext4_dx_str2hb(p, l, in, 4, version == EXT4_HASH_TEA);
+                        ext4_dx_tea(buf, in); l -= 16; p += 16; }
+        hash = buf[0]; minor = buf[1]; break;
+    default:
+        while (l > 0) { ext4_dx_str2hb(p, l, in, 8, 1); ext4_dx_md4(buf, in); l -= 32; p += 32; }
+        hash = buf[1]; minor = buf[2]; break;   /* unknown -> half_md4 */
+    }
+    hash &= ~1u;
+    if (hash == (uint32_t)(EXT4_HTREE_EOF << 1)) hash = (uint32_t)((EXT4_HTREE_EOF - 1) << 1);
+    if (minor_out) *minor_out = minor;
+    return hash;
+}
+
+/* Checksum a dx index block (root if is_root, else interior node).  e2fsck only
+ * recomputes the csum over the on-disk dt_reserved (we keep it 0), so this is
+ * self-consistent and clean.  No-op without metadata_csum. */
+static void ext4_dx_csum_set(const ext4_fs_t *fs, unsigned long dir_ino,
+                             uint32_t gen, uint8_t *blk, int is_root)
+{
+    if (!fs->has_metadata_csum) return;
+    unsigned count_off = is_root ? 32 : 8;
+    ext4_dx_countlimit *cl = (ext4_dx_countlimit *)(blk + count_off);
+    ext4_dx_tail *t = (ext4_dx_tail *)(blk + count_off + (unsigned)cl->limit * 8);
+    t->dt_reserved = 0;
+    uint32_t seed = ext4_inode_csum_seed(fs, dir_ino, gen);
+    uint32_t csum = ext4_crc32c(seed, blk, count_off + (unsigned)cl->count * 8);
+    csum = ext4_crc32c(csum, t, 4);                 /* dt_reserved (0) */
+    uint32_t z = 0; csum = ext4_crc32c(csum, &z, 4);
+    t->dt_checksum = csum;
+}
+
+/* dx entry-array capacity (entries incl. the count/limit slot), reserving the
+ * 8-byte dx_tail when metadata_csum is on. */
+static unsigned ext4_dx_root_limit(const ext4_fs_t *fs)
+{ return (fs->block_size - 32 - (fs->has_metadata_csum ? 8 : 0)) / 8; }
+static unsigned ext4_dx_node_limit(const ext4_fs_t *fs)
+{ return (fs->block_size - 8 - (fs->has_metadata_csum ? 8 : 0)) / 8; }
+
+/* Insert (name,child,ftype) into an in-memory leaf buffer if it fits (does not
+ * write or checksum).  Returns 1 on success, 0 if no room. */
+static int ext4_leaf_insert(ext4_fs_t *fs, uint8_t *blk, const char *name,
+                            unsigned name_len, unsigned long child_ino, unsigned ftype)
+{
+    unsigned tail = fs->has_metadata_csum ? EXT4_DIR_TAIL_SIZE : 0;
+    unsigned scan_limit = fs->block_size - tail;
+    unsigned need = ext4_dirent_len(name_len);
+    unsigned off = 0;
+    while (off + 8 <= scan_limit) {
+        ext4_dir_entry_2 *de = (ext4_dir_entry_2 *)(blk + off);
+        unsigned rec = de->rec_len;
+        if (rec < 8 || off + rec > scan_limit) break;
+        unsigned used = (de->inode == 0) ? 0 : ext4_dirent_len(de->name_len);
+        if (rec - used >= need) {
+            ext4_dir_entry_2 *ne;
+            if (de->inode == 0) { ne = de; ne->rec_len = (uint16_t)rec; }
+            else { de->rec_len = (uint16_t)used; ne = (ext4_dir_entry_2 *)(blk + off + used);
+                   ne->rec_len = (uint16_t)(rec - used); }
+            ne->inode = (uint32_t)child_ino; ne->name_len = (uint8_t)name_len;
+            ne->file_type = (uint8_t)ftype; mm_memcpy(ne->name, name, name_len);
+            return 1;
+        }
+        off += rec;
+    }
+    return 0;
+}
+
+/* Append one block to directory `din` at its next logical index; persists the
+ * inode (with the new extent + size) and invalidates the inode cache so the
+ * block map sees it.  Returns the new logical block index, or ST_NOSPC. */
+static long ext4_dir_grow(ext4_fs_t *fs, unsigned long dir_ino, ext4_inode *din)
+{
+    unsigned long nblocks = ext4_inode_size(din) / fs->block_size;
+    if (ext4_alloc_blocks_for_file(fs, din, nblocks, 1) != 1) return ST_NOSPC;
+    din->i_size_lo = (uint32_t)((nblocks + 1) * fs->block_size);
+    if (ext4_write_inode_struct(fs, dir_ino, din) != ST_OK) return ST_IO;
+    s_ic_ino = 0;
+    return (long)nblocks;
+}
+
+/* A sortable reference to a directory entry (in some block buffer) used while
+ * redistributing entries during a leaf split. */
+typedef struct { uint32_t hash; const ext4_dir_entry_2 *de; } ext4_dx_ref;
+
+static void ext4_dx_sort(ext4_dx_ref *r, int n)   /* insertion sort by hash */
+{
+    for (int i = 1; i < n; i++) {
+        ext4_dx_ref k = r[i]; int j = i - 1;
+        while (j >= 0 && r[j].hash > k.hash) { r[j+1] = r[j]; j--; }
+        r[j+1] = k;
+    }
+}
+
+/* Lay refs[a..b) into a freshly initialised leaf block (no dot/dotdot), with the
+ * last record padded to the block end, then checksum it. */
+static void ext4_dx_build_leaf(ext4_fs_t *fs, unsigned long dir_ino, uint32_t gen,
+                               uint8_t *blk, const ext4_dx_ref *refs, int a, int b)
+{
+    unsigned tail = fs->has_metadata_csum ? EXT4_DIR_TAIL_SIZE : 0;
+    unsigned scan_limit = fs->block_size - tail;
+    mm_memset(blk, 0, fs->block_size);
+    unsigned off = 0, last_off = 0;
+    for (int i = a; i < b; i++) {
+        const ext4_dir_entry_2 *s = refs[i].de;
+        unsigned rl = ext4_dirent_len(s->name_len);
+        ext4_dir_entry_2 *de = (ext4_dir_entry_2 *)(blk + off);
+        de->inode = s->inode; de->name_len = s->name_len; de->file_type = s->file_type;
+        mm_memcpy(de->name, s->name, s->name_len);
+        de->rec_len = (uint16_t)rl;
+        last_off = off; off += rl;
+    }
+    if (b > a) ((ext4_dir_entry_2 *)(blk + last_off))->rec_len = (uint16_t)(scan_limit - last_off);
+    else { ext4_dir_entry_2 *de = (ext4_dir_entry_2 *)blk; de->inode = 0; de->rec_len = (uint16_t)scan_limit; }
+    ext4_dir_csum_set(fs, dir_ino, gen, blk);
+}
+
+/* Insert (hash,block) into a dx index block's sorted entry array at sorted
+ * position; assumes there is room (count < limit).  count_off = 32 root / 8 node. */
+static void ext4_dx_insert_entry(uint8_t *blk, unsigned count_off, uint32_t hash, uint32_t block)
+{
+    ext4_dx_countlimit *cl = (ext4_dx_countlimit *)(blk + count_off);
+    ext4_dx_entry *e = (ext4_dx_entry *)(blk + count_off);   /* e[0].hash aliases cl */
+    unsigned count = cl->count;
+    unsigned pos = 1;
+    while (pos < count && (e[pos].hash & ~1u) <= hash) pos++;   /* keep ascending order */
+    for (unsigned i = count; i > pos; i--) e[i] = e[i-1];        /* pos>=1 so e[0] kept */
+    e[pos].hash = hash; e[pos].block = block;
+    cl->count = (uint16_t)(count + 1);
+}
+
+/* Write a directory block by logical index (maps via the extent tree). */
+static int ext4_dir_write_lblk(ext4_fs_t *fs, unsigned long dir_ino,
+                               unsigned long lblk, const uint8_t *buf)
+{
+    unsigned long pbn = ext4_block_map(fs, dir_ino, lblk);
+    if (pbn == 0) return ST_IO;
+    return ext4_write_block(fs, pbn, buf);
+}
+
+/* Convert a single-block linear directory (block 0 full) into an htree: move its
+ * real entries to a new leaf (logical block 1) and rebuild block 0 as a dx_root
+ * with one entry covering the whole hash range.  Leaves the new name to the
+ * caller's htree add. */
+static int ext4_htree_make_indexed(ext4_fs_t *fs, unsigned long dir_ino, ext4_inode *din)
+{
+    unsigned bs = fs->block_size;
+    uint32_t gen = din->i_generation;
+    int hv = fs->sb_copy.s_def_hash_version;
+    if (hv < 0 || hv > 5) hv = EXT4_HASH_HALF_MD4;
+
+    uint8_t *b0 = (uint8_t *)kalloc(bs);
+    uint8_t *leaf = (uint8_t *)kalloc(bs);
+    if (!b0 || !leaf) { if (b0) kfree(b0); if (leaf) kfree(leaf); return ST_NOMEM; }
+
+    unsigned long pbn0 = ext4_block_map(fs, dir_ino, 0);
+    if (pbn0 == 0 || ext4_read_block(fs, pbn0, b0) != ST_OK) { kfree(b0); kfree(leaf); return ST_IO; }
+
+    /* Collect block 0's real entries (skip dot/dotdot) into the new leaf. */
+    unsigned scan_limit = bs - (fs->has_metadata_csum ? EXT4_DIR_TAIL_SIZE : 0);
+    mm_memset(leaf, 0, bs);
+    { ext4_dir_entry_2 *e0 = (ext4_dir_entry_2 *)leaf;   /* one empty spanning record */
+      e0->inode = 0; e0->rec_len = (uint16_t)scan_limit; }
+    unsigned off = 0; unsigned long parent_ino = EXT4_ROOT_INO; unsigned long self_ino = dir_ino;
+    while (off + 8 <= scan_limit) {
+        ext4_dir_entry_2 *de = (ext4_dir_entry_2 *)(b0 + off);
+        unsigned rec = de->rec_len; if (rec < 8 || off + rec > scan_limit) break;
+        if (de->inode != 0) {
+            int isdot  = (de->name_len == 1 && de->name[0] == '.');
+            int isdd   = (de->name_len == 2 && de->name[0] == '.' && de->name[1] == '.');
+            if (isdd) parent_ino = de->inode;
+            else if (isdot) self_ino = de->inode;
+            else if (!ext4_leaf_insert(fs, leaf, de->name, de->name_len, de->inode, de->file_type)) {
+                kfree(b0); kfree(leaf); return ST_NOSPC;   /* shouldn't happen: same data, more room */
+            }
+        }
+        off += rec;
+    }
+
+    long lblk = ext4_dir_grow(fs, dir_ino, din);     /* new leaf = logical block 1 */
+    if (lblk < 0) { kfree(b0); kfree(leaf); return (int)lblk; }
+    ext4_dir_csum_set(fs, dir_ino, gen, leaf);
+    if (ext4_dir_write_lblk(fs, dir_ino, (unsigned long)lblk, leaf) != ST_OK) { kfree(b0); kfree(leaf); return ST_IO; }
+
+    /* Rebuild block 0 as the dx_root. */
+    mm_memset(b0, 0, bs);
+    ext4_dir_entry_2 *dot = (ext4_dir_entry_2 *)b0;
+    dot->inode = (uint32_t)self_ino; dot->rec_len = 12; dot->name_len = 1; dot->file_type = EXT4_FT_DIR; dot->name[0] = '.';
+    ext4_dir_entry_2 *dd = (ext4_dir_entry_2 *)(b0 + 12);
+    dd->inode = (uint32_t)parent_ino; dd->rec_len = (uint16_t)(bs - 12); dd->name_len = 2;
+    dd->file_type = EXT4_FT_DIR; dd->name[0] = '.'; dd->name[1] = '.';
+    ext4_dx_root_info *info = (ext4_dx_root_info *)(b0 + 24);
+    info->reserved_zero = 0; info->hash_version = (uint8_t)hv; info->info_length = 8;
+    info->indirect_levels = 0; info->unused_flags = 0;
+    ext4_dx_countlimit *cl = (ext4_dx_countlimit *)(b0 + 32);
+    cl->limit = (uint16_t)ext4_dx_root_limit(fs); cl->count = 1;
+    ext4_dx_entry *e = (ext4_dx_entry *)(b0 + 32);
+    e[0].block = (uint32_t)lblk;                      /* whole hash range -> the one leaf */
+    ext4_dx_csum_set(fs, dir_ino, gen, b0, 1);
+    int st = ext4_dir_write_lblk(fs, dir_ino, 0, b0);
+    kfree(b0); kfree(leaf);
+    if (st != ST_OK) return st;
+
+    din->i_flags |= EXT4_INODE_INDEX_FL;
+    if (ext4_write_inode_struct(fs, dir_ino, din) != ST_OK) return ST_IO;
+    s_ic_ino = 0;
+    return ST_OK;
+}
+
+/* Split the full leaf at logical `leaf_lblk` (whose contents are in `leafbuf`),
+ * inserting the new entry; returns the lowest hash of the upper half in
+ * *split_hash and the new leaf's logical block in *new_lblk. */
+static int ext4_htree_split_leaf(ext4_fs_t *fs, unsigned long dir_ino, ext4_inode *din,
+                                 int hv, uint8_t *leafbuf, unsigned long leaf_lblk,
+                                 const char *name, unsigned name_len,
+                                 unsigned long child_ino, unsigned ftype,
+                                 uint32_t *split_hash, unsigned long *new_lblk)
+{
+    unsigned bs = fs->block_size; uint32_t gen = din->i_generation;
+    unsigned scan_limit = bs - (fs->has_metadata_csum ? EXT4_DIR_TAIL_SIZE : 0);
+    /* Two fresh output buffers: the refs point INTO leafbuf, so neither output may
+     * be leafbuf (ext4_dx_build_leaf memsets its destination first). */
+    ext4_dx_ref *refs = (ext4_dx_ref *)kalloc(bs);   /* up to ~512 refs */
+    uint8_t *lowleaf = (uint8_t *)kalloc(bs);
+    uint8_t *newleaf = (uint8_t *)kalloc(bs);
+    if (!refs || !lowleaf || !newleaf) {
+        if (refs) kfree(refs);
+        if (lowleaf) kfree(lowleaf);
+        if (newleaf) kfree(newleaf);
+        return ST_NOMEM;
+    }
+    int n = 0; unsigned cap = bs / sizeof(ext4_dx_ref);
+
+    unsigned off = 0;
+    while (off + 8 <= scan_limit) {
+        ext4_dir_entry_2 *de = (ext4_dir_entry_2 *)(leafbuf + off);
+        unsigned rec = de->rec_len; if (rec < 8 || off + rec > scan_limit) break;
+        if (de->inode != 0 && (unsigned)n < cap) {
+            refs[n].de = de; refs[n].hash = ext4_dx_hash(fs, hv, de->name, de->name_len, 0); n++;
+        }
+        off += rec;
+    }
+    /* Add the new entry via a synthetic dirent. */
+    uint8_t newent[8 + 256];
+    ext4_dir_entry_2 *nde = (ext4_dir_entry_2 *)newent;
+    nde->inode = (uint32_t)child_ino; nde->rec_len = 0; nde->name_len = (uint8_t)name_len;
+    nde->file_type = (uint8_t)ftype; mm_memcpy(nde->name, name, name_len);
+    if ((unsigned)n >= cap) { kfree(refs); kfree(lowleaf); kfree(newleaf); return ST_NOSPC; }
+    refs[n].de = nde; refs[n].hash = ext4_dx_hash(fs, hv, name, name_len, 0); n++;
+
+    ext4_dx_sort(refs, n);
+
+    /* Split by accumulated size so both halves fit. */
+    unsigned total = 0;
+    for (int i = 0; i < n; i++) total += ext4_dirent_len(refs[i].de->name_len);
+    unsigned acc = 0; int m = 1;
+    for (int i = 0; i < n; i++) { acc += ext4_dirent_len(refs[i].de->name_len);
+        if (acc * 2 >= total) { m = i + 1; break; } }
+    if (m < 1) m = 1;
+    if (m > n - 1) m = n - 1;
+
+    long nl = ext4_dir_grow(fs, dir_ino, din);
+    if (nl < 0) { kfree(refs); kfree(lowleaf); kfree(newleaf); return (int)nl; }
+
+    uint32_t sh = refs[m].hash;
+    if (m > 0 && refs[m-1].hash == refs[m].hash) sh |= 1;   /* collision continuation */
+
+    ext4_dx_build_leaf(fs, dir_ino, gen, lowleaf, refs, 0, m);          /* lower half -> old block */
+    ext4_dx_build_leaf(fs, dir_ino, gen, newleaf, refs, m, n);          /* upper half -> new block */
+
+    int st = ext4_dir_write_lblk(fs, dir_ino, leaf_lblk, lowleaf);
+    if (st == ST_OK) st = ext4_dir_write_lblk(fs, dir_ino, (unsigned long)nl, newleaf);
+    kfree(refs); kfree(lowleaf); kfree(newleaf);
+    if (st != ST_OK) return st;
+    *split_hash = sh; *new_lblk = (unsigned long)nl;
+    return ST_OK;
+}
+
+/* Add an entry to an htree directory (din already has INDEX_FL). */
+static int ext4_htree_add(ext4_fs_t *fs, unsigned long dir_ino, ext4_inode *din,
+                          const char *name, unsigned name_len,
+                          unsigned long child_ino, unsigned ftype)
+{
+    unsigned bs = fs->block_size; uint32_t gen = din->i_generation;
+    uint8_t *root = (uint8_t *)kalloc(bs);
+    uint8_t *node = (uint8_t *)kalloc(bs);
+    uint8_t *leaf = (uint8_t *)kalloc(bs);
+    if (!root || !node || !leaf) { if (root) kfree(root); if (node) kfree(node); if (leaf) kfree(leaf); return ST_NOMEM; }
+
+    int rc = ST_IO;
+    unsigned long pbn = ext4_block_map(fs, dir_ino, 0);
+    if (pbn == 0 || ext4_read_block(fs, pbn, root) != ST_OK) goto out;
+
+    ext4_dx_root_info *info = (ext4_dx_root_info *)(root + 24);
+    int hv = info->hash_version; int levels = info->indirect_levels;
+    if (hv < 0 || hv > 5) hv = EXT4_HASH_HALF_MD4;
+    uint32_t hash = ext4_dx_hash(fs, hv, name, name_len, 0);
+
+    /* Descend root -> [node] -> leaf, remembering whether the parent of the leaf
+     * is the root (depth 0) or the interior node (depth 1). */
+    ext4_dx_entry *re = (ext4_dx_entry *)(root + 32);
+    ext4_dx_countlimit *rcl = (ext4_dx_countlimit *)(root + 32);
+    unsigned rcount = rcl->count, rat = 0;
+    for (unsigned i = 1; i < rcount; i++) { if ((re[i].hash & ~1u) <= hash) rat = i; else break; }
+
+    unsigned long leaf_lblk; uint8_t *parent; unsigned parent_off; unsigned long node_lblk = 0;
+    int parent_is_root;
+    if (levels == 0) {
+        leaf_lblk = re[rat].block; parent = root; parent_off = 32; parent_is_root = 1;
+    } else if (levels == 1) {
+        node_lblk = re[rat].block;
+        unsigned long npbn = ext4_block_map(fs, dir_ino, node_lblk);
+        if (npbn == 0 || ext4_read_block(fs, npbn, node) != ST_OK) goto out;
+        ext4_dx_entry *ne = (ext4_dx_entry *)(node + 8);
+        ext4_dx_countlimit *ncl = (ext4_dx_countlimit *)(node + 8);
+        unsigned ncount = ncl->count, nat = 0;
+        for (unsigned i = 1; i < ncount; i++) { if ((ne[i].hash & ~1u) <= hash) nat = i; else break; }
+        leaf_lblk = ne[nat].block; parent = node; parent_off = 8; parent_is_root = 0;
+    } else { rc = ST_NOSPC; goto out; }   /* depth>1: node split / depth 2 unsupported */
+
+    unsigned long lpbn = ext4_block_map(fs, dir_ino, leaf_lblk);
+    if (lpbn == 0 || ext4_read_block(fs, lpbn, leaf) != ST_OK) goto out;
+
+    if (ext4_leaf_insert(fs, leaf, name, name_len, child_ino, ftype)) {
+        ext4_dir_csum_set(fs, dir_ino, gen, leaf);
+        rc = ext4_dir_write_lblk(fs, dir_ino, leaf_lblk, leaf);
+        goto out;
+    }
+
+    /* Leaf full: split it, then add (split_hash,new_leaf) to the parent index. */
+    uint32_t split_hash; unsigned long new_lblk;
+    rc = ext4_htree_split_leaf(fs, dir_ino, din, hv, leaf, leaf_lblk,
+                               name, name_len, child_ino, ftype, &split_hash, &new_lblk);
+    if (rc != ST_OK) goto out;
+    /* din/extents changed in the split; re-read root & node to map blocks safely. */
+    s_ic_ino = 0;
+
+    ext4_dx_countlimit *pcl = (ext4_dx_countlimit *)(parent + parent_off);
+    if (pcl->count < pcl->limit) {                  /* room in the parent */
+        ext4_dx_insert_entry(parent, parent_off, split_hash, (uint32_t)new_lblk);
+        ext4_dx_csum_set(fs, dir_ino, gen, parent, parent_is_root);
+        rc = ext4_dir_write_lblk(fs, dir_ino, parent_is_root ? 0 : node_lblk, parent);
+        goto out;
+    }
+
+    if (!parent_is_root) { rc = ST_NOSPC; goto out; }   /* interior node full: node split unsupported */
+
+    /* Root full at depth 0: grow to depth 1.  Move all root entries into a new
+     * node block, point the root at it, then insert into the (roomy) node. */
+    long nl = ext4_dir_grow(fs, dir_ino, din);
+    if (nl < 0) { rc = (int)nl; goto out; }
+    mm_memset(node, 0, bs);
+    ext4_dir_entry_2 *fake = (ext4_dir_entry_2 *)node;
+    fake->inode = 0; fake->rec_len = (uint16_t)bs; fake->name_len = 0; fake->file_type = 0;
+    ext4_dx_entry *nentry = (ext4_dx_entry *)(node + 8);
+    unsigned cnt = rcl->count;
+    for (unsigned i = 0; i < cnt; i++) nentry[i] = re[i];   /* copies blocks (and hashes for i>=1) */
+    ext4_dx_countlimit *ncl = (ext4_dx_countlimit *)(node + 8);
+    ncl->limit = (uint16_t)ext4_dx_node_limit(fs); ncl->count = (uint16_t)cnt;   /* aliases nentry[0].hash */
+    ext4_dx_insert_entry(node, 8, split_hash, (uint32_t)new_lblk);
+    ext4_dx_csum_set(fs, dir_ino, gen, node, 0);
+    rc = ext4_dir_write_lblk(fs, dir_ino, (unsigned long)nl, node);
+    if (rc != ST_OK) goto out;
+
+    rcl->limit = (uint16_t)ext4_dx_root_limit(fs); rcl->count = 1;
+    re[0].block = (uint32_t)nl;                      /* sole root entry -> the node */
+    info->indirect_levels = 1;
+    ext4_dx_csum_set(fs, dir_ino, gen, root, 1);
+    rc = ext4_dir_write_lblk(fs, dir_ino, 0, root);
+
+out:
+    kfree(root); kfree(node); kfree(leaf);
+    return rc;
+}
+
 static int ext4_dir_add(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
                         unsigned name_len, unsigned long child_ino, unsigned ftype)
 {
     ext4_inode din;
     if (ext4_read_inode_loc(fs, dir_ino, &din, 0, 0) != ST_OK)
         return ST_IO;
+    if (din.i_flags & EXT4_INODE_INDEX_FL)               /* hash-indexed dir */
+        return ext4_htree_add(fs, dir_ino, &din, name, name_len, child_ino, ftype);
     unsigned long dsize = ext4_inode_size(&din);
     unsigned long nblocks = dsize / fs->block_size;
     unsigned need = ext4_dirent_len(name_len);
@@ -2629,6 +3114,17 @@ static int ext4_dir_add(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
             }
             off += rec;
         }
+    }
+
+    /* No room and this is still a single-block dir: if the fs supports dir_index,
+     * convert to an htree (like the reference does at the 1->2 block transition)
+     * and add via the index path. */
+    if (nblocks == 1 && !(din.i_flags & EXT4_INODE_INDEX_FL) &&
+        (fs->sb_copy.s_feature_compat & EXT4_FEATURE_COMPAT_DIR_INDEX)) {
+        kfree(blk);
+        int cv = ext4_htree_make_indexed(fs, dir_ino, &din);
+        if (cv != ST_OK) return cv;
+        return ext4_htree_add(fs, dir_ino, &din, name, name_len, child_ino, ftype);
     }
 
     /* No room in existing blocks: append a fresh directory block. */

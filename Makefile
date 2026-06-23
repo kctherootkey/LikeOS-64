@@ -285,7 +285,7 @@ ROOT_BIN_PROGS = sh ls cat pwd stat uname shutdown poweroff reboot halt ps cp mv
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
 	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
-	netstress openssltest usbtest xattrtest
+	netstress openssltest usbtest ext4test
 # Full prerequisite set for the ext4 image (every staged build artifact).
 GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS))
 
@@ -582,9 +582,9 @@ $(BUILD_DIR)/test_libc: userland-libc userland-rtld | $(BUILD_DIR)
 	cp $(USER_DIR)/tests/test_libc $@
 	$(STRIP) --strip-unneeded $@
 
-$(BUILD_DIR)/xattrtest: userland-libc userland-rtld | $(BUILD_DIR)
-	$(MAKE) -C $(USER_DIR) tests/xattrtest
-	cp $(USER_DIR)/tests/xattrtest $@
+$(BUILD_DIR)/ext4test: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) tests/ext4test
+	cp $(USER_DIR)/tests/ext4test $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/hello: userland-libc userland-rtld | $(BUILD_DIR)
@@ -1104,7 +1104,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp $(BUILD_DIR)/netstress     $(EXT4_STAGING)/usr/local/bin/netstress
 	cp $(BUILD_DIR)/openssltest   $(EXT4_STAGING)/usr/local/bin/openssltest
 	cp $(BUILD_DIR)/usbtest       $(EXT4_STAGING)/usr/local/bin/usbtest
-	cp $(BUILD_DIR)/xattrtest     $(EXT4_STAGING)/usr/local/bin/xattrtest
+	cp $(BUILD_DIR)/ext4test      $(EXT4_STAGING)/usr/local/bin/ext4test
 	# Resources, manpages, config
 	cp res/Lat15-Fixed16.psf $(EXT4_STAGING)/res/Lat15-Fixed16.psf
 	cp res/left_ptr          $(EXT4_STAGING)/res/left_ptr

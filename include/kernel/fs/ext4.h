@@ -69,6 +69,7 @@
 
 /* s_feature_compat bits */
 #define EXT4_FEATURE_COMPAT_HAS_JOURNAL  0x0004
+#define EXT4_FEATURE_COMPAT_DIR_INDEX    0x0020
 
 /* s_feature_ro_compat bits */
 #define EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER 0x0001
@@ -78,6 +79,7 @@
 #define EXT4_FEATURE_RO_COMPAT_METADATA_CSUM 0x0400
 
 /* inode i_flags bits */
+#define EXT4_INODE_INDEX_FL       0x00001000   /* hash-indexed (htree) directory */
 #define EXT4_INODE_EXTENTS_FL     0x00080000
 #define EXT4_INODE_INLINE_DATA_FL 0x10000000
 
