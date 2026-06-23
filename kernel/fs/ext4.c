@@ -409,13 +409,17 @@ static int ext4_txn_lookup(ext4_fs_t *fs, unsigned long pbn, void *buf)
  * Serialized entirely by ext4_io_lock, like s_txn.
  * =================================================================== */
 #define EXT4_CKPT_MAX_BLOCKS 256          /* pending unique-block cap (memory)  */
-/* Max journal LOG blocks per epoch before forcing a checkpoint.  This bounds how
- * much a crash must replay (recovery writes ~one block per log block, and each is
- * a slow uncached device write) — i.e. it trades a little sync amortisation for a
- * fast boot after a crash.  Tunable: raise for fewer syncs/op (longer crash
- * recovery), lower for snappier recovery.  At 32: ~1.25 syncs/op, recovery of a
- * full epoch is ~30 writes.  (Steady state was 2 syncs/op before this; 3 before
- * that.)  Clean shutdowns checkpoint everything and never replay. */
+/* P7 transaction batching.  Each op's metadata is merged into the in-memory
+ * batch (s_ckpt) on commit WITHOUT touching the disk; the batch is journalled +
+ * checkpointed as ONE transaction only when it reaches this many distinct blocks,
+ * on fsync/sync/unmount, or when a journalled block is freed.  This is what makes
+ * the driver fast: the per-op device sync (a cache flush — brutally slow on USB)
+ * is amortised over a whole batch of operations, like a real journal's ~5s commit
+ * interval.  Between flushes the on-disk log is EMPTY, so a normal crash replays
+ * nothing (instant recovery); only a crash during the brief flush window replays,
+ * and at most this many blocks — keep it modest so that rare replay stays fast. */
+#define EXT4_JOURNAL_BATCH 64
+/* (legacy circular-log epoch bound — superseded by EXT4_JOURNAL_BATCH) */
 #define EXT4_EPOCH_MAX_BLOCKS 32
 static struct {
     unsigned       n, cap;
@@ -609,7 +613,11 @@ static int ext4_read_sectors(const block_device_t *bdev, unsigned long lba,
  * cache keeps the hottest metadata blocks in RAM.  All ext4_read_block()
  * calls happen under the I/O mutex, so the cache needs no extra locking.
  * NOTE: read-only in Phase 1; Phase 2 must invalidate entries on writes. */
-#define EXT4_MBC_ENTRIES 32
+/* Sized so a metadata-heavy operation's whole working set stays resident: a big
+ * directory grows to many leaf/index blocks, and a create/delete loop touches
+ * dozens of inode-table + bitmap + dir blocks.  256 * 4 KB = up to 1 MB, buffers
+ * allocated on demand.  (Was 32, which thrashed on htree-sized directories.) */
+#define EXT4_MBC_ENTRIES 256
 static struct {
     unsigned long pbn;      /* 0 = empty slot               */
     uint8_t      *data;     /* block_size bytes             */
@@ -1635,12 +1643,68 @@ static int ext4_write_gd(ext4_fs_t *fs, unsigned int group);
 /* Flush deferred group-descriptor + superblock free-count updates.  These are
  * advisory (e2fsck can recompute them), so instead of writing them on every
  * allocation we batch them once per top-level write operation. */
+/* Group-descriptor dirty tracking: which groups changed since the last flush.
+ * Writing ALL group descriptors on every allocating op is fine for a 1-group
+ * (tiny) fs but catastrophic on a large multi-hundred-group fs (it would journal
+ * ~one block per group per op).  We instead remember the touched groups (a small
+ * per-group flag, bounded by a [lo,hi] span) and write only those.  Serialized by
+ * the I/O mutex like the rest of the metadata state. */
+static uint8_t  *s_gd_dirty;            /* 1 byte/group: this group changed       */
+static unsigned  s_gd_dirty_cap;        /* allocated length of s_gd_dirty          */
+static unsigned  s_gd_lo = (unsigned)-1, s_gd_hi;   /* dirty-group span (lo>hi = empty) */
+static unsigned  s_gd_seen_lo = (unsigned)-1, s_gd_seen_hi;  /* groups touched since mount (never reset) */
+
+/* Persistent, physically-contiguous buffer for coalescing file-data writes into
+ * DMA-sized transfers (allocated once at mount, reused under the I/O mutex). */
+static uint8_t      *s_wbounce;
+static unsigned long s_wbounce_bytes;
+
+/* Persistent scratch block for ext4_write_gd (allocated once at mount).  A
+ * per-call kalloc here could fail under memory pressure and SILENTLY drop a
+ * group-descriptor write — leaving the on-disk GD (free count + bitmap csum)
+ * stale relative to the just-written bitmap.  All callers hold the I/O mutex, so
+ * one shared buffer is safe. */
+static uint8_t      *s_gd_buf;
+
+static void ext4_gd_dirty(ext4_fs_t *fs, unsigned g)
+{
+    fs->meta_dirty = 1;
+    if ((!s_gd_dirty || s_gd_dirty_cap < fs->groups_count) && fs->groups_count) {
+        uint8_t *nd = (uint8_t *)kalloc(fs->groups_count);
+        if (nd) {                       /* one-time per mount (groups_count stable) */
+            mm_memset(nd, 0, fs->groups_count);
+            if (s_gd_dirty) kfree(s_gd_dirty);
+            s_gd_dirty = nd; s_gd_dirty_cap = fs->groups_count;
+        }
+    }
+    if (s_gd_dirty && g < s_gd_dirty_cap) s_gd_dirty[g] = 1;
+    if (g < s_gd_lo) s_gd_lo = g;
+    if (g > s_gd_hi) s_gd_hi = g;
+    if (g < s_gd_seen_lo) s_gd_seen_lo = g;   /* ever-touched span (for the sync resync) */
+    if (g > s_gd_seen_hi) s_gd_seen_hi = g;
+}
+
+/* Self-heal at sync (defined after the bitmap helpers below). */
+static void ext4_resync_gd_from_bitmaps(ext4_fs_t *fs);
+
 static void ext4_flush_meta(ext4_fs_t *fs)
 {
     if (!fs->meta_dirty) return;
-    for (unsigned g = 0; g < fs->groups_count; g++)
-        ext4_write_gd(fs, g);
-    ext4_write_super(fs);
+    if (s_gd_lo <= s_gd_hi) {           /* write only the groups that changed */
+        unsigned long per_block = fs->block_size / fs->desc_size;
+        unsigned long last_blk = (unsigned long)-1;
+        for (unsigned g = s_gd_lo; g <= s_gd_hi && g < fs->groups_count; g++) {
+            if (s_gd_dirty && !s_gd_dirty[g]) continue;   /* precise: skip clean groups */
+            /* ext4_write_gd rewrites the entire descriptor block from fs->gdt[],
+             * so one call per distinct block covers every dirty group in it. */
+            unsigned long blk = (per_block ? g / per_block : 0);
+            if (blk != last_blk) { ext4_write_gd(fs, g); last_blk = blk; }
+            if (s_gd_dirty) s_gd_dirty[g] = 0;
+        }
+    }
+    s_gd_lo = (unsigned)-1; s_gd_hi = 0;
+    /* The superblock is no longer written per op — it rides the batch flush
+     * (ext4_checkpoint) so it never costs a device write per allocating op. */
     fs->meta_dirty = 0;
 }
 
@@ -1650,21 +1714,32 @@ static int ext4_write_gd(ext4_fs_t *fs, unsigned int group)
     unsigned long gdt_start = fs->first_data_block + 1;
     unsigned long per_block = fs->block_size / fs->desc_size;
     unsigned long blk = gdt_start + group / per_block;
-    unsigned long off = (group % per_block) * fs->desc_size;
-    uint8_t *buf = (uint8_t *)kalloc(fs->block_size);
+    uint8_t *buf = s_gd_buf, *buf_owned = 0;
+    if (!buf) { buf_owned = (uint8_t *)kalloc(fs->block_size); buf = buf_owned; }
     if (!buf)
         return ST_NOMEM;
-    int st = ext4_read_block(fs, blk, buf);
-    if (st != ST_OK) { kfree(buf); return st; }
-    /* bitmap csums (in the descriptor) are already current; stamp bg_checksum
-     * over the final descriptor bytes. */
-    if (fs->has_metadata_csum)
-        fs->gdt[group].bg_checksum = ext4_gd_csum(fs, group, &fs->gdt[group]);
+    /* Rebuild the WHOLE descriptor block from the authoritative in-memory GDT
+     * (fs->gdt[]) instead of read-modify-writing just this one descriptor.
+     * Many groups share a descriptor block; an RMW re-reads the OTHER descriptors
+     * from the cache/disk, which can be stale right after a checkpoint emptied the
+     * batch (ext4_write_block_direct only refreshes already-cached entries), and
+     * writing them back would clobber another group's just-persisted free count +
+     * bitmap checksum — exactly the group-0/group-1 corruption e2fsck reported.
+     * fs->gdt[] is always current, so reconstructing the block is both correct
+     * and immune to any cache/disk staleness. */
+    mm_memset(buf, 0, fs->block_size);
+    unsigned long first = (blk - gdt_start) * per_block;   /* first group in this block */
     unsigned copy = fs->desc_size < sizeof(ext4_group_desc)
                   ? fs->desc_size : sizeof(ext4_group_desc);
-    mm_memcpy(buf + off, &fs->gdt[group], copy);
-    st = ext4_write_block(fs, blk, buf);
-    kfree(buf);
+    for (unsigned long k = 0; k < per_block; k++) {
+        unsigned long g = first + k;
+        if (g >= fs->groups_count) break;
+        if (fs->has_metadata_csum)
+            fs->gdt[g].bg_checksum = ext4_gd_csum(fs, (uint32_t)g, &fs->gdt[g]);
+        mm_memcpy(buf + k * fs->desc_size, &fs->gdt[g], copy);
+    }
+    int st = ext4_write_block(fs, blk, buf);
+    if (buf_owned) kfree(buf_owned);   /* never free the persistent scratch block */
     return st;
 }
 
@@ -1683,6 +1758,36 @@ static unsigned long ext4_gd_inode_bitmap(ext4_fs_t *fs, unsigned g)
     unsigned long lo = fs->gdt[g].bg_inode_bitmap_lo;
     unsigned long hi = (fs->desc_size >= 64) ? fs->gdt[g].bg_inode_bitmap_hi : 0;
     return lo | (hi << 32);
+}
+
+/* Self-heal: recompute every touched group's free-block count + block-bitmap
+ * checksum directly from its (authoritative) bitmap, so the on-disk descriptors
+ * can never drift from the bitmaps at a sync point — the same principle the mount
+ * path applies to the superblock.  Called on sync/fsync/unmount, not per op.
+ * Cheap: touched-group bitmaps are hot in the caches, so no extra disk reads. */
+static void ext4_resync_gd_from_bitmaps(ext4_fs_t *fs)
+{
+    if (s_gd_seen_lo > s_gd_seen_hi) return;
+    uint8_t *bm = (uint8_t *)kalloc(fs->block_size);
+    if (!bm) return;
+    int is64 = (fs->feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) != 0;
+    for (unsigned g = s_gd_seen_lo; g <= s_gd_seen_hi && g < fs->groups_count; g++) {
+        unsigned long bblk = ext4_gd_block_bitmap(fs, g);
+        if (ext4_read_block(fs, bblk, bm) != ST_OK) continue;
+        unsigned long free_cnt = 0;
+        for (unsigned long b = 0; b < fs->blocks_per_group; b++)
+            if (!ext4_bm_test(bm, b)) free_cnt++;
+        uint32_t cur = fs->gdt[g].bg_free_blocks_count_lo;
+        if (is64) cur |= (uint32_t)fs->gdt[g].bg_free_blocks_count_hi << 16;
+        if (cur != (uint32_t)free_cnt) {       /* drifted: correct it from the bitmap */
+            fs->gdt[g].bg_free_blocks_count_lo = (uint16_t)free_cnt;
+            if (is64) fs->gdt[g].bg_free_blocks_count_hi = (uint16_t)(free_cnt >> 16);
+        }
+        ext4_block_bitmap_csum_set(fs, g, bm); /* keep the descriptor csum matching the bitmap */
+        ext4_gd_dirty(fs, g);
+    }
+    kfree(bm);
+    s_gd_seen_lo = (unsigned)-1; s_gd_seen_hi = 0;   /* reset: only re-scan groups touched since now */
 }
 
 /* Persist a full inode struct back to the inode table (RMW the table block). */
@@ -1763,7 +1868,7 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino, i
             fs->gdt[g].bg_free_inodes_count_lo--;
             if (is_dir) fs->gdt[g].bg_used_dirs_count_lo++;
             fs->sb_copy.s_free_inodes_count--;
-            fs->meta_dirty = 1;
+            ext4_gd_dirty(fs, g);
             kfree(bm);
             return ino;
         }
@@ -1801,43 +1906,61 @@ static void ext4_free_inode(ext4_fs_t *fs, unsigned long ino, int is_dir)
             fs->gdt[g].bg_free_inodes_count_lo++;
             if (is_dir && fs->gdt[g].bg_used_dirs_count_lo) fs->gdt[g].bg_used_dirs_count_lo--;
             fs->sb_copy.s_free_inodes_count++;
-            fs->meta_dirty = 1;
+            ext4_gd_dirty(fs, g);
         }
     }
     kfree(bm);
 }
 
+/* Free a contiguous run of data blocks [start, start+len).  For each affected
+ * group the bitmap is read, ALL the run's bits cleared, and the GD/super free
+ * counts bumped — ONCE per group, not once per block.  Per-block freeing would
+ * re-read + re-write the same group bitmap for every block: unlinking a 100 MB
+ * file is 25600 single-bit RMWs, a multi-second stall that looks like a hang. */
+static void ext4_free_blocks_run(ext4_fs_t *fs, unsigned long start, unsigned long len)
+{
+    uint8_t *bm = 0;
+    while (len > 0) {
+        if (start < fs->first_data_block) { start++; len--; continue; }
+        unsigned g = (unsigned)((start - fs->first_data_block) / fs->blocks_per_group);
+        if (g >= fs->groups_count) break;
+        unsigned long gbase = fs->first_data_block + (unsigned long)g * fs->blocks_per_group;
+        unsigned long i = start - gbase;                  /* first index within group   */
+        unsigned long n = fs->blocks_per_group - i;       /* blocks of the run in group */
+        if (n > len) n = len;
+        /* Any block still holding a journal copy must be checkpointed before reuse
+         * (see the s_ckpt comment) — this is why no jbd2 revoke records are needed. */
+        for (unsigned long k = 0; k < n; k++)
+            if (ext4_blk_journalled(start + k)) { s_force_ckpt = 1; break; }
+        if (!bm) { bm = (uint8_t *)kalloc(fs->block_size); if (!bm) return; }
+        unsigned long bblk = ext4_gd_block_bitmap(fs, g);
+        if (ext4_read_block(fs, bblk, bm) == ST_OK) {
+            if (!ext4_block_bitmap_csum_ok(fs, g, bm)) {
+                ext4_fs_error(fs, "block bitmap checksum mismatch", 0);
+                kfree(bm); return;
+            }
+            unsigned long cleared = 0;
+            for (unsigned long k = 0; k < n; k++)
+                if (ext4_bm_test(bm, i + k)) { ext4_bm_clear(bm, i + k); cleared++; }
+            if (cleared) {
+                ext4_block_bitmap_csum_set(fs, g, bm);
+                ext4_write_block(fs, bblk, bm);
+                fs->gdt[g].bg_free_blocks_count_lo =
+                    (uint16_t)(fs->gdt[g].bg_free_blocks_count_lo + cleared);
+                fs->sb_copy.s_free_blocks_count_lo += (uint32_t)cleared;
+                ext4_gd_dirty(fs, g);
+            }
+        }
+        for (unsigned long k = 0; k < n; k++)
+            ext4_mbc_drop(start + k);   /* avoid stale cache if reallocated */
+        start += n; len -= n;
+    }
+    if (bm) kfree(bm);
+}
+
 static void ext4_free_block(ext4_fs_t *fs, unsigned long pbn)
 {
-    if (pbn < fs->first_data_block) return;
-    /* If this block still has an outstanding journal copy (e.g. an rmdir freeing
-     * a directory block written earlier this epoch), force a checkpoint after
-     * the op so the stale copy can never be replayed over the block's next use.
-     * This is why no jbd2 revoke records are needed (see the s_ckpt comment). */
-    if (ext4_blk_journalled(pbn))
-        s_force_ckpt = 1;
-    unsigned g = (unsigned)((pbn - fs->first_data_block) / fs->blocks_per_group);
-    if (g >= fs->groups_count) return;
-    unsigned long i = (pbn - fs->first_data_block) % fs->blocks_per_group;
-    uint8_t *bm = (uint8_t *)kalloc(fs->block_size);
-    if (!bm) return;
-    unsigned long bblk = ext4_gd_block_bitmap(fs, g);
-    if (ext4_read_block(fs, bblk, bm) == ST_OK) {
-        if (!ext4_block_bitmap_csum_ok(fs, g, bm)) {
-            ext4_fs_error(fs, "block bitmap checksum mismatch", 0);
-            kfree(bm); return;
-        }
-        if (ext4_bm_test(bm, i)) {
-            ext4_bm_clear(bm, i);
-            ext4_block_bitmap_csum_set(fs, g, bm);
-            ext4_write_block(fs, bblk, bm);
-            fs->gdt[g].bg_free_blocks_count_lo++;
-            fs->sb_copy.s_free_blocks_count_lo++;
-            fs->meta_dirty = 1;
-        }
-    }
-    ext4_mbc_drop(pbn);   /* avoid stale cache if this block is reallocated */
-    kfree(bm);
+    ext4_free_blocks_run(fs, pbn, 1);
 }
 
 /* ===================================================================
@@ -2116,7 +2239,7 @@ static unsigned ext4_alloc_blocks_for_file(ext4_fs_t *fs, unsigned long ino,
             ext4_write_block(fs, bblk, bm);
             fs->gdt[g].bg_free_blocks_count_lo -= group_alloc;
             fs->sb_copy.s_free_blocks_count_lo -= group_alloc;
-            fs->meta_dirty = 1;
+            ext4_gd_dirty(fs, g);
         }
     }
     kfree(bm);
@@ -2161,7 +2284,10 @@ static unsigned ext4_ext_free_subtree(ext4_fs_t *fs, unsigned long ino, uint32_t
                                 | ((unsigned long)ex[e].ee_start_hi << 32);
             if (b0 + len <= from) { if (keep != e) ex[keep] = ex[e]; keep++; continue; }
             unsigned long cut = (from > b0) ? (from - b0) : 0;
-            for (unsigned long k = cut; k < len; k++) { ext4_free_block(fs, start + k); (*freed)++; }
+            if (len > cut) {                       /* free the run in one pass */
+                ext4_free_blocks_run(fs, start + cut, len - cut);
+                *freed += (len - cut);
+            }
             if (cut > 0) { ex[keep] = ex[e]; ex[keep].ee_len = (uint16_t)cut; keep++; }
         }
     } else {                                       /* index: recurse into children */
@@ -2419,7 +2545,7 @@ static unsigned long ext4_alloc_one_block(ext4_fs_t *fs)
             ext4_write_block(fs, bblk, bm);
             fs->gdt[g].bg_free_blocks_count_lo--;
             fs->sb_copy.s_free_blocks_count_lo--;
-            fs->meta_dirty = 1;
+            ext4_gd_dirty(fs, g);
             pbn = base + i;
             break;
         }
@@ -3619,9 +3745,26 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
     s_ic_ino = 0;
     ext4_write_inode_struct(fs, ef->ino, &in);
 
-    /* Write the data, block by block (RMW on partial edges). */
-    uint8_t *blk = (uint8_t *)kalloc(fs->block_size);
+    /* Write the data.  Full blocks with contiguous physical numbers are coalesced
+     * into one large device write through a physically-contiguous bounce buffer
+     * (the user buffer is generally not physically contiguous, so it can't be DMA'd
+     * directly) — turning N tiny per-block writes into a few DMA-sized transfers,
+     * which is most of the sequential-write throughput.  Partial edge blocks fall
+     * back to a read-modify-write of a single block.  Data blocks use raw sector
+     * I/O and must NOT go through the metadata block cache. */
+    /* Reuse the persistent coalescing buffer (allocated once at mount); only fall
+     * back to a per-call single-block buffer if it is somehow unavailable.  This
+     * avoids a 64KB contiguous allocation on every write() (slow, and prone to
+     * failing under fragmentation — which would silently drop back to slow
+     * one-block writes). */
+    unsigned long bounce_bytes;
+    uint8_t *blk, *blk_owned = 0;
+    if (s_wbounce) { blk = s_wbounce; bounce_bytes = s_wbounce_bytes; }
+    else { blk_owned = (uint8_t *)kalloc(fs->block_size); blk = blk_owned; bounce_bytes = fs->block_size; }
     if (!blk) return ST_NOMEM;
+    unsigned max_run = bounce_bytes / fs->block_size;
+    if (max_run < 1) max_run = 1;
+    unsigned long write_start = ef->pos;
     unsigned long pos = ef->pos, remaining = (unsigned long)bytes, written = 0;
     const uint8_t *src = (const uint8_t *)buf;
     int io_err = 0;
@@ -3634,33 +3777,50 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
         unsigned long pbn = ext4_block_map(fs, ef->ino, lidx);
         if (pbn == 0) { io_err = 1; break; }
         if (boff != 0 || chunk != fs->block_size) {
-            /* Partial block: read-modify-write.  Read the CURRENT on-disk data
-             * with raw sector I/O — data blocks must NOT go through the
-             * metadata block cache (it would serve stale content, since data
-             * writes below use raw sectors and don't update that cache). */
+            /* Partial block: read-modify-write a single block. */
             if (ext4_read_sectors(fs->bdev,
                     fs->part_lba_offset + pbn * fs->sectors_per_block,
                     fs->sectors_per_block, blk) != ST_OK)
                 mm_memset(blk, 0, fs->block_size);
+            mm_memcpy(blk + boff, src + written, chunk);
+            if (ext4_write_sectors(fs->bdev,
+                    fs->part_lba_offset + pbn * fs->sectors_per_block,
+                    fs->sectors_per_block, blk) != ST_OK) { io_err = 1; break; }
+            pos += chunk; written += chunk; remaining -= chunk;
         } else {
-            mm_memset(blk, 0, fs->block_size);
+            /* Gather a run of contiguous full blocks (up to the bounce size). */
+            unsigned run = 1;
+            while (run < max_run && remaining - (unsigned long)run * fs->block_size >= fs->block_size) {
+                if (ext4_block_map(fs, ef->ino, lidx + run) != pbn + run) break;
+                run++;
+            }
+            unsigned long n = (unsigned long)run * fs->block_size;
+            mm_memcpy(blk, src + written, n);
+            if (ext4_write_sectors(fs->bdev,
+                    fs->part_lba_offset + pbn * fs->sectors_per_block,
+                    run * fs->sectors_per_block, blk) != ST_OK) { io_err = 1; break; }
+            pos += n; written += n; remaining -= n;
         }
-        mm_memcpy(blk + boff, src + written, chunk);
-        if (ext4_write_sectors(fs->bdev,
-                fs->part_lba_offset + pbn * fs->sectors_per_block,
-                fs->sectors_per_block, blk) != ST_OK) { io_err = 1; break; }
-        pos += chunk; written += chunk; remaining -= chunk;
     }
     smap_enable();
-    kfree(blk);
+    if (blk_owned) kfree(blk_owned);   /* never free the persistent bounce */
 
     if (written == 0 && io_err) return ST_IO;
 
     ef->pos += written;
     if (ef->pos > ef->size) ef->size = ef->pos;
     if (ef->inode) icache_update_size((ic_inode_t *)ef->inode, ef->size);
-    /* Drop cached pages so subsequent reads see the freshly written data. */
-    pagecache_invalidate_file(EXT4_BID_ENC(ef->ino, 0));
+    /* Drop cached pages so subsequent reads see the freshly written data.
+     * A pure append that begins at or beyond the page-rounded end of the file
+     * only touches fresh pages that were never read — hence never cached — so the
+     * whole-file page scan (O(hash buckets) per call) is pure overhead in the
+     * common sequential-write path.  Only scan when the write can overlap a page
+     * that may already be cached. */
+    {
+        unsigned long old_pg_end = (cur_size + 4095UL) & ~4095UL;  /* pagecache page = 4KB */
+        if (write_start < old_pg_end)
+            pagecache_invalidate_file(EXT4_BID_ENC(ef->ino, 0));
+    }
     icache_chain_invalidate(EXT4_BID_ENC(ef->ino, 0));
     ext4_flush_meta(fs);   /* batch the deferred GDT/superblock writeback */
     return (long)written;
@@ -4257,13 +4417,10 @@ static int ext4_fsync(vfs_file_t *f)
         if (ef->inode) icache_flush((ic_inode_t *)ef->inode);
     }
     if (g_ext4_fs) ext4_flush_meta(g_ext4_fs);
-    /* Commit this op's captured metadata now, then mark the journal clean: an
-     * explicit sync is a consistency point, so a reboot after it should not
-     * replay.  (ext4_txn_flush sets s_txn inactive, so the unlock below does
-     * not re-commit.) */
+    /* Merge this op into the batch, then durably commit + clean the journal: an
+     * explicit sync is a consistency point, so a reboot after it must not replay.
+     * journal_clean flushes the batch (one log commit + checkpoint) and syncs. */
     ext4_txn_flush(g_ext4_fs);
-    if (g_ext4_fs && g_ext4_fs->bdev && g_ext4_fs->bdev->sync)
-        g_ext4_fs->bdev->sync((block_device_t *)g_ext4_fs->bdev);
     ext4_journal_clean(g_ext4_fs);
     ext4_io_unlock();
     return 0;
@@ -4277,10 +4434,9 @@ static int ext4_sync_op(void)
 {
     if (!g_ext4_fs) return 0;
     ext4_io_lock();
+    ext4_resync_gd_from_bitmaps(g_ext4_fs);   /* GD free counts/csums <- bitmaps (ground truth) */
     ext4_flush_meta(g_ext4_fs);
     ext4_txn_flush(g_ext4_fs);
-    if (g_ext4_fs->bdev && g_ext4_fs->bdev->sync)
-        g_ext4_fs->bdev->sync((block_device_t *)g_ext4_fs->bdev);
     ext4_journal_clean(g_ext4_fs);
     ext4_io_unlock();
     return 0;
@@ -5006,6 +5162,29 @@ static void ext4_checkpoint(ext4_fs_t *fs)
         return;
     for (unsigned i = 0; i < s_ckpt.n; i++)         /* 1. pending -> final     */
         ext4_write_block_direct(fs, s_ckpt.blk[i], s_ckpt.data[i]);
+    /* The superblock (free counts) rides the batch instead of being written on
+     * every allocating op — it becomes durable here with the matching GDT/bitmaps,
+     * so the on-disk super and group descriptors are always consistent at a flush
+     * (and mount recomputes the free totals from the GDT anyway).  Re-derive the
+     * free totals from the (authoritative) GDT first so the super can never drift
+     * from the descriptors — the same self-healing the mount path applies. */
+    {
+        int is64 = (fs->feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) != 0;
+        uint64_t fb = 0; uint32_t fi = 0;
+        for (unsigned g = 0; g < fs->groups_count; g++) {
+            uint32_t gb = fs->gdt[g].bg_free_blocks_count_lo;
+            uint32_t gi = fs->gdt[g].bg_free_inodes_count_lo;
+            if (is64) {
+                gb |= (uint32_t)fs->gdt[g].bg_free_blocks_count_hi << 16;
+                gi |= (uint32_t)fs->gdt[g].bg_free_inodes_count_hi << 16;
+            }
+            fb += gb; fi += gi;
+        }
+        fs->sb_copy.s_free_blocks_count_lo = (uint32_t)fb;
+        fs->sb_copy.s_free_blocks_count_hi = (uint32_t)(fb >> 32);
+        fs->sb_copy.s_free_inodes_count    = fi;
+    }
+    ext4_write_super(fs);
     if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
 
     journal_superblock_t *jsb = (journal_superblock_t *)fs->j_sb_buf;
@@ -5045,21 +5224,24 @@ static void ext4_checkpoint(ext4_fs_t *fs)
  * directory blocks, and freeing any still-journalled block forces a checkpoint
  * (s_force_ckpt) that empties the log before the block can be reused.
  * =================================================================== */
-static void ext4_txn_flush(ext4_fs_t *fs)
+/* Durably commit the whole in-memory batch (s_ckpt) as ONE journal transaction,
+ * then checkpoint it to its final locations and empty the log.  Called lazily —
+ * when the batch fills, on fsync/sync/unmount, or when a journalled block is
+ * freed — NOT per operation.  This is the single device-sync cost that is now
+ * amortised across an entire batch of operations.
+ *
+ * Crash safety is unchanged in shape from the old per-op commit, just batched:
+ * the txn is made durable (commit sync) before its blocks are written to their
+ * final homes (checkpoint), which is itself made durable before the log is
+ * emptied (s_start=0).  Between flushes the on-disk log is empty, so a crash
+ * outside the brief flush window replays nothing. */
+static void ext4_journal_flush(ext4_fs_t *fs)
 {
-    if (!s_txn.active)
+    if (!fs || !fs->j_enabled || !fs->j_sb_buf)
         return;
-    s_txn.active = 0;                 /* capture off: writes below go direct */
-    unsigned n = s_txn.n;
-    s_txn.n = 0;
+    unsigned n = s_ckpt.n;
     if (n == 0)
-        return;                       /* read-only op: nothing to commit     */
-
-    if (!fs || !fs->j_enabled || !fs->j_sb_buf) {   /* journaling off: direct */
-        for (unsigned i = 0; i < n; i++)
-            ext4_write_block_direct(fs, s_txn.blk[i], s_txn.data[i]);
-        return;
-    }
+        return;                       /* nothing dirty */
 
     unsigned long first  = fs->j_first;
     unsigned long maxlen = fs->j_maxlen;
@@ -5068,30 +5250,20 @@ static void ext4_txn_flush(ext4_fs_t *fs)
 
     journal_superblock_t *jsb = (journal_superblock_t *)fs->j_sb_buf;
     int      is64  = (be32(jsb->s_feature_incompat) & JBD2_FEATURE_INCOMPAT_64BIT) != 0;
-    int      csum3 = fs->j_csum3;                  /* stamp jbd2 csum v3 if set  */
+    int      csum3 = fs->j_csum3;
     unsigned tagsz = csum3 ? JBD2_TAG3_SIZE : (is64 ? 12u : 8u);
 
-    /* All tags + the lone tag0 uuid + (csum v3) the descriptor tail must fit in
-     * one descriptor block — we don't chain descriptors.  Plus the whole txn
-     * (descriptor + n data + commit) must fit the log.  Either overflow → drain
-     * the epoch, then fall back to direct in-place writes for this op. */
+    /* The whole batch must fit one descriptor block + the log.  The batch cap
+     * (EXT4_JOURNAL_BATCH) keeps this true; this is a safety fallback. */
     unsigned desc_need = sizeof(journal_header_t) + n * tagsz + 16 + (csum3 ? 4u : 0u);
     if (n + 2 > span || desc_need > fs->block_size) {
         WARN_ON_ONCE(1);
-        ext4_checkpoint(fs);
         for (unsigned i = 0; i < n; i++)
-            ext4_write_block_direct(fs, s_txn.blk[i], s_txn.data[i]);
+            ext4_write_block_direct(fs, s_ckpt.blk[i], s_ckpt.data[i]);
         if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+        s_ckpt.n = 0; s_epoch_open = 0; s_jhead = first;
         return;
     }
-
-    /* Make room: checkpoint the current epoch first (resets s_jhead = j_first)
-     * if this txn would run off the log end, exceed the per-epoch log-block bound
-     * (keeps crash recovery fast), or exceed the pending-set memory cap. */
-    if (s_jhead + (n + 2) > maxlen ||
-        (s_jhead - first) + (n + 2) > EXT4_EPOCH_MAX_BLOCKS ||
-        s_ckpt.n + n > EXT4_CKPT_MAX_BLOCKS)
-        ext4_checkpoint(fs);
 
     /* 1. mark needs-recovery, durably, once per dirty period (amortised). */
     if (!(fs->sb_copy.s_feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER)) {
@@ -5101,30 +5273,24 @@ static void ext4_txn_flush(ext4_fs_t *fs)
         if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
     }
 
-    unsigned long pos = s_jhead;     /* descriptor @pos, data @pos+1.., commit @pos+1+n */
+    /* 2. point the journal sb at the (single) txn start (== j_first). */
+    jsb->s_start    = __builtin_bswap32((uint32_t)first);
+    jsb->s_sequence = __builtin_bswap32(seq);
+    ext4_jsb_csum_set(fs->j_sb_buf, csum3);
+    jlog_write(fs, 0, fs->j_sb_buf);
 
-    /* 2. On the epoch's FIRST txn, point the journal sb at the epoch start
-     * (== j_first; the log is contiguous from there).  Written but NOT synced
-     * here — folded into the step-3 commit sync.  Later txns leave s_start /
-     * s_sequence unchanged (recovery follows the sequence chain forward). */
-    if (!s_epoch_open) {
-        s_epoch_seq = seq;
-        jsb->s_start    = __builtin_bswap32((uint32_t)first);
-        jsb->s_sequence = __builtin_bswap32(seq);
-        ext4_jsb_csum_set(fs->j_sb_buf, csum3);
-        jlog_write(fs, 0, fs->j_sb_buf);
-    }
+    unsigned long pos = first;        /* descriptor @pos, data @pos+1.., commit @pos+1+n */
 
-    /* 3. descriptor block + data blocks, then the commit block, at the head. */
+    /* 3. descriptor block + data blocks, then the commit block. */
     uint8_t *db  = (uint8_t *)kalloc(fs->block_size);
     uint8_t *cpy = (uint8_t *)kalloc(fs->block_size);
-    if (!db || !cpy) {                /* OOM: drain epoch + direct for this op */
+    if (!db || !cpy) {                /* OOM: write the batch direct + sync */
         if (db) kfree(db);
         if (cpy) kfree(cpy);
-        ext4_checkpoint(fs);
         for (unsigned i = 0; i < n; i++)
-            ext4_write_block_direct(fs, s_txn.blk[i], s_txn.data[i]);
+            ext4_write_block_direct(fs, s_ckpt.blk[i], s_ckpt.data[i]);
         if (fs->bdev->sync) fs->bdev->sync((block_device_t *)fs->bdev);
+        s_ckpt.n = 0; s_epoch_open = 0; s_jhead = first;
         return;
     }
     mm_memset(db, 0, fs->block_size);
@@ -5134,18 +5300,18 @@ static void ext4_txn_flush(ext4_fs_t *fs)
     dh->h_sequence  = __builtin_bswap32(seq);
     unsigned off = sizeof(journal_header_t);
     for (unsigned i = 0; i < n; i++) {
-        unsigned long tgt = s_txn.blk[i];
+        unsigned long tgt = s_ckpt.blk[i];
         uint32_t flags = 0;
         if (i > 0)     flags |= JBD2_FLAG_SAME_UUID;   /* uuid only after tag0 */
         if (i == n - 1) flags |= JBD2_FLAG_LAST_TAG;
         uint32_t fw;
-        mm_memcpy(&fw, s_txn.data[i], 4);
+        mm_memcpy(&fw, s_ckpt.data[i], 4);
         int escape = (fw == __builtin_bswap32(JBD2_MAGIC_NUMBER));
         if (escape) flags |= JBD2_FLAG_ESCAPE;
 
         /* The journalled (escaped) copy must exist before the tag csum, which is
          * computed over the exact bytes written to the log. */
-        mm_memcpy(cpy, s_txn.data[i], fs->block_size);
+        mm_memcpy(cpy, s_ckpt.data[i], fs->block_size);
         if (escape) { uint32_t z = 0; mm_memcpy(cpy, &z, 4); }
 
         uint8_t *tag = db + off;
@@ -5169,9 +5335,7 @@ static void ext4_txn_flush(ext4_fs_t *fs)
         }
         jlog_write(fs, pos + 1 + i, cpy);
     }
-    /* csum v3: the descriptor's TAIL csum covers the whole block (tags + their
-     * per-block csums) with the tail field zeroed — stamp it after the loop. */
-    if (csum3) {
+    if (csum3) {                                       /* descriptor tail csum */
         uint32_t *dt = (uint32_t *)(db + fs->block_size - 4);
         *dt = 0;
         *dt = __builtin_bswap32(ext4_crc32c(fs->j_csum_seed, db, fs->block_size));
@@ -5182,9 +5346,9 @@ static void ext4_txn_flush(ext4_fs_t *fs)
     ch->h_magic     = __builtin_bswap32(JBD2_MAGIC_NUMBER);
     ch->h_blocktype = __builtin_bswap32(JBD2_COMMIT_BLOCK);
     ch->h_sequence  = __builtin_bswap32(seq);
-    if (csum3) {                                       /* h_chksum_type/size=0 */
+    if (csum3) {
         uint32_t *cc = (uint32_t *)(cpy + JBD2_COMMIT_CSUM_OFF);
-        *cc = 0;                                       /* h_chksum[0] zeroed   */
+        *cc = 0;
         *cc = __builtin_bswap32(ext4_crc32c(fs->j_csum_seed, cpy, fs->block_size));
     }
     jlog_write(fs, pos + 1 + n, cpy);
@@ -5192,18 +5356,44 @@ static void ext4_txn_flush(ext4_fs_t *fs)
     kfree(db);
     kfree(cpy);
 
-    /* 4. record the committed txn in the epoch pending set (no checkpoint yet)
-     * and advance the log head + sequence. */
-    for (unsigned i = 0; i < n; i++)
-        ext4_ckpt_merge(fs, s_txn.blk[i], s_txn.data[i]);
-    s_jhead      = pos + n + 2;
-    s_epoch_open = 1;
+    s_jhead        = pos + n + 2;
+    s_epoch_open   = 1;
     fs->j_sequence = seq + 1;
 
-    /* 5. If this op freed a block that still had a journal copy, checkpoint now
-     * so that stale copy can never be replayed over the block's reuse. */
-    if (s_force_ckpt) {
-        ext4_checkpoint(fs);
+    /* 4. checkpoint: write the batch to its final homes + empty the log. */
+    ext4_checkpoint(fs);
+}
+
+/* Per-operation commit (outermost ext4_io_unlock): merge this op's captured
+ * metadata into the in-memory batch — NO disk I/O — and durably flush the batch
+ * only when it fills (or a freed-block forces it).  fsync/sync/unmount flush it
+ * explicitly.  Atomicity on a mid-op task death is preserved because s_txn is
+ * still per-op: the dead-task handler discards s_txn while the already-merged
+ * batch (s_ckpt) of completed ops stays intact. */
+static void ext4_txn_flush(ext4_fs_t *fs)
+{
+    if (!s_txn.active)
+        return;
+    s_txn.active = 0;
+    unsigned n = s_txn.n;
+    s_txn.n = 0;
+    if (n == 0)
+        return;                       /* read-only op: nothing to commit */
+
+    if (!fs || !fs->j_enabled || !fs->j_sb_buf) {   /* journaling off: direct */
+        for (unsigned i = 0; i < n; i++)
+            ext4_write_block_direct(fs, s_txn.blk[i], s_txn.data[i]);
+        return;
+    }
+
+    for (unsigned i = 0; i < n; i++)  /* accumulate into the batch (in memory) */
+        ext4_ckpt_merge(fs, s_txn.blk[i], s_txn.data[i]);
+    s_epoch_open = 1;
+
+    /* Flush durably only when the batch is full, or this op freed a block that
+     * still has a journal copy (it must be checkpointed before reuse). */
+    if (s_force_ckpt || s_ckpt.n >= EXT4_JOURNAL_BATCH) {
+        ext4_journal_flush(fs);
         s_force_ckpt = 0;
     }
 }
@@ -5216,7 +5406,7 @@ static void ext4_journal_clean(ext4_fs_t *fs)
 {
     if (!fs || !fs->j_enabled || !fs->j_sb_buf)
         return;
-    ext4_checkpoint(fs);              /* flush pending epoch -> final, s_start=0 */
+    ext4_journal_flush(fs);          /* durably commit the batch -> log -> final, s_start=0 */
     if (!(fs->sb_copy.s_feature_incompat & EXT4_FEATURE_INCOMPAT_RECOVER))
         return;                                   /* already clean */
     journal_superblock_t *jsb = (journal_superblock_t *)fs->j_sb_buf;
@@ -5538,6 +5728,38 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
     return ST_OK;
 }
 
+/* Periodic journal commit, mirroring a real journal's ~5s commit interval: the
+ * in-memory batch is committed durably on this timer too, not only when it fills
+ * or on fsync — so a crash loses at most this interval's worth of recent work
+ * instead of an unbounded amount.  Runs in its own kernel task because the flush
+ * takes the I/O mutex and sleeps on disk I/O (so it can't live in a timer IRQ). */
+#define EXT4_COMMIT_INTERVAL_SEC 5
+static uint8_t s_flush_stack[16384] __attribute__((aligned(16)));
+static int s_flush_thread_started;
+
+static void ext4_flush_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        task_t *self = sched_current();
+        if (self) {                            /* sleep ~EXT4_COMMIT_INTERVAL_SEC */
+            self->wait_channel = (void *)&s_ckpt;
+            self->wakeup_tick  = timer_ticks()
+                               + (uint64_t)EXT4_COMMIT_INTERVAL_SEC * timer_get_frequency();
+            self->state = TASK_BLOCKED;
+            sched_schedule();
+            self->wakeup_tick  = 0;
+            self->wait_channel = NULL;
+            if (self->state != TASK_RUNNING) self->state = TASK_RUNNING;
+        }
+        if (g_ext4_fs && g_ext4_fs->j_enabled) {
+            ext4_io_lock();
+            ext4_journal_flush(g_ext4_fs);     /* commit + checkpoint the batch (no-op if empty) */
+            ext4_io_unlock();
+        }
+    }
+}
+
 int ext4_vfs_register_root(ext4_fs_t *fs)
 {
     if (!fs)
@@ -5546,5 +5768,33 @@ int ext4_vfs_register_root(ext4_fs_t *fs)
     g_ext4_cwd_ino = EXT4_ROOT_INO;
     ext4_sb_attach(fs);
     vfs_register_root(&ext4_vfs_ops);
+    /* Allocate the persistent write-coalescing buffer once (DMA chunk = 64KB),
+     * while memory is unfragmented so the contiguous allocation succeeds. */
+    if (!s_wbounce) {
+        unsigned ss = fs->bdev->sector_size ? fs->bdev->sector_size : 512;
+        unsigned long want = (unsigned long)EXT4_MAX_SECTORS_PER_READ * ss;
+        if (want < fs->block_size) want = fs->block_size;
+        s_wbounce = (uint8_t *)kalloc(want);
+        s_wbounce_bytes = s_wbounce ? want : 0;
+    }
+    /* Persistent group-descriptor scratch block, so a write never silently drops
+     * a GD update on a transient kalloc failure (would corrupt free counts/csums). */
+    if (!s_gd_buf) {
+        s_gd_buf = (uint8_t *)kalloc(fs->block_size);
+    }
+    /* Start the periodic commit task once the journalled root is live.  It is a
+     * TASK_KERNEL thread, so sched_add_task makes it unkillable by design (sys_kill
+     * and sched_signal_pgrp both reject TASK_KERNEL with -EPERM).  Name it for ps,
+     * which shows kernel threads bracketed, e.g. "[ext4-commit]". */
+    if (!s_flush_thread_started && fs->j_enabled) {
+        s_flush_thread_started = 1;
+        task_t *t = sched_add_task(ext4_flush_thread, 0, s_flush_stack, sizeof(s_flush_stack));
+        if (t) {
+            const char *nm = "ext4-commit";
+            unsigned i = 0;
+            for (; nm[i] && i < sizeof(t->comm) - 1; i++) t->comm[i] = nm[i];
+            t->comm[i] = '\0';
+        }
+    }
     return ST_OK;
 }

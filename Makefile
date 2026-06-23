@@ -1129,7 +1129,11 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	echo "Building ext4 root: $${ext4_mb}M (staged $$(du -sh $(EXT4_STAGING) | cut -f1))"; \
 	rm -f $(EXT4_ROOT_IMG); \
 	feat="$(EXT4_MKFS_FEATURES)"; \
-	fakeroot mkfs.ext4 -F -q -b 4096 $${feat:+-O $$feat} -E root_owner=0:0 \
+	: "resize=536870912 (4k blocks = 2TB) sizes the resize_inode so an offline"; \
+	: "resize2fs can grow this small image to fill a large drive; the default"; \
+	: "headroom (~1024x = ~64GB) is too small for >64GB drives and aborts with"; \
+	: "an invalid-double-indirect-block error."; \
+	fakeroot mkfs.ext4 -F -q -b 4096 $${feat:+-O $$feat} -E root_owner=0:0,resize=536870912 \
 		-d $(EXT4_STAGING) $(EXT4_ROOT_IMG) $${ext4_mb}M; \
 	e2fsck -fn $(EXT4_ROOT_IMG) || true; \
 	rm -f $(EXT4_ESP_IMG); \
@@ -1261,6 +1265,41 @@ usb-write: $(GPT_DISK)
 	@echo "Writing $(GPT_DISK) to $(USB_DEVICE) (this may take a while)..."
 	sudo dd if=$(GPT_DISK) of=$(USB_DEVICE) bs=4M conv=fsync status=progress
 	sudo sync
+	@# The image is small (auto-sized to the build).  Grow the ext4 root partition
+	@# and filesystem to fill the WHOLE target drive, so the running system has the
+	@# drive's full capacity (and contiguous free space -> fast writes), not ~64MB.
+	@echo "Growing the ext4 root partition + filesystem to fill $(USB_DEVICE)..."
+	@PART=$$(case "$(USB_DEVICE)" in *[0-9]) echo "$(USB_DEVICE)p2";; *) echo "$(USB_DEVICE)2";; esac); \
+	 sudo umount $$PART 2>/dev/null || true; \
+	 START=$$(sudo sgdisk -i 2 $(USB_DEVICE) | awk '/First sector/{print $$3}'); \
+	 if [ -z "$$START" ]; then echo "ERROR: could not read partition 2 start; skipping grow"; else \
+	   sudo sgdisk -e $(USB_DEVICE) >/dev/null; \
+	   sudo sgdisk -d 2 $(USB_DEVICE) >/dev/null; \
+	   sudo sgdisk -a 1 -n 2:$$START:0 -t 2:8300 -c 2:"likeos-root" $(USB_DEVICE) >/dev/null; \
+	   DISKSZ=$$(sudo blockdev --getsize64 $(USB_DEVICE)); ok=0; PSZ=0; \
+	   for n in 1 2 3 4 5 6; do \
+	     sudo partprobe $(USB_DEVICE) 2>/dev/null || true; \
+	     sudo blockdev --rereadpt $(USB_DEVICE) 2>/dev/null || true; \
+	     sudo partx -u $(USB_DEVICE) 2>/dev/null || true; \
+	     command -v udevadm >/dev/null 2>&1 && sudo udevadm settle 2>/dev/null || true; \
+	     sleep 1; \
+	     PSZ=$$(sudo blockdev --getsize64 $$PART 2>/dev/null || echo 0); \
+	     if [ "$$PSZ" -gt $$((DISKSZ/2)) ]; then ok=1; break; fi; \
+	   done; \
+	   if [ "$$ok" != 1 ]; then \
+	     echo "WARNING: the kernel did not re-read the new size of $$PART (still $$PSZ bytes)."; \
+	     echo "         Unplug + replug the USB, then run:  sudo e2fsck -fy $$PART && sudo resize2fs $$PART"; \
+	   else \
+	     sudo e2fsck -fy $$PART || true; \
+	     if sudo resize2fs $$PART; then \
+	       sudo sync; \
+	       echo "Grown: $$PART now fills the drive ($$(sudo blockdev --getsize64 $(USB_DEVICE) | awk '{printf "%.1f GiB", $$1/1073741824}'))."; \
+	     else \
+	       echo "ERROR: resize2fs failed — the filesystem was NOT grown."; \
+	       echo "       Repair, then retry:  sudo e2fsck -fy $$PART && sudo resize2fs $$PART"; \
+	     fi; \
+	   fi; \
+	 fi
 	@echo "UEFI bootable USB drive created successfully on $(USB_DEVICE)"
 	@echo "The USB drive boots on UEFI systems: ESP bootloader -> ext4 /boot/kernel.elf."
 
