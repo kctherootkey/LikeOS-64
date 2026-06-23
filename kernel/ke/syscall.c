@@ -675,18 +675,45 @@ static int vfs_status_to_errno(int st) {
     }
 }
 
+/* Access check for a file whose stat is `st`, honouring a POSIX access ACL
+ * (system.posix_acl_access) if it has one, else the mode bits.  `path` is the
+ * file the ACL is read from.  use_real selects the real vs effective/fs ids.
+ * Root never consults the ACL (so the all-root system pays no ACL cost). */
+static int perm_access(task_t* cur, const char* path, const struct kstat* st,
+                       int want, int use_real) {
+    uint32_t cuid = use_real ? cur->cred.uid : cur->cred.euid;
+    if (cuid != 0) {
+        unsigned char acl[512];
+        /* Fetch the ACL by the inode the caller already resolved (st->st_ino),
+         * so we don't walk the path a second time on every access check. */
+        int n = vfs_getxattr_ino(path, (unsigned long)st->st_ino,
+                                 "system.posix_acl_access", acl, sizeof(acl));
+        if (n > 0) {
+            int r = cred_acl_access(&cur->cred, acl, (unsigned)n,
+                                    (uint32_t)st->st_uid, (uint32_t)st->st_gid,
+                                    want, use_real);
+            if (r <= 0) return r;        /* ACL decided: 0 allow, <0 deny */
+            /* r == 1: no usable ACL -> fall through to the mode bits */
+        }
+    }
+    return use_real
+        ? cred_check_access_real(&cur->cred, (uint32_t)st->st_mode,
+                                 (uint32_t)st->st_uid, (uint32_t)st->st_gid, want)
+        : cred_check_access(&cur->cred, (uint32_t)st->st_mode,
+                            (uint32_t)st->st_uid, (uint32_t)st->st_gid, want);
+}
+
 /* P5 permission enforcement: may the current task access `path` for `want`
  * (MAY_* mask)?  Returns 0 if allowed (incl. when the path can't be stat'd —
  * we let the real operation report ENOENT etc.), or a negative errno.
- * cred_check_access() bypasses for root, so this is effectively a no-op for the
+ * perm_access() bypasses for root, so this is effectively a no-op for the
  * all-root system; callers on hot paths additionally gate on euid != 0 to skip
- * the stat entirely. fs-independent (vfs_stat + cred only). */
+ * the stat entirely. fs-independent (vfs_stat + cred + the ACL xattr). */
 static int perm_check_path(task_t* cur, const char* path, int want) {
     if (!cur) return 0;
     struct kstat st;
     if (vfs_stat(path, &st) != ST_OK) return 0;
-    return cred_check_access(&cur->cred, (uint32_t)st.st_mode,
-                             (uint32_t)st.st_uid, (uint32_t)st.st_gid, want);
+    return perm_access(cur, path, &st, want, 0);
 }
 
 /* Resolve `path` to an absolute, canonical form using the task's cwd, so the
@@ -740,11 +767,7 @@ static int perm_traverse_cred(const char* rawpath, int use_real) {
         struct kstat st;
         if (vfs_stat(dir, &st) != ST_OK) continue;      /* defer to the resolver */
         if ((st.st_mode & S_IFMT) != S_IFDIR) continue;
-        int pr = use_real
-            ? cred_check_access_real(&cur->cred, (uint32_t)st.st_mode,
-                                     (uint32_t)st.st_uid, (uint32_t)st.st_gid, MAY_EXEC)
-            : cred_check_access(&cur->cred, (uint32_t)st.st_mode,
-                                (uint32_t)st.st_uid, (uint32_t)st.st_gid, MAY_EXEC);
+        int pr = perm_access(cur, dir, &st, MAY_EXEC, use_real);
         if (pr < 0) return pr;
     }
     return 0;
@@ -884,8 +907,7 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode) {
         struct kstat est;
         int exists = (vfs_stat(path, &est) == ST_OK);
         if (exists && want) {
-            int pr = cred_check_access(&cur->cred, (uint32_t)est.st_mode,
-                                       (uint32_t)est.st_uid, (uint32_t)est.st_gid, want);
+            int pr = perm_access(cur, path, &est, want, 0);
             if (pr < 0) return pr;
         } else if (!exists && (flags & O_CREAT)) {
             int pr = perm_check_parent(path, MAY_WRITE | MAY_EXEC);
@@ -1229,8 +1251,7 @@ static int64_t sys_access(uint64_t pathname, uint64_t mode) {
     }
     int want = (int)(mode & 7);
     if (want == 0) return 0;   /* F_OK: exists and reachable */
-    return cred_check_access_real(&cur->cred, (uint32_t)st.st_mode,
-                                  (uint32_t)st.st_uid, (uint32_t)st.st_gid, want);
+    return perm_access(cur, path, &st, want, 1);
 }
 
 static int64_t sys_faccessat(uint64_t dirfd, uint64_t pathname, uint64_t mode, uint64_t flags) {
@@ -1268,11 +1289,7 @@ static int64_t sys_faccessat(uint64_t dirfd, uint64_t pathname, uint64_t mode, u
     }
     int want = (int)(mode & 7);     /* R_OK/W_OK/X_OK == MAY_READ/WRITE/EXEC */
     if (want == 0) return 0;        /* F_OK: exists and reachable */
-    if (flags & AT_EACCESS)
-        return cred_check_access(&cur->cred, (uint32_t)st.st_mode,
-                                 (uint32_t)st.st_uid, (uint32_t)st.st_gid, want);
-    return cred_check_access_real(&cur->cred, (uint32_t)st.st_mode,
-                                  (uint32_t)st.st_uid, (uint32_t)st.st_gid, want);
+    return perm_access(cur, full, &st, want, (flags & AT_EACCESS) ? 0 : 1);
 }
 
 static int64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count) {
@@ -1319,8 +1336,7 @@ static int64_t sys_chdir(uint64_t pathname) {
     /* P5: entering a directory requires search on it and on every ancestor. */
     int tr = perm_traverse(full);
     if (tr < 0) return tr;
-    int pr = cred_check_access(&cur->cred, (uint32_t)st.st_mode,
-                               (uint32_t)st.st_uid, (uint32_t)st.st_gid, MAY_EXEC);
+    int pr = perm_access(cur, full, &st, MAY_EXEC, 0);
     if (pr < 0) return pr;
     // Update FAT32 layer's cwd cluster
     vfs_chdir(full);
@@ -2299,6 +2315,19 @@ static int xattr_has_prefix(const char* s, const char* pfx) {
     return 1;
 }
 
+/* Namespace policy for a non-root caller setting/removing xattr `name` on a file
+ * owned by `owner_uid`.  The `system.` namespace (which holds the POSIX ACLs) is
+ * owner-controlled, like chmod — write permission is not sufficient.  Returns:
+ *   0      -> allowed by ownership (system.*)
+ *  -EPERM  -> denied (trusted.* at all; system.* when not the owner)
+ *   1      -> defer: caller must still verify write permission (user.* etc.) */
+static int xattr_ns_perm(task_t* cur, const char* name, uint32_t owner_uid) {
+    if (xattr_has_prefix(name, "trusted.")) return -EPERM;
+    if (xattr_has_prefix(name, "system."))
+        return (owner_uid == cur->cred.fsuid) ? 0 : -EPERM;
+    return 1;
+}
+
 /* The syscall ABI here passes at most 5 args, so setxattr's nofollow is carried
  * in a private high bit of `flags` (libc's lsetxattr sets it). */
 #define XATTR_SYS_NOFOLLOW 0x40000000
@@ -2317,9 +2346,16 @@ static int64_t sys_setxattr(uint64_t u_path, uint64_t u_name, uint64_t u_val,
         if (copy_from_user(kval, (const void*)u_val, size)) { kfree(kval); return -EFAULT; }
     }
     if (cur->cred.euid != 0) {
-        if (xattr_has_prefix(kname, "trusted.")) { if (kval) kfree(kval); return -EPERM; }
-        int pr = perm_check_path(cur, kpath, MAY_WRITE);
-        if (pr < 0) { if (kval) kfree(kval); return pr; }
+        struct kstat st;
+        int sr = nofollow ? vfs_lstat(kpath, &st) : vfs_stat(kpath, &st);
+        if (sr == ST_OK) {
+            int np = xattr_ns_perm(cur, kname, (uint32_t)st.st_uid);
+            if (np < 0) { if (kval) kfree(kval); return np; }
+            if (np > 0) {                         /* user.* etc.: need write perm */
+                int pr = perm_access(cur, kpath, &st, MAY_WRITE, 0);
+                if (pr < 0) { if (kval) kfree(kval); return pr; }
+            }
+        }
     }
     int r = vfs_setxattr(kpath, (int)nofollow, kname, kval, size, (int)flags);
     if (kval) kfree(kval);
@@ -2365,9 +2401,16 @@ static int64_t sys_removexattr(uint64_t u_path, uint64_t u_name, uint64_t nofoll
     char kpath[VFS_MAX_PATH]; int c = copy_user_path((const char*)u_path, kpath, sizeof(kpath)); if (c) return c;
     char kname[256]; c = xattr_copy_name(u_name, kname); if (c) return c;
     if (cur->cred.euid != 0) {
-        if (xattr_has_prefix(kname, "trusted.")) return -EPERM;
-        int pr = perm_check_path(cur, kpath, MAY_WRITE);
-        if (pr < 0) return pr;
+        struct kstat st;
+        int sr = nofollow ? vfs_lstat(kpath, &st) : vfs_stat(kpath, &st);
+        if (sr == ST_OK) {
+            int np = xattr_ns_perm(cur, kname, (uint32_t)st.st_uid);
+            if (np < 0) return np;
+            if (np > 0) {                         /* user.* etc.: need write perm */
+                int pr = perm_access(cur, kpath, &st, MAY_WRITE, 0);
+                if (pr < 0) return pr;
+            }
+        }
     }
     int r = vfs_removexattr(kpath, (int)nofollow, kname);
     return (r >= 0) ? 0 : vfs_status_to_errno(r);
@@ -2378,7 +2421,14 @@ static int64_t sys_fsetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val, uint6
     if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd]) return -EBADF;
     char kname[256]; int c = xattr_copy_name(u_name, kname); if (c) return c;
     if (size > XATTR_MAX_VALUE) return -ENOSPC;
-    if (cur->cred.euid != 0 && xattr_has_prefix(kname, "trusted.")) return -EPERM;
+    if (cur->cred.euid != 0) {
+        if (xattr_has_prefix(kname, "trusted.")) return -EPERM;
+        if (xattr_has_prefix(kname, "system.")) {     /* incl. POSIX ACLs: owner-only */
+            struct kstat st;
+            if (vfs_fstat(cur->fd_table[fd], &st) == ST_OK &&
+                (uint32_t)st.st_uid != cur->cred.fsuid) return -EPERM;
+        }
+    }
     uint8_t* kval = 0;
     if (size) {
         if (!validate_user_ptr(u_val, size)) return -EFAULT;
@@ -2425,7 +2475,14 @@ static int64_t sys_fremovexattr(uint64_t fd, uint64_t u_name) {
     task_t* cur = sched_current();
     if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd]) return -EBADF;
     char kname[256]; int c = xattr_copy_name(u_name, kname); if (c) return c;
-    if (cur->cred.euid != 0 && xattr_has_prefix(kname, "trusted.")) return -EPERM;
+    if (cur->cred.euid != 0) {
+        if (xattr_has_prefix(kname, "trusted.")) return -EPERM;
+        if (xattr_has_prefix(kname, "system.")) {     /* incl. POSIX ACLs: owner-only */
+            struct kstat st;
+            if (vfs_fstat(cur->fd_table[fd], &st) == ST_OK &&
+                (uint32_t)st.st_uid != cur->cred.fsuid) return -EPERM;
+        }
+    }
     int r = vfs_fremovexattr(cur->fd_table[fd], kname);
     return (r >= 0) ? 0 : vfs_status_to_errno(r);
 }
@@ -3125,8 +3182,7 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr, uint64_t envp_pt
         if (cur && cur->cred.euid != 0) {
             int pr = perm_traverse(kpath);   /* search on every ancestor dir */
             if (pr == 0 && have_xst)         /* + execute on the binary itself */
-                pr = cred_check_access(&cur->cred, (uint32_t)xst.st_mode,
-                                       (uint32_t)xst.st_uid, (uint32_t)xst.st_gid, MAY_EXEC);
+                pr = perm_access(cur, kpath, &xst, MAY_EXEC, 0);
             if (pr < 0) {
                 free_user_string_array(kenvp);
                 free_user_string_array(kargv);

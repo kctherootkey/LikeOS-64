@@ -56,10 +56,13 @@ OPTIONS
 
        --preserve[=ATTR_LIST]
               preserve  the  specified  attributes:  mode,  ownership,
-              timestamps, links, context, xattr, all
+              timestamps, links, context, xattr, all.  The xattr value
+              copies the file's extended attributes (see the EXTENDED
+              ATTRIBUTES section below); all includes xattr.
 
        --no-preserve=ATTR_LIST
-              don't preserve the specified attributes
+              don't preserve the specified attributes (e.g. xattr to
+              skip extended attributes that -a would otherwise copy)
 
        --parents
               use full source file name under DIRECTORY
@@ -115,6 +118,31 @@ OPTIONS
        none, off
               never make backups
 
+EXTENDED ATTRIBUTES
+       cp can copy a file's extended attributes (xattrs, e.g. user.*
+       namespace attributes) from SOURCE to DEST.  This happens when
+       any of the following is given:
+
+              -a, --archive          (implies --preserve=all)
+              --preserve=xattr
+              --preserve=all
+
+       Each attribute's name and value is read from the source and
+       written to the destination after the file data is copied.  If
+       the destination filesystem does not support extended attributes
+       the attributes are silently skipped; if a particular attribute
+       cannot be set, a warning is printed but the copy still succeeds.
+       Use --no-preserve=xattr to suppress copying xattrs that -a would
+       otherwise carry over.
+
+EXAMPLES
+       cp -a file.txt copy.txt
+              copy file.txt to copy.txt preserving mode, ownership,
+              timestamps and extended attributes.
+
+       cp --preserve=xattr a b
+              copy a to b, preserving only its extended attributes.
+
 EXIT STATUS
        0      if OK
 
@@ -126,4 +154,4 @@ AUTHORS
 SEE ALSO
        mv(1), rm(1), ls(1)
 
-LikeOS-64                         2026-03-10                              CP(1)
+LikeOS-64                         2026-06-23                              CP(1)

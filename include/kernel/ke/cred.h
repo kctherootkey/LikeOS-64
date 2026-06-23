@@ -58,6 +58,14 @@ int  cred_check_access(const cred_t *c, uint32_t mode,
 int  cred_check_access_real(const cred_t *c, uint32_t mode,
                             uint32_t fuid, uint32_t fgid, int want);
 
+/* Evaluate a POSIX access ACL (raw system.posix_acl_access xattr bytes) for the
+ * `want` access on a file owned by fuid:fgid.  use_real selects the real vs the
+ * effective/fs ids (to mirror access(2) vs normal checks).  Returns 0 (allow),
+ * -EACCES (deny), or 1 if there is no usable ACL (caller falls back to the mode
+ * bits).  Root (the selected uid == 0) always returns 1. */
+int  cred_acl_access(const cred_t *c, const void *acl, unsigned len,
+                     uint32_t fuid, uint32_t fgid, int want, int use_real);
+
 /* POSIX set*-id transitions on a credential.  Return 0 on success or a
  * negative errno (-EPERM).  CRED_NOCHANGE leaves a field unchanged.
  * Privilege is "effective uid == 0". */

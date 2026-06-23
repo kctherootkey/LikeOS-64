@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <getopt.h>
+#include <sys/xattr.h>
 
 #define VERSION "1.0"
 #define PROGRAM_NAME "cp"
@@ -236,8 +237,43 @@ static int make_backup(const char *path) {
     return 0;
 }
 
-/* Apply preserved attributes after copy. */
-static void apply_attributes(const char *dest, const struct stat *src_st) {
+/* Copy all extended attributes from src to dest (for --preserve=xattr / -a).
+ * Lenient by design: silently does nothing when the filesystem has no xattr
+ * support (EOPNOTSUPP) or the source has none, and warns — without failing the
+ * copy — if an individual attribute cannot be set on the destination. */
+static void copy_xattrs(const char *src, const char *dest) {
+    ssize_t lsz = listxattr(src, NULL, 0);
+    if (lsz <= 0)
+        return;                         /* none, or no xattr support */
+    char *names = malloc((size_t)lsz);
+    if (!names)
+        return;
+    lsz = listxattr(src, names, (size_t)lsz);
+    if (lsz <= 0) { free(names); return; }
+
+    for (char *name = names; name < names + lsz; name += strlen(name) + 1) {
+        ssize_t vsz = getxattr(src, name, NULL, 0);
+        if (vsz < 0)
+            continue;                   /* attribute vanished between calls */
+        char *val = malloc(vsz ? (size_t)vsz : 1);
+        if (!val)
+            continue;
+        vsz = getxattr(src, name, val, (size_t)vsz);
+        if (vsz >= 0) {
+            if (setxattr(dest, name, val, (size_t)vsz, 0) < 0 && errno != EOPNOTSUPP)
+                fprintf(stderr, PROGRAM_NAME ": warning: cannot set attribute '%s' "
+                        "on '%s': %s\n", name, dest, strerror(errno));
+        }
+        free(val);
+    }
+    free(names);
+}
+
+/* Apply preserved attributes after copy.  Extended attributes are copied first
+ * so the timestamp preservation below is the last thing that touches dest. */
+static void apply_attributes(const char *src, const char *dest, const struct stat *src_st) {
+    if (opt_preserve & PRESERVE_XATTR)
+        copy_xattrs(src, dest);
     if (opt_preserve & PRESERVE_MODE)
         chmod(dest, src_st->st_mode & 07777);
     if (opt_preserve & PRESERVE_OWNERSHIP)
@@ -263,7 +299,7 @@ static int copy_file_data(const char *src, const char *dest,
             return -1;
         }
         close(fd);
-        apply_attributes(dest, src_st);
+        apply_attributes(src, dest, src_st);
         return 0;
     }
 
@@ -318,7 +354,7 @@ done:
     close(dfd);
 
     if (ret == 0)
-        apply_attributes(dest, src_st);
+        apply_attributes(src, dest, src_st);
 
     return ret;
 }
@@ -364,7 +400,7 @@ static int copy_directory(const char *src, const char *dest,
     closedir(d);
 
     /* Apply attributes to the directory */
-    apply_attributes(dest, src_st);
+    apply_attributes(src, dest, src_st);
 
     return errors > 0 ? -1 : 0;
 }

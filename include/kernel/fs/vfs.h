@@ -116,6 +116,10 @@ typedef struct {
     int (*fsetxattr)(vfs_file_t* f, const char* name, const void* val, unsigned long size, int flags);
     int (*flistxattr)(vfs_file_t* f, char* list, unsigned long size);
     int (*fremovexattr)(vfs_file_t* f, const char* name);
+    /* Fetch an attribute given an already-resolved inode number (no path walk).
+     * Lets a caller that just stat()'d a file read e.g. its ACL without paying a
+     * second path resolution.  NULL op => the wrapper reports -EOPNOTSUPP. */
+    int (*getxattr_ino)(unsigned long ino, const char* name, void* val, unsigned long size);
 } vfs_ops_t;
 
 struct vfs_file {
@@ -178,6 +182,10 @@ int vfs_fgetxattr(vfs_file_t* f, const char* name, void* val, unsigned long size
 int vfs_fsetxattr(vfs_file_t* f, const char* name, const void* val, unsigned long size, int flags);
 int vfs_flistxattr(vfs_file_t* f, char* list, unsigned long size);
 int vfs_fremovexattr(vfs_file_t* f, const char* name);
+/* Fetch attribute `name` for the file at `path` using the already-known inode
+ * number `ino` (from a prior stat), skipping the path resolution.  `path` only
+ * selects the owning filesystem.  Returns the value size or a negative ST_. */
+int vfs_getxattr_ino(const char* path, unsigned long ino, const char* name, void* val, unsigned long size);
 /* Flush the root filesystem's pending metadata + journal to disk (sync(2)).
  * No-op when the root fs provides no sync op.  fs-independent. */
 int vfs_sync(void);

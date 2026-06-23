@@ -1167,6 +1167,28 @@ int main(int argc, char** argv) {
                 test_result("fgetxattr value == yes", xn == 3 && memcmp(xbuf, "yes", 3) == 0);
                 close(xfd2);
             }
+
+            /* Large value -> spills to an external xattr block. */
+            {
+                char xbig[600], xbigbuf[700];
+                for (unsigned bi2 = 0; bi2 < sizeof(xbig); bi2++)
+                    xbig[bi2] = (char)('A' + (bi2 % 26));
+                test_result("setxattr large value (external block)",
+                            setxattr(xpath, "user.big", xbig, sizeof(xbig), 0) == 0);
+                memset(xbigbuf, 0, sizeof(xbigbuf));
+                xn = getxattr(xpath, "user.big", xbigbuf, sizeof(xbigbuf));
+                test_result("getxattr large value matches",
+                            xn == (ssize_t)sizeof(xbig) &&
+                            memcmp(xbigbuf, xbig, sizeof(xbig)) == 0);
+                test_result("small attr still readable with block present",
+                            getxattr(xpath, "user.x", xbuf, sizeof(xbuf)) == 1);
+                test_result("removexattr large value (frees the block)",
+                            removexattr(xpath, "user.big") == 0);
+                errno = 0;
+                test_result("getxattr removed large -> ENODATA",
+                            getxattr(xpath, "user.big", xbigbuf, sizeof(xbigbuf)) == -1
+                            && errno == ENODATA);
+            }
         }
         unlink(xpath);
     }
@@ -7731,6 +7753,58 @@ network_skip:;
         }
         unlink(pf);
         rmdir(pd);
+
+        /* POSIX ACL enforcement: a 0600 root-owned file whose access ACL grants
+         * uid 1000 read via a named-user entry + mask.  Without the ACL a
+         * non-root open would be denied, so success proves the ACL is honoured;
+         * the read-only mask proves write is still denied.  Skips cleanly where
+         * xattrs/ACLs are unsupported (e.g. FAT32). */
+        char af[96];
+        snprintf(af, sizeof(af), "%s/aclfile.txt", _pbase);
+        int afd = open(af, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (afd >= 0) { write(afd, "acltest\n", 8); close(afd); }
+        chmod(af, 0600);                              /* 0600, root-owned */
+        unsigned char acl[28];
+        acl[0] = 1; acl[1] = acl[2] = acl[3] = 0;     /* version 1 */
+        int ao = 4;
+        acl[ao]=0x01; acl[ao+1]=0; acl[ao+2]=6; acl[ao+3]=0; ao+=4;        /* USER_OBJ rw- */
+        acl[ao]=0x02; acl[ao+1]=0; acl[ao+2]=4; acl[ao+3]=0;               /* USER 1000 r-- */
+        acl[ao+4]=0xE8; acl[ao+5]=0x03; acl[ao+6]=0; acl[ao+7]=0; ao+=8;   /*   id=1000 (LE) */
+        acl[ao]=0x04; acl[ao+1]=0; acl[ao+2]=0; acl[ao+3]=0; ao+=4;        /* GROUP_OBJ --- */
+        acl[ao]=0x10; acl[ao+1]=0; acl[ao+2]=4; acl[ao+3]=0; ao+=4;        /* MASK r-- */
+        acl[ao]=0x20; acl[ao+1]=0; acl[ao+2]=0; acl[ao+3]=0; ao+=4;        /* OTHER --- */
+        errno = 0;
+        int aclset = (afd >= 0) &&
+                     setxattr(af, "system.posix_acl_access", acl, sizeof(acl), 0) == 0;
+        if (afd >= 0 && !aclset && errno == EOPNOTSUPP) {
+            printf("  [SKIP] ACLs unsupported on this filesystem\n");
+        } else {
+            test_result("setup: set access ACL granting uid 1000 read", aclset);
+            pid_t apid = fork();
+            if (apid == 0) {
+                setgid(1000);
+                if (setuid(1000) != 0) _exit(40);
+                int f = 0;
+                int r = open(af, O_RDONLY);           /* ACL grants read    */
+                if (r >= 0) close(r); else f |= 1;
+                errno = 0;
+                int w = open(af, O_WRONLY);           /* mask: no write     */
+                if (w >= 0) { close(w); f |= 2; } else if (errno != EACCES) f |= 2;
+                if (access(af, R_OK) != 0) f |= 4;    /* read granted       */
+                if (access(af, W_OK) == 0) f |= 8;    /* write denied       */
+                _exit(f);
+            } else if (apid > 0) {
+                int status = 0; waitpid(apid, &status, 0);
+                int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                test_result("ACL: non-root open(RDONLY) allowed by ACL", code >= 0 && (code & 1) == 0);
+                test_result("ACL: non-root open(WRONLY) denied by mask", code >= 0 && (code & 2) == 0);
+                test_result("ACL: non-root access(R_OK) allowed",        code >= 0 && (code & 4) == 0);
+                test_result("ACL: non-root access(W_OK) denied",         code >= 0 && (code & 8) == 0);
+            } else {
+                test_fail("ACL test: fork failed");
+            }
+        }
+        unlink(af);
 
         /* Sticky bit (1777, like /tmp) + set-id stripping on write.  Fresh
          * child with its own exit-code scheme (sentinel 99) to avoid clashes. */

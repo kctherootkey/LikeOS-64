@@ -82,6 +82,26 @@ int main(int argc, char **argv) {
         close(fd);
     }
 
+    /* Large value: too big for the inode slack, so it spills to an external
+     * xattr block (exercises block alloc + per-entry/block hashes + crc32c). */
+    {
+        char big[600], bigbuf[700];
+        for (size_t i = 0; i < sizeof(big); i++) big[i] = (char)('A' + (i % 26));
+        r = setxattr(path, "user.big", big, sizeof(big), 0);
+        CHECK(r == 0, "setxattr large value (external block)");
+        memset(bigbuf, 0, sizeof(bigbuf));
+        n = getxattr(path, "user.big", bigbuf, sizeof(bigbuf));
+        CHECK(n == (ssize_t)sizeof(big) && memcmp(bigbuf, big, sizeof(big)) == 0,
+              "getxattr large value matches");
+        /* small attrs must still be reachable alongside the block */
+        n = getxattr(path, "user.x", buf, sizeof(buf));
+        CHECK(n == 1, "small attr still readable with block present");
+        r = removexattr(path, "user.big");
+        CHECK(r == 0, "removexattr large value (frees the block)");
+        n = getxattr(path, "user.big", bigbuf, sizeof(bigbuf));
+        CHECK(n == -1 && errno == ENODATA, "getxattr removed large -> ENODATA");
+    }
+
     printf("[xattr] %s (%d failure%s)\n", fails ? "FAILED" : "OK",
            fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;

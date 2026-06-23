@@ -224,6 +224,11 @@ int vfs_fremovexattr(vfs_file_t* f, const char* name) {
     if (!f || !f->ops || !f->ops->fremovexattr) return ST_UNSUPPORTED;
     return f->ops->fremovexattr(f, name);
 }
+int vfs_getxattr_ino(const char* path, unsigned long ino, const char* name, void* val, unsigned long size) {
+    const vfs_ops_t* o = vfs_ops_for_path(path);
+    if (!o || !o->getxattr_ino) return ST_UNSUPPORTED;
+    return o->getxattr_ino(ino, name, val, size);
+}
 
 long vfs_read(vfs_file_t* f, void* buf, long bytes) { if (!f || !f->ops || !f->ops->read) return ST_INVALID; return f->ops->read(f, buf, bytes); }
 long vfs_write(vfs_file_t* f, const void* buf, long bytes) { if (!f || !f->ops || !f->ops->write) return ST_INVALID; return f->ops->write(f, buf, bytes); }
