@@ -17,7 +17,9 @@
 #if SMP_DEBUG
 #define smp_dbg(fmt, ...) kprintf(fmt, ##__VA_ARGS__)
 #else
-#define smp_dbg(fmt, ...) do {} while(0)
+#define smp_dbg(fmt, ...) \
+	do {              \
+	} while (0)
 #endif
 
 // ============================================================================
@@ -27,22 +29,22 @@
 // Default AP trampoline location (must be in low memory, below 1MB)
 // The actual address is provided by bootloader via boot_info.smp_trampoline_addr
 // Fallback to 0x8000 if bootloader doesn't provide one
-#define AP_TRAMPOLINE_ADDR_DEFAULT  0x8000
+#define AP_TRAMPOLINE_ADDR_DEFAULT 0x8000
 
 // AP stack size
-#define AP_STACK_SIZE           16384
+#define AP_STACK_SIZE 16384
 
 // Timeout for AP startup (in milliseconds)
-#define AP_STARTUP_TIMEOUT_MS   200
+#define AP_STARTUP_TIMEOUT_MS 200
 
 // ============================================================================
 // SMP State
 // ============================================================================
 
 typedef enum {
-    SMP_STATE_BSP_ONLY = 0,     // Only BSP running
-    SMP_STATE_STARTING_APS,     // APs being started
-    SMP_STATE_RUNNING           // All CPUs running
+	SMP_STATE_BSP_ONLY = 0, // Only BSP running
+	SMP_STATE_STARTING_APS, // APs being started
+	SMP_STATE_RUNNING // All CPUs running
 } smp_state_t;
 
 // ============================================================================
@@ -84,16 +86,16 @@ void ap_entry(void);
 
 // Simple barrier for CPU synchronization
 typedef struct {
-    volatile uint32_t count;
-    volatile uint32_t waiting;
-    volatile uint32_t sense;
+	volatile uint32_t count;
+	volatile uint32_t waiting;
+	volatile uint32_t sense;
 } smp_barrier_t;
 
 // Initialize barrier for given number of CPUs
-void smp_barrier_init(smp_barrier_t* barrier, uint32_t count);
+void smp_barrier_init(smp_barrier_t *barrier, uint32_t count);
 
 // Wait at barrier (all CPUs must reach before any can proceed)
-void smp_barrier_wait(smp_barrier_t* barrier);
+void smp_barrier_wait(smp_barrier_t *barrier);
 
 // ============================================================================
 // Cross-CPU Function Calls (IPIs)
@@ -117,7 +119,7 @@ void smp_tlb_shootdown_ack(void);
 
 // Halt all other CPUs (for panic)
 void smp_halt_others(void);
-int  smp_others_halted(void);
+int smp_others_halted(void);
 
 /* NMI-based "where is that CPU stuck?" diagnostic.
  *
@@ -126,6 +128,6 @@ int  smp_others_halted(void);
  * smp_tlb_shootdown_sync's timeout path — the handler should record the
  * captured state into the per-CPU buffer and iretq.  Returns 0 if it's
  * a real NMI (caller should fall through to kernel_oops). */
-int smp_nmi_capture_record(uint64_t* regs);
+int smp_nmi_capture_record(uint64_t *regs);
 
 #endif // _KERNEL_SMP_H_

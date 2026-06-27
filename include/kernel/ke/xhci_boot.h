@@ -8,15 +8,15 @@
 
 // Boot state tracking
 typedef struct {
-    xhci_controller_t* ctrl;       // Primary controller (mass storage)
-    xhci_controller_t* ctrl_hid;   // Secondary controller (HID), may be NULL
-    int enum_complete;
-    int msd_ready;
+	xhci_controller_t *ctrl; // Primary controller (mass storage)
+	xhci_controller_t *ctrl_hid; // Secondary controller (HID), may be NULL
+	int enum_complete;
+	int msd_ready;
 } xhci_boot_state_t;
 
 // Boot-time initialization
-void xhci_boot_init(xhci_boot_state_t* state);
-void xhci_boot_poll(xhci_boot_state_t* state);
-int xhci_boot_is_ready(xhci_boot_state_t* state);
+void xhci_boot_init(xhci_boot_state_t *state);
+void xhci_boot_poll(xhci_boot_state_t *state);
+int xhci_boot_is_ready(xhci_boot_state_t *state);
 
 #endif // LIKEOS_XHCI_BOOT_H

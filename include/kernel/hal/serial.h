@@ -14,7 +14,7 @@ void serial_init(void);
 void serial_write_char(char c);
 
 // Write a buffer of length len
-void serial_write(const char* s, uint32_t len);
+void serial_write(const char *s, uint32_t len);
 
 // Query availability (1 if COM1 detected and initialized)
 int serial_is_available(void);

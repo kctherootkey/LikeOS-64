@@ -14,18 +14,18 @@ global switch_stack_and_call
 switch_stack_and_call:
     ; Switch to the new stack
     mov rsp, rdi
-    
+
     ; Clear rbp to mark stack bottom
     xor rbp, rbp
-    
+
     ; Ensure stack is 16-byte aligned before call
     ; The call instruction will push 8 bytes, so we need RSP to be 8 mod 16
     and rsp, ~0xF
     sub rsp, 8
-    
+
     ; Call the function (address is in rsi)
     call rsi
-    
+
     ; The function should not return, but if it does, halt
 .hang:
     hlt

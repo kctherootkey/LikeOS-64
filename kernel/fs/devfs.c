@@ -8,463 +8,562 @@
 #include <kernel/dev/rand/random.h>
 #include <kernel/uapi/bug.h>
 
-#define DEVFS_TYPE_TTY       1
+#define DEVFS_TYPE_TTY 1
 #define DEVFS_TYPE_PTY_MASTER 2
-#define DEVFS_TYPE_PTY_SLAVE  3
-#define DEVFS_TYPE_DIR        4
-#define DEVFS_TYPE_PTS_DIR    5
-#define DEVFS_TYPE_RANDOM     6
-#define DEVFS_TYPE_URANDOM    7
-#define DEVFS_TYPE_NULL       8
-#define DEVFS_TYPE_ZERO       9
+#define DEVFS_TYPE_PTY_SLAVE 3
+#define DEVFS_TYPE_DIR 4
+#define DEVFS_TYPE_PTS_DIR 5
+#define DEVFS_TYPE_RANDOM 6
+#define DEVFS_TYPE_URANDOM 7
+#define DEVFS_TYPE_NULL 8
+#define DEVFS_TYPE_ZERO 9
 
 typedef struct {
-    vfs_file_t vfs;
-    int type;
-    tty_t* tty;
-    int pty_id;
-    unsigned dir_pos;
+	vfs_file_t vfs;
+	int type;
+	tty_t *tty;
+	int pty_id;
+	unsigned dir_pos;
 } devfs_file_t;
 
 static vfs_ops_t g_devfs_ops;
 
-static int is_path(const char* path, const char* match) {
-    return (kstrcmp(path, match) == 0);
+static int is_path(const char *path, const char *match)
+{
+	return (kstrcmp(path, match) == 0);
 }
 
-static int is_prefix(const char* path, const char* prefix) {
-    size_t i = 0;
-    while (prefix[i]) {
-        if (path[i] != prefix[i]) return 0;
-        i++;
-    }
-    return 1;
+static int is_prefix(const char *path, const char *prefix)
+{
+	size_t i = 0;
+	while (prefix[i]) {
+		if (path[i] != prefix[i])
+			return 0;
+		i++;
+	}
+	return 1;
 }
 
-long devfs_readdir(vfs_file_t* f, void* buf, long bytes);
+long devfs_readdir(vfs_file_t *f, void *buf, long bytes);
 
-int devfs_init(void) {
-    g_devfs_ops.open = devfs_open;
-    g_devfs_ops.stat = devfs_stat;
-    g_devfs_ops.read = devfs_read;
-    g_devfs_ops.write = devfs_write;
-    g_devfs_ops.seek = NULL;
-    g_devfs_ops.readdir = devfs_readdir;
-    g_devfs_ops.truncate = NULL;
-    g_devfs_ops.unlink = NULL;
-    g_devfs_ops.rename = NULL;
-    g_devfs_ops.mkdir = NULL;
-    g_devfs_ops.rmdir = NULL;
-    g_devfs_ops.chdir = devfs_chdir;
-    g_devfs_ops.close = devfs_close;
-    return 0;
+int devfs_init(void)
+{
+	g_devfs_ops.open = devfs_open;
+	g_devfs_ops.stat = devfs_stat;
+	g_devfs_ops.read = devfs_read;
+	g_devfs_ops.write = devfs_write;
+	g_devfs_ops.seek = NULL;
+	g_devfs_ops.readdir = devfs_readdir;
+	g_devfs_ops.truncate = NULL;
+	g_devfs_ops.unlink = NULL;
+	g_devfs_ops.rename = NULL;
+	g_devfs_ops.mkdir = NULL;
+	g_devfs_ops.rmdir = NULL;
+	g_devfs_ops.chdir = devfs_chdir;
+	g_devfs_ops.close = devfs_close;
+	return 0;
 }
 
-const vfs_ops_t* devfs_get_ops(void) {
-    return &g_devfs_ops;
+const vfs_ops_t *devfs_get_ops(void)
+{
+	return &g_devfs_ops;
 }
 
-static devfs_file_t* devfs_alloc_file(void) {
-    might_sleep();
-    devfs_file_t* df = (devfs_file_t*)kalloc(sizeof(devfs_file_t));
-    if (!df) return NULL;
-    mm_memset(df, 0, sizeof(devfs_file_t));
-    df->vfs.ops = &g_devfs_ops;
-    df->vfs.fs_private = df;
-    WARN_ON(df->vfs.fs_private != df);
-    return df;
+static devfs_file_t *devfs_alloc_file(void)
+{
+	might_sleep();
+	devfs_file_t *df = (devfs_file_t *)kalloc(sizeof(devfs_file_t));
+	if (!df)
+		return NULL;
+	mm_memset(df, 0, sizeof(devfs_file_t));
+	df->vfs.ops = &g_devfs_ops;
+	df->vfs.fs_private = df;
+	WARN_ON(df->vfs.fs_private != df);
+	return df;
 }
 
-static int devfs_open_tty(tty_t* tty, vfs_file_t** out) {
-    BUG_ON(tty == NULL);
-    BUG_ON(out == NULL);
-    if (!tty || !out) return ST_INVALID;
-    devfs_file_t* df = devfs_alloc_file();
-    if (!df) return ST_NOMEM;
-    df->type = DEVFS_TYPE_TTY;
-    df->tty = tty;
-    *out = &df->vfs;
-    return ST_OK;
+static int devfs_open_tty(tty_t *tty, vfs_file_t **out)
+{
+	BUG_ON(tty == NULL);
+	BUG_ON(out == NULL);
+	if (!tty || !out)
+		return ST_INVALID;
+	devfs_file_t *df = devfs_alloc_file();
+	if (!df)
+		return ST_NOMEM;
+	df->type = DEVFS_TYPE_TTY;
+	df->tty = tty;
+	*out = &df->vfs;
+	return ST_OK;
 }
 
-static int devfs_open_dir(int type, vfs_file_t** out) {
-    BUG_ON(out == NULL);
-    if (!out) return ST_INVALID;
-    devfs_file_t* df = devfs_alloc_file();
-    if (!df) return ST_NOMEM;
-    df->type = type;
-    df->tty = NULL;
-    df->pty_id = -1;
-    *out = &df->vfs;
-    return ST_OK;
+static int devfs_open_dir(int type, vfs_file_t **out)
+{
+	BUG_ON(out == NULL);
+	if (!out)
+		return ST_INVALID;
+	devfs_file_t *df = devfs_alloc_file();
+	if (!df)
+		return ST_NOMEM;
+	df->type = type;
+	df->tty = NULL;
+	df->pty_id = -1;
+	*out = &df->vfs;
+	return ST_OK;
 }
 
-static int devfs_open_pty_master(int* out_id, vfs_file_t** out) {
-    BUG_ON(out == NULL);
-    if (!out) return ST_INVALID;
-    int id = -1;
-    if (tty_pty_allocate(&id) != 0) {
-        return ST_BUSY;
-    }
-    WARN_ON(id < 0);  /* tty_pty_allocate succeeded but returned invalid id < 0 */
-    devfs_file_t* df = devfs_alloc_file();
-    if (!df) return ST_NOMEM;
-    df->type = DEVFS_TYPE_PTY_MASTER;
-    df->pty_id = id;
-    *out = &df->vfs;
-    if (out_id) *out_id = id;
-    return ST_OK;
+static int devfs_open_pty_master(int *out_id, vfs_file_t **out)
+{
+	BUG_ON(out == NULL);
+	if (!out)
+		return ST_INVALID;
+	int id = -1;
+	if (tty_pty_allocate(&id) != 0) {
+		return ST_BUSY;
+	}
+	WARN_ON(id <
+		0); /* tty_pty_allocate succeeded but returned invalid id < 0 */
+	devfs_file_t *df = devfs_alloc_file();
+	if (!df)
+		return ST_NOMEM;
+	df->type = DEVFS_TYPE_PTY_MASTER;
+	df->pty_id = id;
+	*out = &df->vfs;
+	if (out_id)
+		*out_id = id;
+	return ST_OK;
 }
 
-static int devfs_open_pty_slave(int id, vfs_file_t** out) {
-    tty_t* tty = tty_get_pty_slave(id);
-    if (!tty) return ST_NOT_FOUND;
-    tty_pty_slave_open(id);
-    devfs_file_t* df = devfs_alloc_file();
-    if (!df) return ST_NOMEM;
-    df->type = DEVFS_TYPE_PTY_SLAVE;
-    df->tty = tty;
-    df->pty_id = id;
-    *out = &df->vfs;
-    return ST_OK;
+static int devfs_open_pty_slave(int id, vfs_file_t **out)
+{
+	tty_t *tty = tty_get_pty_slave(id);
+	if (!tty)
+		return ST_NOT_FOUND;
+	tty_pty_slave_open(id);
+	devfs_file_t *df = devfs_alloc_file();
+	if (!df)
+		return ST_NOMEM;
+	df->type = DEVFS_TYPE_PTY_SLAVE;
+	df->tty = tty;
+	df->pty_id = id;
+	*out = &df->vfs;
+	return ST_OK;
 }
 
-int devfs_open_for_task(const char* path, int flags, vfs_file_t** out, task_t* cur) {
-    (void)flags;
-    if (!path || !out) return ST_INVALID;
+int devfs_open_for_task(const char *path, int flags, vfs_file_t **out,
+			task_t *cur)
+{
+	(void)flags;
+	if (!path || !out)
+		return ST_INVALID;
 
-    if (is_path(path, "/dev") || is_path(path, "/dev/")) {
-        return devfs_open_dir(DEVFS_TYPE_DIR, out);
-    }
-    if (is_path(path, "/dev/pts") || is_path(path, "/dev/pts/")) {
-        return devfs_open_dir(DEVFS_TYPE_PTS_DIR, out);
-    }
+	if (is_path(path, "/dev") || is_path(path, "/dev/")) {
+		return devfs_open_dir(DEVFS_TYPE_DIR, out);
+	}
+	if (is_path(path, "/dev/pts") || is_path(path, "/dev/pts/")) {
+		return devfs_open_dir(DEVFS_TYPE_PTS_DIR, out);
+	}
 
-    if (is_path(path, "/dev/tty") && cur) {
-        tty_t* tty = cur->ctty ? cur->ctty : tty_get_console();
-        if (tty && tty->fg_pgid == 0) {
-            tty->fg_pgid = cur->pgid;
-        }
-        return devfs_open_tty(tty, out);
-    }
-    if (is_path(path, "/dev/console") || is_path(path, "/dev/tty0")) {
-        return devfs_open_tty(tty_get_console(), out);
-    }
-    if (is_path(path, "/dev/ptmx")) {
-        return devfs_open_pty_master(NULL, out);
-    }
-    if (is_path(path, "/dev/random")) {
-        devfs_file_t* df = devfs_alloc_file();
-        if (!df) return ST_NOMEM;
-        df->type = DEVFS_TYPE_RANDOM;
-        *out = &df->vfs;
-        return ST_OK;
-    }
-    if (is_path(path, "/dev/urandom")) {
-        devfs_file_t* df = devfs_alloc_file();
-        if (!df) return ST_NOMEM;
-        df->type = DEVFS_TYPE_URANDOM;
-        *out = &df->vfs;
-        return ST_OK;
-    }
-    if (is_path(path, "/dev/null")) {
-        devfs_file_t* df = devfs_alloc_file();
-        if (!df) return ST_NOMEM;
-        df->type = DEVFS_TYPE_NULL;
-        *out = &df->vfs;
-        return ST_OK;
-    }
-    if (is_path(path, "/dev/zero")) {
-        devfs_file_t* df = devfs_alloc_file();
-        if (!df) return ST_NOMEM;
-        df->type = DEVFS_TYPE_ZERO;
-        *out = &df->vfs;
-        return ST_OK;
-    }
-    if (is_prefix(path, "/dev/pts/")) {
-        int id = 0;
-        const char* p = path + 9;
-        if (!*p) return ST_NOT_FOUND;
-        while (*p) {
-            if (*p < '0' || *p > '9') return ST_NOT_FOUND;
-            id = id * 10 + (*p - '0');
-            p++;
-        }
-        WARN_ON_ONCE(id >= 16);  /* PTY id >= TTY_MAX_PTYS: parsed out-of-range slave index */
-        if (cur) {
-            tty_t* tty = tty_get_pty_slave(id);
-            if (tty && tty->fg_pgid == 0) {
-                tty->fg_pgid = cur->pgid;
-            }
-        }
-        return devfs_open_pty_slave(id, out);
-    }
-    return ST_NOT_FOUND;
+	if (is_path(path, "/dev/tty") && cur) {
+		tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
+		if (tty && tty->fg_pgid == 0) {
+			tty->fg_pgid = cur->pgid;
+		}
+		return devfs_open_tty(tty, out);
+	}
+	if (is_path(path, "/dev/console") || is_path(path, "/dev/tty0")) {
+		return devfs_open_tty(tty_get_console(), out);
+	}
+	if (is_path(path, "/dev/ptmx")) {
+		return devfs_open_pty_master(NULL, out);
+	}
+	if (is_path(path, "/dev/random")) {
+		devfs_file_t *df = devfs_alloc_file();
+		if (!df)
+			return ST_NOMEM;
+		df->type = DEVFS_TYPE_RANDOM;
+		*out = &df->vfs;
+		return ST_OK;
+	}
+	if (is_path(path, "/dev/urandom")) {
+		devfs_file_t *df = devfs_alloc_file();
+		if (!df)
+			return ST_NOMEM;
+		df->type = DEVFS_TYPE_URANDOM;
+		*out = &df->vfs;
+		return ST_OK;
+	}
+	if (is_path(path, "/dev/null")) {
+		devfs_file_t *df = devfs_alloc_file();
+		if (!df)
+			return ST_NOMEM;
+		df->type = DEVFS_TYPE_NULL;
+		*out = &df->vfs;
+		return ST_OK;
+	}
+	if (is_path(path, "/dev/zero")) {
+		devfs_file_t *df = devfs_alloc_file();
+		if (!df)
+			return ST_NOMEM;
+		df->type = DEVFS_TYPE_ZERO;
+		*out = &df->vfs;
+		return ST_OK;
+	}
+	if (is_prefix(path, "/dev/pts/")) {
+		int id = 0;
+		const char *p = path + 9;
+		if (!*p)
+			return ST_NOT_FOUND;
+		while (*p) {
+			if (*p < '0' || *p > '9')
+				return ST_NOT_FOUND;
+			id = id * 10 + (*p - '0');
+			p++;
+		}
+		WARN_ON_ONCE(
+			id >=
+			16); /* PTY id >= TTY_MAX_PTYS: parsed out-of-range slave index */
+		if (cur) {
+			tty_t *tty = tty_get_pty_slave(id);
+			if (tty && tty->fg_pgid == 0) {
+				tty->fg_pgid = cur->pgid;
+			}
+		}
+		return devfs_open_pty_slave(id, out);
+	}
+	return ST_NOT_FOUND;
 }
 
-int devfs_open(const char* path, int flags, vfs_file_t** out) {
-    // Fallback without task context: use console tty for /dev/tty
-    return devfs_open_for_task(path, flags, out, NULL);
+int devfs_open(const char *path, int flags, vfs_file_t **out)
+{
+	// Fallback without task context: use console tty for /dev/tty
+	return devfs_open_for_task(path, flags, out, NULL);
 }
 
-int devfs_stat(const char* path, struct kstat* st) {
-    if (!path || !st) return ST_INVALID;
-    mm_memset(st, 0, sizeof(*st));
-    uint64_t now = timer_get_epoch();  /* real wall-clock seconds */
-    if (is_path(path, "/dev") || is_path(path, "/dev/") || is_path(path, "/dev/pts") || is_path(path, "/dev/pts/")) {
-        st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
-        st->st_nlink = 1;
-        st->st_atime = now;
-        st->st_mtime = now;
-        st->st_ctime = now;
-        return ST_OK;
-    }
-    if (is_path(path, "/dev/tty") || is_path(path, "/dev/console") || is_path(path, "/dev/tty0") || is_path(path, "/dev/ptmx") ||
-        is_path(path, "/dev/random") || is_path(path, "/dev/urandom") ||
-        is_path(path, "/dev/null") || is_path(path, "/dev/zero")) {
-        st->st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
-        st->st_nlink = 1;
-        st->st_atime = now;
-        st->st_mtime = now;
-        st->st_ctime = now;
-        return ST_OK;
-    }
-    if (is_prefix(path, "/dev/pts/")) {
-        st->st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
-        st->st_nlink = 1;
-        st->st_atime = now;
-        st->st_mtime = now;
-        st->st_ctime = now;
-        return ST_OK;
-    }
-    return ST_NOT_FOUND;
+int devfs_stat(const char *path, struct kstat *st)
+{
+	if (!path || !st)
+		return ST_INVALID;
+	mm_memset(st, 0, sizeof(*st));
+	uint64_t now = timer_get_epoch(); /* real wall-clock seconds */
+	if (is_path(path, "/dev") || is_path(path, "/dev/") ||
+	    is_path(path, "/dev/pts") || is_path(path, "/dev/pts/")) {
+		st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP |
+					 S_IXGRP | S_IROTH | S_IXOTH);
+		st->st_nlink = 1;
+		st->st_atime = now;
+		st->st_mtime = now;
+		st->st_ctime = now;
+		return ST_OK;
+	}
+	if (is_path(path, "/dev/tty") || is_path(path, "/dev/console") ||
+	    is_path(path, "/dev/tty0") || is_path(path, "/dev/ptmx") ||
+	    is_path(path, "/dev/random") || is_path(path, "/dev/urandom") ||
+	    is_path(path, "/dev/null") || is_path(path, "/dev/zero")) {
+		st->st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP |
+					 S_IROTH | S_IWOTH);
+		st->st_nlink = 1;
+		st->st_atime = now;
+		st->st_mtime = now;
+		st->st_ctime = now;
+		return ST_OK;
+	}
+	if (is_prefix(path, "/dev/pts/")) {
+		st->st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP |
+					 S_IROTH | S_IWOTH);
+		st->st_nlink = 1;
+		st->st_atime = now;
+		st->st_mtime = now;
+		st->st_ctime = now;
+		return ST_OK;
+	}
+	return ST_NOT_FOUND;
 }
 
-int devfs_chdir(const char* path) {
-    if (!path) return ST_INVALID;
-    if (is_path(path, "/dev") || is_path(path, "/dev/") || is_path(path, "/dev/pts") || is_path(path, "/dev/pts/")) {
-        return ST_OK;
-    }
-    return ST_NOT_FOUND;
+int devfs_chdir(const char *path)
+{
+	if (!path)
+		return ST_INVALID;
+	if (is_path(path, "/dev") || is_path(path, "/dev/") ||
+	    is_path(path, "/dev/pts") || is_path(path, "/dev/pts/")) {
+		return ST_OK;
+	}
+	return ST_NOT_FOUND;
 }
 
-long devfs_read(vfs_file_t* f, void* buf, long bytes) {
-    if (!f || !buf) return -EINVAL;
-    devfs_file_t* df = (devfs_file_t*)f->fs_private;
-    if (!df) return -EINVAL;
-    WARN_ON(df->type < DEVFS_TYPE_TTY || df->type > DEVFS_TYPE_ZERO);
-    int nonblock = (f->flags & O_NONBLOCK) ? 1 : 0;
-    if (df->type == DEVFS_TYPE_TTY) {
-        WARN_ON(df->tty == NULL);
-        return tty_read(df->tty, buf, bytes, nonblock);
-    }
-    if (df->type == DEVFS_TYPE_PTY_SLAVE) {
-        WARN_ON(df->tty == NULL);
-        WARN_ON(df->pty_id < 0);  /* PTY slave file with negative pty_id: state corruption */
-        return tty_read(df->tty, buf, bytes, nonblock);
-    }
-    if (df->type == DEVFS_TYPE_PTY_MASTER) {
-        WARN_ON(df->pty_id < 0);
-        return tty_pty_master_read(df->pty_id, buf, bytes, nonblock);
-    }
-    if (df->type == DEVFS_TYPE_RANDOM) {
-        smap_disable();
-        int ret = random_get_bytes(buf, (size_t)bytes, 1);
-        smap_enable();
-        return ret < 0 ? -EIO : (long)ret;
-    }
-    if (df->type == DEVFS_TYPE_URANDOM) {
-        smap_disable();
-        int ret = random_get_bytes(buf, (size_t)bytes, 0);
-        smap_enable();
-        return ret < 0 ? -EIO : (long)ret;
-    }
-    if (df->type == DEVFS_TYPE_NULL) {
-        return 0; /* always EOF */
-    }
-    if (df->type == DEVFS_TYPE_ZERO) {
-        smap_disable();
-        char* p = (char*)buf;
-        for (long i = 0; i < bytes; i++) p[i] = 0;
-        smap_enable();
-        return bytes;
-    }
-    return -EINVAL;
+long devfs_read(vfs_file_t *f, void *buf, long bytes)
+{
+	if (!f || !buf)
+		return -EINVAL;
+	devfs_file_t *df = (devfs_file_t *)f->fs_private;
+	if (!df)
+		return -EINVAL;
+	WARN_ON(df->type < DEVFS_TYPE_TTY || df->type > DEVFS_TYPE_ZERO);
+	int nonblock = (f->flags & O_NONBLOCK) ? 1 : 0;
+	if (df->type == DEVFS_TYPE_TTY) {
+		WARN_ON(df->tty == NULL);
+		return tty_read(df->tty, buf, bytes, nonblock);
+	}
+	if (df->type == DEVFS_TYPE_PTY_SLAVE) {
+		WARN_ON(df->tty == NULL);
+		WARN_ON(df->pty_id <
+			0); /* PTY slave file with negative pty_id: state corruption */
+		return tty_read(df->tty, buf, bytes, nonblock);
+	}
+	if (df->type == DEVFS_TYPE_PTY_MASTER) {
+		WARN_ON(df->pty_id < 0);
+		return tty_pty_master_read(df->pty_id, buf, bytes, nonblock);
+	}
+	if (df->type == DEVFS_TYPE_RANDOM) {
+		smap_disable();
+		int ret = random_get_bytes(buf, (size_t)bytes, 1);
+		smap_enable();
+		return ret < 0 ? -EIO : (long)ret;
+	}
+	if (df->type == DEVFS_TYPE_URANDOM) {
+		smap_disable();
+		int ret = random_get_bytes(buf, (size_t)bytes, 0);
+		smap_enable();
+		return ret < 0 ? -EIO : (long)ret;
+	}
+	if (df->type == DEVFS_TYPE_NULL) {
+		return 0; /* always EOF */
+	}
+	if (df->type == DEVFS_TYPE_ZERO) {
+		smap_disable();
+		char *p = (char *)buf;
+		for (long i = 0; i < bytes; i++)
+			p[i] = 0;
+		smap_enable();
+		return bytes;
+	}
+	return -EINVAL;
 }
 
-long devfs_write(vfs_file_t* f, const void* buf, long bytes) {
-    if (!f || !buf) return -EINVAL;
-    devfs_file_t* df = (devfs_file_t*)f->fs_private;
-    if (!df) return -EINVAL;
-    WARN_ON(df->type < DEVFS_TYPE_TTY || df->type > DEVFS_TYPE_ZERO);
-    if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_SLAVE) {
-        WARN_ON(df->tty == NULL);  /* TTY/PTY-slave write with NULL tty pointer: state corruption */
-        return tty_write(df->tty, buf, bytes);
-    }
-    if (df->type == DEVFS_TYPE_PTY_MASTER) {
-        WARN_ON(df->pty_id < 0);
-        return tty_pty_master_write(df->pty_id, buf, bytes);
-    }
-    if (df->type == DEVFS_TYPE_RANDOM || df->type == DEVFS_TYPE_URANDOM) {
-        // Writing to /dev/random mixes data into entropy pool
-        smap_disable();
-        random_add_entropy(buf, (size_t)bytes);
-        smap_enable();
-        return bytes;
-    }
-    if (df->type == DEVFS_TYPE_NULL || df->type == DEVFS_TYPE_ZERO) {
-        /* /dev/null and /dev/zero discard all writes. */
-        return bytes;
-    }
-    return -EINVAL;
+long devfs_write(vfs_file_t *f, const void *buf, long bytes)
+{
+	if (!f || !buf)
+		return -EINVAL;
+	devfs_file_t *df = (devfs_file_t *)f->fs_private;
+	if (!df)
+		return -EINVAL;
+	WARN_ON(df->type < DEVFS_TYPE_TTY || df->type > DEVFS_TYPE_ZERO);
+	if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_SLAVE) {
+		WARN_ON(df->tty ==
+			NULL); /* TTY/PTY-slave write with NULL tty pointer: state corruption */
+		return tty_write(df->tty, buf, bytes);
+	}
+	if (df->type == DEVFS_TYPE_PTY_MASTER) {
+		WARN_ON(df->pty_id < 0);
+		return tty_pty_master_write(df->pty_id, buf, bytes);
+	}
+	if (df->type == DEVFS_TYPE_RANDOM || df->type == DEVFS_TYPE_URANDOM) {
+		// Writing to /dev/random mixes data into entropy pool
+		smap_disable();
+		random_add_entropy(buf, (size_t)bytes);
+		smap_enable();
+		return bytes;
+	}
+	if (df->type == DEVFS_TYPE_NULL || df->type == DEVFS_TYPE_ZERO) {
+		/* /dev/null and /dev/zero discard all writes. */
+		return bytes;
+	}
+	return -EINVAL;
 }
 
-static unsigned devfs_write_dirent64(char* out, unsigned out_size, unsigned* out_off,
-                                     const char* name, uint64_t ino, uint8_t type) {
-    if (!out || !out_off || !name) return 0;
-    unsigned name_len = 0;
-    while (name[name_len] && name_len < 255) name_len++;
-    unsigned reclen = (unsigned)sizeof(struct linux_dirent64) + name_len + 1;
-    reclen = (reclen + 7u) & ~7u;
-    WARN_ON(reclen % 8 != 0);
-    if (*out_off + reclen > out_size) return 0;
-    // SMAP-aware write to user buffer
-    smap_disable();
-    struct linux_dirent64* d = (struct linux_dirent64*)(out + *out_off);
-    d->d_ino = ino;
-    d->d_off = 0;
-    d->d_reclen = (uint16_t)reclen;
-    d->d_type = type;
-    char* dn = (char*)d->d_name;
-    for (unsigned i = 0; i < name_len; ++i) dn[i] = name[i];
-    dn[name_len] = '\0';
-    smap_enable();
-    *out_off += reclen;
-    return 1;
+static unsigned devfs_write_dirent64(char *out, unsigned out_size,
+				     unsigned *out_off, const char *name,
+				     uint64_t ino, uint8_t type)
+{
+	if (!out || !out_off || !name)
+		return 0;
+	unsigned name_len = 0;
+	while (name[name_len] && name_len < 255)
+		name_len++;
+	unsigned reclen =
+		(unsigned)sizeof(struct linux_dirent64) + name_len + 1;
+	reclen = (reclen + 7u) & ~7u;
+	WARN_ON(reclen % 8 != 0);
+	if (*out_off + reclen > out_size)
+		return 0;
+	// SMAP-aware write to user buffer
+	smap_disable();
+	struct linux_dirent64 *d = (struct linux_dirent64 *)(out + *out_off);
+	d->d_ino = ino;
+	d->d_off = 0;
+	d->d_reclen = (uint16_t)reclen;
+	d->d_type = type;
+	char *dn = (char *)d->d_name;
+	for (unsigned i = 0; i < name_len; ++i)
+		dn[i] = name[i];
+	dn[name_len] = '\0';
+	smap_enable();
+	*out_off += reclen;
+	return 1;
 }
 
-long devfs_readdir(vfs_file_t* f, void* buf, long bytes) {
-    if (!f || !buf || bytes <= 0) return -EINVAL;
-    devfs_file_t* df = (devfs_file_t*)f->fs_private;
-    if (!df) return -EINVAL;
-    if (df->type != DEVFS_TYPE_DIR && df->type != DEVFS_TYPE_PTS_DIR) {
-        return -ENOTDIR;
-    }
-    if (df->dir_pos) {
-        return 0;
-    }
+long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
+{
+	if (!f || !buf || bytes <= 0)
+		return -EINVAL;
+	devfs_file_t *df = (devfs_file_t *)f->fs_private;
+	if (!df)
+		return -EINVAL;
+	if (df->type != DEVFS_TYPE_DIR && df->type != DEVFS_TYPE_PTS_DIR) {
+		return -ENOTDIR;
+	}
+	if (df->dir_pos) {
+		return 0;
+	}
 
-    unsigned out_off = 0;
-    if (df->type == DEVFS_TYPE_DIR) {
-        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "tty", 1, 2);
-        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "console", 2, 2);
-        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "tty0", 3, 2);
-        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "ptmx", 4, 2);
-        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "pts", 5, 4);
-        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "random", 6, 2);
-        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "urandom", 7, 2);
-        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "null", 8, 2);
-        devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, "zero", 9, 2);
-        df->dir_pos = 1;
-        return (long)out_off;
-    }
+	unsigned out_off = 0;
+	if (df->type == DEVFS_TYPE_DIR) {
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "tty", 1, 2);
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "console", 2, 2);
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "tty0", 3, 2);
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "ptmx", 4, 2);
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "pts", 5, 4);
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "random", 6, 2);
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "urandom", 7, 2);
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "null", 8, 2);
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "zero", 9, 2);
+		df->dir_pos = 1;
+		return (long)out_off;
+	}
 
-    for (int i = 0; i < 16; ++i) {
-        if (!tty_pty_is_allocated(i)) continue;
-        char name[8];
-        int len = 0;
-        int n = i;
-        if (n == 0) {
-            name[len++] = '0';
-        } else {
-            char tmp[8];
-            int t = 0;
-            while (n > 0 && t < 7) { tmp[t++] = (char)('0' + (n % 10)); n /= 10; }
-            while (t > 0) { name[len++] = tmp[--t]; }
-        }
-        name[len] = '\0';
-        if (!devfs_write_dirent64((char*)buf, (unsigned)bytes, &out_off, name, (uint64_t)(100 + i), 2)) {
-            break;
-        }
-    }
-    df->dir_pos = 1;
-    return (long)out_off;
+	for (int i = 0; i < 16; ++i) {
+		if (!tty_pty_is_allocated(i))
+			continue;
+		char name[8];
+		int len = 0;
+		int n = i;
+		if (n == 0) {
+			name[len++] = '0';
+		} else {
+			char tmp[8];
+			int t = 0;
+			while (n > 0 && t < 7) {
+				tmp[t++] = (char)('0' + (n % 10));
+				n /= 10;
+			}
+			while (t > 0) {
+				name[len++] = tmp[--t];
+			}
+		}
+		name[len] = '\0';
+		if (!devfs_write_dirent64((char *)buf, (unsigned)bytes,
+					  &out_off, name, (uint64_t)(100 + i),
+					  2)) {
+			break;
+		}
+	}
+	df->dir_pos = 1;
+	return (long)out_off;
 }
 
-int devfs_close(vfs_file_t* f) {
-    if (!f) return ST_INVALID;
-    devfs_file_t* df = (devfs_file_t*)f->fs_private;
-    if (df) {
-        if (df->type == DEVFS_TYPE_PTY_MASTER) {
-            WARN_ON(df->pty_id < 0);
-            tty_pty_master_close(df->pty_id);
-        } else if (df->type == DEVFS_TYPE_PTY_SLAVE) {
-            WARN_ON(df->pty_id < 0);  /* PTY slave close with negative pty_id: state corruption */
-            tty_pty_slave_close(df->pty_id);
-        }
-        kfree(df);
-    }
-    return ST_OK;
+int devfs_close(vfs_file_t *f)
+{
+	if (!f)
+		return ST_INVALID;
+	devfs_file_t *df = (devfs_file_t *)f->fs_private;
+	if (df) {
+		if (df->type == DEVFS_TYPE_PTY_MASTER) {
+			WARN_ON(df->pty_id < 0);
+			tty_pty_master_close(df->pty_id);
+		} else if (df->type == DEVFS_TYPE_PTY_SLAVE) {
+			WARN_ON(df->pty_id <
+				0); /* PTY slave close with negative pty_id: state corruption */
+			tty_pty_slave_close(df->pty_id);
+		}
+		kfree(df);
+	}
+	return ST_OK;
 }
 
-int devfs_ioctl(vfs_file_t* f, unsigned long req, void* argp, task_t* cur) {
-    if (!f || f->ops != &g_devfs_ops) return -ENOTTY;
-    devfs_file_t* df = (devfs_file_t*)f->fs_private;
-    if (!df) return -ENOTTY;
-    if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_SLAVE) {
-        return tty_ioctl(df->tty, req, argp, cur);
-    }
-    if (df->type == DEVFS_TYPE_PTY_MASTER) {
-        WARN_ON(df->pty_id < 0);  /* PTY master ioctl with negative pty_id: state corruption */
-        if (req == TIOCGPTN && argp) {
-            smap_disable();
-            *(int*)argp = df->pty_id;
-            smap_enable();
-            return 0;
-        }
-        /* Forward all other ioctls to the slave tty (TIOCSWINSZ, TIOCGWINSZ,
+int devfs_ioctl(vfs_file_t *f, unsigned long req, void *argp, task_t *cur)
+{
+	if (!f || f->ops != &g_devfs_ops)
+		return -ENOTTY;
+	devfs_file_t *df = (devfs_file_t *)f->fs_private;
+	if (!df)
+		return -ENOTTY;
+	if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_SLAVE) {
+		return tty_ioctl(df->tty, req, argp, cur);
+	}
+	if (df->type == DEVFS_TYPE_PTY_MASTER) {
+		WARN_ON(df->pty_id <
+			0); /* PTY master ioctl with negative pty_id: state corruption */
+		if (req == TIOCGPTN && argp) {
+			smap_disable();
+			*(int *)argp = df->pty_id;
+			smap_enable();
+			return 0;
+		}
+		/* Forward all other ioctls to the slave tty (TIOCSWINSZ, TIOCGWINSZ,
          * TCGETS, TCSETS, TIOCGPGRP, TIOCSPGRP …).  tmux calls
          * ioctl(ptm_fd, TIOCSWINSZ, &ws) to resize each pane after a split;
          * without this the ioctl returns ENOTTY and the server exits. */
-        tty_t* slave = tty_get_pty_slave(df->pty_id);
-        if (slave) return tty_ioctl(slave, req, argp, cur);
-    }
-    return -ENOTTY;
+		tty_t *slave = tty_get_pty_slave(df->pty_id);
+		if (slave)
+			return tty_ioctl(slave, req, argp, cur);
+	}
+	return -ENOTTY;
 }
 
-int devfs_fstat(vfs_file_t* f, struct kstat* st) {
-    if (!f || f->ops != &g_devfs_ops || !st) return -EINVAL;
-    devfs_file_t* df = (devfs_file_t*)f->fs_private;
-    if (!df) return -EINVAL;
-    if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_MASTER || df->type == DEVFS_TYPE_PTY_SLAVE ||
-        df->type == DEVFS_TYPE_RANDOM || df->type == DEVFS_TYPE_URANDOM) {
-        st->st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
-        st->st_nlink = 1;
-        st->st_size = 0;
-        return 0;
-    }
-    return -EINVAL;
+int devfs_fstat(vfs_file_t *f, struct kstat *st)
+{
+	if (!f || f->ops != &g_devfs_ops || !st)
+		return -EINVAL;
+	devfs_file_t *df = (devfs_file_t *)f->fs_private;
+	if (!df)
+		return -EINVAL;
+	if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_MASTER ||
+	    df->type == DEVFS_TYPE_PTY_SLAVE || df->type == DEVFS_TYPE_RANDOM ||
+	    df->type == DEVFS_TYPE_URANDOM) {
+		st->st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP |
+					 S_IROTH | S_IWOTH);
+		st->st_nlink = 1;
+		st->st_size = 0;
+		return 0;
+	}
+	return -EINVAL;
 }
 
-tty_t* devfs_get_tty(vfs_file_t* f) {
-    if (!f || f->ops != &g_devfs_ops) return NULL;
-    devfs_file_t* df = (devfs_file_t*)f->fs_private;
-    if (!df) return NULL;
-    if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_SLAVE) {
-        return df->tty;
-    }
-    return NULL;
+tty_t *devfs_get_tty(vfs_file_t *f)
+{
+	if (!f || f->ops != &g_devfs_ops)
+		return NULL;
+	devfs_file_t *df = (devfs_file_t *)f->fs_private;
+	if (!df)
+		return NULL;
+	if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_SLAVE) {
+		return df->tty;
+	}
+	return NULL;
 }
 
 /* Returns the pty master id for a /dev/ptmx-opened vfs_file_t,
  * or -1 if the file is not a pty master. */
-int devfs_get_pty_master_id(vfs_file_t* f) {
-    if (!f || f->ops != &g_devfs_ops) return -1;
-    devfs_file_t* df = (devfs_file_t*)f->fs_private;
-    if (!df || df->type != DEVFS_TYPE_PTY_MASTER) return -1;
-    return df->pty_id;
+int devfs_get_pty_master_id(vfs_file_t *f)
+{
+	if (!f || f->ops != &g_devfs_ops)
+		return -1;
+	devfs_file_t *df = (devfs_file_t *)f->fs_private;
+	if (!df || df->type != DEVFS_TYPE_PTY_MASTER)
+		return -1;
+	return df->pty_id;
 }
 
-int devfs_is_devfile(vfs_file_t* f) {
-    return (f && f->ops == &g_devfs_ops);
+int devfs_is_devfile(vfs_file_t *f)
+{
+	return (f && f->ops == &g_devfs_ops);
 }

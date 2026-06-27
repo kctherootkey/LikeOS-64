@@ -13,25 +13,25 @@
 #define FUTEX_HASH_BUCKETS 256
 
 // Futex operation codes (Linux-compatible)
-#define FUTEX_WAIT          0
-#define FUTEX_WAKE          1
-#define FUTEX_FD            2   // Deprecated
-#define FUTEX_REQUEUE       3
-#define FUTEX_CMP_REQUEUE   4
-#define FUTEX_WAKE_OP       5
-#define FUTEX_LOCK_PI       6
-#define FUTEX_UNLOCK_PI     7
-#define FUTEX_TRYLOCK_PI    8
-#define FUTEX_WAIT_BITSET   9
-#define FUTEX_WAKE_BITSET   10
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
+#define FUTEX_FD 2 // Deprecated
+#define FUTEX_REQUEUE 3
+#define FUTEX_CMP_REQUEUE 4
+#define FUTEX_WAKE_OP 5
+#define FUTEX_LOCK_PI 6
+#define FUTEX_UNLOCK_PI 7
+#define FUTEX_TRYLOCK_PI 8
+#define FUTEX_WAIT_BITSET 9
+#define FUTEX_WAKE_BITSET 10
 
 // Futex flags
-#define FUTEX_PRIVATE_FLAG  128
+#define FUTEX_PRIVATE_FLAG 128
 #define FUTEX_CLOCK_REALTIME 256
 
 // Futex owner died flag (for robust mutexes)
-#define FUTEX_OWNER_DIED    (1 << 30)
-#define FUTEX_TID_MASK      0x3FFFFFFF
+#define FUTEX_OWNER_DIED (1 << 30)
+#define FUTEX_TID_MASK 0x3FFFFFFF
 
 // ============================================================================
 // FUTEX API
@@ -51,7 +51,7 @@ int futex_wake(uint64_t uaddr, int nr_wake);
 // Like futex_wake but uses a specific task's PML4 for key computation.
 // Use when performing futex operations on behalf of a task that may differ
 // from sched_current() (e.g. cross-CPU SIGKILL in sched_mark_task_exited).
-int futex_wake_for_task(uint64_t uaddr, int nr_wake, task_t* on_behalf_of);
+int futex_wake_for_task(uint64_t uaddr, int nr_wake, task_t *on_behalf_of);
 
 // Futex requeue: wake some waiters and move others to a different futex
 // Returns: total number of waiters processed (woken + requeued)
@@ -63,22 +63,22 @@ int futex_requeue(uint64_t uaddr, uint64_t uaddr2, int nr_wake, int nr_requeue);
 
 // Robust futex list structures (Linux ABI compatible)
 struct robust_list {
-    struct robust_list* next;
+	struct robust_list *next;
 };
 
 struct robust_list_head {
-    struct robust_list* list;
-    long futex_offset;
-    struct robust_list* list_op_pending;
+	struct robust_list *list;
+	long futex_offset;
+	struct robust_list *list_op_pending;
 };
 
 // Process robust futex list on thread exit
 // Marks owned futexes as FUTEX_OWNER_DIED and wakes waiters
-void exit_robust_list(task_t* task);
+void exit_robust_list(task_t *task);
 
 // Remove all futex waiter entries belonging to a dying task.
 // Must be called before the task is freed, to prevent stale entries
 // in the futex hash table from consuming wake slots.
-void futex_cleanup_task(task_t* task);
+void futex_cleanup_task(task_t *task);
 
 #endif // _KERNEL_FUTEX_H_

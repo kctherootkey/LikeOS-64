@@ -77,11 +77,11 @@ syscall_entry:
     mov [gs:PERCPU_SYSCALL_URSP], rsp
     ; Use per-CPU kernel stack (set by context switch on this CPU)
     mov rsp, [gs:PERCPU_SYSCALL_KRSP]
-    
+
     push qword [gs:PERCPU_SYSCALL_URSP]
     push r11
     push rcx
-    
+
     ; Save user context to PER-CPU storage for fork() and signal handling
     ; At this point: RCX = user RIP, R11 = user RFLAGS
     ; Using GS-relative addressing for SMP safety (each CPU has its own copy)
@@ -91,7 +91,7 @@ syscall_entry:
     mov rax, [gs:PERCPU_SYSCALL_URSP]
     ; Note: user RSP is already in PERCPU_SYSCALL_URSP, no need to duplicate
     pop rax                                     ; Restore syscall number
-    
+
     ; Save callee-saved registers to per-CPU storage for fork()
     mov [gs:PERCPU_SAVED_USER_RBP], rbp
     mov [gs:PERCPU_SAVED_USER_RBX], rbx
@@ -99,7 +99,7 @@ syscall_entry:
     mov [gs:PERCPU_SAVED_USER_R13], r13
     mov [gs:PERCPU_SAVED_USER_R14], r14
     mov [gs:PERCPU_SAVED_USER_R15], r15
-    
+
     push rax
     push rbx
     push rdx
@@ -113,43 +113,43 @@ syscall_entry:
     push r13
     push r14
     push r15
-    
+
     mov r9, r8
     mov r8, r10
     mov rcx, rdx
     mov rdx, rsi
     mov rsi, rdi
     mov rdi, rax
-    
+
     ; Use RBP as frame pointer to remember where our saved registers are
     ; This way we can find them even after sched_yield context switches
     mov rbp, rsp                               ; RBP = top of our saved register area
-    
+
     and rsp, ~0xF
     ; NOTE: Interrupts remain DISABLED here. syscall_handler will enable them
     ; AFTER copying per-CPU values to task-local storage (to prevent race condition
     ; where another task overwrites our per-CPU data before we read it).
     call syscall_handler
     cli                                        ; Disable interrupts for return path
-    
+
     ; Check if signal delivery modified the return context
     ; If per-CPU syscall_signal_pending is non-zero, use modified context for signal handler
     mov rdi, [gs:PERCPU_SIGNAL_PENDING]
     test rdi, rdi
     jnz .signal_return
-    
+
     ; Normal syscall return path
     ; Restore RSP from RBP (which was preserved through any context switches
     ; since it's a callee-saved register)
     mov rsp, rbp
-    
+
     ; Store return value where rax will be popped from
     ; Stack layout (from rsp):
     ;   0: r15, 8: r14, 16: r13, 24: r12, 32: r10, 40: r9, 48: r8
     ;   56: rbp, 64: rdi, 72: rsi, 80: rdx, 88: rbx, 96: rax
     ;   104: rcx, 112: r11, 120: user_rsp
     mov [rsp + 12*8], rax
-    
+
     pop r15
     pop r14
     pop r13
@@ -163,11 +163,11 @@ syscall_entry:
     pop rdx
     pop rbx
     pop rax
-    
+
     pop rcx
     pop r11
     pop rsp
-    
+
     o64 sysret
 
 .signal_return:
@@ -175,21 +175,21 @@ syscall_entry:
     ; RDI has value from per-CPU syscall_signal_pending
     ; If RDI == -1 (0xFFFFFFFFFFFFFFFF), this is sigreturn - don't set RDI to signal
     ; Otherwise, RDI is the signal number for the handler
-    
+
     ; Clear the per-CPU pending flag
     xor rax, rax
     mov [gs:PERCPU_SIGNAL_PENDING], rax
-    
+
     ; Check if this is sigreturn (RDI == -1) or signal delivery
     cmp rdi, -1
     je .sigreturn_restore
-    
+
     ; Signal handler call - RDI already has signal number
     ; Load modified context from per-CPU saved variables
     mov rcx, [gs:PERCPU_SAVED_USER_RIP]       ; Handler address -> RCX for SYSRET
     mov r11, [gs:PERCPU_SAVED_USER_RFLAGS]    ; RFLAGS -> R11 for SYSRET
     mov rsp, [gs:PERCPU_SYSCALL_URSP]         ; Signal frame on stack (stored in user_rsp)
-    
+
     ; Restore callee-saved registers (handler expects these)
     mov rbp, [gs:PERCPU_SAVED_USER_RBP]
     mov rbx, [gs:PERCPU_SAVED_USER_RBX]
@@ -197,7 +197,7 @@ syscall_entry:
     mov r13, [gs:PERCPU_SAVED_USER_R13]
     mov r14, [gs:PERCPU_SAVED_USER_R14]
     mov r15, [gs:PERCPU_SAVED_USER_R15]
-    
+
     ; Clear other registers for security (except RDI which has signal number)
     xor rax, rax
     xor rsi, rsi
@@ -205,7 +205,7 @@ syscall_entry:
     xor r8, r8
     xor r9, r9
     xor r10, r10
-    
+
     o64 sysret
 
 .sigreturn_restore:
@@ -214,7 +214,7 @@ syscall_entry:
     mov rcx, [gs:PERCPU_SAVED_USER_RIP]       ; Original RIP -> RCX for SYSRET
     mov r11, [gs:PERCPU_SAVED_USER_RFLAGS]    ; RFLAGS -> R11 for SYSRET
     mov rsp, [gs:PERCPU_SYSCALL_URSP]         ; Original user RSP
-    
+
     ; Restore callee-saved registers
     mov rbp, [gs:PERCPU_SAVED_USER_RBP]
     mov rbx, [gs:PERCPU_SAVED_USER_RBX]
@@ -222,10 +222,10 @@ syscall_entry:
     mov r13, [gs:PERCPU_SAVED_USER_R13]
     mov r14, [gs:PERCPU_SAVED_USER_R14]
     mov r15, [gs:PERCPU_SAVED_USER_R15]
-    
+
     ; Restore RAX (syscall return value, e.g., -EINTR)
     mov rax, [gs:PERCPU_SAVED_USER_RAX]
-    
+
     ; Clear other registers
     xor rdi, rdi
     xor rsi, rsi
@@ -233,7 +233,7 @@ syscall_entry:
     xor r8, r8
     xor r9, r9
     xor r10, r10
-    
+
     o64 sysret
 
 ; IRET trampoline for user mode entry
@@ -261,7 +261,7 @@ fork_child_return:
     call sched_after_fork_child
 
     pop rax        ; Get fork return value (0)
-    
+
     ; IRET frame starts at RSP (5 qwords: RIP, CS, RFLAGS, RSP, SS)
     ; User callee-saved regs are at RSP + 40 (after the 5 qwords)
     ; Order on stack: RBP, RBX, R12, R13, R14, R15 (pushed in reverse, so RBP is first)
@@ -271,7 +271,7 @@ fork_child_return:
     mov r13, [rsp + 64]
     mov r14, [rsp + 72]
     mov r15, [rsp + 80]
-    
+
     ; Clear volatile registers to prevent leaking kernel addresses to userspace.
     ; These regs are caller-saved so user code doesn't depend on their values,
     ; but leaving kernel pointers in them is an information leak.
@@ -283,7 +283,7 @@ fork_child_return:
     xor r9d, r9d
     xor r10d, r10d
     xor r11d, r11d
-    
+
     iretq          ; Return to userspace
 
 ; Context switch between tasks
@@ -295,15 +295,15 @@ ctx_switch_asm:
     push r13
     push r14
     push r15
-    
+
     mov [rdi], rsp
     mov rsp, rsi
-    
+
     pop r15
     pop r14
     pop r13
     pop r12
     pop rbx
     pop rbp
-    
+
     ret

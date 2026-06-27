@@ -8,534 +8,564 @@
 #include <kernel/hal/pci.h>
 
 // xHCI Capability Register offsets
-#define XHCI_CAP_CAPLENGTH      0x00
-#define XHCI_CAP_HCSPARAMS1     0x04
-#define XHCI_CAP_HCSPARAMS2     0x08
-#define XHCI_CAP_HCSPARAMS3     0x0C
-#define XHCI_CAP_HCCPARAMS1     0x10
-#define XHCI_CAP_DBOFF          0x14
-#define XHCI_CAP_RTSOFF         0x18
-#define XHCI_CAP_HCCPARAMS2     0x1C
+#define XHCI_CAP_CAPLENGTH 0x00
+#define XHCI_CAP_HCSPARAMS1 0x04
+#define XHCI_CAP_HCSPARAMS2 0x08
+#define XHCI_CAP_HCSPARAMS3 0x0C
+#define XHCI_CAP_HCCPARAMS1 0x10
+#define XHCI_CAP_DBOFF 0x14
+#define XHCI_CAP_RTSOFF 0x18
+#define XHCI_CAP_HCCPARAMS2 0x1C
 
 // Extended Capabilities (xHCI 7.1)
-#define XHCI_EXT_CAP_ID_MASK        0xFF
-#define XHCI_EXT_CAP_NEXT_SHIFT     8
-#define XHCI_EXT_CAP_NEXT_MASK      0xFF00
+#define XHCI_EXT_CAP_ID_MASK 0xFF
+#define XHCI_EXT_CAP_NEXT_SHIFT 8
+#define XHCI_EXT_CAP_NEXT_MASK 0xFF00
 
 // Extended Capability IDs
-#define XHCI_EXT_CAP_LEGACY         1       // USB Legacy Support
-#define XHCI_EXT_CAP_PROTOCOL       2       // Supported Protocol
-#define XHCI_EXT_CAP_POWER          3       // Extended Power Management
-#define XHCI_EXT_CAP_IOVIRT         4       // I/O Virtualization
-#define XHCI_EXT_CAP_MSG_IRQ        5       // Message Interrupt
-#define XHCI_EXT_CAP_LOCAL_MEM      6       // Local Memory
-#define XHCI_EXT_CAP_DEBUG          10      // USB Debug Capability
+#define XHCI_EXT_CAP_LEGACY 1 // USB Legacy Support
+#define XHCI_EXT_CAP_PROTOCOL 2 // Supported Protocol
+#define XHCI_EXT_CAP_POWER 3 // Extended Power Management
+#define XHCI_EXT_CAP_IOVIRT 4 // I/O Virtualization
+#define XHCI_EXT_CAP_MSG_IRQ 5 // Message Interrupt
+#define XHCI_EXT_CAP_LOCAL_MEM 6 // Local Memory
+#define XHCI_EXT_CAP_DEBUG 10 // USB Debug Capability
 
 // USB Legacy Support Capability (USBLEGSUP) - xHCI 7.1.1
-#define XHCI_USBLEGSUP_BIOS_OWNED   (1 << 16)   // HC BIOS Owned Semaphore
-#define XHCI_USBLEGSUP_OS_OWNED     (1 << 24)   // HC OS Owned Semaphore
+#define XHCI_USBLEGSUP_BIOS_OWNED (1 << 16) // HC BIOS Owned Semaphore
+#define XHCI_USBLEGSUP_OS_OWNED (1 << 24) // HC OS Owned Semaphore
 
 // USB Legacy Support Control/Status (USBLEGCTLSTS) - offset 4 from USBLEGSUP
-#define XHCI_USBLEGCTLSTS_DISABLE_SMI   0xE0000000  // Disable all SMIs
+#define XHCI_USBLEGCTLSTS_DISABLE_SMI 0xE0000000 // Disable all SMIs
 
 // HCCPARAMS1 bits
-#define XHCI_HCC_64BIT_ADDR         (1 << 0)   // 64-bit Addressing Capability
-#define XHCI_HCC_CSZ                (1 << 2)   // Context Size (0=32, 1=64)
-#define XHCI_HCC_XECP_SHIFT         16         // xHCI Extended Capabilities Pointer
-#define XHCI_HCC_XECP_MASK          0xFFFF0000
+#define XHCI_HCC_64BIT_ADDR (1 << 0) // 64-bit Addressing Capability
+#define XHCI_HCC_CSZ (1 << 2) // Context Size (0=32, 1=64)
+#define XHCI_HCC_XECP_SHIFT 16 // xHCI Extended Capabilities Pointer
+#define XHCI_HCC_XECP_MASK 0xFFFF0000
 
 // Maximum halt/reset wait times
-#define XHCI_MAX_HALT_USEC          (16 * 1000)     // 16ms
-#define XHCI_RESET_LONG_USEC        (10 * 1000 * 1000)  // 10s for reset
-#define XHCI_RESET_SHORT_USEC       (250 * 1000)    // 250ms
-#define XHCI_LEGACY_TIMEOUT_USEC    (1000 * 1000)   // 1s for BIOS handoff
+#define XHCI_MAX_HALT_USEC (16 * 1000) // 16ms
+#define XHCI_RESET_LONG_USEC (10 * 1000 * 1000) // 10s for reset
+#define XHCI_RESET_SHORT_USEC (250 * 1000) // 250ms
+#define XHCI_LEGACY_TIMEOUT_USEC (1000 * 1000) // 1s for BIOS handoff
 
 // xHCI Operational Register offsets
-#define XHCI_OP_USBCMD          0x00
-#define XHCI_OP_USBSTS          0x04
-#define XHCI_OP_PAGESIZE        0x08
-#define XHCI_OP_DNCTRL          0x14
-#define XHCI_OP_CRCR            0x18
-#define XHCI_OP_DCBAAP          0x30
-#define XHCI_OP_CONFIG          0x38
-#define XHCI_OP_PORTSC_BASE     0x400
+#define XHCI_OP_USBCMD 0x00
+#define XHCI_OP_USBSTS 0x04
+#define XHCI_OP_PAGESIZE 0x08
+#define XHCI_OP_DNCTRL 0x14
+#define XHCI_OP_CRCR 0x18
+#define XHCI_OP_DCBAAP 0x30
+#define XHCI_OP_CONFIG 0x38
+#define XHCI_OP_PORTSC_BASE 0x400
 
 // USBCMD bits
-#define XHCI_CMD_RUN            (1 << 0)
-#define XHCI_CMD_HCRST          (1 << 1)
-#define XHCI_CMD_INTE           (1 << 2)
-#define XHCI_CMD_HSEE           (1 << 3)
+#define XHCI_CMD_RUN (1 << 0)
+#define XHCI_CMD_HCRST (1 << 1)
+#define XHCI_CMD_INTE (1 << 2)
+#define XHCI_CMD_HSEE (1 << 3)
 
 // USBSTS bits
-#define XHCI_STS_HCH            (1 << 0)
-#define XHCI_STS_HSE            (1 << 2)
-#define XHCI_STS_EINT           (1 << 3)
-#define XHCI_STS_PCD            (1 << 4)
-#define XHCI_STS_CNR            (1 << 11)
+#define XHCI_STS_HCH (1 << 0)
+#define XHCI_STS_HSE (1 << 2)
+#define XHCI_STS_EINT (1 << 3)
+#define XHCI_STS_PCD (1 << 4)
+#define XHCI_STS_CNR (1 << 11)
 
 // PORTSC bits
-#define XHCI_PORTSC_CCS         (1 << 0)
-#define XHCI_PORTSC_PED         (1 << 1)
-#define XHCI_PORTSC_OCA         (1 << 3)
-#define XHCI_PORTSC_PR          (1 << 4)
-#define XHCI_PORTSC_PLS_MASK    (0xF << 5)
-#define XHCI_PORTSC_PLS_U0      (0 << 5)
-#define XHCI_PORTSC_PP          (1 << 9)
-#define XHCI_PORTSC_SPEED_MASK  (0xF << 10)
-#define XHCI_PORTSC_LWS         (1 << 16)
-#define XHCI_PORTSC_CSC         (1 << 17)
-#define XHCI_PORTSC_PEC         (1 << 18)
-#define XHCI_PORTSC_WRC         (1 << 19)
-#define XHCI_PORTSC_OCC         (1 << 20)
-#define XHCI_PORTSC_PRC         (1 << 21)
-#define XHCI_PORTSC_PLC         (1 << 22)
-#define XHCI_PORTSC_CEC         (1 << 23)
-#define XHCI_PORTSC_WPR_MASK    (XHCI_PORTSC_CSC | XHCI_PORTSC_PEC | XHCI_PORTSC_WRC | \
-                                 XHCI_PORTSC_OCC | XHCI_PORTSC_PRC | XHCI_PORTSC_PLC | XHCI_PORTSC_CEC)
+#define XHCI_PORTSC_CCS (1 << 0)
+#define XHCI_PORTSC_PED (1 << 1)
+#define XHCI_PORTSC_OCA (1 << 3)
+#define XHCI_PORTSC_PR (1 << 4)
+#define XHCI_PORTSC_PLS_MASK (0xF << 5)
+#define XHCI_PORTSC_PLS_U0 (0 << 5)
+#define XHCI_PORTSC_PP (1 << 9)
+#define XHCI_PORTSC_SPEED_MASK (0xF << 10)
+#define XHCI_PORTSC_LWS (1 << 16)
+#define XHCI_PORTSC_CSC (1 << 17)
+#define XHCI_PORTSC_PEC (1 << 18)
+#define XHCI_PORTSC_WRC (1 << 19)
+#define XHCI_PORTSC_OCC (1 << 20)
+#define XHCI_PORTSC_PRC (1 << 21)
+#define XHCI_PORTSC_PLC (1 << 22)
+#define XHCI_PORTSC_CEC (1 << 23)
+#define XHCI_PORTSC_WPR_MASK                                   \
+	(XHCI_PORTSC_CSC | XHCI_PORTSC_PEC | XHCI_PORTSC_WRC | \
+	 XHCI_PORTSC_OCC | XHCI_PORTSC_PRC | XHCI_PORTSC_PLC | \
+	 XHCI_PORTSC_CEC)
 
 // Port speeds
-#define XHCI_SPEED_FULL         1
-#define XHCI_SPEED_LOW          2
-#define XHCI_SPEED_HIGH         3
-#define XHCI_SPEED_SUPER        4
+#define XHCI_SPEED_FULL 1
+#define XHCI_SPEED_LOW 2
+#define XHCI_SPEED_HIGH 3
+#define XHCI_SPEED_SUPER 4
 
 // TRB types
-#define TRB_TYPE_NORMAL         1
-#define TRB_TYPE_SETUP          2
-#define TRB_TYPE_DATA           3
-#define TRB_TYPE_STATUS         4
-#define TRB_TYPE_ISOCH          5
-#define TRB_TYPE_LINK           6
-#define TRB_TYPE_EVENT_DATA     7
-#define TRB_TYPE_NOOP           8
-#define TRB_TYPE_ENABLE_SLOT    9
-#define TRB_TYPE_DISABLE_SLOT   10
-#define TRB_TYPE_ADDRESS_DEV    11
-#define TRB_TYPE_CONFIG_EP      12
-#define TRB_TYPE_EVAL_CTX       13
-#define TRB_TYPE_RESET_EP       14
-#define TRB_TYPE_STOP_EP        15
-#define TRB_TYPE_SET_TR_DEQ     16
-#define TRB_TYPE_RESET_DEV      17
-#define TRB_TYPE_NOOP_CMD       23
-#define TRB_TYPE_TRANSFER       32
-#define TRB_TYPE_CMD_COMPLETE   33
-#define TRB_TYPE_PORT_STATUS    34
-#define TRB_TYPE_HOST_CTRL      37
+#define TRB_TYPE_NORMAL 1
+#define TRB_TYPE_SETUP 2
+#define TRB_TYPE_DATA 3
+#define TRB_TYPE_STATUS 4
+#define TRB_TYPE_ISOCH 5
+#define TRB_TYPE_LINK 6
+#define TRB_TYPE_EVENT_DATA 7
+#define TRB_TYPE_NOOP 8
+#define TRB_TYPE_ENABLE_SLOT 9
+#define TRB_TYPE_DISABLE_SLOT 10
+#define TRB_TYPE_ADDRESS_DEV 11
+#define TRB_TYPE_CONFIG_EP 12
+#define TRB_TYPE_EVAL_CTX 13
+#define TRB_TYPE_RESET_EP 14
+#define TRB_TYPE_STOP_EP 15
+#define TRB_TYPE_SET_TR_DEQ 16
+#define TRB_TYPE_RESET_DEV 17
+#define TRB_TYPE_NOOP_CMD 23
+#define TRB_TYPE_TRANSFER 32
+#define TRB_TYPE_CMD_COMPLETE 33
+#define TRB_TYPE_PORT_STATUS 34
+#define TRB_TYPE_HOST_CTRL 37
 
 // TRB completion codes
-#define TRB_CC_INVALID          0
-#define TRB_CC_SUCCESS          1
-#define TRB_CC_DATA_BUFFER      2
-#define TRB_CC_BABBLE           3
-#define TRB_CC_USB_XACT         4
-#define TRB_CC_TRB              5
-#define TRB_CC_STALL            6
-#define TRB_CC_SHORT_PACKET     13
+#define TRB_CC_INVALID 0
+#define TRB_CC_SUCCESS 1
+#define TRB_CC_DATA_BUFFER 2
+#define TRB_CC_BABBLE 3
+#define TRB_CC_USB_XACT 4
+#define TRB_CC_TRB 5
+#define TRB_CC_STALL 6
+#define TRB_CC_SHORT_PACKET 13
 #define TRB_CC_CMD_RING_STOPPED 24
 
 // TRB flags
-#define TRB_FLAG_CYCLE          (1 << 0)
-#define TRB_FLAG_TC             (1 << 1)   // Toggle Cycle
-#define TRB_FLAG_ISP            (1 << 2)   // Interrupt on Short Packet
-#define TRB_FLAG_CHAIN          (1 << 4)   // Chain bit for multi-TRB transfers
-#define TRB_FLAG_CH             (1 << 4)   // Chain (alias)
-#define TRB_FLAG_IOC            (1 << 5)   // Interrupt on Completion
-#define TRB_FLAG_IDT            (1 << 6)   // Immediate Data
-#define TRB_FLAG_BSR            (1 << 9)   // Block Set Address Request
+#define TRB_FLAG_CYCLE (1 << 0)
+#define TRB_FLAG_TC (1 << 1) // Toggle Cycle
+#define TRB_FLAG_ISP (1 << 2) // Interrupt on Short Packet
+#define TRB_FLAG_CHAIN (1 << 4) // Chain bit for multi-TRB transfers
+#define TRB_FLAG_CH (1 << 4) // Chain (alias)
+#define TRB_FLAG_IOC (1 << 5) // Interrupt on Completion
+#define TRB_FLAG_IDT (1 << 6) // Immediate Data
+#define TRB_FLAG_BSR (1 << 9) // Block Set Address Request
 
 // 64KB boundary - TRB buffers cannot cross this boundary (xHCI spec)
-#define TRB_MAX_BUFF_SIZE       65536
+#define TRB_MAX_BUFF_SIZE 65536
 #define TRB_BUFF_LEN_UP_TO_BOUNDARY(addr) \
-    (TRB_MAX_BUFF_SIZE - ((addr) & (TRB_MAX_BUFF_SIZE - 1)))
+	(TRB_MAX_BUFF_SIZE - ((addr) & (TRB_MAX_BUFF_SIZE - 1)))
 
 // TD_SIZE field (bits 21:17 of TRB status) - packets remaining in TD
 // xHCI 1.0+: number of packets remaining, capped at 31
 // xHCI 0.96: remaining bytes >> 10, capped at 31
-#define TRB_TD_SIZE(p)          (((p) & 0x1F) << 17)
-#define TRB_LEN(len)            ((len) & 0x1FFFF)  // TRB transfer length (bits 16:0)
-#define TRB_INTR_TARGET(t)      (((t) & 0x3FF) << 22)  // Interrupter target (bits 31:22)
+#define TRB_TD_SIZE(p) (((p) & 0x1F) << 17)
+#define TRB_LEN(len) ((len) & 0x1FFFF) // TRB transfer length (bits 16:0)
+#define TRB_INTR_TARGET(t) \
+	(((t) & 0x3FF) << 22) // Interrupter target (bits 31:22)
 
 // Maximum soft retries before endpoint reset
-#define MAX_SOFT_RETRY          3
+#define MAX_SOFT_RETRY 3
 
 // Ring sizes (power of 2, last entry is link TRB)
-#define XHCI_RING_SIZE          256
-#define XHCI_TRBS_PER_SEGMENT   (XHCI_RING_SIZE - 1)  // -1 for link TRB
-#define XHCI_MAX_RING_SEGMENTS  16   // Maximum segments per ring (can expand)
-#define XHCI_MAX_SLOTS          16
-#define XHCI_MAX_ENDPOINTS      32
-#define XHCI_MAX_PORTS          32   // Support USB 2.0 and USB 3.0 ports (typical max is ~30)
+#define XHCI_RING_SIZE 256
+#define XHCI_TRBS_PER_SEGMENT (XHCI_RING_SIZE - 1) // -1 for link TRB
+#define XHCI_MAX_RING_SEGMENTS 16 // Maximum segments per ring (can expand)
+#define XHCI_MAX_SLOTS 16
+#define XHCI_MAX_ENDPOINTS 32
+#define XHCI_MAX_PORTS \
+	32 // Support USB 2.0 and USB 3.0 ports (typical max is ~30)
 
 // Scatter-gather list maximum entries
-#define XHCI_MAX_SG_ENTRIES     32
+#define XHCI_MAX_SG_ENTRIES 32
 
 // Context sizes
-#define XHCI_SLOT_CTX_SIZE      32
-#define XHCI_EP_CTX_SIZE        32
-#define XHCI_INPUT_CTX_SIZE     (33 * 32)  // Input control + slot + 31 endpoints
-#define XHCI_DEV_CTX_SIZE       (32 * 32)  // Slot + 31 endpoints
+#define XHCI_SLOT_CTX_SIZE 32
+#define XHCI_EP_CTX_SIZE 32
+#define XHCI_INPUT_CTX_SIZE (33 * 32) // Input control + slot + 31 endpoints
+#define XHCI_DEV_CTX_SIZE (32 * 32) // Slot + 31 endpoints
 
 // Endpoint types
-#define EP_TYPE_ISOCH_OUT       1
-#define EP_TYPE_BULK_OUT        2
-#define EP_TYPE_INTERRUPT_OUT   3
-#define EP_TYPE_CONTROL         4
-#define EP_TYPE_ISOCH_IN        5
-#define EP_TYPE_BULK_IN         6
-#define EP_TYPE_INTERRUPT_IN    7
+#define EP_TYPE_ISOCH_OUT 1
+#define EP_TYPE_BULK_OUT 2
+#define EP_TYPE_INTERRUPT_OUT 3
+#define EP_TYPE_CONTROL 4
+#define EP_TYPE_ISOCH_IN 5
+#define EP_TYPE_BULK_IN 6
+#define EP_TYPE_INTERRUPT_IN 7
 
 // Scatter-gather list entry
 // Describes a single physically contiguous buffer segment
 typedef struct {
-    uint64_t phys_addr;     // Physical address of buffer
-    uint32_t length;        // Length in bytes
-    uint32_t reserved;      // Padding for alignment
+	uint64_t phys_addr; // Physical address of buffer
+	uint32_t length; // Length in bytes
+	uint32_t reserved; // Padding for alignment
 } xhci_sg_entry_t;
 
 // Scatter-gather list
 // Used for transfers spanning multiple non-contiguous physical buffers
 typedef struct {
-    xhci_sg_entry_t entries[XHCI_MAX_SG_ENTRIES];
-    uint32_t num_entries;   // Number of valid entries
-    uint32_t total_len;     // Total transfer length
+	xhci_sg_entry_t entries[XHCI_MAX_SG_ENTRIES];
+	uint32_t num_entries; // Number of valid entries
+	uint32_t total_len; // Total transfer length
 } xhci_sg_list_t;
 
 // TRB structure (16 bytes, must be aligned to 16)
 typedef struct __attribute__((packed, aligned(16))) {
-    uint64_t param;
-    uint32_t status;
-    uint32_t control;
+	uint64_t param;
+	uint32_t status;
+	uint32_t control;
 } xhci_trb_t;
 
 // Ring segment for dynamic ring expansion
 // Each segment contains XHCI_RING_SIZE TRBs with last one as link TRB
 typedef struct xhci_ring_segment {
-    xhci_trb_t trbs[XHCI_RING_SIZE];        // TRBs in this segment
-    uint64_t dma;                            // Physical address of this segment
-    struct xhci_ring_segment* next;          // Next segment in ring (circular)
-    uint32_t num;                            // Segment number in ring
-    uint32_t reserved;
+	xhci_trb_t trbs[XHCI_RING_SIZE]; // TRBs in this segment
+	uint64_t dma; // Physical address of this segment
+	struct xhci_ring_segment *next; // Next segment in ring (circular)
+	uint32_t num; // Segment number in ring
+	uint32_t reserved;
 } __attribute__((aligned(4096))) xhci_ring_segment_t;
 
 // Transfer ring with link TRB (legacy fixed-size ring)
 typedef struct __attribute__((aligned(64))) {
-    xhci_trb_t trbs[XHCI_RING_SIZE];
-    uint32_t enqueue;
-    uint32_t dequeue;
-    uint8_t cycle;
-    uint8_t pad[3];
+	xhci_trb_t trbs[XHCI_RING_SIZE];
+	uint32_t enqueue;
+	uint32_t dequeue;
+	uint8_t cycle;
+	uint8_t pad[3];
 } xhci_ring_t;
 
 // Expandable transfer ring using linked segments
 typedef struct {
-    xhci_ring_segment_t* first_seg;   // First segment in ring
-    xhci_ring_segment_t* last_seg;    // Last segment (for expansion)
-    xhci_ring_segment_t* enq_seg;     // Current enqueue segment
-    xhci_ring_segment_t* deq_seg;     // Current dequeue segment
-    xhci_trb_t* enqueue;              // Current enqueue pointer
-    xhci_trb_t* dequeue;              // Current dequeue pointer
-    uint32_t num_segs;                // Number of segments
-    uint32_t num_trbs_free;           // Number of free TRBs
-    uint8_t cycle_state;              // Producer cycle state
-    uint8_t type;                     // Ring type (command/transfer/event)
-    uint8_t pad[2];
+	xhci_ring_segment_t *first_seg; // First segment in ring
+	xhci_ring_segment_t *last_seg; // Last segment (for expansion)
+	xhci_ring_segment_t *enq_seg; // Current enqueue segment
+	xhci_ring_segment_t *deq_seg; // Current dequeue segment
+	xhci_trb_t *enqueue; // Current enqueue pointer
+	xhci_trb_t *dequeue; // Current dequeue pointer
+	uint32_t num_segs; // Number of segments
+	uint32_t num_trbs_free; // Number of free TRBs
+	uint8_t cycle_state; // Producer cycle state
+	uint8_t type; // Ring type (command/transfer/event)
+	uint8_t pad[2];
 } xhci_ring_ex_t;
 
 // Event ring segment table entry
 typedef struct __attribute__((packed, aligned(64))) {
-    uint64_t base;
-    uint32_t size;
-    uint32_t reserved;
+	uint64_t base;
+	uint32_t size;
+	uint32_t reserved;
 } xhci_erst_entry_t;
 
 // Slot context
 typedef struct __attribute__((packed)) {
-    uint32_t route_speed_entries;   // Route string[19:0], Speed[23:20], Entries[31:27]
-    uint32_t latency_hub_ports;     // Max exit latency, RH port num, Num ports
-    uint32_t tt_info;               // TT info for FS/LS devices
-    uint32_t slot_state;            // Slot state, device address
-    uint32_t reserved[4];
+	uint32_t
+		route_speed_entries; // Route string[19:0], Speed[23:20], Entries[31:27]
+	uint32_t latency_hub_ports; // Max exit latency, RH port num, Num ports
+	uint32_t tt_info; // TT info for FS/LS devices
+	uint32_t slot_state; // Slot state, device address
+	uint32_t reserved[4];
 } xhci_slot_ctx_t;
 
 // Endpoint context
 typedef struct __attribute__((packed)) {
-    uint32_t ep_info1;              // EP state, mult, max streams, interval, LSA
-    uint32_t ep_info2;              // Error count, EP type, HID, Max burst, Max packet size
-    uint64_t tr_dequeue;            // TR dequeue pointer
-    uint32_t avg_trb_len;           // Average TRB length
-    uint32_t reserved[3];
+	uint32_t ep_info1; // EP state, mult, max streams, interval, LSA
+	uint32_t
+		ep_info2; // Error count, EP type, HID, Max burst, Max packet size
+	uint64_t tr_dequeue; // TR dequeue pointer
+	uint32_t avg_trb_len; // Average TRB length
+	uint32_t reserved[3];
 } xhci_ep_ctx_t;
 
 // Device context
 typedef struct __attribute__((aligned(64))) {
-    xhci_slot_ctx_t slot;
-    xhci_ep_ctx_t endpoints[31];
+	xhci_slot_ctx_t slot;
+	xhci_ep_ctx_t endpoints[31];
 } xhci_dev_ctx_t;
 
 // Input context
 typedef struct __attribute__((aligned(64))) {
-    uint32_t drop_flags;
-    uint32_t add_flags;
-    uint32_t reserved[6];
-    xhci_slot_ctx_t slot;
-    xhci_ep_ctx_t endpoints[31];
+	uint32_t drop_flags;
+	uint32_t add_flags;
+	uint32_t reserved[6];
+	xhci_slot_ctx_t slot;
+	xhci_ep_ctx_t endpoints[31];
 } xhci_input_ctx_t;
 
 // USB device structure
 typedef struct usb_device {
-    uint8_t slot_id;
-    uint8_t port;
-    uint8_t speed;
-    uint8_t address;
-    uint8_t class_code;
-    uint8_t subclass;
-    uint8_t protocol;
-    uint8_t num_configs;
-    uint16_t vendor_id;
-    uint16_t product_id;
-    uint16_t max_packet_ep0;
-    
-    // Endpoint info
-    uint8_t bulk_in_ep;        // Endpoint number (1-15)
-    uint8_t bulk_out_ep;       // Endpoint number (1-15)
-    uint16_t bulk_in_max_pkt;
-    uint16_t bulk_out_max_pkt;
-    
-    // MSD specific
-    uint8_t lun_count;
-    uint8_t configured;
-    
-    // Error tracking for retry logic
-    uint8_t err_count_in;      // Error count for bulk IN endpoint
-    uint8_t err_count_out;     // Error count for bulk OUT endpoint
-    
-    // Transfer rings for bulk endpoints
-    xhci_ring_t* ep0_ring;
-    xhci_ring_t* bulk_in_ring;
-    xhci_ring_t* bulk_out_ring;
-    
-    // Controller back-reference
-    void* controller;
+	uint8_t slot_id;
+	uint8_t port;
+	uint8_t speed;
+	uint8_t address;
+	uint8_t class_code;
+	uint8_t subclass;
+	uint8_t protocol;
+	uint8_t num_configs;
+	uint16_t vendor_id;
+	uint16_t product_id;
+	uint16_t max_packet_ep0;
+
+	// Endpoint info
+	uint8_t bulk_in_ep; // Endpoint number (1-15)
+	uint8_t bulk_out_ep; // Endpoint number (1-15)
+	uint16_t bulk_in_max_pkt;
+	uint16_t bulk_out_max_pkt;
+
+	// MSD specific
+	uint8_t lun_count;
+	uint8_t configured;
+
+	// Error tracking for retry logic
+	uint8_t err_count_in; // Error count for bulk IN endpoint
+	uint8_t err_count_out; // Error count for bulk OUT endpoint
+
+	// Transfer rings for bulk endpoints
+	xhci_ring_t *ep0_ring;
+	xhci_ring_t *bulk_in_ring;
+	xhci_ring_t *bulk_out_ring;
+
+	// Controller back-reference
+	void *controller;
 } usb_device_t;
 
 // Transfer completion structure for interrupt-driven operation
 typedef struct {
-    volatile uint8_t completed;
-    volatile uint8_t cc;           // Completion code
-    volatile uint32_t bytes_transferred;
+	volatile uint8_t completed;
+	volatile uint8_t cc; // Completion code
+	volatile uint32_t bytes_transferred;
 } xhci_transfer_t;
 
 // xHCI controller structure
 typedef struct xhci_controller {
-    // Base addresses
-    uint64_t base;                  // MMIO base (capability registers)
-    uint64_t op_base;               // Operational registers
-    uint64_t db_base;               // Doorbell registers
-    uint64_t rt_base;               // Runtime registers
-    uint64_t ext_caps_base;         // Extended capabilities base (from HCCPARAMS1)
-    
-    // Capability parameters cache
-    uint32_t hcs_params1;
-    uint32_t hcs_params2;
-    uint32_t hcs_params3;
-    uint32_t hcc_params1;
-    uint32_t hcc_params2;
-    uint16_t hci_version;
-    
-    // Controller info
-    uint8_t max_slots;
-    uint8_t max_ports;
-    uint8_t max_intrs;
-    uint8_t context_size;           // 32 or 64 bytes
-    
-    // DCBAA (Device Context Base Address Array)
-    uint64_t* dcbaa;
-    uint64_t dcbaa_phys;
-    
-    // Command ring
-    xhci_ring_t* cmd_ring;
-    uint64_t cmd_ring_phys;
-    
-    // Event ring
-    xhci_ring_t* event_ring;
-    uint64_t event_ring_phys;
-    xhci_erst_entry_t* erst;
-    uint64_t erst_phys;
-    
-    // Device contexts
-    xhci_dev_ctx_t* dev_ctx[XHCI_MAX_SLOTS];
-    xhci_input_ctx_t* input_ctx;       // For compatibility (deprecated)
-    uint8_t* input_ctx_raw;             // Raw byte access for variable context size
-    uint64_t input_ctx_phys;
-    
-    // Devices
-    usb_device_t devices[XHCI_MAX_SLOTS];
-    uint8_t num_devices;
-    
-    // Pending transfers (for interrupt handling)
-    xhci_transfer_t* pending_xfer[XHCI_MAX_SLOTS][XHCI_MAX_ENDPOINTS];
-    
-    // IRQ info
-    uint8_t irq;
-    uint8_t irq_enabled;
-    uint8_t msi_enabled;  // 1 = using MSI, 0 = legacy INTx or polled
-    
-    // State
-    uint8_t running;
-    uint8_t initialized;
-    
-    // PCI info (for quirks detection)
-    uint16_t pci_vendor;
-    uint16_t pci_device;
-    uint8_t quirk_resync;  // Enable EINT cycle resync (QEMU only)
-    
-    // Scratchpad
-    uint64_t* scratchpad_array;
-    void** scratchpad_pages;
-    uint16_t num_scratchpads;
+	// Base addresses
+	uint64_t base; // MMIO base (capability registers)
+	uint64_t op_base; // Operational registers
+	uint64_t db_base; // Doorbell registers
+	uint64_t rt_base; // Runtime registers
+	uint64_t ext_caps_base; // Extended capabilities base (from HCCPARAMS1)
 
-    // Hot-plug: bitmask of ports with pending connect/disconnect changes.
-    // Set by xhci_handle_port_event() in IRQ context, consumed by
-    // xhci_hotplug_poll() in the main loop.
-    volatile uint32_t hotplug_ports;
+	// Capability parameters cache
+	uint32_t hcs_params1;
+	uint32_t hcs_params2;
+	uint32_t hcs_params3;
+	uint32_t hcc_params1;
+	uint32_t hcc_params2;
+	uint16_t hci_version;
+
+	// Controller info
+	uint8_t max_slots;
+	uint8_t max_ports;
+	uint8_t max_intrs;
+	uint8_t context_size; // 32 or 64 bytes
+
+	// DCBAA (Device Context Base Address Array)
+	uint64_t *dcbaa;
+	uint64_t dcbaa_phys;
+
+	// Command ring
+	xhci_ring_t *cmd_ring;
+	uint64_t cmd_ring_phys;
+
+	// Event ring
+	xhci_ring_t *event_ring;
+	uint64_t event_ring_phys;
+	xhci_erst_entry_t *erst;
+	uint64_t erst_phys;
+
+	// Device contexts
+	xhci_dev_ctx_t *dev_ctx[XHCI_MAX_SLOTS];
+	xhci_input_ctx_t *input_ctx; // For compatibility (deprecated)
+	uint8_t *input_ctx_raw; // Raw byte access for variable context size
+	uint64_t input_ctx_phys;
+
+	// Devices
+	usb_device_t devices[XHCI_MAX_SLOTS];
+	uint8_t num_devices;
+
+	// Pending transfers (for interrupt handling)
+	xhci_transfer_t *pending_xfer[XHCI_MAX_SLOTS][XHCI_MAX_ENDPOINTS];
+
+	// IRQ info
+	uint8_t irq;
+	uint8_t irq_enabled;
+	uint8_t msi_enabled; // 1 = using MSI, 0 = legacy INTx or polled
+
+	// State
+	uint8_t running;
+	uint8_t initialized;
+
+	// PCI info (for quirks detection)
+	uint16_t pci_vendor;
+	uint16_t pci_device;
+	uint8_t quirk_resync; // Enable EINT cycle resync (QEMU only)
+
+	// Scratchpad
+	uint64_t *scratchpad_array;
+	void **scratchpad_pages;
+	uint16_t num_scratchpads;
+
+	// Hot-plug: bitmask of ports with pending connect/disconnect changes.
+	// Set by xhci_handle_port_event() in IRQ context, consumed by
+	// xhci_hotplug_poll() in the main loop.
+	volatile uint32_t hotplug_ports;
 } xhci_controller_t;
 
 // Global controller instances
-extern xhci_controller_t g_xhci;       // Primary (mass storage)
-extern xhci_controller_t g_xhci_hid;   // Secondary (HID devices, if present)
+extern xhci_controller_t g_xhci; // Primary (mass storage)
+extern xhci_controller_t g_xhci_hid; // Secondary (HID devices, if present)
 
 // Core functions
-int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev, uint8_t msi_vector);
-void xhci_shutdown(xhci_controller_t* ctrl);
-int xhci_reset(xhci_controller_t* ctrl);
-int xhci_start(xhci_controller_t* ctrl);
-void xhci_stop(xhci_controller_t* ctrl);
+int xhci_init(xhci_controller_t *ctrl, const pci_device_t *dev,
+	      uint8_t msi_vector);
+void xhci_shutdown(xhci_controller_t *ctrl);
+int xhci_reset(xhci_controller_t *ctrl);
+int xhci_start(xhci_controller_t *ctrl);
+void xhci_stop(xhci_controller_t *ctrl);
 
 // Interrupt handling
-void xhci_irq_service(xhci_controller_t* ctrl);
-void xhci_process_events(xhci_controller_t* ctrl);
-void xhci_process_events_locked(xhci_controller_t* ctrl);
+void xhci_irq_service(xhci_controller_t *ctrl);
+void xhci_process_events(xhci_controller_t *ctrl);
+void xhci_process_events_locked(xhci_controller_t *ctrl);
 
 // Port management
-int xhci_power_ports(xhci_controller_t* ctrl);
-int xhci_poll_ports(xhci_controller_t* ctrl);
-int xhci_port_reset(xhci_controller_t* ctrl, uint8_t port);
-uint8_t xhci_port_speed(xhci_controller_t* ctrl, uint8_t port);
+int xhci_power_ports(xhci_controller_t *ctrl);
+int xhci_poll_ports(xhci_controller_t *ctrl);
+int xhci_port_reset(xhci_controller_t *ctrl, uint8_t port);
+uint8_t xhci_port_speed(xhci_controller_t *ctrl, uint8_t port);
 
 // Hot-plug support: poll for runtime connect/disconnect events.
 // Called from the main loop.  Checks hotplug_ports bitmask set by IRQ,
 // enumerates newly connected devices, cleans up disconnected ones.
-void xhci_hotplug_poll(xhci_controller_t* ctrl);
+void xhci_hotplug_poll(xhci_controller_t *ctrl);
 
 // Device management
-int xhci_enable_slot(xhci_controller_t* ctrl);
-int xhci_disable_slot(xhci_controller_t* ctrl, uint8_t slot);
-int xhci_address_device(xhci_controller_t* ctrl, uint8_t slot, uint8_t port, uint8_t speed);
-int xhci_configure_endpoint(xhci_controller_t* ctrl, uint8_t slot, uint8_t ep_num,
-                            uint8_t ep_type, uint16_t max_packet, uint8_t interval);
-int xhci_enumerate_device(xhci_controller_t* ctrl, uint8_t port);
+int xhci_enable_slot(xhci_controller_t *ctrl);
+int xhci_disable_slot(xhci_controller_t *ctrl, uint8_t slot);
+int xhci_address_device(xhci_controller_t *ctrl, uint8_t slot, uint8_t port,
+			uint8_t speed);
+int xhci_configure_endpoint(xhci_controller_t *ctrl, uint8_t slot,
+			    uint8_t ep_num, uint8_t ep_type,
+			    uint16_t max_packet, uint8_t interval);
+int xhci_enumerate_device(xhci_controller_t *ctrl, uint8_t port);
 
 // Control transfers
-int xhci_control_transfer(xhci_controller_t* ctrl, usb_device_t* dev,
-                         uint8_t bmRequestType, uint8_t bRequest,
-                         uint16_t wValue, uint16_t wIndex, uint16_t wLength,
-                         void* data);
+int xhci_control_transfer(xhci_controller_t *ctrl, usb_device_t *dev,
+			  uint8_t bmRequestType, uint8_t bRequest,
+			  uint16_t wValue, uint16_t wIndex, uint16_t wLength,
+			  void *data);
 
 // Bulk transfers
-int xhci_bulk_transfer_in(xhci_controller_t* ctrl, usb_device_t* dev,
-                          void* buf, uint32_t len, uint32_t* transferred);
-int xhci_bulk_transfer_out(xhci_controller_t* ctrl, usb_device_t* dev,
-                           const void* buf, uint32_t len, uint32_t* transferred);
+int xhci_bulk_transfer_in(xhci_controller_t *ctrl, usb_device_t *dev, void *buf,
+			  uint32_t len, uint32_t *transferred);
+int xhci_bulk_transfer_out(xhci_controller_t *ctrl, usb_device_t *dev,
+			   const void *buf, uint32_t len,
+			   uint32_t *transferred);
 
 // Scatter-gather bulk transfers
-int xhci_bulk_transfer_in_sg(xhci_controller_t* ctrl, usb_device_t* dev,
-                             xhci_sg_list_t* sg_list, uint32_t* transferred);
-int xhci_bulk_transfer_out_sg(xhci_controller_t* ctrl, usb_device_t* dev,
-                              xhci_sg_list_t* sg_list, uint32_t* transferred);
+int xhci_bulk_transfer_in_sg(xhci_controller_t *ctrl, usb_device_t *dev,
+			     xhci_sg_list_t *sg_list, uint32_t *transferred);
+int xhci_bulk_transfer_out_sg(xhci_controller_t *ctrl, usb_device_t *dev,
+			      xhci_sg_list_t *sg_list, uint32_t *transferred);
 
 // Scatter-gather list helpers
-void xhci_sg_init(xhci_sg_list_t* sg);
-int xhci_sg_add(xhci_sg_list_t* sg, uint64_t phys_addr, uint32_t length);
-uint32_t xhci_sg_count_trbs(xhci_sg_list_t* sg);
+void xhci_sg_init(xhci_sg_list_t *sg);
+int xhci_sg_add(xhci_sg_list_t *sg, uint64_t phys_addr, uint32_t length);
+uint32_t xhci_sg_count_trbs(xhci_sg_list_t *sg);
 
 // Endpoint reset (for error recovery)
-int xhci_reset_endpoint(xhci_controller_t* ctrl, uint8_t slot, uint8_t dci);
+int xhci_reset_endpoint(xhci_controller_t *ctrl, uint8_t slot, uint8_t dci);
 
 /* Clear ctrl->pending_xfer[slot-1][dci] under lock.  Used by the
  * task-exit lock-recovery path: a task that died inside
  * xhci_bulk_transfer_in/out leaves a pointer to its (about-to-be-freed)
  * kernel stack in pending_xfer; the next transfer-completion IRQ would
  * write through that dangling pointer and oops. */
-void xhci_clear_pending_xfer(xhci_controller_t* ctrl, uint8_t slot, uint8_t dci);
+void xhci_clear_pending_xfer(xhci_controller_t *ctrl, uint8_t slot,
+			     uint8_t dci);
 
 // Extended capability and BIOS handoff
-uint32_t xhci_find_ext_cap(xhci_controller_t* ctrl, uint32_t cap_id, uint32_t start_offset);
-int xhci_bios_handoff(xhci_controller_t* ctrl);
-int xhci_halt(xhci_controller_t* ctrl);
-void xhci_quiesce(xhci_controller_t* ctrl);
+uint32_t xhci_find_ext_cap(xhci_controller_t *ctrl, uint32_t cap_id,
+			   uint32_t start_offset);
+int xhci_bios_handoff(xhci_controller_t *ctrl);
+int xhci_halt(xhci_controller_t *ctrl);
+void xhci_quiesce(xhci_controller_t *ctrl);
 
 // Ring management
-xhci_ring_t* xhci_alloc_ring(void);
-void xhci_free_ring(xhci_ring_t* ring);
-void xhci_ring_init(xhci_ring_t* ring, uint64_t phys);
-int xhci_ring_enqueue(xhci_ring_t* ring, uint64_t param, uint32_t status, uint32_t control);
-void xhci_ring_doorbell(xhci_controller_t* ctrl, uint8_t slot, uint8_t ep);
+xhci_ring_t *xhci_alloc_ring(void);
+void xhci_free_ring(xhci_ring_t *ring);
+void xhci_ring_init(xhci_ring_t *ring, uint64_t phys);
+int xhci_ring_enqueue(xhci_ring_t *ring, uint64_t param, uint32_t status,
+		      uint32_t control);
+void xhci_ring_doorbell(xhci_controller_t *ctrl, uint8_t slot, uint8_t ep);
 
 // Expandable ring management (dynamic ring expansion support)
-xhci_ring_segment_t* xhci_segment_alloc(void);
-void xhci_segment_free(xhci_ring_segment_t* seg);
-xhci_ring_ex_t* xhci_ring_ex_alloc(uint32_t num_segs);
-void xhci_ring_ex_free(xhci_ring_ex_t* ring);
-int xhci_ring_expansion(xhci_ring_ex_t* ring, uint32_t num_new_segs);
-uint32_t xhci_ring_ex_num_trbs_free(xhci_ring_ex_t* ring);
-int xhci_ring_ex_enqueue(xhci_ring_ex_t* ring, uint64_t param, uint32_t status, uint32_t control);
+xhci_ring_segment_t *xhci_segment_alloc(void);
+void xhci_segment_free(xhci_ring_segment_t *seg);
+xhci_ring_ex_t *xhci_ring_ex_alloc(uint32_t num_segs);
+void xhci_ring_ex_free(xhci_ring_ex_t *ring);
+int xhci_ring_expansion(xhci_ring_ex_t *ring, uint32_t num_new_segs);
+uint32_t xhci_ring_ex_num_trbs_free(xhci_ring_ex_t *ring);
+int xhci_ring_ex_enqueue(xhci_ring_ex_t *ring, uint64_t param, uint32_t status,
+			 uint32_t control);
 
 // Command ring operations
-int xhci_send_command(xhci_controller_t* ctrl, uint64_t param, uint32_t status, uint32_t control);
-int xhci_wait_command(xhci_controller_t* ctrl, uint32_t timeout_ms);
+int xhci_send_command(xhci_controller_t *ctrl, uint64_t param, uint32_t status,
+		      uint32_t control);
+int xhci_wait_command(xhci_controller_t *ctrl, uint32_t timeout_ms);
 
 // Memory helpers
-static inline uint32_t xhci_cap_read32(xhci_controller_t* ctrl, uint32_t off) {
-    return *(volatile uint32_t*)(ctrl->base + off);
+static inline uint32_t xhci_cap_read32(xhci_controller_t *ctrl, uint32_t off)
+{
+	return *(volatile uint32_t *)(ctrl->base + off);
 }
 
-static inline uint32_t xhci_op_read32(xhci_controller_t* ctrl, uint32_t off) {
-    return *(volatile uint32_t*)(ctrl->op_base + off);
+static inline uint32_t xhci_op_read32(xhci_controller_t *ctrl, uint32_t off)
+{
+	return *(volatile uint32_t *)(ctrl->op_base + off);
 }
 
-static inline void xhci_op_write32(xhci_controller_t* ctrl, uint32_t off, uint32_t val) {
-    *(volatile uint32_t*)(ctrl->op_base + off) = val;
+static inline void xhci_op_write32(xhci_controller_t *ctrl, uint32_t off,
+				   uint32_t val)
+{
+	*(volatile uint32_t *)(ctrl->op_base + off) = val;
 }
 
-static inline uint64_t xhci_op_read64(xhci_controller_t* ctrl, uint32_t off) {
-    // Read as two 32-bit values for better compatibility
-    uint32_t lo = *(volatile uint32_t*)(ctrl->op_base + off);
-    uint32_t hi = *(volatile uint32_t*)(ctrl->op_base + off + 4);
-    return ((uint64_t)hi << 32) | lo;
+static inline uint64_t xhci_op_read64(xhci_controller_t *ctrl, uint32_t off)
+{
+	// Read as two 32-bit values for better compatibility
+	uint32_t lo = *(volatile uint32_t *)(ctrl->op_base + off);
+	uint32_t hi = *(volatile uint32_t *)(ctrl->op_base + off + 4);
+	return ((uint64_t)hi << 32) | lo;
 }
 
-static inline void xhci_op_write64(xhci_controller_t* ctrl, uint32_t off, uint64_t val) {
-    // Write as two 32-bit values for better compatibility
-    // Low DWORD first, then high DWORD
-    *(volatile uint32_t*)(ctrl->op_base + off) = (uint32_t)(val & 0xFFFFFFFF);
-    *(volatile uint32_t*)(ctrl->op_base + off + 4) = (uint32_t)(val >> 32);
+static inline void xhci_op_write64(xhci_controller_t *ctrl, uint32_t off,
+				   uint64_t val)
+{
+	// Write as two 32-bit values for better compatibility
+	// Low DWORD first, then high DWORD
+	*(volatile uint32_t *)(ctrl->op_base + off) =
+		(uint32_t)(val & 0xFFFFFFFF);
+	*(volatile uint32_t *)(ctrl->op_base + off + 4) = (uint32_t)(val >> 32);
 }
 
-static inline uint32_t xhci_rt_read32(xhci_controller_t* ctrl, uint32_t off) {
-    return *(volatile uint32_t*)(ctrl->rt_base + off);
+static inline uint32_t xhci_rt_read32(xhci_controller_t *ctrl, uint32_t off)
+{
+	return *(volatile uint32_t *)(ctrl->rt_base + off);
 }
 
-static inline void xhci_rt_write32(xhci_controller_t* ctrl, uint32_t off, uint32_t val) {
-    *(volatile uint32_t*)(ctrl->rt_base + off) = val;
+static inline void xhci_rt_write32(xhci_controller_t *ctrl, uint32_t off,
+				   uint32_t val)
+{
+	*(volatile uint32_t *)(ctrl->rt_base + off) = val;
 }
 
-static inline void xhci_rt_write64(xhci_controller_t* ctrl, uint32_t off, uint64_t val) {
-    *(volatile uint64_t*)(ctrl->rt_base + off) = val;
+static inline void xhci_rt_write64(xhci_controller_t *ctrl, uint32_t off,
+				   uint64_t val)
+{
+	*(volatile uint64_t *)(ctrl->rt_base + off) = val;
 }
 
-static inline void xhci_db_write32(xhci_controller_t* ctrl, uint8_t slot, uint32_t val) {
-    *(volatile uint32_t*)(ctrl->db_base + slot * 4) = val;
+static inline void xhci_db_write32(xhci_controller_t *ctrl, uint8_t slot,
+				   uint32_t val)
+{
+	*(volatile uint32_t *)(ctrl->db_base + slot * 4) = val;
 }
 
 #endif // LIKEOS_XHCI_H

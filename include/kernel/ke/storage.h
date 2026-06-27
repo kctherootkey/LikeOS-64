@@ -8,18 +8,18 @@
 #include <kernel/dev/block/block.h>
 
 typedef struct {
-    int signature_found;
-    unsigned int tested_mask;
-    fat32_fs_t fs_instances[BLOCK_MAX_DEVICES];
-    unsigned char ready_reads[BLOCK_MAX_DEVICES];
-    unsigned long ready_polls[BLOCK_MAX_DEVICES];
-    int os_ready;
+	int signature_found;
+	unsigned int tested_mask;
+	fat32_fs_t fs_instances[BLOCK_MAX_DEVICES];
+	unsigned char ready_reads[BLOCK_MAX_DEVICES];
+	unsigned long ready_polls[BLOCK_MAX_DEVICES];
+	int os_ready;
 } storage_fs_state_t;
 
-void storage_fs_init(storage_fs_state_t* state);
-void storage_fs_set_ready(storage_fs_state_t* state);
+void storage_fs_init(storage_fs_state_t *state);
+void storage_fs_set_ready(storage_fs_state_t *state);
 
 // Attempt mounts and signature checks; call periodically after XHCI init
-void storage_fs_poll(storage_fs_state_t* state);
+void storage_fs_poll(storage_fs_state_t *state);
 
 #endif // _KERNEL_STORAGE_H_

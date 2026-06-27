@@ -140,10 +140,10 @@ isr_common_stub:
     pop rcx
     pop rbx
     pop rax
-    
+
     ; Clean up error code and interrupt number
     add rsp, 16
-    
+
     ; Return from interrupt
     ; NOTE: iretq restores RFLAGS (including IF) from the stack frame,
     ; so interrupts are automatically re-enabled when returning to code
@@ -242,10 +242,10 @@ irq_common_stub:
     pop rcx
     pop rbx
     pop rax
-    
+
     ; Clean up error code and interrupt number
     add rsp, 16
-    
+
     ; Return from interrupt (interrupts automatically re-enabled)
     iretq
 

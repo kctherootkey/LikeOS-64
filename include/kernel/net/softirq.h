@@ -23,10 +23,10 @@
 
 // Softirq vector numbers (must stay <= 31; we use a uint32_t bitmask).
 enum {
-    SOFTIRQ_NET_RX = 0,    // process per-CPU RX skb queue
-    SOFTIRQ_NET_TX = 1,    // future use
-    SOFTIRQ_TIMER  = 2,    // future use
-    NR_SOFTIRQ     = 32
+	SOFTIRQ_NET_RX = 0, // process per-CPU RX skb queue
+	SOFTIRQ_NET_TX = 1, // future use
+	SOFTIRQ_TIMER = 2, // future use
+	NR_SOFTIRQ = 32
 };
 
 typedef void (*softirq_fn_t)(void);

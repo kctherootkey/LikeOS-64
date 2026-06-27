@@ -14,7 +14,7 @@
 #include <kernel/uapi/bug.h>
 
 // Global mouse state
-static mouse_state_t mouse_state = {0};
+static mouse_state_t mouse_state = { 0 };
 
 // Flag indicating whether to use loaded cursor or built-in
 static int use_loaded_cursor = 0;
@@ -32,926 +32,1031 @@ static void mouse_update_cursor_internal(void);
 
 static inline int clampi(int v, int lo, int hi)
 {
-    if(v < lo) {
-        return lo;
-    }
-    if(v > hi) {
-        return hi;
-    }
-    return v;
+	if (v < lo) {
+		return lo;
+	}
+	if (v > hi) {
+		return hi;
+	}
+	return v;
 }
 
 // Mouse cursor bitmap (11x19 Windows-style arrow cursor)
 static const uint32_t cursor_bitmap[CURSOR_HEIGHT][CURSOR_WIDTH] = {
-    // Classic Windows cursor: white arrow with black outline
-    {0xFF000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000},
-    {0xFF000000, 0xFF000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000},
-    {0xFF000000, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000},
-    {0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000},
-    {0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000},
-    {0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000},
-    {0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000},
-    {0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000, 0x00000000},
-    {0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000},
-    {0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000},
-    {0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000},
-    {0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0xFF000000, 0xFF000000, 0xFF000000, 0xFF000000, 0xFF000000},
-    {0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000},
-    {0xFF000000, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000, 0x00000000},
-    {0xFF000000, 0xFF000000, 0x00000000, 0x00000000, 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000, 0x00000000},
-    {0xFF000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000},
-    {0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000},
-    {0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xFF000000, 0xFF000000, 0x00000000, 0x00000000, 0x00000000},
-    {0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000}
+	// Classic Windows cursor: white arrow with black outline
+	{ 0xFF000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	  0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	  0x00000000 },
+	{ 0xFF000000, 0xFF000000, 0x00000000, 0x00000000, 0x00000000,
+	  0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	  0x00000000 },
+	{ 0xFF000000, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000,
+	  0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	  0x00000000 },
+	{ 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000,
+	  0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	  0x00000000 },
+	{ 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000,
+	  0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	  0x00000000 },
+	{ 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+	  0xFF000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	  0x00000000 },
+	{ 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+	  0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000, 0x00000000,
+	  0x00000000 },
+	{ 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+	  0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000,
+	  0x00000000 },
+	{ 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+	  0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000,
+	  0x00000000 },
+	{ 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+	  0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000,
+	  0x00000000 },
+	{ 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+	  0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+	  0xFF000000 },
+	{ 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+	  0xFF000000, 0xFF000000, 0xFF000000, 0xFF000000, 0xFF000000,
+	  0xFF000000 },
+	{ 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0xFFFFFFFF,
+	  0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000, 0x00000000,
+	  0x00000000 },
+	{ 0xFF000000, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0xFF000000,
+	  0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000,
+	  0x00000000 },
+	{ 0xFF000000, 0xFF000000, 0x00000000, 0x00000000, 0xFF000000,
+	  0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000, 0x00000000,
+	  0x00000000 },
+	{ 0xFF000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	  0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000,
+	  0x00000000 },
+	{ 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	  0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0x00000000,
+	  0x00000000 },
+	{ 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	  0x00000000, 0xFF000000, 0xFF000000, 0x00000000, 0x00000000,
+	  0x00000000 },
+	{ 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	  0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+	  0x00000000 }
 };
 
 // Cursor background buffer for restoration
-static uint32_t* cursor_background = NULL;
+static uint32_t *cursor_background = NULL;
 
 // Alpha blend foreground (ARGB) over background (xRGB), returns blended xRGB
-static inline uint32_t alpha_blend(uint32_t fg, uint32_t bg) {
-    uint32_t alpha = (fg >> 24) & 0xFF;
-    if (alpha == 0) {
-        return bg;  // Fully transparent
-    }
-    if (alpha == 255) {
-        return fg | 0xFF000000;  // Fully opaque
-    }
-    // Extract components
-    uint32_t fg_r = (fg >> 16) & 0xFF;
-    uint32_t fg_g = (fg >> 8) & 0xFF;
-    uint32_t fg_b = fg & 0xFF;
-    uint32_t bg_r = (bg >> 16) & 0xFF;
-    uint32_t bg_g = (bg >> 8) & 0xFF;
-    uint32_t bg_b = bg & 0xFF;
-    // Blend: out = fg * alpha + bg * (255 - alpha)
-    uint32_t inv_alpha = 255 - alpha;
-    uint32_t out_r = (fg_r * alpha + bg_r * inv_alpha) / 255;
-    uint32_t out_g = (fg_g * alpha + bg_g * inv_alpha) / 255;
-    uint32_t out_b = (fg_b * alpha + bg_b * inv_alpha) / 255;
-    return 0xFF000000 | (out_r << 16) | (out_g << 8) | out_b;
+static inline uint32_t alpha_blend(uint32_t fg, uint32_t bg)
+{
+	uint32_t alpha = (fg >> 24) & 0xFF;
+	if (alpha == 0) {
+		return bg; // Fully transparent
+	}
+	if (alpha == 255) {
+		return fg | 0xFF000000; // Fully opaque
+	}
+	// Extract components
+	uint32_t fg_r = (fg >> 16) & 0xFF;
+	uint32_t fg_g = (fg >> 8) & 0xFF;
+	uint32_t fg_b = fg & 0xFF;
+	uint32_t bg_r = (bg >> 16) & 0xFF;
+	uint32_t bg_g = (bg >> 8) & 0xFF;
+	uint32_t bg_b = bg & 0xFF;
+	// Blend: out = fg * alpha + bg * (255 - alpha)
+	uint32_t inv_alpha = 255 - alpha;
+	uint32_t out_r = (fg_r * alpha + bg_r * inv_alpha) / 255;
+	uint32_t out_g = (fg_g * alpha + bg_g * inv_alpha) / 255;
+	uint32_t out_b = (fg_b * alpha + bg_b * inv_alpha) / 255;
+	return 0xFF000000 | (out_r << 16) | (out_g << 8) | out_b;
 }
 
 // Helper to get cursor pixel at position (from loaded cursor or built-in)
-static inline uint32_t get_cursor_pixel(int cx, int cy) {
-    if (use_loaded_cursor && cursor_is_loaded()) {
-        return cursor_get_pixel((uint32_t)cx, (uint32_t)cy);
-    }
-    // Built-in cursor
-    if (cx >= 0 && cx < CURSOR_WIDTH && cy >= 0 && cy < CURSOR_HEIGHT) {
-        return cursor_bitmap[cy][cx];
-    }
-    return 0;
+static inline uint32_t get_cursor_pixel(int cx, int cy)
+{
+	if (use_loaded_cursor && cursor_is_loaded()) {
+		return cursor_get_pixel((uint32_t)cx, (uint32_t)cy);
+	}
+	// Built-in cursor
+	if (cx >= 0 && cx < CURSOR_WIDTH && cy >= 0 && cy < CURSOR_HEIGHT) {
+		return cursor_bitmap[cy][cx];
+	}
+	return 0;
 }
 
 // Wait for PS/2 controller input buffer to be ready
 static void mouse_wait_input(void)
 {
-    int timeout = 100000;
-    while((inb(PS2_STATUS_PORT) & PS2_STATUS_INPUT_FULL) && timeout-- > 0) {
-        // Wait for input buffer to be empty
-    }
+	int timeout = 100000;
+	while ((inb(PS2_STATUS_PORT) & PS2_STATUS_INPUT_FULL) &&
+	       timeout-- > 0) {
+		// Wait for input buffer to be empty
+	}
 }
 
 // Wait for PS/2 controller output buffer to have data
 static void mouse_wait_output(void)
 {
-    int timeout = 100000;
-    while(!(inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) && timeout-- > 0) {
-        // Wait for output buffer to have data
-    }
+	int timeout = 100000;
+	while (!(inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) &&
+	       timeout-- > 0) {
+		// Wait for output buffer to have data
+	}
 }
 
 // Read data from PS/2 controller
 static uint8_t mouse_read_data(void)
 {
-    mouse_wait_output();
-    return inb(PS2_DATA_PORT);
+	mouse_wait_output();
+	return inb(PS2_DATA_PORT);
 }
 
 // Flush any pending bytes from controller output (bounded)
 static void mouse_flush_output(void)
 {
-    for(int i=0;i<32;i++) {
-        if(inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) {
-            (void)inb(PS2_DATA_PORT);
-        } else {
-            break;
-        }
-    }
+	for (int i = 0; i < 32; i++) {
+		if (inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) {
+			(void)inb(PS2_DATA_PORT);
+		} else {
+			break;
+		}
+	}
 }
 
 static uint8_t mouse_read_controller_config(void)
 {
-    mouse_wait_input();
-    outb(PS2_COMMAND_PORT, PS2_CMD_READ_CONFIG);
-    return mouse_read_data();
+	mouse_wait_input();
+	outb(PS2_COMMAND_PORT, PS2_CMD_READ_CONFIG);
+	return mouse_read_data();
 }
 
 static void mouse_write_controller_config(uint8_t config)
 {
-    mouse_wait_input();
-    outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_CONFIG);
-    mouse_wait_input();
-    outb(PS2_DATA_PORT, config);
+	mouse_wait_input();
+	outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_CONFIG);
+	mouse_wait_input();
+	outb(PS2_DATA_PORT, config);
 }
 
 // Write command to mouse via PS/2 controller
 static void mouse_write_command(uint8_t cmd, uint8_t data)
 {
-    mouse_wait_input();
-    outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_PORT2);
+	mouse_wait_input();
+	outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_PORT2);
 
-    mouse_wait_input();
-    outb(PS2_DATA_PORT, cmd);
+	mouse_wait_input();
+	outb(PS2_DATA_PORT, cmd);
 
-    if(data != 0xFF) { // 0xFF means no data byte
-        // Consume ACK for the command byte before sending data.
-        // Without this, the ACK stays in the output buffer and
-        // desynchronises subsequent reads (especially with IRQ12
-        // masked during init, where nothing else drains it).
-        mouse_wait_output();
-        (void)inb(PS2_DATA_PORT);
+	if (data != 0xFF) { // 0xFF means no data byte
+		// Consume ACK for the command byte before sending data.
+		// Without this, the ACK stays in the output buffer and
+		// desynchronises subsequent reads (especially with IRQ12
+		// masked during init, where nothing else drains it).
+		mouse_wait_output();
+		(void)inb(PS2_DATA_PORT);
 
-        mouse_wait_input();
-        outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_PORT2);
+		mouse_wait_input();
+		outb(PS2_COMMAND_PORT, PS2_CMD_WRITE_PORT2);
 
-        mouse_wait_input();
-        outb(PS2_DATA_PORT, data);
-    }
+		mouse_wait_input();
+		outb(PS2_DATA_PORT, data);
+	}
 }
 
 // Detect mouse type and capabilities
 static uint8_t mouse_detect_type(void)
 {
-    uint8_t response;
+	uint8_t response;
 
-    kprintf("  Attempting mouse reset...\n");
-    // Reset mouse
-    mouse_write_command(MOUSE_CMD_RESET, 0xFF);
-    response = mouse_read_data(); // Should be ACK
-    kprintf("  Reset ACK: 0x%02X\n", response);
-    response = mouse_read_data(); // Should be 0xAA (self-test passed)
-    kprintf("  Self-test: 0x%02X\n", response);
-    response = mouse_read_data(); // Should be 0x00 (device ID)
-    kprintf("  Device ID: 0x%02X\n", response);
+	kprintf("  Attempting mouse reset...\n");
+	// Reset mouse
+	mouse_write_command(MOUSE_CMD_RESET, 0xFF);
+	response = mouse_read_data(); // Should be ACK
+	kprintf("  Reset ACK: 0x%02X\n", response);
+	response = mouse_read_data(); // Should be 0xAA (self-test passed)
+	kprintf("  Self-test: 0x%02X\n", response);
+	response = mouse_read_data(); // Should be 0x00 (device ID)
+	kprintf("  Device ID: 0x%02X\n", response);
 
-    if(response != 0x00) {
-        kprintf("  Mouse reset failed or not standard mouse\n");
-        return MOUSE_TYPE_STANDARD;
-    }
+	if (response != 0x00) {
+		kprintf("  Mouse reset failed or not standard mouse\n");
+		return MOUSE_TYPE_STANDARD;
+	}
 
-    kprintf("  Attempting IntelliMouse detection sequence...\n");
-    // Try to enable scroll wheel (IntelliMouse protocol)
-    mouse_write_command(MOUSE_CMD_SET_SAMPLE_RATE, 200);
-    response = mouse_read_data(); // ACK
-    kprintf("  Sample rate 200 ACK: 0x%02X\n", response);
+	kprintf("  Attempting IntelliMouse detection sequence...\n");
+	// Try to enable scroll wheel (IntelliMouse protocol)
+	mouse_write_command(MOUSE_CMD_SET_SAMPLE_RATE, 200);
+	response = mouse_read_data(); // ACK
+	kprintf("  Sample rate 200 ACK: 0x%02X\n", response);
 
-    mouse_write_command(MOUSE_CMD_SET_SAMPLE_RATE, 100);
-    response = mouse_read_data(); // ACK
-    kprintf("  Sample rate 100 ACK: 0x%02X\n", response);
+	mouse_write_command(MOUSE_CMD_SET_SAMPLE_RATE, 100);
+	response = mouse_read_data(); // ACK
+	kprintf("  Sample rate 100 ACK: 0x%02X\n", response);
 
-    mouse_write_command(MOUSE_CMD_SET_SAMPLE_RATE, 80);
-    response = mouse_read_data(); // ACK
-    kprintf("  Sample rate 80 ACK: 0x%02X\n", response);
+	mouse_write_command(MOUSE_CMD_SET_SAMPLE_RATE, 80);
+	response = mouse_read_data(); // ACK
+	kprintf("  Sample rate 80 ACK: 0x%02X\n", response);
 
-    // Get device ID after the sequence
-    kprintf("  Getting device ID after sequence...\n");
-    mouse_write_command(MOUSE_CMD_GET_DEVICE_ID, 0xFF);
-    response = mouse_read_data(); // ACK
-    kprintf("  Get ID ACK: 0x%02X\n", response);
-    response = mouse_read_data(); // Device ID
-    kprintf("  New Device ID: 0x%02X\n", response);
+	// Get device ID after the sequence
+	kprintf("  Getting device ID after sequence...\n");
+	mouse_write_command(MOUSE_CMD_GET_DEVICE_ID, 0xFF);
+	response = mouse_read_data(); // ACK
+	kprintf("  Get ID ACK: 0x%02X\n", response);
+	response = mouse_read_data(); // Device ID
+	kprintf("  New Device ID: 0x%02X\n", response);
 
-    if(response == MOUSE_TYPE_INTELLIMOUSE) {
-        kprintf("  IntelliMouse detected (scroll wheel supported)\n");
-        mouse_state.has_scroll_wheel = 1;
-        mouse_state.packet_size = 4;
-        return MOUSE_TYPE_INTELLIMOUSE;
-    } else {
-        // Standard 3-byte mouse - don't force IntelliMouse mode
-        // VirtualBox and some other emulators don't support 4-byte packets
-        kprintf("  Standard mouse detected (3-byte mode)\n");
-        mouse_state.has_scroll_wheel = 0;
-        mouse_state.packet_size = 3;
-        return MOUSE_TYPE_STANDARD;
-    }
+	if (response == MOUSE_TYPE_INTELLIMOUSE) {
+		kprintf("  IntelliMouse detected (scroll wheel supported)\n");
+		mouse_state.has_scroll_wheel = 1;
+		mouse_state.packet_size = 4;
+		return MOUSE_TYPE_INTELLIMOUSE;
+	} else {
+		// Standard 3-byte mouse - don't force IntelliMouse mode
+		// VirtualBox and some other emulators don't support 4-byte packets
+		kprintf("  Standard mouse detected (3-byte mode)\n");
+		mouse_state.has_scroll_wheel = 0;
+		mouse_state.packet_size = 3;
+		return MOUSE_TYPE_STANDARD;
+	}
 }
 
 // Draw cursor at specified position
 static void mouse_draw_cursor_full(int x, int y)
 {
-    if(!mouse_state.cursor_visible) {
-        return;
-    }
-    if(!cursor_background) {
-        return;
-    }
-    int cw = mouse_state.cursor_w;
-    int ch = mouse_state.cursor_h;
-    if(x >= mouse_state.screen_width || y >= mouse_state.screen_height || x + cw - 1 < 0 || y + ch - 1 < 0) {
-        return;
-    }
-    for(int cy = 0; cy < ch; cy++) {
-        for(int cx = 0; cx < cw; cx++) {
-            int bg_index = cy * cw + cx;
-            if(bg_index < 0 || bg_index >= cw * ch) {
-                continue;
-            }
-            int screen_x = x + cx;
-            int screen_y = y + cy;
-            if(screen_x < 0 || screen_y < 0 || screen_x >= mouse_state.screen_width || screen_y >= mouse_state.screen_height) {
-                continue;
-            }
-            cursor_background[bg_index] = fb_get_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y);
-            uint32_t pix = get_cursor_pixel(cx, cy);
-            // Alpha blend cursor pixel with background for smooth anti-aliased edges
-            uint8_t alpha = (pix >> 24) & 0xFF;
-            if(alpha > 0) {
-                uint32_t blended = alpha_blend(pix, cursor_background[bg_index]);
-                fb_set_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y, blended);
-            }
-        }
-    }
-    int x1 = clampi(x, 0, mouse_state.screen_width - 1);
-    int y1 = clampi(y, 0, mouse_state.screen_height - 1);
-    int x2 = clampi(x + cw - 1, 0, mouse_state.screen_width - 1);
-    int y2 = clampi(y + ch - 1, 0, mouse_state.screen_height - 1);
-    fb_mark_dirty_unlocked((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
+	if (!mouse_state.cursor_visible) {
+		return;
+	}
+	if (!cursor_background) {
+		return;
+	}
+	int cw = mouse_state.cursor_w;
+	int ch = mouse_state.cursor_h;
+	if (x >= mouse_state.screen_width || y >= mouse_state.screen_height ||
+	    x + cw - 1 < 0 || y + ch - 1 < 0) {
+		return;
+	}
+	for (int cy = 0; cy < ch; cy++) {
+		for (int cx = 0; cx < cw; cx++) {
+			int bg_index = cy * cw + cx;
+			if (bg_index < 0 || bg_index >= cw * ch) {
+				continue;
+			}
+			int screen_x = x + cx;
+			int screen_y = y + cy;
+			if (screen_x < 0 || screen_y < 0 ||
+			    screen_x >= mouse_state.screen_width ||
+			    screen_y >= mouse_state.screen_height) {
+				continue;
+			}
+			cursor_background[bg_index] = fb_get_pixel_unlocked(
+				(uint32_t)screen_x, (uint32_t)screen_y);
+			uint32_t pix = get_cursor_pixel(cx, cy);
+			// Alpha blend cursor pixel with background for smooth anti-aliased edges
+			uint8_t alpha = (pix >> 24) & 0xFF;
+			if (alpha > 0) {
+				uint32_t blended = alpha_blend(
+					pix, cursor_background[bg_index]);
+				fb_set_pixel_unlocked((uint32_t)screen_x,
+						      (uint32_t)screen_y,
+						      blended);
+			}
+		}
+	}
+	int x1 = clampi(x, 0, mouse_state.screen_width - 1);
+	int y1 = clampi(y, 0, mouse_state.screen_height - 1);
+	int x2 = clampi(x + cw - 1, 0, mouse_state.screen_width - 1);
+	int y2 = clampi(y + ch - 1, 0, mouse_state.screen_height - 1);
+	fb_mark_dirty_unlocked((uint32_t)x1, (uint32_t)y1, (uint32_t)x2,
+			       (uint32_t)y2);
 }
 
 // Clear cursor at specified position
 static void mouse_clear_cursor_full(int x, int y)
 {
-    if(!mouse_state.cursor_visible) {
-        return;
-    }
-    if(!cursor_background) {
-        return;
-    }
-    int cw = mouse_state.cursor_w;
-    int ch = mouse_state.cursor_h;
-    if(x >= mouse_state.screen_width || y >= mouse_state.screen_height || x + cw - 1 < 0 || y + ch - 1 < 0) {
-        return;
-    }
-    for(int cy = 0; cy < ch; cy++) {
-        for(int cx = 0; cx < cw; cx++) {
-            int bg_index = cy * cw + cx;
-            if(bg_index < 0 || bg_index >= cw * ch) {
-                continue;
-            }
-            int screen_x = x + cx;
-            int screen_y = y + cy;
-            if(screen_x < 0 || screen_y < 0 || screen_x >= mouse_state.screen_width || screen_y >= mouse_state.screen_height) {
-                continue;
-            }
-            uint32_t bg = cursor_background[bg_index];
-            if(bg != BG_SENTINEL) {
-                fb_set_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y, bg);
-            }
-            // Reset background entry so we never reuse stale data
-            cursor_background[bg_index] = BG_SENTINEL;
-        }
-    }
-    int x1 = clampi(x, 0, mouse_state.screen_width - 1);
-    int y1 = clampi(y, 0, mouse_state.screen_height - 1);
-    int x2 = clampi(x + cw - 1, 0, mouse_state.screen_width - 1);
-    int y2 = clampi(y + ch - 1, 0, mouse_state.screen_height - 1);
-    fb_mark_dirty_unlocked((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
+	if (!mouse_state.cursor_visible) {
+		return;
+	}
+	if (!cursor_background) {
+		return;
+	}
+	int cw = mouse_state.cursor_w;
+	int ch = mouse_state.cursor_h;
+	if (x >= mouse_state.screen_width || y >= mouse_state.screen_height ||
+	    x + cw - 1 < 0 || y + ch - 1 < 0) {
+		return;
+	}
+	for (int cy = 0; cy < ch; cy++) {
+		for (int cx = 0; cx < cw; cx++) {
+			int bg_index = cy * cw + cx;
+			if (bg_index < 0 || bg_index >= cw * ch) {
+				continue;
+			}
+			int screen_x = x + cx;
+			int screen_y = y + cy;
+			if (screen_x < 0 || screen_y < 0 ||
+			    screen_x >= mouse_state.screen_width ||
+			    screen_y >= mouse_state.screen_height) {
+				continue;
+			}
+			uint32_t bg = cursor_background[bg_index];
+			if (bg != BG_SENTINEL) {
+				fb_set_pixel_unlocked((uint32_t)screen_x,
+						      (uint32_t)screen_y, bg);
+			}
+			// Reset background entry so we never reuse stale data
+			cursor_background[bg_index] = BG_SENTINEL;
+		}
+	}
+	int x1 = clampi(x, 0, mouse_state.screen_width - 1);
+	int y1 = clampi(y, 0, mouse_state.screen_height - 1);
+	int x2 = clampi(x + cw - 1, 0, mouse_state.screen_width - 1);
+	int y2 = clampi(y + ch - 1, 0, mouse_state.screen_height - 1);
+	fb_mark_dirty_unlocked((uint32_t)x1, (uint32_t)y1, (uint32_t)x2,
+			       (uint32_t)y2);
 }
 
-static void mouse_draw_cursor_partial(int x, int y, int visible_w, int visible_h)
+static void mouse_draw_cursor_partial(int x, int y, int visible_w,
+				      int visible_h)
 {
-    if(!mouse_state.cursor_visible) {
-        return;
-    }
-    if(!cursor_background) {
-        return;
-    }
-    int cw = mouse_state.cursor_w;
-    int ch = mouse_state.cursor_h;
-    if(visible_w <= 0 || visible_h <= 0) {
-        return;
-    }
-    if(x >= mouse_state.screen_width || y >= mouse_state.screen_height) {
-        return;
-    }
-    if(visible_w > cw) {
-        visible_w = cw;
-    }
-    if(visible_h > ch) {
-        visible_h = ch;
-    }
+	if (!mouse_state.cursor_visible) {
+		return;
+	}
+	if (!cursor_background) {
+		return;
+	}
+	int cw = mouse_state.cursor_w;
+	int ch = mouse_state.cursor_h;
+	if (visible_w <= 0 || visible_h <= 0) {
+		return;
+	}
+	if (x >= mouse_state.screen_width || y >= mouse_state.screen_height) {
+		return;
+	}
+	if (visible_w > cw) {
+		visible_w = cw;
+	}
+	if (visible_h > ch) {
+		visible_h = ch;
+	}
 
-    for(int cy = 0; cy < visible_h; cy++) {
-        for(int cx = 0; cx < visible_w; cx++) {
-            if(cx < 0 || cy < 0 || cx >= cw || cy >= ch) {
-                continue;
-            }
-            int bg_index = cy * cw + cx;
-            if(bg_index < 0 || bg_index >= cw * ch) {
-                continue;
-            }
-            int screen_x = x + cx;
-            int screen_y = y + cy;
-            if(screen_x < 0 || screen_y < 0 || screen_x >= mouse_state.screen_width || screen_y >= mouse_state.screen_height) {
-                continue;
-            }
-            cursor_background[bg_index] = fb_get_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y);
-            uint32_t pix = get_cursor_pixel(cx, cy);
-            // Alpha blend cursor pixel with background for smooth anti-aliased edges
-            uint8_t alpha = (pix >> 24) & 0xFF;
-            if(alpha > 0) {
-                uint32_t blended = alpha_blend(pix, cursor_background[bg_index]);
-                fb_set_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y, blended);
-            }
-        }
-    }
+	for (int cy = 0; cy < visible_h; cy++) {
+		for (int cx = 0; cx < visible_w; cx++) {
+			if (cx < 0 || cy < 0 || cx >= cw || cy >= ch) {
+				continue;
+			}
+			int bg_index = cy * cw + cx;
+			if (bg_index < 0 || bg_index >= cw * ch) {
+				continue;
+			}
+			int screen_x = x + cx;
+			int screen_y = y + cy;
+			if (screen_x < 0 || screen_y < 0 ||
+			    screen_x >= mouse_state.screen_width ||
+			    screen_y >= mouse_state.screen_height) {
+				continue;
+			}
+			cursor_background[bg_index] = fb_get_pixel_unlocked(
+				(uint32_t)screen_x, (uint32_t)screen_y);
+			uint32_t pix = get_cursor_pixel(cx, cy);
+			// Alpha blend cursor pixel with background for smooth anti-aliased edges
+			uint8_t alpha = (pix >> 24) & 0xFF;
+			if (alpha > 0) {
+				uint32_t blended = alpha_blend(
+					pix, cursor_background[bg_index]);
+				fb_set_pixel_unlocked((uint32_t)screen_x,
+						      (uint32_t)screen_y,
+						      blended);
+			}
+		}
+	}
 
-    int x1 = clampi(x, 0, mouse_state.screen_width - 1);
-    int y1 = clampi(y, 0, mouse_state.screen_height - 1);
-    int x2 = clampi(x + visible_w - 1, 0, mouse_state.screen_width - 1);
-    int y2 = clampi(y + visible_h - 1, 0, mouse_state.screen_height - 1);
-    fb_mark_dirty_unlocked((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
+	int x1 = clampi(x, 0, mouse_state.screen_width - 1);
+	int y1 = clampi(y, 0, mouse_state.screen_height - 1);
+	int x2 = clampi(x + visible_w - 1, 0, mouse_state.screen_width - 1);
+	int y2 = clampi(y + visible_h - 1, 0, mouse_state.screen_height - 1);
+	fb_mark_dirty_unlocked((uint32_t)x1, (uint32_t)y1, (uint32_t)x2,
+			       (uint32_t)y2);
 }
 
-static void mouse_clear_cursor_partial(int x, int y, int visible_w, int visible_h)
+static void mouse_clear_cursor_partial(int x, int y, int visible_w,
+				       int visible_h)
 {
-    if(!mouse_state.cursor_visible) {
-        return;
-    }
-    if(!cursor_background) {
-        return;
-    }
-    int cw = mouse_state.cursor_w;
-    int ch = mouse_state.cursor_h;
-    if(visible_w <= 0 || visible_h <= 0) {
-        return;
-    }
-    if(x >= mouse_state.screen_width || y >= mouse_state.screen_height) {
-        return;
-    }
-    if(visible_w > cw) {
-        visible_w = cw;
-    }
-    if(visible_h > ch) {
-        visible_h = ch;
-    }
+	if (!mouse_state.cursor_visible) {
+		return;
+	}
+	if (!cursor_background) {
+		return;
+	}
+	int cw = mouse_state.cursor_w;
+	int ch = mouse_state.cursor_h;
+	if (visible_w <= 0 || visible_h <= 0) {
+		return;
+	}
+	if (x >= mouse_state.screen_width || y >= mouse_state.screen_height) {
+		return;
+	}
+	if (visible_w > cw) {
+		visible_w = cw;
+	}
+	if (visible_h > ch) {
+		visible_h = ch;
+	}
 
-    for(int cy = 0; cy < visible_h; cy++) {
-        for(int cx = 0; cx < visible_w; cx++) {
-            if(cx < 0 || cy < 0 || cx >= cw || cy >= ch) {
-                continue;
-            }
-            int bg_index = cy * cw + cx;
-            if(bg_index < 0 || bg_index >= cw * ch) {
-                continue;
-            }
-            int screen_x = x + cx;
-            int screen_y = y + cy;
-            if(screen_x < 0 || screen_y < 0 || screen_x >= mouse_state.screen_width || screen_y >= mouse_state.screen_height) {
-                continue;
-            }
-            uint32_t bg = cursor_background[bg_index];
-            if(bg != BG_SENTINEL) {
-                fb_set_pixel_unlocked((uint32_t)screen_x, (uint32_t)screen_y, bg);
-            }
-            cursor_background[bg_index] = BG_SENTINEL;
-        }
-    }
+	for (int cy = 0; cy < visible_h; cy++) {
+		for (int cx = 0; cx < visible_w; cx++) {
+			if (cx < 0 || cy < 0 || cx >= cw || cy >= ch) {
+				continue;
+			}
+			int bg_index = cy * cw + cx;
+			if (bg_index < 0 || bg_index >= cw * ch) {
+				continue;
+			}
+			int screen_x = x + cx;
+			int screen_y = y + cy;
+			if (screen_x < 0 || screen_y < 0 ||
+			    screen_x >= mouse_state.screen_width ||
+			    screen_y >= mouse_state.screen_height) {
+				continue;
+			}
+			uint32_t bg = cursor_background[bg_index];
+			if (bg != BG_SENTINEL) {
+				fb_set_pixel_unlocked((uint32_t)screen_x,
+						      (uint32_t)screen_y, bg);
+			}
+			cursor_background[bg_index] = BG_SENTINEL;
+		}
+	}
 
-    int x1 = clampi(x, 0, mouse_state.screen_width - 1);
-    int y1 = clampi(y, 0, mouse_state.screen_height - 1);
-    int x2 = clampi(x + visible_w - 1, 0, mouse_state.screen_width - 1);
-    int y2 = clampi(y + visible_h - 1, 0, mouse_state.screen_height - 1);
-    fb_mark_dirty_unlocked((uint32_t)x1, (uint32_t)y1, (uint32_t)x2, (uint32_t)y2);
+	int x1 = clampi(x, 0, mouse_state.screen_width - 1);
+	int y1 = clampi(y, 0, mouse_state.screen_height - 1);
+	int x2 = clampi(x + visible_w - 1, 0, mouse_state.screen_width - 1);
+	int y2 = clampi(y + visible_h - 1, 0, mouse_state.screen_height - 1);
+	fb_mark_dirty_unlocked((uint32_t)x1, (uint32_t)y1, (uint32_t)x2,
+			       (uint32_t)y2);
 }
 
 // Process mouse packet
 static void mouse_process_packet(void)
 {
-    uint8_t flags = mouse_state.packet_buffer[0];
-    int8_t raw_x = (int8_t)mouse_state.packet_buffer[1]; // Cast to signed 8-bit
-    int8_t raw_y = (int8_t)mouse_state.packet_buffer[2]; // Cast to signed 8-bit
-    int8_t raw_z = 0;
+	uint8_t flags = mouse_state.packet_buffer[0];
+	int8_t raw_x =
+		(int8_t)mouse_state.packet_buffer[1]; // Cast to signed 8-bit
+	int8_t raw_y =
+		(int8_t)mouse_state.packet_buffer[2]; // Cast to signed 8-bit
+	int8_t raw_z = 0;
 
-    // Check if this is a valid packet
-    if(!(flags & 0x08)) {
-        // Bit 3 should always be set in the first byte
-        // Try to resynchronize by looking for a valid first byte in the buffer
-        int sync_found = 0;
-        for(int i = 1; i < mouse_state.packet_size; i++) {
-            if(mouse_state.packet_buffer[i] & 0x08) {
-                // Shift buffer left to align with the valid flags byte
-                for(int j = 0; j < mouse_state.packet_size - i; j++) {
-                    mouse_state.packet_buffer[j] = mouse_state.packet_buffer[j + i];
-                }
-                mouse_state.packet_index = mouse_state.packet_size - i;
-                sync_found = 1;
-                break;
-            }
-        }
-        if(!sync_found) {
-            mouse_state.packet_index = 0;
-        }
-        return;
-    }
+	// Check if this is a valid packet
+	if (!(flags & 0x08)) {
+		// Bit 3 should always be set in the first byte
+		// Try to resynchronize by looking for a valid first byte in the buffer
+		int sync_found = 0;
+		for (int i = 1; i < mouse_state.packet_size; i++) {
+			if (mouse_state.packet_buffer[i] & 0x08) {
+				// Shift buffer left to align with the valid flags byte
+				for (int j = 0; j < mouse_state.packet_size - i;
+				     j++) {
+					mouse_state.packet_buffer[j] =
+						mouse_state
+							.packet_buffer[j + i];
+				}
+				mouse_state.packet_index =
+					mouse_state.packet_size - i;
+				sync_found = 1;
+				break;
+			}
+		}
+		if (!sync_found) {
+			mouse_state.packet_index = 0;
+		}
+		return;
+	}
 
-    // Handle scroll wheel for IntelliMouse
-    if(mouse_state.has_scroll_wheel && mouse_state.packet_size == 4) {
-        raw_z = (int8_t)mouse_state.packet_buffer[3];
-        // For IntelliMouse, use the full Z byte without masking
-        mouse_state.scroll_delta = raw_z;
-        if(raw_z != 0) {
-            // Forward wheel to console immediately
-            console_handle_mouse_wheel((int)raw_z);
-            // Also report scroll to TTY as button 64|0 (up) or 64|1 (down)
-            // SGR scroll: Cb = 64 for scroll-up, 65 for scroll-down
-            tty_mouse_report_scroll(mouse_state.x, mouse_state.y, raw_z);
-        }
-    }
+	// Handle scroll wheel for IntelliMouse
+	if (mouse_state.has_scroll_wheel && mouse_state.packet_size == 4) {
+		raw_z = (int8_t)mouse_state.packet_buffer[3];
+		// For IntelliMouse, use the full Z byte without masking
+		mouse_state.scroll_delta = raw_z;
+		if (raw_z != 0) {
+			// Forward wheel to console immediately
+			console_handle_mouse_wheel((int)raw_z);
+			// Also report scroll to TTY as button 64|0 (up) or 64|1 (down)
+			// SGR scroll: Cb = 64 for scroll-up, 65 for scroll-down
+			tty_mouse_report_scroll(mouse_state.x, mouse_state.y,
+						raw_z);
+		}
+	}
 
-    // Process button states
-    mouse_state.last_buttons = (mouse_state.left_button ? MOUSE_LEFT_BUTTON : 0) |
-        (mouse_state.right_button ? MOUSE_RIGHT_BUTTON : 0) |
-        (mouse_state.middle_button ? MOUSE_MIDDLE_BUTTON : 0);
+	// Process button states
+	mouse_state.last_buttons =
+		(mouse_state.left_button ? MOUSE_LEFT_BUTTON : 0) |
+		(mouse_state.right_button ? MOUSE_RIGHT_BUTTON : 0) |
+		(mouse_state.middle_button ? MOUSE_MIDDLE_BUTTON : 0);
 
-    mouse_state.left_button = (flags & MOUSE_LEFT_BUTTON) ? 1 : 0;
-    mouse_state.right_button = (flags & MOUSE_RIGHT_BUTTON) ? 1 : 0;
-    mouse_state.middle_button = (flags & MOUSE_MIDDLE_BUTTON) ? 1 : 0;
+	mouse_state.left_button = (flags & MOUSE_LEFT_BUTTON) ? 1 : 0;
+	mouse_state.right_button = (flags & MOUSE_RIGHT_BUTTON) ? 1 : 0;
+	mouse_state.middle_button = (flags & MOUSE_MIDDLE_BUTTON) ? 1 : 0;
 
-    // Skip if overflow occurred (check flags, not the data values)
-    if(flags & (MOUSE_X_OVERFLOW | MOUSE_Y_OVERFLOW)) {
-        mouse_state.packet_index = 0;
-        return;
-    }
+	// Skip if overflow occurred (check flags, not the data values)
+	if (flags & (MOUSE_X_OVERFLOW | MOUSE_Y_OVERFLOW)) {
+		mouse_state.packet_index = 0;
+		return;
+	}
 
-    // Apply sensitivity and update position
-    mouse_state.delta_x = (raw_x * mouse_state.sensitivity) / 2; // Less division for IntelliMouse
-    mouse_state.delta_y = -(raw_y * mouse_state.sensitivity) / 2; // Less division for IntelliMouse
+	// Apply sensitivity and update position
+	mouse_state.delta_x = (raw_x * mouse_state.sensitivity) /
+			      2; // Less division for IntelliMouse
+	mouse_state.delta_y = -(raw_y * mouse_state.sensitivity) /
+			      2; // Less division for IntelliMouse
 
-    // Store last position for cursor clearing
-    mouse_state.last_x = mouse_state.x;
-    mouse_state.last_y = mouse_state.y;
+	// Store last position for cursor clearing
+	mouse_state.last_x = mouse_state.x;
+	mouse_state.last_y = mouse_state.y;
 
-    // Update mouse position with bounds checking
-    mouse_state.x += mouse_state.delta_x;
-    mouse_state.y += mouse_state.delta_y;
+	// Update mouse position with bounds checking
+	mouse_state.x += mouse_state.delta_x;
+	mouse_state.y += mouse_state.delta_y;
 
-    // Clamp origin to screen boundaries with partial visibility policy
-    if(mouse_state.x < 0) {
-        mouse_state.x = 0;
-    }
-    if(mouse_state.y < 0) {
-        mouse_state.y = 0;
-    }
-    int max_x_for_partial_visibility = mouse_state.screen_width - 2;
-    int max_y_for_tip_visibility = mouse_state.screen_height - TIP_VISIBLE_ROWS;
-    if(max_x_for_partial_visibility < 0) {
-        max_x_for_partial_visibility = 0;
-    }
-    if(max_y_for_tip_visibility < 0) {
-        max_y_for_tip_visibility = 0;
-    }
-    // Keep at least 2px (right) and TIP_VISIBLE_ROWS (bottom) visible
-    if(mouse_state.x > max_x_for_partial_visibility) {
-        mouse_state.x = max_x_for_partial_visibility;
-    }
-    if(mouse_state.y > max_y_for_tip_visibility) {
-        mouse_state.y = max_y_for_tip_visibility;
-    }
+	// Clamp origin to screen boundaries with partial visibility policy
+	if (mouse_state.x < 0) {
+		mouse_state.x = 0;
+	}
+	if (mouse_state.y < 0) {
+		mouse_state.y = 0;
+	}
+	int max_x_for_partial_visibility = mouse_state.screen_width - 2;
+	int max_y_for_tip_visibility =
+		mouse_state.screen_height - TIP_VISIBLE_ROWS;
+	if (max_x_for_partial_visibility < 0) {
+		max_x_for_partial_visibility = 0;
+	}
+	if (max_y_for_tip_visibility < 0) {
+		max_y_for_tip_visibility = 0;
+	}
+	// Keep at least 2px (right) and TIP_VISIBLE_ROWS (bottom) visible
+	if (mouse_state.x > max_x_for_partial_visibility) {
+		mouse_state.x = max_x_for_partial_visibility;
+	}
+	if (mouse_state.y > max_y_for_tip_visibility) {
+		mouse_state.y = max_y_for_tip_visibility;
+	}
 
-    // Update cursor if position changed
-    WARN_ON(mouse_state.x < 0 || mouse_state.y < 0);  /* clamp failed: negative mouse position */
-    WARN_ON(mouse_state.screen_width > 0 && mouse_state.x >= mouse_state.screen_width);   /* mouse X past screen width after clamp */
-    WARN_ON(mouse_state.screen_height > 0 && mouse_state.y >= mouse_state.screen_height); /* mouse Y past screen height after clamp */
-    if(mouse_state.x != mouse_state.last_x || mouse_state.y != mouse_state.last_y) {
-        mouse_update_cursor_internal();
-    }
+	// Update cursor if position changed
+	WARN_ON(mouse_state.x < 0 ||
+		mouse_state.y < 0); /* clamp failed: negative mouse position */
+	WARN_ON(mouse_state.screen_width > 0 &&
+		mouse_state.x >=
+			mouse_state
+				.screen_width); /* mouse X past screen width after clamp */
+	WARN_ON(mouse_state.screen_height > 0 &&
+		mouse_state.y >=
+			mouse_state
+				.screen_height); /* mouse Y past screen height after clamp */
+	if (mouse_state.x != mouse_state.last_x ||
+	    mouse_state.y != mouse_state.last_y) {
+		mouse_update_cursor_internal();
+	}
 
-    // Forward button/position events to console for scrollbar interactions
-    console_handle_mouse_event(mouse_state.x, mouse_state.y, mouse_state.left_button ? 1 : 0);
+	// Forward button/position events to console for scrollbar interactions
+	console_handle_mouse_event(mouse_state.x, mouse_state.y,
+				   mouse_state.left_button ? 1 : 0);
 
-    // Forward mouse events to TTY for terminal mouse tracking (SGR mode)
-    // Build current and previous button bitmask: bit0=left, bit1=right, bit2=middle
-    uint8_t cur_btns = (mouse_state.left_button ? 0x01 : 0) |
-                       (mouse_state.right_button ? 0x02 : 0) |
-                       (mouse_state.middle_button ? 0x04 : 0);
-    tty_mouse_report(mouse_state.x, mouse_state.y, cur_btns, mouse_state.last_buttons);
+	// Forward mouse events to TTY for terminal mouse tracking (SGR mode)
+	// Build current and previous button bitmask: bit0=left, bit1=right, bit2=middle
+	uint8_t cur_btns = (mouse_state.left_button ? 0x01 : 0) |
+			   (mouse_state.right_button ? 0x02 : 0) |
+			   (mouse_state.middle_button ? 0x04 : 0);
+	tty_mouse_report(mouse_state.x, mouse_state.y, cur_btns,
+			 mouse_state.last_buttons);
 
-    // Reset packet index for next packet
-    mouse_state.packet_index = 0;
+	// Reset packet index for next packet
+	mouse_state.packet_index = 0;
 }
 
 // Initialize mouse system
 void mouse_init(void)
 {
-    kprintf("Initializing PS/2 mouse...\n");
-    uint8_t controller_config = 0;
+	kprintf("Initializing PS/2 mouse...\n");
+	uint8_t controller_config = 0;
 
-    // Initialize mouse state
-    mouse_state.x = 400; // Start in center of screen (assuming 800x600)
-    mouse_state.y = 300;
-    mouse_state.last_x = mouse_state.x;
-    mouse_state.last_y = mouse_state.y;
-    mouse_state.left_button = 0;
-    mouse_state.right_button = 0;
-    mouse_state.middle_button = 0;
-    mouse_state.scroll_delta = 0;
-    mouse_state.packet_index = 0;
-    mouse_state.expecting_ack = 0;
-    mouse_state.enabled = 0;
-    mouse_state.cursor_visible = 1;
-    mouse_state.sensitivity = 4; // Default sensitivity
+	// Initialize mouse state
+	mouse_state.x = 400; // Start in center of screen (assuming 800x600)
+	mouse_state.y = 300;
+	mouse_state.last_x = mouse_state.x;
+	mouse_state.last_y = mouse_state.y;
+	mouse_state.left_button = 0;
+	mouse_state.right_button = 0;
+	mouse_state.middle_button = 0;
+	mouse_state.scroll_delta = 0;
+	mouse_state.packet_index = 0;
+	mouse_state.expecting_ack = 0;
+	mouse_state.enabled = 0;
+	mouse_state.cursor_visible = 1;
+	mouse_state.sensitivity = 4; // Default sensitivity
 
-    // Get screen dimensions from framebuffer optimization system
-    fb_double_buffer_t* fb_buffer = get_fb_double_buffer();
-    BUG_ON(fb_buffer == NULL);  /* mouse_init before framebuffer optimization is set up */
-    mouse_state.screen_width = fb_buffer->width;
-    mouse_state.screen_height = fb_buffer->height;
+	// Get screen dimensions from framebuffer optimization system
+	fb_double_buffer_t *fb_buffer = get_fb_double_buffer();
+	BUG_ON(fb_buffer ==
+	       NULL); /* mouse_init before framebuffer optimization is set up */
+	mouse_state.screen_width = fb_buffer->width;
+	mouse_state.screen_height = fb_buffer->height;
 
-    // Set runtime cursor dimensions
-    mouse_state.cursor_w = CURSOR_WIDTH;
-    mouse_state.cursor_h = CURSOR_HEIGHT;
+	// Set runtime cursor dimensions
+	mouse_state.cursor_w = CURSOR_WIDTH;
+	mouse_state.cursor_h = CURSOR_HEIGHT;
 
-    // Allocate cursor background buffer sized to runtime dimensions
-    size_t bg_count = (size_t)mouse_state.cursor_w * (size_t)mouse_state.cursor_h;
-    cursor_background = (uint32_t*)kalloc(bg_count * sizeof(uint32_t));
-    if(!cursor_background) {
-        kprintf("ERROR: Failed to allocate cursor background buffer\n");
-        return;
-    }
-    for(size_t i = 0; i < bg_count; ++i) {
-        cursor_background[i] = BG_SENTINEL;
-    }
-    (void)bg_count; // count reserved for potential diagnostics
+	// Allocate cursor background buffer sized to runtime dimensions
+	size_t bg_count =
+		(size_t)mouse_state.cursor_w * (size_t)mouse_state.cursor_h;
+	cursor_background = (uint32_t *)kalloc(bg_count * sizeof(uint32_t));
+	if (!cursor_background) {
+		kprintf("ERROR: Failed to allocate cursor background buffer\n");
+		return;
+	}
+	for (size_t i = 0; i < bg_count; ++i) {
+		cursor_background[i] = BG_SENTINEL;
+	}
+	(void)bg_count; // count reserved for potential diagnostics
 
-    // Quiesce both PS/2 IRQ lines for the duration of polled mouse init.
-    // VMware can inject keyboard bytes while the mouse setup code is
-    // polling the shared data port; if those bytes get consumed as mouse
-    // responses, the controller can come out of init in a broken state.
-    // Early boot keypresses do not need to be preserved, so keep the
-    // keyboard side disabled until the mouse path is fully configured.
-    ioapic_mask_gsi(1);
-    ioapic_mask_gsi(12);
+	// Quiesce both PS/2 IRQ lines for the duration of polled mouse init.
+	// VMware can inject keyboard bytes while the mouse setup code is
+	// polling the shared data port; if those bytes get consumed as mouse
+	// responses, the controller can come out of init in a broken state.
+	// Early boot keypresses do not need to be preserved, so keep the
+	// keyboard side disabled until the mouse path is fully configured.
+	ioapic_mask_gsi(1);
+	ioapic_mask_gsi(12);
 
-    mouse_flush_output();
-    controller_config = mouse_read_controller_config();
+	mouse_flush_output();
+	controller_config = mouse_read_controller_config();
 
-    uint8_t ctrl = controller_config;
-    ctrl |= PS2_CTR_KBDDIS;
-    ctrl &= ~PS2_CTR_KBDINT;
-    ctrl |= PS2_CTR_AUXDIS;
-    ctrl &= ~PS2_CTR_AUXINT;
-    mouse_write_controller_config(ctrl);
+	uint8_t ctrl = controller_config;
+	ctrl |= PS2_CTR_KBDDIS;
+	ctrl &= ~PS2_CTR_KBDINT;
+	ctrl |= PS2_CTR_AUXDIS;
+	ctrl &= ~PS2_CTR_AUXINT;
+	mouse_write_controller_config(ctrl);
 
-    // Drain any stale bytes from the output buffer before issuing mouse commands.
-    mouse_flush_output();
+	// Drain any stale bytes from the output buffer before issuing mouse commands.
+	mouse_flush_output();
 
-    // Enable PS/2 mouse port
-    mouse_wait_input();
-    outb(PS2_COMMAND_PORT, PS2_CMD_ENABLE_PORT2);
-    mouse_flush_output();
+	// Enable PS/2 mouse port
+	mouse_wait_input();
+	outb(PS2_COMMAND_PORT, PS2_CMD_ENABLE_PORT2);
+	mouse_flush_output();
 
-    // Test mouse port — non-fatal on failure (stale bytes from eSPI can
-    // cause spurious results; the mouse reset below is the real gate).
-    mouse_wait_input();
-    outb(PS2_COMMAND_PORT, PS2_CMD_TEST_PORT2);
-    uint8_t test_result = mouse_read_data();
-    if (test_result != 0x00) {
-        kprintf("PS2 mouse: port test returned 0x%02x, continuing\n", test_result);
-        mouse_flush_output();
-    }
+	// Test mouse port — non-fatal on failure (stale bytes from eSPI can
+	// cause spurious results; the mouse reset below is the real gate).
+	mouse_wait_input();
+	outb(PS2_COMMAND_PORT, PS2_CMD_TEST_PORT2);
+	uint8_t test_result = mouse_read_data();
+	if (test_result != 0x00) {
+		kprintf("PS2 mouse: port test returned 0x%02x, continuing\n",
+			test_result);
+		mouse_flush_output();
+	}
 
-    // Detect mouse type and capabilities (may leave extra bytes in buffer depending on emulation)
-    mouse_state.mouse_type = mouse_detect_type();
+	// Detect mouse type and capabilities (may leave extra bytes in buffer depending on emulation)
+	mouse_state.mouse_type = mouse_detect_type();
 
-    // Re-apply the IntelliMouse detection sequence after SET_DEFAULTS
-    // would reset the mouse to 3-byte mode.  Instead, just set stream
-    // mode (0xEA) which preserves the IntelliMouse 4-byte mode.
-    mouse_flush_output();
-    mouse_write_command(MOUSE_CMD_SET_STREAM_MODE, 0xFF); // expect ACK
-    uint8_t resp = mouse_read_data();
-    if(resp != MOUSE_ACK) {
-        kprintf("Mouse: SET_STREAM_MODE unexpected resp=0x%02X (continuing)\n", resp);
-    }
-    mouse_flush_output();
+	// Re-apply the IntelliMouse detection sequence after SET_DEFAULTS
+	// would reset the mouse to 3-byte mode.  Instead, just set stream
+	// mode (0xEA) which preserves the IntelliMouse 4-byte mode.
+	mouse_flush_output();
+	mouse_write_command(MOUSE_CMD_SET_STREAM_MODE, 0xFF); // expect ACK
+	uint8_t resp = mouse_read_data();
+	if (resp != MOUSE_ACK) {
+		kprintf("Mouse: SET_STREAM_MODE unexpected resp=0x%02X (continuing)\n",
+			resp);
+	}
+	mouse_flush_output();
 
-    // Drain any leftover bytes before making IRQ12 live.
-    mouse_flush_output();
+	// Drain any leftover bytes before making IRQ12 live.
+	mouse_flush_output();
 
-    ctrl = controller_config;
-    ctrl |= PS2_CTR_KBDDIS;
-    ctrl &= ~PS2_CTR_KBDINT;
-    ctrl &= ~PS2_CTR_AUXDIS;
-    ctrl |= PS2_CTR_AUXINT;
-    mouse_write_controller_config(ctrl);
+	ctrl = controller_config;
+	ctrl |= PS2_CTR_KBDDIS;
+	ctrl &= ~PS2_CTR_KBDINT;
+	ctrl &= ~PS2_CTR_AUXDIS;
+	ctrl |= PS2_CTR_AUXINT;
+	mouse_write_controller_config(ctrl);
 
-    ioapic_unmask_gsi(12);
+	ioapic_unmask_gsi(12);
 
-    // Only allow streaming packets after the controller-side AUX IRQ path is
-    // live; otherwise an early movement byte can sit in OBF with no IRQ edge
-    // and block both PS/2 devices behind it.
-    mouse_state.enabled = 1;
-    mouse_state.packet_index = 0;
-    mouse_state.expecting_ack = 1;
-    mouse_write_command(MOUSE_CMD_ENABLE_REPORTING, 0xFF);
+	// Only allow streaming packets after the controller-side AUX IRQ path is
+	// live; otherwise an early movement byte can sit in OBF with no IRQ edge
+	// and block both PS/2 devices behind it.
+	mouse_state.enabled = 1;
+	mouse_state.packet_index = 0;
+	mouse_state.expecting_ack = 1;
+	mouse_write_command(MOUSE_CMD_ENABLE_REPORTING, 0xFF);
 
-    // If interrupts are not yet flowing, poll a short time for the ACK.
-    for(int i = 0; i < 100000 && mouse_state.expecting_ack; ++i) {
-        uint8_t status = inb(PS2_STATUS_PORT);
-        if(status & PS2_STATUS_OUTPUT_FULL) {
-            if(!(status & PS2_STATUS_AUXDATA)) {
-                (void)inb(PS2_DATA_PORT);
-                continue;
-            }
+	// If interrupts are not yet flowing, poll a short time for the ACK.
+	for (int i = 0; i < 100000 && mouse_state.expecting_ack; ++i) {
+		uint8_t status = inb(PS2_STATUS_PORT);
+		if (status & PS2_STATUS_OUTPUT_FULL) {
+			if (!(status & PS2_STATUS_AUXDATA)) {
+				(void)inb(PS2_DATA_PORT);
+				continue;
+			}
 
-            uint8_t data = inb(PS2_DATA_PORT);
-            if(data == MOUSE_ACK) {
-                mouse_state.expecting_ack = 0;
-            }
-        }
-    }
+			uint8_t data = inb(PS2_DATA_PORT);
+			if (data == MOUSE_ACK) {
+				mouse_state.expecting_ack = 0;
+			}
+		}
+	}
 
-    if(mouse_state.expecting_ack) {
-        kprintf("Mouse: enable-reporting ACK pending, continuing\n");
-    }
+	if (mouse_state.expecting_ack) {
+		kprintf("Mouse: enable-reporting ACK pending, continuing\n");
+	}
 
-    mouse_flush_output();
-    keyboard_reset_state();
+	mouse_flush_output();
+	keyboard_reset_state();
 
-    ctrl = controller_config;
-    ctrl &= ~PS2_CTR_AUXDIS;
-    ctrl |= PS2_CTR_AUXINT;
-    mouse_write_controller_config(ctrl);
-    ioapic_unmask_gsi(1);
+	ctrl = controller_config;
+	ctrl &= ~PS2_CTR_AUXDIS;
+	ctrl |= PS2_CTR_AUXINT;
+	mouse_write_controller_config(ctrl);
+	ioapic_unmask_gsi(1);
 
-    kprintf("Mouse initialized successfully\n");
-    kprintf("  Position: (%d, %d)\n", mouse_state.x, mouse_state.y);
-    kprintf("  Screen size: %dx%d\n", mouse_state.screen_width, mouse_state.screen_height);
-    kprintf("  Mouse type: %s\n", mouse_state.has_scroll_wheel ? "IntelliMouse" : "Standard");
-    kprintf("  Cursor size: %dx%d\n", mouse_state.cursor_w, mouse_state.cursor_h);
+	kprintf("Mouse initialized successfully\n");
+	kprintf("  Position: (%d, %d)\n", mouse_state.x, mouse_state.y);
+	kprintf("  Screen size: %dx%d\n", mouse_state.screen_width,
+		mouse_state.screen_height);
+	kprintf("  Mouse type: %s\n",
+		mouse_state.has_scroll_wheel ? "IntelliMouse" : "Standard");
+	kprintf("  Cursor size: %dx%d\n", mouse_state.cursor_w,
+		mouse_state.cursor_h);
 }
 
 // Mouse IRQ handler (called from interrupt.c)
 void mouse_irq_handler(void)
 {
-    uint64_t flags;
-    spin_lock_irqsave(&mouse_lock, &flags);
+	uint64_t flags;
+	spin_lock_irqsave(&mouse_lock, &flags);
 
-    if(!mouse_state.enabled) {
-        // Clear the data port to prevent buffer overflow
-        inb(PS2_DATA_PORT);
-        spin_unlock_irqrestore(&mouse_lock, flags);
-        return;
-    }
+	if (!mouse_state.enabled) {
+		// Clear the data port to prevent buffer overflow
+		inb(PS2_DATA_PORT);
+		spin_unlock_irqrestore(&mouse_lock, flags);
+		return;
+	}
 
-    uint8_t data = inb(PS2_DATA_PORT);
+	uint8_t data = inb(PS2_DATA_PORT);
 
-    // Handle ACK responses
-    if(mouse_state.expecting_ack) {
-        if(data == MOUSE_ACK) {
-            mouse_state.expecting_ack = 0;
-        } else {
-            // Stay silent
-            // kprintf("Expected ACK, got 0x%02X\n", data);
-        }
-        spin_unlock_irqrestore(&mouse_lock, flags);
-        return;
-    }
+	// Handle ACK responses
+	if (mouse_state.expecting_ack) {
+		if (data == MOUSE_ACK) {
+			mouse_state.expecting_ack = 0;
+		} else {
+			// Stay silent
+			// kprintf("Expected ACK, got 0x%02X\n", data);
+		}
+		spin_unlock_irqrestore(&mouse_lock, flags);
+		return;
+	}
 
-    // Store packet data
-    mouse_state.packet_buffer[mouse_state.packet_index] = data;
-    mouse_state.packet_index++;
+	// Store packet data
+	mouse_state.packet_buffer[mouse_state.packet_index] = data;
+	mouse_state.packet_index++;
 
-    // Process packet when complete
-    if(mouse_state.packet_index >= mouse_state.packet_size) {
-        mouse_process_packet();
-    }
+	// Process packet when complete
+	if (mouse_state.packet_index >= mouse_state.packet_size) {
+		mouse_process_packet();
+	}
 
-    spin_unlock_irqrestore(&mouse_lock, flags);
+	spin_unlock_irqrestore(&mouse_lock, flags);
 }
 
 // Internal cursor update - caller must already hold mouse_lock
 static void mouse_update_cursor_internal(void)
 {
-    if(!mouse_state.enabled || !mouse_state.cursor_visible) {
-        return;
-    }
+	if (!mouse_state.enabled || !mouse_state.cursor_visible) {
+		return;
+	}
 
-    // Acquire framebuffer lock for the entire cursor update operation
-    // This prevents artifacts when console output races with cursor drawing on SMP
-    uint64_t fb_flags;
-    fb_acquire(&fb_flags);
+	// Acquire framebuffer lock for the entire cursor update operation
+	// This prevents artifacts when console output races with cursor drawing on SMP
+	uint64_t fb_flags;
+	fb_acquire(&fb_flags);
 
-    int max_x_for_partial_visibility = mouse_state.screen_width - 2;
-    int max_y_for_tip_visibility = mouse_state.screen_height - TIP_VISIBLE_ROWS;
+	int max_x_for_partial_visibility = mouse_state.screen_width - 2;
+	int max_y_for_tip_visibility =
+		mouse_state.screen_height - TIP_VISIBLE_ROWS;
 
-    // Compute prev visible region
-    int prev_w = mouse_state.cursor_w;
-    int prev_h = mouse_state.cursor_h;
-    if(mouse_state.last_x >= max_x_for_partial_visibility) {
-        int rem = mouse_state.screen_width - mouse_state.last_x;
-        prev_w = rem > 0 ? (rem < 2 ? rem : 2) : 0;
-    }
-    if(mouse_state.last_y >= max_y_for_tip_visibility) {
-        int rem = mouse_state.screen_height - mouse_state.last_y;
-        int tip = TIP_VISIBLE_ROWS;
-        if(rem < tip) {
-            tip = rem < 0 ? 0 : rem;
-        }
-        if(tip > mouse_state.cursor_h) {
-            tip = mouse_state.cursor_h;
-        }
-        prev_h = tip;
-    }
-    if(prev_w > mouse_state.cursor_w) {
-        prev_w = mouse_state.cursor_w;
-    }
-    if(prev_h > mouse_state.cursor_h) {
-        prev_h = mouse_state.cursor_h;
-    }
+	// Compute prev visible region
+	int prev_w = mouse_state.cursor_w;
+	int prev_h = mouse_state.cursor_h;
+	if (mouse_state.last_x >= max_x_for_partial_visibility) {
+		int rem = mouse_state.screen_width - mouse_state.last_x;
+		prev_w = rem > 0 ? (rem < 2 ? rem : 2) : 0;
+	}
+	if (mouse_state.last_y >= max_y_for_tip_visibility) {
+		int rem = mouse_state.screen_height - mouse_state.last_y;
+		int tip = TIP_VISIBLE_ROWS;
+		if (rem < tip) {
+			tip = rem < 0 ? 0 : rem;
+		}
+		if (tip > mouse_state.cursor_h) {
+			tip = mouse_state.cursor_h;
+		}
+		prev_h = tip;
+	}
+	if (prev_w > mouse_state.cursor_w) {
+		prev_w = mouse_state.cursor_w;
+	}
+	if (prev_h > mouse_state.cursor_h) {
+		prev_h = mouse_state.cursor_h;
+	}
 
-    // Clear prev
-    if(prev_w > 0 && prev_h > 0 && (mouse_state.last_x >= max_x_for_partial_visibility || mouse_state.last_y >= max_y_for_tip_visibility)) {
-        mouse_clear_cursor_partial(mouse_state.last_x, mouse_state.last_y, prev_w, prev_h);
-    } else {
-        mouse_clear_cursor_full(mouse_state.last_x, mouse_state.last_y);
-    }
+	// Clear prev
+	if (prev_w > 0 && prev_h > 0 &&
+	    (mouse_state.last_x >= max_x_for_partial_visibility ||
+	     mouse_state.last_y >= max_y_for_tip_visibility)) {
+		mouse_clear_cursor_partial(mouse_state.last_x,
+					   mouse_state.last_y, prev_w, prev_h);
+	} else {
+		mouse_clear_cursor_full(mouse_state.last_x, mouse_state.last_y);
+	}
 
-    // Draw new
-    int visible_w = mouse_state.cursor_w;
-    int visible_h = mouse_state.cursor_h;
-    if(mouse_state.x >= max_x_for_partial_visibility) {
-        int rem = mouse_state.screen_width - mouse_state.x;
-        visible_w = rem > 0 ? (rem < 2 ? rem : 2) : 0;
-    }
-    if(mouse_state.y >= max_y_for_tip_visibility) {
-        int rem = mouse_state.screen_height - mouse_state.y;
-        int tip = TIP_VISIBLE_ROWS;
-        if(rem < tip) {
-            tip = rem < 0 ? 0 : rem;
-        }
-        if(tip > mouse_state.cursor_h) {
-            tip = mouse_state.cursor_h;
-        }
-        visible_h = tip;
-    }
-    if(visible_w > mouse_state.cursor_w) {
-        visible_w = mouse_state.cursor_w;
-    }
-    if(visible_h > mouse_state.cursor_h) {
-        visible_h = mouse_state.cursor_h;
-    }
-    if(visible_w > 0 && visible_h > 0 && (mouse_state.x >= max_x_for_partial_visibility || mouse_state.y >= max_y_for_tip_visibility)) {
-        mouse_draw_cursor_partial(mouse_state.x, mouse_state.y, visible_w, visible_h);
-    } else {
-        mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
-    }
+	// Draw new
+	int visible_w = mouse_state.cursor_w;
+	int visible_h = mouse_state.cursor_h;
+	if (mouse_state.x >= max_x_for_partial_visibility) {
+		int rem = mouse_state.screen_width - mouse_state.x;
+		visible_w = rem > 0 ? (rem < 2 ? rem : 2) : 0;
+	}
+	if (mouse_state.y >= max_y_for_tip_visibility) {
+		int rem = mouse_state.screen_height - mouse_state.y;
+		int tip = TIP_VISIBLE_ROWS;
+		if (rem < tip) {
+			tip = rem < 0 ? 0 : rem;
+		}
+		if (tip > mouse_state.cursor_h) {
+			tip = mouse_state.cursor_h;
+		}
+		visible_h = tip;
+	}
+	if (visible_w > mouse_state.cursor_w) {
+		visible_w = mouse_state.cursor_w;
+	}
+	if (visible_h > mouse_state.cursor_h) {
+		visible_h = mouse_state.cursor_h;
+	}
+	if (visible_w > 0 && visible_h > 0 &&
+	    (mouse_state.x >= max_x_for_partial_visibility ||
+	     mouse_state.y >= max_y_for_tip_visibility)) {
+		mouse_draw_cursor_partial(mouse_state.x, mouse_state.y,
+					  visible_w, visible_h);
+	} else {
+		mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
+	}
 
-    // Flush dirty regions to display changes
-    fb_flush_dirty_regions_unlocked();
-    
-    // Release framebuffer lock
-    fb_release(fb_flags);
+	// Flush dirty regions to display changes
+	fb_flush_dirty_regions_unlocked();
+
+	// Release framebuffer lock
+	fb_release(fb_flags);
 }
 
 // Update cursor position on screen (public wrapper, takes lock)
 void mouse_update_cursor(void)
 {
-    uint64_t flags;
-    spin_lock_irqsave(&mouse_lock, &flags);
-    mouse_update_cursor_internal();
-    spin_unlock_irqrestore(&mouse_lock, flags);
+	uint64_t flags;
+	spin_lock_irqsave(&mouse_lock, &flags);
+	mouse_update_cursor_internal();
+	spin_unlock_irqrestore(&mouse_lock, flags);
 }
 
 // Get current mouse X position
 int mouse_get_x(void)
 {
-    return mouse_state.x;
+	return mouse_state.x;
 }
 
 // Get current mouse Y position
 int mouse_get_y(void)
 {
-    return mouse_state.y;
+	return mouse_state.y;
 }
 
 // Get left button state
 int mouse_button_left(void)
 {
-    return mouse_state.left_button;
+	return mouse_state.left_button;
 }
 
 // Get right button state
 int mouse_button_right(void)
 {
-    return mouse_state.right_button;
+	return mouse_state.right_button;
 }
 
 // Get middle button state
 int mouse_button_middle(void)
 {
-    return mouse_state.middle_button;
+	return mouse_state.middle_button;
 }
 
 // Get scroll wheel delta
 int mouse_scroll_delta(void)
 {
-    int delta = mouse_state.scroll_delta;
-    mouse_state.scroll_delta = 0; // Reset after reading
-    return delta;
+	int delta = mouse_state.scroll_delta;
+	mouse_state.scroll_delta = 0; // Reset after reading
+	return delta;
 }
 
 // Set mouse sensitivity
 void mouse_set_sensitivity(int sensitivity)
 {
-    if(sensitivity >= 1 && sensitivity <= 10) {
-        mouse_state.sensitivity = sensitivity;
-    }
+	if (sensitivity >= 1 && sensitivity <= 10) {
+		mouse_state.sensitivity = sensitivity;
+	}
 }
 
 // Show or hide cursor
 void mouse_show_cursor(int show)
 {
-    if(show && !mouse_state.cursor_visible) {
-        mouse_state.cursor_visible = 1;
-        mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
-        fb_flush_dirty_regions();
-    } else if(!show && mouse_state.cursor_visible) {
-        mouse_clear_cursor_full(mouse_state.x, mouse_state.y);
-        mouse_state.cursor_visible = 0;
-        fb_flush_dirty_regions();
-    }
+	if (show && !mouse_state.cursor_visible) {
+		mouse_state.cursor_visible = 1;
+		mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
+		fb_flush_dirty_regions();
+	} else if (!show && mouse_state.cursor_visible) {
+		mouse_clear_cursor_full(mouse_state.x, mouse_state.y);
+		mouse_state.cursor_visible = 0;
+		fb_flush_dirty_regions();
+	}
 }
 
 // No-flush variant: update cursor in back buffer only, caller flushes later
 void mouse_show_cursor_noflush(int show)
 {
-    if(show && !mouse_state.cursor_visible) {
-        mouse_state.cursor_visible = 1;
-        mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
-    } else if(!show && mouse_state.cursor_visible) {
-        mouse_clear_cursor_full(mouse_state.x, mouse_state.y);
-        mouse_state.cursor_visible = 0;
-    }
+	if (show && !mouse_state.cursor_visible) {
+		mouse_state.cursor_visible = 1;
+		mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
+	} else if (!show && mouse_state.cursor_visible) {
+		mouse_clear_cursor_full(mouse_state.x, mouse_state.y);
+		mouse_state.cursor_visible = 0;
+	}
 }
 
 // Apply a loaded cursor (must be called after cursor_load succeeded)
 void mouse_apply_cursor(void)
 {
-    uint64_t flags;
-    spin_lock_irqsave(&mouse_lock, &flags);
+	uint64_t flags;
+	spin_lock_irqsave(&mouse_lock, &flags);
 
-    if (!cursor_is_loaded()) {
-        spin_unlock_irqrestore(&mouse_lock, flags);
-        return;
-    }
+	if (!cursor_is_loaded()) {
+		spin_unlock_irqrestore(&mouse_lock, flags);
+		return;
+	}
 
-    // Clear the old cursor first
-    if (mouse_state.cursor_visible) {
-        mouse_clear_cursor_full(mouse_state.x, mouse_state.y);
-    }
+	// Clear the old cursor first
+	if (mouse_state.cursor_visible) {
+		mouse_clear_cursor_full(mouse_state.x, mouse_state.y);
+	}
 
-    // Get new cursor dimensions
-    uint32_t new_w = cursor_get_width();
-    uint32_t new_h = cursor_get_height();
+	// Get new cursor dimensions
+	uint32_t new_w = cursor_get_width();
+	uint32_t new_h = cursor_get_height();
 
-    // Reallocate background buffer if size changed
-    size_t old_count = (size_t)mouse_state.cursor_w * (size_t)mouse_state.cursor_h;
-    size_t new_count = (size_t)new_w * (size_t)new_h;
+	// Reallocate background buffer if size changed
+	size_t old_count =
+		(size_t)mouse_state.cursor_w * (size_t)mouse_state.cursor_h;
+	size_t new_count = (size_t)new_w * (size_t)new_h;
 
-    if (new_count != old_count && cursor_background) {
-        kfree(cursor_background);
-        cursor_background = (uint32_t*)kalloc(new_count * sizeof(uint32_t));
-        if (!cursor_background) {
-            kprintf("mouse: failed to reallocate cursor background buffer\n");
-            spin_unlock_irqrestore(&mouse_lock, flags);
-            return;
-        }
-    }
+	if (new_count != old_count && cursor_background) {
+		kfree(cursor_background);
+		cursor_background =
+			(uint32_t *)kalloc(new_count * sizeof(uint32_t));
+		if (!cursor_background) {
+			kprintf("mouse: failed to reallocate cursor background buffer\n");
+			spin_unlock_irqrestore(&mouse_lock, flags);
+			return;
+		}
+	}
 
-    // Initialize background buffer
-    for (size_t i = 0; i < new_count; ++i) {
-        cursor_background[i] = BG_SENTINEL;
-    }
+	// Initialize background buffer
+	for (size_t i = 0; i < new_count; ++i) {
+		cursor_background[i] = BG_SENTINEL;
+	}
 
-    // Update cursor dimensions
-    mouse_state.cursor_w = (int)new_w;
-    mouse_state.cursor_h = (int)new_h;
+	// Update cursor dimensions
+	mouse_state.cursor_w = (int)new_w;
+	mouse_state.cursor_h = (int)new_h;
 
-    // Enable the loaded cursor
-    use_loaded_cursor = 1;
+	// Enable the loaded cursor
+	use_loaded_cursor = 1;
 
-    // Draw the new cursor
-    if (mouse_state.cursor_visible) {
-        mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
-        fb_flush_dirty_regions();
-    }
+	// Draw the new cursor
+	if (mouse_state.cursor_visible) {
+		mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
+		fb_flush_dirty_regions();
+	}
 
-    spin_unlock_irqrestore(&mouse_lock, flags);
+	spin_unlock_irqrestore(&mouse_lock, flags);
 
-    kprintf("mouse: using loaded cursor (%ux%u)\n", new_w, new_h);
+	kprintf("mouse: using loaded cursor (%ux%u)\n", new_w, new_h);
 }
 
 // Inject a USB HID mouse movement/button event into the mouse subsystem.
@@ -964,74 +1069,83 @@ void mouse_apply_cursor(void)
 //   wheel        - scroll wheel delta (signed, 0 = none)
 void mouse_inject_usb_movement(int dx, int dy, uint8_t buttons, int8_t wheel)
 {
-    uint64_t flags;
-    spin_lock_irqsave(&mouse_lock, &flags);
+	uint64_t flags;
+	spin_lock_irqsave(&mouse_lock, &flags);
 
-    // Auto-enable the mouse subsystem on first USB/I2C event.
-    // PS/2 init sets enabled=1, but when there's no PS/2 mouse
-    // (e.g. Dell laptops with only an I2C touchpad) enabled stays 0
-    // and mouse_update_cursor_internal() silently returns without
-    // drawing anything.
-    if (!mouse_state.enabled) {
-        mouse_state.enabled = 1;
-    }
+	// Auto-enable the mouse subsystem on first USB/I2C event.
+	// PS/2 init sets enabled=1, but when there's no PS/2 mouse
+	// (e.g. Dell laptops with only an I2C touchpad) enabled stays 0
+	// and mouse_update_cursor_internal() silently returns without
+	// drawing anything.
+	if (!mouse_state.enabled) {
+		mouse_state.enabled = 1;
+	}
 
-    // --- Button state ---
-    mouse_state.last_buttons = (mouse_state.left_button ? MOUSE_LEFT_BUTTON : 0) |
-        (mouse_state.right_button ? MOUSE_RIGHT_BUTTON : 0) |
-        (mouse_state.middle_button ? MOUSE_MIDDLE_BUTTON : 0);
+	// --- Button state ---
+	mouse_state.last_buttons =
+		(mouse_state.left_button ? MOUSE_LEFT_BUTTON : 0) |
+		(mouse_state.right_button ? MOUSE_RIGHT_BUTTON : 0) |
+		(mouse_state.middle_button ? MOUSE_MIDDLE_BUTTON : 0);
 
-    mouse_state.left_button   = (buttons & 0x01) ? 1 : 0;
-    mouse_state.right_button  = (buttons & 0x02) ? 1 : 0;
-    mouse_state.middle_button = (buttons & 0x04) ? 1 : 0;
+	mouse_state.left_button = (buttons & 0x01) ? 1 : 0;
+	mouse_state.right_button = (buttons & 0x02) ? 1 : 0;
+	mouse_state.middle_button = (buttons & 0x04) ? 1 : 0;
 
-    // --- Scroll wheel ---
-    if (wheel != 0) {
-        mouse_state.scroll_delta = wheel;
-        console_handle_mouse_wheel((int)wheel);
-        tty_mouse_report_scroll(mouse_state.x, mouse_state.y, wheel);
-    }
+	// --- Scroll wheel ---
+	if (wheel != 0) {
+		mouse_state.scroll_delta = wheel;
+		console_handle_mouse_wheel((int)wheel);
+		tty_mouse_report_scroll(mouse_state.x, mouse_state.y, wheel);
+	}
 
-    // --- Movement ---
-    // Apply sensitivity (same formula as PS/2 path)
-    mouse_state.delta_x = (dx * mouse_state.sensitivity) / 2;
-    mouse_state.delta_y = (dy * mouse_state.sensitivity) / 2;  // USB HID Y+ = down, screen Y+ = down (no inversion needed, unlike PS/2)
+	// --- Movement ---
+	// Apply sensitivity (same formula as PS/2 path)
+	mouse_state.delta_x = (dx * mouse_state.sensitivity) / 2;
+	mouse_state.delta_y =
+		(dy * mouse_state.sensitivity) /
+		2; // USB HID Y+ = down, screen Y+ = down (no inversion needed, unlike PS/2)
 
-    mouse_state.last_x = mouse_state.x;
-    mouse_state.last_y = mouse_state.y;
+	mouse_state.last_x = mouse_state.x;
+	mouse_state.last_y = mouse_state.y;
 
-    mouse_state.x += mouse_state.delta_x;
-    mouse_state.y += mouse_state.delta_y;
+	mouse_state.x += mouse_state.delta_x;
+	mouse_state.y += mouse_state.delta_y;
 
-    // Clamp to screen boundaries (same as PS/2 path)
-    if (mouse_state.x < 0)
-        mouse_state.x = 0;
-    if (mouse_state.y < 0)
-        mouse_state.y = 0;
+	// Clamp to screen boundaries (same as PS/2 path)
+	if (mouse_state.x < 0)
+		mouse_state.x = 0;
+	if (mouse_state.y < 0)
+		mouse_state.y = 0;
 
-    int max_x = mouse_state.screen_width - 2;
-    int max_y = mouse_state.screen_height - TIP_VISIBLE_ROWS;
-    if (max_x < 0) max_x = 0;
-    if (max_y < 0) max_y = 0;
-    if (mouse_state.x > max_x)
-        mouse_state.x = max_x;
-    if (mouse_state.y > max_y)
-        mouse_state.y = max_y;
-    WARN_ON(mouse_state.x < 0 || mouse_state.y < 0);  /* clamp failed: negative mouse position (USB path) */
+	int max_x = mouse_state.screen_width - 2;
+	int max_y = mouse_state.screen_height - TIP_VISIBLE_ROWS;
+	if (max_x < 0)
+		max_x = 0;
+	if (max_y < 0)
+		max_y = 0;
+	if (mouse_state.x > max_x)
+		mouse_state.x = max_x;
+	if (mouse_state.y > max_y)
+		mouse_state.y = max_y;
+	WARN_ON(mouse_state.x < 0 ||
+		mouse_state.y <
+			0); /* clamp failed: negative mouse position (USB path) */
 
-    // --- Cursor redraw ---
-    if (mouse_state.x != mouse_state.last_x || mouse_state.y != mouse_state.last_y) {
-        mouse_update_cursor_internal();
-    }
+	// --- Cursor redraw ---
+	if (mouse_state.x != mouse_state.last_x ||
+	    mouse_state.y != mouse_state.last_y) {
+		mouse_update_cursor_internal();
+	}
 
-    // --- Forward events (same as PS/2 path) ---
-    console_handle_mouse_event(mouse_state.x, mouse_state.y,
-                               mouse_state.left_button ? 1 : 0);
+	// --- Forward events (same as PS/2 path) ---
+	console_handle_mouse_event(mouse_state.x, mouse_state.y,
+				   mouse_state.left_button ? 1 : 0);
 
-    uint8_t cur_btns = (mouse_state.left_button ? 0x01 : 0) |
-                       (mouse_state.right_button ? 0x02 : 0) |
-                       (mouse_state.middle_button ? 0x04 : 0);
-    tty_mouse_report(mouse_state.x, mouse_state.y, cur_btns, mouse_state.last_buttons);
+	uint8_t cur_btns = (mouse_state.left_button ? 0x01 : 0) |
+			   (mouse_state.right_button ? 0x02 : 0) |
+			   (mouse_state.middle_button ? 0x04 : 0);
+	tty_mouse_report(mouse_state.x, mouse_state.y, cur_btns,
+			 mouse_state.last_buttons);
 
-    spin_unlock_irqrestore(&mouse_lock, flags);
+	spin_unlock_irqrestore(&mouse_lock, flags);
 }

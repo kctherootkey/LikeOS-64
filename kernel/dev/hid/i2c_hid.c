@@ -41,38 +41,46 @@
 #if I2C_DEBUG
 #define i2c_dbg(fmt, ...) kprintf(fmt, ##__VA_ARGS__)
 #else
-#define i2c_dbg(fmt, ...) do {} while(0)
+#define i2c_dbg(fmt, ...) \
+	do {              \
+	} while (0)
 #endif
 
 // Debug counters for interrupt-driven I2C HID (always present; cheap to
 // update even when I2C_DEBUG == 0 — they feed the i2c_dbg() prints).
-static volatile uint32_t g_dbg_gpio_isr_count = 0;     // Total GPIO ISR invocations
-static volatile uint32_t g_dbg_gpio_isr_hit = 0;       // ISR found pending bit
-static volatile uint32_t g_dbg_gpio_isr_miss = 0;      // ISR: no matching pending bit
-static volatile uint32_t g_dbg_worker_wake = 0;        // Worker woke up
-static volatile uint32_t g_dbg_worker_read = 0;        // Worker did an I2C read
-static volatile uint32_t g_dbg_worker_xfer_err = 0;    // I2C transfer errors
-static volatile uint32_t g_dbg_worker_null_pkt = 0;    // Null/short packets discarded
-static volatile uint32_t g_dbg_worker_null_id = 0;     // Null report ID discarded
+static volatile uint32_t g_dbg_gpio_isr_count = 0; // Total GPIO ISR invocations
+static volatile uint32_t g_dbg_gpio_isr_hit = 0; // ISR found pending bit
+static volatile uint32_t g_dbg_gpio_isr_miss =
+	0; // ISR: no matching pending bit
+static volatile uint32_t g_dbg_worker_wake = 0; // Worker woke up
+static volatile uint32_t g_dbg_worker_read = 0; // Worker did an I2C read
+static volatile uint32_t g_dbg_worker_xfer_err = 0; // I2C transfer errors
+static volatile uint32_t g_dbg_worker_null_pkt =
+	0; // Null/short packets discarded
+static volatile uint32_t g_dbg_worker_null_id = 0; // Null report ID discarded
 static volatile uint32_t g_dbg_worker_id_mismatch = 0; // Report ID mismatch
-static volatile uint32_t g_dbg_worker_processed = 0;   // Reports processed into mouse
-static volatile uint32_t g_dbg_worker_no_finger = 0;   // Reports skipped (no finger)
-static volatile uint32_t g_dbg_ie_reenable = 0;        // GPI_IE re-enabled count
-static volatile uint32_t g_dbg_i2c_isr_count = 0;      // Total I2C controller ISR invocations
-static volatile uint32_t g_dbg_xfer_abort_count = 0;   // Total xfer abort events
-static volatile uint32_t g_dbg_xfer_retry_count = 0;   // Total xfer retries
-static volatile uint32_t g_dbg_xfer_total = 0;         // Total xfer calls
-static volatile uint32_t g_dbg_xfer_ok = 0;            // Successful xfers
-static volatile uint64_t g_dbg_last_print_uptime = 0;  // Last periodic debug print time
+static volatile uint32_t g_dbg_worker_processed =
+	0; // Reports processed into mouse
+static volatile uint32_t g_dbg_worker_no_finger =
+	0; // Reports skipped (no finger)
+static volatile uint32_t g_dbg_ie_reenable = 0; // GPI_IE re-enabled count
+static volatile uint32_t g_dbg_i2c_isr_count =
+	0; // Total I2C controller ISR invocations
+static volatile uint32_t g_dbg_xfer_abort_count = 0; // Total xfer abort events
+static volatile uint32_t g_dbg_xfer_retry_count = 0; // Total xfer retries
+static volatile uint32_t g_dbg_xfer_total = 0; // Total xfer calls
+static volatile uint32_t g_dbg_xfer_ok = 0; // Successful xfers
+static volatile uint64_t g_dbg_last_print_uptime =
+	0; // Last periodic debug print time
 static volatile uint32_t g_dbg_gpio_line_deassert = 0; // ISR: line deasserted
-static volatile uint32_t g_dbg_verify_proactive = 0;   // Proactive verify reads
+static volatile uint32_t g_dbg_verify_proactive = 0; // Proactive verify reads
 
 #define I2C_SPEED_STANDARD_HZ 100000U
-#define I2C_SPEED_FAST_HZ     400000U
+#define I2C_SPEED_FAST_HZ 400000U
 
 static void dw_i2c_cache_acpi_timings(i2c_dw_controller_t *ctrl);
 static void dw_i2c_program_bus_timing(i2c_dw_controller_t *ctrl,
-                                      uint32_t speed_hz);
+				      uint32_t speed_hz);
 
 // ============================================================================
 // Private data
@@ -87,10 +95,12 @@ static int g_i2c_hid_device_count = 0;
 // GPIO interrupt state
 static gpio_community_t g_gpio_communities[GPIO_MAX_COMMUNITIES];
 static int g_gpio_community_count = 0;
-static uint64_t g_sbreg_bar = 0;     // P2SB sideband register BAR (physical)
+static uint64_t g_sbreg_bar = 0; // P2SB sideband register BAR (physical)
 static const gpio_platform_def_t *g_gpio_platform = NULL; // Detected platform
-static uint8_t g_gpio_ioapic_polarity = 0; // From GPIO controller _CRS (0=high, 1=low)
-static uint8_t g_gpio_ioapic_trigger  = 0; // From GPIO controller _CRS (0=level, 1=edge)
+static uint8_t g_gpio_ioapic_polarity =
+	0; // From GPIO controller _CRS (0=high, 1=low)
+static uint8_t g_gpio_ioapic_trigger =
+	0; // From GPIO controller _CRS (0=level, 1=edge)
 
 // ============================================================================
 // Intel GPIO platform tables (derived from Intel pinctrl drivers)
@@ -101,7 +111,11 @@ static uint8_t g_gpio_ioapic_trigger  = 0; // From GPIO controller _CRS (0=level
 //   gpio_base = ACPI GpioInt pin number base (or GPIO_NOMAP)
 // ============================================================================
 
-#define GPP(rn, b, e, gb) { .reg_num = (rn), .base = (b), .size = (uint8_t)((e)-(b)+1), .gpio_base = (gb) }
+#define GPP(rn, b, e, gb)                                           \
+	{                                                           \
+		.reg_num = (rn), .base = (b),                       \
+		.size = (uint8_t)((e) - (b) + 1), .gpio_base = (gb) \
+	}
 
 static const gpio_platform_def_t g_gpio_platforms[] = {
     // Meteor Lake-P (INTC105E, INTC1083)
@@ -296,7 +310,8 @@ static const gpio_platform_def_t g_gpio_platforms[] = {
     },
 };
 
-#define GPIO_NUM_PLATFORMS (sizeof(g_gpio_platforms) / sizeof(g_gpio_platforms[0]))
+#define GPIO_NUM_PLATFORMS \
+	(sizeof(g_gpio_platforms) / sizeof(g_gpio_platforms[0]))
 
 // LPSS I2C uses the DesignWare block at 0x000-0x1FF and LPSS private regs at
 // 0x200-0x2FF. One 4KB page covers the entire window we access here.
@@ -307,63 +322,75 @@ static const gpio_platform_def_t g_gpio_platforms[] = {
 // Utility functions
 // ============================================================================
 
-static void i2c_memset(void *dst, int val, size_t n) {
-    uint8_t *d = (uint8_t *)dst;
-    while (n--) *d++ = (uint8_t)val;
+static void i2c_memset(void *dst, int val, size_t n)
+{
+	uint8_t *d = (uint8_t *)dst;
+	while (n--)
+		*d++ = (uint8_t)val;
 }
 
-static void i2c_memcpy(void *dst, const void *src, size_t n) {
-    uint8_t *d = (uint8_t *)dst;
-    const uint8_t *s = (const uint8_t *)src;
-    while (n--) *d++ = *s++;
+static void i2c_memcpy(void *dst, const void *src, size_t n)
+{
+	uint8_t *d = (uint8_t *)dst;
+	const uint8_t *s = (const uint8_t *)src;
+	while (n--)
+		*d++ = *s++;
 }
 
-static void i2c_delay_us(int us) {
-    // Approximate microsecond delay via busy loop
-    // At ~2 GHz, ~2000 iterations per us
-    for (volatile int i = 0; i < us * 500; i++) {
-        __asm__ volatile("nop");
-    }
+static void i2c_delay_us(int us)
+{
+	// Approximate microsecond delay via busy loop
+	// At ~2 GHz, ~2000 iterations per us
+	for (volatile int i = 0; i < us * 500; i++) {
+		__asm__ volatile("nop");
+	}
 }
 
 // ============================================================================
 // DesignWare I2C Controller - Low-level register access
 // ============================================================================
 
-static inline uint32_t dw_read(i2c_dw_controller_t *ctrl, uint32_t reg) {
-    return *(volatile uint32_t *)((uint8_t *)ctrl->base + reg);
+static inline uint32_t dw_read(i2c_dw_controller_t *ctrl, uint32_t reg)
+{
+	return *(volatile uint32_t *)((uint8_t *)ctrl->base + reg);
 }
 
-static inline void dw_write(i2c_dw_controller_t *ctrl, uint32_t reg, uint32_t val) {
-    *(volatile uint32_t *)((uint8_t *)ctrl->base + reg) = val;
+static inline void dw_write(i2c_dw_controller_t *ctrl, uint32_t reg,
+			    uint32_t val)
+{
+	*(volatile uint32_t *)((uint8_t *)ctrl->base + reg) = val;
 }
 
 // Read LPSS private register (at base + 0x200 + offset)
-static inline uint32_t lpss_read(i2c_dw_controller_t *ctrl, uint32_t reg) {
-    return *(volatile uint32_t *)((uint8_t *)ctrl->base + 0x200 + reg - 0x200);
+static inline uint32_t lpss_read(i2c_dw_controller_t *ctrl, uint32_t reg)
+{
+	return *(volatile uint32_t *)((uint8_t *)ctrl->base + 0x200 + reg -
+				      0x200);
 }
 
-static inline void lpss_write(i2c_dw_controller_t *ctrl, uint32_t reg, uint32_t val) {
-    *(volatile uint32_t *)((uint8_t *)ctrl->base + reg) = val;
+static inline void lpss_write(i2c_dw_controller_t *ctrl, uint32_t reg,
+			      uint32_t val)
+{
+	*(volatile uint32_t *)((uint8_t *)ctrl->base + reg) = val;
 }
 
 static uint16_t pci_cfg_read16(uint8_t bus, uint8_t device, uint8_t function,
-                               uint8_t off)
+			       uint8_t off)
 {
-    uint32_t value = pci_cfg_read32(bus, device, function, off & 0xFC);
-    uint32_t shift = (off & 0x2) ? 16 : 0;
-    return (uint16_t)((value >> shift) & 0xFFFF);
+	uint32_t value = pci_cfg_read32(bus, device, function, off & 0xFC);
+	uint32_t shift = (off & 0x2) ? 16 : 0;
+	return (uint16_t)((value >> shift) & 0xFFFF);
 }
 
 static void pci_cfg_write16(uint8_t bus, uint8_t device, uint8_t function,
-                            uint8_t off, uint16_t value)
+			    uint8_t off, uint16_t value)
 {
-    uint8_t aligned = off & 0xFC;
-    uint32_t shift = (off & 0x2) ? 16 : 0;
-    uint32_t mask = 0xFFFFu << shift;
-    uint32_t current = pci_cfg_read32(bus, device, function, aligned);
-    uint32_t new_value = (current & ~mask) | ((uint32_t)value << shift);
-    pci_cfg_write32(bus, device, function, aligned, new_value);
+	uint8_t aligned = off & 0xFC;
+	uint32_t shift = (off & 0x2) ? 16 : 0;
+	uint32_t mask = 0xFFFFu << shift;
+	uint32_t current = pci_cfg_read32(bus, device, function, aligned);
+	uint32_t new_value = (current & ~mask) | ((uint32_t)value << shift);
+	pci_cfg_write32(bus, device, function, aligned, new_value);
 }
 
 // ============================================================================
@@ -376,368 +403,392 @@ static void pci_cfg_write16(uint8_t bus, uint8_t device, uint8_t function,
 // the write goes through the PCIe fabric and the PMC sees it.
 // ============================================================================
 
-static volatile uint8_t *g_ecam_bus0_va;  // VA covering bus 0 ECAM (1 MB)
+static volatile uint8_t *g_ecam_bus0_va; // VA covering bus 0 ECAM (1 MB)
 
 static int ecam_init_bus0(void)
 {
-    acpi_sdt_header_t *mcfg = acpi_find_table("MCFG");
-    if (!mcfg) {
-        i2c_dbg("[I2C-ECAM] no MCFG table\n");
-        return -1;
-    }
+	acpi_sdt_header_t *mcfg = acpi_find_table("MCFG");
+	if (!mcfg) {
+		i2c_dbg("[I2C-ECAM] no MCFG table\n");
+		return -1;
+	}
 
-    // MCFG layout: 36-byte SDT header + 8 reserved bytes + 16-byte allocs
-    uint8_t *data = (uint8_t *)mcfg + 44;
-    uint64_t base_phys;
-    i2c_memcpy(&base_phys, data, 8);
-    uint16_t seg;
-    i2c_memcpy(&seg, data + 8, 2);
-    uint8_t start_bus = data[10];
-    uint8_t end_bus   = data[11];
+	// MCFG layout: 36-byte SDT header + 8 reserved bytes + 16-byte allocs
+	uint8_t *data = (uint8_t *)mcfg + 44;
+	uint64_t base_phys;
+	i2c_memcpy(&base_phys, data, 8);
+	uint16_t seg;
+	i2c_memcpy(&seg, data + 8, 2);
+	uint8_t start_bus = data[10];
+	uint8_t end_bus = data[11];
 
-    i2c_dbg("[I2C-ECAM] MCFG base=0x%llx seg=%u bus=%u-%u\n",
-            (unsigned long long)base_phys, seg, start_bus, end_bus);
+	i2c_dbg("[I2C-ECAM] MCFG base=0x%llx seg=%u bus=%u-%u\n",
+		(unsigned long long)base_phys, seg, start_bus, end_bus);
 
-    if (start_bus > 0 || base_phys == 0) {
-        i2c_dbg("[I2C-ECAM] bus 0 not in range or base invalid\n");
-        return -1;
-    }
+	if (start_bus > 0 || base_phys == 0) {
+		i2c_dbg("[I2C-ECAM] bus 0 not in range or base invalid\n");
+		return -1;
+	}
 
-    // Map bus 0: 32 devs * 8 funcs * 4 KB = 1 MB = 256 pages
-    uint64_t va = mm_map_device_mmio(base_phys, 256);
-    if (!va) {
-        i2c_dbg("[I2C-ECAM] mm_map_device_mmio failed\n");
-        return -1;
-    }
-    g_ecam_bus0_va = (volatile uint8_t *)va;
-    return 0;
+	// Map bus 0: 32 devs * 8 funcs * 4 KB = 1 MB = 256 pages
+	uint64_t va = mm_map_device_mmio(base_phys, 256);
+	if (!va) {
+		i2c_dbg("[I2C-ECAM] mm_map_device_mmio failed\n");
+		return -1;
+	}
+	g_ecam_bus0_va = (volatile uint8_t *)va;
+	return 0;
 }
 
 // Return pointer into the ECAM mapping for (bus=0, dev, func, offset).
 // Falls back to NULL if ECAM is not available.
 static inline volatile void *ecam_addr(uint8_t dev, uint8_t func, uint16_t off)
 {
-    if (!g_ecam_bus0_va) return NULL;
-    return g_ecam_bus0_va + ((uint32_t)dev << 15) +
-                            ((uint32_t)func << 12) + off;
+	if (!g_ecam_bus0_va)
+		return NULL;
+	return g_ecam_bus0_va + ((uint32_t)dev << 15) + ((uint32_t)func << 12) +
+	       off;
 }
 
 // ECAM config accessors — fall back to CF8/CFC when ECAM is unavailable.
-static uint32_t ecam_read32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off)
+static uint32_t ecam_read32(uint8_t bus, uint8_t dev, uint8_t func,
+			    uint16_t off)
 {
-    if (bus == 0) {
-        volatile uint32_t *p = (volatile uint32_t *)ecam_addr(dev, func, off & ~3u);
-        if (p) return *p;
-    }
-    return pci_cfg_read32(bus, dev, func, (uint8_t)off);
+	if (bus == 0) {
+		volatile uint32_t *p =
+			(volatile uint32_t *)ecam_addr(dev, func, off & ~3u);
+		if (p)
+			return *p;
+	}
+	return pci_cfg_read32(bus, dev, func, (uint8_t)off);
 }
 
-static void ecam_write32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint32_t val)
+static void ecam_write32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off,
+			 uint32_t val)
 {
-    if (bus == 0) {
-        volatile uint32_t *p = (volatile uint32_t *)ecam_addr(dev, func, off & ~3u);
-        if (p) { *p = val; return; }
-    }
-    pci_cfg_write32(bus, dev, func, (uint8_t)off, val);
+	if (bus == 0) {
+		volatile uint32_t *p =
+			(volatile uint32_t *)ecam_addr(dev, func, off & ~3u);
+		if (p) {
+			*p = val;
+			return;
+		}
+	}
+	pci_cfg_write32(bus, dev, func, (uint8_t)off, val);
 }
 
-static uint16_t ecam_read16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off)
+static uint16_t ecam_read16(uint8_t bus, uint8_t dev, uint8_t func,
+			    uint16_t off)
 {
-    if (bus == 0) {
-        volatile uint16_t *p = (volatile uint16_t *)ecam_addr(dev, func, off & ~1u);
-        if (p) return *p;
-    }
-    return pci_cfg_read16(bus, dev, func, (uint8_t)off);
+	if (bus == 0) {
+		volatile uint16_t *p =
+			(volatile uint16_t *)ecam_addr(dev, func, off & ~1u);
+		if (p)
+			return *p;
+	}
+	return pci_cfg_read16(bus, dev, func, (uint8_t)off);
 }
 
-static void ecam_write16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off, uint16_t val)
+static void ecam_write16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t off,
+			 uint16_t val)
 {
-    if (bus == 0) {
-        volatile uint16_t *p = (volatile uint16_t *)ecam_addr(dev, func, off & ~1u);
-        if (p) { *p = val; return; }
-    }
-    pci_cfg_write16(bus, dev, func, (uint8_t)off, val);
+	if (bus == 0) {
+		volatile uint16_t *p =
+			(volatile uint16_t *)ecam_addr(dev, func, off & ~1u);
+		if (p) {
+			*p = val;
+			return;
+		}
+	}
+	pci_cfg_write16(bus, dev, func, (uint8_t)off, val);
 }
 
 // ============================================================================
 // DesignWare I2C Controller - Initialization
 // ============================================================================
 
-static int dw_i2c_disable(i2c_dw_controller_t *ctrl) {
-    uint32_t raw_intr = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
-    uint32_t status = dw_read(ctrl, DW_IC_STATUS);
-    uint32_t enable = dw_read(ctrl, DW_IC_ENABLE);
+static int dw_i2c_disable(i2c_dw_controller_t *ctrl)
+{
+	uint32_t raw_intr = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+	uint32_t status = dw_read(ctrl, DW_IC_STATUS);
+	uint32_t enable = dw_read(ctrl, DW_IC_ENABLE);
 
-    // Handle a DW master that is still holding the bus with an empty
-    // TX FIFO by requesting a hardware abort before disable. Without this,
-    // disabling mid-hold can strand the controller and all later pure reads
-    // devolve into abort_src=0x0 with no further GPIO activity.
-    if ((raw_intr & DW_IC_INTR_MST_ON_HOLD) ||
-        (status & DW_IC_STATUS_MST_HOLD_TX_FIFO_EMPTY)) {
-        if (!(enable & 1)) {
-            dw_write(ctrl, DW_IC_ENABLE, 1);
-            i2c_delay_us(25);
-            enable = 1;
-        }
+	// Handle a DW master that is still holding the bus with an empty
+	// TX FIFO by requesting a hardware abort before disable. Without this,
+	// disabling mid-hold can strand the controller and all later pure reads
+	// devolve into abort_src=0x0 with no further GPIO activity.
+	if ((raw_intr & DW_IC_INTR_MST_ON_HOLD) ||
+	    (status & DW_IC_STATUS_MST_HOLD_TX_FIFO_EMPTY)) {
+		if (!(enable & 1)) {
+			dw_write(ctrl, DW_IC_ENABLE, 1);
+			i2c_delay_us(25);
+			enable = 1;
+		}
 
-        dw_write(ctrl, DW_IC_ENABLE, enable | DW_IC_ENABLE_ABORT);
-        for (int i = 0; i < 100; i++) {
-            if (!(dw_read(ctrl, DW_IC_ENABLE) & DW_IC_ENABLE_ABORT))
-                break;
-            i2c_delay_us(10);
-        }
-    }
+		dw_write(ctrl, DW_IC_ENABLE, enable | DW_IC_ENABLE_ABORT);
+		for (int i = 0; i < 100; i++) {
+			if (!(dw_read(ctrl, DW_IC_ENABLE) & DW_IC_ENABLE_ABORT))
+				break;
+			i2c_delay_us(10);
+		}
+	}
 
-    dw_write(ctrl, DW_IC_ENABLE, 0);
+	dw_write(ctrl, DW_IC_ENABLE, 0);
 
-    // On Arrow Lake, IC_ENABLE_STATUS (0x9C) reads as SRAM garbage when
-    // the DW core's combinational logic isn't clocked. Use IC_ENABLE (0x6C)
-    // readback as fallback — it's a R/W register that always works.
-    for (int i = 0; i < 10000; i++) {
-        uint32_t en_st = dw_read(ctrl, DW_IC_ENABLE_STATUS);
-        if ((en_st & DW_IC_EN_STATUS_IC_EN) == 0)
-            return 0;
-        // Fallback: if IC_ENABLE reads back 0, assume disabled
-        uint32_t en_reg = dw_read(ctrl, DW_IC_ENABLE);
-        if (en_reg == 0) {
-            i2c_delay_us(100);
-            return 0;
-        }
-        i2c_delay_us(1);
-    }
-    // Even on timeout, the write probably took effect — proceed anyway
-    i2c_delay_us(1000);
-    return 0;
+	// On Arrow Lake, IC_ENABLE_STATUS (0x9C) reads as SRAM garbage when
+	// the DW core's combinational logic isn't clocked. Use IC_ENABLE (0x6C)
+	// readback as fallback — it's a R/W register that always works.
+	for (int i = 0; i < 10000; i++) {
+		uint32_t en_st = dw_read(ctrl, DW_IC_ENABLE_STATUS);
+		if ((en_st & DW_IC_EN_STATUS_IC_EN) == 0)
+			return 0;
+		// Fallback: if IC_ENABLE reads back 0, assume disabled
+		uint32_t en_reg = dw_read(ctrl, DW_IC_ENABLE);
+		if (en_reg == 0) {
+			i2c_delay_us(100);
+			return 0;
+		}
+		i2c_delay_us(1);
+	}
+	// Even on timeout, the write probably took effect — proceed anyway
+	i2c_delay_us(1000);
+	return 0;
 }
 
-static int dw_i2c_enable(i2c_dw_controller_t *ctrl) {
-    dw_write(ctrl, DW_IC_ENABLE, 1);
+static int dw_i2c_enable(i2c_dw_controller_t *ctrl)
+{
+	dw_write(ctrl, DW_IC_ENABLE, 1);
 
-    for (int i = 0; i < 10000; i++) {
-        uint32_t en_st = dw_read(ctrl, DW_IC_ENABLE_STATUS);
-        if (en_st & DW_IC_EN_STATUS_IC_EN)
-            return 0;
-        // Fallback: if IC_ENABLE reads back 1, assume enabled
-        uint32_t en_reg = dw_read(ctrl, DW_IC_ENABLE);
-        if (en_reg == 1) {
-            i2c_delay_us(100);
-            return 0;
-        }
-        i2c_delay_us(1);
-    }
-    i2c_delay_us(1000);
-    return 0;
+	for (int i = 0; i < 10000; i++) {
+		uint32_t en_st = dw_read(ctrl, DW_IC_ENABLE_STATUS);
+		if (en_st & DW_IC_EN_STATUS_IC_EN)
+			return 0;
+		// Fallback: if IC_ENABLE reads back 1, assume enabled
+		uint32_t en_reg = dw_read(ctrl, DW_IC_ENABLE);
+		if (en_reg == 1) {
+			i2c_delay_us(100);
+			return 0;
+		}
+		i2c_delay_us(1);
+	}
+	i2c_delay_us(1000);
+	return 0;
 }
 
 static int dw_i2c_wait_bus_not_busy(i2c_dw_controller_t *ctrl, int timeout_us);
 
 static void dw_i2c_clear_pending_irqs(i2c_dw_controller_t *ctrl)
 {
-    uint32_t raw_stat = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+	uint32_t raw_stat = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
 
-    if (raw_stat & DW_IC_INTR_TX_ABRT)
-        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-    if (raw_stat & DW_IC_INTR_STOP_DET)
-        (void)dw_read(ctrl, DW_IC_CLR_STOP_DET);
-    if (raw_stat & DW_IC_INTR_START_DET)
-        (void)dw_read(ctrl, DW_IC_CLR_START_DET);
-    if (raw_stat & DW_IC_INTR_RESTART_DET)
-        (void)dw_read(ctrl, DW_IC_CLR_RESTART_DET);
-    if (raw_stat & DW_IC_INTR_RX_OVER)
-        (void)dw_read(ctrl, DW_IC_CLR_RX_OVER);
-    if (raw_stat & DW_IC_INTR_RX_UNDER)
-        (void)dw_read(ctrl, DW_IC_CLR_RX_UNDER);
-    if (raw_stat & DW_IC_INTR_TX_OVER)
-        (void)dw_read(ctrl, DW_IC_CLR_TX_OVER);
-    if (raw_stat & DW_IC_INTR_ACTIVITY)
-        (void)dw_read(ctrl, DW_IC_CLR_ACTIVITY);
-    (void)dw_read(ctrl, DW_IC_CLR_INTR);
+	if (raw_stat & DW_IC_INTR_TX_ABRT)
+		(void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+	if (raw_stat & DW_IC_INTR_STOP_DET)
+		(void)dw_read(ctrl, DW_IC_CLR_STOP_DET);
+	if (raw_stat & DW_IC_INTR_START_DET)
+		(void)dw_read(ctrl, DW_IC_CLR_START_DET);
+	if (raw_stat & DW_IC_INTR_RESTART_DET)
+		(void)dw_read(ctrl, DW_IC_CLR_RESTART_DET);
+	if (raw_stat & DW_IC_INTR_RX_OVER)
+		(void)dw_read(ctrl, DW_IC_CLR_RX_OVER);
+	if (raw_stat & DW_IC_INTR_RX_UNDER)
+		(void)dw_read(ctrl, DW_IC_CLR_RX_UNDER);
+	if (raw_stat & DW_IC_INTR_TX_OVER)
+		(void)dw_read(ctrl, DW_IC_CLR_TX_OVER);
+	if (raw_stat & DW_IC_INTR_ACTIVITY)
+		(void)dw_read(ctrl, DW_IC_CLR_ACTIVITY);
+	(void)dw_read(ctrl, DW_IC_CLR_INTR);
 }
 
 static void dw_i2c_recover_aborted_xfer(i2c_dw_controller_t *ctrl)
 {
-    uint32_t status;
-    uint32_t enable;
-    uint32_t raw_stat;
+	uint32_t status;
+	uint32_t enable;
+	uint32_t raw_stat;
 
-    dw_write(ctrl, DW_IC_INTR_MASK, 0);
+	dw_write(ctrl, DW_IC_INTR_MASK, 0);
 
-    status = dw_read(ctrl, DW_IC_STATUS);
-    enable = dw_read(ctrl, DW_IC_ENABLE);
-    raw_stat = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+	status = dw_read(ctrl, DW_IC_STATUS);
+	enable = dw_read(ctrl, DW_IC_ENABLE);
+	raw_stat = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
 
-    if ((enable & 1) &&
-        ((raw_stat & (DW_IC_INTR_TX_ABRT | DW_IC_INTR_MST_ON_HOLD |
-                      DW_IC_INTR_STOP_DET)) ||
-         (status & (DW_IC_STATUS_ACTIVITY | DW_IC_STATUS_MST_ACTIVITY |
-                    DW_IC_STATUS_MST_HOLD_TX_FIFO_EMPTY)))) {
-        dw_write(ctrl, DW_IC_ENABLE, 1 | DW_IC_ENABLE_ABORT);
-        for (int i = 0; i < 2500; i++) {
-            uint32_t cur_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
-            uint32_t cur_status = dw_read(ctrl, DW_IC_STATUS);
-            uint32_t cur_enable = dw_read(ctrl, DW_IC_ENABLE);
+	if ((enable & 1) &&
+	    ((raw_stat & (DW_IC_INTR_TX_ABRT | DW_IC_INTR_MST_ON_HOLD |
+			  DW_IC_INTR_STOP_DET)) ||
+	     (status & (DW_IC_STATUS_ACTIVITY | DW_IC_STATUS_MST_ACTIVITY |
+			DW_IC_STATUS_MST_HOLD_TX_FIFO_EMPTY)))) {
+		dw_write(ctrl, DW_IC_ENABLE, 1 | DW_IC_ENABLE_ABORT);
+		for (int i = 0; i < 2500; i++) {
+			uint32_t cur_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+			uint32_t cur_status = dw_read(ctrl, DW_IC_STATUS);
+			uint32_t cur_enable = dw_read(ctrl, DW_IC_ENABLE);
 
-            if (cur_raw & DW_IC_INTR_STOP_DET) {
-                (void)dw_read(ctrl, DW_IC_CLR_STOP_DET);
-                break;
-            }
+			if (cur_raw & DW_IC_INTR_STOP_DET) {
+				(void)dw_read(ctrl, DW_IC_CLR_STOP_DET);
+				break;
+			}
 
-            if (!(cur_enable & DW_IC_ENABLE_ABORT) &&
-                !(cur_status & (DW_IC_STATUS_ACTIVITY |
-                                DW_IC_STATUS_MST_ACTIVITY |
-                                DW_IC_STATUS_MST_HOLD_TX_FIFO_EMPTY))) {
-                break;
-            }
+			if (!(cur_enable & DW_IC_ENABLE_ABORT) &&
+			    !(cur_status &
+			      (DW_IC_STATUS_ACTIVITY |
+			       DW_IC_STATUS_MST_ACTIVITY |
+			       DW_IC_STATUS_MST_HOLD_TX_FIFO_EMPTY))) {
+				break;
+			}
 
-            i2c_delay_us(10);
-        }
-    }
+			i2c_delay_us(10);
+		}
+	}
 
-    dw_i2c_disable(ctrl);
-    dw_i2c_wait_bus_not_busy(ctrl, 25000);
-    dw_i2c_clear_pending_irqs(ctrl);
+	dw_i2c_disable(ctrl);
+	dw_i2c_wait_bus_not_busy(ctrl, 25000);
+	dw_i2c_clear_pending_irqs(ctrl);
 
-    while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
-        (void)dw_read(ctrl, DW_IC_DATA_CMD);
+	while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
+		(void)dw_read(ctrl, DW_IC_DATA_CMD);
 
-    ctrl->current_target = 0xFFFF;
+	ctrl->current_target = 0xFFFF;
 }
 
-static int dw_i2c_init_controller(i2c_dw_controller_t *ctrl) {
-    volatile uint8_t *priv = (volatile uint8_t *)ctrl->base + 0x200;
-    uint32_t bar_lo = (uint32_t)(ctrl->bar_phys & 0xFFFFFFFF);
-    uint32_t bar_hi = (uint32_t)(ctrl->bar_phys >> 32);
-    uint32_t ic_con_existing;
-    int dw_alive = 0;
+static int dw_i2c_init_controller(i2c_dw_controller_t *ctrl)
+{
+	volatile uint8_t *priv = (volatile uint8_t *)ctrl->base + 0x200;
+	uint32_t bar_lo = (uint32_t)(ctrl->bar_phys & 0xFFFFFFFF);
+	uint32_t bar_hi = (uint32_t)(ctrl->bar_phys >> 32);
+	uint32_t ic_con_existing;
+	int dw_alive = 0;
 
-    // ---- intel_lpss_init_dev() equivalent ----
-    // Step 1: Assert reset (put device in reset state)
-    *(volatile uint32_t *)(priv + (LPSS_PRIV_RESETS - 0x200)) = 0;
-    i2c_delay_us(2000);
+	// ---- intel_lpss_init_dev() equivalent ----
+	// Step 1: Assert reset (put device in reset state)
+	*(volatile uint32_t *)(priv + (LPSS_PRIV_RESETS - 0x200)) = 0;
+	i2c_delay_us(2000);
 
-    // Step 2: Deassert reset (bring device out of reset)
-    *(volatile uint32_t *)(priv + (LPSS_PRIV_RESETS - 0x200)) =
-        LPSS_RESETS_FUNC | LPSS_RESETS_IDMA;
-    i2c_delay_us(2000);
+	// Step 2: Deassert reset (bring device out of reset)
+	*(volatile uint32_t *)(priv + (LPSS_PRIV_RESETS - 0x200)) =
+		LPSS_RESETS_FUNC | LPSS_RESETS_IDMA;
+	i2c_delay_us(2000);
 
-    // Step 3: Set remap address (BAR physical address)
-    *(volatile uint32_t *)(priv + (LPSS_PRIV_REMAP_ADDR_LO - 0x200)) = bar_lo;
-    *(volatile uint32_t *)(priv + (LPSS_PRIV_REMAP_ADDR_HI - 0x200)) = bar_hi;
-    i2c_delay_us(1000);
+	// Step 3: Set remap address (BAR physical address)
+	*(volatile uint32_t *)(priv + (LPSS_PRIV_REMAP_ADDR_LO - 0x200)) =
+		bar_lo;
+	*(volatile uint32_t *)(priv + (LPSS_PRIV_REMAP_ADDR_HI - 0x200)) =
+		bar_hi;
+	i2c_delay_us(1000);
 
-    // Disable controller
-    dw_write(ctrl, DW_IC_ENABLE, 0);
-    i2c_delay_us(1000);
+	// Disable controller
+	dw_write(ctrl, DW_IC_ENABLE, 0);
+	i2c_delay_us(1000);
 
-    // Poll for comp_type to confirm DW core is alive (up to 1s)
-    for (int attempt = 0; attempt < 100; attempt++) {
-        uint32_t ct = dw_read(ctrl, DW_IC_COMP_TYPE);
-        if (ct == DW_IC_COMP_TYPE_VALUE) {
-            i2c_dbg("[I2C%d] DW core alive (attempt %d)\n",
-                    ctrl->bus_id, attempt);
-            dw_alive = 1;
-            break;
-        }
-        i2c_delay_us(10000);  // 10ms between attempts
-    }
+	// Poll for comp_type to confirm DW core is alive (up to 1s)
+	for (int attempt = 0; attempt < 100; attempt++) {
+		uint32_t ct = dw_read(ctrl, DW_IC_COMP_TYPE);
+		if (ct == DW_IC_COMP_TYPE_VALUE) {
+			i2c_dbg("[I2C%d] DW core alive (attempt %d)\n",
+				ctrl->bus_id, attempt);
+			dw_alive = 1;
+			break;
+		}
+		i2c_delay_us(10000); // 10ms between attempts
+	}
 
-    if (!dw_alive) {
-        kprintf("[I2C%d] FAIL ct=0x%08x\n", ctrl->bus_id,
-                dw_read(ctrl, DW_IC_COMP_TYPE));
-        return -1;
-    }
+	if (!dw_alive) {
+		kprintf("[I2C%d] FAIL ct=0x%08x\n", ctrl->bus_id,
+			dw_read(ctrl, DW_IC_COMP_TYPE));
+		return -1;
+	}
 
-    // Verify LPSS CAPABILITIES confirms I2C type
-    uint32_t caps = *(volatile uint32_t *)(priv + (LPSS_PRIV_CAPABILITIES - 0x200));
-    uint32_t caps_type = (caps & LPSS_CAPS_TYPE_MASK) >> LPSS_CAPS_TYPE_SHIFT;
-    if (caps_type != LPSS_DEV_TYPE_I2C) {
-        kprintf("[I2C%d] FAIL caps type=%u val=0x%08x\n",
-                ctrl->bus_id, caps_type, caps);
-        return -1;
-    }
+	// Verify LPSS CAPABILITIES confirms I2C type
+	uint32_t caps =
+		*(volatile uint32_t *)(priv + (LPSS_PRIV_CAPABILITIES - 0x200));
+	uint32_t caps_type =
+		(caps & LPSS_CAPS_TYPE_MASK) >> LPSS_CAPS_TYPE_SHIFT;
+	if (caps_type != LPSS_DEV_TYPE_I2C) {
+		kprintf("[I2C%d] FAIL caps type=%u val=0x%08x\n", ctrl->bus_id,
+			caps_type, caps);
+		return -1;
+	}
 
-    // ---- Step 5: Disable controller for configuration ----
-    dw_write(ctrl, DW_IC_ENABLE, 0);
-    for (int w = 0; w < 500000; w++) {
-        if ((dw_read(ctrl, DW_IC_ENABLE_STATUS) & DW_IC_EN_STATUS_IC_EN) == 0)
-            break;
-        i2c_delay_us(1);
-    }
+	// ---- Step 5: Disable controller for configuration ----
+	dw_write(ctrl, DW_IC_ENABLE, 0);
+	for (int w = 0; w < 500000; w++) {
+		if ((dw_read(ctrl, DW_IC_ENABLE_STATUS) &
+		     DW_IC_EN_STATUS_IC_EN) == 0)
+			break;
+		i2c_delay_us(1);
+	}
 
-    // ---- Step 6: Read hardware parameters ----
-    uint32_t comp_param = dw_read(ctrl, DW_IC_COMP_PARAM_1);
-    uint32_t rx_depth = ((comp_param >> 8) & 0xFF) + 1;
-    uint32_t tx_depth = ((comp_param >> 16) & 0xFF) + 1;
-    if (rx_depth > 256 || tx_depth > 256 || rx_depth == 1) {
-        rx_depth = 64;
-        tx_depth = 64;
-    }
-    ctrl->rx_fifo_depth = rx_depth;
-    ctrl->tx_fifo_depth = tx_depth;
+	// ---- Step 6: Read hardware parameters ----
+	uint32_t comp_param = dw_read(ctrl, DW_IC_COMP_PARAM_1);
+	uint32_t rx_depth = ((comp_param >> 8) & 0xFF) + 1;
+	uint32_t tx_depth = ((comp_param >> 16) & 0xFF) + 1;
+	if (rx_depth > 256 || tx_depth > 256 || rx_depth == 1) {
+		rx_depth = 64;
+		tx_depth = 64;
+	}
+	ctrl->rx_fifo_depth = rx_depth;
+	ctrl->tx_fifo_depth = tx_depth;
 
-    // ---- Step 7: Configure controller ----
-    ic_con_existing = dw_read(ctrl, DW_IC_CON);
-    (void)ic_con_existing;
-    dw_i2c_program_bus_timing(ctrl, I2C_SPEED_STANDARD_HZ);
+	// ---- Step 7: Configure controller ----
+	ic_con_existing = dw_read(ctrl, DW_IC_CON);
+	(void)ic_con_existing;
+	dw_i2c_program_bus_timing(ctrl, I2C_SPEED_STANDARD_HZ);
 
-    // Spike suppression filter (SS/FS datasheet default = 7)
-    dw_write(ctrl, DW_IC_FS_SPKLEN, 7);
+	// Spike suppression filter (SS/FS datasheet default = 7)
+	dw_write(ctrl, DW_IC_FS_SPKLEN, 7);
 
-    // Firmware can leave the SMBus sideband interrupt block armed.
-    // Explicitly mask it during init to avoid unrelated interrupt
-    // status from perturbing the controller state machine.
-    dw_write(ctrl, DW_IC_SMBUS_INTR_MASK, 0);
+	// Firmware can leave the SMBus sideband interrupt block armed.
+	// Explicitly mask it during init to avoid unrelated interrupt
+	// status from perturbing the controller state machine.
+	dw_write(ctrl, DW_IC_SMBUS_INTR_MASK, 0);
 
-    // FIFO thresholds
-    dw_write(ctrl, DW_IC_RX_TL, 0);
-    dw_write(ctrl, DW_IC_TX_TL, 0);
+	// FIFO thresholds
+	dw_write(ctrl, DW_IC_RX_TL, 0);
+	dw_write(ctrl, DW_IC_TX_TL, 0);
 
-    // Disable all interrupts (we use polling)
-    dw_write(ctrl, DW_IC_INTR_MASK, 0);
+	// Disable all interrupts (we use polling)
+	dw_write(ctrl, DW_IC_INTR_MASK, 0);
 
-    // Clear any pending interrupts/aborts (SRAM garbage may set flags)
-    (void)dw_read(ctrl, DW_IC_CLR_INTR);
-    (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-    (void)dw_read(ctrl, DW_IC_CLR_RX_OVER);
-    (void)dw_read(ctrl, DW_IC_CLR_RX_UNDER);
-    (void)dw_read(ctrl, DW_IC_CLR_TX_OVER);
+	// Clear any pending interrupts/aborts (SRAM garbage may set flags)
+	(void)dw_read(ctrl, DW_IC_CLR_INTR);
+	(void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+	(void)dw_read(ctrl, DW_IC_CLR_RX_OVER);
+	(void)dw_read(ctrl, DW_IC_CLR_RX_UNDER);
+	(void)dw_read(ctrl, DW_IC_CLR_TX_OVER);
 
-    // Dump status while disabled
-    i2c_dbg("[I2C%d] After config (disabled): IC_CON=0x%x IC_ENABLE=0x%x "
-            "STATUS=0x%x EN_ST=0x%x RAW_INTR=0x%x\n",
-            ctrl->bus_id,
-            dw_read(ctrl, DW_IC_CON),
-            dw_read(ctrl, DW_IC_ENABLE),
-            dw_read(ctrl, DW_IC_STATUS),
-            dw_read(ctrl, DW_IC_ENABLE_STATUS),
-            dw_read(ctrl, DW_IC_RAW_INTR_STAT));
+	// Dump status while disabled
+	i2c_dbg("[I2C%d] After config (disabled): IC_CON=0x%x IC_ENABLE=0x%x "
+		"STATUS=0x%x EN_ST=0x%x RAW_INTR=0x%x\n",
+		ctrl->bus_id, dw_read(ctrl, DW_IC_CON),
+		dw_read(ctrl, DW_IC_ENABLE), dw_read(ctrl, DW_IC_STATUS),
+		dw_read(ctrl, DW_IC_ENABLE_STATUS),
+		dw_read(ctrl, DW_IC_RAW_INTR_STAT));
 
-    // ---- Now ENABLE the controller and check if status comes alive ----
-    dw_write(ctrl, DW_IC_ENABLE, 1);
-    i2c_delay_us(5000);  // 5ms for clocks to stabilize
+	// ---- Now ENABLE the controller and check if status comes alive ----
+	dw_write(ctrl, DW_IC_ENABLE, 1);
+	i2c_delay_us(5000); // 5ms for clocks to stabilize
 
-    // Clear interrupts again after enable
-    (void)dw_read(ctrl, DW_IC_CLR_INTR);
-    (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+	// Clear interrupts again after enable
+	(void)dw_read(ctrl, DW_IC_CLR_INTR);
+	(void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
 
-    uint32_t en_status = dw_read(ctrl, DW_IC_STATUS);
-    uint32_t en_en_st = dw_read(ctrl, DW_IC_ENABLE_STATUS);
-    uint32_t en_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
-    uint32_t en_enable = dw_read(ctrl, DW_IC_ENABLE);
-    i2c_dbg("[I2C%d] After enable: IC_ENABLE=0x%x STATUS=0x%x EN_ST=0x%x "
-            "RAW_INTR=0x%x\n",
-            ctrl->bus_id, en_enable, en_status, en_en_st, en_raw);
+	uint32_t en_status = dw_read(ctrl, DW_IC_STATUS);
+	uint32_t en_en_st = dw_read(ctrl, DW_IC_ENABLE_STATUS);
+	uint32_t en_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+	uint32_t en_enable = dw_read(ctrl, DW_IC_ENABLE);
+	i2c_dbg("[I2C%d] After enable: IC_ENABLE=0x%x STATUS=0x%x EN_ST=0x%x "
+		"RAW_INTR=0x%x\n",
+		ctrl->bus_id, en_enable, en_status, en_en_st, en_raw);
 
-    // Disable again before returning (set_target will re-enable)
-    dw_write(ctrl, DW_IC_ENABLE, 0);
-    i2c_delay_us(1000);
+	// Disable again before returning (set_target will re-enable)
+	dw_write(ctrl, DW_IC_ENABLE, 0);
+	i2c_delay_us(1000);
 
-    kprintf("[I2C%d] Initialized (FIFO: RX=%u TX=%u)\n",
-            ctrl->bus_id, ctrl->rx_fifo_depth, ctrl->tx_fifo_depth);
+	kprintf("[I2C%d] Initialized (FIFO: RX=%u TX=%u)\n", ctrl->bus_id,
+		ctrl->rx_fifo_depth, ctrl->tx_fifo_depth);
 
-    ctrl->active = 1;
-    ctrl->current_target = 0xFFFF;  // Force first set_target to program TAR
-    return 0;
+	ctrl->active = 1;
+	ctrl->current_target = 0xFFFF; // Force first set_target to program TAR
+	return 0;
 }
 
 // ============================================================================
@@ -746,15 +797,15 @@ static int dw_i2c_init_controller(i2c_dw_controller_t *ctrl) {
 
 // Forward declaration for interrupt-driven transfer
 static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
-                            const uint8_t *wbuf, int wlen,
-                            uint8_t *rbuf, int rlen);
+			   const uint8_t *wbuf, int wlen, uint8_t *rbuf,
+			   int rlen);
 
 // Forward declaration for worker thread
 static void i2c_hid_worker_thread(void *arg);
 
 // Forward declaration for length-first I2C HID read
-static int i2c_hid_read_length_first(i2c_hid_device_t *dev,
-                                     uint8_t *buf, uint16_t buf_size);
+static int i2c_hid_read_length_first(i2c_hid_device_t *dev, uint8_t *buf,
+				     uint16_t buf_size);
 
 // Forward declaration for effective HID input read length
 static uint16_t i2c_hid_input_read_len(const i2c_hid_device_t *dev);
@@ -764,208 +815,217 @@ static uint32_t i2c_hid_silent_verify_delay_ticks(uint8_t attempts);
 
 static uint16_t dw_i2c_clamp_count(uint64_t value, uint16_t fallback)
 {
-    if (value == 0 || value > 0xFFFF)
-        return fallback;
-    return (uint16_t)value;
+	if (value == 0 || value > 0xFFFF)
+		return fallback;
+	return (uint16_t)value;
 }
 
 static uint32_t dw_i2c_clamp_hold(uint64_t value, uint32_t fallback)
 {
-    if (value == 0 || value > 0xFFFFFFFFULL)
-        return fallback;
-    return (uint32_t)value;
+	if (value == 0 || value > 0xFFFFFFFFULL)
+		return fallback;
+	return (uint32_t)value;
 }
 
 static void dw_i2c_cache_acpi_timings(i2c_dw_controller_t *ctrl)
 {
-    uint64_t values[3];
+	uint64_t values[3];
 
-    if (!ctrl->acpi_path[0])
-        return;
+	if (!ctrl->acpi_path[0])
+		return;
 
-    if (acpi_aml_exec_device_method_pkg3(ctrl->acpi_path, "SSCN", values) == 0) {
-        ctrl->ss_hcnt = dw_i2c_clamp_count(values[0], 500);
-        ctrl->ss_lcnt = dw_i2c_clamp_count(values[1], 588);
-        ctrl->ss_sda_hold = dw_i2c_clamp_hold(values[2], 0x001C001C);
-        ctrl->have_ss_timing = 1;
-        i2c_dbg("[I2C%d] ACPI SSCN h=%u l=%u hold=0x%x\n",
-                ctrl->bus_id, ctrl->ss_hcnt, ctrl->ss_lcnt,
-                ctrl->ss_sda_hold);
-    }
+	if (acpi_aml_exec_device_method_pkg3(ctrl->acpi_path, "SSCN", values) ==
+	    0) {
+		ctrl->ss_hcnt = dw_i2c_clamp_count(values[0], 500);
+		ctrl->ss_lcnt = dw_i2c_clamp_count(values[1], 588);
+		ctrl->ss_sda_hold = dw_i2c_clamp_hold(values[2], 0x001C001C);
+		ctrl->have_ss_timing = 1;
+		i2c_dbg("[I2C%d] ACPI SSCN h=%u l=%u hold=0x%x\n", ctrl->bus_id,
+			ctrl->ss_hcnt, ctrl->ss_lcnt, ctrl->ss_sda_hold);
+	}
 
-    if (acpi_aml_exec_device_method_pkg3(ctrl->acpi_path, "FMCN", values) == 0) {
-        ctrl->fs_hcnt = dw_i2c_clamp_count(values[0], 160);
-        ctrl->fs_lcnt = dw_i2c_clamp_count(values[1], 320);
-        ctrl->fs_sda_hold = dw_i2c_clamp_hold(values[2], 0x001C001C);
-        ctrl->have_fs_timing = 1;
-        i2c_dbg("[I2C%d] ACPI FMCN h=%u l=%u hold=0x%x\n",
-                ctrl->bus_id, ctrl->fs_hcnt, ctrl->fs_lcnt,
-                ctrl->fs_sda_hold);
-    }
+	if (acpi_aml_exec_device_method_pkg3(ctrl->acpi_path, "FMCN", values) ==
+	    0) {
+		ctrl->fs_hcnt = dw_i2c_clamp_count(values[0], 160);
+		ctrl->fs_lcnt = dw_i2c_clamp_count(values[1], 320);
+		ctrl->fs_sda_hold = dw_i2c_clamp_hold(values[2], 0x001C001C);
+		ctrl->have_fs_timing = 1;
+		i2c_dbg("[I2C%d] ACPI FMCN h=%u l=%u hold=0x%x\n", ctrl->bus_id,
+			ctrl->fs_hcnt, ctrl->fs_lcnt, ctrl->fs_sda_hold);
+	}
 }
 
 static void dw_i2c_program_bus_timing(i2c_dw_controller_t *ctrl,
-                                      uint32_t speed_hz)
+				      uint32_t speed_hz)
 {
-    uint16_t ss_hcnt = ctrl->have_ss_timing ? ctrl->ss_hcnt : 500;
-    uint16_t ss_lcnt = ctrl->have_ss_timing ? ctrl->ss_lcnt : 588;
-    uint16_t fs_hcnt = ctrl->have_fs_timing ? ctrl->fs_hcnt : 160;
-    uint16_t fs_lcnt = ctrl->have_fs_timing ? ctrl->fs_lcnt : 320;
-    uint32_t ic_con_existing = dw_read(ctrl, DW_IC_CON);
-    uint32_t speed_bits = DW_IC_CON_SPEED_SS;
-    uint32_t sda_hold = ctrl->have_ss_timing ? ctrl->ss_sda_hold : 0x001C001C;
+	uint16_t ss_hcnt = ctrl->have_ss_timing ? ctrl->ss_hcnt : 500;
+	uint16_t ss_lcnt = ctrl->have_ss_timing ? ctrl->ss_lcnt : 588;
+	uint16_t fs_hcnt = ctrl->have_fs_timing ? ctrl->fs_hcnt : 160;
+	uint16_t fs_lcnt = ctrl->have_fs_timing ? ctrl->fs_lcnt : 320;
+	uint32_t ic_con_existing = dw_read(ctrl, DW_IC_CON);
+	uint32_t speed_bits = DW_IC_CON_SPEED_SS;
+	uint32_t sda_hold =
+		ctrl->have_ss_timing ? ctrl->ss_sda_hold : 0x001C001C;
 
-    if (speed_hz > I2C_SPEED_STANDARD_HZ) {
-        speed_bits = DW_IC_CON_SPEED_FS;
-        sda_hold = ctrl->have_fs_timing ? ctrl->fs_sda_hold : 0x001C001C;
-        ctrl->configured_bus_speed = I2C_SPEED_FAST_HZ;
-    } else {
-        ctrl->configured_bus_speed = I2C_SPEED_STANDARD_HZ;
-    }
+	if (speed_hz > I2C_SPEED_STANDARD_HZ) {
+		speed_bits = DW_IC_CON_SPEED_FS;
+		sda_hold =
+			ctrl->have_fs_timing ? ctrl->fs_sda_hold : 0x001C001C;
+		ctrl->configured_bus_speed = I2C_SPEED_FAST_HZ;
+	} else {
+		ctrl->configured_bus_speed = I2C_SPEED_STANDARD_HZ;
+	}
 
-    dw_write(ctrl, DW_IC_CON,
-             DW_IC_CON_MASTER | speed_bits |
-             DW_IC_CON_RESTART_EN | DW_IC_CON_SLAVE_DISABLE |
-             (ic_con_existing & DW_IC_CON_BUS_CLEAR_CTRL));
-    dw_write(ctrl, DW_IC_SS_SCL_HCNT, ss_hcnt);
-    dw_write(ctrl, DW_IC_SS_SCL_LCNT, ss_lcnt);
-    dw_write(ctrl, DW_IC_FS_SCL_HCNT, fs_hcnt);
-    dw_write(ctrl, DW_IC_FS_SCL_LCNT, fs_lcnt);
-    dw_write(ctrl, DW_IC_SDA_HOLD, sda_hold);
+	dw_write(ctrl, DW_IC_CON,
+		 DW_IC_CON_MASTER | speed_bits | DW_IC_CON_RESTART_EN |
+			 DW_IC_CON_SLAVE_DISABLE |
+			 (ic_con_existing & DW_IC_CON_BUS_CLEAR_CTRL));
+	dw_write(ctrl, DW_IC_SS_SCL_HCNT, ss_hcnt);
+	dw_write(ctrl, DW_IC_SS_SCL_LCNT, ss_lcnt);
+	dw_write(ctrl, DW_IC_FS_SCL_HCNT, fs_hcnt);
+	dw_write(ctrl, DW_IC_FS_SCL_LCNT, fs_lcnt);
+	dw_write(ctrl, DW_IC_SDA_HOLD, sda_hold);
 }
 
-static int dw_i2c_apply_bus_speed(i2c_dw_controller_t *ctrl,
-                                  uint32_t speed_hz,
-                                  const char *reason)
+static int dw_i2c_apply_bus_speed(i2c_dw_controller_t *ctrl, uint32_t speed_hz,
+				  const char *reason)
 {
-    uint32_t target_speed = speed_hz;
+	uint32_t target_speed = speed_hz;
 
-    if (target_speed == 0)
-        target_speed = ctrl->have_fs_timing ? I2C_SPEED_FAST_HZ :
-                       I2C_SPEED_STANDARD_HZ;
-    else if (target_speed > I2C_SPEED_STANDARD_HZ)
-        target_speed = I2C_SPEED_FAST_HZ;
-    else
-        target_speed = I2C_SPEED_STANDARD_HZ;
+	if (target_speed == 0)
+		target_speed = ctrl->have_fs_timing ? I2C_SPEED_FAST_HZ :
+						      I2C_SPEED_STANDARD_HZ;
+	else if (target_speed > I2C_SPEED_STANDARD_HZ)
+		target_speed = I2C_SPEED_FAST_HZ;
+	else
+		target_speed = I2C_SPEED_STANDARD_HZ;
 
-    if (ctrl->configured_bus_speed == target_speed)
-        return 0;
+	if (ctrl->configured_bus_speed == target_speed)
+		return 0;
 
-    if (dw_i2c_wait_bus_not_busy(ctrl, 20000) < 0)
-        dw_i2c_disable(ctrl);
+	if (dw_i2c_wait_bus_not_busy(ctrl, 20000) < 0)
+		dw_i2c_disable(ctrl);
 
-    dw_i2c_disable(ctrl);
-    (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-    (void)dw_read(ctrl, DW_IC_CLR_INTR);
-    dw_i2c_program_bus_timing(ctrl, target_speed);
-    ctrl->current_target = 0xFFFF;
+	dw_i2c_disable(ctrl);
+	(void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+	(void)dw_read(ctrl, DW_IC_CLR_INTR);
+	dw_i2c_program_bus_timing(ctrl, target_speed);
+	ctrl->current_target = 0xFFFF;
 
-    i2c_dbg("[I2C%d] bus timing: %s speed=%u ss=%u/%u fs=%u/%u hold=0x%x\n",
-            ctrl->bus_id,
-            reason ? reason : "apply",
-            ctrl->configured_bus_speed,
-            ctrl->have_ss_timing ? ctrl->ss_hcnt : 500,
-            ctrl->have_ss_timing ? ctrl->ss_lcnt : 588,
-            ctrl->have_fs_timing ? ctrl->fs_hcnt : 160,
-            ctrl->have_fs_timing ? ctrl->fs_lcnt : 320,
-            (ctrl->configured_bus_speed > I2C_SPEED_STANDARD_HZ) ?
-                (ctrl->have_fs_timing ? ctrl->fs_sda_hold : 0x001C001C) :
-                (ctrl->have_ss_timing ? ctrl->ss_sda_hold : 0x001C001C));
-    return 0;
+	i2c_dbg("[I2C%d] bus timing: %s speed=%u ss=%u/%u fs=%u/%u hold=0x%x\n",
+		ctrl->bus_id, reason ? reason : "apply",
+		ctrl->configured_bus_speed,
+		ctrl->have_ss_timing ? ctrl->ss_hcnt : 500,
+		ctrl->have_ss_timing ? ctrl->ss_lcnt : 588,
+		ctrl->have_fs_timing ? ctrl->fs_hcnt : 160,
+		ctrl->have_fs_timing ? ctrl->fs_lcnt : 320,
+		(ctrl->configured_bus_speed > I2C_SPEED_STANDARD_HZ) ?
+			(ctrl->have_fs_timing ? ctrl->fs_sda_hold :
+						0x001C001C) :
+			(ctrl->have_ss_timing ? ctrl->ss_sda_hold :
+						0x001C001C));
+	return 0;
 }
 
 // Wait for TX FIFO to have space (not full)
-static int dw_i2c_wait_tx_not_full(i2c_dw_controller_t *ctrl, int timeout_us) {
-    for (int i = 0; i < timeout_us; i++) {
-        if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_TFNF)
-            return 0;
-        // Check for abort
-        if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT)
-            return -2;
-        i2c_delay_us(1);
-    }
-    return -1;
+static int dw_i2c_wait_tx_not_full(i2c_dw_controller_t *ctrl, int timeout_us)
+{
+	for (int i = 0; i < timeout_us; i++) {
+		if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_TFNF)
+			return 0;
+		// Check for abort
+		if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT)
+			return -2;
+		i2c_delay_us(1);
+	}
+	return -1;
 }
 
 // Wait for RX FIFO to have data
-static int dw_i2c_wait_rx_not_empty(i2c_dw_controller_t *ctrl, int timeout_us) {
-    for (int i = 0; i < timeout_us; i++) {
-        if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
-            return 0;
-        if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT)
-            return -2;
-        i2c_delay_us(1);
-    }
-    return -1;
+static int dw_i2c_wait_rx_not_empty(i2c_dw_controller_t *ctrl, int timeout_us)
+{
+	for (int i = 0; i < timeout_us; i++) {
+		if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
+			return 0;
+		if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT)
+			return -2;
+		i2c_delay_us(1);
+	}
+	return -1;
 }
 
 static int dw_i2c_wait_bus_not_busy(i2c_dw_controller_t *ctrl, int timeout_us)
 {
-    for (int i = 0; i < timeout_us; i++) {
-        uint32_t status = dw_read(ctrl, DW_IC_STATUS);
-        if (!(status & DW_IC_STATUS_ACTIVITY))
-            return 0;
-        i2c_delay_us(1);
-    }
-    return -1;
+	for (int i = 0; i < timeout_us; i++) {
+		uint32_t status = dw_read(ctrl, DW_IC_STATUS);
+		if (!(status & DW_IC_STATUS_ACTIVITY))
+			return 0;
+		i2c_delay_us(1);
+	}
+	return -1;
 }
 
 // Wait for all bus activity to complete
-static int dw_i2c_wait_idle(i2c_dw_controller_t *ctrl, int timeout_us) {
-    for (int i = 0; i < timeout_us; i++) {
-        uint32_t status = dw_read(ctrl, DW_IC_STATUS);
-        if (!(status & DW_IC_STATUS_MST_ACTIVITY) &&
-            (status & DW_IC_STATUS_TFE))
-            return 0;
-        i2c_delay_us(1);
-    }
-    return -1;
+static int dw_i2c_wait_idle(i2c_dw_controller_t *ctrl, int timeout_us)
+{
+	for (int i = 0; i < timeout_us; i++) {
+		uint32_t status = dw_read(ctrl, DW_IC_STATUS);
+		if (!(status & DW_IC_STATUS_MST_ACTIVITY) &&
+		    (status & DW_IC_STATUS_TFE))
+			return 0;
+		i2c_delay_us(1);
+	}
+	return -1;
 }
 
 // Set target address and enable controller.
 // Always disable → set TAR → re-enable for a clean bus state.
 // This matches i2c-designware-master.c i2c_dw_xfer_init().
-static int dw_i2c_set_target(i2c_dw_controller_t *ctrl, uint16_t addr) {
-    if (dw_i2c_wait_bus_not_busy(ctrl, 20000) < 0)
-        dw_i2c_disable(ctrl);
+static int dw_i2c_set_target(i2c_dw_controller_t *ctrl, uint16_t addr)
+{
+	if (dw_i2c_wait_bus_not_busy(ctrl, 20000) < 0)
+		dw_i2c_disable(ctrl);
 
-    if (dw_i2c_wait_bus_not_busy(ctrl, 20000) < 0)
-        return -1;
+	if (dw_i2c_wait_bus_not_busy(ctrl, 20000) < 0)
+		return -1;
 
-    dw_i2c_disable(ctrl);
+	dw_i2c_disable(ctrl);
 
-    // Clear any stale abort/interrupt status
-    (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-    (void)dw_read(ctrl, DW_IC_CLR_INTR);
+	// Clear any stale abort/interrupt status
+	(void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+	(void)dw_read(ctrl, DW_IC_CLR_INTR);
 
-    // Flush RX FIFO — discard stale data from previous transfer
-    while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
-        (void)dw_read(ctrl, DW_IC_DATA_CMD);
+	// Flush RX FIFO — discard stale data from previous transfer
+	while (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
+		(void)dw_read(ctrl, DW_IC_DATA_CMD);
 
-    // Set target address (7-bit)
-    dw_write(ctrl, DW_IC_TAR, addr & 0x7F);
+	// Set target address (7-bit)
+	dw_write(ctrl, DW_IC_TAR, addr & 0x7F);
 
-    dw_i2c_enable(ctrl);
+	dw_i2c_enable(ctrl);
 
-    // Clear interrupts again after enable
-    (void)dw_read(ctrl, DW_IC_CLR_INTR);
-    (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+	// Clear interrupts again after enable
+	(void)dw_read(ctrl, DW_IC_CLR_INTR);
+	(void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
 
-    ctrl->current_target = addr;
-    return 0;
+	ctrl->current_target = addr;
+	return 0;
 }
 
 // Convenience: write-only transfer
 static int dw_i2c_write(i2c_dw_controller_t *ctrl, uint16_t addr,
-                         const uint8_t *buf, int len) {
-    return dw_i2c_xfer_irq(ctrl, addr, buf, len, NULL, 0);
+			const uint8_t *buf, int len)
+{
+	return dw_i2c_xfer_irq(ctrl, addr, buf, len, NULL, 0);
 }
 
 // Convenience: read with 2-byte register address prefix
 static int dw_i2c_read_reg16(i2c_dw_controller_t *ctrl, uint16_t addr,
-                              uint16_t reg, uint8_t *buf, int len) {
-    uint8_t regbuf[2] = { (uint8_t)(reg & 0xFF), (uint8_t)((reg >> 8) & 0xFF) };
-    return dw_i2c_xfer_irq(ctrl, addr, regbuf, 2, buf, len);
+			     uint16_t reg, uint8_t *buf, int len)
+{
+	uint8_t regbuf[2] = { (uint8_t)(reg & 0xFF),
+			      (uint8_t)((reg >> 8) & 0xFF) };
+	return dw_i2c_xfer_irq(ctrl, addr, regbuf, 2, buf, len);
 }
 
 // ============================================================================
@@ -973,51 +1033,56 @@ static int dw_i2c_read_reg16(i2c_dw_controller_t *ctrl, uint16_t addr,
 // ============================================================================
 
 // Probe a single I2C address — returns 0 if device ACKs, -1 if NACK
-static int dw_i2c_probe_addr(i2c_dw_controller_t *ctrl, uint16_t addr) {
-    dw_i2c_set_target(ctrl, addr);
+static int dw_i2c_probe_addr(i2c_dw_controller_t *ctrl, uint16_t addr)
+{
+	dw_i2c_set_target(ctrl, addr);
 
-    // Issue a single read byte with STOP
-    uint32_t cmd = DW_IC_DATA_CMD_READ | DW_IC_DATA_CMD_STOP;
+	// Issue a single read byte with STOP
+	uint32_t cmd = DW_IC_DATA_CMD_READ | DW_IC_DATA_CMD_STOP;
 
-    int rc = dw_i2c_wait_tx_not_full(ctrl, 5000);
-    if (rc < 0) return -1;
+	int rc = dw_i2c_wait_tx_not_full(ctrl, 5000);
+	if (rc < 0)
+		return -1;
 
-    dw_write(ctrl, DW_IC_DATA_CMD, cmd);
+	dw_write(ctrl, DW_IC_DATA_CMD, cmd);
 
-    // Wait for response or abort
-    for (int i = 0; i < 10000; i++) {
-        // Check for abort (NACK)
-        if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT) {
-            (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-            (void)dw_read(ctrl, DW_IC_CLR_INTR);
-            return -1;
-        }
-        // Check for received data (ACK)
-        if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE) {
-            (void)dw_read(ctrl, DW_IC_DATA_CMD);  // consume byte
-            return 0;  // Device responded
-        }
-        i2c_delay_us(1);
-    }
+	// Wait for response or abort
+	for (int i = 0; i < 10000; i++) {
+		// Check for abort (NACK)
+		if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT) {
+			(void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+			(void)dw_read(ctrl, DW_IC_CLR_INTR);
+			return -1;
+		}
+		// Check for received data (ACK)
+		if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE) {
+			(void)dw_read(ctrl, DW_IC_DATA_CMD); // consume byte
+			return 0; // Device responded
+		}
+		i2c_delay_us(1);
+	}
 
-    // Timeout — treat as no device
-    (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-    (void)dw_read(ctrl, DW_IC_CLR_INTR);
-    return -1;
+	// Timeout — treat as no device
+	(void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+	(void)dw_read(ctrl, DW_IC_CLR_INTR);
+	return -1;
 }
 
-static void dw_i2c_scan_bus(i2c_dw_controller_t *ctrl) {
-    i2c_dbg("[I2C%d] Scanning bus for devices...\n", ctrl->bus_id);
-    int found = 0;
+static void dw_i2c_scan_bus(i2c_dw_controller_t *ctrl)
+{
+	i2c_dbg("[I2C%d] Scanning bus for devices...\n", ctrl->bus_id);
+	int found = 0;
 
-    for (uint16_t addr = 0x08; addr <= 0x77; addr++) {
-        if (dw_i2c_probe_addr(ctrl, addr) == 0) {
-            kprintf("[I2C%d]   Device found at address 0x%02x\n", ctrl->bus_id, addr);
-            found++;
-        }
-    }
+	for (uint16_t addr = 0x08; addr <= 0x77; addr++) {
+		if (dw_i2c_probe_addr(ctrl, addr) == 0) {
+			kprintf("[I2C%d]   Device found at address 0x%02x\n",
+				ctrl->bus_id, addr);
+			found++;
+		}
+	}
 
-    kprintf("[I2C%d] Bus scan complete: %d device(s) found\n", ctrl->bus_id, found);
+	kprintf("[I2C%d] Bus scan complete: %d device(s) found\n", ctrl->bus_id,
+		found);
 }
 
 // ============================================================================
@@ -1025,52 +1090,65 @@ static void dw_i2c_scan_bus(i2c_dw_controller_t *ctrl) {
 // ============================================================================
 
 // Check if a PCI device ID is a known Intel LPSS I2C controller
-static int is_intel_lpss_i2c(uint16_t vendor_id, uint16_t device_id) {
-    if (vendor_id != INTEL_LPSS_I2C_VENDOR)
-        return 0;
+static int is_intel_lpss_i2c(uint16_t vendor_id, uint16_t device_id)
+{
+	if (vendor_id != INTEL_LPSS_I2C_VENDOR)
+		return 0;
 
-    switch (device_id) {
-        // Arrow Lake
-        case INTEL_LPSS_I2C_ARL_H_0: case INTEL_LPSS_I2C_ARL_H_1:
-        case INTEL_LPSS_I2C_ARL_H_2: case INTEL_LPSS_I2C_ARL_H_3:
-        // Meteor Lake
-        case INTEL_LPSS_I2C_MTL_0: case INTEL_LPSS_I2C_MTL_1:
-        case INTEL_LPSS_I2C_MTL_2: case INTEL_LPSS_I2C_MTL_3:
-        // Raptor Lake
-        case INTEL_LPSS_I2C_RPL_S_0: case INTEL_LPSS_I2C_RPL_S_1:
-        case INTEL_LPSS_I2C_RPL_P_0: case INTEL_LPSS_I2C_RPL_P_1:
-        // Alder Lake
-        case INTEL_LPSS_I2C_ADL_S_0: case INTEL_LPSS_I2C_ADL_S_1:
-        case INTEL_LPSS_I2C_ADL_P_0: case INTEL_LPSS_I2C_ADL_P_1:
-        case INTEL_LPSS_I2C_ADL_N_0: case INTEL_LPSS_I2C_ADL_N_1:
-        // Tiger Lake
-        case INTEL_LPSS_I2C_TGL_0: case INTEL_LPSS_I2C_TGL_1:
-        case INTEL_LPSS_I2C_TGL_2: case INTEL_LPSS_I2C_TGL_3:
-            return 1;
-        default:
-            return 0;
-    }
+	switch (device_id) {
+	// Arrow Lake
+	case INTEL_LPSS_I2C_ARL_H_0:
+	case INTEL_LPSS_I2C_ARL_H_1:
+	case INTEL_LPSS_I2C_ARL_H_2:
+	case INTEL_LPSS_I2C_ARL_H_3:
+	// Meteor Lake
+	case INTEL_LPSS_I2C_MTL_0:
+	case INTEL_LPSS_I2C_MTL_1:
+	case INTEL_LPSS_I2C_MTL_2:
+	case INTEL_LPSS_I2C_MTL_3:
+	// Raptor Lake
+	case INTEL_LPSS_I2C_RPL_S_0:
+	case INTEL_LPSS_I2C_RPL_S_1:
+	case INTEL_LPSS_I2C_RPL_P_0:
+	case INTEL_LPSS_I2C_RPL_P_1:
+	// Alder Lake
+	case INTEL_LPSS_I2C_ADL_S_0:
+	case INTEL_LPSS_I2C_ADL_S_1:
+	case INTEL_LPSS_I2C_ADL_P_0:
+	case INTEL_LPSS_I2C_ADL_P_1:
+	case INTEL_LPSS_I2C_ADL_N_0:
+	case INTEL_LPSS_I2C_ADL_N_1:
+	// Tiger Lake
+	case INTEL_LPSS_I2C_TGL_0:
+	case INTEL_LPSS_I2C_TGL_1:
+	case INTEL_LPSS_I2C_TGL_2:
+	case INTEL_LPSS_I2C_TGL_3:
+		return 1;
+	default:
+		return 0;
+	}
 }
 
 static int has_intel_lpss_i2c_controller(void)
 {
-    const pci_device_t *devices;
-    int pci_count = 0;
+	const pci_device_t *devices;
+	int pci_count = 0;
 
-    devices = pci_get_devices(&pci_count);
-    if (!devices || pci_count == 0)
-        return 0;
+	devices = pci_get_devices(&pci_count);
+	if (!devices || pci_count == 0)
+		return 0;
 
-    for (int i = 0; i < pci_count; i++) {
-        if (is_intel_lpss_i2c(devices[i].vendor_id, devices[i].device_id))
-            return 1;
-    }
+	for (int i = 0; i < pci_count; i++) {
+		if (is_intel_lpss_i2c(devices[i].vendor_id,
+				      devices[i].device_id))
+			return 1;
+	}
 
-    return 0;
+	return 0;
 }
 
 // MSI vector base for I2C controllers (50-53 for up to 4 controllers)
-#define I2C_MSI_VECTOR_BASE  50
+#define I2C_MSI_VECTOR_BASE 50
 
 // Map PMC PWRMBASE and return virtual address (0 on failure).
 // Strategy 1: ACPI HID search
@@ -1080,220 +1158,254 @@ static int has_intel_lpss_i2c_controller(void)
 // Strategy 5: Well-known default addresses probed via GEN_PMCON_A
 static volatile uint8_t *pmc_map_pwrmbase(void)
 {
-    uint64_t phys = 0;
+	uint64_t phys = 0;
 
-    // ---- Strategy 1: Find PMC via ACPI HID ----
-    static const char *pmc_hids[] = {
-        "INTC10B5", "INTC1026", "INT34BB", "INTC1025", NULL
-    };
-    for (int h = 0; !phys && pmc_hids[h]; h++) {
-        acpi_aml_device_info_t info;
-        if (acpi_aml_find_devices_by_hid(pmc_hids[h], &info, 1) > 0) {
-            acpi_crs_result_t crs;
-            if (acpi_aml_eval_crs(info.path, &crs) == 0 && crs.mmio_base)
-                phys = crs.mmio_base;
-        }
-    }
+	// ---- Strategy 1: Find PMC via ACPI HID ----
+	static const char *pmc_hids[] = { "INTC10B5", "INTC1026", "INT34BB",
+					  "INTC1025", NULL };
+	for (int h = 0; !phys && pmc_hids[h]; h++) {
+		acpi_aml_device_info_t info;
+		if (acpi_aml_find_devices_by_hid(pmc_hids[h], &info, 1) > 0) {
+			acpi_crs_result_t crs;
+			if (acpi_aml_eval_crs(info.path, &crs) == 0 &&
+			    crs.mmio_base)
+				phys = crs.mmio_base;
+		}
+	}
 
-    // ---- Strategy 2: Try known ACPI paths ----
-    if (!phys) {
-        static const char *pmc_paths[] = {
-            "\\_SB.PC00.PMC", "\\_SB.PCI0.PMC",
-            "\\_SB.PC00.PPMC", "\\_SB.PCI0.PPMC", NULL
-        };
-        for (int p = 0; !phys && pmc_paths[p]; p++) {
-            acpi_crs_result_t crs;
-            if (acpi_aml_eval_crs(pmc_paths[p], &crs) == 0 && crs.mmio_base)
-                phys = crs.mmio_base;
-        }
-    }
+	// ---- Strategy 2: Try known ACPI paths ----
+	if (!phys) {
+		static const char *pmc_paths[] = { "\\_SB.PC00.PMC",
+						   "\\_SB.PCI0.PMC",
+						   "\\_SB.PC00.PPMC",
+						   "\\_SB.PCI0.PPMC", NULL };
+		for (int p = 0; !phys && pmc_paths[p]; p++) {
+			acpi_crs_result_t crs;
+			if (acpi_aml_eval_crs(pmc_paths[p], &crs) == 0 &&
+			    crs.mmio_base)
+				phys = crs.mmio_base;
+		}
+	}
 
-    // ---- Strategy 3: Unhide D31:F2 via P2SB trick ----
-    // P2SB (D31:F1) E0h bit 8 = HIDE. Write 0 to entire dword to
-    // unhide.  We MUST NOT use read-modify-write because reads return
-    // 0xFFFFFFFF on a hidden device, which poisons the reserved bits.
-    // Try both ECAM and CF8 paths — Arrow Lake may block one but not the other.
-    if (!phys) {
-        // Try ECAM path first (MMIO config write may bypass CF8/CFC filter)
-        if (g_ecam_bus0_va) {
-            ecam_write32(0, 31, 1, 0xE0, 0);  // unhide via ECAM
-            i2c_delay_us(1000);
-            uint32_t vid_e = ecam_read32(0, PMC_PCI_DEV, PMC_PCI_FUNC, 0x00);
-            uint32_t vid_c = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                            PMC_PCI_FUNC, 0x00);
-            i2c_dbg("[I2C-PMC] P2SB ECAM unhide: PMC vid ecam=0x%x cf8=0x%x\n",
-                    vid_e, vid_c);
-            uint32_t vid = (vid_e != 0xFFFFFFFF) ? vid_e : vid_c;
-            if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
-                // Use whichever path found the PMC
-                int use_ecam = (vid_e != 0xFFFFFFFF);
-                uint32_t bar_lo, bar_hi;
-                if (use_ecam) {
-                    uint32_t cmd = ecam_read32(0, PMC_PCI_DEV, PMC_PCI_FUNC,
-                                              PMC_PCI_CMD);
-                    if (!(cmd & 0x02))
-                        ecam_write32(0, PMC_PCI_DEV, PMC_PCI_FUNC,
-                                     PMC_PCI_CMD, cmd | 0x02);
-                    bar_lo = ecam_read32(0, PMC_PCI_DEV, PMC_PCI_FUNC,
-                                         PMC_PCI_PWRMBASE);
-                    bar_hi = ecam_read32(0, PMC_PCI_DEV, PMC_PCI_FUNC,
-                                         PMC_PCI_PWRMBASE_HI);
-                } else {
-                    uint32_t cmd = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                                  PMC_PCI_FUNC, PMC_PCI_CMD);
-                    if (!(cmd & 0x02))
-                        pci_cfg_write32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                        PMC_PCI_FUNC, PMC_PCI_CMD, cmd | 0x02);
-                    bar_lo = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                            PMC_PCI_FUNC, PMC_PCI_PWRMBASE);
-                    bar_hi = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                            PMC_PCI_FUNC, PMC_PCI_PWRMBASE_HI);
-                }
-                phys = ((uint64_t)bar_hi << 32) | (bar_lo & ~0x1FFFULL);
-            }
-            ecam_write32(0, 31, 1, 0xE0, (1 << 8));  // re-hide via ECAM
-        }
+	// ---- Strategy 3: Unhide D31:F2 via P2SB trick ----
+	// P2SB (D31:F1) E0h bit 8 = HIDE. Write 0 to entire dword to
+	// unhide.  We MUST NOT use read-modify-write because reads return
+	// 0xFFFFFFFF on a hidden device, which poisons the reserved bits.
+	// Try both ECAM and CF8 paths — Arrow Lake may block one but not the other.
+	if (!phys) {
+		// Try ECAM path first (MMIO config write may bypass CF8/CFC filter)
+		if (g_ecam_bus0_va) {
+			ecam_write32(0, 31, 1, 0xE0, 0); // unhide via ECAM
+			i2c_delay_us(1000);
+			uint32_t vid_e =
+				ecam_read32(0, PMC_PCI_DEV, PMC_PCI_FUNC, 0x00);
+			uint32_t vid_c = pci_cfg_read32(
+				PMC_PCI_BUS, PMC_PCI_DEV, PMC_PCI_FUNC, 0x00);
+			i2c_dbg("[I2C-PMC] P2SB ECAM unhide: PMC vid ecam=0x%x cf8=0x%x\n",
+				vid_e, vid_c);
+			uint32_t vid = (vid_e != 0xFFFFFFFF) ? vid_e : vid_c;
+			if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
+				// Use whichever path found the PMC
+				int use_ecam = (vid_e != 0xFFFFFFFF);
+				uint32_t bar_lo, bar_hi;
+				if (use_ecam) {
+					uint32_t cmd = ecam_read32(
+						0, PMC_PCI_DEV, PMC_PCI_FUNC,
+						PMC_PCI_CMD);
+					if (!(cmd & 0x02))
+						ecam_write32(0, PMC_PCI_DEV,
+							     PMC_PCI_FUNC,
+							     PMC_PCI_CMD,
+							     cmd | 0x02);
+					bar_lo = ecam_read32(0, PMC_PCI_DEV,
+							     PMC_PCI_FUNC,
+							     PMC_PCI_PWRMBASE);
+					bar_hi = ecam_read32(
+						0, PMC_PCI_DEV, PMC_PCI_FUNC,
+						PMC_PCI_PWRMBASE_HI);
+				} else {
+					uint32_t cmd = pci_cfg_read32(
+						PMC_PCI_BUS, PMC_PCI_DEV,
+						PMC_PCI_FUNC, PMC_PCI_CMD);
+					if (!(cmd & 0x02))
+						pci_cfg_write32(PMC_PCI_BUS,
+								PMC_PCI_DEV,
+								PMC_PCI_FUNC,
+								PMC_PCI_CMD,
+								cmd | 0x02);
+					bar_lo = pci_cfg_read32(
+						PMC_PCI_BUS, PMC_PCI_DEV,
+						PMC_PCI_FUNC, PMC_PCI_PWRMBASE);
+					bar_hi = pci_cfg_read32(
+						PMC_PCI_BUS, PMC_PCI_DEV,
+						PMC_PCI_FUNC,
+						PMC_PCI_PWRMBASE_HI);
+				}
+				phys = ((uint64_t)bar_hi << 32) |
+				       (bar_lo & ~0x1FFFULL);
+			}
+			ecam_write32(0, 31, 1, 0xE0,
+				     (1 << 8)); // re-hide via ECAM
+		}
 
-        // CF8/CFC fallback
-        if (!phys) {
-            pci_cfg_write32(0, 31, 1, 0xE0, 0);
-            i2c_delay_us(1000);
-            uint32_t vid = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                          PMC_PCI_FUNC, 0x00);
-            if (!g_ecam_bus0_va)  // only log if ECAM path didn't already
-                i2c_dbg("[I2C-PMC] P2SB CF8 unhide: PMC vid=0x%x\n", vid);
-            if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
-                uint32_t cmd = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                              PMC_PCI_FUNC, PMC_PCI_CMD);
-                if (!(cmd & 0x02))
-                    pci_cfg_write32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                    PMC_PCI_FUNC, PMC_PCI_CMD, cmd | 0x02);
-                uint32_t bar_lo = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                                 PMC_PCI_FUNC, PMC_PCI_PWRMBASE);
-                uint32_t bar_hi = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                                 PMC_PCI_FUNC, PMC_PCI_PWRMBASE_HI);
-                phys = ((uint64_t)bar_hi << 32) | (bar_lo & ~0x1FFFULL);
-            }
-            pci_cfg_write32(0, 31, 1, 0xE0, (1 << 8));
-        }
-    }
+		// CF8/CFC fallback
+		if (!phys) {
+			pci_cfg_write32(0, 31, 1, 0xE0, 0);
+			i2c_delay_us(1000);
+			uint32_t vid = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
+						      PMC_PCI_FUNC, 0x00);
+			if (!g_ecam_bus0_va) // only log if ECAM path didn't already
+				i2c_dbg("[I2C-PMC] P2SB CF8 unhide: PMC vid=0x%x\n",
+					vid);
+			if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
+				uint32_t cmd = pci_cfg_read32(
+					PMC_PCI_BUS, PMC_PCI_DEV, PMC_PCI_FUNC,
+					PMC_PCI_CMD);
+				if (!(cmd & 0x02))
+					pci_cfg_write32(
+						PMC_PCI_BUS, PMC_PCI_DEV,
+						PMC_PCI_FUNC, PMC_PCI_CMD,
+						cmd | 0x02);
+				uint32_t bar_lo = pci_cfg_read32(
+					PMC_PCI_BUS, PMC_PCI_DEV, PMC_PCI_FUNC,
+					PMC_PCI_PWRMBASE);
+				uint32_t bar_hi = pci_cfg_read32(
+					PMC_PCI_BUS, PMC_PCI_DEV, PMC_PCI_FUNC,
+					PMC_PCI_PWRMBASE_HI);
+				phys = ((uint64_t)bar_hi << 32) |
+				       (bar_lo & ~0x1FFFULL);
+			}
+			pci_cfg_write32(0, 31, 1, 0xE0, (1 << 8));
+		}
+	}
 
-    // ---- Strategy 4: Direct PCI D31:F2 (visible on some platforms) ----
-    if (!phys) {
-        uint32_t vid = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                      PMC_PCI_FUNC, 0x00);
-        if (vid != 0xFFFFFFFF && (vid & 0xFFFF) != 0xFFFF) {
-            uint32_t cmd = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                          PMC_PCI_FUNC, PMC_PCI_CMD);
-            if (!(cmd & 0x02))
-                pci_cfg_write32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                PMC_PCI_FUNC, PMC_PCI_CMD, cmd | 0x02);
-            uint32_t bar_lo = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                             PMC_PCI_FUNC, PMC_PCI_PWRMBASE);
-            uint32_t bar_hi = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
-                                             PMC_PCI_FUNC, PMC_PCI_PWRMBASE_HI);
-            phys = ((uint64_t)bar_hi << 32) | (bar_lo & ~0x1FFFULL);
-        }
-    }
+	// ---- Strategy 4: Direct PCI D31:F2 (visible on some platforms) ----
+	if (!phys) {
+		uint32_t vid = pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
+					      PMC_PCI_FUNC, 0x00);
+		if (vid != 0xFFFFFFFF && (vid & 0xFFFF) != 0xFFFF) {
+			uint32_t cmd =
+				pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
+					       PMC_PCI_FUNC, PMC_PCI_CMD);
+			if (!(cmd & 0x02))
+				pci_cfg_write32(PMC_PCI_BUS, PMC_PCI_DEV,
+						PMC_PCI_FUNC, PMC_PCI_CMD,
+						cmd | 0x02);
+			uint32_t bar_lo =
+				pci_cfg_read32(PMC_PCI_BUS, PMC_PCI_DEV,
+					       PMC_PCI_FUNC, PMC_PCI_PWRMBASE);
+			uint32_t bar_hi = pci_cfg_read32(
+				PMC_PCI_BUS, PMC_PCI_DEV, PMC_PCI_FUNC,
+				PMC_PCI_PWRMBASE_HI);
+			phys = ((uint64_t)bar_hi << 32) | (bar_lo & ~0x1FFFULL);
+		}
+	}
 
-    // ---- Strategy 5b: Try PMC D31:F2 via ECAM ----
-    // BIOS hides PMC from CF8/CFC, but ECAM (memory-mapped config) may
-    // still expose it because P2SB HIDE only blocks I/O-port legacy path.
-    if (!phys && g_ecam_bus0_va) {
-        uint32_t vid = ecam_read32(0, PMC_PCI_DEV, PMC_PCI_FUNC, 0x00);
-        if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
-            uint32_t cmd = ecam_read32(0, PMC_PCI_DEV, PMC_PCI_FUNC, PMC_PCI_CMD);
-            if (!(cmd & 0x02))
-                ecam_write32(0, PMC_PCI_DEV, PMC_PCI_FUNC, PMC_PCI_CMD, cmd | 0x02);
-            uint32_t bar_lo = ecam_read32(0, PMC_PCI_DEV, PMC_PCI_FUNC, PMC_PCI_PWRMBASE);
-            uint32_t bar_hi = ecam_read32(0, PMC_PCI_DEV, PMC_PCI_FUNC, PMC_PCI_PWRMBASE_HI);
-            phys = ((uint64_t)bar_hi << 32) | (bar_lo & ~0x1FFFULL);
-        }
-    }
+	// ---- Strategy 5b: Try PMC D31:F2 via ECAM ----
+	// BIOS hides PMC from CF8/CFC, but ECAM (memory-mapped config) may
+	// still expose it because P2SB HIDE only blocks I/O-port legacy path.
+	if (!phys && g_ecam_bus0_va) {
+		uint32_t vid = ecam_read32(0, PMC_PCI_DEV, PMC_PCI_FUNC, 0x00);
+		if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
+			uint32_t cmd = ecam_read32(0, PMC_PCI_DEV, PMC_PCI_FUNC,
+						   PMC_PCI_CMD);
+			if (!(cmd & 0x02))
+				ecam_write32(0, PMC_PCI_DEV, PMC_PCI_FUNC,
+					     PMC_PCI_CMD, cmd | 0x02);
+			uint32_t bar_lo = ecam_read32(
+				0, PMC_PCI_DEV, PMC_PCI_FUNC, PMC_PCI_PWRMBASE);
+			uint32_t bar_hi =
+				ecam_read32(0, PMC_PCI_DEV, PMC_PCI_FUNC,
+					    PMC_PCI_PWRMBASE_HI);
+			phys = ((uint64_t)bar_hi << 32) | (bar_lo & ~0x1FFFULL);
+		}
+	}
 
-    // ---- Strategy 6: Probe well-known default PWRMBASE addresses ----
-    // On Intel PCH the BIOS programs PWRMBASE.  Validate by mapping and
-    // reading GEN_PMCON_A (offset 0x1020) which has non-zero defaults on
-    // every Intel PCH (SLP_S4#, SLP_S3# assertion stretches etc).
-    if (!phys) {
-        static const uint64_t known_bases[] = {
-            0xFE000000ULL,  // ADL/RPL/MTL/ARL most common
-            0
-        };
-        for (int k = 0; !phys && known_bases[k]; k++) {
-            // Need 2+ pages to reach offset 0x1020
-            uint64_t probe_va = mm_map_device_mmio(known_bases[k], 2);
-            if (!probe_va)
-                continue;
-            volatile uint32_t *gen_pmcon_a =
-                (volatile uint32_t *)(probe_va + 0x1020);
-            uint32_t val = *gen_pmcon_a;
-            // Valid: non-zero, non-ones (unmapped returns 0xFF..FF)
-            if (val != 0xFFFFFFFF && val != 0x00000000) {
-                phys = known_bases[k];
-            }
-        }
-    }
+	// ---- Strategy 6: Probe well-known default PWRMBASE addresses ----
+	// On Intel PCH the BIOS programs PWRMBASE.  Validate by mapping and
+	// reading GEN_PMCON_A (offset 0x1020) which has non-zero defaults on
+	// every Intel PCH (SLP_S4#, SLP_S3# assertion stretches etc).
+	if (!phys) {
+		static const uint64_t known_bases[] = {
+			0xFE000000ULL, // ADL/RPL/MTL/ARL most common
+			0
+		};
+		for (int k = 0; !phys && known_bases[k]; k++) {
+			// Need 2+ pages to reach offset 0x1020
+			uint64_t probe_va =
+				mm_map_device_mmio(known_bases[k], 2);
+			if (!probe_va)
+				continue;
+			volatile uint32_t *gen_pmcon_a =
+				(volatile uint32_t *)(probe_va + 0x1020);
+			uint32_t val = *gen_pmcon_a;
+			// Valid: non-zero, non-ones (unmapped returns 0xFF..FF)
+			if (val != 0xFFFFFFFF && val != 0x00000000) {
+				phys = known_bases[k];
+			}
+		}
+	}
 
-    if (!phys) {
-        i2c_dbg("[I2C-PMC] not found (all strategies failed)\n");
-        return 0;
-    }
+	if (!phys) {
+		i2c_dbg("[I2C-PMC] not found (all strategies failed)\n");
+		return 0;
+	}
 
-    // Map 8 pages (32KB) to cover PMC MMIO space including FDIS registers
-    // at offsets 0x1E24, 0x1E44 etc.
-    uint64_t va = mm_map_device_mmio(phys, 8);
-    if (!va) {
-        i2c_dbg("[I2C-PMC] map failed for 0x%llx\n", (unsigned long long)phys);
-        return 0;
-    }
+	// Map 8 pages (32KB) to cover PMC MMIO space including FDIS registers
+	// at offsets 0x1E24, 0x1E44 etc.
+	uint64_t va = mm_map_device_mmio(phys, 8);
+	if (!va) {
+		i2c_dbg("[I2C-PMC] map failed for 0x%llx\n",
+			(unsigned long long)phys);
+		return 0;
+	}
 
-
-    i2c_dbg("[I2C-PMC] PWRMBASE=0x%llx\n", (unsigned long long)phys);
-    return (volatile uint8_t *)va;
+	i2c_dbg("[I2C-PMC] PWRMBASE=0x%llx\n", (unsigned long long)phys);
+	return (volatile uint8_t *)va;
 }
 
 // Check PMC for I2C function/fuse disable.  Returns 0 if I2C is usable.
 static int pmc_check_i2c_enabled(volatile uint8_t *pmc, int i2c_index)
 {
-    if (!pmc) return 0;  // no PMC mapped, assume OK
+	if (!pmc)
+		return 0; // no PMC mapped, assume OK
 
-    uint32_t fuse = *(volatile uint32_t *)(pmc + PMC_FUSE_SS_DIS_RD_2);
-    if (fuse & (1 << 6)) {
-        kprintf("[I2C-PMC] Serial IO fuse-disabled (FUSE=0x%08x)\n", fuse);
-        return -1;
-    }
+	uint32_t fuse = *(volatile uint32_t *)(pmc + PMC_FUSE_SS_DIS_RD_2);
+	if (fuse & (1 << 6)) {
+		kprintf("[I2C-PMC] Serial IO fuse-disabled (FUSE=0x%08x)\n",
+			fuse);
+		return -1;
+	}
 
-    uint32_t fdis2 = *(volatile uint32_t *)(pmc + PMC_ST_PG_FDIS2);
-    if (fdis2 & (1 << i2c_index)) {
-        kprintf("[I2C-PMC] I2C%d function-disabled (FDIS2=0x%08x)\n",
-                i2c_index, fdis2);
-        return -1;
-    }
+	uint32_t fdis2 = *(volatile uint32_t *)(pmc + PMC_ST_PG_FDIS2);
+	if (fdis2 & (1 << i2c_index)) {
+		kprintf("[I2C-PMC] I2C%d function-disabled (FDIS2=0x%08x)\n",
+			i2c_index, fdis2);
+		return -1;
+	}
 
-    // PPASR0 bit 14 = Serial IO Power Gate Ack Status:
-    //   0 = controller may be power gated
-    //   1 = controller may NOT be power gated (active)
-    uint32_t ppasr0 = *(volatile uint32_t *)(pmc + PMC_PPASR0);
-    int sio_pg_ack = (ppasr0 >> 14) & 1;
+	// PPASR0 bit 14 = Serial IO Power Gate Ack Status:
+	//   0 = controller may be power gated
+	//   1 = controller may NOT be power gated (active)
+	uint32_t ppasr0 = *(volatile uint32_t *)(pmc + PMC_PPASR0);
+	int sio_pg_ack = (ppasr0 >> 14) & 1;
 
-    i2c_dbg("[I2C-PMC] I2C%d fdis=0x%x ppasr0=0x%x(%s)\n",
-            i2c_index, fdis2, ppasr0,
-            sio_pg_ack ? "ACTIVE" : "GATED");
-    return 0;
+	i2c_dbg("[I2C-PMC] I2C%d fdis=0x%x ppasr0=0x%x(%s)\n", i2c_index, fdis2,
+		ppasr0, sio_pg_ack ? "ACTIVE" : "GATED");
+	return 0;
 }
 
 // Determine the I2C controller logical index (0-5) from the PCI function number
 // and device number.  Returns -1 if unknown.
 static int lpss_i2c_index(uint8_t dev_nr, uint8_t func_nr)
 {
-    // Arrow Lake / Alder Lake: D21:F0-F3 → I2C 0-3; different chips may vary.
-    // Fall back to function number for controllers on a single device.
-    if (dev_nr == 0x15)       // D21 = 0x15
-        return (int)func_nr;  // F0-F3 → I2C 0-3
-    if (dev_nr == 0x19)       // D25 = 0x19
-        return 4 + (int)func_nr;
-    return (int)func_nr;
+	// Arrow Lake / Alder Lake: D21:F0-F3 → I2C 0-3; different chips may vary.
+	// Fall back to function number for controllers on a single device.
+	if (dev_nr == 0x15) // D21 = 0x15
+		return (int)func_nr; // F0-F3 → I2C 0-3
+	if (dev_nr == 0x19) // D25 = 0x19
+		return 4 + (int)func_nr;
+	return (int)func_nr;
 }
 
 // Helper: extract parent path from a dotted ACPI path.
@@ -1301,26 +1413,33 @@ static int lpss_i2c_index(uint8_t dev_nr, uint8_t func_nr)
 // Returns 0 on success, -1 if no parent.
 static int acpi_parent_path(const char *child, char *parent, int parent_sz)
 {
-    int len = 0;
-    while (child[len]) len++;
-    int last_dot = -1;
-    for (int i = len - 1; i >= 0; i--) {
-        if (child[i] == '.') { last_dot = i; break; }
-    }
-    if (last_dot <= 0 || last_dot >= parent_sz) return -1;
-    for (int i = 0; i < last_dot; i++) parent[i] = child[i];
-    parent[last_dot] = 0;
-    return 0;
+	int len = 0;
+	while (child[len])
+		len++;
+	int last_dot = -1;
+	for (int i = len - 1; i >= 0; i--) {
+		if (child[i] == '.') {
+			last_dot = i;
+			break;
+		}
+	}
+	if (last_dot <= 0 || last_dot >= parent_sz)
+		return -1;
+	for (int i = 0; i < last_dot; i++)
+		parent[i] = child[i];
+	parent[last_dot] = 0;
+	return 0;
 }
 
 // Helper: check if a controller path is already in the list
 static int path_already_listed(char paths[][ACPI_AML_MAX_PATH], int n,
-                               const char *path)
+			       const char *path)
 {
-    for (int i = 0; i < n; i++) {
-        if (kstrcmp(paths[i], path) == 0) return 1;
-    }
-    return 0;
+	for (int i = 0; i < n; i++) {
+		if (kstrcmp(paths[i], path) == 0)
+			return 1;
+	}
+	return 0;
 }
 
 // ============================================================================
@@ -1345,816 +1464,935 @@ static int path_already_listed(char paths[][ACPI_AML_MAX_PATH], int n,
 // ============================================================================
 
 // Local rdmsr/wrmsr for pre-init diagnostics (lapic_init not yet called)
-static inline uint64_t i2c_rdmsr(uint32_t msr) {
-    uint32_t lo, hi;
-    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
-    return ((uint64_t)hi << 32) | lo;
+static inline uint64_t i2c_rdmsr(uint32_t msr)
+{
+	uint32_t lo, hi;
+	__asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+	return ((uint64_t)hi << 32) | lo;
 }
-static inline void i2c_wrmsr(uint32_t msr, uint64_t val) {
-    uint32_t lo = (uint32_t)val;
-    uint32_t hi = (uint32_t)(val >> 32);
-    __asm__ volatile("wrmsr" :: "c"(msr), "a"(lo), "d"(hi));
+static inline void i2c_wrmsr(uint32_t msr, uint64_t val)
+{
+	uint32_t lo = (uint32_t)val;
+	uint32_t hi = (uint32_t)(val >> 32);
+	__asm__ volatile("wrmsr" ::"c"(msr), "a"(lo), "d"(hi));
 }
-#define IA32_APIC_BASE_MSR       0x1B
-#define X2APIC_MSR_BASE_LOCAL    0x800
-#define X2APIC_SVR_MSR           (X2APIC_MSR_BASE_LOCAL + (0x0F0 >> 4))  // 0x80F
-#define X2APIC_TPR_MSR           (X2APIC_MSR_BASE_LOCAL + (0x080 >> 4))  // 0x808
-#define X2APIC_ID_MSR            (X2APIC_MSR_BASE_LOCAL + (0x020 >> 4))  // 0x802
-#define X2APIC_EOI_MSR           (X2APIC_MSR_BASE_LOCAL + (0x0B0 >> 4))  // 0x80B
+#define IA32_APIC_BASE_MSR 0x1B
+#define X2APIC_MSR_BASE_LOCAL 0x800
+#define X2APIC_SVR_MSR (X2APIC_MSR_BASE_LOCAL + (0x0F0 >> 4)) // 0x80F
+#define X2APIC_TPR_MSR (X2APIC_MSR_BASE_LOCAL + (0x080 >> 4)) // 0x808
+#define X2APIC_ID_MSR (X2APIC_MSR_BASE_LOCAL + (0x020 >> 4)) // 0x802
+#define X2APIC_EOI_MSR (X2APIC_MSR_BASE_LOCAL + (0x0B0 >> 4)) // 0x80B
 
 // ITSS sideband port and register offsets (PCH 600/700 / Arrow Lake)
-#define ITSS_PORT_ID       0xC4
-#define ITSS_IPC0          0x3200   // Interrupt Polarity Control 0 (IRQ 0-31)
-#define ITSS_IPC1          0x3204   // Interrupt Polarity Control 1 (IRQ 32-63)
-#define ITSS_IPC2          0x3208   // Interrupt Polarity Control 2 (IRQ 64-95)
-#define ITSS_IPC3          0x320C   // Interrupt Polarity Control 3 (IRQ 96-119)
-#define ITSS_PIR0          0x3140   // PCI Interrupt Route 0 (D31)
-#define ITSS_MMC           0x3334   // Master Message Control
+#define ITSS_PORT_ID 0xC4
+#define ITSS_IPC0 0x3200 // Interrupt Polarity Control 0 (IRQ 0-31)
+#define ITSS_IPC1 0x3204 // Interrupt Polarity Control 1 (IRQ 32-63)
+#define ITSS_IPC2 0x3208 // Interrupt Polarity Control 2 (IRQ 64-95)
+#define ITSS_IPC3 0x320C // Interrupt Polarity Control 3 (IRQ 96-119)
+#define ITSS_PIR0 0x3140 // PCI Interrupt Route 0 (D31)
+#define ITSS_MMC 0x3334 // Master Message Control
 
-static volatile int g_i2c_probe_mode = 0;       // 1 = probe in progress
-static volatile uint32_t g_i2c_probe_hit = 0;   // set by ISR during probe
+static volatile int g_i2c_probe_mode = 0; // 1 = probe in progress
+static volatile uint32_t g_i2c_probe_hit = 0; // set by ISR during probe
 static int g_i2c_claimed_gsi[I2C_DW_MAX_CONTROLLERS]; // GSIs already assigned
 static int g_i2c_claimed_gsi_count = 0;
 
 // Read a 32-bit ITSS PCR register via P2SB sideband.
 // Returns 0xFFFFFFFF on failure (P2SB not accessible).
 // The ITSS region is mapped UC via mm_map_device_mmio on first access.
-static uint64_t g_itss_va = 0;  // UC-mapped VA of ITSS port region
+static uint64_t g_itss_va = 0; // UC-mapped VA of ITSS port region
 
 static uint32_t itss_pcr_read32(uint32_t offset)
 {
-    // Map the ITSS sideband region on first use
-    if (!g_itss_va) {
-        // Get SBREG_BAR if not cached
-        if (!g_sbreg_bar) {
-            if (g_ecam_bus0_va) {
-                // Try unhide first
-                ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
-                             P2SB_P2SBC, 0);
-                i2c_delay_us(500);
-                uint32_t vid = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
-                                           P2SB_PCI_FUNC, 0x00);
-                if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
-                    uint32_t cmd = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
-                                               P2SB_PCI_FUNC, 0x04);
-                    if (!(cmd & 0x02))
-                        ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
-                                     0x04, cmd | 0x02);
-                }
-                // Read BAR even if HIDE is sticky (BAR often readable regardless)
-                uint32_t bl = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
-                                          P2SB_PCI_FUNC, P2SB_SBREG_BAR);
-                uint32_t bh = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
-                                          P2SB_PCI_FUNC, P2SB_SBREG_BARH);
-                uint64_t bar = ((uint64_t)bh << 32) | (bl & ~0xFULL);
-                i2c_dbg("[ITSS] P2SB VID=0x%x BAR raw lo=0x%x hi=0x%x => 0x%llx\n",
-                        vid, bl, bh, (unsigned long long)bar);
-                // Accept if BAR looks like a valid physical address (non-zero,
-                // not all-F, and above 1GB typical for PCH SBREG)
-                if (bar && bar != 0xFFFFFFFFFFFFFFF0ULL && bar >= 0x40000000ULL)
-                    g_sbreg_bar = bar;
-                // Re-hide
-                ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
-                             P2SB_P2SBC, P2SB_HIDE_BIT);
-            }
-        }
-        if (!g_sbreg_bar) {
-            i2c_dbg("[ITSS] No SBREG_BAR, cannot read ITSS IPC\n");
-            return 0xFFFFFFFF;
-        }
-        // Map the ITSS port region (64KB) as UC via mm_map_device_mmio.
-        // SBREG_BAR + (PortID << 16) gives the 64KB window for this port.
-        uint64_t itss_pa = g_sbreg_bar + ((uint64_t)ITSS_PORT_ID << 16);
-        g_itss_va = mm_map_device_mmio(itss_pa, 16);  // 16 pages = 64KB
-        if (!g_itss_va) {
-            i2c_dbg("[ITSS] mm_map_device_mmio failed for 0x%llx\n",
-                    (unsigned long long)itss_pa);
-            return 0xFFFFFFFF;
-        }
-        i2c_dbg("[ITSS] P2SB SBREG_BAR=0x%llx ITSS mapped at VA=0x%llx\n",
-                (unsigned long long)g_sbreg_bar,
-                (unsigned long long)g_itss_va);
-    }
+	// Map the ITSS sideband region on first use
+	if (!g_itss_va) {
+		// Get SBREG_BAR if not cached
+		if (!g_sbreg_bar) {
+			if (g_ecam_bus0_va) {
+				// Try unhide first
+				ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+					     P2SB_PCI_FUNC, P2SB_P2SBC, 0);
+				i2c_delay_us(500);
+				uint32_t vid =
+					ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+						    P2SB_PCI_FUNC, 0x00);
+				if (vid != 0xFFFFFFFF &&
+				    (vid & 0xFFFF) == 0x8086) {
+					uint32_t cmd = ecam_read32(
+						P2SB_PCI_BUS, P2SB_PCI_DEV,
+						P2SB_PCI_FUNC, 0x04);
+					if (!(cmd & 0x02))
+						ecam_write32(P2SB_PCI_BUS,
+							     P2SB_PCI_DEV,
+							     P2SB_PCI_FUNC,
+							     0x04, cmd | 0x02);
+				}
+				// Read BAR even if HIDE is sticky (BAR often readable regardless)
+				uint32_t bl = ecam_read32(
+					P2SB_PCI_BUS, P2SB_PCI_DEV,
+					P2SB_PCI_FUNC, P2SB_SBREG_BAR);
+				uint32_t bh = ecam_read32(
+					P2SB_PCI_BUS, P2SB_PCI_DEV,
+					P2SB_PCI_FUNC, P2SB_SBREG_BARH);
+				uint64_t bar =
+					((uint64_t)bh << 32) | (bl & ~0xFULL);
+				i2c_dbg("[ITSS] P2SB VID=0x%x BAR raw lo=0x%x hi=0x%x => 0x%llx\n",
+					vid, bl, bh, (unsigned long long)bar);
+				// Accept if BAR looks like a valid physical address (non-zero,
+				// not all-F, and above 1GB typical for PCH SBREG)
+				if (bar && bar != 0xFFFFFFFFFFFFFFF0ULL &&
+				    bar >= 0x40000000ULL)
+					g_sbreg_bar = bar;
+				// Re-hide
+				ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+					     P2SB_PCI_FUNC, P2SB_P2SBC,
+					     P2SB_HIDE_BIT);
+			}
+		}
+		if (!g_sbreg_bar) {
+			i2c_dbg("[ITSS] No SBREG_BAR, cannot read ITSS IPC\n");
+			return 0xFFFFFFFF;
+		}
+		// Map the ITSS port region (64KB) as UC via mm_map_device_mmio.
+		// SBREG_BAR + (PortID << 16) gives the 64KB window for this port.
+		uint64_t itss_pa = g_sbreg_bar + ((uint64_t)ITSS_PORT_ID << 16);
+		g_itss_va = mm_map_device_mmio(itss_pa, 16); // 16 pages = 64KB
+		if (!g_itss_va) {
+			i2c_dbg("[ITSS] mm_map_device_mmio failed for 0x%llx\n",
+				(unsigned long long)itss_pa);
+			return 0xFFFFFFFF;
+		}
+		i2c_dbg("[ITSS] P2SB SBREG_BAR=0x%llx ITSS mapped at VA=0x%llx\n",
+			(unsigned long long)g_sbreg_bar,
+			(unsigned long long)g_itss_va);
+	}
 
-    if (offset > 0xFFFF) return 0xFFFFFFFF;
-    return *(volatile uint32_t *)((volatile uint8_t *)g_itss_va + offset);
+	if (offset > 0xFFFF)
+		return 0xFFFFFFFF;
+	return *(volatile uint32_t *)((volatile uint8_t *)g_itss_va + offset);
 }
 
 #if I2C_DEBUG
 // Dump ITSS IPC registers and firmware IOAPIC state for diagnostics.
 static void probe_dump_diagnostics(uint32_t max_gsi)
 {
-    // ---- ITSS IPC polarity registers ----
-    uint32_t ipc0 = itss_pcr_read32(ITSS_IPC0);
-    uint32_t ipc1 = itss_pcr_read32(ITSS_IPC1);
-    uint32_t ipc2 = itss_pcr_read32(ITSS_IPC2);
-    uint32_t ipc3 = itss_pcr_read32(ITSS_IPC3);
-    i2c_dbg("[ITSS] IPC0=0x%08x IPC1=0x%08x IPC2=0x%08x IPC3=0x%08x\n",
-            ipc0, ipc1, ipc2, ipc3);
-    // Bit=1 means "active-HIGH polarity disabled" → signal is active-LOW
-    // Bit=0 means signal is active-HIGH (default for IRQ 24+)
-    i2c_dbg("[ITSS] IPC decode: IRQ24-31 pol=%s, IRQ32-63 pol=%s\n",
-            (ipc0 >> 24) ? "mixed" : "all-HIGH",
-            ipc1 ? "mixed/LOW" : "all-HIGH");
+	// ---- ITSS IPC polarity registers ----
+	uint32_t ipc0 = itss_pcr_read32(ITSS_IPC0);
+	uint32_t ipc1 = itss_pcr_read32(ITSS_IPC1);
+	uint32_t ipc2 = itss_pcr_read32(ITSS_IPC2);
+	uint32_t ipc3 = itss_pcr_read32(ITSS_IPC3);
+	i2c_dbg("[ITSS] IPC0=0x%08x IPC1=0x%08x IPC2=0x%08x IPC3=0x%08x\n",
+		ipc0, ipc1, ipc2, ipc3);
+	// Bit=1 means "active-HIGH polarity disabled" → signal is active-LOW
+	// Bit=0 means signal is active-HIGH (default for IRQ 24+)
+	i2c_dbg("[ITSS] IPC decode: IRQ24-31 pol=%s, IRQ32-63 pol=%s\n",
+		(ipc0 >> 24) ? "mixed" : "all-HIGH",
+		ipc1 ? "mixed/LOW" : "all-HIGH");
 
-    // ---- ITSS MMC and PIR0 ----
-    uint32_t mmc = itss_pcr_read32(ITSS_MMC);
-    uint32_t pir0 = itss_pcr_read32(ITSS_PIR0);
-    i2c_dbg("[ITSS] MMC=0x%04x PIR0=0x%04x\n", mmc & 0xFFFF, pir0 & 0xFFFF);
+	// ---- ITSS MMC and PIR0 ----
+	uint32_t mmc = itss_pcr_read32(ITSS_MMC);
+	uint32_t pir0 = itss_pcr_read32(ITSS_PIR0);
+	i2c_dbg("[ITSS] MMC=0x%04x PIR0=0x%04x\n", mmc & 0xFFFF, pir0 & 0xFFFF);
 
-    // ---- IOAPIC RTE dump: show all entries 16-63 that are not fully masked+zero ----
-    i2c_dbg("[IOAPIC] Firmware RTE dump (entries 16-%u):\n",
-            max_gsi > 63 ? 63 : max_gsi);
-    for (uint32_t g = 16; g <= max_gsi && g <= 63; g++) {
-        uint32_t lo, hi;
-        ioapic_read_rte((uint8_t)g, &lo, &hi);
-        // Skip fully masked default entries (masked + vector 0)
-        if ((lo & 0x1FFFF) == 0x10000 && hi == 0) continue;  // masked, vec=0
-        if (lo == 0 && hi == 0) continue;
-        i2c_dbg("  GSI %u: lo=0x%08x hi=0x%08x [vec=%u del=%u pol=%s trig=%s %s dest=%u]\n",
-                g, lo, hi,
-                lo & 0xFF,            // vector
-                (lo >> 8) & 7,        // delivery mode
-                (lo & (1u<<13)) ? "low" : "high",
-                (lo & (1u<<15)) ? "level" : "edge",
-                (lo & (1u<<16)) ? "MASKED" : "unmask",
-                (hi >> 24) & 0xFF);   // destination
-    }
+	// ---- IOAPIC RTE dump: show all entries 16-63 that are not fully masked+zero ----
+	i2c_dbg("[IOAPIC] Firmware RTE dump (entries 16-%u):\n",
+		max_gsi > 63 ? 63 : max_gsi);
+	for (uint32_t g = 16; g <= max_gsi && g <= 63; g++) {
+		uint32_t lo, hi;
+		ioapic_read_rte((uint8_t)g, &lo, &hi);
+		// Skip fully masked default entries (masked + vector 0)
+		if ((lo & 0x1FFFF) == 0x10000 && hi == 0)
+			continue; // masked, vec=0
+		if (lo == 0 && hi == 0)
+			continue;
+		i2c_dbg("  GSI %u: lo=0x%08x hi=0x%08x [vec=%u del=%u pol=%s trig=%s %s dest=%u]\n",
+			g, lo, hi,
+			lo & 0xFF, // vector
+			(lo >> 8) & 7, // delivery mode
+			(lo & (1u << 13)) ? "low" : "high",
+			(lo & (1u << 15)) ? "level" : "edge",
+			(lo & (1u << 16)) ? "MASKED" : "unmask",
+			(hi >> 24) & 0xFF); // destination
+	}
 }
 #endif /* I2C_DEBUG */
 
 static int probe_ioapic_i2c_gsi(i2c_dw_controller_t *ctrl, uint8_t vector)
 {
-    uint32_t max_gsi = ioapic_max_gsi();
-    if (max_gsi < 24) return -1;
+	uint32_t max_gsi = ioapic_max_gsi();
+	if (max_gsi < 24)
+		return -1;
 
 #if I2C_DEBUG
-    // Dump firmware state before we touch anything
-    probe_dump_diagnostics(max_gsi);
+	// Dump firmware state before we touch anything
+	probe_dump_diagnostics(max_gsi);
 #endif
 
-    // Ensure interrupts are enabled (needed for ISR to fire)
-    uint64_t rflags;
-    __asm__ volatile("pushf; pop %0" : "=r"(rflags));
-    if (!(rflags & 0x200)) {
-        __asm__ volatile("sti");
-        i2c_dbg("[I2C%d] probe: enabled IF\n", ctrl->bus_id);
-    }
+	// Ensure interrupts are enabled (needed for ISR to fire)
+	uint64_t rflags;
+	__asm__ volatile("pushf; pop %0" : "=r"(rflags));
+	if (!(rflags & 0x200)) {
+		__asm__ volatile("sti");
+		i2c_dbg("[I2C%d] probe: enabled IF\n", ctrl->bus_id);
+	}
 
-    // Ensure LAPIC is ready to deliver IOAPIC fixed interrupts.
-    // lapic_init() hasn't run yet, so we must configure via raw MSR.
-    uint64_t apic_base_val = i2c_rdmsr(IA32_APIC_BASE_MSR);
-    int probe_x2apic = (apic_base_val >> 10) & 1;
-    uint32_t bsp_apic_id = 0;  // physical APIC ID of BSP for RTE destination
-    if (probe_x2apic) {
-        bsp_apic_id = (uint32_t)i2c_rdmsr(X2APIC_ID_MSR);
-        uint32_t svr_val   = (uint32_t)i2c_rdmsr(X2APIC_SVR_MSR);
-        uint32_t tpr_val   = (uint32_t)i2c_rdmsr(X2APIC_TPR_MSR);
-        i2c_dbg("[I2C%d] LAPIC pre-init: ID=%u SVR=0x%x TPR=0x%x\n",
-                ctrl->bus_id, bsp_apic_id, svr_val, tpr_val);
+	// Ensure LAPIC is ready to deliver IOAPIC fixed interrupts.
+	// lapic_init() hasn't run yet, so we must configure via raw MSR.
+	uint64_t apic_base_val = i2c_rdmsr(IA32_APIC_BASE_MSR);
+	int probe_x2apic = (apic_base_val >> 10) & 1;
+	uint32_t bsp_apic_id = 0; // physical APIC ID of BSP for RTE destination
+	if (probe_x2apic) {
+		bsp_apic_id = (uint32_t)i2c_rdmsr(X2APIC_ID_MSR);
+		uint32_t svr_val = (uint32_t)i2c_rdmsr(X2APIC_SVR_MSR);
+		uint32_t tpr_val = (uint32_t)i2c_rdmsr(X2APIC_TPR_MSR);
+		i2c_dbg("[I2C%d] LAPIC pre-init: ID=%u SVR=0x%x TPR=0x%x\n",
+			ctrl->bus_id, bsp_apic_id, svr_val, tpr_val);
 
-        // SVR bit 8 must be set for the LAPIC to deliver fixed interrupts.
-        // ExtINT/PIC via LINT0 works even when disabled, but IOAPIC doesn't.
-        if (!(svr_val & (1u << 8))) {
-            i2c_wrmsr(X2APIC_SVR_MSR, (uint64_t)(svr_val | (1u << 8) | 0xFF));
-            i2c_dbg("[I2C%d] LAPIC: software-enabled (SVR was 0x%x)\n",
-                    ctrl->bus_id, svr_val);
-        }
-        // TPR must be 0 to allow delivery of vector 50 (priority 3)
-        if (tpr_val > 0) {
-            i2c_wrmsr(X2APIC_TPR_MSR, 0);
-            i2c_dbg("[I2C%d] LAPIC: TPR cleared (was 0x%x)\n",
-                    ctrl->bus_id, tpr_val);
-        }
-    }
+		// SVR bit 8 must be set for the LAPIC to deliver fixed interrupts.
+		// ExtINT/PIC via LINT0 works even when disabled, but IOAPIC doesn't.
+		if (!(svr_val & (1u << 8))) {
+			i2c_wrmsr(X2APIC_SVR_MSR,
+				  (uint64_t)(svr_val | (1u << 8) | 0xFF));
+			i2c_dbg("[I2C%d] LAPIC: software-enabled (SVR was 0x%x)\n",
+				ctrl->bus_id, svr_val);
+		}
+		// TPR must be 0 to allow delivery of vector 50 (priority 3)
+		if (tpr_val > 0) {
+			i2c_wrmsr(X2APIC_TPR_MSR, 0);
+			i2c_dbg("[I2C%d] LAPIC: TPR cleared (was 0x%x)\n",
+				ctrl->bus_id, tpr_val);
+		}
+	}
 
-    // Mask every unclaimed RTE 24-max so no stale entry fires during sweep
-    for (uint32_t g = 24; g <= max_gsi; g++) {
-        int claimed = 0;
-        for (int k = 0; k < g_i2c_claimed_gsi_count; k++)
-            if (g_i2c_claimed_gsi[k] == (int)g) { claimed = 1; break; }
-        if (!claimed)
-            ioapic_mask_gsi((uint8_t)g);
-    }
+	// Mask every unclaimed RTE 24-max so no stale entry fires during sweep
+	for (uint32_t g = 24; g <= max_gsi; g++) {
+		int claimed = 0;
+		for (int k = 0; k < g_i2c_claimed_gsi_count; k++)
+			if (g_i2c_claimed_gsi[k] == (int)g) {
+				claimed = 1;
+				break;
+			}
+		if (!claimed)
+			ioapic_mask_gsi((uint8_t)g);
+	}
 
-    // Drain any stuck ISR entries so same-priority vectors can be delivered.
-    // (e.g., xHCI vec 49 stuck because lapic_eoi() used MMIO pre-detect)
-    if (probe_x2apic) {
-        for (int eoi_drain = 0; eoi_drain < 16; eoi_drain++) {
-            int any = 0;
-            for (int r = 0; r < 8; r++) {
-                uint32_t isr = (uint32_t)i2c_rdmsr(
-                    X2APIC_MSR_BASE_LOCAL + ((LAPIC_ISR_BASE + r * 0x10) >> 4));
-                if (isr) { any = 1; break; }
-            }
-            if (!any) break;
-            i2c_wrmsr(X2APIC_EOI_MSR, 0);
-        }
-    }
+	// Drain any stuck ISR entries so same-priority vectors can be delivered.
+	// (e.g., xHCI vec 49 stuck because lapic_eoi() used MMIO pre-detect)
+	if (probe_x2apic) {
+		for (int eoi_drain = 0; eoi_drain < 16; eoi_drain++) {
+			int any = 0;
+			for (int r = 0; r < 8; r++) {
+				uint32_t isr = (uint32_t)i2c_rdmsr(
+					X2APIC_MSR_BASE_LOCAL +
+					((LAPIC_ISR_BASE + r * 0x10) >> 4));
+				if (isr) {
+					any = 1;
+					break;
+				}
+			}
+			if (!any)
+				break;
+			i2c_wrmsr(X2APIC_EOI_MSR, 0);
+		}
+	}
 
-    // Enable probe mode in the ISR
-    g_i2c_probe_mode = 1;
-    g_i2c_probe_hit = 0;
+	// Enable probe mode in the ISR
+	g_i2c_probe_mode = 1;
+	g_i2c_probe_hit = 0;
 
-    // The init function disables the controller after verifying it works
-    // (IC_ENABLE=0).  We must re-enable it so TX_EMPTY asserts on the
-    // physical interrupt output pin.
-    {
-        uint32_t en = dw_read(ctrl, DW_IC_ENABLE);
-        if (!(en & 1)) {
-            dw_write(ctrl, DW_IC_ENABLE, 1);
-            i2c_delay_us(2000);  // let clocks stabilize
-            i2c_dbg("[I2C%d] probe: re-enabled DW core (was IC_ENABLE=0x%x)\n",
-                    ctrl->bus_id, en);
-        }
-    }
+	// The init function disables the controller after verifying it works
+	// (IC_ENABLE=0).  We must re-enable it so TX_EMPTY asserts on the
+	// physical interrupt output pin.
+	{
+		uint32_t en = dw_read(ctrl, DW_IC_ENABLE);
+		if (!(en & 1)) {
+			dw_write(ctrl, DW_IC_ENABLE, 1);
+			i2c_delay_us(2000); // let clocks stabilize
+			i2c_dbg("[I2C%d] probe: re-enabled DW core (was IC_ENABLE=0x%x)\n",
+				ctrl->bus_id, en);
+		}
+	}
 
-    // Make the DW core assert its interrupt output by enabling TX_EMPTY.
-    // TX FIFO is empty after init, so the interrupt is asserted immediately.
-    (void)dw_read(ctrl, DW_IC_CLR_INTR);
-    dw_write(ctrl, DW_IC_INTR_MASK, DW_IC_INTR_TX_EMPTY);
+	// Make the DW core assert its interrupt output by enabling TX_EMPTY.
+	// TX FIFO is empty after init, so the interrupt is asserted immediately.
+	(void)dw_read(ctrl, DW_IC_CLR_INTR);
+	dw_write(ctrl, DW_IC_INTR_MASK, DW_IC_INTR_TX_EMPTY);
 
-    // Diagnostic: verify the DW core thinks it is asserting an interrupt
-    uint32_t diag_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
-    uint32_t diag_stat = dw_read(ctrl, DW_IC_INTR_STAT);
-    i2c_dbg("[I2C%d] probe: RAW_INTR=0x%x INTR_STAT=0x%x (expect 0x10)\n",
-            ctrl->bus_id, diag_raw, diag_stat);
+	// Diagnostic: verify the DW core thinks it is asserting an interrupt
+	uint32_t diag_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+	uint32_t diag_stat = dw_read(ctrl, DW_IC_INTR_STAT);
+	i2c_dbg("[I2C%d] probe: RAW_INTR=0x%x INTR_STAT=0x%x (expect 0x10)\n",
+		ctrl->bus_id, diag_raw, diag_stat);
 
-    // If TX_EMPTY still not asserted, try harder: disable/re-enable core,
-    // reset TX threshold to 0, clear all status.
-    if (!(diag_raw & DW_IC_INTR_TX_EMPTY)) {
-        i2c_dbg("[I2C%d] probe: TX_EMPTY not asserted, resetting core...\n",
-                ctrl->bus_id);
-        dw_write(ctrl, DW_IC_ENABLE, 0);
-        i2c_delay_us(2000);
-        dw_write(ctrl, DW_IC_TX_TL, 0);
-        dw_write(ctrl, DW_IC_INTR_MASK, 0);
-        (void)dw_read(ctrl, DW_IC_CLR_INTR);
-        (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-        dw_write(ctrl, DW_IC_ENABLE, 1);
-        i2c_delay_us(5000);
-        (void)dw_read(ctrl, DW_IC_CLR_INTR);
-        dw_write(ctrl, DW_IC_INTR_MASK, DW_IC_INTR_TX_EMPTY);
-        diag_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
-        diag_stat = dw_read(ctrl, DW_IC_INTR_STAT);
-        i2c_dbg("[I2C%d] probe: after reset: RAW_INTR=0x%x INTR_STAT=0x%x "
-                "IC_ENABLE=0x%x STATUS=0x%x\n",
-                ctrl->bus_id, diag_raw, diag_stat,
-                dw_read(ctrl, DW_IC_ENABLE),
-                dw_read(ctrl, DW_IC_STATUS));
-    }
+	// If TX_EMPTY still not asserted, try harder: disable/re-enable core,
+	// reset TX threshold to 0, clear all status.
+	if (!(diag_raw & DW_IC_INTR_TX_EMPTY)) {
+		i2c_dbg("[I2C%d] probe: TX_EMPTY not asserted, resetting core...\n",
+			ctrl->bus_id);
+		dw_write(ctrl, DW_IC_ENABLE, 0);
+		i2c_delay_us(2000);
+		dw_write(ctrl, DW_IC_TX_TL, 0);
+		dw_write(ctrl, DW_IC_INTR_MASK, 0);
+		(void)dw_read(ctrl, DW_IC_CLR_INTR);
+		(void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+		dw_write(ctrl, DW_IC_ENABLE, 1);
+		i2c_delay_us(5000);
+		(void)dw_read(ctrl, DW_IC_CLR_INTR);
+		dw_write(ctrl, DW_IC_INTR_MASK, DW_IC_INTR_TX_EMPTY);
+		diag_raw = dw_read(ctrl, DW_IC_RAW_INTR_STAT);
+		diag_stat = dw_read(ctrl, DW_IC_INTR_STAT);
+		i2c_dbg("[I2C%d] probe: after reset: RAW_INTR=0x%x INTR_STAT=0x%x "
+			"IC_ENABLE=0x%x STATUS=0x%x\n",
+			ctrl->bus_id, diag_raw, diag_stat,
+			dw_read(ctrl, DW_IC_ENABLE),
+			dw_read(ctrl, DW_IC_STATUS));
+	}
 
-    int found_gsi = -1;
+	int found_gsi = -1;
 
-    // Pre-compute LAPIC IRR access for fallback detection
-    uint32_t vec_reg_sw = (uint32_t)vector / 32;
-    uint32_t vec_bit_sw = 1u << ((uint32_t)vector % 32);
-    uint32_t irr_msr_sw = X2APIC_MSR_BASE_LOCAL +
-                           ((LAPIC_IRR_BASE + vec_reg_sw * 0x10) >> 4);
-    uint32_t isr_msr_sw = X2APIC_MSR_BASE_LOCAL +
-                           ((LAPIC_ISR_BASE + vec_reg_sw * 0x10) >> 4);
+	// Pre-compute LAPIC IRR access for fallback detection
+	uint32_t vec_reg_sw = (uint32_t)vector / 32;
+	uint32_t vec_bit_sw = 1u << ((uint32_t)vector % 32);
+	uint32_t irr_msr_sw = X2APIC_MSR_BASE_LOCAL +
+			      ((LAPIC_IRR_BASE + vec_reg_sw * 0x10) >> 4);
+	uint32_t isr_msr_sw = X2APIC_MSR_BASE_LOCAL +
+			      ((LAPIC_ISR_BASE + vec_reg_sw * 0x10) >> 4);
 
-    // Read actual IPC polarity for the gsi range to decide sweep order.
-    // IPC bit=1 → AHPOLDIS → signal is active-LOW to IOAPIC.
-    // IPC bit=0 → signal is active-HIGH to IOAPIC (default for IRQ 24+).
-    uint32_t ipc0 = itss_pcr_read32(ITSS_IPC0);
-    uint32_t ipc1 = itss_pcr_read32(ITSS_IPC1);
+	// Read actual IPC polarity for the gsi range to decide sweep order.
+	// IPC bit=1 → AHPOLDIS → signal is active-LOW to IOAPIC.
+	// IPC bit=0 → signal is active-HIGH to IOAPIC (default for IRQ 24+).
+	uint32_t ipc0 = itss_pcr_read32(ITSS_IPC0);
+	uint32_t ipc1 = itss_pcr_read32(ITSS_IPC1);
 
-    // Sweep with 4 combinations: {pol-high, pol-low} × {level, edge}.
-    // PCH 600/700 defaults: IRQ 24+ active-HIGH, level-triggered.
-    // But firmware may have changed IPC or the device may use edge mode.
-    static const struct {
-        uint32_t pol_bit;   // bit 13 of RTE low word
-        uint32_t trig_bit;  // bit 15 of RTE low word
-        const char *name;
-    } combos[] = {
-        { 0,        (1u<<15), "high/level" },
-        { (1u<<13), (1u<<15), "low/level"  },
-        { 0,        0,        "high/edge"  },
-        { (1u<<13), 0,        "low/edge"   },
-    };
+	// Sweep with 4 combinations: {pol-high, pol-low} × {level, edge}.
+	// PCH 600/700 defaults: IRQ 24+ active-HIGH, level-triggered.
+	// But firmware may have changed IPC or the device may use edge mode.
+	static const struct {
+		uint32_t pol_bit; // bit 13 of RTE low word
+		uint32_t trig_bit; // bit 15 of RTE low word
+		const char *name;
+	} combos[] = {
+		{ 0, (1u << 15), "high/level" },
+		{ (1u << 13), (1u << 15), "low/level" },
+		{ 0, 0, "high/edge" },
+		{ (1u << 13), 0, "low/edge" },
+	};
 
-    for (int ci = 0; ci < 4 && found_gsi < 0; ci++) {
-        for (uint32_t gsi = 24; gsi <= max_gsi && found_gsi < 0; gsi++) {
-            // Skip GSIs already claimed by a previous controller
-            int claimed = 0;
-            for (int k = 0; k < g_i2c_claimed_gsi_count; k++)
-                if (g_i2c_claimed_gsi[k] == (int)gsi) { claimed = 1; break; }
-            if (claimed) continue;
+	for (int ci = 0; ci < 4 && found_gsi < 0; ci++) {
+		for (uint32_t gsi = 24; gsi <= max_gsi && found_gsi < 0;
+		     gsi++) {
+			// Skip GSIs already claimed by a previous controller
+			int claimed = 0;
+			for (int k = 0; k < g_i2c_claimed_gsi_count; k++)
+				if (g_i2c_claimed_gsi[k] == (int)gsi) {
+					claimed = 1;
+					break;
+				}
+			if (claimed)
+				continue;
 
-            g_i2c_probe_hit = 0;
+			g_i2c_probe_hit = 0;
 
-            // Re-enable DW interrupt output (ISR disables IC_INTR_MASK
-            // to deassert the level-triggered line before EOI).
-            dw_write(ctrl, DW_IC_INTR_MASK, DW_IC_INTR_TX_EMPTY);
+			// Re-enable DW interrupt output (ISR disables IC_INTR_MASK
+			// to deassert the level-triggered line before EOI).
+			dw_write(ctrl, DW_IC_INTR_MASK, DW_IC_INTR_TX_EMPTY);
 
-            // Program RTE: fixed delivery to BSP (physical dest mode)
-            uint32_t low = (uint32_t)vector   // IDT vector
-                         | (0u << 8)           // fixed delivery
-                         | (0u << 11)          // physical dest
-                         | combos[ci].pol_bit  // polarity
-                         | combos[ci].trig_bit;// trigger mode
-            // bit 16 = 0 → unmasked
-            uint32_t high = (bsp_apic_id & 0xFF) << 24;  // dest = BSP LAPIC ID
+			// Program RTE: fixed delivery to BSP (physical dest mode)
+			uint32_t low = (uint32_t)vector // IDT vector
+				       | (0u << 8) // fixed delivery
+				       | (0u << 11) // physical dest
+				       | combos[ci].pol_bit // polarity
+				       | combos[ci].trig_bit; // trigger mode
+			// bit 16 = 0 → unmasked
+			uint32_t high = (bsp_apic_id & 0xFF)
+					<< 24; // dest = BSP LAPIC ID
 
-            ioapic_write_rte((uint8_t)gsi, low, high);
+			ioapic_write_rte((uint8_t)gsi, low, high);
 
-            // Give time for the interrupt to propagate
-            // (DW core → ITSS → IOAPIC → LAPIC → ISR)
-            for (volatile int d = 0; d < 8000; d++)
-                __asm__ volatile("pause");
+			// Give time for the interrupt to propagate
+			// (DW core → ITSS → IOAPIC → LAPIC → ISR)
+			for (volatile int d = 0; d < 8000; d++)
+				__asm__ volatile("pause");
 
-            if (g_i2c_probe_hit) {
-                found_gsi = (int)gsi;
-                i2c_dbg("[I2C%d] IOAPIC probe HIT: GSI %u vector %u (%s)\n",
-                        ctrl->bus_id, gsi, vector, combos[ci].name);
-            } else if (probe_x2apic) {
-                // Fallback: check LAPIC IRR/ISR directly via x2APIC MSR.
-                // If the interrupt reached the LAPIC but the ISR didn't fire
-                // (e.g. LAPIC state issue), we can still detect the correct GSI.
-                uint32_t irr = (uint32_t)i2c_rdmsr(irr_msr_sw);
-                uint32_t isr = (uint32_t)i2c_rdmsr(isr_msr_sw);
-                if ((irr | isr) & vec_bit_sw) {
-                    found_gsi = (int)gsi;
-                    i2c_dbg("[I2C%d] IOAPIC probe HIT (LAPIC IRR/ISR): GSI %u "
-                            "vector %u (%s) IRR=0x%x ISR=0x%x\n",
-                            ctrl->bus_id, gsi, vector, combos[ci].name,
-                            irr, isr);
-                    // Clear the stuck ISR/IRR by sending EOI
-                    if (isr & vec_bit_sw)
-                        i2c_wrmsr(X2APIC_EOI_MSR, 0);
-                }
-            }
+			if (g_i2c_probe_hit) {
+				found_gsi = (int)gsi;
+				i2c_dbg("[I2C%d] IOAPIC probe HIT: GSI %u vector %u (%s)\n",
+					ctrl->bus_id, gsi, vector,
+					combos[ci].name);
+			} else if (probe_x2apic) {
+				// Fallback: check LAPIC IRR/ISR directly via x2APIC MSR.
+				// If the interrupt reached the LAPIC but the ISR didn't fire
+				// (e.g. LAPIC state issue), we can still detect the correct GSI.
+				uint32_t irr = (uint32_t)i2c_rdmsr(irr_msr_sw);
+				uint32_t isr = (uint32_t)i2c_rdmsr(isr_msr_sw);
+				if ((irr | isr) & vec_bit_sw) {
+					found_gsi = (int)gsi;
+					i2c_dbg("[I2C%d] IOAPIC probe HIT (LAPIC IRR/ISR): GSI %u "
+						"vector %u (%s) IRR=0x%x ISR=0x%x\n",
+						ctrl->bus_id, gsi, vector,
+						combos[ci].name, irr, isr);
+					// Clear the stuck ISR/IRR by sending EOI
+					if (isr & vec_bit_sw)
+						i2c_wrmsr(X2APIC_EOI_MSR, 0);
+				}
+			}
 
-            // Mask this entry regardless (if found, we'll reprogram later)
-            ioapic_mask_gsi((uint8_t)gsi);
-        }
-    }
+			// Mask this entry regardless (if found, we'll reprogram later)
+			ioapic_mask_gsi((uint8_t)gsi);
+		}
+	}
 
-    // If sweep failed, do a final diagnostic: try GSI 24-39 with the
-    // actual IPC polarity and check LAPIC ISR/IRR to see if the interrupt
-    // is arriving at the LAPIC but not being delivered to the CPU.
-    // Detect x2APIC locally (lapic_init hasn't run yet at this init stage).
-    if (found_gsi < 0) {
-        i2c_dbg("[I2C%d] probe: sweep failed, checking LAPIC ISR/IRR...\n",
-                ctrl->bus_id);
-        uint32_t vec_reg = (uint32_t)vector / 32;
-        uint32_t vec_bit = 1u << ((uint32_t)vector % 32);
+	// If sweep failed, do a final diagnostic: try GSI 24-39 with the
+	// actual IPC polarity and check LAPIC ISR/IRR to see if the interrupt
+	// is arriving at the LAPIC but not being delivered to the CPU.
+	// Detect x2APIC locally (lapic_init hasn't run yet at this init stage).
+	if (found_gsi < 0) {
+		i2c_dbg("[I2C%d] probe: sweep failed, checking LAPIC ISR/IRR...\n",
+			ctrl->bus_id);
+		uint32_t vec_reg = (uint32_t)vector / 32;
+		uint32_t vec_bit = 1u << ((uint32_t)vector % 32);
 
-        // Check IA32_APIC_BASE MSR bit 10 for x2APIC mode
-        uint64_t apic_base_msr = i2c_rdmsr(IA32_APIC_BASE_MSR);
-        int x2apic = (apic_base_msr >> 10) & 1;
-        i2c_dbg("[I2C%d] LAPIC diag: IA32_APIC_BASE=0x%llx x2APIC=%d\n",
-                ctrl->bus_id, (unsigned long long)apic_base_msr, x2apic);
+		// Check IA32_APIC_BASE MSR bit 10 for x2APIC mode
+		uint64_t apic_base_msr = i2c_rdmsr(IA32_APIC_BASE_MSR);
+		int x2apic = (apic_base_msr >> 10) & 1;
+		i2c_dbg("[I2C%d] LAPIC diag: IA32_APIC_BASE=0x%llx x2APIC=%d\n",
+			ctrl->bus_id, (unsigned long long)apic_base_msr,
+			x2apic);
 
-        for (uint32_t gsi = 24; gsi <= 39 && gsi <= max_gsi; gsi++) {
-            dw_write(ctrl, DW_IC_INTR_MASK, DW_IC_INTR_TX_EMPTY);
+		for (uint32_t gsi = 24; gsi <= 39 && gsi <= max_gsi; gsi++) {
+			dw_write(ctrl, DW_IC_INTR_MASK, DW_IC_INTR_TX_EMPTY);
 
-            // Determine polarity from IPC: active-HIGH unless AHPOLDIS set
-            uint32_t ahpoldis;
-            if (gsi < 32) ahpoldis = (ipc0 >> gsi) & 1;
-            else          ahpoldis = (ipc1 >> (gsi - 32)) & 1;
-            uint32_t pol = ahpoldis ? (1u << 13) : 0;
+			// Determine polarity from IPC: active-HIGH unless AHPOLDIS set
+			uint32_t ahpoldis;
+			if (gsi < 32)
+				ahpoldis = (ipc0 >> gsi) & 1;
+			else
+				ahpoldis = (ipc1 >> (gsi - 32)) & 1;
+			uint32_t pol = ahpoldis ? (1u << 13) : 0;
 
-            uint32_t low = (uint32_t)vector | pol | (1u << 15);
-            ioapic_write_rte((uint8_t)gsi, low, (bsp_apic_id & 0xFF) << 24);
+			uint32_t low = (uint32_t)vector | pol | (1u << 15);
+			ioapic_write_rte((uint8_t)gsi, low,
+					 (bsp_apic_id & 0xFF) << 24);
 
-            for (volatile int d = 0; d < 8000; d++)
-                __asm__ volatile("pause");
+			for (volatile int d = 0; d < 8000; d++)
+				__asm__ volatile("pause");
 
-            // Read LAPIC ISR/IRR — use MSR if x2APIC, else lapic_read()
-            uint32_t isr_val, irr_val;
-            if (x2apic) {
-                uint32_t isr_msr = X2APIC_MSR_BASE_LOCAL +
-                                   ((LAPIC_ISR_BASE + vec_reg * 0x10) >> 4);
-                uint32_t irr_msr = X2APIC_MSR_BASE_LOCAL +
-                                   ((LAPIC_IRR_BASE + vec_reg * 0x10) >> 4);
-                isr_val = (uint32_t)i2c_rdmsr(isr_msr);
-                irr_val = (uint32_t)i2c_rdmsr(irr_msr);
-            } else {
-                uint32_t isr_off = LAPIC_ISR_BASE + vec_reg * 0x10;
-                uint32_t irr_off = LAPIC_IRR_BASE + vec_reg * 0x10;
-                isr_val = lapic_read(isr_off);
-                irr_val = lapic_read(irr_off);
-            }
+			// Read LAPIC ISR/IRR — use MSR if x2APIC, else lapic_read()
+			uint32_t isr_val, irr_val;
+			if (x2apic) {
+				uint32_t isr_msr =
+					X2APIC_MSR_BASE_LOCAL +
+					((LAPIC_ISR_BASE + vec_reg * 0x10) >>
+					 4);
+				uint32_t irr_msr =
+					X2APIC_MSR_BASE_LOCAL +
+					((LAPIC_IRR_BASE + vec_reg * 0x10) >>
+					 4);
+				isr_val = (uint32_t)i2c_rdmsr(isr_msr);
+				irr_val = (uint32_t)i2c_rdmsr(irr_msr);
+			} else {
+				uint32_t isr_off =
+					LAPIC_ISR_BASE + vec_reg * 0x10;
+				uint32_t irr_off =
+					LAPIC_IRR_BASE + vec_reg * 0x10;
+				isr_val = lapic_read(isr_off);
+				irr_val = lapic_read(irr_off);
+			}
 
-            if ((isr_val & vec_bit) || (irr_val & vec_bit)) {
-                i2c_dbg("[I2C%d] GSI %u: LAPIC vec %u set ISR=0x%x IRR=0x%x "
-                        "(pol=%s) — interrupt REACHED LAPIC\n",
-                        ctrl->bus_id, gsi, vector, isr_val, irr_val,
-                        ahpoldis ? "low" : "high");
-            }
-            ioapic_mask_gsi((uint8_t)gsi);
-        }
-    }
+			if ((isr_val & vec_bit) || (irr_val & vec_bit)) {
+				i2c_dbg("[I2C%d] GSI %u: LAPIC vec %u set ISR=0x%x IRR=0x%x "
+					"(pol=%s) — interrupt REACHED LAPIC\n",
+					ctrl->bus_id, gsi, vector, isr_val,
+					irr_val, ahpoldis ? "low" : "high");
+			}
+			ioapic_mask_gsi((uint8_t)gsi);
+		}
+	}
 
-    // Disable DW interrupt output and clear pending
-    dw_write(ctrl, DW_IC_INTR_MASK, 0);
-    (void)dw_read(ctrl, DW_IC_CLR_INTR);
+	// Disable DW interrupt output and clear pending
+	dw_write(ctrl, DW_IC_INTR_MASK, 0);
+	(void)dw_read(ctrl, DW_IC_CLR_INTR);
 
-    // Disable controller again (set_target will re-enable for real transfers)
-    dw_write(ctrl, DW_IC_ENABLE, 0);
-    i2c_delay_us(1000);
+	// Disable controller again (set_target will re-enable for real transfers)
+	dw_write(ctrl, DW_IC_ENABLE, 0);
+	i2c_delay_us(1000);
 
-    g_i2c_probe_mode = 0;
+	g_i2c_probe_mode = 0;
 
-    // Restore IF to original state
-    if (!(rflags & 0x200))
-        __asm__ volatile("cli");
+	// Restore IF to original state
+	if (!(rflags & 0x200))
+		__asm__ volatile("cli");
 
-    if (found_gsi < 0)
-        i2c_dbg("[I2C%d] IOAPIC probe: no GSI found (swept 24-%u, 4 combos)\n",
-                ctrl->bus_id, max_gsi);
+	if (found_gsi < 0)
+		i2c_dbg("[I2C%d] IOAPIC probe: no GSI found (swept 24-%u, 4 combos)\n",
+			ctrl->bus_id, max_gsi);
 
-    return found_gsi;
+	return found_gsi;
 }
 
-static int detect_i2c_controllers(void) {
-    int count = 0;
-    const pci_device_t *devices;
-    int pci_count = 0;
+static int detect_i2c_controllers(void)
+{
+	int count = 0;
+	const pci_device_t *devices;
+	int pci_count = 0;
 
-    devices = pci_get_devices(&pci_count);
-    if (!devices || pci_count == 0) return 0;
+	devices = pci_get_devices(&pci_count);
+	if (!devices || pci_count == 0)
+		return 0;
 
-    // Initialize ECAM (PCIe memory-mapped config)
-    ecam_init_bus0();
+	// Initialize ECAM (PCIe memory-mapped config)
+	ecam_init_bus0();
 
-    // ---- Discovery strategy: PCI-first (like intel-lpss driver) ----
-    // Discover LPSS I2C controllers purely via PCI device ID matching.
-    // The BDF and BAR come straight from PCI config space — no ACPI needed
-    // for controller discovery.  ACPI is only used later to find HID child
-    // devices (PNP0C50/ACPI0C50) and to get I2C slave addresses via _CRS.
-    //
-    // 1. Scan PCI bus for Intel LPSS I2C device IDs
-    // 2. Get BDF directly from pci_device_t
-    // 3. Optionally resolve ACPI path (for child discovery), but don't require it
+	// ---- Discovery strategy: PCI-first (like intel-lpss driver) ----
+	// Discover LPSS I2C controllers purely via PCI device ID matching.
+	// The BDF and BAR come straight from PCI config space — no ACPI needed
+	// for controller discovery.  ACPI is only used later to find HID child
+	// devices (PNP0C50/ACPI0C50) and to get I2C slave addresses via _CRS.
+	//
+	// 1. Scan PCI bus for Intel LPSS I2C device IDs
+	// 2. Get BDF directly from pci_device_t
+	// 3. Optionally resolve ACPI path (for child discovery), but don't require it
 
-    // Collect PCI devices that match known LPSS I2C device IDs
-    typedef struct {
-        const pci_device_t *pci;
-        char acpi_path[64];
-    } lpss_ctrl_info_t;
+	// Collect PCI devices that match known LPSS I2C device IDs
+	typedef struct {
+		const pci_device_t *pci;
+		char acpi_path[64];
+	} lpss_ctrl_info_t;
 
-    lpss_ctrl_info_t ctrl_info[I2C_DW_MAX_CONTROLLERS];
-    int n_ctrl = 0;
+	lpss_ctrl_info_t ctrl_info[I2C_DW_MAX_CONTROLLERS];
+	int n_ctrl = 0;
 
-    for (int i = 0; i < pci_count && n_ctrl < I2C_DW_MAX_CONTROLLERS; i++) {
-        if (!is_intel_lpss_i2c(devices[i].vendor_id, devices[i].device_id))
-            continue;
+	for (int i = 0; i < pci_count && n_ctrl < I2C_DW_MAX_CONTROLLERS; i++) {
+		if (!is_intel_lpss_i2c(devices[i].vendor_id,
+				       devices[i].device_id))
+			continue;
 
-        lpss_ctrl_info_t *ci = &ctrl_info[n_ctrl];
-        ci->pci = &devices[i];
-        ci->acpi_path[0] = '\0';
+		lpss_ctrl_info_t *ci = &ctrl_info[n_ctrl];
+		ci->pci = &devices[i];
+		ci->acpi_path[0] = '\0';
 
-        // Try to find ACPI path for this PCI device (best-effort)
-        acpi_find_pci_acpi_path(devices[i].bus, devices[i].device,
-                                devices[i].function,
-                                ci->acpi_path, sizeof(ci->acpi_path));
+		// Try to find ACPI path for this PCI device (best-effort)
+		acpi_find_pci_acpi_path(devices[i].bus, devices[i].device,
+					devices[i].function, ci->acpi_path,
+					sizeof(ci->acpi_path));
 
-        i2c_dbg("[I2C] PCI %02x:%02x.%x DEV_%04x -> %s\n",
-                devices[i].bus, devices[i].device, devices[i].function,
-                devices[i].device_id,
-                ci->acpi_path[0] ? ci->acpi_path : "(no ACPI)");
-        n_ctrl++;
-    }
+		i2c_dbg("[I2C] PCI %02x:%02x.%x DEV_%04x -> %s\n",
+			devices[i].bus, devices[i].device, devices[i].function,
+			devices[i].device_id,
+			ci->acpi_path[0] ? ci->acpi_path : "(no ACPI)");
+		n_ctrl++;
+	}
 
-    // If PCI scan found nothing, try ACPI child-based discovery as fallback
-    if (n_ctrl == 0) {
-        static const char *const hid_ids[] = { "PNP0C50", "ACPI0C50", NULL };
-        char ctrl_paths[I2C_DW_MAX_CONTROLLERS][ACPI_AML_MAX_PATH];
-        int n_acpi = 0;
+	// If PCI scan found nothing, try ACPI child-based discovery as fallback
+	if (n_ctrl == 0) {
+		static const char *const hid_ids[] = { "PNP0C50", "ACPI0C50",
+						       NULL };
+		char ctrl_paths[I2C_DW_MAX_CONTROLLERS][ACPI_AML_MAX_PATH];
+		int n_acpi = 0;
 
-        for (int h = 0; hid_ids[h] && n_acpi < I2C_DW_MAX_CONTROLLERS; h++) {
-            acpi_aml_device_info_t devs[8];
-            int ndev = acpi_aml_find_devices_by_hid(hid_ids[h], devs, 8);
-            for (int d = 0; d < ndev && n_acpi < I2C_DW_MAX_CONTROLLERS; d++) {
-                char parent[ACPI_AML_MAX_PATH];
-                if (acpi_parent_path(devs[d].path, parent,
-                                     ACPI_AML_MAX_PATH) != 0)
-                    continue;
-                if (path_already_listed(ctrl_paths, n_acpi, parent))
-                    continue;
+		for (int h = 0; hid_ids[h] && n_acpi < I2C_DW_MAX_CONTROLLERS;
+		     h++) {
+			acpi_aml_device_info_t devs[8];
+			int ndev = acpi_aml_find_devices_by_hid(hid_ids[h],
+								devs, 8);
+			for (int d = 0;
+			     d < ndev && n_acpi < I2C_DW_MAX_CONTROLLERS; d++) {
+				char parent[ACPI_AML_MAX_PATH];
+				if (acpi_parent_path(devs[d].path, parent,
+						     ACPI_AML_MAX_PATH) != 0)
+					continue;
+				if (path_already_listed(ctrl_paths, n_acpi,
+							parent))
+					continue;
 
-                // Resolve _ADR → PCI BDF
-                uint64_t adr_val = 0;
-                if (acpi_aml_exec_device_method(parent, "_ADR",
-                                                &adr_val) != 0)
-                    continue;
-                uint8_t dev_a = (uint8_t)((adr_val >> 16) & 0xFF);
-                uint8_t fn_a  = (uint8_t)(adr_val & 0xFF);
+				// Resolve _ADR → PCI BDF
+				uint64_t adr_val = 0;
+				if (acpi_aml_exec_device_method(parent, "_ADR",
+								&adr_val) != 0)
+					continue;
+				uint8_t dev_a =
+					(uint8_t)((adr_val >> 16) & 0xFF);
+				uint8_t fn_a = (uint8_t)(adr_val & 0xFF);
 
-                // Find matching PCI device
-                const pci_device_t *pdev = NULL;
-                for (int p = 0; p < pci_count; p++) {
-                    if (devices[p].bus == 0 &&
-                        devices[p].device == dev_a &&
-                        devices[p].function == fn_a) {
-                        pdev = &devices[p];
-                        break;
-                    }
-                }
-                if (!pdev) continue;
+				// Find matching PCI device
+				const pci_device_t *pdev = NULL;
+				for (int p = 0; p < pci_count; p++) {
+					if (devices[p].bus == 0 &&
+					    devices[p].device == dev_a &&
+					    devices[p].function == fn_a) {
+						pdev = &devices[p];
+						break;
+					}
+				}
+				if (!pdev)
+					continue;
 
-                lpss_ctrl_info_t *ci = &ctrl_info[n_ctrl];
-                ci->pci = pdev;
-                i2c_memcpy(ci->acpi_path, parent, sizeof(ci->acpi_path));
-                i2c_memcpy(ctrl_paths[n_acpi], parent, ACPI_AML_MAX_PATH);
-                i2c_dbg("[I2C] ACPI child %s -> ctrl %s (%02x:%02x.%x)\n",
-                        devs[d].path, parent, 0, dev_a, fn_a);
-                n_ctrl++;
-                n_acpi++;
-            }
-        }
+				lpss_ctrl_info_t *ci = &ctrl_info[n_ctrl];
+				ci->pci = pdev;
+				i2c_memcpy(ci->acpi_path, parent,
+					   sizeof(ci->acpi_path));
+				i2c_memcpy(ctrl_paths[n_acpi], parent,
+					   ACPI_AML_MAX_PATH);
+				i2c_dbg("[I2C] ACPI child %s -> ctrl %s (%02x:%02x.%x)\n",
+					devs[d].path, parent, 0, dev_a, fn_a);
+				n_ctrl++;
+				n_acpi++;
+			}
+		}
+	}
 
-    }
+	kprintf("[I2C] %d controller(s)\n", n_ctrl);
 
-    kprintf("[I2C] %d controller(s)\n", n_ctrl);
+	for (int ci = 0; ci < n_ctrl && count < I2C_DW_MAX_CONTROLLERS; ci++) {
+		const pci_device_t *pci_dev = ctrl_info[ci].pci;
+		uint8_t bus_nr = pci_dev->bus;
+		uint8_t dev_nr = pci_dev->device;
+		uint8_t func_nr = pci_dev->function;
 
-    for (int ci = 0; ci < n_ctrl && count < I2C_DW_MAX_CONTROLLERS; ci++) {
-        const pci_device_t *pci_dev = ctrl_info[ci].pci;
-        uint8_t bus_nr  = pci_dev->bus;
-        uint8_t dev_nr  = pci_dev->device;
-        uint8_t func_nr = pci_dev->function;
+		kprintf("[I2C%d] PCI %02x:%02x.%x DEV_%04x VID_%04x\n", ci,
+			bus_nr, dev_nr, func_nr, pci_dev->device_id,
+			pci_dev->vendor_id);
 
-        kprintf("[I2C%d] PCI %02x:%02x.%x DEV_%04x VID_%04x\n",
-                ci, bus_nr, dev_nr, func_nr,
-                pci_dev->device_id, pci_dev->vendor_id);
+		i2c_dw_controller_t *ctrl = &g_i2c_controllers[count];
+		i2c_memset(ctrl, 0, sizeof(*ctrl));
+		ctrl->pci_dev = pci_dev;
+		ctrl->bus_id = ci;
+		if (ctrl_info[ci].acpi_path[0])
+			i2c_memcpy(ctrl->acpi_path, ctrl_info[ci].acpi_path,
+				   sizeof(ctrl->acpi_path));
+		dw_i2c_cache_acpi_timings(ctrl);
 
-        i2c_dw_controller_t *ctrl = &g_i2c_controllers[count];
-        i2c_memset(ctrl, 0, sizeof(*ctrl));
-        ctrl->pci_dev = pci_dev;
-        ctrl->bus_id = ci;
-        if (ctrl_info[ci].acpi_path[0])
-            i2c_memcpy(ctrl->acpi_path, ctrl_info[ci].acpi_path,
-                       sizeof(ctrl->acpi_path));
-        dw_i2c_cache_acpi_timings(ctrl);
+		// ====================================================================
+		// Follow the intel-lpss PCI probe sequence exactly:
+		//   intel_lpss_pci_probe():
+		//     1. pcim_enable_device()  → PMCSR D0, enable BAR (MSE)
+		//     2. pci_set_master()      → BME
+		//     3. intel_lpss_probe()    → ioremap BAR+0x200, init_dev()
+		//   intel_lpss_init_dev():
+		//     a. Assert reset   (write 0 to RESETS  @ priv+0x04)
+		//     b. Deassert reset (write 0x7 to RESETS)
+		//     c. Set remap addr (write BAR phys to priv+0x40)
+		//
+		// Do NOT touch D0I3C, PG_CONFIG, or any other
+		// vendor-specific PCI config registers during probe.
+		// ====================================================================
+		// ---- Step 1: Read BAR0 from config space ----
+		// PCI core reads BARs during enumeration (before any driver).
+		// pci_assign_unassigned_bars() already assigned 64-bit BARs from the
+		// host bridge 64-bit window (~0x501C2xxxxx on Arrow Lake).
+		// We just read the result here.
+		uint32_t bar0_low = ecam_read32(bus_nr, dev_nr, func_nr, 0x10);
+		uint64_t bar0_phys;
 
-        // ====================================================================
-        // Follow the intel-lpss PCI probe sequence exactly:
-        //   intel_lpss_pci_probe():
-        //     1. pcim_enable_device()  → PMCSR D0, enable BAR (MSE)
-        //     2. pci_set_master()      → BME
-        //     3. intel_lpss_probe()    → ioremap BAR+0x200, init_dev()
-        //   intel_lpss_init_dev():
-        //     a. Assert reset   (write 0 to RESETS  @ priv+0x04)
-        //     b. Deassert reset (write 0x7 to RESETS)
-        //     c. Set remap addr (write BAR phys to priv+0x40)
-        //
-        // Do NOT touch D0I3C, PG_CONFIG, or any other
-        // vendor-specific PCI config registers during probe.
-        // ====================================================================
-        // ---- Step 1: Read BAR0 from config space ----
-        // PCI core reads BARs during enumeration (before any driver).
-        // pci_assign_unassigned_bars() already assigned 64-bit BARs from the
-        // host bridge 64-bit window (~0x501C2xxxxx on Arrow Lake).
-        // We just read the result here.
-        uint32_t bar0_low = ecam_read32(bus_nr, dev_nr, func_nr, 0x10);
-        uint64_t bar0_phys;
+		if ((bar0_low & 0x6) == 0x4) { // 64-bit BAR
+			uint32_t bar1_high =
+				ecam_read32(bus_nr, dev_nr, func_nr, 0x14);
+			bar0_phys = ((uint64_t)bar1_high << 32) |
+				    (bar0_low & ~0xFULL);
+		} else {
+			bar0_phys = bar0_low & ~0xFULL;
+		}
 
-        if ((bar0_low & 0x6) == 0x4) {  // 64-bit BAR
-            uint32_t bar1_high = ecam_read32(bus_nr, dev_nr, func_nr, 0x14);
-            bar0_phys = ((uint64_t)bar1_high << 32) | (bar0_low & ~0xFULL);
-        } else {
-            bar0_phys = bar0_low & ~0xFULL;
-        }
+		i2c_dbg("[I2C%d] BAR=0x%llx\n", ci,
+			(unsigned long long)bar0_phys);
 
-        i2c_dbg("[I2C%d] BAR=0x%llx\n", ci, (unsigned long long)bar0_phys);
+		if (bar0_phys == 0) {
+			kprintf("[I2C%d] ERROR: BAR0 not configured\n", ci);
+			continue;
+		}
 
-        if (bar0_phys == 0) {
-            kprintf("[I2C%d] ERROR: BAR0 not configured\n", ci);
-            continue;
-        }
+		ctrl->bar_phys = bar0_phys;
 
-        ctrl->bar_phys = bar0_phys;
+		// ---- Step 2: ACPI power-on (like pcim_enable_device →
+		//              pci_power_up → platform_pci_set_power_state →
+		//              acpi_pci_set_power_state → acpi_device_set_power →
+		//              _PS0) ----
+		{
+			int ps0_rc = acpi_fw_power_on_pci_device(bus_nr, dev_nr,
+								 func_nr);
+			i2c_dbg("[I2C%d] ACPI power-on rc=%d\n", ci, ps0_rc);
+		}
 
-        // ---- Step 2: ACPI power-on (like pcim_enable_device →
-        //              pci_power_up → platform_pci_set_power_state →
-        //              acpi_pci_set_power_state → acpi_device_set_power →
-        //              _PS0) ----
-        {
-            int ps0_rc = acpi_fw_power_on_pci_device(bus_nr, dev_nr, func_nr);
-            i2c_dbg("[I2C%d] ACPI power-on rc=%d\n", ci, ps0_rc);
-        }
+		// ---- Step 3: PMCSR → D0 ----
+		uint8_t pm_cap = pci_find_capability(pci_dev, 0x01);
+		if (pm_cap) {
+			uint16_t pmcsr = ecam_read16(bus_nr, dev_nr, func_nr,
+						     pm_cap + 4);
+			uint16_t old_pm = pmcsr;
+			uint16_t new_pm =
+				(pmcsr & ~PCI_PMCSR_POWER_STATE_MASK) |
+				PCI_PMCSR_PME_STATUS;
+			ecam_write16(bus_nr, dev_nr, func_nr, pm_cap + 4,
+				     new_pm);
+			i2c_delay_us(50000);
+			i2c_dbg("[I2C%d] PMCSR 0x%x->0x%x\n", ci, old_pm,
+				ecam_read16(bus_nr, dev_nr, func_nr,
+					    pm_cap + 4));
+		}
 
-        // ---- Step 3: PMCSR → D0 ----
-        uint8_t pm_cap = pci_find_capability(pci_dev, 0x01);
-        if (pm_cap) {
-            uint16_t pmcsr = ecam_read16(bus_nr, dev_nr, func_nr, pm_cap + 4);
-            uint16_t old_pm = pmcsr;
-            uint16_t new_pm = (pmcsr & ~PCI_PMCSR_POWER_STATE_MASK) |
-                              PCI_PMCSR_PME_STATUS;
-            ecam_write16(bus_nr, dev_nr, func_nr, pm_cap + 4, new_pm);
-            i2c_delay_us(50000);
-            i2c_dbg("[I2C%d] PMCSR 0x%x->0x%x\n", ci, old_pm,
-                    ecam_read16(bus_nr, dev_nr, func_nr, pm_cap + 4));
-        }
+		// ---- Step 4: Enable Memory Space + Bus Master ----
+		{
+			uint32_t cmd =
+				ecam_read32(bus_nr, dev_nr, func_nr, 0x04);
+			i2c_dbg("[I2C%d] CMD 0x%x->0x%x\n", ci, cmd, cmd | 0x6);
+			ecam_write32(bus_nr, dev_nr, func_nr, 0x04, cmd | 0x6);
+		}
 
-        // ---- Step 4: Enable Memory Space + Bus Master ----
-        {
-            uint32_t cmd = ecam_read32(bus_nr, dev_nr, func_nr, 0x04);
-            i2c_dbg("[I2C%d] CMD 0x%x->0x%x\n", ci, cmd, cmd | 0x6);
-            ecam_write32(bus_nr, dev_nr, func_nr, 0x04, cmd | 0x6);
-        }
+		// ---- Step 5: Map BAR0 ----
+		uint64_t mapped =
+			mm_map_device_mmio(bar0_phys, I2C_LPSS_MMIO_PAGES);
+		if (!mapped) {
+			kprintf("[I2C%d] ERROR: map BAR0 failed\n", ci);
+			continue;
+		}
+		ctrl->base = (volatile uint32_t *)mapped;
 
-        // ---- Step 5: Map BAR0 ----
-        uint64_t mapped = mm_map_device_mmio(bar0_phys, I2C_LPSS_MMIO_PAGES);
-        if (!mapped) {
-            kprintf("[I2C%d] ERROR: map BAR0 failed\n", ci);
-            continue;
-        }
-        ctrl->base = (volatile uint32_t *)mapped;
+		// ---- Step 5: Initialize the DesignWare I2C controller ----
+		// dw_i2c_init_controller() does exactly what intel_lpss_init_dev()
+		// does: assert reset, deassert reset, set remap addr.
+		// Plus DW core configuration (speed, FIFO, etc).
+		if (dw_i2c_init_controller(ctrl) == 0) {
+			uint8_t vector = I2C_MSI_VECTOR_BASE + (uint8_t)count;
+			int irq_ok = 0;
 
-        // ---- Step 5: Initialize the DesignWare I2C controller ----
-        // dw_i2c_init_controller() does exactly what intel_lpss_init_dev()
-        // does: assert reset, deassert reset, set remap addr.
-        // Plus DW core configuration (speed, FIFO, etc).
-        if (dw_i2c_init_controller(ctrl) == 0) {
-            uint8_t vector = I2C_MSI_VECTOR_BASE + (uint8_t)count;
-            int irq_ok = 0;
+			// Dump PCI capability list via ECAM for diagnostics
+			{
+				uint32_t sts = ecam_read32(bus_nr, dev_nr,
+							   func_nr, 0x04);
+				i2c_dbg("[I2C%d] PCI STS=0x%04x CMD=0x%04x caplist=%d\n",
+					ci, (sts >> 16) & 0xFFFF, sts & 0xFFFF,
+					(int)((sts >> 16) & (1 << 4)) != 0);
+				if ((sts >> 16) & (1 << 4)) {
+					uint8_t ptr =
+						(uint8_t)(ecam_read32(bus_nr,
+								      dev_nr,
+								      func_nr,
+								      0x34) &
+							  0xFC);
+					for (int ci2 = 0; ci2 < 48 && ptr;
+					     ci2++) {
+						uint32_t hdr = ecam_read32(
+							bus_nr, dev_nr, func_nr,
+							ptr);
+						uint8_t cap_id =
+							(uint8_t)(hdr & 0xFF);
+						i2c_dbg("[I2C%d]   CAP @ 0x%02x: id=0x%02x\n",
+							ci, ptr, cap_id);
+						ptr = (uint8_t)((hdr >> 8) &
+								0xFC);
+					}
+				}
+			}
 
-            // Dump PCI capability list via ECAM for diagnostics
-            {
-                uint32_t sts = ecam_read32(bus_nr, dev_nr, func_nr, 0x04);
-                i2c_dbg("[I2C%d] PCI STS=0x%04x CMD=0x%04x caplist=%d\n",
-                        ci, (sts >> 16) & 0xFFFF, sts & 0xFFFF,
-                        (int)((sts >> 16) & (1 << 4)) != 0);
-                if ((sts >> 16) & (1 << 4)) {
-                    uint8_t ptr = (uint8_t)(ecam_read32(bus_nr, dev_nr, func_nr, 0x34) & 0xFC);
-                    for (int ci2 = 0; ci2 < 48 && ptr; ci2++) {
-                        uint32_t hdr = ecam_read32(bus_nr, dev_nr, func_nr, ptr);
-                        uint8_t cap_id = (uint8_t)(hdr & 0xFF);
-                        i2c_dbg("[I2C%d]   CAP @ 0x%02x: id=0x%02x\n",
-                                ci, ptr, cap_id);
-                        ptr = (uint8_t)((hdr >> 8) & 0xFC);
-                    }
-                }
-            }
+			// Try MSI first (cap 0x05)
+			if (pci_enable_msi(pci_dev, vector) == 0) {
+				i2c_dbg("[I2C%d] MSI vector %u enabled\n", ci,
+					vector);
+				irq_ok = 1;
+			}
 
-            // Try MSI first (cap 0x05)
-            if (pci_enable_msi(pci_dev, vector) == 0) {
-                i2c_dbg("[I2C%d] MSI vector %u enabled\n", ci, vector);
-                irq_ok = 1;
-            }
+			// MSI unavailable — try ACPI _CRS on the controller's own
+			// ACPI device node.  Intel LPSS Serial I/O controllers on
+			// Arrow Lake (and similar PCHs) are absent from the root
+			// bridge's _PRT; instead the BIOS puts an Extended IRQ
+			// resource directly in the controller's _CRS.
+			if (!irq_ok && ctrl->acpi_path[0]) {
+				acpi_crs_result_t crs;
+				if (acpi_aml_eval_crs(ctrl->acpi_path, &crs) ==
+					    0 &&
+				    crs.irq_count > 0) {
+					uint32_t gsi = crs.irqs[0];
+					uint8_t pol =
+						crs.irq_polarity ?
+							IOAPIC_POLARITY_LOW :
+							IOAPIC_POLARITY_HIGH;
+					uint8_t trig =
+						crs.irq_triggering ?
+							IOAPIC_TRIGGER_EDGE :
+							IOAPIC_TRIGGER_LEVEL;
+					i2c_dbg("[I2C%d] _CRS GSI %u (pol=%u trig=%u)\n",
+						ci, gsi, pol, trig);
+					if (ioapic_configure_legacy_irq(
+						    (uint8_t)gsi, vector, pol,
+						    trig) == 0) {
+						i2c_dbg("[I2C%d] IOAPIC GSI %u -> vector %u\n",
+							ci, gsi, vector);
+						irq_ok = 1;
+					}
+				}
+			}
 
-            // MSI unavailable — try ACPI _CRS on the controller's own
-            // ACPI device node.  Intel LPSS Serial I/O controllers on
-            // Arrow Lake (and similar PCHs) are absent from the root
-            // bridge's _PRT; instead the BIOS puts an Extended IRQ
-            // resource directly in the controller's _CRS.
-            if (!irq_ok && ctrl->acpi_path[0]) {
-                acpi_crs_result_t crs;
-                if (acpi_aml_eval_crs(ctrl->acpi_path, &crs) == 0 &&
-                    crs.irq_count > 0) {
-                    uint32_t gsi = crs.irqs[0];
-                    uint8_t pol = crs.irq_polarity
-                                  ? IOAPIC_POLARITY_LOW : IOAPIC_POLARITY_HIGH;
-                    uint8_t trig = crs.irq_triggering
-                                   ? IOAPIC_TRIGGER_EDGE : IOAPIC_TRIGGER_LEVEL;
-                    i2c_dbg("[I2C%d] _CRS GSI %u (pol=%u trig=%u)\n",
-                            ci, gsi, pol, trig);
-                    if (ioapic_configure_legacy_irq((uint8_t)gsi, vector,
-                                                    pol, trig) == 0) {
-                        i2c_dbg("[I2C%d] IOAPIC GSI %u -> vector %u\n",
-                                ci, gsi, vector);
-                        irq_ok = 1;
-                    }
-                }
-            }
+			// Fall back to IOAPIC via ACPI _PRT on the parent bridge.
+			// Re-read INTPIN from config space (BIOS may program it even
+			// though the PCH datasheet default is 0).
+			if (!irq_ok && ctrl->acpi_path[0]) {
+				char bridge[64];
+				if (acpi_parent_path(ctrl->acpi_path, bridge,
+						     sizeof(bridge)) == 0) {
+					// Read INTPIN fresh via ECAM — the cached pci_device_t
+					// may have been read via legacy CF8/CFC before BIOS
+					// finished programming.
+					uint32_t ireg = ecam_read32(
+						bus_nr, dev_nr, func_nr, 0x3C);
+					uint8_t pin =
+						(uint8_t)((ireg >> 8) & 0xFF);
+					uint32_t gsi = 0;
 
-            // Fall back to IOAPIC via ACPI _PRT on the parent bridge.
-            // Re-read INTPIN from config space (BIOS may program it even
-            // though the PCH datasheet default is 0).
-            if (!irq_ok && ctrl->acpi_path[0]) {
-                char bridge[64];
-                if (acpi_parent_path(ctrl->acpi_path, bridge, sizeof(bridge)) == 0) {
-                    // Read INTPIN fresh via ECAM — the cached pci_device_t
-                    // may have been read via legacy CF8/CFC before BIOS
-                    // finished programming.
-                    uint32_t ireg = ecam_read32(bus_nr, dev_nr, func_nr, 0x3C);
-                    uint8_t pin = (uint8_t)((ireg >> 8) & 0xFF);
-                    uint32_t gsi = 0;
+					i2c_dbg("[I2C%d] PCI INTPIN=%u (fresh ECAM read)\n",
+						ci, pin);
 
-                    i2c_dbg("[I2C%d] PCI INTPIN=%u (fresh ECAM read)\n",
-                            ci, pin);
+					if (pin >= 1 && pin <= 4 &&
+					    acpi_pci_lookup_irq(bridge, dev_nr,
+								pin - 1,
+								&gsi) == 0) {
+						if (ioapic_configure_legacy_irq(
+							    (uint8_t)gsi,
+							    vector,
+							    IOAPIC_POLARITY_LOW,
+							    IOAPIC_TRIGGER_LEVEL) ==
+						    0) {
+							i2c_dbg("[I2C%d] IOAPIC GSI %u -> vector %u (PRT pin %u)\n",
+								ci, gsi, vector,
+								pin);
+							irq_ok = 1;
+						}
+					}
 
-                    if (pin >= 1 && pin <= 4 &&
-                        acpi_pci_lookup_irq(bridge, dev_nr, pin - 1, &gsi) == 0) {
-                        if (ioapic_configure_legacy_irq((uint8_t)gsi, vector,
-                                                        IOAPIC_POLARITY_LOW,
-                                                        IOAPIC_TRIGGER_LEVEL) == 0) {
-                            i2c_dbg("[I2C%d] IOAPIC GSI %u -> vector %u (PRT pin %u)\n",
-                                    ci, gsi, vector, pin);
-                            irq_ok = 1;
-                        }
-                    }
+					// If INTPIN=0, try each pin (INTA-INTD) against _PRT.
+					// Some BIOS leave INTPIN=0 but the _PRT still has an
+					// entry for the device slot.
+					if (!irq_ok && pin == 0) {
+						for (uint8_t try_pin = 0;
+						     try_pin < 4 && !irq_ok;
+						     try_pin++) {
+							gsi = 0;
+							if (acpi_pci_lookup_irq(
+								    bridge,
+								    dev_nr,
+								    try_pin,
+								    &gsi) ==
+							    0) {
+								if (ioapic_configure_legacy_irq(
+									    (uint8_t)
+										    gsi,
+									    vector,
+									    IOAPIC_POLARITY_LOW,
+									    IOAPIC_TRIGGER_LEVEL) ==
+								    0) {
+									i2c_dbg("[I2C%d] IOAPIC GSI %u -> vector %u (PRT scan pin %u)\n",
+										ci,
+										gsi,
+										vector,
+										try_pin);
+									irq_ok =
+										1;
+								}
+							}
+						}
+					}
+				}
+			}
 
-                    // If INTPIN=0, try each pin (INTA-INTD) against _PRT.
-                    // Some BIOS leave INTPIN=0 but the _PRT still has an
-                    // entry for the device slot.
-                    if (!irq_ok && pin == 0) {
-                        for (uint8_t try_pin = 0; try_pin < 4 && !irq_ok; try_pin++) {
-                            gsi = 0;
-                            if (acpi_pci_lookup_irq(bridge, dev_nr, try_pin, &gsi) == 0) {
-                                if (ioapic_configure_legacy_irq((uint8_t)gsi, vector,
-                                                                IOAPIC_POLARITY_LOW,
-                                                                IOAPIC_TRIGGER_LEVEL) == 0) {
-                                    i2c_dbg("[I2C%d] IOAPIC GSI %u -> vector %u (PRT scan pin %u)\n",
-                                            ci, gsi, vector, try_pin);
-                                    irq_ok = 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+			// Last resort: PCI interrupt_line as direct IOAPIC GSI.
+			// On Intel PCH, BIOS often programs INTLINE with the IOAPIC
+			// GSI even when INTPIN=0.  Try using it directly.
+			if (!irq_ok) {
+				uint32_t ireg = ecam_read32(bus_nr, dev_nr,
+							    func_nr, 0x3C);
+				uint8_t intline = (uint8_t)(ireg & 0xFF);
+				uint8_t pin = (uint8_t)((ireg >> 8) & 0xFF);
 
-            // Last resort: PCI interrupt_line as direct IOAPIC GSI.
-            // On Intel PCH, BIOS often programs INTLINE with the IOAPIC
-            // GSI even when INTPIN=0.  Try using it directly.
-            if (!irq_ok) {
-                uint32_t ireg = ecam_read32(bus_nr, dev_nr, func_nr, 0x3C);
-                uint8_t intline = (uint8_t)(ireg & 0xFF);
-                uint8_t pin = (uint8_t)((ireg >> 8) & 0xFF);
+				if (intline != 0 && intline != 0xFF) {
+					i2c_dbg("[I2C%d] PCI INTx fallback: line=%u pin=%u\n",
+						ci, intline, pin);
+					if (ioapic_configure_legacy_irq(
+						    intline, vector,
+						    IOAPIC_POLARITY_LOW,
+						    IOAPIC_TRIGGER_LEVEL) ==
+					    0) {
+						i2c_dbg("[I2C%d] IOAPIC GSI %u -> vector %u\n",
+							ci, intline, vector);
+						irq_ok = 1;
+					}
+				}
+			}
 
-                if (intline != 0 && intline != 0xFF) {
-                    i2c_dbg("[I2C%d] PCI INTx fallback: line=%u pin=%u\n",
-                            ci, intline, pin);
-                    if (ioapic_configure_legacy_irq(intline, vector,
-                                                    IOAPIC_POLARITY_LOW,
-                                                    IOAPIC_TRIGGER_LEVEL) == 0) {
-                        i2c_dbg("[I2C%d] IOAPIC GSI %u -> vector %u\n",
-                                ci, intline, vector);
-                        irq_ok = 1;
-                    }
-                }
-            }
+			if (irq_ok) {
+				ctrl->irq_vector = vector;
+				kprintf("[I2C%d] PCI IRQ configured (vector %u)\n",
+					ci, vector);
+			} else {
+				// All standard methods failed (MSI, _CRS, _PRT, INTLINE).
+				// On Arrow Lake PCH 600/700 the LPSS I2C controllers at D21
+				// use direct IOAPIC entries (GSI 24+) programmed by the
+				// firmware through the ITSS.  Neither _PRT nor _CRS exposes
+				// the mapping; VT-d IR is used instead.
+				//
+				// Experiment: Write PCI INTLINE with a chosen GSI before
+				// probing. On some PCH revisions the ITSS uses INTLINE to
+				// determine which IOAPIC entry the device's interrupt
+				// routes to. If INTLINE=0 (Dell default), no routing
+				// occurs and the probe sweep will never fire.
+				uint8_t chosen_gsi = (uint8_t)(25 + count);
+				uint32_t ireg_before = ecam_read32(
+					bus_nr, dev_nr, func_nr, 0x3C);
+				ecam_write32(bus_nr, dev_nr, func_nr, 0x3C,
+					     (ireg_before & 0xFFFFFF00u) |
+						     chosen_gsi);
+				uint32_t ireg_after = ecam_read32(
+					bus_nr, dev_nr, func_nr, 0x3C);
+				i2c_dbg("[I2C%d] PCI INTLINE: 0x%x -> 0x%x (wrote GSI %u)\n",
+					ci, ireg_before & 0xFF,
+					ireg_after & 0xFF, chosen_gsi);
 
-            if (irq_ok) {
-                ctrl->irq_vector = vector;
-                kprintf("[I2C%d] PCI IRQ configured (vector %u)\n", ci, vector);
-            } else {
-                // All standard methods failed (MSI, _CRS, _PRT, INTLINE).
-                // On Arrow Lake PCH 600/700 the LPSS I2C controllers at D21
-                // use direct IOAPIC entries (GSI 24+) programmed by the
-                // firmware through the ITSS.  Neither _PRT nor _CRS exposes
-                // the mapping; VT-d IR is used instead.
-                //
-                // Experiment: Write PCI INTLINE with a chosen GSI before
-                // probing. On some PCH revisions the ITSS uses INTLINE to
-                // determine which IOAPIC entry the device's interrupt
-                // routes to. If INTLINE=0 (Dell default), no routing
-                // occurs and the probe sweep will never fire.
-                uint8_t chosen_gsi = (uint8_t)(25 + count);
-                uint32_t ireg_before = ecam_read32(bus_nr, dev_nr, func_nr, 0x3C);
-                ecam_write32(bus_nr, dev_nr, func_nr, 0x3C,
-                             (ireg_before & 0xFFFFFF00u) | chosen_gsi);
-                uint32_t ireg_after = ecam_read32(bus_nr, dev_nr, func_nr, 0x3C);
-                i2c_dbg("[I2C%d] PCI INTLINE: 0x%x -> 0x%x (wrote GSI %u)\n",
-                        ci, ireg_before & 0xFF, ireg_after & 0xFF, chosen_gsi);
+				// Probe the IOAPIC: enable the DW core's TX_EMPTY interrupt
+				// and sweep entries 24-119 to find which one fires.
+				i2c_dbg("[I2C%d] Probing IOAPIC for direct GSI (vector %u)...\n",
+					ci, vector);
+				int gsi = probe_ioapic_i2c_gsi(ctrl, vector);
+				if (gsi >= 0) {
+					// Found it — configure the IOAPIC entry permanently.
+					// PCH ITSS IPC default for IRQ 24+: active-HIGH.
+					if (ioapic_configure_legacy_irq(
+						    (uint8_t)gsi, vector,
+						    IOAPIC_POLARITY_HIGH,
+						    IOAPIC_TRIGGER_LEVEL) ==
+					    0) {
+						i2c_dbg("[I2C%d] IOAPIC GSI %d -> vector %u (probed)\n",
+							ci, gsi, vector);
+						ctrl->irq_vector = vector;
+						ctrl->irq_gsi = (uint32_t)gsi;
+						irq_ok = 1;
+						// Mask the IOAPIC entry — only unmask during active
+						// transfers.  The DW core's interrupt output stays
+						// HIGH even with IC_INTR_MASK=0 (Intel LPSS quirk),
+						// which causes a 60 kHz ISR storm if left unmasked.
+						ioapic_mask_gsi((uint8_t)gsi);
+						// Record this GSI so the next probe doesn't mask it
+						if (g_i2c_claimed_gsi_count <
+						    I2C_DW_MAX_CONTROLLERS)
+							g_i2c_claimed_gsi
+								[g_i2c_claimed_gsi_count++] =
+									gsi;
+					}
+				}
+			}
 
-                // Probe the IOAPIC: enable the DW core's TX_EMPTY interrupt
-                // and sweep entries 24-119 to find which one fires.
-                i2c_dbg("[I2C%d] Probing IOAPIC for direct GSI (vector %u)...\n",
-                        ci, vector);
-                int gsi = probe_ioapic_i2c_gsi(ctrl, vector);
-                if (gsi >= 0) {
-                    // Found it — configure the IOAPIC entry permanently.
-                    // PCH ITSS IPC default for IRQ 24+: active-HIGH.
-                    if (ioapic_configure_legacy_irq((uint8_t)gsi, vector,
-                                                    IOAPIC_POLARITY_HIGH,
-                                                    IOAPIC_TRIGGER_LEVEL) == 0) {
-                        i2c_dbg("[I2C%d] IOAPIC GSI %d -> vector %u (probed)\n",
-                                ci, gsi, vector);
-                        ctrl->irq_vector = vector;
-                        ctrl->irq_gsi = (uint32_t)gsi;
-                        irq_ok = 1;
-                        // Mask the IOAPIC entry — only unmask during active
-                        // transfers.  The DW core's interrupt output stays
-                        // HIGH even with IC_INTR_MASK=0 (Intel LPSS quirk),
-                        // which causes a 60 kHz ISR storm if left unmasked.
-                        ioapic_mask_gsi((uint8_t)gsi);
-                        // Record this GSI so the next probe doesn't mask it
-                        if (g_i2c_claimed_gsi_count < I2C_DW_MAX_CONTROLLERS)
-                            g_i2c_claimed_gsi[g_i2c_claimed_gsi_count++] = gsi;
-                    }
-                }
-            }
+			if (irq_ok) {
+				// Start with interrupts masked; the transfer routine
+				// enables specific interrupts per-transfer.
+				dw_write(ctrl, DW_IC_INTR_MASK, 0);
+				(void)dw_read(ctrl, DW_IC_CLR_INTR);
+			} else {
+				kprintf("[I2C%d] WARNING: no interrupt source found\n",
+					ci);
+			}
+			count++;
+		}
+	}
 
-            if (irq_ok) {
-                // Start with interrupts masked; the transfer routine
-                // enables specific interrupts per-transfer.
-                dw_write(ctrl, DW_IC_INTR_MASK, 0);
-                (void)dw_read(ctrl, DW_IC_CLR_INTR);
-            } else {
-                kprintf("[I2C%d] WARNING: no interrupt source found\n", ci);
-            }
-            count++;
-        }
-    }
-
-    g_i2c_controller_count = count;
-    return count;
+	g_i2c_controller_count = count;
+	return count;
 }
 
 // ============================================================================
@@ -2163,144 +2401,152 @@ static int detect_i2c_controllers(void) {
 
 // Try to read HID descriptor from a device at a given register address
 static int i2c_hid_fetch_descriptor(i2c_dw_controller_t *ctrl, uint16_t addr,
-                                     uint16_t desc_reg, i2c_hid_desc_t *desc) {
-    uint8_t buf[30];
-    i2c_memset(buf, 0, sizeof(buf));
+				    uint16_t desc_reg, i2c_hid_desc_t *desc)
+{
+	uint8_t buf[30];
+	i2c_memset(buf, 0, sizeof(buf));
 
-    int rc = dw_i2c_read_reg16(ctrl, addr, desc_reg, buf, 30);
-    if (rc < 0) return -1;
+	int rc = dw_i2c_read_reg16(ctrl, addr, desc_reg, buf, 30);
+	if (rc < 0)
+		return -1;
 
-    // Copy to descriptor struct (already little-endian on x86)
-    i2c_memcpy(desc, buf, 30);
+	// Copy to descriptor struct (already little-endian on x86)
+	i2c_memcpy(desc, buf, 30);
 
-    // Validate
-    if (desc->wHIDDescLength != 30) return -1;
-    if (desc->bcdVersion < 0x0100 || desc->bcdVersion > 0x0300) return -1;
-    if (desc->wReportDescLength == 0 || desc->wReportDescLength > 4096) return -1;
-    if (desc->wMaxInputLength < 3) return -1;
+	// Validate
+	if (desc->wHIDDescLength != 30)
+		return -1;
+	if (desc->bcdVersion < 0x0100 || desc->bcdVersion > 0x0300)
+		return -1;
+	if (desc->wReportDescLength == 0 || desc->wReportDescLength > 4096)
+		return -1;
+	if (desc->wMaxInputLength < 3)
+		return -1;
 
-    return 0;
+	return 0;
 }
 
 // Try to discover an I2C HID device at a given address
-static int i2c_hid_probe_device(i2c_dw_controller_t *ctrl,
-                                uint16_t addr,
-                                uint32_t connection_speed) {
-    if (g_i2c_hid_device_count >= I2C_HID_MAX_DEVICES)
-        return -1;
+static int i2c_hid_probe_device(i2c_dw_controller_t *ctrl, uint16_t addr,
+				uint32_t connection_speed)
+{
+	if (g_i2c_hid_device_count >= I2C_HID_MAX_DEVICES)
+		return -1;
 
-    if (dw_i2c_apply_bus_speed(ctrl, connection_speed, "probe") < 0)
-        return -1;
+	if (dw_i2c_apply_bus_speed(ctrl, connection_speed, "probe") < 0)
+		return -1;
 
-    i2c_hid_device_t *dev = &g_i2c_hid_devices[g_i2c_hid_device_count];
-    i2c_memset(dev, 0, sizeof(*dev));
-    dev->ctrl = ctrl;
-    dev->i2c_addr = addr;
+	i2c_hid_device_t *dev = &g_i2c_hid_devices[g_i2c_hid_device_count];
+	i2c_memset(dev, 0, sizeof(*dev));
+	dev->ctrl = ctrl;
+	dev->i2c_addr = addr;
 
-    // Try common HID descriptor register addresses
-    static const uint16_t desc_regs[] = { 0x0001, 0x0020, 0x0030 };
+	// Try common HID descriptor register addresses
+	static const uint16_t desc_regs[] = { 0x0001, 0x0020, 0x0030 };
 
-    int found = 0;
-    for (int r = 0; r < 3; r++) {
-        if (i2c_hid_fetch_descriptor(ctrl, addr, desc_regs[r], &dev->desc) == 0) {
-            dev->hid_desc_reg = desc_regs[r];
-            found = 1;
-            break;
-        }
-    }
+	int found = 0;
+	for (int r = 0; r < 3; r++) {
+		if (i2c_hid_fetch_descriptor(ctrl, addr, desc_regs[r],
+					     &dev->desc) == 0) {
+			dev->hid_desc_reg = desc_regs[r];
+			found = 1;
+			break;
+		}
+	}
 
-    if (!found) return -1;
+	if (!found)
+		return -1;
 
-    kprintf("[I2C-HID] Device at I2C%d:0x%02x  VID=%04x PID=%04x  "
-            "descReg=0x%04x  input=%u bytes  reportDesc=%u bytes\n",
-            ctrl->bus_id, addr,
-            dev->desc.wVendorID, dev->desc.wProductID,
-            dev->hid_desc_reg,
-            dev->desc.wMaxInputLength, dev->desc.wReportDescLength);
+	kprintf("[I2C-HID] Device at I2C%d:0x%02x  VID=%04x PID=%04x  "
+		"descReg=0x%04x  input=%u bytes  reportDesc=%u bytes\n",
+		ctrl->bus_id, addr, dev->desc.wVendorID, dev->desc.wProductID,
+		dev->hid_desc_reg, dev->desc.wMaxInputLength,
+		dev->desc.wReportDescLength);
 
-    g_i2c_hid_device_count++;
-    return 0;
+	g_i2c_hid_device_count++;
+	return 0;
 }
 
 // ============================================================================
 // HID over I2C — Commands
 // ============================================================================
 
-static int i2c_hid_write_simple_command(i2c_hid_device_t *dev,
-                                        uint16_t opcode,
-                                        uint8_t arg,
-                                        const char *name)
+static int i2c_hid_write_simple_command(i2c_hid_device_t *dev, uint16_t opcode,
+					uint8_t arg, const char *name)
 {
-    uint16_t cmd_reg = dev->desc.wCommandRegister;
-    uint8_t buf[4] = {
-        (uint8_t)(cmd_reg & 0xFF),
-        (uint8_t)((cmd_reg >> 8) & 0xFF),
-        arg,
-        (uint8_t)(opcode >> 8)
-    };
+	uint16_t cmd_reg = dev->desc.wCommandRegister;
+	uint8_t buf[4] = { (uint8_t)(cmd_reg & 0xFF),
+			   (uint8_t)((cmd_reg >> 8) & 0xFF), arg,
+			   (uint8_t)(opcode >> 8) };
 
-    i2c_dbg("[I2C-HID] %s wire: [%02x %02x %02x %02x]\n",
-            name, buf[0], buf[1], buf[2], buf[3]);
+	i2c_dbg("[I2C-HID] %s wire: [%02x %02x %02x %02x]\n", name, buf[0],
+		buf[1], buf[2], buf[3]);
 
-    return dw_i2c_write(dev->ctrl, dev->i2c_addr, buf, 4);
+	return dw_i2c_write(dev->ctrl, dev->i2c_addr, buf, 4);
 }
 
-static int i2c_hid_set_power(i2c_hid_device_t *dev, uint16_t power_state) {
-    return i2c_hid_write_simple_command(dev, I2C_HID_OPCODE_SET_POWER,
-                                        (uint8_t)power_state,
-                                        "SET_POWER");
+static int i2c_hid_set_power(i2c_hid_device_t *dev, uint16_t power_state)
+{
+	return i2c_hid_write_simple_command(dev, I2C_HID_OPCODE_SET_POWER,
+					    (uint8_t)power_state, "SET_POWER");
 }
 
-static int i2c_hid_reset(i2c_hid_device_t *dev) {
-    int rc = i2c_hid_write_simple_command(dev, I2C_HID_OPCODE_RESET, 0,
-                                          "RESET");
-    if (rc < 0) return rc;
+static int i2c_hid_reset(i2c_hid_device_t *dev)
+{
+	int rc = i2c_hid_write_simple_command(dev, I2C_HID_OPCODE_RESET, 0,
+					      "RESET");
+	if (rc < 0)
+		return rc;
 
-    // Wait for reset to complete (spec says up to 5 seconds, typically <100ms)
-    // The device will pull INT low and send a reset-completion 2-byte message
-    i2c_delay_us(100000);  // 100ms
+	// Wait for reset to complete (spec says up to 5 seconds, typically <100ms)
+	// The device will pull INT low and send a reset-completion 2-byte message
+	i2c_delay_us(100000); // 100ms
 
-    // Read and discard the reset-completion response using length-first
-    // protocol: read 2-byte header, then actual report length.
-    uint16_t resp_buf_size = dev->input_buf_size;
-    if (resp_buf_size < I2C_HID_LENGTH_HDR_SIZE)
-        resp_buf_size = I2C_HID_LENGTH_HDR_SIZE;
-    uint8_t *resp = dev->input_buf;
-    if (!resp) {
-        // Fallback: stack buffer for minimal drain during early init
-        uint8_t resp_stack[I2C_HID_LENGTH_HDR_SIZE];
-        dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
-                         resp_stack, I2C_HID_LENGTH_HDR_SIZE);
-        uint16_t rst_len = (uint16_t)resp_stack[0] | ((uint16_t)resp_stack[1] << 8);
-        i2c_dbg("[I2C-HID] RESET completion (minimal): len=%u [%02x %02x]\n",
-                rst_len, resp_stack[0], resp_stack[1]);
-        return 0;
-    }
+	// Read and discard the reset-completion response using length-first
+	// protocol: read 2-byte header, then actual report length.
+	uint16_t resp_buf_size = dev->input_buf_size;
+	if (resp_buf_size < I2C_HID_LENGTH_HDR_SIZE)
+		resp_buf_size = I2C_HID_LENGTH_HDR_SIZE;
+	uint8_t *resp = dev->input_buf;
+	if (!resp) {
+		// Fallback: stack buffer for minimal drain during early init
+		uint8_t resp_stack[I2C_HID_LENGTH_HDR_SIZE];
+		dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0, resp_stack,
+				I2C_HID_LENGTH_HDR_SIZE);
+		uint16_t rst_len = (uint16_t)resp_stack[0] |
+				   ((uint16_t)resp_stack[1] << 8);
+		i2c_dbg("[I2C-HID] RESET completion (minimal): len=%u [%02x %02x]\n",
+			rst_len, resp_stack[0], resp_stack[1]);
+		return 0;
+	}
 
-    int drain_rc = i2c_hid_read_length_first(dev, resp, resp_buf_size);
-    uint16_t rst_len = (uint16_t)resp[0] | ((uint16_t)resp[1] << 8);
-    i2c_dbg("[I2C-HID] RESET completion: len=%u rc=%d [%02x %02x %02x %02x]\n",
-            rst_len, drain_rc, resp[0], resp[1],
-            resp_buf_size > 2 ? resp[2] : 0, resp_buf_size > 3 ? resp[3] : 0);
+	int drain_rc = i2c_hid_read_length_first(dev, resp, resp_buf_size);
+	uint16_t rst_len = (uint16_t)resp[0] | ((uint16_t)resp[1] << 8);
+	i2c_dbg("[I2C-HID] RESET completion: len=%u rc=%d [%02x %02x %02x %02x]\n",
+		rst_len, drain_rc, resp[0], resp[1],
+		resp_buf_size > 2 ? resp[2] : 0,
+		resp_buf_size > 3 ? resp[3] : 0);
 
-    return 0;
+	return 0;
 }
 
 static int i2c_hid_set_idle(i2c_hid_device_t *dev, uint8_t duration,
-                             uint8_t report_id) {
-    if (duration != 0) {
-        i2c_dbg("[I2C-HID] SET_IDLE duration=%u unsupported\n", duration);
-        return -1;
-    }
+			    uint8_t report_id)
+{
+	if (duration != 0) {
+		i2c_dbg("[I2C-HID] SET_IDLE duration=%u unsupported\n",
+			duration);
+		return -1;
+	}
 
-    return i2c_hid_write_simple_command(dev, I2C_HID_OPCODE_SET_IDLE,
-                                        report_id, "SET_IDLE");
+	return i2c_hid_write_simple_command(dev, I2C_HID_OPCODE_SET_IDLE,
+					    report_id, "SET_IDLE");
 }
 
-static int i2c_hid_set_protocol(i2c_hid_device_t *dev, uint16_t protocol) {
-    return i2c_hid_write_simple_command(dev, I2C_HID_OPCODE_SET_PROTOCOL,
-                                        (uint8_t)protocol,
-                                        "SET_PROTOCOL");
+static int i2c_hid_set_protocol(i2c_hid_device_t *dev, uint16_t protocol)
+{
+	return i2c_hid_write_simple_command(dev, I2C_HID_OPCODE_SET_PROTOCOL,
+					    (uint8_t)protocol, "SET_PROTOCOL");
 }
 
 // SET_REPORT: send a feature/output report to the device.
@@ -2308,49 +2554,51 @@ static int i2c_hid_set_protocol(i2c_hid_device_t *dev, uint16_t protocol) {
 // report_id:   the report ID
 // data/data_len: report payload (NOT including report ID)
 static int i2c_hid_set_report(i2c_hid_device_t *dev, uint8_t report_type,
-                               uint8_t report_id, const uint8_t *data,
-                               int data_len) {
-    uint16_t cmd_reg  = dev->desc.wCommandRegister;
-    uint16_t data_reg = dev->desc.wDataRegister;
+			      uint8_t report_id, const uint8_t *data,
+			      int data_len)
+{
+	uint16_t cmd_reg = dev->desc.wCommandRegister;
+	uint16_t data_reg = dev->desc.wDataRegister;
 
-    // Command register word:
-    //   low byte  = reportID (bits 0-3) | reportType (bits 4-5)
-    //   high byte = opcode (SET_REPORT = 0x03)
-    uint8_t cmd_lo = (report_id & 0x0F) | ((report_type & 0x03) << 4);
-    uint8_t cmd_hi = 0x03;  // SET_REPORT opcode
+	// Command register word:
+	//   low byte  = reportID (bits 0-3) | reportType (bits 4-5)
+	//   high byte = opcode (SET_REPORT = 0x03)
+	uint8_t cmd_lo = (report_id & 0x0F) | ((report_type & 0x03) << 4);
+	uint8_t cmd_hi = 0x03; // SET_REPORT opcode
 
-    // Data register payload length:
-    // 2 (length field) + 1 (reportID) + data_len
-    uint16_t payload_len = 2 + 1 + (uint16_t)data_len;
+	// Data register payload length:
+	// 2 (length field) + 1 (reportID) + data_len
+	uint16_t payload_len = 2 + 1 + (uint16_t)data_len;
 
-    // Total wire message:
-    // [cmdReg_lo, cmdReg_hi, cmd_lo, cmd_hi,
-    //  dataReg_lo, dataReg_hi, len_lo, len_hi, reportID, data...]
-    int total = 4 + 2 + 2 + 1 + data_len;  // 9 + data_len
-    if (total > 64) return -1;  // Safety limit
+	// Total wire message:
+	// [cmdReg_lo, cmdReg_hi, cmd_lo, cmd_hi,
+	//  dataReg_lo, dataReg_hi, len_lo, len_hi, reportID, data...]
+	int total = 4 + 2 + 2 + 1 + data_len; // 9 + data_len
+	if (total > 64)
+		return -1; // Safety limit
 
-    uint8_t wire[64];
-    wire[0] = (uint8_t)(cmd_reg & 0xFF);
-    wire[1] = (uint8_t)((cmd_reg >> 8) & 0xFF);
-    wire[2] = cmd_lo;
-    wire[3] = cmd_hi;
-    wire[4] = (uint8_t)(data_reg & 0xFF);
-    wire[5] = (uint8_t)((data_reg >> 8) & 0xFF);
-    wire[6] = (uint8_t)(payload_len & 0xFF);
-    wire[7] = (uint8_t)((payload_len >> 8) & 0xFF);
-    wire[8] = report_id;
-    for (int i = 0; i < data_len; i++)
-        wire[9 + i] = data[i];
+	uint8_t wire[64];
+	wire[0] = (uint8_t)(cmd_reg & 0xFF);
+	wire[1] = (uint8_t)((cmd_reg >> 8) & 0xFF);
+	wire[2] = cmd_lo;
+	wire[3] = cmd_hi;
+	wire[4] = (uint8_t)(data_reg & 0xFF);
+	wire[5] = (uint8_t)((data_reg >> 8) & 0xFF);
+	wire[6] = (uint8_t)(payload_len & 0xFF);
+	wire[7] = (uint8_t)((payload_len >> 8) & 0xFF);
+	wire[8] = report_id;
+	for (int i = 0; i < data_len; i++)
+		wire[9 + i] = data[i];
 
-    i2c_dbg("[I2C-HID] SET_REPORT wire(%d): "
-            "[%02x %02x %02x %02x %02x %02x %02x %02x %02x",
-            total, wire[0], wire[1], wire[2], wire[3],
-            wire[4], wire[5], wire[6], wire[7], wire[8]);
-    for (int i = 0; i < data_len && i < 4; i++)
-        i2c_dbg(" %02x", wire[9 + i]);
-    i2c_dbg("]\n");
+	i2c_dbg("[I2C-HID] SET_REPORT wire(%d): "
+		"[%02x %02x %02x %02x %02x %02x %02x %02x %02x",
+		total, wire[0], wire[1], wire[2], wire[3], wire[4], wire[5],
+		wire[6], wire[7], wire[8]);
+	for (int i = 0; i < data_len && i < 4; i++)
+		i2c_dbg(" %02x", wire[9 + i]);
+	i2c_dbg("]\n");
 
-    return dw_i2c_write(dev->ctrl, dev->i2c_addr, wire, total);
+	return dw_i2c_write(dev->ctrl, dev->i2c_addr, wire, total);
 }
 
 // ============================================================================
@@ -2362,33 +2610,33 @@ static int i2c_hid_set_report(i2c_hid_device_t *dev, uint8_t report_type,
 // HID Usage Definitions (usage_page << 16 | usage)
 // ============================================================================
 
-#define HID_GD_MOUSE          0x00010002
-#define HID_GD_X              0x00010030
-#define HID_GD_Y              0x00010031
-#define HID_GD_WHEEL          0x00010038
-#define HID_DG_TOUCHSCREEN    0x000D0004
-#define HID_DG_TOUCHPAD       0x000D0005
-#define HID_DG_TIPSWITCH      0x000D0042
-#define HID_DG_CONTACTID      0x000D0051
-#define HID_DG_INPUTMODE      0x000D0052
-#define HID_DG_CONTACTCOUNT   0x000D0054
-#define HID_UP_BUTTON         0x0009
+#define HID_GD_MOUSE 0x00010002
+#define HID_GD_X 0x00010030
+#define HID_GD_Y 0x00010031
+#define HID_GD_WHEEL 0x00010038
+#define HID_DG_TOUCHSCREEN 0x000D0004
+#define HID_DG_TOUCHPAD 0x000D0005
+#define HID_DG_TIPSWITCH 0x000D0042
+#define HID_DG_CONTACTID 0x000D0051
+#define HID_DG_INPUTMODE 0x000D0052
+#define HID_DG_CONTACTCOUNT 0x000D0054
+#define HID_UP_BUTTON 0x0009
 
 // Parsed field entry (used locally during descriptor parsing)
 typedef struct {
-    uint32_t usage;         // (usage_page << 16) | usage_id
-    uint16_t bit_offset;    // Bit position in report (after report ID byte)
-    uint16_t bit_size;      // Size in bits for this single field
-    int32_t  logical_min;
-    int32_t  logical_max;
-    uint8_t  flags;         // bit 0 = constant, bit 2 = relative
-    uint8_t  report_type;   // 0 = Input, 2 = Feature
-    uint8_t  report_id;
-    uint8_t  app_type;      // 0 = unknown, 1 = touchpad/touchscreen, 2 = mouse
+	uint32_t usage; // (usage_page << 16) | usage_id
+	uint16_t bit_offset; // Bit position in report (after report ID byte)
+	uint16_t bit_size; // Size in bits for this single field
+	int32_t logical_min;
+	int32_t logical_max;
+	uint8_t flags; // bit 0 = constant, bit 2 = relative
+	uint8_t report_type; // 0 = Input, 2 = Feature
+	uint8_t report_id;
+	uint8_t app_type; // 0 = unknown, 1 = touchpad/touchscreen, 2 = mouse
 } hid_parsed_field_t;
 
-#define HID_FIELD_MAX   128
-#define HID_USAGE_MAX   16
+#define HID_FIELD_MAX 128
+#define HID_USAGE_MAX 16
 
 // ============================================================================
 // HID Report Descriptor Parser
@@ -2409,624 +2657,753 @@ typedef struct {
 // when both are present.
 // ============================================================================
 
-static void i2c_hid_parse_report_desc(i2c_hid_device_t *dev) {
-    uint8_t *rd = dev->report_desc;
-    uint16_t rd_len = dev->report_desc_len;
+static void i2c_hid_parse_report_desc(i2c_hid_device_t *dev)
+{
+	uint8_t *rd = dev->report_desc;
+	uint16_t rd_len = dev->report_desc_len;
 
-    // Flat field table — built in Phase 1, resolved in Phase 2
-    hid_parsed_field_t fields[HID_FIELD_MAX];
-    int field_count = 0;
+	// Flat field table — built in Phase 1, resolved in Phase 2
+	hid_parsed_field_t fields[HID_FIELD_MAX];
+	int field_count = 0;
 
-    // ---- Parser global state ----
-    uint16_t usage_page   = 0;
-    int32_t  logical_min  = 0;
-    int32_t  logical_max  = 0;
-    uint32_t report_size  = 0;
-    uint32_t report_count = 0;
-    uint8_t  report_id    = 0;
+	// ---- Parser global state ----
+	uint16_t usage_page = 0;
+	int32_t logical_min = 0;
+	int32_t logical_max = 0;
+	uint32_t report_size = 0;
+	uint32_t report_count = 0;
+	uint8_t report_id = 0;
 
-    // Per-type bit offset tracking (Input and Feature have separate bit streams)
-    uint16_t input_bit_offset = 0;
-    uint16_t feat_bit_offset  = 0;
-    uint8_t  input_last_rid   = 0xFF;  // sentinel
-    uint8_t  feat_last_rid    = 0xFF;
+	// Per-type bit offset tracking (Input and Feature have separate bit streams)
+	uint16_t input_bit_offset = 0;
+	uint16_t feat_bit_offset = 0;
+	uint8_t input_last_rid = 0xFF; // sentinel
+	uint8_t feat_last_rid = 0xFF;
 
-    // ---- Local state (reset after each Main item) ----
-    uint16_t usage_stack[HID_USAGE_MAX];
-    int      usage_count     = 0;
-    uint16_t usage_min       = 0;
-    uint16_t usage_max       = 0;
-    int      has_usage_range = 0;
+	// ---- Local state (reset after each Main item) ----
+	uint16_t usage_stack[HID_USAGE_MAX];
+	int usage_count = 0;
+	uint16_t usage_min = 0;
+	uint16_t usage_max = 0;
+	int has_usage_range = 0;
 
-    // ---- Collection tracking (for app_type classification) ----
-    uint8_t  collection_depth = 0;
-    uint8_t  app_type         = 0;   // 0=unknown, 1=touchpad, 2=mouse
-    uint8_t  app_stack[16];
-    int      app_stack_depth  = 0;
+	// ---- Collection tracking (for app_type classification) ----
+	uint8_t collection_depth = 0;
+	uint8_t app_type = 0; // 0=unknown, 1=touchpad, 2=mouse
+	uint8_t app_stack[16];
+	int app_stack_depth = 0;
 
-    // ================================================================
-    //  Phase 1 — walk descriptor, populate field table
-    // ================================================================
+	// ================================================================
+	//  Phase 1 — walk descriptor, populate field table
+	// ================================================================
 
-    uint16_t pos = 0;
-    while (pos < rd_len) {
-        uint8_t prefix = rd[pos];
+	uint16_t pos = 0;
+	while (pos < rd_len) {
+		uint8_t prefix = rd[pos];
 
-        // Long items (prefix == 0xFE) — skip
-        if (prefix == 0xFE) {
-            if (pos + 2 >= rd_len) break;
-            pos += 3 + rd[pos + 1];
-            continue;
-        }
+		// Long items (prefix == 0xFE) — skip
+		if (prefix == 0xFE) {
+			if (pos + 2 >= rd_len)
+				break;
+			pos += 3 + rd[pos + 1];
+			continue;
+		}
 
-        // Short items
-        uint8_t bSize = prefix & 0x03;
-        uint8_t bType = (prefix >> 2) & 0x03;
-        uint8_t bTag  = (prefix >> 4) & 0x0F;
-        int size = (bSize == 3) ? 4 : bSize;
+		// Short items
+		uint8_t bSize = prefix & 0x03;
+		uint8_t bType = (prefix >> 2) & 0x03;
+		uint8_t bTag = (prefix >> 4) & 0x0F;
+		int size = (bSize == 3) ? 4 : bSize;
 
-        if (pos + 1 + size > rd_len) break;
+		if (pos + 1 + size > rd_len)
+			break;
 
-        // Extract item data
-        uint32_t data_unsigned = 0;
-        int32_t  data_signed   = 0;
-        if (size >= 1) data_unsigned  = rd[pos + 1];
-        if (size >= 2) data_unsigned |= (uint32_t)rd[pos + 2] << 8;
-        if (size >= 3) data_unsigned |= (uint32_t)rd[pos + 3] << 16;
-        if (size >= 4) data_unsigned |= (uint32_t)rd[pos + 4] << 24;
+		// Extract item data
+		uint32_t data_unsigned = 0;
+		int32_t data_signed = 0;
+		if (size >= 1)
+			data_unsigned = rd[pos + 1];
+		if (size >= 2)
+			data_unsigned |= (uint32_t)rd[pos + 2] << 8;
+		if (size >= 3)
+			data_unsigned |= (uint32_t)rd[pos + 3] << 16;
+		if (size >= 4)
+			data_unsigned |= (uint32_t)rd[pos + 4] << 24;
 
-        if (size == 1)      data_signed = (int8_t)(data_unsigned & 0xFF);
-        else if (size == 2) data_signed = (int16_t)(data_unsigned & 0xFFFF);
-        else                data_signed = (int32_t)data_unsigned;
+		if (size == 1)
+			data_signed = (int8_t)(data_unsigned & 0xFF);
+		else if (size == 2)
+			data_signed = (int16_t)(data_unsigned & 0xFFFF);
+		else
+			data_signed = (int32_t)data_unsigned;
 
-        switch (bType) {
-        case 0: // Main
-            switch (bTag) {
-            case 0x08: // Input
-            case 0x0B: // Feature
-            {
-                uint8_t is_const    = data_unsigned & 0x01;
-                uint8_t is_relative = (data_unsigned & 0x04) ? 1 : 0;
-                uint8_t rtype       = (bTag == 0x0B) ? 2 : 0;
+		switch (bType) {
+		case 0: // Main
+			switch (bTag) {
+			case 0x08: // Input
+			case 0x0B: // Feature
+			{
+				uint8_t is_const = data_unsigned & 0x01;
+				uint8_t is_relative =
+					(data_unsigned & 0x04) ? 1 : 0;
+				uint8_t rtype = (bTag == 0x0B) ? 2 : 0;
 
-                // Select the correct per-type bit offset
-                uint16_t *cur_offset;
-                uint8_t  *cur_rid;
-                if (rtype == 0) {
-                    cur_offset = &input_bit_offset;
-                    cur_rid    = &input_last_rid;
-                } else {
-                    cur_offset = &feat_bit_offset;
-                    cur_rid    = &feat_last_rid;
-                }
-                if (report_id != *cur_rid) {
-                    *cur_offset = 0;
-                    *cur_rid    = report_id;
-                }
+				// Select the correct per-type bit offset
+				uint16_t *cur_offset;
+				uint8_t *cur_rid;
+				if (rtype == 0) {
+					cur_offset = &input_bit_offset;
+					cur_rid = &input_last_rid;
+				} else {
+					cur_offset = &feat_bit_offset;
+					cur_rid = &feat_last_rid;
+				}
+				if (report_id != *cur_rid) {
+					*cur_offset = 0;
+					*cur_rid = report_id;
+				}
 
-                // Detect Input Mode feature inline (before field table,
-                // so it works even if the table overflows).
-                if (rtype == 2 && !is_const && usage_count > 0 &&
-                    (((uint32_t)usage_page << 16) | usage_stack[0])
-                        == HID_DG_INPUTMODE &&
-                    dev->input_mode_rid == 0) {
-                    dev->input_mode_rid  = report_id;
-                    dev->input_mode_size =
-                        (uint8_t)((report_size * report_count + 7) / 8);
-                    i2c_dbg("[I2C-HID] Found Input Mode feature: "
-                            "reportID=%u size=%u bits\n",
-                            report_id, report_size * report_count);
-                }
+				// Detect Input Mode feature inline (before field table,
+				// so it works even if the table overflows).
+				if (rtype == 2 && !is_const &&
+				    usage_count > 0 &&
+				    (((uint32_t)usage_page << 16) |
+				     usage_stack[0]) == HID_DG_INPUTMODE &&
+				    dev->input_mode_rid == 0) {
+					dev->input_mode_rid = report_id;
+					dev->input_mode_size =
+						(uint8_t)((report_size *
+								   report_count +
+							   7) /
+							  8);
+					i2c_dbg("[I2C-HID] Found Input Mode feature: "
+						"reportID=%u size=%u bits\n",
+						report_id,
+						report_size * report_count);
+				}
 
-                // Record non-constant fields into the table.
-                // Expand per-item only when there's a usage range or
-                // multiple local usages; otherwise collapse into one
-                // entry to avoid blowing through the table limit.
-                if (!is_const) {
-                    if (has_usage_range) {
-                        // Usage Min/Max range — one entry per item
-                        for (uint32_t i = 0; i < report_count &&
-                                              field_count < HID_FIELD_MAX; i++) {
-                            uint16_t u = (uint16_t)(usage_min + i);
-                            if (u > usage_max) u = usage_max;
-                            hid_parsed_field_t *f = &fields[field_count++];
-                            f->usage       = ((uint32_t)usage_page << 16) | u;
-                            f->bit_offset  = *cur_offset +
-                                             (uint16_t)(i * report_size);
-                            f->bit_size    = (uint16_t)report_size;
-                            f->logical_min = logical_min;
-                            f->logical_max = logical_max;
-                            f->flags       = (is_relative ? 4 : 0);
-                            f->report_type = rtype;
-                            f->report_id   = report_id;
-                            f->app_type    = app_type;
-                        }
-                    } else if (usage_count > 1) {
-                        // Multiple distinct usages — one entry per usage
-                        for (uint32_t i = 0; i < report_count &&
-                                              field_count < HID_FIELD_MAX; i++) {
-                            uint16_t u = ((int)i < usage_count)
-                                             ? usage_stack[i]
-                                             : usage_stack[usage_count - 1];
-                            hid_parsed_field_t *f = &fields[field_count++];
-                            f->usage       = ((uint32_t)usage_page << 16) | u;
-                            f->bit_offset  = *cur_offset +
-                                             (uint16_t)(i * report_size);
-                            f->bit_size    = (uint16_t)report_size;
-                            f->logical_min = logical_min;
-                            f->logical_max = logical_max;
-                            f->flags       = (is_relative ? 4 : 0);
-                            f->report_type = rtype;
-                            f->report_id   = report_id;
-                            f->app_type    = app_type;
-                        }
-                    } else if (field_count < HID_FIELD_MAX) {
-                        // Single usage (or none) — collapse entire item
-                        // into one entry covering all report_count values.
-                        uint16_t u = (usage_count > 0) ? usage_stack[0] : 0;
-                        hid_parsed_field_t *f = &fields[field_count++];
-                        f->usage       = ((uint32_t)usage_page << 16) | u;
-                        f->bit_offset  = *cur_offset;
-                        f->bit_size    = (uint16_t)report_size;
-                        f->logical_min = logical_min;
-                        f->logical_max = logical_max;
-                        f->flags       = (is_relative ? 4 : 0);
-                        f->report_type = rtype;
-                        f->report_id   = report_id;
-                        f->app_type    = app_type;
-                    }
-                }
+				// Record non-constant fields into the table.
+				// Expand per-item only when there's a usage range or
+				// multiple local usages; otherwise collapse into one
+				// entry to avoid blowing through the table limit.
+				if (!is_const) {
+					if (has_usage_range) {
+						// Usage Min/Max range — one entry per item
+						for (uint32_t i = 0;
+						     i < report_count &&
+						     field_count <
+							     HID_FIELD_MAX;
+						     i++) {
+							uint16_t u =
+								(uint16_t)(usage_min +
+									   i);
+							if (u > usage_max)
+								u = usage_max;
+							hid_parsed_field_t *f =
+								&fields[field_count++];
+							f->usage =
+								((uint32_t)
+									 usage_page
+								 << 16) |
+								u;
+							f->bit_offset =
+								*cur_offset +
+								(uint16_t)(i *
+									   report_size);
+							f->bit_size = (uint16_t)
+								report_size;
+							f->logical_min =
+								logical_min;
+							f->logical_max =
+								logical_max;
+							f->flags =
+								(is_relative ?
+									 4 :
+									 0);
+							f->report_type = rtype;
+							f->report_id =
+								report_id;
+							f->app_type = app_type;
+						}
+					} else if (usage_count > 1) {
+						// Multiple distinct usages — one entry per usage
+						for (uint32_t i = 0;
+						     i < report_count &&
+						     field_count <
+							     HID_FIELD_MAX;
+						     i++) {
+							uint16_t u =
+								((int)i <
+								 usage_count) ?
+									usage_stack
+										[i] :
+									usage_stack
+										[usage_count -
+										 1];
+							hid_parsed_field_t *f =
+								&fields[field_count++];
+							f->usage =
+								((uint32_t)
+									 usage_page
+								 << 16) |
+								u;
+							f->bit_offset =
+								*cur_offset +
+								(uint16_t)(i *
+									   report_size);
+							f->bit_size = (uint16_t)
+								report_size;
+							f->logical_min =
+								logical_min;
+							f->logical_max =
+								logical_max;
+							f->flags =
+								(is_relative ?
+									 4 :
+									 0);
+							f->report_type = rtype;
+							f->report_id =
+								report_id;
+							f->app_type = app_type;
+						}
+					} else if (field_count <
+						   HID_FIELD_MAX) {
+						// Single usage (or none) — collapse entire item
+						// into one entry covering all report_count values.
+						uint16_t u =
+							(usage_count > 0) ?
+								usage_stack[0] :
+								0;
+						hid_parsed_field_t *f =
+							&fields[field_count++];
+						f->usage = ((uint32_t)usage_page
+							    << 16) |
+							   u;
+						f->bit_offset = *cur_offset;
+						f->bit_size =
+							(uint16_t)report_size;
+						f->logical_min = logical_min;
+						f->logical_max = logical_max;
+						f->flags =
+							(is_relative ? 4 : 0);
+						f->report_type = rtype;
+						f->report_id = report_id;
+						f->app_type = app_type;
+					}
+				}
 
-                // Always advance bit offset (including const/padding)
-                *cur_offset += (uint16_t)(report_size * report_count);
+				// Always advance bit offset (including const/padding)
+				*cur_offset +=
+					(uint16_t)(report_size * report_count);
 
-                // Reset local state after Main item
-                usage_count     = 0;
-                has_usage_range = 0;
-                usage_min = usage_max = 0;
-                break;
-            }
-            case 0x0A: // Collection
-            {
-                collection_depth++;
-                uint16_t coll_usage = (usage_count > 0) ? usage_stack[0] : 0;
-                uint32_t coll_u32   = ((uint32_t)usage_page << 16) | coll_usage;
+				// Reset local state after Main item
+				usage_count = 0;
+				has_usage_range = 0;
+				usage_min = usage_max = 0;
+				break;
+			}
+			case 0x0A: // Collection
+			{
+				collection_depth++;
+				uint16_t coll_usage =
+					(usage_count > 0) ? usage_stack[0] : 0;
+				uint32_t coll_u32 =
+					((uint32_t)usage_page << 16) |
+					coll_usage;
 
-                // Push parent app_type
-                if (app_stack_depth < 16)
-                    app_stack[app_stack_depth++] = app_type;
+				// Push parent app_type
+				if (app_stack_depth < 16)
+					app_stack[app_stack_depth++] = app_type;
 
-                // Detect application type from collection usage
-                if (coll_u32 == HID_DG_TOUCHPAD ||
-                    coll_u32 == HID_DG_TOUCHSCREEN)
-                    app_type = 1;
-                else if (coll_u32 == HID_GD_MOUSE)
-                    app_type = 2;
-                // else: inherit parent app_type
+				// Detect application type from collection usage
+				if (coll_u32 == HID_DG_TOUCHPAD ||
+				    coll_u32 == HID_DG_TOUCHSCREEN)
+					app_type = 1;
+				else if (coll_u32 == HID_GD_MOUSE)
+					app_type = 2;
+				// else: inherit parent app_type
 
-                // Reset local state
-                usage_count     = 0;
-                has_usage_range = 0;
-                break;
-            }
-            case 0x0C: // End Collection
-            {
-                if (app_stack_depth > 0)
-                    app_type = app_stack[--app_stack_depth];
-                else
-                    app_type = 0;
-                if (collection_depth > 0) collection_depth--;
-                break;
-            }
-            default:
-                usage_count     = 0;
-                has_usage_range = 0;
-                break;
-            }
-            break;
+				// Reset local state
+				usage_count = 0;
+				has_usage_range = 0;
+				break;
+			}
+			case 0x0C: // End Collection
+			{
+				if (app_stack_depth > 0)
+					app_type = app_stack[--app_stack_depth];
+				else
+					app_type = 0;
+				if (collection_depth > 0)
+					collection_depth--;
+				break;
+			}
+			default:
+				usage_count = 0;
+				has_usage_range = 0;
+				break;
+			}
+			break;
 
-        case 1: // Global
-            switch (bTag) {
-            case 0x00: usage_page   = (uint16_t)data_unsigned; break;
-            case 0x01: logical_min  = data_signed; break;
-            case 0x02: logical_max  = data_signed; break;
-            case 0x07: report_size  = data_unsigned; break;
-            case 0x08: // Report ID
-                report_id = (uint8_t)data_unsigned;
-                break;
-            case 0x09: report_count = data_unsigned; break;
-            }
-            break;
+		case 1: // Global
+			switch (bTag) {
+			case 0x00:
+				usage_page = (uint16_t)data_unsigned;
+				break;
+			case 0x01:
+				logical_min = data_signed;
+				break;
+			case 0x02:
+				logical_max = data_signed;
+				break;
+			case 0x07:
+				report_size = data_unsigned;
+				break;
+			case 0x08: // Report ID
+				report_id = (uint8_t)data_unsigned;
+				break;
+			case 0x09:
+				report_count = data_unsigned;
+				break;
+			}
+			break;
 
-        case 2: // Local
-            switch (bTag) {
-            case 0x00: // Usage
-                if (usage_count < HID_USAGE_MAX)
-                    usage_stack[usage_count++] = (uint16_t)data_unsigned;
-                break;
-            case 0x01: // Usage Minimum
-                usage_min = (uint16_t)data_unsigned;
-                has_usage_range = 1;
-                break;
-            case 0x02: // Usage Maximum
-                usage_max = (uint16_t)data_unsigned;
-                has_usage_range = 1;
-                break;
-            }
-            break;
-        }
+		case 2: // Local
+			switch (bTag) {
+			case 0x00: // Usage
+				if (usage_count < HID_USAGE_MAX)
+					usage_stack[usage_count++] =
+						(uint16_t)data_unsigned;
+				break;
+			case 0x01: // Usage Minimum
+				usage_min = (uint16_t)data_unsigned;
+				has_usage_range = 1;
+				break;
+			case 0x02: // Usage Maximum
+				usage_max = (uint16_t)data_unsigned;
+				has_usage_range = 1;
+				break;
+			}
+			break;
+		}
 
-        pos += 1 + size;
-    }
+		pos += 1 + size;
+	}
 
-    // ================================================================
-    //  Phase 2 — resolve specific usages from the field table
-    // ================================================================
+	// ================================================================
+	//  Phase 2 — resolve specific usages from the field table
+	// ================================================================
 
-    // --- Input Mode feature (0x000D0052) ---
-    for (int i = 0; i < field_count; i++) {
-        if (fields[i].report_type == 2 && fields[i].usage == HID_DG_INPUTMODE
-            && dev->input_mode_rid == 0) {
-            dev->input_mode_rid  = fields[i].report_id;
-            dev->input_mode_size = (uint8_t)((fields[i].bit_size + 7) / 8);
-            i2c_dbg("[I2C-HID] Found Input Mode feature: "
-                    "reportID=%u size=%u bits\n",
-                    fields[i].report_id, fields[i].bit_size);
-            break;
-        }
-    }
+	// --- Input Mode feature (0x000D0052) ---
+	for (int i = 0; i < field_count; i++) {
+		if (fields[i].report_type == 2 &&
+		    fields[i].usage == HID_DG_INPUTMODE &&
+		    dev->input_mode_rid == 0) {
+			dev->input_mode_rid = fields[i].report_id;
+			dev->input_mode_size =
+				(uint8_t)((fields[i].bit_size + 7) / 8);
+			i2c_dbg("[I2C-HID] Found Input Mode feature: "
+				"reportID=%u size=%u bits\n",
+				fields[i].report_id, fields[i].bit_size);
+			break;
+		}
+	}
 
-    // --- Find TIP_SWITCH fields (each marks a contact slot) ---
-    int tip_idx[8];
-    int tip_count      = 0;
-    uint8_t tp_rid     = 0;
-    int tp_found       = 0;
+	// --- Find TIP_SWITCH fields (each marks a contact slot) ---
+	int tip_idx[8];
+	int tip_count = 0;
+	uint8_t tp_rid = 0;
+	int tp_found = 0;
 
-    // First pass: prefer touchpad app_type (== 1)
-    for (int i = 0; i < field_count; i++) {
-        if (fields[i].report_type != 0)         continue;
-        if (fields[i].usage != HID_DG_TIPSWITCH) continue;
-        if (fields[i].app_type != 1)             continue;
-        if (!tp_found) { tp_rid = fields[i].report_id; tp_found = 1; }
-        if (fields[i].report_id == tp_rid && tip_count < 8)
-            tip_idx[tip_count++] = i;
-    }
+	// First pass: prefer touchpad app_type (== 1)
+	for (int i = 0; i < field_count; i++) {
+		if (fields[i].report_type != 0)
+			continue;
+		if (fields[i].usage != HID_DG_TIPSWITCH)
+			continue;
+		if (fields[i].app_type != 1)
+			continue;
+		if (!tp_found) {
+			tp_rid = fields[i].report_id;
+			tp_found = 1;
+		}
+		if (fields[i].report_id == tp_rid && tip_count < 8)
+			tip_idx[tip_count++] = i;
+	}
 
-    // Second pass: any TIP_SWITCH
-    if (!tp_found) {
-        for (int i = 0; i < field_count; i++) {
-            if (fields[i].report_type != 0)         continue;
-            if (fields[i].usage != HID_DG_TIPSWITCH) continue;
-            if (!tp_found) { tp_rid = fields[i].report_id; tp_found = 1; }
-            if (fields[i].report_id == tp_rid && tip_count < 8)
-                tip_idx[tip_count++] = i;
-        }
-    }
+	// Second pass: any TIP_SWITCH
+	if (!tp_found) {
+		for (int i = 0; i < field_count; i++) {
+			if (fields[i].report_type != 0)
+				continue;
+			if (fields[i].usage != HID_DG_TIPSWITCH)
+				continue;
+			if (!tp_found) {
+				tp_rid = fields[i].report_id;
+				tp_found = 1;
+			}
+			if (fields[i].report_id == tp_rid && tip_count < 8)
+				tip_idx[tip_count++] = i;
+		}
+	}
 
-    // Fallback: find a report with GD_X (mouse-only device)
-    if (!tp_found) {
-        for (int i = 0; i < field_count; i++) {
-            if (fields[i].report_type == 0 && fields[i].usage == HID_GD_X) {
-                tp_rid   = fields[i].report_id;
-                tp_found = 1;
-                break;
-            }
-        }
-    }
+	// Fallback: find a report with GD_X (mouse-only device)
+	if (!tp_found) {
+		for (int i = 0; i < field_count; i++) {
+			if (fields[i].report_type == 0 &&
+			    fields[i].usage == HID_GD_X) {
+				tp_rid = fields[i].report_id;
+				tp_found = 1;
+				break;
+			}
+		}
+	}
 
-    if (!tp_found) {
-        dev->dev_type = I2C_HID_DEV_UNKNOWN;
-        i2c_dbg("[I2C-HID] Could not determine device type from "
-                "report descriptor (%d fields parsed)\n", field_count);
-        return;
-    }
+	if (!tp_found) {
+		dev->dev_type = I2C_HID_DEV_UNKNOWN;
+		i2c_dbg("[I2C-HID] Could not determine device type from "
+			"report descriptor (%d fields parsed)\n",
+			field_count);
+		return;
+	}
 
-    // --- Populate mouse_report from resolved fields ---
-    i2c_hid_report_info_t *ri = &dev->mouse_report;
-    i2c_memset(ri, 0, sizeof(*ri));
-    ri->report_id     = tp_rid;
-    ri->has_report_id = (tp_rid != 0);
-    ri->dev_type      = (tip_count > 0) ? I2C_HID_DEV_TOUCHPAD
-                                        : I2C_HID_DEV_MOUSE;
-    dev->dev_type     = ri->dev_type;
+	// --- Populate mouse_report from resolved fields ---
+	i2c_hid_report_info_t *ri = &dev->mouse_report;
+	i2c_memset(ri, 0, sizeof(*ri));
+	ri->report_id = tp_rid;
+	ri->has_report_id = (tp_rid != 0);
+	ri->dev_type =
+		(tip_count > 0) ? I2C_HID_DEV_TOUCHPAD : I2C_HID_DEV_MOUSE;
+	dev->dev_type = ri->dev_type;
 
-    // Contact 0 TIP_SWITCH
-    if (tip_count > 0) {
-        int ti = tip_idx[0];
-        ri->tip_switch.report_id  = fields[ti].report_id;
-        ri->tip_switch.bit_offset = fields[ti].bit_offset;
-        ri->tip_switch.bit_size   = fields[ti].bit_size;
-        ri->tip_switch.logical_min = 0;
-        ri->tip_switch.logical_max = 1;
-        ri->has_tip_switch = 1;
-    }
+	// Contact 0 TIP_SWITCH
+	if (tip_count > 0) {
+		int ti = tip_idx[0];
+		ri->tip_switch.report_id = fields[ti].report_id;
+		ri->tip_switch.bit_offset = fields[ti].bit_offset;
+		ri->tip_switch.bit_size = fields[ti].bit_size;
+		ri->tip_switch.logical_min = 0;
+		ri->tip_switch.logical_max = 1;
+		ri->has_tip_switch = 1;
+	}
 
-    // Contact 0 X, Y — fields between first and second TIP_SWITCH
-    int c0_start = (tip_count > 0) ? tip_idx[0] : 0;
-    int c0_end   = (tip_count > 1) ? tip_idx[1] : field_count;
-    for (int i = c0_start; i < c0_end; i++) {
-        if (fields[i].report_type != 0)        continue;
-        if (fields[i].report_id != tp_rid)     continue;
-        if (fields[i].usage == HID_DG_CONTACTID && ri->contact_id.bit_size == 0) {
-            ri->contact_id.report_id   = fields[i].report_id;
-            ri->contact_id.bit_offset  = fields[i].bit_offset;
-            ri->contact_id.bit_size    = fields[i].bit_size;
-            ri->contact_id.logical_min = fields[i].logical_min;
-            ri->contact_id.logical_max = fields[i].logical_max;
-            ri->has_contact_id = 1;
-        } else if (fields[i].usage == HID_GD_X && ri->x.bit_size == 0) {
-            ri->x.report_id   = fields[i].report_id;
-            ri->x.bit_offset  = fields[i].bit_offset;
-            ri->x.bit_size    = fields[i].bit_size;
-            ri->x.logical_min = fields[i].logical_min;
-            ri->x.logical_max = fields[i].logical_max;
-            ri->x.is_relative = (fields[i].flags & 0x04) ? 1 : 0;
-        } else if (fields[i].usage == HID_GD_Y && ri->y.bit_size == 0) {
-            ri->y.report_id   = fields[i].report_id;
-            ri->y.bit_offset  = fields[i].bit_offset;
-            ri->y.bit_size    = fields[i].bit_size;
-            ri->y.logical_min = fields[i].logical_min;
-            ri->y.logical_max = fields[i].logical_max;
-            ri->y.is_relative = (fields[i].flags & 0x04) ? 1 : 0;
-        }
-    }
+	// Contact 0 X, Y — fields between first and second TIP_SWITCH
+	int c0_start = (tip_count > 0) ? tip_idx[0] : 0;
+	int c0_end = (tip_count > 1) ? tip_idx[1] : field_count;
+	for (int i = c0_start; i < c0_end; i++) {
+		if (fields[i].report_type != 0)
+			continue;
+		if (fields[i].report_id != tp_rid)
+			continue;
+		if (fields[i].usage == HID_DG_CONTACTID &&
+		    ri->contact_id.bit_size == 0) {
+			ri->contact_id.report_id = fields[i].report_id;
+			ri->contact_id.bit_offset = fields[i].bit_offset;
+			ri->contact_id.bit_size = fields[i].bit_size;
+			ri->contact_id.logical_min = fields[i].logical_min;
+			ri->contact_id.logical_max = fields[i].logical_max;
+			ri->has_contact_id = 1;
+		} else if (fields[i].usage == HID_GD_X && ri->x.bit_size == 0) {
+			ri->x.report_id = fields[i].report_id;
+			ri->x.bit_offset = fields[i].bit_offset;
+			ri->x.bit_size = fields[i].bit_size;
+			ri->x.logical_min = fields[i].logical_min;
+			ri->x.logical_max = fields[i].logical_max;
+			ri->x.is_relative = (fields[i].flags & 0x04) ? 1 : 0;
+		} else if (fields[i].usage == HID_GD_Y && ri->y.bit_size == 0) {
+			ri->y.report_id = fields[i].report_id;
+			ri->y.bit_offset = fields[i].bit_offset;
+			ri->y.bit_size = fields[i].bit_size;
+			ri->y.logical_min = fields[i].logical_min;
+			ri->y.logical_max = fields[i].logical_max;
+			ri->y.is_relative = (fields[i].flags & 0x04) ? 1 : 0;
+		}
+	}
 
-    // Fallback: search all fields for X/Y (mouse-only descriptor)
-    if (ri->x.bit_size == 0 || ri->y.bit_size == 0) {
-        for (int i = 0; i < field_count; i++) {
-            if (fields[i].report_type != 0)    continue;
-            if (fields[i].report_id != tp_rid) continue;
-            if (fields[i].usage == HID_DG_CONTACTID && ri->contact_id.bit_size == 0) {
-                ri->contact_id.report_id   = fields[i].report_id;
-                ri->contact_id.bit_offset  = fields[i].bit_offset;
-                ri->contact_id.bit_size    = fields[i].bit_size;
-                ri->contact_id.logical_min = fields[i].logical_min;
-                ri->contact_id.logical_max = fields[i].logical_max;
-                ri->has_contact_id = 1;
-            } else if (fields[i].usage == HID_GD_X && ri->x.bit_size == 0) {
-                ri->x.report_id   = fields[i].report_id;
-                ri->x.bit_offset  = fields[i].bit_offset;
-                ri->x.bit_size    = fields[i].bit_size;
-                ri->x.logical_min = fields[i].logical_min;
-                ri->x.logical_max = fields[i].logical_max;
-                ri->x.is_relative = (fields[i].flags & 0x04) ? 1 : 0;
-            } else if (fields[i].usage == HID_GD_Y && ri->y.bit_size == 0) {
-                ri->y.report_id   = fields[i].report_id;
-                ri->y.bit_offset  = fields[i].bit_offset;
-                ri->y.bit_size    = fields[i].bit_size;
-                ri->y.logical_min = fields[i].logical_min;
-                ri->y.logical_max = fields[i].logical_max;
-                ri->y.is_relative = (fields[i].flags & 0x04) ? 1 : 0;
-            }
-        }
-    }
+	// Fallback: search all fields for X/Y (mouse-only descriptor)
+	if (ri->x.bit_size == 0 || ri->y.bit_size == 0) {
+		for (int i = 0; i < field_count; i++) {
+			if (fields[i].report_type != 0)
+				continue;
+			if (fields[i].report_id != tp_rid)
+				continue;
+			if (fields[i].usage == HID_DG_CONTACTID &&
+			    ri->contact_id.bit_size == 0) {
+				ri->contact_id.report_id = fields[i].report_id;
+				ri->contact_id.bit_offset =
+					fields[i].bit_offset;
+				ri->contact_id.bit_size = fields[i].bit_size;
+				ri->contact_id.logical_min =
+					fields[i].logical_min;
+				ri->contact_id.logical_max =
+					fields[i].logical_max;
+				ri->has_contact_id = 1;
+			} else if (fields[i].usage == HID_GD_X &&
+				   ri->x.bit_size == 0) {
+				ri->x.report_id = fields[i].report_id;
+				ri->x.bit_offset = fields[i].bit_offset;
+				ri->x.bit_size = fields[i].bit_size;
+				ri->x.logical_min = fields[i].logical_min;
+				ri->x.logical_max = fields[i].logical_max;
+				ri->x.is_relative =
+					(fields[i].flags & 0x04) ? 1 : 0;
+			} else if (fields[i].usage == HID_GD_Y &&
+				   ri->y.bit_size == 0) {
+				ri->y.report_id = fields[i].report_id;
+				ri->y.bit_offset = fields[i].bit_offset;
+				ri->y.bit_size = fields[i].bit_size;
+				ri->y.logical_min = fields[i].logical_min;
+				ri->y.logical_max = fields[i].logical_max;
+				ri->y.is_relative =
+					(fields[i].flags & 0x04) ? 1 : 0;
+			}
+		}
+	}
 
-    // Contact Count (0x000D0054)
-    for (int i = 0; i < field_count; i++) {
-        if (fields[i].report_type != 0)    continue;
-        if (fields[i].report_id != tp_rid) continue;
-        if (fields[i].usage == HID_DG_CONTACTCOUNT) {
-            ri->contact_count.report_id  = fields[i].report_id;
-            ri->contact_count.bit_offset = fields[i].bit_offset;
-            ri->contact_count.bit_size   = fields[i].bit_size;
-            ri->contact_count.logical_min = fields[i].logical_min;
-            ri->contact_count.logical_max = fields[i].logical_max;
-            ri->has_contact_count = 1;
-            break;
-        }
-    }
+	// Contact Count (0x000D0054)
+	for (int i = 0; i < field_count; i++) {
+		if (fields[i].report_type != 0)
+			continue;
+		if (fields[i].report_id != tp_rid)
+			continue;
+		if (fields[i].usage == HID_DG_CONTACTCOUNT) {
+			ri->contact_count.report_id = fields[i].report_id;
+			ri->contact_count.bit_offset = fields[i].bit_offset;
+			ri->contact_count.bit_size = fields[i].bit_size;
+			ri->contact_count.logical_min = fields[i].logical_min;
+			ri->contact_count.logical_max = fields[i].logical_max;
+			ri->has_contact_count = 1;
+			break;
+		}
+	}
 
-    // Button — prefer touchpad app_type (== 1) over mouse (== 2)
-    int btn_idx = -1;
-    for (int i = 0; i < field_count; i++) {
-        if (fields[i].report_type != 0)        continue;
-        if (fields[i].report_id != tp_rid)     continue;
-        if ((fields[i].usage >> 16) != HID_UP_BUTTON) continue;
-        if (btn_idx < 0 || fields[i].app_type == 1) {
-            btn_idx = i;
-            if (fields[i].app_type == 1) break;  // best match
-        }
-    }
-    if (btn_idx >= 0) {
-        // Count consecutive button fields for combined extraction
-        uint16_t bstart = fields[btn_idx].bit_offset;
-        uint16_t bbits  = fields[btn_idx].bit_size;
-        for (int j = btn_idx + 1; j < field_count; j++) {
-            if (fields[j].report_type != 0)        break;
-            if (fields[j].report_id != tp_rid)     break;
-            if ((fields[j].usage >> 16) != HID_UP_BUTTON) break;
-            if (fields[j].bit_offset != bstart + bbits)    break;
-            bbits += fields[j].bit_size;
-        }
-        ri->buttons.report_id  = fields[btn_idx].report_id;
-        ri->buttons.bit_offset = bstart;
-        ri->buttons.bit_size   = bbits;
-        ri->buttons.count      = bbits / fields[btn_idx].bit_size;
-        ri->buttons.logical_min = 0;
-        ri->buttons.logical_max = 1;
-    }
+	// Button — prefer touchpad app_type (== 1) over mouse (== 2)
+	int btn_idx = -1;
+	for (int i = 0; i < field_count; i++) {
+		if (fields[i].report_type != 0)
+			continue;
+		if (fields[i].report_id != tp_rid)
+			continue;
+		if ((fields[i].usage >> 16) != HID_UP_BUTTON)
+			continue;
+		if (btn_idx < 0 || fields[i].app_type == 1) {
+			btn_idx = i;
+			if (fields[i].app_type == 1)
+				break; // best match
+		}
+	}
+	if (btn_idx >= 0) {
+		// Count consecutive button fields for combined extraction
+		uint16_t bstart = fields[btn_idx].bit_offset;
+		uint16_t bbits = fields[btn_idx].bit_size;
+		for (int j = btn_idx + 1; j < field_count; j++) {
+			if (fields[j].report_type != 0)
+				break;
+			if (fields[j].report_id != tp_rid)
+				break;
+			if ((fields[j].usage >> 16) != HID_UP_BUTTON)
+				break;
+			if (fields[j].bit_offset != bstart + bbits)
+				break;
+			bbits += fields[j].bit_size;
+		}
+		ri->buttons.report_id = fields[btn_idx].report_id;
+		ri->buttons.bit_offset = bstart;
+		ri->buttons.bit_size = bbits;
+		ri->buttons.count = bbits / fields[btn_idx].bit_size;
+		ri->buttons.logical_min = 0;
+		ri->buttons.logical_max = 1;
+	}
 
-    // Wheel (0x00010038) — only useful for mouse devices
-    for (int i = 0; i < field_count; i++) {
-        if (fields[i].report_type != 0)    continue;
-        if (fields[i].report_id != tp_rid) continue;
-        if (fields[i].usage == HID_GD_WHEEL) {
-            ri->wheel.report_id   = fields[i].report_id;
-            ri->wheel.bit_offset  = fields[i].bit_offset;
-            ri->wheel.bit_size    = fields[i].bit_size;
-            ri->wheel.logical_min = fields[i].logical_min;
-            ri->wheel.logical_max = fields[i].logical_max;
-            ri->wheel.is_relative = 1;
-            ri->has_wheel = 1;
-            break;
-        }
-    }
+	// Wheel (0x00010038) — only useful for mouse devices
+	for (int i = 0; i < field_count; i++) {
+		if (fields[i].report_type != 0)
+			continue;
+		if (fields[i].report_id != tp_rid)
+			continue;
+		if (fields[i].usage == HID_GD_WHEEL) {
+			ri->wheel.report_id = fields[i].report_id;
+			ri->wheel.bit_offset = fields[i].bit_offset;
+			ri->wheel.bit_size = fields[i].bit_size;
+			ri->wheel.logical_min = fields[i].logical_min;
+			ri->wheel.logical_max = fields[i].logical_max;
+			ri->wheel.is_relative = 1;
+			ri->has_wheel = 1;
+			break;
+		}
+	}
 
-    // Calculate total report size from highest bit position
-    uint16_t max_bit = 0;
-    for (int i = 0; i < field_count; i++) {
-        if (fields[i].report_type == 0 && fields[i].report_id == tp_rid) {
-            uint16_t end = fields[i].bit_offset + fields[i].bit_size;
-            if (end > max_bit) max_bit = end;
-        }
-    }
-    ri->report_bytes = (max_bit + 7) / 8;
+	// Calculate total report size from highest bit position
+	uint16_t max_bit = 0;
+	for (int i = 0; i < field_count; i++) {
+		if (fields[i].report_type == 0 &&
+		    fields[i].report_id == tp_rid) {
+			uint16_t end =
+				fields[i].bit_offset + fields[i].bit_size;
+			if (end > max_bit)
+				max_bit = end;
+		}
+	}
+	ri->report_bytes = (max_bit + 7) / 8;
 
-    kprintf("[I2C-HID] Parsed %s report (%d fields): "
-            "ID=%d  tip@%u(%u)  buttons@%u(%u bits)  "
-            "X@%u(%u bits%s)  Y@%u(%u bits%s)  "
-            "cc@%u(%u)  wheel=%s  total=%u bytes\n",
-            ri->dev_type == I2C_HID_DEV_TOUCHPAD ? "touchpad" : "mouse",
-            field_count, ri->report_id,
-            ri->tip_switch.bit_offset, ri->tip_switch.bit_size,
-            ri->buttons.bit_offset, ri->buttons.bit_size,
-            ri->x.bit_offset, ri->x.bit_size,
-            ri->x.is_relative ? ",rel" : ",abs",
-            ri->y.bit_offset, ri->y.bit_size,
-            ri->y.is_relative ? ",rel" : ",abs",
-            ri->has_contact_count ? ri->contact_count.bit_offset : 0,
-            ri->has_contact_count ? ri->contact_count.bit_size : 0,
-            ri->has_wheel ? "yes" : "no",
-            ri->report_bytes);
+	kprintf("[I2C-HID] Parsed %s report (%d fields): "
+		"ID=%d  tip@%u(%u)  buttons@%u(%u bits)  "
+		"X@%u(%u bits%s)  Y@%u(%u bits%s)  "
+		"cc@%u(%u)  wheel=%s  total=%u bytes\n",
+		ri->dev_type == I2C_HID_DEV_TOUCHPAD ? "touchpad" : "mouse",
+		field_count, ri->report_id, ri->tip_switch.bit_offset,
+		ri->tip_switch.bit_size, ri->buttons.bit_offset,
+		ri->buttons.bit_size, ri->x.bit_offset, ri->x.bit_size,
+		ri->x.is_relative ? ",rel" : ",abs", ri->y.bit_offset,
+		ri->y.bit_size, ri->y.is_relative ? ",rel" : ",abs",
+		ri->has_contact_count ? ri->contact_count.bit_offset : 0,
+		ri->has_contact_count ? ri->contact_count.bit_size : 0,
+		ri->has_wheel ? "yes" : "no", ri->report_bytes);
 
-    kprintf("[I2C-HID]   X range: %d..%d  Y range: %d..%d\n",
-            ri->x.logical_min, ri->x.logical_max,
-            ri->y.logical_min, ri->y.logical_max);
+	kprintf("[I2C-HID]   X range: %d..%d  Y range: %d..%d\n",
+		ri->x.logical_min, ri->x.logical_max, ri->y.logical_min,
+		ri->y.logical_max);
 }
 
 // ============================================================================
 // HID over I2C — Device initialization
 // ============================================================================
 
-static int i2c_hid_init_device(i2c_hid_device_t *dev) {
-    // Power on
-    int rc = i2c_hid_set_power(dev, I2C_HID_POWER_ON);
-    if (rc < 0) {
-        kprintf("[I2C-HID] SET_POWER ON failed for I2C%d:0x%02x\n",
-                dev->ctrl->bus_id, dev->i2c_addr);
-        return -1;
-    }
-    i2c_delay_us(10000);  // 10ms settle
+static int i2c_hid_init_device(i2c_hid_device_t *dev)
+{
+	// Power on
+	int rc = i2c_hid_set_power(dev, I2C_HID_POWER_ON);
+	if (rc < 0) {
+		kprintf("[I2C-HID] SET_POWER ON failed for I2C%d:0x%02x\n",
+			dev->ctrl->bus_id, dev->i2c_addr);
+		return -1;
+	}
+	i2c_delay_us(10000); // 10ms settle
 
-    // Reset device
-    rc = i2c_hid_reset(dev);
-    if (rc < 0) {
-        i2c_dbg("[I2C-HID] RESET failed for I2C%d:0x%02x\n",
-                dev->ctrl->bus_id, dev->i2c_addr);
-        // Continue anyway — some devices work without reset
-    }
+	// Reset device
+	rc = i2c_hid_reset(dev);
+	if (rc < 0) {
+		i2c_dbg("[I2C-HID] RESET failed for I2C%d:0x%02x\n",
+			dev->ctrl->bus_id, dev->i2c_addr);
+		// Continue anyway — some devices work without reset
+	}
 
-    // Re-read HID descriptor (may have changed after reset)
-    i2c_hid_fetch_descriptor(dev->ctrl, dev->i2c_addr,
-                              dev->hid_desc_reg, &dev->desc);
+	// Re-read HID descriptor (may have changed after reset)
+	i2c_hid_fetch_descriptor(dev->ctrl, dev->i2c_addr, dev->hid_desc_reg,
+				 &dev->desc);
 
-    // Allocate dynamic input buffer based on wMaxInputLength
-    {
-        uint16_t alloc_len = dev->desc.wMaxInputLength;
-        if (alloc_len < I2C_HID_LENGTH_HDR_SIZE)
-            alloc_len = I2C_HID_LENGTH_HDR_SIZE;
-        if (dev->input_buf) {
-            slab_free(dev->input_buf);
-            dev->input_buf = NULL;
-        }
-        dev->input_buf = (uint8_t *)slab_alloc(alloc_len);
-        if (!dev->input_buf) {
-            kprintf("[I2C-HID] Failed to allocate input buffer (%u bytes)\n",
-                    alloc_len);
-            return -1;
-        }
-        dev->input_buf_size = alloc_len;
-        i2c_memset(dev->input_buf, 0, alloc_len);
-        i2c_dbg("[I2C-HID] Allocated input buffer: %u bytes "
-                "(wMaxInputLength=%u)\n",
-                alloc_len, dev->desc.wMaxInputLength);
-    }
+	// Allocate dynamic input buffer based on wMaxInputLength
+	{
+		uint16_t alloc_len = dev->desc.wMaxInputLength;
+		if (alloc_len < I2C_HID_LENGTH_HDR_SIZE)
+			alloc_len = I2C_HID_LENGTH_HDR_SIZE;
+		if (dev->input_buf) {
+			slab_free(dev->input_buf);
+			dev->input_buf = NULL;
+		}
+		dev->input_buf = (uint8_t *)slab_alloc(alloc_len);
+		if (!dev->input_buf) {
+			kprintf("[I2C-HID] Failed to allocate input buffer (%u bytes)\n",
+				alloc_len);
+			return -1;
+		}
+		dev->input_buf_size = alloc_len;
+		i2c_memset(dev->input_buf, 0, alloc_len);
+		i2c_dbg("[I2C-HID] Allocated input buffer: %u bytes "
+			"(wMaxInputLength=%u)\n",
+			alloc_len, dev->desc.wMaxInputLength);
+	}
 
-    // Read report descriptor
-    dev->report_desc_len = dev->desc.wReportDescLength;
-    if (dev->report_desc_len > 0 && dev->report_desc_len <= 4096) {
-        dev->report_desc = (uint8_t *)slab_alloc(dev->report_desc_len);
-        if (dev->report_desc) {
-            rc = dw_i2c_read_reg16(dev->ctrl, dev->i2c_addr,
-                                    dev->desc.wReportDescRegister,
-                                    dev->report_desc, dev->report_desc_len);
-            if (rc < 0) {
-                i2c_dbg("[I2C-HID] Failed to read report descriptor\n");
-                slab_free(dev->report_desc);
-                dev->report_desc = NULL;
-                // Try to use device as generic mouse/keyboard based on vendor
-                if (dev->desc.wVendorID == 0x0488) {
-                    dev->dev_type = I2C_HID_DEV_TOUCHPAD;
-                    i2c_dbg("[I2C-HID] Assuming ITE Tech touchpad (VID 0x0488)\n");
-                }
-            } else {
-                // Parse report descriptor
-                i2c_hid_parse_report_desc(dev);
-            }
-        }
-    }
+	// Read report descriptor
+	dev->report_desc_len = dev->desc.wReportDescLength;
+	if (dev->report_desc_len > 0 && dev->report_desc_len <= 4096) {
+		dev->report_desc = (uint8_t *)slab_alloc(dev->report_desc_len);
+		if (dev->report_desc) {
+			rc = dw_i2c_read_reg16(dev->ctrl, dev->i2c_addr,
+					       dev->desc.wReportDescRegister,
+					       dev->report_desc,
+					       dev->report_desc_len);
+			if (rc < 0) {
+				i2c_dbg("[I2C-HID] Failed to read report descriptor\n");
+				slab_free(dev->report_desc);
+				dev->report_desc = NULL;
+				// Try to use device as generic mouse/keyboard based on vendor
+				if (dev->desc.wVendorID == 0x0488) {
+					dev->dev_type = I2C_HID_DEV_TOUCHPAD;
+					i2c_dbg("[I2C-HID] Assuming ITE Tech touchpad (VID 0x0488)\n");
+				}
+			} else {
+				// Parse report descriptor
+				i2c_hid_parse_report_desc(dev);
+			}
+		}
+	}
 
-    // If we still don't know the type, guess based on vendor
-    if (dev->dev_type == I2C_HID_DEV_UNKNOWN) {
-        if (dev->desc.wVendorID == 0x0488) {
-            dev->dev_type = I2C_HID_DEV_TOUCHPAD;
-            i2c_dbg("[I2C-HID] Guessing ITE Tech (0x0488) = touchpad\n");
-        }
-    }
+	// If we still don't know the type, guess based on vendor
+	if (dev->dev_type == I2C_HID_DEV_UNKNOWN) {
+		if (dev->desc.wVendorID == 0x0488) {
+			dev->dev_type = I2C_HID_DEV_TOUCHPAD;
+			i2c_dbg("[I2C-HID] Guessing ITE Tech (0x0488) = touchpad\n");
+		}
+	}
 
-    // Power on again (some devices need this after reset)
-    i2c_hid_set_power(dev, I2C_HID_POWER_ON);
-    i2c_delay_us(10000);
+	// Power on again (some devices need this after reset)
+	i2c_hid_set_power(dev, I2C_HID_POWER_ON);
+	i2c_delay_us(10000);
 
-    // SET_IDLE(0) — infinite idle: only report when data changes
-    i2c_hid_set_idle(dev, 0, 0);
-    i2c_delay_us(1000);
+	// SET_IDLE(0) — infinite idle: only report when data changes
+	i2c_hid_set_idle(dev, 0, 0);
+	i2c_delay_us(1000);
 
-    // SET_PROTOCOL — ensure Report Protocol mode (not Boot Protocol)
-    i2c_hid_set_protocol(dev, I2C_HID_PROTOCOL_REPORT);
-    i2c_delay_us(1000);
+	// SET_PROTOCOL — ensure Report Protocol mode (not Boot Protocol)
+	i2c_hid_set_protocol(dev, I2C_HID_PROTOCOL_REPORT);
+	i2c_delay_us(1000);
 
-    // SET_REPORT (Feature): Enable touchpad Input Mode (value = 3)
-    // Windows Precision Touchpads require this to switch from mouse
-    // emulation to native touchpad reports with coordinates.
-    if (dev->input_mode_rid != 0) {
-        uint8_t mode_val = 0x03;  // Touchpad collection mode
-        int sr_rc = i2c_hid_set_report(dev, 3, dev->input_mode_rid,
-                                        &mode_val, 1);
-        i2c_dbg("[I2C-HID] SET_REPORT input mode=3 rid=%u rc=%d\n",
-                dev->input_mode_rid, sr_rc);
-        i2c_delay_us(10000);  // 10ms for mode switch
-    } else {
-        i2c_dbg("[I2C-HID] No Input Mode feature found in report desc\n");
-    }
+	// SET_REPORT (Feature): Enable touchpad Input Mode (value = 3)
+	// Windows Precision Touchpads require this to switch from mouse
+	// emulation to native touchpad reports with coordinates.
+	if (dev->input_mode_rid != 0) {
+		uint8_t mode_val = 0x03; // Touchpad collection mode
+		int sr_rc = i2c_hid_set_report(dev, 3, dev->input_mode_rid,
+					       &mode_val, 1);
+		i2c_dbg("[I2C-HID] SET_REPORT input mode=3 rid=%u rc=%d\n",
+			dev->input_mode_rid, sr_rc);
+		i2c_delay_us(10000); // 10ms for mode switch
+	} else {
+		i2c_dbg("[I2C-HID] No Input Mode feature found in report desc\n");
+	}
 
-    // Drain any pending reports left over from reset / init.
-    if (dev->input_buf && dev->input_buf_size >= I2C_HID_LENGTH_HDR_SIZE) {
-        uint16_t drain_len = i2c_hid_input_read_len(dev);
-        for (int drain = 0; drain < 10; drain++) {
-            int drc = i2c_hid_read_length_first(dev, dev->input_buf,
-                                                 drain_len);
-            if (drc < 0) break;
-            uint16_t dlen = (uint16_t)dev->input_buf[0] |
-                            ((uint16_t)dev->input_buf[1] << 8);
-            i2c_dbg("[I2C-HID] drain[%d]: len=%u [%02x %02x %02x %02x]\n",
-                    drain, dlen, dev->input_buf[0], dev->input_buf[1],
-                    drc > 2 ? dev->input_buf[2] : 0,
-                    drc > 3 ? dev->input_buf[3] : 0);
-            if (dlen <= 2) break;
-        }
-    }
+	// Drain any pending reports left over from reset / init.
+	if (dev->input_buf && dev->input_buf_size >= I2C_HID_LENGTH_HDR_SIZE) {
+		uint16_t drain_len = i2c_hid_input_read_len(dev);
+		for (int drain = 0; drain < 10; drain++) {
+			int drc = i2c_hid_read_length_first(dev, dev->input_buf,
+							    drain_len);
+			if (drc < 0)
+				break;
+			uint16_t dlen = (uint16_t)dev->input_buf[0] |
+					((uint16_t)dev->input_buf[1] << 8);
+			i2c_dbg("[I2C-HID] drain[%d]: len=%u [%02x %02x %02x %02x]\n",
+				drain, dlen, dev->input_buf[0],
+				dev->input_buf[1],
+				drc > 2 ? dev->input_buf[2] : 0,
+				drc > 3 ? dev->input_buf[3] : 0);
+			if (dlen <= 2)
+				break;
+		}
+	}
 
-    dev->active = 1;
+	dev->active = 1;
 
-    kprintf("[I2C-HID] Device I2C%d:0x%02x initialized as %s "
-            "(VID=%04x PID=%04x)\n",
-            dev->ctrl->bus_id, dev->i2c_addr,
-            dev->dev_type == I2C_HID_DEV_TOUCHPAD ? "touchpad" :
-            dev->dev_type == I2C_HID_DEV_MOUSE ? "mouse" : "unknown",
-            dev->desc.wVendorID, dev->desc.wProductID);
+	kprintf("[I2C-HID] Device I2C%d:0x%02x initialized as %s "
+		"(VID=%04x PID=%04x)\n",
+		dev->ctrl->bus_id, dev->i2c_addr,
+		dev->dev_type == I2C_HID_DEV_TOUCHPAD ? "touchpad" :
+		dev->dev_type == I2C_HID_DEV_MOUSE    ? "mouse" :
+							"unknown",
+		dev->desc.wVendorID, dev->desc.wProductID);
 
-    return 0;
+	return 0;
 }
 
 // ============================================================================
@@ -3034,88 +3411,90 @@ static int i2c_hid_init_device(i2c_hid_device_t *dev) {
 // ============================================================================
 
 // ISR: called from irq_handler when an I2C MSI/IOAPIC interrupt fires
-void i2c_hid_irq_handler(uint8_t vector) {
-    // ---- Probe mode: just record that the vector fired and exit ----
-    if (g_i2c_probe_mode) {
-        g_i2c_probe_hit = 1;
-        // Clear interrupt source on all active controllers so the
-        // level-triggered line deasserts before we EOI.
-        for (int c = 0; c < g_i2c_controller_count; c++) {
-            i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
-            if (ctrl->active && ctrl->base) {
-                dw_write(ctrl, DW_IC_INTR_MASK, 0);
-                (void)dw_read(ctrl, DW_IC_CLR_INTR);
-            }
-        }
-        // EOI: use x2APIC MSR directly since lapic_init() hasn't run yet
-        // and lapic_eoi() would use MMIO which is a no-op in x2APIC mode.
-        {
-            uint64_t ab = i2c_rdmsr(IA32_APIC_BASE_MSR);
-            if ((ab >> 10) & 1)
-                i2c_wrmsr(X2APIC_EOI_MSR, 0);
-            else
-                lapic_eoi();
-        }
-        return;
-    }
+void i2c_hid_irq_handler(uint8_t vector)
+{
+	// ---- Probe mode: just record that the vector fired and exit ----
+	if (g_i2c_probe_mode) {
+		g_i2c_probe_hit = 1;
+		// Clear interrupt source on all active controllers so the
+		// level-triggered line deasserts before we EOI.
+		for (int c = 0; c < g_i2c_controller_count; c++) {
+			i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
+			if (ctrl->active && ctrl->base) {
+				dw_write(ctrl, DW_IC_INTR_MASK, 0);
+				(void)dw_read(ctrl, DW_IC_CLR_INTR);
+			}
+		}
+		// EOI: use x2APIC MSR directly since lapic_init() hasn't run yet
+		// and lapic_eoi() would use MMIO which is a no-op in x2APIC mode.
+		{
+			uint64_t ab = i2c_rdmsr(IA32_APIC_BASE_MSR);
+			if ((ab >> 10) & 1)
+				i2c_wrmsr(X2APIC_EOI_MSR, 0);
+			else
+				lapic_eoi();
+		}
+		return;
+	}
 
-    // Find which controller this vector belongs to
-    for (int c = 0; c < g_i2c_controller_count; c++) {
-        i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
-        if (!ctrl->active)
-            continue;
-        if (ctrl->irq_vector != vector)
-            continue;
+	// Find which controller this vector belongs to
+	for (int c = 0; c < g_i2c_controller_count; c++) {
+		i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
+		if (!ctrl->active)
+			continue;
+		if (ctrl->irq_vector != vector)
+			continue;
 
-        // Read and clear interrupt status
-        uint32_t stat = dw_read(ctrl, DW_IC_INTR_STAT);
-        g_dbg_i2c_isr_count++;
+		// Read and clear interrupt status
+		uint32_t stat = dw_read(ctrl, DW_IC_INTR_STAT);
+		g_dbg_i2c_isr_count++;
 
-        // Spurious: DW output stuck HIGH with INTR_MASK=0 (LPSS quirk).
-        // Keep the IOAPIC entry masked; HID transfers poll the controller
-        // directly and do not rely on the DW interrupt line.
-        if (stat == 0) {
-            ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
-            lapic_eoi();
-            return;
-        }
+		// Spurious: DW output stuck HIGH with INTR_MASK=0 (LPSS quirk).
+		// Keep the IOAPIC entry masked; HID transfers poll the controller
+		// directly and do not rely on the DW interrupt line.
+		if (stat == 0) {
+			ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
+			lapic_eoi();
+			return;
+		}
 
-        if (stat & DW_IC_INTR_TX_ABRT) {
-            ctrl->abort_source = dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
-            (void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
-            ctrl->xfer_error = 1;
-            ctrl->irq_pending = 1;
-        }
+		if (stat & DW_IC_INTR_TX_ABRT) {
+			ctrl->abort_source =
+				dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
+			(void)dw_read(ctrl, DW_IC_CLR_TX_ABRT);
+			ctrl->xfer_error = 1;
+			ctrl->irq_pending = 1;
+		}
 
-        if (stat & DW_IC_INTR_RX_FULL) {
-            ctrl->rx_ready = 1;
-            ctrl->irq_pending = 1;
-        }
+		if (stat & DW_IC_INTR_RX_FULL) {
+			ctrl->rx_ready = 1;
+			ctrl->irq_pending = 1;
+		}
 
-        if (stat & DW_IC_INTR_TX_EMPTY) {
-            ctrl->tx_complete = 1;
-            ctrl->irq_pending = 1;
-        }
+		if (stat & DW_IC_INTR_TX_EMPTY) {
+			ctrl->tx_complete = 1;
+			ctrl->irq_pending = 1;
+		}
 
-        if (stat & DW_IC_INTR_STOP_DET) {
-            (void)dw_read(ctrl, DW_IC_CLR_STOP_DET);
-            ctrl->irq_pending = 1;
-        }
+		if (stat & DW_IC_INTR_STOP_DET) {
+			(void)dw_read(ctrl, DW_IC_CLR_STOP_DET);
+			ctrl->irq_pending = 1;
+		}
 
-        if (stat & DW_IC_INTR_RX_OVER)
-            (void)dw_read(ctrl, DW_IC_CLR_RX_OVER);
-        if (stat & DW_IC_INTR_TX_OVER)
-            (void)dw_read(ctrl, DW_IC_CLR_TX_OVER);
-        if (stat & DW_IC_INTR_ACTIVITY)
-            (void)dw_read(ctrl, DW_IC_CLR_ACTIVITY);
+		if (stat & DW_IC_INTR_RX_OVER)
+			(void)dw_read(ctrl, DW_IC_CLR_RX_OVER);
+		if (stat & DW_IC_INTR_TX_OVER)
+			(void)dw_read(ctrl, DW_IC_CLR_TX_OVER);
+		if (stat & DW_IC_INTR_ACTIVITY)
+			(void)dw_read(ctrl, DW_IC_CLR_ACTIVITY);
 
-        // Signal EOI
-        lapic_eoi();
-        return;
-    }
+		// Signal EOI
+		lapic_eoi();
+		return;
+	}
 
-    // Unknown vector — still EOI
-    lapic_eoi();
+	// Unknown vector — still EOI
+	lapic_eoi();
 }
 
 // Interrupt-driven write-then-read transfer
@@ -3134,218 +3513,222 @@ void i2c_hid_irq_handler(uint8_t vector) {
 // 6. Retry with a settle delay, not immediately
 // ============================================================================
 static int dw_i2c_xfer_irq(i2c_dw_controller_t *ctrl, uint16_t addr,
-                            const uint8_t *wbuf, int wlen,
-                            uint8_t *rbuf, int rlen)
+			   const uint8_t *wbuf, int wlen, uint8_t *rbuf,
+			   int rlen)
 {
-    int timeout;
-    int rx_idx = 0;
-    int tx_issued = 0;
+	int timeout;
+	int rx_idx = 0;
+	int tx_issued = 0;
 
-    g_dbg_xfer_total++;
-    rx_idx = 0;
-    tx_issued = 0;
+	g_dbg_xfer_total++;
+	rx_idx = 0;
+	tx_issued = 0;
 
-    // ---- Step 1: Wait for bus not busy (like i2c_dw_wait_bus_not_busy) ----
-    // Check DW_IC_STATUS: MST_ACTIVITY should be clear.
-    // If the bus is stuck from a previous abort, this will detect it.
-    for (timeout = 0; timeout < 25000; timeout++) {
-        uint32_t st = dw_read(ctrl, DW_IC_STATUS);
-        if (!(st & DW_IC_STATUS_MST_ACTIVITY))
-            break;
-        i2c_delay_us(1);
-    }
+	// ---- Step 1: Wait for bus not busy (like i2c_dw_wait_bus_not_busy) ----
+	// Check DW_IC_STATUS: MST_ACTIVITY should be clear.
+	// If the bus is stuck from a previous abort, this will detect it.
+	for (timeout = 0; timeout < 25000; timeout++) {
+		uint32_t st = dw_read(ctrl, DW_IC_STATUS);
+		if (!(st & DW_IC_STATUS_MST_ACTIVITY))
+			break;
+		i2c_delay_us(1);
+	}
 
-    // ---- Step 2: Init transfer (like i2c_dw_xfer_init) ----
-    // Disable → set TAR → enable → clear interrupts
-    if (dw_i2c_set_target(ctrl, addr) < 0)
-        return -1;
+	// ---- Step 2: Init transfer (like i2c_dw_xfer_init) ----
+	// Disable → set TAR → enable → clear interrupts
+	if (dw_i2c_set_target(ctrl, addr) < 0)
+		return -1;
 
-    // Clear transfer state AFTER set_target (which clears HW state)
-    ctrl->irq_pending = 0;
-    ctrl->tx_complete = 0;
-    ctrl->rx_ready = 0;
-    ctrl->xfer_error = 0;
-    ctrl->abort_source = 0;
+	// Clear transfer state AFTER set_target (which clears HW state)
+	ctrl->irq_pending = 0;
+	ctrl->tx_complete = 0;
+	ctrl->rx_ready = 0;
+	ctrl->xfer_error = 0;
+	ctrl->abort_source = 0;
 
-    // ---- Step 3: Keep the DW controller IRQ path masked ----
-    // HID traffic is IRQ-driven by the GPIO line.  For the DW engine itself,
-    // poll STATUS/RAW_INTR_STAT directly.  Leaving the controller IRQ enabled
-    // races the transfer loop and the ISR can clear TX_ABRT state underneath us.
-    if (ctrl->irq_gsi)
-        ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
-    dw_write(ctrl, DW_IC_INTR_MASK, 0);
+	// ---- Step 3: Keep the DW controller IRQ path masked ----
+	// HID traffic is IRQ-driven by the GPIO line.  For the DW engine itself,
+	// poll STATUS/RAW_INTR_STAT directly.  Leaving the controller IRQ enabled
+	// races the transfer loop and the ISR can clear TX_ABRT state underneath us.
+	if (ctrl->irq_gsi)
+		ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
+	dw_write(ctrl, DW_IC_INTR_MASK, 0);
 
-    // ---- Step 4: Write phase ----
-    for (int i = 0; i < wlen; i++) {
-        uint32_t cmd = (uint32_t)wbuf[i];
-        // STOP only on last write byte of write-only transfer
-        if (i == wlen - 1 && rlen == 0)
-            cmd |= DW_IC_DATA_CMD_STOP;
+	// ---- Step 4: Write phase ----
+	for (int i = 0; i < wlen; i++) {
+		uint32_t cmd = (uint32_t)wbuf[i];
+		// STOP only on last write byte of write-only transfer
+		if (i == wlen - 1 && rlen == 0)
+			cmd |= DW_IC_DATA_CMD_STOP;
 
-        // Wait for TX FIFO space (check TXFLR, not just TFNF)
-        for (timeout = 0; timeout < 50000; timeout++) {
-            if (ctrl->xfer_error) goto abort;
-            // Poll RAW_INTR_STAT for TX_ABRT — catches aborts even when
-            // the CPU has IRQs disabled (spin_lock_irqsave in worker).
-            if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT)
-                goto abort;
-            if (dw_read(ctrl, DW_IC_TXFLR) < ctrl->tx_fifo_depth)
-                break;
-            i2c_delay_us(1);
-        }
-        if (timeout >= 50000) goto abort;
+		// Wait for TX FIFO space (check TXFLR, not just TFNF)
+		for (timeout = 0; timeout < 50000; timeout++) {
+			if (ctrl->xfer_error)
+				goto abort;
+			// Poll RAW_INTR_STAT for TX_ABRT — catches aborts even when
+			// the CPU has IRQs disabled (spin_lock_irqsave in worker).
+			if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) &
+			    DW_IC_INTR_TX_ABRT)
+				goto abort;
+			if (dw_read(ctrl, DW_IC_TXFLR) < ctrl->tx_fifo_depth)
+				break;
+			i2c_delay_us(1);
+		}
+		if (timeout >= 50000)
+			goto abort;
 
-        dw_write(ctrl, DW_IC_DATA_CMD, cmd);
-    }
+		dw_write(ctrl, DW_IC_DATA_CMD, cmd);
+	}
 
-    // ---- Step 5: Read phase ----
-    // Keep a bounded requested/received window like FreeBSD ig4iic_read().
-    // The controller still needs enough queued read commands to avoid going
-    // idle mid-transaction, so do not collapse this to a tiny hand-fed window.
-    while (rx_idx < rlen) {
-        int outstanding = tx_issued - rx_idx;
-        int burst = (int)ctrl->tx_fifo_depth - (int)dw_read(ctrl, DW_IC_TXFLR);
-        int lowat = 0;
+	// ---- Step 5: Read phase ----
+	// Keep a bounded requested/received window like FreeBSD ig4iic_read().
+	// The controller still needs enough queued read commands to avoid going
+	// idle mid-transaction, so do not collapse this to a tiny hand-fed window.
+	while (rx_idx < rlen) {
+		int outstanding = tx_issued - rx_idx;
+		int burst = (int)ctrl->tx_fifo_depth -
+			    (int)dw_read(ctrl, DW_IC_TXFLR);
+		int lowat = 0;
 
-        if (burst < 0)
-            burst = 0;
+		if (burst < 0)
+			burst = 0;
 
-        if (outstanding < (int)ctrl->rx_fifo_depth) {
-            int rx_space = (int)ctrl->rx_fifo_depth - outstanding;
-            if (burst > rx_space)
-                burst = rx_space;
-        } else {
-            burst = 0;
-        }
+		if (outstanding < (int)ctrl->rx_fifo_depth) {
+			int rx_space = (int)ctrl->rx_fifo_depth - outstanding;
+			if (burst > rx_space)
+				burst = rx_space;
+		} else {
+			burst = 0;
+		}
 
-        while (burst > 0 && tx_issued < rlen) {
-            uint32_t cmd = DW_IC_DATA_CMD_READ;
+		while (burst > 0 && tx_issued < rlen) {
+			uint32_t cmd = DW_IC_DATA_CMD_READ;
 
-            if (tx_issued == 0 && wlen > 0)
-                cmd |= DW_IC_DATA_CMD_RESTART;
-            if (tx_issued == rlen - 1)
-                cmd |= DW_IC_DATA_CMD_STOP;
+			if (tx_issued == 0 && wlen > 0)
+				cmd |= DW_IC_DATA_CMD_RESTART;
+			if (tx_issued == rlen - 1)
+				cmd |= DW_IC_DATA_CMD_STOP;
 
-            dw_write(ctrl, DW_IC_DATA_CMD, cmd);
-            tx_issued++;
-            burst--;
-        }
+			dw_write(ctrl, DW_IC_DATA_CMD, cmd);
+			tx_issued++;
+			burst--;
+		}
 
-        if (tx_issued != rlen && (tx_issued - rx_idx) > 2)
-            lowat = 2;
+		if (tx_issued != rlen && (tx_issued - rx_idx) > 2)
+			lowat = 2;
 
-        while (rx_idx < tx_issued - lowat) {
-            uint32_t rx_valid;
+		while (rx_idx < tx_issued - lowat) {
+			uint32_t rx_valid;
 
-            for (timeout = 0; timeout < 50000; timeout++) {
-                if (ctrl->xfer_error)
-                    goto abort;
-                if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) & DW_IC_INTR_TX_ABRT)
-                    goto abort;
-                if (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)
-                    break;
-                i2c_delay_us(1);
-            }
-            if (timeout >= 50000)
-                goto abort;
+			for (timeout = 0; timeout < 50000; timeout++) {
+				if (ctrl->xfer_error)
+					goto abort;
+				if (dw_read(ctrl, DW_IC_RAW_INTR_STAT) &
+				    DW_IC_INTR_TX_ABRT)
+					goto abort;
+				if (dw_read(ctrl, DW_IC_STATUS) &
+				    DW_IC_STATUS_RFNE)
+					break;
+				i2c_delay_us(1);
+			}
+			if (timeout >= 50000)
+				goto abort;
 
-            rx_valid = dw_read(ctrl, DW_IC_RXFLR);
-            while (rx_idx < tx_issued && rx_valid > 0) {
-                uint32_t data = dw_read(ctrl, DW_IC_DATA_CMD);
-                if (rbuf)
-                    rbuf[rx_idx] = (uint8_t)(data & 0xFF);
-                rx_idx++;
-                rx_valid--;
-            }
-        }
-    }
+			rx_valid = dw_read(ctrl, DW_IC_RXFLR);
+			while (rx_idx < tx_issued && rx_valid > 0) {
+				uint32_t data = dw_read(ctrl, DW_IC_DATA_CMD);
+				if (rbuf)
+					rbuf[rx_idx] = (uint8_t)(data & 0xFF);
+				rx_idx++;
+				rx_valid--;
+			}
+		}
+	}
 
-    // ---- Step 6: Wait for STOP_DET / bus idle ----
-    if (dw_i2c_wait_bus_not_busy(ctrl, 25000) < 0)
-        goto abort;
+	// ---- Step 6: Wait for STOP_DET / bus idle ----
+	if (dw_i2c_wait_bus_not_busy(ctrl, 25000) < 0)
+		goto abort;
 
-    // ---- Step 7: Disable interrupts, mask IOAPIC ----
-    dw_write(ctrl, DW_IC_INTR_MASK, 0);
-    if (ctrl->irq_gsi)
-        ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
+	// ---- Step 7: Disable interrupts, mask IOAPIC ----
+	dw_write(ctrl, DW_IC_INTR_MASK, 0);
+	if (ctrl->irq_gsi)
+		ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
 
-    g_dbg_xfer_ok++;
-    return 0;
+	g_dbg_xfer_ok++;
+	return 0;
 
-abort:
-    {
-        int complete_read = 0;
-        uint16_t pkt_len = 0;
-        // ---- Abort handling (like i2c_dw_xfer error path) ----
-        // Read abort source: prefer ISR-saved value (ISR reads before clearing),
-        // fall back to direct register read (may be stale if ISR already cleared).
-        uint32_t abort_src = ctrl->abort_source;
-        if (abort_src == 0) {
-            // ISR hasn't seen it yet, or no TX_ABRT — read directly
-            abort_src = dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
-        }
-    ctrl->last_abort_source = abort_src;
+abort: {
+	int complete_read = 0;
+	uint16_t pkt_len = 0;
+	// ---- Abort handling (like i2c_dw_xfer error path) ----
+	// Read abort source: prefer ISR-saved value (ISR reads before clearing),
+	// fall back to direct register read (may be stale if ISR already cleared).
+	uint32_t abort_src = ctrl->abort_source;
+	if (abort_src == 0) {
+		// ISR hasn't seen it yet, or no TX_ABRT — read directly
+		abort_src = dw_read(ctrl, DW_IC_TX_ABRT_SOURCE);
+	}
+	ctrl->last_abort_source = abort_src;
 
-        // Disable all interrupts
-        dw_write(ctrl, DW_IC_INTR_MASK, 0);
+	// Disable all interrupts
+	dw_write(ctrl, DW_IC_INTR_MASK, 0);
 
-        // Re-mask IOAPIC
-        if (ctrl->irq_gsi)
-            ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
+	// Re-mask IOAPIC
+	if (ctrl->irq_gsi)
+		ioapic_mask_gsi((uint8_t)ctrl->irq_gsi);
 
-        // For HID input reads, some devices terminate the transfer early after
-        // delivering the complete length-prefixed packet. Drain anything the
-        // controller already received before tearing it down and accept the
-        // transfer if the packet is complete.
-        while (rbuf && wlen == 0 && rx_idx < rlen &&
-               (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)) {
-            uint32_t data = dw_read(ctrl, DW_IC_DATA_CMD);
-            rbuf[rx_idx++] = (uint8_t)(data & 0xFF);
-        }
+	// For HID input reads, some devices terminate the transfer early after
+	// delivering the complete length-prefixed packet. Drain anything the
+	// controller already received before tearing it down and accept the
+	// transfer if the packet is complete.
+	while (rbuf && wlen == 0 && rx_idx < rlen &&
+	       (dw_read(ctrl, DW_IC_STATUS) & DW_IC_STATUS_RFNE)) {
+		uint32_t data = dw_read(ctrl, DW_IC_DATA_CMD);
+		rbuf[rx_idx++] = (uint8_t)(data & 0xFF);
+	}
 
-        if (rbuf && wlen == 0 && rx_idx >= I2C_HID_LENGTH_HDR_SIZE) {
-            pkt_len = (uint16_t)rbuf[0] | ((uint16_t)rbuf[1] << 8);
-            if (pkt_len == 0 || pkt_len == 0xFFFF ||
-                pkt_len <= I2C_HID_LENGTH_HDR_SIZE) {
-                complete_read = 1;
-            } else {
-                if (pkt_len > (uint16_t)rlen)
-                    pkt_len = (uint16_t)rlen;
-                if (rx_idx >= (int)pkt_len)
-                    complete_read = 1;
-            }
-        }
+	if (rbuf && wlen == 0 && rx_idx >= I2C_HID_LENGTH_HDR_SIZE) {
+		pkt_len = (uint16_t)rbuf[0] | ((uint16_t)rbuf[1] << 8);
+		if (pkt_len == 0 || pkt_len == 0xFFFF ||
+		    pkt_len <= I2C_HID_LENGTH_HDR_SIZE) {
+			complete_read = 1;
+		} else {
+			if (pkt_len > (uint16_t)rlen)
+				pkt_len = (uint16_t)rlen;
+			if (rx_idx >= (int)pkt_len)
+				complete_read = 1;
+		}
+	}
 
-        // FreeBSD's ig4 path requests a controller abort and waits for the
-        // transfer to quiesce before it allows the next START. Doing the same
-        // here avoids rearming GPIO against a half-aborted DW engine.
-        dw_i2c_recover_aborted_xfer(ctrl);
+	// FreeBSD's ig4 path requests a controller abort and waits for the
+	// transfer to quiesce before it allows the next START. Doing the same
+	// here avoids rearming GPIO against a half-aborted DW engine.
+	dw_i2c_recover_aborted_xfer(ctrl);
 
-        // Reset state
-        ctrl->xfer_error = 0;
-        ctrl->irq_pending = 0;
-        ctrl->tx_complete = 0;
-        ctrl->rx_ready = 0;
-        ctrl->abort_source = 0;
+	// Reset state
+	ctrl->xfer_error = 0;
+	ctrl->irq_pending = 0;
+	ctrl->tx_complete = 0;
+	ctrl->rx_ready = 0;
+	ctrl->abort_source = 0;
 
-        g_dbg_xfer_abort_count++;
+	g_dbg_xfer_abort_count++;
 
-        if (complete_read) {
-            ctrl->last_abort_source = abort_src;
-            g_dbg_xfer_ok++;
-            return 0;
-        }
+	if (complete_read) {
+		ctrl->last_abort_source = abort_src;
+		g_dbg_xfer_ok++;
+		return 0;
+	}
 
-        i2c_dbg("[I2C-XFER] ABORT bus=%u addr=0x%02x abort_src=0x%x "
-                "rx=%d/%d tx=%d/%d "
-                "isr=%u gpio_isr=%u hit=%u miss=%u\n",
-                ctrl->bus_id, addr, abort_src,
-            rx_idx, rlen, tx_issued, rlen,
-                g_dbg_i2c_isr_count, g_dbg_gpio_isr_count,
-                g_dbg_gpio_isr_hit, g_dbg_gpio_isr_miss);
+	i2c_dbg("[I2C-XFER] ABORT bus=%u addr=0x%02x abort_src=0x%x "
+		"rx=%d/%d tx=%d/%d "
+		"isr=%u gpio_isr=%u hit=%u miss=%u\n",
+		ctrl->bus_id, addr, abort_src, rx_idx, rlen, tx_issued, rlen,
+		g_dbg_i2c_isr_count, g_dbg_gpio_isr_count, g_dbg_gpio_isr_hit,
+		g_dbg_gpio_isr_miss);
 
-        return -1;
-    }
+	return -1;
+}
 }
 
 // ============================================================================
@@ -3356,97 +3739,105 @@ abort:
 // Returns physical base address of P2SB sideband register window, or 0.
 static uint64_t p2sb_get_sbreg_bar(void)
 {
-    uint64_t bar = 0;
+	uint64_t bar = 0;
 
-    // Unhide P2SB via ECAM (preferred) and CF8
-    if (g_ecam_bus0_va) {
-        ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
-                     P2SB_P2SBC, 0);
-        i2c_delay_us(1000);
+	// Unhide P2SB via ECAM (preferred) and CF8
+	if (g_ecam_bus0_va) {
+		ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
+			     P2SB_P2SBC, 0);
+		i2c_delay_us(1000);
 
-        uint32_t vid = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
-                                   P2SB_PCI_FUNC, 0x00);
-        if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
-            // Ensure MSE is enabled
-            uint32_t cmd = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
-                                       P2SB_PCI_FUNC, 0x04);
-            if (!(cmd & 0x02))
-                ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
-                             0x04, cmd | 0x02);
+		uint32_t vid = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+					   P2SB_PCI_FUNC, 0x00);
+		if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
+			// Ensure MSE is enabled
+			uint32_t cmd = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+						   P2SB_PCI_FUNC, 0x04);
+			if (!(cmd & 0x02))
+				ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+					     P2SB_PCI_FUNC, 0x04, cmd | 0x02);
 
-            uint32_t bar_lo = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
-                                          P2SB_PCI_FUNC, P2SB_SBREG_BAR);
-            uint32_t bar_hi = ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
-                                          P2SB_PCI_FUNC, P2SB_SBREG_BARH);
-            bar = ((uint64_t)bar_hi << 32) | (bar_lo & ~0xFULL);
-        }
+			uint32_t bar_lo =
+				ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+					    P2SB_PCI_FUNC, P2SB_SBREG_BAR);
+			uint32_t bar_hi =
+				ecam_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+					    P2SB_PCI_FUNC, P2SB_SBREG_BARH);
+			bar = ((uint64_t)bar_hi << 32) | (bar_lo & ~0xFULL);
+		}
 
-        // Re-hide P2SB
-        ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
-                     P2SB_P2SBC, P2SB_HIDE_BIT);
-    }
+		// Re-hide P2SB
+		ecam_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
+			     P2SB_P2SBC, P2SB_HIDE_BIT);
+	}
 
-    // CF8/CFC fallback
-    if (!bar) {
-        pci_cfg_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
-                        P2SB_P2SBC, 0);
-        i2c_delay_us(1000);
+	// CF8/CFC fallback
+	if (!bar) {
+		pci_cfg_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
+				P2SB_P2SBC, 0);
+		i2c_delay_us(1000);
 
-        uint32_t vid = pci_cfg_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
-                                      P2SB_PCI_FUNC, 0x00);
-        if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
-            uint32_t cmd = pci_cfg_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
-                                          P2SB_PCI_FUNC, 0x04);
-            if (!(cmd & 0x02))
-                pci_cfg_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
-                                0x04, cmd | 0x02);
+		uint32_t vid = pci_cfg_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+					      P2SB_PCI_FUNC, 0x00);
+		if (vid != 0xFFFFFFFF && (vid & 0xFFFF) == 0x8086) {
+			uint32_t cmd =
+				pci_cfg_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+					       P2SB_PCI_FUNC, 0x04);
+			if (!(cmd & 0x02))
+				pci_cfg_write32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+						P2SB_PCI_FUNC, 0x04,
+						cmd | 0x02);
 
-            uint32_t bar_lo = pci_cfg_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
-                                             P2SB_PCI_FUNC, P2SB_SBREG_BAR);
-            uint32_t bar_hi = pci_cfg_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
-                                             P2SB_PCI_FUNC, P2SB_SBREG_BARH);
-            bar = ((uint64_t)bar_hi << 32) | (bar_lo & ~0xFULL);
-        }
+			uint32_t bar_lo =
+				pci_cfg_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+					       P2SB_PCI_FUNC, P2SB_SBREG_BAR);
+			uint32_t bar_hi =
+				pci_cfg_read32(P2SB_PCI_BUS, P2SB_PCI_DEV,
+					       P2SB_PCI_FUNC, P2SB_SBREG_BARH);
+			bar = ((uint64_t)bar_hi << 32) | (bar_lo & ~0xFULL);
+		}
 
-        pci_cfg_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
-                        P2SB_P2SBC, P2SB_HIDE_BIT);
-    }
+		pci_cfg_write32(P2SB_PCI_BUS, P2SB_PCI_DEV, P2SB_PCI_FUNC,
+				P2SB_P2SBC, P2SB_HIDE_BIT);
+	}
 
-    return bar;
+	return bar;
 }
 
 // Read a 32-bit register from a GPIO community's MMIO space
 static inline uint32_t gpio_comm_read32(gpio_community_t *comm, uint32_t offset)
 {
-    volatile uint32_t *addr = (volatile uint32_t *)
-        ((volatile uint8_t *)comm->base + offset);
-    return *addr;
+	volatile uint32_t *addr =
+		(volatile uint32_t *)((volatile uint8_t *)comm->base + offset);
+	return *addr;
 }
 
 // Write a 32-bit register in a GPIO community's MMIO space
 static inline void gpio_comm_write32(gpio_community_t *comm, uint32_t offset,
-                                     uint32_t value)
+				     uint32_t value)
 {
-    volatile uint32_t *addr = (volatile uint32_t *)
-        ((volatile uint8_t *)comm->base + offset);
-    *addr = value;
+	volatile uint32_t *addr =
+		(volatile uint32_t *)((volatile uint8_t *)comm->base + offset);
+	*addr = value;
 }
 
 static int gpio_hid_line_asserted(const i2c_hid_device_t *dev)
 {
-    if (!dev->gpio_irq_active || dev->gpio_community >= g_gpio_community_count)
-        return 0;
+	if (!dev->gpio_irq_active ||
+	    dev->gpio_community >= g_gpio_community_count)
+		return 0;
 
-    gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
-    uint32_t dw0 = gpio_comm_read32(comm, dev->gpio_pad_offset + GPIO_PAD_CFG_DW0);
+	gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
+	uint32_t dw0 =
+		gpio_comm_read32(comm, dev->gpio_pad_offset + GPIO_PAD_CFG_DW0);
 
-    if (dw0 & GPIO_DW0_GPIORXDIS)
-        return 0;
+	if (dw0 & GPIO_DW0_GPIORXDIS)
+		return 0;
 
-    if (dw0 & GPIO_DW0_RXINV)
-        return (dw0 & GPIO_DW0_GPIORXSTATE) == 0;
+	if (dw0 & GPIO_DW0_RXINV)
+		return (dw0 & GPIO_DW0_GPIORXSTATE) == 0;
 
-    return (dw0 & GPIO_DW0_GPIORXSTATE) != 0;
+	return (dw0 & GPIO_DW0_GPIORXSTATE) != 0;
 }
 
 // Detect GPIO platform by checking which known ACPI _HID matches the GPIO
@@ -3456,58 +3847,61 @@ static int gpio_hid_line_asserted(const i2c_hid_device_t *dev)
 // Returns pointer to matching platform table, or NULL if unknown.
 static const gpio_platform_def_t *gpio_detect_platform(const char *gpio_path)
 {
-    (void)gpio_path;
+	(void)gpio_path;
 
-    for (unsigned i = 0; i < GPIO_NUM_PLATFORMS; i++) {
-        for (int h = 0; g_gpio_platforms[i].acpi_hids[h]; h++) {
-            acpi_aml_device_info_t devs[1];
-            int ndev = acpi_aml_find_devices_by_hid(
-                g_gpio_platforms[i].acpi_hids[h], devs, 1);
-            if (ndev > 0) {
-                i2c_dbg("[GPIO] Detected platform via _HID %s (path=%s)\n",
-                        g_gpio_platforms[i].acpi_hids[h], devs[0].path);
-                return &g_gpio_platforms[i];
-            }
-        }
-    }
+	for (unsigned i = 0; i < GPIO_NUM_PLATFORMS; i++) {
+		for (int h = 0; g_gpio_platforms[i].acpi_hids[h]; h++) {
+			acpi_aml_device_info_t devs[1];
+			int ndev = acpi_aml_find_devices_by_hid(
+				g_gpio_platforms[i].acpi_hids[h], devs, 1);
+			if (ndev > 0) {
+				i2c_dbg("[GPIO] Detected platform via _HID %s (path=%s)\n",
+					g_gpio_platforms[i].acpi_hids[h],
+					devs[0].path);
+				return &g_gpio_platforms[i];
+			}
+		}
+	}
 
-    i2c_dbg("[GPIO] No matching platform table for GPIO controller\n");
-    return NULL;
+	i2c_dbg("[GPIO] No matching platform table for GPIO controller\n");
+	return NULL;
 }
 
 // Resolve an ACPI GpioInt pin number to hardware location using platform tables.
 // Returns 0 on success, -1 if pin not found.
 // Sets *out_community_idx, *out_pad_offset (pad index in community),
 // *out_gpi_reg (GPI_IS register index), *out_gpi_bit (bit within register).
-static int gpio_resolve_acpi_pin(uint16_t acpi_pin,
-                                 int *out_community_idx,
-                                 uint16_t *out_pad_index,
-                                 uint8_t *out_gpi_reg,
-                                 uint8_t *out_gpi_bit)
+static int gpio_resolve_acpi_pin(uint16_t acpi_pin, int *out_community_idx,
+				 uint16_t *out_pad_index, uint8_t *out_gpi_reg,
+				 uint8_t *out_gpi_bit)
 {
-    if (!g_gpio_platform) return -1;
+	if (!g_gpio_platform)
+		return -1;
 
-    for (int ci = 0; ci < g_gpio_platform->ncommunities; ci++) {
-        const gpio_community_def_t *cdef = &g_gpio_platform->communities[ci];
-        uint16_t pad_offset_in_comm = 0;
+	for (int ci = 0; ci < g_gpio_platform->ncommunities; ci++) {
+		const gpio_community_def_t *cdef =
+			&g_gpio_platform->communities[ci];
+		uint16_t pad_offset_in_comm = 0;
 
-        for (int gi = 0; gi < cdef->ngpps; gi++) {
-            const gpio_padgroup_def_t *grp = &cdef->gpps[gi];
+		for (int gi = 0; gi < cdef->ngpps; gi++) {
+			const gpio_padgroup_def_t *grp = &cdef->gpps[gi];
 
-            if (grp->gpio_base != GPIO_NOMAP &&
-                acpi_pin >= (uint16_t)grp->gpio_base &&
-                acpi_pin < (uint16_t)grp->gpio_base + grp->size) {
-                uint8_t offset_in_group = (uint8_t)(acpi_pin - grp->gpio_base);
-                *out_community_idx = ci;
-                *out_pad_index = pad_offset_in_comm + offset_in_group;
-                *out_gpi_reg = grp->reg_num;
-                *out_gpi_bit = offset_in_group;
-                return 0;
-            }
-            pad_offset_in_comm += grp->size;
-        }
-    }
-    return -1;
+			if (grp->gpio_base != GPIO_NOMAP &&
+			    acpi_pin >= (uint16_t)grp->gpio_base &&
+			    acpi_pin < (uint16_t)grp->gpio_base + grp->size) {
+				uint8_t offset_in_group =
+					(uint8_t)(acpi_pin - grp->gpio_base);
+				*out_community_idx = ci;
+				*out_pad_index =
+					pad_offset_in_comm + offset_in_group;
+				*out_gpi_reg = grp->reg_num;
+				*out_gpi_bit = offset_in_group;
+				return 0;
+			}
+			pad_offset_in_comm += grp->size;
+		}
+	}
+	return -1;
 }
 
 // Discover GPIO communities from the ACPI GPIO controller's _CRS.
@@ -3516,120 +3910,135 @@ static int gpio_resolve_acpi_pin(uint16_t acpi_pin,
 // Returns number of communities found.
 static int gpio_discover_communities(const char *gpio_ctrl_path)
 {
-    acpi_crs_result_t crs;
-    i2c_memset(&crs, 0, sizeof(crs));
+	acpi_crs_result_t crs;
+	i2c_memset(&crs, 0, sizeof(crs));
 
-    if (acpi_aml_eval_crs(gpio_ctrl_path, &crs) != 0) {
-        i2c_dbg("[GPIO] Failed to evaluate _CRS on %s\n", gpio_ctrl_path);
-        return 0;
-    }
+	if (acpi_aml_eval_crs(gpio_ctrl_path, &crs) != 0) {
+		i2c_dbg("[GPIO] Failed to evaluate _CRS on %s\n",
+			gpio_ctrl_path);
+		return 0;
+	}
 
-    i2c_dbg("[GPIO] %s: %d MMIO ranges, %d IRQs\n",
-            gpio_ctrl_path, crs.mmio_range_count, crs.irq_count);
+	i2c_dbg("[GPIO] %s: %d MMIO ranges, %d IRQs\n", gpio_ctrl_path,
+		crs.mmio_range_count, crs.irq_count);
 
-    // Detect platform from ACPI _HID
-    g_gpio_platform = gpio_detect_platform(gpio_ctrl_path);
+	// Detect platform from ACPI _HID
+	g_gpio_platform = gpio_detect_platform(gpio_ctrl_path);
 
-    // The IRQ resource gives us the IOAPIC GSI for this GPIO controller
-    uint32_t gpio_gsi = 0;
-    if (crs.irq_count > 0) {
-        gpio_gsi = crs.irqs[0];
-        g_gpio_ioapic_polarity = crs.irq_polarity;
-        g_gpio_ioapic_trigger  = crs.irq_triggering;
-        i2c_dbg("[GPIO] IOAPIC GSI from _CRS: %u (trigger=%s, pol=%s)\n",
-                gpio_gsi,
-                crs.irq_triggering ? "edge" : "level",
-                crs.irq_polarity ? "low" : "high");
-    }
+	// The IRQ resource gives us the IOAPIC GSI for this GPIO controller
+	uint32_t gpio_gsi = 0;
+	if (crs.irq_count > 0) {
+		gpio_gsi = crs.irqs[0];
+		g_gpio_ioapic_polarity = crs.irq_polarity;
+		g_gpio_ioapic_trigger = crs.irq_triggering;
+		i2c_dbg("[GPIO] IOAPIC GSI from _CRS: %u (trigger=%s, pol=%s)\n",
+			gpio_gsi, crs.irq_triggering ? "edge" : "level",
+			crs.irq_polarity ? "low" : "high");
+	}
 
-    int count = 0;
+	int count = 0;
 
-    for (int i = 0; i < crs.mmio_range_count && count < GPIO_MAX_COMMUNITIES; i++) {
-        uint64_t phys = crs.mmio_ranges[i].base;
-        uint32_t len = crs.mmio_ranges[i].length;
+	for (int i = 0;
+	     i < crs.mmio_range_count && count < GPIO_MAX_COMMUNITIES; i++) {
+		uint64_t phys = crs.mmio_ranges[i].base;
+		uint32_t len = crs.mmio_ranges[i].length;
 
-        if (phys == 0 || len == 0) continue;
+		if (phys == 0 || len == 0)
+			continue;
 
-        // Map enough pages to cover the full community MMIO region
-        uint32_t npages = (len + 0xFFF) >> 12;
-        if (npages == 0) npages = 1;
-        uint64_t va = mm_map_device_mmio(phys, npages);
-        if (!va) {
-            i2c_dbg("[GPIO] Failed to map community %d at 0x%llx\n",
-                    i, (unsigned long long)phys);
-            continue;
-        }
+		// Map enough pages to cover the full community MMIO region
+		uint32_t npages = (len + 0xFFF) >> 12;
+		if (npages == 0)
+			npages = 1;
+		uint64_t va = mm_map_device_mmio(phys, npages);
+		if (!va) {
+			i2c_dbg("[GPIO] Failed to map community %d at 0x%llx\n",
+				i, (unsigned long long)phys);
+			continue;
+		}
 
-        gpio_community_t *comm = &g_gpio_communities[count];
-        i2c_memset(comm, 0, sizeof(*comm));
-        comm->base = (volatile uint32_t *)va;
-        comm->phys = phys;
+		gpio_community_t *comm = &g_gpio_communities[count];
+		i2c_memset(comm, 0, sizeof(*comm));
+		comm->base = (volatile uint32_t *)va;
+		comm->phys = phys;
 
-        // Read MISCCFG to get GPDMINTSEL (IOAPIC IRQ line for this community)
-        uint32_t misccfg = gpio_comm_read32(comm, GPIO_MISCCFG);
-        comm->irq_line = (misccfg & GPIO_MISCCFG_GPDMINTSEL_MASK)
-                         >> GPIO_MISCCFG_GPDMINTSEL_SHIFT;
+		// Read MISCCFG to get GPDMINTSEL (IOAPIC IRQ line for this community)
+		uint32_t misccfg = gpio_comm_read32(comm, GPIO_MISCCFG);
+		comm->irq_line = (misccfg & GPIO_MISCCFG_GPDMINTSEL_MASK) >>
+				 GPIO_MISCCFG_GPDMINTSEL_SHIFT;
 
-        // Override IRQ line from _CRS if available (more reliable)
-        if (gpio_gsi)
-            comm->irq_line = (uint8_t)gpio_gsi;
+		// Override IRQ line from _CRS if available (more reliable)
+		if (gpio_gsi)
+			comm->irq_line = (uint8_t)gpio_gsi;
 
-        // Read PADBAR to find where pad configs start
-        uint32_t padbar = gpio_comm_read32(comm, GPIO_PADBAR) & 0xFFFF;
+		// Read PADBAR to find where pad configs start
+		uint32_t padbar = gpio_comm_read32(comm, GPIO_PADBAR) & 0xFFFF;
 
-        // Populate group structure from platform table if available
-        if (g_gpio_platform && count < g_gpio_platform->ncommunities) {
-            const gpio_community_def_t *cdef = &g_gpio_platform->communities[count];
-            comm->pin_base = cdef->pin_base;
-            comm->pin_count = cdef->npins;
-            comm->num_groups = cdef->ngpps;
+		// Populate group structure from platform table if available
+		if (g_gpio_platform && count < g_gpio_platform->ncommunities) {
+			const gpio_community_def_t *cdef =
+				&g_gpio_platform->communities[count];
+			comm->pin_base = cdef->pin_base;
+			comm->pin_count = cdef->npins;
+			comm->num_groups = cdef->ngpps;
 
-            uint16_t pad_offset = 0;
-            for (int g = 0; g < cdef->ngpps && g < GPIO_MAX_GROUPS_PER_COMM; g++) {
-                comm->groups[g].pad_cfg_offset = padbar + pad_offset * GPIO_PAD_STRIDE;
-                comm->groups[g].pad_count = cdef->gpps[g].size;
-                comm->groups[g].gpi_reg_index = cdef->gpps[g].reg_num;
-                comm->groups[g].gpio_base = cdef->gpps[g].gpio_base;
-                pad_offset += cdef->gpps[g].size;
-            }
-        } else {
-            // Unknown platform: scan hardware to estimate pad count
-            uint16_t scan_limit = 256;
-            if (padbar + scan_limit * GPIO_PAD_STRIDE > len)
-                scan_limit = (uint16_t)((len - padbar) / GPIO_PAD_STRIDE);
+			uint16_t pad_offset = 0;
+			for (int g = 0;
+			     g < cdef->ngpps && g < GPIO_MAX_GROUPS_PER_COMM;
+			     g++) {
+				comm->groups[g].pad_cfg_offset =
+					padbar + pad_offset * GPIO_PAD_STRIDE;
+				comm->groups[g].pad_count = cdef->gpps[g].size;
+				comm->groups[g].gpi_reg_index =
+					cdef->gpps[g].reg_num;
+				comm->groups[g].gpio_base =
+					cdef->gpps[g].gpio_base;
+				pad_offset += cdef->gpps[g].size;
+			}
+		} else {
+			// Unknown platform: scan hardware to estimate pad count
+			uint16_t scan_limit = 256;
+			if (padbar + scan_limit * GPIO_PAD_STRIDE > len)
+				scan_limit = (uint16_t)((len - padbar) /
+							GPIO_PAD_STRIDE);
 
-            uint16_t npads = 0;
-            for (uint16_t p = 0; p < scan_limit; p++) {
-                uint32_t off = padbar + p * GPIO_PAD_STRIDE;
-                uint32_t dw0 = gpio_comm_read32(comm, off + GPIO_PAD_CFG_DW0);
-                uint32_t dw1 = gpio_comm_read32(comm, off + GPIO_PAD_CFG_DW1);
-                if (dw0 != 0 || dw1 != 0)
-                    npads = p + 1;
-            }
+			uint16_t npads = 0;
+			for (uint16_t p = 0; p < scan_limit; p++) {
+				uint32_t off = padbar + p * GPIO_PAD_STRIDE;
+				uint32_t dw0 = gpio_comm_read32(
+					comm, off + GPIO_PAD_CFG_DW0);
+				uint32_t dw1 = gpio_comm_read32(
+					comm, off + GPIO_PAD_CFG_DW1);
+				if (dw0 != 0 || dw1 != 0)
+					npads = p + 1;
+			}
 
-            comm->pin_base = 0; // Unknown — cumulative not meaningful
-            comm->pin_count = npads;
-            comm->num_groups = 1;
-            comm->groups[0].pad_cfg_offset = padbar;
-            comm->groups[0].pad_count = (uint8_t)(npads > 255 ? 255 : npads);
-            comm->groups[0].gpi_reg_index = 0;
-            comm->groups[0].gpio_base = GPIO_NOMAP;
-        }
+			comm->pin_base =
+				0; // Unknown — cumulative not meaningful
+			comm->pin_count = npads;
+			comm->num_groups = 1;
+			comm->groups[0].pad_cfg_offset = padbar;
+			comm->groups[0].pad_count =
+				(uint8_t)(npads > 255 ? 255 : npads);
+			comm->groups[0].gpi_reg_index = 0;
+			comm->groups[0].gpio_base = GPIO_NOMAP;
+		}
 
-        i2c_dbg("[GPIO] Community %d: phys=0x%llx MISCCFG=0x%08x "
-                "GPDMINTSEL=%u PADBAR=0x%x pins=%u-%u (%u pads, %u groups)%s\n",
-                count, (unsigned long long)phys, misccfg,
-                comm->irq_line, padbar,
-                comm->pin_base,
-                comm->pin_count > 0 ? comm->pin_base + comm->pin_count - 1 : comm->pin_base,
-                comm->pin_count, comm->num_groups,
-                g_gpio_platform ? " [table]" : " [scan]");
+		i2c_dbg("[GPIO] Community %d: phys=0x%llx MISCCFG=0x%08x "
+			"GPDMINTSEL=%u PADBAR=0x%x pins=%u-%u (%u pads, %u groups)%s\n",
+			count, (unsigned long long)phys, misccfg,
+			comm->irq_line, padbar, comm->pin_base,
+			comm->pin_count > 0 ?
+				comm->pin_base + comm->pin_count - 1 :
+				comm->pin_base,
+			comm->pin_count, comm->num_groups,
+			g_gpio_platform ? " [table]" : " [scan]");
 
-        count++;
-    }
+		count++;
+	}
 
-    g_gpio_community_count = count;
-    return count;
+	g_gpio_community_count = count;
+	return count;
 }
 
 // Find which community contains the given ACPI GpioInt pin number.
@@ -3639,563 +4048,691 @@ static int gpio_discover_communities(const char *gpio_ctrl_path)
 // Also sets *out_pad_offset to the PAD_CFG MMIO offset for the pin,
 // *out_gpi_group to the GPI register index, *out_gpi_bit to the bit position.
 static int gpio_find_pin_community(uint16_t pin, uint32_t *out_pad_offset,
-                                   uint8_t *out_gpi_group, uint8_t *out_gpi_bit)
+				   uint8_t *out_gpi_group, uint8_t *out_gpi_bit)
 {
-    int ci_idx = -1;
-    uint16_t pad_index = 0;
-    uint8_t gpi_reg = 0, gpi_bit = 0;
+	int ci_idx = -1;
+	uint16_t pad_index = 0;
+	uint8_t gpi_reg = 0, gpi_bit = 0;
 
-    if (g_gpio_platform) {
-        // Use platform table to resolve ACPI pin → community/pad
-        if (gpio_resolve_acpi_pin(pin, &ci_idx, &pad_index,
-                                  &gpi_reg, &gpi_bit) != 0) {
-            i2c_dbg("[GPIO] Pin %u not found in platform table\n", pin);
-            return -1;
-        }
+	if (g_gpio_platform) {
+		// Use platform table to resolve ACPI pin → community/pad
+		if (gpio_resolve_acpi_pin(pin, &ci_idx, &pad_index, &gpi_reg,
+					  &gpi_bit) != 0) {
+			i2c_dbg("[GPIO] Pin %u not found in platform table\n",
+				pin);
+			return -1;
+		}
 
-        if (ci_idx >= g_gpio_community_count) {
-            i2c_dbg("[GPIO] Pin %u maps to community %d but only %d mapped\n",
-                    pin, ci_idx, g_gpio_community_count);
-            return -1;
-        }
+		if (ci_idx >= g_gpio_community_count) {
+			i2c_dbg("[GPIO] Pin %u maps to community %d but only %d mapped\n",
+				pin, ci_idx, g_gpio_community_count);
+			return -1;
+		}
 
-        gpio_community_t *comm = &g_gpio_communities[ci_idx];
-        uint32_t padbar = gpio_comm_read32(comm, GPIO_PADBAR) & 0xFFFF;
-        *out_pad_offset = padbar + pad_index * GPIO_PAD_STRIDE;
-        *out_gpi_group = gpi_reg;
-        *out_gpi_bit = gpi_bit;
+		gpio_community_t *comm = &g_gpio_communities[ci_idx];
+		uint32_t padbar = gpio_comm_read32(comm, GPIO_PADBAR) & 0xFFFF;
+		*out_pad_offset = padbar + pad_index * GPIO_PAD_STRIDE;
+		*out_gpi_group = gpi_reg;
+		*out_gpi_bit = gpi_bit;
 
-        i2c_dbg("[GPIO] Pin %u: community %d pad_idx %u "
-                "offset=0x%x gpi_reg=%u bit=%u (gpio_base table)\n",
-                pin, ci_idx, pad_index, *out_pad_offset,
-                gpi_reg, gpi_bit);
-        return ci_idx;
-    }
+		i2c_dbg("[GPIO] Pin %u: community %d pad_idx %u "
+			"offset=0x%x gpi_reg=%u bit=%u (gpio_base table)\n",
+			pin, ci_idx, pad_index, *out_pad_offset, gpi_reg,
+			gpi_bit);
+		return ci_idx;
+	}
 
-    // Fallback for unknown platforms: try sequential pin ranges
-    for (int ci = 0; ci < g_gpio_community_count; ci++) {
-        gpio_community_t *comm = &g_gpio_communities[ci];
+	// Fallback for unknown platforms: try sequential pin ranges
+	for (int ci = 0; ci < g_gpio_community_count; ci++) {
+		gpio_community_t *comm = &g_gpio_communities[ci];
 
-        if (pin < comm->pin_base || pin >= comm->pin_base + comm->pin_count)
-            continue;
+		if (pin < comm->pin_base ||
+		    pin >= comm->pin_base + comm->pin_count)
+			continue;
 
-        uint16_t pad_idx = pin - comm->pin_base;
-        uint32_t padbar = gpio_comm_read32(comm, GPIO_PADBAR) & 0xFFFF;
-        *out_pad_offset = padbar + pad_idx * GPIO_PAD_STRIDE;
-        *out_gpi_group = (uint8_t)(pad_idx / 32);
-        *out_gpi_bit = (uint8_t)(pad_idx % 32);
+		uint16_t pad_idx = pin - comm->pin_base;
+		uint32_t padbar = gpio_comm_read32(comm, GPIO_PADBAR) & 0xFFFF;
+		*out_pad_offset = padbar + pad_idx * GPIO_PAD_STRIDE;
+		*out_gpi_group = (uint8_t)(pad_idx / 32);
+		*out_gpi_bit = (uint8_t)(pad_idx % 32);
 
-        i2c_dbg("[GPIO] Pin %u: community %d pad %u "
-                "offset=0x%x group=%u bit=%u (fallback)\n",
-                pin, ci, pad_idx, *out_pad_offset,
-                *out_gpi_group, *out_gpi_bit);
-        return ci;
-    }
+		i2c_dbg("[GPIO] Pin %u: community %d pad %u "
+			"offset=0x%x group=%u bit=%u (fallback)\n",
+			pin, ci, pad_idx, *out_pad_offset, *out_gpi_group,
+			*out_gpi_bit);
+		return ci;
+	}
 
-    i2c_dbg("[GPIO] Pin %u not found in any community\n", pin);
-    return -1;
+	i2c_dbg("[GPIO] Pin %u not found in any community\n", pin);
+	return -1;
 }
 
 // Configure a GPIO pad for interrupt delivery via IOAPIC (GPIO Driver Mode).
 // Like intel_gpio_irq_enable() + intel_gpio_set_gpio_mode().
-static int gpio_configure_pad_interrupt(gpio_community_t *comm,
-                                        uint32_t pad_offset,
-                                        uint8_t gpi_group,
-                                        uint8_t gpi_bit,
-                                        uint8_t triggering,  // 0=level, 1=edge
-                                        uint8_t polarity)    // 0=high, 1=low, 2=both
+static int
+gpio_configure_pad_interrupt(gpio_community_t *comm, uint32_t pad_offset,
+			     uint8_t gpi_group, uint8_t gpi_bit,
+			     uint8_t triggering, // 0=level, 1=edge
+			     uint8_t polarity) // 0=high, 1=low, 2=both
 {
-    // 1. Set HOSTSW_OWN = 1 (GPIO Driver Mode) for this pad
-    //    This makes GPI_IS (instead of GPI_GPE_STS) track interrupt status
-    uint16_t hostsw_base = g_gpio_platform ? g_gpio_platform->hostsw_own_offset : 0x0b0;
-    uint32_t hostsw_reg = hostsw_base + gpi_group * 4;
-    uint32_t hostsw = gpio_comm_read32(comm, hostsw_reg);
-    hostsw |= (1u << gpi_bit);
-    gpio_comm_write32(comm, hostsw_reg, hostsw);
-    i2c_dbg("[GPIO] HOSTSW_OWN[%u] = 0x%08x (set bit %u)\n",
-            gpi_group, gpio_comm_read32(comm, hostsw_reg), gpi_bit);
+	// 1. Set HOSTSW_OWN = 1 (GPIO Driver Mode) for this pad
+	//    This makes GPI_IS (instead of GPI_GPE_STS) track interrupt status
+	uint16_t hostsw_base =
+		g_gpio_platform ? g_gpio_platform->hostsw_own_offset : 0x0b0;
+	uint32_t hostsw_reg = hostsw_base + gpi_group * 4;
+	uint32_t hostsw = gpio_comm_read32(comm, hostsw_reg);
+	hostsw |= (1u << gpi_bit);
+	gpio_comm_write32(comm, hostsw_reg, hostsw);
+	i2c_dbg("[GPIO] HOSTSW_OWN[%u] = 0x%08x (set bit %u)\n", gpi_group,
+		gpio_comm_read32(comm, hostsw_reg), gpi_bit);
 
-    // 2. Configure PAD_CFG_DW0:
-    //    - Set pad mode to GPIO (PMode=0) — should already be set by BIOS
-    //    - RX buffer enabled (GPIORXDIS=0) — ensure input is active
-    //    - Set RXEVCFG for edge or level trigger
-    //    - Set RXINV if active-low
-    //    - Clear all routing bits, then set GPIROUTIOXAPIC=1
-    //      (Actually, for GPIO Driver Mode, we DON'T set GPIROUTIOXAPIC.
-    //       The interrupt goes through GPI_IS/GPI_IE → GPDMINTSEL → IOAPIC.
-    //       GPIROUTIOXAPIC is for direct per-pad IOAPIC routing which is a
-    //       different mechanism. Do NOT use GPIROUTIOXAPIC.)
-    uint32_t dw0 = gpio_comm_read32(comm, pad_offset + GPIO_PAD_CFG_DW0);
-    i2c_dbg("[GPIO] PAD_CFG_DW0 before: 0x%08x\n", dw0);
+	// 2. Configure PAD_CFG_DW0:
+	//    - Set pad mode to GPIO (PMode=0) — should already be set by BIOS
+	//    - RX buffer enabled (GPIORXDIS=0) — ensure input is active
+	//    - Set RXEVCFG for edge or level trigger
+	//    - Set RXINV if active-low
+	//    - Clear all routing bits, then set GPIROUTIOXAPIC=1
+	//      (Actually, for GPIO Driver Mode, we DON'T set GPIROUTIOXAPIC.
+	//       The interrupt goes through GPI_IS/GPI_IE → GPDMINTSEL → IOAPIC.
+	//       GPIROUTIOXAPIC is for direct per-pad IOAPIC routing which is a
+	//       different mechanism. Do NOT use GPIROUTIOXAPIC.)
+	uint32_t dw0 = gpio_comm_read32(comm, pad_offset + GPIO_PAD_CFG_DW0);
+	i2c_dbg("[GPIO] PAD_CFG_DW0 before: 0x%08x\n", dw0);
 
-    // Clear routing bits (we use GPIO Driver Mode, not direct IOAPIC routing)
-    dw0 &= ~(GPIO_DW0_GPIROUTIOXAPIC | GPIO_DW0_GPIROUTSCI |
-              GPIO_DW0_GPIROUTSMI | GPIO_DW0_GPIROUTNMI);
+	// Clear routing bits (we use GPIO Driver Mode, not direct IOAPIC routing)
+	dw0 &= ~(GPIO_DW0_GPIROUTIOXAPIC | GPIO_DW0_GPIROUTSCI |
+		 GPIO_DW0_GPIROUTSMI | GPIO_DW0_GPIROUTNMI);
 
-    // Ensure GPIO mode (PMode = 0)
-    dw0 &= ~GPIO_DW0_PMODE_MASK;
+	// Ensure GPIO mode (PMode = 0)
+	dw0 &= ~GPIO_DW0_PMODE_MASK;
 
-    // Enable RX (clear RX disable)
-    dw0 &= ~GPIO_DW0_GPIORXDIS;
+	// Enable RX (clear RX disable)
+	dw0 &= ~GPIO_DW0_GPIORXDIS;
 
-    // Set RXEVCFG to LEVEL mode (level-triggered, active-low).
-    //
-    // EDGE mode is WRONG for HID-over-I2C: with RXINV=1, edge detection
-    // fires on BOTH the falling edge (INT# assert = device has data) AND
-    // the rising edge (INT# deassert = device done).  The deassert-edge
-    // triggers a read when the device has NO data, causing timeouts
-    // (abort_src=0x0).
-    //
-    // LEVEL mode fires GPI_IS as long as INT# is LOW (data ready).  Once
-    // the host reads the report, INT# goes HIGH and IS auto-clears.  The
-    // GPIO ISR masks IE before EOI, preventing re-delivery flood.
-    // gpio_reenable_ie() re-enables IE after the read completes.
-    dw0 &= ~GPIO_DW0_RXEVCFG_MASK;
-    dw0 |= GPIO_DW0_RXEVCFG_LEVEL;
+	// Set RXEVCFG to LEVEL mode (level-triggered, active-low).
+	//
+	// EDGE mode is WRONG for HID-over-I2C: with RXINV=1, edge detection
+	// fires on BOTH the falling edge (INT# assert = device has data) AND
+	// the rising edge (INT# deassert = device done).  The deassert-edge
+	// triggers a read when the device has NO data, causing timeouts
+	// (abort_src=0x0).
+	//
+	// LEVEL mode fires GPI_IS as long as INT# is LOW (data ready).  Once
+	// the host reads the report, INT# goes HIGH and IS auto-clears.  The
+	// GPIO ISR masks IE before EOI, preventing re-delivery flood.
+	// gpio_reenable_ie() re-enables IE after the read completes.
+	dw0 &= ~GPIO_DW0_RXEVCFG_MASK;
+	dw0 |= GPIO_DW0_RXEVCFG_LEVEL;
 
-    // Always set RXINV for active-low (HID INT# is active-low).
-    // With RXEVCFG_LEVEL + RXINV, IS is set whenever the physical
-    // pin is LOW = INT# asserted = device has data.
-    dw0 |= GPIO_DW0_RXINV;
+	// Always set RXINV for active-low (HID INT# is active-low).
+	// With RXEVCFG_LEVEL + RXINV, IS is set whenever the physical
+	// pin is LOW = INT# asserted = device has data.
+	dw0 |= GPIO_DW0_RXINV;
 
-    gpio_comm_write32(comm, pad_offset + GPIO_PAD_CFG_DW0, dw0);
-    i2c_dbg("[GPIO] PAD_CFG_DW0 after:  0x%08x\n",
-            gpio_comm_read32(comm, pad_offset + GPIO_PAD_CFG_DW0));
+	gpio_comm_write32(comm, pad_offset + GPIO_PAD_CFG_DW0, dw0);
+	i2c_dbg("[GPIO] PAD_CFG_DW0 after:  0x%08x\n",
+		gpio_comm_read32(comm, pad_offset + GPIO_PAD_CFG_DW0));
 
-    // 3. Clear any pending interrupt status
-    uint16_t is_base = g_gpio_platform ? g_gpio_platform->gpi_is_offset : 0x100;
-    uint32_t is_reg = is_base + gpi_group * 4;
-    gpio_comm_write32(comm, is_reg, (1u << gpi_bit));
+	// 3. Clear any pending interrupt status
+	uint16_t is_base =
+		g_gpio_platform ? g_gpio_platform->gpi_is_offset : 0x100;
+	uint32_t is_reg = is_base + gpi_group * 4;
+	gpio_comm_write32(comm, is_reg, (1u << gpi_bit));
 
-    // 4. Enable interrupt in GPI_IE
-    uint16_t ie_base = g_gpio_platform ? g_gpio_platform->gpi_ie_offset : 0x120;
-    uint32_t ie_reg = ie_base + gpi_group * 4;
-    uint32_t ie = gpio_comm_read32(comm, ie_reg);
-    ie |= (1u << gpi_bit);
-    gpio_comm_write32(comm, ie_reg, ie);
-    i2c_dbg("[GPIO] GPI_IE[%u] = 0x%08x (set bit %u)\n",
-            gpi_group, gpio_comm_read32(comm, ie_reg), gpi_bit);
+	// 4. Enable interrupt in GPI_IE
+	uint16_t ie_base =
+		g_gpio_platform ? g_gpio_platform->gpi_ie_offset : 0x120;
+	uint32_t ie_reg = ie_base + gpi_group * 4;
+	uint32_t ie = gpio_comm_read32(comm, ie_reg);
+	ie |= (1u << gpi_bit);
+	gpio_comm_write32(comm, ie_reg, ie);
+	i2c_dbg("[GPIO] GPI_IE[%u] = 0x%08x (set bit %u)\n", gpi_group,
+		gpio_comm_read32(comm, ie_reg), gpi_bit);
 
-    return 0;
+	return 0;
 }
 
 // Set up GPIO interrupt for an I2C HID device.
 // Called after parsing the device's ACPI _CRS GpioInt resource.
 // Returns 0 on success, -1 on failure.
 static int gpio_setup_hid_interrupt(i2c_hid_device_t *dev,
-                                    const acpi_crs_result_t *crs)
+				    const acpi_crs_result_t *crs)
 {
-    if (!crs->gpio_int.valid) return -1;
+	if (!crs->gpio_int.valid)
+		return -1;
 
-    uint16_t pin = crs->gpio_int.pin;
-    const char *gpio_path = crs->gpio_int.resource_source;
+	uint16_t pin = crs->gpio_int.pin;
+	const char *gpio_path = crs->gpio_int.resource_source;
 
-    i2c_dbg("[GPIO] Setting up interrupt: pin=%u trigger=%s polarity=%s "
-            "source=%s\n",
-            pin,
-            crs->gpio_int.triggering ? "edge" : "level",
-            crs->gpio_int.polarity == 0 ? "high" :
-            crs->gpio_int.polarity == 1 ? "low" : "both",
-            gpio_path);
+	i2c_dbg("[GPIO] Setting up interrupt: pin=%u trigger=%s polarity=%s "
+		"source=%s\n",
+		pin, crs->gpio_int.triggering ? "edge" : "level",
+		crs->gpio_int.polarity == 0 ? "high" :
+		crs->gpio_int.polarity == 1 ? "low" :
+					      "both",
+		gpio_path);
 
-    // Step 1: Discover GPIO communities from the controller's ACPI _CRS
-    if (g_gpio_community_count == 0 && gpio_path[0]) {
-        gpio_discover_communities(gpio_path);
-    }
+	// Step 1: Discover GPIO communities from the controller's ACPI _CRS
+	if (g_gpio_community_count == 0 && gpio_path[0]) {
+		gpio_discover_communities(gpio_path);
+	}
 
-    if (g_gpio_community_count == 0) {
-        // Fallback: try P2SB SBREG_BAR + known PortIDs
-        i2c_dbg("[GPIO] No communities from ACPI, trying P2SB...\n");
-        g_sbreg_bar = p2sb_get_sbreg_bar();
-        if (g_sbreg_bar) {
-            i2c_dbg("[GPIO] P2SB SBREG_BAR = 0x%llx\n",
-                    (unsigned long long)g_sbreg_bar);
-            // Try known GPIO PortIDs for Intel PCH 600/700
-            // PortIDs: 0xD1-0xD6 are typical for GPIO communities
-            static const uint8_t port_ids[] = {
-                0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6
-            };
-            for (int i = 0; i < 6 && g_gpio_community_count < GPIO_MAX_COMMUNITIES; i++) {
-                uint64_t phys = g_sbreg_bar + ((uint64_t)port_ids[i] << 16);
-                uint64_t va = mm_map_device_mmio(phys, 1);
-                if (!va) continue;
+	if (g_gpio_community_count == 0) {
+		// Fallback: try P2SB SBREG_BAR + known PortIDs
+		i2c_dbg("[GPIO] No communities from ACPI, trying P2SB...\n");
+		g_sbreg_bar = p2sb_get_sbreg_bar();
+		if (g_sbreg_bar) {
+			i2c_dbg("[GPIO] P2SB SBREG_BAR = 0x%llx\n",
+				(unsigned long long)g_sbreg_bar);
+			// Try known GPIO PortIDs for Intel PCH 600/700
+			// PortIDs: 0xD1-0xD6 are typical for GPIO communities
+			static const uint8_t port_ids[] = { 0xD1, 0xD2, 0xD3,
+							    0xD4, 0xD5, 0xD6 };
+			for (int i = 0; i < 6 && g_gpio_community_count <
+							 GPIO_MAX_COMMUNITIES;
+			     i++) {
+				uint64_t phys = g_sbreg_bar +
+						((uint64_t)port_ids[i] << 16);
+				uint64_t va = mm_map_device_mmio(phys, 1);
+				if (!va)
+					continue;
 
-                gpio_community_t *comm = &g_gpio_communities[g_gpio_community_count];
-                i2c_memset(comm, 0, sizeof(*comm));
-                comm->base = (volatile uint32_t *)va;
-                comm->phys = phys;
+				gpio_community_t *comm =
+					&g_gpio_communities
+						[g_gpio_community_count];
+				i2c_memset(comm, 0, sizeof(*comm));
+				comm->base = (volatile uint32_t *)va;
+				comm->phys = phys;
 
-                uint32_t misccfg = gpio_comm_read32(comm, GPIO_MISCCFG);
-                uint32_t padbar = gpio_comm_read32(comm, GPIO_PADBAR) & 0xFFFF;
+				uint32_t misccfg =
+					gpio_comm_read32(comm, GPIO_MISCCFG);
+				uint32_t padbar =
+					gpio_comm_read32(comm, GPIO_PADBAR) &
+					0xFFFF;
 
-                // Validate: PADBAR should be a reasonable value (0x400-0xC00)
-                if (padbar < 0x400 || padbar > 0xC00) continue;
+				// Validate: PADBAR should be a reasonable value (0x400-0xC00)
+				if (padbar < 0x400 || padbar > 0xC00)
+					continue;
 
-                comm->irq_line = (misccfg & GPIO_MISCCFG_GPDMINTSEL_MASK)
-                                 >> GPIO_MISCCFG_GPDMINTSEL_SHIFT;
+				comm->irq_line =
+					(misccfg &
+					 GPIO_MISCCFG_GPDMINTSEL_MASK) >>
+					GPIO_MISCCFG_GPDMINTSEL_SHIFT;
 
-                i2c_dbg("[GPIO] P2SB PortID 0x%02x: MISCCFG=0x%08x "
-                        "GPDMINTSEL=%u PADBAR=0x%x\n",
-                        port_ids[i], misccfg, comm->irq_line, padbar);
+				i2c_dbg("[GPIO] P2SB PortID 0x%02x: MISCCFG=0x%08x "
+					"GPDMINTSEL=%u PADBAR=0x%x\n",
+					port_ids[i], misccfg, comm->irq_line,
+					padbar);
 
-                g_gpio_community_count++;
-            }
-        }
-    }
+				g_gpio_community_count++;
+			}
+		}
+	}
 
-    if (g_gpio_community_count == 0) {
-        i2c_dbg("[GPIO] No GPIO communities found\n");
-        return -1;
-    }
+	if (g_gpio_community_count == 0) {
+		i2c_dbg("[GPIO] No GPIO communities found\n");
+		return -1;
+	}
 
-    // Step 2: Find which community contains our pin
-    uint32_t pad_offset = 0;
-    uint8_t gpi_group = 0, gpi_bit = 0;
-    int ci = gpio_find_pin_community(pin, &pad_offset, &gpi_group, &gpi_bit);
-    if (ci < 0) return -1;
+	// Step 2: Find which community contains our pin
+	uint32_t pad_offset = 0;
+	uint8_t gpi_group = 0, gpi_bit = 0;
+	int ci =
+		gpio_find_pin_community(pin, &pad_offset, &gpi_group, &gpi_bit);
+	if (ci < 0)
+		return -1;
 
-    gpio_community_t *comm = &g_gpio_communities[ci];
+	gpio_community_t *comm = &g_gpio_communities[ci];
 
-    // Step 3: Configure the pad for interrupt delivery
-    gpio_configure_pad_interrupt(comm, pad_offset, gpi_group, gpi_bit,
-                                 crs->gpio_int.triggering,
-                                 crs->gpio_int.polarity);
+	// Step 3: Configure the pad for interrupt delivery
+	gpio_configure_pad_interrupt(comm, pad_offset, gpi_group, gpi_bit,
+				     crs->gpio_int.triggering,
+				     crs->gpio_int.polarity);
 
-    // Step 4: Route IOAPIC GSI → IDT vector
-    uint8_t gsi = comm->irq_line;
-    uint8_t vector = GPIO_IRQ_VECTOR_BASE;  // All GPIO communities share one vector
+	// Step 4: Route IOAPIC GSI → IDT vector
+	uint8_t gsi = comm->irq_line;
+	uint8_t vector =
+		GPIO_IRQ_VECTOR_BASE; // All GPIO communities share one vector
 
-    // Use the GPIO controller's _CRS IRQ polarity and trigger for the IOAPIC.
-    // This describes the GPIO community's interrupt output to the IOAPIC,
-    // NOT the individual pad's polarity.  Typically active-low, level-triggered.
-    uint8_t ioapic_polarity = g_gpio_ioapic_polarity ?
-                              IOAPIC_POLARITY_LOW : IOAPIC_POLARITY_HIGH;
-    uint8_t ioapic_trigger  = g_gpio_ioapic_trigger ?
-                              IOAPIC_TRIGGER_EDGE : IOAPIC_TRIGGER_LEVEL;
+	// Use the GPIO controller's _CRS IRQ polarity and trigger for the IOAPIC.
+	// This describes the GPIO community's interrupt output to the IOAPIC,
+	// NOT the individual pad's polarity.  Typically active-low, level-triggered.
+	uint8_t ioapic_polarity = g_gpio_ioapic_polarity ? IOAPIC_POLARITY_LOW :
+							   IOAPIC_POLARITY_HIGH;
+	uint8_t ioapic_trigger = g_gpio_ioapic_trigger ? IOAPIC_TRIGGER_EDGE :
+							 IOAPIC_TRIGGER_LEVEL;
 
-    i2c_dbg("[GPIO] Routing IOAPIC GSI %u -> vector %u\n", gsi, vector);
-    if (ioapic_configure_legacy_irq(gsi, vector, ioapic_polarity,
-                                    ioapic_trigger) != 0) {
-        kprintf("[GPIO] IOAPIC routing failed for GSI %u\n", gsi);
-        return -1;
-    }
+	i2c_dbg("[GPIO] Routing IOAPIC GSI %u -> vector %u\n", gsi, vector);
+	if (ioapic_configure_legacy_irq(gsi, vector, ioapic_polarity,
+					ioapic_trigger) != 0) {
+		kprintf("[GPIO] IOAPIC routing failed for GSI %u\n", gsi);
+		return -1;
+	}
 
-    // Step 5: Store GPIO state in the HID device
-    dev->gpio_pin = pin;
-    dev->gpio_community = (uint8_t)ci;
-    dev->gpio_gpi_group = gpi_group;
-    dev->gpio_gpi_bit = gpi_bit;
-    dev->gpio_irq_vector = vector;
-    dev->gpio_irq_active = 1;
-    dev->gpio_irq_pending = 0;
-    dev->gpio_pad_offset = pad_offset;
-    // Save the expected PAD_CFG_DW0 (critical bits) for runtime verification.
-    // If BIOS/SMI changes these, we can detect and repair.
-    dev->gpio_pad_dw0 = gpio_comm_read32(comm, pad_offset + GPIO_PAD_CFG_DW0);
+	// Step 5: Store GPIO state in the HID device
+	dev->gpio_pin = pin;
+	dev->gpio_community = (uint8_t)ci;
+	dev->gpio_gpi_group = gpi_group;
+	dev->gpio_gpi_bit = gpi_bit;
+	dev->gpio_irq_vector = vector;
+	dev->gpio_irq_active = 1;
+	dev->gpio_irq_pending = 0;
+	dev->gpio_pad_offset = pad_offset;
+	// Save the expected PAD_CFG_DW0 (critical bits) for runtime verification.
+	// If BIOS/SMI changes these, we can detect and repair.
+	dev->gpio_pad_dw0 =
+		gpio_comm_read32(comm, pad_offset + GPIO_PAD_CFG_DW0);
 
-    // Step 6: Clear any pending GPI_IS from init
-    {
-        uint16_t is_base = g_gpio_platform ? g_gpio_platform->gpi_is_offset : 0x100;
-        uint32_t is_reg = is_base + gpi_group * 4;
-        gpio_comm_write32(comm, is_reg, (1u << gpi_bit));
-    }
+	// Step 6: Clear any pending GPI_IS from init
+	{
+		uint16_t is_base = g_gpio_platform ?
+					   g_gpio_platform->gpi_is_offset :
+					   0x100;
+		uint32_t is_reg = is_base + gpi_group * 4;
+		gpio_comm_write32(comm, is_reg, (1u << gpi_bit));
+	}
 
-    kprintf("[GPIO] Interrupt configured: pin=%u community=%d "
-            "GSI=%u vector=%u\n", pin, ci, gsi, vector);
-    return 0;
+	kprintf("[GPIO] Interrupt configured: pin=%u community=%d "
+		"GSI=%u vector=%u\n",
+		pin, ci, gsi, vector);
+	return 0;
 }
 
 // ============================================================================
 // Public API
 // ============================================================================
 
-int i2c_hid_init(void) {
-    kprintf("[I2C-HID] Initializing I2C HID subsystem\n");
+int i2c_hid_init(void)
+{
+	kprintf("[I2C-HID] Initializing I2C HID subsystem\n");
 #ifdef BUILD_DATE
-    i2c_dbg("[I2C-HID] Build: %s\n", BUILD_DATE);
+	i2c_dbg("[I2C-HID] Build: %s\n", BUILD_DATE);
 #endif
 
-    i2c_memset(g_i2c_controllers, 0, sizeof(g_i2c_controllers));
-    i2c_memset(g_i2c_hid_devices, 0, sizeof(g_i2c_hid_devices));
-    g_i2c_controller_count = 0;
-    g_i2c_hid_device_count = 0;
+	i2c_memset(g_i2c_controllers, 0, sizeof(g_i2c_controllers));
+	i2c_memset(g_i2c_hid_devices, 0, sizeof(g_i2c_hid_devices));
+	g_i2c_controller_count = 0;
+	g_i2c_hid_device_count = 0;
 
-    if (!has_intel_lpss_i2c_controller()) {
-        kprintf("[I2C-HID] No Intel LPSS I2C PCI controllers present\n");
-        return 0;
-    }
+	if (!has_intel_lpss_i2c_controller()) {
+		kprintf("[I2C-HID] No Intel LPSS I2C PCI controllers present\n");
+		return 0;
+	}
 
-    // Detect and initialize I2C controllers
-    int nctrl = detect_i2c_controllers();
+	// Detect and initialize I2C controllers
+	int nctrl = detect_i2c_controllers();
 
-    if (nctrl == 0) {
-        kprintf("[I2C-HID] No Intel LPSS I2C controllers initialized\n");
-        return -1;  // Hardware present but init failed — caller can debug halt
-    }
-    kprintf("[I2C-HID] Found %d I2C controller(s)\n", nctrl);
+	if (nctrl == 0) {
+		kprintf("[I2C-HID] No Intel LPSS I2C controllers initialized\n");
+		return -1; // Hardware present but init failed — caller can debug halt
+	}
+	kprintf("[I2C-HID] Found %d I2C controller(s)\n", nctrl);
 
-    for (int c = 0; c < g_i2c_controller_count; c++) {
-        i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
-        if (!ctrl->active) continue;
+	for (int c = 0; c < g_i2c_controller_count; c++) {
+		i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
+		if (!ctrl->active)
+			continue;
 
-        int found_via_acpi = 0;
+		int found_via_acpi = 0;
 
-        // Discover I2C HID devices via ACPI: find PNP0C50/ACPI0C50 child
-        // devices whose ACPI path starts with this controller's path, then
-        // evaluate _CRS on the child to get the I2C slave address + speed.
-        if (ctrl->acpi_path[0]) {
-            static const char *const hid_ids[] = { "PNP0C50", "ACPI0C50" };
-            size_t ctrl_path_len = kstrlen(ctrl->acpi_path);
+		// Discover I2C HID devices via ACPI: find PNP0C50/ACPI0C50 child
+		// devices whose ACPI path starts with this controller's path, then
+		// evaluate _CRS on the child to get the I2C slave address + speed.
+		if (ctrl->acpi_path[0]) {
+			static const char *const hid_ids[] = { "PNP0C50",
+							       "ACPI0C50" };
+			size_t ctrl_path_len = kstrlen(ctrl->acpi_path);
 
-            for (int hi = 0; hi < 2 && !found_via_acpi; hi++) {
-                acpi_aml_device_info_t devs[4];
-                int ndev = acpi_aml_find_devices_by_hid(hid_ids[hi], devs, 4);
-                for (int di = 0; di < ndev; di++) {
-                    // Check if this HID device is a child of our controller
-                    if (kstrncmp(devs[di].path, ctrl->acpi_path, ctrl_path_len) != 0)
-                        continue;
-                    // Must be a direct child: next char after prefix is '.'
-                    if (devs[di].path[ctrl_path_len] != '.')
-                        continue;
+			for (int hi = 0; hi < 2 && !found_via_acpi; hi++) {
+				acpi_aml_device_info_t devs[4];
+				int ndev = acpi_aml_find_devices_by_hid(
+					hid_ids[hi], devs, 4);
+				for (int di = 0; di < ndev; di++) {
+					// Check if this HID device is a child of our controller
+					if (kstrncmp(devs[di].path,
+						     ctrl->acpi_path,
+						     ctrl_path_len) != 0)
+						continue;
+					// Must be a direct child: next char after prefix is '.'
+					if (devs[di].path[ctrl_path_len] != '.')
+						continue;
 
-                    i2c_dbg("[I2C%d] ACPI child: %s (HID=%s)\n",
-                            ctrl->bus_id, devs[di].path, hid_ids[hi]);
+					i2c_dbg("[I2C%d] ACPI child: %s (HID=%s)\n",
+						ctrl->bus_id, devs[di].path,
+						hid_ids[hi]);
 
-                    acpi_crs_result_t crs;
-                    if (acpi_aml_eval_crs(devs[di].path, &crs) == 0) {
-                        for (uint8_t ci = 0; ci < crs.i2c_device_count; ci++) {
-                            uint16_t addr = crs.i2c_devices[ci].slave_addr;
-                            if (addr >= 0x08 && addr <= 0x77) {
-                                i2c_dbg("[I2C%d] _CRS: slave 0x%02x speed=%u\n",
-                                        ctrl->bus_id, addr,
-                                        crs.i2c_devices[ci].connection_speed);
-                                int dev_idx = g_i2c_hid_device_count;
-                                i2c_hid_probe_device(ctrl, addr,
-                                             crs.i2c_devices[ci].connection_speed);
-                                if (dev_idx < g_i2c_hid_device_count) {
-                                    // Store ACPI path for power management
-                                    int plen = 0;
-                                    while (devs[di].path[plen] && plen < 63) plen++;
-                                    i2c_memcpy(g_i2c_hid_devices[dev_idx].acpi_path,
-                                               devs[di].path, plen);
-                                    g_i2c_hid_devices[dev_idx].acpi_path[plen] = '\0';
-                                }
-                                // Log and save GpioInt info for later interrupt setup
-                                if (crs.gpio_int.valid &&
-                                    dev_idx < g_i2c_hid_device_count) {
-                                    i2c_dbg("[I2C%d] _CRS GpioInt: pin=%u "
-                                            "trigger=%s pol=%s src=%s\n",
-                                            ctrl->bus_id,
-                                            crs.gpio_int.pin,
-                                            crs.gpio_int.triggering ? "edge" : "level",
-                                            crs.gpio_int.polarity == 0 ? "high" :
-                                            crs.gpio_int.polarity == 1 ? "low" : "both",
-                                            crs.gpio_int.resource_source);
-                                    g_i2c_hid_devices[dev_idx].gpio_pin =
-                                        crs.gpio_int.pin;
-                                }
-                                found_via_acpi++;
-                            }
-                        }
-                    }
-                }
-            }
+					acpi_crs_result_t crs;
+					if (acpi_aml_eval_crs(devs[di].path,
+							      &crs) == 0) {
+						for (uint8_t ci = 0;
+						     ci < crs.i2c_device_count;
+						     ci++) {
+							uint16_t addr =
+								crs.i2c_devices[ci]
+									.slave_addr;
+							if (addr >= 0x08 &&
+							    addr <= 0x77) {
+								i2c_dbg("[I2C%d] _CRS: slave 0x%02x speed=%u\n",
+									ctrl->bus_id,
+									addr,
+									crs.i2c_devices[ci]
+										.connection_speed);
+								int dev_idx =
+									g_i2c_hid_device_count;
+								i2c_hid_probe_device(
+									ctrl,
+									addr,
+									crs.i2c_devices[ci]
+										.connection_speed);
+								if (dev_idx <
+								    g_i2c_hid_device_count) {
+									// Store ACPI path for power management
+									int plen =
+										0;
+									while (devs[di].path
+										       [plen] &&
+									       plen < 63)
+										plen++;
+									i2c_memcpy(
+										g_i2c_hid_devices
+											[dev_idx]
+												.acpi_path,
+										devs[di].path,
+										plen);
+									g_i2c_hid_devices[dev_idx]
+										.acpi_path
+											[plen] =
+										'\0';
+								}
+								// Log and save GpioInt info for later interrupt setup
+								if (crs.gpio_int
+									    .valid &&
+								    dev_idx <
+									    g_i2c_hid_device_count) {
+									i2c_dbg("[I2C%d] _CRS GpioInt: pin=%u "
+										"trigger=%s pol=%s src=%s\n",
+										ctrl->bus_id,
+										crs.gpio_int
+											.pin,
+										crs.gpio_int.triggering ?
+											"edge" :
+											"level",
+										crs.gpio_int.polarity ==
+												0 ?
+											"high" :
+										crs.gpio_int.polarity ==
+												1 ?
+											"low" :
+											"both",
+										crs.gpio_int
+											.resource_source);
+									g_i2c_hid_devices
+										[dev_idx]
+											.gpio_pin =
+										crs.gpio_int
+											.pin;
+								}
+								found_via_acpi++;
+							}
+						}
+					}
+				}
+			}
 
-            // Fallback: walk direct children of controller ACPI node.
-            // Some devices (e.g. ITE VEN_0488) use vendor _HID with _CID=PNP0C50
-            // but AcpiGetDevices() may not match _CID on all ACPICA builds.
-            if (!found_via_acpi) {
-                acpi_aml_device_info_t children[4];
-                int nch = acpi_aml_find_children(ctrl->acpi_path, children, 4);
-                for (int di = 0; di < nch; di++) {
-                    // Only consider children that have _CRS
-                    if (!children[di].has_crs) continue;
+			// Fallback: walk direct children of controller ACPI node.
+			// Some devices (e.g. ITE VEN_0488) use vendor _HID with _CID=PNP0C50
+			// but AcpiGetDevices() may not match _CID on all ACPICA builds.
+			if (!found_via_acpi) {
+				acpi_aml_device_info_t children[4];
+				int nch = acpi_aml_find_children(
+					ctrl->acpi_path, children, 4);
+				for (int di = 0; di < nch; di++) {
+					// Only consider children that have _CRS
+					if (!children[di].has_crs)
+						continue;
 
-                    acpi_crs_result_t crs;
-                    if (acpi_aml_eval_crs(children[di].path, &crs) != 0)
-                        continue;
-                    if (crs.i2c_device_count == 0) continue;
+					acpi_crs_result_t crs;
+					if (acpi_aml_eval_crs(children[di].path,
+							      &crs) != 0)
+						continue;
+					if (crs.i2c_device_count == 0)
+						continue;
 
-                    i2c_dbg("[I2C%d] ACPI child: %s (HID=%s CID=%s)\n",
-                            ctrl->bus_id, children[di].path,
-                            children[di].hid, children[di].cid);
+					i2c_dbg("[I2C%d] ACPI child: %s (HID=%s CID=%s)\n",
+						ctrl->bus_id, children[di].path,
+						children[di].hid,
+						children[di].cid);
 
-                    for (uint8_t ci = 0; ci < crs.i2c_device_count; ci++) {
-                        uint16_t addr = crs.i2c_devices[ci].slave_addr;
-                        if (addr >= 0x08 && addr <= 0x77) {
-                            i2c_dbg("[I2C%d] _CRS: slave 0x%02x speed=%u\n",
-                                    ctrl->bus_id, addr,
-                                    crs.i2c_devices[ci].connection_speed);
-                            int dev_idx = g_i2c_hid_device_count;
-                                i2c_hid_probe_device(ctrl, addr,
-                                         crs.i2c_devices[ci].connection_speed);
-                            if (dev_idx < g_i2c_hid_device_count) {
-                                // Store ACPI path for power management
-                                int plen = 0;
-                                while (children[di].path[plen] && plen < 63) plen++;
-                                i2c_memcpy(g_i2c_hid_devices[dev_idx].acpi_path,
-                                           children[di].path, plen);
-                                g_i2c_hid_devices[dev_idx].acpi_path[plen] = '\0';
-                            }
-                            if (crs.gpio_int.valid &&
-                                dev_idx < g_i2c_hid_device_count) {
-                                i2c_dbg("[I2C%d] _CRS GpioInt: pin=%u "
-                                        "trigger=%s pol=%s src=%s\n",
-                                        ctrl->bus_id,
-                                        crs.gpio_int.pin,
-                                        crs.gpio_int.triggering ? "edge" : "level",
-                                        crs.gpio_int.polarity == 0 ? "high" :
-                                        crs.gpio_int.polarity == 1 ? "low" : "both",
-                                        crs.gpio_int.resource_source);
-                                g_i2c_hid_devices[dev_idx].gpio_pin =
-                                    crs.gpio_int.pin;
-                            }
-                            found_via_acpi++;
-                        }
-                    }
-                }
-            }
-        }
+					for (uint8_t ci = 0;
+					     ci < crs.i2c_device_count; ci++) {
+						uint16_t addr =
+							crs.i2c_devices[ci]
+								.slave_addr;
+						if (addr >= 0x08 &&
+						    addr <= 0x77) {
+							i2c_dbg("[I2C%d] _CRS: slave 0x%02x speed=%u\n",
+								ctrl->bus_id,
+								addr,
+								crs.i2c_devices[ci]
+									.connection_speed);
+							int dev_idx =
+								g_i2c_hid_device_count;
+							i2c_hid_probe_device(
+								ctrl, addr,
+								crs.i2c_devices[ci]
+									.connection_speed);
+							if (dev_idx <
+							    g_i2c_hid_device_count) {
+								// Store ACPI path for power management
+								int plen = 0;
+								while (children[di]
+									       .path[plen] &&
+								       plen < 63)
+									plen++;
+								i2c_memcpy(
+									g_i2c_hid_devices
+										[dev_idx]
+											.acpi_path,
+									children[di]
+										.path,
+									plen);
+								g_i2c_hid_devices[dev_idx]
+									.acpi_path
+										[plen] =
+									'\0';
+							}
+							if (crs.gpio_int
+								    .valid &&
+							    dev_idx <
+								    g_i2c_hid_device_count) {
+								i2c_dbg("[I2C%d] _CRS GpioInt: pin=%u "
+									"trigger=%s pol=%s src=%s\n",
+									ctrl->bus_id,
+									crs.gpio_int
+										.pin,
+									crs.gpio_int.triggering ?
+										"edge" :
+										"level",
+									crs.gpio_int.polarity ==
+											0 ?
+										"high" :
+									crs.gpio_int.polarity ==
+											1 ?
+										"low" :
+										"both",
+									crs.gpio_int
+										.resource_source);
+								g_i2c_hid_devices
+									[dev_idx]
+										.gpio_pin =
+									crs.gpio_int
+										.pin;
+							}
+							found_via_acpi++;
+						}
+					}
+				}
+			}
+		}
 
-        // Fall back to full bus scan if ACPI didn't find devices
-        if (!found_via_acpi) {
-            dw_i2c_scan_bus(ctrl);
-            for (uint16_t addr = 0x08; addr <= 0x77; addr++) {
-                if (dw_i2c_probe_addr(ctrl, addr) != 0)
-                    continue;
-                i2c_hid_probe_device(ctrl, addr, 0);
-            }
-        }
-    }
+		// Fall back to full bus scan if ACPI didn't find devices
+		if (!found_via_acpi) {
+			dw_i2c_scan_bus(ctrl);
+			for (uint16_t addr = 0x08; addr <= 0x77; addr++) {
+				if (dw_i2c_probe_addr(ctrl, addr) != 0)
+					continue;
+				i2c_hid_probe_device(ctrl, addr, 0);
+			}
+		}
+	}
 
-    // Initialize all discovered HID devices
-    for (int d = 0; d < g_i2c_hid_device_count; d++) {
-        i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+	// Initialize all discovered HID devices
+	for (int d = 0; d < g_i2c_hid_device_count; d++) {
+		i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
 
-        // ACPI power management: call _PS0 and resolve _DEP dependencies
-        // This is critical — without it, the device firmware may not fully
-        // initialize and will return empty input reports.
-        if (dev->acpi_path[0]) {
-            i2c_dbg("[I2C-HID] ACPI power-on: %s\n", dev->acpi_path);
+		// ACPI power management: call _PS0 and resolve _DEP dependencies
+		// This is critical — without it, the device firmware may not fully
+		// initialize and will return empty input reports.
+		if (dev->acpi_path[0]) {
+			i2c_dbg("[I2C-HID] ACPI power-on: %s\n",
+				dev->acpi_path);
 
-            // Power on device and all _DEP dependencies (GPIO, I2C host, etc.)
-            int pw_rc = acpi_power_on_device_with_deps(dev->acpi_path);
-            i2c_dbg("[I2C-HID] acpi_power_on_device_with_deps: rc=%d\n", pw_rc);
+			// Power on device and all _DEP dependencies (GPIO, I2C host, etc.)
+			int pw_rc =
+				acpi_power_on_device_with_deps(dev->acpi_path);
+			i2c_dbg("[I2C-HID] acpi_power_on_device_with_deps: rc=%d\n",
+				pw_rc);
 
-            // Also try direct _PS0 on the device itself
-            uint64_t ps0_ret = 0;
-            int ps0_rc = acpi_aml_exec_device_method(dev->acpi_path, "_PS0",
-                                                      &ps0_ret);
-            i2c_dbg("[I2C-HID] _PS0: rc=%d ret=%llu\n", ps0_rc,
-                    (unsigned long long)ps0_ret);
+			// Also try direct _PS0 on the device itself
+			uint64_t ps0_ret = 0;
+			int ps0_rc = acpi_aml_exec_device_method(
+				dev->acpi_path, "_PS0", &ps0_ret);
+			i2c_dbg("[I2C-HID] _PS0: rc=%d ret=%llu\n", ps0_rc,
+				(unsigned long long)ps0_ret);
 
-            // Call _DSM function 1 (HID descriptor register address)
-            // Microsoft HID-over-I2C _DSM: 3cdff6f7-4267-4555-ad05-b30a3d8938de
-            // This may have firmware-level side effects that enable the device.
-            static const uint8_t hid_i2c_dsm_uuid[16] = {
-                0xf7, 0xf6, 0xdf, 0x3c, 0x67, 0x42, 0x55, 0x45,
-                0xad, 0x05, 0xb3, 0x0a, 0x3d, 0x89, 0x38, 0xde
-            };
-            aml_value_t dsm_result;
-            i2c_memset(&dsm_result, 0, sizeof(dsm_result));
-            int dsm_rc = acpi_aml_call_dsm(dev->acpi_path, hid_i2c_dsm_uuid,
-                                            1, 1, &dsm_result);
-            if (dsm_rc == 0) {
-                uint64_t dsm_val = aml_value_to_integer(&dsm_result);
-                i2c_dbg("[I2C-HID] _DSM(1): rc=%d val=0x%llx\n", dsm_rc,
-                        (unsigned long long)dsm_val);
-            } else {
-                i2c_dbg("[I2C-HID] _DSM(1): rc=%d (no _DSM)\n", dsm_rc);
-            }
+			// Call _DSM function 1 (HID descriptor register address)
+			// Microsoft HID-over-I2C _DSM: 3cdff6f7-4267-4555-ad05-b30a3d8938de
+			// This may have firmware-level side effects that enable the device.
+			static const uint8_t hid_i2c_dsm_uuid[16] = {
+				0xf7, 0xf6, 0xdf, 0x3c, 0x67, 0x42, 0x55, 0x45,
+				0xad, 0x05, 0xb3, 0x0a, 0x3d, 0x89, 0x38, 0xde
+			};
+			aml_value_t dsm_result;
+			i2c_memset(&dsm_result, 0, sizeof(dsm_result));
+			int dsm_rc = acpi_aml_call_dsm(dev->acpi_path,
+						       hid_i2c_dsm_uuid, 1, 1,
+						       &dsm_result);
+			if (dsm_rc == 0) {
+				uint64_t dsm_val =
+					aml_value_to_integer(&dsm_result);
+				i2c_dbg("[I2C-HID] _DSM(1): rc=%d val=0x%llx\n",
+					dsm_rc, (unsigned long long)dsm_val);
+			} else {
+				i2c_dbg("[I2C-HID] _DSM(1): rc=%d (no _DSM)\n",
+					dsm_rc);
+			}
 
-            i2c_delay_us(10000);  // 10ms settle after ACPI power-on
-        }
+			i2c_delay_us(10000); // 10ms settle after ACPI power-on
+		}
 
-        i2c_hid_init_device(dev);
-    }
+		i2c_hid_init_device(dev);
+	}
 
-    // Set up GPIO interrupts for active HID devices that have GpioInt resources.
-    // This must happen AFTER device init (SET_POWER + RESET) so the device is
-    // ready to signal on the GPIO line.
-    for (int c = 0; c < g_i2c_controller_count; c++) {
-        i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
-        if (!ctrl->active || !ctrl->acpi_path[0]) continue;
+	// Set up GPIO interrupts for active HID devices that have GpioInt resources.
+	// This must happen AFTER device init (SET_POWER + RESET) so the device is
+	// ready to signal on the GPIO line.
+	for (int c = 0; c < g_i2c_controller_count; c++) {
+		i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
+		if (!ctrl->active || !ctrl->acpi_path[0])
+			continue;
 
-        // Walk direct children of the controller — works regardless of _HID
-        acpi_aml_device_info_t children[4];
-        int nch = acpi_aml_find_children(ctrl->acpi_path, children, 4);
-        for (int di = 0; di < nch; di++) {
-            if (!children[di].has_crs) continue;
+		// Walk direct children of the controller — works regardless of _HID
+		acpi_aml_device_info_t children[4];
+		int nch = acpi_aml_find_children(ctrl->acpi_path, children, 4);
+		for (int di = 0; di < nch; di++) {
+			if (!children[di].has_crs)
+				continue;
 
-            acpi_crs_result_t crs;
-            i2c_memset(&crs, 0, sizeof(crs));
-            if (acpi_aml_eval_crs(children[di].path, &crs) != 0)
-                continue;
-            if (!crs.gpio_int.valid || crs.i2c_device_count == 0)
-                continue;
+			acpi_crs_result_t crs;
+			i2c_memset(&crs, 0, sizeof(crs));
+			if (acpi_aml_eval_crs(children[di].path, &crs) != 0)
+				continue;
+			if (!crs.gpio_int.valid || crs.i2c_device_count == 0)
+				continue;
 
-            // Find the HID device matching this I2C address
-            for (uint8_t ci2 = 0; ci2 < crs.i2c_device_count; ci2++) {
-                uint16_t addr = crs.i2c_devices[ci2].slave_addr;
-                for (int d = 0; d < g_i2c_hid_device_count; d++) {
-                    i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
-                    if (dev->ctrl == ctrl && dev->i2c_addr == addr &&
-                        dev->active) {
-                        gpio_setup_hid_interrupt(dev, &crs);
-                    }
-                }
-            }
-        }
-    }
+			// Find the HID device matching this I2C address
+			for (uint8_t ci2 = 0; ci2 < crs.i2c_device_count;
+			     ci2++) {
+				uint16_t addr = crs.i2c_devices[ci2].slave_addr;
+				for (int d = 0; d < g_i2c_hid_device_count;
+				     d++) {
+					i2c_hid_device_t *dev =
+						&g_i2c_hid_devices[d];
+					if (dev->ctrl == ctrl &&
+					    dev->i2c_addr == addr &&
+					    dev->active) {
+						gpio_setup_hid_interrupt(dev,
+									 &crs);
+					}
+				}
+			}
+		}
+	}
 
-    if (g_i2c_hid_device_count > 0) {
-        kprintf("[I2C-HID] %d HID device(s) active\n", g_i2c_hid_device_count);
-    } else {
-        kprintf("[I2C-HID] No I2C HID devices found\n");
-    }
+	if (g_i2c_hid_device_count > 0) {
+		kprintf("[I2C-HID] %d HID device(s) active\n",
+			g_i2c_hid_device_count);
+	} else {
+		kprintf("[I2C-HID] No I2C HID devices found\n");
+	}
 
-    // ---- Initialize spinlocks on controllers and devices ----
-    for (int c = 0; c < g_i2c_controller_count; c++) {
-        i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
-        if (!ctrl->active) continue;
-        spinlock_init(&ctrl->lock, "i2c_ctrl");
-        ctrl->worker_running = 0;
-    }
-    for (int d = 0; d < g_i2c_hid_device_count; d++) {
-        i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
-        spinlock_init(&dev->dev_lock, "i2c_hid_dev");
-        dev->work_pending = 0;
-        // Use the device struct address itself as the unique wake channel
-        dev->worker_channel = (void *)dev;
-    }
+	// ---- Initialize spinlocks on controllers and devices ----
+	for (int c = 0; c < g_i2c_controller_count; c++) {
+		i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
+		if (!ctrl->active)
+			continue;
+		spinlock_init(&ctrl->lock, "i2c_ctrl");
+		ctrl->worker_running = 0;
+	}
+	for (int d = 0; d < g_i2c_hid_device_count; d++) {
+		i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+		spinlock_init(&dev->dev_lock, "i2c_hid_dev");
+		dev->work_pending = 0;
+		// Use the device struct address itself as the unique wake channel
+		dev->worker_channel = (void *)dev;
+	}
 
-    // ---- Spawn one worker thread per controller that has active HID devices ----
-    for (int c = 0; c < g_i2c_controller_count; c++) {
-        i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
-        if (!ctrl->active) continue;
+	// ---- Spawn one worker thread per controller that has active HID devices ----
+	for (int c = 0; c < g_i2c_controller_count; c++) {
+		i2c_dw_controller_t *ctrl = &g_i2c_controllers[c];
+		if (!ctrl->active)
+			continue;
 
-        // Check if any active HID device lives on this controller
-        int has_dev = 0;
-        for (int d = 0; d < g_i2c_hid_device_count; d++) {
-            if (g_i2c_hid_devices[d].ctrl == ctrl && g_i2c_hid_devices[d].active) {
-                has_dev = 1;
-                break;
-            }
-        }
-        if (!has_dev) continue;
+		// Check if any active HID device lives on this controller
+		int has_dev = 0;
+		for (int d = 0; d < g_i2c_hid_device_count; d++) {
+			if (g_i2c_hid_devices[d].ctrl == ctrl &&
+			    g_i2c_hid_devices[d].active) {
+				has_dev = 1;
+				break;
+			}
+		}
+		if (!has_dev)
+			continue;
 
-        void *stack = kalloc(16384);
-        if (!stack) {
-            kprintf("[I2C-HID] Failed to allocate worker stack for I2C%d\n",
-                    ctrl->bus_id);
-            continue;
-        }
-        ctrl->worker_running = 1;
-        sched_add_task(i2c_hid_worker_thread, ctrl, stack, 16384);
-        kprintf("[I2C-HID] Worker thread created for I2C%d\n", ctrl->bus_id);
-    }
+		void *stack = kalloc(16384);
+		if (!stack) {
+			kprintf("[I2C-HID] Failed to allocate worker stack for I2C%d\n",
+				ctrl->bus_id);
+			continue;
+		}
+		ctrl->worker_running = 1;
+		sched_add_task(i2c_hid_worker_thread, ctrl, stack, 16384);
+		kprintf("[I2C-HID] Worker thread created for I2C%d\n",
+			ctrl->bus_id);
+	}
 
-    return g_i2c_controller_count;
+	return g_i2c_controller_count;
 }
 
 // ============================================================================
@@ -4204,238 +4741,250 @@ int i2c_hid_init(void) {
 
 // Extract a signed field from a HID input report at arbitrary bit offset/size
 static int32_t extract_field(const uint8_t *data, uint16_t bit_offset,
-                             uint16_t bit_size)
+			     uint16_t bit_size)
 {
-    if (bit_size == 0 || bit_size > 32) return 0;
-    uint32_t val = 0;
-    for (uint16_t i = 0; i < bit_size; i++) {
-        uint16_t bit = bit_offset + i;
-        if (data[bit / 8] & (1u << (bit % 8)))
-            val |= (1u << i);
-    }
-    // Sign-extend if MSB is set
-    if (val & (1u << (bit_size - 1)))
-        val |= ~((1u << bit_size) - 1);
-    return (int32_t)val;
+	if (bit_size == 0 || bit_size > 32)
+		return 0;
+	uint32_t val = 0;
+	for (uint16_t i = 0; i < bit_size; i++) {
+		uint16_t bit = bit_offset + i;
+		if (data[bit / 8] & (1u << (bit % 8)))
+			val |= (1u << i);
+	}
+	// Sign-extend if MSB is set
+	if (val & (1u << (bit_size - 1)))
+		val |= ~((1u << bit_size) - 1);
+	return (int32_t)val;
 }
 
 // Extract an unsigned field from a HID input report
 static uint32_t extract_field_unsigned(const uint8_t *data, uint16_t bit_offset,
-                                       uint16_t bit_size)
+				       uint16_t bit_size)
 {
-    if (bit_size == 0 || bit_size > 32) return 0;
-    uint32_t val = 0;
-    for (uint16_t i = 0; i < bit_size; i++) {
-        uint16_t bit = bit_offset + i;
-        if (data[bit / 8] & (1u << (bit % 8)))
-            val |= (1u << i);
-    }
-    return val;
+	if (bit_size == 0 || bit_size > 32)
+		return 0;
+	uint32_t val = 0;
+	for (uint16_t i = 0; i < bit_size; i++) {
+		uint16_t bit = bit_offset + i;
+		if (data[bit / 8] & (1u << (bit % 8)))
+			val |= (1u << i);
+	}
+	return val;
 }
 
 static void i2c_hid_reset_pointer_tracking(i2c_hid_device_t *dev)
 {
-    dev->has_prev_pos = 0;
-    dev->has_prev_contact_id = 0;
+	dev->has_prev_pos = 0;
+	dev->has_prev_contact_id = 0;
 }
 
 static uint32_t i2c_hid_backoff_delay_ticks(uint16_t error_count)
 {
-    uint32_t hz = (uint32_t)timer_get_frequency();
-    uint32_t delay = hz / 50;
+	uint32_t hz = (uint32_t)timer_get_frequency();
+	uint32_t delay = hz / 50;
 
-    if (delay == 0)
-        delay = 1;
+	if (delay == 0)
+		delay = 1;
 
-    if (error_count > 4)
-        error_count = 4;
+	if (error_count > 4)
+		error_count = 4;
 
-    while (error_count > 1 && delay < hz / 4) {
-        delay <<= 1;
-        error_count--;
-    }
+	while (error_count > 1 && delay < hz / 4) {
+		delay <<= 1;
+		error_count--;
+	}
 
-    if (delay > hz / 4)
-        delay = hz / 4;
+	if (delay > hz / 4)
+		delay = hz / 4;
 
-    return delay;
+	return delay;
 }
 
 static uint16_t i2c_hid_input_read_len(const i2c_hid_device_t *dev)
 {
-    uint16_t read_len = dev->input_buf_size;
+	uint16_t read_len = dev->input_buf_size;
 
-    if (read_len < I2C_HID_LENGTH_HDR_SIZE)
-        read_len = I2C_HID_LENGTH_HDR_SIZE;
+	if (read_len < I2C_HID_LENGTH_HDR_SIZE)
+		read_len = I2C_HID_LENGTH_HDR_SIZE;
 
-    return read_len;
+	return read_len;
 }
 
 static uint32_t i2c_hid_silent_verify_delay_ticks(uint8_t attempts)
 {
-    uint32_t hz = (uint32_t)timer_get_frequency();
-    uint32_t delay;
+	uint32_t hz = (uint32_t)timer_get_frequency();
+	uint32_t delay;
 
-    if (hz == 0)
-        return 1;
+	if (hz == 0)
+		return 1;
 
-    delay = hz;
+	delay = hz;
 
-    if (attempts > 3)
-        attempts = 3;
+	if (attempts > 3)
+		attempts = 3;
 
-    while (attempts > 0 && delay < hz * 8) {
-        delay <<= 1;
-        attempts--;
-    }
+	while (attempts > 0 && delay < hz * 8) {
+		delay <<= 1;
+		attempts--;
+	}
 
-    if (delay > hz * 8)
-        delay = hz * 8;
+	if (delay > hz * 8)
+		delay = hz * 8;
 
-    if (delay == 0)
-        delay = 1;
+	if (delay == 0)
+		delay = 1;
 
-    return delay;
+	return delay;
 }
 
 // Process a mouse/touchpad input report and inject into the mouse subsystem
-static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
-                                   const uint8_t *report, uint16_t report_len)
+static void i2c_hid_process_mouse(i2c_hid_device_t *dev, const uint8_t *report,
+				  uint16_t report_len)
 {
-    i2c_hid_report_info_t *info = &dev->mouse_report;
-    if (info->dev_type != I2C_HID_DEV_MOUSE &&
-        info->dev_type != I2C_HID_DEV_TOUCHPAD)
-        return;
+	i2c_hid_report_info_t *info = &dev->mouse_report;
+	if (info->dev_type != I2C_HID_DEV_MOUSE &&
+	    info->dev_type != I2C_HID_DEV_TOUCHPAD)
+		return;
 
-    if (info->report_bytes && report_len < info->report_bytes) {
-        i2c_hid_reset_pointer_tracking(dev);
-        return;
-    }
+	if (info->report_bytes && report_len < info->report_bytes) {
+		i2c_hid_reset_pointer_tracking(dev);
+		return;
+	}
 
-    // Determine if finger is on surface
-    int finger_down = 1;
-    uint32_t contacts = 0, tip = 0;
-    if (info->has_contact_count) {
-        contacts = extract_field_unsigned(report,
-            info->contact_count.bit_offset, info->contact_count.bit_size);
-        if (contacts == 0) finger_down = 0;
-    }
-    if (info->has_tip_switch) {
-        tip = extract_field_unsigned(report,
-            info->tip_switch.bit_offset, info->tip_switch.bit_size);
-        if (!tip) finger_down = 0;
-    }
+	// Determine if finger is on surface
+	int finger_down = 1;
+	uint32_t contacts = 0, tip = 0;
+	if (info->has_contact_count) {
+		contacts = extract_field_unsigned(
+			report, info->contact_count.bit_offset,
+			info->contact_count.bit_size);
+		if (contacts == 0)
+			finger_down = 0;
+	}
+	if (info->has_tip_switch) {
+		tip = extract_field_unsigned(report,
+					     info->tip_switch.bit_offset,
+					     info->tip_switch.bit_size);
+		if (!tip)
+			finger_down = 0;
+	}
 
-    // When finger lifts, reset absolute position tracking
-    if (!finger_down) {
-        g_dbg_worker_no_finger++;
-        i2c_hid_reset_pointer_tracking(dev);
-        return;
-    }
+	// When finger lifts, reset absolute position tracking
+	if (!finger_down) {
+		g_dbg_worker_no_finger++;
+		i2c_hid_reset_pointer_tracking(dev);
+		return;
+	}
 
-    uint8_t buttons = 0;
-    if (info->buttons.bit_size > 0) {
-        uint32_t btn_raw = extract_field_unsigned(report,
-            info->buttons.bit_offset, info->buttons.bit_size);
-        buttons = (uint8_t)(btn_raw & 0x07);
-    }
+	uint8_t buttons = 0;
+	if (info->buttons.bit_size > 0) {
+		uint32_t btn_raw =
+			extract_field_unsigned(report, info->buttons.bit_offset,
+					       info->buttons.bit_size);
+		buttons = (uint8_t)(btn_raw & 0x07);
+	}
 
-    int8_t wheel = 0;
-    if (info->has_wheel && info->wheel.bit_size > 0) {
-        wheel = (int8_t)extract_field(report,
-            info->wheel.bit_offset, info->wheel.bit_size);
-    }
+	int8_t wheel = 0;
+	if (info->has_wheel && info->wheel.bit_size > 0) {
+		wheel = (int8_t)extract_field(report, info->wheel.bit_offset,
+					      info->wheel.bit_size);
+	}
 
-    int32_t dx, dy;
+	int32_t dx, dy;
 
-    if (info->x.is_relative) {
-        // Relative mode (mice): use values directly as deltas
-        dx = extract_field(report, info->x.bit_offset, info->x.bit_size);
-        dy = extract_field(report, info->y.bit_offset, info->y.bit_size);
-    } else {
-        uint32_t contact_id = 0;
-        int contact_changed = 0;
-        int32_t dx_limit;
-        int32_t dy_limit;
-        // Absolute mode (touchpads): compute deltas from previous position
-        int32_t abs_x = (int32_t)extract_field_unsigned(report,
-            info->x.bit_offset, info->x.bit_size);
-        int32_t abs_y = (int32_t)extract_field_unsigned(report,
-            info->y.bit_offset, info->y.bit_size);
+	if (info->x.is_relative) {
+		// Relative mode (mice): use values directly as deltas
+		dx = extract_field(report, info->x.bit_offset,
+				   info->x.bit_size);
+		dy = extract_field(report, info->y.bit_offset,
+				   info->y.bit_size);
+	} else {
+		uint32_t contact_id = 0;
+		int contact_changed = 0;
+		int32_t dx_limit;
+		int32_t dy_limit;
+		// Absolute mode (touchpads): compute deltas from previous position
+		int32_t abs_x = (int32_t)extract_field_unsigned(
+			report, info->x.bit_offset, info->x.bit_size);
+		int32_t abs_y = (int32_t)extract_field_unsigned(
+			report, info->y.bit_offset, info->y.bit_size);
 
-        if (info->has_contact_id && info->contact_id.bit_size > 0) {
-            contact_id = extract_field_unsigned(report,
-                info->contact_id.bit_offset, info->contact_id.bit_size);
-            contact_changed = !dev->has_prev_contact_id ||
-                              contact_id != dev->prev_contact_id;
-        }
+		if (info->has_contact_id && info->contact_id.bit_size > 0) {
+			contact_id = extract_field_unsigned(
+				report, info->contact_id.bit_offset,
+				info->contact_id.bit_size);
+			contact_changed = !dev->has_prev_contact_id ||
+					  contact_id != dev->prev_contact_id;
+		}
 
-        if (abs_x < info->x.logical_min || abs_x > info->x.logical_max ||
-            abs_y < info->y.logical_min || abs_y > info->y.logical_max) {
-            i2c_hid_reset_pointer_tracking(dev);
-            return;
-        }
+		if (abs_x < info->x.logical_min ||
+		    abs_x > info->x.logical_max ||
+		    abs_y < info->y.logical_min ||
+		    abs_y > info->y.logical_max) {
+			i2c_hid_reset_pointer_tracking(dev);
+			return;
+		}
 
-        if (contact_changed)
-            dev->has_prev_pos = 0;
+		if (contact_changed)
+			dev->has_prev_pos = 0;
 
-        if (info->has_contact_id && info->contact_id.bit_size > 0) {
-            dev->prev_contact_id = contact_id;
-            dev->has_prev_contact_id = 1;
-        }
+		if (info->has_contact_id && info->contact_id.bit_size > 0) {
+			dev->prev_contact_id = contact_id;
+			dev->has_prev_contact_id = 1;
+		}
 
-        if (!dev->has_prev_pos) {
-            // First touch — record position, no movement
-            dev->prev_x = abs_x;
-            dev->prev_y = abs_y;
-            dev->has_prev_pos = 1;
-            // Still send button events if any
-            if (buttons != dev->prev_buttons) {
-                mouse_inject_usb_movement(0, 0, buttons, wheel);
-                dev->prev_buttons = buttons;
-            }
-            return;
-        }
+		if (!dev->has_prev_pos) {
+			// First touch — record position, no movement
+			dev->prev_x = abs_x;
+			dev->prev_y = abs_y;
+			dev->has_prev_pos = 1;
+			// Still send button events if any
+			if (buttons != dev->prev_buttons) {
+				mouse_inject_usb_movement(0, 0, buttons, wheel);
+				dev->prev_buttons = buttons;
+			}
+			return;
+		}
 
-        dx = abs_x - dev->prev_x;
-        dy = abs_y - dev->prev_y;
+		dx = abs_x - dev->prev_x;
+		dy = abs_y - dev->prev_y;
 
-        dx_limit = (info->x.logical_max - info->x.logical_min) / 8;
-        dy_limit = (info->y.logical_max - info->y.logical_min) / 8;
-        if (dx_limit < 64)
-            dx_limit = 64;
-        if (dy_limit < 64)
-            dy_limit = 64;
+		dx_limit = (info->x.logical_max - info->x.logical_min) / 8;
+		dy_limit = (info->y.logical_max - info->y.logical_min) / 8;
+		if (dx_limit < 64)
+			dx_limit = 64;
+		if (dy_limit < 64)
+			dy_limit = 64;
 
-        if (dx < -dx_limit || dx > dx_limit ||
-            dy < -dy_limit || dy > dy_limit) {
-            dev->prev_x = abs_x;
-            dev->prev_y = abs_y;
-            dev->has_prev_pos = 1;
-            return;
-        }
+		if (dx < -dx_limit || dx > dx_limit || dy < -dy_limit ||
+		    dy > dy_limit) {
+			dev->prev_x = abs_x;
+			dev->prev_y = abs_y;
+			dev->has_prev_pos = 1;
+			return;
+		}
 
-        dev->prev_x = abs_x;
-        dev->prev_y = abs_y;
-    }
+		dev->prev_x = abs_x;
+		dev->prev_y = abs_y;
+	}
 
-    mouse_inject_usb_movement(dx, dy, buttons, wheel);
-    dev->prev_buttons = buttons;
-    g_dbg_worker_processed++;
+	mouse_inject_usb_movement(dx, dy, buttons, wheel);
+	dev->prev_buttons = buttons;
+	g_dbg_worker_processed++;
 
-    // Log every 50th processed report
-    if ((g_dbg_worker_processed % 50) == 1) {
-        i2c_dbg("[I2C-DBG] #%u dx=%d dy=%d btn=0x%x "
-                "isr=%u hit=%u miss=%u wake=%u read=%u proc=%u "
-                "nofing=%u xferr=%u null=%u nid=%u idmm=%u ie=%u\n",
-                g_dbg_worker_processed, dx, dy, buttons,
-                g_dbg_gpio_isr_count, g_dbg_gpio_isr_hit,
-                g_dbg_gpio_isr_miss, g_dbg_worker_wake,
-                g_dbg_worker_read, g_dbg_worker_processed,
-                g_dbg_worker_no_finger, g_dbg_worker_xfer_err,
-                g_dbg_worker_null_pkt, g_dbg_worker_null_id,
-                g_dbg_worker_id_mismatch, g_dbg_ie_reenable);
-    }
+	// Log every 50th processed report
+	if ((g_dbg_worker_processed % 50) == 1) {
+		i2c_dbg("[I2C-DBG] #%u dx=%d dy=%d btn=0x%x "
+			"isr=%u hit=%u miss=%u wake=%u read=%u proc=%u "
+			"nofing=%u xferr=%u null=%u nid=%u idmm=%u ie=%u\n",
+			g_dbg_worker_processed, dx, dy, buttons,
+			g_dbg_gpio_isr_count, g_dbg_gpio_isr_hit,
+			g_dbg_gpio_isr_miss, g_dbg_worker_wake,
+			g_dbg_worker_read, g_dbg_worker_processed,
+			g_dbg_worker_no_finger, g_dbg_worker_xfer_err,
+			g_dbg_worker_null_pkt, g_dbg_worker_null_id,
+			g_dbg_worker_id_mismatch, g_dbg_ie_reenable);
+	}
 }
 
 // Read from I2C HID device using 2-byte length-first protocol.
@@ -4443,136 +4992,140 @@ static void i2c_hid_process_mouse(i2c_hid_device_t *dev,
 // number of bytes.  This avoids over-reading wMaxInputLength when the
 // actual report is shorter.
 // Returns bytes placed in buf (>= 2), or <0 on I2C error.
-static int i2c_hid_read_length_first(i2c_hid_device_t *dev,
-                                     uint8_t *buf, uint16_t buf_size)
+static int i2c_hid_read_length_first(i2c_hid_device_t *dev, uint8_t *buf,
+				     uint16_t buf_size)
 {
-    int rc;
-    uint16_t pkt_len;
+	int rc;
+	uint16_t pkt_len;
 
-    // For normal input reads, fetch the whole advertised buffer in one I2C
-    // transaction. Doing a 2-byte probe followed by a second full read doubles
-    // bus traffic and can mix packet state between transfers.
-    if (buf_size > I2C_HID_LENGTH_HDR_SIZE) {
-        rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
-                              buf, buf_size);
-        if (rc < 0) return rc;
+	// For normal input reads, fetch the whole advertised buffer in one I2C
+	// transaction. Doing a 2-byte probe followed by a second full read doubles
+	// bus traffic and can mix packet state between transfers.
+	if (buf_size > I2C_HID_LENGTH_HDR_SIZE) {
+		rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0, buf,
+				     buf_size);
+		if (rc < 0)
+			return rc;
 
-        pkt_len = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+		pkt_len = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
 
-        if (pkt_len == 0 || pkt_len == 0xFFFF ||
-            pkt_len <= I2C_HID_LENGTH_HDR_SIZE)
-            return I2C_HID_LENGTH_HDR_SIZE;
+		if (pkt_len == 0 || pkt_len == 0xFFFF ||
+		    pkt_len <= I2C_HID_LENGTH_HDR_SIZE)
+			return I2C_HID_LENGTH_HDR_SIZE;
 
-        if (pkt_len > buf_size)
-            pkt_len = buf_size;
+		if (pkt_len > buf_size)
+			pkt_len = buf_size;
 
-        return (int)pkt_len;
-    }
+		return (int)pkt_len;
+	}
 
-    // Minimal fallback for callers that only provide a 2-byte buffer.
-    rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0,
-                          buf, I2C_HID_LENGTH_HDR_SIZE);
-    if (rc < 0) return rc;
+	// Minimal fallback for callers that only provide a 2-byte buffer.
+	rc = dw_i2c_xfer_irq(dev->ctrl, dev->i2c_addr, NULL, 0, buf,
+			     I2C_HID_LENGTH_HDR_SIZE);
+	if (rc < 0)
+		return rc;
 
-    pkt_len = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+	pkt_len = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
 
-    // Null / invalid / header-only packet — return just the header
-    if (pkt_len == 0 || pkt_len == 0xFFFF || pkt_len <= I2C_HID_LENGTH_HDR_SIZE) {
-        return I2C_HID_LENGTH_HDR_SIZE;
-    }
+	// Null / invalid / header-only packet — return just the header
+	if (pkt_len == 0 || pkt_len == 0xFFFF ||
+	    pkt_len <= I2C_HID_LENGTH_HDR_SIZE) {
+		return I2C_HID_LENGTH_HDR_SIZE;
+	}
 
-    return I2C_HID_LENGTH_HDR_SIZE;
+	return I2C_HID_LENGTH_HDR_SIZE;
 }
 
 // Read one input report from the device and process it
 static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
 {
-    uint16_t buf_size = i2c_hid_input_read_len(dev);
-    if (buf_size < I2C_HID_LENGTH_HDR_SIZE || !dev->input_buf)
-        return;
+	uint16_t buf_size = i2c_hid_input_read_len(dev);
+	if (buf_size < I2C_HID_LENGTH_HDR_SIZE || !dev->input_buf)
+		return;
 
-    uint8_t *buf = dev->input_buf;
-    i2c_memset(buf, 0, buf_size);
+	uint8_t *buf = dev->input_buf;
+	i2c_memset(buf, 0, buf_size);
 
-    // Read using 2-byte length-first protocol
-    int rc = i2c_hid_read_length_first(dev, buf, buf_size);
+	// Read using 2-byte length-first protocol
+	int rc = i2c_hid_read_length_first(dev, buf, buf_size);
 
-    g_dbg_worker_read++;
+	g_dbg_worker_read++;
 
-    if (rc < 0) {
-        uint32_t now_ticks;
-        i2c_hid_reset_pointer_tracking(dev);
-        dev->error_count++;
-        now_ticks = (uint32_t)timer_ticks();
-        dev->backoff_until = now_ticks +
-            i2c_hid_backoff_delay_ticks(dev->error_count);
-        dev->silent_verify_after = 0;
-        dev->silent_verify_attempts = 0;
-        g_dbg_worker_xfer_err++;
-        i2c_dbg("[I2C-DBG] xfer ERR #%u dev=0x%02x errcnt=%u "
-                "abort=0x%x\n",
-                g_dbg_worker_xfer_err, dev->i2c_addr,
-                dev->error_count, dev->ctrl->last_abort_source);
-        return;
-    }
-    dev->error_count = 0;
-    dev->backoff_until = 0;
-    dev->silent_verify_after = 0;
-    dev->silent_verify_attempts = 0;
+	if (rc < 0) {
+		uint32_t now_ticks;
+		i2c_hid_reset_pointer_tracking(dev);
+		dev->error_count++;
+		now_ticks = (uint32_t)timer_ticks();
+		dev->backoff_until = now_ticks + i2c_hid_backoff_delay_ticks(
+							 dev->error_count);
+		dev->silent_verify_after = 0;
+		dev->silent_verify_attempts = 0;
+		g_dbg_worker_xfer_err++;
+		i2c_dbg("[I2C-DBG] xfer ERR #%u dev=0x%02x errcnt=%u "
+			"abort=0x%x\n",
+			g_dbg_worker_xfer_err, dev->i2c_addr, dev->error_count,
+			dev->ctrl->last_abort_source);
+		return;
+	}
+	dev->error_count = 0;
+	dev->backoff_until = 0;
+	dev->silent_verify_after = 0;
+	dev->silent_verify_attempts = 0;
 
-    // First 2 bytes are the HID-over-I2C length prefix (LE)
-    uint16_t pkt_len = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+	// First 2 bytes are the HID-over-I2C length prefix (LE)
+	uint16_t pkt_len = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
 
-    // Discard null-size packets
-    if (pkt_len == 0 || pkt_len == 0xFFFF || pkt_len <= 2) {
-        i2c_hid_reset_pointer_tracking(dev);
-        g_dbg_worker_null_pkt++;
-        return;
-    }
+	// Discard null-size packets
+	if (pkt_len == 0 || pkt_len == 0xFFFF || pkt_len <= 2) {
+		i2c_hid_reset_pointer_tracking(dev);
+		g_dbg_worker_null_pkt++;
+		return;
+	}
 
-    // Clamp to buffer
-    if (pkt_len > buf_size) pkt_len = buf_size;
+	// Clamp to buffer
+	if (pkt_len > buf_size)
+		pkt_len = buf_size;
 
-    // Data starts after the 2-byte length prefix
-    const uint8_t *data = buf + 2;
-    uint16_t data_len = pkt_len - 2;
+	// Data starts after the 2-byte length prefix
+	const uint8_t *data = buf + 2;
+	uint16_t data_len = pkt_len - 2;
 
-    // If device uses report IDs, first data byte is report ID
-    uint8_t report_id = 0;
-    const uint8_t *report_data = data;
-    uint16_t report_data_len = data_len;
+	// If device uses report IDs, first data byte is report ID
+	uint8_t report_id = 0;
+	const uint8_t *report_data = data;
+	uint16_t report_data_len = data_len;
 
-    if (dev->mouse_report.has_report_id) {
-        if (data_len < 1) {
-            i2c_hid_reset_pointer_tracking(dev);
-            return;
-        }
-        report_id = data[0];
+	if (dev->mouse_report.has_report_id) {
+		if (data_len < 1) {
+			i2c_hid_reset_pointer_tracking(dev);
+			return;
+		}
+		report_id = data[0];
 
-        // Discard null report IDs
-        if (report_id == 0) {
-            i2c_hid_reset_pointer_tracking(dev);
-            g_dbg_worker_null_id++;
-            return;
-        }
+		// Discard null report IDs
+		if (report_id == 0) {
+			i2c_hid_reset_pointer_tracking(dev);
+			g_dbg_worker_null_id++;
+			return;
+		}
 
-        report_data = data + 1;
-        report_data_len = data_len - 1;
+		report_data = data + 1;
+		report_data_len = data_len - 1;
 
-        // Only process if report ID matches our mouse/touchpad report
-        if (report_id != dev->mouse_report.report_id) {
-            i2c_hid_reset_pointer_tracking(dev);
-            g_dbg_worker_id_mismatch++;
-            return;
-        }
-    }
+		// Only process if report ID matches our mouse/touchpad report
+		if (report_id != dev->mouse_report.report_id) {
+			i2c_hid_reset_pointer_tracking(dev);
+			g_dbg_worker_id_mismatch++;
+			return;
+		}
+	}
 
-    if (report_data_len == 0) {
-        i2c_hid_reset_pointer_tracking(dev);
-        return;
-    }
+	if (report_data_len == 0) {
+		i2c_hid_reset_pointer_tracking(dev);
+		return;
+	}
 
-    i2c_hid_process_mouse(dev, report_data, report_data_len);
+	i2c_hid_process_mouse(dev, report_data, report_data_len);
 }
 
 // ============================================================================
@@ -4583,242 +5136,278 @@ static void i2c_hid_read_and_process(i2c_hid_device_t *dev)
 // input reports from all pending devices on this controller.
 static void i2c_hid_worker_thread(void *arg)
 {
-    i2c_dw_controller_t *ctrl = (i2c_dw_controller_t *)arg;
+	i2c_dw_controller_t *ctrl = (i2c_dw_controller_t *)arg;
 
-    kprintf("[I2C-HID] Worker thread running for I2C%d\n", ctrl->bus_id);
+	kprintf("[I2C-HID] Worker thread running for I2C%d\n", ctrl->bus_id);
 
-    while (ctrl->worker_running) {
-        uint64_t next_wake_tick = timer_ticks() + timer_get_frequency();
+	while (ctrl->worker_running) {
+		uint64_t next_wake_tick = timer_ticks() + timer_get_frequency();
 
-        // Set BLOCKED *before* checking for work — prevents lost wakes.
-        // If the GPIO ISR fires between here and the check below,
-        // sched_wake_channel() will find us BLOCKED and set us READY,
-        // so sched_schedule() will return immediately.
-        task_t *self = sched_current();
-        self->wait_channel = (void *)ctrl;
-        self->state = TASK_BLOCKED;
-        __asm__ volatile("" ::: "memory");
+		// Set BLOCKED *before* checking for work — prevents lost wakes.
+		// If the GPIO ISR fires between here and the check below,
+		// sched_wake_channel() will find us BLOCKED and set us READY,
+		// so sched_schedule() will return immediately.
+		task_t *self = sched_current();
+		self->wait_channel = (void *)ctrl;
+		self->state = TASK_BLOCKED;
+		__asm__ volatile("" ::: "memory");
 
-        int any_pending = 0;
-        for (int d = 0; d < g_i2c_hid_device_count; d++) {
-            i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
-            if (dev->ctrl == ctrl && dev->active && dev->work_pending) {
-                any_pending = 1;
-                break;
-            }
-        }
+		int any_pending = 0;
+		for (int d = 0; d < g_i2c_hid_device_count; d++) {
+			i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+			if (dev->ctrl == ctrl && dev->active &&
+			    dev->work_pending) {
+				any_pending = 1;
+				break;
+			}
+		}
 
-        if (!any_pending) {
-            for (int d = 0; d < g_i2c_hid_device_count; d++) {
-                i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
-                if (dev->ctrl != ctrl || !dev->active || !dev->gpio_irq_active)
-                    continue;
-                if (dev->gpio_community >= g_gpio_community_count)
-                    continue;
+		if (!any_pending) {
+			for (int d = 0; d < g_i2c_hid_device_count; d++) {
+				i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+				if (dev->ctrl != ctrl || !dev->active ||
+				    !dev->gpio_irq_active)
+					continue;
+				if (dev->gpio_community >=
+				    g_gpio_community_count)
+					continue;
 
-                gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
-                uint16_t ie_base = g_gpio_platform ?
-                    g_gpio_platform->gpi_ie_offset : 0x120;
-                uint16_t is_base = g_gpio_platform ?
-                    g_gpio_platform->gpi_is_offset : 0x100;
-                uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
-                uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
-                uint32_t bit = 1u << dev->gpio_gpi_bit;
-                uint32_t now_ticks = (uint32_t)timer_ticks();
-                uint64_t gflags;
-                uint32_t ie_val;
-                uint32_t is_val;
-                int line_asserted;
-                uint32_t verify_after;
+				gpio_community_t *comm =
+					&g_gpio_communities
+						[dev->gpio_community];
+				uint16_t ie_base =
+					g_gpio_platform ?
+						g_gpio_platform->gpi_ie_offset :
+						0x120;
+				uint16_t is_base =
+					g_gpio_platform ?
+						g_gpio_platform->gpi_is_offset :
+						0x100;
+				uint32_t ie_reg =
+					ie_base + dev->gpio_gpi_group * 4;
+				uint32_t is_reg =
+					is_base + dev->gpio_gpi_group * 4;
+				uint32_t bit = 1u << dev->gpio_gpi_bit;
+				uint32_t now_ticks = (uint32_t)timer_ticks();
+				uint64_t gflags;
+				uint32_t ie_val;
+				uint32_t is_val;
+				int line_asserted;
+				uint32_t verify_after;
 
-                gflags = local_irq_save();
-                ie_val = gpio_comm_read32(comm, ie_reg);
-                is_val = gpio_comm_read32(comm, is_reg);
-                line_asserted = gpio_hid_line_asserted(dev);
+				gflags = local_irq_save();
+				ie_val = gpio_comm_read32(comm, ie_reg);
+				is_val = gpio_comm_read32(comm, is_reg);
+				line_asserted = gpio_hid_line_asserted(dev);
 
-                if ((int32_t)(dev->backoff_until - now_ticks) > 0) {
-                    if (!(ie_val & bit)) {
-                        gpio_comm_write32(comm, is_reg, bit);
-                        gpio_comm_write32(comm, ie_reg, ie_val | bit);
-                        g_dbg_ie_reenable++;
-                    }
-                    local_irq_restore(gflags);
-                    if ((uint64_t)dev->backoff_until < next_wake_tick)
-                        next_wake_tick = dev->backoff_until;
-                    continue;
-                }
+				if ((int32_t)(dev->backoff_until - now_ticks) >
+				    0) {
+					if (!(ie_val & bit)) {
+						gpio_comm_write32(comm, is_reg,
+								  bit);
+						gpio_comm_write32(comm, ie_reg,
+								  ie_val | bit);
+						g_dbg_ie_reenable++;
+					}
+					local_irq_restore(gflags);
+					if ((uint64_t)dev->backoff_until <
+					    next_wake_tick)
+						next_wake_tick =
+							dev->backoff_until;
+					continue;
+				}
 
-                if (dev->error_count > 0) {
-                    if (line_asserted) {
-                        gpio_comm_write32(comm, is_reg, bit);
-                        dev->silent_verify_after = 0;
-                        dev->silent_verify_attempts = 0;
-                        spin_lock(&dev->dev_lock);
-                        dev->work_pending = 1;
-                        spin_unlock(&dev->dev_lock);
-                        local_irq_restore(gflags);
-                        any_pending = 1;
-                        break;
-                    }
+				if (dev->error_count > 0) {
+					if (line_asserted) {
+						gpio_comm_write32(comm, is_reg,
+								  bit);
+						dev->silent_verify_after = 0;
+						dev->silent_verify_attempts = 0;
+						spin_lock(&dev->dev_lock);
+						dev->work_pending = 1;
+						spin_unlock(&dev->dev_lock);
+						local_irq_restore(gflags);
+						any_pending = 1;
+						break;
+					}
 
-                    if (is_val & bit)
-                        gpio_comm_write32(comm, is_reg, bit);
+					if (is_val & bit)
+						gpio_comm_write32(comm, is_reg,
+								  bit);
 
-                    if (!(ie_val & bit)) {
-                        gpio_comm_write32(comm, ie_reg, ie_val | bit);
-                        g_dbg_ie_reenable++;
-                    }
+					if (!(ie_val & bit)) {
+						gpio_comm_write32(comm, ie_reg,
+								  ie_val | bit);
+						g_dbg_ie_reenable++;
+					}
 
-                    verify_after = dev->silent_verify_after;
-                    if (verify_after == 0) {
-                        verify_after = now_ticks +
-                            i2c_hid_silent_verify_delay_ticks(dev->silent_verify_attempts);
-                        dev->silent_verify_after = verify_after;
-                    }
+					verify_after = dev->silent_verify_after;
+					if (verify_after == 0) {
+						verify_after =
+							now_ticks +
+							i2c_hid_silent_verify_delay_ticks(
+								dev->silent_verify_attempts);
+						dev->silent_verify_after =
+							verify_after;
+					}
 
-                    if ((int32_t)(verify_after - now_ticks) <= 0) {
-                        dev->error_count = 0;
-                        dev->backoff_until = 0;
-                        dev->silent_verify_after = 0;
-                        dev->silent_verify_attempts = 0;
-                        local_irq_restore(gflags);
-                        continue;
-                    }
+					if ((int32_t)(verify_after -
+						      now_ticks) <= 0) {
+						dev->error_count = 0;
+						dev->backoff_until = 0;
+						dev->silent_verify_after = 0;
+						dev->silent_verify_attempts = 0;
+						local_irq_restore(gflags);
+						continue;
+					}
 
-                    if ((uint64_t)verify_after < next_wake_tick)
-                        next_wake_tick = verify_after;
-                    local_irq_restore(gflags);
-                    continue;
-                }
+					if ((uint64_t)verify_after <
+					    next_wake_tick)
+						next_wake_tick = verify_after;
+					local_irq_restore(gflags);
+					continue;
+				}
 
-                if (line_asserted) {
-                    gpio_comm_write32(comm, is_reg, bit);
-                    gpio_comm_write32(comm, ie_reg, ie_val | bit);
-                    spin_lock(&dev->dev_lock);
-                    dev->work_pending = 1;
-                    spin_unlock(&dev->dev_lock);
-                    local_irq_restore(gflags);
-                    g_dbg_ie_reenable++;
-                    any_pending = 1;
-                    break;
-                }
+				if (line_asserted) {
+					gpio_comm_write32(comm, is_reg, bit);
+					gpio_comm_write32(comm, ie_reg,
+							  ie_val | bit);
+					spin_lock(&dev->dev_lock);
+					dev->work_pending = 1;
+					spin_unlock(&dev->dev_lock);
+					local_irq_restore(gflags);
+					g_dbg_ie_reenable++;
+					any_pending = 1;
+					break;
+				}
 
-                if (!(ie_val & bit)) {
-                    gpio_comm_write32(comm, is_reg, bit);
-                    gpio_comm_write32(comm, ie_reg, ie_val | bit);
-                    g_dbg_ie_reenable++;
-                }
+				if (!(ie_val & bit)) {
+					gpio_comm_write32(comm, is_reg, bit);
+					gpio_comm_write32(comm, ie_reg,
+							  ie_val | bit);
+					g_dbg_ie_reenable++;
+				}
 
-                local_irq_restore(gflags);
-            }
-        }
+				local_irq_restore(gflags);
+			}
+		}
 
-        if (!any_pending) {
-            // Periodic debug print (every 1 second) even when idle
-            uint64_t now = timer_get_uptime();
-            if (now > g_dbg_last_print_uptime) {
-                g_dbg_last_print_uptime = now;
-                i2c_dbg("[I2C-DBG] t=%llu "
-                        "i2c_isr=%u gpio_isr=%u hit=%u miss=%u "
-                        "wake=%u read=%u proc=%u nofing=%u "
-                        "xfer: tot=%u ok=%u err=%u abort=%u retry=%u "
-                        "null=%u nid=%u idmm=%u ie=%u\n",
-                        (unsigned long long)now,
-                        g_dbg_i2c_isr_count, g_dbg_gpio_isr_count,
-                        g_dbg_gpio_isr_hit, g_dbg_gpio_isr_miss,
-                        g_dbg_worker_wake, g_dbg_worker_read,
-                        g_dbg_worker_processed, g_dbg_worker_no_finger,
-                        g_dbg_xfer_total, g_dbg_xfer_ok,
-                        g_dbg_worker_xfer_err, g_dbg_xfer_abort_count,
-                        g_dbg_xfer_retry_count,
-                        g_dbg_worker_null_pkt, g_dbg_worker_null_id,
-                        g_dbg_worker_id_mismatch, g_dbg_ie_reenable);
-            }
-            // Set wakeup_tick so the timer IRQ wakes us after ~1 second
-            // even if no GPIO interrupt fires. Without this, the thread
-            // stays BLOCKED forever when idle and never prints.
-            self->wakeup_tick = next_wake_tick;
-            g_dbg_worker_wake++;
-            sched_schedule();
-            continue;
-        }
+		if (!any_pending) {
+			// Periodic debug print (every 1 second) even when idle
+			uint64_t now = timer_get_uptime();
+			if (now > g_dbg_last_print_uptime) {
+				g_dbg_last_print_uptime = now;
+				i2c_dbg("[I2C-DBG] t=%llu "
+					"i2c_isr=%u gpio_isr=%u hit=%u miss=%u "
+					"wake=%u read=%u proc=%u nofing=%u "
+					"xfer: tot=%u ok=%u err=%u abort=%u retry=%u "
+					"null=%u nid=%u idmm=%u ie=%u\n",
+					(unsigned long long)now,
+					g_dbg_i2c_isr_count,
+					g_dbg_gpio_isr_count,
+					g_dbg_gpio_isr_hit, g_dbg_gpio_isr_miss,
+					g_dbg_worker_wake, g_dbg_worker_read,
+					g_dbg_worker_processed,
+					g_dbg_worker_no_finger,
+					g_dbg_xfer_total, g_dbg_xfer_ok,
+					g_dbg_worker_xfer_err,
+					g_dbg_xfer_abort_count,
+					g_dbg_xfer_retry_count,
+					g_dbg_worker_null_pkt,
+					g_dbg_worker_null_id,
+					g_dbg_worker_id_mismatch,
+					g_dbg_ie_reenable);
+			}
+			// Set wakeup_tick so the timer IRQ wakes us after ~1 second
+			// even if no GPIO interrupt fires. Without this, the thread
+			// stays BLOCKED forever when idle and never prints.
+			self->wakeup_tick = next_wake_tick;
+			g_dbg_worker_wake++;
+			sched_schedule();
+			continue;
+		}
 
-        // Work available — restore running state before processing
-        self->state = TASK_RUNNING;
-        self->wait_channel = NULL;
+		// Work available — restore running state before processing
+		self->state = TASK_RUNNING;
+		self->wait_channel = NULL;
 
-        // Process all pending devices on this controller
-        for (int d = 0; d < g_i2c_hid_device_count; d++) {
-            i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
-            if (dev->ctrl != ctrl || !dev->active || !dev->work_pending)
-                continue;
+		// Process all pending devices on this controller
+		for (int d = 0; d < g_i2c_hid_device_count; d++) {
+			i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+			if (dev->ctrl != ctrl || !dev->active ||
+			    !dev->work_pending)
+				continue;
 
-            // Acquire controller lock to serialize I2C bus access.
-            // Use irqsave — keeps IRQs disabled so the DW I2C ISR
-            // cannot race with the transfer loop's direct register polls.
-            uint64_t flags;
-            spin_lock_irqsave(&ctrl->lock, &flags);
+			// Acquire controller lock to serialize I2C bus access.
+			// Use irqsave — keeps IRQs disabled so the DW I2C ISR
+			// cannot race with the transfer loop's direct register polls.
+			uint64_t flags;
+			spin_lock_irqsave(&ctrl->lock, &flags);
 
-            // Read and process the input report
-            i2c_hid_read_and_process(dev);
+			// Read and process the input report
+			i2c_hid_read_and_process(dev);
 
-            spin_unlock_irqrestore(&ctrl->lock, flags);
+			spin_unlock_irqrestore(&ctrl->lock, flags);
 
-            // Clear work_pending BEFORE the delay so the ISR can set
-            // it again only after we re-enable IE.
-            uint64_t dflags;
-            spin_lock_irqsave(&dev->dev_lock, &dflags);
-            dev->work_pending = 0;
-            spin_unlock_irqrestore(&dev->dev_lock, dflags);
-        }
+			// Clear work_pending BEFORE the delay so the ISR can set
+			// it again only after we re-enable IE.
+			uint64_t dflags;
+			spin_lock_irqsave(&dev->dev_lock, &dflags);
+			dev->work_pending = 0;
+			spin_unlock_irqrestore(&dev->dev_lock, dflags);
+		}
 
-        // ---- Rate-limit: wait with IE masked ----
-        // The touchpad's level-triggered INT# re-asserts instantly
-        // after each read.  If we re-enabled IE immediately, the ISR
-        // would fire before we can block, creating a tight ~500 Hz
-        // polling loop that stresses the I2C bus into eventual lockup.
-        //
-        // Keep IE masked during this gap so no ISR fires.  8 ms gives
-        // the bus and device firmware breathing room and yields a
-        // natural ~100 Hz read rate (matching the touchpad report rate).
-        i2c_delay_us(8000);
+		// ---- Rate-limit: wait with IE masked ----
+		// The touchpad's level-triggered INT# re-asserts instantly
+		// after each read.  If we re-enabled IE immediately, the ISR
+		// would fire before we can block, creating a tight ~500 Hz
+		// polling loop that stresses the I2C bus into eventual lockup.
+		//
+		// Keep IE masked during this gap so no ISR fires.  8 ms gives
+		// the bus and device firmware breathing room and yields a
+		// natural ~100 Hz read rate (matching the touchpad report rate).
+		i2c_delay_us(8000);
 
-        // NOW re-enable GPI_IE — any pending INT# assertion will
-        // fire the ISR which sets work_pending and wakes us.
-        for (int d = 0; d < g_i2c_hid_device_count; d++) {
-            i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
-            if (dev->ctrl != ctrl || !dev->active)
-                continue;
-            if (!dev->gpio_irq_active || dev->gpio_community >= g_gpio_community_count)
-                continue;
+		// NOW re-enable GPI_IE — any pending INT# assertion will
+		// fire the ISR which sets work_pending and wakes us.
+		for (int d = 0; d < g_i2c_hid_device_count; d++) {
+			i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+			if (dev->ctrl != ctrl || !dev->active)
+				continue;
+			if (!dev->gpio_irq_active ||
+			    dev->gpio_community >= g_gpio_community_count)
+				continue;
 
-            gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
-            uint16_t ie_base = g_gpio_platform ?
-                g_gpio_platform->gpi_ie_offset : 0x120;
-            uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
+			gpio_community_t *comm =
+				&g_gpio_communities[dev->gpio_community];
+			uint16_t ie_base =
+				g_gpio_platform ?
+					g_gpio_platform->gpi_ie_offset :
+					0x120;
+			uint32_t ie_reg = ie_base + dev->gpio_gpi_group * 4;
 
-            uint64_t gflags;
-            uint32_t now_ticks;
-            gflags = local_irq_save();
-            uint32_t ie_val = gpio_comm_read32(comm, ie_reg);
-            now_ticks = (uint32_t)timer_ticks();
-            if ((int32_t)(dev->backoff_until - now_ticks) > 0) {
-                local_irq_restore(gflags);
-                continue;
-            }
-            if (dev->error_count > 0) {
-                local_irq_restore(gflags);
-                continue;
-            }
-            gpio_comm_write32(comm, ie_reg,
-                              ie_val | (1u << dev->gpio_gpi_bit));
-            local_irq_restore(gflags);
+			uint64_t gflags;
+			uint32_t now_ticks;
+			gflags = local_irq_save();
+			uint32_t ie_val = gpio_comm_read32(comm, ie_reg);
+			now_ticks = (uint32_t)timer_ticks();
+			if ((int32_t)(dev->backoff_until - now_ticks) > 0) {
+				local_irq_restore(gflags);
+				continue;
+			}
+			if (dev->error_count > 0) {
+				local_irq_restore(gflags);
+				continue;
+			}
+			gpio_comm_write32(comm, ie_reg,
+					  ie_val | (1u << dev->gpio_gpi_bit));
+			local_irq_restore(gflags);
 
-            g_dbg_ie_reenable++;
-        }
-    }
+			g_dbg_ie_reenable++;
+		}
+	}
 
-    i2c_dbg("[I2C-HID] Worker thread exiting for I2C%d\n", ctrl->bus_id);
+	i2c_dbg("[I2C-HID] Worker thread exiting for I2C%d\n", ctrl->bus_id);
 }
 
 // ============================================================================
@@ -4827,104 +5416,107 @@ static void i2c_hid_worker_thread(void *arg)
 
 void i2c_hid_gpio_irq_handler(uint8_t vector)
 {
-    g_dbg_gpio_isr_count++;
+	g_dbg_gpio_isr_count++;
 
-    if (!g_gpio_platform) {
-        lapic_eoi();
-        return;
-    }
+	if (!g_gpio_platform) {
+		lapic_eoi();
+		return;
+	}
 
-    uint16_t is_base = g_gpio_platform->gpi_is_offset;
-    uint16_t ie_base = g_gpio_platform->gpi_ie_offset;
-    int found_any = 0;
+	uint16_t is_base = g_gpio_platform->gpi_is_offset;
+	uint16_t ie_base = g_gpio_platform->gpi_ie_offset;
+	int found_any = 0;
 
-    for (int d = 0; d < g_i2c_hid_device_count; d++) {
-        i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
-        if (!dev->active || !dev->gpio_irq_active)
-            continue;
-        if (dev->gpio_irq_vector != vector)
-            continue;
-        if (dev->gpio_community >= g_gpio_community_count)
-            continue;
+	for (int d = 0; d < g_i2c_hid_device_count; d++) {
+		i2c_hid_device_t *dev = &g_i2c_hid_devices[d];
+		if (!dev->active || !dev->gpio_irq_active)
+			continue;
+		if (dev->gpio_irq_vector != vector)
+			continue;
+		if (dev->gpio_community >= g_gpio_community_count)
+			continue;
 
-        gpio_community_t *comm = &g_gpio_communities[dev->gpio_community];
-        uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
-        uint32_t is_val = gpio_comm_read32(comm, is_reg);
-        uint32_t ie_reg_off = ie_base + dev->gpio_gpi_group * 4;
-        uint32_t ie_cur = gpio_comm_read32(comm, ie_reg_off);
-        uint32_t bit = 1u << dev->gpio_gpi_bit;
+		gpio_community_t *comm =
+			&g_gpio_communities[dev->gpio_community];
+		uint32_t is_reg = is_base + dev->gpio_gpi_group * 4;
+		uint32_t is_val = gpio_comm_read32(comm, is_reg);
+		uint32_t ie_reg_off = ie_base + dev->gpio_gpi_group * 4;
+		uint32_t ie_cur = gpio_comm_read32(comm, ie_reg_off);
+		uint32_t bit = 1u << dev->gpio_gpi_bit;
 
-        if (!(is_val & bit)) {
-            // IS bit not set for our pin
-            g_dbg_gpio_isr_miss++;
-            if ((g_dbg_gpio_isr_miss % 100) == 1) {
-                i2c_dbg("[I2C-ISR] miss #%u vec=%u IS=0x%x IE=0x%x "
-                        "bit=%u wp=%d\n",
-                        g_dbg_gpio_isr_miss, vector, is_val, ie_cur,
-                        dev->gpio_gpi_bit, dev->work_pending);
-            }
-            continue;
-        }
+		if (!(is_val & bit)) {
+			// IS bit not set for our pin
+			g_dbg_gpio_isr_miss++;
+			if ((g_dbg_gpio_isr_miss % 100) == 1) {
+				i2c_dbg("[I2C-ISR] miss #%u vec=%u IS=0x%x IE=0x%x "
+					"bit=%u wp=%d\n",
+					g_dbg_gpio_isr_miss, vector, is_val,
+					ie_cur, dev->gpio_gpi_bit,
+					dev->work_pending);
+			}
+			continue;
+		}
 
-        if (!gpio_hid_line_asserted(dev)) {
-            gpio_comm_write32(comm, is_reg, bit);
-            gpio_comm_write32(comm, ie_reg_off, ie_cur | bit);
-            g_dbg_gpio_isr_miss++;
-            g_dbg_ie_reenable++;
-            continue;
-        }
+		if (!gpio_hid_line_asserted(dev)) {
+			gpio_comm_write32(comm, is_reg, bit);
+			gpio_comm_write32(comm, ie_reg_off, ie_cur | bit);
+			g_dbg_gpio_isr_miss++;
+			g_dbg_ie_reenable++;
+			continue;
+		}
 
-        found_any = 1;
-        g_dbg_gpio_isr_hit++;
-        dev->silent_verify_after = 0;
-        dev->silent_verify_attempts = 0;
+		found_any = 1;
+		g_dbg_gpio_isr_hit++;
+		dev->silent_verify_after = 0;
+		dev->silent_verify_attempts = 0;
 
-        // Clear the pending interrupt status (write-1-to-clear)
-        gpio_comm_write32(comm, is_reg, bit);
+		// Clear the pending interrupt status (write-1-to-clear)
+		gpio_comm_write32(comm, is_reg, bit);
 
-        // Mask GPI_IE for this pin to prevent re-fire until worker processes it
-        uint32_t ie_val = ie_cur & ~bit;
-        gpio_comm_write32(comm, ie_reg_off, ie_val);
+		// Mask GPI_IE for this pin to prevent re-fire until worker processes it
+		uint32_t ie_val = ie_cur & ~bit;
+		gpio_comm_write32(comm, ie_reg_off, ie_val);
 
-        // Set work_pending flag (spinlock-protected)
-        spin_lock(&dev->dev_lock);
-        dev->work_pending = 1;
-        spin_unlock(&dev->dev_lock);
+		// Set work_pending flag (spinlock-protected)
+		spin_lock(&dev->dev_lock);
+		dev->work_pending = 1;
+		spin_unlock(&dev->dev_lock);
 
-        // Wake the worker thread for this controller
-        sched_wake_channel((void *)dev->ctrl);
+		// Wake the worker thread for this controller
+		sched_wake_channel((void *)dev->ctrl);
 
-        // Log every 50th hit
-        if ((g_dbg_gpio_isr_hit % 50) == 1) {
-            i2c_dbg("[I2C-ISR] hit #%u vec=%u IS=0x%x->clr "
-                    "IE 0x%x->0x%x bit=%u\n",
-                    g_dbg_gpio_isr_hit, vector, is_val,
-                    ie_cur, ie_val, dev->gpio_gpi_bit);
-        }
-    }
+		// Log every 50th hit
+		if ((g_dbg_gpio_isr_hit % 50) == 1) {
+			i2c_dbg("[I2C-ISR] hit #%u vec=%u IS=0x%x->clr "
+				"IE 0x%x->0x%x bit=%u\n",
+				g_dbg_gpio_isr_hit, vector, is_val, ie_cur,
+				ie_val, dev->gpio_gpi_bit);
+		}
+	}
 
-    if (!found_any) {
-        // ISR fired but no device had a pending bit — spurious
-        if ((g_dbg_gpio_isr_count % 100) == 1) {
-            i2c_dbg("[I2C-ISR] spurious #%u vec=%u\n",
-                    g_dbg_gpio_isr_count, vector);
-        }
-    }
+	if (!found_any) {
+		// ISR fired but no device had a pending bit — spurious
+		if ((g_dbg_gpio_isr_count % 100) == 1) {
+			i2c_dbg("[I2C-ISR] spurious #%u vec=%u\n",
+				g_dbg_gpio_isr_count, vector);
+		}
+	}
 
-    lapic_eoi();
+	lapic_eoi();
 }
 
-int i2c_hid_has_touchpad(void) {
-    for (int d = 0; d < g_i2c_hid_device_count; d++) {
-        if (g_i2c_hid_devices[d].active &&
-            (g_i2c_hid_devices[d].dev_type == I2C_HID_DEV_TOUCHPAD ||
-             g_i2c_hid_devices[d].dev_type == I2C_HID_DEV_MOUSE))
-            return 1;
-    }
-    return 0;
+int i2c_hid_has_touchpad(void)
+{
+	for (int d = 0; d < g_i2c_hid_device_count; d++) {
+		if (g_i2c_hid_devices[d].active &&
+		    (g_i2c_hid_devices[d].dev_type == I2C_HID_DEV_TOUCHPAD ||
+		     g_i2c_hid_devices[d].dev_type == I2C_HID_DEV_MOUSE))
+			return 1;
+	}
+	return 0;
 }
 
-int i2c_hid_device_count(void) {
-    return g_i2c_hid_device_count;
+int i2c_hid_device_count(void)
+{
+	return g_i2c_hid_device_count;
 }
-

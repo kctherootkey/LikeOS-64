@@ -22,24 +22,26 @@ static volatile uint64_t g_ticks = 0;
  * The ACPI PM Timer is a chipset-based 3.579545 MHz free-running counter
  * that returns the same value on ALL CPUs and always runs at the correct
  * rate regardless of VM scheduling.  We read it via inl() (IRQ-safe). */
-static volatile uint64_t g_total_us = 0;     // wall-clock µs since ticks started
-static volatile uint32_t g_pm_last = 0;      // PM Timer value at last BSP tick
-static uint16_t g_pmtimer_port = 0;          // ACPI PM Timer I/O port (from FADT)
-static uint32_t g_pmtimer_mask = 0x00FFFFFF; // 24-bit default; 0xFFFFFFFF for 32-bit
+static volatile uint64_t g_total_us = 0; // wall-clock µs since ticks started
+static volatile uint32_t g_pm_last = 0; // PM Timer value at last BSP tick
+static uint16_t g_pmtimer_port = 0; // ACPI PM Timer I/O port (from FADT)
+static uint32_t g_pmtimer_mask =
+	0x00FFFFFF; // 24-bit default; 0xFFFFFFFF for 32-bit
 static volatile int g_pmtimer_available = 0;
-static volatile uint64_t* g_hpet_regs = NULL;
+static volatile uint64_t *g_hpet_regs = NULL;
 static uint64_t g_hpet_start = 0;
 static uint32_t g_hpet_period_fs = 0;
 static volatile int g_hpet_available = 0;
 static volatile int g_tsc_precise_available = 0;
 static inline uint64_t rdtsc(void);
-static uint64_t g_tsc_cpu_base_us[MAX_CPUS] = {0};
-static uint64_t g_tsc_cpu_base_cycles[MAX_CPUS] = {0};
-static volatile uint8_t g_tsc_cpu_ready[MAX_CPUS] = {0};
+static uint64_t g_tsc_cpu_base_us[MAX_CPUS] = { 0 };
+static uint64_t g_tsc_cpu_base_cycles[MAX_CPUS] = { 0 };
+static volatile uint8_t g_tsc_cpu_ready[MAX_CPUS] = { 0 };
 /* Seqlock to ensure g_total_us and g_pm_last are read consistently. */
 static volatile uint32_t g_tick_seq = 0;
 static uint32_t g_frequency = 100; // Default 100 Hz
-static uint64_t g_boot_epoch = 0;  // Unix epoch seconds at boot (from UEFI or CMOS RTC)
+static uint64_t g_boot_epoch =
+	0; // Unix epoch seconds at boot (from UEFI or CMOS RTC)
 
 /* Flag to indicate boot_epoch was set from bootloader (UEFI GetTime) */
 static int g_boot_epoch_from_uefi = 0;
@@ -48,12 +50,13 @@ static int g_boot_epoch_from_uefi = 0;
 static int g_cmos_failed = 0;
 
 /* ACPI FADT boot_arch_flags bits (IA-PC Boot Architecture Flags) */
-#define ACPI_FADT_LEGACY_DEVICES    (1<<0)  /* System has LPC or ISA bus devices */
-#define ACPI_FADT_8042              (1<<1)  /* System has 8042 controller on port 60/64 */
-#define ACPI_FADT_NO_VGA            (1<<2)  /* Not safe to probe for VGA hardware */
-#define ACPI_FADT_NO_MSI            (1<<3)  /* MSI must not be enabled */
-#define ACPI_FADT_NO_ASPM           (1<<4)  /* PCIe ASPM control must not be enabled */
-#define ACPI_FADT_NO_CMOS_RTC       (1<<5)  /* No CMOS real-time clock present */
+#define ACPI_FADT_LEGACY_DEVICES \
+	(1 << 0) /* System has LPC or ISA bus devices */
+#define ACPI_FADT_8042 (1 << 1) /* System has 8042 controller on port 60/64 */
+#define ACPI_FADT_NO_VGA (1 << 2) /* Not safe to probe for VGA hardware */
+#define ACPI_FADT_NO_MSI (1 << 3) /* MSI must not be enabled */
+#define ACPI_FADT_NO_ASPM (1 << 4) /* PCIe ASPM control must not be enabled */
+#define ACPI_FADT_NO_CMOS_RTC (1 << 5) /* No CMOS real-time clock present */
 
 /* ======================================================================
  * CMOS RTC access — mc146818 style
@@ -73,26 +76,26 @@ static int g_cmos_failed = 0;
  * ====================================================================== */
 
 /* RTC register indices (mc146818 standard) */
-#define RTC_SECONDS       0x00
-#define RTC_MINUTES       0x02
-#define RTC_HOURS         0x04
-#define RTC_DAY_OF_MONTH  0x07
-#define RTC_MONTH         0x08
-#define RTC_YEAR          0x09
-#define RTC_REG_A         0x0A  /* Status Register A */
-#define RTC_REG_B         0x0B  /* Status Register B */
-#define RTC_REG_C         0x0C  /* Status Register C (read clears) */
-#define RTC_REG_D         0x0D  /* Status Register D */
-#define RTC_CENTURY       0x32  /* Century register (ACPI) */
+#define RTC_SECONDS 0x00
+#define RTC_MINUTES 0x02
+#define RTC_HOURS 0x04
+#define RTC_DAY_OF_MONTH 0x07
+#define RTC_MONTH 0x08
+#define RTC_YEAR 0x09
+#define RTC_REG_A 0x0A /* Status Register A */
+#define RTC_REG_B 0x0B /* Status Register B */
+#define RTC_REG_C 0x0C /* Status Register C (read clears) */
+#define RTC_REG_D 0x0D /* Status Register D */
+#define RTC_CENTURY 0x32 /* Century register (ACPI) */
 
 /* Register A bits */
-#define RTC_UIP           0x80  /* Update In Progress */
-#define RTC_DIV_RESET2    0x70  /* Divider reset (stops updates) */
+#define RTC_UIP 0x80 /* Update In Progress */
+#define RTC_DIV_RESET2 0x70 /* Divider reset (stops updates) */
 
 /* Register B bits */
-#define RTC_SET           0x80  /* Inhibit updates for clock setting */
-#define RTC_DM_BINARY     0x04  /* Data mode: 1=binary, 0=BCD */
-#define RTC_24H           0x02  /* 24-hour mode */
+#define RTC_SET 0x80 /* Inhibit updates for clock setting */
+#define RTC_DM_BINARY 0x04 /* Data mode: 1=binary, 0=BCD */
+#define RTC_24H 0x02 /* 24-hour mode */
 
 /*
  * io_delay — small I/O delay for CMOS RTC timing.
@@ -101,114 +104,126 @@ static int g_cmos_failed = 0;
  * This is required on modern Intel platforms (Alder Lake, etc.) where
  * eSPI timing may cause problems with back-to-back I/O.
  */
-static inline void io_delay(void) {
-    outb(0x80, 0);
+static inline void io_delay(void)
+{
+	outb(0x80, 0);
 }
 
 /* inl() is provided by <kernel/ke/interrupt.h>. */
 
 /* Direct PM Timer read via I/O port — safe from IRQ context.
  * Mask to 24 or 32 bits depending on FADT flags. */
-static inline uint32_t pmtimer_read(void) {
-    return inl(g_pmtimer_port) & g_pmtimer_mask;
+static inline uint32_t pmtimer_read(void)
+{
+	return inl(g_pmtimer_port) & g_pmtimer_mask;
 }
 
 /* ACPI HPET table (minimal subset used by the timer driver). */
 typedef struct __attribute__((packed)) {
-    acpi_sdt_header_t header;
-    uint32_t event_timer_block_id;
-    uint8_t  base_addr_space_id;
-    uint8_t  base_reg_bit_width;
-    uint8_t  base_reg_bit_offset;
-    uint8_t  base_access_size;
-    uint64_t base_address;
-    uint8_t  hpet_number;
-    uint16_t min_tick;
-    uint8_t  page_protection;
+	acpi_sdt_header_t header;
+	uint32_t event_timer_block_id;
+	uint8_t base_addr_space_id;
+	uint8_t base_reg_bit_width;
+	uint8_t base_reg_bit_offset;
+	uint8_t base_access_size;
+	uint64_t base_address;
+	uint8_t hpet_number;
+	uint16_t min_tick;
+	uint8_t page_protection;
 } acpi_hpet_t;
 
-#define HPET_GEN_CAP_ID_OFFSET      0x000
-#define HPET_GEN_CONFIG_OFFSET      0x010
-#define HPET_MAIN_COUNTER_OFFSET    0x0F0
-#define HPET_GEN_CONFIG_ENABLE      (1ULL << 0)
+#define HPET_GEN_CAP_ID_OFFSET 0x000
+#define HPET_GEN_CONFIG_OFFSET 0x010
+#define HPET_MAIN_COUNTER_OFFSET 0x0F0
+#define HPET_GEN_CONFIG_ENABLE (1ULL << 0)
 
-static inline uint64_t hpet_read_reg(uint32_t offset) {
-    return g_hpet_regs[offset / 8];
+static inline uint64_t hpet_read_reg(uint32_t offset)
+{
+	return g_hpet_regs[offset / 8];
 }
 
-static inline void hpet_write_reg(uint32_t offset, uint64_t value) {
-    g_hpet_regs[offset / 8] = value;
+static inline void hpet_write_reg(uint32_t offset, uint64_t value)
+{
+	g_hpet_regs[offset / 8] = value;
 }
 
-static inline uint64_t hpet_read_counter(void) {
-    return hpet_read_reg(HPET_MAIN_COUNTER_OFFSET);
+static inline uint64_t hpet_read_counter(void)
+{
+	return hpet_read_reg(HPET_MAIN_COUNTER_OFFSET);
 }
 
-static uint64_t tsc_cycles_to_us(uint64_t cycles) {
-    uint64_t tsc_hz = lapic_get_tsc_freq();
-    if (tsc_hz == 0) {
-        return 0;
-    }
+static uint64_t tsc_cycles_to_us(uint64_t cycles)
+{
+	uint64_t tsc_hz = lapic_get_tsc_freq();
+	if (tsc_hz == 0) {
+		return 0;
+	}
 
-    uint64_t whole = cycles / tsc_hz;
-    uint64_t rem = cycles % tsc_hz;
-    return whole * 1000000ULL + (rem * 1000000ULL) / tsc_hz;
+	uint64_t whole = cycles / tsc_hz;
+	uint64_t rem = cycles % tsc_hz;
+	return whole * 1000000ULL + (rem * 1000000ULL) / tsc_hz;
 }
 
-static uint64_t timer_get_fallback_precise_us(void) {
-    if (g_hpet_available) {
-        uint64_t counter = hpet_read_counter() - g_hpet_start;
-        uint64_t whole = counter / 1000000ULL;
-        uint64_t rem = counter % 1000000ULL;
-        return (whole * (uint64_t)g_hpet_period_fs) / 1000ULL
-             + (rem * (uint64_t)g_hpet_period_fs) / 1000000000ULL;
-    }
+static uint64_t timer_get_fallback_precise_us(void)
+{
+	if (g_hpet_available) {
+		uint64_t counter = hpet_read_counter() - g_hpet_start;
+		uint64_t whole = counter / 1000000ULL;
+		uint64_t rem = counter % 1000000ULL;
+		return (whole * (uint64_t)g_hpet_period_fs) / 1000ULL +
+		       (rem * (uint64_t)g_hpet_period_fs) / 1000000000ULL;
+	}
 
-    if (g_pmtimer_available) {
-        uint64_t total_us_base;
-        uint32_t pm_base;
-        uint32_t seq;
-        do {
-            seq = g_tick_seq;
-            __asm__ volatile("" ::: "memory");
-            total_us_base = g_total_us;
-            pm_base = g_pm_last;
-            __asm__ volatile("" ::: "memory");
-        } while (seq != g_tick_seq || (seq & 1));
+	if (g_pmtimer_available) {
+		uint64_t total_us_base;
+		uint32_t pm_base;
+		uint32_t seq;
+		do {
+			seq = g_tick_seq;
+			__asm__ volatile("" ::: "memory");
+			total_us_base = g_total_us;
+			pm_base = g_pm_last;
+			__asm__ volatile("" ::: "memory");
+		} while (seq != g_tick_seq || (seq & 1));
 
-        uint32_t pm_now = pmtimer_read();
-        uint32_t delta = (pm_now - pm_base) & g_pmtimer_mask;
-        uint64_t sub_us = (uint64_t)delta * 1000000ULL / 3579545ULL;
-        if (sub_us > 1000000ULL)
-            sub_us = 1000000ULL;
+		uint32_t pm_now = pmtimer_read();
+		uint32_t delta = (pm_now - pm_base) & g_pmtimer_mask;
+		uint64_t sub_us = (uint64_t)delta * 1000000ULL / 3579545ULL;
+		if (sub_us > 1000000ULL)
+			sub_us = 1000000ULL;
 
-        return total_us_base + sub_us;
-    }
+		return total_us_base + sub_us;
+	}
 
-    return g_ticks * 1000000ULL / g_frequency;
+	return g_ticks * 1000000ULL / g_frequency;
 }
 
-static void timer_enable_reliable_tsc_precise_time(void) {
-    if (!lapic_tsc_is_reliable() || lapic_get_tsc_freq() == 0 || g_tsc_precise_available) {
-        return;
-    }
+static void timer_enable_reliable_tsc_precise_time(void)
+{
+	if (!lapic_tsc_is_reliable() || lapic_get_tsc_freq() == 0 ||
+	    g_tsc_precise_available) {
+		return;
+	}
 
-    g_tsc_precise_available = 1;
+	g_tsc_precise_available = 1;
 
-    kprintf("Timer: using reliable TSC for precise timekeeping\n");
+	kprintf("Timer: using reliable TSC for precise timekeeping\n");
 }
 
 /* Public raw PM Timer read — returns masked counter value (0 if unavailable). */
-uint32_t timer_pmtimer_read_raw(void) {
-    if (!g_pmtimer_available) return 0;
-    return pmtimer_read();
+uint32_t timer_pmtimer_read_raw(void)
+{
+	if (!g_pmtimer_available)
+		return 0;
+	return pmtimer_read();
 }
 
 /* Compute microseconds between two raw PM Timer snapshots.
  * Handles 24/32-bit wraparound correctly. */
-uint64_t timer_pmtimer_delta_us(uint32_t t0, uint32_t t1) {
-    uint32_t delta = (t1 - t0) & g_pmtimer_mask;
-    return (uint64_t)delta * 1000000ULL / 3579545ULL;
+uint64_t timer_pmtimer_delta_us(uint32_t t0, uint32_t t1)
+{
+	uint32_t delta = (t1 - t0) & g_pmtimer_mask;
+	return (uint64_t)delta * 1000000ULL / 3579545ULL;
 }
 
 /*
@@ -217,29 +232,31 @@ uint64_t timer_pmtimer_delta_us(uint32_t t0, uint32_t t1) {
  * Interrupts are disabled during the index-write + data-read/write sequence
  * to prevent any interrupt from corrupting the CMOS index register state.
  */
-static uint8_t cmos_read(uint8_t addr) {
-    uint64_t flags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-    
-    outb(0x70, addr);
-    io_delay();
-    uint8_t val = inb(0x71);
-    io_delay();
-    
-    __asm__ volatile("push %0; popfq" :: "r"(flags) : "memory");
-    return val;
+static uint8_t cmos_read(uint8_t addr)
+{
+	uint64_t flags;
+	__asm__ volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
+
+	outb(0x70, addr);
+	io_delay();
+	uint8_t val = inb(0x71);
+	io_delay();
+
+	__asm__ volatile("push %0; popfq" ::"r"(flags) : "memory");
+	return val;
 }
 
-static void cmos_write(uint8_t addr, uint8_t val) {
-    uint64_t flags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-    
-    outb(0x70, addr);
-    io_delay();
-    outb(0x71, val);
-    io_delay();
-    
-    __asm__ volatile("push %0; popfq" :: "r"(flags) : "memory");
+static void cmos_write(uint8_t addr, uint8_t val)
+{
+	uint64_t flags;
+	__asm__ volatile("pushfq; pop %0; cli" : "=r"(flags)::"memory");
+
+	outb(0x70, addr);
+	io_delay();
+	outb(0x71, val);
+	io_delay();
+
+	__asm__ volatile("push %0; popfq" ::"r"(flags) : "memory");
 }
 
 /*
@@ -252,96 +269,99 @@ static void cmos_write(uint8_t addr, uint8_t val) {
  * timeout_ms: maximum time to wait, in milliseconds.
  * Returns 1 on success, 0 on timeout.
  */
-static int rtc_read_consistent(int timeout_ms,
-    uint8_t *out_sec, uint8_t *out_min, uint8_t *out_hour,
-    uint8_t *out_day, uint8_t *out_mon, uint8_t *out_year,
-    uint8_t *out_century, uint8_t *out_ctrl)
+static int rtc_read_consistent(int timeout_ms, uint8_t *out_sec,
+			       uint8_t *out_min, uint8_t *out_hour,
+			       uint8_t *out_day, uint8_t *out_mon,
+			       uint8_t *out_year, uint8_t *out_century,
+			       uint8_t *out_ctrl)
 {
-    /*
+	/*
      * Poll with a 100us delay between checks.
      * We approximate: each loop iteration does a few inb's plus
      * a short spin.  ~10 iterations ≈ 1ms.  For timeout_ms=1000
      * that's ~10000 iterations max.
      */
-    int max_loops = timeout_ms * 10;
-    for (int i = 0; i < max_loops; i++) {
-        uint8_t seconds;
+	int max_loops = timeout_ms * 10;
+	for (int i = 0; i < max_loops; i++) {
+		uint8_t seconds;
 
-        /* Read seconds first, before checking UIP */
-        seconds = cmos_read(RTC_SECONDS);
+		/* Read seconds first, before checking UIP */
+		seconds = cmos_read(RTC_SECONDS);
 
-        /* Check UIP — if set, wait ~100us and retry */
-        if (cmos_read(RTC_REG_A) & RTC_UIP) {
-            /* Short delay: a few I/O port reads ≈ ~10us each */
-            for (int d = 0; d < 10; d++) inb(0x80);
-            continue;
-        }
+		/* Check UIP — if set, wait ~100us and retry */
+		if (cmos_read(RTC_REG_A) & RTC_UIP) {
+			/* Short delay: a few I/O port reads ≈ ~10us each */
+			for (int d = 0; d < 10; d++)
+				inb(0x80);
+			continue;
+		}
 
-        /* Revalidate seconds */
-        if (seconds != cmos_read(RTC_SECONDS))
-            continue;
+		/* Revalidate seconds */
+		if (seconds != cmos_read(RTC_SECONDS))
+			continue;
 
-        /* UIP is clear, seconds stable — read all registers */
-        uint8_t min     = cmos_read(RTC_MINUTES);
-        uint8_t hour    = cmos_read(RTC_HOURS);
-        uint8_t day     = cmos_read(RTC_DAY_OF_MONTH);
-        uint8_t mon     = cmos_read(RTC_MONTH);
-        uint8_t year    = cmos_read(RTC_YEAR);
-        uint8_t century = cmos_read(RTC_CENTURY);
-        uint8_t ctrl    = cmos_read(RTC_REG_B);
+		/* UIP is clear, seconds stable — read all registers */
+		uint8_t min = cmos_read(RTC_MINUTES);
+		uint8_t hour = cmos_read(RTC_HOURS);
+		uint8_t day = cmos_read(RTC_DAY_OF_MONTH);
+		uint8_t mon = cmos_read(RTC_MONTH);
+		uint8_t year = cmos_read(RTC_YEAR);
+		uint8_t century = cmos_read(RTC_CENTURY);
+		uint8_t ctrl = cmos_read(RTC_REG_B);
 
-        /* Check UIP again — if set, the above values may be garbage */
-        if (cmos_read(RTC_REG_A) & RTC_UIP)
-            continue;
+		/* Check UIP again — if set, the above values may be garbage */
+		if (cmos_read(RTC_REG_A) & RTC_UIP)
+			continue;
 
-        /* Final seconds check — NMI might have interrupted us */
-        if (seconds != cmos_read(RTC_SECONDS))
-            continue;
+		/* Final seconds check — NMI might have interrupted us */
+		if (seconds != cmos_read(RTC_SECONDS))
+			continue;
 
-        /* Success — consistent snapshot */
-        *out_sec     = seconds;
-        *out_min     = min;
-        *out_hour    = hour;
-        *out_day     = day;
-        *out_mon     = mon;
-        *out_year    = year;
-        *out_century = century;
-        *out_ctrl    = ctrl;
-        return 1;
-    }
-    return 0;  /* timeout */
+		/* Success — consistent snapshot */
+		*out_sec = seconds;
+		*out_min = min;
+		*out_hour = hour;
+		*out_day = day;
+		*out_mon = mon;
+		*out_year = year;
+		*out_century = century;
+		*out_ctrl = ctrl;
+		return 1;
+	}
+	return 0; /* timeout */
 }
 
-static uint8_t bcd_to_bin(uint8_t val) {
-    return (val & 0x0F) + ((val >> 4) * 10);
+static uint8_t bcd_to_bin(uint8_t val)
+{
+	return (val & 0x0F) + ((val >> 4) * 10);
 }
 
 /* Days in each month (non-leap) */
-static const uint16_t days_in_month[12] = {
-    31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
-};
+static const uint16_t days_in_month[12] = { 31, 28, 31, 30, 31, 30,
+					    31, 31, 30, 31, 30, 31 };
 
-static int is_leap_year(int y) {
-    return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+static int is_leap_year(int y)
+{
+	return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
 }
 
 /* Convert date/time to Unix epoch seconds */
-static uint64_t datetime_to_epoch(int year, int month, int day,
-                                  int hour, int min, int sec)
+static uint64_t datetime_to_epoch(int year, int month, int day, int hour,
+				  int min, int sec)
 {
-    uint64_t total_days = 0;
-    /* Days from 1970 to year-1 */
-    for (int y = 1970; y < year; y++) {
-        total_days += is_leap_year(y) ? 366 : 365;
-    }
-    /* Days in months of current year */
-    for (int m = 1; m < month; m++) {
-        total_days += days_in_month[m - 1];
-        if (m == 2 && is_leap_year(year))
-            total_days++;
-    }
-    total_days += (day - 1);
-    return total_days * 86400ULL + hour * 3600ULL + min * 60ULL + sec;
+	uint64_t total_days = 0;
+	/* Days from 1970 to year-1 */
+	for (int y = 1970; y < year; y++) {
+		total_days += is_leap_year(y) ? 366 : 365;
+	}
+	/* Days in months of current year */
+	for (int m = 1; m < month; m++) {
+		total_days += days_in_month[m - 1];
+		if (m == 2 && is_leap_year(year))
+			total_days++;
+	}
+	total_days += (day - 1);
+	return total_days * 86400ULL + hour * 3600ULL + min * 60ULL + sec;
 }
 
 /*
@@ -352,218 +372,233 @@ static uint64_t datetime_to_epoch(int year, int month, int day,
  *   2. If CMOS fails (returns 0xFF, timeout, etc.), fall back to
  *      the bootloader's UEFI GetTime value (if available)
  */
-static void rtc_read_boot_time(void) {
-    uint8_t sec, min, hour, day, month, year, century, ctrl;
+static void rtc_read_boot_time(void)
+{
+	uint8_t sec, min, hour, day, month, year, century, ctrl;
 
-    /* Check ACPI FADT for NO_CMOS_RTC flag */
-    acpi_fadt_t *fadt = (acpi_fadt_t *)acpi_find_table(ACPI_SIG_FADT);
-    if (fadt) {
-        if (fadt->boot_arch_flags & ACPI_FADT_NO_CMOS_RTC) {
-            kprintf("RTC: FADT indicates no CMOS RTC\n");
-            goto try_uefi_fallback;
-        }
-    }
+	/* Check ACPI FADT for NO_CMOS_RTC flag */
+	acpi_fadt_t *fadt = (acpi_fadt_t *)acpi_find_table(ACPI_SIG_FADT);
+	if (fadt) {
+		if (fadt->boot_arch_flags & ACPI_FADT_NO_CMOS_RTC) {
+			kprintf("RTC: FADT indicates no CMOS RTC\n");
+			goto try_uefi_fallback;
+		}
+	}
 
-    /* Quick probe: if key registers return 0xFF, CMOS is not accessible */
-    uint8_t reg_a = cmos_read(RTC_REG_A);
-    uint8_t raw_sec = cmos_read(RTC_SECONDS);
-    if (reg_a == 0xFF && raw_sec == 0xFF) {
-        kprintf("RTC: CMOS not accessible (0xFF)\n");
-        goto try_uefi_fallback;
-    }
+	/* Quick probe: if key registers return 0xFF, CMOS is not accessible */
+	uint8_t reg_a = cmos_read(RTC_REG_A);
+	uint8_t raw_sec = cmos_read(RTC_SECONDS);
+	if (reg_a == 0xFF && raw_sec == 0xFF) {
+		kprintf("RTC: CMOS not accessible (0xFF)\n");
+		goto try_uefi_fallback;
+	}
 
-    /* Read all RTC registers with UIP-avoidance (1000ms timeout) */
-    if (!rtc_read_consistent(1000, &sec, &min, &hour, &day, &month,
-                             &year, &century, &ctrl)) {
-        kprintf("RTC: timeout reading CMOS\n");
-        goto try_uefi_fallback;
-    }
+	/* Read all RTC registers with UIP-avoidance (1000ms timeout) */
+	if (!rtc_read_consistent(1000, &sec, &min, &hour, &day, &month, &year,
+				 &century, &ctrl)) {
+		kprintf("RTC: timeout reading CMOS\n");
+		goto try_uefi_fallback;
+	}
 
-    /* Sanity check: if all time registers return 0xFF, RTC is not responding */
-    if (sec == 0xFF && min == 0xFF && hour == 0xFF &&
-        day == 0xFF && month == 0xFF && year == 0xFF) {
-        kprintf("RTC: CMOS time registers all 0xFF\n");
-        goto try_uefi_fallback;
-    }
+	/* Sanity check: if all time registers return 0xFF, RTC is not responding */
+	if (sec == 0xFF && min == 0xFF && hour == 0xFF && day == 0xFF &&
+	    month == 0xFF && year == 0xFF) {
+		kprintf("RTC: CMOS time registers all 0xFF\n");
+		goto try_uefi_fallback;
+	}
 
-    /* Convert BCD to binary if needed (check RTC_DM_BINARY in ctrl) */
-    if (!(ctrl & RTC_DM_BINARY)) {
-        sec     = bcd_to_bin(sec);
-        min     = bcd_to_bin(min);
-        hour    = bcd_to_bin(hour & 0x7F);  /* mask PM bit */
-        day     = bcd_to_bin(day);
-        month   = bcd_to_bin(month);
-        year    = bcd_to_bin(year);
-        century = bcd_to_bin(century);
-    }
+	/* Convert BCD to binary if needed (check RTC_DM_BINARY in ctrl) */
+	if (!(ctrl & RTC_DM_BINARY)) {
+		sec = bcd_to_bin(sec);
+		min = bcd_to_bin(min);
+		hour = bcd_to_bin(hour & 0x7F); /* mask PM bit */
+		day = bcd_to_bin(day);
+		month = bcd_to_bin(month);
+		year = bcd_to_bin(year);
+		century = bcd_to_bin(century);
+	}
 
-    /* Handle 12-hour mode */
-    if (!(ctrl & RTC_24H) && (hour & 0x80)) {
-        hour = ((hour & 0x7F) + 12) % 24;
-    }
+	/* Handle 12-hour mode */
+	if (!(ctrl & RTC_24H) && (hour & 0x80)) {
+		hour = ((hour & 0x7F) + 12) % 24;
+	}
 
-    /* Compute full year (century from ACPI FADT) */
-    int full_year;
-    if (century > 19) {
-        full_year = century * 100 + year;
-    } else if (century > 0) {
-        full_year = century * 100 + year;
-    } else {
-        full_year = (year < 70) ? (2000 + year) : (1900 + year);
-    }
+	/* Compute full year (century from ACPI FADT) */
+	int full_year;
+	if (century > 19) {
+		full_year = century * 100 + year;
+	} else if (century > 0) {
+		full_year = century * 100 + year;
+	} else {
+		full_year = (year < 70) ? (2000 + year) : (1900 + year);
+	}
 
-    g_boot_epoch = datetime_to_epoch(full_year, month, day, hour, min, sec);
-    kprintf("RTC: %d-%02d-%02d %02d:%02d:%02d UTC (epoch=%lu)\n",
-            full_year, month, day, hour, min, sec, (unsigned long)g_boot_epoch);
-    return;
+	g_boot_epoch = datetime_to_epoch(full_year, month, day, hour, min, sec);
+	kprintf("RTC: %d-%02d-%02d %02d:%02d:%02d UTC (epoch=%lu)\n", full_year,
+		month, day, hour, min, sec, (unsigned long)g_boot_epoch);
+	return;
 
 try_uefi_fallback:
-    /* CMOS failed - set the global flag so calibration knows to skip */
-    g_cmos_failed = 1;
-    
-    /* Try UEFI GetTime from bootloader as fallback */
-    if (g_boot_epoch_from_uefi && g_boot_epoch != 0) {
-        kprintf("RTC: Using UEFI GetTime from bootloader (epoch=%lu)\n",
-                (unsigned long)g_boot_epoch);
-        return;
-    }
-    
-    /* No fallback available */
-    kprintf("RTC: No time source available!\n");
+	/* CMOS failed - set the global flag so calibration knows to skip */
+	g_cmos_failed = 1;
+
+	/* Try UEFI GetTime from bootloader as fallback */
+	if (g_boot_epoch_from_uefi && g_boot_epoch != 0) {
+		kprintf("RTC: Using UEFI GetTime from bootloader (epoch=%lu)\n",
+			(unsigned long)g_boot_epoch);
+		return;
+	}
+
+	/* No fallback available */
+	kprintf("RTC: No time source available!\n");
 }
 
-uint64_t timer_get_epoch(void) {
-    if (g_pmtimer_available)
-        return g_boot_epoch + timer_get_precise_us() / 1000000ULL;
-    return g_boot_epoch + g_ticks / g_frequency;
+uint64_t timer_get_epoch(void)
+{
+	if (g_pmtimer_available)
+		return g_boot_epoch + timer_get_precise_us() / 1000000ULL;
+	return g_boot_epoch + g_ticks / g_frequency;
 }
 
-uint32_t timer_get_frequency(void) {
-    return g_frequency;
+uint32_t timer_get_frequency(void)
+{
+	return g_frequency;
 }
 
-uint64_t timer_get_uptime(void) {
-    if (g_pmtimer_available)
-        return timer_get_precise_us() / 1000000ULL;
-    return g_ticks / g_frequency;
+uint64_t timer_get_uptime(void)
+{
+	if (g_pmtimer_available)
+		return timer_get_precise_us() / 1000000ULL;
+	return g_ticks / g_frequency;
 }
 
-uint64_t timer_get_boot_epoch(void) {
-    return g_boot_epoch;
+uint64_t timer_get_boot_epoch(void)
+{
+	return g_boot_epoch;
 }
 
-uint64_t timer_get_tsc_at_tick(void) {
-    /* No longer used for timekeeping (PM Timer replaced TSC interpolation)
+uint64_t timer_get_tsc_at_tick(void)
+{
+	/* No longer used for timekeeping (PM Timer replaced TSC interpolation)
      * but kept for ABI compatibility. Returns 0. */
-    return 0;
+	return 0;
 }
 
-uint64_t timer_get_ticks_at_cpu_tick(void) {
-    return g_ticks;
+uint64_t timer_get_ticks_at_cpu_tick(void)
+{
+	return g_ticks;
 }
 
 /* Return total microseconds since boot, using PM Timer delta accumulation.
  * BSP tick handler sums PM Timer deltas into g_total_us (real wall-clock µs).
  * Sub-tick interpolation adds the PM Timer delta since the last BSP tick.
  * Uses a seqlock so the (g_total_us, g_pm_last) pair is read consistently. */
-uint64_t timer_get_precise_us(void) {
-    if (g_tsc_precise_available) {
-        uint64_t cycles;
-        uint32_t cpu_id;
+uint64_t timer_get_precise_us(void)
+{
+	if (g_tsc_precise_available) {
+		uint64_t cycles;
+		uint32_t cpu_id;
 
-        percpu_preempt_disable();
-        cpu_id = this_cpu_id();
+		percpu_preempt_disable();
+		cpu_id = this_cpu_id();
 
-        if (cpu_id < MAX_CPUS && !g_tsc_cpu_ready[cpu_id]) {
-            uint64_t t0 = rdtsc();
-            uint64_t base_us = timer_get_fallback_precise_us();
-            uint64_t t1 = rdtsc();
-            g_tsc_cpu_base_cycles[cpu_id] = t0 + ((t1 - t0) / 2);
-            g_tsc_cpu_base_us[cpu_id] = base_us;
-            __atomic_store_n(&g_tsc_cpu_ready[cpu_id], 1, __ATOMIC_RELEASE);
-        }
+		if (cpu_id < MAX_CPUS && !g_tsc_cpu_ready[cpu_id]) {
+			uint64_t t0 = rdtsc();
+			uint64_t base_us = timer_get_fallback_precise_us();
+			uint64_t t1 = rdtsc();
+			g_tsc_cpu_base_cycles[cpu_id] = t0 + ((t1 - t0) / 2);
+			g_tsc_cpu_base_us[cpu_id] = base_us;
+			__atomic_store_n(&g_tsc_cpu_ready[cpu_id], 1,
+					 __ATOMIC_RELEASE);
+		}
 
-        cycles = rdtsc();
-        if (cpu_id < MAX_CPUS && __atomic_load_n(&g_tsc_cpu_ready[cpu_id], __ATOMIC_ACQUIRE)) {
-            uint64_t delta = cycles - g_tsc_cpu_base_cycles[cpu_id];
-            uint64_t value = g_tsc_cpu_base_us[cpu_id] + tsc_cycles_to_us(delta);
-            percpu_preempt_enable();
-            return value;
-        }
+		cycles = rdtsc();
+		if (cpu_id < MAX_CPUS &&
+		    __atomic_load_n(&g_tsc_cpu_ready[cpu_id],
+				    __ATOMIC_ACQUIRE)) {
+			uint64_t delta = cycles - g_tsc_cpu_base_cycles[cpu_id];
+			uint64_t value = g_tsc_cpu_base_us[cpu_id] +
+					 tsc_cycles_to_us(delta);
+			percpu_preempt_enable();
+			return value;
+		}
 
-        percpu_preempt_enable();
-    }
+		percpu_preempt_enable();
+	}
 
-    return timer_get_fallback_precise_us();
+	return timer_get_fallback_precise_us();
 }
 
-void timer_init_hpet(void) {
-    acpi_hpet_t* hpet = (acpi_hpet_t*)acpi_find_table(ACPI_SIG_HPET);
-    if (!hpet) {
-        return;
-    }
+void timer_init_hpet(void)
+{
+	acpi_hpet_t *hpet = (acpi_hpet_t *)acpi_find_table(ACPI_SIG_HPET);
+	if (!hpet) {
+		return;
+	}
 
-    if (hpet->base_addr_space_id != 0 || hpet->base_address == 0) {
-        return;
-    }
+	if (hpet->base_addr_space_id != 0 || hpet->base_address == 0) {
+		return;
+	}
 
-    uint64_t virt = mm_map_device_mmio(hpet->base_address, 1);
-    if (!virt) {
-        return;
-    }
+	uint64_t virt = mm_map_device_mmio(hpet->base_address, 1);
+	if (!virt) {
+		return;
+	}
 
-    g_hpet_regs = (volatile uint64_t*)virt;
+	g_hpet_regs = (volatile uint64_t *)virt;
 
-    uint64_t cap = hpet_read_reg(HPET_GEN_CAP_ID_OFFSET);
-    g_hpet_period_fs = (uint32_t)(cap >> 32);
-    if (g_hpet_period_fs == 0) {
-        g_hpet_regs = NULL;
-        return;
-    }
+	uint64_t cap = hpet_read_reg(HPET_GEN_CAP_ID_OFFSET);
+	g_hpet_period_fs = (uint32_t)(cap >> 32);
+	if (g_hpet_period_fs == 0) {
+		g_hpet_regs = NULL;
+		return;
+	}
 
-    uint64_t cfg = hpet_read_reg(HPET_GEN_CONFIG_OFFSET);
-    hpet_write_reg(HPET_GEN_CONFIG_OFFSET, cfg | HPET_GEN_CONFIG_ENABLE);
-    g_hpet_start = hpet_read_counter();
-    g_hpet_available = 1;
+	uint64_t cfg = hpet_read_reg(HPET_GEN_CONFIG_OFFSET);
+	hpet_write_reg(HPET_GEN_CONFIG_OFFSET, cfg | HPET_GEN_CONFIG_ENABLE);
+	g_hpet_start = hpet_read_counter();
+	g_hpet_available = 1;
 
-    kprintf("Timer: HPET at 0x%lx (period %u fs, precise timing enabled)\n",
-            (unsigned long)hpet->base_address, g_hpet_period_fs);
+	kprintf("Timer: HPET at 0x%lx (period %u fs, precise timing enabled)\n",
+		(unsigned long)hpet->base_address, g_hpet_period_fs);
 }
 
 /* Probe ACPI PM Timer and enable sub-tick interpolation if available.
  * Must be called after ACPICA initialization.
  * Reads the PM Timer I/O port from the FADT so we can use inl() directly
  * instead of going through ACPICA (which is not safe from IRQ context). */
-void timer_init_pmtimer(void) {
-    /* Read PM Timer port from custom FADT struct */
-    acpi_fadt_t *fadt = (acpi_fadt_t *)acpi_find_table(ACPI_SIG_FADT);
-    if (!fadt || fadt->pm_timer_length == 0) {
-        return;  /* No PM Timer in FADT */
-    }
-    uint16_t port = (uint16_t)fadt->pm_timer_block;
-    if (port == 0) {
-        return;  /* No valid port */
-    }
-    /* Determine PM Timer width from FADT flags (bit 8 = TMR_VAL_EXT) */
-    if (fadt->flags & (1 << 8)) {
-        g_pmtimer_mask = 0xFFFFFFFFU;  /* 32-bit PM Timer */
-    } else {
-        g_pmtimer_mask = 0x00FFFFFFU;  /* 24-bit PM Timer */
-    }
-    /* Test-read the port */
-    g_pmtimer_port = port;
-    uint32_t val1 = pmtimer_read();
-    /* A second read should return a different value (3.58 MHz counter) */
-    for (volatile int i = 0; i < 100; i++) {} /* tiny delay */
-    uint32_t val2 = pmtimer_read();
-    if (val1 == val2 && val1 == 0) {
-        g_pmtimer_port = 0;
-        return;  /* PM Timer not responding */
-    }
-    g_pmtimer_available = 1;
-    g_pm_last = pmtimer_read();
-    kprintf("Timer: ACPI PM Timer at port 0x%x (%d-bit, sub-tick enabled)\n",
-            port, (g_pmtimer_mask == 0xFFFFFFFFU) ? 32 : 24);
+void timer_init_pmtimer(void)
+{
+	/* Read PM Timer port from custom FADT struct */
+	acpi_fadt_t *fadt = (acpi_fadt_t *)acpi_find_table(ACPI_SIG_FADT);
+	if (!fadt || fadt->pm_timer_length == 0) {
+		return; /* No PM Timer in FADT */
+	}
+	uint16_t port = (uint16_t)fadt->pm_timer_block;
+	if (port == 0) {
+		return; /* No valid port */
+	}
+	/* Determine PM Timer width from FADT flags (bit 8 = TMR_VAL_EXT) */
+	if (fadt->flags & (1 << 8)) {
+		g_pmtimer_mask = 0xFFFFFFFFU; /* 32-bit PM Timer */
+	} else {
+		g_pmtimer_mask = 0x00FFFFFFU; /* 24-bit PM Timer */
+	}
+	/* Test-read the port */
+	g_pmtimer_port = port;
+	uint32_t val1 = pmtimer_read();
+	/* A second read should return a different value (3.58 MHz counter) */
+	for (volatile int i = 0; i < 100; i++) {
+	} /* tiny delay */
+	uint32_t val2 = pmtimer_read();
+	if (val1 == val2 && val1 == 0) {
+		g_pmtimer_port = 0;
+		return; /* PM Timer not responding */
+	}
+	g_pmtimer_available = 1;
+	g_pm_last = pmtimer_read();
+	kprintf("Timer: ACPI PM Timer at port 0x%x (%d-bit, sub-tick enabled)\n",
+		port, (g_pmtimer_mask == 0xFFFFFFFFU) ? 32 : 24);
 }
 
 /*
@@ -572,20 +607,23 @@ void timer_init_pmtimer(void) {
  * Called from init.c with the boot_epoch value from boot_info_t.
  * The bootloader reads the time using UEFI GetTime() before ExitBootServices.
  */
-void timer_set_boot_epoch(uint64_t epoch) {
-    if (epoch > 0) {
-        g_boot_epoch = epoch;
-        g_boot_epoch_from_uefi = 1;
-        kprintf("Timer: boot epoch from UEFI = %lu\n", (unsigned long)epoch);
-    }
+void timer_set_boot_epoch(uint64_t epoch)
+{
+	if (epoch > 0) {
+		g_boot_epoch = epoch;
+		g_boot_epoch_from_uefi = 1;
+		kprintf("Timer: boot epoch from UEFI = %lu\n",
+			(unsigned long)epoch);
+	}
 }
 
 /* ======================================================================
  * CMOS RTC writer — writes wall-clock time back to the hardware RTC
  * ====================================================================== */
 
-static uint8_t bin_to_bcd(uint8_t val) {
-    return (uint8_t)(((val / 10) << 4) | (val % 10));
+static uint8_t bin_to_bcd(uint8_t val)
+{
+	return (uint8_t)(((val / 10) << 4) | (val % 10));
 }
 
 /*
@@ -598,79 +636,86 @@ static uint8_t bin_to_bcd(uint8_t val) {
  *   4. Write all time registers
  *   5. Restore reg A and reg B (clears SET, resumes counting)
  */
-static void cmos_write_datetime(uint64_t epoch) {
-    /* Break epoch into date/time components */
-    uint64_t rem = epoch;
-    int sec  = (int)(rem % 60); rem /= 60;
-    int min  = (int)(rem % 60); rem /= 60;
-    int hour = (int)(rem % 24); rem /= 24;
+static void cmos_write_datetime(uint64_t epoch)
+{
+	/* Break epoch into date/time components */
+	uint64_t rem = epoch;
+	int sec = (int)(rem % 60);
+	rem /= 60;
+	int min = (int)(rem % 60);
+	rem /= 60;
+	int hour = (int)(rem % 24);
+	rem /= 24;
 
-    /* rem is now days since 1970-01-01 */
-    int year = 1970;
-    for (;;) {
-        int ylen = is_leap_year(year) ? 366 : 365;
-        if ((int)rem < ylen) break;
-        rem -= ylen;
-        year++;
-    }
+	/* rem is now days since 1970-01-01 */
+	int year = 1970;
+	for (;;) {
+		int ylen = is_leap_year(year) ? 366 : 365;
+		if ((int)rem < ylen)
+			break;
+		rem -= ylen;
+		year++;
+	}
 
-    int month = 1;
-    for (int m = 0; m < 12; m++) {
-        int mlen = days_in_month[m];
-        if (m == 1 && is_leap_year(year)) mlen++;
-        if ((int)rem < mlen) break;
-        rem -= mlen;
-        month++;
-    }
-    int day = (int)rem + 1;
+	int month = 1;
+	for (int m = 0; m < 12; m++) {
+		int mlen = days_in_month[m];
+		if (m == 1 && is_leap_year(year))
+			mlen++;
+		if ((int)rem < mlen)
+			break;
+		rem -= mlen;
+		month++;
+	}
+	int day = (int)rem + 1;
 
-    int century_val = year / 100;
-    int yrs = year % 100;
+	int century_val = year / 100;
+	int yrs = year % 100;
 
-    /* Read control register to check BCD/binary mode */
-    uint8_t save_control = cmos_read(RTC_REG_B);
+	/* Read control register to check BCD/binary mode */
+	uint8_t save_control = cmos_read(RTC_REG_B);
 
-    /* Convert values to BCD if needed (check RTC_DM_BINARY) */
-    uint8_t w_sec = (uint8_t)sec;
-    uint8_t w_min = (uint8_t)min;
-    uint8_t w_hrs = (uint8_t)hour;
-    uint8_t w_day = (uint8_t)day;
-    uint8_t w_mon = (uint8_t)month;
-    uint8_t w_yrs = (uint8_t)yrs;
-    uint8_t w_cen = (uint8_t)century_val;
+	/* Convert values to BCD if needed (check RTC_DM_BINARY) */
+	uint8_t w_sec = (uint8_t)sec;
+	uint8_t w_min = (uint8_t)min;
+	uint8_t w_hrs = (uint8_t)hour;
+	uint8_t w_day = (uint8_t)day;
+	uint8_t w_mon = (uint8_t)month;
+	uint8_t w_yrs = (uint8_t)yrs;
+	uint8_t w_cen = (uint8_t)century_val;
 
-    if (!(save_control & RTC_DM_BINARY)) {
-        w_sec = bin_to_bcd(w_sec);
-        w_min = bin_to_bcd(w_min);
-        w_hrs = bin_to_bcd(w_hrs);
-        w_day = bin_to_bcd(w_day);
-        w_mon = bin_to_bcd(w_mon);
-        w_yrs = bin_to_bcd(w_yrs);
-        w_cen = bin_to_bcd(w_cen);
-    }
+	if (!(save_control & RTC_DM_BINARY)) {
+		w_sec = bin_to_bcd(w_sec);
+		w_min = bin_to_bcd(w_min);
+		w_hrs = bin_to_bcd(w_hrs);
+		w_day = bin_to_bcd(w_day);
+		w_mon = bin_to_bcd(w_mon);
+		w_yrs = bin_to_bcd(w_yrs);
+		w_cen = bin_to_bcd(w_cen);
+	}
 
-    /* 1. Set RTC_SET bit in control register (inhibit updates) */
-    cmos_write(RTC_REG_B, save_control | RTC_SET);
+	/* 1. Set RTC_SET bit in control register (inhibit updates) */
+	cmos_write(RTC_REG_B, save_control | RTC_SET);
 
-    /* 2. Reset divider in freq_select register (stop time counting) */
-    uint8_t save_freq_select = cmos_read(RTC_REG_A);
-    cmos_write(RTC_REG_A, (save_freq_select | RTC_DIV_RESET2));
+	/* 2. Reset divider in freq_select register (stop time counting) */
+	uint8_t save_freq_select = cmos_read(RTC_REG_A);
+	cmos_write(RTC_REG_A, (save_freq_select | RTC_DIV_RESET2));
 
-    /* 3. Write all time registers */
-    cmos_write(RTC_YEAR, w_yrs);
-    cmos_write(RTC_MONTH, w_mon);
-    cmos_write(RTC_DAY_OF_MONTH, w_day);
-    cmos_write(RTC_HOURS, w_hrs);
-    cmos_write(RTC_MINUTES, w_min);
-    cmos_write(RTC_SECONDS, w_sec);
-    cmos_write(RTC_CENTURY, w_cen);
+	/* 3. Write all time registers */
+	cmos_write(RTC_YEAR, w_yrs);
+	cmos_write(RTC_MONTH, w_mon);
+	cmos_write(RTC_DAY_OF_MONTH, w_day);
+	cmos_write(RTC_HOURS, w_hrs);
+	cmos_write(RTC_MINUTES, w_min);
+	cmos_write(RTC_SECONDS, w_sec);
+	cmos_write(RTC_CENTURY, w_cen);
 
-    /* 4. Restore registers (clears SET bit, resumes counting) */
-    cmos_write(RTC_REG_B, save_control);
-    cmos_write(RTC_REG_A, save_freq_select);
+	/* 4. Restore registers (clears SET bit, resumes counting) */
+	cmos_write(RTC_REG_B, save_control);
+	cmos_write(RTC_REG_A, save_freq_select);
 
-    kprintf("RTC: set to %d-%02d-%02d %02d:%02d:%02d UTC (epoch=%lu)\n",
-            year, month, day, hour, min, sec, (unsigned long)epoch);
+	kprintf("RTC: set to %d-%02d-%02d %02d:%02d:%02d UTC (epoch=%lu)\n",
+		year, month, day, hour, min, sec, (unsigned long)epoch);
 }
 
 /*
@@ -679,27 +724,29 @@ static void cmos_write_datetime(uint64_t epoch) {
  * This adjusts g_boot_epoch so that timer_get_epoch() returns the
  * requested wall-clock time, and also syncs the hardware CMOS RTC.
  */
-void timer_set_time(uint64_t epoch) {
-    /* Compute new boot_epoch such that timer_get_epoch() returns the
+void timer_set_time(uint64_t epoch)
+{
+	/* Compute new boot_epoch such that timer_get_epoch() returns the
      * requested wall-clock time:
      *   epoch_now = boot_epoch + ticks/frequency
      *   => boot_epoch = epoch_now - ticks/frequency
      * But the caller gives us the desired epoch_now, so:
      */
-    uint64_t uptime = g_ticks / g_frequency;
-    g_boot_epoch = epoch - uptime;
+	uint64_t uptime = g_ticks / g_frequency;
+	g_boot_epoch = epoch - uptime;
 
-    /* Sync the hardware CMOS RTC to the new wall-clock time */
-    cmos_write_datetime(epoch);
+	/* Sync the hardware CMOS RTC to the new wall-clock time */
+	cmos_write_datetime(epoch);
 }
 
 /*
  * rdtsc — Read the Time Stamp Counter.
  */
-static inline uint64_t rdtsc(void) {
-    uint32_t low, high;
-    __asm__ volatile("rdtsc" : "=a"(low), "=d"(high));
-    return ((uint64_t)high << 32) | low;
+static inline uint64_t rdtsc(void)
+{
+	uint32_t low, high;
+	__asm__ volatile("rdtsc" : "=a"(low), "=d"(high));
+	return ((uint64_t)high << 32) | low;
 }
 
 /*
@@ -711,44 +758,47 @@ static inline uint64_t rdtsc(void) {
  *
  * Returns 1 on success, 0 if TSC frequency is unknown.
  */
-static int timer_calibrate_tsc(void) {
-    uint64_t tsc_hz = lapic_get_tsc_freq();
-    if (tsc_hz == 0) {
-        kprintf("Timer: TSC frequency unknown, cannot calibrate via TSC\n");
-        return 0;
-    }
+static int timer_calibrate_tsc(void)
+{
+	uint64_t tsc_hz = lapic_get_tsc_freq();
+	if (tsc_hz == 0) {
+		kprintf("Timer: TSC frequency unknown, cannot calibrate via TSC\n");
+		return 0;
+	}
 
-    kprintf("Timer: Calibrating via TSC (freq=%lu Hz)...\n", (unsigned long)tsc_hz);
+	kprintf("Timer: Calibrating via TSC (freq=%lu Hz)...\n",
+		(unsigned long)tsc_hz);
 
-    /* Measure timer ticks over exactly 1 second using TSC */
-    uint64_t tsc_one_second = tsc_hz;
+	/* Measure timer ticks over exactly 1 second using TSC */
+	uint64_t tsc_one_second = tsc_hz;
 
-    uint64_t t0 = g_ticks;
-    uint64_t tsc_start = rdtsc();
+	uint64_t t0 = g_ticks;
+	uint64_t tsc_start = rdtsc();
 
-    /* Spin until 1 second has elapsed according to TSC */
-    while ((rdtsc() - tsc_start) < tsc_one_second)
-        __asm__ volatile("pause");
+	/* Spin until 1 second has elapsed according to TSC */
+	while ((rdtsc() - tsc_start) < tsc_one_second)
+		__asm__ volatile("pause");
 
-    uint64_t t1 = g_ticks;
-    uint64_t measured = t1 - t0;
+	uint64_t t1 = g_ticks;
+	uint64_t measured = t1 - t0;
 
-    /* Sanity bounds: must be within 0.5x..2x of the configured rate.
+	/* Sanity bounds: must be within 0.5x..2x of the configured rate.
      * The TSC window is exactly 1 s of wall time, so a wildly different
      * tick count means the IRQ source is misbehaving (e.g. lost ticks). */
-    uint32_t expected = g_frequency ? g_frequency : 100;
-    uint32_t lo_bound = expected / 2;
-    uint32_t hi_bound = expected * 2;
-    if (measured >= lo_bound && measured <= hi_bound) {
-        g_frequency = (uint32_t)measured;
-        kprintf("Timer: TSC-calibrated frequency = %u Hz\n", g_frequency);
-        timer_enable_reliable_tsc_precise_time();
-        return 1;
-    }
+	uint32_t expected = g_frequency ? g_frequency : 100;
+	uint32_t lo_bound = expected / 2;
+	uint32_t hi_bound = expected * 2;
+	if (measured >= lo_bound && measured <= hi_bound) {
+		g_frequency = (uint32_t)measured;
+		kprintf("Timer: TSC-calibrated frequency = %u Hz\n",
+			g_frequency);
+		timer_enable_reliable_tsc_precise_time();
+		return 1;
+	}
 
-    kprintf("Timer: TSC calibration out of range (%lu ticks/sec, expected ~%u), keeping %u Hz\n",
-            (unsigned long)measured, expected, g_frequency);
-    return 0;
+	kprintf("Timer: TSC calibration out of range (%lu ticks/sec, expected ~%u), keeping %u Hz\n",
+		(unsigned long)measured, expected, g_frequency);
+	return 0;
 }
 
 /*
@@ -762,51 +812,55 @@ static int timer_calibrate_tsc(void) {
  *
  * Returns 1 on success, 0 if HPET is unavailable or out of range.
  */
-static int timer_calibrate_hpet(void) {
-    if (!g_hpet_available || g_hpet_period_fs == 0) {
-        return 0;
-    }
+static int timer_calibrate_hpet(void)
+{
+	if (!g_hpet_available || g_hpet_period_fs == 0) {
+		return 0;
+	}
 
-    /* Counter increments every g_hpet_period_fs femtoseconds.
+	/* Counter increments every g_hpet_period_fs femtoseconds.
      * Ticks per second = 1e15 / period_fs. */
-    uint64_t hpet_one_second = 1000000000000000ULL / (uint64_t)g_hpet_period_fs;
-    if (hpet_one_second == 0) {
-        return 0;
-    }
+	uint64_t hpet_one_second =
+		1000000000000000ULL / (uint64_t)g_hpet_period_fs;
+	if (hpet_one_second == 0) {
+		return 0;
+	}
 
-    uint64_t t0 = g_ticks;
-    uint64_t hpet_start = hpet_read_counter();
-    uint64_t tsc_start = rdtsc();
+	uint64_t t0 = g_ticks;
+	uint64_t hpet_start = hpet_read_counter();
+	uint64_t tsc_start = rdtsc();
 
-    /* Spin until 1 second of HPET counts has elapsed. */
-    while ((hpet_read_counter() - hpet_start) < hpet_one_second)
-        __asm__ volatile("pause");
+	/* Spin until 1 second of HPET counts has elapsed. */
+	while ((hpet_read_counter() - hpet_start) < hpet_one_second)
+		__asm__ volatile("pause");
 
-    uint64_t t1 = g_ticks;
-    uint64_t tsc_end = rdtsc();
-    uint64_t measured = t1 - t0;
+	uint64_t t1 = g_ticks;
+	uint64_t tsc_end = rdtsc();
+	uint64_t measured = t1 - t0;
 
-    uint32_t expected = g_frequency ? g_frequency : 100;
-    uint32_t lo_bound = expected / 2;
-    uint32_t hi_bound = expected * 2;
-    if (measured >= lo_bound && measured <= hi_bound) {
-        g_frequency = (uint32_t)measured;
-        kprintf("Timer: HPET-calibrated frequency = %u Hz\n", g_frequency);
+	uint32_t expected = g_frequency ? g_frequency : 100;
+	uint32_t lo_bound = expected / 2;
+	uint32_t hi_bound = expected * 2;
+	if (measured >= lo_bound && measured <= hi_bound) {
+		g_frequency = (uint32_t)measured;
+		kprintf("Timer: HPET-calibrated frequency = %u Hz\n",
+			g_frequency);
 
-        /* Calibrate TSC frequency from the same 1-second HPET window. */
-        uint64_t tsc_delta = tsc_end - tsc_start;
-        if (!lapic_tsc_is_reliable() && tsc_delta > 100000000ULL && tsc_delta < 20000000000ULL) {
-            lapic_set_tsc_freq(tsc_delta);
-            kprintf("Timer: HPET-calibrated TSC freq = %lu Hz\n",
-                    (unsigned long)tsc_delta);
-        }
-        timer_enable_reliable_tsc_precise_time();
-        return 1;
-    }
+		/* Calibrate TSC frequency from the same 1-second HPET window. */
+		uint64_t tsc_delta = tsc_end - tsc_start;
+		if (!lapic_tsc_is_reliable() && tsc_delta > 100000000ULL &&
+		    tsc_delta < 20000000000ULL) {
+			lapic_set_tsc_freq(tsc_delta);
+			kprintf("Timer: HPET-calibrated TSC freq = %lu Hz\n",
+				(unsigned long)tsc_delta);
+		}
+		timer_enable_reliable_tsc_precise_time();
+		return 1;
+	}
 
-    kprintf("Timer: HPET calibration out of range (%lu ticks/sec, expected ~%u)\n",
-            (unsigned long)measured, expected);
-    return 0;
+	kprintf("Timer: HPET calibration out of range (%lu ticks/sec, expected ~%u)\n",
+		(unsigned long)measured, expected);
+	return 0;
 }
 
 /*
@@ -819,269 +873,286 @@ static int timer_calibrate_hpet(void) {
  *
  * Must be called AFTER the timer interrupt is running (PIT or LAPIC).
  */
-void timer_calibrate_frequency(void) {
-    /* Method 1: HPET — gold standard when present. */
-    if (timer_calibrate_hpet()) {
-        return;
-    }
+void timer_calibrate_frequency(void)
+{
+	/* Method 1: HPET — gold standard when present. */
+	if (timer_calibrate_hpet()) {
+		return;
+	}
 
-    /* If rtc_read_boot_time() already determined CMOS is broken,
+	/* If rtc_read_boot_time() already determined CMOS is broken,
      * go straight to TSC fallback — no point probing CMOS again. */
-    if (g_cmos_failed) {
-        kprintf("Timer: CMOS not available, trying TSC calibration\n");
-        if (!timer_calibrate_tsc())
-            kprintf("Timer: No calibration source available, keeping %u Hz\n",
-                    g_frequency);
-        timer_enable_reliable_tsc_precise_time();
-        return;
-    }
+	if (g_cmos_failed) {
+		kprintf("Timer: CMOS not available, trying TSC calibration\n");
+		if (!timer_calibrate_tsc())
+			kprintf("Timer: No calibration source available, keeping %u Hz\n",
+				g_frequency);
+		timer_enable_reliable_tsc_precise_time();
+		return;
+	}
 
-    /* Quick probe: if CMOS seconds register returns 0xFF, fall back to TSC */
-    uint8_t probe = cmos_read(RTC_SECONDS);
-    uint8_t reg_a = cmos_read(RTC_REG_A);
-    
-    if (probe == 0xFF || reg_a == 0xFF) {
-        kprintf("Timer: CMOS not responding, trying TSC calibration\n");
-        if (!timer_calibrate_tsc())
-            kprintf("Timer: No calibration source available, keeping %u Hz\n",
-                    g_frequency);
-        timer_enable_reliable_tsc_precise_time();
-        return;
-    }
+	/* Quick probe: if CMOS seconds register returns 0xFF, fall back to TSC */
+	uint8_t probe = cmos_read(RTC_SECONDS);
+	uint8_t reg_a = cmos_read(RTC_REG_A);
 
-    /* ---- Method 1: CMOS RTC second boundaries ---- */
+	if (probe == 0xFF || reg_a == 0xFF) {
+		kprintf("Timer: CMOS not responding, trying TSC calibration\n");
+		if (!timer_calibrate_tsc())
+			kprintf("Timer: No calibration source available, keeping %u Hz\n",
+				g_frequency);
+		timer_enable_reliable_tsc_precise_time();
+		return;
+	}
 
-    /* Wait for the RTC to NOT be updating (tick-based timeout: 200 ticks = 2s) */
-    uint64_t start_tick = g_ticks;
-    while ((cmos_read(RTC_REG_A) & RTC_UIP) && (g_ticks - start_tick < 200))
-        ;
-    if (g_ticks - start_tick >= 200) {
-        kprintf("Timer: CMOS UIP timeout, trying TSC calibration\n");
-        timer_calibrate_tsc();
-        timer_enable_reliable_tsc_precise_time();
-        return;
-    }
-    
-    uint8_t prev_sec = cmos_read(RTC_SECONDS);
+	/* ---- Method 1: CMOS RTC second boundaries ---- */
 
-    /* Wait for the second to change (first boundary) — tick-based timeout ~3s */
-    start_tick = g_ticks;
-    for (;;) {
-        while ((cmos_read(RTC_REG_A) & RTC_UIP) && (g_ticks - start_tick < 300))
-            ;
-        uint8_t cur_sec = cmos_read(RTC_SECONDS);
-        if (cur_sec != prev_sec)
-            break;
-        if (g_ticks - start_tick >= 300) {
-            kprintf("Timer: calibration timeout waiting for first RTC second boundary\n");
-            kprintf("Timer: Falling back to TSC calibration\n");
-            timer_calibrate_tsc();
-            timer_enable_reliable_tsc_precise_time();
-            return;
-        }
-    }
-    uint64_t t0 = g_ticks;
-    uint64_t tsc0 = rdtsc();  /* TSC at first RTC second boundary */
+	/* Wait for the RTC to NOT be updating (tick-based timeout: 200 ticks = 2s) */
+	uint64_t start_tick = g_ticks;
+	while ((cmos_read(RTC_REG_A) & RTC_UIP) && (g_ticks - start_tick < 200))
+		;
+	if (g_ticks - start_tick >= 200) {
+		kprintf("Timer: CMOS UIP timeout, trying TSC calibration\n");
+		timer_calibrate_tsc();
+		timer_enable_reliable_tsc_precise_time();
+		return;
+	}
 
-    /* Wait for the second to change again (second boundary = exactly 1s later) */
-    uint8_t boundary_sec;
-    while ((cmos_read(RTC_REG_A) & RTC_UIP) && (g_ticks - t0 < 200))
-        ;
-    boundary_sec = cmos_read(RTC_SECONDS);
-    start_tick = g_ticks;
-    for (;;) {
-        while ((cmos_read(RTC_REG_A) & RTC_UIP) && (g_ticks - start_tick < 300))
-            ;
-        uint8_t cur_sec = cmos_read(RTC_SECONDS);
-        if (cur_sec != boundary_sec)
-            break;
-        if (g_ticks - start_tick >= 300) {
-            kprintf("Timer: calibration timeout waiting for second RTC second boundary\n");
-            kprintf("Timer: Falling back to TSC calibration\n");
-            timer_calibrate_tsc();
-            timer_enable_reliable_tsc_precise_time();
-            return;
-        }
-    }
-    uint64_t t1 = g_ticks;
-    uint64_t tsc1 = rdtsc();  /* TSC at second RTC second boundary */
+	uint8_t prev_sec = cmos_read(RTC_SECONDS);
 
-    uint64_t measured = t1 - t0;
-    /* Sanity bounds: configured rate ± 50 %. Some virtualized RTCs
+	/* Wait for the second to change (first boundary) — tick-based timeout ~3s */
+	start_tick = g_ticks;
+	for (;;) {
+		while ((cmos_read(RTC_REG_A) & RTC_UIP) &&
+		       (g_ticks - start_tick < 300))
+			;
+		uint8_t cur_sec = cmos_read(RTC_SECONDS);
+		if (cur_sec != prev_sec)
+			break;
+		if (g_ticks - start_tick >= 300) {
+			kprintf("Timer: calibration timeout waiting for first RTC second boundary\n");
+			kprintf("Timer: Falling back to TSC calibration\n");
+			timer_calibrate_tsc();
+			timer_enable_reliable_tsc_precise_time();
+			return;
+		}
+	}
+	uint64_t t0 = g_ticks;
+	uint64_t tsc0 = rdtsc(); /* TSC at first RTC second boundary */
+
+	/* Wait for the second to change again (second boundary = exactly 1s later) */
+	uint8_t boundary_sec;
+	while ((cmos_read(RTC_REG_A) & RTC_UIP) && (g_ticks - t0 < 200))
+		;
+	boundary_sec = cmos_read(RTC_SECONDS);
+	start_tick = g_ticks;
+	for (;;) {
+		while ((cmos_read(RTC_REG_A) & RTC_UIP) &&
+		       (g_ticks - start_tick < 300))
+			;
+		uint8_t cur_sec = cmos_read(RTC_SECONDS);
+		if (cur_sec != boundary_sec)
+			break;
+		if (g_ticks - start_tick >= 300) {
+			kprintf("Timer: calibration timeout waiting for second RTC second boundary\n");
+			kprintf("Timer: Falling back to TSC calibration\n");
+			timer_calibrate_tsc();
+			timer_enable_reliable_tsc_precise_time();
+			return;
+		}
+	}
+	uint64_t t1 = g_ticks;
+	uint64_t tsc1 = rdtsc(); /* TSC at second RTC second boundary */
+
+	uint64_t measured = t1 - t0;
+	/* Sanity bounds: configured rate ± 50 %. Some virtualized RTCs
      * (notably VirtualBox) miss UIP transitions, so the "1 s" window
      * between two second-boundary detections can actually be many
      * seconds long. In that case the measured tick count is far higher
      * than the configured rate and we must reject it — otherwise sleep()
      * and every other tick→time conversion is scaled by the same bogus
      * factor. */
-    uint32_t expected = g_frequency ? g_frequency : 100;
-    uint32_t lo_bound = expected / 2;
-    uint32_t hi_bound = expected * 2;
-    if (measured >= lo_bound && measured <= hi_bound) {
-        /* Sane range — accept the measurement */
-        g_frequency = (uint32_t)measured;
-        kprintf("Timer: CMOS-calibrated frequency = %u Hz\n", g_frequency);
-    } else {
-        kprintf("Timer: CMOS calibration out of range (%lu ticks/sec, expected ~%u), trying TSC\n",
-                (unsigned long)measured, expected);
-        timer_calibrate_tsc();
-        timer_enable_reliable_tsc_precise_time();
-        return;
-    }
+	uint32_t expected = g_frequency ? g_frequency : 100;
+	uint32_t lo_bound = expected / 2;
+	uint32_t hi_bound = expected * 2;
+	if (measured >= lo_bound && measured <= hi_bound) {
+		/* Sane range — accept the measurement */
+		g_frequency = (uint32_t)measured;
+		kprintf("Timer: CMOS-calibrated frequency = %u Hz\n",
+			g_frequency);
+	} else {
+		kprintf("Timer: CMOS calibration out of range (%lu ticks/sec, expected ~%u), trying TSC\n",
+			(unsigned long)measured, expected);
+		timer_calibrate_tsc();
+		timer_enable_reliable_tsc_precise_time();
+		return;
+	}
 
-    /* Calibrate TSC frequency from the same 1-second RTC window.
+	/* Calibrate TSC frequency from the same 1-second RTC window.
      * Only trust this if the CMOS measurement itself was within the
      * sanity range above; otherwise the window wasn't really 1 s. */
-    uint64_t tsc_delta = tsc1 - tsc0;
-    if (!lapic_tsc_is_reliable() && tsc_delta > 100000000ULL && tsc_delta < 20000000000ULL) {
-        lapic_set_tsc_freq(tsc_delta);
-        kprintf("Timer: RTC-calibrated TSC freq = %lu Hz\n",
-                (unsigned long)tsc_delta);
-    }
+	uint64_t tsc_delta = tsc1 - tsc0;
+	if (!lapic_tsc_is_reliable() && tsc_delta > 100000000ULL &&
+	    tsc_delta < 20000000000ULL) {
+		lapic_set_tsc_freq(tsc_delta);
+		kprintf("Timer: RTC-calibrated TSC freq = %lu Hz\n",
+			(unsigned long)tsc_delta);
+	}
 
-    timer_enable_reliable_tsc_precise_time();
+	timer_enable_reliable_tsc_precise_time();
 }
 
-void timer_init(uint32_t frequency_hz) {
-    if (frequency_hz < 19 || frequency_hz > 1193182) {
-        WARN_ON_ONCE(1);  /* timer_init: requested frequency %u out of PIT range */
-        frequency_hz = 100; // Clamp to safe default
-    }
-    g_frequency = frequency_hz;
+void timer_init(uint32_t frequency_hz)
+{
+	if (frequency_hz < 19 || frequency_hz > 1193182) {
+		WARN_ON_ONCE(
+			1); /* timer_init: requested frequency %u out of PIT range */
+		frequency_hz = 100; // Clamp to safe default
+	}
+	g_frequency = frequency_hz;
 
-    // Calculate divisor for desired frequency
-    uint32_t divisor = PIT_BASE_FREQ / frequency_hz;
-    if (divisor > 65535) divisor = 65535;
-    if (divisor < 1) divisor = 1;
+	// Calculate divisor for desired frequency
+	uint32_t divisor = PIT_BASE_FREQ / frequency_hz;
+	if (divisor > 65535)
+		divisor = 65535;
+	if (divisor < 1)
+		divisor = 1;
 
-    // Channel 0, lobyte/hibyte, rate generator mode
-    outb(PIT_CMD, 0x36);
+	// Channel 0, lobyte/hibyte, rate generator mode
+	outb(PIT_CMD, 0x36);
 
-    // Send divisor low/high bytes
-    outb(PIT_CHANNEL0_DATA, (uint8_t)(divisor & 0xFF));
-    outb(PIT_CHANNEL0_DATA, (uint8_t)((divisor >> 8) & 0xFF));
+	// Send divisor low/high bytes
+	outb(PIT_CHANNEL0_DATA, (uint8_t)(divisor & 0xFF));
+	outb(PIT_CHANNEL0_DATA, (uint8_t)((divisor >> 8) & 0xFF));
 
-    kprintf("PIT timer initialized at %u Hz (divisor=%u)\n", frequency_hz, divisor);
+	kprintf("PIT timer initialized at %u Hz (divisor=%u)\n", frequency_hz,
+		divisor);
 
-    // Read CMOS RTC (or UEFI fallback) to establish wall-clock boot time
-    rtc_read_boot_time();
+	// Read CMOS RTC (or UEFI fallback) to establish wall-clock boot time
+	rtc_read_boot_time();
 }
 
-void timer_start(void) {
-    irq_enable(0); // Enable IRQ0
+void timer_start(void)
+{
+	irq_enable(0); // Enable IRQ0
 }
 
-void timer_stop(void) {
-    irq_disable(0); // Disable IRQ0
+void timer_stop(void)
+{
+	irq_disable(0); // Disable IRQ0
 }
 
-uint64_t timer_ticks(void) {
-    return g_ticks;
+uint64_t timer_ticks(void)
+{
+	return g_ticks;
 }
 
-void timer_irq_handler(void) {
-    // Determine if we're on BSP or AP
-    // Only BSP (CPU 0) manages global tick counter and task wakeups.
-    // APs receive this via LAPIC timer at the same vector but only
-    // manage their own per-CPU time slice tracking.
-    int is_bsp = 1;
-    if (sched_is_smp()) {
-        is_bsp = (this_cpu_id() == 0);
-    }
-    
-    if (is_bsp) {
-        /* Seqlock write: odd = updating, even = stable */
-        WARN_ON_ONCE(g_tick_seq & 1);  /* seqlock is odd on BSP tick entry: previous tick never closed the write window — readers will spin forever */
-        g_tick_seq++;
-        __asm__ volatile("" ::: "memory");
+void timer_irq_handler(void)
+{
+	// Determine if we're on BSP or AP
+	// Only BSP (CPU 0) manages global tick counter and task wakeups.
+	// APs receive this via LAPIC timer at the same vector but only
+	// manage their own per-CPU time slice tracking.
+	int is_bsp = 1;
+	if (sched_is_smp()) {
+		is_bsp = (this_cpu_id() == 0);
+	}
 
-        g_ticks++;
+	if (is_bsp) {
+		/* Seqlock write: odd = updating, even = stable */
+		WARN_ON_ONCE(
+			g_tick_seq &
+			1); /* seqlock is odd on BSP tick entry: previous tick never closed the write window — readers will spin forever */
+		g_tick_seq++;
+		__asm__ volatile("" ::: "memory");
 
-        /* Accumulate real wall-clock microseconds from PM Timer deltas.
+		g_ticks++;
+
+		/* Accumulate real wall-clock microseconds from PM Timer deltas.
          * Each delta represents actual elapsed time since last BSP tick,
          * immune to virtual LAPIC timer jitter on VMware. */
-        if (g_pmtimer_available) {
-            uint32_t pm_now = pmtimer_read();
-            uint32_t delta = (pm_now - g_pm_last) & g_pmtimer_mask;
-            g_total_us += (uint64_t)delta * 1000000ULL / 3579545ULL;
-            g_pm_last = pm_now;
-        }
+		if (g_pmtimer_available) {
+			uint32_t pm_now = pmtimer_read();
+			uint32_t delta = (pm_now - g_pm_last) & g_pmtimer_mask;
+			g_total_us += (uint64_t)delta * 1000000ULL / 3579545ULL;
+			g_pm_last = pm_now;
+		}
 
-        __asm__ volatile("" ::: "memory");
-        g_tick_seq++;
+		__asm__ volatile("" ::: "memory");
+		g_tick_seq++;
 
-        // Feed entropy from timer jitter
-        entropy_add_timer_jitter();
+		// Feed entropy from timer jitter
+		entropy_add_timer_jitter();
 
-        // Wake any tasks whose sleep timer has expired and check signal timers
-        // This handles alarm(), itimer, and wakes sleeping tasks
-        sched_wake_expired_sleepers(g_ticks);
+		// Wake any tasks whose sleep timer has expired and check signal timers
+		// This handles alarm(), itimer, and wakes sleeping tasks
+		sched_wake_expired_sleepers(g_ticks);
 
-        // Update load averages every 500 ticks (~5 seconds at 100Hz)
-        if ((g_ticks % 500) == 0) {
-            sched_calc_load();
-        }
+		// Update load averages every 500 ticks (~5 seconds at 100Hz)
+		if ((g_ticks % 500) == 0) {
+			sched_calc_load();
+		}
 
-        // Page cache: signal periodic dirty writeback
-        pagecache_timer_tick(g_ticks);
-    }
+		// Page cache: signal periodic dirty writeback
+		pagecache_timer_tick(g_ticks);
+	}
 
-    // Per-CPU: manage this CPU's current task time slice
-    task_t* cur = sched_current();
-    if (cur) {
-        // Accounting: charge a tick to user or system time.
-        // Skip idle tasks and the bootstrap task (PID 0) — their CPU time
-        // should not be counted.
-        // Guard: this_cpu() reads %gs:0 which faults before percpu_init(),
-        // so only attempt the idle-task check after SMP is initialized.
-        int skip = (cur->id == 0);
-        if (!skip && sched_is_smp()) {
-            percpu_t* cpu = this_cpu();
-            if (cur == cpu->idle_task)
-                skip = 1;
-        }
-        if (!skip) {
-            if (cur->privilege == TASK_USER) {
-                if (cur->preempt_frame && (cur->preempt_frame->cs & 3) == 3)
-                    cur->utime_ticks++;
-                else
-                    cur->stime_ticks++;
-            } else {
-                cur->stime_ticks++;
-            }
-        }
+	// Per-CPU: manage this CPU's current task time slice
+	task_t *cur = sched_current();
+	if (cur) {
+		// Accounting: charge a tick to user or system time.
+		// Skip idle tasks and the bootstrap task (PID 0) — their CPU time
+		// should not be counted.
+		// Guard: this_cpu() reads %gs:0 which faults before percpu_init(),
+		// so only attempt the idle-task check after SMP is initialized.
+		int skip = (cur->id == 0);
+		if (!skip && sched_is_smp()) {
+			percpu_t *cpu = this_cpu();
+			if (cur == cpu->idle_task)
+				skip = 1;
+		}
+		if (!skip) {
+			if (cur->privilege == TASK_USER) {
+				if (cur->preempt_frame &&
+				    (cur->preempt_frame->cs & 3) == 3)
+					cur->utime_ticks++;
+				else
+					cur->stime_ticks++;
+			} else {
+				cur->stime_ticks++;
+			}
+		}
 
-        if (cur->remaining_ticks > 0) {
-            cur->remaining_ticks--;
-        }
-        // Always request preemption when the timeslice expires, regardless
-        // of task state.  In particular, a ZOMBIE task (killed by signal
-        // while running) sits in an `sti; hlt` loop waiting to be preempted
-        // off this CPU.  If we only checked RUNNING/READY here, the ZOMBIE
-        // would never get need_resched set, sched_preempt would never be
-        // called, and sched_remove_task on another CPU would spin forever
-        // waiting for this CPU to context-switch away.
-        if (cur->remaining_ticks == 0) {
-            sched_set_need_resched(cur);
-        }
-    }
-    
-    // Per-CPU load balancing: periodically pull tasks from busiest CPU
-    // Use per-CPU timer_ticks (incremented in percpu) to avoid depending
-    // on g_ticks which is only updated by BSP.  When g_ticks==0
-    // (BSP hasn't started yet), (0 % 50)==0 would fire load balance on
-    // EVERY AP timer interrupt, causing massive spinlock contention.
-    if (sched_is_smp()) {
-        percpu_t* cpu = this_cpu();
-        cpu->timer_ticks++;
-        if ((cpu->timer_ticks % 50) == 0) {
-            sched_load_balance();
-        }
-    }
-    
-    // Only BSP calls sched_tick for global statistics
-    if (is_bsp) {
-        sched_tick();
-        console_cursor_update();   /* cursor blink: called once per tick on BSP */
-    }
+		if (cur->remaining_ticks > 0) {
+			cur->remaining_ticks--;
+		}
+		// Always request preemption when the timeslice expires, regardless
+		// of task state.  In particular, a ZOMBIE task (killed by signal
+		// while running) sits in an `sti; hlt` loop waiting to be preempted
+		// off this CPU.  If we only checked RUNNING/READY here, the ZOMBIE
+		// would never get need_resched set, sched_preempt would never be
+		// called, and sched_remove_task on another CPU would spin forever
+		// waiting for this CPU to context-switch away.
+		if (cur->remaining_ticks == 0) {
+			sched_set_need_resched(cur);
+		}
+	}
+
+	// Per-CPU load balancing: periodically pull tasks from busiest CPU
+	// Use per-CPU timer_ticks (incremented in percpu) to avoid depending
+	// on g_ticks which is only updated by BSP.  When g_ticks==0
+	// (BSP hasn't started yet), (0 % 50)==0 would fire load balance on
+	// EVERY AP timer interrupt, causing massive spinlock contention.
+	if (sched_is_smp()) {
+		percpu_t *cpu = this_cpu();
+		cpu->timer_ticks++;
+		if ((cpu->timer_ticks % 50) == 0) {
+			sched_load_balance();
+		}
+	}
+
+	// Only BSP calls sched_tick for global statistics
+	if (is_bsp) {
+		sched_tick();
+		console_cursor_update(); /* cursor blink: called once per tick on BSP */
+	}
 }

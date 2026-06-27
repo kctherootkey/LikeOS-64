@@ -1,6 +1,6 @@
 // LikeOS-64 - xHCI (USB 3.0) Host Controller Driver
 // Interrupt-driven implementation with synchronous transfer API
-// 
+//
 // Design principles:
 // 1. Pre-compute all physical addresses BEFORE enqueueing TRBs
 // 2. Properly handle ring wraparound with link TRBs
@@ -21,14 +21,14 @@
 // Debug output control
 #define XHCI_DEBUG 0
 #if XHCI_DEBUG
-    #define xhci_dbg(fmt, ...) kprintf("[XHCI] " fmt, ##__VA_ARGS__)
+#define xhci_dbg(fmt, ...) kprintf("[XHCI] " fmt, ##__VA_ARGS__)
 #else
-    #define xhci_dbg(fmt, ...) ((void)0)
+#define xhci_dbg(fmt, ...) ((void)0)
 #endif
 
 // Global controller instances
-xhci_controller_t g_xhci;       // Primary (mass storage)
-xhci_controller_t g_xhci_hid;   // Secondary (HID devices, if present)
+xhci_controller_t g_xhci; // Primary (mass storage)
+xhci_controller_t g_xhci_hid; // Secondary (HID devices, if present)
 
 // Spinlock for xHCI controller access (shared by all controllers)
 static spinlock_t xhci_lock = SPINLOCK_INIT("xhci");
@@ -36,11 +36,12 @@ static spinlock_t xhci_lock = SPINLOCK_INIT("xhci");
 // Process events while holding xhci_lock with IRQs disabled.
 // This serialises against the IRQ handler (xhci_irq_service) and prevents
 // concurrent/reentrant access to the event ring (dequeue, cycle, ERDP).
-void xhci_process_events_locked(xhci_controller_t* ctrl) {
-    uint64_t flags;
-    spin_lock_irqsave(&xhci_lock, &flags);
-    xhci_process_events(ctrl);
-    spin_unlock_irqrestore(&xhci_lock, flags);
+void xhci_process_events_locked(xhci_controller_t *ctrl)
+{
+	uint64_t flags;
+	spin_lock_irqsave(&xhci_lock, &flags);
+	xhci_process_events(ctrl);
+	spin_unlock_irqrestore(&xhci_lock, flags);
 }
 
 // Safely clear pending_xfer pointer under lock to prevent race with IRQ handler.
@@ -49,69 +50,81 @@ void xhci_process_events_locked(xhci_controller_t* ctrl) {
 // Non-static: the MSD orphan-lock-recovery path also calls this when a task
 // dies inside xhci_bulk_transfer_in/out (which leaves a stack pointer in
 // pending_xfer that will be dangling once the task's kernel stack is freed).
-void xhci_clear_pending_xfer(xhci_controller_t* ctrl, uint8_t slot, uint8_t dci) {
-    uint64_t flags;
-    WARN_ON(slot == 0 || slot > XHCI_MAX_SLOTS);  /* slot 0 is reserved, slots go 1..XHCI_MAX_SLOTS */
-    WARN_ON(dci >= XHCI_MAX_ENDPOINTS);            /* endpoint DCI out of range */
-    spin_lock_irqsave(&xhci_lock, &flags);
-    ctrl->pending_xfer[slot - 1][dci] = NULL;
-    spin_unlock_irqrestore(&xhci_lock, flags);
+void xhci_clear_pending_xfer(xhci_controller_t *ctrl, uint8_t slot, uint8_t dci)
+{
+	uint64_t flags;
+	WARN_ON(slot == 0 ||
+		slot > XHCI_MAX_SLOTS); /* slot 0 is reserved, slots go 1..XHCI_MAX_SLOTS */
+	WARN_ON(dci >= XHCI_MAX_ENDPOINTS); /* endpoint DCI out of range */
+	spin_lock_irqsave(&xhci_lock, &flags);
+	ctrl->pending_xfer[slot - 1][dci] = NULL;
+	spin_unlock_irqrestore(&xhci_lock, flags);
 }
 
 // Internal helper prototypes
-static void xhci_setup_scratchpad(xhci_controller_t* ctrl);
-static int xhci_wait_ready(xhci_controller_t* ctrl, uint32_t timeout_ms);
-static void xhci_setup_event_ring(xhci_controller_t* ctrl);
-static void xhci_handle_transfer_event(xhci_controller_t* ctrl, xhci_trb_t* trb);
-static void xhci_handle_command_event(xhci_controller_t* ctrl, xhci_trb_t* trb);
-static void xhci_handle_port_event(xhci_controller_t* ctrl, xhci_trb_t* trb);
+static void xhci_setup_scratchpad(xhci_controller_t *ctrl);
+static int xhci_wait_ready(xhci_controller_t *ctrl, uint32_t timeout_ms);
+static void xhci_setup_event_ring(xhci_controller_t *ctrl);
+static void xhci_handle_transfer_event(xhci_controller_t *ctrl,
+				       xhci_trb_t *trb);
+static void xhci_handle_command_event(xhci_controller_t *ctrl, xhci_trb_t *trb);
+static void xhci_handle_port_event(xhci_controller_t *ctrl, xhci_trb_t *trb);
 static void delay_us(uint32_t us);
 static void delay_ms(uint32_t ms);
 
 // Memory barrier
-static inline void xhci_mb(void) {
-    __asm__ volatile ("mfence" ::: "memory");
+static inline void xhci_mb(void)
+{
+	__asm__ volatile("mfence" ::: "memory");
 }
 
 // Flush a cache line to memory (for DMA coherency)
-static inline void xhci_clflush(volatile void* addr) {
-    __asm__ volatile ("clflush (%0)" :: "r"(addr) : "memory");
+static inline void xhci_clflush(volatile void *addr)
+{
+	__asm__ volatile("clflush (%0)" ::"r"(addr) : "memory");
 }
 
 // Flush a range of memory from cache
-static inline void xhci_flush_cache(void* addr, size_t size) {
-    volatile char* p = (volatile char*)addr;
-    volatile char* end = p + size;
-    // Align to cache line (64 bytes on modern x86)
-    p = (volatile char*)((uint64_t)p & ~63ULL);
-    while (p < end) {
-        xhci_clflush(p);
-        p += 64;
-    }
-    xhci_mb();
+static inline void xhci_flush_cache(void *addr, size_t size)
+{
+	volatile char *p = (volatile char *)addr;
+	volatile char *end = p + size;
+	// Align to cache line (64 bytes on modern x86)
+	p = (volatile char *)((uint64_t)p & ~63ULL);
+	while (p < end) {
+		xhci_clflush(p);
+		p += 64;
+	}
+	xhci_mb();
 }
 
 // Simple delay (calibrated approximately)
-static void delay_us(uint32_t us) {
-    for (uint32_t i = 0; i < us * 100; i++) {
-        __asm__ volatile ("pause");
-    }
+static void delay_us(uint32_t us)
+{
+	for (uint32_t i = 0; i < us * 100; i++) {
+		__asm__ volatile("pause");
+	}
 }
 
-static void delay_ms(uint32_t ms) {
-    delay_us(ms * 1000);
+static void delay_ms(uint32_t ms)
+{
+	delay_us(ms * 1000);
 }
 
 // Zero memory
-static void xhci_memset(void* dst, int val, size_t n) {
-    uint8_t* p = (uint8_t*)dst;
-    while (n--) *p++ = (uint8_t)val;
+static void xhci_memset(void *dst, int val, size_t n)
+{
+	uint8_t *p = (uint8_t *)dst;
+	while (n--)
+		*p++ = (uint8_t)val;
 }
 
-static void xhci_memcpy(void* dst, const void* src, size_t n) {
-    uint8_t* d = (uint8_t*)dst;
-    const uint8_t* s = (const uint8_t*)src;
-    while (n--) *d++ = *s++;
+static void xhci_memcpy(void *dst, const void *src, size_t n)
+{
+	uint8_t *d = (uint8_t *)dst;
+	const uint8_t *s = (const uint8_t *)src;
+	while (n--)
+		*d++ = *s++;
 }
 
 //=============================================================================
@@ -119,130 +132,152 @@ static void xhci_memcpy(void* dst, const void* src, size_t n) {
 //=============================================================================
 
 // Get pointer to Input Control Context (offset 0)
-static inline void* xhci_get_input_control_ctx(xhci_controller_t* ctrl) {
-    return (void*)ctrl->input_ctx_raw;
+static inline void *xhci_get_input_control_ctx(xhci_controller_t *ctrl)
+{
+	return (void *)ctrl->input_ctx_raw;
 }
 
 // Get pointer to Slot Context in Input Context (offset = 1 * context_size)
-static inline xhci_slot_ctx_t* xhci_get_input_slot_ctx(xhci_controller_t* ctrl) {
-    return (xhci_slot_ctx_t*)(ctrl->input_ctx_raw + ctrl->context_size);
+static inline xhci_slot_ctx_t *xhci_get_input_slot_ctx(xhci_controller_t *ctrl)
+{
+	return (xhci_slot_ctx_t *)(ctrl->input_ctx_raw + ctrl->context_size);
 }
 
 // Get pointer to Endpoint Context N in Input Context (offset = (2+N) * context_size)
-static inline xhci_ep_ctx_t* xhci_get_input_ep_ctx(xhci_controller_t* ctrl, int ep_idx) {
-    return (xhci_ep_ctx_t*)(ctrl->input_ctx_raw + (2 + ep_idx) * ctrl->context_size);
+static inline xhci_ep_ctx_t *xhci_get_input_ep_ctx(xhci_controller_t *ctrl,
+						   int ep_idx)
+{
+	return (xhci_ep_ctx_t *)(ctrl->input_ctx_raw +
+				 (2 + ep_idx) * ctrl->context_size);
 }
 
 // Get pointer to Slot Context in Device Context
-static inline xhci_slot_ctx_t* xhci_get_dev_slot_ctx(xhci_controller_t* ctrl, xhci_dev_ctx_t* dev) {
-    (void)ctrl;  // context_size not needed - slot is always at offset 0
-    return (xhci_slot_ctx_t*)((uint8_t*)dev);
+static inline xhci_slot_ctx_t *xhci_get_dev_slot_ctx(xhci_controller_t *ctrl,
+						     xhci_dev_ctx_t *dev)
+{
+	(void)ctrl; // context_size not needed - slot is always at offset 0
+	return (xhci_slot_ctx_t *)((uint8_t *)dev);
 }
 
 // Get pointer to Endpoint Context N in Device Context (offset = (1+N) * context_size)
-static inline xhci_ep_ctx_t* xhci_get_dev_ep_ctx(xhci_controller_t* ctrl, xhci_dev_ctx_t* dev, int ep_idx) {
-    return (xhci_ep_ctx_t*)((uint8_t*)dev + (1 + ep_idx) * ctrl->context_size);
+static inline xhci_ep_ctx_t *
+xhci_get_dev_ep_ctx(xhci_controller_t *ctrl, xhci_dev_ctx_t *dev, int ep_idx)
+{
+	return (xhci_ep_ctx_t *)((uint8_t *)dev +
+				 (1 + ep_idx) * ctrl->context_size);
 }
 
 //=============================================================================
 // Ring Management
 //=============================================================================
 
-xhci_ring_t* xhci_alloc_ring(void) {
-    // For xHCI rings, we need 64-byte alignment minimum, but page alignment is safer for DMA
-    // Use DMA-safe allocation for low physical addresses required by XHCI
-    size_t ring_size = sizeof(xhci_ring_t);
-    size_t alloc_size = ring_size + 4096;  // Extra page for alignment
-    
-    uint8_t* raw = (uint8_t*)kcalloc_dma(1, alloc_size);
-    if (!raw) return NULL;
-    
-    // Align to 4KB page boundary
-    uint64_t raw_addr = (uint64_t)raw;
-    uint64_t aligned_addr = (raw_addr + 4095) & ~4095ULL;
-    xhci_ring_t* ring = (xhci_ring_t*)aligned_addr;
-    
-    xhci_memset(ring, 0, ring_size);
-    return ring;
+xhci_ring_t *xhci_alloc_ring(void)
+{
+	// For xHCI rings, we need 64-byte alignment minimum, but page alignment is safer for DMA
+	// Use DMA-safe allocation for low physical addresses required by XHCI
+	size_t ring_size = sizeof(xhci_ring_t);
+	size_t alloc_size = ring_size + 4096; // Extra page for alignment
+
+	uint8_t *raw = (uint8_t *)kcalloc_dma(1, alloc_size);
+	if (!raw)
+		return NULL;
+
+	// Align to 4KB page boundary
+	uint64_t raw_addr = (uint64_t)raw;
+	uint64_t aligned_addr = (raw_addr + 4095) & ~4095ULL;
+	xhci_ring_t *ring = (xhci_ring_t *)aligned_addr;
+
+	xhci_memset(ring, 0, ring_size);
+	return ring;
 }
 
-void xhci_free_ring(xhci_ring_t* ring) {
-    // Note: We can't easily free the original raw pointer, but for kernel this is OK
-    (void)ring;
+void xhci_free_ring(xhci_ring_t *ring)
+{
+	// Note: We can't easily free the original raw pointer, but for kernel this is OK
+	(void)ring;
 }
 
-void xhci_ring_init(xhci_ring_t* ring, uint64_t phys) {
-    BUG_ON(ring == NULL);
-    BUG_ON(phys == 0);
-    BUILD_BUG_ON(sizeof(xhci_trb_t) != 16);
-    xhci_memset(ring->trbs, 0, sizeof(ring->trbs));
-    ring->enqueue = 0;
-    ring->dequeue = 0;
-    ring->cycle = 1;
-    
-    // Setup link TRB at the last entry to loop back
-    uint32_t link_idx = XHCI_RING_SIZE - 1;
-    ring->trbs[link_idx].param = phys;  // Point back to start
-    ring->trbs[link_idx].status = 0;
-    ring->trbs[link_idx].control = (TRB_TYPE_LINK << 10) | TRB_FLAG_TC | TRB_FLAG_CYCLE;
-    
-    // Flush entire ring from cache for DMA coherency
-    xhci_flush_cache(ring->trbs, sizeof(ring->trbs));
+void xhci_ring_init(xhci_ring_t *ring, uint64_t phys)
+{
+	BUG_ON(ring == NULL);
+	BUG_ON(phys == 0);
+	BUILD_BUG_ON(sizeof(xhci_trb_t) != 16);
+	xhci_memset(ring->trbs, 0, sizeof(ring->trbs));
+	ring->enqueue = 0;
+	ring->dequeue = 0;
+	ring->cycle = 1;
+
+	// Setup link TRB at the last entry to loop back
+	uint32_t link_idx = XHCI_RING_SIZE - 1;
+	ring->trbs[link_idx].param = phys; // Point back to start
+	ring->trbs[link_idx].status = 0;
+	ring->trbs[link_idx].control =
+		(TRB_TYPE_LINK << 10) | TRB_FLAG_TC | TRB_FLAG_CYCLE;
+
+	// Flush entire ring from cache for DMA coherency
+	xhci_flush_cache(ring->trbs, sizeof(ring->trbs));
 }
 
 // Enqueue a TRB to the ring, handling link TRB wraparound
 // Returns index of enqueued TRB, or -1 on error
-int xhci_ring_enqueue(xhci_ring_t* ring, uint64_t param, uint32_t status, uint32_t control) {
-    BUG_ON(ring == NULL);
-    static int wrap_count = 0;
+int xhci_ring_enqueue(xhci_ring_t *ring, uint64_t param, uint32_t status,
+		      uint32_t control)
+{
+	BUG_ON(ring == NULL);
+	static int wrap_count = 0;
 
-    // Check if we're at the link TRB
-    if (ring->enqueue >= XHCI_RING_SIZE - 1) {
-        // We need to process the Link TRB. The Link TRB has TC (Toggle Cycle) set,
-        // so the controller will toggle its cycle state when it follows the link.
-        // We need to:
-        // 1. Make sure the Link TRB has the current cycle bit (so controller processes it)
-        // 2. Toggle OUR cycle to match what controller will use after the link
-        // 3. Reset enqueue to 0
-        
-        // Set Link TRB cycle to current cycle (make it valid)
-        uint32_t link_ctrl = ring->trbs[XHCI_RING_SIZE - 1].control;
-        link_ctrl = (link_ctrl & ~TRB_FLAG_CYCLE) | (ring->cycle ? TRB_FLAG_CYCLE : 0);
-        ring->trbs[XHCI_RING_SIZE - 1].control = link_ctrl;
-        
-        // Compiler barrier: ensure link TRB write is emitted before we continue.
-        // No clflush needed — x86 DMA is cache-coherent (bus snooping).
-        __asm__ volatile("" ::: "memory");
-        
-        // Toggle our cycle to match post-link state
-        ring->cycle ^= 1;
-        ring->enqueue = 0;
-    }
-    
-    uint32_t idx = ring->enqueue;
-    WARN_ON(idx >= XHCI_RING_SIZE - 1);  /* enqueue at or past link TRB slot - ring wraparound code missed the link TRB */
-    ring->trbs[idx].param = param;
-    ring->trbs[idx].status = status;
-    ring->trbs[idx].control = (control & ~TRB_FLAG_CYCLE) | (ring->cycle ? TRB_FLAG_CYCLE : 0);
-    
-    // Compiler barrier: ensure TRB fields are written before enqueue advances.
-    // No clflush/mfence needed — x86 DMA is cache-coherent (bus snooping)
-    // and x86 stores are naturally ordered (TSO).
-    __asm__ volatile("" ::: "memory");
-    
-    ring->enqueue++;
-    
-    return (int)idx;
+	// Check if we're at the link TRB
+	if (ring->enqueue >= XHCI_RING_SIZE - 1) {
+		// We need to process the Link TRB. The Link TRB has TC (Toggle Cycle) set,
+		// so the controller will toggle its cycle state when it follows the link.
+		// We need to:
+		// 1. Make sure the Link TRB has the current cycle bit (so controller processes it)
+		// 2. Toggle OUR cycle to match what controller will use after the link
+		// 3. Reset enqueue to 0
+
+		// Set Link TRB cycle to current cycle (make it valid)
+		uint32_t link_ctrl = ring->trbs[XHCI_RING_SIZE - 1].control;
+		link_ctrl = (link_ctrl & ~TRB_FLAG_CYCLE) |
+			    (ring->cycle ? TRB_FLAG_CYCLE : 0);
+		ring->trbs[XHCI_RING_SIZE - 1].control = link_ctrl;
+
+		// Compiler barrier: ensure link TRB write is emitted before we continue.
+		// No clflush needed — x86 DMA is cache-coherent (bus snooping).
+		__asm__ volatile("" ::: "memory");
+
+		// Toggle our cycle to match post-link state
+		ring->cycle ^= 1;
+		ring->enqueue = 0;
+	}
+
+	uint32_t idx = ring->enqueue;
+	WARN_ON(idx >=
+		XHCI_RING_SIZE -
+			1); /* enqueue at or past link TRB slot - ring wraparound code missed the link TRB */
+	ring->trbs[idx].param = param;
+	ring->trbs[idx].status = status;
+	ring->trbs[idx].control = (control & ~TRB_FLAG_CYCLE) |
+				  (ring->cycle ? TRB_FLAG_CYCLE : 0);
+
+	// Compiler barrier: ensure TRB fields are written before enqueue advances.
+	// No clflush/mfence needed — x86 DMA is cache-coherent (bus snooping)
+	// and x86 stores are naturally ordered (TSO).
+	__asm__ volatile("" ::: "memory");
+
+	ring->enqueue++;
+
+	return (int)idx;
 }
 
 // Ring doorbell for a slot/endpoint
 // Compiler barrier ensures TRB stores are emitted before the MMIO write.
 // On x86, stores to WB memory are ordered before MMIO (UC) writes,
 // and DMA is cache-coherent, so mfence is unnecessary.
-void xhci_ring_doorbell(xhci_controller_t* ctrl, uint8_t slot, uint8_t ep) {
-    BUG_ON(ctrl == NULL);
-    __asm__ volatile("" ::: "memory");
-    xhci_db_write32(ctrl, slot, ep);
+void xhci_ring_doorbell(xhci_controller_t *ctrl, uint8_t slot, uint8_t ep)
+{
+	BUG_ON(ctrl == NULL);
+	__asm__ volatile("" ::: "memory");
+	xhci_db_write32(ctrl, slot, ep);
 }
 
 //=============================================================================
@@ -250,231 +285,259 @@ void xhci_ring_doorbell(xhci_controller_t* ctrl, uint8_t slot, uint8_t ep) {
 //=============================================================================
 
 // Allocate a single ring segment (page-aligned for DMA)
-xhci_ring_segment_t* xhci_segment_alloc(void) {
-    // Ring segments need page alignment for DMA
-    // Use DMA-safe allocation for low physical addresses
-    size_t seg_size = sizeof(xhci_ring_segment_t);
-    size_t alloc_size = seg_size + 4096;
-    
-    uint8_t* raw = (uint8_t*)kcalloc_dma(1, alloc_size);
-    if (!raw) return NULL;
-    
-    // Align to 4KB page boundary
-    uint64_t raw_addr = (uint64_t)raw;
-    uint64_t aligned_addr = (raw_addr + 4095) & ~4095ULL;
-    xhci_ring_segment_t* seg = (xhci_ring_segment_t*)aligned_addr;
-    
-    xhci_memset(seg, 0, seg_size);
-    seg->dma = mm_get_physical_address(aligned_addr);
-    seg->next = NULL;
-    seg->num = 0;
-    
-    return seg;
+xhci_ring_segment_t *xhci_segment_alloc(void)
+{
+	// Ring segments need page alignment for DMA
+	// Use DMA-safe allocation for low physical addresses
+	size_t seg_size = sizeof(xhci_ring_segment_t);
+	size_t alloc_size = seg_size + 4096;
+
+	uint8_t *raw = (uint8_t *)kcalloc_dma(1, alloc_size);
+	if (!raw)
+		return NULL;
+
+	// Align to 4KB page boundary
+	uint64_t raw_addr = (uint64_t)raw;
+	uint64_t aligned_addr = (raw_addr + 4095) & ~4095ULL;
+	xhci_ring_segment_t *seg = (xhci_ring_segment_t *)aligned_addr;
+
+	xhci_memset(seg, 0, seg_size);
+	seg->dma = mm_get_physical_address(aligned_addr);
+	seg->next = NULL;
+	seg->num = 0;
+
+	return seg;
 }
 
-void xhci_segment_free(xhci_ring_segment_t* seg) {
-    // Note: Similar to xhci_free_ring, we don't track raw pointer
-    (void)seg;
+void xhci_segment_free(xhci_ring_segment_t *seg)
+{
+	// Note: Similar to xhci_free_ring, we don't track raw pointer
+	(void)seg;
 }
 
 // Set up link TRB at end of segment to point to next segment
-static void xhci_set_link_trb(xhci_ring_segment_t* seg, int chain_links) {
-    if (!seg || !seg->next) return;
-    
-    xhci_trb_t* link = &seg->trbs[XHCI_RING_SIZE - 1];
-    link->param = seg->next->dma;
-    link->status = 0;
-    
-    uint32_t ctrl = (TRB_TYPE_LINK << 10);
-    if (chain_links) ctrl |= TRB_FLAG_CHAIN;
-    link->control = ctrl;
+static void xhci_set_link_trb(xhci_ring_segment_t *seg, int chain_links)
+{
+	if (!seg || !seg->next)
+		return;
+
+	xhci_trb_t *link = &seg->trbs[XHCI_RING_SIZE - 1];
+	link->param = seg->next->dma;
+	link->status = 0;
+
+	uint32_t ctrl = (TRB_TYPE_LINK << 10);
+	if (chain_links)
+		ctrl |= TRB_FLAG_CHAIN;
+	link->control = ctrl;
 }
 
 // Allocate an expandable ring with initial segments
-xhci_ring_ex_t* xhci_ring_ex_alloc(uint32_t num_segs) {
-    if (num_segs == 0) num_segs = 1;
-    if (num_segs > XHCI_MAX_RING_SEGMENTS) num_segs = XHCI_MAX_RING_SEGMENTS;
-    
-    xhci_ring_ex_t* ring = (xhci_ring_ex_t*)kcalloc_dma(1, sizeof(xhci_ring_ex_t));
-    if (!ring) return NULL;
-    
-    // Allocate segments
-    xhci_ring_segment_t* prev = NULL;
-    for (uint32_t i = 0; i < num_segs; i++) {
-        xhci_ring_segment_t* seg = xhci_segment_alloc();
-        if (!seg) {
-            // Cleanup on failure
-            xhci_ring_ex_free(ring);
-            return NULL;
-        }
-        seg->num = i;
-        
-        if (i == 0) {
-            ring->first_seg = seg;
-        }
-        if (prev) {
-            prev->next = seg;
-            xhci_set_link_trb(prev, 0);
-        }
-        prev = seg;
-    }
-    
-    // Complete the circular list
-    ring->last_seg = prev;
-    prev->next = ring->first_seg;
-    xhci_set_link_trb(prev, 0);
-    
-    // Set toggle cycle on last segment's link TRB
-    ring->last_seg->trbs[XHCI_RING_SIZE - 1].control |= TRB_FLAG_TC;
-    
-    // Initialize ring state
-    ring->enq_seg = ring->first_seg;
-    ring->deq_seg = ring->first_seg;
-    ring->enqueue = ring->first_seg->trbs;
-    ring->dequeue = ring->first_seg->trbs;
-    ring->num_segs = num_segs;
-    ring->cycle_state = 1;
-    ring->num_trbs_free = num_segs * XHCI_TRBS_PER_SEGMENT - 1;  // -1 for safety
-    
-    return ring;
+xhci_ring_ex_t *xhci_ring_ex_alloc(uint32_t num_segs)
+{
+	if (num_segs == 0)
+		num_segs = 1;
+	if (num_segs > XHCI_MAX_RING_SEGMENTS)
+		num_segs = XHCI_MAX_RING_SEGMENTS;
+
+	xhci_ring_ex_t *ring =
+		(xhci_ring_ex_t *)kcalloc_dma(1, sizeof(xhci_ring_ex_t));
+	if (!ring)
+		return NULL;
+
+	// Allocate segments
+	xhci_ring_segment_t *prev = NULL;
+	for (uint32_t i = 0; i < num_segs; i++) {
+		xhci_ring_segment_t *seg = xhci_segment_alloc();
+		if (!seg) {
+			// Cleanup on failure
+			xhci_ring_ex_free(ring);
+			return NULL;
+		}
+		seg->num = i;
+
+		if (i == 0) {
+			ring->first_seg = seg;
+		}
+		if (prev) {
+			prev->next = seg;
+			xhci_set_link_trb(prev, 0);
+		}
+		prev = seg;
+	}
+
+	// Complete the circular list
+	ring->last_seg = prev;
+	prev->next = ring->first_seg;
+	xhci_set_link_trb(prev, 0);
+
+	// Set toggle cycle on last segment's link TRB
+	ring->last_seg->trbs[XHCI_RING_SIZE - 1].control |= TRB_FLAG_TC;
+
+	// Initialize ring state
+	ring->enq_seg = ring->first_seg;
+	ring->deq_seg = ring->first_seg;
+	ring->enqueue = ring->first_seg->trbs;
+	ring->dequeue = ring->first_seg->trbs;
+	ring->num_segs = num_segs;
+	ring->cycle_state = 1;
+	ring->num_trbs_free =
+		num_segs * XHCI_TRBS_PER_SEGMENT - 1; // -1 for safety
+
+	return ring;
 }
 
-void xhci_ring_ex_free(xhci_ring_ex_t* ring) {
-    if (!ring) return;
-    
-    if (ring->first_seg) {
-        // Break the circular link before freeing
-        if (ring->last_seg) {
-            ring->last_seg->next = NULL;
-        }
-        
-        xhci_ring_segment_t* seg = ring->first_seg;
-        while (seg) {
-            xhci_ring_segment_t* next = seg->next;
-            xhci_segment_free(seg);
-            seg = next;
-        }
-    }
-    
-    kfree_dma(ring);
+void xhci_ring_ex_free(xhci_ring_ex_t *ring)
+{
+	if (!ring)
+		return;
+
+	if (ring->first_seg) {
+		// Break the circular link before freeing
+		if (ring->last_seg) {
+			ring->last_seg->next = NULL;
+		}
+
+		xhci_ring_segment_t *seg = ring->first_seg;
+		while (seg) {
+			xhci_ring_segment_t *next = seg->next;
+			xhci_segment_free(seg);
+			seg = next;
+		}
+	}
+
+	kfree_dma(ring);
 }
 
 // Expand ring by adding new segments after the current enqueue segment
 // This can be called when ring is running low on space
-int xhci_ring_expansion(xhci_ring_ex_t* ring, uint32_t num_new_segs) {
-    if (!ring || num_new_segs == 0) return ST_INVALID;
-    if (ring->num_segs + num_new_segs > XHCI_MAX_RING_SEGMENTS) {
-        num_new_segs = XHCI_MAX_RING_SEGMENTS - ring->num_segs;
-        if (num_new_segs == 0) return ST_NOMEM;
-    }
-    
-    // Allocate new segments
-    xhci_ring_segment_t* new_first = NULL;
-    xhci_ring_segment_t* new_last = NULL;
-    xhci_ring_segment_t* prev = NULL;
-    
-    for (uint32_t i = 0; i < num_new_segs; i++) {
-        xhci_ring_segment_t* seg = xhci_segment_alloc();
-        if (!seg) {
-            // Cleanup on failure
-            xhci_ring_segment_t* s = new_first;
-            while (s) {
-                xhci_ring_segment_t* next = s->next;
-                xhci_segment_free(s);
-                s = next;
-            }
-            return ST_NOMEM;
-        }
-        seg->num = ring->num_segs + i;
-        
-        if (!new_first) new_first = seg;
-        if (prev) {
-            prev->next = seg;
-            xhci_set_link_trb(prev, 0);
-        }
-        prev = seg;
-        new_last = seg;
-    }
-    
-    // Insert new segments after enq_seg
-    // The new_last->next points to where enq_seg->next was pointing
-    xhci_ring_segment_t* old_next = ring->enq_seg->next;
-    
-    // Link new segments into the ring
-    ring->enq_seg->next = new_first;
-    xhci_set_link_trb(ring->enq_seg, 0);
-    
-    new_last->next = old_next;
-    xhci_set_link_trb(new_last, 0);
-    
-    // Update last_seg if we inserted after it
-    if (ring->enq_seg == ring->last_seg) {
-        // Move toggle cycle bit to new last segment
-        ring->last_seg->trbs[XHCI_RING_SIZE - 1].control &= ~TRB_FLAG_TC;
-        ring->last_seg = new_last;
-        ring->last_seg->trbs[XHCI_RING_SIZE - 1].control |= TRB_FLAG_TC;
-    }
-    
-    ring->num_segs += num_new_segs;
-    ring->num_trbs_free += num_new_segs * XHCI_TRBS_PER_SEGMENT;
-    
-    xhci_dbg("Ring expanded: now %d segments, %d TRBs free\n", 
-             ring->num_segs, ring->num_trbs_free);
-    
-    return ST_OK;
+int xhci_ring_expansion(xhci_ring_ex_t *ring, uint32_t num_new_segs)
+{
+	if (!ring || num_new_segs == 0)
+		return ST_INVALID;
+	if (ring->num_segs + num_new_segs > XHCI_MAX_RING_SEGMENTS) {
+		num_new_segs = XHCI_MAX_RING_SEGMENTS - ring->num_segs;
+		if (num_new_segs == 0)
+			return ST_NOMEM;
+	}
+
+	// Allocate new segments
+	xhci_ring_segment_t *new_first = NULL;
+	xhci_ring_segment_t *new_last = NULL;
+	xhci_ring_segment_t *prev = NULL;
+
+	for (uint32_t i = 0; i < num_new_segs; i++) {
+		xhci_ring_segment_t *seg = xhci_segment_alloc();
+		if (!seg) {
+			// Cleanup on failure
+			xhci_ring_segment_t *s = new_first;
+			while (s) {
+				xhci_ring_segment_t *next = s->next;
+				xhci_segment_free(s);
+				s = next;
+			}
+			return ST_NOMEM;
+		}
+		seg->num = ring->num_segs + i;
+
+		if (!new_first)
+			new_first = seg;
+		if (prev) {
+			prev->next = seg;
+			xhci_set_link_trb(prev, 0);
+		}
+		prev = seg;
+		new_last = seg;
+	}
+
+	// Insert new segments after enq_seg
+	// The new_last->next points to where enq_seg->next was pointing
+	xhci_ring_segment_t *old_next = ring->enq_seg->next;
+
+	// Link new segments into the ring
+	ring->enq_seg->next = new_first;
+	xhci_set_link_trb(ring->enq_seg, 0);
+
+	new_last->next = old_next;
+	xhci_set_link_trb(new_last, 0);
+
+	// Update last_seg if we inserted after it
+	if (ring->enq_seg == ring->last_seg) {
+		// Move toggle cycle bit to new last segment
+		ring->last_seg->trbs[XHCI_RING_SIZE - 1].control &=
+			~TRB_FLAG_TC;
+		ring->last_seg = new_last;
+		ring->last_seg->trbs[XHCI_RING_SIZE - 1].control |= TRB_FLAG_TC;
+	}
+
+	ring->num_segs += num_new_segs;
+	ring->num_trbs_free += num_new_segs * XHCI_TRBS_PER_SEGMENT;
+
+	xhci_dbg("Ring expanded: now %d segments, %d TRBs free\n",
+		 ring->num_segs, ring->num_trbs_free);
+
+	return ST_OK;
 }
 
 // Get number of free TRBs in expandable ring
-uint32_t xhci_ring_ex_num_trbs_free(xhci_ring_ex_t* ring) {
-    if (!ring) return 0;
-    return ring->num_trbs_free;
+uint32_t xhci_ring_ex_num_trbs_free(xhci_ring_ex_t *ring)
+{
+	if (!ring)
+		return 0;
+	return ring->num_trbs_free;
 }
 
 // Check if a TRB is a link TRB
-static inline int trb_is_link(xhci_trb_t* trb) {
-    return ((trb->control >> 10) & 0x3F) == TRB_TYPE_LINK;
+static inline int trb_is_link(xhci_trb_t *trb)
+{
+	return ((trb->control >> 10) & 0x3F) == TRB_TYPE_LINK;
 }
 
 // Check if TRB is last on segment
-static inline int last_trb_on_seg(xhci_ring_segment_t* seg, xhci_trb_t* trb) {
-    return trb == &seg->trbs[XHCI_RING_SIZE - 1];
+static inline int last_trb_on_seg(xhci_ring_segment_t *seg, xhci_trb_t *trb)
+{
+	return trb == &seg->trbs[XHCI_RING_SIZE - 1];
 }
 
 // Enqueue a TRB to expandable ring
-int xhci_ring_ex_enqueue(xhci_ring_ex_t* ring, uint64_t param, uint32_t status, uint32_t control) {
-    if (!ring || ring->num_trbs_free == 0) return -1;
-    
-    // Check if we're at the link TRB - need to follow it
-    while (trb_is_link(ring->enqueue)) {
-        // Update link TRB with current cycle
-        uint32_t link_ctrl = ring->enqueue->control;
-        link_ctrl = (link_ctrl & ~TRB_FLAG_CYCLE) | (ring->cycle_state ? TRB_FLAG_CYCLE : 0);
-        ring->enqueue->control = link_ctrl;
-        xhci_mb();
-        
-        // Toggle cycle if link has TC bit
-        if (link_ctrl & TRB_FLAG_TC) {
-            ring->cycle_state ^= 1;
-        }
-        
-        // Move to next segment
-        ring->enq_seg = ring->enq_seg->next;
-        ring->enqueue = ring->enq_seg->trbs;
-    }
-    
-    // Write the TRB
-    ring->enqueue->param = param;
-    ring->enqueue->status = status;
-    ring->enqueue->control = (control & ~TRB_FLAG_CYCLE) | (ring->cycle_state ? TRB_FLAG_CYCLE : 0);
-    xhci_mb();
-    
-    // Advance enqueue pointer
-    ring->enqueue++;
-    ring->num_trbs_free--;
-    
-    // Check if we landed on link TRB - handle it on next enqueue
-    
-    return 0;
+int xhci_ring_ex_enqueue(xhci_ring_ex_t *ring, uint64_t param, uint32_t status,
+			 uint32_t control)
+{
+	if (!ring || ring->num_trbs_free == 0)
+		return -1;
+
+	// Check if we're at the link TRB - need to follow it
+	while (trb_is_link(ring->enqueue)) {
+		// Update link TRB with current cycle
+		uint32_t link_ctrl = ring->enqueue->control;
+		link_ctrl = (link_ctrl & ~TRB_FLAG_CYCLE) |
+			    (ring->cycle_state ? TRB_FLAG_CYCLE : 0);
+		ring->enqueue->control = link_ctrl;
+		xhci_mb();
+
+		// Toggle cycle if link has TC bit
+		if (link_ctrl & TRB_FLAG_TC) {
+			ring->cycle_state ^= 1;
+		}
+
+		// Move to next segment
+		ring->enq_seg = ring->enq_seg->next;
+		ring->enqueue = ring->enq_seg->trbs;
+	}
+
+	// Write the TRB
+	ring->enqueue->param = param;
+	ring->enqueue->status = status;
+	ring->enqueue->control = (control & ~TRB_FLAG_CYCLE) |
+				 (ring->cycle_state ? TRB_FLAG_CYCLE : 0);
+	xhci_mb();
+
+	// Advance enqueue pointer
+	ring->enqueue++;
+	ring->num_trbs_free--;
+
+	// Check if we landed on link TRB - handle it on next enqueue
+
+	return 0;
 }
 
 //=============================================================================
@@ -482,113 +545,136 @@ int xhci_ring_ex_enqueue(xhci_ring_ex_t* ring, uint64_t param, uint32_t status, 
 //=============================================================================
 
 // Initialize a scatter-gather list
-void xhci_sg_init(xhci_sg_list_t* sg) {
-    if (!sg) return;
-    xhci_memset(sg, 0, sizeof(xhci_sg_list_t));
+void xhci_sg_init(xhci_sg_list_t *sg)
+{
+	if (!sg)
+		return;
+	xhci_memset(sg, 0, sizeof(xhci_sg_list_t));
 }
 
 // Add an entry to scatter-gather list
-int xhci_sg_add(xhci_sg_list_t* sg, uint64_t phys_addr, uint32_t length) {
-    if (!sg || sg->num_entries >= XHCI_MAX_SG_ENTRIES) return ST_NOMEM;
-    if (length == 0) return ST_OK;  // Skip empty entries
-    
-    xhci_sg_entry_t* entry = &sg->entries[sg->num_entries];
-    entry->phys_addr = phys_addr;
-    entry->length = length;
-    
-    sg->num_entries++;
-    sg->total_len += length;
-    
-    return ST_OK;
+int xhci_sg_add(xhci_sg_list_t *sg, uint64_t phys_addr, uint32_t length)
+{
+	if (!sg || sg->num_entries >= XHCI_MAX_SG_ENTRIES)
+		return ST_NOMEM;
+	if (length == 0)
+		return ST_OK; // Skip empty entries
+
+	xhci_sg_entry_t *entry = &sg->entries[sg->num_entries];
+	entry->phys_addr = phys_addr;
+	entry->length = length;
+
+	sg->num_entries++;
+	sg->total_len += length;
+
+	return ST_OK;
 }
 
 // Count number of TRBs needed for scatter-gather list
 // Accounts for 64KB boundary crossings within each segment
-uint32_t xhci_sg_count_trbs(xhci_sg_list_t* sg) {
-    if (!sg) return 0;
-    
-    uint32_t num_trbs = 0;
-    for (uint32_t i = 0; i < sg->num_entries; i++) {
-        uint64_t addr = sg->entries[i].phys_addr;
-        uint32_t remaining = sg->entries[i].length;
-        
-        while (remaining > 0) {
-            uint32_t trb_len = TRB_BUFF_LEN_UP_TO_BOUNDARY(addr);
-            if (trb_len > remaining) trb_len = remaining;
-            if (trb_len == 0) trb_len = remaining;  // Safety
-            
-            num_trbs++;
-            addr += trb_len;
-            remaining -= trb_len;
-        }
-    }
-    
-    return num_trbs > 0 ? num_trbs : 1;  // At least 1 for zero-length
+uint32_t xhci_sg_count_trbs(xhci_sg_list_t *sg)
+{
+	if (!sg)
+		return 0;
+
+	uint32_t num_trbs = 0;
+	for (uint32_t i = 0; i < sg->num_entries; i++) {
+		uint64_t addr = sg->entries[i].phys_addr;
+		uint32_t remaining = sg->entries[i].length;
+
+		while (remaining > 0) {
+			uint32_t trb_len = TRB_BUFF_LEN_UP_TO_BOUNDARY(addr);
+			if (trb_len > remaining)
+				trb_len = remaining;
+			if (trb_len == 0)
+				trb_len = remaining; // Safety
+
+			num_trbs++;
+			addr += trb_len;
+			remaining -= trb_len;
+		}
+	}
+
+	return num_trbs > 0 ? num_trbs : 1; // At least 1 for zero-length
 }
 
 // Queue TRBs for scatter-gather list (internal helper)
-static int xhci_queue_sg_trbs(xhci_ring_t* ring, xhci_sg_list_t* sg, int is_in, uint16_t max_pkt) {
-    if (!ring || !sg) return 0;
-    
-    int num_trbs = 0;
-    uint32_t total_len = sg->total_len;
-    uint32_t transferred = 0;
-    
-    // Handle zero-length transfer
-    if (sg->num_entries == 0 || total_len == 0) {
-        uint32_t control = (TRB_TYPE_NORMAL << 10) | TRB_FLAG_IOC;
-        if (is_in) control |= TRB_FLAG_ISP;
-        xhci_ring_enqueue(ring, 0, 0, control);
-        return 1;
-    }
-    
-    // Process each scatter-gather entry
-    for (uint32_t i = 0; i < sg->num_entries; i++) {
-        uint64_t addr = sg->entries[i].phys_addr;
-        uint32_t remaining = sg->entries[i].length;
-        
-        while (remaining > 0) {
-            // Calculate bytes until 64KB boundary
-            uint32_t trb_len = TRB_BUFF_LEN_UP_TO_BOUNDARY(addr);
-            if (trb_len > remaining) trb_len = remaining;
-            if (trb_len == 0) trb_len = remaining;  // Safety
-            
-            uint32_t control = (TRB_TYPE_NORMAL << 10);
-            
-            // Calculate if more TRBs coming
-            uint32_t bytes_after = (sg->total_len - transferred - trb_len);
-            int more_trbs = (bytes_after > 0);
-            
-            if (more_trbs) {
-                control |= TRB_FLAG_CHAIN;
-            } else {
-                control |= TRB_FLAG_IOC;
-            }
-            
-            if (is_in) {
-                control |= TRB_FLAG_ISP;
-            }
-            
-            // Calculate TD_SIZE
-            uint32_t td_size = 0;
-            if (more_trbs && max_pkt > 0) {
-                uint32_t total_pkts = (total_len + max_pkt - 1) / max_pkt;
-                uint32_t pkts_done = (transferred + trb_len) / max_pkt;
-                td_size = total_pkts > pkts_done ? (total_pkts - pkts_done) : 0;
-                if (td_size > 31) td_size = 31;
-            }
-            
-            uint32_t status = TRB_LEN(trb_len) | TRB_TD_SIZE(td_size) | TRB_INTR_TARGET(0);
-            xhci_ring_enqueue(ring, addr, status, control);
-            
-            addr += trb_len;
-            remaining -= trb_len;
-            transferred += trb_len;
-            num_trbs++;
-        }
-    }
-    
-    return num_trbs;
+static int xhci_queue_sg_trbs(xhci_ring_t *ring, xhci_sg_list_t *sg, int is_in,
+			      uint16_t max_pkt)
+{
+	if (!ring || !sg)
+		return 0;
+
+	int num_trbs = 0;
+	uint32_t total_len = sg->total_len;
+	uint32_t transferred = 0;
+
+	// Handle zero-length transfer
+	if (sg->num_entries == 0 || total_len == 0) {
+		uint32_t control = (TRB_TYPE_NORMAL << 10) | TRB_FLAG_IOC;
+		if (is_in)
+			control |= TRB_FLAG_ISP;
+		xhci_ring_enqueue(ring, 0, 0, control);
+		return 1;
+	}
+
+	// Process each scatter-gather entry
+	for (uint32_t i = 0; i < sg->num_entries; i++) {
+		uint64_t addr = sg->entries[i].phys_addr;
+		uint32_t remaining = sg->entries[i].length;
+
+		while (remaining > 0) {
+			// Calculate bytes until 64KB boundary
+			uint32_t trb_len = TRB_BUFF_LEN_UP_TO_BOUNDARY(addr);
+			if (trb_len > remaining)
+				trb_len = remaining;
+			if (trb_len == 0)
+				trb_len = remaining; // Safety
+
+			uint32_t control = (TRB_TYPE_NORMAL << 10);
+
+			// Calculate if more TRBs coming
+			uint32_t bytes_after =
+				(sg->total_len - transferred - trb_len);
+			int more_trbs = (bytes_after > 0);
+
+			if (more_trbs) {
+				control |= TRB_FLAG_CHAIN;
+			} else {
+				control |= TRB_FLAG_IOC;
+			}
+
+			if (is_in) {
+				control |= TRB_FLAG_ISP;
+			}
+
+			// Calculate TD_SIZE
+			uint32_t td_size = 0;
+			if (more_trbs && max_pkt > 0) {
+				uint32_t total_pkts =
+					(total_len + max_pkt - 1) / max_pkt;
+				uint32_t pkts_done =
+					(transferred + trb_len) / max_pkt;
+				td_size = total_pkts > pkts_done ?
+						  (total_pkts - pkts_done) :
+						  0;
+				if (td_size > 31)
+					td_size = 31;
+			}
+
+			uint32_t status = TRB_LEN(trb_len) |
+					  TRB_TD_SIZE(td_size) |
+					  TRB_INTR_TARGET(0);
+			xhci_ring_enqueue(ring, addr, status, control);
+
+			addr += trb_len;
+			remaining -= trb_len;
+			transferred += trb_len;
+			num_trbs++;
+		}
+	}
+
+	return num_trbs;
 }
 
 //=============================================================================
@@ -597,693 +683,757 @@ static int xhci_queue_sg_trbs(xhci_ring_t* ring, xhci_sg_list_t* sg, int is_in, 
 
 // Find an extended capability by ID, starting from a given offset
 // Returns offset of capability or 0 if not found
-uint32_t xhci_find_ext_cap(xhci_controller_t* ctrl, uint32_t cap_id, uint32_t start_offset) {
-    uint32_t offset;
-    uint32_t val;
-    
-    // If no start offset, begin from HCCPARAMS1 XECP pointer
-    if (start_offset == 0) {
-        uint32_t hccparams1 = xhci_cap_read32(ctrl, XHCI_CAP_HCCPARAMS1);
-        offset = ((hccparams1 & XHCI_HCC_XECP_MASK) >> XHCI_HCC_XECP_SHIFT) << 2;
-    } else {
-        // Read next pointer from previous capability
-        val = *(volatile uint32_t*)(ctrl->base + start_offset);
-        offset = start_offset + (((val & XHCI_EXT_CAP_NEXT_MASK) >> XHCI_EXT_CAP_NEXT_SHIFT) << 2);
-    }
-    
-    if (offset == 0) return 0;
-    
-    // Search for capability
-    while (offset) {
-        val = *(volatile uint32_t*)(ctrl->base + offset);
-        if ((val & XHCI_EXT_CAP_ID_MASK) == cap_id) {
-            return offset;
-        }
-        
-        // Get next capability offset
-        uint32_t next = ((val & XHCI_EXT_CAP_NEXT_MASK) >> XHCI_EXT_CAP_NEXT_SHIFT) << 2;
-        if (next == 0) break;
-        offset += next;
-    }
-    
-    return 0;
+uint32_t xhci_find_ext_cap(xhci_controller_t *ctrl, uint32_t cap_id,
+			   uint32_t start_offset)
+{
+	uint32_t offset;
+	uint32_t val;
+
+	// If no start offset, begin from HCCPARAMS1 XECP pointer
+	if (start_offset == 0) {
+		uint32_t hccparams1 =
+			xhci_cap_read32(ctrl, XHCI_CAP_HCCPARAMS1);
+		offset = ((hccparams1 & XHCI_HCC_XECP_MASK) >>
+			  XHCI_HCC_XECP_SHIFT)
+			 << 2;
+	} else {
+		// Read next pointer from previous capability
+		val = *(volatile uint32_t *)(ctrl->base + start_offset);
+		offset = start_offset + (((val & XHCI_EXT_CAP_NEXT_MASK) >>
+					  XHCI_EXT_CAP_NEXT_SHIFT)
+					 << 2);
+	}
+
+	if (offset == 0)
+		return 0;
+
+	// Search for capability
+	while (offset) {
+		val = *(volatile uint32_t *)(ctrl->base + offset);
+		if ((val & XHCI_EXT_CAP_ID_MASK) == cap_id) {
+			return offset;
+		}
+
+		// Get next capability offset
+		uint32_t next = ((val & XHCI_EXT_CAP_NEXT_MASK) >>
+				 XHCI_EXT_CAP_NEXT_SHIFT)
+				<< 2;
+		if (next == 0)
+			break;
+		offset += next;
+	}
+
+	return 0;
 }
 
 // Take ownership of xHCI controller from BIOS
 // This is critical for controllers that were being used by BIOS USB support
-int xhci_bios_handoff(xhci_controller_t* ctrl) {
-    uint32_t offset;
-    uint32_t val;
-    int timeout;
-    
-    // Find USB Legacy Support extended capability
-    offset = xhci_find_ext_cap(ctrl, XHCI_EXT_CAP_LEGACY, 0);
-    if (offset == 0) {
-        xhci_dbg("No USB Legacy Support capability found\n");
-        return ST_OK;  // No legacy support, nothing to do
-    }
-    
-    xhci_dbg("Found USB Legacy Support capability at offset 0x%x\n", offset);
-    
-    // Read USBLEGSUP register
-    val = *(volatile uint32_t*)(ctrl->base + offset);
-    
-    // Check if BIOS owns the controller
-    if (!(val & XHCI_USBLEGSUP_BIOS_OWNED)) {
-        xhci_dbg("BIOS does not own xHCI controller\n");
-        return ST_OK;
-    }
-    
-    kprintf("[XHCI] Requesting ownership from BIOS\n");
-    
-    // Request ownership by setting OS Owned bit
-    val |= XHCI_USBLEGSUP_OS_OWNED;
-    *(volatile uint32_t*)(ctrl->base + offset) = val;
-    
-    // Wait for BIOS to release ownership (up to 1 second)
-    timeout = XHCI_LEGACY_TIMEOUT_USEC / 10;  // 10us increments
-    while (timeout > 0) {
-        val = *(volatile uint32_t*)(ctrl->base + offset);
-        if ((val & XHCI_USBLEGSUP_OS_OWNED) && !(val & XHCI_USBLEGSUP_BIOS_OWNED)) {
-            break;
-        }
-        delay_us(10);
-        timeout--;
-    }
-    
-    if (timeout <= 0) {
-        kprintf("[XHCI] WARNING: BIOS handoff timeout, forcing ownership\n");
-        // Force ownership anyway
-        val = XHCI_USBLEGSUP_OS_OWNED;
-        *(volatile uint32_t*)(ctrl->base + offset) = val;
-    } else {
-        // Success
-    }
-    
-    // Disable SMI events on the controller (USBLEGCTLSTS register at offset + 4)
-    // This prevents BIOS SMI handlers from interfering with USB operation
-    uint32_t legctl_offset = offset + 4;
-    val = *(volatile uint32_t*)(ctrl->base + legctl_offset);
-    
-    // Clear all SMI enable bits and status bits
-    // Bits 31:29 are SMI enables, clear them; bits 28:16 are write-1-to-clear status
-    val &= ~XHCI_USBLEGCTLSTS_DISABLE_SMI;  // Clear SMI enables
-    val |= 0x00FF0000;  // Clear all status bits by writing 1
-    *(volatile uint32_t*)(ctrl->base + legctl_offset) = val;
-    
-    return ST_OK;
+int xhci_bios_handoff(xhci_controller_t *ctrl)
+{
+	uint32_t offset;
+	uint32_t val;
+	int timeout;
+
+	// Find USB Legacy Support extended capability
+	offset = xhci_find_ext_cap(ctrl, XHCI_EXT_CAP_LEGACY, 0);
+	if (offset == 0) {
+		xhci_dbg("No USB Legacy Support capability found\n");
+		return ST_OK; // No legacy support, nothing to do
+	}
+
+	xhci_dbg("Found USB Legacy Support capability at offset 0x%x\n",
+		 offset);
+
+	// Read USBLEGSUP register
+	val = *(volatile uint32_t *)(ctrl->base + offset);
+
+	// Check if BIOS owns the controller
+	if (!(val & XHCI_USBLEGSUP_BIOS_OWNED)) {
+		xhci_dbg("BIOS does not own xHCI controller\n");
+		return ST_OK;
+	}
+
+	kprintf("[XHCI] Requesting ownership from BIOS\n");
+
+	// Request ownership by setting OS Owned bit
+	val |= XHCI_USBLEGSUP_OS_OWNED;
+	*(volatile uint32_t *)(ctrl->base + offset) = val;
+
+	// Wait for BIOS to release ownership (up to 1 second)
+	timeout = XHCI_LEGACY_TIMEOUT_USEC / 10; // 10us increments
+	while (timeout > 0) {
+		val = *(volatile uint32_t *)(ctrl->base + offset);
+		if ((val & XHCI_USBLEGSUP_OS_OWNED) &&
+		    !(val & XHCI_USBLEGSUP_BIOS_OWNED)) {
+			break;
+		}
+		delay_us(10);
+		timeout--;
+	}
+
+	if (timeout <= 0) {
+		kprintf("[XHCI] WARNING: BIOS handoff timeout, forcing ownership\n");
+		// Force ownership anyway
+		val = XHCI_USBLEGSUP_OS_OWNED;
+		*(volatile uint32_t *)(ctrl->base + offset) = val;
+	} else {
+		// Success
+	}
+
+	// Disable SMI events on the controller (USBLEGCTLSTS register at offset + 4)
+	// This prevents BIOS SMI handlers from interfering with USB operation
+	uint32_t legctl_offset = offset + 4;
+	val = *(volatile uint32_t *)(ctrl->base + legctl_offset);
+
+	// Clear all SMI enable bits and status bits
+	// Bits 31:29 are SMI enables, clear them; bits 28:16 are write-1-to-clear status
+	val &= ~XHCI_USBLEGCTLSTS_DISABLE_SMI; // Clear SMI enables
+	val |= 0x00FF0000; // Clear all status bits by writing 1
+	*(volatile uint32_t *)(ctrl->base + legctl_offset) = val;
+
+	return ST_OK;
 }
 
 // Disable interrupts and prepare for halt
-void xhci_quiesce(xhci_controller_t* ctrl) {
-    uint32_t cmd;
-    uint32_t halted;
-    uint32_t mask;
-    
-    // Disable interrupts
-    mask = ~(XHCI_CMD_INTE | XHCI_CMD_HSEE);
-    halted = xhci_op_read32(ctrl, XHCI_OP_USBSTS) & XHCI_STS_HCH;
-    
-    if (!halted) {
-        mask &= ~XHCI_CMD_RUN;
-    }
-    
-    cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
-    cmd &= mask;
-    xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd);
+void xhci_quiesce(xhci_controller_t *ctrl)
+{
+	uint32_t cmd;
+	uint32_t halted;
+	uint32_t mask;
+
+	// Disable interrupts
+	mask = ~(XHCI_CMD_INTE | XHCI_CMD_HSEE);
+	halted = xhci_op_read32(ctrl, XHCI_OP_USBSTS) & XHCI_STS_HCH;
+
+	if (!halted) {
+		mask &= ~XHCI_CMD_RUN;
+	}
+
+	cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
+	cmd &= mask;
+	xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd);
 }
 
 // Halt the controller
-int xhci_halt(xhci_controller_t* ctrl) {
-    xhci_dbg("Halting controller\n");
-    
-    // Quiesce first
-    xhci_quiesce(ctrl);
-    
-    // Wait for halt
-    for (int i = 0; i < XHCI_MAX_HALT_USEC / 100; i++) {
-        if (xhci_op_read32(ctrl, XHCI_OP_USBSTS) & XHCI_STS_HCH) {
-            ctrl->running = 0;
-            xhci_dbg("Controller halted\n");
-            return ST_OK;
-        }
-        delay_us(100);
-    }
-    
-    kprintf("[XHCI] WARNING: Halt timeout\n");
-    return ST_TIMEOUT;
+int xhci_halt(xhci_controller_t *ctrl)
+{
+	xhci_dbg("Halting controller\n");
+
+	// Quiesce first
+	xhci_quiesce(ctrl);
+
+	// Wait for halt
+	for (int i = 0; i < XHCI_MAX_HALT_USEC / 100; i++) {
+		if (xhci_op_read32(ctrl, XHCI_OP_USBSTS) & XHCI_STS_HCH) {
+			ctrl->running = 0;
+			xhci_dbg("Controller halted\n");
+			return ST_OK;
+		}
+		delay_us(100);
+	}
+
+	kprintf("[XHCI] WARNING: Halt timeout\n");
+	return ST_TIMEOUT;
 }
 
 //=============================================================================
 // Controller Initialization
 //=============================================================================
 
-int xhci_init(xhci_controller_t* ctrl, const pci_device_t* dev, uint8_t msi_vector) {
-    xhci_memset(ctrl, 0, sizeof(*ctrl));
-    ctrl->irq = msi_vector;  // Store desired MSI vector for later use
-    
-    // Store PCI IDs for quirk detection
-    ctrl->pci_vendor = dev->vendor_id;
-    ctrl->pci_device = dev->device_id;
-    
-    // Most xHCI controllers (Intel, VMware, VirtualBox) set EINT spuriously,
-    // causing cycle resync to match stale TRBs. Only QEMU needs resync.
-    // 0x1b36:0x000d = QEMU xHCI
-    if (ctrl->pci_vendor == 0x1b36 && ctrl->pci_device == 0x000d) {
-        ctrl->quirk_resync = 1;
-    }
-    
-    // CRITICAL: Enable bus mastering and memory access BEFORE any MMIO access
-    pci_enable_busmaster_mem(dev);
-    
-    // Get BAR0 (MMIO base) - physical address
-    // Check if it's a 64-bit BAR (bits 2-1 = 10 means 64-bit)
-    uint64_t bar0_phys;
-    uint32_t bar0_low = dev->bar[0];
-    uint32_t bar1_high = 0;
-    
-    if ((bar0_low & 0x6) == 0x4) {
-        // 64-bit BAR: BAR0 has low 32 bits, BAR1 has high 32 bits
-        bar1_high = dev->bar[1];
-        bar0_phys = ((uint64_t)bar1_high << 32) | (bar0_low & ~0xFULL);
-    } else {
-        // 32-bit BAR
-        bar0_phys = bar0_low & ~0xFULL;
-    }
-    
-    if (bar0_phys == 0) {
-        kprintf("[XHCI] ERROR: BAR0 not configured\n");
-        return ST_ERR;
-    }
-    
-    // Convert the BAR to a UC MMIO mapping. If the BAR is already inside the
-    // direct map, remap those direct-map pages in place instead of using the
-    // write-back alias.
-    {
-        #define XHCI_MMIO_PAGES 16
-        uint64_t mapped = mm_map_device_mmio(bar0_phys, XHCI_MMIO_PAGES);
-        if (!mapped) {
-            kprintf("[XHCI] ERROR: Failed to map BAR0 0x%llx into virtual memory\n",
-                    (unsigned long long)bar0_phys);
-            return ST_ERR;
-        }
-        ctrl->base = mapped;
-    }
-    
-    // Read and cache capability registers
-    uint32_t cap_base = xhci_cap_read32(ctrl, XHCI_CAP_CAPLENGTH);
-    uint8_t cap_len = cap_base & 0xFF;
-    ctrl->hci_version = (cap_base >> 16) & 0xFFFF;
-    
-    // Sanity check cap_len - Intel Skylake/Kaby Lake uses 0x80
-    // Valid range per xHCI spec is 0x20 to 0xFF (must be DWORD aligned)
-    if (cap_len < 0x20) {
-        kprintf("[XHCI] ERROR: Invalid cap_len=0x%x (too small), forcing to 0x20\n", cap_len);
-        cap_len = 0x20;
-    }
-    
-    ctrl->hcs_params1 = xhci_cap_read32(ctrl, XHCI_CAP_HCSPARAMS1);
-    ctrl->hcs_params2 = xhci_cap_read32(ctrl, XHCI_CAP_HCSPARAMS2);
-    ctrl->hcs_params3 = xhci_cap_read32(ctrl, XHCI_CAP_HCSPARAMS3);
-    ctrl->hcc_params1 = xhci_cap_read32(ctrl, XHCI_CAP_HCCPARAMS1);
-    ctrl->hcc_params2 = xhci_cap_read32(ctrl, XHCI_CAP_HCCPARAMS2);
-    
-    uint32_t dboff = xhci_cap_read32(ctrl, XHCI_CAP_DBOFF) & ~0x3;
-    uint32_t rtsoff = xhci_cap_read32(ctrl, XHCI_CAP_RTSOFF) & ~0x1F;
-    
-    // Extract parameters from cached registers
-    ctrl->max_slots = ctrl->hcs_params1 & 0xFF;
-    ctrl->max_ports = (ctrl->hcs_params1 >> 24) & 0xFF;
-    ctrl->max_intrs = (ctrl->hcs_params1 >> 8) & 0x7FF;
-    ctrl->context_size = (ctrl->hcc_params1 & XHCI_HCC_CSZ) ? 64 : 32;
-    ctrl->num_scratchpads = ((ctrl->hcs_params2 >> 21) & 0x1F) | (((ctrl->hcs_params2 >> 27) & 0x1F) << 5);
-    
-    // Calculate register base addresses
-    ctrl->op_base = ctrl->base + cap_len;
-    ctrl->db_base = ctrl->base + dboff;
-    ctrl->rt_base = ctrl->base + rtsoff;
-    
-    // Calculate extended capabilities base
-    uint32_t xecp = ((ctrl->hcc_params1 & XHCI_HCC_XECP_MASK) >> XHCI_HCC_XECP_SHIFT) << 2;
-    ctrl->ext_caps_base = xecp ? (ctrl->base + xecp) : 0;
-    
-    // Read controller's supported page size
-    uint32_t pagesize_reg = xhci_op_read32(ctrl, XHCI_OP_PAGESIZE);
-    kprintf("[XHCI] xHCI v%x.%02x, MaxSlots=%d, MaxPorts=%d, Scratchpads=%d, CtxSize=%d\n", 
-            ctrl->hci_version >> 8, ctrl->hci_version & 0xFF,
-            ctrl->max_slots, ctrl->max_ports, ctrl->num_scratchpads, ctrl->context_size);
-    (void)pagesize_reg;
-    
-    // Limit slots to our maximum
-    if (ctrl->max_slots > XHCI_MAX_SLOTS) ctrl->max_slots = XHCI_MAX_SLOTS;
-    if (ctrl->max_ports > XHCI_MAX_PORTS) ctrl->max_ports = XHCI_MAX_PORTS;
-    
-    // Take ownership from BIOS
-    if (ctrl->ext_caps_base) {
-        xhci_bios_handoff(ctrl);
-    }
-    
-    // Halt controller first before reset
-    if (xhci_halt(ctrl) != ST_OK) {
-        kprintf("[XHCI] Warning: Controller halt timeout, continuing anyway\n");
-    }
-    
-    // Reset controller
-    if (xhci_reset(ctrl) != ST_OK) {
-        kprintf("[XHCI] Reset failed\n");
-        return ST_ERR;
-    }
-    
-    // Wait for controller to be ready after reset (CNR must be 0)
-    if (xhci_wait_ready(ctrl, 100) != ST_OK) {
-        kprintf("[XHCI] Controller not ready after reset\n");
-        return ST_ERR;
-    }
+int xhci_init(xhci_controller_t *ctrl, const pci_device_t *dev,
+	      uint8_t msi_vector)
+{
+	xhci_memset(ctrl, 0, sizeof(*ctrl));
+	ctrl->irq = msi_vector; // Store desired MSI vector for later use
 
-    
-    // Allocate DCBAA (Device Context Base Address Array) - DMA-safe
-    ctrl->dcbaa = (uint64_t*)kcalloc_dma(1, (ctrl->max_slots + 1) * sizeof(uint64_t) + 64);
-    if (!ctrl->dcbaa) {
-        kprintf("[XHCI] Failed to allocate DCBAA\n");
-        return ST_NOMEM;
-    }
-    // Align to 64 bytes
-    uint64_t dcbaa_addr = (uint64_t)ctrl->dcbaa;
-    if (dcbaa_addr & 0x3F) {
-        dcbaa_addr = (dcbaa_addr + 63) & ~63ULL;
-        ctrl->dcbaa = (uint64_t*)dcbaa_addr;
-    }
-    ctrl->dcbaa_phys = mm_get_physical_address((uint64_t)ctrl->dcbaa);
-    
-    // Setup scratchpad if needed
-    if (ctrl->num_scratchpads > 0) {
-        xhci_setup_scratchpad(ctrl);
-    }
-    
-    // Check HCCPARAMS1 capabilities
-    
-    // Allocate command ring
-    ctrl->cmd_ring = xhci_alloc_ring();
-    if (!ctrl->cmd_ring) {
-        kprintf("[XHCI] Failed to allocate command ring\n");
-        return ST_NOMEM;
-    }
-    ctrl->cmd_ring_phys = mm_get_physical_address((uint64_t)ctrl->cmd_ring->trbs);
-    xhci_ring_init(ctrl->cmd_ring, ctrl->cmd_ring_phys);
-    
-    // Validate DMA addresses are within 32-bit range if controller doesn't support AC64
-    if (!(ctrl->hcc_params1 & 1)) {
-        // Controller doesn't support 64-bit addressing
-        if (ctrl->dcbaa_phys > 0xFFFFFFFFULL || ctrl->cmd_ring_phys > 0xFFFFFFFFULL) {
-            kprintf("[XHCI] ERROR: Controller doesn't support 64-bit DMA but addresses are >4GB!\n");
-            kprintf("[XHCI]   DCBAA=0x%llx, CRCR=0x%llx\n", ctrl->dcbaa_phys, ctrl->cmd_ring_phys);
-        }
-    }
-    
-    // Allocate input context - DMA-safe
-    // Size: 33 contexts (input control + slot + 31 endpoints) * context_size
-    size_t input_ctx_size = 33 * ctrl->context_size;
-    ctrl->input_ctx_raw = (uint8_t*)kcalloc_dma(1, input_ctx_size + 64);
-    if (!ctrl->input_ctx_raw) {
-        kprintf("[XHCI] Failed to allocate input context\n");
-        return ST_NOMEM;
-    }
-    uint64_t ictx_addr = (uint64_t)ctrl->input_ctx_raw;
-    if (ictx_addr & 0x3F) {
-        ictx_addr = (ictx_addr + 63) & ~63ULL;
-        ctrl->input_ctx_raw = (uint8_t*)ictx_addr;
-    }
-    ctrl->input_ctx = (xhci_input_ctx_t*)ctrl->input_ctx_raw;  // For compatibility
-    ctrl->input_ctx_phys = mm_get_physical_address((uint64_t)ctrl->input_ctx_raw);
-    
-    // Configure operational registers:
-    // 1. Set max slots (CONFIG)
-    // 2. Write CRCR (Command Ring Control Register) 
-    // 3. Write DCBAAP (Device Context Base Address Array Pointer)
-    // 4. Setup event ring (interrupter)
-    
-    // Step 1: Set max device slots (CONFIG register)
-    xhci_op_write32(ctrl, XHCI_OP_CONFIG, ctrl->max_slots);
-    
-    // Verify controller is halted before writing CRCR (xHCI spec 5.4.5)
-    uint32_t sts_check = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-    if (!(sts_check & XHCI_STS_HCH)) {
-        kprintf("[XHCI] ERROR: Controller not halted (HCH=0)!\n");
-    }
-    if (sts_check & XHCI_STS_CNR) {
-        kprintf("[XHCI] ERROR: Controller not ready (CNR=1)!\n");
-    }
-    
-    // Step 2: Write CRCR FIRST (before DCBAAP)
-    // The command ring pointer must be 64-byte aligned
-    // Bit 0 = RCS (Ring Cycle State) = 1
-    uint64_t crcr_before = xhci_op_read64(ctrl, XHCI_OP_CRCR);
-    if (crcr_before & (1 << 3)) {
-        // CRR=1 - command ring running, abort it
-        xhci_op_write32(ctrl, XHCI_OP_CRCR, (1 << 2));  // Set CA bit
-        delay_ms(10);
-    }
-    
-    // Ensure command ring TRBs are flushed from cache before programming CRCR
-    xhci_flush_cache(ctrl->cmd_ring->trbs, sizeof(ctrl->cmd_ring->trbs));
-    xhci_mb();
-    
-    uint64_t crcr_value = (ctrl->cmd_ring_phys & ~0x3FULL) | TRB_FLAG_CYCLE;
-    
-    // Memory barrier before 64-bit register write
-    xhci_mb();
-    
-    // Write CRCR using split 32-bit writes (low DWORD first, then high DWORD)
-    xhci_op_write32(ctrl, XHCI_OP_CRCR, (uint32_t)(crcr_value & 0xFFFFFFFF));
-    xhci_op_write32(ctrl, XHCI_OP_CRCR + 4, (uint32_t)(crcr_value >> 32));
-    
-    // PCI posted write flush - read back a register to ensure writes are flushed
-    (void)xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-    
-    // Memory barrier to ensure CRCR write completes before DCBAAP
-    xhci_mb();
-    
-    // Flush DCBAA array from cache before telling controller about it
-    xhci_flush_cache(ctrl->dcbaa, (ctrl->max_slots + 1) * sizeof(uint64_t));
-    
-    // Step 3: Write DCBAAP as two 32-bit writes (after CRCR)
-    xhci_op_write32(ctrl, XHCI_OP_DCBAAP, (uint32_t)(ctrl->dcbaa_phys & 0xFFFFFFFF));
-    xhci_op_write32(ctrl, XHCI_OP_DCBAAP + 4, (uint32_t)(ctrl->dcbaa_phys >> 32));
-    
-    // PCI posted write flush
-    (void)xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-    
-    // Memory barrier to ensure DCBAAP write completes
-    xhci_mb();
-    
-    // Step 4: Setup event ring (interrupter) - AFTER CRCR and DCBAAP
-    xhci_setup_event_ring(ctrl);
-    
-    // Small delay for controller to process all register writes
-    delay_ms(1);
-    
-    // Verify writes took effect
-    uint64_t dcbaap_readback = xhci_op_read64(ctrl, XHCI_OP_DCBAAP);
-    uint64_t crcr_readback = xhci_op_read64(ctrl, XHCI_OP_CRCR);
-    uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-    (void)crcr_readback;  // CRCR pointer reads as 0 per spec
-    
-    // Only report errors
-    if (usbsts & 0x04) kprintf("[XHCI] ERROR: HSE during init!\n");
-    if (dcbaap_readback != ctrl->dcbaa_phys) {
-        kprintf("[XHCI] ERROR: DCBAA write failed!\n");
-    }
-    
-    // Clear any pending error status bits before starting
-    if (usbsts & (XHCI_STS_HSE | XHCI_STS_EINT | XHCI_STS_PCD)) {
-        xhci_op_write32(ctrl, XHCI_OP_USBSTS, usbsts & (XHCI_STS_HSE | XHCI_STS_EINT | XHCI_STS_PCD));
-        xhci_mb();
-    }
-    
-    // Enable Interrupter 0 BEFORE starting the controller
-    uint32_t iman = xhci_rt_read32(ctrl, 0x20);
-    xhci_rt_write32(ctrl, 0x20, iman | (1 << 1));
-    
-    // Start controller
-    if (xhci_start(ctrl) != ST_OK) {
-        kprintf("[XHCI] Failed to start controller\n");
-        return ST_ERR;
-    }
-    
-    // After halting and resetting the controller, USB 3.x ports may be stuck
-    // in PLS=Disabled (4) instead of RxDetect (5).  Transition them back to
-    // RxDetect so attached devices can be re-detected.  USB 2.0 ports don't
-    // need this — they auto-detect on their own.
-    for (uint8_t p = 1; p <= ctrl->max_ports; p++) {
-        uint32_t portsc = xhci_op_read32(ctrl, XHCI_OP_PORTSC_BASE + (p - 1) * 0x10);
-        uint8_t pls = (portsc >> 5) & 0xF;
-        
-        // PLS=4 (Disabled) on a powered port with no connection: kick to RxDetect
-        if ((portsc & XHCI_PORTSC_PP) && !(portsc & XHCI_PORTSC_CCS) && pls == 4) {
-            // Write PLS=5 (RxDetect) with LWS (Link State Write Strobe) set.
-            // Preserve PP, clear status change bits (write-1-to-clear).
-            uint32_t val = (portsc & ~(XHCI_PORTSC_PLS_MASK | XHCI_PORTSC_PED |
-                                       XHCI_PORTSC_WPR_MASK)) |
-                           (5 << 5) | XHCI_PORTSC_LWS;
-            xhci_op_write32(ctrl, XHCI_OP_PORTSC_BASE + (p - 1) * 0x10, val);
-        }
-    }
-    // Allow time for ports to transition and devices to reconnect
-    delay_ms(100);
+	// Store PCI IDs for quirk detection
+	ctrl->pci_vendor = dev->vendor_id;
+	ctrl->pci_device = dev->device_id;
 
-    // Enable interrupts — prefer MSI, fall back to legacy INTx, then polling.
+	// Most xHCI controllers (Intel, VMware, VirtualBox) set EINT spuriously,
+	// causing cycle resync to match stale TRBs. Only QEMU needs resync.
+	// 0x1b36:0x000d = QEMU xHCI
+	if (ctrl->pci_vendor == 0x1b36 && ctrl->pci_device == 0x000d) {
+		ctrl->quirk_resync = 1;
+	}
+
+	// CRITICAL: Enable bus mastering and memory access BEFORE any MMIO access
+	pci_enable_busmaster_mem(dev);
+
+	// Get BAR0 (MMIO base) - physical address
+	// Check if it's a 64-bit BAR (bits 2-1 = 10 means 64-bit)
+	uint64_t bar0_phys;
+	uint32_t bar0_low = dev->bar[0];
+	uint32_t bar1_high = 0;
+
+	if ((bar0_low & 0x6) == 0x4) {
+		// 64-bit BAR: BAR0 has low 32 bits, BAR1 has high 32 bits
+		bar1_high = dev->bar[1];
+		bar0_phys = ((uint64_t)bar1_high << 32) | (bar0_low & ~0xFULL);
+	} else {
+		// 32-bit BAR
+		bar0_phys = bar0_low & ~0xFULL;
+	}
+
+	if (bar0_phys == 0) {
+		kprintf("[XHCI] ERROR: BAR0 not configured\n");
+		return ST_ERR;
+	}
+
+	// Convert the BAR to a UC MMIO mapping. If the BAR is already inside the
+	// direct map, remap those direct-map pages in place instead of using the
+	// write-back alias.
+	{
+#define XHCI_MMIO_PAGES 16
+		uint64_t mapped =
+			mm_map_device_mmio(bar0_phys, XHCI_MMIO_PAGES);
+		if (!mapped) {
+			kprintf("[XHCI] ERROR: Failed to map BAR0 0x%llx into virtual memory\n",
+				(unsigned long long)bar0_phys);
+			return ST_ERR;
+		}
+		ctrl->base = mapped;
+	}
+
+	// Read and cache capability registers
+	uint32_t cap_base = xhci_cap_read32(ctrl, XHCI_CAP_CAPLENGTH);
+	uint8_t cap_len = cap_base & 0xFF;
+	ctrl->hci_version = (cap_base >> 16) & 0xFFFF;
+
+	// Sanity check cap_len - Intel Skylake/Kaby Lake uses 0x80
+	// Valid range per xHCI spec is 0x20 to 0xFF (must be DWORD aligned)
+	if (cap_len < 0x20) {
+		kprintf("[XHCI] ERROR: Invalid cap_len=0x%x (too small), forcing to 0x20\n",
+			cap_len);
+		cap_len = 0x20;
+	}
+
+	ctrl->hcs_params1 = xhci_cap_read32(ctrl, XHCI_CAP_HCSPARAMS1);
+	ctrl->hcs_params2 = xhci_cap_read32(ctrl, XHCI_CAP_HCSPARAMS2);
+	ctrl->hcs_params3 = xhci_cap_read32(ctrl, XHCI_CAP_HCSPARAMS3);
+	ctrl->hcc_params1 = xhci_cap_read32(ctrl, XHCI_CAP_HCCPARAMS1);
+	ctrl->hcc_params2 = xhci_cap_read32(ctrl, XHCI_CAP_HCCPARAMS2);
+
+	uint32_t dboff = xhci_cap_read32(ctrl, XHCI_CAP_DBOFF) & ~0x3;
+	uint32_t rtsoff = xhci_cap_read32(ctrl, XHCI_CAP_RTSOFF) & ~0x1F;
+
+	// Extract parameters from cached registers
+	ctrl->max_slots = ctrl->hcs_params1 & 0xFF;
+	ctrl->max_ports = (ctrl->hcs_params1 >> 24) & 0xFF;
+	ctrl->max_intrs = (ctrl->hcs_params1 >> 8) & 0x7FF;
+	ctrl->context_size = (ctrl->hcc_params1 & XHCI_HCC_CSZ) ? 64 : 32;
+	ctrl->num_scratchpads = ((ctrl->hcs_params2 >> 21) & 0x1F) |
+				(((ctrl->hcs_params2 >> 27) & 0x1F) << 5);
+
+	// Calculate register base addresses
+	ctrl->op_base = ctrl->base + cap_len;
+	ctrl->db_base = ctrl->base + dboff;
+	ctrl->rt_base = ctrl->base + rtsoff;
+
+	// Calculate extended capabilities base
+	uint32_t xecp = ((ctrl->hcc_params1 & XHCI_HCC_XECP_MASK) >>
+			 XHCI_HCC_XECP_SHIFT)
+			<< 2;
+	ctrl->ext_caps_base = xecp ? (ctrl->base + xecp) : 0;
+
+	// Read controller's supported page size
+	uint32_t pagesize_reg = xhci_op_read32(ctrl, XHCI_OP_PAGESIZE);
+	kprintf("[XHCI] xHCI v%x.%02x, MaxSlots=%d, MaxPorts=%d, Scratchpads=%d, CtxSize=%d\n",
+		ctrl->hci_version >> 8, ctrl->hci_version & 0xFF,
+		ctrl->max_slots, ctrl->max_ports, ctrl->num_scratchpads,
+		ctrl->context_size);
+	(void)pagesize_reg;
+
+	// Limit slots to our maximum
+	if (ctrl->max_slots > XHCI_MAX_SLOTS)
+		ctrl->max_slots = XHCI_MAX_SLOTS;
+	if (ctrl->max_ports > XHCI_MAX_PORTS)
+		ctrl->max_ports = XHCI_MAX_PORTS;
+
+	// Take ownership from BIOS
+	if (ctrl->ext_caps_base) {
+		xhci_bios_handoff(ctrl);
+	}
+
+	// Halt controller first before reset
+	if (xhci_halt(ctrl) != ST_OK) {
+		kprintf("[XHCI] Warning: Controller halt timeout, continuing anyway\n");
+	}
+
+	// Reset controller
+	if (xhci_reset(ctrl) != ST_OK) {
+		kprintf("[XHCI] Reset failed\n");
+		return ST_ERR;
+	}
+
+	// Wait for controller to be ready after reset (CNR must be 0)
+	if (xhci_wait_ready(ctrl, 100) != ST_OK) {
+		kprintf("[XHCI] Controller not ready after reset\n");
+		return ST_ERR;
+	}
+
+	// Allocate DCBAA (Device Context Base Address Array) - DMA-safe
+	ctrl->dcbaa = (uint64_t *)kcalloc_dma(
+		1, (ctrl->max_slots + 1) * sizeof(uint64_t) + 64);
+	if (!ctrl->dcbaa) {
+		kprintf("[XHCI] Failed to allocate DCBAA\n");
+		return ST_NOMEM;
+	}
+	// Align to 64 bytes
+	uint64_t dcbaa_addr = (uint64_t)ctrl->dcbaa;
+	if (dcbaa_addr & 0x3F) {
+		dcbaa_addr = (dcbaa_addr + 63) & ~63ULL;
+		ctrl->dcbaa = (uint64_t *)dcbaa_addr;
+	}
+	ctrl->dcbaa_phys = mm_get_physical_address((uint64_t)ctrl->dcbaa);
+
+	// Setup scratchpad if needed
+	if (ctrl->num_scratchpads > 0) {
+		xhci_setup_scratchpad(ctrl);
+	}
+
+	// Check HCCPARAMS1 capabilities
+
+	// Allocate command ring
+	ctrl->cmd_ring = xhci_alloc_ring();
+	if (!ctrl->cmd_ring) {
+		kprintf("[XHCI] Failed to allocate command ring\n");
+		return ST_NOMEM;
+	}
+	ctrl->cmd_ring_phys =
+		mm_get_physical_address((uint64_t)ctrl->cmd_ring->trbs);
+	xhci_ring_init(ctrl->cmd_ring, ctrl->cmd_ring_phys);
+
+	// Validate DMA addresses are within 32-bit range if controller doesn't support AC64
+	if (!(ctrl->hcc_params1 & 1)) {
+		// Controller doesn't support 64-bit addressing
+		if (ctrl->dcbaa_phys > 0xFFFFFFFFULL ||
+		    ctrl->cmd_ring_phys > 0xFFFFFFFFULL) {
+			kprintf("[XHCI] ERROR: Controller doesn't support 64-bit DMA but addresses are >4GB!\n");
+			kprintf("[XHCI]   DCBAA=0x%llx, CRCR=0x%llx\n",
+				ctrl->dcbaa_phys, ctrl->cmd_ring_phys);
+		}
+	}
+
+	// Allocate input context - DMA-safe
+	// Size: 33 contexts (input control + slot + 31 endpoints) * context_size
+	size_t input_ctx_size = 33 * ctrl->context_size;
+	ctrl->input_ctx_raw = (uint8_t *)kcalloc_dma(1, input_ctx_size + 64);
+	if (!ctrl->input_ctx_raw) {
+		kprintf("[XHCI] Failed to allocate input context\n");
+		return ST_NOMEM;
+	}
+	uint64_t ictx_addr = (uint64_t)ctrl->input_ctx_raw;
+	if (ictx_addr & 0x3F) {
+		ictx_addr = (ictx_addr + 63) & ~63ULL;
+		ctrl->input_ctx_raw = (uint8_t *)ictx_addr;
+	}
+	ctrl->input_ctx =
+		(xhci_input_ctx_t *)ctrl->input_ctx_raw; // For compatibility
+	ctrl->input_ctx_phys =
+		mm_get_physical_address((uint64_t)ctrl->input_ctx_raw);
+
+	// Configure operational registers:
+	// 1. Set max slots (CONFIG)
+	// 2. Write CRCR (Command Ring Control Register)
+	// 3. Write DCBAAP (Device Context Base Address Array Pointer)
+	// 4. Setup event ring (interrupter)
+
+	// Step 1: Set max device slots (CONFIG register)
+	xhci_op_write32(ctrl, XHCI_OP_CONFIG, ctrl->max_slots);
+
+	// Verify controller is halted before writing CRCR (xHCI spec 5.4.5)
+	uint32_t sts_check = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+	if (!(sts_check & XHCI_STS_HCH)) {
+		kprintf("[XHCI] ERROR: Controller not halted (HCH=0)!\n");
+	}
+	if (sts_check & XHCI_STS_CNR) {
+		kprintf("[XHCI] ERROR: Controller not ready (CNR=1)!\n");
+	}
+
+	// Step 2: Write CRCR FIRST (before DCBAAP)
+	// The command ring pointer must be 64-byte aligned
+	// Bit 0 = RCS (Ring Cycle State) = 1
+	uint64_t crcr_before = xhci_op_read64(ctrl, XHCI_OP_CRCR);
+	if (crcr_before & (1 << 3)) {
+		// CRR=1 - command ring running, abort it
+		xhci_op_write32(ctrl, XHCI_OP_CRCR, (1 << 2)); // Set CA bit
+		delay_ms(10);
+	}
+
+	// Ensure command ring TRBs are flushed from cache before programming CRCR
+	xhci_flush_cache(ctrl->cmd_ring->trbs, sizeof(ctrl->cmd_ring->trbs));
+	xhci_mb();
+
+	uint64_t crcr_value = (ctrl->cmd_ring_phys & ~0x3FULL) | TRB_FLAG_CYCLE;
+
+	// Memory barrier before 64-bit register write
+	xhci_mb();
+
+	// Write CRCR using split 32-bit writes (low DWORD first, then high DWORD)
+	xhci_op_write32(ctrl, XHCI_OP_CRCR,
+			(uint32_t)(crcr_value & 0xFFFFFFFF));
+	xhci_op_write32(ctrl, XHCI_OP_CRCR + 4, (uint32_t)(crcr_value >> 32));
+
+	// PCI posted write flush - read back a register to ensure writes are flushed
+	(void)xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+
+	// Memory barrier to ensure CRCR write completes before DCBAAP
+	xhci_mb();
+
+	// Flush DCBAA array from cache before telling controller about it
+	xhci_flush_cache(ctrl->dcbaa, (ctrl->max_slots + 1) * sizeof(uint64_t));
+
+	// Step 3: Write DCBAAP as two 32-bit writes (after CRCR)
+	xhci_op_write32(ctrl, XHCI_OP_DCBAAP,
+			(uint32_t)(ctrl->dcbaa_phys & 0xFFFFFFFF));
+	xhci_op_write32(ctrl, XHCI_OP_DCBAAP + 4,
+			(uint32_t)(ctrl->dcbaa_phys >> 32));
+
+	// PCI posted write flush
+	(void)xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+
+	// Memory barrier to ensure DCBAAP write completes
+	xhci_mb();
+
+	// Step 4: Setup event ring (interrupter) - AFTER CRCR and DCBAAP
+	xhci_setup_event_ring(ctrl);
+
+	// Small delay for controller to process all register writes
+	delay_ms(1);
+
+	// Verify writes took effect
+	uint64_t dcbaap_readback = xhci_op_read64(ctrl, XHCI_OP_DCBAAP);
+	uint64_t crcr_readback = xhci_op_read64(ctrl, XHCI_OP_CRCR);
+	uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+	(void)crcr_readback; // CRCR pointer reads as 0 per spec
+
+	// Only report errors
+	if (usbsts & 0x04)
+		kprintf("[XHCI] ERROR: HSE during init!\n");
+	if (dcbaap_readback != ctrl->dcbaa_phys) {
+		kprintf("[XHCI] ERROR: DCBAA write failed!\n");
+	}
+
+	// Clear any pending error status bits before starting
+	if (usbsts & (XHCI_STS_HSE | XHCI_STS_EINT | XHCI_STS_PCD)) {
+		xhci_op_write32(
+			ctrl, XHCI_OP_USBSTS,
+			usbsts & (XHCI_STS_HSE | XHCI_STS_EINT | XHCI_STS_PCD));
+		xhci_mb();
+	}
+
+	// Enable Interrupter 0 BEFORE starting the controller
+	uint32_t iman = xhci_rt_read32(ctrl, 0x20);
+	xhci_rt_write32(ctrl, 0x20, iman | (1 << 1));
+
+	// Start controller
+	if (xhci_start(ctrl) != ST_OK) {
+		kprintf("[XHCI] Failed to start controller\n");
+		return ST_ERR;
+	}
+
+	// After halting and resetting the controller, USB 3.x ports may be stuck
+	// in PLS=Disabled (4) instead of RxDetect (5).  Transition them back to
+	// RxDetect so attached devices can be re-detected.  USB 2.0 ports don't
+	// need this — they auto-detect on their own.
+	for (uint8_t p = 1; p <= ctrl->max_ports; p++) {
+		uint32_t portsc = xhci_op_read32(ctrl, XHCI_OP_PORTSC_BASE +
+							       (p - 1) * 0x10);
+		uint8_t pls = (portsc >> 5) & 0xF;
+
+		// PLS=4 (Disabled) on a powered port with no connection: kick to RxDetect
+		if ((portsc & XHCI_PORTSC_PP) && !(portsc & XHCI_PORTSC_CCS) &&
+		    pls == 4) {
+			// Write PLS=5 (RxDetect) with LWS (Link State Write Strobe) set.
+			// Preserve PP, clear status change bits (write-1-to-clear).
+			uint32_t val = (portsc & ~(XHCI_PORTSC_PLS_MASK |
+						   XHCI_PORTSC_PED |
+						   XHCI_PORTSC_WPR_MASK)) |
+				       (5 << 5) | XHCI_PORTSC_LWS;
+			xhci_op_write32(ctrl,
+					XHCI_OP_PORTSC_BASE + (p - 1) * 0x10,
+					val);
+		}
+	}
+	// Allow time for ports to transition and devices to reconnect
+	delay_ms(100);
+
+	// Enable interrupts — prefer MSI, fall back to legacy INTx, then polling.
 #if XHCI_USE_INTERRUPTS
-    // Try MSI first (required for most modern hardware)
-    if (pci_enable_msi(dev, ctrl->irq) == 0) {
-        ctrl->msi_enabled = 1;
+	// Try MSI first (required for most modern hardware)
+	if (pci_enable_msi(dev, ctrl->irq) == 0) {
+		ctrl->msi_enabled = 1;
 
-        // Configure interrupter 0
-        uint64_t erdp = mm_get_physical_address((uint64_t)ctrl->event_ring->trbs);
-        xhci_rt_write64(ctrl, 0x38, erdp | (1 << 3)); // ERDP with EHB
+		// Configure interrupter 0
+		uint64_t erdp = mm_get_physical_address(
+			(uint64_t)ctrl->event_ring->trbs);
+		xhci_rt_write64(ctrl, 0x38, erdp | (1 << 3)); // ERDP with EHB
 
-        // Set IMOD (interrupt moderation) to 0 for immediate interrupts
-        xhci_rt_write32(ctrl, 0x24, 0);
+		// Set IMOD (interrupt moderation) to 0 for immediate interrupts
+		xhci_rt_write32(ctrl, 0x24, 0);
 
-        // Enable interrupter
-        xhci_rt_write32(ctrl, 0x20, (1 << 1) | (1 << 0)); // IE | IP
+		// Enable interrupter
+		xhci_rt_write32(ctrl, 0x20, (1 << 1) | (1 << 0)); // IE | IP
 
-        // Enable interrupts in USBCMD
-        uint32_t cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
-        xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd | XHCI_CMD_INTE);
+		// Enable interrupts in USBCMD
+		uint32_t cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
+		xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd | XHCI_CMD_INTE);
 
-        ctrl->irq_enabled = 1;
-        kprintf("[XHCI] Interrupts enabled via MSI (vector %d)\n", ctrl->irq);
-    } else {
-        // Fall back to legacy INTx
-        ctrl->irq = dev->interrupt_line;
-        ctrl->msi_enabled = 0;
-        if (ctrl->irq != 0xFF && ctrl->irq < 16) {
-            uint64_t erdp = mm_get_physical_address((uint64_t)ctrl->event_ring->trbs);
-            xhci_rt_write64(ctrl, 0x38, erdp | (1 << 3));
-            xhci_rt_write32(ctrl, 0x24, 0);
-            xhci_rt_write32(ctrl, 0x20, (1 << 1) | (1 << 0));
+		ctrl->irq_enabled = 1;
+		kprintf("[XHCI] Interrupts enabled via MSI (vector %d)\n",
+			ctrl->irq);
+	} else {
+		// Fall back to legacy INTx
+		ctrl->irq = dev->interrupt_line;
+		ctrl->msi_enabled = 0;
+		if (ctrl->irq != 0xFF && ctrl->irq < 16) {
+			uint64_t erdp = mm_get_physical_address(
+				(uint64_t)ctrl->event_ring->trbs);
+			xhci_rt_write64(ctrl, 0x38, erdp | (1 << 3));
+			xhci_rt_write32(ctrl, 0x24, 0);
+			xhci_rt_write32(ctrl, 0x20, (1 << 1) | (1 << 0));
 
-            uint32_t cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
-            xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd | XHCI_CMD_INTE);
+			uint32_t cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
+			xhci_op_write32(ctrl, XHCI_OP_USBCMD,
+					cmd | XHCI_CMD_INTE);
 
-            irq_enable(ctrl->irq);
-            ctrl->irq_enabled = 1;
-            kprintf("[XHCI] Interrupts enabled via legacy INTx (IRQ %d)\n", ctrl->irq);
-        } else {
-            kprintf("[XHCI] No MSI and no valid INTx line — using polled mode\n");
-        }
-    }
+			irq_enable(ctrl->irq);
+			ctrl->irq_enabled = 1;
+			kprintf("[XHCI] Interrupts enabled via legacy INTx (IRQ %d)\n",
+				ctrl->irq);
+		} else {
+			kprintf("[XHCI] No MSI and no valid INTx line — using polled mode\n");
+		}
+	}
 #endif
-    
-    ctrl->initialized = 1;
-    
-    return ST_OK;
+
+	ctrl->initialized = 1;
+
+	return ST_OK;
 }
 
-static void xhci_setup_scratchpad(xhci_controller_t* ctrl) {
-    if (ctrl->num_scratchpads == 0) return;
-    
-    // Allocate scratchpad array - MUST be page-aligned per xHCI spec!
-    // Array needs num_scratchpads * 8 bytes, allocate extra for page alignment
-    size_t array_size = ctrl->num_scratchpads * sizeof(uint64_t);
-    size_t array_alloc_size = array_size + PAGE_SIZE;
-    uint8_t* raw_array = (uint8_t*)kcalloc_dma(1, array_alloc_size);
-    if (!raw_array) {
-        kprintf("[XHCI] Failed to allocate scratchpad array\n");
-        return;
-    }
-    // Align to page boundary
-    uint64_t aligned_array = ((uint64_t)raw_array + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    ctrl->scratchpad_array = (uint64_t*)aligned_array;
-    
-    ctrl->scratchpad_pages = (void**)kcalloc_dma(ctrl->num_scratchpads, sizeof(void*));
-    
-    if (!ctrl->scratchpad_pages) {
-        kprintf("[XHCI] Failed to allocate scratchpad pages array\n");
-        return;
-    }
-    
-    uint64_t scratchpad_array_phys = mm_get_physical_address((uint64_t)ctrl->scratchpad_array);
-    
-    // Allocate pages for scratchpad (must be page-aligned for DMA)
-    for (uint16_t i = 0; i < ctrl->num_scratchpads; i++) {
-        // Allocate extra for alignment, DMA-safe for low physical addresses
-        void* raw = kcalloc_dma(1, PAGE_SIZE + PAGE_SIZE);
-        if (!raw) {
-            kprintf("[XHCI] Failed to allocate scratchpad page %d\n", i);
-            return;
-        }
-        // Align to page boundary
-        void* page = (void*)(((uint64_t)raw + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
-        ctrl->scratchpad_pages[i] = raw;  // Store raw for freeing later
-        ctrl->scratchpad_array[i] = mm_get_physical_address((uint64_t)page);
-        
-        // Flush this scratchpad page from cache (controller may DMA to/from it)
-        xhci_flush_cache(page, PAGE_SIZE);
-        
+static void xhci_setup_scratchpad(xhci_controller_t *ctrl)
+{
+	if (ctrl->num_scratchpads == 0)
+		return;
 
-    }
-    
-    // Point DCBAA[0] to scratchpad array
-    ctrl->dcbaa[0] = mm_get_physical_address((uint64_t)ctrl->scratchpad_array);
-    
-    // Flush scratchpad array from cache for DMA coherency
-    xhci_flush_cache(ctrl->scratchpad_array, ctrl->num_scratchpads * sizeof(uint64_t));
-    
-    // Flush DCBAA[0] entry as well
-    xhci_flush_cache(&ctrl->dcbaa[0], sizeof(uint64_t));
+	// Allocate scratchpad array - MUST be page-aligned per xHCI spec!
+	// Array needs num_scratchpads * 8 bytes, allocate extra for page alignment
+	size_t array_size = ctrl->num_scratchpads * sizeof(uint64_t);
+	size_t array_alloc_size = array_size + PAGE_SIZE;
+	uint8_t *raw_array = (uint8_t *)kcalloc_dma(1, array_alloc_size);
+	if (!raw_array) {
+		kprintf("[XHCI] Failed to allocate scratchpad array\n");
+		return;
+	}
+	// Align to page boundary
+	uint64_t aligned_array =
+		((uint64_t)raw_array + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+	ctrl->scratchpad_array = (uint64_t *)aligned_array;
+
+	ctrl->scratchpad_pages =
+		(void **)kcalloc_dma(ctrl->num_scratchpads, sizeof(void *));
+
+	if (!ctrl->scratchpad_pages) {
+		kprintf("[XHCI] Failed to allocate scratchpad pages array\n");
+		return;
+	}
+
+	uint64_t scratchpad_array_phys =
+		mm_get_physical_address((uint64_t)ctrl->scratchpad_array);
+
+	// Allocate pages for scratchpad (must be page-aligned for DMA)
+	for (uint16_t i = 0; i < ctrl->num_scratchpads; i++) {
+		// Allocate extra for alignment, DMA-safe for low physical addresses
+		void *raw = kcalloc_dma(1, PAGE_SIZE + PAGE_SIZE);
+		if (!raw) {
+			kprintf("[XHCI] Failed to allocate scratchpad page %d\n",
+				i);
+			return;
+		}
+		// Align to page boundary
+		void *page = (void *)(((uint64_t)raw + PAGE_SIZE - 1) &
+				      ~(PAGE_SIZE - 1));
+		ctrl->scratchpad_pages[i] = raw; // Store raw for freeing later
+		ctrl->scratchpad_array[i] =
+			mm_get_physical_address((uint64_t)page);
+
+		// Flush this scratchpad page from cache (controller may DMA to/from it)
+		xhci_flush_cache(page, PAGE_SIZE);
+	}
+
+	// Point DCBAA[0] to scratchpad array
+	ctrl->dcbaa[0] =
+		mm_get_physical_address((uint64_t)ctrl->scratchpad_array);
+
+	// Flush scratchpad array from cache for DMA coherency
+	xhci_flush_cache(ctrl->scratchpad_array,
+			 ctrl->num_scratchpads * sizeof(uint64_t));
+
+	// Flush DCBAA[0] entry as well
+	xhci_flush_cache(&ctrl->dcbaa[0], sizeof(uint64_t));
 }
 
-static void xhci_setup_event_ring(xhci_controller_t* ctrl) {
-    // Allocate event ring
-    ctrl->event_ring = xhci_alloc_ring();
-    if (!ctrl->event_ring) {
-        kprintf("[XHCI] Failed to allocate event ring\n");
-        return;
-    }
-    ctrl->event_ring_phys = mm_get_physical_address((uint64_t)ctrl->event_ring->trbs);
-    
-    // Initialize event ring (no link TRB, just zero it)
-    xhci_memset(ctrl->event_ring->trbs, 0, sizeof(ctrl->event_ring->trbs));
-    ctrl->event_ring->enqueue = 0;
-    ctrl->event_ring->dequeue = 0;
-    ctrl->event_ring->cycle = 1;
-    
-    // Allocate ERST (Event Ring Segment Table) - DMA-safe
-    ctrl->erst = (xhci_erst_entry_t*)kcalloc_dma(1, sizeof(xhci_erst_entry_t) * 2 + 64);
-    if (!ctrl->erst) {
-        kprintf("[XHCI] Failed to allocate ERST\n");
-        return;
-    }
-    // Align to 64 bytes
-    uint64_t erst_addr = (uint64_t)ctrl->erst;
-    if (erst_addr & 0x3F) {
-        erst_addr = (erst_addr + 63) & ~63ULL;
-        ctrl->erst = (xhci_erst_entry_t*)erst_addr;
-    }
-    ctrl->erst_phys = mm_get_physical_address((uint64_t)ctrl->erst);
-    
-    // Configure ERST entry 0
-    // Note: size field is the number of TRBs in this segment (per xHCI spec 6.5)
-    ctrl->erst[0].base = ctrl->event_ring_phys;
-    ctrl->erst[0].size = XHCI_RING_SIZE;  // Number of TRBs in event ring segment
-    ctrl->erst[0].reserved = 0;
-    
-    // Flush event ring and ERST from cache before telling controller about them
-    xhci_flush_cache(ctrl->event_ring->trbs, sizeof(ctrl->event_ring->trbs));
-    xhci_flush_cache(ctrl->erst, sizeof(xhci_erst_entry_t));
-    
+static void xhci_setup_event_ring(xhci_controller_t *ctrl)
+{
+	// Allocate event ring
+	ctrl->event_ring = xhci_alloc_ring();
+	if (!ctrl->event_ring) {
+		kprintf("[XHCI] Failed to allocate event ring\n");
+		return;
+	}
+	ctrl->event_ring_phys =
+		mm_get_physical_address((uint64_t)ctrl->event_ring->trbs);
 
-    
-    // Configure interrupter 0 runtime registers (offsets from rt_base + 0x20)
-    // Use split 32-bit writes for Intel controller compatibility
-    //
-    // CRITICAL: Per xHCI spec 4.9.4, the order MUST be:
-    //   1. ERSTSZ (Event Ring Segment Table Size)
-    //   2. ERDP (Event Ring Dequeue Pointer) - BEFORE ERSTBA!
-    //   3. ERSTBA (Event Ring Segment Table Base Address) - enables the ring
-    // Writing ERSTBA enables the Event Ring State Machine, so ERDP must be set first!
-    
-    // Step 1: ERSTSZ = 1 (one segment) at offset 0x28
-    xhci_rt_write32(ctrl, 0x28, 1);
-    
-    // Step 2: ERDP = physical address of event ring at offset 0x38 (BEFORE ERSTBA!)
-    // Note: bit 3 is EHB (Event Handler Busy), clear it
-    xhci_rt_write32(ctrl, 0x38, (uint32_t)(ctrl->event_ring_phys & 0xFFFFFFFF));
-    xhci_rt_write32(ctrl, 0x3C, (uint32_t)(ctrl->event_ring_phys >> 32));
-    
-    // Step 3: ERSTBA = physical address of ERST at offset 0x30 (write low then high)
-    // This ENABLES the event ring - must be done AFTER ERDP is set!
-    xhci_rt_write32(ctrl, 0x30, (uint32_t)(ctrl->erst_phys & 0xFFFFFFFF));
-    xhci_rt_write32(ctrl, 0x34, (uint32_t)(ctrl->erst_phys >> 32));
-    
-    xhci_dbg("Event ring configured at 0x%llx\n", ctrl->event_ring_phys);
+	// Initialize event ring (no link TRB, just zero it)
+	xhci_memset(ctrl->event_ring->trbs, 0, sizeof(ctrl->event_ring->trbs));
+	ctrl->event_ring->enqueue = 0;
+	ctrl->event_ring->dequeue = 0;
+	ctrl->event_ring->cycle = 1;
+
+	// Allocate ERST (Event Ring Segment Table) - DMA-safe
+	ctrl->erst = (xhci_erst_entry_t *)kcalloc_dma(
+		1, sizeof(xhci_erst_entry_t) * 2 + 64);
+	if (!ctrl->erst) {
+		kprintf("[XHCI] Failed to allocate ERST\n");
+		return;
+	}
+	// Align to 64 bytes
+	uint64_t erst_addr = (uint64_t)ctrl->erst;
+	if (erst_addr & 0x3F) {
+		erst_addr = (erst_addr + 63) & ~63ULL;
+		ctrl->erst = (xhci_erst_entry_t *)erst_addr;
+	}
+	ctrl->erst_phys = mm_get_physical_address((uint64_t)ctrl->erst);
+
+	// Configure ERST entry 0
+	// Note: size field is the number of TRBs in this segment (per xHCI spec 6.5)
+	ctrl->erst[0].base = ctrl->event_ring_phys;
+	ctrl->erst[0].size =
+		XHCI_RING_SIZE; // Number of TRBs in event ring segment
+	ctrl->erst[0].reserved = 0;
+
+	// Flush event ring and ERST from cache before telling controller about them
+	xhci_flush_cache(ctrl->event_ring->trbs,
+			 sizeof(ctrl->event_ring->trbs));
+	xhci_flush_cache(ctrl->erst, sizeof(xhci_erst_entry_t));
+
+	// Configure interrupter 0 runtime registers (offsets from rt_base + 0x20)
+	// Use split 32-bit writes for Intel controller compatibility
+	//
+	// CRITICAL: Per xHCI spec 4.9.4, the order MUST be:
+	//   1. ERSTSZ (Event Ring Segment Table Size)
+	//   2. ERDP (Event Ring Dequeue Pointer) - BEFORE ERSTBA!
+	//   3. ERSTBA (Event Ring Segment Table Base Address) - enables the ring
+	// Writing ERSTBA enables the Event Ring State Machine, so ERDP must be set first!
+
+	// Step 1: ERSTSZ = 1 (one segment) at offset 0x28
+	xhci_rt_write32(ctrl, 0x28, 1);
+
+	// Step 2: ERDP = physical address of event ring at offset 0x38 (BEFORE ERSTBA!)
+	// Note: bit 3 is EHB (Event Handler Busy), clear it
+	xhci_rt_write32(ctrl, 0x38,
+			(uint32_t)(ctrl->event_ring_phys & 0xFFFFFFFF));
+	xhci_rt_write32(ctrl, 0x3C, (uint32_t)(ctrl->event_ring_phys >> 32));
+
+	// Step 3: ERSTBA = physical address of ERST at offset 0x30 (write low then high)
+	// This ENABLES the event ring - must be done AFTER ERDP is set!
+	xhci_rt_write32(ctrl, 0x30, (uint32_t)(ctrl->erst_phys & 0xFFFFFFFF));
+	xhci_rt_write32(ctrl, 0x34, (uint32_t)(ctrl->erst_phys >> 32));
+
+	xhci_dbg("Event ring configured at 0x%llx\n", ctrl->event_ring_phys);
 }
 
-int xhci_reset(xhci_controller_t* ctrl) {
-    // Stop controller first
-    uint32_t cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
-    
-    xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd & ~XHCI_CMD_RUN);
-    
-    // Wait for halt
-    for (int i = 0; i < 100; i++) {
-        if (xhci_op_read32(ctrl, XHCI_OP_USBSTS) & XHCI_STS_HCH) break;
-        delay_ms(1);
-    }
-    
-    // Issue reset
-    xhci_op_write32(ctrl, XHCI_OP_USBCMD, XHCI_CMD_HCRST);
-    
-    // Wait for reset to complete
-    for (int i = 0; i < 1000; i++) {
-        uint32_t cmd_val = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
-        uint32_t sts_val = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-        if (!(cmd_val & XHCI_CMD_HCRST) && !(sts_val & XHCI_STS_CNR)) {
-            return ST_OK;
-        }
-        delay_ms(1);
-    }
-    
-    kprintf("[XHCI] Reset timeout\n");
-    return ST_TIMEOUT;
+int xhci_reset(xhci_controller_t *ctrl)
+{
+	// Stop controller first
+	uint32_t cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
+
+	xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd & ~XHCI_CMD_RUN);
+
+	// Wait for halt
+	for (int i = 0; i < 100; i++) {
+		if (xhci_op_read32(ctrl, XHCI_OP_USBSTS) & XHCI_STS_HCH)
+			break;
+		delay_ms(1);
+	}
+
+	// Issue reset
+	xhci_op_write32(ctrl, XHCI_OP_USBCMD, XHCI_CMD_HCRST);
+
+	// Wait for reset to complete
+	for (int i = 0; i < 1000; i++) {
+		uint32_t cmd_val = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
+		uint32_t sts_val = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+		if (!(cmd_val & XHCI_CMD_HCRST) && !(sts_val & XHCI_STS_CNR)) {
+			return ST_OK;
+		}
+		delay_ms(1);
+	}
+
+	kprintf("[XHCI] Reset timeout\n");
+	return ST_TIMEOUT;
 }
 
-int xhci_start(xhci_controller_t* ctrl) {
-    // Wait for controller not ready to clear
-    if (xhci_wait_ready(ctrl, 100) != ST_OK) {
-        kprintf("[XHCI] ERROR: Controller not ready (CNR=1)\n");
-        return ST_ERR;
-    }
-    
-    // Memory barrier before starting
-    xhci_mb();
-    
-    // Start controller with R/S bit
-    uint32_t cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
-    xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd | XHCI_CMD_RUN);
-    
-    // Memory barrier after write
-    xhci_mb();
-    
-    // Wait for running (HCH bit must clear)
-    for (int i = 0; i < 100; i++) {
-        uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-        if (!(sts & XHCI_STS_HCH)) {
-            ctrl->running = 1;
-            kprintf("[XHCI] Controller started\n");
-            
-            // Check for immediate HSE
-            if (sts & XHCI_STS_HSE) {
-                kprintf("[XHCI] ERROR: HSE set immediately after start!\n");
-            }
-            
-            return ST_OK;
-        }
-        delay_ms(1);
-    }
-    
-    // Start failed - dump diagnostic info
-    uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-    cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
-    kprintf("[XHCI] Failed to start: USBCMD=0x%x USBSTS=0x%x\n", cmd, sts);
-    return ST_TIMEOUT;
+int xhci_start(xhci_controller_t *ctrl)
+{
+	// Wait for controller not ready to clear
+	if (xhci_wait_ready(ctrl, 100) != ST_OK) {
+		kprintf("[XHCI] ERROR: Controller not ready (CNR=1)\n");
+		return ST_ERR;
+	}
+
+	// Memory barrier before starting
+	xhci_mb();
+
+	// Start controller with R/S bit
+	uint32_t cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
+	xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd | XHCI_CMD_RUN);
+
+	// Memory barrier after write
+	xhci_mb();
+
+	// Wait for running (HCH bit must clear)
+	for (int i = 0; i < 100; i++) {
+		uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+		if (!(sts & XHCI_STS_HCH)) {
+			ctrl->running = 1;
+			kprintf("[XHCI] Controller started\n");
+
+			// Check for immediate HSE
+			if (sts & XHCI_STS_HSE) {
+				kprintf("[XHCI] ERROR: HSE set immediately after start!\n");
+			}
+
+			return ST_OK;
+		}
+		delay_ms(1);
+	}
+
+	// Start failed - dump diagnostic info
+	uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+	cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
+	kprintf("[XHCI] Failed to start: USBCMD=0x%x USBSTS=0x%x\n", cmd, sts);
+	return ST_TIMEOUT;
 }
 
-void xhci_stop(xhci_controller_t* ctrl) {
-    uint32_t cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
-    xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd & ~XHCI_CMD_RUN);
-    ctrl->running = 0;
+void xhci_stop(xhci_controller_t *ctrl)
+{
+	uint32_t cmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
+	xhci_op_write32(ctrl, XHCI_OP_USBCMD, cmd & ~XHCI_CMD_RUN);
+	ctrl->running = 0;
 }
 
-static int xhci_wait_ready(xhci_controller_t* ctrl, uint32_t timeout_ms) {
-    for (uint32_t i = 0; i < timeout_ms; i++) {
-        if (!(xhci_op_read32(ctrl, XHCI_OP_USBSTS) & XHCI_STS_CNR)) {
-            return ST_OK;
-        }
-        delay_ms(1);
-    }
-    return ST_TIMEOUT;
+static int xhci_wait_ready(xhci_controller_t *ctrl, uint32_t timeout_ms)
+{
+	for (uint32_t i = 0; i < timeout_ms; i++) {
+		if (!(xhci_op_read32(ctrl, XHCI_OP_USBSTS) & XHCI_STS_CNR)) {
+			return ST_OK;
+		}
+		delay_ms(1);
+	}
+	return ST_TIMEOUT;
 }
 
 //=============================================================================
@@ -1295,374 +1445,411 @@ static volatile uint8_t g_cmd_complete = 0;
 static volatile uint8_t g_cmd_cc = 0;
 static volatile uint32_t g_cmd_slot = 0;
 
-int xhci_send_command(xhci_controller_t* ctrl, uint64_t param, uint32_t status, uint32_t control) {
-    BUG_ON(ctrl == NULL);
-    BUG_ON(ctrl->base == 0);
-    uint64_t flags;
-    spin_lock_irqsave(&xhci_lock, &flags);
+int xhci_send_command(xhci_controller_t *ctrl, uint64_t param, uint32_t status,
+		      uint32_t control)
+{
+	BUG_ON(ctrl == NULL);
+	BUG_ON(ctrl->base == 0);
+	uint64_t flags;
+	spin_lock_irqsave(&xhci_lock, &flags);
 
-    g_cmd_complete = 0;
-    g_cmd_cc = TRB_CC_INVALID;
-    g_cmd_slot = 0;
-    
-    // Check controller state before sending command
-    uint32_t usbcmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
-    uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-    
-    // Verify controller is running (R/S=1, HCH=0)
-    if (!(usbcmd & XHCI_CMD_RUN)) {
-        xhci_op_write32(ctrl, XHCI_OP_USBCMD, usbcmd | XHCI_CMD_RUN);
-        xhci_mb();
-        delay_ms(10);
-        usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-    }
-    
-    if (usbsts & XHCI_STS_HCH) {
-        kprintf("[XHCI] ERROR: Controller halted!\n");
-        spin_unlock_irqrestore(&xhci_lock, flags);
-        return ST_ERR;
-    }
-    
-    // Check for HSE - if set, there was a DMA error
-    if (usbsts & XHCI_STS_HSE) {
-        kprintf("[XHCI] ERROR: HSE set before command!\n");
-        xhci_op_write32(ctrl, XHCI_OP_USBSTS, XHCI_STS_HSE);
-        xhci_mb();
-    }
-    
-    int idx = xhci_ring_enqueue(ctrl->cmd_ring, param, status, control);
-    if (idx < 0) {
-        spin_unlock_irqrestore(&xhci_lock, flags);
-        return ST_ERR;
-    }
-    
+	g_cmd_complete = 0;
+	g_cmd_cc = TRB_CC_INVALID;
+	g_cmd_slot = 0;
 
-    
-    // Ring command doorbell (slot 0, target 0)
-    xhci_ring_doorbell(ctrl, 0, 0);
-    
-    spin_unlock_irqrestore(&xhci_lock, flags);
-    return ST_OK;
+	// Check controller state before sending command
+	uint32_t usbcmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
+	uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+
+	// Verify controller is running (R/S=1, HCH=0)
+	if (!(usbcmd & XHCI_CMD_RUN)) {
+		xhci_op_write32(ctrl, XHCI_OP_USBCMD, usbcmd | XHCI_CMD_RUN);
+		xhci_mb();
+		delay_ms(10);
+		usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+	}
+
+	if (usbsts & XHCI_STS_HCH) {
+		kprintf("[XHCI] ERROR: Controller halted!\n");
+		spin_unlock_irqrestore(&xhci_lock, flags);
+		return ST_ERR;
+	}
+
+	// Check for HSE - if set, there was a DMA error
+	if (usbsts & XHCI_STS_HSE) {
+		kprintf("[XHCI] ERROR: HSE set before command!\n");
+		xhci_op_write32(ctrl, XHCI_OP_USBSTS, XHCI_STS_HSE);
+		xhci_mb();
+	}
+
+	int idx = xhci_ring_enqueue(ctrl->cmd_ring, param, status, control);
+	if (idx < 0) {
+		spin_unlock_irqrestore(&xhci_lock, flags);
+		return ST_ERR;
+	}
+
+	// Ring command doorbell (slot 0, target 0)
+	xhci_ring_doorbell(ctrl, 0, 0);
+
+	spin_unlock_irqrestore(&xhci_lock, flags);
+	return ST_OK;
 }
 
-int xhci_wait_command(xhci_controller_t* ctrl, uint32_t timeout_ms) {
-    BUG_ON(ctrl == NULL);
-    for (uint32_t i = 0; i < timeout_ms * 10; i++) {  // 10x iterations with 100us delays
-        // Process events (either from interrupt or polling)
-        xhci_process_events_locked(ctrl);
-        
-        if (g_cmd_complete) {
-            if (g_cmd_cc == TRB_CC_SUCCESS) {
-                return ST_OK;
-            }
-            // Command failed - caller will handle error
-            return ST_ERR;
-        }
-        
-        delay_us(100);  // 100 microsecond delay for faster response
-    }
-    
-    // Timeout - print essential diagnostic
-    uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-    kprintf("[XHCI] Command timeout! USBSTS=0x%x (HSE=%d HCH=%d)\n", 
-            usbsts, (usbsts >> 2) & 1, usbsts & 1);
-    
-    return ST_TIMEOUT;
+int xhci_wait_command(xhci_controller_t *ctrl, uint32_t timeout_ms)
+{
+	BUG_ON(ctrl == NULL);
+	for (uint32_t i = 0; i < timeout_ms * 10;
+	     i++) { // 10x iterations with 100us delays
+		// Process events (either from interrupt or polling)
+		xhci_process_events_locked(ctrl);
+
+		if (g_cmd_complete) {
+			if (g_cmd_cc == TRB_CC_SUCCESS) {
+				return ST_OK;
+			}
+			// Command failed - caller will handle error
+			return ST_ERR;
+		}
+
+		delay_us(100); // 100 microsecond delay for faster response
+	}
+
+	// Timeout - print essential diagnostic
+	uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+	kprintf("[XHCI] Command timeout! USBSTS=0x%x (HSE=%d HCH=%d)\n", usbsts,
+		(usbsts >> 2) & 1, usbsts & 1);
+
+	return ST_TIMEOUT;
 }
 
 //=============================================================================
 // Event Processing
 //=============================================================================
 
-void xhci_irq_service(xhci_controller_t* ctrl) {
-    uint64_t flags;
-    spin_lock_irqsave(&xhci_lock, &flags);
+void xhci_irq_service(xhci_controller_t *ctrl)
+{
+	uint64_t flags;
+	spin_lock_irqsave(&xhci_lock, &flags);
 
-    if (!ctrl || !ctrl->initialized) {
-        spin_unlock_irqrestore(&xhci_lock, flags);
-        return;
-    }
-    
-    // Check if we have an interrupt pending
-    uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-    if (!(sts & XHCI_STS_EINT)) {
-        spin_unlock_irqrestore(&xhci_lock, flags);
-        return;
-    }
-    
-    // Clear interrupt
-    xhci_op_write32(ctrl, XHCI_OP_USBSTS, XHCI_STS_EINT);
-    
-    // Clear interrupter pending
-    uint32_t iman = xhci_rt_read32(ctrl, 0x20);
-    xhci_rt_write32(ctrl, 0x20, iman | (1 << 0)); // Clear IP
-    
-    // Process events
-    xhci_process_events(ctrl);
+	if (!ctrl || !ctrl->initialized) {
+		spin_unlock_irqrestore(&xhci_lock, flags);
+		return;
+	}
 
-    spin_unlock_irqrestore(&xhci_lock, flags);
+	// Check if we have an interrupt pending
+	uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+	if (!(sts & XHCI_STS_EINT)) {
+		spin_unlock_irqrestore(&xhci_lock, flags);
+		return;
+	}
+
+	// Clear interrupt
+	xhci_op_write32(ctrl, XHCI_OP_USBSTS, XHCI_STS_EINT);
+
+	// Clear interrupter pending
+	uint32_t iman = xhci_rt_read32(ctrl, 0x20);
+	xhci_rt_write32(ctrl, 0x20, iman | (1 << 0)); // Clear IP
+
+	// Process events
+	xhci_process_events(ctrl);
+
+	spin_unlock_irqrestore(&xhci_lock, flags);
 }
 
-void xhci_process_events(xhci_controller_t* ctrl) {
-    if (!ctrl || !ctrl->event_ring) return;
-    
-    xhci_ring_t* ring = ctrl->event_ring;
-    int processed = 0;
-    
-    // QEMU quirk: pre-clear EINT/IP so the quirk_resync cycle-toggle
-    // check below doesn't see stale EINT left over from missed IRQs.
-    // Only QEMU needs this; on other controllers (VirtualBox, VMware,
-    // real hardware) pre-clearing can race with event posting and cause
-    // the controller to not re-assert EINT for new events.
-    if (ctrl->quirk_resync) {
-        uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-        if (sts & XHCI_STS_EINT) {
-            xhci_op_write32(ctrl, XHCI_OP_USBSTS, XHCI_STS_EINT);
-        }
-        uint32_t iman_val = xhci_rt_read32(ctrl, 0x20);
-        if (iman_val & 1) {
-            xhci_rt_write32(ctrl, 0x20, iman_val | (1 << 0));
-        }
-    }
-    
-    // Compiler barrier: ensure we re-read event ring TRBs from memory (not
-    // cached in registers).  On x86, DMA writes to WB memory are coherent
-    // and the preceding MMIO reads (UC) already serialise; mfence is not
-    // needed here and was very expensive inside the 50 000-iteration poll loop.
-    __asm__ volatile("" ::: "memory");
-    
-    while (processed < XHCI_RING_SIZE) {
-        xhci_trb_t* trb = &ring->trbs[ring->dequeue];
-        
-        // Check cycle bit matches expected
-        uint8_t trb_cycle = (trb->control & TRB_FLAG_CYCLE) ? 1 : 0;
-        if (trb_cycle != ring->cycle) {
-            // Check if EINT is set but we have cycle mismatch - might need resync
-            // Only QEMU needs resync - other controllers set EINT spuriously
-            uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-            if (ctrl->quirk_resync && (usbsts & XHCI_STS_EINT) && processed == 0) {
-                // EINT set but no events - try toggling cycle bit
-                ring->cycle ^= 1;
-                trb_cycle = (trb->control & TRB_FLAG_CYCLE) ? 1 : 0;
-                if (trb_cycle == ring->cycle) {
-                    // Fixed! Continue processing
-                    //kprintf("[XHCI] Event ring cycle resync at deq=%d\n", ring->dequeue);
-                } else {
-                    // Still mismatched, revert and break
-                    ring->cycle ^= 1;
-                    break;
-                }
-            } else {
-                break;  // No more events
-            }
-        }
-        
-        uint8_t trb_type = (trb->control >> 10) & 0x3F;
-        
-        switch (trb_type) {
-            case TRB_TYPE_TRANSFER:
-                xhci_handle_transfer_event(ctrl, trb);
-                break;
-            case TRB_TYPE_CMD_COMPLETE:
-                xhci_handle_command_event(ctrl, trb);
-                break;
-            case TRB_TYPE_PORT_STATUS:
-                xhci_handle_port_event(ctrl, trb);
-                break;
-            case TRB_TYPE_HOST_CTRL:
-                xhci_dbg("Host controller event\n");
-                break;
-            default:
-                xhci_dbg("Unknown event type %d\n", trb_type);
-                break;
-        }
-        
-        // Advance dequeue
-        ring->dequeue++;
-        if (ring->dequeue >= XHCI_RING_SIZE) {
-            ring->dequeue = 0;
-            ring->cycle ^= 1;
-        }
-        
-        processed++;
-    }
-    
-    // Update ERDP and clear EINT/IP after processing (xHCI spec 4.17.2).
-    // Clearing EINT after processing (not before) is the spec-compliant
-    // order and avoids races on VirtualBox/VMware where pre-clearing can
-    // prevent the controller from properly re-asserting EINT.
-    if (processed > 0) {
-        uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-        if (sts & XHCI_STS_EINT) {
-            xhci_op_write32(ctrl, XHCI_OP_USBSTS, XHCI_STS_EINT);
-        }
-        uint32_t iman_val = xhci_rt_read32(ctrl, 0x20);
-        if (iman_val & 1) {
-            xhci_rt_write32(ctrl, 0x20, iman_val | (1 << 0));
-        }
-        uint64_t erdp = mm_get_physical_address((uint64_t)&ring->trbs[ring->dequeue]);
-        xhci_rt_write64(ctrl, 0x38, erdp | (1 << 3)); // Set EHB (W1C)
-    }
+void xhci_process_events(xhci_controller_t *ctrl)
+{
+	if (!ctrl || !ctrl->event_ring)
+		return;
+
+	xhci_ring_t *ring = ctrl->event_ring;
+	int processed = 0;
+
+	// QEMU quirk: pre-clear EINT/IP so the quirk_resync cycle-toggle
+	// check below doesn't see stale EINT left over from missed IRQs.
+	// Only QEMU needs this; on other controllers (VirtualBox, VMware,
+	// real hardware) pre-clearing can race with event posting and cause
+	// the controller to not re-assert EINT for new events.
+	if (ctrl->quirk_resync) {
+		uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+		if (sts & XHCI_STS_EINT) {
+			xhci_op_write32(ctrl, XHCI_OP_USBSTS, XHCI_STS_EINT);
+		}
+		uint32_t iman_val = xhci_rt_read32(ctrl, 0x20);
+		if (iman_val & 1) {
+			xhci_rt_write32(ctrl, 0x20, iman_val | (1 << 0));
+		}
+	}
+
+	// Compiler barrier: ensure we re-read event ring TRBs from memory (not
+	// cached in registers).  On x86, DMA writes to WB memory are coherent
+	// and the preceding MMIO reads (UC) already serialise; mfence is not
+	// needed here and was very expensive inside the 50 000-iteration poll loop.
+	__asm__ volatile("" ::: "memory");
+
+	while (processed < XHCI_RING_SIZE) {
+		xhci_trb_t *trb = &ring->trbs[ring->dequeue];
+
+		// Check cycle bit matches expected
+		uint8_t trb_cycle = (trb->control & TRB_FLAG_CYCLE) ? 1 : 0;
+		if (trb_cycle != ring->cycle) {
+			// Check if EINT is set but we have cycle mismatch - might need resync
+			// Only QEMU needs resync - other controllers set EINT spuriously
+			uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+			if (ctrl->quirk_resync && (usbsts & XHCI_STS_EINT) &&
+			    processed == 0) {
+				// EINT set but no events - try toggling cycle bit
+				ring->cycle ^= 1;
+				trb_cycle =
+					(trb->control & TRB_FLAG_CYCLE) ? 1 : 0;
+				if (trb_cycle == ring->cycle) {
+					// Fixed! Continue processing
+					//kprintf("[XHCI] Event ring cycle resync at deq=%d\n", ring->dequeue);
+				} else {
+					// Still mismatched, revert and break
+					ring->cycle ^= 1;
+					break;
+				}
+			} else {
+				break; // No more events
+			}
+		}
+
+		uint8_t trb_type = (trb->control >> 10) & 0x3F;
+
+		switch (trb_type) {
+		case TRB_TYPE_TRANSFER:
+			xhci_handle_transfer_event(ctrl, trb);
+			break;
+		case TRB_TYPE_CMD_COMPLETE:
+			xhci_handle_command_event(ctrl, trb);
+			break;
+		case TRB_TYPE_PORT_STATUS:
+			xhci_handle_port_event(ctrl, trb);
+			break;
+		case TRB_TYPE_HOST_CTRL:
+			xhci_dbg("Host controller event\n");
+			break;
+		default:
+			xhci_dbg("Unknown event type %d\n", trb_type);
+			break;
+		}
+
+		// Advance dequeue
+		ring->dequeue++;
+		if (ring->dequeue >= XHCI_RING_SIZE) {
+			ring->dequeue = 0;
+			ring->cycle ^= 1;
+		}
+
+		processed++;
+	}
+
+	// Update ERDP and clear EINT/IP after processing (xHCI spec 4.17.2).
+	// Clearing EINT after processing (not before) is the spec-compliant
+	// order and avoids races on VirtualBox/VMware where pre-clearing can
+	// prevent the controller from properly re-asserting EINT.
+	if (processed > 0) {
+		uint32_t sts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+		if (sts & XHCI_STS_EINT) {
+			xhci_op_write32(ctrl, XHCI_OP_USBSTS, XHCI_STS_EINT);
+		}
+		uint32_t iman_val = xhci_rt_read32(ctrl, 0x20);
+		if (iman_val & 1) {
+			xhci_rt_write32(ctrl, 0x20, iman_val | (1 << 0));
+		}
+		uint64_t erdp = mm_get_physical_address(
+			(uint64_t)&ring->trbs[ring->dequeue]);
+		xhci_rt_write64(ctrl, 0x38, erdp | (1 << 3)); // Set EHB (W1C)
+	}
 }
 
-static void xhci_handle_command_event(xhci_controller_t* ctrl, xhci_trb_t* trb) {
-    (void)ctrl;
-    g_cmd_cc = (trb->status >> 24) & 0xFF;
-    g_cmd_slot = (trb->control >> 24) & 0xFF;
-    g_cmd_complete = 1;
-    xhci_dbg("Command complete: CC=%d, Slot=%d\n", g_cmd_cc, g_cmd_slot);
+static void xhci_handle_command_event(xhci_controller_t *ctrl, xhci_trb_t *trb)
+{
+	(void)ctrl;
+	g_cmd_cc = (trb->status >> 24) & 0xFF;
+	g_cmd_slot = (trb->control >> 24) & 0xFF;
+	g_cmd_complete = 1;
+	xhci_dbg("Command complete: CC=%d, Slot=%d\n", g_cmd_cc, g_cmd_slot);
 }
 
-static void xhci_handle_transfer_event(xhci_controller_t* ctrl, xhci_trb_t* trb) {
-    uint8_t cc = (trb->status >> 24) & 0xFF;
-    uint32_t residue = trb->status & 0xFFFFFF;
-    uint8_t slot = (trb->control >> 24) & 0xFF;
-    uint8_t ep_id = (trb->control >> 16) & 0x1F;
-    WARN_ON(slot == 0);  /* transfer event with slot_id==0 is invalid — slot IDs start at 1 in xHCI spec */
-    // If a HID device owns this endpoint, it processes the report and
-    // re-submits the next interrupt transfer entirely in IRQ context,
-    // providing the lowest possible input latency.
-    if (usbhid_irq_completion(ctrl, slot, ep_id, cc, residue)) {
-        return;  // Consumed by HID driver
-    }
+static void xhci_handle_transfer_event(xhci_controller_t *ctrl, xhci_trb_t *trb)
+{
+	uint8_t cc = (trb->status >> 24) & 0xFF;
+	uint32_t residue = trb->status & 0xFFFFFF;
+	uint8_t slot = (trb->control >> 24) & 0xFF;
+	uint8_t ep_id = (trb->control >> 16) & 0x1F;
+	WARN_ON(slot ==
+		0); /* transfer event with slot_id==0 is invalid — slot IDs start at 1 in xHCI spec */
+	// If a HID device owns this endpoint, it processes the report and
+	// re-submits the next interrupt transfer entirely in IRQ context,
+	// providing the lowest possible input latency.
+	if (usbhid_irq_completion(ctrl, slot, ep_id, cc, residue)) {
+		return; // Consumed by HID driver
+	}
 
-    // Generic pending transfer completion (bulk/control transfers)
-    if (slot > 0 && slot <= XHCI_MAX_SLOTS && ep_id < XHCI_MAX_ENDPOINTS) {
-        xhci_transfer_t* xfer = ctrl->pending_xfer[slot - 1][ep_id];
-        if (xfer) {
-            xfer->cc = cc;
-            xfer->bytes_transferred = residue;
-            xfer->completed = 1;
-        }
-    }
+	// Generic pending transfer completion (bulk/control transfers)
+	if (slot > 0 && slot <= XHCI_MAX_SLOTS && ep_id < XHCI_MAX_ENDPOINTS) {
+		xhci_transfer_t *xfer = ctrl->pending_xfer[slot - 1][ep_id];
+		if (xfer) {
+			xfer->cc = cc;
+			xfer->bytes_transferred = residue;
+			xfer->completed = 1;
+		}
+	}
 }
 
-static void xhci_handle_port_event(xhci_controller_t* ctrl, xhci_trb_t* trb) {
-    uint8_t port = ((trb->param >> 24) & 0xFF);
-    uint32_t portsc = 0;
-    if (port > 0 && port <= ctrl->max_ports) {
-        portsc = xhci_op_read32(ctrl, XHCI_OP_PORTSC_BASE + (port - 1) * 0x10);
-    }
-    xhci_dbg("Port status change event: Port %d, PORTSC=0x%08x\n", port, portsc);
+static void xhci_handle_port_event(xhci_controller_t *ctrl, xhci_trb_t *trb)
+{
+	uint8_t port = ((trb->param >> 24) & 0xFF);
+	uint32_t portsc = 0;
+	if (port > 0 && port <= ctrl->max_ports) {
+		portsc = xhci_op_read32(ctrl, XHCI_OP_PORTSC_BASE +
+						      (port - 1) * 0x10);
+	}
+	xhci_dbg("Port status change event: Port %d, PORTSC=0x%08x\n", port,
+		 portsc);
 
-    // If this is a Connect Status Change (CSC), flag the port for the
-    // main-loop hot-plug handler.  We don't enumerate here because
-    // enumeration requires control transfers that can't be issued from
-    // IRQ context with xhci_lock held.
-    if ((portsc & XHCI_PORTSC_CSC) && port > 0 && port <= XHCI_MAX_PORTS) {
-        ctrl->hotplug_ports |= (1U << (port - 1));
-    }
+	// If this is a Connect Status Change (CSC), flag the port for the
+	// main-loop hot-plug handler.  We don't enumerate here because
+	// enumeration requires control transfers that can't be issued from
+	// IRQ context with xhci_lock held.
+	if ((portsc & XHCI_PORTSC_CSC) && port > 0 && port <= XHCI_MAX_PORTS) {
+		ctrl->hotplug_ports |= (1U << (port - 1));
+	}
 
-    // NOTE: Don't clear change bits here - let xhci_port_reset / hotplug_poll
-    // handle them.  The reset code polls for these bits.
+	// NOTE: Don't clear change bits here - let xhci_port_reset / hotplug_poll
+	// handle them.  The reset code polls for these bits.
 }
 
 //=============================================================================
 // Port Management
 //=============================================================================
 
-int xhci_power_ports(xhci_controller_t* ctrl) {
-    if (!ctrl) return ST_INVALID;
-    
-    // Power up all ports
-    for (uint8_t port = 1; port <= ctrl->max_ports; port++) {
-        uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
-        uint32_t portsc = xhci_op_read32(ctrl, off);
-        
-        if (!(portsc & XHCI_PORTSC_PP)) {
-            // Set Port Power (PP) bit
-            xhci_op_write32(ctrl, off, XHCI_PORTSC_PP);
-        } else if (portsc & XHCI_PORTSC_WPR_MASK) {
-            // Clear any pending change bits
-            xhci_op_write32(ctrl, off, (portsc & XHCI_PORTSC_PP) | XHCI_PORTSC_WPR_MASK);
-        }
-    }
-    
-    // Wait for port power stabilization (USB spec: 100ms, use 200ms for compatibility)
-    delay_ms(200);
-    
-    // Clear any port status change bits that appeared during power-up
-    for (uint8_t port = 1; port <= ctrl->max_ports; port++) {
-        uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
-        uint32_t portsc = xhci_op_read32(ctrl, off);
-        
-        if (portsc & XHCI_PORTSC_WPR_MASK) {
-            xhci_op_write32(ctrl, off, (portsc & (XHCI_PORTSC_PP | XHCI_PORTSC_PED)) | XHCI_PORTSC_WPR_MASK);
-        }
-    }
-    
-    return ST_OK;
+int xhci_power_ports(xhci_controller_t *ctrl)
+{
+	if (!ctrl)
+		return ST_INVALID;
+
+	// Power up all ports
+	for (uint8_t port = 1; port <= ctrl->max_ports; port++) {
+		uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
+		uint32_t portsc = xhci_op_read32(ctrl, off);
+
+		if (!(portsc & XHCI_PORTSC_PP)) {
+			// Set Port Power (PP) bit
+			xhci_op_write32(ctrl, off, XHCI_PORTSC_PP);
+		} else if (portsc & XHCI_PORTSC_WPR_MASK) {
+			// Clear any pending change bits
+			xhci_op_write32(ctrl, off,
+					(portsc & XHCI_PORTSC_PP) |
+						XHCI_PORTSC_WPR_MASK);
+		}
+	}
+
+	// Wait for port power stabilization (USB spec: 100ms, use 200ms for compatibility)
+	delay_ms(200);
+
+	// Clear any port status change bits that appeared during power-up
+	for (uint8_t port = 1; port <= ctrl->max_ports; port++) {
+		uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
+		uint32_t portsc = xhci_op_read32(ctrl, off);
+
+		if (portsc & XHCI_PORTSC_WPR_MASK) {
+			xhci_op_write32(
+				ctrl, off,
+				(portsc & (XHCI_PORTSC_PP | XHCI_PORTSC_PED)) |
+					XHCI_PORTSC_WPR_MASK);
+		}
+	}
+
+	return ST_OK;
 }
 
-int xhci_poll_ports(xhci_controller_t* ctrl) {
-    int connected = 0;
-    int start_devices = ctrl->num_devices;
-    
-    for (uint8_t port = 1; port <= ctrl->max_ports; port++) {
-        uint32_t portsc = xhci_op_read32(ctrl, XHCI_OP_PORTSC_BASE + (port - 1) * 0x10);
-        
-        if (portsc & XHCI_PORTSC_CCS) {
-            connected++;
-            
-            // Check if this port is already enumerated
-            int already_enumerated = 0;
-            for (int i = 0; i < ctrl->num_devices; i++) {
-                if (ctrl->devices[i].port == port && ctrl->devices[i].configured) {
-                    already_enumerated = 1;
-                    break;
-                }
-            }
-            
-            // Try to enumerate if not already done for this port
-            if (!already_enumerated && ctrl->num_devices < XHCI_MAX_SLOTS) {
-                xhci_enumerate_device(ctrl, port);
-            }
-        }
-    }
-    
-    int new_devices = ctrl->num_devices - start_devices;
-    if (new_devices > 0) {
-        kprintf("[XHCI] Found %d USB devices\n", new_devices);
-    }
-    
-    return connected;
+int xhci_poll_ports(xhci_controller_t *ctrl)
+{
+	int connected = 0;
+	int start_devices = ctrl->num_devices;
+
+	for (uint8_t port = 1; port <= ctrl->max_ports; port++) {
+		uint32_t portsc = xhci_op_read32(
+			ctrl, XHCI_OP_PORTSC_BASE + (port - 1) * 0x10);
+
+		if (portsc & XHCI_PORTSC_CCS) {
+			connected++;
+
+			// Check if this port is already enumerated
+			int already_enumerated = 0;
+			for (int i = 0; i < ctrl->num_devices; i++) {
+				if (ctrl->devices[i].port == port &&
+				    ctrl->devices[i].configured) {
+					already_enumerated = 1;
+					break;
+				}
+			}
+
+			// Try to enumerate if not already done for this port
+			if (!already_enumerated &&
+			    ctrl->num_devices < XHCI_MAX_SLOTS) {
+				xhci_enumerate_device(ctrl, port);
+			}
+		}
+	}
+
+	int new_devices = ctrl->num_devices - start_devices;
+	if (new_devices > 0) {
+		kprintf("[XHCI] Found %d USB devices\n", new_devices);
+	}
+
+	return connected;
 }
 
 // Disable a device slot and release its resources.
 // xHCI spec Section 4.6.4: Disable Slot Command.
-int xhci_disable_slot(xhci_controller_t* ctrl, uint8_t slot) {
-    if (slot == 0 || slot > ctrl->max_slots) return ST_INVALID;
+int xhci_disable_slot(xhci_controller_t *ctrl, uint8_t slot)
+{
+	if (slot == 0 || slot > ctrl->max_slots)
+		return ST_INVALID;
 
-    usb_device_t* dev = &ctrl->devices[slot - 1];
+	usb_device_t *dev = &ctrl->devices[slot - 1];
 
-    // Send Disable Slot command (slot ID in bits 31:24 of control)
-    uint32_t control = (TRB_TYPE_DISABLE_SLOT << 10) | ((uint32_t)slot << 24);
-    if (xhci_send_command(ctrl, 0, 0, control) != ST_OK) {
-        xhci_dbg("Disable slot %d: send failed\n", slot);
-        return ST_ERR;
-    }
-    xhci_wait_command(ctrl, 500);
+	// Send Disable Slot command (slot ID in bits 31:24 of control)
+	uint32_t control =
+		(TRB_TYPE_DISABLE_SLOT << 10) | ((uint32_t)slot << 24);
+	if (xhci_send_command(ctrl, 0, 0, control) != ST_OK) {
+		xhci_dbg("Disable slot %d: send failed\n", slot);
+		return ST_ERR;
+	}
+	xhci_wait_command(ctrl, 500);
 
-    // Clear DCBAA entry
-    ctrl->dcbaa[slot] = 0;
+	// Clear DCBAA entry
+	ctrl->dcbaa[slot] = 0;
 
-    // Free transfer rings
-    if (dev->ep0_ring)      { xhci_free_ring(dev->ep0_ring);      dev->ep0_ring = NULL; }
-    if (dev->bulk_in_ring)  { xhci_free_ring(dev->bulk_in_ring);  dev->bulk_in_ring = NULL; }
-    if (dev->bulk_out_ring) { xhci_free_ring(dev->bulk_out_ring); dev->bulk_out_ring = NULL; }
+	// Free transfer rings
+	if (dev->ep0_ring) {
+		xhci_free_ring(dev->ep0_ring);
+		dev->ep0_ring = NULL;
+	}
+	if (dev->bulk_in_ring) {
+		xhci_free_ring(dev->bulk_in_ring);
+		dev->bulk_in_ring = NULL;
+	}
+	if (dev->bulk_out_ring) {
+		xhci_free_ring(dev->bulk_out_ring);
+		dev->bulk_out_ring = NULL;
+	}
 
-    // Clear all pending transfers for this slot
-    for (int ep = 0; ep < XHCI_MAX_ENDPOINTS; ep++) {
-        ctrl->pending_xfer[slot - 1][ep] = NULL;
-    }
+	// Clear all pending transfers for this slot
+	for (int ep = 0; ep < XHCI_MAX_ENDPOINTS; ep++) {
+		ctrl->pending_xfer[slot - 1][ep] = NULL;
+	}
 
-    // Mark device as unconfigured
-    dev->configured = 0;
-    dev->slot_id = 0;
-    dev->port = 0;
+	// Mark device as unconfigured
+	dev->configured = 0;
+	dev->slot_id = 0;
+	dev->port = 0;
 
-    xhci_dbg("Slot %d disabled and cleaned up\n", slot);
-    return ST_OK;
+	xhci_dbg("Slot %d disabled and cleaned up\n", slot);
+	return ST_OK;
 }
 
 // Hot-plug poll: called from the main loop to handle runtime USB
@@ -1673,798 +1860,872 @@ int xhci_disable_slot(xhci_controller_t* ctrl, uint8_t slot) {
 // INTx routing issues on modern hardware).  Without this, transfer
 // completions and port status change events would never be seen on
 // such systems, causing HID devices to stop working after boot.
-void xhci_hotplug_poll(xhci_controller_t* ctrl) {
-    if (!ctrl || !ctrl->initialized || !ctrl->running) return;
+void xhci_hotplug_poll(xhci_controller_t *ctrl)
+{
+	if (!ctrl || !ctrl->initialized || !ctrl->running)
+		return;
 
-    // Always process the event ring.  This is the critical fallback for
-    // hardware where the xHCI IRQ doesn't fire (very common on real
-    // machines — INTx line is 0xFF, MSI not configured, etc.).
-    // If the IRQ *is* working, the event ring will typically be empty
-    // and this returns immediately after one cycle-bit check, so it's
-    // essentially free.
-    xhci_process_events_locked(ctrl);
+	// Always process the event ring.  This is the critical fallback for
+	// hardware where the xHCI IRQ doesn't fire (very common on real
+	// machines — INTx line is 0xFF, MSI not configured, etc.).
+	// If the IRQ *is* working, the event ring will typically be empty
+	// and this returns immediately after one cycle-bit check, so it's
+	// essentially free.
+	xhci_process_events_locked(ctrl);
 
-    // Now handle any port status changes that were flagged
-    uint32_t pending = ctrl->hotplug_ports;
-    if (!pending) return;
-    ctrl->hotplug_ports = 0;
-    __asm__ volatile("" ::: "memory");
+	// Now handle any port status changes that were flagged
+	uint32_t pending = ctrl->hotplug_ports;
+	if (!pending)
+		return;
+	ctrl->hotplug_ports = 0;
+	__asm__ volatile("" ::: "memory");
 
-    for (uint8_t port = 1; port <= ctrl->max_ports && port <= XHCI_MAX_PORTS; port++) {
-        if (!(pending & (1U << (port - 1)))) continue;
+	for (uint8_t port = 1;
+	     port <= ctrl->max_ports && port <= XHCI_MAX_PORTS; port++) {
+		if (!(pending & (1U << (port - 1))))
+			continue;
 
-        uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
-        uint32_t portsc = xhci_op_read32(ctrl, off);
+		uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
+		uint32_t portsc = xhci_op_read32(ctrl, off);
 
-        // Clear the CSC bit (RW1C) while preserving PP.
-        // CRITICAL: Do NOT include PED in the write value!  PED is RW1CS,
-        // meaning writing 1 to it CLEARS it, which disables the port and
-        // kills any active transfers on that port.
-        uint32_t clear = (portsc & XHCI_PORTSC_PP) | XHCI_PORTSC_CSC;
-        xhci_op_write32(ctrl, off, clear);
+		// Clear the CSC bit (RW1C) while preserving PP.
+		// CRITICAL: Do NOT include PED in the write value!  PED is RW1CS,
+		// meaning writing 1 to it CLEARS it, which disables the port and
+		// kills any active transfers on that port.
+		uint32_t clear = (portsc & XHCI_PORTSC_PP) | XHCI_PORTSC_CSC;
+		xhci_op_write32(ctrl, off, clear);
 
-        if (portsc & XHCI_PORTSC_CCS) {
-            // === Device connected ===
-            // Check if already enumerated on this port
-            int already = 0;
-            for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
-                if (ctrl->devices[i].port == port && ctrl->devices[i].configured) {
-                    already = 1;
-                    break;
-                }
-            }
-            if (!already && ctrl->num_devices < XHCI_MAX_SLOTS) {
-                kprintf("[XHCI] Hot-plug: device connected on port %d\n", port);
-                xhci_enumerate_device(ctrl, port);
-            }
-        } else {
-            // === Device disconnected ===
-            for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
-                usb_device_t* dev = &ctrl->devices[i];
-                if (dev->port == port && dev->configured) {
-                    kprintf("[XHCI] Hot-unplug: device removed from port %d (slot %d)\n",
-                            port, dev->slot_id);
+		if (portsc & XHCI_PORTSC_CCS) {
+			// === Device connected ===
+			// Check if already enumerated on this port
+			int already = 0;
+			for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
+				if (ctrl->devices[i].port == port &&
+				    ctrl->devices[i].configured) {
+					already = 1;
+					break;
+				}
+			}
+			if (!already && ctrl->num_devices < XHCI_MAX_SLOTS) {
+				kprintf("[XHCI] Hot-plug: device connected on port %d\n",
+					port);
+				xhci_enumerate_device(ctrl, port);
+			}
+		} else {
+			// === Device disconnected ===
+			for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
+				usb_device_t *dev = &ctrl->devices[i];
+				if (dev->port == port && dev->configured) {
+					kprintf("[XHCI] Hot-unplug: device removed from port %d (slot %d)\n",
+						port, dev->slot_id);
 
-                    // Notify HID driver first so it stops using the device
-                    usbhid_disconnect(dev);
-                    usbserial_disconnect(dev);
+					// Notify HID driver first so it stops using the device
+					usbhid_disconnect(dev);
+					usbserial_disconnect(dev);
 
-                    // Disable the slot and free resources
-                    uint8_t slot = dev->slot_id;
-                    xhci_disable_slot(ctrl, slot);
-                    if (ctrl->num_devices > 0) ctrl->num_devices--;
-                }
-            }
-        }
-    }
+					// Disable the slot and free resources
+					uint8_t slot = dev->slot_id;
+					xhci_disable_slot(ctrl, slot);
+					if (ctrl->num_devices > 0)
+						ctrl->num_devices--;
+				}
+			}
+		}
+	}
 }
 
-int xhci_port_reset(xhci_controller_t* ctrl, uint8_t port) {
-    if (port < 1 || port > ctrl->max_ports) return ST_INVALID;
-    
-    uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
-    uint32_t portsc = xhci_op_read32(ctrl, off);
-    
-    xhci_dbg("Port %d before reset: PORTSC=0x%08x\n", port, portsc);
-    
-    // Check if port is already enabled (SuperSpeed devices may not need reset)
-    if (portsc & XHCI_PORTSC_PED) {
-        xhci_dbg("Port %d already enabled, skipping reset\n", port);
-        return ST_OK;
-    }
-    
-    // For USB 3.0 ports, use warm reset if needed
-    // For USB 2.0 ports, use regular reset
-    uint8_t speed = (portsc >> 10) & 0xF;
-    
-    // PORTSC write: preserve PP (bit 9), set PR (bit 4), clear change bits by writing 0 to them
-    // RW1C bits: CSC(17), PEC(18), WRC(19), OCC(20), PRC(21), PLC(22), CEC(23)
-    // Preserve: PP(9). Set: PR(4) or WPR(31)
-    uint32_t preserve_mask = XHCI_PORTSC_PP;  // Keep power on
-    uint32_t write_val = portsc & preserve_mask;
-    
-    if (speed == XHCI_SPEED_SUPER) {
-        // SuperSpeed: set warm reset (bit 31)
-        write_val |= (1 << 31);  // WPR
-    } else {
-        // Full/High Speed: set regular reset
-        write_val |= XHCI_PORTSC_PR;
-    }
-    
-    xhci_op_write32(ctrl, off, write_val);
-    
-    // Phase 1: Wait for reset to complete (PRC or WRC will be set)
-    int reset_complete = 0;
-    for (int i = 0; i < 500; i++) {
-        delay_ms(1);
-        
-        // Poll events - xHC may need this to update port status
-        xhci_process_events_locked(ctrl);
-        
-        portsc = xhci_op_read32(ctrl, off);
-        
-        // Check for Port Reset Change or Warm Port Reset Change
-        if ((portsc & XHCI_PORTSC_PRC) || (portsc & XHCI_PORTSC_WRC)) {
-            // Clear the change bits by writing 1 to them (RW1C)
-            // CRITICAL: Do NOT write 1 to PED! PED is RW1CS - writing 1 clears it!
-            // Only preserve PP (bit 9), write 1 to PRC/WRC to clear them
-            uint32_t clear_val = (portsc & XHCI_PORTSC_PP) | 
-                                 XHCI_PORTSC_PRC | XHCI_PORTSC_WRC;
-            xhci_op_write32(ctrl, off, clear_val);
-            
-            reset_complete = 1;
-            break;
-        }
-        
-        // Check if port became enabled without explicit PRC
-        if (portsc & XHCI_PORTSC_PED) {
-            xhci_dbg("Port %d now enabled, PORTSC=0x%08x\n", port, portsc);
-            return ST_OK;
-        }
-    }
-    
-    if (!reset_complete) {
-        return ST_TIMEOUT;
-    }
-    
-    // Phase 2: Wait for port to become enabled (PED=1) and reach U0 state (PLS=0)
-    // This is required before the port is ready for device communication
-    for (int i = 0; i < 200; i++) {
-        delay_ms(1);
-        
-        // Poll events - xHC may need this to update port status
-        xhci_process_events_locked(ctrl);
-        
-        portsc = xhci_op_read32(ctrl, off);
-        
-        if (portsc & XHCI_PORTSC_PED) {
-            uint8_t pls = (portsc >> 5) & 0xF;
-            if (pls == 0) {  // U0 state - link is ready
-                xhci_dbg("Port %d enabled in U0 state, PORTSC=0x%08x\n", port, portsc);
-                return ST_OK;
-            }
-            // Port enabled but not in U0 yet, keep waiting
-        }
-    }
-    
-    // Final check
-    portsc = xhci_op_read32(ctrl, off);
-    if (portsc & XHCI_PORTSC_PED) {
-        return ST_OK;  // Enabled but not in U0, might still work
-    }
-    
-    return ST_ERR;
+int xhci_port_reset(xhci_controller_t *ctrl, uint8_t port)
+{
+	if (port < 1 || port > ctrl->max_ports)
+		return ST_INVALID;
+
+	uint32_t off = XHCI_OP_PORTSC_BASE + (port - 1) * 0x10;
+	uint32_t portsc = xhci_op_read32(ctrl, off);
+
+	xhci_dbg("Port %d before reset: PORTSC=0x%08x\n", port, portsc);
+
+	// Check if port is already enabled (SuperSpeed devices may not need reset)
+	if (portsc & XHCI_PORTSC_PED) {
+		xhci_dbg("Port %d already enabled, skipping reset\n", port);
+		return ST_OK;
+	}
+
+	// For USB 3.0 ports, use warm reset if needed
+	// For USB 2.0 ports, use regular reset
+	uint8_t speed = (portsc >> 10) & 0xF;
+
+	// PORTSC write: preserve PP (bit 9), set PR (bit 4), clear change bits by writing 0 to them
+	// RW1C bits: CSC(17), PEC(18), WRC(19), OCC(20), PRC(21), PLC(22), CEC(23)
+	// Preserve: PP(9). Set: PR(4) or WPR(31)
+	uint32_t preserve_mask = XHCI_PORTSC_PP; // Keep power on
+	uint32_t write_val = portsc & preserve_mask;
+
+	if (speed == XHCI_SPEED_SUPER) {
+		// SuperSpeed: set warm reset (bit 31)
+		write_val |= (1 << 31); // WPR
+	} else {
+		// Full/High Speed: set regular reset
+		write_val |= XHCI_PORTSC_PR;
+	}
+
+	xhci_op_write32(ctrl, off, write_val);
+
+	// Phase 1: Wait for reset to complete (PRC or WRC will be set)
+	int reset_complete = 0;
+	for (int i = 0; i < 500; i++) {
+		delay_ms(1);
+
+		// Poll events - xHC may need this to update port status
+		xhci_process_events_locked(ctrl);
+
+		portsc = xhci_op_read32(ctrl, off);
+
+		// Check for Port Reset Change or Warm Port Reset Change
+		if ((portsc & XHCI_PORTSC_PRC) || (portsc & XHCI_PORTSC_WRC)) {
+			// Clear the change bits by writing 1 to them (RW1C)
+			// CRITICAL: Do NOT write 1 to PED! PED is RW1CS - writing 1 clears it!
+			// Only preserve PP (bit 9), write 1 to PRC/WRC to clear them
+			uint32_t clear_val = (portsc & XHCI_PORTSC_PP) |
+					     XHCI_PORTSC_PRC | XHCI_PORTSC_WRC;
+			xhci_op_write32(ctrl, off, clear_val);
+
+			reset_complete = 1;
+			break;
+		}
+
+		// Check if port became enabled without explicit PRC
+		if (portsc & XHCI_PORTSC_PED) {
+			xhci_dbg("Port %d now enabled, PORTSC=0x%08x\n", port,
+				 portsc);
+			return ST_OK;
+		}
+	}
+
+	if (!reset_complete) {
+		return ST_TIMEOUT;
+	}
+
+	// Phase 2: Wait for port to become enabled (PED=1) and reach U0 state (PLS=0)
+	// This is required before the port is ready for device communication
+	for (int i = 0; i < 200; i++) {
+		delay_ms(1);
+
+		// Poll events - xHC may need this to update port status
+		xhci_process_events_locked(ctrl);
+
+		portsc = xhci_op_read32(ctrl, off);
+
+		if (portsc & XHCI_PORTSC_PED) {
+			uint8_t pls = (portsc >> 5) & 0xF;
+			if (pls == 0) { // U0 state - link is ready
+				xhci_dbg(
+					"Port %d enabled in U0 state, PORTSC=0x%08x\n",
+					port, portsc);
+				return ST_OK;
+			}
+			// Port enabled but not in U0 yet, keep waiting
+		}
+	}
+
+	// Final check
+	portsc = xhci_op_read32(ctrl, off);
+	if (portsc & XHCI_PORTSC_PED) {
+		return ST_OK; // Enabled but not in U0, might still work
+	}
+
+	return ST_ERR;
 }
 
-uint8_t xhci_port_speed(xhci_controller_t* ctrl, uint8_t port) {
-    if (port < 1 || port > ctrl->max_ports) return 0;
-    uint32_t portsc = xhci_op_read32(ctrl, XHCI_OP_PORTSC_BASE + (port - 1) * 0x10);
-    return (portsc >> 10) & 0xF;
+uint8_t xhci_port_speed(xhci_controller_t *ctrl, uint8_t port)
+{
+	if (port < 1 || port > ctrl->max_ports)
+		return 0;
+	uint32_t portsc =
+		xhci_op_read32(ctrl, XHCI_OP_PORTSC_BASE + (port - 1) * 0x10);
+	return (portsc >> 10) & 0xF;
 }
 
 //=============================================================================
 // Device Enumeration
 //=============================================================================
 
-int xhci_enable_slot(xhci_controller_t* ctrl) {
-    // Send Enable Slot command
-    uint32_t control = (TRB_TYPE_ENABLE_SLOT << 10);
-    
-    if (xhci_send_command(ctrl, 0, 0, control) != ST_OK) {
-        return -1;
-    }
-    
-    if (xhci_wait_command(ctrl, 1000) != ST_OK) {
-        return -1;
-    }
-    
-    return g_cmd_slot;  // Slot ID assigned by controller
+int xhci_enable_slot(xhci_controller_t *ctrl)
+{
+	// Send Enable Slot command
+	uint32_t control = (TRB_TYPE_ENABLE_SLOT << 10);
+
+	if (xhci_send_command(ctrl, 0, 0, control) != ST_OK) {
+		return -1;
+	}
+
+	if (xhci_wait_command(ctrl, 1000) != ST_OK) {
+		return -1;
+	}
+
+	return g_cmd_slot; // Slot ID assigned by controller
 }
 
-int xhci_address_device(xhci_controller_t* ctrl, uint8_t slot, uint8_t port, uint8_t speed) {
-    if (slot == 0 || slot > ctrl->max_slots) return ST_INVALID;
-    
-    // Allocate device context - DMA-safe for low physical addresses
-    // Size: 32 contexts (slot + 31 endpoints) * context_size
-    size_t dev_ctx_size = 32 * ctrl->context_size;
-    uint8_t* dev_ctx_raw = (uint8_t*)kcalloc_dma(1, dev_ctx_size + 64);
-    if (!dev_ctx_raw) return ST_NOMEM;
-    
-    // Align to 64 bytes
-    uint64_t ctx_addr = (uint64_t)dev_ctx_raw;
-    if (ctx_addr & 0x3F) {
-        ctx_addr = (ctx_addr + 63) & ~63ULL;
-        dev_ctx_raw = (uint8_t*)ctx_addr;
-    }
-    
-    xhci_dev_ctx_t* dev_ctx = (xhci_dev_ctx_t*)dev_ctx_raw;
-    ctrl->dev_ctx[slot - 1] = dev_ctx;
-    uint64_t dev_ctx_phys = mm_get_physical_address((uint64_t)dev_ctx_raw);
-    
-    if (dev_ctx_phys == 0) {
-        kprintf("[XHCI] ERROR: Device context physical address is 0!\n");
-        return ST_ERR;
-    }
-    
-    ctrl->dcbaa[slot] = dev_ctx_phys;
-    
-    // Allocate transfer ring for EP0 (control endpoint)
-    usb_device_t* udev = &ctrl->devices[slot - 1];
-    udev->slot_id = slot;
-    udev->port = port;
-    udev->speed = speed;
-    udev->controller = ctrl;
-    udev->ep0_ring = xhci_alloc_ring();
-    
-    if (!udev->ep0_ring) {
-        kprintf("[XHCI] Failed to allocate EP0 ring\n");
-        return ST_NOMEM;
-    }
-    
-    uint64_t ep0_ring_phys = mm_get_physical_address((uint64_t)udev->ep0_ring->trbs);
-    xhci_ring_init(udev->ep0_ring, ep0_ring_phys);
-    
-    // Determine max packet size for EP0 based on speed
-    uint16_t max_pkt_ep0;
-    switch (speed) {
-        case XHCI_SPEED_LOW:    max_pkt_ep0 = 8; break;
-        case XHCI_SPEED_FULL:   max_pkt_ep0 = 8; break;  // Start with 8, will update
-        case XHCI_SPEED_HIGH:   max_pkt_ep0 = 64; break;
-        case XHCI_SPEED_SUPER:  max_pkt_ep0 = 512; break;
-        default:                max_pkt_ep0 = 8; break;
-    }
-    udev->max_packet_ep0 = max_pkt_ep0;
-    
-    // Setup input context using helper functions for proper context size handling
-    size_t input_ctx_size = 33 * ctrl->context_size;
-    xhci_memset(ctrl->input_ctx_raw, 0, input_ctx_size);
-    
-    // Input Control Context at offset 0
-    uint32_t* input_ctrl = (uint32_t*)xhci_get_input_control_ctx(ctrl);
-    input_ctrl[0] = 0;               // Drop flags
-    input_ctrl[1] = (1 << 0) | (1 << 1);  // Add flags: Slot context (bit 0) and EP0 (bit 1)
-    
-    // Slot context
-    xhci_slot_ctx_t* slot_ctx = xhci_get_input_slot_ctx(ctrl);
-    uint32_t route = 0;  // No route string for directly attached device
-    slot_ctx->route_speed_entries = route | (speed << 20) | (1 << 27); // 1 context entry
-    slot_ctx->latency_hub_ports = (port << 16);  // Root hub port number
-    slot_ctx->tt_info = 0;
-    slot_ctx->slot_state = 0;
-    
-    // EP0 context (endpoint 0 in the array = DCI 1)
-    xhci_ep_ctx_t* ep0 = xhci_get_input_ep_ctx(ctrl, 0);
-    ep0->ep_info1 = 0;  // Interval = 0 for control
-    ep0->ep_info2 = (3 << 1) |            // CErr = 3
-                    (EP_TYPE_CONTROL << 3) |   // EP Type
-                    (max_pkt_ep0 << 16);       // Max packet size
-    ep0->tr_dequeue = ep0_ring_phys | 1;  // DCS = 1
-    ep0->avg_trb_len = 8;  // Average for control
-    
-    // Flush all DMA structures before sending command
-    xhci_flush_cache(ctrl->input_ctx_raw, input_ctx_size);
-    xhci_flush_cache(dev_ctx_raw, dev_ctx_size);
-    xhci_flush_cache(udev->ep0_ring->trbs, sizeof(udev->ep0_ring->trbs));
-    xhci_flush_cache(&ctrl->dcbaa[slot], sizeof(uint64_t));
-    xhci_mb();
-    
-    // Send Address Device command (BSR=0 to send SET_ADDRESS to device)
-    uint32_t control = (TRB_TYPE_ADDRESS_DEV << 10) | (slot << 24);
-    
-    if (xhci_send_command(ctrl, ctrl->input_ctx_phys, 0, control) != ST_OK) {
-        return ST_ERR;
-    }
-    
-    if (xhci_wait_command(ctrl, 1000) != ST_OK) {
-        kprintf("[XHCI] Address Device failed: CC=%d\n", g_cmd_cc);
-        // CC=4 = USB Transaction Error (device not responding)
-        // CC=9 = No Slots Available
-        return ST_ERR;
-    }
-    
-    // Invalidate cache to read back device context written by DMA
-    // CLFLUSH invalidates and writes back, so we need to call it before reading
-    xhci_flush_cache(dev_ctx_raw, dev_ctx_size);
-    xhci_mb();
-    
-    // Read back assigned address from device context (using proper offsets)
-    xhci_slot_ctx_t* out_slot = xhci_get_dev_slot_ctx(ctrl, dev_ctx);
-    xhci_ep_ctx_t* out_ep0 = xhci_get_dev_ep_ctx(ctrl, dev_ctx, 0);
-    
-    udev->address = out_slot->slot_state & 0xFF;
-    uint32_t slot_state = (out_slot->slot_state >> 27) & 0x1F;
-    uint32_t ep0_state = out_ep0->ep_info1 & 0x7;
-    
-    // Verify EP0 is in Running state (should be 1)
-    if (ep0_state != 1) {
-        // EP0 not running - device didn't respond to SET_ADDRESS
-        (void)slot_state;  // Suppress unused warning
-        return ST_ERR;
-    }
-    
-    return ST_OK;
+int xhci_address_device(xhci_controller_t *ctrl, uint8_t slot, uint8_t port,
+			uint8_t speed)
+{
+	if (slot == 0 || slot > ctrl->max_slots)
+		return ST_INVALID;
+
+	// Allocate device context - DMA-safe for low physical addresses
+	// Size: 32 contexts (slot + 31 endpoints) * context_size
+	size_t dev_ctx_size = 32 * ctrl->context_size;
+	uint8_t *dev_ctx_raw = (uint8_t *)kcalloc_dma(1, dev_ctx_size + 64);
+	if (!dev_ctx_raw)
+		return ST_NOMEM;
+
+	// Align to 64 bytes
+	uint64_t ctx_addr = (uint64_t)dev_ctx_raw;
+	if (ctx_addr & 0x3F) {
+		ctx_addr = (ctx_addr + 63) & ~63ULL;
+		dev_ctx_raw = (uint8_t *)ctx_addr;
+	}
+
+	xhci_dev_ctx_t *dev_ctx = (xhci_dev_ctx_t *)dev_ctx_raw;
+	ctrl->dev_ctx[slot - 1] = dev_ctx;
+	uint64_t dev_ctx_phys = mm_get_physical_address((uint64_t)dev_ctx_raw);
+
+	if (dev_ctx_phys == 0) {
+		kprintf("[XHCI] ERROR: Device context physical address is 0!\n");
+		return ST_ERR;
+	}
+
+	ctrl->dcbaa[slot] = dev_ctx_phys;
+
+	// Allocate transfer ring for EP0 (control endpoint)
+	usb_device_t *udev = &ctrl->devices[slot - 1];
+	udev->slot_id = slot;
+	udev->port = port;
+	udev->speed = speed;
+	udev->controller = ctrl;
+	udev->ep0_ring = xhci_alloc_ring();
+
+	if (!udev->ep0_ring) {
+		kprintf("[XHCI] Failed to allocate EP0 ring\n");
+		return ST_NOMEM;
+	}
+
+	uint64_t ep0_ring_phys =
+		mm_get_physical_address((uint64_t)udev->ep0_ring->trbs);
+	xhci_ring_init(udev->ep0_ring, ep0_ring_phys);
+
+	// Determine max packet size for EP0 based on speed
+	uint16_t max_pkt_ep0;
+	switch (speed) {
+	case XHCI_SPEED_LOW:
+		max_pkt_ep0 = 8;
+		break;
+	case XHCI_SPEED_FULL:
+		max_pkt_ep0 = 8;
+		break; // Start with 8, will update
+	case XHCI_SPEED_HIGH:
+		max_pkt_ep0 = 64;
+		break;
+	case XHCI_SPEED_SUPER:
+		max_pkt_ep0 = 512;
+		break;
+	default:
+		max_pkt_ep0 = 8;
+		break;
+	}
+	udev->max_packet_ep0 = max_pkt_ep0;
+
+	// Setup input context using helper functions for proper context size handling
+	size_t input_ctx_size = 33 * ctrl->context_size;
+	xhci_memset(ctrl->input_ctx_raw, 0, input_ctx_size);
+
+	// Input Control Context at offset 0
+	uint32_t *input_ctrl = (uint32_t *)xhci_get_input_control_ctx(ctrl);
+	input_ctrl[0] = 0; // Drop flags
+	input_ctrl[1] =
+		(1 << 0) |
+		(1 << 1); // Add flags: Slot context (bit 0) and EP0 (bit 1)
+
+	// Slot context
+	xhci_slot_ctx_t *slot_ctx = xhci_get_input_slot_ctx(ctrl);
+	uint32_t route = 0; // No route string for directly attached device
+	slot_ctx->route_speed_entries =
+		route | (speed << 20) | (1 << 27); // 1 context entry
+	slot_ctx->latency_hub_ports = (port << 16); // Root hub port number
+	slot_ctx->tt_info = 0;
+	slot_ctx->slot_state = 0;
+
+	// EP0 context (endpoint 0 in the array = DCI 1)
+	xhci_ep_ctx_t *ep0 = xhci_get_input_ep_ctx(ctrl, 0);
+	ep0->ep_info1 = 0; // Interval = 0 for control
+	ep0->ep_info2 = (3 << 1) | // CErr = 3
+			(EP_TYPE_CONTROL << 3) | // EP Type
+			(max_pkt_ep0 << 16); // Max packet size
+	ep0->tr_dequeue = ep0_ring_phys | 1; // DCS = 1
+	ep0->avg_trb_len = 8; // Average for control
+
+	// Flush all DMA structures before sending command
+	xhci_flush_cache(ctrl->input_ctx_raw, input_ctx_size);
+	xhci_flush_cache(dev_ctx_raw, dev_ctx_size);
+	xhci_flush_cache(udev->ep0_ring->trbs, sizeof(udev->ep0_ring->trbs));
+	xhci_flush_cache(&ctrl->dcbaa[slot], sizeof(uint64_t));
+	xhci_mb();
+
+	// Send Address Device command (BSR=0 to send SET_ADDRESS to device)
+	uint32_t control = (TRB_TYPE_ADDRESS_DEV << 10) | (slot << 24);
+
+	if (xhci_send_command(ctrl, ctrl->input_ctx_phys, 0, control) !=
+	    ST_OK) {
+		return ST_ERR;
+	}
+
+	if (xhci_wait_command(ctrl, 1000) != ST_OK) {
+		kprintf("[XHCI] Address Device failed: CC=%d\n", g_cmd_cc);
+		// CC=4 = USB Transaction Error (device not responding)
+		// CC=9 = No Slots Available
+		return ST_ERR;
+	}
+
+	// Invalidate cache to read back device context written by DMA
+	// CLFLUSH invalidates and writes back, so we need to call it before reading
+	xhci_flush_cache(dev_ctx_raw, dev_ctx_size);
+	xhci_mb();
+
+	// Read back assigned address from device context (using proper offsets)
+	xhci_slot_ctx_t *out_slot = xhci_get_dev_slot_ctx(ctrl, dev_ctx);
+	xhci_ep_ctx_t *out_ep0 = xhci_get_dev_ep_ctx(ctrl, dev_ctx, 0);
+
+	udev->address = out_slot->slot_state & 0xFF;
+	uint32_t slot_state = (out_slot->slot_state >> 27) & 0x1F;
+	uint32_t ep0_state = out_ep0->ep_info1 & 0x7;
+
+	// Verify EP0 is in Running state (should be 1)
+	if (ep0_state != 1) {
+		// EP0 not running - device didn't respond to SET_ADDRESS
+		(void)slot_state; // Suppress unused warning
+		return ST_ERR;
+	}
+
+	return ST_OK;
 }
 
-static int xhci_evaluate_context(xhci_controller_t* ctrl, uint8_t slot, uint16_t max_pkt_ep0);
+static int xhci_evaluate_context(xhci_controller_t *ctrl, uint8_t slot,
+				 uint16_t max_pkt_ep0);
 
-int xhci_enumerate_device(xhci_controller_t* ctrl, uint8_t port) {
-    // Reset port
-    if (xhci_port_reset(ctrl, port) != ST_OK) {
-        return ST_ERR;
-    }
-    
-    // CRITICAL: Read speed IMMEDIATELY after reset completes
-    // The Port Speed field is only valid right after reset completes
-    // (before any port status change events can modify the port state)
-    uint8_t speed = xhci_port_speed(ctrl, port);
-    
-    // Validate speed - must be 1-4 (Full, Low, High, Super)
-    if (speed == 0 || speed > XHCI_SPEED_SUPER) {
-        kprintf("[XHCI] Port %d: Invalid speed %d\n", port, speed);
-        return ST_ERR;
-    }
-    
-    // USB spec requires at least 10ms recovery time after reset before SET_ADDRESS
-    // But we've already read the speed, so a shorter delay is OK
-    delay_ms(10);
-    
-    // Enable slot
-    int slot = xhci_enable_slot(ctrl);
-    if (slot <= 0) {
-        return ST_ERR;  // Slot enable failed
-    }
-    
-    // Address device
-    if (xhci_address_device(ctrl, slot, port, speed) != ST_OK) {
-        return ST_ERR;  // Address device failed (no logging to reduce noise)
-    }
-    
-    usb_device_t* dev = &ctrl->devices[slot - 1];
-    
-    // Allocate DMA-safe PAGE-ALIGNED buffer for descriptors
-    // Uses legacy heap for low physical addresses required by XHCI DMA
-    uint8_t* raw_buf = (uint8_t*)kcalloc_dma(1, 4096 + 4096);
-    if (!raw_buf) {
-        kprintf("[XHCI] Failed to allocate DMA buffer\n");
-        return ST_NOMEM;
-    }
-    uint8_t* dma_buf = (uint8_t*)(((uint64_t)raw_buf + 4095) & ~4095ULL);
-    usb_device_desc_t* desc = (usb_device_desc_t*)dma_buf;
-    
-    // Get device descriptor (first 8 bytes to get max packet size)
-    if (xhci_control_transfer(ctrl, dev,
-                              USB_RT_D2H | USB_RT_STD | USB_RT_DEV,
-                              USB_REQ_GET_DESCRIPTOR,
-                              (USB_DESC_DEVICE << 8) | 0,
-                              0, 8, desc) != ST_OK) {
-        kprintf("[XHCI] Failed to get device descriptor (8 bytes)\n");
-        // Try to continue anyway
-    } else {
-        dev->max_packet_ep0 = desc->max_pkt_ep0;
-        xhci_dbg("MaxPacketEP0: %d (raw bytes: %02x %02x %02x %02x)\n", 
-                 dev->max_packet_ep0,
-                 dma_buf[0], dma_buf[1], dma_buf[2], dma_buf[3]);
+int xhci_enumerate_device(xhci_controller_t *ctrl, uint8_t port)
+{
+	// Reset port
+	if (xhci_port_reset(ctrl, port) != ST_OK) {
+		return ST_ERR;
+	}
 
-        // Update EP0 max packet size in xHCI hardware via Evaluate Context
-        // Only needed for Full-Speed devices that start with EP0 max_pkt=8
-        // but report a larger size (typically 64) in the device descriptor
-        if (dev->speed == XHCI_SPEED_FULL && dev->max_packet_ep0 > 8) {
-            if (xhci_evaluate_context(ctrl, slot, dev->max_packet_ep0) != ST_OK) {
-                kprintf("[XHCI] Port %d: Evaluate Context failed, continuing\n", port);
-            }
-        }
-    }
-    
-    // Get full device descriptor
-    xhci_memset(dma_buf, 0, 256);
-    if (xhci_control_transfer(ctrl, dev,
-                              USB_RT_D2H | USB_RT_STD | USB_RT_DEV,
-                              USB_REQ_GET_DESCRIPTOR,
-                              (USB_DESC_DEVICE << 8) | 0,
-                              0, 18, desc) == ST_OK) {
-        dev->vendor_id = desc->vendor_id;
-        dev->product_id = desc->product_id;
-        dev->class_code = desc->class_code;
-        dev->subclass = desc->subclass;
-        dev->protocol = desc->protocol;
-        dev->num_configs = desc->num_configs;
-        
-        xhci_dbg("Device: VID=%04x PID=%04x Class=%02x/%02x/%02x\n",
-                 dev->vendor_id, dev->product_id,
-                 dev->class_code, dev->subclass, dev->protocol);
-    }
-    
-    // Get configuration descriptor to find interfaces and endpoints
-    // Use the same DMA buffer we already allocated
-    xhci_memset(dma_buf, 0, 256);
-    
-    if (xhci_control_transfer(ctrl, dev,
-                              USB_RT_D2H | USB_RT_STD | USB_RT_DEV,
-                              USB_REQ_GET_DESCRIPTOR,
-                              (USB_DESC_CONFIG << 8) | 0,
-                              0, 256, dma_buf) == ST_OK) {
-        // Parse configuration descriptor
-        usb_config_desc_t* cfg = (usb_config_desc_t*)dma_buf;
-        uint8_t* ptr = dma_buf + cfg->length;
-        uint8_t* end = dma_buf + cfg->total_length;
-        
-        while (ptr < end) {
-            uint8_t len = ptr[0];
-            uint8_t type = ptr[1];
-            
-            if (len == 0) break;
-            
-            if (type == USB_DESC_INTERFACE) {
-                usb_interface_desc_t* iface = (usb_interface_desc_t*)ptr;
-                xhci_dbg("Interface: %d/%d/%d, EPs=%d\n",
-                         iface->class_code, iface->subclass, iface->protocol,
-                         iface->num_endpoints);
-                
-                // Check for Mass Storage
-                if (iface->class_code == USB_CLASS_MASS_STORAGE &&
-                    iface->subclass == 0x06 &&
-                    iface->protocol == 0x50) {
-                    dev->class_code = iface->class_code;
-                    dev->subclass = iface->subclass;
-                    dev->protocol = iface->protocol;
-                }
-            } else if (type == USB_DESC_ENDPOINT) {
-                usb_endpoint_desc_t* ep = (usb_endpoint_desc_t*)ptr;
-                uint8_t ep_type = ep->attributes & USB_EP_TYPE_MASK;
-                uint8_t ep_num = ep->address & USB_EP_NUM_MASK;
-                uint8_t ep_in = (ep->address & USB_EP_DIR_IN) ? 1 : 0;
-                
-                xhci_dbg("Endpoint: 0x%02x, Type=%d, MaxPkt=%d\n",
-                         ep->address, ep_type, ep->max_packet);
-                
-                if (ep_type == USB_EP_TYPE_BULK) {
-                    if (ep_in) {
-                        dev->bulk_in_ep = ep_num;
-                        dev->bulk_in_max_pkt = ep->max_packet;
-                    } else {
-                        dev->bulk_out_ep = ep_num;
-                        dev->bulk_out_max_pkt = ep->max_packet;
-                    }
-                }
-            }
-            
-            ptr += len;
-        }
-    }
-    
-    // Set configuration
-    if (xhci_control_transfer(ctrl, dev,
-                              USB_RT_H2D | USB_RT_STD | USB_RT_DEV,
-                              USB_REQ_SET_CONFIG,
-                              1, 0, 0, NULL) != ST_OK) {
-        // Continue anyway, some devices work without this
-    }
-    
-    // Probe for USB HID devices (keyboard/mouse) while the configuration
-    // descriptor is still resident in dma_buf from the GET_DESCRIPTOR above.
-    {
-        usb_config_desc_t* cfg_tmp = (usb_config_desc_t*)dma_buf;
-        uint16_t cfg_total = cfg_tmp->total_length;
-        if (cfg_total > 256) cfg_total = 256;
-        usbhid_probe(ctrl, dev, dma_buf, cfg_total);
-    }
-    
-    // Configure bulk endpoints if found
-    if (dev->bulk_in_ep && dev->bulk_out_ep) {
-        if (xhci_configure_endpoint(ctrl, slot, dev->bulk_in_ep,
-                                    EP_TYPE_BULK_IN, dev->bulk_in_max_pkt, 0) != ST_OK) {
-            kprintf("[XHCI] Failed to configure bulk IN endpoint\n");
-        }
-        
-        if (xhci_configure_endpoint(ctrl, slot, dev->bulk_out_ep,
-                                    EP_TYPE_BULK_OUT, dev->bulk_out_max_pkt, 0) != ST_OK) {
-            kprintf("[XHCI] Failed to configure bulk OUT endpoint\n");
-        }
+	// CRITICAL: Read speed IMMEDIATELY after reset completes
+	// The Port Speed field is only valid right after reset completes
+	// (before any port status change events can modify the port state)
+	uint8_t speed = xhci_port_speed(ctrl, port);
 
-        {
-            usb_config_desc_t* cfg_tmp = (usb_config_desc_t*)dma_buf;
-            uint16_t cfg_total = cfg_tmp->total_length;
-            if (cfg_total > 256) cfg_total = 256;
-            (void)usbserial_probe(ctrl, dev, dma_buf, cfg_total);
-        }
-    }
+	// Validate speed - must be 1-4 (Full, Low, High, Super)
+	if (speed == 0 || speed > XHCI_SPEED_SUPER) {
+		kprintf("[XHCI] Port %d: Invalid speed %d\n", port, speed);
+		return ST_ERR;
+	}
 
-    // Free DMA buffer (free the raw allocation, not the aligned pointer)
-    kfree_dma(raw_buf);
-    
-    dev->configured = 1;
-    ctrl->num_devices++;
-    
-    // Report success with device info
-    kprintf("[XHCI] Port %d: USB device (VID=%04x PID=%04x class=%d)\n",
-            dev->port, dev->vendor_id, dev->product_id, dev->class_code);
-    
-    return ST_OK;
+	// USB spec requires at least 10ms recovery time after reset before SET_ADDRESS
+	// But we've already read the speed, so a shorter delay is OK
+	delay_ms(10);
+
+	// Enable slot
+	int slot = xhci_enable_slot(ctrl);
+	if (slot <= 0) {
+		return ST_ERR; // Slot enable failed
+	}
+
+	// Address device
+	if (xhci_address_device(ctrl, slot, port, speed) != ST_OK) {
+		return ST_ERR; // Address device failed (no logging to reduce noise)
+	}
+
+	usb_device_t *dev = &ctrl->devices[slot - 1];
+
+	// Allocate DMA-safe PAGE-ALIGNED buffer for descriptors
+	// Uses legacy heap for low physical addresses required by XHCI DMA
+	uint8_t *raw_buf = (uint8_t *)kcalloc_dma(1, 4096 + 4096);
+	if (!raw_buf) {
+		kprintf("[XHCI] Failed to allocate DMA buffer\n");
+		return ST_NOMEM;
+	}
+	uint8_t *dma_buf = (uint8_t *)(((uint64_t)raw_buf + 4095) & ~4095ULL);
+	usb_device_desc_t *desc = (usb_device_desc_t *)dma_buf;
+
+	// Get device descriptor (first 8 bytes to get max packet size)
+	if (xhci_control_transfer(
+		    ctrl, dev, USB_RT_D2H | USB_RT_STD | USB_RT_DEV,
+		    USB_REQ_GET_DESCRIPTOR, (USB_DESC_DEVICE << 8) | 0, 0, 8,
+		    desc) != ST_OK) {
+		kprintf("[XHCI] Failed to get device descriptor (8 bytes)\n");
+		// Try to continue anyway
+	} else {
+		dev->max_packet_ep0 = desc->max_pkt_ep0;
+		xhci_dbg("MaxPacketEP0: %d (raw bytes: %02x %02x %02x %02x)\n",
+			 dev->max_packet_ep0, dma_buf[0], dma_buf[1],
+			 dma_buf[2], dma_buf[3]);
+
+		// Update EP0 max packet size in xHCI hardware via Evaluate Context
+		// Only needed for Full-Speed devices that start with EP0 max_pkt=8
+		// but report a larger size (typically 64) in the device descriptor
+		if (dev->speed == XHCI_SPEED_FULL && dev->max_packet_ep0 > 8) {
+			if (xhci_evaluate_context(
+				    ctrl, slot, dev->max_packet_ep0) != ST_OK) {
+				kprintf("[XHCI] Port %d: Evaluate Context failed, continuing\n",
+					port);
+			}
+		}
+	}
+
+	// Get full device descriptor
+	xhci_memset(dma_buf, 0, 256);
+	if (xhci_control_transfer(
+		    ctrl, dev, USB_RT_D2H | USB_RT_STD | USB_RT_DEV,
+		    USB_REQ_GET_DESCRIPTOR, (USB_DESC_DEVICE << 8) | 0, 0, 18,
+		    desc) == ST_OK) {
+		dev->vendor_id = desc->vendor_id;
+		dev->product_id = desc->product_id;
+		dev->class_code = desc->class_code;
+		dev->subclass = desc->subclass;
+		dev->protocol = desc->protocol;
+		dev->num_configs = desc->num_configs;
+
+		xhci_dbg("Device: VID=%04x PID=%04x Class=%02x/%02x/%02x\n",
+			 dev->vendor_id, dev->product_id, dev->class_code,
+			 dev->subclass, dev->protocol);
+	}
+
+	// Get configuration descriptor to find interfaces and endpoints
+	// Use the same DMA buffer we already allocated
+	xhci_memset(dma_buf, 0, 256);
+
+	if (xhci_control_transfer(
+		    ctrl, dev, USB_RT_D2H | USB_RT_STD | USB_RT_DEV,
+		    USB_REQ_GET_DESCRIPTOR, (USB_DESC_CONFIG << 8) | 0, 0, 256,
+		    dma_buf) == ST_OK) {
+		// Parse configuration descriptor
+		usb_config_desc_t *cfg = (usb_config_desc_t *)dma_buf;
+		uint8_t *ptr = dma_buf + cfg->length;
+		uint8_t *end = dma_buf + cfg->total_length;
+
+		while (ptr < end) {
+			uint8_t len = ptr[0];
+			uint8_t type = ptr[1];
+
+			if (len == 0)
+				break;
+
+			if (type == USB_DESC_INTERFACE) {
+				usb_interface_desc_t *iface =
+					(usb_interface_desc_t *)ptr;
+				xhci_dbg("Interface: %d/%d/%d, EPs=%d\n",
+					 iface->class_code, iface->subclass,
+					 iface->protocol, iface->num_endpoints);
+
+				// Check for Mass Storage
+				if (iface->class_code ==
+					    USB_CLASS_MASS_STORAGE &&
+				    iface->subclass == 0x06 &&
+				    iface->protocol == 0x50) {
+					dev->class_code = iface->class_code;
+					dev->subclass = iface->subclass;
+					dev->protocol = iface->protocol;
+				}
+			} else if (type == USB_DESC_ENDPOINT) {
+				usb_endpoint_desc_t *ep =
+					(usb_endpoint_desc_t *)ptr;
+				uint8_t ep_type =
+					ep->attributes & USB_EP_TYPE_MASK;
+				uint8_t ep_num = ep->address & USB_EP_NUM_MASK;
+				uint8_t ep_in =
+					(ep->address & USB_EP_DIR_IN) ? 1 : 0;
+
+				xhci_dbg(
+					"Endpoint: 0x%02x, Type=%d, MaxPkt=%d\n",
+					ep->address, ep_type, ep->max_packet);
+
+				if (ep_type == USB_EP_TYPE_BULK) {
+					if (ep_in) {
+						dev->bulk_in_ep = ep_num;
+						dev->bulk_in_max_pkt =
+							ep->max_packet;
+					} else {
+						dev->bulk_out_ep = ep_num;
+						dev->bulk_out_max_pkt =
+							ep->max_packet;
+					}
+				}
+			}
+
+			ptr += len;
+		}
+	}
+
+	// Set configuration
+	if (xhci_control_transfer(ctrl, dev,
+				  USB_RT_H2D | USB_RT_STD | USB_RT_DEV,
+				  USB_REQ_SET_CONFIG, 1, 0, 0, NULL) != ST_OK) {
+		// Continue anyway, some devices work without this
+	}
+
+	// Probe for USB HID devices (keyboard/mouse) while the configuration
+	// descriptor is still resident in dma_buf from the GET_DESCRIPTOR above.
+	{
+		usb_config_desc_t *cfg_tmp = (usb_config_desc_t *)dma_buf;
+		uint16_t cfg_total = cfg_tmp->total_length;
+		if (cfg_total > 256)
+			cfg_total = 256;
+		usbhid_probe(ctrl, dev, dma_buf, cfg_total);
+	}
+
+	// Configure bulk endpoints if found
+	if (dev->bulk_in_ep && dev->bulk_out_ep) {
+		if (xhci_configure_endpoint(ctrl, slot, dev->bulk_in_ep,
+					    EP_TYPE_BULK_IN,
+					    dev->bulk_in_max_pkt, 0) != ST_OK) {
+			kprintf("[XHCI] Failed to configure bulk IN endpoint\n");
+		}
+
+		if (xhci_configure_endpoint(
+			    ctrl, slot, dev->bulk_out_ep, EP_TYPE_BULK_OUT,
+			    dev->bulk_out_max_pkt, 0) != ST_OK) {
+			kprintf("[XHCI] Failed to configure bulk OUT endpoint\n");
+		}
+
+		{
+			usb_config_desc_t *cfg_tmp =
+				(usb_config_desc_t *)dma_buf;
+			uint16_t cfg_total = cfg_tmp->total_length;
+			if (cfg_total > 256)
+				cfg_total = 256;
+			(void)usbserial_probe(ctrl, dev, dma_buf, cfg_total);
+		}
+	}
+
+	// Free DMA buffer (free the raw allocation, not the aligned pointer)
+	kfree_dma(raw_buf);
+
+	dev->configured = 1;
+	ctrl->num_devices++;
+
+	// Report success with device info
+	kprintf("[XHCI] Port %d: USB device (VID=%04x PID=%04x class=%d)\n",
+		dev->port, dev->vendor_id, dev->product_id, dev->class_code);
+
+	return ST_OK;
 }
 
 //=============================================================================
 // Evaluate Context (update EP0 max packet size for Full-Speed devices)
 //=============================================================================
 
-static int xhci_evaluate_context(xhci_controller_t* ctrl, uint8_t slot, uint16_t max_pkt_ep0) {
-    if (slot == 0 || slot > ctrl->max_slots) return ST_INVALID;
+static int xhci_evaluate_context(xhci_controller_t *ctrl, uint8_t slot,
+				 uint16_t max_pkt_ep0)
+{
+	if (slot == 0 || slot > ctrl->max_slots)
+		return ST_INVALID;
 
-    usb_device_t* dev = &ctrl->devices[slot - 1];
+	usb_device_t *dev = &ctrl->devices[slot - 1];
 
-    // Setup input context - only EP0 context needs updating
-    size_t input_ctx_size = 33 * ctrl->context_size;
-    xhci_memset(ctrl->input_ctx_raw, 0, input_ctx_size);
+	// Setup input context - only EP0 context needs updating
+	size_t input_ctx_size = 33 * ctrl->context_size;
+	xhci_memset(ctrl->input_ctx_raw, 0, input_ctx_size);
 
-    // Input Control Context: Add EP0 only (bit 1), no Slot context needed
-    uint32_t* input_ctrl = (uint32_t*)xhci_get_input_control_ctx(ctrl);
-    input_ctrl[0] = 0;          // Drop flags
-    input_ctrl[1] = (1 << 1);   // Add flags: EP0 (DCI 1)
+	// Input Control Context: Add EP0 only (bit 1), no Slot context needed
+	uint32_t *input_ctrl = (uint32_t *)xhci_get_input_control_ctx(ctrl);
+	input_ctrl[0] = 0; // Drop flags
+	input_ctrl[1] = (1 << 1); // Add flags: EP0 (DCI 1)
 
-    // EP0 context (endpoint index 0)
-    xhci_ep_ctx_t* ep0 = xhci_get_input_ep_ctx(ctrl, 0);
-    ep0->ep_info2 = (3 << 1) |                    // CErr = 3
-                    (EP_TYPE_CONTROL << 3) |       // EP Type
-                    (max_pkt_ep0 << 16);           // New max packet size
+	// EP0 context (endpoint index 0)
+	xhci_ep_ctx_t *ep0 = xhci_get_input_ep_ctx(ctrl, 0);
+	ep0->ep_info2 = (3 << 1) | // CErr = 3
+			(EP_TYPE_CONTROL << 3) | // EP Type
+			(max_pkt_ep0 << 16); // New max packet size
 
-    // Flush before sending command
-    xhci_flush_cache(ctrl->input_ctx_raw, input_ctx_size);
-    xhci_mb();
+	// Flush before sending command
+	xhci_flush_cache(ctrl->input_ctx_raw, input_ctx_size);
+	xhci_mb();
 
-    // Send Evaluate Context command
-    uint32_t control = (TRB_TYPE_EVAL_CTX << 10) | (slot << 24);
+	// Send Evaluate Context command
+	uint32_t control = (TRB_TYPE_EVAL_CTX << 10) | (slot << 24);
 
-    if (xhci_send_command(ctrl, ctrl->input_ctx_phys, 0, control) != ST_OK) {
-        return ST_ERR;
-    }
+	if (xhci_send_command(ctrl, ctrl->input_ctx_phys, 0, control) !=
+	    ST_OK) {
+		return ST_ERR;
+	}
 
-    if (xhci_wait_command(ctrl, 1000) != ST_OK) {
-        kprintf("[XHCI] Evaluate Context failed for slot %d\n", slot);
-        return ST_ERR;
-    }
+	if (xhci_wait_command(ctrl, 1000) != ST_OK) {
+		kprintf("[XHCI] Evaluate Context failed for slot %d\n", slot);
+		return ST_ERR;
+	}
 
-    xhci_dbg("Evaluate Context: slot=%d, EP0 max_pkt=%d\n", slot, max_pkt_ep0);
-    dev->max_packet_ep0 = max_pkt_ep0;
-    return ST_OK;
+	xhci_dbg("Evaluate Context: slot=%d, EP0 max_pkt=%d\n", slot,
+		 max_pkt_ep0);
+	dev->max_packet_ep0 = max_pkt_ep0;
+	return ST_OK;
 }
 
-int xhci_configure_endpoint(xhci_controller_t* ctrl, uint8_t slot, uint8_t ep_num,
-                            uint8_t ep_type, uint16_t max_packet, uint8_t interval) {
-    if (slot == 0 || slot > ctrl->max_slots) return ST_INVALID;
-    
-    usb_device_t* dev = &ctrl->devices[slot - 1];
-    
-    // Calculate endpoint index (DCI)
-    // DCI = endpoint number * 2 + direction (0=out, 1=in)
-    uint8_t dci;
-    if (ep_type == EP_TYPE_BULK_IN || ep_type == EP_TYPE_INTERRUPT_IN || ep_type == EP_TYPE_ISOCH_IN) {
-        dci = ep_num * 2 + 1;
-    } else {
-        dci = ep_num * 2;
-    }
-    
-    // Allocate transfer ring for this endpoint
-    xhci_ring_t* ring = xhci_alloc_ring();
-    if (!ring) return ST_NOMEM;
-    
-    uint64_t ring_phys = mm_get_physical_address((uint64_t)ring->trbs);
-    xhci_ring_init(ring, ring_phys);
-    
-    // Store ring pointer
-    if (ep_type == EP_TYPE_BULK_IN) {
-        dev->bulk_in_ring = ring;
-    } else if (ep_type == EP_TYPE_BULK_OUT) {
-        dev->bulk_out_ring = ring;
-    }
-    
-    // Setup input context using proper context size handling
-    size_t input_ctx_size = 33 * ctrl->context_size;
-    xhci_memset(ctrl->input_ctx_raw, 0, input_ctx_size);
-    
-    // Input Control Context
-    uint32_t* input_ctrl = (uint32_t*)xhci_get_input_control_ctx(ctrl);
-    input_ctrl[0] = 0;                        // Drop flags
-    input_ctrl[1] = (1 << 0) | (1 << dci);   // Add flags: Slot context and the endpoint
-    
-    // Copy slot context from device context and update
-    xhci_dev_ctx_t* dev_ctx = ctrl->dev_ctx[slot - 1];
-    xhci_slot_ctx_t* in_slot = xhci_get_input_slot_ctx(ctrl);
-    xhci_slot_ctx_t* out_slot = xhci_get_dev_slot_ctx(ctrl, dev_ctx);
-    xhci_memcpy(in_slot, out_slot, sizeof(xhci_slot_ctx_t));
-    
-    // Update context entries to include this endpoint
-    uint32_t entries = (in_slot->route_speed_entries >> 27) & 0x1F;
-    if (dci > entries) {
-        in_slot->route_speed_entries = (in_slot->route_speed_entries & 0x07FFFFFF) | (dci << 27);
-    }
-    
-    // Setup endpoint context
-    xhci_ep_ctx_t* ep = xhci_get_input_ep_ctx(ctrl, dci - 1);
-    ep->ep_info1 = (interval << 16);  // Interval
-    ep->ep_info2 = (3 << 1) |                    // CErr = 3
-                   (ep_type << 3) |               // EP Type
-                   (max_packet << 16);            // Max packet size
-    ep->tr_dequeue = ring_phys | 1;  // DCS = 1
-    ep->avg_trb_len = max_packet;
-    
-    // Flush before sending command
-    xhci_flush_cache(ctrl->input_ctx_raw, input_ctx_size);
-    xhci_mb();
-    
-    // Send Configure Endpoint command
-    uint32_t control = (TRB_TYPE_CONFIG_EP << 10) | (slot << 24);
-    
-    if (xhci_send_command(ctrl, ctrl->input_ctx_phys, 0, control) != ST_OK) {
-        return ST_ERR;
-    }
-    
-    if (xhci_wait_command(ctrl, 1000) != ST_OK) {
-        kprintf("[XHCI] Configure Endpoint failed\n");
-        return ST_ERR;
-    }
-    
-    xhci_dbg("Endpoint configured: Slot=%d, DCI=%d, Type=%d\n", slot, dci, ep_type);
-    return ST_OK;
+int xhci_configure_endpoint(xhci_controller_t *ctrl, uint8_t slot,
+			    uint8_t ep_num, uint8_t ep_type,
+			    uint16_t max_packet, uint8_t interval)
+{
+	if (slot == 0 || slot > ctrl->max_slots)
+		return ST_INVALID;
+
+	usb_device_t *dev = &ctrl->devices[slot - 1];
+
+	// Calculate endpoint index (DCI)
+	// DCI = endpoint number * 2 + direction (0=out, 1=in)
+	uint8_t dci;
+	if (ep_type == EP_TYPE_BULK_IN || ep_type == EP_TYPE_INTERRUPT_IN ||
+	    ep_type == EP_TYPE_ISOCH_IN) {
+		dci = ep_num * 2 + 1;
+	} else {
+		dci = ep_num * 2;
+	}
+
+	// Allocate transfer ring for this endpoint
+	xhci_ring_t *ring = xhci_alloc_ring();
+	if (!ring)
+		return ST_NOMEM;
+
+	uint64_t ring_phys = mm_get_physical_address((uint64_t)ring->trbs);
+	xhci_ring_init(ring, ring_phys);
+
+	// Store ring pointer
+	if (ep_type == EP_TYPE_BULK_IN) {
+		dev->bulk_in_ring = ring;
+	} else if (ep_type == EP_TYPE_BULK_OUT) {
+		dev->bulk_out_ring = ring;
+	}
+
+	// Setup input context using proper context size handling
+	size_t input_ctx_size = 33 * ctrl->context_size;
+	xhci_memset(ctrl->input_ctx_raw, 0, input_ctx_size);
+
+	// Input Control Context
+	uint32_t *input_ctrl = (uint32_t *)xhci_get_input_control_ctx(ctrl);
+	input_ctrl[0] = 0; // Drop flags
+	input_ctrl[1] = (1 << 0) |
+			(1 << dci); // Add flags: Slot context and the endpoint
+
+	// Copy slot context from device context and update
+	xhci_dev_ctx_t *dev_ctx = ctrl->dev_ctx[slot - 1];
+	xhci_slot_ctx_t *in_slot = xhci_get_input_slot_ctx(ctrl);
+	xhci_slot_ctx_t *out_slot = xhci_get_dev_slot_ctx(ctrl, dev_ctx);
+	xhci_memcpy(in_slot, out_slot, sizeof(xhci_slot_ctx_t));
+
+	// Update context entries to include this endpoint
+	uint32_t entries = (in_slot->route_speed_entries >> 27) & 0x1F;
+	if (dci > entries) {
+		in_slot->route_speed_entries =
+			(in_slot->route_speed_entries & 0x07FFFFFF) |
+			(dci << 27);
+	}
+
+	// Setup endpoint context
+	xhci_ep_ctx_t *ep = xhci_get_input_ep_ctx(ctrl, dci - 1);
+	ep->ep_info1 = (interval << 16); // Interval
+	ep->ep_info2 = (3 << 1) | // CErr = 3
+		       (ep_type << 3) | // EP Type
+		       (max_packet << 16); // Max packet size
+	ep->tr_dequeue = ring_phys | 1; // DCS = 1
+	ep->avg_trb_len = max_packet;
+
+	// Flush before sending command
+	xhci_flush_cache(ctrl->input_ctx_raw, input_ctx_size);
+	xhci_mb();
+
+	// Send Configure Endpoint command
+	uint32_t control = (TRB_TYPE_CONFIG_EP << 10) | (slot << 24);
+
+	if (xhci_send_command(ctrl, ctrl->input_ctx_phys, 0, control) !=
+	    ST_OK) {
+		return ST_ERR;
+	}
+
+	if (xhci_wait_command(ctrl, 1000) != ST_OK) {
+		kprintf("[XHCI] Configure Endpoint failed\n");
+		return ST_ERR;
+	}
+
+	xhci_dbg("Endpoint configured: Slot=%d, DCI=%d, Type=%d\n", slot, dci,
+		 ep_type);
+	return ST_OK;
 }
 
 //=============================================================================
 // Endpoint Reset (for error recovery)
 //=============================================================================
 
-int xhci_reset_endpoint(xhci_controller_t* ctrl, uint8_t slot, uint8_t dci) {
-    if (slot == 0 || slot > ctrl->max_slots) return ST_INVALID;
-    if (dci == 0 || dci > 31) return ST_INVALID;
-    
-    xhci_dbg("Resetting endpoint: slot=%d, dci=%d\n", slot, dci);
-    
-    // Get the ring for this endpoint
-    usb_device_t* dev = &ctrl->devices[slot - 1];
-    xhci_ring_t* ring = NULL;
-    
-    if (dci == 1) {
-        ring = dev->ep0_ring;
-    } else if (dci == dev->bulk_in_ep * 2 + 1) {
-        ring = dev->bulk_in_ring;
-    } else if (dci == dev->bulk_out_ep * 2) {
-        ring = dev->bulk_out_ring;
-    }
-    
-    // Step 1: Queue Reset Endpoint command
-    uint32_t reset_ctrl = (TRB_TYPE_RESET_EP << 10) | (slot << 24) | (dci << 16);
-    
-    if (xhci_send_command(ctrl, 0, 0, reset_ctrl) != ST_OK) {
-        kprintf("[XHCI] Failed to send Reset EP command\n");
-        return ST_ERR;
-    }
-    
-    if (xhci_wait_command(ctrl, 1000) != ST_OK) {
-        kprintf("[XHCI] Reset EP command timeout\n");
-        return ST_TIMEOUT;
-    }
-    
-    // Step 2: Queue Set TR Dequeue Pointer command to reset ring position
-    if (ring) {
-        // Calculate the dequeue pointer (point to current enqueue position)
-        uint64_t deq_ptr = mm_get_physical_address((uint64_t)&ring->trbs[ring->enqueue]);
-        deq_ptr |= ring->cycle;  // Include current cycle state (DCS)
-        
-        uint32_t set_deq_ctrl = (TRB_TYPE_SET_TR_DEQ << 10) | (slot << 24) | (dci << 16);
-        
-        if (xhci_send_command(ctrl, deq_ptr, 0, set_deq_ctrl) != ST_OK) {
-            kprintf("[XHCI] Failed to send Set TR Dequeue command\n");
-            return ST_ERR;
-        }
-        
-        if (xhci_wait_command(ctrl, 1000) != ST_OK) {
-            kprintf("[XHCI] Set TR Dequeue command timeout\n");
-            return ST_TIMEOUT;
-        }
-    }
-    
-    xhci_dbg("Endpoint reset complete: slot=%d, dci=%d\n", slot, dci);
-    return ST_OK;
+int xhci_reset_endpoint(xhci_controller_t *ctrl, uint8_t slot, uint8_t dci)
+{
+	if (slot == 0 || slot > ctrl->max_slots)
+		return ST_INVALID;
+	if (dci == 0 || dci > 31)
+		return ST_INVALID;
+
+	xhci_dbg("Resetting endpoint: slot=%d, dci=%d\n", slot, dci);
+
+	// Get the ring for this endpoint
+	usb_device_t *dev = &ctrl->devices[slot - 1];
+	xhci_ring_t *ring = NULL;
+
+	if (dci == 1) {
+		ring = dev->ep0_ring;
+	} else if (dci == dev->bulk_in_ep * 2 + 1) {
+		ring = dev->bulk_in_ring;
+	} else if (dci == dev->bulk_out_ep * 2) {
+		ring = dev->bulk_out_ring;
+	}
+
+	// Step 1: Queue Reset Endpoint command
+	uint32_t reset_ctrl =
+		(TRB_TYPE_RESET_EP << 10) | (slot << 24) | (dci << 16);
+
+	if (xhci_send_command(ctrl, 0, 0, reset_ctrl) != ST_OK) {
+		kprintf("[XHCI] Failed to send Reset EP command\n");
+		return ST_ERR;
+	}
+
+	if (xhci_wait_command(ctrl, 1000) != ST_OK) {
+		kprintf("[XHCI] Reset EP command timeout\n");
+		return ST_TIMEOUT;
+	}
+
+	// Step 2: Queue Set TR Dequeue Pointer command to reset ring position
+	if (ring) {
+		// Calculate the dequeue pointer (point to current enqueue position)
+		uint64_t deq_ptr = mm_get_physical_address(
+			(uint64_t)&ring->trbs[ring->enqueue]);
+		deq_ptr |= ring->cycle; // Include current cycle state (DCS)
+
+		uint32_t set_deq_ctrl = (TRB_TYPE_SET_TR_DEQ << 10) |
+					(slot << 24) | (dci << 16);
+
+		if (xhci_send_command(ctrl, deq_ptr, 0, set_deq_ctrl) !=
+		    ST_OK) {
+			kprintf("[XHCI] Failed to send Set TR Dequeue command\n");
+			return ST_ERR;
+		}
+
+		if (xhci_wait_command(ctrl, 1000) != ST_OK) {
+			kprintf("[XHCI] Set TR Dequeue command timeout\n");
+			return ST_TIMEOUT;
+		}
+	}
+
+	xhci_dbg("Endpoint reset complete: slot=%d, dci=%d\n", slot, dci);
+	return ST_OK;
 }
 
 //=============================================================================
 // Control Transfers
 //=============================================================================
 
-int xhci_control_transfer(xhci_controller_t* ctrl, usb_device_t* dev,
-                         uint8_t bmRequestType, uint8_t bRequest,
-                         uint16_t wValue, uint16_t wIndex, uint16_t wLength,
-                         void* data) {
-    if (!dev || !dev->ep0_ring) {
-        kprintf("[XHCI] Control: invalid dev=%p ring=%p\n", dev, dev ? dev->ep0_ring : NULL);
-        return ST_INVALID;
-    }
-    
-    xhci_ring_t* ring = dev->ep0_ring;
-    uint8_t slot = dev->slot_id;
-    uint8_t direction = (bmRequestType & USB_RT_D2H) ? 1 : 0;
-    
-    // Determine number of TRBs we'll enqueue
-    int num_trbs = 2;  // Setup + Status
-    if (wLength > 0 && data) {
-        num_trbs = 3;  // Setup + Data + Status
-    }
-    
-    // Setup TRB - NO IOC, chain to next
-    uint64_t setup_data = (uint64_t)bmRequestType |
-                          ((uint64_t)bRequest << 8) |
-                          ((uint64_t)wValue << 16) |
-                          ((uint64_t)wIndex << 32) |
-                          ((uint64_t)wLength << 48);
-    
-    uint32_t setup_status = 8;  // TRB transfer length = 8 bytes
-    uint32_t setup_control = (TRB_TYPE_SETUP << 10) | TRB_FLAG_IDT;
-    
-    if (wLength > 0) {
-        // TRT: 3 = IN data, 2 = OUT data
-        setup_control |= (direction ? 3 : 2) << 16;
-    }
-    
-    xhci_transfer_t xfer = {0, 0, 0};
-    ctrl->pending_xfer[slot - 1][1] = &xfer;  // EP0 = DCI 1
-    
-    // Enqueue Setup TRB
-    xhci_ring_enqueue(ring, setup_data, setup_status, setup_control);
-    
-    // Data TRB if needed - NO IOC, chain to status
-    if (wLength > 0 && data) {
-        uint64_t data_phys = mm_get_physical_address((uint64_t)data);
-        uint32_t data_status = wLength;
-        uint32_t data_control = (TRB_TYPE_DATA << 10);
-        
-        if (direction) {
-            data_control |= (1 << 16);  // DIR = IN
-        } else {
-            // OUT data: flush CPU cache so xHCI DMA reads current contents
-            xhci_flush_cache(data, wLength);
-            xhci_mb();
-        }
-        
-        xhci_ring_enqueue(ring, data_phys, data_status, data_control);
-    }
-    
-    // Status TRB - IOC only here to get one completion for entire transfer
-    // Per Intel spec Table 4-7:
-    // - No Data Stage (wLength=0): Status DIR = IN (1)  
-    // - OUT Data Stage: Status DIR = IN (1)
-    // - IN Data Stage: Status DIR = OUT (0)
-    uint32_t status_control = (TRB_TYPE_STATUS << 10) | TRB_FLAG_IOC;
-    if (wLength == 0) {
-        // No Data Stage: Status phase is always IN
-        status_control |= (1 << 16);  // DIR = IN
-    } else if (!direction) {
-        // OUT Data Stage: Status phase is IN
-        status_control |= (1 << 16);  // DIR = IN
-    }
-    // else: IN Data Stage: Status phase is OUT (DIR bit not set)
-    
-    xhci_ring_enqueue(ring, 0, 0, status_control);
-    
-    // Ring doorbell for EP0 (DCI = 1)
-    xhci_ring_doorbell(ctrl, slot, 1);
-    
-    // Wait for completion (only Status TRB has IOC, so one event expected)
-    for (int i = 0; i < 1000; i++) {
-        xhci_process_events_locked(ctrl);
-        
-        if (xfer.completed) {
-            xhci_clear_pending_xfer(ctrl, slot, 1);
-            
-            if (xfer.cc == TRB_CC_SUCCESS || xfer.cc == TRB_CC_SHORT_PACKET) {
-                return ST_OK;
-            }
-            
-            return ST_IO;
-        }
-        
-        delay_ms(1);
-    }
-    
-    // Timeout
-    xhci_clear_pending_xfer(ctrl, slot, 1);
-    return ST_TIMEOUT;
+int xhci_control_transfer(xhci_controller_t *ctrl, usb_device_t *dev,
+			  uint8_t bmRequestType, uint8_t bRequest,
+			  uint16_t wValue, uint16_t wIndex, uint16_t wLength,
+			  void *data)
+{
+	if (!dev || !dev->ep0_ring) {
+		kprintf("[XHCI] Control: invalid dev=%p ring=%p\n", dev,
+			dev ? dev->ep0_ring : NULL);
+		return ST_INVALID;
+	}
+
+	xhci_ring_t *ring = dev->ep0_ring;
+	uint8_t slot = dev->slot_id;
+	uint8_t direction = (bmRequestType & USB_RT_D2H) ? 1 : 0;
+
+	// Determine number of TRBs we'll enqueue
+	int num_trbs = 2; // Setup + Status
+	if (wLength > 0 && data) {
+		num_trbs = 3; // Setup + Data + Status
+	}
+
+	// Setup TRB - NO IOC, chain to next
+	uint64_t setup_data =
+		(uint64_t)bmRequestType | ((uint64_t)bRequest << 8) |
+		((uint64_t)wValue << 16) | ((uint64_t)wIndex << 32) |
+		((uint64_t)wLength << 48);
+
+	uint32_t setup_status = 8; // TRB transfer length = 8 bytes
+	uint32_t setup_control = (TRB_TYPE_SETUP << 10) | TRB_FLAG_IDT;
+
+	if (wLength > 0) {
+		// TRT: 3 = IN data, 2 = OUT data
+		setup_control |= (direction ? 3 : 2) << 16;
+	}
+
+	xhci_transfer_t xfer = { 0, 0, 0 };
+	ctrl->pending_xfer[slot - 1][1] = &xfer; // EP0 = DCI 1
+
+	// Enqueue Setup TRB
+	xhci_ring_enqueue(ring, setup_data, setup_status, setup_control);
+
+	// Data TRB if needed - NO IOC, chain to status
+	if (wLength > 0 && data) {
+		uint64_t data_phys = mm_get_physical_address((uint64_t)data);
+		uint32_t data_status = wLength;
+		uint32_t data_control = (TRB_TYPE_DATA << 10);
+
+		if (direction) {
+			data_control |= (1 << 16); // DIR = IN
+		} else {
+			// OUT data: flush CPU cache so xHCI DMA reads current contents
+			xhci_flush_cache(data, wLength);
+			xhci_mb();
+		}
+
+		xhci_ring_enqueue(ring, data_phys, data_status, data_control);
+	}
+
+	// Status TRB - IOC only here to get one completion for entire transfer
+	// Per Intel spec Table 4-7:
+	// - No Data Stage (wLength=0): Status DIR = IN (1)
+	// - OUT Data Stage: Status DIR = IN (1)
+	// - IN Data Stage: Status DIR = OUT (0)
+	uint32_t status_control = (TRB_TYPE_STATUS << 10) | TRB_FLAG_IOC;
+	if (wLength == 0) {
+		// No Data Stage: Status phase is always IN
+		status_control |= (1 << 16); // DIR = IN
+	} else if (!direction) {
+		// OUT Data Stage: Status phase is IN
+		status_control |= (1 << 16); // DIR = IN
+	}
+	// else: IN Data Stage: Status phase is OUT (DIR bit not set)
+
+	xhci_ring_enqueue(ring, 0, 0, status_control);
+
+	// Ring doorbell for EP0 (DCI = 1)
+	xhci_ring_doorbell(ctrl, slot, 1);
+
+	// Wait for completion (only Status TRB has IOC, so one event expected)
+	for (int i = 0; i < 1000; i++) {
+		xhci_process_events_locked(ctrl);
+
+		if (xfer.completed) {
+			xhci_clear_pending_xfer(ctrl, slot, 1);
+
+			if (xfer.cc == TRB_CC_SUCCESS ||
+			    xfer.cc == TRB_CC_SHORT_PACKET) {
+				return ST_OK;
+			}
+
+			return ST_IO;
+		}
+
+		delay_ms(1);
+	}
+
+	// Timeout
+	xhci_clear_pending_xfer(ctrl, slot, 1);
+	return ST_TIMEOUT;
 }
 
 //=============================================================================
@@ -2472,162 +2733,180 @@ int xhci_control_transfer(xhci_controller_t* ctrl, usb_device_t* dev,
 //=============================================================================
 
 // Helper: Count number of TRBs needed for a transfer respecting 64KB boundaries
-static int xhci_count_trbs(uint64_t addr, uint32_t len) {
-    int num_trbs = 0;
-    while (len > 0) {
-        // Calculate max bytes until 64KB boundary
-        uint32_t trb_len = TRB_BUFF_LEN_UP_TO_BOUNDARY(addr);
-        if (trb_len > len) trb_len = len;
-        if (trb_len == 0) trb_len = len;  // Safety for aligned addresses
-        
-        num_trbs++;
-        addr += trb_len;
-        len -= trb_len;
-    }
-    return num_trbs ? num_trbs : 1;  // At least 1 TRB for zero-length
+static int xhci_count_trbs(uint64_t addr, uint32_t len)
+{
+	int num_trbs = 0;
+	while (len > 0) {
+		// Calculate max bytes until 64KB boundary
+		uint32_t trb_len = TRB_BUFF_LEN_UP_TO_BOUNDARY(addr);
+		if (trb_len > len)
+			trb_len = len;
+		if (trb_len == 0)
+			trb_len = len; // Safety for aligned addresses
+
+		num_trbs++;
+		addr += trb_len;
+		len -= trb_len;
+	}
+	return num_trbs ? num_trbs : 1; // At least 1 TRB for zero-length
 }
 
 // Calculate TD_SIZE (packets remaining) for xHCI 1.0+
 // Returns number of packets remaining after this TRB, capped at 31
-static uint32_t xhci_td_remainder(uint32_t transferred, uint32_t trb_len, 
-                                   uint32_t td_total_len, uint16_t max_pkt) {
-    uint32_t total_packets, packets_transferred;
-    
-    // Zero length or last TRB
-    if (trb_len == 0 || transferred + trb_len >= td_total_len) {
-        return 0;
-    }
-    
-    // Total packets in TD
-    total_packets = (td_total_len + max_pkt - 1) / max_pkt;
-    
-    // Packets transferred after this TRB
-    packets_transferred = (transferred + trb_len) / max_pkt;
-    
-    // Remaining packets (capped at 31 for 5-bit field)
-    uint32_t remaining = total_packets > packets_transferred ? 
-                         total_packets - packets_transferred : 0;
-    return remaining > 31 ? 31 : remaining;
+static uint32_t xhci_td_remainder(uint32_t transferred, uint32_t trb_len,
+				  uint32_t td_total_len, uint16_t max_pkt)
+{
+	uint32_t total_packets, packets_transferred;
+
+	// Zero length or last TRB
+	if (trb_len == 0 || transferred + trb_len >= td_total_len) {
+		return 0;
+	}
+
+	// Total packets in TD
+	total_packets = (td_total_len + max_pkt - 1) / max_pkt;
+
+	// Packets transferred after this TRB
+	packets_transferred = (transferred + trb_len) / max_pkt;
+
+	// Remaining packets (capped at 31 for 5-bit field)
+	uint32_t remaining = total_packets > packets_transferred ?
+				     total_packets - packets_transferred :
+				     0;
+	return remaining > 31 ? 31 : remaining;
 }
 
 // Helper: Enqueue multiple chained TRBs for a bulk transfer with TD_SIZE
 // Returns number of TRBs enqueued
-static int xhci_queue_bulk_trbs_ex(xhci_ring_t* ring, uint64_t buf_phys, 
-                                    uint32_t len, int is_in, uint16_t max_pkt) {
-    int num_trbs = 0;
-    uint32_t remaining = len;
-    uint32_t transferred = 0;
-    uint64_t addr = buf_phys;
-    
-    // Handle zero-length transfer
-    if (len == 0) {
-        uint32_t status = TRB_LEN(0) | TRB_TD_SIZE(0);
-        uint32_t control = (TRB_TYPE_NORMAL << 10) | TRB_FLAG_IOC;
-        if (is_in) control |= TRB_FLAG_ISP;
-        xhci_ring_enqueue(ring, 0, status, control);
-        return 1;
-    }
-    
-    while (remaining > 0) {
-        // Calculate max bytes until 64KB boundary
-        uint32_t trb_len = TRB_BUFF_LEN_UP_TO_BOUNDARY(addr);
-        if (trb_len > remaining) trb_len = remaining;
-        if (trb_len == 0) trb_len = remaining;  // Safety
-        
-        // Calculate TD_SIZE for this TRB
-        uint32_t td_size = xhci_td_remainder(transferred, trb_len, len, max_pkt);
-        uint32_t status = TRB_LEN(trb_len) | TRB_TD_SIZE(td_size);
-        
-        uint32_t control = (TRB_TYPE_NORMAL << 10);
-        
-        // Chain all but the last TRB
-        if (remaining > trb_len) {
-            control |= TRB_FLAG_CHAIN;
-        } else {
-            // Last TRB gets IOC (Interrupt On Completion)
-            control |= TRB_FLAG_IOC;
-        }
-        
-        // For IN endpoints, set ISP (Interrupt on Short Packet)
-        if (is_in) {
-            control |= TRB_FLAG_ISP;
-        }
-        
-        xhci_ring_enqueue(ring, addr, status, control);
-        
-        addr += trb_len;
-        transferred += trb_len;
-        remaining -= trb_len;
-        num_trbs++;
-    }
-    
-    return num_trbs;
+static int xhci_queue_bulk_trbs_ex(xhci_ring_t *ring, uint64_t buf_phys,
+				   uint32_t len, int is_in, uint16_t max_pkt)
+{
+	int num_trbs = 0;
+	uint32_t remaining = len;
+	uint32_t transferred = 0;
+	uint64_t addr = buf_phys;
+
+	// Handle zero-length transfer
+	if (len == 0) {
+		uint32_t status = TRB_LEN(0) | TRB_TD_SIZE(0);
+		uint32_t control = (TRB_TYPE_NORMAL << 10) | TRB_FLAG_IOC;
+		if (is_in)
+			control |= TRB_FLAG_ISP;
+		xhci_ring_enqueue(ring, 0, status, control);
+		return 1;
+	}
+
+	while (remaining > 0) {
+		// Calculate max bytes until 64KB boundary
+		uint32_t trb_len = TRB_BUFF_LEN_UP_TO_BOUNDARY(addr);
+		if (trb_len > remaining)
+			trb_len = remaining;
+		if (trb_len == 0)
+			trb_len = remaining; // Safety
+
+		// Calculate TD_SIZE for this TRB
+		uint32_t td_size =
+			xhci_td_remainder(transferred, trb_len, len, max_pkt);
+		uint32_t status = TRB_LEN(trb_len) | TRB_TD_SIZE(td_size);
+
+		uint32_t control = (TRB_TYPE_NORMAL << 10);
+
+		// Chain all but the last TRB
+		if (remaining > trb_len) {
+			control |= TRB_FLAG_CHAIN;
+		} else {
+			// Last TRB gets IOC (Interrupt On Completion)
+			control |= TRB_FLAG_IOC;
+		}
+
+		// For IN endpoints, set ISP (Interrupt on Short Packet)
+		if (is_in) {
+			control |= TRB_FLAG_ISP;
+		}
+
+		xhci_ring_enqueue(ring, addr, status, control);
+
+		addr += trb_len;
+		transferred += trb_len;
+		remaining -= trb_len;
+		num_trbs++;
+	}
+
+	return num_trbs;
 }
 
-int xhci_bulk_transfer_in(xhci_controller_t* ctrl, usb_device_t* dev,
-                          void* buf, uint32_t len, uint32_t* transferred) {
-    BUG_ON(ctrl == NULL);
-    if (!dev || !dev->bulk_in_ring || !dev->bulk_in_ep) return ST_INVALID;
-    
-    xhci_ring_t* ring = dev->bulk_in_ring;
-    uint8_t slot = dev->slot_id;
-    uint8_t dci = dev->bulk_in_ep * 2 + 1;  // IN endpoint DCI
-    uint16_t max_pkt = dev->bulk_in_max_pkt ? dev->bulk_in_max_pkt : 512;
-    
-    // Pre-calculate physical address BEFORE enqueueing
-    uint64_t buf_phys = mm_get_physical_address((uint64_t)buf);
-    
-    int num_trbs = xhci_count_trbs(buf_phys, len);
-    xhci_dbg("Bulk IN: slot=%d, dci=%d, len=%d, trbs=%d, ring enq=%d\n", 
-             slot, dci, len, num_trbs, ring->enqueue);
-    
-    xhci_transfer_t xfer = {0, 0, 0};
-    ctrl->pending_xfer[slot - 1][dci] = &xfer;
-    
-    // Enqueue TRBs with 64KB boundary handling and TD_SIZE
-    xhci_queue_bulk_trbs_ex(ring, buf_phys, len, 1, max_pkt);
-    
-    // Ring doorbell
-    xhci_ring_doorbell(ctrl, slot, dci);
-    
-    // Wait for completion (ultra-fast polling with 100us delays)
-    for (int i = 0; i < 50000; i++) {  // 5 second timeout total
-        xhci_process_events_locked(ctrl);
-        
-        if (xfer.completed) {
-            xhci_clear_pending_xfer(ctrl, slot, dci);
-            
-            // Compiler barrier — x86 DMA is cache-coherent so mfence is not
-            // needed; just prevent compiler from caching stale values.
-            __asm__ volatile("" ::: "memory");
-            
-            if (xfer.cc == TRB_CC_SUCCESS || xfer.cc == TRB_CC_SHORT_PACKET) {
-                if (transferred) {
-                    // bytes_transferred is actually residue
-                    *transferred = len - xfer.bytes_transferred;
-                }
-                dev->err_count_in = 0;  // Reset error count on success
-                return ST_OK;
-            }
-            
-            // Handle transaction errors with retry
-            if (xfer.cc == TRB_CC_USB_XACT && dev->err_count_in < MAX_SOFT_RETRY) {
-                dev->err_count_in++;
-                xhci_dbg("Bulk IN retry %d after CC=%d\n", dev->err_count_in, xfer.cc);
-                
-                // Reset transfer state and retry
-                xfer.completed = 0;
-                xfer.cc = 0;
-                xfer.bytes_transferred = 0;
-                ctrl->pending_xfer[slot - 1][dci] = &xfer;
-                
-                // Re-enqueue and ring doorbell
-                xhci_queue_bulk_trbs_ex(ring, buf_phys, len, 1, max_pkt);
-                xhci_ring_doorbell(ctrl, slot, dci);
-                continue;
-            }
-            
-            /* On ANY non-success return we must reset the endpoint so
+int xhci_bulk_transfer_in(xhci_controller_t *ctrl, usb_device_t *dev, void *buf,
+			  uint32_t len, uint32_t *transferred)
+{
+	BUG_ON(ctrl == NULL);
+	if (!dev || !dev->bulk_in_ring || !dev->bulk_in_ep)
+		return ST_INVALID;
+
+	xhci_ring_t *ring = dev->bulk_in_ring;
+	uint8_t slot = dev->slot_id;
+	uint8_t dci = dev->bulk_in_ep * 2 + 1; // IN endpoint DCI
+	uint16_t max_pkt = dev->bulk_in_max_pkt ? dev->bulk_in_max_pkt : 512;
+
+	// Pre-calculate physical address BEFORE enqueueing
+	uint64_t buf_phys = mm_get_physical_address((uint64_t)buf);
+
+	int num_trbs = xhci_count_trbs(buf_phys, len);
+	xhci_dbg("Bulk IN: slot=%d, dci=%d, len=%d, trbs=%d, ring enq=%d\n",
+		 slot, dci, len, num_trbs, ring->enqueue);
+
+	xhci_transfer_t xfer = { 0, 0, 0 };
+	ctrl->pending_xfer[slot - 1][dci] = &xfer;
+
+	// Enqueue TRBs with 64KB boundary handling and TD_SIZE
+	xhci_queue_bulk_trbs_ex(ring, buf_phys, len, 1, max_pkt);
+
+	// Ring doorbell
+	xhci_ring_doorbell(ctrl, slot, dci);
+
+	// Wait for completion (ultra-fast polling with 100us delays)
+	for (int i = 0; i < 50000; i++) { // 5 second timeout total
+		xhci_process_events_locked(ctrl);
+
+		if (xfer.completed) {
+			xhci_clear_pending_xfer(ctrl, slot, dci);
+
+			// Compiler barrier — x86 DMA is cache-coherent so mfence is not
+			// needed; just prevent compiler from caching stale values.
+			__asm__ volatile("" ::: "memory");
+
+			if (xfer.cc == TRB_CC_SUCCESS ||
+			    xfer.cc == TRB_CC_SHORT_PACKET) {
+				if (transferred) {
+					// bytes_transferred is actually residue
+					*transferred =
+						len - xfer.bytes_transferred;
+				}
+				dev->err_count_in =
+					0; // Reset error count on success
+				return ST_OK;
+			}
+
+			// Handle transaction errors with retry
+			if (xfer.cc == TRB_CC_USB_XACT &&
+			    dev->err_count_in < MAX_SOFT_RETRY) {
+				dev->err_count_in++;
+				xhci_dbg("Bulk IN retry %d after CC=%d\n",
+					 dev->err_count_in, xfer.cc);
+
+				// Reset transfer state and retry
+				xfer.completed = 0;
+				xfer.cc = 0;
+				xfer.bytes_transferred = 0;
+				ctrl->pending_xfer[slot - 1][dci] = &xfer;
+
+				// Re-enqueue and ring doorbell
+				xhci_queue_bulk_trbs_ex(ring, buf_phys, len, 1,
+							max_pkt);
+				xhci_ring_doorbell(ctrl, slot, dci);
+				continue;
+			}
+
+			/* On ANY non-success return we must reset the endpoint so
              * the controller drops the orphan TD before the caller
              * frees the DMA buffer.  Without this, the hardware can
              * keep fetching the still-queued TRBs and DMA into a
@@ -2643,142 +2922,156 @@ int xhci_bulk_transfer_in(xhci_controller_t* ctrl, usb_device_t* dev,
              * (≈25 000 cluster writes) one such transient error per
              * download is enough to silently overwrite the /tmp
              * directory cluster with leaked network/heap content. */
-            xhci_dbg("Resetting IN endpoint after CC=%d, err_count=%d\n",
-                     xfer.cc, dev->err_count_in);
-            xhci_reset_endpoint(ctrl, slot, dci);
-            dev->err_count_in = 0;
+			xhci_dbg(
+				"Resetting IN endpoint after CC=%d, err_count=%d\n",
+				xfer.cc, dev->err_count_in);
+			xhci_reset_endpoint(ctrl, slot, dci);
+			dev->err_count_in = 0;
 
-            return ST_IO;
-        }
+			return ST_IO;
+		}
 
-        delay_us(100);  // 100 microsecond delay for ultra-fast response
-    }
-    
-    // Debug: transfer timed out - dump comprehensive state
-    kprintf("[XHCI] ===== BULK IN TIMEOUT =====\n");
-    kprintf("[XHCI] slot=%d dci=%d len=%d ring_enq=%d\n", slot, dci, len, ring->enqueue);
-    
-    // Check endpoint context state
-    if (ctrl->dcbaa && slot > 0) {
-        uint64_t* dev_ctx = (uint64_t*)phys_to_virt(ctrl->dcbaa[slot]);
-        if (dev_ctx) {
-            uint32_t* ep_ctx = (uint32_t*)((uint8_t*)dev_ctx + 32 * dci);
-            uint32_t ep_state = ep_ctx[0] & 0x7;
-            uint64_t ep_deq = ((uint64_t)ep_ctx[3] << 32) | (ep_ctx[2] & ~0xF);
-            kprintf("[XHCI] EP_state=%d (0=Dis 1=Run 2=Halt 3=Stop 4=Err) deq=0x%lx\n",
-                    ep_state, ep_deq);
-        }
-    }
-    
-    // Check event ring state
-    if (ctrl->event_ring) {
-        xhci_ring_t* er = ctrl->event_ring;
-        volatile xhci_trb_t* trb = &er->trbs[er->dequeue];
-        uint32_t ctrl_field = trb->control;
-        int trb_cycle = ctrl_field & 1;
-        int trb_type = (ctrl_field >> 10) & 0x3F;
-        kprintf("[XHCI] Event ring: deq=%d cycle=%d trb_cycle=%d trb_type=%d\n",
-                er->dequeue, er->cycle, trb_cycle, trb_type);
-    }
-    
-    // Check transfer ring TRBs around enqueue
-    if (ring->trbs) {
-        int prev = (ring->enqueue > 0) ? ring->enqueue - 1 : XHCI_RING_SIZE - 2;
-        volatile xhci_trb_t* prev_trb = &ring->trbs[prev];
-        kprintf("[XHCI] Xfer TRB[%d]: addr=0x%lx len=%d ctrl=0x%x\n",
-                prev, prev_trb->param, prev_trb->status & 0x1FFFF, prev_trb->control);
-    }
-    
-    // Check USB status register
-    uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
-    uint32_t usbcmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
-    kprintf("[XHCI] USBSTS=0x%x USBCMD=0x%x (HCH=%d HSE=%d)\n",
-            usbsts, usbcmd, (usbsts >> 0) & 1, (usbsts >> 2) & 1);
-    kprintf("[XHCI] ==========================\n");
+		delay_us(100); // 100 microsecond delay for ultra-fast response
+	}
 
-    /* Timeout: the TD is still live in the ring.  Reset the endpoint
+	// Debug: transfer timed out - dump comprehensive state
+	kprintf("[XHCI] ===== BULK IN TIMEOUT =====\n");
+	kprintf("[XHCI] slot=%d dci=%d len=%d ring_enq=%d\n", slot, dci, len,
+		ring->enqueue);
+
+	// Check endpoint context state
+	if (ctrl->dcbaa && slot > 0) {
+		uint64_t *dev_ctx = (uint64_t *)phys_to_virt(ctrl->dcbaa[slot]);
+		if (dev_ctx) {
+			uint32_t *ep_ctx =
+				(uint32_t *)((uint8_t *)dev_ctx + 32 * dci);
+			uint32_t ep_state = ep_ctx[0] & 0x7;
+			uint64_t ep_deq = ((uint64_t)ep_ctx[3] << 32) |
+					  (ep_ctx[2] & ~0xF);
+			kprintf("[XHCI] EP_state=%d (0=Dis 1=Run 2=Halt 3=Stop 4=Err) deq=0x%lx\n",
+				ep_state, ep_deq);
+		}
+	}
+
+	// Check event ring state
+	if (ctrl->event_ring) {
+		xhci_ring_t *er = ctrl->event_ring;
+		volatile xhci_trb_t *trb = &er->trbs[er->dequeue];
+		uint32_t ctrl_field = trb->control;
+		int trb_cycle = ctrl_field & 1;
+		int trb_type = (ctrl_field >> 10) & 0x3F;
+		kprintf("[XHCI] Event ring: deq=%d cycle=%d trb_cycle=%d trb_type=%d\n",
+			er->dequeue, er->cycle, trb_cycle, trb_type);
+	}
+
+	// Check transfer ring TRBs around enqueue
+	if (ring->trbs) {
+		int prev = (ring->enqueue > 0) ? ring->enqueue - 1 :
+						 XHCI_RING_SIZE - 2;
+		volatile xhci_trb_t *prev_trb = &ring->trbs[prev];
+		kprintf("[XHCI] Xfer TRB[%d]: addr=0x%lx len=%d ctrl=0x%x\n",
+			prev, prev_trb->param, prev_trb->status & 0x1FFFF,
+			prev_trb->control);
+	}
+
+	// Check USB status register
+	uint32_t usbsts = xhci_op_read32(ctrl, XHCI_OP_USBSTS);
+	uint32_t usbcmd = xhci_op_read32(ctrl, XHCI_OP_USBCMD);
+	kprintf("[XHCI] USBSTS=0x%x USBCMD=0x%x (HCH=%d HSE=%d)\n", usbsts,
+		usbcmd, (usbsts >> 0) & 1, (usbsts >> 2) & 1);
+	kprintf("[XHCI] ==========================\n");
+
+	/* Timeout: the TD is still live in the ring.  Reset the endpoint
      * before clearing pending_xfer so the queued TRBs cannot fetch
      * the caller's about-to-be-freed DMA buffer after we return.
      * See the matching comment in xhci_bulk_transfer_out. */
-    xhci_reset_endpoint(ctrl, slot, dci);
-    xhci_clear_pending_xfer(ctrl, slot, dci);
-    return ST_TIMEOUT;
+	xhci_reset_endpoint(ctrl, slot, dci);
+	xhci_clear_pending_xfer(ctrl, slot, dci);
+	return ST_TIMEOUT;
 }
 
-int xhci_bulk_transfer_out(xhci_controller_t* ctrl, usb_device_t* dev,
-                           const void* buf, uint32_t len, uint32_t* transferred) {
-    if (!dev || !dev->bulk_out_ring || !dev->bulk_out_ep) return ST_INVALID;
-    
-    xhci_ring_t* ring = dev->bulk_out_ring;
-    uint8_t slot = dev->slot_id;
-    uint8_t dci = dev->bulk_out_ep * 2;  // OUT endpoint DCI
-    uint16_t max_pkt = dev->bulk_out_max_pkt ? dev->bulk_out_max_pkt : 512;
-    
-    // Pre-calculate physical address BEFORE enqueueing
-    uint64_t buf_phys = mm_get_physical_address((uint64_t)buf);
-    
-    int num_trbs = xhci_count_trbs(buf_phys, len);
-    xhci_dbg("Bulk OUT: slot=%d, dci=%d, len=%d, trbs=%d\n", slot, dci, len, num_trbs);
-    
-    xhci_transfer_t xfer = {0, 0, 0};
-    ctrl->pending_xfer[slot - 1][dci] = &xfer;
-    
-    // Enqueue TRBs with 64KB boundary handling and TD_SIZE
-    xhci_queue_bulk_trbs_ex(ring, buf_phys, len, 0, max_pkt);
-    
-    // Ring doorbell
-    xhci_ring_doorbell(ctrl, slot, dci);
-    
-    // Wait for completion (ultra-fast polling with 100us delays)
-    for (int i = 0; i < 50000; i++) {  // 5 second timeout total
-        xhci_process_events_locked(ctrl);
-        
-        if (xfer.completed) {
-            xhci_clear_pending_xfer(ctrl, slot, dci);
-            
-            if (transferred) {
-                *transferred = len - xfer.bytes_transferred;
-            }
-            
-            if (xfer.cc == TRB_CC_SUCCESS) {
-                dev->err_count_out = 0;  // Reset error count on success
-                return ST_OK;
-            }
-            
-            // Handle transaction errors with retry
-            if (xfer.cc == TRB_CC_USB_XACT && dev->err_count_out < MAX_SOFT_RETRY) {
-                dev->err_count_out++;
-                xhci_dbg("Bulk OUT retry %d after CC=%d\n", dev->err_count_out, xfer.cc);
-                
-                // Reset transfer state and retry
-                xfer.completed = 0;
-                xfer.cc = 0;
-                xfer.bytes_transferred = 0;
-                ctrl->pending_xfer[slot - 1][dci] = &xfer;
-                
-                // Re-enqueue and ring doorbell
-                xhci_queue_bulk_trbs_ex(ring, buf_phys, len, 0, max_pkt);
-                xhci_ring_doorbell(ctrl, slot, dci);
-                continue;
-            }
-            
-            /* Same orphan-TRB hazard as the IN side — see the long
+int xhci_bulk_transfer_out(xhci_controller_t *ctrl, usb_device_t *dev,
+			   const void *buf, uint32_t len, uint32_t *transferred)
+{
+	if (!dev || !dev->bulk_out_ring || !dev->bulk_out_ep)
+		return ST_INVALID;
+
+	xhci_ring_t *ring = dev->bulk_out_ring;
+	uint8_t slot = dev->slot_id;
+	uint8_t dci = dev->bulk_out_ep * 2; // OUT endpoint DCI
+	uint16_t max_pkt = dev->bulk_out_max_pkt ? dev->bulk_out_max_pkt : 512;
+
+	// Pre-calculate physical address BEFORE enqueueing
+	uint64_t buf_phys = mm_get_physical_address((uint64_t)buf);
+
+	int num_trbs = xhci_count_trbs(buf_phys, len);
+	xhci_dbg("Bulk OUT: slot=%d, dci=%d, len=%d, trbs=%d\n", slot, dci, len,
+		 num_trbs);
+
+	xhci_transfer_t xfer = { 0, 0, 0 };
+	ctrl->pending_xfer[slot - 1][dci] = &xfer;
+
+	// Enqueue TRBs with 64KB boundary handling and TD_SIZE
+	xhci_queue_bulk_trbs_ex(ring, buf_phys, len, 0, max_pkt);
+
+	// Ring doorbell
+	xhci_ring_doorbell(ctrl, slot, dci);
+
+	// Wait for completion (ultra-fast polling with 100us delays)
+	for (int i = 0; i < 50000; i++) { // 5 second timeout total
+		xhci_process_events_locked(ctrl);
+
+		if (xfer.completed) {
+			xhci_clear_pending_xfer(ctrl, slot, dci);
+
+			if (transferred) {
+				*transferred = len - xfer.bytes_transferred;
+			}
+
+			if (xfer.cc == TRB_CC_SUCCESS) {
+				dev->err_count_out =
+					0; // Reset error count on success
+				return ST_OK;
+			}
+
+			// Handle transaction errors with retry
+			if (xfer.cc == TRB_CC_USB_XACT &&
+			    dev->err_count_out < MAX_SOFT_RETRY) {
+				dev->err_count_out++;
+				xhci_dbg("Bulk OUT retry %d after CC=%d\n",
+					 dev->err_count_out, xfer.cc);
+
+				// Reset transfer state and retry
+				xfer.completed = 0;
+				xfer.cc = 0;
+				xfer.bytes_transferred = 0;
+				ctrl->pending_xfer[slot - 1][dci] = &xfer;
+
+				// Re-enqueue and ring doorbell
+				xhci_queue_bulk_trbs_ex(ring, buf_phys, len, 0,
+							max_pkt);
+				xhci_ring_doorbell(ctrl, slot, dci);
+				continue;
+			}
+
+			/* Same orphan-TRB hazard as the IN side — see the long
              * comment in xhci_bulk_transfer_in.  Always reset on any
              * non-success return so the controller can no longer
              * fetch the queued TRBs that point at the caller's about-
              * to-be-freed DMA buffer. */
-            xhci_dbg("Resetting OUT endpoint after CC=%d, err_count=%d\n",
-                     xfer.cc, dev->err_count_out);
-            xhci_reset_endpoint(ctrl, slot, dci);
-            dev->err_count_out = 0;
+			xhci_dbg(
+				"Resetting OUT endpoint after CC=%d, err_count=%d\n",
+				xfer.cc, dev->err_count_out);
+			xhci_reset_endpoint(ctrl, slot, dci);
+			dev->err_count_out = 0;
 
-            return ST_IO;
-        }
+			return ST_IO;
+		}
 
-        delay_us(100);  // 100 microsecond delay for ultra-fast response
-    }
+		delay_us(100); // 100 microsecond delay for ultra-fast response
+	}
 
-    /* Timeout — by definition the controller still considers the TD
+	/* Timeout — by definition the controller still considers the TD
      * live, so the queued TRBs that point at the caller's DMA buffer
      * are still in the ring.  Reset the endpoint BEFORE clearing
      * pending_xfer so the caller is safe to free its DMA buffer when
@@ -2787,174 +3080,200 @@ int xhci_bulk_transfer_out(xhci_controller_t* ctrl, usb_device_t* dev,
      * corrupting whatever the heap allocator next put at that
      * physical address (observed as /tmp directory cluster filled
      * with random bytes after a 100 MB curl download). */
-    xhci_reset_endpoint(ctrl, slot, dci);
-    xhci_clear_pending_xfer(ctrl, slot, dci);
-    return ST_TIMEOUT;
+	xhci_reset_endpoint(ctrl, slot, dci);
+	xhci_clear_pending_xfer(ctrl, slot, dci);
+	return ST_TIMEOUT;
 }
 
 //=============================================================================
 // Scatter-Gather Bulk Transfers
 //=============================================================================
 
-int xhci_bulk_transfer_in_sg(xhci_controller_t* ctrl, usb_device_t* dev,
-                             xhci_sg_list_t* sg_list, uint32_t* transferred) {
-    if (!dev || !dev->bulk_in_ring || !dev->bulk_in_ep || !sg_list) return ST_INVALID;
-    
-    xhci_ring_t* ring = dev->bulk_in_ring;
-    uint8_t slot = dev->slot_id;
-    uint8_t dci = dev->bulk_in_ep * 2 + 1;  // IN endpoint DCI
-    uint16_t max_pkt = dev->bulk_in_max_pkt ? dev->bulk_in_max_pkt : 512;
-    uint32_t len = sg_list->total_len;
-    
-    int num_trbs = xhci_sg_count_trbs(sg_list);
-    xhci_dbg("Bulk IN SG: slot=%d, dci=%d, entries=%d, len=%d, trbs=%d\n", 
-             slot, dci, sg_list->num_entries, len, num_trbs);
-    
-    xhci_transfer_t xfer = {0, 0, 0};
-    ctrl->pending_xfer[slot - 1][dci] = &xfer;
-    
-    // Enqueue TRBs for all scatter-gather entries
-    xhci_queue_sg_trbs(ring, sg_list, 1, max_pkt);
-    
-    // Ring doorbell
-    xhci_ring_doorbell(ctrl, slot, dci);
-    
-    // Wait for completion
-    for (int i = 0; i < 50000; i++) {  // 5 second timeout
-        xhci_process_events_locked(ctrl);
-        
-        if (xfer.completed) {
-            xhci_clear_pending_xfer(ctrl, slot, dci);
-            
-            __asm__ volatile("" ::: "memory");  // compiler barrier only (x86 DMA is coherent)
-            
-            if (xfer.cc == TRB_CC_SUCCESS || xfer.cc == TRB_CC_SHORT_PACKET) {
-                if (transferred) {
-                    *transferred = len - xfer.bytes_transferred;
-                }
-                dev->err_count_in = 0;
-                return ST_OK;
-            }
-            
-            // Handle transaction errors with retry
-            if (xfer.cc == TRB_CC_USB_XACT && dev->err_count_in < MAX_SOFT_RETRY) {
-                dev->err_count_in++;
-                xhci_dbg("Bulk IN SG retry %d after CC=%d\n", dev->err_count_in, xfer.cc);
-                
-                xfer.completed = 0;
-                xfer.cc = 0;
-                xfer.bytes_transferred = 0;
-                ctrl->pending_xfer[slot - 1][dci] = &xfer;
-                
-                xhci_queue_sg_trbs(ring, sg_list, 1, max_pkt);
-                xhci_ring_doorbell(ctrl, slot, dci);
-                continue;
-            }
-            
-            // Too many errors or stall - reset endpoint
-            if (xfer.cc == TRB_CC_STALL || dev->err_count_in >= MAX_SOFT_RETRY) {
-                xhci_dbg("Resetting IN endpoint after SG transfer CC=%d\n", xfer.cc);
-                xhci_reset_endpoint(ctrl, slot, dci);
-                dev->err_count_in = 0;
-            }
-            
-            return ST_IO;
-        }
-        
-        delay_us(100);
-    }
-    
-    xhci_clear_pending_xfer(ctrl, slot, dci);
-    return ST_TIMEOUT;
+int xhci_bulk_transfer_in_sg(xhci_controller_t *ctrl, usb_device_t *dev,
+			     xhci_sg_list_t *sg_list, uint32_t *transferred)
+{
+	if (!dev || !dev->bulk_in_ring || !dev->bulk_in_ep || !sg_list)
+		return ST_INVALID;
+
+	xhci_ring_t *ring = dev->bulk_in_ring;
+	uint8_t slot = dev->slot_id;
+	uint8_t dci = dev->bulk_in_ep * 2 + 1; // IN endpoint DCI
+	uint16_t max_pkt = dev->bulk_in_max_pkt ? dev->bulk_in_max_pkt : 512;
+	uint32_t len = sg_list->total_len;
+
+	int num_trbs = xhci_sg_count_trbs(sg_list);
+	xhci_dbg("Bulk IN SG: slot=%d, dci=%d, entries=%d, len=%d, trbs=%d\n",
+		 slot, dci, sg_list->num_entries, len, num_trbs);
+
+	xhci_transfer_t xfer = { 0, 0, 0 };
+	ctrl->pending_xfer[slot - 1][dci] = &xfer;
+
+	// Enqueue TRBs for all scatter-gather entries
+	xhci_queue_sg_trbs(ring, sg_list, 1, max_pkt);
+
+	// Ring doorbell
+	xhci_ring_doorbell(ctrl, slot, dci);
+
+	// Wait for completion
+	for (int i = 0; i < 50000; i++) { // 5 second timeout
+		xhci_process_events_locked(ctrl);
+
+		if (xfer.completed) {
+			xhci_clear_pending_xfer(ctrl, slot, dci);
+
+			__asm__ volatile(
+				"" ::
+					: "memory"); // compiler barrier only (x86 DMA is coherent)
+
+			if (xfer.cc == TRB_CC_SUCCESS ||
+			    xfer.cc == TRB_CC_SHORT_PACKET) {
+				if (transferred) {
+					*transferred =
+						len - xfer.bytes_transferred;
+				}
+				dev->err_count_in = 0;
+				return ST_OK;
+			}
+
+			// Handle transaction errors with retry
+			if (xfer.cc == TRB_CC_USB_XACT &&
+			    dev->err_count_in < MAX_SOFT_RETRY) {
+				dev->err_count_in++;
+				xhci_dbg("Bulk IN SG retry %d after CC=%d\n",
+					 dev->err_count_in, xfer.cc);
+
+				xfer.completed = 0;
+				xfer.cc = 0;
+				xfer.bytes_transferred = 0;
+				ctrl->pending_xfer[slot - 1][dci] = &xfer;
+
+				xhci_queue_sg_trbs(ring, sg_list, 1, max_pkt);
+				xhci_ring_doorbell(ctrl, slot, dci);
+				continue;
+			}
+
+			// Too many errors or stall - reset endpoint
+			if (xfer.cc == TRB_CC_STALL ||
+			    dev->err_count_in >= MAX_SOFT_RETRY) {
+				xhci_dbg(
+					"Resetting IN endpoint after SG transfer CC=%d\n",
+					xfer.cc);
+				xhci_reset_endpoint(ctrl, slot, dci);
+				dev->err_count_in = 0;
+			}
+
+			return ST_IO;
+		}
+
+		delay_us(100);
+	}
+
+	xhci_clear_pending_xfer(ctrl, slot, dci);
+	return ST_TIMEOUT;
 }
 
-int xhci_bulk_transfer_out_sg(xhci_controller_t* ctrl, usb_device_t* dev,
-                              xhci_sg_list_t* sg_list, uint32_t* transferred) {
-    if (!dev || !dev->bulk_out_ring || !dev->bulk_out_ep || !sg_list) return ST_INVALID;
-    
-    xhci_ring_t* ring = dev->bulk_out_ring;
-    uint8_t slot = dev->slot_id;
-    uint8_t dci = dev->bulk_out_ep * 2;  // OUT endpoint DCI
-    uint16_t max_pkt = dev->bulk_out_max_pkt ? dev->bulk_out_max_pkt : 512;
-    uint32_t len = sg_list->total_len;
-    
-    int num_trbs = xhci_sg_count_trbs(sg_list);
-    xhci_dbg("Bulk OUT SG: slot=%d, dci=%d, entries=%d, len=%d, trbs=%d\n", 
-             slot, dci, sg_list->num_entries, len, num_trbs);
-    
-    xhci_transfer_t xfer = {0, 0, 0};
-    ctrl->pending_xfer[slot - 1][dci] = &xfer;
-    
-    // Enqueue TRBs for all scatter-gather entries
-    xhci_queue_sg_trbs(ring, sg_list, 0, max_pkt);
-    
-    // Ring doorbell
-    xhci_ring_doorbell(ctrl, slot, dci);
-    
-    // Wait for completion
-    for (int i = 0; i < 50000; i++) {  // 5 second timeout
-        xhci_process_events_locked(ctrl);
-        
-        if (xfer.completed) {
-            xhci_clear_pending_xfer(ctrl, slot, dci);
-            
-            if (transferred) {
-                *transferred = len - xfer.bytes_transferred;
-            }
-            
-            if (xfer.cc == TRB_CC_SUCCESS) {
-                dev->err_count_out = 0;
-                return ST_OK;
-            }
-            
-            // Handle transaction errors with retry
-            if (xfer.cc == TRB_CC_USB_XACT && dev->err_count_out < MAX_SOFT_RETRY) {
-                dev->err_count_out++;
-                xhci_dbg("Bulk OUT SG retry %d after CC=%d\n", dev->err_count_out, xfer.cc);
-                
-                xfer.completed = 0;
-                xfer.cc = 0;
-                xfer.bytes_transferred = 0;
-                ctrl->pending_xfer[slot - 1][dci] = &xfer;
-                
-                xhci_queue_sg_trbs(ring, sg_list, 0, max_pkt);
-                xhci_ring_doorbell(ctrl, slot, dci);
-                continue;
-            }
-            
-            // Too many errors or stall - reset endpoint
-            if (xfer.cc == TRB_CC_STALL || dev->err_count_out >= MAX_SOFT_RETRY) {
-                xhci_dbg("Resetting OUT endpoint after SG transfer CC=%d\n", xfer.cc);
-                xhci_reset_endpoint(ctrl, slot, dci);
-                dev->err_count_out = 0;
-            }
-            
-            return ST_IO;
-        }
-        
-        delay_us(100);
-    }
-    
-    xhci_clear_pending_xfer(ctrl, slot, dci);
-    return ST_TIMEOUT;
+int xhci_bulk_transfer_out_sg(xhci_controller_t *ctrl, usb_device_t *dev,
+			      xhci_sg_list_t *sg_list, uint32_t *transferred)
+{
+	if (!dev || !dev->bulk_out_ring || !dev->bulk_out_ep || !sg_list)
+		return ST_INVALID;
+
+	xhci_ring_t *ring = dev->bulk_out_ring;
+	uint8_t slot = dev->slot_id;
+	uint8_t dci = dev->bulk_out_ep * 2; // OUT endpoint DCI
+	uint16_t max_pkt = dev->bulk_out_max_pkt ? dev->bulk_out_max_pkt : 512;
+	uint32_t len = sg_list->total_len;
+
+	int num_trbs = xhci_sg_count_trbs(sg_list);
+	xhci_dbg("Bulk OUT SG: slot=%d, dci=%d, entries=%d, len=%d, trbs=%d\n",
+		 slot, dci, sg_list->num_entries, len, num_trbs);
+
+	xhci_transfer_t xfer = { 0, 0, 0 };
+	ctrl->pending_xfer[slot - 1][dci] = &xfer;
+
+	// Enqueue TRBs for all scatter-gather entries
+	xhci_queue_sg_trbs(ring, sg_list, 0, max_pkt);
+
+	// Ring doorbell
+	xhci_ring_doorbell(ctrl, slot, dci);
+
+	// Wait for completion
+	for (int i = 0; i < 50000; i++) { // 5 second timeout
+		xhci_process_events_locked(ctrl);
+
+		if (xfer.completed) {
+			xhci_clear_pending_xfer(ctrl, slot, dci);
+
+			if (transferred) {
+				*transferred = len - xfer.bytes_transferred;
+			}
+
+			if (xfer.cc == TRB_CC_SUCCESS) {
+				dev->err_count_out = 0;
+				return ST_OK;
+			}
+
+			// Handle transaction errors with retry
+			if (xfer.cc == TRB_CC_USB_XACT &&
+			    dev->err_count_out < MAX_SOFT_RETRY) {
+				dev->err_count_out++;
+				xhci_dbg("Bulk OUT SG retry %d after CC=%d\n",
+					 dev->err_count_out, xfer.cc);
+
+				xfer.completed = 0;
+				xfer.cc = 0;
+				xfer.bytes_transferred = 0;
+				ctrl->pending_xfer[slot - 1][dci] = &xfer;
+
+				xhci_queue_sg_trbs(ring, sg_list, 0, max_pkt);
+				xhci_ring_doorbell(ctrl, slot, dci);
+				continue;
+			}
+
+			// Too many errors or stall - reset endpoint
+			if (xfer.cc == TRB_CC_STALL ||
+			    dev->err_count_out >= MAX_SOFT_RETRY) {
+				xhci_dbg(
+					"Resetting OUT endpoint after SG transfer CC=%d\n",
+					xfer.cc);
+				xhci_reset_endpoint(ctrl, slot, dci);
+				dev->err_count_out = 0;
+			}
+
+			return ST_IO;
+		}
+
+		delay_us(100);
+	}
+
+	xhci_clear_pending_xfer(ctrl, slot, dci);
+	return ST_TIMEOUT;
 }
 
-void xhci_shutdown(xhci_controller_t* ctrl) {
-    if (!ctrl) return;
-    
-    xhci_stop(ctrl);
-    
-    // Free rings
-    if (ctrl->cmd_ring) xhci_free_ring(ctrl->cmd_ring);
-    if (ctrl->event_ring) xhci_free_ring(ctrl->event_ring);
-    
-    // Free device resources
-    for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
-        if (ctrl->dev_ctx[i]) kfree_dma(ctrl->dev_ctx[i]);
-        if (ctrl->devices[i].ep0_ring) xhci_free_ring(ctrl->devices[i].ep0_ring);
-        if (ctrl->devices[i].bulk_in_ring) xhci_free_ring(ctrl->devices[i].bulk_in_ring);
-        if (ctrl->devices[i].bulk_out_ring) xhci_free_ring(ctrl->devices[i].bulk_out_ring);
-    }
-    
-    ctrl->initialized = 0;
+void xhci_shutdown(xhci_controller_t *ctrl)
+{
+	if (!ctrl)
+		return;
+
+	xhci_stop(ctrl);
+
+	// Free rings
+	if (ctrl->cmd_ring)
+		xhci_free_ring(ctrl->cmd_ring);
+	if (ctrl->event_ring)
+		xhci_free_ring(ctrl->event_ring);
+
+	// Free device resources
+	for (int i = 0; i < XHCI_MAX_SLOTS; i++) {
+		if (ctrl->dev_ctx[i])
+			kfree_dma(ctrl->dev_ctx[i]);
+		if (ctrl->devices[i].ep0_ring)
+			xhci_free_ring(ctrl->devices[i].ep0_ring);
+		if (ctrl->devices[i].bulk_in_ring)
+			xhci_free_ring(ctrl->devices[i].bulk_in_ring);
+		if (ctrl->devices[i].bulk_out_ring)
+			xhci_free_ring(ctrl->devices[i].bulk_out_ring);
+	}
+
+	ctrl->initialized = 0;
 }

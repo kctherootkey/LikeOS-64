@@ -24,7 +24,7 @@ typedef int bool;
 
 // Common NULL definition
 #ifndef NULL
-#define NULL ((void*)0)
+#define NULL ((void *)0)
 #endif
 
 // Disable stack-protector instrumentation on a function.

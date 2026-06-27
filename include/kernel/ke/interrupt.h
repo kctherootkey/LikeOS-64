@@ -7,86 +7,93 @@
 #include <kernel/io/console.h>
 
 // I/O port functions
-static inline void outb(uint16_t port, uint8_t val) {
-    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
+static inline void outb(uint16_t port, uint8_t val)
+{
+	__asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 
-static inline uint8_t inb(uint16_t port) {
-    uint8_t ret;
-    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
+static inline uint8_t inb(uint16_t port)
+{
+	uint8_t ret;
+	__asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
+	return ret;
 }
 
-static inline void outw(uint16_t port, uint16_t val) {
-    __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
+static inline void outw(uint16_t port, uint16_t val)
+{
+	__asm__ volatile("outw %0, %1" : : "a"(val), "Nd"(port));
 }
 
-static inline uint16_t inw(uint16_t port) {
-    uint16_t ret;
-    __asm__ volatile ("inw %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
+static inline uint16_t inw(uint16_t port)
+{
+	uint16_t ret;
+	__asm__ volatile("inw %1, %0" : "=a"(ret) : "Nd"(port));
+	return ret;
 }
 
-static inline void outl(uint16_t port, uint32_t val) {
-    __asm__ volatile ("outl %0, %1" : : "a"(val), "Nd"(port));
+static inline void outl(uint16_t port, uint32_t val)
+{
+	__asm__ volatile("outl %0, %1" : : "a"(val), "Nd"(port));
 }
 
-static inline uint32_t inl(uint16_t port) {
-    uint32_t ret;
-    __asm__ volatile ("inl %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
+static inline uint32_t inl(uint16_t port)
+{
+	uint32_t ret;
+	__asm__ volatile("inl %1, %0" : "=a"(ret) : "Nd"(port));
+	return ret;
 }
 
-static inline void io_wait(void) {
-    outb(0x80, 0);
+static inline void io_wait(void)
+{
+	outb(0x80, 0);
 }
 
 // IDT entry structure for 64-bit long mode
 struct idt_entry {
-    uint16_t offset_low;    // Lower 16 bits of handler address
-    uint16_t selector;      // Code segment selector
-    uint8_t ist;           // Interrupt Stack Table offset (0 for now)
-    uint8_t type_attr;     // Type and attributes
-    uint16_t offset_mid;   // Middle 16 bits of handler address
-    uint32_t offset_high;  // Upper 32 bits of handler address
-    uint32_t zero;         // Reserved, must be zero
+	uint16_t offset_low; // Lower 16 bits of handler address
+	uint16_t selector; // Code segment selector
+	uint8_t ist; // Interrupt Stack Table offset (0 for now)
+	uint8_t type_attr; // Type and attributes
+	uint16_t offset_mid; // Middle 16 bits of handler address
+	uint32_t offset_high; // Upper 32 bits of handler address
+	uint32_t zero; // Reserved, must be zero
 } __attribute__((packed));
 
 // IDT descriptor
 struct idt_descriptor {
-    uint16_t limit;
-    uint64_t base;
+	uint16_t limit;
+	uint64_t base;
 } __attribute__((packed));
 
 // TSS structure for 64-bit mode
 struct tss_entry {
-    uint32_t reserved1;
-    uint64_t rsp0;          // Stack pointer for privilege level 0
-    uint64_t rsp1;          // Stack pointer for privilege level 1
-    uint64_t rsp2;          // Stack pointer for privilege level 2
-    uint64_t reserved2;
-    uint64_t ist1;          // Interrupt Stack Table entries
-    uint64_t ist2;
-    uint64_t ist3;
-    uint64_t ist4;
-    uint64_t ist5;
-    uint64_t ist6;
-    uint64_t ist7;
-    uint64_t reserved3;
-    uint16_t reserved4;
-    uint16_t iopb_offset;   // I/O Permission Bitmap offset
+	uint32_t reserved1;
+	uint64_t rsp0; // Stack pointer for privilege level 0
+	uint64_t rsp1; // Stack pointer for privilege level 1
+	uint64_t rsp2; // Stack pointer for privilege level 2
+	uint64_t reserved2;
+	uint64_t ist1; // Interrupt Stack Table entries
+	uint64_t ist2;
+	uint64_t ist3;
+	uint64_t ist4;
+	uint64_t ist5;
+	uint64_t ist6;
+	uint64_t ist7;
+	uint64_t reserved3;
+	uint16_t reserved4;
+	uint16_t iopb_offset; // I/O Permission Bitmap offset
 } __attribute__((packed));
 
 // GDT entry structure for TSS
 struct gdt_tss_entry {
-    uint16_t limit_low;
-    uint16_t base_low;
-    uint8_t base_mid;
-    uint8_t access;
-    uint8_t granularity;
-    uint8_t base_high;
-    uint32_t base_upper;
-    uint32_t reserved;
+	uint16_t limit_low;
+	uint16_t base_low;
+	uint8_t base_mid;
+	uint8_t access;
+	uint8_t granularity;
+	uint8_t base_high;
+	uint32_t base_upper;
+	uint32_t reserved;
 } __attribute__((packed));
 
 // IDT constants
@@ -95,14 +102,14 @@ struct gdt_tss_entry {
 #define IDT_TYPE_TRAP_GATE 0x8F
 
 // IRQ constants
-#define IRQ_BASE 32  // IRQs mapped to interrupts 32-47
+#define IRQ_BASE 32 // IRQs mapped to interrupts 32-47
 #define IRQ_KEYBOARD 1
 #define IRQ_TIMER 0
 
 // PIC ports
-#define PIC1_CMD  0x20
+#define PIC1_CMD 0x20
 #define PIC1_DATA 0x21
-#define PIC2_CMD  0xA0
+#define PIC2_CMD 0xA0
 #define PIC2_DATA 0xA1
 
 // PIC commands
@@ -122,8 +129,8 @@ void gdt_install_tss(void);
 // Exception handlers
 void exception_handler(uint64_t *regs);
 void kernel_oops(const char *reason, uint64_t *regs);
-__attribute__((noreturn, format(printf, 1, 2)))
-void panic(const char *fmt, ...);
+__attribute__((noreturn, format(printf, 1, 2))) void panic(const char *fmt,
+							   ...);
 
 // IRQ handlers
 void irq_handler(uint64_t *regs);
@@ -172,12 +179,12 @@ uint64_t tss_get_kernel_stack(void);
 void tss_init_ap(uint32_t cpu_id);
 
 // Get IDT and GDT descriptors for AP initialization
-void* interrupts_get_idt_descriptor(void);
-void* gdt_get_descriptor(void);
+void *interrupts_get_idt_descriptor(void);
+void *gdt_get_descriptor(void);
 
 // IRQ stubs
-extern void irq32(void);  // Timer
-extern void irq33(void);  // Keyboard
+extern void irq32(void); // Timer
+extern void irq33(void); // Keyboard
 extern void irq34(void);
 extern void irq35(void);
 extern void irq36(void);
@@ -192,24 +199,24 @@ extern void irq44(void);
 extern void irq45(void);
 extern void irq46(void);
 extern void irq47(void);
-extern void irq16(void);  // MSI: xHCI USB controller 0 (vector 48)
-extern void irq17(void);  // MSI: xHCI USB controller 1 (vector 49)
-extern void irq27(void);  // MSI: E1000 NIC (vector 59)
-extern void irq28(void);  // MSI: e1000e NIC (vector 60)
-extern void irq29(void);  // MSI: vmxnet3 NIC (vector 61)
+extern void irq16(void); // MSI: xHCI USB controller 0 (vector 48)
+extern void irq17(void); // MSI: xHCI USB controller 1 (vector 49)
+extern void irq27(void); // MSI: E1000 NIC (vector 59)
+extern void irq28(void); // MSI: e1000e NIC (vector 60)
+extern void irq29(void); // MSI: vmxnet3 NIC (vector 61)
 
 // MSI vector assignment
-#define XHCI_MSI_VECTOR    48   // IDT vector for xHCI USB controller 0
-#define XHCI_MSI_VECTOR_2  49   // IDT vector for xHCI USB controller 1
-#define E1000_MSI_VECTOR   59   // IDT vector for E1000 NIC
-#define E1000E_MSI_VECTOR  60   // IDT vector for e1000e (82574L/82583V) NIC
-#define VMXNET3_MSI_VECTOR 61   // IDT vector for vmxnet3 paravirt NIC
+#define XHCI_MSI_VECTOR 48 // IDT vector for xHCI USB controller 0
+#define XHCI_MSI_VECTOR_2 49 // IDT vector for xHCI USB controller 1
+#define E1000_MSI_VECTOR 59 // IDT vector for E1000 NIC
+#define E1000E_MSI_VECTOR 60 // IDT vector for e1000e (82574L/82583V) NIC
+#define VMXNET3_MSI_VECTOR 61 // IDT vector for vmxnet3 paravirt NIC
 
 // IPI stubs (SMP inter-processor interrupts)
-extern void ipi_vector_0xFC(void);  // TLB shootdown
-extern void ipi_vector_0xFD(void);  // Halt CPU
-extern void ipi_vector_0xFE(void);  // Reschedule
-extern void ipi_vector_0xFF(void);  // LAPIC spurious
+extern void ipi_vector_0xFC(void); // TLB shootdown
+extern void ipi_vector_0xFD(void); // Halt CPU
+extern void ipi_vector_0xFE(void); // Reschedule
+extern void ipi_vector_0xFF(void); // LAPIC spurious
 
 // IPI handler (called from assembly)
 void ipi_handler(uint64_t *regs);

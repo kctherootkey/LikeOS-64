@@ -6,118 +6,130 @@
 
 // GDT structure
 struct gdt_entry {
-    uint16_t limit_low;
-    uint16_t base_low;
-    uint8_t base_middle;
-    uint8_t access;
-    uint8_t granularity;
-    uint8_t base_high;
+	uint16_t limit_low;
+	uint16_t base_low;
+	uint8_t base_middle;
+	uint8_t access;
+	uint8_t granularity;
+	uint8_t base_high;
 } __attribute__((packed));
 
 struct gdt_ptr {
-    uint16_t limit;
-    uint64_t base;
+	uint16_t limit;
+	uint64_t base;
 } __attribute__((packed));
 
 // GDT with TSS entry (need extra space for 128-bit TSS descriptor)
-static struct gdt_entry gdt[8];  // Increased to accommodate 128-bit TSS
+static struct gdt_entry gdt[8]; // Increased to accommodate 128-bit TSS
 static struct gdt_ptr gdt_pointer;
 
 // External function to load GDT
 extern void gdt_flush(uint64_t);
 
 // Set GDT entry
-static void gdt_set_gate(int num, uint64_t base, uint64_t limit, uint8_t access, uint8_t gran) {
-    BUG_ON(num < 0 || num >= 8);  /* GDT index out of range */
-    gdt[num].base_low = (base & 0xFFFF);
-    gdt[num].base_middle = (base >> 16) & 0xFF;
-    gdt[num].base_high = (base >> 24) & 0xFF;
-    
-    gdt[num].limit_low = (limit & 0xFFFF);
-    gdt[num].granularity = (limit >> 16) & 0x0F;
-    gdt[num].granularity |= gran & 0xF0;
-    gdt[num].access = access;
+static void gdt_set_gate(int num, uint64_t base, uint64_t limit, uint8_t access,
+			 uint8_t gran)
+{
+	BUG_ON(num < 0 || num >= 8); /* GDT index out of range */
+	gdt[num].base_low = (base & 0xFFFF);
+	gdt[num].base_middle = (base >> 16) & 0xFF;
+	gdt[num].base_high = (base >> 24) & 0xFF;
+
+	gdt[num].limit_low = (limit & 0xFFFF);
+	gdt[num].granularity = (limit >> 16) & 0x0F;
+	gdt[num].granularity |= gran & 0xF0;
+	gdt[num].access = access;
 }
 
 // Set TSS entry (128-bit entry for 64-bit mode)
-static void gdt_set_tss(int num, uint64_t base, uint64_t limit) {
-    BUG_ON(num < 0 || num >= 7);  /* TSS occupies two entries; must not overflow table */
-    WARN_ON(base == 0);  /* TSS base address is NULL */
-    WARN_ON(limit == 0 || limit > 0xFFFF);  /* TSS limit out of expected range */
-    // TSS descriptor is 16 bytes (128 bits) in 64-bit mode
-    // We need to set up two consecutive GDT entries
-    
-    // First 8 bytes (standard descriptor format)
-    gdt[num].limit_low = limit & 0xFFFF;
-    gdt[num].base_low = base & 0xFFFF;
-    gdt[num].base_middle = (base >> 16) & 0xFF;
-    gdt[num].access = 0x89;  // Present, Ring 0, TSS Available
-    gdt[num].granularity = (limit >> 16) & 0x0F;
-    gdt[num].base_high = (base >> 24) & 0xFF;
-    
-    // Second 8 bytes (upper 32 bits of base address)
-    gdt[num + 1].limit_low = (base >> 32) & 0xFFFF;
-    gdt[num + 1].base_low = (base >> 48) & 0xFFFF;
-    gdt[num + 1].base_middle = 0;
-    gdt[num + 1].access = 0;
-    gdt[num + 1].granularity = 0;
-    gdt[num + 1].base_high = 0;
+static void gdt_set_tss(int num, uint64_t base, uint64_t limit)
+{
+	BUG_ON(num < 0 ||
+	       num >= 7); /* TSS occupies two entries; must not overflow table */
+	WARN_ON(base == 0); /* TSS base address is NULL */
+	WARN_ON(limit == 0 ||
+		limit > 0xFFFF); /* TSS limit out of expected range */
+	// TSS descriptor is 16 bytes (128 bits) in 64-bit mode
+	// We need to set up two consecutive GDT entries
+
+	// First 8 bytes (standard descriptor format)
+	gdt[num].limit_low = limit & 0xFFFF;
+	gdt[num].base_low = base & 0xFFFF;
+	gdt[num].base_middle = (base >> 16) & 0xFF;
+	gdt[num].access = 0x89; // Present, Ring 0, TSS Available
+	gdt[num].granularity = (limit >> 16) & 0x0F;
+	gdt[num].base_high = (base >> 24) & 0xFF;
+
+	// Second 8 bytes (upper 32 bits of base address)
+	gdt[num + 1].limit_low = (base >> 32) & 0xFFFF;
+	gdt[num + 1].base_low = (base >> 48) & 0xFFFF;
+	gdt[num + 1].base_middle = 0;
+	gdt[num + 1].access = 0;
+	gdt[num + 1].granularity = 0;
+	gdt[num + 1].base_high = 0;
 }
 
 // Initialize GDT with basic segments and TSS
-void gdt_init() {
-    BUILD_BUG_ON(sizeof(struct gdt_entry) != 8);
-    /* SYSRET requires: user_data at selector 0x18, user_code at 0x20 */
-    BUILD_BUG_ON(3 * 8 != 0x18);  /* user data selector must be 0x18 */
-    BUILD_BUG_ON(4 * 8 != 0x20);  /* user code selector must be 0x20 */
-    gdt_pointer.limit = (sizeof(struct gdt_entry) * 8) - 1;  // Updated for 8 entries
-    gdt_pointer.base = (uint64_t)&gdt;
-    
-    // Null descriptor
-    gdt_set_gate(0, 0, 0, 0, 0);
-    
-    // Kernel code segment (selector 0x08)
-    gdt_set_gate(1, 0, 0xFFFFF, 0x9A, 0xAF);  // AF = Long mode, 4KB granularity
-    
-    // Kernel data segment (selector 0x10)
-    gdt_set_gate(2, 0, 0xFFFFF, 0x93, 0xCF);  // 0x93 = Present, Ring 0, RW Data
-    
-    // User data segment (selector 0x18) - MUST come before user code for SYSRET!
-    // SYSRET: SS = STAR[63:48] + 8 | 3 = 0x10 + 8 | 3 = 0x1B
-    gdt_set_gate(3, 0, 0xFFFFF, 0xF3, 0xCF);  // 0xF3 = Present, Ring 3, RW Data
-    
-    // User code segment (selector 0x20) - 64-bit
-    // SYSRET: CS = STAR[63:48] + 16 | 3 = 0x10 + 16 | 3 = 0x23
-    gdt_set_gate(4, 0, 0xFFFFF, 0xFA, 0xAF);
-    
-    // TSS entry - entries 5 and 6 (128-bit TSS descriptor)
-    gdt_set_gate(5, 0, 0, 0, 0);  // Will be set up later
-    gdt_set_gate(6, 0, 0, 0, 0);  // Second half of TSS descriptor
-    
-    // Reserve entry 7
-    gdt_set_gate(7, 0, 0, 0, 0);
-    
-    // Load the GDT
-    gdt_flush((uint64_t)&gdt_pointer);
-    
-    kprintf("GDT initialized\n");
+void gdt_init()
+{
+	BUILD_BUG_ON(sizeof(struct gdt_entry) != 8);
+	/* SYSRET requires: user_data at selector 0x18, user_code at 0x20 */
+	BUILD_BUG_ON(3 * 8 != 0x18); /* user data selector must be 0x18 */
+	BUILD_BUG_ON(4 * 8 != 0x20); /* user code selector must be 0x20 */
+	gdt_pointer.limit =
+		(sizeof(struct gdt_entry) * 8) - 1; // Updated for 8 entries
+	gdt_pointer.base = (uint64_t)&gdt;
+
+	// Null descriptor
+	gdt_set_gate(0, 0, 0, 0, 0);
+
+	// Kernel code segment (selector 0x08)
+	gdt_set_gate(1, 0, 0xFFFFF, 0x9A,
+		     0xAF); // AF = Long mode, 4KB granularity
+
+	// Kernel data segment (selector 0x10)
+	gdt_set_gate(2, 0, 0xFFFFF, 0x93,
+		     0xCF); // 0x93 = Present, Ring 0, RW Data
+
+	// User data segment (selector 0x18) - MUST come before user code for SYSRET!
+	// SYSRET: SS = STAR[63:48] + 8 | 3 = 0x10 + 8 | 3 = 0x1B
+	gdt_set_gate(3, 0, 0xFFFFF, 0xF3,
+		     0xCF); // 0xF3 = Present, Ring 3, RW Data
+
+	// User code segment (selector 0x20) - 64-bit
+	// SYSRET: CS = STAR[63:48] + 16 | 3 = 0x10 + 16 | 3 = 0x23
+	gdt_set_gate(4, 0, 0xFFFFF, 0xFA, 0xAF);
+
+	// TSS entry - entries 5 and 6 (128-bit TSS descriptor)
+	gdt_set_gate(5, 0, 0, 0, 0); // Will be set up later
+	gdt_set_gate(6, 0, 0, 0, 0); // Second half of TSS descriptor
+
+	// Reserve entry 7
+	gdt_set_gate(7, 0, 0, 0, 0);
+
+	// Load the GDT
+	gdt_flush((uint64_t)&gdt_pointer);
+
+	kprintf("GDT initialized\n");
 }
 
 // Install TSS in the GDT
-void gdt_install_tss_real(uint64_t tss_base, uint64_t tss_size) {
-    // Set up TSS entry in GDT
-    gdt_set_tss(5, tss_base, tss_size);
+void gdt_install_tss_real(uint64_t tss_base, uint64_t tss_size)
+{
+	// Set up TSS entry in GDT
+	gdt_set_tss(5, tss_base, tss_size);
 
-    // Reload GDT with TSS
-    gdt_flush((uint64_t)&gdt_pointer);
+	// Reload GDT with TSS
+	gdt_flush((uint64_t)&gdt_pointer);
 
-    // Load TSS register
-    __asm__ volatile ("ltr %0" : : "r" ((uint16_t)0x28)); // 5 * 8 = 0x28
+	// Load TSS register
+	__asm__ volatile("ltr %0" : : "r"((uint16_t)0x28)); // 5 * 8 = 0x28
 
-    kprintf("TSS installed in GDT\n");
+	kprintf("TSS installed in GDT\n");
 }
 
 // Get GDT pointer for AP initialization
-void* gdt_get_descriptor(void) {
-    return &gdt_pointer;
+void *gdt_get_descriptor(void)
+{
+	return &gdt_pointer;
 }

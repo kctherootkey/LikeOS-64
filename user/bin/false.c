@@ -10,24 +10,24 @@
 #include <string.h>
 
 #define PROGRAM_NAME "false"
-#define VERSION      "1.0"
+#define VERSION "1.0"
 
 int main(int argc, char *argv[])
 {
-    if (argc == 2) {
-        if (strcmp(argv[1], "--help") == 0) {
-            printf("Usage: false [ignored command line arguments]\n");
-            printf("  or:  false OPTION\n\n");
-            printf("Exit with a status code indicating failure.\n\n");
-            printf("      --help     display this help and exit\n");
-            printf("      --version  output version information and exit\n");
-            return 1;   /* false always returns failure */
-        }
-        if (strcmp(argv[1], "--version") == 0) {
-            printf("%s (LikeOS) %s\n", PROGRAM_NAME, VERSION);
-            return 1;   /* false always returns failure */
-        }
-    }
+	if (argc == 2) {
+		if (strcmp(argv[1], "--help") == 0) {
+			printf("Usage: false [ignored command line arguments]\n");
+			printf("  or:  false OPTION\n\n");
+			printf("Exit with a status code indicating failure.\n\n");
+			printf("      --help     display this help and exit\n");
+			printf("      --version  output version information and exit\n");
+			return 1; /* false always returns failure */
+		}
+		if (strcmp(argv[1], "--version") == 0) {
+			printf("%s (LikeOS) %s\n", PROGRAM_NAME, VERSION);
+			return 1; /* false always returns failure */
+		}
+	}
 
-    return 1;
+	return 1;
 }
