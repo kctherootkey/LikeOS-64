@@ -276,12 +276,19 @@ int usb_msd_read_capacity(usb_msd_device_t* msd, uint32_t* block_count, uint32_t
     return st;
 }
 
+/* Max blocks per SCSI READ(10)/WRITE(10).  Raised from 128 (64KiB) so the
+ * filesystem can issue MiB-sized transfers and amortise the per-command
+ * (CBW/data/CSW) latency.  2048 blocks = 1 MiB; the xHCI bulk path chains the
+ * needed TRBs (TRB_MAX_BUFF_SIZE=64KiB each, ring = 256 TRBs) and SCSI(10)
+ * encodes the count in 16 bits, so this is well within both limits. */
+#define USB_MSD_MAX_BLOCKS 2048
+
 int usb_msd_read(usb_msd_device_t* msd, uint32_t lba, uint32_t count, void* buf) {
     BUG_ON(buf == NULL);
     usb_msd_cbw_t cbw;
     usb_msd_csw_t csw;
     
-    if (count == 0 || count > 128) {
+    if (count == 0 || count > USB_MSD_MAX_BLOCKS) {
         msd_dbg("Invalid read count: %u\n", count);
         return ST_INVALID;
     }
@@ -314,7 +321,7 @@ int usb_msd_write(usb_msd_device_t* msd, uint32_t lba, uint32_t count, const voi
     usb_msd_cbw_t cbw;
     usb_msd_csw_t csw;
     
-    if (count == 0 || count > 128) {
+    if (count == 0 || count > USB_MSD_MAX_BLOCKS) {
         return ST_INVALID;
     }
     

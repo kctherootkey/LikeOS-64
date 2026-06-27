@@ -27,7 +27,11 @@
 #include <kernel/fs/vfs_sb.h>
 #include <kernel/uapi/bug.h>
 
-#define EXT4_MAX_SECTORS_PER_READ 128
+/* Max sectors per device transfer (== USB_MSD_MAX_BLOCKS in usb_msd.c).  Also the
+ * size of the write-back coalescing buffer (s_wbounce).  2048 sectors = 1 MiB:
+ * large transfers amortise the USB per-command latency (the throughput limiter),
+ * and the xHCI ring (256 TRBs) chains the needed 16 TRBs comfortably. */
+#define EXT4_MAX_SECTORS_PER_READ 2048
 
 /* On-disk layout is load-bearing: verify sizes/offsets at compile time. */
 _Static_assert(sizeof(ext4_super_block) == 1024, "ext4_super_block must be 1024 bytes");
@@ -328,6 +332,7 @@ static inline int ext4_txn_active(void) { return s_txn.active; }
 static int  ext4_write_block_direct(ext4_fs_t *fs, unsigned long pbn, const void *buf);
 static void ext4_txn_flush(ext4_fs_t *fs);   /* defined with the journal code */
 static void ext4_journal_clean(ext4_fs_t *fs);/* mark journal empty on sync     */
+static int  ext4_wb_flush(ext4_fs_t *fs);    /* flush the data write-back buffer */
 /* P6 enforcement: record a metadata-corruption error + apply the errors=
  * policy (remount-ro latch / panic / continue).  Defined after ext4_write_super. */
 static void ext4_fs_error(ext4_fs_t *fs, const char *what, unsigned long ino);
@@ -1344,6 +1349,10 @@ static long ext4_read_impl(vfs_file_t *f, void *buf, long bytes)
     if ((unsigned long)bytes > ef->size - ef->pos)
         bytes = (long)(ef->size - ef->pos);
 
+    /* Read-your-writes: any file data still in the write-back buffer must reach
+     * disk first — the read path below goes to the device, not the buffer. */
+    if (ef->fs) ext4_wb_flush(ef->fs);
+
     unsigned long remaining = (unsigned long)bytes;
     unsigned long copied = 0;
     unsigned long chain_id = EXT4_BID_ENC(ef->ino, 0);
@@ -1666,6 +1675,41 @@ static unsigned long s_wbounce_bytes;
  * one shared buffer is safe. */
 static uint8_t      *s_gd_buf;
 
+/* ---- Write-back batching of file data ------------------------------------
+ * File-data writes are accumulated into the large physically-contiguous buffer
+ * s_wbounce and flushed to disk as ONE big device transfer (ext4_wb_flush),
+ * coalescing many small write()s into a few large USB commands — the USB
+ * per-command latency, not bandwidth, is the throughput limiter, so fewer/larger
+ * commands is the whole win.  The buffer holds a single contiguous physical run
+ * [s_wb_pbn, s_wb_pbn+s_wb_len) of inode s_wb_ino.
+ *
+ * data=ordered is preserved: the buffer is flushed (and made durable) BEFORE the
+ * journal commits the metadata that references those blocks (ext4_journal_flush),
+ * and before any read of them (ext4_read_impl) or free of them (free run).  All
+ * accesses are under the I/O mutex, so no extra locking is needed.  Used only when
+ * journalling is on; with no journal, data is written directly as before. */
+static unsigned long s_wb_pbn;          /* physical start block of the buffered run */
+static unsigned      s_wb_len;          /* blocks currently buffered (0 = empty)    */
+static unsigned long s_wb_ino;          /* inode the buffered data belongs to       */
+static int           s_wb_err;          /* deferred flush error, surfaced at fsync  */
+
+/* Flush the write-back buffer to its physical home (no device sync here — the
+ * caller adds one where ordering requires it).  Returns ST_OK if nothing pending
+ * or the write succeeded. */
+static int ext4_wb_flush(ext4_fs_t *fs)
+{
+    if (!fs || s_wb_len == 0)
+        return ST_OK;
+    unsigned      len = s_wb_len;
+    unsigned long pbn = s_wb_pbn;
+    s_wb_len = 0;                        /* reset before I/O (non-reentrant under the lock) */
+    int st = ext4_write_sectors(fs->bdev,
+                fs->part_lba_offset + pbn * fs->sectors_per_block,
+                (unsigned long)len * fs->sectors_per_block, s_wbounce);
+    if (st != ST_OK) { s_wb_err = st; WARN_ON_ONCE(1); }
+    return st;
+}
+
 static void ext4_gd_dirty(ext4_fs_t *fs, unsigned g)
 {
     fs->meta_dirty = 1;
@@ -1919,6 +1963,10 @@ static void ext4_free_inode(ext4_fs_t *fs, unsigned long ino, int is_dir)
  * file is 25600 single-bit RMWs, a multi-second stall that looks like a hang. */
 static void ext4_free_blocks_run(ext4_fs_t *fs, unsigned long start, unsigned long len)
 {
+    /* If the run being freed overlaps the write-back buffer, flush it first so the
+     * buffer never holds data for now-free (and possibly soon-reallocated) blocks. */
+    if (s_wb_len > 0 && start < s_wb_pbn + s_wb_len && s_wb_pbn < start + len)
+        ext4_wb_flush(fs);
     uint8_t *bm = 0;
     while (len > 0) {
         if (start < fs->first_data_block) { start++; len--; continue; }
@@ -3745,25 +3793,18 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
     s_ic_ino = 0;
     ext4_write_inode_struct(fs, ef->ino, &in);
 
-    /* Write the data.  Full blocks with contiguous physical numbers are coalesced
-     * into one large device write through a physically-contiguous bounce buffer
-     * (the user buffer is generally not physically contiguous, so it can't be DMA'd
-     * directly) — turning N tiny per-block writes into a few DMA-sized transfers,
-     * which is most of the sequential-write throughput.  Partial edge blocks fall
-     * back to a read-modify-write of a single block.  Data blocks use raw sector
-     * I/O and must NOT go through the metadata block cache. */
-    /* Reuse the persistent coalescing buffer (allocated once at mount); only fall
-     * back to a per-call single-block buffer if it is somehow unavailable.  This
-     * avoids a 64KB contiguous allocation on every write() (slow, and prone to
-     * failing under fragmentation — which would silently drop back to slow
-     * one-block writes). */
-    unsigned long bounce_bytes;
-    uint8_t *blk, *blk_owned = 0;
-    if (s_wbounce) { blk = s_wbounce; bounce_bytes = s_wbounce_bytes; }
-    else { blk_owned = (uint8_t *)kalloc(fs->block_size); blk = blk_owned; bounce_bytes = fs->block_size; }
-    if (!blk) return ST_NOMEM;
-    unsigned max_run = bounce_bytes / fs->block_size;
-    if (max_run < 1) max_run = 1;
+    /* Write the data.  When journalling is on, full blocks are accumulated into
+     * the persistent write-back buffer (s_wbounce) and flushed to disk as ONE big
+     * device transfer (ext4_wb_flush) — coalescing many small write()s into a few
+     * large USB commands, which is most of the sequential-write throughput.  The
+     * buffer OUTLIVES the write() (that is the point); it is flushed when it fills,
+     * on a non-contiguous write, before the journal commits the referencing
+     * metadata (data=ordered, see ext4_journal_flush), and before any read/free of
+     * these blocks.  Partial edge blocks are read-modify-written directly (after
+     * flushing pending data so the on-disk block is current).  With NO journal,
+     * data is written directly as before — no deferral. */
+    unsigned wb_cap = (fs->j_enabled && s_wbounce && s_wbounce_bytes >= fs->block_size)
+                    ? (unsigned)(s_wbounce_bytes / fs->block_size) : 0;
     unsigned long write_start = ef->pos;
     unsigned long pos = ef->pos, remaining = (unsigned long)bytes, written = 0;
     const uint8_t *src = (const uint8_t *)buf;
@@ -3777,33 +3818,72 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
         unsigned long pbn = ext4_block_map(fs, ef->ino, lidx);
         if (pbn == 0) { io_err = 1; break; }
         if (boff != 0 || chunk != fs->block_size) {
-            /* Partial block: read-modify-write a single block. */
+            /* Partial block: flush pending data (this block may be buffered, and
+             * for ordering), then read-modify-write the single block directly.
+             * After the flush s_wbounce is free, so reuse it as the RMW scratch. */
+            if (ext4_wb_flush(fs) != ST_OK) { io_err = 1; break; }
+            uint8_t *pb = s_wbounce, *pb_owned = 0;
+            if (!pb) { pb_owned = (uint8_t *)kalloc(fs->block_size); pb = pb_owned; }
+            if (!pb) { io_err = 1; break; }
             if (ext4_read_sectors(fs->bdev,
                     fs->part_lba_offset + pbn * fs->sectors_per_block,
-                    fs->sectors_per_block, blk) != ST_OK)
-                mm_memset(blk, 0, fs->block_size);
-            mm_memcpy(blk + boff, src + written, chunk);
-            if (ext4_write_sectors(fs->bdev,
+                    fs->sectors_per_block, pb) != ST_OK)
+                mm_memset(pb, 0, fs->block_size);
+            mm_memcpy(pb + boff, src + written, chunk);
+            int w = ext4_write_sectors(fs->bdev,
                     fs->part_lba_offset + pbn * fs->sectors_per_block,
-                    fs->sectors_per_block, blk) != ST_OK) { io_err = 1; break; }
+                    fs->sectors_per_block, pb);
+            if (pb_owned) kfree(pb_owned);
+            if (w != ST_OK) { io_err = 1; break; }
             pos += chunk; written += chunk; remaining -= chunk;
         } else {
-            /* Gather a run of contiguous full blocks (up to the bounce size). */
+            /* Gather the run of contiguous full blocks present in this write(). */
             unsigned run = 1;
-            while (run < max_run && remaining - (unsigned long)run * fs->block_size >= fs->block_size) {
+            while (remaining - (unsigned long)run * fs->block_size >= fs->block_size) {
                 if (ext4_block_map(fs, ef->ino, lidx + run) != pbn + run) break;
                 run++;
             }
+            if (wb_cap == 0) {
+                /* No write-back buffer (no journal / unavailable): write directly
+                 * through a one-block scratch, contiguous run by run. */
+                for (unsigned r = 0; r < run; r++) {
+                    uint8_t *pb = (uint8_t *)kalloc(fs->block_size);
+                    if (!pb) { io_err = 1; break; }
+                    mm_memcpy(pb, src + written + (unsigned long)r * fs->block_size, fs->block_size);
+                    int w = ext4_write_sectors(fs->bdev,
+                            fs->part_lba_offset + (pbn + r) * fs->sectors_per_block,
+                            fs->sectors_per_block, pb);
+                    kfree(pb);
+                    if (w != ST_OK) { io_err = 1; break; }
+                }
+                if (io_err) break;
+            } else {
+                /* Append the run to the write-back buffer, flushing when it can't
+                 * extend the buffered run (other file / non-adjacent) or fills. */
+                unsigned r = 0;
+                while (r < run) {
+                    if (s_wb_len > 0 &&
+                        (s_wb_ino != ef->ino || s_wb_pbn + s_wb_len != pbn + r)) {
+                        if (ext4_wb_flush(fs) != ST_OK) { io_err = 1; break; }
+                    }
+                    if (s_wb_len == 0) { s_wb_ino = ef->ino; s_wb_pbn = pbn + r; }
+                    unsigned take = run - r;
+                    if (s_wb_len + take > wb_cap) take = wb_cap - s_wb_len;
+                    mm_memcpy(s_wbounce + (unsigned long)s_wb_len * fs->block_size,
+                              src + written + (unsigned long)r * fs->block_size,
+                              (unsigned long)take * fs->block_size);
+                    s_wb_len += take; r += take;
+                    if (s_wb_len == wb_cap) {
+                        if (ext4_wb_flush(fs) != ST_OK) { io_err = 1; break; }
+                    }
+                }
+                if (io_err) break;
+            }
             unsigned long n = (unsigned long)run * fs->block_size;
-            mm_memcpy(blk, src + written, n);
-            if (ext4_write_sectors(fs->bdev,
-                    fs->part_lba_offset + pbn * fs->sectors_per_block,
-                    run * fs->sectors_per_block, blk) != ST_OK) { io_err = 1; break; }
             pos += n; written += n; remaining -= n;
         }
     }
     smap_enable();
-    if (blk_owned) kfree(blk_owned);   /* never free the persistent bounce */
 
     if (written == 0 && io_err) return ST_IO;
 
@@ -4422,8 +4502,10 @@ static int ext4_fsync(vfs_file_t *f)
      * journal_clean flushes the batch (one log commit + checkpoint) and syncs. */
     ext4_txn_flush(g_ext4_fs);
     ext4_journal_clean(g_ext4_fs);
+    /* Write-back defers data-write I/O errors past write(); surface them here. */
+    int werr = s_wb_err; s_wb_err = 0;
     ext4_io_unlock();
-    return 0;
+    return werr ? -EIO : 0;
 }
 
 /* Whole-filesystem sync (the sync(2) op, not tied to a file): flush deferred
@@ -5239,6 +5321,15 @@ static void ext4_journal_flush(ext4_fs_t *fs)
 {
     if (!fs || !fs->j_enabled || !fs->j_sb_buf)
         return;
+    /* data=ordered: write the buffered file data to its final home AND make it
+     * durable BEFORE this transaction commits the metadata that references those
+     * blocks, so a crash can never expose stale block contents through committed
+     * metadata.  One extra sync here is cheap — this runs per batch, not per op. */
+    if (s_wb_len > 0) {
+        ext4_wb_flush(fs);
+        if (fs->bdev && fs->bdev->sync)
+            fs->bdev->sync((block_device_t *)fs->bdev);
+    }
     unsigned n = s_ckpt.n;
     if (n == 0)
         return;                       /* nothing dirty */
@@ -5768,13 +5859,19 @@ int ext4_vfs_register_root(ext4_fs_t *fs)
     g_ext4_cwd_ino = EXT4_ROOT_INO;
     ext4_sb_attach(fs);
     vfs_register_root(&ext4_vfs_ops);
-    /* Allocate the persistent write-coalescing buffer once (DMA chunk = 64KB),
-     * while memory is unfragmented so the contiguous allocation succeeds. */
+    /* Allocate the persistent write-back/coalescing buffer once (target 1 MiB),
+     * while memory is unfragmented so the large contiguous allocation succeeds.
+     * Fall back to progressively smaller sizes if a full 1 MiB isn't available —
+     * a smaller buffer just coalesces less (still correct). */
     if (!s_wbounce) {
         unsigned ss = fs->bdev->sector_size ? fs->bdev->sector_size : 512;
         unsigned long want = (unsigned long)EXT4_MAX_SECTORS_PER_READ * ss;
         if (want < fs->block_size) want = fs->block_size;
-        s_wbounce = (uint8_t *)kalloc(want);
+        while (want >= fs->block_size) {
+            s_wbounce = (uint8_t *)kalloc(want);
+            if (s_wbounce) break;
+            want /= 2;
+        }
         s_wbounce_bytes = s_wbounce ? want : 0;
     }
     /* Persistent group-descriptor scratch block, so a write never silently drops
