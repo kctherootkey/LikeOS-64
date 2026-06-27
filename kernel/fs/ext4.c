@@ -1,9 +1,10 @@
 // LikeOS-64 - ext4 filesystem driver
 //
-// Phase 1: read-only mount, extent + indirect block mapping, directory
-// traversal, and integration with the generic page/inode caches.  Write
-// support, symlinks, journaling and permission enforcement land in later
-// phases (see plan).  Structurally this mirrors kernel/fs/fat32.c: a
+// A full read/write ext4 driver: extent + indirect block mapping, directory
+// traversal, allocation and metadata writeback, symlinks/hard links, journaling
+// (ordered mode), metadata_csum (crc32c), xattrs/ACLs, and permission
+// enforcement, integrated with the generic page/inode caches.
+// Structurally this mirrors kernel/fs/fat32.c: a
 // reentrant sleeping I/O mutex serialises operations, the data path runs
 // through the shared pagecache, and the two vtables (vfs_ops_t for path/
 // handle ops, vfs_sb_ops_t for the cache's block plumbing) are filled in.
@@ -58,9 +59,9 @@ _Static_assert(__builtin_offsetof(ext4_group_desc, bg_checksum) == 0x1E, "bg_che
 _Static_assert(__builtin_offsetof(ext4_inode, i_checksum_hi) == 0x82, "i_checksum_hi offset");
 
 /* ===================================================================
- * P6: metadata_csum (crc32c, Castagnoli) — checksum machinery.
+ * metadata_csum (crc32c, Castagnoli) — checksum machinery.
  *
- * Step 1 is read-side VERIFICATION only: compute the checksums the way the
+ * The read-side VERIFICATION path computes the checksums the way the
  * reference does and WARN (once) if an on-disk value disagrees, so the crc32c
  * implementation + seed derivation can be proven against a real image before
  * any write-side code relies on them.  Nothing here rejects or mutates.
@@ -143,7 +144,7 @@ static uint32_t ext4_inode_csum(const ext4_fs_t *fs, unsigned long ino,
 }
 
 /* ===================================================================
- * P6 Step 2: metadata_csum WRITE side — stamp the checksums computed above into
+ * metadata_csum WRITE side — stamp the checksums computed above into
  * the on-disk metadata just before it is written.  Every helper is a no-op
  * unless the filesystem has metadata_csum, so a ^metadata_csum image is written
  * byte-for-byte as before.
@@ -293,7 +294,7 @@ static int ext4_memcmp(const void *a, const void *b, unsigned long n)
     return 0;
 }
 
-/* The single mounted ext4 root (Phase 1 supports one ext4 filesystem). */
+/* The single mounted ext4 root (one ext4 filesystem is supported). */
 ext4_fs_t *g_ext4_fs = 0;
 
 /* Refuse a mutating op up front when the fs is read-only / error-latched.  The
@@ -309,7 +310,7 @@ unsigned long ext4_get_cwd_ino(void) { return g_ext4_cwd_ino; }
 void ext4_set_cwd_ino(unsigned long ino) { g_ext4_cwd_ino = ino ? ino : EXT4_ROOT_INO; }
 
 /* ===================================================================
- * PJ: journaled-writes transaction (ordered mode).
+ * Journaled-writes transaction (ordered mode).
  *
  * A transaction spans one top-level operation: it begins on the outermost
  * ext4_io_lock() and commits on the matching outermost ext4_io_unlock().
@@ -333,7 +334,7 @@ static int  ext4_write_block_direct(ext4_fs_t *fs, unsigned long pbn, const void
 static void ext4_txn_flush(ext4_fs_t *fs);   /* defined with the journal code */
 static void ext4_journal_clean(ext4_fs_t *fs);/* mark journal empty on sync     */
 static int  ext4_wb_flush(ext4_fs_t *fs);    /* flush the data write-back buffer */
-/* P6 enforcement: record a metadata-corruption error + apply the errors=
+/* Record a metadata-corruption error + apply the errors=
  * policy (remount-ro latch / panic / continue).  Defined after ext4_write_super. */
 static void ext4_fs_error(ext4_fs_t *fs, const char *what, unsigned long ino);
 
@@ -391,7 +392,7 @@ static int ext4_txn_lookup(ext4_fs_t *fs, unsigned long pbn, void *buf)
 }
 
 /* ===================================================================
- * P7: deferred-checkpoint circular journal log.
+ * Deferred-checkpoint circular journal log.
  *
  * Instead of checkpointing (writing committed metadata to its final location)
  * synchronously after every op — which cost a sync per op — committed
@@ -414,7 +415,7 @@ static int ext4_txn_lookup(ext4_fs_t *fs, unsigned long pbn, void *buf)
  * Serialized entirely by ext4_io_lock, like s_txn.
  * =================================================================== */
 #define EXT4_CKPT_MAX_BLOCKS 256          /* pending unique-block cap (memory)  */
-/* P7 transaction batching.  Each op's metadata is merged into the in-memory
+/* Transaction batching.  Each op's metadata is merged into the in-memory
  * batch (s_ckpt) on commit WITHOUT touching the disk; the batch is journalled +
  * checkpointed as ONE transaction only when it reaches this many distinct blocks,
  * on fsync/sync/unmount, or when a journalled block is freed.  This is what makes
@@ -617,7 +618,7 @@ static int ext4_read_sectors(const block_device_t *bdev, unsigned long lba,
  * separate ~4KB USB transaction — painfully slow.  This small round-robin
  * cache keeps the hottest metadata blocks in RAM.  All ext4_read_block()
  * calls happen under the I/O mutex, so the cache needs no extra locking.
- * NOTE: read-only in Phase 1; Phase 2 must invalidate entries on writes. */
+ * NOTE: entries are invalidated on writes. */
 /* Sized so a metadata-heavy operation's whole working set stays resident: a big
  * directory grows to many leaf/index blocks, and a create/delete loop touches
  * dozens of inode-table + bitmap + dir blocks.  256 * 4 KB = up to 1 MB, buffers
@@ -762,7 +763,7 @@ static int ext4_read_inode_loc(ext4_fs_t *fs, unsigned long ino,
     st = ext4_read_block(fs, blk, buf);
     if (st != ST_OK) { kfree(buf); return st; }
 
-    /* P6 enforcement: verify the inode's metadata_csum using the full on-disk
+    /* Verify the inode's metadata_csum using the full on-disk
      * bytes still in `buf` (the struct copy below truncates them).  A mismatch
      * means the inode is corrupt — refuse to hand it back (ST_IO => -EIO) and
      * mark the filesystem errored, exactly like the reference's -EFSBADCRC. */
@@ -999,7 +1000,7 @@ static unsigned long ext4_sb_next_block(vfs_superblock_t *sb, unsigned long bid)
         return EXT4_BID_EOC;
     unsigned long ino  = EXT4_BID_INO(bid);
     unsigned long lidx = EXT4_BID_LIDX(bid);
-    /* Stop at EOF.  For Phase 1 (non-sparse images) a 0 mapping means EOF;
+    /* Stop at EOF.  For non-sparse images a 0 mapping means EOF;
      * proper mid-file hole handling arrives with write support. */
     if (ext4_block_map(fs, ino, lidx + 1) == 0)
         return EXT4_BID_EOC;
@@ -1197,12 +1198,12 @@ static int ext4_resolve(ext4_fs_t *fs, const char *path, unsigned long *out_ino)
 }
 
 /* ===================================================================
- * VFS operations (read-only subset for Phase 1)
+ * VFS operations
  * =================================================================== */
 
 static const vfs_ops_t ext4_vfs_ops;   /* forward */
 
-/* Phase-2 write helpers (defined further below; used by open/truncate). */
+/* Write helpers (defined further below; used by open/truncate). */
 static int  ext4_resolve_parent(ext4_fs_t *fs, const char *path,
                                 unsigned long *parent_ino, char *name_out, unsigned cap);
 static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino, int is_dir);
@@ -1535,14 +1536,14 @@ static int ext4_chdir_impl(const char *path)
 }
 
 /* ===================================================================
- * Phase 2: write support — allocation, metadata writeback, file lifecycle.
+ * Write support — allocation, metadata writeback, file lifecycle.
  *
  * Metadata (inodes, bitmaps, group descs, directory blocks) is written via
  * ext4_write_block (write-through to the metadata cache).  File data bypasses
  * that cache and uses raw sector I/O, with the pagecache invalidated after a
  * write so reads re-fetch fresh data.  All of this runs under ext4_io_lock.
  * Perf note: metadata writeback here is eager (not batched the way fat32
- * defers FAT-sector flushes); large-file write throughput tuning is P7.
+ * defers FAT-sector flushes).
  * =================================================================== */
 
 static int ext4_write_sectors(const block_device_t *bdev, unsigned long lba,
@@ -2021,8 +2022,8 @@ static void ext4_free_block(ext4_fs_t *fs, unsigned long pbn)
  * level on top".  External index/leaf blocks carry the et_checksum tail
  * (ext4_ext_block_csum_set); the inline root is covered by the inode csum.
  * Metadata blocks are allocated via ext4_alloc_one_block, so the caller must
- * have already persisted the data-block bitmaps (see ext4_alloc_blocks_for_file
- * Phase A/B) to avoid double-allocation.
+ * have already persisted the data-block bitmaps (see the two-pass
+ * reserve-then-map allocator) to avoid double-allocation.
  * =================================================================== */
 static unsigned long ext4_alloc_one_block(ext4_fs_t *fs);   /* defined below */
 
@@ -2262,7 +2263,7 @@ static unsigned ext4_alloc_blocks_for_file(ext4_fs_t *fs, unsigned long ino,
     uint8_t *bm = (uint8_t *)kalloc(fs->block_size);
     if (!bm) return 0;
 
-    /* Phase A: reserve physical data blocks as contiguous runs; persist bitmaps. */
+    /* First pass: reserve physical data blocks as contiguous runs; persist bitmaps. */
     for (unsigned g = 0; g < fs->groups_count && phys < count && nruns < EXT4_ALLOC_RUNS_MAX; g++) {
         if (fs->gdt[g].bg_free_blocks_count_lo == 0) continue;
         unsigned long bblk = ext4_gd_block_bitmap(fs, g);
@@ -2292,7 +2293,7 @@ static unsigned ext4_alloc_blocks_for_file(ext4_fs_t *fs, unsigned long ino,
     }
     kfree(bm);
 
-    /* Phase B: map runs into the extent tree (metadata alloc is safe now). */
+    /* Second pass: map runs into the extent tree (metadata alloc is safe now). */
     unsigned mapped = 0;
     for (unsigned r = 0; r < nruns; r++) {
         unsigned got = ext4_ext_add(fs, ino, in, start_lidx + mapped, runs[r].pbn, runs[r].len);
@@ -2389,7 +2390,7 @@ static void ext4_free_blocks_from(ext4_fs_t *fs, unsigned long ino,
 /* ===================================================================
  * Extended attributes (xattr) — storage layer.
  *
- * STAGE 1a: in-inode ("ibody") attributes only — those stored in the inode's
+ * In-inode ("ibody") attributes — those stored in the inode's
  * slack space [128 + i_extra_isize, s_inode_size).  This region is covered by
  * the inode metadata_csum (already computed correctly), so there is no separate
  * on-disk hash/checksum to get byte-exact here.  The external xattr block (with
@@ -2564,7 +2565,7 @@ static int ext4_xa_serialize_ibody(uint8_t *region, unsigned long size, const ex
     return ST_OK;
 }
 
-/* ---- external xattr block (i_file_acl) ----  STAGE 1c.  Large attributes that
+/* ---- external xattr block (i_file_acl) ----  Large attributes that
  * don't fit the inode slack live in one shared-format block: a 32-byte header
  * then forward-growing entries and backward-growing values, with per-entry and
  * whole-block hashes (legacy, always present) plus a crc32c (metadata_csum).
@@ -4278,7 +4279,7 @@ int ext4_get_statfs(unsigned long *f_bsize, unsigned long *f_blocks,
 }
 
 /* ===================================================================
- * Phase 3: symlinks, hard links, chmod/chown, lstat.
+ * Symlinks, hard links, chmod/chown, lstat.
  * =================================================================== */
 
 int ext4_symlink(const char *target, const char *linkpath)
@@ -4838,7 +4839,7 @@ static unsigned long ext4_locate_partition(const block_device_t *bdev)
 }
 
 /* ===================================================================
- * Journal replay (jbd2 recovery) — PJ, replay-on-mount half.
+ * Journal replay (jbd2 recovery) — replay-on-mount half.
  *
  * Closes the integrity hole where mount accepted the RECOVER incompat flag but
  * ignored it.  When the filesystem was not cleanly unmounted, jbd2 left
@@ -4860,7 +4861,7 @@ static unsigned long ext4_locate_partition(const block_device_t *bdev)
  * matching csum v3 (see ext4_txn_flush), so journaled writes are now enabled on
  * csum-v3 journals.  Replay is otherwise gated on the jbd2 magic + a contiguous
  * run of sequence numbers, correct for cleanly-written journals.  ASYNC_COMMIT
- * and fast-commit are still not specially handled (deferred, P6).
+ * and fast-commit are still not specially handled.
  * =================================================================== */
 
 static inline uint16_t be16(uint16_t v) { return __builtin_bswap16(v); }
@@ -5282,7 +5283,7 @@ static void ext4_checkpoint(ext4_fs_t *fs)
 }
 
 /* ===================================================================
- * PJ/P7: journaled writes (ordered mode), deferred-checkpoint circular log.
+ * Journaled writes (ordered mode), deferred-checkpoint circular log.
  *
  * Called from ext4_io_unlock on the outermost release with the lock held.  Each
  * op's buffered metadata (s_txn) is journalled to the log head and made durable
@@ -5564,7 +5565,7 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
     out->first_ino = (sb->s_rev_level == 0) ? EXT4_GOOD_OLD_FIRST_INO
                                             : sb->s_first_ino;
     out->journal_inum = sb->s_journal_inum;
-    out->read_only = 0;   /* Phase 2: writes enabled */
+    out->read_only = 0;   /* writes enabled */
     /* errors= policy for runtime corruption (ext4_fs_error).  Linux applies a
      * mount-time default of remount-ro on metadata corruption regardless of the
      * on-disk s_errors hint (mke2fs stamps s_errors=continue by default), since
@@ -5586,7 +5587,7 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
         ((out->blocks_count - out->first_data_block + out->blocks_per_group - 1)
          / out->blocks_per_group);
 
-    /* P6: metadata_csum seed + (verify-only) superblock checksum.  The seed is
+    /* metadata_csum seed + (verify-only) superblock checksum.  The seed is
      * s_checksum_seed when the CSUM_SEED feature is set, else crc32c(~0, uuid). */
     out->has_metadata_csum =
         (out->feature_ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) != 0;
@@ -5633,7 +5634,7 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
         return ST_IO;
     }
 
-    /* P6 (verify-only): confirm every group descriptor's metadata_csum, which
+    /* Verify-only: confirm every group descriptor's metadata_csum, which
      * exercises the csum_seed derivation.  Warn with a count; never reject. */
     if (out->has_metadata_csum) {
         unsigned bad = 0;
@@ -5721,7 +5722,7 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
         }
     }
 
-    /* PJ: set up journaled writes (ordered mode).  Disabled unless the journal
+    /* Set up journaled writes (ordered mode).  Disabled unless the journal
      * exists, matches our block size, and uses only features we can WRITE
      * correctly.  We stamp jbd2 csum v3, so a csum-v3 journal is supported; csum
      * v2, async-commit and fast-commit remain unsupported on the write side and
@@ -5758,7 +5759,7 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
                 out->j_csum_seed = ext4_crc32c(0xFFFFFFFFu, out->j_uuid, 16);
                 if (out->j_maxlen > out->j_first + 3)
                     out->j_enabled = 1;
-                /* P7: deferred-checkpoint epoch state.  The log is empty here
+                /* Deferred-checkpoint epoch state.  The log is empty here
                  * (recovery, run earlier, left s_start=0), so the first epoch
                  * starts writing at j_first. */
                 s_jhead      = out->j_first;

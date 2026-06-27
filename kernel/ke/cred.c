@@ -1,4 +1,4 @@
-// LikeOS-64 - UNIX process credentials (P5)
+// LikeOS-64 - UNIX process credentials
 //
 // The set*-id transition rules below follow POSIX: a privileged process
 // (effective uid 0) may set IDs freely; an unprivileged process may only

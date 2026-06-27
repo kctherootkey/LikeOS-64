@@ -1,7 +1,8 @@
 // LikeOS-64 - ext4 filesystem driver
 //
-// Phase 1: read-only mount + extent/indirect block reads + directory
-// traversal.  Plugs into the same generic cache layer (pagecache / dcache /
+// Mount, extent/indirect block mapping, directory traversal, block allocation
+// + metadata writeback, journaling (ordered mode), metadata_csum, xattrs/ACLs,
+// symlinks/hard links and permissions.  Plugs into the same generic cache layer (pagecache / dcache /
 // icache) as FAT32 by implementing the two vtables vfs_ops_t (path/handle
 // ops) and vfs_sb_ops_t (block ops the caches dispatch through).
 //
@@ -448,11 +449,11 @@ typedef struct ext4_fs {
     ext4_super_block sb_copy;           /* cached superblock                 */
     /* VFS-layer superblock published to g_root_sb; sb.fs_private = this.    */
     vfs_superblock_t sb;
-    /* P6: metadata_csum (crc32c).  has_metadata_csum gates all csum work;
+    /* metadata_csum (crc32c).  has_metadata_csum gates all csum work;
      * csum_seed is crc32c(~0, s_uuid) (or s_checksum_seed if CSUM_SEED).    */
     int            has_metadata_csum;
     uint32_t       csum_seed;
-    /* PJ: journaled-writes (ordered mode) state.  j_enabled gates it all.   */
+    /* Journaled-writes (ordered mode) state.  j_enabled gates it all.        */
     int            j_enabled;           /* journal writes active this mount  */
     unsigned long  j_sb_pbn;            /* physical block of journal sblock  */
     unsigned long  j_first;             /* journal s_first (first log block) */
@@ -517,7 +518,7 @@ int ext4_get_statfs(unsigned long *f_bsize, unsigned long *f_blocks,
                     unsigned long *f_ffree, unsigned long *f_namelen,
                     unsigned long *f_type);
 
-/* Phase 3: symlinks / hard links / chmod / chown / lstat.  All return ST_OK
+/* Symlinks / hard links / chmod / chown / lstat.  All return ST_OK
  * or an ST_* error (readlink returns the byte count). */
 int ext4_symlink(const char *target, const char *linkpath);
 int ext4_readlink(const char *path, char *buf, unsigned long bufsiz);

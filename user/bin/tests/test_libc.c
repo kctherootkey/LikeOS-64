@@ -5664,7 +5664,7 @@ network_section:
     }
 
     // ========================================
-    // Phase A+B follow-on tests (items 3-9)
+    // Follow-on tests (items 3-9)
     // ========================================
     {
         // SOCK_RAW ICMP socket creation (skip if not root-mode permissive)
@@ -7706,7 +7706,7 @@ network_section:
 
 network_skip:;
     // ========================================
-    // P5: permission enforcement.  Drop to a non-root uid in a child and
+    // Permission enforcement.  Drop to a non-root uid in a child and
     // confirm the kernel denies access to root-owned objects (root, running
     // these tests, is unaffected — it bypasses the checks).
     // ========================================

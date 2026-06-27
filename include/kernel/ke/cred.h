@@ -1,4 +1,4 @@
-// LikeOS-64 - UNIX process credentials (P5)
+// LikeOS-64 - UNIX process credentials
 //
 // A per-task credential set: real / effective / saved-set user and group IDs,
 // the filesystem IDs (which track the effective IDs), and the supplementary
@@ -6,8 +6,8 @@
 // free via the task struct memcpy.  Fresh (non-fork) tasks inherit the spawning
 // task's credentials; kernel tasks run privileged and the primordial boot task
 // is the sole root origin — no task is silently born root.  Permission
-// ENFORCEMENT (P5b) consults the effective/fs IDs; P5a only stores and reports
-// them and implements the POSIX set*-id transitions.
+// enforcement consults the effective/fs IDs; this credential layer only stores
+// and reports them and implements the POSIX set*-id transitions.
 //
 // Note: threads (CLONE_THREAD) currently get an independent copy rather than a
 // shared credential — full POSIX shared-cred semantics is a later refinement.

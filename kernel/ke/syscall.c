@@ -562,7 +562,7 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
 }
 
 // SYS_WRITE - write to file descriptor
-/* P5: set-id stripping after a non-privileged modify (defined below with the
+/* Set-id stripping after a non-privileged modify (defined below with the
  * permission helpers). */
 static unsigned setid_strip_bits(uint32_t mode);
 static void strip_setid_file(vfs_file_t* file);
@@ -644,7 +644,7 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count) {
     if (wret < 0) {
         return wret;
     }
-    /* P5: a write by a non-privileged task drops the file's set-user/-group-ID
+    /* A write by a non-privileged task drops the file's set-user/-group-ID
      * bits, so a set-id program can't outlive a change to its contents.  Root
      * (the whole live system) skips this entirely; for non-root the per-inode
      * clean hint keeps the steady state cheap (no per-write inode read). */
@@ -703,7 +703,7 @@ static int perm_access(task_t* cur, const char* path, const struct kstat* st,
                             (uint32_t)st->st_uid, (uint32_t)st->st_gid, want);
 }
 
-/* P5 permission enforcement: may the current task access `path` for `want`
+/* Permission enforcement: may the current task access `path` for `want`
  * (MAY_* mask)?  Returns 0 if allowed (incl. when the path can't be stat'd —
  * we let the real operation report ENOENT etc.), or a negative errno.
  * perm_access() bypasses for root, so this is effectively a no-op for the
@@ -730,7 +730,7 @@ static int perm_abspath(task_t* cur, const char* path, char* out, size_t outsz) 
     return normalize_path(cwd, path, out, outsz) == 0;
 }
 
-/* P5: per-component path traversal — a non-root task needs search (execute)
+/* Per-component path traversal — a non-root task needs search (execute)
  * permission on every directory in the path PREFIX (i.e. each strict ANCESTOR
  * of the final component, never the final component itself) to resolve through
  * it.  Walks "/", "/a", "/a/b" for "/a/b/c"; for "/" there are no ancestors.
@@ -776,7 +776,7 @@ static int perm_traverse_cred(const char* rawpath, int use_real) {
 /* Effective/fs-id traversal — the default for path-resolving syscalls. */
 static int perm_traverse(const char* rawpath) { return perm_traverse_cred(rawpath, 0); }
 
-/* P5: check the current task's access to the PARENT directory of `path` —
+/* Check the current task's access to the PARENT directory of `path` —
  * needed by create/remove/rename, which modify the containing directory
  * (want is typically MAY_WRITE|MAY_EXEC).  No-op for root, and permissive when
  * the parent can't be derived (bare relative name) or stat'd.  Self-fetches the
@@ -811,7 +811,7 @@ static int perm_check_parent(const char* rawpath, int want) {
     return perm_check_path(cur, parent, want);
 }
 
-/* P5: remove/rename gate.  Beyond the parent's write+search (perm_check_parent),
+/* Remove/rename gate.  Beyond the parent's write+search (perm_check_parent),
  * a non-root task is subject to the directory's STICKY bit (S_ISVTX, e.g. /tmp
  * at 1777): it may only remove or rename an entry it owns, or when it owns the
  * containing directory.  Permissive when anything can't be stat'd (the real op
@@ -835,7 +835,7 @@ static int perm_check_remove(const char* rawpath) {
     return -EACCES;
 }
 
-/* P5: the set-user/-group-ID bits a successful modification (write/chown) by a
+/* The set-user/-group-ID bits a successful modification (write/chown) by a
  * non-privileged caller must clear, to stop a set-id file outliving a change to
  * its contents or ownership.  S_ISUID is always cleared; S_ISGID only when the
  * file is group-executable (otherwise that bit is a mandatory-lock marker, not
@@ -894,7 +894,7 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode) {
         if (brest != 0) return brest;
         path = full;
     }
-    /* P5: enforce read/write permission for non-root openers (root's path is
+    /* Enforce read/write permission for non-root openers (root's path is
      * untouched).  For an existing file we check its mode; for O_CREAT of a new
      * file we require write+search on the parent directory. */
     if (cur->cred.euid != 0) {
@@ -929,7 +929,7 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode) {
     }
 
     cur->fd_table[fd] = file;
-    /* P5: O_TRUNC modifies contents → drop set-id bits for a non-root caller. */
+    /* O_TRUNC modifies contents → drop set-id bits for a non-root caller. */
     if ((flags & O_TRUNC) && cur->cred.euid != 0) strip_setid_file(file);
     return fd;
 }
@@ -975,7 +975,7 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags, uin
         return vfs_status_to_errno(ret);
     }
     cur->fd_table[fd] = file;
-    /* P5: O_TRUNC modifies contents → drop set-id bits for a non-root caller. */
+    /* O_TRUNC modifies contents → drop set-id bits for a non-root caller. */
     if ((flags & O_TRUNC) && cur->cred.euid != 0) strip_setid_file(file);
     return fd;
 }
@@ -1082,7 +1082,7 @@ static int64_t sys_stat_common(const char* path, uint64_t stat_buf, int validate
     // Security: Zero the struct to prevent leaking uninitialized kernel stack data
     struct kstat st;
     mm_memset(&st, 0, sizeof(st));
-    /* P5: enforce ancestor search BEFORE existence is revealed, so an
+    /* Enforce ancestor search BEFORE existence is revealed, so an
      * unsearchable prefix yields EACCES (not ENOENT) — matches the reference. */
     int tr = perm_traverse(path);
     if (tr < 0) return tr;
@@ -1140,7 +1140,7 @@ static int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf) {
      * transparently falls back to plain stat. */
     if (!validate_user_ptr(stat_buf, sizeof(struct kstat))) return -EFAULT;
     struct kstat st; mm_memset(&st, 0, sizeof(st));
-    int tr = perm_traverse(p);   /* P5: ancestor search before existence */
+    int tr = perm_traverse(p);   /* ancestor search before existence */
     if (tr < 0) return tr;
     int r = vfs_lstat(p, &st);
     if (r != ST_OK) return (r == ST_NOT_FOUND) ? -ENOENT : -EINVAL;
@@ -1237,7 +1237,7 @@ static int64_t sys_access(uint64_t pathname, uint64_t mode) {
         if (retb != 0) return retb;
         path = full;
     }
-    /* P5: ancestor search first (so an unsearchable prefix → EACCES, not
+    /* Ancestor search first (so an unsearchable prefix → EACCES, not
      * ENOENT, and F_OK requires reachability), then existence, then the mode.
      * access(2) checks the REAL uid/gid; R_OK/W_OK/X_OK (4/2/1) == MAY_*. */
     int tr = perm_traverse_cred(path, 1);   /* real-id search to match the check */
@@ -1333,7 +1333,7 @@ static int64_t sys_chdir(uint64_t pathname) {
     if (vret == ST_IO) return -EIO;            /* corrupt metadata, not "not a dir" */
     if (vret != ST_OK) return -ENOTDIR;
     if ((st.st_mode & S_IFMT) != S_IFDIR) return -ENOTDIR;
-    /* P5: entering a directory requires search on it and on every ancestor. */
+    /* Entering a directory requires search on it and on every ancestor. */
     int tr = perm_traverse(full);
     if (tr < 0) return tr;
     int pr = perm_access(cur, full, &st, MAY_EXEC, 0);
@@ -1372,9 +1372,9 @@ static int64_t sys_umask(uint64_t mask) {
     return old;
 }
 
-/* Real credential syscalls (P5).  Operate on the current task's embedded
+/* Real credential syscalls.  Operate on the current task's embedded
  * cred; the set*-id permission rules live in cred.c.  Enforcement of file
- * permissions against these IDs is P5b. */
+ * permissions against these IDs is done by the perm_check and perm_traverse helpers above. */
 static int64_t sys_getuid(void)  { task_t* c = sched_current(); return c ? (int64_t)c->cred.uid  : 0; }
 static int64_t sys_geteuid(void) { task_t* c = sched_current(); return c ? (int64_t)c->cred.euid : 0; }
 static int64_t sys_getgid(void)  { task_t* c = sched_current(); return c ? (int64_t)c->cred.gid  : 0; }
@@ -1560,7 +1560,7 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length) {
     if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) return -EBADF;
     vfs_file_t* file = cur->fd_table[fd];
     int r = vfs_truncate(file, (unsigned long)length);
-    /* P5: truncating contents drops set-id bits for a non-privileged caller,
+    /* Truncating contents drops set-id bits for a non-privileged caller,
      * same as write() (see strip_setid_file for the once-per-inode fast-path). */
     if (r >= 0 && cur->cred.euid != 0 && !vfs_setid_clean(file)) strip_setid_file(file);
     return r;
@@ -1959,7 +1959,7 @@ static int64_t sys_unlink(uint64_t pathname) {
     int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
     if (cret != 0) return cret;
 
-    int pr = perm_check_remove(kpath);  /* P5: parent write+search, + sticky bit */
+    int pr = perm_check_remove(kpath);  /* parent write+search, + sticky bit */
     if (pr < 0) return pr;
     int st = vfs_unlink(kpath);
     if (st == ST_OK) return 0;
@@ -1977,9 +1977,9 @@ static int64_t sys_rename(uint64_t oldpath, uint64_t newpath) {
     cret = copy_user_path((const char*)newpath, knewpath, sizeof(knewpath));
     if (cret != 0) return cret;
 
-    int pr = perm_check_remove(koldpath);   /* P5: remove source (+ sticky)        */
+    int pr = perm_check_remove(koldpath);   /* remove source (+ sticky)        */
     if (pr < 0) return pr;
-    pr = perm_check_remove(knewpath);       /* P5: write dest (+ sticky on overwrite) */
+    pr = perm_check_remove(knewpath);       /* write dest (+ sticky on overwrite) */
     if (pr < 0) return pr;
     int st = vfs_rename(koldpath, knewpath);
     if (st == ST_OK) return 0;
@@ -1996,7 +1996,7 @@ static int64_t sys_mkdir(uint64_t pathname, uint64_t mode) {
     int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
     if (cret != 0) return cret;
 
-    int pr = perm_check_parent(kpath, MAY_WRITE | MAY_EXEC);  /* P5: write the dir */
+    int pr = perm_check_parent(kpath, MAY_WRITE | MAY_EXEC);  /* write the dir */
     if (pr < 0) return pr;
     int st = vfs_mkdir(kpath, (unsigned int)mode);
     if (st == ST_OK) return 0;
@@ -2014,7 +2014,7 @@ static int64_t sys_rmdir(uint64_t pathname) {
     int cret = copy_user_path((const char*)pathname, kpath, sizeof(kpath));
     if (cret != 0) return cret;
 
-    int pr = perm_check_remove(kpath);  /* P5: parent write+search, + sticky bit */
+    int pr = perm_check_remove(kpath);  /* parent write+search, + sticky bit */
     if (pr < 0) return pr;
     int st = vfs_rmdir(kpath);
     if (st == ST_OK) return 0;
@@ -2028,7 +2028,7 @@ static int64_t sys_link(uint64_t oldpath, uint64_t newpath) {
     char kold[VFS_MAX_PATH], knew[VFS_MAX_PATH];
     int c = copy_user_path((const char*)oldpath, kold, sizeof(kold)); if (c) return c;
     c = copy_user_path((const char*)newpath, knew, sizeof(knew)); if (c) return c;
-    int pr = perm_check_parent(knew, MAY_WRITE | MAY_EXEC);  /* P5: write the new dir */
+    int pr = perm_check_parent(knew, MAY_WRITE | MAY_EXEC);  /* write the new dir */
     if (pr < 0) return pr;
     int r = vfs_link(kold, knew);
     if (r == ST_OK) return 0;
@@ -2039,7 +2039,7 @@ static int64_t sys_symlink(uint64_t target, uint64_t linkpath) {
     char ktarget[VFS_MAX_PATH], klink[VFS_MAX_PATH];
     int c = copy_user_path((const char*)target, ktarget, sizeof(ktarget)); if (c) return c;
     c = copy_user_path((const char*)linkpath, klink, sizeof(klink)); if (c) return c;
-    int pr = perm_check_parent(klink, MAY_WRITE | MAY_EXEC);  /* P5: write the new dir */
+    int pr = perm_check_parent(klink, MAY_WRITE | MAY_EXEC);  /* write the new dir */
     if (pr < 0) return pr;
     int r = vfs_symlink(ktarget, klink);
     if (r == ST_OK) return 0;
@@ -2049,7 +2049,7 @@ static int64_t sys_symlink(uint64_t target, uint64_t linkpath) {
 static int64_t sys_readlink(uint64_t pathname, uint64_t buf, uint64_t bufsiz) {
     char kpath[VFS_MAX_PATH];
     int c = copy_user_path((const char*)pathname, kpath, sizeof(kpath)); if (c) return c;
-    int tr = perm_traverse(kpath);   /* P5: search on every ancestor dir */
+    int tr = perm_traverse(kpath);   /* search on every ancestor dir */
     if (tr < 0) return tr;
     if (bufsiz == 0) return -EINVAL;
     if (!validate_user_ptr(buf, 1)) return -EFAULT;
@@ -2066,7 +2066,7 @@ static int64_t sys_chmod(uint64_t pathname, uint64_t mode) {
     char kpath[VFS_MAX_PATH];
     int c = copy_user_path((const char*)pathname, kpath, sizeof(kpath)); if (c) return c;
     unsigned new_mode = (unsigned)mode;
-    /* P5: only the file's owner (or root) may change its mode; and a non-root
+    /* Only the file's owner (or root) may change its mode; and a non-root
      * caller not in the file's group cannot set the set-group-ID bit. */
     task_t* cur = sched_current();
     if (cur && cur->cred.euid != 0) {
@@ -2087,7 +2087,7 @@ static int64_t sys_fchmod(uint64_t fd, uint64_t mode) {
     if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd]) return -EBADF;
     if (fd_is_special(cur->fd_table[fd])) return 0;   /* no perms to change */
     unsigned new_mode = (unsigned)mode;
-    /* P5: only the owner (or root) may chmod, and a non-root caller not in the
+    /* Only the owner (or root) may chmod, and a non-root caller not in the
      * file's group cannot set the set-group-ID bit.  Permissive if the fs can't
      * report the owner (vfs_fstat unsupported, e.g. the perm-less FAT path). */
     if (cur->cred.euid != 0) {
@@ -2104,7 +2104,7 @@ static int64_t sys_fchmod(uint64_t fd, uint64_t mode) {
 static int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group) {
     char kpath[VFS_MAX_PATH];
     int c = copy_user_path((const char*)pathname, kpath, sizeof(kpath)); if (c) return c;
-    /* P5: changing the owner is root-only; a non-root owner may change the
+    /* Changing the owner is root-only; a non-root owner may change the
      * group of their own file to one of their groups. */
     task_t* cur = sched_current();
     int new_uid = (int)owner, new_gid = (int)group;
@@ -2136,7 +2136,7 @@ static int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group) {
     if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd]) return -EBADF;
     if (fd_is_special(cur->fd_table[fd])) return 0;   /* no ownership to change */
     int new_uid = (int)owner, new_gid = (int)group;
-    /* P5: owner change is root-only; a non-root owner may regroup to one of
+    /* Owner change is root-only; a non-root owner may regroup to one of
      * their groups (same rule as path chown).  Permissive if owner unknown. */
     if (cur->cred.euid != 0) {
         struct kstat st;
@@ -3170,7 +3170,7 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr, uint64_t envp_pt
         return ret;
     }
 
-    /* P5: stat the target up front, so we can (a) deny exec to a non-root
+    /* Stat the target up front, so we can (a) deny exec to a non-root
      * caller without execute permission BEFORE the image is replaced (after
      * which an error can no longer be returned), and (b) apply set-user/
      * set-group-ID after a successful exec.  Permissive if it can't be stat'd
@@ -3203,7 +3203,7 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr, uint64_t envp_pt
         return -ENOEXEC;
     }
 
-    /* P5: set-user-ID / set-group-ID on a successful exec (04000 / 02000).
+    /* Set-user-ID / set-group-ID on a successful exec (04000 / 02000).
      * The real IDs are unchanged; effective+saved+fs IDs take the file's. */
     {
         task_t* cur = sched_current();
