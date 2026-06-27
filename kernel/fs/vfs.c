@@ -1,6 +1,5 @@
 // LikeOS-64 - Minimal VFS implementation
 #include <kernel/fs/vfs.h>
-#include <kernel/fs/fat32.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include <kernel/uapi/dirent.h>
@@ -340,8 +339,11 @@ void vfs_incref(vfs_file_t* f) {
 size_t vfs_size(vfs_file_t* f) {
     if (!f) return 0;
     WARN_ON(f->ops == NULL);
-    // vfs_file_t is embedded as the first member of fat32_file_t
-    // so we can cast directly (or use fs_private which points to same)
-    fat32_file_t* ff = (fat32_file_t*)f;
-    return ff->size;
+    /* Ask the file's own filesystem for its size via the fstat op, so this stays
+     * filesystem-independent (fat32, ext4, ...) instead of casting to a
+     * driver-specific handle. */
+    struct kstat st;
+    if (vfs_fstat(f, &st) == ST_OK)
+        return (size_t)st.st_size;
+    return 0;
 }

@@ -1991,17 +1991,17 @@ void sched_dump_tasks(struct tty *tty) {
                 (uint64_t)snaps[i].wait_channel);
     }
     tty_printf(tty, "=======================================================================\n");
-    /* Show FAT32 I/O lock state — useful to detect orphaned-lock hangs
+    /* Show ext4 I/O lock state — useful to detect orphaned-lock hangs
      * (e.g., a task killed while holding the mutex). */
     {
-        extern volatile int      fat32_io_locked;
-        extern volatile int      fat32_io_depth;
-        extern volatile uint64_t fat32_io_owner;
-        tty_printf(tty, "FAT32 io_lock: held=%d depth=%d owner=%lld\n",
-                fat32_io_locked, fat32_io_depth, (long long)fat32_io_owner);
+        extern volatile int      ext4_io_locked;
+        extern volatile int      ext4_io_depth;
+        extern volatile uint64_t ext4_io_owner;
+        tty_printf(tty, "ext4 io_lock: held=%d depth=%d owner=%lld\n",
+                ext4_io_locked, ext4_io_depth, (long long)ext4_io_owner);
     }
-    /* Show USB MSD per-device lock states — fat32_io_lock is nested over
-     * msd->io_locked; if curl dies mid-write both can orphan. */
+    /* Show USB MSD per-device lock states — ext4_io_lock is nested over
+     * msd->io_locked; if a task dies mid-write both can orphan. */
     {
         extern usb_msd_device_t* g_msd_devices[8];
         extern int g_msd_count;

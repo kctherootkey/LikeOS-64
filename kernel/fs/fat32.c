@@ -2551,6 +2551,29 @@ static int fat32_open(const char* path, int flags, vfs_file_t** out) {
 static int fat32_stat_vfs(const char* path, struct kstat* st) {
     fat32_io_lock(); int r = fat32_stat_vfs_impl(path, st); fat32_io_unlock(); return r;
 }
+/* fstat on an open handle: report size + type straight from the in-memory file
+ * object (no path lookup, no disk I/O).  Lets the VFS read a file's size in a
+ * filesystem-independent way (vfs_size -> ops->fstat) without casting to a
+ * driver-specific struct. */
+static int fat32_fstat(vfs_file_t* f, struct kstat* st) {
+    if (!f || !st) return ST_INVALID;
+    fat32_file_t* ff = (fat32_file_t*)f;   /* vfs_file_t is the first member */
+    mm_memset(st, 0, sizeof(*st));
+    st->st_nlink  = 1;
+    st->st_blksize = g_root_fs
+        ? (uint64_t)g_root_fs->sectors_per_cluster * g_root_fs->bytes_per_sector : 4096;
+    st->st_ino = ff->start_cluster;
+    if (ff->is_dir) {
+        st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+    } else {
+        st->st_mode = S_IFREG | (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+        st->st_size = (long)ff->size;
+        st->st_blocks = (long)((ff->size + 511) / 512);
+    }
+    uint64_t now = timer_get_epoch();
+    st->st_mtime = now; st->st_atime = now; st->st_ctime = now;
+    return ST_OK;
+}
 static long fat32_read(vfs_file_t* f, void* buf, long bytes) {
     fat32_io_lock(); long r = fat32_read_impl(f, buf, bytes); fat32_io_unlock(); return r;
 }
@@ -2650,7 +2673,7 @@ static const vfs_ops_t fat32_vfs_ops = {
     fat32_close, fat32_release_locks_for_task, fat32_fsync,
     /* lstat */ 0, /* symlink */ 0, /* readlink */ 0, /* link */ 0,
     /* chmod */ 0, /* chown */ 0, /* fchmod */ 0, /* fchown */ 0,
-    fat32_utimensat, fat32_statfs_op,
+    fat32_utimensat, fat32_statfs_op, fat32_fstat,
 };
 
 static int fat32_resolve_parent(unsigned long start_cluster, const char *path,
