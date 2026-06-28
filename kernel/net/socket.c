@@ -361,6 +361,30 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 		return -err;
 	}
 
+	/* connect_done can be observed without this socket's connection actually
+	 * reaching the requested peer: under heavy concurrency the conn slot may
+	 * have been freed and recycled to a different connection (or had its
+	 * 4-tuple rewritten) while we were blocked.  Trusting connect_done/!error
+	 * blindly then lets a connect to a port with no listener wrongly succeed
+	 * (it should always be refused — a SYN to a closed port only ever yields a
+	 * RST, never a SYN+ACK).  Only report success if this is still OUR
+	 * connection to the requested destination and it has left SYN_SENT. */
+	if (conn->owner_socket != s || conn->remote_ip != dst_ip ||
+	    conn->remote_port != dst_port ||
+	    conn->state == TCP_STATE_SYN_SENT) {
+		kprintf("tcp: connect %u.%u.%u.%u:%u completed without establishing to "
+			"it (state=%d rport=%u mine=%d) -> ECONNREFUSED\n",
+			(dst_ip >> 24) & 0xff, (dst_ip >> 16) & 0xff,
+			(dst_ip >> 8) & 0xff, dst_ip & 0xff, dst_port, conn->state,
+			conn->remote_port, conn->owner_socket == s);
+		if (conn->owner_socket == s) {
+			conn->owner_socket = NULL;
+			tcp_close(conn);
+		}
+		s->tcp = NULL;
+		return -ECONNREFUSED;
+	}
+
 	s->connected = 1;
 	return 0;
 }
