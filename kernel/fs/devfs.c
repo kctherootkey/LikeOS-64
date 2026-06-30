@@ -240,6 +240,11 @@ int devfs_open(const char *path, int flags, vfs_file_t **out)
 	return devfs_open_for_task(path, flags, out, NULL);
 }
 
+/* The owner (root), group (root) and mode bits reported here are what the VFS
+ * permission layer enforces device access against — i.e. device-node DAC is
+ * driven entirely by this metadata.  Char devices are world-accessible (0666)
+ * and the /dev directories are world-searchable (0755); tightening a node to
+ * e.g. 0600 root here would restrict it to the privileged caller. */
 int devfs_stat(const char *path, struct kstat *st)
 {
 	if (!path || !st)
@@ -358,7 +363,10 @@ long devfs_write(vfs_file_t *f, const void *buf, long bytes)
 		return tty_pty_master_write(df->pty_id, buf, bytes);
 	}
 	if (df->type == DEVFS_TYPE_RANDOM || df->type == DEVFS_TYPE_URANDOM) {
-		// Writing to /dev/random mixes data into entropy pool
+		// Writing to /dev/random mixes data into the entropy pool and can
+		// trigger a reseed, so it is restricted to the privileged caller.
+		if (!capable())
+			return -EPERM;
 		smap_disable();
 		random_add_entropy(buf, (size_t)bytes);
 		smap_enable();

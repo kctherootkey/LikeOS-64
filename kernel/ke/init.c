@@ -176,6 +176,13 @@ __no_stack_protector void continue_system_startup(void)
 	futex_init();
 	sched_init();
 
+	/* The primordial task established by sched_init() is the sole root origin
+	 * of the credential system (real/effective/saved uid/gid all 0).  Every
+	 * other task inherits its credentials from a spawning task, so none is
+	 * silently born privileged.  Assert that initial security context here so a
+	 * regression in the "init is root" invariant is caught at boot. */
+	BUG_ON(!current_is_root());
+
 	// Mask ACPI SCI permanently — level-triggered EC GPE 0x66 fires
 	// continuously on this platform, causing an interrupt storm that
 	// blocks init progress.  We don't need EC events (battery/thermal)

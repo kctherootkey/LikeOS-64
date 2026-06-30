@@ -22,6 +22,9 @@ typedef enum {
 		-15, // no space left (e.g. xattr value too big for the inode)
 	ST_NODATA = -16, // no such attribute (xattr) — maps to ENODATA
 	ST_RANGE = -17, // result buffer too small (xattr) — maps to ERANGE
+	ST_ACCESS = -18, // permission denied by mode/ACL — maps to EACCES
+	ST_PERM =
+		-19, // operation not permitted (ownership/privilege) — maps to EPERM
 } status_t;
 
 #endif // LIKEOS_STATUS_H

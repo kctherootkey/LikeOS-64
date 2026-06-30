@@ -6,6 +6,7 @@
 #include <kernel/ke/syscall.h>
 #include <kernel/io/console.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/fs/vfs.h> /* vfs_permission_parent, MAY_* */
 
 // UNIX socket table
 static unix_socket_t unix_sockets[MAX_UNIX_SOCKETS];
@@ -142,6 +143,19 @@ int unix_bind(int usockfd, const struct sockaddr_un *addr)
 		return -EINVAL;
 	if (!addr || addr->sun_family != AF_UNIX)
 		return -EINVAL;
+
+	/* A pathname socket occupies a name in the filesystem namespace, so
+	 * binding it requires write+search permission on the containing
+	 * directory — the same rule as creating a file there.  Abstract sockets
+	 * (sun_path[0] == '\0') have no filesystem presence and are exempt.  The
+	 * check runs before the table lock so it never holds a spinlock across
+	 * the VFS stat.  (Peer-credential passing / SO_PEERCRED is a follow-up.) */
+	if (addr->sun_path[0]) {
+		int pr = vfs_permission_parent(addr->sun_path,
+					       MAY_WRITE | MAY_EXEC);
+		if (pr != ST_OK)
+			return (pr == ST_PERM) ? -EPERM : -EACCES;
+	}
 
 	// Path lookup + write of bound=1 must be atomic against other binds
 	// and against unix_close clearing bound — otherwise two binds can

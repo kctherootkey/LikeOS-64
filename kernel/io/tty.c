@@ -974,12 +974,22 @@ int tty_ioctl(tty_t *tty, unsigned long req, void *argp, task_t *cur)
 		int ret = tty_copy_from_user(&pgid, argp, sizeof(int));
 		if (ret != 0)
 			return ret;
+		/* Only a process whose controlling terminal is this tty (or the
+		 * privileged caller) may set the foreground process group. */
+		if (cur && !capable() && cur->ctty != tty)
+			return -EPERM;
+		if (pgid < 0)
+			return -EINVAL;
 		tty->fg_pgid = pgid;
 		return 0;
 	}
 	case TIOCSCTTY:
 		if (!cur)
 			return -EINVAL;
+		/* Only a session leader may acquire a controlling terminal; the
+		 * privileged caller is exempt. */
+		if (!capable() && cur->sid != (int)cur->id)
+			return -EPERM;
 		cur->ctty = tty;
 		return 0;
 	case TIOCGWINSZ:

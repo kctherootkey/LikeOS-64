@@ -4,6 +4,7 @@
 
 #include <kernel/uapi/status.h>
 #include <kernel/uapi/stat.h>
+#include <kernel/ke/cred.h> /* cred_t, MAY_READ/MAY_WRITE/MAY_EXEC, capable() */
 
 // Basic types (avoid hosted headers in freestanding build)
 typedef unsigned long size_t;
@@ -11,6 +12,12 @@ typedef long ssize_t; // signed size for read return
 typedef unsigned long uintptr_t;
 
 #define VFS_MAX_PATH 256
+
+/* Inode attribute flags the VFS enforces independently of the rwx mode bits,
+ * reported by a filesystem's optional inode_flags op.  These gate modification
+ * regardless of ownership (even the owner / root must clear them first). */
+#define VFS_ATTR_IMMUTABLE 0x01u /* no modification at all                  */
+#define VFS_ATTR_APPEND 0x02u /* writes append-only; no truncate/remove  */
 
 /* utimensat() nanosecond sentinels shared between the syscall layer and the
  * filesystem drivers' utimensat op (values match the userspace UTIME_NOW /
@@ -130,6 +137,18 @@ typedef struct {
      * second path resolution.  NULL op => the wrapper reports -EOPNOTSUPP. */
 	int (*getxattr_ino)(unsigned long ino, const char *name, void *val,
 			    unsigned long size);
+
+	/* ---- Optional permission participation --------------------------------
+	 * Filesystem-specific access decision, consulted by vfs_permission()
+	 * BEFORE the generic mode/ACL check.  Returns ST_OK to allow outright,
+	 * a negative ST_ code to deny outright, or ST_UNSUPPORTED to defer to the
+	 * generic VFS check.  Used by an ownership-less fs (FAT32) to emulate
+	 * permissive access.  NULL => always defer to the generic check. */
+	int (*permission)(const char *path, unsigned long ino, int want);
+	/* Report the VFS_ATTR_* flags for an already-resolved inode (immutable /
+	 * append-only).  Lets the VFS veto modifications independently of the mode
+	 * bits.  NULL => the filesystem has no such flags (none set). */
+	int (*inode_flags)(unsigned long ino, uint32_t *out_flags);
 } vfs_ops_t;
 
 struct vfs_file {
@@ -202,6 +221,36 @@ int vfs_fremovexattr(vfs_file_t *f, const char *name);
  * selects the owning filesystem.  Returns the value size or a negative ST_. */
 int vfs_getxattr_ino(const char *path, unsigned long ino, const char *name,
 		     void *val, unsigned long size);
+/* ---- Permission enforcement (the canonical place for DAC) -------------------
+ * The VFS is where Unix permission policy lives; the syscall layer only copies
+ * arguments and dispatches, and the filesystem drivers only supply ownership /
+ * ACL / inode-flag data.  The vfs_* operation wrappers call these internally,
+ * so most callers never invoke them directly — the exceptions are access(2)/
+ * faccessat (real-id check, no open) and execve (MAY_EXEC on the image).
+ *
+ * `want` is a mask of MAY_READ/MAY_WRITE/MAY_EXEC (from cred.h).  All return 0
+ * when permitted or a negative ST_ code (mapped to errno by the syscall layer).
+ * They are permissive when a path can't be resolved/stat'd, leaving the real
+ * operation to report ENOENT/ENOTDIR — and a no-op for the privileged caller. */
+
+/* May the current task access `path` for `want`, using the effective/fs IDs?
+ * Generic mode/ACL check plus the filesystem's optional `permission` hook. */
+int vfs_permission(const char *path, int want);
+/* Search (x) permission on every ancestor directory of `path` (effective IDs). */
+int vfs_permission_traverse(const char *path);
+/* access(2)/faccessat: traversal + access check against the REAL uid/gid. */
+int vfs_access(const char *path, int want);
+/* Prefix traversal with explicit real(1)/effective(0) id selection. */
+int vfs_access_traverse(const char *path, int use_real);
+/* Write+search on the PARENT directory of `path` (create/remove/rename). */
+int vfs_permission_parent(const char *path, int want);
+/* Remove/rename gate: parent write+search plus the sticky-bit ownership rule. */
+int vfs_permission_remove(const char *path);
+/* Access check against an already-resolved stat `st` (no path walk); honours
+ * the ACL then the mode bits.  `use_real` selects real vs effective/fs ids. */
+int vfs_check_access(const char *path, const struct kstat *st, int want,
+		     int use_real);
+
 /* Flush the root filesystem's pending metadata + journal to disk (sync(2)).
  * No-op when the root fs provides no sync op.  fs-independent. */
 int vfs_sync(void);

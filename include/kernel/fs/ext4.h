@@ -80,6 +80,9 @@
 #define EXT4_FEATURE_RO_COMPAT_METADATA_CSUM 0x0400
 
 /* inode i_flags bits */
+#define EXT4_INODE_IMMUTABLE_FL 0x00000010 /* may not be modified at all      */
+#define EXT4_INODE_APPEND_FL \
+	0x00000020 /* writes append-only; no truncate/remove */
 #define EXT4_INODE_INDEX_FL 0x00001000 /* hash-indexed (htree) directory */
 #define EXT4_INODE_EXTENTS_FL 0x00080000
 #define EXT4_INODE_INLINE_DATA_FL 0x10000000

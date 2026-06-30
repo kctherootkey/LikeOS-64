@@ -76,4 +76,26 @@ int cred_setegid(cred_t *c, uint32_t egid);
 int cred_setresuid(cred_t *c, uint32_t r, uint32_t e, uint32_t s);
 int cred_setresgid(cred_t *c, uint32_t r, uint32_t e, uint32_t s);
 
+/* ---- Current-task credential accessors --------------------------------------
+ * Thin helpers that fetch the calling task's credentials (via the scheduler),
+ * so callers throughout the kernel don't reach into task internals.  When there
+ * is no current task (very early boot / pure kernel context) the identity is
+ * root, matching the rule that kernel context is privileged.  These take no
+ * task argument by design — they always operate on the caller. */
+cred_t *current_cred(void); /* &current->cred, or NULL in kernel context */
+uint32_t current_uid(void);
+uint32_t current_euid(void);
+uint32_t current_gid(void);
+uint32_t current_egid(void);
+uint32_t current_fsuid(void);
+uint32_t current_fsgid(void);
+int current_in_group(uint32_t gid); /* 1 if egid or a supplementary group */
+int current_is_root(void); /* 1 if effective uid 0 */
+
+/* The single privilege chokepoint.  Today this is simply "effective uid 0";
+ * every privileged-operation gate in the kernel routes through it so a real
+ * capability model can be introduced later without touching call sites.
+ * Returns non-zero if the caller is permitted the privileged action. */
+int capable(void);
+
 #endif /* LIKEOS_CRED_H */

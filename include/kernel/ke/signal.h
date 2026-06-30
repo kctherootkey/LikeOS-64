@@ -467,6 +467,11 @@ void signal_fork_copy(struct task *child, struct task *parent);
 void signal_cleanup_task(struct task *task);
 int signal_send(struct task *task, int sig, siginfo_t *info);
 int signal_send_group(int pgid, int sig, siginfo_t *info);
+/* May the calling task send `sig` to `target`?  POSIX rule: the privileged
+ * caller may signal anyone; otherwise the sender's real or effective uid must
+ * match the target's real or saved-set uid (SIGCONT is also allowed within the
+ * same session).  Returns 0 if permitted, or -EPERM. */
+int signal_permission(struct task *target, int sig);
 int signal_pending(struct task *task);
 int signal_should_restart(struct task *task);
 int signal_dequeue(struct task *task, kernel_sigset_t *mask, siginfo_t *info);

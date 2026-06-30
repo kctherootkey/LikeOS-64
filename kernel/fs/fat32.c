@@ -3131,9 +3131,24 @@ static int fat32_statfs_op(struct vfs_statfs *out)
 	return ST_OK;
 }
 
+/* FAT32 stores no ownership or permission bits, so it emulates a fully
+ * permissive policy: every user may read and traverse (and, lacking any owner,
+ * write) any file or directory.  A future mount option could instead stamp the
+ * files with the mounting user's uid/gid.  Returning ST_OK makes the VFS
+ * permission check allow the access outright, before the generic mode-bit
+ * check the emulated metadata would otherwise drive. */
+static int fat32_permission_op(const char *path, unsigned long ino, int want)
+{
+	(void)path;
+	(void)ino;
+	(void)want;
+	return ST_OK; /* no on-disk perms: allow everyone */
+}
+
 /* FAT32 has no symlinks, hard links, permission bits or ownership, so those
  * ops stay NULL — the vfs_* wrappers then apply the legacy fallbacks (chmod/
- * chown succeed silently, symlink/link report unsupported, lstat == stat). */
+ * chown succeed silently, symlink/link report unsupported, lstat == stat).
+ * The permission op above makes access permissive for all users. */
 static const vfs_ops_t fat32_vfs_ops = {
 	fat32_open,       fat32_stat_vfs,
 	fat32_read,       fat32_write,
@@ -3149,6 +3164,7 @@ static const vfs_ops_t fat32_vfs_ops = {
 	/* fchmod */ 0,   /* fchown */ 0,
 	fat32_utimensat,  fat32_statfs_op,
 	fat32_fstat,
+	.permission = fat32_permission_op,
 };
 
 static int fat32_resolve_parent(unsigned long start_cluster, const char *path,

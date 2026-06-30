@@ -9,6 +9,283 @@
 static const vfs_ops_t *g_root_ops = 0;
 static const vfs_ops_t *g_dev_ops = 0;
 
+/* Open-flag bits the permission layer interprets.  These mirror the stable
+ * open(2) ABI values (see the syscall header); defined locally with guards so
+ * the VFS does not have to depend on the syscall layer's header. */
+#ifndef O_RDONLY
+#define O_RDONLY 0x0000
+#endif
+#ifndef O_WRONLY
+#define O_WRONLY 0x0001
+#endif
+#ifndef O_RDWR
+#define O_RDWR 0x0002
+#endif
+#ifndef O_CREAT
+#define O_CREAT 0x0040
+#endif
+#ifndef O_TRUNC
+#define O_TRUNC 0x0200
+#endif
+#ifndef O_APPEND
+#define O_APPEND 0x0400
+#endif
+
+/* Permission helpers used by the operation wrappers below; the canonical
+ * vfs_permission / vfs_permission_traverse / vfs_access are declared in vfs.h. */
+static int vfs_attr_allow_modify(const char *path, int is_append_write);
+static const vfs_ops_t *vfs_ops_for_path(const char *path);
+/* Raw stat dispatch with NO permission check — used by the permission layer
+ * itself (the public vfs_stat below adds prefix-traversal enforcement, so the
+ * permission helpers must use this raw form to avoid unbounded recursion). */
+static int vfs_raw_stat(const char *path, struct kstat *st);
+
+/* ============================ Permission layer ============================
+ * The VFS is the canonical place for Unix discretionary access control: this
+ * policy was consolidated out of the syscall layer so every filesystem — and
+ * every path that reaches a file through the VFS — is checked uniformly.  The
+ * ownership/mode/ACL data comes from the filesystem (stat + the ACL xattr); the
+ * privileged caller (capable()) bypasses, which keeps the all-root boot and
+ * every in-kernel VFS caller working unchanged.  Checks are permissive when a
+ * path can't be resolved/stat'd, leaving the real op to report ENOENT/ENOTDIR. */
+
+/* Access check for a file whose stat is `st`, honouring a POSIX access ACL
+ * (system.posix_acl_access) if present, else the mode bits.  `use_real` selects
+ * the real vs effective/fs ids (access(2) uses the real ids).  ST_OK/ST_ACCESS. */
+static int vfs_perm_access(const char *path, const struct kstat *st, int want,
+			   int use_real)
+{
+	cred_t *c = current_cred();
+	if (!c)
+		return ST_OK; /* kernel context: privileged */
+	uint32_t cuid = use_real ? c->uid : c->euid;
+	if (cuid != 0) {
+		unsigned char acl[512];
+		int n = vfs_getxattr_ino(path, (unsigned long)st->st_ino,
+					 "system.posix_acl_access", acl,
+					 sizeof(acl));
+		if (n > 0) {
+			int r = cred_acl_access(c, acl, (unsigned)n,
+						(uint32_t)st->st_uid,
+						(uint32_t)st->st_gid, want,
+						use_real);
+			if (r <= 0)
+				return (r == 0) ? ST_OK :
+						  ST_ACCESS; /* ACL decided */
+			/* r == 1: no usable ACL -> fall through to mode bits */
+		}
+	}
+	int r = use_real ? cred_check_access_real(c, (uint32_t)st->st_mode,
+						  (uint32_t)st->st_uid,
+						  (uint32_t)st->st_gid, want) :
+			   cred_check_access(c, (uint32_t)st->st_mode,
+					     (uint32_t)st->st_uid,
+					     (uint32_t)st->st_gid, want);
+	return (r == 0) ? ST_OK : ST_ACCESS;
+}
+
+/* Shared worker for vfs_permission (use_real=0) and vfs_access (use_real=1). */
+static int vfs_permission_id(const char *path, int want, int use_real)
+{
+	BUG_ON(path == NULL);
+	const vfs_ops_t *o = vfs_ops_for_path(path);
+	struct kstat st;
+	if (!o || vfs_raw_stat(path, &st) != ST_OK)
+		return ST_OK; /* unresolved: defer to the real op */
+	/* Filesystem-specific decision first (e.g. FAT32 emulates permissive). */
+	if (o->permission) {
+		int fr = o->permission(path, (unsigned long)st.st_ino, want);
+		if (fr != ST_UNSUPPORTED)
+			return fr;
+	}
+	return vfs_perm_access(path, &st, want, use_real);
+}
+
+int vfs_permission(const char *path, int want)
+{
+	return vfs_permission_id(path, want, 0);
+}
+
+/* Access check against an already-resolved stat (no path walk), honouring the
+ * ACL then the mode bits.  Lets a caller that just stat'd a file check it
+ * without re-resolving.  `use_real` selects the real vs effective/fs ids. */
+int vfs_check_access(const char *path, const struct kstat *st, int want,
+		     int use_real)
+{
+	BUG_ON(path == NULL);
+	BUG_ON(st == NULL);
+	return vfs_perm_access(path, st, want, use_real);
+}
+
+/* Per-component traversal: a non-privileged task needs search (x) on every
+ * ancestor directory of `path`.  Walks "/", "/a", "/a/b" for "/a/b/c".  Assumes
+ * an absolute path (the syscall layer canonicalises before calling the VFS); a
+ * relative path is deferred to the resolver.  No-op for the privileged caller. */
+static int vfs_permission_traverse_id(const char *path, int use_real)
+{
+	cred_t *c = current_cred();
+	if (!c)
+		return ST_OK;
+	uint32_t cuid = use_real ? c->uid : c->euid;
+	if (cuid == 0)
+		return ST_OK; /* privileged: bypass */
+	if (!path || path[0] != '/') {
+		WARN_ON_ONCE(path && path[0] != '/');
+		return ST_OK; /* not absolute: defer to the resolver */
+	}
+	size_t len = 0;
+	while (path[len])
+		len++;
+	while (len > 1 && path[len - 1] == '/')
+		len--; /* ignore a trailing slash */
+	if (len <= 1)
+		return ST_OK; /* "/" has no ancestors */
+	size_t last = 0;
+	for (size_t i = 0; i < len; i++)
+		if (path[i] == '/')
+			last = i;
+	char dir[VFS_MAX_PATH];
+	for (size_t i = 0; i <= last; i++) { /* ancestors only */
+		if (path[i] != '/')
+			continue;
+		if (i == 0) {
+			dir[0] = '/';
+			dir[1] = '\0';
+		} else {
+			if (i >= sizeof(dir))
+				return ST_OK;
+			for (size_t j = 0; j < i; j++)
+				dir[j] = path[j];
+			dir[i] = '\0';
+		}
+		struct kstat st;
+		if (vfs_raw_stat(dir, &st) != ST_OK)
+			continue; /* defer to the resolver */
+		if ((st.st_mode & S_IFMT) != S_IFDIR)
+			continue;
+		int pr = vfs_perm_access(dir, &st, MAY_EXEC, use_real);
+		if (pr != ST_OK)
+			return pr;
+	}
+	return ST_OK;
+}
+
+int vfs_permission_traverse(const char *path)
+{
+	return vfs_permission_traverse_id(path, 0);
+}
+
+int vfs_access(const char *path, int want)
+{
+	int tr = vfs_permission_traverse_id(path, 1);
+	if (tr != ST_OK)
+		return tr;
+	return vfs_permission_id(path, want, 1);
+}
+
+/* Prefix traversal with an explicit real/effective id selection, exposed so the
+ * access(2)/faccessat syscalls can search the prefix separately from the final
+ * access check (they need to distinguish F_OK reachability and ENOENT). */
+int vfs_access_traverse(const char *path, int use_real)
+{
+	return vfs_permission_traverse_id(path, use_real);
+}
+
+/* Absolute parent directory of `path` into `out`.  Returns 1, or 0 when there's
+ * no directory component or it won't fit.  Assumes an absolute path. */
+static int vfs_parent_of(const char *path, char *out, size_t outsz)
+{
+	if (!path || path[0] != '/')
+		return 0;
+	size_t len = 0;
+	while (path[len])
+		len++;
+	while (len > 1 && path[len - 1] == '/')
+		len--;
+	size_t slash = (size_t)-1;
+	for (size_t i = 0; i < len; i++)
+		if (path[i] == '/')
+			slash = i;
+	if (slash == (size_t)-1)
+		return 0;
+	if (slash == 0) {
+		out[0] = '/';
+		out[1] = '\0';
+	} else {
+		if (slash >= outsz)
+			return 0;
+		for (size_t i = 0; i < slash; i++)
+			out[i] = path[i];
+		out[slash] = '\0';
+	}
+	return 1;
+}
+
+/* Access to the PARENT directory of `path` — for create/remove/rename, which
+ * modify the containing directory (want is typically MAY_WRITE|MAY_EXEC). */
+int vfs_permission_parent(const char *path, int want)
+{
+	if (capable())
+		return ST_OK;
+	char parent[VFS_MAX_PATH];
+	if (!vfs_parent_of(path, parent, sizeof(parent)))
+		return ST_OK;
+	int tr = vfs_permission_traverse(parent);
+	if (tr != ST_OK)
+		return tr;
+	return vfs_permission(parent, want);
+}
+
+/* Remove/rename gate: parent write+search, plus the sticky bit (S_ISVTX, e.g.
+ * /tmp at 1777) — a non-privileged task may then only remove/rename an entry it
+ * owns, or when it owns the containing directory. */
+int vfs_permission_remove(const char *path)
+{
+	if (capable())
+		return ST_OK;
+	int pr = vfs_permission_parent(path, MAY_WRITE | MAY_EXEC);
+	if (pr != ST_OK)
+		return pr;
+	char parent[VFS_MAX_PATH];
+	if (!vfs_parent_of(path, parent, sizeof(parent)))
+		return ST_OK;
+	struct kstat pst;
+	if (vfs_raw_stat(parent, &pst) != ST_OK)
+		return ST_OK;
+	if (!(pst.st_mode & S_ISVTX))
+		return ST_OK; /* no sticky bit: parent write is enough */
+	struct kstat st;
+	if (vfs_raw_stat(path, &st) != ST_OK)
+		return ST_OK;
+	uint32_t me = current_fsuid();
+	if ((uint32_t)st.st_uid == me || (uint32_t)pst.st_uid == me)
+		return ST_OK;
+	return ST_PERM;
+}
+
+/* Veto a modification forbidden by immutable/append-only inode flags, which
+ * bind regardless of ownership (even the owner and the privileged caller must
+ * clear the flag first).  `is_append_write` is 1 only for an append-mode write
+ * (the lone modification an append-only file permits).  No-op for a filesystem
+ * without the inode_flags op. */
+static int vfs_attr_allow_modify(const char *path, int is_append_write)
+{
+	const vfs_ops_t *o = vfs_ops_for_path(path);
+	if (!o || !o->inode_flags)
+		return ST_OK;
+	struct kstat st;
+	if (vfs_raw_stat(path, &st) != ST_OK)
+		return ST_OK;
+	uint32_t fl = 0;
+	if (o->inode_flags((unsigned long)st.st_ino, &fl) != ST_OK)
+		return ST_OK;
+	if (fl & VFS_ATTR_IMMUTABLE)
+		return ST_PERM;
+	if ((fl & VFS_ATTR_APPEND) && !is_append_write)
+		return ST_PERM;
+	return ST_OK;
+}
+
 /* ================================================================== */
 
 int vfs_init(void)
@@ -62,6 +339,49 @@ int vfs_open(const char *path, int flags, vfs_file_t **out)
 {
 	BUG_ON(path == NULL);
 	BUG_ON(out == NULL);
+
+	/* Permission enforcement (canonical for every filesystem): search the
+	 * path prefix, then check read/write on an existing target — or write on
+	 * the parent directory when creating — plus any immutable/append-only
+	 * inode flag.  Decided here so read()/write() need not re-check: the open
+	 * mode the fd carries already encodes the granted access. */
+	{
+		int tr = vfs_permission_traverse(path);
+		if (tr != ST_OK)
+			return tr;
+		int acc = flags & 3;
+		int want = 0;
+		if (acc == O_RDONLY || acc == O_RDWR)
+			want |= MAY_READ;
+		if (acc == O_WRONLY || acc == O_RDWR)
+			want |= MAY_WRITE;
+		if (flags & O_TRUNC)
+			want |= MAY_WRITE;
+		struct kstat est;
+		int exists = (vfs_raw_stat(path, &est) == ST_OK);
+		if (exists) {
+			if (want) {
+				int pr = vfs_permission(path, want);
+				if (pr != ST_OK)
+					return pr;
+			}
+			if (want & MAY_WRITE) {
+				int append_ok = ((flags & O_APPEND) &&
+						 !(flags & O_TRUNC)) ?
+							1 :
+							0;
+				int im = vfs_attr_allow_modify(path, append_ok);
+				if (im != ST_OK)
+					return im;
+			}
+		} else if (flags & O_CREAT) {
+			int pr = vfs_permission_parent(path,
+						       MAY_WRITE | MAY_EXEC);
+			if (pr != ST_OK)
+				return pr;
+		}
+	}
+
 	if (vfs_is_dev_path(path)) {
 		if (!g_dev_ops || !g_dev_ops->open)
 			return ST_UNSUPPORTED;
@@ -93,7 +413,9 @@ int vfs_open(const char *path, int flags, vfs_file_t **out)
 	return ret;
 }
 
-int vfs_stat(const char *path, struct kstat *st)
+/* Raw stat: dispatch to the owning filesystem with no permission check.  Used
+ * by the permission layer (which would otherwise recurse through vfs_stat). */
+static int vfs_raw_stat(const char *path, struct kstat *st)
 {
 	if (vfs_is_dev_path(path)) {
 		if (!g_dev_ops || !g_dev_ops->stat)
@@ -105,8 +427,25 @@ int vfs_stat(const char *path, struct kstat *st)
 	return g_root_ops->stat(path, st);
 }
 
+int vfs_stat(const char *path, struct kstat *st)
+{
+	/* stat(2) requires search (x) permission on every directory in the
+	 * prefix; the file's own permissions are not consulted. */
+	int tr = vfs_permission_traverse(path);
+	if (tr != ST_OK)
+		return tr;
+	return vfs_raw_stat(path, st);
+}
+
 int vfs_chdir(const char *path)
 {
+	/* Need search (x) on the prefix and on the target directory itself. */
+	int tr = vfs_permission_traverse(path);
+	if (tr != ST_OK)
+		return tr;
+	int pr = vfs_permission(path, MAY_EXEC);
+	if (pr != ST_OK)
+		return pr;
 	if (vfs_is_dev_path(path)) {
 		if (!g_dev_ops || !g_dev_ops->chdir)
 			return ST_UNSUPPORTED;
@@ -140,6 +479,9 @@ int vfs_sync(void)
 
 int vfs_lstat(const char *path, struct kstat *st)
 {
+	int tr = vfs_permission_traverse(path); /* search the prefix */
+	if (tr != ST_OK)
+		return tr;
 	const vfs_ops_t *o = vfs_ops_for_path(path);
 	if (!o)
 		return ST_UNSUPPORTED;
@@ -155,6 +497,9 @@ int vfs_symlink(const char *target, const char *linkpath)
 	const vfs_ops_t *o = vfs_ops_for_path(linkpath);
 	if (!o || !o->symlink)
 		return ST_UNSUPPORTED;
+	int pr = vfs_permission_parent(linkpath, MAY_WRITE | MAY_EXEC);
+	if (pr != ST_OK)
+		return pr;
 	return o->symlink(target, linkpath);
 }
 
@@ -173,6 +518,13 @@ int vfs_link(const char *oldpath, const char *newpath)
 	const vfs_ops_t *o = vfs_ops_for_path(newpath);
 	if (!o || !o->link)
 		return ST_UNSUPPORTED;
+	/* Need to reach the existing inode and write the new name's directory. */
+	int tr = vfs_permission_traverse(oldpath);
+	if (tr != ST_OK)
+		return tr;
+	int pr = vfs_permission_parent(newpath, MAY_WRITE | MAY_EXEC);
+	if (pr != ST_OK)
+		return pr;
 	return o->link(oldpath, newpath);
 }
 
@@ -181,6 +533,25 @@ int vfs_chmod(const char *path, unsigned int mode)
 	const vfs_ops_t *o = vfs_ops_for_path(path);
 	if (!o)
 		return ST_UNSUPPORTED;
+	int tr = vfs_permission_traverse(path);
+	if (tr != ST_OK)
+		return tr;
+	if (!capable()) {
+		struct kstat st;
+		if (vfs_raw_stat(path, &st) == ST_OK) {
+			/* Only the file's owner may change its mode. */
+			if ((uint32_t)st.st_uid != current_fsuid())
+				return ST_PERM;
+			/* A non-privileged owner cannot set the set-group-ID bit
+			 * for a group it is not a member of. */
+			if ((mode & S_ISGID) &&
+			    !current_in_group((uint32_t)st.st_gid))
+				mode &= ~(unsigned)S_ISGID;
+		}
+	}
+	int im = vfs_attr_allow_modify(path, 0);
+	if (im != ST_OK)
+		return im;
 	if (!o->chmod)
 		return ST_OK; /* fs has no permission bits */
 	return o->chmod(path, mode);
@@ -191,6 +562,28 @@ int vfs_chown(const char *path, int uid, int gid)
 	const vfs_ops_t *o = vfs_ops_for_path(path);
 	if (!o)
 		return ST_UNSUPPORTED;
+	int tr = vfs_permission_traverse(path);
+	if (tr != ST_OK)
+		return tr;
+	if (!capable()) {
+		struct kstat st;
+		if (vfs_raw_stat(path, &st) == ST_OK) {
+			/* Changing the owner is privileged. */
+			if (uid != -1 && (uint32_t)uid != (uint32_t)st.st_uid)
+				return ST_PERM;
+			/* Changing the group requires owning the file and being
+			 * a member of the target group. */
+			if (gid != -1 && (uint32_t)gid != (uint32_t)st.st_gid) {
+				if ((uint32_t)st.st_uid != current_fsuid())
+					return ST_PERM;
+				if (!current_in_group((uint32_t)gid))
+					return ST_PERM;
+			}
+		}
+	}
+	int im = vfs_attr_allow_modify(path, 0);
+	if (im != ST_OK)
+		return im;
 	if (!o->chown)
 		return ST_OK; /* fs has no ownership */
 	return o->chown(path, uid, gid);
@@ -219,6 +612,23 @@ int vfs_utimensat(const char *path, int64_t mtime_sec, long mtime_nsec)
 	const vfs_ops_t *o = vfs_ops_for_path(path);
 	if (!o)
 		return ST_UNSUPPORTED;
+	int tr = vfs_permission_traverse(path);
+	if (tr != ST_OK)
+		return tr;
+	if (!capable()) {
+		struct kstat st;
+		/* The owner may always set times; otherwise write permission on
+		 * the file is required. */
+		if (vfs_raw_stat(path, &st) == ST_OK &&
+		    (uint32_t)st.st_uid != current_fsuid()) {
+			int pr = vfs_permission(path, MAY_WRITE);
+			if (pr != ST_OK)
+				return pr;
+		}
+	}
+	int im = vfs_attr_allow_modify(path, 0);
+	if (im != ST_OK)
+		return im;
 	if (!o->utimensat)
 		return ST_OK; /* fs manages times itself */
 	return o->utimensat(path, mtime_sec, mtime_nsec);
@@ -278,6 +688,20 @@ int vfs_setxattr(const char *path, int nofollow, const char *name,
 	const vfs_ops_t *o = vfs_ops_for_path(path);
 	if (!o || !o->setxattr)
 		return ST_UNSUPPORTED;
+	int tr = vfs_permission_traverse(path);
+	if (tr != ST_OK)
+		return tr;
+	/* Setting an attribute (including a POSIX ACL) is reserved to the file's
+	 * owner and the privileged caller. */
+	if (!capable()) {
+		struct kstat st;
+		if (vfs_raw_stat(path, &st) == ST_OK &&
+		    (uint32_t)st.st_uid != current_fsuid())
+			return ST_PERM;
+	}
+	int im = vfs_attr_allow_modify(path, 0);
+	if (im != ST_OK)
+		return im;
 	return o->setxattr(path, nofollow, name, val, size, flags);
 }
 int vfs_listxattr(const char *path, int nofollow, char *list,
@@ -293,6 +717,18 @@ int vfs_removexattr(const char *path, int nofollow, const char *name)
 	const vfs_ops_t *o = vfs_ops_for_path(path);
 	if (!o || !o->removexattr)
 		return ST_UNSUPPORTED;
+	int tr = vfs_permission_traverse(path);
+	if (tr != ST_OK)
+		return tr;
+	if (!capable()) {
+		struct kstat st;
+		if (vfs_raw_stat(path, &st) == ST_OK &&
+		    (uint32_t)st.st_uid != current_fsuid())
+			return ST_PERM;
+	}
+	int im = vfs_attr_allow_modify(path, 0);
+	if (im != ST_OK)
+		return im;
 	return o->removexattr(path, nofollow, name);
 }
 int vfs_fgetxattr(vfs_file_t *f, const char *name, void *val,
@@ -407,30 +843,59 @@ int vfs_truncate(vfs_file_t *f, unsigned long size)
 {
 	if (!f || !f->ops || !f->ops->truncate)
 		return ST_UNSUPPORTED;
+	/* Write access (and the immutable/append-only veto) were enforced when
+	 * the handle was opened for writing, so no path-based recheck is needed
+	 * here — an fd opened read-only cannot reach a writable fs truncate op. */
 	return f->ops->truncate(f, size);
 }
 int vfs_unlink(const char *path)
 {
 	if (!g_root_ops || !g_root_ops->unlink)
 		return ST_UNSUPPORTED;
+	int pr = vfs_permission_remove(path);
+	if (pr != ST_OK)
+		return pr;
+	int im = vfs_attr_allow_modify(path, 0); /* immutable/append: no unlink */
+	if (im != ST_OK)
+		return im;
 	return g_root_ops->unlink(path);
 }
 int vfs_rename(const char *oldpath, const char *newpath)
 {
 	if (!g_root_ops || !g_root_ops->rename)
 		return ST_UNSUPPORTED;
+	/* Renaming removes the old name (parent write + sticky) and creates the
+	 * new one (new parent write); the source inode's flags must permit it. */
+	int pr = vfs_permission_remove(oldpath);
+	if (pr != ST_OK)
+		return pr;
+	pr = vfs_permission_parent(newpath, MAY_WRITE | MAY_EXEC);
+	if (pr != ST_OK)
+		return pr;
+	int im = vfs_attr_allow_modify(oldpath, 0);
+	if (im != ST_OK)
+		return im;
 	return g_root_ops->rename(oldpath, newpath);
 }
 int vfs_mkdir(const char *path, unsigned int mode)
 {
 	if (!g_root_ops || !g_root_ops->mkdir)
 		return ST_UNSUPPORTED;
+	int pr = vfs_permission_parent(path, MAY_WRITE | MAY_EXEC);
+	if (pr != ST_OK)
+		return pr;
 	return g_root_ops->mkdir(path, mode);
 }
 int vfs_rmdir(const char *path)
 {
 	if (!g_root_ops || !g_root_ops->rmdir)
 		return ST_UNSUPPORTED;
+	int pr = vfs_permission_remove(path);
+	if (pr != ST_OK)
+		return pr;
+	int im = vfs_attr_allow_modify(path, 0);
+	if (im != ST_OK)
+		return im;
 	return g_root_ops->rmdir(path);
 }
 

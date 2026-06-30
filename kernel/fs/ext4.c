@@ -6278,6 +6278,31 @@ static int ext4_fremovexattr_op(vfs_file_t *f, const char *name)
 	return r;
 }
 
+/* Report the VFS_ATTR_* flags (immutable / append-only) for an inode, so the
+ * VFS can veto modifications independently of the rwx mode bits.  ext4 stores
+ * these in the on-disk inode's i_flags; this is the filesystem-specific input
+ * to the otherwise-generic VFS permission check. */
+static int ext4_inode_flags_op(unsigned long ino, uint32_t *out_flags)
+{
+	if (!out_flags)
+		return ST_INVALID;
+	*out_flags = 0;
+	ext4_fs_t *fs = g_ext4_fs;
+	if (!fs)
+		return ST_NO_DEVICE;
+	ext4_inode in;
+	ext4_io_lock();
+	int r = ext4_read_inode_loc(fs, ino, &in, 0, 0);
+	ext4_io_unlock();
+	if (r != ST_OK)
+		return ST_IO;
+	if (in.i_flags & EXT4_INODE_IMMUTABLE_FL)
+		*out_flags |= VFS_ATTR_IMMUTABLE;
+	if (in.i_flags & EXT4_INODE_APPEND_FL)
+		*out_flags |= VFS_ATTR_APPEND;
+	return ST_OK;
+}
+
 static const vfs_ops_t ext4_vfs_ops = {
 	ext4_open,
 	ext4_stat_vfs,
@@ -6318,6 +6343,11 @@ static const vfs_ops_t ext4_vfs_ops = {
 	ext4_flistxattr_op,
 	ext4_fremovexattr_op,
 	ext4_getxattr_ino_op,
+	/* permission participation: ext4 uses the generic VFS mode/ACL check
+	 * (the ACL is read through getxattr_ino), so no custom decision hook; it
+	 * only contributes the immutable/append-only inode flags. */
+	0, /* permission */
+	ext4_inode_flags_op,
 };
 
 /* ===================================================================

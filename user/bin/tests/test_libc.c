@@ -526,6 +526,116 @@ static void rmtree(const char *path)
 	rmdir(path);
 }
 
+/* Credential / permission tests.  These run from a privileged process (the
+ * shell spawns programs with the inherited root credentials), so denials are
+ * exercised by dropping the effective uid with seteuid() and then restoring it
+ * with seteuid(0) — the real and saved uids stay 0, so root can always be
+ * regained.  The cross-uid kill() test uses forked children that take a fixed
+ * uid via setresuid(), so the parent's credentials are never disturbed. */
+static void test_credentials(void)
+{
+	printf("\n[TEST] credentials & permissions\n");
+
+	/* Baseline: a freshly spawned program is privileged. */
+	test_result("getuid() is root at start", getuid() == 0);
+	test_result("geteuid() is root at start", geteuid() == 0);
+	int rr = -1, ee = -1, ss = -1;
+	test_result("getresuid() succeeds", getresuid(&rr, &ee, &ss) == 0);
+	test_result("getresuid() reports all-root", rr == 0 && ee == 0 &&
+							    ss == 0);
+
+	/* kill() permission: a uid-3000 process may not signal a uid-2000 one.
+	 * Done entirely in children (parent stays root). */
+	pid_t victim = fork();
+	if (victim == 0) {
+		setresuid(2000, 2000, 2000); /* become uid 2000 permanently */
+		sleep(30); /* wait to be killed by the (root) parent */
+		_exit(0);
+	}
+	if (victim > 0) {
+		usleep(50000); /* let the victim drop its uid */
+		pid_t prober = fork();
+		if (prober == 0) {
+			setresuid(3000, 3000, 3000);
+			int kr = kill(victim, 0); /* permission probe, no signal */
+			_exit((kr < 0 && errno == EPERM) ? 0 : 1);
+		}
+		int pst = 0;
+		waitpid(prober, &pst, 0);
+		test_result("kill() across uids denied (EPERM)",
+			    WIFEXITED(pst) && WEXITSTATUS(pst) == 0);
+		kill(victim, SIGKILL); /* parent is root: allowed */
+		waitpid(victim, NULL, 0);
+	}
+
+	/* Create a root-owned 0600 file and a 0700 directory while privileged.
+	 * Paths are made unique per process so several testlibc instances can run
+	 * concurrently without racing on the same files; stale entries from an
+	 * earlier run that reused this PID are cleared first. */
+	int mypid = (int)getpid();
+	char secret[64], priv_dir[64], priv_child[96];
+	snprintf(secret, sizeof(secret), "/tmp/cred_secret_%d", mypid);
+	snprintf(priv_dir, sizeof(priv_dir), "/tmp/cred_dir_%d", mypid);
+	snprintf(priv_child, sizeof(priv_child), "%s/whatever", priv_dir);
+	unlink(secret);
+	rmdir(priv_dir);
+	int fd = open(secret, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+	test_result("create root-owned 0600 file", fd >= 0);
+	if (fd >= 0) {
+		write(fd, "x", 1);
+		close(fd);
+	}
+	chmod(secret, 0600);
+	mkdir(priv_dir, 0700);
+
+	/* Drop the effective uid to an unprivileged value. */
+	test_result("seteuid(1000) succeeds", seteuid(1000) == 0);
+	test_result("geteuid() == 1000 after drop", geteuid() == 1000);
+	test_result("getuid() == 0 (real uid unchanged)", getuid() == 0);
+
+	/* A non-root effective uid cannot raise privilege. */
+	test_result("setuid(1) denied for non-root", setuid(1) < 0);
+	int grp[1] = { 7 };
+	test_result("setgroups() denied for non-root", setgroups(1, grp) < 0);
+
+	/* A non-root process cannot read a root-owned 0600 file ... */
+	int rfd = open(secret, O_RDONLY);
+	test_result("read of root 0600 file denied (EACCES)",
+		    rfd < 0 && errno == EACCES);
+	if (rfd >= 0)
+		close(rfd);
+	/* ... cannot search a root-owned 0700 directory ... */
+	int dfd = open(priv_child, O_RDONLY);
+	test_result("traverse of 0700 root dir denied", dfd < 0);
+	if (dfd >= 0)
+		close(dfd);
+	/* ... and cannot chmod/chown a file it does not own. */
+	test_result("chmod of unowned file denied", chmod(secret, 0666) < 0);
+	test_result("chown of unowned file denied", chown(secret, 1000, 1000) < 0);
+
+	/* Restore privilege (always possible: real and saved uid are still 0). */
+	test_result("seteuid(0) restores root", seteuid(0) == 0 &&
+						       geteuid() == 0);
+
+	/* Root regains full access. */
+	int rfd2 = open(secret, O_RDONLY);
+	test_result("root can read the 0600 file", rfd2 >= 0);
+	if (rfd2 >= 0)
+		close(rfd2);
+	test_result("root can chmod the file", chmod(secret, 0644) == 0);
+
+	/* Supplementary groups round-trip as root. */
+	int setg[2] = { 10, 20 };
+	test_result("setgroups() succeeds as root", setgroups(2, setg) == 0);
+	int gotg[8];
+	int ng = getgroups(8, gotg);
+	test_result("getgroups() returns the set count", ng == 2);
+
+	/* Cleanup. */
+	unlink(secret);
+	rmdir(priv_dir);
+}
+
 int main(int argc, char **argv)
 {
 	/* Subcommand selection:
@@ -4798,6 +4908,11 @@ int main(int argc, char **argv)
 				    sjr2 == 1);
 		}
 	}
+
+	// ========================================
+	// Credentials & permissions
+	// ========================================
+	test_credentials();
 
 	// ========================================
 	// Socket / Networking Tests
@@ -9282,8 +9397,9 @@ network_skip:;
 				close(m); /* may create own entry   */
 			if (unlink(sroot) == 0)
 				f |= 2; /* may NOT remove root's  */
-			else if (errno != EACCES)
-				f |= 2;
+			else if (errno != EPERM && errno != EACCES)
+				f |= 2; /* sticky-bit denial is EPERM (as the
+                                         * reference does); EACCES also accepted */
 			if (unlink(smine) != 0)
 				f |= 4; /* may remove its own     */
 			int w = open(suf,

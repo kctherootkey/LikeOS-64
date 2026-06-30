@@ -105,6 +105,10 @@ int sock_create(int domain, int type, int protocol)
 		return -EAFNOSUPPORT;
 	if (type != SOCK_STREAM && type != SOCK_DGRAM && type != SOCK_RAW)
 		return -ESOCKTNOSUPPORT;
+	/* Raw sockets bypass the transport layer (arbitrary packet crafting), so
+	 * creating one is reserved to the privileged caller. */
+	if (type == SOCK_RAW && !capable())
+		return -EPERM;
 
 	uint64_t flags;
 	spin_lock_irqsave(&socket_lock, &flags);
@@ -157,6 +161,10 @@ int sock_bind(int sockfd, const struct sockaddr_in *addr)
 		return -EBADF;
 	if (s->bound)
 		return -EINVAL;
+	/* Reserved ports (<1024) may only be bound by the privileged caller. */
+	uint16_t bind_port = net_ntohs(addr->sin_port);
+	if (bind_port != 0 && bind_port < 1024 && !capable())
+		return -EACCES;
 
 	/* For non-ephemeral (explicit) ports, check for address already in use.
      * Two UDP sockets cannot share a port unless SO_REUSEADDR is set. */

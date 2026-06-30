@@ -136,6 +136,29 @@ static pending_signal_t *alloc_pending_signal(void)
 	return ps;
 }
 
+/* Permission check for kill(2): may the calling task signal `target`?  The
+ * privileged caller may signal anyone; otherwise the sender's real OR effective
+ * uid must equal the target's real OR saved-set uid.  SIGCONT is additionally
+ * permitted between processes of the same session.  Mirrors the conventional
+ * check so an unprivileged process cannot signal another user's processes. */
+int signal_permission(task_t *target, int sig)
+{
+	if (!target)
+		return -EPERM;
+	task_t *sender = sched_current();
+	if (!sender)
+		return 0; /* kernel context: privileged */
+	if (capable())
+		return 0; /* root may signal anyone */
+	uint32_t suid = sender->cred.uid, seuid = sender->cred.euid;
+	uint32_t tuid = target->cred.uid, tsuid = target->cred.suid;
+	if (suid == tuid || suid == tsuid || seuid == tuid || seuid == tsuid)
+		return 0;
+	if (sig == SIGCONT && sender->sid == target->sid)
+		return 0; /* job-control continue within the session */
+	return -EPERM;
+}
+
 // Send a signal to a task
 int signal_send(task_t *task, int sig, siginfo_t *info)
 {

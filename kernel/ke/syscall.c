@@ -727,231 +727,60 @@ static int vfs_status_to_errno(int st)
 		return -ERANGE;
 	case ST_UNSUPPORTED:
 		return -EOPNOTSUPP;
+	case ST_ACCESS:
+		return -EACCES;
+	case ST_PERM:
+		return -EPERM;
 	default:
 		return -EACCES;
 	}
 }
 
-/* Access check for a file whose stat is `st`, honouring a POSIX access ACL
- * (system.posix_acl_access) if it has one, else the mode bits.  `path` is the
- * file the ACL is read from.  use_real selects the real vs effective/fs ids.
- * Root never consults the ACL (so the all-root system pays no ACL cost). */
+/* ---- Permission checks: thin adapters over the canonical VFS policy --------
+ * The discretionary-access policy lives in the VFS now (vfs_permission and
+ * friends — the one place every filesystem shares), so these are just adapters
+ * that translate the VFS's ST_ result into the negative-errno the syscalls
+ * return.  They let a credential-sensitive syscall screen an operation and
+ * report a precise errno; the VFS re-checks authoritatively when the operation
+ * actually runs, so removing any of these pre-checks would not weaken security. */
+static int perm_st_errno(int st)
+{
+	return (st == ST_OK) ? 0 : vfs_status_to_errno(st);
+}
+
+/* Access check for a file whose stat is `st`, against the ACL then mode bits.
+ * use_real selects the real vs effective/fs ids. */
 static int perm_access(task_t *cur, const char *path, const struct kstat *st,
 		       int want, int use_real)
 {
-	uint32_t cuid = use_real ? cur->cred.uid : cur->cred.euid;
-	if (cuid != 0) {
-		unsigned char acl[512];
-		/* Fetch the ACL by the inode the caller already resolved (st->st_ino),
-         * so we don't walk the path a second time on every access check. */
-		int n = vfs_getxattr_ino(path, (unsigned long)st->st_ino,
-					 "system.posix_acl_access", acl,
-					 sizeof(acl));
-		if (n > 0) {
-			int r = cred_acl_access(&cur->cred, acl, (unsigned)n,
-						(uint32_t)st->st_uid,
-						(uint32_t)st->st_gid, want,
-						use_real);
-			if (r <= 0)
-				return r; /* ACL decided: 0 allow, <0 deny */
-			/* r == 1: no usable ACL -> fall through to the mode bits */
-		}
-	}
-	return use_real ?
-		       cred_check_access_real(&cur->cred, (uint32_t)st->st_mode,
-					      (uint32_t)st->st_uid,
-					      (uint32_t)st->st_gid, want) :
-		       cred_check_access(&cur->cred, (uint32_t)st->st_mode,
-					 (uint32_t)st->st_uid,
-					 (uint32_t)st->st_gid, want);
+	(void)cur; /* the VFS reads the current task's credentials itself */
+	return perm_st_errno(vfs_check_access(path, st, want, use_real));
 }
 
-/* Permission enforcement: may the current task access `path` for `want`
- * (MAY_* mask)?  Returns 0 if allowed (incl. when the path can't be stat'd —
- * we let the real operation report ENOENT etc.), or a negative errno.
- * perm_access() bypasses for root, so this is effectively a no-op for the
- * all-root system; callers on hot paths additionally gate on euid != 0 to skip
- * the stat entirely. fs-independent (vfs_stat + cred + the ACL xattr). */
-static int perm_check_path(task_t *cur, const char *path, int want)
-{
-	if (!cur)
-		return 0;
-	struct kstat st;
-	if (vfs_stat(path, &st) != ST_OK)
-		return 0;
-	return perm_access(cur, path, &st, want, 0);
-}
-
-/* Resolve `path` to an absolute, canonical form using the task's cwd, so the
- * permission helpers enforce relative paths too (else `rm foo` would bypass the
- * traversal/parent checks).  Returns 1 with `out` filled, 0 if it can't. */
-static int perm_abspath(task_t *cur, const char *path, char *out, size_t outsz)
-{
-	if (path[0] == '/') {
-		size_t i = 0;
-		for (; path[i] && i < outsz - 1; i++)
-			out[i] = path[i];
-		out[i] = '\0';
-		return 1;
-	}
-	const char *cwd = (cur->cwd[0] != 0) ? cur->cwd : "/";
-	return normalize_path(cwd, path, out, outsz) == 0;
-}
-
-/* Per-component path traversal — a non-root task needs search (execute)
- * permission on every directory in the path PREFIX (i.e. each strict ANCESTOR
- * of the final component, never the final component itself) to resolve through
- * it.  Walks "/", "/a", "/a/b" for "/a/b/c"; for "/" there are no ancestors.
- * Relative paths and trailing slashes are normalised first.  No-op for root.
- *
- * A prefix component that can't be resolved as a directory (missing, not a
- * directory, or a separately-mounted namespace such as /dev that this layer
- * can't stat) is skipped: the syscall's own resolver then reports
- * ENOENT/ENOTDIR — the same outcome as the reference — without this layer
- * risking a wrong denial on a path it cannot resolve.  Returns 0 or -EACCES. */
-static int perm_traverse_cred(const char *rawpath, int use_real)
-{
-	task_t *cur = sched_current();
-	if (!cur)
-		return 0;
-	/* access(2)/faccessat use the REAL ids; everything else the effective/fs ids
-     * — and the prefix search must use the same ids as the target check. */
-	uint32_t cuid = use_real ? cur->cred.uid : cur->cred.euid;
-	if (cuid == 0)
-		return 0; /* privileged: bypass   */
-	char path[VFS_MAX_PATH];
-	if (!perm_abspath(cur, rawpath, path, sizeof(path)))
-		return 0;
-	size_t len = 0;
-	while (path[len])
-		len++;
-	while (len > 1 && path[len - 1] == '/')
-		len--; /* ignore trailing '/'  */
-	if (len <= 1)
-		return 0; /* "/" has no ancestors */
-	size_t last = 0; /* '/' before final comp */
-	for (size_t i = 0; i < len; i++)
-		if (path[i] == '/')
-			last = i;
-	char dir[VFS_MAX_PATH];
-	for (size_t i = 0; i <= last; i++) { /* ancestors only       */
-		if (path[i] != '/')
-			continue;
-		if (i == 0) {
-			dir[0] = '/';
-			dir[1] = '\0';
-		} /* root */
-		else {
-			if (i >= sizeof(dir))
-				return 0;
-			for (size_t j = 0; j < i; j++)
-				dir[j] = path[j];
-			dir[i] = '\0';
-		}
-		struct kstat st;
-		if (vfs_stat(dir, &st) != ST_OK)
-			continue; /* defer to the resolver */
-		if ((st.st_mode & S_IFMT) != S_IFDIR)
-			continue;
-		int pr = perm_access(cur, dir, &st, MAY_EXEC, use_real);
-		if (pr < 0)
-			return pr;
-	}
-	return 0;
-}
-
-/* Effective/fs-id traversal — the default for path-resolving syscalls. */
+/* Search (x) permission on every ancestor directory of `path` (effective ids). */
 static int perm_traverse(const char *rawpath)
 {
-	return perm_traverse_cred(rawpath, 0);
+	return perm_st_errno(vfs_permission_traverse(rawpath));
 }
 
-/* Check the current task's access to the PARENT directory of `path` —
- * needed by create/remove/rename, which modify the containing directory
- * (want is typically MAY_WRITE|MAY_EXEC).  No-op for root, and permissive when
- * the parent can't be derived (bare relative name) or stat'd.  Self-fetches the
- * current task, so callers need no euid gating. */
-/* Resolve the absolute parent directory of `rawpath` into `out`.  Returns 1 on
- * success, 0 when there's no directory component (bare relative name) or it
- * won't fit.  Trailing slashes on the input are ignored. */
-static int perm_parent_of(task_t *cur, const char *rawpath, char *out,
-			  size_t outsz)
+/* Like perm_traverse but with an explicit real(1)/effective(0) id selection,
+ * for access(2)/faccessat which screen the prefix with the real ids. */
+static int perm_traverse_cred(const char *rawpath, int use_real)
 {
-	char path[VFS_MAX_PATH];
-	if (!perm_abspath(cur, rawpath, path, sizeof(path)))
-		return 0;
-	size_t len = 0;
-	while (path[len])
-		len++;
-	while (len > 1 && path[len - 1] == '/')
-		len--; /* ignore trailing '/'  */
-	size_t slash = (size_t)-1;
-	for (size_t i = 0; i < len; i++)
-		if (path[i] == '/')
-			slash = i;
-	if (slash == (size_t)-1)
-		return 0; /* no dir component     */
-	if (slash == 0) {
-		out[0] = '/';
-		out[1] = '\0';
-	} /* parent is root       */
-	else {
-		if (slash >= outsz)
-			return 0;
-		for (size_t i = 0; i < slash; i++)
-			out[i] = path[i];
-		out[slash] = '\0';
-	}
-	return 1;
+	return perm_st_errno(vfs_access_traverse(rawpath, use_real));
 }
 
+/* Write+search on the PARENT directory of `path` (create/remove/rename). */
 static int perm_check_parent(const char *rawpath, int want)
 {
-	task_t *cur = sched_current();
-	if (!cur || cur->cred.euid == 0)
-		return 0; /* root: bypass */
-	char parent[VFS_MAX_PATH];
-	if (!perm_parent_of(cur, rawpath, parent, sizeof(parent)))
-		return 0;
-	int tr = perm_traverse(
-		parent); /* search on the parent's own ancestors */
-	if (tr < 0)
-		return tr;
-	return perm_check_path(cur, parent, want);
+	return perm_st_errno(vfs_permission_parent(rawpath, want));
 }
 
-/* Remove/rename gate.  Beyond the parent's write+search (perm_check_parent),
- * a non-root task is subject to the directory's STICKY bit (S_ISVTX, e.g. /tmp
- * at 1777): it may only remove or rename an entry it owns, or when it owns the
- * containing directory.  Permissive when anything can't be stat'd (the real op
- * then reports ENOENT etc.).  Returns 0 or a negative errno. */
+/* Remove/rename gate: parent write+search plus the directory's sticky-bit rule.
+ * The sticky-bit ownership check now lives in the VFS (vfs_permission_remove). */
 static int perm_check_remove(const char *rawpath)
 {
-	task_t *cur = sched_current();
-	if (!cur || cur->cred.euid == 0)
-		return 0; /* root: bypass */
-	int pr = perm_check_parent(rawpath, MAY_WRITE | MAY_EXEC);
-	if (pr < 0)
-		return pr;
-	char parent[VFS_MAX_PATH];
-	if (!perm_parent_of(cur, rawpath, parent, sizeof(parent)))
-		return 0;
-	struct kstat ps;
-	if (vfs_stat(parent, &ps) != ST_OK)
-		return 0;
-	if (!((uint32_t)ps.st_mode & S_ISVTX))
-		return 0; /* not a sticky dir     */
-	if ((uint32_t)ps.st_uid == cur->cred.fsuid)
-		return 0; /* owns the directory */
-	char abs[VFS_MAX_PATH];
-	if (!perm_abspath(cur, rawpath, abs, sizeof(abs)))
-		return 0;
-	struct kstat ts;
-	if (vfs_stat(abs, &ts) != ST_OK)
-		return 0; /* target gone: defer   */
-	if ((uint32_t)ts.st_uid == cur->cred.fsuid)
-		return 0; /* owns the entry    */
-	return -EACCES;
+	return perm_st_errno(vfs_permission_remove(rawpath));
 }
 
 /* The set-user/-group-ID bits a successful modification (write/chown) by a
@@ -2061,6 +1890,20 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp)
 			if (!validate_user_ptr(argp, arg_len))
 				return -EFAULT;
 		}
+		/* Mutating interface configuration (address, netmask, flags, MTU)
+		 * is a privileged, system-wide change; the query ioctls are not. */
+		switch (req) {
+		case SIOCSIFFLAGS:
+		case SIOCSIFADDR:
+		case SIOCSIFNETMASK:
+		case SIOCSIFBRDADDR:
+		case SIOCSIFMTU:
+			if (!capable())
+				return -EPERM;
+			break;
+		default:
+			break;
+		}
 		smap_disable();
 		int64_t ret =
 			sock_ioctl_net(idx, (unsigned long)req, (void *)argp);
@@ -2349,6 +2192,11 @@ static int64_t sys_kill(uint64_t pid, uint64_t sig)
 	// Kernel tasks (idle, init, kernel threads) cannot be signalled
 	if (t->privilege == TASK_KERNEL)
 		return -EPERM;
+	/* Credential check: an unprivileged caller may only signal a process
+	 * with a matching uid (applies even to the sig==0 existence probe). */
+	int perr = signal_permission(t, (int)sig);
+	if (perr != 0)
+		return perr;
 	if (sig == 0)
 		return 0;
 	kill_task(t, (int)sig);
@@ -7763,6 +7611,9 @@ dns_str_done:
 	}
 
 	case SYS_SETHOSTNAME: {
+		/* Setting the hostname is a system-wide change: privileged only. */
+		if (!capable())
+			return -EPERM;
 		if (!validate_user_ptr(a1, 1))
 			return -EFAULT;
 		size_t len = (size_t)a2;

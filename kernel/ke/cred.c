@@ -6,11 +6,14 @@
 // track the effective IDs (we do not expose a separate setfsuid/setfsgid).
 
 #include <kernel/ke/cred.h>
+#include <kernel/ke/sched.h> /* task_t, sched_current() */
 #include <kernel/ke/syscall.h> /* EPERM, EACCES */
 #include <kernel/uapi/stat.h> /* S_ISDIR */
+#include <kernel/uapi/bug.h>
 
 void cred_init_root(cred_t *c)
 {
+	BUG_ON(c == NULL);
 	c->uid = c->gid = 0;
 	c->euid = c->egid = 0;
 	c->suid = c->sgid = 0;
@@ -301,4 +304,66 @@ int cred_setresgid(cred_t *c, uint32_t r, uint32_t e, uint32_t s)
 	if (s != CRED_NOCHANGE)
 		c->sgid = s;
 	return 0;
+}
+
+/* ---- Current-task credential accessors ------------------------------------ */
+
+cred_t *current_cred(void)
+{
+	task_t *t = sched_current();
+	return t ? &t->cred : NULL;
+}
+
+uint32_t current_uid(void)
+{
+	cred_t *c = current_cred();
+	return c ? c->uid : 0; /* no task == kernel context == root */
+}
+
+uint32_t current_euid(void)
+{
+	cred_t *c = current_cred();
+	return c ? c->euid : 0;
+}
+
+uint32_t current_gid(void)
+{
+	cred_t *c = current_cred();
+	return c ? c->gid : 0;
+}
+
+uint32_t current_egid(void)
+{
+	cred_t *c = current_cred();
+	return c ? c->egid : 0;
+}
+
+uint32_t current_fsuid(void)
+{
+	cred_t *c = current_cred();
+	return c ? c->fsuid : 0;
+}
+
+uint32_t current_fsgid(void)
+{
+	cred_t *c = current_cred();
+	return c ? c->fsgid : 0;
+}
+
+int current_in_group(uint32_t gid)
+{
+	cred_t *c = current_cred();
+	return c ? cred_in_group(c, gid) : 1; /* kernel context: in any group */
+}
+
+int current_is_root(void)
+{
+	return current_euid() == 0;
+}
+
+int capable(void)
+{
+	/* The lone privilege test today: effective uid 0.  Routing every gate
+	 * through here means a future capability set slots in at one place. */
+	return current_euid() == 0;
 }
