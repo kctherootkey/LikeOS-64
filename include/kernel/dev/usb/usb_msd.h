@@ -109,6 +109,23 @@ typedef struct usb_msd_device {
 		io_owner; // task id of holder (-1 = none); for orphan-lock recovery
 	spinlock_t io_wait_lock; // protects the sleep/wake race
 
+	// Persistent DMA staging buffers, allocated once at init and reused for
+	// every command.  The previous code allocated (and freed) a CBW buffer,
+	// a CSW buffer and a contiguous data bounce buffer on *every* transfer.
+	// The contiguous allocator is an O(total_pages) bitmap scan under a
+	// global lock with IRQs disabled — running it per transfer dominated the
+	// I/O path.  I/O to a device is serialized by io_lock, so one shared set
+	// of buffers per device is safe.  NULL pointers mean "fall back to
+	// per-command allocation" (used if these one-time allocations fail).
+	uint8_t *cbw_buf; // page-aligned CBW staging buffer (one page)
+	uint8_t *csw_buf; // page-aligned CSW staging buffer (one page)
+	uint8_t *cbw_buf_raw; // raw allocation backing cbw_buf
+	uint8_t *csw_buf_raw; // raw allocation backing csw_buf
+	uint8_t *data_buf; // virtual base of contiguous bounce buffer
+	uint64_t data_buf_phys; // physical base of bounce buffer (0 = none)
+	uint32_t data_buf_size; // usable size of bounce buffer in bytes
+	uint32_t data_buf_pages; // page count backing the bounce buffer
+
 	// Block device
 	block_device_t blk;
 } usb_msd_device_t;
