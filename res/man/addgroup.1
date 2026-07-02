@@ -1,0 +1,48 @@
+ADDGROUP(8)                 System Manager's Manual                ADDGROUP(8)
+
+NAME
+       addgroup - add a group to the system
+
+SYNOPSIS
+       addgroup [options] GROUP
+       addgroup --system [options] GROUP
+       adduser USER GROUP
+
+DESCRIPTION
+       addgroup adds groups to the system.  It is the same program as
+       adduser(8), invoked under the name addgroup so that group creation is
+       the default action.
+
+       addgroup GROUP
+              Create a group.  A group id is allocated from FIRST_GID..LAST_GID
+              (1000..59999) unless --gid is given.
+
+       addgroup --system GROUP
+              Create a group from the system range (100..999).
+
+       adduser USER GROUP
+              Add an existing user to an existing group.
+
+OPTIONS
+       --system              create a system group
+       --gid ID              force the group id
+       --firstgid ID, --lastgid ID
+                             override the group id range
+       --allow-all-names, --allow-bad-names
+                             relax the group name check
+       --quiet, --verbose, --debug
+                             adjust the amount of output
+       --conf FILE           configuration file (accepted, unused)
+       --help                display this help
+       --version             display version
+
+FILES
+       /etc/group    group database
+
+NOTES
+       Only the superuser may add groups.
+
+SEE ALSO
+       adduser(8), passwd(1), groups(1)
+
+ADDGROUP(8)                 System Manager's Manual                ADDGROUP(8)

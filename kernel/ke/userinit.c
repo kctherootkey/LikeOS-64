@@ -1,4 +1,4 @@
-#include <kernel/ke/shell.h>
+#include <kernel/ke/userinit.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/elf.h>
 #include <kernel/ke/sched.h>
@@ -7,64 +7,60 @@
 #include <kernel/ke/syscall.h>
 #include <kernel/uapi/bug.h>
 
-static task_t *g_shell_task = NULL;
+static int g_init_started = 0;
 
-static int shell_spawn(void)
+static int init_spawn(void)
 {
 	if (!vfs_root_ready()) {
 		return -EAGAIN;
 	}
-	char *argv[] = { "/bin/sh", NULL };
+	/* PID 1 is /sbin/init; it spawns getty, which authenticates via login
+	 * and starts the user's shell.  init runs in its own session but has no
+	 * controlling terminal: getty calls setsid()+TIOCSCTTY to claim the
+	 * console for each login session. */
+	char *argv[] = { "/sbin/init", NULL };
 	char *envp[] = { "PATH=/bin:/usr/local/bin", NULL };
 	task_t *task = NULL;
-	int ret = elf_exec("/bin/sh", argv, envp, &task);
+	int ret = elf_exec("/sbin/init", argv, envp, &task);
 	if (ret == 0 && task) {
-		// Make the shell a session leader with its own process group
+		/* Reserve process id 1 for init and make it a session leader.
+		 * tgid must track id so getpid() (which returns tgid) reports 1.
+		 * The kernel then protects it from stray signals and panics if
+		 * it ever exits (see sched_mark_task_exited). */
+		task->id = 1;
+		task->tgid = 1;
 		task->pgid = task->id;
 		task->sid = task->id;
-		tty_t *tty = tty_get_console();
-		if (tty) {
-			task->ctty = tty;
-			tty->fg_pgid = task->pgid;
-		}
-		g_shell_task = task;
+		sched_set_init_task(task);
+		g_init_started = 1;
 	} else if (ret != -EAGAIN) {
-		g_shell_task = NULL;
-		kprintf("shell: failed to start /bin/sh (error %d)\n", ret);
+		kprintf("init: failed to start /sbin/init (error %d)\n", ret);
 	}
 	return ret;
 }
 
-void shell_init(void)
+void userinit_start(void)
 {
 	BUG_ON(tty_get_console() ==
-	       NULL); /* shell init: console TTY not ready */
+	       NULL); /* userinit: console TTY not ready */
 	tty_reset_termios(tty_get_console());
-	shell_spawn();
+	init_spawn();
 	console_cursor_enable();
 }
 
-void shell_redisplay_prompt(void)
+void userinit_redisplay_prompt(void)
 {
-	// Userland /bin/sh handles its own prompt.
+	// User space (getty/login/sh) owns its own prompt.
 }
 
-int shell_tick(void)
+int userinit_tick(void)
 {
-	if (g_shell_task &&
-	    (g_shell_task->has_exited || g_shell_task->state == TASK_ZOMBIE)) {
-		/* The shell task is done.  Do NOT call sched_reap_zombies here.
-         * When the shell's parent is the bootstrap task, sched_mark_task_exited
-         * clears exit_signal so that the context-switch path enqueues the task
-         * in dead_thread_queue, which calls sched_remove_task() after the CPU
-         * has safely switched away.  Calling sched_reap_zombies() here causes a
-         * second sched_remove_task() on the same task_t → double-free → page fault
-         * at task->parent (offset 0x60).  Nulling the pointer is sufficient;
-         * the kernel owns the task lifecycle from this point. */
-		g_shell_task = NULL;
-	}
-	if (!g_shell_task) {
-		shell_spawn();
+	/* Launch init once the root filesystem is ready.  init is not
+	 * respawned if it exits: the kernel panics instead (init must never
+	 * die), so here we only need to keep retrying the initial start until
+	 * the filesystem becomes available. */
+	if (!g_init_started) {
+		init_spawn();
 	}
 	return 0;
 }

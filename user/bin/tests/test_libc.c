@@ -39,6 +39,11 @@
 #include <setjmp.h>
 #include <utime.h>
 #include <sys/xattr.h>
+#include <pwd.h>
+#include <grp.h>
+#include <shadow.h>
+#include <crypt.h>
+#include <security/pam_appl.h>
 
 // Futex helper declarations (from sched.c)
 int futex_wait(int *uaddr, int val, const struct timespec *timeout);
@@ -634,6 +639,415 @@ static void test_credentials(void)
 	/* Cleanup. */
 	unlink(secret);
 	rmdir(priv_dir);
+}
+
+/* ============================================================
+ * User/group/shadow database, crypt, credentials, session and PAM tests.
+ * These run in the root context (before the non-root permission section).
+ * ============================================================ */
+
+static const char *g_test_password;
+
+static int test_pam_conv(int num_msg, const struct pam_message **msg,
+                         struct pam_response **resp, void *appdata)
+{
+	struct pam_response *r;
+	int i;
+	(void)appdata;
+	if (num_msg <= 0)
+		return PAM_CONV_ERR;
+	r = calloc(num_msg, sizeof(*r));
+	if (!r)
+		return PAM_BUF_ERR;
+	for (i = 0; i < num_msg; i++) {
+		if (msg[i]->msg_style == PAM_PROMPT_ECHO_OFF ||
+		    msg[i]->msg_style == PAM_PROMPT_ECHO_ON)
+			r[i].resp = strdup(g_test_password ? g_test_password : "");
+	}
+	*resp = r;
+	return PAM_SUCCESS;
+}
+
+static void test_userdb(void)
+{
+	printf("\n[TEST] passwd database (getpwnam/getpwuid)\n");
+	struct passwd *pw = getpwnam("root");
+	test_result("getpwnam(\"root\") found", pw != NULL);
+	if (pw) {
+		test_result("root uid == 0", pw->pw_uid == 0);
+		test_result("root gid == 0", pw->pw_gid == 0);
+		test_result("root home == /root",
+			    strcmp(pw->pw_dir, "/root") == 0);
+		test_result("root shell == /bin/sh",
+			    strcmp(pw->pw_shell, "/bin/sh") == 0);
+	}
+	struct passwd *pw2 = getpwuid(0);
+	test_result("getpwuid(0) returns root",
+		    pw2 && strcmp(pw2->pw_name, "root") == 0);
+	test_result("getpwnam(nonexistent) == NULL",
+		    getpwnam("no_such_user_xyz") == NULL);
+
+	/* reentrant */
+	struct passwd pwr;
+	char pbuf[512];
+	struct passwd *pres = NULL;
+	int rc = getpwnam_r("root", &pwr, pbuf, sizeof(pbuf), &pres);
+	test_result("getpwnam_r(\"root\") ok", rc == 0 && pres != NULL &&
+						       pres->pw_uid == 0);
+
+	/* iteration */
+	int count = 0;
+	setpwent();
+	while (getpwent() != NULL)
+		count++;
+	endpwent();
+	test_result("getpwent() iterated at least one entry", count >= 1);
+
+	printf("\n[TEST] group database (getgrnam/getgrgid/initgroups)\n");
+	struct group *gr = getgrnam("root");
+	test_result("getgrnam(\"root\") found", gr != NULL);
+	if (gr)
+		test_result("root group gid == 0", gr->gr_gid == 0);
+	struct group *gr2 = getgrgid(0);
+	test_result("getgrgid(0) returns root group",
+		    gr2 && strcmp(gr2->gr_name, "root") == 0);
+	/* initgroups must succeed for root and include gid 0 */
+	int ig = initgroups("root", 0);
+	test_result("initgroups(\"root\", 0) succeeds", ig == 0);
+	if (ig == 0) {
+		int list[32];
+		int n = getgroups(32, list);
+		int has0 = 0, i;
+		for (i = 0; i < n; i++)
+			if (list[i] == 0)
+				has0 = 1;
+		test_result("supplementary groups include gid 0", has0);
+	}
+}
+
+/* A fixed yescrypt hash of the password "toor".  crypt() is verified against
+ * this self-contained value rather than /etc/shadow, because the root password
+ * is usually changed by the user after installation. */
+static const char *const TOOR_HASH =
+	"$y$j9T$LikeOSrootsalt000000000$dvrg4Bi3ykTNHFOIx5ljbUBrsUJnocNuwHToDQWqKr1";
+
+static void test_shadow_and_crypt(void)
+{
+	printf("\n[TEST] shadow database + yescrypt crypt()\n");
+
+	/* /etc/shadow must be readable (root) and yield a non-empty hash; we do
+	 * NOT assume its contents - the password may have been changed. */
+	struct spwd *sp = getspnam("root");
+	test_result("getspnam(\"root\") found (needs root)", sp != NULL);
+	if (sp)
+		test_result("root has a non-empty password hash",
+			    sp->sp_pwdp && sp->sp_pwdp[0] != '\0');
+
+	/* crypt() correctness against the known "toor" hash. */
+	test_result("known hash is yescrypt ($y$)",
+		    strncmp(TOOR_HASH, "$y$", 3) == 0);
+
+	struct crypt_data cd;
+	cd.initialized = 0;
+	char *h = crypt_r("toor", TOOR_HASH, &cd);
+	test_result("crypt_r(\"toor\", known) reproduces known hash",
+		    h != NULL && strcmp(h, TOOR_HASH) == 0);
+
+	cd.initialized = 0;
+	char *w = crypt_r("wrongpassword", TOOR_HASH, &cd);
+	test_result("crypt_r(wrong, known) != known",
+		    w != NULL && strcmp(w, TOOR_HASH) != 0);
+
+	/* Non-reentrant crypt() should also reproduce the hash. */
+	char *h2 = crypt("toor", TOOR_HASH);
+	test_result("crypt(\"toor\", known) reproduces known hash",
+		    h2 != NULL && strcmp(h2, TOOR_HASH) == 0);
+
+	/* Secure salt generation: crypt_gensalt() draws random bytes from the
+	 * kernel CSPRNG, so each call yields a distinct random $y$j9T$ setting,
+	 * and hashing a password against it round-trips. */
+	char salt1[128] = { 0 }, salt2[128] = { 0 };
+	char *g1 = crypt_gensalt("$y$", 0, NULL, 0);
+	test_result("crypt_gensalt returns a $y$j9T$ setting",
+		    g1 != NULL && strncmp(g1, "$y$j9T$", 7) == 0);
+	if (g1) {
+		strncpy(salt1, g1, sizeof(salt1) - 1);
+		char *g2 = crypt_gensalt("$y$", 0, NULL, 0);
+		if (g2)
+			strncpy(salt2, g2, sizeof(salt2) - 1);
+		test_result("crypt_gensalt salts are random (two differ)",
+			    salt2[0] && strcmp(salt1, salt2) != 0);
+
+		struct crypt_data cdg;
+		cdg.initialized = 0;
+		char *nh = crypt_r("s3cret!", salt1, &cdg);
+		char newhash[256] = { 0 };
+		if (nh)
+			strncpy(newhash, nh, sizeof(newhash) - 1);
+		test_result("crypt() with generated salt produces a yescrypt hash",
+			    newhash[0] && strncmp(newhash, "$y$", 3) == 0);
+		if (newhash[0]) {
+			struct crypt_data cdv;
+			cdv.initialized = 0;
+			char *v = crypt_r("s3cret!", newhash, &cdv);
+			test_result("generated-salt hash verifies correct password",
+				    v && strcmp(v, newhash) == 0);
+			cdv.initialized = 0;
+			char *w = crypt_r("wrong!", newhash, &cdv);
+			test_result("generated-salt hash rejects wrong password",
+				    w && strcmp(w, newhash) != 0);
+		}
+	}
+}
+
+static void test_extra_creds(void)
+{
+	printf("\n[TEST] setreuid/setregid (in child) + getlogin\n");
+	/* Run credential changes in a child so we never disturb the runner. */
+	pid_t pid = fork();
+	if (pid == 0) {
+		int r, e, s;
+		int ok = 1;
+		/* Change the group id FIRST, while still privileged (euid 0);
+		 * dropping euid via setreuid would remove the privilege needed
+		 * to set an arbitrary gid. */
+		if (setregid(-1, 1000) != 0)
+			ok = 0;
+		getresgid(&r, &e, &s);
+		if (e != 1000 || r != 0)
+			ok = 0;
+		if (setreuid(-1, 1000) != 0)
+			ok = 0;
+		getresuid(&r, &e, &s);
+		/* euid changed to 1000, real stayed 0 */
+		if (e != 1000 || r != 0)
+			ok = 0;
+		_exit(ok ? 0 : 1);
+	} else if (pid > 0) {
+		int status = 0;
+		waitpid(pid, &status, 0);
+		test_result("setreuid/setregid round-trip (child)",
+			    WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	} else {
+		test_fail("fork for setreuid test");
+	}
+
+	/* getlogin via LOGNAME fallback */
+	setenv("LOGNAME", "root", 1);
+	char *l = getlogin();
+	test_result("getlogin() returns a name", l != NULL);
+	setlogin("root");
+	char lbuf[64];
+	test_result("getlogin_r() after setlogin(\"root\")",
+		    getlogin_r(lbuf, sizeof(lbuf)) == 0 &&
+			    strcmp(lbuf, "root") == 0);
+}
+
+static void test_session_creation(void)
+{
+	printf("\n[TEST] session creation (fork+setsid) + login env\n");
+	pid_t pid = fork();
+	if (pid == 0) {
+		pid_t sid = setsid();
+		pid_t self = getpid();
+		int ok = (sid == self) && (getsid(0) == self) &&
+			 (getpgid(0) == self);
+		_exit(ok ? 0 : 1);
+	} else if (pid > 0) {
+		int status = 0;
+		waitpid(pid, &status, 0);
+		test_result("child is its own session & group leader",
+			    WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	} else {
+		test_fail("fork for session test");
+	}
+
+	/* Login environment fields round-trip through the environment. */
+	setenv("HOME", "/root", 1);
+	setenv("USER", "root", 1);
+	setenv("SHELL", "/bin/sh", 1);
+	test_result("HOME/USER/SHELL set/get",
+		    getenv("HOME") && strcmp(getenv("HOME"), "/root") == 0 &&
+			    getenv("USER") &&
+			    strcmp(getenv("USER"), "root") == 0 &&
+			    getenv("SHELL") &&
+			    strcmp(getenv("SHELL"), "/bin/sh") == 0);
+}
+
+static void test_pam(void)
+{
+	printf("\n[TEST] PAM authentication (unix)\n");
+	struct pam_conv conv = { test_pam_conv, NULL };
+	pam_handle_t *pamh = NULL;
+
+	/* Is "toor" still root's password?  It may have been changed, so only
+	 * assert the positive-authentication case when the default is intact. */
+	int toor_is_current = 0;
+	struct spwd *sp = getspnam("root");
+	if (sp && sp->sp_pwdp && sp->sp_pwdp[0]) {
+		char *c = crypt("toor", sp->sp_pwdp);
+		toor_is_current = (c && strcmp(c, sp->sp_pwdp) == 0);
+	}
+
+	g_test_password = "toor";
+	if (pam_start("login", "root", &conv, &pamh) == PAM_SUCCESS) {
+		int rc = pam_authenticate(pamh, 0);
+		if (toor_is_current)
+			test_result("pam_authenticate (password 'toor')",
+				    rc == PAM_SUCCESS);
+		else
+			printf("  root password changed from default;"
+			       " skipping positive auth assertion\n");
+		test_result("pam_acct_mgmt", pam_acct_mgmt(pamh, 0) == PAM_SUCCESS);
+		test_result("pam_open_session",
+			    pam_open_session(pamh, 0) == PAM_SUCCESS);
+		test_result("pam_close_session",
+			    pam_close_session(pamh, 0) == PAM_SUCCESS);
+		pam_end(pamh, PAM_SUCCESS);
+	}
+
+	/* A clearly wrong password must always be rejected. */
+	g_test_password = "definitely-not-the-password-xyz";
+	if (pam_start("login", "root", &conv, &pamh) == PAM_SUCCESS) {
+		test_result("pam_authenticate (wrong password) -> PAM_AUTH_ERR",
+			    pam_authenticate(pamh, 0) == PAM_AUTH_ERR);
+		pam_end(pamh, 0);
+	}
+
+	if (pam_start("login", "no_such_user_xyz", &conv, &pamh) == PAM_SUCCESS) {
+		test_result("pam_authenticate (unknown user) -> PAM_USER_UNKNOWN",
+			    pam_authenticate(pamh, 0) == PAM_USER_UNKNOWN);
+		pam_end(pamh, 0);
+	}
+}
+
+/* Copy a file's bytes to `dst` with the given mode.  Returns 0 on success. */
+static int copy_file(const char *src, const char *dst, mode_t mode)
+{
+	int in = open(src, O_RDONLY);
+	if (in < 0)
+		return -1;
+	int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
+	if (out < 0) {
+		close(in);
+		return -1;
+	}
+	char buf[8192];
+	ssize_t n;
+	int rc = 0;
+	while ((n = read(in, buf, sizeof(buf))) > 0) {
+		if (write(out, buf, n) != n) {
+			rc = -1;
+			break;
+		}
+	}
+	if (n < 0)
+		rc = -1;
+	close(in);
+	close(out);
+	/* open() honours umask; force the exact mode (incl. the setuid bit). */
+	if (chmod(dst, mode) != 0)
+		rc = -1;
+	return rc;
+}
+
+/* Run "prog -u" as uid `as_uid` and return the euid it prints (or -1). */
+static int run_id_euid_as(const char *prog, int as_uid)
+{
+	int p[2];
+	if (pipe(p) != 0)
+		return -1;
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(p[0]);
+		close(p[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		close(p[0]);
+		dup2(p[1], 1);
+		close(p[1]);
+		/* Drop to a non-root uid, then exec.  If prog is setuid-root,
+		 * the kernel raises euid back to 0 across the exec. */
+		setgid(as_uid);
+		setuid(as_uid);
+		char *av[] = { (char *)"id", (char *)"-u", NULL };
+		char *ev[] = { NULL };
+		execve(prog, av, ev);
+		_exit(127);
+	}
+	close(p[1]);
+	char buf[32];
+	int off = 0, r;
+	while (off < (int)sizeof(buf) - 1 &&
+	       (r = read(p[0], buf + off, sizeof(buf) - 1 - off)) > 0)
+		off += r;
+	buf[off] = '\0';
+	close(p[0]);
+	int st = 0;
+	waitpid(pid, &st, 0);
+	if (!WIFEXITED(st) || WEXITSTATUS(st) == 127)
+		return -1;
+	return atoi(buf);
+}
+
+static void test_setuid_exec(void)
+{
+	printf("\n[TEST] setuid-bit program execution\n");
+	if (geteuid() != 0) {
+		printf("  (skipped: test is not running as root)\n");
+		return;
+	}
+
+	/* Unique per-instance names via mkstemp so several testlibc processes
+	 * can run this test in parallel without colliding on the temp files. */
+	char suid[] = "/tmp/suid_id.XXXXXX";
+	char plain[] = "/tmp/plain_id.XXXXXX";
+	int fda = mkstemp(suid);
+	int fdb = mkstemp(plain);
+	if (fda < 0 || fdb < 0) {
+		test_fail("setuid test: cannot create temp files");
+		if (fda >= 0) { close(fda); unlink(suid); }
+		if (fdb >= 0) { close(fdb); unlink(plain); }
+		return;
+	}
+	close(fda);
+	close(fdb);
+
+	/* We are root, so these copies are owned by root. */
+	if (copy_file("/bin/id", suid, 04755) != 0 ||
+	    copy_file("/bin/id", plain, 0755) != 0) {
+		test_fail("setuid test: cannot stage /bin/id copies");
+		unlink(suid);
+		unlink(plain);
+		return;
+	}
+
+	/* Confirm the setuid bit actually persisted on disk. */
+	struct stat stb;
+	test_result("setuid copy has S_ISUID bit",
+		    stat(suid, &stb) == 0 && (stb.st_mode & 04000));
+
+	/* A non-root child exec'ing the setuid-root binary regains euid 0. */
+	int e_suid = run_id_euid_as(suid, 1000);
+	test_result("setuid-root exec: child euid becomes 0", e_suid == 0);
+
+	/* Without the bit, the child keeps its dropped (non-root) euid. */
+	int e_plain = run_id_euid_as(plain, 1000);
+	test_result("non-setuid exec: child euid stays 1000", e_plain == 1000);
+
+	unlink(suid);
+	unlink(plain);
+}
+
+static void run_auth_tests(void)
+{
+	test_userdb();
+	test_shadow_and_crypt();
+	test_extra_creds();
+	test_session_creation();
+	test_pam();
+	test_setuid_exec();
 }
 
 int main(int argc, char **argv)
@@ -4335,18 +4749,23 @@ int main(int argc, char **argv)
 					       "testlibc") == 0);
 			}
 
-			/* Check that PID 0 (kernel bootstrap) exists */
-			int found_kernel = 0;
+			/* PID 1 is /sbin/init (the first process); there is no
+			 * PID 0, and the kernel's swapper-class tasks (bootstrap
+			 * + idle) are hidden.  Real kernel threads remain visible
+			 * with is_kernel == 1. */
+			int found_init = 0, found_pid0 = 0, found_kernel = 0;
 			for (int i = 0; i < n; i++) {
-				if (buf[i].pid == 0) {
+				if (buf[i].pid == 1)
+					found_init = 1;
+				if (buf[i].pid == 0)
+					found_pid0 = 1;
+				if (buf[i].is_kernel == 1)
 					found_kernel = 1;
-					test_result(
-						"getprocinfo: PID 0 is kernel",
-						buf[i].is_kernel == 1);
-					break;
-				}
 			}
-			test_result("getprocinfo: PID 0 exists", found_kernel);
+			test_result("getprocinfo: PID 1 (init) exists", found_init);
+			test_result("getprocinfo: no PID 0", !found_pid0);
+			test_result("getprocinfo: a kernel thread is present",
+				    found_kernel);
 
 			/* Edge case: max_count=0 */
 			int n0 = getprocinfo(buf, 0);
@@ -4913,6 +5332,12 @@ int main(int argc, char **argv)
 	// Credentials & permissions
 	// ========================================
 	test_credentials();
+
+	// ========================================
+	// User/group/shadow DB, crypt, session, PAM
+	// (root context, before the non-root section)
+	// ========================================
+	run_auth_tests();
 
 	// ========================================
 	// Socket / Networking Tests

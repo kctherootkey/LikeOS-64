@@ -1769,8 +1769,46 @@ int sock_poll(int sockfd, short events)
 #define SOCK_FIONBIO 0x5421
 #define SOCK_FIONREAD 0x541B
 
+/* Interface, ARP and route ioctls that modify kernel network state.  These are
+ * privileged: only a process with an effective uid of 0 may issue them.  All
+ * read-only ioctls (SIOCGIF*, SIOCGARP, table dumps) are omitted and stay
+ * available to every user. */
+static int siocmd_is_privileged(unsigned long cmd)
+{
+	switch (cmd) {
+	case SIOCSIFFLAGS:
+	case SIOCSIFADDR:
+	case SIOCSIFNETMASK:
+	case SIOCSIFBRDADDR:
+	case SIOCSIFDSTADDR:
+	case SIOCSIFMTU:
+	case SIOCSIFMETRIC:
+	case SIOCSIFHWADDR:
+	case SIOCSIFMEM:
+	case SIOCSIFNAME:
+	case SIOCSIFENCAP:
+	case SIOCSIFSLAVE:
+	case SIOCSIFPFLAGS:
+	case SIOCSIFHWBROADCAST:
+	case SIOCSIFLINK:
+	case SIOCSIFVLAN:
+	case SIOCSARP:
+	case SIOCDARP:
+	case SIOCADDRT:
+	case SIOCDELRT:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
 int sock_ioctl_net(int sockfd, unsigned long request, void *argp)
 {
+	/* Reject privileged interface/ARP/route changes from non-root callers.
+	 * Reads pass through unchanged. */
+	if (siocmd_is_privileged(request) && !capable())
+		return -EPERM;
+
 	/* Handle socket-level ioctls that operate on the socket state itself */
 	if (request == SOCK_FIONBIO) {
 		if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS)

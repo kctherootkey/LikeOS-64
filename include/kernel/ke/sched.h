@@ -535,6 +535,15 @@ uint32_t sched_get_ppid(task_t *task); // Get parent PID
 void sched_reap_zombies(task_t *parent); // Reap all zombie children of parent
 void sched_mark_task_exited(task_t *task, int status);
 void sched_signal_task(task_t *task, int sig);
+
+// Record the /sbin/init task (PID 1).  Once set, the scheduler protects it
+// from ordinary signals and panics if it ever exits.
+extern task_t *g_init_task;
+void sched_set_init_task(task_t *t);
+
+// True for the kernel's swapper-class tasks (bootstrap + per-CPU idle), which
+// should be hidden from process listings.
+int sched_task_hidden(const task_t *t);
 void sched_signal_pgrp(int pgid, int sig);
 int sched_pgid_exists(int pgid);
 struct tty; // forward declaration for dump output

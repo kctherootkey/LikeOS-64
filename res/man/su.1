@@ -1,0 +1,81 @@
+SU(1)                            User Commands                           SU(1)
+
+NAME
+       su - run a command with a substitute user and group ID
+
+SYNOPSIS
+       su [options] [-] [user [argument...]]
+
+DESCRIPTION
+       su allows commands to be run with a substitute user and group ID.
+
+       When called with no user specified, su defaults to running an
+       interactive shell as root.  When a user is specified, additional
+       arguments can be supplied, in which case they are passed to the shell.
+
+       su uses the PAM framework for authentication, account and session
+       management.  When invoked by root, no password is required; otherwise
+       the target user's password is requested.
+
+       By default su does not change the current directory and only sets the
+       environment variables HOME and SHELL (plus USER and LOGNAME when the
+       target user is not root).  Use the --login option for an environment
+       similar to a real login.
+
+OPTIONS
+       -c, --command=COMMAND
+              Pass COMMAND to the shell with the -c option.
+
+       -f, --fast
+              Pass -f to the shell.
+
+       -g, --group=GROUP
+              Specify the primary group.  Available to root only.
+
+       -G, --supp-group=GROUP
+              Specify a supplementary group.  Available to root only.  The
+              first such group is also used as the primary group if --group is
+              not given.
+
+       -, -l, --login
+              Start the shell as a login shell: clear the environment (keeping
+              TERM and any --whitelist-environment variables), initialize HOME,
+              SHELL, USER, LOGNAME and PATH, change to the target user's home
+              directory, and set argv[0] of the shell to a leading '-'.
+
+       -m, -p, --preserve-environment
+              Preserve the entire environment; do not set HOME, SHELL, USER or
+              LOGNAME.  Ignored together with --login.
+
+       -P, --pty
+              Create a pseudo-terminal for the session.  su acts as a proxy
+              between the terminals, so the target shell does not share the
+              caller's terminal file descriptors.
+
+       -s, --shell=SHELL
+              Run SHELL instead of the default.  The shell is chosen from
+              --shell, then SHELL in the environment (with -m), then the target
+              user's passwd entry, then /bin/sh.
+
+       --session-command=COMMAND
+              Same as -c, but do not create a new session.
+
+       -w, --whitelist-environment=LIST
+              Keep the comma-separated environment variables in LIST when
+              clearing the environment for --login.
+
+       -h, --help
+              Display help text and exit.
+
+       -V, --version
+              Print version and exit.
+
+FILES
+       /etc/passwd   user account database
+       /etc/shadow   encrypted passwords
+       /etc/group    group database
+
+SEE ALSO
+       login(1), passwd(1), id(1)
+
+SU(1)                            User Commands                           SU(1)

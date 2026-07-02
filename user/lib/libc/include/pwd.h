@@ -1,11 +1,11 @@
 /*
- * pwd.h - password/user database for LikeOS
- * Stub implementation - LikeOS is single-user.
+ * pwd.h - user database (/etc/passwd) for LikeOS
  */
 #ifndef _PWD_H
 #define _PWD_H
 
 #include <sys/types.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,52 +13,29 @@ extern "C" {
 
 struct passwd {
     char  *pw_name;    /* username */
-    char  *pw_passwd;  /* password (unused) */
+    char  *pw_passwd;  /* password (usually "x"; real hash is in shadow) */
     uid_t  pw_uid;     /* user ID */
     gid_t  pw_gid;     /* group ID */
-    char  *pw_gecos;   /* real name */
+    char  *pw_gecos;   /* real name / comment */
     char  *pw_dir;     /* home directory */
-    char  *pw_shell;   /* shell program */
+    char  *pw_shell;   /* login shell */
 };
 
-static inline struct passwd *getpwuid(uid_t uid)
-{
-    (void)uid;
-    static struct passwd pw = {
-        .pw_name   = "root",
-        .pw_passwd = "",
-        .pw_uid    = 0,
-        .pw_gid    = 0,
-        .pw_gecos  = "root",
-        .pw_dir    = "/",
-        .pw_shell  = "/bin/sh",
-    };
-    return &pw;
-}
+struct passwd *getpwnam(const char *name);
+struct passwd *getpwuid(uid_t uid);
+int getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t buflen,
+               struct passwd **result);
+int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
+               struct passwd **result);
 
-static inline struct passwd *getpwnam(const char *name)
-{
-    (void)name;
-    return getpwuid(0);
-}
+struct passwd *getpwent(void);
+void setpwent(void);
+void endpwent(void);
 
-static inline struct passwd *getpwent(void)
-{
-    static int _called = 0;
-    if (_called) return (struct passwd *)0;
-    _called = 1;
-    return getpwuid(0);
-}
-
-static inline void endpwent(void)
-{
-    /* nothing to do */
-}
-
-static inline void setpwent(void)
-{
-    /* nothing to do */
-}
+int putpwent(const struct passwd *pwd, FILE *stream);
+struct passwd *fgetpwent(FILE *stream);
+int fgetpwent_r(FILE *stream, struct passwd *pwd, char *buf, size_t buflen,
+                struct passwd **result);
 
 #ifdef __cplusplus
 }

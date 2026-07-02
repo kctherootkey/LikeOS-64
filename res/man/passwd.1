@@ -1,0 +1,84 @@
+PASSWD(1)                        User Commands                       PASSWD(1)
+
+NAME
+       passwd - change user password
+
+SYNOPSIS
+       passwd [options] [LOGIN]
+
+DESCRIPTION
+       passwd changes passwords for user accounts.  A normal user may only
+       change the password for their own account, while the superuser may
+       change the password for any account.  passwd also changes password
+       aging information.
+
+       The user is first prompted for the current password (the superuser is
+       exempt).  The password is hashed and compared against the stored value.
+       The user is then prompted twice for the replacement password; both
+       entries must match.
+
+       New passwords are hashed with yescrypt using a cryptographically random
+       salt drawn from the kernel entropy pool, and the account's last-change
+       date is updated.
+
+OPTIONS
+       -a, --all
+              Only with -S: show status for all users.
+
+       -d, --delete
+              Delete the password (make it empty).
+
+       -e, --expire
+              Expire the password, forcing a change at the next login.
+
+       -i, --inactive DAYS
+              Set the number of days after expiry before the account is
+              disabled.
+
+       -k, --keep-tokens
+              Change the password only if it has expired.
+
+       -l, --lock
+              Lock the account's password by prefixing it with '!'.
+
+       -n, --mindays DAYS
+              Set the minimum number of days between password changes.
+
+       -q, --quiet
+              Quiet mode.
+
+       -r, --repository REPO
+              Change the password in REPO.  Only the "files" repository is
+              supported.
+
+       -R, --root DIR
+              Apply changes to the account databases under DIR.
+
+       -S, --status
+              Report password status: name, status (P usable, L locked, NP no
+              password), last change, and the min, max, warn and inactive
+              fields (in days).
+
+       -u, --unlock
+              Unlock the account's password.
+
+       -w, --warndays DAYS
+              Set the number of days of warning before a password expires.
+
+       -x, --maxdays DAYS
+              Set the maximum number of days a password stays valid.
+
+       -h, --help
+              Display help and exit.
+
+       Options that change aging information or lock, unlock or delete a
+       password may be used by the superuser only.
+
+FILES
+       /etc/passwd   user account database
+       /etc/shadow   encrypted passwords and aging information
+
+SEE ALSO
+       login(1), su(1), adduser(8)
+
+PASSWD(1)                        User Commands                       PASSWD(1)

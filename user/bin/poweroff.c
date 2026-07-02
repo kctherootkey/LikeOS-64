@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/reboot.h>
 
 enum action {
@@ -192,7 +193,10 @@ int main(int argc, char *argv[])
 		break;
 	}
 
-	/* Should not reach here */
-	fprintf(stderr, "%s: reboot syscall failed\n", progname);
+	/* reboot() only returns on failure. */
+	if (errno == EPERM)
+		fprintf(stderr, "%s: Need to be root\n", progname);
+	else
+		fprintf(stderr, "%s: %s\n", progname, strerror(errno));
 	return 1;
 }

@@ -1,0 +1,78 @@
+DELUSER(8)                  System Manager's Manual                 DELUSER(8)
+
+NAME
+       deluser, delgroup - remove a user or group from the system
+
+SYNOPSIS
+       deluser [options] USER
+       deluser --system [options] USER
+       deluser --group GROUP
+       delgroup [--system] [--only-if-empty] GROUP
+       deluser USER GROUP
+
+DESCRIPTION
+       deluser and delgroup remove users and groups from the system.  They are
+       the counterpart to adduser(8) and operate on the account databases
+       /etc/passwd, /etc/shadow and /etc/group.  The program behaves as
+       delgroup when it is invoked under that name.
+
+       Five modes of operation are available:
+
+       deluser USER
+              Remove a normal user.  The user is removed from /etc/passwd,
+              /etc/shadow and the member list of every group.  If the user had
+              a private group of the same name that is now unused, it is
+              removed as well.  The home directory is kept unless --remove-home
+              or --remove-all-files is given.
+
+       deluser --system USER
+              Remove USER only if it is a system user (uid 100..999).  If the
+              user does not exist, no error is returned.
+
+       deluser --group GROUP, delgroup GROUP
+              Remove a group.  The group must not be the primary group of any
+              user.
+
+       delgroup --system GROUP
+              Remove GROUP only if it is a system group (gid 100..999).
+
+       deluser USER GROUP
+              Remove USER from GROUP.  A user cannot be removed from their
+              primary group.
+
+       Only the superuser may remove users or groups.
+
+OPTIONS
+       --system              only remove a system user or group; a missing
+                             account is not an error
+       --group               remove a group (default when run as delgroup)
+       --remove-home         remove the user's home directory and mailspool
+       --remove-all-files    remove every file on the system owned by the user
+                             (implies --remove-home)
+       --backup              archive the home directory to USER.tar before the
+                             files are removed (uncompressed tar)
+       --backup-to DIR       write the backup archive into DIR (implies
+                             --backup)
+       --backup-suffix STR   accepted for compatibility; archives are
+                             uncompressed tar regardless
+       --only-if-empty       (group modes) only remove the group if it has no
+                             members
+       --quiet, --verbose, --debug
+                             adjust the amount of output
+       --conf FILE           configuration file (accepted, unused)
+       --help                display this help
+       --version             display version
+
+FILES
+       /etc/passwd   user account database
+       /etc/shadow   encrypted passwords
+       /etc/group    group database
+
+SECURITY
+       deluser needs root privileges.  Do not grant partial privileges to
+       deluser with restricted arguments; that is easy to circumvent.
+
+SEE ALSO
+       adduser(8), addgroup(8), passwd(1), groups(1)
+
+DELUSER(8)                  System Manager's Manual                 DELUSER(8)

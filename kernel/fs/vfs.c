@@ -49,6 +49,111 @@ static int vfs_raw_stat(const char *path, struct kstat *st);
  * every in-kernel VFS caller working unchanged.  Checks are permissive when a
  * path can't be resolved/stat'd, leaving the real op to report ENOENT/ENOTDIR. */
 
+/* ---- POSIX access-ACL absence cache ----
+ * A permission check on a non-root caller consults the filesystem for an access
+ * ACL on every path component of every access.  That per-check inode/xattr read
+ * made non-root file operations dramatically slower than root's (root bypasses
+ * the whole check).  Access ACLs are rare — most inodes have none — so we
+ * remember inodes proven to have no access ACL and skip the filesystem lookup
+ * for them, running it at most once per inode (mirroring the kernel's i_acl
+ * cache).  It is flushed whenever an ACL could have been added or removed. */
+#define VFS_NOACL_CACHE 512
+static unsigned long g_noacl_ino[VFS_NOACL_CACHE];
+static unsigned g_noacl_next;
+
+static int noacl_cached(unsigned long ino)
+{
+	if (ino == 0)
+		return 0;
+	for (unsigned i = 0; i < VFS_NOACL_CACHE; i++)
+		if (g_noacl_ino[i] == ino)
+			return 1;
+	return 0;
+}
+
+static void noacl_remember(unsigned long ino)
+{
+	if (ino == 0 || noacl_cached(ino))
+		return;
+	g_noacl_ino[g_noacl_next] = ino;
+	g_noacl_next = (g_noacl_next + 1) % VFS_NOACL_CACHE;
+}
+
+static void vfs_acl_cache_flush(void)
+{
+	for (unsigned i = 0; i < VFS_NOACL_CACHE; i++)
+		g_noacl_ino[i] = 0;
+	g_noacl_next = 0;
+}
+
+/* ---- directory-stat cache for the permission traverse ----
+ * Path resolution is not cached, so the non-privileged permission traverse,
+ * which re-resolves every ancestor prefix of every accessed path, was
+ * O(depth^2) directory reads per open — invisible to root, which skips the
+ * traverse entirely.  This caches the stat of recently-resolved paths so the
+ * repeated ancestor lookups become cheap.  The cached metadata is
+ * cred-independent (the per-caller permission decision is still computed fresh
+ * from it), so the cache is shared across processes; a generation counter,
+ * bumped by every metadata/namespace-changing VFS op, invalidates it. */
+#define VFS_STATC 128
+static struct {
+	char path[256];
+	struct kstat st;
+	int valid;
+} g_statc[VFS_STATC];
+static unsigned g_statc_next;
+static unsigned long g_meta_gen, g_statc_gen;
+
+/* Invalidate the directory-stat cache: called by every op that changes a
+ * file's metadata or the directory namespace. */
+static void vfs_meta_bump(void)
+{
+	g_meta_gen++;
+}
+
+static int statc_get(const char *path, struct kstat *out)
+{
+	if (g_statc_gen != g_meta_gen) { /* stale: drop everything */
+		for (unsigned i = 0; i < VFS_STATC; i++)
+			g_statc[i].valid = 0;
+		g_statc_gen = g_meta_gen;
+		return 0;
+	}
+	for (unsigned i = 0; i < VFS_STATC; i++)
+		if (g_statc[i].valid && strcmp(g_statc[i].path, path) == 0) {
+			*out = g_statc[i].st;
+			return 1;
+		}
+	return 0;
+}
+
+static void statc_put(const char *path, const struct kstat *st)
+{
+	size_t n = 0;
+	while (path[n])
+		n++;
+	if (n >= sizeof(g_statc[0].path))
+		return;
+	unsigned idx = g_statc_next;
+	g_statc_next = (g_statc_next + 1) % VFS_STATC;
+	for (size_t i = 0; i <= n; i++)
+		g_statc[idx].path[i] = path[i];
+	g_statc[idx].st = *st;
+	g_statc[idx].valid = 1;
+}
+
+/* stat used by the traverse: cache-first, so re-resolving shared ancestor
+ * prefixes across many opens is cheap. */
+static int traverse_stat(const char *path, struct kstat *st)
+{
+	if (statc_get(path, st))
+		return ST_OK;
+	int r = vfs_raw_stat(path, st);
+	if (r == ST_OK)
+		statc_put(path, st);
+	return r;
+}
+
 /* Access check for a file whose stat is `st`, honouring a POSIX access ACL
  * (system.posix_acl_access) if present, else the mode bits.  `use_real` selects
  * the real vs effective/fs ids (access(2) uses the real ids).  ST_OK/ST_ACCESS. */
@@ -59,7 +164,7 @@ static int vfs_perm_access(const char *path, const struct kstat *st, int want,
 	if (!c)
 		return ST_OK; /* kernel context: privileged */
 	uint32_t cuid = use_real ? c->uid : c->euid;
-	if (cuid != 0) {
+	if (cuid != 0 && !noacl_cached((unsigned long)st->st_ino)) {
 		unsigned char acl[512];
 		int n = vfs_getxattr_ino(path, (unsigned long)st->st_ino,
 					 "system.posix_acl_access", acl,
@@ -73,6 +178,10 @@ static int vfs_perm_access(const char *path, const struct kstat *st, int want,
 				return (r == 0) ? ST_OK :
 						  ST_ACCESS; /* ACL decided */
 			/* r == 1: no usable ACL -> fall through to mode bits */
+		} else if (n == ST_NODATA) {
+			/* Proven to have no access ACL: skip the lookup next
+			 * time.  (Other errors are not cached.) */
+			noacl_remember((unsigned long)st->st_ino);
 		}
 	}
 	int r = use_real ? cred_check_access_real(c, (uint32_t)st->st_mode,
@@ -84,6 +193,22 @@ static int vfs_perm_access(const char *path, const struct kstat *st, int want,
 	return (r == 0) ? ST_OK : ST_ACCESS;
 }
 
+/* Permission decision against an already-resolved stat: the filesystem's own
+ * hook first (e.g. FAT32 emulates permissive), then the generic ACL/mode-bit
+ * check.  Callers that just stat'd the target use this directly to avoid
+ * re-resolving the path. */
+static int vfs_permission_st(const char *path, const struct kstat *st, int want,
+			     int use_real)
+{
+	const vfs_ops_t *o = vfs_ops_for_path(path);
+	if (o && o->permission) {
+		int fr = o->permission(path, (unsigned long)st->st_ino, want);
+		if (fr != ST_UNSUPPORTED)
+			return fr;
+	}
+	return vfs_perm_access(path, st, want, use_real);
+}
+
 /* Shared worker for vfs_permission (use_real=0) and vfs_access (use_real=1). */
 static int vfs_permission_id(const char *path, int want, int use_real)
 {
@@ -92,13 +217,7 @@ static int vfs_permission_id(const char *path, int want, int use_real)
 	struct kstat st;
 	if (!o || vfs_raw_stat(path, &st) != ST_OK)
 		return ST_OK; /* unresolved: defer to the real op */
-	/* Filesystem-specific decision first (e.g. FAT32 emulates permissive). */
-	if (o->permission) {
-		int fr = o->permission(path, (unsigned long)st.st_ino, want);
-		if (fr != ST_UNSUPPORTED)
-			return fr;
-	}
-	return vfs_perm_access(path, &st, want, use_real);
+	return vfs_permission_st(path, &st, want, use_real);
 }
 
 int vfs_permission(const char *path, int want)
@@ -159,7 +278,7 @@ static int vfs_permission_traverse_id(const char *path, int use_real)
 			dir[i] = '\0';
 		}
 		struct kstat st;
-		if (vfs_raw_stat(dir, &st) != ST_OK)
+		if (traverse_stat(dir, &st) != ST_OK)
 			continue; /* defer to the resolver */
 		if ((st.st_mode & S_IFMT) != S_IFDIR)
 			continue;
@@ -268,6 +387,21 @@ int vfs_permission_remove(const char *path)
  * clear the flag first).  `is_append_write` is 1 only for an append-mode write
  * (the lone modification an append-only file permits).  No-op for a filesystem
  * without the inode_flags op. */
+static int vfs_attr_allow_modify_ino(const vfs_ops_t *o, unsigned long ino,
+				     int is_append_write)
+{
+	if (!o || !o->inode_flags)
+		return ST_OK;
+	uint32_t fl = 0;
+	if (o->inode_flags(ino, &fl) != ST_OK)
+		return ST_OK;
+	if (fl & VFS_ATTR_IMMUTABLE)
+		return ST_PERM;
+	if ((fl & VFS_ATTR_APPEND) && !is_append_write)
+		return ST_PERM;
+	return ST_OK;
+}
+
 static int vfs_attr_allow_modify(const char *path, int is_append_write)
 {
 	const vfs_ops_t *o = vfs_ops_for_path(path);
@@ -276,14 +410,8 @@ static int vfs_attr_allow_modify(const char *path, int is_append_write)
 	struct kstat st;
 	if (vfs_raw_stat(path, &st) != ST_OK)
 		return ST_OK;
-	uint32_t fl = 0;
-	if (o->inode_flags((unsigned long)st.st_ino, &fl) != ST_OK)
-		return ST_OK;
-	if (fl & VFS_ATTR_IMMUTABLE)
-		return ST_PERM;
-	if ((fl & VFS_ATTR_APPEND) && !is_append_write)
-		return ST_PERM;
-	return ST_OK;
+	return vfs_attr_allow_modify_ino(o, (unsigned long)st.st_ino,
+					 is_append_write);
 }
 
 /* ================================================================== */
@@ -361,7 +489,9 @@ int vfs_open(const char *path, int flags, vfs_file_t **out)
 		int exists = (vfs_raw_stat(path, &est) == ST_OK);
 		if (exists) {
 			if (want) {
-				int pr = vfs_permission(path, want);
+				/* est was just resolved: decide on it directly
+				 * instead of re-resolving the path. */
+				int pr = vfs_permission_st(path, &est, want, 0);
 				if (pr != ST_OK)
 					return pr;
 			}
@@ -370,7 +500,9 @@ int vfs_open(const char *path, int flags, vfs_file_t **out)
 						 !(flags & O_TRUNC)) ?
 							1 :
 							0;
-				int im = vfs_attr_allow_modify(path, append_ok);
+				int im = vfs_attr_allow_modify_ino(
+					vfs_ops_for_path(path),
+					(unsigned long)est.st_ino, append_ok);
 				if (im != ST_OK)
 					return im;
 			}
@@ -500,6 +632,7 @@ int vfs_symlink(const char *target, const char *linkpath)
 	int pr = vfs_permission_parent(linkpath, MAY_WRITE | MAY_EXEC);
 	if (pr != ST_OK)
 		return pr;
+	vfs_meta_bump();
 	return o->symlink(target, linkpath);
 }
 
@@ -525,6 +658,7 @@ int vfs_link(const char *oldpath, const char *newpath)
 	int pr = vfs_permission_parent(newpath, MAY_WRITE | MAY_EXEC);
 	if (pr != ST_OK)
 		return pr;
+	vfs_meta_bump();
 	return o->link(oldpath, newpath);
 }
 
@@ -554,6 +688,7 @@ int vfs_chmod(const char *path, unsigned int mode)
 		return im;
 	if (!o->chmod)
 		return ST_OK; /* fs has no permission bits */
+	vfs_meta_bump();
 	return o->chmod(path, mode);
 }
 
@@ -586,6 +721,7 @@ int vfs_chown(const char *path, int uid, int gid)
 		return im;
 	if (!o->chown)
 		return ST_OK; /* fs has no ownership */
+	vfs_meta_bump();
 	return o->chown(path, uid, gid);
 }
 
@@ -595,6 +731,7 @@ int vfs_fchmod(vfs_file_t *f, unsigned int mode)
 		return ST_INVALID;
 	if (!f->ops->fchmod)
 		return ST_OK;
+	vfs_meta_bump();
 	return f->ops->fchmod(f, mode);
 }
 
@@ -604,6 +741,7 @@ int vfs_fchown(vfs_file_t *f, int uid, int gid)
 		return ST_INVALID;
 	if (!f->ops->fchown)
 		return ST_OK;
+	vfs_meta_bump();
 	return f->ops->fchown(f, uid, gid);
 }
 
@@ -702,6 +840,7 @@ int vfs_setxattr(const char *path, int nofollow, const char *name,
 	int im = vfs_attr_allow_modify(path, 0);
 	if (im != ST_OK)
 		return im;
+	vfs_acl_cache_flush(); /* an ACL may have been added/changed */
 	return o->setxattr(path, nofollow, name, val, size, flags);
 }
 int vfs_listxattr(const char *path, int nofollow, char *list,
@@ -729,6 +868,7 @@ int vfs_removexattr(const char *path, int nofollow, const char *name)
 	int im = vfs_attr_allow_modify(path, 0);
 	if (im != ST_OK)
 		return im;
+	vfs_acl_cache_flush(); /* an ACL may have been removed */
 	return o->removexattr(path, nofollow, name);
 }
 int vfs_fgetxattr(vfs_file_t *f, const char *name, void *val,
@@ -743,6 +883,7 @@ int vfs_fsetxattr(vfs_file_t *f, const char *name, const void *val,
 {
 	if (!f || !f->ops || !f->ops->fsetxattr)
 		return ST_UNSUPPORTED;
+	vfs_acl_cache_flush(); /* an ACL may have been added/changed */
 	return f->ops->fsetxattr(f, name, val, size, flags);
 }
 int vfs_flistxattr(vfs_file_t *f, char *list, unsigned long size)
@@ -755,6 +896,7 @@ int vfs_fremovexattr(vfs_file_t *f, const char *name)
 {
 	if (!f || !f->ops || !f->ops->fremovexattr)
 		return ST_UNSUPPORTED;
+	vfs_acl_cache_flush(); /* an ACL may have been removed */
 	return f->ops->fremovexattr(f, name);
 }
 int vfs_getxattr_ino(const char *path, unsigned long ino, const char *name,
@@ -858,6 +1000,7 @@ int vfs_unlink(const char *path)
 	int im = vfs_attr_allow_modify(path, 0); /* immutable/append: no unlink */
 	if (im != ST_OK)
 		return im;
+	vfs_meta_bump();
 	return g_root_ops->unlink(path);
 }
 int vfs_rename(const char *oldpath, const char *newpath)
@@ -875,6 +1018,7 @@ int vfs_rename(const char *oldpath, const char *newpath)
 	int im = vfs_attr_allow_modify(oldpath, 0);
 	if (im != ST_OK)
 		return im;
+	vfs_meta_bump();
 	return g_root_ops->rename(oldpath, newpath);
 }
 int vfs_mkdir(const char *path, unsigned int mode)
@@ -884,6 +1028,7 @@ int vfs_mkdir(const char *path, unsigned int mode)
 	int pr = vfs_permission_parent(path, MAY_WRITE | MAY_EXEC);
 	if (pr != ST_OK)
 		return pr;
+	vfs_meta_bump();
 	return g_root_ops->mkdir(path, mode);
 }
 int vfs_rmdir(const char *path)
@@ -896,6 +1041,7 @@ int vfs_rmdir(const char *path)
 	int im = vfs_attr_allow_modify(path, 0);
 	if (im != ST_OK)
 		return im;
+	vfs_meta_bump();
 	return g_root_ops->rmdir(path);
 }
 

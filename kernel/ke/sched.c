@@ -73,8 +73,19 @@ int g_smp_initialized = 0;
 // Legacy global current (pre-SMP only; post-SMP uses percpu->current_task)
 static task_t *g_current = 0;
 
-// PID allocator (non-static for sys_clone in syscall.c)
-int g_next_id = 1;
+// PID allocator (non-static for sys_clone in syscall.c).
+// id 1 is reserved for /sbin/init (PID 1); every other task is numbered from
+// 2 upward.  There is no PID 0.
+int g_next_id = 2;
+
+// The /sbin/init task (PID 1).  Recorded when init is spawned; used to protect
+// it from ordinary signals and to panic if it ever exits.
+task_t *g_init_task = NULL;
+
+void sched_set_init_task(task_t *t)
+{
+	g_init_task = t;
+}
 
 // Kernel page table and default kernel stack
 static uint64_t *g_kernel_pml4 = 0;
@@ -178,6 +189,14 @@ static inline int is_idle_task(const task_t *t)
 static inline int is_bootstrap_task(const task_t *t)
 {
 	return t == &g_bootstrap_task;
+}
+
+/* The bootstrap (primordial kernel) task and the per-CPU idle tasks are the
+ * kernel's own swapper-class contexts, not real processes.  Hide them from
+ * process listings so tools like ps don't show them. */
+int sched_task_hidden(const task_t *t)
+{
+	return t && (is_bootstrap_task(t) || is_idle_task(t));
 }
 
 /* Close every open fd on `task`.  Extracted from sched_mark_task_exited so
@@ -691,7 +710,7 @@ void sched_init(void)
 	g_bootstrap_task.arg = 0;
 	g_bootstrap_task.state = TASK_RUNNING;
 	g_bootstrap_task.privilege = TASK_KERNEL;
-	g_bootstrap_task.id = 0;
+	g_bootstrap_task.id = g_next_id++; /* kernel bootstrap task; never PID 0 */
 	task_init_common(&g_bootstrap_task);
 	// The bootstrap task is already running: stack frames already contain the
 	// current per-CPU canary.  Inherit it so epilogue checks keep passing.
@@ -1781,6 +1800,14 @@ void sched_mark_task_exited(task_t *task, int status)
 	if (!task)
 		return;
 
+	// PID 1 must never die.  If /sbin/init exits, returns from main, or is
+	// killed by a fatal fault, the system has lost its fundamental process
+	// manager; halt loudly rather than continue.
+	if (g_init_task && task == g_init_task) {
+		panic("init (PID 1) terminated with status %d - system halted",
+		      status);
+	}
+
 	// Atomic guard against concurrent calls from multiple CPUs.
 	// Scenario: CPU 0 sends SIGKILL → sched_signal_task → sched_mark_task_exited.
 	// Meanwhile CPU 1's timer fires → signal_deliver_irq dequeues the same SIGKILL
@@ -1936,6 +1963,22 @@ void sched_signal_task(task_t *task, int sig)
 	// may have already marked this task as exited.
 	if (task->has_exited || task->state == TASK_ZOMBIE)
 		return;
+
+	// PID 1 protection: /sbin/init cannot be terminated or stopped by an
+	// ordinary signal.  A signal whose disposition is the default TERM or
+	// STOP action (this includes the uncatchable SIGKILL and SIGSTOP) is
+	// ignored for init; a signal with an installed handler (e.g. init's
+	// SIGTERM/SIGINT) is delivered normally so init can act on it.  Fatal
+	// fault signals (CORE, e.g. SIGSEGV) are allowed through so a genuine
+	// init crash still reaches sched_mark_task_exited and panics.
+	if (g_init_task && task == g_init_task) {
+		struct k_sigaction *ia = &task->signals.action[sig];
+		if (ia->sa_handler == SIG_DFL) {
+			int da = sig_default_action(sig);
+			if (da == SIG_DFL_TERM || da == SIG_DFL_STOP)
+				return;
+		}
+	}
 
 	siginfo_t info;
 	mm_memset(&info, 0, sizeof(info));
@@ -3232,7 +3275,7 @@ void sched_calc_load(void)
 	spin_lock_irqsave(&g_task_list_lock, &tl_flags);
 	task_t *t = g_task_list_head;
 	while (t) {
-		if (t->id != 0 && !t->has_exited &&
+		if (!is_bootstrap_task(t) && !t->has_exited &&
 		    (t->state == TASK_READY || t->state == TASK_RUNNING)) {
 			// Skip idle tasks
 			int is_idle = 0;

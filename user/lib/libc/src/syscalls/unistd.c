@@ -635,11 +635,8 @@ int gethostname(char *name, size_t len)
 	return 0;
 }
 
-char *getlogin(void)
-{
-	static char user[] = "root";
-	return user;
-}
+/* getlogin()/getlogin_r()/setlogin() live in src/pwd/creds.c so they can share
+ * the stored login-name state with setlogin(). */
 
 int uname(struct utsname *buf)
 {

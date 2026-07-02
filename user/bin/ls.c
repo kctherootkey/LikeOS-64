@@ -17,6 +17,77 @@
 #include <getopt.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <pwd.h>
+#include <grp.h>
+
+/* ======================================================================
+ * uid/gid -> name resolution.  /etc/passwd and /etc/group are each read only
+ * once (on first use) into an in-memory table; every listed file then resolves
+ * its owner/group from memory instead of re-opening the databases.
+ * ====================================================================== */
+static struct {
+	unsigned id;
+	char name[33];
+} g_users[256], g_groups[256];
+static int g_nusers = -1, g_ngroups = -1;
+
+static const char *uid_to_name(uid_t uid)
+{
+	if (g_nusers < 0) {
+		g_nusers = 0;
+		setpwent();
+		struct passwd *pw;
+		while ((pw = getpwent()) != NULL && g_nusers < 256) {
+			g_users[g_nusers].id = pw->pw_uid;
+			snprintf(g_users[g_nusers].name, 33, "%s", pw->pw_name);
+			g_nusers++;
+		}
+		endpwent();
+	}
+	for (int i = 0; i < g_nusers; i++)
+		if (g_users[i].id == uid)
+			return g_users[i].name;
+	return NULL;
+}
+
+static const char *gid_to_name(gid_t gid)
+{
+	if (g_ngroups < 0) {
+		g_ngroups = 0;
+		setgrent();
+		struct group *gr;
+		while ((gr = getgrent()) != NULL && g_ngroups < 256) {
+			g_groups[g_ngroups].id = gr->gr_gid;
+			snprintf(g_groups[g_ngroups].name, 33, "%s", gr->gr_name);
+			g_ngroups++;
+		}
+		endgrent();
+	}
+	for (int i = 0; i < g_ngroups; i++)
+		if (g_groups[i].id == gid)
+			return g_groups[i].name;
+	return NULL;
+}
+
+/* Render an owner (uid) or group (gid) as a name, or the number if unknown or
+ * numeric output was requested. */
+static void owner_str(char *buf, size_t sz, uid_t uid, int numeric)
+{
+	const char *nm = numeric ? NULL : uid_to_name(uid);
+	if (nm)
+		snprintf(buf, sz, "%s", nm);
+	else
+		snprintf(buf, sz, "%u", uid);
+}
+
+static void group_str(char *buf, size_t sz, gid_t gid, int numeric)
+{
+	const char *nm = numeric ? NULL : gid_to_name(gid);
+	if (nm)
+		snprintf(buf, sz, "%s", nm);
+	else
+		snprintf(buf, sz, "%u", gid);
+}
 
 /* ======================================================================
  * Version & help
@@ -687,19 +758,19 @@ static void print_long(entry_t *entries, int count, const char *dirpath)
 			max_nlink = w;
 
 		if (!opt_no_owner) {
-			snprintf(tmp, sizeof(tmp), "%u", st->st_uid);
-			w = (int)strlen(tmp);
-			if (st->st_uid == 0)
-				w = 4; /* "root" */
+			char ubuf[33];
+			owner_str(ubuf, sizeof(ubuf), st->st_uid,
+			          opt_numeric_uid);
+			w = (int)strlen(ubuf);
 			if (w > max_uid)
 				max_uid = w;
 		}
 
 		if (!opt_no_group && !opt_no_list_group) {
-			snprintf(tmp, sizeof(tmp), "%u", st->st_gid);
-			w = (int)strlen(tmp);
-			if (st->st_gid == 0)
-				w = 4; /* "root" */
+			char gbuf[33];
+			group_str(gbuf, sizeof(gbuf), st->st_gid,
+			          opt_numeric_uid);
+			w = (int)strlen(gbuf);
 			if (w > max_gid)
 				max_gid = w;
 		}
@@ -761,38 +832,26 @@ static void print_long(entry_t *entries, int count, const char *dirpath)
 
 		/* Owner (unless -g or -o with no owner) */
 		if (!opt_no_owner) {
-			if (opt_numeric_uid || e->st.st_uid != 0) {
-				char ubuf[16];
-				snprintf(ubuf, sizeof(ubuf), "%u",
-					 e->st.st_uid);
-				printf("%-*s ", max_uid, ubuf);
-			} else {
-				printf("%-*s ", max_uid, "root");
-			}
+			char ubuf[33];
+			owner_str(ubuf, sizeof(ubuf), e->st.st_uid,
+			          opt_numeric_uid);
+			printf("%-*s ", max_uid, ubuf);
 		}
 
 		/* --author (same as owner for us) */
 		if (opt_author) {
-			if (opt_numeric_uid || e->st.st_uid != 0) {
-				char ubuf[16];
-				snprintf(ubuf, sizeof(ubuf), "%u",
-					 e->st.st_uid);
-				printf("%-*s ", max_uid, ubuf);
-			} else {
-				printf("%-*s ", max_uid, "root");
-			}
+			char ubuf[33];
+			owner_str(ubuf, sizeof(ubuf), e->st.st_uid,
+			          opt_numeric_uid);
+			printf("%-*s ", max_uid, ubuf);
 		}
 
 		/* Group (unless -G or -o) */
 		if (!opt_no_group && !opt_no_list_group) {
-			if (opt_numeric_uid || e->st.st_gid != 0) {
-				char gbuf[16];
-				snprintf(gbuf, sizeof(gbuf), "%u",
-					 e->st.st_gid);
-				printf("%-*s ", max_gid, gbuf);
-			} else {
-				printf("%-*s ", max_gid, "root");
-			}
+			char gbuf[33];
+			group_str(gbuf, sizeof(gbuf), e->st.st_gid,
+			          opt_numeric_uid);
+			printf("%-*s ", max_gid, gbuf);
 		}
 
 		/* Size */

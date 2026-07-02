@@ -22,6 +22,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -188,6 +189,18 @@ static void show_one_interface(const char *name, int verbose)
 		name);
 }
 
+/* Report a failed interface-configuration ioctl.  A non-root caller gets
+ * EPERM, so state that clearly. */
+static void report_set_error(const char *op)
+{
+	if (errno == EPERM)
+		fprintf(stderr,
+		    "ifconfig: %s: Operation not permitted "
+		    "(only root may configure interfaces)\n", op);
+	else
+		fprintf(stderr, "ifconfig: %s: %s\n", op, strerror(errno));
+}
+
 static int set_addr(int fd, const char *ifname, unsigned long req,
 		    const char *addr_str)
 {
@@ -199,7 +212,16 @@ static int set_addr(int fd, const char *ifname, unsigned long req,
 	sin->sin_family = AF_INET;
 	sin->sin_addr.s_addr = inet_addr(addr_str);
 
-	return ioctl(fd, req, &ifr);
+	int r = ioctl(fd, req, &ifr);
+	if (r < 0) {
+		const char *op = req == SIOCSIFADDR ? "SIOCSIFADDR" :
+		                 req == SIOCSIFNETMASK ? "SIOCSIFNETMASK" :
+		                 req == SIOCSIFBRDADDR ? "SIOCSIFBRDADDR" :
+		                 req == SIOCSIFDSTADDR ? "SIOCSIFDSTADDR" :
+		                 "SIOCSIF";
+		report_set_error(op);
+	}
+	return r;
 }
 
 static int set_flags(int fd, const char *ifname, short flags, int set)
@@ -216,7 +238,10 @@ static int set_flags(int fd, const char *ifname, short flags, int set)
 	else
 		ifr.ifr_flags &= ~flags;
 
-	return ioctl(fd, SIOCSIFFLAGS, &ifr);
+	int r = ioctl(fd, SIOCSIFFLAGS, &ifr);
+	if (r < 0)
+		report_set_error("SIOCSIFFLAGS");
+	return r;
 }
 
 static int parse_hwaddr(const char *str, unsigned char *mac)
@@ -365,7 +390,8 @@ int main(int argc, char *argv[])
 			memset(&ifr, 0, sizeof(ifr));
 			strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
 			ifr.ifr_metric = atoi(argv[i + 1]);
-			ioctl(fd, SIOCSIFMETRIC, &ifr);
+			if (ioctl(fd, SIOCSIFMETRIC, &ifr) < 0)
+				report_set_error("SIOCSIFMETRIC");
 			i += 2;
 		}
 		/* mtu N */
@@ -375,8 +401,7 @@ int main(int argc, char *argv[])
 			strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
 			ifr.ifr_mtu = atoi(argv[i + 1]);
 			if (ioctl(fd, SIOCSIFMTU, &ifr) < 0)
-				fprintf(stderr,
-					"ifconfig: SIOCSIFMTU: Invalid argument\n");
+				report_set_error("SIOCSIFMTU");
 			i += 2;
 		}
 		/* dstaddr addr */

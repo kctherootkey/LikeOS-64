@@ -1,0 +1,6 @@
+# /etc/profile - system-wide startup for login shells (sourced by /bin/sh
+# when started as a login shell, e.g. "-sh" from /bin/login).
+
+export PATH=/bin:/usr/local/bin
+export PAGER=less
+export EDITOR=nano

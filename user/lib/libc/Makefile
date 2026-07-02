@@ -24,6 +24,7 @@ REGEX_SRC = src/regex/regex.c
 EXTRA_STDIO_SRC = src/stdio/getline.c src/stdio/err.c
 SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/sched.c src/syscalls/socket.c src/syscalls/uio.c src/syscalls/resource.c src/syscalls/pty_util.c
 DLFCN_SRC = src/dl/dlfcn.c
+PWD_SRC = src/pwd/pwd.c src/pwd/grp.c src/pwd/shadow.c src/pwd/creds.c
 NET_SRC = src/net/inet.c src/net/getaddrinfo.c src/net/getifaddrs.c src/net/netdb_extra.c
 PTHREAD_SRC = src/pthread/pthread.c src/pthread/pthread_mutex.c src/pthread/pthread_cond.c src/pthread/pthread_sync.c src/pthread/pthread_tsd.c
 STACK_CHK_SRC = src/stack_chk.c
@@ -46,6 +47,7 @@ MATH_OBJ = $(MATH_SRC:.c=.o)
 REGEX_OBJ = $(REGEX_SRC:.c=.o)
 SYSCALLS_OBJ = $(SYSCALLS_SRC:.c=.o)
 DLFCN_OBJ = $(DLFCN_SRC:.c=.o)
+PWD_OBJ = $(PWD_SRC:.c=.o)
 NET_OBJ = $(NET_SRC:.c=.o)
 PTHREAD_OBJ = $(PTHREAD_SRC:.c=.o) $(PTHREAD_ASM:.S=.o)
 SETJMP_OBJ  = $(SETJMP_ASM:.S=.o)
@@ -58,7 +60,7 @@ CRTN_OBJ = $(CRTN_SRC:.S=.o)
 # All static objects (libc – everything except pthread)
 LIBC_OBJ = $(MALLOC_OBJ) $(STDIO_OBJ) $(STRING_OBJ) $(STDLIB_OBJ) \
            $(CTYPE_OBJ) $(TIME_OBJ) $(DIR_OBJ) $(MATH_OBJ) $(REGEX_OBJ) $(SYSCALLS_OBJ) \
-           $(NET_OBJ) $(SETJMP_OBJ) $(STACK_CHK_OBJ)
+           $(NET_OBJ) $(SETJMP_OBJ) $(STACK_CHK_OBJ) $(PWD_OBJ)
 
 ALL_OBJ = $(LIBC_OBJ) $(PTHREAD_OBJ)
 

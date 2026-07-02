@@ -798,6 +798,33 @@ static unsigned setid_strip_bits(uint32_t mode)
 	return clr;
 }
 
+/* Permission screen for /dev opens.  Devfs opens are dispatched directly to
+ * devfs_open_for_task (they need the task context for /dev/tty), bypassing
+ * vfs_open's canonical enforcement — so the DAC decision vfs_open would have
+ * made is applied here instead: ancestor search plus the open mode against the
+ * device node's reported ownership/mode bits. */
+static int devfs_open_perm(task_t *cur, const char *path, uint64_t flags)
+{
+	if (cur->cred.euid == 0)
+		return 0;
+	int tr = perm_traverse(path);
+	if (tr < 0)
+		return tr;
+	int want = 0, acc = (int)(flags & 3);
+	if (acc == O_RDONLY || acc == O_RDWR)
+		want |= MAY_READ;
+	if (acc == O_WRONLY || acc == O_RDWR)
+		want |= MAY_WRITE;
+	if (flags & O_TRUNC)
+		want |= MAY_WRITE;
+	if (!want)
+		return 0;
+	struct kstat est;
+	if (vfs_stat(path, &est) != ST_OK)
+		return 0; /* unresolved: let the open report ENOENT */
+	return perm_access(cur, path, &est, want, 0);
+}
+
 /* Drop the set-id bits from an open file after a content modification.  Caller
  * gates on non-root + success.  Runs at most once per INODE: the first call
  * evaluates the mode (one inode read) and clears any set-id bits, then marks
@@ -853,35 +880,17 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 			return brest;
 		path = full;
 	}
-	/* Enforce read/write permission for non-root openers (root's path is
-     * untouched).  For an existing file we check its mode; for O_CREAT of a new
-     * file we require write+search on the parent directory. */
-	if (cur->cred.euid != 0) {
-		int tr = perm_traverse(path); /* search on ancestor dirs */
-		if (tr < 0)
-			return tr;
-		int want = 0, acc = (int)(flags & 3);
-		if (acc == O_RDONLY || acc == O_RDWR)
-			want |= MAY_READ;
-		if (acc == O_WRONLY || acc == O_RDWR)
-			want |= MAY_WRITE;
-		if (flags & O_TRUNC)
-			want |= MAY_WRITE;
-		struct kstat est;
-		int exists = (vfs_stat(path, &est) == ST_OK);
-		if (exists && want) {
-			int pr = perm_access(cur, path, &est, want, 0);
-			if (pr < 0)
-				return pr;
-		} else if (!exists && (flags & O_CREAT)) {
-			int pr = perm_check_parent(path, MAY_WRITE | MAY_EXEC);
-			if (pr < 0)
-				return pr;
-		}
-	}
+	/* No pre-flight permission screening here: vfs_open() enforces the whole
+     * policy authoritatively (ancestor search, read/write mode on an existing
+     * target, parent write+search for O_CREAT, immutable/append flags) and its
+     * ST_ status maps to the same errno.  The duplicate screening made every
+     * non-root open re-resolve the path several extra times. */
 	int ret;
 	if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' &&
 	    path[3] == 'v' && (path[4] == '/' || path[4] == '\0')) {
+		int pr = devfs_open_perm(cur, path, flags);
+		if (pr < 0)
+			return pr;
 		ret = devfs_open_for_task(path, (int)flags, &file, cur);
 		if (ret == ST_OK && file) {
 			file->refcount = 1;
@@ -937,6 +946,9 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
 	vfs_file_t *file = NULL;
 	if (full[0] == '/' && full[1] == 'd' && full[2] == 'e' &&
 	    full[3] == 'v' && (full[4] == '/' || full[4] == '\0')) {
+		int pr = devfs_open_perm(cur, full, flags);
+		if (pr < 0)
+			return pr;
 		ret = devfs_open_for_task(full, (int)flags, &file, cur);
 		if (ret == ST_OK && file) {
 			file->refcount = 1;
@@ -1063,17 +1075,16 @@ static int64_t sys_stat_common(const char *path, uint64_t stat_buf,
 	// Security: Zero the struct to prevent leaking uninitialized kernel stack data
 	struct kstat st;
 	mm_memset(&st, 0, sizeof(st));
-	/* Enforce ancestor search BEFORE existence is revealed, so an
-     * unsearchable prefix yields EACCES (not ENOENT) — matches the reference. */
-	int tr = perm_traverse(path);
-	if (tr < 0)
-		return tr;
+	/* vfs_stat runs the ancestor search itself, BEFORE resolving the target,
+     * so an unsearchable prefix still yields EACCES (not ENOENT). */
 	int ret = vfs_stat(path, &st);
 	if (ret != ST_OK) {
 		if (ret == ST_NOT_FOUND)
 			return -ENOENT;
 		if (ret == ST_IO)
 			return -EIO; /* corrupt metadata, not absent */
+		if (ret == ST_ACCESS || ret == ST_PERM)
+			return vfs_status_to_errno(ret);
 		return -EINVAL;
 	}
 	// Security: Use SMAP-aware copy to user
@@ -1132,17 +1143,18 @@ static int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf)
 	}
 	/* lstat must NOT follow a final symlink.  vfs_lstat dispatches to the
      * filesystem's no-follow stat; on a filesystem without symlinks it
-     * transparently falls back to plain stat. */
+     * transparently falls back to plain stat.  vfs_lstat runs the ancestor
+     * search itself (before existence is revealed). */
 	if (!validate_user_ptr(stat_buf, sizeof(struct kstat)))
 		return -EFAULT;
 	struct kstat st;
 	mm_memset(&st, 0, sizeof(st));
-	int tr = perm_traverse(p); /* ancestor search before existence */
-	if (tr < 0)
-		return tr;
 	int r = vfs_lstat(p, &st);
-	if (r != ST_OK)
+	if (r != ST_OK) {
+		if (r == ST_ACCESS || r == ST_PERM)
+			return vfs_status_to_errno(r);
 		return (r == ST_NOT_FOUND) ? -ENOENT : -EINVAL;
+	}
 	if (copy_to_user((void *)stat_buf, &st, sizeof(st)) != 0)
 		return -EFAULT;
 	return 0;
@@ -1657,6 +1669,9 @@ static int64_t sys_gettimeofday(uint64_t tv, uint64_t tz)
 static int64_t sys_settimeofday(uint64_t tv_ptr, uint64_t tz)
 {
 	(void)tz;
+	/* Setting the wall-clock is a system-wide change: privileged only. */
+	if (!capable())
+		return -EPERM;
 	if (!validate_user_ptr(tv_ptr, sizeof(k_timeval_t)))
 		return -EFAULT;
 	k_timeval_t kv;
@@ -3768,6 +3783,16 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 		return -ENOEXEC;
 	}
 
+	/* POSIX: a successful exec resets caught signal handlers to their
+	 * default disposition (ignored signals stay ignored).  The old handler
+	 * addresses belong to the previous program image and would crash if a
+	 * signal were delivered to them in the new one. */
+	{
+		task_t *cur = sched_current();
+		if (cur)
+			signal_reset_on_exec(cur);
+	}
+
 	/* Set-user-ID / set-group-ID on a successful exec (04000 / 02000).
      * The real IDs are unchanged; effective+saved+fs IDs take the file's. */
 	{
@@ -5811,8 +5836,10 @@ static int64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t cmd,
 	    m2 != LINUX_REBOOT_MAGIC2B && m2 != LINUX_REBOOT_MAGIC2C)
 		return -EINVAL;
 
-	// Only root (PID 1 shell or PID 0) can reboot - we don't have UID so check PID <= 2
-	// In a simple OS, just allow it from any process for now
+	// Halting, powering off or rebooting the machine is privileged: only a
+	// process with an effective uid of 0 (root) may do it.
+	if (!capable())
+		return -EPERM;
 
 	// Flush filesystems (pagecache + journal) before going down so a journalled
 	// root isn't left dirty (which would force a replay on the next boot).
@@ -5923,7 +5950,9 @@ static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 	for (int pid = 0; pid < max_pid && count < (int)max_count; pid++) {
 		spin_lock_irqsave(&g_task_list_lock, &flags);
 		task_t *t = sched_find_task_by_id_locked(pid);
-		if (!t) {
+		if (!t || sched_task_hidden(t)) {
+			/* Skip empty slots and the kernel's swapper-class tasks
+			 * (bootstrap + idle), which are not real processes. */
 			spin_unlock_irqrestore(&g_task_list_lock, flags);
 			continue;
 		}
@@ -5956,11 +5985,11 @@ static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 		p->utime_ticks = t->utime_ticks;
 		p->stime_ticks = t->stime_ticks;
 
-		// UID/GID from signal state (where the kernel stores it)
-		p->uid = 0;
-		p->gid = 0;
-		p->euid = 0;
-		p->egid = 0;
+		// Real and effective credentials of the process.
+		p->uid = (int)t->cred.uid;
+		p->gid = (int)t->cred.gid;
+		p->euid = (int)t->cred.euid;
+		p->egid = (int)t->cred.egid;
 
 		// VSZ: count pages mapped in user space (rough estimate)
 		p->vsz = 0;
@@ -6057,6 +6086,9 @@ static int64_t sys_sysinfo(uint64_t info_ptr)
 // ============================================================================
 static int64_t sys_klogctl(uint64_t type, uint64_t bufp, uint64_t len)
 {
+	/* Reading or clearing the kernel log is privileged (dmesg is root-only). */
+	if (!capable())
+		return -EPERM;
 	switch ((int)type) {
 	case SYSLOG_ACTION_READ:
 	case SYSLOG_ACTION_READ_ALL: {
@@ -7720,6 +7752,10 @@ dns_str_done:
 		net_device_t *dev = net_get_default_device();
 		if (!dev)
 			return -ENETDOWN;
+		/* DISCOVER/RELEASE/RENEW reconfigure the interface address and
+		 * are privileged; STATUS is read-only and open to all. */
+		if (subcmd != DHCP_CMD_STATUS && !capable())
+			return -EPERM;
 		switch (subcmd) {
 		case DHCP_CMD_DISCOVER:
 			return dhcp_discover(dev);

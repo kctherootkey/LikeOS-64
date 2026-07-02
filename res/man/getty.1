@@ -1,0 +1,44 @@
+GETTY(1)                         User Commands                        GETTY(1)
+
+NAME
+       getty - open a terminal, prompt for a login name and run login
+
+SYNOPSIS
+       getty [tty]
+
+DESCRIPTION
+       getty prepares a terminal for use and starts the login process on
+       it.  It is normally started by init(1), which respawns it after each
+       session ends.
+
+       getty performs the following steps:
+
+         o  creates a new session with setsid(2);
+         o  opens the terminal device (/dev/console by default, or the tty
+            named on the command line) and makes it the controlling
+            terminal;
+         o  redirects standard input, output and error to the terminal and
+            makes its own process group the terminal's foreground group;
+         o  puts the line discipline into canonical mode with echo enabled;
+         o  displays the login banner and the "<host> login: " prompt;
+         o  reads the login name; and
+         o  executes /bin/login, passing the login name as an argument.
+
+       When the login session started by login(1) exits, getty exits too,
+       and init(1) starts a fresh getty so the login prompt reappears.
+
+OPTIONS
+       tty    The terminal device to operate on.  Defaults to
+              /dev/console.
+
+FILES
+       /dev/console   default terminal device
+       /bin/login     program executed to authenticate the user
+
+SEE ALSO
+       login(1), init(1)
+
+AUTHORS
+       Written for LikeOS-64.
+
+GETTY(1)                         User Commands                        GETTY(1)

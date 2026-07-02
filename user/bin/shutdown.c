@@ -17,6 +17,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <time.h>
 #include <sys/reboot.h>
@@ -405,7 +406,10 @@ int main(int argc, char *argv[])
 		break;
 	}
 
-	/* Should not reach here */
-	fprintf(stderr, "shutdown: reboot syscall failed\n");
+	/* reboot() only returns on failure. */
+	if (errno == EPERM)
+		fprintf(stderr, "shutdown: Need to be root\n");
+	else
+		fprintf(stderr, "shutdown: %s\n", strerror(errno));
 	return 1;
 }

@@ -41,10 +41,13 @@ int seteuid(int uid);
 int setgid(int gid);
 int setegid(int gid);
 int setgroups(int size, const int* list);
+int setreuid(int ruid, int euid);
+int setregid(int rgid, int egid);
 int setresuid(int ruid, int euid, int suid);
 int setresgid(int rgid, int egid, int sgid);
 int getresuid(int* ruid, int* euid, int* suid);
 int getresgid(int* rgid, int* egid, int* sgid);
+int initgroups(const char* user, gid_t group);
 
 // Process groups / terminal
 int setpgid(int pid, int pgid);
@@ -67,6 +70,8 @@ unsigned int sleep(unsigned int seconds);
 int gethostname(char* name, size_t len);
 int sethostname(const char *name, size_t len);
 char* getlogin(void);
+int getlogin_r(char* buf, size_t bufsize);
+int setlogin(const char* name);
 int fsync(int fd);
 void sync(void);
 int ftruncate(int fd, off_t length);

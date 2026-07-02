@@ -987,29 +987,43 @@ uint64_t mm_allocate_contiguous_pages(size_t page_count)
 		return 0;
 	}
 
-	// Find contiguous free pages
-	for (uint64_t start_page = 0;
-	     start_page <= mm_state.total_pages - page_count; start_page++) {
-		bool found = true;
+	// Find contiguous free pages.  Next-fit: resume scanning where the last
+	// search left off instead of from page 0 — a first-fit scan re-walks the
+	// densely allocated low region on EVERY call, which made each block-sized
+	// kalloc() (2 contiguous pages) cost a near-full bitmap scan under this
+	// global lock.  Two passes cover the wrap-around.
+	static uint64_t next_fit_hint;
+	uint64_t limit = mm_state.total_pages - page_count;
+	if (next_fit_hint > limit)
+		next_fit_hint = 0;
+	for (int pass = 0; pass < 2; pass++) {
+		uint64_t begin = pass ? 0 : next_fit_hint;
+		uint64_t end = pass ? next_fit_hint : limit + 1;
+		for (uint64_t start_page = begin; start_page < end;
+		     start_page++) {
+			bool found = true;
 
-		// Check if all pages in range are free
-		for (size_t i = 0; i < page_count; i++) {
-			if (is_page_allocated(start_page + i)) {
-				found = false;
-				break;
-			}
-		}
-
-		if (found) {
-			// Allocate all pages in range
+			// Check if all pages in range are free
 			for (size_t i = 0; i < page_count; i++) {
-				set_page_bit(start_page + i);
-				mm_state.free_pages--;
+				if (is_page_allocated(start_page + i)) {
+					found = false;
+					start_page += i; // skip past the used page
+					break;
+				}
 			}
-			uint64_t result = mm_state.memory_start +
-					  (start_page * PAGE_SIZE);
-			spin_unlock_irqrestore(&mm_phys_lock, flags);
-			return result;
+
+			if (found) {
+				// Allocate all pages in range
+				for (size_t i = 0; i < page_count; i++) {
+					set_page_bit(start_page + i);
+					mm_state.free_pages--;
+				}
+				next_fit_hint = start_page + page_count;
+				uint64_t result = mm_state.memory_start +
+						  (start_page * PAGE_SIZE);
+				spin_unlock_irqrestore(&mm_phys_lock, flags);
+				return result;
+			}
 		}
 	}
 

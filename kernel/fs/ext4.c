@@ -425,6 +425,9 @@ static void ext4_txn_begin(void)
 /* Buffer (or overwrite) a metadata block in the running transaction. */
 static void ext4_txn_capture(ext4_fs_t *fs, unsigned long pbn, const void *buf)
 {
+	/* A zero pbn here would be journaled as a block-0 tag and skipped (with a
+	 * warning) on replay — catch the writer at the source instead. */
+	WARN_ON_ONCE(pbn == 0);
 	for (unsigned i = 0; i < s_txn.n; i++)
 		if (s_txn.blk[i] == pbn) { /* re-dirtied in same op   */
 			mm_memcpy(s_txn.data[i], buf, fs->block_size);
@@ -531,6 +534,7 @@ static void ext4_checkpoint(ext4_fs_t *fs);
 /* Merge one block into the epoch pending set (latest content wins). */
 static void ext4_ckpt_merge(ext4_fs_t *fs, unsigned long pbn, const void *buf)
 {
+	WARN_ON_ONCE(pbn == 0); /* see ext4_txn_capture */
 	for (unsigned i = 0; i < s_ckpt.n; i++)
 		if (s_ckpt.blk[i] == pbn) {
 			mm_memcpy(s_ckpt.data[i], buf, fs->block_size);
@@ -795,6 +799,77 @@ static int ext4_read_block(ext4_fs_t *fs, unsigned long pbn, void *buf)
 	return ST_OK;
 }
 
+/* ---- recycled scratch block buffers --------------------------------------
+ * A block-sized kalloc is a "large" slab allocation: it takes 2 contiguous
+ * physical pages (bitmap scan under a global lock), page-table maps them, and
+ * the matching kfree unmaps with a cross-CPU TLB shootdown.  The hot metadata
+ * paths (resolve, dir lookup, inode read, xattr/ACL read) each burn several of
+ * those per operation, which made every path syscall cost milliseconds.  These
+ * scratch buffers are allocated once and recycled instead.  Guarded by a
+ * spinlock so early-boot/mount callers outside ext4_io_lock stay safe; when
+ * the pool is exhausted (or a remount grew block_size) we fall back to kalloc,
+ * and ext4_bput() routes foreign pointers back to kfree. */
+#define EXT4_BPOOL 16
+static struct {
+	uint8_t *data;
+	unsigned size;
+	int busy;
+} s_bpool[EXT4_BPOOL];
+static spinlock_t s_bpool_lock = SPINLOCK_INIT("ext4_bpool");
+
+static void *ext4_bget(ext4_fs_t *fs)
+{
+	unsigned want = fs->block_size;
+	uint64_t flags;
+	spin_lock_irqsave(&s_bpool_lock, &flags);
+	for (int i = 0; i < EXT4_BPOOL; i++) {
+		if (s_bpool[i].busy)
+			continue;
+		if (s_bpool[i].data && s_bpool[i].size < want) {
+			kfree(s_bpool[i].data); /* stale from a smaller mount */
+			s_bpool[i].data = 0;
+		}
+		if (!s_bpool[i].data) {
+			spin_unlock_irqrestore(&s_bpool_lock, flags);
+			uint8_t *nb = (uint8_t *)kalloc(want);
+			if (!nb)
+				return 0;
+			spin_lock_irqsave(&s_bpool_lock, &flags);
+			if (s_bpool[i].busy || s_bpool[i].data) {
+				/* raced: someone claimed the slot meanwhile */
+				spin_unlock_irqrestore(&s_bpool_lock, flags);
+				return nb; /* use it as a foreign buffer */
+			}
+			s_bpool[i].data = nb;
+			s_bpool[i].size = want;
+		}
+		s_bpool[i].busy = 1;
+		uint8_t *p = s_bpool[i].data;
+		spin_unlock_irqrestore(&s_bpool_lock, flags);
+		mm_memset(p, 0, want); /* match kalloc's zeroed contract */
+		return p;
+	}
+	spin_unlock_irqrestore(&s_bpool_lock, flags);
+	return kalloc(want); /* pool exhausted: degrade gracefully */
+}
+
+static void ext4_bput(void *p)
+{
+	if (!p)
+		return;
+	uint64_t flags;
+	spin_lock_irqsave(&s_bpool_lock, &flags);
+	for (int i = 0; i < EXT4_BPOOL; i++)
+		if (s_bpool[i].data == (uint8_t *)p) {
+			WARN_ON_ONCE(!s_bpool[i].busy);
+			s_bpool[i].busy = 0;
+			spin_unlock_irqrestore(&s_bpool_lock, flags);
+			return;
+		}
+	spin_unlock_irqrestore(&s_bpool_lock, flags);
+	kfree(p); /* fallback allocation */
+}
+
 /* ===================================================================
  * Group descriptor + inode reads
  * =================================================================== */
@@ -887,12 +962,12 @@ static int ext4_read_inode_loc(ext4_fs_t *fs, unsigned long ino,
 	unsigned long blk = itbl + byte / fs->block_size;
 	unsigned off = byte % fs->block_size;
 
-	uint8_t *buf = (uint8_t *)kalloc(fs->block_size);
+	uint8_t *buf = (uint8_t *)ext4_bget(fs);
 	if (!buf)
 		return ST_NOMEM;
 	st = ext4_read_block(fs, blk, buf);
 	if (st != ST_OK) {
-		kfree(buf);
+		ext4_bput(buf);
 		return st;
 	}
 
@@ -924,7 +999,7 @@ static int ext4_read_inode_loc(ext4_fs_t *fs, unsigned long ino,
 			kprintf("ext4: inode %lu metadata_csum mismatch "
 				"(disk 0x%x computed 0x%x)\n",
 				ino, want, got & mask);
-			kfree(buf);
+			ext4_bput(buf);
 			ext4_fs_error(fs, "inode checksum mismatch", ino);
 			return ST_IO;
 		}
@@ -934,7 +1009,7 @@ static int ext4_read_inode_loc(ext4_fs_t *fs, unsigned long ino,
 	unsigned copy =
 		fs->inode_size < sizeof(*out) ? fs->inode_size : sizeof(*out);
 	mm_memcpy(out, buf + off, copy);
-	kfree(buf);
+	ext4_bput(buf);
 
 	if (out_block)
 		*out_block = blk;
@@ -1032,7 +1107,7 @@ static unsigned long ext4_extent_map(ext4_fs_t *fs, unsigned long ino,
 				(unsigned long)ix[chosen].ei_leaf_lo |
 				((unsigned long)ix[chosen].ei_leaf_hi << 32);
 			if (!heap) {
-				heap = (uint8_t *)kalloc(fs->block_size);
+				heap = (uint8_t *)ext4_bget(fs);
 				if (!heap)
 					break;
 			}
@@ -1050,7 +1125,7 @@ static unsigned long ext4_extent_map(ext4_fs_t *fs, unsigned long ino,
 	}
 done:
 	if (heap)
-		kfree(heap);
+		ext4_bput(heap);
 	return result;
 }
 
@@ -1065,7 +1140,7 @@ static unsigned long ext4_indirect_map(ext4_fs_t *fs, const ext4_inode *in,
 		return direct[lidx];
 
 	lidx -= EXT4_NDIR_BLOCKS;
-	uint32_t *buf = (uint32_t *)kalloc(fs->block_size);
+	uint32_t *buf = (uint32_t *)ext4_bget(fs);
 	if (!buf)
 		return 0;
 	unsigned long result = 0;
@@ -1101,7 +1176,7 @@ static unsigned long ext4_indirect_map(ext4_fs_t *fs, const ext4_inode *in,
 		}
 	}
 out:
-	kfree(buf);
+	ext4_bput(buf);
 	return result;
 }
 
@@ -1257,7 +1332,7 @@ static int ext4_dir_lookup(ext4_fs_t *fs, unsigned long dir_ino,
 	uint32_t gen =
 		din->i_generation; /* for the leaf csum (din may be evicted below) */
 
-	uint8_t *blk = (uint8_t *)kalloc(fs->block_size);
+	uint8_t *blk = (uint8_t *)ext4_bget(fs);
 	if (!blk)
 		return ST_NOMEM;
 
@@ -1268,7 +1343,7 @@ static int ext4_dir_lookup(ext4_fs_t *fs, unsigned long dir_ino,
 		if (ext4_read_block(fs, pbn, blk) != ST_OK)
 			continue;
 		if (!ext4_dir_csum_ok(fs, dir_ino, gen, blk)) {
-			kfree(blk);
+			ext4_bput(blk);
 			ext4_fs_error(fs, "directory leaf checksum mismatch",
 				      dir_ino);
 			return ST_IO;
@@ -1287,13 +1362,13 @@ static int ext4_dir_lookup(ext4_fs_t *fs, unsigned long dir_ino,
 				*out_ino = de->inode;
 				if (out_ftype)
 					*out_ftype = de->file_type;
-				kfree(blk);
+				ext4_bput(blk);
 				return ST_OK;
 			}
 			off += rec;
 		}
 	}
-	kfree(blk);
+	ext4_bput(blk);
 	return ST_NOT_FOUND;
 }
 
@@ -1317,18 +1392,18 @@ static int ext4_read_symlink_target(ext4_fs_t *fs, unsigned long ino,
 		unsigned long pbn = ext4_block_map(fs, ino, 0);
 		if (pbn == 0)
 			return -1;
-		uint8_t *blk = (uint8_t *)kalloc(fs->block_size);
+		uint8_t *blk = (uint8_t *)ext4_bget(fs);
 		if (!blk)
 			return -1;
 		if (ext4_read_sectors(fs->bdev,
 				      fs->part_lba_offset +
 					      pbn * fs->sectors_per_block,
 				      fs->sectors_per_block, blk) != ST_OK) {
-			kfree(blk);
+			ext4_bput(blk);
 			return -1;
 		}
 		mm_memcpy(buf, blk, len);
-		kfree(blk);
+		ext4_bput(blk);
 	}
 	buf[len] = '\0';
 	return (int)len;
@@ -1693,7 +1768,7 @@ static long ext4_readdir_impl(vfs_file_t *f, void *buf, long bytes)
 	uint32_t gen =
 		din->i_generation; /* for the leaf csum (din may be evicted below) */
 
-	uint8_t *blk = (uint8_t *)kalloc(fs->block_size);
+	uint8_t *blk = (uint8_t *)ext4_bget(fs);
 	if (!blk)
 		return ST_NOMEM;
 
@@ -1712,7 +1787,7 @@ static long ext4_readdir_impl(vfs_file_t *f, void *buf, long bytes)
 			continue;
 		}
 		if (!ext4_dir_csum_ok(fs, ef->ino, gen, blk)) {
-			kfree(blk);
+			ext4_bput(blk);
 			ext4_fs_error(fs, "directory leaf checksum mismatch",
 				      ef->ino);
 			return ST_IO;
@@ -1733,7 +1808,7 @@ static long ext4_readdir_impl(vfs_file_t *f, void *buf, long bytes)
 						  ~7u; /* align 8 */
 				if (out_off + reclen > (unsigned)bytes) {
 					/* Output buffer full; resume here next call. */
-					kfree(blk);
+					ext4_bput(blk);
 					return out_off ? (long)out_off :
 							 -EINVAL;
 				}
@@ -1765,7 +1840,7 @@ static long ext4_readdir_impl(vfs_file_t *f, void *buf, long bytes)
 			ef->dir_pos = (b + 1) * fs->block_size;
 		}
 	}
-	kfree(blk);
+	ext4_bput(blk);
 	return (long)out_off;
 }
 
@@ -3367,7 +3442,7 @@ static int ext4_xattr_get_ino(ext4_fs_t *fs, unsigned long ino, int index,
 		return st;
 	int found_size = ST_NODATA;
 	if (rsize) {
-		uint8_t *bbuf = (uint8_t *)kalloc(fs->block_size);
+		uint8_t *bbuf = (uint8_t *)ext4_bget(fs);
 		if (!bbuf)
 			return ST_NOMEM;
 		if (ext4_read_block(fs, blk, bbuf) == ST_OK) {
@@ -3401,11 +3476,11 @@ static int ext4_xattr_get_ino(ext4_fs_t *fs, unsigned long ino, int index,
 				ext4_xa_list_free(&L);
 			}
 		}
-		kfree(bbuf);
+		ext4_bput(bbuf);
 	}
 	/* External xattr block (i_file_acl) — checked only if not found in the ibody. */
 	if (found_size == ST_NODATA && in.i_file_acl_lo) {
-		uint8_t *xbuf = (uint8_t *)kalloc(fs->block_size);
+		uint8_t *xbuf = (uint8_t *)ext4_bget(fs);
 		if (!xbuf)
 			return ST_NOMEM;
 		if (ext4_read_block(fs, in.i_file_acl_lo, xbuf) == ST_OK) {
@@ -3413,7 +3488,7 @@ static int ext4_xattr_get_ino(ext4_fs_t *fs, unsigned long ino, int index,
 			if (xh->h_magic == EXT4_XATTR_MAGIC) {
 				if (!ext4_xattr_block_csum_ok(
 					    fs, in.i_file_acl_lo, xbuf)) {
-					kfree(xbuf);
+					ext4_bput(xbuf);
 					ext4_fs_error(
 						fs,
 						"xattr block checksum mismatch",
@@ -3443,7 +3518,7 @@ static int ext4_xattr_get_ino(ext4_fs_t *fs, unsigned long ino, int index,
 				ext4_xa_list_free(&LB);
 			}
 		}
-		kfree(xbuf);
+		ext4_bput(xbuf);
 	}
 	return found_size;
 }
@@ -6757,8 +6832,14 @@ static int ext4_journal_pass(ext4_fs_t *fs, const journal_superblock_t *jsb,
 						mm_memcpy(data, &m, 4);
 					}
 					if (target == 0) {
-						WARN_ON_ONCE(
-							1); /* tag targets block 0 */
+						/* An otherwise csum-valid descriptor should never
+						 * carry a block-0 tag (the writer refuses pbn 0);
+						 * log enough context to identify the source. */
+						kprintf("ext4: journal seq %u tag %lu (of a %s descriptor at log block %lu) targets block 0 — skipped\n",
+							next_seq, data_idx,
+							tagbad ? "csum-BAD" :
+								 "csum-ok",
+							next_log);
 					} else if (!tagbad &&
 						   !jrev_test(revtbl, target,
 							      next_seq)) {
@@ -7128,13 +7209,13 @@ static void ext4_journal_flush(ext4_fs_t *fs)
 		first; /* descriptor @pos, data @pos+1.., commit @pos+1+n */
 
 	/* 3. descriptor block + data blocks, then the commit block. */
-	uint8_t *db = (uint8_t *)kalloc(fs->block_size);
-	uint8_t *cpy = (uint8_t *)kalloc(fs->block_size);
+	uint8_t *db = (uint8_t *)ext4_bget(fs);
+	uint8_t *cpy = (uint8_t *)ext4_bget(fs);
 	if (!db || !cpy) { /* OOM: write the batch direct + sync */
 		if (db)
-			kfree(db);
+			ext4_bput(db);
 		if (cpy)
-			kfree(cpy);
+			ext4_bput(cpy);
 		for (unsigned i = 0; i < n; i++)
 			ext4_write_block_direct(fs, s_ckpt.blk[i],
 						s_ckpt.data[i]);
@@ -7222,8 +7303,8 @@ static void ext4_journal_flush(ext4_fs_t *fs)
 	jlog_write(fs, pos + 1 + n, cpy);
 	if (fs->bdev->sync)
 		fs->bdev->sync((block_device_t *)fs->bdev); /* commit durable */
-	kfree(db);
-	kfree(cpy);
+	ext4_bput(db);
+	ext4_bput(cpy);
 
 	s_jhead = pos + n + 2;
 	s_epoch_open = 1;

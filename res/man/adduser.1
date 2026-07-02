@@ -1,0 +1,87 @@
+ADDUSER(8)                  System Manager's Manual                 ADDUSER(8)
+
+NAME
+       adduser, addgroup - add or manipulate users and groups
+
+SYNOPSIS
+       adduser [options] USER
+       adduser --system [options] USER
+       adduser --group GROUP
+       addgroup [options] GROUP
+       addgroup --system [options] GROUP
+       adduser USER GROUP
+
+DESCRIPTION
+       adduser and addgroup add users and groups to the system.  They are
+       friendlier front ends to the account databases /etc/passwd,
+       /etc/shadow and /etc/group.  The program behaves as addgroup when it is
+       invoked under that name.
+
+       Five modes of operation are available:
+
+       adduser USER
+              Add a normal user.  A user id is allocated from the range
+              FIRST_UID..LAST_UID (1000..59999).  Unless overridden, a group
+              with the same name as the user is created (a usergroup) and used
+              as the primary group.  A home directory is created under /home,
+              seeded from /etc/skel, and owned by the new user.  Finally passwd
+              is run to set the account's password.
+
+       adduser --system USER
+              Add a system user.  A user id is allocated from the system range
+              (100..999), the login shell is /usr/sbin/nologin, the home
+              directory defaults to /nonexistent and no password is set.
+
+       adduser --group GROUP, addgroup GROUP
+              Add a group.  A group id is allocated from FIRST_GID..LAST_GID.
+
+       addgroup --system GROUP
+              Add a group from the system range (100..999).
+
+       adduser USER GROUP
+              Add an existing user to an existing group.
+
+OPTIONS
+       --system              create a system account
+       --group               create a group, or a usergroup with --system
+       --uid ID              force the user id
+       --gid ID              force the (primary) group id
+       --ingroup GROUP       set the primary group by name (must exist)
+       --home DIR            set the home directory
+       --shell SHELL         set the login shell
+       --comment TEXT        set the GECOS/comment field (also --gecos)
+       --no-create-home      do not create the home directory
+       --disabled-password   do not set a password
+       --disabled-login      like --disabled-password and set a nologin shell
+       --add-extra-groups    add the user to the configured extra groups
+       --firstuid ID, --lastuid ID
+                             override the user id range
+       --firstgid ID, --lastgid ID
+                             override the group id range
+       --allow-all-names, --allow-bad-names
+                             relax the user/group name check
+       --quiet, --verbose, --debug
+                             adjust the amount of output
+       --conf FILE           configuration file (accepted, unused)
+       --help                display this help
+       --version             display version
+
+       When --comment is not given for a normal user, adduser prompts
+       interactively for the GECOS fields (Full Name, Room Number, Work Phone,
+       Home Phone, Other) if standard input is a terminal.
+
+FILES
+       /etc/passwd   user account database
+       /etc/shadow   encrypted passwords
+       /etc/group    group database
+       /etc/skel     skeleton files copied into new home directories
+
+NOTES
+       Only the superuser may add users or groups.  adduser and addgroup are
+       the same program; the mode is chosen from the invocation name and the
+       options.
+
+SEE ALSO
+       passwd(1), id(1), groups(1)
+
+ADDUSER(8)                  System Manager's Manual                 ADDUSER(8)

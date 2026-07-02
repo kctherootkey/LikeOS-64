@@ -162,7 +162,7 @@ UEFI_LDFLAGS = -nostdlib -znocombreloc -T $(EFI_LDS) -shared -Bsymbolic
 
 # Kernel object files
 KERNEL_OBJS = $(BUILD_DIR)/init.o \
-			  $(BUILD_DIR)/shell.o \
+			  $(BUILD_DIR)/userinit.o \
 			  $(BUILD_DIR)/xhci_boot.o \
 			  $(BUILD_DIR)/storage.o \
               $(BUILD_DIR)/console.o \
@@ -281,13 +281,16 @@ ROOT_BIN_PROGS = sh ls cat pwd stat uname shutdown poweroff reboot halt ps cp mv
 	mkdir rmdir ln chmod readlink touch more less clear env kill find df du hexdump \
 	sleep strings file grep wc head tail echo printf free uptime dmesg which date time \
 	sort uniq cut tr yes true false top man hostname ping ifconfig netstat route arp \
-	traceroute arping dhclient dig nslookup host nano tmux nc openssl curl
+	traceroute arping dhclient dig nslookup host nano tmux nc openssl curl login \
+	id whoami groups su passwd adduser addgroup deluser delgroup
+# System binaries -> /sbin/<name>
+ROOT_SBIN_PROGS = init getty
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
-	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so
+	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so libcrypt.so libpam.so
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
-	netstress openssltest usbtest ext4test
+	netstress openssltest usbtest ext4test permbench
 # Full prerequisite set for the ext4 image (every staged build artifact).
-GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS))
+GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS))
 
 # Default target: build the single ext4 GPT USB disk.
 all: $(GPT_DISK)
@@ -300,7 +303,7 @@ $(BUILD_DIR):
 $(BUILD_DIR)/init.o: $(KERNEL_DIR)/ke/init.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/shell.o: $(KERNEL_DIR)/ke/shell.c | $(BUILD_DIR)
+$(BUILD_DIR)/userinit.o: $(KERNEL_DIR)/ke/userinit.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/xhci_boot.o: $(KERNEL_DIR)/ke/xhci_boot.c | $(BUILD_DIR)
@@ -558,6 +561,16 @@ userland-rtld:
 userland-testlib:
 	$(MAKE) -C user/lib/testlib
 
+# Build password-hashing library (yescrypt-based crypt())
+.PHONY: userland-libcrypt
+userland-libcrypt: userland-libc
+	$(MAKE) -C user/lib/libcrypt
+
+# Build minimal PAM library (depends on libcrypt for crypt())
+.PHONY: userland-libpam
+userland-libpam: userland-libc userland-libcrypt
+	$(MAKE) -C user/lib/libpam
+
 # Copy shared libraries to build directory
 $(BUILD_DIR)/ld-likeos.so: userland-rtld | $(BUILD_DIR)
 	cp user/lib/rtld/ld-likeos.so $@
@@ -571,13 +584,21 @@ $(BUILD_DIR)/libtestlib.so: userland-testlib | $(BUILD_DIR)
 	cp user/lib/testlib/libtestlib.so $@
 	$(STRIP) --strip-unneeded $@
 
+$(BUILD_DIR)/libcrypt.so: userland-libcrypt | $(BUILD_DIR)
+	cp user/lib/libcrypt/libcrypt.so $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/libpam.so: userland-libpam | $(BUILD_DIR)
+	cp user/lib/libpam/libpam.so $@
+	$(STRIP) --strip-unneeded $@
+
 # Build test programs using libc
 $(BUILD_DIR)/user_test.elf: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/test_syscalls
 	cp $(USER_DIR)/tests/test_syscalls $@
 	$(STRIP) --strip-unneeded $@
 
-$(BUILD_DIR)/test_libc: userland-libc userland-rtld | $(BUILD_DIR)
+$(BUILD_DIR)/test_libc: userland-libc userland-rtld userland-libcrypt userland-libpam | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tests/test_libc
 	cp $(USER_DIR)/tests/test_libc $@
 	$(STRIP) --strip-unneeded $@
@@ -595,6 +616,69 @@ $(BUILD_DIR)/hello: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/sh: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) sh
 	cp $(USER_DIR)/sh $@
+	$(STRIP) --strip-unneeded $@
+
+# Login stack: login authenticates via libpam/libcrypt; getty+init use libc only.
+$(BUILD_DIR)/login: userland-libc userland-rtld userland-libcrypt userland-libpam | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) login
+	cp $(USER_DIR)/login $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/getty: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) getty
+	cp $(USER_DIR)/getty $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/init: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) init
+	cp $(USER_DIR)/init $@
+	$(STRIP) --strip-unneeded $@
+
+# Account/identity utilities.  id/whoami/groups/adduser/addgroup use libc only;
+# su and passwd link against libpam/libcrypt.
+$(BUILD_DIR)/id: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) id
+	cp $(USER_DIR)/id $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/whoami: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) whoami
+	cp $(USER_DIR)/whoami $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/groups: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) groups
+	cp $(USER_DIR)/groups $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/adduser: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) adduser
+	cp $(USER_DIR)/adduser $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/addgroup: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) addgroup
+	cp $(USER_DIR)/addgroup $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/deluser: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) deluser
+	cp $(USER_DIR)/deluser $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/delgroup: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) delgroup
+	cp $(USER_DIR)/delgroup $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/su: userland-libc userland-rtld userland-libcrypt userland-libpam | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) su
+	cp $(USER_DIR)/su $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/passwd: userland-libc userland-rtld userland-libcrypt | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) passwd
+	cp $(USER_DIR)/passwd $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/ls: userland-libc userland-rtld | $(BUILD_DIR)
@@ -655,6 +739,11 @@ $(BUILD_DIR)/usbtest: userland-libc userland-rtld | $(BUILD_DIR)
 	$(STRIP) --strip-unneeded $@
 
 # usbtest is staged into the ext4 image via GPT_PREREQS (ROOT_USRLOCAL_BINS).
+
+$(BUILD_DIR)/permbench: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) permbench
+	cp $(USER_DIR)/permbench $@
+	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/uname: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) uname
@@ -1083,14 +1172,23 @@ $(BOOTLOADER_EFI): $(BOOT_DIR)/bootloader.c $(BOOT_DIR)/boot_stack_chk.c $(BOOT_
 $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	@echo "Assembling ext4 root staging tree from build artifacts..."
 	rm -rf $(EXT4_STAGING)
-	mkdir -p $(EXT4_STAGING)/boot $(EXT4_STAGING)/bin $(EXT4_STAGING)/lib \
+	mkdir -p $(EXT4_STAGING)/boot $(EXT4_STAGING)/bin $(EXT4_STAGING)/sbin \
+		$(EXT4_STAGING)/lib \
 		$(EXT4_STAGING)/usr/local/bin $(EXT4_STAGING)/usr/share/man/man1 \
 		$(EXT4_STAGING)/usr/share/nano $(EXT4_STAGING)/res \
-		$(EXT4_STAGING)/etc/ssl/certs $(EXT4_STAGING)/tmp
+		$(EXT4_STAGING)/etc/ssl/certs $(EXT4_STAGING)/root $(EXT4_STAGING)/home \
+		$(EXT4_STAGING)/tmp
 	# Kernel lives ONLY at /boot/kernel.elf (the bootloader loads it from ext4)
 	cp $(KERNEL_ELF) $(EXT4_STAGING)/boot/kernel.elf
 	# Userland programs -> /bin
 	for p in $(ROOT_BIN_PROGS); do cp $(BUILD_DIR)/$$p $(EXT4_STAGING)/bin/$$p; done
+	# System programs (init, getty) -> /sbin
+	for p in $(ROOT_SBIN_PROGS); do cp $(BUILD_DIR)/$$p $(EXT4_STAGING)/sbin/$$p; done
+	# setuid-root helpers: passwd (write /etc/shadow) and su (switch user).
+	# Owner is root (root_owner=0:0 below), so mode 4755 = -rwsr-xr-x root.
+	# Each drops or confines privilege internally and decides on getuid().
+	# ping does NOT get setuid: it uses the unprivileged ICMP echo syscall.
+	chmod 4755 $(EXT4_STAGING)/bin/passwd $(EXT4_STAGING)/bin/su
 	# Shared libraries -> /lib
 	for l in $(ROOT_LIBS); do cp $(BUILD_DIR)/$$l $(EXT4_STAGING)/lib/$$l; done
 	# Tests and demos -> /usr/local/bin (a few are renamed)
@@ -1105,6 +1203,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp $(BUILD_DIR)/openssltest   $(EXT4_STAGING)/usr/local/bin/openssltest
 	cp $(BUILD_DIR)/usbtest       $(EXT4_STAGING)/usr/local/bin/usbtest
 	cp $(BUILD_DIR)/ext4test      $(EXT4_STAGING)/usr/local/bin/ext4test
+	cp $(BUILD_DIR)/permbench     $(EXT4_STAGING)/usr/local/bin/permbench
 	# Resources, manpages, config
 	cp res/Lat15-Fixed16.psf $(EXT4_STAGING)/res/Lat15-Fixed16.psf
 	cp res/left_ptr          $(EXT4_STAGING)/res/left_ptr
@@ -1114,6 +1213,16 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp res/etc/hosts         $(EXT4_STAGING)/etc/hosts
 	cp res/etc/resolv.conf   $(EXT4_STAGING)/etc/resolv.conf
 	cp res/nanorc            $(EXT4_STAGING)/etc/nanorc
+	# User/group/shadow databases (root:toor preconfigured, yescrypt hash)
+	cp res/etc/passwd        $(EXT4_STAGING)/etc/passwd
+	cp res/etc/group         $(EXT4_STAGING)/etc/group
+	cp res/etc/shadow        $(EXT4_STAGING)/etc/shadow
+	chmod 0644 $(EXT4_STAGING)/etc/passwd $(EXT4_STAGING)/etc/group
+	chmod 0600 $(EXT4_STAGING)/etc/shadow
+	# Login-shell startup files (sourced by sh when started as "-sh")
+	cp res/etc/profile       $(EXT4_STAGING)/etc/profile
+	cp res/etc/root.profile  $(EXT4_STAGING)/root/.profile
+	chmod 0700 $(EXT4_STAGING)/root
 	cp ports/openssl-3.5.6/apps/openssl.cnf $(EXT4_STAGING)/etc/ssl/openssl.cnf
 	cp res/etc/ssl/certs/ca-certificates.crt $(EXT4_STAGING)/etc/ssl/certs/ca-certificates.crt
 	# Signature file selects this device as the OS root; sample text file
@@ -1331,6 +1440,8 @@ clean:
 	$(MAKE) -C user/lib/libc clean
 	$(MAKE) -C user/lib/rtld clean
 	$(MAKE) -C user/lib/testlib clean
+	$(MAKE) -C user/lib/libcrypt clean
+	$(MAKE) -C user/lib/libpam clean
 	$(MAKE) -C $(USER_DIR) clean
 
 distclean: clean

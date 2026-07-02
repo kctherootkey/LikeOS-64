@@ -16,6 +16,7 @@
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <sys/procinfo.h>
+#include <pwd.h>
 
 #define PS_VERSION "ps (LikeOS procps) 0.1"
 
@@ -581,6 +582,41 @@ static void fmt_bsd_v(void)
 
 /* ======================================================================
  * Column value formatter
+/* Resolve uid -> user name from an in-memory copy of /etc/passwd.  The file is
+ * read exactly once (on the first lookup) into a table; every USER column then
+ * resolves from memory, so a whole process listing never re-opens the file. */
+static struct {
+	uid_t uid;
+	char name[33];
+} g_users[256];
+static int g_nusers = -1; /* -1 = not loaded yet */
+
+static void load_users(void)
+{
+	g_nusers = 0;
+	setpwent();
+	struct passwd *pw;
+	while ((pw = getpwent()) != NULL &&
+	       g_nusers < (int)(sizeof(g_users) / sizeof(g_users[0]))) {
+		g_users[g_nusers].uid = pw->pw_uid;
+		snprintf(g_users[g_nusers].name, sizeof(g_users[g_nusers].name),
+		         "%s", pw->pw_name);
+		g_nusers++;
+	}
+	endpwent();
+}
+
+static const char *uid_to_name(uid_t uid)
+{
+	if (g_nusers < 0)
+		load_users();
+	for (int i = 0; i < g_nusers; i++)
+		if (g_users[i].uid == uid)
+			return g_users[i].name;
+	return NULL; /* unknown uid -> caller prints the number */
+}
+
+/* ======================================================================
  *
  * Writes a human-readable value for column `id` into `buf`.
  * ====================================================================== */
@@ -615,12 +651,14 @@ static void format_value(const procinfo_t *p, int id, char *buf, size_t sz)
 		snprintf(buf, sz, "%d", p->egid);
 		break;
 
-	case COL_USER:
-		if (opt_numeric || p->uid != 0)
-			snprintf(buf, sz, "%d", p->uid);
+	case COL_USER: {
+		const char *nm = opt_numeric ? NULL : uid_to_name(p->uid);
+		if (nm)
+			snprintf(buf, sz, "%s", nm);
 		else
-			snprintf(buf, sz, "root");
+			snprintf(buf, sz, "%d", p->uid);
 		break;
+	}
 
 	case COL_COMM: {
 		/* COMM = basename only. Kernel threads wrapped in [] */

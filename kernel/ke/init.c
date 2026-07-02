@@ -13,7 +13,7 @@
 #include <kernel/hal/ioapic.h>
 #include <kernel/ke/xhci_boot.h>
 #include <kernel/ke/storage.h>
-#include <kernel/ke/shell.h>
+#include <kernel/ke/userinit.h>
 #include <kernel/ke/timer.h>
 #include <kernel/ke/sched.h>
 #include <kernel/io/tty.h>
@@ -250,13 +250,13 @@ __no_stack_protector void continue_system_startup(void)
 		}
 	}
 
-	shell_init();
+	userinit_start();
 	storage_fs_set_ready(&g_storage_state);
 	keyboard_activate();
 
 	while (1) {
 		__asm__ volatile("sti");
-		int handled_input = shell_tick();
+		int handled_input = userinit_tick();
 		xhci_boot_poll(&g_xhci_boot);
 		xhci_hotplug_poll(&g_xhci);
 		xhci_hotplug_poll(&g_xhci_hid);

@@ -19,6 +19,7 @@
 #include <termios.h>
 #include <sys/procinfo.h>
 #include <sys/sysinfo.h>
+#include <pwd.h>
 
 #define TOP_VERSION "top (LikeOS procps) 0.1"
 
@@ -955,6 +956,40 @@ static void sort_processes(void)
 	qsort(g_procs, g_nprocs, sizeof(proc_entry_t), compare_procs);
 }
 
+/* Resolve uid -> user name from an in-memory copy of /etc/passwd.  The file is
+ * read exactly once (on the first lookup) into a table, so rendering the USER
+ * column for every process on every refresh never re-opens the file. */
+static struct {
+	uid_t uid;
+	char name[33];
+} g_users[256];
+static int g_nusers = -1; /* -1 = not loaded yet */
+
+static void load_users(void)
+{
+	g_nusers = 0;
+	setpwent();
+	struct passwd *pw;
+	while ((pw = getpwent()) != NULL &&
+	       g_nusers < (int)(sizeof(g_users) / sizeof(g_users[0]))) {
+		g_users[g_nusers].uid = pw->pw_uid;
+		snprintf(g_users[g_nusers].name, sizeof(g_users[g_nusers].name),
+		         "%s", pw->pw_name);
+		g_nusers++;
+	}
+	endpwent();
+}
+
+static const char *uid_to_name(uid_t uid)
+{
+	if (g_nusers < 0)
+		load_users();
+	for (int i = 0; i < g_nusers; i++)
+		if (g_users[i].uid == uid)
+			return g_users[i].name;
+	return NULL; /* unknown uid -> caller prints the number */
+}
+
 /* ======================================================================
  * Field value formatting (per-process)
  * ====================================================================== */
@@ -974,21 +1009,25 @@ static void format_field_value(const proc_entry_t *pe, int field_id, char *buf,
 	case FLD_UID:
 		snprintf(buf, bufsz, "%d", pe->info.euid);
 		break;
-	case FLD_USER:
-		if (pe->info.euid == 0)
-			snprintf(buf, bufsz, "root");
+	case FLD_USER: {
+		const char *nm = uid_to_name(pe->info.euid);
+		if (nm)
+			snprintf(buf, bufsz, "%s", nm);
 		else
 			snprintf(buf, bufsz, "%d", pe->info.euid);
 		break;
+	}
 	case FLD_RUID:
 		snprintf(buf, bufsz, "%d", pe->info.uid);
 		break;
-	case FLD_RUSER:
-		if (pe->info.uid == 0)
-			snprintf(buf, bufsz, "root");
+	case FLD_RUSER: {
+		const char *nm = uid_to_name(pe->info.uid);
+		if (nm)
+			snprintf(buf, bufsz, "%s", nm);
 		else
 			snprintf(buf, bufsz, "%d", pe->info.uid);
 		break;
+	}
 	case FLD_GID:
 		snprintf(buf, bufsz, "%d", pe->info.egid);
 		break;

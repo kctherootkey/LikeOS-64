@@ -19,6 +19,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -415,8 +416,14 @@ int main(int argc, char *argv[])
 		if (optind < argc && strcmp(argv[optind], "pub") == 0)
 			pub = 1;
 		if (delete_entry(action_host, iface, pub, verbose) < 0) {
-			fprintf(stderr, "arp: SIOCDARP(%s): No such entry\n",
-				action_host);
+			if (errno == EPERM)
+				fprintf(stderr,
+				    "arp: SIOCDARP: Operation not permitted "
+				    "(only root may modify ARP entries)\n");
+			else
+				fprintf(stderr,
+				    "arp: SIOCDARP(%s): %s\n", action_host,
+				    strerror(errno));
 			return 1;
 		}
 		return 0;
@@ -445,7 +452,13 @@ int main(int argc, char *argv[])
 
 		if (set_entry(action_host, action_hw, iface, temp, pub,
 			      use_device, verbose) < 0) {
-			fprintf(stderr, "arp: SIOCSARP: Operation failed\n");
+			if (errno == EPERM)
+				fprintf(stderr,
+				    "arp: SIOCSARP: Operation not permitted "
+				    "(only root may modify ARP entries)\n");
+			else
+				fprintf(stderr, "arp: SIOCSARP: %s\n",
+				        strerror(errno));
 			return 1;
 		}
 		return 0;

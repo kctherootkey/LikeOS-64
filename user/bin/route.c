@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -358,8 +359,15 @@ int main(int argc, char *argv[])
 	close(fd);
 
 	if (ret < 0) {
-		fprintf(stderr, "route: %s: %s\n",
-			adding ? "SIOCADDRT" : "SIOCDELRT", "Operation failed");
+		if (errno == EPERM)
+			fprintf(stderr,
+			    "route: %s: Operation not permitted "
+			    "(only root may modify the routing table)\n",
+			    adding ? "SIOCADDRT" : "SIOCDELRT");
+		else
+			fprintf(stderr, "route: %s: %s\n",
+			        adding ? "SIOCADDRT" : "SIOCDELRT",
+			        strerror(errno));
 		return 1;
 	}
 

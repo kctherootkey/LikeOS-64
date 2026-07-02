@@ -1,0 +1,29 @@
+GROUPS(1)                        User Commands                       GROUPS(1)
+
+NAME
+       groups - print the groups a user is in
+
+SYNOPSIS
+       groups [OPTION]... [USERNAME]...
+
+DESCRIPTION
+       Print group memberships for each USERNAME or, if no USERNAME is
+       specified, for the current process (which may differ if the group
+       database has changed).
+
+       When a USERNAME is given, the output line is prefixed with
+       "USERNAME : ".
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+FILES
+       /etc/passwd   user account database
+       /etc/group    group database
+
+SEE ALSO
+       id(1), whoami(1)
+
+GROUPS(1)                        User Commands                       GROUPS(1)

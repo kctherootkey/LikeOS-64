@@ -3,7 +3,7 @@
 #include <kernel/fs/vfs.h>
 #include <kernel/dev/usb/xhci.h>
 #include <kernel/dev/usb/usb_msd.h>
-#include <kernel/ke/shell.h>
+#include <kernel/ke/userinit.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/sysfont.h>
 #include <kernel/io/cursor.h>
@@ -110,7 +110,7 @@ void storage_fs_poll(storage_fs_state_t *state)
 					bdev->name);
 				state->tested_mask |= (1u << bi);
 			}
-			shell_redisplay_prompt();
+			userinit_redisplay_prompt();
 			continue; /* ext4-formatted device handled; skip FAT32 */
 		}
 
@@ -141,18 +141,18 @@ void storage_fs_poll(storage_fs_state_t *state)
 					mouse_apply_cursor();
 				}
 
-				shell_redisplay_prompt(); // Redisplay prompt after mount messages
+				userinit_redisplay_prompt(); // Redisplay prompt after mount messages
 			} else {
 				kprintf("FAT32: signature not found on %s\n",
 					bdev->name);
 				state->tested_mask |= (1u << bi);
-				shell_redisplay_prompt(); // Redisplay prompt after mount messages
+				userinit_redisplay_prompt(); // Redisplay prompt after mount messages
 			}
 		} else {
 			kprintf("FAT32: mount failed on %s\n",
 				bdev->name ? bdev->name : "(unnamed)");
 			state->tested_mask |= (1u << bi);
-			shell_redisplay_prompt(); // Redisplay prompt after mount messages
+			userinit_redisplay_prompt(); // Redisplay prompt after mount messages
 		}
 	}
 }

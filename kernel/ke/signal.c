@@ -56,6 +56,33 @@ void signal_init_task(task_t *task)
 	sig->signal_frame_addr = 0;
 }
 
+// Reset signal dispositions across execve.
+// POSIX: caught signals are reset to SIG_DFL; ignored signals stay ignored;
+// the signal mask and the set of pending signals are preserved.  Without this,
+// a handler address installed before exec would survive into the new program
+// (where that address is meaningless) and crash when the signal is delivered.
+void signal_reset_on_exec(task_t *task)
+{
+	if (!task)
+		return;
+
+	task_signal_state_t *sig = &task->signals;
+
+	for (int i = 0; i < NSIG; i++) {
+		if (sig->action[i].sa_handler != SIG_IGN)
+			sig->action[i].sa_handler = SIG_DFL;
+		sig->action[i].sa_flags = 0;
+		sig->action[i].sa_restorer = NULL;
+		sigemptyset_k(&sig->action[i].sa_mask);
+	}
+
+	// The alternate signal stack does not survive exec.
+	sig->altstack.ss_sp = NULL;
+	sig->altstack.ss_flags = SS_DISABLE;
+	sig->altstack.ss_size = 0;
+	sig->signal_frame_addr = 0;
+}
+
 // Copy signal handlers from parent to child during fork
 // POSIX: signal dispositions are inherited across fork
 void signal_fork_copy(task_t *child, task_t *parent)

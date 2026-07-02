@@ -1,16 +1,19 @@
-// LikeOS-64 Simple Shell interface
-// Provides initialization and polling for the console shell
+// LikeOS-64 user-space init launcher
+// Starts /sbin/init (PID 1) once the root filesystem is ready and keeps it
+// alive: init spawns getty, which runs login and the user's shell.
 
-#ifndef _KERNEL_SHELL_H_
-#define _KERNEL_SHELL_H_
+#ifndef _KERNEL_USERINIT_H_
+#define _KERNEL_USERINIT_H_
 
-// Initialize shell state and print initial prompt
-void shell_init(void);
+// Prepare the console and launch /sbin/init.
+void userinit_start(void);
 
-// Poll shell input once; returns non-zero if a character was handled
-int shell_tick(void);
+// Poll once; re-launch /sbin/init if it has exited.  Returns 0.
+int userinit_tick(void);
 
-// Request shell to redisplay prompt (call after printing messages)
-void shell_redisplay_prompt(void);
+// Hook called after the kernel prints asynchronous console messages (e.g.
+// mount notifications).  Prompt redisplay is owned by user space, so this is
+// currently a no-op kept for call-site compatibility.
+void userinit_redisplay_prompt(void);
 
-#endif // _KERNEL_SHELL_H_
+#endif // _KERNEL_USERINIT_H_

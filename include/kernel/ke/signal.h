@@ -463,6 +463,7 @@ extern uint64_t syscall_saved_user_rax;
 
 // Signal API for kernel use
 void signal_init_task(struct task *task);
+void signal_reset_on_exec(struct task *task);
 void signal_fork_copy(struct task *child, struct task *parent);
 void signal_cleanup_task(struct task *task);
 int signal_send(struct task *task, int sig, siginfo_t *info);

@@ -25,6 +25,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <getopt.h>
@@ -241,9 +242,14 @@ int main(int argc, char *argv[])
 			printf("Releasing DHCP lease...\n");
 		int ret = dhcp_control(DHCP_CMD_RELEASE);
 		if (ret < 0) {
-			if (!quiet)
+			if (errno == EPERM)
 				fprintf(stderr,
-					"dhclient: DHCPRELEASE failed\n");
+				    "dhclient: Operation not permitted "
+				    "(only root may configure interfaces)\n");
+			else if (!quiet)
+				fprintf(stderr,
+					"dhclient: DHCPRELEASE failed: %s\n",
+					strerror(errno));
 			return 1;
 		}
 		if (!quiet)
@@ -271,8 +277,13 @@ int main(int argc, char *argv[])
 
 	int ret = dhcp_control(DHCP_CMD_RENEW);
 	if (ret < 0) {
-		if (!quiet)
-			fprintf(stderr, "dhclient: DHCP request failed\n");
+		if (errno == EPERM)
+			fprintf(stderr,
+			    "dhclient: Operation not permitted "
+			    "(only root may configure interfaces)\n");
+		else if (!quiet)
+			fprintf(stderr, "dhclient: DHCP request failed: %s\n",
+			        strerror(errno));
 		return 1;
 	}
 

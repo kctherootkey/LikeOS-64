@@ -1,0 +1,44 @@
+DELGROUP(8)                 System Manager's Manual                DELGROUP(8)
+
+NAME
+       delgroup - remove a group from the system
+
+SYNOPSIS
+       delgroup [--only-if-empty] GROUP
+       delgroup --system [--only-if-empty] GROUP
+       deluser USER GROUP
+
+DESCRIPTION
+       delgroup removes groups from the system.  It is the same program as
+       deluser(8), invoked under the name delgroup so that group removal is
+       the default action.
+
+       delgroup GROUP
+              Remove a group.  The group must not be the primary group of any
+              user.
+
+       delgroup --system GROUP
+              Remove GROUP only if it is a system group (gid 100..999).
+
+       deluser USER GROUP
+              Remove an existing user from a group (a user cannot be removed
+              from their primary group).
+
+       Only the superuser may remove groups.
+
+OPTIONS
+       --system              only remove a system group
+       --only-if-empty       only remove the group if it has no members
+       --quiet, --verbose, --debug
+                             adjust the amount of output
+       --conf FILE           configuration file (accepted, unused)
+       --help                display this help
+       --version             display version
+
+FILES
+       /etc/group    group database
+
+SEE ALSO
+       deluser(8), adduser(8), addgroup(8), groups(1)
+
+DELGROUP(8)                 System Manager's Manual                DELGROUP(8)

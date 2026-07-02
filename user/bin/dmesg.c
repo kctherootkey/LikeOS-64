@@ -405,7 +405,14 @@ int main(int argc, char *argv[])
 	if (do_clear && !do_read_clear) {
 		int ret = klogctl(SYSLOG_ACTION_CLEAR, NULL, 0);
 		if (ret < 0) {
-			fprintf(stderr, "dmesg: klogctl(CLEAR) failed\n");
+			if (errno == EPERM)
+				fprintf(stderr,
+				    "dmesg: clear kernel buffer failed: "
+				    "Operation not permitted "
+				    "(only root may clear the kernel log)\n");
+			else
+				fprintf(stderr, "dmesg: klogctl(CLEAR): %s\n",
+				        strerror(errno));
 			return 1;
 		}
 		return 0;
@@ -444,7 +451,14 @@ int main(int argc, char *argv[])
 					     SYSLOG_ACTION_READ_ALL;
 		nread = klogctl(action, buf, bufsize - 1);
 		if (nread < 0) {
-			fprintf(stderr, "dmesg: klogctl failed\n");
+			if (errno == EPERM)
+				fprintf(stderr,
+				    "dmesg: read kernel buffer failed: "
+				    "Operation not permitted "
+				    "(only root may read the kernel log)\n");
+			else
+				fprintf(stderr, "dmesg: klogctl: %s\n",
+				        strerror(errno));
 			free(buf);
 			return 1;
 		}

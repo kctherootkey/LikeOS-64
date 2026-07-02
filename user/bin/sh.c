@@ -103,7 +103,19 @@ static void bg_check_jobs(void)
 /* Command history                                                      */
 /* ------------------------------------------------------------------ */
 #define HIST_MAX 500
-#define HIST_FILE "/.sh_history"
+
+/* Command history is stored per-user at $HOME/.sh_history, never in the
+ * filesystem root.  Returns NULL when HOME is unset, in which case no history
+ * file is read or written. */
+static const char *hist_path(void)
+{
+	static char path[512];
+	const char *home = getenv("HOME");
+	if (!home || !home[0])
+		return NULL;
+	snprintf(path, sizeof(path), "%s/.sh_history", home);
+	return path;
+}
 
 static char hist_buf[HIST_MAX][SHELL_MAX_LINE];
 static int hist_count;
@@ -129,7 +141,8 @@ static void hist_add(const char *line)
 
 static void hist_load(void)
 {
-	FILE *f = fopen(HIST_FILE, "r");
+	const char *hp = hist_path();
+	FILE *f = hp ? fopen(hp, "r") : NULL;
 	if (!f)
 		return;
 	char tmp[SHELL_MAX_LINE];
@@ -145,7 +158,8 @@ static void hist_load(void)
 
 static void hist_save(void)
 {
-	FILE *f = fopen(HIST_FILE, "w");
+	const char *hp = hist_path();
+	FILE *f = hp ? fopen(hp, "w") : NULL;
 	if (!f)
 		return;
 	for (int i = 0; i < hist_count; i++) {
@@ -157,7 +171,8 @@ static void hist_save(void)
 
 static void hist_append(void)
 {
-	FILE *f = fopen(HIST_FILE, "a");
+	const char *hp = hist_path();
+	FILE *f = hp ? fopen(hp, "a") : NULL;
 	if (!f)
 		return;
 	if (hist_count > 0) {
@@ -1439,6 +1454,10 @@ static int run_builtin(int argc, char **argv)
 		printf("  grep head tail wc echo printf free uptime dmesg\n");
 		printf("  which date sleep strings file top man nano tmux\n");
 		printf("  shutdown reboot poweroff halt\n");
+		printf("Users, groups and sessions:\n");
+		printf("  id whoami groups su passwd\n");
+		printf("  adduser addgroup deluser delgroup\n");
+		printf("  login getty\n");
 		printf("Networking commands:\n");
 		printf("  ifconfig ping netstat route arp traceroute arping\n");
 		printf("  dhclient dig nslookup host hostname nc openssl curl\n");
@@ -2113,13 +2132,15 @@ static int shell_readline(const char *prompt, char *buf, int bufsz)
 static void get_prompt(char *prompt, int maxlen)
 {
 	char cwd[256];
+	/* Root (effective uid 0) gets '#', every other user gets '$'. */
+	char sym = (geteuid() == 0) ? '#' : '$';
 	if (getcwd(cwd, sizeof(cwd)) == NULL) {
 		strcpy(cwd, "/");
 	}
 	if (strcmp(cwd, "/") == 0) {
-		snprintf(prompt, maxlen, "/ # ");
+		snprintf(prompt, maxlen, "/ %c ", sym);
 	} else {
-		snprintf(prompt, maxlen, "%s # ", cwd);
+		snprintf(prompt, maxlen, "%s %c ", cwd, sym);
 	}
 	ioctl(STDIN_FILENO, TIOCSGUARD, NULL);
 }
@@ -2128,7 +2149,44 @@ static void get_prompt(char *prompt, int maxlen)
 /* Main                                                                 */
 /* ------------------------------------------------------------------ */
 
-int main(void)
+/* Execute a single command line.  Used for sourcing startup files, so it
+ * skips history and interactive here-document collection. */
+static void source_line(char *line)
+{
+	static token_t tokens[128];
+	static cmd_entry_t entries[MAX_COMMANDS];
+
+	alias_expand(line, SHELL_MAX_LINE);
+	int ntok = tokenize(line, tokens,
+			    (int)(sizeof(tokens) / sizeof(tokens[0])));
+	if (ntok == 0)
+		return;
+	int nentries = parse_command_list(tokens, ntok, entries, MAX_COMMANDS);
+	if (nentries <= 0)
+		return;
+	exec_command_list(entries, nentries);
+}
+
+/* Read and run the commands in `path`, if it exists.  Used for login-shell
+ * startup files (/etc/profile and ~/.profile). */
+static void source_file(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return;
+	char buf[SHELL_MAX_LINE];
+	while (fgets(buf, sizeof(buf), f)) {
+		size_t n = strlen(buf);
+		while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+			buf[--n] = '\0';
+		if (buf[0] == '\0' || buf[0] == '#')
+			continue;
+		source_line(buf);
+	}
+	fclose(f);
+}
+
+int main(int argc, char **argv)
 {
 	setenv("PATH", "/bin:/usr/local/bin", 1);
 	/* Default TERM so terminfo-using programs (tmux, less, ...) get a
@@ -2142,6 +2200,19 @@ int main(void)
 	res_init();
 	hist_load();
 	alias_load();
+
+	/* A login shell (argv[0] begins with '-', e.g. "-sh" as started by
+	 * login) reads the system-wide and per-user startup files before the
+	 * first prompt. */
+	if (argc > 0 && argv[0] && argv[0][0] == '-') {
+		source_file("/etc/profile");
+		const char *home = getenv("HOME");
+		if (home && home[0]) {
+			char rcpath[512];
+			snprintf(rcpath, sizeof(rcpath), "%s/.profile", home);
+			source_file(rcpath);
+		}
+	}
 
 	char line[SHELL_MAX_LINE];
 	char prompt[512];

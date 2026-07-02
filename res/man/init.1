@@ -1,0 +1,35 @@
+INIT(1)                          User Commands                         INIT(1)
+
+NAME
+       init - process 1, the ancestor of all processes
+
+SYNOPSIS
+       init
+
+DESCRIPTION
+       init is the first program the kernel starts and runs as process 1.
+       It brings up user space and keeps it running.
+
+       init performs the following:
+
+         o  spawns a single getty(1) on the console;
+         o  waits for and reaps child processes, adopting orphans;
+         o  respawns getty whenever its login session ends, so the login
+            prompt always returns; and
+         o  handles shutdown and reboot signals.
+
+       The root filesystem is expected to be mounted already (the kernel
+       mounts the USB root at boot); mounting additional filesystems from
+       user space is a future addition.
+
+SIGNALS
+       SIGTERM   power the machine off
+       SIGINT    reboot the machine (Ctrl-Alt-Del)
+
+SEE ALSO
+       getty(1), login(1), reboot(1)
+
+AUTHORS
+       Written for LikeOS-64.
+
+INIT(1)                          User Commands                         INIT(1)

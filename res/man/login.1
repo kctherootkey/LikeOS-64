@@ -1,0 +1,59 @@
+LOGIN(1)                         User Commands                        LOGIN(1)
+
+NAME
+       login - begin a session on the system
+
+SYNOPSIS
+       login [-f username] [-h host] [username]
+
+DESCRIPTION
+       login authenticates a user and starts a session.  It is normally
+       invoked by getty(1) on a terminal, but may also be run directly.
+
+       When invoked with a username argument (as getty does) login prompts
+       only for the password.  Otherwise it prompts for both the login name
+       and the password.
+
+       Authentication is performed through the PAM framework (see
+       pam_appl.h), which verifies the supplied password against the
+       user's entry in /etc/shadow using yescrypt password hashing.
+
+       On success login:
+
+         o  sets the real, effective and saved user and group IDs and the
+            supplementary group list from /etc/passwd and /etc/group;
+         o  sets the environment variables HOME, USER, LOGNAME, SHELL,
+            PATH and TERM;
+         o  changes to the user's home directory; and
+         o  executes the user's login shell.
+
+       The shell is started as a login shell: argv[0] is the shell's base
+       name prefixed with '-' (for example "-sh"), so the shell reads its
+       login startup files.
+
+OPTIONS
+       -f username
+              Skip authentication and log the named user in directly.  This
+              option is restricted to the superuser.
+
+       -h host
+              Record the name of the remote host.  Reserved for a future
+              network login service (sshd); it has no effect at present.
+
+FILES
+       /etc/passwd    user account database
+       /etc/shadow    encrypted passwords (readable only by root)
+       /etc/group     group database
+
+EXIT STATUS
+       login exits nonzero if authentication fails after three attempts or
+       if the account cannot be set up.  On success it does not return: it
+       replaces itself with the user's shell.
+
+SEE ALSO
+       getty(1), init(1), sh(1)
+
+AUTHORS
+       Written for LikeOS-64.
+
+LOGIN(1)                         User Commands                        LOGIN(1)
