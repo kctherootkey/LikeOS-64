@@ -169,6 +169,9 @@ QEMU:
   make qemu          # plain boot from the ext4 GPT disk
   make qemu-usb      # same, plus SLIRP networking (sudo)
 
+At the first login prompt, log in with the username "root" and the
+password "toor".
+
 Other useful targets:
 
   make distclean
