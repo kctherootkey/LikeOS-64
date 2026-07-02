@@ -6835,7 +6835,7 @@ static int ext4_journal_pass(ext4_fs_t *fs, const journal_superblock_t *jsb,
 						/* An otherwise csum-valid descriptor should never
 						 * carry a block-0 tag (the writer refuses pbn 0);
 						 * log enough context to identify the source. */
-						kprintf("ext4: journal seq %u tag %lu (of a %s descriptor at log block %lu) targets block 0 — skipped\n",
+						kprintf("ext4: journal seq %u tag %lu (of a %s descriptor at log block %lu) targets block 0 - skipped\n",
 							next_seq, data_idx,
 							tagbad ? "csum-BAD" :
 								 "csum-ok",
