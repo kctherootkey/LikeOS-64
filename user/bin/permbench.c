@@ -12,6 +12,7 @@
 #include <time.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 static long long now_us(void)
 {
@@ -143,6 +144,111 @@ static void bench_tty_write(const char *who, int n)
 	report("tty-write", who, now_us() - t0, n);
 }
 
+static void bench_fork_exit(const char *who, int n)
+{
+	long long t0 = now_us();
+	for (int i = 0; i < n; i++) {
+		pid_t pid = fork();
+		if (pid == 0)
+			_exit(0);
+		if (pid > 0) {
+			int st;
+			waitpid(pid, &st, 0);
+		}
+	}
+	report("fork-exit", who, now_us() - t0, n);
+}
+
+static void bench_spawn(const char *who, int n)
+{
+	long long t0 = now_us();
+	for (int i = 0; i < n; i++) {
+		pid_t pid = fork();
+		if (pid == 0) {
+			char *argv[] = { (char *)"true", 0 };
+			char *envp[] = { 0 };
+			execve("/bin/true", argv, envp);
+			_exit(127);
+		}
+		if (pid > 0) {
+			int st;
+			waitpid(pid, &st, 0);
+		}
+	}
+	report("spawn-true", who, now_us() - t0, n);
+}
+
+#define BIG_CHUNK 65536
+#define BIG_CHUNKS 64 /* 4 MB */
+static char big_buf[BIG_CHUNK];
+
+static void bench_big_write(const char *who)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/tmp/permbench.big.%d", getuid());
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	if (fd < 0) {
+		printf("PB big-write %s SKIP (open failed)\n", who);
+		return;
+	}
+	memset(big_buf, 0x5a, sizeof(big_buf));
+	long long t0 = now_us();
+	long long total = 0;
+	for (int i = 0; i < BIG_CHUNKS; i++) {
+		int w = write(fd, big_buf, BIG_CHUNK);
+		if (w <= 0)
+			break;
+		total += w;
+	}
+	long long us = now_us() - t0;
+	close(fd);
+	long long kbps = us ? (total * 1000000LL / us) / 1024 : 0;
+	printf("PB %-14s %-5s total=%lldKB in %lldus -> %lld KB/s\n",
+	       "big-write", who, total / 1024, us, kbps);
+}
+
+static void bench_big_read(const char *who)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/tmp/permbench.big.%d", getuid());
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		printf("PB big-read %s SKIP (open failed)\n", who);
+		return;
+	}
+	long long t0 = now_us();
+	long long total = 0;
+	for (;;) {
+		int r = read(fd, big_buf, BIG_CHUNK);
+		if (r <= 0)
+			break;
+		total += r;
+	}
+	long long us = now_us() - t0;
+	close(fd);
+	long long kbps = us ? (total * 1000000LL / us) / 1024 : 0;
+	printf("PB %-14s %-5s total=%lldKB in %lldus -> %lld KB/s\n",
+	       "big-read", who, total / 1024, us, kbps);
+	/* second pass: warm (pagecache) read */
+	fd = open(path, O_RDONLY);
+	if (fd >= 0) {
+		t0 = now_us();
+		total = 0;
+		for (;;) {
+			int r = read(fd, big_buf, BIG_CHUNK);
+			if (r <= 0)
+				break;
+			total += r;
+		}
+		us = now_us() - t0;
+		close(fd);
+		kbps = us ? (total * 1000000LL / us) / 1024 : 0;
+		printf("PB %-14s %-5s total=%lldKB in %lldus -> %lld KB/s\n",
+		       "big-read2", who, total / 1024, us, kbps);
+	}
+	unlink(path);
+}
+
 static void run_suite(const char *who)
 {
 	/* warmup: populate all kernel caches before timing */
@@ -157,6 +263,10 @@ static void run_suite(const char *who)
 	bench_file_write(who, 1000);
 	bench_devnull_write(who, 1000);
 	bench_tty_write(who, 200);
+	bench_fork_exit(who, 20);
+	bench_spawn(who, 20);
+	bench_big_write(who);
+	bench_big_read(who);
 }
 
 int main(void)

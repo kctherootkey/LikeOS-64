@@ -5,7 +5,7 @@ DEBUG ?= 0
 CFLAGS = -Wall -Wextra -O2 -nostdlib -fno-builtin -fstack-protector-strong \
          -mno-red-zone -ffreestanding -I./include
 ifeq ($(DEBUG),1)
-CFLAGS += -DSTACK_SMASH_DEBUG
+CFLAGS += -DSTACK_SMASH_DEBUG -DDEBUG=1
 endif
 
 # PIC flags for shared-library objects

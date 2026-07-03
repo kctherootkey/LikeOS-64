@@ -89,15 +89,95 @@ _Static_assert(__builtin_offsetof(ext4_inode, i_checksum_hi) == 0x82,
  * =================================================================== */
 
 /* crc32c (reflected polynomial 0x82F63B78).  No implicit pre/post inversion —
- * the caller supplies the seed explicitly (matching the reference's usage). */
+ * the caller supplies the seed explicitly (matching the reference's usage).
+ *
+ * Performance-critical: a checksum is verified on every metadata block read
+ * (4 KB directory leaves per lookup, extent nodes, inode records) and computed
+ * on every journaled block.  The original bit-at-a-time loop cost ~50 µs per
+ * 4 KB block, several times per path syscall — a large share of why every
+ * stat/open took ~1 ms.  Dispatch: the SSE4.2 CRC32 instruction (which
+ * implements exactly this Castagnoli polynomial) when the CPU has it, else a
+ * slice-by-4 table (~30x the bitwise speed). */
+#define EXT4_C32C_UNINIT 0
+#define EXT4_C32C_TABLE 1
+#define EXT4_C32C_HW 2
+static int s_c32c_mode = EXT4_C32C_UNINIT;
+static uint32_t s_c32c_tab[4][256];
+
+static void ext4_crc32c_init(void)
+{
+	uint32_t a, b, c, d;
+	__asm__ volatile("cpuid"
+			 : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+			 : "a"(1), "c"(0));
+	if (c & (1u << 20)) { /* CPUID.1:ECX.SSE4_2 */
+		s_c32c_mode = EXT4_C32C_HW;
+		return;
+	}
+	for (uint32_t i = 0; i < 256; i++) {
+		uint32_t crc = i;
+		for (int k = 0; k < 8; k++)
+			crc = (crc >> 1) ^ (0x82F63B78u & (0u - (crc & 1u)));
+		s_c32c_tab[0][i] = crc;
+	}
+	for (uint32_t i = 0; i < 256; i++) {
+		s_c32c_tab[1][i] = (s_c32c_tab[0][i] >> 8) ^
+				   s_c32c_tab[0][s_c32c_tab[0][i] & 0xFF];
+		s_c32c_tab[2][i] = (s_c32c_tab[1][i] >> 8) ^
+				   s_c32c_tab[0][s_c32c_tab[1][i] & 0xFF];
+		s_c32c_tab[3][i] = (s_c32c_tab[2][i] >> 8) ^
+				   s_c32c_tab[0][s_c32c_tab[2][i] & 0xFF];
+	}
+	/* Publish the mode only after the tables are complete (a concurrent
+	 * caller may race the lazy init; rebuilding the same values is safe,
+	 * but reading a half-built table is not). */
+	__atomic_store_n(&s_c32c_mode, EXT4_C32C_TABLE, __ATOMIC_RELEASE);
+}
+
 static uint32_t ext4_crc32c(uint32_t crc, const void *buf, unsigned long len)
 {
 	const uint8_t *p = (const uint8_t *)buf;
-	while (len--) {
-		crc ^= *p++;
-		for (int i = 0; i < 8; i++)
-			crc = (crc >> 1) ^ (0x82F63B78u & (0u - (crc & 1u)));
+	int mode = __atomic_load_n(&s_c32c_mode, __ATOMIC_ACQUIRE);
+	if (mode == EXT4_C32C_UNINIT) {
+		ext4_crc32c_init();
+		mode = s_c32c_mode;
 	}
+	if (mode == EXT4_C32C_HW) {
+		uint64_t c = crc;
+		while (((uintptr_t)p & 7) && len) {
+			__asm__("crc32b %1, %0" : "+r"(c) : "rm"(*p));
+			p++;
+			len--;
+		}
+		while (len >= 8) {
+			__asm__("crc32q %1, %0"
+				: "+r"(c)
+				: "rm"(*(const uint64_t *)p));
+			p += 8;
+			len -= 8;
+		}
+		while (len--) {
+			__asm__("crc32b %1, %0" : "+r"(c) : "rm"(*p));
+			p++;
+		}
+		return (uint32_t)c;
+	}
+	while (((uintptr_t)p & 3) && len) {
+		crc = (crc >> 8) ^ s_c32c_tab[0][(crc ^ *p++) & 0xFF];
+		len--;
+	}
+	while (len >= 4) {
+		uint32_t w;
+		mm_memcpy(&w, p, 4);
+		crc ^= w;
+		crc = s_c32c_tab[3][crc & 0xFF] ^
+		      s_c32c_tab[2][(crc >> 8) & 0xFF] ^
+		      s_c32c_tab[1][(crc >> 16) & 0xFF] ^ s_c32c_tab[0][crc >> 24];
+		p += 4;
+		len -= 4;
+	}
+	while (len--)
+		crc = (crc >> 8) ^ s_c32c_tab[0][(crc ^ *p++) & 0xFF];
 	return crc;
 }
 
@@ -742,8 +822,33 @@ static int ext4_read_sectors(const block_device_t *bdev, unsigned long lba,
 static struct {
 	unsigned long pbn; /* 0 = empty slot               */
 	uint8_t *data; /* block_size bytes             */
+	int verified; /* type-specific csum already checked once */
 } s_mbc[EXT4_MBC_ENTRIES];
 static unsigned s_mbc_next;
+
+/* ---- checksum-verification cache ----
+ * Metadata checksums (directory leaves, extent nodes, xattr blocks) were
+ * re-verified on EVERY read of the block — a directory leaf is re-checked on
+ * every lookup that scans it, so hot directories paid a full-block crc32c per
+ * path component per syscall.  The block cache remembers when a cached copy
+ * has already passed its type-specific check; the flag is cleared whenever the
+ * cached content changes (fresh disk read, write-through update). */
+static int ext4_mbc_verified(unsigned long pbn)
+{
+	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
+		if (s_mbc[i].pbn == pbn)
+			return s_mbc[i].verified;
+	return 0;
+}
+
+static void ext4_mbc_mark_verified(unsigned long pbn)
+{
+	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
+		if (s_mbc[i].pbn == pbn) {
+			s_mbc[i].verified = 1;
+			return;
+		}
+}
 
 static void ext4_mbc_invalidate(void)
 {
@@ -795,6 +900,7 @@ static int ext4_read_block(ext4_fs_t *fs, unsigned long pbn, void *buf)
 	if (s_mbc[slot].data) {
 		mm_memcpy(s_mbc[slot].data, buf, fs->block_size);
 		s_mbc[slot].pbn = pbn;
+		s_mbc[slot].verified = 0; /* fresh from disk: not yet checked */
 	}
 	return ST_OK;
 }
@@ -1018,28 +1124,47 @@ static int ext4_read_inode_loc(ext4_fs_t *fs, unsigned long ino,
 	return ST_OK;
 }
 
-/* Single-entry inode cache: the chain mapper resolves blocks sequentially for
- * one file at a time under the I/O lock, so caching the most-recently-read
- * inode collapses N inode reads per file down to 1. */
-static unsigned long s_ic_ino = 0;
-static ext4_inode s_ic_inode;
+/* Small parsed-inode cache.  Was a SINGLE entry, which path resolution
+ * thrashed on every component (directory inode, then child inode, then the
+ * next directory...), forcing an inode-table block read + inode checksum
+ * verification per step.  A handful of entries covers a whole resolve.
+ * Returned pointers are only valid until the next few cache fills — callers
+ * already copy what they need before nested lookups (same contract as the old
+ * single entry, which could be evicted by ANY nested call). */
+#define EXT4_IC_ENTRIES 8
+static struct {
+	unsigned long ino; /* 0 = empty */
+	ext4_inode inode;
+} s_ic[EXT4_IC_ENTRIES];
+static unsigned s_ic_next;
+
+static void ext4_inode_cache_flush(void)
+{
+	for (int i = 0; i < EXT4_IC_ENTRIES; i++)
+		s_ic[i].ino = 0;
+}
 
 static const ext4_inode *ext4_get_inode_cached(ext4_fs_t *fs, unsigned long ino)
 {
-	if (ino == s_ic_ino && s_ic_ino != 0)
-		return &s_ic_inode;
-	if (ext4_read_inode_loc(fs, ino, &s_ic_inode, 0, 0) != ST_OK) {
-		s_ic_ino = 0;
+	if (ino == 0)
+		return 0;
+	for (int i = 0; i < EXT4_IC_ENTRIES; i++)
+		if (s_ic[i].ino == ino)
+			return &s_ic[i].inode;
+	unsigned slot = s_ic_next++ % EXT4_IC_ENTRIES;
+	if (ext4_read_inode_loc(fs, ino, &s_ic[slot].inode, 0, 0) != ST_OK) {
+		s_ic[slot].ino = 0;
 		return 0;
 	}
-	s_ic_ino = ino;
-	return &s_ic_inode;
+	s_ic[slot].ino = ino;
+	return &s_ic[slot].inode;
 }
 
 static inline void ext4_inode_cache_drop(unsigned long ino)
 {
-	if (ino == s_ic_ino)
-		s_ic_ino = 0;
+	for (int i = 0; i < EXT4_IC_ENTRIES; i++)
+		if (s_ic[i].ino == ino)
+			s_ic[i].ino = 0;
 }
 
 static inline unsigned long ext4_inode_size(const ext4_inode *in)
@@ -1113,12 +1238,16 @@ static unsigned long ext4_extent_map(ext4_fs_t *fs, unsigned long ino,
 			}
 			if (ext4_read_block(fs, child, heap) != ST_OK)
 				break;
-			if (!ext4_extent_block_csum_ok(
-				    fs, ino, in->i_generation, heap)) {
-				ext4_fs_error(fs,
-					      "extent block checksum mismatch",
-					      ino);
-				break; /* corrupt index/leaf node: treat as unmapped */
+			if (!ext4_mbc_verified(child)) {
+				if (!ext4_extent_block_csum_ok(
+					    fs, ino, in->i_generation, heap)) {
+					ext4_fs_error(
+						fs,
+						"extent block checksum mismatch",
+						ino);
+					break; /* corrupt index/leaf node: treat as unmapped */
+				}
+				ext4_mbc_mark_verified(child);
 			}
 			node = heap; /* descend */
 		}
@@ -1289,7 +1418,7 @@ static int ext4_sb_write_inode(vfs_superblock_t *sb, ic_inode_t *inode)
 	in.i_size_lo = (uint32_t)inode->size;
 	if ((in.i_mode & S_IFMT) == S_IFREG)
 		in.i_size_high = (uint32_t)(inode->size >> 32);
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	ext4_write_inode_struct(fs, ino, &in);
 	return 0;
 }
@@ -1342,11 +1471,15 @@ static int ext4_dir_lookup(ext4_fs_t *fs, unsigned long dir_ino,
 			continue; /* sparse dir block (rare) */
 		if (ext4_read_block(fs, pbn, blk) != ST_OK)
 			continue;
-		if (!ext4_dir_csum_ok(fs, dir_ino, gen, blk)) {
-			ext4_bput(blk);
-			ext4_fs_error(fs, "directory leaf checksum mismatch",
-				      dir_ino);
-			return ST_IO;
+		if (!ext4_mbc_verified(pbn)) {
+			if (!ext4_dir_csum_ok(fs, dir_ino, gen, blk)) {
+				ext4_bput(blk);
+				ext4_fs_error(fs,
+					      "directory leaf checksum mismatch",
+					      dir_ino);
+				return ST_IO;
+			}
+			ext4_mbc_mark_verified(pbn);
 		}
 		unsigned off = 0;
 		while (off + 8 <= fs->block_size) {
@@ -1564,7 +1697,7 @@ static int ext4_open_impl(const char *path, int flags, vfs_file_t **out)
 			ext4_free_inode(fs, newino, 0);
 			return ST_IO;
 		}
-		s_ic_ino = 0;
+		ext4_inode_cache_flush();
 		ino = newino;
 	}
 
@@ -1581,7 +1714,7 @@ static int ext4_open_impl(const char *path, int flags, vfs_file_t **out)
 		in.i_size_lo = 0;
 		in.i_size_high = 0;
 		in.i_mtime = in.i_ctime = (uint32_t)timer_get_epoch();
-		s_ic_ino = 0;
+		ext4_inode_cache_flush();
 		ext4_write_inode_struct(fs, ino, &in);
 		pagecache_invalidate_file(EXT4_BID_ENC(ino, 0));
 		icache_chain_invalidate(EXT4_BID_ENC(ino, 0));
@@ -1786,11 +1919,15 @@ static long ext4_readdir_impl(vfs_file_t *f, void *buf, long bytes)
 			ef->dir_pos = (b + 1) * fs->block_size;
 			continue;
 		}
-		if (!ext4_dir_csum_ok(fs, ef->ino, gen, blk)) {
-			ext4_bput(blk);
-			ext4_fs_error(fs, "directory leaf checksum mismatch",
-				      ef->ino);
-			return ST_IO;
+		if (!ext4_mbc_verified(pbn)) {
+			if (!ext4_dir_csum_ok(fs, ef->ino, gen, blk)) {
+				ext4_bput(blk);
+				ext4_fs_error(fs,
+					      "directory leaf checksum mismatch",
+					      ef->ino);
+				return ST_IO;
+			}
+			ext4_mbc_mark_verified(pbn);
 		}
 		int block_done = 0;
 		while (in_blk + 8 <= fs->block_size) {
@@ -1923,6 +2060,7 @@ static int ext4_write_block_direct(ext4_fs_t *fs, unsigned long pbn,
 	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
 		if (s_mbc[i].pbn == pbn && s_mbc[i].data) {
 			mm_memcpy(s_mbc[i].data, buf, fs->block_size);
+			s_mbc[i].verified = 0; /* content changed */
 			break;
 		}
 	return ST_OK;
@@ -2264,8 +2402,7 @@ static int ext4_write_inode_struct(ext4_fs_t *fs, unsigned long ino,
 			    buf + off); /* over the full on-disk inode */
 	st = ext4_write_block(fs, blk, buf);
 	kfree(buf);
-	if (ino == s_ic_ino)
-		s_ic_ino = 0; /* parsed-inode cache now stale */
+	ext4_inode_cache_drop(ino); /* parsed-inode cache now stale */
 	return st;
 }
 
@@ -3486,14 +3623,19 @@ static int ext4_xattr_get_ino(ext4_fs_t *fs, unsigned long ino, int index,
 		if (ext4_read_block(fs, in.i_file_acl_lo, xbuf) == ST_OK) {
 			ext4_xattr_header *xh = (ext4_xattr_header *)xbuf;
 			if (xh->h_magic == EXT4_XATTR_MAGIC) {
-				if (!ext4_xattr_block_csum_ok(
-					    fs, in.i_file_acl_lo, xbuf)) {
-					ext4_bput(xbuf);
-					ext4_fs_error(
-						fs,
-						"xattr block checksum mismatch",
-						ino);
-					return ST_IO;
+				if (!ext4_mbc_verified(in.i_file_acl_lo)) {
+					if (!ext4_xattr_block_csum_ok(
+						    fs, in.i_file_acl_lo,
+						    xbuf)) {
+						ext4_bput(xbuf);
+						ext4_fs_error(
+							fs,
+							"xattr block checksum mismatch",
+							ino);
+						return ST_IO;
+					}
+					ext4_mbc_mark_verified(
+						in.i_file_acl_lo);
 				}
 				static ext4_xa_list LB;
 				LB.n = 0;
@@ -4133,7 +4275,7 @@ static long ext4_dir_grow(ext4_fs_t *fs, unsigned long dir_ino, ext4_inode *din)
 	din->i_size_lo = (uint32_t)((nblocks + 1) * fs->block_size);
 	if (ext4_write_inode_struct(fs, dir_ino, din) != ST_OK)
 		return ST_IO;
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	return (long)nblocks;
 }
 
@@ -4337,7 +4479,7 @@ static int ext4_htree_make_indexed(ext4_fs_t *fs, unsigned long dir_ino,
 	din->i_flags |= EXT4_INODE_INDEX_FL;
 	if (ext4_write_inode_struct(fs, dir_ino, din) != ST_OK)
 		return ST_IO;
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	return ST_OK;
 }
 
@@ -4551,7 +4693,7 @@ static int ext4_htree_add(ext4_fs_t *fs, unsigned long dir_ino, ext4_inode *din,
 	if (rc != ST_OK)
 		goto out;
 	/* din/extents changed in the split; re-read root & node to map blocks safely. */
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 
 	ext4_dx_countlimit *pcl = (ext4_dx_countlimit *)(parent + parent_off);
 	if (pcl->count < pcl->limit) { /* room in the parent */
@@ -4699,7 +4841,7 @@ static int ext4_dir_add(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
 	}
 	unsigned long pbn = ext4_block_map(fs, dir_ino, nblocks);
 	/* ext4_block_map reads via the parsed cache; ensure it reflects new extent */
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	if (pbn == 0) {
 		/* extent just appended to din (in-memory); compute directly */
 		ext4_extent_header *eh = (ext4_extent_header *)din.i_block;
@@ -4975,7 +5117,7 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 		uint64_t now = timer_get_epoch();
 		in.i_mtime = in.i_ctime = (uint32_t)now;
 	}
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	ext4_write_inode_struct(fs, ef->ino, &in);
 
 	/* Write the data.  When journalling is on, full blocks are accumulated into
@@ -5192,7 +5334,7 @@ static int ext4_truncate_impl(vfs_file_t *f, unsigned long size)
 		in.i_size_high = (uint32_t)(size >> 32);
 	uint64_t now = timer_get_epoch();
 	in.i_mtime = in.i_ctime = (uint32_t)now;
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	int st = ext4_write_inode_struct(fs, ef->ino, &in);
 	ef->size = size;
 	if (ef->pos > size)
@@ -5249,7 +5391,7 @@ static int ext4_unlink_impl(const char *path)
 		cin.i_ctime = (uint32_t)timer_get_epoch();
 		ext4_write_inode_struct(fs, child, &cin);
 	}
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	ext4_flush_meta(fs);
 	return ST_OK;
 }
@@ -5372,7 +5514,7 @@ static void ext4_adjust_links(ext4_fs_t *fs, unsigned long ino, int delta)
 	else
 		in.i_links_count = (uint16_t)(in.i_links_count + delta);
 	in.i_ctime = (uint32_t)timer_get_epoch();
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	ext4_write_inode_struct(fs, ino, &in);
 }
 
@@ -5445,7 +5587,7 @@ static int ext4_mkdir_impl(const char *path, unsigned mode)
 	ext4_init_dir_block(fs, blk, nino, parent, in.i_generation);
 	ext4_write_block(fs, pbn, blk); /* dir block is metadata           */
 	kfree(blk);
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	ext4_write_inode_new(fs, nino,
 			     &in); /* fresh inode: clear stale ibody xattrs */
 
@@ -5457,7 +5599,7 @@ static int ext4_mkdir_impl(const char *path, unsigned mode)
 	}
 	ext4_adjust_links(fs, parent,
 			  +1); /* new dir's ".." references parent */
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	ext4_flush_meta(fs);
 	return ST_OK;
 }
@@ -5502,7 +5644,7 @@ static int ext4_rmdir_impl(const char *path)
 	icache_remove(EXT4_BID_ENC(child, 0));
 	pagecache_invalidate_file(EXT4_BID_ENC(child, 0));
 	ext4_adjust_links(fs, parent, -1); /* child's ".." is gone            */
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	ext4_flush_meta(fs);
 	return ST_OK;
 }
@@ -5563,7 +5705,7 @@ static int ext4_rename_impl(const char *oldp, const char *newp)
 		} else {
 			ext4_write_inode_struct(fs, dst, &din);
 		}
-		s_ic_ino = 0;
+		ext4_inode_cache_flush();
 	}
 
 	if (ext4_dir_add(fs, np, nname, nnl, src, sft) != ST_OK)
@@ -5577,7 +5719,7 @@ static int ext4_rename_impl(const char *oldp, const char *newp)
 		ext4_adjust_links(fs, np,
 				  +1); /* src's new ".." references np     */
 	}
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	ext4_flush_meta(fs);
 	return ST_OK;
 }
@@ -5616,7 +5758,7 @@ int ext4_utimensat(const char *path, int64_t mtime_sec, long mtime_nsec)
 	}
 	in.i_atime = now;
 	in.i_ctime = now;
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	int rc = ext4_write_inode_struct(fs, ino, &in);
 	ext4_io_unlock();
 	return rc == ST_OK ? ST_OK : ST_IO;
@@ -5715,7 +5857,7 @@ int ext4_symlink(const char *target, const char *linkpath)
 
 	if (tlen < 60) { /* fast symlink — inline target  */
 		mm_memcpy(in.i_block, target, tlen);
-		s_ic_ino = 0;
+		ext4_inode_cache_flush();
 		ext4_write_inode_new(
 			fs, nino,
 			&in); /* fresh inode: clear stale ibody xattrs */
@@ -5748,7 +5890,7 @@ int ext4_symlink(const char *target, const char *linkpath)
 					   pbn * fs->sectors_per_block,
 				   fs->sectors_per_block, blk);
 		kfree(blk);
-		s_ic_ino = 0;
+		ext4_inode_cache_flush();
 		ext4_write_inode_new(
 			fs, nino,
 			&in); /* fresh inode: clear stale ibody xattrs */
@@ -5760,7 +5902,7 @@ int ext4_symlink(const char *target, const char *linkpath)
 		ext4_io_unlock();
 		return ST_IO;
 	}
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	ext4_flush_meta(fs);
 	ext4_io_unlock();
 	return ST_OK;
@@ -5844,7 +5986,7 @@ int ext4_link(const char *oldpath, const char *newpath)
 	}
 	sin.i_links_count++;
 	sin.i_ctime = (uint32_t)timer_get_epoch();
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	ext4_write_inode_struct(fs, src, &sin);
 	ext4_flush_meta(fs);
 	ext4_io_unlock();
@@ -5858,7 +6000,7 @@ static int ext4_set_mode_locked(ext4_fs_t *fs, unsigned long ino, unsigned mode)
 		return ST_IO;
 	in.i_mode = (uint16_t)((in.i_mode & S_IFMT) | (mode & 07777));
 	in.i_ctime = (uint32_t)timer_get_epoch();
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	/* A mode change can re-add a set-id bit: invalidate the per-inode strip
      * hint (S_NOSEC analog) for every handle, so the next non-root modify
      * re-evaluates.  Peek the cache without taking a ref. */
@@ -5879,7 +6021,7 @@ static int ext4_set_owner_locked(ext4_fs_t *fs, unsigned long ino, int uid,
 	if (gid >= 0)
 		in.i_gid = (uint16_t)gid;
 	in.i_ctime = (uint32_t)timer_get_epoch();
-	s_ic_ino = 0;
+	ext4_inode_cache_flush();
 	return ext4_write_inode_struct(fs, ino, &in) == ST_OK ? ST_OK : ST_IO;
 }
 
@@ -7498,7 +7640,7 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
 		return ST_UNSUPPORTED;
 	}
 
-	s_ic_ino = 0; /* reset the single-entry inode cache */
+	ext4_inode_cache_flush(); /* reset the parsed-inode cache */
 	ext4_mbc_invalidate();
 	if (ext4_load_gdt(out) != ST_OK) {
 		kprintf("ext4: failed to load group descriptor table\n");
@@ -7542,7 +7684,7 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
                  * were populated before/by replay so later reads see the
                  * recovered state. */
 				ext4_mbc_invalidate();
-				s_ic_ino = 0;
+				ext4_inode_cache_flush();
 				ext4_load_gdt(
 					out); /* GDT blocks may have been replayed   */
 			}

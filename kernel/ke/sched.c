@@ -315,6 +315,26 @@ static void dead_thread_queue(task_t *task)
 	spin_unlock_irqrestore(&g_dead_thread_lock, flags);
 }
 
+/* Deferred reap for waitpid: unlink the zombie from its parent (so a second
+ * waitpid cannot return it again) and queue it for destruction on the
+ * scheduling tail.  The synchronous sched_remove_task in waitpid cost 7-9 ms
+ * per child: the exit path wakes the parent BEFORE the child has switched off
+ * its CPU, so the parent's reap always entered the still-running spin (IPI +
+ * pause loop), then paid a full TLB shootdown, the address-space destroy and
+ * the kernel-stack free — all inside the wait.  All of that now runs in
+ * dead_thread_reap (scheduling-tail context, IRQs on), where the child has
+ * long since left its CPU. */
+void sched_defer_reap(task_t *child)
+{
+	if (!child)
+		return;
+	if (child->parent) {
+		sched_remove_child(child->parent, child);
+		child->parent = NULL;
+	}
+	dead_thread_queue(child);
+}
+
 // Reap all dead threads.  Called AFTER ctx_switch_asm when we are safely on a
 // different kernel stack and can free the previous thread's stack.
 static void dead_thread_reap(void)
@@ -461,7 +481,9 @@ static void rq_enqueue_locked(percpu_t *cpu, task_t *task)
 	lockdep_assert_held(&cpu->runqueue_lock);
 	BUG_ON(cpu == NULL);
 	BUG_ON(task == NULL);
-	uint32_t cpu_id = cpu - percpu_get(0);
+	/* Diagnostic id: percpu structs are separately allocated, so pointer
+	 * arithmetic against percpu_get(0) printed garbage; use the real id. */
+	uint32_t cpu_id = cpu->cpu_id;
 
 	// Prevent double-enqueue
 	if (task->on_rq) {
@@ -1400,21 +1422,25 @@ void sched_remove_task(task_t *task)
 		const int max_retries = 10000;
 
 		while (retries < max_retries) {
-			bool still_running = false;
+			uint32_t running_on = (uint32_t)-1;
 			for (uint32_t cpu = 0; cpu < online; cpu++) {
 				percpu_t *p = percpu_get(cpu);
 				if (p && p->current_task == task) {
-					still_running = true;
+					running_on = cpu;
 					break;
 				}
 			}
 
-			if (!still_running) {
+			if (running_on == (uint32_t)-1) {
 				break; // Task is not running on any CPU
 			}
 
-			// Task is still running - send reschedule IPI and yield
-			smp_send_reschedule_all();
+			// Task is still running — nudge ONLY the CPU it is on.
+			// The previous smp_send_reschedule_all() here IPI'd every
+			// CPU on every retry, an IPI storm that dominated the
+			// spin's cost (each IPI to a HLT-parked vCPU is
+			// expensive under virtualization).
+			smp_send_reschedule(running_on);
 
 			// Brief pause to let the other CPU context switch
 			for (volatile int i = 0; i < 1000; i++) {
@@ -1712,11 +1738,26 @@ void sched_reap_zombies(task_t *parent)
 	}
 }
 
+/* Atomically claim a task's `from`->READY wake transition.  Wakers run under
+ * UNRELATED locks — the futex bucket lock, g_task_list_lock, and the signal
+ * paths — so a plain "if (state == BLOCKED) state = READY" lets two wakers
+ * claim the same task and BOTH enqueue it.  The second enqueue races the
+ * task's first run: it can find the task re-BLOCKED (would enqueue a waiting
+ * task), RUNNING, or already exited — observed as the rq_enqueue_locked
+ * "double-enqueue" warnings under parallel teststress.  CAS makes exactly one
+ * waker win; only the winner may clear wait state and enqueue. */
+int sched_claim_wake(task_t *t, task_state_t from)
+{
+	task_state_t expected = from;
+	return __atomic_compare_exchange_n(&t->state, &expected, TASK_READY,
+					   false, __ATOMIC_ACQ_REL,
+					   __ATOMIC_ACQUIRE);
+}
+
 // Wake a single blocked task and enqueue it to its CPU's run queue
 static void sched_wake_task(task_t *task)
 {
-	if (task && task->state == TASK_BLOCKED) {
-		task->state = TASK_READY;
+	if (task && sched_claim_wake(task, TASK_BLOCKED)) {
 		task->wait_channel = NULL;
 		task->wakeup_tick = 0;
 		sched_enqueue_ready(task);
@@ -1737,8 +1778,8 @@ void sched_wake_channel(void *channel)
 	uint64_t flags;
 	spin_lock_irqsave(&g_task_list_lock, &flags);
 	for (task_t *t = g_task_list_head; t; t = t->next) {
-		if (t->state == TASK_BLOCKED && t->wait_channel == channel) {
-			t->state = TASK_READY;
+		if (t->wait_channel == channel &&
+		    sched_claim_wake(t, TASK_BLOCKED)) {
 			t->wait_channel = NULL;
 			if (nwake < 16) {
 				to_wake[nwake++] = t;
@@ -1770,9 +1811,9 @@ void sched_wake_expired_sleepers(uint64_t current_tick)
 		signal_check_timers(t, current_tick);
 
 		// Check sleep timer
-		if (t->state == TASK_BLOCKED && t->wakeup_tick != 0) {
-			if (current_tick >= t->wakeup_tick) {
-				t->state = TASK_READY;
+		if (t->state == TASK_BLOCKED && t->wakeup_tick != 0 &&
+		    current_tick >= t->wakeup_tick) {
+			if (sched_claim_wake(t, TASK_BLOCKED)) {
 				t->wakeup_tick = 0;
 				if (nwake < 16)
 					to_wake[nwake++] = t;
@@ -1781,10 +1822,11 @@ void sched_wake_expired_sleepers(uint64_t current_tick)
 
 		// Wake blocked tasks with pending signals
 		if (t->state == TASK_BLOCKED && signal_pending(t)) {
-			t->state = TASK_READY;
-			t->wakeup_tick = 0;
-			if (nwake < 16)
-				to_wake[nwake++] = t;
+			if (sched_claim_wake(t, TASK_BLOCKED)) {
+				t->wakeup_tick = 0;
+				if (nwake < 16)
+					to_wake[nwake++] = t;
+			}
 		}
 	}
 	spin_unlock_irqrestore(&g_task_list_lock, flags);
@@ -2013,10 +2055,8 @@ void sched_signal_task(task_t *task, int sig)
 	}
 
 	if (sig == SIGCONT) {
-		if (task->state == TASK_STOPPED) {
-			task->state = TASK_READY;
+		if (sched_claim_wake(task, TASK_STOPPED))
 			sched_enqueue_ready(task);
-		}
 		signal_send(task, sig, &info);
 		return;
 	}
@@ -2033,10 +2073,8 @@ void sched_signal_task(task_t *task, int sig)
 			return;
 		}
 		signal_send(task, sig, &info);
-		if (task->state == TASK_BLOCKED) {
-			task->state = TASK_READY;
+		if (sched_claim_wake(task, TASK_BLOCKED))
 			sched_enqueue_ready(task);
-		}
 		return;
 	}
 
@@ -2047,10 +2085,8 @@ void sched_signal_task(task_t *task, int sig)
 
 	if (act->sa_handler != SIG_DFL) {
 		signal_send(task, sig, &info);
-		if (task->state == TASK_BLOCKED) {
-			task->state = TASK_READY;
+		if (sched_claim_wake(task, TASK_BLOCKED))
 			sched_enqueue_ready(task);
-		}
 		return;
 	}
 
@@ -2080,10 +2116,8 @@ void sched_signal_task(task_t *task, int sig)
 	case SIG_DFL_IGN:
 		break;
 	case SIG_DFL_CONT:
-		if (task->state == TASK_STOPPED) {
-			task->state = TASK_READY;
+		if (sched_claim_wake(task, TASK_STOPPED))
 			sched_enqueue_ready(task);
-		}
 		break;
 	}
 }

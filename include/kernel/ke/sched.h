@@ -504,6 +504,8 @@ void sched_set_need_resched(task_t *t); // Mark task as needing reschedule
 void sched_wake_expired_sleepers(
 	uint64_t current_tick); // Wake tasks whose sleep timer expired
 void sched_wake_channel(void *channel); // Wake all tasks waiting on a channel
+int sched_claim_wake(task_t *t,
+		     task_state_t from); // Atomic from->READY claim (see sched.c)
 
 // Global task list lock (protects the all-tasks linked list)
 extern spinlock_t g_task_list_lock;
@@ -523,6 +525,8 @@ void sched_load_balance(
 // Process management
 task_t *sched_fork_current(void); // Fork current task with COW
 void sched_remove_task(task_t *task); // Remove task from scheduler
+void sched_defer_reap(
+	task_t *child); // waitpid reap: unlink from parent, destroy deferred
 task_t *sched_find_task_by_id(uint32_t pid); // Find task by PID
 task_t *sched_find_task_by_id_locked(
 	uint32_t pid); // Find task by PID (caller holds g_task_list_lock)

@@ -723,6 +723,12 @@ again:
 			task_t *cur = sched_current();
 			if (cur) {
 				cur->wait_channel = (void *)&conn->rx_ready;
+				/* SO_RCVTIMEO: arm the sleep timer so the park
+				 * wakes at the deadline.  Without this the
+				 * deadline was only checked when something else
+				 * happened to wake the task — a receiver whose
+				 * peer went silent slept forever. */
+				cur->wakeup_tick = deadline;
 				__atomic_thread_fence(__ATOMIC_SEQ_CST);
 				cur->state = TASK_BLOCKED;
 				__atomic_thread_fence(__ATOMIC_SEQ_CST);
@@ -733,12 +739,15 @@ again:
 				    conn->state != TCP_STATE_ESTABLISHED) {
 					cur->state = TASK_RUNNING;
 					cur->wait_channel = NULL;
+					cur->wakeup_tick = 0;
 					continue;
 				}
 			}
 			sched_schedule();
-			if (cur)
+			if (cur) {
 				cur->wait_channel = NULL;
+				cur->wakeup_tick = 0;
+			}
 		}
 
 		if (conn->error)

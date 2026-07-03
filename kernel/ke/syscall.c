@@ -3269,8 +3269,14 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 			return (int64_t)MAP_FAILED;
 		}
 
-		// Zero page via direct map
+		/* No memset in production: mm_allocate_physical_page already
+		 * zeroed the page (double-zeroing every anonymous page slowed
+		 * each process start — rtld/malloc mmap hundreds of pages).
+		 * DEBUG builds poison on alloc, so zero explicitly there:
+		 * anon mmap pages must read as zero in userspace. */
+#if DEBUG
 		mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
+#endif
 
 		// For file-backed mappings, read content from file
 		if (!is_anonymous && fd < TASK_MAX_FDS && cur->fd_table[fd]) {
@@ -3647,7 +3653,11 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 			}
 
 			int child_pid = child->id;
-			sched_remove_task(child);
+			/* Heavy destruction (address space, kernel stack, TLB
+			 * shootdown, still-running spin) is deferred to the
+			 * dead-thread reaper; running it synchronously here
+			 * cost 7-9 ms per reaped child. */
+			sched_defer_reap(child);
 			return child_pid;
 		}
 
@@ -5269,11 +5279,14 @@ static void sys_exit_group(uint64_t status)
 
 	// Now exit ourselves
 	sched_mark_task_exited(cur, (int)status);
-	sched_schedule();
 
-	// Never returns
-	while (1) {
-		__asm__ volatile("hlt");
+	/* Same hardened park as sys_exit: sched_schedule() can return in the
+	 * rare zombie edge case, and a bare `hlt` here (without STI and without
+	 * retrying the switch) parks the CPU for a full timer tick per exit —
+	 * and with IRQs off would wedge TLB shootdowns (see sys_exit). */
+	for (;;) {
+		sched_schedule();
+		__asm__ volatile("sti; hlt");
 	}
 }
 

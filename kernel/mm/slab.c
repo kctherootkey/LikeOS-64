@@ -542,6 +542,40 @@ void *slab_alloc(size_t size)
 			return NULL;
 		}
 
+		/* Direct-map fast path: physical memory below 16 GB is already
+		 * mapped at PHYS_MAP_BASE, so the allocation needs NO page-table
+		 * work — and, critically, its free needs no unmap and no
+		 * cross-CPU TLB shootdown.  The mapped path below cost one
+		 * shootdown IPI storm per kfree; with every kalloc(>2KB) in the
+		 * kernel taking it (ELF/exec staging, fd tables, kernel stacks,
+		 * pipe rings...), fork+exec alone paid dozens of shootdowns.
+		 * slab_free distinguishes the two by the pointer's address
+		 * range. */
+		if (is_phys_in_direct_map(phys_pages + alloc_bytes)) {
+			uint64_t flags;
+			spin_lock_irqsave(&slab_global_lock, &flags);
+			slab_global_stats.large_allocations++;
+			slab_global_stats.total_allocations++;
+			slab_global_stats.total_pages_used += page_count;
+			spin_unlock_irqrestore(&slab_global_lock, flags);
+
+			large_alloc_header_t *header =
+				(large_alloc_header_t *)phys_to_virt(
+					phys_pages);
+			header->magic = SLAB_LARGE_MAGIC;
+			header->page_count = page_count;
+			header->size = size;
+			header->phys_addr = phys_pages;
+			void *user_ptr =
+				(uint8_t *)header + sizeof(large_alloc_header_t);
+#if DEBUG
+			slab_poison_fill(user_ptr, POISON_UNINIT, size);
+#else
+			mm_memset(user_ptr, 0, size);
+#endif
+			return user_ptr;
+		}
+
 		// Acquire global lock to protect virtual address allocation.
 		// On SMP, two CPUs calling slab_alloc concurrently could read the
 		// same slab_next_virt_addr and get overlapping virtual ranges,
@@ -747,6 +781,21 @@ void slab_free(void *ptr)
 					 alloc_bytes > header_sz ?
 						 alloc_bytes - header_sz :
 						 0);
+		}
+
+		/* Direct-map allocation (see slab_alloc): nothing was mapped, so
+		 * there is nothing to unmap and no TLB shootdown to pay — just
+		 * return the physical pages. */
+		if (is_direct_map_addr(virt_addr)) {
+			large_header->magic = 0; /* poison the header */
+			mm_free_contiguous_pages(phys_addr, page_count);
+			uint64_t flags;
+			spin_lock_irqsave(&slab_global_lock, &flags);
+			slab_global_stats.large_frees++;
+			slab_global_stats.total_frees++;
+			slab_global_stats.total_pages_used -= page_count;
+			spin_unlock_irqrestore(&slab_global_lock, flags);
+			return;
 		}
 
 		// Unmap all pages WITHOUT individual TLB shootdowns (batched for performance)

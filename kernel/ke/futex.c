@@ -417,13 +417,16 @@ int futex_wake(uint64_t uaddr, int nr_wake)
 			// prevent ABA races with kalloc recycling the same address.
 			w->removed_by_wake = true;
 
-			// Collect task for deferred wakeup
+			// Collect task for deferred wakeup.  The BLOCKED->READY
+			// claim must be atomic: the sleep-timeout and signal
+			// wakers run under g_task_list_lock (not this bucket
+			// lock) and can claim the same task concurrently — a
+			// plain check-then-set let both sides enqueue it.
 			task_t *task = w->task;
 			ftrace_log_key(FT_WAKE_FOUND, uaddr, (uint32_t)task->id,
 				       (uint32_t)task->state, w->key,
 				       bucket_idx, 0);
-			if (task->state == TASK_BLOCKED) {
-				task->state = TASK_READY;
+			if (sched_claim_wake(task, TASK_BLOCKED)) {
 				task->wait_channel = NULL;
 				task->wakeup_tick = 0;
 				wake_list[wake_count] = task;
@@ -485,8 +488,8 @@ int futex_wake_for_task(uint64_t uaddr, int nr_wake, task_t *on_behalf_of)
 			w->removed_by_wake = true;
 
 			task_t *task = w->task;
-			if (task->state == TASK_BLOCKED) {
-				task->state = TASK_READY;
+			/* Atomic claim — see the comment in futex_wake. */
+			if (sched_claim_wake(task, TASK_BLOCKED)) {
 				task->wait_channel = NULL;
 				task->wakeup_tick = 0;
 				wake_list[wake_count] = task;
@@ -554,10 +557,10 @@ int futex_requeue(uint64_t uaddr, uint64_t uaddr2, int nr_wake, int nr_requeue)
 				// Mark as removed (waiter freed by the waiting thread)
 				w->removed_by_wake = true;
 
-				// Collect for deferred wakeup (only count if actually blocked)
+				// Collect for deferred wakeup (only count if actually
+				// blocked).  Atomic claim — see futex_wake.
 				task_t *task = w->task;
-				if (task->state == TASK_BLOCKED) {
-					task->state = TASK_READY;
+				if (sched_claim_wake(task, TASK_BLOCKED)) {
 					task->wait_channel = NULL;
 					task->wakeup_tick = 0;
 					wake_list[wake_count] = task;

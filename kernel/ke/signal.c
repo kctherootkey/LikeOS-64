@@ -237,10 +237,14 @@ int signal_send(task_t *task, int sig, siginfo_t *info)
 	if (task->state == TASK_BLOCKED) {
 		if (sig_kernel_only(sig) ||
 		    !sigismember_k(&sigstate->blocked, sig)) {
-			task->state = TASK_READY;
-			task->wait_channel = NULL;
-			task->wakeup_tick = 0;
-			sched_enqueue_ready(task);
+			/* Atomic BLOCKED->READY claim: other wakers (futex,
+			 * sleep timeout) run under different locks and could
+			 * otherwise claim + enqueue the same task twice. */
+			if (sched_claim_wake(task, TASK_BLOCKED)) {
+				task->wait_channel = NULL;
+				task->wakeup_tick = 0;
+				sched_enqueue_ready(task);
+			}
 		}
 	}
 

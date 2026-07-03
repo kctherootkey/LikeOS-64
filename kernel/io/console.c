@@ -80,6 +80,7 @@ static uint32_t cursor_last_y = 0; // Last cursor Y position
 
 // Batch output mode: suppresses cursor updates and rate-limits VRAM flushes
 static volatile int g_console_batch_active = 0;
+static void console_flush_unless_batch(void);
 static uint64_t g_last_flush_tick = 0;
 #define CONSOLE_FLUSH_INTERVAL \
 	2 // Min ticks between VRAM flushes (~20ms at 100Hz = 50fps)
@@ -907,7 +908,7 @@ void console_clear(void)
 		// Use optimized fill operation - only clear text area
 		fb_fill_rect(0, 0, text_area_width,
 			     fb_info->vertical_resolution, bg_color);
-		fb_flush_dirty_regions(); // Immediately update the screen
+		console_flush_unless_batch(); // Immediately update the screen
 	} else {
 		// Fallback to direct framebuffer access
 		uint32_t *framebuffer = (uint32_t *)fb_info->framebuffer_base;
@@ -1024,7 +1025,7 @@ void console_erase_display(int mode)
 		fb_fill_rect(0, y, x, CHAR_HEIGHT, bg_color);
 	}
 
-	fb_flush_dirty_regions();
+	console_flush_unless_batch();
 	g_sb.at_bottom = 1;
 
 	spin_unlock_irqrestore(&console_lock, flags);
@@ -1078,7 +1079,7 @@ void console_erase_line(int mode)
 		fb_fill_rect(0, y, x, CHAR_HEIGHT, bg_color);
 	}
 
-	fb_flush_dirty_regions();
+	console_flush_unless_batch();
 
 	spin_unlock_irqrestore(&console_lock, flags);
 }
@@ -1101,6 +1102,18 @@ static uint32_t console_text_width_pixels(void)
 
 /* Scroll a rectangular region [top..bot] (rows, inclusive) up by N rows.
  * Top N rows of the region are discarded; bottom N rows become blank.    */
+/* Flush to VRAM unless a tty output batch is active — console_batch_end()
+ * flushes once for the whole burst.  The VT-sequence handlers below used to
+ * flush unconditionally, so EVERY scrolled/erased line inside a write() paid
+ * a full dirty-region VRAM push (~5-10 ms): an `ls` listing cost ~130 ms per
+ * write and a tmux startup (scroll regions + full-screen setup through the
+ * pty) took seconds. */
+static void console_flush_unless_batch(void)
+{
+	if (!g_console_batch_active)
+		fb_flush_dirty_regions();
+}
+
 void console_scroll_region_up(int n, int top, int bot)
 {
 	if (!fb_info || !fb_info->framebuffer_base)
@@ -1136,7 +1149,7 @@ void console_scroll_region_up(int n, int top, int bot)
 		     text_w, (uint32_t)n * CHAR_HEIGHT, bg_color);
 
 	mouse_show_cursor_noflush(1);
-	fb_flush_dirty_regions();
+	console_flush_unless_batch();
 	spin_unlock_irqrestore(&console_lock, flags);
 }
 
@@ -1176,7 +1189,7 @@ void console_scroll_region_down(int n, int top, int bot)
 		     (uint32_t)n * CHAR_HEIGHT, bg_color);
 
 	mouse_show_cursor_noflush(1);
-	fb_flush_dirty_regions();
+	console_flush_unless_batch();
 	spin_unlock_irqrestore(&console_lock, flags);
 }
 
@@ -1228,7 +1241,7 @@ void console_insert_chars(int n)
 	}
 	fb_fill_rect(x, y, shift, CHAR_HEIGHT, bg_color);
 
-	fb_flush_dirty_regions();
+	console_flush_unless_batch();
 	spin_unlock_irqrestore(&console_lock, flags);
 }
 
@@ -1261,7 +1274,7 @@ void console_delete_chars(int n)
 		fb_fill_rect(text_w - shift, y, shift, CHAR_HEIGHT, bg_color);
 	}
 
-	fb_flush_dirty_regions();
+	console_flush_unless_batch();
 	spin_unlock_irqrestore(&console_lock, flags);
 }
 
@@ -1285,7 +1298,7 @@ void console_erase_chars(int n)
 	uint32_t x = cursor_x * CHAR_WIDTH;
 	fb_fill_rect(x, y, (uint32_t)n * CHAR_WIDTH, CHAR_HEIGHT, bg_color);
 
-	fb_flush_dirty_regions();
+	console_flush_unless_batch();
 	spin_unlock_irqrestore(&console_lock, flags);
 }
 

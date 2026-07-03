@@ -3,9 +3,15 @@
 
 #include <stddef.h>
 
-/* Environment storage limits */
+/* Environment storage limits.
+ * MAX_ENV_SIZE is the cap for ONE "NAME" or "value" string.  It was 4096,
+ * which made libc's static env_names/env_values arrays (and execv's
+ * conversion buffer) total ~2 MB of BSS — eagerly zero-faulted into every
+ * process at exec, dominating process-start time.  The kernel caps the whole
+ * environment at 16 KB total (copy_user_string_array), so 512 per string is
+ * still generous. */
 #define MAX_ENV_VARS 128
-#define MAX_ENV_SIZE 4096
+#define MAX_ENV_SIZE 512
 
 /* Multibyte character maximum - single-byte locale only */
 #define MB_CUR_MAX  1

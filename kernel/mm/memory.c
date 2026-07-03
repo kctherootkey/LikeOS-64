@@ -2741,8 +2741,13 @@ bool mm_map_user_stack(uint64_t *pml4, uint64_t stack_top, size_t stack_size)
 			return false;
 		}
 
-		// Zero the stack page via direct map
+		/* No memset in production: mm_allocate_physical_page already
+		 * zeroed the page (re-zeroing the 2 MB stack cost ~1 ms per
+		 * exec).  DEBUG builds poison on alloc, so zero explicitly —
+		 * the user stack must not leak poison patterns. */
+#if DEBUG
 		mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
+#endif
 
 		// Map with user, writable, non-executable flags (stack should not be executable)
 		uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
