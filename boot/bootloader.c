@@ -84,6 +84,7 @@ typedef struct {
     uint64_t rsdp_address;        // ACPI RSDP physical address from UEFI
     uint64_t smp_trampoline_addr; // Reserved SMP AP trampoline address (4KB aligned, < 1MB)
     uint64_t boot_epoch;          // Unix epoch seconds at boot (from UEFI GetTime before ExitBootServices)
+    uint64_t direct_map_bytes;    // Bytes of physical RAM covered by the PML4[272] direct map
 } boot_info_t;
 
 // Global boot info to pass to kernel
@@ -111,7 +112,14 @@ static EFI_PHYSICAL_ADDRESS g_pdpt_high_addr = 0;
 static EFI_PHYSICAL_ADDRESS g_pd_high_addr = 0;
 static EFI_PHYSICAL_ADDRESS g_pt_high_addr = 0;
 static EFI_PHYSICAL_ADDRESS g_pdpt_physmap_addr = 0;
-static EFI_PHYSICAL_ADDRESS g_pd_physmap_addr[16] = {0}; // 16 page directories for physmap (16GB)
+// Direct map ("physmap") page directories.  One PD maps 1 GB, so the array is
+// sized for the theoretical max of a single PML4 slot (512 * 1 GB = 512 GB).
+// The number actually allocated/filled is g_num_physmap_pds, computed at boot
+// from the real memory map — see detect_physmap_size().
+#define PHYSMAP_MAX_PDS 512
+#define PHYSMAP_MIN_PDS 16 // floor: keep <=16 GB MMIO/framebuffer covered
+static EFI_PHYSICAL_ADDRESS g_pd_physmap_addr[PHYSMAP_MAX_PDS] = {0};
+static UINTN g_num_physmap_pds = PHYSMAP_MIN_PDS; // GB of RAM the direct map covers
 
 // Trampoline address (will be allocated below kernel)
 static EFI_PHYSICAL_ADDRESS trampoline_addr = 0;
@@ -298,7 +306,76 @@ static const char* efi_memory_type_name(UINT32 type) {
 // We'll allocate a contiguous block from UEFI in low memory during init
 static EFI_PHYSICAL_ADDRESS pt_pool_base = 0;
 static EFI_PHYSICAL_ADDRESS pt_pool_next = 0;
-static UINTN pt_pool_pages = 128;  // 128 pages = 512KB for page tables (increased for all initial tables)
+// Pool sizing: the fixed tables (PML4, low/high PDPT+PD+PT, physmap PDPT) plus
+// dynamic kernel PTs need well under 112 pages; the physmap PDs add one page
+// per GB mapped.  112 + g_num_physmap_pds reproduces the historical 128-page
+// pool exactly at the 16-PD floor and scales up with RAM.  Set in
+// detect_physmap_size(), consumed by init_page_table_pool().
+static UINTN pt_pool_pages = 128;
+
+// Round a byte count up to whole GiB, i.e. the number of 1 GB physmap PDs
+// needed to cover it.
+#define BYTES_TO_GB_CEIL(b) (((b) + (1024ULL*1024*1024) - 1) / (1024ULL*1024*1024))
+
+// Walk the UEFI memory map to find the highest usable physical address, and
+// from it decide how many 1 GB direct-map page directories to build.  Clamped
+// to [PHYSMAP_MIN_PDS, PHYSMAP_MAX_PDS]: the floor keeps small-RAM machines'
+// MMIO/framebuffer (typically < 16 GB) covered, the ceiling is one PML4 slot
+// (512 GB).  Must run before init_page_table_pool so the pool is sized to fit
+// the resulting PDs.  On any failure we keep the safe default (16 PDs).
+static void detect_physmap_size(void) {
+    UINTN map_size = 0, map_key, desc_size;
+    UINT32 desc_ver;
+    EFI_MEMORY_DESCRIPTOR *map = NULL;
+
+    EFI_STATUS status = uefi_call_wrapper(BS->GetMemoryMap, 5, &map_size, map,
+                                          &map_key, &desc_size, &desc_ver);
+    if (status != EFI_BUFFER_TOO_SMALL)
+        return; // keep default 16 PDs
+    map_size += 4 * desc_size; // headroom: the pool alloc below grows the map
+    status = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData, map_size,
+                               (VOID**)&map);
+    if (EFI_ERROR(status))
+        return;
+    status = uefi_call_wrapper(BS->GetMemoryMap, 5, &map_size, map, &map_key,
+                               &desc_size, &desc_ver);
+    if (EFI_ERROR(status)) {
+        uefi_call_wrapper(BS->FreePool, 1, map);
+        return;
+    }
+
+    UINT64 highest_usable_end = 0;
+    UINTN entries = map_size / desc_size;
+    for (UINTN i = 0; i < entries; i++) {
+        EFI_MEMORY_DESCRIPTOR *d =
+            (EFI_MEMORY_DESCRIPTOR*)((UINT8*)map + i * desc_size);
+        // Only conventional/usable RAM extends the direct map; MMIO/reserved
+        // holes above RAM are handled by the kernel's separate MMIO mapper.
+        int usable = (d->Type == EfiConventionalMemory ||
+                      d->Type == EfiLoaderCode || d->Type == EfiLoaderData ||
+                      d->Type == EfiBootServicesCode ||
+                      d->Type == EfiBootServicesData);
+        if (!usable)
+            continue;
+        UINT64 end = d->PhysicalStart + d->NumberOfPages * 4096ULL;
+        if (end > highest_usable_end)
+            highest_usable_end = end;
+    }
+    uefi_call_wrapper(BS->FreePool, 1, map);
+
+    UINTN pds = (UINTN)BYTES_TO_GB_CEIL(highest_usable_end);
+    if (pds < PHYSMAP_MIN_PDS)
+        pds = PHYSMAP_MIN_PDS;
+    if (pds > PHYSMAP_MAX_PDS)
+        pds = PHYSMAP_MAX_PDS;
+    g_num_physmap_pds = pds;
+
+    // Size the page-table pool to fit these PDs plus all the fixed tables.
+    pt_pool_pages = 112 + g_num_physmap_pds;
+
+    Print(L"Direct map: %lu GB usable RAM detected -> %lu physmap PD(s)\r\n",
+          (UINT64)BYTES_TO_GB_CEIL(highest_usable_end), (UINT64)g_num_physmap_pds);
+}
 
 static EFI_STATUS init_page_table_pool(void) {
     // Allocate page table pool in low memory (below 1MB to be safe)
@@ -357,6 +434,10 @@ static EFI_PHYSICAL_ADDRESS allocate_page_table(void) {
 
 // Allocate all initial page tables from the pool
 static EFI_STATUS init_page_tables(void) {
+    // Size the direct map to actual RAM before the pool is allocated, so the
+    // pool is big enough to hold the physmap page directories.
+    detect_physmap_size();
+
     // First allocate the pool
     EFI_STATUS status = init_page_table_pool();
     if (EFI_ERROR(status)) {
@@ -390,9 +471,10 @@ static EFI_STATUS init_page_tables(void) {
     // Allocate physmap page tables
     g_pdpt_physmap_addr = allocate_page_table();
     if (!g_pdpt_physmap_addr) return EFI_OUT_OF_RESOURCES;
-    
-    // Allocate 16 page directories for physmap (16GB)
-    for (int i = 0; i < 16; i++) {
+
+    // Allocate one page directory per GB of direct map (g_num_physmap_pds,
+    // sized to actual RAM by detect_physmap_size()).
+    for (UINTN i = 0; i < g_num_physmap_pds; i++) {
         g_pd_physmap_addr[i] = allocate_page_table();
         if (!g_pd_physmap_addr[i]) return EFI_OUT_OF_RESOURCES;
     }
@@ -405,7 +487,9 @@ static EFI_STATUS init_page_tables(void) {
     Print(L"  PD (high):    0x%lx\r\n", g_pd_high_addr);
     Print(L"  PT (high):    0x%lx\r\n", g_pt_high_addr);
     Print(L"  PDPT (phys):  0x%lx\r\n", g_pdpt_physmap_addr);
-    Print(L"  PD (phys):    0x%lx - 0x%lx\r\n", g_pd_physmap_addr[0], g_pd_physmap_addr[15]);
+    Print(L"  PD (phys):    0x%lx - 0x%lx (%lu PD(s))\r\n",
+          g_pd_physmap_addr[0], g_pd_physmap_addr[g_num_physmap_pds - 1],
+          (UINT64)g_num_physmap_pds);
     
     serial_puts("Page tables allocated:\n");
     serial_puts("  PML4:       "); serial_puthex(g_pml4_addr); serial_puts("\n");
@@ -627,10 +711,7 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
         UINT64 pd_entry_index = pd_index + pt_i;
         if (pd_entry_index < 512) {
             pd_high->entries[pd_entry_index] = pt_phys_addr | PAGE_RWX;
-            
-            Print(L"Page table %lu allocated at 0x%lx, mapped to PD[%lu]\r\n", 
-                  pt_i, pt_phys_addr, pd_entry_index);
-            
+
             // Get pointer to the new page table
             page_table_t *current_pt = (page_table_t*)pt_phys_addr;
             
@@ -675,34 +756,35 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
     
     // ===================================================================
     // Set up DIRECT MAP region at PHYS_MAP_BASE = 0xFFFF880000000000
-    // This maps physical memory 0-16GB to virtual 0xFFFF880000000000-0xFFFF880400000000
+    // Maps physical memory 0 .. g_num_physmap_pds GB (sized to actual RAM by
+    // detect_physmap_size()) at virt 0xFFFF880000000000+, using 2MB pages.
     // PML4 index 272 = (0xFFFF880000000000 >> 39) & 0x1FF
     // ===================================================================
     {
         page_table_t *pdpt_physmap = (page_table_t*)g_pdpt_physmap_addr;
-        
+
         // Clear the PDPT for direct map
         for (int i = 0; i < 512; i++) {
             pdpt_physmap->entries[i] = 0;
         }
-        
+
         // Set up PML4 entry 272 to point to direct map PDPT
         pml4->entries[272] = g_pdpt_physmap_addr | PAGE_RWX;
-        
-        // Map first 16GB of physical memory using 2MB pages
-        for (int pdpt_i = 0; pdpt_i < 16; pdpt_i++) {
+
+        // Map one 1GB region per allocated physmap PD.
+        for (UINTN pdpt_i = 0; pdpt_i < g_num_physmap_pds; pdpt_i++) {
             // Use pre-allocated page directory for this 1GB region
             EFI_PHYSICAL_ADDRESS pd_addr = g_pd_physmap_addr[pdpt_i];
             page_table_t *pd = (page_table_t*)pd_addr;
-            
+
             // Clear page directory
             for (int i = 0; i < 512; i++) {
                 pd->entries[i] = 0;
             }
-            
+
             // Set PDPT entry to point to this page directory (supervisor-only, RWX)
             pdpt_physmap->entries[pdpt_i] = pd_addr | PAGE_RWX;
-            
+
             // Map each 2MB page in this 1GB region
             for (int pd_i = 0; pd_i < 512; pd_i++) {
                 UINT64 phys_addr = (UINT64)pdpt_i * 0x40000000ULL + (UINT64)pd_i * 0x200000ULL;
@@ -710,8 +792,14 @@ static void setup_higher_half_paging(UINT64 kernel_phys_addr, UINT64 kernel_size
                 pd->entries[pd_i] = phys_addr | PAGE_RWX | PAGE_SIZE;
             }
         }
-        
-        Print(L"  Direct map: 0xFFFF880000000000 -> phys 0x0 (16GB, 2MB pages)\r\n");
+
+        // Record the covered extent for the kernel so it can size its managed
+        // memory to exactly what is mapped, independent of the 16GB legacy cap.
+        g_boot_info.direct_map_bytes =
+            (UINT64)g_num_physmap_pds * 0x40000000ULL;
+
+        Print(L"  Direct map: 0xFFFF880000000000 -> phys 0x0 (%lu GB, 2MB pages)\r\n",
+              (UINT64)g_num_physmap_pds);
     }
     
     Print(L"Higher half paging configured:\r\n");

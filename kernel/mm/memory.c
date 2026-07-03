@@ -591,12 +591,21 @@ static void reserve_uefi_memory_regions(void)
 
 // Initialize memory manager with UEFI memory map from boot_info
 // This should be called before mm_initialize_physical_memory if boot_info is available
+/* Bytes of physical RAM the bootloader's PML4[272] direct map covers.  Set
+ * from boot_info; phys_to_virt() is only valid below this, so the physical
+ * allocator must not manage memory past it.  Defaults to the historical 16 GB
+ * for a legacy bootloader that does not report the field (direct_map_bytes==0). */
+static uint64_t g_direct_map_limit = 16ULL * 1024 * 1024 * 1024;
+
 void mm_initialize_from_boot_info(boot_info_t *boot_info)
 {
 	if (!boot_info) {
 		kprintf("WARNING: No boot_info provided, UEFI memory map not available\n");
 		return;
 	}
+
+	if (boot_info->direct_map_bytes != 0)
+		g_direct_map_limit = boot_info->direct_map_bytes;
 
 	// Copy the memory map to our static storage
 	g_uefi_memory_map.entry_count = boot_info->mem_info.entry_count;
@@ -732,17 +741,19 @@ void mm_initialize_physical_memory(uint64_t memory_size)
 		pt_pool_phys_start, mm_state.memory_start, pt_pool_size,
 		pt_pool_size_bytes / (1024 * 1024));
 
-// End of managed memory is total RAM, but limited to what the direct map covers
-// The bootloader sets up a 16GB direct map (phys 0 - 16GB at virt 0xFFFF880000000000)
-// We cannot allocate physical pages beyond this because phys_to_virt() won't work
-#define DIRECT_MAP_LIMIT (16ULL * 1024 * 1024 * 1024) // 16GB
+	// End of managed memory is total RAM, but limited to what the direct map
+	// covers: phys_to_virt() only works below g_direct_map_limit, which the
+	// bootloader sized to actual RAM (see detect_physmap_size()).  On matching
+	// bootloader+kernel this clamp never fires; it remains as a safety net (and
+	// for a legacy bootloader that reports no extent, defaulting to 16 GB).
 	mm_state.memory_end = memory_size;
-	if (mm_state.memory_end > DIRECT_MAP_LIMIT) {
-		kprintf("  NOTE: Limiting managed memory to 16GB (direct map limit)\n");
+	if (mm_state.memory_end > g_direct_map_limit) {
+		kprintf("  NOTE: Limiting managed memory to %lu MB (direct map limit)\n",
+			g_direct_map_limit / (1024 * 1024));
 		kprintf("  System has %lu MB but only %lu MB is usable\n",
 			memory_size / (1024 * 1024),
-			DIRECT_MAP_LIMIT / (1024 * 1024));
-		mm_state.memory_end = DIRECT_MAP_LIMIT;
+			g_direct_map_limit / (1024 * 1024));
+		mm_state.memory_end = g_direct_map_limit;
 	}
 
 	// Sanity check

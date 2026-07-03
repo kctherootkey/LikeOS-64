@@ -151,6 +151,8 @@ typedef struct {
 		smp_trampoline_addr; // Reserved SMP AP trampoline address (4KB aligned, < 1MB)
 	uint64_t
 		boot_epoch; // Unix epoch seconds at boot (from UEFI GetTime before ExitBootServices)
+	uint64_t
+		direct_map_bytes; // Bytes of physical RAM covered by the PML4[272] direct map (0 = legacy bootloader, assume 16 GB)
 } boot_info_t;
 
 // Memory regions
