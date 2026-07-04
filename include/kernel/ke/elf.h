@@ -328,8 +328,9 @@ typedef struct {
 	// Followed by: uint32_t chain[] (for each symbol starting at symoffset)
 } Elf64_GNU_Hash_Header;
 
-// Forward declaration for task
+// Forward declarations
 struct task;
+struct vfs_file;
 
 // ELF loader result structure
 typedef struct {
@@ -346,17 +347,23 @@ typedef struct {
 	int has_interp; // Whether PT_INTERP was found
 	int is_dynamic; // Whether this is ET_DYN
 
-	/* Demand paging: page ranges the loader deliberately left unmapped
-	 * (BSS pages with no file bytes).  The caller registers these as
-	 * lazy anonymous regions on the task so the fault handler zero-fills
-	 * them on first touch. */
-#define ELF_MAX_LAZY_REGIONS 8
+	/* Demand paging: page ranges the loader deliberately left unmapped.
+	 * file_idx == 0: anonymous (BSS) — zero-filled on first touch.
+	 * file_idx == 1: backed by backing[0] (the executable) at file_off.
+	 * file_idx == 2: backed by backing[1] (the interpreter) at file_off.
+	 * The caller registers these as lazy regions on the task (taking a
+	 * vfs reference per file-backed region) and then closes backing[].
+	 * The fault handler zero-fills / pages-in on first touch. */
+#define ELF_MAX_LAZY_REGIONS 16
 	struct {
 		uint64_t start;
 		uint64_t length;
 		uint64_t prot; // PROT_* protection
+		uint64_t file_off; // file offset of first page (file-backed)
+		uint8_t file_idx; // 0 = anon, 1/2 = backing[idx-1]
 	} lazy_regions[ELF_MAX_LAZY_REGIONS];
 	int num_lazy_regions;
+	struct vfs_file *backing[2]; // open exec / interp files (loader-owned)
 } elf_load_result_t;
 
 // Function prototypes
@@ -373,6 +380,13 @@ int elf_validate(const void *data, size_t size);
 // Returns 0 on success, negative error code on failure
 int elf_load_user(const void *elf_data, size_t elf_size, uint64_t *pml4,
 		  elf_load_result_t *result);
+
+/* Demand-paged variant: reads only ehdr+phdrs from `file`; non-writable
+ * segments become file-backed lazy regions tagged `file_idx` in
+ * result->lazy_regions.  base_override: ~0ULL = auto. */
+int elf_load_user_file(struct vfs_file *file, uint64_t *pml4,
+		       uint64_t base_override, int file_idx,
+		       elf_load_result_t *result);
 
 // Execute an ELF file from the filesystem
 // Parameters:

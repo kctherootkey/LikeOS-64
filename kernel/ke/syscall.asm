@@ -126,6 +126,15 @@ syscall_entry:
     mov rbp, rsp                               ; RBP = top of our saved register area
 
     and rsp, ~0xF
+    ; Pass the user's 6th syscall argument (original r9, saved at [rbp+40] per
+    ; the stack layout documented in the return path) as the 7th C argument on
+    ; the stack.  Needed for mmap's `offset`; the register shuffle above only
+    ; delivers a1..a5 in registers.  Keep 16-byte alignment: after `sub 8`
+    ; then `push`, rsp is 16-aligned at the `call`.  The pushed value is
+    ; discarded by the `mov rsp, rbp` on every return path.
+    mov rax, [rbp + 40]                        ; user arg6 (saved r9)
+    sub rsp, 8
+    push rax                                   ; C 7th arg (a6) at [rsp]
     ; NOTE: Interrupts remain DISABLED here. syscall_handler will enable them
     ; AFTER copying per-CPU values to task-local storage (to prevent race condition
     ; where another task overwrites our per-CPU data before we read it).

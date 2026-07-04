@@ -789,58 +789,60 @@ static uint64_t g_lib_mmap_base = 0x7F0001000000ULL;
 
 static dso_t *rtld_load_library(const char *name);
 
+/* Seek+read helper for the header-only load path. */
+static int rtld_pread(int fd, void *buf, size_t n, long off)
+{
+	if (rtld_lseek(fd, off, SEEK_SET) != off)
+		return -1;
+	uint8_t *dst = (uint8_t *)buf;
+	size_t rem = n;
+	while (rem) {
+		long r = rtld_read(fd, dst, rem);
+		if (r <= 0)
+			return -1;
+		dst += r;
+		rem -= (size_t)r;
+	}
+	return 0;
+}
+
 static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 {
 	int fd = rtld_open(path, O_RDONLY);
 	if (fd < 0)
 		return NULL;
 
-	/* Get file size and read entire file at once — avoids repeated seek+read syscalls */
+	/* Demand paging: read ONLY the ELF header and program headers.
+	 * Read-only/executable segments are mapped straight from the file
+	 * (MAP_PRIVATE, kernel pages them in on first touch), so a library's
+	 * text costs neither disk reads nor memory until it is executed. */
 	long file_size = rtld_lseek(fd, 0, SEEK_END);
-	if (file_size <= 0 || file_size > 64 * 1024 * 1024)
-		goto fail;
-	rtld_lseek(fd, 0, SEEK_SET);
-
-	void *file_buf =
-		rtld_mmap(NULL, (size_t)file_size, PROT_READ | PROT_WRITE,
-			  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (file_buf == MAP_FAILED)
+	if (file_size <= (long)sizeof(Elf64_Ehdr) ||
+	    file_size > 64 * 1024 * 1024)
 		goto fail;
 
-	/* Read entire file in one call */
-	{
-		uint8_t *dst = (uint8_t *)file_buf;
-		size_t rem = (size_t)file_size;
-		while (rem) {
-			long r = rtld_read(fd, dst, rem);
-			if (r <= 0) {
-				rtld_munmap(file_buf, (size_t)file_size);
-				goto fail;
-			}
-			dst += r;
-			rem -= r;
-		}
-	}
-	rtld_close(fd);
-	fd = -1;
-
-	const uint8_t *fb = (const uint8_t *)file_buf;
-	Elf64_Ehdr *ehdr = (Elf64_Ehdr *)fb;
-	if ((size_t)file_size < sizeof(Elf64_Ehdr) ||
-	    ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
+	Elf64_Ehdr ehdr_buf;
+	Elf64_Ehdr *ehdr = &ehdr_buf;
+	if (rtld_pread(fd, &ehdr_buf, sizeof(ehdr_buf), 0) != 0)
+		goto fail;
+	if (ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
 	    ehdr->e_ident[2] != 'L' || ehdr->e_ident[3] != 'F' ||
 	    ehdr->e_type != ET_DYN) {
-		rtld_munmap(file_buf, (size_t)file_size);
-		return NULL;
+		goto fail;
 	}
 
-	Elf64_Phdr *phdrs = (Elf64_Phdr *)(fb + ehdr->e_phoff);
+	static Elf64_Phdr phdr_buf[64];
+	Elf64_Phdr *phdrs = phdr_buf;
 	if (ehdr->e_phnum > 64 ||
+	    ehdr->e_phentsize != sizeof(Elf64_Phdr) ||
 	    ehdr->e_phoff + (size_t)ehdr->e_phnum * ehdr->e_phentsize >
 		    (size_t)file_size) {
-		rtld_munmap(file_buf, (size_t)file_size);
-		return NULL;
+		goto fail;
 	}
+	if (rtld_pread(fd, phdr_buf,
+		       (size_t)ehdr->e_phnum * sizeof(Elf64_Phdr),
+		       (long)ehdr->e_phoff) != 0)
+		goto fail;
 
 	/* Total memory span */
 	uint64_t lo = ~0ULL, hi = 0;
@@ -855,10 +857,8 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 		if (e > hi)
 			hi = e;
 	}
-	if (lo >= hi) {
-		rtld_munmap(file_buf, (size_t)file_size);
-		return NULL;
-	}
+	if (lo >= hi)
+		goto fail;
 	uint64_t span = hi - lo;
 
 	/* Reserve address space */
@@ -871,7 +871,20 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 	d->map_base = map;
 	d->map_size = span;
 
-	/* Map each PT_LOAD — copy from in-memory file buffer (zero syscalls) */
+	/* Map each PT_LOAD.
+	 *
+	 * Read-only / executable segments with page-congruent file offsets
+	 * are mapped DIRECTLY from the file (MAP_PRIVATE|MAP_FIXED with fd):
+	 * the kernel registers a lazy file-backed region and pages text in
+	 * on first execution — no read of the segment happens here at all.
+	 * The mapping pins the file in the kernel, so closing fd below is
+	 * safe.
+	 *
+	 * Writable segments (.data — small) are mapped anonymous (lazy
+	 * zero-fill) and their file bytes read in eagerly: relocations
+	 * touch essentially all of .data anyway, so laziness buys nothing
+	 * and the eager read keeps kernel-write-under-lock faults out of
+	 * the picture. */
 	for (int i = 0; i < ehdr->e_phnum; i++) {
 		if (phdrs[i].p_type != PT_LOAD)
 			continue;
@@ -889,24 +902,50 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 		if (phdrs[i].p_flags & PF_X)
 			prot |= PROT_EXEC;
 
+		int congruent = ((phdrs[i].p_offset & 0xFFFULL) ==
+				 (phdrs[i].p_vaddr & 0xFFFULL));
+
+		if (!(prot & PROT_WRITE) && congruent &&
+		    phdrs[i].p_filesz > 0) {
+			/* Demand-paged from the file. */
+			uint64_t fend = (va + phdrs[i].p_filesz + 0xFFFULL) &
+					~0xFFFULL;
+			long foff = (long)(phdrs[i].p_offset -
+					   (phdrs[i].p_vaddr & 0xFFFULL));
+			void *m = rtld_mmap((void *)alv, fend - alv, prot,
+					    MAP_PRIVATE | MAP_FIXED, fd, foff);
+			if (m == MAP_FAILED)
+				goto fail;
+			/* Rare RO-BSS tail beyond the file bytes. */
+			if (end > fend) {
+				m = rtld_mmap((void *)fend, end - fend, prot,
+					      MAP_PRIVATE | MAP_ANONYMOUS |
+						      MAP_FIXED,
+					      -1, 0);
+				if (m == MAP_FAILED)
+					goto fail;
+			}
+			continue;
+		}
+
 		void *m = rtld_mmap((void *)alv, len, PROT_READ | PROT_WRITE,
 				    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1,
 				    0);
-		if (m == MAP_FAILED) {
-			rtld_munmap(file_buf, (size_t)file_size);
-			return NULL;
-		}
+		if (m == MAP_FAILED)
+			goto fail;
 
 		if (phdrs[i].p_filesz) {
-			/* Direct memcpy from file buffer — no syscalls */
-			if (phdrs[i].p_offset + phdrs[i].p_filesz <=
-			    (uint64_t)file_size)
-				rtld_memcpy((void *)va, fb + phdrs[i].p_offset,
-					    phdrs[i].p_filesz);
+			if (phdrs[i].p_offset + phdrs[i].p_filesz >
+				    (uint64_t)file_size ||
+			    rtld_pread(fd, (void *)va, phdrs[i].p_filesz,
+				       (long)phdrs[i].p_offset) != 0)
+				goto fail;
 		}
 		if (!(prot & PROT_WRITE))
 			rtld_mprotect((void *)alv, len, prot);
 	}
+	rtld_close(fd);
+	fd = -1;
 
 	/* PT_DYNAMIC, PT_TLS */
 	for (int i = 0; i < ehdr->e_phnum; i++) {
@@ -921,9 +960,6 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 		}
 	}
 	d->phnum = ehdr->e_phnum;
-
-	/* Release file buffer — no longer needed */
-	rtld_munmap(file_buf, (size_t)file_size);
 
 	rtld_parse_dynamic(d);
 	rtld_assign_tls(d);

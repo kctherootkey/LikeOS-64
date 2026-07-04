@@ -1240,8 +1240,23 @@ void exception_handler(uint64_t *regs)
 		// Demand paging: not-present fault (err bit 0 clear) on a user
 		// address.  Like COW below, this fires from BOTH CPU modes —
 		// kernel code touches lazy user pages via copy_to_user etc.
+		//
+		// CRITICAL: the exception gate cleared IF.  File page-in
+		// sleeps on disk I/O (ext4 → USB, whose completions arrive by
+		// interrupt), so re-enable interrupts for the handler IF the
+		// interrupted context had them enabled (always true for
+		// user-mode faults).  A context that faulted with IRQs off
+		// (spinlock held) stays off — its faults can only be lazy
+		// zero-fill, which never sleeps.
 		if (!(err_code & 0x1) && cr2 < 0x8000000000000000ULL) {
-			if (mm_handle_demand_fault(cr2, !user_mode)) {
+			int irqs_were_on =
+				(regs[REGS_RFLAGS] & 0x200) != 0;
+			if (irqs_were_on)
+				__asm__ volatile("sti" ::: "memory");
+			int resolved = mm_handle_demand_fault(cr2, !user_mode);
+			if (irqs_were_on)
+				__asm__ volatile("cli" ::: "memory");
+			if (resolved) {
 				return;
 			}
 		}

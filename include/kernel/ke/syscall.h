@@ -383,7 +383,7 @@ typedef struct k_sysinfo {
 
 // Syscall handler prototype
 int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
-			uint64_t a4, uint64_t a5);
+			uint64_t a4, uint64_t a5, uint64_t a6);
 
 // ============================================================================
 // Process info structure for SYS_GETPROCINFO

@@ -1555,7 +1555,8 @@ void sched_remove_task(task_t *task)
 // ============================================================================
 
 int task_register_lazy_region(task_t *task, uint64_t start, uint64_t length,
-			      uint64_t prot)
+			      uint64_t prot, struct vfs_file *file,
+			      uint64_t offset)
 {
 	if (!task || !length)
 		return -1;
@@ -1568,13 +1569,13 @@ int task_register_lazy_region(task_t *task, uint64_t start, uint64_t length,
 		r->prot = prot;
 		r->flags = 0;
 		r->fd = -1;
-		r->offset = 0;
+		r->offset = offset;
 		r->lazy = true;
-		r->file = NULL;
+		r->file = file ? vfs_dup(file) : NULL;
 		r->in_use = true;
 		return 0;
 	}
-	WARN_ON_ONCE(1); /* mmap region table full — BSS range not lazy */
+	WARN_ON_ONCE(1); /* mmap region table full — lazy range dropped */
 	return -1;
 }
 

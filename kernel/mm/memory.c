@@ -3078,16 +3078,14 @@ int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode)
 
 	if (file) {
 		/* Page-in from the backing file.  This sleeps on disk I/O, so
-		 * it must only happen in process context with no FS locks
-		 * held.  User-mode faults always qualify; a kernel-mode fault
-		 * here means some user-copy site lacks its pre-fault shield —
-		 * warn so it can be found, then proceed (the common callers
-		 * are shielded, so this path indicates a missed one, not a
-		 * certain deadlock). */
-		WARN_RATELIMIT(
-			from_kernel_mode,
-			"demand fault: file page-in from kernel-mode fault at 0x%lx — missing prefault shield",
-			fault_addr);
+		 * it must only happen in process context with no FS/socket
+		 * locks held.  User-mode faults always qualify.  Kernel-mode
+		 * faults are routine as well (copy_from_user of argv/rodata
+		 * in lazy text segments, etc.) and equally safe when no such
+		 * locks are held — the read/write/send/recv entry points
+		 * pre-fault their buffers precisely so that lock-holding
+		 * copy loops never reach this path. */
+		(void)from_kernel_mode;
 		pagein_lock();
 		long saved = vfs_seek(file, 0, SEEK_CUR);
 		long got = 0;

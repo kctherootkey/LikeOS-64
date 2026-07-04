@@ -512,11 +512,14 @@ static inline task_t *task_mm_owner(task_t *t)
 	return (t && t->group_leader) ? t->group_leader : t;
 }
 
-/* Register a lazy (demand-paged) anonymous region on a task — used by the
- * ELF loader for BSS ranges.  Returns 0 on success, -1 if the region table
- * is full. */
+/* Register a lazy (demand-paged) region on a task — used by the ELF
+ * loader for BSS ranges (file == NULL: zero-fill) and for demand-paged
+ * executable/interpreter segments (file != NULL: page-in from `offset`).
+ * Takes its own vfs reference on `file`.  Returns 0 on success, -1 if
+ * the region table is full. */
 int task_register_lazy_region(task_t *task, uint64_t start, uint64_t length,
-			      uint64_t prot);
+			      uint64_t prot, struct vfs_file *file,
+			      uint64_t offset);
 
 // Preemptive scheduling API
 void sched_preempt(

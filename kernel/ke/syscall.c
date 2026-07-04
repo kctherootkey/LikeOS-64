@@ -6740,7 +6740,8 @@ __attribute__((noinline)) static int unix_do_recvmsg(int ufd,
 
 // Main syscall dispatcher (inner function)
 static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
-				     uint64_t a3, uint64_t a4, uint64_t a5)
+				     uint64_t a3, uint64_t a4, uint64_t a5,
+				     uint64_t a6)
 {
 	/* All syscalls run in process context with IRQs enabled — any path
      * that allocates, blocks on I/O, or sleeps must be reachable.  If
@@ -6764,9 +6765,7 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		return sys_lseek(a1, (int64_t)a2, a3);
 
 	case SYS_MMAP:
-		return sys_mmap(
-			a1, a2, a3, a4, a5,
-			0); // Note: 6th arg (offset) would need special handling
+		return sys_mmap(a1, a2, a3, a4, a5, a6);
 
 	case SYS_MUNMAP:
 		return sys_munmap(a1, a2);
@@ -8095,7 +8094,7 @@ dns_str_done:
 
 // Wrapper that handles signal delivery after syscall
 int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
-			uint64_t a4, uint64_t a5)
+			uint64_t a4, uint64_t a5, uint64_t a6)
 {
 	// CRITICAL: Interrupts are DISABLED when we enter (syscall_entry no longer does sti)
 	// This prevents a race where:
@@ -8128,7 +8127,7 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 	// NOW enable interrupts - per-CPU values are safely copied to task struct
 	__asm__ volatile("sti" ::: "memory");
 
-	int64_t ret = syscall_handler_inner(num, a1, a2, a3, a4, a5);
+	int64_t ret = syscall_handler_inner(num, a1, a2, a3, a4, a5, a6);
 
 	// Check for pending signals before returning to userspace.
 	// Skip for:

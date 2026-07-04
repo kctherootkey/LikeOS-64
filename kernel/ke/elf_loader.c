@@ -58,16 +58,43 @@ int elf_validate(const void *data, size_t size)
 // SEGMENT LOADER  (common for main binary & interpreter)
 // ============================================================================
 
+/* Read `len` bytes of the ELF image at `file_off` into `dst`.  Buffer mode
+ * (whole != NULL) copies from the in-memory image; file mode seeks + reads
+ * from the open backing file.  Caller has bounds-checked against elf_size. */
+static int elf_image_read(const uint8_t *whole, vfs_file_t *file,
+			  uint64_t file_off, void *dst, uint64_t len)
+{
+	if (whole) {
+		mm_memcpy(dst, whole + file_off, len);
+		return 0;
+	}
+	if (vfs_seek(file, (long)file_off, SEEK_SET) < 0)
+		return -1;
+	if (vfs_read(file, dst, (long)len) != (long)len)
+		return -1;
+	return 0;
+}
+
 // Load PT_LOAD segments of an ELF into *pml4* at the given base offset.
 // For ET_EXEC base_offset = 0 (absolute addresses in ELF).
 // For ET_DYN  base_offset shifts every p_vaddr.
-static int elf_load_segments(const void *elf_data, size_t elf_size,
-			     uint64_t *pml4, uint64_t base_offset,
-			     elf_load_result_t *result)
+//
+// Two source modes:
+//   whole != NULL — classic path: the entire image is in memory.
+//   file  != NULL — demand-paged path: only ehdr+phdrs are in memory;
+//     non-writable segments with page-congruent offsets are NOT loaded at
+//     all — they are recorded as file-backed lazy regions (tagged file_idx)
+//     and paged in from `file` on first touch.  Writable segments (small
+//     .data) are read eagerly; BSS stays lazy-anonymous as before.
+static int elf_load_segments_ex(const Elf64_Ehdr *ehdr,
+				const Elf64_Phdr *phdrs, const uint8_t *whole,
+				vfs_file_t *file, size_t elf_size,
+				uint64_t *pml4, uint64_t base_offset,
+				int file_idx, elf_load_result_t *result)
 {
-	BUG_ON(elf_data == NULL || pml4 == NULL || result == NULL);
-	const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)elf_data;
-	const uint8_t *elf_bytes = (const uint8_t *)elf_data;
+	BUG_ON(ehdr == NULL || phdrs == NULL || pml4 == NULL ||
+	       result == NULL);
+	BUG_ON(whole == NULL && file == NULL);
 
 	result->load_base = ~0ULL;
 	result->load_end = 0;
@@ -84,17 +111,17 @@ static int elf_load_segments(const void *elf_data, size_t elf_size,
 	// ---- First pass: PT_INTERP ----
 	for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
 		const Elf64_Phdr *ph =
-			(const Elf64_Phdr *)(elf_bytes + ehdr->e_phoff +
-					     i * ehdr->e_phentsize);
+			(const Elf64_Phdr *)((const uint8_t *)phdrs +
+					     (size_t)i * ehdr->e_phentsize);
 		if (ph->p_type == PT_INTERP && ph->p_filesz > 0 &&
 		    ph->p_filesz < 256 &&
 		    ph->p_offset + ph->p_filesz <= elf_size) {
 			size_t len = ph->p_filesz;
 			if (len > 255)
 				len = 255;
-			for (size_t j = 0; j < len; j++)
-				result->interp_path[j] =
-					(char)elf_bytes[ph->p_offset + j];
+			if (elf_image_read(whole, file, ph->p_offset,
+					   result->interp_path, len) != 0)
+				continue;
 			result->interp_path[len] = '\0';
 			// Trim trailing NUL that the ELF may include in p_filesz
 			while (len > 0 && result->interp_path[len - 1] == '\0')
@@ -106,8 +133,8 @@ static int elf_load_segments(const void *elf_data, size_t elf_size,
 	// ---- Second pass: PT_LOAD + PT_PHDR ----
 	for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
 		const Elf64_Phdr *ph =
-			(const Elf64_Phdr *)(elf_bytes + ehdr->e_phoff +
-					     i * ehdr->e_phentsize);
+			(const Elf64_Phdr *)((const uint8_t *)phdrs +
+					     (size_t)i * ehdr->e_phentsize);
 
 		if (ph->p_type == PT_PHDR) {
 			result->phdr_addr = ph->p_vaddr + base_offset;
@@ -150,7 +177,37 @@ static int elf_load_segments(const void *elf_data, size_t elf_size,
 		uint64_t vaddr_start = seg_vaddr & ~0xFFFULL;
 		uint64_t vaddr_end = (seg_end + 0xFFF) & ~0xFFFULL;
 
-		for (uint64_t va = vaddr_start; va < vaddr_end;
+		/* Demand-paged executable text/rodata: in file mode, a
+		 * non-writable segment whose file offset is page-congruent
+		 * with its vaddr is not loaded here at all — the pages
+		 * containing its file bytes become a file-backed lazy region
+		 * and are paged in from disk on first touch.  Writable
+		 * segments (small .data) and non-congruent oddballs stay
+		 * eager.  Fall back to eager if the first page is already
+		 * mapped (an overlapping earlier segment owns it — the fault
+		 * handler would never fire for a present page). */
+		int lazy_file_seg = 0;
+		if (file && !(ph->p_flags & PF_W) && ph->p_filesz > 0 &&
+		    ((ph->p_offset & 0xFFFULL) == (ph->p_vaddr & 0xFFFULL)) &&
+		    result->num_lazy_regions < ELF_MAX_LAZY_REGIONS &&
+		    mm_get_physical_address_from_pml4(pml4, vaddr_start) == 0) {
+			uint64_t fend = (seg_vaddr + ph->p_filesz + 0xFFFULL) &
+					~0xFFFULL;
+			uint64_t rprot = PROT_READ;
+			if (ph->p_flags & PF_X)
+				rprot |= PROT_EXEC;
+			int n = result->num_lazy_regions++;
+			result->lazy_regions[n].start = vaddr_start;
+			result->lazy_regions[n].length = fend - vaddr_start;
+			result->lazy_regions[n].prot = rprot;
+			result->lazy_regions[n].file_off =
+				ph->p_offset - (ph->p_vaddr & 0xFFFULL);
+			result->lazy_regions[n].file_idx = (uint8_t)file_idx;
+			lazy_file_seg = 1;
+		}
+
+		for (uint64_t va = vaddr_start; lazy_file_seg == 0 &&
+						va < vaddr_end;
 		     va += PAGE_SIZE) {
 			// Copy window of file data that falls within this page.
 			// The segment occupies user addresses [seg_vaddr, seg_vaddr+p_filesz)
@@ -199,9 +256,11 @@ static int elf_load_segments(const void *elf_data, size_t elf_size,
 				uint64_t file_off =
 					ph->p_offset + (cpy_lo - seg_vaddr);
 				uint64_t len = cpy_hi - cpy_lo;
-				if (file_off + len <= elf_size)
-					mm_memcpy(page_ptr + dst_off,
-						  elf_bytes + file_off, len);
+				if (file_off + len <= elf_size &&
+				    elf_image_read(whole, file, file_off,
+						   page_ptr + dst_off,
+						   len) != 0)
+					return -13;
 			}
 		}
 
@@ -241,6 +300,67 @@ static int elf_load_segments(const void *elf_data, size_t elf_size,
 	return 0;
 }
 
+/* Classic whole-buffer wrapper (image fully in memory, nothing file-lazy). */
+static int elf_load_segments(const void *elf_data, size_t elf_size,
+			     uint64_t *pml4, uint64_t base_offset,
+			     elf_load_result_t *result)
+{
+	const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)elf_data;
+	const Elf64_Phdr *phdrs =
+		(const Elf64_Phdr *)((const uint8_t *)elf_data +
+				     ehdr->e_phoff);
+	return elf_load_segments_ex(ehdr, phdrs, (const uint8_t *)elf_data,
+				    NULL, elf_size, pml4, base_offset, 0,
+				    result);
+}
+
+/* Demand-paged ELF load: reads ONLY the ehdr + program headers from the
+ * file.  Non-writable segments become file-backed lazy regions (recorded
+ * in result->lazy_regions with the given file_idx tag) and are paged in
+ * on first touch; writable .data is read eagerly; BSS stays lazy-anon.
+ * The caller owns `file` and must keep it open until the lazy regions
+ * have been registered on the task (registration takes its own refs).
+ * base_override: ~0ULL = automatic (ET_DYN → 0x400000), else explicit. */
+int elf_load_user_file(vfs_file_t *file, uint64_t *pml4,
+		       uint64_t base_override, int file_idx,
+		       elf_load_result_t *result)
+{
+	if (!file || !pml4 || !result)
+		return -1;
+	size_t sz = vfs_size(file);
+	if (sz < sizeof(Elf64_Ehdr) || sz > 64 * 1024 * 1024)
+		return -2;
+
+	Elf64_Ehdr ehdr;
+	if (elf_image_read(NULL, file, 0, &ehdr, sizeof(ehdr)) != 0)
+		return -3;
+	int rc = elf_validate(&ehdr, sz); /* dereferences ehdr fields only */
+	if (rc != 0)
+		return rc;
+	if (ehdr.e_phentsize != sizeof(Elf64_Phdr) || ehdr.e_phnum > 64)
+		return -4;
+
+	size_t phbytes = (size_t)ehdr.e_phnum * ehdr.e_phentsize;
+	Elf64_Phdr *phdrs = (Elf64_Phdr *)kalloc(phbytes);
+	if (!phdrs)
+		return -5;
+	if (elf_image_read(NULL, file, ehdr.e_phoff, phdrs, phbytes) != 0) {
+		kfree(phdrs);
+		return -6;
+	}
+
+	uint64_t base = 0;
+	if (ehdr.e_type == ET_DYN)
+		base = (base_override != ~0ULL) ? base_override : 0x400000ULL;
+	else if (base_override != ~0ULL)
+		base = base_override;
+
+	rc = elf_load_segments_ex(&ehdr, phdrs, NULL, file, sz, pml4, base,
+				  file_idx, result);
+	kfree(phdrs);
+	return rc;
+}
+
 // ============================================================================
 // PUBLIC: elf_load_user
 // ============================================================================
@@ -275,56 +395,46 @@ static int elf_load_interp(const char *path, uint64_t *pml4,
 		kprintf("elf: cannot open interp '%s' (err %d)\n", path, ret);
 		return -1;
 	}
-	size_t sz = vfs_size(file);
-	if (sz == 0 || sz > 4 * 1024 * 1024) {
-		vfs_close(file);
-		return -2;
-	}
-
-	void *buf = kalloc(sz);
-	if (!buf) {
-		vfs_close(file);
-		return -3;
-	}
-
-	long rd = vfs_read(file, buf, sz);
-	vfs_close(file);
-	if (rd != (long)sz) {
-		kfree(buf);
-		return -4;
-	}
-
-	ret = elf_validate(buf, sz);
-	if (ret != 0) {
-		kfree(buf);
-		return ret;
-	}
-
-	const Elf64_Ehdr *eh = (const Elf64_Ehdr *)buf;
-	if (eh->e_type != ET_DYN) {
-		kfree(buf);
-		return -5;
-	}
 
 	uint64_t interp_base = 0x7F0000000000ULL; // High address, clear of app
 	elf_load_result_t ir;
 	mm_memset(&ir, 0, sizeof(ir));
-	ret = elf_load_segments(buf, sz, pml4, interp_base, &ir);
-	kfree(buf);
-	if (ret != 0)
+	/* Demand-paged: only ehdr+phdrs are read; the interpreter's text is
+	 * registered as file-backed lazy regions tagged file_idx 2. */
+	ret = elf_load_user_file(file, pml4, interp_base, 2, &ir);
+	if (ret != 0) {
+		vfs_close(file);
 		return ret;
+	}
+	if (!ir.is_dynamic) {
+		vfs_close(file);
+		return -5;
+	}
 
-	/* Propagate the interpreter's lazy BSS ranges into the main result
-	 * so the caller registers them alongside the executable's. */
+	/* Propagate the interpreter's lazy regions (file-backed text +
+	 * anon BSS) into the main result.  Ownership of the open interp
+	 * file transfers to main_result->backing[1]; the caller closes it
+	 * after registering the regions (registration takes its own refs). */
 	if (main_result) {
-		for (int i = 0; i < ir.num_lazy_regions &&
-				main_result->num_lazy_regions <
-					ELF_MAX_LAZY_REGIONS;
-		     i++) {
+		for (int i = 0; i < ir.num_lazy_regions; i++) {
+			if (main_result->num_lazy_regions >=
+			    ELF_MAX_LAZY_REGIONS) {
+				/* Dropping a FILE region would leave interp
+				 * text unmapped and unfixable — fail hard. */
+				WARN_ON(1);
+				vfs_close(file);
+				return -6;
+			}
 			main_result->lazy_regions
 				[main_result->num_lazy_regions++] =
 				ir.lazy_regions[i];
 		}
+		main_result->backing[1] = file;
+	} else {
+		/* No result to carry the lazy regions — the interp's demand-
+		 * paged text could never be registered or paged in. */
+		vfs_close(file);
+		return -7;
 	}
 
 	*out_entry = ir.entry_point;
@@ -536,39 +646,24 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 		return -1;
 	}
 
-	size_t sz = vfs_size(file);
-	if (sz == 0 || sz > 16 * 1024 * 1024) {
-		vfs_close(file);
-		return -2;
-	}
-
-	void *eb = kalloc(sz);
-	if (!eb) {
-		vfs_close(file);
-		return -3;
-	}
-
-	long rd = vfs_read(file, eb, sz);
-	vfs_close(file);
-	if (rd != (long)sz) {
-		kfree(eb);
-		return -4;
-	}
-
 	uint64_t *pml4 = mm_create_user_address_space();
 	if (!pml4) {
-		kfree(eb);
+		vfs_close(file);
 		return -5;
 	}
 
 	elf_load_result_t lr;
 	mm_memset(&lr, 0, sizeof(lr));
-	ret = elf_load_user(eb, sz, pml4, &lr);
-	kfree(eb);
+	/* Demand-paged exec: only ehdr+phdrs are read here.  Text/rodata
+	 * page in from the file on first touch; the file stays open, owned
+	 * by lr.backing[0] until the regions are registered on the task. */
+	ret = elf_load_user_file(file, pml4, ~0ULL, 1, &lr);
 	if (ret) {
+		vfs_close(file);
 		mm_destroy_address_space(pml4);
 		return -6;
 	}
+	lr.backing[0] = file;
 
 	uint64_t entry = lr.entry_point;
 	uint64_t ib = 0;
@@ -579,6 +674,7 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 		if (ret) {
 			kprintf("elf_exec: interp '%s' err %d\n",
 				lr.interp_path, ret);
+			vfs_close(lr.backing[0]);
 			mm_destroy_address_space(pml4);
 			return -6;
 		}
@@ -597,12 +693,18 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 	uint64_t sp = elf_setup_stack(pml4, USER_STACK_TOP, USER_STACK_SIZE,
 				      argv, envp, &lr, ib);
 	if (!sp) {
+		for (int b = 0; b < 2; b++)
+			if (lr.backing[b])
+				vfs_close(lr.backing[b]);
 		mm_destroy_address_space(pml4);
 		return -7;
 	}
 
 	task_t *t = sched_add_user_task((task_entry_t)entry, NULL, pml4, sp, 0);
 	if (!t) {
+		for (int b = 0; b < 2; b++)
+			if (lr.backing[b])
+				vfs_close(lr.backing[b]);
 		mm_destroy_address_space(pml4);
 		return -10;
 	}
@@ -612,12 +714,23 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 	t->user_stack_top = USER_STACK_TOP;
 	t->mmap_base = USER_STACK_TOP - (4 * 1024 * 1024);
 
-	/* Register the loader's unmapped BSS ranges (executable + interp) as
-	 * lazy anonymous regions — zero-filled on first touch. */
-	for (int i = 0; i < lr.num_lazy_regions; i++)
+	/* Register the loader's lazy ranges: anonymous BSS (zero-filled on
+	 * first touch) and demand-paged executable/interpreter segments
+	 * (paged in from their backing file).  Registration takes its own
+	 * vfs references, so release the loader's after. */
+	for (int i = 0; i < lr.num_lazy_regions; i++) {
+		vfs_file_t *bf =
+			lr.lazy_regions[i].file_idx ?
+				lr.backing[lr.lazy_regions[i].file_idx - 1] :
+				NULL;
 		task_register_lazy_region(t, lr.lazy_regions[i].start,
 					  lr.lazy_regions[i].length,
-					  lr.lazy_regions[i].prot);
+					  lr.lazy_regions[i].prot, bf,
+					  lr.lazy_regions[i].file_off);
+	}
+	for (int b = 0; b < 2; b++)
+		if (lr.backing[b])
+			vfs_close(lr.backing[b]);
 
 	/* Allocate per-process TLS page with random canary at fs:0x28.
      * This MUST happen before sched_enqueue_ready: on SMP an AP could
@@ -716,40 +829,24 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	if (ret || !file)
 		return 0;
 
-	size_t sz = vfs_size(file);
-	if (sz == 0 || sz > 16 * 1024 * 1024) {
-		vfs_close(file);
-		return 0;
-	}
-
-	void *eb = kalloc(sz);
-	if (!eb) {
-		vfs_close(file);
-		return 0;
-	}
-
-	long rd = vfs_read(file, eb, sz);
-	vfs_close(file);
-	if (rd != (long)sz) {
-		kfree(eb);
-		return 0;
-	}
-
 	uint64_t *old = cur->pml4;
 	uint64_t *pml4 = mm_create_user_address_space();
 	if (!pml4) {
-		kfree(eb);
+		vfs_close(file);
 		return 0;
 	}
 
 	elf_load_result_t lr;
 	mm_memset(&lr, 0, sizeof(lr));
-	ret = elf_load_user(eb, sz, pml4, &lr);
-	kfree(eb);
+	/* Demand-paged execve: only ehdr+phdrs are read; text/rodata page
+	 * in on first touch (see elf_exec). */
+	ret = elf_load_user_file(file, pml4, ~0ULL, 1, &lr);
 	if (ret) {
+		vfs_close(file);
 		mm_destroy_address_space(pml4);
 		return 0;
 	}
+	lr.backing[0] = file;
 
 	uint64_t entry = lr.entry_point;
 	uint64_t ib = 0;
@@ -758,6 +855,7 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 		uint64_t ie = 0;
 		ret = elf_load_interp(lr.interp_path, pml4, &ie, &ib, &lr);
 		if (ret) {
+			vfs_close(lr.backing[0]);
 			mm_destroy_address_space(pml4);
 			return 0;
 		}
@@ -774,6 +872,9 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 		elf_setup_stack(pml4, USER_STACK_TOP_EXEC, USER_STACK_SIZE_EXEC,
 				argv, envp, &lr, ib);
 	if (!sp) {
+		for (int b = 0; b < 2; b++)
+			if (lr.backing[b])
+				vfs_close(lr.backing[b]);
 		mm_destroy_address_space(pml4);
 		return 0;
 	}
@@ -797,11 +898,22 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	}
 	cur->mmap_base = USER_STACK_TOP_EXEC - (4 * 1024 * 1024);
 
-	/* Register the new image's lazy BSS ranges (executable + interp). */
-	for (int i = 0; i < lr.num_lazy_regions; i++)
+	/* Register the new image's lazy ranges (anon BSS + demand-paged
+	 * executable/interpreter segments), then drop the loader's file
+	 * references — registration took its own. */
+	for (int i = 0; i < lr.num_lazy_regions; i++) {
+		vfs_file_t *bf =
+			lr.lazy_regions[i].file_idx ?
+				lr.backing[lr.lazy_regions[i].file_idx - 1] :
+				NULL;
 		task_register_lazy_region(cur, lr.lazy_regions[i].start,
 					  lr.lazy_regions[i].length,
-					  lr.lazy_regions[i].prot);
+					  lr.lazy_regions[i].prot, bf,
+					  lr.lazy_regions[i].file_off);
+	}
+	for (int b = 0; b < 2; b++)
+		if (lr.backing[b])
+			vfs_close(lr.backing[b]);
 
 	for (int i = 3; i < TASK_MAX_FDS; i++) {
 		if (cur->fd_table[i]) {
