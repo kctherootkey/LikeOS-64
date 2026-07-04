@@ -8,6 +8,9 @@
 #include <kernel/mm/slab.h>
 #include <kernel/ke/sched.h> // For spinlock_t
 #include <kernel/uapi/bug.h>
+#include <kernel/fs/pagecache.h> // pagecache_get_stats for memstat breakdown
+#include <kernel/fs/vfs.h> // demand paging: file-backed page-in
+#include <kernel/ke/syscall.h> // PROT_* for lazy region protection
 
 // Enable SLAB allocator (comment out to use legacy fixed-size heap)
 #define USE_SLAB_ALLOCATOR
@@ -2220,6 +2223,18 @@ void mm_get_memory_stats(memory_stats_t *stats)
 	stats->heap_free = mm_state.heap_size - mm_state.heap_used;
 	stats->allocations = mm_state.allocation_count;
 	stats->deallocations = mm_state.deallocation_count;
+
+	// Ownership breakdown (see memory_stats_t): slab + page cache; the
+	// remainder of used_pages is raw page-allocator consumers (user
+	// mappings, page tables, kernel stacks, DMA buffers).
+	slab_stats_t sstats;
+	slab_get_stats(&sstats);
+	stats->slab_pages = sstats.total_pages_used;
+	stats->slab_large_active =
+		sstats.large_allocations - sstats.large_frees;
+	pc_stats_t pcs;
+	pagecache_get_stats(&pcs);
+	stats->pagecache_pages = pcs.total_pages;
 }
 
 // Print memory statistics
@@ -2532,7 +2547,10 @@ void mm_destroy_address_space(uint64_t *pml4)
 							// Check if it's a 2MB page or a page table
 							if (pd[k] &
 							    PAGE_SIZE_FLAG) {
-								// 2MB page - check COW refcount before freeing (mask 21 bits for 2MB alignment)
+								// 2MB page - check COW refcount before freeing (mask 21 bits for 2MB alignment).
+								// A 2MB mapping covers 512 physical 4K frames; each
+								// one must be released individually or 511 of them
+								// leak (the bitmap tracks 4K frames).
 								uint64_t phys =
 									pd[k] &
 									0x000FFFFFFFE00000ULL;
@@ -2541,8 +2559,14 @@ void mm_destroy_address_space(uint64_t *pml4)
 									// User page - use refcount
 									if (mm_decref_page(
 										    phys)) {
-										mm_free_physical_page(
-											phys);
+										for (int p2 = 0;
+										     p2 <
+										     512;
+										     p2++)
+											mm_free_physical_page(
+												phys +
+												(uint64_t)p2 *
+													PAGE_SIZE);
 										pages_freed +=
 											512; // 2MB = 512 4K pages
 									} else {
@@ -2550,8 +2574,14 @@ void mm_destroy_address_space(uint64_t *pml4)
 											512;
 									}
 								} else {
-									mm_free_physical_page(
-										phys);
+									for (int p2 = 0;
+									     p2 <
+									     512;
+									     p2++)
+										mm_free_physical_page(
+											phys +
+											(uint64_t)p2 *
+												PAGE_SIZE);
 									pages_freed +=
 										512;
 								}
@@ -2971,6 +3001,160 @@ bool mm_handle_cow_fault(uint64_t fault_addr)
 	// We don't need to track it until it's shared via fork again
 
 	return true;
+}
+
+// ============================================================================
+// Demand paging — lazy region materialisation
+// ============================================================================
+
+/* Serialises the check-PTE-then-map step so two threads faulting on the
+ * same page cannot both install a page (the loser would leak its copy or,
+ * worse, the two would see different contents).  Held only around the
+ * final non-sleeping check+map. */
+static spinlock_t g_lazy_map_lock = SPINLOCK_INIT("lazymap");
+
+/* Serialises file page-in.  A region's backing vfs_file is shared with the
+ * user's fd (vfs_dup), so the seek/read/seek-back sequence below must not
+ * interleave with another faulting thread.  This is a sleeping-friendly
+ * lock (page-in does disk I/O): atomic flag + yield. */
+static volatile int g_pagein_busy;
+static void pagein_lock(void)
+{
+	while (__atomic_test_and_set(&g_pagein_busy, __ATOMIC_ACQUIRE))
+		sched_yield_in_kernel();
+}
+static void pagein_unlock(void)
+{
+	__atomic_clear(&g_pagein_busy, __ATOMIC_RELEASE);
+}
+
+int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode)
+{
+	if (fault_addr >= 0x0000800000000000ULL)
+		return 0;
+	task_t *cur = sched_current();
+	if (!cur || cur->privilege != TASK_USER || !cur->pml4)
+		return 0;
+	task_t *mm = task_mm_owner(cur);
+	uint64_t page = fault_addr & ~0xFFFULL;
+
+	uint64_t map_flags = 0;
+	struct vfs_file *file = NULL;
+	uint64_t file_off = 0;
+	int found = 0;
+
+	// brk heap: everything in [brk_start, page-aligned brk) is lazy zeros
+	if (mm->brk_start && page >= mm->brk_start &&
+	    page < ((mm->brk + 0xFFFULL) & ~0xFFFULL)) {
+		map_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER |
+			    PAGE_NO_EXECUTE;
+		found = 1;
+	} else {
+		for (int i = 0; i < TASK_MAX_MMAP; i++) {
+			mmap_region_t *r = &mm->mmap_regions[i];
+			if (!r->in_use || !r->lazy)
+				continue;
+			if (page < r->start || page >= r->start + r->length)
+				continue;
+			if (!(r->prot & (PROT_READ | PROT_WRITE | PROT_EXEC)))
+				return 0; // PROT_NONE — genuine fault
+			map_flags = PAGE_PRESENT | PAGE_USER;
+			if (r->prot & PROT_WRITE)
+				map_flags |= PAGE_WRITABLE;
+			if (!(r->prot & PROT_EXEC))
+				map_flags |= PAGE_NO_EXECUTE;
+			file = r->file;
+			file_off = r->offset + (page - r->start);
+			found = 1;
+			break;
+		}
+	}
+	if (!found)
+		return 0;
+
+	uint64_t phys = mm_allocate_physical_page();
+	if (!phys)
+		return 0;
+
+	if (file) {
+		/* Page-in from the backing file.  This sleeps on disk I/O, so
+		 * it must only happen in process context with no FS locks
+		 * held.  User-mode faults always qualify; a kernel-mode fault
+		 * here means some user-copy site lacks its pre-fault shield —
+		 * warn so it can be found, then proceed (the common callers
+		 * are shielded, so this path indicates a missed one, not a
+		 * certain deadlock). */
+		WARN_RATELIMIT(
+			from_kernel_mode,
+			"demand fault: file page-in from kernel-mode fault at 0x%lx — missing prefault shield",
+			fault_addr);
+		pagein_lock();
+		long saved = vfs_seek(file, 0, SEEK_CUR);
+		long got = 0;
+		if (saved >= 0 &&
+		    vfs_seek(file, (long)file_off, SEEK_SET) >= 0) {
+			got = vfs_read(file, phys_to_virt(phys), PAGE_SIZE);
+			vfs_seek(file, saved, SEEK_SET);
+		}
+		pagein_unlock();
+		if (got < 0)
+			got = 0;
+		/* Short read (EOF inside the mapping) — rest reads as zeros.
+		 * Also covers DEBUG builds where fresh pages are poisoned. */
+		if (got < (long)PAGE_SIZE)
+			mm_memset((uint8_t *)phys_to_virt(phys) + got, 0,
+				  PAGE_SIZE - (uint64_t)got);
+	} else {
+#if DEBUG
+		/* Production pages come pre-zeroed from the allocator; DEBUG
+		 * builds poison them, so zero explicitly (anon mappings must
+		 * read as zeros). */
+		mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
+#endif
+	}
+
+	// Install — re-check under the lock in case another thread won.
+	uint64_t lf;
+	spin_lock_irqsave(&g_lazy_map_lock, &lf);
+	uint64_t *pte = mm_get_page_table_from_pml4(mm->pml4, page, false);
+	if (pte && (*pte & PAGE_PRESENT)) {
+		spin_unlock_irqrestore(&g_lazy_map_lock, lf);
+		mm_free_physical_page(phys);
+		return 1; // already materialised by a concurrent fault
+	}
+	bool ok = mm_map_page_in_address_space(mm->pml4, page, phys, map_flags);
+	spin_unlock_irqrestore(&g_lazy_map_lock, lf);
+	if (!ok) {
+		mm_free_physical_page(phys);
+		return 0;
+	}
+	return 1;
+}
+
+void mm_prefault_user_range(uint64_t addr, uint64_t len, int for_write)
+{
+	if (!len || addr >= 0x0000800000000000ULL)
+		return;
+	task_t *cur = sched_current();
+	if (!cur || cur->privilege != TASK_USER || !cur->pml4)
+		return;
+	uint64_t end = addr + len;
+	if (end < addr || end > 0x0000800000000000ULL)
+		end = 0x0000800000000000ULL;
+	/* Bound the walk: no legitimate single I/O here exceeds this, and a
+	 * hostile length must not turn into an unbounded loop.  Anything
+	 * beyond the cap still works — anon faults resolve safely inline
+	 * from any context; only file-backed lazy pages past the cap would
+	 * hit the kernel-mode-fault warning above. */
+	if (end - addr > (64ULL << 20))
+		end = addr + (64ULL << 20);
+	for (uint64_t p = addr & ~0xFFFULL; p < end; p += PAGE_SIZE) {
+		uint64_t *pte = mm_get_page_table(p, false);
+		if (!pte || !(*pte & PAGE_PRESENT))
+			mm_handle_demand_fault(p, 0);
+		else if (for_write && (*pte & PAGE_COW))
+			mm_handle_cow_fault(p);
+	}
 }
 
 // Clone an address space for fork() - uses COW for efficiency

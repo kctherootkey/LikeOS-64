@@ -17,6 +17,10 @@ typedef struct {
 	uint64_t heap_free;
 	uint32_t allocations;
 	uint32_t deallocations;
+	/* Ownership breakdown (must match kernel memory_stats_t) */
+	uint64_t slab_pages;
+	uint64_t slab_large_active;
+	uint64_t pagecache_pages;
 } memory_stats_t;
 
 static long syscall1(long num, long a1)
@@ -48,6 +52,25 @@ int main(void)
 	printf("  Free:  %llu MB (%llu pages)\n",
 	       (unsigned long long)(stats.free_memory / (1024ULL * 1024)),
 	       (unsigned long long)stats.free_pages);
+	/* Attribute used pages to their owners.  "other" is everything the
+	 * kernel takes straight from the page allocator: user process pages,
+	 * page tables, kernel stacks, DMA buffers. */
+	uint64_t slab_kb = stats.slab_pages * 4;
+	uint64_t pc_kb = stats.pagecache_pages * 4;
+	uint64_t accounted = stats.slab_pages + stats.pagecache_pages;
+	uint64_t other_pages = stats.used_pages > accounted ?
+				       stats.used_pages - accounted :
+				       0;
+	printf("Used breakdown:\n");
+	printf("  Slab:      %llu KB (%llu pages, %llu large allocs active)\n",
+	       (unsigned long long)slab_kb,
+	       (unsigned long long)stats.slab_pages,
+	       (unsigned long long)stats.slab_large_active);
+	printf("  Pagecache: %llu KB (%llu pages)\n", (unsigned long long)pc_kb,
+	       (unsigned long long)stats.pagecache_pages);
+	printf("  Other:     %llu KB (%llu pages)\n",
+	       (unsigned long long)(other_pages * 4),
+	       (unsigned long long)other_pages);
 	printf("Heap:\n");
 	printf("  Allocated: %llu KB\n",
 	       (unsigned long long)(stats.heap_allocated / 1024));

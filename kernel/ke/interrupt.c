@@ -1237,6 +1237,14 @@ void exception_handler(uint64_t *regs)
 	if (int_no == 14) {
 		uint64_t cr2;
 		__asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+		// Demand paging: not-present fault (err bit 0 clear) on a user
+		// address.  Like COW below, this fires from BOTH CPU modes —
+		// kernel code touches lazy user pages via copy_to_user etc.
+		if (!(err_code & 0x1) && cr2 < 0x8000000000000000ULL) {
+			if (mm_handle_demand_fault(cr2, !user_mode)) {
+				return;
+			}
+		}
 		// Handle COW faults on user-space addresses (write + present)
 		// Note: Kernel code can trigger COW when accessing user pages (copy_to_user etc)
 		// so we check the ADDRESS is in user space, not the mode of the fault

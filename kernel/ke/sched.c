@@ -280,6 +280,22 @@ static void task_close_open_files(task_t *task)
 			}
 		}
 	}
+
+	/* Demand paging: release the file references pinned by lazy
+	 * file-backed regions.  Leader-only — threads carry a stale copy of
+	 * the leader's region table without their own references (only
+	 * fork adds a reference per copy). */
+	if (!task->group_leader || task->group_leader == task) {
+		for (int i = 0; i < TASK_MAX_MMAP; i++) {
+			mmap_region_t *r = &task->mmap_regions[i];
+			if (r->in_use && r->file) {
+				vfs_close(r->file);
+				r->file = NULL;
+			}
+			r->in_use = false;
+			r->lazy = false;
+		}
+	}
 }
 
 // Queue a dead thread for deferred reaping (called from sched_mark_task_exited)
@@ -1535,6 +1551,34 @@ void sched_remove_task(task_t *task)
 }
 
 // ============================================================================
+// Demand-paged region registration (used by the ELF loader for BSS)
+// ============================================================================
+
+int task_register_lazy_region(task_t *task, uint64_t start, uint64_t length,
+			      uint64_t prot)
+{
+	if (!task || !length)
+		return -1;
+	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+		mmap_region_t *r = &task->mmap_regions[i];
+		if (r->in_use)
+			continue;
+		r->start = start;
+		r->length = length;
+		r->prot = prot;
+		r->flags = 0;
+		r->fd = -1;
+		r->offset = 0;
+		r->lazy = true;
+		r->file = NULL;
+		r->in_use = true;
+		return 0;
+	}
+	WARN_ON_ONCE(1); /* mmap region table full — BSS range not lazy */
+	return -1;
+}
+
+// ============================================================================
 // FORK
 // ============================================================================
 
@@ -1587,6 +1631,15 @@ task_t *sched_fork_current(void)
 
 	// Copy parent
 	mm_memcpy(child, cur, sizeof(task_t));
+
+	/* Demand paging: the child inherits the region table by value; each
+	 * file-backed region pins its backing file with a reference, so the
+	 * child needs its own. */
+	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+		if (child->mmap_regions[i].in_use &&
+		    child->mmap_regions[i].file)
+			vfs_incref(child->mmap_regions[i].file);
+	}
 
 	// Child-specific fields
 	child->id = g_next_id++;
@@ -1862,6 +1915,15 @@ void sched_mark_task_exited(task_t *task, int status)
 	}
 
 	task->exit_code = status;
+
+	/* POSIX hangup: when a session leader with a controlling terminal
+	 * exits, the terminal's foreground process group receives SIGHUP —
+	 * this is what cleans up a dead login/pane session's leftover
+	 * processes instead of leaving them pinned to the tty. */
+	if (task->privilege == TASK_USER && task->ctty &&
+	    task->sid == task->id && task->ctty->fg_pgid > 0) {
+		sched_signal_pgrp(task->ctty->fg_pgid, SIGHUP);
+	}
 
 	// ========================================================================
 	// THREAD GROUP EXIT HANDLING

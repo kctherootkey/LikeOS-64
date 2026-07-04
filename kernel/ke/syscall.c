@@ -527,6 +527,12 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 		return -EFAULT;
 	}
 
+	/* Demand paging shield: materialise lazy pages (and resolve COW) in
+	 * the destination buffer NOW, before any FS/pipe/tty lock is taken —
+	 * a page fault needing file I/O inside a lock-holding copy loop
+	 * would deadlock. */
+	mm_prefault_user_range(buf, count, 1);
+
 	vfs_file_t *file = NULL;
 	if (fd < TASK_MAX_FDS) {
 		file = cur->fd_table[fd];
@@ -617,6 +623,10 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
 	if (!validate_user_ptr(buf, count)) {
 		return -EFAULT;
 	}
+
+	/* Demand paging shield: fault-in the SOURCE buffer before FS/pipe/
+	 * tty locks are taken (see sys_read).  Read-only touch: no COW. */
+	mm_prefault_user_range(buf, count, 0);
 
 	vfs_file_t *file = NULL;
 	if (fd < TASK_MAX_FDS) {
@@ -3121,6 +3131,9 @@ static int64_t sys_brk(uint64_t new_brk)
 	task_t *cur = sched_current();
 	if (!cur)
 		return -EFAULT;
+	/* Threads share the leader's heap — all brk bookkeeping (and the
+	 * fault handler's validity check) goes through the group leader. */
+	cur = task_mm_owner(cur);
 
 	// If new_brk is 0, return current break
 	if (new_brk == 0) {
@@ -3137,46 +3150,10 @@ static int64_t sys_brk(uint64_t new_brk)
 		return (int64_t)cur->brk; // Would collide with stack
 	}
 
-	// Growing the heap
-	if (new_brk > cur->brk) {
-		uint64_t old_page = PAGE_ALIGN(cur->brk);
-		uint64_t new_page = PAGE_ALIGN(new_brk);
-		// Map new pages
-		for (uint64_t addr = old_page; addr < new_page;
-		     addr += PAGE_SIZE) {
-			uint64_t phys = mm_allocate_physical_page();
-			if (!phys) {
-				// Out of physical memory - rollback pages we already mapped
-				for (uint64_t cleanup = old_page;
-				     cleanup < addr; cleanup += PAGE_SIZE) {
-					mm_unmap_page_in_address_space(
-						cur->pml4, cleanup);
-				}
-				return (int64_t)
-					cur->brk; // Return unchanged brk
-			}
-
-			// Zero page via direct map
-			mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
-
-			uint64_t flags = PAGE_PRESENT | PAGE_WRITABLE |
-					 PAGE_USER | PAGE_NO_EXECUTE;
-			if (!mm_map_page_in_address_space(cur->pml4, addr, phys,
-							  flags)) {
-				mm_free_physical_page(phys);
-				// Rollback pages we already mapped
-				for (uint64_t cleanup = old_page;
-				     cleanup < addr; cleanup += PAGE_SIZE) {
-					mm_unmap_page_in_address_space(
-						cur->pml4, cleanup);
-				}
-				return (int64_t)
-					cur->brk; // Return unchanged brk
-			}
-		}
-	}
-	// Shrinking the heap - could free pages but keep it simple for now
-
+	/* Growing the heap: demand-paged — no pages are allocated here.  The
+	 * page-fault handler zero-fills anything in [brk_start, brk) on first
+	 * touch, so growing the break is just bookkeeping.  Shrinking keeps
+	 * the pages mapped (as before). */
 	cur->brk = new_brk;
 	return (int64_t)new_brk;
 }
@@ -3188,6 +3165,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 	task_t *cur = sched_current();
 	if (!cur)
 		return (int64_t)MAP_FAILED;
+	/* fd lookup below stays on the calling task; the region table,
+	 * mmap_base and pml4 belong to the thread-group leader. */
+	task_t *caller = cur;
+	cur = task_mm_owner(cur);
 
 	// Security: Validate length - must be non-zero and reasonable
 	if (length == 0) {
@@ -3250,8 +3231,54 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 		page_flags |= PAGE_NO_EXECUTE;
 	}
 
-	// Map pages
 	bool is_anonymous = (flags & MAP_ANONYMOUS) || (int64_t)fd == -1;
+
+	/* Resolve and validate the backing file up front (also needed for the
+	 * lazy path).  Only real VFS files can back a mapping — socket/pipe/
+	 * epoll fd markers and stdio placeholders cannot. */
+	vfs_file_t *backing = NULL;
+	if (!is_anonymous) {
+		if (fd >= TASK_MAX_FDS || !caller->fd_table[fd])
+			return (int64_t)MAP_FAILED;
+		uint64_t marker = (uint64_t)caller->fd_table[fd];
+		if (marker <= 3 || IS_SOCKET_FD(caller->fd_table[fd]) ||
+		    IS_UNIX_SOCKET_FD(caller->fd_table[fd]) ||
+		    IS_EPOLL_FD(caller->fd_table[fd]) ||
+		    pipe_is_end(caller->fd_table[fd]))
+			return (int64_t)MAP_FAILED;
+		backing = caller->fd_table[fd];
+	}
+
+	/* Demand paging: PRIVATE mappings (anonymous or file-backed) are not
+	 * populated here at all — the page-fault handler materialises pages
+	 * on first touch (zero-fill / file page-in).  Only MAP_SHARED stays
+	 * eager: fork() must find real pages to share.
+	 *
+	 * MAP_FIXED over an existing mapping must not leave stale pages in
+	 * place (a lazy region would otherwise never fault there and expose
+	 * the old contents), so clear the range first.  This also fixes the
+	 * old eager path silently overwriting live PTEs (leaking the pages). */
+	if (!(flags & MAP_SHARED)) {
+		if (flags & MAP_FIXED) {
+			for (uint64_t off = 0; off < length; off += PAGE_SIZE)
+				mm_unmap_page_in_address_space(cur->pml4,
+							       vaddr + off);
+		}
+		if (backing)
+			vfs_incref(backing);
+		region->start = vaddr;
+		region->length = length;
+		region->prot = prot;
+		region->flags = flags;
+		region->fd = is_anonymous ? -1 : (int)fd;
+		region->offset = offset;
+		region->lazy = true;
+		region->file = backing;
+		region->in_use = true;
+		return (int64_t)vaddr;
+	}
+
+	// Map pages (eager, MAP_SHARED only)
 	uint64_t pages_mapped = 0;
 
 	for (uint64_t off = 0; off < length; off += PAGE_SIZE) {
@@ -3279,12 +3306,12 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 #endif
 
 		// For file-backed mappings, read content from file
-		if (!is_anonymous && fd < TASK_MAX_FDS && cur->fd_table[fd]) {
-			vfs_file_t *file = cur->fd_table[fd];
+		if (backing) {
 			// Seek to the correct position and read into direct-mapped address
 			long file_off = (long)(offset + off);
-			if (vfs_seek(file, file_off, SEEK_SET) >= 0) {
-				vfs_read(file, phys_to_virt(phys), PAGE_SIZE);
+			if (vfs_seek(backing, file_off, SEEK_SET) >= 0) {
+				vfs_read(backing, phys_to_virt(phys),
+					 PAGE_SIZE);
 			}
 		}
 
@@ -3312,6 +3339,8 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 	region->flags = flags;
 	region->fd = is_anonymous ? -1 : (int)fd;
 	region->offset = offset;
+	region->lazy = false;
+	region->file = NULL;
 	region->in_use = true;
 
 	return (int64_t)vaddr;
@@ -3323,6 +3352,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length)
 	task_t *cur = sched_current();
 	if (!cur)
 		return -EFAULT;
+	cur = task_mm_owner(cur); // regions/pml4 live on the group leader
 
 	if (addr == 0 || length == 0) {
 		return -EINVAL;
@@ -3359,7 +3389,15 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length)
 		/* Update or free the region record. */
 		if (cur_addr == region->start && unmap_end == region_end) {
 			region->in_use = false;
+			if (region->file) {
+				vfs_close(region->file);
+				region->file = NULL;
+			}
+			region->lazy = false;
 		} else if (cur_addr == region->start) {
+			/* Keep file_off = offset + (addr - start) invariant
+			 * when the region head is trimmed. */
+			region->offset += unmap_end - region->start;
 			region->start = unmap_end;
 			region->length = region_end - unmap_end;
 		} else if (unmap_end == region_end) {
@@ -3995,9 +4033,45 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd)
 	if (oldfd == newfd)
 		return newfd;
 
-	// Close newfd if open
-	if (newfd >= 3 && cur->fd_table[newfd]) {
-		sys_close(newfd);
+	// POSIX: validate oldfd BEFORE touching newfd — "if oldfd is not a
+	// valid file descriptor, the call fails and newfd is not closed".
+	// fds 0-2 count as valid even when they hold console markers.
+	if (oldfd != STDIN_FD && oldfd != STDOUT_FD && oldfd != STDERR_FD &&
+	    (oldfd >= TASK_MAX_FDS || cur->fd_table[oldfd] == NULL))
+		return -EBADF;
+
+	// POSIX: dup2 implicitly closes newfd if it is open — INCLUDING fds
+	// 0-2.  In a pty session those hold real refcounted vfs files (the
+	// pts slave), not console markers; the old `newfd >= 3` guard (there
+	// only because sys_close refuses fds 0-2) leaked one slave reference
+	// every time a pipeline child dup2'ed a pipe end over its stdio.
+	// Enough leaked references kept the slave alive after every process
+	// on the pty had exited, the master never saw POLLHUP, and a tmux
+	// window that had ever run a pipeline could not close.
+	if (cur->fd_table[newfd]) {
+		if (newfd >= 3) {
+			sys_close(newfd);
+		} else {
+			vfs_file_t *old = cur->fd_table[newfd];
+			uint64_t om = (uint64_t)old;
+			cur->fd_table[newfd] = NULL;
+			if (om >= 1 && om <= 3) {
+				/* console stdio marker — nothing to release */
+			} else if (IS_SOCKET_FD(old)) {
+				sock_close(SOCKET_FD_IDX(old));
+			} else if (IS_UNIX_SOCKET_FD(old)) {
+				unix_close((int)(uintptr_t)old);
+			} else if (IS_EPOLL_FD(old)) {
+				int idx = EPOLL_FD_IDX(old);
+				extern epoll_instance_t epoll_instances[];
+				if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
+					epoll_instances[idx].active = 0;
+			} else if (pipe_is_end(old)) {
+				pipe_close_end((pipe_end_t *)old);
+			} else {
+				vfs_close(old);
+			}
+		}
 	}
 
 	if (oldfd == STDIN_FD || oldfd == STDOUT_FD || oldfd == STDERR_FD) {
@@ -4922,6 +4996,20 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	// Initialize child from parent
 	mm_memcpy(child, cur, sizeof(task_t));
 
+	/* Demand paging: a fork-like clone (no CLONE_VM) copies the region
+	 * table by value and is its own thread-group leader, so it needs its
+	 * own reference on every file-backed lazy region.  CLONE_VM threads
+	 * carry only a stale copy (bookkeeping is owner-routed to the group
+	 * leader) and must NOT take references — the leader-only release at
+	 * exit would not balance them. */
+	if (!share_vm) {
+		for (int i = 0; i < TASK_MAX_MMAP; i++) {
+			if (child->mmap_regions[i].in_use &&
+			    child->mmap_regions[i].file)
+				vfs_incref(child->mmap_regions[i].file);
+		}
+	}
+
 	// Assign unique ID
 	uint64_t irq_flags;
 	spin_lock_irqsave(&g_task_list_lock, &irq_flags);
@@ -5794,6 +5882,23 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
 	uint64_t *pml4 = cur->pml4;
 	if (!pml4) {
 		return -EFAULT;
+	}
+
+	/* Demand paging: pages of a lazy region that have not been touched
+	 * yet have no PTE for the loop below to fix — update the covering
+	 * region's prot so they fault in with the NEW protection.  Only a
+	 * full-region cover is honoured (partial-region prot splits are not
+	 * supported, same granularity policy as munmap). */
+	{
+		task_t *mm = task_mm_owner(cur);
+		for (int i = 0; i < TASK_MAX_MMAP; i++) {
+			mmap_region_t *r = &mm->mmap_regions[i];
+			if (!r->in_use)
+				continue;
+			if (addr <= r->start &&
+			    addr + pages * PAGE_SIZE >= r->start + r->length)
+				r->prot = prot;
+		}
 	}
 
 	for (uint64_t i = 0; i < pages; i++) {

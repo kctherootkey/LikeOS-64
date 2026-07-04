@@ -10,6 +10,7 @@
 #include <kernel/ke/timer.h>
 #include <kernel/net/net.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/fs/vfs.h> /* vfs_file refcount in the pty diagnostic dump */
 
 #define TTY_MAX_PTYS 16
 
@@ -87,6 +88,7 @@ typedef struct pty {
 	task_t *master_read_waiters;
 	int master_open;
 	int slave_open;
+	void *slave_vf; // diagnostic: slave's vfs_file (refcount visibility)
 } pty_t;
 
 static tty_t g_console_tty;
@@ -701,6 +703,14 @@ long tty_read(tty_t *tty, void *buf, long count, int nonblock)
 			tty->eof_pending = 0;
 			return read;
 		}
+		/* PTY slave hangup: once the master is closed the line is
+		 * dead — return EOF after draining, so even readers that
+		 * ignore SIGHUP cannot block forever. */
+		if (tty->is_pty && !tty->is_master && tty->priv &&
+		    !((pty_t *)tty->priv)->master_open &&
+		    tty->read_count == 0) {
+			return read;
+		}
 		char c = 0;
 		if (!tty_dequeue_read(tty, &c)) {
 			if (read > 0)
@@ -1072,6 +1082,37 @@ int tty_pty_slave_open(int id)
 	return 0;
 }
 
+/* Diagnostic: remember the vfs_file backing the slave so the pty dump can
+ * show its live refcount (who is keeping the line open). */
+void tty_pty_slave_set_vf(int id, void *vf)
+{
+	pty_t *pty = tty_get_pty(id);
+	if (pty)
+		pty->slave_vf = vf;
+}
+
+/* Diagnostic dump for the Ctrl+N hotkey: per-pty open/buffer/refcount state.
+ * The tmux window-close chain depends on slave refcount → 0 → slave_open=0 →
+ * master POLLHUP; this dump shows exactly which link is stuck. */
+void tty_dump_ptys(tty_t *out)
+{
+	tty_printf(out, "=== PTY table ===\n");
+	for (int i = 0; i < TTY_MAX_PTYS; i++) {
+		pty_t *p = &g_ptys[i];
+		if (p->id == -1)
+			continue;
+		int refs = -1;
+		if (p->slave_vf)
+			refs = ((vfs_file_t *)p->slave_vf)->refcount;
+		tty_printf(
+			out,
+			"pty%d master_open=%d slave_open=%d m_count=%u fg_pgid=%d slave_refs=%d\n",
+			p->id, p->master_open, p->slave_open,
+			(unsigned)p->m_count, p->slave.fg_pgid, refs);
+	}
+	tty_printf(out, "=================\n");
+}
+
 int tty_pty_is_allocated(int id)
 {
 	pty_t *pty = tty_get_pty(id);
@@ -1166,6 +1207,17 @@ int tty_pty_master_close(int id)
 		return -EINVAL;
 	}
 	pty->master_open = 0;
+	if (pty->slave_open) {
+		/* POSIX hangup: closing the master takes the line down.  The
+		 * slave side's foreground process group gets SIGHUP (default
+		 * action: terminate) and blocked readers are woken so they
+		 * observe the hangup instead of sleeping forever.  Without
+		 * this, shells in tmux panes survived `tmux kill-server` as
+		 * orphans pinned to a dead pts. */
+		if (pty->slave.fg_pgid > 0)
+			sched_signal_pgrp(pty->slave.fg_pgid, SIGHUP);
+		tty_wake_readers(&pty->slave.read_waiters);
+	}
 	if (!pty->slave_open) {
 		pty->id = -1;
 	}
@@ -1179,6 +1231,7 @@ int tty_pty_slave_close(int id)
 		return -EINVAL;
 	}
 	pty->slave_open = 0;
+	pty->slave_vf = NULL;
 	/* Wake any task blocked in tty_pty_master_read so it can observe
      * EOF (read returns 0) and the master fd's poll set transitions to
      * POLLHUP.  Without this, the last shell `exit` leaves tmux's I/O

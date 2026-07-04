@@ -147,6 +147,7 @@ static int devfs_open_pty_slave(int id, vfs_file_t **out)
 	df->tty = tty;
 	df->pty_id = id;
 	*out = &df->vfs;
+	tty_pty_slave_set_vf(id, &df->vfs); // diagnostic refcount visibility
 	return ST_OK;
 }
 

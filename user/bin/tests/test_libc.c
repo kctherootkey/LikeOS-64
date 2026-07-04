@@ -3309,6 +3309,17 @@ int main(int argc, char **argv)
 					shared[1]++;
 					sched_yield();
 				}
+				/* Don't raise the stop flag until the child has
+	             * demonstrably run.  The 5 yields above complete in
+	             * microseconds; under parallel stress load the child
+	             * may not have had a single CPU slice yet (it can sit
+	             * behind unrelated runnable tasks, possibly on another
+	             * CPU's queue where our yield donates nothing).  The
+	             * child checks the flag before its first increment, so
+	             * flagging too early lets it exit with 0 iterations.
+	             * Allow up to ~10 s of wall time. */
+				for (int i = 0; i < 10000 && shared[0] == 0; i++)
+					usleep(1000);
 				shared[2] = 1; // Signal child to stop
 
 				waitpid(child, NULL, 0);

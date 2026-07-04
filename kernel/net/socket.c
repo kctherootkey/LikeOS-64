@@ -146,6 +146,8 @@ int sock_create(int domain, int type, int protocol)
 	}
 
 	spin_unlock_irqrestore(&socket_lock, flags);
+	WARN_RATELIMIT(fd < 0, "sock_create: socket table full (%d slots)",
+		       NET_MAX_SOCKETS);
 	return fd;
 }
 
@@ -405,6 +407,7 @@ int sock_sendto(int sockfd, const void *buf, size_t len, int flags,
 {
 	(void)flags;
 	(void)addrlen;
+	mm_prefault_user_range((uint64_t)buf, len, 0); // see sock_send
 	if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS)
 		return -EBADF;
 	net_socket_t *s = &sockets[sockfd];
@@ -528,6 +531,7 @@ int sock_sendto(int sockfd, const void *buf, size_t len, int flags,
 int sock_recvfrom(int sockfd, void *buf, size_t len, int flags,
 		  struct sockaddr_in *src_addr, socklen_t *addrlen)
 {
+	mm_prefault_user_range((uint64_t)buf, len, 1); // see sock_recv
 	if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS)
 		return -EBADF;
 	net_socket_t *s = &sockets[sockfd];
@@ -599,6 +603,9 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 	might_sleep();
 	BUG_ON(buf == NULL && len > 0);
 	(void)flags;
+	/* Demand paging shield: the copy below runs under conn->lock with
+	 * IRQs off — fault-in the source buffer first. */
+	mm_prefault_user_range((uint64_t)buf, len, 0);
 	if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS)
 		return -EBADF;
 	net_socket_t *s = &sockets[sockfd];
@@ -672,6 +679,9 @@ int sock_recv(int sockfd, void *buf, size_t len, int flags)
 {
 	might_sleep();
 	BUG_ON(buf == NULL && len > 0);
+	/* Demand paging shield: destination copy runs under conn->lock —
+	 * fault-in (and COW-resolve) the buffer first. */
+	mm_prefault_user_range((uint64_t)buf, len, 1);
 	if (sockfd < 0 || sockfd >= NET_MAX_SOCKETS)
 		return -EBADF;
 	net_socket_t *s = &sockets[sockfd];

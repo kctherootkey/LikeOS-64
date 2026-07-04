@@ -11,8 +11,15 @@
 #include <kernel/ke/sched.h>
 #include <kernel/uapi/bug.h>
 
-#define SKB_SMALL_COUNT 512
-#define SKB_JUMBO_COUNT 64
+/* Pool sizing: every packet in flight through the stack — NIC RX, loopback
+ * TX sitting in rx_queue[NET_RX_CPU] awaiting ksoftirqd, ARP-pending — holds
+ * one slot.  A single sock_send() can emit min(cwnd, TCP_MAX_INFLIGHT)
+ * segments in one burst, so a handful of concurrent connections (parallel
+ * stress runs) transiently need well over 512 small slots; exhaustion turns
+ * into silent packet loss.  2048 small (~3.3 MB) + 128 jumbo (~8.4 MB)
+ * static cost buys headroom for dozens of concurrent bursting streams. */
+#define SKB_SMALL_COUNT 2048
+#define SKB_JUMBO_COUNT 128
 
 #define SKB_SIG_SMALL 0x534B5342u // 'SKSB'
 #define SKB_SIG_JUMBO 0x4A4B5342u // 'JKSB'

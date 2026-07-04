@@ -254,8 +254,23 @@ typedef struct __attribute__((packed)) {
 #define TCP_TX_BUF_SIZE 131072
 #define TCP_RETRANSMIT_TICKS 200 // 2 seconds at 100Hz
 #define TCP_TIME_WAIT_TICKS 6000 // 60 seconds
-#define TCP_MAX_RETRANSMITS 5
+#define TCP_MAX_RETRANSMITS 5 // handshake (SYN / SYN+ACK) give-up limit
+/* Give-up limit for retransmitting data on an established connection.
+ * 15 attempts with exponential backoff from the 200 ms RTO floor spans
+ * minutes of sustained loss, satisfying RFC 1122 §4.2.3.5's R2 minimum
+ * of 100 seconds.  Handshakes keep the short limit above: no user data
+ * is at stake yet and connect() callers expect prompt failure. */
+#define TCP_MAX_DATA_RETRANSMITS 15
 #define TCP_SYN_RETRANSMIT_TICKS 300 // 3 seconds
+/* Hard wall-clock bound on a handshake (SYN_SENT / SYN_RECEIVED).  The
+ * attempt counter only advances on transmits that actually left the
+ * machine, so without this a handshake whose sends keep failing locally
+ * (skb pool exhausted under load) would retry without bound. */
+#define TCP_HANDSHAKE_TIMEOUT_TICKS 6000 // 60 seconds
+/* Retry delay after a retransmit failed to allocate a buffer locally:
+ * quick (one tick batch) rather than a full RTO/SYN interval, since the
+ * pool usually drains within milliseconds. */
+#define TCP_LOCAL_DROP_RETRY_TICKS 2 // 20 ms at 100 Hz
 #define TCP_MAX_OPTIONS 40
 /* Maximum un-ACKed segments per connection.  The previous value of 32
  * hard-capped throughput at ~32 * MSS / RTT independent of cwnd or peer
@@ -388,6 +403,9 @@ typedef struct tcp_conn {
 	// Retransmission
 	uint64_t retransmit_tick;
 	uint32_t retransmit_count;
+	// Absolute give-up tick for SYN_SENT/SYN_RECEIVED (see
+	// TCP_HANDSHAKE_TIMEOUT_TICKS); 0 = unarmed.
+	uint64_t handshake_deadline;
 
 	// Negotiated segment sizing and outstanding transmit queue
 	uint16_t peer_mss;

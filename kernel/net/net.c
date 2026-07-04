@@ -249,6 +249,12 @@ static int loopback_send(net_device_t *dev, const uint8_t *data, uint16_t len)
 		return 0;
 	sk_buff_t *skb = skb_alloc(len);
 	if (!skb) {
+		// This is silent packet loss on loopback — callers (TCP) treat
+		// it as a local drop and retry, but make exhaustion visible so
+		// pool sizing problems are diagnosable instead of appearing
+		// only as mysterious latency/hangs under parallel stress.
+		WARN_RATELIMIT(1, "loopback_send: skb pool exhausted, dropping %u bytes",
+			       len);
 		dev->rx_errors++;
 		return -1;
 	}

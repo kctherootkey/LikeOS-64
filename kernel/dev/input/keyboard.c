@@ -358,11 +358,13 @@ void keyboard_irq_handler(void)
 		return;
 	}
 
-	// Debug hotkey: Ctrl+N dumps the TCP connection table
+	// Debug hotkey: Ctrl+N dumps the TCP connection table + PTY state
 	if (kb_state.ctrl_pressed && !kb_state.alt_pressed &&
 	    scan_code == 0x31) { // 0x31 = 'n'
 		extern void tcp_dump_table(struct tty * tty);
+		extern void tty_dump_ptys(struct tty * tty);
 		tcp_dump_table(tty_get_active());
+		tty_dump_ptys(tty_get_active());
 		return;
 	}
 

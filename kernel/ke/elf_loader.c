@@ -5,6 +5,7 @@
 #include <kernel/ke/elf.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/sched.h>
+#include <kernel/ke/syscall.h> /* PROT_* for lazy BSS regions */
 #include <kernel/io/console.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/ke/pipe.h>
@@ -151,27 +152,7 @@ static int elf_load_segments(const void *elf_data, size_t elf_size,
 
 		for (uint64_t va = vaddr_start; va < vaddr_end;
 		     va += PAGE_SIZE) {
-			// Check if page already mapped (overlapping segments)
-			uint64_t existing =
-				mm_get_physical_address_from_pml4(pml4, va);
-			uint8_t *page_ptr;
-
-			if (existing) {
-				page_ptr = (uint8_t *)phys_to_virt(existing);
-			} else {
-				uint64_t phys = mm_allocate_physical_page();
-				if (!phys)
-					return -11;
-				mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
-				if (!mm_map_page_in_address_space(
-					    pml4, va, phys, flags)) {
-					mm_free_physical_page(phys);
-					return -12;
-				}
-				page_ptr = (uint8_t *)phys_to_virt(phys);
-			}
-
-			// Copy file data that falls within this page
+			// Copy window of file data that falls within this page.
 			// The segment occupies user addresses [seg_vaddr, seg_vaddr+p_filesz)
 			// for file-backed data and [seg_vaddr+p_filesz, seg_end) for BSS (zeros).
 			uint64_t page_lo = va;
@@ -185,6 +166,34 @@ static int elf_load_segments(const void *elf_data, size_t elf_size,
 			uint64_t cpy_hi =
 				(page_hi < data_hi) ? page_hi : data_hi;
 
+			// Check if page already mapped (overlapping segments)
+			uint64_t existing =
+				mm_get_physical_address_from_pml4(pml4, va);
+			uint8_t *page_ptr;
+
+			if (existing) {
+				page_ptr = (uint8_t *)phys_to_virt(existing);
+			} else {
+				/* Demand paging: a page with NO file bytes is
+				 * pure BSS — leave it unmapped.  The caller
+				 * registers the range (recorded below) as a
+				 * lazy region and the fault handler zero-
+				 * fills on first touch.  A 67 MB BSS then
+				 * costs nothing until actually used. */
+				if (cpy_lo >= cpy_hi)
+					continue;
+				uint64_t phys = mm_allocate_physical_page();
+				if (!phys)
+					return -11;
+				mm_memset(phys_to_virt(phys), 0, PAGE_SIZE);
+				if (!mm_map_page_in_address_space(
+					    pml4, va, phys, flags)) {
+					mm_free_physical_page(phys);
+					return -12;
+				}
+				page_ptr = (uint8_t *)phys_to_virt(phys);
+			}
+
 			if (cpy_lo < cpy_hi) {
 				uint64_t dst_off = cpy_lo - va;
 				uint64_t file_off =
@@ -193,6 +202,29 @@ static int elf_load_segments(const void *elf_data, size_t elf_size,
 				if (file_off + len <= elf_size)
 					mm_memcpy(page_ptr + dst_off,
 						  elf_bytes + file_off, len);
+			}
+		}
+
+		// Record the pure-BSS page range (if any) for lazy zero-fill.
+		{
+			uint64_t lazy_lo = (seg_vaddr + ph->p_filesz + 0xFFF) &
+					   ~0xFFFULL;
+			if (vaddr_end > lazy_lo &&
+			    result->num_lazy_regions < ELF_MAX_LAZY_REGIONS) {
+				uint64_t rprot = PROT_READ;
+				if (ph->p_flags & PF_W)
+					rprot |= PROT_WRITE;
+				if (ph->p_flags & PF_X)
+					rprot |= PROT_EXEC;
+				int n = result->num_lazy_regions++;
+				result->lazy_regions[n].start = lazy_lo;
+				result->lazy_regions[n].length =
+					vaddr_end - lazy_lo;
+				result->lazy_regions[n].prot = rprot;
+			} else {
+				WARN_ON(vaddr_end > lazy_lo &&
+					result->num_lazy_regions >=
+						ELF_MAX_LAZY_REGIONS);
 			}
 		}
 	}
@@ -234,7 +266,8 @@ int elf_load_user(const void *elf_data, size_t elf_size, uint64_t *pml4,
 // ============================================================================
 
 static int elf_load_interp(const char *path, uint64_t *pml4,
-			   uint64_t *out_entry, uint64_t *out_base)
+			   uint64_t *out_entry, uint64_t *out_base,
+			   elf_load_result_t *main_result)
 {
 	vfs_file_t *file = NULL;
 	int ret = vfs_open(path, 0, &file);
@@ -280,6 +313,19 @@ static int elf_load_interp(const char *path, uint64_t *pml4,
 	kfree(buf);
 	if (ret != 0)
 		return ret;
+
+	/* Propagate the interpreter's lazy BSS ranges into the main result
+	 * so the caller registers them alongside the executable's. */
+	if (main_result) {
+		for (int i = 0; i < ir.num_lazy_regions &&
+				main_result->num_lazy_regions <
+					ELF_MAX_LAZY_REGIONS;
+		     i++) {
+			main_result->lazy_regions
+				[main_result->num_lazy_regions++] =
+				ir.lazy_regions[i];
+		}
+	}
 
 	*out_entry = ir.entry_point;
 	*out_base = interp_base;
@@ -529,7 +575,7 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 
 	if (lr.has_interp) {
 		uint64_t ie = 0;
-		ret = elf_load_interp(lr.interp_path, pml4, &ie, &ib);
+		ret = elf_load_interp(lr.interp_path, pml4, &ie, &ib, &lr);
 		if (ret) {
 			kprintf("elf_exec: interp '%s' err %d\n",
 				lr.interp_path, ret);
@@ -565,6 +611,13 @@ int elf_exec(const char *path, char *const argv[], char *const envp[],
 	t->brk = lr.brk_start;
 	t->user_stack_top = USER_STACK_TOP;
 	t->mmap_base = USER_STACK_TOP - (4 * 1024 * 1024);
+
+	/* Register the loader's unmapped BSS ranges (executable + interp) as
+	 * lazy anonymous regions — zero-filled on first touch. */
+	for (int i = 0; i < lr.num_lazy_regions; i++)
+		task_register_lazy_region(t, lr.lazy_regions[i].start,
+					  lr.lazy_regions[i].length,
+					  lr.lazy_regions[i].prot);
 
 	/* Allocate per-process TLS page with random canary at fs:0x28.
      * This MUST happen before sched_enqueue_ready: on SMP an AP could
@@ -703,7 +756,7 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 
 	if (lr.has_interp) {
 		uint64_t ie = 0;
-		ret = elf_load_interp(lr.interp_path, pml4, &ie, &ib);
+		ret = elf_load_interp(lr.interp_path, pml4, &ie, &ib, &lr);
 		if (ret) {
 			mm_destroy_address_space(pml4);
 			return 0;
@@ -733,10 +786,22 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	cur->brk_start = lr.brk_start;
 	cur->brk = lr.brk_start;
 	cur->user_stack_top = USER_STACK_TOP_EXEC;
-	/* Clear stale mmap_region slots inherited from parent via fork+exec. */
-	for (int i = 0; i < TASK_MAX_MMAP; i++)
+	/* Clear stale mmap_region slots inherited from parent via fork+exec,
+	 * releasing any file references pinned for demand paging. */
+	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+		if (cur->mmap_regions[i].in_use && cur->mmap_regions[i].file)
+			vfs_close(cur->mmap_regions[i].file);
+		cur->mmap_regions[i].file = NULL;
+		cur->mmap_regions[i].lazy = false;
 		cur->mmap_regions[i].in_use = false;
+	}
 	cur->mmap_base = USER_STACK_TOP_EXEC - (4 * 1024 * 1024);
+
+	/* Register the new image's lazy BSS ranges (executable + interp). */
+	for (int i = 0; i < lr.num_lazy_regions; i++)
+		task_register_lazy_region(cur, lr.lazy_regions[i].start,
+					  lr.lazy_regions[i].length,
+					  lr.lazy_regions[i].prot);
 
 	for (int i = 3; i < TASK_MAX_FDS; i++) {
 		if (cur->fd_table[i]) {

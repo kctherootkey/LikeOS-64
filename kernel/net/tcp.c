@@ -925,6 +925,7 @@ static tcp_conn_t *tcp_alloc_conn(uint8_t *rx_buf, uint8_t *tx_buf)
 			conn->parent = NULL;
 			conn->retransmit_count = 0;
 			conn->retransmit_tick = 0;
+			conn->handshake_deadline = 0;
 			conn->time_wait_tick = 0;
 			conn->peer_mss = TCP_MSS;
 			conn->max_seg_size = TCP_MSS;
@@ -1323,6 +1324,38 @@ static void tcp_send_rst(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 			 TCP_RST | TCP_ACK, 0, NULL, 0);
 }
 
+/* Consume an in-order data payload arriving in FIN_WAIT_1 / FIN_WAIT_2.
+ * Half-close (RFC 793 §3.5): our FIN closed only OUR direction — the peer
+ * may legitimately still deliver data, typically a TLS close_notify sent
+ * in response to ours.  Ignoring it would leave rcv_nxt behind the peer's
+ * FIN, which the in-order FIN rule then (correctly) keeps refusing — the
+ * shutdown never completes cleanly.  Store what fits so a shutdown(SHUT_WR)
+ * reader can still recv() it; bytes beyond the ring stay unACKed for
+ * retransmission.  Caller holds conn->lock and guarantees seq == rcv_nxt. */
+static void tcp_consume_data_half_closed(tcp_conn_t *conn,
+					 const uint8_t *payload,
+					 uint16_t payload_len)
+{
+	if (!conn->rx_buf)
+		return;
+	uint32_t avail =
+		ring_free(conn->rx_head, conn->rx_tail, conn->rx_buf_size);
+	uint32_t copy = payload_len > avail ? avail : payload_len;
+	if (copy > 0) {
+		uint32_t first = conn->rx_buf_size - conn->rx_tail;
+		if (first > copy)
+			first = copy;
+		mm_memcpy(conn->rx_buf + conn->rx_tail, payload, first);
+		if (copy > first)
+			mm_memcpy(conn->rx_buf, payload + first, copy - first);
+		conn->rx_tail = (conn->rx_tail + copy) % conn->rx_buf_size;
+		conn->rcv_nxt += copy;
+		conn->rx_ready = 1;
+		poll_notify_io_ready();
+		sched_wake_channel((void *)&conn->rx_ready);
+	}
+}
+
 // ============================================================================
 // TCP Connect (active open)
 // ============================================================================
@@ -1341,6 +1374,9 @@ tcp_conn_t *tcp_connect(net_device_t *dev, uint32_t local_ip, uint32_t dst_ip,
 	uint8_t *new_rx = (uint8_t *)slab_alloc(TCP_RX_BUF_SIZE);
 	uint8_t *new_tx = (uint8_t *)slab_alloc(TCP_TX_BUF_SIZE);
 	if (!new_rx || !new_tx) {
+		WARN_RATELIMIT(
+			1, "tcp_connect: conn buffer alloc failed (rx=%d tx=%d)",
+			new_rx != NULL, new_tx != NULL);
 		if (new_rx)
 			slab_free(new_rx);
 		if (new_tx)
@@ -1380,6 +1416,9 @@ tcp_conn_t *tcp_connect(net_device_t *dev, uint32_t local_ip, uint32_t dst_ip,
 		conn = tcp_alloc_conn(new_rx, new_tx);
 		if (!conn) {
 			spin_unlock_irqrestore(&tcp_lock, flags);
+			WARN_RATELIMIT(
+				1,
+				"tcp_connect: conn table full even after TIME_WAIT reap");
 			slab_free(new_rx);
 			slab_free(new_tx);
 			return NULL;
@@ -1403,6 +1442,7 @@ tcp_conn_t *tcp_connect(net_device_t *dev, uint32_t local_ip, uint32_t dst_ip,
 	conn->state = TCP_STATE_SYN_SENT;
 	conn->retransmit_tick = timer_ticks() + TCP_SYN_RETRANSMIT_TICKS;
 	conn->retransmit_count = 0;
+	conn->handshake_deadline = timer_ticks() + TCP_HANDSHAKE_TIMEOUT_TICKS;
 
 	// Publish: 4-tuple is set, now lock-free walkers may match this slot.
 	tcp_publish_conn(conn);
@@ -1431,6 +1471,9 @@ tcp_conn_t *tcp_listen(net_device_t *dev, uint32_t local_ip,
 	uint8_t *new_rx = (uint8_t *)slab_alloc(TCP_RX_BUF_SIZE);
 	uint8_t *new_tx = (uint8_t *)slab_alloc(TCP_TX_BUF_SIZE);
 	if (!new_rx || !new_tx) {
+		WARN_RATELIMIT(
+			1, "tcp_listen: conn buffer alloc failed (rx=%d tx=%d)",
+			new_rx != NULL, new_tx != NULL);
 		if (new_rx)
 			slab_free(new_rx);
 		if (new_tx)
@@ -1450,6 +1493,8 @@ tcp_conn_t *tcp_listen(net_device_t *dev, uint32_t local_ip,
 	}
 	if (!conn) {
 		spin_unlock_irqrestore(&tcp_lock, flags);
+		WARN_RATELIMIT(
+			1, "tcp_listen: conn table full even after TIME_WAIT reap");
 		slab_free(new_rx);
 		slab_free(new_tx);
 		return NULL;
@@ -1922,6 +1967,8 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 			new_conn->retransmit_count = 0;
 			new_conn->retransmit_tick =
 				timer_ticks() + TCP_SYN_RETRANSMIT_TICKS;
+			new_conn->handshake_deadline =
+				timer_ticks() + TCP_HANDSHAKE_TIMEOUT_TICKS;
 
 			// RFC 7323/2018 — adopt peer-offered options
 			if (pop.ts_present) {
@@ -2289,6 +2336,15 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 		if (conn->ts_enabled && pop.ts_present) {
 			if ((int32_t)(pop.tsval - conn->ts_recent) < 0 &&
 			    payload_len > 0) {
+				// Silent data discard — should essentially never
+				// fire on loopback; make it visible so timestamp
+				// pollution is diagnosable and not just "recv
+				// mysteriously came up short".
+				WARN_RATELIMIT(
+					1,
+					"tcp_rx: PAWS drop (tsval=%u ts_recent=%u len=%u port %u->%u)",
+					pop.tsval, conn->ts_recent, payload_len,
+					src_port, dst_port);
 				tcp_queue_ack_locked(conn);
 				ack_pending = 1;
 				break;
@@ -2612,26 +2668,52 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 			}
 		}
 
-		// Process FIN
+		// Process FIN — only when it lands exactly in order (RFC 793:
+		// the FIN occupies the sequence position one past the last data
+		// byte).  Honoring an out-of-order FIN (earlier data still
+		// missing or only partially stored) would jump rcv_nxt over the
+		// hole — silently discarding the missing bytes, ACKing them as
+		// received, and turning the reader's recv() into a false EOF
+		// with truncated data.  Dup-ACK instead; the peer retransmits
+		// the hole and the FIN gets re-processed in order.
 		if (tcp_flags & TCP_FIN) {
-			conn->rcv_nxt = seq + payload_len + 1;
-			conn->state = TCP_STATE_CLOSE_WAIT;
-			conn->rx_ready = 1; // Wake up reader (EOF)
-			poll_notify_io_ready();
-			sched_wake_channel((void *)&conn->rx_ready);
-
+			if (seq + payload_len == conn->rcv_nxt) {
+				conn->rcv_nxt += 1;
+				conn->state = TCP_STATE_CLOSE_WAIT;
+				conn->rx_ready = 1; // Wake up reader (EOF)
+				poll_notify_io_ready();
+				sched_wake_channel((void *)&conn->rx_ready);
+			} else {
+				WARN_RATELIMIT(
+					1,
+					"tcp_rx: out-of-order FIN refused (seq=%u len=%u rcv_nxt=%u)",
+					seq, payload_len, conn->rcv_nxt);
+			}
 			tcp_queue_ack_locked(conn);
 			ack_pending = 1;
 		}
 		break;
 
 	case TCP_STATE_FIN_WAIT_1:
+		// Half-close: consume in-order data (e.g. the peer's TLS
+		// close_notify) so its FIN lands exactly at rcv_nxt below.
+		if (payload_len > 0 && seq == conn->rcv_nxt) {
+			tcp_consume_data_half_closed(conn, payload,
+						     payload_len);
+			tcp_queue_ack_locked(conn);
+			ack_pending = 1;
+		}
 		if (tcp_flags & TCP_ACK) {
 			if (ack == conn->snd_nxt) {
 				conn->snd_una = ack;
 				tcp_ack_inflight(conn, ack);
-				if (tcp_flags & TCP_FIN) {
-					conn->rcv_nxt = seq + payload_len + 1;
+				// Same in-order FIN rule as ESTABLISHED: a FIN
+				// beyond rcv_nxt means data is still missing —
+				// don't jump the hole, dup-ACK and wait for the
+				// retransmit.
+				if ((tcp_flags & TCP_FIN) &&
+				    seq + payload_len == conn->rcv_nxt) {
+					conn->rcv_nxt += 1;
 					conn->state = TCP_STATE_TIME_WAIT;
 					conn->time_wait_tick =
 						timer_ticks() +
@@ -2642,24 +2724,48 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 					conn->state = TCP_STATE_FIN_WAIT_2;
 					conn->fin_wait_2_deadline =
 						timer_ticks() + 6000; // 60s
+					// An out-of-order FIN (data hole still
+					// unfilled) just gets a dup-ACK; the
+					// peer retransmits and the FIN is
+					// re-processed in order in FIN_WAIT_2.
+					if (tcp_flags & TCP_FIN) {
+						tcp_queue_ack_locked(conn);
+						ack_pending = 1;
+					}
 				}
 			}
 		}
 		if ((tcp_flags & TCP_FIN) &&
 		    conn->state == TCP_STATE_FIN_WAIT_1) {
-			conn->rcv_nxt = seq + payload_len + 1;
-			conn->state = TCP_STATE_CLOSING;
+			// In-order FIN only; an OOO FIN gets the dup-ACK and
+			// is re-processed once the peer fills the hole.
+			if (seq + payload_len == conn->rcv_nxt) {
+				conn->rcv_nxt += 1;
+				conn->state = TCP_STATE_CLOSING;
+			}
 			tcp_queue_ack_locked(conn);
 			ack_pending = 1;
 		}
 		break;
 
 	case TCP_STATE_FIN_WAIT_2:
+		// Half-close: consume in-order data (see FIN_WAIT_1).
+		if (payload_len > 0 && seq == conn->rcv_nxt)
+			tcp_consume_data_half_closed(conn, payload,
+						     payload_len);
 		if (tcp_flags & TCP_FIN) {
-			conn->rcv_nxt = seq + payload_len + 1;
-			conn->state = TCP_STATE_TIME_WAIT;
-			conn->time_wait_tick =
-				timer_ticks() + TCP_TIME_WAIT_TICKS;
+			// In-order FIN only (see ESTABLISHED case).  An OOO
+			// FIN just gets the dup-ACK below; the peer
+			// retransmits the hole and the FIN is re-processed
+			// in order.
+			if (seq + payload_len == conn->rcv_nxt) {
+				conn->rcv_nxt += 1;
+				conn->state = TCP_STATE_TIME_WAIT;
+				conn->time_wait_tick =
+					timer_ticks() + TCP_TIME_WAIT_TICKS;
+			}
+		}
+		if (payload_len > 0 || (tcp_flags & TCP_FIN)) {
 			tcp_queue_ack_locked(conn);
 			ack_pending = 1;
 		}
@@ -2837,9 +2943,17 @@ void tcp_timer_tick(void)
 			tcp_send_ack(conn);
 		}
 
-		// Slow-loris / idle timeout: close ESTABLISHED connections that have
-		// sent no data for TCP_IDLE_TIMEOUT_TICKS (5 minutes by default).
-		if (conn->state == TCP_STATE_ESTABLISHED &&
+		// Slow-loris / idle timeout: close connections that have received
+		// nothing for TCP_IDLE_TIMEOUT_TICKS (5 minutes by default).
+		// Covers the closing states too, not just ESTABLISHED: since
+		// retransmit_count only advances on transmits that actually left
+		// the machine, a FIN_WAIT_1/CLOSING/LAST_ACK conn whose sends
+		// keep failing locally (skb exhaustion) would otherwise hold a
+		// table slot forever.
+		if ((conn->state == TCP_STATE_ESTABLISHED ||
+		     conn->state == TCP_STATE_FIN_WAIT_1 ||
+		     conn->state == TCP_STATE_CLOSING ||
+		     conn->state == TCP_STATE_LAST_ACK) &&
 		    conn->last_rx_tick != 0 &&
 		    (now - conn->last_rx_tick) > TCP_IDLE_TIMEOUT_TICKS) {
 			tcp_fail_connection(conn, ETIMEDOUT);
@@ -2856,17 +2970,29 @@ void tcp_timer_tick(void)
 		// Retransmission timeout
 		if (conn->state == TCP_STATE_SYN_SENT &&
 		    now >= conn->retransmit_tick) {
-			if (conn->retransmit_count >= TCP_MAX_RETRANSMITS) {
+			if (conn->retransmit_count >= TCP_MAX_RETRANSMITS ||
+			    (conn->handshake_deadline &&
+			     now >= conn->handshake_deadline)) {
 				tcp_fail_connection(conn, ETIMEDOUT);
 				goto unlock_conn;
 			}
-			// Retransmit SYN
-			tcp_send_syn_packet(conn->dev, conn->local_ip,
-					    conn->remote_ip, conn->local_port,
-					    conn->remote_port, conn->iss, 0,
-					    TCP_SYN, TCP_WINDOW_SIZE, conn);
-			conn->retransmit_count++;
-			conn->retransmit_tick = now + TCP_SYN_RETRANSMIT_TICKS;
+			// Retransmit SYN.  A local send failure (skb pool empty
+			// under load) is not network loss: retry quickly without
+			// consuming the attempt budget.  handshake_deadline
+			// bounds the total time either way.
+			if (tcp_send_syn_packet(conn->dev, conn->local_ip,
+						conn->remote_ip,
+						conn->local_port,
+						conn->remote_port, conn->iss, 0,
+						TCP_SYN, TCP_WINDOW_SIZE,
+						conn) >= 0) {
+				conn->retransmit_count++;
+				conn->retransmit_tick =
+					now + TCP_SYN_RETRANSMIT_TICKS;
+			} else {
+				conn->retransmit_tick =
+					now + TCP_LOCAL_DROP_RETRY_TICKS;
+			}
 		}
 
 		// SYN+ACK retransmit for half-open server-side connections.  The
@@ -2882,14 +3008,25 @@ void tcp_timer_tick(void)
 		// LISTEN but happily returns SYN_RECEIVED).
 		if (conn->state == TCP_STATE_SYN_RECEIVED &&
 		    conn->retransmit_tick && now >= conn->retransmit_tick) {
-			if (conn->retransmit_count >= TCP_MAX_RETRANSMITS) {
+			if (conn->retransmit_count >= TCP_MAX_RETRANSMITS ||
+			    (conn->handshake_deadline &&
+			     now >= conn->handshake_deadline)) {
 				conn->state = TCP_STATE_CLOSED;
 				do_free = 1;
 				goto unlock_conn;
 			}
-			tcp_send_synack_conn(conn, tcp_advertised_window(conn));
-			conn->retransmit_count++;
-			conn->retransmit_tick = now + TCP_SYN_RETRANSMIT_TICKS;
+			// Same local-drop rule as SYN_SENT: only transmits that
+			// actually left the machine consume the attempt budget.
+			if (tcp_send_synack_conn(conn,
+						 tcp_advertised_window(conn)) >=
+			    0) {
+				conn->retransmit_count++;
+				conn->retransmit_tick =
+					now + TCP_SYN_RETRANSMIT_TICKS;
+			} else {
+				conn->retransmit_tick =
+					now + TCP_LOCAL_DROP_RETRY_TICKS;
+			}
 		}
 
 		if ((conn->state == TCP_STATE_ESTABLISHED ||
@@ -2897,18 +3034,20 @@ void tcp_timer_tick(void)
 		     conn->state == TCP_STATE_LAST_ACK ||
 		     conn->state == TCP_STATE_CLOSING) &&
 		    conn->inflight_count > 0 && now >= conn->retransmit_tick) {
-			if (conn->retransmit_count >= TCP_MAX_RETRANSMITS) {
+			// The long give-up budget is reserved for connections an
+			// application is still actively using.  In the closing
+			// states nobody is waiting on the data any more and the
+			// conn only pins one of the TCP_MAX_CONNECTIONS slots —
+			// keep the short limit there so parallel stress churn
+			// cannot exhaust the table and starve fresh connect()s.
+			uint32_t retrans_limit =
+				conn->state == TCP_STATE_ESTABLISHED ?
+					TCP_MAX_DATA_RETRANSMITS :
+					TCP_MAX_RETRANSMITS;
+			if (conn->retransmit_count >= retrans_limit) {
 				tcp_fail_connection(conn, ETIMEDOUT);
 				goto unlock_conn;
 			}
-
-			// RFC 6298: on RTO, ssthresh = max(flightsize/2, 2*MSS), cwnd = 1.
-			// Karn: don't sample RTT on retransmits.  Exponential backoff.
-			uint32_t flight = conn->inflight_count;
-			conn->ssthresh = flight > 2 ? flight / 2 : 2;
-			conn->cwnd = 1;
-			conn->dup_acks = 0;
-			conn->rto_backoff++;
 
 			tcp_inflight_segment_t *seg = &conn->inflight[0];
 			// Skip retransmission for segments fully covered by a SACK block
@@ -2930,21 +3069,43 @@ void tcp_timer_tick(void)
 					}
 				}
 			}
-			if (seg) {
-				tcp_send_segment(conn->dev, conn->local_ip,
-						 conn->remote_ip,
-						 conn->local_port,
-						 conn->remote_port, seg->seq,
-						 conn->rcv_nxt, seg->flags,
-						 tcp_advertised_window(conn),
-						 seg->data, seg->len);
-				seg->retransmit_count++;
-				seg->send_us =
-					0; // invalidate RTT sample for retransmitted seg
+			// A failed transmit here is a local drop (skb pool
+			// exhausted under load), not evidence the network lost
+			// the segment: it must consume neither the give-up
+			// budget nor trigger the congestion penalty, or memory
+			// pressure alone can kill a healthy connection without
+			// a single packet reaching the peer.  Retry quickly —
+			// the pool drains within milliseconds.
+			if (seg &&
+			    tcp_send_segment(conn->dev, conn->local_ip,
+					     conn->remote_ip, conn->local_port,
+					     conn->remote_port, seg->seq,
+					     conn->rcv_nxt, seg->flags,
+					     tcp_advertised_window(conn),
+					     seg->data, seg->len) < 0) {
+				conn->retransmit_tick =
+					now + TCP_LOCAL_DROP_RETRY_TICKS;
+			} else {
+				if (seg) {
+					// RFC 6298: on RTO, ssthresh =
+					// max(flightsize/2, 2*MSS), cwnd = 1.
+					// Karn: don't sample RTT on
+					// retransmits.  Exponential backoff.
+					uint32_t flight = conn->inflight_count;
+					conn->ssthresh =
+						flight > 2 ? flight / 2 : 2;
+					conn->cwnd = 1;
+					conn->dup_acks = 0;
+					conn->rto_backoff++;
+					seg->retransmit_count++;
+					seg->send_us =
+						0; // invalidate RTT sample for retransmitted seg
+					conn->retransmit_count++;
+					conn->total_retrans++;
+				}
+				conn->retransmit_tick =
+					now + tcp_rto_ticks(conn);
 			}
-			conn->retransmit_count++;
-			conn->total_retrans++;
-			conn->retransmit_tick = now + tcp_rto_ticks(conn);
 		}
 
 		// SO_KEEPALIVE: send 0-byte probe at seq=snd_una-1 after idle.

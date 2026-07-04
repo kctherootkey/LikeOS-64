@@ -345,6 +345,18 @@ typedef struct {
 	char interp_path[256]; // Interpreter path from PT_INTERP
 	int has_interp; // Whether PT_INTERP was found
 	int is_dynamic; // Whether this is ET_DYN
+
+	/* Demand paging: page ranges the loader deliberately left unmapped
+	 * (BSS pages with no file bytes).  The caller registers these as
+	 * lazy anonymous regions on the task so the fault handler zero-fills
+	 * them on first touch. */
+#define ELF_MAX_LAZY_REGIONS 8
+	struct {
+		uint64_t start;
+		uint64_t length;
+		uint64_t prot; // PROT_* protection
+	} lazy_regions[ELF_MAX_LAZY_REGIONS];
+	int num_lazy_regions;
 } elf_load_result_t;
 
 // Function prototypes

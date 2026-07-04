@@ -60,6 +60,25 @@ static inline bool is_phys_in_direct_map(uint64_t phys_addr)
 // Function to get dynamic kernel heap start address
 uint64_t mm_get_kernel_heap_start(void);
 
+/* ---- Demand paging ----------------------------------------------------
+ * Resolve a not-present fault on a user address against the current
+ * task's lazy regions (anonymous mmap / brk heap / ELF BSS: zero-fill;
+ * file-backed private mmap: page-in from the backing file).  Returns 1
+ * if the fault was resolved and execution may resume, 0 if the address
+ * is not covered by any lazy region (genuine fault).
+ * `from_kernel_mode` is diagnostic: file page-in from a kernel-mode
+ * fault means a pre-fault shield is missing at some user-copy site. */
+int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode);
+
+/* Pre-fault a user buffer range before copying to/from it while holding
+ * FS/socket locks: materialises lazy pages (and resolves COW when the
+ * copy will WRITE into the buffer) so no page fault needing file I/O can
+ * fire inside a lock-holding copy loop.  Anonymous zero-fill faults are
+ * safe from any context, so this shield only *needs* to run where the
+ * buffer might overlap a file-backed lazy mapping — but it is cheap and
+ * called unconditionally from the read/write/send/recv entry points. */
+void mm_prefault_user_range(uint64_t addr, uint64_t len, int for_write);
+
 // Page flags for virtual memory
 #define PAGE_PRESENT 0x001
 #define PAGE_WRITABLE 0x002
@@ -174,6 +193,11 @@ typedef struct {
 	uint64_t heap_free;
 	uint32_t allocations;
 	uint32_t deallocations;
+	/* Ownership breakdown of used pages — lets memstat attribute growth
+	 * to a subsystem instead of showing one opaque "used" number. */
+	uint64_t slab_pages; // pages held by the slab allocator (incl. large)
+	uint64_t slab_large_active; // outstanding large allocations (count)
+	uint64_t pagecache_pages; // file/page cache pages
 } memory_stats_t;
 
 // Heap block header

@@ -273,6 +273,7 @@ typedef enum {
 } task_privilege_t;
 
 // Memory region for mmap tracking
+struct vfs_file; /* forward — region may pin a file for demand paging */
 typedef struct mmap_region {
 	uint64_t start; // Virtual start address
 	uint64_t length; // Length in bytes
@@ -281,6 +282,13 @@ typedef struct mmap_region {
 	int fd; // File descriptor (-1 for anonymous)
 	uint64_t offset; // Offset in file
 	bool in_use; // Whether this slot is used
+	/* Demand paging: lazy regions have NO pages mapped up front; the
+	 * page-fault handler materialises them on first touch (zero-fill for
+	 * anonymous, page-in via `file` for file-backed).  `file` holds a
+	 * vfs reference so the mapping survives close(fd); fork adds a ref
+	 * per child, munmap/exec/exit release it. */
+	bool lazy;
+	struct vfs_file *file; // backing file (NULL for anonymous)
 } mmap_region_t;
 
 // Saved interrupt frame for preemptive context switch
@@ -494,6 +502,21 @@ void sched_yield_in_kernel(void); // In-kernel cooperative yield (no syscall)
 void sched_run_ready(void);
 task_t *sched_current(void);
 int sched_has_user_tasks(void); // Check if any user tasks are running
+
+/* Owner of the address-space bookkeeping (mmap_regions, brk, mmap_base).
+ * Threads share the leader's address space, so all VM bookkeeping must be
+ * read and written through the group leader — a thread's own task_t copy
+ * of these fields is stale. */
+static inline task_t *task_mm_owner(task_t *t)
+{
+	return (t && t->group_leader) ? t->group_leader : t;
+}
+
+/* Register a lazy (demand-paged) anonymous region on a task — used by the
+ * ELF loader for BSS ranges.  Returns 0 on success, -1 if the region table
+ * is full. */
+int task_register_lazy_region(task_t *task, uint64_t start, uint64_t length,
+			      uint64_t prot);
 
 // Preemptive scheduling API
 void sched_preempt(
