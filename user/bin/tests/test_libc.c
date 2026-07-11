@@ -5,6 +5,7 @@
 #include <sched.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <malloc.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -394,6 +395,85 @@ static void *detached_thread_fn(void *arg)
 {
 	(void)arg;
 	g_detached_thread_ran = 1;
+	return NULL;
+}
+
+// For malloc cross-thread free test: producers allocate and publish blocks,
+// consumers verify and free them (exercises frees on a foreign arena).
+#define XT_MBOX 128
+static void *g_xt_mbox[XT_MBOX];
+static size_t g_xt_sz[XT_MBOX];
+static pthread_mutex_t g_xt_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_xt_prod_done = 0;
+static volatile long g_xt_produced = 0;
+static volatile long g_xt_consumed = 0;
+static volatile long g_xt_errors = 0;
+
+static void *xt_producer_fn(void *arg)
+{
+	unsigned long st = 0x1111UL + (unsigned long)(long)arg;
+	for (int i = 0; i < 3000; i++) {
+		st ^= st << 13;
+		st ^= st >> 7;
+		st ^= st << 17;
+		size_t sz = 16 + (st % 4096);
+		unsigned char *p = malloc(sz);
+		if (!p) {
+			__sync_fetch_and_add(&g_xt_errors, 1);
+			continue;
+		}
+		memset(p, (int)(sz & 0xff), sz);
+		int placed = 0;
+		while (!placed) {
+			pthread_mutex_lock(&g_xt_lock);
+			for (int s = 0; s < XT_MBOX; s++) {
+				if (!g_xt_mbox[s]) {
+					g_xt_sz[s] = sz;
+					g_xt_mbox[s] = p;
+					placed = 1;
+					break;
+				}
+			}
+			pthread_mutex_unlock(&g_xt_lock);
+			if (!placed)
+				sched_yield();
+		}
+		__sync_fetch_and_add(&g_xt_produced, 1);
+		/* local churn on this thread's own cache/arena */
+		void *q = malloc(1 + (st % 512));
+		free(q);
+	}
+	return NULL;
+}
+
+static void *xt_consumer_fn(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		unsigned char *p = NULL;
+		size_t sz = 0;
+		pthread_mutex_lock(&g_xt_lock);
+		for (int s = 0; s < XT_MBOX; s++) {
+			if (g_xt_mbox[s]) {
+				p = g_xt_mbox[s];
+				sz = g_xt_sz[s];
+				g_xt_mbox[s] = NULL;
+				break;
+			}
+		}
+		pthread_mutex_unlock(&g_xt_lock);
+		if (p) {
+			if (p[0] != (unsigned char)(sz & 0xff) ||
+			    p[sz - 1] != (unsigned char)(sz & 0xff))
+				__sync_fetch_and_add(&g_xt_errors, 1);
+			free(p);
+			__sync_fetch_and_add(&g_xt_consumed, 1);
+		} else {
+			if (g_xt_prod_done && g_xt_consumed >= g_xt_produced)
+				break;
+			sched_yield();
+		}
+	}
 	return NULL;
 }
 
@@ -1102,6 +1182,475 @@ int main(int argc, char **argv)
 		test_result("strcpy/strcat/strlen", len == 13);
 		free(buf);
 		test_pass("free() completed");
+	}
+
+	// ========================================
+	// Test: malloc alignment
+	// ========================================
+	printf("\n[TEST] malloc alignment\n");
+	{
+		static const size_t asz[] = { 1,    2,    3,	 8,     13,
+					      16,   17,   24,	 31,    32,
+					      100,  555,  1023,	 1024,  4097,
+					      65537, 200000 };
+		void *aptr[sizeof(asz) / sizeof(asz[0])];
+		int all_ok = 1, align_ok = 1;
+		for (unsigned ai = 0; ai < sizeof(asz) / sizeof(asz[0]); ai++) {
+			aptr[ai] = malloc(asz[ai]);
+			if (!aptr[ai]) {
+				all_ok = 0;
+			} else {
+				if (((unsigned long)aptr[ai] & 15UL) != 0)
+					align_ok = 0;
+				memset(aptr[ai], 0xAB, asz[ai]);
+			}
+		}
+		test_result("all sizes allocate", all_ok);
+		test_result("all pointers 16-byte aligned", align_ok);
+		for (unsigned ai = 0; ai < sizeof(asz) / sizeof(asz[0]); ai++)
+			free(aptr[ai]);
+		test_pass("all freed");
+	}
+
+	// ========================================
+	// Test: malloc(0) and free(NULL)
+	// ========================================
+	printf("\n[TEST] malloc(0) and free(NULL)\n");
+	{
+		void *z1 = malloc(0);
+		void *z2 = malloc(0);
+		test_result("malloc(0) returns non-NULL", z1 != NULL);
+		test_result("malloc(0) pointers are unique",
+			    z2 != NULL && z2 != z1);
+		free(z1);
+		free(z2);
+		free(NULL);
+		test_pass("free(NULL) is a no-op");
+	}
+
+	// ========================================
+	// Test: malloc thread-cache reuse
+	// ========================================
+	printf("\n[TEST] malloc thread-cache reuse\n");
+	{
+		void *t1 = malloc(64);
+		memset(t1, 1, 64);
+		free(t1);
+		void *t2 = malloc(64);
+		test_result("same-size realloc reuses freed block", t2 == t1);
+		free(t2);
+	}
+
+	// ========================================
+	// Test: malloc corruption detection.  A detected corruption always
+	// aborts the process (production prints a generic notice, a DEBUG
+	// build prints details); each case runs in a child so the abort is
+	// contained and observable as a non-zero exit.
+	// ========================================
+	printf("\n[TEST] malloc corruption aborts\n");
+	{
+		/* tcache double free */
+		pid_t dfpid = fork();
+		if (dfpid == 0) {
+			char *dp = malloc(200);
+			free(dp);
+			free(dp);
+			_exit(0); /* only reached if the abort did not fire */
+		}
+		int dfst = 0;
+		waitpid(dfpid, &dfst, 0);
+		test_result("tcache double free aborts",
+			    !(WIFEXITED(dfst) && WEXITSTATUS(dfst) == 0));
+
+		/* fast-bin top double free (fill the thread cache first) */
+		dfpid = fork();
+		if (dfpid == 0) {
+			void *dfb[9];
+			for (int di = 0; di < 9; di++)
+				dfb[di] = malloc(100);
+			for (int di = 0; di < 9; di++)
+				free(dfb[di]);
+			free(dfb[8]);
+			_exit(0);
+		}
+		waitpid(dfpid, &dfst, 0);
+		test_result("fast-bin double free aborts",
+			    !(WIFEXITED(dfst) && WEXITSTATUS(dfst) == 0));
+
+		/* free of a non-heap pointer */
+		dfpid = fork();
+		if (dfpid == 0) {
+			int on_stack = 42;
+			free(&on_stack);
+			_exit(0);
+		}
+		waitpid(dfpid, &dfst, 0);
+		test_result("free of non-heap pointer aborts",
+			    !(WIFEXITED(dfst) && WEXITSTATUS(dfst) == 0));
+
+		/* the parent allocator is untouched by the children */
+		void *dchk = malloc(200);
+		test_result("allocator alive after corruption aborts",
+			    dchk != NULL);
+		free(dchk);
+	}
+
+	// ========================================
+	// Test: realloc grow/shrink
+	// ========================================
+	printf("\n[TEST] realloc grow/shrink\n");
+	{
+		char *rp = malloc(1024);
+		for (int ri = 0; ri < 1024; ri++)
+			rp[ri] = (char)ri;
+		char *rs = realloc(rp, 100);
+		test_result("shrink keeps the block in place", rs == rp);
+		int rok = 1;
+		for (int ri = 0; ri < 100; ri++)
+			if (rs[ri] != (char)ri)
+				rok = 0;
+		test_result("shrink preserves content", rok);
+		free(rs);
+
+		char *rg = malloc(100000);
+		for (int ri = 0; ri < 100000; ri++)
+			rg[ri] = (char)(ri * 3);
+		char *rg2 = realloc(rg, 150000);
+		test_result("grow succeeds", rg2 != NULL);
+		rok = 1;
+		for (int ri = 0; ri < 100000; ri++)
+			if (rg2[ri] != (char)(ri * 3))
+				rok = 0;
+		test_result("grow preserves content", rok);
+		free(rg2);
+
+		char *rn = realloc(NULL, 64);
+		test_result("realloc(NULL, n) acts as malloc", rn != NULL);
+		test_result("realloc(p, 0) frees and returns NULL",
+			    realloc(rn, 0) == NULL);
+	}
+
+	// ========================================
+	// Test: realloc across size classes
+	// ========================================
+	printf("\n[TEST] realloc across size classes\n");
+	{
+		static const size_t rcsz[] = { 32,     200,    3000,
+					       70000,  200000, 64 };
+		char *rc = malloc(rcsz[0]);
+		memset(rc, 0x5A, rcsz[0]);
+		size_t rprev = rcsz[0];
+		int rcok = (rc != NULL);
+		for (unsigned ri = 1;
+		     rcok && ri < sizeof(rcsz) / sizeof(rcsz[0]); ri++) {
+			rc = realloc(rc, rcsz[ri]);
+			if (!rc) {
+				rcok = 0;
+				break;
+			}
+			size_t keep = rprev < rcsz[ri] ? rprev : rcsz[ri];
+			if (keep > 512)
+				keep = 512;
+			for (size_t rj = 0; rj < keep; rj++)
+				if ((unsigned char)rc[rj] != 0x5A)
+					rcok = 0;
+			memset(rc, 0x5A, rcsz[ri]);
+			rprev = rcsz[ri];
+		}
+		test_result("realloc chain preserves prefix", rcok);
+		free(rc);
+	}
+
+	// ========================================
+	// Test: calloc
+	// ========================================
+	printf("\n[TEST] calloc\n");
+	{
+		unsigned char *cp = calloc(1000, 100);
+		test_result("calloc(1000,100) succeeds", cp != NULL);
+		int cok = 1;
+		for (int ci = 0; ci < 100000; ci++)
+			if (cp[ci])
+				cok = 0;
+		test_result("calloc memory is zero", cok);
+		memset(cp, 0xFF, 100000);
+		free(cp);
+
+		cp = calloc(1000, 100);
+		cok = 1;
+		for (int ci = 0; ci < 100000; ci++)
+			if (cp[ci])
+				cok = 0;
+		test_result("calloc re-zeroes recycled memory", cok);
+		free(cp);
+
+		errno = 0;
+		void *cbig = calloc((size_t)-1 / 2, 3);
+		test_result("calloc overflow returns NULL + ENOMEM",
+			    cbig == NULL && errno == ENOMEM);
+
+		cp = calloc(1, 2 * 1024 * 1024);
+		test_result("large calloc succeeds", cp != NULL);
+		cok = 1;
+		for (int ci = 0; ci < 2 * 1024 * 1024; ci += 4099)
+			if (cp[ci])
+				cok = 0;
+		test_result("large calloc is zero", cok);
+		free(cp);
+	}
+
+	// ========================================
+	// Test: aligned allocation family
+	// ========================================
+	printf("\n[TEST] aligned allocation\n");
+	{
+		static const size_t mal[] = { 16, 32, 64, 256, 4096, 65536 };
+		int maok = 1;
+		for (unsigned mi = 0; mi < sizeof(mal) / sizeof(mal[0]); mi++) {
+			void *mp = NULL;
+			int mrc = posix_memalign(&mp, mal[mi], 1000);
+			if (mrc != 0 || !mp ||
+			    ((unsigned long)mp % mal[mi]) != 0) {
+				maok = 0;
+			} else {
+				memset(mp, 3, 1000);
+				free(mp);
+			}
+		}
+		test_result("posix_memalign all alignments", maok);
+
+		void *mp = NULL;
+		test_result("posix_memalign rejects non-power-of-two",
+			    posix_memalign(&mp, 24, 100) == EINVAL);
+		test_result("posix_memalign accepts 8",
+			    posix_memalign(&mp, 8, 100) == 0);
+		free(mp);
+
+		mp = aligned_alloc(64, 100);
+		test_result("aligned_alloc works",
+			    mp && ((unsigned long)mp & 63UL) == 0);
+		free(mp);
+
+		mp = memalign(4096, 300000);
+		test_result("memalign large block",
+			    mp && ((unsigned long)mp & 4095UL) == 0);
+		if (mp) {
+			memset(mp, 9, 300000);
+			free(mp);
+		}
+
+		mp = valloc(100);
+		test_result("valloc page-aligned",
+			    mp && ((unsigned long)mp & 4095UL) == 0);
+		free(mp);
+	}
+
+	// ========================================
+	// Test: malloc_usable_size
+	// ========================================
+	printf("\n[TEST] malloc_usable_size\n");
+	{
+		static const size_t usz[] = { 1, 24, 100, 1000, 50000, 300000 };
+		int uok = 1;
+		for (unsigned ui = 0; ui < sizeof(usz) / sizeof(usz[0]); ui++) {
+			char *up = malloc(usz[ui]);
+			size_t u = malloc_usable_size(up);
+			if (u < usz[ui])
+				uok = 0;
+			memset(up, 7, u); /* the full usable size is writable */
+			free(up);
+		}
+		test_result("usable size >= request", uok);
+		test_result("usable size of NULL is 0",
+			    malloc_usable_size(NULL) == 0);
+		int uchurn = 1;
+		for (int ui = 0; ui < 100; ui++) {
+			void *up = malloc(200);
+			if (!up)
+				uchurn = 0;
+			free(up);
+		}
+		test_result("heap intact after full-usable writes", uchurn);
+	}
+
+	// ========================================
+	// Test: mallinfo2
+	// ========================================
+	printf("\n[TEST] mallinfo2\n");
+	{
+		struct mallinfo2 mia = mallinfo2();
+		char *mip = malloc(60000);
+		struct mallinfo2 mib = mallinfo2();
+		test_result("uordblks grows on malloc",
+			    mib.uordblks > mia.uordblks);
+		test_result("arena >= uordblks", mib.arena >= mib.uordblks);
+		free(mip);
+		struct mallinfo2 mic = mallinfo2();
+		test_result("free reflected in stats",
+			    mic.fordblks > mib.fordblks ||
+			    mic.uordblks < mib.uordblks);
+	}
+
+	// ========================================
+	// Test: malloc_trim
+	// ========================================
+	printf("\n[TEST] malloc_trim\n");
+	{
+		void *tp[16];
+		for (int ti = 0; ti < 16; ti++)
+			tp[ti] = malloc(60000);
+		for (int ti = 0; ti < 16; ti++)
+			free(tp[ti]);
+		int tr = malloc_trim(0);
+		test_result("malloc_trim returns 0 or 1", tr == 0 || tr == 1);
+		int tok = 1;
+		for (int ti = 0; ti < 200; ti++) {
+			void *q = malloc(1 + (ti * 37) % 5000);
+			if (!q)
+				tok = 0;
+			free(q);
+		}
+		test_result("heap works after trim", tok);
+	}
+
+	// ========================================
+	// Test: large allocations are mapped and released
+	// ========================================
+	printf("\n[TEST] malloc large mapped blocks\n");
+	{
+		struct mallinfo2 mbase = mallinfo2();
+		int mok = 1;
+		for (int mi = 0; mi < 10; mi++) {
+			unsigned char *mp = malloc(1024 * 1024);
+			if (!mp) {
+				mok = 0;
+				continue;
+			}
+			mp[0] = 1;
+			mp[512 * 1024] = 2;
+			mp[1024 * 1024 - 1] = 3;
+			if (mp[0] != 1 || mp[512 * 1024] != 2 ||
+			    mp[1024 * 1024 - 1] != 3)
+				mok = 0;
+			free(mp);
+		}
+		test_result("10x 1MB alloc/verify/free", mok);
+		struct mallinfo2 mafter = mallinfo2();
+		test_result("mapped blocks returned to the OS",
+			    mafter.hblks <= mbase.hblks);
+		unsigned char *mbig = malloc(64UL * 1024 * 1024);
+		test_result("64MB allocation succeeds", mbig != NULL);
+		if (mbig) {
+			mbig[0] = 1;
+			mbig[64UL * 1024 * 1024 - 1] = 2;
+			test_result("64MB block usable",
+				    mbig[0] == 1 &&
+				    mbig[64UL * 1024 * 1024 - 1] == 2);
+			free(mbig);
+		}
+	}
+
+	// ========================================
+	// Test: malloc many-sizes stress
+	// ========================================
+	printf("\n[TEST] malloc many-sizes stress\n");
+	{
+		enum { MS_SLOTS = 128 };
+		static void *msp[MS_SLOTS];
+		static size_t mss[MS_SLOTS];
+		unsigned long st = 0x123456789abcdefUL;
+		int mism = 0;
+		memset(msp, 0, sizeof(msp));
+		for (int it = 0; it < 20000; it++) {
+			st ^= st << 13;
+			st ^= st >> 7;
+			st ^= st << 17;
+			int s = (int)(st % MS_SLOTS);
+			if (msp[s]) {
+				unsigned char *m = msp[s];
+				unsigned char want =
+					(unsigned char)(s * 7 + (int)mss[s]);
+				if (m[0] != want || m[mss[s] / 2] != want ||
+				    m[mss[s] - 1] != want)
+					mism++;
+				free(m);
+				msp[s] = NULL;
+			} else {
+				size_t size = (it % 64 == 63)
+					? 100000 + (size_t)(st % 200000)
+					: 1 + (size_t)(st % 16384);
+				unsigned char *m = malloc(size);
+				if (!m) {
+					mism++;
+					continue;
+				}
+				unsigned char b =
+					(unsigned char)(s * 7 + (int)size);
+				m[0] = b;
+				m[size / 2] = b;
+				m[size - 1] = b;
+				msp[s] = m;
+				mss[s] = size;
+			}
+		}
+		for (int s = 0; s < MS_SLOTS; s++) {
+			if (!msp[s])
+				continue;
+			unsigned char *m = msp[s];
+			unsigned char want =
+				(unsigned char)(s * 7 + (int)mss[s]);
+			if (m[0] != want || m[mss[s] / 2] != want ||
+			    m[mss[s] - 1] != want)
+				mism++;
+			free(m);
+			msp[s] = NULL;
+		}
+		test_result("20000-op stress, zero corruptions", mism == 0);
+	}
+
+	// ========================================
+	// Test: malloc across fork
+	// ========================================
+	printf("\n[TEST] malloc across fork\n");
+	{
+		char *fbuf = malloc(50000);
+		test_result("parent allocation", fbuf != NULL);
+		if (fbuf) {
+			for (int fi = 0; fi < 50000; fi++)
+				fbuf[fi] = (char)(fi * 13);
+			pid_t fpid = fork();
+			if (fpid == 0) {
+				for (int fi = 0; fi < 50000; fi++)
+					if (fbuf[fi] != (char)(fi * 13))
+						_exit(2);
+				for (int fi = 0; fi < 2000; fi++) {
+					size_t fs = 1 + (fi * 977) % 8192;
+					char *fp = malloc(fs);
+					if (!fp)
+						_exit(3);
+					fp[0] = 1;
+					fp[fs - 1] = 2;
+					free(fp);
+				}
+				char *fbig = malloc(300000);
+				if (!fbig)
+					_exit(4);
+				fbig[0] = 5;
+				fbig[299999] = 6;
+				free(fbig);
+				_exit(0);
+			}
+			int fst = 0;
+			waitpid(fpid, &fst, 0);
+			test_result("child heap works after fork",
+				    WIFEXITED(fst) && WEXITSTATUS(fst) == 0);
+			int fok = 1;
+			for (int fi = 0; fi < 50000; fi++)
+				if (fbuf[fi] != (char)(fi * 13))
+					fok = 0;
+			test_result("parent pattern intact after fork", fok);
+			free(fbuf);
+		}
 	}
 
 	// ========================================
@@ -3931,6 +4480,30 @@ int main(int argc, char **argv)
 
 		pthread_cond_destroy(&g_bcast_cond);
 		pthread_mutex_destroy(&g_bcast_mutex);
+	}
+
+	// Test malloc under threads: allocate in one thread, free in another
+	printf("\n[TEST] malloc cross-thread free\n");
+	{
+		pthread_t xp1, xp2, xc1, xc2;
+		g_xt_prod_done = 0;
+		g_xt_produced = g_xt_consumed = g_xt_errors = 0;
+		memset((void *)g_xt_mbox, 0, sizeof(g_xt_mbox));
+		pthread_create(&xc1, NULL, xt_consumer_fn, NULL);
+		pthread_create(&xc2, NULL, xt_consumer_fn, NULL);
+		pthread_create(&xp1, NULL, xt_producer_fn, (void *)1L);
+		pthread_create(&xp2, NULL, xt_producer_fn, (void *)2L);
+		pthread_join(xp1, NULL);
+		pthread_join(xp2, NULL);
+		g_xt_prod_done = 1;
+		pthread_join(xc1, NULL);
+		pthread_join(xc2, NULL);
+		test_result("all blocks produced were consumed",
+			    g_xt_produced == g_xt_consumed);
+		test_result("no cross-thread corruption", g_xt_errors == 0);
+		char *xa = malloc(100);
+		test_result("allocator alive after thread churn", xa != NULL);
+		free(xa);
 	}
 
 	// Test rwlock

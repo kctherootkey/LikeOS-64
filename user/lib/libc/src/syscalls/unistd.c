@@ -317,9 +317,22 @@ int setgroups(int size, const int *list)
 	return 0;
 }
 
+/* Allocator fork hooks (src/malloc/malloc.c).  The allocator's locks must be
+ * held across fork so the child never inherits a lock left locked by another
+ * thread mid-allocation. */
+extern void __malloc_fork_prepare(void);
+extern void __malloc_fork_parent(void);
+extern void __malloc_fork_child(void);
+
 pid_t fork(void)
 {
+	__malloc_fork_prepare();
 	long ret = syscall0(SYS_FORK);
+	if (ret == 0) {
+		__malloc_fork_child();
+	} else {
+		__malloc_fork_parent();
+	}
 	if (ret < 0) {
 		errno = -ret;
 		return -1;

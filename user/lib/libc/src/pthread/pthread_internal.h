@@ -67,7 +67,11 @@ struct __pthread {
     int cancel_state;
     int cancel_type;
     int canceled;
-    
+
+    // Allocator per-thread state (owned by src/malloc/malloc.c)
+    void* malloc_tcache;            // Per-thread allocation cache (or dead sentinel)
+    void* malloc_arena;             // Arena this thread is attached to
+
     // Padding to ensure alignment
     char _pad[32];
 };
