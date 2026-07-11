@@ -22,6 +22,7 @@
 #include <kernel/ke/percpu.h>
 #include <kernel/ke/smp.h>
 #include <kernel/hal/lapic.h>
+#include <kernel/hal/cpu_pstate.h>
 #include <kernel/dev/hid/usb_hid.h>
 #include <kernel/dev/usb/usb_serial.h>
 #include <kernel/net/net.h>
@@ -93,6 +94,11 @@ __no_stack_protector void system_startup(boot_info_t *boot_info)
 	mm_enable_nx();
 	mm_remap_kernel_with_nx();
 	mm_enable_smep_smap();
+
+	// Request max-performance CPU frequency behavior (enable HWP, EPP=0) so the
+	// core does not linger in a low idle P-state.  Per-CPU MSR; APs do the same
+	// in ap_entry().  BSP prints the one-line summary.
+	cpu_pstate_init(1);
 
 	// Before removing identity mapping, remap framebuffer pointers to direct map
 	console_remap_to_direct_map();

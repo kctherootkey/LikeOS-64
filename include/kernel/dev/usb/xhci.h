@@ -36,7 +36,15 @@
 #define XHCI_USBLEGSUP_OS_OWNED (1 << 24) // HC OS Owned Semaphore
 
 // USB Legacy Support Control/Status (USBLEGCTLSTS) - offset 4 from USBLEGSUP
-#define XHCI_USBLEGCTLSTS_DISABLE_SMI 0xE0000000 // Disable all SMIs
+// xHCI spec 7.1.2.  The SMI *enable* bits are RW: USB SMI(0), Host System
+// Error(4), OS Ownership(13), PCI Command(14), BAR(15).  Clearing them stops
+// the firmware from taking an SMI on USB events once the OS owns the HC --
+// otherwise every USB interrupt triggers a BIOS SMI, stealing CPU invisibly
+// (a source of latency jitter on real hardware; hypervisors never emulate it).
+#define XHCI_USBLEGCTLSTS_SMI_ENABLES 0x0000E011 // bits 0,4,13,14,15 (RW)
+// SMI *status* bits are RW1C: OS Ownership Change(29), PCI Command(30), BAR(31).
+// Write 1 to acknowledge/clear any pending SMI event.
+#define XHCI_USBLEGCTLSTS_SMI_STATUS 0xE0000000 // bits 29,30,31 (RW1C)
 
 // HCCPARAMS1 bits
 #define XHCI_HCC_64BIT_ADDR (1 << 0) // 64-bit Addressing Capability

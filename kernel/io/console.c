@@ -80,6 +80,10 @@ static uint32_t cursor_last_y = 0; // Last cursor Y position
 
 // Batch output mode: suppresses cursor updates and rate-limits VRAM flushes
 static volatile int g_console_batch_active = 0;
+/* Set when a scrollbar redraw was requested during a batch.  The (expensive)
+ * pixel render is deferred to console_batch_end() so a streaming write that
+ * scrolls many lines repaints the scrollbar once instead of once per line. */
+static volatile int g_scrollbar_render_pending = 0;
 static void console_flush_unless_batch(void);
 static uint64_t g_last_flush_tick = 0;
 #define CONSOLE_FLUSH_INTERVAL \
@@ -577,8 +581,27 @@ static void console_sync_scrollbar(void)
 		.visible_lines = sb_visible_lines(),
 		.viewport_top = g_sb.viewport_top,
 	};
+	/* Geometry recompute is cheap; do it every call so the thumb position
+	 * is current.  The pixel render (track + gradient buttons + thumb) is
+	 * expensive and floods the dirty-region tracker, so during a batch it
+	 * is deferred to console_batch_end() and coalesced to a single repaint. */
 	scrollbar_sync_content(sb, &content);
-	scrollbar_render(sb);
+	if (g_console_batch_active)
+		g_scrollbar_render_pending = 1;
+	else
+		scrollbar_render(sb);
+}
+
+/* Render the scrollbar now if a batch deferred it.  Called from the flush
+ * points (console_batch_end / console_flush) outside console_lock. */
+static void console_render_scrollbar_if_pending(void)
+{
+	if (!g_scrollbar_render_pending)
+		return;
+	g_scrollbar_render_pending = 0;
+	scrollbar_t *sb = scrollbar_get_system();
+	if (sb)
+		scrollbar_render(sb);
 }
 
 // Draw a single pixel (32-bit BGRA format) - now uses optimized framebuffer
@@ -1726,13 +1749,21 @@ void console_putchar_batch(char c)
 	spin_unlock_irqrestore(&console_lock, flags);
 }
 
-// Flush deferred framebuffer changes to VRAM (rate-limited during batch output)
+// Flush deferred framebuffer changes to VRAM.
 void console_flush(void)
 {
+	/* Inside a batch, defer to console_batch_end() which flushes exactly
+	 * once for the whole write().  A scroll dirties the entire text area,
+	 * so an extra mid-batch flush is a full-frame VRAM blit (tens of ms on
+	 * a plain framebuffer) that batch_end would immediately repeat — a
+	 * `ls` at the bottom of the screen paid two of them back to back. */
+	if (g_console_batch_active)
+		return;
 	uint64_t now = timer_ticks();
 	if (now - g_last_flush_tick < CONSOLE_FLUSH_INTERVAL) {
 		return; // Skip — will be flushed by next interval or batch_end
 	}
+	console_render_scrollbar_if_pending();
 	g_last_flush_tick = now;
 	fb_flush_dirty_regions();
 }
@@ -1858,6 +1889,9 @@ void console_batch_end(void)
 		}
 		spin_unlock_irqrestore(&console_lock, flags);
 	}
+	/* Repaint the scrollbar once for the whole burst (deferred from every
+	 * scrolled line), then perform the single VRAM flush for this write(). */
+	console_render_scrollbar_if_pending();
 	g_last_flush_tick = timer_ticks();
 	fb_flush_dirty_regions();
 }

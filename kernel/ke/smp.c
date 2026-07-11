@@ -4,6 +4,8 @@
 #include <kernel/ke/smp.h>
 #include <kernel/hal/acpi.h>
 #include <kernel/hal/lapic.h>
+#include <kernel/hal/cpu_pstate.h>
+#include <kernel/dev/video/fb_optimize.h> // fb_pat_program_wc_this_cpu (per-CPU PAT)
 #include <kernel/ke/percpu.h>
 #include <kernel/io/console.h>
 #include <kernel/mm/memory.h>
@@ -136,6 +138,13 @@ __no_stack_protector void ap_entry(void)
 
 	// Enable SMEP/SMAP (per-CPU CR4 bits)
 	mm_enable_smep_smap();
+
+	// Program IA32_PAT entry 1 = WC (per-CPU MSR; must match the BSP or the
+	// framebuffer runs effective-UC on this AP -- ~90x slower flushes).
+	fb_pat_program_wc_this_cpu();
+
+	// Request max-performance frequency behavior on this AP (per-CPU HWP MSR).
+	cpu_pstate_init(0);
 
 	// Initialize SYSCALL/SYSRET MSRs (STAR, LSTAR, SFMASK, EFER.SCE are per-CPU)
 	// Without this, any 'syscall' instruction on this AP would cause #UD

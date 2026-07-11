@@ -103,6 +103,14 @@ void *fast_memcpy(void *dst, const void *src, size_t bytes);
 // Reprograms PAT MSR entry 1 to WC, then sets PWT on framebuffer 2MB pages
 int configure_pat_write_combining(uint64_t fb_phys_base, uint64_t fb_size);
 
+// Program THIS CPU's IA32_PAT entry 1 to WC.  IA32_PAT is per-logical-CPU and
+// must be identical on all processors: the BSP gets it via
+// configure_pat_write_combining(); every AP MUST call this from ap_entry(), or
+// the framebuffer (whose PDEs select PAT entry 1) is WC on the BSP but
+// effective-UC on that AP -- flushes then run ~90x slower depending on which
+// CPU performs them.
+void fb_pat_program_wc_this_cpu(void);
+
 // Fast character drawing: writes directly to back buffer, marks dirty once
 void fb_draw_char_fast(uint32_t x, uint32_t y, const uint8_t *glyph,
 		       uint32_t font_w, uint32_t font_h, uint32_t bytes_per_row,

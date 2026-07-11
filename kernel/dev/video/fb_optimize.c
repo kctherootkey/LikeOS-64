@@ -646,6 +646,31 @@ void fb_flush_dirty_regions_unlocked(void)
 		g_double_buffer.num_dirty_regions = 0;
 		return;
 	}
+
+	// Promote a largely-dirty frame (e.g. a scroll: one ~full-screen region)
+	// to a single contiguous whole-buffer copy: one linear sweep beats many
+	// strided per-scanline bursts and skips the per-region clamping below.
+	uint64_t dirty_px = 0;
+	uint64_t total_px =
+		(uint64_t)g_double_buffer.width * g_double_buffer.height;
+	for (uint32_t i = 0; i < g_double_buffer.num_dirty_regions; i++) {
+		dirty_rect_t *r = &g_double_buffer.dirty_regions[i];
+		if (!r->dirty || r->x2 < r->x1 || r->y2 < r->y1)
+			continue;
+		uint32_t rw = r->x2 - r->x1 + 1, rh = r->y2 - r->y1 + 1;
+		dirty_px += (uint64_t)rw * rh;
+	}
+	if (total_px && dirty_px * 2 >= total_px) {
+		size_t buffer_size = g_double_buffer.height *
+				     g_double_buffer.pitch * sizeof(uint32_t);
+		sse_copy_nt(g_double_buffer.front_buffer,
+			    g_double_buffer.back_buffer, buffer_size);
+		__asm__ volatile("sfence" ::: "memory");
+		g_double_buffer.pixels_copied += total_px;
+		g_double_buffer.num_dirty_regions = 0;
+		return;
+	}
+
 	// Copy individual dirty regions
 	for (uint32_t i = 0; i < g_double_buffer.num_dirty_regions; i++) {
 		dirty_rect_t *region = &g_double_buffer.dirty_regions[i];
@@ -1087,17 +1112,23 @@ int verify_write_combining(uint64_t fb_base)
 // framebuffer. This ensures the framebuffer VRAM is accessed with WC memory
 // type on real hardware, preventing the MTRR WC + PTE WB -> UC conflict.
 
-int configure_pat_write_combining(uint64_t fb_phys_base, uint64_t fb_size)
+/* Program this CPU's IA32_PAT so entry 1 = WC (default has WT there).
+ *
+ * IA32_PAT is a PER-LOGICAL-PROCESSOR MSR and the SDM requires all processors
+ * to use an identical PAT.  This function MUST run on every CPU: the BSP calls
+ * it via configure_pat_write_combining() at console init, and each AP calls it
+ * from ap_entry().  Skipping the APs was a real bug with a spectacular
+ * symptom: the framebuffer PDEs select PAT entry 1, so the fb was WC on the
+ * BSP but WT->effective-UC on the APs (firmware UC MTRR + PAT-WT combine to
+ * UC) -- the same 3MB flush took 134us or 12.8ms depending on which CPU the
+ * write() happened to run on ("scrolling is sometimes slow, sometimes fast",
+ * bare metal only, since hypervisors don't model the per-core PAT/MTRR mix). */
+void fb_pat_program_wc_this_cpu(void)
 {
-	if (!fb_phys_base || !fb_size)
-		return -1;
-
-	// Step 1: Reprogram PAT MSR
 	// Default PAT: PA0=WB(06) PA1=WT(04) PA2=UC-(07) PA3=UC(00)
 	//              PA4=WB(06) PA5=WT(04) PA6=UC-(07) PA7=UC(00)
 	// We change PA1 from WT(04) to WC(01)
 	// Then pages with PWT=1, PCD=0, PAT-bit=0 will use WC
-
 	uint64_t pat_msr = read_msr(MSR_IA32_PAT);
 	// Clear PA1 (bits 15:8) and set to WC (0x01)
 	pat_msr &= ~(0xFFULL << 8);
@@ -1124,6 +1155,15 @@ int configure_pat_write_combining(uint64_t fb_phys_base, uint64_t fb_size)
 	__asm__ volatile("mov %0, %%cr0" ::"r"(cr0)); // Restore CR0
 	__asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::
 				 : "rax", "memory");
+}
+
+int configure_pat_write_combining(uint64_t fb_phys_base, uint64_t fb_size)
+{
+	if (!fb_phys_base || !fb_size)
+		return -1;
+
+	// Step 1: Reprogram this CPU's PAT (APs repeat this in ap_entry)
+	fb_pat_program_wc_this_cpu();
 
 	// Step 2: Set PWT bit on direct-map page table entries for the framebuffer
 	// The direct map uses 2MB pages: PML4[272] -> PDPT -> PD
@@ -1181,6 +1221,7 @@ int configure_pat_write_combining(uint64_t fb_phys_base, uint64_t fb_size)
 #endif
 	return 0;
 }
+
 
 // ============================================================================
 // Fast Character Drawing - Direct Back Buffer Access

@@ -1,0 +1,46 @@
+# LikeOS-64 build artifacts
+#
+# Only compiler/linker output is ignored here; all source (including the
+# third-party ports/ trees and user/ sources) stays tracked.  Verified that no
+# file with these extensions is currently tracked, so nothing real is hidden.
+# NOTE: *.bin is intentionally NOT ignored -- 7 *.bin files are tracked assets.
+
+# --- Kernel / OS build tree (kernel.elf, bootloader.efi, disk images, objects)
+/build/
+
+# --- Compiled objects & libraries (userland libc/rtld and in-tree ports build
+#     their .o next to the sources).  *.o also covers *.pic.o and *.lib.o.
+*.o
+*.a
+*.so
+*.so.*
+*.lo
+*.la
+
+# --- Dependency files (openssl's in-tree build emits thousands of these).
+#     *.d also matches a couple of tracked config *directories* named "*.d",
+#     so re-include those so their contents stay tracked.
+*.d
+!*.service.d/
+!.ctags.d/
+
+# --- Port build stamps (e.g. ports/openssl-3.5.6/.likeos-configured[.built])
+.likeos-configured*
+
+# --- Built port executables
+/ports/nano-8.3/nano
+/ports/netcat-OpenBSD/nc
+/ports/openssl-3.5.6/apps/openssl
+
+# --- Compiled userland executables (built in-tree next to their .c sources).
+#     Ignore everything under the bin dirs, then re-include tracked sources.
+/user/bin/*
+!/user/bin/*.c
+!/user/bin/*.h
+!/user/bin/*.lds
+!/user/bin/Makefile
+!/user/bin/tests
+/user/bin/tests/*
+!/user/bin/tests/*.c
+!/user/bin/tests/*.h
+!/user/bin/tests/Makefile

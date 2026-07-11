@@ -207,6 +207,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/stack_guard.o \
 			  $(BUILD_DIR)/signal.o \
 			  $(BUILD_DIR)/lapic.o \
+			  $(BUILD_DIR)/cpu_pstate.o \
 			  $(BUILD_DIR)/acpi.o \
 			  $(ACPICA_OBJS) \
 			  $(BUILD_DIR)/percpu.o \
@@ -521,6 +522,9 @@ $(BUILD_DIR)/signal.o: $(KERNEL_DIR)/ke/signal.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/lapic.o: $(KERNEL_DIR)/hal/lapic.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/cpu_pstate.o: $(KERNEL_DIR)/hal/cpu_pstate.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/acpi.o: $(KERNEL_DIR)/hal/acpi.c | $(BUILD_DIR)

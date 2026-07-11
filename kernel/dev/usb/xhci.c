@@ -798,15 +798,17 @@ int xhci_bios_handoff(xhci_controller_t *ctrl)
 		// Success
 	}
 
-	// Disable SMI events on the controller (USBLEGCTLSTS register at offset + 4)
-	// This prevents BIOS SMI handlers from interfering with USB operation
+	// Disable USB legacy SMIs on the controller (USBLEGCTLSTS at offset + 4)
+	// now that the OS owns the HC.  Clear the RW SMI *enable* bits (bits
+	// 0,4,13,14,15) so the firmware stops taking an SMI on every USB event,
+	// and write 1 to the RW1C SMI *status* bits (29,30,31) to acknowledge any
+	// already-pending event.  (The previous mask cleared the status bits and
+	// left the enables set, so USB SMIs kept firing -- latency jitter on real
+	// hardware that a hypervisor never reproduces.)
 	uint32_t legctl_offset = offset + 4;
 	val = *(volatile uint32_t *)(ctrl->base + legctl_offset);
-
-	// Clear all SMI enable bits and status bits
-	// Bits 31:29 are SMI enables, clear them; bits 28:16 are write-1-to-clear status
-	val &= ~XHCI_USBLEGCTLSTS_DISABLE_SMI; // Clear SMI enables
-	val |= 0x00FF0000; // Clear all status bits by writing 1
+	val &= ~XHCI_USBLEGCTLSTS_SMI_ENABLES; // disable all USB SMI sources
+	val |= XHCI_USBLEGCTLSTS_SMI_STATUS; // W1C: clear pending SMI status
 	*(volatile uint32_t *)(ctrl->base + legctl_offset) = val;
 
 	return ST_OK;
