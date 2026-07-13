@@ -1227,6 +1227,10 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp res/etc/profile       $(EXT4_STAGING)/etc/profile
 	cp res/etc/root.profile  $(EXT4_STAGING)/root/.profile
 	chmod 0700 $(EXT4_STAGING)/root
+	# World-writable + sticky /tmp (1777, like every Unix): lets any user create
+	# their own /tmp/tmux-<uid> socket dir (tmux then makes it 0700); the sticky
+	# bit keeps users from deleting each other's files.
+	chmod 1777 $(EXT4_STAGING)/tmp
 	cp ports/openssl-3.5.6/apps/openssl.cnf $(EXT4_STAGING)/etc/ssl/openssl.cnf
 	cp res/etc/ssl/certs/ca-certificates.crt $(EXT4_STAGING)/etc/ssl/certs/ca-certificates.crt
 	# Signature file selects this device as the OS root; sample text file

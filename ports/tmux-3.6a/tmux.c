@@ -222,20 +222,10 @@ make_label(const char *label, char **cause)
 		xasprintf(cause, "%s is not a directory", base);
 		goto fail;
 	}
-	/*
-	 * LikeOS note: the root filesystem is FAT32, which does not track
-	 * per-file Unix permissions and reports a fixed mode of 0755 for
-	 * every directory.  The owner/permission safety check that tmux
-	 * normally performs against TMUX_SOCK_PERM is therefore meaningless
-	 * here; LikeOS is also a single-user system (uid 0).  Skip the
-	 * check rather than reject every socket directory.
-	 */
-#ifndef __LikeOS__
 	if (sb.st_uid != uid || (sb.st_mode & TMUX_SOCK_PERM) != 0) {
 		xasprintf(cause, "directory %s has unsafe permissions", base);
 		goto fail;
 	}
-#endif
 	xasprintf(&path, "%s/%s", base, label);
 	free(base);
 	return (path);
