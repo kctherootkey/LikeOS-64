@@ -4720,7 +4720,10 @@ int i2c_hid_init(void)
 		if (!has_dev)
 			continue;
 
-		void *stack = kalloc(16384);
+		/* Guarded kstack (guard page below) so a worker-thread stack
+		 * overflow faults cleanly instead of silently clobbering the
+		 * heap — same reasoning as ksoftirqd/AP-idle. */
+		void *stack = mm_alloc_guarded_kstack(16384);
 		if (!stack) {
 			kprintf("[I2C-HID] Failed to allocate worker stack for I2C%d\n",
 				ctrl->bus_id);

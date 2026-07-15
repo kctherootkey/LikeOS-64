@@ -3013,19 +3013,30 @@ bool mm_handle_cow_fault(uint64_t fault_addr)
  * final non-sleeping check+map. */
 static spinlock_t g_lazy_map_lock = SPINLOCK_INIT("lazymap");
 
-/* Serialises file page-in.  A region's backing vfs_file is shared with the
- * user's fd (vfs_dup), so the seek/read/seek-back sequence below must not
- * interleave with another faulting thread.  This is a sleeping-friendly
- * lock (page-in does disk I/O): atomic flag + yield. */
-static volatile int g_pagein_busy;
-static void pagein_lock(void)
+/* Serialises file page-in PER FILE HANDLE.  A region's backing vfs_file is
+ * shared with the user's fd and across the fork family (vfs_dup), so the
+ * seek/read/seek-back sequence below must not interleave with another
+ * faulting task using the SAME handle.  Unrelated processes open their own
+ * handles (rtld opens libraries per process), so their page-ins proceed in
+ * parallel — the previous GLOBAL flag serialised every page-in in the
+ * system and could starve a cold-starting process for seconds while
+ * another process fault-stormed (observed as the TLS-test child missing
+ * its 10 s ready deadline under parallel teststress).  Sleeping-friendly:
+ * atomic flag + yield.  Holders can no longer be killed in place (fatal
+ * signals defer to delivery points), so the flag is always released.
+ * task_close_open_files clears a flag its dying owner left behind
+ * (crash-abandon) before dropping the region's file reference. */
+static void pagein_lock(vfs_file_t *file)
 {
-	while (__atomic_test_and_set(&g_pagein_busy, __ATOMIC_ACQUIRE))
+	while (__atomic_test_and_set(&file->pagein_busy, __ATOMIC_ACQUIRE))
 		sched_yield_in_kernel();
+	task_t *cur = sched_current();
+	file->pagein_owner = cur ? (int64_t)cur->id : -1;
 }
-static void pagein_unlock(void)
+static void pagein_unlock(vfs_file_t *file)
 {
-	__atomic_clear(&g_pagein_busy, __ATOMIC_RELEASE);
+	file->pagein_owner = -1;
+	__atomic_clear(&file->pagein_busy, __ATOMIC_RELEASE);
 }
 
 int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode)
@@ -3086,7 +3097,7 @@ int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode)
 		 * pre-fault their buffers precisely so that lock-holding
 		 * copy loops never reach this path. */
 		(void)from_kernel_mode;
-		pagein_lock();
+		pagein_lock(file);
 		long saved = vfs_seek(file, 0, SEEK_CUR);
 		long got = 0;
 		if (saved >= 0 &&
@@ -3094,7 +3105,7 @@ int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode)
 			got = vfs_read(file, phys_to_virt(phys), PAGE_SIZE);
 			vfs_seek(file, saved, SEEK_SET);
 		}
-		pagein_unlock();
+		pagein_unlock(file);
 		if (got < 0)
 			got = 0;
 		/* Short read (EOF inside the mapping) — rest reads as zeros.

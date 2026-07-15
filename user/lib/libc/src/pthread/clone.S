@@ -143,5 +143,38 @@ clone:
 
 .size clone, .-clone
 
+/* void __unmapself(void *stack_base, size_t size, int exit_code)  [[noreturn]]
+ *
+ * Free THIS thread's own stack and exit, without ever touching the stack
+ * after it is unmapped.  A detached thread cannot let anyone else free its
+ * stack safely: reading a liveness flag inside the stack (the tid_futex) to
+ * decide when it is safe races the thread still running on that stack, and
+ * dereferencing such a flag after the region is gone faults.  Instead the
+ * thread unmaps its own stack here (rdi=base, rsi=size, rdx=exit_code are in
+ * registers, and munmap + exit use only registers + the syscall instruction —
+ * no push, pop, call, ret, or TLS access), then exits.  After the munmap the
+ * stack pointer and %fs base point at freed memory, but nothing reads them.
+ *
+ *   munmap(base, size);        // SYS_MUNMAP = 11 (per-thread exit below)
+ *   _exit(exit_code);          // SYS_EXIT   = 60
+ *
+ * exit_code is forwarded (not hardcoded 0): SYS_EXIT terminates only this
+ * thread, but if a detached thread is the LAST thread of the process its code
+ * becomes the process exit status, so it must be the caller's retval.  It is
+ * stashed in %r12 (callee-saved, so the kernel preserves it across the munmap
+ * syscall regardless of whether arg registers are clobbered).
+ */
+.global __unmapself
+.type __unmapself, @function
+__unmapself:
+    mov     %rdx, %r12          // save exit_code (survives the syscall in r12)
+    mov     $11, %rax           // SYS_MUNMAP
+    syscall                     // munmap(rdi=base, rsi=size); stack now gone
+    mov     %r12, %rdi          // exit_code
+    mov     $60, %rax           // SYS_EXIT
+    syscall
+    ud2                         // unreachable
+.size __unmapself, .-__unmapself
+
 /* Non-executable stack */
 .section .note.GNU-stack,"",@progbits

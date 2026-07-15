@@ -540,12 +540,16 @@ int usb_msd_block_read(block_device_t *dev, unsigned long lba,
 		return ST_NO_DEVICE;
 	}
 
-	// Serialize I/O to this device (sleeping mutex — IRQs stay enabled)
-	msd_io_lock(msd);
-
 	// Read in USB_MSD_BLOCK_CHUNK-sector chunks — large enough to amortize
 	// the CBW + CSW round-trip overhead per SCSI READ_10/WRITE_10
 	// transaction.  Each chunk reuses the device's persistent bounce buffer.
+	//
+	// The device mutex is taken PER CHUNK, not across the whole request:
+	// a multi-megabyte transfer otherwise monopolises the device end to
+	// end, and every other task's first disk access (page-in, metadata
+	// read) stalls behind it.  Per-chunk locking lets competing streams
+	// interleave at ~128 KB granularity; the extra lock/unlock per chunk
+	// is noise next to the transfer itself.
 	uint8_t *ptr = (uint8_t *)buf;
 	unsigned long remaining = count;
 	unsigned long current_lba = lba;
@@ -556,8 +560,10 @@ int usb_msd_block_read(block_device_t *dev, unsigned long lba,
 					      USB_MSD_BLOCK_CHUNK :
 					      remaining;
 
+		msd_io_lock(msd);
 		int st = usb_msd_read(msd, (uint32_t)current_lba,
 				      (uint32_t)chunk, ptr);
+		msd_io_unlock(msd);
 		if (st != ST_OK) {
 			msd_dbg("Block read failed at LBA %lu: st=%d\n",
 				current_lba, st);
@@ -570,7 +576,6 @@ int usb_msd_block_read(block_device_t *dev, unsigned long lba,
 		remaining -= chunk;
 	}
 
-	msd_io_unlock(msd);
 	return result;
 }
 
@@ -585,9 +590,7 @@ int usb_msd_block_write(block_device_t *dev, unsigned long lba,
 		return ST_NO_DEVICE;
 	}
 
-	// Serialize I/O to this device (sleeping mutex — IRQs stay enabled)
-	msd_io_lock(msd);
-
+	// Per-chunk device locking — same rationale as usb_msd_block_read.
 	const uint8_t *ptr = (const uint8_t *)buf;
 	unsigned long remaining = count;
 	unsigned long current_lba = lba;
@@ -598,8 +601,10 @@ int usb_msd_block_write(block_device_t *dev, unsigned long lba,
 					      USB_MSD_BLOCK_CHUNK :
 					      remaining;
 
+		msd_io_lock(msd);
 		int st = usb_msd_write(msd, (uint32_t)current_lba,
 				       (uint32_t)chunk, ptr);
+		msd_io_unlock(msd);
 		if (st != ST_OK) {
 			result = st;
 			break;
@@ -610,7 +615,6 @@ int usb_msd_block_write(block_device_t *dev, unsigned long lba,
 		remaining -= chunk;
 	}
 
-	msd_io_unlock(msd);
 	return result;
 }
 

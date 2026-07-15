@@ -593,6 +593,15 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 	unsigned long run_sectors = 0;
 	unsigned long run_count = 0;
 
+	/* Mapping phase.  Drivers with a shared mapping lock let the transfer
+	 * below run with no filesystem lock at all (they fence data-block
+	 * lifetime per inode); drivers without keep lock_io across both. */
+	int split = (sb->ops->lock_map != 0);
+	if (split)
+		sb->ops->lock_map(sb);
+	else
+		vfs_sb_lock_io(sb);
+
 	for (unsigned long pi = page_index;
 	     pi < file_pages && run_count < PC_COALESCE_MAX; pi++) {
 		if (pi != page_index && pagecache_lookup(cluster_id, pi))
@@ -627,8 +636,13 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 				}
 			}
 			if (!ok) {
-				if (run_count == 0)
+				if (run_count == 0) {
+					if (split)
+						sb->ops->unlock_map(sb);
+					else
+						vfs_sb_unlock_io(sb);
 					return 0;
+				}
 				break;
 			}
 			page_lba = vfs_sb_block_to_lba(sb, fc);
@@ -644,21 +658,40 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 		run_count++;
 	}
 
-	if (run_count == 0)
+	/* Mapping complete.  With a shared mapping lock the transfer below is
+	 * lock-free (the run cannot be freed/reused under us: the caller holds
+	 * the file's inode lock, which every data-freeing op takes exclusive).
+	 * Without one, lock_io stays held across the transfer (old behaviour;
+	 * released by pc_io_done below). */
+	if (split)
+		sb->ops->unlock_map(sb);
+#define pc_io_done(sb)                          \
+	do {                                    \
+		if (!split)                     \
+			vfs_sb_unlock_io((sb)); \
+	} while (0)
+
+	if (run_count == 0) {
+		pc_io_done(sb);
 		return 0;
+	}
 
 	// --- Single page fast path: read directly into page data ---
 	if (run_count == 1) {
 		pc_page_t *pg = pc_page_alloc();
-		if (!pg)
+		if (!pg) {
+			pc_io_done(sb);
 			return 0;
+		}
 		pg->cluster_id = cluster_id;
 		pg->page_index = page_index;
 		if (pc_read_sectors(bdev, run_start_lba, run_sectors,
 				    pg->data) != 0) {
 			pc_page_free(pg);
+			pc_io_done(sb);
 			return 0;
 		}
+		pc_io_done(sb);
 		unsigned long psb = page_index * PAGE_SIZE;
 		if (psb + PAGE_SIZE > file_size) {
 			unsigned long v = file_size - psb;
@@ -676,14 +709,18 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 	void *buf = kalloc(total_bytes);
 	if (!buf) {
 		pc_page_t *pg = pc_page_alloc();
-		if (!pg)
+		if (!pg) {
+			pc_io_done(sb);
 			return 0;
+		}
 		pg->cluster_id = cluster_id;
 		pg->page_index = page_index;
 		if (pc_read_sectors(bdev, run_start_lba, spp, pg->data) != 0) {
 			pc_page_free(pg);
+			pc_io_done(sb);
 			return 0;
 		}
+		pc_io_done(sb);
 		unsigned long psb = page_index * PAGE_SIZE;
 		if (psb + PAGE_SIZE > file_size) {
 			unsigned long v = file_size - psb;
@@ -698,8 +735,10 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 
 	if (pc_read_sectors(bdev, run_start_lba, run_sectors, buf) != 0) {
 		kfree(buf);
+		pc_io_done(sb);
 		return 0;
 	}
+	pc_io_done(sb);
 
 	// Distribute the big buffer into individual cache pages
 	pc_page_t *result = 0;
@@ -734,6 +773,7 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 
 	kfree(buf);
 	return result;
+#undef pc_io_done
 }
 
 // ============================================================================
@@ -775,16 +815,17 @@ pc_page_t *pagecache_get(unsigned long cluster_id, unsigned long page_index,
 	pagecache_reclaim_if_needed();
 
 	// 3. Try coalesced read: up to 64KB of contiguous pages in one transfer.
-	vfs_sb_lock_io(sb);
+	//    (Handles its own locking: mapping under the driver's shared map
+	//    lock when provided, transfer unlocked; else lock_io across both.)
 	pc_page_t *result = pc_coalesced_read(sb, cluster_id, start_cluster,
 					      page_index, file_size);
-	if (result) {
-		vfs_sb_unlock_io(sb);
+	if (result)
 		return result;
-	}
 
 	// 4. Fallback for fragmented files (block_size < PAGE_SIZE with
-	//    non-contiguous blocks inside a single page).
+	//    non-contiguous blocks inside a single page).  Collect the LBAs
+	//    under the mapping lock first, then read them with the same
+	//    locking policy as above.
 	{
 		const block_device_t *bdev = vfs_sb_bdev(sb);
 		unsigned long bs = vfs_sb_block_size(sb);
@@ -794,41 +835,57 @@ pc_page_t *pagecache_get(unsigned long cluster_id, unsigned long page_index,
 		if (blocks_per_page == 0)
 			blocks_per_page = 1;
 		unsigned long first_ci = page_index * blocks_per_page;
+		/* PAGE_SIZE / bs is at most 8 (512-byte blocks). */
+		unsigned long lbas[8];
+		unsigned long nlba = 0;
 
 		pc_page_t *new_pg = pc_page_alloc();
-		if (!new_pg) {
-			vfs_sb_unlock_io(sb);
+		if (!new_pg)
 			return 0;
-		}
 		new_pg->cluster_id = cluster_id;
 		new_pg->page_index = page_index;
+
+		int split = (sb->ops->lock_map != 0);
+		if (split)
+			sb->ops->lock_map(sb);
+		else
+			vfs_sb_lock_io(sb);
 
 		unsigned long cur_block =
 			pc_walk_chain(sb, start_cluster, first_ci);
 		if (cur_block == 0 || cur_block >= eoc) {
-			vfs_sb_unlock_io(sb);
+			if (split)
+				sb->ops->unlock_map(sb);
+			else
+				vfs_sb_unlock_io(sb);
 			pc_page_free(new_pg);
 			return 0;
 		}
+		for (unsigned long c = 0; c < blocks_per_page && c < 8; c++) {
+			if (cur_block == 0 || cur_block >= eoc)
+				break;
+			lbas[nlba++] = vfs_sb_block_to_lba(sb, cur_block);
+			if (c + 1 < blocks_per_page)
+				cur_block = vfs_sb_next_block(sb, cur_block);
+		}
+		if (split)
+			sb->ops->unlock_map(sb);
 
 		unsigned long secs_per_block = bs / ss;
 		unsigned offset = 0;
-		for (unsigned long c = 0; c < blocks_per_page; c++) {
-			if (cur_block == 0 || cur_block >= eoc)
-				break;
-			unsigned long lba = vfs_sb_block_to_lba(sb, cur_block);
-			int st = pc_read_sectors(bdev, lba, secs_per_block,
+		for (unsigned long c = 0; c < nlba; c++) {
+			int st = pc_read_sectors(bdev, lbas[c], secs_per_block,
 						 new_pg->data + offset);
 			if (st != 0) {
-				vfs_sb_unlock_io(sb);
+				if (!split)
+					vfs_sb_unlock_io(sb);
 				pc_page_free(new_pg);
 				return 0;
 			}
 			offset += bs;
-			if (c + 1 < blocks_per_page)
-				cur_block = vfs_sb_next_block(sb, cur_block);
 		}
-		vfs_sb_unlock_io(sb);
+		if (!split)
+			vfs_sb_unlock_io(sb);
 
 		if (offset < PAGE_SIZE)
 			mm_memset(new_pg->data + offset, 0, PAGE_SIZE - offset);

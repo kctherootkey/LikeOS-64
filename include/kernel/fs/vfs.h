@@ -158,6 +158,13 @@ struct vfs_file {
 	int flags; // O_CLOEXEC, O_RDONLY, etc.
 	int is_root_dir; // True if this is the root "/" directory
 	int dev_injected; // True if we've already injected /dev entry in readdir
+	/* Demand-paging page-in serialisation (mm_handle_demand_fault):
+	 * protects THIS handle's seek/read/seek-back sequence against a
+	 * concurrent faulting task sharing the handle (fork family).  Per-file
+	 * on purpose: a global flag serialised every page-in in the system and
+	 * starved cold-starting processes for seconds under parallel load. */
+	volatile int pagein_busy;
+	volatile int64_t pagein_owner; /* holder task id; stale when !busy */
 };
 
 // File descriptor flags

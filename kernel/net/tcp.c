@@ -472,6 +472,22 @@ static uint16_t tcp_advertised_window(tcp_conn_t *conn)
 	return (uint16_t)shifted;
 }
 
+// Window for SYN+ACK segments.  RFC 7323 §2.2: the window field in a segment
+// with the SYN bit set is NEVER scaled — the peer reads it raw (our own
+// SYN_SENT handler does exactly that: "SYN window unscaled").  Advertising
+// tcp_advertised_window() here shipped the >>rcv_wscale value (131071 >> 7 =
+// 1023), so every peer started its transfer against a 1023-byte send window
+// instead of 64 KB.  A 4 KB client burst then needed multiple ACK-clocked
+// round-trips right at connection start, and one lost/late ACK under stress
+// cascaded into RTO backoff and the intermittent teststress recv failures.
+// The stateless SYN-cookie path always advertised TCP_WINDOW_SIZE correctly.
+static uint16_t tcp_syn_window(tcp_conn_t *conn)
+{
+	uint32_t avail =
+		ring_free(conn->rx_head, conn->rx_tail, conn->rx_buf_size);
+	return avail > 0xFFFFu ? (uint16_t)0xFFFFu : (uint16_t)avail;
+}
+
 /* Linux-style TCP receive buffer auto-tuning.
  *
  * Throughput is BDP-limited: max_rate = rx_buf_size / RTT.  A fixed
@@ -1913,6 +1929,30 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 			uint64_t flags;
 			spin_lock_irqsave(&tcp_lock, &flags);
 
+			/* Duplicate-conn guard.  The tcp_find_conn() at the top
+			 * of tcp_rx ran LOCK-FREE, so between it and acquiring
+			 * tcp_lock here another CPU processing a racing SYN for
+			 * the SAME 4-tuple (a client SYN retransmit, or the
+			 * loopback self-connect delivering the peer's SYN on
+			 * another CPU) may have already allocated + published a
+			 * SYN_RECEIVED conn.  Re-check under the lock: without
+			 * this we would allocate a SECOND conn for one 4-tuple.
+			 * The client's data then lands on whichever conn
+			 * tcp_find_conn returns first while accept() hands the
+			 * listener the OTHER, empty conn — the server reads an
+			 * immediate 0-byte EOF although the client sent and
+			 * completed fine (intermittent "tcp eth0: recv 0/4096
+			 * rc=0" under parallel teststress).  Drop this SYN; the
+			 * existing conn's SYN-ACK (already sent, and rearmed by
+			 * the retransmit timer) drives the handshake. */
+			if (tcp_find_conn(local_ip, dst_port, src_ip,
+					  src_port)) {
+				spin_unlock_irqrestore(&tcp_lock, flags);
+				slab_free(nc_rx);
+				slab_free(nc_tx);
+				return;
+			}
+
 			tcp_conn_t *new_conn = tcp_alloc_conn(nc_rx, nc_tx);
 			if (!new_conn) {
 				// Table full.  Reap TIME_WAIT slots (RFC 6191) before
@@ -1993,7 +2033,7 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 
 			// Send SYN+ACK with mirrored options
 			tcp_send_synack_conn(new_conn,
-					     tcp_advertised_window(new_conn));
+					     tcp_syn_window(new_conn));
 			return;
 		}
 
@@ -2023,6 +2063,23 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 
 				uint64_t flags;
 				spin_lock_irqsave(&tcp_lock, &flags);
+
+				/* Same duplicate-conn guard as the SYN path: the
+				 * top-of-tcp_rx tcp_find_conn ran lock-free, so a
+				 * racing cookie-ACK (retransmit, or the loopback
+				 * self-connect delivering on another CPU) may have
+				 * already created + published the conn for this
+				 * 4-tuple.  Re-check under the lock so we never
+				 * mint a SECOND conn — otherwise the client's data
+				 * splits across two conns and accept() hands out
+				 * the wrong (empty) one. */
+				if (tcp_find_conn(local_ip, dst_port, src_ip,
+						  src_port)) {
+					spin_unlock_irqrestore(&tcp_lock, flags);
+					slab_free(cc_rx);
+					slab_free(cc_tx);
+					return;
+				}
 
 				tcp_conn_t *new_conn =
 					tcp_alloc_conn(cc_rx, cc_tx);
@@ -2218,7 +2275,7 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 			conn->retransmit_count = 0;
 			conn->retransmit_tick =
 				timer_ticks() + TCP_SYN_RETRANSMIT_TICKS;
-			tcp_send_synack_conn(conn, tcp_advertised_window(conn));
+			tcp_send_synack_conn(conn, tcp_syn_window(conn));
 		}
 		break;
 
@@ -2234,7 +2291,7 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 		// accept() hang under teststress network loops.
 		if ((tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK) &&
 		    seq == conn->irs) {
-			tcp_send_synack_conn(conn, tcp_advertised_window(conn));
+			tcp_send_synack_conn(conn, tcp_syn_window(conn));
 			tcp_lock_release(&conn->lock, flags);
 			return;
 		}
@@ -2316,9 +2373,25 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 			tcp_free_conn(conn);
 			return;
 		}
+		/* RFC 793 p.72 (SYN-RECEIVED, acceptable ACK): "enter ESTABLISHED
+		 * state and continue processing".  The segment that completes the
+		 * handshake may itself carry data: connect() returns as soon as
+		 * the SYN+ACK is processed, so the client's first data segment
+		 * (which also carries the ACK flag) races the deferred bare ACK
+		 * onto the loopback queue and regularly arrives here first.
+		 * Breaking out silently dropped that payload: rcv_nxt froze at
+		 * iss+1, the follow-up segments piled into the OOO queue, the
+		 * peer's FIN was refused as out-of-order (seq exactly
+		 * transfer-size ahead of rcv_nxt in dmesg), and the transfer
+		 * stalled until RTO retransmission — the intermittent teststress
+		 * recv failures.  Process the payload/FIN in ESTABLISHED. */
+		if (conn->state == TCP_STATE_ESTABLISHED &&
+		    (payload_len > 0 || (tcp_flags & TCP_FIN)))
+			goto established_segment;
 		break;
 
 	case TCP_STATE_ESTABLISHED:
+established_segment:
 		if (tcp_flags & TCP_RST) {
 			// RFC 5961: validate RST seq within receive window
 			if ((int32_t)(seq - conn->rcv_nxt) < 0 ||
@@ -3017,8 +3090,7 @@ void tcp_timer_tick(void)
 			}
 			// Same local-drop rule as SYN_SENT: only transmits that
 			// actually left the machine consume the attempt budget.
-			if (tcp_send_synack_conn(conn,
-						 tcp_advertised_window(conn)) >=
+			if (tcp_send_synack_conn(conn, tcp_syn_window(conn)) >=
 			    0) {
 				conn->retransmit_count++;
 				conn->retransmit_tick =
@@ -3034,14 +3106,25 @@ void tcp_timer_tick(void)
 		     conn->state == TCP_STATE_LAST_ACK ||
 		     conn->state == TCP_STATE_CLOSING) &&
 		    conn->inflight_count > 0 && now >= conn->retransmit_tick) {
-			// The long give-up budget is reserved for connections an
-			// application is still actively using.  In the closing
-			// states nobody is waiting on the data any more and the
-			// conn only pins one of the TCP_MAX_CONNECTIONS slots —
-			// keep the short limit there so parallel stress churn
-			// cannot exhaust the table and starve fresh connect()s.
+			// Give-up budget.  The short limit is meant for closing
+			// conns that only have control (a FIN) left to get
+			// ACKed — nobody is waiting on payload, and the slot
+			// shouldn't be pinned long under stress.  BUT a graceful
+			// close (application wrote data then close()d) leaves
+			// real DATA queued in FIN_WAIT_1/LAST_ACK/CLOSING that
+			// the PEER IS STILL READING: close() must deliver it.
+			// Using the short limit there drops that data after ~6 s
+			// of backoff and frees the conn out from under the peer
+			// (observed: TLS 64 KB echo delivered only 48 KB, then
+			// the receiver timed out with the server conn already
+			// gone).  So: if the oldest unacked segment carries
+			// payload, use the full DATA budget regardless of
+			// state; only a pure-control (FIN, len==0) head gets the
+			// short limit.
+			int head_has_data = conn->inflight[0].len > 0;
 			uint32_t retrans_limit =
-				conn->state == TCP_STATE_ESTABLISHED ?
+				(conn->state == TCP_STATE_ESTABLISHED ||
+				 head_has_data) ?
 					TCP_MAX_DATA_RETRANSMITS :
 					TCP_MAX_RETRANSMITS;
 			if (conn->retransmit_count >= retrans_limit) {

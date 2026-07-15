@@ -289,6 +289,18 @@ static void task_close_open_files(task_t *task)
 		for (int i = 0; i < TASK_MAX_MMAP; i++) {
 			mmap_region_t *r = &task->mmap_regions[i];
 			if (r->in_use && r->file) {
+				/* Crash-abandon safety: if this task died
+				 * holding the file's page-in flag (its exit was
+				 * abandoned mid fault, e.g. a kernel oops), the
+				 * fork-family faulters sharing the handle would
+				 * spin forever.  Clear it while the file is
+				 * still pinned by our reference. */
+				if (r->file->pagein_busy &&
+				    r->file->pagein_owner == (int64_t)task->id) {
+					r->file->pagein_owner = -1;
+					__atomic_clear(&r->file->pagein_busy,
+						       __ATOMIC_RELEASE);
+				}
 				vfs_close(r->file);
 				r->file = NULL;
 			}
@@ -366,12 +378,20 @@ static void dead_thread_reap(void)
 	count = g_dead_thread_count;
 	for (int i = 0; i < count; i++) {
 		batch[i] = g_dead_threads[i];
-		/* Clear the queued flag while still under the lock.  After this
-         * point a concurrent dead_thread_queue() for the same task would
-         * succeed — which is the correct behavior, because we are about
-         * to free this task and any later reference is a bug elsewhere. */
-		if (batch[i])
-			batch[i]->on_dead_queue = false;
+		/* on_dead_queue stays TRUE for the whole destruction.  It used
+         * to be cleared here, which reopened the exact double-free the
+         * flag exists to prevent: between this unlock and the kfree in
+         * sched_remove_task below (a window containing a TLB shootdown
+         * and the address-space teardown), a concurrent
+         * dead_thread_queue() for the same task — waitpid's
+         * sched_defer_reap finding the child still linked, or
+         * sched_reparent_children on a dying ancestor — saw the flag
+         * clear, re-queued the task, and a later reap pass ran
+         * sched_remove_task on the already-freed, page-poisoned task_t
+         * (observed as a GPF on mm_struct_put(0xfeedface...) during the
+         * pthread teststress).  Destruction is guaranteed from here, so
+         * every later queue attempt must be a no-op; the flag is never
+         * cleared again — the task_t is about to cease to exist. */
 	}
 	g_dead_thread_count = 0;
 	spin_unlock_irqrestore(&g_dead_thread_lock, flags);
@@ -559,30 +579,20 @@ static task_t *rq_dequeue_locked(percpu_t *cpu)
 	return task;
 }
 
-// Remove a specific task from any run queue it might be on.
-// Acquires the appropriate CPU's runqueue_lock.
-static void rq_remove(task_t *task)
+/* Unlink `task` from one CPU's run queue if it is linked there.  Returns 1
+ * and clears the task's queue linkage on success, 0 if the task is not on
+ * this queue.  The task's rq_next/on_rq must ONLY be touched when the task
+ * was actually unlinked: clearing rq_next while the task is still chained in
+ * some queue cuts that chain and permanently strands every task behind it. */
+static int rq_try_unlink_locked(percpu_t *cpu, task_t *task)
 {
-	if (!task->on_rq)
-		return;
-
-	percpu_t *cpu = percpu_get(task->on_cpu);
-	if (!cpu)
-		return;
-
-	uint64_t flags;
-	spin_lock_irqsave(&cpu->runqueue_lock, &flags);
-
-	if (!task->on_rq) {
-		// Race: already removed
-		spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
-		return;
-	}
-
+	lockdep_assert_held(&cpu->runqueue_lock);
+	int found = 0;
 	if (cpu->runqueue_head == task) {
 		cpu->runqueue_head = task->rq_next;
 		if (!cpu->runqueue_head)
 			cpu->runqueue_tail = NULL;
+		found = 1;
 	} else {
 		for (task_t *prev = cpu->runqueue_head; prev;
 		     prev = prev->rq_next) {
@@ -590,17 +600,63 @@ static void rq_remove(task_t *task)
 				prev->rq_next = task->rq_next;
 				if (cpu->runqueue_tail == task)
 					cpu->runqueue_tail = prev;
+				found = 1;
 				break;
 			}
 		}
 	}
-	task->rq_next = NULL;
-	task->on_rq = false;
-	cpu->runqueue_length--;
-	WARN_ON((long)cpu->runqueue_length <
-		0); /* rq_remove: runqueue length underflow */
+	if (found) {
+		task->rq_next = NULL;
+		task->on_rq = false;
+		cpu->runqueue_length--;
+		WARN_ON((long)cpu->runqueue_length <
+			0); /* rq_remove: runqueue length underflow */
+	}
+	return found;
+}
 
-	spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
+// Remove a specific task from any run queue it might be on.
+// Acquires the appropriate CPU's runqueue_lock.
+static void rq_remove(task_t *task)
+{
+	if (!task->on_rq)
+		return;
+
+	// Fast path: the queue named by on_cpu (the invariant case).
+	percpu_t *cpu = percpu_get(task->on_cpu);
+	if (cpu) {
+		uint64_t flags;
+		spin_lock_irqsave(&cpu->runqueue_lock, &flags);
+		if (!task->on_rq) {
+			// Race: already removed
+			spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
+			return;
+		}
+		int found = rq_try_unlink_locked(cpu, task);
+		spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
+		if (found)
+			return;
+	}
+
+	/* on_rq is set but the task is not on on_cpu's queue — on_cpu is out
+	 * of sync with the queue the task actually sits on.  Search all CPUs
+	 * and unlink from wherever the task really is.  Do NOT blindly clear
+	 * rq_next/on_rq: doing so on a still-chained task truncates that
+	 * queue and strands the tasks linked behind it. */
+	for (uint32_t i = 0; i < MAX_CPUS; i++) {
+		percpu_t *p = percpu_get(i);
+		if (!p)
+			continue;
+		uint64_t flags;
+		spin_lock_irqsave(&p->runqueue_lock, &flags);
+		int found = task->on_rq ? rq_try_unlink_locked(p, task) : 1;
+		spin_unlock_irqrestore(&p->runqueue_lock, flags);
+		if (found)
+			return;
+	}
+
+	/* Not linked anywhere despite on_rq — stale flag (e.g. a concurrent
+	 * dequeue finished after our first check).  Nothing to unlink. */
 }
 
 // Enqueue a READY task to its assigned CPU's run queue.
@@ -654,6 +710,7 @@ static void task_init_common(task_t *t)
 	t->wait_next = NULL;
 	t->wait_channel = NULL;
 	t->wakeup_tick = 0;
+	t->fs_rdepth = 0;
 	t->need_resched = 0;
 	t->remaining_ticks = SCHED_TIME_SLICE;
 	t->preempt_frame = NULL;
@@ -930,7 +987,17 @@ void sched_yield_in_kernel(void)
 // Core scheduling function – select next task from local run queue and switch.
 // Caller must set current task's state before calling (TASK_BLOCKED, TASK_ZOMBIE,
 // TASK_READY, etc.).
-void sched_schedule(void)
+//
+// no_stack_protector: this function is the ONE place that reassigns GS:104 (the
+// per-CPU stack-canary slot the compiler reads at prologue and epilogue) to a
+// different task's canary mid-body — that is precisely what a context switch
+// does.  A stack-protected build therefore saves the OLD task's canary in the
+// prologue and, on any path that reaches the epilogue after GS:104 has moved to
+// another task (the switch-away/idle/zombie handoffs under SMP load), compares
+// it against a different value and calls __stack_chk_fail on a frame that was
+// never actually smashed — halting the box on a self-diagnosed false positive.
+// The function has no local buffers to protect, so excluding it loses nothing.
+__attribute__((no_stack_protector)) void sched_schedule(void)
 {
 	if (!g_smp_initialized) {
 		// Pre-SMP: nothing to schedule yet (timer hasn't started)
@@ -1116,8 +1183,10 @@ void sched_schedule(void)
 	}
 }
 
-// Called from BSP main loop to check if reschedule is needed
-void sched_run_ready(void)
+// Called from BSP main loop to check if reschedule is needed.
+// no_stack_protector for the same reason as sched_schedule(): it hands GS:104
+// to the next task mid-body via its context switch.
+__attribute__((no_stack_protector)) void sched_run_ready(void)
 {
 	if (!g_smp_initialized)
 		return;
@@ -1660,6 +1729,7 @@ task_t *sched_fork_current(void)
 	child->wait_next = NULL;
 	child->wait_channel = NULL;
 	child->wakeup_tick = 0;
+	child->fs_rdepth = 0; /* parent holds no fs lock during fork */
 	child->need_resched = 0;
 	child->remaining_ticks = SCHED_TIME_SLICE;
 	child->preempt_frame = NULL;
@@ -1824,27 +1894,48 @@ void sched_wake_channel(void *channel)
 	if (!channel)
 		return;
 
-	// Collect tasks to wake while holding the task list lock,
-	// then enqueue them after releasing it (lock ordering: task_list before rq).
-	task_t *to_wake[16];
-	int nwake = 0;
+	/* Wake EVERY task blocked on this channel, in batches sized to the
+	 * on-stack array (lock ordering: collect under g_task_list_lock, then
+	 * enqueue under rq locks).
+	 *
+	 * CRITICAL: a waiter may be CLAIMED (state CAS'd BLOCKED->READY and
+	 * wait_channel cleared) ONLY if it is also enqueued in the same pass.
+	 * The previous loop scanned UNBOUNDED and claimed every match but
+	 * enqueued only the first 16 — waiter #17+ was left READY with
+	 * wait_channel==NULL and on no runqueue.  Being neither BLOCKED nor
+	 * chained, no later wake could ever find it again: it was permanently
+	 * stranded (alive but never scheduled).  This is reachable whenever
+	 * more than 16 tasks wait on one channel — e.g. the single global
+	 * USB-MSD I/O lock (&msd->io_locked), onto which every process's disk
+	 * I/O piles under parallel load; the stranded waiter was the TLS test
+	 * child hanging in a libcrypto demand page-in.
+	 *
+	 * Bounding the claim to the batch (nwake < 16 in the scan condition)
+	 * and looping until a partial batch wakes them all with none dropped.
+	 * Terminates: each woken task's wait_channel is cleared so it never
+	 * re-matches, and freshly-woken tasks cannot re-block on the channel
+	 * until they run (which cannot happen before this call returns). */
+	for (;;) {
+		task_t *to_wake[16];
+		int nwake = 0;
 
-	uint64_t flags;
-	spin_lock_irqsave(&g_task_list_lock, &flags);
-	for (task_t *t = g_task_list_head; t; t = t->next) {
-		if (t->wait_channel == channel &&
-		    sched_claim_wake(t, TASK_BLOCKED)) {
-			t->wait_channel = NULL;
-			if (nwake < 16) {
+		uint64_t flags;
+		spin_lock_irqsave(&g_task_list_lock, &flags);
+		for (task_t *t = g_task_list_head; t && nwake < 16;
+		     t = t->next) {
+			if (t->wait_channel == channel &&
+			    sched_claim_wake(t, TASK_BLOCKED)) {
+				t->wait_channel = NULL;
 				to_wake[nwake++] = t;
 			}
 		}
-	}
-	spin_unlock_irqrestore(&g_task_list_lock, flags);
+		spin_unlock_irqrestore(&g_task_list_lock, flags);
 
-	// Enqueue only the tasks we actually woke (not a blanket READY scan).
-	for (int i = 0; i < nwake; i++) {
-		sched_enqueue_ready(to_wake[i]);
+		for (int i = 0; i < nwake; i++)
+			sched_enqueue_ready(to_wake[i]);
+
+		if (nwake < 16)
+			break; /* batch not full => every waiter has been woken */
 	}
 }
 
@@ -2092,17 +2183,54 @@ void sched_signal_task(task_t *task, int sig)
 
 	if (sig == SIGKILL) {
 		signal_send(task, sig, &info);
-		task->exit_code = 128 + sig;
-		sched_mark_task_exited(task, 128 + sig);
-		// On SMP, do NOT call sched_schedule() here - the exception handler will
-		// loop with 'sti; hlt' and the timer will safely preempt us. Calling
-		// sched_schedule() while on this task's kernel stack creates a race:
-		// another CPU can free the stack via waitpid before ctx_switch.
-		// On single-CPU, this race can't happen, so schedule immediately.
 		if (task == sched_current()) {
-			if (!smp_is_enabled()) {
+			// Own context at a safe point (syscall level or the
+			// crash handler's abandoned frame): exit in place.
+			task->exit_code = 128 + sig;
+			sched_mark_task_exited(task, 128 + sig);
+			// On SMP, do NOT call sched_schedule() here - the exception handler will
+			// loop with 'sti; hlt' and the timer will safely preempt us. Calling
+			// sched_schedule() while on this task's kernel stack creates a race:
+			// another CPU can free the stack via waitpid before ctx_switch.
+			// On single-CPU, this race can't happen, so schedule immediately.
+			if (!smp_is_enabled())
 				sched_schedule();
-			}
+			return;
+		}
+		/* NEVER force-exit another task in place (same rationale as the
+		 * SIG_DFL_TERM case below): if it is blocked inside a kernel
+		 * path it may hold sleeping-context exclusions (ext4/fat32/msd
+		 * io locks, the demand-paging page-in flag) that would be
+		 * orphaned forever, wedging every later exec/page-in.  SIGKILL
+		 * is unblockable and already pending: wake the task; the
+		 * interruptible wait loops return -EINTR, the timer sweep
+		 * re-wakes it while blocked, and it exits at its own next
+		 * delivery point with all locks released. */
+		if (sched_claim_wake(task, TASK_BLOCKED) ||
+		    sched_claim_wake(task, TASK_STOPPED)) {
+			sched_enqueue_ready(task);
+		} else if (task->state == TASK_READY) {
+			/* READY but not on a CPU right now.  Unlike a BLOCKED
+			 * task it holds no sleeping-context kernel locks (those
+			 * are only held while sleeping) — there is nothing to
+			 * orphan, it just has to get SCHEDULED so it can dequeue
+			 * and dispatch the already-pending SIGKILL at its next
+			 * return-to-user (irqentry_exit).  Re-enqueue it: a
+			 * harmless no-op when it is already on its runqueue, but
+			 * this RECOVERS a task that has fallen off every runqueue
+			 * — exactly how a CPU-bound child could otherwise ignore
+			 * SIGKILL forever.  sched_enqueue_ready() also kicks the
+			 * target's CPU with a reschedule IPI when that CPU is
+			 * remote, so delivery is prompt, not load-dependent. */
+			sched_enqueue_ready(task);
+		} else if (g_smp_initialized && task->state == TASK_RUNNING &&
+			   task->on_cpu != this_cpu_id()) {
+			/* RUNNING on another CPU: nudge it so the pending SIGKILL
+			 * is delivered at its next return-to-user (irqentry_exit)
+			 * rather than waiting for its next timer tick.  The IPI
+			 * lands on the target itself; the fatal path schedules it
+			 * away directly, so no unrelated task is disturbed. */
+			smp_send_reschedule(task->on_cpu);
 		}
 		return;
 	}
@@ -2160,12 +2288,45 @@ void sched_signal_task(task_t *task, int sig)
 	switch (def_action) {
 	case SIG_DFL_TERM:
 	case SIG_DFL_CORE:
-		task->exit_code = 128 + sig;
-		sched_mark_task_exited(task, 128 + sig);
-		// On SMP, let timer preemption safely switch us off this stack.
-		// On single-CPU, schedule immediately (no race possible).
-		if (task == sched_current() && !smp_is_enabled()) {
-			sched_schedule();
+		if (task == sched_current()) {
+			// Own context at a safe delivery point: no kernel
+			// locks are held here, immediate exit is safe.
+			task->exit_code = 128 + sig;
+			sched_mark_task_exited(task, 128 + sig);
+			// On SMP, let timer preemption switch us off this
+			// stack.  On single-CPU, schedule immediately.
+			if (!smp_is_enabled())
+				sched_schedule();
+			break;
+		}
+		/* NEVER force-exit another task in place.  If it is blocked
+		 * inside a kernel path it may hold sleeping-context exclusions
+		 * (ext4/fat32 io locks, the usb-msd io mutex, the demand-paging
+		 * page-in flag).  Marking it exited there orphans those forever
+		 * — observed as a system-wide wedge where every new exec /
+		 * page-in hangs after a parallel-teststress kill landed mid
+		 * page-in.  The fatal signal is already pending (signal_send
+		 * above): wake the task so it finishes or re-checks its wait,
+		 * releases its locks, and dies at its own next delivery point
+		 * (syscall exit / IRQ return).  The timer sweep re-wakes
+		 * BLOCKED tasks with pending signals until that happens. */
+		if (sched_claim_wake(task, TASK_BLOCKED) ||
+		    sched_claim_wake(task, TASK_STOPPED)) {
+			sched_enqueue_ready(task);
+		} else if (task->state == TASK_READY) {
+			/* READY: holds no sleeping-context kernel locks, so
+			 * nothing to orphan — it only has to get scheduled to
+			 * dispatch the already-pending fatal signal.  Re-enqueue
+			 * it (no-op if already queued) to recover a task stranded
+			 * off every runqueue; also kicks its CPU when remote.
+			 * See the SIGKILL branch above. */
+			sched_enqueue_ready(task);
+		} else if (g_smp_initialized && task->state == TASK_RUNNING &&
+			   task->on_cpu != this_cpu_id()) {
+			/* RUNNING on another CPU: nudge it so the fatal signal is
+			 * delivered at its next return-to-user rather than its
+			 * next timer tick. */
+			smp_send_reschedule(task->on_cpu);
 		}
 		break;
 	case SIG_DFL_STOP:
@@ -2409,8 +2570,10 @@ void sched_set_need_resched(task_t *t)
 		t->need_resched = 1;
 }
 
-// Called from timer IRQ with interrupts disabled
-void sched_preempt(interrupt_frame_t *frame)
+// Called from timer IRQ with interrupts disabled.
+// no_stack_protector for the same reason as sched_schedule(): its context
+// switch reassigns GS:104 to the preempted-in task mid-body.
+__attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 {
 	if (!g_smp_initialized)
 		return;

@@ -2541,8 +2541,11 @@ static int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group)
 static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
 			     uint64_t flags)
 {
-	(void)dirfd;
 	(void)flags;
+
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
 
 	/* Reject AT_EMPTY_PATH (0x1000) - not supported */
 	if (flags & 0x1000)
@@ -2560,6 +2563,22 @@ static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
 	err = copy_from_user(kpath, (const void *)pathname, plen + 1);
 	if (err)
 		return err;
+
+	/* Canonicalise against the task cwd / dirfd so the VFS gets an absolute
+	 * path: a relative path skips the ancestor search-permission traversal
+	 * (and trips a warning) for a non-root caller. */
+	char full[VFS_MAX_PATH];
+	if (kpath[0] == '/') {
+		size_t i = 0;
+		for (; kpath[i] && i < sizeof(full) - 1; ++i)
+			full[i] = kpath[i];
+		full[i] = '\0';
+	} else {
+		int bret = build_at_path(cur, (int)dirfd, kpath, full,
+					 sizeof(full));
+		if (bret != 0)
+			return bret;
+	}
 
 	int64_t mtime_sec = 0;
 	/* The UTIME_NOW / UTIME_OMIT sentinels (1073741823 / 1073741822) match the
@@ -2582,7 +2601,7 @@ static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
 
 	/* vfs_utimensat routes to the owning filesystem (devfs has no timestamps,
      * so it succeeds silently). */
-	int r = vfs_utimensat(kpath, mtime_sec, mtime_nsec);
+	int r = vfs_utimensat(full, mtime_sec, mtime_nsec);
 	if (r == ST_NOT_FOUND || r == ST_INVALID)
 		return -ENOENT;
 	if (r == ST_NOMEM)
@@ -5646,17 +5665,30 @@ static int64_t sys_sched_setaffinity(uint64_t pid, uint64_t cpusetsize,
 	// Store the full affinity mask (0 means all CPUs allowed)
 	target->cpu_affinity = mask;
 
-	// If current CPU is not in the new affinity mask, migrate to first allowed CPU
-	if (!(mask & (1ULL << target->on_cpu))) {
-		for (int i = 0; i < 64; i++) {
-			if (mask & (1ULL << i)) {
-				target->on_cpu = (uint32_t)i;
-				// Mark for reschedule to migrate
-				target->need_resched = 1;
-				break;
-			}
-		}
-	}
+	/* Migration to an allowed CPU.
+	 *
+	 * NEVER rewrite target->on_cpu here: on_cpu names the run queue the
+	 * task is (or will be) linked on, and the scheduler's re-enqueue paths
+	 * use this_cpu while rq_remove uses on_cpu.  Flipping on_cpu on a
+	 * RUNNING or queued task desynchronises the two, and a later rq_remove
+	 * then operates on the wrong queue — which used to truncate the real
+	 * queue and permanently strand every task linked behind (unkillable
+	 * READY tasks; showed up as rare teststress hangs).
+	 *
+	 * Also never wake-and-retarget a BLOCKED task onto another CPU from
+	 * here: a task can be BLOCKED but still executing on its old CPU (the
+	 * window between state=TASK_BLOCKED and its context switch completing).
+	 * Every waker in the kernel re-enqueues to the task's OWN on_cpu so
+	 * that window resolves locally; handing the task to a different CPU in
+	 * that window lets two CPUs act on one context (observed as an idle
+	 * task IRET-ing into user code + shifted-frame kernel stack smashes).
+	 *
+	 * So: only record the mask and request a reschedule.  The load
+	 * balancer migrates the task lazily with both run-queue locks held,
+	 * honouring cpu_affinity — the one protocol that is safe.
+	 */
+	if (!(mask & (1ULL << target->on_cpu)))
+		target->need_resched = 1;
 
 	return 0;
 }

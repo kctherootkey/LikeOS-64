@@ -236,10 +236,36 @@ int vfs_check_access(const char *path, const struct kstat *st, int want,
 	return vfs_perm_access(path, st, want, use_real);
 }
 
+/* Return `path` made absolute in `buf` by joining the current task cwd when it
+ * is relative (else `path` unchanged).  The VFS permission helpers below walk
+ * the path textually and assume an absolute path; some syscalls hand the VFS a
+ * cwd-relative path directly (there are no *at dirfd variants that reach here
+ * unresolved), so resolving here keeps the DAC checks from being silently
+ * skipped for a non-root caller. */
+static const char *vfs_abspath(const char *path, char *buf, size_t bufsz)
+{
+	if (!path || path[0] == '/')
+		return path;
+	const char *cwd = current_cwd(); /* absolute; "/" if unset */
+	size_t ci = 0;
+	while (cwd[ci] && ci < bufsz - 2) {
+		buf[ci] = cwd[ci];
+		ci++;
+	}
+	if (ci == 0)
+		buf[ci++] = '/';
+	if (buf[ci - 1] != '/')
+		buf[ci++] = '/';
+	size_t pi = 0;
+	while (path[pi] && ci < bufsz - 1)
+		buf[ci++] = path[pi++];
+	buf[ci] = '\0';
+	return buf;
+}
+
 /* Per-component traversal: a non-privileged task needs search (x) on every
- * ancestor directory of `path`.  Walks "/", "/a", "/a/b" for "/a/b/c".  Assumes
- * an absolute path (the syscall layer canonicalises before calling the VFS); a
- * relative path is deferred to the resolver.  No-op for the privileged caller. */
+ * ancestor directory of `path`.  Walks "/", "/a", "/a/b" for "/a/b/c".
+ * No-op for the privileged caller. */
 static int vfs_permission_traverse_id(const char *path, int use_real)
 {
 	cred_t *c = current_cred();
@@ -248,10 +274,10 @@ static int vfs_permission_traverse_id(const char *path, int use_real)
 	uint32_t cuid = use_real ? c->uid : c->euid;
 	if (cuid == 0)
 		return ST_OK; /* privileged: bypass */
-	if (!path || path[0] != '/') {
-		WARN_ON_ONCE(path && path[0] != '/');
-		return ST_OK; /* not absolute: defer to the resolver */
-	}
+	if (!path)
+		return ST_OK;
+	char abuf[VFS_MAX_PATH];
+	path = vfs_abspath(path, abuf, sizeof(abuf));
 	size_t len = 0;
 	while (path[len])
 		len++;
@@ -346,6 +372,8 @@ int vfs_permission_parent(const char *path, int want)
 {
 	if (capable())
 		return ST_OK;
+	char abuf[VFS_MAX_PATH];
+	path = vfs_abspath(path, abuf, sizeof(abuf)); /* parent-of needs absolute */
 	char parent[VFS_MAX_PATH];
 	if (!vfs_parent_of(path, parent, sizeof(parent)))
 		return ST_OK;
@@ -362,6 +390,8 @@ int vfs_permission_remove(const char *path)
 {
 	if (capable())
 		return ST_OK;
+	char abuf[VFS_MAX_PATH];
+	path = vfs_abspath(path, abuf, sizeof(abuf)); /* parent-of / raw_stat need it */
 	int pr = vfs_permission_parent(path, MAY_WRITE | MAY_EXEC);
 	if (pr != ST_OK)
 		return pr;

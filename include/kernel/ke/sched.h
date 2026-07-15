@@ -380,6 +380,13 @@ typedef struct task {
 	struct task *wait_next;
 	void *wait_channel;
 
+	/* Count of filesystem rw-semaphores this task currently holds in
+	 * SHARED mode.  A nested shared acquisition (e.g. a page-in during a
+	 * read already holding a shared lock) must not defer to queued
+	 * writers, or it deadlocks against them; a positive count bypasses
+	 * writer-preference in the fs rwsem slow path. */
+	int fs_rdepth;
+
 	// Timer-based sleep support
 	uint64_t
 		wakeup_tick; // Tick count when task should wake (0 = not sleeping)

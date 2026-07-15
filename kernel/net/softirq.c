@@ -194,9 +194,34 @@ static void ksoftirqd_main(void *arg)
 		cur->state = TASK_BLOCKED;
 		__atomic_thread_fence(__ATOMIC_SEQ_CST);
 		if (softirq_pending_mask[my_cpu] != 0) {
-			cur->state = TASK_RUNNING;
-			cur->wait_channel = NULL;
-			continue;
+			/* Un-park by CLAIMING ourselves back with a CAS — the
+			 * mirror of sched_claim_wake() on the waker side.  The
+			 * previous blind `state = TASK_RUNNING` write raced
+			 * softirq_wake_local's claim: the waker could CAS
+			 * BLOCKED→READY first, then find state == RUNNING at
+			 * rq_enqueue_locked — a "BUG: enqueue RUNNING" warning
+			 * per packet once loopback started streaming at full
+			 * rate (the console flood alone destabilizes the box). */
+			task_state_t expected = TASK_BLOCKED;
+			if (__atomic_compare_exchange_n(&cur->state, &expected,
+							TASK_RUNNING, false,
+							__ATOMIC_ACQ_REL,
+							__ATOMIC_ACQUIRE)) {
+				cur->wait_channel = NULL;
+				continue;
+			}
+			/* A waker won the claim: we are READY and it enqueues
+			 * us (it already cleared wait_channel).  Do NOT write
+			 * RUNNING over the claim (that refused the waker's
+			 * enqueue and spammed "BUG: enqueue RUNNING"), and do
+			 * NOT wait for on_rq — a third CPU's transient
+			 * dequeue/re-enqueue of the sp==0 entry, or a timer
+			 * preempt cycling this task, makes that wait
+			 * unbounded.  Fall through to sched_schedule() as a
+			 * READY current: it either dequeues us straight back
+			 * (next == cur → stay on CPU) or parks us READY and
+			 * the queue entry resumes us; sched_enqueue_ready
+			 * dedups silently via on_rq if both sides enqueue. */
 		}
 		sched_schedule();
 		cur->wait_channel = NULL;
@@ -220,7 +245,15 @@ void ksoftirqd_start_all(void)
      * kalloc'd kernel stack. */
 	const size_t KSOFTIRQD_STACK_SIZE = 16 * 1024;
 	for (uint32_t cpu = 0; cpu < ncpus && cpu < MAX_CPUS; cpu++) {
-		void *stack = kalloc(KSOFTIRQD_STACK_SIZE);
+		/* Guarded kstack (guard page below): ksoftirqd runs the WHOLE
+		 * network RX path — softirq_drain -> net_rx_softirq -> ipv4_rx
+		 * -> tcp_rx -> ... -> tcp_send/ipv4_send, plus nested hard IRQs
+		 * — on this stack, the deepest kernel-thread stack usage in the
+		 * system.  A plain kalloc'd stack has no guard page, so an
+		 * overflow would silently clobber adjacent heap (a task_t, a
+		 * malloc chunk) and surface later as unrelated corruption; the
+		 * guard page turns that into a clean fault at the overflow. */
+		void *stack = mm_alloc_guarded_kstack(KSOFTIRQD_STACK_SIZE);
 		if (!stack) {
 			kprintf("ksoftirqd: failed to alloc stack for CPU %u\n",
 				cpu);
@@ -232,7 +265,7 @@ void ksoftirqd_start_all(void)
 		if (!t) {
 			kprintf("ksoftirqd: failed to create thread for CPU %u\n",
 				cpu);
-			kfree(stack);
+			mm_free_guarded_kstack(stack, KSOFTIRQD_STACK_SIZE);
 			continue;
 		}
 		t->on_cpu = cpu;

@@ -215,6 +215,7 @@ int unix_accept(int usockfd, struct sockaddr_un *addr, socklen_t *addrlen)
 	// same CPU as the listener, and a tight pause loop here will starve
 	// it forever — the test hangs with parent on accept and no child
 	// visible because the child never gets CPU.
+	task_t *acc_cur = sched_current();
 	for (;;) {
 		int h = *(volatile int *)&us->accept_head;
 		int t = *(volatile int *)&us->accept_tail;
@@ -224,6 +225,11 @@ int unix_accept(int usockfd, struct sockaddr_un *addr, socklen_t *addrlen)
 			return -EBADF;
 		if (us->nonblock)
 			return -EAGAIN;
+		/* Interruptible: POSIX accept() returns EINTR; also lets a
+		 * pending fatal signal terminate a listener whose client died
+		 * before connecting (previously an unkillable forever-wait). */
+		if (acc_cur && signal_pending(acc_cur))
+			return -EINTR;
 		sched_yield_in_kernel();
 	}
 
@@ -331,11 +337,15 @@ int unix_connect(int usockfd, const struct sockaddr_un *addr)
 	// each iteration via volatile so the compiler doesn't hoist.  Yield
 	// rather than pause so the listener task on another CPU (or this
 	// CPU) can actually run accept and link us.
+	task_t *con_cur = sched_current();
 	while (!*(volatile void **)&us->peer && !*(volatile int *)&us->error) {
 		if (us->nonblock)
 			return -EINPROGRESS;
 		if (!*(volatile int *)&us->active)
 			return -EBADF;
+		/* Interruptible: POSIX connect() returns EINTR. */
+		if (con_cur && signal_pending(con_cur))
+			return -EINTR;
 		sched_yield_in_kernel();
 	}
 
@@ -410,6 +420,14 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 							   __ATOMIC_ACQ_REL);
 					return -EPIPE;
 				}
+				/* Interruptible: send() returns EINTR (no data
+				 * was written yet at this point). */
+				task_t *snd_cur = sched_current();
+				if (snd_cur && signal_pending(snd_cur)) {
+					__atomic_fetch_sub(&peer->ref_count, 1,
+							   __ATOMIC_ACQ_REL);
+					return -EINTR;
+				}
 				sched_yield_in_kernel();
 			}
 			spin_lock_irqsave(&peer->lock, &irqflags);
@@ -473,6 +491,12 @@ int unix_recv(int usockfd, void *buf, size_t len, int flags)
 			return -ENOTCONN;
 		if (us->nonblock)
 			return -EAGAIN;
+		/* Interruptible: recv() returns EINTR when a signal is pending. */
+		{
+			task_t *rcv_cur = sched_current();
+			if (rcv_cur && signal_pending(rcv_cur))
+				return -EINTR;
+		}
 		sched_yield_in_kernel();
 	}
 

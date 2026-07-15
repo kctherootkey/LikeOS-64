@@ -329,8 +329,20 @@ void smp_boot_aps(void)
 		smp_dbg("SMP: Starting AP %u (APIC ID %u)...\n", ap_index,
 			cpu->apic_id);
 
-		// Allocate stack for this AP
-		g_ap_stacks[ap_index] = (uint8_t *)kalloc(AP_STACK_SIZE);
+		// Allocate stack for this AP.  Use a GUARDED kstack (guard page
+		// below the usable region) rather than a plain kalloc: this is
+		// the stack the AP runs its bringup AND its idle loop on (the
+		// idle task's sp is overwritten with this stack on its first
+		// context switch, so the separately-allocated guarded idle
+		// stack in sched_init_ap goes unused).  Without a guard page an
+		// idle-stack overflow — the idle task services interrupts and
+		// nested IRQs on this stack — would SILENTLY corrupt adjacent
+		// kalloc memory (a task_t->sp, a malloc chunk, ...) instead of
+		// faulting, surfacing much later as unrelated corruption.  The
+		// AP shares the BSP's kernel PML4 (CR3 set in the trampoline
+		// before RSP), so this guarded-region address is mapped for it.
+		g_ap_stacks[ap_index] =
+			(uint8_t *)mm_alloc_guarded_kstack(AP_STACK_SIZE);
 		if (!g_ap_stacks[ap_index]) {
 			kprintf("SMP: Failed to allocate stack for AP %u\n",
 				ap_index);

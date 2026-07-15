@@ -314,6 +314,15 @@ cred_t *current_cred(void)
 	return t ? &t->cred : NULL;
 }
 
+/* Current task's canonical absolute working directory; "/" when unset or in
+ * kernel context.  Used by the VFS to resolve a relative path for the ancestor
+ * search-permission traversal. */
+const char *current_cwd(void)
+{
+	task_t *t = sched_current();
+	return (t && t->cwd[0]) ? t->cwd : "/";
+}
+
 uint32_t current_uid(void)
 {
 	cred_t *c = current_cred();

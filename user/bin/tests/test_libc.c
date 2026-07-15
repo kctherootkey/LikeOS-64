@@ -254,6 +254,16 @@ static void run_tcp_large_transfer_case(const char *prefix, uint32_t bind_ip,
 		test_result(label, ret == 0);
 	}
 
+	/* Bound the accept: if the child's connect() ever fails (e.g. a
+	 * handshake segment dropped under heavy parallel load), the server
+	 * must not block in accept() forever and wedge the whole run — it
+	 * reports a clean accept failure and the suite carries on. */
+	{
+		struct timeval atv = { .tv_sec = 30, .tv_usec = 0 };
+		setsockopt(server_fd, SOL_SOCKET, SO_RCVTIMEO, &atv,
+			   sizeof(atv));
+	}
+
 	if (ret == 0) {
 		pid_t pid = fork();
 		if (pid == 0) {

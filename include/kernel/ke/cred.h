@@ -83,6 +83,7 @@ int cred_setresgid(cred_t *c, uint32_t r, uint32_t e, uint32_t s);
  * root, matching the rule that kernel context is privileged.  These take no
  * task argument by design — they always operate on the caller. */
 cred_t *current_cred(void); /* &current->cred, or NULL in kernel context */
+const char *current_cwd(void); /* current task cwd (absolute), "/" if unset */
 uint32_t current_uid(void);
 uint32_t current_euid(void);
 uint32_t current_gid(void);

@@ -253,6 +253,7 @@ int sock_accept(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen)
 		s->rcv_timeout_ticks ? timer_ticks() + s->rcv_timeout_ticks : 0;
 
 	tcp_conn_t *new_conn = NULL;
+	task_t *acc_cur = sched_current();
 	while (1) {
 		new_conn = tcp_accept(s->tcp);
 		if (new_conn)
@@ -261,6 +262,10 @@ int sock_accept(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen)
 			return -EAGAIN;
 		if (deadline && timer_ticks() >= deadline)
 			return -ETIMEDOUT;
+		/* Interruptible: a pending (possibly fatal) signal must be able
+		 * to take us out of this wait — POSIX accept() returns EINTR. */
+		if (acc_cur && signal_pending(acc_cur))
+			return -EINTR;
 		loopback_process_pending();
 		sched_yield_in_kernel();
 	}
@@ -354,11 +359,16 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 	uint64_t deadline =
 		s->rcv_timeout_ticks ? timer_ticks() + s->rcv_timeout_ticks : 0;
 
+	task_t *con_cur = sched_current();
 	while (!conn->connect_done) {
 		if (s->nonblock)
 			return -EINPROGRESS;
 		if (deadline && timer_ticks() >= deadline)
 			return -ETIMEDOUT;
+		/* Interruptible (POSIX: connect() returns EINTR; the handshake
+		 * continues in the background if the caller survives). */
+		if (con_cur && signal_pending(con_cur))
+			return -EINTR;
 		loopback_process_pending();
 		sched_yield_in_kernel();
 	}
@@ -547,11 +557,15 @@ int sock_recvfrom(int sockfd, void *buf, size_t len, int flags,
 				timer_ticks() + s->rcv_timeout_ticks :
 				0;
 
+		task_t *udp_cur = sched_current();
 		while (!s->udp_rx_ready) {
 			if (s->nonblock || dontwait)
 				return -EAGAIN;
 			if (deadline && timer_ticks() >= deadline)
 				return -ETIMEDOUT;
+			/* Interruptible: recvfrom() returns EINTR on a signal. */
+			if (udp_cur && signal_pending(udp_cur))
+				return -EINTR;
 			loopback_process_pending();
 			sched_yield_in_kernel();
 		}
@@ -660,6 +674,7 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 
 			if (nonblock)
 				return -EAGAIN;
+
 			loopback_process_pending();
 			sched_yield_in_kernel();
 		}
@@ -721,6 +736,14 @@ again:
 				return total ? (int)total : -EAGAIN;
 			if (deadline && timer_ticks() >= deadline)
 				return total ? (int)total : -ETIMEDOUT;
+			/* Interruptible: without this, a task parked here with a
+			 * pending fatal signal is re-woken by the timer sweep and
+			 * immediately re-parks, forever — it can never die. */
+			{
+				task_t *rx_cur = sched_current();
+				if (rx_cur && signal_pending(rx_cur))
+					return total ? (int)total : -EINTR;
+			}
 			loopback_process_pending();
 
 			/* Park on &conn->rx_ready instead of busy-yielding.  The previous
@@ -744,13 +767,33 @@ again:
 				__atomic_thread_fence(__ATOMIC_SEQ_CST);
 				/* Re-check after marking blocked.  If the waker fired
                  * between the first check and now, rx_ready / state will
-                 * already reflect the new value — unblock and loop. */
+                 * already reflect the new value — unblock and loop.
+                 * Un-park via CAS (mirror of sched_claim_wake): a blind
+                 * state=RUNNING write here races the waker's claim and
+                 * produces "BUG: enqueue RUNNING" at rq_enqueue_locked.
+                 * If the CAS fails the waker already claimed us and is
+                 * enqueueing: wait for the entry to land and reconcile
+                 * through sched_schedule (it picks us straight back). */
 				if (conn->rx_ready ||
 				    conn->state != TCP_STATE_ESTABLISHED) {
-					cur->state = TASK_RUNNING;
-					cur->wait_channel = NULL;
-					cur->wakeup_tick = 0;
-					continue;
+					task_state_t expected = TASK_BLOCKED;
+					if (__atomic_compare_exchange_n(
+						    &cur->state, &expected,
+						    TASK_RUNNING, false,
+						    __ATOMIC_ACQ_REL,
+						    __ATOMIC_ACQUIRE)) {
+						cur->wait_channel = NULL;
+						cur->wakeup_tick = 0;
+						continue;
+					}
+					/* Waker won the claim: we are READY
+					 * and it enqueues us.  Never write
+					 * RUNNING over the claim and never
+					 * wait for on_rq (unbounded under
+					 * preemption) — fall through to
+					 * sched_schedule() as READY current;
+					 * the queue entry brings us straight
+					 * back and the loop re-checks. */
 				}
 			}
 			sched_schedule();

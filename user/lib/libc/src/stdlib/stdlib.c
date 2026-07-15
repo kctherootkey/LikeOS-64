@@ -4,6 +4,7 @@
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
+#include <signal.h>
 
 // Simple environment variable storage
 
@@ -49,7 +50,19 @@ void quick_exit(int status)
 
 void abort(void)
 {
-	_exit(1);
+	/* POSIX: abort() must raise SIGABRT so the process terminates with a
+	 * signal (WIFSIGNALED true), not a normal exit.  The old _exit(1) made
+	 * a heap-corruption / assertion abort indistinguishable from a benign
+	 * exit(1), so a parent (teststress) waiting on the child could not tell
+	 * a crash from an ordinary failure and did not stop.  Send SIGABRT to
+	 * ourselves; if a handler catches it and returns, reset the disposition
+	 * to default and re-raise so we cannot be trapped forever, then fall
+	 * back to _exit as a last resort. */
+	extern int raise(int sig);
+	raise(SIGABRT);
+	signal(SIGABRT, SIG_DFL);
+	raise(SIGABRT);
+	_exit(127);
 }
 
 /* basename()/dirname() — POSIX pathname helpers.

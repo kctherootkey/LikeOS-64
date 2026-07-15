@@ -688,91 +688,360 @@ static int ext4_blk_journalled(unsigned long pbn)
 }
 
 /* ===================================================================
- * Reentrant sleeping I/O mutex (identical discipline to fat32_io_lock).
+ * Fine-grained locking engine.
+ *
+ * Replaces the single reentrant I/O mutex (which serialised EVERY
+ * filesystem operation — including multi-millisecond USB data transfers —
+ * against every other one) with a conventional lock hierarchy:
+ *
+ *   per-inode rwsem  →  metadata rwsem  →  per-block-group lock
+ *        →  cache spinlocks (mbc / parsed-inode / bpool / pagecache)
+ *        →  block-device mutex
+ *
+ *   - s_meta (metadata/transaction rwsem): SHARED for read-only metadata
+ *     access (path resolution, extent mapping, stat, readdir, xattr
+ *     reads); EXCLUSIVE for every mutator.  The exclusive mode is exactly
+ *     the old global mutex: the journal transaction machinery (s_txn,
+ *     s_ckpt, write-back buffer, group-descriptor dirty spans, superblock
+ *     counters) is entirely serialised by it and needs no further change.
+ *     Exclusive acquire/release keeps the txn begin/commit hooks.
+ *   - s_ilock[] (per-inode rwsems, hashed by inode number): file-content
+ *     fences.  Readers hold SHARED across data-page reads (which run with
+ *     NO metadata lock at all — see pagecache lock_map); write/truncate/
+ *     unlink/rename-overwrite/O_TRUNC hold EXCLUSIVE so a file's data
+ *     blocks can never be freed or rewritten under an in-flight reader.
+ *     A hash collision merely over-serialises two unrelated files.
+ *   - s_bglock[] (per-block-group locks, hashed): serialise allocation
+ *     bitmap read-modify-write per group.  Today every allocator also
+ *     holds s_meta exclusive (journaled bitmap writes), so these add
+ *     ordering structure rather than parallelism; they become live when
+ *     allocation moves off the exclusive path.
+ *   - Superblock/GDT counter updates: under s_meta exclusive (this is the
+ *     filesystem-wide "superblock lock" level of the hierarchy).
+ *
+ * Fairness: writers set w_wait, and new readers defer to queued writers
+ * so a stream of readers cannot starve mutators.  The one exception is a
+ * task that already holds a shared fs lock (task->fs_rdepth > 0): its
+ * nested shared acquisition (page-in during a read) must not queue
+ * behind a writer that is itself waiting for the first shared hold to
+ * drain — that would deadlock.  Recursion under one's own EXCLUSIVE hold
+ * (write path faulting into a mapped file, nested VFS calls) is granted
+ * as a depth increment, preserving the old reentrant-mutex semantics.
  * =================================================================== */
-volatile int ext4_io_locked = 0;
-volatile int ext4_io_depth = 0;
-volatile uint64_t ext4_io_owner = (uint64_t)-1;
-static spinlock_t ext4_io_wait_lock = SPINLOCK_INIT("ext4_io_wait");
+typedef struct {
+	volatile int readers; /* active shared holders                  */
+	volatile int writer; /* 1 while exclusive is held              */
+	volatile uint64_t owner; /* exclusive owner task id                */
+	volatile int wdepth; /* exclusive recursion depth              */
+	volatile int w_wait; /* writers queued (fairness hint)         */
+	spinlock_t lock; /* protects the fields above              */
+} ext4_rwsem_t;
 
-void ext4_io_lock(void)
+#define EXT4_RWSEM_INIT(name)                                        \
+	{                                                            \
+		.readers = 0, .writer = 0, .owner = (uint64_t)-1,    \
+		.wdepth = 0, .w_wait = 0, .lock = SPINLOCK_INIT(name) \
+	}
+
+/* Park the current task on `sem`'s wait channel.  Same discipline as the
+ * other sleeping fs/device mutexes: blind-block under the spinlock, then
+ * schedule; the wake side (sched_wake_channel) claims BLOCKED→READY
+ * atomically, and sched_schedule handles the woken-before-scheduled race. */
+static void ext4_rwsem_park(ext4_rwsem_t *sem, uint64_t *flags)
+{
+	task_t *cur = sched_current();
+	if (cur) {
+		cur->state = TASK_BLOCKED;
+		cur->wait_channel = (void *)sem;
+	}
+	spin_unlock_irqrestore(&sem->lock, *flags);
+	sched_schedule();
+}
+
+static void ext4_rwsem_read_lock(ext4_rwsem_t *sem)
 {
 	might_sleep();
 	task_t *cur = sched_current();
 	uint64_t my_id = cur ? cur->id : 0;
 	while (1) {
 		uint64_t flags;
-		spin_lock_irqsave(&ext4_io_wait_lock, &flags);
-		if (!ext4_io_locked) {
-			ext4_io_locked = 1;
-			ext4_io_owner = my_id;
-			ext4_io_depth = 1;
-			ext4_txn_begin(); /* outermost acquire starts a txn */
-			spin_unlock_irqrestore(&ext4_io_wait_lock, flags);
+		spin_lock_irqsave(&sem->lock, &flags);
+		if (sem->writer && sem->owner == my_id && cur) {
+			/* Nested acquisition under our own exclusive hold:
+			 * treat as exclusive recursion. */
+			sem->wdepth++;
+			spin_unlock_irqrestore(&sem->lock, flags);
 			return;
 		}
-		if (ext4_io_owner == my_id) {
-			ext4_io_depth++;
-			spin_unlock_irqrestore(&ext4_io_wait_lock, flags);
+		int defer_to_writers = sem->w_wait && !(cur && cur->fs_rdepth);
+		if (!sem->writer && !defer_to_writers) {
+			sem->readers++;
+			if (cur)
+				cur->fs_rdepth++;
+			spin_unlock_irqrestore(&sem->lock, flags);
 			return;
 		}
-		if (cur) {
-			cur->state = TASK_BLOCKED;
-			cur->wait_channel = (void *)&ext4_io_locked;
-		}
-		spin_unlock_irqrestore(&ext4_io_wait_lock, flags);
-		sched_schedule();
+		ext4_rwsem_park(sem, &flags);
 	}
+}
+
+static void ext4_rwsem_read_unlock(ext4_rwsem_t *sem)
+{
+	task_t *cur = sched_current();
+	uint64_t my_id = cur ? cur->id : 0;
+	uint64_t flags;
+	spin_lock_irqsave(&sem->lock, &flags);
+	if (sem->writer && sem->owner == my_id && cur) {
+		/* matching nested-under-exclusive acquisition */
+		WARN_ON(sem->wdepth <= 1);
+		sem->wdepth--;
+		spin_unlock_irqrestore(&sem->lock, flags);
+		return;
+	}
+	WARN_ON(sem->readers <= 0);
+	sem->readers--;
+	if (cur && cur->fs_rdepth > 0)
+		cur->fs_rdepth--;
+	int wake = (sem->readers == 0);
+	spin_unlock_irqrestore(&sem->lock, flags);
+	if (wake)
+		sched_wake_channel((void *)sem);
+}
+
+static void ext4_rwsem_write_lock(ext4_rwsem_t *sem)
+{
+	might_sleep();
+	task_t *cur = sched_current();
+	uint64_t my_id = cur ? cur->id : 0;
+	int queued = 0;
+	while (1) {
+		uint64_t flags;
+		spin_lock_irqsave(&sem->lock, &flags);
+		if (sem->writer && sem->owner == my_id) {
+			sem->wdepth++; /* reentrant exclusive */
+			if (queued)
+				sem->w_wait--;
+			spin_unlock_irqrestore(&sem->lock, flags);
+			return;
+		}
+		if (!sem->writer && sem->readers == 0) {
+			sem->writer = 1;
+			sem->owner = my_id;
+			sem->wdepth = 1;
+			if (queued)
+				sem->w_wait--;
+			spin_unlock_irqrestore(&sem->lock, flags);
+			return;
+		}
+		if (!queued) {
+			sem->w_wait++;
+			queued = 1;
+		}
+		ext4_rwsem_park(sem, &flags);
+	}
+}
+
+static void ext4_rwsem_write_unlock(ext4_rwsem_t *sem)
+{
+	uint64_t flags;
+	spin_lock_irqsave(&sem->lock, &flags);
+	WARN_ON(!sem->writer || sem->wdepth <= 0);
+	if (sem->wdepth > 1) {
+		sem->wdepth--;
+		spin_unlock_irqrestore(&sem->lock, flags);
+		return;
+	}
+	sem->writer = 0;
+	sem->owner = (uint64_t)-1;
+	sem->wdepth = 0;
+	spin_unlock_irqrestore(&sem->lock, flags);
+	sched_wake_channel((void *)sem);
+}
+
+/* --- the lock instances ------------------------------------------------ */
+static ext4_rwsem_t s_meta = EXT4_RWSEM_INIT("ext4_meta");
+
+#define EXT4_ILOCKS 64
+static ext4_rwsem_t s_ilock[EXT4_ILOCKS];
+
+#define EXT4_BGLOCKS 32
+static ext4_rwsem_t s_bglock[EXT4_BGLOCKS];
+
+static int s_locks_ready; /* set once the tables are initialised */
+
+static void ext4_rwsem_init(ext4_rwsem_t *sem, const char *name)
+{
+	sem->readers = 0;
+	sem->writer = 0;
+	sem->owner = (uint64_t)-1;
+	sem->wdepth = 0;
+	sem->w_wait = 0;
+	spinlock_init(&sem->lock, name);
+}
+
+static void ext4_locks_init(void)
+{
+	if (s_locks_ready)
+		return;
+	for (int i = 0; i < EXT4_ILOCKS; i++)
+		ext4_rwsem_init(&s_ilock[i], "ext4_ino");
+	for (int i = 0; i < EXT4_BGLOCKS; i++)
+		ext4_rwsem_init(&s_bglock[i], "ext4_bg");
+	s_locks_ready = 1;
+}
+
+/* Debug mirrors read by the scheduler's Ctrl+D dump (legacy names). */
+volatile int ext4_io_locked = 0;
+volatile int ext4_io_depth = 0;
+volatile uint64_t ext4_io_owner = (uint64_t)-1;
+
+/* Metadata lock, EXCLUSIVE (mutators).  Semantically identical to the old
+ * global mutex including the transaction hooks: the outermost acquire
+ * begins a journal transaction, the matching outermost release commits it. */
+void ext4_io_lock(void)
+{
+	ext4_rwsem_write_lock(&s_meta);
+	if (s_meta.wdepth == 1) {
+		ext4_txn_begin();
+		ext4_io_locked = 1;
+		ext4_io_owner = s_meta.owner;
+	}
+	ext4_io_depth = s_meta.wdepth;
 }
 
 void ext4_io_unlock(void)
 {
-	/* On the outermost release, commit the operation's transaction while the
-     * lock is still held (depth==1, we are still the owner).  Done before the
-     * spinlock since the flush sleeps on disk I/O.  Reads ext4_io_depth
-     * lock-free: only the owning task mutates its own depth. */
-	if (ext4_io_depth == 1 && s_txn.active)
+	/* On the outermost release, commit the operation's transaction while
+	 * the lock is still held.  The flush sleeps on disk I/O — fine, we
+	 * still own the exclusive hold. */
+	if (s_meta.wdepth == 1 && s_txn.active)
 		ext4_txn_flush(g_ext4_fs);
-
-	uint64_t flags;
-	spin_lock_irqsave(&ext4_io_wait_lock, &flags);
-	WARN_ON(!ext4_io_locked);
-	WARN_ON(ext4_io_depth <= 0);
-	if (ext4_io_depth > 1) {
-		ext4_io_depth--;
-		spin_unlock_irqrestore(&ext4_io_wait_lock, flags);
-		return;
-	}
-	ext4_io_locked = 0;
-	ext4_io_owner = (uint64_t)-1;
-	ext4_io_depth = 0;
-	spin_unlock_irqrestore(&ext4_io_wait_lock, flags);
-	sched_wake_channel((void *)&ext4_io_locked);
-}
-
-int ext4_io_release_if_owner(uint64_t task_id)
-{
-	uint64_t flags;
-	int released = 0;
-	spin_lock_irqsave(&ext4_io_wait_lock, &flags);
-	if (ext4_io_locked && ext4_io_owner == task_id) {
+	if (s_meta.wdepth == 1) {
 		ext4_io_locked = 0;
 		ext4_io_owner = (uint64_t)-1;
 		ext4_io_depth = 0;
-		/* The dead task may have been mid-operation: discard its uncommitted
-         * transaction.  Nothing was journaled or checkpointed, so the fs stays
-         * at its pre-operation state (atomicity).  Any committed epoch (s_ckpt +
-         * log) is durable and stays — it is checkpointed/replayed normally.
-         * Buffers are kept for reuse. */
+	} else {
+		ext4_io_depth = s_meta.wdepth - 1;
+	}
+	ext4_rwsem_write_unlock(&s_meta);
+}
+
+/* Metadata lock, SHARED (read-only ops: resolve/stat/readdir/extent
+ * mapping/xattr reads).  Concurrent with other shared holders. */
+static void ext4_meta_rlock(void)
+{
+	ext4_rwsem_read_lock(&s_meta);
+}
+static void ext4_meta_runlock(void)
+{
+	ext4_rwsem_read_unlock(&s_meta);
+}
+
+/* Does the current task hold the metadata lock EXCLUSIVE?  Used by shared
+ * paths that would otherwise perform an opportunistic mutator action
+ * (e.g. open's deferred GDT flush). */
+static int ext4_meta_held_excl(void)
+{
+	task_t *cur = sched_current();
+	return s_meta.writer && cur && s_meta.owner == cur->id;
+}
+
+/* Per-inode locks. */
+static inline ext4_rwsem_t *ext4_ilock_of(unsigned long ino)
+{
+	return &s_ilock[ino % EXT4_ILOCKS];
+}
+static void ext4_ilock_shared(unsigned long ino)
+{
+	ext4_rwsem_read_lock(ext4_ilock_of(ino));
+}
+static void ext4_iunlock_shared(unsigned long ino)
+{
+	ext4_rwsem_read_unlock(ext4_ilock_of(ino));
+}
+static void ext4_ilock_excl(unsigned long ino)
+{
+	ext4_rwsem_write_lock(ext4_ilock_of(ino));
+}
+static void ext4_iunlock_excl(unsigned long ino)
+{
+	ext4_rwsem_write_unlock(ext4_ilock_of(ino));
+}
+
+/* Per-block-group allocation locks (nest inside s_meta exclusive). */
+static void ext4_bg_lock(unsigned g)
+{
+	ext4_rwsem_write_lock(&s_bglock[g % EXT4_BGLOCKS]);
+}
+static void ext4_bg_unlock(unsigned g)
+{
+	ext4_rwsem_write_unlock(&s_bglock[g % EXT4_BGLOCKS]);
+}
+
+/* Crash-abandon cleanup: force-release every lock the dead task still
+ * owns in EXCLUSIVE mode.  (Shared holds cannot be attributed to a task
+ * without per-task tracking; they also cannot be abandoned in practice —
+ * fatal signals defer to delivery points, so a shared holder always runs
+ * its unlock path.  Exclusive holds are tracked by owner and swept here.) */
+int ext4_io_release_if_owner(uint64_t task_id)
+{
+	int released = 0;
+
+	uint64_t flags;
+	spin_lock_irqsave(&s_meta.lock, &flags);
+	if (s_meta.writer && s_meta.owner == task_id) {
+		s_meta.writer = 0;
+		s_meta.owner = (uint64_t)-1;
+		s_meta.wdepth = 0;
+		/* The dead task may have been mid-operation: discard its
+		 * uncommitted transaction.  Nothing was journaled or
+		 * checkpointed, so the fs stays at its pre-operation state
+		 * (atomicity).  Any committed epoch (s_ckpt + log) is durable
+		 * and stays — it is checkpointed/replayed normally. */
 		s_txn.active = 0;
 		s_txn.n = 0;
-		s_force_ckpt =
-			0; /* the freeing op was discarded with s_txn      */
+		s_force_ckpt = 0;
+		ext4_io_locked = 0;
+		ext4_io_owner = (uint64_t)-1;
+		ext4_io_depth = 0;
 		released = 1;
 	}
-	spin_unlock_irqrestore(&ext4_io_wait_lock, flags);
+	spin_unlock_irqrestore(&s_meta.lock, flags);
 	if (released)
-		sched_wake_channel((void *)&ext4_io_locked);
+		sched_wake_channel((void *)&s_meta);
+
+	for (int i = 0; i < EXT4_ILOCKS; i++) {
+		ext4_rwsem_t *sem = &s_ilock[i];
+		int r = 0;
+		spin_lock_irqsave(&sem->lock, &flags);
+		if (sem->writer && sem->owner == task_id) {
+			sem->writer = 0;
+			sem->owner = (uint64_t)-1;
+			sem->wdepth = 0;
+			r = 1;
+		}
+		spin_unlock_irqrestore(&sem->lock, flags);
+		if (r) {
+			sched_wake_channel((void *)sem);
+			released = 1;
+		}
+	}
+	for (int i = 0; i < EXT4_BGLOCKS; i++) {
+		ext4_rwsem_t *sem = &s_bglock[i];
+		int r = 0;
+		spin_lock_irqsave(&sem->lock, &flags);
+		if (sem->writer && sem->owner == task_id) {
+			sem->writer = 0;
+			sem->owner = (uint64_t)-1;
+			sem->wdepth = 0;
+			r = 1;
+		}
+		spin_unlock_irqrestore(&sem->lock, flags);
+		if (r) {
+			sched_wake_channel((void *)sem);
+			released = 1;
+		}
+	}
 	return released;
 }
 
@@ -825,6 +1094,11 @@ static struct {
 	int verified; /* type-specific csum already checked once */
 } s_mbc[EXT4_MBC_ENTRIES];
 static unsigned s_mbc_next;
+/* The metadata block cache is read AND repopulated by concurrent shared-mode
+ * readers (mutators hold the metadata lock exclusive, but reader–reader
+ * insertions race), so it carries its own spinlock.  Copies in/out happen
+ * under the lock (a block-size memcpy — sub-microsecond). */
+static spinlock_t s_mbc_lock = SPINLOCK_INIT("ext4_mbc");
 
 /* ---- checksum-verification cache ----
  * Metadata checksums (directory leaves, extent nodes, xattr blocks) were
@@ -835,40 +1109,101 @@ static unsigned s_mbc_next;
  * cached content changes (fresh disk read, write-through update). */
 static int ext4_mbc_verified(unsigned long pbn)
 {
+	uint64_t flags;
+	int v = 0;
+	spin_lock_irqsave(&s_mbc_lock, &flags);
 	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
-		if (s_mbc[i].pbn == pbn)
-			return s_mbc[i].verified;
-	return 0;
+		if (s_mbc[i].pbn == pbn) {
+			v = s_mbc[i].verified;
+			break;
+		}
+	spin_unlock_irqrestore(&s_mbc_lock, flags);
+	return v;
 }
 
 static void ext4_mbc_mark_verified(unsigned long pbn)
 {
+	uint64_t flags;
+	spin_lock_irqsave(&s_mbc_lock, &flags);
 	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
 		if (s_mbc[i].pbn == pbn) {
 			s_mbc[i].verified = 1;
-			return;
+			break;
 		}
+	spin_unlock_irqrestore(&s_mbc_lock, flags);
 }
 
 static void ext4_mbc_invalidate(void)
 {
+	/* Detach the buffers under the lock, free them after releasing it —
+	 * kfree of a block-sized buffer does a TLB shootdown and must not run
+	 * with IRQs off under a spinlock. */
+	uint8_t *bufs[EXT4_MBC_ENTRIES];
+	uint64_t flags;
+	spin_lock_irqsave(&s_mbc_lock, &flags);
 	for (int i = 0; i < EXT4_MBC_ENTRIES; i++) {
 		s_mbc[i].pbn = 0;
-		if (s_mbc[i].data) {
-			kfree(s_mbc[i].data);
-			s_mbc[i].data = 0;
-		}
+		bufs[i] = s_mbc[i].data;
+		s_mbc[i].data = 0;
 	}
 	s_mbc_next = 0;
+	spin_unlock_irqrestore(&s_mbc_lock, flags);
+	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
+		if (bufs[i])
+			kfree(bufs[i]);
 }
 
 /* Drop a single block from the metadata cache (on free, so a later reuse of
  * the same physical block never serves stale cached content). */
 static void ext4_mbc_drop(unsigned long pbn)
 {
+	uint64_t flags;
+	spin_lock_irqsave(&s_mbc_lock, &flags);
 	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
 		if (s_mbc[i].pbn == pbn)
 			s_mbc[i].pbn = 0;
+	spin_unlock_irqrestore(&s_mbc_lock, flags);
+}
+
+/* Serve `pbn` from the cache into `buf`.  Returns 1 on hit. */
+static int ext4_mbc_lookup(ext4_fs_t *fs, unsigned long pbn, void *buf)
+{
+	uint64_t flags;
+	int hit = 0;
+	spin_lock_irqsave(&s_mbc_lock, &flags);
+	for (int i = 0; i < EXT4_MBC_ENTRIES; i++) {
+		if (s_mbc[i].pbn == pbn && s_mbc[i].data) {
+			mm_memcpy(buf, s_mbc[i].data, fs->block_size);
+			hit = 1;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&s_mbc_lock, flags);
+	return hit;
+}
+
+/* Insert a freshly-read block.  `verified` seeds the csum-checked flag. */
+static void ext4_mbc_insert(ext4_fs_t *fs, unsigned long pbn, const void *buf,
+			    int verified)
+{
+	uint64_t flags;
+	spin_lock_irqsave(&s_mbc_lock, &flags);
+	unsigned slot = s_mbc_next++ % EXT4_MBC_ENTRIES;
+	if (!s_mbc[slot].data) {
+		/* One-time buffer allocation for this slot.  kalloc's
+		 * allocation path takes only spinlocks (no sleep, no TLB
+		 * shootdown — that is on the free path), so this is safe
+		 * with IRQs off; it happens once per slot per mount. */
+		s_mbc[slot].data = (uint8_t *)kalloc(fs->block_size);
+		if (!s_mbc[slot].data) {
+			spin_unlock_irqrestore(&s_mbc_lock, flags);
+			return;
+		}
+	}
+	mm_memcpy(s_mbc[slot].data, buf, fs->block_size);
+	s_mbc[slot].pbn = pbn;
+	s_mbc[slot].verified = verified;
+	spin_unlock_irqrestore(&s_mbc_lock, flags);
 }
 
 /* Read one filesystem block (block_size bytes) by physical block number,
@@ -880,28 +1215,21 @@ static int ext4_read_block(ext4_fs_t *fs, unsigned long pbn, void *buf)
 	/* Read-your-writes: the current op's buffer wins, then the epoch's committed-
      * but-not-yet-checkpointed metadata (whose final disk location is still
      * stale), then the cache, then disk. */
+	/* s_txn/s_ckpt are only mutated under the metadata lock held EXCLUSIVE;
+	 * every caller of this function holds it at least SHARED, so these
+	 * lookups need no further locking.  The mbc is repopulated by
+	 * concurrent shared readers and locks internally. */
 	if (s_txn.active && ext4_txn_lookup(fs, pbn, buf))
 		return ST_OK;
 	if (s_ckpt.n && ext4_ckpt_lookup(fs, pbn, buf))
 		return ST_OK;
-	for (int i = 0; i < EXT4_MBC_ENTRIES; i++) {
-		if (s_mbc[i].pbn == pbn && s_mbc[i].data) {
-			mm_memcpy(buf, s_mbc[i].data, fs->block_size);
-			return ST_OK;
-		}
-	}
+	if (ext4_mbc_lookup(fs, pbn, buf))
+		return ST_OK;
 	unsigned long lba = fs->part_lba_offset + pbn * fs->sectors_per_block;
 	int st = ext4_read_sectors(fs->bdev, lba, fs->sectors_per_block, buf);
 	if (st != ST_OK)
 		return st;
-	unsigned slot = s_mbc_next++ % EXT4_MBC_ENTRIES;
-	if (!s_mbc[slot].data)
-		s_mbc[slot].data = (uint8_t *)kalloc(fs->block_size);
-	if (s_mbc[slot].data) {
-		mm_memcpy(s_mbc[slot].data, buf, fs->block_size);
-		s_mbc[slot].pbn = pbn;
-		s_mbc[slot].verified = 0; /* fresh from disk: not yet checked */
-	}
+	ext4_mbc_insert(fs, pbn, buf, 0); /* fresh from disk: not yet checked */
 	return ST_OK;
 }
 
@@ -1128,43 +1456,64 @@ static int ext4_read_inode_loc(ext4_fs_t *fs, unsigned long ino,
  * thrashed on every component (directory inode, then child inode, then the
  * next directory...), forcing an inode-table block read + inode checksum
  * verification per step.  A handful of entries covers a whole resolve.
- * Returned pointers are only valid until the next few cache fills — callers
- * already copy what they need before nested lookups (same contract as the old
- * single entry, which could be evicted by ANY nested call). */
+ *
+ * Copy-out API: with concurrent shared-mode readers, a pointer into the
+ * cache array would be a use-after-recycle hazard (another reader's fill
+ * can reuse the slot at any time).  Lookups therefore copy the record into
+ * a caller-owned buffer under the spinlock; the disk fill on a miss runs
+ * unlocked (a racing double-fill of the same inode is benign). */
 #define EXT4_IC_ENTRIES 8
 static struct {
 	unsigned long ino; /* 0 = empty */
 	ext4_inode inode;
 } s_ic[EXT4_IC_ENTRIES];
 static unsigned s_ic_next;
+static spinlock_t s_ic_lock = SPINLOCK_INIT("ext4_ic");
 
 static void ext4_inode_cache_flush(void)
 {
+	uint64_t flags;
+	spin_lock_irqsave(&s_ic_lock, &flags);
 	for (int i = 0; i < EXT4_IC_ENTRIES; i++)
 		s_ic[i].ino = 0;
+	spin_unlock_irqrestore(&s_ic_lock, flags);
 }
 
-static const ext4_inode *ext4_get_inode_cached(ext4_fs_t *fs, unsigned long ino)
+/* Fetch inode `ino` into caller-owned `out`.  Returns 1 on success, 0 on
+ * failure. */
+static int ext4_get_inode_cached(ext4_fs_t *fs, unsigned long ino,
+				 ext4_inode *out)
 {
-	if (ino == 0)
+	if (ino == 0 || !out)
 		return 0;
+	uint64_t flags;
+	spin_lock_irqsave(&s_ic_lock, &flags);
 	for (int i = 0; i < EXT4_IC_ENTRIES; i++)
-		if (s_ic[i].ino == ino)
-			return &s_ic[i].inode;
-	unsigned slot = s_ic_next++ % EXT4_IC_ENTRIES;
-	if (ext4_read_inode_loc(fs, ino, &s_ic[slot].inode, 0, 0) != ST_OK) {
-		s_ic[slot].ino = 0;
+		if (s_ic[i].ino == ino) {
+			mm_memcpy(out, &s_ic[i].inode, sizeof(*out));
+			spin_unlock_irqrestore(&s_ic_lock, flags);
+			return 1;
+		}
+	spin_unlock_irqrestore(&s_ic_lock, flags);
+	/* Miss: read from disk without the spinlock (sleeps on I/O). */
+	if (ext4_read_inode_loc(fs, ino, out, 0, 0) != ST_OK)
 		return 0;
-	}
+	spin_lock_irqsave(&s_ic_lock, &flags);
+	unsigned slot = s_ic_next++ % EXT4_IC_ENTRIES;
+	mm_memcpy(&s_ic[slot].inode, out, sizeof(*out));
 	s_ic[slot].ino = ino;
-	return &s_ic[slot].inode;
+	spin_unlock_irqrestore(&s_ic_lock, flags);
+	return 1;
 }
 
 static inline void ext4_inode_cache_drop(unsigned long ino)
 {
+	uint64_t flags;
+	spin_lock_irqsave(&s_ic_lock, &flags);
 	for (int i = 0; i < EXT4_IC_ENTRIES; i++)
 		if (s_ic[i].ino == ino)
 			s_ic[i].ino = 0;
+	spin_unlock_irqrestore(&s_ic_lock, flags);
 }
 
 static inline unsigned long ext4_inode_size(const ext4_inode *in)
@@ -1313,12 +1662,12 @@ out:
 static unsigned long ext4_block_map(ext4_fs_t *fs, unsigned long ino,
 				    unsigned long lidx)
 {
-	const ext4_inode *in = ext4_get_inode_cached(fs, ino);
-	if (!in)
+	ext4_inode in;
+	if (!ext4_get_inode_cached(fs, ino, &in))
 		return 0;
-	if (in->i_flags & EXT4_INODE_EXTENTS_FL)
-		return ext4_extent_map(fs, ino, in, lidx);
-	return ext4_indirect_map(fs, in, lidx);
+	if (in.i_flags & EXT4_INODE_EXTENTS_FL)
+		return ext4_extent_map(fs, ino, &in, lidx);
+	return ext4_indirect_map(fs, &in, lidx);
 }
 
 /* ===================================================================
@@ -1390,6 +1739,22 @@ static void ext4_sb_unlock_io(vfs_superblock_t *sb)
 	ext4_io_unlock();
 }
 
+/* Shared mapping lock for the pagecache: extent lookups (next_block /
+ * block_to_lba) only read metadata, so concurrent readers may map in
+ * parallel; mutators hold the metadata lock exclusive.  The pagecache
+ * performs the data transfer with no fs lock — data-block lifetime is
+ * fenced by the per-inode lock the read entry point holds. */
+static void ext4_sb_lock_map(vfs_superblock_t *sb)
+{
+	(void)sb;
+	ext4_meta_rlock();
+}
+static void ext4_sb_unlock_map(vfs_superblock_t *sb)
+{
+	(void)sb;
+	ext4_meta_runlock();
+}
+
 static unsigned long ext4_sb_reserved_meta_block(vfs_superblock_t *sb)
 {
 	(void)sb;
@@ -1433,6 +1798,8 @@ static const vfs_sb_ops_t ext4_sb_ops = {
 	.write_inode = ext4_sb_write_inode,
 	.lock_io = ext4_sb_lock_io,
 	.unlock_io = ext4_sb_unlock_io,
+	.lock_map = ext4_sb_lock_map,
+	.unlock_map = ext4_sb_unlock_map,
 	.reserved_meta_block = ext4_sb_reserved_meta_block,
 };
 
@@ -1453,13 +1820,13 @@ static int ext4_dir_lookup(ext4_fs_t *fs, unsigned long dir_ino,
 			   const char *name, unsigned name_len,
 			   unsigned long *out_ino, unsigned *out_ftype)
 {
-	const ext4_inode *din = ext4_get_inode_cached(fs, dir_ino);
-	if (!din || (din->i_mode & S_IFMT) != S_IFDIR)
+	ext4_inode din;
+	if (!ext4_get_inode_cached(fs, dir_ino, &din) ||
+	    (din.i_mode & S_IFMT) != S_IFDIR)
 		return ST_NOT_FOUND;
-	unsigned long dsize = ext4_inode_size(din);
+	unsigned long dsize = ext4_inode_size(&din);
 	unsigned long nblocks = (dsize + fs->block_size - 1) / fs->block_size;
-	uint32_t gen =
-		din->i_generation; /* for the leaf csum (din may be evicted below) */
+	uint32_t gen = din.i_generation; /* for the leaf csum */
 
 	uint8_t *blk = (uint8_t *)ext4_bget(fs);
 	if (!blk)
@@ -1588,14 +1955,14 @@ static int ext4_resolve_ex(ext4_fs_t *fs, unsigned long start_ino,
                                                      rather than masking ENOENT  */
 			return lr;
 
-		const ext4_inode *cin = ext4_get_inode_cached(fs, child);
-		if (!cin)
+		ext4_inode cin;
+		if (!ext4_get_inode_cached(fs, child, &cin))
 			return ST_IO;
-		if ((cin->i_mode & S_IFMT) == S_IFLNK &&
+		if ((cin.i_mode & S_IFMT) == S_IFLNK &&
 		    (!is_last || follow_final)) {
 			char target[256];
 			int tl = ext4_read_symlink_target(
-				fs, child, cin, target, sizeof(target));
+				fs, child, &cin, target, sizeof(target));
 			if (tl <= 0)
 				return ST_IO;
 			unsigned long linked;
@@ -1608,10 +1975,10 @@ static int ext4_resolve_ex(ext4_fs_t *fs, unsigned long start_ino,
 			cur = child;
 		}
 		if (!is_last) {
-			const ext4_inode *d = ext4_get_inode_cached(fs, cur);
-			if (!d)
+			ext4_inode d;
+			if (!ext4_get_inode_cached(fs, cur, &d))
 				return ST_IO; /* unreadable/corrupt component */
-			if ((d->i_mode & S_IFMT) != S_IFDIR)
+			if ((d.i_mode & S_IFMT) != S_IFDIR)
 				return ST_NOT_FOUND;
 		}
 	}
@@ -1720,8 +2087,11 @@ static int ext4_open_impl(const char *path, int flags, vfs_file_t **out)
 		icache_chain_invalidate(EXT4_BID_ENC(ino, 0));
 	}
 
-	/* Flush any deferred GDT/superblock updates from create/truncate alloc. */
-	if (fs->meta_dirty)
+	/* Flush any deferred GDT/superblock updates from create/truncate
+	 * alloc — but only on the exclusive (mutating-open) path; a plain
+	 * shared open must not write metadata.  Deferred updates flush on
+	 * the next mutator/fsync/commit anyway. */
+	if (fs->meta_dirty && ext4_meta_held_excl())
 		ext4_flush_meta(fs);
 
 	ext4_file_t *ef = (ext4_file_t *)kalloc(sizeof(ext4_file_t));
@@ -1794,10 +2164,10 @@ static long ext4_read_impl(vfs_file_t *f, void *buf, long bytes)
 	if ((unsigned long)bytes > ef->size - ef->pos)
 		bytes = (long)(ef->size - ef->pos);
 
-	/* Read-your-writes: any file data still in the write-back buffer must reach
-     * disk first — the read path below goes to the device, not the buffer. */
-	if (ef->fs)
-		ext4_wb_flush(ef->fs);
+	/* Read-your-writes for the data write-back buffer is handled by the
+	 * ext4_read entry point (flushes under the exclusive lock when the
+	 * buffer holds this file's blocks) — this impl runs under the inode
+	 * lock SHARED and the pagecache's mapping lock only. */
 
 	unsigned long remaining = (unsigned long)bytes;
 	unsigned long copied = 0;
@@ -1894,12 +2264,11 @@ static long ext4_readdir_impl(vfs_file_t *f, void *buf, long bytes)
 		return -ENOTDIR;
 	ext4_fs_t *fs = ef->fs;
 
-	const ext4_inode *din = ext4_get_inode_cached(fs, ef->ino);
-	if (!din)
+	ext4_inode din;
+	if (!ext4_get_inode_cached(fs, ef->ino, &din))
 		return ST_IO;
-	unsigned long dsize = ext4_inode_size(din);
-	uint32_t gen =
-		din->i_generation; /* for the leaf csum (din may be evicted below) */
+	unsigned long dsize = ext4_inode_size(&din);
+	uint32_t gen = din.i_generation; /* for the leaf csum */
 
 	uint8_t *blk = (uint8_t *)ext4_bget(fs);
 	if (!blk)
@@ -2002,8 +2371,9 @@ static int ext4_chdir_impl(const char *path)
 	int rr = ext4_resolve(g_ext4_fs, path, &ino);
 	if (rr != ST_OK) /* propagate ST_IO, not ENOENT */
 		return rr;
-	const ext4_inode *in = ext4_get_inode_cached(g_ext4_fs, ino);
-	if (!in || (in->i_mode & S_IFMT) != S_IFDIR)
+	ext4_inode in;
+	if (!ext4_get_inode_cached(g_ext4_fs, ino, &in) ||
+	    (in.i_mode & S_IFMT) != S_IFDIR)
 		return -ENOTDIR;
 	g_ext4_cwd_ino = ino;
 	return ST_OK;
@@ -2057,12 +2427,17 @@ static int ext4_write_block_direct(ext4_fs_t *fs, unsigned long pbn,
 	int st = ext4_write_sectors(fs->bdev, lba, fs->sectors_per_block, buf);
 	if (st != ST_OK)
 		return st;
-	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
-		if (s_mbc[i].pbn == pbn && s_mbc[i].data) {
-			mm_memcpy(s_mbc[i].data, buf, fs->block_size);
-			s_mbc[i].verified = 0; /* content changed */
-			break;
-		}
+	{
+		uint64_t flags;
+		spin_lock_irqsave(&s_mbc_lock, &flags);
+		for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
+			if (s_mbc[i].pbn == pbn && s_mbc[i].data) {
+				mm_memcpy(s_mbc[i].data, buf, fs->block_size);
+				s_mbc[i].verified = 0; /* content changed */
+				break;
+			}
+		spin_unlock_irqrestore(&s_mbc_lock, flags);
+	}
 	return ST_OK;
 }
 
@@ -2440,11 +2815,16 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino,
 		unsigned g = (pgroup + gi) % fs->groups_count;
 		if (fs->gdt[g].bg_free_inodes_count_lo == 0)
 			continue;
+		/* Group lock: this group's inode-bitmap read-modify-write. */
+		ext4_bg_lock(g);
 		unsigned long bblk = ext4_gd_inode_bitmap(fs, g);
-		if (ext4_read_block(fs, bblk, bm) != ST_OK)
+		if (ext4_read_block(fs, bblk, bm) != ST_OK) {
+			ext4_bg_unlock(g);
 			continue;
+		}
 		if (!ext4_inode_bitmap_csum_ok(fs, g, bm)) {
 			ext4_fs_error(fs, "inode bitmap checksum mismatch", 0);
+			ext4_bg_unlock(g);
 			kfree(bm);
 			return 0;
 		}
@@ -2471,6 +2851,7 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino,
 						fs->inodes_per_group - off1);
 			}
 			if (ext4_write_block(fs, bblk, bm) != ST_OK) {
+				ext4_bg_unlock(g);
 				kfree(bm);
 				return 0;
 			}
@@ -2479,9 +2860,11 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino,
 				fs->gdt[g].bg_used_dirs_count_lo++;
 			fs->sb_copy.s_free_inodes_count--;
 			ext4_gd_dirty(fs, g);
+			ext4_bg_unlock(g);
 			kfree(bm);
 			return ino;
 		}
+		ext4_bg_unlock(g);
 	}
 	kfree(bm);
 	return 0;
@@ -2507,10 +2890,13 @@ static void ext4_free_inode(ext4_fs_t *fs, unsigned long ino, int is_dir)
 	uint8_t *bm = (uint8_t *)kalloc(fs->block_size);
 	if (!bm)
 		return;
+	/* Group lock: serialises this group's bitmap read-modify-write. */
+	ext4_bg_lock(g);
 	unsigned long bblk = ext4_gd_inode_bitmap(fs, g);
 	if (ext4_read_block(fs, bblk, bm) == ST_OK) {
 		if (!ext4_inode_bitmap_csum_ok(fs, g, bm)) {
 			ext4_fs_error(fs, "inode bitmap checksum mismatch", 0);
+			ext4_bg_unlock(g);
 			kfree(bm);
 			return;
 		}
@@ -2525,6 +2911,7 @@ static void ext4_free_inode(ext4_fs_t *fs, unsigned long ino, int is_dir)
 			ext4_gd_dirty(fs, g);
 		}
 	}
+	ext4_bg_unlock(g);
 	kfree(bm);
 }
 
@@ -2572,12 +2959,15 @@ static void ext4_free_blocks_run(ext4_fs_t *fs, unsigned long start,
 			if (!bm)
 				return;
 		}
+		/* Group lock: this group's block-bitmap read-modify-write. */
+		ext4_bg_lock(g);
 		unsigned long bblk = ext4_gd_block_bitmap(fs, g);
 		if (ext4_read_block(fs, bblk, bm) == ST_OK) {
 			if (!ext4_block_bitmap_csum_ok(fs, g, bm)) {
 				ext4_fs_error(fs,
 					      "block bitmap checksum mismatch",
 					      0);
+				ext4_bg_unlock(g);
 				kfree(bm);
 				return;
 			}
@@ -2599,6 +2989,7 @@ static void ext4_free_blocks_run(ext4_fs_t *fs, unsigned long start,
 				ext4_gd_dirty(fs, g);
 			}
 		}
+		ext4_bg_unlock(g);
 		for (unsigned long k = 0; k < n; k++)
 			ext4_mbc_drop(start +
 				      k); /* avoid stale cache if reallocated */
@@ -2974,11 +3365,16 @@ static unsigned ext4_alloc_blocks_for_file(ext4_fs_t *fs, unsigned long ino,
 	     g++) {
 		if (fs->gdt[g].bg_free_blocks_count_lo == 0)
 			continue;
+		/* Group lock: this group's block-bitmap read-modify-write. */
+		ext4_bg_lock(g);
 		unsigned long bblk = ext4_gd_block_bitmap(fs, g);
-		if (ext4_read_block(fs, bblk, bm) != ST_OK)
+		if (ext4_read_block(fs, bblk, bm) != ST_OK) {
+			ext4_bg_unlock(g);
 			continue;
+		}
 		if (!ext4_block_bitmap_csum_ok(fs, g, bm)) {
 			ext4_fs_error(fs, "block bitmap checksum mismatch", 0);
+			ext4_bg_unlock(g);
 			break;
 		}
 		unsigned long base = fs->first_data_block +
@@ -3011,6 +3407,7 @@ static unsigned ext4_alloc_blocks_for_file(ext4_fs_t *fs, unsigned long ino,
 			fs->sb_copy.s_free_blocks_count_lo -= group_alloc;
 			ext4_gd_dirty(fs, g);
 		}
+		ext4_bg_unlock(g);
 	}
 	kfree(bm);
 
@@ -3386,11 +3783,16 @@ static unsigned long ext4_alloc_one_block(ext4_fs_t *fs)
 	for (unsigned g = 0; g < fs->groups_count && !pbn; g++) {
 		if (fs->gdt[g].bg_free_blocks_count_lo == 0)
 			continue;
+		/* Group lock: this group's block-bitmap read-modify-write. */
+		ext4_bg_lock(g);
 		unsigned long bblk = ext4_gd_block_bitmap(fs, g);
-		if (ext4_read_block(fs, bblk, bm) != ST_OK)
+		if (ext4_read_block(fs, bblk, bm) != ST_OK) {
+			ext4_bg_unlock(g);
 			continue;
+		}
 		if (!ext4_block_bitmap_csum_ok(fs, g, bm)) {
 			ext4_fs_error(fs, "block bitmap checksum mismatch", 0);
+			ext4_bg_unlock(g);
 			break;
 		}
 		unsigned long base = fs->first_data_block +
@@ -3407,6 +3809,7 @@ static unsigned long ext4_alloc_one_block(ext4_fs_t *fs)
 			pbn = base + i;
 			break;
 		}
+		ext4_bg_unlock(g);
 	}
 	kfree(bm);
 	return pbn;
@@ -5468,8 +5871,10 @@ static int ext4_dir_is_empty(ext4_fs_t *fs, unsigned long dir_ino)
 static void ext4_dir_set_dotdot(ext4_fs_t *fs, unsigned long dir_ino,
 				unsigned long new_parent)
 {
-	const ext4_inode *di = ext4_get_inode_cached(fs, dir_ino);
-	uint32_t gen = di ? di->i_generation : 0;
+	ext4_inode di;
+	uint32_t gen = ext4_get_inode_cached(fs, dir_ino, &di) ?
+			       di.i_generation :
+			       0;
 	unsigned long pbn = ext4_block_map(fs, dir_ino, 0);
 	if (pbn == 0)
 		return;
@@ -5913,24 +6318,24 @@ int ext4_readlink(const char *path, char *buf, unsigned long bufsiz)
 	if (!path || !buf || !g_ext4_fs || bufsiz == 0)
 		return ST_INVALID;
 	ext4_fs_t *fs = g_ext4_fs;
-	ext4_io_lock();
+	ext4_meta_rlock();
 	unsigned long ino;
 	if (ext4_resolve_ex(fs, g_ext4_cwd_ino, path, 0, &ino, 0) != ST_OK) {
-		ext4_io_unlock();
+		ext4_meta_runlock();
 		return ST_NOT_FOUND;
 	}
-	const ext4_inode *in = ext4_get_inode_cached(fs, ino);
-	if (!in) {
-		ext4_io_unlock();
+	ext4_inode in;
+	if (!ext4_get_inode_cached(fs, ino, &in)) {
+		ext4_meta_runlock();
 		return ST_IO;
 	}
-	if ((in->i_mode & S_IFMT) != S_IFLNK) {
-		ext4_io_unlock();
+	if ((in.i_mode & S_IFMT) != S_IFLNK) {
+		ext4_meta_runlock();
 		return ST_INVALID;
 	}
 	char tmp[256];
-	int tl = ext4_read_symlink_target(fs, ino, in, tmp, sizeof(tmp));
-	ext4_io_unlock();
+	int tl = ext4_read_symlink_target(fs, ino, &in, tmp, sizeof(tmp));
+	ext4_meta_runlock();
 	if (tl < 0)
 		return ST_IO;
 	unsigned long n = (unsigned long)tl;
@@ -6095,13 +6500,13 @@ int ext4_lstat(const char *path, struct kstat *st)
 	if (!path || !st || !g_ext4_fs)
 		return ST_INVALID;
 	ext4_fs_t *fs = g_ext4_fs;
-	ext4_io_lock();
+	ext4_meta_rlock();
 	unsigned long ino;
 	int r = ext4_resolve_ex(fs, g_ext4_cwd_ino, path, 0, &ino,
 				0); /* no follow final */
 	if (r == ST_OK)
 		r = ext4_stat_fill(fs, ino, st);
-	ext4_io_unlock();
+	ext4_meta_runlock();
 	return r;
 }
 
@@ -6147,57 +6552,155 @@ static int ext4_sync_op(void)
 }
 
 /* ---- Locked wrappers (serialise via the reentrant sleeping mutex) ---- */
+/* ===================================================================
+ * VFS entry points — the locking happens HERE, per the hierarchy
+ * (per-inode → metadata → block-group).  Read-only ops take the metadata
+ * lock SHARED and run concurrently; mutators take it EXCLUSIVE (the old
+ * global-mutex semantics, transaction hooks included).  File-content ops
+ * additionally take the file's inode lock so data reads (which transfer
+ * with NO metadata lock) can never overlap a free/rewrite of the same
+ * file's blocks.
+ * =================================================================== */
+
+/* Fence helper for path-named ops that FREE file data (unlink, rename
+ * over an existing file, O_TRUNC open): resolve the victim under the
+ * shared lock, take its inode lock exclusive, then re-check the name
+ * still maps to the same inode under the exclusive metadata lock (it may
+ * have been renamed/replaced while unlocked).  Returns 1 with BOTH locks
+ * held (*ino_out set) when fenced, 0 with NO locks held when the path
+ * does not currently resolve (or keeps racing — caller falls back to the
+ * plain exclusive path, where the data-free is safe anyway because the
+ * name no longer reaches a file a reader could have mapped). */
+static int ext4_fence_path_excl(const char *path, int follow,
+				unsigned long *ino_out)
+{
+	if (!g_ext4_fs)
+		return 0;
+	for (int tries = 0; tries < 4; tries++) {
+		unsigned long ino = 0;
+		ext4_meta_rlock();
+		int rr = ext4_resolve_ex(g_ext4_fs, g_ext4_cwd_ino, path,
+					 follow, &ino, 0);
+		ext4_meta_runlock();
+		if (rr != ST_OK || ino == 0)
+			return 0;
+		ext4_ilock_excl(ino);
+		ext4_io_lock();
+		unsigned long ino2 = 0;
+		int rr2 = ext4_resolve_ex(g_ext4_fs, g_ext4_cwd_ino, path,
+					  follow, &ino2, 0);
+		if (rr2 == ST_OK && ino2 == ino) {
+			*ino_out = ino;
+			return 1; /* both locks held */
+		}
+		ext4_io_unlock();
+		ext4_iunlock_excl(ino);
+		/* raced with a rename/unlink of the name — retry */
+	}
+	return 0;
+}
+
 static int ext4_open(const char *path, int flags, vfs_file_t **out)
 {
-	ext4_io_lock();
+	if (flags & (O_CREAT | O_TRUNC)) {
+		/* A truncating open frees the file's data blocks: fence
+		 * in-flight readers via the inode lock when the target
+		 * already exists. */
+		if (flags & O_TRUNC) {
+			unsigned long ino = 0;
+			if (ext4_fence_path_excl(path, 1, &ino)) {
+				int r = ext4_open_impl(path, flags, out);
+				ext4_io_unlock();
+				ext4_iunlock_excl(ino);
+				return r;
+			}
+		}
+		ext4_io_lock();
+		int r = ext4_open_impl(path, flags, out);
+		ext4_io_unlock();
+		return r;
+	}
+	ext4_meta_rlock();
 	int r = ext4_open_impl(path, flags, out);
-	ext4_io_unlock();
+	ext4_meta_runlock();
 	return r;
 }
 static int ext4_stat_vfs(const char *path, struct kstat *st)
 {
-	ext4_io_lock();
+	ext4_meta_rlock();
 	int r = ext4_stat_vfs_impl(path, st);
-	ext4_io_unlock();
+	ext4_meta_runlock();
 	return r;
 }
 static long ext4_read(vfs_file_t *f, void *buf, long bytes)
 {
-	ext4_io_lock();
+	ext4_file_t *ef = f ? (ext4_file_t *)f->fs_private : 0;
+	if (!ef)
+		return ST_INVALID;
+	unsigned long ino = ef->ino;
+	ext4_ilock_shared(ino);
+	/* Read-your-writes for the data write-back buffer: if it holds THIS
+	 * file's blocks, flush them under the exclusive lock first.  It
+	 * cannot refill for this inode afterwards — a writer needs the inode
+	 * lock exclusive, which we hold shared. */
+	ext4_meta_rlock();
+	int wb_hit = (s_wb_len && s_wb_ino == ino);
+	ext4_meta_runlock();
+	if (wb_hit) {
+		ext4_io_lock();
+		ext4_wb_flush(ef->fs ? ef->fs : g_ext4_fs);
+		ext4_io_unlock();
+	}
 	long r = ext4_read_impl(f, buf, bytes);
-	ext4_io_unlock();
+	ext4_iunlock_shared(ino);
 	return r;
 }
 static long ext4_write(vfs_file_t *f, const void *buf, long bytes)
 {
+	ext4_file_t *ef = f ? (ext4_file_t *)f->fs_private : 0;
+	if (!ef)
+		return ST_INVALID;
+	ext4_ilock_excl(ef->ino);
 	ext4_io_lock();
 	long r = ext4_write_impl(f, buf, bytes);
 	ext4_io_unlock();
+	ext4_iunlock_excl(ef->ino);
 	return r;
 }
 static long ext4_seek(vfs_file_t *f, long offset, int whence)
 {
-	ext4_io_lock();
-	long r = ext4_seek_impl(f, offset, whence);
-	ext4_io_unlock();
-	return r;
+	/* Touches only per-open-file fields (pos; size is a single-word
+	 * read) — no filesystem lock needed. */
+	return ext4_seek_impl(f, offset, whence);
 }
 static long ext4_readdir(vfs_file_t *f, void *buf, long bytes)
 {
-	ext4_io_lock();
+	ext4_meta_rlock();
 	long r = ext4_readdir_impl(f, buf, bytes);
-	ext4_io_unlock();
+	ext4_meta_runlock();
 	return r;
 }
 static int ext4_truncate(vfs_file_t *f, unsigned long size)
 {
+	ext4_file_t *ef = f ? (ext4_file_t *)f->fs_private : 0;
+	if (!ef)
+		return ST_INVALID;
+	ext4_ilock_excl(ef->ino);
 	ext4_io_lock();
 	int r = ext4_truncate_impl(f, size);
 	ext4_io_unlock();
+	ext4_iunlock_excl(ef->ino);
 	return r;
 }
 static int ext4_unlink(const char *path)
 {
+	unsigned long ino = 0;
+	if (ext4_fence_path_excl(path, 0, &ino)) {
+		int r = ext4_unlink_impl(path);
+		ext4_io_unlock();
+		ext4_iunlock_excl(ino);
+		return r;
+	}
 	ext4_io_lock();
 	int r = ext4_unlink_impl(path);
 	ext4_io_unlock();
@@ -6205,6 +6708,15 @@ static int ext4_unlink(const char *path)
 }
 static int ext4_rename(const char *o, const char *n)
 {
+	/* Only an existing DESTINATION file has its data freed (overwrite);
+	 * fence it.  The source inode's data is untouched by rename. */
+	unsigned long dst = 0;
+	if (ext4_fence_path_excl(n, 0, &dst)) {
+		int r = ext4_rename_impl(o, n);
+		ext4_io_unlock();
+		ext4_iunlock_excl(dst);
+		return r;
+	}
 	ext4_io_lock();
 	int r = ext4_rename_impl(o, n);
 	ext4_io_unlock();
@@ -6226,17 +6738,15 @@ static int ext4_rmdir(const char *path)
 }
 static int ext4_chdir(const char *path)
 {
-	ext4_io_lock();
+	ext4_meta_rlock();
 	int r = ext4_chdir_impl(path);
-	ext4_io_unlock();
+	ext4_meta_runlock();
 	return r;
 }
 static int ext4_close(vfs_file_t *f)
 {
-	ext4_io_lock();
-	int r = ext4_close_impl(f);
-	ext4_io_unlock();
-	return r;
+	/* icache_unref locks internally; nothing else is shared. */
+	return ext4_close_impl(f);
 }
 
 static int ext4_release_locks_for_task(uint64_t task_id)
@@ -6295,9 +6805,9 @@ static int ext4_fstat_op(vfs_file_t *f, struct kstat *st)
 	ext4_file_t *ef = (ext4_file_t *)f->fs_private;
 	if (!ef)
 		return ST_INVALID;
-	ext4_io_lock();
+	ext4_meta_rlock();
 	int r = ext4_stat_fill(g_ext4_fs, ef->ino, st);
-	ext4_io_unlock();
+	ext4_meta_runlock();
 	return r;
 }
 
@@ -6344,13 +6854,13 @@ static int ext4_getxattr_op(const char *path, int nofollow, const char *name,
 	int idx = ext4_xattr_name_index(name, &suf, &slen);
 	if (idx == 0)
 		return ST_NODATA; /* slen==0 is valid for POSIX-ACL names */
-	ext4_io_lock();
+	ext4_meta_rlock();
 	unsigned long ino;
 	int r = ext4_xattr_resolve(path, nofollow, &ino);
 	if (r == ST_OK)
 		r = ext4_xattr_get_ino(g_ext4_fs, ino, idx, suf, slen, val,
 				       size);
-	ext4_io_unlock();
+	ext4_meta_runlock();
 	return r;
 }
 /* Fetch by already-resolved inode number, skipping the path walk (used by the
@@ -6365,9 +6875,9 @@ static int ext4_getxattr_ino_op(unsigned long ino, const char *name, void *val,
 	int idx = ext4_xattr_name_index(name, &suf, &slen);
 	if (idx == 0)
 		return ST_NODATA; /* slen==0 is valid for POSIX-ACL names */
-	ext4_io_lock();
+	ext4_meta_rlock();
 	int r = ext4_xattr_get_ino(g_ext4_fs, ino, idx, suf, slen, val, size);
-	ext4_io_unlock();
+	ext4_meta_runlock();
 	return r;
 }
 static int ext4_setxattr_op(const char *path, int nofollow, const char *name,
@@ -6396,12 +6906,12 @@ static int ext4_listxattr_op(const char *path, int nofollow, char *list,
 {
 	if (!g_ext4_fs || !path)
 		return ST_INVALID;
-	ext4_io_lock();
+	ext4_meta_rlock();
 	unsigned long ino;
 	int r = ext4_xattr_resolve(path, nofollow, &ino);
 	if (r == ST_OK)
 		r = ext4_xattr_list_ino(g_ext4_fs, ino, list, size);
-	ext4_io_unlock();
+	ext4_meta_runlock();
 	return r;
 }
 static int ext4_removexattr_op(const char *path, int nofollow, const char *name)
@@ -6441,10 +6951,10 @@ static int ext4_fgetxattr_op(vfs_file_t *f, const char *name, void *val,
 	int idx = ext4_xattr_name_index(name, &suf, &slen);
 	if (idx == 0)
 		return ST_NODATA; /* slen==0 is valid for POSIX-ACL names */
-	ext4_io_lock();
+	ext4_meta_rlock();
 	int r = ext4_xattr_get_ino(g_ext4_fs, ef->ino, idx, suf, slen, val,
 				   size);
-	ext4_io_unlock();
+	ext4_meta_runlock();
 	return r;
 }
 static int ext4_fsetxattr_op(vfs_file_t *f, const char *name, const void *val,
@@ -6471,9 +6981,9 @@ static int ext4_flistxattr_op(vfs_file_t *f, char *list, unsigned long size)
 	ext4_file_t *ef = ext4_ef(f);
 	if (!ef || !g_ext4_fs)
 		return ST_INVALID;
-	ext4_io_lock();
+	ext4_meta_rlock();
 	int r = ext4_xattr_list_ino(g_ext4_fs, ef->ino, list, size);
-	ext4_io_unlock();
+	ext4_meta_runlock();
 	return r;
 }
 static int ext4_fremovexattr_op(vfs_file_t *f, const char *name)
@@ -6508,9 +7018,9 @@ static int ext4_inode_flags_op(unsigned long ino, uint32_t *out_flags)
 	if (!fs)
 		return ST_NO_DEVICE;
 	ext4_inode in;
-	ext4_io_lock();
+	ext4_meta_rlock();
 	int r = ext4_read_inode_loc(fs, ino, &in, 0, 0);
-	ext4_io_unlock();
+	ext4_meta_runlock();
 	if (r != ST_OK)
 		return ST_IO;
 	if (in.i_flags & EXT4_INODE_IMMUTABLE_FL)
@@ -7525,6 +8035,7 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
 {
 	if (!bdev || !out)
 		return ST_INVALID;
+	ext4_locks_init();
 	unsigned ss = bdev->sector_size ? bdev->sector_size : 512;
 
 	/* Find the ext4 filesystem (whole-device or a GPT partition). */
@@ -7925,6 +8436,7 @@ int ext4_vfs_register_root(ext4_fs_t *fs)
 {
 	if (!fs)
 		return ST_INVALID;
+	ext4_locks_init();
 	g_ext4_fs = fs;
 	g_ext4_cwd_ino = EXT4_ROOT_INO;
 	ext4_sb_attach(fs);

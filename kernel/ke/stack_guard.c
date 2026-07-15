@@ -141,6 +141,7 @@ __attribute__((noreturn, no_stack_protector)) void __stack_chk_fail(void)
      * saved that canary at its prologue, but the scheduler changed GS:104   *
      * to a different task's canary before the epilogue ran → false positive. *
      * ------------------------------------------------------------------ */
+	int is_sched_race = 0;
 	{
 		int found_null_term = (found != 0) && ((found & 0xFF) == 0);
 		int expect_null_term =
@@ -157,6 +158,7 @@ __attribute__((noreturn, no_stack_protector)) void __stack_chk_fail(void)
 				}
 			}
 		}
+		is_sched_race = (race_cpu >= 0);
 
 		kprintf("\n--- DIAGNOSIS ---\n");
 		if (!found_null_term) {
@@ -197,6 +199,26 @@ __attribute__((noreturn, no_stack_protector)) void __stack_chk_fail(void)
 	_ksc_trace(rbp, rip);
 	kprintf("\n");
 	_ksc_dump(rsp);
+
+	if (is_sched_race) {
+		/* Confirmed scheduler-race false positive: 'found' matches
+		 * another CPU's live canary, so GS:104 merely moved under this
+		 * frame — no memory was actually smashed.  Do NOT wedge the CPU
+		 * with cli;hlt: a halted-with-IRQs-off CPU stops acknowledging
+		 * TLB-shootdown IPIs, which times out every other CPU doing a
+		 * slab_free/address-space teardown and stalls the whole machine
+		 * (observed as "SMP: TLB shootdown sync timeout", then cascading
+		 * loopback / fork-child hangs).  Park INTERRUPTIBLY instead: the
+		 * timer preempts this frame to run real work and IPIs are
+		 * serviced, so the system keeps running.  The one task that hit
+		 * the false positive is parked here (acceptable — it is almost
+		 * always an idle task, and losing one task beats losing the
+		 * box).  Only a genuine smash (below) still halts. */
+		kprintf("\nFALSE POSITIVE — CPU parked INTERRUPTIBLY (system continues, TLB/IPI serviced)\n");
+		kprintf("========================================\n");
+		for (;;)
+			__asm__ volatile("sti; hlt");
+	}
 
 	kprintf("\nSYSTEM HALTED\n");
 	kprintf("========================================\n");

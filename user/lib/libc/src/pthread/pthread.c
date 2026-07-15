@@ -88,30 +88,73 @@ static inline void __spin_unlock(volatile int *lock)
 struct zombie_stack {
 	void *base;
 	size_t size;
+	/* Liveness gate: points at the thread's tid_futex INSIDE this stack
+	 * region (the kernel zeroes it via CLONE_CHILD_CLEARTID as the
+	 * thread's very last act).  NULL means the thread is already known
+	 * dead (joined).  A detached thread adds its own stack from inside
+	 * pthread_exit and then KEEPS EXECUTING on it until the exit
+	 * syscall; munmapping such an entry before the kernel cleared the
+	 * futex yanks the stack from under the exiting thread — its next
+	 * push faults on an unmapped page (observed as an intermittent
+	 * SIGSEGV at RSP-8 in the detached thread whenever the main thread
+	 * reached the next pthread_create within that window). */
+	volatile int *alive;
 };
 
 static struct zombie_stack __zombie_stacks[ZOMBIE_STACK_MAX];
 static volatile int __zombie_count = 0;
 static volatile int __zombie_lock = 0;
 
+/* Free every entry whose thread has really exited (kernel cleared the
+ * tid_futex, or no gate at all); keep the rest.  Caller holds
+ * __zombie_lock.  Reading *alive is safe precisely because the entry has
+ * not been munmapped yet. */
+static void __zombie_stack_reap_locked(void)
+{
+	int keep = 0;
+	for (int i = 0; i < __zombie_count; i++) {
+		if (!__zombie_stacks[i].base)
+			continue;
+		if (__zombie_stacks[i].alive &&
+		    *__zombie_stacks[i].alive != 0) {
+			// Thread still finishing pthread_exit on this stack.
+			__zombie_stacks[keep++] = __zombie_stacks[i];
+			continue;
+		}
+		munmap(__zombie_stacks[i].base, __zombie_stacks[i].size);
+	}
+	for (int i = keep; i < __zombie_count; i++) {
+		__zombie_stacks[i].base = NULL;
+		__zombie_stacks[i].size = 0;
+		__zombie_stacks[i].alive = NULL;
+	}
+	__zombie_count = keep;
+}
+
 // Add a stack to the zombie list for deferred cleanup
-static void __zombie_stack_add(void *base, size_t size)
+static void __zombie_stack_add(void *base, size_t size, volatile int *alive)
 {
 	if (!base || size == 0)
 		return;
 
 	__spin_lock(&__zombie_lock);
 
+	if (__zombie_count >= ZOMBIE_STACK_MAX) {
+		// Try to make room by reaping entries that are really dead.
+		__zombie_stack_reap_locked();
+	}
 	if (__zombie_count < ZOMBIE_STACK_MAX) {
 		__zombie_stacks[__zombie_count].base = base;
 		__zombie_stacks[__zombie_count].size = size;
+		__zombie_stacks[__zombie_count].alive = alive;
 		__zombie_count++;
-	} else {
-		// List full - must free now (shouldn't happen in practice)
-		// This is safe because by the time the list is full, earlier
-		// entries have definitely finished exiting
+	} else if (!alive || *alive == 0) {
+		// List still full but this thread is provably dead: free now.
 		munmap(base, size);
 	}
+	/* else: list full AND the thread may still be running on this stack.
+	 * Leak it — a leaked stack is recoverable, a munmapped live stack is
+	 * a crash. */
 
 	__spin_unlock(&__zombie_lock);
 }
@@ -120,16 +163,7 @@ static void __zombie_stack_add(void *base, size_t size)
 static void __zombie_stack_cleanup(void)
 {
 	__spin_lock(&__zombie_lock);
-
-	for (int i = 0; i < __zombie_count; i++) {
-		if (__zombie_stacks[i].base) {
-			munmap(__zombie_stacks[i].base,
-			       __zombie_stacks[i].size);
-			__zombie_stacks[i].base = NULL;
-			__zombie_stacks[i].size = 0;
-		}
-	}
-	__zombie_count = 0;
+	__zombie_stack_reap_locked();
 
 	__spin_unlock(&__zombie_lock);
 }
@@ -162,6 +196,61 @@ static inline struct __pthread *__get_tcb(void)
 static inline int __set_tls(void *addr)
 {
 	return arch_prctl(ARCH_SET_FS, (unsigned long)addr);
+}
+
+/* ============================================================================
+ * Fork hooks — called from fork() in unistd.c alongside the malloc hooks.
+ *
+ * All pthread global locks are acquired across the fork so the parent's
+ * thread bookkeeping is consistent at the fork instant, and the state is
+ * REINITIALISED in the child: after fork only the calling thread exists
+ * there, and a lock captured mid-critical-section by another thread would
+ * otherwise be inherited locked forever.  (Observed: a child forked from a
+ * thread while another thread was inside pthread_exit's detached cleanup
+ * spun forever on __thread_list_lock when its own pthread_exit ran.)
+ * ============================================================================ */
+void __pthread_fork_prepare(void)
+{
+	__spin_lock(&__thread_list_lock);
+	__spin_lock(&__tsd_lock);
+	__spin_lock(&__zombie_lock);
+}
+
+void __pthread_fork_parent(void)
+{
+	__spin_unlock(&__zombie_lock);
+	__spin_unlock(&__tsd_lock);
+	__spin_unlock(&__thread_list_lock);
+}
+
+void __pthread_fork_child(void)
+{
+	/* The child is single-threaded: force every pthread lock free. */
+	__zombie_lock = 0;
+	__tsd_lock = 0;
+	__thread_list_lock = 0;
+
+	if (__pthread_initialized) {
+		/* Only the calling thread survives fork — reset the thread
+		 * list to a self-linked singleton so pthread_exit /
+		 * pthread_create in the child never walk the parent's stale
+		 * sibling entries. */
+		struct __pthread *self = __get_tcb();
+		if (self) {
+			self->next = self;
+			self->prev = self;
+			__thread_list_head = self;
+		}
+		/* Zombie stacks recorded in the parent belong to parent
+		 * threads; drop them rather than munmap addresses the child
+		 * did not create. */
+		for (int zi = 0; zi < __zombie_count; zi++) {
+			__zombie_stacks[zi].base = NULL;
+			__zombie_stacks[zi].size = 0;
+			__zombie_stacks[zi].alive = NULL;
+		}
+		__zombie_count = 0;
+	}
 }
 
 // Initialize the main thread's TCB (called lazily)
@@ -442,12 +531,17 @@ void pthread_exit(void *retval)
 	// Mark as exited (before exit so joiners see it)
 	tcb->state = THREAD_STATE_EXITED;
 
-	// If this is a detached thread, queue our stack for cleanup.
-	// We can't munmap our own stack while running on it, but by adding
-	// it to the zombie list now, it will be cleaned up by the next
-	// pthread_create call (after we've fully exited).
+	// If this is a detached thread, free our OWN stack and exit without
+	// ever touching it again.  The old approach queued the stack on a
+	// shared list and let the next pthread_create munmap it, gated on our
+	// tid_futex — but that flag lives INSIDE this stack, so the reaper had
+	// to dereference a pointer into a region that could already be gone,
+	// which faulted (SIGSEGV in __zombie_stack_reap_locked).  __unmapself
+	// does munmap(stack)+exit() in raw asm using only registers, so no one
+	// else ever reads into a stack a thread is/was running on.
 	if (tcb->detach_state == PTHREAD_CREATE_DETACHED && tcb->stack_base) {
-		// Remove from thread list
+		// Remove from thread list first (its links are in the TCB, which
+		// is inside the stack we are about to unmap).
 		__spin_lock(&__thread_list_lock);
 		tcb->prev->next = tcb->next;
 		tcb->next->prev = tcb->prev;
@@ -457,12 +551,19 @@ void pthread_exit(void *retval)
 		}
 		__spin_unlock(&__thread_list_lock);
 
-		// Add to zombie list for deferred cleanup
-		__zombie_stack_add(tcb->stack_base, tcb->stack_size);
+		/* Forward our retval as the exit code (matches the old
+		 * _exit((long)retval)): SYS_EXIT ends only this thread, but if
+		 * we are the last thread it becomes the process exit status. */
+		extern void __unmapself(void *stack_base, size_t size,
+					int exit_code);
+		__unmapself(tcb->stack_base, tcb->stack_size,
+			    (int)(long)retval); // never returns
 	}
 
-	// Exit this thread only (kernel handles CLONE_CHILD_CLEARTID)
-	// This will write 0 to tid_futex and wake waiters
+	// Joinable thread: keep the stack mapped so the joiner can read the
+	// TCB; the kernel clears tid_futex (CLONE_CHILD_CLEARTID) and wakes the
+	// joiner, which frees the stack via the zombie list (alive == NULL,
+	// i.e. never dereferenced).
 	_exit((long)retval);
 
 	// Never reached
@@ -534,7 +635,9 @@ int pthread_join(pthread_t thread, void **retval)
 	// is cleared). The stack will be freed on the next pthread_create call,
 	// when we're certain all previously exited threads have fully terminated.
 	if (stack_base) {
-		__zombie_stack_add(stack_base, stack_size);
+		/* Joined: pthread_join already waited for tid_futex == 0, the
+		 * thread is provably gone — no liveness gate needed. */
+		__zombie_stack_add(stack_base, stack_size, NULL);
 	}
 
 	return 0;
@@ -572,7 +675,12 @@ int pthread_detach(pthread_t thread)
 		}
 		__spin_unlock(&__thread_list_lock);
 
-		__zombie_stack_add(tcb->stack_base, tcb->stack_size);
+		/* We only get here with tid_futex == 0, i.e. the kernel has
+		 * finished with this thread (CLONE_CHILD_CLEARTID wrote 0 on
+		 * exit) and it is provably off its stack.  So the stack is safe
+		 * to free now: enqueue with alive == NULL (the reaper frees it
+		 * without ever dereferencing into the stack). */
+		__zombie_stack_add(tcb->stack_base, tcb->stack_size, NULL);
 	}
 
 	return 0;

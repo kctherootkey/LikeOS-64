@@ -80,6 +80,16 @@ typedef struct vfs_sb_ops {
 	void (*lock_io)(vfs_superblock_t *sb);
 	void (*unlock_io)(vfs_superblock_t *sb);
 
+	/* OPTIONAL shared-mode mapping lock.  When a driver provides these, the
+     * pagecache holds them (instead of lock_io) around the block-mapping
+     * calls only (next_block / block_to_lba) and performs the data transfer
+     * with NO filesystem lock held — the driver must then fence data-block
+     * lifetime itself (e.g. per-inode locks that exclude truncate/free
+     * while a read is in flight).  Drivers that leave these NULL keep the
+     * old behaviour: lock_io held across mapping AND transfer. */
+	void (*lock_map)(vfs_superblock_t *sb);
+	void (*unlock_map)(vfs_superblock_t *sb);
+
 	/* A block_id that the driver reserves for metadata and that user data
      * must never be written to (FAT32 root cluster).  Pagecache's flush
      * paths guard against this to avoid corrupting the root dir.  Drivers

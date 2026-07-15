@@ -323,15 +323,29 @@ int setgroups(int size, const int *list)
 extern void __malloc_fork_prepare(void);
 extern void __malloc_fork_parent(void);
 extern void __malloc_fork_child(void);
+/* Pthread fork hooks (src/pthread/pthread.c) — same protocol for the thread
+ * list / TSD / zombie-stack locks, plus child-side reinitialisation to a
+ * single-threaded state.  Without these, a child forked while another thread
+ * held __thread_list_lock (e.g. inside pthread_exit's detached cleanup)
+ * inherited the lock in the held state and spun forever in its own
+ * pthread_exit. */
+extern void __pthread_fork_prepare(void);
+extern void __pthread_fork_parent(void);
+extern void __pthread_fork_child(void);
 
 pid_t fork(void)
 {
+	/* Lock order: pthread outside, malloc inside (pthread code allocates;
+	 * the allocator never calls into pthread).  Released in reverse. */
+	__pthread_fork_prepare();
 	__malloc_fork_prepare();
 	long ret = syscall0(SYS_FORK);
 	if (ret == 0) {
 		__malloc_fork_child();
+		__pthread_fork_child();
 	} else {
 		__malloc_fork_parent();
+		__pthread_fork_parent();
 	}
 	if (ret < 0) {
 		errno = -ret;

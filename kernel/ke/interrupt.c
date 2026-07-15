@@ -1216,6 +1216,55 @@ static void report_userspace_crash(task_t *cur, uint64_t *regs, int signum,
 #endif
 }
 
+/*
+ * The single "return from an interrupt" work point.  Every interrupt and
+ * exception path that can hand control back to user mode funnels through here
+ * instead of open-coding signal delivery and preemption in each handler, so the
+ * two things that must happen on the way out — and their ordering — live in one
+ * place:
+ *
+ *   1. If returning to user mode, deliver a pending signal.  This may rewrite
+ *      the frame to enter a handler, or terminate the task outright.
+ *   2. Only then, honour a pending reschedule.
+ *
+ * Parameters:
+ *   regs          - saved GPR + iret frame (REGS_* layout, alias of
+ *                   interrupt_frame_t).
+ *   allow_preempt - honour need_resched.  The IRQ and IPI paths pass 1; the
+ *                   exception path passes 0, because a fault may have occurred
+ *                   inside an atomic kernel section that must not be preempted.
+ */
+static void irqentry_exit(uint64_t *regs, int allow_preempt)
+{
+	int from_user = (regs[REGS_CS] & 3) == 3;
+
+	// Signal delivery only makes sense when returning to user mode.
+	if (from_user) {
+		task_t *cur = sched_current();
+		if (cur && cur->privilege == TASK_USER && signal_pending(cur)) {
+			signal_deliver_irq(cur, (interrupt_frame_t *)regs);
+			// A fatal default action marked us exited: never IRET to
+			// user as a zombie.  Schedule away for good — actively,
+			// because a passive hlt would rely on a preemption that
+			// may never arrive on an otherwise-idle CPU.
+			if (cur->has_exited || cur->state == TASK_ZOMBIE) {
+				for (;;) {
+					sched_schedule();
+					__asm__ volatile("cli; hlt");
+				}
+			}
+		}
+	}
+
+	// Reschedule only from a preemptible context: returning to user, or the
+	// interrupted kernel code had IRQs enabled (i.e. not inside an IRQ-off
+	// critical section such as a held spinlock).  sched_preempt() applies
+	// its own in_context_switch / bootstrap / try-lock guards on top.
+	if (allow_preempt && sched_need_resched() &&
+	    (from_user || (regs[REGS_RFLAGS] & 0x200)))
+		sched_preempt((interrupt_frame_t *)regs);
+}
+
 void exception_handler(uint64_t *regs)
 {
 	uint64_t int_no = regs[REGS_INTNO];
@@ -1257,6 +1306,12 @@ void exception_handler(uint64_t *regs)
 			if (irqs_were_on)
 				__asm__ volatile("cli" ::: "memory");
 			if (resolved) {
+				/* Resolved fault returns to the interrupted
+				 * instruction.  Run the common return-to-user
+				 * work (deliver a pending signal so a fault-heavy
+				 * loop stays killable) but do NOT preempt — a
+				 * kernel-mode fault may hold a spinlock. */
+				irqentry_exit(regs, 0);
 				return;
 			}
 		}
@@ -1265,6 +1320,7 @@ void exception_handler(uint64_t *regs)
 		// so we check the ADDRESS is in user space, not the mode of the fault
 		if ((err_code & 0x3) == 0x3 && cr2 < 0x8000000000000000ULL) {
 			if (mm_handle_cow_fault(cr2)) {
+				irqentry_exit(regs, 0);
 				return;
 			}
 		}
@@ -1289,75 +1345,75 @@ void exception_handler(uint64_t *regs)
 
 	if (user_mode) {
 		task_t *cur = sched_current();
+		int fault_sig;
+		const char *fault_name;
+		uint64_t fault_addr = 0;
 		switch (int_no) {
-		case 14: {
-			uint64_t cr2;
-			__asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-			report_userspace_crash(cur, regs, SIGSEGV, "SIGSEGV",
-					       cr2, 14);
-			sched_signal_task(cur, SIGSEGV);
-			// NEVER return - the iret frame points to faulting code
-			// Enable interrupts and halt forever, timer will preempt us away
-			for (;;) {
-				__asm__ volatile("sti; hlt");
+		case 14:
+			__asm__ volatile("mov %%cr2, %0" : "=r"(fault_addr));
+			fault_sig = SIGSEGV;
+			fault_name = "SIGSEGV";
+			break;
+		case 6:
+			fault_sig = SIGILL;
+			fault_name = "SIGILL";
+			break;
+		case 0:
+		case 4:
+			fault_sig = SIGFPE;
+			fault_name = "SIGFPE";
+			break;
+		case 3:
+		case 5:
+			fault_sig = SIGTRAP;
+			fault_name = "SIGTRAP";
+			break;
+		case 13:
+			fault_sig = SIGSEGV;
+			fault_name = "SIGSEGV";
+			break;
+		case 17:
+			fault_sig = SIGBUS;
+			fault_name = "SIGBUS";
+			break;
+		default:
+			fault_sig = SIGABRT;
+			fault_name = "SIGABRT";
+			break;
+		}
+		report_userspace_crash(cur, regs, fault_sig, fault_name,
+				       fault_addr, (int)int_no);
+		sched_signal_task(cur, fault_sig);
+		/* The old tail parked in sti;hlt unconditionally ("timer will
+		 * preempt us away"), assuming the signal is fatal.  When the
+		 * process has a user handler installed (or the signal blocked),
+		 * a caught fault signal is only deliverable on return to USER
+		 * mode — which the park never performs — leaving an immortal
+		 * READY task ping-ponging between the run queue and the halt
+		 * loop (observed: testlibc thread stranded on CPU0's queue
+		 * after a teardown SIGSEGV, hanging teststress's waitpid until
+		 * Ctrl+C).  Deliver on THIS exception frame instead. */
+		if (cur && !cur->has_exited && cur->state != TASK_ZOMBIE) {
+			interrupt_frame_t *frame = (interrupt_frame_t *)regs;
+			uint64_t old_rip = frame->rip;
+			signal_deliver_irq(cur, frame);
+			if (!cur->has_exited && cur->state != TASK_ZOMBIE) {
+				if (frame->rip != old_rip) {
+					/* Frame redirected — IRET enters the
+					 * user handler. */
+					return;
+				}
+				/* Undeliverable fault signal (blocked or
+				 * ignored): returning would re-execute the
+				 * faulting instruction forever.  Force-exit. */
+				cur->exit_code = 128 + fault_sig;
+				sched_mark_task_exited(cur, 128 + fault_sig);
 			}
 		}
-		case 6:
-			report_userspace_crash(cur, regs, SIGILL, "SIGILL", 0,
-					       6);
-			sched_signal_task(cur, SIGILL);
-			for (;;) {
-				__asm__ volatile("sti; hlt");
-			}
-		case 0:
-			report_userspace_crash(cur, regs, SIGFPE, "SIGFPE", 0,
-					       0);
-			sched_signal_task(cur, SIGFPE);
-			for (;;) {
-				__asm__ volatile("sti; hlt");
-			}
-		case 3:
-			report_userspace_crash(cur, regs, SIGTRAP, "SIGTRAP", 0,
-					       3);
-			sched_signal_task(cur, SIGTRAP);
-			for (;;) {
-				__asm__ volatile("sti; hlt");
-			}
-		case 4:
-			report_userspace_crash(cur, regs, SIGFPE, "SIGFPE", 0,
-					       4);
-			sched_signal_task(cur, SIGFPE);
-			for (;;) {
-				__asm__ volatile("sti; hlt");
-			}
-		case 5:
-			report_userspace_crash(cur, regs, SIGTRAP, "SIGTRAP", 0,
-					       5);
-			sched_signal_task(cur, SIGTRAP);
-			for (;;) {
-				__asm__ volatile("sti; hlt");
-			}
-		case 13:
-			report_userspace_crash(cur, regs, SIGSEGV, "SIGSEGV", 0,
-					       13);
-			sched_signal_task(cur, SIGSEGV);
-			for (;;) {
-				__asm__ volatile("sti; hlt");
-			}
-		case 17:
-			report_userspace_crash(cur, regs, SIGBUS, "SIGBUS", 0,
-					       17);
-			sched_signal_task(cur, SIGBUS);
-			for (;;) {
-				__asm__ volatile("sti; hlt");
-			}
-		default:
-			report_userspace_crash(cur, regs, SIGABRT, "SIGABRT", 0,
-					       int_no);
-			sched_signal_task(cur, SIGABRT);
-			for (;;) {
-				__asm__ volatile("sti; hlt");
-			}
+		/* Task is dead: park until the timer preempts us away; the
+		 * zombie is reaped via the deferred_zombie path. */
+		for (;;) {
+			__asm__ volatile("sti; hlt");
 		}
 	}
 
@@ -1616,29 +1672,11 @@ void irq_handler(uint64_t *regs)
 		// Send EOI before preemption to avoid missing ticks
 		pic_send_eoi(irq);
 
-		// Deliver pending signals to the current user task.
-		// We use signal_deliver_irq() which modifies the IRETQ frame
-		// on the stack directly, NOT the per-CPU SYSRET state.  The
-		// regular signal_deliver() sets PERCPU_SIGNAL_PENDING etc.
-		// which is only consumed by the sysret path in syscall.asm —
-		// timer interrupts return via iretq, so those per-CPU writes
-		// would be stale and corrupt the next syscall return.
-		{
-			interrupt_frame_t *frame = (interrupt_frame_t *)regs;
-			// Only deliver if we interrupted user mode (CS RPL == 3)
-			if ((frame->cs & 3) == 3) {
-				task_t *cur = sched_current();
-				if (cur && cur->privilege == TASK_USER) {
-					signal_deliver_irq(cur, frame);
-				}
-			}
-		}
-
-		// Check if preemption is needed after timer
-		if (sched_need_resched()) {
-			// Preempt if not in critical section
-			sched_preempt((interrupt_frame_t *)regs);
-		}
+		/* Common return-to-user work: deliver a pending signal (on the
+		 * IRETQ frame, not the SYSRET state — timer returns via iretq)
+		 * and honour a pending reschedule.  Same code path as every
+		 * other interrupt return; see irqentry_exit(). */
+		irqentry_exit(regs, 1);
 		return; // EOI already sent
 	}
 	case 33:
@@ -1672,6 +1710,12 @@ void irq_handler(uint64_t *regs)
 	// interrupted context.  Runs with interrupts enabled internally so it
 	// never delays TLB-shootdown IPIs.
 	softirq_drain();
+
+	/* Common return-to-user work — deliver a pending signal / reschedule.
+	 * Placed after softirq_drain so a wakeup raised by a softirq (e.g. a
+	 * NIC rx that made a polled task runnable) is seen by the preempt
+	 * check. */
+	irqentry_exit(regs, 1);
 }
 
 // ============================================================================
@@ -1684,7 +1728,11 @@ void ipi_handler(uint64_t *regs)
 
 	switch (vector) {
 	case 0xFE: // IPI_RESCHEDULE_VECTOR
-		// Mark current task as needing reschedule
+		// Mark current task as needing reschedule; the actual signal
+		// delivery + preemption happen in the shared irqentry_exit()
+		// call at the tail of this handler.  (sched_remove_task sends
+		// this IPI to force a zombie off a CPU — the tail preempt is
+		// what switches it away, so the sender's spin-wait completes.)
 		{
 			task_t *cur = sched_current();
 			if (cur) {
@@ -1692,13 +1740,6 @@ void ipi_handler(uint64_t *regs)
 			}
 		}
 		lapic_eoi();
-		// Actually preempt now — don't just set a flag and wait for the
-		// next timer tick.  When sched_remove_task sends reschedule IPIs
-		// to get a zombie task off a CPU, we must switch away immediately
-		// or the spin-wait times out and the system crashes.
-		if (sched_need_resched()) {
-			sched_preempt((interrupt_frame_t *)regs);
-		}
 		break;
 
 	case 0xFD: // IPI_HALT_VECTOR
@@ -1736,6 +1777,12 @@ void ipi_handler(uint64_t *regs)
 		lapic_eoi();
 		break;
 	}
+
+	/* Common return-to-user work — one shared path for every IPI vector
+	 * that returns (the halt vector loops forever and never reaches here).
+	 * Delivers a pending signal on return to user and performs the pending
+	 * reschedule (need_resched set by the 0xFE case above, or by a wakeup). */
+	irqentry_exit(regs, 1);
 }
 
 void interrupts_init()
