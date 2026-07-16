@@ -6,7 +6,8 @@
 #include <sys/wait.h>
 #include <time.h>
 
-#define TIMEOUT_SECONDS (10 * 60) // 10 minutes
+#define DEFAULT_MINUTES 10
+#define MAX_MINUTES 100000 // ~69 days; guards against overflow in minutes*60
 
 // Simple linear congruential generator for random numbers
 static unsigned int seed = 12345;
@@ -104,6 +105,16 @@ static int parse_command(const char *cmd, char *argv[], int max_args)
 	return argc;
 }
 
+static void usage(const char *prog)
+{
+	printf("usage: %s [-t minutes] [all|network]\n", prog);
+	printf("  -t minutes  run for this many minutes (default %d)\n",
+	       DEFAULT_MINUTES);
+	printf("  all         default command mix plus network commands\n");
+	printf("  network     network commands only\n");
+	printf("  (no mode)   default command mix, no network commands\n");
+}
+
 int main(int argc, char **argv)
 {
 	// Three modes:
@@ -111,14 +122,51 @@ int main(int argc, char **argv)
 	//                             testlibc is run WITHOUT "network").
 	//   teststress all          — default mix + network commands.
 	//   teststress network      — only network commands (testlibc "network").
+	// Each optionally preceded by -t <minutes> to override the run length.
 	int network_only = 0;
 	int run_all = 0;
+	long minutes = DEFAULT_MINUTES;
+
 	for (int i = 1; i < argc; i++) {
-		if (argv[i] && strcmp(argv[i], "network") == 0)
+		if (!argv[i])
+			continue;
+		if (strcmp(argv[i], "-t") == 0) {
+			if (i + 1 >= argc) {
+				printf("%s: -t requires a value in minutes\n",
+				       argv[0]);
+				usage(argv[0]);
+				return 2;
+			}
+			char *end = NULL;
+			minutes = strtol(argv[++i], &end, 10);
+			// Reject trailing garbage ("30x"), empty strings and
+			// out-of-range values rather than silently running for
+			// some other length than asked for.
+			if (!end || *end != '\0' || minutes <= 0 ||
+			    minutes > MAX_MINUTES) {
+				printf("%s: invalid duration '%s' (expected 1..%d minutes)\n",
+				       argv[0], argv[i], MAX_MINUTES);
+				return 2;
+			}
+			continue;
+		}
+		if (strcmp(argv[i], "network") == 0) {
 			network_only = 1;
-		else if (argv[i] && strcmp(argv[i], "all") == 0)
+			continue;
+		}
+		if (strcmp(argv[i], "all") == 0) {
 			run_all = 1;
+			continue;
+		}
+		// Reject unknown arguments instead of ignoring them: a typo'd
+		// flag would otherwise silently run the default mix for the
+		// default duration, which looks like a passing test.
+		printf("%s: unknown argument '%s'\n", argv[0], argv[i]);
+		usage(argv[0]);
+		return 2;
 	}
+
+	const time_t timeout_seconds = (time_t)minutes * 60;
 
 	// Build the active command pool.
 	const char *pool[NUM_COMMANDS + NUM_NETWORK_COMMANDS];
@@ -144,17 +192,19 @@ int main(int argc, char **argv)
 	printf("Mode: %s\n", network_only ? "network only" :
 			     run_all      ? "default + network" :
 					    "default only");
-	printf("Running random commands for up to 10 minutes...\n");
+	printf("Running random commands for up to %ld minute%s...\n", minutes,
+	       minutes == 1 ? "" : "s");
 	printf("Press Ctrl+C to stop early\n\n");
 
 	// Use pid as part of seed for some variation
 	seed = (unsigned int)getpid() * 31337;
 
 	while (1) {
-		// Check if 10 minutes have passed
+		// Check if the requested run length has elapsed
 		time_t now = time(NULL);
-		if (now - start_time >= TIMEOUT_SECONDS) {
-			printf("\n=== 10 MINUTES ELAPSED - STRESS TEST COMPLETE ===\n");
+		if (now - start_time >= timeout_seconds) {
+			printf("\n=== %ld MINUTE%s ELAPSED - STRESS TEST COMPLETE ===\n",
+			       minutes, minutes == 1 ? "" : "S");
 			printf("Total iterations: %d\n", iteration);
 			break;
 		}

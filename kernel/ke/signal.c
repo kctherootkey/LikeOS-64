@@ -282,6 +282,15 @@ int signal_pending(task_t *task)
 	task_signal_state_t *sig = &task->signals;
 	kernel_sigset_t unblocked;
 
+	/* SIGKILL/SIGSTOP are actionable regardless of the mask.  Every path that
+	 * installs a mask strips them, but enforce it here too: this is the
+	 * predicate that decides whether a task ever looks at its signals, so a
+	 * single missed strip anywhere else would otherwise make it unkillable. */
+	if (sigismember_k(&sig->pending, SIGKILL) ||
+	    sigismember_k(&sig->pending, SIGSTOP)) {
+		return 1;
+	}
+
 	// Compute pending & ~blocked
 	signandset_k(&unblocked, &sig->pending, &sig->blocked);
 
@@ -488,6 +497,9 @@ int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 	if (!(act->sa_flags & SA_NODEFER)) {
 		sigaddset_k(&task->signals.blocked, sig);
 	}
+	/* A handler must not be able to make itself unkillable for its duration,
+	 * via sa_mask or via being SIGKILL/SIGSTOP itself. */
+	sig_strip_unblockable(&task->signals.blocked);
 
 	// Reset handler if SA_RESETHAND
 	if (act->sa_flags & SA_RESETHAND) {
@@ -618,6 +630,9 @@ int signal_setup_frame_irq(task_t *task, int sig, siginfo_t *info,
 	if (!(act->sa_flags & SA_NODEFER)) {
 		sigaddset_k(&task->signals.blocked, sig);
 	}
+	/* A handler must not be able to make itself unkillable for its duration,
+	 * via sa_mask or via being SIGKILL/SIGSTOP itself. */
+	sig_strip_unblockable(&task->signals.blocked);
 
 	// Reset handler if SA_RESETHAND
 	if (act->sa_flags & SA_RESETHAND) {
@@ -692,8 +707,11 @@ int signal_restore_frame(task_t *task)
 	// Save RAX (syscall return value) for assembly to restore
 	task->syscall_rax = kframe.rax;
 
-	// Restore signal mask
+	/* Restore signal mask.  kframe was just read back from the user's own
+	 * stack, so saved_mask is user-writable: a process could otherwise edit
+	 * it to include SIGKILL and sigreturn itself unkillable. */
 	task->signals.blocked = kframe.saved_mask;
+	sig_strip_unblockable(&task->signals.blocked);
 
 	// Clear sigsuspend flag if set
 	task->signals.in_sigsuspend = 0;

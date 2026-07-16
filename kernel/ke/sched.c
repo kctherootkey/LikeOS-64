@@ -847,6 +847,11 @@ task_t *sched_add_task(task_entry_t entry, void *arg, void *stack_mem,
 	uint64_t *sp = (uint64_t *)((uint8_t *)stack_mem + stack_size);
 	sp = (uint64_t *)((uint64_t)sp & ~0xFUL);
 	*(--sp) = (uint64_t)task_trampoline;
+	// RFLAGS for ctx_switch_asm's popfq.  IF MUST be set: task_trampoline
+	// never returns to the scheduling function, so it never reaches the
+	// post-switch sti — it calls the task body directly.  With IF clear a
+	// fresh kernel thread would run (and hlt) with interrupts off forever.
+	*(--sp) = 0x202; // RFLAGS: reserved bit 1 + IF
 	*(--sp) = 0; // rbp
 	*(--sp) = 0; // rbx
 	*(--sp) = 0; // r12
@@ -909,12 +914,16 @@ task_t *sched_add_user_task(task_entry_t entry, void *arg, uint64_t *pml4,
 	*(--k_sp) = (uint64_t)entry; // RIP
 	// Callee-saved registers
 	*(--k_sp) = (uint64_t)user_mode_iret_trampoline;
-	*(--k_sp) = 0;
-	*(--k_sp) = 0;
-	*(--k_sp) = 0;
-	*(--k_sp) = 0;
-	*(--k_sp) = 0;
-	*(--k_sp) = 0;
+	// RFLAGS for ctx_switch_asm's popfq; matches the IF=1 a fresh task used to
+	// inherit from the switching path's sti.  The iretq below then loads the
+	// user RFLAGS pushed above, so this only covers the trampoline itself.
+	*(--k_sp) = 0x202; // RFLAGS: reserved bit 1 + IF
+	*(--k_sp) = 0; // rbp
+	*(--k_sp) = 0; // rbx
+	*(--k_sp) = 0; // r12
+	*(--k_sp) = 0; // r13
+	*(--k_sp) = 0; // r14
+	*(--k_sp) = 0; // r15
 
 	mm_memset(t, 0, sizeof(task_t));
 	t->sp = k_sp;
@@ -2821,12 +2830,16 @@ void sched_init_ap(uint32_t cpu_id)
 		(uint64_t *)(g_ap_idle_stacks[cpu_id] + KERNEL_STACK_SIZE);
 	sp = (uint64_t *)((uint64_t)sp & ~0xFUL);
 	*(--sp) = (uint64_t)task_trampoline;
-	*(--sp) = 0;
-	*(--sp) = 0;
-	*(--sp) = 0;
-	*(--sp) = 0;
-	*(--sp) = 0;
-	*(--sp) = 0;
+	// RFLAGS for ctx_switch_asm's popfq.  IF MUST be set — this is the AP idle
+	// task: task_trampoline calls idle_entry directly (no post-switch sti), and
+	// idle_entry hlt's.  With IF clear the AP would hlt forever and never wake.
+	*(--sp) = 0x202; // RFLAGS: reserved bit 1 + IF
+	*(--sp) = 0; // rbp
+	*(--sp) = 0; // rbx
+	*(--sp) = 0; // r12
+	*(--sp) = 0; // r13
+	*(--sp) = 0; // r14
+	*(--sp) = 0; // r15
 
 	mm_memset(idle, 0, sizeof(task_t));
 	idle->sp = sp;

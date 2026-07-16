@@ -327,6 +327,18 @@ static inline int sigisemptyset_k(const kernel_sigset_t *set)
 // Unmaskable signals
 #define sig_kernel_only(sig) ((sig) == SIGKILL || (sig) == SIGSTOP)
 
+/* SIGKILL and SIGSTOP are unblockable by contract: a task must always notice
+ * them whatever mask it installs, or it becomes unkillable.  Run every mask
+ * that originates in (or can be influenced by) userspace through here before
+ * installing it — sigprocmask, sigsuspend, sigaction's sa_mask, the mask
+ * applied while a handler runs, and the mask sigreturn restores from the
+ * user's own stack. */
+static inline void sig_strip_unblockable(kernel_sigset_t *set)
+{
+	sigdelset_k(set, SIGKILL);
+	sigdelset_k(set, SIGSTOP);
+}
+
 // Default action types
 #define SIG_DFL_TERM 0 // Terminate
 #define SIG_DFL_IGN 1 // Ignore

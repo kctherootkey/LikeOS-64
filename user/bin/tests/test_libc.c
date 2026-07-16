@@ -2512,6 +2512,91 @@ int main(int argc, char **argv)
 		char name[64];
 		snprintf(name, sizeof(name), "raise signal %d", sig);
 		test_result(name, rr == 0 && g_last_signal == sig);
+		/* Put the disposition back before moving on.  Leaving a handler
+		 * installed for a signal whose default action is "ignore"
+		 * (SIGCHLD, SIGURG, SIGWINCH in this list) changes it from
+		 * "discarded the moment it is raised" to "stays pending until
+		 * delivered".  A pending signal makes nanosleep() return EINTR
+		 * without sleeping, so every later test that sleeps would
+		 * silently not sleep — a failure that surfaces far from here. */
+		signal(sig, SIG_DFL);
+	}
+
+	// ========================================
+	// Test: SIGKILL/SIGSTOP are uncatchable and unblockable
+	// ========================================
+	printf("\n[TEST] SIGKILL/SIGSTOP cannot be caught or blocked\n");
+	{
+		struct sigaction sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = handle_generic;
+		sigemptyset(&sa.sa_mask);
+
+		errno = 0;
+		test_result("sigaction(SIGKILL) rejected with EINVAL",
+			    sigaction(SIGKILL, &sa, NULL) < 0 && errno == EINVAL);
+		errno = 0;
+		test_result("sigaction(SIGSTOP) rejected with EINVAL",
+			    sigaction(SIGSTOP, &sa, NULL) < 0 && errno == EINVAL);
+
+		/* Blocking them must be a silent no-op, not an error: the mask
+		 * that comes back must simply never contain them. */
+		sigset_t prevmask, allsigs, aftermask;
+		sigfillset(&allsigs);
+		sigemptyset(&aftermask);
+		sigprocmask(SIG_BLOCK, &allsigs, &prevmask);
+		sigprocmask(SIG_BLOCK, NULL, &aftermask);
+		test_result("SIGKILL never enters the blocked mask",
+			    !sigismember(&aftermask, SIGKILL));
+		test_result("SIGSTOP never enters the blocked mask",
+			    !sigismember(&aftermask, SIGSTOP));
+		sigprocmask(SIG_SETMASK, &prevmask, NULL);
+	}
+
+	/* The case that actually matters, and the one a mask check alone cannot
+	 * prove: a task that has blocked everything it is permitted to block,
+	 * spinning in user mode and never entering a syscall, must still die. */
+	printf("\n[TEST] SIGKILL reaches a task that blocked every signal\n");
+	{
+		pid_t child = fork();
+		if (child == 0) {
+			sigset_t all;
+			sigfillset(&all);
+			sigprocmask(SIG_BLOCK, &all, NULL);
+			for (;;) {
+			}
+			_exit(0);
+		} else if (child > 0) {
+			/* Let the child reach its spin with the mask installed. */
+			struct timespec settle = { 0, 50 * 1000 * 1000L };
+			nanosleep(&settle, NULL);
+
+			test_result("kill(blocked-mask child, SIGKILL) returns 0",
+				    kill(child, SIGKILL) == 0);
+
+			int status = 0;
+			pid_t waited = -1;
+			for (int tries = 0; tries < 100; tries++) {
+				waited = waitpid(child, &status, WNOHANG);
+				if (waited > 0) {
+					break;
+				}
+				struct timespec d = { 0, 10 * 1000 * 1000L };
+				nanosleep(&d, NULL);
+			}
+			test_result("blocked-mask child still reaped",
+				    waited == child);
+			test_result("blocked-mask child died by SIGKILL",
+				    waited == child && WIFSIGNALED(status) &&
+					    WTERMSIG(status) == SIGKILL);
+			if (waited != child) {
+				/* Unkillable child: do not leak it into later tests. */
+				kill(child, SIGKILL);
+				waitpid(child, NULL, 0);
+			}
+		} else {
+			test_fail("SIGKILL vs blocked mask: fork failed");
+		}
 	}
 
 	// ========================================
@@ -3188,7 +3273,13 @@ int main(int argc, char **argv)
 			int kill_ret = kill(child, SIGKILL);
 			printf("kill() returned %d\n", kill_ret);
 
-			// Use WNOHANG in a loop with timeout to avoid infinite hang
+			// Poll with WNOHANG so a delivery failure shows up as a
+			// bounded failure rather than an infinite hang.  Sleep
+			// between tries instead of spinning: a busy loop burns
+			// this task's timeslice competing with the very child we
+			// are waiting on, and gives no real time bound.  100 x
+			// 10ms = 1s, which is many orders of magnitude more than
+			// SIGKILL delivery should ever need.
 			int status = 0;
 			pid_t waited = -1;
 			for (int tries = 0; tries < 100; tries++) {
@@ -3196,9 +3287,8 @@ int main(int argc, char **argv)
 				if (waited > 0) {
 					break; // Child reaped
 				}
-				// Small delay using busy loop
-				for (volatile int d = 0; d < 100000; d++) {
-				}
+				struct timespec d = { 0, 10 * 1000 * 1000L };
+				nanosleep(&d, NULL);
 			}
 
 			if (waited == child) {
@@ -3361,9 +3451,17 @@ int main(int argc, char **argv)
 			// Parent: measure sleep duration while child consumes CPU
 			struct timespec start, end;
 
-			// Measure 100ms sleep
+			// Measure 100ms sleep.  Resume on EINTR with the remainder
+			// the kernel reports: a signal legitimately cuts a sleep
+			// short without sleeping the rest, and swallowing that
+			// would make this measure signal latency instead of timer
+			// accuracy.  usleep() is not usable here for the same
+			// reason — it cannot report how much time is left.
+			struct timespec req = { 0, 100 * 1000 * 1000L }, rem;
 			clock_gettime(CLOCK_MONOTONIC, &start);
-			usleep(100000); // 100ms
+			while (nanosleep(&req, &rem) < 0 && errno == EINTR) {
+				req = rem;
+			}
 			clock_gettime(CLOCK_MONOTONIC, &end);
 
 			// Calculate elapsed time in ms

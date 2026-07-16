@@ -296,8 +296,34 @@ fork_child_return:
     iretq          ; Return to userspace
 
 ; Context switch between tasks
+;
+; RFLAGS is saved/restored along with the callee-saved GPRs because it holds
+; per-task kernel state that the SysV ABI does not preserve across a call --
+; specifically EFLAGS.AC, the SMAP override set by smap_disable()/stac.  Kernel
+; code holds AC=1 across sleeping work (ext4/pagecache/USB read+write wrap their
+; whole copy loop in smap_disable), and every sleep lands here.  Without saving
+; it, AC leaks into the next task (silently disabling SMAP for unrelated kernel
+; code) and, worse, is LOST on resume -- the interrupted copy then takes a SMAP
+; #PF on a present user page and the process is killed with SIGSEGV.  A voluntary
+; sleep has no IRET to restore RFLAGS for it, so it has to be saved here.
+;
+; IF is saved/restored with it, which is safe because each task now restores the
+; IF *it* switched away with instead of inheriting whatever the previous task
+; left.  Note the call sites differ: sched_schedule and sched_run_ready sti
+; BEFORE ctx_switch_asm (IF=1), while sched_preempt switches from a hardware
+; interrupt (IF=0) and lets its iretq epilogue restore RFLAGS.  Both resume
+; correctly under popfq because the value is per-task.
+;
+; Hand-built frames for fresh tasks must push a matching RFLAGS slot between the
+; return address and RBP -- see sched_add_task, sched_add_user_task,
+; sched_init_ap, sys_fork and sys_clone.  They use 0x202 (reserved bit 1 + IF):
+; a fresh task diverges to a trampoline and never reaches a post-switch sti, so
+; IF has to be live in the frame or the task runs with interrupts off forever.
+; This also makes the start-up IF deterministic -- previously a fresh task
+; inherited IF=0 when it happened to be started from sched_preempt.
 global ctx_switch_asm
 ctx_switch_asm:
+    pushfq
     push rbp
     push rbx
     push r12
@@ -314,5 +340,6 @@ ctx_switch_asm:
     pop r12
     pop rbx
     pop rbp
+    popfq
 
     ret

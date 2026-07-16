@@ -386,31 +386,46 @@ int nanosleep(const struct timespec *req, struct timespec *rem)
 	return 0;
 }
 
+/* Sleep for `seconds`, returning 0 if the full interval elapsed.  If a signal
+ * interrupts the sleep, return the time REMAINING, rounded to whole seconds —
+ * the caller uses that to decide whether to resume.  Interruption is a normal
+ * outcome, not an error, so errno is left alone in that case.
+ *
+ * Deliberately does NOT retry: a sleep cut short by a signal must report that,
+ * or a caller waiting on the signal can never observe it. */
 unsigned int sleep(unsigned int seconds)
 {
 	struct timespec req, rem;
-	req.tv_sec = (long)seconds;
+	req.tv_sec = (time_t)seconds;
 	req.tv_nsec = 0;
 
-	if (nanosleep(&req, &rem) < 0) {
-		if (errno == EINTR) {
-			return (unsigned int)rem.tv_sec;
-		}
-		return seconds;
-	}
-	return 0;
+	rem.tv_sec = 0;
+	rem.tv_nsec = 0;
+	if (nanosleep(&req, &rem) == 0)
+		return 0; /* slept the whole interval */
+	if (errno != EINTR)
+		return seconds; /* nothing slept: all of it is left */
+	/* Round the leftover to whole seconds, half up, so a caller looping on
+	 * the result cannot spin forever on a sub-second remainder. */
+	return (unsigned int)(rem.tv_sec + (rem.tv_nsec >= 500000000L ? 1 : 0));
 }
 
+/* Sleep for `usec` microseconds.  Returns 0 if the full interval elapsed, or -1
+ * with errno set — errno == EINTR meaning a signal cut it short, in which case
+ * NOTHING was necessarily slept.
+ *
+ * Returning 0 on EINTR (as this once did) is the dangerous shape: it reports
+ * success to a caller that in fact did not sleep at all, so a pending signal
+ * silently turns every usleep() in the process into a no-op.  Callers that must
+ * sleep a full interval regardless of signals have to loop on nanosleep() with
+ * the remainder themselves — that policy is theirs to choose, not ours. */
 int usleep(unsigned int usec)
 {
-	struct timespec req, rem;
-	req.tv_sec = usec / 1000000;
-	req.tv_nsec = (usec % 1000000) * 1000;
+	struct timespec req;
+	req.tv_sec = (time_t)(usec / 1000000u);
+	req.tv_nsec = (long)(usec % 1000000u) * 1000L;
 
-	if (nanosleep(&req, &rem) < 0 && errno != EINTR) {
-		return -1;
-	}
-	return 0;
+	return nanosleep(&req, NULL);
 }
 
 int clock_gettime(clockid_t clk_id, struct timespec *tp)

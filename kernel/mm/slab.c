@@ -863,11 +863,23 @@ void slab_free(void *ptr)
 
 	// Check if already free (double-free detection)
 	if (!bitmap_is_set(slab->bitmap, obj_idx)) {
-		void *ra = __builtin_return_address(0);
-		WARN(1, "SLAB: Double free at %p (caller=%p size=%u)", ptr, ra,
-		     (unsigned)cache->object_size);
-		kprintf("SLAB: Double free detected at %p (caller=%p size=%u)\n",
-			ptr, ra, (unsigned)cache->object_size);
+		/* Report TWO frames.  Frame 0 is the direct caller, which is
+		 * almost always kfree() — every free funnels through it, so on its
+		 * own it identifies nothing.  Frame 1 is then the code that
+		 * actually double-freed.  Both are printed because a few callers
+		 * (tcp.c) reach slab_free() directly, in which case frame 0 is the
+		 * meaningful one; resolve whichever is not inside kfree().
+		 * Frame 1 is safe to read here: this tree builds without -O, so
+		 * frame pointers are present. */
+		void *via = __builtin_return_address(0);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wframe-address"
+		void *ra = __builtin_return_address(1);
+#pragma GCC diagnostic pop
+		WARN(1, "SLAB: Double free at %p (caller=%p via=%p size=%u)", ptr,
+		     ra, via, (unsigned)cache->object_size);
+		kprintf("SLAB: Double free detected at %p (caller=%p via=%p size=%u)\n",
+			ptr, ra, via, (unsigned)cache->object_size);
 		return;
 	}
 

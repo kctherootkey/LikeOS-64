@@ -3595,6 +3595,12 @@ static int64_t sys_fork(void)
 	// Push callee-saved registers (ctx_switch_asm will restore these)
 	*(--k_sp) = (uint64_t)
 		fork_child_return; // Return address: sets RAX=0 and does IRET
+	// RFLAGS restored by ctx_switch_asm's popfq.  IF set, matching the state a
+	// fresh child used to inherit from the switching path's sti (sched_schedule
+	// / sched_run_ready both sti *before* ctx_switch_asm).  fork_child_return
+	// only requires that sched_after_fork_child run before its iretq, not that
+	// interrupts be off.
+	*(--k_sp) = 0x202; // RFLAGS (kernel): reserved bit 1 + IF
 	*(--k_sp) = 0; // RBP (kernel)
 	*(--k_sp) = 0; // RBX (kernel)
 	*(--k_sp) = 0; // R12 (kernel)
@@ -4224,6 +4230,11 @@ static int64_t sys_rt_sigaction(uint64_t sig, uint64_t act_ptr,
 				   sizeof(struct k_sigaction)) != 0) {
 			return -EFAULT;
 		}
+		/* sa_mask is applied to the blocked mask for the duration of the
+		 * handler.  Strip the unblockable signals here, at the point they
+		 * enter the kernel, so a filled sa_mask cannot make the task
+		 * unkillable while its handler runs. */
+		sig_strip_unblockable(&newact.sa_mask);
 		mm_memcpy(kact, &newact, sizeof(struct k_sigaction));
 	}
 
@@ -4275,8 +4286,7 @@ static int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set_ptr,
 		}
 
 		// Can't block SIGKILL or SIGSTOP
-		sigdelset_k(blocked, SIGKILL);
-		sigdelset_k(blocked, SIGSTOP);
+		sig_strip_unblockable(blocked);
 	}
 
 	return 0;
@@ -4416,8 +4426,7 @@ static int64_t sys_rt_sigsuspend(uint64_t mask_ptr, uint64_t sigsetsize)
 	cur->signals.in_sigsuspend = 1;
 
 	// Can't block SIGKILL/SIGSTOP
-	sigdelset_k(&cur->signals.blocked, SIGKILL);
-	sigdelset_k(&cur->signals.blocked, SIGSTOP);
+	sig_strip_unblockable(&cur->signals.blocked);
 
 	// Block until signal
 	cur->state = TASK_BLOCKED;
@@ -5310,6 +5319,8 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 
 	// Kernel callee-saved for context switch
 	*(--k_sp) = (uint64_t)fork_child_return;
+	// RFLAGS restored by ctx_switch_asm's popfq; IF set (see sys_fork).
+	*(--k_sp) = 0x202; // RFLAGS (kernel): reserved bit 1 + IF
 	*(--k_sp) = 0; // RBP
 	*(--k_sp) = 0; // RBX
 	*(--k_sp) = 0; // R12

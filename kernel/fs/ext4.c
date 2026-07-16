@@ -2465,6 +2465,51 @@ static int ext4_write_super(ext4_fs_t *fs)
 	return ext4_write_sectors(fs->bdev, lba, sects, &fs->sb_copy);
 }
 
+/* ---- Device cache-flush barrier -------------------------------------------
+ *
+ * The journal's crash-safety is an ordering argument — commit durable before
+ * checkpoint, checkpoint durable before s_start=0 — and each "durable" step is
+ * one bdev->sync (SCSI SYNCHRONIZE CACHE 10 on USB MSD).
+ *
+ * Not every device implements that command.  VMware's virtual USB storage
+ * refuses it with ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE; QEMU
+ * honours it.  A refusal is not automatically unsafe: a device with no volatile
+ * write cache has nothing to flush, and its writes are already durable when the
+ * command completes, so the ordering above still holds without any flush.  Only
+ * a device that caches AND refuses to flush is unsafe, and we cannot tell those
+ * apart from here (such devices tend not to implement MODE SENSE either, and
+ * probing it wedges VMware's bulk endpoint).
+ *
+ * So: probe once at mount and simply stop re-issuing a command the device has
+ * already refused — the callers all used to discard the result anyway, which
+ * cost a failing USB round-trip on every barrier. */
+static int s_flush_unsupported; /* device refused the mount-time probe */
+
+static int ext4_dev_sync(ext4_fs_t *fs, const char *where)
+{
+	if (!fs || !fs->bdev || !fs->bdev->sync || s_flush_unsupported)
+		return ST_OK;
+	int rc = fs->bdev->sync((block_device_t *)fs->bdev);
+	if (rc != ST_OK)
+		WARN_RATELIMIT(1, "ext4: device flush failed (%s, rc=%d)", where,
+			       rc);
+	return rc;
+}
+
+/* Probe cache-flush support once, before any barrier can run, and latch it. */
+static void ext4_probe_dev_sync(ext4_fs_t *fs)
+{
+	s_flush_unsupported = 0;
+	if (!fs || !fs->bdev || !fs->bdev->sync) {
+		s_flush_unsupported = 1;
+		return;
+	}
+	if (fs->bdev->sync((block_device_t *)fs->bdev) != ST_OK) {
+		s_flush_unsupported = 1;
+		kprintf("ext4: device implements no cache flush; relying on write completion for ordering\n");
+	}
+}
+
 /* Central metadata-corruption handler — the ext4_error() analog.  Records the
  * error in the superblock (clears the "clean" bit, sets the error bit, bumps the
  * count) and persists it, then applies the errors= policy: remount read-only
@@ -2487,8 +2532,7 @@ static void ext4_fs_error(ext4_fs_t *fs, const char *what, unsigned long ino)
 	fs->sb_copy.s_state |= (uint16_t)EXT4_ERROR_FS;
 	fs->sb_copy.s_error_count++;
 	ext4_write_super(fs); /* best-effort; ungated by latch */
-	if (fs->bdev && fs->bdev->sync)
-		fs->bdev->sync((block_device_t *)fs->bdev);
+	ext4_dev_sync(fs, "error-mark");
 
 	if (!first)
 		return; /* policy already applied once   */
@@ -7688,10 +7732,7 @@ static int ext4_journal_recover(ext4_fs_t *fs, int *did_work)
 		kfree(jblk);
 		return ST_IO;
 	}
-	if (fs->bdev && fs->bdev->sync)
-		fs->bdev->sync(
-			(block_device_t *)
-				fs->bdev); /* persist before RECOVER clears */
+	ext4_dev_sync(fs, "replay"); /* persist before RECOVER clears */
 
 	kprintf("ext4: journal replay complete (%lu block(s) recovered, end_txn=%u)\n",
 		replayed, end_txn);
@@ -7745,16 +7786,14 @@ static void ext4_checkpoint(ext4_fs_t *fs)
 		fs->sb_copy.s_free_inodes_count = fi;
 	}
 	ext4_write_super(fs);
-	if (fs->bdev->sync)
-		fs->bdev->sync((block_device_t *)fs->bdev);
+	ext4_dev_sync(fs, "checkpoint-final"); /* finals durable BEFORE s_start=0 */
 
 	journal_superblock_t *jsb = (journal_superblock_t *)fs->j_sb_buf;
 	jsb->s_start = 0; /* 2. empty the log        */
 	jsb->s_sequence = __builtin_bswap32(fs->j_sequence);
 	ext4_jsb_csum_set(fs->j_sb_buf, fs->j_csum3);
 	jlog_write(fs, 0, fs->j_sb_buf);
-	if (fs->bdev->sync)
-		fs->bdev->sync((block_device_t *)fs->bdev);
+	ext4_dev_sync(fs, "checkpoint-jsb");
 
 	s_ckpt.n = 0; /* 3. epoch closed         */
 	s_epoch_open = 0;
@@ -7807,8 +7846,7 @@ static void ext4_journal_flush(ext4_fs_t *fs)
      * metadata.  One extra sync here is cheap — this runs per batch, not per op. */
 	if (s_wb_len > 0) {
 		ext4_wb_flush(fs);
-		if (fs->bdev && fs->bdev->sync)
-			fs->bdev->sync((block_device_t *)fs->bdev);
+		ext4_dev_sync(fs, "ordered-data");
 	}
 	unsigned n = s_ckpt.n;
 	if (n == 0)
@@ -7834,8 +7872,7 @@ static void ext4_journal_flush(ext4_fs_t *fs)
 		for (unsigned i = 0; i < n; i++)
 			ext4_write_block_direct(fs, s_ckpt.blk[i],
 						s_ckpt.data[i]);
-		if (fs->bdev->sync)
-			fs->bdev->sync((block_device_t *)fs->bdev);
+		ext4_dev_sync(fs, "batch-overflow-direct");
 		s_ckpt.n = 0;
 		s_epoch_open = 0;
 		s_jhead = first;
@@ -7847,8 +7884,7 @@ static void ext4_journal_flush(ext4_fs_t *fs)
 		fs->sb_copy.s_feature_incompat |= EXT4_FEATURE_INCOMPAT_RECOVER;
 		fs->feature_incompat |= EXT4_FEATURE_INCOMPAT_RECOVER;
 		ext4_write_super(fs);
-		if (fs->bdev->sync)
-			fs->bdev->sync((block_device_t *)fs->bdev);
+		ext4_dev_sync(fs, "set-recover");
 	}
 
 	/* 2. point the journal sb at the (single) txn start (== j_first). */
@@ -7871,8 +7907,7 @@ static void ext4_journal_flush(ext4_fs_t *fs)
 		for (unsigned i = 0; i < n; i++)
 			ext4_write_block_direct(fs, s_ckpt.blk[i],
 						s_ckpt.data[i]);
-		if (fs->bdev->sync)
-			fs->bdev->sync((block_device_t *)fs->bdev);
+		ext4_dev_sync(fs, "oom-direct");
 		s_ckpt.n = 0;
 		s_epoch_open = 0;
 		s_jhead = first;
@@ -7953,8 +7988,7 @@ static void ext4_journal_flush(ext4_fs_t *fs)
 			ext4_crc32c(fs->j_csum_seed, cpy, fs->block_size));
 	}
 	jlog_write(fs, pos + 1 + n, cpy);
-	if (fs->bdev->sync)
-		fs->bdev->sync((block_device_t *)fs->bdev); /* commit durable */
+	ext4_dev_sync(fs, "commit"); /* commit durable */
 	ext4_bput(db);
 	ext4_bput(cpy);
 
@@ -8021,14 +8055,12 @@ static void ext4_journal_clean(ext4_fs_t *fs)
 		jsb->s_sequence = __builtin_bswap32(fs->j_sequence);
 		ext4_jsb_csum_set(fs->j_sb_buf, fs->j_csum3);
 		jlog_write(fs, 0, fs->j_sb_buf);
-		if (fs->bdev->sync)
-			fs->bdev->sync((block_device_t *)fs->bdev);
+		ext4_dev_sync(fs, "clean-jsb");
 	}
 	fs->sb_copy.s_feature_incompat &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
 	fs->feature_incompat &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
 	ext4_write_super(fs);
-	if (fs->bdev->sync)
-		fs->bdev->sync((block_device_t *)fs->bdev);
+	ext4_dev_sync(fs, "clean-recover");
 }
 
 int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
@@ -8065,6 +8097,9 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
 	mm_memset(out, 0, sizeof(*out));
 	mm_memcpy(&out->sb_copy, sb, sizeof(out->sb_copy));
 	out->bdev = bdev;
+	/* Settle the device's cache-flush support before anything can issue a
+	 * barrier (journal replay and the csum-v3 upgrade both do). */
+	ext4_probe_dev_sync(out);
 	out->part_lba_offset =
 		part_lba; /* 0 for whole-device, else GPT part start */
 	out->block_size = 1024u << sb->s_log_block_size;
@@ -8207,9 +8242,7 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
 				out->sb_copy.s_feature_incompat &=
 					~EXT4_FEATURE_INCOMPAT_RECOVER;
 				ext4_write_super(out);
-				if (out->bdev && out->bdev->sync)
-					out->bdev->sync(
-						(block_device_t *)out->bdev);
+				ext4_dev_sync(out, "mount-clear-recover");
 			}
 		} else {
 			/* Leave RECOVER set so the next mount retries (replay is
@@ -8255,8 +8288,7 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
 			out->sb_copy.s_free_blocks_count_hi = fb_hi;
 			out->sb_copy.s_free_inodes_count = fi;
 			ext4_write_super(out);
-			if (out->bdev && out->bdev->sync)
-				out->bdev->sync((block_device_t *)out->bdev);
+			ext4_dev_sync(out, "mount-resync-counts");
 			kprintf("ext4: resynced superblock free counts (blocks=%lu inodes=%u)\n",
 				(unsigned long)fb, fi);
 		}
@@ -8358,12 +8390,8 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
 
 					if (jlog_write(out, 0, out->j_sb_buf) ==
 					    ST_OK) {
-						if (out->bdev &&
-						    out->bdev->sync)
-							out->bdev->sync(
-								(block_device_t
-									 *)out
-									->bdev);
+						ext4_dev_sync(out,
+							      "mount-jsb-csum3");
 						out->j_csum3 = 1;
 						kprintf("ext4: %s journal to csum-v3 (metadata_csum fs)\n",
 							was_v3 ?
