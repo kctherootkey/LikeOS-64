@@ -1659,33 +1659,50 @@ int tcp_close(tcp_conn_t *conn)
 
 	switch (conn->state) {
 	case TCP_STATE_ESTABLISHED:
-	case TCP_STATE_SYN_RECEIVED:
-		if (tcp_send_segment(conn->dev, conn->local_ip, conn->remote_ip,
-				     conn->local_port, conn->remote_port,
-				     conn->snd_nxt, conn->rcv_nxt,
-				     TCP_FIN | TCP_ACK, (uint16_t)conn->rcv_wnd,
-				     NULL, 0) == 0) {
-			tcp_queue_inflight(conn, conn->snd_nxt,
-					   TCP_FIN | TCP_ACK, NULL, 0);
+	case TCP_STATE_SYN_RECEIVED: {
+		int fin_sent = tcp_send_segment(
+			conn->dev, conn->local_ip, conn->remote_ip,
+			conn->local_port, conn->remote_port, conn->snd_nxt,
+			conn->rcv_nxt, TCP_FIN | TCP_ACK,
+			(uint16_t)conn->rcv_wnd, NULL, 0);
+		// Queue the FIN for retransmit whether or not the immediate
+		// send succeeded.  A local drop (skb pool exhausted under load)
+		// must not swallow the FIN: if it is not queued, snd_nxt never
+		// advances, the retransmit timer has nothing to resend, and the
+		// peer blocks in recv()/SSL_read forever waiting for a close
+		// that never arrives.
+		if (tcp_queue_inflight(conn, conn->snd_nxt, TCP_FIN | TCP_ACK,
+				       NULL, 0) == 0) {
 			conn->snd_nxt++;
+			if (fin_sent != 0)
+				conn->retransmit_tick =
+					timer_ticks() +
+					TCP_LOCAL_DROP_RETRY_TICKS;
 		}
 		conn->state = TCP_STATE_FIN_WAIT_1;
 		tcp_lock_release(&conn->lock, flags);
 		break;
+	}
 
-	case TCP_STATE_CLOSE_WAIT:
-		if (tcp_send_segment(conn->dev, conn->local_ip, conn->remote_ip,
-				     conn->local_port, conn->remote_port,
-				     conn->snd_nxt, conn->rcv_nxt,
-				     TCP_FIN | TCP_ACK, (uint16_t)conn->rcv_wnd,
-				     NULL, 0) == 0) {
-			tcp_queue_inflight(conn, conn->snd_nxt,
-					   TCP_FIN | TCP_ACK, NULL, 0);
+	case TCP_STATE_CLOSE_WAIT: {
+		int fin_sent = tcp_send_segment(
+			conn->dev, conn->local_ip, conn->remote_ip,
+			conn->local_port, conn->remote_port, conn->snd_nxt,
+			conn->rcv_nxt, TCP_FIN | TCP_ACK,
+			(uint16_t)conn->rcv_wnd, NULL, 0);
+		// Same local-drop safety as the ESTABLISHED case above.
+		if (tcp_queue_inflight(conn, conn->snd_nxt, TCP_FIN | TCP_ACK,
+				       NULL, 0) == 0) {
 			conn->snd_nxt++;
+			if (fin_sent != 0)
+				conn->retransmit_tick =
+					timer_ticks() +
+					TCP_LOCAL_DROP_RETRY_TICKS;
 		}
 		conn->state = TCP_STATE_LAST_ACK;
 		tcp_lock_release(&conn->lock, flags);
 		break;
+	}
 
 	case TCP_STATE_LISTEN:
 		tcp_lock_release(&conn->lock, flags);
@@ -2832,13 +2849,51 @@ established_segment:
 			ack_pending = 1;
 		}
 		if (tcp_flags & TCP_ACK) {
-			if (ack == conn->snd_nxt) {
+			// Graceful close leaves the data the app wrote before
+			// close() still in flight; the peer keeps ACKing it as
+			// it arrives.  Those are PARTIAL (cumulative) ACKs
+			// (snd_una < ack < snd_nxt) — process them exactly like
+			// ESTABLISHED so the inflight queue drains and the
+			// retransmit timer tracks the peer's real gap.  Without
+			// this, snd_una freezes at close() time, inflight[0]
+			// never advances, the RTO timer resends the already-
+			// delivered head forever, retransmit_count never resets,
+			// and the conn is failed with the tail still unsent —
+			// the peer stalls mid-stream and times out (observed:
+			// TLS 64 KB echo, client got 32 KB then ETIMEDOUT).
+			if (ack > conn->snd_una && ack <= conn->snd_nxt) {
 				conn->snd_una = ack;
 				tcp_ack_inflight(conn, ack);
-				// Same in-order FIN rule as ESTABLISHED: a FIN
-				// beyond rcv_nxt means data is still missing —
-				// don't jump the hole, dup-ACK and wait for the
-				// retransmit.
+				conn->retransmit_count = 0;
+				conn->retransmit_tick =
+					timer_ticks() + tcp_rto_ticks(conn);
+				conn->dup_acks = 0;
+			} else if (ack == conn->snd_una && payload_len == 0 &&
+				   conn->inflight_count > 0) {
+				// Fast retransmit on 3 dup-ACKs (mirror
+				// ESTABLISHED) so a gap recovers within an RTT
+				// instead of a full RTO backoff during close.
+				conn->dup_acks++;
+				if (conn->dup_acks == 3) {
+					tcp_inflight_segment_t *seg =
+						&conn->inflight[0];
+					tcp_send_segment(
+						conn->dev, conn->local_ip,
+						conn->remote_ip,
+						conn->local_port,
+						conn->remote_port, seg->seq,
+						conn->rcv_nxt, seg->flags,
+						tcp_advertised_window(conn),
+						seg->data, seg->len);
+					seg->retransmit_count++;
+					conn->total_retrans++;
+				}
+			}
+			if (ack == conn->snd_nxt) {
+				// Our FIN is now ACKed.  Same in-order FIN rule
+				// as ESTABLISHED: a peer FIN beyond rcv_nxt
+				// means data is still missing — don't jump the
+				// hole, dup-ACK and wait for the retransmit.
 				if ((tcp_flags & TCP_FIN) &&
 				    seq + payload_len == conn->rcv_nxt) {
 					conn->rcv_nxt += 1;
@@ -2900,23 +2955,46 @@ established_segment:
 		break;
 
 	case TCP_STATE_CLOSING:
-		if ((tcp_flags & TCP_ACK) && ack == conn->snd_nxt) {
-			conn->snd_una = ack;
-			tcp_ack_inflight(conn, ack);
-			conn->state = TCP_STATE_TIME_WAIT;
-			conn->time_wait_tick =
-				timer_ticks() + TCP_TIME_WAIT_TICKS;
+		if (tcp_flags & TCP_ACK) {
+			// Drain inflight on partial ACKs (see FIN_WAIT_1) so any
+			// data still unacked at simultaneous close is delivered
+			// and retransmit tracks the real gap.
+			if (ack > conn->snd_una && ack <= conn->snd_nxt) {
+				conn->snd_una = ack;
+				tcp_ack_inflight(conn, ack);
+				conn->retransmit_count = 0;
+				conn->retransmit_tick =
+					timer_ticks() + tcp_rto_ticks(conn);
+				conn->dup_acks = 0;
+			}
+			if (ack == conn->snd_nxt) {
+				conn->state = TCP_STATE_TIME_WAIT;
+				conn->time_wait_tick =
+					timer_ticks() + TCP_TIME_WAIT_TICKS;
+			}
 		}
 		break;
 
 	case TCP_STATE_LAST_ACK:
-		if ((tcp_flags & TCP_ACK) && ack == conn->snd_nxt) {
-			conn->snd_una = ack;
-			tcp_ack_inflight(conn, ack);
-			conn->state = TCP_STATE_CLOSED;
-			tcp_lock_release(&conn->lock, flags);
-			tcp_free_conn(conn);
-			return;
+		if (tcp_flags & TCP_ACK) {
+			// Drain inflight on partial ACKs (see FIN_WAIT_1): a
+			// server that read EOF, wrote a response, then close()d
+			// enters LAST_ACK with that response still in flight —
+			// it must be delivered before the conn is freed.
+			if (ack > conn->snd_una && ack <= conn->snd_nxt) {
+				conn->snd_una = ack;
+				tcp_ack_inflight(conn, ack);
+				conn->retransmit_count = 0;
+				conn->retransmit_tick =
+					timer_ticks() + tcp_rto_ticks(conn);
+				conn->dup_acks = 0;
+			}
+			if (ack == conn->snd_nxt) {
+				conn->state = TCP_STATE_CLOSED;
+				tcp_lock_release(&conn->lock, flags);
+				tcp_free_conn(conn);
+				return;
+			}
 		}
 		break;
 
