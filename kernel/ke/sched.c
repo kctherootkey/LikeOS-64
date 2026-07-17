@@ -78,6 +78,24 @@ static task_t *g_current = 0;
 // 2 upward.  There is no PID 0.
 int g_next_id = 2;
 
+/* Allocate the next task id.
+ *
+ * MUST be atomic: `g_next_id++` is a read-modify-write, so two CPUs creating
+ * tasks at the same moment (two parallel fork()s) can both read N and both
+ * write N+1 — handing the SAME pid to two live tasks.  That breaks everything
+ * keyed on pid: kill() and waitpid() hit the wrong process, and userspace that
+ * derives per-process state from getpid() (a scratch dir, a lock file) has two
+ * processes silently sharing one namespace.
+ *
+ * Overflow: pid_t is signed, so a wrap would hand out <= 0. Report it rather
+ * than silently issue an invalid pid. */
+int sched_alloc_task_id(void)
+{
+	int id = __sync_fetch_and_add(&g_next_id, 1);
+	WARN_ON_ONCE(id <= 0); /* pid counter wrapped: too many tasks created */
+	return id;
+}
+
 // The /sbin/init task (PID 1).  Recorded when init is spawned; used to protect
 // it from ordinary signals and to panic if it ever exits.
 task_t *g_init_task = NULL;
@@ -805,7 +823,8 @@ void sched_init(void)
 	g_bootstrap_task.arg = 0;
 	g_bootstrap_task.state = TASK_RUNNING;
 	g_bootstrap_task.privilege = TASK_KERNEL;
-	g_bootstrap_task.id = g_next_id++; /* kernel bootstrap task; never PID 0 */
+	g_bootstrap_task.id =
+		sched_alloc_task_id(); /* kernel bootstrap task; never PID 0 */
 	task_init_common(&g_bootstrap_task);
 	// The bootstrap task is already running: stack frames already contain the
 	// current per-CPU canary.  Inherit it so epilogue checks keep passing.
@@ -866,7 +885,7 @@ task_t *sched_add_task(task_entry_t entry, void *arg, void *stack_mem,
 	t->arg = arg;
 	t->state = TASK_READY;
 	t->privilege = TASK_KERNEL;
-	t->id = g_next_id++;
+	t->id = sched_alloc_task_id();
 	task_init_common(t);
 	t->on_cpu = 0; // Default to BSP
 
@@ -932,10 +951,7 @@ task_t *sched_add_user_task(task_entry_t entry, void *arg, uint64_t *pml4,
 	t->arg = arg;
 	t->state = TASK_READY;
 	t->privilege = TASK_USER;
-	t->id = g_next_id++;
-	WARN_ON_ONCE(
-		g_next_id <=
-		0); /* PID counter overflowed: too many tasks created or pid_t wrap-around */
+	t->id = sched_alloc_task_id();
 	task_init_common(t);
 	t->user_stack_top = user_stack;
 	t->kernel_stack_top = k_stack_top;
@@ -1721,7 +1737,7 @@ task_t *sched_fork_current(void)
 	}
 
 	// Child-specific fields
-	child->id = g_next_id++;
+	child->id = sched_alloc_task_id();
 	child->pml4 = child_pml4;
 	child->state = TASK_READY;
 	child->kernel_stack_top = k_stack_top;
@@ -1955,6 +1971,18 @@ void sched_wake_expired_sleepers(uint64_t current_tick)
 	// A blanket "READY + !on_rq" scan is dangerous on SMP because it can
 	// re-enqueue a task that's currently RUNNING but hasn't been marked as
 	// such yet (or was momentarily marked READY by a buggy caller).
+	//
+	// CLAIM GATE: gate sched_claim_wake() itself on batch space (nwake < 16),
+	// NOT just the enqueue.  sched_claim_wake() transitions the task
+	// BLOCKED->READY and we then clear its wakeup_tick — so if we claim a task
+	// we cannot fit in this batch, it is left READY, on no runqueue, with its
+	// timer disarmed, and no later tick re-finds it: a permanent strand (seen
+	// as a 100ms nanosleep measured at ~964ms).  With the && short-circuit, a
+	// full batch skips the claim entirely, leaving the overflow task BLOCKED
+	// with its timer still armed so the next tick (10ms) wakes it — bounded,
+	// self-correcting, never stranded.  Single pass, no re-scan loop: this
+	// runs in the timer IRQ with interrupts off and must not lengthen that
+	// window.
 	task_t *to_wake[16];
 	int nwake = 0;
 
@@ -1967,19 +1995,19 @@ void sched_wake_expired_sleepers(uint64_t current_tick)
 		// Check sleep timer
 		if (t->state == TASK_BLOCKED && t->wakeup_tick != 0 &&
 		    current_tick >= t->wakeup_tick) {
-			if (sched_claim_wake(t, TASK_BLOCKED)) {
+			if (nwake < 16 &&
+			    sched_claim_wake(t, TASK_BLOCKED)) {
 				t->wakeup_tick = 0;
-				if (nwake < 16)
-					to_wake[nwake++] = t;
+				to_wake[nwake++] = t;
 			}
 		}
 
 		// Wake blocked tasks with pending signals
 		if (t->state == TASK_BLOCKED && signal_pending(t)) {
-			if (sched_claim_wake(t, TASK_BLOCKED)) {
+			if (nwake < 16 &&
+			    sched_claim_wake(t, TASK_BLOCKED)) {
 				t->wakeup_tick = 0;
-				if (nwake < 16)
-					to_wake[nwake++] = t;
+				to_wake[nwake++] = t;
 			}
 		}
 	}
@@ -2427,19 +2455,27 @@ void sched_dump_tasks(struct tty *tty)
 			uint32_t rq_len = cpu->runqueue_length;
 			uint64_t ctx_sw = cpu->context_switches;
 			spin_unlock(&cpu->runqueue_lock);
+			/* current task + why it may not be yielding to a queued
+			 * READY head: in_ctx_sw stuck set makes sched_preempt bail
+			 * on its first guard; need_resched=0 on a busy current
+			 * means the timer hasn't asked to preempt it yet;
+			 * rem_ticks is its remaining slice. */
+			task_t *ct = cpu->current_task;
 			tty_printf(
 				tty,
-				"  CPU%u: rq_len=%u ctx_sw=%llu head_pid=%d\n",
-				c, rq_len, ctx_sw, head_pid);
+				"  CPU%u: rq_len=%u ctx_sw=%llu head_pid=%d cur=%d in_ctxsw=%d nr=%d rem=%d\n",
+				c, rq_len, ctx_sw, head_pid, ct ? ct->id : -1,
+				cpu->in_context_switch, ct ? ct->need_resched : 0,
+				ct ? ct->remaining_ticks : 0);
 		}
 	}
 
 	tty_printf(
 		tty,
-		" TID  TGID PPID  CPU  State   onRQ  #Th  Ldr  lastRIP           userRIP            waitCh\n");
+		" TID  TGID PPID  CPU  State   onRQ  #Th  Ldr  lastRIP           userRIP           sp                waitCh\n");
 	tty_printf(
 		tty,
-		"----  ---- ----  ---  ------  ----  ---  ---  ----------------  ----------------  ----------------\n");
+		"----  ---- ----  ---  ------  ----  ---  ---  ----------------  ----------------  ----------------  ----------------\n");
 
 	/* Snapshot the task list while holding g_task_list_lock, then release
      * before calling tty_printf.  tty_write on a PTY slave calls
@@ -2453,6 +2489,8 @@ void sched_dump_tasks(struct tty *tty)
 		int id, tgid, ppid, on_cpu, on_rq, nr_threads;
 		uint64_t last_rip, user_rip;
 		void *wait_channel;
+		void *sp; /* saved kernel sp: 0 == "committed to a CPU" — a READY
+			   * task with sp==0 is the classic un-dispatchable strand */
 		uint8_t state;
 		char is_leader, marker;
 	} *snaps = slab_alloc((size_t)snap_cap * sizeof(*snaps));
@@ -2479,6 +2517,7 @@ void sched_dump_tasks(struct tty *tty)
 		snaps[nsnaps].user_rip = t->syscall_rip;
 		snaps[nsnaps].state = (uint8_t)t->state;
 		snaps[nsnaps].wait_channel = t->wait_channel;
+		snaps[nsnaps].sp = t->sp;
 		snaps[nsnaps].is_leader = (t == t->group_leader) ? 'L' : '-';
 		snaps[nsnaps].marker = (t == cur) ? '*' : ' ';
 		nsnaps++;
@@ -2491,11 +2530,12 @@ void sched_dump_tasks(struct tty *tty)
 					 "???";
 		tty_printf(
 			tty,
-			"%c%3d  %4d %4d  %3u  %-6s  %4d  %3d   %c   %016lx  %016lx  %016lx\n",
+			"%c%3d  %4d %4d  %3u  %-6s  %4d  %3d   %c   %016lx  %016lx  %016lx  %016lx\n",
 			snaps[i].marker, snaps[i].id, snaps[i].tgid,
 			snaps[i].ppid, snaps[i].on_cpu, sn, snaps[i].on_rq,
 			snaps[i].nr_threads, snaps[i].is_leader,
 			snaps[i].last_rip, snaps[i].user_rip,
+			(uint64_t)snaps[i].sp,
 			(uint64_t)snaps[i].wait_channel);
 	}
 	tty_printf(
@@ -2848,7 +2888,7 @@ void sched_init_ap(uint32_t cpu_id)
 	idle->arg = NULL;
 	idle->state = TASK_RUNNING; // Start as running (AP's initial task)
 	idle->privilege = TASK_KERNEL;
-	idle->id = g_next_id++;
+	idle->id = sched_alloc_task_id();
 	task_init_common(idle);
 	/* The AP idle task is "already running": we set it current just below and
      * the AP falls straight into the idle loop on its own kernel stack.  Those

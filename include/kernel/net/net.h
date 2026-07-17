@@ -416,8 +416,21 @@ typedef struct tcp_conn {
 	// TIME_WAIT timer
 	uint64_t time_wait_tick;
 
+	/* Generation counter, bumped by tcp_alloc_conn every time this slot is
+	 * claimed.  tcp_connections[] is a fixed array and freed slots are
+	 * recycled, so a bare tcp_conn_t* is NOT a stable identity: a pointer
+	 * stored somewhere can silently come to mean a completely different
+	 * connection (classic ABA).  Pair the pointer with the generation it was
+	 * captured at and compare both to know it is still the same connection.
+	 * Deliberately NOT reset by tcp_alloc_conn's field-by-field reset —
+	 * it must increase monotonically across the slot's whole lifetime. */
+	uint32_t gen;
+
 	// Listen queue (for server sockets)
-	struct tcp_conn *accept_queue[16];
+	struct tcp_accept_entry {
+		struct tcp_conn *conn;
+		uint32_t gen; /* conn->gen at the moment it was queued */
+	} accept_queue[16];
 	int accept_head;
 	int accept_tail;
 	int backlog;
@@ -977,7 +990,15 @@ void net_timer_tick(void);
 #define UNIX_SOCKET_FD_BASE 0x30000UL
 #define MAX_EPOLL_INSTANCES 32
 #define MAX_EPOLL_ENTRIES 64
-#define MAX_UNIX_SOCKETS 64
+/* Each slot is ~8.6 KB (dominated by its 8 KB ring buffer), so this is a
+ * static ~2 MB.  64 was far too tight for parallel load: every socket(),
+ * every accept() and every socketpair() end takes a slot, so a handful of
+ * concurrent AF_UNIX users could exhaust the table.  Exhaustion is at least
+ * reported honestly (unix_create -> -ENOMEM, unix_accept -> -ENOMEM and it
+ * sets the waiting client's error), but there is no reason to be that close
+ * to the edge.  Bounded by the fd encoding: UNIX_SOCKET_FD_BASE ranges are
+ * 0x10000 apart, so anything up to 65536 is representable. */
+#define MAX_UNIX_SOCKETS 256
 
 #define IS_SOCKET_FD(ptr)                      \
 	((uintptr_t)(ptr) >= SOCKET_FD_BASE && \
@@ -1288,7 +1309,20 @@ typedef struct unix_socket {
 	int closed;
 	int nonblock;
 	int error;
-	char path[UNIX_PATH_MAX]; // Bind path (or empty for abstract)
+	/* Bound name, as RAW BYTES — not a C string.
+	 *
+	 * Two disjoint namespaces share this field, told apart by the first byte
+	 * (a pathname can never start with NUL):
+	 *   path[0] != '\0'  -> filesystem pathname; path_len = strlen
+	 *   path[0] == '\0'  -> abstract name; path_len counts the leading NUL,
+	 *                       so an abstract socket with an empty name has
+	 *                       path_len == 1.  The bytes after the NUL are
+	 *                       arbitrary (they may contain NULs), which is why
+	 *                       this cannot be a C string and every comparison
+	 *                       must be (path_len, memcmp).
+	 * path_len == 0 means unnamed: not reachable by name at all. */
+	char path[UNIX_PATH_MAX];
+	int path_len;
 	struct unix_socket *peer; // Connected peer
 	struct unix_socket *parent; // Listener (for accepted sockets)
 
@@ -1329,10 +1363,11 @@ typedef struct unix_socket {
 
 // UNIX domain socket API
 int unix_create(int type);
-int unix_bind(int usockfd, const struct sockaddr_un *addr);
+int unix_bind(int usockfd, const struct sockaddr_un *addr, socklen_t addrlen);
 int unix_listen(int usockfd, int backlog);
 int unix_accept(int usockfd, struct sockaddr_un *addr, socklen_t *addrlen);
-int unix_connect(int usockfd, const struct sockaddr_un *addr);
+int unix_connect(int usockfd, const struct sockaddr_un *addr,
+		 socklen_t addrlen);
 int unix_send(int usockfd, const void *buf, size_t len, int flags);
 int unix_recv(int usockfd, void *buf, size_t len, int flags);
 int unix_close(int usockfd);

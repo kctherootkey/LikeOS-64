@@ -193,6 +193,7 @@
 #define SYS_FGETXATTR   396   /* (fd, name, val, size) */
 #define SYS_FLISTXATTR  397   /* (fd, list, size) */
 #define SYS_FREMOVEXATTR 398  /* (fd, name) */
+#define SYS_DEBUG_DUMP  399   /* () root-only: dump kernel diag tables to tty */
 #define XATTR_SYS_NOFOLLOW 0x40000000  /* OR'd into setxattr flags for lsetxattr */
 
 // NET_GETINFO sub-commands

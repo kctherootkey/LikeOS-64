@@ -928,6 +928,13 @@ static tcp_conn_t *tcp_alloc_conn(uint8_t *rx_buf, uint8_t *tx_buf)
 			// Slot is currently active=0.  We hold tcp_lock so no other
 			// allocator can race us.  Initialise all per-conn state, but
 			// leave active=0 — caller publishes after 4-tuple is written.
+			//
+			// Bump the generation FIRST: from this point the slot is a
+			// different connection than anything that captured a pointer
+			// to it earlier, and any (conn, gen) pair they hold must now
+			// compare unequal.  Never reset to 0 — it must only ever
+			// increase for this slot.
+			conn->gen++;
 			conn->lock = (spinlock_t)SPINLOCK_INIT("tcp_conn");
 			conn->state = TCP_STATE_CLOSED;
 			conn->error = 0;
@@ -1542,15 +1549,45 @@ tcp_conn_t *tcp_accept(tcp_conn_t *listener)
 	uint64_t flags;
 	tcp_lock_acquire(&listener->lock, &flags);
 
-	if (listener->accept_head != listener->accept_tail) {
-		tcp_conn_t *conn =
+	/* accept_queue holds raw tcp_conn_t* into the fixed tcp_connections[]
+	 * array, and tcp_free_conn() does NOT remove a conn from the queue when
+	 * it frees the slot — it only clears parent/active.  So a conn that was
+	 * queued on reaching ESTABLISHED and then reset by the peer leaves a
+	 * dangling entry, and once tcp_alloc_conn recycles that slot the entry
+	 * points at a COMPLETELY UNRELATED connection.  Returning it published a
+	 * corpse (or a stranger) to userspace as a live socket: the server's
+	 * first read fails, the client sees a reset it never caused, and
+	 * sock_accept's ESTABLISHED/CLOSE_WAIT assertion fires.
+	 *
+	 * The entry's generation settles identity EXACTLY: conn->gen is bumped
+	 * every time tcp_alloc_conn claims the slot, so gen still matching means
+	 * this is literally the connection that was queued — no guessing from
+	 * parent/owner_socket, which are set at several points for several
+	 * purposes and cannot stand in for identity.
+	 *
+	 * A stale entry is SKIPPED, never closed: the slot may now host a
+	 * perfectly good new connection that will be enqueued in its own right.
+	 * A live conn whose entry we consume is still reachable via the
+	 * orphan-recovery scan below (it keeps parent == listener). */
+	while (listener->accept_head != listener->accept_tail) {
+		struct tcp_accept_entry e =
 			listener->accept_queue[listener->accept_head];
+		listener->accept_queue[listener->accept_head].conn = NULL;
+		listener->accept_queue[listener->accept_head].gen = 0;
 		listener->accept_head = (listener->accept_head + 1) % 16;
 		if (listener->accept_head == listener->accept_tail)
 			listener->accept_ready = 0;
-		if (conn)
-			conn->parent = NULL;
 
+		tcp_conn_t *conn = e.conn;
+		if (!conn || conn->gen != e.gen)
+			continue; /* slot recycled: a different connection now */
+		if (!conn->active)
+			continue; /* freed before we got to it */
+		if (conn->state != TCP_STATE_ESTABLISHED &&
+		    conn->state != TCP_STATE_CLOSE_WAIT)
+			continue; /* died between queueing and accept */
+
+		conn->parent = NULL;
 		tcp_lock_release(&listener->lock, flags);
 		return conn;
 	}
@@ -2161,9 +2198,19 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 						16;
 					if (next_tail !=
 					    listener->accept_head) {
+						/* Capture the generation with the
+						 * pointer: if this slot is freed
+						 * and recycled before accept()
+						 * dequeues it, the pair will not
+						 * match and the entry is known to
+						 * be stale. */
 						listener->accept_queue
-							[listener->accept_tail] =
-							new_conn;
+							[listener->accept_tail]
+								.conn = new_conn;
+						listener->accept_queue
+							[listener->accept_tail]
+								.gen =
+							new_conn->gen;
 						listener->accept_tail =
 							next_tail;
 						listener->accept_ready = 1;
@@ -2351,9 +2398,17 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 							(p->accept_tail + 1) %
 							16;
 						if (next != p->accept_head) {
+							/* Capture the generation
+							 * with the pointer — see
+							 * tcp_accept. */
 							p->accept_queue
-								[p->accept_tail] =
+								[p->accept_tail]
+									.conn =
 								conn;
+							p->accept_queue
+								[p->accept_tail]
+									.gen =
+								conn->gen;
 							p->accept_tail = next;
 							p->accept_ready = 1;
 						}

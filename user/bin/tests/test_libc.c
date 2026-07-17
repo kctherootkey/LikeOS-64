@@ -302,7 +302,27 @@ static void run_tcp_large_transfer_case(const char *prefix, uint32_t bind_ip,
 			}
 			_exit(1);
 		} else if (pid > 0) {
+			/* Watchdog: if accept() hangs, dump the kernel's TCP /
+			 * AF_UNIX / PTY / task tables at 15s so the stuck state is
+			 * captured automatically (the connection is still mid-
+			 * handshake then, unlike after the 30s timeout when it has
+			 * been torn down).  Killed as soon as accept() returns, so
+			 * on the normal fast path it never dumps.  debug_dump() is
+			 * root-only and a no-op for non-root. */
+			pid_t wd = fork();
+			if (wd == 0) {
+				struct timespec w = { 15, 0 };
+				nanosleep(&w, NULL);
+				debug_dump();
+				_exit(0);
+			}
+
 			int conn_fd = accept(server_fd, NULL, NULL);
+
+			if (wd > 0) {
+				kill(wd, SIGKILL);
+				waitpid(wd, NULL, 0);
+			}
 			snprintf(label, sizeof(label), "%s: accept", prefix);
 			test_result(label, conn_fd >= 0);
 
@@ -1167,12 +1187,44 @@ int main(int argc, char **argv)
 	}
 	test_pass("printf basic output");
 
-	/* Per-process sandbox directory — must be initialized before any goto so
-     * that the sendfile section (inside network_section) can use _pbase too. */
+	/* Per-process sandbox directories — these MUST be initialized before any
+     * goto.  `goto network_section` below jumps over everything in between, so
+     * anything set up there is left as uninitialised stack for the whole
+     * `testlibc network` run, while code after the label still uses it.  That
+     * is not theoretical: _p_usock used to be initialized down in the
+     * filesystem section, so under `testlibc network` the AF_UNIX test bound
+     * its listener to an EMPTY path — and two concurrent runs then both
+     * answered to "", so a child connected into the other process's listener
+     * and both sides hung forever.  _td was likewise garbage at the rmdir()
+     * cleanup.  Keep every path this function uses on both entry paths here. */
 	char _pbase[32];
 	snprintf(_pbase, sizeof(_pbase), "/tmp/tl%d", (int)getpid());
 	rmtree(_pbase); /* remove any stale dir from a previous run with this PID */
 	mkdir(_pbase, 0777);
+
+	/* PID-isolated sandbox — prevents path collisions when two teststress
+     * instances run concurrently (observed in VMware with hardware virt). */
+	char _td[56]; /* base tmpdir: /tmp/ts<pid>  */
+	char _p_mkdir[96], _p_unlink[96], _p_no_such[96];
+	char _p_rsrc[96], _p_rdst[96];
+	char _p_chmod[96], _p_chown[96], _p_utime[96];
+	char _p_pa[96], _p_pb[112], _p_pc[128];
+	char _p_usock[96], _p_uio[96];
+	snprintf(_td, sizeof(_td), "/tmp/ts%d", (int)getpid());
+	mkdir(_td, 0755); /* best-effort; EEXIST is fine */
+	snprintf(_p_mkdir, sizeof(_p_mkdir), "%s/mkdir_dir", _td);
+	snprintf(_p_unlink, sizeof(_p_unlink), "%s/unlink_file", _td);
+	snprintf(_p_no_such, sizeof(_p_no_such), "%s/no_such_file", _td);
+	snprintf(_p_rsrc, sizeof(_p_rsrc), "%s/rename_src", _td);
+	snprintf(_p_rdst, sizeof(_p_rdst), "%s/rename_dst", _td);
+	snprintf(_p_chmod, sizeof(_p_chmod), "%s/chmod_file", _td);
+	snprintf(_p_chown, sizeof(_p_chown), "%s/chown_file", _td);
+	snprintf(_p_utime, sizeof(_p_utime), "%s/utime_file", _td);
+	snprintf(_p_pa, sizeof(_p_pa), "%s/parent_a", _td);
+	snprintf(_p_pb, sizeof(_p_pb), "%s/parent_a/b", _td);
+	snprintf(_p_pc, sizeof(_p_pc), "%s/parent_a/b/c", _td);
+	snprintf(_p_usock, sizeof(_p_usock), "%s/unix.sock", _td);
+	snprintf(_p_uio, sizeof(_p_uio), "%s/_uio_test", _td);
 
 	if (net_only)
 		goto network_section;
@@ -2284,9 +2336,32 @@ int main(int argc, char **argv)
 				    setxattr(xpath, "user.color", "blue", 4,
 					     0) == 0);
 
-			test_result("getxattr size query == 4",
-				    getxattr(xpath, "user.color", NULL, 0) ==
-					    4);
+			errno = 0;
+			ssize_t xq = getxattr(xpath, "user.color", NULL, 0);
+			if (xq != 4) {
+				/* setxattr just returned 0, so the attribute was
+				 * written.  Distinguish "the write was lost" from
+				 * "it was momentarily invisible": retry the same
+				 * query and list every attribute on the file.  If
+				 * the retry succeeds it is a visibility/cache
+				 * problem; if user.color is absent from the list
+				 * too, the write really was lost. */
+				int e1 = errno;
+				errno = 0;
+				ssize_t xq2 =
+					getxattr(xpath, "user.color", NULL, 0);
+				int e2 = errno;
+				char ldbg[256];
+				memset(ldbg, 0, sizeof(ldbg));
+				ssize_t ln = listxattr(xpath, ldbg,
+						       sizeof(ldbg) - 1);
+				printf("  [DBG] getxattr=%ld errno=%d; retry=%ld errno=%d; listxattr=%ld [",
+				       (long)xq, e1, (long)xq2, e2, (long)ln);
+				for (ssize_t i = 0; i < ln && i < 200; i++)
+					putchar(ldbg[i] ? ldbg[i] : ' ');
+				printf("]\n");
+			}
+			test_result("getxattr size query == 4", xq == 4);
 
 			memset(xbuf, 0, sizeof(xbuf));
 			xn = getxattr(xpath, "user.color", xbuf, sizeof(xbuf));
@@ -3476,6 +3551,28 @@ int main(int argc, char **argv)
 			// Timer should be reasonably accurate (80-200ms for 100ms sleep)
 			printf("  Requested 100ms sleep, actual: %ld ms\n",
 			       elapsed_ms);
+			/* On failure, dump the raw clock readings.  elapsed is
+			 * derived from two CLOCK_MONOTONIC samples taken either
+			 * side of the sleep, and the task may migrate between
+			 * CPUs in between — so a bogus elapsed means either the
+			 * clock disagreed with itself across that migration
+			 * (end <= start, or a nonsense jump) or the sleep really
+			 * did not sleep.  The raw values say which; elapsed on
+			 * its own cannot. */
+			if (!(elapsed_ms >= 80 && elapsed_ms <= 300)) {
+				long long s_ns =
+					(long long)start.tv_sec * 1000000000LL +
+					start.tv_nsec;
+				long long e_ns =
+					(long long)end.tv_sec * 1000000000LL +
+					end.tv_nsec;
+				printf("  [DBG] start=%lld ns end=%lld ns delta=%lld ns%s\n",
+				       s_ns, e_ns, e_ns - s_ns,
+				       (e_ns < s_ns) ?
+					       "  <-- CLOCK WENT BACKWARD" :
+				       (e_ns == s_ns) ? "  <-- CLOCK DID NOT ADVANCE" :
+							"");
+			}
 			test_result("timer accuracy under load",
 				    elapsed_ms >= 80 && elapsed_ms <= 300);
 		} else {
@@ -5470,29 +5567,8 @@ int main(int argc, char **argv)
 	// ========================================
 	// Filesystem syscalls: mkdir, rmdir, rename, unlink, chmod, utimensat
 	// ========================================
-	/* PID-isolated sandbox — prevents path collisions when two teststress
-     * instances run concurrently (observed in VMware with hardware virt). */
-	char _td[56]; /* base tmpdir: /tmp/ts<pid>  */
-	char _p_mkdir[96], _p_unlink[96], _p_no_such[96];
-	char _p_rsrc[96], _p_rdst[96];
-	char _p_chmod[96], _p_chown[96], _p_utime[96];
-	char _p_pa[96], _p_pb[112], _p_pc[128];
-	char _p_usock[96], _p_uio[96];
-	snprintf(_td, sizeof(_td), "/tmp/ts%d", (int)getpid());
-	mkdir(_td, 0755); /* best-effort; EEXIST is fine */
-	snprintf(_p_mkdir, sizeof(_p_mkdir), "%s/mkdir_dir", _td);
-	snprintf(_p_unlink, sizeof(_p_unlink), "%s/unlink_file", _td);
-	snprintf(_p_no_such, sizeof(_p_no_such), "%s/no_such_file", _td);
-	snprintf(_p_rsrc, sizeof(_p_rsrc), "%s/rename_src", _td);
-	snprintf(_p_rdst, sizeof(_p_rdst), "%s/rename_dst", _td);
-	snprintf(_p_chmod, sizeof(_p_chmod), "%s/chmod_file", _td);
-	snprintf(_p_chown, sizeof(_p_chown), "%s/chown_file", _td);
-	snprintf(_p_utime, sizeof(_p_utime), "%s/utime_file", _td);
-	snprintf(_p_pa, sizeof(_p_pa), "%s/parent_a", _td);
-	snprintf(_p_pb, sizeof(_p_pb), "%s/parent_a/b", _td);
-	snprintf(_p_pc, sizeof(_p_pc), "%s/parent_a/b/c", _td);
-	snprintf(_p_usock, sizeof(_p_usock), "%s/unix.sock", _td);
-	snprintf(_p_uio, sizeof(_p_uio), "%s/_uio_test", _td);
+	/* _td and the _p_* paths are initialized near the top of main(), before
+     * `goto network_section`, so both entry paths have them. */
 
 	printf("\n[TEST] mkdir()\n");
 	{
@@ -6477,6 +6553,12 @@ network_section:
      * (e.g. after the LFN section empties the directory).  Re-create it
      * now so all per-process temp paths below are valid. */
 	mkdir(_pbase, 0777);
+	/* Same for _td: the early mkdir near the top of main() can fail or be
+     * undone, and `goto network_section` skips the filesystem section that
+     * would otherwise have created it.  The AF_UNIX test below binds
+     * _p_usock (= _td/unix.sock), and bind() needs the parent directory to
+     * exist, so ensure it here on both entry paths. */
+	mkdir(_td, 0755);
 
 	// Per-process paths to avoid races between parallel test instances.
 	char sf_src[64], sf_dst[64], sf_off[64], sf_off_d[64];
@@ -7893,9 +7975,10 @@ network_section:
 	// ========================================
 	printf("\n[TEST] writev/readv\n");
 	{
-		/* Use a locally-computed path so this test works regardless of
-         * which entry path was taken (goto network_section skips the
-         * sandbox snprintf calls above, leaving _p_uio uninitialised). */
+		/* Deliberately a path directly in /tmp rather than inside the
+         * _td sandbox: _td is rmdir'd during the run (and re-created only
+         * where needed), so depending on it here just adds a way for this
+         * test to fail for reasons that have nothing to do with writev. */
 		char _local_uio[64];
 		snprintf(_local_uio, sizeof(_local_uio), "/tmp/uio_%d",
 			 (int)getpid());
@@ -9873,9 +9956,29 @@ tls_loopback_done:;
 			while (recv_total < ETH0_DATA_LEN) {
 				int n = p_SSL_read(ssl, e_srv_buf + recv_total,
 						   ETH0_DATA_LEN - recv_total);
-				if (n <= 0)
-					break;
-				recv_total += n;
+				if (n > 0) {
+					recv_total += n;
+					continue;
+				}
+				/* Match the loopback server: a non-fatal SSL
+				 * return (WANT_READ/WANT_WRITE, or EAGAIN/EINTR
+				 * on a SYSCALL) is not an error — retry.  Only a
+				 * genuine fatal condition ends the loop, and we
+				 * log which one so a real reset/EOF is
+				 * diagnosable instead of a silent "recv short". */
+				int err = p_SSL_get_error ?
+						  p_SSL_get_error(ssl, n) :
+						  -1;
+				if (err == 2 /* WANT_READ */ ||
+				    err == 3 /* WANT_WRITE */)
+					continue;
+				if (err == 5 /* SSL_ERROR_SYSCALL */ &&
+				    (errno == 11 /* EAGAIN */ ||
+				     errno == 4 /* EINTR */))
+					continue;
+				printf("  [DBG] TLS eth0 srv: SSL_read ret %d after %d/%d bytes, ssl_err=%d errno=%d\n",
+				       n, recv_total, ETH0_DATA_LEN, err, errno);
+				break;
 			}
 			int sent_total = 0;
 			if (recv_total == ETH0_DATA_LEN) {
@@ -10320,6 +10423,17 @@ network_skip:;
 		snprintf(pf, sizeof(pf), "%s/rootonly.txt", _pbase);
 		snprintf(pd, sizeof(pd), "%s/rootdir", _pbase);
 		snprintf(inside, sizeof(inside), "%s/rootdir/x", _pbase);
+
+		/* Ensure the per-process sandbox exists before we create files in
+		 * it.  Earlier sections rmdir() it (LFN cleanup) and mkdir() it
+		 * back thousands of lines up; do not depend on that surviving.
+		 * If the create itself fails (e.g. an ext4 error on a /tmp
+		 * cluttered by earlier runs' leftover dirs), say so — otherwise
+		 * the ENOENT below reads as a bogus permission-enforcement fail. */
+		errno = 0;
+		if (mkdir(_pbase, 0777) != 0 && errno != EEXIST)
+			printf("  [DBG] perm test: mkdir(%s) failed errno=%d\n",
+			       _pbase, errno);
 
 		int sfd = open(pf, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 		if (sfd >= 0) {

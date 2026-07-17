@@ -5,6 +5,7 @@
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/io/console.h>
+#include <kernel/io/tty.h> /* tty_printf for the Ctrl+N table dump */
 #include <kernel/uapi/bug.h>
 #include <kernel/fs/vfs.h> /* vfs_permission_parent, MAY_* */
 
@@ -25,25 +26,64 @@ static unix_socket_t unix_sockets[MAX_UNIX_SOCKETS];
 static spinlock_t unix_table_lock = SPINLOCK_INIT("unix_table");
 
 // ============================================================================
-// String helpers
+// Name helpers
+//
+// Socket names are raw byte strings, NOT C strings — an abstract name begins
+// with NUL and may contain NULs.  There are deliberately no strcmp/strcpy
+// helpers here: using them is what collapsed every abstract name to "" and let
+// unrelated sockets find each other.
 // ============================================================================
-static int uds_strcmp(const char *a, const char *b)
+static int uds_memcmp(const void *a, const void *b, int n)
 {
-	while (*a && *b && *a == *b) {
-		a++;
-		b++;
-	}
-	return (unsigned char)*a - (unsigned char)*b;
+	const uint8_t *pa = (const uint8_t *)a, *pb = (const uint8_t *)b;
+	for (int i = 0; i < n; i++)
+		if (pa[i] != pb[i])
+			return (int)pa[i] - (int)pb[i];
+	return 0;
 }
 
-static void uds_strcpy(char *dst, const char *src, int maxlen)
+/* Decode a sockaddr_un + addrlen into a raw name.
+ *
+ * Returns the name length in bytes (0 == unnamed) or a negative errno.  On
+ * success *name_out points at the first name byte inside addr->sun_path.
+ *
+ *   addrlen == sizeof(sa_family_t)     -> unnamed (no name supplied)
+ *   sun_path[0] == '\0', addrlen > 2   -> abstract; the name is exactly the
+ *                                         (addrlen - 2) bytes present, leading
+ *                                         NUL included.  An abstract name is
+ *                                         NOT NUL-terminated and may contain
+ *                                         NULs, so its length can only come
+ *                                         from addrlen.  addrlen == 3 gives the
+ *                                         empty abstract name (length 1).
+ *   sun_path[0] != '\0'                -> pathname; the name is the
+ *                                         NUL-TERMINATED string.
+ *
+ * The pathname length is deliberately taken from the terminator rather than
+ * from addrlen: callers legitimately pass either sizeof(struct sockaddr_un)
+ * (both tmux and testlibc do) or SUN_LEN-style lengths, and bind/connect must
+ * agree on the name regardless of which the caller chose.  Deriving it from
+ * addrlen would make those two spellings name different sockets. */
+static int uds_name_from_addr(const struct sockaddr_un *addr, socklen_t addrlen,
+			      const char **name_out)
 {
-	int i = 0;
-	while (src[i] && i < maxlen - 1) {
-		dst[i] = src[i];
-		i++;
-	}
-	dst[i] = '\0';
+	*name_out = addr->sun_path;
+	if (addrlen < sizeof(sa_family_t) ||
+	    addrlen > sizeof(struct sockaddr_un))
+		return -EINVAL;
+
+	int avail = (int)(addrlen - sizeof(sa_family_t));
+	if (avail <= 0)
+		return 0; /* unnamed */
+
+	if (addr->sun_path[0] == '\0')
+		return avail; /* abstract: raw bytes, length from addrlen */
+
+	int n = 0;
+	while (n < avail && addr->sun_path[n])
+		n++;
+	if (n == avail)
+		return -EINVAL; /* pathname not NUL-terminated within addrlen */
+	return n;
 }
 
 // ============================================================================
@@ -84,14 +124,30 @@ static int unix_alloc_locked(void)
 // Caller MUST hold unix_table_lock so the returned pointer is stable
 // against concurrent close (which clears active/bound under the lock).
 // ============================================================================
-static unix_socket_t *unix_find_by_path_locked(const char *path)
+/* Find a bound socket by RAW NAME.
+ *
+ * Compares (length, bytes) — never as a C string.  An abstract name starts
+ * with NUL and may contain NULs, so strcmp would truncate every one of them to
+ * "" and make them all match each other: that is precisely how two unrelated
+ * listeners ended up answering to the same name, each holding the other's
+ * queued client while both waited forever.
+ *
+ * Because a pathname can never begin with NUL, comparing raw bytes keeps the
+ * pathname and abstract namespaces disjoint for free.
+ *
+ * len <= 0 means unnamed, which is not reachable by name at all. */
+static unix_socket_t *unix_find_by_name_locked(const char *name, int len)
 {
+	if (!name || len <= 0)
+		return NULL;
 	for (int i = 0; i < MAX_UNIX_SOCKETS; i++) {
 		if (!unix_sockets[i].active)
 			continue;
 		if (!unix_sockets[i].bound)
 			continue;
-		if (uds_strcmp(unix_sockets[i].path, path) == 0)
+		if (unix_sockets[i].path_len != len)
+			continue;
+		if (uds_memcmp(unix_sockets[i].path, name, len) == 0)
 			return &unix_sockets[i];
 	}
 	return NULL;
@@ -132,9 +188,9 @@ int unix_create(int type)
 }
 
 // ============================================================================
-// unix_bind - Bind a UNIX socket to a path
+// unix_bind - Bind a UNIX socket to a pathname or abstract name
 // ============================================================================
-int unix_bind(int usockfd, const struct sockaddr_un *addr)
+int unix_bind(int usockfd, const struct sockaddr_un *addr, socklen_t addrlen)
 {
 	unix_socket_t *us = unix_get(usockfd);
 	if (!us)
@@ -144,30 +200,44 @@ int unix_bind(int usockfd, const struct sockaddr_un *addr)
 	if (!addr || addr->sun_family != AF_UNIX)
 		return -EINVAL;
 
+	const char *name;
+	int nlen = uds_name_from_addr(addr, addrlen, &name);
+	if (nlen < 0)
+		return nlen;
+	/* Unnamed bind (addrlen carries no sun_path): there is no name to
+	 * register, so there is nothing to bind to.  Auto-generating one is not
+	 * supported; say so rather than registering the socket under a name
+	 * every other unnamed socket would also answer to. */
+	if (nlen == 0)
+		return -EINVAL;
+	if (nlen > UNIX_PATH_MAX)
+		return -EINVAL;
+
 	/* A pathname socket occupies a name in the filesystem namespace, so
 	 * binding it requires write+search permission on the containing
-	 * directory — the same rule as creating a file there.  Abstract sockets
-	 * (sun_path[0] == '\0') have no filesystem presence and are exempt.  The
-	 * check runs before the table lock so it never holds a spinlock across
-	 * the VFS stat.  (Peer-credential passing / SO_PEERCRED is a follow-up.) */
-	if (addr->sun_path[0]) {
-		int pr = vfs_permission_parent(addr->sun_path,
-					       MAY_WRITE | MAY_EXEC);
+	 * directory — the same rule as creating a file there.  An abstract name
+	 * (leading NUL) has no filesystem presence and is exempt.  The check
+	 * runs before the table lock so it never holds a spinlock across the VFS
+	 * stat.  (Peer-credential passing / SO_PEERCRED is a follow-up.) */
+	if (name[0] != '\0') {
+		int pr = vfs_permission_parent(name, MAY_WRITE | MAY_EXEC);
 		if (pr != ST_OK)
 			return (pr == ST_PERM) ? -EPERM : -EACCES;
 	}
 
-	// Path lookup + write of bound=1 must be atomic against other binds
+	// Name lookup + write of bound=1 must be atomic against other binds
 	// and against unix_close clearing bound — otherwise two binds can
-	// both see the path free and both succeed, producing duplicates that
-	// confuse subsequent unix_find_by_path callers.
+	// both see the name free and both succeed, producing duplicates that
+	// confuse subsequent unix_find_by_name callers.
 	uint64_t tflags;
 	spin_lock_irqsave(&unix_table_lock, &tflags);
-	if (addr->sun_path[0] && unix_find_by_path_locked(addr->sun_path)) {
+	if (unix_find_by_name_locked(name, nlen)) {
 		spin_unlock_irqrestore(&unix_table_lock, tflags);
 		return -EADDRINUSE;
 	}
-	uds_strcpy(us->path, addr->sun_path, UNIX_PATH_MAX);
+	for (int i = 0; i < nlen; i++)
+		us->path[i] = name[i];
+	us->path_len = nlen;
 	us->bound = 1;
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
 
@@ -282,11 +352,22 @@ int unix_accept(int usockfd, struct sockaddr_un *addr, socklen_t *addrlen)
 	client->connected = 1;
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
 
-	// Fill addr if requested
+	/* Fill addr if requested.  Report the client's own bound name, as raw
+	 * bytes plus a matching addrlen — the connecting side is normally
+	 * unnamed, which is reported as family-only (addrlen == sizeof
+	 * sa_family_t), exactly as an unnamed peer should be. */
 	if (addr && addrlen) {
+		for (int i = 0; i < UNIX_PATH_MAX; i++)
+			addr->sun_path[i] = 0;
 		addr->sun_family = AF_UNIX;
-		uds_strcpy(addr->sun_path, client->path, UNIX_PATH_MAX);
-		*addrlen = sizeof(struct sockaddr_un);
+		int cl = client->path_len;
+		if (cl < 0)
+			cl = 0;
+		if (cl > UNIX_PATH_MAX)
+			cl = UNIX_PATH_MAX;
+		for (int i = 0; i < cl; i++)
+			addr->sun_path[i] = client->path[i];
+		*addrlen = (socklen_t)(sizeof(sa_family_t) + cl);
 	}
 
 	return MAKE_UNIX_SOCKET_FD(new_idx);
@@ -295,7 +376,8 @@ int unix_accept(int usockfd, struct sockaddr_un *addr, socklen_t *addrlen)
 // ============================================================================
 // unix_connect - Connect to a bound/listening UNIX socket
 // ============================================================================
-int unix_connect(int usockfd, const struct sockaddr_un *addr)
+int unix_connect(int usockfd, const struct sockaddr_un *addr,
+		 socklen_t addrlen)
 {
 	unix_socket_t *us = unix_get(usockfd);
 	if (!us)
@@ -305,11 +387,18 @@ int unix_connect(int usockfd, const struct sockaddr_un *addr)
 	if (!addr || addr->sun_family != AF_UNIX)
 		return -EINVAL;
 
+	const char *name;
+	int nlen = uds_name_from_addr(addr, addrlen, &name);
+	if (nlen < 0)
+		return nlen;
+	if (nlen == 0)
+		return -EINVAL; /* no name to connect to */
+
 	// Look up listener and enqueue under unix_table_lock so the listener
 	// cannot be closed (and its slot reused) between lookup and enqueue.
 	uint64_t tflags;
 	spin_lock_irqsave(&unix_table_lock, &tflags);
-	unix_socket_t *listener = unix_find_by_path_locked(addr->sun_path);
+	unix_socket_t *listener = unix_find_by_name_locked(name, nlen);
 	if (!listener || !listener->listening) {
 		spin_unlock_irqrestore(&unix_table_lock, tflags);
 		return -ECONNREFUSED;
@@ -396,56 +485,77 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 
 	const uint8_t *src = (const uint8_t *)buf;
 	int sent = 0;
-
 	uint64_t irqflags;
-	spin_lock_irqsave(&peer->lock, &irqflags);
 
-	for (size_t i = 0; i < len; i++) {
-		int next = (peer->tail + 1) % (int)sizeof(peer->buf);
-		if (next == peer->head) {
-			// Buffer full
-			if (sent > 0)
-				break;
-			spin_unlock_irqrestore(&peer->lock, irqflags);
-			if (us->nonblock) {
+	/* Bounce through a kernel buffer.  User memory must NEVER be touched
+	 * while peer->lock is held: a user page can be demand-paged (lazily
+	 * mapped text/rodata — a string literal passed to write() is exactly
+	 * that — or anon), and a fault taken with interrupts disabled cannot
+	 * re-enable them to sleep for the page-in.  The demand-fault path only
+	 * sti's when the faulting context had interrupts on (see
+	 * exception_handler), so faulting under a spinlock waits for a disk
+	 * completion IRQ that can never be delivered on this CPU — wedged
+	 * forever, still holding the lock.  Chunked to keep the stack small. */
+	uint8_t kbuf[256];
+
+	while ((size_t)sent < len) {
+		size_t chunk = len - (size_t)sent;
+		if (chunk > sizeof(kbuf))
+			chunk = sizeof(kbuf);
+
+		/* Read user memory with NO lock held — safe to fault and sleep. */
+		smap_disable();
+		for (size_t i = 0; i < chunk; i++)
+			kbuf[i] = src[(size_t)sent + i];
+		smap_enable();
+
+		/* Push into the peer's ring under its lock — kernel memory only. */
+		spin_lock_irqsave(&peer->lock, &irqflags);
+		size_t n = 0;
+		while (n < chunk) {
+			int next = (peer->tail + 1) % (int)sizeof(peer->buf);
+			if (next == peer->head)
+				break; /* ring full */
+			peer->buf[peer->tail] = kbuf[n];
+			peer->tail = next;
+			peer->bytes_written++;
+			n++;
+		}
+		if (n)
+			peer->ready = 1;
+		spin_unlock_irqrestore(&peer->lock, irqflags);
+		sent += (int)n;
+
+		if (n == chunk)
+			continue; /* chunk placed; keep going */
+
+		/* Ring is full. */
+		if (sent > 0)
+			break; /* partial write — report what we sent */
+		if (us->nonblock) {
+			__atomic_fetch_sub(&peer->ref_count, 1,
+					   __ATOMIC_ACQ_REL);
+			return -EAGAIN;
+		}
+		// Wait for space — yield so the receiver gets CPU and drains.
+		while ((peer->tail + 1) % (int)sizeof(peer->buf) ==
+		       peer->head) {
+			if (peer->closed) {
 				__atomic_fetch_sub(&peer->ref_count, 1,
 						   __ATOMIC_ACQ_REL);
-				return -EAGAIN;
+				return -EPIPE;
 			}
-			// Wait for space — yield so the receiver gets CPU and drains.
-			while ((peer->tail + 1) % (int)sizeof(peer->buf) ==
-			       peer->head) {
-				if (peer->closed) {
-					__atomic_fetch_sub(&peer->ref_count, 1,
-							   __ATOMIC_ACQ_REL);
-					return -EPIPE;
-				}
-				/* Interruptible: send() returns EINTR (no data
-				 * was written yet at this point). */
-				task_t *snd_cur = sched_current();
-				if (snd_cur && signal_pending(snd_cur)) {
-					__atomic_fetch_sub(&peer->ref_count, 1,
-							   __ATOMIC_ACQ_REL);
-					return -EINTR;
-				}
-				sched_yield_in_kernel();
+			/* Interruptible: send() returns EINTR (no data was
+			 * written yet at this point). */
+			task_t *snd_cur = sched_current();
+			if (snd_cur && signal_pending(snd_cur)) {
+				__atomic_fetch_sub(&peer->ref_count, 1,
+						   __ATOMIC_ACQ_REL);
+				return -EINTR;
 			}
-			spin_lock_irqsave(&peer->lock, &irqflags);
-			next = (peer->tail + 1) % (int)sizeof(peer->buf);
-			if (next == peer->head)
-				break;
+			sched_yield_in_kernel();
 		}
-		smap_disable();
-		peer->buf[peer->tail] = src[i];
-		smap_enable();
-		peer->tail = next;
-		WARN_ON(peer->tail == peer->head &&
-			i + 1 < len); /* unix_socket ring buffer wrapped to head mid-write: capacity calculation is wrong */
-		peer->bytes_written++;
-		sent++;
 	}
-	peer->ready = 1;
-	spin_unlock_irqrestore(&peer->lock, irqflags);
 
 	// Drop the reference we took above.  If this was the last ref and
 	// peer was already closed, unix_close's deferred-free logic (or
@@ -501,22 +611,42 @@ int unix_recv(int usockfd, void *buf, size_t len, int flags)
 	}
 
 	uint64_t irqflags;
-	spin_lock_irqsave(&us->lock, &irqflags);
-
 	int received = 0;
-	for (size_t i = 0; i < len; i++) {
+
+	/* Same rule as unix_send: never touch user memory under us->lock.  Drain
+	 * the ring into a kernel buffer with the lock held, then copy out to the
+	 * user with it released, where a demand fault is free to sleep. */
+	uint8_t kbuf[256];
+
+	while ((size_t)received < len) {
+		size_t chunk = len - (size_t)received;
+		if (chunk > sizeof(kbuf))
+			chunk = sizeof(kbuf);
+
+		spin_lock_irqsave(&us->lock, &irqflags);
+		size_t n = 0;
+		while (n < chunk && us->head != us->tail) {
+			kbuf[n++] = us->buf[us->head];
+			us->head = (us->head + 1) % (int)sizeof(us->buf);
+			us->bytes_read++;
+		}
 		if (us->head == us->tail)
-			break;
+			us->ready = 0;
+		spin_unlock_irqrestore(&us->lock, irqflags);
+
+		if (n == 0)
+			break; /* ring empty */
+
+		/* Copy to user with NO lock held — safe to fault and sleep. */
 		smap_disable();
-		dst[i] = us->buf[us->head];
+		for (size_t i = 0; i < n; i++)
+			dst[(size_t)received + i] = kbuf[i];
 		smap_enable();
-		us->head = (us->head + 1) % (int)sizeof(us->buf);
-		us->bytes_read++;
-		received++;
+
+		received += (int)n;
+		if (n < chunk)
+			break; /* ring drained */
 	}
-	if (us->head == us->tail)
-		us->ready = 0;
-	spin_unlock_irqrestore(&us->lock, irqflags);
 
 	return received;
 }
@@ -568,6 +698,7 @@ int unix_close(int usockfd)
 	us->peer = NULL;
 	us->head = 0;
 	us->tail = 0;
+	us->path_len = 0; /* name released with the slot */
 
 	spin_unlock_irqrestore(&us->lock, flags);
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
@@ -763,4 +894,62 @@ int unix_peek_fd_offset(unix_socket_t *sock, uint64_t *out_off)
 	*out_off = sock->pending_fd_off[sock->pending_fd_head];
 	spin_unlock_irqrestore(&sock->lock, flags);
 	return 0;
+}
+
+// ============================================================================
+// unix_dump_sockets - On-demand AF_UNIX table snapshot for the Ctrl+N dump.
+//
+// Lock-free best-effort read, exactly like tcp_dump_table: this runs from the
+// keyboard interrupt handler, so it must never take unix_table_lock (a holder
+// on another CPU would wedge the box).  Values may tear; it is purely
+// diagnostic and never used for correctness.
+//
+// Reading a hang: a listener stuck in accept() has lsn=1 with ah==at (nothing
+// queued), while its client stuck in connect() has peer=-1 (never linked).  If
+// both are true at once, the client enqueued into a DIFFERENT socket than the
+// listener is polling — compare the two `path` columns and the u<idx> of each.
+// ============================================================================
+void unix_dump_sockets(struct tty *tty)
+{
+	tty_printf(tty, "=== AF_UNIX table ===\n");
+	for (int i = 0; i < MAX_UNIX_SOCKETS; i++) {
+		unix_socket_t *u = &unix_sockets[i];
+		if (!*(volatile int *)&u->active)
+			continue;
+		unix_socket_t *peer = (unix_socket_t *)*(volatile unix_socket_t *
+							 *const *)&u->peer;
+		unix_socket_t *par = (unix_socket_t *)*(volatile unix_socket_t *
+						       *const *)&u->parent;
+		/* Render the raw name.  An abstract name starts with NUL and is
+		 * not a C string, so print it as @<rest> with NULs shown as '.'
+		 * rather than handing printf a string that stops at byte 0. */
+		char nm[UNIX_PATH_MAX + 2];
+		int nlen = u->path_len;
+		if (nlen < 0)
+			nlen = 0;
+		if (nlen > UNIX_PATH_MAX)
+			nlen = UNIX_PATH_MAX;
+		if (nlen == 0) {
+			nm[0] = '-';
+			nm[1] = '\0';
+		} else if (u->path[0] == '\0') {
+			nm[0] = '@';
+			for (int j = 1; j < nlen; j++)
+				nm[j] = u->path[j] ? u->path[j] : '.';
+			nm[nlen] = '\0';
+		} else {
+			for (int j = 0; j < nlen; j++)
+				nm[j] = u->path[j];
+			nm[nlen] = '\0';
+		}
+		tty_printf(
+			tty,
+			"u%d ref=%d ty=%d bnd=%d lsn=%d con=%d cls=%d pcls=%d ah=%d at=%d h=%d t=%d peer=%d par=%d nlen=%d name=%s\n",
+			i, u->ref_count, u->type, u->bound, u->listening,
+			u->connected, u->closed, u->peer_closed,
+			u->accept_head, u->accept_tail, u->head, u->tail,
+			peer ? (int)(peer - unix_sockets) : -1,
+			par ? (int)(par - unix_sockets) : -1, nlen, nm);
+	}
+	tty_printf(tty, "=====================\n");
 }

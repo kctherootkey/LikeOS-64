@@ -215,6 +215,7 @@
 #define SYS_FGETXATTR 396 // (fd, name, val, size)
 #define SYS_FLISTXATTR 397 // (fd, list, size)
 #define SYS_FREMOVEXATTR 398 // (fd, name)
+#define SYS_DEBUG_DUMP 399 // () root-only: dump TCP/AF_UNIX/PTY tables + tasks
 
 // rusage who values
 #define RUSAGE_SELF 0

@@ -5038,11 +5038,9 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 		}
 	}
 
-	// Assign unique ID
+	// Assign unique ID (atomic; no lock needed just for the counter)
 	uint64_t irq_flags;
-	spin_lock_irqsave(&g_task_list_lock, &irq_flags);
-	child->id = g_next_id++;
-	spin_unlock_irqrestore(&g_task_list_lock, irq_flags);
+	child->id = sched_alloc_task_id();
 
 	// Basic child setup
 	child->state = TASK_READY;
@@ -6781,6 +6779,28 @@ __attribute__((noinline)) static int unix_do_recvmsg(int ufd,
 	return got;
 }
 
+/* SYS_DEBUG_DUMP: root-only.  Emit the same diagnostic tables as the Ctrl+N /
+ * Ctrl+D debug hotkeys (TCP connection table, AF_UNIX socket table, PTY table,
+ * and the scheduler task list) to the active tty.  Lets userspace capture the
+ * kernel state at a chosen moment — e.g. a watchdog that fires when an accept()
+ * has hung — without needing a physical keypress.  All four dumps are lock-free
+ * best-effort reads with no side effects. */
+static int64_t sys_debug_dump(void)
+{
+	if (!capable())
+		return -EPERM;
+	extern void tcp_dump_table(struct tty * tty);
+	extern void unix_dump_sockets(struct tty * tty);
+	extern void tty_dump_ptys(struct tty * tty);
+	extern void sched_dump_tasks(struct tty * tty);
+	tty_t *t = tty_get_active();
+	tcp_dump_table(t);
+	unix_dump_sockets(t);
+	tty_dump_ptys(t);
+	sched_dump_tasks(t);
+	return 0;
+}
+
 // Main syscall dispatcher (inner function)
 static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 				     uint64_t a3, uint64_t a4, uint64_t a5,
@@ -6922,6 +6942,9 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		return sys_flistxattr(a1, a2, a3);
 	case SYS_FREMOVEXATTR:
 		return sys_fremovexattr(a1, a2);
+
+	case SYS_DEBUG_DUMP:
+		return sys_debug_dump();
 
 	case SYS_GETHOSTNAME:
 		return sys_gethostname(a1, a2);
@@ -7188,9 +7211,13 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			if (!validate_user_ptr(a2, sizeof(struct sockaddr_un)))
 				return -EFAULT;
 			struct sockaddr_un kaddr;
-			copy_from_user(&kaddr, (const void *)a2,
-				       sizeof(struct sockaddr_un));
-			return unix_bind(ufd, &kaddr);
+			/* MUST check the copy: on failure kaddr is uninitialised
+			 * stack garbage, and binding that silently registers a
+			 * socket under a junk (often empty) name. */
+			if (copy_from_user(&kaddr, (const void *)a2,
+					   sizeof(struct sockaddr_un)) != 0)
+				return -EFAULT;
+			return unix_bind(ufd, &kaddr, (socklen_t)a3);
 		}
 		int idx = sock_idx_from_fd(a1);
 		if (idx < 0)
@@ -7299,9 +7326,12 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			if (!validate_user_ptr(a2, sizeof(struct sockaddr_un)))
 				return -EFAULT;
 			struct sockaddr_un kaddr;
-			copy_from_user(&kaddr, (const void *)a2,
-				       sizeof(struct sockaddr_un));
-			return unix_connect(ufd, &kaddr);
+			/* Check the copy: on failure kaddr is uninitialised
+			 * stack garbage and we would connect to a junk name. */
+			if (copy_from_user(&kaddr, (const void *)a2,
+					   sizeof(struct sockaddr_un)) != 0)
+				return -EFAULT;
+			return unix_connect(ufd, &kaddr, (socklen_t)a3);
 		}
 		int idx = sock_idx_from_fd(a1);
 		if (idx < 0)

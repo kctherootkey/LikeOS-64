@@ -107,6 +107,9 @@ char* ptsname(int fd);
 // Scheduling
 int sched_yield(void);
 
+// Root-only: dump kernel diagnostic tables (TCP/AF_UNIX/PTY/tasks) to the tty.
+int debug_dump(void);
+
 // Process operations
 pid_t getpid(void);
 pid_t getppid(void);

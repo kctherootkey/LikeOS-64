@@ -17,6 +17,18 @@ int sched_yield(void)
 	return 0;
 }
 
+// SYS_DEBUG_DUMP - root-only: dump kernel diagnostic tables to the active tty.
+// Returns 0 on success, -1/errno on failure (EPERM if not root).
+int debug_dump(void)
+{
+	long ret = syscall0(SYS_DEBUG_DUMP);
+	if (ret < 0) {
+		errno = -ret;
+		return -1;
+	}
+	return 0;
+}
+
 // SYS_GETTID - get current thread ID
 pid_t gettid(void)
 {

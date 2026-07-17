@@ -498,6 +498,10 @@ static inline void task_set_fd_flags(task_t *t, unsigned fd, uint8_t flags)
 }
 
 void sched_init(void);
+/* Allocate the next task id atomically.  Every task-creation path must use
+ * this: a bare g_next_id++ races between CPUs and hands two live tasks the
+ * same pid. */
+int sched_alloc_task_id(void);
 task_t *sched_add_task(task_entry_t entry, void *arg, void *stack_mem,
 		       size_t stack_size);
 task_t *sched_add_user_task(task_entry_t entry, void *arg, uint64_t *pml4,

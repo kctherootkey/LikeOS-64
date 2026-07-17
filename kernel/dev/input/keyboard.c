@@ -363,7 +363,9 @@ void keyboard_irq_handler(void)
 	    scan_code == 0x31) { // 0x31 = 'n'
 		extern void tcp_dump_table(struct tty * tty);
 		extern void tty_dump_ptys(struct tty * tty);
+		extern void unix_dump_sockets(struct tty * tty);
 		tcp_dump_table(tty_get_active());
+		unix_dump_sockets(tty_get_active());
 		tty_dump_ptys(tty_get_active());
 		return;
 	}

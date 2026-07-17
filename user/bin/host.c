@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <getopt.h>
@@ -288,7 +289,11 @@ int main(int argc, char *argv[])
 				printf("Host %s not found: 3(NXDOMAIN)\n",
 				       name);
 		} else {
-			printf("Host %s not found: 3(NXDOMAIN)\n", name);
+			/* No answer came back — see the comment on the forward
+			 * path below.  Do not invent an rcode we never received. */
+			int e = errno;
+			printf("Host %s lookup failed: %s\n", name,
+			       e ? strerror(e) : "no response from server");
 			return 1;
 		}
 		return 0;
@@ -312,11 +317,22 @@ int main(int argc, char *argv[])
 	}
 
 	dns_query_buf_t qbuf;
-	memset(&qbuf, 0, sizeof(qbuf));
-	strncpy(qbuf.name, name, 255);
-	qbuf.qtype = qt;
 
-	int ret = dns_query(&qbuf);
+	/* Retry a few times before giving up: a single UDP query can be lost
+	 * (or its reply raced away) under load, and reporting "timed out" on the
+	 * first miss is too eager for a stub resolver.  Short backoff between
+	 * tries so the whole thing still returns quickly when the server is up. */
+	int ret = -1;
+	for (int attempt = 0; attempt < 4; attempt++) {
+		memset(&qbuf, 0, sizeof(qbuf));
+		strncpy(qbuf.name, name, 255);
+		qbuf.qtype = qt;
+		ret = dns_query(&qbuf);
+		if (ret == 0 && qbuf.response_len >= 12)
+			break;
+		struct timespec backoff = { 0, 250L * 1000L * 1000L }; /* 250ms */
+		nanosleep(&backoff, NULL);
+	}
 	if (ret == 0 && qbuf.response_len >= 12) {
 		const uint8_t *pkt = qbuf.response;
 		int pktlen = qbuf.response_len;
@@ -418,16 +434,31 @@ int main(int argc, char *argv[])
 			       server ? server : "(system DNS)");
 
 		if (!found && rcode != 0) {
-			printf("Host %s not found: 3(NXDOMAIN)\n", name);
+			/* Print the rcode the server ACTUALLY sent.  This used to
+			 * hardcode "3(NXDOMAIN)" for every non-zero rcode, so a
+			 * SERVFAIL(2) or REFUSED(5) — what a busy resolver returns
+			 * when it rate-limits you — was reported as "this name does
+			 * not exist".  Two completely different diagnoses. */
+			static const char *const rc[] = { "NOERROR",  "FORMERR",
+							  "SERVFAIL", "NXDOMAIN",
+							  "NOTIMP",   "REFUSED" };
+			printf("Host %s not found: %d(%s)\n", name, rcode,
+			       (rcode < 6) ? rc[rcode] : "UNKNOWN");
 			return 1;
 		}
 	} else {
-		if (verbose) {
+		/* The query did not complete — we never got an answer at all, so
+		 * we have NO rcode and must not invent one.  Reporting NXDOMAIN
+		 * here (as this did) claims the server authoritatively said the
+		 * name does not exist, when in reality the lookup timed out, the
+		 * network was down, or the reply was truncated.  That lie sends
+		 * anyone debugging it hunting a DNS answer that was never on the
+		 * wire.  Report what actually happened. */
+		int e = errno;
+		if (verbose)
 			printf("Trying \"%s\"\n", name);
-			printf(";; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN, id: 1\n");
-			printf(";; flags: qr rd ra; QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 0\n\n");
-		}
-		printf("Host %s not found: 3(NXDOMAIN)\n", name);
+		printf("Host %s lookup failed: %s\n", name,
+		       e ? strerror(e) : "no response from server");
 		return 1;
 	}
 

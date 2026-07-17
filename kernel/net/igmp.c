@@ -5,6 +5,7 @@
 #include <kernel/net/net.h>
 #include <kernel/io/console.h>
 #include <kernel/uapi/bug.h>
+#include <kernel/ke/syscall.h> /* errno constants returned to the socket layer */
 
 // IGMPv2 packet
 typedef struct __attribute__((packed)) {
@@ -20,9 +21,17 @@ typedef struct __attribute__((packed)) {
 #define IGMP_TYPE_LEAVE 0x17
 
 // Per-device joined-group table.
+//
+// Membership is REFCOUNTED: this table is per (device, group), but any number
+// of sockets — in any number of processes — may join the same group on the same
+// device.  The device must stay joined until the LAST of them leaves.  Without
+// a count, the first leave tore the membership down and every other holder's
+// leave then failed (and, worse, stopped receiving the group's traffic while
+// still believing it was a member).
 #define IGMP_MAX_GROUPS 16
 typedef struct {
 	int active;
+	unsigned refs; // joiners holding this membership; 0 == free
 	net_device_t *dev;
 	uint32_t group; // host byte order
 } igmp_membership_t;
@@ -32,8 +41,10 @@ static spinlock_t igmp_lock = SPINLOCK_INIT("igmp");
 
 void igmp_init(void)
 {
-	for (int i = 0; i < IGMP_MAX_GROUPS; i++)
+	for (int i = 0; i < IGMP_MAX_GROUPS; i++) {
 		igmp_table[i].active = 0;
+		igmp_table[i].refs = 0;
+	}
 }
 
 static int igmp_send(net_device_t *dev, uint32_t dst_group, uint8_t type)
@@ -61,7 +72,7 @@ int igmp_join(net_device_t *dev, uint32_t group)
 	WARN_ON((group >> 28) !=
 		0xE); /* igmp_join: address not in multicast range 224.x.x.x - 239.x.x.x */
 	if (!dev || (group >> 28) != 0xE)
-		return -1;
+		return -EINVAL;
 
 	uint64_t flags;
 	spin_lock_irqsave(&igmp_lock, &flags);
@@ -70,17 +81,21 @@ int igmp_join(net_device_t *dev, uint32_t group)
 	for (int i = 0; i < IGMP_MAX_GROUPS; i++) {
 		if (igmp_table[i].active && igmp_table[i].dev == dev &&
 		    igmp_table[i].group == group) {
+			/* Already joined by someone else: take a reference and
+			 * skip the report — the device is already a member. */
+			igmp_table[i].refs++;
 			spin_unlock_irqrestore(&igmp_lock, flags);
-			return 0; // already joined
+			return 0;
 		}
 		if (!igmp_table[i].active && slot < 0)
 			slot = i;
 	}
 	if (slot < 0) {
 		spin_unlock_irqrestore(&igmp_lock, flags);
-		return -1;
+		return -ENOBUFS;
 	}
 	igmp_table[slot].active = 1;
+	igmp_table[slot].refs = 1;
 	igmp_table[slot].dev = dev;
 	igmp_table[slot].group = group;
 	spin_unlock_irqrestore(&igmp_lock, flags);
@@ -95,18 +110,29 @@ int igmp_leave(net_device_t *dev, uint32_t group)
 {
 	uint64_t flags;
 	spin_lock_irqsave(&igmp_lock, &flags);
-	int found = 0;
+	int found = 0, last = 0;
 	for (int i = 0; i < IGMP_MAX_GROUPS; i++) {
 		if (igmp_table[i].active && igmp_table[i].dev == dev &&
 		    igmp_table[i].group == group) {
-			igmp_table[i].active = 0;
 			found = 1;
+			/* Only the final joiner tears the membership down; the
+			 * others just drop their reference. */
+			if (igmp_table[i].refs > 0)
+				igmp_table[i].refs--;
+			if (igmp_table[i].refs == 0) {
+				igmp_table[i].active = 0;
+				last = 1;
+			}
+			break;
 		}
 	}
 	spin_unlock_irqrestore(&igmp_lock, flags);
-	if (found && dev != net_get_loopback())
+	if (last && dev != net_get_loopback())
 		igmp_send(dev, group, IGMP_TYPE_LEAVE);
-	return found ? 0 : -1;
+	/* Not a member is a caller error, not a permission problem: return a
+	 * real errno.  The old bare -1 was read by the socket layer as a
+	 * negative errno and surfaced to userspace as EPERM. */
+	return found ? 0 : -EADDRNOTAVAIL;
 }
 
 void igmp_rx(net_device_t *dev, uint32_t src_ip, const uint8_t *data,

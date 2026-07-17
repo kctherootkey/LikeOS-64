@@ -52,11 +52,51 @@ typedef struct {
 static dns_cache_entry_t dns_cache[DNS_CACHE_SIZE];
 static int dns_cache_next = 0; // Next slot to use (round-robin)
 
-// Response buffer for async receive
+// Response buffer for async receive.
+//
+// dns_rx() fills this from the network receive path while a resolver is
+// spinning on dns_rx_ready in task context, so the id and the buffer MUST be
+// read together, under dns_lock.  Reading the id, deciding the buffer is ours,
+// and only then copying it out is a check-then-use race: another lookup's reply
+// can land in between and get copied out as our answer.  A reverse lookup
+// answering NXDOMAIN (routine, and netstat/ping do them constantly) then
+// surfaces as NXDOMAIN for a perfectly good name.
 static uint8_t dns_rx_buf[DNS_MAX_PACKET];
-static volatile int dns_rx_len = 0;
-static volatile uint16_t dns_rx_id = 0;
+static int dns_rx_len = 0;
+static uint16_t dns_rx_id = 0;
 static volatile int dns_rx_ready = 0;
+static spinlock_t dns_lock = SPINLOCK_INIT("dns");
+
+/* Does `resp` answer the question `query` asked?
+ *
+ * Matching on the 16-bit transaction id alone is not enough.  The resolver
+ * uses ONE fixed source port (DNS_CLIENT_PORT) for every lookup in the system,
+ * so a late straggler — a reply to a query that already timed out and retried,
+ * or to one whose process has since exited — can arrive while an unrelated
+ * lookup is waiting.  If the two ids happen to collide (1 in 65536), that reply
+ * is accepted as ours.  A reverse (PTR) lookup answering NXDOMAIN is routine,
+ * so the straggler is quite likely to BE an NXDOMAIN — and a perfectly good
+ * name comes back "not found".  Rare, unreproducible, and exactly what was
+ * observed under teststress.
+ *
+ * A response echoes the question section verbatim (it is never compressed), so
+ * comparing it byte-for-byte against the query we built settles it: same name,
+ * same qtype, same qclass. */
+static int dns_answers_our_question(const uint8_t *resp, int resp_len,
+				    const uint8_t *query, int query_len)
+{
+	int qlen = query_len - (int)sizeof(dns_header_t);
+	if (qlen <= 0 || resp_len < query_len)
+		return 0;
+	const dns_header_t *rh = (const dns_header_t *)resp;
+	if (net_ntohs(rh->qdcount) != 1)
+		return 0; /* not the single question we asked */
+	for (int i = 0; i < qlen; i++)
+		if (resp[sizeof(dns_header_t) + i] !=
+		    query[sizeof(dns_header_t) + i])
+			return 0;
+	return 1;
+}
 
 // ============================================================================
 // String helpers
@@ -317,12 +357,16 @@ void dns_rx(const uint8_t *data, uint16_t len)
 	if (!(flags & DNS_FLAG_QR))
 		return;
 
-	// Copy to response buffer
+	// Copy to response buffer.  Under dns_lock so a resolver cannot observe
+	// this id paired with a different reply's bytes.
+	uint64_t lflags;
+	spin_lock_irqsave(&dns_lock, &lflags);
 	for (int i = 0; i < len; i++)
 		dns_rx_buf[i] = data[i];
 	dns_rx_len = len;
 	dns_rx_id = id;
 	dns_rx_ready = 1;
+	spin_unlock_irqrestore(&dns_lock, lflags);
 }
 
 // ============================================================================
@@ -405,8 +449,14 @@ int dns_resolve(const char *hostname, uint32_t *ip_out)
 
 	// Send query and wait for response
 	for (int retry = 0; retry < DNS_MAX_RETRIES; retry++) {
+		/* Arm for this attempt under the lock: an unlocked reset can
+		 * clobber a reply dns_rx() is landing right now, leaving
+		 * ready=1 with len=0. */
+		uint64_t aflags;
+		spin_lock_irqsave(&dns_lock, &aflags);
 		dns_rx_ready = 0;
 		dns_rx_len = 0;
+		spin_unlock_irqrestore(&dns_lock, aflags);
 
 		int ret = udp_send(dev, dns_server, DNS_CLIENT_PORT, DNS_PORT,
 				   query_buf, (uint16_t)query_len);
@@ -424,13 +474,36 @@ int dns_resolve(const char *hostname, uint32_t *ip_out)
 
 		if (!dns_rx_ready)
 			continue; // Timeout, retry
-		if (dns_rx_id != query_id)
+
+		/* Take the id and the bytes together, then work only from the
+		 * snapshot.  Checking dns_rx_id and afterwards parsing the live
+		 * dns_rx_buf lets a reply that arrives in between be parsed as
+		 * ours. */
+		uint8_t snap[DNS_MAX_PACKET];
+		int snap_len;
+		uint16_t snap_id;
+		uint64_t lflags;
+		spin_lock_irqsave(&dns_lock, &lflags);
+		snap_len = dns_rx_len;
+		snap_id = dns_rx_id;
+		if (snap_len < 0)
+			snap_len = 0;
+		if (snap_len > DNS_MAX_PACKET)
+			snap_len = DNS_MAX_PACKET;
+		for (int i = 0; i < snap_len; i++)
+			snap[i] = dns_rx_buf[i];
+		spin_unlock_irqrestore(&dns_lock, lflags);
+
+		if (snap_id != query_id)
 			continue; // Wrong response, retry
+		if (!dns_answers_our_question(snap, snap_len, query_buf,
+					      query_len))
+			continue; // id collided with a straggler — not ours
 
 		// Parse response
 		uint32_t ip = 0, ttl = 0;
-		if (dns_parse_response(dns_rx_buf, dns_rx_len, query_id, &ip,
-				       &ttl) == 0) {
+		if (dns_parse_response(snap, snap_len, query_id, &ip, &ttl) ==
+		    0) {
 			*ip_out = ip;
 			dns_cache_insert(hostname, ip, ttl);
 			return 0;
@@ -512,8 +585,14 @@ int dns_query_raw(const char *name, uint16_t qtype, uint8_t *response,
 		return -EINVAL;
 
 	for (int retry = 0; retry < DNS_MAX_RETRIES; retry++) {
+		/* Arm for this attempt under the lock: an unlocked reset can
+		 * clobber a reply dns_rx() is landing right now, leaving
+		 * ready=1 with len=0. */
+		uint64_t aflags;
+		spin_lock_irqsave(&dns_lock, &aflags);
 		dns_rx_ready = 0;
 		dns_rx_len = 0;
+		spin_unlock_irqrestore(&dns_lock, aflags);
 
 		int ret = udp_send(dev, dns_server, DNS_CLIENT_PORT, DNS_PORT,
 				   query_buf, (uint16_t)query_len);
@@ -529,15 +608,32 @@ int dns_query_raw(const char *name, uint16_t qtype, uint8_t *response,
 
 		if (!dns_rx_ready)
 			continue;
-		if (dns_rx_id != query_id)
-			continue;
 
-		// Copy raw response to caller's buffer
-		int copy_len = dns_rx_len;
+		/* Copy the id and the bytes out together, then decide.  The old
+		 * order — test dns_rx_id, then copy dns_rx_buf — let a reply
+		 * arriving in between be handed back as the answer to this query.
+		 * That is how a valid name came back NXDOMAIN: the bytes copied
+		 * were some other lookup's (a PTR NXDOMAIN is routine). */
+		int copy_len;
+		uint16_t got_id;
+		uint64_t lflags;
+		spin_lock_irqsave(&dns_lock, &lflags);
+		copy_len = dns_rx_len;
+		got_id = dns_rx_id;
+		if (copy_len < 0)
+			copy_len = 0;
 		if (copy_len > max_len)
 			copy_len = max_len;
 		for (int i = 0; i < copy_len; i++)
 			response[i] = dns_rx_buf[i];
+		spin_unlock_irqrestore(&dns_lock, lflags);
+
+		if (got_id != query_id)
+			continue; // Someone else's answer — retry
+		if (!dns_answers_our_question(response, copy_len, query_buf,
+					      query_len))
+			continue; // id collided with a straggler — not ours
+
 		return copy_len;
 	}
 

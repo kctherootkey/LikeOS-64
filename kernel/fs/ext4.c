@@ -1777,15 +1777,35 @@ static int ext4_sb_write_inode(vfs_superblock_t *sb, ic_inode_t *inode)
 	unsigned long ino = EXT4_BID_INO(inode->start_cluster);
 	if (ino == 0 || ino > fs->inodes_count)
 		return 0;
+	/* This is reached from the generic sync path (pagecache_sync ->
+	 * icache_flush_all) with NO ext4 lock held, yet it does a read-modify-
+	 * write of an inode-table block THROUGH the journal/mbc tiers
+	 * (ext4_read_block -> s_txn/s_ckpt/mbc, ext4_write_block -> s_txn
+	 * capture).  Every other s_txn/mbc mutator holds ext4_io_lock (the
+	 * invariant documented at ext4_read_block / the s_txn comment); this one
+	 * did not.  Unlocked, it races a concurrent mkdir/dir-grow mutating
+	 * s_txn: it can corrupt the s_txn array (concurrent append/realloc) or
+	 * write back a whole inode block whose OTHER inode slots (e.g. a
+	 * directory sharing the 4 KB block) still hold pre-grow values —
+	 * reverting that directory's i_size.  Since ext4_dir_lookup linearly
+	 * scans blocks 0..i_size/blocksize, a reverted (smaller) i_size makes it
+	 * miss the just-added entry in the grown tail leaf -> spurious ENOENT,
+	 * only ever on multi-block (large/htree) directories.  Take the
+	 * (reentrant) io lock so the RMW is serialized and reads the current
+	 * block.  Safe nested: same owner just bumps wdepth. */
+	ext4_io_lock();
 	ext4_inode in;
-	if (ext4_read_inode_loc(fs, ino, &in, 0, 0) != ST_OK)
-		return -1;
-	in.i_size_lo = (uint32_t)inode->size;
-	if ((in.i_mode & S_IFMT) == S_IFREG)
-		in.i_size_high = (uint32_t)(inode->size >> 32);
-	ext4_inode_cache_flush();
-	ext4_write_inode_struct(fs, ino, &in);
-	return 0;
+	int rc = -1;
+	if (ext4_read_inode_loc(fs, ino, &in, 0, 0) == ST_OK) {
+		in.i_size_lo = (uint32_t)inode->size;
+		if ((in.i_mode & S_IFMT) == S_IFREG)
+			in.i_size_high = (uint32_t)(inode->size >> 32);
+		ext4_inode_cache_flush();
+		ext4_write_inode_struct(fs, ino, &in);
+		rc = 0;
+	}
+	ext4_io_unlock();
+	return rc;
 }
 
 static const vfs_sb_ops_t ext4_sb_ops = {
@@ -6695,7 +6715,25 @@ static long ext4_read(vfs_file_t *f, void *buf, long bytes)
 		ext4_wb_flush(ef->fs ? ef->fs : g_ext4_fs);
 		ext4_io_unlock();
 	}
+	/* Hold the metadata lock SHARED across the read itself.  ext4_read_impl
+	 * reads metadata (the inode via ext4_get_inode_cached, extent blocks via
+	 * ext4_block_map), and ext4_read_block's read-your-writes lookups are
+	 * documented to require this lock at least shared — it is what keeps
+	 * s_txn/s_ckpt stable while they are consulted, and what serialises the
+	 * mbc population against a concurrent writer.  Without it, a reader can
+	 * fetch a block from disk, a writer can then checkpoint the new content
+	 * (refreshing the mbc), and the reader finishes by inserting its now-
+	 * stale copy over the fresh one — after which every later read of that
+	 * block sees pre-write content, e.g. setxattr succeeding and the next
+	 * getxattr returning ENODATA.  Every other reader (stat, getxattr,
+	 * listxattr) already holds it this way; this path only took it for the
+	 * write-back peek above and dropped it again.
+	 *
+	 * Taken AFTER the wb flush above: that needs the lock exclusive, so
+	 * holding it shared across it would self-deadlock. */
+	ext4_meta_rlock();
 	long r = ext4_read_impl(f, buf, bytes);
+	ext4_meta_runlock();
 	ext4_iunlock_shared(ino);
 	return r;
 }

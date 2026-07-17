@@ -34,9 +34,7 @@ static uint32_t g_hpet_period_fs = 0;
 static volatile int g_hpet_available = 0;
 static volatile int g_tsc_precise_available = 0;
 static inline uint64_t rdtsc(void);
-static uint64_t g_tsc_cpu_base_us[MAX_CPUS] = { 0 };
-static uint64_t g_tsc_cpu_base_cycles[MAX_CPUS] = { 0 };
-static volatile uint8_t g_tsc_cpu_ready[MAX_CPUS] = { 0 };
+/* The TSC base is global, not per-CPU — see timer_get_precise_us(). */
 /* Seqlock to ensure g_total_us and g_pm_last are read consistently. */
 static volatile uint32_t g_tick_seq = 0;
 static uint32_t g_frequency = 100; // Default 100 Hz
@@ -493,37 +491,54 @@ uint64_t timer_get_ticks_at_cpu_tick(void)
  * BSP tick handler sums PM Timer deltas into g_total_us (real wall-clock µs).
  * Sub-tick interpolation adds the PM Timer delta since the last BSP tick.
  * Uses a seqlock so the (g_total_us, g_pm_last) pair is read consistently. */
+/* ONE base for every CPU — deliberately not per-CPU.
+ *
+ * This used to keep a separate (base_us, base_cycles) pair per CPU, each
+ * calibrated independently at whatever moment that CPU first read the clock.
+ * Two CPUs' clocks then disagreed by (TSC frequency error x the gap between
+ * their calibrations) — permanently, with nothing to reconcile them.  Since a
+ * task migrates freely, code that read the clock, slept, and read it again
+ * could sample two different clocks and get a meaningless difference: the
+ * "timer accuracy under load" test reported a 100ms sleep as 0ms because it
+ * started on one CPU and finished on another.  CLOCK_MONOTONIC must be
+ * monotonic across migration, and per-CPU bases cannot provide that.
+ *
+ * One base is correct here: this path only runs when g_tsc_precise_available,
+ * which is set solely from the hypervisor-reported TSC frequency (see
+ * timer_enable_reliable_tsc_precise_time -> lapic_tsc_is_reliable), i.e. only
+ * where the TSC is guaranteed invariant and synchronised across vCPUs.  Every
+ * other machine falls through to the HPET/PM-timer path below, which is
+ * already global.  It is also cheaper: no per-CPU lookup and no preempt
+ * disable, because there is no per-CPU state left to protect. */
+static uint64_t g_tsc_base_us = 0;
+static uint64_t g_tsc_base_cycles = 0;
+static volatile int g_tsc_base_ready = 0;
+static spinlock_t g_tsc_base_lock = SPINLOCK_INIT("tsc_base");
+
 uint64_t timer_get_precise_us(void)
 {
 	if (g_tsc_precise_available) {
-		uint64_t cycles;
-		uint32_t cpu_id;
-
-		percpu_preempt_disable();
-		cpu_id = this_cpu_id();
-
-		if (cpu_id < MAX_CPUS && !g_tsc_cpu_ready[cpu_id]) {
-			uint64_t t0 = rdtsc();
-			uint64_t base_us = timer_get_fallback_precise_us();
-			uint64_t t1 = rdtsc();
-			g_tsc_cpu_base_cycles[cpu_id] = t0 + ((t1 - t0) / 2);
-			g_tsc_cpu_base_us[cpu_id] = base_us;
-			__atomic_store_n(&g_tsc_cpu_ready[cpu_id], 1,
-					 __ATOMIC_RELEASE);
+		if (!__atomic_load_n(&g_tsc_base_ready, __ATOMIC_ACQUIRE)) {
+			/* Establish the single base once.  Under a lock so two
+			 * CPUs racing here cannot install different bases — the
+			 * very thing this replaced. */
+			uint64_t flags;
+			spin_lock_irqsave(&g_tsc_base_lock, &flags);
+			if (!g_tsc_base_ready) {
+				uint64_t t0 = rdtsc();
+				uint64_t base_us =
+					timer_get_fallback_precise_us();
+				uint64_t t1 = rdtsc();
+				g_tsc_base_cycles = t0 + ((t1 - t0) / 2);
+				g_tsc_base_us = base_us;
+				__atomic_store_n(&g_tsc_base_ready, 1,
+						 __ATOMIC_RELEASE);
+			}
+			spin_unlock_irqrestore(&g_tsc_base_lock, flags);
 		}
 
-		cycles = rdtsc();
-		if (cpu_id < MAX_CPUS &&
-		    __atomic_load_n(&g_tsc_cpu_ready[cpu_id],
-				    __ATOMIC_ACQUIRE)) {
-			uint64_t delta = cycles - g_tsc_cpu_base_cycles[cpu_id];
-			uint64_t value = g_tsc_cpu_base_us[cpu_id] +
-					 tsc_cycles_to_us(delta);
-			percpu_preempt_enable();
-			return value;
-		}
-
-		percpu_preempt_enable();
+		uint64_t delta = rdtsc() - g_tsc_base_cycles;
+		return g_tsc_base_us + tsc_cycles_to_us(delta);
 	}
 
 	return timer_get_fallback_precise_us();
