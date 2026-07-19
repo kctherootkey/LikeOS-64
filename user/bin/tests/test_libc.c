@@ -302,27 +302,13 @@ static void run_tcp_large_transfer_case(const char *prefix, uint32_t bind_ip,
 			}
 			_exit(1);
 		} else if (pid > 0) {
-			/* Watchdog: if accept() hangs, dump the kernel's TCP /
-			 * AF_UNIX / PTY / task tables at 15s so the stuck state is
-			 * captured automatically (the connection is still mid-
-			 * handshake then, unlike after the 30s timeout when it has
-			 * been torn down).  Killed as soon as accept() returns, so
-			 * on the normal fast path it never dumps.  debug_dump() is
-			 * root-only and a no-op for non-root. */
-			pid_t wd = fork();
-			if (wd == 0) {
-				struct timespec w = { 15, 0 };
-				nanosleep(&w, NULL);
-				debug_dump();
-				_exit(0);
-			}
-
+			/* Plain accept() — no watchdog fork here.  A fork()
+			 * immediately before accept() perturbs pid allocation and
+			 * scheduling right as the handshake completes, which masks
+			 * the rare accept race (it stopped reproducing once the
+			 * watchdog was added).  The kernel-side invariant WARNs now
+			 * catch a stuck/timed-out accept at its source. */
 			int conn_fd = accept(server_fd, NULL, NULL);
-
-			if (wd > 0) {
-				kill(wd, SIGKILL);
-				waitpid(wd, NULL, 0);
-			}
 			snprintf(label, sizeof(label), "%s: accept", prefix);
 			test_result(label, conn_fd >= 0);
 
@@ -9943,7 +9929,19 @@ tls_loopback_done:;
 				_exit(6);
 			}
 			p_SSL_set_fd(ssl, e_conn);
-			if (p_SSL_accept(ssl) != 1) {
+			int e_acc = p_SSL_accept(ssl);
+			if (e_acc != 1) {
+				int e_ae = p_SSL_get_error ?
+						   p_SSL_get_error(ssl, e_acc) :
+						   -1;
+				unsigned long e_er =
+					p_ERR_get_error ? p_ERR_get_error() : 0;
+				char e_eb[128];
+				e_eb[0] = 0;
+				if (e_er && p_ERR_error_string)
+					p_ERR_error_string(e_er, e_eb);
+				printf("  [DBG] TLS eth0 srv: SSL_accept=%d err=%d errno=%d reason=%s\n",
+				       e_acc, e_ae, errno, e_eb);
 				p_SSL_free(ssl);
 				p_SSL_CTX_free(sctx);
 				close(e_conn);
@@ -10127,13 +10125,25 @@ tls_loopback_done:;
 												ssl,
 												last_rcv_n) :
 											-1;
+									unsigned long c_er =
+										p_ERR_get_error ?
+											p_ERR_get_error() :
+											0;
+									char c_eb[128];
+									c_eb[0] = 0;
+									if (c_er &&
+									    p_ERR_error_string)
+										p_ERR_error_string(
+											c_er,
+											c_eb);
 									printf("  [DBG] TLS eth0 cli: got %d/%d bytes,"
-									       " last_n=%d ssl_err=%d errno=%d\n",
+									       " last_n=%d ssl_err=%d errno=%d reason=%s\n",
 									       rcv,
 									       ETH0_DATA_LEN,
 									       last_rcv_n,
 									       ssl_err,
-									       errno);
+									       errno,
+									       c_eb);
 								}
 								test_result(
 									"TLS eth0: recv 8 KB echo",

@@ -67,9 +67,16 @@ static inline void tcp_lock_release(spinlock_t *lock, uint64_t flags)
 // handler invocations on at least one CPU, so IPIs can be serviced) by
 // tcp_reap_pending(), which calls tcp_free_conn → slab_free safely.
 static tcp_conn_t *tcp_pending_free[TCP_MAX_CONNECTIONS];
+/* Generation of each queued conn, captured at defer time.  The drain frees
+ * gen-validated: an entry that is dequeued-but-not-yet-freed can be re-deferred
+ * by the reaper (the idempotency scan sees it already gone from the queue),
+ * then the first free releases the slot, tcp_alloc_conn recycles it into a NEW
+ * live conn, and the stale re-queued entry would free THAT live conn.  gen
+ * mismatch makes the stale free a no-op. */
+static uint32_t tcp_pending_free_gen[TCP_MAX_CONNECTIONS];
 static uint32_t tcp_pending_free_count = 0;
 static spinlock_t tcp_pending_free_lock = SPINLOCK_INIT("tcp_pf");
-static void tcp_free_conn(tcp_conn_t *conn); // forward
+static void tcp_free_conn_gen(tcp_conn_t *conn, uint32_t gen); // forward
 
 // Push a conn onto the deferred-free queue.  IRQ-safe (uses spinlock; the
 // critical section is just an array append so it is bounded and very
@@ -89,6 +96,9 @@ static void tcp_defer_free(tcp_conn_t *conn)
 		}
 	}
 	if (!already && tcp_pending_free_count < TCP_MAX_CONNECTIONS) {
+		/* Capture identity so a slot recycled between defer and drain is
+		 * not clobbered (see tcp_pending_free_gen). */
+		tcp_pending_free_gen[tcp_pending_free_count] = conn->gen;
 		tcp_pending_free[tcp_pending_free_count++] = conn;
 	}
 	spin_unlock_irqrestore(&tcp_pending_free_lock, flags);
@@ -119,15 +129,19 @@ void tcp_reap_pending(void)
 {
 	for (;;) {
 		tcp_conn_t *conn = NULL;
+		uint32_t gen = 0;
 		uint64_t flags;
 		spin_lock_irqsave(&tcp_pending_free_lock, &flags);
 		if (tcp_pending_free_count > 0) {
 			conn = tcp_pending_free[--tcp_pending_free_count];
+			gen = tcp_pending_free_gen[tcp_pending_free_count];
 		}
 		spin_unlock_irqrestore(&tcp_pending_free_lock, flags);
 		if (!conn)
 			break;
-		tcp_free_conn(conn); // safe outside the pending-free lock
+		/* Gen-validated: refuses to free a slot recycled into a live conn
+		 * since this entry was queued (the dequeue-then-re-defer race). */
+		tcp_free_conn_gen(conn, gen); // safe outside the pending-free lock
 	}
 }
 
@@ -466,7 +480,16 @@ static uint16_t tcp_advertised_window(tcp_conn_t *conn)
 		ring_free(conn->rx_head, conn->rx_tail, conn->rx_buf_size);
 	if (avail == 0)
 		return 0;
-	uint32_t shifted = avail >> conn->rcv_wscale;
+	// Only apply the receive window scale when window scaling was actually
+	// negotiated — mirror the send side, which gates the snd_wscale shift on
+	// ws_enabled (see the ESTABLISHED inbound-window handling).  A conn that
+	// never negotiated WS keeps the default rcv_wscale=7 from tcp_alloc_conn;
+	// the stateless SYN-cookie path in particular leaves rcv_wscale=7 while
+	// ws_enabled=0.  Shifting by it would advertise a 128x-too-small window to
+	// a peer that reads the field unscaled, throttling that peer to ~1/128 of
+	// the real buffer (the receive-side sibling of the tcp_syn_window bug).
+	uint32_t shifted =
+		conn->ws_enabled ? (avail >> conn->rcv_wscale) : avail;
 	if (shifted > 0xFFFFu)
 		shifted = 0xFFFFu;
 	return (uint16_t)shifted;
@@ -1059,8 +1082,12 @@ static int tcp_reap_time_wait_slots(void)
 	int reaped = 0;
 	for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
 		tcp_conn_t *tw = &tcp_connections[i];
+		/* Snapshot gen BEFORE the state read; free is gen-validated so a
+		 * slot recycled into a live conn between here and the free is
+		 * never clobbered. */
+		uint32_t g = tw->gen;
 		if (tw->active && tw->state == TCP_STATE_TIME_WAIT) {
-			tcp_free_conn(tw);
+			tcp_free_conn_gen(tw, g);
 			reaped++;
 		}
 	}
@@ -1102,7 +1129,7 @@ static void tcp_detach_listener_children(tcp_conn_t *listener)
 //
 // Caller MUST NOT hold conn->lock.  Safe to call with or without
 // tcp_lock held.
-static void tcp_free_conn(tcp_conn_t *conn)
+static void tcp_free_conn_impl(tcp_conn_t *conn, int has_gen, uint32_t gen)
 {
 	uint64_t flags;
 	tcp_lock_acquire(&conn->lock, &flags);
@@ -1114,6 +1141,32 @@ static void tcp_free_conn(tcp_conn_t *conn)
 		tcp_lock_release(&conn->lock, flags);
 		return;
 	}
+	/* Generation guard for callers that selected this slot with a LOCK-FREE
+	 * state read (the TIME_WAIT recyclers below).  Between that read and
+	 * this lock the slot can be freed AND re-allocated by tcp_alloc_conn
+	 * into a completely different, LIVE connection — active is true again,
+	 * so the active-only check above would happily free that live conn
+	 * (observed: a client's ESTABLISHED conn freed mid-transfer → its peer's
+	 * data gets no-conn-RST'd → TLS 64 KB echo dies at 32 KB).  gen is
+	 * bumped on every tcp_alloc_conn, so a mismatch means "not the conn you
+	 * looked at" — refuse. */
+	if (has_gen && conn->gen != gen) {
+		WARN_RATELIMIT(
+			1,
+			"tcp_free_conn: slot recycled since TIME_WAIT check (gen %u != %u, state=%d) - stale free refused",
+			conn->gen, gen, conn->state);
+		tcp_lock_release(&conn->lock, flags);
+		return;
+	}
+	/* INVARIANT: a conn must not be freed while a socket still references it.
+	 * sock_close() clears owner_socket to NULL before calling tcp_close(), and
+	 * the timer reapers only free conns with owner_socket==NULL.  The self-
+	 * pointer sentinel (owner_socket==conn) means "allocated, not yet bound to
+	 * a socket" and is fine.  A REAL net_socket_t* here means sock_recv/send on
+	 * that socket will dereference this slot after we slab_free() its buffers
+	 * and tcp_alloc_conn recycles it — a use-after-free that surfaces as an
+	 * ECONNRESET / recv-timeout on a connection that "vanished" mid-flow. */
+	WARN_ON_ONCE(conn->owner_socket && conn->owner_socket != (void *)conn);
 	void *old_rx = conn->rx_buf;
 	void *old_tx = conn->tx_buf;
 	conn->rx_buf = NULL;
@@ -1138,6 +1191,17 @@ static void tcp_free_conn(tcp_conn_t *conn)
 		slab_free(old_rx);
 	if (old_tx)
 		slab_free(old_tx);
+}
+
+/* Gen-validated free — the ONLY way to free a conn.  `gen` must be the conn's
+ * generation captured when the caller selected it (under conn->lock, or via a
+ * lock-free read that this call re-validates).  Frees ONLY if the slot still
+ * holds that exact instance (gen match); a slot recycled since the caller
+ * looked is left untouched.  There is deliberately no non-gen free wrapper, so
+ * no future caller can free a recycled slot by accident. */
+static void tcp_free_conn_gen(tcp_conn_t *conn, uint32_t gen)
+{
+	tcp_free_conn_impl(conn, 1, gen);
 }
 
 // Find connection by 4-tuple
@@ -1413,11 +1477,14 @@ tcp_conn_t *tcp_connect(net_device_t *dev, uint32_t local_ip, uint32_t dst_ip,
 	// tcp_lock critical section across slab_free (TLB-shootdown deadlock).
 	for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
 		tcp_conn_t *tw = &tcp_connections[i];
-		// Lock-free pre-check; tcp_free_conn re-checks active under conn->lock.
+		/* Snapshot gen with the lock-free state read; the free is gen-
+		 * validated so a slot recycled into a live conn between the read
+		 * and the free (active true again) is NOT clobbered. */
+		uint32_t g = tw->gen;
 		if (tw->active && tw->state == TCP_STATE_TIME_WAIT &&
 		    tw->local_port == src_port && tw->remote_port == dst_port &&
 		    tw->local_ip == local_ip && tw->remote_ip == dst_ip) {
-			tcp_free_conn(tw);
+			tcp_free_conn_gen(tw, g);
 		}
 	}
 
@@ -1579,13 +1646,36 @@ tcp_conn_t *tcp_accept(tcp_conn_t *listener)
 			listener->accept_ready = 0;
 
 		tcp_conn_t *conn = e.conn;
-		if (!conn || conn->gen != e.gen)
+		/* These three skips silently CONSUME the queue entry.  Each one
+		 * means a child that completed its handshake (it was enqueued)
+		 * died or was recycled before accept() could claim it — if the
+		 * client is still alive and waiting, accept() then times out
+		 * with no trace (observed: TLS loopback accept ETIMEDOUT while
+		 * the client held an ESTABLISHED conn).  A client that RST'd
+		 * right after connecting also lands here, so rate-limited. */
+		if (!conn || conn->gen != e.gen) {
+			WARN_RATELIMIT(
+				conn != NULL,
+				"tcp_accept: queued child slot recycled (gen %u != %u) — entry discarded",
+				conn ? conn->gen : 0, e.gen);
 			continue; /* slot recycled: a different connection now */
-		if (!conn->active)
+		}
+		if (!conn->active) {
+			WARN_RATELIMIT(
+				1,
+				"tcp_accept: queued child :%u->:%u freed before accept — entry discarded",
+				conn->local_port, conn->remote_port);
 			continue; /* freed before we got to it */
+		}
 		if (conn->state != TCP_STATE_ESTABLISHED &&
-		    conn->state != TCP_STATE_CLOSE_WAIT)
+		    conn->state != TCP_STATE_CLOSE_WAIT) {
+			WARN_RATELIMIT(
+				1,
+				"tcp_accept: queued child :%u->:%u in state %d (err=%d) — entry discarded",
+				conn->local_port, conn->remote_port,
+				conn->state, conn->error);
 			continue; /* died between queueing and accept */
+		}
 
 		conn->parent = NULL;
 		tcp_lock_release(&listener->lock, flags);
@@ -1649,13 +1739,41 @@ tcp_conn_t *tcp_accept(tcp_conn_t *listener)
 // ============================================================================
 // TCP Close
 // ============================================================================
-int tcp_close(tcp_conn_t *conn)
+static int tcp_close_impl(tcp_conn_t *conn, int has_gen, uint32_t gen)
 {
 	if (!conn)
 		return -1;
 
 	uint64_t flags;
 	tcp_lock_acquire(&conn->lock, &flags);
+
+	/* Deferred-teardown identity check.  sock_close/sock_shutdown clear
+	 * owner_socket under s->lock and only THEN call here — and the moment
+	 * owner_socket is NULL, a conn that is already CLOSED (peer RST →
+	 * tcp_fail_connection keeps the slot for SO_ERROR) becomes reapable by
+	 * the 100Hz orphan reaper.  If the closing task is preempted in that
+	 * window, the slot can be freed AND recycled for a brand-new connection
+	 * before this runs; proceeding would then close/FIN the INNOCENT new
+	 * conn (observed: recycled accept-child driven to FIN_WAIT_1 →
+	 * accept() ETIMEDOUT; later freed with its new owner still attached →
+	 * the tcp_free_conn owner WARN).  The gen captured under s->lock while
+	 * owner_socket was still set settles identity exactly. */
+	if (has_gen && (!conn->active || conn->gen != gen)) {
+		WARN_RATELIMIT(
+			conn->active,
+			"tcp: deferred close hit recycled conn slot (gen %u != %u, state=%d) — stale close dropped",
+			conn->gen, gen, conn->state);
+		tcp_lock_release(&conn->lock, flags);
+		return -1;
+	}
+
+	/* Snapshot identity while we hold the lock.  The synchronous-free cases
+	 * below (LISTEN / SYN_SENT / already-CLOSED) set state=CLOSED, release
+	 * the lock, then free — but the moment state is CLOSED and owner_socket
+	 * is NULL the 100Hz reaper can grab the conn, defer it, and a drain can
+	 * free AND recycle the slot into a new live conn before our free runs.
+	 * Freeing gen-validated makes that stale free a no-op. */
+	uint32_t self_gen = conn->gen;
 
 	switch (conn->state) {
 	case TCP_STATE_ESTABLISHED:
@@ -1712,13 +1830,13 @@ int tcp_close(tcp_conn_t *conn)
 		spin_unlock_irqrestore(&tcp_lock, flags);
 
 		conn->state = TCP_STATE_CLOSED;
-		tcp_free_conn(conn);
+		tcp_free_conn_gen(conn, self_gen);
 		break;
 
 	case TCP_STATE_SYN_SENT:
 		conn->state = TCP_STATE_CLOSED;
 		tcp_lock_release(&conn->lock, flags);
-		tcp_free_conn(conn);
+		tcp_free_conn_gen(conn, self_gen);
 		break;
 
 	case TCP_STATE_CLOSED:
@@ -1731,7 +1849,7 @@ int tcp_close(tcp_conn_t *conn)
 		// one slot until reboot, eventually exhausting
 		// TCP_MAX_CONNECTIONS and silently dropping further SYNs.
 		tcp_lock_release(&conn->lock, flags);
-		tcp_free_conn(conn);
+		tcp_free_conn_gen(conn, self_gen);
 		break;
 
 	default:
@@ -1750,6 +1868,20 @@ int tcp_close(tcp_conn_t *conn)
 	// We are in process context (a syscall) — slab_free is safe here.
 	tcp_reap_pending();
 	return 0;
+}
+
+int tcp_close(tcp_conn_t *conn)
+{
+	return tcp_close_impl(conn, 0, 0);
+}
+
+/* Gen-validated close for DEFERRED teardown (sock_close/sock_shutdown call
+ * this after dropping s->lock).  `gen` must be captured under s->lock while
+ * owner_socket was still set (the conn cannot be reaped while owned).  Returns
+ * -1 without touching the conn if the slot was freed/recycled in between. */
+int tcp_close_gen(tcp_conn_t *conn, uint32_t gen)
+{
+	return tcp_close_impl(conn, 1, gen);
 }
 
 // ============================================================================
@@ -1931,10 +2063,16 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 	// the SYN is processed as a brand-new connection.
 	WARN_ON(conn &&
 		!conn->active); /* tcp_find_conn returned a non-active slot — race with tcp_free_conn */
-	if (conn && conn->state == TCP_STATE_TIME_WAIT &&
-	    (tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK)) {
-		tcp_free_conn(conn);
-		conn = NULL;
+	/* Same lock-free-select→free hazard as the TIME_WAIT recyclers: the
+	 * top-of-tcp_rx tcp_find_conn is lock-free, so between it and the free
+	 * this TIME_WAIT slot can be recycled into a live conn.  Gen-validate. */
+	if (conn) {
+		uint32_t g = conn->gen;
+		if (conn->state == TCP_STATE_TIME_WAIT && (tcp_flags & TCP_SYN) &&
+		    !(tcp_flags & TCP_ACK)) {
+			tcp_free_conn_gen(conn, g);
+			conn = NULL;
+		}
 	}
 
 	if (!conn) {
@@ -2243,7 +2381,48 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 			}
 		}
 
-		// No connection and no listener - send RST
+		// No connection - send RST (RFC 793: a segment to a nonexistent
+		// connection elicits an RST so the peer stops).
+		//
+		// DIAGNOSTIC: a data/ACK segment (already-handshaken traffic)
+		// that finds NO conn, while its PEER — the reverse 4-tuple, i.e.
+		// the sender's own end of a loopback/self flow — is still a LIVE
+		// conn, means one side of an active connection was freed/recycled
+		// out from under a transfer that was mid-flight.  The RST we send
+		// here then loops back and aborts that live peer (observed: TLS
+		// 64 KB echo giving the client 32 KB then ETIMEDOUT; the in-window
+		// RST is caught at the ESTABLISHED RST-received WARN).  This fires
+		// ONLY on that premature-free signature — a genuinely stale
+		// segment (peer also gone) does not warn, and a bare SYN is a
+		// normal new-connection probe.  Lock-free peer peek: read-only,
+		// diagnostic; a torn read at worst mislabels one rare warning.
+		if ((tcp_flags & TCP_ACK) && !(tcp_flags & (TCP_SYN | TCP_RST))) {
+			/* The PEER is the reverse 4-tuple: the sender's OWN end of
+			 * the flow (local=this segment's SOURCE, remote=its
+			 * DEST).  The gone conn (local=dst_port) is by definition
+			 * not found; the peer is the one that should still be
+			 * live if this is a mid-transfer premature free. */
+			int peer_state = -1;
+			for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
+				tcp_conn_t *pc = &tcp_connections[i];
+				if (pc->active && pc->local_port == src_port &&
+				    pc->remote_port == dst_port &&
+				    pc->local_ip == src_ip &&
+				    pc->remote_ip == local_ip) {
+					peer_state = pc->state;
+					break;
+				}
+			}
+			WARN_RATELIMIT(
+				peer_state == TCP_STATE_ESTABLISHED ||
+					peer_state == TCP_STATE_FIN_WAIT_1 ||
+					peer_state == TCP_STATE_CLOSE_WAIT,
+				"tcp_rx: RST'ing seg (seq=%u len=%u) to GONE conn "
+				":%u->:%u whose peer :%u->:%u is ALIVE (state=%d) "
+				"- a live flow's endpoint was freed mid-transfer",
+				seq, payload_len, src_port, dst_port, dst_port,
+				src_port, peer_state);
+		}
 		if (!(tcp_flags & TCP_RST)) {
 			if (tcp_flags & TCP_ACK) {
 				tcp_send_rst(dev, local_ip, src_ip, dst_port,
@@ -2428,10 +2607,38 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 								conn->gen;
 							p->accept_tail = next;
 							p->accept_ready = 1;
+						} else {
+							/* accept_queue (16 slots)
+							 * full: the just-established
+							 * child cannot be published
+							 * to accept().  It keeps its
+							 * parent link so orphan
+							 * recovery may still find it,
+							 * but a blocking accept() can
+							 * miss it and time out. */
+							WARN_RATELIMIT(
+								1,
+								"tcp: accept queue full on listener :%u (backlog=%d) - established child :%u not enqueued",
+								p->local_port,
+								p->backlog,
+								conn->remote_port);
 						}
 						spin_unlock_irqrestore(&p->lock,
 								       pflags);
 					} else {
+						/* Parent is no longer a LISTEN conn
+						 * on our port — it was closed and
+						 * the slot recycled (TIME_WAIT churn)
+						 * between tcp_find_listener and here.
+						 * The child is orphaned and only
+						 * reachable via tcp_accept's 4-tuple
+						 * fallback; if that misses it,
+						 * accept() times out. */
+						WARN_RATELIMIT(
+							1,
+							"tcp: listener for established child :%u->:%u recycled before enqueue - relying on orphan recovery",
+							conn->local_port,
+							conn->remote_port);
 						spin_unlock_irqrestore(&p->lock,
 								       pflags);
 						conn->parent = NULL;
@@ -2440,9 +2647,14 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 			}
 		}
 		if (tcp_flags & TCP_RST) {
+			/* Safe today (SYN_RECEIVED child's owner_socket is the
+			 * self-sentinel, so the reaper won't free it in the
+			 * release→free window) but gen-validated for uniformity /
+			 * future-proofing against that assumption changing. */
+			uint32_t g = conn->gen;
 			conn->state = TCP_STATE_CLOSED;
 			tcp_lock_release(&conn->lock, flags);
-			tcp_free_conn(conn);
+			tcp_free_conn_gen(conn, g);
 			return;
 		}
 		/* RFC 793 p.72 (SYN-RECEIVED, acceptable ACK): "enter ESTABLISHED
@@ -2470,6 +2682,19 @@ established_segment:
 			    (int32_t)(seq - (conn->rcv_nxt + conn->rcv_wnd)) >
 				    0)
 				break; // out-of-window RST, silently drop
+			/* INVARIANT-ish: a valid RST is legitimate TCP, but one
+			 * that aborts an ESTABLISHED conn with data still in
+			 * flight or buffered means a transfer was reset mid-
+			 * stream and bytes are lost.  On a self/loopback flow
+			 * (no real network) an in-window RST should essentially
+			 * never happen — surface it (rate-limited) so a spurious
+			 * reset behind a TLS ECONNRESET is diagnosable. */
+			WARN_RATELIMIT(conn->inflight_count > 0 || conn->rx_ready,
+				       "tcp_rx: in-window RST aborted ESTABLISHED "
+				       ":%u->:%u mid-transfer (inflight=%u "
+				       "rx_ready=%d) - data lost",
+				       conn->local_port, conn->remote_port,
+				       conn->inflight_count, conn->rx_ready);
 			tcp_fail_connection(conn, ECONNRESET);
 			break;
 		}
@@ -2990,9 +3215,13 @@ established_segment:
 				conn->dup_acks = 0;
 			}
 			if (ack == conn->snd_nxt) {
+				/* gen-validate: after we release the lock the
+				 * reaper can defer+drain+recycle this slot before
+				 * our free runs (it's CLOSED + owner-detached). */
+				uint32_t g = conn->gen;
 				conn->state = TCP_STATE_CLOSED;
 				tcp_lock_release(&conn->lock, flags);
-				tcp_free_conn(conn);
+				tcp_free_conn_gen(conn, g);
 				return;
 			}
 		}
@@ -3217,6 +3446,19 @@ void tcp_timer_tick(void)
 			if (conn->retransmit_count >= TCP_MAX_RETRANSMITS ||
 			    (conn->handshake_deadline &&
 			     now >= conn->handshake_deadline)) {
+				/* A half-open server conn whose 3-way handshake
+				 * never completed: the client's ACK never arrived
+				 * (or its SYN-ACK never reached the client) before
+				 * the deadline.  The child never reached the accept
+				 * queue, so a blocking accept() on this listener
+				 * times out (errno ETIMEDOUT) — exactly the "tcp
+				 * eth0: accept" failure.  Rate-limited so a real SYN
+				 * flood can't spam. */
+				WARN_RATELIMIT(
+					1,
+					"tcp: SYN_RECEIVED :%u->:%u dropped after handshake timeout (retx=%u) - accept() will time out",
+					conn->local_port, conn->remote_port,
+					conn->retransmit_count);
 				conn->state = TCP_STATE_CLOSED;
 				do_free = 1;
 				goto unlock_conn;
@@ -3606,12 +3848,23 @@ void tcp_handle_pmtu(uint32_t local_ip, uint16_t local_port, uint32_t remote_ip,
 
 // RFC 793 §3.5 abort: send RST and tear down connection immediately.
 // Used by SO_LINGER l_onoff=1 l_linger=0.
-void tcp_abort(tcp_conn_t *conn)
+static void tcp_abort_impl(tcp_conn_t *conn, int has_gen, uint32_t gen)
 {
 	if (!conn)
 		return;
 	uint64_t flags;
 	tcp_lock_acquire(&conn->lock, &flags);
+	/* Same recycled-slot identity check as tcp_close_impl — aborting a
+	 * recycled conn would RST and FREE an innocent new connection. */
+	if (has_gen && (!conn->active || conn->gen != gen)) {
+		WARN_RATELIMIT(
+			conn->active,
+			"tcp: deferred abort hit recycled conn slot (gen %u != %u, state=%d) — stale abort dropped",
+			conn->gen, gen, conn->state);
+		tcp_lock_release(&conn->lock, flags);
+		return;
+	}
+	uint32_t self_gen = conn->gen; /* free gen-validated (see tcp_close_impl) */
 	if (conn->state != TCP_STATE_CLOSED && conn->dev) {
 		tcp_send_rst(conn->dev, conn->local_ip, conn->remote_ip,
 			     conn->local_port, conn->remote_port, conn->snd_nxt,
@@ -3619,5 +3872,16 @@ void tcp_abort(tcp_conn_t *conn)
 	}
 	conn->state = TCP_STATE_CLOSED;
 	tcp_lock_release(&conn->lock, flags);
-	tcp_free_conn(conn);
+	tcp_free_conn_gen(conn, self_gen);
+}
+
+void tcp_abort(tcp_conn_t *conn)
+{
+	tcp_abort_impl(conn, 0, 0);
+}
+
+/* Gen-validated abort for deferred teardown — see tcp_close_gen. */
+void tcp_abort_gen(tcp_conn_t *conn, uint32_t gen)
+{
+	tcp_abort_impl(conn, 1, gen);
 }

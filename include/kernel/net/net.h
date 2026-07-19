@@ -772,6 +772,13 @@ typedef struct net_socket {
 	// Socket options
 	int reuse_addr;
 	int reuse_port;
+	/* Effective UID of the process that bound this socket's local port.
+	 * Set at every bind (explicit or implicit ephemeral).  Gates
+	 * SO_REUSEPORT group membership: a second bind may share the port
+	 * only with the same euid (or a privileged caller) — otherwise any
+	 * user could join another user's reuseport group and hijack a share
+	 * of its incoming connections. */
+	uint32_t bind_euid;
 	int broadcast;
 	int oobinline;
 	int sndbuf_size;
@@ -929,6 +936,12 @@ tcp_conn_t *tcp_listen(net_device_t *dev, uint32_t local_ip,
 tcp_conn_t *tcp_accept(tcp_conn_t *listener);
 int tcp_close(tcp_conn_t *conn);
 void tcp_abort(tcp_conn_t *conn); // Send RST and free (SO_LINGER l_onoff=0)
+/* Gen-validated variants for DEFERRED teardown (caller captured conn->gen
+ * under s->lock while owner_socket was still set): no-ops with a warning if
+ * the slot was freed/recycled in between, so a stale close/abort can never
+ * tear down an innocent recycled connection. */
+int tcp_close_gen(tcp_conn_t *conn, uint32_t gen);
+void tcp_abort_gen(tcp_conn_t *conn, uint32_t gen);
 void tcp_send_window_update(tcp_conn_t *conn); // Proactive ACK after RX drain
 void tcp_timer_tick(void);
 void tcp_reap_pending(void);

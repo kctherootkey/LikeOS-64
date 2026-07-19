@@ -551,16 +551,31 @@ unsigned long icache_chain_get(unsigned long start_cluster, unsigned long idx,
 		return cur;
 	}
 
-	// Fast path: already populated
+	// The fast path (array read) and the slow path (ic_chain_extend, which
+	// reallocs and kfree()s the old array) both touch inode->chain /
+	// chain_len / chain_cap.  The pagecache read path reaches here holding the
+	// filesystem metadata lock only SHARED (sb->ops->lock_map), so two
+	// concurrent readers of the SAME inode race the array: a use-after-free of
+	// the reallocated array, or two interleaved appends that skip/duplicate an
+	// entry — either way a corrupt block map that later misdirects a
+	// write-back to the wrong LBA.  (This became reachable when the mapping
+	// phase moved from the exclusive I/O lock to the shared map lock.)
+	//
+	// Serialize per-inode with the sleeping per-inode I/O mutex: it is safe to
+	// hold across ic_chain_extend's sleeping next_block()/kfree(), and readers
+	// of DIFFERENT inodes never contend.  Chain teardown (icache_chain_invalidate,
+	// eviction) runs only under the metadata lock held EXCLUSIVE, which excludes
+	// every shared reader, so it needs no additional guard.
+	icache_io_lock(inode);
+	unsigned long result;
 	if (idx < inode->chain_len)
-		return inode->chain[idx];
-
-	// Slow path: extend the chain.  Caller is expected to hold the FS-wide
-	// I/O lock; ic_chain_extend only reads through sb ops.
-	if (!ic_chain_extend(inode, idx, sb))
-		return 0;
-
-	return inode->chain[idx];
+		result = inode->chain[idx]; // fast path: already populated
+	else if (ic_chain_extend(inode, idx, sb))
+		result = inode->chain[idx];
+	else
+		result = 0;
+	icache_io_unlock(inode);
+	return result;
 }
 
 void icache_chain_invalidate(unsigned long start_cluster)

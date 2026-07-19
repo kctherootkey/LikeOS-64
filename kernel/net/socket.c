@@ -12,6 +12,7 @@
 #include <kernel/io/tty.h>
 #include <kernel/dev/rand/random.h>
 #include <kernel/ke/sched.h>
+#include <kernel/ke/cred.h>
 #include <kernel/uapi/bug.h>
 
 // Socket table
@@ -187,12 +188,58 @@ int sock_bind(int sockfd, const struct sockaddr_in *addr)
 		spin_unlock_irqrestore(&socket_lock, gflags);
 	}
 
+	/* TCP: reject a bind that conflicts with an existing ACTIVE TCP socket on
+	 * the same port with an overlapping local address.  POSIX/BSD: only
+	 * SO_REUSEPORT (set on BOTH sockets) permits two live sockets to share a
+	 * port; SO_REUSEADDR alone only permits reusing a port whose old
+	 * connection is gone (TIME_WAIT, handled separately in the SYN path), NOT
+	 * two concurrent listeners.  Without this check two processes that pick
+	 * the same port (e.g. per-pid test ports that collide) both bind
+	 * INADDR_ANY:port successfully, and tcp_find_listener then distributes
+	 * SYNs across the two unrelated listeners — silently cross-wiring their
+	 * connections. */
+	if (addr->sin_port != 0 && s->type == SOCK_STREAM) {
+		uint32_t bind_ip = net_ntohl(addr->sin_addr.s_addr);
+		uint64_t gflags;
+		spin_lock_irqsave(&socket_lock, &gflags);
+		for (int i = 0; i < NET_MAX_SOCKETS; i++) {
+			net_socket_t *o = &sockets[i];
+			if (i == sockfd || !o->active || !o->bound ||
+			    o->type != SOCK_STREAM)
+				continue;
+			if (o->local_addr.sin_port != addr->sin_port)
+				continue;
+			/* Addresses conflict when equal or either is the
+			 * wildcard 0.0.0.0. */
+			uint32_t o_ip =
+				net_ntohl(o->local_addr.sin_addr.s_addr);
+			if (bind_ip != o_ip && bind_ip != 0 && o_ip != 0)
+				continue;
+			/* Both explicitly opted into SO_REUSEPORT → allowed,
+			 * but only within one user's group (Linux semantics):
+			 * the joining bind must have the same effective UID as
+			 * the socket already holding the port, unless the
+			 * caller is privileged.  Without this, any user could
+			 * join another user's reuseport group and hijack a
+			 * share of its incoming connections.  The exception is
+			 * on the CALLER only: an unprivileged user cannot join
+			 * root's group, but root can join anyone's. */
+			if (s->reuse_port && o->reuse_port &&
+			    (capable() || current_euid() == o->bind_euid))
+				continue;
+			spin_unlock_irqrestore(&socket_lock, gflags);
+			return -EADDRINUSE;
+		}
+		spin_unlock_irqrestore(&socket_lock, gflags);
+	}
+
 	uint64_t flags;
 	spin_lock_irqsave(&s->lock, &flags);
 	s->local_addr = *addr;
 	if (s->local_addr.sin_port == 0) {
 		s->local_addr.sin_port = net_htons(alloc_ephemeral_port());
 	}
+	s->bind_euid = current_euid();
 	s->bound = 1;
 	spin_unlock_irqrestore(&s->lock, flags);
 
@@ -285,6 +332,7 @@ int sock_accept(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen)
 			TCP_STATE_CLOSE_WAIT); /* accepted connection in unexpected state: must be ESTABLISHED or CLOSE_WAIT */
 	new_conn->owner_socket = ns;
 	ns->connected = 1;
+	ns->bind_euid = current_euid();
 	ns->bound = 1;
 	ns->local_addr.sin_family = AF_INET;
 	ns->local_addr.sin_port = net_htons(new_conn->local_port);
@@ -329,6 +377,7 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 		s->local_addr.sin_port = net_htons(alloc_ephemeral_port());
 		s->local_addr.sin_addr.s_addr = net_htonl(dev->ip_addr);
 		s->local_addr.sin_family = AF_INET;
+		s->bind_euid = current_euid();
 		s->bound = 1;
 	}
 
@@ -375,9 +424,13 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 
 	if (conn->error) {
 		int err = conn->error;
+		/* Gen before owner-clear: the conn is CLOSED (fail path), so it
+		 * becomes reapable the instant owner_socket is NULL — the same
+		 * deferred-teardown recycle race as sock_close. */
+		uint32_t g = conn->gen;
 		conn->owner_socket = NULL;
-		tcp_close(conn);
 		s->tcp = NULL;
+		tcp_close_gen(conn, g);
 		return -err;
 	}
 
@@ -398,8 +451,10 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 			(dst_ip >> 8) & 0xff, dst_ip & 0xff, dst_port, conn->state,
 			conn->remote_port, conn->owner_socket == s);
 		if (conn->owner_socket == s) {
+			/* Same gen-before-owner-clear as above. */
+			uint32_t g = conn->gen;
 			conn->owner_socket = NULL;
-			tcp_close(conn);
+			tcp_close_gen(conn, g);
 		}
 		s->tcp = NULL;
 		return -ECONNREFUSED;
@@ -518,6 +573,7 @@ int sock_sendto(int sockfd, const void *buf, size_t len, int flags,
 			s->local_addr.sin_port =
 				net_htons(alloc_ephemeral_port());
 			s->local_addr.sin_addr.s_addr = net_htonl(dev->ip_addr);
+			s->bind_euid = current_euid();
 			s->bound = 1;
 		}
 
@@ -961,7 +1017,19 @@ int sock_close(int sockfd)
 	uint8_t do_linger_block = 0;
 	uint16_t linger_secs = 0;
 	uint8_t use_abort = 0;
+	uint32_t teardown_gen = 0;
 	if (tcp_to_teardown) {
+		/* Capture the conn's generation NOW — under s->lock and BEFORE
+		 * owner_socket is cleared below, the conn cannot be reaped, so
+		 * this gen is authoritative.  The deferred tcp_close/tcp_abort
+		 * after the lock drop validates against it: once owner_socket
+		 * goes NULL, an already-CLOSED conn (peer RST kept for
+		 * SO_ERROR) is instantly reapable, and if we are preempted the
+		 * slot can be recycled for a NEW connection before our close
+		 * runs — closing by raw pointer would then FIN/RST the
+		 * innocent new conn (observed: accept-child hijacked into
+		 * FIN_WAIT_1 → accept() ETIMEDOUT; tcp_free_conn owner WARN). */
+		teardown_gen = tcp_to_teardown->gen;
 		if (s->linger_onoff && s->linger_seconds == 0) {
 			use_abort = 1;
 		} else if (s->linger_onoff && s->linger_seconds > 0) {
@@ -991,13 +1059,19 @@ int sock_close(int sockfd)
 	if (tcp_to_teardown) {
 		if (use_abort) {
 			// SO_LINGER l_onoff=1, l_linger=0 → RST (RFC 1122 §4.2.2.13)
-			tcp_abort(tcp_to_teardown);
+			tcp_abort_gen(tcp_to_teardown, teardown_gen);
 		} else {
-			tcp_close(tcp_to_teardown);
-			if (do_linger_block) {
+			int closed_live =
+				tcp_close_gen(tcp_to_teardown, teardown_gen);
+			if (do_linger_block && closed_live == 0) {
 				uint64_t deadline = timer_ticks() +
 						    (uint64_t)linger_secs * 100;
-				while (tcp_to_teardown->state !=
+				/* gen re-check each iteration: the conn can be
+				 * freed+recycled while we poll (slots are a
+				 * static array, so the deref is memory-safe;
+				 * a gen change means OUR conn is gone). */
+				while (tcp_to_teardown->gen == teardown_gen &&
+				       tcp_to_teardown->state !=
 					       TCP_STATE_CLOSED &&
 				       tcp_to_teardown->state !=
 					       TCP_STATE_TIME_WAIT &&
@@ -1024,11 +1098,14 @@ int sock_shutdown(int sockfd, int how)
 
 	if (s->type == SOCK_STREAM && s->tcp) {
 		tcp_conn_t *c = s->tcp;
+		/* Capture gen BEFORE clearing owner_socket — same deferred-
+		 * teardown recycle race as sock_close (see comment there). */
+		uint32_t gen = c->gen;
 		c->owner_socket = NULL;
-		tcp_close(c);
 		s->tcp = NULL;
 		s->connected = 0;
 		s->listening = 0;
+		tcp_close_gen(c, gen);
 	}
 
 	return 0;
@@ -1557,6 +1634,7 @@ int sock_socketpair(int domain, int type, int protocol, int sv[2])
 	s0->remote_addr.sin_family = AF_INET;
 	s0->remote_addr.sin_port = net_htons(port1);
 	s0->remote_addr.sin_addr.s_addr = net_htonl(0x7F000001);
+	s0->bind_euid = current_euid();
 	s0->bound = 1;
 	s0->connected = 1;
 
@@ -1566,6 +1644,7 @@ int sock_socketpair(int domain, int type, int protocol, int sv[2])
 	s1->remote_addr.sin_family = AF_INET;
 	s1->remote_addr.sin_port = net_htons(port0);
 	s1->remote_addr.sin_addr.s_addr = net_htonl(0x7F000001);
+	s1->bind_euid = current_euid();
 	s1->bound = 1;
 	s1->connected = 1;
 

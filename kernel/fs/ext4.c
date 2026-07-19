@@ -867,6 +867,20 @@ static ext4_rwsem_t s_ilock[EXT4_ILOCKS];
 #define EXT4_BGLOCKS 32
 static ext4_rwsem_t s_bglock[EXT4_BGLOCKS];
 
+/* Serializes the function-scope STATIC xattr parse scratch lists in
+ * ext4_xattr_get_ino / ext4_xattr_list_ino.  Those lists are static because
+ * ext4_xa_list is ~8.6 KB — far too big for the 16 KB kernel stack — which was
+ * safe under the old global ext4 mutex but NOT under the fine-grained locking:
+ * getxattr/listxattr are read ops holding s_meta only SHARED, so two
+ * concurrent ACL/xattr reads parsed into and freed the SAME static list —
+ * double-free of the value buffers (SLAB "Double free ... size=32" via
+ * ext4_xa_list_free) plus wrong xattr bytes returned to one caller (ACL grant
+ * "vanishing" with a clean on-disk fs).  Sleeping lock, NOT a spinlock:
+ * ext4_xa_list_free → kfree can TLB-shootdown.  Order: s_meta → s_xa_scratch,
+ * never the reverse.  setxattr's static lists need no lock — mutators hold
+ * s_meta EXCLUSIVE, which already excludes readers and each other. */
+static ext4_rwsem_t s_xa_scratch = EXT4_RWSEM_INIT("ext4_xa");
+
 static int s_locks_ready; /* set once the tables are initialised */
 
 static void ext4_rwsem_init(ext4_rwsem_t *sem, const char *name)
@@ -1125,11 +1139,12 @@ static void ext4_mbc_mark_verified(unsigned long pbn)
 {
 	uint64_t flags;
 	spin_lock_irqsave(&s_mbc_lock, &flags);
+	/* All matches, not just the first — symmetric with ext4_mbc_drop, so a
+	 * duplicate entry (should no longer exist; insert dedupes) can never
+	 * diverge in verified-state from the copy lookups serve. */
 	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
-		if (s_mbc[i].pbn == pbn) {
+		if (s_mbc[i].pbn == pbn)
 			s_mbc[i].verified = 1;
-			break;
-		}
 	spin_unlock_irqrestore(&s_mbc_lock, flags);
 }
 
@@ -1188,6 +1203,37 @@ static void ext4_mbc_insert(ext4_fs_t *fs, unsigned long pbn, const void *buf,
 {
 	uint64_t flags;
 	spin_lock_irqsave(&s_mbc_lock, &flags);
+	/* DEDUPE — never create a second entry for the same pbn.  Two
+	 * shared-mode readers (fine-grained locking allows concurrent readers)
+	 * can both miss the same block, both sit in the sleeping disk read, and
+	 * both arrive here.  Blind slot assignment then caches the block TWICE.
+	 * Duplicates are fatal in slow motion: lookup and the write-side refresh
+	 * in ext4_write_block_direct touch only the FIRST match, so the second
+	 * copy keeps its old content; once round-robin reuse evicts the first
+	 * (fresh) copy, the stale duplicate becomes authoritative, and the next
+	 * inode/bitmap RMW through it durably REVERTS every update made since
+	 * the duplicate was created (observed: /tmp htree leaf loss + ~78 lost
+	 * links_count increments + lost bitmap bits, e2fsck).  Update the
+	 * existing entry in place instead.
+	 *
+	 * INVARIANT: both racing readers read the same disk content (anything
+	 * newer lives in s_txn/s_ckpt, checked before the mbc; mutators hold
+	 * the meta lock exclusive), so an existing entry MUST equal what we
+	 * just read.  A mismatch means a stale/incoherent cached metadata
+	 * block — the corruption, caught at the moment it exists. */
+	for (int i = 0; i < EXT4_MBC_ENTRIES; i++) {
+		if (s_mbc[i].pbn == pbn && s_mbc[i].data) {
+			WARN_RATELIMIT(
+				ext4_memcmp(s_mbc[i].data, buf,
+					    fs->block_size) != 0,
+				"ext4 mbc: cached pbn %lu differs from disk (stale metadata cache entry — corruption)",
+				pbn);
+			mm_memcpy(s_mbc[i].data, buf, fs->block_size);
+			s_mbc[i].verified = verified;
+			spin_unlock_irqrestore(&s_mbc_lock, flags);
+			return;
+		}
+	}
 	unsigned slot = s_mbc_next++ % EXT4_MBC_ENTRIES;
 	if (!s_mbc[slot].data) {
 		/* One-time buffer allocation for this slot.  kalloc's
@@ -1797,6 +1843,18 @@ static int ext4_sb_write_inode(vfs_superblock_t *sb, ic_inode_t *inode)
 	ext4_inode in;
 	int rc = -1;
 	if (ext4_read_inode_loc(fs, ino, &in, 0, 0) == ST_OK) {
+		/* INVARIANT: an ext4 directory's i_size only ever grows — entries
+		 * are tombstoned (rec_len merge), never removed, and dir blocks are
+		 * appended, never truncated.  Writing back a SMALLER i_size for a
+		 * directory reverts it, which is the corruption signature: a stale
+		 * inode-block RMW clobbered a concurrent dir-grow.  It shrinks the
+		 * block range ext4_dir_lookup linearly scans, so it misses the
+		 * just-added entry in the grown tail leaf (spurious ENOENT on
+		 * large/htree dirs).  Catch the revert at the moment it is written. */
+		WARN_RATELIMIT((in.i_mode & S_IFMT) == S_IFDIR &&
+				       (uint32_t)inode->size < in.i_size_lo,
+			       "ext4: dir ino %lu i_size reverting %u -> %u (stale inode-block RMW / corruption)",
+			       ino, in.i_size_lo, (uint32_t)inode->size);
 		in.i_size_lo = (uint32_t)inode->size;
 		if ((in.i_mode & S_IFMT) == S_IFREG)
 			in.i_size_high = (uint32_t)(inode->size >> 32);
@@ -2448,15 +2506,25 @@ static int ext4_write_block_direct(ext4_fs_t *fs, unsigned long pbn,
 	if (st != ST_OK)
 		return st;
 	{
+		/* Refresh EVERY cached copy, not just the first match (mirror of
+		 * ext4_mbc_drop).  Refreshing only the first left a duplicate
+		 * entry stale forever — the delayed-revert corruption (see the
+		 * dedupe comment in ext4_mbc_insert).  ext4_mbc_insert now
+		 * dedupes, so >1 match means duplicate creation slipped through
+		 * some path — surface it. */
+		int matches = 0;
 		uint64_t flags;
 		spin_lock_irqsave(&s_mbc_lock, &flags);
 		for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
 			if (s_mbc[i].pbn == pbn && s_mbc[i].data) {
 				mm_memcpy(s_mbc[i].data, buf, fs->block_size);
 				s_mbc[i].verified = 0; /* content changed */
-				break;
+				matches++;
 			}
 		spin_unlock_irqrestore(&s_mbc_lock, flags);
+		WARN_ON_ONCE(
+			matches >
+			1); /* duplicate mbc entries for one pbn: insert dedup bypassed */
 	}
 	return ST_OK;
 }
@@ -2836,6 +2904,26 @@ static int ext4_write_inode_struct(ext4_fs_t *fs, unsigned long ino,
 	unsigned copy = fs->inode_size < sizeof(ext4_inode) ?
 				fs->inode_size :
 				sizeof(ext4_inode);
+	/* INVARIANT: a live directory's i_size only grows (dir blocks are
+	 * appended, never truncated; the only legitimate shrink writes are
+	 * deletions, which carry i_links_count==0 — rmdir/unlink/rename all
+	 * zero size and links in the same write).  Writing a SMALLER size for
+	 * a still-linked directory over a larger on-disk one means this RMW is
+	 * about to persist a stale inode image — the delayed-revert corruption
+	 * (lost htree leaves + lost links_count, e2fsck "bad block number" /
+	 * unconnected inodes).  Caught here because this is the generic path
+	 * every mkdir/link-count/extent update flows through. */
+	{
+		const ext4_inode *old = (const ext4_inode *)(buf + off);
+		WARN_RATELIMIT((old->i_mode & S_IFMT) == S_IFDIR &&
+				       (in->i_mode & S_IFMT) == S_IFDIR &&
+				       old->i_links_count != 0 &&
+				       in->i_links_count != 0 &&
+				       in->i_size_lo < old->i_size_lo,
+			       "ext4: live dir ino %lu i_size reverting %u -> %u (links %u -> %u): stale inode RMW",
+			       ino, old->i_size_lo, in->i_size_lo,
+			       old->i_links_count, in->i_links_count);
+	}
 	mm_memcpy(buf + off, in, copy);
 	ext4_inode_csum_set(fs, ino,
 			    buf + off); /* over the full on-disk inode */
@@ -4059,6 +4147,7 @@ static int ext4_xattr_get_ino(ext4_fs_t *fs, unsigned long ino, int index,
 					sizeof(ext4_xattr_ibody_header);
 				uint8_t *rend = bbuf + off + fs->inode_size;
 				static ext4_xa_list L;
+				ext4_rwsem_write_lock(&s_xa_scratch);
 				L.n = 0;
 				ext4_xa_parse(&L, ifirst, rend, ifirst);
 				int i = ext4_xa_find(&L, index, name, nlen);
@@ -4078,6 +4167,7 @@ static int ext4_xattr_get_ino(ext4_fs_t *fs, unsigned long ino, int index,
 					}
 				}
 				ext4_xa_list_free(&L);
+				ext4_rwsem_write_unlock(&s_xa_scratch);
 			}
 		}
 		ext4_bput(bbuf);
@@ -4105,6 +4195,7 @@ static int ext4_xattr_get_ino(ext4_fs_t *fs, unsigned long ino, int index,
 						in.i_file_acl_lo);
 				}
 				static ext4_xa_list LB;
+				ext4_rwsem_write_lock(&s_xa_scratch);
 				LB.n = 0;
 				ext4_xa_parse(&LB,
 					      xbuf + sizeof(ext4_xattr_header),
@@ -4125,6 +4216,7 @@ static int ext4_xattr_get_ino(ext4_fs_t *fs, unsigned long ino, int index,
 					}
 				}
 				ext4_xa_list_free(&LB);
+				ext4_rwsem_write_unlock(&s_xa_scratch);
 			}
 		}
 		ext4_bput(xbuf);
@@ -4188,6 +4280,7 @@ static int ext4_xattr_list_ino(ext4_fs_t *fs, unsigned long ino, char *buf,
 					region +
 					sizeof(ext4_xattr_ibody_header);
 				static ext4_xa_list L;
+				ext4_rwsem_write_lock(&s_xa_scratch);
 				L.n = 0;
 				ext4_xa_parse(&L, ifirst,
 					      bbuf + off + fs->inode_size,
@@ -4195,6 +4288,7 @@ static int ext4_xattr_list_ino(ext4_fs_t *fs, unsigned long ino, char *buf,
 				ext4_xa_emit_names(&L, buf, bufsz, &total,
 						   &erange);
 				ext4_xa_list_free(&L);
+				ext4_rwsem_write_unlock(&s_xa_scratch);
 			}
 		}
 		kfree(bbuf);
@@ -4216,6 +4310,7 @@ static int ext4_xattr_list_ino(ext4_fs_t *fs, unsigned long ino, char *buf,
 					return ST_IO;
 				}
 				static ext4_xa_list LB;
+				ext4_rwsem_write_lock(&s_xa_scratch);
 				LB.n = 0;
 				ext4_xa_parse(&LB,
 					      xbuf + sizeof(ext4_xattr_header),
@@ -4223,6 +4318,7 @@ static int ext4_xattr_list_ino(ext4_fs_t *fs, unsigned long ino, char *buf,
 				ext4_xa_emit_names(&LB, buf, bufsz, &total,
 						   &erange);
 				ext4_xa_list_free(&LB);
+				ext4_rwsem_write_unlock(&s_xa_scratch);
 			}
 		}
 		kfree(xbuf);
@@ -7792,8 +7888,11 @@ static void ext4_checkpoint(ext4_fs_t *fs)
 {
 	if (!fs || !fs->j_enabled || !fs->j_sb_buf || !s_epoch_open)
 		return;
+	int failed = 0;
 	for (unsigned i = 0; i < s_ckpt.n; i++) /* 1. pending -> final     */
-		ext4_write_block_direct(fs, s_ckpt.blk[i], s_ckpt.data[i]);
+		if (ext4_write_block_direct(fs, s_ckpt.blk[i], s_ckpt.data[i]) !=
+		    ST_OK)
+			failed = 1;
 	/* The superblock (free counts) rides the batch instead of being written on
      * every allocating op — it becomes durable here with the matching GDT/bitmaps,
      * so the on-disk super and group descriptors are always consistent at a flush
@@ -7823,8 +7922,29 @@ static void ext4_checkpoint(ext4_fs_t *fs)
 		fs->sb_copy.s_free_blocks_count_hi = (uint32_t)(fb >> 32);
 		fs->sb_copy.s_free_inodes_count = fi;
 	}
-	ext4_write_super(fs);
-	ext4_dev_sync(fs, "checkpoint-final"); /* finals durable BEFORE s_start=0 */
+	if (ext4_write_super(fs) != ST_OK)
+		failed = 1;
+	if (ext4_dev_sync(fs, "checkpoint-final") !=
+	    ST_OK) /* finals durable BEFORE s_start=0 */
+		failed = 1;
+
+	/* If ANY final write or its barrier failed, the on-disk final locations
+	 * are an incomplete image of this batch.  Emptying the log (s_start=0) and
+	 * dropping the in-memory batch here would be a SILENT, UNRECOVERABLE revert
+	 * of every block whose final write failed — e.g. a directory's inode-table
+	 * block reverts below its already-persisted grown extent tree / htree leaf,
+	 * which is exactly the "/tmp entry vanishes, extent past i_size" corruption.
+	 * Instead keep the committed transaction in the journal (so a later
+	 * checkpoint, or a mount-time replay, can complete it) and keep s_ckpt (so
+	 * read-your-writes still serves the fresh content and no reader observes the
+	 * half-written disk).  The next flush re-commits the batch (a superset,
+	 * latest-content-wins) from j_first and retries the checkpoint. */
+	if (failed) {
+		WARN_RATELIMIT(1,
+			       "ext4: checkpoint incomplete (device write/flush "
+			       "failed) - keeping journal + batch for recovery");
+		return;
+	}
 
 	journal_superblock_t *jsb = (journal_superblock_t *)fs->j_sb_buf;
 	jsb->s_start = 0; /* 2. empty the log        */
