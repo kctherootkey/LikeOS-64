@@ -25,7 +25,8 @@
 enum {
 	SOFTIRQ_NET_RX = 0, // process per-CPU RX skb queue
 	SOFTIRQ_NET_TX = 1, // future use
-	SOFTIRQ_TIMER = 2, // future use
+	SOFTIRQ_TIMER = 2, // drain the deferred connection-free queue
+	SOFTIRQ_TCP_TIMER = 3, // run the per-connection TCP timer sweep
 	NR_SOFTIRQ = 32
 };
 

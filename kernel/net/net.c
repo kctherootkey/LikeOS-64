@@ -100,10 +100,17 @@ void net_quiesce_for_poweroff(void)
 	}
 }
 
+static inline uint32_t net_safe_cpu_id(void);
+
 // Called from timer IRQ
 void net_timer_tick(void)
 {
-	tcp_timer_tick();
+	// Hand the per-connection TCP timer sweep to softirq context instead of
+	// running it inline here on every CPU with interrupts disabled.  Only
+	// the lowest online CPU raises it, so the sweep runs once per tick (its
+	// per-connection deadlines are absolute, so a single sweeper suffices).
+	if (net_safe_cpu_id() == 0)
+		softirq_raise(SOFTIRQ_TCP_TIMER);
 	static uint64_t dhcp_last = 0;
 	uint64_t now = timer_ticks();
 	// Timer frequency is TSC-calibrated at boot and is NOT necessarily

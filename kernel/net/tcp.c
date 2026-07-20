@@ -882,6 +882,11 @@ void tcp_init(void)
 	// Bind the deferred-free drain to a softirq vector so the timer
 	// can hand work off to ksoftirqd from hard-IRQ context.
 	softirq_register(SOFTIRQ_TIMER, tcp_pending_softirq);
+	// The per-connection timer sweep runs in softirq context (raised once
+	// per tick by the lowest online CPU) rather than in the hard-IRQ timer
+	// handler on every CPU: softirq context has interrupts enabled, so the
+	// sweep may block on conn->lock and slab_free directly.
+	softirq_register(SOFTIRQ_TCP_TIMER, tcp_timer_tick);
 }
 
 // ============================================================================
