@@ -2028,6 +2028,95 @@ int tcp_send_data(tcp_conn_t *conn, const uint8_t *data, uint16_t len)
 // Idle connection timeout: close ESTABLISHED connections with no data for 5 minutes
 #define TCP_IDLE_TIMEOUT_TICKS (300 * 100)
 
+// Disposition of an inbound segment as decided by tcp_validate_incoming().
+typedef enum {
+	TCP_SEG_OK, // passed validation; continue to the state machine
+	TCP_SEG_DROP, // discard silently
+	TCP_SEG_DROP_ACK, // discard, but emit a current-state ACK
+	TCP_SEG_RESET, // a valid reset at rcv_nxt; fail the connection
+} tcp_seg_verdict_t;
+
+// Central inbound-segment validation, run exactly once before the per-state
+// switch for every fully-synchronized data-transfer state (ESTABLISHED,
+// FIN_WAIT_1/2, CLOSE_WAIT, CLOSING, LAST_ACK).  It unifies three checks that
+// were previously scattered across individual states, duplicated, or missing
+// entirely (CLOSE_WAIT had none): reset processing (RFC 5961 §3), blind-SYN
+// mitigation (RFC 5961 §4), and timestamp/PAWS validation (RFC 7323 §5.3).
+//
+// It performs NO transmit and mutates only ts_recent on an accepted in-window
+// segment, preserving the deferred-ACK discipline: the caller emits any owed
+// ACK after releasing conn->lock.  TIME_WAIT and the handshake states
+// (SYN_SENT/SYN_RECEIVED) keep their own bespoke validation and are not
+// routed here.
+static tcp_seg_verdict_t tcp_validate_incoming(tcp_conn_t *conn, uint8_t flags,
+					       uint32_t seq, uint32_t ack,
+					       uint16_t payload_len,
+					       const tcp_parsed_opts_t *pop)
+{
+	(void)ack;
+	int in_window =
+		(int32_t)(seq - conn->rcv_nxt) >= 0 &&
+		(int32_t)(seq - (conn->rcv_nxt + conn->rcv_wnd)) <= 0;
+
+	// RFC 5961 §3 — reset processing.  Only a reset landing exactly at
+	// rcv_nxt is honored; an in-window-but-not-exact reset gets a
+	// challenge ACK (a blind-reset probe cannot then tear us down), and an
+	// out-of-window reset is ignored.
+	if (flags & TCP_RST) {
+		if (!in_window)
+			return TCP_SEG_DROP;
+		if (seq == conn->rcv_nxt) {
+			if (conn->inflight_count > 0 || conn->rx_ready)
+				NET_STATS_INC(NET_MIB_TCP_RSTDATALOSS);
+			NET_STATS_INC(NET_MIB_TCP_ESTABRESETS);
+			WARN_RATELIMIT(
+				conn->inflight_count > 0 || conn->rx_ready,
+				"tcp_rx: in-window RST aborted :%u->:%u mid-transfer (inflight=%u rx_ready=%d) - data lost",
+				conn->local_port, conn->remote_port,
+				conn->inflight_count, conn->rx_ready);
+			return TCP_SEG_RESET;
+		}
+		NET_STATS_INC(NET_MIB_TCP_CHALLENGEACK);
+		return TCP_SEG_DROP_ACK;
+	}
+
+	// RFC 5961 §4 — a SYN inside the window on an already-synchronized
+	// connection is answered with a challenge ACK, never an abort.  (True
+	// simultaneous open is handled only in SYN_SENT.)
+	if (flags & TCP_SYN) {
+		if (in_window) {
+			NET_STATS_INC(NET_MIB_TCP_CHALLENGEACK);
+			return TCP_SEG_DROP_ACK;
+		}
+		return TCP_SEG_DROP;
+	}
+
+	// RFC 7323 §5.3 — protection against wrapped sequence numbers.  Applied
+	// to every synchronized state now, not just ESTABLISHED.
+	if (conn->ts_enabled && pop->ts_present) {
+		if ((int32_t)(pop->tsval - conn->ts_recent) < 0 &&
+		    payload_len > 0) {
+			NET_STATS_INC(NET_MIB_TCP_PAWSDROP);
+			return TCP_SEG_DROP_ACK;
+		}
+		if ((int32_t)(seq - conn->rcv_nxt) <= 0 &&
+		    (int32_t)(pop->tsval - conn->ts_recent) >= 0) {
+			conn->ts_recent = pop->tsval;
+			conn->ts_recent_age = (uint32_t)timer_ticks();
+		}
+	}
+
+	return TCP_SEG_OK;
+}
+
+static inline int tcp_state_is_synchronized(int state)
+{
+	return state == TCP_STATE_ESTABLISHED ||
+	       state == TCP_STATE_FIN_WAIT_1 || state == TCP_STATE_FIN_WAIT_2 ||
+	       state == TCP_STATE_CLOSE_WAIT || state == TCP_STATE_CLOSING ||
+	       state == TCP_STATE_LAST_ACK;
+}
+
 void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 	    const uint8_t *data, uint16_t len)
 {
@@ -2500,28 +2589,26 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 		return;
 	}
 
-	/* RFC 793: a synchronized connection must process RST in EVERY state,
-	 * not just ESTABLISHED.  The closing states below had no RST handling
-	 * at all, so a conn stuck in FIN_WAIT_1 whose peer was gone kept
-	 * retransmitting its FIN forever while the peer's no-conn RSTs bounced
-	 * off it (observed: FIN_WAIT_1 conn alive for minutes, RST'ing the
-	 * same FIN seq repeatedly).  Same RFC 5961 in-window validation as the
-	 * ESTABLISHED case.  TIME_WAIT deliberately still ignores RST
-	 * (RFC 1337, TIME-WAIT assassination hazard). */
-	if ((tcp_flags & TCP_RST) &&
-	    (conn->state == TCP_STATE_FIN_WAIT_1 ||
-	     conn->state == TCP_STATE_FIN_WAIT_2 ||
-	     conn->state == TCP_STATE_CLOSING ||
-	     conn->state == TCP_STATE_LAST_ACK)) {
-		if ((int32_t)(seq - conn->rcv_nxt) >= 0 &&
-		    (int32_t)(seq - (conn->rcv_nxt + conn->rcv_wnd)) <= 0) {
+	// Central inbound validation for the fully-synchronized states
+	// (RST / blind-SYN / PAWS in one place — see tcp_validate_incoming).
+	// The handshake states and TIME_WAIT keep their own handling below.
+	if (tcp_state_is_synchronized(conn->state)) {
+		switch (tcp_validate_incoming(conn, tcp_flags, seq, ack,
+					      payload_len, &pop)) {
+		case TCP_SEG_DROP:
+			tcp_lock_release(&conn->lock, flags);
+			return;
+		case TCP_SEG_DROP_ACK:
+			tcp_queue_ack_locked(conn);
+			ack_pending = 1;
+			goto deferred_ack_out;
+		case TCP_SEG_RESET:
 			tcp_fail_connection(conn, ECONNRESET);
 			tcp_lock_release(&conn->lock, flags);
 			return;
+		case TCP_SEG_OK:
+			break;
 		}
-		/* out-of-window RST: silently drop (RFC 5961) */
-		tcp_lock_release(&conn->lock, flags);
-		return;
 	}
 
 	// Process by state
@@ -2771,60 +2858,10 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 
 	case TCP_STATE_ESTABLISHED:
 established_segment:
-		if (tcp_flags & TCP_RST) {
-			// RFC 5961: validate RST seq within receive window
-			if ((int32_t)(seq - conn->rcv_nxt) < 0 ||
-			    (int32_t)(seq - (conn->rcv_nxt + conn->rcv_wnd)) >
-				    0)
-				break; // out-of-window RST, silently drop
-			/* INVARIANT-ish: a valid RST is legitimate TCP, but one
-			 * that aborts an ESTABLISHED conn with data still in
-			 * flight or buffered means a transfer was reset mid-
-			 * stream and bytes are lost.  On a self/loopback flow
-			 * (no real network) an in-window RST should essentially
-			 * never happen — surface it (rate-limited) so a spurious
-			 * reset behind a TLS ECONNRESET is diagnosable. */
-			if (conn->inflight_count > 0 || conn->rx_ready)
-				NET_STATS_INC(NET_MIB_TCP_RSTDATALOSS);
-			NET_STATS_INC(NET_MIB_TCP_ESTABRESETS);
-			WARN_RATELIMIT(conn->inflight_count > 0 || conn->rx_ready,
-				       "tcp_rx: in-window RST aborted ESTABLISHED "
-				       ":%u->:%u mid-transfer (inflight=%u "
-				       "rx_ready=%d) - data lost",
-				       conn->local_port, conn->remote_port,
-				       conn->inflight_count, conn->rx_ready);
-			tcp_fail_connection(conn, ECONNRESET);
-			break;
-		}
+		// RST, blind-SYN, and PAWS were already handled by
+		// tcp_validate_incoming() before the switch.
 		conn->last_rx_tick = timer_ticks();
 		conn->keep_probes_sent = 0;
-
-		// RFC 7323 §5.3 PAWS — drop segments with TSval older than ts_recent
-		// (only if seg has data and we have a ts_recent).
-		if (conn->ts_enabled && pop.ts_present) {
-			if ((int32_t)(pop.tsval - conn->ts_recent) < 0 &&
-			    payload_len > 0) {
-				// Silent data discard — should essentially never
-				// fire on loopback; make it visible so timestamp
-				// pollution is diagnosable and not just "recv
-				// mysteriously came up short".
-				NET_STATS_INC(NET_MIB_TCP_PAWSDROP);
-				WARN_RATELIMIT(
-					1,
-					"tcp_rx: PAWS drop (tsval=%u ts_recent=%u len=%u port %u->%u)",
-					pop.tsval, conn->ts_recent, payload_len,
-					src_port, dst_port);
-				tcp_queue_ack_locked(conn);
-				ack_pending = 1;
-				break;
-			}
-			// Update ts_recent if seg covers ts_recent's ack point
-			if ((int32_t)(seq - conn->rcv_nxt) <= 0 &&
-			    (int32_t)(pop.tsval - conn->ts_recent) >= 0) {
-				conn->ts_recent = pop.tsval;
-				conn->ts_recent_age = (uint32_t)timer_ticks();
-			}
-		}
 
 		// Apply RFC 7323 window scaling on inbound advertised window
 		{
@@ -3292,6 +3329,58 @@ established_segment:
 		}
 		break;
 
+	case TCP_STATE_CLOSE_WAIT:
+		// The peer half-closed (sent its FIN); our application may still
+		// be sending, and the peer keeps ACKing that data.  Without
+		// processing those ACKs here the inflight queue never drains, the
+		// RTO timer resends the already-delivered head forever, and the
+		// peer stalls (this case previously fell through to default and
+		// did nothing).  Update the send window and drain inflight on
+		// partial ACKs, mirroring the closing-state handlers.
+		conn->last_rx_tick = timer_ticks();
+		{
+			uint32_t scaled = (uint32_t)window;
+			if (conn->ws_enabled)
+				scaled <<= conn->snd_wscale;
+			conn->snd_wnd = scaled;
+		}
+		if (tcp_flags & TCP_ACK) {
+			if (ack > conn->snd_una && ack <= conn->snd_nxt) {
+				conn->snd_una = ack;
+				tcp_ack_inflight(conn, ack);
+				conn->retransmit_count = 0;
+				conn->retransmit_tick =
+					timer_ticks() + tcp_rto_ticks(conn);
+				conn->dup_acks = 0;
+			} else if (ack == conn->snd_una && payload_len == 0 &&
+				   conn->inflight_count > 0) {
+				// 3-dup-ACK fast retransmit, same as the closing
+				// states, so a gap recovers within an RTT.
+				conn->dup_acks++;
+				if (conn->dup_acks == 3) {
+					tcp_inflight_segment_t *seg =
+						&conn->inflight[0];
+					tcp_send_segment(
+						conn->dev, conn->local_ip,
+						conn->remote_ip,
+						conn->local_port,
+						conn->remote_port, seg->seq,
+						conn->rcv_nxt, seg->flags,
+						tcp_advertised_window(conn),
+						seg->data, seg->len);
+					seg->retransmit_count++;
+					conn->total_retrans++;
+					NET_STATS_INC(NET_MIB_TCP_RETRANSSEGS);
+				}
+			}
+		}
+		// A retransmitted FIN (peer didn't see our ACK) just gets re-ACKed.
+		if (tcp_flags & TCP_FIN) {
+			tcp_queue_ack_locked(conn);
+			ack_pending = 1;
+		}
+		break;
+
 	case TCP_STATE_CLOSING:
 		if (tcp_flags & TCP_ACK) {
 			// Drain inflight on partial ACKs (see FIN_WAIT_1) so any
@@ -3354,6 +3443,7 @@ established_segment:
 		break;
 	}
 
+deferred_ack_out:;
 	/* Snapshot the deferred ACK params UNDER conn->lock, then release
      * the lock, then transmit.  This removes the NIC TX (skb build +
      * checksum + tx_lock + MMIO doorbell) from the conn->lock-held
