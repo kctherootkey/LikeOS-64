@@ -234,7 +234,9 @@ typedef struct __attribute__((packed)) {
 #define TCP_STATE_TIME_WAIT 10
 
 // TCP configuration
-#define TCP_MAX_CONNECTIONS 128
+// Connections are dynamically allocated; there is no fixed connection-table
+// size — the number of live connections is bounded only by available memory
+// (and ultimately by the number of open file descriptors).
 /* Initial advertised receive window — placed in the unscaled 16-bit
  * window field of SYN/SYN+ACK (RFC 7323 §2.2 forbids window scaling
  * before the handshake completes), and as the seed for conn->rcv_wnd
@@ -542,17 +544,6 @@ typedef struct tcp_conn {
 	uint32_t rcv_up; // most recent received urgent ptr (sequence)
 	uint8_t snd_urg_pending; // we owe an URG segment
 
-	// Owner-detached marker.  Set by tcp_close() once the owning socket
-	// has released its reference (s->tcp = NULL).  After this point any
-	// protocol-side transition to TCP_STATE_CLOSED (peer RST,
-	// tcp_fail_connection from retransmit timeout, FIN_WAIT_2 timeout,
-	// LAST_ACK→CLOSED) means the slot has no owner left and may be
-	// reaped by tcp_timer_tick.  Without this, an orphaned conn that
-	// peer-RSTs after sock_close runs would sit in CLOSED forever and
-	// permanently consume one of TCP_MAX_CONNECTIONS slots, eventually
-	// starving incoming SYNs (silently dropped → accept() hang).
-	uint8_t detached;
-
 	// Back-pointer to the owning net_socket_t (typed as void* to avoid
 	// a forward-declaration cycle: net_socket_t embeds tcp_conn_t*).
 	// Lifecycle:
@@ -585,10 +576,13 @@ typedef struct tcp_conn {
 	//   * on_reap_queue: dedup guard so a connection is queued for free once.
 	//   * list_next: singly-linked global list of all live connections
 	//     (g_tcp_conn_list), protected by tcp_lock.
+	//   * reap_next: singly-linked list of connections whose refcount hit 0,
+	//     awaiting physical free (g_tcp_reap_list), protected by tcp_reap_lock.
 	volatile int refcount;
 	uint8_t proto_ref;
 	uint8_t on_reap_queue;
 	struct tcp_conn *list_next;
+	struct tcp_conn *reap_next;
 } tcp_conn_t;
 
 // ============================================================================

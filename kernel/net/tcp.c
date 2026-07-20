@@ -81,11 +81,11 @@ static uint32_t g_tcp_conn_count; // number of live connections (bounded)
 
 static void tcp_conn_final_free(tcp_conn_t *conn); // forward
 
-// Reap queue: connections whose refcount reached 0, awaiting physical free in
-// softirq/process context.  No generation needed — a 0-refcount connection is
-// stable (nothing can re-reference it).
-static tcp_conn_t *tcp_reap_queue[TCP_MAX_CONNECTIONS];
-static uint32_t tcp_reap_count;
+// Reap list: connections whose refcount reached 0, awaiting physical free in
+// softirq/process context.  Intrusive singly-linked list (chained by
+// conn->reap_next) so it needs no fixed capacity.  No generation needed — a
+// 0-refcount connection is stable (nothing can re-reference it).
+static tcp_conn_t *g_tcp_reap_list;
 static spinlock_t tcp_reap_lock = SPINLOCK_INIT("tcp_reap");
 
 // Increment a reference the caller already holds one of.
@@ -122,12 +122,13 @@ static void tcp_conn_put(tcp_conn_t *conn)
 		return;
 	uint64_t flags;
 	spin_lock_irqsave(&tcp_reap_lock, &flags);
-	if (!conn->on_reap_queue && tcp_reap_count < TCP_MAX_CONNECTIONS) {
+	if (!conn->on_reap_queue) {
 		conn->on_reap_queue = 1;
-		tcp_reap_queue[tcp_reap_count++] = conn;
+		conn->reap_next = g_tcp_reap_list;
+		g_tcp_reap_list = conn;
 	}
 	spin_unlock_irqrestore(&tcp_reap_lock, flags);
-	// Wake ksoftirqd to drain the reap queue in process/softirq context.
+	// Wake ksoftirqd to drain the reap list in process/softirq context.
 	softirq_raise(SOFTIRQ_TIMER);
 }
 
@@ -152,16 +153,19 @@ static void tcp_pending_softirq(void)
 	tcp_reap_pending();
 }
 
-// Drain the reap queue: unlink each 0-refcount connection from the global
-// list and physically free it.  Process/softirq context only (slab_free).
+// Drain the reap list: unlink each 0-refcount connection from the global list
+// and physically free it.  Process/softirq context only (slab_free).
 void tcp_reap_pending(void)
 {
 	for (;;) {
 		tcp_conn_t *conn = NULL;
 		uint64_t flags;
 		spin_lock_irqsave(&tcp_reap_lock, &flags);
-		if (tcp_reap_count > 0)
-			conn = tcp_reap_queue[--tcp_reap_count];
+		if (g_tcp_reap_list) {
+			conn = g_tcp_reap_list;
+			g_tcp_reap_list = conn->reap_next;
+			conn->reap_next = NULL;
+		}
 		spin_unlock_irqrestore(&tcp_reap_lock, flags);
 		if (!conn)
 			break;
@@ -1025,21 +1029,15 @@ static tcp_conn_t *tcp_conn_alloc(uint8_t *rx_buf, uint8_t *tx_buf,
 	BUG_ON(inflight == NULL);
 	BUG_ON(ooo == NULL);
 
-	// Bound the number of live connections (DoS protection + keeps the
-	// timer snapshot array below a fixed cap).  Reserve a slot atomically.
-	uint32_t prev = __atomic_fetch_add(&g_tcp_conn_count, 1, __ATOMIC_ACQ_REL);
-	if (prev >= TCP_MAX_CONNECTIONS) {
-		__atomic_fetch_sub(&g_tcp_conn_count, 1, __ATOMIC_ACQ_REL);
-		return NULL;
-	}
-
+	// There is no fixed connection cap: the number of live connections is
+	// bounded only by available memory (slab_alloc returns NULL on
+	// exhaustion) and, above this layer, by the number of open sockets.
 	tcp_conn_t *conn = (tcp_conn_t *)slab_alloc(sizeof(*conn));
-	if (!conn) {
-		__atomic_fetch_sub(&g_tcp_conn_count, 1, __ATOMIC_ACQ_REL);
+	if (!conn)
 		return NULL;
-	}
 	for (size_t b = 0; b < sizeof(*conn); b++)
 		((uint8_t *)conn)[b] = 0;
+	__atomic_fetch_add(&g_tcp_conn_count, 1, __ATOMIC_ACQ_REL);
 
 	conn->lock = (spinlock_t)SPINLOCK_INIT("tcp_conn");
 	conn->state = TCP_STATE_CLOSED;
@@ -3407,24 +3405,21 @@ void tcp_timer_tick(void)
 {
 	uint64_t now = timer_ticks();
 
-	// Snapshot the live connections, taking a reference on each, so each can
-	// be processed under its own conn->lock without holding tcp_lock and
-	// with no risk of it being freed mid-processing.  This runs in softirq
-	// context (see net_timer_tick / SOFTIRQ_TCP_TIMER), so blocking on
-	// conn->lock and freeing via tcp_conn_put are both legal here.
-	tcp_conn_t *snap[TCP_MAX_CONNECTIONS];
-	int nsnap = 0;
+	// Walk the connection list holding a reference on each connection while
+	// it is processed — no fixed-size snapshot, so no cap on live
+	// connections.  Reference-counted safe traversal: keep the current
+	// connection held while finding and holding the next one, so the current
+	// node's list_next stays valid across the unlocked processing window.
+	// Runs in softirq context (net_timer_tick / SOFTIRQ_TCP_TIMER), so
+	// blocking on conn->lock and freeing via tcp_conn_put are both legal.
 	uint64_t lflags;
 	spin_lock_irqsave(&tcp_lock, &lflags);
-	for (tcp_conn_t *c = g_tcp_conn_list;
-	     c && nsnap < TCP_MAX_CONNECTIONS; c = c->list_next) {
-		if (c->active && tcp_conn_tryhold(c))
-			snap[nsnap++] = c;
-	}
+	tcp_conn_t *conn = g_tcp_conn_list;
+	while (conn && !tcp_conn_tryhold(conn))
+		conn = conn->list_next;
 	spin_unlock_irqrestore(&tcp_lock, lflags);
 
-	for (int si = 0; si < nsnap; si++) {
-		tcp_conn_t *conn = snap[si];
+	while (conn) {
 		uint64_t flags;
 		tcp_lock_acquire(&conn->lock, &flags);
 
@@ -3678,10 +3673,17 @@ void tcp_timer_tick(void)
 
 unlock_conn:
 		tcp_lock_release(&conn->lock, flags);
-		// Release the snapshot reference.  If this was the last reference
-		// (the connection was killed above and has no socket), it is
-		// queued for physical free here.
+
+		// Advance: find and hold the next connection while still holding
+		// `conn` (so conn->list_next is valid), then drop `conn`.  If the
+		// drop was the last reference, the connection is queued for free.
+		spin_lock_irqsave(&tcp_lock, &lflags);
+		tcp_conn_t *next = conn->list_next;
+		while (next && !tcp_conn_tryhold(next))
+			next = next->list_next;
+		spin_unlock_irqrestore(&tcp_lock, lflags);
 		tcp_conn_put(conn);
+		conn = next;
 	}
 }
 
