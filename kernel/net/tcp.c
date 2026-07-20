@@ -1656,14 +1656,14 @@ tcp_conn_t *tcp_accept(tcp_conn_t *listener)
 		if (!conn || conn->gen != e.gen) {
 			WARN_RATELIMIT(
 				conn != NULL,
-				"tcp_accept: queued child slot recycled (gen %u != %u) — entry discarded",
+				"tcp_accept: queued child slot recycled (gen %u != %u) - entry discarded",
 				conn ? conn->gen : 0, e.gen);
 			continue; /* slot recycled: a different connection now */
 		}
 		if (!conn->active) {
 			WARN_RATELIMIT(
 				1,
-				"tcp_accept: queued child :%u->:%u freed before accept — entry discarded",
+				"tcp_accept: queued child :%u->:%u freed before accept - entry discarded",
 				conn->local_port, conn->remote_port);
 			continue; /* freed before we got to it */
 		}
@@ -1671,7 +1671,7 @@ tcp_conn_t *tcp_accept(tcp_conn_t *listener)
 		    conn->state != TCP_STATE_CLOSE_WAIT) {
 			WARN_RATELIMIT(
 				1,
-				"tcp_accept: queued child :%u->:%u in state %d (err=%d) — entry discarded",
+				"tcp_accept: queued child :%u->:%u in state %d (err=%d) - entry discarded",
 				conn->local_port, conn->remote_port,
 				conn->state, conn->error);
 			continue; /* died between queueing and accept */
@@ -1761,7 +1761,7 @@ static int tcp_close_impl(tcp_conn_t *conn, int has_gen, uint32_t gen)
 	if (has_gen && (!conn->active || conn->gen != gen)) {
 		WARN_RATELIMIT(
 			conn->active,
-			"tcp: deferred close hit recycled conn slot (gen %u != %u, state=%d) — stale close dropped",
+			"tcp: deferred close hit recycled conn slot (gen %u != %u, state=%d) - stale close dropped",
 			conn->gen, gen, conn->state);
 		tcp_lock_release(&conn->lock, flags);
 		return -1;
@@ -3859,7 +3859,7 @@ static void tcp_abort_impl(tcp_conn_t *conn, int has_gen, uint32_t gen)
 	if (has_gen && (!conn->active || conn->gen != gen)) {
 		WARN_RATELIMIT(
 			conn->active,
-			"tcp: deferred abort hit recycled conn slot (gen %u != %u, state=%d) — stale abort dropped",
+			"tcp: deferred abort hit recycled conn slot (gen %u != %u, state=%d) - stale abort dropped",
 			conn->gen, gen, conn->state);
 		tcp_lock_release(&conn->lock, flags);
 		return;
