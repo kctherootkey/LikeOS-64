@@ -73,6 +73,13 @@ static inline void skb_init_slot(sk_buff_t *skb, uint8_t *data,
 	skb->cb = 0;
 }
 
+// Total skb allocation failures (pool exhausted).  Exposed for the network
+// statistics fold so buffer-pressure drops are visible in netstat.
+uint64_t skb_get_alloc_failures(void)
+{
+	return skb_alloc_total_fail;
+}
+
 void skb_pool_init(void)
 {
 	small_freelist = NULL;

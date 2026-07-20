@@ -7924,6 +7924,16 @@ dns_str_done:
 				     (size_t)count * sizeof(net_iface_info_t));
 			return count;
 		}
+		case NET_GET_NETSTATS: {
+			if (!validate_user_ptr(a2, sizeof(net_stats_info_t)))
+				return -EFAULT;
+			net_stats_info_t kbuf;
+			if (net_get_stats(&kbuf) != 0)
+				return -EINVAL;
+			copy_to_user((void *)a2, &kbuf,
+				     sizeof(net_stats_info_t));
+			return 1;
+		}
 		case NET_DNS_QUERY: {
 			if (!validate_user_ptr(a2, sizeof(dns_query_buf_t)))
 				return -EFAULT;

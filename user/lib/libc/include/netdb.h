@@ -13,6 +13,7 @@
 #define NET_GET_UDP_SOCKS     4
 #define NET_GET_IFACE_INFO    5
 #define NET_DNS_QUERY         6
+#define NET_GET_STATS         7
 
 /* DHCP_CONTROL sub-commands — must match kernel include/kernel/ke/syscall.h */
 #define DHCP_CMD_DISCOVER     1
@@ -87,6 +88,47 @@ typedef struct {
     uint64_t tx_errors;
     uint64_t rx_dropped;
 } net_iface_info_t;
+
+/* Aggregate protocol counters — must match kernel net_stats_info in
+ * include/kernel/net/net.h */
+typedef struct {
+    uint64_t ip_in_receives;
+    uint64_t ip_in_hdr_errors;
+    uint64_t ip_in_delivers;
+    uint64_t ip_out_requests;
+    uint64_t tcp_active_opens;
+    uint64_t tcp_passive_opens;
+    uint64_t tcp_attempt_fails;
+    uint64_t tcp_estab_resets;
+    uint64_t tcp_in_segs;
+    uint64_t tcp_out_segs;
+    uint64_t tcp_retrans_segs;
+    uint64_t tcp_in_errs;
+    uint64_t tcp_out_rsts;
+    uint64_t tcp_paws_drop;
+    uint64_t tcp_oow_seq_drop;
+    uint64_t tcp_challenge_ack;
+    uint64_t tcp_ooo_queue_full;
+    uint64_t tcp_ooo_oversize_drop;
+    uint64_t tcp_ooo_fin_refused;
+    uint64_t tcp_acceptq_full;
+    uint64_t tcp_listener_gone_rst;
+    uint64_t tcp_rst_data_loss;
+    uint64_t tcp_conn_table_full;
+    uint64_t tcp_backlog_drop;
+    uint64_t tcp_persist_probes;
+    uint64_t tcp_syncookie_sent;
+    uint64_t tcp_syncookie_recv;
+    uint64_t tcp_syncookie_fail;
+    uint64_t tcp_tw_created;
+    uint64_t tcp_tw_reused;
+    uint64_t tcp_tw_killed;
+    uint64_t udp_in_datagrams;
+    uint64_t udp_out_datagrams;
+    uint64_t udp_no_ports;
+    uint64_t udp_rcvbuf_errors;
+    uint64_t skb_alloc_fail;
+} net_stats_info_t;
 
 typedef struct __attribute__((packed)) {
     uint32_t src_ip;

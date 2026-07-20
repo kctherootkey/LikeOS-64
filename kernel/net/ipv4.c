@@ -5,6 +5,7 @@
 #include <kernel/ke/timer.h>
 #include <kernel/net/skb.h>
 #include <kernel/net/ratelimit.h>
+#include <kernel/net/stats.h>
 #include <kernel/uapi/bug.h>
 #include <kernel/mm/memory.h>
 
@@ -89,6 +90,7 @@ static void ipv4_dispatch_payload(net_device_t *dev, uint32_t src_ip,
 	BUG_ON(dev == NULL);
 	BUG_ON(payload == NULL);
 	BUILD_BUG_ON(sizeof(ipv4_header_t) != 20);
+	NET_STATS_INC(NET_MIB_IP_INDELIVERS);
 	switch (protocol) {
 	case IP_PROTO_ICMP:
 		icmp_rx(dev, src_ip, payload, payload_len, ttl);
@@ -223,6 +225,7 @@ static int ipv4_send_common(net_device_t *dev, uint32_t dst_ip,
 {
 	BUILD_BUG_ON(sizeof(ipv4_header_t) != 20);
 	WARN_ON(payload == NULL && len > 0);
+	NET_STATS_INC(NET_MIB_IP_OUTREQUESTS);
 	uint32_t next_hop = dst_ip;
 	net_device_t *out_dev = route_lookup(dst_ip, &next_hop);
 	if (!out_dev) {
@@ -454,27 +457,38 @@ void ipv4_rx(net_device_t *dev, const uint8_t *data, uint16_t len)
 {
 	BUG_ON(dev == NULL);
 	BUG_ON(data == NULL);
-	if (len < sizeof(ipv4_header_t))
+	if (len < sizeof(ipv4_header_t)) {
+		NET_STATS_INC(NET_MIB_IP_INHDRERRORS);
 		return;
+	}
+	NET_STATS_INC(NET_MIB_IP_INRECEIVES);
 
 	const ipv4_header_t *ip = (const ipv4_header_t *)data;
 
 	// Verify version
-	if ((ip->version_ihl >> 4) != 4)
+	if ((ip->version_ihl >> 4) != 4) {
+		NET_STATS_INC(NET_MIB_IP_INHDRERRORS);
 		return;
+	}
 
 	// Get header length
 	uint8_t ihl = (ip->version_ihl & 0x0F) * 4;
-	if (ihl < 20 || ihl > len)
+	if (ihl < 20 || ihl > len) {
+		NET_STATS_INC(NET_MIB_IP_INHDRERRORS);
 		return;
+	}
 
 	uint16_t total_len = net_ntohs(ip->total_length);
-	if (total_len > len)
+	if (total_len > len) {
+		NET_STATS_INC(NET_MIB_IP_INHDRERRORS);
 		return;
+	}
 
 	// Verify checksum
-	if (ipv4_checksum(ip, ihl) != 0)
+	if (ipv4_checksum(ip, ihl) != 0) {
+		NET_STATS_INC(NET_MIB_IP_INHDRERRORS);
 		return;
+	}
 
 	uint32_t dst_ip = net_ntohl(ip->dst_addr);
 	uint32_t src_ip = net_ntohl(ip->src_addr);

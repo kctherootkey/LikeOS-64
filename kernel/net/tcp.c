@@ -8,6 +8,7 @@
 #include <kernel/dev/rand/random.h>
 #include <kernel/net/softirq.h>
 #include <kernel/net/ratelimit.h>
+#include <kernel/net/stats.h>
 #include <kernel/uapi/bug.h>
 
 // TCP connection table
@@ -522,7 +523,7 @@ static uint16_t tcp_syn_window(tcp_conn_t *conn)
 	return avail > 0xFFFFu ? (uint16_t)0xFFFFu : (uint16_t)avail;
 }
 
-/* Linux-style TCP receive buffer auto-tuning.
+/* Adaptive TCP receive buffer auto-tuning.
  *
  * Throughput is BDP-limited: max_rate = rx_buf_size / RTT.  A fixed
  * 128 KB rx ring caps a 481 ms transcontinental flow at ~280 KB/s.
@@ -630,6 +631,9 @@ static int tcp_send_segment_ex(net_device_t *dev, uint32_t src_ip,
 
 	tcp->checksum = ipv4_checksum(pseudo, (uint16_t)(12 + tcp_len));
 
+	NET_STATS_INC(NET_MIB_TCP_OUTSEGS);
+	if (flags & TCP_RST)
+		NET_STATS_INC(NET_MIB_TCP_OUTRSTS);
 	return ipv4_send(dev, dst_ip, IP_PROTO_TCP, pkt, tcp_len);
 }
 
@@ -1554,6 +1558,7 @@ tcp_conn_t *tcp_connect(net_device_t *dev, uint32_t local_ip, uint32_t dst_ip,
 	conn->retransmit_tick = timer_ticks() + TCP_SYN_RETRANSMIT_TICKS;
 	conn->retransmit_count = 0;
 	conn->handshake_deadline = timer_ticks() + TCP_HANDSHAKE_TIMEOUT_TICKS;
+	NET_STATS_INC(NET_MIB_TCP_ACTIVEOPENS);
 
 	// Publish: 4-tuple is set, now lock-free walkers may match this slot.
 	tcp_publish_conn(conn);
@@ -2026,8 +2031,11 @@ int tcp_send_data(tcp_conn_t *conn, const uint8_t *data, uint16_t len)
 void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 	    const uint8_t *data, uint16_t len)
 {
-	if (len < sizeof(tcp_header_t))
+	if (len < sizeof(tcp_header_t)) {
+		NET_STATS_INC(NET_MIB_TCP_INERRS);
 		return;
+	}
+	NET_STATS_INC(NET_MIB_TCP_INSEGS);
 
 	const tcp_header_t *tcp = (const tcp_header_t *)data;
 	uint16_t src_port = net_ntohs(tcp->src_port);
@@ -2219,6 +2227,7 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 			new_conn->max_seg_size = new_conn->peer_mss;
 			new_conn->state = TCP_STATE_SYN_RECEIVED;
 			new_conn->parent = listener;
+			NET_STATS_INC(NET_MIB_TCP_PASSIVEOPENS);
 			// Arm SYN+ACK retransmit deadline.  tcp_timer_tick now handles
 			// SYN_RECEIVED retransmit/timeout; without this, a lost client
 			// ACK leaves the slot wedged forever and hangs accept().
@@ -2262,9 +2271,12 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 				ack -
 				1; // The ISN we sent was cookie, client ACKs cookie+1
 			uint16_t cookie_mss = 0;
-			if (tcp_syncookie_validate(src_ip, local_ip, src_port,
-						   dst_port, cookie,
-						   &cookie_mss)) {
+			int cookie_ok = tcp_syncookie_validate(
+				src_ip, local_ip, src_port, dst_port, cookie,
+				&cookie_mss);
+			NET_STATS_INC(cookie_ok ? NET_MIB_TCP_SYNCOOKIERECV :
+						  NET_MIB_TCP_SYNCOOKIEFAIL);
+			if (cookie_ok) {
 				// Valid SYN cookie - create connection directly in ESTABLISHED state.
 				// Pre-allocate buffers BEFORE taking tcp_lock (TLB-shootdown safety).
 				uint8_t *cc_rx =
@@ -2342,6 +2354,7 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 					cookie_mss ? cookie_mss : TCP_MSS;
 				new_conn->max_seg_size = new_conn->peer_mss;
 				new_conn->state = TCP_STATE_ESTABLISHED;
+				NET_STATS_INC(NET_MIB_TCP_PASSIVEOPENS);
 				new_conn->parent = listener;
 
 				// Publish new_conn FIRST (4-tuple is set; lock-free walkers
@@ -2547,6 +2560,7 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 				ack_pending = 1;
 			}
 		} else if (tcp_flags & TCP_RST) {
+			NET_STATS_INC(NET_MIB_TCP_ATTEMPTFAILS);
 			tcp_fail_connection(conn, ECONNREFUSED);
 		} else if ((tcp_flags & TCP_SYN) && !(tcp_flags & TCP_ACK)) {
 			// RFC 793 §3.4 simultaneous open — both sides sent SYN
@@ -2666,6 +2680,8 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 							 * recovery may still find it,
 							 * but a blocking accept() can
 							 * miss it and time out. */
+							NET_STATS_INC(
+								NET_MIB_TCP_ACCEPTQFULL);
 							WARN_RATELIMIT(
 								1,
 								"tcp: accept queue full on listener :%u (backlog=%d) - established child :%u not enqueued",
@@ -2707,6 +2723,7 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 					 * 120 s in SSL_connect), and the slot leaks.
 					 * RFC-conformant behaviour is a reset — the
 					 * peer gets ECONNRESET immediately. */
+					NET_STATS_INC(NET_MIB_TCP_LISTENERGONE);
 					WARN_RATELIMIT(
 						1,
 						"tcp: established child :%u->:%u has no listener - RST peer and fail conn",
@@ -2767,6 +2784,9 @@ established_segment:
 			 * (no real network) an in-window RST should essentially
 			 * never happen — surface it (rate-limited) so a spurious
 			 * reset behind a TLS ECONNRESET is diagnosable. */
+			if (conn->inflight_count > 0 || conn->rx_ready)
+				NET_STATS_INC(NET_MIB_TCP_RSTDATALOSS);
+			NET_STATS_INC(NET_MIB_TCP_ESTABRESETS);
 			WARN_RATELIMIT(conn->inflight_count > 0 || conn->rx_ready,
 				       "tcp_rx: in-window RST aborted ESTABLISHED "
 				       ":%u->:%u mid-transfer (inflight=%u "
@@ -2788,6 +2808,7 @@ established_segment:
 				// fire on loopback; make it visible so timestamp
 				// pollution is diagnosable and not just "recv
 				// mysteriously came up short".
+				NET_STATS_INC(NET_MIB_TCP_PAWSDROP);
 				WARN_RATELIMIT(
 					1,
 					"tcp_rx: PAWS drop (tsval=%u ts_recent=%u len=%u port %u->%u)",
@@ -2936,6 +2957,8 @@ established_segment:
 							seg->data, seg->len);
 						seg->retransmit_count++;
 						conn->total_retrans++;
+						NET_STATS_INC(
+							NET_MIB_TCP_RETRANSSEGS);
 					}
 				} else if (conn->dup_acks > 3) {
 					conn->cwnd++;
@@ -3105,11 +3128,21 @@ established_segment:
 						conn->ooo[pos].data[j] =
 							payload[j];
 					conn->ooo_count++;
+				} else if (!dup) {
+					// Reassembly queue full: this future
+					// segment is dropped and must be
+					// retransmitted by the peer.
+					NET_STATS_INC(NET_MIB_TCP_OOOQUEUEFULL);
 				}
 				// Send immediate dup-ACK with SACK info (helps fast retransmit)
 				tcp_queue_ack_locked(conn);
 				ack_pending = 1;
 			} else {
+				// A future segment (seq > rcv_nxt) larger than
+				// one MSS falls here and is dropped — not a
+				// duplicate; only a retransmit recovers it.
+				if ((int32_t)(seq - conn->rcv_nxt) > 0)
+					NET_STATS_INC(NET_MIB_TCP_OOOOVERSIZE);
 				// Already-received data — duplicate ACK
 				tcp_queue_ack_locked(conn);
 				ack_pending = 1;
@@ -3132,6 +3165,7 @@ established_segment:
 				poll_notify_io_ready();
 				sched_wake_channel((void *)&conn->rx_ready);
 			} else {
+				NET_STATS_INC(NET_MIB_TCP_OOOFINREFUSED);
 				WARN_RATELIMIT(
 					1,
 					"tcp_rx: out-of-order FIN refused (seq=%u len=%u rcv_nxt=%u)",
@@ -3190,6 +3224,7 @@ established_segment:
 						seg->data, seg->len);
 					seg->retransmit_count++;
 					conn->total_retrans++;
+					NET_STATS_INC(NET_MIB_TCP_RETRANSSEGS);
 				}
 			}
 			if (ack == conn->snd_nxt) {
@@ -3657,6 +3692,7 @@ void tcp_timer_tick(void)
 						0; // invalidate RTT sample for retransmitted seg
 					conn->retransmit_count++;
 					conn->total_retrans++;
+					NET_STATS_INC(NET_MIB_TCP_RETRANSSEGS);
 				}
 				conn->retransmit_tick =
 					now + tcp_rto_ticks(conn);
@@ -3922,6 +3958,46 @@ void tcp_dump_table(struct tty *tty)
 			cpu, net_rx_queue_len(cpu), softirq_pending_get(cpu),
 			ksoftirqd_state_get(cpu));
 	}
+
+	// Nonzero protocol counters — surfaces silent-drop paths at a glance.
+	tty_printf(tty, "--- net counters (nonzero) ---\n");
+	static const struct {
+		const char *name;
+		enum net_mib_idx idx;
+	} mib_names[] = {
+		{ "InSegs", NET_MIB_TCP_INSEGS },
+		{ "OutSegs", NET_MIB_TCP_OUTSEGS },
+		{ "RetransSegs", NET_MIB_TCP_RETRANSSEGS },
+		{ "OutRsts", NET_MIB_TCP_OUTRSTS },
+		{ "InErrs", NET_MIB_TCP_INERRS },
+		{ "ActiveOpens", NET_MIB_TCP_ACTIVEOPENS },
+		{ "PassiveOpens", NET_MIB_TCP_PASSIVEOPENS },
+		{ "AttemptFails", NET_MIB_TCP_ATTEMPTFAILS },
+		{ "EstabResets", NET_MIB_TCP_ESTABRESETS },
+		{ "PAWSDrop", NET_MIB_TCP_PAWSDROP },
+		{ "OOWSeqDrop", NET_MIB_TCP_OOWSEQDROP },
+		{ "ChallengeAck", NET_MIB_TCP_CHALLENGEACK },
+		{ "OOOQueueFull", NET_MIB_TCP_OOOQUEUEFULL },
+		{ "OOOOversize", NET_MIB_TCP_OOOOVERSIZE },
+		{ "OOOFinRefused", NET_MIB_TCP_OOOFINREFUSED },
+		{ "AcceptQFull", NET_MIB_TCP_ACCEPTQFULL },
+		{ "ListenerGone", NET_MIB_TCP_LISTENERGONE },
+		{ "RstDataLoss", NET_MIB_TCP_RSTDATALOSS },
+		{ "ConnTableFull", NET_MIB_TCP_CONNTABLEFULL },
+		{ "BacklogDrop", NET_MIB_TCP_BACKLOGDROP },
+		{ "PersistProbes", NET_MIB_TCP_PERSISTPROBES },
+		{ "TWReused", NET_MIB_TCP_TWREUSED },
+		{ "UdpNoPorts", NET_MIB_UDP_NOPORTS },
+		{ "UdpRcvBufErr", NET_MIB_UDP_RCVBUFERRORS },
+	};
+	for (unsigned i = 0; i < sizeof(mib_names) / sizeof(mib_names[0]); i++) {
+		uint64_t v = net_stats_read(mib_names[i].idx);
+		if (v)
+			tty_printf(tty, "  %s=%llu\n", mib_names[i].name, v);
+	}
+	uint64_t skb_fail = skb_get_alloc_failures();
+	if (skb_fail)
+		tty_printf(tty, "  SkbAllocFail=%llu\n", skb_fail);
 	tty_printf(tty, "=================\n");
 }
 

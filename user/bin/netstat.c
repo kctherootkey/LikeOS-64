@@ -239,51 +239,126 @@ static void show_interfaces(int extended)
 		flg[fi] = '\0';
 
 		if (extended) {
-			printf("%-10s %-5u %-7d %-6lu %-6d %-6d %-6d %-6lu %-6d %-6d %-6d %s\n",
+			printf("%-10s %-5u %-7d %-6lu %-6lu %-6lu %-6d %-6lu %-6lu %-6d %-6d %s\n",
 			       ifaces[i].name, ifaces[i].mtu, 0,
-			       (unsigned long)ifaces[i].rx_packets, 0, 0, 0,
-			       (unsigned long)ifaces[i].tx_packets, 0, 0, 0,
-			       flg);
+			       (unsigned long)ifaces[i].rx_packets,
+			       (unsigned long)ifaces[i].rx_errors,
+			       (unsigned long)ifaces[i].rx_dropped, 0,
+			       (unsigned long)ifaces[i].tx_packets,
+			       (unsigned long)ifaces[i].tx_errors, 0, 0, flg);
 		} else {
-			printf("%-10s %-5u %-6lu %-6d %-6d %-6d %-6lu %-6d %-6d %-6d %s\n",
+			printf("%-10s %-5u %-6lu %-6lu %-6lu %-6d %-6lu %-6lu %-6d %-6d %s\n",
 			       ifaces[i].name, ifaces[i].mtu,
-			       (unsigned long)ifaces[i].rx_packets, 0, 0, 0,
-			       (unsigned long)ifaces[i].tx_packets, 0, 0, 0,
-			       flg);
+			       (unsigned long)ifaces[i].rx_packets,
+			       (unsigned long)ifaces[i].rx_errors,
+			       (unsigned long)ifaces[i].rx_dropped, 0,
+			       (unsigned long)ifaces[i].tx_packets,
+			       (unsigned long)ifaces[i].tx_errors, 0, 0, flg);
 		}
 	}
 }
 
 static void show_statistics(int show_tcp_flag, int show_udp_flag)
 {
-	if (show_tcp_flag || (!show_tcp_flag && !show_udp_flag)) {
+	net_stats_info_t st;
+	int have_stats = (net_getinfo(NET_GET_STATS, &st, 1) == 1);
+	if (!have_stats)
+		memset(&st, 0, sizeof(st));
+
+	int show_ip = (!show_tcp_flag && !show_udp_flag);
+	if (show_ip) {
+		printf("Ip:\n");
+		printf("    %lu total packets received\n",
+		       (unsigned long)st.ip_in_receives);
+		printf("    %lu with invalid headers\n",
+		       (unsigned long)st.ip_in_hdr_errors);
+		printf("    %lu incoming packets delivered\n",
+		       (unsigned long)st.ip_in_delivers);
+		printf("    %lu requests sent out\n",
+		       (unsigned long)st.ip_out_requests);
+	}
+	if (show_tcp_flag || show_ip) {
 		net_tcp_info_t conns[64];
 		int n = net_getinfo(NET_GET_TCP_CONNS, conns, 64);
-		printf("Tcp:\n");
-		printf("    %d active connection openings\n", n > 0 ? n : 0);
-		printf("    0 passive connection openings\n");
-		printf("    0 failed connection attempts\n");
-		printf("    0 connection resets received\n");
 		int estab = 0;
 		for (int i = 0; i < n; i++)
 			if (conns[i].state == 4)
 				estab++;
+		printf("Tcp:\n");
+		printf("    %lu active connection openings\n",
+		       (unsigned long)st.tcp_active_opens);
+		printf("    %lu passive connection openings\n",
+		       (unsigned long)st.tcp_passive_opens);
+		printf("    %lu failed connection attempts\n",
+		       (unsigned long)st.tcp_attempt_fails);
+		printf("    %lu connection resets received\n",
+		       (unsigned long)st.tcp_estab_resets);
 		printf("    %d connections established\n", estab);
-		printf("    0 segments received\n");
-		printf("    0 segments sent out\n");
-		printf("    0 segments retransmitted\n");
+		printf("    %lu segments received\n",
+		       (unsigned long)st.tcp_in_segs);
+		printf("    %lu segments sent out\n",
+		       (unsigned long)st.tcp_out_segs);
+		printf("    %lu segments retransmitted\n",
+		       (unsigned long)st.tcp_retrans_segs);
+		printf("    %lu resets sent\n",
+		       (unsigned long)st.tcp_out_rsts);
 	}
-	if (show_udp_flag || (!show_tcp_flag && !show_udp_flag)) {
-		net_udp_info_t socks[64];
-		int n = net_getinfo(NET_GET_UDP_SOCKS, socks, 64);
+	if (show_udp_flag || show_ip) {
 		printf("Udp:\n");
-		printf("    0 packets received\n");
-		printf("    0 packets to unknown port received\n");
-		printf("    0 packet receive errors\n");
-		printf("    0 packets sent\n");
-		printf("    0 receive buffer errors\n");
-		printf("    0 send buffer errors\n");
-		(void)n;
+		printf("    %lu packets received\n",
+		       (unsigned long)st.udp_in_datagrams);
+		printf("    %lu packets to unknown port received\n",
+		       (unsigned long)st.udp_no_ports);
+		printf("    %lu packet receive errors\n",
+		       (unsigned long)st.udp_rcvbuf_errors);
+		printf("    %lu packets sent\n",
+		       (unsigned long)st.udp_out_datagrams);
+	}
+	if (show_ip) {
+		/* Extended counters — the previously-silent discard paths.
+		 * Only shown when nonzero to keep the report readable. */
+		printf("TcpExt:\n");
+		struct {
+			const char *label;
+			unsigned long val;
+		} ext[] = {
+			{ "PAWS-dropped segments", (unsigned long)st.tcp_paws_drop },
+			{ "out-of-window segments dropped",
+			  (unsigned long)st.tcp_oow_seq_drop },
+			{ "challenge ACKs sent",
+			  (unsigned long)st.tcp_challenge_ack },
+			{ "reassembly-queue-full drops",
+			  (unsigned long)st.tcp_ooo_queue_full },
+			{ "oversize out-of-order drops",
+			  (unsigned long)st.tcp_ooo_oversize_drop },
+			{ "out-of-order FIN refused",
+			  (unsigned long)st.tcp_ooo_fin_refused },
+			{ "accept-queue-full drops",
+			  (unsigned long)st.tcp_acceptq_full },
+			{ "listener-gone resets",
+			  (unsigned long)st.tcp_listener_gone_rst },
+			{ "resets with data loss",
+			  (unsigned long)st.tcp_rst_data_loss },
+			{ "connection-table-full events",
+			  (unsigned long)st.tcp_conn_table_full },
+			{ "backlog overflow drops",
+			  (unsigned long)st.tcp_backlog_drop },
+			{ "zero-window persist probes",
+			  (unsigned long)st.tcp_persist_probes },
+			{ "SYN cookies sent",
+			  (unsigned long)st.tcp_syncookie_sent },
+			{ "SYN cookies validated",
+			  (unsigned long)st.tcp_syncookie_recv },
+			{ "SYN cookie failures",
+			  (unsigned long)st.tcp_syncookie_fail },
+			{ "TIME-WAIT sockets reused",
+			  (unsigned long)st.tcp_tw_reused },
+			{ "buffer allocation failures",
+			  (unsigned long)st.skb_alloc_fail },
+		};
+		for (unsigned i = 0; i < sizeof(ext) / sizeof(ext[0]); i++)
+			if (ext[i].val)
+				printf("    %lu %s\n", ext[i].val, ext[i].label);
 	}
 }
 

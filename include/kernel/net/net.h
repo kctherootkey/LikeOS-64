@@ -1134,7 +1134,7 @@ typedef struct {
 } epoll_instance_t;
 
 // ============================================================================
-// Network Interface Ioctls (Linux-compatible values)
+// Network Interface Ioctls (conventional numeric values)
 // ============================================================================
 // Socket-level / interface ioctls
 #define SIOCGIFNAME 0x8910
@@ -1474,6 +1474,56 @@ typedef struct net_iface_info {
 	uint64_t rx_dropped;
 } net_iface_info_t;
 
+// Aggregate protocol counters (userland view).  Named fields keep the
+// user-facing ABI stable; the kernel folds its internal per-CPU counter
+// array into this struct in net_get_stats().  Counter names follow the
+// standard management-information-base conventions (RFC 4293 IP,
+// RFC 4022 TCP, RFC 4113 UDP) plus extended drop/event counters that make
+// previously-silent discard paths observable.
+typedef struct net_stats_info {
+	/* IP */
+	uint64_t ip_in_receives;
+	uint64_t ip_in_hdr_errors;
+	uint64_t ip_in_delivers;
+	uint64_t ip_out_requests;
+	/* TCP (standard) */
+	uint64_t tcp_active_opens;
+	uint64_t tcp_passive_opens;
+	uint64_t tcp_attempt_fails;
+	uint64_t tcp_estab_resets;
+	uint64_t tcp_in_segs;
+	uint64_t tcp_out_segs;
+	uint64_t tcp_retrans_segs;
+	uint64_t tcp_in_errs;
+	uint64_t tcp_out_rsts;
+	/* TCP (extended drop/event accounting) */
+	uint64_t tcp_paws_drop;
+	uint64_t tcp_oow_seq_drop;
+	uint64_t tcp_challenge_ack;
+	uint64_t tcp_ooo_queue_full;
+	uint64_t tcp_ooo_oversize_drop;
+	uint64_t tcp_ooo_fin_refused;
+	uint64_t tcp_acceptq_full;
+	uint64_t tcp_listener_gone_rst;
+	uint64_t tcp_rst_data_loss;
+	uint64_t tcp_conn_table_full;
+	uint64_t tcp_backlog_drop;
+	uint64_t tcp_persist_probes;
+	uint64_t tcp_syncookie_sent;
+	uint64_t tcp_syncookie_recv;
+	uint64_t tcp_syncookie_fail;
+	uint64_t tcp_tw_created;
+	uint64_t tcp_tw_reused;
+	uint64_t tcp_tw_killed;
+	/* UDP */
+	uint64_t udp_in_datagrams;
+	uint64_t udp_out_datagrams;
+	uint64_t udp_no_ports;
+	uint64_t udp_rcvbuf_errors;
+	/* buffer pool */
+	uint64_t skb_alloc_fail;
+} net_stats_info_t;
+
 // Raw DNS query buffer (shared with userspace)
 typedef struct dns_query_buf {
 	char name[256];
@@ -1491,6 +1541,7 @@ int net_get_route_table(net_route_info_t *entries, int max_entries);
 int net_get_tcp_connections(net_tcp_info_t *entries, int max_entries);
 int net_get_udp_sockets(net_udp_info_t *entries, int max_entries);
 int net_get_iface_info(net_iface_info_t *entries, int max_entries);
+int net_get_stats(net_stats_info_t *out);
 int dhcp_release(net_device_t *dev);
 int dhcp_renew(net_device_t *dev);
 void dhcp_tick(void);

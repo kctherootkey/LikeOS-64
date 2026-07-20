@@ -86,6 +86,7 @@ typedef struct sk_buff {
 // ---- pool-managed lifecycle ----
 
 void skb_pool_init(void);
+uint64_t skb_get_alloc_failures(void);
 
 // Allocate an skb whose data area is at least `min_payload` bytes long.
 // Returns NULL only on pool exhaustion of *both* size classes (effectively

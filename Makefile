@@ -242,7 +242,8 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/unix_socket.o \
 			  $(BUILD_DIR)/skb.o \
 			  $(BUILD_DIR)/softirq.o \
-			  $(BUILD_DIR)/ratelimit.o
+			  $(BUILD_DIR)/ratelimit.o \
+			  $(BUILD_DIR)/netstats.o
 # Target files
 KERNEL_ELF = $(BUILD_DIR)/kernel.elf
 BOOTLOADER_EFI = $(BUILD_DIR)/bootloader.efi
@@ -486,6 +487,9 @@ $(BUILD_DIR)/softirq.o: $(KERNEL_DIR)/net/softirq.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ratelimit.o: $(KERNEL_DIR)/net/ratelimit.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/netstats.o: $(KERNEL_DIR)/net/stats.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ioapic.o: $(KERNEL_DIR)/hal/ioapic.c | $(BUILD_DIR)

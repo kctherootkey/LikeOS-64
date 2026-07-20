@@ -216,7 +216,7 @@ int sock_bind(int sockfd, const struct sockaddr_in *addr)
 			if (bind_ip != o_ip && bind_ip != 0 && o_ip != 0)
 				continue;
 			/* Both explicitly opted into SO_REUSEPORT → allowed,
-			 * but only within one user's group (Linux semantics):
+			 * but only within one user's group (conventional semantics):
 			 * the joining bind must have the same effective UID as
 			 * the socket already holding the port, unless the
 			 * caller is privileged.  Without this, any user could

@@ -229,6 +229,7 @@
 #define NET_GET_UDP_SOCKETS 4
 #define NET_GET_IFACE_STATS 5
 #define NET_DNS_QUERY 6
+#define NET_GET_NETSTATS 7
 
 // DHCP_CONTROL sub-commands
 #define DHCP_CMD_DISCOVER 1

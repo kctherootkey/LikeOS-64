@@ -4,6 +4,7 @@
 #include <kernel/ke/syscall.h>
 #include <kernel/net/skb.h>
 #include <kernel/net/ratelimit.h>
+#include <kernel/net/stats.h>
 #include <kernel/uapi/bug.h>
 
 // UDP pseudo-header for checksum
@@ -92,6 +93,8 @@ int udp_send(net_device_t *dev, uint32_t dst_ip, uint16_t src_port,
 		udp_compute_checksum(src_ip, dst_ip, buf, (uint16_t)udp_len);
 
 	int ret = ipv4_send(dev, dst_ip, IP_PROTO_UDP, skb->data, skb->len);
+	if (ret >= 0)
+		NET_STATS_INC(NET_MIB_UDP_OUTDATAGRAMS);
 	skb_put(skb);
 	return ret;
 }
@@ -153,6 +156,8 @@ void udp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 		}
 	}
 
+	NET_STATS_INC(NET_MIB_UDP_INDATAGRAMS);
+
 	const uint8_t *payload = data + sizeof(udp_header_t);
 	uint16_t payload_len = udp_len - sizeof(udp_header_t);
 
@@ -171,6 +176,7 @@ void udp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 	// Deliver to socket layer
 	extern net_socket_t *sock_find_udp(uint16_t port, uint32_t dst_ip);
 	if (!sock_find_udp(dst_port, dst_ip)) {
+		NET_STATS_INC(NET_MIB_UDP_NOPORTS);
 		// Rate-limit ICMP port-unreachable to prevent reflection amplification
 		uint64_t rl_flags;
 		spin_lock_irqsave(&g_ratelimit_lock, &rl_flags);
@@ -231,6 +237,7 @@ void udp_deliver_to_socket(uint32_t src_ip, uint16_t src_port, uint32_t dst_ip,
 	int next = (sk->udp_rx_tail + 1) % 16;
 	if (next == sk->udp_rx_head) {
 		// Queue full, drop packet
+		NET_STATS_INC(NET_MIB_UDP_RCVBUFERRORS);
 		spin_unlock_irqrestore(&sk->lock, flags);
 		return;
 	}
