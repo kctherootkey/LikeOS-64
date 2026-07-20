@@ -515,7 +515,7 @@ static uint16_t tcp_advertised_window(tcp_conn_t *conn)
 	// Only apply the receive window scale when window scaling was actually
 	// negotiated — mirror the send side, which gates the snd_wscale shift on
 	// ws_enabled (see the ESTABLISHED inbound-window handling).  A conn that
-	// never negotiated WS keeps the default rcv_wscale=7 from tcp_alloc_conn;
+	// never negotiated WS keeps the default rcv_wscale=7 from tcp_conn_alloc;
 	// the stateless SYN-cookie path in particular leaves rcv_wscale=7 while
 	// ws_enabled=0.  Shifting by it would advertise a 128x-too-small window to
 	// a peer that reads the field unscaled, throttling that peer to ~1/128 of
@@ -1526,8 +1526,6 @@ tcp_conn_t *tcp_connect(net_device_t *dev, uint32_t local_ip, uint32_t dst_ip,
 	}
 	if (!conn) {
 		NET_STATS_INC(NET_MIB_TCP_CONNTABLEFULL);
-		WARN_RATELIMIT(
-			1, "tcp_connect: connection cap reached even after reap");
 		slab_free(new_rx);
 		slab_free(new_tx);
 		tcp_free_seg_arrays(new_if, new_ooo);
@@ -1622,8 +1620,6 @@ tcp_conn_t *tcp_listen(net_device_t *dev, uint32_t local_ip,
 	}
 	if (!conn) {
 		NET_STATS_INC(NET_MIB_TCP_CONNTABLEFULL);
-		WARN_RATELIMIT(
-			1, "tcp_listen: connection cap reached even after reap");
 		slab_free(new_rx);
 		slab_free(new_tx);
 		tcp_free_seg_arrays(new_if, new_ooo);
@@ -1868,7 +1864,7 @@ int tcp_send_data(tcp_conn_t *conn, const uint8_t *data, uint16_t len)
 		conn->remote_port ==
 			0); /* sending on a connection without a bound 4-tuple */
 	WARN_ON(conn->tx_buf ==
-		NULL); /* TX ring buffer is NULL — tcp_alloc_conn invariant violated */
+		NULL); /* TX ring buffer is NULL — tcp_conn_alloc invariant violated */
 
 	uint64_t flags;
 	tcp_lock_acquire(&conn->lock, &flags);
@@ -2026,11 +2022,6 @@ static tcp_seg_verdict_t tcp_validate_incoming(tcp_conn_t *conn, uint8_t flags,
 			if (conn->inflight_count > 0 || conn->rx_ready)
 				NET_STATS_INC(NET_MIB_TCP_RSTDATALOSS);
 			NET_STATS_INC(NET_MIB_TCP_ESTABRESETS);
-			WARN_RATELIMIT(
-				conn->inflight_count > 0 || conn->rx_ready,
-				"tcp_rx: in-window RST aborted :%u->:%u mid-transfer (inflight=%u rx_ready=%d) - data lost",
-				conn->local_port, conn->remote_port,
-				conn->inflight_count, conn->rx_ready);
 			return TCP_SEG_RESET;
 		}
 		NET_STATS_INC(NET_MIB_TCP_CHALLENGEACK);
@@ -2199,51 +2190,17 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 				goto rx_no_conn_done;
 			}
 
-			uint64_t flags;
-			spin_lock_irqsave(&tcp_lock, &flags);
-
-			/* Duplicate-conn guard.  The tcp_find_conn() at the top
-			 * of tcp_rx ran LOCK-FREE, so between it and acquiring
-			 * tcp_lock here another CPU processing a racing SYN for
-			 * the SAME 4-tuple (a client SYN retransmit, or the
-			 * loopback self-connect delivering the peer's SYN on
-			 * another CPU) may have already allocated + published a
-			 * SYN_RECEIVED conn.  Re-check under the lock: without
-			 * this we would allocate a SECOND conn for one 4-tuple.
-			 * The client's data then lands on whichever conn
-			 * tcp_find_conn returns first while accept() hands the
-			 * listener the OTHER, empty conn — the server reads an
-			 * immediate 0-byte EOF although the client sent and
-			 * completed fine (intermittent "tcp eth0: recv 0/4096
-			 * rc=0" under parallel teststress).  Drop this SYN; the
-			 * existing conn's SYN-ACK (already sent, and rearmed by
-			 * the retransmit timer) drives the handshake. */
-			if (tcp_find_conn_locked(local_ip, dst_port, src_ip,
-					  src_port)) {
-				spin_unlock_irqrestore(&tcp_lock, flags);
-				slab_free(nc_rx);
-				slab_free(nc_tx);
-				tcp_free_seg_arrays(nc_if, nc_ooo);
-				goto rx_no_conn_done;
-			}
-
+			// Allocate the connection OUTSIDE tcp_lock (slab_alloc may
+			// fire a TLB-shootdown IPI); it adopts the buffers above.
 			tcp_conn_t *new_conn =
 				tcp_conn_alloc(nc_rx, nc_tx, nc_if, nc_ooo);
 			if (!new_conn) {
-				// Table full.  Reap TIME_WAIT slots (RFC 6191) before
-				// falling back to stateless SYN cookies — cookies disable
-				// TS/WSCALE/SACK option negotiation, so handshakes that
-				// succeed via cookies have degraded performance for the
-				// entire connection.  Reaping is done WITHOUT tcp_lock
-				// because tcp_free_conn may slab_free → TLB shootdown.
-				spin_unlock_irqrestore(&tcp_lock, flags);
 				tcp_reap_time_wait_slots();
-				spin_lock_irqsave(&tcp_lock, &flags);
+				tcp_reap_pending();
 				new_conn = tcp_conn_alloc(nc_rx, nc_tx, nc_if,
 							  nc_ooo);
 			}
 			if (!new_conn) {
-				spin_unlock_irqrestore(&tcp_lock, flags);
 				slab_free(nc_rx);
 				slab_free(nc_tx);
 				tcp_free_seg_arrays(nc_if, nc_ooo);
@@ -2306,9 +2263,27 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 			if (pop.sack_perm)
 				new_conn->sack_ok = 1;
 
-			// Publish: 4-tuple set, now lock-free walkers may match this slot.
-			tcp_publish_conn(new_conn);
-			spin_unlock_irqrestore(&tcp_lock, flags);
+			// Publish under tcp_lock, guarding against a racing SYN
+			// for the SAME 4-tuple having already created a
+			// connection on another CPU (a client SYN retransmit or
+			// the loopback self-connect delivering on another CPU).
+			// Without the re-check we would mint a SECOND connection
+			// for one 4-tuple; the client's data would then split
+			// across the two while accept() hands out the wrong
+			// (empty) one.  Drop ours; the existing connection's
+			// SYN-ACK drives the handshake.
+			{
+				uint64_t flags;
+				spin_lock_irqsave(&tcp_lock, &flags);
+				if (tcp_find_conn_locked(local_ip, dst_port,
+							 src_ip, src_port)) {
+					spin_unlock_irqrestore(&tcp_lock, flags);
+					tcp_conn_free_unpublished(new_conn);
+					goto rx_no_conn_done;
+				}
+				tcp_publish_conn(new_conn);
+				spin_unlock_irqrestore(&tcp_lock, flags);
+			}
 
 			// Send SYN+ACK with mirrored options
 			tcp_send_synack_conn(new_conn,
@@ -2346,46 +2321,18 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 					goto rx_no_conn_done;
 				}
 
-				uint64_t flags;
-				spin_lock_irqsave(&tcp_lock, &flags);
-
-				/* Same duplicate-conn guard as the SYN path: the
-				 * top-of-tcp_rx tcp_find_conn ran lock-free, so a
-				 * racing cookie-ACK (retransmit, or the loopback
-				 * self-connect delivering on another CPU) may have
-				 * already created + published the conn for this
-				 * 4-tuple.  Re-check under the lock so we never
-				 * mint a SECOND conn — otherwise the client's data
-				 * splits across two conns and accept() hands out
-				 * the wrong (empty) one. */
-				if (tcp_find_conn_locked(local_ip, dst_port, src_ip,
-						  src_port)) {
-					spin_unlock_irqrestore(&tcp_lock, flags);
-					slab_free(cc_rx);
-					slab_free(cc_tx);
-					tcp_free_seg_arrays(cc_if, cc_ooo);
-					goto rx_no_conn_done;
-				}
-
+				// Allocate the connection OUTSIDE tcp_lock
+				// (slab_alloc TLB-shootdown safety); it adopts the
+				// buffers above.
 				tcp_conn_t *new_conn = tcp_conn_alloc(
 					cc_rx, cc_tx, cc_if, cc_ooo);
 				if (!new_conn) {
-					// Table full.  Reap TIME_WAIT slots and retry —
-					// otherwise a valid SYN-cookie ACK is silently
-					// dropped, the client's send() proceeds against a
-					// half-open connection, and every data segment is
-					// RST'd by the no-listener path below until the
-					// client gives up.
-					spin_unlock_irqrestore(&tcp_lock,
-							       flags);
 					tcp_reap_time_wait_slots();
-					spin_lock_irqsave(&tcp_lock, &flags);
+					tcp_reap_pending();
 					new_conn = tcp_conn_alloc(cc_rx, cc_tx,
 								  cc_if, cc_ooo);
 				}
 				if (!new_conn) {
-					spin_unlock_irqrestore(&tcp_lock,
-							       flags);
 					slab_free(cc_rx);
 					slab_free(cc_tx);
 					tcp_free_seg_arrays(cc_if, cc_ooo);
@@ -2416,16 +2363,27 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 				NET_STATS_INC(NET_MIB_TCP_PASSIVEOPENS);
 				new_conn->parent = listener;
 
-				// Publish new_conn FIRST (4-tuple is set; lock-free walkers
-				// may now match it), THEN release tcp_lock, THEN take
-				// listener->lock for the accept_queue enqueue.  We do NOT
-				// hold tcp_lock and listener->lock simultaneously: doing so
-				// would extend the IRQ-off section across two lock
-				// acquisitions and contribute to TLB-shootdown timeouts
-				// when other CPUs are already contending listener->lock
-				// via tcp_accept().
-				tcp_publish_conn(new_conn);
-				spin_unlock_irqrestore(&tcp_lock, flags);
+				// Publish under tcp_lock with the same duplicate-
+				// connection guard as the SYN path (a racing
+				// cookie-ACK may have already created the conn for
+				// this 4-tuple).  Release tcp_lock BEFORE taking
+				// listener->lock for the accept enqueue — never
+				// hold both at once.
+				{
+					uint64_t flags;
+					spin_lock_irqsave(&tcp_lock, &flags);
+					if (tcp_find_conn_locked(local_ip,
+								 dst_port, src_ip,
+								 src_port)) {
+						spin_unlock_irqrestore(&tcp_lock,
+								       flags);
+						tcp_conn_free_unpublished(
+							new_conn);
+						goto rx_no_conn_done;
+					}
+					tcp_publish_conn(new_conn);
+					spin_unlock_irqrestore(&tcp_lock, flags);
+				}
 
 				// Enqueue to listener accept queue under listener->lock so
 				// it serialises with tcp_accept (the reader).  Re-validate
@@ -2507,12 +2465,9 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 	int ack_pending = 0;
 	tcp_lock_acquire(&conn->lock, &flags);
 
-	// TOCTOU re-validate: tcp_find_conn() above ran lock-free, so between
-	// that lookup and acquiring conn->lock the slot may have been freed
-	// (active=0) or recycled with a different 4-tuple by tcp_alloc_conn on
-	// another CPU.  If anything no longer matches, drop the packet — the
-	// caller's payload pointer would otherwise be applied to the wrong
-	// connection (silent cross-stream corruption) or a freed buffer (UAF).
+	// Re-validate under conn->lock.  We hold a reference (tcp_find_conn_hold),
+	// so the connection cannot be freed, but its 4-tuple could in principle
+	// change; if anything no longer matches, drop the packet.
 	if (!conn->active || conn->local_port != dst_port ||
 	    conn->remote_port != src_port || conn->remote_ip != src_ip ||
 	    (conn->local_ip != local_ip && conn->local_ip != 0)) {
@@ -2656,19 +2611,11 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 				// the writes below.  Drop the stale link so the
 				// orphan-recovery fallback in tcp_accept can still pair
 				// this conn with the real listener by 4-tuple.
-				/* Read conn->parent ONCE into a local.  The previous code
-                 * read it twice — once for the NULL test, once for the
-                 * deref below — which is a TOCTOU race: another CPU can set
-                 * conn->parent = NULL between the two reads (e.g.
-                 * tcp_detach_listener_children() when the listener is
-                 * closed, tcp_free_conn(), or the TIME_WAIT reaper), none of
-                 * which serialise against this conn->lock.  The compiler
-                 * reloaded the field, so the NULL test passed but the deref
-                 * used NULL, computing &((tcp_conn_t*)0)->lock == 0x2e520 and
-                 * page-faulting inside spin_lock_irqsave (observed as a
-                 * kernel #PF in ksoftirqd's tcp_rx promotion path).  A stale
-                 * but non-NULL parent is still handled — it is re-validated
-                 * under p->lock below. */
+				/* Read conn->parent ONCE into a local: another CPU
+                 * can clear it (tcp_detach_listener_children on listener
+                 * close) between a NULL test and a deref, so a re-read
+                 * could deref NULL.  A stale but non-NULL parent is fine —
+                 * it is re-validated under p->lock below. */
 				tcp_conn_t *p = conn->parent;
 				if (p) {
 					uint64_t pflags;
@@ -2698,32 +2645,20 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 							 * parent link so orphan
 							 * recovery may still find it,
 							 * but a blocking accept() can
-							 * miss it and time out. */
+							 * miss it and time out.
+							 * Counted (ACCEPTQFULL). */
 							NET_STATS_INC(
 								NET_MIB_TCP_ACCEPTQFULL);
-							WARN_RATELIMIT(
-								1,
-								"tcp: accept queue full on listener :%u (backlog=%d) - established child :%u not enqueued",
-								p->local_port,
-								p->backlog,
-								conn->remote_port);
 						}
 						spin_unlock_irqrestore(&p->lock,
 								       pflags);
 					} else {
 						/* Parent is no longer a LISTEN conn
-						 * on our port — it was closed and
-						 * the slot recycled (TIME_WAIT churn)
-						 * between tcp_find_listener and here.
-						 * The child is orphaned and only
+						 * on our port — it was closed
+						 * between the lookup and here.  The
+						 * child is orphaned and only
 						 * reachable via tcp_accept's 4-tuple
-						 * fallback; if that misses it,
-						 * accept() times out. */
-						WARN_RATELIMIT(
-							1,
-							"tcp: listener for established child :%u->:%u recycled before enqueue - relying on orphan recovery",
-							conn->local_port,
-							conn->remote_port);
+						 * fallback. */
 						spin_unlock_irqrestore(&p->lock,
 								       pflags);
 						conn->parent = NULL;
@@ -2739,16 +2674,11 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 					 * recovery.  Nothing will ever accept this
 					 * conn: keeping it leaves the peer talking to
 					 * a socket-less ESTABLISHED zombie until its
-					 * own timeout (observed: TLS client starving
-					 * 120 s in SSL_connect), and the slot leaks.
+					 * own timeout, and the connection leaks.
 					 * RFC-conformant behaviour is a reset — the
-					 * peer gets ECONNRESET immediately. */
+					 * peer gets ECONNRESET immediately.  Counted
+					 * (LISTENERGONE). */
 					NET_STATS_INC(NET_MIB_TCP_LISTENERGONE);
-					WARN_RATELIMIT(
-						1,
-						"tcp: established child :%u->:%u has no listener - RST peer and fail conn",
-						conn->local_port,
-						conn->remote_port);
 					tcp_send_rst(conn->dev, conn->local_ip,
 						     conn->remote_ip,
 						     conn->local_port,
@@ -3140,11 +3070,10 @@ established_segment:
 				poll_notify_io_ready();
 				sched_wake_channel((void *)&conn->rx_ready);
 			} else {
+				// Out-of-order FIN (a data hole precedes it):
+				// dup-ACK and wait for the retransmit rather than
+				// jumping rcv_nxt over the hole.  Counted.
 				NET_STATS_INC(NET_MIB_TCP_OOOFINREFUSED);
-				WARN_RATELIMIT(
-					1,
-					"tcp_rx: out-of-order FIN refused (seq=%u len=%u rcv_nxt=%u)",
-					seq, payload_len, conn->rcv_nxt);
 			}
 			tcp_queue_ack_locked(conn);
 			ack_pending = 1;
@@ -3579,18 +3508,11 @@ void tcp_timer_tick(void)
 			    (conn->handshake_deadline &&
 			     now >= conn->handshake_deadline)) {
 				/* A half-open server conn whose 3-way handshake
-				 * never completed: the client's ACK never arrived
-				 * (or its SYN-ACK never reached the client) before
-				 * the deadline.  The child never reached the accept
-				 * queue, so a blocking accept() on this listener
-				 * times out (errno ETIMEDOUT) — exactly the "tcp
-				 * eth0: accept" failure.  Rate-limited so a real SYN
-				 * flood can't spam. */
-				WARN_RATELIMIT(
-					1,
-					"tcp: SYN_RECEIVED :%u->:%u dropped after handshake timeout (retx=%u) - accept() will time out",
-					conn->local_port, conn->remote_port,
-					conn->retransmit_count);
+				 * never completed (the client's ACK never
+				 * arrived).  Drop it — a blocking accept() on this
+				 * listener sees nothing and times out.  Counted as
+				 * a failed connection attempt. */
+				NET_STATS_INC(NET_MIB_TCP_ATTEMPTFAILS);
 				tcp_conn_kill(conn);
 				goto unlock_conn;
 			}
