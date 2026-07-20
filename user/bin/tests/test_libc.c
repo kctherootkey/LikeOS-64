@@ -9348,11 +9348,14 @@ network_section:
 			}
 			close(sync_pipe[1]);
 
-			/* 30 s accept timeout — prevents the server child from hanging
-             * indefinitely if the client never connects (e.g. port collision
-             * edge case with a parallel instance). */
+			/* DEBUG: 30 MINUTE accept timeout (was 30 s).  The recurring
+             * TLS failure leaves both ends starved with NO kernel warning;
+             * freezing the test in-kernel for half an hour lets a Ctrl+N
+             * network dump capture the live TCP table (rnxt/snxt/suna/ooo
+             * of both conns) while the evidence still exists.  Revert to
+             * 30 s once the root cause is fixed. */
 			{
-				struct timeval atv = { .tv_sec = 30,
+				struct timeval atv = { .tv_sec = 1800,
 						       .tv_usec = 0 };
 				setsockopt(srv_sock, SOL_SOCKET, SO_RCVTIMEO,
 					   &atv, sizeof(atv));
@@ -9536,9 +9539,14 @@ network_section:
 				cli_sock = socket(AF_INET, SOCK_STREAM, 0);
 				if (cli_sock < 0)
 					break;
-				/* 120 s receive timeout — two parallel TLS sessions on a
-                 * slow VMware VM can take much longer than 30 s under load */
-				struct timeval rcv_tv = { .tv_sec = 120,
+				/* DEBUG: 30 MINUTE receive timeout (was 120 s) — freeze
+                 * the client in-kernel on the starved conn so a Ctrl+N
+                 * dump shows its live seq state instead of a post-mortem
+                 * empty table.  Dump within the first ~4 minutes for the
+                 * richest state (before the retransmit give-up marks the
+                 * conn with ETIMEDOUT — it stays visible either way).
+                 * Revert to 120 s once the root cause is fixed. */
+				struct timeval rcv_tv = { .tv_sec = 1800,
 							  .tv_usec = 0 };
 				setsockopt(cli_sock, SOL_SOCKET, SO_RCVTIMEO,
 					   &rcv_tv, sizeof(rcv_tv));

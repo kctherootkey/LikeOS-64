@@ -172,8 +172,21 @@ __attribute__((noreturn, no_stack_protector)) void __stack_chk_fail(void)
 			kprintf("    GS:104 was updated by a context switch between this function's\n");
 			kprintf("    prologue (saved 'found') and epilogue (read 'expected').\n");
 			kprintf("    No actual stack smash occurred.\n");
-			kprintf("    Fix: ensure the scheduler writes task canary to GS:104 BEFORE\n");
-			kprintf("    re-enabling interrupts (sti) in sched_schedule/sched_run_ready.\n");
+			/* Name the owning tasks: 'found' belongs to the task whose
+			 * canary sat in GS:104 at this function's PROLOGUE — i.e.
+			 * the task some switch-in path failed to replace.  Together
+			 * with the current task this pinpoints which switch path
+			 * skipped the canary install. */
+			{
+				task_t *ft = sched_task_by_canary(found);
+				task_t *et = sched_task_by_canary(expected);
+				kprintf("    'found' canary owner:    tid=%d comm=%s\n",
+					ft ? (int)ft->id : -1,
+					ft ? ft->comm : "(no live task)");
+				kprintf("    'expected' canary owner: tid=%d comm=%s\n",
+					et ? (int)et->id : -1,
+					et ? et->comm : "(no live task)");
+			}
 		} else if (found_null_term && expect_null_term && pat == NULL) {
 			kprintf("??? AMBIGUOUS: both canaries have valid format (null low byte,\n");
 			kprintf("    no recognizable pattern).  Possible scheduler race where the\n");
@@ -208,12 +221,31 @@ __attribute__((noreturn, no_stack_protector)) void __stack_chk_fail(void)
 		 * TLB-shootdown IPIs, which times out every other CPU doing a
 		 * slab_free/address-space teardown and stalls the whole machine
 		 * (observed as "SMP: TLB shootdown sync timeout", then cascading
-		 * loopback / fork-child hangs).  Park INTERRUPTIBLY instead: the
-		 * timer preempts this frame to run real work and IPIs are
-		 * serviced, so the system keeps running.  The one task that hit
-		 * the false positive is parked here (acceptable — it is almost
-		 * always an idle task, and losing one task beats losing the
-		 * box).  Only a genuine smash (below) still halts. */
+		 * loopback / fork-child hangs).
+		 *
+		 * An sti;hlt loop is NOT enough either: kernel-mode frames are
+		 * never involuntarily preempted in this design (cooperative
+		 * only), so hlt keeps the CPU pinned on this dead task forever.
+		 * When the victim is a real task rather than an idle task, every
+		 * READY task on this CPU's runqueue is stranded behind it —
+		 * observed as PID 2 parking CPU 0 (NET_RX_CPU) and starving
+		 * ksoftirqd/0: rx_q grew unbounded and all networking hung
+		 * system-wide.
+		 *
+		 * So in process context, surrender the CPU through the scheduler
+		 * forever: the task stays parked in this loop (acceptable), but
+		 * the runqueue keeps draining.  From IRQ context or with
+		 * preemption disabled, scheduling is impossible — fall back to
+		 * the interruptible halt (IPIs still serviced). */
+		if (pcpu && pcpu->interrupt_nesting == 0 &&
+		    pcpu->preempt_count == 0) {
+			kprintf("\nFALSE POSITIVE — task parked, CPU yields (runqueue keeps draining)\n");
+			kprintf("========================================\n");
+			for (;;) {
+				__asm__ volatile("sti" ::: "memory");
+				sched_yield_in_kernel();
+			}
+		}
 		kprintf("\nFALSE POSITIVE — CPU parked INTERRUPTIBLY (system continues, TLB/IPI serviced)\n");
 		kprintf("========================================\n");
 		for (;;)

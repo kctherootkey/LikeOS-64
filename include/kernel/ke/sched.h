@@ -567,6 +567,8 @@ void sched_defer_reap(
 task_t *sched_find_task_by_id(uint32_t pid); // Find task by PID
 task_t *sched_find_task_by_id_locked(
 	uint32_t pid); // Find task by PID (caller holds g_task_list_lock)
+task_t *sched_task_by_canary(
+	uint64_t canary); // Crash diagnostic: lock-free, __stack_chk_fail only
 void sched_add_child(task_t *parent, task_t *child); // Add child to parent
 void sched_remove_child(task_t *parent,
 			task_t *child); // Remove child from parent

@@ -108,16 +108,32 @@ extern void panic(const char *fmt, ...)
 	})
 
 // ============================================================================
-// WARN_RATELIMIT — rate-limited warning (at most 10 messages per call site)
+// WARN_RATELIMIT — rate-limited warning (≤ 10 messages per call site per
+// 60-second window)
 //
 // Useful in hot paths (interrupt handlers, network RX) where a single bad
 // condition can generate thousands of log lines per second.
+//
+// The budget REFILLS once per minute rather than being per-boot: a per-boot
+// budget went permanently silent on multi-hour stress runs — by iteration
+// ~4000 every seasoned call site had spent its 10 prints, so the one
+// incident that mattered produced no diagnostics ("the WARN didn't fire"
+// stopped being evidence).  Worst case is still bounded: 10 lines/min/site.
+// The unlocked static counters can race; a lost increment just permits an
+// extra line — acceptable for diagnostics.
 // ============================================================================
 #define WARN_RATELIMIT(cond, fmt, ...)                                                                \
 	({                                                                                            \
 		int __ret_rl = !!(cond);                                                              \
 		if (unlikely(__ret_rl)) {                                                             \
 			static int __rl_count = 0;                                                    \
+			static uint64_t __rl_window = 0;                                              \
+			extern uint64_t timer_ticks(void);                                            \
+			uint64_t __rl_now = timer_ticks();                                            \
+			if (__rl_now - __rl_window > 6000) { /* 60 s @ 100 Hz */                      \
+				__rl_window = __rl_now;                                               \
+				__rl_count = 0;                                                       \
+			}                                                                             \
 			if (__rl_count < 10) {                                                        \
 				++__rl_count;                                                         \
 				kprintf("WARNING (ratelimit %d/10): at %s:%d %s(): " fmt              \
@@ -125,7 +141,7 @@ extern void panic(const char *fmt, ...)
 					__rl_count, __FILE__, __LINE__,                               \
 					__func__, ##__VA_ARGS__);                                     \
 				if (__rl_count == 10)                                                 \
-					kprintf("WARNING (ratelimit): further occurrences suppressed" \
+					kprintf("WARNING (ratelimit): suppressed for 60s"             \
 						" at %s:%d\n",                                        \
 						__FILE__, __LINE__);                                  \
 			}                                                                             \

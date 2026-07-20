@@ -5024,6 +5024,12 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	// Initialize child from parent
 	mm_memcpy(child, cur, sizeof(task_t));
 
+	/* Fresh kernel-stack canary — same rationale as sched_fork_current:
+	 * the wholesale copy duplicated the parent's canary; the child's only
+	 * kernel context is the hand-built fork_child_return frame, so no live
+	 * frame carries the old value and regenerating is safe. */
+	child->stack_canary = generate_stack_canary();
+
 	/* Demand paging: a fork-like clone (no CLONE_VM) copies the region
 	 * table by value and is its own thread-group leader, so it needs its
 	 * own reference on every file-backed lazy region.  CLONE_VM threads
@@ -8229,7 +8235,10 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 		}
 	}
 
-	/* Clear syscall tracking on return */
-	cpu->current_syscall_nr = -1;
+	/* Clear syscall tracking on return.  Re-derive the percpu pointer:
+	 * the syscall may have blocked and this task may have been resumed on
+	 * a DIFFERENT CPU — `cpu` from function entry would then point at the
+	 * old CPU and clobber ITS current_syscall_nr mid-syscall. */
+	this_cpu()->current_syscall_nr = -1;
 	return ret;
 }

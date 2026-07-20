@@ -109,6 +109,15 @@ void sched_set_init_task(task_t *t)
 static uint64_t *g_kernel_pml4 = 0;
 static uint64_t g_default_kernel_stack = 0;
 
+/* Pristine per-CPU kernel-task syscall stack (the CPU's dedicated static
+ * interrupt stack, captured at scheduler init BEFORE any user task mutates
+ * TSS RSP0).  switch_address_space must use THIS for kernel tasks — reading
+ * the value back from the TSS returns whatever the LAST USER TASK set RSP0
+ * to, leaving gs:syscall_kernel_rsp and RSP0 pointing at that task's kernel
+ * stack (possibly freed, possibly in live use on another CPU) for as long
+ * as a kernel task is current. */
+static uint64_t g_kernel_task_krsp[MAX_CPUS];
+
 // Current kernel stack for syscall handler is now per-CPU: percpu_t::syscall_kernel_rsp
 // (set in switch_address_space, read by syscall_entry via GS:8)
 
@@ -463,8 +472,15 @@ static inline void switch_address_space(task_t *prev, task_t *next)
 		tss_set_kernel_stack(next->kernel_stack_top);
 		this_cpu()->syscall_kernel_rsp = next->kernel_stack_top;
 	} else {
-		// Use this CPU's kernel stack from TSS (not BSP's global default)
-		uint64_t cpu_kernel_stack = tss_get_kernel_stack();
+		// Kernel task: use this CPU's pristine dedicated kernel stack
+		// (captured at sched init).  The old code read the value BACK
+		// from the TSS — i.e. whatever the last USER task set RSP0 to —
+		// so a kernel task's gs:syscall_kernel_rsp and RSP0 pointed at
+		// that user task's kernel stack: freed when it exits, and in
+		// concurrent use when it runs on another CPU.
+		uint64_t cpu_kernel_stack = g_kernel_task_krsp[this_cpu_id()];
+		if (!cpu_kernel_stack)
+			cpu_kernel_stack = tss_get_kernel_stack(); /* pre-init */
 		tss_set_kernel_stack(cpu_kernel_stack);
 		this_cpu()->syscall_kernel_rsp = cpu_kernel_stack;
 	}
@@ -521,6 +537,25 @@ static void task_list_remove(task_t *t)
 			return;
 		}
 	}
+}
+
+/* Crash-handler diagnostic: find the live task owning a given stack canary.
+ * Called from __stack_chk_fail (IRQs off, possibly mid-crash) — must NOT take
+ * g_task_list_lock.  The lock-free walk is bounded and pointer-validated so a
+ * torn list at worst misses a match; it must never fault (a #PF here would
+ * turn a parked false positive into a real crash).  no_stack_protector: this
+ * runs while GS:104 is in a known-inconsistent state. */
+__attribute__((no_stack_protector)) task_t *sched_task_by_canary(uint64_t canary)
+{
+	int depth = 0;
+	for (task_t *t = g_task_list_head; t && depth < 4096;
+	     t = t->next, depth++) {
+		if ((uint64_t)t < 0xffff800000000000ULL)
+			break; /* dangling/torn pointer — stop, don't fault */
+		if (t->stack_canary == canary)
+			return t;
+	}
+	return NULL;
 }
 
 // ============================================================================
@@ -1029,13 +1064,29 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 		return;
 	}
 
+	/* Disable IRQs BEFORE reading this_cpu()/current_task.  The old order
+	 * (read both, THEN spin_lock_irqsave) left a preemptible window: a
+	 * timer preempt in those few instructions makes this task READY, the
+	 * load balancer can pull it to another CPU, and it resumes HERE with
+	 * `cpu` and `cur` still pointing at the OLD CPU's percpu and current
+	 * task.  It then runs the whole switch against the wrong CPU:
+	 * `cpu->current_task = next` stomps the old CPU's current-task pointer
+	 * while that CPU is running something else entirely.  From that moment
+	 * the old CPU misattributes its running task — its next voluntary
+	 * block saves the RUNNING task's stack pointer into the WRONG task's
+	 * ->sp, and dispatching that task later resumes it in the middle of a
+	 * foreign kernel stack (observed: bootstrap task "resumed" inside a
+	 * user task's sys_execve frames → canary mismatch, found == the
+	 * fork-parent's canary live on another CPU). */
+	uint64_t flags = local_irq_save();
 	percpu_t *cpu = this_cpu();
 	task_t *cur = cpu->current_task;
-	if (!cur)
+	if (!cur) {
+		local_irq_restore(flags);
 		return;
+	}
 
-	uint64_t flags;
-	spin_lock_irqsave(&cpu->runqueue_lock, &flags);
+	spin_lock(&cpu->runqueue_lock);
 
 	g_total_schedules++;
 
@@ -1177,16 +1228,22 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	next->sp = 0;
 	ctx_switch_asm(&prev->sp, next_sp);
 
-	// Resumed on the new task's stack.  Always clear the guard — the task
-	// we just resumed could have been suspended from any scheduling path.
-	this_cpu()->in_context_switch = 0;
-	__asm__ volatile("sti");
-
-	// Queue and reap deferred zombie now that we are on a safe stack.
+	// Resumed on the new task's stack.  Process the deferred zombie BEFORE
+	// clearing in_context_switch: while the flag is set, sched_preempt
+	// refuses to preempt this CPU, so we cannot be migrated between the
+	// this_cpu() reads below.  (With the flag already cleared and IRQs on,
+	// a preempt+migration between the reads would queue CPU A's zombie and
+	// then NULL CPU B's slot — losing B's pending zombie.)
 	if (this_cpu()->deferred_zombie) {
 		dead_thread_queue(this_cpu()->deferred_zombie);
 		this_cpu()->deferred_zombie = NULL;
 	}
+
+	// Always clear the guard — the task we just resumed could have been
+	// suspended from any scheduling path.
+	this_cpu()->in_context_switch = 0;
+	__asm__ volatile("sti");
+
 	dead_thread_reap();
 
 	// CRITICAL: if we resumed as a task that has since been zombied (e.g.
@@ -1216,13 +1273,17 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 	if (!g_smp_initialized)
 		return;
 
-	task_t *cur = sched_current();
-	if (!cur || !cur->need_resched)
-		return;
-
+	/* IRQs off BEFORE reading this_cpu()/current_task — same stale-percpu
+	 * migration hazard as sched_schedule (see the comment there). */
+	uint64_t flags = local_irq_save();
 	percpu_t *cpu = this_cpu();
-	uint64_t flags;
-	spin_lock_irqsave(&cpu->runqueue_lock, &flags);
+	task_t *cur = cpu->current_task;
+	if (!cur || !cur->need_resched) {
+		local_irq_restore(flags);
+		return;
+	}
+
+	spin_lock(&cpu->runqueue_lock);
 
 	cur->need_resched = 0;
 
@@ -1325,15 +1386,18 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 	next->sp = 0;
 	ctx_switch_asm(&prev->sp, next_sp);
 
-	// Resumed on the new task's stack.  Always clear the guard.
-	this_cpu()->in_context_switch = 0;
-	__asm__ volatile("sti");
-
-	// Queue and reap deferred zombie now that we are on a safe stack.
+	// Resumed on the new task's stack.  Process the deferred zombie BEFORE
+	// clearing in_context_switch — see the comment in sched_schedule: the
+	// set flag blocks preemption, keeping this_cpu() stable across the
+	// reads below.
 	if (this_cpu()->deferred_zombie) {
 		dead_thread_queue(this_cpu()->deferred_zombie);
 		this_cpu()->deferred_zombie = NULL;
 	}
+
+	// Always clear the guard.
+	this_cpu()->in_context_switch = 0;
+	__asm__ volatile("sti");
 	dead_thread_reap();
 }
 
@@ -1726,6 +1790,13 @@ task_t *sched_fork_current(void)
 
 	// Copy parent
 	mm_memcpy(child, cur, sizeof(task_t));
+
+	/* Fresh kernel-stack canary: the wholesale copy above duplicated the
+	 * parent's.  The child's kernel context is only the hand-built
+	 * fork_child_return frame (no live C frames carry the old value), so
+	 * regenerating is safe — and per-task-unique canaries keep the stack-
+	 * smash detector's "which task's canary is this" diagnostics honest. */
+	child->stack_canary = generate_stack_canary();
 
 	/* Demand paging: the child inherits the region table by value; each
 	 * file-backed region pins its backing file with a reference, so the
@@ -2811,6 +2882,9 @@ void sched_enable_smp(void)
 	// Initialize syscall_kernel_rsp for BSP
 	// This is critical for syscall handling in SMP mode
 	bsp->syscall_kernel_rsp = tss_get_kernel_stack();
+	// Capture the pristine value while TSS RSP0 is still the BSP's own
+	// static interrupt stack (no user task has run yet).
+	g_kernel_task_krsp[bsp->cpu_id] = bsp->syscall_kernel_rsp;
 
 	// Enqueue all READY tasks (except idle and bootstrap) to CPU 0's run queue
 	for (task_t *t = g_task_list_head; t; t = t->next) {
@@ -2933,6 +3007,9 @@ void sched_init_ap(uint32_t cpu_id)
 	// This is critical: without this, syscalls on this CPU before any
 	// context switch would use an invalid (zero) kernel stack pointer
 	cpu->syscall_kernel_rsp = tss_get_kernel_stack();
+	// Capture the pristine value while TSS RSP0 is still this AP's own
+	// static interrupt stack (no user task has run on this CPU yet).
+	g_kernel_task_krsp[cpu->cpu_id] = cpu->syscall_kernel_rsp;
 
 	kprintf("Scheduler: CPU %u initialized (idle task PID %d)\n", cpu_id,
 		idle->id);
