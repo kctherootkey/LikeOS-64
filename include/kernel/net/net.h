@@ -273,6 +273,10 @@ typedef struct __attribute__((packed)) {
  * quick (one tick batch) rather than a full RTO/SYN interval, since the
  * pool usually drains within milliseconds. */
 #define TCP_LOCAL_DROP_RETRY_TICKS 2 // 20 ms at 100 Hz
+// Zero-window persist probe interval (RFC 1122 §4.2.2.17): starts ~0.5 s and
+// backs off exponentially to a ~60 s ceiling.
+#define TCP_PERSIST_MIN_TICKS 50 // 0.5 s at 100 Hz
+#define TCP_PERSIST_MAX_TICKS 6000 // 60 s at 100 Hz
 #define TCP_MAX_OPTIONS 40
 /* Maximum un-ACKed segments per connection.  The previous value of 32
  * hard-capped throughput at ~32 * MSS / RTT independent of cwnd or peer
@@ -417,6 +421,13 @@ typedef struct tcp_conn {
 	// Absolute give-up tick for SYN_SENT/SYN_RECEIVED (see
 	// TCP_HANDSHAKE_TIMEOUT_TICKS); 0 = unarmed.
 	uint64_t handshake_deadline;
+
+	// Zero-window persist timer (RFC 1122 §4.2.2.17 / RFC 9293 §3.8.6.1).
+	// Armed when a send is blocked by a closed peer window with nothing in
+	// flight (so the retransmit timer would never probe); the timer then
+	// sends periodic window probes with exponential backoff.  0 = unarmed.
+	uint64_t persist_tick;
+	uint8_t persist_backoff;
 
 	// Negotiated segment sizing and outstanding transmit queue
 	uint16_t peer_mss;

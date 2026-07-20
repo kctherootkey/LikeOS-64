@@ -1883,7 +1883,10 @@ int tcp_send_data(tcp_conn_t *conn, const uint8_t *data, uint16_t len)
 	for (uint8_t i = 0; i < conn->inflight_count; i++)
 		flightsize += conn->inflight[i].len;
 	uint32_t cwnd_bytes = conn->cwnd * seg_mss;
-	uint32_t window_bytes = conn->snd_wnd ? conn->snd_wnd : seg_mss;
+	// A closed peer window (snd_wnd == 0) blocks new data: the zero-window
+	// persist timer (armed below, fired in tcp_timer_tick) probes instead
+	// of sending data the peer would drop.  RFC 9293 §3.8.6.
+	uint32_t window_bytes = conn->snd_wnd;
 	uint32_t allowed =
 		cwnd_bytes < window_bytes ? cwnd_bytes : window_bytes;
 	uint32_t budget = (allowed > flightsize) ? (allowed - flightsize) : 0;
@@ -1942,10 +1945,23 @@ int tcp_send_data(tcp_conn_t *conn, const uint8_t *data, uint16_t len)
 
 	if (sent == 0) {
 		conn->tx_ready = 0;
+		// Arm the zero-window persist timer if the block is a closed peer
+		// window with nothing in flight: the retransmit timer only probes
+		// when there is inflight data, so without this a receiver that
+		// advertised window 0 and then lost its re-open ACK would stall
+		// this sender forever.  RFC 1122 §4.2.2.17.
+		if (conn->snd_wnd == 0 && conn->inflight_count == 0 &&
+		    conn->persist_tick == 0) {
+			conn->persist_backoff = 0;
+			conn->persist_tick =
+				timer_ticks() + TCP_PERSIST_MIN_TICKS;
+		}
 		tcp_lock_release(&conn->lock, flags);
 		return 0;
 	}
 
+	// Data went out — no window stall, so disarm any persist probe.
+	conn->persist_tick = 0;
 	conn->retransmit_tick = timer_ticks() + tcp_rto_ticks(conn);
 	conn->retransmit_count = 0;
 
@@ -2776,6 +2792,12 @@ established_segment:
 			if (conn->ws_enabled)
 				scaled <<= conn->snd_wscale;
 			conn->snd_wnd = scaled;
+			// Peer re-opened its window — cancel any persist probe and
+			// wake the send path.
+			if (scaled > 0 && conn->persist_tick) {
+				conn->persist_tick = 0;
+				conn->tx_ready = 1;
+			}
 		}
 
 		// RFC 6093: track urgent pointer for MSG_OOB / SIOCATMARK
@@ -3250,6 +3272,10 @@ established_segment:
 			if (conn->ws_enabled)
 				scaled <<= conn->snd_wscale;
 			conn->snd_wnd = scaled;
+			if (scaled > 0 && conn->persist_tick) {
+				conn->persist_tick = 0;
+				conn->tx_ready = 1;
+			}
 		}
 		if (tcp_flags & TCP_ACK) {
 			if (ack > conn->snd_una && ack <= conn->snd_nxt) {
@@ -3669,6 +3695,31 @@ void tcp_timer_tick(void)
 				conn->keep_next_tick =
 					now + conn->keepintvl_ticks;
 			}
+		}
+
+		// Zero-window persist probe (RFC 1122 §4.2.2.17).  Armed by
+		// tcp_send_data when a send stalls on a closed peer window with
+		// nothing in flight.  Send a 1-octet-back probe (seq snd_una-1)
+		// to force the peer to re-advertise its window; back off
+		// exponentially to the ceiling.  Disarmed the moment the window
+		// reopens (see the ACK-processing paths that clear persist_tick).
+		if (conn->persist_tick && now >= conn->persist_tick &&
+		    conn->snd_wnd == 0 && conn->inflight_count == 0 &&
+		    (conn->state == TCP_STATE_ESTABLISHED ||
+		     conn->state == TCP_STATE_CLOSE_WAIT)) {
+			tcp_send_segment(conn->dev, conn->local_ip,
+					 conn->remote_ip, conn->local_port,
+					 conn->remote_port, conn->snd_una - 1,
+					 conn->rcv_nxt, TCP_ACK,
+					 (uint16_t)conn->rcv_wnd, NULL, 0);
+			NET_STATS_INC(NET_MIB_TCP_PERSISTPROBES);
+			if (conn->persist_backoff < 7)
+				conn->persist_backoff++;
+			uint64_t interval = (uint64_t)TCP_PERSIST_MIN_TICKS
+					    << conn->persist_backoff;
+			if (interval > TCP_PERSIST_MAX_TICKS)
+				interval = TCP_PERSIST_MAX_TICKS;
+			conn->persist_tick = now + interval;
 		}
 
 unlock_conn:
