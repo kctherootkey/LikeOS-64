@@ -1083,31 +1083,6 @@ static tcp_conn_t *tcp_alloc_conn(uint8_t *rx_buf, uint8_t *tx_buf)
 // 4-tuple stores; on x86 store-store ordering is a hardware guarantee.
 static inline void tcp_publish_conn(tcp_conn_t *conn)
 {
-	/* INVARIANT tripwire: at most ONE active non-LISTEN conn per 4-tuple.
-	 * All publishers hold tcp_lock, so this scan is race-free.  A breach
-	 * means the dup-conn guards missed a path: traffic then splits between
-	 * two conns (handshake lands on one, data on the other) — the exact
-	 * signature of the "handshake completes, ClientHello never arrives"
-	 * TLS accept failures.  Diagnostic only: the conn is still published.
-	 * O(N) per conn CREATION (not per packet) — negligible. */
-	if (conn->remote_port != 0 && conn->state != TCP_STATE_LISTEN) {
-		for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
-			tcp_conn_t *o = &tcp_connections[i];
-			if (o != conn && o->active &&
-			    o->state != TCP_STATE_LISTEN &&
-			    o->local_port == conn->local_port &&
-			    o->remote_port == conn->remote_port &&
-			    o->local_ip == conn->local_ip &&
-			    o->remote_ip == conn->remote_ip) {
-				WARN_RATELIMIT(
-					1,
-					"tcp: DUPLICATE conn published for :%u->:%u (existing state=%d gen=%u) - dup-guard breached",
-					conn->local_port, conn->remote_port,
-					o->state, o->gen);
-				break;
-			}
-		}
-	}
 	__asm__ volatile("" ::: "memory");
 	conn->active = 1;
 }
@@ -1209,34 +1184,10 @@ static void tcp_free_conn_impl(tcp_conn_t *conn, int has_gen, uint32_t gen)
 	 * that socket will dereference this slot after we slab_free() its buffers
 	 * and tcp_alloc_conn recycles it — a use-after-free that surfaces as an
 	 * ECONNRESET / recv-timeout on a connection that "vanished" mid-flow. */
-	/* Rate-limited, not ONCE: in a multi-hour stress run a single early
-	 * firing would permanently silence the tripwire for exactly the bug
-	 * class it exists to catch (live-conn free), leaving later incidents
-	 * with no kernel-side evidence. */
 	WARN_RATELIMIT(
 		conn->owner_socket && conn->owner_socket != (void *)conn,
 		"tcp_free_conn: freeing conn :%u->:%u (state=%d gen=%u) with live owner_socket - use-after-free for that socket",
 		conn->local_port, conn->remote_port, conn->state, conn->gen);
-	/* CULPRIT tracer: NO legitimate free happens while the conn is still
-	 * in a synchronized data-bearing state — every valid path transitions
-	 * to CLOSED/TIME_WAIT first (close paths, abort, fail_connection) or
-	 * frees only TIME_WAIT/CLOSED slots (reapers, recyclers).  A free at
-	 * ESTABLISHED/CLOSE_WAIT is therefore always a bug; print the call
-	 * chain so the next occurrence identifies the freeing path directly
-	 * (observed: client conn with 16 KB unread vanishing mid-TLS-echo —
-	 * every state-based suspect ruled out, caller unknown).  Frame
-	 * pointers are enabled in this kernel, so the nonzero-level
-	 * __builtin_return_address walk is well-defined here. */
-	WARN_RATELIMIT(
-		conn->state == TCP_STATE_ESTABLISHED ||
-			conn->state == TCP_STATE_CLOSE_WAIT,
-		"tcp_free_conn: freeing SYNCHRONIZED conn :%u->:%u (state=%d gen=%u owner=%llx used=%u) ra1=%llx ra2=%llx",
-		conn->local_port, conn->remote_port, conn->state, conn->gen,
-		(uint64_t)(uintptr_t)conn->owner_socket,
-		(unsigned)((conn->rx_tail - conn->rx_head + conn->rx_buf_size) %
-			   conn->rx_buf_size),
-		(uint64_t)(uintptr_t)__builtin_return_address(1),
-		(uint64_t)(uintptr_t)__builtin_return_address(2));
 	void *old_rx = conn->rx_buf;
 	void *old_tx = conn->tx_buf;
 	conn->rx_buf = NULL;
@@ -2994,22 +2945,6 @@ established_segment:
 
 		// Process data: in-order vs out-of-order
 		if (payload_len > 0) {
-			/* DESYNC tripwire: the FIRST data segment of a loopback
-			 * flow is always in order (single FIFO queue, no loss).
-			 * A conn that has never delivered a single in-order byte
-			 * (rcv_nxt still == irs+1) receiving out-of-order data
-			 * means its sequence numbering disagrees with the peer's
-			 * — every byte the peer ever sends will silently park in
-			 * the OOO queue or dup-ACK forever, starving the reader
-			 * with NO error (observed: TLS ClientHello never delivered
-			 * although the segment stream arrived; both ends
-			 * ETIMEDOUT with zero warnings). */
-			WARN_RATELIMIT(
-				seq != conn->rcv_nxt &&
-					conn->rcv_nxt == conn->irs + 1,
-				"tcp_rx: FIRST data seg out of order :%u->:%u seq=%u rcv_nxt=%u irs=%u len=%u - sequence desync",
-				conn->remote_port, conn->local_port, seq,
-				conn->rcv_nxt, conn->irs, payload_len);
 			if (seq == conn->rcv_nxt) {
 				uint32_t avail =
 					ring_free(conn->rx_head, conn->rx_tail,
@@ -3170,36 +3105,11 @@ established_segment:
 						conn->ooo[pos].data[j] =
 							payload[j];
 					conn->ooo_count++;
-				} else if (!dup) {
-					/* OOO queue full: this future segment is
-					 * DROPPED and must be retransmitted.
-					 * Persistent firing = the reassembly hole
-					 * never fills = receive-side stall with no
-					 * app-visible error.  Make it visible. */
-					WARN_RATELIMIT(
-						1,
-						"tcp_rx: OOO queue full (%u), dropping seg seq=%u len=%u rcv_nxt=%u :%u->:%u",
-						conn->ooo_count, seq,
-						payload_len, conn->rcv_nxt,
-						conn->remote_port,
-						conn->local_port);
 				}
 				// Send immediate dup-ACK with SACK info (helps fast retransmit)
 				tcp_queue_ack_locked(conn);
 				ack_pending = 1;
 			} else {
-				/* seq < rcv_nxt: genuinely already-received data →
-				 * dup-ACK below is correct and silent.  BUT a
-				 * FUTURE segment (seq > rcv_nxt) that fell through
-				 * the OOO branch because payload_len > TCP_MSS is
-				 * NOT a duplicate — it is silently discarded here
-				 * and only a retransmit can save it.  That is a
-				 * silent receive stall; make it visible. */
-				WARN_RATELIMIT(
-					(int32_t)(seq - conn->rcv_nxt) > 0,
-					"tcp_rx: oversize OOO seg silently dropped seq=%u len=%u (>MSS) rcv_nxt=%u :%u->:%u",
-					seq, payload_len, conn->rcv_nxt,
-					conn->remote_port, conn->local_port);
 				// Already-received data — duplicate ACK
 				tcp_queue_ack_locked(conn);
 				ack_pending = 1;
