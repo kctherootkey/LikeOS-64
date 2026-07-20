@@ -371,6 +371,15 @@ typedef struct tcp_inflight_segment {
 	uint8_t data[TCP_MSS];
 } tcp_inflight_segment_t;
 
+// Out-of-order receive-reassembly slot (holds one future segment until the
+// hole ahead of it fills).  Kept as a named type so the connection block can
+// reference the queue through a pointer instead of inlining ~92 KB of slots.
+typedef struct tcp_ooo_segment {
+	uint32_t seq;
+	uint16_t len;
+	uint8_t data[TCP_MSS];
+} tcp_ooo_segment_t;
+
 // TCP connection block
 typedef struct tcp_conn {
 	int state;
@@ -411,7 +420,11 @@ typedef struct tcp_conn {
 	uint16_t peer_mss;
 	uint16_t max_seg_size;
 	uint8_t inflight_count;
-	tcp_inflight_segment_t inflight[TCP_MAX_INFLIGHT];
+	// Retransmit queue: pointer to a TCP_MAX_INFLIGHT-entry array allocated
+	// with the connection's buffers (de-inlined to keep the connection
+	// block small enough to allocate dynamically).  Indexed as before:
+	// conn->inflight[i] works identically to an inline array.
+	tcp_inflight_segment_t *inflight;
 
 	// TIME_WAIT timer
 	uint64_t time_wait_tick;
@@ -504,12 +517,10 @@ typedef struct tcp_conn {
 		uint32_t right;
 	} sack_blocks[TCP_MAX_SACK_BLOCKS];
 
-	// Out-of-order receive queue (small per-conn buffer; data dropped if full)
-	struct {
-		uint32_t seq;
-		uint16_t len;
-		uint8_t data[TCP_MSS];
-	} ooo[TCP_MAX_OOO];
+	// Out-of-order receive queue: pointer to a TCP_MAX_OOO-entry array
+	// allocated with the connection's buffers (de-inlined; indexed as
+	// conn->ooo[i] exactly as before).  Data dropped if the array is full.
+	tcp_ooo_segment_t *ooo;
 	uint8_t ooo_count;
 
 	// Delayed ACK (RFC 1122 §4.2.3.2): defer up to 200ms / every 2nd seg

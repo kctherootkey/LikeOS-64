@@ -959,14 +959,56 @@ static uint64_t tcp_rto_ticks(tcp_conn_t *conn)
 // recycled slot and dispatch a packet to the wrong (about-to-be-rewritten)
 // connection.
 //
+// Allocate the de-inlined per-connection inflight + ooo arrays.  Both are
+// slab-allocated by the caller OUTSIDE tcp_lock (same TLB-shootdown-safety
+// discipline as the rx/tx ring buffers).  Returns 0 with both pointers set on
+// success, or -1 with neither leaked on failure.
+static int tcp_alloc_seg_arrays(tcp_inflight_segment_t **inflight_out,
+				tcp_ooo_segment_t **ooo_out)
+{
+	tcp_inflight_segment_t *inflight = (tcp_inflight_segment_t *)slab_alloc(
+		sizeof(tcp_inflight_segment_t) * TCP_MAX_INFLIGHT);
+	tcp_ooo_segment_t *ooo = (tcp_ooo_segment_t *)slab_alloc(
+		sizeof(tcp_ooo_segment_t) * TCP_MAX_OOO);
+	if (!inflight || !ooo) {
+		if (inflight)
+			slab_free(inflight);
+		if (ooo)
+			slab_free(ooo);
+		return -1;
+	}
+	*inflight_out = inflight;
+	*ooo_out = ooo;
+	return 0;
+}
+
+static inline void tcp_free_seg_arrays(tcp_inflight_segment_t *inflight,
+				       tcp_ooo_segment_t *ooo)
+{
+	if (inflight)
+		slab_free(inflight);
+	if (ooo)
+		slab_free(ooo);
+}
+
 // On allocation failure (table full) returns NULL; caller must slab_free
 // the buffers it pre-allocated.
-static tcp_conn_t *tcp_alloc_conn(uint8_t *rx_buf, uint8_t *tx_buf)
+//
+// rx_buf/tx_buf and the inflight/ooo arrays are all allocated by the caller
+// OUTSIDE tcp_lock (slab_alloc may fire a TLB-shootdown IPI, illegal while
+// holding tcp_lock IRQs-off) and adopted here.  The inflight/ooo arrays used
+// to be inlined in the connection block (~280 KB/conn); pointing at
+// caller-allocated arrays shrinks the block enough to allocate dynamically.
+static tcp_conn_t *tcp_alloc_conn(uint8_t *rx_buf, uint8_t *tx_buf,
+				  tcp_inflight_segment_t *inflight,
+				  tcp_ooo_segment_t *ooo)
 {
 	BUG_ON(rx_buf ==
 	       NULL); /* pre-allocated RX buffer must not be NULL — slab_alloc must be called before tcp_lock */
 	BUG_ON(tx_buf ==
 	       NULL); /* pre-allocated TX buffer must not be NULL — slab_alloc must be called before tcp_lock */
+	BUG_ON(inflight == NULL); /* pre-allocated inflight array required */
+	BUG_ON(ooo == NULL); /* pre-allocated ooo array required */
 	for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
 		if (!tcp_connections[i].active) {
 			tcp_conn_t *conn = &tcp_connections[i];
@@ -1065,6 +1107,8 @@ static tcp_conn_t *tcp_alloc_conn(uint8_t *rx_buf, uint8_t *tx_buf)
 			// Adopt pre-allocated RX/TX buffers (allocator was caller, OUTSIDE tcp_lock).
 			conn->rx_buf = rx_buf;
 			conn->tx_buf = tx_buf;
+			conn->inflight = inflight;
+			conn->ooo = ooo;
 			conn->rx_buf_size = TCP_RX_BUF_SIZE;
 			conn->tx_buf_size = TCP_TX_BUF_SIZE;
 			conn->rx_head = 0;
@@ -1194,8 +1238,12 @@ static void tcp_free_conn_impl(tcp_conn_t *conn, int has_gen, uint32_t gen)
 		conn->local_port, conn->remote_port, conn->state, conn->gen);
 	void *old_rx = conn->rx_buf;
 	void *old_tx = conn->tx_buf;
+	void *old_inflight = conn->inflight;
+	void *old_ooo = conn->ooo;
 	conn->rx_buf = NULL;
 	conn->tx_buf = NULL;
+	conn->inflight = NULL;
+	conn->ooo = NULL;
 	conn->parent = NULL;
 	conn->state = TCP_STATE_CLOSED;
 	// Zero the 4-tuple so a lock-free walker that races between our
@@ -1216,6 +1264,10 @@ static void tcp_free_conn_impl(tcp_conn_t *conn, int has_gen, uint32_t gen)
 		slab_free(old_rx);
 	if (old_tx)
 		slab_free(old_tx);
+	if (old_inflight)
+		slab_free(old_inflight);
+	if (old_ooo)
+		slab_free(old_ooo);
 }
 
 /* Gen-validated free — the ONLY way to free a conn.  `gen` must be the conn's
@@ -1485,7 +1537,10 @@ tcp_conn_t *tcp_connect(net_device_t *dev, uint32_t local_ip, uint32_t dst_ip,
 	// any other CPU were spinning on tcp_lock with IRQs off.
 	uint8_t *new_rx = (uint8_t *)slab_alloc(TCP_RX_BUF_SIZE);
 	uint8_t *new_tx = (uint8_t *)slab_alloc(TCP_TX_BUF_SIZE);
-	if (!new_rx || !new_tx) {
+	tcp_inflight_segment_t *new_if = NULL;
+	tcp_ooo_segment_t *new_ooo = NULL;
+	if (!new_rx || !new_tx ||
+	    tcp_alloc_seg_arrays(&new_if, &new_ooo) != 0) {
 		WARN_RATELIMIT(
 			1, "tcp_connect: conn buffer alloc failed (rx=%d tx=%d)",
 			new_rx != NULL, new_tx != NULL);
@@ -1515,7 +1570,7 @@ tcp_conn_t *tcp_connect(net_device_t *dev, uint32_t local_ip, uint32_t dst_ip,
 
 	spin_lock_irqsave(&tcp_lock, &flags);
 
-	tcp_conn_t *conn = tcp_alloc_conn(new_rx, new_tx);
+	tcp_conn_t *conn = tcp_alloc_conn(new_rx, new_tx, new_if, new_ooo);
 	if (!conn) {
 		// Table full.  Drop the lock and reap *any* TIME_WAIT slot to
 		// recover capacity (RFC 6191 — a fresh SYN is allowed to evict
@@ -1528,14 +1583,16 @@ tcp_conn_t *tcp_connect(net_device_t *dev, uint32_t local_ip, uint32_t dst_ip,
 		spin_unlock_irqrestore(&tcp_lock, flags);
 		tcp_reap_time_wait_slots();
 		spin_lock_irqsave(&tcp_lock, &flags);
-		conn = tcp_alloc_conn(new_rx, new_tx);
+		conn = tcp_alloc_conn(new_rx, new_tx, new_if, new_ooo);
 		if (!conn) {
 			spin_unlock_irqrestore(&tcp_lock, flags);
+			NET_STATS_INC(NET_MIB_TCP_CONNTABLEFULL);
 			WARN_RATELIMIT(
 				1,
 				"tcp_connect: conn table full even after TIME_WAIT reap");
 			slab_free(new_rx);
 			slab_free(new_tx);
+			tcp_free_seg_arrays(new_if, new_ooo);
 			return NULL;
 		}
 	}
@@ -1586,7 +1643,10 @@ tcp_conn_t *tcp_listen(net_device_t *dev, uint32_t local_ip,
 	// a TLB shootdown IPI that would deadlock against tcp_lock holders.
 	uint8_t *new_rx = (uint8_t *)slab_alloc(TCP_RX_BUF_SIZE);
 	uint8_t *new_tx = (uint8_t *)slab_alloc(TCP_TX_BUF_SIZE);
-	if (!new_rx || !new_tx) {
+	tcp_inflight_segment_t *new_if = NULL;
+	tcp_ooo_segment_t *new_ooo = NULL;
+	if (!new_rx || !new_tx ||
+	    tcp_alloc_seg_arrays(&new_if, &new_ooo) != 0) {
 		WARN_RATELIMIT(
 			1, "tcp_listen: conn buffer alloc failed (rx=%d tx=%d)",
 			new_rx != NULL, new_tx != NULL);
@@ -1599,20 +1659,22 @@ tcp_conn_t *tcp_listen(net_device_t *dev, uint32_t local_ip,
 
 	spin_lock_irqsave(&tcp_lock, &flags);
 
-	tcp_conn_t *conn = tcp_alloc_conn(new_rx, new_tx);
+	tcp_conn_t *conn = tcp_alloc_conn(new_rx, new_tx, new_if, new_ooo);
 	if (!conn) {
 		// Table full — reap TIME_WAIT slots and retry (RFC 6191).
 		spin_unlock_irqrestore(&tcp_lock, flags);
 		tcp_reap_time_wait_slots();
 		spin_lock_irqsave(&tcp_lock, &flags);
-		conn = tcp_alloc_conn(new_rx, new_tx);
+		conn = tcp_alloc_conn(new_rx, new_tx, new_if, new_ooo);
 	}
 	if (!conn) {
 		spin_unlock_irqrestore(&tcp_lock, flags);
+		NET_STATS_INC(NET_MIB_TCP_CONNTABLEFULL);
 		WARN_RATELIMIT(
 			1, "tcp_listen: conn table full even after TIME_WAIT reap");
 		slab_free(new_rx);
 		slab_free(new_tx);
+		tcp_free_seg_arrays(new_if, new_ooo);
 		return NULL;
 	}
 
@@ -2225,7 +2287,10 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 			// tcp_lock holders.
 			uint8_t *nc_rx = (uint8_t *)slab_alloc(TCP_RX_BUF_SIZE);
 			uint8_t *nc_tx = (uint8_t *)slab_alloc(TCP_TX_BUF_SIZE);
-			if (!nc_rx || !nc_tx) {
+			tcp_inflight_segment_t *nc_if = NULL;
+			tcp_ooo_segment_t *nc_ooo = NULL;
+			if (!nc_rx || !nc_tx ||
+			    tcp_alloc_seg_arrays(&nc_if, &nc_ooo) != 0) {
 				if (nc_rx)
 					slab_free(nc_rx);
 				if (nc_tx)
@@ -2265,10 +2330,12 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 				spin_unlock_irqrestore(&tcp_lock, flags);
 				slab_free(nc_rx);
 				slab_free(nc_tx);
+				tcp_free_seg_arrays(nc_if, nc_ooo);
 				return;
 			}
 
-			tcp_conn_t *new_conn = tcp_alloc_conn(nc_rx, nc_tx);
+			tcp_conn_t *new_conn =
+				tcp_alloc_conn(nc_rx, nc_tx, nc_if, nc_ooo);
 			if (!new_conn) {
 				// Table full.  Reap TIME_WAIT slots (RFC 6191) before
 				// falling back to stateless SYN cookies — cookies disable
@@ -2279,12 +2346,15 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 				spin_unlock_irqrestore(&tcp_lock, flags);
 				tcp_reap_time_wait_slots();
 				spin_lock_irqsave(&tcp_lock, &flags);
-				new_conn = tcp_alloc_conn(nc_rx, nc_tx);
+				new_conn = tcp_alloc_conn(nc_rx, nc_tx, nc_if,
+							  nc_ooo);
 			}
 			if (!new_conn) {
 				spin_unlock_irqrestore(&tcp_lock, flags);
 				slab_free(nc_rx);
 				slab_free(nc_tx);
+				tcp_free_seg_arrays(nc_if, nc_ooo);
+				NET_STATS_INC(NET_MIB_TCP_CONNTABLEFULL);
 				// Fallback to SYN cookie
 				uint32_t cookie = tcp_syncookie_generate(
 					src_ip, local_ip, src_port, dst_port,
@@ -2372,7 +2442,10 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 					(uint8_t *)slab_alloc(TCP_RX_BUF_SIZE);
 				uint8_t *cc_tx =
 					(uint8_t *)slab_alloc(TCP_TX_BUF_SIZE);
-				if (!cc_rx || !cc_tx) {
+				tcp_inflight_segment_t *cc_if = NULL;
+				tcp_ooo_segment_t *cc_ooo = NULL;
+				if (!cc_rx || !cc_tx ||
+				    tcp_alloc_seg_arrays(&cc_if, &cc_ooo) != 0) {
 					if (cc_rx)
 						slab_free(cc_rx);
 					if (cc_tx)
@@ -2397,11 +2470,12 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 					spin_unlock_irqrestore(&tcp_lock, flags);
 					slab_free(cc_rx);
 					slab_free(cc_tx);
+					tcp_free_seg_arrays(cc_if, cc_ooo);
 					return;
 				}
 
-				tcp_conn_t *new_conn =
-					tcp_alloc_conn(cc_rx, cc_tx);
+				tcp_conn_t *new_conn = tcp_alloc_conn(
+					cc_rx, cc_tx, cc_if, cc_ooo);
 				if (!new_conn) {
 					// Table full.  Reap TIME_WAIT slots and retry —
 					// otherwise a valid SYN-cookie ACK is silently
@@ -2413,13 +2487,16 @@ void tcp_rx(net_device_t *dev, uint32_t src_ip, uint32_t dst_ip,
 							       flags);
 					tcp_reap_time_wait_slots();
 					spin_lock_irqsave(&tcp_lock, &flags);
-					new_conn = tcp_alloc_conn(cc_rx, cc_tx);
+					new_conn = tcp_alloc_conn(cc_rx, cc_tx,
+								  cc_if, cc_ooo);
 				}
 				if (!new_conn) {
 					spin_unlock_irqrestore(&tcp_lock,
 							       flags);
 					slab_free(cc_rx);
 					slab_free(cc_tx);
+					tcp_free_seg_arrays(cc_if, cc_ooo);
+					NET_STATS_INC(NET_MIB_TCP_CONNTABLEFULL);
 					return;
 				}
 
