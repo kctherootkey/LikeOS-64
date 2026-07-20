@@ -504,6 +504,10 @@ static uint8_t tcp_build_options(tcp_conn_t *conn, uint8_t flags,
 // bits after the rcv_wscale shift.
 static uint16_t tcp_advertised_window(tcp_conn_t *conn)
 {
+	// A TIME_WAIT connection has had its receive buffer shed — it advertises
+	// a zero window (it will not receive data).
+	if (!conn->rx_buf || conn->rx_buf_size == 0)
+		return 0;
 	uint32_t avail =
 		ring_free(conn->rx_head, conn->rx_tail, conn->rx_buf_size);
 	if (avail == 0)
@@ -1402,10 +1406,15 @@ static void tcp_queue_ack_locked(tcp_conn_t *conn)
 	BUG_ON(conn->dev == NULL);
 	conn->delayed_ack_pending = 0;
 	conn->segs_since_ack = 0;
-	conn->rcv_adv_last_bytes = (uint32_t)((
-		conn->rx_buf_size -
-		((conn->rx_tail - conn->rx_head + conn->rx_buf_size) %
-		 conn->rx_buf_size)));
+	// rx_buf_size is 0 for a TIME_WAIT connection whose buffers were shed
+	// (it re-ACKs a retransmitted FIN with a zero window).
+	conn->rcv_adv_last_bytes =
+		conn->rx_buf_size ?
+			(uint32_t)((conn->rx_buf_size -
+				    ((conn->rx_tail - conn->rx_head +
+				      conn->rx_buf_size) %
+				     conn->rx_buf_size))) :
+			0;
 }
 
 // ============================================================================
@@ -3447,12 +3456,37 @@ void tcp_timer_tick(void)
 
 	while (conn) {
 		uint64_t flags;
+		// Buffers to shed after releasing conn->lock (slab_free must not
+		// run under the lock — TLB-shootdown safety).
+		void *shed_rx = NULL, *shed_tx = NULL, *shed_if = NULL,
+		     *shed_ooo = NULL;
 		tcp_lock_acquire(&conn->lock, &flags);
 
 		// Terminally-dead connections are reclaimed by reference counting
 		// (tcp_conn_kill drops the protocol reference; the connection is
 		// freed once no reference remains), so the timer no longer has any
 		// orphan-reaper clauses — it only drives deadlines.
+
+		// TIME_WAIT demotion: a connection in TIME_WAIT only re-ACKs a
+		// retransmitted FIN and blocks 4-tuple reuse for 2·MSL — it moves
+		// no data, so its ~512 KB of rx/tx/reassembly buffers are dead
+		// weight for up to 60 s.  Shed them here (captured under the lock,
+		// freed after release), keeping only the small connection record.
+		if (conn->state == TCP_STATE_TIME_WAIT && conn->rx_buf) {
+			shed_rx = conn->rx_buf;
+			shed_tx = conn->tx_buf;
+			shed_if = conn->inflight;
+			shed_ooo = conn->ooo;
+			conn->rx_buf = NULL;
+			conn->tx_buf = NULL;
+			conn->inflight = NULL;
+			conn->ooo = NULL;
+			conn->rx_buf_size = 0;
+			conn->tx_buf_size = 0;
+			conn->rx_head = conn->rx_tail = 0;
+			conn->inflight_count = 0;
+			conn->ooo_count = 0;
+		}
 
 		// TIME_WAIT expiry
 		if (conn->state == TCP_STATE_TIME_WAIT &&
@@ -3725,6 +3759,16 @@ void tcp_timer_tick(void)
 unlock_conn:
 		tcp_lock_release(&conn->lock, flags);
 
+		// Free any shed TIME_WAIT buffers now that conn->lock is dropped.
+		if (shed_rx)
+			slab_free(shed_rx);
+		if (shed_tx)
+			slab_free(shed_tx);
+		if (shed_if)
+			slab_free(shed_if);
+		if (shed_ooo)
+			slab_free(shed_ooo);
+
 		// Advance: find and hold the next connection while still holding
 		// `conn` (so conn->list_next is valid), then drop `conn`.  If the
 		// drop was the last reference, the connection is queued for free.
@@ -3929,8 +3973,13 @@ void tcp_dump_table(struct tty *tty)
 					"???";
 		uint32_t li = c->local_ip, ri = c->remote_ip;
 		int parent_slot = c->parent ? 1 : -1;
-		uint32_t used = (c->rx_tail - c->rx_head + c->rx_buf_size) %
-				c->rx_buf_size;
+		// rx_buf_size is 0 for a TIME_WAIT connection whose buffers were
+		// shed — avoid the modulo-by-zero.
+		uint32_t used = c->rx_buf_size ?
+					((c->rx_tail - c->rx_head +
+					  c->rx_buf_size) %
+					 c->rx_buf_size) :
+					0;
 		uint32_t free_b = c->rx_buf_size - used;
 		tty_printf(
 			tty,
