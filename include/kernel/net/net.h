@@ -439,10 +439,10 @@ typedef struct tcp_conn {
 	 * it must increase monotonically across the slot's whole lifetime. */
 	uint32_t gen;
 
-	// Listen queue (for server sockets)
+	// Listen queue (for server sockets).  Each entry holds a reference on
+	// its child connection (taken at enqueue, released at accept/flush).
 	struct tcp_accept_entry {
 		struct tcp_conn *conn;
-		uint32_t gen; /* conn->gen at the moment it was queued */
 	} accept_queue[16];
 	int accept_head;
 	int accept_tail;
@@ -570,6 +570,25 @@ typedef struct tcp_conn {
 	// closes the TOCTOU window between tcp_accept/connect returning and
 	// the socket layer assigning the real pointer.
 	void *owner_socket;
+
+	// ---- Dynamic lifetime (reference counting) ----
+	// Connections are individually slab-allocated and linked into a global
+	// list; a bare tcp_conn_t* is a stable identity (never recycled while a
+	// reference is held), so the generation counter above is vestigial.
+	//   * refcount: number of outstanding references.  Reaching 0 queues the
+	//     connection for physical free.  A reference is held by: the protocol
+	//     state machine while the connection is not terminally dead
+	//     (proto_ref), the owning socket (s->tcp), each accept-queue entry,
+	//     and transiently by any lookup or the timer sweep.
+	//   * proto_ref: 1 while the protocol self-reference is held; cleared
+	//     exactly once when the connection becomes terminally dead.
+	//   * on_reap_queue: dedup guard so a connection is queued for free once.
+	//   * list_next: singly-linked global list of all live connections
+	//     (g_tcp_conn_list), protected by tcp_lock.
+	volatile int refcount;
+	uint8_t proto_ref;
+	uint8_t on_reap_queue;
+	struct tcp_conn *list_next;
 } tcp_conn_t;
 
 // ============================================================================
@@ -946,13 +965,10 @@ tcp_conn_t *tcp_listen(net_device_t *dev, uint32_t local_ip,
 		       uint16_t local_port, int backlog);
 tcp_conn_t *tcp_accept(tcp_conn_t *listener);
 int tcp_close(tcp_conn_t *conn);
-void tcp_abort(tcp_conn_t *conn); // Send RST and free (SO_LINGER l_onoff=0)
-/* Gen-validated variants for DEFERRED teardown (caller captured conn->gen
- * under s->lock while owner_socket was still set): no-ops with a warning if
- * the slot was freed/recycled in between, so a stale close/abort can never
- * tear down an innocent recycled connection. */
-int tcp_close_gen(tcp_conn_t *conn, uint32_t gen);
-void tcp_abort_gen(tcp_conn_t *conn, uint32_t gen);
+void tcp_abort(tcp_conn_t *conn); // Send RST (SO_LINGER l_onoff=0)
+// Reference counting: hold/put a connection so it is not freed while used.
+void tcp_conn_get(tcp_conn_t *conn);
+void tcp_conn_release(tcp_conn_t *conn);
 void tcp_send_window_update(tcp_conn_t *conn); // Proactive ACK after RX drain
 void tcp_timer_tick(void);
 void tcp_reap_pending(void);

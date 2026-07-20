@@ -317,10 +317,13 @@ int sock_accept(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen)
 		sched_yield_in_kernel();
 	}
 
-	// Create a new socket for the accepted connection
+	// Create a new socket for the accepted connection.  tcp_accept returned
+	// new_conn with a reference (the accept-queue reference, transferred to
+	// us), which becomes this socket's reference.
 	int newfd = sock_create(AF_INET, SOCK_STREAM, 0);
 	if (newfd < 0) {
 		tcp_close(new_conn);
+		tcp_conn_release(new_conn); // drop the reference we were handed
 		return newfd;
 	}
 
@@ -424,13 +427,10 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 
 	if (conn->error) {
 		int err = conn->error;
-		/* Gen before owner-clear: the conn is CLOSED (fail path), so it
-		 * becomes reapable the instant owner_socket is NULL — the same
-		 * deferred-teardown recycle race as sock_close. */
-		uint32_t g = conn->gen;
 		conn->owner_socket = NULL;
 		s->tcp = NULL;
-		tcp_close_gen(conn, g);
+		tcp_close(conn); // drive teardown (we still hold the socket ref)
+		tcp_conn_release(conn); // drop the socket reference
 		return -err;
 	}
 
@@ -451,10 +451,9 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 			(dst_ip >> 8) & 0xff, dst_ip & 0xff, dst_port, conn->state,
 			conn->remote_port, conn->owner_socket == s);
 		if (conn->owner_socket == s) {
-			/* Same gen-before-owner-clear as above. */
-			uint32_t g = conn->gen;
 			conn->owner_socket = NULL;
-			tcp_close_gen(conn, g);
+			tcp_close(conn);
+			tcp_conn_release(conn); // drop the socket reference
 		}
 		s->tcp = NULL;
 		return -ECONNREFUSED;
@@ -701,27 +700,35 @@ int sock_send(int sockfd, const void *buf, size_t len, int flags)
 			return 0;
 
 		for (;;) {
-			// Re-snapshot s->tcp under s->lock each iteration so that a
-			// concurrent sock_close() (which detaches s->tcp before
-			// tcp_close/tcp_free_conn) cannot leave us holding a stale
-			// pointer whose backing buffers have been slab_free()d.
+			// Re-snapshot s->tcp under s->lock each iteration and take
+			// a reference on it, so a concurrent sock_close() (which
+			// detaches s->tcp and drops the socket reference) cannot
+			// free the connection out from under tcp_send_data.
 			uint64_t sflags;
 			spin_lock_irqsave(&s->lock, &sflags);
 			tcp_conn_t *conn = s->active ? s->tcp : NULL;
+			if (conn)
+				tcp_conn_get(conn);
 			int connected =
 				s->connected ||
 				(conn && conn->state == TCP_STATE_ESTABLISHED);
 			int nonblock = s->nonblock;
 			spin_unlock_irqrestore(&s->lock, sflags);
-			if (!conn || !connected)
+			if (!conn || !connected) {
+				if (conn)
+					tcp_conn_release(conn);
 				return -ENOTCONN;
-			if (conn->state != TCP_STATE_ESTABLISHED)
+			}
+			if (conn->state != TCP_STATE_ESTABLISHED) {
+				tcp_conn_release(conn);
 				return -EPIPE;
+			}
 
 			smap_disable();
 			int ret = tcp_send_data(conn, (const uint8_t *)buf,
 						to_send);
 			smap_enable();
+			tcp_conn_release(conn);
 
 			if (ret < 0)
 				return ret;
@@ -763,7 +770,19 @@ int sock_recv(int sockfd, void *buf, size_t len, int flags)
 	int waitall = (flags & MSG_WAITALL) != 0;
 
 	if (s->type == SOCK_STREAM) {
-		if (!s->tcp)
+		// Snapshot the connection under s->lock and hold a reference for
+		// the whole recv, so a concurrent sock_close() (which detaches
+		// s->tcp and drops the socket reference) cannot free the
+		// connection while we park on conn->rx_ready or copy from its rx
+		// ring.  Every exit of this path drops the reference (goto
+		// recv_out).
+		uint64_t hflags;
+		spin_lock_irqsave(&s->lock, &hflags);
+		tcp_conn_t *conn = s->active ? s->tcp : NULL;
+		if (conn)
+			tcp_conn_get(conn);
+		spin_unlock_irqrestore(&s->lock, hflags);
+		if (!conn)
 			return -ENOTCONN;
 
 		uint64_t deadline =
@@ -771,34 +790,40 @@ int sock_recv(int sockfd, void *buf, size_t len, int flags)
 				timer_ticks() + s->rcv_timeout_ticks :
 				0;
 		size_t total = 0;
+		int rc;
 again:
-		// Wait for data.  Re-snapshot s->tcp under s->lock each iteration —
-		// a concurrent sock_close() detaches s->tcp before tcp_free_conn()
-		// frees the rx buffer; without re-checking we would touch a freed
-		// conn->rx_buf and corrupt unrelated kernel memory (e.g. percpu).
-		tcp_conn_t *conn;
 		while (1) {
 			uint64_t sflags;
 			spin_lock_irqsave(&s->lock, &sflags);
-			conn = s->active ? s->tcp : NULL;
 			int nonblock = s->nonblock;
+			int detached = !s->active || s->tcp != conn;
 			spin_unlock_irqrestore(&s->lock, sflags);
-			if (!conn)
-				return total ? (int)total : -EBADF;
+			if (detached) {
+				// The socket released this connection; it is
+				// failed/closing and will report EOF/error below.
+				rc = total ? (int)total : -EBADF;
+				goto recv_out;
+			}
 			if (conn->rx_ready ||
 			    conn->state != TCP_STATE_ESTABLISHED)
 				break;
-			if (nonblock || dontwait)
-				return total ? (int)total : -EAGAIN;
-			if (deadline && timer_ticks() >= deadline)
-				return total ? (int)total : -ETIMEDOUT;
+			if (nonblock || dontwait) {
+				rc = total ? (int)total : -EAGAIN;
+				goto recv_out;
+			}
+			if (deadline && timer_ticks() >= deadline) {
+				rc = total ? (int)total : -ETIMEDOUT;
+				goto recv_out;
+			}
 			/* Interruptible: without this, a task parked here with a
 			 * pending fatal signal is re-woken by the timer sweep and
 			 * immediately re-parks, forever — it can never die. */
 			{
 				task_t *rx_cur = sched_current();
-				if (rx_cur && signal_pending(rx_cur))
-					return total ? (int)total : -EINTR;
+				if (rx_cur && signal_pending(rx_cur)) {
+					rc = total ? (int)total : -EINTR;
+					goto recv_out;
+				}
 			}
 			loopback_process_pending();
 
@@ -859,27 +884,30 @@ again:
 			}
 		}
 
-		if (conn->error)
-			return total ? (int)total : -conn->error;
+		if (conn->error) {
+			rc = total ? (int)total : -conn->error;
+			goto recv_out;
+		}
 
 		// Connection closed - return 0 (EOF)
 		if (conn->state == TCP_STATE_CLOSE_WAIT ||
 		    conn->state == TCP_STATE_CLOSED) {
-			if (conn->rx_head == conn->rx_tail)
-				return (int)total;
+			if (conn->rx_head == conn->rx_tail) {
+				rc = (int)total;
+				goto recv_out;
+			}
 		}
 
 		// Copy from rx buffer
 		uint64_t cflags;
 		sock_conn_lock(&conn->lock, &cflags);
 
-		// Re-validate under conn->lock: tcp_free_conn() acquires conn->lock
-		// and clears active + rx_buf together.  If we lost the race the
-		// buffer pointer is NULL and the slot may even have been recycled
-		// by tcp_alloc_conn() with a different 4-tuple.
+		// Re-validate under conn->lock: a peer reset can NULL rx_buf.  We
+		// hold a reference so the connection object itself is valid.
 		if (!conn->active || !conn->rx_buf) {
 			sock_conn_unlock(&conn->lock, cflags);
-			return total ? (int)total : -EBADF;
+			rc = total ? (int)total : -EBADF;
+			goto recv_out;
 		}
 
 		uint32_t avail =
@@ -960,7 +988,11 @@ again:
 		if (waitall && !peek && total < len &&
 		    conn->state == TCP_STATE_ESTABLISHED)
 			goto again;
-		return (int)total;
+		rc = (int)total;
+recv_out:
+		// Drop the reference taken at entry.
+		tcp_conn_release(conn);
+		return rc;
 	}
 
 	// UDP recv (connected, no src addr)
@@ -1017,19 +1049,7 @@ int sock_close(int sockfd)
 	uint8_t do_linger_block = 0;
 	uint16_t linger_secs = 0;
 	uint8_t use_abort = 0;
-	uint32_t teardown_gen = 0;
 	if (tcp_to_teardown) {
-		/* Capture the conn's generation NOW — under s->lock and BEFORE
-		 * owner_socket is cleared below, the conn cannot be reaped, so
-		 * this gen is authoritative.  The deferred tcp_close/tcp_abort
-		 * after the lock drop validates against it: once owner_socket
-		 * goes NULL, an already-CLOSED conn (peer RST kept for
-		 * SO_ERROR) is instantly reapable, and if we are preempted the
-		 * slot can be recycled for a NEW connection before our close
-		 * runs — closing by raw pointer would then FIN/RST the
-		 * innocent new conn (observed: accept-child hijacked into
-		 * FIN_WAIT_1 → accept() ETIMEDOUT; tcp_free_conn owner WARN). */
-		teardown_gen = tcp_to_teardown->gen;
 		if (s->linger_onoff && s->linger_seconds == 0) {
 			use_abort = 1;
 		} else if (s->linger_onoff && s->linger_seconds > 0) {
@@ -1037,12 +1057,10 @@ int sock_close(int sockfd)
 			linger_secs = s->linger_seconds;
 		}
 	}
-	// Clear the back-pointer FIRST so the timer reaper can reclaim this
-	// slot the moment it reaches CLOSED.  Safe to write here without
-	// conn->lock: we still hold s->lock so no parallel sock_close on the
-	// same fd is running, and tcp_alloc_conn / tcp_free_conn never touch
-	// owner_socket of an already-published live conn.  No one else writes
-	// it because the conn is owned by exactly one socket.
+	// Detach the connection from the socket.  We still hold a reference on
+	// it (the socket reference), so it stays alive across the teardown below
+	// even though sock_send/recv (which re-check s->tcp under s->lock) can
+	// no longer reach it.
 	if (tcp_to_teardown)
 		tcp_to_teardown->owner_socket = NULL;
 	s->tcp = NULL;
@@ -1050,28 +1068,21 @@ int sock_close(int sockfd)
 	s->active = 0;
 	spin_unlock_irqrestore(&s->lock, flags);
 
-	// CRITICAL: do NOT hold s->lock across tcp_close/tcp_abort.  Those
-	// call tcp_send_segment (FIN packet, may queue+drain a softirq),
-	// tcp_free_conn → slab_free (initiates a TLB-shootdown IPI on freed
-	// buffer pages), and tcp_reap_pending (more slab_free).  Holding
-	// s->lock with IRQs off across that window starves remote
-	// TLB-shootdown IPIs and trips `SMP: TLB shootdown sync timeout`.
+	// Do NOT hold s->lock across tcp_close/tcp_abort (they send FIN/RST and
+	// may free memory → TLB-shootdown IPIs).  We hold the socket reference,
+	// so tcp_to_teardown is a stable, valid pointer here.
 	if (tcp_to_teardown) {
 		if (use_abort) {
 			// SO_LINGER l_onoff=1, l_linger=0 → RST (RFC 1122 §4.2.2.13)
-			tcp_abort_gen(tcp_to_teardown, teardown_gen);
+			tcp_abort(tcp_to_teardown);
 		} else {
-			int closed_live =
-				tcp_close_gen(tcp_to_teardown, teardown_gen);
-			if (do_linger_block && closed_live == 0) {
+			tcp_close(tcp_to_teardown);
+			if (do_linger_block) {
 				uint64_t deadline = timer_ticks() +
 						    (uint64_t)linger_secs * 100;
-				/* gen re-check each iteration: the conn can be
-				 * freed+recycled while we poll (slots are a
-				 * static array, so the deref is memory-safe;
-				 * a gen change means OUR conn is gone). */
-				while (tcp_to_teardown->gen == teardown_gen &&
-				       tcp_to_teardown->state !=
+				// We hold a reference, so the deref is always
+				// memory-safe.
+				while (tcp_to_teardown->state !=
 					       TCP_STATE_CLOSED &&
 				       tcp_to_teardown->state !=
 					       TCP_STATE_TIME_WAIT &&
@@ -1080,6 +1091,9 @@ int sock_close(int sockfd)
 				}
 			}
 		}
+		// Drop the socket reference; the connection is freed once its
+		// protocol reference is also gone (at teardown completion).
+		tcp_conn_release(tcp_to_teardown);
 	}
 	return 0;
 }
@@ -1098,14 +1112,12 @@ int sock_shutdown(int sockfd, int how)
 
 	if (s->type == SOCK_STREAM && s->tcp) {
 		tcp_conn_t *c = s->tcp;
-		/* Capture gen BEFORE clearing owner_socket — same deferred-
-		 * teardown recycle race as sock_close (see comment there). */
-		uint32_t gen = c->gen;
 		c->owner_socket = NULL;
 		s->tcp = NULL;
 		s->connected = 0;
 		s->listening = 0;
-		tcp_close_gen(c, gen);
+		tcp_close(c);
+		tcp_conn_release(c); // drop the socket reference
 	}
 
 	return 0;
@@ -2601,40 +2613,8 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 // ============================================================================
 
 // Get TCP connection info
-int net_get_tcp_connections(net_tcp_info_t *entries, int max_entries)
-{
-	extern tcp_conn_t tcp_connections[TCP_MAX_CONNECTIONS];
-	int count = 0;
-	for (int i = 0; i < TCP_MAX_CONNECTIONS && count < max_entries; i++) {
-		tcp_conn_t *c = &tcp_connections[i];
-		if (!c->active)
-			continue;
-		entries[count].local_ip = c->local_ip;
-		entries[count].local_port = c->local_port;
-		entries[count].remote_ip = c->remote_ip;
-		entries[count].remote_port = c->remote_port;
-		entries[count].state = c->state;
-		// Calculate queue sizes
-		uint32_t rx_used = 0;
-		if (c->rx_buf) {
-			if (c->rx_tail >= c->rx_head)
-				rx_used = c->rx_tail - c->rx_head;
-			else
-				rx_used = c->rx_buf_size - c->rx_head +
-					  c->rx_tail;
-		}
-		entries[count].rx_queue = rx_used;
-		uint32_t tx_used = 0;
-		for (uint8_t seg = 0; seg < c->inflight_count; seg++) {
-			tx_used += c->inflight[seg].len;
-			if (c->inflight[seg].flags & (TCP_SYN | TCP_FIN))
-				tx_used++;
-		}
-		entries[count].tx_queue = tx_used;
-		count++;
-	}
-	return count;
-}
+// net_get_tcp_connections lives in tcp.c (it needs the internal connection
+// list); declared in net.h.
 
 // Get UDP socket info
 int net_get_udp_sockets(net_udp_info_t *entries, int max_entries)
