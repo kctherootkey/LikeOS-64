@@ -1076,7 +1076,17 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
      * terminal as the rest of the report. */
 #ifdef DEBUG
 	if ((rip >> 47) == 0 && mm_user_addr_mapped(rip - 16, 32)) {
+		/* Snapshot the user bytes into a kernel buffer first, inside a
+	     * tight SMAP window.  Reading the user page directly from the
+	     * printf argument list faulted under SMAP (supervisor read of a
+	     * user page with AC clear) and crashed the crash handler
+	     * recursively, destroying the original report. */
+		uint8_t b[32];
 		const uint8_t *p = (const uint8_t *)(rip - 16);
+		smap_disable();
+		for (int i = 0; i < 32; i++)
+			b[i] = p[i];
+		smap_enable();
 		task_tty_printf(cur,
 				"\nBytes around RIP (RIP-16 .. RIP+15):\n");
 		for (int row = 0; row < 2; row++) {
@@ -1085,14 +1095,14 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 				cur,
 				"  %016llx: %02x %02x %02x %02x %02x %02x %02x %02x"
 				" %02x %02x %02x %02x %02x %02x %02x %02x\n",
-				base, p[row * 16 + 0], p[row * 16 + 1],
-				p[row * 16 + 2], p[row * 16 + 3],
-				p[row * 16 + 4], p[row * 16 + 5],
-				p[row * 16 + 6], p[row * 16 + 7],
-				p[row * 16 + 8], p[row * 16 + 9],
-				p[row * 16 + 10], p[row * 16 + 11],
-				p[row * 16 + 12], p[row * 16 + 13],
-				p[row * 16 + 14], p[row * 16 + 15]);
+				base, b[row * 16 + 0], b[row * 16 + 1],
+				b[row * 16 + 2], b[row * 16 + 3],
+				b[row * 16 + 4], b[row * 16 + 5],
+				b[row * 16 + 6], b[row * 16 + 7],
+				b[row * 16 + 8], b[row * 16 + 9],
+				b[row * 16 + 10], b[row * 16 + 11],
+				b[row * 16 + 12], b[row * 16 + 13],
+				b[row * 16 + 14], b[row * 16 + 15]);
 		}
 		task_tty_printf(
 			cur,
@@ -1100,6 +1110,28 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 	} else {
 		task_tty_printf(cur,
 				"\nBytes around RIP: <not safely readable>\n");
+	}
+
+	/* User stack snapshot: the top 16 qwords at RSP.  Return addresses
+	 * here reveal where a wild jump or corrupted return came from —
+	 * without this, a crash at a bogus RIP leaves no trail.  Same SMAP
+	 * discipline as the RIP bytes: snapshot under a tight STAC window,
+	 * print from the kernel copy. */
+	if ((rsp >> 47) == 0 && (rsp & 7) == 0 &&
+	    mm_user_addr_mapped(rsp, 128)) {
+		uint64_t q[16];
+		const uint64_t *up = (const uint64_t *)rsp;
+		smap_disable();
+		for (int i = 0; i < 16; i++)
+			q[i] = up[i];
+		smap_enable();
+		task_tty_printf(cur, "\nStack (16 qwords at RSP):\n");
+		for (int i = 0; i < 16; i += 2)
+			task_tty_printf(cur,
+					"  %016llx: %016llx %016llx\n",
+					rsp + (uint64_t)i * 8, q[i], q[i + 1]);
+	} else {
+		task_tty_printf(cur, "\nStack: <not safely readable>\n");
 	}
 #endif /* DEBUG */
 

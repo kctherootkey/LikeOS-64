@@ -3099,8 +3099,9 @@ int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode)
 		(void)from_kernel_mode;
 		pagein_lock(file);
 		long saved = vfs_seek(file, 0, SEEK_CUR);
-		long got = 0;
-		if (saved >= 0 &&
+		long fsize = vfs_seek(file, 0, SEEK_END);
+		long got = -1;
+		if (saved >= 0 && fsize >= 0 &&
 		    vfs_seek(file, (long)file_off, SEEK_SET) >= 0) {
 			got = vfs_read(file, phys_to_virt(phys), PAGE_SIZE);
 			vfs_seek(file, saved, SEEK_SET);
@@ -3108,8 +3109,30 @@ int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode)
 		pagein_unlock(file);
 		if (got < 0)
 			got = 0;
-		/* Short read (EOF inside the mapping) — rest reads as zeros.
-		 * Also covers DEBUG builds where fresh pages are poisoned. */
+		/* A short read is legitimate ONLY at EOF inside the mapping
+		 * (e.g. an RO-BSS tail past the file bytes) — that tail reads
+		 * as zeros.  A short read of bytes that DO exist in the file
+		 * is an I/O error or a transient FS failure: mapping a
+		 * zeroed/partial page over real file content would hand the
+		 * CPU garbage text/data and produce wild-jump crashes far
+		 * from the cause.  Fail the fault loudly instead. */
+		long expected = 0;
+		if (fsize > (long)file_off) {
+			expected = fsize - (long)file_off;
+			if (expected > (long)PAGE_SIZE)
+				expected = (long)PAGE_SIZE;
+		}
+		if (got < expected || fsize < 0) {
+			WARN_RATELIMIT(
+				1,
+				"pagein: short read %ld/%ld at file_off=%llu va=%llx - failing fault",
+				got, expected, (unsigned long long)file_off,
+				(unsigned long long)page);
+			mm_free_physical_page(phys);
+			return 0;
+		}
+		/* Zero the EOF tail (also covers DEBUG builds where fresh
+		 * pages are poisoned). */
 		if (got < (long)PAGE_SIZE)
 			mm_memset((uint8_t *)phys_to_virt(phys) + got, 0,
 				  PAGE_SIZE - (uint64_t)got);
