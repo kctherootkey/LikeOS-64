@@ -45,6 +45,14 @@ static inline void sock_conn_unlock(spinlock_t *lock, uint64_t flags)
 // Ephemeral port counter (49152-65535)
 static uint16_t next_ephemeral_port = 49152;
 
+// Serialises the whole ephemeral-port allocation: the scan for a free port
+// and the reservation that publishes it on the socket must be atomic with
+// respect to each other, or two callers on different CPUs can both observe
+// the same port as free (neither has marked its socket bound yet) and hand it
+// out twice.  The lock is a leaf — it may be taken while a caller already
+// holds that socket's s->lock (the bind path), never the reverse.
+static spinlock_t g_port_alloc_lock = SPINLOCK_INIT("portalloc");
+
 void socket_init(void)
 {
 	for (int i = 0; i < NET_MAX_SOCKETS; i++) {
@@ -52,28 +60,52 @@ void socket_init(void)
 	}
 }
 
-static uint16_t alloc_ephemeral_port(void)
+// Allocate a free ephemeral port and atomically RESERVE it on `s` by
+// publishing it (local_addr.sin_port + bound=1) before releasing the port
+// lock.  A concurrent allocator therefore sees the reservation and cannot
+// pick the same port for another socket.  Callers set the remaining
+// local_addr fields (family/addr) around this call; only sin_port + bound key
+// the collision scan, so their ordering does not matter.  Returns host-order.
+static uint16_t alloc_ephemeral_port(net_socket_t *s)
 {
-	// Randomized ephemeral port allocation
+	// Draw the randomized starting point BEFORE taking the port lock —
+	// random_get_bytes may take the entropy lock, which must not nest under
+	// this IRQs-off spinlock.  Probe sequentially from there under the lock.
+	uint16_t start = 49152 + (uint16_t)(random_u32() % 16384);
+
+	uint64_t flags;
+	spin_lock_irqsave(&g_port_alloc_lock, &flags);
+	uint16_t port = 0;
 	for (int attempt = 0; attempt < 128; attempt++) {
-		uint16_t port = 49152 + (uint16_t)(random_u32() % 16384);
-		// Check for collision with bound sockets
+		uint16_t cand = (uint16_t)(49152 +
+					   (((uint32_t)(start - 49152) + attempt) %
+					    16384));
 		int in_use = 0;
 		for (int i = 0; i < NET_MAX_SOCKETS; i++) {
 			if (sockets[i].active && sockets[i].bound &&
-			    net_ntohs(sockets[i].local_addr.sin_port) == port) {
+			    net_ntohs(sockets[i].local_addr.sin_port) == cand) {
 				in_use = 1;
 				break;
 			}
 		}
 		if (!in_use) {
-			return port;
+			port = cand;
+			break;
 		}
 	}
-	// Fallback: sequential
-	uint16_t port = next_ephemeral_port++;
-	if (next_ephemeral_port < 49152)
-		next_ephemeral_port = 49152;
+	if (!port) {
+		// 128 consecutive ports all in use (near-exhaustion): fall back
+		// to the sequential counter, still under the lock.
+		port = next_ephemeral_port++;
+		if (next_ephemeral_port < 49152)
+			next_ephemeral_port = 49152;
+	}
+	// Publish the reservation.  sin_port before bound (with a release
+	// fence) so a lock-free reader that sees bound=1 also sees the port.
+	s->local_addr.sin_port = net_htons(port);
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	s->bound = 1;
+	spin_unlock_irqrestore(&g_port_alloc_lock, flags);
 	return port;
 }
 
@@ -237,7 +269,8 @@ int sock_bind(int sockfd, const struct sockaddr_in *addr)
 	spin_lock_irqsave(&s->lock, &flags);
 	s->local_addr = *addr;
 	if (s->local_addr.sin_port == 0) {
-		s->local_addr.sin_port = net_htons(alloc_ephemeral_port());
+		// Reserves the port and sets s->bound under the port lock.
+		alloc_ephemeral_port(s);
 	}
 	s->bind_euid = current_euid();
 	s->bound = 1;
@@ -377,11 +410,11 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 		return -ENETDOWN;
 
 	if (!s->bound) {
-		s->local_addr.sin_port = net_htons(alloc_ephemeral_port());
 		s->local_addr.sin_addr.s_addr = net_htonl(dev->ip_addr);
 		s->local_addr.sin_family = AF_INET;
 		s->bind_euid = current_euid();
-		s->bound = 1;
+		// Reserves the port and sets s->bound under the port lock.
+		alloc_ephemeral_port(s);
 	}
 
 	s->remote_addr = *addr;
@@ -569,11 +602,10 @@ int sock_sendto(int sockfd, const void *buf, size_t len, int flags,
 		}
 
 		if (!s->bound) {
-			s->local_addr.sin_port =
-				net_htons(alloc_ephemeral_port());
 			s->local_addr.sin_addr.s_addr = net_htonl(dev->ip_addr);
 			s->bind_euid = current_euid();
-			s->bound = 1;
+			// Reserves the port and sets s->bound under the port lock.
+			alloc_ephemeral_port(s);
 		}
 
 		uint16_t src_port = net_ntohs(s->local_addr.sin_port);
@@ -621,8 +653,42 @@ int sock_recvfrom(int sockfd, void *buf, size_t len, int flags,
 			/* Interruptible: recvfrom() returns EINTR on a signal. */
 			if (udp_cur && signal_pending(udp_cur))
 				return -EINTR;
+
+			/* Deliver any datagram already queued on the loopback
+			 * device ourselves (a same-task sender's datagram sits
+			 * there until someone drains it), then park on
+			 * &s->udp_rx_ready — udp_deliver_to_socket wakes it when
+			 * a datagram arrives from any other context.  This
+			 * replaces a busy spin-yield that pegged a CPU while
+			 * "blocked".  Mirrors the TCP recv park (see sock_recv):
+			 * mark BLOCKED, re-check, and un-park via CAS so we never
+			 * race the waker's claim into a double-enqueue. */
 			loopback_process_pending();
-			sched_yield_in_kernel();
+			if (!udp_cur) {
+				sched_yield_in_kernel();
+				continue;
+			}
+			udp_cur->wait_channel = (void *)&s->udp_rx_ready;
+			udp_cur->wakeup_tick = deadline; /* 0 = no timeout */
+			__atomic_thread_fence(__ATOMIC_SEQ_CST);
+			udp_cur->state = TASK_BLOCKED;
+			__atomic_thread_fence(__ATOMIC_SEQ_CST);
+			if (s->udp_rx_ready) {
+				task_state_t expected = TASK_BLOCKED;
+				if (__atomic_compare_exchange_n(
+					    &udp_cur->state, &expected,
+					    TASK_RUNNING, false,
+					    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+					udp_cur->wait_channel = NULL;
+					udp_cur->wakeup_tick = 0;
+					continue;
+				}
+				/* Waker claimed us: fall through to schedule as
+				 * READY current; the queue entry brings us back. */
+			}
+			sched_schedule();
+			udp_cur->wait_channel = NULL;
+			udp_cur->wakeup_tick = 0;
 		}
 
 		uint64_t sflags;
@@ -1529,6 +1595,8 @@ void raw_socket_deliver(uint32_t src_ip, uint32_t dst_ip, uint8_t protocol,
 		s->udp_rx_ready = 1;
 
 		spin_unlock_irqrestore(&s->lock, flags);
+		/* Wake a receiver parked on this RAW socket (see sock_recvfrom). */
+		sched_wake_channel((void *)&s->udp_rx_ready);
 	}
 }
 
@@ -1609,6 +1677,11 @@ void sock_post_icmp_error(uint8_t proto, uint32_t src_ip, uint16_t src_port,
 			s->tcp->tx_ready = 1;
 			s->tcp->connect_done = 1;
 		}
+		/* A UDP recv now parks on &s->udp_rx_ready rather than
+		 * busy-polling, so an error posted here must wake it or it
+		 * would sleep through the failure until its timeout. */
+		if (wanted_type == SOCK_DGRAM)
+			sched_wake_channel((void *)&s->udp_rx_ready);
 	}
 }
 
@@ -1637,27 +1710,33 @@ int sock_socketpair(int domain, int type, int protocol, int sv[2])
 	net_socket_t *s0 = &sockets[fd0];
 	net_socket_t *s1 = &sockets[fd1];
 
-	uint16_t port0 = alloc_ephemeral_port();
-	uint16_t port1 = alloc_ephemeral_port();
-
+	// Reserve each local port with alloc_ephemeral_port(), which publishes
+	// sin_port+bound on the socket under the port lock before returning.
+	// Reserving s0 before drawing s1's port guarantees the two differ —
+	// otherwise a collision (both sockets sharing a local port) makes
+	// sock_find_udp() match the lower-fd socket (the sender) for the peer's
+	// datagram, so the peer's recv() never sees data and blocks forever.
+	// Set family/addr first so the socket is fully described the instant it
+	// becomes bound.
 	s0->local_addr.sin_family = AF_INET;
-	s0->local_addr.sin_port = net_htons(port0);
 	s0->local_addr.sin_addr.s_addr = net_htonl(0x7F000001);
+	s0->bind_euid = current_euid();
+	uint16_t port0 = alloc_ephemeral_port(s0);
+
+	s1->local_addr.sin_family = AF_INET;
+	s1->local_addr.sin_addr.s_addr = net_htonl(0x7F000001);
+	s1->bind_euid = current_euid();
+	uint16_t port1 = alloc_ephemeral_port(s1);
+
+	// Cross-connect the pair now that both local ports are fixed.
 	s0->remote_addr.sin_family = AF_INET;
 	s0->remote_addr.sin_port = net_htons(port1);
 	s0->remote_addr.sin_addr.s_addr = net_htonl(0x7F000001);
-	s0->bind_euid = current_euid();
-	s0->bound = 1;
 	s0->connected = 1;
 
-	s1->local_addr.sin_family = AF_INET;
-	s1->local_addr.sin_port = net_htons(port1);
-	s1->local_addr.sin_addr.s_addr = net_htonl(0x7F000001);
 	s1->remote_addr.sin_family = AF_INET;
 	s1->remote_addr.sin_port = net_htons(port0);
 	s1->remote_addr.sin_addr.s_addr = net_htonl(0x7F000001);
-	s1->bind_euid = current_euid();
-	s1->bound = 1;
 	s1->connected = 1;
 
 	if (type & SOCK_NONBLOCK) {

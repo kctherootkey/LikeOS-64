@@ -271,4 +271,10 @@ void udp_deliver_to_socket(uint32_t src_ip, uint16_t src_port, uint32_t dst_ip,
 	sk->udp_rx_ready = 1;
 
 	spin_unlock_irqrestore(&sk->lock, flags);
+
+	/* Wake a receiver parked in sock_recvfrom on &sk->udp_rx_ready.  The
+	 * flag is set before this wake, so the standard park double-check
+	 * closes the set-vs-park race.  Done after dropping sk->lock — the
+	 * waker path takes scheduler locks. */
+	sched_wake_channel((void *)&sk->udp_rx_ready);
 }
