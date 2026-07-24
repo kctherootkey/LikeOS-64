@@ -17,6 +17,9 @@ long devfs_write(vfs_file_t *f, const void *buf, long bytes);
 int devfs_ioctl(vfs_file_t *f, unsigned long req, void *argp, task_t *cur);
 int devfs_fstat(vfs_file_t *f, struct kstat *st);
 int devfs_is_devfile(vfs_file_t *f);
+int devfs_is_fb0(vfs_file_t *f);
+int devfs_evdev_unit(vfs_file_t *f); // event-device unit or -1
+long devfs_seek(vfs_file_t *f, long offset, int whence);
 
 // Helpers for syscall layer
 const vfs_ops_t *devfs_get_ops(void);

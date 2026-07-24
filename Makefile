@@ -95,11 +95,19 @@ endif
 
 # Screen size: pass SCREEN_SIZE=large for 1920x1200 preferred resolution,
 # SCREEN_SIZE=medium (or unset) for 1280x800 preferred resolution.
+# The kernel gets the same define so the SVGA driver's boot-time best-fit
+# mode selection uses the identical preferred-resolution table.
 ifeq ($(SCREEN_SIZE),large)
   UEFI_SCREEN_CFLAGS = -DSCREEN_LARGE
+  KERNEL_SCREEN_CFLAGS = -DSCREEN_LARGE
 else
   UEFI_SCREEN_CFLAGS =
+  KERNEL_SCREEN_CFLAGS =
 endif
+
+# All QEMU run targets use the VMware SVGA II display adapter so the vmsvga2
+# kernel driver is exercised; the GOP framebuffer remains the fallback path.
+QEMU_VGA = -vga vmware
 
 MKFS_FAT = mkfs.fat
 MTOOLS = mcopy
@@ -126,6 +134,7 @@ KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-D__LIKEOS__ -DACPI_USE_BUILTIN_STDARG \
 			-U__linux__ -U_LINUX -Ulinux \
 			-DXHCI_USE_INTERRUPTS=1 $(SERIAL_CFLAGS) $(USB_SERIAL_CFLAGS) \
+			$(KERNEL_SCREEN_CFLAGS) \
 			-DBUILD_DATE='"$(BUILD_DATE)"' \
 			-DLIKEOS_VERSION='"$(LIKEOS_VERSION)"' \
 			$(KERNEL_DEBUG_CFLAGS)
@@ -168,7 +177,10 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/console.o \
               $(BUILD_DIR)/sysfont.o \
               $(BUILD_DIR)/cursor.o \
-              $(BUILD_DIR)/fb_optimize.o \
+              $(BUILD_DIR)/fb.o \
+              $(BUILD_DIR)/vmsvga2.o \
+              $(BUILD_DIR)/fbdev.o \
+              $(BUILD_DIR)/evdev.o \
               $(BUILD_DIR)/interrupt.o \
               $(BUILD_DIR)/interrupt_c.o \
               $(BUILD_DIR)/gdt.o \
@@ -323,7 +335,16 @@ $(BUILD_DIR)/sysfont.o: $(KERNEL_DIR)/io/sysfont.c | $(BUILD_DIR)
 $(BUILD_DIR)/cursor.o: $(KERNEL_DIR)/io/cursor.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/fb_optimize.o: $(KERNEL_DIR)/dev/video/fb_optimize.c | $(BUILD_DIR)
+$(BUILD_DIR)/fb.o: $(KERNEL_DIR)/dev/video/fb.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/vmsvga2.o: $(KERNEL_DIR)/dev/video/vmsvga2.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fbdev.o: $(KERNEL_DIR)/dev/video/fbdev.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/evdev.o: $(KERNEL_DIR)/dev/input/evdev.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/interrupt.o: $(KERNEL_DIR)/ke/interrupt.asm | $(BUILD_DIR)
@@ -1275,7 +1296,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 # bootloader, which then loads /boot/kernel.elf from the ext4 root partition.
 qemu: $(GPT_DISK)
 	@echo "Running LikeOS-64 from the ext4 GPT USB disk in QEMU..."
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-machine type=pc,accel=kvm:tcg -device qemu-xhci,id=xhci \
 		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
 		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
@@ -1293,7 +1314,7 @@ qemu-usb: $(GPT_DISK)
 	@# sudo is required so SLIRP can open a raw ICMP socket on the host;
 	@# without it, external `ping` (e.g. ping 8.8.8.8) is silently dropped
 	@# while the synthetic gateway reply (10.0.2.2) still works.
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-machine type=pc,accel=kvm:tcg -device qemu-xhci,id=xhci \
 		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
 		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
@@ -1308,7 +1329,7 @@ qemu-usb-gdb:
 	@echo "Running LikeOS-64 from the ext4 GPT USB disk + $(NIC_DEVICE) + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
 	@# sudo: see qemu-usb target above (SLIRP raw ICMP socket).
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-machine type=pc,accel=kvm:tcg -device qemu-xhci,id=xhci \
 		-drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off \
 		-device usb-storage,drive=ext4disk,bootindex=0 $(QEMU_USB_HID) \
@@ -1322,7 +1343,7 @@ ifndef USB_DEVICE
 	$(error USB_DEVICE is not set. Usage: make qemu-realusb USB_DEVICE=/dev/sdb)
 endif
 	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC)..."
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg \
 		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0
@@ -1339,7 +1360,7 @@ endif
 	$(MAKE) KERNEL_CFLAGS="$(KERNEL_CFLAGS) -g" NO_STRIP=1 usb-write USB_DEVICE=$(USB_DEVICE)
 	@echo "Running LikeOS-64 in QEMU booting from xHCI USB device $(USB_DEVICE) ($(NIC_DEVICE) NIC) + GDB server on :1234..."
 	@echo "Connect with: gdb build/kernel.elf -ex 'target remote :1234'"
-	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
+	sudo $(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) \
 		-device qemu-xhci,id=xhci -drive if=none,id=stick,format=raw,file=$(USB_DEVICE) \
 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=1 -machine type=pc,accel=kvm:tcg \
 		-device $(NIC_DEVICE),netdev=net0 -netdev user,id=net0 \
@@ -1365,7 +1386,7 @@ qemu-usb-passthrough: $(GPT_DISK)
 	if [ -z "$$devices" ]; then echo "(No host USB devices selected for passthrough. Set PASSTHROUGH_FILTER=vid:pid to choose explicitly.)"; fi; \
 	echo "Passing through devices:$$devices"; \
 	set -x; \
-	$(QEMU) -bios /usr/share/ovmf/OVMF.fd -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) -machine q35 -device qemu-xhci,id=xhci -device usb-tablet -drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off -device usb-storage,drive=ext4disk,bootindex=0 $$devices || echo "QEMU exited with status $$?"; \
+	$(QEMU) -bios /usr/share/ovmf/OVMF.fd $(QEMU_VGA) -m $(QEMU_MEM) $(QEMU_SERIAL) $(QEMU_SMP) -machine q35 -device qemu-xhci,id=xhci -device usb-tablet -drive if=none,id=ext4disk,file=$(GPT_DISK),format=raw,readonly=off -device usb-storage,drive=ext4disk,bootindex=0 $$devices || echo "QEMU exited with status $$?"; \
 	set +x || true
 
 # Write the single ext4 GPT USB disk to a real USB device (like Rufus, but the

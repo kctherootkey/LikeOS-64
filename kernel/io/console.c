@@ -6,7 +6,7 @@
 #include <kernel/io/console.h>
 #include <kernel/hal/serial.h>
 #include <kernel/dev/usb/usb_serial.h>
-#include <kernel/dev/video/fb_optimize.h>
+#include <kernel/dev/video/fb.h>
 #include <kernel/dev/input/mouse.h>
 #include <kernel/io/scrollbar.h>
 #include <kernel/mm/memory.h>
@@ -912,6 +912,85 @@ void console_apply_sysfont(void)
 
 	kprintf("Console: using system font (%ux%u)\n", char_width,
 		char_height);
+}
+
+// Declared here rather than via tty.h: console sits below the tty layer.
+extern void tty_console_resize(void);
+
+// Copy of the current framebuffer parameters (fbdev/GOP fallback path).
+int console_get_framebuffer_info(framebuffer_info_t *out)
+{
+	if (!out || !fb_info || !fb_info->framebuffer_base)
+		return -1;
+	*out = *fb_info;
+	return 0;
+}
+
+// Re-initialize the console for a new framebuffer/mode (runtime resolution
+// change by the display driver).  Re-derives text geometry, swaps the pixel
+// backend via fb_reinit(), redraws the scrollback view and resizes the
+// console tty (winsize + SIGWINCH).
+int console_reinit_framebuffer(framebuffer_info_t *fb)
+{
+	uint64_t flags;
+
+	if (!fb || !fb->framebuffer_base)
+		return -1;
+	if (WARN_ON_ONCE(fb->horizontal_resolution == 0 ||
+			 fb->vertical_resolution == 0))
+		return -1;
+
+	spin_lock_irqsave(&console_lock, &flags);
+
+	g_fb_info_copy = *fb;
+	fb_info = &g_fb_info_copy;
+
+	// Recompute text geometry with the current font
+	uint32_t scrollbar_total_width =
+		SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
+	uint32_t text_area_width =
+		fb_info->horizontal_resolution - scrollbar_total_width;
+	max_cols = text_area_width / char_width;
+	max_rows = fb_info->vertical_resolution / char_height;
+	WARN_ON_ONCE(max_cols == 0 || max_rows == 0);
+	g_sb.visible_lines = max_rows;
+
+	// Swap the double-buffer backend to the new front buffer/geometry
+	if (fb_reinit(fb_info) != 0) {
+		spin_unlock_irqrestore(&console_lock, flags);
+		WARN(1, "console: fb_reinit failed for %ux%u",
+		     fb->horizontal_resolution, fb->vertical_resolution);
+		return -1;
+	}
+
+	// Clamp cursor into the new geometry
+	if (cursor_x >= max_cols)
+		cursor_x = max_cols ? max_cols - 1 : 0;
+	if (cursor_y >= max_rows)
+		cursor_y = max_rows ? max_rows - 1 : 0;
+
+	// Full clear (including the old scrollbar area), then rebuild the
+	// scrollbar for the new geometry and re-render the scrollback view.
+	fb_fill_rect(0, 0, fb_info->horizontal_resolution,
+		     fb_info->vertical_resolution, bg_color);
+	scrollbar_t *sb = scrollbar_get_system();
+	if (sb) {
+		scrollbar_init_system_default(sb);
+		scrollbar_render(sb);
+	}
+	console_render_view();
+	console_sync_scrollbar();
+
+	spin_unlock_irqrestore(&console_lock, flags);
+
+	// Flush outside console_lock: the flush hook may reach code that logs.
+	fb_flush_dirty_regions();
+
+	// Propagate outside console_lock: tty winsize + SIGWINCH, mouse clamp
+	tty_console_resize();
+	mouse_set_bounds((int)fb->horizontal_resolution,
+			 (int)fb->vertical_resolution);
+	return 0;
 }
 
 // Clear the entire screen (text area only, preserve scrollbar)

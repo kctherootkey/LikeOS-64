@@ -12,7 +12,7 @@
 //        ↓
 //   console.c — framebuffer renderer bridge, cursor blink timer, scrollback
 //        ↓
-//   fb_optimize.c — pixel-level drawing
+//   fb.c — pixel-level drawing
 
 #ifndef _KERNEL_VT_H_
 #define _KERNEL_VT_H_

@@ -90,6 +90,11 @@ void mm_prefault_user_range(uint64_t addr, uint64_t len, int for_write);
 #define PAGE_SIZE_FLAG 0x080
 #define PAGE_GLOBAL 0x100
 #define PAGE_COW 0x200 // Copy-on-Write marker (available bit)
+// Device MMIO mapping marker (available bit 10): the physical page behind
+// this PTE belongs to a device BAR (e.g. framebuffer VRAM), NOT to the
+// physical page allocator.  Unmap/teardown/clone paths must never free,
+// refcount or COW such pages — only clear or copy the PTE.
+#define PAGE_DEVICE 0x400
 #define PAGE_NO_EXECUTE 0x8000000000000000ULL
 
 // Physical address mask for extracting physical address from page table entries

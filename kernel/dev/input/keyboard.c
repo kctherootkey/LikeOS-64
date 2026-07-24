@@ -6,6 +6,7 @@
 #include <kernel/io/tty.h>
 #include <kernel/ke/sched.h>
 #include <kernel/dev/rand/random.h>
+#include <kernel/dev/input/evdev.h>
 #include <kernel/uapi/bug.h>
 
 // Global keyboard state
@@ -127,10 +128,20 @@ char scan_code_to_ascii(uint8_t scan_code, uint8_t shift)
 	}
 }
 
+// Set around the PS/2 handler's own keyboard_buffer_add call so the evdev
+// tap below doesn't double-report scancodes the handler already fed.
+static volatile int kb_ps2_in_irq;
+
 // Add character to keyboard buffer
 void keyboard_buffer_add(uint8_t scan_code)
 {
 	uint64_t flags;
+
+	// evdev tap for non-PS/2 producers (USB HID translates its reports
+	// into set-1 scancodes and delivers them through this funnel).
+	if (!kb_ps2_in_irq)
+		(void)evdev_feed_keyboard(scan_code);
+
 	spin_lock_irqsave(&kb_lock, &flags);
 	WARN_ON(kb_state.buffer_count >= KEYBOARD_BUFFER_SIZE);
 	if (kb_state.buffer_count < KEYBOARD_BUFFER_SIZE) {
@@ -174,6 +185,14 @@ void keyboard_irq_handler(void)
 	entropy_add_interrupt_timing((uint64_t)scan_code);
 
 	if (!kb_input_ready) {
+		return;
+	}
+
+	// evdev tap: the raw set-1 stream (0xE0 prefixes included) becomes
+	// input events on /dev/input/event0 in parallel with the cooked tty
+	// path below.  While a client holds a grab, the tty path (and thus
+	// SIGINT generation) is suppressed — the grabber owns the console.
+	if (evdev_feed_keyboard(scan_code)) {
 		return;
 	}
 
@@ -348,8 +367,11 @@ void keyboard_irq_handler(void)
 		}
 	}
 
-	// Add to buffer for processing
+	// Add to buffer for processing (evdev already saw this scancode at
+	// the top of the handler; the flag stops a duplicate report)
+	kb_ps2_in_irq = 1;
 	keyboard_buffer_add(scan_code);
+	kb_ps2_in_irq = 0;
 
 	// Debug hotkey: Ctrl+D dumps all task states
 	if (kb_state.ctrl_pressed && !kb_state.alt_pressed &&

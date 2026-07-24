@@ -9,6 +9,7 @@
 #include <kernel/fs/vfs.h>
 #include <kernel/io/tty.h>
 #include <kernel/fs/devfs.h>
+#include <kernel/dev/input/evdev.h>
 #include <kernel/uapi/bug.h>
 
 // ============================================================================
@@ -166,6 +167,13 @@ static short fd_poll_one(int fd, short events)
 		int pid = devfs_get_pty_master_id((vfs_file_t *)entry);
 		if (pid >= 0)
 			return (short)tty_pty_master_poll(pid, events);
+	}
+
+	// Event devices (/dev/input/eventN): readable when events are queued.
+	{
+		int unit = devfs_evdev_unit((vfs_file_t *)entry);
+		if (unit >= 0)
+			return evdev_poll(unit, events);
 	}
 
 	// Tty/pty-slave (real terminal): always writable, readable when input is queued.

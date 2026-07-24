@@ -30,6 +30,8 @@
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <poll.h>
+#include <sys/fb.h>
+#include <sys/input.h>
 #include <sys/select.h>
 #include <sys/epoll.h>
 #include <net/if.h>
@@ -633,6 +635,199 @@ static void rmtree(const char *path)
  * with seteuid(0) — the real and saved uids stay 0, so root can always be
  * regained.  The cross-uid kill() test uses forked children that take a fixed
  * uid via setresuid(), so the parent's credentials are never disturbed. */
+// ============================================================================
+// Device nodes: /dev/null, /dev/zero, /dev/urandom, /dev/tty0, /dev/fb0,
+// /dev/input (added with the display/input driver work)
+// ============================================================================
+static void test_dev_nodes(void)
+{
+	printf("\n--- Device Node Tests (/dev) ---\n");
+
+	int fd = open("/dev/null", O_WRONLY);
+	test_result("open(/dev/null)", fd >= 0);
+	if (fd >= 0) {
+		test_result("write(/dev/null) accepts data",
+			    write(fd, "abc", 3) == 3);
+		close(fd);
+	}
+
+	fd = open("/dev/zero", O_RDONLY);
+	test_result("open(/dev/zero)", fd >= 0);
+	if (fd >= 0) {
+		char b[16];
+		memset(b, 0xAA, sizeof(b));
+		int ok = read(fd, b, sizeof(b)) == (long)sizeof(b);
+		for (int i = 0; i < 16 && ok; i++)
+			if (b[i])
+				ok = 0;
+		test_result("read(/dev/zero) returns zeros", ok);
+		close(fd);
+	}
+
+	fd = open("/dev/urandom", O_RDONLY);
+	test_result("open(/dev/urandom)", fd >= 0);
+	if (fd >= 0) {
+		unsigned char b1[32], b2[32];
+		int r1 = (int)read(fd, b1, 32);
+		int r2 = (int)read(fd, b2, 32);
+		test_result("read(/dev/urandom) full blocks",
+			    r1 == 32 && r2 == 32);
+		test_result("urandom output varies", memcmp(b1, b2, 32) != 0);
+		close(fd);
+	}
+
+	fd = open("/dev/tty0", O_RDWR);
+	test_result("open(/dev/tty0)", fd >= 0);
+	if (fd >= 0)
+		close(fd);
+
+	struct stat st;
+	test_result("stat(/dev/input) is a directory",
+		    stat("/dev/input", &st) == 0 && S_ISDIR(st.st_mode));
+	test_result("stat(/dev/fb0) is a char device",
+		    stat("/dev/fb0", &st) == 0 && S_ISCHR(st.st_mode));
+}
+
+// ============================================================================
+// Framebuffer device: geometry ioctls + user mmap of the framebuffer
+// ============================================================================
+static void test_fbdev(void)
+{
+	printf("\n--- Framebuffer Device Tests (/dev/fb0) ---\n");
+
+	int fd = open("/dev/fb0", O_RDWR);
+	test_result("open(/dev/fb0, O_RDWR)", fd >= 0);
+	if (fd < 0)
+		return;
+
+	struct fb_var_screeninfo var;
+	struct fb_fix_screeninfo fix;
+	memset(&var, 0, sizeof(var));
+	memset(&fix, 0, sizeof(fix));
+
+	test_result("FBIOGET_VSCREENINFO",
+		    ioctl(fd, FBIOGET_VSCREENINFO, &var) == 0);
+	test_result("var: sane mode",
+		    var.xres >= 640 && var.yres >= 480 &&
+			    (var.bits_per_pixel == 32 ||
+			     var.bits_per_pixel == 16));
+	test_result("FBIOGET_FSCREENINFO",
+		    ioctl(fd, FBIOGET_FSCREENINFO, &fix) == 0);
+	test_result("fix: line_length covers xres",
+		    fix.line_length >= var.xres * (var.bits_per_pixel / 8));
+	test_result("fix: smem_len covers the screen",
+		    fix.smem_len >= fix.line_length * var.yres);
+	test_result("FBIOPUT_VSCREENINFO with current mode is accepted",
+		    ioctl(fd, FBIOPUT_VSCREENINFO, &var) == 0);
+
+	size_t maplen = (size_t)fix.line_length * var.yres;
+	void *fb = mmap(NULL, maplen, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+			0);
+	test_result("mmap(/dev/fb0) succeeds", fb != MAP_FAILED);
+	if (fb != MAP_FAILED) {
+		volatile unsigned int *px = (volatile unsigned int *)fb;
+		unsigned int saved = px[0];
+		px[0] = 0x00FF00FF;
+		test_result("framebuffer mmap write/readback",
+			    px[0] == 0x00FF00FF);
+		px[0] = saved;
+		test_result("munmap(framebuffer)", munmap(fb, maplen) == 0);
+	}
+	close(fd);
+}
+
+// ============================================================================
+// Event devices: capability ioctls, nonblocking reads, poll, exclusive grab
+// ============================================================================
+static void test_evdev(void)
+{
+	printf("\n--- Input Device Tests (/dev/input/event*) ---\n");
+
+	int fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+	test_result("open(/dev/input/event0)", fd >= 0);
+	if (fd >= 0) {
+		int ver = 0;
+		test_result("EVIOCGVERSION returns protocol version",
+			    ioctl(fd, EVIOCGVERSION, &ver) == 0 &&
+				    ver == EV_VERSION);
+
+		struct input_id id;
+		memset(&id, 0, sizeof(id));
+		test_result("EVIOCGID reports keyboard identity",
+			    ioctl(fd, EVIOCGID, &id) == 0 &&
+				    id.bustype == BUS_I8042);
+
+		char name[64] = { 0 };
+		int n = ioctl(fd, EVIOCGNAME(sizeof(name)), name);
+		test_result("EVIOCGNAME returns a name", n > 0 && name[0]);
+
+		unsigned char evb[(EV_MAX + 7) / 8];
+		memset(evb, 0, sizeof(evb));
+		test_result("EVIOCGBIT(0) reports EV_KEY",
+			    ioctl(fd, EVIOCGBIT(0, sizeof(evb)), evb) > 0 &&
+				    (evb[EV_KEY / 8] & (1 << (EV_KEY % 8))));
+
+		unsigned char keyb[(KEY_MAX + 7) / 8];
+		memset(keyb, 0, sizeof(keyb));
+		test_result("EVIOCGBIT(EV_KEY) reports KEY_A",
+			    ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(keyb)), keyb) >
+					    0 &&
+				    (keyb[KEY_A / 8] & (1 << (KEY_A % 8))));
+
+		unsigned char ks[(KEY_MAX + 7) / 8];
+		test_result("EVIOCGKEY returns key state bitmap",
+			    ioctl(fd, EVIOCGKEY(sizeof(ks)), ks) >= 0);
+
+		struct input_event ev;
+		long r = read(fd, &ev, sizeof(ev));
+		test_result("nonblocking read: EAGAIN or one whole event",
+			    (r == -1 && errno == EAGAIN) ||
+				    r == (long)sizeof(ev));
+		test_result("short read buffer rejected",
+			    read(fd, &ev, sizeof(ev) - 1) == -1);
+
+		struct pollfd pfd = { .fd = fd, .events = POLLIN };
+		int pr = poll(&pfd, 1, 0);
+		test_result("poll(event0) works", pr >= 0);
+
+		test_result("EVIOCGRAB(1) acquires the grab",
+			    ioctl(fd, EVIOCGRAB, (void *)1) == 0);
+		test_result("EVIOCGRAB(0) releases the grab",
+			    ioctl(fd, EVIOCGRAB, (void *)0) == 0);
+		close(fd);
+	}
+
+	fd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
+	test_result("open(/dev/input/event1)", fd >= 0);
+	if (fd >= 0) {
+		unsigned char relb[(REL_MAX + 7) / 8];
+		memset(relb, 0, sizeof(relb));
+		int ok = ioctl(fd, EVIOCGBIT(EV_REL, sizeof(relb)), relb) > 0;
+		test_result(
+			"mouse: EVIOCGBIT(EV_REL) has REL_X/REL_Y/REL_WHEEL",
+			ok && (relb[0] & (1 << REL_X)) &&
+				(relb[0] & (1 << REL_Y)) &&
+				(relb[REL_WHEEL / 8] &
+				 (1 << (REL_WHEEL % 8))));
+
+		unsigned char evb1[(EV_MAX + 7) / 8];
+		memset(evb1, 0, sizeof(evb1));
+		test_result("mouse: EVIOCGBIT(0) reports EV_REL",
+			    ioctl(fd, EVIOCGBIT(0, sizeof(evb1)), evb1) > 0 &&
+				    (evb1[EV_REL / 8] &
+				     (1 << (EV_REL % 8))));
+
+		struct input_id id;
+		memset(&id, 0, sizeof(id));
+		test_result("mouse: EVIOCGID distinct product",
+			    ioctl(fd, EVIOCGID, &id) == 0 && id.product == 2);
+		close(fd);
+	}
+
+	test_result("open(/dev/input/event7) fails",
+		    open("/dev/input/event7", O_RDONLY) < 0);
+}
+
 static void test_credentials(void)
 {
 	printf("\n[TEST] credentials & permissions\n");
@@ -6092,6 +6287,13 @@ int main(int argc, char **argv)
 	// (root context, before the non-root section)
 	// ========================================
 	run_auth_tests();
+
+	// ========================================
+	// Device nodes, framebuffer device, event devices
+	// ========================================
+	test_dev_nodes();
+	test_fbdev();
+	test_evdev();
 
 	// ========================================
 	// Socket / Networking Tests

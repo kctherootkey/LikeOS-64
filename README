@@ -9,9 +9,9 @@ Current state
 -------------
 
 - Real hardware support: tested on Lenovo and Dell notebooks with USB boot.
-- QEMU support: run with USB image targets.
+- QEMU support: run with USB image targets, XHCI enabled and VMSVGA graphics.
 - VMware support: USB 3.1 boot.
-- VirtualBox support: xHCI (USB 3) and ICH9 chipset.
+- VirtualBox support: xHCI (USB 3) and VMSVGA graphics.
 - UEFI boot is required.
 - Linux bootstrapper support: boot from a Linux USB host and launch LikeOS in
   embedded QEMU. Note: not strictly required -- the supported targets are VMs

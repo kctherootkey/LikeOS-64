@@ -2,7 +2,7 @@
 // Linux Gnome Chrome-style scrollbar rendering system
 
 #include <kernel/io/scrollbar.h>
-#include <kernel/dev/video/fb_optimize.h>
+#include <kernel/dev/video/fb.h>
 #include <kernel/mm/memory.h>
 #include <kernel/ke/sched.h>
 #include <kernel/uapi/bug.h>

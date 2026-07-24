@@ -7,7 +7,8 @@
 #include <kernel/mm/memory.h>
 #include <kernel/mm/slab.h>
 #include <kernel/io/scrollbar.h>
-#include <kernel/dev/video/fb_optimize.h>
+#include <kernel/dev/video/fb.h>
+#include <kernel/dev/video/vmsvga2.h>
 #include <kernel/hal/pci.h>
 #include <kernel/dev/hid/ps2.h>
 #include <kernel/hal/ioapic.h>
@@ -165,6 +166,12 @@ __no_stack_protector void continue_system_startup(void)
 	// Without this, MMIO-based EOI is a no-op in x2APIC mode and
 	// interrupts get stuck in the LAPIC ISR (blocking same-priority vectors).
 	lapic_early_detect();
+
+	// VMware SVGA II display adapter (QEMU -vga vmware, VMware,
+	// VirtualBox VMSVGA).  On failure or absence the GOP framebuffer
+	// path set up above keeps running unchanged.
+	if (vmsvga2_init() == 0)
+		vmsvga2_setup_boot_mode();
 
 	xhci_boot_init(&g_xhci_boot);
 	usbhid_init();

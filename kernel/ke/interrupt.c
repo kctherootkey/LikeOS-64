@@ -1599,6 +1599,22 @@ void irq_handler(uint64_t *regs)
 		}
 	}
 
+	{
+		// VMware SVGA II fence/FIFO interrupt (legacy INTx, may share
+		// its line): only claim it when the device's IRQ status port
+		// was actually asserted.
+		extern volatile int g_vmsvga_initialized;
+		extern volatile int g_vmsvga_legacy_irq;
+		extern int vmsvga2_irq(void);
+		if (g_vmsvga_initialized && g_vmsvga_legacy_irq >= 0 &&
+		    irq == g_vmsvga_legacy_irq) {
+			if (vmsvga2_irq()) {
+				lapic_eoi();
+				return;
+			}
+		}
+	}
+
 	// MSI vector for xHCI USB — vector 48 (irq == 16 after subtracting IRQ_BASE).
 	// MSI bypasses the PIC entirely; requires LAPIC EOI, not PIC EOI.
 	if (int_no == XHCI_MSI_VECTOR) {

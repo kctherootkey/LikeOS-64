@@ -299,6 +299,32 @@ tty_t *tty_get_console(void)
 	return &g_console_tty;
 }
 
+static void tty_signal_pgrp(tty_t *tty, int sig);
+
+// While a client holds an exclusive keyboard grab (/dev/input/event0), no
+// cooked input may reach the console tty — the grabber owns the console.
+// PTYs are unaffected.  (Declared here: tty sits below the input drivers.)
+extern int evdev_kbd_grabbed(void);
+
+// Runtime resolution change: re-read the console dimensions, resize the VT
+// emulator and notify the foreground process group (SIGWINCH).
+void tty_console_resize(void)
+{
+	uint32_t rows = 0, cols = 0;
+
+	console_get_dimensions(&rows, &cols);
+	if (WARN_ON_ONCE(rows == 0 || cols == 0))
+		return;
+	if (g_console_tty.winsz.ws_row == rows &&
+	    g_console_tty.winsz.ws_col == cols)
+		return;
+	g_console_tty.winsz.ws_row = (unsigned short)rows;
+	g_console_tty.winsz.ws_col = (unsigned short)cols;
+	vt_resize(&g_console_vt, (int)cols, (int)rows);
+	if (g_console_tty.fg_pgid > 0)
+		tty_signal_pgrp(&g_console_tty, SIGWINCH);
+}
+
 /* Returns the most recently active PTY slave (the pane with keyboard focus),
  * or the console TTY if no PTY has ever received input. */
 tty_t *tty_get_active(void)
@@ -333,6 +359,9 @@ static void tty_signal_pgrp(tty_t *tty, int sig)
 void tty_input_char_raw(tty_t *tty, char c)
 {
 	if (!tty)
+		return;
+	// See tty_input_char: grabbed keyboards bypass the console tty.
+	if (!tty->is_pty && evdev_kbd_grabbed())
 		return;
 	tty_enqueue_read(tty, c);
 	tty_wake_readers(&tty->read_waiters);
@@ -539,6 +568,11 @@ void tty_input_char(tty_t *tty, char c, int ctrl)
 {
 	BUG_ON(tty == NULL);
 	if (!tty || c == 0) {
+		return;
+	}
+	// Exclusive keyboard grab: hardware input bypasses the console tty
+	// entirely (the grabbing display server reads /dev/input/event0).
+	if (!tty->is_pty && evdev_kbd_grabbed()) {
 		return;
 	}
 

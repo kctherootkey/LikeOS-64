@@ -116,6 +116,8 @@ typedef struct {
 
 // Core functions
 void mouse_init(void);
+// Update the cursor clamping bounds after a runtime resolution change.
+void mouse_set_bounds(int width, int height);
 void mouse_irq_handler(void);
 void mouse_update_cursor(void);
 // Update paths (full vs partial visible regions)

@@ -73,6 +73,10 @@ void console_handle_mouse_wheel(int delta);
 void console_init(framebuffer_info_t *fb_info);
 void console_init_fb_optimization(void);
 void console_apply_sysfont(void); // Apply loaded system font and redraw screen
+// Runtime resolution change (display driver modeset): re-derives geometry,
+// swaps the fb backend, redraws, resizes the console tty (SIGWINCH).
+int console_reinit_framebuffer(framebuffer_info_t *fb);
+int console_get_framebuffer_info(framebuffer_info_t *out);
 void console_clear(void);
 void console_putchar(char c);
 void console_putchar_batch(

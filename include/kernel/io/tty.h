@@ -97,6 +97,7 @@ typedef struct tty {
 
 void tty_init(void);
 tty_t *tty_get_console(void);
+void tty_console_resize(void); // after a runtime resolution change
 tty_t *tty_get_active(void); // active PTY slave (keyboard focus), or console
 void tty_reset_termios(tty_t *tty);
 

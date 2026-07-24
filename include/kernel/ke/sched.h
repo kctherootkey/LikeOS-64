@@ -289,6 +289,11 @@ typedef struct mmap_region {
 	 * per child, munmap/exec/exit release it. */
 	bool lazy;
 	struct vfs_file *file; // backing file (NULL for anonymous)
+	/* Device mapping (/dev/fb0): pages are device BAR memory mapped
+	 * eagerly with PAGE_DEVICE PTEs — never freed to the physical
+	 * allocator, shared (not copied) across fork. */
+	bool device;
+	uint64_t device_phys; // physical base backing region start
 } mmap_region_t;
 
 // Saved interrupt frame for preemptive context switch

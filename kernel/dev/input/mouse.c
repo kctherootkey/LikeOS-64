@@ -3,7 +3,9 @@
 
 #include <kernel/dev/input/mouse.h>
 #include <kernel/ke/interrupt.h>
-#include <kernel/dev/video/fb_optimize.h>
+#include <kernel/dev/video/fb.h>
+#include <kernel/dev/video/vmsvga2.h>
+#include <kernel/dev/input/evdev.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/sched.h>
@@ -142,6 +144,93 @@ static inline uint32_t get_cursor_pixel(int cx, int cy)
 		return cursor_bitmap[cy][cx];
 	}
 	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Hardware cursor (VMware SVGA II): when the display driver owns the screen
+// and exposes a hardware cursor, position updates go straight to the device
+// and the software cursor (back-buffer drawing) is bypassed entirely.
+// ---------------------------------------------------------------------------
+
+static int g_hw_cursor_defined = 0;
+
+// Build + upload the current effective cursor image as a hardware cursor.
+static int mouse_hw_cursor_define(void)
+{
+	int w = mouse_state.cursor_w;
+	int h = mouse_state.cursor_h;
+
+	if (w <= 0 || h <= 0 || w > 64 || h > 64)
+		return -1;
+
+	if (vmsvga2_get_caps() & SVGA_CAP_ALPHA_CURSOR) {
+		static uint32_t px[64 * 64];
+		for (int y = 0; y < h; y++)
+			for (int x = 0; x < w; x++)
+				px[y * w + x] = get_cursor_pixel(x, y);
+		return vmsvga2_cursor_define_alpha((uint32_t)w, (uint32_t)h, 0,
+						   0, px);
+	}
+
+	// Monochrome AND/XOR cursor: transparent = AND 1 / XOR 0,
+	// black = AND 0 / XOR 0, anything else = AND 0 / XOR 1 (white).
+	// Wire format is byte-oriented MSB-first scanlines padded to 32 bits
+	// (pixel 0 = byte 0 bit 7, matching the VirtualBox/QEMU decoders).
+	// The width itself is padded to a dword multiple with transparent
+	// columns: QEMU's vmware-vga walks mono rows with byte-aligned
+	// stride instead of the spec's dword alignment, and at 32/64-pixel
+	// widths the two agree.
+	{
+		uint32_t and_mask[64 * 2];
+		uint32_t xor_mask[64 * 2] = { 0 };
+		uint8_t *andb = (uint8_t *)and_mask;
+		uint8_t *xorb = (uint8_t *)xor_mask;
+		int pw = (w + 31) & ~31;
+		int row_bytes = pw / 8;
+
+		for (unsigned i = 0; i < sizeof(and_mask) / sizeof(and_mask[0]);
+		     i++)
+			and_mask[i] = 0xFFFFFFFFu; // default: transparent
+		for (int y = 0; y < h; y++) {
+			for (int x = 0; x < w; x++) {
+				uint32_t p = get_cursor_pixel(x, y);
+				int i = y * row_bytes + (x >> 3);
+				uint8_t bit = (uint8_t)(0x80u >> (x & 7));
+
+				if ((p >> 24) >= 0x80) {
+					andb[i] &= (uint8_t)~bit;
+					if (p & 0xFFFFFF)
+						xorb[i] |= bit;
+				}
+			}
+		}
+		return vmsvga2_cursor_define((uint32_t)pw, (uint32_t)h, 0, 0,
+					     and_mask, xor_mask);
+	}
+}
+
+// Returns 1 when the hardware cursor handled this update (no software draw).
+static int mouse_hw_cursor_update(void)
+{
+	if (!vmsvga2_active() || !vmsvga2_has_hw_cursor())
+		return 0;
+	// Alpha-cursor hosts (VMware/VirtualBox) composite the cursor
+	// themselves.  Mono-only hosts (QEMU) set the HOST pointer shape to
+	// the guest cursor — but with a relative pointing device the host
+	// pointer is grabbed and hidden, so the hardware cursor can never be
+	// seen there.  Use the software cursor instead.
+	if (!(vmsvga2_get_caps() & SVGA_CAP_ALPHA_CURSOR))
+		return 0;
+	if (!g_hw_cursor_defined) {
+		if (mouse_hw_cursor_define() != 0)
+			return 0;
+		g_hw_cursor_defined = 1;
+	}
+	vmsvga2_cursor_move(mouse_state.x, mouse_state.y,
+			    mouse_state.cursor_visible);
+	mouse_state.last_x = mouse_state.x;
+	mouse_state.last_y = mouse_state.y;
+	return 1;
 }
 
 // Wait for PS/2 controller input buffer to be ready
@@ -531,9 +620,20 @@ static void mouse_process_packet(void)
 		return;
 	}
 
+	if (mouse_state.has_scroll_wheel && mouse_state.packet_size == 4)
+		raw_z = (int8_t)mouse_state.packet_buffer[3];
+
+	// evdev tap: raw pre-sensitivity deltas in event-device orientation
+	// (Y+ = down, wheel + = away from user).  While a client holds a
+	// grab, the console cursor and tty mouse reporting are suppressed.
+	if (evdev_feed_mouse((int)raw_x, -(int)raw_y, flags & 0x07,
+			     -(int)raw_z, 0)) {
+		mouse_state.packet_index = 0;
+		return;
+	}
+
 	// Handle scroll wheel for IntelliMouse
 	if (mouse_state.has_scroll_wheel && mouse_state.packet_size == 4) {
-		raw_z = (int8_t)mouse_state.packet_buffer[3];
 		// For IntelliMouse, use the full Z byte without masking
 		mouse_state.scroll_delta = raw_z;
 		if (raw_z != 0) {
@@ -633,6 +733,20 @@ static void mouse_process_packet(void)
 }
 
 // Initialize mouse system
+// Update cursor clamping bounds after a runtime resolution change and pull
+// the cursor back inside the new screen if necessary.
+void mouse_set_bounds(int width, int height)
+{
+	if (WARN_ON_ONCE(width <= 0 || height <= 0))
+		return;
+	mouse_state.screen_width = width;
+	mouse_state.screen_height = height;
+	if (mouse_state.x >= width)
+		mouse_state.x = width - 1;
+	if (mouse_state.y >= height)
+		mouse_state.y = height - 1;
+}
+
 void mouse_init(void)
 {
 	kprintf("Initializing PS/2 mouse...\n");
@@ -831,7 +945,15 @@ void mouse_irq_handler(void)
 // Internal cursor update - caller must already hold mouse_lock
 static void mouse_update_cursor_internal(void)
 {
-	if (!mouse_state.enabled || !mouse_state.cursor_visible) {
+	if (!mouse_state.enabled) {
+		return;
+	}
+	// Hardware cursor path: the device composites the cursor itself,
+	// nothing is drawn into the framebuffer.
+	if (mouse_hw_cursor_update()) {
+		return;
+	}
+	if (!mouse_state.cursor_visible) {
 		return;
 	}
 
@@ -917,6 +1039,12 @@ static void mouse_update_cursor_internal(void)
 
 	// Release framebuffer lock
 	fb_release(fb_flags);
+
+	// Forward the cursor rect to the display driver (SVGA update
+	// commands); must run after fb_lock is released, mirroring
+	// fb_flush_dirty_regions().  Without this the software cursor lands
+	// in VRAM but is never presented by the host.
+	fb_flush_hook_run();
 }
 
 // Update cursor position on screen (public wrapper, takes lock)
@@ -977,6 +1105,13 @@ void mouse_set_sensitivity(int sensitivity)
 // Show or hide cursor
 void mouse_show_cursor(int show)
 {
+	if (vmsvga2_active() && vmsvga2_has_hw_cursor()) {
+		int prev = mouse_state.cursor_visible;
+		mouse_state.cursor_visible = show ? 1 : 0;
+		if (mouse_hw_cursor_update())
+			return;
+		mouse_state.cursor_visible = prev;
+	}
 	if (show && !mouse_state.cursor_visible) {
 		mouse_state.cursor_visible = 1;
 		mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
@@ -991,6 +1126,13 @@ void mouse_show_cursor(int show)
 // No-flush variant: update cursor in back buffer only, caller flushes later
 void mouse_show_cursor_noflush(int show)
 {
+	if (vmsvga2_active() && vmsvga2_has_hw_cursor()) {
+		int prev = mouse_state.cursor_visible;
+		mouse_state.cursor_visible = show ? 1 : 0;
+		if (mouse_hw_cursor_update())
+			return;
+		mouse_state.cursor_visible = prev;
+	}
 	if (show && !mouse_state.cursor_visible) {
 		mouse_state.cursor_visible = 1;
 		mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
@@ -1047,9 +1189,11 @@ void mouse_apply_cursor(void)
 
 	// Enable the loaded cursor
 	use_loaded_cursor = 1;
+	// Force re-upload of the hardware cursor image on the next update.
+	g_hw_cursor_defined = 0;
 
-	// Draw the new cursor
-	if (mouse_state.cursor_visible) {
+	// Draw the new cursor (skipped when the hardware cursor took it)
+	if (mouse_state.cursor_visible && !mouse_hw_cursor_update()) {
 		mouse_draw_cursor_full(mouse_state.x, mouse_state.y);
 		fb_flush_dirty_regions();
 	}
@@ -1079,6 +1223,13 @@ void mouse_inject_usb_movement(int dx, int dy, uint8_t buttons, int8_t wheel)
 	// drawing anything.
 	if (!mouse_state.enabled) {
 		mouse_state.enabled = 1;
+	}
+
+	// evdev tap (USB/I2C injected events use event-device orientation
+	// already: Y+ = down, wheel + = away from user).
+	if (evdev_feed_mouse(dx, dy, buttons & 0x07, (int)wheel, 0)) {
+		spin_unlock_irqrestore(&mouse_lock, flags);
+		return; // grabbed: suppress console cursor/tty reporting
 	}
 
 	// --- Button state ---

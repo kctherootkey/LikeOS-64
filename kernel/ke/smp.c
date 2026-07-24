@@ -5,7 +5,7 @@
 #include <kernel/hal/acpi.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/hal/cpu_pstate.h>
-#include <kernel/dev/video/fb_optimize.h> // fb_pat_program_wc_this_cpu (per-CPU PAT)
+#include <kernel/dev/video/fb.h> // fb_pat_program_wc_this_cpu (per-CPU PAT)
 #include <kernel/ke/percpu.h>
 #include <kernel/io/console.h>
 #include <kernel/mm/memory.h>

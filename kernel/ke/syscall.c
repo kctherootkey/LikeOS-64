@@ -14,6 +14,7 @@
 #include <kernel/io/tty.h>
 #include <kernel/ke/signal.h>
 #include <kernel/fs/devfs.h>
+#include <kernel/dev/video/fbdev.h>
 #include <kernel/uapi/dirent.h>
 #include <kernel/hal/serial.h>
 #include <kernel/ke/percpu.h>
@@ -488,6 +489,11 @@ static mmap_region_t *alloc_mmap_region(task_t *task)
 {
 	for (int i = 0; i < TASK_MAX_MMAP; i++) {
 		if (!task->mmap_regions[i].in_use) {
+			/* Scrub the recycled slot: stale fields (device,
+			 * file, lazy) from a previous mapping must never
+			 * leak into a new region. */
+			mm_memset(&task->mmap_regions[i], 0,
+				  sizeof(mmap_region_t));
 			return &task->mmap_regions[i];
 		}
 	}
@@ -3268,6 +3274,51 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 		backing = caller->fd_table[fd];
 	}
 
+	/* Device mapping: /dev/fb0 maps the framebuffer BAR itself.  Pages
+	 * are mapped eagerly with PAGE_DEVICE PTEs (never freed back to the
+	 * physical allocator, shared across fork) and write-combining
+	 * caching (PWT selects PAT entry 1, programmed WC at boot). */
+	if (backing && devfs_is_fb0(backing)) {
+		uint64_t dev_phys = fbdev_mmap_phys(offset, length);
+		uint64_t dev_flags = page_flags | PAGE_DEVICE |
+				     PAGE_WRITE_THROUGH;
+
+		if (!dev_phys) {
+			if (!(flags & MAP_FIXED))
+				cur->mmap_base += length; // Rollback
+			return (int64_t)MAP_FAILED;
+		}
+		for (uint64_t off = 0; off < length; off += PAGE_SIZE) {
+			if (!mm_map_page_in_address_space(cur->pml4,
+							  vaddr + off,
+							  dev_phys + off,
+							  dev_flags)) {
+				for (uint64_t cl = 0; cl < off;
+				     cl += PAGE_SIZE)
+					mm_unmap_page_in_address_space(
+						cur->pml4, vaddr + cl);
+				if (!(flags & MAP_FIXED))
+					cur->mmap_base += length; // Rollback
+				return (int64_t)MAP_FAILED;
+			}
+		}
+		vfs_incref(backing);
+		region->start = vaddr;
+		region->length = length;
+		region->prot = prot;
+		/* Force shared semantics: fork must share the device pages,
+		 * never COW them. */
+		region->flags = flags | MAP_SHARED;
+		region->fd = (int)fd;
+		region->offset = offset;
+		region->lazy = false;
+		region->file = backing;
+		region->device = true;
+		region->device_phys = dev_phys;
+		region->in_use = true;
+		return (int64_t)vaddr;
+	}
+
 	/* Demand paging: PRIVATE mappings (anonymous or file-backed) are not
 	 * populated here at all — the page-fault handler materialises pages
 	 * on first touch (zero-fill / file page-in).  Only MAP_SHARED stays
@@ -5950,12 +6001,25 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
 
 	for (uint64_t i = 0; i < pages; i++) {
 		uint64_t vaddr = addr + i * PAGE_SIZE;
+		uint64_t page_flags = flags;
 
 		// Get current PTE
 		uint64_t phys = mm_get_physical_address(vaddr);
 		if (phys == 0) {
 			// Page not mapped
 			continue;
+		}
+
+		/* Device MMIO PTEs (/dev/fb0): the marker and caching bits
+		 * must survive protection changes — losing PAGE_DEVICE would
+		 * make a later unmap free BAR memory into the allocator. */
+		{
+			uint64_t *pte = mm_get_page_table_from_pml4(
+				pml4, vaddr, false);
+			if (pte && (*pte & PAGE_DEVICE))
+				page_flags |= PAGE_DEVICE |
+					      (*pte & (PAGE_WRITE_THROUGH |
+						       PAGE_CACHE_DISABLE));
 		}
 
 		// Remap with new protection

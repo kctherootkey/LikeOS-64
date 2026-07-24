@@ -3,7 +3,7 @@
 
 #define BOOT_DEBUG 0
 
-#include <kernel/dev/video/fb_optimize.h>
+#include <kernel/dev/video/fb.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/sched.h>
@@ -47,6 +47,64 @@ static uint32_t g_static_back_buffer[MAX_STATIC_FB_SIZE / sizeof(uint32_t)]
 static dirty_rect_t g_static_dirty_regions[MAX_DIRTY_REGIONS]
 	__attribute__((aligned(64)));
 static uint8_t g_using_static_buffers = 0;
+
+// Post-flush notification hook (display drivers that need explicit
+// screen-update commands, e.g. SVGA).  The flushed area is accumulated as a
+// bounding box under fb_lock and the hook runs after the lock is released:
+// the hook may log or take other locks, which is unsafe under fb_lock.
+static fb_flush_hook_t g_flush_hook = 0;
+static struct {
+	uint32_t x1, y1, x2, y2;
+	int valid;
+} g_hook_pending;
+
+void fb_set_flush_hook(fb_flush_hook_t hook)
+{
+	g_flush_hook = hook;
+}
+
+// Accumulate a flushed rect (pixel coords, inclusive); caller holds fb_lock.
+static void hook_accumulate(uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2)
+{
+	if (!g_flush_hook)
+		return;
+	if (!g_hook_pending.valid) {
+		g_hook_pending.x1 = x1;
+		g_hook_pending.y1 = y1;
+		g_hook_pending.x2 = x2;
+		g_hook_pending.y2 = y2;
+		g_hook_pending.valid = 1;
+		return;
+	}
+	if (x1 < g_hook_pending.x1)
+		g_hook_pending.x1 = x1;
+	if (y1 < g_hook_pending.y1)
+		g_hook_pending.y1 = y1;
+	if (x2 > g_hook_pending.x2)
+		g_hook_pending.x2 = x2;
+	if (y2 > g_hook_pending.y2)
+		g_hook_pending.y2 = y2;
+}
+
+void fb_flush_hook_run(void)
+{
+	uint64_t flags;
+	uint32_t x1, y1, x2, y2;
+	int valid;
+
+	if (!g_flush_hook)
+		return;
+	spin_lock_irqsave(&fb_lock, &flags);
+	valid = g_hook_pending.valid;
+	x1 = g_hook_pending.x1;
+	y1 = g_hook_pending.y1;
+	x2 = g_hook_pending.x2;
+	y2 = g_hook_pending.y2;
+	g_hook_pending.valid = 0;
+	spin_unlock_irqrestore(&fb_lock, flags);
+	if (valid && x2 >= x1 && y2 >= y1)
+		g_flush_hook(x1, y1, x2 - x1 + 1, y2 - y1 + 1);
+}
 
 // Helper function for string concatenation
 static void kstrncat(char *dest, const char *src, size_t dest_size)
@@ -452,6 +510,62 @@ void fb_optimize_shutdown(void)
 	kprintf("Framebuffer optimization system shutdown\n");
 }
 
+// Re-initialize for a new video mode (runtime resolution change).
+// Swaps geometry and back buffer under fb_lock; the caller is responsible for
+// the caching attributes of the new front buffer (MTRR/PAT WC), and for
+// redrawing the screen afterwards.  Never touches identity/direct mapping:
+// fb_info->framebuffer_base must already be a kernel virtual address.
+int fb_reinit(framebuffer_info_t *fb_info)
+{
+	uint32_t *new_back;
+	uint32_t *old_back = 0;
+	int new_static;
+	size_t new_size;
+	uint64_t flags;
+
+	if (!fb_info || !fb_info->framebuffer_base)
+		return -1;
+	if (!g_initialized)
+		return fb_optimize_init(fb_info);
+	if (WARN_ON_ONCE(fb_info->bytes_per_pixel != 4))
+		return -1; // double buffering is 32bpp-only
+
+	new_size = (size_t)fb_info->vertical_resolution *
+		   fb_info->pixels_per_scanline * sizeof(uint32_t);
+	if (new_size <= MAX_STATIC_FB_SIZE) {
+		new_back = g_static_back_buffer;
+		new_static = 1;
+	} else {
+		new_back = (uint32_t *)kalloc(new_size);
+		if (!new_back)
+			return -1;
+		new_static = 0;
+	}
+
+	spin_lock_irqsave(&fb_lock, &flags);
+	if (g_double_buffer.back_buffer && !g_using_static_buffers &&
+	    g_double_buffer.back_buffer != new_back)
+		old_back = g_double_buffer.back_buffer;
+	g_double_buffer.front_buffer = (uint32_t *)fb_info->framebuffer_base;
+	g_double_buffer.width = fb_info->horizontal_resolution;
+	g_double_buffer.height = fb_info->vertical_resolution;
+	g_double_buffer.pitch = fb_info->pixels_per_scanline;
+	g_double_buffer.bytes_per_pixel = fb_info->bytes_per_pixel;
+	g_double_buffer.back_buffer = new_back;
+	g_using_static_buffers = new_static;
+	g_double_buffer.num_dirty_regions = 0;
+	g_hook_pending.valid = 0;
+	// Fresh mode: front-buffer content is undefined; the caller redraws.
+	// Seed the back buffer from the front so unwritten areas stay stable.
+	fast_memcpy(new_back, g_double_buffer.front_buffer, new_size);
+	g_double_buffer.full_screen_dirty = 1;
+	spin_unlock_irqrestore(&fb_lock, flags);
+
+	if (old_back)
+		kfree(old_back);
+	return 0;
+}
+
 // Remap front buffer to use direct map (call before removing identity mapping)
 void fb_optimize_remap_to_direct_map(void)
 {
@@ -623,6 +737,7 @@ void fb_flush_dirty_regions(void)
 	spin_lock_irqsave(&fb_lock, &flags);
 	fb_flush_dirty_regions_unlocked();
 	spin_unlock_irqrestore(&fb_lock, flags);
+	fb_flush_hook_run();
 }
 
 // Unlocked variant - caller must hold fb_lock via fb_acquire()
@@ -644,6 +759,8 @@ void fb_flush_dirty_regions_unlocked(void)
 			g_double_buffer.width * g_double_buffer.height;
 		g_double_buffer.full_screen_dirty = 0;
 		g_double_buffer.num_dirty_regions = 0;
+		hook_accumulate(0, 0, g_double_buffer.width - 1,
+				g_double_buffer.height - 1);
 		return;
 	}
 
@@ -668,6 +785,8 @@ void fb_flush_dirty_regions_unlocked(void)
 		__asm__ volatile("sfence" ::: "memory");
 		g_double_buffer.pixels_copied += total_px;
 		g_double_buffer.num_dirty_regions = 0;
+		hook_accumulate(0, 0, g_double_buffer.width - 1,
+				g_double_buffer.height - 1);
 		return;
 	}
 
@@ -721,6 +840,7 @@ void fb_flush_dirty_regions_unlocked(void)
 				continue;
 			}
 			copy_region_to_front(x1, y1, x2, y2);
+			hook_accumulate(x1, y1, x2, y2);
 		}
 	}
 	// Ensure all non-temporal stores are globally visible

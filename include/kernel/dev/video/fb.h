@@ -57,6 +57,22 @@ typedef struct {
 int fb_optimize_init(framebuffer_info_t *fb_info);
 void fb_optimize_shutdown(void);
 
+// Re-initialize for a new mode (runtime resolution change).  Swaps the back
+// buffer and geometry; does NOT touch MTRR/PAT write-combining (the display
+// driver configures caching for its framebuffer once at probe time).
+int fb_reinit(framebuffer_info_t *fb_info);
+
+// Post-flush notification hook: called AFTER dirty regions were copied to the
+// front buffer and AFTER fb_lock is released, with the bounding box of the
+// flushed area.  The SVGA driver uses this to send screen-update commands.
+typedef void (*fb_flush_hook_t)(uint32_t x, uint32_t y, uint32_t w,
+				uint32_t h);
+void fb_set_flush_hook(fb_flush_hook_t hook);
+// Run the hook for any pending flushed area.  fb_flush_dirty_regions() calls
+// this automatically; callers of the _unlocked variant must invoke it after
+// releasing the framebuffer lock.
+void fb_flush_hook_run(void);
+
 // Remap front buffer to use direct map (call before removing identity mapping)
 void fb_optimize_remap_to_direct_map(void);
 

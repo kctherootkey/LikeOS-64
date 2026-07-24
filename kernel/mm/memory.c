@@ -1589,6 +1589,17 @@ void mm_unmap_page_in_address_space(uint64_t *pml4, uint64_t virtual_addr)
 {
 	uint64_t *pte = mm_get_page_table_from_pml4(pml4, virtual_addr, false);
 	if (pte && (*pte & PAGE_PRESENT)) {
+		/* Device MMIO mapping (framebuffer BAR etc.): the physical
+		 * page is not allocator-owned — clear the PTE only.  Freeing
+		 * it would corrupt the phys bitmap/refcounts when the BAR
+		 * address falls inside the managed range. */
+		if (*pte & PAGE_DEVICE) {
+			*pte = 0;
+			if (pml4 == mm_get_current_address_space()) {
+				mm_flush_tlb(virtual_addr);
+			}
+			return;
+		}
 		// Free the physical page - mask out flags (bits 0-11) AND upper reserved/NX bits
 		uint64_t phys = *pte & 0x000FFFFFFFFFF000ULL;
 		if (phys) {
@@ -2547,6 +2558,10 @@ void mm_destroy_address_space(uint64_t *pml4)
 							// Check if it's a 2MB page or a page table
 							if (pd[k] &
 							    PAGE_SIZE_FLAG) {
+								/* Device MMIO 2MB mappings: not allocator-owned. */
+								if (pd[k] &
+								    PAGE_DEVICE)
+									continue;
 								// 2MB page - check COW refcount before freeing (mask 21 bits for 2MB alignment).
 								// A 2MB mapping covers 512 physical 4K frames; each
 								// one must be released individually or 511 of them
@@ -2600,6 +2615,10 @@ void mm_destroy_address_space(uint64_t *pml4)
 								     l++) {
 									if (pt[l] &
 									    PAGE_PRESENT) {
+										/* Device MMIO PTEs: not allocator-owned, skip. */
+										if (pt[l] &
+										    PAGE_DEVICE)
+											continue;
 										uint64_t phys =
 											pt[l] &
 											0x000FFFFFFFFFF000ULL;
@@ -3306,6 +3325,14 @@ uint64_t *mm_clone_address_space(uint64_t *src_pml4)
 						if (!(src_pt[l] & PAGE_PRESENT))
 							continue;
 
+						/* Device MMIO PTEs: share the
+						 * mapping, never COW/refcount
+						 * (phys not allocator-owned) */
+						if (src_pt[l] & PAGE_DEVICE) {
+							new_pt[l] = src_pt[l];
+							continue;
+						}
+
 						if (src_pt[l] & PAGE_USER) {
 							// User page — mark both parent and child COW.
 							// Disable IRQs for only this PTE so the
@@ -3491,6 +3518,14 @@ uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
 					for (int l = 0; l < 512; l++) {
 						if (!(src_pt[l] & PAGE_PRESENT))
 							continue;
+
+						/* Device MMIO PTEs: share the
+						 * mapping, never COW/refcount
+						 * (phys not allocator-owned) */
+						if (src_pt[l] & PAGE_DEVICE) {
+							new_pt[l] = src_pt[l];
+							continue;
+						}
 
 						// Calculate full virtual address
 						uint64_t vaddr =
