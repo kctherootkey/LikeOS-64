@@ -9,6 +9,14 @@
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
 
+/* POSIX conformance level implemented by this libc (required by POSIX;
+ * ported software keys feature selection off it, e.g. termios vs old
+ * BSD tty interfaces). */
+#define _POSIX_VERSION  200809L
+#define _POSIX2_VERSION 200809L
+#define _POSIX_JOB_CONTROL 1
+#define _POSIX_SAVED_IDS 1
+
 // File operations
 int open(const char* pathname, int flags, ...);
 ssize_t read(int fd, void* buf, size_t count);

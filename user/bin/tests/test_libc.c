@@ -13,6 +13,7 @@
 #include <time.h>
 #include <signal.h>
 #include <errno.h>
+#include <wchar.h>
 #include <fcntl.h>
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -404,6 +405,40 @@ static void *simple_thread_fn(void *arg)
 	g_simple_thread_ran = 1;
 	g_simple_thread_arg = (int)(long)arg;
 	return (void *)42L;
+}
+
+/* For the shared-descriptor-table test: threads of a process share ONE fd
+ * table (CLONE_FILES), so a descriptor opened by any thread is usable by all
+ * of them, a close by one is seen by the others, and the close-on-exec bits
+ * are process-wide.  Every field below records what the thread observed so
+ * the main thread can assert on it after the join. */
+static int g_fdshare_main_fd = -1; /* opened by main, used by the thread   */
+static int g_fdshare_thread_fd = -1; /* opened by the thread, used by main   */
+static volatile int g_fdshare_write_ok = -1;
+static volatile int g_fdshare_cloexec = -1;
+static volatile int g_fdshare_stdout_ok = -1;
+static const char g_fdshare_text[] = "shared-fd";
+
+static void *fdshare_thread_fn(void *arg)
+{
+	(void)arg;
+	/* 1. A descriptor the main thread opened must be usable here.  With a
+	 *    private per-thread table this was EBADF. */
+	g_fdshare_write_ok =
+		(write(g_fdshare_main_fd, g_fdshare_text,
+		       sizeof(g_fdshare_text) - 1) ==
+		 (ssize_t)(sizeof(g_fdshare_text) - 1)) ?
+			1 :
+			0;
+	/* 2. Close-on-exec state is per descriptor, not per thread. */
+	g_fdshare_cloexec = fcntl(g_fdshare_main_fd, F_GETFD);
+	/* 3. stdout points wherever the PROCESS pointed it.  A thread whose
+	 *    slot 1 was empty fell back to the console and silently bypassed
+	 *    the redirection. */
+	g_fdshare_stdout_ok = (write(1, "T", 1) == 1) ? 1 : 0;
+	/* 4. A descriptor opened here must be visible to the main thread. */
+	g_fdshare_thread_fd = open("/dev/zero", O_RDONLY);
+	return NULL;
 }
 
 // For pthread_detach test
@@ -969,8 +1004,10 @@ static void test_userdb(void)
 		test_result("root gid == 0", pw->pw_gid == 0);
 		test_result("root home == /root",
 			    strcmp(pw->pw_dir, "/root") == 0);
-		test_result("root shell == /bin/sh",
-			    strcmp(pw->pw_shell, "/bin/sh") == 0);
+		/* /etc/passwd gives root /bin/bash — /bin/sh is a symlink to
+		 * the same binary, so assert what the file actually says. */
+		test_result("root shell == /bin/bash",
+			    strcmp(pw->pw_shell, "/bin/bash") == 0);
 	}
 	struct passwd *pw2 = getpwuid(0);
 	test_result("getpwuid(0) returns root",
@@ -1673,6 +1710,313 @@ static void test_shebang(void)
 	}
 
 	rmtree(base);
+}
+
+/* ---- /dev/fd + /dev/stdin/out/err (added for the bash port) ---------- */
+
+static void test_devfd(void)
+{
+	printf("\n[TEST] /dev/fd descriptor aliases\n");
+
+	int p[2];
+	if (pipe(p) != 0) {
+		test_fail("devfd: pipe() failed");
+		return;
+	}
+	/* open(/dev/fd/N) == dup(N): the new fd must reach the same pipe */
+	char path[32];
+	snprintf(path, sizeof(path), "/dev/fd/%d", p[0]);
+	int dupfd = open(path, O_RDONLY);
+	test_result("open(/dev/fd/N) duplicates the descriptor", dupfd >= 0);
+	if (dupfd >= 0) {
+		char buf[8] = { 0 };
+		if (write(p[1], "dfd", 3)) {
+		}
+		test_result("read through /dev/fd duplicate works",
+			    read(dupfd, buf, sizeof(buf)) == 3 &&
+				    memcmp(buf, "dfd", 3) == 0);
+		close(dupfd);
+	}
+	close(p[0]);
+	close(p[1]);
+
+	/* named aliases for 0/1/2 */
+	int so = open("/dev/stdout", O_WRONLY);
+	test_result("open(/dev/stdout) works", so >= 0);
+	if (so >= 0)
+		close(so);
+	/* nonexistent fd -> EBADF at open time */
+	errno = 0;
+	test_result("open(/dev/fd/222) on closed fd fails",
+		    open("/dev/fd/222", O_RDONLY) < 0);
+}
+
+/* ---- waitpid job-control reporting (WUNTRACED/WCONTINUED) ------------ */
+
+static void test_jobctl_wait(void)
+{
+	printf("\n[TEST] waitpid job control (WUNTRACED/WCONTINUED)\n");
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("jobctl: fork failed");
+		return;
+	}
+	if (pid == 0) {
+		/* Child spins in sleep; parent stops/continues/kills it. */
+		for (;;)
+			usleep(50000);
+	}
+	usleep(100000); /* let the child reach its loop */
+
+	int st = 0;
+	kill(pid, SIGSTOP);
+	pid_t r = waitpid(pid, &st, WUNTRACED);
+	test_result("waitpid(WUNTRACED) reports stopped child",
+		    r == pid && WIFSTOPPED(st) && WSTOPSIG(st) == SIGSTOP);
+	test_result("stopped status is not WIFSIGNALED",
+		    r == pid && !WIFSIGNALED(st) && !WIFEXITED(st));
+
+	/* No event pending now: WNOHANG must return 0, not re-report */
+	r = waitpid(pid, &st, WUNTRACED | WNOHANG);
+	test_result("stop reported only once", r == 0);
+
+	kill(pid, SIGCONT);
+	r = waitpid(pid, &st, WCONTINUED);
+	test_result("waitpid(WCONTINUED) reports continued child",
+		    r == pid && WIFCONTINUED(st));
+
+	/* SIGTSTP (tty stop, catchable flavor) must also be reportable */
+	kill(pid, SIGTSTP);
+	r = waitpid(pid, &st, WUNTRACED);
+	test_result("SIGTSTP stop reported via WUNTRACED",
+		    r == pid && WIFSTOPPED(st) && WSTOPSIG(st) == SIGTSTP);
+	kill(pid, SIGCONT);
+
+	kill(pid, SIGKILL);
+	r = waitpid(pid, &st, 0);
+	test_result("killed child reaped normally",
+		    r == pid && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+}
+
+/* ---- syscall argument-register hygiene -------------------------------
+ *
+ * The kernel dispatcher reads all six argument registers unconditionally, so
+ * a libc wrapper that passes fewer must still zero the rest.  waitpid() once
+ * used a 3-argument wrapper while SYS_WAIT4 treats the 4th argument as a
+ * `struct rusage *` and WRITES 56 bytes through it: whatever the compiler
+ * had left in r10 became the destination, so every reaped child scribbled on
+ * random process memory (found as heap corruption in bash).
+ *
+ * tl_waitpid_r10 calls waitpid() with r10 pre-loaded with a caller-supplied
+ * value.  The PLT jump preserves r10, so if the wrapper leaks it the kernel
+ * writes the rusage into our canary buffer and the test fails. */
+__asm__(".text\n\t"
+	".globl tl_waitpid_r10\n\t"
+	".type tl_waitpid_r10, @function\n"
+	"tl_waitpid_r10:\n\t"
+	"movq %rcx, %r10\n\t" /* 4th C argument -> syscall arg-4 register */
+	"jmp waitpid@PLT\n\t"
+	".size tl_waitpid_r10, .-tl_waitpid_r10\n");
+extern pid_t tl_waitpid_r10(pid_t pid, int *status, int options, void *r10val);
+
+static void test_syscall_arg_hygiene(void)
+{
+	printf("\n[TEST] syscall unused-argument registers are zeroed\n");
+
+	/* Canary large enough for the 56-byte rusage the kernel would write */
+	unsigned char *canary = malloc(128);
+	if (!canary) {
+		test_fail("arg hygiene: malloc failed");
+		return;
+	}
+	memset(canary, 0xAB, 128);
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		test_fail("arg hygiene: fork failed");
+		free(canary);
+		return;
+	}
+	if (pid == 0)
+		_exit(7);
+
+	int st = 0;
+	pid_t r = tl_waitpid_r10(pid, &st, 0, canary);
+	test_result("waitpid reaps child correctly",
+		    r == pid && WIFEXITED(st) && WEXITSTATUS(st) == 7);
+
+	int intact = 1;
+	for (int i = 0; i < 128; i++)
+		if (canary[i] != 0xAB)
+			intact = 0;
+	test_result("waitpid does not write rusage through a stale r10", intact);
+	free(canary);
+
+	/* wait4() with an explicit rusage still works and fills it in. */
+	pid = fork();
+	if (pid == 0) {
+		_exit(3);
+	} else if (pid > 0) {
+		struct rusage ru;
+		memset(&ru, 0xCD, sizeof(ru));
+		r = wait4(pid, &st, 0, &ru);
+		test_result("wait4 with rusage reaps and fills it",
+			    r == pid && WIFEXITED(st) &&
+				    WEXITSTATUS(st) == 3 &&
+				    ru.ru_utime.tv_sec != (long)0xCDCDCDCDCDCDCDCDULL);
+	}
+
+	/* Bulk reaping must not disturb the heap (the shape of the bash bug). */
+	unsigned char *guard = malloc(256);
+	if (guard) {
+		memset(guard, 0x5A, 256);
+		for (int i = 0; i < 20; i++) {
+			pid_t c = fork();
+			if (c == 0)
+				_exit(0);
+			if (c > 0)
+				waitpid(c, &st, 0);
+		}
+		int ok = 1;
+		for (int i = 0; i < 256; i++)
+			if (guard[i] != 0x5A)
+				ok = 0;
+		test_result("20 fork/waitpid cycles leave the heap intact", ok);
+		free(guard);
+	}
+}
+
+/* ---- duplicating a REDIRECTED standard descriptor --------------------
+ *
+ * fds 0/1/2 are ordinarily the console, which the kernel represents with a
+ * NULL descriptor-table slot.  Once one of them has been pointed somewhere
+ * else, dup()/dup2()/fcntl(F_DUPFD) must duplicate what it points at NOW -
+ * not the console.  Special-casing the fd NUMBER instead of its contents
+ * made a shell's save/restore around a builtin redirection hand stdout back
+ * to the terminal, silently losing every captured `$(...)` output. */
+
+static void test_dup_redirected_stdio(void)
+{
+	printf("\n[TEST] duplicating redirected standard descriptors\n");
+
+	int p[2];
+	if (pipe(p) != 0) {
+		test_fail("dup-redirect: pipe() failed");
+		return;
+	}
+	int saved_stdout = dup(1); /* console; restored at the end */
+	test_result("dup(1) while stdout is the console", saved_stdout >= 3);
+
+	/* Point stdout at the pipe, then duplicate it three different ways. */
+	dup2(p[1], 1);
+	int d_dup = dup(1);
+	int d_fcntl = fcntl(1, F_DUPFD, 10);
+	int d_dup2 = 7;
+	dup2(1, d_dup2);
+
+	/* Put the console back before printing any results. */
+	dup2(saved_stdout, 1);
+	close(saved_stdout);
+
+	test_result("fcntl(F_DUPFD, 10) honours the minimum", d_fcntl >= 10);
+
+	/* Each duplicate must reach the PIPE, not the console. */
+	const char *msg = "abc";
+	int wrote_ok = 1;
+	if (d_dup < 0 || write(d_dup, msg, 3) != 3)
+		wrote_ok = 0;
+	if (d_fcntl < 0 || write(d_fcntl, msg, 3) != 3)
+		wrote_ok = 0;
+	if (write(d_dup2, msg, 3) != 3)
+		wrote_ok = 0;
+	test_result("writes to the duplicates succeed", wrote_ok);
+
+	if (d_dup >= 0)
+		close(d_dup);
+	if (d_fcntl >= 0)
+		close(d_fcntl);
+	close(d_dup2);
+	close(p[1]); /* all write ends gone -> reader sees EOF */
+
+	char buf[32];
+	int total = 0, n;
+	while (total < (int)sizeof(buf) - 1 &&
+	       (n = read(p[0], buf + total, sizeof(buf) - 1 - total)) > 0)
+		total += n;
+	buf[total > 0 ? total : 0] = '\0';
+	close(p[0]);
+	test_result("duplicates wrote to the pipe, not the console",
+		    total == 9 && strcmp(buf, "abcabcabc") == 0);
+
+	/* FD_CLOEXEC: F_DUPFD clears it, F_DUPFD_CLOEXEC sets it. */
+	int c1 = fcntl(0, F_DUPFD, 10);
+	int c2 = fcntl(0, F_DUPFD_CLOEXEC, 10);
+	test_result("F_DUPFD clears FD_CLOEXEC",
+		    c1 >= 0 && (fcntl(c1, F_GETFD, 0) & FD_CLOEXEC) == 0);
+	test_result("F_DUPFD_CLOEXEC sets FD_CLOEXEC",
+		    c2 >= 0 && (fcntl(c2, F_GETFD, 0) & FD_CLOEXEC) != 0);
+	if (c1 >= 0)
+		close(c1);
+	if (c2 >= 0)
+		close(c2);
+
+	/* Bad source descriptor is still rejected. */
+	errno = 0;
+	test_result("F_DUPFD on a closed fd -> EBADF",
+		    fcntl(200, F_DUPFD, 10) == -1 && errno == EBADF);
+}
+
+/* ---- libc additions made for the bash port --------------------------- */
+
+static void test_bash_libc_additions(void)
+{
+	printf("\n[TEST] libc additions (mktemp/mkdtemp/mkfifo/wcs*/mblen)\n");
+
+	/* mktemp: template rewritten to a nonexistent name */
+	char t1[] = "/tmp/mtXXXXXX";
+	char *mt = mktemp(t1);
+	test_result("mktemp fills template",
+		    mt == t1 && t1[0] != '\0' && strncmp(t1, "/tmp/mt", 7) == 0 &&
+			    strcmp(t1 + 7, "XXXXXX") != 0 &&
+			    access(t1, F_OK) != 0);
+
+	/* mkdtemp: directory created 0700 */
+	char t2[] = "/tmp/mdXXXXXX";
+	char *md = mkdtemp(t2);
+	struct stat dst;
+	test_result("mkdtemp creates directory",
+		    md == t2 && stat(t2, &dst) == 0 && S_ISDIR(dst.st_mode) &&
+			    (dst.st_mode & 0777) == 0700);
+	if (md)
+		rmdir(t2);
+
+	/* mkfifo: honestly unsupported -> ENOSYS (not a silent success) */
+	errno = 0;
+	test_result("mkfifo -> ENOSYS",
+		    mkfifo("/tmp/nofifo", 0644) == -1 && errno == ENOSYS);
+
+	/* wide-char helpers used by ported code */
+	wchar_t wbuf[8];
+	test_result("wcscpy/wcscmp/wcslen",
+		    wcscpy(wbuf, L"abc") == wbuf && wcslen(wbuf) == 3 &&
+			    wcscmp(wbuf, L"abc") == 0 &&
+			    wcscmp(wbuf, L"abd") < 0);
+	test_result("wcschr/wcsrchr",
+		    wcschr(wbuf, L'b') == wbuf + 1 &&
+			    wcsrchr(wbuf, L'c') == wbuf + 2 &&
+			    wcschr(wbuf, L'x') == 0);
+	test_result("wcsncmp/wmemchr",
+		    wcsncmp(L"abcd", L"abce", 3) == 0 &&
+			    wmemchr(wbuf, L'c', 3) == wbuf + 2);
+	test_result("wcswidth of plain ASCII", wcswidth(wbuf, 3) == 3);
+
+	/* single-byte locale mblen/mbrlen */
+	test_result("mblen semantics",
+		    mblen("a", 1) == 1 && mblen("", 1) == 0 && mblen(0, 0) == 0);
+	mbstate_t ms;
+	memset(&ms, 0, sizeof(ms));
+	test_result("mbrlen semantics", mbrlen("a", 1, &ms) == 1);
 }
 
 static void run_auth_tests(void)
@@ -2449,6 +2793,44 @@ int main(int argc, char **argv)
 	val = getenv("TEST_VAR");
 	test_result("unsetenv() clears variable", val == NULL);
 
+	/* `environ` must describe the SAME environment getenv/setenv do: it is
+	 * what a program hands to execve(), so an environ that does not track
+	 * setenv gives every child an empty environment.  That is how TERM
+	 * disappeared across su (login builds its own envp, so it was fine,
+	 * which made it look like an su bug). */
+	{
+		extern char **environ;
+		int n = 0, found = 0;
+		test_result("environ is populated at startup",
+			    environ != NULL && environ[0] != NULL);
+		setenv("LIKEOS_ENV_TEST", "42", 1);
+		for (n = 0; environ && environ[n]; n++)
+			if (strcmp(environ[n], "LIKEOS_ENV_TEST=42") == 0)
+				found = 1;
+		test_result("setenv is visible in environ", found == 1);
+
+		/* The whole point: a child started with `environ` inherits it. */
+		pid_t epid = fork();
+		if (epid == 0) {
+			char *eargv[4] = { (char *)"sh", (char *)"-c",
+					   (char *)"[ \"$LIKEOS_ENV_TEST\" = 42 ]",
+					   NULL };
+			execve("/bin/sh", eargv, environ);
+			_exit(127);
+		}
+		int est = -1;
+		waitpid(epid, &est, 0);
+		test_result("child exec'd with environ inherits the variable",
+			    WIFEXITED(est) && WEXITSTATUS(est) == 0);
+
+		unsetenv("LIKEOS_ENV_TEST");
+		found = 0;
+		for (n = 0; environ && environ[n]; n++)
+			if (strncmp(environ[n], "LIKEOS_ENV_TEST=", 16) == 0)
+				found = 1;
+		test_result("unsetenv removes it from environ", found == 0);
+	}
+
 	// ========================================
 	// Test: fork/wait/getpid/getppid
 	// ========================================
@@ -2694,6 +3076,24 @@ int main(int argc, char **argv)
 	test_result("chdir('/') succeeds", chdir("/") == 0);
 	cwdret = getcwd(cwd, sizeof(cwd));
 	test_result("getcwd after chdir", cwdret != NULL);
+	/* getcwd(NULL, 0) allocates.  A shell calls exactly this for every
+	 * prompt and after every cd; passing the NULL through to the kernel
+	 * failed with EFAULT ("cannot access parent directories: Bad
+	 * address"). */
+	char *cwdalloc = getcwd(NULL, 0);
+	test_result("getcwd(NULL, 0) allocates the result",
+		    cwdalloc != NULL && cwdalloc[0] == '/');
+	free(cwdalloc);
+	/* buf != NULL with size 0 is EINVAL; too small a buffer is ERANGE. */
+	errno = 0;
+	test_result("getcwd(buf, 0) fails with EINVAL",
+		    getcwd(cwd, 0) == NULL && errno == EINVAL);
+	errno = 0;
+	char tiny[2];
+	test_result("getcwd(buf, too-small) fails with ERANGE",
+		    chdir("/usr/local") == 0 && getcwd(tiny, sizeof(tiny)) == NULL &&
+			    errno == ERANGE);
+	chdir("/");
 
 	// ========================================
 	// Test: uid/gid and time
@@ -5229,6 +5629,78 @@ int main(int argc, char **argv)
 		pthread_mutex_destroy(&g_bcast_mutex);
 	}
 
+	/* Threads share ONE descriptor table (CLONE_FILES).  Regression test:
+	 * the table used to be copied and then emptied for the new thread, so
+	 * a thread had no descriptors at all — every fd >= 3 answered EBADF and
+	 * its stdio quietly fell back to the console instead of following the
+	 * process's own redirection. */
+	printf("\n[TEST] pthread shared descriptor table\n");
+	{
+		char path[64];
+		snprintf(path, sizeof(path), "/tmp/fdshare_%d", (int)getpid());
+		g_fdshare_main_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+		test_result("main thread opened the file",
+			    g_fdshare_main_fd >= 3);
+		fcntl(g_fdshare_main_fd, F_SETFD, FD_CLOEXEC);
+
+		/* Point stdout at the same file for the duration of the thread
+		 * so the thread's write(1, ...) is checkable; saved_out keeps a
+		 * handle on the real stdout to restore afterwards. */
+		fflush(stdout);
+		int saved_out = dup(1);
+		int redirected = (saved_out >= 3) && (dup2(g_fdshare_main_fd, 1) == 1);
+
+		g_fdshare_write_ok = -1;
+		g_fdshare_cloexec = -1;
+		g_fdshare_stdout_ok = -1;
+		g_fdshare_thread_fd = -1;
+
+		pthread_t t;
+		int ret = pthread_create(&t, NULL, fdshare_thread_fn, NULL);
+		if (ret == 0)
+			pthread_join(t, NULL);
+
+		/* Restore stdout before reporting anything. */
+		if (redirected) {
+			dup2(saved_out, 1);
+			close(saved_out);
+		} else if (saved_out >= 0) {
+			close(saved_out);
+		}
+
+		test_result("pthread_create for fd-share thread succeeds",
+			    ret == 0);
+		test_result("thread can write to a descriptor opened by main",
+			    g_fdshare_write_ok == 1);
+		test_result("thread sees the process's FD_CLOEXEC bit",
+			    g_fdshare_cloexec == FD_CLOEXEC);
+		test_result("thread's stdout follows the process redirection",
+			    redirected && g_fdshare_stdout_ok == 1);
+		test_result("descriptor opened in the thread is valid in main",
+			    g_fdshare_thread_fd >= 3 &&
+				    fcntl(g_fdshare_thread_fd, F_GETFD) != -1);
+
+		/* Everything both threads wrote landed in the one file. */
+		char buf[64];
+		memset(buf, 0, sizeof(buf));
+		lseek(g_fdshare_main_fd, 0, SEEK_SET);
+		ssize_t n = read(g_fdshare_main_fd, buf, sizeof(buf) - 1);
+		test_result("thread's writes went to the shared descriptor",
+			    n == (ssize_t)sizeof(g_fdshare_text) &&
+				    strncmp(buf, g_fdshare_text,
+					    sizeof(g_fdshare_text) - 1) == 0 &&
+				    buf[sizeof(g_fdshare_text) - 1] == 'T');
+
+		/* A close by one thread is a close for the whole process. */
+		close(g_fdshare_thread_fd);
+		test_result("close in one thread frees the fd process-wide",
+			    fcntl(g_fdshare_thread_fd, F_GETFD) == -1 &&
+				    errno == EBADF);
+
+		close(g_fdshare_main_fd);
+		unlink(path);
+	}
+
 	// Test malloc under threads: allocate in one thread, free in another
 	printf("\n[TEST] malloc cross-thread free\n");
 	{
@@ -6656,6 +7128,11 @@ int main(int argc, char **argv)
 	test_fbdev();
 	test_evdev();
 	test_shebang();
+	test_devfd();
+	test_jobctl_wait();
+	test_bash_libc_additions();
+	test_syscall_arg_hygiene();
+	test_dup_redirected_stdio();
 
 	// ========================================
 	// Socket / Networking Tests

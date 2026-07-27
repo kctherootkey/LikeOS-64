@@ -2507,7 +2507,7 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 	// ---- Resolve in_fd: must be a regular VFS file (seekable) ----
 	if (in_fd < 0 || in_fd >= TASK_MAX_FDS)
 		return -EBADF;
-	struct vfs_file *in_file = cur->fd_table[in_fd];
+	struct vfs_file *in_file = task_fds(cur)[in_fd];
 	if (!in_file)
 		return -EBADF;
 	uintptr_t in_marker = (uintptr_t)in_file;
@@ -2522,7 +2522,7 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 	// ---- Resolve out_fd ----
 	if (out_fd < 0 || out_fd >= TASK_MAX_FDS)
 		return -EBADF;
-	struct vfs_file *out_entry = cur->fd_table[out_fd];
+	struct vfs_file *out_entry = task_fds(cur)[out_fd];
 	if (!out_entry && (out_fd == 1 || out_fd == 2)) {
 		// stdout/stderr without explicit fd_table entry - treat as console
 	} else if (!out_entry) {

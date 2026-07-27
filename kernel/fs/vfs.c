@@ -971,14 +971,14 @@ long vfs_readdir(vfs_file_t *f, void *buf, long bytes)
 	if (f->is_root_dir && !f->dev_injected && g_dev_ops) {
 		// Calculate size for "dev" entry
 		unsigned short reclen =
-			(unsigned short)(sizeof(struct linux_dirent64) +
+			(unsigned short)(sizeof(struct dirent64) +
 					 4); // "dev" + null
 		reclen = (reclen + 7) & ~7; // Align to 8 bytes
 		WARN_ON(reclen % 8 != 0);
 
 		if (bytes >= reclen) {
 			// Build entry in kernel buffer first, then copy to user
-			struct linux_dirent64 ent;
+			struct dirent64 ent;
 			ent.d_ino = 2; // Fake inode for /dev
 			ent.d_off = reclen;
 			ent.d_reclen = reclen;

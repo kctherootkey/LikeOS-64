@@ -2410,8 +2410,8 @@ static long ext4_readdir_impl(vfs_file_t *f, void *buf, long bytes)
                  * (real hw / VMware), and since the page is present+writable
                  * the fault handler finds nothing to fix and re-faults forever
                  * (silent hang).  Matches fat32_write_dirent64. */
-				struct linux_dirent64 *ld =
-					(struct linux_dirent64 *)((uint8_t *)
+				struct dirent64 *ld =
+					(struct dirent64 *)((uint8_t *)
 									  buf +
 								  out_off);
 				smap_disable();

@@ -56,3 +56,13 @@ int munlockall(void)
 {
 	return 0;
 }
+
+/* madvise is purely advisory; accepting and ignoring the hint is a
+ * conforming implementation (like the mlock family above). */
+int madvise(void *addr, size_t len, int advice)
+{
+	(void)addr;
+	(void)len;
+	(void)advice;
+	return 0;
+}

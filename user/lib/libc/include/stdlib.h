@@ -17,6 +17,15 @@
 #define MB_CUR_MAX  1
 #define MB_LEN_MAX  1
 
+/* Multibyte length, single-byte locale semantics (mbtowc/wctomb live in
+ * <wchar.h>) */
+static inline int mblen(const char *s, size_t n)
+{
+    if (!s) return 0;         /* no state-dependent encodings */
+    if (n == 0) return -1;
+    return (*s != '\0') ? 1 : 0;
+}
+
 // Memory allocation
 void* malloc(size_t size);
 void* calloc(size_t nmemb, size_t size);
@@ -70,6 +79,8 @@ void qsort(void* base, size_t nmemb, size_t size, int (*compar)(const void*, con
 void* bsearch(const void* key, const void* base, size_t nmemb, size_t size, int (*compar)(const void*, const void*));
 int mkstemp(char* templ);
 int mkstemps(char* templ, int suffixlen);
+char* mktemp(char* templ);
+char* mkdtemp(char* templ);
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1

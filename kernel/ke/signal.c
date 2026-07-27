@@ -742,6 +742,40 @@ int signal_restore_frame(task_t *task)
 	return 0;
 }
 
+/* Record a job-control state change (stop or continue) on the task and
+ * notify its parent: mark the event for waitpid(WUNTRACED/WCONTINUED),
+ * send SIGCHLD with the matching CLD_ code, and wake the parent if it is
+ * blocked in waitpid (same wake pattern as the exit path in
+ * sched_mark_task_exited - a parent that ignores SIGCHLD must still see
+ * the stopped child). */
+void signal_notify_jobctl(task_t *task, int signum, int stopped)
+{
+	if (stopped) {
+		task->jc_stop_signo = signum;
+		task->jc_continued = 0;
+	} else {
+		task->jc_continued = 1;
+		task->jc_stop_signo = 0;
+	}
+	task_t *parent = task->parent;
+	if (!parent || parent->has_exited)
+		return;
+	siginfo_t ci;
+	mm_memset(&ci, 0, sizeof(ci));
+	ci.si_signo = SIGCHLD;
+	ci.si_code = stopped ? CLD_STOPPED : CLD_CONTINUED;
+	ci.si_pid = task->id;
+	ci.si_status = signum;
+	signal_send(parent, SIGCHLD, &ci);
+	/* Wake a parent blocked in waitpid (wait_channel == itself) via the
+	 * claim CAS; a spurious wake is safe, the waitpid loop rechecks. */
+	if (parent->wait_channel == parent &&
+	    sched_claim_wake(parent, TASK_BLOCKED)) {
+		parent->wait_channel = NULL;
+		sched_enqueue_ready(parent);
+	}
+}
+
 // Deliver pending signals to a task (called before returning to userspace)
 void signal_deliver(task_t *task)
 {
@@ -775,20 +809,12 @@ void signal_deliver(task_t *task)
 			break;
 		case SIG_DFL_STOP:
 			task->state = TASK_STOPPED;
-			// Notify parent
-			if (task->parent) {
-				siginfo_t chld_info;
-				mm_memset(&chld_info, 0, sizeof(chld_info));
-				chld_info.si_signo = SIGCHLD;
-				chld_info.si_code = CLD_STOPPED;
-				chld_info.si_pid = task->id;
-				chld_info.si_status = signum;
-				signal_send(task->parent, SIGCHLD, &chld_info);
-			}
+			signal_notify_jobctl(task, signum, 1);
 			break;
 		case SIG_DFL_CONT:
 			if (task->state == TASK_STOPPED) {
 				task->state = TASK_READY;
+				signal_notify_jobctl(task, signum, 0);
 			}
 			break;
 		case SIG_DFL_IGN:
@@ -849,19 +875,12 @@ void signal_deliver_irq(task_t *task, interrupt_frame_t *frame)
 			break;
 		case SIG_DFL_STOP:
 			task->state = TASK_STOPPED;
-			if (task->parent) {
-				siginfo_t chld_info;
-				mm_memset(&chld_info, 0, sizeof(chld_info));
-				chld_info.si_signo = SIGCHLD;
-				chld_info.si_code = CLD_STOPPED;
-				chld_info.si_pid = task->id;
-				chld_info.si_status = signum;
-				signal_send(task->parent, SIGCHLD, &chld_info);
-			}
+			signal_notify_jobctl(task, signum, 1);
 			break;
 		case SIG_DFL_CONT:
 			if (task->state == TASK_STOPPED) {
 				task->state = TASK_READY;
+				signal_notify_jobctl(task, signum, 0);
 			}
 			break;
 		case SIG_DFL_IGN:

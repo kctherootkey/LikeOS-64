@@ -915,31 +915,40 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 		if (lr.backing[b])
 			vfs_close(lr.backing[b]);
 
+	/* Close ONLY the descriptors marked close-on-exec.  POSIX keeps every
+	 * other descriptor open across exec, and programs depend on it: a
+	 * shell hands a child an already-open pipe end (process substitution
+	 * passes it as /dev/fd/N), a service manager passes listening sockets
+	 * down, and so on.  Closing everything >= 3 unconditionally broke all
+	 * of that - the child found the descriptor gone (EBADF). */
 	for (int i = 3; i < TASK_MAX_FDS; i++) {
-		if (cur->fd_table[i]) {
-			uint64_t marker = (uint64_t)cur->fd_table[i];
+		if (!(task_get_fd_flags(cur, (unsigned)i) & FD_CLOEXEC))
+			continue;
+		task_set_fd_flags(cur, (unsigned)i, 0);
+		if (task_fds(cur)[i]) {
+			uint64_t marker = (uint64_t)task_fds(cur)[i];
 			if (marker >= 1 && marker <= 3) {
-				cur->fd_table[i] = NULL;
-			} else if (IS_SOCKET_FD(cur->fd_table[i])) {
-				int idx = SOCKET_FD_IDX(cur->fd_table[i]);
-				cur->fd_table[i] = NULL;
+				task_fds(cur)[i] = NULL;
+			} else if (IS_SOCKET_FD(task_fds(cur)[i])) {
+				int idx = SOCKET_FD_IDX(task_fds(cur)[i]);
+				task_fds(cur)[i] = NULL;
 				sock_close(idx);
-			} else if (IS_UNIX_SOCKET_FD(cur->fd_table[i])) {
-				int ufd = (int)(uintptr_t)cur->fd_table[i];
-				cur->fd_table[i] = NULL;
+			} else if (IS_UNIX_SOCKET_FD(task_fds(cur)[i])) {
+				int ufd = (int)(uintptr_t)task_fds(cur)[i];
+				task_fds(cur)[i] = NULL;
 				unix_close(ufd);
-			} else if (IS_EPOLL_FD(cur->fd_table[i])) {
-				int idx = EPOLL_FD_IDX(cur->fd_table[i]);
-				cur->fd_table[i] = NULL;
+			} else if (IS_EPOLL_FD(task_fds(cur)[i])) {
+				int idx = EPOLL_FD_IDX(task_fds(cur)[i]);
+				task_fds(cur)[i] = NULL;
 				extern epoll_instance_t epoll_instances[];
 				if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
 					epoll_instances[idx].active = 0;
-			} else if (pipe_is_end(cur->fd_table[i])) {
-				pipe_close_end((pipe_end_t *)cur->fd_table[i]);
-				cur->fd_table[i] = NULL;
+			} else if (pipe_is_end(task_fds(cur)[i])) {
+				pipe_close_end((pipe_end_t *)task_fds(cur)[i]);
+				task_fds(cur)[i] = NULL;
 			} else {
-				vfs_close(cur->fd_table[i]);
-				cur->fd_table[i] = NULL;
+				vfs_close(task_fds(cur)[i]);
+				task_fds(cur)[i] = NULL;
 			}
 		}
 	}

@@ -451,18 +451,112 @@ static int64_t pipe_write_from_user(pipe_end_t *end, uint64_t buf,
 	return (int64_t)to_write;
 }
 
-// Allocate a file descriptor for current task
-static int alloc_fd(task_t *task)
+/* The descriptor table is SHARED between the threads of a process
+ * (CLONE_FILES), so the lock below serialises slot bookkeeping across them.
+ * A task that owns its table privately has no files_struct and needs none. */
+static void fds_lock(task_t *task, uint64_t *flags)
 {
-	// Start at 3 to skip stdin(0), stdout(1), stderr(2)
-	for (int i = 3; i < TASK_MAX_FDS; i++) {
-		if (task->fd_table[i] == NULL) {
-			task_set_fd_flags(task, (unsigned)i,
-					  0); // clear FD_CLOEXEC for new slot
-			return i;
+	if (task->files)
+		spin_lock_irqsave(&task->files->lock, flags);
+}
+
+static void fds_unlock(task_t *task, uint64_t flags)
+{
+	if (task->files)
+		spin_unlock_irqrestore(&task->files->lock, flags);
+}
+
+/* Install `file` in the lowest free descriptor >= `from` and return it, or
+ * -EMFILE (the caller still owns `file` then).  Never allocates below 3:
+ * sys_close refuses 0-2 so they are never free.
+ *
+ * Claiming the slot and storing the object are ONE atomic step on purpose.
+ * The old split — scan for a free number, then open the file, then store it —
+ * handed the same number to two threads of the same process opening
+ * concurrently, and one of the two objects was simply lost.  The object is
+ * always built BEFORE this call, so nothing sleeps under the lock and no
+ * half-installed slot is ever visible to another thread. */
+static int fd_install_from(task_t *task, vfs_file_t *file, int from)
+{
+	if (from < 3)
+		from = 3;
+	uint64_t flags = 0;
+	fds_lock(task, &flags);
+	struct vfs_file **fds = task_fds(task);
+	int ret = -EMFILE;
+	for (int i = from; i < TASK_MAX_FDS; i++) {
+		if (fds[i] == NULL) {
+			fds[i] = file;
+			/* A freed slot keeps its old flag byte, so clear it
+			 * here rather than inheriting a stale FD_CLOEXEC. */
+			task_set_fd_flags(task, (unsigned)i, 0);
+			ret = i;
+			break;
 		}
 	}
-	return -EMFILE; // Too many open files
+	fds_unlock(task, flags);
+	return ret;
+}
+
+static int fd_install(task_t *task, vfs_file_t *file)
+{
+	return fd_install_from(task, file, 3);
+}
+
+/* Take one more reference on whatever kind of thing `entry` is and return the
+ * value to store in the new slot.  Console markers and epoll handles are not
+ * refcounted and duplicate as themselves; a pipe end gets its own end object.
+ * Returns NULL only when a pipe end could not be allocated. */
+static vfs_file_t *fd_dup_entry(vfs_file_t *entry)
+{
+	uint64_t marker = (uint64_t)entry;
+	if (marker >= 1 && marker <= 3)
+		return entry; /* console stdio marker */
+	if (IS_SOCKET_FD(entry)) {
+		net_socket_t *s = sock_get(SOCKET_FD_IDX(entry));
+		if (s)
+			__atomic_fetch_add(&s->ref_count, 1, __ATOMIC_ACQ_REL);
+		return entry;
+	}
+	if (IS_UNIX_SOCKET_FD(entry)) {
+		unix_socket_t *us = unix_get((int)(uintptr_t)entry);
+		if (us)
+			__atomic_fetch_add(&us->ref_count, 1, __ATOMIC_ACQ_REL);
+		return entry;
+	}
+	if (IS_EPOLL_FD(entry))
+		return entry;
+	if (pipe_is_end(entry))
+		return (vfs_file_t *)pipe_dup_end((pipe_end_t *)entry);
+	return vfs_dup(entry);
+}
+
+/* Drop the reference held by one descriptor slot.  Mirror of fd_dup_entry. */
+static void fd_release_entry(vfs_file_t *entry)
+{
+	uint64_t marker = (uint64_t)entry;
+	if (!entry || (marker >= 1 && marker <= 3))
+		return; /* console stdio marker — nothing to release */
+	if (IS_SOCKET_FD(entry)) {
+		sock_close(SOCKET_FD_IDX(entry));
+		return;
+	}
+	if (IS_UNIX_SOCKET_FD(entry)) {
+		unix_close((int)(uintptr_t)entry);
+		return;
+	}
+	if (IS_EPOLL_FD(entry)) {
+		int idx = EPOLL_FD_IDX(entry);
+		extern epoll_instance_t epoll_instances[];
+		if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
+			epoll_instances[idx].active = 0;
+		return;
+	}
+	if (pipe_is_end(entry)) {
+		pipe_close_end((pipe_end_t *)entry);
+		return;
+	}
+	vfs_close(entry);
 }
 
 // Forward declarations for helper syscalls used before definition
@@ -543,7 +637,7 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 
 	vfs_file_t *file = NULL;
 	if (fd < TASK_MAX_FDS) {
-		file = cur->fd_table[fd];
+		file = task_fds(cur)[fd];
 	}
 	if (!file && fd == STDIN_FD) {
 		tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
@@ -638,7 +732,7 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
 
 	vfs_file_t *file = NULL;
 	if (fd < TASK_MAX_FDS) {
-		file = cur->fd_table[fd];
+		file = task_fds(cur)[fd];
 	}
 	if (!file && (fd == STDOUT_FD || fd == STDERR_FD)) {
 		tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
@@ -863,6 +957,8 @@ static void strip_setid_file(vfs_file_t *file)
 	vfs_mark_setid_clean(file); /* mark AFTER fchmod's invalidation */
 }
 
+static int64_t sys_dup(uint64_t oldfd);
+
 // SYS_OPEN - open a file
 static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 {
@@ -883,11 +979,6 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 	if (cret != 0)
 		return cret;
 
-	int fd = alloc_fd(cur);
-	if (fd < 0) {
-		return fd; // Error code
-	}
-
 	vfs_file_t *file = NULL;
 	const char *path = kpath;
 	char full[VFS_MAX_PATH];
@@ -898,6 +989,12 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 			return brest;
 		path = full;
 	}
+
+	/* /dev/fd/N and friends: open == duplicate the caller's descriptor */
+	int devfd = devfs_fd_alias_target(path);
+	if (devfd >= 0)
+		return sys_dup((uint64_t)devfd);
+
 	/* No pre-flight permission screening here: vfs_open() enforces the whole
      * policy authoritatively (ancestor search, read/write mode on an existing
      * target, parent write+search for O_CREAT, immutable/append flags) and its
@@ -921,7 +1018,19 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 		return vfs_status_to_errno(ret);
 	}
 
-	cur->fd_table[fd] = file;
+	/* Open FIRST, claim the descriptor after: the slot is claimed and
+	 * filled in one locked step so two threads of the same process cannot
+	 * be handed the same number (see fd_install_from). */
+	int fd = fd_install(cur, file);
+	if (fd < 0) {
+		fd_release_entry(file);
+		return fd;
+	}
+	/* O_CLOEXEC must be recorded: exec now honours FD_CLOEXEC instead of
+	 * closing every descriptor, so a descriptor opened with O_CLOEXEC only
+	 * disappears across exec if the flag is stored here. */
+	if (flags & O_CLOEXEC)
+		task_set_fd_flags(cur, (unsigned)fd, FD_CLOEXEC);
 	/* O_TRUNC modifies contents → drop set-id bits for a non-root caller. */
 	if ((flags & O_TRUNC) && cur->cred.euid != 0)
 		strip_setid_file(file);
@@ -957,10 +1066,11 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
 		if (ret != 0)
 			return ret;
 	}
-	int fd = alloc_fd(cur);
-	if (fd < 0) {
-		return fd;
-	}
+	/* /dev/fd/N and friends: open == duplicate the caller's descriptor */
+	int devfd = devfs_fd_alias_target(full);
+	if (devfd >= 0)
+		return sys_dup((uint64_t)devfd);
+
 	vfs_file_t *file = NULL;
 	if (full[0] == '/' && full[1] == 'd' && full[2] == 'e' &&
 	    full[3] == 'v' && (full[4] == '/' || full[4] == '\0')) {
@@ -978,7 +1088,17 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
 	if (ret != ST_OK || file == NULL) {
 		return vfs_status_to_errno(ret);
 	}
-	cur->fd_table[fd] = file;
+	/* Claim the descriptor only once the object exists — see sys_open. */
+	int fd = fd_install(cur, file);
+	if (fd < 0) {
+		fd_release_entry(file);
+		return fd;
+	}
+	/* O_CLOEXEC must be recorded: exec now honours FD_CLOEXEC instead of
+	 * closing every descriptor, so a descriptor opened with O_CLOEXEC only
+	 * disappears across exec if the flag is stored here. */
+	if (flags & O_CLOEXEC)
+		task_set_fd_flags(cur, (unsigned)fd, FD_CLOEXEC);
 	/* O_TRUNC modifies contents → drop set-id bits for a non-root caller. */
 	if ((flags & O_TRUNC) && cur->cred.euid != 0)
 		strip_setid_file(file);
@@ -997,54 +1117,39 @@ static int64_t sys_close(uint64_t fd)
 		return -EBADF;
 	}
 
-	if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) {
+	if (fd >= TASK_MAX_FDS)
 		return -EBADF;
+
+	/* Detach the descriptor from the table FIRST, under the shared-table
+	 * lock, and release the object afterwards.  Two threads of the same
+	 * process closing the same fd must not both reach the release (a
+	 * double free), and a slot must never be observable as free while the
+	 * object behind it is still being torn down — releasing can sleep
+	 * (vfs_close → pagecache flush), which is exactly the window in which
+	 * another thread's open() would claim the slot. */
+	uint64_t lflags = 0;
+	fds_lock(cur, &lflags);
+	vfs_file_t *file = task_fds(cur)[fd];
+	if (file) {
+		task_fds(cur)[fd] = NULL;
+		/* The slot is about to become free: drop its FD_CLOEXEC bit
+		 * with it.  A stale bit left behind is inherited by whatever
+		 * lands there next and makes that descriptor vanish across the
+		 * next exec. */
+		task_set_fd_flags(cur, (unsigned)fd, 0);
 	}
+	fds_unlock(cur, lflags);
 
-	vfs_file_t *file = cur->fd_table[fd];
+	if (!file)
+		return -EBADF;
 
-	// Check for console dup markers - don't call vfs_close on them
-	uint64_t marker = (uint64_t)file;
-	if (marker >= 1 && marker <= 3) {
-		// Console dup marker - just clear the entry
-		cur->fd_table[fd] = NULL;
-		return 0;
-	}
-
-	// Check for socket fd markers
-	if (IS_SOCKET_FD(file)) {
-		int idx = SOCKET_FD_IDX(file);
-		cur->fd_table[fd] = NULL;
-		return sock_close(idx);
-	}
-
-	// Check for UNIX socket fd markers
-	if (IS_UNIX_SOCKET_FD(file)) {
-		int ufd = (int)(uintptr_t)file;
-		cur->fd_table[fd] = NULL;
-		return unix_close(ufd);
-	}
-
-	// Check for epoll fd markers
-	if (IS_EPOLL_FD(file)) {
-		int idx = EPOLL_FD_IDX(file);
-		cur->fd_table[fd] = NULL;
-		// Mark epoll instance as inactive
-		extern epoll_instance_t epoll_instances[];
-		if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
-			epoll_instances[idx].active = 0;
-		return 0;
-	}
-
-	if (pipe_is_end(file)) {
-		pipe_close_end((pipe_end_t *)file);
-		cur->fd_table[fd] = NULL;
-		return 0;
-	}
-
-	vfs_close(file);
-	cur->fd_table[fd] = NULL;
-
+	/* Sockets report their own close status; everything else cannot fail
+	 * in a way the caller could act on. */
+	if (IS_SOCKET_FD(file))
+		return sock_close(SOCKET_FD_IDX(file));
+	if (IS_UNIX_SOCKET_FD(file))
+		return unix_close((int)(uintptr_t)file);
+	fd_release_entry(file);
 	return 0;
 }
 
@@ -1060,11 +1165,11 @@ static int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence)
 		return -ESPIPE;
 	}
 
-	if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) {
+	if (fd >= TASK_MAX_FDS || task_fds(cur)[fd] == NULL) {
 		return -EBADF;
 	}
 
-	vfs_file_t *file = cur->fd_table[fd];
+	vfs_file_t *file = task_fds(cur)[fd];
 
 	// Check for console dup markers - not seekable
 	uint64_t marker = (uint64_t)file;
@@ -1081,6 +1186,62 @@ static int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence)
 	return result;
 }
 
+static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf);
+
+/* The text a /dev/fd/N symlink resolves to.  A descriptor carries no pathname
+ * here, so anything that is not a named file gets the conventional
+ * "kind:[id]" form and a regular file is identified by inode.  Returns the
+ * length written (never NUL-terminated in the caller's count), or -EBADF. */
+static int fd_link_target(task_t *cur, int fd, char *out, size_t cap)
+{
+	if (fd < 0 || fd >= TASK_MAX_FDS)
+		return -EBADF;
+	if (cap < 2)
+		return -EINVAL;
+	vfs_file_t *entry = task_fds(cur)[fd];
+	uint64_t marker = (uint64_t)entry;
+	int n;
+	/* 0/1/2 with an empty slot (and the explicit console markers dup'ed
+	 * from them) are the caller's terminal. */
+	if (!entry) {
+		if (fd != STDIN_FD && fd != STDOUT_FD && fd != STDERR_FD)
+			return -EBADF;
+		n = ksnprintf(out, cap, "/dev/tty");
+	} else if (marker >= 1 && marker <= 3) {
+		n = ksnprintf(out, cap, "/dev/tty");
+	} else if (IS_SOCKET_FD(entry)) {
+		n = ksnprintf(out, cap, "socket:[%d]", SOCKET_FD_IDX(entry));
+	} else if (IS_UNIX_SOCKET_FD(entry)) {
+		n = ksnprintf(out, cap, "socket:[%d]", (int)(uintptr_t)entry);
+	} else if (IS_EPOLL_FD(entry)) {
+		n = ksnprintf(out, cap, "anon_inode:[eventpoll]");
+	} else if (pipe_is_end(entry)) {
+		n = ksnprintf(out, cap, "pipe:[%d]", fd);
+	} else {
+		/* A device node reports the /dev path it was opened under —
+		 * the handle's own type is not enough (/dev/tty, /dev/console
+		 * and /dev/tty0 share one type), which is why this used to
+		 * answer a bare "/dev" for every one of them. */
+		n = devfs_fpath(entry, out, cap);
+		if (n < 0) {
+			struct kstat st;
+			mm_memset(&st, 0, sizeof(st));
+			if (vfs_fstat(entry, &st) == ST_OK)
+				n = ksnprintf(out, cap, "file:[%lu]",
+					      (unsigned long)st.st_ino);
+			else
+				n = ksnprintf(out, cap, "file:[0]");
+		}
+	}
+	/* ksnprintf reports what the format WOULD have produced; clamp to what
+	 * actually fits so the length never overruns the caller's buffer. */
+	if (n < 0)
+		n = 0;
+	if ((size_t)n > cap - 1)
+		n = (int)cap - 1;
+	return n;
+}
+
 static int64_t sys_stat_common(const char *path, uint64_t stat_buf,
 			       int validate_path)
 {
@@ -1090,6 +1251,13 @@ static int64_t sys_stat_common(const char *path, uint64_t stat_buf,
 	if (validate_path && !validate_user_ptr((uint64_t)path, 1)) {
 		return -EFAULT;
 	}
+	/* /dev/fd/N (and /dev/stdin|stdout|stderr) describe an open descriptor
+	 * of the CALLER, so stat'ing one means fstat'ing that descriptor -
+	 * programs handed such a path (process substitution) expect it to
+	 * stat like the underlying object, not to be missing. */
+	int devfd = devfs_fd_alias_target(path);
+	if (devfd >= 0)
+		return sys_fstat((uint64_t)devfd, stat_buf);
 	// Security: Zero the struct to prevent leaking uninitialized kernel stack data
 	struct kstat st;
 	mm_memset(&st, 0, sizeof(st));
@@ -1165,6 +1333,29 @@ static int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf)
      * search itself (before existence is revealed). */
 	if (!validate_user_ptr(stat_buf, sizeof(struct kstat)))
 		return -EFAULT;
+	/* /dev/fd/N, /dev/stdin, /dev/stdout, /dev/stderr are SYMLINKS, as on
+	 * every other Unix, and lstat reports the link itself rather than what
+	 * it points at.  Reporting the target's type here instead made `ls -l
+	 * /dev/fd` describe the descriptor a caller happened to hold — listing
+	 * the directory made ls's own directory handle show up as a
+	 * subdirectory of /dev/fd, which is nonsense.  stat() (sys_stat_common)
+	 * still follows through to the descriptor. */
+	int devfd = devfs_fd_alias_target(p);
+	if (devfd >= 0) {
+		char target[64];
+		int tlen = fd_link_target(cur, devfd, target, sizeof(target));
+		if (tlen < 0)
+			return tlen;
+		struct kstat lst;
+		mm_memset(&lst, 0, sizeof(lst));
+		lst.st_mode = S_IFLNK | 0777;
+		lst.st_nlink = 1;
+		lst.st_size = tlen;
+		lst.st_blksize = 4096;
+		if (copy_to_user((void *)stat_buf, &lst, sizeof(lst)) != 0)
+			return -EFAULT;
+		return 0;
+	}
 	struct kstat st;
 	mm_memset(&st, 0, sizeof(st));
 	int r = vfs_lstat(p, &st);
@@ -1208,10 +1399,10 @@ static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 		// Security: Use SMAP-aware copy to user
 		return copy_to_user((void *)stat_buf, &st, sizeof(st));
 	}
-	if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL) {
+	if (fd >= TASK_MAX_FDS || task_fds(cur)[fd] == NULL) {
 		return -EBADF;
 	}
-	vfs_file_t *file = cur->fd_table[fd];
+	vfs_file_t *file = task_fds(cur)[fd];
 	if (pipe_is_end(file)) {
 		st.st_mode = S_IFIFO | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP |
 					S_IROTH | S_IWOTH);
@@ -1366,9 +1557,9 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count)
 		return 0;
 	if (!validate_user_ptr(dirp, count))
 		return -EFAULT;
-	if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL)
+	if (fd >= TASK_MAX_FDS || task_fds(cur)[fd] == NULL)
 		return -EBADF;
-	vfs_file_t *file = cur->fd_table[fd];
+	vfs_file_t *file = task_fds(cur)[fd];
 	uint64_t marker = (uint64_t)file;
 	if (marker >= 1 && marker <= 3)
 		return -ENOTDIR;
@@ -1445,9 +1636,13 @@ static int64_t sys_getcwd(uint64_t buf, uint64_t size)
 	size_t len = 0;
 	while (src[len])
 		len++;
-	if (size == 0 || len + 1 > size) {
+	/* POSIX: EINVAL when size is 0, ERANGE when the path does not fit.
+	 * Callers retry with a bigger buffer on ERANGE and give up on EINVAL,
+	 * so reporting EINVAL for both made a long cwd unreadable. */
+	if (size == 0)
 		return -EINVAL;
-	}
+	if (len + 1 > size)
+		return -ERANGE;
 	if (copy_to_user((void *)buf, src, len + 1) < 0) {
 		return -EFAULT;
 	}
@@ -1723,9 +1918,9 @@ static int64_t sys_fsync(uint64_t fd)
 	task_t *cur = sched_current();
 	if (!cur)
 		return -EFAULT;
-	if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL)
+	if (fd >= TASK_MAX_FDS || task_fds(cur)[fd] == NULL)
 		return -EBADF;
-	vfs_file_t *file = cur->fd_table[fd];
+	vfs_file_t *file = task_fds(cur)[fd];
 	if (fd_is_special(file))
 		return 0; /* nothing to flush */
 	/* Dispatch to the file's own filesystem; a filesystem with nothing to
@@ -1747,9 +1942,9 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length)
 	task_t *cur = sched_current();
 	if (!cur)
 		return -EFAULT;
-	if (fd >= TASK_MAX_FDS || cur->fd_table[fd] == NULL)
+	if (fd >= TASK_MAX_FDS || task_fds(cur)[fd] == NULL)
 		return -EBADF;
-	vfs_file_t *file = cur->fd_table[fd];
+	vfs_file_t *file = task_fds(cur)[fd];
 	int r = vfs_truncate(file, (unsigned long)length);
 	/* Truncating contents drops set-id bits for a non-privileged caller,
      * same as write() (see strip_setid_file for the once-per-inode fast-path). */
@@ -1757,6 +1952,9 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length)
 		strip_setid_file(file);
 	return r;
 }
+
+static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd);
+static int64_t sys_dup_from(uint64_t oldfd, int from);
 
 static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 {
@@ -1766,16 +1964,51 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 	if (fd >= TASK_MAX_FDS)
 		return -EBADF;
 
-	/* F_GETFD/F_SETFD are per-descriptor-slot flags stored in fd_flags[]. */
-	if (cmd == F_GETFD)
-		return (int64_t)task_get_fd_flags(cur, (unsigned)fd);
-	if (cmd == F_SETFD) {
+	/* F_GETFD/F_SETFD are per-descriptor-slot flags stored in fd_flags[].
+	 * They must still REJECT a descriptor that is not open: programs probe
+	 * with fcntl(fd, F_GETFD, 0) == -1 to find out whether a descriptor
+	 * exists (a shell does this to decide whether a redirection has to
+	 * save the previous descriptor or merely close it afterwards).
+	 * Answering "open" for every slot below the table size sent bash down
+	 * the save path for a closed fd, where the following F_DUPFD failed
+	 * with EBADF and aborted the whole redirection. */
+	if (cmd == F_GETFD || cmd == F_SETFD) {
+		if (!task_fds(cur)[fd] && fd != STDIN_FD && fd != STDOUT_FD &&
+		    fd != STDERR_FD)
+			return -EBADF;
+		if (cmd == F_GETFD)
+			return (int64_t)task_get_fd_flags(cur, (unsigned)fd);
 		task_set_fd_flags(cur, (unsigned)fd,
 				  (uint8_t)((uint32_t)arg & FD_CLOEXEC));
 		return 0;
 	}
 
-	vfs_file_t *file = cur->fd_table[fd];
+	/* F_DUPFD/F_DUPFD_CLOEXEC: duplicate onto the lowest free descriptor
+	 * >= arg.  Handled here, ahead of the per-descriptor-type blocks
+	 * below, so it works for EVERY kind of descriptor - sys_dup2 already
+	 * knows how to duplicate console markers, sockets, pipes and files.
+	 * A shell saves a standard descriptor this way (fcntl(1, F_DUPFD, 10))
+	 * before pointing it somewhere else for a builtin, so without this
+	 * every redirection in the current shell fails. */
+	if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC) {
+		if ((int64_t)arg < 0 || arg >= TASK_MAX_FDS)
+			return -EINVAL;
+		/* Source must be open.  0/1/2 stay open as console markers
+		 * even when their fd_table slot is NULL. */
+		if (!task_fds(cur)[fd] && fd != STDIN_FD && fd != STDOUT_FD &&
+		    fd != STDERR_FD)
+			return -EBADF;
+		int64_t newfd = sys_dup_from(fd, (int)arg);
+		if (newfd < 0)
+			return newfd;
+		/* POSIX: the copy does NOT inherit FD_CLOEXEC; F_DUPFD clears
+		 * it (sys_dup_from already did) and F_DUPFD_CLOEXEC sets it. */
+		if (cmd == F_DUPFD_CLOEXEC)
+			task_set_fd_flags(cur, (unsigned)newfd, FD_CLOEXEC);
+		return newfd;
+	}
+
+	vfs_file_t *file = task_fds(cur)[fd];
 
 	// Handle console markers: only when fd_table entry is NULL
 	if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
@@ -1883,7 +2116,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp)
 		return -EFAULT;
 	vfs_file_t *file = NULL;
 	if (fd < TASK_MAX_FDS) {
-		file = cur->fd_table[fd];
+		file = task_fds(cur)[fd];
 	}
 
 	// Socket fd markers - route to network ioctl handler
@@ -2000,7 +2233,7 @@ static int64_t sys_tcgetpgrp(uint64_t fd)
 		return -EFAULT;
 	vfs_file_t *file = NULL;
 	if (fd < TASK_MAX_FDS) {
-		file = cur->fd_table[fd];
+		file = task_fds(cur)[fd];
 	}
 	tty_t *tty = NULL;
 	if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
@@ -2027,7 +2260,7 @@ static int64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgrp)
 		return -EFAULT;
 	vfs_file_t *file = NULL;
 	if (fd < TASK_MAX_FDS) {
-		file = cur->fd_table[fd];
+		file = task_fds(cur)[fd];
 	}
 	tty_t *tty = NULL;
 	if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
@@ -2207,7 +2440,27 @@ static int64_t sys_kill(uint64_t pid, uint64_t sig)
 {
 	if (sig > 64)
 		return -EINVAL;
-	if ((int64_t)pid < 0) {
+	task_t *self = sched_current();
+	if (!self)
+		return -EFAULT;
+	/* POSIX pid forms:
+	 *   pid  > 0   that process
+	 *   pid == 0   every process in the CALLER's process group
+	 *   pid <  -1  every process in process group -pid
+	 * pid 0 used to be refused as "the kernel idle task", but 0 is not a
+	 * pid here at all — it is the caller's own group.  A shell relies on
+	 * this: when it finds itself in the background it does kill(0, SIGTTIN)
+	 * to stop until it is moved to the foreground, and the EPERM made it
+	 * spin and then switch job control off entirely. */
+	if (pid == 0) {
+		if (self->pgid <= 0)
+			return -ESRCH;
+		if (sig == 0)
+			return 0; /* our own group always exists */
+		sched_signal_pgrp(self->pgid, (int)sig);
+		return 0;
+	}
+	if ((int64_t)pid < -1) {
 		int pgid = -(int)pid;
 		if (sig == 0) {
 			return sched_pgid_exists(pgid) ? 0 : -ESRCH;
@@ -2215,9 +2468,14 @@ static int64_t sys_kill(uint64_t pid, uint64_t sig)
 		sched_signal_pgrp(pgid, (int)sig);
 		return 0;
 	}
-	if (pid == 0) {
-		/* PID 0 is the kernel idle task — cannot be signalled */
-		return -EPERM;
+	if ((int64_t)pid == -1) {
+		/* Broadcast: every process the caller may signal, except itself
+		 * and init.  Treating -1 as "process group 1" (which is what
+		 * negating it used to produce) signalled init's group instead
+		 * of everything, which is both wrong and dangerous. */
+		if (sig == 0)
+			return 0;
+		return sched_signal_all(self, (int)sig);
 	}
 	task_t *t = sched_find_task_by_id((uint32_t)pid);
 	if (!t)
@@ -2401,6 +2659,24 @@ static int64_t sys_readlink(uint64_t pathname, uint64_t buf, uint64_t bufsiz)
 		return -EINVAL;
 	if (!validate_user_ptr(buf, 1))
 		return -EFAULT;
+	/* /dev/fd/N and the standard-stream aliases are symlinks (see the
+	 * lstat path); `ls -l` reads them to print the "-> target" and errors
+	 * out if the read fails. */
+	int devfd = devfs_fd_alias_target(kpath);
+	if (devfd >= 0) {
+		task_t *cur = sched_current();
+		if (!cur)
+			return -EFAULT;
+		char target[64];
+		int tlen = fd_link_target(cur, devfd, target, sizeof(target));
+		if (tlen < 0)
+			return tlen;
+		if ((unsigned long)tlen > bufsiz)
+			tlen = (int)bufsiz;
+		if (copy_to_user((void *)buf, target, (size_t)tlen) != 0)
+			return -EFAULT;
+		return tlen;
+	}
 	char kbuf[256];
 	unsigned long n = bufsiz;
 	if (n > sizeof(kbuf))
@@ -2444,9 +2720,9 @@ static int64_t sys_chmod(uint64_t pathname, uint64_t mode)
 static int64_t sys_fchmod(uint64_t fd, uint64_t mode)
 {
 	task_t *cur = sched_current();
-	if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd])
+	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
 		return -EBADF;
-	if (fd_is_special(cur->fd_table[fd]))
+	if (fd_is_special(task_fds(cur)[fd]))
 		return 0; /* no perms to change */
 	unsigned new_mode = (unsigned)mode;
 	/* Only the owner (or root) may chmod, and a non-root caller not in the
@@ -2454,7 +2730,7 @@ static int64_t sys_fchmod(uint64_t fd, uint64_t mode)
      * report the owner (vfs_fstat unsupported, e.g. the perm-less FAT path). */
 	if (cur->cred.euid != 0) {
 		struct kstat st;
-		if (vfs_fstat(cur->fd_table[fd], &st) == ST_OK) {
+		if (vfs_fstat(task_fds(cur)[fd], &st) == ST_OK) {
 			if ((uint32_t)st.st_uid != cur->cred.fsuid)
 				return -EPERM;
 			if ((new_mode & S_ISGID) &&
@@ -2462,7 +2738,7 @@ static int64_t sys_fchmod(uint64_t fd, uint64_t mode)
 				new_mode &= ~(unsigned)S_ISGID;
 		}
 	}
-	int r = vfs_fchmod(cur->fd_table[fd], new_mode);
+	int r = vfs_fchmod(task_fds(cur)[fd], new_mode);
 	return (r == ST_OK) ? 0 : vfs_status_to_errno(r);
 }
 static int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group)
@@ -2509,16 +2785,16 @@ static int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group)
 static int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group)
 {
 	task_t *cur = sched_current();
-	if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd])
+	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
 		return -EBADF;
-	if (fd_is_special(cur->fd_table[fd]))
+	if (fd_is_special(task_fds(cur)[fd]))
 		return 0; /* no ownership to change */
 	int new_uid = (int)owner, new_gid = (int)group;
 	/* Owner change is root-only; a non-root owner may regroup to one of
      * their groups (same rule as path chown).  Permissive if owner unknown. */
 	if (cur->cred.euid != 0) {
 		struct kstat st;
-		if (vfs_fstat(cur->fd_table[fd], &st) == ST_OK) {
+		if (vfs_fstat(task_fds(cur)[fd], &st) == ST_OK) {
 			if (new_uid != -1 &&
 			    (uint32_t)new_uid != (uint32_t)st.st_uid)
 				return -EPERM;
@@ -2532,14 +2808,14 @@ static int64_t sys_fchown(uint64_t fd, uint64_t owner, uint64_t group)
 			}
 		}
 	}
-	int r = vfs_fchown(cur->fd_table[fd], new_uid, new_gid);
+	int r = vfs_fchown(task_fds(cur)[fd], new_uid, new_gid);
 	if (r == ST_OK &&
 	    cur->cred.euid != 0) { /* drop set-id on ownership change */
 		struct kstat st;
-		if (vfs_fstat(cur->fd_table[fd], &st) == ST_OK) {
+		if (vfs_fstat(task_fds(cur)[fd], &st) == ST_OK) {
 			unsigned clr = setid_strip_bits((uint32_t)st.st_mode);
 			if (clr)
-				vfs_fchmod(cur->fd_table[fd],
+				vfs_fchmod(task_fds(cur)[fd],
 					   (unsigned)st.st_mode & ~clr);
 		}
 	}
@@ -2688,7 +2964,7 @@ static int64_t sys_fstatfs(uint64_t fd, uint64_t u_buf)
 		return -EBADF;
 
 	task_t *cur = sched_current();
-	if (!cur || !cur->fd_table[fd])
+	if (!cur || !task_fds(cur)[fd])
 		return -EBADF;
 
 	/* Stats of the filesystem the descriptor's file lives on.  Descriptors not
@@ -2696,7 +2972,7 @@ static int64_t sys_fstatfs(uint64_t fd, uint64_t u_buf)
      * own, so report the root filesystem instead of dereferencing them. */
 	struct vfs_statfs vsf;
 	mm_memset(&vsf, 0, sizeof(vsf));
-	vfs_file_t *file = cur->fd_table[fd];
+	vfs_file_t *file = task_fds(cur)[fd];
 	int r = fd_is_special(file) ? vfs_statfs("/", &vsf) :
 				      vfs_fstatfs(file, &vsf);
 	if (r == ST_UNSUPPORTED)
@@ -2936,7 +3212,7 @@ static int64_t sys_fsetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 			     uint64_t size, uint64_t flags)
 {
 	task_t *cur = sched_current();
-	if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd])
+	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
 		return -EBADF;
 	char kname[256];
 	int c = xattr_copy_name(u_name, kname);
@@ -2951,7 +3227,7 @@ static int64_t sys_fsetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 			    kname,
 			    "system.")) { /* incl. POSIX ACLs: owner-only */
 			struct kstat st;
-			if (vfs_fstat(cur->fd_table[fd], &st) == ST_OK &&
+			if (vfs_fstat(task_fds(cur)[fd], &st) == ST_OK &&
 			    (uint32_t)st.st_uid != cur->cred.fsuid)
 				return -EPERM;
 		}
@@ -2968,7 +3244,7 @@ static int64_t sys_fsetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 			return -EFAULT;
 		}
 	}
-	int r = vfs_fsetxattr(cur->fd_table[fd], kname, kval, size, (int)flags);
+	int r = vfs_fsetxattr(task_fds(cur)[fd], kname, kval, size, (int)flags);
 	if (kval)
 		kfree(kval);
 	return (r >= 0) ? 0 : vfs_status_to_errno(r);
@@ -2978,21 +3254,21 @@ static int64_t sys_fgetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 			     uint64_t size)
 {
 	task_t *cur = sched_current();
-	if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd])
+	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
 		return -EBADF;
 	char kname[256];
 	int c = xattr_copy_name(u_name, kname);
 	if (c)
 		return c;
 	if (size == 0) {
-		int r = vfs_fgetxattr(cur->fd_table[fd], kname, 0, 0);
+		int r = vfs_fgetxattr(task_fds(cur)[fd], kname, 0, 0);
 		return (r >= 0) ? r : vfs_status_to_errno(r);
 	}
 	unsigned long cap = size > XATTR_MAX_VALUE ? XATTR_MAX_VALUE : size;
 	uint8_t *kbuf = (uint8_t *)kalloc(cap);
 	if (!kbuf)
 		return -ENOMEM;
-	int r = vfs_fgetxattr(cur->fd_table[fd], kname, kbuf, cap);
+	int r = vfs_fgetxattr(task_fds(cur)[fd], kname, kbuf, cap);
 	if (r >= 0 && copy_to_user((void *)u_val, kbuf, r)) {
 		kfree(kbuf);
 		return -EFAULT;
@@ -3004,17 +3280,17 @@ static int64_t sys_fgetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 static int64_t sys_flistxattr(uint64_t fd, uint64_t u_list, uint64_t size)
 {
 	task_t *cur = sched_current();
-	if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd])
+	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
 		return -EBADF;
 	if (size == 0) {
-		int r = vfs_flistxattr(cur->fd_table[fd], 0, 0);
+		int r = vfs_flistxattr(task_fds(cur)[fd], 0, 0);
 		return (r >= 0) ? r : vfs_status_to_errno(r);
 	}
 	unsigned long cap = size > XATTR_MAX_VALUE ? XATTR_MAX_VALUE : size;
 	char *kbuf = (char *)kalloc(cap);
 	if (!kbuf)
 		return -ENOMEM;
-	int r = vfs_flistxattr(cur->fd_table[fd], kbuf, cap);
+	int r = vfs_flistxattr(task_fds(cur)[fd], kbuf, cap);
 	if (r >= 0 && copy_to_user((void *)u_list, kbuf, r)) {
 		kfree(kbuf);
 		return -EFAULT;
@@ -3026,7 +3302,7 @@ static int64_t sys_flistxattr(uint64_t fd, uint64_t u_list, uint64_t size)
 static int64_t sys_fremovexattr(uint64_t fd, uint64_t u_name)
 {
 	task_t *cur = sched_current();
-	if (!cur || fd >= TASK_MAX_FDS || !cur->fd_table[fd])
+	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
 		return -EBADF;
 	char kname[256];
 	int c = xattr_copy_name(u_name, kname);
@@ -3039,12 +3315,12 @@ static int64_t sys_fremovexattr(uint64_t fd, uint64_t u_name)
 			    kname,
 			    "system.")) { /* incl. POSIX ACLs: owner-only */
 			struct kstat st;
-			if (vfs_fstat(cur->fd_table[fd], &st) == ST_OK &&
+			if (vfs_fstat(task_fds(cur)[fd], &st) == ST_OK &&
 			    (uint32_t)st.st_uid != cur->cred.fsuid)
 				return -EPERM;
 		}
 	}
-	int r = vfs_fremovexattr(cur->fd_table[fd], kname);
+	int r = vfs_fremovexattr(task_fds(cur)[fd], kname);
 	return (r >= 0) ? 0 : vfs_status_to_errno(r);
 }
 
@@ -3265,15 +3541,15 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 	 * epoll fd markers and stdio placeholders cannot. */
 	vfs_file_t *backing = NULL;
 	if (!is_anonymous) {
-		if (fd >= TASK_MAX_FDS || !caller->fd_table[fd])
+		if (fd >= TASK_MAX_FDS || !task_fds(caller)[fd])
 			return (int64_t)MAP_FAILED;
-		uint64_t marker = (uint64_t)caller->fd_table[fd];
-		if (marker <= 3 || IS_SOCKET_FD(caller->fd_table[fd]) ||
-		    IS_UNIX_SOCKET_FD(caller->fd_table[fd]) ||
-		    IS_EPOLL_FD(caller->fd_table[fd]) ||
-		    pipe_is_end(caller->fd_table[fd]))
+		uint64_t marker = (uint64_t)task_fds(caller)[fd];
+		if (marker <= 3 || IS_SOCKET_FD(task_fds(caller)[fd]) ||
+		    IS_UNIX_SOCKET_FD(task_fds(caller)[fd]) ||
+		    IS_EPOLL_FD(task_fds(caller)[fd]) ||
+		    pipe_is_end(task_fds(caller)[fd]))
 			return (int64_t)MAP_FAILED;
-		backing = caller->fd_table[fd];
+		backing = task_fds(caller)[fd];
 	}
 
 	/* Device mapping: /dev/fb0 maps the framebuffer BAR itself.  Pages
@@ -3517,25 +3793,22 @@ static int64_t sys_pipe(uint64_t pipefd_ptr)
 		return -ENOMEM;
 	}
 
-	int fd_read = alloc_fd(cur);
+	/* Installing the read end also reserves its slot, so the write end
+	 * cannot land on the same number. */
+	int fd_read = fd_install(cur, (vfs_file_t *)read_end);
 	if (fd_read < 0) {
 		pipe_close_end(read_end);
 		pipe_close_end(write_end);
 		return fd_read;
 	}
 
-	// Reserve the read end fd before allocating the write end
-	cur->fd_table[fd_read] = (vfs_file_t *)read_end;
-
-	int fd_write = alloc_fd(cur);
+	int fd_write = fd_install(cur, (vfs_file_t *)write_end);
 	if (fd_write < 0) {
-		cur->fd_table[fd_read] = NULL;
+		task_fds(cur)[fd_read] = NULL;
 		pipe_close_end(read_end);
 		pipe_close_end(write_end);
 		return fd_write;
 	}
-
-	cur->fd_table[fd_write] = (vfs_file_t *)write_end;
 
 	// SMAP-aware write to user array
 	int *user_pipefd = (int *)pipefd_ptr;
@@ -3693,31 +3966,59 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 		return -ECHILD;
 	}
 
-	// Loop until we find a zombie child or get interrupted
+	// Loop until we find a reportable child or get interrupted
 	while (1) {
-		task_t *child = NULL;
+		task_t *child = NULL; /* zombie to reap */
+		task_t *stopped = NULL; /* WUNTRACED: freshly stopped child */
+		task_t *continued = NULL; /* WCONTINUED: freshly continued */
+		int matched_any = 0;
 
-		if (pid == -1) {
-			// Wait for any child
-			task_t *c = cur->first_child;
-			while (c) {
-				if (c->has_exited) {
-					child = c;
-					break;
-				}
-				c = c->next_sibling;
+		/* One scan of the child list handles every pid form:
+		 *   pid > 0   that child only
+		 *   pid == -1 any child
+		 *   pid == 0  any child in the caller's process group
+		 *   pid < -1  any child in process group -pid */
+		for (task_t *c = cur->first_child; c; c = c->next_sibling) {
+			if (pid > 0 && c->id != (uint32_t)pid)
+				continue;
+			if (pid == 0 && c->pgid != cur->pgid)
+				continue;
+			if (pid < -1 && c->pgid != (int)(-pid))
+				continue;
+			matched_any = 1;
+			if (c->has_exited) {
+				child = c;
+				break;
 			}
-		} else if (pid > 0) {
-			// Wait for specific child
-			task_t *found = sched_find_task_by_id((uint32_t)pid);
-			if (found && found->parent == cur) {
-				if (found->has_exited) {
-					child = found;
-				}
-			} else if (!found || found->parent != cur) {
-				// Child doesn't exist or isn't ours
-				return -ECHILD;
-			}
+			if ((options & 2 /* WUNTRACED */) && c->jc_stop_signo &&
+			    !stopped)
+				stopped = c;
+			if ((options & 8 /* WCONTINUED */) && c->jc_continued &&
+			    !continued)
+				continued = c;
+		}
+		if (!matched_any)
+			return -ECHILD;
+
+		/* Job-control events: report without reaping. */
+		if (!child && stopped) {
+			int signo = stopped->jc_stop_signo;
+			stopped->jc_stop_signo = 0;
+			int status = ((signo & 0xFF) << 8) | 0x7F;
+			if (status_ptr &&
+			    validate_user_ptr(status_ptr, sizeof(int)))
+				copy_to_user((void *)status_ptr, &status,
+					     sizeof(status));
+			return stopped->id;
+		}
+		if (!child && continued) {
+			continued->jc_continued = 0;
+			int status = 0xFFFF; /* conventional "continued" code */
+			if (status_ptr &&
+			    validate_user_ptr(status_ptr, sizeof(int)))
+				copy_to_user((void *)status_ptr, &status,
+					     sizeof(status));
+			return continued->id;
 		}
 
 		if (child) {
@@ -3793,12 +4094,15 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 		// We must set BLOCKED atomically with respect to that check.
 		uint64_t irq_flags = local_irq_save();
 
-		// Re-check for zombie children under lock to close the race window
-		// where child exits between our check above and setting BLOCKED
+		// Re-check for reportable children under lock to close the race
+		// window where a child exits (or stops/continues) between our
+		// scan above and setting BLOCKED
 		bool found_zombie = false;
 		task_t *zombie_check = cur->first_child;
 		while (zombie_check) {
-			if (zombie_check->has_exited) {
+			if (zombie_check->has_exited ||
+			    ((options & 2) && zombie_check->jc_stop_signo) ||
+			    ((options & 8) && zombie_check->jc_continued)) {
 				found_zombie = true;
 				break;
 			}
@@ -4066,64 +4370,47 @@ static int64_t sys_dup(uint64_t oldfd)
 	if (!cur)
 		return -EFAULT;
 
-	int newfd = -1;
-	for (int i = 3; i < TASK_MAX_FDS; i++) {
-		if (cur->fd_table[i] == NULL) {
-			newfd = i;
-			break;
-		}
-	}
+	return sys_dup_from(oldfd, 3);
+}
 
-	if (newfd < 0)
-		return -EMFILE;
+/* dup(oldfd) onto the lowest free descriptor >= `from`.  Shared by SYS_DUP
+ * and fcntl(F_DUPFD), which differ only in that floor. */
+static int64_t sys_dup_from(uint64_t oldfd, int from)
+{
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
 
-	if (oldfd == STDIN_FD || oldfd == STDOUT_FD || oldfd == STDERR_FD) {
-		cur->fd_table[newfd] = (vfs_file_t *)(oldfd + 1);
-		return newfd;
-	}
+	/* Console-marker shortcut - ONLY when the descriptor really still is
+	 * the console.  fds 0-2 are routinely redirected (a shell points
+	 * stdout at a pipe for command substitution, then saves and restores
+	 * it around a builtin's own redirection); taking this branch on the
+	 * fd NUMBER alone duplicated a console marker instead of the pipe, so
+	 * the restore handed stdout back to the terminal and the captured
+	 * output was lost.  A non-NULL slot falls through to the normal
+	 * per-type duplication below. */
+	if ((oldfd == STDIN_FD || oldfd == STDOUT_FD || oldfd == STDERR_FD) &&
+	    task_fds(cur)[oldfd] == NULL)
+		return fd_install_from(cur, (vfs_file_t *)(oldfd + 1), from);
 
-	if (oldfd >= TASK_MAX_FDS || cur->fd_table[oldfd] == NULL)
+	if (oldfd >= TASK_MAX_FDS || task_fds(cur)[oldfd] == NULL)
 		return -EBADF;
 
-	uint64_t marker = (uint64_t)cur->fd_table[oldfd];
-	if (marker >= 1 && marker <= 3) {
-		cur->fd_table[newfd] = cur->fd_table[oldfd];
+	/* Take the reference BEFORE claiming a slot, so the install step stays
+	 * a single locked store (and so a failed install releases cleanly). */
+	vfs_file_t *copy = fd_dup_entry(task_fds(cur)[oldfd]);
+	if (!copy)
+		return -ENOMEM; /* only a pipe end can fail to duplicate */
+
+	/* fd_install_from clears FD_CLOEXEC on the new slot, which is what
+	 * POSIX requires of a duplicate — and what a slot recycled from a
+	 * close-on-exec descriptor would otherwise have kept, making the copy
+	 * vanish across the next exec. */
+	int newfd = fd_install_from(cur, copy, from);
+	if (newfd < 0) {
+		fd_release_entry(copy);
 		return newfd;
 	}
-
-	if (IS_SOCKET_FD(cur->fd_table[oldfd])) {
-		int idx = SOCKET_FD_IDX(cur->fd_table[oldfd]);
-		net_socket_t *s = sock_get(idx);
-		if (s)
-			__atomic_fetch_add(&s->ref_count, 1, __ATOMIC_ACQ_REL);
-		cur->fd_table[newfd] = cur->fd_table[oldfd];
-		return newfd;
-	}
-
-	if (IS_UNIX_SOCKET_FD(cur->fd_table[oldfd])) {
-		unix_socket_t *us =
-			unix_get((int)(uintptr_t)cur->fd_table[oldfd]);
-		if (us)
-			__atomic_fetch_add(&us->ref_count, 1, __ATOMIC_ACQ_REL);
-		cur->fd_table[newfd] = cur->fd_table[oldfd];
-		return newfd;
-	}
-
-	if (IS_EPOLL_FD(cur->fd_table[oldfd])) {
-		cur->fd_table[newfd] = cur->fd_table[oldfd];
-		return newfd;
-	}
-
-	if (pipe_is_end(cur->fd_table[oldfd])) {
-		pipe_end_t *new_end =
-			pipe_dup_end((pipe_end_t *)cur->fd_table[oldfd]);
-		if (!new_end)
-			return -ENOMEM;
-		cur->fd_table[newfd] = (vfs_file_t *)new_end;
-		return newfd;
-	}
-
-	cur->fd_table[newfd] = vfs_dup(cur->fd_table[oldfd]);
 	return newfd;
 }
 
@@ -4142,8 +4429,29 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd)
 	// valid file descriptor, the call fails and newfd is not closed".
 	// fds 0-2 count as valid even when they hold console markers.
 	if (oldfd != STDIN_FD && oldfd != STDOUT_FD && oldfd != STDERR_FD &&
-	    (oldfd >= TASK_MAX_FDS || cur->fd_table[oldfd] == NULL))
+	    (oldfd >= TASK_MAX_FDS || task_fds(cur)[oldfd] == NULL))
 		return -EBADF;
+
+	/* Build the duplicate BEFORE closing newfd: a dup that cannot be made
+	 * (a pipe end that fails to allocate) must not have destroyed the
+	 * descriptor it was going to overwrite.
+	 *
+	 * Console-marker shortcut - ONLY when the descriptor really still is
+	 * the console.  fds 0-2 are routinely redirected (a shell points
+	 * stdout at a pipe for command substitution, then saves and restores
+	 * it around a builtin's own redirection); taking this branch on the
+	 * fd NUMBER alone duplicated a console marker instead of the pipe, so
+	 * the restore handed stdout back to the terminal and the captured
+	 * output was lost. */
+	vfs_file_t *copy;
+	if ((oldfd == STDIN_FD || oldfd == STDOUT_FD || oldfd == STDERR_FD) &&
+	    task_fds(cur)[oldfd] == NULL) {
+		copy = (vfs_file_t *)(oldfd + 1); /* console stdio marker */
+	} else {
+		copy = fd_dup_entry(task_fds(cur)[oldfd]);
+		if (!copy)
+			return -ENOMEM;
+	}
 
 	// POSIX: dup2 implicitly closes newfd if it is open — INCLUDING fds
 	// 0-2.  In a pty session those hold real refcounted vfs files (the
@@ -4153,79 +4461,21 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd)
 	// Enough leaked references kept the slave alive after every process
 	// on the pty had exited, the master never saw POLLHUP, and a tmux
 	// window that had ever run a pipeline could not close.
-	if (cur->fd_table[newfd]) {
-		if (newfd >= 3) {
-			sys_close(newfd);
-		} else {
-			vfs_file_t *old = cur->fd_table[newfd];
-			uint64_t om = (uint64_t)old;
-			cur->fd_table[newfd] = NULL;
-			if (om >= 1 && om <= 3) {
-				/* console stdio marker — nothing to release */
-			} else if (IS_SOCKET_FD(old)) {
-				sock_close(SOCKET_FD_IDX(old));
-			} else if (IS_UNIX_SOCKET_FD(old)) {
-				unix_close((int)(uintptr_t)old);
-			} else if (IS_EPOLL_FD(old)) {
-				int idx = EPOLL_FD_IDX(old);
-				extern epoll_instance_t epoll_instances[];
-				if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
-					epoll_instances[idx].active = 0;
-			} else if (pipe_is_end(old)) {
-				pipe_close_end((pipe_end_t *)old);
-			} else {
-				vfs_close(old);
-			}
-		}
-	}
-
-	if (oldfd == STDIN_FD || oldfd == STDOUT_FD || oldfd == STDERR_FD) {
-		cur->fd_table[newfd] = (vfs_file_t *)(oldfd + 1);
-		return newfd;
-	}
-
-	if (oldfd >= TASK_MAX_FDS || cur->fd_table[oldfd] == NULL)
-		return -EBADF;
-
-	uint64_t marker = (uint64_t)cur->fd_table[oldfd];
-	if (marker >= 1 && marker <= 3) {
-		cur->fd_table[newfd] = cur->fd_table[oldfd];
-		return newfd;
-	}
-
-	if (IS_SOCKET_FD(cur->fd_table[oldfd])) {
-		int idx = SOCKET_FD_IDX(cur->fd_table[oldfd]);
-		net_socket_t *s = sock_get(idx);
-		if (s)
-			__atomic_fetch_add(&s->ref_count, 1, __ATOMIC_ACQ_REL);
-		cur->fd_table[newfd] = cur->fd_table[oldfd];
-		return newfd;
-	}
-
-	if (IS_UNIX_SOCKET_FD(cur->fd_table[oldfd])) {
-		unix_socket_t *us =
-			unix_get((int)(uintptr_t)cur->fd_table[oldfd]);
-		if (us)
-			__atomic_fetch_add(&us->ref_count, 1, __ATOMIC_ACQ_REL);
-		cur->fd_table[newfd] = cur->fd_table[oldfd];
-		return newfd;
-	}
-
-	if (IS_EPOLL_FD(cur->fd_table[oldfd])) {
-		cur->fd_table[newfd] = cur->fd_table[oldfd];
-		return newfd;
-	}
-
-	if (pipe_is_end(cur->fd_table[oldfd])) {
-		pipe_end_t *new_end =
-			pipe_dup_end((pipe_end_t *)cur->fd_table[oldfd]);
-		if (!new_end)
-			return -ENOMEM;
-		cur->fd_table[newfd] = (vfs_file_t *)new_end;
-		return newfd;
-	}
-
-	cur->fd_table[newfd] = vfs_dup(cur->fd_table[oldfd]);
+	uint64_t lflags = 0;
+	fds_lock(cur, &lflags);
+	vfs_file_t *old = task_fds(cur)[newfd];
+	task_fds(cur)[newfd] = copy;
+	/* POSIX: the copy never inherits FD_CLOEXEC — dup2 always leaves the
+	 * flag clear on newfd.  Set only here, AFTER oldfd was validated, so a
+	 * failed dup2 (bad oldfd) leaves an open newfd's flags untouched.
+	 * Without it a slot that previously held a close-on-exec descriptor
+	 * kept the bit and the duplicate disappeared across the next exec. */
+	task_set_fd_flags(cur, (unsigned)newfd, 0);
+	fds_unlock(cur, lflags);
+	/* Released last, and only after the slot already points at the copy:
+	 * fd_release_entry can sleep (vfs_close → pagecache flush), so newfd
+	 * must never be observable as empty in between. */
+	fd_release_entry(old);
 	return newfd;
 }
 
@@ -4234,8 +4484,14 @@ static int64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags)
 {
 	if (oldfd == newfd)
 		return -EINVAL;
-	(void)flags; // O_CLOEXEC accepted but not enforced
-	return sys_dup2(oldfd, newfd);
+	int64_t r = sys_dup2(oldfd, newfd);
+	if (r >= 0) {
+		task_t *c = sched_current();
+		if (c)
+			task_set_fd_flags(c, (unsigned)newfd,
+					  (flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
+	}
+	return r;
 }
 
 // SYS_GETPID - get process ID (thread group ID)
@@ -4250,7 +4506,7 @@ static int64_t sys_getpid(void)
 	return cur->tgid;
 }
 
-// SYS_YIELD - yield CPU to other runnable tasks (Linux-style)
+// SYS_YIELD - yield CPU to other runnable tasks
 // Moves current task to back of run queue and immediately reschedules.
 // Returns 0 on success. In a preemptive kernel this is a hint to the
 // scheduler that the caller is willing to give up its remaining timeslice.
@@ -4265,7 +4521,7 @@ static int64_t sys_yield(void)
 	cur->remaining_ticks = 0;
 	cur->state = TASK_READY;
 
-	// Immediate reschedule (Linux does this via schedule())
+	// Immediate reschedule
 	sched_schedule();
 
 	return 0;
@@ -5012,7 +5268,7 @@ static int64_t sys_signalfd(uint64_t fd, uint64_t mask_ptr, uint64_t flags)
 // SMP/THREADING SYSCALLS - FULL IMPLEMENTATION
 // ============================================================================
 
-// Clone flags (Linux compatible)
+// Clone flags (conventional Unix ABI values)
 #define CLONE_VM 0x00000100 // Share memory space
 #define CLONE_FS 0x00000200 // Share filesystem info
 #define CLONE_FILES 0x00000400 // Share file descriptors
@@ -5129,6 +5385,11 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	child->id = sched_alloc_task_id();
 
 	// Basic child setup
+	/* No unreported stop/continue of its own: the wholesale copy above
+	 * duplicated the parent's, which would make the parent's next
+	 * waitpid(WUNTRACED/WCONTINUED) report this running child as stopped. */
+	child->jc_stop_signo = 0;
+	child->jc_continued = 0;
 	child->state = TASK_READY;
 	child->kernel_stack_top = k_stack_top;
 	child->kernel_stack_base = k_stack_mem;
@@ -5190,7 +5451,16 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 			files_struct_get(cur->files);
 			child->files = cur->files;
 		} else {
-			// Create files_struct from parent's legacy fd_table
+			/* First CLONE_FILES in this process: promote the
+			 * caller's private table to a shared one.  The
+			 * descriptors are MOVED, not duplicated — the shared
+			 * table becomes the single owner of each reference, so
+			 * a close() by any thread really closes the object and
+			 * the reader on the other end of a pipe sees EOF.  (The
+			 * previous code duplicated every reference into a table
+			 * no lookup ever consulted; those copies were only
+			 * released when the last thread exited, so nothing a
+			 * threaded process closed was ever truly closed.) */
 			cur->files = files_struct_create();
 			if (!cur->files) {
 				if (!share_vm && child->pml4) {
@@ -5201,77 +5471,49 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 				kfree(child);
 				return -ENOMEM;
 			}
-			// Copy existing fd_table to files_struct, bumping refcounts so
-			// that files_struct holds independent references.  Without this,
-			// a later sys_close() frees the object while files_struct still
-			// holds the same raw pointer → vfs_close refcount underflow on
-			// process exit via files_struct_put().
 			for (int i = 0; i < TASK_MAX_FDS; i++) {
-				void *entry = cur->fd_table[i];
-				if (!entry) {
-					cur->files->fd_table[i] = NULL;
-					continue;
-				}
-				uint64_t marker = (uint64_t)entry;
-				if (marker >= 1 && marker <= 3) {
-					cur->files->fd_table[i] = entry;
-				} else if (IS_SOCKET_FD(entry)) {
-					int idx = SOCKET_FD_IDX(entry);
-					net_socket_t *s = sock_get(idx);
-					if (s)
-						__atomic_fetch_add(
-							&s->ref_count, 1,
-							__ATOMIC_ACQ_REL);
-					cur->files->fd_table[i] = entry;
-				} else if (IS_UNIX_SOCKET_FD(entry)) {
-					unix_socket_t *us =
-						unix_get((int)(uintptr_t)entry);
-					if (us)
-						__atomic_fetch_add(
-							&us->ref_count, 1,
-							__ATOMIC_ACQ_REL);
-					cur->files->fd_table[i] = entry;
-				} else if (IS_EPOLL_FD(entry)) {
-					cur->files->fd_table[i] = entry;
-				} else if (pipe_is_end(entry)) {
-					pipe_end_t *ne = pipe_dup_end(
-						(pipe_end_t *)entry);
-					cur->files->fd_table[i] =
-						ne ? (void *)ne : NULL;
-				} else {
-					cur->files->fd_table[i] =
-						vfs_dup((vfs_file_t *)entry);
-				}
+				cur->files->fd_table[i] = cur->fd_table[i];
+				/* Carry the close-on-exec bits over with the
+				 * descriptors: task_get/set_fd_flags switch to
+				 * the shared array the moment ->files is set,
+				 * so without this every FD_CLOEXEC bit in the
+				 * process silently vanished at the first
+				 * pthread_create. */
+				cur->files->fd_flags[i] = cur->fd_flags[i];
+				cur->fd_table[i] = NULL;
+				cur->fd_flags[i] = 0;
 			}
 
 			files_struct_get(cur->files);
 			child->files = cur->files;
 		}
-		// Clear legacy fd_table (now using files_struct)
+		/* The wholesale task copy above duplicated the caller's private
+		 * table into the child; it is not the child's to own — the
+		 * shared files_struct holds every reference now. */
 		for (int i = 0; i < TASK_MAX_FDS; i++) {
 			child->fd_table[i] = NULL;
+			child->fd_flags[i] = 0;
 		}
 	} else {
 		// Clone file descriptors
 		child->files = NULL;
 		for (int i = 0; i < TASK_MAX_FDS; i++) {
-			vfs_file_t *src_fd = cur->files ?
-						     cur->files->fd_table[i] :
-						     cur->fd_table[i];
-			if (src_fd) {
-				uint64_t marker = (uint64_t)src_fd;
-				if (marker >= 1 && marker <= 3) {
-					child->fd_table[i] = src_fd;
-				} else if (pipe_is_end(src_fd)) {
-					child->fd_table[i] =
-						(vfs_file_t *)pipe_dup_end(
-							(pipe_end_t *)src_fd);
-				} else {
-					child->fd_table[i] = vfs_dup(src_fd);
-				}
-			} else {
-				child->fd_table[i] = NULL;
-			}
+			vfs_file_t *src_fd = task_fds(cur)[i];
+			/* The child owns a PRIVATE table, so the flags have to
+			 * be copied out of whichever array is the caller's
+			 * effective one — the wholesale task copy duplicated
+			 * cur->fd_flags, which is the empty legacy array once
+			 * the caller became part of a thread group. */
+			child->fd_flags[i] = task_get_fd_flags(cur, (unsigned)i);
+			/* Every descriptor KIND has to be duplicated the way its
+			 * own type demands.  This used to fall through to
+			 * vfs_dup() for anything that was not a console marker
+			 * or a pipe end — but a socket, unix-socket or epoll
+			 * descriptor is a small tagged integer, not a pointer,
+			 * so vfs_dup dereferenced it.  fd_dup_entry classifies
+			 * first (and takes the socket refcounts fork already
+			 * took). */
+			child->fd_table[i] = src_fd ? fd_dup_entry(src_fd) : NULL;
 		}
 	}
 
@@ -6066,7 +6308,7 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
 	return 0;
 }
 
-// Linux reboot() magic numbers and commands
+// reboot() magic numbers and commands
 #define LINUX_REBOOT_MAGIC1 0xfee1dead
 #define LINUX_REBOOT_MAGIC2 672274793 // 0x28121969
 #define LINUX_REBOOT_MAGIC2A 85072278
@@ -6412,7 +6654,7 @@ static int sock_idx_from_fd(uint64_t fd)
 	task_t *cur = sched_current();
 	if (!cur || fd >= TASK_MAX_FDS)
 		return -EBADF;
-	void *entry = cur->fd_table[fd];
+	void *entry = task_fds(cur)[fd];
 	if (!entry)
 		return -EBADF;
 	if (!IS_SOCKET_FD(entry))
@@ -6426,7 +6668,7 @@ static int unix_sock_fd_from_fd(uint64_t fd)
 	task_t *cur = sched_current();
 	if (!cur || fd >= TASK_MAX_FDS)
 		return -EBADF;
-	void *entry = cur->fd_table[fd];
+	void *entry = task_fds(cur)[fd];
 	if (!entry)
 		return -EBADF;
 	if (!IS_UNIX_SOCKET_FD(entry))
@@ -6440,7 +6682,7 @@ static int epoll_idx_from_fd(uint64_t fd)
 	task_t *cur = sched_current();
 	if (!cur || fd >= TASK_MAX_FDS)
 		return -EBADF;
-	void *entry = cur->fd_table[fd];
+	void *entry = task_fds(cur)[fd];
 	if (!entry)
 		return -EBADF;
 	if (!IS_EPOLL_FD(entry))
@@ -6658,7 +6900,7 @@ __attribute__((noinline)) static int unix_do_sendmsg(int ufd,
 					int sfd = fds[i];
 					if (sfd < 0 || sfd >= TASK_MAX_FDS)
 						continue;
-					void *entry = cur->fd_table[sfd];
+					void *entry = task_fds(cur)[sfd];
 					if (!entry)
 						continue;
 					/* Bump the underlying refcount so the entry survives
@@ -6830,8 +7072,8 @@ __attribute__((noinline)) static int unix_do_recvmsg(int ufd,
 			int newfd = -1;
 			if (cur) {
 				for (int i = 3; i < TASK_MAX_FDS; i++) {
-					if (cur->fd_table[i] == NULL) {
-						cur->fd_table[i] = entry;
+					if (task_fds(cur)[i] == NULL) {
+						task_fds(cur)[i] = entry;
 						newfd = i;
 						break;
 					}
@@ -7271,8 +7513,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 				return -EFAULT;
 			}
 			for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-				if (cur->fd_table[_fd] == NULL) {
-					cur->fd_table[_fd] =
+				if (task_fds(cur)[_fd] == NULL) {
+					task_fds(cur)[_fd] =
 						(void *)(uintptr_t)ufd;
 					if ((int)a2 & SOCK_NONBLOCK) {
 						unix_socket_t *_s =
@@ -7296,8 +7538,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			return -EFAULT;
 		}
 		for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-			if (cur->fd_table[_fd] == NULL) {
-				cur->fd_table[_fd] = MAKE_SOCKET_FD(sock_idx);
+			if (task_fds(cur)[_fd] == NULL) {
+				task_fds(cur)[_fd] = MAKE_SOCKET_FD(sock_idx);
 				if ((int)a2 & SOCK_NONBLOCK) {
 					net_socket_t *_s = sock_get(sock_idx);
 					if (_s)
@@ -7359,8 +7601,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 				return -EFAULT;
 			}
 			for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-				if (cur->fd_table[_fd] == NULL) {
-					cur->fd_table[_fd] =
+				if (task_fds(cur)[_fd] == NULL) {
+					task_fds(cur)[_fd] =
 						(void *)(uintptr_t)new_ufd;
 					if (a2 && a3) {
 						if (validate_user_ptr(
@@ -7401,8 +7643,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			return -EFAULT;
 		}
 		for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-			if (cur->fd_table[_fd] == NULL) {
-				cur->fd_table[_fd] =
+			if (task_fds(cur)[_fd] == NULL) {
+				task_fds(cur)[_fd] =
 					MAKE_SOCKET_FD(new_sock_idx);
 				if (a2 && a3) {
 					if (validate_user_ptr(
@@ -7640,7 +7882,7 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			for (int _fd = 3;
 			     _fd < TASK_MAX_FDS && (pfd[0] < 0 || pfd[1] < 0);
 			     _fd++) {
-				if (cur->fd_table[_fd] == NULL) {
+				if (task_fds(cur)[_fd] == NULL) {
 					if (pfd[0] < 0)
 						pfd[0] = _fd;
 					else
@@ -7652,8 +7894,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 				unix_close(usv[1]);
 				return -EMFILE;
 			}
-			cur->fd_table[pfd[0]] = (void *)(uintptr_t)usv[0];
-			cur->fd_table[pfd[1]] = (void *)(uintptr_t)usv[1];
+			task_fds(cur)[pfd[0]] = (void *)(uintptr_t)usv[0];
+			task_fds(cur)[pfd[1]] = (void *)(uintptr_t)usv[1];
 			copy_to_user((void *)a4, pfd, 2 * sizeof(int));
 			return 0;
 		}
@@ -7671,7 +7913,7 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		int ufd[2] = { -1, -1 };
 		for (int _fd = 3;
 		     _fd < TASK_MAX_FDS && (ufd[0] < 0 || ufd[1] < 0); _fd++) {
-			if (cur->fd_table[_fd] == NULL) {
+			if (task_fds(cur)[_fd] == NULL) {
 				if (ufd[0] < 0)
 					ufd[0] = _fd;
 				else
@@ -7683,8 +7925,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			sock_close(sv[1]);
 			return -EMFILE;
 		}
-		cur->fd_table[ufd[0]] = MAKE_SOCKET_FD(sv[0]);
-		cur->fd_table[ufd[1]] = MAKE_SOCKET_FD(sv[1]);
+		task_fds(cur)[ufd[0]] = MAKE_SOCKET_FD(sv[0]);
+		task_fds(cur)[ufd[1]] = MAKE_SOCKET_FD(sv[1]);
 		copy_to_user((void *)a4, ufd, 2 * sizeof(int));
 		return 0;
 	}
@@ -7703,8 +7945,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 				return -EFAULT;
 			}
 			for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-				if (cur->fd_table[_fd] == NULL) {
-					cur->fd_table[_fd] =
+				if (task_fds(cur)[_fd] == NULL) {
+					task_fds(cur)[_fd] =
 						(void *)(uintptr_t)new_ufd;
 					if ((int)a4 & SOCK_NONBLOCK) {
 						unix_socket_t *_s =
@@ -7751,8 +7993,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			return -EFAULT;
 		}
 		for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-			if (cur->fd_table[_fd] == NULL) {
-				cur->fd_table[_fd] =
+			if (task_fds(cur)[_fd] == NULL) {
+				task_fds(cur)[_fd] =
 					MAKE_SOCKET_FD(new_sock_idx);
 				if (a2 && a3) {
 					if (validate_user_ptr(
@@ -7851,8 +8093,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		if (!cur)
 			return -EFAULT;
 		for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-			if (cur->fd_table[_fd] == NULL) {
-				cur->fd_table[_fd] = MAKE_EPOLL_FD(ep_idx);
+			if (task_fds(cur)[_fd] == NULL) {
+				task_fds(cur)[_fd] = MAKE_EPOLL_FD(ep_idx);
 				return _fd;
 			}
 		}
@@ -7867,8 +8109,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		if (!cur)
 			return -EFAULT;
 		for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-			if (cur->fd_table[_fd] == NULL) {
-				cur->fd_table[_fd] = MAKE_EPOLL_FD(ep_idx);
+			if (task_fds(cur)[_fd] == NULL) {
+				task_fds(cur)[_fd] = MAKE_EPOLL_FD(ep_idx);
 				return _fd;
 			}
 		}
@@ -8349,5 +8591,29 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 	 * a DIFFERENT CPU — `cpu` from function entry would then point at the
 	 * old CPU and clobber ITS current_syscall_nr mid-syscall. */
 	this_cpu()->current_syscall_nr = -1;
+
+	/* A task that DIED inside this syscall must never sysret to user mode.
+	 * sched_mark_task_exited() has already closed its descriptors and
+	 * released its demand-paging region table, so the moment it executes
+	 * user code again the first not-yet-paged-in text page faults with no
+	 * region backing it — a bogus SIGSEGV report (with an empty region
+	 * list) for a process that was already dead.  That is exactly what
+	 * `kill -TERM $$` produced: sys_kill → SIG_DFL_TERM on the caller
+	 * itself → marked exited, and the signal-delivery block above is
+	 * skipped precisely BECAUSE has_exited is set, so control fell
+	 * straight through to `return ret`.  Park here instead and let the
+	 * scheduler take us off this CPU for good.
+	 *
+	 * IRQs stay ENABLED in the retry loop (`sti; hlt`, same as sys_exit):
+	 * a CPU halted with IRQs off can no longer ack TLB-shootdown IPIs and
+	 * wedges every other CPU spinning in smp_tlb_shootdown_sync(). */
+	cur = sched_current();
+	if (cur && cur->privilege == TASK_USER &&
+	    (cur->has_exited || cur->state == TASK_ZOMBIE)) {
+		for (;;) {
+			sched_schedule();
+			__asm__ volatile("sti; hlt");
+		}
+	}
 	return ret;
 }

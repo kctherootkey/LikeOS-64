@@ -1,4 +1,4 @@
-// LikeOS-64 - linux_dirent64 structure for getdents64
+// LikeOS-64 - dirent64 structure for getdents64
 #ifndef _KERNEL_DIRENT_H_
 #define _KERNEL_DIRENT_H_
 
@@ -15,7 +15,7 @@
 #define DT_SOCK 12
 #define DT_WHT 14
 
-struct linux_dirent64 {
+struct dirent64 {
 	uint64_t d_ino;
 	int64_t d_off;
 	uint16_t d_reclen;

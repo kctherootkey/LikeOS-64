@@ -22,7 +22,8 @@
 #define DEVFS_TYPE_FB0 10
 #define DEVFS_TYPE_INPUT_DIR 11
 #define DEVFS_TYPE_EVDEV 12 /* /dev/input/eventN; unit in evdev_id */
-#define DEVFS_TYPE_MAX DEVFS_TYPE_EVDEV
+#define DEVFS_TYPE_FD_DIR 13 /* /dev/fd: the caller's own descriptors */
+#define DEVFS_TYPE_MAX DEVFS_TYPE_FD_DIR
 
 /* Device-node group owners; values must match /etc/group on the root fs. */
 #define DEVFS_GID_TTY 5
@@ -37,6 +38,11 @@ typedef struct {
 	unsigned dir_pos;
 	uint64_t fpos; // byte position (framebuffer device)
 	int evdev_id; // input device unit (DEVFS_TYPE_EVDEV)
+	/* The name this handle was opened under.  Several device paths share
+	 * one type (/dev/tty, /dev/console and /dev/tty0 are all DEVFS_TYPE_TTY),
+	 * so the type alone cannot say which node a descriptor refers to — and
+	 * that is exactly what a /dev/fd/N symlink has to report. */
+	char path[32];
 } devfs_file_t;
 
 static vfs_ops_t g_devfs_ops;
@@ -58,6 +64,37 @@ static int is_prefix(const char *path, const char *prefix)
 }
 
 long devfs_readdir(vfs_file_t *f, void *buf, long bytes);
+
+/* Virtual /dev/fd/N plus the /dev/stdin, /dev/stdout, /dev/stderr aliases:
+ * opening one of these names duplicates the caller's own descriptor N, the
+ * conventional Unix semantics.  This only classifies the path; the actual
+ * duplication happens in the syscall layer, which owns the fd table (devfs
+ * has no notion of the caller's descriptors).  Returns the descriptor
+ * number the path names, or -1 if it is not one of these paths.  The
+ * caller validates the descriptor itself (bad fd => EBADF), so the only
+ * bound enforced here is against integer overflow. */
+int devfs_fd_alias_target(const char *path)
+{
+	if (is_prefix(path, "/dev/fd/")) {
+		const char *p = path + 8;
+		if (*p < '0' || *p > '9')
+			return -1;
+		int n = 0;
+		for (; *p >= '0' && *p <= '9'; p++) {
+			n = n * 10 + (*p - '0');
+			if (n > 65535)
+				return -1;
+		}
+		return (*p == '\0') ? n : -1;
+	}
+	if (is_path(path, "/dev/stdin"))
+		return 0;
+	if (is_path(path, "/dev/stdout"))
+		return 1;
+	if (is_path(path, "/dev/stderr"))
+		return 2;
+	return -1;
+}
 
 int devfs_init(void)
 {
@@ -164,8 +201,8 @@ static int devfs_open_pty_slave(int id, vfs_file_t **out)
 	return ST_OK;
 }
 
-int devfs_open_for_task(const char *path, int flags, vfs_file_t **out,
-			task_t *cur)
+static int devfs_open_impl(const char *path, int flags, vfs_file_t **out,
+			   task_t *cur)
 {
 	(void)flags;
 	if (!path || !out)
@@ -176,6 +213,12 @@ int devfs_open_for_task(const char *path, int flags, vfs_file_t **out,
 	}
 	if (is_path(path, "/dev/pts") || is_path(path, "/dev/pts/")) {
 		return devfs_open_dir(DEVFS_TYPE_PTS_DIR, out);
+	}
+	/* /dev/fd itself is a directory listing the caller's descriptors; the
+	 * individual /dev/fd/N entries never reach devfs (the syscall layer
+	 * turns opening one into a dup - see devfs_fd_alias_target). */
+	if (is_path(path, "/dev/fd") || is_path(path, "/dev/fd/")) {
+		return devfs_open_dir(DEVFS_TYPE_FD_DIR, out);
 	}
 
 	if (is_path(path, "/dev/tty") && cur) {
@@ -280,10 +323,51 @@ int devfs_open_for_task(const char *path, int flags, vfs_file_t **out,
 	return ST_NOT_FOUND;
 }
 
+int devfs_open_for_task(const char *path, int flags, vfs_file_t **out,
+			task_t *cur)
+{
+	int r = devfs_open_impl(path, flags, out, cur);
+	/* Remember the name so a /dev/fd/N symlink can report which node the
+	 * descriptor refers to.  Trailing-slash forms ("/dev/pts/") normalise
+	 * to the directory itself. */
+	if (r == ST_OK && out && *out) {
+		devfs_file_t *df = (devfs_file_t *)(*out)->fs_private;
+		if (df && path) {
+			size_t i = 0;
+			while (path[i] && i < sizeof(df->path) - 1) {
+				df->path[i] = path[i];
+				i++;
+			}
+			while (i > 1 && df->path[i - 1] == '/')
+				i--;
+			df->path[i] = '\0';
+		}
+	}
+	return r;
+}
+
 int devfs_open(const char *path, int flags, vfs_file_t **out)
 {
 	// Fallback without task context: use console tty for /dev/tty
 	return devfs_open_for_task(path, flags, out, NULL);
+}
+
+/* The /dev path an open devfs handle was created from, for /dev/fd/N symlink
+ * targets.  Returns the length written, or -1 if `f` is not a devfs handle. */
+int devfs_fpath(vfs_file_t *f, char *out, size_t cap)
+{
+	if (!f || f->ops != &g_devfs_ops || !out || cap == 0)
+		return -1;
+	devfs_file_t *df = (devfs_file_t *)f->fs_private;
+	if (!df || !df->path[0])
+		return -1;
+	size_t i = 0;
+	while (df->path[i] && i < cap - 1) {
+		out[i] = df->path[i];
+		i++;
+	}
+	out[i] = '\0';
+	return (int)i;
 }
 
 /* Decimal suffix of a device path (e.g. after "/dev/input/event"), or -1. */
@@ -315,6 +399,7 @@ int devfs_stat(const char *path, struct kstat *st)
 	uint64_t now = timer_get_epoch(); /* real wall-clock seconds */
 	if (is_path(path, "/dev") || is_path(path, "/dev/") ||
 	    is_path(path, "/dev/pts") || is_path(path, "/dev/pts/") ||
+	    is_path(path, "/dev/fd") || is_path(path, "/dev/fd/") ||
 	    is_path(path, "/dev/input") || is_path(path, "/dev/input/")) {
 		st->st_mode = S_IFDIR | (S_IRUSR | S_IWUSR | S_IXUSR | S_IRGRP |
 					 S_IXGRP | S_IROTH | S_IXOTH);
@@ -377,6 +462,7 @@ int devfs_chdir(const char *path)
 		return ST_INVALID;
 	if (is_path(path, "/dev") || is_path(path, "/dev/") ||
 	    is_path(path, "/dev/pts") || is_path(path, "/dev/pts/") ||
+	    is_path(path, "/dev/fd") || is_path(path, "/dev/fd/") ||
 	    is_path(path, "/dev/input") || is_path(path, "/dev/input/")) {
 		return ST_OK;
 	}
@@ -524,14 +610,14 @@ static unsigned devfs_write_dirent64(char *out, unsigned out_size,
 	while (name[name_len] && name_len < 255)
 		name_len++;
 	unsigned reclen =
-		(unsigned)sizeof(struct linux_dirent64) + name_len + 1;
+		(unsigned)sizeof(struct dirent64) + name_len + 1;
 	reclen = (reclen + 7u) & ~7u;
 	WARN_ON(reclen % 8 != 0);
 	if (*out_off + reclen > out_size)
 		return 0;
 	// SMAP-aware write to user buffer
 	smap_disable();
-	struct linux_dirent64 *d = (struct linux_dirent64 *)(out + *out_off);
+	struct dirent64 *d = (struct dirent64 *)(out + *out_off);
 	d->d_ino = ino;
 	d->d_off = 0;
 	d->d_reclen = (uint16_t)reclen;
@@ -553,7 +639,7 @@ long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
 	if (!df)
 		return -EINVAL;
 	if (df->type != DEVFS_TYPE_DIR && df->type != DEVFS_TYPE_PTS_DIR &&
-	    df->type != DEVFS_TYPE_INPUT_DIR) {
+	    df->type != DEVFS_TYPE_INPUT_DIR && df->type != DEVFS_TYPE_FD_DIR) {
 		return -ENOTDIR;
 	}
 	if (df->dir_pos) {
@@ -592,6 +678,52 @@ long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
 				     "fb0", 10, 2);
 		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
 				     "input", 11, 4);
+		/* Descriptor aliases: the /dev/fd directory (DT_DIR) and the
+		 * three standard-stream names, which are symlinks to the
+		 * descriptor they name (DT_LNK), as on every other Unix. */
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "fd", 12, 4);
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "stdin", 13, 10);
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "stdout", 14, 10);
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "stderr", 15, 10);
+		df->dir_pos = 1;
+		return (long)out_off;
+	}
+	/* /dev/fd: one entry per descriptor the CALLING task has open. */
+	if (df->type == DEVFS_TYPE_FD_DIR) {
+		task_t *cur = sched_current();
+		for (int i = 0; cur && i < TASK_MAX_FDS; i++) {
+			/* 0/1/2 are always open (they may be console markers
+			 * with a NULL slot); the rest need a live entry. */
+			if (i > 2 && task_fds(cur)[i] == NULL)
+				continue;
+			char name[8];
+			int len = 0;
+			int n = i;
+			if (n == 0) {
+				name[len++] = '0';
+			} else {
+				char tmp[8];
+				int t = 0;
+				while (n > 0 && t < 7) {
+					tmp[t++] = (char)('0' + (n % 10));
+					n /= 10;
+				}
+				while (t > 0)
+					name[len++] = tmp[--t];
+			}
+			name[len] = '\0';
+			/* DT_LNK: these entries are symlinks to whatever the
+			 * descriptor refers to, the conventional Unix shape.
+			 * DT_UNKNOWN forced ls to lstat every one of them. */
+			if (!devfs_write_dirent64((char *)buf, (unsigned)bytes,
+						  &out_off, name,
+						  (uint64_t)(300 + i), 10))
+				break;
+		}
 		df->dir_pos = 1;
 		return (long)out_off;
 	}
@@ -736,6 +868,18 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st)
 		perm = 0660, gid = DEVFS_GID_INPUT, rmaj = 13;
 		rmin = 64 + (uint32_t)df->evdev_id;
 		break;
+	/* The directory handles (/dev, /dev/pts, /dev/input, /dev/fd) are not
+	 * character devices; without these cases fstat() fell through to the
+	 * caller's "unknown - call it a regular file" default, so an open
+	 * directory descriptor listed as -rw-r--r--. */
+	case DEVFS_TYPE_DIR:
+	case DEVFS_TYPE_PTS_DIR:
+	case DEVFS_TYPE_INPUT_DIR:
+	case DEVFS_TYPE_FD_DIR:
+		st->st_mode = S_IFDIR | 0755;
+		st->st_nlink = 1;
+		st->st_size = 0;
+		return 0;
 	default:
 		return -EINVAL;
 	}

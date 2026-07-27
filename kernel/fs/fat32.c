@@ -4360,14 +4360,14 @@ static unsigned fat32_write_dirent64(char *out, unsigned out_size,
 		name_len++;
 	}
 	unsigned reclen =
-		(unsigned)sizeof(struct linux_dirent64) + name_len + 1;
+		(unsigned)sizeof(struct dirent64) + name_len + 1;
 	reclen = (reclen + 7u) & ~7u;
 	if (*out_off + reclen > out_size) {
 		return 0;
 	}
 	// SMAP-aware write to user buffer
 	smap_disable();
-	struct linux_dirent64 *d = (struct linux_dirent64 *)(out + *out_off);
+	struct dirent64 *d = (struct dirent64 *)(out + *out_off);
 	d->d_ino = ino;
 	d->d_off = 0;
 	d->d_reclen = (uint16_t)reclen;
@@ -4416,7 +4416,7 @@ static long fat32_readdir_impl(vfs_file_t *f, void *buf, long bytes)
 	unsigned long lfn_start_cluster = cluster;
 	unsigned int lfn_start_idx = idx;
 
-	while (out_off + sizeof(struct linux_dirent64) + 2 < (unsigned)bytes) {
+	while (out_off + sizeof(struct dirent64) + 2 < (unsigned)bytes) {
 		if (cluster == 0 || cluster >= 0x0FFFFFF8) {
 			ff->dir_iter_cluster = cluster;
 			ff->dir_iter_index = idx;

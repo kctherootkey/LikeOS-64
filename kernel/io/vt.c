@@ -577,9 +577,11 @@ static void vt_put_char(struct vt_state *vt, char c)
 		return;
 	}
 
-	/* ---- Other C0 controls (BEL, SI, SO, etc.): pass through ------ */
-	if (ch < 0x20) {
-		console_putchar_batch(c);
+	/* ---- Other C0 controls (BEL, SI, SO, ...) and DEL: ignored -----
+     * They occupy no cell and move no cursor, so the shadow buffer needs no
+     * update; forwarding them made the console draw the font glyph at that
+     * code point (BEL = a full-width bar in Lat15-Fixed16). */
+	if (ch < 0x20 || ch == 0x7F) {
 		return;
 	}
 

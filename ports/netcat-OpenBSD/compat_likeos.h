@@ -168,20 +168,8 @@ asprintf(char **strp, const char *fmt, ...)
 }
 #endif /* HAVE_ASPRINTF */
 
-/* ------------------------------------------------------------------
- * mktemp — create a unique filename from a template ending in XXXXXX.
- * Uses mkstemp internally and closes the fd.
- * ------------------------------------------------------------------ */
-static inline char *mktemp(char *tmpl)
-{
-    int fd = mkstemp(tmpl);
-    if (fd < 0)
-        return NULL;
-    close(fd);
-    /* Unlink so the caller can create a socket at this path. */
-    unlink(tmpl);
-    return tmpl;
-}
+/* mktemp: now provided by libc <stdlib.h> (the compat definition here
+ * predates it and would clash with the libc declaration). */
 
 /* ------------------------------------------------------------------
  * readpassphrase — read a passphrase from the terminal.

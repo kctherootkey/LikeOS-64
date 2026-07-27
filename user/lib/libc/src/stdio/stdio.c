@@ -775,6 +775,7 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 
 		/* --- Length modifiers --- */
 		int lng = 0; /* 1 = long, 2 = long long */
+		int ldbl = 0; /* 'L' = long double argument */
 		if (*format == 'l') {
 			format++;
 			lng = 1;
@@ -789,6 +790,13 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 			format++;
 			if (*format == 'h')
 				format++;
+		} else if (*format == 'L') {
+			/* long double.  It MUST be consumed as a long double
+			 * (16 bytes here, not 8) or every later argument is
+			 * read from the wrong offset; the value is then
+			 * narrowed to double for formatting. */
+			format++;
+			ldbl = 1;
 		}
 
 		/* --- Specifier --- */
@@ -1025,7 +1033,9 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 		/* ---- floating-point ---- */
 		case 'f':
 		case 'F': {
-			double val = va_arg(ap, double);
+			double val = ldbl ?
+					     (double)va_arg(ap, long double) :
+					     va_arg(ap, double);
 			int fprec = (prec < 0) ? 6 : prec;
 
 			/* Handle negative / sign */
@@ -1119,7 +1129,9 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 
 		case 'e':
 		case 'E': {
-			double val = va_arg(ap, double);
+			double val = ldbl ?
+					     (double)va_arg(ap, long double) :
+					     va_arg(ap, double);
 			int fprec = (prec < 0) ? 6 : prec;
 			int is_neg = 0;
 			if (val < 0.0) {
@@ -1233,7 +1245,9 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 		case 'g':
 		case 'G': {
 			/* %g: use %e if exponent < -4 or >= precision, else %f style */
-			double val = va_arg(ap, double);
+			double val = ldbl ?
+					     (double)va_arg(ap, long double) :
+					     va_arg(ap, double);
 			int fprec = (prec < 0) ? 6 : (prec == 0 ? 1 : prec);
 			int is_neg = 0;
 			if (val < 0.0) {

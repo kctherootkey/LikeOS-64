@@ -337,6 +337,12 @@ typedef struct task {
 	// Exit status tracking
 	int exit_code; // Exit status for waitpid
 	bool has_exited; // True when exit() was called
+	/* Job control: which stop signal stopped this task (0 = none) and
+	 * whether a continue is unreported.  Set on the stop/continue paths,
+	 * cleared when the parent collects the event via
+	 * waitpid(WUNTRACED/WCONTINUED). */
+	volatile int jc_stop_signo;
+	volatile int jc_continued;
 	volatile int
 		exit_lock; // Atomic guard for sched_mark_task_exited (0=unlocked)
 	bool is_fork_child; // True if this is a newly forked child (should return 0)
@@ -485,6 +491,18 @@ typedef struct task {
 	sighand_struct_t *sighand; // Shared signal handlers (CLONE_SIGHAND)
 } task_t;
 
+/* THE descriptor table of `t`.  A thread created with CLONE_FILES shares one
+ * files_struct with the rest of its thread group; every other task owns the
+ * legacy in-task array.  EVERY fd lookup must go through this: the two arrays
+ * used to diverge (flags were read from files->fd_flags while objects came
+ * from the in-task table), which left a freshly cloned thread with an EMPTY
+ * descriptor table — every fd >= 3 answered EBADF and its stdio fell back to
+ * the console, bypassing the process's own redirection. */
+static inline struct vfs_file **task_fds(task_t *t)
+{
+	return t->files ? t->files->fd_table : t->fd_table;
+}
+
 /* Helper: get the fd_flags byte for fd (uses files->fd_flags if shared, else task->fd_flags) */
 static inline uint8_t task_get_fd_flags(task_t *t, unsigned fd)
 {
@@ -593,6 +611,7 @@ void sched_set_init_task(task_t *t);
 // should be hidden from process listings.
 int sched_task_hidden(const task_t *t);
 void sched_signal_pgrp(int pgid, int sig);
+int sched_signal_all(struct task *sender, int sig);
 int sched_pgid_exists(int pgid);
 struct tty; // forward declaration for dump output
 void sched_dump_tasks(struct tty *tty); // Debug: dump all task states

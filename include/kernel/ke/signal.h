@@ -480,6 +480,11 @@ void signal_fork_copy(struct task *child, struct task *parent);
 void signal_cleanup_task(struct task *task);
 int signal_send(struct task *task, int sig, siginfo_t *info);
 int signal_send_group(int pgid, int sig, siginfo_t *info);
+
+/* Record a stop/continue on `task` for waitpid(WUNTRACED/WCONTINUED) and
+ * notify its parent (SIGCHLD + waitpid wakeup).  stopped=1 for a stop by
+ * signal `signum`, 0 for a continue. */
+void signal_notify_jobctl(struct task *task, int signum, int stopped);
 /* May the calling task send `sig` to `target`?  POSIX rule: the privileged
  * caller may signal anyone; otherwise the sender's real or effective uid must
  * match the target's real or saved-set uid (SIGCONT is also allowed within the

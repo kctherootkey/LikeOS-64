@@ -49,6 +49,11 @@ static inline size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *p
     return (*s != '\0') ? 1 : 0;
 }
 
+static inline size_t mbrlen(const char *s, size_t n, mbstate_t *ps)
+{
+    return mbrtowc(0, s, n, ps);
+}
+
 static inline size_t wcrtomb(char *s, wchar_t wc, mbstate_t *ps)
 {
     (void)ps;
@@ -106,6 +111,69 @@ static inline size_t wcslen(const wchar_t *s)
     size_t n = 0;
     while (*s++) n++;
     return n;
+}
+
+static inline wchar_t *wcschr(const wchar_t *s, wchar_t c)
+{
+    for (;; s++) {
+        if (*s == c) return (wchar_t *)s;
+        if (*s == L'\0') return 0;
+    }
+}
+
+static inline wchar_t *wcsrchr(const wchar_t *s, wchar_t c)
+{
+    const wchar_t *last = 0;
+    for (;; s++) {
+        if (*s == c) last = s;
+        if (*s == L'\0') return (wchar_t *)last;
+    }
+}
+
+static inline int wcscmp(const wchar_t *a, const wchar_t *b)
+{
+    while (*a && *a == *b) { a++; b++; }
+    return (*a < *b) ? -1 : (*a > *b) ? 1 : 0;
+}
+
+static inline int wcsncmp(const wchar_t *a, const wchar_t *b, size_t n)
+{
+    for (; n; n--, a++, b++) {
+        if (*a != *b) return (*a < *b) ? -1 : 1;
+        if (*a == L'\0') break;
+    }
+    return 0;
+}
+
+static inline int wcscoll(const wchar_t *a, const wchar_t *b)
+{
+    return wcscmp(a, b);  /* C locale collation */
+}
+
+static inline wchar_t *wcscpy(wchar_t *dest, const wchar_t *src)
+{
+    wchar_t *d = dest;
+    while ((*d++ = *src++) != L'\0')
+        ;
+    return dest;
+}
+
+static inline wchar_t *wmemchr(const wchar_t *s, wchar_t c, size_t n)
+{
+    for (; n; n--, s++)
+        if (*s == c) return (wchar_t *)s;
+    return 0;
+}
+
+static inline int wcswidth(const wchar_t *s, size_t n)
+{
+    int w = 0;
+    for (; n && *s; n--, s++) {
+        int cw = wcwidth(*s);
+        if (cw < 0) return -1;
+        w += cw;
+    }
+    return w;
 }
 
 static inline wchar_t towlower(wchar_t wc)

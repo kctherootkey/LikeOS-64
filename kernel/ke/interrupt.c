@@ -1235,6 +1235,17 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 }
 #endif /* CRASH_VERBOSE */
 
+/* True once `task` is past the point where sched_mark_task_exited() released
+ * its descriptors and its demand-paging region table.  It can still execute a
+ * few instructions before the scheduler takes it off this CPU, and any cold
+ * page it touches then faults with nothing behind it.  Such a fault is our own
+ * teardown catching up with the task, not a defect in the program: it must not
+ * be reported as a crash, and a half-torn-down task must not be signalled. */
+static int task_is_dying(task_t *task)
+{
+	return task && (task->has_exited || task->state == TASK_ZOMBIE);
+}
+
 static void report_userspace_crash(task_t *cur, uint64_t *regs, int signum,
 				   const char *signame, uint64_t cr2,
 				   uint64_t int_no)
@@ -1273,16 +1284,26 @@ static void irqentry_exit(uint64_t *regs, int allow_preempt)
 	// Signal delivery only makes sense when returning to user mode.
 	if (from_user) {
 		task_t *cur = sched_current();
-		if (cur && cur->privilege == TASK_USER && signal_pending(cur)) {
-			signal_deliver_irq(cur, (interrupt_frame_t *)regs);
-			// A fatal default action marked us exited: never IRET to
-			// user as a zombie.  Schedule away for good — actively,
-			// because a passive hlt would rely on a preemption that
-			// may never arrive on an otherwise-idle CPU.
+		if (cur && cur->privilege == TASK_USER) {
+			if (signal_pending(cur))
+				signal_deliver_irq(cur, (interrupt_frame_t *)regs);
+			/* Never IRET to user as a zombie.  The check sits OUTSIDE
+			 * the signal-pending branch on purpose: the task can also
+			 * have been marked exited with nothing left pending — a
+			 * cross-CPU SIGKILL that dequeued the signal already, or a
+			 * fatal default action taken in place.  Once exited its
+			 * descriptors are closed and its demand-paging region
+			 * table is gone, so the next user instruction touching an
+			 * unpaged text page faults with no region behind it.
+			 * Schedule away for good — actively, because a passive
+			 * hlt would rely on a preemption that may never arrive on
+			 * an otherwise-idle CPU.  IRQs stay ENABLED in the retry
+			 * (see sys_exit): halting with IRQs off stops this CPU
+			 * from acking TLB-shootdown IPIs and wedges the others. */
 			if (cur->has_exited || cur->state == TASK_ZOMBIE) {
 				for (;;) {
 					sched_schedule();
-					__asm__ volatile("cli; hlt");
+					__asm__ volatile("sti; hlt");
 				}
 			}
 		}
@@ -1364,9 +1385,15 @@ void exception_handler(uint64_t *regs)
 		if (!user_mode && cr2 < 0x8000000000000000ULL) {
 			task_t *cur = sched_current();
 			if (cur && cur->privilege == TASK_USER) {
-				report_userspace_crash(cur, regs, SIGSEGV,
-						       "SIGSEGV", cr2, 14);
-				sched_signal_task(cur, SIGSEGV);
+				/* Already dead (killed mid-syscall, still
+				 * finishing kernel work): report nothing and
+				 * signal nothing — see task_is_dying. */
+				if (!task_is_dying(cur)) {
+					report_userspace_crash(cur, regs,
+							       SIGSEGV, "SIGSEGV",
+							       cr2, 14);
+					sched_signal_task(cur, SIGSEGV);
+				}
 				// Enable interrupts and halt - timer will preempt us to another task
 				for (;;) {
 					__asm__ volatile("sti; hlt");
@@ -1377,6 +1404,13 @@ void exception_handler(uint64_t *regs)
 
 	if (user_mode) {
 		task_t *cur = sched_current();
+		/* Dead already — our teardown caught up with it mid-instruction
+		 * (see task_is_dying).  No report, no signal on a half-torn-down
+		 * task: just park until the scheduler takes us away. */
+		if (task_is_dying(cur)) {
+			for (;;)
+				__asm__ volatile("sti; hlt");
+		}
 		int fault_sig;
 		const char *fault_name;
 		uint64_t fault_addr = 0;

@@ -693,11 +693,39 @@ void tty_input_char(tty_t *tty, char c, int ctrl)
 	tty_wake_readers(&tty->read_waiters);
 }
 
+/* Background process group access check (POSIX job control).  When a
+ * process whose group is not the terminal's foreground group reads from
+ * the terminal (or writes with TOSTOP set), its whole group gets SIGTTIN/
+ * SIGTTOU - default action: stop - and the call fails with EINTR so it is
+ * retried after SIGCONT.  A process that blocks or ignores the signal
+ * gets EIO for reads and proceeds for writes, per POSIX.  Returns 0 when
+ * access is allowed. */
+static long tty_bg_pgrp_check(tty_t *tty, int sig)
+{
+	task_t *cur = sched_current();
+	/* POSIX scopes this to the CONTROLLING terminal: a process holding an
+	 * fd to some other tty (a pty master, another session's console) must
+	 * never be stopped for using it. */
+	if (!cur || cur->ctty != tty || tty->fg_pgid <= 0 || cur->pgid <= 0 ||
+	    cur->pgid == tty->fg_pgid)
+		return 0;
+	struct k_sigaction *act = &cur->signals.action[sig];
+	if (act->sa_handler == SIG_IGN ||
+	    sigismember_k(&cur->signals.blocked, sig))
+		return (sig == SIGTTIN) ? -EIO : 0;
+	sched_signal_pgrp(cur->pgid, sig);
+	return -EINTR;
+}
+
 long tty_read(tty_t *tty, void *buf, long count, int nonblock)
 {
 	if (!tty || !buf || count <= 0) {
 		return 0;
 	}
+
+	long bg = tty_bg_pgrp_check(tty, SIGTTIN);
+	if (bg < 0)
+		return bg;
 
 	task_t *cur = sched_current();
 	char *out = (char *)buf;
@@ -841,6 +869,13 @@ long tty_write(tty_t *tty, const void *buf, long count)
 {
 	if (!tty || !buf || count <= 0) {
 		return 0;
+	}
+
+	/* Background writes stop the writer only when TOSTOP is set. */
+	if (tty->term.c_lflag & TOSTOP) {
+		long bg = tty_bg_pgrp_check(tty, SIGTTOU);
+		if (bg < 0)
+			return bg;
 	}
 
 	/* PTY slave writes go to a per-pty ring buffer that has its own lock
@@ -1035,6 +1070,16 @@ int tty_ioctl(tty_t *tty, unsigned long req, void *argp, task_t *cur)
 		if (!capable() && cur->sid != (int)cur->id)
 			return -EPERM;
 		cur->ctty = tty;
+		/* Claiming the terminal also makes the claimant's process group
+		 * its FOREGROUND group.  Without this the tty kept whatever
+		 * group happened to open it first — in a pty that is the
+		 * process which called openpty(), not the session that goes on
+		 * to run in it.  A shell starting in a fresh pane then saw
+		 * tcgetpgrp() != getpgrp(), decided it was a background job,
+		 * and tried to stop itself with SIGTTIN until it gave up and
+		 * turned job control off ("no job control in background"). */
+		if (cur->pgid > 0)
+			tty->fg_pgid = cur->pgid;
 		return 0;
 	case TIOCGWINSZ:
 		if (!argp)

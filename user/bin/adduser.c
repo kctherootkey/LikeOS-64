@@ -43,7 +43,7 @@
 #define FIRST_SYS_GID    100
 #define LAST_SYS_GID     999
 #define DEF_HOME         "/home"
-#define DEF_SHELL        "/bin/sh"
+#define DEF_SHELL        "/bin/bash"
 #define NOLOGIN_SHELL    "/usr/sbin/nologin"
 #define DEF_SKEL         "/etc/skel"
 #define DEF_DIR_MODE     0755

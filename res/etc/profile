@@ -1,6 +1,21 @@
-# /etc/profile - system-wide startup for login shells (sourced by /bin/sh
-# when started as a login shell, e.g. "-sh" from /bin/login).
+# /etc/profile - system-wide startup for LOGIN shells.
+#
+# Read by bash when it is started as a login shell (getty -> login -> "-bash"),
+# before the per-user ~/.profile.  A login shell does not read /etc/bash.bashrc
+# by itself, so source it here: the prompt and the other interactive settings
+# then apply to login and non-login shells alike.
 
 export PATH=/bin:/usr/local/bin
 export PAGER=less
 export EDITOR=nano
+
+umask 022
+
+# Interactive shells also get the system-wide interactive configuration.
+case $- in
+	*i*)
+		if [ -r /etc/bash.bashrc ]; then
+			. /etc/bash.bashrc
+		fi
+		;;
+esac

@@ -112,6 +112,38 @@ int chdir(const char *path)
 
 char *getcwd(char *buf, size_t size)
 {
+	/* buf == NULL asks us to allocate (the widely-used extension, and what
+	 * a shell calls: bash uses getcwd(0, 0) for every prompt and after
+	 * every cd).  Passing the NULL straight to the kernel made it fail
+	 * with EFAULT, which surfaced as
+	 *   "shell-init: error retrieving current directory: getcwd: cannot
+	 *    access parent directories: Bad address".
+	 * size == 0 with a buffer means "how big?" and is EINVAL, as specified;
+	 * size == 0 with no buffer means "as large as needed". */
+	if (!buf) {
+		char tmp[PATH_MAX];
+		long r = syscall2(SYS_GETCWD, (long)tmp, sizeof(tmp));
+		if (r < 0) {
+			errno = -r;
+			return NULL;
+		}
+		size_t need = strlen(tmp) + 1;
+		if (size != 0 && need > size) {
+			errno = ERANGE;
+			return NULL;
+		}
+		char *out = malloc(size != 0 ? size : need);
+		if (!out) {
+			errno = ENOMEM;
+			return NULL;
+		}
+		memcpy(out, tmp, need);
+		return out;
+	}
+	if (size == 0) {
+		errno = EINVAL;
+		return NULL;
+	}
 	long ret = syscall2(SYS_GETCWD, (long)buf, size);
 	if (ret < 0) {
 		errno = -ret;
@@ -606,7 +638,9 @@ pid_t waitpid(pid_t pid, int *status, int options)
 {
 	// Kernel handles blocking when WNOHANG is not set
 	// No need for userspace busy-loop - preemptive kernel blocks until child exits
-	long ret = syscall3(SYS_WAIT4, pid, (long)status, options);
+	// The 4th argument MUST be passed explicitly: SYS_WAIT4 treats it as a
+	// `struct rusage *` and writes through it when non-NULL.
+	long ret = syscall4(SYS_WAIT4, pid, (long)status, options, 0);
 	if (ret >= 0) {
 		return ret;
 	}
@@ -755,6 +789,23 @@ int rmdir(const char *path)
 		return -1;
 	}
 	return 0;
+}
+
+/* The kernel has no special-file inodes (FIFOs, device nodes) on disk yet,
+ * so mknod/mkfifo report ENOSYS honestly rather than pretending.  Programs
+ * with a fallback (e.g. process substitution via /dev/fd) take it. */
+int mknod(const char *path, mode_t mode, dev_t dev)
+{
+	(void)path;
+	(void)mode;
+	(void)dev;
+	errno = ENOSYS;
+	return -1;
+}
+
+int mkfifo(const char *path, mode_t mode)
+{
+	return mknod(path, (mode & 07777) | S_IFIFO, 0);
 }
 
 int link(const char *oldpath, const char *newpath)

@@ -12,8 +12,48 @@ static char env_names[MAX_ENV_VARS][MAX_ENV_SIZE];
 static char env_values[MAX_ENV_VARS][MAX_ENV_SIZE];
 static int g_env_count = 0;
 
-/* POSIX environment vector - kept NULL until populated by program startup. */
-char **environ = (char *[]){ (char *)0 };
+/* POSIX environment vector.  The name/value tables above hold the
+ * authoritative copy; this vector is rebuilt from them after every change so
+ * that `environ` always describes the same environment.
+ *
+ * It used to be left as the empty array it is initialised to, for the whole
+ * life of every process: getenv/setenv worked (they read the tables), but
+ * `environ` stayed empty, so every execve(path, argv, environ) started its
+ * child with NO environment at all.  su hands the target user's shell exactly
+ * that, which is why TERM vanished across `su` and tmux then refused to start
+ * ("terminal does not support clear").  Programs that build their own envp
+ * array — login does — were unaffected, which is what made it look like an su
+ * bug. */
+static char *env_vec[MAX_ENV_VARS + 1] = { (char *)0 };
+static char *env_str[MAX_ENV_VARS]; /* "NAME=VALUE" backing for env_vec */
+char **environ = env_vec;
+
+static void env_sync(void)
+{
+	int i;
+	for (i = 0; i < g_env_count; i++) {
+		size_t nlen = strlen(env_names[i]);
+		size_t vlen = strlen(env_values[i]);
+		char *s = realloc(env_str[i], nlen + vlen + 2);
+		if (!s)
+			break; /* out of memory: publish what we have */
+		memcpy(s, env_names[i], nlen);
+		s[nlen] = '=';
+		memcpy(s + nlen + 1, env_values[i], vlen);
+		s[nlen + 1 + vlen] = '\0';
+		env_str[i] = s;
+		env_vec[i] = s;
+	}
+	env_vec[i] = NULL;
+	/* Release the backing strings of entries that no longer exist. */
+	for (int j = i; j < MAX_ENV_VARS; j++) {
+		if (env_str[j]) {
+			free(env_str[j]);
+			env_str[j] = NULL;
+		}
+	}
+	environ = env_vec;
+}
 
 /* atexit / at_quick_exit — simple fixed-size table */
 #define ATEXIT_MAX 32
@@ -460,6 +500,7 @@ int setenv(const char *name, const char *value, int overwrite)
 			if (overwrite) {
 				strncpy(env_values[i], value, MAX_ENV_SIZE - 1);
 				env_values[i][MAX_ENV_SIZE - 1] = '\0';
+				env_sync();
 			}
 			return 0;
 		}
@@ -475,6 +516,7 @@ int setenv(const char *name, const char *value, int overwrite)
 	strncpy(env_values[g_env_count], value, MAX_ENV_SIZE - 1);
 	env_values[g_env_count][MAX_ENV_SIZE - 1] = '\0';
 	g_env_count++;
+	env_sync();
 
 	return 0;
 }
@@ -495,6 +537,7 @@ int unsetenv(const char *name)
 				       env_values[g_env_count - 1]);
 			}
 			g_env_count--;
+			env_sync();
 			return 0;
 		}
 	}
@@ -504,6 +547,7 @@ int unsetenv(const char *name)
 int clearenv(void)
 {
 	g_env_count = 0;
+	env_sync();
 	return 0;
 }
 
@@ -567,6 +611,7 @@ void __libc_init_environ(char **envp)
 		env_values[g_env_count][MAX_ENV_SIZE - 1] = '\0';
 		g_env_count++;
 	}
+	env_sync();
 }
 
 static int normalize_path(const char *in, char *out, size_t out_size)

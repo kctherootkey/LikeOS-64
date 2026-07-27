@@ -17,6 +17,14 @@ typedef uint64_t ino_t;
 typedef uint32_t blksize_t;
 typedef int64_t  blkcnt_t;
 
+/* Signal set type (canonical definition shared with <signal.h>).  Exposed
+ * here too because portable software expects sigset_t after including only
+ * <sys/types.h>. */
+#ifndef __likeos_sigset_t_defined
+#define __likeos_sigset_t_defined
+typedef unsigned long sigset_t;
+#endif
+
 /* Historic 4.4BSD short integer aliases. */
 typedef unsigned char  u_char;
 typedef unsigned short u_short;

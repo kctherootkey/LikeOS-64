@@ -5,7 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-struct linux_dirent64 {
+struct dirent64 {
 	uint64_t d_ino;
 	int64_t d_off;
 	uint16_t d_reclen;
@@ -51,8 +51,8 @@ struct dirent *readdir(DIR *dirp)
 			dirp->buf_len = n;
 			dirp->buf_pos = 0;
 		}
-		struct linux_dirent64 *d =
-			(struct linux_dirent64 *)(dirp->buf + dirp->buf_pos);
+		struct dirent64 *d =
+			(struct dirent64 *)(dirp->buf + dirp->buf_pos);
 		if (d->d_reclen == 0) {
 			return NULL;
 		}

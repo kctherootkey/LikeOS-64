@@ -100,7 +100,7 @@ static short fd_poll_one(int fd, short events)
 	if ((unsigned)fd >= TASK_MAX_FDS)
 		return POLLNVAL;
 
-	void *entry = cur->fd_table[fd];
+	void *entry = task_fds(cur)[fd];
 	if (!entry)
 		return POLLNVAL;
 

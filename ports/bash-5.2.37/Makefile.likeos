@@ -1,0 +1,190 @@
+# Makefile.likeos - Build GNU bash 5.2.37 for LikeOS
+#
+# Follows the nano-8.3 port pattern: compile bash's own sources (readline,
+# history, glob, tilde and lib/sh included) with the LikeOS libc headers and
+# link a PIE against libc.so + ncurses.so (which provides the termcap entry
+# points readline needs).
+#
+# There is no configure run: the generated files (config.h, pathnames.h,
+# version.h, pipesize.h, syntax.c, signames.h, builtins/*.c from *.def) are
+# produced by likeos-generate.sh, which also builds the three build-machine
+# tools it needs into hosttools/.  The build regenerates them automatically
+# when they are missing, so `distclean` can safely delete them.
+
+CC = gcc
+LD = ld
+
+LIBC_DIR    = ../../user/lib/libc
+RTLD_DIR    = ../../user/lib/rtld
+NCURSES_DIR = ../lib/ncurses-likeos
+
+# -MMD -MP emit a .d per object listing the headers it used; they are included
+# at the bottom so editing a header (bash's own or the libc's) rebuilds what
+# depends on it.  Without this, stale objects silently survive header and
+# CFLAGS changes - which has produced both phantom link errors and a shell
+# built without a setting that was already in the Makefile.
+CFLAGS = -O2 -Wall -Wno-parentheses -Wno-format-security -MMD -MP \
+         -nostdlib -fno-builtin -fstack-protector-strong \
+         -mno-red-zone -ffreestanding -fPIE \
+         -DHAVE_CONFIG_H -DSHELL -DLIKEOS \
+         -DSYS_BASHRC='"/etc/bash.bashrc"' \
+         -DSYS_BASH_LOGOUT='"/etc/bash.bash_logout"' \
+         -I. -I./include -I./lib \
+         -I$(LIBC_DIR)/include \
+         -Wno-unused-variable -Wno-unused-but-set-variable \
+         -Wno-maybe-uninitialized -Wno-implicit-fallthrough \
+         -Wno-sign-compare -Wno-unused-parameter -Wno-old-style-definition \
+         -Wno-strict-aliasing -Wno-discarded-qualifiers
+
+# readline is built as part of the shell, with the same config.h
+RL_CFLAGS = $(CFLAGS) -DRL_LIBRARY_VERSION='"8.2"' -I./lib/readline
+
+TOP_OBJ = shell.o eval.o y.tab.o general.o make_cmd.o print_cmd.o \
+	dispose_cmd.o execute_cmd.o variables.o copy_cmd.o error.o \
+	expr.o flags.o jobs.o subst.o hashcmd.o hashlib.o mailcheck.o \
+	trap.o input.o unwind_prot.o pathexp.o sig.o test.o version.o \
+	alias.o array.o arrayfunc.o assoc.o braces.o bracecomp.o \
+	bashhist.o bashline.o list.o stringlib.o locale.o findcmd.o \
+	redir.o pcomplete.o pcomplib.o syntax.o xmalloc.o siglist.o
+
+BUILTINS_OBJ = \
+	builtins/builtins.o builtins/alias.o builtins/bind.o builtins/break.o \
+	builtins/builtin.o builtins/caller.o builtins/cd.o builtins/colon.o \
+	builtins/command.o builtins/common.o builtins/declare.o builtins/echo.o \
+	builtins/enable.o builtins/eval.o builtins/evalfile.o builtins/evalstring.o \
+	builtins/exec.o builtins/exit.o builtins/fc.o builtins/fg_bg.o \
+	builtins/getopt.o builtins/bashgetopt.o builtins/getopts.o builtins/hash.o \
+	builtins/help.o builtins/history.o builtins/jobs.o builtins/kill.o \
+	builtins/let.o builtins/mapfile.o builtins/printf.o builtins/pushd.o \
+	builtins/read.o builtins/return.o builtins/set.o builtins/setattr.o \
+	builtins/shift.o builtins/shopt.o builtins/source.o builtins/suspend.o \
+	builtins/test.o builtins/times.o builtins/trap.o builtins/type.o \
+	builtins/ulimit.o builtins/umask.o builtins/wait.o \
+	builtins/complete.o
+
+GLOB_OBJ = lib/glob/glob.o lib/glob/strmatch.o lib/glob/smatch.o \
+	lib/glob/xmbsrtowcs.o lib/glob/gmisc.o
+
+TILDE_OBJ = lib/tilde/tilde.o
+
+SH_OBJ = lib/sh/clktck.o lib/sh/clock.o lib/sh/getenv.o lib/sh/oslib.o \
+	lib/sh/setlinebuf.o lib/sh/strnlen.o lib/sh/itos.o lib/sh/zread.o \
+	lib/sh/zwrite.o lib/sh/shtty.o lib/sh/shmatch.o lib/sh/eaccess.o \
+	lib/sh/netconn.o lib/sh/netopen.o lib/sh/timeval.o lib/sh/makepath.o \
+	lib/sh/pathcanon.o lib/sh/pathphys.o lib/sh/tmpfile.o \
+	lib/sh/stringlist.o lib/sh/stringvec.o lib/sh/spell.o lib/sh/shquote.o \
+	lib/sh/strtrans.o lib/sh/snprintf.o lib/sh/mailstat.o \
+	lib/sh/fmtulong.o lib/sh/fmtullong.o lib/sh/fmtumax.o \
+	lib/sh/zcatfd.o lib/sh/zmapfd.o lib/sh/winsize.o lib/sh/wcsdup.o \
+	lib/sh/fpurge.o lib/sh/zgetline.o lib/sh/mbscmp.o lib/sh/uconvert.o \
+	lib/sh/ufuncs.o lib/sh/casemod.o lib/sh/input_avail.o \
+	lib/sh/mbscasecmp.o lib/sh/fnxform.o lib/sh/mbschr.o lib/sh/unicode.o \
+	lib/sh/shmbchar.o lib/sh/strvis.o lib/sh/utf8.o lib/sh/random.o \
+	lib/sh/gettimeofday.o lib/sh/timers.o lib/sh/wcsnwidth.o
+
+# Note: emacs_keymap.c/vi_keymap.c are #include'd by keymaps.c, and bash's
+# own xmalloc.o, top-level sh_* glue and lib/tilde replace readline's
+# xmalloc/xfree/shell/tilde objects (upstream resolves this via archive
+# link order; with explicit objects the duplicates must simply be omitted).
+RL_OBJ = lib/readline/readline.o lib/readline/funmap.o lib/readline/keymaps.o \
+	lib/readline/vi_mode.o lib/readline/parens.o lib/readline/rltty.o \
+	lib/readline/complete.o lib/readline/bind.o lib/readline/isearch.o \
+	lib/readline/display.o lib/readline/signals.o \
+	lib/readline/util.o lib/readline/kill.o \
+	lib/readline/undo.o lib/readline/macro.o lib/readline/input.o \
+	lib/readline/callback.o lib/readline/terminal.o \
+	lib/readline/history.o lib/readline/histsearch.o lib/readline/histexpand.o \
+	lib/readline/histfile.o lib/readline/nls.o lib/readline/search.o \
+	lib/readline/savestring.o \
+	lib/readline/text.o lib/readline/misc.o lib/readline/compat.o \
+	lib/readline/colors.o lib/readline/parse-colors.o \
+	lib/readline/mbutil.o
+
+OBJECTS = $(TOP_OBJ) $(BUILTINS_OBJ) $(GLOB_OBJ) $(TILDE_OBJ) $(SH_OBJ) $(RL_OBJ)
+
+LDFLAGS = -pie -nostdlib -T ../../user/bin/user_dyn.lds --hash-style=gnu \
+          -z now \
+          -rpath /lib -dynamic-linker /lib/ld-likeos.so \
+          -L$(LIBC_DIR) -L$(RTLD_DIR) -L$(NCURSES_DIR)
+
+CRT1 = $(LIBC_DIR)/crt1.o
+LIBS = -lc -l:ncurses.so -l:ld-likeos.so
+
+TARGET = bash
+
+# ---------------------------------------------------------------------------
+# Generated sources (see likeos-generate.sh).  A single stamp guards the whole
+# set: every object depends on it, and each generated source names it as a
+# prerequisite with an empty recipe, so a missing file after `distclean`
+# re-runs the generator instead of failing with "no rule to make target".
+# ---------------------------------------------------------------------------
+GEN_STAMP    = .likeos-generated
+BUILTIN_DEFS = $(wildcard builtins/*.def)
+# reserved.def is documentation only - it produces no .c
+GEN_BUILTINS = $(filter-out builtins/reserved.c,$(BUILTIN_DEFS:.def=.c)) \
+               builtins/builtins.c
+GEN_SOURCES  = config.h config-likeos.h pathnames.h version.h pipesize.h \
+               builtins/pipesize.h syntax.c signames.h builtins/builtext.h \
+               $(GEN_BUILTINS)
+
+all: $(TARGET)
+
+$(GEN_STAMP): likeos-generate.sh config.h.in
+	$(SHELL) ./likeos-generate.sh
+	@touch $@
+
+$(GEN_SOURCES): $(GEN_STAMP) ;
+
+# Rebuild everything when the build rules themselves change (CFLAGS edits)
+$(OBJECTS): $(GEN_STAMP) Makefile.likeos
+
+$(TARGET): $(CRT1) $(OBJECTS)
+	$(LD) $(LDFLAGS) $(CRT1) $(OBJECTS) $(LIBS) -o $@
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+builtins/%.o: builtins/%.c
+	$(CC) $(CFLAGS) -I./builtins -c $< -o $@
+
+lib/glob/%.o: lib/glob/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+lib/sh/%.o: lib/sh/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+lib/tilde/%.o: lib/tilde/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+lib/readline/%.o: lib/readline/%.c
+	$(CC) $(RL_CFLAGS) -c $< -o $@
+
+# Re-run the generator explicitly (normally automatic via $(GEN_STAMP))
+generate:
+	$(SHELL) ./likeos-generate.sh
+	@touch $(GEN_STAMP)
+
+# clean: objects, the shell, and the build-machine tools.  The port Makefile
+# tracks no header dependencies, so leaving stale objects behind is a real
+# hazard - remove them all.
+# The second rm sweeps every object in the tree, not just $(OBJECTS): sources
+# that were once compiled and later dropped from the link (readline's xmalloc,
+# shell, tilde and keymap objects, which bash's own definitions replace) would
+# otherwise linger forever.  Comments must stay outside the recipe - make
+# expands and echoes recipe lines, including comments.
+clean:
+	rm -f $(OBJECTS) $(TARGET) err.log
+	rm -f *.o builtins/*.o lib/*/*.o
+	rm -f *.d builtins/*.d lib/*/*.d
+	rm -rf hosttools
+
+# distclean: also drop everything likeos-generate.sh produced, returning the
+# tree to the contents of the upstream tarball plus the port's own files.
+distclean: clean
+	rm -f $(GEN_SOURCES) $(GEN_STAMP)
+
+.PHONY: all clean distclean generate
+
+# Header dependencies recorded by -MMD (absent on the first build, which
+# compiles everything anyway).
+-include $(OBJECTS:.o=.d)

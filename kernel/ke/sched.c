@@ -237,6 +237,11 @@ static void task_close_open_files(task_t *task)
 	if (!task)
 		return;
 	if (task->files) {
+		/* Descriptors live in the shared files_struct and are released
+		 * by the last thread's files_struct_put below.  The in-task
+		 * array was emptied when the table was promoted to shared (see
+		 * the CLONE_FILES path in sys_clone), so this loop normally
+		 * finds nothing — it stays as a belt-and-braces sweep. */
 		for (int i = 0; i < TASK_MAX_FDS; i++) {
 			if (task->fd_table[i]) {
 				uint64_t marker = (uint64_t)task->fd_table[i];
@@ -876,7 +881,7 @@ void sched_init(void)
 
 	// Create BSP idle task
 	sched_add_task(idle_entry, 0, g_idle_stack, sizeof(g_idle_stack));
-	// Name the BSP idle task (Linux-like)
+	// Name the BSP idle task (conventional Unix naming)
 	mm_memcpy(g_idle_task.comm, "kernel idle/0", 14);
 
 	kprintf("Preemptive scheduler initialized (time slice=%d ticks)\n",
@@ -1808,6 +1813,12 @@ task_t *sched_fork_current(void)
 	}
 
 	// Child-specific fields
+	/* A newly forked child has no unreported stop/continue of its own; the
+	 * wholesale copy above duplicated the parent's, which would make the
+	 * parent's next waitpid(WUNTRACED/WCONTINUED) report a freshly forked,
+	 * running child as stopped. */
+	child->jc_stop_signo = 0;
+	child->jc_continued = 0;
 	child->id = sched_alloc_task_id();
 	child->pml4 = child_pml4;
 	child->state = TASK_READY;
@@ -1872,32 +1883,37 @@ task_t *sched_fork_current(void)
 
 	// Duplicate file descriptors
 	for (int i = 0; i < TASK_MAX_FDS; i++) {
-		if (cur->fd_table[i]) {
-			uint64_t marker = (uint64_t)cur->fd_table[i];
+		/* The child owns a private table (child->files was cleared
+		 * above), so take the flags from the parent's EFFECTIVE array:
+		 * once the parent joined a thread group its own fd_flags[] is
+		 * the empty legacy one and the live bits live in ->files. */
+		child->fd_flags[i] = task_get_fd_flags(cur, (unsigned)i);
+		if (task_fds(cur)[i]) {
+			uint64_t marker = (uint64_t)task_fds(cur)[i];
 			if (marker >= 1 && marker <= 3) {
-				child->fd_table[i] = cur->fd_table[i];
-			} else if (IS_SOCKET_FD(cur->fd_table[i])) {
-				int idx = SOCKET_FD_IDX(cur->fd_table[i]);
+				child->fd_table[i] = task_fds(cur)[i];
+			} else if (IS_SOCKET_FD(task_fds(cur)[i])) {
+				int idx = SOCKET_FD_IDX(task_fds(cur)[i]);
 				net_socket_t *s = sock_get(idx);
 				if (s)
 					__atomic_fetch_add(&s->ref_count, 1,
 							   __ATOMIC_ACQ_REL);
-				child->fd_table[i] = cur->fd_table[i];
-			} else if (IS_UNIX_SOCKET_FD(cur->fd_table[i])) {
+				child->fd_table[i] = task_fds(cur)[i];
+			} else if (IS_UNIX_SOCKET_FD(task_fds(cur)[i])) {
 				unix_socket_t *us = unix_get(
-					(int)(uintptr_t)cur->fd_table[i]);
+					(int)(uintptr_t)task_fds(cur)[i]);
 				if (us)
 					__atomic_fetch_add(&us->ref_count, 1,
 							   __ATOMIC_ACQ_REL);
-				child->fd_table[i] = cur->fd_table[i];
-			} else if (IS_EPOLL_FD(cur->fd_table[i])) {
-				child->fd_table[i] = cur->fd_table[i];
-			} else if (pipe_is_end(cur->fd_table[i])) {
+				child->fd_table[i] = task_fds(cur)[i];
+			} else if (IS_EPOLL_FD(task_fds(cur)[i])) {
+				child->fd_table[i] = task_fds(cur)[i];
+			} else if (pipe_is_end(task_fds(cur)[i])) {
 				pipe_end_t *new_end = pipe_dup_end(
-					(pipe_end_t *)cur->fd_table[i]);
+					(pipe_end_t *)task_fds(cur)[i]);
 				child->fd_table[i] = (vfs_file_t *)new_end;
 			} else {
-				child->fd_table[i] = vfs_dup(cur->fd_table[i]);
+				child->fd_table[i] = vfs_dup(task_fds(cur)[i]);
 			}
 		} else {
 			child->fd_table[i] = NULL;
@@ -2347,6 +2363,7 @@ void sched_signal_task(task_t *task, int sig)
 		if (task->on_rq)
 			rq_remove(task);
 		task->state = TASK_STOPPED;
+		signal_notify_jobctl(task, sig, 1);
 		signal_send(task, sig, &info);
 		if (task == sched_current())
 			sched_schedule();
@@ -2354,8 +2371,10 @@ void sched_signal_task(task_t *task, int sig)
 	}
 
 	if (sig == SIGCONT) {
-		if (sched_claim_wake(task, TASK_STOPPED))
+		if (sched_claim_wake(task, TASK_STOPPED)) {
 			sched_enqueue_ready(task);
+			signal_notify_jobctl(task, sig, 0);
+		}
 		signal_send(task, sig, &info);
 		return;
 	}
@@ -2366,6 +2385,13 @@ void sched_signal_task(task_t *task, int sig)
 			if (task->on_rq)
 				rq_remove(task);
 			task->state = TASK_STOPPED;
+			/* Record the stop for job control exactly as the
+			 * SIGSTOP path does.  Stopping here without it left
+			 * jc_stop_signo clear, so waitpid(WUNTRACED) had
+			 * nothing to report and the parent blocked forever on
+			 * a child that really had stopped — SIGSTOP worked,
+			 * the tty stop signals did not. */
+			signal_notify_jobctl(task, sig, 1);
 			signal_send(task, sig, &info);
 			if (task == sched_current())
 				sched_schedule();
@@ -2452,6 +2478,37 @@ void sched_signal_task(task_t *task, int sig)
 			sched_enqueue_ready(task);
 		break;
 	}
+}
+
+/* kill(-1, sig): every process the caller is allowed to signal, except itself,
+ * init and the kernel's own threads.  Returns 0 if at least one target was
+ * signalled, -ESRCH if there were none. */
+int sched_signal_all(task_t *sender, int sig)
+{
+	uint64_t flags;
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+#define MAX_BROADCAST_TARGETS 64
+	task_t *targets[MAX_BROADCAST_TARGETS];
+	int count = 0;
+	for (task_t *t = g_task_list_head; t && count < MAX_BROADCAST_TARGETS;
+	     t = t->next) {
+		if (t == sender || t == g_init_task)
+			continue;
+		if (t->state == TASK_ZOMBIE || t->privilege == TASK_KERNEL)
+			continue;
+		targets[count++] = t;
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+	int delivered = 0;
+	for (int i = 0; i < count; i++) {
+		/* Same credential rule as a targeted kill; a process we may not
+		 * signal is skipped rather than failing the whole call. */
+		if (signal_permission(targets[i], sig) != 0)
+			continue;
+		sched_signal_task(targets[i], sig);
+		delivered++;
+	}
+	return delivered ? 0 : -ESRCH;
 }
 
 void sched_signal_pgrp(int pgid, int sig)
@@ -2978,7 +3035,7 @@ void sched_init_ap(uint32_t cpu_id)
      * holds the random per-task value). */
 	idle->stack_canary = cpu->stack_canary;
 	idle->on_cpu = cpu_id;
-	// Name the AP idle task (Linux-like: kernel idle/N)
+	// Name the AP idle task (conventional Unix naming: kernel idle/N)
 	{
 		char name[32] = "kernel idle/";
 		int pos = 12; /* length of "kernel idle/" */
@@ -3398,6 +3455,12 @@ files_struct_t *files_struct_create(void)
 
 	for (int i = 0; i < TASK_MAX_FDS; i++) {
 		files->fd_table[i] = NULL;
+		/* kalloc does not guarantee zeroed memory (the slab's large
+		 * path poisons instead of zeroing in DEBUG builds), and these
+		 * bytes become the process's close-on-exec state the instant
+		 * ->files is installed — uninitialised here meant exec closed
+		 * an arbitrary subset of the caller's descriptors. */
+		files->fd_flags[i] = 0;
 	}
 
 	return files;

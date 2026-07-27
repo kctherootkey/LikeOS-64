@@ -292,7 +292,7 @@ LINUX_USB_IMAGE = $(LINUX_USB_BUILD_DIR)/linux-usb.img
 #   ROOT_LIBS         -> /lib/<name>
 #   ROOT_USRLOCAL_BINS-> /usr/local/bin/<name> (a few are renamed; see recipe)
 # ---------------------------------------------------------------------------
-ROOT_BIN_PROGS = sh ls cat pwd stat uname shutdown poweroff reboot halt ps cp mv rm \
+ROOT_BIN_PROGS = bash ls cat pwd stat uname shutdown poweroff reboot halt ps cp mv rm \
 	mkdir rmdir ln chmod readlink touch more less clear env kill find df du hexdump \
 	sleep strings file grep wc head tail echo printf free uptime dmesg which date time \
 	sort uniq cut tr yes true false top man hostname ping ifconfig netstat route arp \
@@ -644,11 +644,6 @@ $(BUILD_DIR)/ext4test: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/hello: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) hello
 	cp $(USER_DIR)/hello $@
-	$(STRIP) --strip-unneeded $@
-
-$(BUILD_DIR)/sh: userland-libc userland-rtld | $(BUILD_DIR)
-	$(MAKE) -C $(USER_DIR) sh
-	cp $(USER_DIR)/sh $@
 	$(STRIP) --strip-unneeded $@
 
 # Login stack: login authenticates via libpam/libcrypt; getty+init use libc only.
@@ -1098,6 +1093,15 @@ $(BUILD_DIR)/nano: ports-nano | $(BUILD_DIR)
 	cp ports/nano-8.3/nano $@
 	$(STRIP) --strip-unneeded $@
 
+# --- GNU bash ---------------------------------------------------------------
+.PHONY: ports-bash
+ports-bash: userland-libc userland-rtld ports-ncurses
+	$(MAKE) -C ports/bash-5.2.37 -f Makefile.likeos
+
+$(BUILD_DIR)/bash: ports-bash | $(BUILD_DIR)
+	cp ports/bash-5.2.37/bash $@
+	$(STRIP) --strip-unneeded $@
+
 # Build libevent (shared library used by tmux)
 .PHONY: ports-libevent
 ports-libevent: userland-libc userland-rtld
@@ -1221,6 +1225,9 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp $(KERNEL_ELF) $(EXT4_STAGING)/boot/kernel.elf
 	# Userland programs -> /bin
 	for p in $(ROOT_BIN_PROGS); do cp $(BUILD_DIR)/$$p $(EXT4_STAGING)/bin/$$p; done
+	# /bin/sh is GNU bash (bash runs in POSIX-ish sh mode when invoked
+	# as "sh"); the ext4 resolver follows the symlink for exec/open.
+	ln -sfn bash $(EXT4_STAGING)/bin/sh
 	# System programs (init, getty) -> /sbin
 	for p in $(ROOT_SBIN_PROGS); do cp $(BUILD_DIR)/$$p $(EXT4_STAGING)/sbin/$$p; done
 	# setuid-root helpers: passwd (write /etc/shadow) and su (switch user).
@@ -1250,10 +1257,15 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# Shebang smoke-test script (mode 755 propagates via fakeroot mkfs -d)
 	cp user/bin/tests/scripttest.sh $(EXT4_STAGING)/usr/local/bin/scripttest.sh
 	chmod 755 $(EXT4_STAGING)/usr/local/bin/scripttest.sh
+	# bash language/builtin test suite (run: testbash.sh)
+	cp user/bin/tests/testbash.sh $(EXT4_STAGING)/usr/local/bin/testbash.sh
+	chmod 755 $(EXT4_STAGING)/usr/local/bin/testbash.sh
 	# Resources, manpages, config
 	cp res/Lat15-Fixed16.psf $(EXT4_STAGING)/res/Lat15-Fixed16.psf
 	cp res/left_ptr          $(EXT4_STAGING)/res/left_ptr
 	cp res/man/*.1           $(EXT4_STAGING)/usr/share/man/man1/
+	# "man sh" shows the bash page: sh IS bash now (see /bin/sh symlink)
+	ln -sfn bash.1 $(EXT4_STAGING)/usr/share/man/man1/sh.1
 	cp ports/nano-8.3/syntax/*.nanorc $(EXT4_STAGING)/usr/share/nano/
 	cp /etc/services         $(EXT4_STAGING)/etc/services
 	cp res/etc/hosts         $(EXT4_STAGING)/etc/hosts
@@ -1265,9 +1277,17 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp res/etc/shadow        $(EXT4_STAGING)/etc/shadow
 	chmod 0644 $(EXT4_STAGING)/etc/passwd $(EXT4_STAGING)/etc/group
 	chmod 0600 $(EXT4_STAGING)/etc/shadow
-	# Login-shell startup files (sourced by sh when started as "-sh")
+	# Shell startup files.  /etc/profile runs for login shells and sources
+	# /etc/bash.bashrc; bash reads /etc/bash.bashrc directly for interactive
+	# non-login shells (built with SYS_BASHRC).  /etc/skel is copied into
+	# each new home by adduser, so new users get the same prompt.
 	cp res/etc/profile       $(EXT4_STAGING)/etc/profile
+	cp res/etc/bash.bashrc   $(EXT4_STAGING)/etc/bash.bashrc
 	cp res/etc/root.profile  $(EXT4_STAGING)/root/.profile
+	cp res/etc/root.bashrc   $(EXT4_STAGING)/root/.bashrc
+	mkdir -p $(EXT4_STAGING)/etc/skel
+	cp res/etc/skel/.profile $(EXT4_STAGING)/etc/skel/.profile
+	cp res/etc/skel/.bashrc  $(EXT4_STAGING)/etc/skel/.bashrc
 	chmod 0700 $(EXT4_STAGING)/root
 	# World-writable + sticky /tmp (1777, like every Unix): lets any user create
 	# their own /tmp/tmux-<uid> socket dir (tmux then makes it 0700); the sticky
@@ -1500,10 +1520,21 @@ distclean: clean
 	$(MAKE) -C ports/lib/zlib-1.3.1 -f Makefile.likeos clean
 	$(MAKE) -C ports/lib/nghttp2-1.65.0 -f Makefile.likeos clean
 	$(MAKE) -C ports/nano-8.3 -f Makefile.likeos clean
+	$(MAKE) -C ports/bash-5.2.37 -f Makefile.likeos distclean
 	$(MAKE) -C ports/tmux-3.6a -f Makefile.likeos clean
 	$(MAKE) -C ports/netcat-OpenBSD -f Makefile.likeos clean
 	$(MAKE) -C ports/openssl-3.5.6 -f Makefile.likeos clean
 	$(MAKE) -C ports/curl-8.14.1 -f Makefile.likeos clean
+
+# Regenerate res/man/bash.1 from the port's troff source.  man(1) reads
+# PRE-FORMATTED (catman) text, not troff, so the upstream doc/bash.1 has to be
+# rendered to 78-column plain text first.  Deliberately NOT part of the normal
+# build: the rendered page is checked in, and groff is not a build dependency.
+.PHONY: bash-manpage
+bash-manpage:
+	GROFF_NO_SGR=1 groff -t -e -mandoc -Tascii -rLL=78n -rLT=78n \
+		ports/bash-5.2.37/doc/bash.1 | col -bx > res/man/bash.1
+	@echo "res/man/bash.1 regenerated ($$(wc -l < res/man/bash.1) lines)"
 
 # Install dependencies (Ubuntu/Debian)
 deps:
@@ -1531,6 +1562,7 @@ help:
 	@echo "  usb-write  - dd the ext4 GPT USB disk to a real device (requires USB_DEVICE=/dev/sdX)"
 	@echo "  linux-usb  - Build Debian-based host USB image that auto-launches LikeOS via QEMU/KVM"
 	@echo "  linux-usb-write - Write the host Linux image to USB (requires USB_DEVICE=/dev/sdX)"
+	@echo "  bash-manpage - Re-render res/man/bash.1 from the bash port's troff source (needs groff)"
 	@echo "  clean      - Clean build files (ports are preserved for fast incremental rebuild)"
 	@echo "  distclean  - Clean everything including ports (full rebuild next time)"
 	@echo "  deps       - Install build dependencies"

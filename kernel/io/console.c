@@ -1735,6 +1735,15 @@ static void console_putchar_unlocked(char c)
 		}
 		return;
 	}
+	/* Unhandled C0 control characters and DEL are NOT glyphs.  A terminal
+     * ignores the ones it does not act on; drawing them paints whatever the
+     * font happens to hold at that code point.  Lat15-Fixed16 glyph 0x07 is
+     * a full-width bar, so readline's bell — rung on every backspace at an
+     * empty prompt — printed a stray dash per keypress.
+     * (\n, \r, \t and \b are handled above and never reach here.) */
+	if ((unsigned char)c < 0x20 || (unsigned char)c == 0x7F)
+		return;
+
 	// Normal printable character
 	sb_append_char(c);
 	if (g_sb.at_bottom) {

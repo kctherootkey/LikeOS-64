@@ -1843,9 +1843,157 @@ bool wenclose(const WINDOW *win, int y, int x)
             x >= win->_begx && x < win->_begx + win->_maxx + 1);
 }
 
+/* ===================================================================
+ * termcap emulation (readline and other termcap clients)
+ *
+ * The console is an ANSI terminal (the kernel VT implements the full
+ * CSI cursor/edit set), so instead of reading /etc/termcap this shim
+ * serves a built-in capability table matching that terminal.  String
+ * capabilities are in termcap notation; tgoto() expands the cursor
+ * motion string.
+ * =================================================================== */
+
+/* termcap global variables (some clients read/set these directly) */
+char *UP = (char *)"\033[A";
+char *BC = (char *)"\b";
+char PC = '\0';
+short ospeed = 0;
+
+static const struct { const char *id; const char *value; } _tc_strings[] = {
+    { "cm", "\033[%i%d;%dH" },  /* cursor motion */
+    { "ho", "\033[H"    },      /* home */
+    { "cl", "\033[H\033[J" },   /* clear screen */
+    { "ce", "\033[K"    },      /* clear to end of line */
+    { "cd", "\033[J"    },      /* clear to end of display */
+    { "up", "\033[A"    },      /* cursor up */
+    { "do", "\033[B"    },      /* cursor down */
+    { "nd", "\033[C"    },      /* cursor right (non-destructive) */
+    { "le", "\b"        },      /* cursor left */
+    { "cr", "\r"        },      /* carriage return */
+    { "ta", "\t"        },      /* tab */
+    { "bl", "\a"        },      /* bell */
+    { "dc", "\033[P"    },      /* delete character */
+    { "DC", "\033[%dP"  },      /* delete N characters */
+    { "ic", "\033[@"    },      /* insert character */
+    { "IC", "\033[%d@"  },      /* insert N characters */
+    { "im", ""          },      /* enter insert mode (no-op) */
+    { "ei", ""          },      /* exit insert mode (no-op) */
+    { "al", "\033[L"    },      /* insert line */
+    { "dl", "\033[M"    },      /* delete line */
+    { "so", "\033[7m"   },      /* standout */
+    { "se", "\033[m"    },      /* standout end */
+    { "us", "\033[4m"   },      /* underline */
+    { "ue", "\033[m"    },      /* underline end */
+    { "md", "\033[1m"   },      /* bold */
+    { "mr", "\033[7m"   },      /* reverse */
+    { "me", "\033[m"    },      /* all attributes off */
+    { "ku", "\033[A"    },      /* arrow keys */
+    { "kd", "\033[B"    },
+    { "kr", "\033[C"    },
+    { "kl", "\033[D"    },
+    { "kh", "\033[H"    },      /* home key */
+    { "@7", "\033[F"    },      /* end key */
+    { "kD", "\033[3~"   },      /* delete key */
+    { "kI", "\033[2~"   },      /* insert key */
+    { "kP", "\033[5~"   },      /* page up */
+    { "kN", "\033[6~"   },      /* page down */
+    { 0, 0 }
+};
+
+int tgetent(char *bp, const char *name)
+{
+    (void)bp;
+    (void)name;   /* every LikeOS terminal is the ANSI console */
+    return 1;
+}
+
 char *tgetstr(const char *id, char **area)
 {
-    (void)id;
-    (void)area;
+    for (int i = 0; _tc_strings[i].id; i++) {
+        if (id && id[0] == _tc_strings[i].id[0] && id[1] == _tc_strings[i].id[1]) {
+            const char *v = _tc_strings[i].value;
+            if (!area || !*area)
+                return (char *)v;
+            char *r = *area;
+            size_t len = strlen(v) + 1;
+            memcpy(r, v, len);
+            *area += len;
+            return r;
+        }
+    }
     return (char *)0; /* not found */
+}
+
+int tgetnum(const char *id)
+{
+    struct winsize ws;
+    if (id && id[0] == 'c' && id[1] == 'o') {
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+            return ws.ws_col;
+        return 80;
+    }
+    if (id && id[0] == 'l' && id[1] == 'i') {
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
+            return ws.ws_row;
+        return 25;
+    }
+    return -1;
+}
+
+int tgetflag(const char *id)
+{
+    if (!id) return 0;
+    if (id[0] == 'a' && id[1] == 'm') return 1;  /* automatic margins */
+    if (id[0] == 'b' && id[1] == 's') return 1;  /* backspace with \b */
+    if (id[0] == 'x' && id[1] == 'n') return 1;  /* newline glitch at margin */
+    if (id[0] == 'p' && id[1] == 't') return 1;  /* hardware tabs */
+    return 0;
+}
+
+/* Expand a termcap cursor-motion string: handles %i, %d, %2d/%3d, %., %+x
+ * and %% (the forms the built-in table and common clients use). */
+char *tgoto(const char *cap, int col, int row)
+{
+    static char buf[64];
+    if (!cap) return (char *)0;
+    int params[2] = { row, col };  /* termcap order: row first */
+    int pi = 0, bi = 0, incr = 0;
+    for (const char *s = cap; *s && bi < (int)sizeof(buf) - 8; s++) {
+        if (*s != '%') {
+            buf[bi++] = *s;
+            continue;
+        }
+        s++;
+        switch (*s) {
+        case 'i': incr = 1; break;
+        case 'd': {
+            int v = (pi < 2 ? params[pi++] : 0) + incr;
+            bi += snprintf(buf + bi, sizeof(buf) - bi, "%d", v);
+            break;
+        }
+        case '2': case '3':
+            if (s[1] == 'd') {
+                int v = (pi < 2 ? params[pi++] : 0) + incr;
+                bi += snprintf(buf + bi, sizeof(buf) - bi,
+                               (*s == '2') ? "%02d" : "%03d", v);
+                s++;
+            }
+            break;
+        case '.': {
+            int v = (pi < 2 ? params[pi++] : 0) + incr;
+            buf[bi++] = (char)v;
+            break;
+        }
+        case '+': {
+            s++;
+            int v = (pi < 2 ? params[pi++] : 0) + incr + *s;
+            buf[bi++] = (char)v;
+            break;
+        }
+        case '%': buf[bi++] = '%'; break;
+        default: break;
+        }
+    }
+    buf[bi] = '\0';
+    return buf;
 }

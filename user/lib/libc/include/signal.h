@@ -12,8 +12,12 @@ typedef volatile int sig_atomic_t;
 typedef void (*sighandler_t)(int);
 typedef void (*__sighandler_t)(int);
 
-// sigset_t - 64-bit set for signals 1-64
+// sigset_t - 64-bit set for signals 1-64 (also exposed by <sys/types.h>,
+// as POSIX allows; the guard keeps the two definitions from clashing)
+#ifndef __likeos_sigset_t_defined
+#define __likeos_sigset_t_defined
 typedef unsigned long sigset_t;
+#endif
 
 #define SIG_DFL ((sighandler_t)0)
 #define SIG_IGN ((sighandler_t)1)

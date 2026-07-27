@@ -7,14 +7,19 @@
 // Options for waitpid
 #define WNOHANG     1   // Don't block
 #define WUNTRACED   2   // Also wait for stopped children
+#define WCONTINUED  8   // Also wait for SIGCONT-resumed children
+#define WSTOPPED    WUNTRACED
 
 // Macros to interpret status
 #define WIFEXITED(status)    (((status) & 0x7f) == 0)
 #define WEXITSTATUS(status)  (((status) >> 8) & 0xff)
-#define WIFSIGNALED(status)  (((status) & 0x7f) != 0)
+/* Terminated by a signal: low 7 bits are the signal, but 0 means normal
+ * exit and 0x7f means stopped - both must test false here. */
+#define WIFSIGNALED(status)  (((status) & 0x7f) != 0 && ((status) & 0x7f) != 0x7f)
 #define WTERMSIG(status)     ((status) & 0x7f)
 #define WIFSTOPPED(status)   (((status) & 0xff) == 0x7f)
 #define WSTOPSIG(status)     (((status) >> 8) & 0xff)
+#define WIFCONTINUED(status) ((status) == 0xffff)
 
 /* Resource usage (subset used by wait4/getrusage) */
 struct rusage {

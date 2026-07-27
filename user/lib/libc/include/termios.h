@@ -78,6 +78,15 @@ typedef unsigned int speed_t;
 #define VSUSP   7
 #define VMIN    8
 #define VTIME   9
+/* POSIX/conventional control characters the line discipline does not act on
+ * yet; programs (readline, etc.) still save/restore these slots.  All fit
+ * within NCCS (16), so the kernel/libc termios ABI is unchanged. */
+#define VEOL      10
+#define VREPRINT  11
+#define VDISCARD  12
+#define VWERASE   13
+#define VLNEXT    14
+#define VEOL2     15
 
 struct termios {
     tcflag_t c_iflag;

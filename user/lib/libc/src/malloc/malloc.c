@@ -1381,7 +1381,14 @@ static void _int_free(struct malloc_state *av, mchunkptr p, int have_lock)
         if (!have_lock)
             mlock_lock(&av->mutex);
 
-        size_t nextsz = chunksize(chunk_at_offset(p, size));
+        /* Same rule as the normal path below: bound the next chunk before
+         * reading its header.  `size` is small here (it indexed a fast bin),
+         * but `p` itself may point anywhere the caller pleases. */
+        mchunkptr nextp = chunk_at_offset(p, size);
+        if (av == &main_arena && !(av->flags & ARENA_NONCONTIGUOUS) &&
+            av->top && (char *)nextp > (char *)av->top)
+            malloc_printerr("double free or corruption (out, fast)", p);
+        size_t nextsz = chunksize(nextp);
         if (nextsz <= CHUNK_HDR_SZ || nextsz > av->system_mem)
             malloc_printerr("free(): invalid next size (fast)", p);
 
@@ -1403,8 +1410,15 @@ static void _int_free(struct malloc_state *av, mchunkptr p, int have_lock)
         mlock_lock(&av->mutex);
 
     mchunkptr nextchunk = chunk_at_offset(p, size);
-    size_t nextsize = chunksize(nextchunk);
 
+    /* Every check below that can be made WITHOUT touching nextchunk comes
+     * first, because `size` is attacker/bug-controlled: it is read out of the
+     * chunk header the caller handed us.  Reading nextchunk's header before
+     * bounding it turned a bad free() into a fault instead of a diagnosis —
+     * free(&stack_variable) produced a wild size, and the header read at
+     * p + size hit a non-canonical address and raised #GP inside free().
+     * Only the pointer comparisons are safe to do first; they dereference
+     * nothing but av->top, which is ours. */
     if (p == av->top)
         malloc_printerr("double free or corruption (top)", p);
     if (av == &main_arena && !(av->flags & ARENA_NONCONTIGUOUS) && av->top &&
@@ -1412,6 +1426,8 @@ static void _int_free(struct malloc_state *av, mchunkptr p, int have_lock)
         malloc_printerr("double free or corruption (out)", p);
     if (!inuse_bit_at_offset(p, size))
         malloc_printerr("double free or corruption (!prev)", p);
+
+    size_t nextsize = chunksize(nextchunk);
     if (nextsize <= CHUNK_HDR_SZ || nextsize > av->system_mem)
         malloc_printerr("free(): invalid next size (normal)", p);
 
