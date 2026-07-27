@@ -8,6 +8,7 @@
 #include <kernel/fs/vfs.h>
 #include <kernel/uapi/status.h>
 #include <kernel/ke/elf.h>
+#include <kernel/ke/script_loader.h>
 #include <kernel/ke/pipe.h>
 #include <kernel/ke/timer.h>
 #include <kernel/uapi/stat.h>
@@ -23,6 +24,7 @@
 #include <kernel/hal/acpi.h>
 #include <kernel/fs/pagecache.h>
 #include <kernel/fs/icache.h>
+#include <kernel/fs/dcache.h>
 #include <kernel/net/net.h>
 #include <kernel/hal/lapic.h>
 #include <kernel/dev/rand/random.h>
@@ -3838,6 +3840,26 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 
 // SYS_EXECVE - execute a new program, replacing current process image
 // This is the POSIX-compliant version that replaces the current task
+/* Per-exec-level DAC screen: stat the target (also needed later for set-id
+ * application) and, for a non-root caller, require search on every ancestor
+ * directory plus execute on the file itself.  Permissive if it can't be
+ * stat'd (e.g. a relative path elf_exec_replace resolves itself).  Run once
+ * for the exec target and once per shebang interpreter level. */
+static int execve_check_exec(const char *kpath, struct kstat *xst,
+			     int *have_xst)
+{
+	*have_xst = (vfs_stat(kpath, xst) == ST_OK);
+	task_t *cur = sched_current();
+	if (cur && cur->cred.euid != 0) {
+		int pr = perm_traverse(kpath); /* search on ancestor dirs */
+		if (pr == 0 && *have_xst) /* + execute on the file itself */
+			pr = perm_access(cur, kpath, xst, MAY_EXEC, 0);
+		if (pr < 0)
+			return pr;
+	}
+	return 0;
+}
+
 static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 			  uint64_t envp_ptr)
 {
@@ -3871,29 +3893,32 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 		return ret;
 	}
 
-	/* Stat the target up front, so we can (a) deny exec to a non-root
-     * caller without execute permission BEFORE the image is replaced (after
-     * which an error can no longer be returned), and (b) apply set-user/
-     * set-group-ID after a successful exec.  Permissive if it can't be stat'd
-     * (e.g. a relative path elf_exec_replace resolves itself). */
+	/* Exec-permission screen + shebang (#!) resolution.  Each iteration
+	 * checks DAC on the current target (denying BEFORE the image is
+	 * replaced, after which an error can no longer be returned) and then
+	 * asks the script loader to rewrite path/argv one interpreter level.
+	 * The loop ends at the first non-script target; xst then describes
+	 * the FINAL binary, so set-id bits on scripts are naturally ignored
+	 * while an interpreter's own set-id bits still apply.  kenvp is never
+	 * touched: the environment passes through unchanged. */
 	struct kstat xst;
-	int have_xst = (vfs_stat(kpath, &xst) == ST_OK);
-	{
-		task_t *cur = sched_current();
-		if (cur && cur->cred.euid != 0) {
-			int pr = perm_traverse(
-				kpath); /* search on every ancestor dir */
-			if (pr == 0 &&
-			    have_xst) /* + execute on the binary itself */
-				pr = perm_access(cur, kpath, &xst, MAY_EXEC, 0);
-			if (pr < 0) {
-				free_user_string_array(kenvp);
-				free_user_string_array(kargv);
-				kfree(kpath);
-				return pr;
-			}
+	int have_xst = 0;
+	for (int depth = 0;; depth++) {
+		ret = execve_check_exec(kpath, &xst, &have_xst);
+		if (ret < 0)
+			goto out_err;
+		int sr = script_load_rewrite(&kpath, &kargv, depth);
+		if (sr == 0)
+			break; /* not a script: kpath is the final binary */
+		if (sr < 0) {
+			ret = sr;
+			goto out_err;
 		}
+		/* sr == 1: kpath now names the interpreter; re-check it */
 	}
+	ret = script_check_stack_fit(kargv, kenvp);
+	if (ret < 0)
+		goto out_err;
 
 	uint64_t new_stack_ptr = 0;
 	uint64_t entry_point =
@@ -3901,10 +3926,8 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 
 	if (entry_point == 0) {
 		// exec failed, return error to caller
-		free_user_string_array(kenvp);
-		free_user_string_array(kargv);
-		kfree(kpath);
-		return -ENOEXEC;
+		ret = -ENOEXEC;
+		goto out_err;
 	}
 
 	/* POSIX: a successful exec resets caught signal handlers to their
@@ -4019,6 +4042,12 @@ static int64_t sys_execve(uint64_t pathname, uint64_t argv_ptr,
 
 	// Should never reach here
 	__builtin_unreachable();
+
+out_err:
+	free_user_string_array(kenvp);
+	free_user_string_array(kargv);
+	kfree(kpath);
+	return ret;
 }
 
 // SYS_GETPPID - get parent process ID
@@ -6294,16 +6323,22 @@ static int64_t sys_sysinfo(uint64_t info_ptr)
 	mm_get_memory_stats(&mstats);
 	info.totalram = mstats.total_memory;
 	info.freeram = mstats.free_memory;
-	info.sharedram = mstats.heap_allocated; // kernel heap as shared
-	info.bufferram = 0; // no buffer cache
+	info.sharedram = 0; // no tmpfs/shm accounting
+	/* buff/cache, matching what free(1)/top expect the fields to mean:
+	 *   bufferram — block/metadata buffers filesystem drivers reported
+	 *               via mm_buffercache_account()
+	 *   cached    — page cache plus the reclaimable entry caches
+	 *               (inode + dentry caches, both LRU-evictable) */
+	info.bufferram = mm_buffercache_bytes();
 	info.totalswap = 0;
 	info.freeswap = 0;
 	info.procs = (unsigned short)sched_get_nr_procs();
 	info.totalhigh = 0;
 	info.freehigh = 0;
 	info.mem_unit = 1; // byte granularity
-	info.cached = mstats.heap_allocated;
-	info.available = mstats.free_memory;
+	info.cached = mstats.pagecache_pages * PAGE_SIZE +
+		      icache_mem_bytes() + dcache_mem_bytes();
+	info.available = info.freeram + info.bufferram + info.cached;
 
 	if (copy_to_user((void *)info_ptr, &info, sizeof(info)) != 0)
 		return -EFAULT;

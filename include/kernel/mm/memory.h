@@ -287,6 +287,13 @@ void kfree_dma(void *ptr);
 
 // Memory utilities
 void mm_get_memory_stats(memory_stats_t *stats);
+
+/* Block/metadata buffer-cache accounting.  Filesystem drivers report the
+ * bytes they hold in reclaimable block buffers (e.g. metadata block caches)
+ * so sysinfo can surface them as "buffers" without mm or the syscall layer
+ * knowing any filesystem specifics. */
+void mm_buffercache_account(long delta);
+uint64_t mm_buffercache_bytes(void);
 void mm_print_memory_stats(void);
 void mm_print_heap_stats(void);
 bool mm_validate_heap(void);

@@ -528,16 +528,24 @@ int sock_sendto(int sockfd, const void *buf, size_t len, int flags,
 			dev = net_get_default_device();
 		if (!dev)
 			return -ENETDOWN;
+		// buf is user memory read directly by the send path (SMAP)
+		int rret;
 		if (s->ip_hdrincl) {
 			// Caller-supplied IP header — forward as-is via raw L3 send hook
 			extern int ipv4_send_raw(net_device_t *, uint32_t,
 						 const uint8_t *, uint16_t);
-			return ipv4_send_raw(dev, dst_ip, (const uint8_t *)buf,
+			smap_disable();
+			rret = ipv4_send_raw(dev, dst_ip, (const uint8_t *)buf,
 					     (uint16_t)len);
+			smap_enable();
+			return rret;
 		}
-		return ipv4_send_full(dev, dst_ip, (uint8_t)s->protocol,
+		smap_disable();
+		rret = ipv4_send_full(dev, dst_ip, (uint8_t)s->protocol,
 				      (const uint8_t *)buf, (uint16_t)len,
 				      s->ip_ttl ? s->ip_ttl : 64, s->ip_tos);
+		smap_enable();
+		return rret;
 	}
 
 	if (s->type == SOCK_DGRAM) {

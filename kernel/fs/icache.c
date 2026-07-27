@@ -38,6 +38,18 @@ static ic_bucket_t ic_hash[IC_HASH_BUCKETS];
 static ic_inode_t ic_lru_sentinel;
 static spinlock_t ic_lru_lock;
 static volatile uint64_t ic_entry_count;
+/* Bytes currently held in block-chain arrays (inode->chain), for the
+ * reclaimable-cache figure icache_mem_bytes() reports.  Updated at every
+ * chain kalloc/kfree; entry structs themselves are counted via
+ * ic_entry_count * sizeof(ic_inode_t). */
+static volatile uint64_t ic_chain_bytes;
+
+static inline void ic_chain_account_free(const ic_inode_t *inode)
+{
+	if (inode->chain)
+		__sync_fetch_and_sub(&ic_chain_bytes,
+				     inode->chain_cap * sizeof(unsigned long));
+}
 
 // ============================================================================
 // Statistics
@@ -147,6 +159,7 @@ static void ic_evict_one(void)
 	}
 	spin_unlock_irqrestore(&ic_hash[bucket].lock, bucket_flags);
 
+	ic_chain_account_free(victim);
 	if (victim->chain)
 		kfree(victim->chain);
 	kfree(victim);
@@ -311,6 +324,7 @@ void icache_unref(ic_inode_t *inode)
 			/* Detached earlier (e.g. unlink of an open file); this was the
              * last reference, so free it now. */
 			spin_unlock_irqrestore(&ic_lru_lock, flags);
+			ic_chain_account_free(inode);
 			if (inode->chain)
 				kfree(inode->chain);
 			kfree(inode);
@@ -428,6 +442,7 @@ void icache_remove(unsigned long start_cluster)
 			spin_unlock_irqrestore(&ic_lru_lock, lru_flags);
 
 			if (rc <= 0) {
+				ic_chain_account_free(n);
 				if (n->chain)
 					kfree(n->chain);
 				kfree(n);
@@ -451,6 +466,7 @@ void icache_invalidate_all(void)
 		ic_inode_t *n = ic_hash[b].head;
 		while (n) {
 			ic_inode_t *next = n->hash_next;
+			ic_chain_account_free(n);
 			if (n->chain)
 				kfree(n->chain);
 			kfree(n);
@@ -493,6 +509,8 @@ static int ic_chain_extend(ic_inode_t *inode, unsigned long target_idx,
 			if (!inode->chain)
 				return 0;
 			inode->chain_cap = cap;
+			__sync_fetch_and_add(&ic_chain_bytes,
+					     cap * sizeof(unsigned long));
 		}
 		inode->chain[0] = inode->start_cluster;
 		inode->chain_len = 1;
@@ -519,6 +537,9 @@ static int ic_chain_extend(ic_inode_t *inode, unsigned long target_idx,
 			for (unsigned long i = 0; i < inode->chain_len; i++)
 				new_arr[i] = inode->chain[i];
 			kfree(inode->chain);
+			__sync_fetch_and_add(&ic_chain_bytes,
+					     (new_cap - inode->chain_cap) *
+						     sizeof(unsigned long));
 			inode->chain = new_arr;
 			inode->chain_cap = new_cap;
 		}
@@ -588,6 +609,7 @@ void icache_chain_invalidate(unsigned long start_cluster)
 		return;
 
 	if (inode->chain) {
+		ic_chain_account_free(inode);
 		kfree(inode->chain);
 		inode->chain = 0;
 		inode->chain_len = 0;
@@ -644,4 +666,9 @@ void icache_get_stats(ic_stats_t *stats)
 	stats->misses = ic_stat_misses;
 	stats->evictions = ic_stat_evictions;
 	stats->total_entries = ic_entry_count;
+}
+
+uint64_t icache_mem_bytes(void)
+{
+	return ic_entry_count * sizeof(ic_inode_t) + ic_chain_bytes;
 }

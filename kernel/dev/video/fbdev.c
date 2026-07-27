@@ -72,6 +72,12 @@ uint64_t fbdev_mmap_phys(uint64_t offset, uint64_t length)
 		return 0; // mmap offsets are page-granular
 	if (offset >= size || length > size - offset)
 		return 0;
+	/* A mapping client (X.org fbdev style) scans out by storing straight
+	 * to VRAM and sends no update commands.  Enable SVGA traces so the
+	 * host snoops those writes; sticky-on - the console's explicit
+	 * update-rect path remains correct alongside it, at a small
+	 * host-side tracking cost once a client has mapped the fb. */
+	vmsvga2_set_traces(1);
 	return phys + offset;
 }
 

@@ -215,6 +215,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/syscall.o \
 			  $(BUILD_DIR)/syscall_c.o \
 			  $(BUILD_DIR)/elf_loader.o \
+			  $(BUILD_DIR)/script_loader.o \
 			  $(BUILD_DIR)/pipe.o \
 			  $(BUILD_DIR)/stack_guard.o \
 			  $(BUILD_DIR)/signal.o \
@@ -302,7 +303,7 @@ ROOT_SBIN_PROGS = init getty
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
 	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so libcrypt.so libpam.so
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
-	netstress openssltest usbtest ext4test permbench
+	netstress openssltest usbtest ext4test permbench fbtest
 # Full prerequisite set for the ext4 image (every staged build artifact).
 GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS))
 
@@ -537,6 +538,9 @@ $(BUILD_DIR)/syscall_c.o: $(KERNEL_DIR)/ke/syscall.c | $(BUILD_DIR)
 $(BUILD_DIR)/elf_loader.o: $(KERNEL_DIR)/ke/elf_loader.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/script_loader.o: $(KERNEL_DIR)/ke/script_loader.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/pipe.o: $(KERNEL_DIR)/ke/pipe.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
@@ -668,6 +672,12 @@ $(BUILD_DIR)/init: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/id: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) id
 	cp $(USER_DIR)/id $@
+	$(STRIP) --strip-unneeded $@
+
+# /dev/fb0 exerciser (X.org fbdev-style ioctl+mmap sequence)
+$(BUILD_DIR)/fbtest: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) fbtest
+	cp $(USER_DIR)/fbtest $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/whoami: userland-libc userland-rtld | $(BUILD_DIR)
@@ -1202,7 +1212,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	@echo "Assembling ext4 root staging tree from build artifacts..."
 	rm -rf $(EXT4_STAGING)
 	mkdir -p $(EXT4_STAGING)/boot $(EXT4_STAGING)/bin $(EXT4_STAGING)/sbin \
-		$(EXT4_STAGING)/lib \
+		$(EXT4_STAGING)/lib $(EXT4_STAGING)/usr/bin \
 		$(EXT4_STAGING)/usr/local/bin $(EXT4_STAGING)/usr/share/man/man1 \
 		$(EXT4_STAGING)/usr/share/nano $(EXT4_STAGING)/res \
 		$(EXT4_STAGING)/etc/ssl/certs $(EXT4_STAGING)/root $(EXT4_STAGING)/home \
@@ -1220,6 +1230,9 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	chmod 4755 $(EXT4_STAGING)/bin/passwd $(EXT4_STAGING)/bin/su
 	# Shared libraries -> /lib
 	for l in $(ROOT_LIBS); do cp $(BUILD_DIR)/$$l $(EXT4_STAGING)/lib/$$l; done
+	# /usr/bin/env so "#!/usr/bin/env <interp>" shebangs resolve (real copy;
+	# the exec path does not depend on symlink support)
+	cp $(BUILD_DIR)/env $(EXT4_STAGING)/usr/bin/env
 	# Tests and demos -> /usr/local/bin (a few are renamed)
 	cp $(BUILD_DIR)/user_test.elf $(EXT4_STAGING)/usr/local/bin/tests
 	cp $(BUILD_DIR)/test_libc     $(EXT4_STAGING)/usr/local/bin/testlibc
@@ -1233,6 +1246,10 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp $(BUILD_DIR)/usbtest       $(EXT4_STAGING)/usr/local/bin/usbtest
 	cp $(BUILD_DIR)/ext4test      $(EXT4_STAGING)/usr/local/bin/ext4test
 	cp $(BUILD_DIR)/permbench     $(EXT4_STAGING)/usr/local/bin/permbench
+	cp $(BUILD_DIR)/fbtest        $(EXT4_STAGING)/usr/local/bin/fbtest
+	# Shebang smoke-test script (mode 755 propagates via fakeroot mkfs -d)
+	cp user/bin/tests/scripttest.sh $(EXT4_STAGING)/usr/local/bin/scripttest.sh
+	chmod 755 $(EXT4_STAGING)/usr/local/bin/scripttest.sh
 	# Resources, manpages, config
 	cp res/Lat15-Fixed16.psf $(EXT4_STAGING)/res/Lat15-Fixed16.psf
 	cp res/left_ptr          $(EXT4_STAGING)/res/left_ptr

@@ -304,7 +304,7 @@ static int devfs_parse_unit(const char *p)
 /* The owner (root), group and mode bits reported here are what the VFS
  * permission layer enforces device access against — i.e. device-node DAC is
  * driven entirely by this metadata.  Console and input/video nodes are
- * group-restricted (tty/input/video, Linux-conventional modes and
+ * group-restricted (tty/input/video, conventional Unix modes and
  * major:minor numbers); the pseudo devices stay world-accessible and the
  * /dev directories world-searchable (0755). */
 int devfs_stat(const char *path, struct kstat *st)

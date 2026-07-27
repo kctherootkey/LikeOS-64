@@ -337,6 +337,7 @@ typedef struct k_sysinfo {
 #define EACCES 13 // Permission denied
 #define EFAULT 14 // Bad address
 #define ENOEXEC 8 // Exec format error
+#define E2BIG 7 // Argument list too long
 #define ENOENT 2 // No such file or directory
 #define EPERM 1 // Operation not permitted
 #define ENOTDIR 20 // Not a directory

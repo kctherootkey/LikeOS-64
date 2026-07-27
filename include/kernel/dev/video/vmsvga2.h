@@ -382,6 +382,7 @@ int vmsvga2_set_mode(uint32_t width, uint32_t height, uint32_t bpp);
 int vmsvga2_display_enable(int enable);
 int vmsvga2_get_info(framebuffer_info_t *out); // current scanout geometry
 uint64_t vmsvga2_get_fb_phys(uint64_t *size_out); // FB BAR for mmap
+void vmsvga2_set_traces(int enable); // host snoops direct VRAM writes
 
 // Updates and synchronization
 void vmsvga2_update_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h);

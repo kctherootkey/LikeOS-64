@@ -2221,6 +2221,21 @@ void kfree_dma(void *ptr)
 
 // MEMORY STATISTICS AND DEBUGGING
 
+/* Bytes filesystem drivers hold in reclaimable block/metadata buffers
+ * (see mm_buffercache_account in memory.h). */
+static volatile int64_t g_buffercache_bytes;
+
+void mm_buffercache_account(long delta)
+{
+	__sync_fetch_and_add(&g_buffercache_bytes, (int64_t)delta);
+}
+
+uint64_t mm_buffercache_bytes(void)
+{
+	int64_t v = g_buffercache_bytes;
+	return v > 0 ? (uint64_t)v : 0;
+}
+
 // Get memory statistics
 void mm_get_memory_stats(memory_stats_t *stats)
 {

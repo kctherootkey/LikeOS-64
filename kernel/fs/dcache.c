@@ -509,3 +509,8 @@ void dcache_get_stats(dc_stats_t *stats)
 	stats->evictions = dc_stat_evictions;
 	stats->total_entries = dc_entry_count;
 }
+
+uint64_t dcache_mem_bytes(void)
+{
+	return dc_entry_count * sizeof(dc_entry_t);
+}

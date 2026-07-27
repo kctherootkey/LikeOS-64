@@ -1105,6 +1105,7 @@ static int ext4_read_sectors(const block_device_t *bdev, unsigned long lba,
 static struct {
 	unsigned long pbn; /* 0 = empty slot               */
 	uint8_t *data; /* block_size bytes             */
+	unsigned size; /* allocated bytes (for buffer-cache accounting) */
 	int verified; /* type-specific csum already checked once */
 } s_mbc[EXT4_MBC_ENTRIES];
 static unsigned s_mbc_next;
@@ -1155,14 +1156,18 @@ static void ext4_mbc_invalidate(void)
 	 * with IRQs off under a spinlock. */
 	uint8_t *bufs[EXT4_MBC_ENTRIES];
 	uint64_t flags;
+	long freed = 0;
 	spin_lock_irqsave(&s_mbc_lock, &flags);
 	for (int i = 0; i < EXT4_MBC_ENTRIES; i++) {
 		s_mbc[i].pbn = 0;
 		bufs[i] = s_mbc[i].data;
 		s_mbc[i].data = 0;
+		freed += s_mbc[i].size;
+		s_mbc[i].size = 0;
 	}
 	s_mbc_next = 0;
 	spin_unlock_irqrestore(&s_mbc_lock, flags);
+	mm_buffercache_account(-freed);
 	for (int i = 0; i < EXT4_MBC_ENTRIES; i++)
 		if (bufs[i])
 			kfree(bufs[i]);
@@ -1245,6 +1250,8 @@ static void ext4_mbc_insert(ext4_fs_t *fs, unsigned long pbn, const void *buf,
 			spin_unlock_irqrestore(&s_mbc_lock, flags);
 			return;
 		}
+		s_mbc[slot].size = fs->block_size;
+		mm_buffercache_account((long)fs->block_size);
 	}
 	mm_memcpy(s_mbc[slot].data, buf, fs->block_size);
 	s_mbc[slot].pbn = pbn;
@@ -1306,6 +1313,7 @@ static void *ext4_bget(ext4_fs_t *fs)
 		if (s_bpool[i].busy)
 			continue;
 		if (s_bpool[i].data && s_bpool[i].size < want) {
+			mm_buffercache_account(-(long)s_bpool[i].size);
 			kfree(s_bpool[i].data); /* stale from a smaller mount */
 			s_bpool[i].data = 0;
 		}
@@ -1322,6 +1330,7 @@ static void *ext4_bget(ext4_fs_t *fs)
 			}
 			s_bpool[i].data = nb;
 			s_bpool[i].size = want;
+			mm_buffercache_account((long)want);
 		}
 		s_bpool[i].busy = 1;
 		uint8_t *p = s_bpool[i].data;

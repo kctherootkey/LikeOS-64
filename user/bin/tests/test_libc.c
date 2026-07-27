@@ -1331,6 +1331,350 @@ static void test_setuid_exec(void)
 	unlink(plain);
 }
 
+/* ---- shebang (#!) exec tests ------------------------------------------ */
+
+static int write_script(const char *path, mode_t mode, const char *contents)
+{
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0)
+		return -1;
+	size_t len = strlen(contents);
+	int rc = (write(fd, contents, len) == (ssize_t)len) ? 0 : -1;
+	close(fd);
+	if (chmod(path, mode) != 0)
+		rc = -1;
+	return rc;
+}
+
+/* Exec `path` in a child and capture its stdout; returns 0 with *status
+ * set, -1 on infrastructure failure. */
+static int exec_capture(const char *path, char *const argvv[],
+			char *const envpv[], char *out, size_t outsz, int *status)
+{
+	int p[2];
+	if (pipe(p) != 0)
+		return -1;
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(p[0]);
+		close(p[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		close(p[0]);
+		dup2(p[1], 1);
+		close(p[1]);
+		execve(path, argvv, envpv);
+		_exit(126);
+	}
+	close(p[1]);
+	size_t off = 0;
+	int r;
+	while (off < outsz - 1 &&
+	       (r = read(p[0], out + off, outsz - 1 - off)) > 0)
+		off += (size_t)r;
+	out[off] = '\0';
+	close(p[0]);
+	int st = 0;
+	waitpid(pid, &st, 0);
+	*status = st;
+	return 0;
+}
+
+/* Exec `path` in a child expected to FAIL: returns the child's execve
+ * errno (or the program's exit status if the exec unexpectedly worked). */
+static int exec_expect_errno(const char *path, char *const argvv[],
+			     char *const envpv[])
+{
+	pid_t pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {
+		int nul = open("/dev/null", O_WRONLY);
+		if (nul >= 0) {
+			dup2(nul, 1);
+			dup2(nul, 2);
+			if (nul > 2)
+				close(nul);
+		}
+		execve(path, argvv, envpv);
+		_exit(errno);
+	}
+	int st = 0;
+	waitpid(pid, &st, 0);
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* Same, but after dropping to `as_uid` (for DAC checks - root skips them). */
+static int exec_errno_as_uid(const char *path, int as_uid)
+{
+	pid_t pid = fork();
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {
+		int nul = open("/dev/null", O_WRONLY);
+		if (nul >= 0) {
+			dup2(nul, 1);
+			dup2(nul, 2);
+			if (nul > 2)
+				close(nul);
+		}
+		setgid(as_uid);
+		setuid(as_uid);
+		char *av[] = { (char *)path, NULL };
+		char *ev[] = { NULL };
+		execve(path, av, ev);
+		_exit(errno);
+	}
+	int st = 0;
+	waitpid(pid, &st, 0);
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+static void test_shebang(void)
+{
+	printf("\n[TEST] shebang (#!) script execution\n");
+
+	char base[48];
+	snprintf(base, sizeof(base), "/tmp/shb%d", (int)getpid());
+	rmtree(base);
+	/* 0755: the uid-1000 children of the EACCES tests must traverse it */
+	if (mkdir(base, 0755) != 0) {
+		test_fail("shebang: cannot create test dir");
+		return;
+	}
+
+	char p1[96], p2[96], out[1024], expect[512];
+	int st;
+
+	/* basic /bin/sh script: output + exit status */
+	snprintf(p1, sizeof(p1), "%s/basic", base);
+	write_script(p1, 0755, "#!/bin/sh\necho shebang-sh-ok\nexit 42\n");
+	{
+		char *av[] = { p1, NULL };
+		char *ev[] = { (char *)"PATH=/bin", NULL };
+		int rc = exec_capture(p1, av, ev, out, sizeof(out), &st);
+		test_result("basic #!/bin/sh script runs",
+			    rc == 0 && strstr(out, "shebang-sh-ok") != NULL);
+		test_result("script exit status propagates",
+			    WIFEXITED(st) && WEXITSTATUS(st) == 42);
+	}
+
+	/* argv construction: interp, optarg, script path replaces argv[0],
+	 * original tail preserved (testlibc __argv dumps the exact vector) */
+	snprintf(p1, sizeof(p1), "%s/argv", base);
+	write_script(p1, 0755, "#!/usr/local/bin/testlibc __argv\n");
+	{
+		char *av[] = { (char *)"IGNORED-ARGV0", (char *)"x",
+			       (char *)"y", NULL };
+		char *ev[] = { NULL };
+		int rc = exec_capture(p1, av, ev, out, sizeof(out), &st);
+		snprintf(expect, sizeof(expect),
+			 "0=[/usr/local/bin/testlibc]\n1=[__argv]\n2=[%s]\n"
+			 "3=[x]\n4=[y]\n",
+			 p1);
+		test_result("shebang argv order (interp,opt,script,args)",
+			    rc == 0 && strcmp(out, expect) == 0);
+	}
+
+	/* whitespace: blanks after #! skipped; remainder is ONE argument with
+	 * internal spaces kept; trailing space/tab/CR/LF trimmed */
+	snprintf(p1, sizeof(p1), "%s/white", base);
+	write_script(p1, 0755,
+		     "#! \t /usr/local/bin/testlibc \t __argv  with  spaces \t\r\n");
+	{
+		char *av[] = { p1, NULL };
+		char *ev[] = { NULL };
+		int rc = exec_capture(p1, av, ev, out, sizeof(out), &st);
+		test_result("shebang whitespace/optarg handling",
+			    rc == 0 &&
+				    strstr(out, "1=[__argv  with  spaces]") !=
+					    NULL);
+	}
+
+	/* environment passes through execve unchanged (testlibc __env dumps
+	 * it).  NOT "#!/bin/env": the shebang rewrite appends the script path,
+	 * which env then treats as a COMMAND and re-executes — script -> env
+	 * -> script forever.  (Each env exec is a fresh execve at depth 0, so
+	 * the kernel ELOOP budget never trips; conventional Unix loops the
+	 * same way.) */
+	snprintf(p1, sizeof(p1), "%s/envdump", base);
+	write_script(p1, 0755, "#!/usr/local/bin/testlibc __env\n");
+	{
+		char *av[] = { p1, NULL };
+		char *ev[] = { (char *)"SHEBANG_MARK=xyzzy", NULL };
+		int rc = exec_capture(p1, av, ev, out, sizeof(out), &st);
+		test_result("envp passed unchanged to interpreter",
+			    rc == 0 &&
+				    strstr(out, "SHEBANG_MARK=xyzzy") != NULL);
+	}
+
+	/* /usr/bin/env resolves and locates the interpreter */
+	snprintf(p1, sizeof(p1), "%s/envsh", base);
+	write_script(p1, 0755, "#!/usr/bin/env sh\necho env-sh-ok\nexit 5\n");
+	{
+		char *av[] = { p1, NULL };
+		char *ev[] = { (char *)"PATH=/bin", NULL };
+		int rc = exec_capture(p1, av, ev, out, sizeof(out), &st);
+		test_result("#!/usr/bin/env sh works",
+			    rc == 0 && strstr(out, "env-sh-ok") != NULL &&
+				    WIFEXITED(st) && WEXITSTATUS(st) == 5);
+	}
+
+	/* python-style: env finds a PATH-relative interpreter that is itself
+	 * a script */
+	snprintf(p1, sizeof(p1), "%s/fakepython", base);
+	write_script(p1, 0755, "#!/bin/sh\necho fake-python-ran\n");
+	snprintf(p2, sizeof(p2), "%s/usepython", base);
+	write_script(p2, 0755, "#!/usr/bin/env fakepython\n");
+	{
+		char pathvar[128];
+		snprintf(pathvar, sizeof(pathvar), "PATH=%s:/bin", base);
+		char *av[] = { p2, NULL };
+		char *ev[] = { pathvar, NULL };
+		int rc = exec_capture(p2, av, ev, out, sizeof(out), &st);
+		test_result("#!/usr/bin/env PATH interpreter lookup",
+			    rc == 0 &&
+				    strstr(out, "fake-python-ran") != NULL);
+	}
+
+	/* recursion: script -> script -> /bin/echo, argv accumulates */
+	snprintf(p1, sizeof(p1), "%s/inner", base);
+	write_script(p1, 0755, "#!/bin/echo -n\n");
+	snprintf(p2, sizeof(p2), "%s/outer", base);
+	snprintf(expect, sizeof(expect), "#!%s\n", p1);
+	write_script(p2, 0755, expect);
+	{
+		char *av[] = { p2, NULL };
+		char *ev[] = { NULL };
+		int rc = exec_capture(p2, av, ev, out, sizeof(out), &st);
+		snprintf(expect, sizeof(expect), "%s %s", p1, p2);
+		test_result("recursive shebang (2 levels)",
+			    rc == 0 && strcmp(out, expect) == 0);
+	}
+
+	/* recursion limit: self-referential interpreter chain -> ELOOP */
+	snprintf(p1, sizeof(p1), "%s/self", base);
+	snprintf(expect, sizeof(expect), "#!%s\n", p1);
+	write_script(p1, 0755, expect);
+	{
+		char *av[] = { p1, NULL };
+		char *ev[] = { NULL };
+		test_result("shebang recursion limit -> ELOOP",
+			    exec_expect_errno(p1, av, ev) == ELOOP);
+	}
+
+	/* over-long #! line without newline -> ENOEXEC */
+	snprintf(p1, sizeof(p1), "%s/longline", base);
+	{
+		char big[312];
+		memcpy(big, "#!/bin/sh", 9);
+		memset(big + 9, 'x', 300);
+		big[309] = '\0';
+		write_script(p1, 0755, big);
+		char *av[] = { p1, NULL };
+		char *ev[] = { NULL };
+		test_result("truncated #! line -> ENOEXEC",
+			    exec_expect_errno(p1, av, ev) == ENOEXEC);
+	}
+
+	/* empty interpreter -> ENOEXEC */
+	snprintf(p1, sizeof(p1), "%s/noint", base);
+	write_script(p1, 0755, "#!\n");
+	snprintf(p2, sizeof(p2), "%s/blankint", base);
+	write_script(p2, 0755, "#! \t \n");
+	{
+		char *av[] = { p1, NULL };
+		char *ev[] = { NULL };
+		test_result("empty interpreter -> ENOEXEC",
+			    exec_expect_errno(p1, av, ev) == ENOEXEC);
+		char *av2[] = { p2, NULL };
+		test_result("blank interpreter -> ENOEXEC",
+			    exec_expect_errno(p2, av2, ev) == ENOEXEC);
+	}
+
+	/* non-ELF, non-script garbage -> ENOEXEC */
+	snprintf(p1, sizeof(p1), "%s/garbage", base);
+	{
+		char junk[65];
+		for (int i = 0; i < 64; i++)
+			junk[i] = (char)(i + 1);
+		junk[64] = '\0';
+		write_script(p1, 0755, junk);
+		char *av[] = { p1, NULL };
+		char *ev[] = { NULL };
+		test_result("binary garbage -> ENOEXEC",
+			    exec_expect_errno(p1, av, ev) == ENOEXEC);
+	}
+
+	/* missing interpreter -> ENOENT; missing script -> ENOENT */
+	snprintf(p1, sizeof(p1), "%s/nointerp", base);
+	snprintf(expect, sizeof(expect), "#!%s/no_such_interp\n", base);
+	write_script(p1, 0755, expect);
+	{
+		char *av[] = { p1, NULL };
+		char *ev[] = { NULL };
+		test_result("missing interpreter -> ENOENT",
+			    exec_expect_errno(p1, av, ev) == ENOENT);
+		snprintf(p2, sizeof(p2), "%s/does_not_exist", base);
+		char *av2[] = { p2, NULL };
+		test_result("missing exec target -> ENOENT",
+			    exec_expect_errno(p2, av2, ev) == ENOENT);
+	}
+
+	/* E2BIG: rewritten argv + strings exceed the exec stack budget */
+	snprintf(p1, sizeof(p1), "%s/big", base);
+	write_script(p1, 0755, "#!/bin/sh\n");
+	{
+		static char argstore[100][41];
+		static char *av[102];
+		av[0] = p1;
+		for (int i = 0; i < 100; i++) {
+			memset(argstore[i], 'a', 40);
+			argstore[i][40] = '\0';
+			av[i + 1] = argstore[i];
+		}
+		av[101] = NULL;
+		char *ev[] = { NULL };
+		test_result("oversized argv -> E2BIG",
+			    exec_expect_errno(p1, av, ev) == E2BIG);
+	}
+
+	/* CRLF script: trailing \r is trimmed from the optarg */
+	snprintf(p1, sizeof(p1), "%s/crlf", base);
+	write_script(p1, 0755, "#!/bin/echo -n\r\n");
+	{
+		char *av[] = { p1, NULL };
+		char *ev[] = { NULL };
+		int rc = exec_capture(p1, av, ev, out, sizeof(out), &st);
+		test_result("CRLF #! line: \\r trimmed from optarg",
+			    rc == 0 && strcmp(out, p1) == 0);
+	}
+
+	/* DAC: non-root needs x on the script AND on the interpreter */
+	if (geteuid() == 0) {
+		snprintf(p1, sizeof(p1), "%s/noexec", base);
+		write_script(p1, 0644, "#!/bin/sh\necho nope\n");
+		test_result("script without x -> EACCES (uid 1000)",
+			    exec_errno_as_uid(p1, 1000) == EACCES);
+
+		snprintf(p1, sizeof(p1), "%s/interp_nox", base);
+		if (copy_file("/bin/echo", p1, 0644) == 0) {
+			snprintf(p2, sizeof(p2), "%s/useinterp", base);
+			snprintf(expect, sizeof(expect), "#!%s\n", p1);
+			write_script(p2, 0755, expect);
+			test_result("interpreter without x -> EACCES (uid 1000)",
+				    exec_errno_as_uid(p2, 1000) == EACCES);
+		} else {
+			test_fail("shebang: cannot stage nox interpreter");
+		}
+	} else {
+		printf("  (EACCES cases skipped: not running as root)\n");
+	}
+
+	rmtree(base);
+}
+
 static void run_auth_tests(void)
 {
 	test_userdb();
@@ -1343,6 +1687,23 @@ static void run_auth_tests(void)
 
 int main(int argc, char **argv)
 {
+	/* Hidden mode used by the shebang tests: when testlibc is itself the
+	 * shebang interpreter, dump the exact argv vector and exit. */
+	if (argc > 1 && strncmp(argv[1], "__argv", 6) == 0) {
+		for (int i = 0; i < argc; i++)
+			printf("%d=[%s]\n", i, argv[i]);
+		return 0;
+	}
+	/* Companion hidden mode: dump the environment and exit, ignoring the
+	 * script-path argument the shebang rewrite appends. */
+	if (argc > 1 && strcmp(argv[1], "__env") == 0) {
+		int cookie = 0;
+		const char *en, *ev;
+		while (env_iter(&cookie, &en, &ev))
+			printf("%s=%s\n", en, ev);
+		return 0;
+	}
+
 	/* Subcommand selection:
      *   (no arg)          — run all sections except network
      *   testlibc all      — run all sections including network
@@ -6294,6 +6655,7 @@ int main(int argc, char **argv)
 	test_dev_nodes();
 	test_fbdev();
 	test_evdev();
+	test_shebang();
 
 	// ========================================
 	// Socket / Networking Tests

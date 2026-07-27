@@ -2149,6 +2149,106 @@ static void get_prompt(char *prompt, int maxlen)
 /* Main                                                                 */
 /* ------------------------------------------------------------------ */
 
+/* Script/-c mode state ($-expansion + positional parameters).  Only set for
+ * non-interactive invocations, so interactive behavior is untouched. */
+static int script_mode = 0;
+static int script_argc = 0; /* number of positional parameters ($1..$N) */
+static char **script_argv = NULL; /* script_argv[0] = $0, [1] = $1, ... */
+
+/* Minimal parameter expansion for script mode: $0-$9, $#, $?, $$, $@,
+ * $NAME and ${NAME} (environment).  Literal inside single quotes; unknown
+ * names expand to the empty string.  In-place rewrite like alias_expand. */
+static void dollar_expand(char *line, size_t max)
+{
+	char out[SHELL_MAX_LINE];
+	char num[16];
+	char name[128];
+	size_t o = 0;
+	int in_sq = 0;
+
+	for (size_t i = 0; line[i] && o < sizeof(out) - 1; i++) {
+		char c = line[i];
+		if (c == '\'') {
+			in_sq = !in_sq;
+			out[o++] = c;
+			continue;
+		}
+		if (in_sq || c != '$') {
+			out[o++] = c;
+			continue;
+		}
+		const char *rep = NULL;
+		char next = line[i + 1];
+		if (next == '#') {
+			snprintf(num, sizeof(num), "%d", script_argc);
+			rep = num;
+			i++;
+		} else if (next == '?') {
+			snprintf(num, sizeof(num), "%d", last_exit_status);
+			rep = num;
+			i++;
+		} else if (next == '$') {
+			snprintf(num, sizeof(num), "%d", getpid());
+			rep = num;
+			i++;
+		} else if (next >= '0' && next <= '9') {
+			int idx = next - '0';
+			rep = (script_argv && idx <= script_argc) ?
+				      script_argv[idx] :
+				      "";
+			if (!rep)
+				rep = "";
+			i++;
+		} else if (next == '@') {
+			i++;
+			for (int a = 1; a <= script_argc && script_argv; a++) {
+				const char *s = script_argv[a] ? script_argv[a] :
+								 "";
+				while (*s && o < sizeof(out) - 1)
+					out[o++] = *s++;
+				if (a < script_argc && o < sizeof(out) - 1)
+					out[o++] = ' ';
+			}
+			continue;
+		} else if (next == '{') {
+			size_t j = i + 2, k = 0;
+			while (line[j] && line[j] != '}' &&
+			       k < sizeof(name) - 1)
+				name[k++] = line[j++];
+			if (line[j] != '}') {
+				out[o++] = '$';
+				continue;
+			}
+			name[k] = '\0';
+			const char *v = getenv(name);
+			rep = v ? v : "";
+			i = j;
+		} else if (next == '_' || (next >= 'A' && next <= 'Z') ||
+			   (next >= 'a' && next <= 'z')) {
+			size_t j = i + 1, k = 0;
+			while (line[j] &&
+			       (line[j] == '_' ||
+				(line[j] >= 'A' && line[j] <= 'Z') ||
+				(line[j] >= 'a' && line[j] <= 'z') ||
+				(line[j] >= '0' && line[j] <= '9')) &&
+			       k < sizeof(name) - 1)
+				name[k++] = line[j++];
+			name[k] = '\0';
+			const char *v = getenv(name);
+			rep = v ? v : "";
+			i = j - 1;
+		} else {
+			out[o++] = '$';
+			continue;
+		}
+		while (rep && *rep && o < sizeof(out) - 1)
+			out[o++] = *rep++;
+	}
+	out[o] = '\0';
+	strncpy(line, out, max - 1);
+	line[max - 1] = '\0';
+}
+
 /* Execute a single command line.  Used for sourcing startup files, so it
  * skips history and interactive here-document collection. */
 static void source_line(char *line)
@@ -2156,6 +2256,8 @@ static void source_line(char *line)
 	static token_t tokens[128];
 	static cmd_entry_t entries[MAX_COMMANDS];
 
+	if (script_mode)
+		dollar_expand(line, SHELL_MAX_LINE);
 	alias_expand(line, SHELL_MAX_LINE);
 	int ntok = tokenize(line, tokens,
 			    (int)(sizeof(tokens) / sizeof(tokens[0])));
@@ -2200,6 +2302,63 @@ int main(int argc, char **argv)
 	res_init();
 	hist_load();
 	alias_load();
+
+	/* Non-interactive modes (how #! scripts arrive here):
+	 *   sh -c "commands" [name [args...]]
+	 *   sh scriptfile [args...]
+	 * History/alias persistence stays untouched in these modes. */
+	if (argc >= 2 && strcmp(argv[1], "-c") == 0) {
+		static char *c_default0 = "sh";
+		if (argc < 3) {
+			fprintf(stderr, "sh: -c: option requires an argument\n");
+			_exit(2);
+		}
+		script_mode = 1;
+		if (argc >= 4) {
+			script_argv = &argv[3];
+			script_argc = argc - 4;
+		} else {
+			script_argv = &c_default0;
+			script_argc = 0;
+		}
+		char cmdbuf[SHELL_MAX_LINE];
+		strncpy(cmdbuf, argv[2], sizeof(cmdbuf) - 1);
+		cmdbuf[sizeof(cmdbuf) - 1] = '\0';
+		char *p = cmdbuf;
+		while (p && *p) {
+			char *nl = strchr(p, '\n');
+			if (nl)
+				*nl = '\0';
+			if (*p && *p != '#')
+				source_line(p);
+			p = nl ? nl + 1 : NULL;
+		}
+		_exit(last_exit_status);
+	}
+	if (argc >= 2 && argv[1][0] != '-') {
+		FILE *sf = fopen(argv[1], "r");
+		if (!sf) {
+			fprintf(stderr, "sh: %s: No such file or directory\n",
+				argv[1]);
+			_exit(127);
+		}
+		script_mode = 1;
+		script_argv = &argv[1]; /* $0 = script path, $1.. follow */
+		script_argc = argc - 2;
+		char sbuf[SHELL_MAX_LINE];
+		while (fgets(sbuf, sizeof(sbuf), sf)) {
+			size_t n = strlen(sbuf);
+			while (n && (sbuf[n - 1] == '\n' || sbuf[n - 1] == '\r'))
+				sbuf[--n] = '\0';
+			/* '#' lines are comments - this also skips the #!
+			 * shebang line itself. */
+			if (sbuf[0] == '\0' || sbuf[0] == '#')
+				continue;
+			source_line(sbuf);
+		}
+		fclose(sf);
+		_exit(last_exit_status);
+	}
 
 	/* A login shell (argv[0] begins with '-', e.g. "-sh" as started by
 	 * login) reads the system-wide and per-user startup files before the

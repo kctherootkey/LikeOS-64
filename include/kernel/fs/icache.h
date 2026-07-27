@@ -164,4 +164,8 @@ typedef struct ic_stats {
 
 void icache_get_stats(ic_stats_t *stats);
 
+// Bytes currently held by the cache (entry structs + block-chain arrays);
+// reclaimable via LRU eviction, reported by sysinfo as cache memory.
+uint64_t icache_mem_bytes(void);
+
 #endif // _KERNEL_ICACHE_H_

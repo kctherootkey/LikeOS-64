@@ -117,4 +117,8 @@ typedef struct dc_stats {
 
 void dcache_get_stats(dc_stats_t *stats);
 
+// Bytes currently held by cached dentries; reclaimable via LRU eviction,
+// reported by sysinfo as cache memory.
+uint64_t dcache_mem_bytes(void);
+
 #endif // _KERNEL_DCACHE_H_

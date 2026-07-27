@@ -774,6 +774,18 @@ int vmsvga2_set_mode(uint32_t width, uint32_t height, uint32_t bpp)
 	return rc;
 }
 
+// Host-side dirty tracking of direct VRAM writes.  With traces enabled the
+// host snoops framebuffer stores and repaints without explicit UPDATE
+// commands - required for /dev/fb0 mmap clients (X.org fbdev style) that
+// scan out by writing VRAM directly.  The explicit update-rect path stays
+// correct alongside it; traces just add host-side tracking.
+void vmsvga2_set_traces(int enable)
+{
+	if (!g_svga.present)
+		return;
+	svga_write_reg(SVGA_REG_TRACES, enable ? 1 : 0);
+}
+
 int vmsvga2_display_enable(int enable)
 {
 	if (!g_svga.present)
