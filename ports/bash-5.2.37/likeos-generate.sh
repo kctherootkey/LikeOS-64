@@ -167,7 +167,11 @@ sed -i 's|^#include "config-bot.h"$|#include "config-likeos.h"\n\n#include "conf
 sed 's|@DEBUGGER_START_FILE@|/usr/share/bashdb/bashdb-main.inc|' \
 	pathnames.h.in > pathnames.h
 
-sh support/mkversion.sh -b -S . -s release -d 5.2 -o newversion.h >/dev/null
+# No -b: that flag increments the build counter and rewrites .build, a TRACKED
+# upstream file, so every regeneration left the tree dirty and the reported
+# build number drifting.  Without it mkversion.sh just reads the current value,
+# which keeps the version string stable and the port byte-identical upstream.
+sh support/mkversion.sh -S . -s release -d 5.2 -o newversion.h >/dev/null
 mv newversion.h version.h
 
 cat > pipesize.h <<'EOF'
