@@ -32,6 +32,8 @@
 /ports/netcat-OpenBSD/nc
 /ports/openssl-3.5.6/apps/openssl
 /ports/bash-5.2.37/bash
+#     openssh's fourteen programs are NOT listed here: that port ships its own
+#     .gitignore (see the openssh block below).
 
 # --- bash port: everything likeos-generate.sh produces (see GEN_SOURCES and
 #     GEN_STAMP in ports/bash-5.2.37/Makefile.likeos).  `make distclean` in
@@ -61,6 +63,20 @@
 !/ports/bash-5.2.37/builtins/getopt.c
 !/ports/bash-5.2.37/builtins/mkbuiltins.c
 !/ports/bash-5.2.37/builtins/psize.c
+
+# --- openssh port.  Unlike the other ports, the openssh tarball ships its OWN
+#     .gitignore, and a .gitignore in a subdirectory takes precedence over this
+#     one -- so rules for that tree belong there, not here.  Upstream's file
+#     already covers everything configure and the build produce: the fourteen
+#     programs, Makefile, config.h/.log/.status, openbsd-compat/{Makefile,
+#     include}, *.out, buildpkg.sh, opensshd.init, openssh.xml, survey.sh and
+#     autom4te.cache/ -- i.e. exactly what `make distclean` removes there.
+#
+#     Only the two files this port adds are left to cover: the configure cache
+#     seeded by likeos-configure.sh (the .likeos-configured stamp is already
+#     handled by the .likeos-configured* rule above).
+/ports/openssh-10.4p1/likeos.cache
+/ports/openssh-10.4p1/config.cache
 
 # --- Compiled userland executables (built in-tree next to their .c sources).
 #     Ignore everything under the bin dirs, then re-include tracked sources.
