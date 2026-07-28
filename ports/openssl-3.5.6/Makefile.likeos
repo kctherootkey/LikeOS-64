@@ -45,7 +45,7 @@ $(CONFIGURE_STAMP): Configure
 	    --openssldir=/etc/ssl \
 	    --libdir=lib \
 	    no-tests no-afalgeng no-async no-ktls no-fuzz-libfuzzer no-fuzz-afl \
-	    no-ssl3 no-ssl3-method no-deprecated \
+	    no-ssl3 no-ssl3-method \
 	    -I$(ABS_LIBC)/include
 	touch $(CONFIGURE_STAMP)
 

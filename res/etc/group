@@ -2,3 +2,4 @@ root:x:0:
 tty:x:5:
 video:x:44:
 input:x:104:
+sshd:x:74:

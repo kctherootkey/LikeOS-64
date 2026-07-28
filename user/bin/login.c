@@ -135,7 +135,7 @@ static void setup_environment(const struct passwd *pw, char *envp[], int *n)
 	envp[(*n)++] = user;
 	envp[(*n)++] = logname;
 	envp[(*n)++] = shell;
-	envp[(*n)++] = (char *)"PATH=/bin:/usr/local/bin";
+	envp[(*n)++] = (char *)"PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 	envp[(*n)++] = term;
 	envp[*n] = NULL;
 }

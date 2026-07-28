@@ -64,6 +64,7 @@ extern int errno;
 #define EPROTONOSUPPORT 93 /* Protocol not supported */
 #define ESOCKTNOSUPPORT 94 /* Socket type not supported */
 #define EOPNOTSUPP     95  /* Operation not supported on transport endpoint */
+#define EPFNOSUPPORT   96  /* Protocol family not supported */
 #define EAFNOSUPPORT   97  /* Address family not supported */
 #define EADDRINUSE     98  /* Address already in use */
 #define EADDRNOTAVAIL  99  /* Cannot assign requested address */
@@ -80,6 +81,12 @@ extern int errno;
 #define EALREADY       114 /* Operation already in progress */
 #define EINPROGRESS    115 /* Operation now in progress */
 #define ESTALE         116 /* Stale file handle */
+#define ESHUTDOWN      108 /* Cannot send after transport endpoint shutdown */
+#define ETOOMANYREFS   109 /* Too many references: cannot splice */
+#define EHOSTDOWN      112 /* Host is down */
+#define EUSERS         87  /* Too many users */
+#define EDQUOT         122 /* Disk quota exceeded */
+#define EREMOTE        66  /* Object is remote */
 #define EOWNERDEAD     130 /* Owner died */
 #define ENOTRECOVERABLE 131 /* State not recoverable */
 

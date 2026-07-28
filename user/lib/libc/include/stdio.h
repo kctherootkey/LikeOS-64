@@ -48,6 +48,8 @@ extern FILE* stderr;
 // File operations
 FILE* fopen(const char* pathname, const char* mode);
 int fclose(FILE* stream);
+FILE* popen(const char* command, const char* type);
+int pclose(FILE* stream);
 size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream);
 size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* stream);
 int fseek(FILE* stream, long offset, int whence);
@@ -96,6 +98,11 @@ int asprintf(char **strp, const char* format, ...);
 int scanf(const char* format, ...);
 int fscanf(FILE* stream, const char* format, ...);
 int sscanf(const char* str, const char* format, ...);
+#if defined(_STDARG_H) || defined(va_start)
+int vscanf(const char* format, va_list ap);
+int vfscanf(FILE* stream, const char* format, va_list ap);
+int vsscanf(const char* str, const char* format, va_list ap);
+#endif
 
 // Error reporting
 void perror(const char* s);

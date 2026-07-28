@@ -1473,6 +1473,7 @@ void exception_handler(uint64_t *regs)
 				 * ignored): returning would re-execute the
 				 * faulting instruction forever.  Force-exit. */
 				cur->exit_code = 128 + fault_sig;
+				cur->term_sig = fault_sig;
 				sched_mark_task_exited(cur, 128 + fault_sig);
 			}
 		}

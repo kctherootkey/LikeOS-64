@@ -1,0 +1,61 @@
+#!/bin/sh
+# likeos-cc — a gcc driver wrapper that makes autoconf's compile/link probes
+# build LikeOS-64 PIE binaries against the LikeOS libc + rtld + OpenSSL.
+#
+# configure invokes $CC for both "-c" compiles and for full links (it uses gcc
+# as the link driver, not ld directly).  This wrapper adds the freestanding
+# include paths on every invocation, and the LikeOS crt1/linker-script/rtld
+# glue only when it is actually linking a program.
+set -e
+
+# Derive the repo root from this script's own location
+# ($ROOT/ports/openssh-10.4p1/likeos-cc) so the port is not tied to an
+# absolute checkout path.
+self=$0
+case "$self" in
+  /*) ;;
+  *)  self="$(pwd)/$self" ;;
+esac
+ROOT="$(cd "$(dirname "$self")/../.." && pwd)"
+LIBC="$ROOT/user/lib/libc"
+RTLD="$ROOT/user/lib/rtld"
+LDS="$ROOT/user/bin/user_dyn.lds"
+CRT1="$LIBC/crt1.o"
+OPENSSL="$ROOT/ports/openssl-3.5.6"
+ZLIB="$ROOT/ports/lib/zlib-1.3.1"
+
+# GCC's own freestanding headers (float.h, stdarg.h, stdbool.h ...) that the
+# libc does not ship.  Placed AFTER the libc include so the libc wins for the
+# headers it does provide (stdint.h, limits.h, stddef.h).
+GCC_INC="$(gcc -print-file-name=include)"
+
+INCLUDES="-nostdinc \
+  -isystem $LIBC/include \
+  -isystem $OPENSSL/include \
+  -isystem $ZLIB \
+  -isystem $GCC_INC"
+
+COMPILE_FLAGS="-O2 -fPIE -fno-builtin -ffreestanding -mno-red-zone \
+  -fno-stack-protector -fno-strict-aliasing -fno-tree-vectorize \
+  -D__LIKEOS__ -DHAVE_CONFIG_H"
+
+# Detect whether this is a link step (no -c / -E / -S among the args).
+link=1
+for a in "$@"; do
+  case "$a" in
+    -c|-E|-S) link=0 ;;
+  esac
+done
+
+if [ "$link" = 1 ]; then
+  # Link a LikeOS dynamic PIE.  crt1.o must precede the user objects, so it is
+  # injected right after the flags; configure appends conftest.c/objs after.
+  exec gcc $INCLUDES $COMPILE_FLAGS \
+    -nostdlib -pie \
+    -Wl,-T,"$LDS" -Wl,--hash-style=gnu -Wl,-z,now \
+    -Wl,-rpath,/lib -Wl,-dynamic-linker,/lib/ld-likeos.so \
+    -L"$LIBC" -L"$RTLD" -L"$ROOT/build" \
+    "$CRT1" "$@" -lc -l:ld-likeos.so
+else
+  exec gcc $INCLUDES $COMPILE_FLAGS "$@"
+fi

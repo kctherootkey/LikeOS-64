@@ -1818,6 +1818,8 @@ task_t *sched_fork_current(void)
 	 * parent's next waitpid(WUNTRACED/WCONTINUED) report a freshly forked,
 	 * running child as stopped. */
 	child->jc_stop_signo = 0;
+	child->term_sig = 0;
+	child->sigmask_restore_pending = 0;
 	child->jc_continued = 0;
 	child->id = sched_alloc_task_id();
 	child->pml4 = child_pml4;
@@ -2268,6 +2270,34 @@ void sched_mark_task_exited(task_t *task, int status)
 	}
 
 	local_irq_restore(irq_flags);
+
+	/* Now actually SEND the exit signal (normally SIGCHLD) to the parent.
+	 * Waking a parent that happens to be blocked in waitpid (above) is not
+	 * enough: a parent that instead sits in poll()/select() and relies on a
+	 * SIGCHLD *handler* to learn that a child died never heard anything, so
+	 * it never reaped the child.  That is why an sshd session stayed open
+	 * after its shell exited — sshd polls, and its SIGCHLD handler is what
+	 * triggers sending the exit status and closing the channel.
+	 *
+	 * Deliberately outside the IRQ-disabled section above: queuing a
+	 * siginfo allocates, which may sleep.  signal_send() itself is a no-op
+	 * when the parent leaves SIGCHLD at its default (ignored) disposition,
+	 * so a shell that only ever calls waitpid() pays nothing. */
+	if (should_notify_parent && task->parent && !task->parent->has_exited &&
+	    task->exit_signal != 0) {
+		siginfo_t ci;
+		mm_memset(&ci, 0, sizeof(ci));
+		ci.si_signo = task->exit_signal;
+		ci.si_pid = (int32_t)task->id;
+		if (task->term_sig != 0) {
+			ci.si_code = CLD_KILLED;
+			ci.si_status = task->term_sig;
+		} else {
+			ci.si_code = CLD_EXITED;
+			ci.si_status = task->exit_code & 0xFF;
+		}
+		signal_send(task->parent, task->exit_signal, &ci);
+	}
 }
 
 // ============================================================================
@@ -2311,6 +2341,7 @@ void sched_signal_task(task_t *task, int sig)
 			// Own context at a safe point (syscall level or the
 			// crash handler's abandoned frame): exit in place.
 			task->exit_code = 128 + sig;
+			task->term_sig = sig;
 			sched_mark_task_exited(task, 128 + sig);
 			// On SMP, do NOT call sched_schedule() here - the exception handler will
 			// loop with 'sti; hlt' and the timer will safely preempt us. Calling
@@ -2426,6 +2457,7 @@ void sched_signal_task(task_t *task, int sig)
 			// Own context at a safe delivery point: no kernel
 			// locks are held here, immediate exit is safe.
 			task->exit_code = 128 + sig;
+			task->term_sig = sig;
 			sched_mark_task_exited(task, 128 + sig);
 			// On SMP, let timer preemption switch us off this
 			// stack.  On single-CPU, schedule immediately.

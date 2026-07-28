@@ -202,6 +202,29 @@ static void _detect_size(void)
     }
 }
 
+int resizeterm(int lines, int columns);
+
+/* Re-read the terminal size and, if it changed, grow/shrink the standard
+ * windows to match.  Returns 1 when the size changed.
+ *
+ * An application does not have to use our SIGWINCH handler — it may install
+ * its own and then simply expect the library to notice the new size on the
+ * next endwin()/refresh() cycle (nano does exactly that, and documents it as
+ * "leave and immediately reenter curses mode, so that ncurses notices the new
+ * screen dimensions").  Re-querying here is what makes that work; without it
+ * an application that overrides the handler keeps painting at the old width,
+ * leaving the newly exposed columns full of stale text. */
+static int _update_screensize(void)
+{
+    int old_lines = LINES, old_cols = COLS;
+    _detect_size();
+    if (LINES == old_lines && COLS == old_cols)
+        return 0;
+    /* resizeterm() re-reads LINES/COLS itself, so pass the fresh values. */
+    resizeterm(LINES, COLS);
+    return 1;
+}
+
 /* ===================================================================
  * Apply current attributes to terminal
  * =================================================================== */
@@ -339,6 +362,10 @@ int endwin(void)
         tcsetattr(STDIN_FILENO, TCSANOW, &_saved_tios);
     _raw_mode = false;
     _is_endwin = true;
+
+    /* Leaving curses mode is the point at which an application expects the
+     * library to pick up a new terminal size (see _update_screensize). */
+    _update_screensize();
 
     _cur_applied_attrs = A_NORMAL;
     _cur_applied_pair  = 0;
@@ -625,6 +652,24 @@ int wnoutrefresh(WINDOW *win)
 int doupdate(void)
 {
     if (!curscr) return ERR;
+
+    /* Refreshing after endwin() RESUMES curses mode.  endwin() left the
+     * alternate screen, so without this the application would draw over the
+     * shell's normal screen and whatever it still contains.  This is also the
+     * path nano's resize takes (endwin(); refresh();), so pick up any new
+     * terminal size here and repaint everything at the new geometry. */
+    if (_is_endwin) {
+        _update_screensize();
+        _emits("\033[?1049h"); /* re-enter alternate screen */
+        _emits("\033[0m");
+        _cur_applied_attrs = A_NORMAL;
+        _cur_applied_pair  = 0;
+        _emits("\033[2J\033[H"); /* clear: no stale text in new columns */
+        _is_endwin = false;
+        /* Everything on screen is gone — force a full repaint. */
+        for (int i = 0; i <= curscr->_maxy; i++)
+            curscr->_dirty[i] = true;
+    }
 
     /* Force-reset terminal attributes at the start of every update
      * so the kernel ANSI state is known-good regardless of what
@@ -1290,10 +1335,12 @@ int wgetch(WINDOW *win)
     /* Flush output before reading */
     _flush();
 
-    /* Check resize signal */
+    /* Check resize signal.  Resize the standard windows too, not just the
+     * LINES/COLS globals — a caller that acts on KEY_RESIZE will start
+     * drawing at the new width immediately. */
     if (_got_resize) {
         _got_resize = 0;
-        _detect_size();
+        _update_screensize();
         return KEY_RESIZE;
     }
 

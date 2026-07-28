@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <sys/reboot.h>
 #include <sys/vfs.h>
+#include <sys/statvfs.h>
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/sysinfo.h>
@@ -103,6 +104,16 @@ int faccessat(int dirfd, const char *path, int mode, int flags)
 int chdir(const char *path)
 {
 	long ret = syscall1(SYS_CHDIR, (long)path);
+	if (ret < 0) {
+		errno = -ret;
+		return -1;
+	}
+	return 0;
+}
+
+int chroot(const char *path)
+{
+	long ret = syscall1(SYS_CHROOT, (long)path);
 	if (ret < 0) {
 		errno = -ret;
 		return -1;
@@ -209,6 +220,43 @@ int fstatfs(int fd, struct statfs *buf)
 		errno = -ret;
 		return -1;
 	}
+	return 0;
+}
+
+/* statvfs/fstatvfs: the POSIX filesystem-statistics interface.  The kernel
+ * only exposes the BSD statfs layout, so translate it into the statvfs one
+ * that callers (df, sftp-server) expect.  f_frsize falls back to the block
+ * size, and f_favail mirrors f_ffree (no root reservation on inodes). */
+static void statfs_to_statvfs(const struct statfs *s, struct statvfs *v)
+{
+	v->f_bsize = s->f_bsize;
+	v->f_frsize = s->f_frsize ? s->f_frsize : s->f_bsize;
+	v->f_blocks = s->f_blocks;
+	v->f_bfree = s->f_bfree;
+	v->f_bavail = s->f_bavail;
+	v->f_files = s->f_files;
+	v->f_ffree = s->f_ffree;
+	v->f_favail = s->f_ffree;
+	v->f_fsid = 0;
+	v->f_flag = s->f_flags;
+	v->f_namemax = s->f_namelen;
+}
+
+int statvfs(const char *path, struct statvfs *buf)
+{
+	struct statfs sf;
+	if (statfs(path, &sf) != 0)
+		return -1;
+	statfs_to_statvfs(&sf, buf);
+	return 0;
+}
+
+int fstatvfs(int fd, struct statvfs *buf)
+{
+	struct statfs sf;
+	if (fstatfs(fd, &sf) != 0)
+		return -1;
+	statfs_to_statvfs(&sf, buf);
 	return 0;
 }
 

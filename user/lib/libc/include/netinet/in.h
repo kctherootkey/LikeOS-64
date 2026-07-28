@@ -19,6 +19,36 @@
 
 #define IN_MULTICAST(a)  (((uint32_t)(a) & 0xF0000000U) == 0xE0000000U)
 
+/* Classful address predicates and the loopback network number (127.x). */
+#define IN_CLASSA(a)      ((((uint32_t)(a)) & 0x80000000U) == 0)
+#define IN_CLASSA_NET     0xff000000U
+#define IN_CLASSA_NSHIFT  24
+#define IN_CLASSB(a)      ((((uint32_t)(a)) & 0xc0000000U) == 0x80000000U)
+#define IN_CLASSB_NET     0xffff0000U
+#define IN_CLASSB_NSHIFT  16
+#define IN_CLASSC(a)      ((((uint32_t)(a)) & 0xe0000000U) == 0xc0000000U)
+#define IN_CLASSC_NET     0xffffff00U
+#define IN_CLASSC_NSHIFT  8
+#define IN_CLASSD(a)      ((((uint32_t)(a)) & 0xf0000000U) == 0xe0000000U)
+#define IN_EXPERIMENTAL(a) ((((uint32_t)(a)) & 0xe0000000U) == 0xe0000000U)
+#define IN_LOOPBACKNET    127
+
+/* Well-known TCP/UDP port ranges (standard <netinet/in.h> constants). */
+#define IPPORT_ECHO          7
+#define IPPORT_DISCARD       9
+#define IPPORT_SYSTAT        11
+#define IPPORT_DAYTIME       13
+#define IPPORT_NETSTAT       15
+#define IPPORT_FTP           21
+#define IPPORT_TELNET        23
+#define IPPORT_SMTP          25
+#define IPPORT_TIMESERVER    37
+#define IPPORT_NAMESERVER    42
+#define IPPORT_WHOIS         43
+#define IPPORT_HTTP          80
+#define IPPORT_RESERVED      1024 /* ports < 1024 are privileged */
+#define IPPORT_USERRESERVED  5000 /* dynamic/private ports start above here */
+
 // IP-level (SOL_IP / IPPROTO_IP) sockopts
 #define IP_TOS                 1
 #define IP_TTL                 2
@@ -101,6 +131,44 @@ extern const struct in6_addr in6addr_loopback;
 
 #define IN6ADDR_ANY_INIT      { { { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0 } } }
 #define IN6ADDR_LOOPBACK_INIT { { { 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1 } } }
+
+/* RFC 2553 address-test macros.  Operate on a (struct in6_addr *). */
+#define IN6_IS_ADDR_UNSPECIFIED(a) \
+	(((const uint32_t *)(a))[0] == 0 && ((const uint32_t *)(a))[1] == 0 && \
+	 ((const uint32_t *)(a))[2] == 0 && ((const uint32_t *)(a))[3] == 0)
+#define IN6_IS_ADDR_LOOPBACK(a) \
+	(((const uint32_t *)(a))[0] == 0 && ((const uint32_t *)(a))[1] == 0 && \
+	 ((const uint32_t *)(a))[2] == 0 && \
+	 ((const uint32_t *)(a))[3] == __builtin_bswap32(1))
+#define IN6_IS_ADDR_MULTICAST(a)  (((const uint8_t *)(a))[0] == 0xff)
+#define IN6_IS_ADDR_LINKLOCAL(a) \
+	((((const uint8_t *)(a))[0] == 0xfe) && \
+	 ((((const uint8_t *)(a))[1] & 0xc0) == 0x80))
+#define IN6_IS_ADDR_SITELOCAL(a) \
+	((((const uint8_t *)(a))[0] == 0xfe) && \
+	 ((((const uint8_t *)(a))[1] & 0xc0) == 0xc0))
+#define IN6_IS_ADDR_V4MAPPED(a) \
+	(((const uint32_t *)(a))[0] == 0 && ((const uint32_t *)(a))[1] == 0 && \
+	 ((const uint32_t *)(a))[2] == __builtin_bswap32(0x0000ffff))
+#define IN6_IS_ADDR_V4COMPAT(a) \
+	(((const uint32_t *)(a))[0] == 0 && ((const uint32_t *)(a))[1] == 0 && \
+	 ((const uint32_t *)(a))[2] == 0 && \
+	 __builtin_bswap32(((const uint32_t *)(a))[3]) > 1)
+#define IN6_IS_ADDR_MC_NODELOCAL(a) \
+	(IN6_IS_ADDR_MULTICAST(a) && ((((const uint8_t *)(a))[1] & 0xf) == 0x1))
+#define IN6_IS_ADDR_MC_LINKLOCAL(a) \
+	(IN6_IS_ADDR_MULTICAST(a) && ((((const uint8_t *)(a))[1] & 0xf) == 0x2))
+#define IN6_IS_ADDR_MC_SITELOCAL(a) \
+	(IN6_IS_ADDR_MULTICAST(a) && ((((const uint8_t *)(a))[1] & 0xf) == 0x5))
+#define IN6_IS_ADDR_MC_ORGLOCAL(a) \
+	(IN6_IS_ADDR_MULTICAST(a) && ((((const uint8_t *)(a))[1] & 0xf) == 0x8))
+#define IN6_IS_ADDR_MC_GLOBAL(a) \
+	(IN6_IS_ADDR_MULTICAST(a) && ((((const uint8_t *)(a))[1] & 0xf) == 0xe))
+#define IN6_ARE_ADDR_EQUAL(a, b) \
+	(((const uint32_t *)(a))[0] == ((const uint32_t *)(b))[0] && \
+	 ((const uint32_t *)(a))[1] == ((const uint32_t *)(b))[1] && \
+	 ((const uint32_t *)(a))[2] == ((const uint32_t *)(b))[2] && \
+	 ((const uint32_t *)(a))[3] == ((const uint32_t *)(b))[3])
 
 // Byte order conversion
 static inline uint16_t htons(uint16_t x) {

@@ -336,6 +336,12 @@ typedef struct task {
 
 	// Exit status tracking
 	int exit_code; // Exit status for waitpid
+	/* The signal that terminated this task, or 0 if it exited normally via
+	 * exit().  This is what distinguishes "killed by signal N" from
+	 * "exit(128+N)" — both otherwise land in exit_code, so a program that
+	 * exit()s with a status >= 128 (ssh uses 255) was misreported by
+	 * waitpid as signalled/stopped.  Only waitpid consumes it. */
+	int term_sig;
 	bool has_exited; // True when exit() was called
 	/* Job control: which stop signal stopped this task (0 = none) and
 	 * whether a continue is unreported.  Set on the stop/continue paths,
@@ -435,6 +441,23 @@ typedef struct task {
 
 	// Current working directory
 	char cwd[256];
+
+	/* ppoll()/pselect() install a temporary signal mask for the duration of
+	 * the wait.  The caller's mask must NOT be put back before the kernel
+	 * gets a chance to deliver what arrived — restoring it inline re-blocked
+	 * the signal, so the handler never ran even though the wait had already
+	 * returned EINTR.  Instead the original is parked here and put back
+	 * either by the signal frame (so sigreturn restores it after the
+	 * handler) or at syscall exit when no handler ran. */
+	int sigmask_restore_pending;
+	kernel_sigset_t sigmask_saved;
+
+	/* chroot() jail root.  Empty means "no jail" (the whole system root).
+	 * When set, textual path resolution (build_at_path) prepends it to the
+	 * canonicalised absolute path, and the canonicaliser already clamps
+	 * ".." at "/", so a jailed task cannot escape upward.  Inherited across
+	 * fork and preserved across exec. */
+	char root[256];
 
 	// Implicit console I/O flags (O_NONBLOCK etc., for when fd 0/1/2 are
 	// not backed by a real vfs_file but use the console TTY directly).

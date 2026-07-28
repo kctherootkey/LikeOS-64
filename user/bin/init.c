@@ -29,7 +29,7 @@ static pid_t spawn_getty(void)
 	pid_t pid = fork();
 	if (pid == 0) {
 		char *argv[] = { (char *)"getty", (char *)CONSOLE, NULL };
-		char *envp[] = { (char *)"PATH=/bin:/usr/local/bin", NULL };
+		char *envp[] = { (char *)"PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", NULL };
 		execve(GETTY_PATH, argv, envp);
 		/* exec failed */
 		_exit(127);

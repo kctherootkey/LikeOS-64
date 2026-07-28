@@ -82,10 +82,23 @@ static short fd_poll_one(int fd, short events)
 	if (fd < 0)
 		return POLLNVAL;
 
-	// Check if it's a console fd (0-2 with NULL entry).
-	// /dev/console is bidirectional, so any of fd 0/1/2 may be polled
-	// for both POLLIN and POLLOUT (matches real-tty semantics).
-	if (fd < 3) {
+	if ((unsigned)fd >= TASK_MAX_FDS)
+		return POLLNVAL;
+
+	void *entry = task_fds(cur)[fd];
+
+	/* The console is an EMPTY fd_table slot at 0/1/2 (the 1..3 dup markers
+	 * are handled further down).  It must be selected by the slot's
+	 * CONTENT, never by the descriptor NUMBER: deciding by number polled
+	 * the terminal even for a descriptor that had been redirected
+	 * elsewhere, so a program that polls its own stdin waited on the
+	 * console forever while its real input sat unread in a socket or pipe
+	 * (this is what hung sftp-server, whose stdin is an AF_UNIX socket).
+	 * /dev/console is bidirectional, so any of 0/1/2 may be polled for
+	 * both POLLIN and POLLOUT. */
+	if (!entry) {
+		if (fd >= 3)
+			return POLLNVAL;
 		short rev = 0;
 		if (events & (POLLIN | POLLRDNORM)) {
 			tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
@@ -96,13 +109,6 @@ static short fd_poll_one(int fd, short events)
 			rev |= POLLOUT | POLLWRNORM;
 		return rev;
 	}
-
-	if ((unsigned)fd >= TASK_MAX_FDS)
-		return POLLNVAL;
-
-	void *entry = task_fds(cur)[fd];
-	if (!entry)
-		return POLLNVAL;
 
 	// Socket fd marker
 	if (IS_SOCKET_FD(entry)) {
@@ -292,6 +298,20 @@ int sys_select_internal(int nfds, fd_set *readfds, fd_set *writefds,
 			return 0;
 		}
 
+		/* A deliverable signal must break the wait: a signal handler only
+		 * runs on the way back to user mode, so a task that just keeps
+		 * sleeping here never runs it.  This silently broke every
+		 * event-driven program — a terminal app blocked in poll() never
+		 * saw SIGWINCH (window resizes were ignored) and a server never
+		 * saw SIGCHLD (children were never reaped, so a session never
+		 * closed).  signal_pending() ignores masked signals, so a
+		 * blocked signal cannot spin us here. */
+		{
+			task_t *_cur = sched_current();
+			if (_cur && signal_pending(_cur))
+				return -EINTR;
+		}
+
 		poll_sleep_until_next_tick(deadline,
 					   timeout_ticks != (uint64_t)-1);
 	}
@@ -331,6 +351,20 @@ int sys_poll_internal(struct pollfd *fds, int nfds, uint64_t timeout_ticks)
 
 		if (timeout_ticks != (uint64_t)-1 && timer_ticks() >= deadline)
 			return 0;
+
+		/* A deliverable signal must break the wait: a signal handler only
+		 * runs on the way back to user mode, so a task that just keeps
+		 * sleeping here never runs it.  This silently broke every
+		 * event-driven program — a terminal app blocked in poll() never
+		 * saw SIGWINCH (window resizes were ignored) and a server never
+		 * saw SIGCHLD (children were never reaped, so a session never
+		 * closed).  signal_pending() ignores masked signals, so a
+		 * blocked signal cannot spin us here. */
+		{
+			task_t *_cur = sched_current();
+			if (_cur && signal_pending(_cur))
+				return -EINTR;
+		}
 
 		poll_sleep_until_next_tick(deadline,
 					   timeout_ticks != (uint64_t)-1);
@@ -529,6 +563,20 @@ int epoll_wait_internal(int epfd_idx, struct epoll_event *events, int maxevents,
 
 		if (timeout_ticks != (uint64_t)-1 && timer_ticks() >= deadline)
 			return 0;
+
+		/* A deliverable signal must break the wait: a signal handler only
+		 * runs on the way back to user mode, so a task that just keeps
+		 * sleeping here never runs it.  This silently broke every
+		 * event-driven program — a terminal app blocked in poll() never
+		 * saw SIGWINCH (window resizes were ignored) and a server never
+		 * saw SIGCHLD (children were never reaped, so a session never
+		 * closed).  signal_pending() ignores masked signals, so a
+		 * blocked signal cannot spin us here. */
+		{
+			task_t *_cur = sched_current();
+			if (_cur && signal_pending(_cur))
+				return -EINTR;
+		}
 
 		poll_sleep_until_next_tick(deadline,
 					   timeout_ticks != (uint64_t)-1);

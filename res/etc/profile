@@ -5,7 +5,7 @@
 # by itself, so source it here: the prompt and the other interactive settings
 # then apply to login and non-login shells alike.
 
-export PATH=/bin:/usr/local/bin
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 export PAGER=less
 export EDITOR=nano
 

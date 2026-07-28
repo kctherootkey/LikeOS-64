@@ -26,7 +26,10 @@ extern "C" {
 #endif
 
 typedef int wint_t;
+#ifndef __wchar_t_defined
+#define __wchar_t_defined
 typedef int wchar_t;
+#endif
 
 /* Multibyte conversion state */
 typedef struct {

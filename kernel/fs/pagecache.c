@@ -431,10 +431,17 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 					unsigned long sp = pg->page_index % ppb;
 					unsigned long dc = pc_walk_chain(
 						sb, pg->cluster_id, ci);
-					if (dc >= 2 && dc < eoc) {
-						unsigned long lba =
-							vfs_sb_block_to_lba(sb,
-									    dc);
+					unsigned long dc_lba =
+						(dc >= 2 && dc < eoc) ?
+							vfs_sb_block_to_lba(sb, dc) :
+							0;
+					/* lba 0 == a hole (block_to_lba sentinel)
+					 * or an unmapped block.  Writing a dirty
+					 * page there would clobber the superblock
+					 * and needs block allocation we do not do;
+					 * leave it dirty instead. */
+					if (dc >= 2 && dc < eoc && dc_lba != 0) {
+						unsigned long lba = dc_lba;
 						if (bs == PAGE_SIZE) {
 							pc_write_sectors(
 								bdev, lba,
@@ -478,10 +485,13 @@ unsigned long pagecache_shrink(unsigned long nr_pages, int flush_dirty)
 						unsigned long lba =
 							vfs_sb_block_to_lba(
 								sb, cur);
-						pc_write_sectors(bdev, lba,
-								 secs_per_block,
-								 pg->data +
-									 off);
+						/* Skip holes (lba 0): never
+						 * write over the superblock. */
+						if (lba != 0)
+							pc_write_sectors(
+								bdev, lba,
+								secs_per_block,
+								pg->data + off);
 						off += bs;
 						if (c + 1 < bpp)
 							cur = vfs_sb_next_block(
@@ -646,6 +656,31 @@ static pc_page_t *pc_coalesced_read(vfs_superblock_t *sb,
 				break;
 			}
 			page_lba = vfs_sb_block_to_lba(sb, fc);
+		}
+
+		/* A hole maps to LBA 0 (block_to_lba's sentinel — LBA 0 is the
+		 * boot/superblock, never file data).  It must read as zeros, not
+		 * as whatever is on the disk there.  End any run in progress
+		 * before the hole; if the requested page itself is the hole,
+		 * hand back a freshly zeroed page. */
+		if (page_lba == 0) {
+			if (run_count > 0)
+				break;
+			if (split)
+				sb->ops->unlock_map(sb);
+			else
+				vfs_sb_unlock_io(sb);
+			pc_page_t *zpg = pc_page_alloc();
+			if (!zpg)
+				return 0;
+			zpg->cluster_id = cluster_id;
+			zpg->page_index = page_index;
+			mm_memset(zpg->data, 0, PAGE_SIZE);
+			zpg->flags = PC_PAGE_VALID | PC_PAGE_REFERENCED;
+			pc_page_t *zr = pagecache_insert(zpg);
+			if (zr != zpg)
+				pc_page_free(zpg);
+			return zr;
 		}
 
 		if (run_count == 0) {
@@ -874,6 +909,13 @@ pc_page_t *pagecache_get(unsigned long cluster_id, unsigned long page_index,
 		unsigned long secs_per_block = bs / ss;
 		unsigned offset = 0;
 		for (unsigned long c = 0; c < nlba; c++) {
+			/* LBA 0 marks a hole (see block_to_lba): zero-fill the
+			 * block rather than reading the on-disk superblock. */
+			if (lbas[c] == 0) {
+				mm_memset(new_pg->data + offset, 0, bs);
+				offset += bs;
+				continue;
+			}
 			int st = pc_read_sectors(bdev, lbas[c], secs_per_block,
 						 new_pg->data + offset);
 			if (st != 0) {
@@ -1014,6 +1056,13 @@ int pagecache_flush_file(unsigned long cluster_id)
 				unsigned long lba =
 					vfs_sb_block_to_lba(sb, disk_block);
 
+				/* lba 0 marks a hole: never persist a dirty
+				 * page there (it is the superblock, and a hole
+				 * needs allocation we do not do); leave dirty. */
+				if (lba == 0) {
+					p->flags &= ~PC_PAGE_LOCKED;
+					continue;
+				}
 				if (bs == PAGE_SIZE) {
 					pc_write_sectors(bdev, lba,
 							 secs_per_block,
@@ -1048,9 +1097,12 @@ int pagecache_flush_file(unsigned long cluster_id)
 						break;
 					unsigned long lba = vfs_sb_block_to_lba(
 						sb, cur_block);
-					pc_write_sectors(bdev, lba,
-							 secs_per_block,
-							 p->data + offset);
+					/* Skip holes (lba 0) — never write the
+					 * superblock. */
+					if (lba != 0)
+						pc_write_sectors(bdev, lba,
+								 secs_per_block,
+								 p->data + offset);
 					offset += bs;
 					if (c + 1 < bpp)
 						cur_block = vfs_sb_next_block(
@@ -1151,6 +1203,12 @@ int pagecache_flush_all(void)
 
 				unsigned long lba =
 					vfs_sb_block_to_lba(sb, disk_block);
+				/* lba 0 marks a hole: never persist a dirty page
+				 * there (superblock; needs allocation). */
+				if (lba == 0) {
+					p->flags &= ~PC_PAGE_LOCKED;
+					continue;
+				}
 				if (bs == PAGE_SIZE) {
 					pc_write_sectors(bdev, lba,
 							 secs_per_block,
@@ -1185,9 +1243,12 @@ int pagecache_flush_all(void)
 						break;
 					unsigned long lba = vfs_sb_block_to_lba(
 						sb, cur_block);
-					pc_write_sectors(bdev, lba,
-							 secs_per_block,
-							 p->data + offset);
+					/* Skip holes (lba 0) — never write the
+					 * superblock. */
+					if (lba != 0)
+						pc_write_sectors(bdev, lba,
+								 secs_per_block,
+								 p->data + offset);
 					offset += bs;
 					if (c + 1 < bpp)
 						cur_block = vfs_sb_next_block(

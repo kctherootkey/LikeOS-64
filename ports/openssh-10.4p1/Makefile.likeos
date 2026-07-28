@@ -1,0 +1,51 @@
+# Makefile.likeos — build OpenSSH 10.4p1 for LikeOS-64.
+#
+# The port is configured by likeos-configure.sh (which drives the stock
+# autoconf configure through the likeos-cc cross wrapper) and then built with
+# the configure-generated Makefile.  A stamp file records that configuration
+# has happened so repeat builds are incremental.
+#
+# Outputs (in this directory): ssh sshd sshd-session sshd-auth scp sftp
+#   ssh-keygen sftp-server ssh-agent ssh-add ssh-keyscan ...
+
+STAMP := .likeos-configured
+
+# The programs configure's Makefile builds (its $(TARGETS)); repeated here so
+# distclean can remove them without that Makefile.
+TARGETS := ssh sshd sshd-session sshd-auth ssh-add ssh-keygen ssh-keyscan \
+	   ssh-keysign ssh-pkcs11-helper ssh-agent scp sftp-server sftp \
+	   ssh-sk-helper
+
+.PHONY: all clean distclean configure
+
+all: $(STAMP)
+	$(MAKE) -f Makefile
+
+$(STAMP): likeos-configure.sh likeos-cc
+	$(SHELL) ./likeos-configure.sh
+	@touch $(STAMP)
+
+configure:
+	$(SHELL) ./likeos-configure.sh
+	@touch $(STAMP)
+
+clean:
+	-$(MAKE) -f Makefile clean 2>/dev/null || true
+	rm -f *.o openbsd-compat/*.o
+
+# distclean returns the tree to just-unpacked + the port's own files
+# (Makefile.likeos, likeos-configure.sh, likeos-cc).
+#
+# The removals below are spelled out rather than left entirely to the
+# configure-generated Makefile: that Makefile is itself one of the things being
+# deleted, so once it is gone the delegation silently becomes a no-op and any
+# leftover binaries/objects would stay in the tree forever.  Repeating the work
+# here makes the target idempotent.
+distclean:
+	-$(MAKE) -f Makefile distclean 2>/dev/null || true
+	rm -f $(STAMP) likeos.cache config.h config.status config.log config.cache
+	rm -f Makefile openbsd-compat/Makefile openbsd-compat/regress/Makefile
+	rm -f $(TARGETS)
+	rm -f *.o *.a openbsd-compat/*.o openbsd-compat/*.a
+	rm -f *.out opensshd.init openssh.xml buildpkg.sh survey.sh
+	rm -rf openbsd-compat/include autom4te.cache

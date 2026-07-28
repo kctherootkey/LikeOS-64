@@ -305,7 +305,8 @@ ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
 	netstress openssltest usbtest ext4test permbench fbtest
 # Full prerequisite set for the ext4 image (every staged build artifact).
-GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS))
+GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS)) \
+	$(BUILD_DIR)/openssh/bin/ssh
 
 # Default target: build the single ext4 GPT USB disk.
 all: $(GPT_DISK)
@@ -1173,6 +1174,44 @@ $(BUILD_DIR)/curl: ports-curl | $(BUILD_DIR)
 $(BUILD_DIR)/libcurl.so.4: ports-curl | $(BUILD_DIR)
 	@# copied by Makefile.likeos already
 
+# ---------------------------------------------------------------------------
+# OpenSSH (ssh/scp/sftp/ssh-keygen + sshd server suite).  Links the LikeOS
+# libc, ported OpenSSL (libcrypto/libssl) and zlib.  The port is configured
+# and built by its own Makefile.likeos (see ports/openssh-10.4p1); this target
+# also renders fresh host keys with the BUILD machine's ssh-keygen so the
+# image ships a ready-to-run sshd.
+# ---------------------------------------------------------------------------
+OPENSSH_DIR   = ports/openssh-10.4p1
+# /usr/bin clients + /usr/sbin daemon + /usr/libexec helpers
+OPENSSH_UBIN  = ssh scp sftp ssh-keygen ssh-add ssh-agent ssh-keyscan
+OPENSSH_SBIN  = sshd
+OPENSSH_LIBX  = sshd-session sshd-auth sftp-server ssh-keysign \
+                ssh-pkcs11-helper ssh-sk-helper
+OPENSSH_ALL   = $(OPENSSH_UBIN) $(OPENSSH_SBIN) $(OPENSSH_LIBX)
+OPENSSH_HOSTKEYS = ssh_host_rsa_key ssh_host_ecdsa_key ssh_host_ed25519_key
+
+.PHONY: ports-openssh
+ports-openssh: userland-libc userland-rtld ports-openssl ports-zlib | $(BUILD_DIR)
+	$(MAKE) -C $(OPENSSH_DIR) -f Makefile.likeos
+	mkdir -p $(BUILD_DIR)/openssh/bin $(BUILD_DIR)/openssh/etc
+	for b in $(OPENSSH_ALL); do \
+		cp $(OPENSSH_DIR)/$$b $(BUILD_DIR)/openssh/bin/$$b; \
+		$(STRIP) --strip-unneeded $(BUILD_DIR)/openssh/bin/$$b 2>/dev/null || true; \
+	done
+	cp $(OPENSSH_DIR)/sshd_config $(OPENSSH_DIR)/ssh_config \
+	   $(OPENSSH_DIR)/moduli $(BUILD_DIR)/openssh/etc/
+	# Fresh host keys, generated with the host's ssh-keygen (the target's own
+	# ssh-keygen cannot run here).  -N '' = no passphrase (host keys never
+	# have one); regenerated only when missing so rebuilds are stable.
+	for t in rsa ecdsa ed25519; do \
+		k=$(BUILD_DIR)/openssh/etc/ssh_host_$${t}_key; \
+		[ -f $$k ] || ssh-keygen -q -t $$t -f $$k -N '' -C likeos-host; \
+	done
+
+# Sentinel the image build depends on (first client + the daemon + a helper).
+$(BUILD_DIR)/openssh/bin/ssh: ports-openssh | $(BUILD_DIR)
+	@# built and copied by ports-openssh above
+
 
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel.lds | $(BUILD_DIR)
 	@echo "Building LikeOS-64 kernel as ELF64..."
@@ -1216,11 +1255,14 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	@echo "Assembling ext4 root staging tree from build artifacts..."
 	rm -rf $(EXT4_STAGING)
 	mkdir -p $(EXT4_STAGING)/boot $(EXT4_STAGING)/bin $(EXT4_STAGING)/sbin \
-		$(EXT4_STAGING)/lib $(EXT4_STAGING)/usr/bin \
+		$(EXT4_STAGING)/lib $(EXT4_STAGING)/usr/bin $(EXT4_STAGING)/usr/sbin \
+		$(EXT4_STAGING)/usr/libexec \
 		$(EXT4_STAGING)/usr/local/bin $(EXT4_STAGING)/usr/share/man/man1 \
 		$(EXT4_STAGING)/usr/share/nano $(EXT4_STAGING)/res \
-		$(EXT4_STAGING)/etc/ssl/certs $(EXT4_STAGING)/root $(EXT4_STAGING)/home \
-		$(EXT4_STAGING)/tmp
+		$(EXT4_STAGING)/etc/ssl/certs $(EXT4_STAGING)/etc/ssh \
+		$(EXT4_STAGING)/root $(EXT4_STAGING)/home \
+		$(EXT4_STAGING)/var/empty $(EXT4_STAGING)/var/run \
+		$(EXT4_STAGING)/var/log $(EXT4_STAGING)/tmp
 	# Kernel lives ONLY at /boot/kernel.elf (the bootloader loads it from ext4)
 	cp $(KERNEL_ELF) $(EXT4_STAGING)/boot/kernel.elf
 	# Userland programs -> /bin
@@ -1271,6 +1313,21 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp res/etc/hosts         $(EXT4_STAGING)/etc/hosts
 	cp res/etc/resolv.conf   $(EXT4_STAGING)/etc/resolv.conf
 	cp res/nanorc            $(EXT4_STAGING)/etc/nanorc
+	# --- OpenSSH: clients -> /usr/bin, daemon -> /usr/sbin, helpers -> /usr/libexec
+	for b in $(OPENSSH_UBIN); do cp $(BUILD_DIR)/openssh/bin/$$b $(EXT4_STAGING)/usr/bin/$$b; done
+	for b in $(OPENSSH_SBIN); do cp $(BUILD_DIR)/openssh/bin/$$b $(EXT4_STAGING)/usr/sbin/$$b; done
+	for b in $(OPENSSH_LIBX); do cp $(BUILD_DIR)/openssh/bin/$$b $(EXT4_STAGING)/usr/libexec/$$b; done
+	# OpenSSH config + moduli + host keys (private keys mode 0600)
+	cp $(BUILD_DIR)/openssh/etc/sshd_config $(EXT4_STAGING)/etc/ssh/sshd_config
+	cp $(BUILD_DIR)/openssh/etc/ssh_config  $(EXT4_STAGING)/etc/ssh/ssh_config
+	cp $(BUILD_DIR)/openssh/etc/moduli      $(EXT4_STAGING)/etc/ssh/moduli
+	for t in rsa ecdsa ed25519; do \
+		cp $(BUILD_DIR)/openssh/etc/ssh_host_$${t}_key     $(EXT4_STAGING)/etc/ssh/; \
+		cp $(BUILD_DIR)/openssh/etc/ssh_host_$${t}_key.pub $(EXT4_STAGING)/etc/ssh/; \
+	done
+	chmod 0600 $(EXT4_STAGING)/etc/ssh/ssh_host_*_key
+	chmod 0644 $(EXT4_STAGING)/etc/ssh/ssh_host_*_key.pub $(EXT4_STAGING)/etc/ssh/sshd_config $(EXT4_STAGING)/etc/ssh/ssh_config
+	chmod 0700 $(EXT4_STAGING)/var/empty
 	# User/group/shadow databases (root:toor preconfigured, yescrypt hash)
 	cp res/etc/passwd        $(EXT4_STAGING)/etc/passwd
 	cp res/etc/group         $(EXT4_STAGING)/etc/group
@@ -1525,6 +1582,8 @@ distclean: clean
 	$(MAKE) -C ports/netcat-OpenBSD -f Makefile.likeos clean
 	$(MAKE) -C ports/openssl-3.5.6 -f Makefile.likeos clean
 	$(MAKE) -C ports/curl-8.14.1 -f Makefile.likeos clean
+	$(MAKE) -C ports/openssh-10.4p1 -f Makefile.likeos distclean
+	rm -rf $(BUILD_DIR)/openssh
 
 # Regenerate res/man/bash.1 from the port's troff source.  man(1) reads
 # PRE-FORMATTED (catman) text, not troff, so the upstream doc/bash.1 has to be
@@ -1535,6 +1594,21 @@ bash-manpage:
 	GROFF_NO_SGR=1 groff -t -e -mandoc -Tascii -rLL=78n -rLT=78n \
 		ports/bash-5.2.37/doc/bash.1 | col -bx > res/man/bash.1
 	@echo "res/man/bash.1 regenerated ($$(wc -l < res/man/bash.1) lines)"
+
+# Regenerate the OpenSSH catman pages in res/man from the port's mdoc sources.
+# Like bash-manpage this is a maintenance target, not part of the build: the
+# rendered pages are checked in and groff is not a build dependency.  Every
+# page is stored as NAME.1 because LikeOS keeps a single flat man1 catman dir.
+.PHONY: openssh-manpages
+openssh-manpages:
+	@for m in ssh.1 scp.1 sftp.1 ssh-keygen.1 ssh-add.1 ssh-agent.1 \
+		 ssh-keyscan.1 sshd.8 sftp-server.8 ssh-keysign.8 ssh-sk-helper.8 \
+		 ssh-pkcs11-helper.8 ssh_config.5 sshd_config.5 moduli.5; do \
+		base=$$(echo $$m | sed 's/\.[0-9]$$//'); \
+		GROFF_NO_SGR=1 groff -Tascii -mandoc ports/openssh-10.4p1/$$m \
+			| col -bx > res/man/$$base.1; \
+		echo "  res/man/$$base.1 ($$(wc -l < res/man/$$base.1) lines)"; \
+	done
 
 # Install dependencies (Ubuntu/Debian)
 deps:

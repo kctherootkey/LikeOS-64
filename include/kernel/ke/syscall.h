@@ -216,6 +216,7 @@
 #define SYS_FLISTXATTR 397 // (fd, list, size)
 #define SYS_FREMOVEXATTR 398 // (fd, name)
 #define SYS_DEBUG_DUMP 399 // () root-only: dump TCP/AF_UNIX/PTY tables + tasks
+#define SYS_CHROOT 400 // (path) root-only: confine textual path resolution to a subtree
 
 // rusage who values
 #define RUSAGE_SELF 0

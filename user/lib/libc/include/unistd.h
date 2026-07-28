@@ -36,6 +36,7 @@ int getdtablesize(void);
 int access(const char* path, int mode);
 int faccessat(int dirfd, const char* path, int mode, int flags);
 int chdir(const char* path);
+int chroot(const char* path);
 char* getcwd(char* buf, size_t size);
 
 // User/group IDs

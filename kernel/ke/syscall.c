@@ -982,7 +982,7 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 	vfs_file_t *file = NULL;
 	const char *path = kpath;
 	char full[VFS_MAX_PATH];
-	if (path[0] != '/') {
+	if (path[0] != '/' || cur->root[0]) {
 		int brest =
 			build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
 		if (brest != 0)
@@ -1061,6 +1061,15 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
 		for (; kpath[i] && i < sizeof(full) - 1; ++i)
 			full[i] = kpath[i];
 		full[i] = '\0';
+		/* A jailed task's absolute paths must be canonicalised and
+		 * prefixed with the jail root; build_at_path does both.  No-op
+		 * (verbatim copy stands) when the task is not chrooted. */
+		if (cur->root[0]) {
+			int _cr = build_at_path(cur, AT_FDCWD, kpath, full,
+						sizeof(full));
+			if (_cr != 0)
+				return _cr;
+		}
 	} else {
 		ret = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
 		if (ret != 0)
@@ -1294,7 +1303,7 @@ static int64_t sys_stat(uint64_t pathname, uint64_t stat_buf)
 	if (cret != 0)
 		return cret;
 
-	if (kpath[0] == '/') {
+	if (kpath[0] == '/' && cur->root[0] == '\0') {
 		return sys_stat_common(kpath, stat_buf, 0);
 	}
 	char full[VFS_MAX_PATH];
@@ -1320,7 +1329,7 @@ static int64_t sys_lstat(uint64_t pathname, uint64_t stat_buf)
 
 	const char *p = kpath;
 	char full[VFS_MAX_PATH];
-	if (kpath[0] != '/') {
+	if (kpath[0] != '/' || cur->root[0]) {
 		int ret =
 			build_at_path(cur, AT_FDCWD, kpath, full, sizeof(full));
 		if (ret != 0)
@@ -1414,6 +1423,16 @@ static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 		// Security: Use SMAP-aware copy to user
 		return copy_to_user((void *)stat_buf, &st, sizeof(st));
 	}
+	/* Regular file: report the REAL inode metadata (mode/uid/gid/size/
+	 * times) from the filesystem.  fstat() used to hardcode 0644 root:root,
+	 * so a program that opens a file and enforces its permission bits via
+	 * fstat — sshd rejecting a host key that is not 0600, for one — saw the
+	 * wrong mode even though stat() on the path reported the truth. */
+	if (vfs_fstat(file, &st) == ST_OK) {
+		// Security: Use SMAP-aware copy to user
+		return copy_to_user((void *)stat_buf, &st, sizeof(st));
+	}
+	/* Filesystem cannot report fd metadata: sane regular-file default. */
 	st.st_mode = S_IFREG | (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 	st.st_size = vfs_size(file);
 	// Security: Use SMAP-aware copy to user
@@ -1444,6 +1463,15 @@ static int64_t sys_fstatat(uint64_t dirfd, uint64_t pathname, uint64_t stat_buf,
 		for (; kpath[i] && i < sizeof(full) - 1; ++i)
 			full[i] = kpath[i];
 		full[i] = '\0';
+		/* A jailed task's absolute paths must be canonicalised and
+		 * prefixed with the jail root; build_at_path does both.  No-op
+		 * (verbatim copy stands) when the task is not chrooted. */
+		if (cur->root[0]) {
+			int _cr = build_at_path(cur, AT_FDCWD, kpath, full,
+						sizeof(full));
+			if (_cr != 0)
+				return _cr;
+		}
 	} else {
 		int ret = build_at_path(cur, (int)dirfd, kpath, full,
 					sizeof(full));
@@ -1469,7 +1497,7 @@ static int64_t sys_access(uint64_t pathname, uint64_t mode)
 
 	const char *path = kpath;
 	char full[VFS_MAX_PATH];
-	if (path[0] != '/') {
+	if (path[0] != '/' || cur->root[0]) {
 		int retb =
 			build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
 		if (retb != 0)
@@ -1520,6 +1548,15 @@ static int64_t sys_faccessat(uint64_t dirfd, uint64_t pathname, uint64_t mode,
 		for (; kpath[i] && i < sizeof(full) - 1; ++i)
 			full[i] = kpath[i];
 		full[i] = '\0';
+		/* A jailed task's absolute paths must be canonicalised and
+		 * prefixed with the jail root; build_at_path does both.  No-op
+		 * (verbatim copy stands) when the task is not chrooted. */
+		if (cur->root[0]) {
+			int _cr = build_at_path(cur, AT_FDCWD, kpath, full,
+						sizeof(full));
+			if (_cr != 0)
+				return _cr;
+		}
 	} else {
 		int ret = build_at_path(cur, (int)dirfd, kpath, full,
 					sizeof(full));
@@ -1621,6 +1658,62 @@ static int64_t sys_chdir(uint64_t pathname)
 	for (; full[i] && i < sizeof(cur->cwd) - 1; ++i)
 		cur->cwd[i] = full[i];
 	cur->cwd[i] = '\0';
+	return 0;
+}
+
+/* SYS_CHROOT — confine the calling task (and its future children) to a
+ * subtree.  Privileged operation.  The target is resolved through the normal
+ * path machinery, so a chroot INSIDE an existing jail nests correctly, and the
+ * stored root is the real, canonical, already-jail-prefixed absolute path.
+ * Enforcement happens in build_at_path/apply_chroot for every later textual
+ * path; the caller is expected to chdir("/") afterwards, exactly as on other
+ * Unix systems. */
+static int64_t sys_chroot(uint64_t pathname)
+{
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+	if (!validate_user_ptr(pathname, 1))
+		return -EFAULT;
+	if (!capable())
+		return -EPERM;
+
+	char kpath[VFS_MAX_PATH];
+	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (cret != 0)
+		return cret;
+
+	/* Resolve to a canonical absolute path WITH any current jail applied. */
+	char full[VFS_MAX_PATH];
+	int ret = build_at_path(cur, AT_FDCWD, kpath, full, sizeof(full));
+	if (ret != 0)
+		return ret;
+
+	/* Target must exist and be a directory. */
+	struct kstat st;
+	int vret = vfs_stat(full, &st);
+	if (vret == ST_NOT_FOUND)
+		return -ENOENT;
+	if (vret == ST_IO)
+		return -EIO;
+	if (vret != ST_OK)
+		return -ENOTDIR;
+	if ((st.st_mode & S_IFMT) != S_IFDIR)
+		return -ENOTDIR;
+
+	/* Store as the new jail root (drop a trailing slash; "/" clears it). */
+	size_t n = 0;
+	while (full[n])
+		n++;
+	while (n > 1 && full[n - 1] == '/')
+		n--;
+	if (n >= sizeof(cur->root))
+		return -ENAMETOOLONG;
+	mm_memset(cur->root, 0, sizeof(cur->root));
+	if (!(n == 1 && full[0] == '/')) {
+		for (size_t i = 0; i < n; i++)
+			cur->root[i] = full[i];
+	}
 	return 0;
 }
 
@@ -2196,6 +2289,36 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp)
 	if (!file) {
 		return -EBADF;
 	}
+
+	/* AF_UNIX and epoll descriptors are fd-table MARKERS (small tagged
+	 * integers), not vfs_file pointers, and a pipe end is a pipe object
+	 * rather than a devfs file.  All three have to be classified HERE:
+	 * the devfs fallthrough below dereferences whatever it is handed, so
+	 * an ioctl() on a unix socket faulted the kernel on the marker value
+	 * itself (scp hit this — ssh probes its socketpair with tcgetattr).
+	 * The numeric marker tests come first because they dereference
+	 * nothing. */
+	if (IS_UNIX_SOCKET_FD(file)) {
+		unix_socket_t *us = unix_get((int)(uintptr_t)file);
+		if (!us)
+			return -EBADF;
+		if (req == 0x5421 /* FIONBIO */) {
+			if (!argp || !validate_user_ptr(argp, sizeof(int)))
+				return -EFAULT;
+			int on = 0;
+			if (copy_from_user(&on, (void *)argp, sizeof(on)) != 0)
+				return -EFAULT;
+			us->nonblock = on ? 1 : 0;
+			return 0;
+		}
+		/* Not a terminal: what tcgetattr()/isatty() expect to see. */
+		return -ENOTTY;
+	}
+	if (IS_EPOLL_FD(file))
+		return -ENOTTY;
+	if (pipe_is_end(file))
+		return -ENOTTY;
+
 	return devfs_ioctl(file, (unsigned long)req, (void *)argp, cur);
 }
 
@@ -2857,6 +2980,15 @@ static int64_t sys_utimensat(uint64_t dirfd, uint64_t pathname, uint64_t times,
 		for (; kpath[i] && i < sizeof(full) - 1; ++i)
 			full[i] = kpath[i];
 		full[i] = '\0';
+		/* A jailed task's absolute paths must be canonicalised and
+		 * prefixed with the jail root; build_at_path does both.  No-op
+		 * (verbatim copy stands) when the task is not chrooted. */
+		if (cur->root[0]) {
+			int _cr = build_at_path(cur, AT_FDCWD, kpath, full,
+						sizeof(full));
+			if (_cr != 0)
+				return _cr;
+		}
 	} else {
 		int bret = build_at_path(cur, (int)dirfd, kpath, full,
 					 sizeof(full));
@@ -3416,6 +3548,37 @@ static int normalize_path(const char *base, const char *path, char *out,
 	return 0;
 }
 
+/* Prepend the task's chroot root to an already-canonical absolute path.
+ * `abs` starts with '/', has no ".." (normalize_path guarantees both), so the
+ * result stays inside the jail.  A no-op when the task is not chrooted. */
+static int apply_chroot(task_t *cur, char *abs, size_t out_size)
+{
+	if (!cur || cur->root[0] == '\0')
+		return 0;
+	size_t rlen = 0;
+	while (cur->root[rlen])
+		rlen++;
+	/* "/" inside the jail is just the jail root itself. */
+	size_t alen = 0;
+	while (abs[alen])
+		alen++;
+	int only_slash = (alen == 1 && abs[0] == '/');
+	size_t need = rlen + (only_slash ? 0 : alen) + 1;
+	if (need > out_size)
+		return -ENAMETOOLONG;
+	/* Shift abs right by rlen (unless it is bare "/"), then copy root in. */
+	if (only_slash) {
+		for (size_t i = 0; i <= rlen; i++)
+			abs[i] = cur->root[i];
+	} else {
+		for (size_t i = alen + 1; i-- > 0;)
+			abs[i + rlen] = abs[i];
+		for (size_t i = 0; i < rlen; i++)
+			abs[i] = cur->root[i];
+	}
+	return 0;
+}
+
 static int build_at_path(task_t *cur, int dirfd, const char *path, char *out,
 			 size_t out_size)
 {
@@ -3425,7 +3588,10 @@ static int build_at_path(task_t *cur, int dirfd, const char *path, char *out,
 		return -ENOTDIR;
 	}
 	const char *cwd = (cur->cwd[0] != 0) ? cur->cwd : "/";
-	return normalize_path(cwd, path, out, out_size);
+	int r = normalize_path(cwd, path, out, out_size);
+	if (r != 0)
+		return r;
+	return apply_chroot(cur, out, out_size);
 }
 
 // SYS_BRK - set program break
@@ -4024,11 +4190,15 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 		if (child) {
 			// Found a zombie child - reap it
 			int status = 0;
-			if (child->exit_code >= 128 && child->exit_code < 256) {
-				// Signaled exit: low 7 bits are signal number
-				status = (child->exit_code - 128) & 0x7F;
+			if (child->term_sig != 0) {
+				// Killed by a signal: WIFSIGNALED, low 7 bits =
+				// signal number.  Distinguished from exit(128+N)
+				// by the explicit term_sig flag — exit_code alone
+				// is ambiguous (a program exiting with a status
+				// >= 128, e.g. ssh's 255, is NOT a signal death).
+				status = child->term_sig & 0x7F;
 			} else {
-				// Normal exit: exit_code << 8
+				// Normal exit: exit_code << 8 (WIFEXITED)
 				status = (child->exit_code & 0xFF) << 8;
 			}
 
@@ -5389,6 +5559,8 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	 * duplicated the parent's, which would make the parent's next
 	 * waitpid(WUNTRACED/WCONTINUED) report this running child as stopped. */
 	child->jc_stop_signo = 0;
+	child->term_sig = 0;
+	child->sigmask_restore_pending = 0;
 	child->jc_continued = 0;
 	child->state = TASK_READY;
 	child->kernel_stack_top = k_stack_top;
@@ -6697,6 +6869,50 @@ static int epoll_idx_from_fd(uint64_t fd)
 // blowing past the 8 KB kernel stack.
 // ---------------------------------------------------------------------------
 
+/* ppoll()/pselect() take a signal mask that must be installed for exactly the
+ * duration of the wait and restored afterwards.  Ignoring it broke the
+ * standard "block the signal, then let ppoll unblock it while waiting" idiom:
+ * the signal stayed blocked, signal_pending() correctly skipped it, the wait
+ * was never interrupted and the handler never ran.  sshd uses precisely that
+ * idiom for SIGCHLD, so exited sessions were left unreaped as zombies until
+ * some unrelated event happened to wake the listener.
+ *
+ * Returns 1 if a mask was installed (caller must restore `saved`), 0 if none
+ * was supplied, or a negative errno. */
+static int poll_sigmask_install(uint64_t umask_ptr, kernel_sigset_t *saved)
+{
+	task_t *cur = sched_current();
+	if (!cur || umask_ptr == 0)
+		return 0;
+	if (!validate_user_ptr(umask_ptr, sizeof(kernel_sigset_t)))
+		return -EFAULT;
+	kernel_sigset_t newset;
+	if (copy_from_user(&newset, (void *)umask_ptr,
+			   sizeof(kernel_sigset_t)) != 0)
+		return -EFAULT;
+	*saved = cur->signals.blocked;
+	/* Park the caller's mask for the deferred restore (see the field
+	 * comment in struct task): it must stay OFF until signal delivery has
+	 * had its chance, otherwise the signal the caller unblocked for the
+	 * wait is re-blocked before its handler can run. */
+	cur->sigmask_saved = *saved;
+	cur->sigmask_restore_pending = 1;
+	cur->signals.blocked = newset;
+	sig_strip_unblockable(&cur->signals.blocked);
+	return 1;
+}
+
+/* Put the caller's mask back if nothing else already did (i.e. no handler was
+ * set up, which would have handed the restore to sigreturn). */
+void poll_sigmask_restore_pending(task_t *cur)
+{
+	if (!cur || !cur->sigmask_restore_pending)
+		return;
+	cur->sigmask_restore_pending = 0;
+	cur->signals.blocked = cur->sigmask_saved;
+	sig_strip_unblockable(&cur->signals.blocked);
+}
+
 __attribute__((noinline)) static int64_t
 sys_select_wrapper(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 		   uint64_t a5)
@@ -6736,7 +6952,7 @@ sys_select_wrapper(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 
 __attribute__((noinline)) static int64_t
 sys_pselect6_wrapper(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
-		     uint64_t a5)
+		     uint64_t a5, uint64_t a6)
 {
 	fd_set kr, kw, ke;
 	fd_set *rp = NULL, *wp = NULL, *ep = NULL;
@@ -6762,7 +6978,13 @@ sys_pselect6_wrapper(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 		if (tv_sec == 0 && tv_nsec == 0)
 			timeout_ticks = 0;
 	}
+	kernel_sigset_t saved_mask;
+	int have_mask = poll_sigmask_install(a6, &saved_mask);
+	if (have_mask < 0)
+		return have_mask;
 	int ret = sys_select_internal((int)a1, rp, wp, ep, timeout_ticks);
+	/* Mask restored after signal delivery — see the ppoll wrapper. */
+	(void)saved_mask;
 	if (rp && a2)
 		copy_to_user((void *)a2, rp, sizeof(fd_set));
 	if (wp && a3)
@@ -6797,7 +7019,7 @@ sys_poll_wrapper(uint64_t a1, uint64_t a2, uint64_t a3)
 }
 
 __attribute__((noinline)) static int64_t
-sys_ppoll_wrapper(uint64_t a1, uint64_t a2, uint64_t a3)
+sys_ppoll_wrapper(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 {
 	int nfds = (int)a2;
 	if (nfds < 0 || nfds > 256)
@@ -6817,7 +7039,14 @@ sys_ppoll_wrapper(uint64_t a1, uint64_t a2, uint64_t a3)
 		if (tv_sec == 0 && tv_nsec == 0)
 			timeout_ticks = 0;
 	}
+	kernel_sigset_t saved_mask;
+	int have_mask = poll_sigmask_install(a4, &saved_mask);
+	if (have_mask < 0)
+		return have_mask;
 	int ret = sys_poll_internal(kfds, nfds, timeout_ticks);
+	/* The mask stays installed on purpose; it is put back after signal
+	 * delivery (poll_sigmask_restore_pending). */
+	(void)saved_mask;
 	copy_to_user((void *)a1, kfds, sz);
 	return ret;
 }
@@ -7228,6 +7457,9 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 
 	case SYS_CHDIR:
 		return sys_chdir(a1);
+
+	case SYS_CHROOT:
+		return sys_chroot(a1);
 
 	case SYS_GETCWD:
 		return sys_getcwd(a1, a2);
@@ -7878,24 +8110,39 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 				unix_close(usv[1]);
 				return -EFAULT;
 			}
-			int pfd[2] = { -1, -1 };
-			for (int _fd = 3;
-			     _fd < TASK_MAX_FDS && (pfd[0] < 0 || pfd[1] < 0);
-			     _fd++) {
-				if (task_fds(cur)[_fd] == NULL) {
-					if (pfd[0] < 0)
-						pfd[0] = _fd;
-					else
-						pfd[1] = _fd;
-				}
-			}
-			if (pfd[0] < 0 || pfd[1] < 0) {
+			/* Install through fd_install: it claims each slot and
+			 * clears the slot's stale FD_CLOEXEC.  The old
+			 * hand-rolled scan did neither, so a pair could inherit
+			 * close-on-exec from whatever previously used those
+			 * slots and vanish across the next exec. */
+			int pfd[2];
+			pfd[0] = fd_install(cur, (vfs_file_t *)(uintptr_t)usv[0]);
+			if (pfd[0] < 0) {
 				unix_close(usv[0]);
 				unix_close(usv[1]);
-				return -EMFILE;
+				return pfd[0];
 			}
-			task_fds(cur)[pfd[0]] = (void *)(uintptr_t)usv[0];
-			task_fds(cur)[pfd[1]] = (void *)(uintptr_t)usv[1];
+			pfd[1] = fd_install(cur, (vfs_file_t *)(uintptr_t)usv[1]);
+			if (pfd[1] < 0) {
+				task_fds(cur)[pfd[0]] = NULL;
+				unix_close(usv[0]);
+				unix_close(usv[1]);
+				return pfd[1];
+			}
+			if ((int)a2 & SOCK_CLOEXEC) {
+				task_set_fd_flags(cur, (unsigned)pfd[0],
+						  FD_CLOEXEC);
+				task_set_fd_flags(cur, (unsigned)pfd[1],
+						  FD_CLOEXEC);
+			}
+			if ((int)a2 & SOCK_NONBLOCK) {
+				unix_socket_t *u0 = unix_get(usv[0]);
+				unix_socket_t *u1 = unix_get(usv[1]);
+				if (u0)
+					u0->nonblock = 1;
+				if (u1)
+					u1->nonblock = 1;
+			}
 			copy_to_user((void *)a4, pfd, 2 * sizeof(int));
 			return 0;
 		}
@@ -7910,23 +8157,27 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			sock_close(sv[1]);
 			return -EFAULT;
 		}
-		int ufd[2] = { -1, -1 };
-		for (int _fd = 3;
-		     _fd < TASK_MAX_FDS && (ufd[0] < 0 || ufd[1] < 0); _fd++) {
-			if (task_fds(cur)[_fd] == NULL) {
-				if (ufd[0] < 0)
-					ufd[0] = _fd;
-				else
-					ufd[1] = _fd;
-			}
-		}
-		if (ufd[0] < 0 || ufd[1] < 0) {
+		/* Same as the AF_UNIX path above: install via fd_install so the
+		 * slots are claimed atomically and their stale FD_CLOEXEC is
+		 * cleared. */
+		int ufd[2];
+		ufd[0] = fd_install(cur, MAKE_SOCKET_FD(sv[0]));
+		if (ufd[0] < 0) {
 			sock_close(sv[0]);
 			sock_close(sv[1]);
-			return -EMFILE;
+			return ufd[0];
 		}
-		task_fds(cur)[ufd[0]] = MAKE_SOCKET_FD(sv[0]);
-		task_fds(cur)[ufd[1]] = MAKE_SOCKET_FD(sv[1]);
+		ufd[1] = fd_install(cur, MAKE_SOCKET_FD(sv[1]));
+		if (ufd[1] < 0) {
+			task_fds(cur)[ufd[0]] = NULL;
+			sock_close(sv[0]);
+			sock_close(sv[1]);
+			return ufd[1];
+		}
+		if ((int)a2 & SOCK_CLOEXEC) {
+			task_set_fd_flags(cur, (unsigned)ufd[0], FD_CLOEXEC);
+			task_set_fd_flags(cur, (unsigned)ufd[1], FD_CLOEXEC);
+		}
 		copy_to_user((void *)a4, ufd, 2 * sizeof(int));
 		return 0;
 	}
@@ -8077,13 +8328,13 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		return sys_select_wrapper(a1, a2, a3, a4, a5);
 
 	case SYS_PSELECT6:
-		return sys_pselect6_wrapper(a1, a2, a3, a4, a5);
+		return sys_pselect6_wrapper(a1, a2, a3, a4, a5, a6);
 
 	case SYS_POLL:
 		return sys_poll_wrapper(a1, a2, a3);
 
 	case SYS_PPOLL:
-		return sys_ppoll_wrapper(a1, a2, a3);
+		return sys_ppoll_wrapper(a1, a2, a3, a4);
 
 	case SYS_EPOLL_CREATE: {
 		int ep_idx = epoll_create_internal(0);
@@ -8584,6 +8835,17 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 				// Should not return here
 			}
 		}
+	}
+
+	/* ppoll()/pselect() leave their temporary mask installed across the
+	 * delivery above so the signal the caller unblocked can actually run
+	 * its handler.  Put the caller's mask back now — unless a handler was
+	 * set up, in which case signal_setup_frame already took ownership and
+	 * sigreturn restores it after the handler returns. */
+	{
+		task_t *mcur = sched_current();
+		if (mcur)
+			poll_sigmask_restore_pending(mcur);
 	}
 
 	/* Clear syscall tracking on return.  Re-derive the percpu pointer:

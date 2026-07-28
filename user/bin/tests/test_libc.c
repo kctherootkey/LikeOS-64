@@ -21,6 +21,7 @@
 #include <getopt.h>
 #include <sys/procinfo.h>
 #include <sys/vfs.h>
+#include <sys/statvfs.h>
 #include <sys/sysinfo.h>
 #include <sys/klog.h>
 #include <sys/un.h>
@@ -1753,6 +1754,198 @@ static void test_devfd(void)
 
 /* ---- waitpid job-control reporting (WUNTRACED/WCONTINUED) ------------ */
 
+/* ---- poll()/select() must be interruptible by a signal ---------------
+ *
+ * A signal handler only runs on the way back to user mode, so a task parked
+ * in poll()/select() that is never woken out of the wait can never run it.
+ * That made every event-driven program miss asynchronous events: a terminal
+ * app blocked in poll() ignored SIGWINCH (window resizes did nothing) and a
+ * server never ran its SIGCHLD handler (children were not reaped, so remote
+ * sessions never closed).  Both must return EINTR instead.
+ */
+static volatile sig_atomic_t g_alarm_fired;
+static void poll_eintr_handler(int sig)
+{
+	(void)sig;
+	g_alarm_fired = 1;
+}
+
+static void test_poll_signal_eintr(void)
+{
+	printf("\n[TEST] poll/select interrupted by signal (EINTR)\n");
+
+	struct sigaction sa, old;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = poll_eintr_handler;
+	sigaction(SIGALRM, &sa, &old);
+
+	/* An empty pipe never becomes readable, so the only way out is the
+	 * signal.  Without the fix these calls hang until the timeout. */
+	int p[2];
+	if (pipe(p) != 0) {
+		test_fail("poll-eintr: pipe failed");
+		sigaction(SIGALRM, &old, NULL);
+		return;
+	}
+
+	g_alarm_fired = 0;
+	struct pollfd pfd = { .fd = p[0], .events = POLLIN, .revents = 0 };
+	alarm(1);
+	int r = poll(&pfd, 1, 10000); /* 10s: must be cut short by SIGALRM */
+	int e = errno;
+	test_result("poll() returns -1 on signal", r == -1);
+	test_result("poll() sets EINTR", r == -1 && e == EINTR);
+	test_result("poll() ran the signal handler", g_alarm_fired == 1);
+
+	g_alarm_fired = 0;
+	fd_set rfds;
+	FD_ZERO(&rfds);
+	FD_SET(p[0], &rfds);
+	struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+	alarm(1);
+	r = select(p[0] + 1, &rfds, NULL, NULL, &tv);
+	e = errno;
+	test_result("select() returns -1 on signal", r == -1);
+	test_result("select() sets EINTR", r == -1 && e == EINTR);
+	test_result("select() ran the signal handler", g_alarm_fired == 1);
+
+	/* ppoll()'s signal mask must apply for the duration of the wait.  The
+	 * common idiom is to BLOCK a signal, then hand ppoll a mask with it
+	 * unblocked so it can only arrive while waiting.  Ignoring the mask
+	 * left the signal blocked, so the wait was never interrupted and the
+	 * handler never ran — sshd uses exactly this for SIGCHLD, and its
+	 * exited sessions piled up as zombies. */
+	sigset_t block_alrm, prev;
+	sigemptyset(&block_alrm);
+	sigaddset(&block_alrm, SIGALRM);
+	sigprocmask(SIG_BLOCK, &block_alrm, &prev);
+
+	g_alarm_fired = 0;
+	pfd.revents = 0;
+	alarm(1);
+	struct timespec ts = { .tv_sec = 10, .tv_nsec = 0 };
+	/* prev has SIGALRM unblocked -> ppoll must let it through */
+	r = ppoll(&pfd, 1, &ts, &prev);
+	e = errno;
+	test_result("ppoll() honours its signal mask (returns EINTR)",
+		    r == -1 && e == EINTR);
+	test_result("ppoll() ran the handler while waiting", g_alarm_fired == 1);
+
+	/* And the caller's mask must be restored afterwards: SIGALRM blocked. */
+	sigset_t after;
+	sigemptyset(&after);
+	sigprocmask(SIG_BLOCK, NULL, &after);
+	test_result("ppoll() restores the caller's signal mask",
+		    sigismember(&after, SIGALRM) == 1);
+
+	alarm(0);
+	sigprocmask(SIG_SETMASK, &prev, NULL);
+
+	alarm(0);
+	close(p[0]);
+	close(p[1]);
+	sigaction(SIGALRM, &old, NULL);
+}
+
+/* ---- ioctl() on non-terminal descriptors must not fault the kernel ----
+ *
+ * AF_UNIX, epoll and pipe descriptors are stored in the fd table as tagged
+ * marker values rather than file pointers.  ioctl() used to hand them straight
+ * to the device layer, which dereferenced the marker — so any process could
+ * take the kernel down with tcgetattr() on a socketpair (scp hit this).
+ * Each of these must simply report "not a terminal".
+ */
+/* ---- poll() must follow the fd TABLE, not the fd NUMBER ---------------
+ *
+ * fds 0/1/2 mean "the console" only while their table slot is empty.  Once
+ * stdin has been redirected onto a pipe or socket, polling fd 0 must report
+ * that object's readiness.  Deciding by descriptor number instead polled the
+ * terminal, so a program that polls its own stdin (sftp-server does) blocked
+ * on the console forever while its real input sat unread.
+ */
+static void test_poll_redirected_stdio(void)
+{
+	printf("\n[TEST] poll() honours redirected stdin (not the console)\n");
+
+	int p[2];
+	if (pipe(p) != 0) {
+		test_fail("poll-redirect: pipe failed");
+		return;
+	}
+	/* Put known data in the pipe, then move the read end onto fd 0. */
+	if (write(p[1], "x", 1) != 1) {
+		test_fail("poll-redirect: write failed");
+		close(p[0]); close(p[1]);
+		return;
+	}
+	int saved_stdin = dup(0);
+	if (dup2(p[0], 0) != 0) {
+		test_fail("poll-redirect: dup2 onto stdin failed");
+		close(p[0]); close(p[1]);
+		if (saved_stdin >= 0) close(saved_stdin);
+		return;
+	}
+
+	struct pollfd pfd = { .fd = 0, .events = POLLIN, .revents = 0 };
+	int r = poll(&pfd, 1, 1000); /* data is already there: must be instant */
+	int readable = (r == 1) && (pfd.revents & POLLIN);
+
+	char c = 0;
+	ssize_t n = readable ? read(0, &c, 1) : -1;
+
+	/* Restore stdin before reporting. */
+	dup2(saved_stdin, 0);
+	close(saved_stdin);
+	close(p[0]);
+	close(p[1]);
+
+	test_result("poll(stdin) sees the pipe it was redirected to", readable);
+	test_result("data read back from redirected stdin", n == 1 && c == 'x');
+}
+
+static void test_ioctl_non_tty(void)
+{
+	printf("\n[TEST] ioctl on non-tty fds returns ENOTTY (no kernel fault)\n");
+	struct termios t;
+
+	int sv[2];
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+		errno = 0;
+		int r = ioctl(sv[0], TCGETS, &t);
+		test_result("ioctl(TCGETS) on unix socket fails cleanly",
+			    r == -1 && errno == ENOTTY);
+		test_result("isatty() on unix socket is false", isatty(sv[0]) == 0);
+		close(sv[0]);
+		close(sv[1]);
+	} else {
+		test_fail("ioctl-non-tty: socketpair failed");
+	}
+
+	int p[2];
+	if (pipe(p) == 0) {
+		errno = 0;
+		int r = ioctl(p[0], TCGETS, &t);
+		test_result("ioctl(TCGETS) on pipe fails cleanly",
+			    r == -1 && errno == ENOTTY);
+		test_result("isatty() on pipe is false", isatty(p[0]) == 0);
+		close(p[0]);
+		close(p[1]);
+	} else {
+		test_fail("ioctl-non-tty: pipe failed");
+	}
+
+	int ep = epoll_create1(0);
+	if (ep >= 0) {
+		errno = 0;
+		int r = ioctl(ep, TCGETS, &t);
+		test_result("ioctl(TCGETS) on epoll fd fails cleanly",
+			    r == -1 && errno == ENOTTY);
+		close(ep);
+	}
+	/* Still alive => the kernel did not dereference a marker value. */
+	test_result("kernel survived ioctl on marker fds", 1);
+}
+
 static void test_jobctl_wait(void)
 {
 	printf("\n[TEST] waitpid job control (WUNTRACED/WCONTINUED)\n");
@@ -1797,6 +1990,28 @@ static void test_jobctl_wait(void)
 	r = waitpid(pid, &st, 0);
 	test_result("killed child reaped normally",
 		    r == pid && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+
+	/* A NORMAL exit with a status >= 128 must be reported as WIFEXITED,
+	 * NOT as signalled/stopped.  The kernel used to overload exit_code with
+	 * the shell's "128 + signal" convention, so exit(255) (which ssh uses)
+	 * decoded to status 0x7F == WIFSTOPPED with signal 0 — bash then
+	 * reported a plain `ssh` invocation as "Stopped / Unknown signal 0". */
+	pid_t ep = fork();
+	if (ep == 0)
+		_exit(255);
+	int est = 0;
+	waitpid(ep, &est, 0);
+	test_result("exit(255) is WIFEXITED, not stopped/signalled",
+		    WIFEXITED(est) && !WIFSTOPPED(est) && !WIFSIGNALED(est));
+	test_result("exit(255) status is 255", WEXITSTATUS(est) == 255);
+
+	ep = fork();
+	if (ep == 0)
+		_exit(130); /* looks like 128+SIGINT but is a real exit code */
+	waitpid(ep, &est, 0);
+	test_result("exit(130) is WIFEXITED with status 130",
+		    WIFEXITED(est) && WEXITSTATUS(est) == 130 &&
+			    !WIFSIGNALED(est));
 }
 
 /* ---- syscall argument-register hygiene -------------------------------
@@ -1912,12 +2127,28 @@ static void test_dup_redirected_stdio(void)
 	dup2(p[1], 1);
 	int d_dup = dup(1);
 	int d_fcntl = fcntl(1, F_DUPFD, 10);
-	int d_dup2 = 7;
+	/* Pick the dup2 target dynamically.  A hardcoded number can collide
+	 * with a descriptor this test still needs (the pipe, or the saved
+	 * console stdout) as the surrounding fd layout shifts; clobbering
+	 * saved_stdout leaves stdout pointing at the pipe, and the process
+	 * then dies of SIGPIPE with no output once the read end is closed. */
+	int d_dup2 = fcntl(1, F_DUPFD, 20);
+	if (d_dup2 >= 0)
+		close(d_dup2); /* now known to be free */
+	else
+		d_dup2 = 20;
 	dup2(1, d_dup2);
 
 	/* Put the console back before printing any results. */
 	dup2(saved_stdout, 1);
 	close(saved_stdout);
+
+	/* Guard the setup itself: if the dup2 target had aliased a descriptor
+	 * this test still needs, everything below would report nonsense (or
+	 * vanish into the pipe), so say so out loud instead. */
+	test_result("dup2 target does not alias the test's own descriptors",
+		    d_dup2 != p[0] && d_dup2 != p[1] && d_dup2 != saved_stdout &&
+			    d_dup2 != d_dup && d_dup2 != d_fcntl);
 
 	test_result("fcntl(F_DUPFD, 10) honours the minimum", d_fcntl >= 10);
 
@@ -3056,6 +3287,109 @@ int main(int argc, char **argv)
 		ssize_t wr = write(newfd, dupmsg, strlen(dupmsg));
 		test_result("write to duped fd succeeds", wr > 0);
 		close(newfd);
+	}
+
+	// ========================================
+	// ========================================
+	// Test: popen/pclose, fscanf, statvfs, chroot
+	// (libc pieces added for the OpenSSH port)
+	// ========================================
+	printf("\n[TEST] popen/pclose\n");
+	{
+		FILE *pp = popen("echo popen-works", "r");
+		test_result("popen(r) returns a stream", pp != NULL);
+		char line[64] = { 0 };
+		if (pp) {
+			char *g = fgets(line, sizeof(line), pp);
+			test_result("popen child output read",
+				    g != NULL && strncmp(line, "popen-works", 11) == 0);
+			int st = pclose(pp);
+			test_result("pclose reaps child (exit 0)",
+				    st != -1 && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+		}
+		FILE *pw = popen("cat > /tmp/popen_w_test", "w");
+		test_result("popen(w) returns a stream", pw != NULL);
+		if (pw) {
+			fputs("to-child\n", pw);
+			pclose(pw);
+			FILE *rb = fopen("/tmp/popen_w_test", "r");
+			char b[32] = { 0 };
+			if (rb) { fgets(b, sizeof(b), rb); fclose(rb); }
+			test_result("popen(w) delivered stdin to child",
+				    strncmp(b, "to-child", 8) == 0);
+			unlink("/tmp/popen_w_test");
+		}
+	}
+
+	printf("\n[TEST] fscanf (stream formatted input)\n");
+	{
+		FILE *f = fopen("/tmp/fscanf_test", "w");
+		if (f) { fputs("42 hello 3.5 0xff ab:cd\n", f); fclose(f); }
+		f = fopen("/tmp/fscanf_test", "r");
+		int n = -1; char word[16] = { 0 }; float fl = 0; unsigned hx = 0;
+		int a = 0, b = 0;
+		int got = 0;
+		if (f) {
+			got = fscanf(f, "%d %15s %f %x %x:%x", &n, word, &fl, &hx, &a, &b);
+			fclose(f);
+		}
+		test_result("fscanf matched all 6 fields", got == 6);
+		test_result("fscanf %d", n == 42);
+		test_result("fscanf %s", strcmp(word, "hello") == 0);
+		test_result("fscanf %f", fl > 3.4f && fl < 3.6f);
+		test_result("fscanf %x", hx == 0xff);
+		test_result("fscanf literal + fields", a == 0xab && b == 0xcd);
+		unlink("/tmp/fscanf_test");
+	}
+
+	printf("\n[TEST] statvfs\n");
+	{
+		struct statvfs vfs;
+		int r = statvfs("/", &vfs);
+		test_result("statvfs(/) succeeds", r == 0);
+		test_result("statvfs block size non-zero", r == 0 && vfs.f_bsize > 0);
+		test_result("statvfs has total blocks", r == 0 && vfs.f_blocks > 0);
+		test_result("statvfs namemax sane",
+			    r == 0 && vfs.f_namemax >= 8 && vfs.f_namemax <= 4096);
+	}
+
+	printf("\n[TEST] chroot (confinement)\n");
+	{
+		/* Build a jail dir with a file inside, fork a child that chroots
+		 * into it, and confirm the inside file is reachable while an
+		 * outside path (/etc) is not.  Done in a child so the parent's
+		 * root is unaffected. */
+		char jail[64], inside[96];
+		snprintf(jail, sizeof(jail), "/tmp/jail_%d", (int)getpid());
+		mkdir(jail, 0755);
+		snprintf(inside, sizeof(inside), "%s/secret.txt", jail);
+		FILE *jf = fopen(inside, "w");
+		if (jf) { fputs("jailed\n", jf); fclose(jf); }
+
+		pid_t cp = fork();
+		if (cp == 0) {
+			if (chroot(jail) != 0)
+				_exit(10);
+			if (chdir("/") != 0)
+				_exit(11);
+			/* inside file now appears at /secret.txt */
+			int fd1 = open("/secret.txt", O_RDONLY);
+			if (fd1 < 0)
+				_exit(12);
+			close(fd1);
+			/* the real /etc/passwd must NOT be reachable */
+			int fd2 = open("/etc/passwd", O_RDONLY);
+			if (fd2 >= 0) { close(fd2); _exit(13); }
+			_exit(0);
+		}
+		int cst = -1;
+		waitpid(cp, &cst, 0);
+		test_result("chroot confines child correctly",
+			    WIFEXITED(cst) && WEXITSTATUS(cst) == 0);
+		test_result("parent root unaffected by child chroot",
+			    open("/etc/passwd", O_RDONLY) >= 0);
+		unlink(inside);
+		rmdir(jail);
 	}
 
 	// ========================================
@@ -7129,6 +7463,9 @@ int main(int argc, char **argv)
 	test_evdev();
 	test_shebang();
 	test_devfd();
+	test_poll_signal_eintr();
+	test_poll_redirected_stdio();
+	test_ioctl_non_tty();
 	test_jobctl_wait();
 	test_bash_libc_additions();
 	test_syscall_arg_hygiene();

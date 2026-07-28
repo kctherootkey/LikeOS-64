@@ -61,6 +61,7 @@ our %config = (
         "fuzz/build.info",
         "providers/build.info",
         "doc/build.info",
+        "engines/build.info",
         "exporters/build.info",
         "crypto/objects/build.info",
         "crypto/buffer/build.info",
@@ -112,12 +113,14 @@ our %config = (
         "crypto/dh/build.info",
         "crypto/sm2/build.info",
         "crypto/dso/build.info",
+        "crypto/engine/build.info",
         "crypto/err/build.info",
         "crypto/comp/build.info",
         "crypto/http/build.info",
         "crypto/ocsp/build.info",
         "crypto/cms/build.info",
         "crypto/ts/build.info",
+        "crypto/srp/build.info",
         "crypto/cmac/build.info",
         "crypto/ct/build.info",
         "crypto/async/build.info",
@@ -192,15 +195,12 @@ our %config = (
         "OPENSSL_NO_ASYNC",
         "OPENSSL_NO_BROTLI",
         "OPENSSL_NO_BROTLI_DYNAMIC",
-        "OPENSSL_NO_CAPIENG",
         "OPENSSL_NO_CRYPTO_MDEBUG",
         "OPENSSL_NO_CRYPTO_MDEBUG_BACKTRACE",
         "OPENSSL_NO_DEMOS",
-        "OPENSSL_NO_DEPRECATED",
         "OPENSSL_NO_DEVCRYPTOENG",
         "OPENSSL_NO_EC_NISTP_64_GCC_128",
         "OPENSSL_NO_EGD",
-        "OPENSSL_NO_ENGINE",
         "OPENSSL_NO_EXTERNAL_TESTS",
         "OPENSSL_NO_FIPS_JITTER",
         "OPENSSL_NO_FIPS_POST",
@@ -211,20 +211,16 @@ our %config = (
         "OPENSSL_NO_HQINTEROP",
         "OPENSSL_NO_JITTER",
         "OPENSSL_NO_KTLS",
-        "OPENSSL_NO_LOADERENG",
         "OPENSSL_NO_MD2",
         "OPENSSL_NO_MSAN",
-        "OPENSSL_NO_PADLOCKENG",
         "OPENSSL_NO_PIE",
         "OPENSSL_NO_RC5",
         "OPENSSL_NO_SCTP",
-        "OPENSSL_NO_SRP",
         "OPENSSL_NO_SSL3",
         "OPENSSL_NO_SSL3_METHOD",
         "OPENSSL_NO_SSLKEYLOG",
         "OPENSSL_NO_TESTS",
         "OPENSSL_NO_TFO",
-        "OPENSSL_NO_TLS_DEPRECATED_EC",
         "OPENSSL_NO_TRACE",
         "OPENSSL_NO_UBSAN",
         "OPENSSL_NO_UNIT_TEST",
@@ -235,7 +231,7 @@ our %config = (
         "OPENSSL_NO_ZLIB_DYNAMIC",
         "OPENSSL_NO_ZSTD",
         "OPENSSL_NO_ZSTD_DYNAMIC",
-        "OPENSSL_NO_DYNAMIC_ENGINE"
+        "OPENSSL_NO_STATIC_ENGINE"
     ],
     "openssl_other_defines" => [
         "OPENSSL_NO_KTLS"
@@ -244,7 +240,7 @@ our %config = (
         "OPENSSL_SYS_LIKEOS"
     ],
     "openssldir" => "/etc/ssl",
-    "options" => "--prefix=/usr --openssldir=/etc/ssl --libdir=lib -I/home/kcope/Dokumente/LikeOS-64/user/lib/libc/include no-acvp-tests no-afalgeng no-asan no-async no-brotli no-brotli-dynamic no-buildtest-c++ no-capieng no-crypto-mdebug no-crypto-mdebug-backtrace no-demos no-deprecated no-devcryptoeng no-dynamic-engine no-ec_nistp_64_gcc_128 no-egd no-engine no-external-tests no-fips no-fips-jitter no-fips-post no-fips-securitychecks no-fuzz-afl no-fuzz-libfuzzer no-h3demo no-hqinterop no-jitter no-ktls no-loadereng no-md2 no-msan no-padlockeng no-pie no-rc5 no-sctp no-srp no-ssl3 no-ssl3-method no-sslkeylog no-tests no-tfo no-tls-deprecated-ec no-trace no-ubsan no-unit-test no-uplink no-weak-ssl-ciphers no-winstore no-zlib no-zlib-dynamic no-zstd no-zstd-dynamic",
+    "options" => "--prefix=/usr --openssldir=/etc/ssl --libdir=lib -I/home/kcope/Dokumente/LikeOS-64/user/lib/libc/include no-acvp-tests no-afalgeng no-asan no-async no-brotli no-brotli-dynamic no-buildtest-c++ no-crypto-mdebug no-crypto-mdebug-backtrace no-demos no-devcryptoeng no-ec_nistp_64_gcc_128 no-egd no-external-tests no-fips no-fips-jitter no-fips-post no-fips-securitychecks no-fuzz-afl no-fuzz-libfuzzer no-h3demo no-hqinterop no-jitter no-ktls no-md2 no-msan no-pie no-rc5 no-sctp no-ssl3 no-ssl3-method no-sslkeylog no-tests no-tfo no-trace no-ubsan no-unit-test no-uplink no-weak-ssl-ciphers no-winstore no-zlib no-zlib-dynamic no-zstd no-zstd-dynamic",
     "patch" => "6",
     "perl_archname" => "x86_64-linux-gnu-thread-multi",
     "perl_cmd" => "/usr/bin/perl",
@@ -262,7 +258,6 @@ our %config = (
         "no-fuzz-afl",
         "no-ssl3",
         "no-ssl3-method",
-        "no-deprecated",
         "-I/home/kcope/Dokumente/LikeOS-64/user/lib/libc/include"
     ],
     "perlenv" => {
@@ -515,24 +510,12 @@ our %disabled = (
     "brotli" => "default",
     "brotli-dynamic" => "default",
     "buildtest-c++" => "default",
-    "capieng" => "cascade",
     "crypto-mdebug" => "default",
     "crypto-mdebug-backtrace" => "default",
     "demos" => "default",
-    "deprecated" => "option",
-    "deprecated-0.9.8" => "deprecation",
-    "deprecated-1.0.0" => "deprecation",
-    "deprecated-1.0.1" => "deprecation",
-    "deprecated-1.0.2" => "deprecation",
-    "deprecated-1.1.0" => "deprecation",
-    "deprecated-1.1.1" => "deprecation",
-    "deprecated-3.0" => "deprecation",
-    "deprecated-3.0.0" => "deprecation",
     "devcryptoeng" => "default",
-    "dynamic-engine" => "cascade",
     "ec_nistp_64_gcc_128" => "default",
     "egd" => "default",
-    "engine" => "cascade",
     "external-tests" => "default",
     "fips" => "default",
     "fips-jitter" => "default",
@@ -544,20 +527,16 @@ our %disabled = (
     "hqinterop" => "default",
     "jitter" => "default",
     "ktls" => "option",
-    "loadereng" => "cascade",
     "md2" => "default",
     "msan" => "default",
-    "padlockeng" => "cascade",
     "pie" => "default",
     "rc5" => "default",
     "sctp" => "default",
-    "srp" => "cascade",
     "ssl3" => "option(ssl3-method)",
     "ssl3-method" => "option",
     "sslkeylog" => "default",
     "tests" => "option",
     "tfo" => "default",
-    "tls-deprecated-ec" => "cascade",
     "trace" => "default",
     "ubsan" => "default",
     "unit-test" => "default",
@@ -891,6 +870,25 @@ our %unified_info = (
                 "noinst" => "1"
             }
         },
+        "modules" => {
+            "engines/capi" => {
+                "engine" => "1"
+            },
+            "engines/dasync" => {
+                "engine" => "1",
+                "noinst" => "1"
+            },
+            "engines/loader_attic" => {
+                "engine" => "1"
+            },
+            "engines/ossltest" => {
+                "engine" => "1",
+                "noinst" => "1"
+            },
+            "engines/padlock" => {
+                "engine" => "1"
+            }
+        },
         "scripts" => {
             "apps/CA.pl" => {
                 "misc" => "1"
@@ -921,6 +919,12 @@ our %unified_info = (
         }
     },
     "defines" => {
+        "engines/loader_attic" => [
+            "OPENSSL_NO_PROVIDER_CODE"
+        ],
+        "engines/padlock" => [
+            "PADLOCK_ASM"
+        ],
         "libcrypto" => [
             "AES_ASM",
             "BSAES_ASM",
@@ -998,7 +1002,6 @@ our %unified_info = (
             "SHA256_ASM",
             "SHA512_ASM",
             "VPAES_ASM",
-            "WHIRLPOOL_ASM",
             "X25519_ASM"
         ]
     },
@@ -1096,6 +1099,9 @@ our %unified_info = (
         "apps/openssl-bin-enc.o" => [
             "apps/progs.h"
         ],
+        "apps/openssl-bin-engine.o" => [
+            "apps/progs.h"
+        ],
         "apps/openssl-bin-errstr.o" => [
             "apps/progs.h"
         ],
@@ -1171,6 +1177,9 @@ our %unified_info = (
         "apps/openssl-bin-rsa.o" => [
             "apps/progs.h"
         ],
+        "apps/openssl-bin-rsautl.o" => [
+            "apps/progs.h"
+        ],
         "apps/openssl-bin-s_client.o" => [
             "apps/progs.h"
         ],
@@ -1193,6 +1202,9 @@ our %unified_info = (
             "apps/progs.h"
         ],
         "apps/openssl-bin-spkac.o" => [
+            "apps/progs.h"
+        ],
+        "apps/openssl-bin-srp.o" => [
             "apps/progs.h"
         ],
         "apps/openssl-bin-storeutl.o" => [
@@ -6905,6 +6917,21 @@ our %unified_info = (
         "doc/man7/openssl_user_macros.pod" => [
             "doc/man7/openssl_user_macros.pod.in"
         ],
+        "engines/capi" => [
+            "libcrypto"
+        ],
+        "engines/dasync" => [
+            "libcrypto"
+        ],
+        "engines/loader_attic" => [
+            "libcrypto"
+        ],
+        "engines/ossltest" => [
+            "libcrypto"
+        ],
+        "engines/padlock" => [
+            "libcrypto"
+        ],
         "exporters/OpenSSLConfig.cmake" => [
             "installdata.pm"
         ],
@@ -7163,7 +7190,8 @@ our %unified_info = (
                 "apps/lib/libapps-lib-names.o",
                 "apps/lib/libapps-lib-opt.o",
                 "apps/lib/libapps-lib-s_cb.o",
-                "apps/lib/libapps-lib-s_socket.o"
+                "apps/lib/libapps-lib-s_socket.o",
+                "apps/lib/libapps-lib-tlssrp_depr.o"
             ],
             "products" => {
                 "bin" => [
@@ -7312,6 +7340,7 @@ our %unified_info = (
                 "crypto/aes/libcrypto-lib-aes-x86_64.o",
                 "crypto/aes/libcrypto-lib-aes_cfb.o",
                 "crypto/aes/libcrypto-lib-aes_ecb.o",
+                "crypto/aes/libcrypto-lib-aes_ige.o",
                 "crypto/aes/libcrypto-lib-aes_misc.o",
                 "crypto/aes/libcrypto-lib-aes_ofb.o",
                 "crypto/aes/libcrypto-lib-aes_wrap.o",
@@ -7325,6 +7354,7 @@ our %unified_info = (
                 "crypto/aes/libcrypto-shlib-aes-x86_64.o",
                 "crypto/aes/libcrypto-shlib-aes_cfb.o",
                 "crypto/aes/libcrypto-shlib-aes_ecb.o",
+                "crypto/aes/libcrypto-shlib-aes_ige.o",
                 "crypto/aes/libcrypto-shlib-aes_misc.o",
                 "crypto/aes/libcrypto-shlib-aes_ofb.o",
                 "crypto/aes/libcrypto-shlib-aes_wrap.o",
@@ -7414,6 +7444,7 @@ our %unified_info = (
                 "crypto/asn1/libcrypto-lib-x_bignum.o",
                 "crypto/asn1/libcrypto-lib-x_info.o",
                 "crypto/asn1/libcrypto-lib-x_int64.o",
+                "crypto/asn1/libcrypto-lib-x_long.o",
                 "crypto/asn1/libcrypto-lib-x_pkey.o",
                 "crypto/asn1/libcrypto-lib-x_sig.o",
                 "crypto/asn1/libcrypto-lib-x_spki.o",
@@ -7477,6 +7508,7 @@ our %unified_info = (
                 "crypto/asn1/libcrypto-shlib-x_bignum.o",
                 "crypto/asn1/libcrypto-shlib-x_info.o",
                 "crypto/asn1/libcrypto-shlib-x_int64.o",
+                "crypto/asn1/libcrypto-shlib-x_long.o",
                 "crypto/asn1/libcrypto-shlib-x_pkey.o",
                 "crypto/asn1/libcrypto-shlib-x_sig.o",
                 "crypto/asn1/libcrypto-shlib-x_spki.o",
@@ -7529,17 +7561,11 @@ our %unified_info = (
                 "crypto/bf/libcrypto-shlib-bf_ecb.o",
                 "crypto/bf/libcrypto-shlib-bf_enc.o",
                 "crypto/bf/libcrypto-shlib-bf_ofb64.o",
-                "crypto/bf/libcrypto-shlib-bf_skey.o",
-                "crypto/bf/liblegacy-lib-bf_cfb64.o",
-                "crypto/bf/liblegacy-lib-bf_ecb.o",
-                "crypto/bf/liblegacy-lib-bf_enc.o",
-                "crypto/bf/liblegacy-lib-bf_ofb64.o",
-                "crypto/bf/liblegacy-lib-bf_skey.o"
+                "crypto/bf/libcrypto-shlib-bf_skey.o"
             ],
             "products" => {
                 "lib" => [
-                    "libcrypto",
-                    "providers/liblegacy.a"
+                    "libcrypto"
                 ]
             }
         },
@@ -7615,6 +7641,7 @@ our %unified_info = (
                 "crypto/bn/libcrypto-lib-bn_const.o",
                 "crypto/bn/libcrypto-lib-bn_conv.o",
                 "crypto/bn/libcrypto-lib-bn_ctx.o",
+                "crypto/bn/libcrypto-lib-bn_depr.o",
                 "crypto/bn/libcrypto-lib-bn_dh.o",
                 "crypto/bn/libcrypto-lib-bn_div.o",
                 "crypto/bn/libcrypto-lib-bn_err.o",
@@ -7640,6 +7667,7 @@ our %unified_info = (
                 "crypto/bn/libcrypto-lib-bn_sqrt.o",
                 "crypto/bn/libcrypto-lib-bn_srp.o",
                 "crypto/bn/libcrypto-lib-bn_word.o",
+                "crypto/bn/libcrypto-lib-bn_x931p.o",
                 "crypto/bn/libcrypto-lib-rsaz-2k-avx512.o",
                 "crypto/bn/libcrypto-lib-rsaz-2k-avxifma.o",
                 "crypto/bn/libcrypto-lib-rsaz-3k-avx512.o",
@@ -7658,6 +7686,7 @@ our %unified_info = (
                 "crypto/bn/libcrypto-shlib-bn_const.o",
                 "crypto/bn/libcrypto-shlib-bn_conv.o",
                 "crypto/bn/libcrypto-shlib-bn_ctx.o",
+                "crypto/bn/libcrypto-shlib-bn_depr.o",
                 "crypto/bn/libcrypto-shlib-bn_dh.o",
                 "crypto/bn/libcrypto-shlib-bn_div.o",
                 "crypto/bn/libcrypto-shlib-bn_err.o",
@@ -7683,6 +7712,7 @@ our %unified_info = (
                 "crypto/bn/libcrypto-shlib-bn_sqrt.o",
                 "crypto/bn/libcrypto-shlib-bn_srp.o",
                 "crypto/bn/libcrypto-shlib-bn_word.o",
+                "crypto/bn/libcrypto-shlib-bn_x931p.o",
                 "crypto/bn/libcrypto-shlib-rsaz-2k-avx512.o",
                 "crypto/bn/libcrypto-shlib-rsaz-2k-avxifma.o",
                 "crypto/bn/libcrypto-shlib-rsaz-3k-avx512.o",
@@ -7759,17 +7789,11 @@ our %unified_info = (
                 "crypto/cast/libcrypto-shlib-c_ecb.o",
                 "crypto/cast/libcrypto-shlib-c_enc.o",
                 "crypto/cast/libcrypto-shlib-c_ofb64.o",
-                "crypto/cast/libcrypto-shlib-c_skey.o",
-                "crypto/cast/liblegacy-lib-c_cfb64.o",
-                "crypto/cast/liblegacy-lib-c_ecb.o",
-                "crypto/cast/liblegacy-lib-c_enc.o",
-                "crypto/cast/liblegacy-lib-c_ofb64.o",
-                "crypto/cast/liblegacy-lib-c_skey.o"
+                "crypto/cast/libcrypto-shlib-c_skey.o"
             ],
             "products" => {
                 "lib" => [
-                    "libcrypto",
-                    "providers/liblegacy.a"
+                    "libcrypto"
                 ]
             }
         },
@@ -8003,25 +8027,8 @@ our %unified_info = (
                 "crypto/des/libcrypto-shlib-set_key.o",
                 "crypto/des/libcrypto-shlib-str2key.o",
                 "crypto/des/libcrypto-shlib-xcbc_enc.o",
-                "crypto/des/liblegacy-lib-cbc_cksm.o",
-                "crypto/des/liblegacy-lib-cbc_enc.o",
-                "crypto/des/liblegacy-lib-cfb64ede.o",
-                "crypto/des/liblegacy-lib-cfb64enc.o",
-                "crypto/des/liblegacy-lib-cfb_enc.o",
                 "crypto/des/liblegacy-lib-des_enc.o",
-                "crypto/des/liblegacy-lib-ecb3_enc.o",
-                "crypto/des/liblegacy-lib-ecb_enc.o",
-                "crypto/des/liblegacy-lib-fcrypt.o",
-                "crypto/des/liblegacy-lib-fcrypt_b.o",
-                "crypto/des/liblegacy-lib-ofb64ede.o",
-                "crypto/des/liblegacy-lib-ofb64enc.o",
-                "crypto/des/liblegacy-lib-ofb_enc.o",
-                "crypto/des/liblegacy-lib-pcbc_enc.o",
-                "crypto/des/liblegacy-lib-qud_cksm.o",
-                "crypto/des/liblegacy-lib-rand_key.o",
-                "crypto/des/liblegacy-lib-set_key.o",
-                "crypto/des/liblegacy-lib-str2key.o",
-                "crypto/des/liblegacy-lib-xcbc_enc.o"
+                "crypto/des/liblegacy-lib-fcrypt_b.o"
             ],
             "products" => {
                 "lib" => [
@@ -8036,6 +8043,7 @@ our %unified_info = (
                 "crypto/dh/libcrypto-lib-dh_asn1.o",
                 "crypto/dh/libcrypto-lib-dh_backend.o",
                 "crypto/dh/libcrypto-lib-dh_check.o",
+                "crypto/dh/libcrypto-lib-dh_depr.o",
                 "crypto/dh/libcrypto-lib-dh_err.o",
                 "crypto/dh/libcrypto-lib-dh_gen.o",
                 "crypto/dh/libcrypto-lib-dh_group_params.o",
@@ -8050,6 +8058,7 @@ our %unified_info = (
                 "crypto/dh/libcrypto-shlib-dh_asn1.o",
                 "crypto/dh/libcrypto-shlib-dh_backend.o",
                 "crypto/dh/libcrypto-shlib-dh_check.o",
+                "crypto/dh/libcrypto-shlib-dh_depr.o",
                 "crypto/dh/libcrypto-shlib-dh_err.o",
                 "crypto/dh/libcrypto-shlib-dh_gen.o",
                 "crypto/dh/libcrypto-shlib-dh_group_params.o",
@@ -8073,6 +8082,7 @@ our %unified_info = (
                 "crypto/dsa/libcrypto-lib-dsa_asn1.o",
                 "crypto/dsa/libcrypto-lib-dsa_backend.o",
                 "crypto/dsa/libcrypto-lib-dsa_check.o",
+                "crypto/dsa/libcrypto-lib-dsa_depr.o",
                 "crypto/dsa/libcrypto-lib-dsa_err.o",
                 "crypto/dsa/libcrypto-lib-dsa_gen.o",
                 "crypto/dsa/libcrypto-lib-dsa_key.o",
@@ -8087,6 +8097,7 @@ our %unified_info = (
                 "crypto/dsa/libcrypto-shlib-dsa_asn1.o",
                 "crypto/dsa/libcrypto-shlib-dsa_backend.o",
                 "crypto/dsa/libcrypto-shlib-dsa_check.o",
+                "crypto/dsa/libcrypto-shlib-dsa_depr.o",
                 "crypto/dsa/libcrypto-shlib-dsa_err.o",
                 "crypto/dsa/libcrypto-shlib-dsa_gen.o",
                 "crypto/dsa/libcrypto-shlib-dsa_key.o",
@@ -8270,6 +8281,59 @@ our %unified_info = (
                 ]
             }
         },
+        "crypto/engine" => {
+            "deps" => [
+                "crypto/engine/libcrypto-lib-eng_all.o",
+                "crypto/engine/libcrypto-lib-eng_cnf.o",
+                "crypto/engine/libcrypto-lib-eng_ctrl.o",
+                "crypto/engine/libcrypto-lib-eng_dyn.o",
+                "crypto/engine/libcrypto-lib-eng_err.o",
+                "crypto/engine/libcrypto-lib-eng_fat.o",
+                "crypto/engine/libcrypto-lib-eng_init.o",
+                "crypto/engine/libcrypto-lib-eng_lib.o",
+                "crypto/engine/libcrypto-lib-eng_list.o",
+                "crypto/engine/libcrypto-lib-eng_openssl.o",
+                "crypto/engine/libcrypto-lib-eng_pkey.o",
+                "crypto/engine/libcrypto-lib-eng_rdrand.o",
+                "crypto/engine/libcrypto-lib-eng_table.o",
+                "crypto/engine/libcrypto-lib-tb_asnmth.o",
+                "crypto/engine/libcrypto-lib-tb_cipher.o",
+                "crypto/engine/libcrypto-lib-tb_dh.o",
+                "crypto/engine/libcrypto-lib-tb_digest.o",
+                "crypto/engine/libcrypto-lib-tb_dsa.o",
+                "crypto/engine/libcrypto-lib-tb_eckey.o",
+                "crypto/engine/libcrypto-lib-tb_pkmeth.o",
+                "crypto/engine/libcrypto-lib-tb_rand.o",
+                "crypto/engine/libcrypto-lib-tb_rsa.o",
+                "crypto/engine/libcrypto-shlib-eng_all.o",
+                "crypto/engine/libcrypto-shlib-eng_cnf.o",
+                "crypto/engine/libcrypto-shlib-eng_ctrl.o",
+                "crypto/engine/libcrypto-shlib-eng_dyn.o",
+                "crypto/engine/libcrypto-shlib-eng_err.o",
+                "crypto/engine/libcrypto-shlib-eng_fat.o",
+                "crypto/engine/libcrypto-shlib-eng_init.o",
+                "crypto/engine/libcrypto-shlib-eng_lib.o",
+                "crypto/engine/libcrypto-shlib-eng_list.o",
+                "crypto/engine/libcrypto-shlib-eng_openssl.o",
+                "crypto/engine/libcrypto-shlib-eng_pkey.o",
+                "crypto/engine/libcrypto-shlib-eng_rdrand.o",
+                "crypto/engine/libcrypto-shlib-eng_table.o",
+                "crypto/engine/libcrypto-shlib-tb_asnmth.o",
+                "crypto/engine/libcrypto-shlib-tb_cipher.o",
+                "crypto/engine/libcrypto-shlib-tb_dh.o",
+                "crypto/engine/libcrypto-shlib-tb_digest.o",
+                "crypto/engine/libcrypto-shlib-tb_dsa.o",
+                "crypto/engine/libcrypto-shlib-tb_eckey.o",
+                "crypto/engine/libcrypto-shlib-tb_pkmeth.o",
+                "crypto/engine/libcrypto-shlib-tb_rand.o",
+                "crypto/engine/libcrypto-shlib-tb_rsa.o"
+            ],
+            "products" => {
+                "lib" => [
+                    "libcrypto"
+                ]
+            }
+        },
         "crypto/err" => {
             "deps" => [
                 "crypto/err/libcrypto-lib-err.o",
@@ -8335,6 +8399,7 @@ our %unified_info = (
                 "crypto/evp/libcrypto-lib-e_des3.o",
                 "crypto/evp/libcrypto-lib-e_idea.o",
                 "crypto/evp/libcrypto-lib-e_null.o",
+                "crypto/evp/libcrypto-lib-e_old.o",
                 "crypto/evp/libcrypto-lib-e_rc2.o",
                 "crypto/evp/libcrypto-lib-e_rc4.o",
                 "crypto/evp/libcrypto-lib-e_rc4_hmac_md5.o",
@@ -8376,6 +8441,8 @@ our %unified_info = (
                 "crypto/evp/libcrypto-lib-names.o",
                 "crypto/evp/libcrypto-lib-p5_crpt.o",
                 "crypto/evp/libcrypto-lib-p5_crpt2.o",
+                "crypto/evp/libcrypto-lib-p_dec.o",
+                "crypto/evp/libcrypto-lib-p_enc.o",
                 "crypto/evp/libcrypto-lib-p_legacy.o",
                 "crypto/evp/libcrypto-lib-p_lib.o",
                 "crypto/evp/libcrypto-lib-p_open.o",
@@ -8414,6 +8481,7 @@ our %unified_info = (
                 "crypto/evp/libcrypto-shlib-e_des3.o",
                 "crypto/evp/libcrypto-shlib-e_idea.o",
                 "crypto/evp/libcrypto-shlib-e_null.o",
+                "crypto/evp/libcrypto-shlib-e_old.o",
                 "crypto/evp/libcrypto-shlib-e_rc2.o",
                 "crypto/evp/libcrypto-shlib-e_rc4.o",
                 "crypto/evp/libcrypto-shlib-e_rc4_hmac_md5.o",
@@ -8455,6 +8523,8 @@ our %unified_info = (
                 "crypto/evp/libcrypto-shlib-names.o",
                 "crypto/evp/libcrypto-shlib-p5_crpt.o",
                 "crypto/evp/libcrypto-shlib-p5_crpt2.o",
+                "crypto/evp/libcrypto-shlib-p_dec.o",
+                "crypto/evp/libcrypto-shlib-p_enc.o",
                 "crypto/evp/libcrypto-shlib-p_legacy.o",
                 "crypto/evp/libcrypto-shlib-p_lib.o",
                 "crypto/evp/libcrypto-shlib-p_open.o",
@@ -8563,17 +8633,11 @@ our %unified_info = (
                 "crypto/idea/libcrypto-shlib-i_cfb64.o",
                 "crypto/idea/libcrypto-shlib-i_ecb.o",
                 "crypto/idea/libcrypto-shlib-i_ofb64.o",
-                "crypto/idea/libcrypto-shlib-i_skey.o",
-                "crypto/idea/liblegacy-lib-i_cbc.o",
-                "crypto/idea/liblegacy-lib-i_cfb64.o",
-                "crypto/idea/liblegacy-lib-i_ecb.o",
-                "crypto/idea/liblegacy-lib-i_ofb64.o",
-                "crypto/idea/liblegacy-lib-i_skey.o"
+                "crypto/idea/libcrypto-shlib-i_skey.o"
             ],
             "products" => {
                 "lib" => [
-                    "libcrypto",
-                    "providers/liblegacy.a"
+                    "libcrypto"
                 ]
             }
         },
@@ -8606,14 +8670,11 @@ our %unified_info = (
                 "crypto/md4/libcrypto-lib-md4_dgst.o",
                 "crypto/md4/libcrypto-lib-md4_one.o",
                 "crypto/md4/libcrypto-shlib-md4_dgst.o",
-                "crypto/md4/libcrypto-shlib-md4_one.o",
-                "crypto/md4/liblegacy-lib-md4_dgst.o",
-                "crypto/md4/liblegacy-lib-md4_one.o"
+                "crypto/md4/libcrypto-shlib-md4_one.o"
             ],
             "products" => {
                 "lib" => [
-                    "libcrypto",
-                    "providers/liblegacy.a"
+                    "libcrypto"
                 ]
             }
         },
@@ -8644,14 +8705,11 @@ our %unified_info = (
                 "crypto/mdc2/libcrypto-lib-mdc2_one.o",
                 "crypto/mdc2/libcrypto-lib-mdc2dgst.o",
                 "crypto/mdc2/libcrypto-shlib-mdc2_one.o",
-                "crypto/mdc2/libcrypto-shlib-mdc2dgst.o",
-                "crypto/mdc2/liblegacy-lib-mdc2_one.o",
-                "crypto/mdc2/liblegacy-lib-mdc2dgst.o"
+                "crypto/mdc2/libcrypto-shlib-mdc2dgst.o"
             ],
             "products" => {
                 "lib" => [
-                    "libcrypto",
-                    "providers/liblegacy.a"
+                    "libcrypto"
                 ]
             }
         },
@@ -8780,6 +8838,7 @@ our %unified_info = (
         },
         "crypto/pem" => {
             "deps" => [
+                "crypto/pem/loader_attic-dso-pvkfmt.o",
                 "crypto/pem/libcrypto-lib-pem_all.o",
                 "crypto/pem/libcrypto-lib-pem_err.o",
                 "crypto/pem/libcrypto-lib-pem_info.o",
@@ -8804,6 +8863,9 @@ our %unified_info = (
                 "crypto/pem/libcrypto-shlib-pvkfmt.o"
             ],
             "products" => {
+                "dso" => [
+                    "engines/loader_attic"
+                ],
                 "lib" => [
                     "libcrypto"
                 ]
@@ -8915,6 +8977,7 @@ our %unified_info = (
                 "crypto/rand/libcrypto-lib-rand_deprecated.o",
                 "crypto/rand/libcrypto-lib-rand_err.o",
                 "crypto/rand/libcrypto-lib-rand_lib.o",
+                "crypto/rand/libcrypto-lib-rand_meth.o",
                 "crypto/rand/libcrypto-lib-rand_pool.o",
                 "crypto/rand/libcrypto-lib-rand_uniform.o",
                 "crypto/rand/libcrypto-lib-randfile.o",
@@ -8922,6 +8985,7 @@ our %unified_info = (
                 "crypto/rand/libcrypto-shlib-rand_deprecated.o",
                 "crypto/rand/libcrypto-shlib-rand_err.o",
                 "crypto/rand/libcrypto-shlib-rand_lib.o",
+                "crypto/rand/libcrypto-shlib-rand_meth.o",
                 "crypto/rand/libcrypto-shlib-rand_pool.o",
                 "crypto/rand/libcrypto-shlib-rand_uniform.o",
                 "crypto/rand/libcrypto-shlib-randfile.o"
@@ -8943,17 +9007,11 @@ our %unified_info = (
                 "crypto/rc2/libcrypto-shlib-rc2_ecb.o",
                 "crypto/rc2/libcrypto-shlib-rc2_skey.o",
                 "crypto/rc2/libcrypto-shlib-rc2cfb64.o",
-                "crypto/rc2/libcrypto-shlib-rc2ofb64.o",
-                "crypto/rc2/liblegacy-lib-rc2_cbc.o",
-                "crypto/rc2/liblegacy-lib-rc2_ecb.o",
-                "crypto/rc2/liblegacy-lib-rc2_skey.o",
-                "crypto/rc2/liblegacy-lib-rc2cfb64.o",
-                "crypto/rc2/liblegacy-lib-rc2ofb64.o"
+                "crypto/rc2/libcrypto-shlib-rc2ofb64.o"
             ],
             "products" => {
                 "lib" => [
-                    "libcrypto",
-                    "providers/liblegacy.a"
+                    "libcrypto"
                 ]
             }
         },
@@ -8978,14 +9036,11 @@ our %unified_info = (
                 "crypto/ripemd/libcrypto-lib-rmd_dgst.o",
                 "crypto/ripemd/libcrypto-lib-rmd_one.o",
                 "crypto/ripemd/libcrypto-shlib-rmd_dgst.o",
-                "crypto/ripemd/libcrypto-shlib-rmd_one.o",
-                "crypto/ripemd/liblegacy-lib-rmd_dgst.o",
-                "crypto/ripemd/liblegacy-lib-rmd_one.o"
+                "crypto/ripemd/libcrypto-shlib-rmd_one.o"
             ],
             "products" => {
                 "lib" => [
-                    "libcrypto",
-                    "providers/liblegacy.a"
+                    "libcrypto"
                 ]
             }
         },
@@ -8996,6 +9051,7 @@ our %unified_info = (
                 "crypto/rsa/libcrypto-lib-rsa_backend.o",
                 "crypto/rsa/libcrypto-lib-rsa_chk.o",
                 "crypto/rsa/libcrypto-lib-rsa_crpt.o",
+                "crypto/rsa/libcrypto-lib-rsa_depr.o",
                 "crypto/rsa/libcrypto-lib-rsa_err.o",
                 "crypto/rsa/libcrypto-lib-rsa_gen.o",
                 "crypto/rsa/libcrypto-lib-rsa_lib.o",
@@ -9015,11 +9071,13 @@ our %unified_info = (
                 "crypto/rsa/libcrypto-lib-rsa_sp800_56b_check.o",
                 "crypto/rsa/libcrypto-lib-rsa_sp800_56b_gen.o",
                 "crypto/rsa/libcrypto-lib-rsa_x931.o",
+                "crypto/rsa/libcrypto-lib-rsa_x931g.o",
                 "crypto/rsa/libcrypto-shlib-rsa_ameth.o",
                 "crypto/rsa/libcrypto-shlib-rsa_asn1.o",
                 "crypto/rsa/libcrypto-shlib-rsa_backend.o",
                 "crypto/rsa/libcrypto-shlib-rsa_chk.o",
                 "crypto/rsa/libcrypto-shlib-rsa_crpt.o",
+                "crypto/rsa/libcrypto-shlib-rsa_depr.o",
                 "crypto/rsa/libcrypto-shlib-rsa_err.o",
                 "crypto/rsa/libcrypto-shlib-rsa_gen.o",
                 "crypto/rsa/libcrypto-shlib-rsa_lib.o",
@@ -9038,7 +9096,8 @@ our %unified_info = (
                 "crypto/rsa/libcrypto-shlib-rsa_sign.o",
                 "crypto/rsa/libcrypto-shlib-rsa_sp800_56b_check.o",
                 "crypto/rsa/libcrypto-shlib-rsa_sp800_56b_gen.o",
-                "crypto/rsa/libcrypto-shlib-rsa_x931.o"
+                "crypto/rsa/libcrypto-shlib-rsa_x931.o",
+                "crypto/rsa/libcrypto-shlib-rsa_x931g.o"
             ],
             "products" => {
                 "lib" => [
@@ -9057,17 +9116,11 @@ our %unified_info = (
                 "crypto/seed/libcrypto-shlib-seed_cbc.o",
                 "crypto/seed/libcrypto-shlib-seed_cfb.o",
                 "crypto/seed/libcrypto-shlib-seed_ecb.o",
-                "crypto/seed/libcrypto-shlib-seed_ofb.o",
-                "crypto/seed/liblegacy-lib-seed.o",
-                "crypto/seed/liblegacy-lib-seed_cbc.o",
-                "crypto/seed/liblegacy-lib-seed_cfb.o",
-                "crypto/seed/liblegacy-lib-seed_ecb.o",
-                "crypto/seed/liblegacy-lib-seed_ofb.o"
+                "crypto/seed/libcrypto-shlib-seed_ofb.o"
             ],
             "products" => {
                 "lib" => [
-                    "libcrypto",
-                    "providers/liblegacy.a"
+                    "libcrypto"
                 ]
             }
         },
@@ -9185,6 +9238,19 @@ our %unified_info = (
                 ]
             }
         },
+        "crypto/srp" => {
+            "deps" => [
+                "crypto/srp/libcrypto-lib-srp_lib.o",
+                "crypto/srp/libcrypto-lib-srp_vfy.o",
+                "crypto/srp/libcrypto-shlib-srp_lib.o",
+                "crypto/srp/libcrypto-shlib-srp_vfy.o"
+            ],
+            "products" => {
+                "lib" => [
+                    "libcrypto"
+                ]
+            }
+        },
         "crypto/stack" => {
             "deps" => [
                 "crypto/stack/libcrypto-lib-stack.o",
@@ -9199,13 +9265,17 @@ our %unified_info = (
         "crypto/store" => {
             "deps" => [
                 "crypto/store/libcrypto-lib-store_err.o",
+                "crypto/store/libcrypto-lib-store_init.o",
                 "crypto/store/libcrypto-lib-store_lib.o",
                 "crypto/store/libcrypto-lib-store_meth.o",
+                "crypto/store/libcrypto-lib-store_register.o",
                 "crypto/store/libcrypto-lib-store_result.o",
                 "crypto/store/libcrypto-lib-store_strings.o",
                 "crypto/store/libcrypto-shlib-store_err.o",
+                "crypto/store/libcrypto-shlib-store_init.o",
                 "crypto/store/libcrypto-shlib-store_lib.o",
                 "crypto/store/libcrypto-shlib-store_meth.o",
+                "crypto/store/libcrypto-shlib-store_register.o",
                 "crypto/store/libcrypto-shlib-store_result.o",
                 "crypto/store/libcrypto-shlib-store_strings.o"
             ],
@@ -9317,14 +9387,11 @@ our %unified_info = (
                 "crypto/whrlpool/libcrypto-lib-wp-x86_64.o",
                 "crypto/whrlpool/libcrypto-lib-wp_dgst.o",
                 "crypto/whrlpool/libcrypto-shlib-wp-x86_64.o",
-                "crypto/whrlpool/libcrypto-shlib-wp_dgst.o",
-                "crypto/whrlpool/liblegacy-lib-wp-x86_64.o",
-                "crypto/whrlpool/liblegacy-lib-wp_dgst.o"
+                "crypto/whrlpool/libcrypto-shlib-wp_dgst.o"
             ],
             "products" => {
                 "lib" => [
-                    "libcrypto",
-                    "providers/liblegacy.a"
+                    "libcrypto"
                 ]
             }
         },
@@ -9417,6 +9484,7 @@ our %unified_info = (
                 "crypto/x509/libcrypto-lib-x509name.o",
                 "crypto/x509/libcrypto-lib-x509rset.o",
                 "crypto/x509/libcrypto-lib-x509spki.o",
+                "crypto/x509/libcrypto-lib-x509type.o",
                 "crypto/x509/libcrypto-lib-x_all.o",
                 "crypto/x509/libcrypto-lib-x_attrib.o",
                 "crypto/x509/libcrypto-lib-x_crl.o",
@@ -9514,6 +9582,7 @@ our %unified_info = (
                 "crypto/x509/libcrypto-shlib-x509name.o",
                 "crypto/x509/libcrypto-shlib-x509rset.o",
                 "crypto/x509/libcrypto-shlib-x509spki.o",
+                "crypto/x509/libcrypto-shlib-x509type.o",
                 "crypto/x509/libcrypto-shlib-x_all.o",
                 "crypto/x509/libcrypto-shlib-x_attrib.o",
                 "crypto/x509/libcrypto-shlib-x_crl.o",
@@ -9528,6 +9597,17 @@ our %unified_info = (
             "products" => {
                 "lib" => [
                     "libcrypto"
+                ]
+            }
+        },
+        "engines" => {
+            "products" => {
+                "dso" => [
+                    "engines/capi",
+                    "engines/dasync",
+                    "engines/loader_attic",
+                    "engines/ossltest",
+                    "engines/padlock"
                 ]
             }
         },
@@ -9935,6 +10015,7 @@ our %unified_info = (
                 "ssl/libssl-lib-ssl_lib.o",
                 "ssl/libssl-lib-ssl_mcnf.o",
                 "ssl/libssl-lib-ssl_rsa.o",
+                "ssl/libssl-lib-ssl_rsa_legacy.o",
                 "ssl/libssl-lib-ssl_sess.o",
                 "ssl/libssl-lib-ssl_stat.o",
                 "ssl/libssl-lib-ssl_txt.o",
@@ -9965,6 +10046,7 @@ our %unified_info = (
                 "ssl/libssl-shlib-ssl_lib.o",
                 "ssl/libssl-shlib-ssl_mcnf.o",
                 "ssl/libssl-shlib-ssl_rsa.o",
+                "ssl/libssl-shlib-ssl_rsa_legacy.o",
                 "ssl/libssl-shlib-ssl_sess.o",
                 "ssl/libssl-shlib-ssl_stat.o",
                 "ssl/libssl-shlib-ssl_txt.o",
@@ -10098,6 +10180,7 @@ our %unified_info = (
                 "ssl/record/methods/libssl-lib-tls_multib.o",
                 "ssl/record/methods/libssl-lib-tlsany_meth.o",
                 "ssl/record/methods/libssl-shlib-dtls_meth.o",
+                "ssl/record/methods/libssl-shlib-ssl3_cbc.o",
                 "ssl/record/methods/libssl-shlib-ssl3_meth.o",
                 "ssl/record/methods/libssl-shlib-tls13_meth.o",
                 "ssl/record/methods/libssl-shlib-tls1_meth.o",
@@ -16453,6 +16536,12 @@ our %unified_info = (
         "doc/man7/openssl_user_macros.pod" => [
             "doc/man7/openssl_user_macros.pod.in"
         ],
+        "engines/e_padlock-x86.S" => [
+            "engines/asm/e_padlock-x86.pl"
+        ],
+        "engines/e_padlock-x86_64.s" => [
+            "engines/asm/e_padlock-x86_64.pl"
+        ],
         "exporters/OpenSSLConfig.cmake" => [
             "exporters/cmake/OpenSSLConfig.cmake.in"
         ],
@@ -17607,6 +17696,9 @@ our %unified_info = (
         "apps/enc.o" => [
             "apps"
         ],
+        "apps/engine.o" => [
+            "apps"
+        ],
         "apps/errstr.o" => [
             "apps"
         ],
@@ -17698,6 +17790,9 @@ our %unified_info = (
         "apps/openssl-bin-enc.o" => [
             "apps"
         ],
+        "apps/openssl-bin-engine.o" => [
+            "apps"
+        ],
         "apps/openssl-bin-errstr.o" => [
             "apps"
         ],
@@ -17773,6 +17868,9 @@ our %unified_info = (
         "apps/openssl-bin-rsa.o" => [
             "apps"
         ],
+        "apps/openssl-bin-rsautl.o" => [
+            "apps"
+        ],
         "apps/openssl-bin-s_client.o" => [
             "apps"
         ],
@@ -17795,6 +17893,9 @@ our %unified_info = (
             "apps"
         ],
         "apps/openssl-bin-spkac.o" => [
+            "apps"
+        ],
+        "apps/openssl-bin-srp.o" => [
             "apps"
         ],
         "apps/openssl-bin-storeutl.o" => [
@@ -17857,6 +17958,9 @@ our %unified_info = (
         "apps/rsa.o" => [
             "apps"
         ],
+        "apps/rsautl.o" => [
+            "apps"
+        ],
         "apps/s_client.o" => [
             "apps"
         ],
@@ -17879,6 +17983,9 @@ our %unified_info = (
             "apps"
         ],
         "apps/spkac.o" => [
+            "apps"
+        ],
+        "apps/srp.o" => [
             "apps"
         ],
         "apps/storeutl.o" => [
@@ -18423,6 +18530,21 @@ our %unified_info = (
         ],
         "doc/man1/openssl-x509.pod" => [
             "doc"
+        ],
+        "engines/capi" => [
+            "include"
+        ],
+        "engines/dasync" => [
+            "include"
+        ],
+        "engines/loader_attic" => [
+            "include"
+        ],
+        "engines/ossltest" => [
+            "include"
+        ],
+        "engines/padlock" => [
+            "include"
         ],
         "exporters/OpenSSLConfig.cmake" => [
             "."
@@ -19658,6 +19780,11 @@ our %unified_info = (
         ]
     },
     "modules" => [
+        "engines/capi",
+        "engines/dasync",
+        "engines/loader_attic",
+        "engines/ossltest",
+        "engines/padlock",
         "providers/legacy"
     ],
     "programs" => [
@@ -19675,6 +19802,7 @@ our %unified_info = (
             "crypto/aes/libcrypto-shlib-aes-x86_64.o",
             "crypto/aes/libcrypto-shlib-aes_cfb.o",
             "crypto/aes/libcrypto-shlib-aes_ecb.o",
+            "crypto/aes/libcrypto-shlib-aes_ige.o",
             "crypto/aes/libcrypto-shlib-aes_misc.o",
             "crypto/aes/libcrypto-shlib-aes_ofb.o",
             "crypto/aes/libcrypto-shlib-aes_wrap.o",
@@ -19745,6 +19873,7 @@ our %unified_info = (
             "crypto/asn1/libcrypto-shlib-x_bignum.o",
             "crypto/asn1/libcrypto-shlib-x_info.o",
             "crypto/asn1/libcrypto-shlib-x_int64.o",
+            "crypto/asn1/libcrypto-shlib-x_long.o",
             "crypto/asn1/libcrypto-shlib-x_pkey.o",
             "crypto/asn1/libcrypto-shlib-x_sig.o",
             "crypto/asn1/libcrypto-shlib-x_spki.o",
@@ -19794,6 +19923,7 @@ our %unified_info = (
             "crypto/bn/libcrypto-shlib-bn_const.o",
             "crypto/bn/libcrypto-shlib-bn_conv.o",
             "crypto/bn/libcrypto-shlib-bn_ctx.o",
+            "crypto/bn/libcrypto-shlib-bn_depr.o",
             "crypto/bn/libcrypto-shlib-bn_dh.o",
             "crypto/bn/libcrypto-shlib-bn_div.o",
             "crypto/bn/libcrypto-shlib-bn_err.o",
@@ -19819,6 +19949,7 @@ our %unified_info = (
             "crypto/bn/libcrypto-shlib-bn_sqrt.o",
             "crypto/bn/libcrypto-shlib-bn_srp.o",
             "crypto/bn/libcrypto-shlib-bn_word.o",
+            "crypto/bn/libcrypto-shlib-bn_x931p.o",
             "crypto/bn/libcrypto-shlib-rsaz-2k-avx512.o",
             "crypto/bn/libcrypto-shlib-rsaz-2k-avxifma.o",
             "crypto/bn/libcrypto-shlib-rsaz-3k-avx512.o",
@@ -19927,6 +20058,7 @@ our %unified_info = (
             "crypto/dh/libcrypto-shlib-dh_asn1.o",
             "crypto/dh/libcrypto-shlib-dh_backend.o",
             "crypto/dh/libcrypto-shlib-dh_check.o",
+            "crypto/dh/libcrypto-shlib-dh_depr.o",
             "crypto/dh/libcrypto-shlib-dh_err.o",
             "crypto/dh/libcrypto-shlib-dh_gen.o",
             "crypto/dh/libcrypto-shlib-dh_group_params.o",
@@ -19941,6 +20073,7 @@ our %unified_info = (
             "crypto/dsa/libcrypto-shlib-dsa_asn1.o",
             "crypto/dsa/libcrypto-shlib-dsa_backend.o",
             "crypto/dsa/libcrypto-shlib-dsa_check.o",
+            "crypto/dsa/libcrypto-shlib-dsa_depr.o",
             "crypto/dsa/libcrypto-shlib-dsa_err.o",
             "crypto/dsa/libcrypto-shlib-dsa_gen.o",
             "crypto/dsa/libcrypto-shlib-dsa_key.o",
@@ -20007,6 +20140,28 @@ our %unified_info = (
             "crypto/encode_decode/libcrypto-shlib-encoder_lib.o",
             "crypto/encode_decode/libcrypto-shlib-encoder_meth.o",
             "crypto/encode_decode/libcrypto-shlib-encoder_pkey.o",
+            "crypto/engine/libcrypto-shlib-eng_all.o",
+            "crypto/engine/libcrypto-shlib-eng_cnf.o",
+            "crypto/engine/libcrypto-shlib-eng_ctrl.o",
+            "crypto/engine/libcrypto-shlib-eng_dyn.o",
+            "crypto/engine/libcrypto-shlib-eng_err.o",
+            "crypto/engine/libcrypto-shlib-eng_fat.o",
+            "crypto/engine/libcrypto-shlib-eng_init.o",
+            "crypto/engine/libcrypto-shlib-eng_lib.o",
+            "crypto/engine/libcrypto-shlib-eng_list.o",
+            "crypto/engine/libcrypto-shlib-eng_openssl.o",
+            "crypto/engine/libcrypto-shlib-eng_pkey.o",
+            "crypto/engine/libcrypto-shlib-eng_rdrand.o",
+            "crypto/engine/libcrypto-shlib-eng_table.o",
+            "crypto/engine/libcrypto-shlib-tb_asnmth.o",
+            "crypto/engine/libcrypto-shlib-tb_cipher.o",
+            "crypto/engine/libcrypto-shlib-tb_dh.o",
+            "crypto/engine/libcrypto-shlib-tb_digest.o",
+            "crypto/engine/libcrypto-shlib-tb_dsa.o",
+            "crypto/engine/libcrypto-shlib-tb_eckey.o",
+            "crypto/engine/libcrypto-shlib-tb_pkmeth.o",
+            "crypto/engine/libcrypto-shlib-tb_rand.o",
+            "crypto/engine/libcrypto-shlib-tb_rsa.o",
             "crypto/err/libcrypto-shlib-err.o",
             "crypto/err/libcrypto-shlib-err_all.o",
             "crypto/err/libcrypto-shlib-err_all_legacy.o",
@@ -20042,6 +20197,7 @@ our %unified_info = (
             "crypto/evp/libcrypto-shlib-e_des3.o",
             "crypto/evp/libcrypto-shlib-e_idea.o",
             "crypto/evp/libcrypto-shlib-e_null.o",
+            "crypto/evp/libcrypto-shlib-e_old.o",
             "crypto/evp/libcrypto-shlib-e_rc2.o",
             "crypto/evp/libcrypto-shlib-e_rc4.o",
             "crypto/evp/libcrypto-shlib-e_rc4_hmac_md5.o",
@@ -20083,6 +20239,8 @@ our %unified_info = (
             "crypto/evp/libcrypto-shlib-names.o",
             "crypto/evp/libcrypto-shlib-p5_crpt.o",
             "crypto/evp/libcrypto-shlib-p5_crpt2.o",
+            "crypto/evp/libcrypto-shlib-p_dec.o",
+            "crypto/evp/libcrypto-shlib-p_enc.o",
             "crypto/evp/libcrypto-shlib-p_legacy.o",
             "crypto/evp/libcrypto-shlib-p_lib.o",
             "crypto/evp/libcrypto-shlib-p_open.o",
@@ -20269,6 +20427,7 @@ our %unified_info = (
             "crypto/rand/libcrypto-shlib-rand_deprecated.o",
             "crypto/rand/libcrypto-shlib-rand_err.o",
             "crypto/rand/libcrypto-shlib-rand_lib.o",
+            "crypto/rand/libcrypto-shlib-rand_meth.o",
             "crypto/rand/libcrypto-shlib-rand_pool.o",
             "crypto/rand/libcrypto-shlib-rand_uniform.o",
             "crypto/rand/libcrypto-shlib-randfile.o",
@@ -20286,6 +20445,7 @@ our %unified_info = (
             "crypto/rsa/libcrypto-shlib-rsa_backend.o",
             "crypto/rsa/libcrypto-shlib-rsa_chk.o",
             "crypto/rsa/libcrypto-shlib-rsa_crpt.o",
+            "crypto/rsa/libcrypto-shlib-rsa_depr.o",
             "crypto/rsa/libcrypto-shlib-rsa_err.o",
             "crypto/rsa/libcrypto-shlib-rsa_gen.o",
             "crypto/rsa/libcrypto-shlib-rsa_lib.o",
@@ -20305,6 +20465,7 @@ our %unified_info = (
             "crypto/rsa/libcrypto-shlib-rsa_sp800_56b_check.o",
             "crypto/rsa/libcrypto-shlib-rsa_sp800_56b_gen.o",
             "crypto/rsa/libcrypto-shlib-rsa_x931.o",
+            "crypto/rsa/libcrypto-shlib-rsa_x931g.o",
             "crypto/seed/libcrypto-shlib-seed.o",
             "crypto/seed/libcrypto-shlib-seed_cbc.o",
             "crypto/seed/libcrypto-shlib-seed_cfb.o",
@@ -20339,10 +20500,14 @@ our %unified_info = (
             "crypto/sm3/libcrypto-shlib-legacy_sm3.o",
             "crypto/sm3/libcrypto-shlib-sm3.o",
             "crypto/sm4/libcrypto-shlib-sm4.o",
+            "crypto/srp/libcrypto-shlib-srp_lib.o",
+            "crypto/srp/libcrypto-shlib-srp_vfy.o",
             "crypto/stack/libcrypto-shlib-stack.o",
             "crypto/store/libcrypto-shlib-store_err.o",
+            "crypto/store/libcrypto-shlib-store_init.o",
             "crypto/store/libcrypto-shlib-store_lib.o",
             "crypto/store/libcrypto-shlib-store_meth.o",
+            "crypto/store/libcrypto-shlib-store_register.o",
             "crypto/store/libcrypto-shlib-store_result.o",
             "crypto/store/libcrypto-shlib-store_strings.o",
             "crypto/thread/arch/libcrypto-shlib-thread_none.o",
@@ -20457,6 +20622,7 @@ our %unified_info = (
             "crypto/x509/libcrypto-shlib-x509name.o",
             "crypto/x509/libcrypto-shlib-x509rset.o",
             "crypto/x509/libcrypto-shlib-x509spki.o",
+            "crypto/x509/libcrypto-shlib-x509type.o",
             "crypto/x509/libcrypto-shlib-x_all.o",
             "crypto/x509/libcrypto-shlib-x_attrib.o",
             "crypto/x509/libcrypto-shlib-x_crl.o",
@@ -20505,6 +20671,7 @@ our %unified_info = (
             "ssl/libssl-shlib-ssl_lib.o",
             "ssl/libssl-shlib-ssl_mcnf.o",
             "ssl/libssl-shlib-ssl_rsa.o",
+            "ssl/libssl-shlib-ssl_rsa_legacy.o",
             "ssl/libssl-shlib-ssl_sess.o",
             "ssl/libssl-shlib-ssl_stat.o",
             "ssl/libssl-shlib-ssl_txt.o",
@@ -20560,6 +20727,7 @@ our %unified_info = (
             "ssl/record/libssl-shlib-rec_layer_d1.o",
             "ssl/record/libssl-shlib-rec_layer_s3.o",
             "ssl/record/methods/libssl-shlib-dtls_meth.o",
+            "ssl/record/methods/libssl-shlib-ssl3_cbc.o",
             "ssl/record/methods/libssl-shlib-ssl3_meth.o",
             "ssl/record/methods/libssl-shlib-tls13_meth.o",
             "ssl/record/methods/libssl-shlib-tls1_meth.o",
@@ -20639,6 +20807,9 @@ our %unified_info = (
         "apps/lib/libapps-lib-s_socket.o" => [
             "apps/lib/s_socket.c"
         ],
+        "apps/lib/libapps-lib-tlssrp_depr.o" => [
+            "apps/lib/tlssrp_depr.c"
+        ],
         "apps/lib/openssl-bin-cmp_mock_srv.o" => [
             "apps/lib/cmp_mock_srv.c"
         ],
@@ -20660,7 +20831,8 @@ our %unified_info = (
             "apps/lib/libapps-lib-names.o",
             "apps/lib/libapps-lib-opt.o",
             "apps/lib/libapps-lib-s_cb.o",
-            "apps/lib/libapps-lib-s_socket.o"
+            "apps/lib/libapps-lib-s_socket.o",
+            "apps/lib/libapps-lib-tlssrp_depr.o"
         ],
         "apps/openssl" => [
             "apps/lib/openssl-bin-cmp_mock_srv.o",
@@ -20678,6 +20850,7 @@ our %unified_info = (
             "apps/openssl-bin-ec.o",
             "apps/openssl-bin-ecparam.o",
             "apps/openssl-bin-enc.o",
+            "apps/openssl-bin-engine.o",
             "apps/openssl-bin-errstr.o",
             "apps/openssl-bin-fipsinstall.o",
             "apps/openssl-bin-gendsa.o",
@@ -20703,6 +20876,7 @@ our %unified_info = (
             "apps/openssl-bin-rehash.o",
             "apps/openssl-bin-req.o",
             "apps/openssl-bin-rsa.o",
+            "apps/openssl-bin-rsautl.o",
             "apps/openssl-bin-s_client.o",
             "apps/openssl-bin-s_server.o",
             "apps/openssl-bin-s_time.o",
@@ -20711,6 +20885,7 @@ our %unified_info = (
             "apps/openssl-bin-smime.o",
             "apps/openssl-bin-speed.o",
             "apps/openssl-bin-spkac.o",
+            "apps/openssl-bin-srp.o",
             "apps/openssl-bin-storeutl.o",
             "apps/openssl-bin-ts.o",
             "apps/openssl-bin-verify.o",
@@ -20758,6 +20933,9 @@ our %unified_info = (
         ],
         "apps/openssl-bin-enc.o" => [
             "apps/enc.c"
+        ],
+        "apps/openssl-bin-engine.o" => [
+            "apps/engine.c"
         ],
         "apps/openssl-bin-errstr.o" => [
             "apps/errstr.c"
@@ -20834,6 +21012,9 @@ our %unified_info = (
         "apps/openssl-bin-rsa.o" => [
             "apps/rsa.c"
         ],
+        "apps/openssl-bin-rsautl.o" => [
+            "apps/rsautl.c"
+        ],
         "apps/openssl-bin-s_client.o" => [
             "apps/s_client.c"
         ],
@@ -20857,6 +21038,9 @@ our %unified_info = (
         ],
         "apps/openssl-bin-spkac.o" => [
             "apps/spkac.c"
+        ],
+        "apps/openssl-bin-srp.o" => [
+            "apps/srp.c"
         ],
         "apps/openssl-bin-storeutl.o" => [
             "apps/storeutl.c"
@@ -20884,6 +21068,9 @@ our %unified_info = (
         ],
         "crypto/aes/libcrypto-lib-aes_ecb.o" => [
             "crypto/aes/aes_ecb.c"
+        ],
+        "crypto/aes/libcrypto-lib-aes_ige.o" => [
+            "crypto/aes/aes_ige.c"
         ],
         "crypto/aes/libcrypto-lib-aes_misc.o" => [
             "crypto/aes/aes_misc.c"
@@ -20923,6 +21110,9 @@ our %unified_info = (
         ],
         "crypto/aes/libcrypto-shlib-aes_ecb.o" => [
             "crypto/aes/aes_ecb.c"
+        ],
+        "crypto/aes/libcrypto-shlib-aes_ige.o" => [
+            "crypto/aes/aes_ige.c"
         ],
         "crypto/aes/libcrypto-shlib-aes_misc.o" => [
             "crypto/aes/aes_misc.c"
@@ -21137,6 +21327,9 @@ our %unified_info = (
         "crypto/asn1/libcrypto-lib-x_int64.o" => [
             "crypto/asn1/x_int64.c"
         ],
+        "crypto/asn1/libcrypto-lib-x_long.o" => [
+            "crypto/asn1/x_long.c"
+        ],
         "crypto/asn1/libcrypto-lib-x_pkey.o" => [
             "crypto/asn1/x_pkey.c"
         ],
@@ -21326,6 +21519,9 @@ our %unified_info = (
         "crypto/asn1/libcrypto-shlib-x_int64.o" => [
             "crypto/asn1/x_int64.c"
         ],
+        "crypto/asn1/libcrypto-shlib-x_long.o" => [
+            "crypto/asn1/x_long.c"
+        ],
         "crypto/asn1/libcrypto-shlib-x_pkey.o" => [
             "crypto/asn1/x_pkey.c"
         ],
@@ -21402,21 +21598,6 @@ our %unified_info = (
             "crypto/bf/bf_ofb64.c"
         ],
         "crypto/bf/libcrypto-shlib-bf_skey.o" => [
-            "crypto/bf/bf_skey.c"
-        ],
-        "crypto/bf/liblegacy-lib-bf_cfb64.o" => [
-            "crypto/bf/bf_cfb64.c"
-        ],
-        "crypto/bf/liblegacy-lib-bf_ecb.o" => [
-            "crypto/bf/bf_ecb.c"
-        ],
-        "crypto/bf/liblegacy-lib-bf_enc.o" => [
-            "crypto/bf/bf_enc.c"
-        ],
-        "crypto/bf/liblegacy-lib-bf_ofb64.o" => [
-            "crypto/bf/bf_ofb64.c"
-        ],
-        "crypto/bf/liblegacy-lib-bf_skey.o" => [
             "crypto/bf/bf_skey.c"
         ],
         "crypto/bio/libcrypto-lib-bf_buff.o" => [
@@ -21608,6 +21789,9 @@ our %unified_info = (
         "crypto/bn/libcrypto-lib-bn_ctx.o" => [
             "crypto/bn/bn_ctx.c"
         ],
+        "crypto/bn/libcrypto-lib-bn_depr.o" => [
+            "crypto/bn/bn_depr.c"
+        ],
         "crypto/bn/libcrypto-lib-bn_dh.o" => [
             "crypto/bn/bn_dh.c"
         ],
@@ -21683,6 +21867,9 @@ our %unified_info = (
         "crypto/bn/libcrypto-lib-bn_word.o" => [
             "crypto/bn/bn_word.c"
         ],
+        "crypto/bn/libcrypto-lib-bn_x931p.o" => [
+            "crypto/bn/bn_x931p.c"
+        ],
         "crypto/bn/libcrypto-lib-rsaz-2k-avx512.o" => [
             "crypto/bn/rsaz-2k-avx512.s"
         ],
@@ -21736,6 +21923,9 @@ our %unified_info = (
         ],
         "crypto/bn/libcrypto-shlib-bn_ctx.o" => [
             "crypto/bn/bn_ctx.c"
+        ],
+        "crypto/bn/libcrypto-shlib-bn_depr.o" => [
+            "crypto/bn/bn_depr.c"
         ],
         "crypto/bn/libcrypto-shlib-bn_dh.o" => [
             "crypto/bn/bn_dh.c"
@@ -21811,6 +22001,9 @@ our %unified_info = (
         ],
         "crypto/bn/libcrypto-shlib-bn_word.o" => [
             "crypto/bn/bn_word.c"
+        ],
+        "crypto/bn/libcrypto-shlib-bn_x931p.o" => [
+            "crypto/bn/bn_x931p.c"
         ],
         "crypto/bn/libcrypto-shlib-rsaz-2k-avx512.o" => [
             "crypto/bn/rsaz-2k-avx512.s"
@@ -21927,21 +22120,6 @@ our %unified_info = (
             "crypto/cast/c_ofb64.c"
         ],
         "crypto/cast/libcrypto-shlib-c_skey.o" => [
-            "crypto/cast/c_skey.c"
-        ],
-        "crypto/cast/liblegacy-lib-c_cfb64.o" => [
-            "crypto/cast/c_cfb64.c"
-        ],
-        "crypto/cast/liblegacy-lib-c_ecb.o" => [
-            "crypto/cast/c_ecb.c"
-        ],
-        "crypto/cast/liblegacy-lib-c_enc.o" => [
-            "crypto/cast/c_enc.c"
-        ],
-        "crypto/cast/liblegacy-lib-c_ofb64.o" => [
-            "crypto/cast/c_ofb64.c"
-        ],
-        "crypto/cast/liblegacy-lib-c_skey.o" => [
             "crypto/cast/c_skey.c"
         ],
         "crypto/chacha/libcrypto-lib-chacha-x86_64.o" => [
@@ -22412,62 +22590,11 @@ our %unified_info = (
         "crypto/des/libcrypto-shlib-xcbc_enc.o" => [
             "crypto/des/xcbc_enc.c"
         ],
-        "crypto/des/liblegacy-lib-cbc_cksm.o" => [
-            "crypto/des/cbc_cksm.c"
-        ],
-        "crypto/des/liblegacy-lib-cbc_enc.o" => [
-            "crypto/des/cbc_enc.c"
-        ],
-        "crypto/des/liblegacy-lib-cfb64ede.o" => [
-            "crypto/des/cfb64ede.c"
-        ],
-        "crypto/des/liblegacy-lib-cfb64enc.o" => [
-            "crypto/des/cfb64enc.c"
-        ],
-        "crypto/des/liblegacy-lib-cfb_enc.o" => [
-            "crypto/des/cfb_enc.c"
-        ],
         "crypto/des/liblegacy-lib-des_enc.o" => [
             "crypto/des/des_enc.c"
         ],
-        "crypto/des/liblegacy-lib-ecb3_enc.o" => [
-            "crypto/des/ecb3_enc.c"
-        ],
-        "crypto/des/liblegacy-lib-ecb_enc.o" => [
-            "crypto/des/ecb_enc.c"
-        ],
-        "crypto/des/liblegacy-lib-fcrypt.o" => [
-            "crypto/des/fcrypt.c"
-        ],
         "crypto/des/liblegacy-lib-fcrypt_b.o" => [
             "crypto/des/fcrypt_b.c"
-        ],
-        "crypto/des/liblegacy-lib-ofb64ede.o" => [
-            "crypto/des/ofb64ede.c"
-        ],
-        "crypto/des/liblegacy-lib-ofb64enc.o" => [
-            "crypto/des/ofb64enc.c"
-        ],
-        "crypto/des/liblegacy-lib-ofb_enc.o" => [
-            "crypto/des/ofb_enc.c"
-        ],
-        "crypto/des/liblegacy-lib-pcbc_enc.o" => [
-            "crypto/des/pcbc_enc.c"
-        ],
-        "crypto/des/liblegacy-lib-qud_cksm.o" => [
-            "crypto/des/qud_cksm.c"
-        ],
-        "crypto/des/liblegacy-lib-rand_key.o" => [
-            "crypto/des/rand_key.c"
-        ],
-        "crypto/des/liblegacy-lib-set_key.o" => [
-            "crypto/des/set_key.c"
-        ],
-        "crypto/des/liblegacy-lib-str2key.o" => [
-            "crypto/des/str2key.c"
-        ],
-        "crypto/des/liblegacy-lib-xcbc_enc.o" => [
-            "crypto/des/xcbc_enc.c"
         ],
         "crypto/dh/libcrypto-lib-dh_ameth.o" => [
             "crypto/dh/dh_ameth.c"
@@ -22480,6 +22607,9 @@ our %unified_info = (
         ],
         "crypto/dh/libcrypto-lib-dh_check.o" => [
             "crypto/dh/dh_check.c"
+        ],
+        "crypto/dh/libcrypto-lib-dh_depr.o" => [
+            "crypto/dh/dh_depr.c"
         ],
         "crypto/dh/libcrypto-lib-dh_err.o" => [
             "crypto/dh/dh_err.c"
@@ -22523,6 +22653,9 @@ our %unified_info = (
         "crypto/dh/libcrypto-shlib-dh_check.o" => [
             "crypto/dh/dh_check.c"
         ],
+        "crypto/dh/libcrypto-shlib-dh_depr.o" => [
+            "crypto/dh/dh_depr.c"
+        ],
         "crypto/dh/libcrypto-shlib-dh_err.o" => [
             "crypto/dh/dh_err.c"
         ],
@@ -22565,6 +22698,9 @@ our %unified_info = (
         "crypto/dsa/libcrypto-lib-dsa_check.o" => [
             "crypto/dsa/dsa_check.c"
         ],
+        "crypto/dsa/libcrypto-lib-dsa_depr.o" => [
+            "crypto/dsa/dsa_depr.c"
+        ],
         "crypto/dsa/libcrypto-lib-dsa_err.o" => [
             "crypto/dsa/dsa_err.c"
         ],
@@ -22606,6 +22742,9 @@ our %unified_info = (
         ],
         "crypto/dsa/libcrypto-shlib-dsa_check.o" => [
             "crypto/dsa/dsa_check.c"
+        ],
+        "crypto/dsa/libcrypto-shlib-dsa_depr.o" => [
+            "crypto/dsa/dsa_depr.c"
         ],
         "crypto/dsa/libcrypto-shlib-dsa_err.o" => [
             "crypto/dsa/dsa_err.c"
@@ -22973,6 +23112,138 @@ our %unified_info = (
         "crypto/encode_decode/libcrypto-shlib-encoder_pkey.o" => [
             "crypto/encode_decode/encoder_pkey.c"
         ],
+        "crypto/engine/libcrypto-lib-eng_all.o" => [
+            "crypto/engine/eng_all.c"
+        ],
+        "crypto/engine/libcrypto-lib-eng_cnf.o" => [
+            "crypto/engine/eng_cnf.c"
+        ],
+        "crypto/engine/libcrypto-lib-eng_ctrl.o" => [
+            "crypto/engine/eng_ctrl.c"
+        ],
+        "crypto/engine/libcrypto-lib-eng_dyn.o" => [
+            "crypto/engine/eng_dyn.c"
+        ],
+        "crypto/engine/libcrypto-lib-eng_err.o" => [
+            "crypto/engine/eng_err.c"
+        ],
+        "crypto/engine/libcrypto-lib-eng_fat.o" => [
+            "crypto/engine/eng_fat.c"
+        ],
+        "crypto/engine/libcrypto-lib-eng_init.o" => [
+            "crypto/engine/eng_init.c"
+        ],
+        "crypto/engine/libcrypto-lib-eng_lib.o" => [
+            "crypto/engine/eng_lib.c"
+        ],
+        "crypto/engine/libcrypto-lib-eng_list.o" => [
+            "crypto/engine/eng_list.c"
+        ],
+        "crypto/engine/libcrypto-lib-eng_openssl.o" => [
+            "crypto/engine/eng_openssl.c"
+        ],
+        "crypto/engine/libcrypto-lib-eng_pkey.o" => [
+            "crypto/engine/eng_pkey.c"
+        ],
+        "crypto/engine/libcrypto-lib-eng_rdrand.o" => [
+            "crypto/engine/eng_rdrand.c"
+        ],
+        "crypto/engine/libcrypto-lib-eng_table.o" => [
+            "crypto/engine/eng_table.c"
+        ],
+        "crypto/engine/libcrypto-lib-tb_asnmth.o" => [
+            "crypto/engine/tb_asnmth.c"
+        ],
+        "crypto/engine/libcrypto-lib-tb_cipher.o" => [
+            "crypto/engine/tb_cipher.c"
+        ],
+        "crypto/engine/libcrypto-lib-tb_dh.o" => [
+            "crypto/engine/tb_dh.c"
+        ],
+        "crypto/engine/libcrypto-lib-tb_digest.o" => [
+            "crypto/engine/tb_digest.c"
+        ],
+        "crypto/engine/libcrypto-lib-tb_dsa.o" => [
+            "crypto/engine/tb_dsa.c"
+        ],
+        "crypto/engine/libcrypto-lib-tb_eckey.o" => [
+            "crypto/engine/tb_eckey.c"
+        ],
+        "crypto/engine/libcrypto-lib-tb_pkmeth.o" => [
+            "crypto/engine/tb_pkmeth.c"
+        ],
+        "crypto/engine/libcrypto-lib-tb_rand.o" => [
+            "crypto/engine/tb_rand.c"
+        ],
+        "crypto/engine/libcrypto-lib-tb_rsa.o" => [
+            "crypto/engine/tb_rsa.c"
+        ],
+        "crypto/engine/libcrypto-shlib-eng_all.o" => [
+            "crypto/engine/eng_all.c"
+        ],
+        "crypto/engine/libcrypto-shlib-eng_cnf.o" => [
+            "crypto/engine/eng_cnf.c"
+        ],
+        "crypto/engine/libcrypto-shlib-eng_ctrl.o" => [
+            "crypto/engine/eng_ctrl.c"
+        ],
+        "crypto/engine/libcrypto-shlib-eng_dyn.o" => [
+            "crypto/engine/eng_dyn.c"
+        ],
+        "crypto/engine/libcrypto-shlib-eng_err.o" => [
+            "crypto/engine/eng_err.c"
+        ],
+        "crypto/engine/libcrypto-shlib-eng_fat.o" => [
+            "crypto/engine/eng_fat.c"
+        ],
+        "crypto/engine/libcrypto-shlib-eng_init.o" => [
+            "crypto/engine/eng_init.c"
+        ],
+        "crypto/engine/libcrypto-shlib-eng_lib.o" => [
+            "crypto/engine/eng_lib.c"
+        ],
+        "crypto/engine/libcrypto-shlib-eng_list.o" => [
+            "crypto/engine/eng_list.c"
+        ],
+        "crypto/engine/libcrypto-shlib-eng_openssl.o" => [
+            "crypto/engine/eng_openssl.c"
+        ],
+        "crypto/engine/libcrypto-shlib-eng_pkey.o" => [
+            "crypto/engine/eng_pkey.c"
+        ],
+        "crypto/engine/libcrypto-shlib-eng_rdrand.o" => [
+            "crypto/engine/eng_rdrand.c"
+        ],
+        "crypto/engine/libcrypto-shlib-eng_table.o" => [
+            "crypto/engine/eng_table.c"
+        ],
+        "crypto/engine/libcrypto-shlib-tb_asnmth.o" => [
+            "crypto/engine/tb_asnmth.c"
+        ],
+        "crypto/engine/libcrypto-shlib-tb_cipher.o" => [
+            "crypto/engine/tb_cipher.c"
+        ],
+        "crypto/engine/libcrypto-shlib-tb_dh.o" => [
+            "crypto/engine/tb_dh.c"
+        ],
+        "crypto/engine/libcrypto-shlib-tb_digest.o" => [
+            "crypto/engine/tb_digest.c"
+        ],
+        "crypto/engine/libcrypto-shlib-tb_dsa.o" => [
+            "crypto/engine/tb_dsa.c"
+        ],
+        "crypto/engine/libcrypto-shlib-tb_eckey.o" => [
+            "crypto/engine/tb_eckey.c"
+        ],
+        "crypto/engine/libcrypto-shlib-tb_pkmeth.o" => [
+            "crypto/engine/tb_pkmeth.c"
+        ],
+        "crypto/engine/libcrypto-shlib-tb_rand.o" => [
+            "crypto/engine/tb_rand.c"
+        ],
+        "crypto/engine/libcrypto-shlib-tb_rsa.o" => [
+            "crypto/engine/tb_rsa.c"
+        ],
         "crypto/err/libcrypto-lib-err.o" => [
             "crypto/err/err.c"
         ],
@@ -23108,6 +23379,9 @@ our %unified_info = (
         "crypto/evp/libcrypto-lib-e_null.o" => [
             "crypto/evp/e_null.c"
         ],
+        "crypto/evp/libcrypto-lib-e_old.o" => [
+            "crypto/evp/e_old.c"
+        ],
         "crypto/evp/libcrypto-lib-e_rc2.o" => [
             "crypto/evp/e_rc2.c"
         ],
@@ -23231,6 +23505,12 @@ our %unified_info = (
         "crypto/evp/libcrypto-lib-p5_crpt2.o" => [
             "crypto/evp/p5_crpt2.c"
         ],
+        "crypto/evp/libcrypto-lib-p_dec.o" => [
+            "crypto/evp/p_dec.c"
+        ],
+        "crypto/evp/libcrypto-lib-p_enc.o" => [
+            "crypto/evp/p_enc.c"
+        ],
         "crypto/evp/libcrypto-lib-p_legacy.o" => [
             "crypto/evp/p_legacy.c"
         ],
@@ -23344,6 +23624,9 @@ our %unified_info = (
         ],
         "crypto/evp/libcrypto-shlib-e_null.o" => [
             "crypto/evp/e_null.c"
+        ],
+        "crypto/evp/libcrypto-shlib-e_old.o" => [
+            "crypto/evp/e_old.c"
         ],
         "crypto/evp/libcrypto-shlib-e_rc2.o" => [
             "crypto/evp/e_rc2.c"
@@ -23467,6 +23750,12 @@ our %unified_info = (
         ],
         "crypto/evp/libcrypto-shlib-p5_crpt2.o" => [
             "crypto/evp/p5_crpt2.c"
+        ],
+        "crypto/evp/libcrypto-shlib-p_dec.o" => [
+            "crypto/evp/p_dec.c"
+        ],
+        "crypto/evp/libcrypto-shlib-p_enc.o" => [
+            "crypto/evp/p_enc.c"
         ],
         "crypto/evp/libcrypto-shlib-p_legacy.o" => [
             "crypto/evp/p_legacy.c"
@@ -23628,21 +23917,6 @@ our %unified_info = (
             "crypto/idea/i_ofb64.c"
         ],
         "crypto/idea/libcrypto-shlib-i_skey.o" => [
-            "crypto/idea/i_skey.c"
-        ],
-        "crypto/idea/liblegacy-lib-i_cbc.o" => [
-            "crypto/idea/i_cbc.c"
-        ],
-        "crypto/idea/liblegacy-lib-i_cfb64.o" => [
-            "crypto/idea/i_cfb64.c"
-        ],
-        "crypto/idea/liblegacy-lib-i_ecb.o" => [
-            "crypto/idea/i_ecb.c"
-        ],
-        "crypto/idea/liblegacy-lib-i_ofb64.o" => [
-            "crypto/idea/i_ofb64.c"
-        ],
-        "crypto/idea/liblegacy-lib-i_skey.o" => [
             "crypto/idea/i_skey.c"
         ],
         "crypto/kdf/libcrypto-lib-kdf_err.o" => [
@@ -24035,12 +24309,6 @@ our %unified_info = (
         "crypto/md4/libcrypto-shlib-md4_one.o" => [
             "crypto/md4/md4_one.c"
         ],
-        "crypto/md4/liblegacy-lib-md4_dgst.o" => [
-            "crypto/md4/md4_dgst.c"
-        ],
-        "crypto/md4/liblegacy-lib-md4_one.o" => [
-            "crypto/md4/md4_one.c"
-        ],
         "crypto/md5/libcrypto-lib-md5-x86_64.o" => [
             "crypto/md5/md5-x86_64.s"
         ],
@@ -24087,12 +24355,6 @@ our %unified_info = (
             "crypto/mdc2/mdc2_one.c"
         ],
         "crypto/mdc2/libcrypto-shlib-mdc2dgst.o" => [
-            "crypto/mdc2/mdc2dgst.c"
-        ],
-        "crypto/mdc2/liblegacy-lib-mdc2_one.o" => [
-            "crypto/mdc2/mdc2_one.c"
-        ],
-        "crypto/mdc2/liblegacy-lib-mdc2dgst.o" => [
             "crypto/mdc2/mdc2dgst.c"
         ],
         "crypto/ml_dsa/libcrypto-lib-ml_dsa_encoders.o" => [
@@ -24395,6 +24657,9 @@ our %unified_info = (
         "crypto/pem/libcrypto-shlib-pvkfmt.o" => [
             "crypto/pem/pvkfmt.c"
         ],
+        "crypto/pem/loader_attic-dso-pvkfmt.o" => [
+            "crypto/pem/pvkfmt.c"
+        ],
         "crypto/pkcs12/libcrypto-lib-p12_add.o" => [
             "crypto/pkcs12/p12_add.c"
         ],
@@ -24599,6 +24864,9 @@ our %unified_info = (
         "crypto/rand/libcrypto-lib-rand_lib.o" => [
             "crypto/rand/rand_lib.c"
         ],
+        "crypto/rand/libcrypto-lib-rand_meth.o" => [
+            "crypto/rand/rand_meth.c"
+        ],
         "crypto/rand/libcrypto-lib-rand_pool.o" => [
             "crypto/rand/rand_pool.c"
         ],
@@ -24619,6 +24887,9 @@ our %unified_info = (
         ],
         "crypto/rand/libcrypto-shlib-rand_lib.o" => [
             "crypto/rand/rand_lib.c"
+        ],
+        "crypto/rand/libcrypto-shlib-rand_meth.o" => [
+            "crypto/rand/rand_meth.c"
         ],
         "crypto/rand/libcrypto-shlib-rand_pool.o" => [
             "crypto/rand/rand_pool.c"
@@ -24659,21 +24930,6 @@ our %unified_info = (
         "crypto/rc2/libcrypto-shlib-rc2ofb64.o" => [
             "crypto/rc2/rc2ofb64.c"
         ],
-        "crypto/rc2/liblegacy-lib-rc2_cbc.o" => [
-            "crypto/rc2/rc2_cbc.c"
-        ],
-        "crypto/rc2/liblegacy-lib-rc2_ecb.o" => [
-            "crypto/rc2/rc2_ecb.c"
-        ],
-        "crypto/rc2/liblegacy-lib-rc2_skey.o" => [
-            "crypto/rc2/rc2_skey.c"
-        ],
-        "crypto/rc2/liblegacy-lib-rc2cfb64.o" => [
-            "crypto/rc2/rc2cfb64.c"
-        ],
-        "crypto/rc2/liblegacy-lib-rc2ofb64.o" => [
-            "crypto/rc2/rc2ofb64.c"
-        ],
         "crypto/rc4/libcrypto-lib-rc4-md5-x86_64.o" => [
             "crypto/rc4/rc4-md5-x86_64.s"
         ],
@@ -24704,12 +24960,6 @@ our %unified_info = (
         "crypto/ripemd/libcrypto-shlib-rmd_one.o" => [
             "crypto/ripemd/rmd_one.c"
         ],
-        "crypto/ripemd/liblegacy-lib-rmd_dgst.o" => [
-            "crypto/ripemd/rmd_dgst.c"
-        ],
-        "crypto/ripemd/liblegacy-lib-rmd_one.o" => [
-            "crypto/ripemd/rmd_one.c"
-        ],
         "crypto/rsa/libcrypto-lib-rsa_ameth.o" => [
             "crypto/rsa/rsa_ameth.c"
         ],
@@ -24724,6 +24974,9 @@ our %unified_info = (
         ],
         "crypto/rsa/libcrypto-lib-rsa_crpt.o" => [
             "crypto/rsa/rsa_crpt.c"
+        ],
+        "crypto/rsa/libcrypto-lib-rsa_depr.o" => [
+            "crypto/rsa/rsa_depr.c"
         ],
         "crypto/rsa/libcrypto-lib-rsa_err.o" => [
             "crypto/rsa/rsa_err.c"
@@ -24782,6 +25035,9 @@ our %unified_info = (
         "crypto/rsa/libcrypto-lib-rsa_x931.o" => [
             "crypto/rsa/rsa_x931.c"
         ],
+        "crypto/rsa/libcrypto-lib-rsa_x931g.o" => [
+            "crypto/rsa/rsa_x931g.c"
+        ],
         "crypto/rsa/libcrypto-shlib-rsa_ameth.o" => [
             "crypto/rsa/rsa_ameth.c"
         ],
@@ -24796,6 +25052,9 @@ our %unified_info = (
         ],
         "crypto/rsa/libcrypto-shlib-rsa_crpt.o" => [
             "crypto/rsa/rsa_crpt.c"
+        ],
+        "crypto/rsa/libcrypto-shlib-rsa_depr.o" => [
+            "crypto/rsa/rsa_depr.c"
         ],
         "crypto/rsa/libcrypto-shlib-rsa_err.o" => [
             "crypto/rsa/rsa_err.c"
@@ -24854,6 +25113,9 @@ our %unified_info = (
         "crypto/rsa/libcrypto-shlib-rsa_x931.o" => [
             "crypto/rsa/rsa_x931.c"
         ],
+        "crypto/rsa/libcrypto-shlib-rsa_x931g.o" => [
+            "crypto/rsa/rsa_x931g.c"
+        ],
         "crypto/seed/libcrypto-lib-seed.o" => [
             "crypto/seed/seed.c"
         ],
@@ -24882,21 +25144,6 @@ our %unified_info = (
             "crypto/seed/seed_ecb.c"
         ],
         "crypto/seed/libcrypto-shlib-seed_ofb.o" => [
-            "crypto/seed/seed_ofb.c"
-        ],
-        "crypto/seed/liblegacy-lib-seed.o" => [
-            "crypto/seed/seed.c"
-        ],
-        "crypto/seed/liblegacy-lib-seed_cbc.o" => [
-            "crypto/seed/seed_cbc.c"
-        ],
-        "crypto/seed/liblegacy-lib-seed_cfb.o" => [
-            "crypto/seed/seed_cfb.c"
-        ],
-        "crypto/seed/liblegacy-lib-seed_ecb.o" => [
-            "crypto/seed/seed_ecb.c"
-        ],
-        "crypto/seed/liblegacy-lib-seed_ofb.o" => [
             "crypto/seed/seed_ofb.c"
         ],
         "crypto/sha/libcrypto-lib-keccak1600-x86_64.o" => [
@@ -25076,6 +25323,18 @@ our %unified_info = (
         "crypto/sm4/libcrypto-shlib-sm4.o" => [
             "crypto/sm4/sm4.c"
         ],
+        "crypto/srp/libcrypto-lib-srp_lib.o" => [
+            "crypto/srp/srp_lib.c"
+        ],
+        "crypto/srp/libcrypto-lib-srp_vfy.o" => [
+            "crypto/srp/srp_vfy.c"
+        ],
+        "crypto/srp/libcrypto-shlib-srp_lib.o" => [
+            "crypto/srp/srp_lib.c"
+        ],
+        "crypto/srp/libcrypto-shlib-srp_vfy.o" => [
+            "crypto/srp/srp_vfy.c"
+        ],
         "crypto/stack/libcrypto-lib-stack.o" => [
             "crypto/stack/stack.c"
         ],
@@ -25085,11 +25344,17 @@ our %unified_info = (
         "crypto/store/libcrypto-lib-store_err.o" => [
             "crypto/store/store_err.c"
         ],
+        "crypto/store/libcrypto-lib-store_init.o" => [
+            "crypto/store/store_init.c"
+        ],
         "crypto/store/libcrypto-lib-store_lib.o" => [
             "crypto/store/store_lib.c"
         ],
         "crypto/store/libcrypto-lib-store_meth.o" => [
             "crypto/store/store_meth.c"
+        ],
+        "crypto/store/libcrypto-lib-store_register.o" => [
+            "crypto/store/store_register.c"
         ],
         "crypto/store/libcrypto-lib-store_result.o" => [
             "crypto/store/store_result.c"
@@ -25100,11 +25365,17 @@ our %unified_info = (
         "crypto/store/libcrypto-shlib-store_err.o" => [
             "crypto/store/store_err.c"
         ],
+        "crypto/store/libcrypto-shlib-store_init.o" => [
+            "crypto/store/store_init.c"
+        ],
         "crypto/store/libcrypto-shlib-store_lib.o" => [
             "crypto/store/store_lib.c"
         ],
         "crypto/store/libcrypto-shlib-store_meth.o" => [
             "crypto/store/store_meth.c"
+        ],
+        "crypto/store/libcrypto-shlib-store_register.o" => [
+            "crypto/store/store_register.c"
         ],
         "crypto/store/libcrypto-shlib-store_result.o" => [
             "crypto/store/store_result.c"
@@ -25272,12 +25543,6 @@ our %unified_info = (
             "crypto/whrlpool/wp-x86_64.s"
         ],
         "crypto/whrlpool/libcrypto-shlib-wp_dgst.o" => [
-            "crypto/whrlpool/wp_dgst.c"
-        ],
-        "crypto/whrlpool/liblegacy-lib-wp-x86_64.o" => [
-            "crypto/whrlpool/wp-x86_64.s"
-        ],
-        "crypto/whrlpool/liblegacy-lib-wp_dgst.o" => [
             "crypto/whrlpool/wp_dgst.c"
         ],
         "crypto/x509/libcrypto-lib-by_dir.o" => [
@@ -25540,6 +25805,9 @@ our %unified_info = (
         ],
         "crypto/x509/libcrypto-lib-x509spki.o" => [
             "crypto/x509/x509spki.c"
+        ],
+        "crypto/x509/libcrypto-lib-x509type.o" => [
+            "crypto/x509/x509type.c"
         ],
         "crypto/x509/libcrypto-lib-x_all.o" => [
             "crypto/x509/x_all.c"
@@ -25832,6 +26100,9 @@ our %unified_info = (
         "crypto/x509/libcrypto-shlib-x509spki.o" => [
             "crypto/x509/x509spki.c"
         ],
+        "crypto/x509/libcrypto-shlib-x509type.o" => [
+            "crypto/x509/x509type.c"
+        ],
         "crypto/x509/libcrypto-shlib-x_all.o" => [
             "crypto/x509/x_all.c"
         ],
@@ -25862,10 +26133,46 @@ our %unified_info = (
         "crypto/x509/libcrypto-shlib-x_x509a.o" => [
             "crypto/x509/x_x509a.c"
         ],
+        "engines/capi" => [
+            "engines/capi-dso-e_capi.o"
+        ],
+        "engines/capi-dso-e_capi.o" => [
+            "engines/e_capi.c"
+        ],
+        "engines/dasync" => [
+            "engines/dasync-dso-e_dasync.o"
+        ],
+        "engines/dasync-dso-e_dasync.o" => [
+            "engines/e_dasync.c"
+        ],
+        "engines/loader_attic" => [
+            "crypto/pem/loader_attic-dso-pvkfmt.o",
+            "engines/loader_attic-dso-e_loader_attic.o"
+        ],
+        "engines/loader_attic-dso-e_loader_attic.o" => [
+            "engines/e_loader_attic.c"
+        ],
+        "engines/ossltest" => [
+            "engines/ossltest-dso-e_ossltest.o"
+        ],
+        "engines/ossltest-dso-e_ossltest.o" => [
+            "engines/e_ossltest.c"
+        ],
+        "engines/padlock" => [
+            "engines/padlock-dso-e_padlock-x86_64.o",
+            "engines/padlock-dso-e_padlock.o"
+        ],
+        "engines/padlock-dso-e_padlock-x86_64.o" => [
+            "engines/e_padlock-x86_64.s"
+        ],
+        "engines/padlock-dso-e_padlock.o" => [
+            "engines/e_padlock.c"
+        ],
         "libcrypto" => [
             "crypto/aes/libcrypto-lib-aes-x86_64.o",
             "crypto/aes/libcrypto-lib-aes_cfb.o",
             "crypto/aes/libcrypto-lib-aes_ecb.o",
+            "crypto/aes/libcrypto-lib-aes_ige.o",
             "crypto/aes/libcrypto-lib-aes_misc.o",
             "crypto/aes/libcrypto-lib-aes_ofb.o",
             "crypto/aes/libcrypto-lib-aes_wrap.o",
@@ -25936,6 +26243,7 @@ our %unified_info = (
             "crypto/asn1/libcrypto-lib-x_bignum.o",
             "crypto/asn1/libcrypto-lib-x_info.o",
             "crypto/asn1/libcrypto-lib-x_int64.o",
+            "crypto/asn1/libcrypto-lib-x_long.o",
             "crypto/asn1/libcrypto-lib-x_pkey.o",
             "crypto/asn1/libcrypto-lib-x_sig.o",
             "crypto/asn1/libcrypto-lib-x_spki.o",
@@ -25985,6 +26293,7 @@ our %unified_info = (
             "crypto/bn/libcrypto-lib-bn_const.o",
             "crypto/bn/libcrypto-lib-bn_conv.o",
             "crypto/bn/libcrypto-lib-bn_ctx.o",
+            "crypto/bn/libcrypto-lib-bn_depr.o",
             "crypto/bn/libcrypto-lib-bn_dh.o",
             "crypto/bn/libcrypto-lib-bn_div.o",
             "crypto/bn/libcrypto-lib-bn_err.o",
@@ -26010,6 +26319,7 @@ our %unified_info = (
             "crypto/bn/libcrypto-lib-bn_sqrt.o",
             "crypto/bn/libcrypto-lib-bn_srp.o",
             "crypto/bn/libcrypto-lib-bn_word.o",
+            "crypto/bn/libcrypto-lib-bn_x931p.o",
             "crypto/bn/libcrypto-lib-rsaz-2k-avx512.o",
             "crypto/bn/libcrypto-lib-rsaz-2k-avxifma.o",
             "crypto/bn/libcrypto-lib-rsaz-3k-avx512.o",
@@ -26118,6 +26428,7 @@ our %unified_info = (
             "crypto/dh/libcrypto-lib-dh_asn1.o",
             "crypto/dh/libcrypto-lib-dh_backend.o",
             "crypto/dh/libcrypto-lib-dh_check.o",
+            "crypto/dh/libcrypto-lib-dh_depr.o",
             "crypto/dh/libcrypto-lib-dh_err.o",
             "crypto/dh/libcrypto-lib-dh_gen.o",
             "crypto/dh/libcrypto-lib-dh_group_params.o",
@@ -26132,6 +26443,7 @@ our %unified_info = (
             "crypto/dsa/libcrypto-lib-dsa_asn1.o",
             "crypto/dsa/libcrypto-lib-dsa_backend.o",
             "crypto/dsa/libcrypto-lib-dsa_check.o",
+            "crypto/dsa/libcrypto-lib-dsa_depr.o",
             "crypto/dsa/libcrypto-lib-dsa_err.o",
             "crypto/dsa/libcrypto-lib-dsa_gen.o",
             "crypto/dsa/libcrypto-lib-dsa_key.o",
@@ -26198,6 +26510,28 @@ our %unified_info = (
             "crypto/encode_decode/libcrypto-lib-encoder_lib.o",
             "crypto/encode_decode/libcrypto-lib-encoder_meth.o",
             "crypto/encode_decode/libcrypto-lib-encoder_pkey.o",
+            "crypto/engine/libcrypto-lib-eng_all.o",
+            "crypto/engine/libcrypto-lib-eng_cnf.o",
+            "crypto/engine/libcrypto-lib-eng_ctrl.o",
+            "crypto/engine/libcrypto-lib-eng_dyn.o",
+            "crypto/engine/libcrypto-lib-eng_err.o",
+            "crypto/engine/libcrypto-lib-eng_fat.o",
+            "crypto/engine/libcrypto-lib-eng_init.o",
+            "crypto/engine/libcrypto-lib-eng_lib.o",
+            "crypto/engine/libcrypto-lib-eng_list.o",
+            "crypto/engine/libcrypto-lib-eng_openssl.o",
+            "crypto/engine/libcrypto-lib-eng_pkey.o",
+            "crypto/engine/libcrypto-lib-eng_rdrand.o",
+            "crypto/engine/libcrypto-lib-eng_table.o",
+            "crypto/engine/libcrypto-lib-tb_asnmth.o",
+            "crypto/engine/libcrypto-lib-tb_cipher.o",
+            "crypto/engine/libcrypto-lib-tb_dh.o",
+            "crypto/engine/libcrypto-lib-tb_digest.o",
+            "crypto/engine/libcrypto-lib-tb_dsa.o",
+            "crypto/engine/libcrypto-lib-tb_eckey.o",
+            "crypto/engine/libcrypto-lib-tb_pkmeth.o",
+            "crypto/engine/libcrypto-lib-tb_rand.o",
+            "crypto/engine/libcrypto-lib-tb_rsa.o",
             "crypto/err/libcrypto-lib-err.o",
             "crypto/err/libcrypto-lib-err_all.o",
             "crypto/err/libcrypto-lib-err_all_legacy.o",
@@ -26233,6 +26567,7 @@ our %unified_info = (
             "crypto/evp/libcrypto-lib-e_des3.o",
             "crypto/evp/libcrypto-lib-e_idea.o",
             "crypto/evp/libcrypto-lib-e_null.o",
+            "crypto/evp/libcrypto-lib-e_old.o",
             "crypto/evp/libcrypto-lib-e_rc2.o",
             "crypto/evp/libcrypto-lib-e_rc4.o",
             "crypto/evp/libcrypto-lib-e_rc4_hmac_md5.o",
@@ -26274,6 +26609,8 @@ our %unified_info = (
             "crypto/evp/libcrypto-lib-names.o",
             "crypto/evp/libcrypto-lib-p5_crpt.o",
             "crypto/evp/libcrypto-lib-p5_crpt2.o",
+            "crypto/evp/libcrypto-lib-p_dec.o",
+            "crypto/evp/libcrypto-lib-p_enc.o",
             "crypto/evp/libcrypto-lib-p_legacy.o",
             "crypto/evp/libcrypto-lib-p_lib.o",
             "crypto/evp/libcrypto-lib-p_open.o",
@@ -26460,6 +26797,7 @@ our %unified_info = (
             "crypto/rand/libcrypto-lib-rand_deprecated.o",
             "crypto/rand/libcrypto-lib-rand_err.o",
             "crypto/rand/libcrypto-lib-rand_lib.o",
+            "crypto/rand/libcrypto-lib-rand_meth.o",
             "crypto/rand/libcrypto-lib-rand_pool.o",
             "crypto/rand/libcrypto-lib-rand_uniform.o",
             "crypto/rand/libcrypto-lib-randfile.o",
@@ -26477,6 +26815,7 @@ our %unified_info = (
             "crypto/rsa/libcrypto-lib-rsa_backend.o",
             "crypto/rsa/libcrypto-lib-rsa_chk.o",
             "crypto/rsa/libcrypto-lib-rsa_crpt.o",
+            "crypto/rsa/libcrypto-lib-rsa_depr.o",
             "crypto/rsa/libcrypto-lib-rsa_err.o",
             "crypto/rsa/libcrypto-lib-rsa_gen.o",
             "crypto/rsa/libcrypto-lib-rsa_lib.o",
@@ -26496,6 +26835,7 @@ our %unified_info = (
             "crypto/rsa/libcrypto-lib-rsa_sp800_56b_check.o",
             "crypto/rsa/libcrypto-lib-rsa_sp800_56b_gen.o",
             "crypto/rsa/libcrypto-lib-rsa_x931.o",
+            "crypto/rsa/libcrypto-lib-rsa_x931g.o",
             "crypto/seed/libcrypto-lib-seed.o",
             "crypto/seed/libcrypto-lib-seed_cbc.o",
             "crypto/seed/libcrypto-lib-seed_cfb.o",
@@ -26530,10 +26870,14 @@ our %unified_info = (
             "crypto/sm3/libcrypto-lib-legacy_sm3.o",
             "crypto/sm3/libcrypto-lib-sm3.o",
             "crypto/sm4/libcrypto-lib-sm4.o",
+            "crypto/srp/libcrypto-lib-srp_lib.o",
+            "crypto/srp/libcrypto-lib-srp_vfy.o",
             "crypto/stack/libcrypto-lib-stack.o",
             "crypto/store/libcrypto-lib-store_err.o",
+            "crypto/store/libcrypto-lib-store_init.o",
             "crypto/store/libcrypto-lib-store_lib.o",
             "crypto/store/libcrypto-lib-store_meth.o",
+            "crypto/store/libcrypto-lib-store_register.o",
             "crypto/store/libcrypto-lib-store_result.o",
             "crypto/store/libcrypto-lib-store_strings.o",
             "crypto/thread/arch/libcrypto-lib-thread_none.o",
@@ -26648,6 +26992,7 @@ our %unified_info = (
             "crypto/x509/libcrypto-lib-x509name.o",
             "crypto/x509/libcrypto-lib-x509rset.o",
             "crypto/x509/libcrypto-lib-x509spki.o",
+            "crypto/x509/libcrypto-lib-x509type.o",
             "crypto/x509/libcrypto-lib-x_all.o",
             "crypto/x509/libcrypto-lib-x_attrib.o",
             "crypto/x509/libcrypto-lib-x_crl.o",
@@ -26685,6 +27030,7 @@ our %unified_info = (
             "ssl/libssl-lib-ssl_lib.o",
             "ssl/libssl-lib-ssl_mcnf.o",
             "ssl/libssl-lib-ssl_rsa.o",
+            "ssl/libssl-lib-ssl_rsa_legacy.o",
             "ssl/libssl-lib-ssl_sess.o",
             "ssl/libssl-lib-ssl_stat.o",
             "ssl/libssl-lib-ssl_txt.o",
@@ -27594,64 +27940,14 @@ our %unified_info = (
             "providers/prov_running.c"
         ],
         "providers/liblegacy.a" => [
-            "crypto/bf/liblegacy-lib-bf_cfb64.o",
-            "crypto/bf/liblegacy-lib-bf_ecb.o",
-            "crypto/bf/liblegacy-lib-bf_enc.o",
-            "crypto/bf/liblegacy-lib-bf_ofb64.o",
-            "crypto/bf/liblegacy-lib-bf_skey.o",
-            "crypto/cast/liblegacy-lib-c_cfb64.o",
-            "crypto/cast/liblegacy-lib-c_ecb.o",
-            "crypto/cast/liblegacy-lib-c_enc.o",
-            "crypto/cast/liblegacy-lib-c_ofb64.o",
-            "crypto/cast/liblegacy-lib-c_skey.o",
-            "crypto/des/liblegacy-lib-cbc_cksm.o",
-            "crypto/des/liblegacy-lib-cbc_enc.o",
-            "crypto/des/liblegacy-lib-cfb64ede.o",
-            "crypto/des/liblegacy-lib-cfb64enc.o",
-            "crypto/des/liblegacy-lib-cfb_enc.o",
             "crypto/des/liblegacy-lib-des_enc.o",
-            "crypto/des/liblegacy-lib-ecb3_enc.o",
-            "crypto/des/liblegacy-lib-ecb_enc.o",
-            "crypto/des/liblegacy-lib-fcrypt.o",
             "crypto/des/liblegacy-lib-fcrypt_b.o",
-            "crypto/des/liblegacy-lib-ofb64ede.o",
-            "crypto/des/liblegacy-lib-ofb64enc.o",
-            "crypto/des/liblegacy-lib-ofb_enc.o",
-            "crypto/des/liblegacy-lib-pcbc_enc.o",
-            "crypto/des/liblegacy-lib-qud_cksm.o",
-            "crypto/des/liblegacy-lib-rand_key.o",
-            "crypto/des/liblegacy-lib-set_key.o",
-            "crypto/des/liblegacy-lib-str2key.o",
-            "crypto/des/liblegacy-lib-xcbc_enc.o",
-            "crypto/idea/liblegacy-lib-i_cbc.o",
-            "crypto/idea/liblegacy-lib-i_cfb64.o",
-            "crypto/idea/liblegacy-lib-i_ecb.o",
-            "crypto/idea/liblegacy-lib-i_ofb64.o",
-            "crypto/idea/liblegacy-lib-i_skey.o",
-            "crypto/md4/liblegacy-lib-md4_dgst.o",
-            "crypto/md4/liblegacy-lib-md4_one.o",
             "crypto/md5/liblegacy-lib-md5-x86_64.o",
             "crypto/md5/liblegacy-lib-md5_dgst.o",
             "crypto/md5/liblegacy-lib-md5_one.o",
             "crypto/md5/liblegacy-lib-md5_sha1.o",
-            "crypto/mdc2/liblegacy-lib-mdc2_one.o",
-            "crypto/mdc2/liblegacy-lib-mdc2dgst.o",
-            "crypto/rc2/liblegacy-lib-rc2_cbc.o",
-            "crypto/rc2/liblegacy-lib-rc2_ecb.o",
-            "crypto/rc2/liblegacy-lib-rc2_skey.o",
-            "crypto/rc2/liblegacy-lib-rc2cfb64.o",
-            "crypto/rc2/liblegacy-lib-rc2ofb64.o",
             "crypto/rc4/liblegacy-lib-rc4-md5-x86_64.o",
             "crypto/rc4/liblegacy-lib-rc4-x86_64.o",
-            "crypto/ripemd/liblegacy-lib-rmd_dgst.o",
-            "crypto/ripemd/liblegacy-lib-rmd_one.o",
-            "crypto/seed/liblegacy-lib-seed.o",
-            "crypto/seed/liblegacy-lib-seed_cbc.o",
-            "crypto/seed/liblegacy-lib-seed_cfb.o",
-            "crypto/seed/liblegacy-lib-seed_ecb.o",
-            "crypto/seed/liblegacy-lib-seed_ofb.o",
-            "crypto/whrlpool/liblegacy-lib-wp-x86_64.o",
-            "crypto/whrlpool/liblegacy-lib-wp_dgst.o",
             "providers/common/liblegacy-lib-provider_util.o",
             "providers/implementations/ciphers/liblegacy-lib-cipher_blowfish.o",
             "providers/implementations/ciphers/liblegacy-lib-cipher_blowfish_hw.o",
@@ -27744,6 +28040,9 @@ our %unified_info = (
         "ssl/libssl-lib-ssl_rsa.o" => [
             "ssl/ssl_rsa.c"
         ],
+        "ssl/libssl-lib-ssl_rsa_legacy.o" => [
+            "ssl/ssl_rsa_legacy.c"
+        ],
         "ssl/libssl-lib-ssl_sess.o" => [
             "ssl/ssl_sess.c"
         ],
@@ -27833,6 +28132,9 @@ our %unified_info = (
         ],
         "ssl/libssl-shlib-ssl_rsa.o" => [
             "ssl/ssl_rsa.c"
+        ],
+        "ssl/libssl-shlib-ssl_rsa_legacy.o" => [
+            "ssl/ssl_rsa_legacy.c"
         ],
         "ssl/libssl-shlib-ssl_sess.o" => [
             "ssl/ssl_sess.c"
@@ -28158,6 +28460,9 @@ our %unified_info = (
         "ssl/record/methods/libssl-shlib-dtls_meth.o" => [
             "ssl/record/methods/dtls_meth.c"
         ],
+        "ssl/record/methods/libssl-shlib-ssl3_cbc.o" => [
+            "ssl/record/methods/ssl3_cbc.c"
+        ],
         "ssl/record/methods/libssl-shlib-ssl3_meth.o" => [
             "ssl/record/methods/ssl3_meth.c"
         ],
@@ -28326,9 +28631,6 @@ my %disabled_info = (
     "brotli-dynamic" => {
         "macro" => "OPENSSL_NO_BROTLI_DYNAMIC"
     },
-    "capieng" => {
-        "macro" => "OPENSSL_NO_CAPIENG"
-    },
     "crypto-mdebug" => {
         "macro" => "OPENSSL_NO_CRYPTO_MDEBUG"
     },
@@ -28338,9 +28640,6 @@ my %disabled_info = (
     "demos" => {
         "macro" => "OPENSSL_NO_DEMOS"
     },
-    "deprecated" => {
-        "macro" => "OPENSSL_NO_DEPRECATED"
-    },
     "devcryptoeng" => {
         "macro" => "OPENSSL_NO_DEVCRYPTOENG"
     },
@@ -28349,12 +28648,6 @@ my %disabled_info = (
     },
     "egd" => {
         "macro" => "OPENSSL_NO_EGD"
-    },
-    "engine" => {
-        "macro" => "OPENSSL_NO_ENGINE",
-        "skipped" => [
-            "crypto/engine"
-        ]
     },
     "external-tests" => {
         "macro" => "OPENSSL_NO_EXTERNAL_TESTS"
@@ -28386,9 +28679,6 @@ my %disabled_info = (
     "ktls" => {
         "macro" => "OPENSSL_NO_KTLS"
     },
-    "loadereng" => {
-        "macro" => "OPENSSL_NO_LOADERENG"
-    },
     "md2" => {
         "macro" => "OPENSSL_NO_MD2",
         "skipped" => [
@@ -28397,9 +28687,6 @@ my %disabled_info = (
     },
     "msan" => {
         "macro" => "OPENSSL_NO_MSAN"
-    },
-    "padlockeng" => {
-        "macro" => "OPENSSL_NO_PADLOCKENG"
     },
     "pie" => {
         "macro" => "OPENSSL_NO_PIE"
@@ -28412,12 +28699,6 @@ my %disabled_info = (
     },
     "sctp" => {
         "macro" => "OPENSSL_NO_SCTP"
-    },
-    "srp" => {
-        "macro" => "OPENSSL_NO_SRP",
-        "skipped" => [
-            "crypto/srp"
-        ]
     },
     "ssl3" => {
         "macro" => "OPENSSL_NO_SSL3"
@@ -28433,9 +28714,6 @@ my %disabled_info = (
     },
     "tfo" => {
         "macro" => "OPENSSL_NO_TFO"
-    },
-    "tls-deprecated-ec" => {
-        "macro" => "OPENSSL_NO_TLS_DEPRECATED_EC"
     },
     "trace" => {
         "macro" => "OPENSSL_NO_TRACE"

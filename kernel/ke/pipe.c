@@ -9,10 +9,15 @@ bool pipe_is_end(const void *ptr)
 	if (!ptr) {
 		return false;
 	}
-	/* Reject small marker values stashed in the fd table (e.g. KEYBOARD_FD=1,
-     * TTY_FD=2, etc.) and any non-canonical kernel pointer. */
+	/* Reject every tagged fd-table MARKER, not just the tiny stdio ones:
+	 * sockets (0x10000), epoll (0x20000) and unix sockets (0x30000) are
+	 * encoded as small integers too, and reading ->magic out of one of
+	 * those faults the kernel.  Callers are expected to classify markers
+	 * first, but this predicate is invoked from many fd paths, so it must
+	 * be safe on any fd-table value.  A real pipe_end_t comes from kalloc
+	 * and therefore lives far above this bound. */
 	uintptr_t v = (uintptr_t)ptr;
-	if (v < 0x1000)
+	if (v < 0x100000)
 		return false;
 	if (v < 0xffffffff80000000ULL && v > 0x00007fffffffffffULL)
 		return false;

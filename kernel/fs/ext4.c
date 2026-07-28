@@ -1776,9 +1776,21 @@ static unsigned long ext4_sb_next_block(vfs_superblock_t *sb, unsigned long bid)
 		return EXT4_BID_EOC;
 	unsigned long ino = EXT4_BID_INO(bid);
 	unsigned long lidx = EXT4_BID_LIDX(bid);
-	/* Stop at EOF.  For non-sparse images a 0 mapping means EOF;
-     * proper mid-file hole handling arrives with write support. */
-	if (ext4_block_map(fs, ino, lidx + 1) == 0)
+	/* Advance to the next logical block, ending the chain only at the real
+	 * end of file — NOT at the first hole.  A sparse file (e.g. a linked
+	 * binary with a page-aligned run of zeros, which mkfs stores as a hole)
+	 * has unmapped blocks in the MIDDLE; the old "0 mapping means EOF" test
+	 * truncated the chain there, so every block past the hole became
+	 * unreadable and exec of such a binary failed with ENOEXEC.  The block
+	 * count comes from the inode size; the read path zero-fills any block
+	 * whose physical mapping is a hole (ext4_sb_block_to_lba returns 0). */
+	ext4_inode in;
+	if (!ext4_get_inode_cached(fs, ino, &in))
+		return EXT4_BID_EOC;
+	unsigned long size = ext4_inode_size(&in);
+	unsigned long bs = fs->block_size ? fs->block_size : 4096;
+	unsigned long total_blocks = (size + bs - 1) / bs;
+	if (lidx + 1 >= total_blocks)
 		return EXT4_BID_EOC;
 	return EXT4_BID_ENC(ino, lidx + 1);
 }

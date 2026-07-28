@@ -1747,6 +1747,54 @@ int vsscanf(const char *str, const char *format, va_list ap)
 				matched++;
 			break;
 		}
+		case '[': {
+			/* `spec` already consumed '['; `format` points past it. */
+			int negate = 0;
+			if (*format == '^') {
+				negate = 1;
+				format++;
+			}
+			unsigned char set[256] = { 0 };
+			if (*format == ']') {
+				set[(unsigned char)']'] = 1;
+				format++;
+			}
+			while (*format && *format != ']') {
+				if (format[1] == '-' && format[2] &&
+				    format[2] != ']') {
+					unsigned char lo = (unsigned char)format[0];
+					unsigned char hi = (unsigned char)format[2];
+					for (unsigned x = lo; x <= hi; x++)
+						set[x] = 1;
+					format += 3;
+				} else {
+					set[(unsigned char)*format] = 1;
+					format++;
+				}
+			}
+			if (*format == ']')
+				format++;
+			char *dest = suppress ? NULL : va_arg(ap, char *);
+			int cnt = 0;
+			while (*s && (width < 0 || cnt < width)) {
+				int in = set[(unsigned char)*s] ? 1 : 0;
+				if (negate)
+					in = !in;
+				if (!in)
+					break;
+				if (dest)
+					dest[cnt] = *s;
+				s++;
+				cnt++;
+			}
+			if (cnt == 0)
+				goto done;
+			if (dest)
+				dest[cnt] = '\0';
+			if (!suppress)
+				matched++;
+			break;
+		}
 		case 'n': {
 			if (!suppress) {
 				*va_arg(ap, int *) = (int)(s - str);

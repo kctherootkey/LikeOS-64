@@ -460,8 +460,16 @@ int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 		mm_memcpy(&kframe.info, info, sizeof(siginfo_t));
 	}
 
-	// Save current blocked mask
-	kframe.saved_mask = task->signals.blocked;
+	/* Save the mask sigreturn must restore.  Normally that is the current
+	 * blocked set, but if ppoll()/pselect() installed a temporary mask for
+	 * its wait, the caller's ORIGINAL mask is the one that has to come back
+	 * after the handler — take ownership of that deferred restore here. */
+	if (task->sigmask_restore_pending) {
+		kframe.saved_mask = task->sigmask_saved;
+		task->sigmask_restore_pending = 0;
+	} else {
+		kframe.saved_mask = task->signals.blocked;
+	}
 
 	// Set up sigreturn trampoline code in the frame
 	// mov rax, SYS_RT_SIGRETURN (256)
@@ -597,8 +605,16 @@ int signal_setup_frame_irq(task_t *task, int sig, siginfo_t *info,
 		mm_memcpy(&kframe.info, info, sizeof(siginfo_t));
 	}
 
-	// Save current blocked mask
-	kframe.saved_mask = task->signals.blocked;
+	/* Save the mask sigreturn must restore.  Normally that is the current
+	 * blocked set, but if ppoll()/pselect() installed a temporary mask for
+	 * its wait, the caller's ORIGINAL mask is the one that has to come back
+	 * after the handler — take ownership of that deferred restore here. */
+	if (task->sigmask_restore_pending) {
+		kframe.saved_mask = task->sigmask_saved;
+		task->sigmask_restore_pending = 0;
+	} else {
+		kframe.saved_mask = task->signals.blocked;
+	}
 
 	// Set up sigreturn trampoline code
 	kframe.retcode[0] = 0x48; // REX.W
@@ -805,6 +821,7 @@ void signal_deliver(task_t *task)
 		case SIG_DFL_TERM:
 		case SIG_DFL_CORE:
 			// Terminate (core dump not implemented)
+			task->term_sig = signum;
 			sched_mark_task_exited(task, 128 + signum);
 			break;
 		case SIG_DFL_STOP:
@@ -827,6 +844,7 @@ void signal_deliver(task_t *task)
 	// User-defined handler - set up signal frame
 	if (signal_setup_frame(task, signum, &info, act) < 0) {
 		// Failed to set up frame - terminate with signal
+		task->term_sig = signum;
 		sched_mark_task_exited(task, 128 + signum);
 	}
 }
@@ -868,6 +886,7 @@ void signal_deliver_irq(task_t *task, interrupt_frame_t *frame)
 		switch (action) {
 		case SIG_DFL_TERM:
 		case SIG_DFL_CORE:
+			task->term_sig = signum;
 			sched_mark_task_exited(task, 128 + signum);
 			// Ensure sched_preempt runs after we return to irq_handler,
 			// even if the timer's remaining_ticks hasn't expired yet.
@@ -891,6 +910,7 @@ void signal_deliver_irq(task_t *task, interrupt_frame_t *frame)
 
 	// User-defined handler — modify the IRETQ frame
 	if (signal_setup_frame_irq(task, signum, &info, act, frame) < 0) {
+		task->term_sig = signum;
 		sched_mark_task_exited(task, 128 + signum);
 	}
 }

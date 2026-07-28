@@ -106,7 +106,7 @@ int main(int argc, char *argv[])
 		{
 			char *login_argv[] = { (char *)"login", name, NULL };
 			char *login_envp[] = {
-				(char *)"PATH=/bin:/usr/local/bin",
+				(char *)"PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
 				(char *)"TERM=linux",
 				NULL
 			};
