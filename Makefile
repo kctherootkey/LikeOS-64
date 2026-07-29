@@ -1312,6 +1312,9 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp /etc/services         $(EXT4_STAGING)/etc/services
 	cp res/etc/hosts         $(EXT4_STAGING)/etc/hosts
 	cp res/etc/resolv.conf   $(EXT4_STAGING)/etc/resolv.conf
+	# What init (process 1) starts and supervises at boot: the console getty
+	# and the services listed there.
+	cp res/etc/inittab       $(EXT4_STAGING)/etc/inittab
 	cp res/nanorc            $(EXT4_STAGING)/etc/nanorc
 	# --- OpenSSH: clients -> /usr/bin, daemon -> /usr/sbin, helpers -> /usr/libexec
 	for b in $(OPENSSH_UBIN); do cp $(BUILD_DIR)/openssh/bin/$$b $(EXT4_STAGING)/usr/bin/$$b; done

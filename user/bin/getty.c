@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
+#include <errno.h>
 #include <sys/ioctl.h>
 
 #define DEFAULT_TTY "/dev/console"
@@ -28,6 +29,8 @@ static char *read_line(int fd)
 	for (;;) {
 		char c;
 		ssize_t n = read(fd, &c, 1);
+		if (n < 0 && errno == EINTR)
+			continue; /* a signal (a window resize) is not an EOF */
 		if (n <= 0) {
 			if (len == 0) {
 				free(buf);
@@ -96,8 +99,13 @@ int main(int argc, char *argv[])
 		fflush(stdout);
 
 		name = read_line(0);
-		if (!name) /* EOF - retry */
-			continue;
+		if (!name) {
+			/* The terminal reached end of file or went away.
+			 * Retrying here would print prompts into a dead
+			 * descriptor forever, burning a CPU; exit instead and
+			 * let init decide whether to start a fresh getty. */
+			return 0;
+		}
 		if (name[0] == '\0') {
 			free(name);
 			continue;

@@ -1514,6 +1514,68 @@ int printf(const char *format, ...)
 	return ret;
 }
 
+/* dprintf()/vdprintf() format straight to a descriptor with write(2): no FILE,
+ * no buffering.  That is what makes them usable where a stream is unavailable
+ * or unwanted - in a forked child before exec, or on an error path that must
+ * not disturb a stream's buffer. */
+int vdprintf(int fd, const char *format, va_list ap)
+{
+	char stackbuf[1024];
+	char *buf = stackbuf;
+	va_list ap2;
+	int len, written = 0;
+
+	va_copy(ap2, ap);
+	len = vsnprintf(stackbuf, sizeof(stackbuf), format, ap2);
+	va_end(ap2);
+	if (len < 0)
+		return -1;
+
+	/* vsnprintf() reports what it managed to store, so a full buffer means
+	 * the line may have been cut short.  Measure it properly and format it
+	 * again rather than writing a truncated line. */
+	if ((size_t)len >= sizeof(stackbuf) - 1) {
+		va_copy(ap2, ap);
+		len = vsnprintf(NULL, 0, format, ap2);
+		va_end(ap2);
+		if (len < 0)
+			return -1;
+		buf = (char *)malloc((size_t)len + 1);
+		if (!buf)
+			return -1;
+		va_copy(ap2, ap);
+		vsnprintf(buf, (size_t)len + 1, format, ap2);
+		va_end(ap2);
+	}
+
+	while (written < len) {
+		ssize_t n = write(fd, buf + written, (size_t)(len - written));
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			if (buf != stackbuf)
+				free(buf);
+			return -1;
+		}
+		if (n == 0)
+			break;
+		written += (int)n;
+	}
+
+	if (buf != stackbuf)
+		free(buf);
+	return written;
+}
+
+int dprintf(int fd, const char *format, ...)
+{
+	va_list ap;
+	va_start(ap, format);
+	int ret = vdprintf(fd, format, ap);
+	va_end(ap);
+	return ret;
+}
+
 /* ------------------------------------------------------------------ */
 /* sscanf / vsscanf - minimal implementation                           */
 /* Supports: %d, %i, %u, %x, %X, %o, %s, %c, %n, %ld, %li, %lu,    */

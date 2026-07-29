@@ -2198,6 +2198,82 @@ static void test_dup_redirected_stdio(void)
 		    fcntl(200, F_DUPFD, 10) == -1 && errno == EBADF);
 }
 
+/* ---- dprintf()/vdprintf(): formatted output straight to a descriptor ---- */
+
+static int vdprintf_helper(int fd, const char *fmt, ...)
+{
+	va_list ap;
+	int r;
+
+	va_start(ap, fmt);
+	r = vdprintf(fd, fmt, ap);
+	va_end(ap);
+	return r;
+}
+
+static void test_dprintf(void)
+{
+	int p[2];
+	char buf[8192];
+	int n, total;
+
+	printf("\n[TEST] dprintf/vdprintf\n");
+
+	if (pipe(p) != 0) {
+		test_fail("dprintf: pipe() failed");
+		return;
+	}
+
+	/* Writes to the descriptor itself, with no FILE and no buffering. */
+	n = dprintf(p[1], "%s=%d/%c\n", "answer", 42, 'x');
+	total = (int)read(p[0], buf, sizeof(buf) - 1);
+	if (total > 0)
+		buf[total] = '\0';
+	else
+		buf[0] = '\0';
+	test_result("dprintf formats and writes to the fd",
+		    n == 12 && total == 12 && strcmp(buf, "answer=42/x\n") == 0);
+
+	/* Longer than the internal stack buffer: must not be truncated. */
+	{
+		char big[3000];
+		memset(big, 'A', sizeof(big) - 1);
+		big[sizeof(big) - 1] = '\0';
+		n = dprintf(p[1], "<%s>", big);
+		total = 0;
+		while (total < (int)sizeof(buf) - 1) {
+			int r = (int)read(p[0], buf + total,
+					  sizeof(buf) - 1 - total);
+			if (r <= 0)
+				break;
+			total += r;
+			if (total >= n)
+				break;
+		}
+		buf[total > 0 ? total : 0] = '\0';
+		test_result("dprintf does not truncate a long line",
+			    n == 3001 && total == 3001 && buf[0] == '<' &&
+				    buf[3000] == '>' && buf[1500] == 'A');
+	}
+
+	/* vdprintf takes the va_list form. */
+	n = vdprintf_helper(p[1], "%d-%s", 7, "ok");
+	total = (int)read(p[0], buf, sizeof(buf) - 1);
+	if (total > 0)
+		buf[total] = '\0';
+	else
+		buf[0] = '\0';
+	test_result("vdprintf writes through a va_list",
+		    n == 4 && total == 4 && strcmp(buf, "7-ok") == 0);
+
+	close(p[0]);
+	close(p[1]);
+
+	/* A descriptor that cannot be written fails rather than pretending. */
+	errno = 0;
+	test_result("dprintf on a closed fd -> -1", dprintf(200, "x") == -1);
+}
+
 /* ---- libc additions made for the bash port --------------------------- */
 
 static void test_bash_libc_additions(void)
@@ -7467,6 +7543,7 @@ int main(int argc, char **argv)
 	test_poll_redirected_stdio();
 	test_ioctl_non_tty();
 	test_jobctl_wait();
+	test_dprintf();
 	test_bash_libc_additions();
 	test_syscall_arg_hygiene();
 	test_dup_redirected_stdio();

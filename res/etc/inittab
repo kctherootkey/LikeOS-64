@@ -1,0 +1,39 @@
+# /etc/inittab - programs started and supervised by init, which is process 1.
+#
+# Format:
+#
+#	[action] [console] program [arguments...]
+#
+# Blank lines and lines beginning with # are ignored.  A program name without
+# a slash is looked up in PATH.  The action is one of:
+#
+#	respawn   restart the program every time it exits.  This is the
+#	          default when the action word is left out, so a bare
+#	          "sshd -D" line means "respawn sshd -D".
+#	once      start it at boot and do not restart it.
+#	wait      run it at boot and wait for it to finish before starting
+#	          anything else -- for boot scripts.
+#
+# Services run with stdin/stdout/stderr on /dev/null, so nothing they print
+# lands in the middle of the login prompt.  Put "console" before the program to
+# keep init's terminal instead, which is useful while bringing a service up:
+#
+#	respawn console /usr/sbin/sshd -D
+#
+# Failing to start is reported on the console either way.  A getty is not
+# affected by this: it opens its own terminal.
+#
+# A program that exits immediately over and over is held off for 30 seconds
+# instead of being restarted in a tight loop.  If this file is missing or has
+# nothing usable in it, init starts a getty on the console anyway, so a
+# mistake here cannot lock you out of the machine.
+
+# Login prompt on the system console.  respawn is what puts a fresh prompt up
+# after every logout.
+respawn	/sbin/getty /dev/console
+
+# Secure shell daemon.  -D keeps it in the foreground: without it sshd forks
+# into the background and exits, init would see that as a crash and start it
+# again and again.  Add "console" after "respawn" to see what it logs.
+# Comment this line out to stop starting sshd at boot.
+# respawn	/usr/sbin/sshd -D
