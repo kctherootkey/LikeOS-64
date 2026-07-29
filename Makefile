@@ -672,8 +672,8 @@ $(BUILD_DIR)/id: userland-libc userland-rtld | $(BUILD_DIR)
 
 # /dev/fb0 exerciser (X.org fbdev-style ioctl+mmap sequence)
 $(BUILD_DIR)/fbtest: userland-libc userland-rtld | $(BUILD_DIR)
-	$(MAKE) -C $(USER_DIR) fbtest
-	cp $(USER_DIR)/fbtest $@
+	$(MAKE) -C $(USER_DIR) tests/fbtest
+	cp $(USER_DIR)/tests/fbtest $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/whoami: userland-libc userland-rtld | $(BUILD_DIR)
