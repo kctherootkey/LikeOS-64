@@ -1,0 +1,63 @@
+Make a click in the icon manager behave like a taskbar.
+
+f.iconify is an unconditional toggle, which is wrong for the icon manager when
+it is used as a taskbar: every click iconified the window, so clicking the entry
+of a window that was on screen made it vanish, and there was no way to switch
+between two windows without minimising one on the way.
+
+There is no way to express this in a .ctwmrc -- ctwm has no conditional
+function, and none of f.iconify / f.deiconify / f.raise / f.focus alone covers
+the three cases -- so it has to happen here.
+
+Scoped to C_ICONMGR so the title bar's minimise button, and f.iconify from a
+menu or a key binding, keep the unconditional toggle they have always had.
+
+--- a/functions_win.c
++++ b/functions_win.c
+@@ -182,6 +182,46 @@
+ static void
+ iconify_handler(EF_FULLPROTO)
+ {
++#ifdef __LIKEOS__
++	/*
++	 * Taskbar behaviour, for clicks in the icon manager only.
++	 *
++	 * A click on an entry ACTIVATES that window; only a click on the entry
++	 * of the window that already holds the focus minimises it.  Plain
++	 * f.iconify toggles unconditionally, so from a taskbar every click
++	 * iconified: clicking a visible window's entry made it disappear, and
++	 * switching between two windows was impossible without minimising one on
++	 * the way there.
++	 *
++	 * The three states, in the order a user meets them:
++	 *   minimised            -> restore it and focus it
++	 *   visible, not focused -> raise it and focus it  (plain switch)
++	 *   visible and focused  -> minimise it            (the toggle)
++	 *
++	 * Only C_ICONMGR takes this path, so the title bar's minimise button and
++	 * f.iconify from a menu or key binding keep the unconditional toggle.
++	 */
++	if(context == C_ICONMGR && func == F_ICONIFY) {
++		if(tmp_win->isicon) {
++			DeIconify(tmp_win);
++		}
++		else if(Scr->Focus != tmp_win) {
++			OtpRaise(tmp_win, WinWin);
++			WMapRaise(tmp_win);
++		}
++		else {
++			Iconify(tmp_win, eventp->xbutton.x_root - 5,
++			        eventp->xbutton.y_root - 5);
++			return;
++		}
++		/* Windows that decline the input focus are left alone, exactly as
++		 * the pointer-driven focus path does. */
++		if(tmp_win->wmhints && tmp_win->wmhints->input) {
++			SetFocus(tmp_win, CurrentTime);
++		}
++		return;
++	}
++#endif
+ 	if(tmp_win->isicon) {
+ 		DeIconify(tmp_win);
+ 	}

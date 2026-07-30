@@ -21,66 +21,214 @@ UseThreeDTitles
 UseThreeDIconManagers
 UseThreeDBorders
 UseThreeDWMap
-SunkFocusWindowTitle
+#
+# SunkFocusWindowTitle is deliberately NOT set (upstream had it).  It draws the
+# FOCUSED window's title bar and its buttons pressed-in, so the active window
+# looked like its controls were being held down while every other window looked
+# normal.  Focus is still visible -- the title bar highlights and the taskbar
+# entry takes IconManagerHighlight -- without the decoration changing shape.
+#
+#
+# Focus and stacking, the way a Windows user expects: pressing a mouse button
+# ANYWHERE in a window focuses it (so its title bar highlights) and raises it.
+#
+# Without ClickToFocus, ctwm follows the pointer, so moving onto a second xterm
+# focused it silently and pressing a button changed nothing visible.
+#
+# The click is NOT eaten.  Both of these are handled in one place in
+# HandleButtonPress, which sets the focus, raises, and then calls
+# XAllowEvents(ReplayPointer) -- so the press still reaches the application and
+# a click that also selects text or presses a button behaves normally.
+ClickToFocus
+RaiseOnClick
 
-WorkSpaceManagerGeometry        "360x60+60-0" 4
+#
+# Minimise into the taskbar instead of onto the desktop.
+#
+# Iconifying normally leaves a little icon window lying on the root.  Unmapping
+# instead means the window simply disappears, and the entry it already has in
+# the icon manager at the top IS the minimised state -- click that entry to get
+# the window back.
+IconifyByUnmapping
+
+#
+# Title buttons: minimise, maximise, close -- in that order, left to right.
+#
+# NoDefaults is required.  Without it ctwm adds its own two ("dot" to iconify on
+# the LEFT, "resize" on the right) and there is no way to remove just those.  It
+# also drops the six fallback mouse bindings AddDefaultFuncButtons() installs
+# (buttons 1 and 2 on title, icon and iconmgr) -- every one of which this file
+# already binds explicitly further down, which is what makes it safe here.
+#
+# Right-side buttons are laid out left to right in the order declared
+# (win_decorations.c walks the list adding boxwidth each time), so close ends up
+# in the corner rather than where minimise is expected.
+NoDefaults
+RightTitleButton ":xpm:bar"     = f.iconify
+RightTitleButton ":xpm:zoom"    = f.fullzoom
+RightTitleButton ":xpm:cross"   = f.delete
+
+#
+# Four workspaces.  With the four columns set below that is a single row, which
+# is what the bar's 52px height has room for -- eight would have wrapped to a
+# second row of 26px buttons.
+#
+# Fields per workspace, as ctwm's workspace_config.c documents them:
+#     "name" { button-bg  button-fg  map-bg  map-fg  [root-image] }
+#
+# Field 3 is the background of each workspace's CELL in the workspace manager --
+# the grey the little window blocks are drawn on.
+#
+# ctwm normally uses that same colour for the DESKTOP too
+# (XSetWindowBackground(vs->window, ws->backcp.back) in workspace_manager.c), so
+# grey cells would have forced a grey desktop.  DontPaintRootWindow, set below,
+# switches only the root half of that off: the cells still take field 3, and the
+# desktop is left to the xsetroot in xinitrc.  The two are independent now, which
+# is what lets the cells be grey and the desktop teal.
+#
+# The root-image field upstream used is dropped: one entry named an .xpm that is
+# not installed here, and the other asked for the "plaid" pattern -- both only
+# per-workspace, so the background changed as you switched desktops.
+#
 WorkSpaces {
-    "One"   {"#686B9F" "white" "DeepSkyBlue3" "white" "xpm:background8.xpm"}
-    "Two"   {"#619AAE" "white" "firebrick" "white" "plaid"}
-    "Three" {"#727786" "white" "brown"}
-    "Four"  {"#8C5b7A" "white" "MidnightBlue"}
-
-    "Five"  {"#727786" "white" "firebrick"}
-    "Six"   {"#619AAE" "white" "DeepSkyBlue3"}
-    "Seven" {"#8C5b7A" "white" "chartreuse4"}
-    "Eight" {"#686B9F" "white" "MidnightBlue"}
+    "1" {"#c6c6c6" "black" "#c6c6c6" "black"}
+    "2" {"#c6c6c6" "black" "#c6c6c6" "black"}
+    "3" {"#c6c6c6" "black" "#c6c6c6" "black"}
+    "4" {"#c6c6c6" "black" "#c6c6c6" "black"}
 }
 
-Color
+###########################################################
+# Top desktop bar
+###########################################################
+
+#
+# Workspace manager (right side)
+#
+# ONE number, not two: the grammar is "WorkSpaceManagerGeometry <geom>
+# <columns>" and there is no row argument -- rows come out of the workspace
+# count divided by the columns.  Four workspaces over four columns is therefore
+# a single row, each button 250/4 = 62px wide and the full 52px height.
+#
+# Anchored to the RIGHT edge with -0, so it stays in the corner whatever
+# resolution the framebuffer comes up at (this driver picks anything from
+# 1024x768 to 1920x1200).
+WorkSpaceManagerGeometry        "250x52-0+0" 4
+
+# Leave the root window alone.  Without this ctwm repaints the desktop from the
+# current workspace's field 3 every time a workspace is mapped, which would tie
+# the desktop colour to the workspace cell colour.
+DontPaintRootWindow
+
+#
+# Icon manager (taskbar)
+#
+# The number is COLUMNS, and it is what makes the bar horizontal: each entry is
+# width/columns wide and a new row starts only once a row is full
+# (PackIconManager in iconmgr.c).  At 1 every entry was full-width and they
+# stacked downward, which is the vertical strip this replaces.  Five columns of
+# 700/5 = 140px each is enough for a window name.
+ShowIconManager
+NoIconManagerFocus
+
+#
+# Geometry:
+# Width x Height + X + Y
+#
+# Left-anchored just past the clock.  Unlike the workspace manager this cannot
+# stretch to the space available -- ctwm has no way to say "the rest of the
+# row" -- so it is sized for the narrowest mode; on a wider screen the gap
+# before the workspace manager simply grows.  Widen the 700 to suit.
+IconManagerGeometry             "700x52+64+0" 5
+
+#
+# Make it look like a panel: undecorated, and present on every workspace rather
+# than only the one it was opened on.
+#
+# AlwaysOnTop is deliberately NOT set for these.  It works -- but it also wins
+# against every window that overlaps the bar, and a new xterm placed under it
+# had its title bar hidden, leaving nothing to grab to move the window.  With
+# normal stacking new windows come up ABOVE the bar.
+#
+# To bring the bar back to the front: button 3 on the taskbar raises it (bound
+# below), and meta-button-3 raises any window, the workspace manager included.
+#
+NoTitle
 {
-    BorderColor           "Red"
-    DefaultBackground     "blue"
-    DefaultForeground     "gray85"
-    BorderTileBackground  "DeepSkyBlue1" {
-	"xterm"		"DeepSkyBlue3"
-    }
-    BorderTileForeground  "Black" {
-	"xterm" "DeepSkyBlue3"
-    }
-    TitleBackground       "DeepSkyBlue1" {
-	"xterm" "DeepSkyBlue3"
-    }
-    TitleForeground       "Black" {
-	"xterm" "White"
-    }
-    MenuBackground        "#686B9F"
-    MenuForeground        "white"
-    MenuTitleBackground   "gray70"
-    MenuTitleForeground   "White"
-    IconBackground        "LightSlateBlue"
-    IconForeground        "White"
-    IconBorderColor       "gray85"
-    IconManagerBackground "DeepSkyBlue1" {"Axe" "DeepSkyBlue3" "xload" "DeepSkyBlue2"}
-    IconManagerForeground "Black"
-    MapWindowBackground   "DeepSkyBlue1" {
-	"root*" "Red"
-	"xterm" "DeepSkyBlue3"
-	"Axe"	"Yellow"
-    }
-    MapWindowForeground   "Black" {
-	"xterm" "White"
-    }
-}
-
-IconManagerGeometry		"202x300-0+0" 1
-IconManagerDontShow {
-    "WorkSpaceManager"
-}
-
-NoTitle {                  # little programs that look like icons
     "TWM Icon Manager"
     "WorkSpaceManager"
+    "xclock"
 }
+
+NoBorder
+{
+    "TWM Icon Manager"
+    "WorkSpaceManager"
+    "xclock"
+}
+
+OccupyAll
+{
+    "TWM Icon Manager"
+    "WorkSpaceManager"
+    "xclock"
+}
+
+#
+# Don't list the panel itself
+#
+IconManagerDontShow
+{
+    "TWM Icon Manager"
+    "WorkSpaceManager"
+    "xclock"
+}
+
+#
+# Solaris/CDE palette.  Three colours do all the work:
+#
+#   #c6c6c6  light grey  - every frame, title bar, menu and the taskbar
+#   #ae5c8c  dusty pink  - "this one is active": focused border, menu titles
+#   #40408c  dark blue   - the window blocks drawn inside the workspace map
+#
+# The greys are flat rather than saturated on purpose: UseThreeD* shades its
+# bevels FROM the base colour, so a strong colour there produces harsh edges.
+#
+# Focus is shown by BorderColor alone.  ctwm paints the border of the FOCUSED
+# window in BorderColor and fills every other window's border from the
+# BorderTile pair, so pink borders mark the active window while the rest stay
+# grey -- and the title bar itself does not change shape (see the note about
+# SunkFocusWindowTitle at the top of this file).
+#
+Color
+{
+    BorderColor           "#ae5c8c"
+    DefaultBackground     "#c6c6c6"
+    DefaultForeground     "black"
+    BorderTileBackground  "#c6c6c6"
+    BorderTileForeground  "#8c8c8c"
+    TitleBackground       "#c6c6c6"
+    TitleForeground       "black"
+    MenuBackground        "#c6c6c6"
+    MenuForeground        "black"
+    MenuTitleBackground   "#ae5c8c"
+    MenuTitleForeground   "white"
+    IconBackground        "#c6c6c6"
+    IconForeground        "black"
+    IconBorderColor       "#8c8c8c"
+    IconManagerBackground "#c6c6c6"
+    IconManagerForeground "black"
+    IconManagerHighlight  "#ae5c8c"
+    MapWindowBackground   "#40408c"
+    MapWindowForeground   "white"
+}
+
+# The IconManagerGeometry, IconManagerDontShow and NoTitle that upstream set here
+# now live in the "Top desktop bar" section above, with the panel's values (a wide
+# short bar at the top rather than a tall column on the right, and xclock listed
+# as well).  Removed rather than left in place: ctwm accepts either of them twice
+# without complaint -- the window lists would simply accumulate, and the second
+# geometry would silently win -- so a leftover copy here would be a trap for
+# whoever next changes the bar and cannot see why it has no effect.
 #
 # Define some useful functions for motion-based actions.
 #
@@ -108,6 +256,9 @@ Button2 =	: icon		: f.iconify
 
 Button1 =	: iconmgr	: f.iconify
 Button2 =	: iconmgr	: f.iconify
+# Button 3 was free here.  It raises the taskbar itself, which is the way back
+# when a window has come up over the bar (see the panel section above).
+Button3 =	: iconmgr	: f.raise
 
 Button1 =	: frame		: f.resize
 Button1 = m	: frame		: f.move
@@ -117,7 +268,7 @@ Button2 =	: frame		: f.raiselower
 #
 menu "defops"
 {
-    "Twm"		f.title
+    "LikeOS"		f.title
     "Xterm"		!"xterm&"
     "Calculator"	!"xcalc&"
     "Xman"		!"xman &"
@@ -138,6 +289,8 @@ menu "windowops" {
     ""			f.separator
     "Resize"		f.resize
     "Move"		f.move
+    "Raise"		f.raise
+    "Lower"		f.lower
     "Animate"		f.startanimation
     "Don't animate"	f.stopanimation
     ""			f.separator

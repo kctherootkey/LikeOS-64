@@ -1,0 +1,62 @@
+#!/bin/sh
+# X server command line for startx, installed as /etc/X11/xinit/xserverrc.
+#
+# startx runs THIS instead of the server directly whenever it was given no
+# server arguments of its own.  It still appends the display and the -auth file
+# holding the MIT-MAGIC-COOKIE-1 record it generated, so those arrive here as
+# "$@" and have to be passed through -- dropping them would start a server with
+# no access control at all.
+#
+# The file exists so that a NORMAL USER can run startx.  Nothing here is needed
+# when running as root.
+
+if [ "$(id -u)" = 0 ]; then
+	logfile=/var/log/Xorg.0.log
+else
+	# The server's default log is /var/log/Xorg.0.log, and LogInit() calls
+	# FatalError() when it cannot open OR ROTATE that file -- so a non-root
+	# startx died before it ever touched the hardware.  Making /var/log
+	# group-writable would not have fixed it either: the rotation step still
+	# has to rename a root-owned Xorg.0.log left by an earlier session.
+	#
+	# Per-user, under the user's own data directory, which is where a
+	# rootless server conventionally logs.  Deliberately NOT somewhere in
+	# /tmp: the server opens the log O_CREAT|O_TRUNC and follows symlinks, so
+	# a predictable name in a world-writable directory would let another user
+	# point it at a file of ours.  If HOME is unusable the server stops with
+	# "Cannot open log file", which is the honest outcome.
+	logdir="${XDG_DATA_HOME:-$HOME/.local/share}/xorg"
+	mkdir -p "$logdir" 2>/dev/null
+	logfile="$logdir/Xorg.0.log"
+fi
+
+# The server reaches the display and the input devices through ordinary file
+# permissions: /dev/fb0 is 0660 root:video and /dev/input/event* are 0660
+# root:input.  There is no seat manager here to hand those out to whoever is
+# logged in at the console, so access means group membership.
+#
+# Checked up front because the alternative is a permission-denied buried in a
+# log file the user has not been told the location of yet.
+for dev in /dev/fb0 /dev/input/event0 /dev/input/event1; do
+	if [ ! -r "$dev" ] || [ ! -w "$dev" ]; then
+		user=$(id -u -n)
+		echo "startx: $user has no read/write access to $dev" >&2
+		echo "startx:" >&2
+		echo "startx: the X server needs the 'video' and 'input' groups." >&2
+		echo "startx: as root, run:" >&2
+		echo "startx:     adduser $user video" >&2
+		echo "startx:     adduser $user input" >&2
+		echo "startx:" >&2
+		echo "startx: then log out and log in again -- supplementary" >&2
+		echo "startx: groups are established at login, so they do not" >&2
+		echo "startx: apply to a session that is already running." >&2
+		exit 1
+	fi
+done
+
+# -nolisten tcp: this server is built with LISTEN_TCP=no, so the option only
+# states the intent explicitly and keeps it true if that build setting ever
+# changes.  Clients connect over the AF_UNIX socket and are authorised by the
+# cookie in $XAUTHORITY, which is what stops another local user from attaching
+# to this session's display.
+exec /usr/bin/Xorg -logfile "$logfile" -nolisten tcp "$@"

@@ -95,6 +95,12 @@ done
 mkdir -p "$DEST/etc/X11/xinit" "$DEST/etc/X11/ctwm"
 cp "$root/res/xorg/xinitrc" "$DEST/etc/X11/xinit/xinitrc"
 chmod 755 "$DEST/etc/X11/xinit/xinitrc"
+
+# The server command line.  startx execs this file, so it needs the exec bit as
+# much as xinitrc does; it is what lets a non-root user start a session (the
+# server's default log path is not writable for them).
+cp "$root/res/xorg/xserverrc" "$DEST/etc/X11/xinit/xserverrc"
+chmod 755 "$DEST/etc/X11/xinit/xserverrc"
 cp "$root/res/xorg/system.ctwmrc" "$DEST/etc/X11/ctwm/system.ctwmrc"
 
 # Our own resource file, pointed at by $XENVIRONMENT from xinitrc.  Kept

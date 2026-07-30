@@ -23,9 +23,46 @@ if [ -x /usr/bin/setxkbmap ]; then
 	setxkbmap us
 fi
 
-# Plain grey root window.  The default is a black-and-white weave that renders
-# as harsh dither on a framebuffer with no colormap tricks available.
-xsetroot -solid grey
+# Desktop background: the CDE teal.
+#
+# This is the real desktop colour and it sticks, because system.ctwmrc sets
+# DontPaintRootWindow -- otherwise ctwm would repaint the root from the current
+# workspace's own colour the moment it mapped a workspace, and whatever was set
+# here would last only an instant.
+#
+# Set once, to the final colour, so there is no intermediate shade: the screen is
+# black until the server starts, then this, then the desktop.  (The default root
+# pattern is a black-and-white weave that dithers harshly on a framebuffer, so
+# something does have to replace it.)
+xsetroot -solid "#6f9c9c"
+
+# Clock, top-left, as the first piece of the desktop bar.  Started BEFORE the
+# window manager so it is already mapped when ctwm takes over and applies the
+# NoTitle / NoBorder / OccupyAll rules that make the bar a panel rather than
+# three ordinary windows.
+#
+# Backgrounded: only the LAST command in this script may run in the foreground,
+# because that one's lifetime is the session's.
+#
+# -strftime cuts the display down to the time alone.  A digital xclock otherwise
+# prints the full date as well, which is far wider than the slot the bar leaves
+# for it, and the text would simply be clipped.
+#
+# 60x52 is the bar's own height, so the clock is the same height as the taskbar
+# and the workspace manager beside it.
+#
+# Colours on the COMMAND LINE, not in the resource file.  xclock names every one
+# of its own resources under the instance "clock" (*clock.analog, *clock.chime,
+# ...), and a tight ".clock" binding outranks the loose "XClock*background" a
+# resource file can offer -- which is why the clock stayed pale.  A command-line
+# option outranks every resource file, so this is the one place that cannot be
+# overridden.  #c6c6c6 is exactly IconManagerBackground, the taskbar's own fill,
+# so the clock and the bar it sits in stay the same colour.
+if [ -x /usr/bin/xclock ]; then
+	xclock -digital -strftime "%H:%M" \
+	       -background "#c6c6c6" -foreground black -borderwidth 0 \
+	       -geometry 60x52+0+0 &
+fi
 
 # No terminal is started here on purpose.  Use "New xterm" on the root menu
 # (button 1 on the background) to open one.  Starting clients from this script
