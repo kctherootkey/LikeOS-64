@@ -1,0 +1,16 @@
+# pthread-stubs: satisfied natively.
+#
+# Upstream's libpthread-stubs exists for systems whose libc does NOT contain
+# the pthread symbols: it supplies weak no-op stubs so a library can call them
+# unconditionally.  LikeOS builds pthreads INTO libc (there is no separate
+# libpthread), so there is nothing to stub and nothing to link — which is
+# precisely the case upstream also handles by installing an empty .pc.
+#
+# Declaring it here rather than porting the package keeps libxcb's dependency
+# check honest: the requirement genuinely is met.
+
+Name: pthread-stubs
+Description: Meta-package for pthread symbols, provided by libc on this system
+Version: 0.5
+Libs:
+Cflags:

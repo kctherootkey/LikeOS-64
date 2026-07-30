@@ -21,4 +21,10 @@ extern "C" {
 }
 #endif
 
+/* C11 spells the compile-time assertion _Static_assert and provides this
+ * lowercase alias here.  Plenty of code uses the alias unqualified. */
+#if !defined(__cplusplus) && !defined(static_assert)
+#define static_assert _Static_assert
+#endif
+
 #endif /* _ASSERT_H */

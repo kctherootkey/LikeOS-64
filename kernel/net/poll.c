@@ -97,7 +97,10 @@ static short fd_poll_one(int fd, short events)
 	 * /dev/console is bidirectional, so any of 0/1/2 may be polled for
 	 * both POLLIN and POLLOUT. */
 	if (!entry) {
-		if (fd >= 3)
+		/* An empty slot at 0/1/2 is the console only while the process
+		 * still has it open; once closed it is an invalid descriptor
+		 * like any other, and must not be reported as ready. */
+		if (!task_fd_is_console(cur, fd))
 			return POLLNVAL;
 		short rev = 0;
 		if (events & (POLLIN | POLLRDNORM)) {
@@ -396,11 +399,49 @@ int epoll_create_internal(int flags)
 
 	epoll_instance_t *ep = &epoll_instances[idx];
 	ep->active = 1;
+	ep->ref_count = 1; /* the descriptor about to be returned */
 	ep->nentries = 0;
 	ep->lock = (spinlock_t)SPINLOCK_INIT("epoll_inst");
 
 	spin_unlock_irqrestore(&epoll_lock, fl);
 	return idx;
+}
+
+/*
+ * Take and drop a reference on an epoll instance.
+ *
+ * Called from the descriptor lifetime paths -- fork duplicates a task's fd
+ * table, close releases one entry, exec closes the FD_CLOEXEC ones.  The
+ * instance outlives any single descriptor and is only released when the last
+ * one goes.
+ */
+void epoll_get(int idx)
+{
+	uint64_t fl;
+
+	if (idx < 0 || idx >= MAX_EPOLL_INSTANCES)
+		return;
+	spin_lock_irqsave(&epoll_lock, &fl);
+	if (epoll_instances[idx].active)
+		epoll_instances[idx].ref_count++;
+	spin_unlock_irqrestore(&epoll_lock, fl);
+}
+
+void epoll_put(int idx)
+{
+	uint64_t fl;
+
+	if (idx < 0 || idx >= MAX_EPOLL_INSTANCES)
+		return;
+	spin_lock_irqsave(&epoll_lock, &fl);
+	if (epoll_instances[idx].active) {
+		if (--epoll_instances[idx].ref_count <= 0) {
+			epoll_instances[idx].active = 0;
+			epoll_instances[idx].nentries = 0;
+			epoll_instances[idx].ref_count = 0;
+		}
+	}
+	spin_unlock_irqrestore(&epoll_lock, fl);
 }
 
 int epoll_ctl_internal(int epfd_idx, int op, int fd, struct epoll_event *event)

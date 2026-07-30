@@ -78,12 +78,91 @@ static int uds_name_from_addr(const struct sockaddr_un *addr, socklen_t addrlen,
 	if (addr->sun_path[0] == '\0')
 		return avail; /* abstract: raw bytes, length from addrlen */
 
+	/* The path runs to the first NUL, or to the end of the declared length
+	 * if there is no NUL in it.  An unterminated path is NOT an error: the
+	 * standard way to compute addrlen is
+	 *
+	 *     SUN_LEN(p) == offsetof(struct sockaddr_un, sun_path)
+	 *                   + strlen((p)->sun_path)
+	 *
+	 * which deliberately does not count the terminator, so a caller using
+	 * it declares exactly strlen bytes of path.  Rejecting that rejects the
+	 * conventional spelling: it is what X11's xtrans uses, and it made the
+	 * display server fail at bind() with EINVAL, reported four layers up as
+	 * "Cannot establish any listening sockets".
+	 *
+	 * The name is returned as a (pointer, length) pair precisely because it
+	 * may not be terminated; callers that need a C string must copy it. */
 	int n = 0;
 	while (n < avail && addr->sun_path[n])
 		n++;
-	if (n == avail)
-		return -EINVAL; /* pathname not NUL-terminated within addrlen */
 	return n;
+}
+
+/*
+ * unix_getname - fill in a sockaddr_un for this socket or its peer.
+ *
+ * Needed by more than curiosity: X clients ask the socket what it is before
+ * choosing an authorisation record.  libxcb calls getpeername(), falls back to
+ * getsockname(), and if BOTH fail it gives up and sends no authorisation at
+ * all -- the server then refuses the connection with "Authorization required,
+ * but no authorization protocol specified", which names neither call.
+ *
+ * `peer` selects which end: 0 for this socket's own name, 1 for the name of
+ * the socket it is connected to.
+ *
+ * An unnamed socket is not an error.  A client that connect()s without
+ * bind() has no name, and the correct answer is a sockaddr_un with the family
+ * set and no path -- length sizeof(sa_family_t).  That is what tells the
+ * caller "this is a Unix socket" even when there is nothing else to say.
+ *
+ * *addrlen is in/out: in, the size of the caller's buffer; out, the size the
+ * address ACTUALLY needs.  A caller whose buffer was too small gets a
+ * truncated address and a length larger than it passed, which is how it knows
+ * to try again with a bigger one (libxcb does exactly this).
+ */
+int unix_getname(int usockfd, int peer, struct sockaddr_un *addr,
+		 socklen_t *addrlen)
+{
+	unix_socket_t *us = unix_get(usockfd);
+	unix_socket_t *target;
+	socklen_t have, need;
+	int nlen;
+
+	if (!us)
+		return -EBADF;
+	if (!addr || !addrlen)
+		return -EFAULT;
+
+	if (peer) {
+		target = us->peer;
+		if (!target || !us->connected)
+			return -ENOTCONN;
+	} else {
+		target = us;
+	}
+
+	have = *addrlen;
+	nlen = target->path_len;
+	if (nlen < 0)
+		nlen = 0;
+	if (nlen > UNIX_PATH_MAX)
+		nlen = UNIX_PATH_MAX;
+
+	/* The declared length counts the family and the name, and NOT a
+	 * terminator -- the same SUN_LEN convention the caller uses on the way
+	 * in (see uds_name_from_addr). */
+	need = (socklen_t)(sizeof(sa_family_t) + (socklen_t)nlen);
+
+	addr->sun_family = AF_UNIX;
+	for (int i = 0; i < UNIX_PATH_MAX; i++)
+		addr->sun_path[i] = '\0';
+	for (int i = 0; i < nlen; i++)
+		addr->sun_path[i] = target->path[i];
+
+	*addrlen = need;
+	(void)have; /* truncation is the caller's business, not an error */
+	return 0;
 }
 
 // ============================================================================
@@ -213,6 +292,16 @@ int unix_bind(int usockfd, const struct sockaddr_un *addr, socklen_t addrlen)
 	if (nlen > UNIX_PATH_MAX)
 		return -EINVAL;
 
+	/* The VFS takes C strings, and `name` points into the caller's address
+	 * structure where it may run to the end of the declared length with no
+	 * terminator (see uds_name_from_addr).  Copy it out before the path
+	 * reaches anything that expects a string. */
+	char pathbuf[UNIX_PATH_MAX + 1];
+
+	for (int i = 0; i < nlen; i++)
+		pathbuf[i] = name[i];
+	pathbuf[nlen] = '\0';
+
 	/* A pathname socket occupies a name in the filesystem namespace, so
 	 * binding it requires write+search permission on the containing
 	 * directory — the same rule as creating a file there.  An abstract name
@@ -220,7 +309,7 @@ int unix_bind(int usockfd, const struct sockaddr_un *addr, socklen_t addrlen)
 	 * runs before the table lock so it never holds a spinlock across the VFS
 	 * stat.  (Peer-credential passing / SO_PEERCRED is a follow-up.) */
 	if (name[0] != '\0') {
-		int pr = vfs_permission_parent(name, MAY_WRITE | MAY_EXEC);
+		int pr = vfs_permission_parent(pathbuf, MAY_WRITE | MAY_EXEC);
 		if (pr != ST_OK)
 			return (pr == ST_PERM) ? -EPERM : -EACCES;
 	}
@@ -239,7 +328,39 @@ int unix_bind(int usockfd, const struct sockaddr_un *addr, socklen_t addrlen)
 		us->path[i] = name[i];
 	us->path_len = nlen;
 	us->bound = 1;
+	us->has_node = 0;
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
+
+	/* A pathname bind must leave a real socket node behind.  Clients stat()
+	 * the path and refuse to connect unless it reports S_IFSOCK, so a name
+	 * that exists only in this table is unreachable from another process.
+	 *
+	 * Done AFTER dropping the table lock: creating the node is filesystem
+	 * I/O that can block, and this lock is held with interrupts disabled.
+	 * Abstract names have no filesystem presence and skip all of it. */
+	if (name[0] != '\0') {
+		int mr = vfs_mknod(pathbuf, S_IFSOCK | 0777);
+		if (mr != ST_OK) {
+			/* Undo the registration so the name does not stay
+			 * claimed by a socket nobody can reach. */
+			spin_lock_irqsave(&unix_table_lock, &tflags);
+			us->path_len = 0;
+			us->bound = 0;
+			spin_unlock_irqrestore(&unix_table_lock, tflags);
+			if (mr == ST_EXISTS)
+				return -EADDRINUSE;
+			if (mr == ST_ACCESS)
+				return -EACCES;
+			if (mr == ST_PERM)
+				return -EPERM;
+			if (mr == ST_ROFS)
+				return -EROFS;
+			if (mr == ST_UNSUPPORTED)
+				return 0; /* fs cannot hold nodes: name still bound */
+			return -EIO;
+		}
+		us->has_node = 1;
+	}
 
 	return 0;
 }
@@ -342,6 +463,32 @@ int unix_accept(int usockfd, struct sockaddr_un *addr, socklen_t *addrlen)
 	server->connected = 1;
 	server->ref_count = 1;
 	server->parent = us;
+
+	/* The accepted socket carries the listener's name.
+	 *
+	 * It is the address the client connected TO, so it is what the client's
+	 * getpeername() must report and what getsockname() on this end must
+	 * report as well.  Without it the client sees a peer with no name, and
+	 * anything that identifies a connection by the socket it arrived on
+	 * cannot.
+	 *
+	 * `bound` is deliberately NOT set: the name belongs to the listener,
+	 * this socket merely reports it.  unix_find_by_name_locked() only
+	 * considers bound sockets, so the copy can never satisfy a lookup and
+	 * a later bind to the same path still sees it as free.
+	 */
+	{
+		int pl = us->path_len;
+
+		if (pl < 0)
+			pl = 0;
+		if (pl > UNIX_PATH_MAX)
+			pl = UNIX_PATH_MAX;
+		for (int i = 0; i < pl; i++)
+			server->path[i] = us->path[i];
+		server->path_len = pl;
+	}
+
 	spinlock_init(&server->lock, "unix_sock");
 
 	// Link peers under the table lock so close cannot race with the
@@ -572,10 +719,16 @@ int unix_recv(int usockfd, void *buf, size_t len, int flags)
 {
 	might_sleep();
 	BUG_ON(buf == NULL && len > 0);
-	(void)flags;
 	unix_socket_t *us = unix_get(usockfd);
 	if (!us)
 		return -EBADF;
+
+	/* MSG_DONTWAIT makes this one call non-blocking without touching the
+	 * socket's own O_NONBLOCK state.  recvmsg() filling a second iovec
+	 * needs it: the first one may block waiting for the stream to start,
+	 * but once any byte has been handed over the call must return what it
+	 * has rather than waiting for more to arrive. */
+	int dontwait = (flags & MSG_DONTWAIT) ? 1 : 0;
 
 	uint8_t *dst = (uint8_t *)buf;
 
@@ -599,7 +752,7 @@ int unix_recv(int usockfd, void *buf, size_t len, int flags)
 			return 0;
 		if (!us->connected && us->type == SOCK_STREAM)
 			return -ENOTCONN;
-		if (us->nonblock)
+		if (us->nonblock || dontwait)
 			return -EAGAIN;
 		/* Interruptible: recv() returns EINTR when a signal is pending. */
 		{
@@ -698,10 +851,31 @@ int unix_close(int usockfd)
 	us->peer = NULL;
 	us->head = 0;
 	us->tail = 0;
+
+	/* Capture the pathname before releasing the slot: the node has to be
+	 * removed from the filesystem, but that is blocking I/O and cannot run
+	 * with these spinlocks held (interrupts are off). */
+	char node_path[UNIX_PATH_MAX + 1];
+	int node_len = 0;
+	if (us->has_node && us->path_len > 0 && us->path[0] != '\0') {
+		node_len = us->path_len;
+		if (node_len > UNIX_PATH_MAX)
+			node_len = UNIX_PATH_MAX;
+		for (int i = 0; i < node_len; i++)
+			node_path[i] = (char)us->path[i];
+		node_path[node_len] = '\0';
+	}
+	us->has_node = 0;
 	us->path_len = 0; /* name released with the slot */
 
 	spin_unlock_irqrestore(&us->lock, flags);
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
+
+	/* Stale sockets otherwise accumulate in /tmp and every later bind to
+	 * the same name fails with EADDRINUSE — which is exactly how a display
+	 * server refuses to restart after an unclean exit. */
+	if (node_len > 0)
+		vfs_unlink(node_path);
 	return 0;
 }
 

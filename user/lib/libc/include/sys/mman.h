@@ -2,6 +2,7 @@
 #define _SYS_MMAN_H
 
 #include <stddef.h>
+#include <sys/types.h>
 
 // mmap protection flags
 #define PROT_NONE       0x0
@@ -14,6 +15,8 @@
 #define MAP_PRIVATE     0x02
 #define MAP_FIXED       0x10
 #define MAP_ANONYMOUS   0x20
+/* The older BSD spelling; still what a lot of code writes. */
+#define MAP_ANON      MAP_ANONYMOUS
 
 // mmap error return
 #define MAP_FAILED      ((void*)-1)
@@ -33,6 +36,19 @@ int madvise(void* addr, size_t len, int advice);
 void* mmap(void* addr, size_t length, int prot, int flags, int fd, long offset);
 int munmap(void* addr, size_t length);
 int mprotect(void* addr, size_t len, int prot);
+/* msync() flags */
+#define MS_ASYNC      1
+#define MS_INVALIDATE 2
+#define MS_SYNC       4
+
+/* POSIX shared memory.  Backed by the /dev/shm namespace, so the returned
+ * descriptor is an ordinary fd: size it with ftruncate(), map it with
+ * mmap(MAP_SHARED), and it is shared with any other process that opens the
+ * same name. */
+int shm_open(const char* name, int oflag, mode_t mode);
+int shm_unlink(const char* name);
+
+int msync(void* addr, size_t length, int flags);
 int mlock(const void* addr, size_t len);
 int munlock(const void* addr, size_t len);
 int mlockall(int flags);

@@ -14,8 +14,30 @@
  * BSD tty interfaces). */
 #define _POSIX_VERSION  200809L
 #define _POSIX2_VERSION 200809L
-#define _POSIX_JOB_CONTROL 1
-#define _POSIX_SAVED_IDS 1
+
+/* POSIX option macros.  These are how a program asks what the system actually
+ * supports, and leaving them out is not neutral: code that feature-tests falls
+ * back to an older interface.  X11's Xos_r.h is exactly that case — without
+ * _POSIX_THREAD_SAFE_FUNCTIONS it selects a four-argument getpwnam_r that no
+ * POSIX system has had in decades, and the build fails on the arity.
+ *
+ * Only options that are genuinely implemented are declared here. */
+#define _POSIX_THREAD_SAFE_FUNCTIONS 200809L /* the *_r family */
+#define _POSIX_THREADS               200809L /* pthreads (inside libc) */
+#define _POSIX_REENTRANT_FUNCTIONS   1
+#define _POSIX_MAPPED_FILES          200809L /* mmap/munmap/msync */
+#define _POSIX_SHARED_MEMORY_OBJECTS 200809L /* shm_open/shm_unlink */
+#define _POSIX_MEMORY_PROTECTION     200809L /* mprotect */
+#define _POSIX_JOB_CONTROL           1
+#define _POSIX_SAVED_IDS             1
+#define _POSIX_TIMERS                200809L
+#define _POSIX_MONOTONIC_CLOCK       200809L
+#define _POSIX_READER_WRITER_LOCKS   200809L
+#define _POSIX_SPIN_LOCKS            200809L
+#define _POSIX_BARRIERS              200809L
+#define _POSIX_SEMAPHORES            (-1) /* sem_open/sem_init: not implemented */
+#define _POSIX_MESSAGE_PASSING       (-1) /* mq_*: not implemented */
+#define _POSIX_PRIORITY_SCHEDULING   (-1) /* sched_setscheduler: not implemented */
 
 // File operations
 int open(const char* pathname, int flags, ...);
@@ -36,6 +58,7 @@ int getdtablesize(void);
 int access(const char* path, int mode);
 int faccessat(int dirfd, const char* path, int mode, int flags);
 int chdir(const char* path);
+int fchdir(int fd);
 int chroot(const char* path);
 char* getcwd(char* buf, size_t size);
 
@@ -61,6 +84,10 @@ int initgroups(const char* user, gid_t group);
 // Process groups / terminal
 int setpgid(int pid, int pgid);
 int getpgrp(void);
+/* POSIX spells this with no arguments and defines it as setpgid(0, 0).  The
+ * two-argument BSD form of the same name is not provided: the two cannot
+ * coexist, and this is the one POSIX standardised. */
+pid_t setpgrp(void);
 int tcgetpgrp(int fd);
 int tcsetpgrp(int fd, int pgrp);
 int kill(int pid, int sig);
@@ -76,6 +103,11 @@ extern char **environ;
 // Misc
 unsigned int alarm(unsigned int seconds);
 unsigned int sleep(unsigned int seconds);
+/* Implemented in libc but not previously declared here, so every caller got an
+ * implicit declaration — which -Werror=implicit turns into a build failure. */
+int usleep(unsigned int usec);
+int pause(void);
+pid_t vfork(void);
 int gethostname(char* name, size_t len);
 int sethostname(const char *name, size_t len);
 char* getlogin(void);
@@ -84,6 +116,7 @@ int setlogin(const char* name);
 int fsync(int fd);
 void sync(void);
 int ftruncate(int fd, off_t length);
+int truncate(const char* path, off_t length);
 int fcntl(int fd, int cmd, ...);
 int isatty(int fd);
 char *ttyname(int fd);
@@ -112,6 +145,14 @@ int posix_openpt(int flags);
 int grantpt(int fd);
 int unlockpt(int fd);
 char* ptsname(int fd);
+int   ptsname_r(int fd, char* buf, size_t buflen);
+
+/* getopt(): POSIX declares it here as well as in <getopt.h>, which is where
+ * the GNU getopt_long extension lives.  Code that includes only <unistd.h> —
+ * the portable spelling — must still see it. */
+int getopt(int argc, char * const argv[], const char *optstring);
+extern char *optarg;
+extern int optind, opterr, optopt;
 
 // Scheduling
 int sched_yield(void);

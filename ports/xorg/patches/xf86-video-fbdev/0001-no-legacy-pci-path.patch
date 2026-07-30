@@ -1,0 +1,75 @@
+Do not take the legacy PCI path on a server built without pciaccess.
+
+The driver treats "libpciaccess is absent" as "this is an old server with the
+Resource Access Control interface", and its #ifndef XSERVER_LIBPCIACCESS blocks
+reach for racMemFlags, RAC_FB and xf86RegisterResources -- all removed from the
+server years ago.  That assumption predates the possibility of a modern server
+built without PCI support, which is what this is.
+
+There is no PCI bus reachable from userspace here, so neither of the file's two
+PCI paths applies and both are excluded.  What remains is the non-PCI path:
+pci_dev stays NULL (it is already initialised that way), isPci stays FALSE, and
+the framebuffer is opened by the device name from the config file -- which is
+how this driver is meant to be used on a non-PCI framebuffer anyway.
+
+--- a/src/fbdev.c
++++ b/src/fbdev.c
+@@ -34,6 +34,22 @@
+ 
+ #include "compat-api.h"
+ 
++/* This platform has no PCI bus reachable from userspace, so NEITHER of this
++ * file's two PCI paths applies.
++ *
++ * The #ifdef XSERVER_LIBPCIACCESS blocks are already off, because the server
++ * is built --disable-pciaccess.  The trouble is the #ifndef blocks that pair
++ * with them: the driver reads "no libpciaccess" as "an old server with the
++ * Resource Access Control interface", and reaches for racMemFlags, RAC_FB and
++ * xf86RegisterResources -- all removed from the server years ago.  That
++ * assumption predates the possibility of a modern server built without PCI
++ * support, which is exactly what this is.
++ *
++ * Excluding them too leaves the non-PCI path, which is the one that applies:
++ * pci_dev stays NULL, isPci stays FALSE, and the framebuffer is opened by the
++ * device name from the config file.
++ */
++
+ #ifdef XSERVER_LIBPCIACCESS
+ #include <pciaccess.h>
+ #endif
+@@ -315,7 +331,7 @@
+ 	ScrnInfoPtr pScrn;
+        	GDevPtr *devSections;
+ 	int numDevSections;
+-#ifndef XSERVER_LIBPCIACCESS
++#if !defined(XSERVER_LIBPCIACCESS) && !defined(__LIKEOS__)
+ 	int bus,device,func;
+ #endif
+ 	char *dev;
+@@ -339,7 +355,7 @@
+ 
+ 	    dev = xf86FindOptionValue(devSections[i]->options,"fbdev");
+ 	    if (devSections[i]->busID) {
+-#ifndef XSERVER_LIBPCIACCESS
++#if !defined(XSERVER_LIBPCIACCESS) && !defined(__LIKEOS__)
+ 	        if (xf86ParsePciBusString(devSections[i]->busID,&bus,&device,
+ 					  &func)) {
+ 		    if (!xf86CheckPciSlot(bus,device,func))
+@@ -358,7 +374,7 @@
+ 	    if (fbdevHWProbe(NULL,dev,NULL)) {
+ 		pScrn = NULL;
+ 		if (isPci) {
+-#ifndef XSERVER_LIBPCIACCESS
++#if !defined(XSERVER_LIBPCIACCESS) && !defined(__LIKEOS__)
+ 		    /* XXX what about when there's no busID set? */
+ 		    int entity;
+ 		    
+@@ -443,7 +459,7 @@
+ 
+ 	fPtr->pEnt = xf86GetEntityInfo(pScrn->entityList[0]);
+ 
+-#ifndef XSERVER_LIBPCIACCESS
++#if !defined(XSERVER_LIBPCIACCESS) && !defined(__LIKEOS__)
+ 	pScrn->racMemFlags = RAC_FB | RAC_COLORMAP | RAC_CURSOR | RAC_VIEWPORT;
+ 	/* XXX Is this right?  Can probably remove RAC_FB */
+ 	pScrn->racIoFlags = RAC_FB | RAC_COLORMAP | RAC_CURSOR | RAC_VIEWPORT;

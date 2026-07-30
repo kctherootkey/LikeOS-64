@@ -15,6 +15,7 @@
 #include <kernel/io/tty.h>
 #include <kernel/ke/signal.h>
 #include <kernel/fs/devfs.h>
+#include <kernel/mm/shm.h>
 #include <kernel/dev/video/fbdev.h>
 #include <kernel/uapi/dirent.h>
 #include <kernel/hal/serial.h>
@@ -467,8 +468,12 @@ static void fds_unlock(task_t *task, uint64_t flags)
 }
 
 /* Install `file` in the lowest free descriptor >= `from` and return it, or
- * -EMFILE (the caller still owns `file` then).  Never allocates below 3:
- * sys_close refuses 0-2 so they are never free.
+ * -EMFILE (the caller still owns `file` then).  0/1/2 are eligible once the
+ * process has closed them -- POSIX defines "lowest free descriptor" over the
+ * whole table, and the classic way to put a terminal on stdin is close(0)
+ * followed by open() or dup() landing back on 0.  Refusing to allocate there
+ * left the pty on fd 3 and the program's stdio still on whatever it inherited
+ * (this is what gave xterm's shell no prompt: its output went to the console).
  *
  * Claiming the slot and storing the object are ONE atomic step on purpose.
  * The old split — scan for a free number, then open the file, then store it —
@@ -478,17 +483,18 @@ static void fds_unlock(task_t *task, uint64_t flags)
  * half-installed slot is ever visible to another thread. */
 static int fd_install_from(task_t *task, vfs_file_t *file, int from)
 {
-	if (from < 3)
-		from = 3;
+	if (from < 0)
+		from = 0;
 	uint64_t flags = 0;
 	fds_lock(task, &flags);
 	struct vfs_file **fds = task_fds(task);
 	int ret = -EMFILE;
 	for (int i = from; i < TASK_MAX_FDS; i++) {
-		if (fds[i] == NULL) {
+		if (task_fd_slot_free(task, (unsigned)i)) {
 			fds[i] = file;
 			/* A freed slot keeps its old flag byte, so clear it
-			 * here rather than inheriting a stale FD_CLOEXEC. */
+			 * here rather than inheriting a stale FD_CLOEXEC --
+			 * and, for 0/1/2, rather than staying marked closed. */
 			task_set_fd_flags(task, (unsigned)i, 0);
 			ret = i;
 			break;
@@ -500,7 +506,7 @@ static int fd_install_from(task_t *task, vfs_file_t *file, int from)
 
 static int fd_install(task_t *task, vfs_file_t *file)
 {
-	return fd_install_from(task, file, 3);
+	return fd_install_from(task, file, 0);
 }
 
 /* Take one more reference on whatever kind of thing `entry` is and return the
@@ -524,8 +530,12 @@ static vfs_file_t *fd_dup_entry(vfs_file_t *entry)
 			__atomic_fetch_add(&us->ref_count, 1, __ATOMIC_ACQ_REL);
 		return entry;
 	}
-	if (IS_EPOLL_FD(entry))
+	if (IS_EPOLL_FD(entry)) {
+		/* The marker is the same value in both slots, but each slot is
+		 * a descriptor and each descriptor holds a reference. */
+		epoll_get(EPOLL_FD_IDX(entry));
 		return entry;
+	}
 	if (pipe_is_end(entry))
 		return (vfs_file_t *)pipe_dup_end((pipe_end_t *)entry);
 	return vfs_dup(entry);
@@ -546,10 +556,10 @@ static void fd_release_entry(vfs_file_t *entry)
 		return;
 	}
 	if (IS_EPOLL_FD(entry)) {
-		int idx = EPOLL_FD_IDX(entry);
-		extern epoll_instance_t epoll_instances[];
-		if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
-			epoll_instances[idx].active = 0;
+		/* Drop THIS descriptor's reference.  The instance is global and
+		 * the descriptor is not: marking it inactive here tore it down
+		 * for every other process that had inherited the fd. */
+		epoll_put(EPOLL_FD_IDX(entry));
 		return;
 	}
 	if (pipe_is_end(entry)) {
@@ -639,7 +649,7 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 	if (fd < TASK_MAX_FDS) {
 		file = task_fds(cur)[fd];
 	}
-	if (!file && fd == STDIN_FD) {
+	if (task_fd_is_console(cur, fd) && fd == STDIN_FD) {
 		tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
 		if (tty && tty->fg_pgid == 0) {
 			tty->fg_pgid = cur->pgid;
@@ -734,7 +744,7 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
 	if (fd < TASK_MAX_FDS) {
 		file = task_fds(cur)[fd];
 	}
-	if (!file && (fd == STDOUT_FD || fd == STDERR_FD)) {
+	if (task_fd_is_console(cur, fd) && fd != STDIN_FD) {
 		tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
 		if (tty && tty->fg_pgid == 0) {
 			tty->fg_pgid = cur->pgid;
@@ -1121,13 +1131,30 @@ static int64_t sys_close(uint64_t fd)
 	if (!cur)
 		return -EFAULT;
 
-	// Don't allow closing stdin/stdout/stderr
-	if (fd < 3) {
-		return -EBADF;
-	}
-
 	if (fd >= TASK_MAX_FDS)
 		return -EBADF;
+
+	/* Closing a standard descriptor is ordinary and portable: a program
+	 * about to hand itself a terminal does close(0) and then opens or dups
+	 * the one it wants onto the descriptor that frees up.  Refusing it here
+	 * made close() fail and the following dup() land on 3 instead, so the
+	 * program kept the stdio it inherited (xterm's shell talked to the
+	 * console rather than to its pty).
+	 *
+	 * The console has no object to release -- it IS the empty slot -- so
+	 * the close is recorded in the flag byte instead. */
+	if (fd < 3 && task_fds(cur)[fd] == NULL) {
+		uint64_t cflags = 0;
+		fds_lock(cur, &cflags);
+		/* Re-tested under the lock: two threads of one process closing
+		 * the same descriptor must not both be told they succeeded. */
+		int already =
+			task_get_fd_flags(cur, (unsigned)fd) & FD_STDIO_CLOSED;
+		if (!already)
+			task_set_fd_flags(cur, (unsigned)fd, FD_STDIO_CLOSED);
+		fds_unlock(cur, cflags);
+		return already ? -EBADF : 0;
+	}
 
 	/* Detach the descriptor from the table FIRST, under the shared-table
 	 * lock, and release the object afterwards.  Two threads of the same
@@ -1144,8 +1171,14 @@ static int64_t sys_close(uint64_t fd)
 		/* The slot is about to become free: drop its FD_CLOEXEC bit
 		 * with it.  A stale bit left behind is inherited by whatever
 		 * lands there next and makes that descriptor vanish across the
-		 * next exec. */
-		task_set_fd_flags(cur, (unsigned)fd, 0);
+		 * next exec.
+		 *
+		 * For 0/1/2 the empty slot would otherwise read as the console
+		 * again, silently reattaching a descriptor the process just
+		 * closed (and one that had been redirected onto a pty at that,
+		 * so the output would reappear on the terminal). */
+		task_set_fd_flags(cur, (unsigned)fd,
+				  fd < 3 ? FD_STDIO_CLOSED : 0);
 	}
 	fds_unlock(cur, lflags);
 
@@ -1169,8 +1202,11 @@ static int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence)
 	if (!cur)
 		return -EFAULT;
 
-	// stdin/stdout/stderr are not seekable
-	if (fd < 3) {
+	// The console is not seekable.  Tested by slot CONTENT, not by
+	// descriptor number: 0/1/2 are routinely redirected onto a regular
+	// file, and lseek on that must work (a shell tracks its own read
+	// offset on a redirected stdin this way).
+	if (task_fd_is_console(cur, fd)) {
 		return -ESPIPE;
 	}
 
@@ -1213,7 +1249,7 @@ static int fd_link_target(task_t *cur, int fd, char *out, size_t cap)
 	/* 0/1/2 with an empty slot (and the explicit console markers dup'ed
 	 * from them) are the caller's terminal. */
 	if (!entry) {
-		if (fd != STDIN_FD && fd != STDOUT_FD && fd != STDERR_FD)
+		if (!task_fd_is_console(cur, fd))
 			return -EBADF;
 		n = ksnprintf(out, cap, "/dev/tty");
 	} else if (marker >= 1 && marker <= 3) {
@@ -1400,7 +1436,7 @@ static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 	st.st_atime = 0;
 	st.st_mtime = 0;
 	st.st_ctime = 0;
-	if (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD) {
+	if (task_fd_is_console(cur, fd)) {
 		st.st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP |
 					S_IROTH | S_IWOTH);
 		st.st_rdev = ((uint64_t)5 << 8) | (fd & 0xff); /* tty major=5 */
@@ -1668,6 +1704,169 @@ static int64_t sys_chdir(uint64_t pathname)
  * Enforcement happens in build_at_path/apply_chroot for every later textual
  * path; the caller is expected to chdir("/") afterwards, exactly as on other
  * Unix systems. */
+/* Defined further down; the shared-memory calls below map and unmap through
+ * them so attach/detach reuse the ordinary region bookkeeping. */
+static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
+			uint64_t flags, uint64_t fd, uint64_t offset);
+static int64_t sys_munmap(uint64_t addr, uint64_t length);
+
+/* ================= System V shared memory ============================
+ *
+ * These sit on top of the same objects /dev/shm exposes, so a segment is a
+ * segment however it was created.  shmat() deliberately goes through the
+ * filesystem path rather than mapping the object directly: that reuses the
+ * region/vfs_file reference machinery, so detaching, exec and process exit all
+ * release the segment through paths that already work, instead of needing
+ * three new teardown hooks.
+ */
+static int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg)
+{
+	shm_object_t *o;
+	int id = -1;
+	int create = (shmflg & IPC_CREAT) != 0;
+	int excl = (shmflg & IPC_EXCL) != 0;
+
+	if (size > (unsigned long)SHM_MAX_PAGES * PAGE_SIZE)
+		return -EINVAL;
+
+	o = shm_sysv_get((int)key, size, create, excl, (unsigned)(shmflg & 0777),
+			 &id);
+	if (!o) {
+		if (excl && create)
+			return -EEXIST;
+		if (!create)
+			return -ENOENT;
+		return -ENOSPC;
+	}
+	/* An existing segment smaller than requested cannot satisfy the call. */
+	if (size && o->size < size) {
+		shm_put(o);
+		return -EINVAL;
+	}
+	shm_put(o); /* the id keeps it findable; no reference is held here */
+	return id;
+}
+
+static int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg)
+{
+	shm_object_t *o = shm_by_id_get((int)shmid);
+	char name[SHM_NAME_MAX];
+	char path[SHM_NAME_MAX + 16];
+	unsigned long size;
+	int prot;
+	int64_t r;
+
+	if (!o)
+		return -EINVAL;
+	if (shm_name_of(o, name, sizeof(name)) != 0) {
+		/* Marked for removal: the name is gone, so it can no longer be
+		 * attached — existing attachments are unaffected. */
+		shm_put(o);
+		return -EINVAL;
+	}
+	size = o->size;
+	shm_put(o);
+	if (size == 0)
+		return -EINVAL;
+
+	{
+		static const char pfx[] = "/dev/shm/";
+		size_t i = 0, n = 0;
+		while (pfx[i])
+			path[n++] = pfx[i++];
+		i = 0;
+		while (name[i] && n < sizeof(path) - 1)
+			path[n++] = name[i++];
+		path[n] = '\0';
+	}
+
+	prot = PROT_READ | ((shmflg & SHM_RDONLY) ? 0 : PROT_WRITE);
+
+	/* Open the object and map it.  sys_mmap takes the descriptor route, so
+	 * install one, map through it, then drop it: the mapping keeps its own
+	 * reference on the file, exactly as an mmap after close would. */
+	{
+		vfs_file_t *f = NULL;
+		int fd;
+		if (vfs_open(path, O_RDWR, &f) != ST_OK || !f)
+			return -EINVAL;
+		fd = fd_install(sched_current(), f);
+		if (fd < 0) {
+			vfs_close(f);
+			return -EMFILE;
+		}
+		r = sys_mmap(shmaddr, size, (uint64_t)prot, MAP_SHARED,
+			     (uint64_t)fd, 0);
+		sys_close((uint64_t)fd);
+	}
+	return r;
+}
+
+static int64_t sys_shmdt(uint64_t shmaddr)
+{
+	task_t *cur = sched_current();
+	mmap_region_t *region;
+
+	if (!cur || shmaddr == 0)
+		return -EINVAL;
+	cur = task_mm_owner(cur);
+	region = find_mmap_region(cur, shmaddr);
+	/* Only the exact attach address detaches, as elsewhere. */
+	if (!region || region->start != shmaddr)
+		return -EINVAL;
+	return sys_munmap(shmaddr, region->length);
+}
+
+static int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf)
+{
+	shm_object_t *o = shm_by_id_get((int)shmid);
+	char name[SHM_NAME_MAX];
+	int rc = 0;
+
+	if (!o)
+		return -EINVAL;
+
+	switch (cmd) {
+	case IPC_RMID:
+		/* Mark for destruction: the name goes now, the memory when the
+		 * last attachment does.  Creating a segment and removing it
+		 * straight away is the normal idiom — it is what stops one
+		 * being left behind if the process dies. */
+		if (shm_name_of(o, name, sizeof(name)) == 0)
+			rc = shm_unlink_name(name);
+		else
+			rc = 0; /* already removed */
+		break;
+	case IPC_STAT: {
+		struct k_shmid_ds ds;
+		if (!buf || !validate_user_ptr(buf, sizeof(ds))) {
+			rc = -EFAULT;
+			break;
+		}
+		mm_memset(&ds, 0, sizeof(ds));
+		ds.shm_perm.uid = o->uid;
+		ds.shm_perm.gid = o->gid;
+		ds.shm_perm.cuid = o->uid;
+		ds.shm_perm.cgid = o->gid;
+		ds.shm_perm.mode = o->mode & 0777;
+		ds.shm_segsz = o->size;
+		ds.shm_nattch = (uint64_t)(o->refs > 0 ? o->refs - 1 : 0);
+		if (copy_to_user((void *)buf, &ds, sizeof(ds)) != 0)
+			rc = -EFAULT;
+		break;
+	}
+	case IPC_SET:
+		/* Nothing here is adjustable after creation. */
+		rc = 0;
+		break;
+	default:
+		rc = -EINVAL;
+		break;
+	}
+	shm_put(o);
+	return rc;
+}
+
 static int64_t sys_chroot(uint64_t pathname)
 {
 	task_t *cur = sched_current();
@@ -2066,11 +2265,14 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 	 * the save path for a closed fd, where the following F_DUPFD failed
 	 * with EBADF and aborted the whole redirection. */
 	if (cmd == F_GETFD || cmd == F_SETFD) {
-		if (!task_fds(cur)[fd] && fd != STDIN_FD && fd != STDOUT_FD &&
-		    fd != STDERR_FD)
+		if (!task_fds(cur)[fd] && !task_fd_is_console(cur, fd))
 			return -EBADF;
 		if (cmd == F_GETFD)
-			return (int64_t)task_get_fd_flags(cur, (unsigned)fd);
+			/* Masked: FD_STDIO_CLOSED shares this byte and is
+			 * kernel-internal, not part of the fd flags POSIX
+			 * defines. */
+			return (int64_t)(task_get_fd_flags(cur, (unsigned)fd) &
+					 FD_CLOEXEC);
 		task_set_fd_flags(cur, (unsigned)fd,
 				  (uint8_t)((uint32_t)arg & FD_CLOEXEC));
 		return 0;
@@ -2088,8 +2290,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 			return -EINVAL;
 		/* Source must be open.  0/1/2 stay open as console markers
 		 * even when their fd_table slot is NULL. */
-		if (!task_fds(cur)[fd] && fd != STDIN_FD && fd != STDOUT_FD &&
-		    fd != STDERR_FD)
+		if (!task_fds(cur)[fd] && !task_fd_is_console(cur, fd))
 			return -EBADF;
 		int64_t newfd = sys_dup_from(fd, (int)arg);
 		if (newfd < 0)
@@ -2104,7 +2305,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 	vfs_file_t *file = task_fds(cur)[fd];
 
 	// Handle console markers: only when fd_table entry is NULL
-	if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
+	if (task_fd_is_console(cur, fd)) {
 		if (cmd == F_GETFL) {
 			uint32_t fl = (fd == STDIN_FD) ? O_RDONLY : O_WRONLY;
 			fl |= (cur->console_flags & O_NONBLOCK);
@@ -2270,7 +2471,7 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp)
 		return ret;
 	}
 
-	if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
+	if (task_fd_is_console(cur, fd)) {
 		tty_t *tty = cur->ctty ? cur->ctty : tty_get_console();
 		return tty_ioctl(tty, (unsigned long)req, (void *)argp, cur);
 	}
@@ -2359,7 +2560,7 @@ static int64_t sys_tcgetpgrp(uint64_t fd)
 		file = task_fds(cur)[fd];
 	}
 	tty_t *tty = NULL;
-	if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
+	if (task_fd_is_console(cur, fd)) {
 		tty = cur->ctty ? cur->ctty : tty_get_console();
 	}
 	if (file) {
@@ -2386,7 +2587,7 @@ static int64_t sys_tcsetpgrp(uint64_t fd, uint64_t pgrp)
 		file = task_fds(cur)[fd];
 	}
 	tty_t *tty = NULL;
-	if (!file && (fd == STDIN_FD || fd == STDOUT_FD || fd == STDERR_FD)) {
+	if (task_fd_is_console(cur, fd)) {
 		tty = cur->ctty ? cur->ctty : tty_get_console();
 	}
 	if (file) {
@@ -2452,7 +2653,18 @@ static int64_t sys_getpgid(uint64_t pid)
 }
 
 // POSIX getrusage(2) - resource usage.
-// We don't track per-process CPU time accurately yet; return zeros.
+//
+// The CPU times are real: the timer tick charges every task to utime_ticks or
+// stime_ticks depending on the privilege level it interrupted (see
+// timer_handle_tick), so the accounting already exists and only needs
+// reporting.  wait4() has been reporting a dead child's times from the same
+// counters all along; this is the same conversion for a live process.
+//
+// Resolution is one timer tick, so a process that has run for less than a tick
+// reads as zero.  That is the honest answer at this sampling rate, not a bug.
+//
+// The remaining fields stay zero because nothing counts them yet: there is no
+// per-task page-fault or resident-set accounting to report.
 struct k_rusage_compat {
 	int64_t ru_utime_sec;
 	int64_t ru_utime_usec;
@@ -2460,16 +2672,51 @@ struct k_rusage_compat {
 	int64_t ru_stime_usec;
 	int64_t ru_pad[14];
 };
+
+// Ticks -> seconds and microseconds, at whatever rate the timer is running.
+static void ticks_to_timeval(uint64_t ticks, int64_t *sec, int64_t *usec)
+{
+	uint32_t freq = timer_get_frequency();
+	if (freq == 0)
+		freq = 100;
+	*sec = (int64_t)(ticks / freq);
+	*usec = (int64_t)((ticks % freq) * (1000000 / freq));
+}
+
+#define K_RUSAGE_SELF     0
+#define K_RUSAGE_CHILDREN (-1)
+
 static int64_t sys_getrusage(uint64_t who, uint64_t uptr)
 {
-	(void)who;
 	if (!uptr)
 		return -EFAULT;
 	if (!validate_user_ptr(uptr, sizeof(struct k_rusage_compat)))
 		return -EFAULT;
+
 	struct k_rusage_compat ru;
 	for (size_t i = 0; i < sizeof(ru); i++)
 		((uint8_t *)&ru)[i] = 0;
+
+	task_t *cur = sched_current();
+	switch ((int)(int32_t)who) {
+	case K_RUSAGE_SELF:
+		if (cur) {
+			ticks_to_timeval(cur->utime_ticks, &ru.ru_utime_sec,
+					 &ru.ru_utime_usec);
+			ticks_to_timeval(cur->stime_ticks, &ru.ru_stime_sec,
+					 &ru.ru_stime_usec);
+		}
+		break;
+	case K_RUSAGE_CHILDREN:
+		// Reaped children's times are not accumulated onto the parent,
+		// so this is zero rather than wrong.  wait4() reports each
+		// child's own usage as it is reaped, which is where a caller
+		// can get the real figures today.
+		break;
+	default:
+		return -EINVAL;
+	}
+
 	if (copy_to_user((void *)uptr, &ru, sizeof(ru)) != 0)
 		return -EFAULT;
 	return 0;
@@ -3633,7 +3880,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 {
 	task_t *cur = sched_current();
 	if (!cur)
-		return (int64_t)MAP_FAILED;
+		return -ENOMEM;
 	/* fd lookup below stays on the calling task; the region table,
 	 * mmap_base and pml4 belong to the thread-group leader. */
 	task_t *caller = cur;
@@ -3641,12 +3888,12 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
 	// Security: Validate length - must be non-zero and reasonable
 	if (length == 0) {
-		return (int64_t)MAP_FAILED;
+		return -EINVAL;
 	}
 
 	// Security: Prevent integer overflow when aligning length
 	if (length > 0x7FFFFFFFFFFFFFF0ULL) {
-		return (int64_t)MAP_FAILED; // Would overflow during PAGE_ALIGN
+		return -ENOMEM; // Would overflow during PAGE_ALIGN
 	}
 
 	// Round up length to page size
@@ -3654,24 +3901,30 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
 	// Security: Prevent excessive allocation (max 2GB per mmap call)
 	if (length > (2ULL * 1024 * 1024 * 1024)) {
-		return (int64_t)MAP_FAILED;
+		return -ENOMEM;
 	}
 
 	// Find a free mmap region slot
 	mmap_region_t *region = alloc_mmap_region(cur);
 	if (!region) {
-		return (int64_t)MAP_FAILED;
+		/* Loud on purpose: a process that runs out of region slots
+		 * fails every subsequent mmap, which downstream looks like a
+		 * random allocation crash rather than a table limit. */
+		WARN_RATELIMIT(1,
+			       "mmap: pid %d out of mmap regions (max %d)",
+			       cur->id, TASK_MAX_MMAP);
+		return -ENOMEM;
 	}
 
 	// Determine virtual address
 	uint64_t vaddr;
 	if (flags & MAP_FIXED) {
 		if (addr == 0 || (addr & (PAGE_SIZE - 1))) {
-			return (int64_t)MAP_FAILED; // Invalid fixed address
+			return -EINVAL; // Invalid fixed address
 		}
 		// Security: Reject mappings below 64KB to prevent NULL deref exploits
 		if (addr < 0x10000) {
-			return (int64_t)MAP_FAILED;
+			return -EINVAL;
 		}
 		vaddr = addr;
 	} else {
@@ -3681,12 +3934,12 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 		if (cur->mmap_base < cur->brk + (4 * 1024 * 1024)) {
 			// Too close to heap
 			cur->mmap_base += length; // Rollback
-			return (int64_t)MAP_FAILED;
+			return -ENOMEM;
 		}
 		// Security: Reject mappings below 64KB to prevent NULL deref exploits
 		if (cur->mmap_base < 0x10000) {
 			cur->mmap_base += length; // Rollback
-			return (int64_t)MAP_FAILED;
+			return -ENOMEM;
 		}
 		vaddr = cur->mmap_base;
 	}
@@ -3708,13 +3961,13 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 	vfs_file_t *backing = NULL;
 	if (!is_anonymous) {
 		if (fd >= TASK_MAX_FDS || !task_fds(caller)[fd])
-			return (int64_t)MAP_FAILED;
+			return -EBADF;
 		uint64_t marker = (uint64_t)task_fds(caller)[fd];
 		if (marker <= 3 || IS_SOCKET_FD(task_fds(caller)[fd]) ||
 		    IS_UNIX_SOCKET_FD(task_fds(caller)[fd]) ||
 		    IS_EPOLL_FD(task_fds(caller)[fd]) ||
 		    pipe_is_end(task_fds(caller)[fd]))
-			return (int64_t)MAP_FAILED;
+			return -ENODEV;
 		backing = task_fds(caller)[fd];
 	}
 
@@ -3722,6 +3975,76 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 	 * are mapped eagerly with PAGE_DEVICE PTEs (never freed back to the
 	 * physical allocator, shared across fork) and write-combining
 	 * caching (PWT selects PAT entry 1, programmed WC at boot). */
+	/* Shared memory: map the OBJECT's own physical pages.  This is the one
+	 * mapping in the system that is shared between processes with no fork
+	 * relationship — the generic MAP_SHARED path below allocates fresh
+	 * pages per process, which is fine for anonymous memory but would give
+	 * every opener of a /dev/shm object its own private copy. */
+	if (backing) {
+		shm_object_t *sobj = devfs_shm_object(backing);
+		if (sobj) {
+			if (!(flags & MAP_SHARED)) {
+				/* A private mapping of shared memory is legal
+				 * but pointless here, and implementing it means
+				 * copy-on-write over borrowed pages.  Say so
+				 * rather than silently sharing. */
+				return -EOPNOTSUPP;
+			}
+			if ((offset & (PAGE_SIZE - 1)) != 0)
+				return -EINVAL;
+			if (offset + length > sobj->size)
+				return -EINVAL; /* past the object's length */
+
+			/* PAGE_DEVICE marks these as pages this address space
+			 * does not own: teardown must not hand them back to the
+			 * physical allocator, and fork shares rather than copies
+			 * them.  They belong to the shm object and are released
+			 * only when it is destroyed.  Without this bit every
+			 * munmap frees memory the object still owns — the pages
+			 * get reused underneath it and are freed a second time
+			 * later. */
+			uint64_t shm_flags = page_flags | PAGE_DEVICE;
+
+			for (uint64_t off = 0; off < length; off += PAGE_SIZE) {
+				uint64_t phys = shm_page_phys(
+					sobj, (offset + off) / PAGE_SIZE);
+				if (!phys ||
+				    !mm_map_page_in_address_space(
+					    cur->pml4, vaddr + off, phys,
+					    shm_flags)) {
+					for (uint64_t cl = 0; cl < off;
+					     cl += PAGE_SIZE)
+						mm_unmap_page_in_address_space(
+							cur->pml4, vaddr + cl);
+					if (!(flags & MAP_FIXED))
+						cur->mmap_base += length;
+					return -ENOMEM;
+				}
+			}
+			/* Pin the object for the life of the mapping: the
+			 * region holds a vfs reference, and unmapping releases
+			 * it through the normal file teardown. */
+			vfs_incref(backing);
+			region->start = vaddr;
+			region->length = length;
+			region->prot = prot;
+			region->flags = flags | MAP_SHARED;
+			region->fd = (int)fd;
+			region->offset = offset;
+			region->lazy = false;
+			region->file = backing;
+			/* Marked as a device mapping so fork() shares the pages
+			 * instead of copying them, and teardown never hands
+			 * them back to the physical allocator — they belong to
+			 * the shm object, not to this address space. */
+			region->device = true;
+			region->device_phys = shm_page_phys(sobj, offset /
+								     PAGE_SIZE);
+			region->in_use = true;
+			return (int64_t)vaddr;
+		}
+	}
+
 	if (backing && devfs_is_fb0(backing)) {
 		uint64_t dev_phys = fbdev_mmap_phys(offset, length);
 		uint64_t dev_flags = page_flags | PAGE_DEVICE |
@@ -3730,7 +4053,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 		if (!dev_phys) {
 			if (!(flags & MAP_FIXED))
 				cur->mmap_base += length; // Rollback
-			return (int64_t)MAP_FAILED;
+			return -ENODEV;
 		}
 		for (uint64_t off = 0; off < length; off += PAGE_SIZE) {
 			if (!mm_map_page_in_address_space(cur->pml4,
@@ -3743,7 +4066,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 						cur->pml4, vaddr + cl);
 				if (!(flags & MAP_FIXED))
 					cur->mmap_base += length; // Rollback
-				return (int64_t)MAP_FAILED;
+				return -ENOMEM;
 			}
 		}
 		vfs_incref(backing);
@@ -3772,7 +4095,13 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 	 * place (a lazy region would otherwise never fault there and expose
 	 * the old contents), so clear the range first.  This also fixes the
 	 * old eager path silently overwriting live PTEs (leaking the pages). */
-	if (!(flags & MAP_SHARED)) {
+	/* PROT_NONE takes the lazy path even when MAP_SHARED is asked for: the
+	 * mapping has no accessible contents, so there is nothing for the eager
+	 * path to share, and the fault handler above already refuses PROT_NONE
+	 * regions.  Mapping it eagerly would hand out PAGE_PRESENT|PAGE_USER
+	 * pages that are freely readable — i.e. PROT_NONE would not protect. */
+	bool prot_none = !(prot & (PROT_READ | PROT_WRITE | PROT_EXEC));
+	if (!(flags & MAP_SHARED) || prot_none) {
 		if (flags & MAP_FIXED) {
 			for (uint64_t off = 0; off < length; off += PAGE_SIZE)
 				mm_unmap_page_in_address_space(cur->pml4,
@@ -3807,7 +4136,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 			if (!(flags & MAP_FIXED)) {
 				cur->mmap_base += length; // Rollback
 			}
-			return (int64_t)MAP_FAILED;
+			return -ENOMEM;
 		}
 
 		/* No memset in production: mm_allocate_physical_page already
@@ -3841,7 +4170,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 			if (!(flags & MAP_FIXED)) {
 				cur->mmap_base += length; // Rollback
 			}
-			return (int64_t)MAP_FAILED;
+			return -ENOMEM;
 		}
 		pages_mapped++;
 	}
@@ -4540,7 +4869,10 @@ static int64_t sys_dup(uint64_t oldfd)
 	if (!cur)
 		return -EFAULT;
 
-	return sys_dup_from(oldfd, 3);
+	/* Floor 0, not 3: POSIX defines dup() as "the lowest numbered
+	 * available file descriptor", and close(fd)+dup(x) is the classic way
+	 * to put x on a standard descriptor. */
+	return sys_dup_from(oldfd, 0);
 }
 
 /* dup(oldfd) onto the lowest free descriptor >= `from`.  Shared by SYS_DUP
@@ -4559,8 +4891,7 @@ static int64_t sys_dup_from(uint64_t oldfd, int from)
 	 * the restore handed stdout back to the terminal and the captured
 	 * output was lost.  A non-NULL slot falls through to the normal
 	 * per-type duplication below. */
-	if ((oldfd == STDIN_FD || oldfd == STDOUT_FD || oldfd == STDERR_FD) &&
-	    task_fds(cur)[oldfd] == NULL)
+	if (task_fd_is_console(cur, oldfd))
 		return fd_install_from(cur, (vfs_file_t *)(oldfd + 1), from);
 
 	if (oldfd >= TASK_MAX_FDS || task_fds(cur)[oldfd] == NULL)
@@ -4598,7 +4929,7 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd)
 	// POSIX: validate oldfd BEFORE touching newfd — "if oldfd is not a
 	// valid file descriptor, the call fails and newfd is not closed".
 	// fds 0-2 count as valid even when they hold console markers.
-	if (oldfd != STDIN_FD && oldfd != STDOUT_FD && oldfd != STDERR_FD &&
+	if (!task_fd_is_console(cur, oldfd) &&
 	    (oldfd >= TASK_MAX_FDS || task_fds(cur)[oldfd] == NULL))
 		return -EBADF;
 
@@ -4614,8 +4945,7 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd)
 	 * the restore handed stdout back to the terminal and the captured
 	 * output was lost. */
 	vfs_file_t *copy;
-	if ((oldfd == STDIN_FD || oldfd == STDOUT_FD || oldfd == STDERR_FD) &&
-	    task_fds(cur)[oldfd] == NULL) {
+	if (task_fd_is_console(cur, oldfd)) {
 		copy = (vfs_file_t *)(oldfd + 1); /* console stdio marker */
 	} else {
 		copy = fd_dup_entry(task_fds(cur)[oldfd]);
@@ -5383,10 +5713,30 @@ static int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr)
 		tp.tv_nsec = frac_ns;
 		break;
 	case 1: // CLOCK_MONOTONIC
-	case 2: // CLOCK_PROCESS_CPUTIME_ID
-	case 3: // CLOCK_THREAD_CPUTIME_ID
 		tp.tv_sec = total_secs;
 		tp.tv_nsec = frac_ns;
+		break;
+	case 2: // CLOCK_PROCESS_CPUTIME_ID
+	case 3: // CLOCK_THREAD_CPUTIME_ID
+		// CPU time consumed, not time elapsed.  These used to return
+		// uptime, which is the same number only for a process that
+		// never sleeps -- so anything measuring its own cost (clock(),
+		// a profiler, a benchmark) was reading wall time and calling it
+		// CPU time.  The tick handler already charges user and system
+		// ticks per task, so report those.
+		//
+		// PROCESS and THREAD are the same figure here because the
+		// accounting is per task and a thread IS a task; for a
+		// single-threaded process the two agree exactly.
+		{
+			task_t *cur = sched_current();
+			uint64_t ticks = cur ? cur->utime_ticks + cur->stime_ticks : 0;
+			uint32_t freq = timer_get_frequency();
+			if (freq == 0)
+				freq = 100;
+			tp.tv_sec = (int64_t)(ticks / freq);
+			tp.tv_nsec = (int64_t)((ticks % freq) * (1000000000ULL / freq));
+		}
 		break;
 	default:
 		return -EINVAL;
@@ -7154,7 +7504,11 @@ __attribute__((noinline)) static int unix_do_sendmsg(int ufd,
 								1,
 								__ATOMIC_ACQ_REL);
 					} else if (IS_EPOLL_FD(entry)) {
-						/* opaque marker, no per-instance ref */
+						/* The child gets its own
+						 * descriptor onto the same
+						 * instance, so the instance
+						 * gains a reference. */
+						epoll_get(EPOLL_FD_IDX(entry));
 					} else if (pipe_is_end(entry)) {
 						pipe_end_t *ne = pipe_dup_end(
 							(pipe_end_t *)entry);
@@ -7172,11 +7526,9 @@ __attribute__((noinline)) static int unix_do_sendmsg(int ufd,
 		}
 	}
 
-	/* Flatten iov into a temp buffer, then unix_send. */
 	if (kmsg->msg_iovlen <= 0)
 		return 0;
-	/* Stream sockets: process up to 4096 bytes; cap iov count so the
-     * on-stack array is bounded. */
+	/* Cap the iov count so the on-stack copy of the array is bounded. */
 	int kiovcnt = kmsg->msg_iovlen;
 	if (kiovcnt > 256)
 		kiovcnt = 256;
@@ -7186,30 +7538,42 @@ __attribute__((noinline)) static int unix_do_sendmsg(int ufd,
 		return -EFAULT;
 	copy_from_user(iov, kmsg->msg_iov,
 		       sizeof(struct iovec) * (size_t)kiovcnt);
-	size_t total = 0;
+
+	/* Send each iovec in turn, stopping at the first short write, exactly as
+	 * sys_writev does.  A stream socket has no message boundaries, so this
+	 * is indistinguishable from one big write -- and unix_send already
+	 * bounces user memory through its own small on-stack buffer, so no
+	 * flattening buffer is needed here at all.
+	 *
+	 * It used to flatten into a `static uint8_t sbuf[4096]`: ONE buffer for
+	 * the whole system, with no lock.  Two processes sending on unix sockets
+	 * at the same time overwrote each other's bytes, so each peer received a
+	 * stream with someone else's data spliced into it.  Every byte an X
+	 * client writes goes through here, which is how a window resize -- the
+	 * window manager and the terminal both bursting at once -- ended in
+	 * "[xcb] Unknown sequence number while processing queue".  Same bug
+	 * class as the ext4 xattr static scratch list. */
+	int64_t sent_total = 0;
 	for (int i = 0; i < kiovcnt; i++) {
-		if (total + iov[i].iov_len > 4096) {
-			iov[i].iov_len = 4096 - total;
-			total = 4096;
-			kiovcnt = i + 1;
-			break;
-		}
-		total += iov[i].iov_len;
+		size_t want = iov[i].iov_len;
+		if (want == 0)
+			continue;
+		/* Bounded per call so the byte count cannot overflow the int this
+		 * returns.  A caller that asked for more sees a short write and
+		 * comes back for the rest, which is what it must already do for a
+		 * full peer ring. */
+		if (want > 65536)
+			want = 65536;
+		if (!validate_user_ptr((uint64_t)iov[i].iov_base, want))
+			return sent_total ? (int)sent_total : -EFAULT;
+		int r = unix_send(ufd, iov[i].iov_base, want, 0);
+		if (r < 0)
+			return sent_total ? (int)sent_total : r;
+		sent_total += r;
+		if ((size_t)r < want)
+			break; /* peer's ring is full; report what went */
 	}
-	if (total == 0)
-		return 0;
-	static uint8_t sbuf[4096];
-	size_t off = 0;
-	for (int i = 0; i < kiovcnt && off < total; i++) {
-		size_t chunk = iov[i].iov_len;
-		if (off + chunk > total)
-			chunk = total - off;
-		if (!validate_user_ptr((uint64_t)iov[i].iov_base, chunk))
-			return -EFAULT;
-		copy_from_user(sbuf + off, iov[i].iov_base, chunk);
-		off += chunk;
-	}
-	return unix_send(ufd, sbuf, total, 0);
+	return (int)sent_total;
 }
 
 __attribute__((noinline)) static int unix_do_recvmsg(int ufd,
@@ -7235,8 +7599,6 @@ __attribute__((noinline)) static int unix_do_recvmsg(int ufd,
 		total += iov[i].iov_len;
 	if (total == 0)
 		return 0;
-	if (total > 4096)
-		total = 4096;
 
 	/* Stream-mode SCM_RIGHTS framing: if a pending fd is queued at byte
      * offset N (in the receiver's bytes_read coordinate system), clamp
@@ -7274,21 +7636,45 @@ __attribute__((noinline)) static int unix_do_recvmsg(int ufd,
 		}
 	}
 
-	static uint8_t rbuf[4096];
-	int got = unix_recv(ufd, rbuf, total, 0);
-	if (got < 0)
-		return got;
-
+	/* Receive straight into the caller's iovecs.  unix_recv copies to user
+	 * memory itself (with no lock held, so a demand fault may sleep), so
+	 * there is nothing to stage through.
+	 *
+	 * This used to drain into a `static uint8_t rbuf[4096]`: ONE buffer for
+	 * the whole system, with no lock.  Two processes reading unix sockets at
+	 * the same time overwrote each other's bytes.  libxcb reads EVERY byte
+	 * of the X protocol through recvmsg(), so a client got a stream with
+	 * another client's data spliced into it and aborted with "[xcb] Unknown
+	 * sequence number while processing queue" -- which needed simultaneous
+	 * traffic to show up, hence a window resize triggering it.
+	 *
+	 * Only the first read may block.  Once any byte has been handed over the
+	 * call must return what it has, so later iovecs use MSG_DONTWAIT and a
+	 * drained ring ends the loop. */
+	int got = 0;
 	size_t off = 0;
-	for (int i = 0; i < riovcnt && off < (size_t)got; i++) {
-		size_t chunk = iov[i].iov_len;
-		if (off + chunk > (size_t)got)
-			chunk = (size_t)got - off;
-		if (!validate_user_ptr((uint64_t)iov[i].iov_base, chunk))
-			return -EFAULT;
-		copy_to_user(iov[i].iov_base, rbuf + off, chunk);
-		off += chunk;
+	for (int i = 0; i < riovcnt && off < total; i++) {
+		size_t want = iov[i].iov_len;
+		if (want == 0)
+			continue;
+		if (off + want > total)
+			want = total - off;
+		if (!validate_user_ptr((uint64_t)iov[i].iov_base, want))
+			return off ? (int)off : -EFAULT;
+		int n = unix_recv(ufd, iov[i].iov_base, want,
+				  off ? MSG_DONTWAIT : 0);
+		if (n < 0) {
+			if (off)
+				break; /* keep what was already delivered */
+			return n;
+		}
+		if (n == 0)
+			break; /* peer closed, or nothing more queued */
+		off += (size_t)n;
+		if ((size_t)n < want)
+			break; /* ring drained */
 	}
+	got = (int)off;
 
 	/* Deliver one pending fd via SCM_RIGHTS, but only at the correct
      * byte boundary. */
@@ -7298,16 +7684,13 @@ __attribute__((noinline)) static int unix_do_recvmsg(int ufd,
 		void *entry = NULL;
 		if (unix_pop_fd(us, &entry) == 0 && entry) {
 			task_t *cur = sched_current();
-			int newfd = -1;
-			if (cur) {
-				for (int i = 3; i < TASK_MAX_FDS; i++) {
-					if (task_fds(cur)[i] == NULL) {
-						task_fds(cur)[i] = entry;
-						newfd = i;
-						break;
-					}
-				}
-			}
+			/* fd_install_from, not a bare scan: it claims the slot
+			 * under the descriptor-table lock (so two threads of one
+			 * process cannot be handed the same number) and clears
+			 * the slot's flag byte -- a recycled slot that kept a
+			 * stale FD_CLOEXEC made the received descriptor vanish
+			 * at the next exec. */
+			int newfd = cur ? fd_install_from(cur, entry, 0) : -1;
 			if (newfd < 0) {
 				/* No fd slot available — drop the entry's reference. */
 				uintptr_t marker = (uintptr_t)entry;
@@ -7457,6 +7840,15 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 
 	case SYS_CHDIR:
 		return sys_chdir(a1);
+
+	case SYS_SHMGET:
+		return sys_shmget(a1, a2, a3);
+	case SYS_SHMAT:
+		return sys_shmat(a1, a2, a3);
+	case SYS_SHMDT:
+		return sys_shmdt(a1);
+	case SYS_SHMCTL:
+		return sys_shmctl(a1, a2, a3);
 
 	case SYS_CHROOT:
 		return sys_chroot(a1);
@@ -7787,16 +8179,28 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	case SYS_BIND: {
 		int ufd = unix_sock_fd_from_fd(a1);
 		if (ufd >= 0) {
-			if (!validate_user_ptr(a2, sizeof(struct sockaddr_un)))
+			/* Validate and copy only the DECLARED length, into a
+			 * zeroed structure.
+			 *
+			 * Requiring the full sizeof(struct sockaddr_un) to be
+			 * readable rejects a caller that allocated exactly
+			 * SUN_LEN bytes -- which is legal, and which the
+			 * address is normally sized by.  Zeroing first means
+			 * the untouched tail is deterministic rather than
+			 * stack garbage. */
+			socklen_t alen = (socklen_t)a3;
+
+			if (alen < sizeof(sa_family_t))
+				return -EINVAL;
+			if (alen > sizeof(struct sockaddr_un))
+				alen = sizeof(struct sockaddr_un);
+			if (!validate_user_ptr(a2, alen))
 				return -EFAULT;
 			struct sockaddr_un kaddr;
-			/* MUST check the copy: on failure kaddr is uninitialised
-			 * stack garbage, and binding that silently registers a
-			 * socket under a junk (often empty) name. */
-			if (copy_from_user(&kaddr, (const void *)a2,
-					   sizeof(struct sockaddr_un)) != 0)
+			mm_memset(&kaddr, 0, sizeof(kaddr));
+			if (copy_from_user(&kaddr, (const void *)a2, alen) != 0)
 				return -EFAULT;
-			return unix_bind(ufd, &kaddr, (socklen_t)a3);
+			return unix_bind(ufd, &kaddr, alen);
 		}
 		int idx = sock_idx_from_fd(a1);
 		if (idx < 0)
@@ -7902,15 +8306,28 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	case SYS_CONNECT: {
 		int ufd = unix_sock_fd_from_fd(a1);
 		if (ufd >= 0) {
-			if (!validate_user_ptr(a2, sizeof(struct sockaddr_un)))
+			/* Validate and copy only the DECLARED length, into a
+			 * zeroed structure.
+			 *
+			 * Requiring the full sizeof(struct sockaddr_un) to be
+			 * readable rejects a caller that allocated exactly
+			 * SUN_LEN bytes -- which is legal, and which the
+			 * address is normally sized by.  Zeroing first means
+			 * the untouched tail is deterministic rather than
+			 * stack garbage. */
+			socklen_t alen = (socklen_t)a3;
+
+			if (alen < sizeof(sa_family_t))
+				return -EINVAL;
+			if (alen > sizeof(struct sockaddr_un))
+				alen = sizeof(struct sockaddr_un);
+			if (!validate_user_ptr(a2, alen))
 				return -EFAULT;
 			struct sockaddr_un kaddr;
-			/* Check the copy: on failure kaddr is uninitialised
-			 * stack garbage and we would connect to a junk name. */
-			if (copy_from_user(&kaddr, (const void *)a2,
-					   sizeof(struct sockaddr_un)) != 0)
+			mm_memset(&kaddr, 0, sizeof(kaddr));
+			if (copy_from_user(&kaddr, (const void *)a2, alen) != 0)
 				return -EFAULT;
-			return unix_connect(ufd, &kaddr, (socklen_t)a3);
+			return unix_connect(ufd, &kaddr, alen);
 		}
 		int idx = sock_idx_from_fd(a1);
 		if (idx < 0)
@@ -8063,6 +8480,51 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	}
 
 	case SYS_GETPEERNAME: {
+		/* AF_UNIX first: sock_idx_from_fd() only knows AF_INET, so a
+		 * Unix socket used to fail here -- and an X client that cannot
+		 * name its own socket cannot choose an authorisation record,
+		 * so it sends none and the server rejects it with
+		 * "Authorization required, but no authorization protocol
+		 * specified".  Neither message mentions getpeername(). */
+		int ufd = unix_sock_fd_from_fd(a1);
+
+		if (ufd >= 0) {
+			struct sockaddr_un ukaddr;
+			socklen_t ulen = sizeof(struct sockaddr_un);
+			int uret;
+
+			if (a3 && validate_user_ptr(a3, sizeof(socklen_t)))
+				copy_from_user(&ulen, (const void *)a3,
+					       sizeof(socklen_t));
+			uret = unix_getname(ufd, 1, &ukaddr, &ulen);
+			if (uret < 0)
+				return uret;
+			/* Copy only as much as the caller's buffer holds, but
+			 * report the length the address really needs -- that
+			 * is how a caller learns to retry with a bigger one. */
+			{
+				socklen_t cap = ulen;
+
+				if (a3 && validate_user_ptr(a3,
+							    sizeof(socklen_t))) {
+					socklen_t given = 0;
+
+					copy_from_user(&given, (const void *)a3,
+						       sizeof(socklen_t));
+					if (given < cap)
+						cap = given;
+				}
+				if (a2 && cap > 0 &&
+				    validate_user_ptr(a2, cap))
+					copy_to_user((void *)a2, &ukaddr, cap);
+				if (a3 && validate_user_ptr(a3,
+							    sizeof(socklen_t)))
+					copy_to_user((void *)a3, &ulen,
+						     sizeof(socklen_t));
+			}
+			return 0;
+		}
+
 		int idx = sock_idx_from_fd(a1);
 		if (idx < 0)
 			return idx;
@@ -8079,6 +8541,51 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	}
 
 	case SYS_GETSOCKNAME: {
+		/* AF_UNIX first: sock_idx_from_fd() only knows AF_INET, so a
+		 * Unix socket used to fail here -- and an X client that cannot
+		 * name its own socket cannot choose an authorisation record,
+		 * so it sends none and the server rejects it with
+		 * "Authorization required, but no authorization protocol
+		 * specified".  Neither message mentions getsockname(). */
+		int ufd = unix_sock_fd_from_fd(a1);
+
+		if (ufd >= 0) {
+			struct sockaddr_un ukaddr;
+			socklen_t ulen = sizeof(struct sockaddr_un);
+			int uret;
+
+			if (a3 && validate_user_ptr(a3, sizeof(socklen_t)))
+				copy_from_user(&ulen, (const void *)a3,
+					       sizeof(socklen_t));
+			uret = unix_getname(ufd, 0, &ukaddr, &ulen);
+			if (uret < 0)
+				return uret;
+			/* Copy only as much as the caller's buffer holds, but
+			 * report the length the address really needs -- that
+			 * is how a caller learns to retry with a bigger one. */
+			{
+				socklen_t cap = ulen;
+
+				if (a3 && validate_user_ptr(a3,
+							    sizeof(socklen_t))) {
+					socklen_t given = 0;
+
+					copy_from_user(&given, (const void *)a3,
+						       sizeof(socklen_t));
+					if (given < cap)
+						cap = given;
+				}
+				if (a2 && cap > 0 &&
+				    validate_user_ptr(a2, cap))
+					copy_to_user((void *)a2, &ukaddr, cap);
+				if (a3 && validate_user_ptr(a3,
+							    sizeof(socklen_t)))
+					copy_to_user((void *)a3, &ulen,
+						     sizeof(socklen_t));
+			}
+			return 0;
+		}
+
 		int idx = sock_idx_from_fd(a1);
 		if (idx < 0)
 			return idx;
@@ -8362,6 +8869,16 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
 			if (task_fds(cur)[_fd] == NULL) {
 				task_fds(cur)[_fd] = MAKE_EPOLL_FD(ep_idx);
+				/* EPOLL_CLOEXEC has to be RECORDED, not just
+				 * accepted.  An epoll set is private to the
+				 * process that built it, and every caller asks
+				 * for it -- letting the descriptor survive
+				 * exec() hands an unrelated program a handle
+				 * onto it, and the reference it drops on exit
+				 * is one the creator was still using. */
+				if ((int)a1 & EPOLL_CLOEXEC)
+					task_set_fd_flags(cur, (unsigned)_fd,
+							  FD_CLOEXEC);
 				return _fd;
 			}
 		}

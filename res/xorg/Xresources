@@ -1,0 +1,39 @@
+! X resources for LikeOS-64, installed as /etc/X11/Xresources.
+!
+! Read via $XENVIRONMENT, which the session startup script exports.  That is
+! the toolkit's own per-host resource file mechanism, and it needs no running
+! program -- xrdb, which would instead publish these on the root window for
+! every client to read, is not built here.
+!
+! These are OUR settings.  The app-defaults files under
+! /usr/share/X11/app-defaults are installed exactly as their packages ship
+! them, and nothing here edits them; resources from this file simply take
+! precedence.
+!
+! xterm's built-in defaults are black text on a WHITE background, and the
+! XTerm app-defaults file it ships does not change them (the dark scheme lives
+! in XTerm-color, commented out for the user to choose).  Nothing else on this
+! system expects a light terminal: the framebuffer console is light text on
+! black, and programs that colour their output assume the same.  top prints its
+! summary block in white, which on a white background is simply invisible --
+! that is the whole of the "upper half of top is missing" symptom.
+!
+! Both colours are set, never one.  A program that changes only the foreground
+! still has to land on a readable background, and vice versa.
+XTerm*VT100*background:		black
+XTerm*VT100*foreground:		gray90
+XTerm*VT100*cursorColor:	gray90
+
+! Colour is on so the ANSI colour escapes programs emit mean something.
+XTerm*VT100*colorMode:		on
+XTerm*VT100*boldColors:		on
+XTerm*VT100*dynamicColors:	on
+
+! Scrollback.  A terminal without it loses everything that scrolls past, which
+! matters more here than usual: this is where build and boot output is read.
+XTerm*saveLines:		2048
+
+! Send-to-scrollback on output is off, so a program drawing a full-screen
+! display (top, tmux, nano) does not fill the scrollback with its redraws.
+XTerm*scrollTtyOutput:		false
+XTerm*scrollKey:		true

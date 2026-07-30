@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <stdio.h>    /* snprintf: fchdir builds a /dev/fd path */
 #include <errno.h>
 #include <limits.h>
 #include <sys/wait.h>
@@ -10,6 +11,8 @@
 #include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
+#include <fcntl.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <signal.h>
@@ -568,6 +571,83 @@ int ftruncate(int fd, off_t length)
 		errno = -ret;
 		return -1;
 	}
+	return 0;
+}
+
+/* truncate(): there is no path-based truncate syscall, so open the file for
+ * writing and use ftruncate().  The permission and existence errors surface
+ * from open() exactly as a direct syscall would report them. */
+/* creat(): the original way to make a file, kept because POSIX requires it and
+ * plenty of code still uses it.  It is exactly open() with the three flags
+ * that spell "create it, empty, for writing". */
+/* remove(): the C-standard way to delete a name, without the caller having to
+ * know whether it is a file or a directory.  unlink() refuses directories, so
+ * fall back to rmdir() for those. */
+int remove(const char *pathname)
+{
+	if (!pathname) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (unlink(pathname) == 0)
+		return 0;
+	if (errno == EISDIR || errno == EPERM)
+		return rmdir(pathname);
+	return -1;
+}
+
+int creat(const char *pathname, mode_t mode)
+{
+	return open(pathname, O_WRONLY | O_CREAT | O_TRUNC, mode);
+}
+
+int truncate(const char *path, off_t length)
+{
+	int fd, rc, saved;
+
+	if (!path) {
+		errno = EINVAL;
+		return -1;
+	}
+	fd = open(path, O_WRONLY);
+	if (fd < 0)
+		return -1;
+	rc = ftruncate(fd, length);
+	saved = errno;
+	close(fd);
+	if (rc < 0)
+		errno = saved;
+	return rc;
+}
+
+/* getpriority/setpriority: the scheduler has no nice level, so every process
+ * runs at the default priority 0.  Report that honestly and accept a request
+ * to change it without pretending to have applied one, rather than failing —
+ * callers that lower their own priority treat an error as fatal. */
+int getpriority(int which, id_t who)
+{
+	if (which != PRIO_PROCESS && which != PRIO_PGRP &&
+	    which != PRIO_USER) {
+		errno = EINVAL;
+		return -1;
+	}
+	(void)who;
+	errno = 0;
+	return 0;
+}
+
+int setpriority(int which, id_t who, int prio)
+{
+	if (which != PRIO_PROCESS && which != PRIO_PGRP &&
+	    which != PRIO_USER) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (prio < -20 || prio > 19) {
+		errno = EINVAL;
+		return -1;
+	}
+	(void)who;
 	return 0;
 }
 
@@ -1235,18 +1315,110 @@ unsigned long getauxval(unsigned long type)
 	return 0UL;
 }
 
-/* times: return process CPU-time accounting.
- * The kernel does not yet export fine-grained CPU accounting, so we
- * return zeroed tms fields and a monotonic tick count of 0. */
+/* setpgrp: put this process into its own process group.
+ *
+ * Equivalent to setpgid(0, 0), which is how POSIX defines it.  It exists as a
+ * separate name for historical reasons: BSD once had a two-argument
+ * setpgrp(pid, pgid), System V had this no-argument form, and POSIX settled on
+ * the System V one.  Code still reaches for it -- xterm calls it when handing
+ * a pty slave to a child -- and it costs one line to provide.
+ *
+ * Returns the new process-group ID (which is this process's own PID) on
+ * success, so callers do not need a second call to find out what it became. */
+pid_t setpgrp(void)
+{
+	if (setpgid(0, 0) != 0)
+		return -1;
+	return getpgrp();
+}
+
+/* fchdir: change the working directory to the one an open descriptor refers to.
+ *
+ * There is no fchdir syscall, so this goes through /dev/fd/N, which devfs
+ * publishes as a symlink to the descriptor's path.  Resolving that symlink and
+ * chdir()ing to its target is precisely what fchdir means, and it is the
+ * reason /dev/fd exists.
+ *
+ * The one way this differs from a real fchdir is that it re-resolves by NAME:
+ * if the directory has been renamed or replaced since the descriptor was
+ * opened, this follows the name to wherever it leads now, whereas a kernel
+ * fchdir would follow the descriptor to the original directory.  Programs use
+ * fchdir to return to a directory they are holding open, and the name is
+ * almost always still correct; the alternative -- not providing it at all --
+ * is worse.
+ *
+ * EBADF for a descriptor that is not open, ENOTDIR for one that is not a
+ * directory, both from the chdir() underneath. */
+int fchdir(int fd)
+{
+	char path[32];
+
+	if (fd < 0) {
+		errno = EBADF;
+		return -1;
+	}
+	snprintf(path, sizeof(path), "/dev/fd/%d", fd);
+	return chdir(path);
+}
+
+/* times: process CPU-time accounting, in clock ticks.
+ *
+ * The unit here is sysconf(_SC_CLK_TCK) ticks -- NOT the CLOCKS_PER_SEC that
+ * clock() counts in.  The two interfaces measure the same thing in different
+ * units, and mixing them up is the classic way to be off by a factor of ten
+ * thousand.
+ *
+ * The child fields stay zero: reaped children's times are not accumulated onto
+ * the parent.  wait4() reports each child's own usage as it is reaped, which is
+ * where those figures are available.
+ *
+ * The return value is elapsed real time since an arbitrary point in the past,
+ * as POSIX specifies -- callers use differences of it, never its absolute
+ * value. */
 clock_t times(struct tms *buf)
 {
+	struct rusage ru;
+	long hz = sysconf(_SC_CLK_TCK);
+	struct timespec now;
+
+	if (hz <= 0)
+		hz = 100;
+
 	if (buf) {
-		buf->tms_utime = 0;
-		buf->tms_stime = 0;
+		if (getrusage(RUSAGE_SELF, &ru) != 0)
+			return (clock_t)-1;
+		buf->tms_utime = (clock_t)(ru.ru_utime.tv_sec * hz +
+					   ru.ru_utime.tv_usec * hz / 1000000);
+		buf->tms_stime = (clock_t)(ru.ru_stime.tv_sec * hz +
+					   ru.ru_stime.tv_usec * hz / 1000000);
 		buf->tms_cutime = 0;
 		buf->tms_cstime = 0;
 	}
-	return 0;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+		return (clock_t)-1;
+	return (clock_t)(now.tv_sec * hz + now.tv_nsec / (1000000000L / hz));
+}
+
+/* clock: processor time consumed by this process, in CLOCKS_PER_SEC units.
+ *
+ * Built on CLOCK_PROCESS_CPUTIME_ID, which the kernel serves from the per-task
+ * user+system tick counters, so this really is CPU time and not elapsed time.
+ * Resolution is one timer tick, so a process that has run for less than a tick
+ * reads zero -- that is the sampling rate, not a failure, and callers that need
+ * finer granularity should measure a longer interval. */
+clock_t clock(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0)
+		return (clock_t)-1;
+
+	/* Scale to CLOCKS_PER_SEC (10^6): seconds up, nanoseconds down.  Doing
+	 * it in this order keeps the whole computation in integers without
+	 * overflowing until the process has used ~292,000 years of CPU. */
+	return (clock_t)(ts.tv_sec * (time_t)CLOCKS_PER_SEC +
+			 ts.tv_nsec / 1000);
 }
 
 /* syscall: variadic generic syscall entry point.

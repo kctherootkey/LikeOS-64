@@ -725,27 +725,114 @@ long labs(long n)
 	return n < 0 ? -n : n;
 }
 
+/* One sort serves both qsort() and qsort_r(): quicksort with a median-of-three
+ * pivot, recursing into the smaller side and looping on the larger so stack
+ * depth stays O(log n), and finishing short runs with insertion sort.  This
+ * replaced a bubble sort — directory and font-name lists routinely have
+ * thousands of entries, where O(n^2) is seconds rather than milliseconds. */
+static void sort_swap(char *a, char *b, size_t size)
+{
+	if (a == b)
+		return;
+	for (size_t k = 0; k < size; k++) {
+		char tmp = a[k];
+		a[k] = b[k];
+		b[k] = tmp;
+	}
+}
+
+typedef int (*sort_cmp_t)(const void *, const void *, void *);
+
+static int sort_call(sort_cmp_t cmp, const void *a, const void *b, void *arg)
+{
+	return cmp(a, b, arg);
+}
+
+static void sort_range(char *base, size_t nmemb, size_t size, sort_cmp_t cmp,
+		       void *arg)
+{
+	while (nmemb > 8) {
+		char *lo = base;
+		char *hi = base + (nmemb - 1) * size;
+		char *mid = base + (nmemb / 2) * size;
+		char *i, *j;
+		size_t left_n, right_n;
+
+		/* Median of three, parked at lo, so already-sorted and
+		 * reverse-sorted inputs do not degrade to O(n^2). */
+		if (sort_call(cmp, mid, lo, arg) < 0)
+			sort_swap(mid, lo, size);
+		if (sort_call(cmp, hi, mid, arg) < 0) {
+			sort_swap(hi, mid, size);
+			if (sort_call(cmp, mid, lo, arg) < 0)
+				sort_swap(mid, lo, size);
+		}
+		sort_swap(mid, lo, size);
+
+		i = lo;
+		j = hi + size;
+		for (;;) {
+			do {
+				i += size;
+			} while (i <= hi && sort_call(cmp, i, lo, arg) < 0);
+			do {
+				j -= size;
+			} while (sort_call(cmp, j, lo, arg) > 0);
+			if (i > j)
+				break;
+			sort_swap(i, j, size);
+		}
+		sort_swap(lo, j, size);
+
+		left_n = (size_t)((j - lo) / (long)size);
+		right_n = nmemb - left_n - 1;
+
+		/* Recurse into the smaller partition, iterate on the larger. */
+		if (left_n < right_n) {
+			sort_range(lo, left_n, size, cmp, arg);
+			base = j + size;
+			nmemb = right_n;
+		} else {
+			sort_range(j + size, right_n, size, cmp, arg);
+			nmemb = left_n;
+		}
+	}
+
+	/* Short tail: insertion sort. */
+	for (size_t k = 1; k < nmemb; k++) {
+		char *cur = base + k * size;
+		char *prev = cur - size;
+		while (cur > base && sort_call(cmp, prev, cur, arg) > 0) {
+			sort_swap(prev, cur, size);
+			cur = prev;
+			prev -= size;
+		}
+	}
+}
+
+/* Adapter so plain qsort() can share sort_range() without paying for an
+ * indirect call through a captured argument. */
+static int sort_plain_cmp(const void *a, const void *b, void *arg)
+{
+	int (*compar)(const void *, const void *) =
+		(int (*)(const void *, const void *))arg;
+	return compar(a, b);
+}
+
 void qsort(void *base, size_t nmemb, size_t size,
 	   int (*compar)(const void *, const void *))
 {
-	if (nmemb <= 1)
+	if (!base || !compar || size == 0 || nmemb <= 1)
 		return;
-	// Simple bubble sort for now
-	char *b = base;
-	for (size_t i = 0; i < nmemb - 1; i++) {
-		for (size_t j = 0; j < nmemb - i - 1; j++) {
-			void *p1 = b + j * size;
-			void *p2 = b + (j + 1) * size;
-			if (compar(p1, p2) > 0) {
-				// Swap
-				for (size_t k = 0; k < size; k++) {
-					char tmp = ((char *)p1)[k];
-					((char *)p1)[k] = ((char *)p2)[k];
-					((char *)p2)[k] = tmp;
-				}
-			}
-		}
-	}
+	sort_range((char *)base, nmemb, size, sort_plain_cmp, (void *)compar);
+}
+
+void qsort_r(void *base, size_t nmemb, size_t size,
+	     int (*compar)(const void *, const void *, void *), void *arg)
+{
+	if (!base || !compar || size == 0 || nmemb <= 1)
+		return;
+	sort_range((char *)base, nmemb, size, compar, arg);
 }
 
 void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
@@ -805,4 +892,47 @@ intmax_t strtoimax(const char *nptr, char **endptr, int base)
 uintmax_t strtoumax(const char *nptr, char **endptr, int base)
 {
 	return (uintmax_t)strtoull(nptr, endptr, base);
+}
+
+/* The remaining integer absolute-value and division functions.
+ *
+ * div()/ldiv()/lldiv() return quotient and remainder together because C's /
+ * and % are two separate operations that most processors compute at once —
+ * and because they are defined to truncate toward zero, which is the part
+ * callers get wrong when they hand-roll it for negative operands. */
+long long llabs(long long j)
+{
+	return j < 0 ? -j : j;
+}
+
+intmax_t imaxabs(intmax_t j)
+{
+	return j < 0 ? -j : j;
+}
+
+div_t div(int num, int den)
+{
+	div_t r;
+
+	r.quot = num / den;
+	r.rem = num % den;
+	return r;
+}
+
+ldiv_t ldiv(long num, long den)
+{
+	ldiv_t r;
+
+	r.quot = num / den;
+	r.rem = num % den;
+	return r;
+}
+
+lldiv_t lldiv(long long num, long long den)
+{
+	lldiv_t r;
+
+	r.quot = num / den;
+	r.rem = num % den;
+	return r;
 }

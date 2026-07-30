@@ -1,6 +1,8 @@
 #ifndef _FCNTL_H
 #define _FCNTL_H
 
+#include <sys/types.h>  /* mode_t, off_t */
+
 // File open flags
 #define O_RDONLY    0x0000
 #define O_WRONLY    0x0001
@@ -41,5 +43,6 @@
 // File access
 int open(const char* pathname, int flags, ...);
 int openat(int dirfd, const char* pathname, int flags, ...);
+int creat(const char* pathname, mode_t mode);
 
 #endif

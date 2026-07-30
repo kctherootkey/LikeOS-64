@@ -14,6 +14,15 @@ struct task;
 
 // ioctl entry for /dev/fb0 (FBIOGET_VSCREENINFO, FBIOGET_FSCREENINFO,
 // FBIOPUT_VSCREENINFO, FBIOBLANK).  argp is a raw user pointer.
+/* Open/close accounting for /dev/fb0.  The last close restores the console,
+ * which has been drawn over by whoever mapped the framebuffer. */
+/* True while another program has /dev/fb0 open, i.e. owns the display.  The
+ * console suppresses its own painting then; see fbdev.c. */
+int fbdev_display_owned(void);
+
+void fbdev_opened(void);
+void fbdev_closed(void);
+
 int fbdev_ioctl(unsigned long req, void *argp, struct task *cur);
 
 // Physical base of the visible framebuffer and its mappable size.

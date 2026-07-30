@@ -14,6 +14,13 @@
 // Maximum number of TSD keys (must match PTHREAD_KEYS_MAX)
 #define MAX_TSD_KEYS 128
 
+/* Bytes the dynamic loader reserves at and above the thread pointer for this
+ * structure.  The TCB lives INSIDE the TLS allocation so that %fs:0 is both
+ * the ABI self-pointer and the start of struct __pthread; see rtld_init_tls()
+ * in user/lib/rtld/rtld.c, where RTLD_TCB_RESERVE must hold the same value.
+ * A static assertion below fails the build if the structure outgrows it. */
+#define LIKEOS_TCB_RESERVE 2048
+
 // Thread states
 #define THREAD_STATE_RUNNING    0
 #define THREAD_STATE_EXITED     1
@@ -75,6 +82,22 @@ struct __pthread {
     // Padding to ensure alignment
     char _pad[32];
 };
+
+/* The loader reserves exactly LIKEOS_TCB_RESERVE bytes at the thread pointer
+ * for this structure.  If it ever outgrows that, threads would scribble past
+ * the end of their TLS allocation — fail the build instead. */
+_Static_assert(sizeof(struct __pthread) <= LIKEOS_TCB_RESERVE,
+	       "struct __pthread outgrew the loader's TCB reserve "
+	       "(raise RTLD_TCB_RESERVE in user/lib/rtld/rtld.c and "
+	       "LIKEOS_TCB_RESERVE here together)");
+
+/* %fs:0 is the self-pointer and %fs:0x28 the stack canary: both are fixed by
+ * the ABI and by compiler-generated code, so their offsets are not ours to
+ * change. */
+_Static_assert(__builtin_offsetof(struct __pthread, self) == 0,
+	       "self must be at offset 0 (%fs:0)");
+_Static_assert(__builtin_offsetof(struct __pthread, stack_guard) == 0x28,
+	       "stack_guard must be at offset 0x28 (%fs:0x28)");
 
 /* stack_guard must sit at exactly offset 0x28 so GCC's -fstack-protector
  * finds the canary via %fs:0x28.  Tighten the layout here if this fires. */

@@ -53,6 +53,25 @@ typedef uint64_t  uint_least64_t;
 #define INTPTR_MIN  INT64_MIN
 #define INTPTR_MAX  INT64_MAX
 #define UINTPTR_MAX UINT64_MAX
+
+/* C99 integer-constant macros: append the suffix that makes a literal have the
+ * named type.  They exist because there is no portable way to write, say, a
+ * 64-bit constant — "1" is an int, and the suffix differs per model.  Code
+ * that builds bit masks wider than int needs them, and without them the
+ * expression silently truncates. */
+#define INT8_C(c)   (c)
+#define INT16_C(c)  (c)
+#define INT32_C(c)  (c)
+#define INT64_C(c)  (c ## L)
+
+#define UINT8_C(c)  (c)
+#define UINT16_C(c) (c)
+#define UINT32_C(c) (c ## U)
+#define UINT64_C(c) (c ## UL)
+
+#define INTMAX_C(c)  INT64_C(c)
+#define UINTMAX_C(c) UINT64_C(c)
+
 #ifndef SIZE_MAX
 #define SIZE_MAX    UINT64_MAX
 #endif

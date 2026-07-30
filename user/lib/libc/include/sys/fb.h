@@ -8,7 +8,12 @@
 #ifndef _KERNEL_UAPI_FB_H_
 #define _KERNEL_UAPI_FB_H_
 
-#ifdef __LIKEOS__
+// Which half of the system is compiling this decides where the fixed-width
+// types come from: the kernel has its own, userspace has <stdint.h>.  The test
+// is __LIKEOS_KERNEL__ and NOT __LIKEOS__ -- the latter is true for userspace
+// as well (the port toolchain defines it), so keying on it sent every ported
+// program down the kernel path and it failed on an unreachable include.
+#ifdef __LIKEOS_KERNEL__
 #include <kernel/uapi/types.h>
 #else
 #include <stdint.h>
@@ -40,13 +45,43 @@
 #define FB_ACTIVATE_NOW  0
 #define FB_ACTIVATE_TEST 4
 
+// fb_var_screeninfo.sync -- polarity of the sync signals, and whether the
+// display is driven by a broadcast-video timing rather than a computer one.
+// Informational for virtual hardware, but a driver reads them back and hands
+// them to the X server's mode description, so the names have to exist.
+#define FB_SYNC_HOR_HIGH_ACT  1  // horizontal sync is active high
+#define FB_SYNC_VERT_HIGH_ACT 2  // vertical sync is active high
+#define FB_SYNC_EXT           4  // external sync
+#define FB_SYNC_COMP_HIGH_ACT 8  // composite sync is active high
+#define FB_SYNC_BROADCAST     16 // broadcast video timings
+#define FB_SYNC_ON_GREEN      32 // sync on green
+
 // fb_var_screeninfo.vmode
 #define FB_VMODE_NONINTERLACED 0
+#define FB_VMODE_INTERLACED    1 // interlaced
+#define FB_VMODE_DOUBLE        2 // double-scanned
+#define FB_VMODE_MASK          255
 
 // FBIOBLANK levels
 #define FB_BLANK_UNBLANK  0
 #define FB_BLANK_NORMAL	  1
 #define FB_BLANK_POWERDOWN 4
+
+// Palette, for FBIOGETCMAP / FBIOPUTCMAP.
+//
+// Only meaningful on a pseudocolor visual, where the pixel value is an index
+// into this table.  The framebuffers here are truecolor and the pixel value IS
+// the colour, so the ioctls are not implemented -- but a driver that supports
+// both asks, so the structure has to be describable.  Each array holds `len`
+// entries starting at `start`; transp may be NULL.
+struct fb_cmap {
+	uint32_t start; // first entry
+	uint32_t len; // number of entries
+	uint16_t *red; // values, or NULL
+	uint16_t *green;
+	uint16_t *blue;
+	uint16_t *transp;
+};
 
 struct fb_bitfield {
 	uint32_t offset; // beginning of bitfield

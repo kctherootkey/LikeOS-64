@@ -6,6 +6,7 @@
 #define _WCHAR_H
 
 #include <stddef.h>
+#include <bits/multibyte.h>
 #include <stdint.h>
 #include <stdarg.h>
 
@@ -65,42 +66,13 @@ static inline size_t wcrtomb(char *s, wchar_t wc, mbstate_t *ps)
     return 1;
 }
 
-static inline int mbtowc(wchar_t *pwc, const char *s, size_t n)
-{
-    if (!s) return 0;
-    if (n == 0) return -1;
-    if (pwc) *pwc = (wchar_t)(unsigned char)*s;
-    return (*s != '\0') ? 1 : 0;
-}
 
-static inline int wctomb(char *s, wchar_t wc)
-{
-    if (!s) return 0;
-    *s = (char)(wc & 0xFF);
-    return 1;
-}
 
-static inline size_t mbstowcs(wchar_t *dest, const char *src, size_t n)
-{
-    size_t i;
-    if (!src) return (size_t)-1;
-    for (i = 0; i < n && src[i]; i++) {
-        if (dest) dest[i] = (wchar_t)(unsigned char)src[i];
-    }
-    if (dest && i < n) dest[i] = 0;
-    return i;
-}
 
-static inline size_t wcstombs(char *dest, const wchar_t *src, size_t n)
-{
-    size_t i;
-    if (!src) return (size_t)-1;
-    for (i = 0; i < n && src[i]; i++) {
-        if (dest) dest[i] = (char)(src[i] & 0xFF);
-    }
-    if (dest && i < n) dest[i] = 0;
-    return i;
-}
+
+
+
+
 
 static inline int wcwidth(wchar_t wc)
 {
@@ -220,5 +192,116 @@ static inline size_t wcsrtombs(char *dest, const wchar_t **src, size_t len, mbst
 #ifdef __cplusplus
 }
 #endif
+
+
+/* The rest of the wide-character string interface.  These mirror their <string.h>
+ * counterparts exactly, operating on wchar_t units rather than bytes, and are
+ * defined here as inlines for the same reason the existing ones are: they are
+ * short, and a caller that includes this header should not need a library
+ * symbol for a two-line loop. */
+static inline wchar_t *wcsncpy(wchar_t *d, const wchar_t *s, size_t n)
+{
+    size_t i = 0;
+    for (; i < n && s[i]; i++) d[i] = s[i];
+    for (; i < n; i++) d[i] = 0;          /* pad, per the standard */
+    return d;
+}
+
+static inline wchar_t *wcscat(wchar_t *d, const wchar_t *s)
+{
+    wchar_t *p = d;
+    while (*p) p++;
+    while ((*p++ = *s++)) ;
+    return d;
+}
+
+static inline wchar_t *wcsncat(wchar_t *d, const wchar_t *s, size_t n)
+{
+    wchar_t *p = d;
+    while (*p) p++;
+    while (n-- && *s) *p++ = *s++;
+    *p = 0;                                /* always terminated, unlike wcsncpy */
+    return d;
+}
+
+static inline wchar_t *wcsstr(const wchar_t *h, const wchar_t *nd)
+{
+    if (!*nd) return (wchar_t *)h;
+    for (; *h; h++) {
+        const wchar_t *a = h, *b = nd;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b) return (wchar_t *)h;
+    }
+    return 0;
+}
+
+static inline size_t wcsspn(const wchar_t *s, const wchar_t *set)
+{
+    size_t n = 0;
+    for (; s[n]; n++) {
+        const wchar_t *p = set;
+        while (*p && *p != s[n]) p++;
+        if (!*p) break;
+    }
+    return n;
+}
+
+static inline size_t wcscspn(const wchar_t *s, const wchar_t *set)
+{
+    size_t n = 0;
+    for (; s[n]; n++) {
+        const wchar_t *p = set;
+        while (*p && *p != s[n]) p++;
+        if (*p) break;
+    }
+    return n;
+}
+
+static inline wchar_t *wcspbrk(const wchar_t *s, const wchar_t *set)
+{
+    s += wcscspn(s, set);
+    return *s ? (wchar_t *)s : 0;
+}
+
+/* Reentrant: the caller owns the cursor, as with strtok_r. */
+static inline wchar_t *wcstok(wchar_t *s, const wchar_t *sep, wchar_t **save)
+{
+    wchar_t *tok;
+    if (!save) return 0;
+    if (!s) s = *save;
+    if (!s) return 0;
+    s += wcsspn(s, sep);
+    if (!*s) { *save = 0; return 0; }
+    tok = s;
+    s += wcscspn(s, sep);
+    if (*s) { *s = 0; *save = s + 1; } else { *save = 0; }
+    return tok;
+}
+
+static inline wchar_t *wmemcpy(wchar_t *d, const wchar_t *s, size_t n)
+{
+    for (size_t i = 0; i < n; i++) d[i] = s[i];
+    return d;
+}
+
+static inline wchar_t *wmemmove(wchar_t *d, const wchar_t *s, size_t n)
+{
+    if (d < s) { for (size_t i = 0; i < n; i++) d[i] = s[i]; }
+    else { while (n--) d[n] = s[n]; }      /* overlapping: copy backwards */
+    return d;
+}
+
+static inline wchar_t *wmemset(wchar_t *d, wchar_t c, size_t n)
+{
+    for (size_t i = 0; i < n; i++) d[i] = c;
+    return d;
+}
+
+static inline int wmemcmp(const wchar_t *a, const wchar_t *b, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+    return 0;
+}
 
 #endif /* _WCHAR_H */

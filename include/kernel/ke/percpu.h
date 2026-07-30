@@ -49,6 +49,26 @@ struct percpu {
 	// Must stay at offset 104; seeded uniquely per CPU in percpu_init*().
 	uint64_t stack_canary; // GS:104
 
+	/* The rest of the user's register set, saved for sigreturn.
+	 *
+	 * A syscall return does not need these -- the ABI lets a syscall clobber
+	 * them -- which is why only the callee-saved ones are above.  A SIGNAL
+	 * return does: a signal can interrupt user code at any instruction, where
+	 * every register is live.  Returning without them corrupts the
+	 * interrupted program silently and at random; xterm crashed calling
+	 * VTRun(NULL) because RDI was wiped between the compare and the call.
+	 *
+	 * Placed after stack_canary so that everything the assembly addresses by
+	 * a fixed offset (all of it at GS:0..104) keeps its offset. */
+	uint64_t syscall_saved_user_rdi; // GS:112
+	uint64_t syscall_saved_user_rsi; // GS:120
+	uint64_t syscall_saved_user_rdx; // GS:128
+	uint64_t syscall_saved_user_rcx; // GS:136
+	uint64_t syscall_saved_user_r8; // GS:144
+	uint64_t syscall_saved_user_r9; // GS:152
+	uint64_t syscall_saved_user_r10; // GS:160
+	uint64_t syscall_saved_user_r11; // GS:168
+
 	// CPU identification
 	uint32_t cpu_id; // Logical CPU index (0 = BSP)
 	uint32_t apic_id; // LAPIC APIC ID
@@ -104,7 +124,7 @@ struct percpu {
 	int current_syscall_nr;
 
 	// Padding to ensure page alignment and cache line separation
-	uint8_t padding[PERCPU_SIZE - 252]; // +8 for stack_canary at GS:104
+	uint8_t padding[PERCPU_SIZE - 316]; // +64 for the sigreturn register block
 } __attribute__((aligned(64)));
 
 typedef struct percpu percpu_t;
@@ -140,6 +160,25 @@ _Static_assert(__builtin_offsetof(percpu_t, syscall_signal_pending) == 96,
 _Static_assert(
 	__builtin_offsetof(percpu_t, stack_canary) == 104,
 	"percpu: stack_canary must be at GS:104 for -mstack-protector-guard-offset=104");
+
+/* The sigreturn register block.  The assembly addresses these by offset, so a
+ * field inserted above would silently restore the wrong register. */
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_rdi) == 112,
+	       "percpu: syscall_saved_user_rdi must be at GS:112");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_rsi) == 120,
+	       "percpu: syscall_saved_user_rsi must be at GS:120");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_rdx) == 128,
+	       "percpu: syscall_saved_user_rdx must be at GS:128");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_rcx) == 136,
+	       "percpu: syscall_saved_user_rcx must be at GS:136");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_r8) == 144,
+	       "percpu: syscall_saved_user_r8 must be at GS:144");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_r9) == 152,
+	       "percpu: syscall_saved_user_r9 must be at GS:152");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_r10) == 160,
+	       "percpu: syscall_saved_user_r10 must be at GS:160");
+_Static_assert(__builtin_offsetof(percpu_t, syscall_saved_user_r11) == 168,
+	       "percpu: syscall_saved_user_r11 must be at GS:168");
 
 // ============================================================================
 // Per-CPU Access Macros

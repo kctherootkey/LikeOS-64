@@ -1,0 +1,140 @@
+EXPR(1)                          User Commands                         EXPR(1)
+
+NAME
+       expr - evaluate an expression and print the result
+
+SYNOPSIS
+       expr EXPRESSION
+       expr OPTION
+
+DESCRIPTION
+       Evaluate EXPRESSION and write the result to standard output.
+
+       EXPRESSION arrives as separate arguments, not as one string: the shell
+       has already split it.  Every operator must therefore be separated by
+       whitespace and, where the shell would otherwise claim it, quoted -- \*
+       for multiplication, \| for or, \( \) for grouping.
+
+       The exit status is inverted relative to the value.  It is 0 when the
+       result is neither an empty string nor the number zero, and 1 when it
+       is, which is what makes expr usable directly in an if.
+
+OPTIONS
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+OPERATORS
+       Listed from loosest to tightest binding.  Operators of equal
+       precedence group left to right.
+
+       ARG1 | ARG2
+              ARG1 if it is neither null nor 0, otherwise ARG2
+
+       ARG1 & ARG2
+              ARG1 if neither argument is null or 0, otherwise 0
+
+       ARG1 < ARG2,  ARG1 <= ARG2,  ARG1 = ARG2,
+       ARG1 != ARG2, ARG1 >= ARG2,  ARG1 > ARG2
+              1 if the comparison holds, 0 if not.  The comparison is
+              numeric when BOTH arguments are integers and lexical
+              otherwise, so `expr 10 '>' 9` is 1 but `expr 10 '>' 9a`
+              compares the strings and is 0.
+
+       ARG1 + ARG2,  ARG1 - ARG2
+              arithmetic sum and difference
+
+       ARG1 * ARG2,  ARG1 / ARG2,  ARG1 % ARG2
+              arithmetic product, quotient and remainder.  Division by zero
+              is an error, not zero.
+
+       STRING : REGEXP
+              anchored pattern match; see PATTERN MATCHING below
+
+       match STRING REGEXP
+              the same as STRING : REGEXP, written as a function
+
+       substr STRING POSITION LENGTH
+              the substring of STRING of at most LENGTH characters starting
+              at POSITION, counting from 1.  A position or length outside the
+              string yields the empty string rather than an error.
+
+       index STRING CHARS
+              the 1-based position in STRING of the first character that
+              appears anywhere in CHARS, or 0 if none does
+
+       length STRING
+              the number of characters in STRING
+
+       + TOKEN
+              TOKEN as a string, even when it is also an operator name.  This
+              is the only way to compare against a literal "match", "index",
+              "substr" or "length".
+
+       ( EXPRESSION )
+              grouping
+
+PATTERN MATCHING
+       The : operator matches REGEXP -- a basic regular expression -- against
+       STRING, anchored at the start of STRING whether or not the pattern
+       begins with ^.
+
+       What it yields depends on whether the pattern contains a \( \) group:
+
+       o      with a group, the text that group matched, or the empty string
+              if the match failed
+
+       o      without a group, the NUMBER of characters matched, or 0 if the
+              match failed
+
+       The two failure values differ, which is what lets a caller tell "the
+       pattern did not match" from "the group matched nothing".
+
+EXIT STATUS
+       0      EXPRESSION is neither null nor 0
+
+       1      EXPRESSION is null or 0
+
+       2      EXPRESSION is syntactically invalid
+
+       3      an error occurred
+
+EXAMPLES
+       Arithmetic -- note the quoting of *:
+
+              expr 6 '*' 7                       ->  42
+              expr '(' 1 + 2 ')' '*' 3           ->  9
+
+       Test whether a terminal name is a virtual console.  This is the exact
+       idiom startx(1) uses, and it relies on the exit status rather than the
+       output:
+
+              if expr "$t" : '/dev/tty[0-9][0-9]*$' > /dev/null; then
+                      echo "virtual console"
+              fi
+
+       Extract part of a string with a group:
+
+              expr /usr/local/bin : '/usr/\(.*\)'   ->  local/bin
+
+       Count characters matched, with no group:
+
+              expr abcdef : 'abc'                ->  3
+
+       String functions:
+
+              expr length abcdef                 ->  6
+              expr substr abcdef 2 3             ->  bcd
+              expr index abcdef cd               ->  3
+
+NOTES
+       Neither | nor & short-circuits: both sides are always evaluated, so a
+       syntax error on the right is reported even when the left already
+       decides the result.
+
+       An argument is treated as a number only when the whole of it is an
+       integer.  "12abc" is a string; "  12  " is the number 12.
+
+SEE ALSO
+       test(1), tty(1), sed(1)

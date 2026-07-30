@@ -1022,7 +1022,11 @@ int vfs_truncate(vfs_file_t *f, unsigned long size)
 }
 int vfs_unlink(const char *path)
 {
-	if (!g_root_ops || !g_root_ops->unlink)
+	/* Dispatch by path, not to the root filesystem: /dev/shm names live in
+	 * devfs, and sending their unlink to ext4 would report ENOENT for an
+	 * object that plainly exists. */
+	const vfs_ops_t *ops = vfs_ops_for_path(path);
+	if (!ops || !ops->unlink)
 		return ST_UNSUPPORTED;
 	int pr = vfs_permission_remove(path);
 	if (pr != ST_OK)
@@ -1031,7 +1035,7 @@ int vfs_unlink(const char *path)
 	if (im != ST_OK)
 		return im;
 	vfs_meta_bump();
-	return g_root_ops->unlink(path);
+	return ops->unlink(path);
 }
 int vfs_rename(const char *oldpath, const char *newpath)
 {
@@ -1051,6 +1055,20 @@ int vfs_rename(const char *oldpath, const char *newpath)
 	vfs_meta_bump();
 	return g_root_ops->rename(oldpath, newpath);
 }
+/* Create a socket or FIFO node.  Same permission rule as creating any other
+ * name: write+search on the containing directory.  The caller is expected to
+ * have already applied its umask to `mode`. */
+int vfs_mknod(const char *path, unsigned int mode)
+{
+	if (!g_root_ops || !g_root_ops->mknod)
+		return ST_UNSUPPORTED;
+	int pr = vfs_permission_parent(path, MAY_WRITE | MAY_EXEC);
+	if (pr != ST_OK)
+		return pr;
+	vfs_meta_bump();
+	return g_root_ops->mknod(path, mode);
+}
+
 int vfs_mkdir(const char *path, unsigned int mode)
 {
 	if (!g_root_ops || !g_root_ops->mkdir)

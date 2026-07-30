@@ -19,6 +19,7 @@
 #include <kernel/ke/sched.h>
 #include <kernel/io/tty.h>
 #include <kernel/fs/devfs.h>
+#include <kernel/mm/shm.h>
 #include <kernel/hal/acpi.h>
 #include <kernel/ke/percpu.h>
 #include <kernel/ke/smp.h>
@@ -138,6 +139,10 @@ __no_stack_protector void continue_system_startup(void)
 	pci_assign_unassigned_bars();
 
 	vfs_init();
+	/* Before devfs, which exposes the shared memory namespace as /dev/shm.
+	 * Initialising it here rather than lazily on first use avoids two CPUs
+	 * racing to set up the table. */
+	shm_init();
 	devfs_init();
 	vfs_register_devfs(devfs_get_ops());
 	tty_init();

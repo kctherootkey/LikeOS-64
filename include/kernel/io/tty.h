@@ -50,7 +50,11 @@ typedef unsigned int speed_t;
 #define TIOCGWINSZ 0x5413
 #define TIOCSWINSZ 0x5414
 #define TIOCGPTN 0x80045430
-#define TIOCSGUARD 0x5420
+/* LikeOS-private: arm the shell's console prompt guard.  Deliberately
+ * outside the conventional 0x54xx tty range — it previously sat on
+ * 0x5420, which is TIOCPKT (pty packet mode), so any program enabling
+ * packet mode on a pty master silently landed in the guard path. */
+#define TIOCSGUARD 0x4C4B0001
 
 struct winsize {
 	uint16_t ws_row;
@@ -72,6 +76,10 @@ typedef struct tty {
 	int is_pty;
 	int is_master;
 	int fg_pgid;
+	/* Session that owns this terminal, or 0 if none does.  A terminal may be
+	 * the controlling terminal of exactly one session, which is what stops a
+	 * second session from stealing it by opening the device. */
+	int sid;
 	termios_k_t term;
 	struct winsize winsz;
 

@@ -56,6 +56,15 @@ extern int errno;
 #define EBADMSG        74  /* Not a data message */
 #define EOVERFLOW      75  /* Value too large for defined data type */
 #define EILSEQ         84  /* Illegal byte sequence */
+/* Never returned by this kernel.
+ *
+ * ERESTART is an internal marker meaning "restart this system call", used
+ * between a signal handler and the syscall return path; it is not supposed to
+ * reach userspace on any system.  It is defined here because portable code
+ * tests for it anyway, defensively, alongside EINTR -- X.Org's fbdevhw retries
+ * an interrupted FBIOBLANK on `case EINTR: case ERESTART:` and does not build
+ * without the name.  The arm is simply never taken here. */
+#define ERESTART       85  /* Interrupted system call should be restarted */
 #define ENOTSOCK       88  /* Socket operation on non-socket */
 #define EDESTADDRREQ   89  /* Destination address required */
 #define EMSGSIZE       90  /* Message too long */
@@ -64,6 +73,12 @@ extern int errno;
 #define EPROTONOSUPPORT 93 /* Protocol not supported */
 #define ESOCKTNOSUPPORT 94 /* Socket type not supported */
 #define EOPNOTSUPP     95  /* Operation not supported on transport endpoint */
+/* POSIX names this error ENOTSUP and the sockets interfaces name it
+ * EOPNOTSUPP.  They are permitted to be the same value and on every system
+ * that matters they are, so code that tests for one catches the other.
+ * Portable software uses ENOTSUP freely; without it the build fails on a name
+ * that was simply never spelled out here. */
+#define ENOTSUP        EOPNOTSUPP
 #define EPFNOSUPPORT   96  /* Protocol family not supported */
 #define EAFNOSUPPORT   97  /* Address family not supported */
 #define EADDRINUSE     98  /* Address already in use */

@@ -1,5 +1,6 @@
 // LikeOS-64 - devfs (device filesystem)
 #include <kernel/fs/devfs.h>
+#include <kernel/mm/shm.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
 #include <kernel/ke/syscall.h>
@@ -23,7 +24,9 @@
 #define DEVFS_TYPE_INPUT_DIR 11
 #define DEVFS_TYPE_EVDEV 12 /* /dev/input/eventN; unit in evdev_id */
 #define DEVFS_TYPE_FD_DIR 13 /* /dev/fd: the caller's own descriptors */
-#define DEVFS_TYPE_MAX DEVFS_TYPE_FD_DIR
+#define DEVFS_TYPE_SHM_DIR 14 /* /dev/shm: POSIX shared memory namespace  */
+#define DEVFS_TYPE_SHM 15 /* /dev/shm/<name>; object in `shm`        */
+#define DEVFS_TYPE_MAX DEVFS_TYPE_SHM
 
 /* Device-node group owners; values must match /etc/group on the root fs. */
 #define DEVFS_GID_TTY 5
@@ -38,6 +41,7 @@ typedef struct {
 	unsigned dir_pos;
 	uint64_t fpos; // byte position (framebuffer device)
 	int evdev_id; // input device unit (DEVFS_TYPE_EVDEV)
+	shm_object_t *shm; // shared memory object (DEVFS_TYPE_SHM)
 	/* The name this handle was opened under.  Several device paths share
 	 * one type (/dev/tty, /dev/console and /dev/tty0 are all DEVFS_TYPE_TTY),
 	 * so the type alone cannot say which node a descriptor refers to — and
@@ -46,6 +50,14 @@ typedef struct {
 } devfs_file_t;
 
 static vfs_ops_t g_devfs_ops;
+
+/* ftruncate() on a shared memory object sets how much memory it holds; this is
+ * how a process decides the size of a region before mapping it.  No other
+ * device node has a length to set. */
+static int devfs_truncate(vfs_file_t *f, unsigned long size);
+/* unlink() removes a name from /dev/shm.  Anything already holding the object
+ * keeps working — see shm_unlink_name(). */
+static int devfs_unlink(const char *path);
 
 static int is_path(const char *path, const char *match)
 {
@@ -104,8 +116,8 @@ int devfs_init(void)
 	g_devfs_ops.write = devfs_write;
 	g_devfs_ops.seek = devfs_seek;
 	g_devfs_ops.readdir = devfs_readdir;
-	g_devfs_ops.truncate = NULL;
-	g_devfs_ops.unlink = NULL;
+	g_devfs_ops.truncate = devfs_truncate;
+	g_devfs_ops.unlink = devfs_unlink;
 	g_devfs_ops.rename = NULL;
 	g_devfs_ops.mkdir = NULL;
 	g_devfs_ops.rmdir = NULL;
@@ -204,7 +216,6 @@ static int devfs_open_pty_slave(int id, vfs_file_t **out)
 static int devfs_open_impl(const char *path, int flags, vfs_file_t **out,
 			   task_t *cur)
 {
-	(void)flags;
 	if (!path || !out)
 		return ST_INVALID;
 
@@ -219,6 +230,88 @@ static int devfs_open_impl(const char *path, int flags, vfs_file_t **out,
 	 * turns opening one into a dup - see devfs_fd_alias_target). */
 	if (is_path(path, "/dev/fd") || is_path(path, "/dev/fd/")) {
 		return devfs_open_dir(DEVFS_TYPE_FD_DIR, out);
+	}
+
+	/* POSIX shared memory lives under /dev/shm.  Routing it through devfs
+	 * means a handle on an object is an ordinary vfs_file, so dup, fork,
+	 * exec, close refcounting, fstat, ftruncate and descriptor passing all
+	 * work already instead of each needing a special case. */
+	if (is_path(path, "/dev/shm") || is_path(path, "/dev/shm/")) {
+		return devfs_open_dir(DEVFS_TYPE_SHM_DIR, out);
+	}
+	if (is_prefix(path, "/dev/shm/")) {
+		const char *nm = path + 9;
+		shm_object_t *obj;
+		devfs_file_t *df;
+
+		if (!*nm)
+			return ST_INVALID;
+		/* A name is a single component: nothing here is a directory. */
+		for (const char *q = nm; *q; q++)
+			if (*q == '/')
+				return ST_INVALID;
+
+		obj = shm_lookup_get(nm);
+		if (!obj) {
+			if (!(flags & O_CREAT))
+				return ST_NOT_FOUND;
+			obj = shm_create_get(nm, 0600);
+			if (!obj)
+				return ST_NOMEM;
+		} else if ((flags & O_CREAT) && (flags & O_EXCL)) {
+			shm_put(obj);
+			return ST_EXISTS;
+		}
+
+		df = devfs_alloc_file();
+		if (!df) {
+			shm_put(obj);
+			return ST_NOMEM;
+		}
+		df->type = DEVFS_TYPE_SHM;
+		df->shm = obj;
+		df->fpos = 0;
+		*out = &df->vfs;
+		return ST_OK;
+	}
+
+	/* Opening a terminal makes it this process's CONTROLLING terminal, when
+	 * all of the conventional conditions hold: the caller leads its own
+	 * session, has no controlling terminal yet, did not pass O_NOCTTY, and
+	 * the terminal does not already belong to another session.
+	 *
+	 * Programs rely on this rather than on TIOCSCTTY, which is a BSD
+	 * extension they only reach for on platforms known to need it.  xterm is
+	 * one: its child calls setsid(), opens the pts slave, and expects the
+	 * open to have done this.  Without it the child kept NO controlling
+	 * terminal, so /dev/tty resolved to the fallback -- the console -- and
+	 * anything that deliberately talks to the terminal rather than to stdout
+	 * went to the wrong screen.  ssh's "Are you sure you want to continue
+	 * connecting" prompt appeared on the system console while the user sat
+	 * in front of an xterm waiting for it. */
+	if (cur && !(flags & O_NOCTTY) && cur->ctty == NULL &&
+	    cur->sid == (int)cur->id) {
+		tty_t *cand = NULL;
+		if (is_prefix(path, "/dev/pts/")) {
+			int pid = 0;
+			const char *q = path + 9;
+			if (*q) {
+				for (; *q >= '0' && *q <= '9'; q++)
+					pid = pid * 10 + (*q - '0');
+				if (!*q)
+					cand = tty_get_pty_slave(pid);
+			}
+		} else if (is_path(path, "/dev/console") ||
+			   is_path(path, "/dev/tty0")) {
+			cand = tty_get_console();
+		}
+		/* sid 0 means unclaimed; re-claiming our own session is a no-op. */
+		if (cand && (cand->sid == 0 || cand->sid == cur->sid)) {
+			cur->ctty = cand;
+			cand->sid = cur->sid;
+			if (cur->pgid > 0)
+				cand->fg_pgid = cur->pgid;
+		}
 	}
 
 	if (is_path(path, "/dev/tty") && cur) {
@@ -271,6 +364,7 @@ static int devfs_open_impl(const char *path, int flags, vfs_file_t **out,
 		if (!df)
 			return ST_NOMEM;
 		df->type = DEVFS_TYPE_FB0;
+		fbdev_opened();
 		*out = &df->vfs;
 		return ST_OK;
 	}
@@ -397,6 +491,38 @@ int devfs_stat(const char *path, struct kstat *st)
 		return ST_INVALID;
 	mm_memset(st, 0, sizeof(*st));
 	uint64_t now = timer_get_epoch(); /* real wall-clock seconds */
+	/* The shared memory namespace: world-writable and sticky like /tmp, so
+	 * any user can create an object but only its owner can remove it. */
+	if (is_path(path, "/dev/shm") || is_path(path, "/dev/shm/")) {
+		st->st_mode = S_IFDIR | 01777;
+		st->st_nlink = 1;
+		st->st_atime = now;
+		st->st_mtime = now;
+		st->st_ctime = now;
+		return ST_OK;
+	}
+	/* An individual object: a regular file whose length is how much memory
+	 * it holds.  Without this, stat() on the path failed outright and the
+	 * objects were invisible to anything that looks before it opens. */
+	if (is_prefix(path, "/dev/shm/")) {
+		shm_object_t *o = shm_lookup_get(path + 9);
+		if (!o)
+			return ST_NOT_FOUND;
+		st->st_mode = S_IFREG | (o->mode & 0777);
+		st->st_uid = o->uid;
+		st->st_gid = o->gid;
+		st->st_ino = o->ino;
+		st->st_nlink = 1;
+		st->st_size = (long)o->size;
+		st->st_blksize = 4096;
+		st->st_blocks = (long)(o->npages * 8);
+		st->st_atime = now;
+		st->st_mtime = now;
+		st->st_ctime = now;
+		shm_put(o);
+		return ST_OK;
+	}
+
 	if (is_path(path, "/dev") || is_path(path, "/dev/") ||
 	    is_path(path, "/dev/pts") || is_path(path, "/dev/pts/") ||
 	    is_path(path, "/dev/fd") || is_path(path, "/dev/fd/") ||
@@ -463,7 +589,8 @@ int devfs_chdir(const char *path)
 	if (is_path(path, "/dev") || is_path(path, "/dev/") ||
 	    is_path(path, "/dev/pts") || is_path(path, "/dev/pts/") ||
 	    is_path(path, "/dev/fd") || is_path(path, "/dev/fd/") ||
-	    is_path(path, "/dev/input") || is_path(path, "/dev/input/")) {
+	    is_path(path, "/dev/input") || is_path(path, "/dev/input/") ||
+	    is_path(path, "/dev/shm") || is_path(path, "/dev/shm/")) {
 		return ST_OK;
 	}
 	return ST_NOT_FOUND;
@@ -639,7 +766,8 @@ long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
 	if (!df)
 		return -EINVAL;
 	if (df->type != DEVFS_TYPE_DIR && df->type != DEVFS_TYPE_PTS_DIR &&
-	    df->type != DEVFS_TYPE_INPUT_DIR && df->type != DEVFS_TYPE_FD_DIR) {
+	    df->type != DEVFS_TYPE_INPUT_DIR && df->type != DEVFS_TYPE_FD_DIR &&
+	    df->type != DEVFS_TYPE_SHM_DIR) {
 		return -ENOTDIR;
 	}
 	if (df->dir_pos) {
@@ -689,6 +817,17 @@ long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
 				     "stdout", 14, 10);
 		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
 				     "stderr", 15, 10);
+		devfs_write_dirent64((char *)buf, (unsigned)bytes, &out_off,
+				     "shm", 16, 4);
+		df->dir_pos = 1;
+		return (long)out_off;
+	}
+	/* /dev/shm: one entry per live shared memory object. */
+	if (df->type == DEVFS_TYPE_SHM_DIR) {
+		char nm[SHM_NAME_MAX];
+		for (unsigned i = 0; shm_enumerate(i, nm, sizeof(nm)); i++)
+			devfs_write_dirent64((char *)buf, (unsigned)bytes,
+					     &out_off, nm, 300 + i, 8 /*DT_REG*/);
 		df->dir_pos = 1;
 		return (long)out_off;
 	}
@@ -758,6 +897,60 @@ long devfs_readdir(vfs_file_t *f, void *buf, long bytes)
 	return (long)out_off;
 }
 
+/* The shm layer speaks negative errnos internally; the VFS op contract is in
+ * status_t.  The two overlap numerically without meaning the same thing —
+ * -ENOENT is -2, which as a status_t is ST_UNSUPPORTED — so a value crossing
+ * this boundary untranslated surfaces as a completely unrelated error. */
+static int devfs_shm_status(int rc)
+{
+	switch (rc) {
+	case 0:
+		return ST_OK;
+	case -ENOENT:
+		return ST_NOT_FOUND;
+	case -EEXIST:
+		return ST_EXISTS;
+	case -ENOMEM:
+		return ST_NOMEM;
+	case -EBUSY:
+		return ST_BUSY;
+	case -EINVAL:
+	default:
+		return ST_INVALID;
+	}
+}
+
+static int devfs_truncate(vfs_file_t *f, unsigned long size)
+{
+	devfs_file_t *df;
+
+	if (!f || f->ops != &g_devfs_ops)
+		return ST_INVALID;
+	df = (devfs_file_t *)f->fs_private;
+	if (!df || df->type != DEVFS_TYPE_SHM || !df->shm)
+		return ST_INVALID; /* no other device node has a settable length */
+	return devfs_shm_status(shm_set_size(df->shm, size));
+}
+
+static int devfs_unlink(const char *path)
+{
+	const char *nm;
+
+	if (!path)
+		return ST_INVALID;
+	/* Only the shared memory namespace has removable names; every other
+	 * /dev node is owned by a driver. */
+	if (!is_prefix(path, "/dev/shm/"))
+		return ST_PERM;
+	nm = path + 9;
+	if (!*nm)
+		return ST_INVALID;
+	for (const char *q = nm; *q; q++)
+		if (*q == '/')
+			return ST_INVALID;
+	return devfs_shm_status(shm_unlink_name(nm));
+}
+
 int devfs_close(vfs_file_t *f)
 {
 	if (!f)
@@ -772,16 +965,41 @@ int devfs_close(vfs_file_t *f)
 				0); /* PTY slave close with negative pty_id: state corruption */
 			tty_pty_slave_close(df->pty_id);
 		} else if (df->type == DEVFS_TYPE_EVDEV) {
-			/* Auto-release an exclusive grab held through this
-			 * handle (covers process exit without EVIOCGRAB(0)). */
-			task_t *cur = sched_current();
-			if (cur)
-				evdev_release_grab_for(df->evdev_id, cur->id);
+			/* Release an exclusive grab held through THIS handle.
+			 * Keyed on the handle, not on the closing task: a
+			 * descriptor is not always closed by the task that
+			 * opened it, and matching on the task left the grab in
+			 * place -- which suppressed every pointer event from
+			 * then on. */
+			evdev_release_grab_by_owner(df->evdev_id, f);
+		} else if (df->type == DEVFS_TYPE_FB0) {
+			/* On the last close, put the console back on screen:
+			 * whoever had the framebuffer mapped has been drawing
+			 * over it, and with no virtual terminals there is no
+			 * other point at which the console would be redrawn. */
+			fbdev_closed();
+		} else if (df->type == DEVFS_TYPE_SHM) {
+			/* Drops this handle's reference; an already-unlinked
+			 * object releases its pages when the last one goes. */
+			shm_put(df->shm);
+			df->shm = NULL;
 		}
 		kfree(df);
 	}
 	return ST_OK;
 }
+
+/* FIONBIO: the ioctl spelling of fcntl(F_SETFL, O_NONBLOCK).
+ *
+ * It is a property of the DESCRIPTOR, not of the device behind it, so it is
+ * handled here for every device rather than in each driver -- the tty layer
+ * does not even receive the vfs_file_t whose flags it would have to change.
+ *
+ * Not optional: programs pick one spelling or the other by #ifdef and cannot
+ * fall back at runtime.  xterm uses this one on its pty master, and without it
+ * exits at startup with "Reason: main: ioctl() failed on FIONBIO" -- an error
+ * about a call that simply was not implemented. */
+#define DEVFS_FIONBIO 0x5421UL
 
 int devfs_ioctl(vfs_file_t *f, unsigned long req, void *argp, task_t *cur)
 {
@@ -790,6 +1008,21 @@ int devfs_ioctl(vfs_file_t *f, unsigned long req, void *argp, task_t *cur)
 	devfs_file_t *df = (devfs_file_t *)f->fs_private;
 	if (!df)
 		return -ENOTTY;
+
+	if (req == DEVFS_FIONBIO) {
+		int on;
+
+		if (!argp)
+			return -EFAULT;
+		smap_disable();
+		on = *(const int *)argp;
+		smap_enable();
+		if (on)
+			f->flags |= O_NONBLOCK;
+		else
+			f->flags &= ~O_NONBLOCK;
+		return 0;
+	}
 	if (df->type == DEVFS_TYPE_TTY || df->type == DEVFS_TYPE_PTY_SLAVE) {
 		return tty_ioctl(df->tty, req, argp, cur);
 	}
@@ -814,7 +1047,7 @@ int devfs_ioctl(vfs_file_t *f, unsigned long req, void *argp, task_t *cur)
 		return fbdev_ioctl(req, argp, cur);
 	}
 	if (df->type == DEVFS_TYPE_EVDEV) {
-		return evdev_ioctl(df->evdev_id, req, argp, cur);
+		return evdev_ioctl(df->evdev_id, req, argp, cur, f);
 	}
 	return -ENOTTY;
 }
@@ -880,6 +1113,29 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st)
 		st->st_nlink = 1;
 		st->st_size = 0;
 		return 0;
+	case DEVFS_TYPE_SHM_DIR:
+		/* World-writable and sticky, like /tmp: any user may create an
+		 * object, but only its owner may remove it. */
+		st->st_mode = S_IFDIR | 01777;
+		st->st_nlink = 1;
+		st->st_size = 0;
+		return 0;
+	case DEVFS_TYPE_SHM:
+		/* A shared memory object is a regular file as far as callers
+		 * are concerned — ftruncate sets its length and fstat reports
+		 * it, which is exactly how a client learns how much was
+		 * shared with it. */
+		if (!df->shm)
+			return -EINVAL;
+		st->st_mode = S_IFREG | (df->shm->mode & 0777);
+		st->st_uid = df->shm->uid;
+		st->st_gid = df->shm->gid;
+		st->st_ino = df->shm->ino;
+		st->st_nlink = 1;
+		st->st_size = (long)df->shm->size;
+		st->st_blksize = 4096;
+		st->st_blocks = (long)(df->shm->npages * 8);
+		return 0;
 	default:
 		return -EINVAL;
 	}
@@ -899,6 +1155,20 @@ int devfs_is_fb0(vfs_file_t *f)
 		return 0;
 	devfs_file_t *df = (devfs_file_t *)f->fs_private;
 	return df && df->type == DEVFS_TYPE_FB0;
+}
+
+/* The shared memory object behind a handle, or NULL.  mmap() uses this to map
+ * the object's own physical pages rather than allocating fresh ones — which is
+ * the entire point: two unrelated processes must end up looking at the same
+ * memory. */
+shm_object_t *devfs_shm_object(vfs_file_t *f)
+{
+	if (!f || f->ops != &g_devfs_ops)
+		return NULL;
+	devfs_file_t *df = (devfs_file_t *)f->fs_private;
+	if (!df || df->type != DEVFS_TYPE_SHM)
+		return NULL;
+	return df->shm;
 }
 
 tty_t *devfs_get_tty(vfs_file_t *f)

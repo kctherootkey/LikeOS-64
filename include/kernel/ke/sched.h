@@ -16,7 +16,13 @@ struct task;
 #define TASK_MAX_FDS 1024
 
 // Maximum memory regions per task (for mmap tracking)
-#define TASK_MAX_MMAP 64
+/* Address-space regions per process.  The dynamic linker maps roughly one
+ * region per PT_LOAD (~4 per shared object) with no reservation mapping, so a
+ * program with a large DSO graph — an X server plus its client libraries and
+ * dlopen'd driver modules — needs well over a hundred.  Raising this grows
+ * task_t; see the note in sched_fork_current() about not copying the table
+ * onto the kernel stack. */
+#define TASK_MAX_MMAP 256
 
 // ============================================================================
 // CPU FEATURE FLAGS
@@ -541,6 +547,35 @@ static inline void task_set_fd_flags(task_t *t, unsigned fd, uint8_t flags)
 		t->files->fd_flags[fd] = flags;
 	else
 		t->fd_flags[fd] = flags;
+}
+
+/* Descriptors 0/1/2 are the console when their table slot is EMPTY: the console
+ * has no vfs_file object behind it, so "this is the terminal" is represented by
+ * the absence of one.  That makes it indistinguishable from "closed" unless the
+ * close is recorded separately -- which is what this flag does.
+ *
+ * It lives in the per-descriptor flag byte rather than as a sentinel POINTER in
+ * the slot itself, because every descriptor-classifying site dereferences
+ * whatever the slot holds.  A new pointer value would have to be excluded at
+ * each of them and missing one faults the kernel; a flag can only be missed in
+ * the harmless direction, where the descriptor reads as the console exactly as
+ * it did before. */
+#define FD_STDIO_CLOSED 0x02
+
+/* True when `fd` is a standard descriptor still attached to the terminal. */
+static inline int task_fd_is_console(task_t *t, uint64_t fd)
+{
+	return fd < 3 && task_fds(t)[fd] == NULL &&
+	       !(task_get_fd_flags(t, (unsigned)fd) & FD_STDIO_CLOSED);
+}
+
+/* True when nothing occupies `fd`, so open()/dup() may claim it.  0/1/2 are
+ * occupied by the console until the process closes them. */
+static inline int task_fd_slot_free(task_t *t, unsigned fd)
+{
+	if (task_fds(t)[fd] != NULL)
+		return 0;
+	return fd >= 3 || (task_get_fd_flags(t, fd) & FD_STDIO_CLOSED);
 }
 
 void sched_init(void);

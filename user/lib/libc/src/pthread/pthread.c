@@ -43,7 +43,39 @@ extern int errno;
 // ============================================================================
 
 // Main thread's TCB (statically allocated for the initial thread)
+/* Thread-pointer-relative TLS is laid out by ld-likeos.so, which is the only
+ * component that knows which object owns which slice.  These are declared weak
+ * so a program running without the loader still links; the wrappers then
+ * report "no static TLS", which is exactly right for that configuration.
+ * (See the TLS interface block in user/lib/rtld/rtld.c.) */
+extern uint64_t _rtld_tls_size(void) __attribute__((weak));
+extern uint64_t _rtld_tls_align(void) __attribute__((weak));
+extern void _rtld_tls_init(void *tp) __attribute__((weak));
+
+static size_t __rtld_tls_size(void)
+{
+	return _rtld_tls_size ? (size_t)_rtld_tls_size() : 0;
+}
+
+static size_t __rtld_tls_align(void)
+{
+	return _rtld_tls_align ? (size_t)_rtld_tls_align() : 16;
+}
+
+static void __rtld_tls_init(void *tp)
+{
+	if (_rtld_tls_init)
+		_rtld_tls_init(tp);
+}
+
+/* Fallback control block, used only when no loader-provided one exists. */
 static struct __pthread __main_thread;
+
+/* The initial thread's control block.  It normally lives at the thread
+ * pointer inside the loader's TLS allocation, NOT at __main_thread, so the
+ * initial thread has to be recognised by this recorded pointer rather than
+ * by comparing against that fallback object. */
+static struct __pthread *__main_tcb;
 static int __pthread_initialized = 0;
 
 // Thread list for cleanup (protected by spinlock in real implementation)
@@ -267,7 +299,24 @@ static void __pthread_init_main(void)
 	size_t old_canary;
 	__asm__ volatile("mov %%fs:0x28, %0" : "=r"(old_canary));
 
-	struct __pthread *main = &__main_thread;
+	/* Adopt the thread pointer the loader already installed rather than
+	 * pointing %fs somewhere else.
+	 *
+	 * The loader lays out [ static TLS ][ tp ][ TCB reserve ] and sets
+	 * %fs = tp, so the reserved area at %fs IS where this structure
+	 * belongs.  Putting it in .bss instead — which is what used to happen
+	 * — moved %fs off the TLS block entirely, and every __thread access at
+	 * %fs:-N then read whatever happened to precede that .bss object.
+	 * There are no __thread variables in the tree today, which is the only
+	 * reason this was survivable. */
+	struct __pthread *main = __get_tcb();
+	if (!main) {
+		/* No loader-provided block (a statically linked program, or a
+		 * loader too old to reserve one): fall back to the .bss copy.
+		 * __thread data does not work in that configuration, but
+		 * everything that does not use it still does. */
+		main = &__main_thread;
+	}
 
 	// Zero out
 	for (size_t i = 0; i < sizeof(*main); i++) {
@@ -295,13 +344,16 @@ static void __pthread_init_main(void)
 	// Register robust list with kernel
 	set_robust_list(&main->robust_list, sizeof(main->robust_list));
 
-	// Set TLS to point to main thread's TCB
-	__set_tls(main);
+	/* %fs already points here when the loader supplied the block; only the
+	 * fallback above needs the register changed. */
+	if (main == &__main_thread)
+		__set_tls(main);
 
 	// Add to thread list
 	main->next = main->prev = main;
 	__thread_list_head = main;
 
+	__main_tcb = main;
 	__pthread_initialized = 1;
 }
 
@@ -399,9 +451,21 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 		}
 	}
 
-	// Calculate total allocation size
-	// Layout: [guard] [stack grows down] [TCB at high address]
-	size_t total_size = guard_size + stack_size + sizeof(struct __pthread);
+	/* Calculate total allocation size.
+	 *
+	 * Layout: [guard] [stack grows down] [static TLS] [tp = TCB]
+	 *
+	 * The per-thread TLS area sits immediately below the TCB, because
+	 * __thread variables are addressed at negative offsets from the thread
+	 * pointer and the TCB is at that pointer.  A thread whose block lacked
+	 * this room would read and write past the bottom of its own TCB. */
+	size_t tls_size = __rtld_tls_size();
+	size_t tls_align = __rtld_tls_align();
+	if (tls_align < PTHREAD_TLS_ALIGN)
+		tls_align = PTHREAD_TLS_ALIGN;
+
+	size_t total_size = guard_size + stack_size + tls_size + tls_align +
+			    sizeof(struct __pthread);
 	total_size = (total_size + 4095) & ~4095UL; // Page align
 
 	// Allocate stack + TCB region
@@ -427,14 +491,20 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 		(struct __pthread *)((char *)stack_base + total_size -
 				     sizeof(struct __pthread));
 
-	// Align TCB
-	tcb = (struct __pthread *)((unsigned long)tcb &
-				   ~(PTHREAD_TLS_ALIGN - 1));
+	/* Align the thread pointer down.  The static TLS area is [tcb -
+	 * tls_size, tcb), so the alignment has to satisfy the strictest
+	 * __thread variable in the process, not just the TCB's own. */
+	tcb = (struct __pthread *)((unsigned long)tcb & ~(tls_align - 1));
 
 	// Initialize TCB
 	for (size_t i = 0; i < sizeof(*tcb); i++) {
 		((char *)tcb)[i] = 0;
 	}
+
+	/* Fill this thread's TLS slice with each object's initial image.  The
+	 * loader owns the mapping of offsets to objects, so it does the copy. */
+	if (tls_size)
+		__rtld_tls_init(tcb);
 
 	tcb->self = tcb;
 	tcb->state = THREAD_STATE_RUNNING;
@@ -460,12 +530,21 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 	tcb->robust_list.futex_offset = (long)&((pthread_mutex_t *)0)->state;
 	tcb->robust_list.list_op_pending = NULL;
 
-	// Calculate child's stack pointer (below TCB, aligned)
-	// Stack grows downward, so child_stack should point to the bottom of the TCB.
-	// The first push will go to (child_stack - 8), which is safely below the TCB.
-	// Note: tcb points to the START of TCB struct, so we use tcb directly (aligned).
-	// When the child thread starts, it will push onto the stack BELOW this address.
-	void *child_stack = (void *)(((unsigned long)tcb) & ~15UL);
+	/* Calculate the child's stack pointer.
+	 *
+	 * The allocation is laid out
+	 *
+	 *     [guard][stack grows down ...][static TLS][tp = TCB]
+	 *                                  ^ child_stack
+	 *
+	 * so the stack must start BELOW the thread's static TLS area, not
+	 * directly below the TCB.  Starting it at the TCB lets the stack grow
+	 * straight through the TLS slice: the thread's __thread writes and its
+	 * call frames then occupy the same bytes, which shows up as corrupted
+	 * locals and a wild return address rather than as anything resembling a
+	 * TLS problem. */
+	void *child_stack =
+		(void *)((((unsigned long)tcb) - tls_size) & ~15UL);
 
 	// Add to thread list
 	__spin_lock(&__thread_list_lock);
@@ -513,7 +592,7 @@ void pthread_exit(void *retval)
 {
 	struct __pthread *tcb = __get_tcb();
 
-	if (!tcb || tcb == &__main_thread) {
+	if (!tcb || tcb == __main_tcb || tcb == &__main_thread) {
 		// Main thread exiting - exit the entire process
 		_exit((long)retval);
 	}
@@ -1062,4 +1141,27 @@ void pthread_testcancel(void)
 	    tcb->cancel_state == PTHREAD_CANCEL_ENABLE) {
 		pthread_exit(PTHREAD_CANCELED);
 	}
+}
+
+/* pthread_sigmask(): examine or change the calling thread's signal mask.
+ *
+ * Signal masks are per-task in this kernel and a pthread IS a task (threads
+ * are created with clone()), so sigprocmask() already operates on exactly the
+ * calling thread.  The two calls therefore do the same work; they differ only
+ * in how they report failure — pthread_sigmask returns the error number and
+ * leaves errno alone, which is what POSIX specifies for the pthread_* family. */
+int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset)
+{
+	int saved = errno;
+	int rc;
+
+	errno = 0;
+	rc = sigprocmask(how, set, oldset);
+	if (rc != 0) {
+		int err = errno ? errno : EINVAL;
+		errno = saved;
+		return err;
+	}
+	errno = saved;
+	return 0;
 }

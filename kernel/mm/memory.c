@@ -3404,16 +3404,17 @@ fail:
 	return NULL;
 }
 
-// Helper: check if virtual address is in a shared range
-static bool is_in_shared_range(uint64_t vaddr, uint64_t *shared_regions,
-			       int num_shared)
+// Helper: check if virtual address falls in an in-use MAP_SHARED region
+static bool is_in_shared_range(uint64_t vaddr, const struct mmap_region *regions,
+			       int num_regions)
 {
-	if (!shared_regions)
+	if (!regions)
 		return false;
-	for (int i = 0; i < num_shared; i++) {
-		uint64_t start = shared_regions[i * 2];
-		uint64_t end = shared_regions[i * 2 + 1];
-		if (vaddr >= start && vaddr < end) {
+	for (int i = 0; i < num_regions; i++) {
+		if (!regions[i].in_use || !(regions[i].flags & MAP_SHARED))
+			continue;
+		if (vaddr >= regions[i].start &&
+		    vaddr < regions[i].start + regions[i].length) {
 			return true;
 		}
 	}
@@ -3423,8 +3424,8 @@ static bool is_in_shared_range(uint64_t vaddr, uint64_t *shared_regions,
 // Clone an address space with support for shared memory regions
 // For MAP_SHARED regions, we keep the same physical pages (no COW)
 uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
-					     uint64_t *shared_regions,
-					     int num_shared)
+					     const struct mmap_region *regions,
+					     int num_regions)
 {
 	if (!src_pml4) {
 		return NULL;
@@ -3482,8 +3483,8 @@ uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
 					if (src_pd[k] & PAGE_USER) {
 						if (is_in_shared_range(
 							    vaddr_base,
-							    shared_regions,
-							    num_shared)) {
+							    regions,
+							    num_regions)) {
 							// Shared - keep same physical page, keep writable
 							new_pd[k] = src_pd[k];
 						} else {
@@ -3554,8 +3555,8 @@ uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
 
 							if (is_in_shared_range(
 								    vaddr,
-								    shared_regions,
-								    num_shared)) {
+								    regions,
+								    num_regions)) {
 								// Shared region — map same physical page.
 								// Briefly disable IRQs for the {write-PTE, incref} pair.
 								uint64_t pte_irq =

@@ -21,6 +21,17 @@ struct timespec {
 
 typedef int clockid_t;
 
+/* The unit clock() counts in.  POSIX fixes this at exactly one million
+ * regardless of how fast the system timer actually ticks, so it is a property
+ * of the interface and not of the hardware -- do not derive it from
+ * sysconf(_SC_CLK_TCK), which is the (different) unit times() counts in. */
+#define CLOCKS_PER_SEC ((clock_t)1000000)
+
+/* Processor time consumed by this process, in CLOCKS_PER_SEC units, or
+ * (clock_t)-1 if it cannot be determined.  Note this is CPU time, not elapsed
+ * time: a process that sleeps for an hour has consumed almost none of it. */
+clock_t clock(void);
+
 time_t time(time_t* tloc);
 int clock_gettime(clockid_t clk_id, struct timespec* tp);
 int clock_getres(clockid_t clk_id, struct timespec* res);

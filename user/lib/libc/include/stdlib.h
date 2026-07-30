@@ -17,8 +17,12 @@
 #define MB_CUR_MAX  1
 #define MB_LEN_MAX  1
 
-/* Multibyte length, single-byte locale semantics (mbtowc/wctomb live in
- * <wchar.h>) */
+/* Multibyte conversions.  The C standard puts mbtowc/wctomb/mbstowcs/wcstombs
+ * here as well as in <wchar.h>; the shared definition lives in one place so
+ * the two headers cannot disagree. */
+#include <bits/multibyte.h>
+
+/* Multibyte length, single-byte locale semantics */
 static inline int mblen(const char *s, size_t n)
 {
     if (!s) return 0;         /* no state-dependent encodings */
@@ -75,10 +79,56 @@ char* realpath(const char* path, char* resolved_path);
 // Utilities
 int abs(int n);
 long labs(long n);
+
+/* Quotient and remainder together; both truncate toward zero. */
+typedef struct { int quot, rem; } div_t;
+typedef struct { long quot, rem; } ldiv_t;
+typedef struct { long long quot, rem; } lldiv_t;
+
+long long llabs(long long j);
+/* intmax_t comes from <stdint.h>, which is where it is defined; do not
+ * redeclare it here. */
+#include <stdint.h>
+intmax_t imaxabs(intmax_t j);
+div_t   div(int num, int den);
+ldiv_t  ldiv(long num, long den);
+lldiv_t lldiv(long long num, long long den);
+/* Pseudo-random numbers.  rand() and random() share one generator (the
+ * degree-31 additive-feedback one), so seeding either affects both.  Not for
+ * anything security-related — use getrandom() for that. */
+#define RAND_MAX 2147483647
+
+int   rand(void);
+void  srand(unsigned int seed);
+int   rand_r(unsigned int* seedp);
+
+/* The SVID 48-bit generator.  A different, independently-seeded sequence from
+ * rand()/random() above -- seeding one does not affect the other.
+ *
+ * The e/n/j variants take the caller's own state and are reentrant; the plain
+ * names share one global state and are not. */
+double drand48(void);
+long   lrand48(void);
+long   mrand48(void);
+double erand48(unsigned short xsubi[3]);
+long   nrand48(unsigned short xsubi[3]);
+long   jrand48(unsigned short xsubi[3]);
+void   srand48(long seed);
+unsigned short* seed48(unsigned short seed16v[3]);
+void   lcong48(unsigned short param[7]);
+long  random(void);
+void  srandom(unsigned int seed);
+char* initstate(unsigned int seed, char* state, size_t size);
+char* setstate(char* state);
+
 void qsort(void* base, size_t nmemb, size_t size, int (*compar)(const void*, const void*));
+void qsort_r(void* base, size_t nmemb, size_t size,
+             int (*compar)(const void*, const void*, void*), void* arg);
 void* bsearch(const void* key, const void* base, size_t nmemb, size_t size, int (*compar)(const void*, const void*));
 int mkstemp(char* templ);
 int mkstemps(char* templ, int suffixlen);
+int mkostemp(char* templ, int oflags);
+int mkostemps(char* templ, int suffixlen, int oflags);
 char* mktemp(char* templ);
 char* mkdtemp(char* templ);
 

@@ -6190,6 +6190,82 @@ static int ext4_mkdir_impl(const char *path, unsigned mode)
 	return ST_OK;
 }
 
+/* Create a node that owns no data blocks: a socket or a FIFO.
+ *
+ * Simpler than ext4_mkdir_impl above — there is no directory block to
+ * allocate, no "." / ".." to write, and the parent's link count is untouched.
+ * The point of it is that a bound AF_UNIX socket has to EXIST in the
+ * filesystem: clients stat() the path and refuse to connect unless it reports
+ * S_IFSOCK, so an absent entry (or a plain file standing in for one) fails
+ * every connect rather than merely looking untidy in ls. */
+static int ext4_mknod_impl(const char *path, unsigned mode)
+{
+	if (ext4_is_ro())
+		return ST_ROFS;
+	if (!path || !g_ext4_fs)
+		return ST_INVALID;
+	ext4_fs_t *fs = g_ext4_fs;
+	unsigned long parent = 0;
+	char name[256];
+	if (ext4_resolve_parent(fs, path, &parent, name, sizeof(name)) != ST_OK)
+		return ST_NOT_FOUND;
+	unsigned nl = 0;
+	while (name[nl])
+		nl++;
+	unsigned long existing;
+	if (ext4_dir_lookup(fs, parent, name, nl, &existing, 0) == ST_OK)
+		return ST_EXISTS;
+
+	unsigned puid = 0, pgid = 0, pmode = 0;
+	ext4_inode pin0;
+	if (ext4_read_inode_loc(fs, parent, &pin0, 0, 0) == ST_OK) {
+		puid = pin0.i_uid;
+		pgid = pin0.i_gid;
+		pmode = pin0.i_mode;
+	}
+	unsigned nuid = puid, ngid = pgid;
+	unsigned nmode = mode;
+	ext4_init_owner(puid, pgid, pmode, 0, &nuid, &ngid, &nmode);
+
+	unsigned long nino = ext4_alloc_inode(fs, parent, 0);
+	if (nino == 0)
+		return ST_NOMEM;
+
+	ext4_inode in;
+	mm_memset(&in, 0, sizeof(in));
+	in.i_mode = (uint16_t)nmode;
+	in.i_uid = (uint16_t)nuid;
+	in.i_gid = (uint16_t)ngid;
+	in.i_links_count = 1;
+	in.i_flags = EXT4_INODE_EXTENTS_FL;
+	uint32_t now = (uint32_t)timer_get_epoch();
+	in.i_atime = in.i_ctime = in.i_mtime = now;
+	/* An empty extent header still has to be well formed: fsck reads it
+	 * even though the node will never own a block. */
+	ext4_extent_header *eh = (ext4_extent_header *)in.i_block;
+	eh->eh_magic = EXT4_EXT_MAGIC;
+	eh->eh_max = 4;
+	if (fs->inode_size > 128)
+		in.i_extra_isize = 32;
+	ext4_inode_cache_flush();
+	ext4_write_inode_new(fs, nino, &in);
+
+	unsigned ft = EXT4_FT_REG_FILE;
+	if ((mode & S_IFMT) == S_IFSOCK)
+		ft = EXT4_FT_SOCK;
+	else if ((mode & S_IFMT) == S_IFIFO)
+		ft = EXT4_FT_FIFO;
+
+	if (ext4_dir_add(fs, parent, name, nl, nino, ft) != ST_OK) {
+		ext4_free_inode(fs, nino, 0);
+		ext4_flush_meta(fs);
+		return ST_IO;
+	}
+	ext4_inode_cache_flush();
+	ext4_flush_meta(fs);
+	return ST_OK;
+}
+
 static int ext4_rmdir_impl(const char *path)
 {
 	if (ext4_is_ro())
@@ -6928,6 +7004,13 @@ static int ext4_mkdir(const char *path, unsigned int mode)
 	ext4_io_unlock();
 	return r;
 }
+static int ext4_mknod(const char *path, unsigned int mode)
+{
+	ext4_io_lock();
+	int r = ext4_mknod_impl(path, mode);
+	ext4_io_unlock();
+	return r;
+}
 static int ext4_rmdir(const char *path)
 {
 	ext4_io_lock();
@@ -7274,6 +7357,7 @@ static const vfs_ops_t ext4_vfs_ops = {
 	 * only contributes the immutable/append-only inode flags. */
 	0, /* permission */
 	ext4_inode_flags_op,
+	ext4_mknod,
 };
 
 /* ===================================================================

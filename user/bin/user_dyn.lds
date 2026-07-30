@@ -66,6 +66,23 @@ SECTIONS
     .got : { *(.got) }
     .got.plt : { *(.got.plt) }
 
+    /* Thread-local storage.  These must come before .data/.bss and be kept
+     * adjacent: the linker builds PT_TLS from them, and the loader copies
+     * .tdata as each thread's initial image while .tbss is the zeroed
+     * remainder.  Without these output sections the sections land as orphans,
+     * no PT_TLS is emitted, and every __thread variable in the program
+     * silently reads whatever shares its address. */
+    .tdata : {
+        *(.tdata)
+        *(.tdata.*)
+        *(.gnu.linkonce.td.*)
+    }
+    .tbss : {
+        *(.tbss)
+        *(.tbss.*)
+        *(.gnu.linkonce.tb.*)
+    }
+
     .data : {
         *(.data)
         *(.data.*)

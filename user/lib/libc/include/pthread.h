@@ -330,6 +330,11 @@ int pthread_setcancelstate(int state, int* oldstate);
 int pthread_setcanceltype(int type, int* oldtype);
 void pthread_testcancel(void);
 
+#include <signal.h>
+/* Per-thread signal mask (threads are tasks here, so this is the calling
+ * thread's own mask, reported the pthread way: return value, not errno). */
+int pthread_sigmask(int how, const sigset_t* set, sigset_t* oldset);
+
 #ifdef __cplusplus
 }
 #endif

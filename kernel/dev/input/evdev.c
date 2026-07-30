@@ -34,12 +34,33 @@ typedef struct {
 	unsigned count;
 	uint32_t dropped; // ring overflows (reported once per overflow)
 	int64_t grab_task; // task id holding the grab, 0 = none
+	/* The descriptor the grab was taken through.
+	 *
+	 * The task id alone is not enough to release it: the release happens
+	 * when the descriptor is closed, and a descriptor is not always closed
+	 * by the task that opened it -- process teardown, a shared descriptor
+	 * table, or a reaper can all do it.  When the ids did not match the grab
+	 * was simply left in place, and with it every pointer event stayed
+	 * suppressed: after an X session ended the console cursor was drawn but
+	 * would not move, forever.
+	 *
+	 * Keyed on the handle, the release is exact and does not care who is
+	 * doing the closing. */
+	void *grab_owner;
 	uint8_t key_state[KEY_CNT / 8]; // current down/up bitmap
 	struct input_id id;
 	const char *name;
+	const char *phys; // physical location, e.g. "isa0060/serio0/input0"
 	uint8_t evbits[EV_CNT / 8];
 	uint8_t keybits[KEY_CNT / 8];
 	uint8_t relbits[REL_CNT / 8];
+	uint8_t propbits[INPUT_PROP_CNT / 8]; // device properties (EVIOCGPROP)
+	uint8_t ledbits[LED_CNT / 8]; // LEDs this device has
+	uint8_t led_state[LED_CNT / 8]; // which of them are lit
+	/* Clock used for event timestamps.  Display servers set this to
+	 * CLOCK_MONOTONIC so input timing is immune to the wall clock being
+	 * stepped; the default stays CLOCK_REALTIME for compatibility. */
+	int clock_id;
 	int wq; // wait-channel key for blocked readers
 } evdev_dev_t;
 
@@ -117,6 +138,16 @@ static void evdev_init_devices(void)
 
 	spinlock_init(&kbd->lock, "evdev_kbd");
 	kbd->name = "LikeOS Keyboard";
+	/* Physical path in the conventional serio form; a display server uses
+	 * it to tell devices apart and to match configuration rules. */
+	kbd->phys = "isa0060/serio0/input0";
+	kbd->clock_id = CLOCK_REALTIME;
+	/* The keyboard reports the three standard lock LEDs.  Their state is
+	 * tracked but not driven yet, so EVIOCGLED reads them all unlit. */
+	bit_set(kbd->evbits, EV_LED);
+	bit_set(kbd->ledbits, LED_NUML);
+	bit_set(kbd->ledbits, LED_CAPSL);
+	bit_set(kbd->ledbits, LED_SCROLLL);
 	kbd->id.bustype = BUS_I8042;
 	kbd->id.vendor = 0x0001;
 	kbd->id.product = 0x0001;
@@ -137,6 +168,11 @@ static void evdev_init_devices(void)
 
 	spinlock_init(&mou->lock, "evdev_mouse");
 	mou->name = "LikeOS Mouse";
+	mou->phys = "isa0060/serio1/input0";
+	mou->clock_id = CLOCK_REALTIME;
+	/* INPUT_PROP_POINTER: motion is relative and drives a cursor, rather
+	 * than mapping onto screen coordinates the way a touchscreen does. */
+	bit_set(mou->propbits, INPUT_PROP_POINTER);
 	mou->id.bustype = BUS_I8042;
 	mou->id.vendor = 0x0001;
 	mou->id.product = 0x0002;
@@ -158,11 +194,18 @@ static void evdev_init_devices(void)
 	g_evdev_initialized = 1;
 }
 
-static void evdev_timestamp(struct input_event *ev)
+static void evdev_timestamp(evdev_dev_t *dev, struct input_event *ev)
 {
 	uint64_t us = timer_get_precise_us();
 
-	ev->time.tv_sec = (int64_t)(timer_get_boot_epoch() + us / 1000000);
+	/* CLOCK_MONOTONIC is time since boot; CLOCK_REALTIME adds the boot
+	 * epoch.  Both come from the same counter, so events stay ordered
+	 * whichever a client picks. */
+	if (dev && dev->clock_id == CLOCK_MONOTONIC)
+		ev->time.tv_sec = (int64_t)(us / 1000000);
+	else
+		ev->time.tv_sec =
+			(int64_t)(timer_get_boot_epoch() + us / 1000000);
 	ev->time.tv_usec = (int64_t)(us % 1000000);
 }
 
@@ -181,7 +224,7 @@ static void evdev_queue_locked(evdev_dev_t *dev, uint16_t type, uint16_t code,
 		dev->count = 0;
 		dev->dropped++;
 		ev = &dev->ring[dev->head];
-		evdev_timestamp(ev);
+		evdev_timestamp(dev, ev);
 		ev->type = EV_SYN;
 		ev->code = SYN_DROPPED;
 		ev->value = 0;
@@ -189,7 +232,7 @@ static void evdev_queue_locked(evdev_dev_t *dev, uint16_t type, uint16_t code,
 		dev->count++;
 	}
 	ev = &dev->ring[dev->head];
-	evdev_timestamp(ev);
+	evdev_timestamp(dev, ev);
 	ev->type = type;
 	ev->code = code;
 	ev->value = value;
@@ -403,6 +446,22 @@ short evdev_poll(int unit, short events)
 	return rev;
 }
 
+/* Release a grab held through this descriptor, whoever is closing it. */
+void evdev_release_grab_by_owner(int unit, void *owner)
+{
+	evdev_dev_t *dev = evdev_get(unit);
+	uint64_t f;
+
+	if (!dev || !owner)
+		return;
+	spin_lock_irqsave(&dev->lock, &f);
+	if (dev->grab_owner == owner) {
+		dev->grab_owner = NULL;
+		dev->grab_task = 0;
+	}
+	spin_unlock_irqrestore(&dev->lock, f);
+}
+
 void evdev_release_grab_for(int unit, int64_t task_id)
 {
 	evdev_dev_t *dev = evdev_get(unit);
@@ -426,6 +485,16 @@ static int evdev_copy_out(void *user_dst, const void *src, size_t len)
 		return -EFAULT;
 	smap_disable();
 	kmemcpy(user_dst, src, len);
+	smap_enable();
+	return 0;
+}
+
+static int evdev_copy_in(void *dst, const void *user_src, size_t len)
+{
+	if (!user_src)
+		return -EFAULT;
+	smap_disable();
+	kmemcpy(dst, user_src, len);
 	smap_enable();
 	return 0;
 }
@@ -460,7 +529,8 @@ static int evdev_copy_bits(void *argp, const uint8_t *bits, size_t bits_len,
 	return (int)n;
 }
 
-int evdev_ioctl(int unit, unsigned long req, void *argp, struct task *cur)
+int evdev_ioctl(int unit, unsigned long req, void *argp, struct task *cur,
+		void *owner)
 {
 	evdev_dev_t *dev = evdev_get(unit);
 	unsigned int nr = (unsigned int)((req >> _INPUT_IOC_NRSHIFT) & 0xFF);
@@ -523,6 +593,63 @@ int evdev_ioctl(int unit, unsigned long req, void *argp, struct task *cur)
 					       user_len);
 		}
 	}
+	if (nr == 0x07) { // EVIOCGPHYS(len) - physical location
+		const char *ph = dev->phys ? dev->phys : "";
+		size_t len = 0;
+		while (ph[len])
+			len++;
+		len++; // NUL
+		if (len > user_len)
+			len = user_len;
+		if (len == 0)
+			return 0;
+		if (evdev_copy_out(argp, ph, len) != 0)
+			return -EFAULT;
+		return (int)len;
+	}
+	if (nr == 0x08) { // EVIOCGUNIQ(len) - unique identifier
+		/* These devices have no serial number.  Reporting "no such
+		 * entry" is how a driver says the property is absent; an empty
+		 * string would claim it exists and is blank. */
+		return -ENOENT;
+	}
+	if (nr == 0x09) // EVIOCGPROP(len) - device properties
+		return evdev_copy_bits(argp, dev->propbits,
+				       sizeof(dev->propbits), user_len);
+	if (nr == 0x19) // EVIOCGLED(len) - which LEDs are lit
+		return evdev_copy_bits(argp, dev->led_state,
+				       sizeof(dev->led_state), user_len);
+	if (nr == 0x1a) { // EVIOCGSND(len) - sound-source state
+		static const uint8_t none[8];
+		return evdev_copy_bits(argp, none, sizeof(none), user_len);
+	}
+	if (nr == 0x1b) { // EVIOCGSW(len) - switch state
+		static const uint8_t none[8];
+		return evdev_copy_bits(argp, none, sizeof(none), user_len);
+	}
+	if (nr >= 0x40 && nr <= 0x40 + ABS_MAX) { // EVIOCGABS(abs)
+		/* No device here reports absolute motion.  A zeroed absinfo is
+		 * the conventional answer for an axis the device does not
+		 * have: the query succeeds and the ranges read as empty, which
+		 * is what a driver checks. */
+		struct input_absinfo abs = { 0, 0, 0, 0, 0, 0 };
+		return evdev_copy_out(argp, &abs, sizeof(abs));
+	}
+	if (req == EVIOCSCLOCKID) { // select the clock used for timestamps
+		int id;
+		uint64_t f;
+
+		if (!argp)
+			return -EFAULT;
+		if (evdev_copy_in(&id, argp, sizeof(id)) != 0)
+			return -EFAULT;
+		if (id != CLOCK_REALTIME && id != CLOCK_MONOTONIC)
+			return -EINVAL;
+		spin_lock_irqsave(&dev->lock, &f);
+		dev->clock_id = id;
+		spin_unlock_irqrestore(&dev->lock, f);
+		return 0;
+	}
 	if (req == EVIOCGRAB) {
 		// The argument is the flag value itself, not a pointer.
 		long grab = (long)(uint64_t)argp;
@@ -534,15 +661,19 @@ int evdev_ioctl(int unit, unsigned long req, void *argp, struct task *cur)
 			return -EINVAL;
 		spin_lock_irqsave(&dev->lock, &f);
 		if (grab) {
-			if (dev->grab_task == 0 || dev->grab_task == tid)
+			if (dev->grab_task == 0 || dev->grab_task == tid) {
 				dev->grab_task = tid;
-			else
+				dev->grab_owner = owner;
+			} else {
 				rc = -EBUSY;
+			}
 		} else {
-			if (dev->grab_task == tid || dev->grab_task == 0)
+			if (dev->grab_task == tid || dev->grab_task == 0) {
 				dev->grab_task = 0;
-			else
+				dev->grab_owner = NULL;
+			} else {
 				rc = -EINVAL;
+			}
 		}
 		spin_unlock_irqrestore(&dev->lock, f);
 		return rc;

@@ -1,0 +1,31 @@
+#!/bin/sh
+# pkg-config confined to the port's sysroot.
+#
+# The host has its own X11 .pc files installed.  If even one of them is
+# consulted, a package silently configures against the host's headers and
+# libraries and the failure surfaces much later as a mysterious link error or,
+# worse, as a working build of the wrong thing.  PKG_CONFIG_LIBDIR (not _PATH)
+# REPLACES the default search path rather than adding to it, which is what
+# makes this airtight.
+set -e
+
+self=$0
+case "$self" in
+/*) ;;
+*) self=$(pwd)/$self ;;
+esac
+TOOLCHAIN=$(cd "$(dirname "$self")" && pwd)
+ROOT=$(cd "$TOOLCHAIN/../../.." && pwd)
+SYSROOT="${LIKEOS_SYSROOT:-$ROOT/build/xorg-sysroot}"
+
+PKG_CONFIG_LIBDIR="$SYSROOT/usr/lib/pkgconfig:$SYSROOT/usr/share/pkgconfig"
+export PKG_CONFIG_LIBDIR
+unset PKG_CONFIG_PATH
+
+# Deliberately NOT setting PKG_CONFIG_SYSROOT_DIR: the .pc files are generated
+# with --prefix=/usr but installed under the sysroot, so their -I/-L already
+# need the sysroot prefix added.  Setting both would apply it twice.
+PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
+export PKG_CONFIG_SYSROOT_DIR
+
+exec pkg-config "$@"

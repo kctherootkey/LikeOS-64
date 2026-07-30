@@ -1,0 +1,131 @@
+# X.Org port manifest — one line per package, in DEPENDENCY ORDER.
+#
+#   <section>  <name>  <version>  [debian-source-package]  [gitlab-repo]
+#
+# `section` is the directory under x.org's individual/ archive.  The optional
+# The fourth field names the Debian source package to fall back to when the
+# x.org archive cannot be reached, and the fifth the X.Org GitLab repository to
+# fall back to after that ("-" means the field is not applicable).  See
+# fetch.sh for what each source is and why all three exist.
+#
+# Build order matters and is not alphabetical: util-macros supplies the m4
+# macros every other package's configure needs, xorgproto the headers, and so
+# on down to the server.  Do not sort this file.
+
+# ---- CANONICAL-ONLY -----------------------------------------------------
+# Debian has no upstream .orig tarball for these: util-macros/xkbcomp/font-util
+# ship inside aggregate Debian-native packages (xutils-dev, x11-xkb-utils,
+# xfonts-utils), and the small apps below live in x11-xserver-utils / x11-apps
+# / xfonts-base.  Unpacking those would not give the upstream tree, so they are
+# fetched from the X.Org archive only.  NOTE: util-macros is required by every
+# other package's configure, so nothing builds without it.
+
+# ---- build tooling and protocol headers ----
+util      util-macros        1.20.2   -  xorg/util/macros
+proto     xorgproto          2024.1   xorgproto
+lib       xtrans             1.6.0    xtrans
+
+# ---- core client libraries ----
+lib       libXau             1.0.12   libxau
+lib       libXdmcp           1.1.5    libxdmcp
+proto     xcb-proto          1.17.0   xcb-proto
+lib       libxcb             1.17.0   libxcb
+lib       libX11             1.8.13   libx11
+lib       libXext            1.3.6    libxext
+lib       libXrender         0.9.12   libxrender
+lib       libXfixes          6.0.1    libxfixes
+lib       libXdamage         1.1.6    libxdamage
+lib       libXcomposite      0.4.6    libxcomposite
+lib       libXrandr          1.5.4    libxrandr
+lib       libXcursor         1.2.3    libxcursor
+lib       libXi              1.8.2    libxi
+lib       libXtst            1.2.5    libxtst
+
+# ---- toolkit stack (needed by xterm, ctwm, xclock) ----
+lib       libICE             1.1.2    libice
+lib       libSM              1.2.5    libsm
+lib       libXt              1.3.1    libxt
+lib       libXmu             1.2.1    libxmu
+# libxkbfile is required by xkbcomp, and libXpm/libXaw by xterm (its menus are
+# Athena widgets).  All three were missing from the original list.
+lib       libxkbfile         1.1.3    libxkbfile
+lib       libXpm             3.5.17   libxpm
+lib       libXaw             1.0.16   libxaw
+
+# ---- rendering and fonts ----
+# pixman and libxkbcommon are meson-only; the rest are autotools.
+lib       pixman             0.46.0   pixman
+# freetype is not an x.org package; fetched from its own project (see fetch.sh).
+-         freetype           2.13.3   freetype
+lib       libfontenc         1.1.8    libfontenc
+lib       libXfont2          2.0.8    libxfont
+lib       libxcvt            0.1.3    libxcvt
+# libpciaccess compiles a per-OS backend chosen by the host triple, and there
+# was none for LikeOS.  Needed after all: fbdevhw's public signatures take a
+# struct pci_device *, so xorg-server does not build without the header.  A
+# backend reporting an empty bus is in patches/libpciaccess/ — userspace here
+# has no path to PCI configuration space, so that is the truthful answer, and
+# the fbdev DDX never probes the bus anyway.
+lib       libpciaccess       0.18.1   libpciaccess
+
+# ---- keyboard data and compiler ----
+data      xkeyboard-config   2.44     xkeyboard-config
+app       xkbcomp            1.4.7    -  xorg/app/xkbcomp
+
+# AFTER xkeyboard-config, not with the other libraries: its meson.build asks
+# pkg-config for xkeyboard-config's xkb_root and bakes the answer into its own
+# .pc file.  With xkeyboard-config not yet built the variable comes out empty
+# and meson stops with "pkgconfig.generate keyword argument variables empty
+# variable value" -- which names neither package.
+#
+# Not on the critical path either way: the X server has its own XKB
+# implementation and compiles keymaps with xkbcomp.
+lib       libxkbcommon       1.13.1   libxkbcommon
+
+# ---- bitmap fonts (built to .pcf with the host's bdftopcf) ----
+font      font-util          1.4.1    -  xorg/font/util
+font      font-misc-misc     1.1.3    -  xorg/font/misc-misc
+font      font-cursor-misc   1.0.4    -  xorg/font/cursor-misc
+
+# ---- input-driver dependencies ----
+# Neither is an X.Org package.  xf86-input-evdev needs both: libevdev is its
+# entire event-reading layer (17 distinct calls), and mtdev translates the
+# kernel's multitouch protocol.  libudev is its third stated dependency but is
+# used in exactly one function -- already guarded by #ifdef HAVE_LIBUDEV with a
+# working fallback -- so it is made optional by a patch instead of ported.
+lib       libevdev           1.13.6   libevdev
+lib       mtdev              1.1.7    mtdev
+
+# ---- the server and its two drivers ----
+xserver   xorg-server        21.1.23  xorg-server
+driver    xf86-input-evdev   2.11.0   xserver-xorg-input-evdev
+driver    xf86-video-fbdev   0.5.0    xserver-xorg-video-fbdev
+
+# ---- session ----
+# xbitmaps installs the classic X bitmap files (the root weave, the icons the
+# toolkit draws) plus their pkg-config description.  xsetroot's configure
+# requires it by name.
+data      xbitmaps           1.1.1    xbitmaps
+app       xinit              1.4.4    xinit
+app       xauth              1.1.4    xauth
+app       xsetroot           1.1.3    -  xorg/app/xsetroot
+app       xterm              400      xterm
+# ctwm is not an x.org package; fetched from its own project (see fetch.sh).
+-         ctwm               4.1.0    ctwm
+
+# ---- extras (Phase 5) ----
+app       xset               1.2.5    -  xorg/app/xset
+app       xrandr             1.5.3    -  xorg/app/xrandr
+app       xclock             1.1.1    -  xorg/app/xclock
+app       twm                1.0.13   twm
+# libdrm is NOT built.  It is the userspace side of the kernel's direct
+# rendering manager, and there is no DRM device here to talk to: the server is
+# configured --disable-libdrm, the fbdev driver goes through /dev/fb0, and Mesa
+# is deferred.  Building it would produce a library whose every entry point
+# opens /dev/dri/card0 and fails.
+#
+# It also does not compile as-is -- include/drm/drm.h takes a BSD branch that
+# wants <sys/ioccom.h> -- but that is a symptom, not the reason to leave it out.
+# If DRM is ever implemented in the kernel, this is the first package to add
+# back, and that header is the first thing it will need.
+#lib      libdrm             2.4.124  libdrm

@@ -189,9 +189,20 @@ static void test_open_close(void)
 	int ret = close(9999);
 	test_result(ret < 0, "close invalid fd returns error");
 
-	// Can't close stdin/stdout/stderr
+	// Standard descriptors are ordinary descriptors: they can be closed,
+	// and the number that frees up is then the lowest available one, so the
+	// next open() gets it back.  That is how a program hands itself a
+	// terminal (close(0) then dup the one it wants), and it is what a
+	// terminal emulator does for the shell it starts.
 	ret = close(0);
-	test_result(ret < 0, "cannot close stdin");
+	test_result(ret == 0, "can close stdin");
+	ret = close(0);
+	test_result(ret < 0, "a closed stdin stays closed");
+
+	// Put a descriptor back on 0 so the rest of this program is unaffected,
+	// and confirm the reuse rule while doing it.
+	ret = open("/dev/null", O_RDONLY);
+	test_result(ret == 0, "open() reuses descriptor 0");
 }
 
 // Entry point

@@ -1,0 +1,38 @@
+Use the POSIX process-group calls on this platform.
+
+main.c carries a second per-system list, separate from the one in xterm_io.h,
+and USE_SYSV_PGRP is what selects setpgid()/setsid()/tcsetpgrp() -- the POSIX
+set, which is all this system has.  Without it the other branch calls the
+two-argument BSD setpgrp(pid, pgid), which does not exist here and has been
+obsolete everywhere for decades:
+
+    main.c:4946:13: error: too many arguments to function 'setpgrp'
+
+USE_SYSV_SIGNALS is deliberately NOT defined alongside it: handlers installed
+through sigaction stay installed across a delivery here, so xterm must not
+reinstall them from inside the handler.  WTMP is left out because there is no
+login-record database to write to.
+
+--- a/main.c
++++ b/main.c
+@@ -160,6 +160,20 @@
+ #endif
+ #endif
+ 
++#ifdef __LIKEOS__
++/* Process groups follow POSIX here: setpgid()/setsid()/tcsetpgrp(), and no
++ * setpgrp() at all.  USE_SYSV_PGRP selects exactly that set; without it the
++ * other branch calls the two-argument BSD setpgrp(pid, pgid), which this
++ * system does not have and which has been obsolete everywhere for decades.
++ *
++ * USE_SYSV_SIGNALS is NOT defined: signal handlers here stay installed across
++ * a delivery (BSD semantics, which is also what POSIX sigaction gives), so
++ * xterm must not reinstall them from inside the handler.
++ *
++ * WTMP is left out because there is no login-record database to write to. */
++#define USE_SYSV_PGRP
++#endif
++
+ #ifdef __CYGWIN__
+ #define WTMP
+ #endif

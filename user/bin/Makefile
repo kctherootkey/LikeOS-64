@@ -31,7 +31,7 @@ AUTH_LDFLAGS = -L$(LIBPAM_DIR) -L$(LIBCRYPT_DIR) \
 
 # Programs (sources live alongside this Makefile in user/bin/)
 # getty/init link only against libc; login needs libpam+libcrypt (custom rule below).
-PROGRAMS = hello ls cat pwd stat progerr memstat uname shutdown poweroff ps cp mv rm mkdir rmdir touch more less clear env kill find df du hexdump sleep strings file grep wc head tail echo printf free uptime dmesg which date time sort uniq cut tr yes true false top man hostname ping ifconfig netstat route arp traceroute arping dhclient dig nslookup host ln chmod readlink getty init id whoami groups adduser deluser permbench
+PROGRAMS = hello ls cat pwd stat progerr memstat uname shutdown poweroff ps cp mv rm mkdir rmdir touch more less clear env kill find df du hexdump sleep strings file grep wc head tail echo printf free uptime dmesg which date time sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp traceroute arping dhclient dig nslookup host ln chmod readlink getty init id whoami groups adduser deluser permbench
 
 # Test programs (sources live in user/bin/tests/, built as tests/<name>)
 # test_libc has a custom rule (needs libpam+libcrypt for the auth tests).

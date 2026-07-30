@@ -7,6 +7,8 @@
 // path (console included); on the GOP fallback the single boot mode is the
 // only accepted mode.
 
+#include <kernel/dev/input/mouse.h>
+#include <kernel/dev/video/fb.h>
 #include <kernel/dev/video/fbdev.h>
 #include <kernel/dev/video/vmsvga2.h>
 #include <kernel/uapi/fb.h>
@@ -181,6 +183,67 @@ static int fbdev_put_var(const struct fb_var_screeninfo *var)
 		return -EIO;
 	vmsvga2_update_full();
 	return 0;
+}
+
+/*
+ * How many handles are open on /dev/fb0.
+ *
+ * A process that maps the framebuffer draws straight into video memory, behind
+ * the console's back.  The console keeps its own back buffer, so the text is
+ * never lost -- but nothing tells it to put the text back on screen when the
+ * other program is done, and on a system with no virtual terminals to switch
+ * between there is no other moment at which that would happen.  Killing an X
+ * server left the screen showing whatever it had drawn last, with a working
+ * but invisible shell behind it.
+ *
+ * So the last close is the signal.  Counted rather than tracked per handle
+ * because a display server has several (it dup()s, and it survives fork), and
+ * the console must not be redrawn while one of them is still drawing.
+ */
+static int g_fb0_opens;
+
+/*
+ * Is another program driving the display?
+ *
+ * While one is, the console must not paint: it and the display server would be
+ * writing to the same pixels, and the console would win whenever anything --
+ * a kernel message, an echoed keystroke -- made it draw.  On a system with
+ * virtual terminals this is what KD_GRAPHICS does; the open count is the same
+ * signal without the VT.
+ *
+ * The console keeps updating its BACK buffer throughout, so nothing written
+ * meanwhile is lost: the full redraw on the last close brings it all back.
+ */
+int fbdev_display_owned(void)
+{
+	return g_fb0_opens > 0;
+}
+
+void fbdev_opened(void)
+{
+	g_fb0_opens++;
+}
+
+void fbdev_closed(void)
+{
+	if (g_fb0_opens > 0)
+		g_fb0_opens--;
+	if (g_fb0_opens > 0)
+		return;
+
+	/* Every pixel is suspect, so mark the whole screen rather than any
+	 * region the console thinks it dirtied -- it has no idea what was
+	 * drawn over it.  Flushed directly rather than through
+	 * console_flush(), which rate-limits and would drop this one. */
+	fb_mark_full_dirty();
+	fb_flush_dirty_regions();
+
+	/* And the pointer, which was not drawn either while the display was
+	 * owned.  It needs more than a redraw: the background it saved is from
+	 * before the other program took over, so it is discarded first --
+	 * otherwise the first movement stamps a rectangle of pre-session pixels
+	 * onto the console that was just restored. */
+	mouse_console_display_released();
 }
 
 int fbdev_ioctl(unsigned long req, void *argp, struct task *cur)

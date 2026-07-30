@@ -148,6 +148,7 @@ typedef struct {
 #define R_X86_64_DTPMOD64 16
 #define R_X86_64_DTPOFF64 17
 #define R_X86_64_TPOFF64 18
+#define R_X86_64_IRELATIVE 37
 
 /* Macros */
 #define ELF64_R_SYM(i) ((i) >> 32)
@@ -222,10 +223,37 @@ static void rtld_die(const char *msg)
 /*  DSO descriptor                                                    */
 /* ================================================================== */
 
-#define MAX_DSOS 64
+/* Bytes reserved at and above the thread pointer for libc's thread control
+ * block.  The TCB lives INSIDE the TLS allocation, at the thread pointer, so
+ * that %fs:0 is both the ABI-required self-pointer and the start of libc's
+ * struct __pthread.  libc static-asserts its structure against this value
+ * (LIKEOS_TCB_RESERVE in user/lib/libc/src/pthread/pthread_internal.h) — keep
+ * the two in step. */
+#define RTLD_TCB_RESERVE 2048
+
+/* Spare static TLS, handed out to objects that arrive via dlopen() after the
+ * block has been laid out.  Without it, a dlopen'd module carrying __thread
+ * data has nowhere to live: its offsets would fall outside the allocation.
+ * This is the same trick as the conventional loader's static TLS surplus. */
+#define RTLD_TLS_SURPLUS 1024
+
+/* An X server loads its client libraries plus a driver module per device
+ * and an extension module per protocol extension, so the object table has
+ * to be far larger than a typical program needs. */
+#define MAX_DSOS 256
+
+/* Object names are at most a basename ("libXfont2.so.2"), so a small fixed
+ * buffer is enough and keeps the loader allocation-free. */
+#define RTLD_NAME_MAX 96
 
 typedef struct dso {
+	/* Points at name_buf below, or at a string literal with static
+	 * lifetime.  It must NEVER borrow from another object's mapping: a
+	 * DT_NEEDED name lives in the *parent's* strtab, and dlclose()ing the
+	 * parent would leave every dependency holding a pointer into unmapped
+	 * pages — which rtld_find_dso() then walks straight into. */
 	const char *name;
+	char name_buf[RTLD_NAME_MAX];
 	uint64_t base;
 
 	const Elf64_Phdr *phdrs;
@@ -302,6 +330,9 @@ static int g_ndsos;
 static int g_tls_next_modid = 1;
 static uint64_t g_tls_static_size;
 static uint64_t g_tls_static_align = 16;
+static int g_tls_initialised;   /* the block is laid out exactly once */
+static uint8_t *g_tls_tp;       /* thread pointer of the initial thread */
+static uint64_t g_tls_reserved; /* bytes below tp available for TLS */
 static uint64_t g_page_size = 4096;
 
 static char g_dlerror_buf[256];
@@ -569,7 +600,12 @@ static void rtld_apply_relocs(dso_t *d, const Elf64_Rela *rel, size_t sz)
 			else if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
 				*tgt = 0;
 			else {
-				rtld_write_str("ld-likeos.so: undefined: ");
+				/* Name the object too: with a couple of dozen
+				 * libraries loaded, the symbol alone does not
+				 * say which one failed to resolve. */
+				rtld_write_str("ld-likeos.so: ");
+				rtld_write_str(d->name ? d->name : "?");
+				rtld_write_str(": undefined symbol: ");
 				rtld_write_str(d->strtab + sym->st_name);
 				rtld_write_str("\n");
 				*tgt = 0;
@@ -640,8 +676,27 @@ static void rtld_apply_relocs(dso_t *d, const Elf64_Rela *rel, size_t sz)
 			}
 			break;
 
+		/* IRELATIVE: the addend is a resolver function in this object.
+		 * Call it and store what it returns.  Skipping these (as the
+		 * default case used to) leaves a NULL where a function pointer
+		 * belongs, and the crash lands far from the cause. */
+		case R_X86_64_IRELATIVE: {
+			uint64_t (*resolver)(void) =
+				(uint64_t(*)(void))(d->base + rel[i].r_addend);
+			*tgt = resolver();
+			break;
+		}
+
 		case R_X86_64_NONE:
+			break;
+
 		default:
+			/* Say so rather than silently leaving the slot as it
+			 * was: an unhandled relocation type otherwise shows up
+			 * as an inexplicable jump to a wild address. */
+			rtld_write_str("ld-likeos.so: ");
+			rtld_write_str(d->name ? d->name : "?");
+			rtld_write_str(": unhandled relocation type\n");
 			break;
 		}
 	}
@@ -651,25 +706,95 @@ static void rtld_apply_relocs(dso_t *d, const Elf64_Rela *rel, size_t sz)
 /*  TLS                                                               */
 /* ================================================================== */
 
+/* Hand out a slice of the static TLS block.
+ *
+ * ORDER IS PART OF THE ABI.  The main executable must be assigned FIRST, so
+ * that its block sits immediately below the thread pointer.  Its __thread
+ * accesses are compiled local-exec (R_X86_64_TPOFF32), which the *static*
+ * linker resolves to constant offsets on exactly that assumption — there is no
+ * dynamic relocation left for us to adjust.  Assign a library ahead of the
+ * executable and every one of those accesses silently reads the wrong slice.
+ * _dl_main() therefore calls this for main_dso before loading any DT_NEEDED
+ * library; do not reorder it. */
 static void rtld_assign_tls(dso_t *d)
 {
 	if (!d->tls_memsz)
 		return;
 	d->tls_modid = g_tls_next_modid++;
-	uint64_t a = d->tls_align < 16 ? 16 : d->tls_align;
+
+	/* Use the object's OWN p_align, never a rounded-up minimum.  For
+	 * local-exec accesses the static linker has already burned the offset
+	 * into the instruction stream as
+	 *
+	 *     tpoff = offset_in_segment - align_up(p_memsz, p_align)
+	 *
+	 * so the slice has to be sized by that same formula.  Substituting a
+	 * 16-byte floor here (p_align is commonly 4 or 8) moves the image a few
+	 * bytes away from where every one of those instructions expects it, and
+	 * the reads land just past the end of the data. */
+	uint64_t a = d->tls_align ? d->tls_align : 1;
+
+	/* The BLOCK alignment is a separate question: the thread pointer keeps
+	 * a 16-byte floor so the TCB at tp stays suitably aligned. */
 	if (a > g_tls_static_align)
 		g_tls_static_align = a;
-	g_tls_static_size =
-		(g_tls_static_size + d->tls_memsz + a - 1) & ~(a - 1);
+
+	uint64_t want = (g_tls_static_size + d->tls_memsz + a - 1) & ~(a - 1);
+
+	/* Objects loaded after the block was laid out (dlopen) can only be
+	 * given space that was already reserved as surplus — the block cannot
+	 * grow, because every thread already has one at a fixed size. */
+	if (g_tls_initialised && want > g_tls_reserved) {
+		rtld_write_str("ld-likeos.so: ");
+		rtld_write_str(d->name ? d->name : "?");
+		rtld_write_str(": no static TLS space left for this object\n");
+		d->tls_memsz = 0;
+		d->tls_offset = 0;
+		return;
+	}
+
+	g_tls_static_size = want;
 	d->tls_offset = -(int64_t)g_tls_static_size; /* variant-II */
+
+	/* Already-running threads have a block whose images were copied at
+	 * creation, so a late arrival must initialise its own slice here. */
+	if (g_tls_initialised && g_tls_tp) {
+		uint8_t *dst = g_tls_tp + d->tls_offset;
+		rtld_memset(dst, 0, d->tls_memsz);
+		if (d->tls_filesz && d->tls_image)
+			rtld_memcpy(dst, (const void *)d->tls_image,
+				    d->tls_filesz);
+	}
 }
 
+/* Lay out the initial thread's TLS block.
+ *
+ * Variant-II layout, which is what x86-64 __thread accesses assume:
+ *
+ *     [ static TLS ][ tp ][ TCB ... ]
+ *       negative offsets    %fs:0 = self-pointer = libc's struct __pthread
+ *
+ * The TCB deliberately lives inside this allocation.  libc used to point %fs
+ * at a struct in its own .bss instead, which meant whichever of the two ran
+ * last won: with libc winning, every __thread access at %fs:-N landed in
+ * unrelated .bss.  Reserving RTLD_TCB_RESERVE bytes at the thread pointer lets
+ * both live at the same address without fighting over it.
+ *
+ * Runs exactly once.  dlopen() used to call this again and hand the process a
+ * brand-new block, silently discarding every thread's existing TLS. */
 static void rtld_init_tls(void)
 {
-	if (!g_tls_static_size)
+	if (g_tls_initialised)
 		return;
-	uint64_t total = (g_tls_static_size + 8 + g_tls_static_align - 1) &
-			 ~(g_tls_static_align - 1);
+
+	/* Round the static area up, then add the dlopen surplus so late
+	 * arrivals have somewhere to go. */
+	uint64_t stat_sz = (g_tls_static_size + g_tls_static_align - 1) &
+			   ~(g_tls_static_align - 1);
+	uint64_t reserved = stat_sz + RTLD_TLS_SURPLUS;
+	reserved = (reserved + g_tls_static_align - 1) &
+		   ~(g_tls_static_align - 1);
+	uint64_t total = reserved + RTLD_TCB_RESERVE;
 
 	void *blk = rtld_mmap(NULL, total + g_page_size, PROT_READ | PROT_WRITE,
 			      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -677,8 +802,12 @@ static void rtld_init_tls(void)
 		rtld_die("cannot allocate TLS block");
 	rtld_memset(blk, 0, total);
 
-	uint8_t *tp = (uint8_t *)blk + g_tls_static_size;
+	uint8_t *tp = (uint8_t *)blk + reserved;
 	*(uint64_t *)tp = (uint64_t)tp; /* self-pointer */
+
+	g_tls_reserved = reserved;
+	g_tls_tp = tp;
+	g_tls_initialised = 1;
 
 	for (int i = 0; i < g_ndsos; i++) {
 		dso_t *d = &g_dsos[i];
@@ -866,7 +995,20 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 	g_lib_mmap_base = (map + span + g_page_size - 1) & ~(g_page_size - 1);
 
 	dso_t *d = rtld_alloc_dso();
-	d->name = soname;
+	/* Own the name (see the field comment): `soname` usually points into
+	 * the requesting object's string table, which can be unmapped while
+	 * this object is still loaded. */
+	{
+		size_t n = 0;
+		if (soname) {
+			while (soname[n] && n < RTLD_NAME_MAX - 1) {
+				d->name_buf[n] = soname[n];
+				n++;
+			}
+		}
+		d->name_buf[n] = '\0';
+		d->name = d->name_buf;
+	}
 	d->base = map - lo;
 	d->map_base = map;
 	d->map_size = span;
@@ -1058,6 +1200,53 @@ void *_rtld_dlsym(void *handle, const char *symbol)
 int _rtld_dlclose(void *handle) __attribute__((visibility("default")));
 char *_rtld_dlerror(void) __attribute__((visibility("default")));
 
+/* ------------------------------------------------------------------ *
+ * TLS interface for libc.
+ *
+ * libc creates a thread's stack and control block, so it — not the loader —
+ * has to place the per-thread TLS area.  These three calls tell it how much
+ * room to leave below the thread pointer and fill that area with the initial
+ * images.  Keeping the knowledge of which objects own which slice here means
+ * libc never has to walk the object list.
+ * ------------------------------------------------------------------ */
+
+uint64_t _rtld_tls_size(void) __attribute__((visibility("default")));
+uint64_t _rtld_tls_align(void) __attribute__((visibility("default")));
+void _rtld_tls_init(void *tp) __attribute__((visibility("default")));
+
+/* Bytes that must be reserved BELOW the thread pointer. */
+uint64_t _rtld_tls_size(void)
+{
+	return g_tls_reserved;
+}
+
+uint64_t _rtld_tls_align(void)
+{
+	return g_tls_static_align;
+}
+
+/* Fill [tp - _rtld_tls_size(), tp) with each object's initial image, zeroing
+ * the .tbss remainder.  The caller has already zeroed the block, but do it
+ * again per-object so a recycled allocation cannot leak another thread's
+ * values. */
+void _rtld_tls_init(void *tp)
+{
+	uint8_t *t = (uint8_t *)tp;
+
+	if (!t)
+		return;
+	for (int i = 0; i < g_ndsos; i++) {
+		dso_t *d = &g_dsos[i];
+		if (!d->tls_memsz || !d->tls_offset)
+			continue;
+		uint8_t *dst = t + d->tls_offset;
+		rtld_memset(dst, 0, d->tls_memsz);
+		if (d->tls_filesz && d->tls_image)
+			rtld_memcpy(dst, (const void *)d->tls_image,
+				    d->tls_filesz);
+	}
+}
+
 void *_rtld_dlopen(const char *filename, int flags)
 {
 	(void)flags;
@@ -1076,10 +1265,19 @@ void *_rtld_dlopen(const char *filename, int flags)
 
 	dso_t *ld = NULL;
 	if (filename[0] == '/') {
+		/* Objects are registered under their basename, so an absolute
+		 * path has to be matched against that too — otherwise
+		 * dlopen("/usr/lib/xorg/modules/libfoo.so") loads a second
+		 * copy of an object already open as "libfoo.so". */
 		const char *bn = filename;
 		for (const char *p = filename; *p; p++)
 			if (*p == '/')
 				bn = p + 1;
+		d = rtld_find_dso(bn);
+		if (d) {
+			d->refcount++;
+			return d;
+		}
 		ld = rtld_load_dso_from_file(filename, bn);
 	} else {
 		ld = rtld_load_library(filename);
@@ -1089,10 +1287,22 @@ void *_rtld_dlopen(const char *filename, int flags)
 		return NULL;
 	}
 
-	rtld_relocate(ld);
-	if (ld->tls_memsz)
-		rtld_init_tls();
-	rtld_init_dso(ld);
+	/* Relocate and initialise everything that is not done yet, not just the
+	 * object named above: loading it may have pulled in its own DT_NEEDED
+	 * dependencies, and those arrive unrelocated.  Leaving them that way
+	 * means calling through GOT slots that were never filled in, which is
+	 * how a dlopen'd module with a dependency of its own crashes.  Both
+	 * helpers are idempotent, so already-loaded objects are skipped.
+	 *
+	 * Dependencies are appended to g_dsos after the object that needs them,
+	 * so walking backwards relocates and initialises them first. */
+	for (int i = g_ndsos - 1; i >= 0; i--)
+		rtld_relocate(&g_dsos[i]);
+	/* No-op after the first call; a dlopen'd object's slice is initialised
+	 * in rtld_assign_tls() as it is assigned out of the surplus. */
+	rtld_init_tls();
+	for (int i = g_ndsos - 1; i >= 0; i--)
+		rtld_init_dso(&g_dsos[i]);
 	return ld;
 }
 
@@ -1261,9 +1471,10 @@ uint64_t _dl_main(uint64_t *sp, uint64_t own_base)
 	for (int i = g_ndsos - 1; i >= 0; i--)
 		rtld_relocate(&g_dsos[i]);
 
-	/* ---- TLS ---- */
-	if (g_tls_static_size)
-		rtld_init_tls();
+	/* ---- TLS ----
+	 * Unconditional: even a program with no __thread data needs the block,
+	 * because libc's thread control block lives at the thread pointer. */
+	rtld_init_tls();
 
 	/* ---- Initializers ---- */
 	for (int i = 0; i < g_ndsos; i++)

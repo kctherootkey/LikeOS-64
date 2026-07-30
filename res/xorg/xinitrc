@@ -1,0 +1,37 @@
+#!/bin/sh
+# Default X session, installed as /etc/X11/xinit/xinitrc.
+#
+# xinit runs this unless the user has their own ~/.xinitrc.  When it exits, the
+# session is over and the server shuts down -- so the LAST command runs in the
+# foreground and defines the session's lifetime, and everything before it is a
+# background helper that gets killed when that program ends.
+
+# System-wide X resources.  The toolkit reads the file named by $XENVIRONMENT as
+# this host's resource file, which gets these defaults to every toolkit client
+# without needing xrdb (not built) to publish them on the root window.
+#
+# Exported before any client starts, because a client only reads resources once
+# at startup.
+if [ -r /etc/X11/Xresources ]; then
+	XENVIRONMENT=/etc/X11/Xresources
+	export XENVIRONMENT
+fi
+
+# Keyboard map.  The server already reads this from xorg.conf; setting it again
+# here is where to change it for a session without editing the configuration.
+if [ -x /usr/bin/setxkbmap ]; then
+	setxkbmap us
+fi
+
+# Plain grey root window.  The default is a black-and-white weave that renders
+# as harsh dither on a framebuffer with no colormap tricks available.
+xsetroot -solid grey
+
+# No terminal is started here on purpose.  Use "New xterm" on the root menu
+# (button 1 on the background) to open one.  Starting clients from this script
+# only obscures which of them failed and why.
+
+# The window manager runs in the FOREGROUND, which is the conventional
+# arrangement for twm and its relatives: "Exit" on the root menu then ends the
+# session and stops the server, rather than merely removing the decorations.
+exec ctwm

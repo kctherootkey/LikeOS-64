@@ -5,6 +5,7 @@
 #include <sched.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sys/shm.h>
 #include <malloc.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -40,6 +41,7 @@
 #include <sys/uio.h>
 #include <sys/resource.h>
 #include <dirent.h>
+#include <strings.h>
 #include <libgen.h>
 #include <setjmp.h>
 #include <utime.h>
@@ -142,6 +144,22 @@ static void __test_fail_impl(const char *name, const char *file, int line,
 	}
 }
 
+/* Records whether a signal handler was entered with the stack alignment the
+ * ABI promises.  The check is an ALIGNED 16-byte local rather than arithmetic
+ * on RSP: what actually faulted before the fix was `movaps %xmm0,(%rsp)`, and
+ * a handler entered 8 bytes out leaves exactly this kind of local misaligned. */
+volatile int __sig_align_rsp_ok = -1;
+
+static void sig_align_handler(int sig)
+{
+	__attribute__((aligned(16))) unsigned char probe[16];
+
+	(void)sig;
+	for (int i = 0; i < 16; i++)
+		probe[i] = (unsigned char)i;
+	__sig_align_rsp_ok = (((unsigned long)probe & 0xF) == 0) ? 1 : 0;
+}
+
 static void __test_result_impl(const char *name, int condition,
 			       const char *expr, const char *file, int line,
 			       int saved_errno)
@@ -170,6 +188,191 @@ static void __test_result_impl(const char *name, int condition,
 		__test_result_impl((name), __test_ok, #cond, __FILE__, \
 				   __LINE__, errno);                   \
 	} while (0)
+
+/* Descriptors 0, 1 and 2 are ordinary descriptors: they can be closed, and the
+ * numbers then freed are the lowest available ones, so the next open() or dup()
+ * gets them back.  That is how a program hands itself a terminal --
+ * close(0) followed by dup(slave) -- and it is exactly what xterm does for the
+ * shell it starts.
+ *
+ * These checks run in a CHILD on purpose: they close the standard descriptors,
+ * which in the test process itself would take the harness's own output with
+ * them.  One character per check comes back over a pipe.
+ *
+ * The interesting part is that the console has no object behind it -- it is
+ * represented by an EMPTY slot at 0/1/2 -- so "closed" and "attached to the
+ * terminal" are the same state unless the close is recorded separately.  Checks
+ * 2 and 3 are what tell those two apart. */
+#define FDR_CHECKS 10
+
+static void fd_reuse_child(int wfd)
+{
+	char r[FDR_CHECKS];
+	struct stat ss, s0, s1, s2;
+	char pts[32];
+	int i, m = -1, sl = -1, n = -1;
+	int pfd[2];
+	char c;
+
+	memset(r, '0', sizeof(r));
+
+	/* Own session first, which is also what a terminal emulator's child does
+	 * before it touches the pty.  Opening a pts slave makes the opener's
+	 * process group the terminal's foreground group, and fork() left this
+	 * child in the PARENT's group -- so when the master closed at exit the
+	 * hangup went to the whole group and killed the test harness. */
+	setsid();
+
+	/* 1. Closing a standard descriptor is allowed at all. */
+	r[0] = (close(0) == 0) ? '1' : '0';
+
+	/* 2. ...and it stays closed.  An empty slot at 0 must not read back as
+	 *    the console again. */
+	r[1] = (close(0) == -1 && errno == EBADF) ? '1' : '0';
+
+	/* 3. Same question from the I/O side: reading a closed 0 is an error,
+	 *    not a silent read from the terminal. */
+	r[2] = (read(0, &c, 1) == -1 && errno == EBADF) ? '1' : '0';
+
+	/* 4. "Lowest available descriptor" includes the standard ones once
+	 *    they are free. */
+	i = open("/dev/null", O_RDONLY);
+	r[3] = (i == 0) ? '1' : '0';
+
+	/* 5. dup() allocates by the same rule as open(). */
+	if (pipe(pfd) == 0) {
+		close(0);
+		r[4] = (dup(pfd[0]) == 0) ? '1' : '0';
+		close(pfd[0]);
+		close(pfd[1]);
+	}
+
+	/* 6-9. The sequence a terminal emulator runs in the child it forks,
+	 *      verbatim from xterm: close each standard descriptor and dup the
+	 *      pty slave onto it.  Checked by device identity and not merely by
+	 *      isatty(), because the console is a terminal too -- and the
+	 *      console is precisely what the shell wrongly ended up talking to
+	 *      when these descriptors could not be closed. */
+	m = posix_openpt(O_RDWR);
+	if (m >= 0 && ioctl(m, TIOCGPTN, &n) == 0 && n >= 0) {
+		snprintf(pts, sizeof(pts), "/dev/pts/%d", n);
+		sl = open(pts, O_RDWR);
+	}
+	if (sl >= 0 && fstat(sl, &ss) == 0) {
+		int dup_ok = 1;
+		for (i = 0; i <= 2; i++) {
+			if (i != sl) {
+				close(i);
+				if (dup(sl) != i)
+					dup_ok = 0;
+			}
+		}
+		r[5] = (dup_ok && isatty(0) && isatty(1) && isatty(2)) ? '1' :
+									 '0';
+		r[6] = (fstat(0, &s0) == 0 && s0.st_rdev == ss.st_rdev) ? '1' :
+									  '0';
+		r[7] = (fstat(1, &s1) == 0 && s1.st_rdev == ss.st_rdev) ? '1' :
+									  '0';
+		r[8] = (fstat(2, &s2) == 0 && s2.st_rdev == ss.st_rdev) ? '1' :
+									  '0';
+	}
+
+	/* 10. However the kernel records the close, it must not show up in the
+	 *     descriptor flags a program can read: F_GETFD is defined to report
+	 *     FD_CLOEXEC and nothing else. */
+	r[9] = (fcntl(0, F_GETFD) == 0) ? '1' : '0';
+
+	if (write(wfd, r, sizeof(r)) != (ssize_t)sizeof(r)) {
+		/* Nothing useful to do; the parent times the read out. */
+	}
+	_exit(0);
+}
+
+/* Concurrent sendmsg/recvmsg on AF_UNIX.
+ *
+ * Two processes, each on its OWN socketpair, pushing distinct byte patterns
+ * through at the same time.  The concurrency is the whole point: every
+ * unix-socket sendmsg and recvmsg used to be staged through one static 4 KB
+ * buffer shared by the entire system, with no lock, so two processes doing this
+ * simultaneously received each other's bytes.  No single-threaded test can see
+ * that -- which is why it survived until an X client aborted with "[xcb]
+ * Unknown sequence number while processing queue" on a window resize.
+ *
+ * Two iovecs per call on purpose: a single flat buffer would not exercise the
+ * scatter/gather path the staging buffer used to serve. */
+#define UDS_MSG_LEN 2048
+#define UDS_ROUNDS 200
+
+/* Fill iov[] with up to two segments covering b[0..len), and return the count. */
+static int uds_split(struct iovec *iov, unsigned char *b, size_t len)
+{
+	size_t half = len / 2;
+	if (half == 0) {
+		iov[0].iov_base = b;
+		iov[0].iov_len = len;
+		return 1;
+	}
+	iov[0].iov_base = b;
+	iov[0].iov_len = half;
+	iov[1].iov_base = b + half;
+	iov[1].iov_len = len - half;
+	return 2;
+}
+
+static int uds_send_all(int fd, unsigned char *b, size_t len)
+{
+	size_t off = 0;
+	while (off < len) {
+		struct iovec iov[2];
+		struct msghdr mh;
+		int n;
+		memset(&mh, 0, sizeof(mh));
+		mh.msg_iov = iov;
+		mh.msg_iovlen = uds_split(iov, b + off, len - off);
+		n = sendmsg(fd, &mh, 0);
+		if (n <= 0)
+			return -1;
+		off += (size_t)n;
+	}
+	return 0;
+}
+
+static int uds_recv_all(int fd, unsigned char *b, size_t len)
+{
+	size_t off = 0;
+	while (off < len) {
+		struct iovec iov[2];
+		struct msghdr mh;
+		int n;
+		memset(&mh, 0, sizeof(mh));
+		mh.msg_iov = iov;
+		mh.msg_iovlen = uds_split(iov, b + off, len - off);
+		n = recvmsg(fd, &mh, 0);
+		if (n <= 0)
+			return -1;
+		off += (size_t)n;
+	}
+	return 0;
+}
+
+/* Returns 0 on success, -1 on an I/O failure, -2 if the bytes read back were
+ * not the bytes written -- i.e. another process's data arrived here. */
+static int uds_run(int sv[2], unsigned char tag, int rounds)
+{
+	unsigned char out[UDS_MSG_LEN], in[UDS_MSG_LEN];
+	for (int r = 0; r < rounds; r++) {
+		for (size_t i = 0; i < sizeof(out); i++)
+			out[i] = (unsigned char)(tag ^ (unsigned char)(i + (size_t)r));
+		if (uds_send_all(sv[0], out, sizeof(out)) != 0)
+			return -1;
+		memset(in, 0, sizeof(in));
+		if (uds_recv_all(sv[1], in, sizeof(in)) != 0)
+			return -1;
+		if (memcmp(in, out, sizeof(out)) != 0)
+			return -2;
+	}
+	return 0;
+}
 
 /* Bind a socket to an ephemeral port on the given local IP (host byte
  * order).  Returns the assigned port number (host byte order) on
@@ -830,6 +1033,63 @@ static void test_evdev(void)
 			    ioctl(fd, EVIOCGRAB, (void *)1) == 0);
 		test_result("EVIOCGRAB(0) releases the grab",
 			    ioctl(fd, EVIOCGRAB, (void *)0) == 0);
+
+		/* The probe sequence xf86-input-evdev runs at device init.
+		 * All of these used to be rejected outright, which stops the
+		 * driver before it ever reads an event. */
+		unsigned char props[(INPUT_PROP_MAX + 7) / 8];
+		memset(props, 0xFF, sizeof(props));
+		test_result("EVIOCGPROP returns a property bitmap",
+			    ioctl(fd, EVIOCGPROP(sizeof(props)), props) > 0);
+		test_result("keyboard claims no pointer property",
+			    (props[INPUT_PROP_POINTER / 8] &
+			     (1 << (INPUT_PROP_POINTER % 8))) == 0);
+
+		char phys[64] = { 0 };
+		int pn = ioctl(fd, EVIOCGPHYS(sizeof(phys)), phys);
+		test_result("EVIOCGPHYS returns a physical path",
+			    pn > 0 && phys[0] != '\0');
+
+		/* No serial number exists, and saying so is not the same as
+		 * reporting an empty one. */
+		char uniq[64] = { 0 };
+		errno = 0;
+		test_result("EVIOCGUNIQ reports no unique id -> ENOENT",
+			    ioctl(fd, EVIOCGUNIQ(sizeof(uniq)), uniq) == -1 &&
+				    errno == ENOENT);
+
+		struct input_absinfo ai;
+		memset(&ai, 0xFF, sizeof(ai));
+		test_result("EVIOCGABS succeeds on a relative-only device",
+			    ioctl(fd, EVIOCGABS(ABS_X), &ai) == 0);
+		test_result("EVIOCGABS reports an empty range",
+			    ai.minimum == 0 && ai.maximum == 0);
+
+		unsigned char leds[(LED_MAX + 7) / 8];
+		memset(leds, 0xFF, sizeof(leds));
+		test_result("EVIOCGLED returns the LED state",
+			    ioctl(fd, EVIOCGLED(sizeof(leds)), leds) > 0 &&
+				    leds[0] == 0);
+
+		unsigned char sw[(SW_MAX + 7) / 8];
+		memset(sw, 0xFF, sizeof(sw));
+		test_result("EVIOCGSW returns the switch state",
+			    ioctl(fd, EVIOCGSW(sizeof(sw)), sw) > 0 &&
+				    sw[0] == 0);
+
+		/* Display servers switch to CLOCK_MONOTONIC so input timing
+		 * survives the wall clock being stepped. */
+		int clk = CLOCK_MONOTONIC;
+		test_result("EVIOCSCLOCKID accepts CLOCK_MONOTONIC",
+			    ioctl(fd, EVIOCSCLOCKID, &clk) == 0);
+		clk = CLOCK_REALTIME;
+		test_result("EVIOCSCLOCKID accepts CLOCK_REALTIME",
+			    ioctl(fd, EVIOCSCLOCKID, &clk) == 0);
+		clk = 99;
+		errno = 0;
+		test_result("EVIOCSCLOCKID rejects an unknown clock",
+			    ioctl(fd, EVIOCSCLOCKID, &clk) == -1 &&
+				    errno == EINVAL);
 		close(fd);
 	}
 
@@ -857,6 +1117,22 @@ static void test_evdev(void)
 		memset(&id, 0, sizeof(id));
 		test_result("mouse: EVIOCGID distinct product",
 			    ioctl(fd, EVIOCGID, &id) == 0 && id.product == 2);
+
+		/* The mouse must advertise INPUT_PROP_POINTER: that is how a
+		 * driver tells relative motion driving a cursor apart from a
+		 * touchscreen that maps onto screen coordinates. */
+		unsigned char mprops[(INPUT_PROP_MAX + 7) / 8];
+		memset(mprops, 0, sizeof(mprops));
+		test_result("mouse: EVIOCGPROP returns a bitmap",
+			    ioctl(fd, EVIOCGPROP(sizeof(mprops)), mprops) > 0);
+		test_result("mouse: claims INPUT_PROP_POINTER",
+			    (mprops[INPUT_PROP_POINTER / 8] &
+			     (1 << (INPUT_PROP_POINTER % 8))) != 0);
+
+		char mphys[64] = { 0 };
+		test_result("mouse: EVIOCGPHYS differs from the keyboard's",
+			    ioctl(fd, EVIOCGPHYS(sizeof(mphys)), mphys) > 0 &&
+				    mphys[0] != '\0');
 		close(fd);
 	}
 
@@ -1944,6 +2220,93 @@ static void test_ioctl_non_tty(void)
 	}
 	/* Still alive => the kernel did not dereference a marker value. */
 	test_result("kernel survived ioctl on marker fds", 1);
+
+	/* An epoll set must survive a child that inherited its descriptor.
+	 *
+	 * The instance is global to the kernel while the descriptor is
+	 * per-process, so fork() hands the child a second reference to the
+	 * same set.  Closing it there used to destroy the instance outright,
+	 * and the PARENT's epoll_wait() then failed with EBADF forever.  The X
+	 * server hit this the moment it forked to run xkbcomp: the keymap
+	 * compiled, xkbcomp exited, and the main loop span printing
+	 * "WaitForSomething(): poll: Bad file descriptor". */
+	{
+		int pfd[2];
+		int epfd = epoll_create1(0);
+
+		if (epfd >= 0 && pipe(pfd) == 0) {
+			struct epoll_event ev;
+			pid_t kid;
+
+			ev.events = EPOLLIN;
+			ev.data.fd = pfd[0];
+			test_result("epoll_ctl ADD before fork",
+				    epoll_ctl(epfd, EPOLL_CTL_ADD, pfd[0], &ev) == 0);
+
+			kid = fork();
+			if (kid == 0) {
+				/* Close the inherited copy and exit -- exactly
+				 * what a short-lived helper process does. */
+				close(epfd);
+				close(pfd[0]);
+				close(pfd[1]);
+				_exit(0);
+			}
+			if (kid > 0) {
+				int st = 0;
+
+				while (waitpid(kid, &st, 0) < 0 && errno == EINTR)
+					;
+
+				/* The parent's set must still work. */
+				struct epoll_event out;
+
+				errno = 0;
+				int n = epoll_wait(epfd, &out, 1, 0);
+				test_result("epoll survives a child closing its copy",
+					    n >= 0 && errno != EBADF);
+
+				/* And must still report real readiness. */
+				if (write(pfd[1], "x", 1) == 1) {
+					n = epoll_wait(epfd, &out, 1, 500);
+					test_result("epoll still reports readiness after fork",
+						    n == 1 &&
+							    out.data.fd == pfd[0]);
+				} else {
+					test_fail("epoll-fork: write to pipe failed");
+				}
+			} else {
+				test_fail("epoll-fork: fork failed");
+			}
+			close(pfd[0]);
+			close(pfd[1]);
+			close(epfd);
+		} else {
+			test_fail("epoll-fork: setup failed");
+		}
+	}
+
+	/* dup() takes a reference too: closing one copy must not invalidate
+	 * the other. */
+	{
+		int epfd = epoll_create1(0);
+
+		if (epfd >= 0) {
+			int dupfd = dup(epfd);
+
+			test_result("dup of an epoll fd succeeds", dupfd >= 0);
+			if (dupfd >= 0) {
+				struct epoll_event out;
+
+				close(epfd);
+				errno = 0;
+				test_result("epoll survives closing the original fd",
+					    epoll_wait(dupfd, &out, 1, 0) >= 0 &&
+						    errno != EBADF);
+				close(dupfd);
+			}
+		}
+	}
 }
 
 static void test_jobctl_wait(void)
@@ -2196,6 +2559,689 @@ static void test_dup_redirected_stdio(void)
 	errno = 0;
 	test_result("F_DUPFD on a closed fd -> EBADF",
 		    fcntl(200, F_DUPFD, 10) == -1 && errno == EBADF);
+}
+
+/* ---- POSIX shared memory ---------------------------------------------
+ *
+ * The property under test is the one nothing else in this system provides:
+ * two processes that are NOT related by fork() mapping the same physical
+ * memory.  MAP_SHARED on anonymous memory only survives fork; a shared memory
+ * object has to be reachable by name.
+ */
+static void test_shm(void)
+{
+	const char *nm = "/tl_shm_test";
+	const size_t sz = 8192;
+
+	printf("\n[TEST] POSIX shared memory (shm_open/ftruncate/mmap)\n");
+
+	shm_unlink(nm); /* clear anything a previous run left behind */
+
+	int fd = shm_open(nm, O_RDWR | O_CREAT | O_EXCL, 0600);
+	test_result("shm_open creates an object", fd >= 0);
+	if (fd < 0)
+		return;
+
+	/* A fresh object has no memory until it is sized. */
+	struct stat st;
+	test_result("a new object starts empty",
+		    fstat(fd, &st) == 0 && st.st_size == 0);
+
+	test_result("ftruncate sizes the object", ftruncate(fd, sz) == 0);
+	test_result("fstat reports the new size",
+		    fstat(fd, &st) == 0 && (size_t)st.st_size == sz);
+	test_result("the object looks like a regular file",
+		    S_ISREG(st.st_mode));
+
+	void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	test_result("mmap of the object succeeds", p != MAP_FAILED);
+	if (p == MAP_FAILED) {
+		close(fd);
+		shm_unlink(nm);
+		return;
+	}
+	test_result("the object reads as zero", ((char *)p)[0] == 0 &&
+						       ((char *)p)[sz - 1] == 0);
+
+	strcpy((char *)p, "written by the parent");
+
+	/* Opening the SAME NAME again must reach the same memory.  A second
+	 * mapping in this process is the cheap half of the test... */
+	int fd2 = shm_open(nm, O_RDWR, 0);
+	test_result("the object can be opened again by name", fd2 >= 0);
+	if (fd2 >= 0) {
+		void *q = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED,
+			       fd2, 0);
+		test_result("a second mapping succeeds", q != MAP_FAILED);
+		if (q != MAP_FAILED) {
+			test_result("both mappings see the same bytes",
+				    strcmp((char *)q,
+					   "written by the parent") == 0);
+			((char *)q)[0] = 'W';
+			test_result("a write through one is seen by the other",
+				    ((char *)p)[0] == 'W');
+			munmap(q, sz);
+		}
+		close(fd2);
+	}
+
+	/* ...and this is the real one: a child that opens the object by name
+	 * AFTER forking, so nothing was inherited through the address space. */
+	{
+		int sync_pipe[2];
+		if (pipe(sync_pipe) == 0) {
+			pid_t kid = fork();
+			if (kid == 0) {
+				char c;
+				/* Drop the inherited mapping and descriptor so
+				 * nothing can be reached except by name. */
+				munmap(p, sz);
+				close(fd);
+				close(sync_pipe[1]);
+				read(sync_pipe[0], &c, 1); /* wait for the go-ahead */
+				close(sync_pipe[0]);
+
+				int cfd = shm_open(nm, O_RDWR, 0);
+				if (cfd < 0)
+					_exit(10);
+				void *cp = mmap(NULL, sz,
+						PROT_READ | PROT_WRITE,
+						MAP_SHARED, cfd, 0);
+				if (cp == MAP_FAILED)
+					_exit(11);
+				if (strcmp((char *)cp + 1,
+					   "ritten by the parent") != 0)
+					_exit(12);
+				strcpy((char *)cp + 100, "written by the child");
+				munmap(cp, sz);
+				close(cfd);
+				_exit(0);
+			} else if (kid > 0) {
+				int st2 = 0;
+				close(sync_pipe[0]);
+				write(sync_pipe[1], "g", 1);
+				close(sync_pipe[1]);
+				waitpid(kid, &st2, 0);
+				test_result(
+					"an unrelated process opened it by name and read our data",
+					WIFEXITED(st2) &&
+						WEXITSTATUS(st2) == 0);
+				test_result(
+					"the child's write is visible to us",
+					strcmp((char *)p + 100,
+					       "written by the child") == 0);
+			}
+		}
+	}
+
+	/* Unlinking removes the name but must not pull the memory out from
+	 * under a mapping that is still live. */
+	test_result("shm_unlink removes the name", shm_unlink(nm) == 0);
+	test_result("the mapping still works after unlink",
+		    strcmp((char *)p + 100, "written by the child") == 0);
+	errno = 0;
+	test_result("the name is gone",
+		    shm_open(nm, O_RDWR, 0) == -1);
+	errno = 0;
+	test_result("unlinking a missing name -> ENOENT",
+		    shm_unlink("/tl_shm_absent") == -1 && errno == ENOENT);
+
+	munmap(p, sz);
+	close(fd);
+
+	/* The name is free again once nothing holds the object. */
+	int fd3 = shm_open(nm, O_RDWR | O_CREAT | O_EXCL, 0600);
+	test_result("the name can be reused after everything is released",
+		    fd3 >= 0);
+	if (fd3 >= 0) {
+		close(fd3);
+		shm_unlink(nm);
+	}
+}
+
+/* ---- System V shared memory -------------------------------------------
+ *
+ * Modelled on what the MIT-SHM X extension actually does: one process creates
+ * a segment and attaches it, hands the IDENTIFIER (not a descriptor, not an
+ * address) to another process, and that one attaches the same memory.
+ */
+static void test_sysv_shm(void)
+{
+	const size_t sz = 4096;
+
+	printf("\n[TEST] System V shared memory (shmget/shmat/shmdt)\n");
+
+	int id = shmget(IPC_PRIVATE, sz, IPC_CREAT | 0600);
+	test_result("shmget creates a segment", id >= 0);
+	if (id < 0)
+		return;
+
+	void *p = shmat(id, NULL, 0);
+	test_result("shmat attaches it", p != (void *)-1);
+	if (p == (void *)-1) {
+		shmctl(id, IPC_RMID, NULL);
+		return;
+	}
+	test_result("the segment reads as zero",
+		    ((char *)p)[0] == 0 && ((char *)p)[sz - 1] == 0);
+
+	struct shmid_ds ds;
+	memset(&ds, 0, sizeof(ds));
+	test_result("IPC_STAT reports the size",
+		    shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_segsz >= sz);
+
+	strcpy((char *)p, "segment contents");
+
+	/* The identifier is meaningful in another process: the child attaches
+	 * by id alone, having dropped everything it inherited. */
+	{
+		int sync_pipe[2];
+		if (pipe(sync_pipe) == 0) {
+			pid_t kid = fork();
+			if (kid == 0) {
+				char c;
+				shmdt(p); /* drop the inherited attachment */
+				close(sync_pipe[1]);
+				read(sync_pipe[0], &c, 1);
+				close(sync_pipe[0]);
+
+				void *cp = shmat(id, NULL, 0);
+				if (cp == (void *)-1)
+					_exit(20);
+				if (strcmp((char *)cp, "segment contents") != 0)
+					_exit(21);
+				strcpy((char *)cp + 64, "child was here");
+				shmdt(cp);
+				_exit(0);
+			} else if (kid > 0) {
+				int st = 0;
+				close(sync_pipe[0]);
+				write(sync_pipe[1], "g", 1);
+				close(sync_pipe[1]);
+				waitpid(kid, &st, 0);
+				test_result(
+					"another process attached by identifier alone",
+					WIFEXITED(st) && WEXITSTATUS(st) == 0);
+				test_result("its write is visible to us",
+					    strcmp((char *)p + 64,
+						   "child was here") == 0);
+			}
+		}
+	}
+
+	/* Removing the segment while it is attached must not pull the memory
+	 * away — create-attach-remove is the usual order precisely so nothing
+	 * survives a crash. */
+	test_result("IPC_RMID marks it for removal",
+		    shmctl(id, IPC_RMID, NULL) == 0);
+	test_result("the attachment still works after removal",
+		    strcmp((char *)p, "segment contents") == 0);
+
+	test_result("shmdt detaches", shmdt(p) == 0);
+	errno = 0;
+	test_result("detaching a bad address fails",
+		    shmdt((void *)0x12345000) == -1);
+
+	/* A keyed segment: a second shmget with the same key finds it. */
+	{
+		int k = 0x4C494B45; /* an arbitrary well-known key */
+		int a = shmget(k, sz, IPC_CREAT | 0600);
+		int b = shmget(k, sz, 0);
+		test_result("a keyed segment is found again by key",
+			    a >= 0 && b == a);
+		errno = 0;
+		test_result("IPC_EXCL refuses an existing key",
+			    shmget(k, sz, IPC_CREAT | IPC_EXCL | 0600) == -1 &&
+				    errno == EEXIST);
+		if (a >= 0)
+			shmctl(a, IPC_RMID, NULL);
+	}
+	errno = 0;
+	test_result("an unknown key without IPC_CREAT -> ENOENT",
+		    shmget(0x7ABCDEF1, sz, 0) == -1 && errno == ENOENT);
+}
+
+/* ---- libc additions the X.org port needs ----------------------------- */
+
+static int xorg_filter_dot(const struct dirent *d)
+{
+	return d->d_name[0] != '.';
+}
+
+static int qsort_r_cmp(const void *a, const void *b, void *arg)
+{
+	int *calls = (int *)arg;
+	(*calls)++;
+	return *(const int *)a - *(const int *)b;
+}
+
+static int qsort_int_cmp(const void *a, const void *b)
+{
+	int x = *(const int *)a, y = *(const int *)b;
+	return (x > y) - (x < y);
+}
+
+/* Fault handler used by the PROT_NONE check: reaching it proves the access
+ * faulted, and exiting from it keeps the fault out of the kernel's crash
+ * reporter (the process is handling the signal, not dying from it). */
+static void protnone_segv_handler(int sig)
+{
+	(void)sig;
+	_exit(42);
+}
+
+/* ---- ELF thread-local storage (__thread) ------------------------------
+ *
+ * pixman and the X server use __thread heavily.  Until the loader and libc
+ * agreed on where the thread pointer lives, %fs pointed at a struct in libc's
+ * .bss and every access here read unrelated memory instead.  An initialised
+ * variable lands in .tdata (copied per thread), an uninitialised one in .tbss
+ * (zeroed per thread); both are exercised.
+ */
+static __thread int tls_initialised = 0xABCD;
+static __thread int tls_zeroed;
+static __thread char tls_buf[64];
+
+struct tls_probe {
+	int saw_initial; /* the .tdata image arrived */
+	int saw_zero; /* the .tbss area was zeroed */
+	int private_ok; /* writes stayed private to this thread */
+	unsigned long tp; /* this thread's %fs base */
+};
+
+static void *tls_thread_fn(void *arg)
+{
+	struct tls_probe *p = (struct tls_probe *)arg;
+	int want = (int)(long)p->tp; /* reused below as a marker */
+
+	p->saw_initial = (tls_initialised == 0xABCD);
+	p->saw_zero = (tls_zeroed == 0 && tls_buf[0] == '\0');
+
+	/* Stamp our own copies, wait for the other thread to do the same, and
+	 * confirm nothing bled across. */
+	tls_initialised = want;
+	tls_zeroed = want;
+	for (int i = 0; i < 64; i++)
+		tls_buf[i] = (char)(want + i);
+
+	usleep(150000);
+
+	p->private_ok = (tls_initialised == want && tls_zeroed == want &&
+			 tls_buf[7] == (char)(want + 7));
+	__asm__ volatile("mov %%fs:0, %0" : "=r"(p->tp));
+	return NULL;
+}
+
+static void test_tls(void)
+{
+	printf("\n[TEST] ELF thread-local storage (__thread)\n");
+
+	/* Main thread: the loader must have copied the .tdata image and zeroed
+	 * the .tbss remainder into its block. */
+	test_result("main thread sees the .tdata initial value",
+		    tls_initialised == 0xABCD);
+	test_result("main thread sees .tbss zeroed",
+		    tls_zeroed == 0 && tls_buf[0] == '\0');
+
+	tls_initialised = 0x1111;
+	tls_zeroed = 0x2222;
+	strcpy(tls_buf, "main");
+
+	/* The thread pointer must sit inside a real TLS block, not in .bss.
+	 * A __thread variable is addressed below %fs, so its address has to be
+	 * lower than the thread pointer. */
+	unsigned long tp = 0;
+	__asm__ volatile("mov %%fs:0, %0" : "=r"(tp));
+	test_result("thread pointer is non-zero", tp != 0);
+	test_result("__thread data lives below the thread pointer",
+		    (unsigned long)&tls_initialised < tp);
+
+	pthread_t t1, t2;
+	struct tls_probe p1 = { 0, 0, 0, 0x5A5A }, p2 = { 0, 0, 0, 0x7C7C };
+	int r1 = pthread_create(&t1, NULL, tls_thread_fn, &p1);
+	int r2 = pthread_create(&t2, NULL, tls_thread_fn, &p2);
+
+	test_result("two threads started", r1 == 0 && r2 == 0);
+	if (r1 == 0)
+		pthread_join(t1, NULL);
+	if (r2 == 0)
+		pthread_join(t2, NULL);
+
+	test_result("each thread got its own .tdata image",
+		    p1.saw_initial && p2.saw_initial);
+	test_result("each thread got its own zeroed .tbss",
+		    p1.saw_zero && p2.saw_zero);
+	test_result("threads did not share __thread storage",
+		    p1.private_ok && p2.private_ok);
+	test_result("each thread had a distinct thread pointer",
+		    p1.tp != 0 && p2.tp != 0 && p1.tp != p2.tp);
+
+	/* The main thread's values must have survived both threads running. */
+	test_result("main thread's __thread values were untouched",
+		    tls_initialised == 0x1111 && tls_zeroed == 0x2222 &&
+			    strcmp(tls_buf, "main") == 0);
+}
+
+static void test_xorg_libc_additions(void)
+{
+	printf("\n[TEST] libc additions for X.org (scandir/strtok_r/ffs/...)\n");
+
+	/* --- scandir: how the X server enumerates its module directory --- */
+	{
+		const char *dir = "/tmp/scandir_t";
+		struct dirent **nl = NULL;
+		int n;
+
+		mkdir(dir, 0755);
+		for (int i = 0; i < 12; i++) {
+			char p[64];
+			snprintf(p, sizeof(p), "%s/mod%d.so", dir, i);
+			int fd = open(p, O_CREAT | O_WRONLY, 0644);
+			if (fd >= 0)
+				close(fd);
+		}
+		{ /* a dotfile the filter must drop */
+			char p[64];
+			snprintf(p, sizeof(p), "%s/.hidden", dir);
+			int fd = open(p, O_CREAT | O_WRONLY, 0644);
+			if (fd >= 0)
+				close(fd);
+		}
+
+		n = scandir(dir, &nl, xorg_filter_dot, alphasort);
+		test_result("scandir returns the filtered entry count", n == 12);
+		if (n > 0) {
+			int sorted = 1;
+			for (int i = 1; i < n; i++)
+				if (strcmp(nl[i - 1]->d_name, nl[i]->d_name) > 0)
+					sorted = 0;
+			test_result("scandir + alphasort orders entries", sorted);
+			test_result("scandir dropped the dotfile",
+				    strchr(nl[0]->d_name, '.') != NULL &&
+					    nl[0]->d_name[0] != '.');
+			for (int i = 0; i < n; i++)
+				free(nl[i]);
+			free(nl);
+		}
+
+		/* versionsort orders digit runs numerically: mod9 < mod10 */
+		nl = NULL;
+		n = scandir(dir, &nl, xorg_filter_dot, versionsort);
+		if (n == 12) {
+			test_result("scandir + versionsort puts mod2 before mod10",
+				    strcmp(nl[1]->d_name, "mod1.so") == 0 &&
+					    strcmp(nl[2]->d_name, "mod2.so") == 0);
+			for (int i = 0; i < n; i++)
+				free(nl[i]);
+			free(nl);
+		} else {
+			test_fail("scandir + versionsort entry count");
+		}
+
+		errno = 0;
+		test_result("scandir on a missing directory fails",
+			    scandir("/tmp/no_such_dir_xyz", &nl, NULL, NULL) ==
+				    -1);
+
+		for (int i = 0; i < 12; i++) {
+			char p[64];
+			snprintf(p, sizeof(p), "%s/mod%d.so", dir, i);
+			unlink(p);
+		}
+		{
+			char p[64];
+			snprintf(p, sizeof(p), "%s/.hidden", dir);
+			unlink(p);
+		}
+		rmdir(dir);
+	}
+
+	/* --- a large directory: libXfont2 reads font dirs this way, and the
+	 * DIR buffer is only 1 KB, so this crosses many getdents64 refills --- */
+	{
+		const char *dir = "/tmp/bigdir_t";
+		DIR *dp;
+		int count = 0, dup_seen = 0;
+		char seen[200] = { 0 };
+
+		mkdir(dir, 0755);
+		for (int i = 0; i < 200; i++) {
+			char p[80];
+			snprintf(p, sizeof(p), "%s/entry_%03d", dir, i);
+			int fd = open(p, O_CREAT | O_WRONLY, 0644);
+			if (fd >= 0)
+				close(fd);
+		}
+		dp = opendir(dir);
+		if (dp) {
+			struct dirent *d;
+			while ((d = readdir(dp)) != NULL) {
+				int idx;
+				if (d->d_name[0] == '.')
+					continue;
+				count++;
+				if (sscanf(d->d_name, "entry_%d", &idx) == 1 &&
+				    idx >= 0 && idx < 200) {
+					if (seen[idx])
+						dup_seen = 1;
+					seen[idx] = 1;
+				}
+			}
+			closedir(dp);
+		}
+		test_result("readdir returns all 200 entries", count == 200);
+		test_result("readdir returns no duplicates", !dup_seen);
+
+		for (int i = 0; i < 200; i++) {
+			char p[80];
+			snprintf(p, sizeof(p), "%s/entry_%03d", dir, i);
+			unlink(p);
+		}
+		rmdir(dir);
+	}
+
+	/* --- strtok_r: two interleaved tokenisations must not collide --- */
+	{
+		char a[] = "one,two,three";
+		char b[] = "alpha:beta";
+		char *sa = NULL, *sb = NULL;
+		char *t1 = strtok_r(a, ",", &sa);
+		char *u1 = strtok_r(b, ":", &sb);
+		char *t2 = strtok_r(NULL, ",", &sa);
+		char *u2 = strtok_r(NULL, ":", &sb);
+		char *t3 = strtok_r(NULL, ",", &sa);
+
+		test_result("strtok_r keeps interleaved scans separate",
+			    t1 && u1 && t2 && u2 && t3 &&
+				    strcmp(t1, "one") == 0 &&
+				    strcmp(t2, "two") == 0 &&
+				    strcmp(t3, "three") == 0 &&
+				    strcmp(u1, "alpha") == 0 &&
+				    strcmp(u2, "beta") == 0);
+		test_result("strtok_r reports end of string",
+			    strtok_r(NULL, ",", &sa) == NULL);
+	}
+
+	/* --- ffs / memmem / strverscmp --- */
+	test_result("ffs finds the lowest set bit",
+		    ffs(0) == 0 && ffs(1) == 1 && ffs(8) == 4 &&
+			    ffs(0x100) == 9);
+	test_result("ffsl works on longs",
+		    ffsl(0) == 0 && ffsl(1L << 40) == 41);
+	{
+		const char hay[] = "abcXYZdef";
+		test_result("memmem finds a substring",
+			    memmem(hay, 9, "XYZ", 3) == hay + 3);
+		test_result("memmem reports a miss",
+			    memmem(hay, 9, "QQ", 2) == NULL);
+		test_result("memmem with an empty needle matches at the start",
+			    memmem(hay, 9, "", 0) == hay);
+	}
+	test_result("strverscmp orders versions numerically",
+		    strverscmp("libfoo.so.9", "libfoo.so.10") < 0 &&
+			    strverscmp("a2", "a10") < 0 &&
+			    strverscmp("abc", "abc") == 0);
+
+	/* --- qsort/qsort_r: qsort was a bubble sort; both share one sort now --- */
+	{
+		int big[512];
+		unsigned long seed = 12345;
+		int ok = 1;
+
+		for (int i = 0; i < 512; i++) {
+			seed = seed * 1103515245UL + 12345UL;
+			big[i] = (int)((seed >> 16) & 0x7FFF);
+		}
+		qsort(big, 512, sizeof(int), qsort_int_cmp);
+		for (int i = 1; i < 512; i++)
+			if (big[i - 1] > big[i])
+				ok = 0;
+		test_result("qsort sorts 512 elements", ok);
+
+		/* already sorted and reverse sorted: the pathological inputs
+		 * for a naive pivot choice */
+		qsort(big, 512, sizeof(int), qsort_int_cmp);
+		ok = 1;
+		for (int i = 1; i < 512; i++)
+			if (big[i - 1] > big[i])
+				ok = 0;
+		test_result("qsort is stable on already-sorted input", ok);
+
+		int arr[6] = { 5, 3, 9, 1, 4, 2 };
+		int calls = 0;
+		qsort_r(arr, 6, sizeof(int), qsort_r_cmp, &calls);
+		test_result("qsort_r sorts and passes the caller's argument",
+			    arr[0] == 1 && arr[5] == 9 && calls > 0);
+	}
+
+	/* --- msync / truncate / priorities / mkostemp / ptsname_r --- */
+	{
+		void *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (m != MAP_FAILED) {
+			test_result("msync on a page-aligned range succeeds",
+				    msync(m, 4096, MS_SYNC) == 0);
+			errno = 0;
+			test_result("msync on a misaligned address -> EINVAL",
+				    msync((char *)m + 1, 4096, MS_SYNC) == -1 &&
+					    errno == EINVAL);
+			errno = 0;
+			test_result("msync with MS_SYNC|MS_ASYNC -> EINVAL",
+				    msync(m, 4096, MS_SYNC | MS_ASYNC) == -1 &&
+					    errno == EINVAL);
+			munmap(m, 4096);
+		}
+	}
+	{
+		const char *p = "/tmp/trunc_t";
+		int fd = open(p, O_CREAT | O_WRONLY, 0644);
+		struct stat st;
+		if (fd >= 0) {
+			write(fd, "0123456789", 10);
+			close(fd);
+		}
+		test_result("truncate shrinks a file",
+			    truncate(p, 4) == 0 && stat(p, &st) == 0 &&
+				    st.st_size == 4);
+		test_result("truncate grows a file",
+			    truncate(p, 100) == 0 && stat(p, &st) == 0 &&
+				    st.st_size == 100);
+		errno = 0;
+		test_result("truncate on a missing path fails",
+			    truncate("/tmp/no_such_file_xyz", 0) == -1);
+		unlink(p);
+	}
+	test_result("getpriority reports the default priority",
+		    getpriority(PRIO_PROCESS, 0) == 0);
+	errno = 0;
+	test_result("getpriority with a bad which -> EINVAL",
+		    getpriority(99, 0) == -1 && errno == EINVAL);
+	test_result("setpriority accepts an in-range value",
+		    setpriority(PRIO_PROCESS, 0, 5) == 0);
+	errno = 0;
+	test_result("setpriority out of range -> EINVAL",
+		    setpriority(PRIO_PROCESS, 0, 100) == -1 &&
+			    errno == EINVAL);
+	{
+		char t[] = "/tmp/mkoXXXXXX";
+		int fd = mkostemp(t, O_CLOEXEC);
+		test_result("mkostemp creates the file", fd >= 0);
+		if (fd >= 0) {
+			test_result("mkostemp honours O_CLOEXEC",
+				    (fcntl(fd, F_GETFD, 0) & FD_CLOEXEC) != 0);
+			close(fd);
+			unlink(t);
+		}
+	}
+	{
+		int m = posix_openpt(O_RDWR);
+		char nbuf[64];
+		if (m >= 0) {
+			test_result("ptsname_r fills the caller's buffer",
+				    ptsname_r(m, nbuf, sizeof(nbuf)) == 0 &&
+					    strncmp(nbuf, "/dev/pts/", 9) == 0);
+			test_result("ptsname_r on a short buffer -> ERANGE",
+				    ptsname_r(m, nbuf, 4) == ERANGE);
+			test_result("ptsname agrees with ptsname_r",
+				    strcmp(ptsname(m), nbuf) == 0);
+
+			/* The slave is reference counted: two independent
+			 * opens mean the first close must NOT hang up the
+			 * line.  It used to be a flat flag, so closing either
+			 * descriptor gave the master EOF and POLLHUP while the
+			 * other was still perfectly usable. */
+			int s1 = open(nbuf, O_RDWR);
+			int s2 = open(nbuf, O_RDWR);
+			test_result("slave opens twice", s1 >= 0 && s2 >= 0);
+			if (s1 >= 0 && s2 >= 0) {
+				close(s1);
+
+				/* Still one opener left, so a write on the
+				 * surviving descriptor must reach the master
+				 * rather than the line being torn down. */
+				ssize_t w = write(s2, "x\n", 2);
+				char rb[8];
+				ssize_t r = (w == 2) ? read(m, rb, sizeof(rb))
+						     : -1;
+				test_result(
+					"line survives closing one of two slave fds",
+					w == 2 && r > 0);
+
+				close(s2);
+
+				/* Now the last opener is gone: the master
+				 * should see the hangup. */
+				struct pollfd pfd = { .fd = m,
+						      .events = POLLIN };
+				int pr = poll(&pfd, 1, 500);
+				test_result(
+					"master sees hangup after the last slave closes",
+					pr > 0 &&
+						(pfd.revents &
+						 (POLLHUP | POLLIN)) != 0);
+			}
+			close(m);
+		} else {
+			test_fail("ptsname_r: posix_openpt failed");
+		}
+	}
+
+	/* --- pthread_sigmask: reports errors by return value, not errno --- */
+	{
+		sigset_t block, old, cur;
+		sigemptyset(&block);
+		sigaddset(&block, SIGUSR2);
+		test_result("pthread_sigmask blocks a signal",
+			    pthread_sigmask(SIG_BLOCK, &block, &old) == 0);
+		sigemptyset(&cur);
+		test_result("pthread_sigmask reads the mask back",
+			    pthread_sigmask(SIG_SETMASK, NULL, &cur) == 0 &&
+				    sigismember(&cur, SIGUSR2) == 1);
+		test_result("pthread_sigmask restores the old mask",
+			    pthread_sigmask(SIG_SETMASK, &old, NULL) == 0);
+		test_result("pthread_sigmask returns the error, not -1",
+			    pthread_sigmask(12345, &block, NULL) != 0);
+	}
 }
 
 /* ---- dprintf()/vdprintf(): formatted output straight to a descriptor ---- */
@@ -3908,6 +4954,122 @@ int main(int argc, char **argv)
 	}
 
 	// ========================================
+	// Test: standard descriptor reuse
+	// ========================================
+	printf("\n[TEST] standard descriptor reuse (close/open/dup on 0-2)\n");
+	{
+		int p[2];
+		if (pipe(p) != 0) {
+			test_fail("pipe() for the fd-reuse child");
+		} else {
+			/* Flush first: fork duplicates whatever is still sitting
+			 * in the stdio buffer, and the child must not print it a
+			 * second time down the pty it installs on fd 1. */
+			fflush(stdout);
+			pid_t pid = fork();
+			if (pid == 0) {
+				close(p[0]);
+				fd_reuse_child(p[1]);
+				_exit(1); /* not reached */
+			} else if (pid < 0) {
+				close(p[0]);
+				close(p[1]);
+				test_fail("fork() for the fd-reuse child");
+			} else {
+				char r[FDR_CHECKS];
+				size_t got = 0;
+				int st = 0;
+				memset(r, '0', sizeof(r));
+				close(p[1]);
+				while (got < sizeof(r)) {
+					ssize_t k = read(p[0], r + got,
+							 sizeof(r) - got);
+					if (k <= 0)
+						break;
+					got += (size_t)k;
+				}
+				close(p[0]);
+				waitpid(pid, &st, 0);
+
+				test_result("fd-reuse child reported all checks",
+					    got == sizeof(r));
+				test_result(
+					"close() on a standard descriptor succeeds",
+					r[0] == '1');
+				test_result("a closed 0 stays closed (EBADF)",
+					    r[1] == '1');
+				test_result(
+					"read() on a closed 0 is EBADF, not the console",
+					r[2] == '1');
+				test_result("open() reuses descriptor 0",
+					    r[3] == '1');
+				test_result("dup() reuses descriptor 0",
+					    r[4] == '1');
+				test_result(
+					"close+dup puts a pty on all of 0/1/2 (isatty)",
+					r[5] == '1');
+				test_result("descriptor 0 is the pty slave itself",
+					    r[6] == '1');
+				test_result("descriptor 1 is the pty slave itself",
+					    r[7] == '1');
+				test_result("descriptor 2 is the pty slave itself",
+					    r[8] == '1');
+				test_result(
+					"F_GETFD reports only the flags POSIX defines",
+					r[9] == '1');
+			}
+		}
+	}
+
+	// ========================================
+	// Test: concurrent AF_UNIX scatter/gather I/O
+	// ========================================
+	printf("\n[TEST] concurrent AF_UNIX sendmsg/recvmsg\n");
+	{
+		int sv[2];
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+			test_fail("socketpair() for the concurrency test");
+		} else {
+			fflush(stdout);
+			pid_t pid = fork();
+			if (pid == 0) {
+				int csv[2];
+				int rc = 1;
+				/* Own pair, so the two processes share no socket
+				 * and any crosstalk is the kernel's. */
+				close(sv[0]);
+				close(sv[1]);
+				if (socketpair(AF_UNIX, SOCK_STREAM, 0, csv) ==
+				    0) {
+					rc = (uds_run(csv, 0x5A, UDS_ROUNDS) ==
+					      0) ?
+						     0 :
+						     2;
+					close(csv[0]);
+					close(csv[1]);
+				}
+				_exit(rc);
+			} else if (pid < 0) {
+				close(sv[0]);
+				close(sv[1]);
+				test_fail("fork() for the concurrency test");
+			} else {
+				int prc = uds_run(sv, 0xA5, UDS_ROUNDS);
+				int st = 0;
+				waitpid(pid, &st, 0);
+				close(sv[0]);
+				close(sv[1]);
+				test_result(
+					"unix stream survives concurrent sendmsg/recvmsg (this process)",
+					prc == 0);
+				test_result(
+					"unix stream survives concurrent sendmsg/recvmsg (other process)",
+					WIFEXITED(st) && WEXITSTATUS(st) == 0);
+			}
+		}
+	}
+
+	// ========================================
 	// Test: signals
 	// ========================================
 	printf("\n[TEST] signals\n");
@@ -4510,6 +5672,91 @@ int main(int argc, char **argv)
 		     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 	test_result("mmap(MAP_FIXED, addr=0x10000000) succeeds",
 		    valid_fixed != MAP_FAILED);
+
+	/* Failure paths must report WHY.  Every one of these used to come back
+	 * as EPERM because the kernel returned MAP_FAILED (-1) for all of them
+	 * and the libc wrapper read that as errno 1. */
+	errno = 0;
+	test_result("mmap(0 length) -> EINVAL",
+		    mmap(NULL, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1,
+			 0) == MAP_FAILED &&
+			    errno == EINVAL);
+	errno = 0;
+	test_result("mmap(3 GB) -> ENOMEM",
+		    mmap(NULL, 3ULL * 1024 * 1024 * 1024, PROT_READ,
+			 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED &&
+			    errno == ENOMEM);
+	errno = 0;
+	test_result("mmap(bad fd) -> EBADF",
+		    mmap(NULL, 4096, PROT_READ, MAP_SHARED, 9999, 0) ==
+				    MAP_FAILED &&
+			    errno == EBADF);
+	{
+		int mp[2];
+		if (pipe(mp) == 0) {
+			errno = 0;
+			test_result("mmap(pipe fd) -> ENODEV",
+				    mmap(NULL, 4096, PROT_READ, MAP_SHARED,
+					 mp[0], 0) == MAP_FAILED &&
+					    errno == ENODEV);
+			close(mp[0]);
+			close(mp[1]);
+		}
+	}
+
+	/* Region-table headroom.  A dynamically linked X server maps roughly
+	 * four regions per shared object, so a process must be able to hold
+	 * well over a hundred mappings at once. */
+	{
+		void *regs[200];
+		int n = 0, ok = 1;
+		for (n = 0; n < 200; n++) {
+			regs[n] = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+				       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (regs[n] == MAP_FAILED)
+				break;
+			*(volatile char *)regs[n] = (char)n; /* touch it */
+		}
+		test_result("200 concurrent anonymous mappings", n == 200);
+		for (int i = 0; i < n; i++) {
+			if (*(volatile char *)regs[i] != (char)i)
+				ok = 0;
+			munmap(regs[i], 4096);
+		}
+		test_result("each mapping kept its own contents", ok);
+	}
+
+	/* PROT_NONE must actually deny access, including with MAP_SHARED —
+	 * the eager shared path used to map PAGE_PRESENT|PAGE_USER regardless
+	 * of prot, leaving PROT_NONE freely readable. */
+	{
+		void *pn = mmap(NULL, 4096, PROT_NONE,
+				MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+		test_result("mmap(PROT_NONE, MAP_SHARED) succeeds",
+			    pn != MAP_FAILED);
+		if (pn != MAP_FAILED) {
+			/* Catch the fault in a child rather than letting it
+			 * kill the process: the point is that the access
+			 * faults, and a caught fault says so without the
+			 * kernel printing a crash report for something the
+			 * test did on purpose. */
+			pid_t p = fork();
+			if (p == 0) {
+				struct sigaction sa;
+				memset(&sa, 0, sizeof(sa));
+				sa.sa_handler = protnone_segv_handler;
+				sigaction(SIGSEGV, &sa, NULL);
+				volatile char c = *(volatile char *)pn;
+				(void)c;
+				_exit(0); /* no fault: PROT_NONE did not protect */
+			}
+			int st = 0;
+			waitpid(p, &st, 0);
+			test_result("reading a PROT_NONE page faults",
+				    WIFEXITED(st) && WEXITSTATUS(st) == 42);
+			munmap(pn, 4096);
+		}
+	}
 	if (valid_fixed != MAP_FAILED) {
 		munmap(valid_fixed, 4096);
 	}
@@ -4551,6 +5798,78 @@ int main(int argc, char **argv)
 	// ========================================
 	// MAP_SHARED Test (Shared Memory Between Parent and Child)
 	// ========================================
+	// ========================================
+	// scanf: one engine for streams and strings
+	// ========================================
+	printf("\n--- scanf (string and stream sources) ---\n");
+	{
+		/* sscanf used to be a second, smaller implementation with no
+		 * float conversions at all, so this returned 0 while fscanf on
+		 * the same input worked.  X.Org's xkbcomp scans its geometry
+		 * files with sscanf and called every coordinate "Malformed
+		 * number", which stopped the server compiling a keymap. */
+		float f = 0.0f;
+
+		test_result("sscanf %g parses a float",
+			    sscanf("1.5", "%g", &f) == 1 && f == 1.5f);
+
+		f = 0.0f;
+		test_result("sscanf %f parses a float",
+			    sscanf("12.25", "%f", &f) == 1 && f == 12.25f);
+
+		f = 0.0f;
+		test_result("sscanf %e parses an exponent",
+			    sscanf("1e3", "%e", &f) == 1 && f == 1000.0f);
+
+		f = 0.0f;
+		test_result("sscanf %g parses a negative",
+			    sscanf("-3.5", "%g", &f) == 1 && f == -3.5f);
+
+		double d = 0.0;
+		test_result("sscanf %lg parses a double",
+			    sscanf("2.75", "%lg", &d) == 1 && d == 2.75);
+
+		/* Must stop at the first character it cannot use and leave the
+		 * rest -- xkbcomp's numbers are followed by punctuation. */
+		f = 0.0f;
+		test_result("sscanf %g stops at trailing punctuation",
+			    sscanf("1.5)", "%g", &f) == 1 && f == 1.5f);
+
+		f = 99.0f;
+		test_result("sscanf %g rejects a non-number",
+			    sscanf("abc", "%g", &f) == 0 && f == 99.0f);
+
+		/* Mixed conversions, to show the float path does not disturb
+		 * the position the next conversion starts from. */
+		int n = 0;
+		f = 0.0f;
+		test_result("sscanf mixes %d and %g",
+			    sscanf("7 1.5", "%d %g", &n, &f) == 2 && n == 7 &&
+				    f == 1.5f);
+
+		/* The string and stream forms are the same engine now; a float
+		 * read back through a FILE* must agree. */
+		{
+			char path[96];
+			FILE *fp;
+
+			snprintf(path, sizeof(path), "%s/scanf.txt", _td);
+			fp = fopen(path, "w");
+			if (fp) {
+				fputs("4.25 rest\n", fp);
+				fclose(fp);
+			}
+			f = 0.0f;
+			fp = fopen(path, "r");
+			test_result("fscanf %g agrees with sscanf",
+				    fp && fscanf(fp, "%g", &f) == 1 &&
+					    f == 4.25f);
+			if (fp)
+				fclose(fp);
+			unlink(path);
+		}
+	}
+
 	printf("\n--- MAP_SHARED Test ---\n");
 	{
 		// Create shared anonymous memory
@@ -6552,6 +7871,90 @@ int main(int argc, char **argv)
 			}
 			dlclose(handle2);
 		}
+
+		/* Test 13: dlopen of a library that has a DT_NEEDED of its own.
+		 *
+		 * libdlchain.so depends on libdlbase.so and every entry point
+		 * below reaches into that dependency.  The loader used to
+		 * relocate only the object named in dlopen(), so the
+		 * dependency arrived with an unrelocated GOT and these calls
+		 * went through empty slots.  This is the X server's module
+		 * situation exactly: a driver that pulls in a library of its
+		 * own. */
+		printf("\n[TEST] dlopen() a library with its own dependency\n");
+		void *ch = dlopen("/lib/libdlchain.so", RTLD_NOW);
+		test_result("dlopen(libdlchain.so) returns non-NULL",
+			    ch != NULL);
+		if (ch) {
+			int (*call_dep)(void) =
+				(int (*)(void))dlsym(ch, "dlchain_call_dep");
+			int (*read_dep)(void) = (int (*)(void))dlsym(
+				ch, "dlchain_read_dep_data");
+			int (*dep_ctor)(void) = (int (*)(void))dlsym(
+				ch, "dlchain_dep_ctor_ran");
+			int (*own_ctor)(void) = (int (*)(void))dlsym(
+				ch, "dlchain_own_ctor_ran");
+
+			test_result("dlsym finds the chain entry points",
+				    call_dep && read_dep && dep_ctor &&
+					    own_ctor);
+			if (call_dep)
+				test_result(
+					"calling through the PLT into the dependency works",
+					call_dep() == 0x5EED);
+			if (read_dep)
+				test_result(
+					"reading a data symbol from the dependency works",
+					read_dep() == 0x5EED);
+			if (own_ctor)
+				test_result("the dlopen'd object was initialised",
+					    own_ctor() == 1);
+			if (dep_ctor)
+				test_result(
+					"the dependency was initialised too",
+					dep_ctor() == 1);
+
+			/* The dependency is a separate object that dlopen must
+			 * also have made available. */
+			void *base = dlopen("/lib/libdlbase.so", RTLD_NOW);
+			test_result("the dependency is loadable in its own right",
+				    base != NULL);
+			if (base) {
+				int *magic = (int *)dlsym(base, "dlbase_magic");
+				test_result("dependency data symbol reads back",
+					    magic && *magic == 0x5EED);
+				dlclose(base); /* refcount 2 -> 1: stays loaded */
+			}
+
+			/* ORDER MATTERS.  Closing the parent here unmaps
+			 * libdlchain.so while libdlbase.so is still loaded,
+			 * which used to leave the dependency's recorded name
+			 * pointing into the parent's freed string table — the
+			 * next loader table walk then read unmapped pages.  The
+			 * dlopen below is that walk, so this sequence is the
+			 * regression test; do not reorder it. */
+			dlclose(ch);
+
+			void *probe = dlopen("/lib/libtestlib.so", RTLD_NOW);
+			test_result(
+				"loader table survives closing a parent whose dependency is still loaded",
+				probe != NULL);
+			if (probe)
+				dlclose(probe);
+		}
+
+		/* Test 14: an absolute path naming an already-open object must
+		 * return the SAME handle, not load a second copy — objects are
+		 * registered under their basename. */
+		printf("\n[TEST] dlopen() absolute-path deduplication\n");
+		void *h_a = dlopen("/lib/libtestlib.so", RTLD_NOW);
+		void *h_b = dlopen("/lib/libtestlib.so", RTLD_NOW);
+		test_result("the same path twice yields the same handle",
+			    h_a != NULL && h_a == h_b);
+		if (h_a)
+			dlclose(h_a);
+		if (h_b)
+			dlclose(h_b);
 	}
 
 	// ========================================
@@ -7543,6 +8946,10 @@ int main(int argc, char **argv)
 	test_poll_redirected_stdio();
 	test_ioctl_non_tty();
 	test_jobctl_wait();
+	test_shm();
+	test_sysv_shm();
+	test_tls();
+	test_xorg_libc_additions();
 	test_dprintf();
 	test_bash_libc_additions();
 	test_syscall_arg_hygiene();
@@ -8397,6 +9804,264 @@ network_section:
 				       sizeof(addr));
 			test_result("unix server: bind", ret == 0);
 
+			/* A pathname bind must leave a real socket node behind.
+			 * X11 clients stat() /tmp/.X11-unix/X0 and refuse to
+			 * connect unless it reports S_IFSOCK, so a name that
+			 * exists only inside the kernel is unreachable. */
+			struct stat ust;
+			test_result("bind creates a filesystem node",
+				    stat(_p_usock, &ust) == 0);
+			test_result("the node reports S_IFSOCK",
+				    S_ISSOCK(ust.st_mode));
+			test_result("lstat agrees it is a socket",
+				    lstat(_p_usock, &ust) == 0 &&
+					    S_ISSOCK(ust.st_mode));
+
+			/* Bind with the SUN_LEN convention: an addrlen that
+			 * counts the path but NOT its terminator.
+			 *
+			 * This is how the address length is normally computed
+			 *
+			 *     SUN_LEN(p) = offsetof(struct sockaddr_un, sun_path)
+			 *                  + strlen((p)->sun_path)
+			 *
+			 * and it is what X11's xtrans passes.  The kernel used
+			 * to require a NUL inside addrlen and returned EINVAL
+			 * for it, which surfaced four layers up as the display
+			 * server reporting "Cannot establish any listening
+			 * sockets" -- with nothing pointing at bind().
+			 *
+			 * Tested end to end, not just for a zero return: an
+			 * accepted bind that registered a truncated name would
+			 * still fail to accept a connection.
+			 *
+			 * The connect runs in a CHILD because connect() on this
+			 * system blocks until the listener accepts -- doing
+			 * both in one process deadlocks.  The parent's accept
+			 * is non-blocking and bounded, so a child that never
+			 * connects fails the test instead of hanging the whole
+			 * suite.
+			 */
+			{
+				char sunpath[96];
+				int srv, acc = -1;
+				struct sockaddr_un sa;
+				socklen_t slen;
+				pid_t kid;
+
+				snprintf(sunpath, sizeof(sunpath),
+					 "%s/sunlen.sock", _td);
+				unlink(sunpath);
+
+				srv = socket(AF_UNIX, SOCK_STREAM, 0);
+				memset(&sa, 0, sizeof(sa));
+				sa.sun_family = AF_UNIX;
+				strcpy(sa.sun_path, sunpath);
+				slen = (socklen_t)(offsetof(struct sockaddr_un,
+							   sun_path) +
+						   strlen(sa.sun_path));
+
+				test_result("bind with SUN_LEN addrlen (no NUL counted)",
+					    srv >= 0 &&
+						    bind(srv,
+							 (struct sockaddr *)&sa,
+							 slen) == 0);
+				{
+					struct stat st_;
+
+					test_result("SUN_LEN bind still creates S_IFSOCK",
+						    stat(sunpath, &st_) == 0 &&
+							    S_ISSOCK(st_.st_mode));
+				}
+				test_result("SUN_LEN bind listens",
+					    listen(srv, 4) == 0);
+
+				fcntl(srv, F_SETFL, O_NONBLOCK);
+
+				kid = fork();
+				if (kid == 0) {
+					int cli = socket(AF_UNIX, SOCK_STREAM, 0);
+					int ok = 0;
+
+					if (cli >= 0 &&
+					    connect(cli, (struct sockaddr *)&sa,
+						    slen) == 0 &&
+					    write(cli, "ok", 2) == 2)
+						ok = 1;
+					if (cli >= 0)
+						close(cli);
+					_exit(ok ? 0 : 1);
+				}
+
+				if (kid > 0) {
+					/* Bounded wait: ~2s at 10ms a turn. */
+					for (int tries = 0; tries < 200; tries++) {
+						acc = accept(srv, NULL, NULL);
+						if (acc >= 0)
+							break;
+						if (errno != EAGAIN &&
+						    errno != EWOULDBLOCK)
+							break;
+						usleep(10000);
+					}
+					test_result("SUN_LEN listener accepts a connection",
+						    acc >= 0);
+
+					if (acc >= 0) {
+						char b[4] = { 0 };
+
+						test_result("SUN_LEN socket carries data",
+							    read(acc, b, 2) == 2 &&
+								    b[0] == 'o' &&
+								    b[1] == 'k');
+						close(acc);
+					}
+
+					int st = 0;
+
+					while (waitpid(kid, &st, 0) < 0 &&
+					       errno == EINTR)
+						;
+					test_result("SUN_LEN client connected cleanly",
+						    WIFEXITED(st) &&
+							    WEXITSTATUS(st) == 0);
+				} else {
+					test_fail("SUN_LEN: fork failed");
+				}
+
+				if (srv >= 0)
+					close(srv);
+				unlink(sunpath);
+			}
+
+			/* getsockname()/getpeername() must work on AF_UNIX.
+			 *
+			 * libxcb asks a connected socket what it is before it
+			 * can choose an authorisation record: getpeername()
+			 * first, getsockname() as a fallback, and if BOTH fail
+			 * it sends no authorisation at all.  The X server then
+			 * refuses every client with "Authorization required,
+			 * but no authorization protocol specified" -- a message
+			 * that names neither call.  Both used to fail here
+			 * because the syscalls only understood AF_INET. */
+			{
+				char sp2[96];
+				int srv2, acc2 = -1;
+				struct sockaddr_un sa2;
+				socklen_t sl2;
+				pid_t kid2;
+
+				snprintf(sp2, sizeof(sp2), "%s/sockname.sock",
+					 _td);
+				unlink(sp2);
+
+				srv2 = socket(AF_UNIX, SOCK_STREAM, 0);
+				memset(&sa2, 0, sizeof(sa2));
+				sa2.sun_family = AF_UNIX;
+				strcpy(sa2.sun_path, sp2);
+				sl2 = (socklen_t)(offsetof(struct sockaddr_un,
+							  sun_path) +
+						  strlen(sa2.sun_path));
+
+				if (srv2 >= 0 &&
+				    bind(srv2, (struct sockaddr *)&sa2, sl2) == 0 &&
+				    listen(srv2, 4) == 0) {
+					struct sockaddr_un q;
+					socklen_t ql = sizeof(q);
+
+					memset(&q, 0, sizeof(q));
+					test_result("getsockname on a bound unix socket",
+						    getsockname(srv2,
+								(struct sockaddr *)&q,
+								&ql) == 0 &&
+							    q.sun_family == AF_UNIX);
+					test_result("getsockname reports the bound path",
+						    strcmp(q.sun_path, sp2) == 0);
+					/* SUN_LEN convention on the way out too. */
+					test_result("getsockname reports SUN_LEN",
+						    ql == (socklen_t)(offsetof(struct sockaddr_un, sun_path) + strlen(sp2)));
+
+					fcntl(srv2, F_SETFL, O_NONBLOCK);
+					kid2 = fork();
+					if (kid2 == 0) {
+						int c = socket(AF_UNIX, SOCK_STREAM, 0);
+						int ok = 0;
+
+						if (c >= 0 &&
+						    connect(c, (struct sockaddr *)&sa2, sl2) == 0) {
+							struct sockaddr_un pn;
+							socklen_t pl = sizeof(pn);
+
+							memset(&pn, 0, sizeof(pn));
+							/* The peer is the
+							 * listener, so this
+							 * must name its path. */
+							if (getpeername(c, (struct sockaddr *)&pn, &pl) == 0 &&
+							    pn.sun_family == AF_UNIX &&
+							    strcmp(pn.sun_path, sp2) == 0)
+								ok = 1;
+							/* An unbound client
+							 * still has a family. */
+							memset(&pn, 0, sizeof(pn));
+							pl = sizeof(pn);
+							if (getsockname(c, (struct sockaddr *)&pn, &pl) != 0 ||
+							    pn.sun_family != AF_UNIX)
+								ok = 0;
+						}
+						if (c >= 0)
+							close(c);
+						_exit(ok ? 0 : 1);
+					}
+					if (kid2 > 0) {
+						int st2 = 0;
+
+						for (int t = 0; t < 200; t++) {
+							acc2 = accept(srv2, NULL, NULL);
+							if (acc2 >= 0)
+								break;
+							if (errno != EAGAIN &&
+							    errno != EWOULDBLOCK)
+								break;
+							usleep(10000);
+						}
+						test_result("unix listener accepted for name test",
+							    acc2 >= 0);
+						if (acc2 >= 0)
+							close(acc2);
+						while (waitpid(kid2, &st2, 0) < 0 &&
+						       errno == EINTR)
+							;
+						test_result("getpeername/getsockname work in the client",
+							    WIFEXITED(st2) &&
+								    WEXITSTATUS(st2) == 0);
+					} else {
+						test_fail("sockname: fork failed");
+					}
+				} else {
+					test_fail("sockname: setup failed");
+				}
+				if (srv2 >= 0)
+					close(srv2);
+				unlink(sp2);
+			}
+
+			/* A second bind to the same name must be refused, and
+			 * with the address-in-use error rather than a generic
+			 * failure. */
+			{
+				int dup_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+				if (dup_fd >= 0) {
+					errno = 0;
+					test_result(
+						"re-binding the same path -> EADDRINUSE",
+						bind(dup_fd,
+						     (struct sockaddr *)&addr,
+						     sizeof(addr)) == -1 &&
+							errno == EADDRINUSE);
+					close(dup_fd);
+				}
+			}
+
 			ret = listen(server_fd, 5);
 			test_result("unix server: listen", ret == 0);
 
@@ -8440,7 +10105,33 @@ network_section:
 				waitpid(pid, &status, 0);
 			}
 			close(server_fd);
-			unlink(_p_usock); /* remove socket file — bind fails on re-run if left */
+
+			/* Closing the socket removes its node.  Without this,
+			 * stale sockets accumulate and every later bind to the
+			 * same name fails with EADDRINUSE — which is how a
+			 * display server refuses to restart after an unclean
+			 * exit. */
+			{
+				struct stat gone;
+				test_result(
+					"closing the socket removes its node",
+					stat(_p_usock, &gone) != 0);
+			}
+
+			/* And the name is immediately reusable. */
+			{
+				int again = socket(AF_UNIX, SOCK_STREAM, 0);
+				if (again >= 0) {
+					test_result(
+						"the path can be bound again",
+						bind(again,
+						     (struct sockaddr *)&addr,
+						     sizeof(addr)) == 0);
+					close(again);
+				}
+			}
+
+			unlink(_p_usock); /* belt and braces if the above failed */
 		}
 	}
 

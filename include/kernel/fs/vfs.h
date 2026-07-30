@@ -149,6 +149,15 @@ typedef struct {
 	 * append-only).  Lets the VFS veto modifications independently of the mode
 	 * bits.  NULL => the filesystem has no such flags (none set). */
 	int (*inode_flags)(unsigned long ino, uint32_t *out_flags);
+	/* Create a node that owns no data: a socket (S_IFSOCK) or FIFO
+	 * (S_IFIFO), with the type in the high bits of `mode`.  Needed because
+	 * a bound AF_UNIX socket must be visible in the filesystem — clients
+	 * stat() the path and require S_IFSOCK before connecting.  NULL => the
+	 * filesystem cannot represent such nodes (the wrapper reports
+	 * -EOPNOTSUPP).  Appended deliberately at the END of this structure:
+	 * the per-filesystem tables are positional, so a slot inserted
+	 * anywhere else renumbers every entry after it. */
+	int (*mknod)(const char *path, unsigned int mode);
 } vfs_ops_t;
 
 struct vfs_file {
@@ -185,6 +194,8 @@ int vfs_truncate(vfs_file_t *f, unsigned long size);
 int vfs_unlink(const char *path);
 int vfs_rename(const char *oldpath, const char *newpath);
 int vfs_mkdir(const char *path, unsigned int mode);
+/* Create a node with no data: S_IFSOCK or S_IFIFO in the mode's type bits. */
+int vfs_mknod(const char *path, unsigned int mode);
 int vfs_rmdir(const char *path);
 int vfs_close(vfs_file_t *f);
 /* UNIX-semantics wrappers — dispatch to the mounted filesystem's op (path ops

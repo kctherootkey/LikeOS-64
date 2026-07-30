@@ -44,4 +44,11 @@ typedef int      id_t;
 
 typedef char*    caddr_t;
 
+
+/* fd_set and the FD_* macros belong to <sys/select.h>, but <sys/types.h> has
+ * carried them since long before that header existed, and a great deal of code
+ * still expects to get them here — libXaw's text widget among it.  Included at
+ * the end so the types above are already defined. */
+#include <sys/select.h>
+
 #endif

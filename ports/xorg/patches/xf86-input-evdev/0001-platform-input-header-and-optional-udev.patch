@@ -1,0 +1,50 @@
+Include this platform's evdev UAPI header, and stop requiring libudev.
+
+The header change is the same one-line redirect applied to libevdev and mtdev.
+
+libudev is a different matter: configure demands it, but src/evdev.c uses it in
+exactly one function -- EvdevDeviceIsVirtual(), which looks for "LNXSYSTM" in a
+sysfs device path -- and that function is ALREADY wrapped in #ifdef
+HAVE_LIBUDEV with a "return FALSE" fallback.  So the hard requirement buys
+nothing: without udev the code compiles out and the driver works, but configure
+refuses to get that far.  Made optional, which is what the source already
+assumes.
+
+configure.ac changes have no effect until `configure` is regenerated, so the
+port deletes the shipped one; see unpack.sh.
+
+--- a/src/evdev.h
++++ b/src/evdev.h
+@@ -35,7 +35,13 @@
+ #ifndef EVDEV_H
+ #define EVDEV_H
+ 
++/* This platform's evdev UAPI header. Same event structure, event codes and
++ * ioctl encoding; it is only reached under a different name. */
++#ifdef __LIKEOS__
++#include <sys/input.h>
++#else
+ #include <linux/input.h>
++#endif
+ #include <sys/types.h>
+ 
+ /* Tolerate prior #include <linux/input.h> */
+--- a/configure.ac
++++ b/configure.ac
+@@ -45,7 +45,15 @@
+ 
+ # Obtain compiler/linker options from server and required extensions
+ PKG_CHECK_MODULES(XORG, [xorg-server >= 1.18] xproto [inputproto >= 2.1.99.3])
+-PKG_CHECK_MODULES(UDEV, libudev, [AC_DEFINE(HAVE_LIBUDEV, 1,[libudev support])])
++dnl libudev is optional, not required.  src/evdev.c uses it in exactly one
++dnl function -- EvdevDeviceIsVirtual(), which looks for "LNXSYSTM" in a sysfs
++dnl device path -- and that function is already wrapped in #ifdef HAVE_LIBUDEV
++dnl with a "return FALSE" fallback.  Demanding the library to build a check
++dnl that compiles out anyway makes the driver unbuildable on any system without
++dnl udev, for no gain.
++PKG_CHECK_MODULES(UDEV, libudev,
++                  [AC_DEFINE(HAVE_LIBUDEV, 1,[libudev support])],
++                  [AC_MSG_NOTICE([libudev not found; virtual-device detection disabled])])
+ 
+ PKG_CHECK_MODULES(LIBEVDEV, [libevdev >= 0.4])
+ PKG_CHECK_MODULES(MTDEV, mtdev)

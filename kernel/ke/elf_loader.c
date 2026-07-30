@@ -938,11 +938,14 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 				task_fds(cur)[i] = NULL;
 				unix_close(ufd);
 			} else if (IS_EPOLL_FD(task_fds(cur)[i])) {
+				/* Release this descriptor's reference; the
+				 * instance stays alive for anyone else holding
+				 * one.  Closing it outright here destroyed the
+				 * epoll set of the process that forked us. */
 				int idx = EPOLL_FD_IDX(task_fds(cur)[i]);
+
 				task_fds(cur)[i] = NULL;
-				extern epoll_instance_t epoll_instances[];
-				if (idx >= 0 && idx < MAX_EPOLL_INSTANCES)
-					epoll_instances[idx].active = 0;
+				epoll_put(idx);
 			} else if (pipe_is_end(task_fds(cur)[i])) {
 				pipe_close_end((pipe_end_t *)task_fds(cur)[i]);
 				task_fds(cur)[i] = NULL;

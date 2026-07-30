@@ -23,6 +23,8 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st);
 int devfs_fpath(vfs_file_t *f, char *out, size_t cap);
 int devfs_is_devfile(vfs_file_t *f);
 int devfs_is_fb0(vfs_file_t *f);
+/* POSIX shared memory object behind a /dev/shm handle, or NULL. */
+struct shm_object *devfs_shm_object(vfs_file_t *f);
 int devfs_evdev_unit(vfs_file_t *f); // event-device unit or -1
 long devfs_seek(vfs_file_t *f, long offset, int whence);
 

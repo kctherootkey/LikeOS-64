@@ -1,0 +1,275 @@
+SED(1)                           User Commands                          SED(1)
+
+NAME
+       sed - stream editor for filtering and transforming text
+
+SYNOPSIS
+       sed [OPTION]... {script} [input-file]...
+
+DESCRIPTION
+       sed reads its input a line at a time, applies the commands of the
+       script to each line in turn, and writes the result to standard output.
+
+       If no -e or -f option is given, the first non-option argument is the
+       script.  With no input file, or with -, standard input is read.
+
+HOW IT WORKS
+       Understanding three things explains almost every sed script:
+
+       o      The current line is held in the PATTERN SPACE.  Every command in
+              the script is considered in order; a command whose address
+              matches runs.  At the end of the script the pattern space is
+              printed -- unless -n -- and the next line is read.
+
+       o      A separate HOLD SPACE persists across lines and is the only
+              memory a script has.  It starts empty.  g, G, h, H and x move
+              text between the two.
+
+       o      The trailing newline is NOT part of the pattern space.  That is
+              why $ in a regular expression matches end of line rather than
+              the newline itself, and why N and G insert one explicitly.
+
+OPTIONS
+       -n, --quiet, --silent
+              suppress the automatic printing of the pattern space
+
+       -e SCRIPT, --expression=SCRIPT
+              add SCRIPT to the commands to be executed.  May be repeated;
+              the scripts are joined with newlines.
+
+       -f FILE, --file=FILE
+              add the contents of FILE to the commands to be executed
+
+       -i[SUFFIX], --in-place[=SUFFIX]
+              edit files in place.  If SUFFIX is given, the original is kept
+              under that suffix.  The suffix is attached to the option, never
+              given as a separate argument: `sed -i.bak s/a/b/ f` keeps f.bak,
+              whereas `sed -i s/a/b/ f` keeps nothing.  A * in SUFFIX is
+              replaced by the file name, which is how a backup directory is
+              requested.
+
+       -E, -r, --regexp-extended
+              use extended regular expressions
+
+       -s, --separate
+              treat the input files as separate streams rather than as one.
+              Line numbering restarts and $ matches the last line of each
+              file.  Implied by -i.
+
+       -z, --null-data
+              separate lines by NUL characters rather than newlines
+
+       --posix
+              disable the extensions.  Currently this affects N at end of
+              input: POSIX discards the pattern space, the default prints it.
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+ADDRESSES
+       A command with no address runs on every line.  With one address it
+       runs on matching lines; with two, on the range between them.  A ! after
+       the address inverts the selection.
+
+       N      line number N
+
+       $      the last line of the input
+
+       /REGEXP/, \cREGEXPc
+              lines matching REGEXP.  The second form uses c as the delimiter,
+              which avoids escaping slashes in a path.  I after the closing
+              delimiter matches case-insensitively, M makes ^ and $ match at
+              embedded newlines.
+
+       FIRST~STEP
+              line FIRST and every STEP lines after it
+
+       ADDR1,ADDR2
+              from a line matching ADDR1 to the next line matching ADDR2
+
+       ADDR1,+N
+              ADDR1 and the N lines following it
+
+       ADDR1,~N
+              from ADDR1 to the next line whose number is a multiple of N
+
+       0,/REGEXP/
+              like 1,/REGEXP/ except that REGEXP may match on the FIRST line.
+              This is the only way to select up to the first match inclusive.
+
+       A range becomes active when ADDR1 matches and stays active until ADDR2
+       matches on a LATER line -- ADDR2 is never tested on the line that
+       opened the range.  So /a/,/a/ spans from one matching line to the next,
+       not a single line.
+
+COMMANDS
+       {COMMANDS}
+              run COMMANDS as a group
+
+       =      print the current line number
+
+       a TEXT append TEXT after the pattern space is printed
+
+       b LABEL
+              branch to LABEL, or to the end of the script if omitted
+
+       c TEXT replace the selected lines with TEXT.  For a range the text
+              appears once, at the end of the range.
+
+       d      delete the pattern space and start the next cycle
+
+       D      delete up to the first newline in the pattern space and restart
+              the script WITHOUT reading a new line
+
+       g      replace the pattern space with the hold space
+
+       G      append a newline and the hold space to the pattern space
+
+       h      replace the hold space with the pattern space
+
+       H      append a newline and the pattern space to the hold space
+
+       i TEXT insert TEXT before the pattern space
+
+       l [N]  print the pattern space unambiguously, escaping non-printing
+              characters and wrapping at N columns (default 70)
+
+       n      print the pattern space (unless -n) and read the next line
+
+       N      append a newline and the next line to the pattern space
+
+       p      print the pattern space
+
+       P      print the pattern space up to the first newline
+
+       q [N]  print the pattern space, then exit with status N
+
+       Q [N]  exit with status N without printing
+
+       r FILE queue the contents of FILE to be output at the end of the cycle.
+              A missing file is silently ignored.
+
+       R FILE queue one line of FILE
+
+       s/RE/REPL/FLAGS
+              substitute; see SUBSTITUTION below
+
+       t LABEL
+              branch to LABEL if an s command has succeeded since the last
+              input line was read or the last t
+
+       T LABEL
+              branch to LABEL if no s command has succeeded
+
+       w FILE write the pattern space to FILE
+
+       W FILE write the first line of the pattern space to FILE
+
+       x      exchange the pattern and hold spaces
+
+       y/SRC/DST/
+              transliterate the characters of SRC to those of DST
+
+       z      empty the pattern space
+
+       F      print the name of the current input file
+
+       :LABEL define a branch target
+
+       #      comment to end of line
+
+SUBSTITUTION
+       s/REGEXP/REPLACEMENT/FLAGS replaces text matching REGEXP.  Any
+       character may be used as the delimiter in place of /.
+
+       In REPLACEMENT:
+
+       &      the whole matched text
+
+       \1 to \9
+              the text matched by the corresponding \( \) group
+
+       \n, \t, \r, \f, \v, \a
+              the corresponding control character
+
+       \U, \L turn the rest of the replacement upper or lower case, until \E
+
+       \u, \l turn the next character upper or lower case
+
+       \E     end a \U or \L
+
+       Flags:
+
+       g      replace every match, not just the first
+
+       N      replace only the Nth match
+
+       Ng     replace the Nth match and all after it
+
+       p      print the pattern space if a substitution was made
+
+       i, I   match case-insensitively
+
+       m, M   make ^ and $ match at embedded newlines
+
+       w FILE write the pattern space to FILE if a substitution was made
+
+EXIT STATUS
+       0      the script ran successfully
+
+       1      the script asked to quit with a non-zero status
+
+       2      an input file could not be read
+
+       4      an I/O error occurred
+
+EXAMPLES
+       Replace the first occurrence on each line, and every occurrence:
+
+              sed 's/old/new/'  file
+              sed 's/old/new/g' file
+
+       Print only matching lines, the grep of sed:
+
+              sed -n '/pattern/p' file
+
+       Delete a range:
+
+              sed '2,4d' file
+
+       Join every pair of lines.  \n is a real newline here -- that is the
+       whole reason N is useful:
+
+              sed 'N;s/\n/ /' file
+
+       Reverse the file, the classic hold-space idiom:
+
+              sed -n '1!G;h;$p' file
+
+       Join the whole file into one comma-separated line, using a branch:
+
+              sed -n ':a;$!{N;ba};s/\n/,/gp' file
+
+       Edit in place, keeping a backup:
+
+              sed -i.bak 's/old/new/g' file
+
+       Print the first line only, which needs the 0 address form:
+
+              sed -n '0,/./p' file
+
+NOTES
+       s///g always makes progress on an empty match: after matching nothing,
+       the scan advances one character.  Without that a pattern such as x*
+       would substitute forever.
+
+       Character escapes are expanded before the regular expression is
+       compiled, because POSIX regular expressions have no \n of their own --
+       to the matcher, \n would otherwise be an escaped letter n.  Regex
+       syntax (\( \) \1 \. \* \[ \\) and the word operators (\b \w \s \< \>)
+       are left untouched.
+
+SEE ALSO
+       grep(1), expr(1), tr(1), cut(1)

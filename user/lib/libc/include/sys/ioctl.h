@@ -14,7 +14,11 @@
 #define TIOCGWINSZ 0x5413
 #define TIOCSWINSZ 0x5414
 #define TIOCGPTN   0x80045430
-#define TIOCSGUARD 0x5420
+/* LikeOS-private: arm the shell's console prompt guard.  Deliberately
+ * outside the conventional 0x54xx tty range — it previously sat on
+ * 0x5420, which is TIOCPKT (pty packet mode), so any program enabling
+ * packet mode on a pty master silently landed in the guard path. */
+#define TIOCSGUARD 0x4C4B0001
 #define TIOCLINUX  0x541C
 #define FIONREAD   0x541B
 #define FIONBIO    0x5421

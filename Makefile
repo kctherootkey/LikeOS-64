@@ -131,7 +131,7 @@ KERNEL_CFLAGS = -m64 -ffreestanding -nostdlib -nostdinc -fno-builtin \
 			-mstack-protector-guard-reg=gs -mstack-protector-guard-offset=104 \
 			-mno-red-zone -mcmodel=large -fno-pic -Wall -Wextra \
 			-I$(INCLUDE_DIR) -I$(KERNEL_DIR)/hal/acpica/include \
-			-D__LIKEOS__ -DACPI_USE_BUILTIN_STDARG \
+			-D__LIKEOS__ -D__LIKEOS_KERNEL__ -DACPI_USE_BUILTIN_STDARG \
 			-U__linux__ -U_LINUX -Ulinux \
 			-DXHCI_USE_INTERRUPTS=1 $(SERIAL_CFLAGS) $(USB_SERIAL_CFLAGS) \
 			$(KERNEL_SCREEN_CFLAGS) \
@@ -190,7 +190,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/mouse.o \
               $(BUILD_DIR)/memory.o \
 			  $(BUILD_DIR)/stack_switch.o \
-			  $(BUILD_DIR)/slab.o \
+			  $(BUILD_DIR)/slab.o $(BUILD_DIR)/shm.o \
 			  $(BUILD_DIR)/scrollbar.o \
 			  $(BUILD_DIR)/vfs.o \
 			  $(BUILD_DIR)/devfs.o \
@@ -295,18 +295,34 @@ LINUX_USB_IMAGE = $(LINUX_USB_BUILD_DIR)/linux-usb.img
 ROOT_BIN_PROGS = bash ls cat pwd stat uname shutdown poweroff reboot halt ps cp mv rm \
 	mkdir rmdir ln chmod readlink touch more less clear env kill find df du hexdump \
 	sleep strings file grep wc head tail echo printf free uptime dmesg which date time \
-	sort uniq cut tr yes true false top man hostname ping ifconfig netstat route arp \
+	sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp \
 	traceroute arping dhclient dig nslookup host nano tmux nc openssl curl login \
 	id whoami groups su passwd adduser addgroup deluser delgroup
 # System binaries -> /sbin/<name>
 ROOT_SBIN_PROGS = init getty
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
-	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so libcrypt.so libpam.so
+	libz.so.1 libnghttp2.so.14 libcurl.so.4 libtestlib.so libcrypt.so libpam.so \
+	libdlbase.so libdlchain.so
 ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat teststress \
 	netstress openssltest usbtest ext4test permbench fbtest
+# Configuration and data files staged into the image, and the script that stages
+# the X.Org tree.  These are prerequisites for exactly the same reason the
+# binaries are: editing one and rebuilding has to CHANGE the image.  Without
+# them make compared only build artifacts, found them all unchanged, declared
+# the image up to date and wrote the PREVIOUS one to the device -- an edited
+# config that never reached the running system, which looks identical to the
+# edit not working.
+RES_PREREQS = res/Lat15-Fixed16.psf res/left_ptr res/nanorc \
+	res/etc/skel/.profile res/etc/skel/.bashrc \
+	$(wildcard res/man/*.1) $(wildcard res/etc/*) \
+	$(wildcard res/etc/ssl/certs/*) $(wildcard res/xorg/*) \
+	ports/xorg/stage.sh
+
 # Full prerequisite set for the ext4 image (every staged build artifact).
 GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS)) \
-	$(BUILD_DIR)/openssh/bin/ssh
+	$(BUILD_DIR)/openssh/bin/ssh \
+	$(BUILD_DIR)/xorg-sysroot/usr/bin/Xorg \
+	$(RES_PREREQS)
 
 # Default target: build the single ext4 GPT USB disk.
 all: $(GPT_DISK)
@@ -377,6 +393,9 @@ $(BUILD_DIR)/stack_switch.o: $(KERNEL_DIR)/mm/stack_switch.asm | $(BUILD_DIR)
 	nasm -f elf64 $< -o $@
 
 $(BUILD_DIR)/slab.o: $(KERNEL_DIR)/mm/slab.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/shm.o: $(KERNEL_DIR)/mm/shm.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/scrollbar.o: $(KERNEL_DIR)/io/scrollbar.c | $(BUILD_DIR)
@@ -595,6 +614,13 @@ userland-rtld:
 userland-testlib:
 	$(MAKE) -C user/lib/testlib
 
+# Two-level DSO chain (libdlchain.so -> libdlbase.so) used only by testlibc to
+# prove dlopen() relocates and initialises a dependency, not just the object
+# it was handed.
+.PHONY: userland-dlchain
+userland-dlchain:
+	$(MAKE) -C user/lib/dlchain
+
 # Build password-hashing library (yescrypt-based crypt())
 .PHONY: userland-libcrypt
 userland-libcrypt: userland-libc
@@ -616,6 +642,14 @@ $(BUILD_DIR)/libc.so: userland-libc | $(BUILD_DIR)
 
 $(BUILD_DIR)/libtestlib.so: userland-testlib | $(BUILD_DIR)
 	cp user/lib/testlib/libtestlib.so $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/libdlbase.so: userland-dlchain | $(BUILD_DIR)
+	cp user/lib/dlchain/libdlbase.so $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/libdlchain.so: userland-dlchain | $(BUILD_DIR)
+	cp user/lib/dlchain/libdlchain.so $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/libcrypt.so: userland-libcrypt | $(BUILD_DIR)
@@ -980,6 +1014,25 @@ $(BUILD_DIR)/cut: userland-libc userland-rtld | $(BUILD_DIR)
 	cp $(USER_DIR)/cut $@
 	$(STRIP) --strip-unneeded $@
 
+# Text and expression utilities that scripts assume exist.  sed and expr were
+# missing until startx needed them: it calls `tty` to find its terminal, `expr`
+# to test that against /dev/ttyN, and `sed` to pull a cookie out of xauth's
+# output.
+$(BUILD_DIR)/sed: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) sed
+	cp $(USER_DIR)/sed $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/expr: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) expr
+	cp $(USER_DIR)/expr $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/tty: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) tty
+	cp $(USER_DIR)/tty $@
+	$(STRIP) --strip-unneeded $@
+
 $(BUILD_DIR)/tr: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) tr
 	cp $(USER_DIR)/tr $@
@@ -1212,6 +1265,49 @@ ports-openssh: userland-libc userland-rtld ports-openssl ports-zlib | $(BUILD_DI
 $(BUILD_DIR)/openssh/bin/ssh: ports-openssh | $(BUILD_DIR)
 	@# built and copied by ports-openssh above
 
+# --------------------------------------------------------------------------
+# X.Org: the display server, its drivers, the client libraries and a session.
+#
+# Nearly fifty upstream packages, so unlike the other ports this one is driven
+# by scripts in ports/xorg/ rather than a Makefile.likeos: fetch.sh downloads
+# and records checksums, unpack.sh extracts and applies patches/, build.sh
+# builds each package in dependency order into build/xorg-sysroot.
+#
+# All three are idempotent -- fetch.sh skips tarballs it already has, unpack.sh
+# skips trees that exist, build.sh skips packages with a stamp -- so running
+# them on every build costs a few seconds and nothing else.
+#
+# The libraries it links against have to exist first: openssl (the server uses
+# libcrypto for SHA1), zlib (libXfont2), and ncurses (xterm's termcap).
+# --------------------------------------------------------------------------
+XORG_SYSROOT = $(BUILD_DIR)/xorg-sysroot
+
+.PHONY: ports-xorg
+ports-xorg: userland-libc userland-rtld ports-openssl ports-zlib ports-ncurses \
+		| $(BUILD_DIR)
+	ports/xorg/fetch.sh
+	ports/xorg/unpack.sh
+	ports/xorg/build.sh
+
+# Sentinel the image build depends on.  The server is the last thing that can
+# be produced without every library beneath it, so its presence means the whole
+# stack built.
+#
+# The recipe CHECKS rather than assuming.  A rule whose recipe does not create
+# its target is a rule make cannot verify: it runs the prerequisite, runs the
+# (empty) recipe, and carries on regardless -- which is how a missing sysroot
+# turned into an image without an X server and only a warning to show for it,
+# thirty seconds before the image was written.
+$(XORG_SYSROOT)/usr/bin/Xorg: ports-xorg | $(BUILD_DIR)
+	@test -x $@ || { \
+		echo "ERROR: $@ is missing after building the X.Org port."; \
+		echo "  The per-package stamps in ports/xorg/.stamps say the"; \
+		echo "  packages are built, but the sysroot they install into"; \
+		echo "  is not there.  Rebuild it with:"; \
+		echo "      ports/xorg/clean.sh && make"; \
+		exit 1; \
+	}
+
 
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel.lds | $(BUILD_DIR)
 	@echo "Building LikeOS-64 kernel as ELF64..."
@@ -1310,6 +1406,10 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	ln -sfn bash.1 $(EXT4_STAGING)/usr/share/man/man1/sh.1
 	cp ports/nano-8.3/syntax/*.nanorc $(EXT4_STAGING)/usr/share/nano/
 	cp /etc/services         $(EXT4_STAGING)/etc/services
+	# The valid login shells.  Consulted by chsh, by daemons that refuse a
+	# login whose shell is not listed, and by xterm -- which falls back to
+	# /bin/sh when the file is missing, whatever the password database says.
+	cp res/etc/shells        $(EXT4_STAGING)/etc/shells
 	cp res/etc/hosts         $(EXT4_STAGING)/etc/hosts
 	cp res/etc/resolv.conf   $(EXT4_STAGING)/etc/resolv.conf
 	# What init (process 1) starts and supervises at boot: the console getty
@@ -1349,10 +1449,27 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp res/etc/skel/.profile $(EXT4_STAGING)/etc/skel/.profile
 	cp res/etc/skel/.bashrc  $(EXT4_STAGING)/etc/skel/.bashrc
 	chmod 0700 $(EXT4_STAGING)/root
+	# X11 puts its per-display listening socket at /tmp/.X11-unix/X<n>.  The
+	# directory must exist before the server binds, and carries the same
+	# world-writable + sticky mode as /tmp itself.
+	mkdir -p $(EXT4_STAGING)/tmp/.X11-unix
+	chmod 1777 $(EXT4_STAGING)/tmp/.X11-unix
 	# World-writable + sticky /tmp (1777, like every Unix): lets any user create
 	# their own /tmp/tmux-<uid> socket dir (tmux then makes it 0700); the sticky
 	# bit keeps users from deleting each other's files.
 	chmod 1777 $(EXT4_STAGING)/tmp
+	# --- X.Org: server, drivers, libraries, keymaps, fonts, config.
+	# Staged by a script rather than inline: it is a few hundred files
+	# picked out of a build sysroot that also holds static archives,
+	# headers and host tools, and the selection needs explaining.
+	# ports-xorg is a prerequisite of the image, so the sysroot is normally
+	# there.  The guard is for the case where it has been removed by hand
+	# between the build and the staging step: an image without an X server is
+	# a better outcome than a staging failure, as long as it says so.
+	@# Refuses rather than warning: an image that silently has no X server
+	@# is the failure this whole chain exists to prevent, and a warning in
+	@# the middle of a long build is not seen.
+	ports/xorg/stage.sh $(EXT4_STAGING)
 	cp ports/openssl-3.5.6/apps/openssl.cnf $(EXT4_STAGING)/etc/ssl/openssl.cnf
 	cp res/etc/ssl/certs/ca-certificates.crt $(EXT4_STAGING)/etc/ssl/certs/ca-certificates.crt
 	# Signature file selects this device as the OS root; sample text file
@@ -1566,7 +1683,21 @@ linux-usb-write: linux-usb
 
 # Clean build files
 clean:
-	rm -rf $(BUILD_DIR)
+	@# Everything in build/ EXCEPT the X.Org sysroot.
+	@#
+	@# build/xorg-sysroot is the X port's build state, not one of our
+	@# outputs -- it is where the 51 packages install to, and it is the
+	@# counterpart of the object files that `clean` leaves alone inside
+	@# ports/openssh-10.4p1 and the others.  Deleting it here while
+	@# ports/xorg/.stamps survived meant build.sh skipped every package as
+	@# "already done" and never recreated it, so `make clean && make`
+	@# produced an image with no X server at all.
+	@#
+	@# `make distclean` removes it, through ports/xorg/clean.sh.
+	@if [ -d $(BUILD_DIR) ]; then \
+		find $(BUILD_DIR) -mindepth 1 -maxdepth 1 \
+			! -name xorg-sysroot -exec rm -rf {} + ; \
+	fi
 	$(MAKE) -C user/lib/libc clean
 	$(MAKE) -C user/lib/rtld clean
 	$(MAKE) -C user/lib/testlib clean
@@ -1587,6 +1718,12 @@ distclean: clean
 	$(MAKE) -C ports/curl-8.14.1 -f Makefile.likeos clean
 	$(MAKE) -C ports/openssh-10.4p1 -f Makefile.likeos distclean
 	rm -rf $(BUILD_DIR)/openssh
+	# X.Org: the source trees are unpacked tarballs rather than checked-in
+	# sources, so cleaning deletes them.  The tarballs themselves are kept --
+	# they ARE this port's sources, and re-downloading forty-seven of them
+	# would make `make distclean && make` need a network connection.
+	# ports/xorg/clean.sh -a removes those too.
+	ports/xorg/clean.sh
 
 # Regenerate res/man/bash.1 from the port's troff source.  man(1) reads
 # PRE-FORMATTED (catman) text, not troff, so the upstream doc/bash.1 has to be
@@ -1613,6 +1750,76 @@ openssh-manpages:
 		echo "  res/man/$$base.1 ($$(wc -l < res/man/$$base.1) lines)"; \
 	done
 
+# Render the X.Org manual pages, the same way openssh-manpages above does.
+#
+# Maintenance target, not part of the build: the rendered pages are checked in
+# and groff is not a build dependency.  Sources are taken from the built
+# sysroot rather than the source trees, because several are generated at build
+# time from .man templates with paths substituted in -- rendering the template
+# would ship a page full of unexpanded @variables@.
+#
+# ONLY section 1: programs someone can actually run.  Everything else is left
+# out on purpose -- section 3 is 3631 pages of Xlib function reference (22 MB,
+# for writing X clients, not for using this system), section 4 documents driver
+# options and section 5 file formats.  This system's manual is a flat man1
+# catman directory, and putting a file-format page in it produces entries like
+# "Compose(5)" sitting among the commands.
+#
+# A few section-1 pages are skipped by name because their programs are build
+# host tooling and are not staged onto the image; a manual page for a command
+# that does not exist is worse than no page.
+#
+# Some packages install their page already gzipped, so the source is piped
+# through zcat where needed rather than handed to groff by name.
+#
+# groff runs FROM the man root with a relative path, because some pages are a
+# single .so line (an include of another page) resolved relative to the working
+# directory.  A few spell it without the directory, so those get a second
+# attempt from the page's own directory; between the two forms every page
+# renders.
+XORG_MAN_SKIP = bdftruncate ucs2any libevdev-tweak-device mouse-dpi-tool \
+		touchpad-edge-detector koi8rxterm gtf
+
+.PHONY: xorg-manpages
+xorg-manpages:
+	@set -e; \
+	sysroot=$$(pwd)/$(BUILD_DIR)/xorg-sysroot; \
+	if [ ! -d $$sysroot/usr/share/man ]; then \
+		echo "no X.Org sysroot; run ports/xorg/build.sh first"; exit 1; \
+	fi; \
+	out=$$(cd res/man && pwd); \
+	cd $$sysroot/usr/share/man; \
+	n=0; \
+	for m in $$(find man1 -type f \( -name '*.[0-9]' -o -name '*.[0-9].gz' \) \
+			2>/dev/null | sort); do \
+		base=$$(basename $$m); \
+		base=$$(echo $$base | sed 's/\.gz$$//; s/\.[0-9]$$//'); \
+		skip=0; \
+		for x in $(XORG_MAN_SKIP); do \
+			[ "$$base" = "$$x" ] && skip=1; \
+		done; \
+		[ $$skip = 1 ] && continue; \
+		case $$m in \
+		*.gz) cat="zcat" ;; \
+		*)    cat="cat"  ;; \
+		esac; \
+		$$cat $$m 2>/dev/null | GROFF_NO_SGR=1 groff -Tascii -mandoc - \
+			2>/dev/null | col -bx > $$out/$$base.1; \
+		if [ ! -s $$out/$$base.1 ]; then \
+			( cd $$(dirname $$m) && $$cat $$(basename $$m) \
+				2>/dev/null | GROFF_NO_SGR=1 groff -Tascii \
+				-mandoc - 2>/dev/null ) \
+				| col -bx > $$out/$$base.1; \
+		fi; \
+		if [ -s $$out/$$base.1 ]; then \
+			n=$$((n + 1)); \
+		else \
+			rm -f $$out/$$base.1; \
+			echo "  SKIP $$base (rendered empty)"; \
+		fi; \
+	done; \
+	echo "rendered $$n X.Org manual pages into res/man/"
+
 # Install dependencies (Ubuntu/Debian)
 deps:
 	@echo "Installing build dependencies..."
@@ -1621,6 +1828,15 @@ deps:
 	# Ubuntu names the package gnu-efi (no -dev); Debian uses gnu-efi-dev. Try both.
 	sudo apt install -y gcc nasm mtools dosfstools e2fsprogs fakeroot ovmf debootstrap parted gdisk qemu-utils qemu-system-x86 grub-efi-amd64-bin rsync || true
 	sudo apt install -y gnu-efi-dev || sudo apt install -y gnu-efi
+	# X.Org port build tooling.  meson/ninja are needed by the packages that
+	# dropped autotools (pixman, libxkbcommon); libtool/gperf/xsltproc by the
+	# autotools ones; xfonts-utils supplies bdftopcf and mkfontdir, which
+	# render and index the bitmap fonts on the HOST at image-build time.
+	# cmake is for ctwm, which is the one package here that uses neither
+	# autotools nor meson.  groff/man-db render the manual pages
+	# (maintenance target only, but the tools belong on the list).
+	sudo apt install -y meson ninja-build libtool gperf xsltproc xfonts-utils \
+		bison flex cmake groff || true
 
 # Help target
 help:

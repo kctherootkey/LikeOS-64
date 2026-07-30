@@ -37,6 +37,13 @@ struct rlimit {
 extern "C" {
 #endif
 
+/* setpriority()/getpriority() target selector */
+#define PRIO_PROCESS 0
+#define PRIO_PGRP    1
+#define PRIO_USER    2
+
+int getpriority(int which, id_t who);
+int setpriority(int which, id_t who, int prio);
 int getrusage(int who, struct rusage* usage);
 int getrlimit(int resource, struct rlimit* rlim);
 int setrlimit(int resource, const struct rlimit* rlim);

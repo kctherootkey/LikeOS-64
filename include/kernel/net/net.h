@@ -1152,9 +1152,24 @@ struct epoll_event {
 	epoll_data_t data;
 } __attribute__((packed));
 
+/* epoll_create1() flags.  Same value userspace uses (sys/epoll.h). */
+#define EPOLL_CLOEXEC 0x80000
+
 // Epoll instance (kernel internal)
 typedef struct {
 	int active;
+	/* How many descriptors refer to this instance.
+	 *
+	 * The instance is global to the kernel while the DESCRIPTOR is
+	 * per-process, and fork() hands the child a copy.  Without a count,
+	 * the first close in ANY of those processes tore the instance down for
+	 * all of them: the X server created its epoll set, forked to run
+	 * xkbcomp, and when xkbcomp exited and its inherited descriptor was
+	 * closed, the server's own epoll_wait() began returning EBADF forever.
+	 *
+	 * Incremented on fork and dup, decremented on close; the instance is
+	 * released when it reaches zero. */
+	int ref_count;
 	struct {
 		int fd;
 		uint32_t events;
@@ -1308,6 +1323,10 @@ int sys_select_internal(int nfds, fd_set *readfds, fd_set *writefds,
 			fd_set *exceptfds, uint64_t timeout_ticks);
 int sys_poll_internal(struct pollfd *fds, int nfds, uint64_t timeout_ticks);
 int epoll_create_internal(int flags);
+/* Descriptor-lifetime references on an epoll instance: fork and dup take one,
+ * close and exec drop one.  See the ref_count comment on epoll_instance_t. */
+void epoll_get(int idx);
+void epoll_put(int idx);
 int epoll_ctl_internal(int epfd_idx, int op, int fd, struct epoll_event *event);
 int epoll_wait_internal(int epfd_idx, struct epoll_event *events, int maxevents,
 			uint64_t timeout_ticks);
@@ -1349,6 +1368,10 @@ typedef struct unix_socket {
 	int active;
 	int type; // SOCK_STREAM or SOCK_DGRAM
 	int bound;
+	/* A pathname bind also creates an S_IFSOCK node in the filesystem, and
+	 * this records that we own it so close() removes it again.  Abstract
+	 * names have no filesystem presence and leave this clear. */
+	int has_node;
 	int listening;
 	int connected;
 	int closed;
@@ -1409,6 +1432,10 @@ typedef struct unix_socket {
 // UNIX domain socket API
 int unix_create(int type);
 int unix_bind(int usockfd, const struct sockaddr_un *addr, socklen_t addrlen);
+/* Fill in this socket's name (peer == 0) or its peer's (peer == 1).
+ * *addrlen is in/out: buffer size in, required size out. */
+int unix_getname(int usockfd, int peer, struct sockaddr_un *addr,
+		 socklen_t *addrlen);
 int unix_listen(int usockfd, int backlog);
 int unix_accept(int usockfd, struct sockaddr_un *addr, socklen_t *addrlen);
 int unix_connect(int usockfd, const struct sockaddr_un *addr,

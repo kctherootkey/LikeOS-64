@@ -1,0 +1,62 @@
+Do not treat a claimed framebuffer as a conflict when there is no PCI at all.
+
+xf86PostProbe() refuses to continue if a framebuffer slot was claimed
+alongside a bus slot, because the server then cannot tell which device drives
+the screen and asks the user to disambiguate with busIDs.  Without
+XSERVER_LIBPCIACCESS the other half of that test is hardcoded to TRUE:
+
+    if (fbSlotClaimed && (
+    #ifdef XSERVER_LIBPCIACCESS
+                             pciSlotClaimed
+    #else
+                             TRUE
+    #endif
+        ))
+        FatalError("Cannot run in framebuffer mode. Please specify busIDs ...");
+
+so claiming a framebuffer is unconditionally fatal.  The driver opens the
+device, logs "using /dev/fb0", and the server then dies telling the user to
+specify busIDs for a bus that does not exist.
+
+That TRUE reads "no libpciaccess means an older server that reaches PCI some
+other way" -- the same assumption xf86-video-fbdev makes about the Resource
+Access Control interface, and wrong for the same reason.  It predates a modern
+server built with PCI support switched off entirely.
+
+With no PCI there is no bus slot to conflict with, so nothing conflicts.
+
+--- a/hw/xfree86/common/xf86Bus.c
++++ b/hw/xfree86/common/xf86Bus.c
+@@ -565,6 +565,32 @@
+ #endif
+ #ifdef XSERVER_LIBPCIACCESS
+                              pciSlotClaimed
++#elif defined(__LIKEOS__)
++                             /* Nothing can conflict with the framebuffer here.
++                              *
++                              * The test is meant to catch an ambiguous
++                              * configuration: a framebuffer slot claimed
++                              * alongside a bus slot, where the server cannot
++                              * tell which device drives the screen, so the
++                              * user is asked to disambiguate with busIDs.
++                              *
++                              * The `TRUE` below reads "no libpciaccess means an
++                              * older server that reaches PCI another way", and
++                              * that is the same assumption the fbdev driver
++                              * makes about the Resource Access Control
++                              * interface.  It predates a modern server built
++                              * with PCI support switched off entirely, which is
++                              * what this is: there is no bus slot to conflict
++                              * with, and no busID to specify even if one
++                              * wanted to.
++                              *
++                              * Left as TRUE it makes claiming a framebuffer
++                              * unconditionally fatal -- the driver opens
++                              * /dev/fb0, reports "using /dev/fb0", and the
++                              * server then dies telling the user to specify
++                              * busIDs for a bus that does not exist.
++                              */
++                             FALSE
+ #else
+                              TRUE
+ #endif

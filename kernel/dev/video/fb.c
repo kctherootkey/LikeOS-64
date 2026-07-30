@@ -3,6 +3,7 @@
 
 #define BOOT_DEBUG 0
 
+#include <kernel/dev/video/fbdev.h>
 #include <kernel/dev/video/fb.h>
 #include <kernel/mm/memory.h>
 #include <kernel/io/console.h>
@@ -733,6 +734,21 @@ void fb_mark_full_dirty(void)
 // Flush all dirty regions to the front buffer
 void fb_flush_dirty_regions(void)
 {
+	/* Nothing is painted while another program owns the display.
+	 *
+	 * The console and a display server would otherwise be writing the same
+	 * pixels, and the console would win every time anything made it draw --
+	 * an echoed keystroke, a kernel message -- appearing on top of the X
+	 * screen.  On a system with virtual terminals KD_GRAPHICS does this;
+	 * with no VTs, having /dev/fb0 open is the equivalent statement.
+	 *
+	 * Only the BLIT is skipped.  The back buffer and the dirty regions
+	 * carry on being updated, so the full redraw on the last close shows
+	 * everything that happened in the meantime rather than a blank screen.
+	 */
+	if (fbdev_display_owned())
+		return;
+
 	uint64_t flags;
 	spin_lock_irqsave(&fb_lock, &flags);
 	fb_flush_dirty_regions_unlocked();

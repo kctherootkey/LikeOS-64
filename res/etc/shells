@@ -1,0 +1,12 @@
+# /etc/shells - the login shells on this system.
+#
+# The list of shells a user may legitimately be given.  chsh(1) refuses a shell
+# that is not here, ftp daemons reject logins whose shell is missing from it,
+# and xterm consults it to decide whether the shell it is about to run is a
+# real login shell -- if the file is absent, xterm falls back to /bin/sh
+# regardless of what the password database says.
+#
+# One absolute path per line; lines starting with # are comments.
+
+/bin/sh
+/bin/bash

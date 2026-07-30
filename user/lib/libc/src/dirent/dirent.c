@@ -91,3 +91,170 @@ void rewinddir(DIR *dirp)
 	dirp->buf_pos = 0;
 	dirp->buf_len = 0;
 }
+
+DIR *fdopendir(int fd)
+{
+	DIR *dirp;
+
+	if (fd < 0) {
+		errno = EBADF;
+		return NULL;
+	}
+	dirp = (DIR *)malloc(sizeof(DIR));
+	if (!dirp) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	/* The descriptor becomes the DIR's property: closedir() closes it. */
+	dirp->fd = fd;
+	dirp->buf_pos = 0;
+	dirp->buf_len = 0;
+	return dirp;
+}
+
+int dirfd(DIR *dirp)
+{
+	if (!dirp) {
+		errno = EINVAL;
+		return -1;
+	}
+	return dirp->fd;
+}
+
+int readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result)
+{
+	struct dirent *d;
+
+	if (!dirp || !entry || !result)
+		return EINVAL;
+	errno = 0;
+	d = readdir(dirp);
+	if (!d) {
+		*result = NULL;
+		return errno; /* 0 at end of directory, else the error */
+	}
+	*entry = *d;
+	*result = entry;
+	return 0;
+}
+
+/* telldir() reports where the NEXT readdir() would resume.  The kernel gives
+ * us that directly as the d_off of the entry just returned, which is what
+ * seekdir() feeds back to lseek(). */
+long telldir(DIR *dirp)
+{
+	if (!dirp) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (dirp->buf_pos == 0 && dirp->buf_len == 0)
+		return 0; /* nothing read yet */
+	return (long)dirp->current.d_off;
+}
+
+void seekdir(DIR *dirp, long loc)
+{
+	if (!dirp)
+		return;
+	if (lseek(dirp->fd, (off_t)loc, 0 /* SEEK_SET */) < 0)
+		return;
+	/* Drop the readahead buffer so the next readdir() refills from loc. */
+	dirp->buf_pos = 0;
+	dirp->buf_len = 0;
+}
+
+int alphasort(const struct dirent **a, const struct dirent **b)
+{
+	return strcmp((*a)->d_name, (*b)->d_name);
+}
+
+/* versionsort() orders embedded digit runs numerically, so "mod9" sorts
+ * before "mod10" instead of after it. */
+int versionsort(const struct dirent **a, const struct dirent **b)
+{
+	const char *p = (*a)->d_name;
+	const char *q = (*b)->d_name;
+
+	while (*p && *q) {
+		if (*p >= '0' && *p <= '9' && *q >= '0' && *q <= '9') {
+			unsigned long lp = 0, lq = 0;
+			/* Leading zeros do not change the value, so compare
+			 * the numbers rather than the digit strings. */
+			while (*p == '0')
+				p++;
+			while (*q == '0')
+				q++;
+			while (*p >= '0' && *p <= '9')
+				lp = lp * 10 + (unsigned long)(*p++ - '0');
+			while (*q >= '0' && *q <= '9')
+				lq = lq * 10 + (unsigned long)(*q++ - '0');
+			if (lp != lq)
+				return lp < lq ? -1 : 1;
+			continue;
+		}
+		if (*p != *q)
+			return (int)((unsigned char)*p) -
+			       (int)((unsigned char)*q);
+		p++;
+		q++;
+	}
+	return (int)((unsigned char)*p) - (int)((unsigned char)*q);
+}
+
+int scandir(const char *dirname, struct dirent ***namelist,
+	    int (*filter)(const struct dirent *),
+	    int (*compar)(const struct dirent **, const struct dirent **))
+{
+	DIR *dirp;
+	struct dirent **list = NULL, **grown;
+	size_t used = 0, cap = 0;
+	struct dirent *d;
+	int saved;
+
+	if (!dirname || !namelist) {
+		errno = EINVAL;
+		return -1;
+	}
+	dirp = opendir(dirname);
+	if (!dirp)
+		return -1;
+
+	while ((d = readdir(dirp)) != NULL) {
+		struct dirent *copy;
+
+		if (filter && !filter(d))
+			continue;
+		if (used == cap) {
+			cap = cap ? cap * 2 : 16;
+			grown = (struct dirent **)realloc(
+				list, cap * sizeof(struct dirent *));
+			if (!grown)
+				goto nomem;
+			list = grown;
+		}
+		/* A full-size copy: callers index d_name freely, and the
+		 * entries outlive this DIR. */
+		copy = (struct dirent *)malloc(sizeof(struct dirent));
+		if (!copy)
+			goto nomem;
+		*copy = *d;
+		list[used++] = copy;
+	}
+	closedir(dirp);
+
+	if (compar && used > 1)
+		qsort(list, used, sizeof(struct dirent *),
+		      (int (*)(const void *, const void *))compar);
+
+	*namelist = list;
+	return (int)used;
+
+nomem:
+	saved = errno;
+	for (size_t i = 0; i < used; i++)
+		free(list[i]);
+	free(list);
+	closedir(dirp);
+	errno = saved ? saved : ENOMEM;
+	return -1;
+}

@@ -57,9 +57,17 @@ struct linger {
 #define SHUT_RDWR       2
 
 // Message flags
+#define MSG_OOB         0x01
 #define MSG_PEEK        0x02
+#define MSG_DONTROUTE   0x04
+#define MSG_CTRUNC      0x08   /* control data was truncated */
+#define MSG_TRUNC       0x20   /* datagram was truncated     */
 #define MSG_DONTWAIT    0x40
+#define MSG_EOR         0x80
+#define MSG_WAITALL     0x100
 #define MSG_NOSIGNAL    0x4000
+#define MSG_MORE        0x8000
+#define MSG_CMSG_CLOEXEC 0x40000000
 
 typedef uint32_t socklen_t;
 typedef uint16_t sa_family_t;

@@ -1512,6 +1512,27 @@ int define_key(const char *definition, int keycode)
  * Terminfo stubs
  * =================================================================== */
 
+/* Does the terminal on the other end implement the DEC special graphics
+ * charset (ESC ( 0), the one terminfo describes with smacs/rmacs/acsc?
+ *
+ * The framebuffer console does NOT: it consumes ESC ( N and then draws the
+ * following letters as letters, so a client told the capability exists would
+ * spell out "qqqq" where it meant to draw a line.  xterm does implement it.
+ *
+ * TERM is what tells the two apart -- the console session runs with TERM=linux
+ * (getty sets it) and xterm sets TERM=xterm*.  Reporting the console's answer
+ * to a client running inside xterm is what left tmux drawing its status line
+ * and pane borders out of its fallback set instead of line-drawing glyphs. */
+static int term_has_acs(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *t = getenv("TERM");
+        cached = (t && strncmp(t, "xterm", 5) == 0) ? 1 : 0;
+    }
+    return cached;
+}
+
 /* We provide minimal tigetstr for the capabilities nano queries */
 
 char *tigetstr(const char *capname)
@@ -1600,9 +1621,11 @@ char *tigetstr(const char *capname)
      * which is exactly what we want.) */
 
     /* --- Color (xterm-256color style) --------------------------------
-     * We deliberately use the fully general 38;5;N / 48;5;N form here
-     * for all indices (rather than the xterm-style "%?...%t3N%e38;5;N%;"
-     * conditional) because our tparm only understands %i / %pN%d. */
+     * The fully general 38;5;N / 48;5;N form for every index, rather than
+     * the xterm-style "%?...%t3N%e38;5;N%;" conditional.  Not a limitation
+     * any more (tparm implements the whole terminfo stack machine): both
+     * terminals here accept 38;5;N for the low 16 indices too, so the
+     * unconditional form is simply the simpler thing that works. */
     if (strcmp(capname, "setaf") == 0) return "\033[38;5;%p1%dm";
     if (strcmp(capname, "setab") == 0) return "\033[48;5;%p1%dm";
     if (strcmp(capname, "setf")  == 0) return "\033[3%p1%dm";
@@ -1610,11 +1633,21 @@ char *tigetstr(const char *capname)
     if (strcmp(capname, "op")    == 0) return "\033[39;49m";
 
     /* --- Alt charset / line drawing ----------------------------------
-     * Deliberately omitted: our framebuffer console doesn't implement
-     * the DEC special graphics charset (it just consumes ESC ( N).  If
-     * we exposed smacs/rmacs/acsc, tmux would emit alphabetic codepoints
-     * meant for line-drawing and they'd render as plain letters.  Leaving
-     * these unset makes tmux fall back to its built-in ASCII art set. */
+     * Reported only when the terminal actually implements DEC special
+     * graphics -- see term_has_acs().  On the framebuffer console these stay
+     * unset, so a client falls back to its own ASCII art rather than spelling
+     * out the line-drawing letters; under xterm they are real, and hiding
+     * them made tmux draw borders with the fallback set instead.
+     *
+     * acsc maps each ACS character to itself: ESC ( 0 switches the charset,
+     * so the same byte then renders as the corresponding glyph. */
+    if (term_has_acs()) {
+        if (strcmp(capname, "smacs") == 0) return "\033(0";
+        if (strcmp(capname, "rmacs") == 0) return "\033(B";
+        if (strcmp(capname, "enacs") == 0) return "";
+        if (strcmp(capname, "acsc") == 0)
+            return "``aaffggiijjkkllmmnnooppqqrrssttuuvvwwxxyyzz{{||}}~~";
+    }
 
     /* --- Keypad / misc ----------------------------------------------- */
     if (strcmp(capname, "smkx")  == 0) return "\033[?1h\033=";
@@ -1636,8 +1669,11 @@ char *tigetstr(const char *capname)
         return "\033[48;2;%p1%d;%p2%d;%p3%dm";
 
     /* --- Mouse (tmux probes these) -----------------------------------
-     * Only return the input sequence (kmous); the XM/Ms emit-side caps
-     * use %?/%t/%e/%; or %s which our tparm cannot expand. */
+     * Only the input sequence (kmous).  The emit-side XM/Ms caps are held
+     * back deliberately: tparm can expand their conditionals now, but
+     * advertising them switches tmux into reporting mouse mode, and the
+     * mouse handling of these two terminals has not been checked against
+     * that.  Silently breaking keyboard input is the worse failure. */
     if (strcmp(capname, "kmous") == 0) return "\033[M";
 
     /* --- Bell --------------------------------------------------------- */
@@ -1779,65 +1815,320 @@ int tputs(const char *str, int affcnt, int (*putfunc)(int))
     return OK;
 }
 
-char *tparm(const char *str, ...)
+/* ===================================================================
+ * tparm: the terminfo parameterized-string interpreter
+ *
+ * This has to be the real stack machine from terminfo(5), not a matcher for
+ * the handful of capabilities we hand out ourselves, because callers supply
+ * their OWN capability strings.  tmux is the case in point: it injects its
+ * 256-colour capabilities rather than trusting terminfo's --
+ *
+ *   \E[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m
+ *
+ * -- and passes them straight here.  The previous version understood %i and
+ * %pN%d and copied everything else through verbatim, so tmux painted
+ * "8}%<%t30%e{16}" across its status line instead of setting a colour.
+ *
+ * Parameters are taken as integers.  %s and %l (string parameters) are
+ * recognised so they cannot desynchronise the parse, but produce nothing: no
+ * capability in use here passes a string, and treating an integer parameter as
+ * a pointer would fault.
+ * =================================================================== */
+
+#define TPARM_STACK 32
+
+/* %P[a-z] are the "static" variables of terminfo(5) and persist between calls;
+ * %P[A-Z] are dynamic and last for one expansion. */
+static long tparm_static_vars[26];
+
+typedef struct {
+    long v[TPARM_STACK];
+    int sp;
+} tparm_stack_t;
+
+static void tparm_push(tparm_stack_t *st, long v)
 {
-    /* Minimal tparm: handle %i, %p1%d, %p2%d for cup */
-    static char result[256];
-    if (!str) return NULL;
+    if (st->sp < TPARM_STACK)
+        st->sp++, st->v[st->sp - 1] = v;
+}
 
-    va_list ap;
-    va_start(ap, str);
-    long params[9] = {0};
-    for (int i = 0; i < 9; i++)
-        params[i] = va_arg(ap, long);
-    va_end(ap);
+static long tparm_pop(tparm_stack_t *st)
+{
+    return st->sp > 0 ? st->v[--st->sp] : 0;
+}
 
-    bool incr = false;
-    int ri = 0;
-    const char *s = str;
-    while (*s && ri < 250) {
-        if (*s == '%') {
+/* Advance past the body of a conditional branch.
+ *
+ * From just after a %t whose condition was false, stop_at_else=1 leaves the
+ * cursor after the matching %e so the else body runs.  From just after a %e
+ * whose then-body already ran, stop_at_else=0 skips to after the matching %;.
+ *
+ * The chained form "%? c1 %t b1 %e c2 %t b2 %e b3 %;" has several %e but only
+ * one %;, so the second case must pass over every %e it meets.  Nested %?...%;
+ * are tracked by depth. */
+static const char *tparm_skip(const char *s, int stop_at_else)
+{
+    int depth = 0;
+    while (*s) {
+        if (*s != '%') {
             s++;
-            if (*s == 'i') {
-                incr = true;
-                s++;
-            } else if (*s == 'p') {
-                s++;
-                int pn = *s - '1';
-                s++;
-                if (*s == '%') s++;
-                if (*s == 'd') {
-                    long val = (pn >= 0 && pn < 9) ? params[pn] : 0;
-                    if (incr) val++;
-                    ri += snprintf(result + ri, 256 - ri, "%ld", val);
-                    s++;
-                }
-            } else if (*s == '%') {
-                result[ri++] = '%';
-                s++;
-            } else if (*s == 'd') {
-                ri += snprintf(result + ri, 256 - ri, "%ld", params[0]);
-                s++;
-            } else {
-                result[ri++] = '%';
-            }
+            continue;
+        }
+        s++;
+        if (!*s)
+            break;
+        if (*s == '?') {
+            depth++;
+            s++;
+        } else if (*s == ';') {
+            if (depth == 0)
+                return s + 1;
+            depth--;
+            s++;
+        } else if (*s == 'e' && depth == 0 && stop_at_else) {
+            return s + 1;
+        } else if (*s == '\'') {
+            /* %'c' -- the quoted character may itself be '%' or ';' */
+            s++;
+            if (*s) s++;
+            if (*s == '\'') s++;
         } else {
-            result[ri++] = *s++;
+            s++;
         }
     }
+    return s;
+}
+
+char *tparm(const char *str, ...)
+{
+    static char result[512];
+    long params[9] = {0};
+    long dyn[26] = {0};
+    tparm_stack_t st;
+    size_t ri = 0;
+    const char *s;
+
+    if (!str) return NULL;
+
+    {
+        va_list ap;
+        va_start(ap, str);
+        for (int i = 0; i < 9; i++)
+            params[i] = va_arg(ap, long);
+        va_end(ap);
+    }
+
+    st.sp = 0;
+    s = str;
+
+#define TP_EMIT(c)                                     \
+    do {                                               \
+        if (ri + 1 < sizeof(result))                   \
+            result[ri++] = (char)(c);                  \
+    } while (0)
+
+    while (*s) {
+        if (*s != '%') {
+            TP_EMIT(*s++);
+            continue;
+        }
+        s++;
+        switch (*s) {
+        case '\0':
+            TP_EMIT('%');
+            break;
+        case '%':
+            TP_EMIT('%');
+            s++;
+            break;
+
+        /* --- push operands ------------------------------------------- */
+        case 'p':
+            s++;
+            if (*s >= '1' && *s <= '9') {
+                tparm_push(&st, params[*s - '1']);
+                s++;
+            }
+            break;
+        case '{': {                       /* %{nn} integer constant */
+            long v = 0;
+            int neg = 0;
+            s++;
+            if (*s == '-') { neg = 1; s++; }
+            while (*s >= '0' && *s <= '9')
+                v = v * 10 + (*s++ - '0');
+            if (*s == '}') s++;
+            tparm_push(&st, neg ? -v : v);
+            break;
+        }
+        case '\'': {                      /* %'c' character constant */
+            s++;
+            tparm_push(&st, (long)(unsigned char)*s);
+            if (*s) s++;
+            if (*s == '\'') s++;
+            break;
+        }
+        case 'i':                         /* 1-index the first two params */
+            params[0]++;
+            params[1]++;
+            s++;
+            break;
+
+        /* --- variables ----------------------------------------------- */
+        case 'P': {
+            long v = tparm_pop(&st);
+            s++;
+            if (*s >= 'a' && *s <= 'z')
+                tparm_static_vars[*s - 'a'] = v;
+            else if (*s >= 'A' && *s <= 'Z')
+                dyn[*s - 'A'] = v;
+            if (*s) s++;
+            break;
+        }
+        case 'g':
+            s++;
+            if (*s >= 'a' && *s <= 'z')
+                tparm_push(&st, tparm_static_vars[*s - 'a']);
+            else if (*s >= 'A' && *s <= 'Z')
+                tparm_push(&st, dyn[*s - 'A']);
+            if (*s) s++;
+            break;
+
+        /* --- output conversions --------------------------------------
+         * '-' and '+' are NOT accepted as printf flags here: terminfo
+         * defines them as subtraction and addition, which is why it has
+         * ':' to introduce a flag that would otherwise be an operator. */
+        case 'd': case 'o': case 'x': case 'X': case 'u':
+        case 's': case 'c':
+        case ':': case '#': case ' ': case '.':
+        case '0': case '1': case '2': case '3': case '4':
+        case '5': case '6': case '7': case '8': case '9': {
+            char spec[24];
+            size_t k = 0;
+            char conv;
+
+            if (*s == 'c') {              /* %c: pop and emit as a byte */
+                long v = tparm_pop(&st);
+                /* terminfo sends a NUL as \200, which a terminal treats
+                 * as a no-op instead of ending the string. */
+                TP_EMIT(v ? v : 0200);
+                s++;
+                break;
+            }
+
+            spec[k++] = '%';
+            if (*s == ':') s++;
+            while (*s && k < sizeof(spec) - 3 &&
+                   (*s == '-' || *s == '+' || *s == '#' || *s == ' '))
+                spec[k++] = *s++;
+            while (*s >= '0' && *s <= '9' && k < sizeof(spec) - 3)
+                spec[k++] = *s++;
+            if (*s == '.') {
+                spec[k++] = *s++;
+                while (*s >= '0' && *s <= '9' && k < sizeof(spec) - 3)
+                    spec[k++] = *s++;
+            }
+            conv = *s ? *s++ : 'd';
+            if (conv == 's') {
+                (void)tparm_pop(&st);     /* consume, emit nothing */
+                break;
+            }
+            spec[k++] = 'l';
+            spec[k++] = conv;
+            spec[k] = '\0';
+            if (ri < sizeof(result) - 1) {
+                int n = snprintf(result + ri, sizeof(result) - ri, spec,
+                                 tparm_pop(&st));
+                if (n > 0) {
+                    ri += (size_t)n;
+                    if (ri > sizeof(result) - 1)
+                        ri = sizeof(result) - 1;
+                }
+            }
+            break;
+        }
+        case 'l':                         /* strlen of a string param */
+            (void)tparm_pop(&st);
+            tparm_push(&st, 0);
+            s++;
+            break;
+
+        /* --- binary operators: pop two, push one --------------------- */
+        case '+': case '-': case '*': case '/': case 'm':
+        case '&': case '|': case '^':
+        case '=': case '>': case '<':
+        case 'A': case 'O': {
+            char op = *s++;
+            long b = tparm_pop(&st);
+            long a = tparm_pop(&st);
+            long r = 0;
+            switch (op) {
+            case '+': r = a + b; break;
+            case '-': r = a - b; break;
+            case '*': r = a * b; break;
+            case '/': r = b ? a / b : 0; break;
+            case 'm': r = b ? a % b : 0; break;
+            case '&': r = a & b; break;
+            case '|': r = a | b; break;
+            case '^': r = a ^ b; break;
+            case '=': r = (a == b); break;
+            case '>': r = (a > b);  break;
+            case '<': r = (a < b);  break;
+            case 'A': r = (a && b); break;
+            case 'O': r = (a || b); break;
+            }
+            tparm_push(&st, r);
+            break;
+        }
+        case '!':
+            tparm_push(&st, !tparm_pop(&st));
+            s++;
+            break;
+        case '~':
+            tparm_push(&st, ~tparm_pop(&st));
+            s++;
+            break;
+
+        /* --- conditionals -------------------------------------------- */
+        case '?':                         /* condition expression follows */
+            s++;
+            break;
+        case 't':
+            s++;
+            if (!tparm_pop(&st))
+                s = tparm_skip(s, 1);
+            break;
+        case 'e':                         /* then-body ran; skip the else */
+            s++;
+            s = tparm_skip(s, 0);
+            break;
+        case ';':
+            s++;
+            break;
+
+        default:                          /* unknown: pass it through */
+            TP_EMIT('%');
+            TP_EMIT(*s++);
+            break;
+        }
+    }
+#undef TP_EMIT
+
     result[ri] = '\0';
     return result;
 }
 
 char *tiparm(const char *str, ...)
 {
-    /* Forward to tparm with the same args */
+    /* Same expansion as tparm; forwarded with all nine slots so a capability
+     * using %p3 and beyond is not silently given zeroes. */
+    long p[9];
     va_list ap;
     va_start(ap, str);
-    long p1 = va_arg(ap, long);
-    long p2 = va_arg(ap, long);
+    for (int i = 0; i < 9; i++)
+        p[i] = va_arg(ap, long);
     va_end(ap);
-    return tparm(str, p1, p2);
+    return tparm(str, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]);
 }
 
 /* ===================================================================

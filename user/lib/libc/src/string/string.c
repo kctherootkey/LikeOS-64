@@ -225,6 +225,44 @@ char *strdup(const char *s)
 	return new;
 }
 
+/* Reentrant strtok: the caller owns the cursor, so two interleaved
+ * tokenisations (or two threads) cannot clobber each other.  strtok() below is
+ * this function over a single static cursor. */
+char *strtok_r(char *str, const char *delim, char **saveptr)
+{
+	char *saved, *token;
+
+	if (!saveptr || !delim)
+		return NULL;
+	saved = str ? str : *saveptr;
+	if (!saved)
+		return NULL;
+
+	/* Skip leading delimiters */
+	while (*saved && strchr(delim, *saved))
+		saved++;
+
+	if (!*saved) {
+		*saveptr = NULL;
+		return NULL;
+	}
+
+	token = saved;
+
+	/* Find end of token */
+	while (*saved && !strchr(delim, *saved))
+		saved++;
+
+	if (*saved) {
+		*saved++ = '\0';
+		*saveptr = saved;
+	} else {
+		*saveptr = NULL;
+	}
+
+	return token;
+}
+
 char *strtok(char *str, const char *delim)
 {
 	static char *saved = NULL;
@@ -658,4 +696,128 @@ int strerror_r(int errnum, char *buf, size_t buflen)
 	}
 	memcpy(buf, s, len + 1);
 	return 0;
+}
+
+/* memmem: the memory analogue of strstr().  Returns NULL when the needle is
+ * not present; an empty needle matches at the start, as on other systems. */
+void *memmem(const void *haystack, size_t haystacklen, const void *needle,
+	     size_t needlelen)
+{
+	const unsigned char *h = (const unsigned char *)haystack;
+	const unsigned char *n = (const unsigned char *)needle;
+
+	if (needlelen == 0)
+		return (void *)haystack;
+	if (!haystack || !needle || haystacklen < needlelen)
+		return NULL;
+
+	for (size_t i = 0; i + needlelen <= haystacklen; i++) {
+		if (h[i] == n[0] && memcmp(h + i, n, needlelen) == 0)
+			return (void *)(h + i);
+	}
+	return NULL;
+}
+
+/* strverscmp: like strcmp(), except that runs of digits compare by numeric
+ * value, so "libfoo.so.9" sorts before "libfoo.so.10". */
+int strverscmp(const char *s1, const char *s2)
+{
+	const char *p = s1, *q = s2;
+
+	if (!p || !q)
+		return p == q ? 0 : (p ? 1 : -1);
+
+	while (*p && *q) {
+		if (*p >= '0' && *p <= '9' && *q >= '0' && *q <= '9') {
+			unsigned long lp = 0, lq = 0;
+
+			while (*p == '0')
+				p++;
+			while (*q == '0')
+				q++;
+			while (*p >= '0' && *p <= '9')
+				lp = lp * 10 + (unsigned long)(*p++ - '0');
+			while (*q >= '0' && *q <= '9')
+				lq = lq * 10 + (unsigned long)(*q++ - '0');
+			if (lp != lq)
+				return lp < lq ? -1 : 1;
+			continue;
+		}
+		if (*p != *q)
+			return (int)((unsigned char)*p) -
+			       (int)((unsigned char)*q);
+		p++;
+		q++;
+	}
+	return (int)((unsigned char)*p) - (int)((unsigned char)*q);
+}
+
+/* ffs/ffsl/ffsll: index of the least significant set bit, counting from 1;
+ * 0 when the argument has no bits set. */
+int ffs(int i)
+{
+	unsigned int v = (unsigned int)i;
+	int n = 1;
+
+	if (v == 0)
+		return 0;
+	while ((v & 1u) == 0) {
+		v >>= 1;
+		n++;
+	}
+	return n;
+}
+
+int ffsl(long i)
+{
+	unsigned long v = (unsigned long)i;
+	int n = 1;
+
+	if (v == 0)
+		return 0;
+	while ((v & 1ul) == 0) {
+		v >>= 1;
+		n++;
+	}
+	return n;
+}
+
+int ffsll(long long i)
+{
+	unsigned long long v = (unsigned long long)i;
+	int n = 1;
+
+	if (v == 0)
+		return 0;
+	while ((v & 1ull) == 0) {
+		v >>= 1;
+		n++;
+	}
+	return n;
+}
+
+/* strcoll()/strxfrm(): locale-aware string comparison.
+ *
+ * This system runs in the "C" locale, where collation order IS byte order, so
+ * strcoll is strcmp and strxfrm is a bounded copy — which is exactly what the
+ * standard requires of a C-locale implementation, not a shortcut.  If real
+ * locales ever arrive, these are where the collation table plugs in.
+ */
+int strcoll(const char *s1, const char *s2)
+{
+	return strcmp(s1, s2);
+}
+
+size_t strxfrm(char *dest, const char *src, size_t n)
+{
+	size_t len = strlen(src);
+
+	/* Returns the length the transform WOULD need, and only writes when it
+	 * fits — callers size their buffer from the return value. */
+	if (dest && n > 0) {
+		size_t copy = len < n - 1 ? len : n - 1;
+		memcpy(dest, src, copy);
+		dest[copy] = '\0';
+	}
+	return len;
 }

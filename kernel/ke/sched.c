@@ -257,13 +257,8 @@ static void task_close_open_files(task_t *task)
 							  task->fd_table[i];
 					unix_close(ufd);
 				} else if (IS_EPOLL_FD(task->fd_table[i])) {
-					int idx =
-						EPOLL_FD_IDX(task->fd_table[i]);
-					extern epoll_instance_t
-						epoll_instances[];
-					if (idx >= 0 &&
-					    idx < MAX_EPOLL_INSTANCES)
-						epoll_instances[idx].active = 0;
+					epoll_put(EPOLL_FD_IDX(
+						task->fd_table[i]));
 				} else if (pipe_is_end(task->fd_table[i])) {
 					pipe_close_end((pipe_end_t *)task
 							       ->fd_table[i]);
@@ -293,14 +288,10 @@ static void task_close_open_files(task_t *task)
 					task->fd_table[i] = NULL;
 					unix_close(ufd);
 				} else if (IS_EPOLL_FD(task->fd_table[i])) {
-					int idx =
-						EPOLL_FD_IDX(task->fd_table[i]);
+					int idx = EPOLL_FD_IDX(
+						task->fd_table[i]);
 					task->fd_table[i] = NULL;
-					extern epoll_instance_t
-						epoll_instances[];
-					if (idx >= 0 &&
-					    idx < MAX_EPOLL_INSTANCES)
-						epoll_instances[idx].active = 0;
+					epoll_put(idx);
 				} else if (pipe_is_end(task->fd_table[i])) {
 					pipe_close_end((pipe_end_t *)task
 							       ->fd_table[i]);
@@ -1756,25 +1747,23 @@ task_t *sched_fork_current(void)
 	if (!child)
 		return NULL;
 
-	// Build shared region list for COW
-	uint64_t shared_regions[TASK_MAX_MMAP * 2];
-	int num_shared = 0;
+	/* MAP_SHARED regions must be shared outright rather than COW'd.  The
+	 * region table is handed to the cloner as-is: copying the ranges into
+	 * a local array here would put TASK_MAX_MMAP * 2 uint64s on a 16 KB
+	 * kernel stack, which does not survive a large TASK_MAX_MMAP. */
+	bool has_shared = false;
 	for (int i = 0; i < TASK_MAX_MMAP; i++) {
 		if (cur->mmap_regions[i].in_use &&
 		    (cur->mmap_regions[i].flags & MAP_SHARED)) {
-			shared_regions[num_shared * 2] =
-				cur->mmap_regions[i].start;
-			shared_regions[num_shared * 2 + 1] =
-				cur->mmap_regions[i].start +
-				cur->mmap_regions[i].length;
-			num_shared++;
+			has_shared = true;
+			break;
 		}
 	}
 
 	uint64_t *child_pml4;
-	if (num_shared > 0) {
+	if (has_shared) {
 		child_pml4 = mm_clone_address_space_with_shared(
-			cur->pml4, shared_regions, num_shared);
+			cur->pml4, cur->mmap_regions, TASK_MAX_MMAP);
 	} else {
 		child_pml4 = mm_clone_address_space(cur->pml4);
 	}
@@ -1909,6 +1898,11 @@ task_t *sched_fork_current(void)
 							   __ATOMIC_ACQ_REL);
 				child->fd_table[i] = task_fds(cur)[i];
 			} else if (IS_EPOLL_FD(task_fds(cur)[i])) {
+				/* The child gets its own descriptor onto the
+				 * same (kernel-global) instance, so the
+				 * instance gains a reference.  Without this the
+				 * child's close destroyed it for the parent. */
+				epoll_get(EPOLL_FD_IDX(task_fds(cur)[i]));
 				child->fd_table[i] = task_fds(cur)[i];
 			} else if (pipe_is_end(task_fds(cur)[i])) {
 				pipe_end_t *new_end = pipe_dup_end(
@@ -2139,8 +2133,18 @@ void sched_mark_task_exited(task_t *task, int status)
 	 * this is what cleans up a dead login/pane session's leftover
 	 * processes instead of leaving them pinned to the tty. */
 	if (task->privilege == TASK_USER && task->ctty &&
-	    task->sid == task->id && task->ctty->fg_pgid > 0) {
-		sched_signal_pgrp(task->ctty->fg_pgid, SIGHUP);
+	    task->sid == task->id) {
+		if (task->ctty->fg_pgid > 0)
+			sched_signal_pgrp(task->ctty->fg_pgid, SIGHUP);
+		/* Release the terminal along with the session that owned it.
+		 * A terminal belongs to one session at a time, so leaving the
+		 * dead session's id on it would stop the NEXT session from
+		 * acquiring it -- after a logout, the getty that replaces the
+		 * shell could never take the console back. */
+		if (task->ctty->sid == task->sid) {
+			task->ctty->sid = 0;
+			task->ctty->fg_pgid = 0;
+		}
 	}
 
 	// ========================================================================
@@ -3532,6 +3536,7 @@ files_struct_t *files_struct_clone(files_struct_t *src)
 							   __ATOMIC_ACQ_REL);
 				files->fd_table[i] = src->fd_table[i];
 			} else if (IS_EPOLL_FD(src->fd_table[i])) {
+				epoll_get(EPOLL_FD_IDX(src->fd_table[i]));
 				files->fd_table[i] = src->fd_table[i];
 			} else if (pipe_is_end(src->fd_table[i])) {
 				// Pipe end - duplicate it
@@ -3586,11 +3591,7 @@ void files_struct_put(files_struct_t *files)
 					int idx = EPOLL_FD_IDX(
 						files->fd_table[i]);
 					files->fd_table[i] = NULL;
-					extern epoll_instance_t
-						epoll_instances[];
-					if (idx >= 0 &&
-					    idx < MAX_EPOLL_INSTANCES)
-						epoll_instances[idx].active = 0;
+					epoll_put(idx);
 				} else if (pipe_is_end(files->fd_table[i])) {
 					pipe_close_end((pipe_end_t *)files
 							       ->fd_table[i]);

@@ -89,10 +89,14 @@
 #define SYS_TIMER_GETOVERRUN 266
 #define SYS_TIMER_DELETE    267
 #define SYS_SIGNALFD        268
+#define SYS_SIGNALFD4       269
 #define SYS_PAUSE           270
 #define SYS_NANOSLEEP       271
 #define SYS_CLOCK_GETTIME   272
 #define SYS_CLOCK_GETRES    273
+
+// Debug/diagnostic syscalls (LikeOS specific)
+#define SYS_MEMSTATS        300
 
 // SMP/Threading syscalls (using 310+ to avoid conflicts)
 #define SYS_CLONE           310
@@ -104,6 +108,7 @@
 #define SYS_SET_ROBUST_LIST 316
 #define SYS_GET_ROBUST_LIST 317
 #define SYS_ARCH_PRCTL      318
+#define SYS_FUTEX_REQUEUE   319
 
 // Scheduling syscalls (using 320+ to avoid conflicts)
 #define SYS_SCHED_SETAFFINITY       320
@@ -195,6 +200,12 @@
 #define SYS_FREMOVEXATTR 398  /* (fd, name) */
 #define SYS_DEBUG_DUMP  399   /* () root-only: dump kernel diag tables to tty */
 #define SYS_CHROOT      400   /* (path) root-only: confine path resolution to a subtree */
+
+// System V shared memory
+#define SYS_SHMGET      401
+#define SYS_SHMAT       402
+#define SYS_SHMDT       403
+#define SYS_SHMCTL      404
 #define XATTR_SYS_NOFOLLOW 0x40000000  /* OR'd into setxattr flags for lsetxattr */
 
 // NET_GETINFO sub-commands

@@ -1,0 +1,96 @@
+Build the real fbdevhw, not the stub, and let it open the framebuffer.
+
+Three changes, all needed before a framebuffer can be driven here.
+
+1. configure decides between hw/xfree86/fbdevhw/fbdevhw.c and fbdevhwstub.c on
+   whether <linux/fb.h> exists.  The interface is the same here, the header is
+   called <sys/fb.h>, so the test accepts either.
+
+   That test is worth more than it looks: the stub exports no
+   fbdevhwModuleData, so the server loads the module, finds no module data, and
+   gives up with
+
+       (EE) Module fbdevhw does not have a fbdevhwModuleData data object
+       (EE) No devices detected
+
+   Nothing in that names a missing header.
+
+2. fbdevhw.c takes the system header in place of the tree's own fbpriv.h copy.
+   The structures are an ioctl ABI, and keeping two independent descriptions of
+   one ABI is how they come to disagree.
+
+3. fbdev_open() asks sysfs whether the framebuffer belongs to a PCI device, so
+   a PCI-aware driver can claim it instead.  Neither half applies here: there
+   is no sysfs to ask, and no PCI bus reachable from userspace.  It cannot be
+   left to fail either -- a readlink() returning -1 satisfies the condition, so
+   the device is closed and rejected, and the server again reports "No devices
+   detected" without mentioning either sysfs or the framebuffer it had just
+   opened successfully.
+
+--- a/configure.ac
++++ b/configure.ac
+@@ -209,7 +209,18 @@
+ AM_CONDITIONAL(AGP, [test "x$AGP" = xyes])
+ 
+ dnl fbdev header
+-AC_CHECK_HEADERS([linux/fb.h], FBDEV=yes)
++dnl
++dnl Two spellings, because the header's name is not the same everywhere while
++dnl the interface behind it is.  hw/xfree86/fbdevhw/Makefile.am builds the real
++dnl fbdevhw.c only when this is set and fbdevhwstub.c otherwise -- and the stub
++dnl exports no fbdevhwModuleData at all, so the server loads it, finds no module
++dnl data, and reports
++dnl
++dnl     (EE) Module fbdevhw does not have a fbdevhwModuleData data object
++dnl     (EE) No devices detected
++dnl
++dnl which says nothing about a missing header.
++AC_CHECK_HEADERS([linux/fb.h sys/fb.h], FBDEV=yes)
+ AM_CONDITIONAL(FBDEVHW, [test "x$FBDEV" = xyes])
+ 
+ dnl FreeBSD kldload support (sys/linker.h)
+--- a/hw/xfree86/fbdevhw/fbdevhw.c
++++ b/hw/xfree86/fbdevhw/fbdevhw.c
+@@ -15,7 +15,15 @@
+ #include "xf86cmap.h"
+ 
+ #include "fbdevhw.h"
++/* fbpriv.h is this tree's own copy of the framebuffer definitions, kept for
++ * platforms whose headers do not provide them.  Where the system has an
++ * authoritative header it must be preferred: the structures are an ioctl ABI,
++ * and having two independent descriptions of it is how they drift apart. */
++#ifdef __LIKEOS__
++#include <sys/fb.h>
++#else
+ #include "fbpriv.h"
++#endif
+ #include "globals.h"
+ #include <X11/extensions/dpmsconst.h>
+ 
+@@ -330,6 +338,7 @@
+     }
+ 
+     /* only touch non-PCI devices on this path */
++#ifndef __LIKEOS__
+     {
+         char buf[PATH_MAX] = {0};
+         char *sysfs_path = NULL;
+@@ -344,6 +353,18 @@
+         }
+         free(sysfs_path);
+     }
++#else
++    /* The check above asks sysfs whether this framebuffer belongs to a PCI
++     * device, so that a PCI-aware driver can claim it instead.  Neither half
++     * of that applies here: there is no sysfs to ask, and no PCI bus reachable
++     * from userspace for the answer to be about.
++     *
++     * It cannot be left to fail, either.  A readlink() returning -1 satisfies
++     * the condition, so the framebuffer that was just opened successfully is
++     * CLOSED and rejected -- and the server reports "No devices detected",
++     * naming neither sysfs nor the device.
++     */
++#endif
+ 
+     if (namep) {
+         if (-1 == ioctl(fd, FBIOGET_FSCREENINFO, (void *) (&fix))) {

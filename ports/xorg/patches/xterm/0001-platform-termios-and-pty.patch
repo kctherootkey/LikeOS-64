@@ -1,0 +1,38 @@
+Add an arm for this platform to the per-system list.
+
+xterm_io.h is a chain of one-chunk-per-system blocks, and a system with no
+chunk falls off the end into
+
+    #error Neither termio or termios is enabled
+
+which reads as a missing header rather than a missing entry in a list.
+
+This platform has POSIX termios and Unix 98 pseudo-terminals.  Naming all three
+PTY macros selects the posix_openpt()/ptsname() branch of get_pty() in main.c,
+which is the only one that applies here: there is no openpty(), and no
+/dev/ptyXX pairs to search.
+
+--- a/xterm_io.h
++++ b/xterm_io.h
+@@ -77,6 +77,21 @@
+ #define HAVE_GRANTPT_PTY_ISATTY 1
+ #endif
+ 
++#ifdef __LIKEOS__
++/* POSIX termios, and Unix 98 pseudo-terminals.  Naming all three PTY macros
++ * selects the posix_openpt()/ptsname() branch of get_pty() in main.c, which is
++ * the only one that applies: there is no openpty(), no /dev/ptyXX pairs to
++ * search, and /dev/ptmx is opened through posix_openpt() anyway.
++ *
++ * Without an arm here the chain falls through to "#error Neither termio or
++ * termios is enabled" -- which reads as a missing header rather than a
++ * missing entry in this list. */
++#define USE_POSIX_TERMIOS 1
++#define HAVE_POSIX_OPENPT 1
++#define HAVE_PTSNAME 1
++#define HAVE_GRANTPT_PTY_ISATTY 1
++#endif
++
+ #ifdef __SCO__
+ #define USE_TERMIOS
+ #ifndef _SVID3

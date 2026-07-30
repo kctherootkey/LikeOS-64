@@ -1,0 +1,59 @@
+TTY(1)                           User Commands                          TTY(1)
+
+NAME
+       tty - print the file name of the terminal connected to standard input
+
+SYNOPSIS
+       tty [OPTION]...
+
+DESCRIPTION
+       Print the file name of the terminal connected to standard input.
+
+       If standard input is not a terminal, print "not a tty" and exit with a
+       status of 1.  The message goes to standard output, not standard error:
+       it is the answer to the question asked, not a failure of the command.
+
+OPTIONS
+       -s, --silent, --quiet
+              print nothing, only return an exit status
+
+       --help display this help and exit
+
+       --version
+              output version information and exit
+
+EXIT STATUS
+       0      standard input is a terminal
+
+       1      standard input is not a terminal
+
+       2      an invalid option was given
+
+       3      a write error occurred
+
+       The status is distinct from the output on purpose.  A script that only
+       wants to know whether it is interactive uses -s and tests the status;
+       one that needs the device name captures the output.
+
+EXAMPLES
+       Decide whether the script is interactive:
+
+              if tty -s; then
+                      echo "running on a terminal"
+              fi
+
+       Find out which terminal, and act on it -- this is what startx(1) does
+       to work out whether it was started from a virtual console:
+
+              t=$(tty)
+              if expr "$t" : '/dev/tty[0-9][0-9]*$' > /dev/null; then
+                      echo "on virtual console ${t#/dev/tty}"
+              fi
+
+NOTES
+       The name reported is the one the kernel records for the descriptor, so
+       it reflects where standard input actually points -- after a redirection
+       it names the redirected terminal, not the one the shell started on.
+
+SEE ALSO
+       expr(1), stty(1), who(1)

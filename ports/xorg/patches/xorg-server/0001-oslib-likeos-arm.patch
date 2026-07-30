@@ -1,0 +1,39 @@
+Give xf86_OSlib.h an arm for this platform.
+
+The header is a chain of per-OS arms, and with none of them matching, none of
+<errno.h>, <sys/stat.h>, <sys/mman.h> or <termios.h> is included and POSIX_TTY
+is left undefined -- so hw/xfree86/common fails to compile on errno and on an
+incomplete struct stat.
+
+The arm this platform belongs in is the POSIX one.  What it must NOT pick up is
+the inner __linux__ block: HAS_USL_VTS, <sys/kd.h> and <sys/vt.h> are the USL
+virtual-terminal interface, which this system does not have and is not going to
+grow.  That is consistent with configure, which selects the "stub" os-support
+backend here -- xf86OpenConsole()/xf86CloseConsole() are already no-ops.
+
+--- a/hw/xfree86/os-support/xf86_OSlib.h
++++ b/hw/xfree86/os-support/xf86_OSlib.h
+@@ -174,9 +174,12 @@
+ #endif                          /* (SYSV || SVR4) */
+ 
+ /**************************************************************************/
+-/* Linux or Glibc-based system                                            */
++/* POSIX system: conventional Unix, Cygwin, or LikeOS                     */
+ /**************************************************************************/
+-#if defined(__linux__) || defined(__GLIBC__) || defined(__CYGWIN__)
++/* __LIKEOS__ takes this arm for the POSIX headers below, but deliberately
++ * not the __linux__ block inside it: there is no USL VT interface here, and
++ * the "stub" os-support backend that configure selects expects none. */
++#if defined(__linux__) || defined(__GLIBC__) || defined(__CYGWIN__) || defined(__LIKEOS__)
+ #include <sys/ioctl.h>
+ #include <signal.h>
+ #include <stdlib.h>
+@@ -205,7 +208,7 @@
+ 
+ #define POSIX_TTY
+ 
+-#endif                          /* __linux__ || __GLIBC__ */
++#endif                          /* __linux__ || __GLIBC__ || __LIKEOS__ */
+ 
+ /**************************************************************************/
+ /* System is BSD-like                                                     */

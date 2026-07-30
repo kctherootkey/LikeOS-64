@@ -1,0 +1,140 @@
+#!/bin/sh
+# Cross compiler driver for the X.Org port.
+#
+# autoconf and meson both use $CC as the LINK driver as well as the compiler,
+# so this has to behave as both: it detects whether the command line is a
+# compile or a link and supplies the right pieces for each.  Derived from the
+# openssh port's likeos-cc, extended with the shared sysroot every X package
+# installs its headers, libraries and .pc files into.
+#
+# The include order is load-bearing: LikeOS libc first, then the sysroot, and
+# GCC's own headers LAST.  GCC's directory contains a float.h/stddef.h we do
+# want, but also a stdlib.h etc. we very much do not.
+
+set -e
+
+self=$0
+case "$self" in
+/*) ;;
+*) self=$(pwd)/$self ;;
+esac
+TOOLCHAIN=$(cd "$(dirname "$self")" && pwd)
+ROOT=$(cd "$TOOLCHAIN/../../.." && pwd)
+
+LIBC="$ROOT/user/lib/libc"
+RTLD="$ROOT/user/lib/rtld"
+LDS="$ROOT/user/bin/user_dyn.lds"
+CRT1="$LIBC/crt1.o"
+SYSROOT="${LIKEOS_SYSROOT:-$ROOT/build/xorg-sysroot}"
+ZLIB="$ROOT/ports/lib/zlib-1.3.1"
+# The X server wants a SHA-1 implementation; OpenSSL is already ported, so use
+# that rather than adding another crypto library to the tree.
+OPENSSL="$ROOT/ports/openssl-3.5.6"
+
+GCC_INC="$(gcc -print-file-name=include)"
+
+INCLUDES="-nostdinc \
+  -isystem $LIBC/include \
+  -isystem $SYSROOT/usr/include \
+  -isystem $ZLIB \
+  -isystem $OPENSSL/include \
+  -isystem $GCC_INC"
+
+# The -U flags matter more than they look.  We build with the HOST's gcc, which
+# defines __linux__/linux/__gnu_linux__ automatically — so every package has
+# been compiling as though it were targeting Linux, silently taking Linux code
+# paths for things this system does not have.  The X server is where that
+# surfaces first (it reaches for <sys/kd.h> and the VT ioctls behind
+# `#ifdef __linux__`), but it would have produced quieter wrongness elsewhere.
+# The kernel build already does exactly this for the same reason.
+#
+# __unix__ is deliberately LEFT defined: that one is true.
+#
+# -DXOS_USE_MTSAFE_PWDAPI: X11's Xos_r.h chooses between three spellings of
+# getpwnam depending on what it believes the platform offers.  LikeOS is not a
+# system it has heard of, so it falls back to the "threads but no _r API"
+# branch and calls a four-argument variant that does not exist here.  We do
+# provide the POSIX getpwnam_r/getpwuid_r, so state that rather than patching
+# the header.
+#
+# -fno-strict-aliasing: several X packages punt types through pointers.
+# -fno-stack-protector: the canary lives at %fs:0x28, which is valid only once
+# libc's thread control block is in place; library code that runs earlier must
+# not depend on it.
+COMPILE_FLAGS="-O2 -fPIC -fno-builtin -ffreestanding -mno-red-zone \
+  -fno-stack-protector -fno-strict-aliasing -fno-tree-vectorize \
+  -D__LIKEOS__ -D_GNU_SOURCE \
+  -DXOS_USE_MTSAFE_PWDAPI \
+  -U__linux__ -U__linux -Ulinux -U__gnu_linux__ -U_LINUX"
+
+# A link step is anything that is not -c / -E / -S.
+is_link=1
+for a in "$@"; do
+	case "$a" in
+	-c | -E | -S) is_link=0 ;;
+	esac
+done
+
+if [ "$is_link" = "0" ]; then
+	exec gcc $INCLUDES $COMPILE_FLAGS "$@"
+fi
+
+# Shared library or executable?  Both need the sysroot on the library path.
+is_shared=0
+for a in "$@"; do
+	case "$a" in
+	-shared) is_shared=1 ;;
+	esac
+done
+
+LIBDIRS="-L$LIBC -L$RTLD -L$SYSROOT/usr/lib -L$ROOT/build -L$OPENSSL"
+
+# Stop -lfoo from ever reaching a build-host library.
+#
+# -nostdlib drops the default startup files and libraries, but NOT the
+# directories the linker searches: ld carries a built-in list (/usr/lib,
+# /lib/x86_64-linux-gnu, ...) and will happily satisfy -lncurses from it.  What
+# comes back is a library built against the host libc, and the link then either
+# fails with an error about errno and .tbss that says nothing about the real
+# cause, or -- worse -- succeeds, because not every host library drags the host
+# libc in visibly.
+#
+# Those built-in entries are all "=" prefixed (see `ld --verbose`), which means
+# they are relative to the linker sysroot.  Pointing that at our own sysroot
+# redirects every one of them inside it, so an unsatisfiable -lfoo now fails
+# with a plain "cannot find -lfoo" instead of quietly finding the wrong file.
+# The explicit -L paths above are absolute and unaffected.
+NO_HOST_LIBS="-Wl,--sysroot=$SYSROOT"
+
+# Where ld should look when resolving the DT_NEEDED of the libraries named on
+# the command line.  That search does NOT use -L: without this, ld falls back
+# to its built-in directories, finds the HOST's /usr/lib/.../libc.so linker
+# script while trying to satisfy our libraries' need for "libc.so", and pulls
+# the host C library into the link.  The failure names errno and TLS sections
+# and says nothing about the real cause.
+RPATH_LINK="-Wl,-rpath-link,$LIBC:$RTLD:$SYSROOT/usr/lib:$ROOT/build:$OPENSSL"
+
+if [ "$is_shared" = "1" ]; then
+	# -Bsymbolic-functions: bind a library's own calls internally, which
+	# keeps the loader's work down and matches how the other ports link.
+	# -l:ld-likeos.so as well as -lc: a shared library that uses __thread
+	# in the general-dynamic model emits calls to __tls_get_addr, which the
+	# dynamic linker provides (libc.so carries no DT_NEEDED on it, so it
+	# cannot resolve transitively).  pixman is the first library here to do
+	# that; without this the link fails with an undefined reference that
+	# says nothing about TLS.
+	exec gcc $INCLUDES $COMPILE_FLAGS -nostdlib -shared \
+		-Wl,--hash-style=gnu -Wl,-Bsymbolic-functions \
+		$LIBDIRS $NO_HOST_LIBS $RPATH_LINK "$@" -lc -l:ld-likeos.so -lgcc
+fi
+
+# Executable.  crt1.o goes BEFORE "$@" because configure appends its test
+# objects after the flags.  --export-dynamic matters for the X server: its
+# modules are dlopen'd and resolve back into the binary's own symbols.
+exec gcc $INCLUDES $COMPILE_FLAGS \
+	-nostdlib -pie \
+	-Wl,-T,"$LDS" -Wl,--hash-style=gnu -Wl,-z,now \
+	-Wl,--export-dynamic \
+	-Wl,-rpath,/lib -Wl,-dynamic-linker,/lib/ld-likeos.so \
+	$LIBDIRS $NO_HOST_LIBS $RPATH_LINK \
+	"$CRT1" "$@" -lc -l:ld-likeos.so -lgcc

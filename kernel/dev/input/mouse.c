@@ -1,6 +1,7 @@
 // LikeOS-64 I/O Subsystem - Mouse Driver
 // PS/2 mouse input handling and cursor management
 
+#include <kernel/dev/video/fbdev.h>
 #include <kernel/dev/input/mouse.h>
 #include <kernel/ke/interrupt.h>
 #include <kernel/dev/video/fb.h>
@@ -214,6 +215,17 @@ static int mouse_hw_cursor_update(void)
 {
 	if (!vmsvga2_active() || !vmsvga2_has_hw_cursor())
 		return 0;
+	/* While another program owns the framebuffer it draws its own pointer.
+	 * The hardware cursor is composited by the DEVICE, so it would appear
+	 * on top of that program's output no matter what the console does --
+	 * hide it, and report the update as handled so the software path does
+	 * not draw one either. */
+	if (fbdev_display_owned()) {
+		vmsvga2_cursor_move(mouse_state.x, mouse_state.y, 0);
+		mouse_state.last_x = mouse_state.x;
+		mouse_state.last_y = mouse_state.y;
+		return 1;
+	}
 	// Alpha-cursor hosts (VMware/VirtualBox) composite the cursor
 	// themselves.  Mono-only hosts (QEMU) set the HOST pointer shape to
 	// the guest cursor — but with a relative pointing device the host
@@ -231,6 +243,45 @@ static int mouse_hw_cursor_update(void)
 	mouse_state.last_x = mouse_state.x;
 	mouse_state.last_y = mouse_state.y;
 	return 1;
+}
+
+/*
+ * The display has been handed back to the console: make the pointer work again.
+ *
+ * Two different things can be stale, and the first one is easy to miss.
+ *
+ * On a host with an alpha hardware cursor the console pointer is NOT drawn into
+ * the framebuffer at all -- the device composites it, from a shape uploaded
+ * once and then only repositioned.  That shape lives in device memory which a
+ * mode set clears, so after another program has driven the display it is gone,
+ * while g_hw_cursor_defined still claims otherwise.  cursor_move() then
+ * addresses a shape that no longer exists: the pointer stops moving, and
+ * nothing about that suggests the cursor image is the problem.  Clearing the
+ * flag makes the next update upload it again.
+ *
+ * On the software path the saved background is from before the session and
+ * matches nothing on screen, so it is discarded -- otherwise the first movement
+ * stamps a rectangle of pre-session pixels onto the restored console.
+ *
+ * Then the ordinary update runs and takes whichever path applies.
+ */
+void mouse_console_display_released(void)
+{
+	uint64_t fb_flags;
+
+	g_hw_cursor_defined = 0;
+
+	if (cursor_background) {
+		fb_acquire(&fb_flags);
+		for (int i = 0; i < mouse_state.cursor_w * mouse_state.cursor_h;
+		     i++)
+			cursor_background[i] = BG_SENTINEL;
+		fb_release(fb_flags);
+	}
+
+	mouse_state.last_x = mouse_state.x;
+	mouse_state.last_y = mouse_state.y;
+	mouse_update_cursor_internal();
 }
 
 // Wait for PS/2 controller input buffer to be ready
@@ -956,6 +1007,21 @@ static void mouse_update_cursor_internal(void)
 	if (!mouse_state.cursor_visible) {
 		return;
 	}
+
+	/* Do not touch the screen while another program owns the framebuffer.
+	 *
+	 * The console's pointer and a display server's own pointer would both
+	 * be drawn, and worse: this code SAVES the pixels it covers and puts
+	 * them back when the cursor moves, so it would be capturing the other
+	 * program's output and stamping stale copies of it around the screen.
+	 *
+	 * The position still tracks (above), so the pointer is where the user
+	 * left it when the display comes back -- only the drawing stops.  This
+	 * does not depend on the display server grabbing the device: it is true
+	 * whether it grabs or not, which is why it is checked here rather than
+	 * relying on evdev's grab suppression. */
+	if (fbdev_display_owned())
+		return;
 
 	// Acquire framebuffer lock for the entire cursor update operation
 	// This prevents artifacts when console output races with cursor drawing on SMP

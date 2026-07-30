@@ -1600,285 +1600,13 @@ static int _hex_val(int c)
 	return -1;
 }
 
-int vsscanf(const char *str, const char *format, va_list ap)
-{
-	int matched = 0;
-	const char *s = str;
+/* vsscanf() and sscanf() now live in vfscanf.c, sharing the one scanf
+ * engine with the stream forms.  The separate implementation that used
+ * to be here had no float conversions, so sscanf("1.5", "%g", &f)
+ * returned 0 while fscanf on the same input worked -- a divergence that
+ * is invisible until something depends on the missing half. */
 
-	while (*format) {
-		if (_is_space((unsigned char)*format)) {
-			format++;
-			while (_is_space((unsigned char)*s))
-				s++;
-			continue;
-		}
 
-		if (*format != '%') {
-			if (*s != *format)
-				break;
-			s++;
-			format++;
-			continue;
-		}
-
-		format++; /* skip '%' */
-		if (*format == '%') {
-			if (*s == '%') {
-				s++;
-				format++;
-				continue;
-			} else
-				break;
-		}
-
-		int suppress = 0;
-		if (*format == '*') {
-			suppress = 1;
-			format++;
-		}
-
-		/* width */
-		int width = 0;
-		while (*format >= '0' && *format <= '9')
-			width = width * 10 + (*format++ - '0');
-		if (width == 0)
-			width = -1; /* unlimited */
-
-		/* length modifier */
-		int len_mod = 0; /* 0=int, 'h'=short, 'l'=long */
-		if (*format == 'h') {
-			len_mod = 'h';
-			format++;
-		} else if (*format == 'l') {
-			len_mod = 'l';
-			format++;
-		}
-
-		char spec = *format++;
-		if (!spec)
-			break;
-
-		switch (spec) {
-		case 'd':
-		case 'i': {
-			while (_is_space((unsigned char)*s))
-				s++;
-			int neg = 0;
-			if (*s == '-') {
-				neg = 1;
-				s++;
-			} else if (*s == '+')
-				s++;
-			if (!(*s >= '0' && *s <= '9'))
-				goto done;
-			long val = 0;
-			int cnt = 0;
-			while (*s >= '0' && *s <= '9' &&
-			       (width < 0 || cnt < width)) {
-				val = val * 10 + (*s - '0');
-				s++;
-				cnt++;
-			}
-			if (neg)
-				val = -val;
-			if (!suppress) {
-				if (len_mod == 'h')
-					*va_arg(ap, short *) = (short)val;
-				else if (len_mod == 'l')
-					*va_arg(ap, long *) = val;
-				else
-					*va_arg(ap, int *) = (int)val;
-				matched++;
-			}
-			break;
-		}
-		case 'u': {
-			while (_is_space((unsigned char)*s))
-				s++;
-			if (!(*s >= '0' && *s <= '9'))
-				goto done;
-			unsigned long val = 0;
-			int cnt = 0;
-			while (*s >= '0' && *s <= '9' &&
-			       (width < 0 || cnt < width)) {
-				val = val * 10 + (*s - '0');
-				s++;
-				cnt++;
-			}
-			if (!suppress) {
-				if (len_mod == 'h')
-					*va_arg(ap, unsigned short *) =
-						(unsigned short)val;
-				else if (len_mod == 'l')
-					*va_arg(ap, unsigned long *) = val;
-				else
-					*va_arg(ap, unsigned int *) =
-						(unsigned int)val;
-				matched++;
-			}
-			break;
-		}
-		case 'x':
-		case 'X': {
-			while (_is_space((unsigned char)*s))
-				s++;
-			if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
-				s += 2;
-			if (_hex_val((unsigned char)*s) < 0)
-				goto done;
-			unsigned long val = 0;
-			int cnt = 0;
-			int h;
-			while ((h = _hex_val((unsigned char)*s)) >= 0 &&
-			       (width < 0 || cnt < width)) {
-				val = val * 16 + h;
-				s++;
-				cnt++;
-			}
-			if (!suppress) {
-				if (len_mod == 'h')
-					*va_arg(ap, unsigned short *) =
-						(unsigned short)val;
-				else if (len_mod == 'l')
-					*va_arg(ap, unsigned long *) = val;
-				else
-					*va_arg(ap, unsigned int *) =
-						(unsigned int)val;
-				matched++;
-			}
-			break;
-		}
-		case 'o': {
-			while (_is_space((unsigned char)*s))
-				s++;
-			if (!(*s >= '0' && *s <= '7'))
-				goto done;
-			unsigned long val = 0;
-			int cnt = 0;
-			while (*s >= '0' && *s <= '7' &&
-			       (width < 0 || cnt < width)) {
-				val = val * 8 + (*s - '0');
-				s++;
-				cnt++;
-			}
-			if (!suppress) {
-				if (len_mod == 'h')
-					*va_arg(ap, unsigned short *) =
-						(unsigned short)val;
-				else if (len_mod == 'l')
-					*va_arg(ap, unsigned long *) = val;
-				else
-					*va_arg(ap, unsigned int *) =
-						(unsigned int)val;
-				matched++;
-			}
-			break;
-		}
-		case 's': {
-			while (_is_space((unsigned char)*s))
-				s++;
-			if (!*s)
-				goto done;
-			char *dest = suppress ? NULL : va_arg(ap, char *);
-			int cnt = 0;
-			while (*s && !_is_space((unsigned char)*s) &&
-			       (width < 0 || cnt < width)) {
-				if (dest)
-					dest[cnt] = *s;
-				s++;
-				cnt++;
-			}
-			if (dest)
-				dest[cnt] = '\0';
-			if (!suppress)
-				matched++;
-			break;
-		}
-		case 'c': {
-			if (!*s)
-				goto done;
-			if (width < 0)
-				width = 1;
-			char *dest = suppress ? NULL : va_arg(ap, char *);
-			for (int i = 0; i < width && *s; i++) {
-				if (dest)
-					dest[i] = *s;
-				s++;
-			}
-			if (!suppress)
-				matched++;
-			break;
-		}
-		case '[': {
-			/* `spec` already consumed '['; `format` points past it. */
-			int negate = 0;
-			if (*format == '^') {
-				negate = 1;
-				format++;
-			}
-			unsigned char set[256] = { 0 };
-			if (*format == ']') {
-				set[(unsigned char)']'] = 1;
-				format++;
-			}
-			while (*format && *format != ']') {
-				if (format[1] == '-' && format[2] &&
-				    format[2] != ']') {
-					unsigned char lo = (unsigned char)format[0];
-					unsigned char hi = (unsigned char)format[2];
-					for (unsigned x = lo; x <= hi; x++)
-						set[x] = 1;
-					format += 3;
-				} else {
-					set[(unsigned char)*format] = 1;
-					format++;
-				}
-			}
-			if (*format == ']')
-				format++;
-			char *dest = suppress ? NULL : va_arg(ap, char *);
-			int cnt = 0;
-			while (*s && (width < 0 || cnt < width)) {
-				int in = set[(unsigned char)*s] ? 1 : 0;
-				if (negate)
-					in = !in;
-				if (!in)
-					break;
-				if (dest)
-					dest[cnt] = *s;
-				s++;
-				cnt++;
-			}
-			if (cnt == 0)
-				goto done;
-			if (dest)
-				dest[cnt] = '\0';
-			if (!suppress)
-				matched++;
-			break;
-		}
-		case 'n': {
-			if (!suppress) {
-				*va_arg(ap, int *) = (int)(s - str);
-			}
-			break;
-		}
-		default:
-			goto done;
-		}
-	}
-done:
-	return matched;
-}
-
-int sscanf(const char *str, const char *format, ...)
-{
-	va_list ap;
-	va_start(ap, format);
-	int ret = vsscanf(str, format, ap);
-	va_end(ap);
-	return ret;
-}
 
 /* fseeko / ftello - large-file aliases. We use 64-bit off_t already so
  * these are simple wrappers around fseek / ftell. */
@@ -1897,4 +1625,44 @@ void perror(const char *s)
 	if (s && *s)
 		fprintf(stderr, "%s: ", s);
 	fprintf(stderr, "%s\n", strerror(errno));
+}
+
+/* tmpfile(): a scratch file that vanishes when it is closed.
+ *
+ * Created and then immediately unlinked — the open descriptor keeps the inode
+ * alive, so the data survives exactly as long as the stream and nothing is
+ * left behind if the process dies. That is the whole point of the call, and
+ * it is why this cannot be built from tmpnam() plus fopen(): between those two
+ * steps another process could claim the name. */
+FILE *tmpfile(void)
+{
+	char path[] = "/tmp/tmpfXXXXXX";
+	int fd = mkstemp(path);
+	FILE *f;
+
+	if (fd < 0)
+		return NULL;
+	unlink(path);
+	f = fdopen(fd, "w+");
+	if (!f)
+		close(fd);
+	return f;
+}
+
+/* tmpnam(): returns a name that did not exist a moment ago.  Inherently racy —
+ * anything may create it before the caller does — which is why tmpfile() and
+ * mkstemp() exist and why the standard marks this obsolescent. */
+char *tmpnam(char *s)
+{
+	static char buf[L_tmpnam];
+	char *out = s ? s : buf;
+	static unsigned counter;
+
+	for (int attempt = 0; attempt < 100; attempt++) {
+		snprintf(out, L_tmpnam, "/tmp/tn%u_%u", (unsigned)getpid(),
+			 counter++);
+		if (access(out, F_OK) != 0)
+			return out;
+	}
+	return NULL;
 }

@@ -1070,6 +1070,7 @@ int tty_ioctl(tty_t *tty, unsigned long req, void *argp, task_t *cur)
 		if (!capable() && cur->sid != (int)cur->id)
 			return -EPERM;
 		cur->ctty = tty;
+		tty->sid = cur->sid;
 		/* Claiming the terminal also makes the claimant's process group
 		 * its FOREGROUND group.  Without this the tty kept whatever
 		 * group happened to open it first — in a pty that is the
@@ -1151,13 +1152,23 @@ tty_t *tty_get_pty_slave(int id)
 	return &pty->slave;
 }
 
+/* slave_open is an OPEN COUNT, not a flag.  Every open() of /dev/pts/N takes a
+ * reference and every close() drops one; the line is only torn down when the
+ * last one goes.  As a flat flag, two independent opens of the same slave meant
+ * the first close hung up the line for both — the master saw EOF and POLLHUP
+ * while another descriptor was still perfectly usable.  Boolean tests elsewhere
+ * ("is the slave open?") read a count just as well. */
 int tty_pty_slave_open(int id)
 {
 	pty_t *pty = tty_get_pty(id);
+	uint64_t f;
+
 	if (!pty) {
 		return -EINVAL;
 	}
-	pty->slave_open = 1;
+	spin_lock_irqsave(&pty->lock, &f);
+	pty->slave_open++;
+	spin_unlock_irqrestore(&pty->lock, f);
 	return 0;
 }
 
@@ -1306,10 +1317,23 @@ int tty_pty_master_close(int id)
 int tty_pty_slave_close(int id)
 {
 	pty_t *pty = tty_get_pty(id);
+	uint64_t f;
+	int last;
+
 	if (!pty) {
 		return -EINVAL;
 	}
-	pty->slave_open = 0;
+	spin_lock_irqsave(&pty->lock, &f);
+	if (pty->slave_open > 0)
+		pty->slave_open--;
+	last = (pty->slave_open == 0);
+	spin_unlock_irqrestore(&pty->lock, f);
+
+	/* Other descriptors still hold the slave open: the line stays up and
+	 * the master must not see a hangup. */
+	if (!last)
+		return 0;
+
 	pty->slave_vf = NULL;
 	/* Wake any task blocked in tty_pty_master_read so it can observe
      * EOF (read returns 0) and the master fd's poll set transitions to

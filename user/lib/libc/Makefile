@@ -15,14 +15,14 @@ PIC_CFLAGS = $(CFLAGS) -fPIC
 MALLOC_SRC = src/malloc/malloc.c
 STDIO_SRC = src/stdio/stdio.c
 STRING_SRC = src/string/string.c src/string/fnmatch.c src/string/strnlen.c src/string/glob.c
-STDLIB_SRC = src/stdlib/stdlib.c src/stdlib/getopt.c src/stdlib/mkstemps.c
+STDLIB_SRC = src/stdlib/stdlib.c src/stdlib/getopt.c src/stdlib/mkstemps.c src/stdlib/random.c src/stdlib/spawn.c
 CTYPE_SRC = src/ctype/ctype.c
 TIME_SRC = src/time/time.c
 DIR_SRC = src/dirent/dirent.c
 MATH_SRC = src/math/math.c
 REGEX_SRC = src/regex/regex.c
 EXTRA_STDIO_SRC = src/stdio/getline.c src/stdio/err.c src/stdio/popen.c src/stdio/vfscanf.c
-SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/sched.c src/syscalls/socket.c src/syscalls/uio.c src/syscalls/resource.c src/syscalls/pty_util.c
+SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/shm.c src/syscalls/sysvshm.c src/syscalls/sched.c src/syscalls/socket.c src/syscalls/uio.c src/syscalls/resource.c src/syscalls/pty_util.c
 DLFCN_SRC = src/dl/dlfcn.c
 PWD_SRC = src/pwd/pwd.c src/pwd/grp.c src/pwd/shadow.c src/pwd/creds.c
 NET_SRC = src/net/inet.c src/net/getaddrinfo.c src/net/getifaddrs.c src/net/netdb_extra.c
@@ -77,7 +77,7 @@ CRT1        = crt1.o
 CRTI        = crti.o
 CRTN        = crtn.o
 
-all: $(LIBC_A) $(CRT0) $(CRT1) $(CRTI) $(CRTN) $(LIBC_SO)
+all: $(LIBC_A) $(CRT0) $(CRT1) $(CRTI) $(CRTN) $(LIBC_SO) libm.a
 
 # ---- Static library (libc.a) — contains everything including pthread ----
 $(LIBC_A): $(ALL_OBJ)
@@ -119,3 +119,14 @@ clean:
 	rm -f $(LIBC_PIC) $(DLFCN_PIC) $(PTHREAD_PIC) $(LIBC_SO)
 
 .PHONY: all clean
+
+# libm.a — deliberately EMPTY.
+#
+# The math functions live in libc here, as they do on any system that has
+# merged the two.  But an enormous amount of software passes -lm
+# unconditionally, and configure scripts routinely probe for it (libXfont2
+# refuses to build without one).  An empty archive satisfies the link, adds
+# nothing to the binary, and creates no runtime dependency: the symbols still
+# resolve from libc.so.
+libm.a:
+	$(AR) rcs $@

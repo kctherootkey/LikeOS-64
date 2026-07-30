@@ -22,7 +22,9 @@ static unsigned long _temp_rand(void)
 	return _temp_seed;
 }
 
-int mkstemps(char *templ, int suffixlen)
+/* Shared body: mkstemp/mkstemps/mkostemp/mkostemps differ only in how many
+ * trailing bytes follow the XXXXXX and which extra open() flags apply. */
+static int mkstemps_flags(char *templ, int suffixlen, int oflags)
 {
 	static const char letters[] =
 		"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -49,7 +51,7 @@ int mkstemps(char *templ, int suffixlen)
 			r /= 62;
 		}
 
-		int fd = open(templ, O_RDWR | O_CREAT | O_EXCL, 0600);
+		int fd = open(templ, O_RDWR | O_CREAT | O_EXCL | oflags, 0600);
 		if (fd >= 0)
 			return fd;
 		if (errno != EEXIST)
@@ -60,9 +62,27 @@ int mkstemps(char *templ, int suffixlen)
 	return -1;
 }
 
+int mkstemps(char *templ, int suffixlen)
+{
+	return mkstemps_flags(templ, suffixlen, 0);
+}
+
 int mkstemp(char *templ)
 {
-	return mkstemps(templ, 0);
+	return mkstemps_flags(templ, 0, 0);
+}
+
+/* mkostemp/mkostemps take extra open() flags (O_CLOEXEC being the point of
+ * them: creating the file and marking it close-on-exec without a window in
+ * between where a fork could leak the descriptor). */
+int mkostemp(char *templ, int oflags)
+{
+	return mkstemps_flags(templ, 0, oflags);
+}
+
+int mkostemps(char *templ, int suffixlen, int oflags)
+{
+	return mkstemps_flags(templ, suffixlen, oflags);
 }
 
 /* mktemp: replace the trailing XXXXXX with a name that does not exist.

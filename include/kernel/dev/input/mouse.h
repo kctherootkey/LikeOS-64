@@ -142,4 +142,9 @@ void mouse_apply_cursor(void); // Apply loaded cursor from cursor.h
 // Called by the USB HID driver to feed events into the mouse subsystem.
 void mouse_inject_usb_movement(int dx, int dy, uint8_t buttons, int8_t wheel);
 
+
+/* Redraw the console pointer after another program gives the display back.
+ * Discards the saved background first; see mouse.c. */
+void mouse_console_display_released(void);
+
 #endif // _KERNEL_MOUSE_H_

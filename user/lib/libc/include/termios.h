@@ -32,15 +32,55 @@ typedef unsigned int speed_t;
 #define OCRNL   0x0004
 #define ONOCR   0x0008
 #define ONLRET  0x0010
+#define OLCUC   0x0020
 #define OFILL   0x0040
 #define OFDEL   0x0080
-#define OLCUC   0x0100
+
+/* Output delays.  Each *DLY name is a MASK selecting a field, and the values
+ * that go in that field are the numbered names beside it -- so a test is
+ * written `(c_oflag & TABDLY) == TAB3`, never `c_oflag & TAB3`.
+ *
+ * The values were missing entirely: only the masks were defined, which is
+ * enough to compile a test and not enough to write one.  xterm asks for TAB3
+ * (tabs expanded to spaces by the driver) when setting up a pty.
+ *
+ * OLCUC moved to 0x0020 above, because it had been given the same bit as
+ * NLDLY.  Nothing in the tree read it -- the one user is a table in the SSH
+ * port that only checks whether the name is defined -- so the collision had
+ * gone unnoticed, but it made the two settings impossible to tell apart.
+ *
+ * The driver does not implement the delays themselves: it acts on OPOST and
+ * ONLCR and ignores the rest, which is normal (they date from mechanical
+ * terminals that needed time to move the carriage).  They round-trip through
+ * tcgetattr/tcsetattr faithfully, which is what programs actually depend on. */
 #define NLDLY   0x0100
+#define NL0     0x0000
+#define NL1     0x0100
+
 #define CRDLY   0x0600
+#define CR0     0x0000
+#define CR1     0x0200
+#define CR2     0x0400
+#define CR3     0x0600
+
 #define TABDLY  0x1800
+#define TAB0    0x0000
+#define TAB1    0x0800
+#define TAB2    0x1000
+#define TAB3    0x1800
+#define XTABS   TAB3    /* the BSD name for TAB3 */
+
 #define BSDLY   0x2000
+#define BS0     0x0000
+#define BS1     0x2000
+
 #define VTDLY   0x4000
+#define VT0     0x0000
+#define VT1     0x4000
+
 #define FFDLY   0x8000
+#define FF0     0x0000
+#define FF1     0x8000
 
 // Local flags
 #define ISIG    0x0001

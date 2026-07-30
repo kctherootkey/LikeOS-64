@@ -1246,10 +1246,34 @@ static int task_is_dying(task_t *task)
 	return task && (task->has_exited || task->state == TASK_ZOMBIE);
 }
 
+/* Will this fault signal actually end the process?
+ *
+ * A program that installs a handler for a fault signal is using the fault
+ * deliberately — guard pages, a garbage collector's write barrier, an X
+ * server's own backtrace-and-restore-the-console wrapper.  Reporting that as a
+ * crash is wrong twice over: it buries the program's real output, and the
+ * report ends with "process terminated" when the process carries on. */
+static int fault_signal_is_fatal(task_t *cur, int signum)
+{
+	if (!cur || signum <= 0 || signum >= NSIG)
+		return 1;
+	/* A blocked or ignored fault signal cannot be delivered to a handler,
+	 * so the default action still applies and the task dies. */
+	if (sigismember_k(&cur->signals.blocked, signum))
+		return 1;
+	sighandler_t h = cur->signals.action[signum].sa_handler;
+	if (h == SIG_DFL || h == SIG_IGN)
+		return 1;
+	return 0;
+}
+
 static void report_userspace_crash(task_t *cur, uint64_t *regs, int signum,
 				   const char *signame, uint64_t cr2,
 				   uint64_t int_no)
 {
+	/* Stay quiet when the program has said it will handle this itself. */
+	if (!fault_signal_is_fatal(cur, signum))
+		return;
 #ifdef CRASH_VERBOSE
 	report_userspace_crash_detailed(cur, regs, signum, signame, cr2,
 					int_no);

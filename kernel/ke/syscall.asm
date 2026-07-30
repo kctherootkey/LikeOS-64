@@ -20,6 +20,20 @@ global syscall_entry
 %define PERCPU_SAVED_USER_R15       80   ; percpu_t::syscall_saved_user_r15
 %define PERCPU_SAVED_USER_RAX       88   ; percpu_t::syscall_saved_user_rax
 %define PERCPU_SIGNAL_PENDING       96   ; percpu_t::syscall_signal_pending
+; The rest of the user register file, saved only for sigreturn.  A syscall
+; return may clobber these; a signal return may not.  See percpu.h.
+%define PERCPU_SAVED_USER_RDI       112
+%define PERCPU_SAVED_USER_RSI       120
+%define PERCPU_SAVED_USER_RDX       128
+%define PERCPU_SAVED_USER_RCX       136
+%define PERCPU_SAVED_USER_R8        144
+%define PERCPU_SAVED_USER_R9        152
+%define PERCPU_SAVED_USER_R10       160
+%define PERCPU_SAVED_USER_R11       168
+; Selectors for the IRETQ frame, matching the ones sched.c builds for a new
+; task (CS 0x23, SS 0x1B).
+%define USER_CS_SEL                 0x23
+%define USER_SS_SEL                 0x1B
 
 SECTION .bss
 align 16
@@ -218,32 +232,49 @@ syscall_entry:
     o64 sysret
 
 .sigreturn_restore:
-    ; Sigreturn path - restore full context from per-CPU saved variables
-    ; The saved variables were already updated by signal_restore_frame
-    mov rcx, [gs:PERCPU_SAVED_USER_RIP]       ; Original RIP -> RCX for SYSRET
-    mov r11, [gs:PERCPU_SAVED_USER_RFLAGS]    ; RFLAGS -> R11 for SYSRET
-    mov rsp, [gs:PERCPU_SYSCALL_URSP]         ; Original user RSP
+    ; Sigreturn: restore the COMPLETE user context, via IRETQ.
+    ;
+    ; SYSRET cannot be used here.  It takes the return RIP from RCX and RFLAGS
+    ; from R11, so those two registers are destroyed by the return itself --
+    ; and the code that was interrupted is not at a syscall boundary, so every
+    ; register is live.  The previous version went further and zeroed
+    ; RDI/RSI/RDX/R8/R9/R10 on the way out, which silently corrupted whatever
+    ; the program was doing: a signal arriving between a register load and its
+    ; use handed the interrupted function a zero.  xterm died calling
+    ; VTRun(NULL) because RDI was wiped between the compare and the call, and
+    ; the window for it is every instruction that is not a syscall.
+    ;
+    ; IRETQ reads RIP, CS, RFLAGS, RSP and SS from the stack and leaves the
+    ; general-purpose registers alone, so all of them can be restored first.
+    ;
+    ; Still on the kernel stack here; the frame pushed below is consumed by the
+    ; IRETQ, and the next syscall reloads RSP from PERCPU_SYSCALL_KRSP anyway.
 
-    ; Restore callee-saved registers
+    mov rax, [gs:PERCPU_SYSCALL_URSP]         ; user RSP for the IRET frame
+    push qword USER_SS_SEL
+    push rax
+    push qword [gs:PERCPU_SAVED_USER_RFLAGS]
+    push qword USER_CS_SEL
+    push qword [gs:PERCPU_SAVED_USER_RIP]
+
+    ; With the frame built, no GPR is needed any more: restore them all.
+    mov rdi, [gs:PERCPU_SAVED_USER_RDI]
+    mov rsi, [gs:PERCPU_SAVED_USER_RSI]
+    mov rdx, [gs:PERCPU_SAVED_USER_RDX]
+    mov rcx, [gs:PERCPU_SAVED_USER_RCX]
+    mov r8,  [gs:PERCPU_SAVED_USER_R8]
+    mov r9,  [gs:PERCPU_SAVED_USER_R9]
+    mov r10, [gs:PERCPU_SAVED_USER_R10]
+    mov r11, [gs:PERCPU_SAVED_USER_R11]
     mov rbp, [gs:PERCPU_SAVED_USER_RBP]
     mov rbx, [gs:PERCPU_SAVED_USER_RBX]
     mov r12, [gs:PERCPU_SAVED_USER_R12]
     mov r13, [gs:PERCPU_SAVED_USER_R13]
     mov r14, [gs:PERCPU_SAVED_USER_R14]
     mov r15, [gs:PERCPU_SAVED_USER_R15]
-
-    ; Restore RAX (syscall return value, e.g., -EINTR)
     mov rax, [gs:PERCPU_SAVED_USER_RAX]
 
-    ; Clear other registers
-    xor rdi, rdi
-    xor rsi, rsi
-    xor rdx, rdx
-    xor r8, r8
-    xor r9, r9
-    xor r10, r10
-
-    o64 sysret
+    iretq
 
 ; IRET trampoline for user mode entry
 global user_mode_iret_trampoline

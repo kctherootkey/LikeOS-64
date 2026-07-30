@@ -112,6 +112,7 @@ void perror(const char* s);
 ssize_t getline(char** lineptr, size_t* n, FILE* stream);
 ssize_t getdelim(char** lineptr, size_t* n, int delim, FILE* stream);
 FILE* tmpfile(void);
+char* tmpnam(char* s);
 int mkstemp(char* templ);
 int mkstemps(char* templ, int suffixlen);
 int remove(const char* pathname);

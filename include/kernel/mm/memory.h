@@ -257,11 +257,14 @@ bool mm_handle_cow_fault(uint64_t fault_addr);
 uint64_t *mm_clone_address_space(uint64_t *src_pml4);
 
 // Clone with shared memory support (for MAP_SHARED regions)
-// shared_regions: array of {start, end} pairs, null-terminated
-// These ranges will NOT use COW - they'll share the same physical pages
+// Takes the caller's mmap region table directly and shares (rather than COWs)
+// every in-use MAP_SHARED range in it.  The table is read, never modified.
+// Passing it straight through avoids materialising a copy of the ranges on the
+// kernel stack, which does not scale with TASK_MAX_MMAP.
+struct mmap_region;
 uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
-					     uint64_t *shared_regions,
-					     int num_shared);
+					     const struct mmap_region *regions,
+					     int num_regions);
 
 // Physical page refcounting (for COW)
 void mm_init_page_refcounts(void);

@@ -419,9 +419,27 @@ int signal_setup_frame(task_t *task, int sig, siginfo_t *info,
 	// RIP 0 — an instant SIGSEGV (exec at VA 0) instead of running the handler.
 	uint64_t handler = (uint64_t)act->sa_handler;
 
-	// Calculate new stack position for signal frame (16-byte aligned)
-	uint64_t frame_addr = (user_rsp - sizeof(signal_frame_t)) & ~0xFULL;
-	WARN_ON(frame_addr & 0xF); /* signal frame must be 16-byte aligned */
+	/* Place the signal frame so the handler is entered with the alignment
+	 * the ABI promises it.
+	 *
+	 * The handler is entered as though by a call: RSP points AT the return
+	 * address (pretcode, the first field of the frame).  At the target of a
+	 * call, RSP % 16 == 8 -- 16-byte aligned before the call, minus the
+	 * 8-byte return address the call pushed.  That is what the compiler
+	 * assumes when it lays out the handler's own frame.
+	 *
+	 * Putting the frame at a 16-ALIGNED address gives the handler
+	 * RSP % 16 == 0 instead, so everything it computes is 8 bytes out and
+	 * the first 16-byte-aligned SSE store to the stack (`movaps %xmm0,
+	 * (%rsp)`, which gcc emits for something as ordinary as initialising a
+	 * local struct) raises a general protection fault -- inside the
+	 * handler, with nothing to suggest the frame was misplaced.
+	 *
+	 * Hence: align down, then step back 8. */
+	uint64_t frame_addr =
+		((user_rsp - sizeof(signal_frame_t)) & ~0xFULL) - 8;
+	WARN_ON((frame_addr & 0xF) !=
+		8); /* handler must be entered with RSP % 16 == 8 */
 
 	// Validate the stack address is in user space
 	if (frame_addr < 0x10000 || frame_addr >= 0x7FFFFFFFFFFF) {
@@ -566,7 +584,11 @@ int signal_setup_frame_irq(task_t *task, int sig, siginfo_t *info,
 	uint64_t handler = (uint64_t)act->sa_handler;
 
 	// Calculate new stack position for signal frame (16-byte aligned)
-	uint64_t frame_addr = (user_rsp - sizeof(signal_frame_t)) & ~0xFULL;
+	/* Same alignment rule as signal_setup_frame(): the handler is entered
+	 * as though by a call, so RSP must be 8 (mod 16) there. */
+	uint64_t frame_addr =
+		((user_rsp - sizeof(signal_frame_t)) & ~0xFULL) - 8;
+	WARN_ON((frame_addr & 0xF) != 8);
 
 	// Validate the stack address is in user space
 	if (frame_addr < 0x10000 || frame_addr >= 0x7FFFFFFFFFFF) {
@@ -749,6 +771,24 @@ int signal_restore_frame(task_t *task)
 	cpu->syscall_saved_user_r15 = kframe.r15;
 	cpu->syscall_saved_user_rax =
 		kframe.rax; // Syscall return value (e.g., -EINTR)
+
+	/* And the rest of the register file.
+	 *
+	 * A syscall return can leave these clobbered -- the ABI allows it -- but
+	 * a signal return cannot: the signal may have interrupted user code at
+	 * any instruction, with every register live.  They used to be dropped
+	 * (and the assembly then zeroed them), so a signal arriving between a
+	 * register load and its use corrupted the interrupted program at random.
+	 * That is not a rare window: it is every instruction that is not a
+	 * syscall. */
+	cpu->syscall_saved_user_rdi = kframe.rdi;
+	cpu->syscall_saved_user_rsi = kframe.rsi;
+	cpu->syscall_saved_user_rdx = kframe.rdx;
+	cpu->syscall_saved_user_rcx = kframe.rcx;
+	cpu->syscall_saved_user_r8 = kframe.r8;
+	cpu->syscall_saved_user_r9 = kframe.r9;
+	cpu->syscall_saved_user_r10 = kframe.r10;
+	cpu->syscall_saved_user_r11 = kframe.r11;
 
 	// Tell syscall.asm to use the restored context
 	// Use special value 0xFFFFFFFFFFFFFFFF (-1) to indicate sigreturn (not a handler call)

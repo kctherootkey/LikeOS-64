@@ -1,0 +1,90 @@
+Add a backend for this platform.
+
+Every existing libpciaccess backend needs a door into the kernel that this
+system does not have (sysfs, /dev/pci, devfs, or raw port I/O), so this one
+reports an empty bus with ENODEV rather than inventing config-space data.  The
+reasoning is in the file header of src/likeos_pci.c.
+
+Why build the library at all when the X server is configured
+--disable-pciaccess and never calls pci_system_init(): fbdevhw's public
+signatures (fbdevHWProbe, fbdevHWInit) take a struct pci_device *, so the
+header has to exist.  It is only ever passed NULL on the framebuffer path.
+Installing the header alone would leave a pkg-config file advertising a library
+that is not there.
+
+--- a/src/likeos_pci.c
++++ b/src/likeos_pci.c
+@@ -0,0 +1,35 @@
++/*
++ * PCI backend for LikeOS.
++ *
++ * libpciaccess is a thin shell over a per-OS backend that reaches PCI
++ * configuration space, and every existing one needs a door into the kernel
++ * that this system does not have: sysfs, /dev/pci (BSD), devfs (Solaris), or
++ * raw port I/O on 0xCF8/0xCFC (x86_pci.c).  Userspace here has none of those —
++ * the kernel enumerates the bus internally and exposes no interface to it — so
++ * a backend claiming to read config space would be inventing the data.
++ *
++ * This one reports that there is no accessible bus and says so with ENODEV.
++ * Callers already handle that: a non-zero pci_system_init() leaves pci_sys
++ * NULL, and everything downstream is guarded on it.
++ *
++ * If the kernel ever grows a userspace interface to config space, this is the
++ * one file to rewrite; nothing else assumes the bus is absent.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include <errno.h>
++
++#include "pciaccess.h"
++#include "pciaccess_private.h"
++
++int
++pci_system_likeos_create(void)
++{
++    /* ENODEV rather than ENOSYS: the interface is implemented, the bus is what
++     * is missing.  Callers that distinguish the two — telling "this build has
++     * no PCI support" from "this machine has no PCI" — get the accurate one. */
++    return ENODEV;
++}
+--- a/src/common_init.c
++++ b/src/common_init.c
+@@ -55,7 +55,9 @@
+ {
+     int err = ENOSYS;
+ 
+-#ifdef __linux__
++#if defined(__LIKEOS__)
++    err = pci_system_likeos_create();
++#elif defined(__linux__)
+     err = pci_system_linux_sysfs_create();
+ #elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || defined(__DragonFly__)
+     err = pci_system_freebsd_create();
+--- a/src/pciaccess_private.h
++++ b/src/pciaccess_private.h
+@@ -190,6 +190,7 @@
+ 
+ extern struct pci_system * pci_sys;
+ 
++extern int pci_system_likeos_create( void );
+ extern int pci_system_linux_sysfs_create( void );
+ extern int pci_system_freebsd_create( void );
+ extern int pci_system_netbsd_create( void );
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -20,7 +20,11 @@
+ 
+ host = host_machine.system()
+ _pci_access_host_files = []
+-if host == 'linux'
++if host == 'likeos'
++  # No VGA arbiter either: with nothing able to reach config space there is
++  # nothing to arbitrate, and one framebuffer cannot conflict with itself.
++  _pci_access_host_files += ['likeos_pci.c', 'common_vgaarb_stub.c']
++elif host == 'linux'
+   _pci_access_host_files += ['linux_sysfs.c', 'linux_devmem.c', 'common_vgaarb.c']
+ elif host == 'freebsd'
+   _pci_access_host_files += ['freebsd_pci.c', 'common_vgaarb_stub.c']

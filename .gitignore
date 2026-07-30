@@ -78,6 +78,38 @@
 /ports/openssh-10.4p1/likeos.cache
 /ports/openssh-10.4p1/config.cache
 
+# --- openssl port.  Configured and built in place with the tree tracked, and
+#     its release tarball ships no .gitignore of its own, so the ~163 files its
+#     Makefile derives from tracked .in/.pl sources are listed in
+#     ports/openssl-3.5.6/.gitignore -- next to the tree they describe, the same
+#     arrangement as openssh above.  They are not globbed there: most sit in
+#     directories full of real sources with the same extension.
+
+# --- X.Org port (52 packages).
+#
+#     The TARBALLS ARE TRACKED, deliberately, all 52 of them (~38 MB).  They are
+#     the build's only source of upstream code, so committing them is what makes
+#     `git clone && make` produce an X server on a machine with no network and
+#     without depending on 52 upstream download URLs still resolving.  That is
+#     also why ports/xorg/fetch.sh checks for an existing tarball before
+#     reaching for the network: with these present it makes no requests at all.
+#
+#     What IS ignored is everything derived from them: the source tree each
+#     tarball unpacks into (ports/xorg/<pkg>/), plus .stamps/ and .logs/, which
+#     the `*/` rule below covers because a gitignore `*` matches a leading dot.
+#     The build sysroot they install into lives under /build/ and is gone with it.
+/ports/xorg/*/
+#     Re-included: the cross-compile toolchain and the patches we apply to
+#     upstream source.  Both are OURS and there is no way to rebuild them from
+#     a tarball.  (Negating a directory works here because the rule above
+#     excludes the directory itself, so git still descends into these two.)
+!/ports/xorg/toolchain/
+!/ports/xorg/patches/
+#     Not listed, therefore tracked, and all required to build from a clone:
+#     packages.list (the manifest), fetch/unpack/build/stage/clean.sh, and
+#     checksums.sha256 (records which upstream bytes a build used).
+/build/xorg-sysroot/
+
 # --- Compiled userland executables (built in-tree next to their .c sources).
 #     Ignore everything under the bin dirs, then re-include tracked sources.
 /user/bin/*

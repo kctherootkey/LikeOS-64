@@ -216,7 +216,38 @@
 #define SYS_FLISTXATTR 397 // (fd, list, size)
 #define SYS_FREMOVEXATTR 398 // (fd, name)
 #define SYS_DEBUG_DUMP 399 // () root-only: dump TCP/AF_UNIX/PTY tables + tasks
-#define SYS_CHROOT 400 // (path) root-only: confine textual path resolution to a subtree
+#define SYS_CHROOT 400
+
+// System V shared memory (the MIT-SHM extension's interface)
+/* System V shared memory control commands and the stat structure.  Only the
+ * few operations the MIT-SHM extension uses are implemented. */
+#define IPC_PRIVATE 0
+#define IPC_CREAT 01000
+#define IPC_EXCL 02000
+#define IPC_RMID 0
+#define IPC_SET 1
+#define IPC_STAT 2
+#define SHM_RDONLY 010000
+
+struct k_ipc_perm {
+	int32_t key;
+	uint32_t uid, gid, cuid, cgid;
+	uint32_t mode;
+	uint32_t seq;
+};
+
+struct k_shmid_ds {
+	struct k_ipc_perm shm_perm;
+	uint64_t shm_segsz;
+	int64_t shm_atime, shm_dtime, shm_ctime;
+	int32_t shm_cpid, shm_lpid;
+	uint64_t shm_nattch;
+};
+
+#define SYS_SHMGET 401
+#define SYS_SHMAT 402
+#define SYS_SHMDT 403
+#define SYS_SHMCTL 404 // (path) root-only: confine textual path resolution to a subtree
 
 // rusage who values
 #define RUSAGE_SELF 0
@@ -286,6 +317,7 @@ typedef struct k_sysinfo {
 #define O_RDWR 0x0002
 #define O_CREAT 0x0040
 #define O_EXCL 0x0080
+#define O_NOCTTY 0x0100
 #define O_TRUNC 0x0200
 #define O_APPEND 0x0400
 #define O_NONBLOCK 0x0800

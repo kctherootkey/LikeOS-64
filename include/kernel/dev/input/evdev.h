@@ -19,7 +19,11 @@ struct task;
 
 // Device-file interface (devfs dispatch)
 long evdev_read(int unit, void *user_buf, long bytes, int nonblock);
-int evdev_ioctl(int unit, unsigned long req, void *argp, struct task *cur);
+int evdev_ioctl(int unit, unsigned long req, void *argp, struct task *cur,
+		void *owner);
+/* Release a grab taken through a particular descriptor.  Keyed on the handle
+ * rather than the task, because the closer is not always the opener. */
+void evdev_release_grab_by_owner(int unit, void *owner);
 short evdev_poll(int unit, short events);
 void evdev_release_grab_for(int unit, int64_t task_id); // close/exit hook
 
