@@ -97,6 +97,40 @@ WorkSpaces {
     "4" {"#c6c6c6" "black" "#c6c6c6" "black"}
 }
 
+#
+# Mouse pointers.
+#
+# ctwm's defaults are the old X set: "top_left_arrow" over frames, titles and
+# icons (the thin skewed outline arrow), "hand2" over the title buttons and
+# "sb_left_arrow" over menus.  "left_ptr" is the plain arrow every current
+# desktop uses, and it is what these should all be.
+#
+# Kept as they are, because they say something a plain arrow could not, and
+# because Windows shows its own equivalents in the same situations:
+#   Move/Resize  fleur  - a drag is in progress
+#   Wait         watch  - busy
+#   Destroy      pirate - the next click KILLS the window it lands on; that is
+#                         worth a pointer that does not look routine
+#
+# The DESKTOP pointer is not here: ctwm never sets a cursor on the root window,
+# so the X-shaped one comes from the server's own default and has to be replaced
+# with xsetroot -cursor_name (see xinitrc).
+#
+Cursors
+{
+    Frame    "left_ptr"
+    Title    "left_ptr"
+    Icon     "left_ptr"
+    IconMgr  "left_ptr"
+    Button   "left_ptr"
+    Menu     "left_ptr"
+    Select   "left_ptr"
+    Move     "fleur"
+    Resize   "fleur"
+    Wait     "watch"
+    Destroy  "pirate"
+}
+
 ###########################################################
 # Top desktop bar
 ###########################################################

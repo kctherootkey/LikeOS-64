@@ -60,7 +60,16 @@ __no_stack_protector void system_startup(boot_info_t *boot_info)
 		     boot_info->fb_info.vertical_resolution ==
 			     0); /* UEFI framebuffer has zero resolution */
 	console_set_color(10, 0);
-	kprintf("\nLikeOS-64 Kernel v0.2\n\n");
+	/* The version comes from the build (LIKEOS_VERSION in the Makefile, which
+	 * KERNEL_CFLAGS passes in as a define), so the boot banner and what
+	 * uname(2) reports cannot drift apart -- this line used to be a
+	 * hardcoded "v0.2" while uname already reported the real one.  The
+	 * fallback mirrors the one in sys_uname for a build without the define. */
+#ifdef LIKEOS_VERSION
+	kprintf("\nLikeOS-64 Kernel v%s\n\n", LIKEOS_VERSION);
+#else
+	kprintf("\nLikeOS-64 Kernel\n\n");
+#endif
 	console_set_color(15, 0);
 
 	kprintf("64-bit Long Mode Active\n");

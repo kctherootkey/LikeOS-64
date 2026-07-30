@@ -34,7 +34,12 @@ fi
 # black until the server starts, then this, then the desktop.  (The default root
 # pattern is a black-and-white weave that dithers harshly on a framebuffer, so
 # something does have to replace it.)
-xsetroot -solid "#6f9c9c"
+# -cursor_name is here for the same reason the colour is: the DESKTOP pointer
+# belongs to the root window, which ctwm never touches, so it keeps whatever the
+# server set -- and the server's default is X_cursor, the big X.  left_ptr is the
+# plain arrow.  The pointers over windows, titles and menus are ctwm's, and are
+# set in the Cursors block in system.ctwmrc.
+xsetroot -solid "#6f9c9c" -cursor_name left_ptr
 
 # Clock, top-left, as the first piece of the desktop bar.  Started BEFORE the
 # window manager so it is already mapped when ctwm takes over and applies the

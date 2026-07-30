@@ -42,7 +42,7 @@ endif
 CODENAME = blessed kitty
 
 # Version string: override on command line with LIKEOS_VERSION=x.y.z
-LIKEOS_VERSION ?= 0.2.3-HEAD
+LIKEOS_VERSION ?= 0.2.4-HEAD
 
 # Tools
 GCC = gcc
@@ -1868,7 +1868,7 @@ help:
 	@echo "  ESP_MB=N          - FAT EFI System Partition size in MB (default: 64)"
 	@echo "  SCREEN_SIZE=large - Preferred bootloader resolution 1920x1200 (fallback: 1920x1080, 1280x800, 1280x768, 1152x864, 1024x768)"
 	@echo "  SCREEN_SIZE=medium or unset - Preferred bootloader resolution 1280x800 (fallback: 1280x768, 1024x768)"
-	@echo "  LIKEOS_VERSION=x.y.z - Override kernel version string reported by uname (default: 0.2.1-HEAD)"
+	@echo "  LIKEOS_VERSION=x.y.z - Override the version in the boot banner and uname (default: $(LIKEOS_VERSION))"
 	@echo "  CRASH_VERBOSE=1   - Emit detailed userspace and kernel crash reports (registers, fault decode, page-table walk) in an otherwise stripped, non-poisoned production-like build."
 	@echo "  DEBUG=1           - Full debug build: kernel memory poisoning, DWARF symbols, unstripped kernel, libc stack-smash detail, and the RIP byte dumps (implies CRASH_VERBOSE=1)."
 	@echo "  NO_STRIP=1        - Keep the kernel symbol table (do not strip kernel.elf) so a crash trace can be resolved to function names with nm/objdump (implied by DEBUG=1)."
