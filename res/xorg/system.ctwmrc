@@ -160,7 +160,7 @@ DontPaintRootWindow
 # width/columns wide and a new row starts only once a row is full
 # (PackIconManager in iconmgr.c).  At 1 every entry was full-width and they
 # stacked downward, which is the vertical strip this replaces.  Five columns of
-# 700/5 = 140px each is enough for a window name.
+# 600/5 = 120px each is enough for a window name.
 ShowIconManager
 NoIconManagerFocus
 
@@ -168,11 +168,15 @@ NoIconManagerFocus
 # Geometry:
 # Width x Height + X + Y
 #
-# Left-anchored just past the clock.  Unlike the workspace manager this cannot
-# stretch to the space available -- ctwm has no way to say "the rest of the
-# row" -- so it is sized for the narrowest mode; on a wider screen the gap
-# before the workspace manager simply grows.  Widen the 700 to suit.
-IconManagerGeometry             "700x52+64+0" 5
+# Left-anchored past the clock AND the load graph (0..60 clock, 64..164 xload,
+# so the bar starts at 168).  600 wide keeps it clear of the workspace manager's
+# 250 at the right edge on a 1024-wide screen.
+#
+# Unlike the workspace manager this cannot stretch to the space available --
+# ctwm has no way to say "the rest of the row" -- so it is sized for the
+# narrowest mode; on a wider screen the gap before the workspace manager simply
+# grows.  Widen the 600 to suit.
+IconManagerGeometry             "600x52+168+0" 5
 
 #
 # Make it look like a panel: undecorated, and present on every workspace rather
@@ -191,6 +195,7 @@ NoTitle
     "TWM Icon Manager"
     "WorkSpaceManager"
     "xclock"
+    "xload"
 }
 
 NoBorder
@@ -198,6 +203,7 @@ NoBorder
     "TWM Icon Manager"
     "WorkSpaceManager"
     "xclock"
+    "xload"
 }
 
 OccupyAll
@@ -205,6 +211,7 @@ OccupyAll
     "TWM Icon Manager"
     "WorkSpaceManager"
     "xclock"
+    "xload"
 }
 
 #
@@ -215,6 +222,7 @@ IconManagerDontShow
     "TWM Icon Manager"
     "WorkSpaceManager"
     "xclock"
+    "xload"
 }
 
 #
@@ -274,7 +282,21 @@ Function "move-or-iconify" { f.move f.deltastop f.iconify }
 #
 # Set some useful bindings.  Sort of uwm-ish, sort of simple-button-ish
 #
-Button1 =	: root		: f.menu "defops"
+#
+# Root menu, MS-Windows style: RIGHT button opens it, it then stays open
+# until an entry is clicked or a click lands outside it.
+#
+# StayUpMenus is what makes it stay: without it a ctwm menu is press-drag-
+# release, so the menu vanishes the instant the button comes up and an entry
+# can only be chosen by releasing over it.  With it, a press-and-release that
+# does not select simply leaves the menu posted, and the next click either
+# activates the entry under the pointer or dismisses the menu.  Either button
+# can do that activating click -- ctwm's release handler acts on the entry the
+# pointer is over, whichever button opened the menu.
+#
+StayUpMenus
+
+Button3 =	: root		: f.menu "defops"
 Button2 =	: root		: f.menu "windowops"
 
 Button1 = m	: window|icon	: f.function "move-or-lower"
@@ -300,16 +322,26 @@ Button2 =	: frame		: f.raiselower
 #
 # And a menus with the usual things
 #
+#
+# Root menu.  Only programs that are actually installed appear here: upstream
+# offered xcalc, xman and xmag, none of which is in this port, and a menu entry
+# that runs a command the system does not have is worse than no entry -- it
+# fails silently, with nothing on screen to say why.
+#
+# When a program is added to ports/xorg/packages.list and staged, add it here.
+#
 menu "defops"
 {
     "LikeOS"		f.title
     "Xterm"		!"xterm&"
-    "Calculator"	!"xcalc&"
-    "Xman"		!"xman &"
-    "Xmag"		!"xmag&"
-    ""			f.nop
-    "Restart"		f.restart
-    "Exit"		f.quit
+    "Clock"		!"xclock -digital -strftime %H:%M:%S &"
+    "Load"		!"xload -update 2 &"
+    "Calculator"	!"xcalc &"
+    "Editor"		!"xnedit &"
+    "Web browser"	!"netsurf &"
+    ""			f.separator
+    "Restart ctwm"	f.restart
+    "Exit session"	f.quit
 }
 
 menu "windowops" {

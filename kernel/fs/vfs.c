@@ -493,7 +493,42 @@ static int vfs_is_root_path(const char *path)
 	return 0;
 }
 
-int vfs_open(const char *path, int flags, vfs_file_t **out)
+/* Remember the absolute path a handle was opened with, so the descriptor can
+ * later serve as the dirfd of an *at() syscall.
+ *
+ * Stored for every handle rather than only for directories: telling the two
+ * apart here would mean an extra fstat on every open, and open() is already
+ * doing path resolution and disk I/O -- a short string copy is the cheaper of
+ * the two.  A failed allocation is not an error: at_path stays NULL and the
+ * *at() syscalls then report ENOTDIR for that descriptor, which is what they
+ * did for every descriptor before this existed. */
+static void vfs_set_at_path(vfs_file_t *f, const char *path)
+{
+	unsigned long n = 0;
+
+	if (!f)
+		return;
+	f->at_path = NULL;
+	if (!path)
+		return;
+	while (path[n])
+		n++;
+	if (n == 0 || n >= VFS_MAX_PATH)
+		return;
+	f->at_path = (char *)kalloc(n + 1);
+	if (!f->at_path)
+		return;
+	for (unsigned long i = 0; i <= n; i++)
+		f->at_path[i] = path[i];
+}
+
+/* Shared body of vfs_open() and vfs_open_mode().
+ *
+ * `cmode` is the mode a newly created file gets (already umask-adjusted by the
+ * caller).  It is only consulted when the filesystem provides ->open_mode and
+ * the open actually creates something. */
+static int vfs_open_common(const char *path, int flags, unsigned int cmode,
+			   vfs_file_t **out)
 {
 	BUG_ON(path == NULL);
 	BUG_ON(out == NULL);
@@ -555,6 +590,7 @@ int vfs_open(const char *path, int flags, vfs_file_t **out)
 			(*out)->flags = flags;
 			(*out)->is_root_dir = 0;
 			(*out)->dev_injected = 0;
+			vfs_set_at_path(*out, path);
 		}
 		WARN_ON(ret == ST_OK && *out == NULL);
 		return ret;
@@ -562,7 +598,11 @@ int vfs_open(const char *path, int flags, vfs_file_t **out)
 
 	if (!g_root_ops || !g_root_ops->open)
 		return ST_UNSUPPORTED;
-	int ret = g_root_ops->open(path, flags, out);
+	/* ->open_mode when the filesystem has it, so an O_CREAT open creates
+	 * with the mode the caller asked for instead of a fixed default. */
+	int ret = g_root_ops->open_mode ?
+			  g_root_ops->open_mode(path, flags, cmode, out) :
+			  g_root_ops->open(path, flags, out);
 	if (ret == ST_OK && *out) {
 		WARN_ON(*out == NULL);
 		WARN_ON((*out)->ops == NULL);
@@ -570,9 +610,24 @@ int vfs_open(const char *path, int flags, vfs_file_t **out)
 		(*out)->flags = flags;
 		(*out)->is_root_dir = vfs_is_root_path(path);
 		(*out)->dev_injected = 0;
+		vfs_set_at_path(*out, path);
 	}
 	WARN_ON(ret == ST_OK && *out == NULL);
 	return ret;
+}
+
+/* Plain open().  Used by every in-kernel opener, none of which creates a file
+ * with a caller-chosen mode; 0666 is the POSIX default for a creat-style open
+ * and is only reached if such a caller ever does pass O_CREAT. */
+int vfs_open(const char *path, int flags, vfs_file_t **out)
+{
+	return vfs_open_common(path, flags, 0666, out);
+}
+
+int vfs_open_mode(const char *path, int flags, unsigned int mode,
+		  vfs_file_t **out)
+{
+	return vfs_open_common(path, flags, mode, out);
 }
 
 /* Raw stat: dispatch to the owning filesystem with no permission check.  Used
@@ -1095,6 +1150,11 @@ int vfs_rmdir(const char *path)
 
 void vfs_release_locks_for_task(uint64_t task_id)
 {
+	/* Advisory record locks go with the process.  A lock that outlived its
+	 * owner would block every later process permanently, and the F_SETLKW
+	 * wait would spin on it with nothing left to release it. */
+	frlock_release_for_task((uint32_t)task_id);
+
 	if (g_root_ops && g_root_ops->release_locks_for_task)
 		g_root_ops->release_locks_for_task(task_id);
 	if (g_dev_ops && g_dev_ops->release_locks_for_task)
@@ -1127,7 +1187,14 @@ int vfs_close(vfs_file_t *f)
 		return ST_INVALID;
 	}
 
-	// Actually close when refcount reaches 0 (old was 1, now 0)
+	/* Actually close when refcount reaches 0 (old was 1, now 0).
+	 *
+	 * at_path is released FIRST: ->close frees the vfs_file itself, so
+	 * reading the pointer afterwards would be a use-after-free. */
+	if (f->at_path) {
+		kfree(f->at_path);
+		f->at_path = NULL;
+	}
 	return f->ops->close(f);
 }
 

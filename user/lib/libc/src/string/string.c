@@ -109,13 +109,24 @@ char *strcpy(char *dest, const char *src)
 
 char *strncpy(char *dest, const char *src, size_t n)
 {
-	char *d = dest;
-	while (n && (*d++ = *src++)) {
-		n--;
-	}
-	while (n--) {
-		*d++ = '\0';
-	}
+	size_t i;
+
+	/* EXACTLY n bytes are written -- no more, and no fewer.
+	 *
+	 * The previous form was `while (n && (*d++ = *src++)) n--;` followed by
+	 * a NUL-padding loop.  The character is copied BEFORE n is decremented,
+	 * so when the terminator was copied the loop exited without decrementing
+	 * -- and the padding loop then wrote one more NUL PAST the end.  With
+	 * n = 3 and src = "ab" it wrote four bytes into a three-byte buffer.
+	 *
+	 * That overflowed by one every time the source was shorter than the
+	 * destination, which is the common case, and it corrupted whatever
+	 * followed the buffer -- the neighbouring heap allocation, or the next
+	 * local on the stack. */
+	for (i = 0; i < n && src[i] != '\0'; i++)
+		dest[i] = src[i];
+	for (; i < n; i++)
+		dest[i] = '\0';
 	return dest;
 }
 
@@ -133,13 +144,18 @@ char *strcat(char *dest, const char *src)
 char *strncat(char *dest, const char *src, size_t n)
 {
 	char *d = dest;
-	while (*d) {
+	size_t i;
+
+	while (*d)
 		d++;
-	}
-	while (n && (*d++ = *src++)) {
-		n--;
-	}
-	*d = '\0';
+	/* At most n characters, then exactly one terminator.
+	 *
+	 * Same defect as strncpy had: the old loop copied src's own NUL through
+	 * the assignment and then wrote a second one after it, putting one byte
+	 * beyond what the contract allows. */
+	for (i = 0; i < n && src[i] != '\0'; i++)
+		d[i] = src[i];
+	d[i] = '\0';
 	return dest;
 }
 

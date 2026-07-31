@@ -24,6 +24,19 @@ logs="$here/.logs"
 SYSROOT="${LIKEOS_SYSROOT:-$root/build/xorg-sysroot}"
 export LIKEOS_SYSROOT="$SYSROOT"
 
+# Where BUILD-time tools go.
+#
+# NOT the sysroot: that describes the target, and a binary compiled for this
+# machine sitting in it would be one careless copy away from the image.
+#
+# NOT under build/ either, which was the first attempt: `make clean` deletes
+# everything in build/ except xorg-sysroot, so the tools vanished while
+# .stamps still said they were built -- and the next netsurf build failed with
+# "nsgenbind: not found".  This lives beside .stamps and .logs, which are the
+# port's own build state and which the top-level clean does not touch, so the
+# three cannot get out of step with each other.
+HOSTTOOLS="$here/.hosttools"
+
 mkdir -p "$stamps" "$logs" \
 	"$SYSROOT/usr/include" "$SYSROOT/usr/lib/pkgconfig" \
 	"$SYSROOT/usr/share/aclocal" "$SYSROOT/usr/share/pkgconfig" \
@@ -77,6 +90,31 @@ want=$*
 #   --disable-static  we link everything dynamically; static archives just
 #       double the build time.
 # ---------------------------------------------------------------------------
+# Build the helper programs a package RUNS during its own build.
+#
+# A package that generates source with a tool it builds itself has a problem
+# under cross compilation: configure hands that tool the cross compiler, so the
+# result cannot execute on the build host.  It fails as "cannot execute:
+# required file not found" -- the target's dynamic loader is missing, not the
+# tool.
+#
+# The tool has to be built for the HOST instead.  Both the object and the
+# executable are produced here so make finds them newer than the source and does
+# not relink them with the cross compiler.
+host_tools() {
+	case "$1" in
+	motif)
+		# config/util/makestrs turns xmstring.list into XmStrDefs.[ch],
+		# and every widget in libXm includes those.  It only needs
+		# X11/Xos.h, which the build host has.
+		cc -O2 -I. -Iconfig/util -c -o config/util/makestrs.o \
+			config/util/makestrs.c || return 1
+		cc -O2 -o config/util/makestrs config/util/makestrs.o || return 1
+		;;
+	esac
+	return 0
+}
+
 pkg_opts() {
 	case "$1" in
 	xorgproto) echo "--disable-specs" ;;
@@ -158,11 +196,69 @@ pkg_opts() {
 		#
 		# The analogue clock face is unaffected; only the digital mode's
 		# antialiased text falls back to a core bitmap font.
-		echo "--without-xft"
+		#
+		# (fontconfig and expat ARE built now, for Motif; this could be
+		# revisited, but it changes how the clock renders and the current
+		# rendering is what is wanted.)
+		#
+		# --with-appdefaultdir for the same reason as xload and xcalc
+		# below -- and it has to be HERE rather than in that case arm,
+		# because a shell `case` takes the FIRST match and this arm would
+		# otherwise shadow it.  That is exactly what happened: xclock was
+		# the one app whose app-defaults still went to the doubled path
+		# after the other two were fixed.
+		echo "--without-xft \
+		      --with-appdefaultdir=/usr/share/X11/app-defaults"
 		;;
 	xterm)
 		echo "--disable-imake --enable-256-color --disable-desktop \
 		      --with-app-defaults=/usr/share/X11/app-defaults"
+		;;
+	fontconfig)
+		# Docs need docbook and python; --disable-docs covers both.
+		#
+		# The default font path is stated because fontconfig's guess is a
+		# list of directories this system does not have, and a font path
+		# that points nowhere means every fontconfig client falls back to
+		# whatever the X core protocol offers.
+		#
+		# Its install step wants to run fc-cache, which is a TARGET
+		# binary and could not run on the build host -- but upstream
+		# already guards that with `test -z "$(DESTDIR)"` and we always
+		# install with a DESTDIR, so no flag is needed for it.
+		echo "--disable-docs --disable-docbook \
+		      --with-default-fonts=/usr/share/fonts/X11/misc"
+		;;
+	libXft)
+		echo "--disable-specs --without-xmlto --without-fop"
+		;;
+	motif)
+		# --disable-printing avoids libXp, the old X print extension:
+		# Motif only needs it for print-to-Xp, and porting a dead
+		# extension for that is not worth it.
+		#
+		# Xft the other way round: Motif defaults it OFF, and with
+		# libXft built there is no reason for its widgets to draw with
+		# core bitmap fonts.
+		echo "--disable-printing --enable-xft"
+		;;
+	xload | xcalc)
+		# These ask pkg-config for libXt's appdefaultdir and install to
+		# $(DESTDIR)$(appdefaultdir).  pkg-config prefixes
+		# PKG_CONFIG_SYSROOT_DIR when reporting a .pc VARIABLE, so the
+		# answer already contains the sysroot and DESTDIR then doubles
+		# it: the files landed in <sysroot>/<sysroot>/usr/share/X11/
+		# app-defaults and never reached the image.
+		#
+		# Nothing complained, because an app-defaults file that is not
+		# there is not an error -- the program starts with its built-in
+		# defaults.  For xcalc that means no buttons at all, since its
+		# entire keypad is defined in resources.
+		#
+		# Stating the path removes the guess.  xterm above does the same
+		# thing, which is why xterm's were the only ones installed
+		# correctly.
+		echo "--with-appdefaultdir=/usr/share/X11/app-defaults"
 		;;
 	*) echo "" ;;
 	esac
@@ -240,6 +336,23 @@ make_dirs() {
 	# include/ has the public header, src/ the library; only sxpm (the
 	# viewer demo) is skipped.
 	libXpm) echo "-C include -C src" ;;
+	# Motif: the library and its headers, not the development toolchain.
+	#
+	# lib/ is libXm and libMrm, include/ the public headers -- that is
+	# everything a Motif PROGRAM links against, and all xnedit asks for
+	# (-lXm).  Skipped:
+	#   tools/    the UIL compiler and its table generators.  These are HOST
+	#             programs the build runs to generate source, and unlike
+	#             makestrs they link against fontconfig/freetype/Xft, so
+	#             building them for the host would mean host copies of the
+	#             whole font stack.  UIL compiles .uil interface
+	#             descriptions at DEVELOPMENT time; nothing on this system
+	#             does that.
+	#   clients/  mwm and friends -- there is already a window manager.
+	#   doc/      manual sources, and man1 pages come from the sysroot.
+	#   bindings/localized/  virtual-key and message-catalogue data for
+	#             hardware and locales this system does not have.
+	motif) echo "-C lib -C include" ;;
 	*) echo "" ;;
 	esac
 }
@@ -261,11 +374,59 @@ build_subdirs() {
 # Anything a restricted build (see make_dirs) would otherwise leave behind.
 post_install() {
 	case "$1" in
+	netsurf)
+		# The build installs the binary and its resources but not the
+		# manual page, which sits unreferenced in docs/.  Installed
+		# under the name the image ships the binary as, so `man netsurf`
+		# matches the command the user actually has.
+		mkdir -p "$SYSROOT/usr/share/man/man1" || return 1
+		if [ -f docs/netsurf-fb.1 ]; then
+			cp -f docs/netsurf-fb.1 \
+				"$SYSROOT/usr/share/man/man1/netsurf.1" || return 1
+		fi
+		;;
+	utf8proc)
+		# NetSurf includes <libutf8proc/utf8proc.h>, but utf8proc
+		# installs its header at the include root as <utf8proc.h>.
+		# Both spellings are in use across distributions, and the
+		# package offers no option to choose, so the second one is
+		# provided here rather than patching every consumer.
+		#
+		# A copy, not a symlink: the sysroot is packed into the image
+		# and copied between machines, where a dangling absolute link
+		# would be worse than a duplicated 40KB header.
+		mkdir -p "$SYSROOT/usr/include/libutf8proc" || return 1
+		cp -f "$SYSROOT/usr/include/utf8proc.h" \
+			"$SYSROOT/usr/include/libutf8proc/utf8proc.h" || return 1
+		;;
 	libXpm)
 		# The .pc file is generated at the top level, so building only
 		# src/ installs the library but not the description of it — and
 		# the next package's configure then cannot find xpm.
 		make install-pkgconfigDATA DESTDIR="$SYSROOT" || return 1
+		;;
+	xnedit)
+		# Its own install target ships only the binaries, an icon and a
+		# .desktop file -- no manual page, because the page is generated
+		# from POD by a target upstream keeps out of the default build
+		# ("users may not have Perl installed").
+		#
+		# Generated here, into the sysroot's man1, so the repository's
+		# xorg-manpages target renders it alongside every other page
+		# instead of this one being a special case.  pod2man runs on the
+		# BUILD host, which is where it belongs -- it is documentation,
+		# not code.
+		if command -v pod2man >/dev/null 2>&1; then
+			mkdir -p "$SYSROOT/usr/share/man/man1"
+			for pg in xnedit xnc; do
+				[ -f "doc/$pg.pod" ] || continue
+				pod2man --section=1 --center="User Commands" \
+					--name="$(echo "$pg" | tr a-z A-Z)" \
+					"doc/$pg.pod" \
+					>"$SYSROOT/usr/share/man/man1/$pg.1" ||
+					return 1
+			done
+		fi
 		;;
 	esac
 	return 0
@@ -282,6 +443,32 @@ is_meson() {
 is_cmake() {
 	[ -f "$2/CMakeLists.txt" ] && [ ! -f "$2/meson.build" ] &&
 		[ ! -f "$2/configure" ] && [ ! -f "$2/autogen.sh" ]
+}
+
+# Packages with no configure at all: a hand-written Makefile per platform, built
+# by naming the platform as a target.  There is nothing to detect from the tree
+# (a Makefile is present in almost every package), so this is by name.
+is_plainmake() {
+	case "$1" in
+	xnedit) return 0 ;;
+	esac
+	return 1
+}
+
+# NetSurf and its libraries use the project's OWN build system: no configure,
+# no meson -- a set of shared makefiles (the "buildsystem" package) that every
+# component includes and drives with make variables.  By name for the same
+# reason as is_plainmake: a bare Makefile is present in nearly every package
+# and so detects nothing.
+is_nsbuild() {
+	case "$1" in
+	buildsystem | libwapcaplet | libparserutils | libhubbub | libcss | \
+		libdom | libnsutils | libnslog | libnsgif | libnsbmp | \
+		libnspsl | libnsfb | nsgenbind | netsurf)
+		return 0
+		;;
+	esac
+	return 1
 }
 
 # Packages that compile nothing and so need no cross toolchain: building them
@@ -359,7 +546,120 @@ build_one() {
 				-DCMAKE_BUILD_TYPE=Release \
 				$(cmake_opts "$name") &&
 				cmake --build .likeos-build -j"$(nproc)" &&
-				DESTDIR="$SYSROOT" cmake --install .likeos-build
+				DESTDIR="$SYSROOT" cmake --install .likeos-build &&
+				post_install "$name"
+		) >"$log" 2>&1
+	elif is_nsbuild "$name"; then
+		(
+			cd "$dir" || exit 1
+
+			# Where the shared makefiles live once `buildsystem` has
+			# been installed.  It has to be given explicitly: the
+			# components default NSSHARED to $(PREFIX)/share/..., and
+			# PREFIX is /usr here, which would point at the HOST's
+			# /usr instead of the sysroot.  This is a build-time
+			# include path, so it is an absolute host path -- unlike
+			# PREFIX, which is where things end up on the target.
+			nsshared="$SYSROOT/usr/share/netsurf-buildsystem"
+
+			if [ "$name" = buildsystem ]; then
+				# Copies makefiles into place; compiles nothing.
+				make install PREFIX=/usr DESTDIR="$SYSROOT" &&
+					post_install "$name"
+			elif [ "$name" = nsgenbind ]; then
+				# Built for the BUILD machine, so the host
+				# compiler and NO cross wrappers: this binary
+				# runs here, during netsurf's build, and would
+				# be useless as a LikeOS executable.
+				make -j"$(nproc)" \
+					PREFIX="$HOSTTOOLS" \
+					NSSHARED="$nsshared" &&
+					make install PREFIX="$HOSTTOOLS" \
+						NSSHARED="$nsshared"
+			elif [ "$name" = netsurf ]; then
+				# The browser, not a library.
+				#
+				# TARGET=framebuffer is the frontend that draws
+				# through libnsfb, whose X surface makes it an
+				# ordinary X client -- the GTK frontend would
+				# drag in GTK, which is not ported.
+				#
+				# JavaScript is ON.  The bindings between the
+				# bundled Duktape engine and the DOM are
+				# generated by nsgenbind, which is built just
+				# above for THIS machine and found on PATH.
+				PATH="$HOSTTOOLS/bin:$PATH" \
+				make TARGET=framebuffer -j"$(nproc)" \
+					PREFIX=/usr DESTDIR="$SYSROOT" \
+					NSSHARED="$nsshared" \
+					CC="$here/toolchain/likeos-cc" \
+					AR="ar" BUILD_CC=cc \
+					PKGCONFIG="$here/toolchain/likeos-pkg-config" \
+					PKG_CONFIG="$here/toolchain/likeos-pkg-config" &&
+					PATH="$HOSTTOOLS/bin:$PATH" \
+					make install TARGET=framebuffer \
+						PREFIX=/usr DESTDIR="$SYSROOT" \
+						NSSHARED="$nsshared" \
+						CC="$here/toolchain/likeos-cc" \
+						AR="ar" BUILD_CC=cc \
+						PKGCONFIG="$here/toolchain/likeos-pkg-config" \
+						PKG_CONFIG="$here/toolchain/likeos-pkg-config" &&
+					post_install "$name"
+			else
+				# Static libraries.  Nothing but netsurf links
+				# them, so a shared build would ship eleven
+				# libraries to the image for one consumer, and
+				# add eleven chances for a soname mismatch.
+				#
+				# CC/AR come from the command line so they win:
+				# Makefile.tools only assigns CC when its origin
+				# is `default`, and a command-line variable is
+				# never overridden by a makefile.
+				#
+				# PKGCONFIG is the name this build system uses --
+				# NOT PKG_CONFIG, which it ignores.  Its default
+				# is `PKG_CONFIG_PATH=$(PREFIX)/lib/pkgconfig
+				# pkg-config`, and PREFIX is /usr here, so the
+				# default asks the HOST about the HOST's
+				# libraries.  That does not fail loudly: feature
+				# detection just answers "no" and the component
+				# quietly builds without the feature.  It cost an
+				# entire libnsfb build -- every X surface was
+				# omitted because xcb-icccm and friends were
+				# looked for on the build machine.  Both spellings
+				# are passed so neither name can go stale.
+				make -j"$(nproc)" \
+					PREFIX=/usr DESTDIR="$SYSROOT" \
+					NSSHARED="$nsshared" \
+					COMPONENT_TYPE=lib-static \
+					CC="$here/toolchain/likeos-cc" \
+					AR="ar" \
+					PKGCONFIG="$here/toolchain/likeos-pkg-config" \
+					PKG_CONFIG="$here/toolchain/likeos-pkg-config" &&
+					make install \
+						PREFIX=/usr DESTDIR="$SYSROOT" \
+						NSSHARED="$nsshared" \
+						COMPONENT_TYPE=lib-static \
+						CC="$here/toolchain/likeos-cc" \
+						AR="ar" \
+						PKGCONFIG="$here/toolchain/likeos-pkg-config" \
+						PKG_CONFIG="$here/toolchain/likeos-pkg-config" &&
+					post_install "$name"
+			fi
+		) >"$log" 2>&1
+	elif is_plainmake "$name"; then
+		(
+			cd "$dir" || exit 1
+			# The platform target creates the Makefile.<platform>
+			# symlinks and then builds util/, Xlt/, Microline/ and
+			# source/ in order.  CC and PKG_CONFIG are passed on the
+			# command line, which overrides the arm's defaults and is
+			# inherited by every sub-make.
+			make likeos -j"$(nproc)" \
+				CC="$here/toolchain/likeos-cc" \
+				PKG_CONFIG="$here/toolchain/likeos-pkg-config" &&
+				make install DESTDIR="$SYSROOT" PREFIX=/usr &&
+				post_install "$name"
 		) >"$log" 2>&1
 	elif is_meson "$name" "$dir"; then
 		(
@@ -372,7 +672,8 @@ build_one() {
 				-Ddefault_library=shared \
 				$(meson_opts "$name") &&
 				DESTDIR="$SYSROOT" PATH="$here/toolchain:$PATH" \
-					meson install -C .likeos-build
+					meson install -C .likeos-build &&
+					post_install "$name"
 		) >"$log" 2>&1
 	elif is_noarch "$name"; then
 		(
@@ -407,6 +708,7 @@ build_one() {
 			# not.
 			[ -f Makefile ] && make distclean >/dev/null 2>&1
 			"$here/toolchain/likeos-autogen.sh" $(pkg_opts "$name") &&
+				host_tools "$name" &&
 				build_subdirs "$name" &&
 				post_install "$name"
 		) >"$log" 2>&1

@@ -82,9 +82,30 @@ ln -sfn Xorg "$DEST/usr/bin/X"
 # Listed by name rather than copied wholesale, because the sysroot's bin/ also
 # holds build tooling (ucs2any, bdftruncate) and host-side diagnostics.
 for b in startx xinit xauth xsetroot xterm uxterm resize ctwm \
-	 xset xrandr xclock twm; do
+	 xset xrandr xclock xload xcalc xnedit xnc twm; do
 	[ -f "$SYSROOT/usr/bin/$b" ] && cp "$SYSROOT/usr/bin/$b" "$DEST/usr/bin/$b"
 done
+
+# ---------------------------------------------------------------------------
+# NetSurf.
+#
+# Installed by its build as netsurf-fb -- "fb" being the frontend, which draws
+# through libnsfb.  That is an implementation detail from the user's side, and
+# libnsfb's X surface makes it an ordinary X client, so it ships under the name
+# people actually type.
+#
+# Its resources are NOT optional: the CSS files are the default stylesheet and
+# the quirks table, and Messages holds every string the interface displays.
+# Without them netsurf starts and renders nothing usefully.  The path is
+# compiled into the binary, so it has to be exactly /usr/share/netsurf.
+if [ -f "$SYSROOT/usr/bin/netsurf-fb" ]; then
+	cp "$SYSROOT/usr/bin/netsurf-fb" "$DEST/usr/bin/netsurf"
+	mkdir -p "$DEST/usr/share/netsurf"
+	cp -a "$SYSROOT/usr/share/netsurf/." "$DEST/usr/share/netsurf/"
+	# Our options file: window size and the start-up page.  Installed after
+	# the upstream resources so it is not overwritten by them.
+	cp "$root/res/xorg/netsurf-Choices" "$DEST/usr/share/netsurf/Choices"
+fi
 
 # ---------------------------------------------------------------------------
 # Session configuration.
@@ -157,6 +178,37 @@ for f in XErrorDB Xcms.txt; do
 done
 [ -d "$SYSROOT/usr/share/X11/locale" ] &&
 	cp -a "$SYSROOT/usr/share/X11/locale" "$DEST/usr/share/X11/locale"
+
+# ---------------------------------------------------------------------------
+# fontconfig.
+#
+# Its configuration is NOT optional.  Without /etc/fonts/fonts.conf, fontconfig
+# has no font directories to search and every client that renders text through
+# Xft -- Motif widgets, xnedit -- comes up with no usable font.  Nothing reports
+# an error: fontconfig simply matches nothing.
+#
+# conf.d holds the ordering and substitution rules (which family stands in for
+# another, hinting and antialias defaults).  fonts.conf names the font path this
+# build was configured with, /usr/share/fonts/X11/misc, which is where the .pcf
+# files staged above actually are.
+# ---------------------------------------------------------------------------
+if [ -f "$SYSROOT/etc/fonts/fonts.conf" ]; then
+	mkdir -p "$DEST/etc/fonts"
+	cp "$SYSROOT/etc/fonts/fonts.conf" "$DEST/etc/fonts/fonts.conf"
+	[ -d "$SYSROOT/etc/fonts/conf.d" ] &&
+		cp -a "$SYSROOT/etc/fonts/conf.d" "$DEST/etc/fonts/conf.d"
+	# fonts.conf names this cache directory.  Created here because
+	# fontconfig cannot create it itself, and without it every client
+	# rescans every font directory at startup.
+	mkdir -p "$DEST/var/cache/fontconfig"
+fi
+# The DTD fonts.conf declares.  fontconfig only validates against it when built
+# for it, but a missing DTD makes any hand edit of fonts.conf unverifiable.
+if [ -f "$SYSROOT/usr/share/xml/fontconfig/fonts.dtd" ]; then
+	mkdir -p "$DEST/usr/share/xml/fontconfig"
+	cp "$SYSROOT/usr/share/xml/fontconfig/fonts.dtd" \
+		"$DEST/usr/share/xml/fontconfig/fonts.dtd"
+fi
 
 # ---------------------------------------------------------------------------
 # Configuration.

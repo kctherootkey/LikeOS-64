@@ -790,12 +790,16 @@ static void task_init_common(task_t *t)
 	// process creation.
 	if (t->privilege == TASK_USER) {
 		task_t *creator = sched_current();
-		if (creator)
+		if (creator) {
 			t->cred = creator->cred; // inherit the spawning task
-		else
+			t->umask = creator->umask;
+		} else {
 			cred_init_root(&t->cred); // no creator yet (early boot)
+			t->umask = 0022;
+		}
 	} else {
 		cred_init_root(&t->cred); // privileged kernel context
+		t->umask = 0022;
 	}
 	for (int i = 0; i < TASK_MAX_FDS; i++)
 		t->fd_table[i] = NULL;
@@ -2195,6 +2199,23 @@ void sched_mark_task_exited(task_t *task, int status)
 
 	// Remove from thread group
 	thread_group_remove(task);
+
+	/* Advisory record locks belong to the PROCESS, so they must be gone the
+	 * moment it terminates -- NOT when its zombie is finally reaped.
+	 * waitpid() returns as soon as the child is a zombie, while reaping
+	 * happens later and asynchronously, so a parent that takes the lock
+	 * immediately after waitpid() was being refused by a lock whose owner
+	 * no longer existed.
+	 *
+	 * Keyed on tgid, and only once the LAST thread of the group has gone:
+	 * one thread exiting does not end the process that owns the locks.
+	 * (sched_remove_task still calls vfs_release_locks_for_task at reap for
+	 * the filesystem-level locks; releasing here is idempotent.) */
+	{
+		task_t *ldr = task->group_leader;
+		if (!ldr || ldr->nr_threads == 0)
+			frlock_release_for_task((uint32_t)task->tgid);
+	}
 
 	// CRITICAL: Do NOT release mm_struct here!  The PML4 owned by the
 	// mm_struct may still be loaded in this CPU's (or another CPU's) CR3.
@@ -3763,15 +3784,17 @@ void sched_calc_load(void)
 	while (t) {
 		if (!is_bootstrap_task(t) && !t->has_exited &&
 		    (t->state == TASK_READY || t->state == TASK_RUNNING)) {
-			// Skip idle tasks
-			int is_idle = 0;
-			if (g_smp_initialized) {
-				// Check if this is any CPU's idle task (check by comm)
-				if (t->comm[0] == 'i' && t->comm[1] == 'd' &&
-				    t->comm[2] == 'l' && t->comm[3] == 'e')
-					is_idle = 1;
-			}
-			if (!is_idle)
+			/* Skip idle tasks, by POINTER IDENTITY.
+			 *
+			 * This used to compare comm against "idle", but the
+			 * idle tasks are named "kernel idle/N" -- so the test
+			 * never matched and every CPU's idle task, which is
+			 * permanently TASK_RUNNING, counted as load.  On an
+			 * 8-CPU machine that pinned the load average near 8
+			 * while the system was doing nothing, which is what
+			 * xload drew.  The comm test was also skipped entirely
+			 * before SMP came up, counting idle even then. */
+			if (!is_idle_task(t))
 				nr_active++;
 		}
 		t = t->next;
@@ -3787,6 +3810,36 @@ void sched_calc_load(void)
 	g_loadavg[2] = calc_load(g_loadavg[2], LOADAVG_EXP_15,
 				 (unsigned long)nr_active);
 	spin_unlock_irqrestore(&g_loadavg_lock, flags);
+}
+
+/* The umask belongs to the PROCESS.  Both accessors resolve to the thread-group
+ * leader so that every thread of a process shares one mask: a thread calling
+ * umask() changes it for all of them, which is what a shared filesystem context
+ * means.  A task with no leader yet (the earliest boot tasks) answers for
+ * itself. */
+static inline task_t *task_umask_owner(task_t *t)
+{
+	if (!t)
+		return NULL;
+	return t->group_leader ? t->group_leader : t;
+}
+
+uint32_t task_umask(task_t *t)
+{
+	task_t *o = task_umask_owner(t);
+	return o ? (o->umask & 0777) : 0022u;
+}
+
+uint32_t task_set_umask(task_t *t, uint32_t mask)
+{
+	task_t *o = task_umask_owner(t);
+	uint32_t old;
+
+	if (!o)
+		return 0022u;
+	old = o->umask & 0777;
+	o->umask = mask & 0777;
+	return old;
 }
 
 void sched_get_loadavg(unsigned long loads[3])

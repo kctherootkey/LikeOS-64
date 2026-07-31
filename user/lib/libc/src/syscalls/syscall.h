@@ -199,6 +199,7 @@
 #define SYS_FLISTXATTR  397   /* (fd, list, size) */
 #define SYS_FREMOVEXATTR 398  /* (fd, name) */
 #define SYS_DEBUG_DUMP  399   /* () root-only: dump kernel diag tables to tty */
+#define SYS_UNLINKAT  405
 #define SYS_CHROOT      400   /* (path) root-only: confine path resolution to a subtree */
 
 // System V shared memory

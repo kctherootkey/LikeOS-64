@@ -6,15 +6,21 @@
 extern "C" {
 #endif
 
+/* The one function assert() expands to.
+ *
+ * Deliberately the ONLY name the macro mentions, and deliberately in the
+ * reserved __ namespace.  The macro used to expand to fprintf(stderr, ...) and
+ * abort() directly, which breaks in any scope where the program has its own
+ * object by one of those names -- a local `bool abort` is perfectly legal C and
+ * made every assert() in that function fail to compile. */
+void __assert_fail(const char *__expr, const char *__file, unsigned int __line,
+		   const char *__func) __attribute__((noreturn));
+
 #ifdef NDEBUG
 #  define assert(expr) ((void)0)
 #else
-#  include <stdio.h>
-#  include <stdlib.h>
 #  define assert(expr) \
-    ((expr) ? (void)0 \
-            : (fprintf(stderr, "Assertion failed: %s, file %s, line %d\n", \
-                       #expr, __FILE__, __LINE__), abort()))
+    ((expr) ? (void)0 : __assert_fail(#expr, __FILE__, __LINE__, __func__))
 #endif
 
 #ifdef __cplusplus

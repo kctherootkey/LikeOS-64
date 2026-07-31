@@ -394,6 +394,21 @@ typedef struct task {
 	// silently born root.  Enforcement consults cred.euid/egid/fsuid/etc.
 	cred_t cred;
 
+	/* File-mode creation mask.
+	 *
+	 * Per PROCESS, not per task and not global.  A global mask would let one
+	 * user's umask change the modes of files another user creates; a
+	 * per-task one would let two threads of the same process disagree about
+	 * it.  The value that counts is the thread-group leader's, reached
+	 * through task_umask()/task_set_umask(), so every thread of a process
+	 * shares one mask -- which is what a process-wide filesystem context
+	 * means.
+	 *
+	 * Inherited across fork/clone by the task-struct copy, and NOT reset by
+	 * execve: a shell that sets a mask expects the commands it runs to
+	 * inherit it. */
+	uint32_t umask;
+
 	// Job control / session
 	int pgid;
 	int sid;
@@ -746,6 +761,12 @@ void task_list_add(task_t *t);
 // LOAD AVERAGE AND SYSTEM STATISTICS
 // ============================================================================
 void sched_calc_load(void); // Update load averages (call from timer)
+/* The calling process's file-mode creation mask, and a setter returning the
+ * previous value.  Both resolve to the thread-group leader, so all threads of a
+ * process see one mask. */
+uint32_t task_umask(task_t *t);
+uint32_t task_set_umask(task_t *t, uint32_t mask);
+
 void sched_get_loadavg(
 	unsigned long
 		loads[3]); // Get 1/5/15 min load averages (<<16 fixed-point)

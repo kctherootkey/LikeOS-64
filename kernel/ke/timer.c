@@ -1098,14 +1098,41 @@ void timer_irq_handler(void)
 		// Feed entropy from timer jitter
 		entropy_add_timer_jitter();
 
+		/* Sample the load average BEFORE waking expired sleepers.
+		 *
+		 * Order matters, and getting it wrong made the load average
+		 * meaningless.  sched_calc_load() counts tasks in READY or
+		 * RUNNING; sched_wake_expired_sleepers() marks every sleeper
+		 * whose timer has expired READY.  Sampling right after that
+		 * pass, in the same tick, caught every one of them still
+		 * queued -- none had run yet.
+		 *
+		 * That is not a rare coincidence: poll/select park with a
+		 * one-tick timeout (poll_sleep_until_next_tick), so every task
+		 * waiting in poll expires on EVERY tick.  With an X session up
+		 * -- server, window manager, terminal, clock, xload -- that
+		 * pinned the count at the number of polling clients while the
+		 * CPUs sat 98% idle, because each one wakes, looks at its fds
+		 * for microseconds and parks again.
+		 *
+		 * Sampling first counts a task only if it was runnable at the
+		 * END of the previous tick, which is what the average is meant
+		 * to measure.  Tasks that stay runnable across ticks (the real
+		 * load) are still counted every time; tasks woken by I/O and
+		 * not yet run are still READY and still counted.
+		 *
+		 * The interval is 501 ticks rather than 500 for the same
+		 * reason the reference kernel uses 5*HZ+1: a period that
+		 * shares a factor with other periodic work samples the system
+		 * in lockstep with it, measuring the phase instead of the
+		 * load. */
+		if ((g_ticks % 501) == 0) {
+			sched_calc_load();
+		}
+
 		// Wake any tasks whose sleep timer has expired and check signal timers
 		// This handles alarm(), itimer, and wakes sleeping tasks
 		sched_wake_expired_sleepers(g_ticks);
-
-		// Update load averages every 500 ticks (~5 seconds at 100Hz)
-		if ((g_ticks % 500) == 0) {
-			sched_calc_load();
-		}
 
 		// Page cache: signal periodic dirty writeback
 		pagecache_timer_tick(g_ticks);

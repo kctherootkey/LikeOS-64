@@ -573,8 +573,6 @@ static void fd_release_entry(vfs_file_t *entry)
 static int64_t sys_getpid(void);
 static void sys_exit(uint64_t status);
 
-// Simple umask (global for now)
-static uint32_t g_umask = 0022;
 
 // Minimal uname struct (kernel-side)
 typedef struct {
@@ -970,9 +968,17 @@ static void strip_setid_file(vfs_file_t *file)
 static int64_t sys_dup(uint64_t oldfd);
 
 // SYS_OPEN - open a file
+/* The mode a create-style syscall should hand the filesystem: the requested
+ * permission bits minus the caller's umask, which is what POSIX specifies.
+ * Every path that creates a name goes through here so the mask cannot be
+ * applied in one place and forgotten in another. */
+static unsigned int creat_mode(task_t *cur, uint64_t mode)
+{
+	return (unsigned int)mode & 0777 & ~task_umask(cur) & 0777;
+}
+
 static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 {
-	(void)mode; // creation mode unused here; access mode comes from flags
 	might_sleep();
 	task_t *cur = sched_current();
 	BUG_ON(cur == NULL);
@@ -1016,13 +1022,19 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 		int pr = devfs_open_perm(cur, path, flags);
 		if (pr < 0)
 			return pr;
-		ret = devfs_open_for_task(path, (int)flags, &file, cur);
+		ret = devfs_open_for_task(path, (int)flags, creat_mode(cur, mode), &file, cur);
 		if (ret == ST_OK && file) {
 			file->refcount = 1;
 			file->flags = (int)flags;
 		}
 	} else {
-		ret = vfs_open(path, (int)flags, &file);
+		/* vfs_open_mode, not vfs_open: an O_CREAT open must create the
+		 * file with the mode the caller asked for.  Discarding it made
+		 * every created file 0644 -- so mkstemp(), which asks for 0600
+		 * precisely so its temporary file is private, produced a
+		 * world-readable one. */
+		ret = vfs_open_mode(path, (int)flags, creat_mode(cur, mode),
+				    &file);
 	}
 	if (ret != ST_OK || file == NULL) {
 		return vfs_status_to_errno(ret);
@@ -1051,7 +1063,6 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 static int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
 			  uint64_t mode)
 {
-	(void)mode;
 	task_t *cur = sched_current();
 	if (!cur)
 		return -EFAULT;
@@ -1096,13 +1107,15 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
 		int pr = devfs_open_perm(cur, full, flags);
 		if (pr < 0)
 			return pr;
-		ret = devfs_open_for_task(full, (int)flags, &file, cur);
+		ret = devfs_open_for_task(full, (int)flags, creat_mode(cur, mode), &file, cur);
 		if (ret == ST_OK && file) {
 			file->refcount = 1;
 			file->flags = (int)flags;
 		}
 	} else {
-		ret = vfs_open(full, (int)flags, &file);
+		/* Same as sys_open: the creation mode must reach the fs. */
+		ret = vfs_open_mode(full, (int)flags, creat_mode(cur, mode),
+				    &file);
 	}
 	if (ret != ST_OK || file == NULL) {
 		return vfs_status_to_errno(ret);
@@ -1163,6 +1176,18 @@ static int64_t sys_close(uint64_t fd)
 	 * object behind it is still being torn down — releasing can sleep
 	 * (vfs_close → pagecache flush), which is exactly the window in which
 	 * another thread's open() would claim the slot. */
+	/* Before detaching: POSIX releases this process's record locks on the
+	 * file when it closes ANY descriptor for it, even if others remain
+	 * open.  Done here, while the descriptor is still valid, because the
+	 * file's identity (dev/ino) is what the locks are keyed on. */
+	{
+		vfs_file_t *lf = task_fds(cur)[fd];
+		if (lf && !IS_SOCKET_FD(lf) && !IS_UNIX_SOCKET_FD(lf) &&
+		    !IS_EPOLL_FD(lf) && !pipe_is_end(lf) &&
+		    (uintptr_t)lf > 3)
+			frlock_release_for_file(lf, (uint32_t)cur->tgid);
+	}
+
 	uint64_t lflags = 0;
 	fds_lock(cur, &lflags);
 	vfs_file_t *file = task_fds(cur)[fd];
@@ -1719,6 +1744,49 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length);
  * release the segment through paths that already work, instead of needing
  * three new teardown hooks.
  */
+/* SysV IPC permission check, the reference algorithm.
+ *
+ * `flag` carries the requested access in its low nine bits, as the shm* calls
+ * define it.  Those are collapsed to one rwx triple, and compared against the
+ * triple that applies to this caller -- owner, group, or other.  Root passes
+ * regardless, as CAP_IPC_OWNER does there.
+ *
+ * Without this, shmget() on an existing key handed out an id no matter who
+ * owned the segment or what its mode said.
+ */
+static int ipc_perm_ok(const shm_object_t *o, task_t *cur, unsigned int flag)
+{
+	unsigned int requested, granted;
+
+	if (!o || !cur)
+		return 0;
+	if (cred_is_root(&cur->cred))
+		return 1;
+
+	requested = ((flag >> 6) | (flag >> 3) | flag) & 0007;
+	granted = o->mode & 0777;
+
+	if (cur->cred.euid == o->uid)
+		granted >>= 6;
+	else if (cred_in_group(&cur->cred, o->gid))
+		granted >>= 3;
+
+	return (requested & ~granted & 0007) == 0;
+}
+
+/* May this caller administer the segment (IPC_RMID / IPC_SET)?
+ *
+ * Ownership, not mode: the reference requires the effective uid to match the
+ * segment's owner or creator, or the caller to be privileged.  Mode bits do
+ * NOT grant this -- a world-writable segment is still only its owner's to
+ * destroy. */
+static int ipc_owner_ok(const shm_object_t *o, task_t *cur)
+{
+	if (!o || !cur)
+		return 0;
+	return cred_is_root(&cur->cred) || cur->cred.euid == o->uid;
+}
+
 static int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg)
 {
 	shm_object_t *o;
@@ -1729,6 +1797,7 @@ static int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg)
 	if (size > (unsigned long)SHM_MAX_PAGES * PAGE_SIZE)
 		return -EINVAL;
 
+	int existed = 0;
 	o = shm_sysv_get((int)key, size, create, excl, (unsigned)(shmflg & 0777),
 			 &id);
 	if (!o) {
@@ -1737,6 +1806,14 @@ static int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg)
 		if (!create)
 			return -ENOENT;
 		return -ENOSPC;
+	}
+	/* The segment pre-existed if this caller did not just create it: a
+	 * fresh one is owned by the caller and always passes the check below,
+	 * so testing unconditionally is both correct and simpler. */
+	(void)existed;
+	if (!ipc_perm_ok(o, sched_current(), (unsigned)(shmflg & 0777))) {
+		shm_put(o);
+		return -EACCES;
 	}
 	/* An existing segment smaller than requested cannot satisfy the call. */
 	if (size && o->size < size) {
@@ -1782,13 +1859,31 @@ static int64_t sys_shmat(uint64_t shmid, uint64_t shmaddr, uint64_t shmflg)
 
 	prot = PROT_READ | ((shmflg & SHM_RDONLY) ? 0 : PROT_WRITE);
 
+	/* Attaching needs read, and write unless SHM_RDONLY was asked for.
+	 * The vfs_open below enforces the same thing through the node's mode,
+	 * but only for the access it is opened with -- which is why the open
+	 * must match the request rather than always being O_RDWR. */
+	{
+		unsigned int want = (shmflg & SHM_RDONLY) ? 0444 : 0666;
+		shm_object_t *co = shm_by_id_get((int)shmid);
+		int ok = ipc_perm_ok(co, sched_current(), want);
+		if (co)
+			shm_put(co);
+		if (!ok)
+			return -EACCES;
+	}
+
 	/* Open the object and map it.  sys_mmap takes the descriptor route, so
 	 * install one, map through it, then drop it: the mapping keeps its own
 	 * reference on the file, exactly as an mmap after close would. */
 	{
 		vfs_file_t *f = NULL;
 		int fd;
-		if (vfs_open(path, O_RDWR, &f) != ST_OK || !f)
+		/* Opened to match the requested access.  It was always O_RDWR,
+		 * so a legitimate read-only attach to a segment the caller may
+		 * only read was refused by the VFS permission check. */
+		int oflags = (shmflg & SHM_RDONLY) ? O_RDONLY : O_RDWR;
+		if (vfs_open(path, oflags, &f) != ST_OK || !f)
 			return -EINVAL;
 		fd = fd_install(sched_current(), f);
 		if (fd < 0) {
@@ -1828,6 +1923,15 @@ static int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf)
 
 	switch (cmd) {
 	case IPC_RMID:
+		/* Only the owner (or root) may destroy a segment.  There was no
+		 * check at all: segment ids are small integers and trivially
+		 * enumerated, so any user could tear down any other user's
+		 * shared memory -- including the segments the X server and its
+		 * clients share through MIT-SHM. */
+		if (!ipc_owner_ok(o, sched_current())) {
+			shm_put(o);
+			return -EPERM;
+		}
 		/* Mark for destruction: the name goes now, the memory when the
 		 * last attachment does.  Creating a segment and removing it
 		 * straight away is the normal idiom — it is what stops one
@@ -1839,6 +1943,11 @@ static int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf)
 		break;
 	case IPC_STAT: {
 		struct k_shmid_ds ds;
+		/* Reading the metadata needs read access to the segment. */
+		if (!ipc_perm_ok(o, sched_current(), 0444)) {
+			shm_put(o);
+			return -EACCES;
+		}
 		if (!buf || !validate_user_ptr(buf, sizeof(ds))) {
 			rc = -EFAULT;
 			break;
@@ -1856,7 +1965,13 @@ static int64_t sys_shmctl(uint64_t shmid, uint64_t cmd, uint64_t buf)
 		break;
 	}
 	case IPC_SET:
-		/* Nothing here is adjustable after creation. */
+		/* Nothing here is adjustable after creation, but the ownership
+		 * rule still applies: reporting success to a caller who may not
+		 * administer the segment would be misleading. */
+		if (!ipc_owner_ok(o, sched_current())) {
+			shm_put(o);
+			return -EPERM;
+		}
 		rc = 0;
 		break;
 	default:
@@ -1943,10 +2058,14 @@ static int64_t sys_getcwd(uint64_t buf, uint64_t size)
 
 static int64_t sys_umask(uint64_t mask)
 {
-	uint32_t old = g_umask;
-	g_umask = (uint32_t)mask;
-	return old;
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+	/* The mask is process-wide: set it through the accessor so every thread
+	 * of this process sees the change. */
+	return (int64_t)task_set_umask(cur, (uint32_t)mask);
 }
+
 
 /* Real credential syscalls.  Operate on the current task's embedded
  * cred; the set*-id permission rules live in cred.c.  Enforcement of file
@@ -2276,6 +2395,29 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 		task_set_fd_flags(cur, (unsigned)fd,
 				  (uint8_t)((uint32_t)arg & FD_CLOEXEC));
 		return 0;
+	}
+
+	/* Advisory record locks.  Placed here, ahead of the per-descriptor-type
+	 * blocks, because locking is a property of the FILE and applies to any
+	 * descriptor that has one -- and because the marker descriptors below
+	 * (sockets, epoll, pipes) have no file to lock and must fall through to
+	 * their own handling rather than reach this. */
+	if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
+		vfs_file_t *lf = task_fds(cur)[fd];
+		if (!lf || IS_SOCKET_FD(lf) || IS_UNIX_SOCKET_FD(lf) ||
+		    IS_EPOLL_FD(lf) || pipe_is_end(lf) ||
+		    (uintptr_t)lf <= 3)
+			return -EBADF;
+		k_flock_t kfl;
+		if (!arg || !validate_user_ptr(arg, sizeof(kfl)))
+			return -EFAULT;
+		if (copy_from_user(&kfl, (void *)arg, sizeof(kfl)) != 0)
+			return -EFAULT;
+		int fr = frlock_fcntl(lf, (int)cmd, &kfl, cur);
+		if (fr == 0 && cmd == F_GETLK &&
+		    copy_to_user((void *)arg, &kfl, sizeof(kfl)) != 0)
+			return -EFAULT;
+		return fr;
 	}
 
 	/* F_DUPFD/F_DUPFD_CLOEXEC: duplicate onto the lowest free descriptor
@@ -2921,7 +3063,7 @@ static int64_t sys_rename(uint64_t oldpath, uint64_t newpath)
 
 static int64_t sys_mkdir(uint64_t pathname, uint64_t mode)
 {
-	(void)mode;
+	task_t *cur = sched_current();
 	if (!validate_user_ptr(pathname, 1))
 		return -EFAULT;
 
@@ -2935,7 +3077,10 @@ static int64_t sys_mkdir(uint64_t pathname, uint64_t mode)
 				   MAY_WRITE | MAY_EXEC); /* write the dir */
 	if (pr < 0)
 		return pr;
-	int st = vfs_mkdir(kpath, (unsigned int)mode);
+	/* umask applies to directories too; the raw mode was being passed
+	 * straight through, so `mkdir -m 700` and a default 0777 mkdir both
+	 * ignored the caller's mask. */
+	int st = vfs_mkdir(kpath, creat_mode(cur, mode));
 	if (st == ST_OK)
 		return 0;
 	if (st == ST_EXISTS)
@@ -2976,6 +3121,54 @@ static int64_t sys_rmdir(uint64_t pathname)
 		return -EIO;
 	return -EINVAL;
 }
+
+/* unlinkat(dirfd, path, flags) -- remove a name relative to a directory fd.
+ *
+ * One syscall covering both unlink() and rmdir(), which is how POSIX defines
+ * it: AT_REMOVEDIR selects the directory case.  Everything else -- the
+ * relative-path resolution against dirfd (and the caller's chroot), the
+ * parent write+search check and the sticky-bit rule -- is the same machinery
+ * the non-at versions use, so the two cannot drift apart in policy. */
+static int64_t sys_unlinkat(uint64_t dirfd, uint64_t pathname, uint64_t flags)
+{
+	task_t *cur = sched_current();
+	if (!cur)
+		return -EFAULT;
+	if (!validate_user_ptr(pathname, 1))
+		return -EFAULT;
+	/* Reject flags we do not implement rather than ignoring them: a caller
+	 * that passes one is asking for behaviour we would not deliver. */
+	if (flags & ~((uint64_t)AT_REMOVEDIR))
+		return -EINVAL;
+
+	char kpath[VFS_MAX_PATH];
+	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (cret != 0)
+		return cret;
+
+	char full[VFS_MAX_PATH];
+	int brest = build_at_path(cur, (int)dirfd, kpath, full, sizeof(full));
+	if (brest != 0)
+		return brest;
+
+	int pr = perm_check_remove(full);
+	if (pr < 0)
+		return pr;
+
+	int st = (flags & AT_REMOVEDIR) ? vfs_rmdir(full) : vfs_unlink(full);
+	if (st == ST_OK)
+		return 0;
+	if (st == ST_NOT_FOUND)
+		return -ENOENT;
+	if (st == ST_NOTEMPTY)
+		return -ENOTEMPTY;
+	if (st == ST_NOMEM)
+		return -ENOMEM;
+	if (st == ST_IO)
+		return -EIO;
+	return -EINVAL;
+}
+
 static int64_t sys_link(uint64_t oldpath, uint64_t newpath)
 {
 	char kold[VFS_MAX_PATH], knew[VFS_MAX_PATH];
@@ -3829,13 +4022,51 @@ static int apply_chroot(task_t *cur, char *abs, size_t out_size)
 static int build_at_path(task_t *cur, int dirfd, const char *path, char *out,
 			 size_t out_size)
 {
+	const char *base;
+
 	if (!cur || !path || !out || out_size < 2)
 		return -EINVAL;
-	if (dirfd != AT_FDCWD) {
-		return -ENOTDIR;
+
+	/* An ABSOLUTE path ignores dirfd entirely, as POSIX requires -- the
+	 * descriptor is not even required to be valid in that case. */
+	if (path[0] == '/' || dirfd == AT_FDCWD) {
+		base = (cur->cwd[0] != 0) ? cur->cwd : "/";
+	} else {
+		/* Relative to the directory the descriptor refers to.
+		 *
+		 * This used to return ENOTDIR for every dirfd that was not
+		 * AT_FDCWD, which meant the whole *at() family silently did
+		 * not work: openat(), fstatat(), faccessat() and unlinkat()
+		 * all fail the moment a caller passes a real descriptor, which
+		 * is the entire reason those calls exist. */
+		vfs_file_t *df;
+
+		if (dirfd < 0 || dirfd >= (int)TASK_MAX_FDS)
+			return -EBADF;
+		df = task_fds(cur)[dirfd];
+		if (!df)
+			return -EBADF;
+		/* The marker descriptors (sockets, epoll, pipes, the console)
+		 * are not files and have no path; a directory is required. */
+		if (IS_SOCKET_FD(df) || IS_UNIX_SOCKET_FD(df) ||
+		    IS_EPOLL_FD(df) || pipe_is_end(df) || (uintptr_t)df <= 3)
+			return -ENOTDIR;
+		if (!df->at_path)
+			return -ENOTDIR;
+		/* It must really be a directory: resolving "file" against a
+		 * regular file would otherwise invent a path that looks valid
+		 * and refers to nothing. */
+		{
+			struct kstat dst;
+			if (vfs_fstat(df, &dst) != ST_OK)
+				return -ENOTDIR;
+			if (!S_ISDIR(dst.st_mode))
+				return -ENOTDIR;
+		}
+		base = df->at_path;
 	}
-	const char *cwd = (cur->cwd[0] != 0) ? cur->cwd : "/";
-	int r = normalize_path(cwd, path, out, out_size);
+
+	int r = normalize_path(base, path, out, out_size);
 	if (r != 0)
 		return r;
 	return apply_chroot(cur, out, out_size);
@@ -7990,6 +8221,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		return sys_chown(a1, a2, a3);
 	case SYS_OPENAT:
 		return sys_openat(a1, a2, a3, a4);
+	case SYS_UNLINKAT:
+		return sys_unlinkat(a1, a2, a3);
 	case SYS_FSTATAT:
 		return sys_fstatat(a1, a2, a3, a4);
 	case SYS_FACCESSAT:

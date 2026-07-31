@@ -69,6 +69,42 @@ if [ -x /usr/bin/xclock ]; then
 	       -geometry 60x52+0+0 &
 fi
 
+# Load-average graph, immediately right of the clock and before the taskbar
+# (which system.ctwmrc starts at +168 to leave room for both).
+#
+# Same colours as the rest of the bar, and for the same reason they are on the
+# command line rather than in Xresources: an option cannot be outranked by a
+# tighter resource binding.  -update 2 is a two-second sample; the default of 10
+# makes the graph look frozen.
+#
+# -scale is the number of divisions the graph is drawn against, and it decides
+# what "full height" MEANS.  xload plots the 1-minute load average -- the
+# number of runnable tasks -- and the default scale of 1 makes a full-height
+# graph mean ONE task runnable, i.e. one core busy.  On a multi-core machine
+# that reads alarmingly: an idle desktop with a load of 0.6 fills 60% of the
+# graph while the CPUs are 95% idle, because 0.6 of one core IS most of one
+# core -- it is just a small share of the machine.
+#
+# Scaling by the processor count makes full height mean "every core busy", so
+# the graph tracks what top reports.  Taken from nproc rather than hardcoded,
+# because this image boots on machines with different core counts.
+if [ -x /usr/bin/xload ]; then
+	_ncpu=1
+	# /bin, not /usr/bin: the X clients live in /usr/bin but the LikeOS
+	# tools are in /bin, and they are separate directories here.
+	if [ -x /bin/nproc ]; then
+		_ncpu=$(/bin/nproc 2>/dev/null) || _ncpu=1
+	fi
+	case "$_ncpu" in
+	''|*[!0-9]*) _ncpu=1 ;;
+	esac
+	[ "$_ncpu" -lt 1 ] && _ncpu=1
+	xload -update 2 -nolabel -scale "$_ncpu" \
+	      -background "#c6c6c6" -foreground black -borderwidth 0 \
+	      -geometry 100x52+64+0 &
+	unset _ncpu
+fi
+
 # No terminal is started here on purpose.  Use "New xterm" on the root menu
 # (button 1 on the background) to open one.  Starting clients from this script
 # only obscures which of them failed and why.

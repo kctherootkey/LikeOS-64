@@ -8,6 +8,7 @@
 #include <sys/utsname.h>
 #include <time.h>
 #include <sys/times.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
@@ -30,8 +31,18 @@ int errno = 0;
 
 int open(const char *pathname, int flags, ...)
 {
-	// mode argument ignored for now (no create support yet)
-	long ret = syscall3(SYS_OPEN, (long)pathname, flags, 0);
+	/* The creation mode has to be forwarded.  It was hardcoded to 0 with a
+	 * comment about there being no create support -- but O_CREAT does work,
+	 * so every file created through open() ignored the mode the caller
+	 * asked for.  mkstemp() passes 0600 for privacy and got none of it. */
+	long mode = 0;
+	if (flags & O_CREAT) {
+		va_list ap;
+		va_start(ap, flags);
+		mode = va_arg(ap, long);
+		va_end(ap);
+	}
+	long ret = syscall3(SYS_OPEN, (long)pathname, flags, mode);
 	if (ret < 0) {
 		errno = -ret;
 		return -1;
@@ -41,7 +52,14 @@ int open(const char *pathname, int flags, ...)
 
 int openat(int dirfd, const char *pathname, int flags, ...)
 {
-	long ret = syscall4(SYS_OPENAT, dirfd, (long)pathname, flags, 0);
+	long mode = 0;
+	if (flags & O_CREAT) {
+		va_list ap;
+		va_start(ap, flags);
+		mode = va_arg(ap, long);
+		va_end(ap);
+	}
+	long ret = syscall4(SYS_OPENAT, dirfd, (long)pathname, flags, mode);
 	if (ret < 0) {
 		errno = -ret;
 		return -1;
@@ -653,14 +671,25 @@ int setpriority(int which, id_t who, int prio)
 
 int fcntl(int fd, int cmd, ...)
 {
-	long arg = 0;
-	if (cmd == F_SETFL || cmd == F_SETFD || cmd == F_DUPFD ||
-	    cmd == F_DUPFD_CLOEXEC) {
-		va_list ap;
-		va_start(ap, cmd);
-		arg = va_arg(ap, long);
-		va_end(ap);
-	}
+	long arg;
+	va_list ap;
+
+	/* The third argument is fetched for EVERY command, not for a list of
+	 * the ones known to take one.
+	 *
+	 * That list is a trap: it silently passes zero for any command missing
+	 * from it, so a command whose argument is a POINTER gets NULL and the
+	 * call fails with EFAULT -- which looks like a bad address from the
+	 * caller rather than a libc that dropped the argument.  The record
+	 * locking commands (F_GETLK/F_SETLK/F_SETLKW) were exactly that case.
+	 *
+	 * Reading an argument a caller did not pass is harmless in this ABI --
+	 * va_arg just reads the next register slot, and commands that take none
+	 * ignore the value -- and it is what a production libc does. */
+	va_start(ap, cmd);
+	arg = va_arg(ap, long);
+	va_end(ap);
+
 	long ret = syscall3(SYS_FCNTL, fd, cmd, arg);
 	if (ret < 0) {
 		errno = -ret;
@@ -887,6 +916,22 @@ int unlink(const char *path)
 		return -1;
 	}
 	return 0;
+}
+
+/* unlinkat(): remove a name relative to a directory descriptor.
+ *
+ * With AT_REMOVEDIR it removes a directory, which is how POSIX folds rmdir()
+ * into the same call.  One syscall serves both; the kernel applies the same
+ * parent write+search and sticky-bit rules as unlink() and rmdir(), so the two
+ * spellings cannot drift apart about what is permitted. */
+int unlinkat(int dirfd, const char *pathname, int flags)
+{
+	long ret = syscall3(SYS_UNLINKAT, dirfd, (long)pathname, flags);
+	if (ret < 0) {
+		errno = -ret;
+		return -1;
+	}
+	return (int)ret;
 }
 
 int rename(const char *oldpath, const char *newpath)
@@ -1148,6 +1193,25 @@ long sysconf(int name)
 		return 256;
 	case _SC_CLK_TCK:
 		return 100;
+	case _SC_NPROCESSORS_CONF:
+	case _SC_NPROCESSORS_ONLN: {
+		/* Derived from the default scheduling affinity mask, which the
+		 * kernel fills with one bit per online CPU when a task has set
+		 * no affinity of its own.  That is how this is done without a
+		 * dedicated syscall, and malloc() already counts arenas the
+		 * same way.
+		 *
+		 * CONF and ONLN answer the same here: CPUs are never taken
+		 * offline at runtime, so "configured" and "online" cannot
+		 * differ. */
+		cpu_set_t set;
+		int n;
+		memset(&set, 0, sizeof(set));
+		if (sched_getaffinity(0, sizeof(set), &set) != 0)
+			return 1; /* never report 0: callers size arrays by this */
+		n = CPU_COUNT(&set);
+		return n > 0 ? n : 1;
+	}
 	default:
 		errno = EINVAL;
 		return -1;
@@ -1245,14 +1309,15 @@ int getdtablesize(void)
 	return OPEN_MAX;
 }
 
-/* umask: file-mode creation mask. We don't track per-process state in
- * the kernel today, so just store and return the previous value. */
-static mode_t _current_umask = 022;
+/* umask: file-mode creation mask.
+ *
+ * This used to be a libc-private variable that nothing ever read, so umask()
+ * changed no file's mode: the mask has to be the KERNEL's, because the kernel
+ * is what applies it when a file is created.  It is per-process there and
+ * inherited across fork, so the value also survives into children. */
 mode_t umask(mode_t mask)
 {
-	mode_t prev = _current_umask;
-	_current_umask = mask & 0777;
-	return prev;
+	return (mode_t)syscall1(SYS_UMASK, mask & 0777);
 }
 
 /* ttyname: walk /dev/pts and /dev to find the path of fd's tty.

@@ -1,0 +1,258 @@
+XNEDIT(1)                        User Commands                       XNEDIT(1)
+
+NAME
+       XNEdit - Text Editor
+
+SYNOPSYS
+       xnedit [-read] [-create] [-line n | +n] [-server]
+             [-do command] [-tags file] [-tabs n]
+             [-wrap] [-nowrap] [-autowrap]
+             [-autoindent] [-noautoindent]
+             [-autosave] [-noautosave]
+             [-lm languagemode] [-rows n] [-columns n]
+             [-font font]
+             [-geometry|-g geometry] [-iconic] [-noiconic]
+             [-display [host]:server[.screen]]
+             [-xrm resourcestring]
+             [-svrname name] [-import file]
+             [-background|-bg color] [-foreground|-fg color]
+             [-tabbed] [-untabbed] [-group]
+             [-V|-version] [-h|-help] [--] [file...]
+
+DESCRIPTION
+       XNEdit is a standard GUI (Graphical User Interface) style text editor
+       for programs and plain-text files. It provides mouse based editing and
+       a streamlined editing style, based on popular Macintosh and MS Windows
+       editors, for users of X workstations and X terminals.
+
+OPTIONS
+       -read
+           Open the file read-only regardless of the actual file protection.
+
+       -create
+           Don't warn about file creation when a file doesn't exist.
+
+       -line n, +n
+           Go to line number n.
+
+       -server
+           Designate this session as an XNEdit server, for processing commands
+           from  the  nc(1)  program. nc(1) can be used to interface XNEdit to
+           code development environments, mailers, etc., or just  as  a  quick
+           way  to  open  files from the shell command line without starting a
+           new XNEdit session.
+
+       -do command
+           Execute an XNEdit macro or action on the  file  following  the  -do
+           argument  on  the command line. -do is particularly useful from the
+           nc(1) program, where `nc -do' can remotely execute commands  in  an
+           xnedit -server session.
+
+       -tags file
+           Load  a  file  of  directions  for  finding  definitions of program
+           subroutines and data objects.  The  file  must  be  of  the  format
+           generated  by  Exuberant  Ctags,  or  the  standard  Unix  ctags(1)
+           command.
+
+       -tabs n
+           Set tab stops every n characters.
+
+       -wrap, -nowrap
+           Wrap long lines at  the  right  edge  of  the  window  rather  than
+           continuing them past it. (Continuous Wrap mode)
+
+       -autowrap, -noautowrap
+           Wrap  long  lines  when  the  cursor  reaches the right edge of the
+           window by inserting newlines at word boundaries. (Auto Newline Wrap
+           mode)
+
+       -autoindent, -noautoindent
+           Maintain a running indent.
+
+       -autosave, -noautosave
+           Maintain a backup copy of the file  being  edited  under  the  name
+           ~filename (on Unix) or _filename (on VMS).
+
+       -lm languagemode
+           Initial language mode used for editing succeeding files.
+
+       -rows n
+           Default height in characters for an editing window.
+
+       -columns n
+           Default width in characters for an editing window.
+
+       -font font, -fn font
+           Font  for  text being edited. Font for menus and dialogs can be set
+           with -xrm "*fontList:font".
+
+       -geometry geometry, -g geometry
+           The initial size and/or location of editor  windows.  The  argument
+           geometry has the form:
+
+             [<width>x<height>][+|-][<xoffset>[+|-]<yoffset>]
+
+           where C`<width>' and "<height>" are the desired width and height of
+           the  window,  and  <xoffset> and C`<yoffset>' are the distance from
+           the edge of the screen to the window, + for  top  or  left,  -  for
+           bottom or right. -geometry can be specified for individual files on
+           the command line.
+
+       -iconic, -noiconic
+           Initial window state for succeeding files.
+
+       -display [host]:server[.screen]
+           The name of the X server to use. host specifies the machine, server
+           specifies  the  display  server  number,  and  screen specifies the
+           screen number.  host or screen can be omitted and  default  to  the
+           local machine, and screen 0.
+
+       -background color, -bg color
+           Background  color.  The  background  color  for  text  can  be  set
+           separately with -xrm "nedit*text.background: color".
+
+       -foreground color, -fg color
+           Foreground  color.  The  foreground  color  for  text  can  be  set
+           separately with -xrm "nedit*text.foreground: color".
+
+       -xrm resourcestring
+           Set the value of an X resource to override a default value.
+
+       -svrname name
+           When  starting xnedit in server mode, name the server, such that it
+           responds to requests only  when  nc(1)  is  given  a  corresponding
+           -svrname   argument.   By  naming  servers,  you  can  run  several
+           simultaneously, and direct files and commands specifically  to  any
+           one.  Specifying  a  non-empty  name  automatically designates this
+           session as an XNEdit server, as though -server were specified.
+
+       -import file
+           Loads an  additional  preferences  file  on  top  of  the  existing
+           defaults  saved  in  your  nedit.rc  file.   To incorporate macros,
+           language modes, and highlight patterns and styles written by  other
+           users,  run  xnedit with -import <file>, then re-save your nedit.rc
+           file with Preferences->Save Defaults.
+
+       -tabbed
+           Open all subsequent files in new tabs. Resets -group option.
+
+       -untabbed
+           Open all subsequent files in new windows. Resets -group option.
+
+       -group
+           Open all subsequent files as tabs in a new window.
+
+       -V, -version
+           Prints  version  and  build  information,  to  be  mentioned   when
+           reporting bugs and problems.
+
+       -h, -help
+           Prints the command line help and then exits.
+
+       --  Treats  all  subsequent arguments as file names, even if they start
+           with a dash.  This is so XNEdit can access files  that  begin  with
+           the dash character.
+
+ENVIRONMENT
+       DISPLAY
+           XNEdit  requires  an X-based workstation or X-Terminal. If you have
+           used  telnet or rlogin to access the host Unix system, set the Unix
+           environment variable for your display:
+
+           csh-type shells:
+
+              % setenv DISPLAY devicename:0
+
+           sh-type shells:
+
+              % DISPLAY=devicename:0 && export DISPLAY
+
+       NEDIT_HOME
+           This environment variable can be set to the name  of  a  directory.
+           This  directory will then be used instead of `$HOME/.xnedit' as the
+           base directory for  XNEdit's  special  files  (see  section  FILES,
+           below).
+
+FILES
+       XNEdit creates a directory in which XNEdit's special files reside. This
+       directory is named '.xnedit' by default.
+
+       nedit.rc
+           This  is  an  X resource file which contains most user settings for
+           XNEdit. It is read at startup and written  by  selecting  the  item
+           'Save  Defaults...'  in the Preferences menu. Do not edit this file
+           by hand, all settings can be reached  via  the  'Default  Settings'
+           menu.
+
+       nedit.history
+           The list of recently opened files. Do not edit this file by hand.
+
+       autoload.nm
+           A  file  that  can  contain  a  number  of  XNEdit  Macro  Language
+           statements and  subroutine  definitions.  The  statements  will  be
+           executed  when  an  XNEdit  server  starts, the subroutines will be
+           loaded for later reference.  This  file  will  not  be  created  or
+           modified by XNEdit (unless you load it and edit it of course).
+
+       Note  that  NEdit still supports the older names for these files, which
+       were  used  by  version  5.3  and   below.   These   file   names   are
+       `$HOME/.nedit', `$HOME/.neditdb' and `$HOME/.neditmacro', respectively.
+       The old naming scheme will be used if NEdit detects that `$HOME/.nedit'
+       is a regular file and NEDIT_HOME isn't set.
+
+       See also the entry for NEDIT_HOME under ENVIRONMENT, above.
+
+NOTES
+       For  more  information  see  XNEdit's online help, or xnedit.txt in the
+       XNEdit distribution kit.
+
+       XNEdit sources, executables, additional documentation, and  contributed
+       software    are    available    from    the    XNEdit   web   site   at
+       https://unixwork.de/xnedit/
+
+SEE ALSO
+       nc(1), X(1), mwm(1), ctags(1), etags(1)
+
+AUTHORS
+       XNEdit was written by Olaf  Winterman,  Mark  Edel,  Joy  Kyriakopulos,
+       Christopher  Conrad, Jim Clark, Arnulfo Zepeda-Navratil, Suresh Ravoor,
+       Tony Balinski, Max Vohlken, Yunliang Yu, Donna Reid, Arne Forlie,  Eddy
+       De Greef, Steve LoBasso, Alexander Mai, Scott Tringali, Thorsten Haude,
+       Steve Haehn, Andrew Hood, Nathaniel Gray and TK Soh.
+
+       The  regular  expression  matching  routines used in XNEdit are adapted
+       (with permission) from original code written by Henry  Spencer  at  the
+       University of Toronto.
+
+       Syntax  highlighting  patterns and smart indent macros were contributed
+       by: Simon T. MacDonald,  Maurice Leysens, Matt  Majka,  Alfred  Smeenk,
+       Alain  Fargues,  Christopher Conrad, Scott Markinson, Konrad Bernloehr,
+       Ivan Herman, Patrice Venant,  Christian  Denat,  Philippe  Couton,  Max
+       Vohlken,  Markus Schwarzenberg, Himanshu Gohel, Steven C. Kapp, Michael
+       Turomsha, John Fieber, Chris Ross, Nathaniel Gray, Joachim  Lous,  Mike
+       Duigou,  Seak  Teng-Fong,  Joor  Loohuis,  Mark Jones, and Niek van den
+       Berg.
+
+COPYRIGHT
+       This program is free software; you can redistribute it and/or modify it
+       under the terms of the GNU General Public License as published  by  the
+       Free  Software Foundation; either version 2 of the License, or (at your
+       option) any later version.
+
+       In addition, as a special exception  to  the  GNU  GPL,  the  copyright
+       holders give permission to link the code of this program with the Motif
+       and  Open  Motif libraries (or with modified versions of these that use
+       the same license), and distribute  linked  combinations  including  the
+       two.  You  must obey the GNU General Public License in all respects for
+       all of the code used other than linking with Motif/Open Motif.  If  you
+       modify  this file, you may extend this exception to your version of the
+       file, but you are not obligated to do so. If you do not wish to do  so,
+       delete this exception statement from your version.
+
+       This  program  is  distributed  in the hope that it will be useful, but
+       WITHOUT  ANY  WARRANTY;  without   even   the   implied   warranty   of
+       MERCHANTABILITY  or  FITNESS  FOR  A  PARTICULAR  PURPOSE.  See the GNU
+       General Public License in the Help section  "Distribution  Policy"  for
+       more details.
+
+perl v5.38.2                      2025-03-21                         XNEDIT(1)

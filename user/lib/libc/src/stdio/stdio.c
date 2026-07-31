@@ -684,32 +684,48 @@ static int num_to_str(long long num, char *buf, int base, int uppercase)
 	return len;
 }
 
-int vsnprintf(char *str, size_t size, const char *format, va_list ap)
-{
-	/* C99: when str is NULL or size is 0, return the number of characters
-     * that would have been written (excluding the terminating NUL) had the
-     * buffer been large enough.  asprintf/vasprintf depend on this two-pass
-     * sizing behaviour. */
-	if (!str || size == 0) {
-		char tmpbuf[8192];
-		va_list ap2;
-		va_copy(ap2, ap);
-		int n = vsnprintf(tmpbuf, sizeof(tmpbuf), format, ap2);
-		va_end(ap2);
-		return n;
-	}
-	size_t pos = 0;
+/* Store one character if it fits, and count it either way.
+ *
+ * The argument is evaluated EXACTLY ONCE, and unconditionally.  Call sites pass
+ * expressions with side effects -- SP_PUT(*format++) is the main loop's way of
+ * consuming a literal character -- so evaluating it only when the character
+ * fits would stop advancing the format string as soon as the buffer filled,
+ * and the loop would never end. */
+#define SP_PUT(c)                                  \
+	do {                                       \
+		char sp_c_ = (char)(c);            \
+		if (pos < cap)                     \
+			str[pos] = sp_c_;          \
+		pos++;                             \
+	} while (0)
 
-	while (*format && pos < size - 1) {
+/* The formatter.
+ *
+ * `pos` counts every character the format PRODUCES, whether or not it fits.
+ * Only the first `size - 1` are stored.  That distinction is the whole of C99's
+ * contract for snprintf: the return value is the length the output would have
+ * had, which is what lets a caller detect truncation and size a buffer.
+ *
+ * It used to return the truncated length instead, so
+ *     if (snprintf(buf, sizeof buf, ...) >= (int)sizeof buf)
+ * -- the standard truncation check -- could never fire, and a caller sizing a
+ * buffer from the return value silently under-allocated. */
+static int vsnprintf_body(char *str, size_t size, const char *format,
+			  va_list ap)
+{
+	size_t pos = 0;
+	const size_t cap = size - 1; /* size >= 1 is guaranteed by the caller */
+
+	while (*format) {
 		if (*format != '%') {
-			str[pos++] = *format++;
+			SP_PUT(*format++);
 			continue;
 		}
 		format++; /* skip '%' */
 
 		/* %% */
 		if (*format == '%') {
-			str[pos++] = '%';
+			SP_PUT('%');
 			format++;
 			continue;
 		}
@@ -775,6 +791,11 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 
 		/* --- Length modifiers --- */
 		int lng = 0; /* 1 = long, 2 = long long */
+		/* 1 = h (short), 2 = hh (char).  Default argument promotion
+		 * passes both as int, so the value has to be narrowed back
+		 * here.  The modifiers were parsed and then ignored, so
+		 * printf("%hhd", 300) printed 300 instead of 44. */
+		int sht = 0;
 		int ldbl = 0; /* 'L' = long double argument */
 		if (*format == 'l') {
 			format++;
@@ -788,8 +809,11 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 			lng = 2;
 		} else if (*format == 'h') {
 			format++;
-			if (*format == 'h')
+			sht = 1;
+			if (*format == 'h') {
 				format++;
+				sht = 2;
+			}
 		} else if (*format == 'L') {
 			/* long double.  It MUST be consumed as a long double
 			 * (16 bytes here, not 8) or every later argument is
@@ -814,6 +838,10 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 				val = va_arg(ap, long);
 			else
 				val = va_arg(ap, int);
+			if (sht == 1)
+				val = (short)val;
+			else if (sht == 2)
+				val = (signed char)val;
 
 			char sign = 0;
 			unsigned long long uval;
@@ -830,22 +858,39 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 
 			len = num_to_str((long long)uval, buf, 10, 0);
 
-			int total = len + (sign ? 1 : 0);
+			/* C99 integer precision: at least `prec` digits,
+			 * zero-filled on the left.  A precision of 0 with a
+			 * value of 0 produces NO digits at all, and an explicit
+			 * precision makes the '0' flag inoperative.  None of
+			 * this was implemented -- prec was read and then used
+			 * only by %s and the float conversions. */
+			int zeros = 0;
+			if (prec >= 0) {
+				if (prec == 0 && uval == 0)
+					len = 0;
+				if (prec > len)
+					zeros = prec - len;
+			}
+			int zpad = fl_zero && prec < 0;
+
+			int total = len + zeros + (sign ? 1 : 0);
 			int pad = (width > total) ? width - total : 0;
 
-			if (!fl_minus && !fl_zero)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
-			if (sign && pos < size - 1)
-				str[pos++] = sign;
-			if (!fl_minus && fl_zero)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = '0';
-			for (int i = 0; i < len && pos < size - 1; i++)
-				str[pos++] = buf[i];
+			if (!fl_minus && !zpad)
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
+			if (sign)
+				SP_PUT(sign);
+			if (!fl_minus && zpad)
+				for (int p = 0; p < pad; p++)
+					SP_PUT('0');
+			for (int z = 0; z < zeros; z++)
+				SP_PUT('0');
+			for (int i = 0; i < len; i++)
+				SP_PUT(buf[i]);
 			if (fl_minus)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
 
 			format++;
 			continue;
@@ -860,20 +905,42 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 				val = va_arg(ap, unsigned long);
 			else
 				val = va_arg(ap, unsigned int);
+			if (sht == 1)
+				val = (unsigned short)val;
+			else if (sht == 2)
+				val = (unsigned char)val;
 
 			len = num_to_str((long long)val, buf, 10, 0);
 
-			int pad = (width > len) ? width - len : 0;
-			if (!fl_minus) {
-				char pc = fl_zero ? '0' : ' ';
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = pc;
+			/* C99 integer precision: at least `prec` digits,
+			 * zero-filled on the left.  A precision of 0 with a
+			 * value of 0 produces NO digits at all, and an explicit
+			 * precision makes the '0' flag inoperative.  None of
+			 * this was implemented -- prec was read and then used
+			 * only by %s and the float conversions. */
+			int zeros = 0;
+			if (prec >= 0) {
+				if (prec == 0 && val == 0)
+					len = 0;
+				if (prec > len)
+					zeros = prec - len;
 			}
-			for (int i = 0; i < len && pos < size - 1; i++)
-				str[pos++] = buf[i];
+			int zpad = fl_zero && prec < 0;
+
+			int total = len + zeros;
+			int pad = (width > total) ? width - total : 0;
+			if (!fl_minus) {
+				char pc = zpad ? '0' : ' ';
+				for (int p = 0; p < pad; p++)
+					SP_PUT(pc);
+			}
+			for (int z = 0; z < zeros; z++)
+				SP_PUT('0');
+			for (int i = 0; i < len; i++)
+				SP_PUT(buf[i]);
 			if (fl_minus)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
 
 			format++;
 			continue;
@@ -889,56 +956,63 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 				val = va_arg(ap, unsigned long);
 			else
 				val = va_arg(ap, unsigned int);
+			if (sht == 1)
+				val = (unsigned short)val;
+			else if (sht == 2)
+				val = (unsigned char)val;
 
 			len = num_to_str((long long)val, buf, 16,
 					 *format == 'X');
+			/* C99 integer precision: at least `prec` digits,
+			 * zero-filled on the left.  A precision of 0 with a
+			 * value of 0 produces NO digits at all, and an explicit
+			 * precision makes the '0' flag inoperative.  None of
+			 * this was implemented -- prec was read and then used
+			 * only by %s and the float conversions. */
+			int zeros = 0;
+			if (prec >= 0) {
+				if (prec == 0 && val == 0)
+					len = 0;
+				if (prec > len)
+					zeros = prec - len;
+			}
+			int zpad = fl_zero && prec < 0;
+
 			int pfx = (fl_hash && val != 0) ? 2 : 0;
-			int total = len + pfx;
+			int total = len + zeros + pfx;
 			int pad = (width > total) ? width - total : 0;
 
 			if (!fl_minus) {
-				if (fl_zero) {
+				if (zpad) {
 					if (pfx) {
-						if (pos < size - 1)
-							str[pos++] = '0';
-						if (pos < size - 1)
-							str[pos++] =
-								(*format == 'X' ?
-									 'X' :
-									 'x');
+						SP_PUT('0');
+						SP_PUT((*format == 'X' ? 'X' : 'x'));
 					}
 					for (int p = 0;
-					     p < pad && pos < size - 1; p++)
-						str[pos++] = '0';
+					     p < pad; p++)
+						SP_PUT('0');
 				} else {
 					for (int p = 0;
-					     p < pad && pos < size - 1; p++)
-						str[pos++] = ' ';
+					     p < pad; p++)
+						SP_PUT(' ');
 					if (pfx) {
-						if (pos < size - 1)
-							str[pos++] = '0';
-						if (pos < size - 1)
-							str[pos++] =
-								(*format == 'X' ?
-									 'X' :
-									 'x');
+						SP_PUT('0');
+						SP_PUT((*format == 'X' ? 'X' : 'x'));
 					}
 				}
 			} else {
 				if (pfx) {
-					if (pos < size - 1)
-						str[pos++] = '0';
-					if (pos < size - 1)
-						str[pos++] =
-							(*format == 'X' ? 'X' :
-									  'x');
+					SP_PUT('0');
+					SP_PUT((*format == 'X' ? 'X' : 'x'));
 				}
 			}
-			for (int i = 0; i < len && pos < size - 1; i++)
-				str[pos++] = buf[i];
+			for (int z = 0; z < zeros; z++)
+				SP_PUT('0');
+			for (int i = 0; i < len; i++)
+				SP_PUT(buf[i]);
 			if (fl_minus)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
 
 			format++;
 			continue;
@@ -953,20 +1027,47 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 				val = va_arg(ap, unsigned long);
 			else
 				val = va_arg(ap, unsigned int);
+			if (sht == 1)
+				val = (unsigned short)val;
+			else if (sht == 2)
+				val = (unsigned char)val;
 
 			len = num_to_str((long long)val, buf, 8, 0);
 
-			int pad = (width > len) ? width - len : 0;
-			if (!fl_minus) {
-				char pc = fl_zero ? '0' : ' ';
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = pc;
+			/* C99 integer precision: at least `prec` digits,
+			 * zero-filled on the left.  A precision of 0 with a
+			 * value of 0 produces NO digits at all, and an explicit
+			 * precision makes the '0' flag inoperative.  None of
+			 * this was implemented -- prec was read and then used
+			 * only by %s and the float conversions. */
+			int zeros = 0;
+			if (prec >= 0) {
+				if (prec == 0 && val == 0)
+					len = 0;
+				if (prec > len)
+					zeros = prec - len;
 			}
-			for (int i = 0; i < len && pos < size - 1; i++)
-				str[pos++] = buf[i];
+			/* '#' forces the first digit to be 0, which C99 states
+			 * as "increase the precision if and only if necessary".
+			 * It was not implemented at all. */
+			if (fl_hash && zeros == 0 && (len == 0 || buf[0] != '0'))
+				zeros = 1;
+			int zpad = fl_zero && prec < 0;
+
+			int total = len + zeros;
+			int pad = (width > total) ? width - total : 0;
+			if (!fl_minus) {
+				char pc = zpad ? '0' : ' ';
+				for (int p = 0; p < pad; p++)
+					SP_PUT(pc);
+			}
+			for (int z = 0; z < zeros; z++)
+				SP_PUT('0');
+			for (int i = 0; i < len; i++)
+				SP_PUT(buf[i]);
 			if (fl_minus)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
 
 			format++;
 			continue;
@@ -975,16 +1076,14 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 		/* ---- pointer ---- */
 		case 'p': {
 			void *ptr = va_arg(ap, void *);
-			if (pos < size - 1)
-				str[pos++] = '0';
-			if (pos < size - 1)
-				str[pos++] = 'x';
+			SP_PUT('0');
+			SP_PUT('x');
 			len = num_to_str(
 				(long long)(unsigned long long)(unsigned long)
 					ptr,
 				buf, 16, 0);
-			for (int i = 0; i < len && pos < size - 1; i++)
-				str[pos++] = buf[i];
+			for (int i = 0; i < len; i++)
+				SP_PUT(buf[i]);
 			format++;
 			continue;
 		}
@@ -1002,13 +1101,13 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 			int pad = (width > slen) ? width - slen : 0;
 
 			if (!fl_minus)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
-			for (int i = 0; i < slen && pos < size - 1; i++)
-				str[pos++] = s[i];
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
+			for (int i = 0; i < slen; i++)
+				SP_PUT(s[i]);
 			if (fl_minus)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
 
 			format++;
 			continue;
@@ -1019,13 +1118,12 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 			char c = (char)va_arg(ap, int);
 			int pad = (width > 1) ? width - 1 : 0;
 			if (!fl_minus)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
-			if (pos < size - 1)
-				str[pos++] = c;
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
+			SP_PUT(c);
 			if (fl_minus)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
 			format++;
 			continue;
 		}
@@ -1103,25 +1201,24 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 			int pad = (width > total) ? width - total : 0;
 
 			if (!fl_minus && !fl_zero)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
-			if (sign && pos < size - 1)
-				str[pos++] = sign;
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
+			if (sign)
+				SP_PUT(sign);
 			if (!fl_minus && fl_zero)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = '0';
-			for (int i = 0; i < ilen && pos < size - 1; i++)
-				str[pos++] = ibuf[i];
+				for (int p = 0; p < pad; p++)
+					SP_PUT('0');
+			for (int i = 0; i < ilen; i++)
+				SP_PUT(ibuf[i]);
 			if (fprec > 0) {
-				if (pos < size - 1)
-					str[pos++] = '.';
-				for (int i = 0; i < fprec && pos < size - 1;
+				SP_PUT('.');
+				for (int i = 0; i < fprec;
 				     i++)
-					str[pos++] = fbuf[i];
+					SP_PUT(fbuf[i]);
 			}
 			if (fl_minus)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
 
 			format++;
 			continue;
@@ -1216,27 +1313,25 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 			int pad = (width > total) ? width - total : 0;
 
 			if (!fl_minus && !fl_zero)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
-			if (sign && pos < size - 1)
-				str[pos++] = sign;
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
+			if (sign)
+				SP_PUT(sign);
 			if (!fl_minus && fl_zero)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = '0';
-			if (pos < size - 1)
-				str[pos++] = '0' + (char)int_digit;
+				for (int p = 0; p < pad; p++)
+					SP_PUT('0');
+			SP_PUT('0' + (char)int_digit);
 			if (fprec > 0) {
-				if (pos < size - 1)
-					str[pos++] = '.';
-				for (int i = 0; i < fprec && pos < size - 1;
+				SP_PUT('.');
+				for (int i = 0; i < fprec;
 				     i++)
-					str[pos++] = fbuf[i];
+					SP_PUT(fbuf[i]);
 			}
-			for (int i = 0; i < elen && pos < size - 1; i++)
-				str[pos++] = ebuf[i];
+			for (int i = 0; i < elen; i++)
+				SP_PUT(ebuf[i]);
 			if (fl_minus)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
 
 			format++;
 			continue;
@@ -1411,13 +1506,13 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 
 			int pad = (width > tlen) ? width - tlen : 0;
 			if (!fl_minus)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = fl_zero ? '0' : ' ';
-			for (int i = 0; i < tlen && pos < size - 1; i++)
-				str[pos++] = tmp_buf[i];
+				for (int p = 0; p < pad; p++)
+					SP_PUT(fl_zero ? '0' : ' ');
+			for (int i = 0; i < tlen; i++)
+				SP_PUT(tmp_buf[i]);
 			if (fl_minus)
-				for (int p = 0; p < pad && pos < size - 1; p++)
-					str[pos++] = ' ';
+				for (int p = 0; p < pad; p++)
+					SP_PUT(' ');
 
 			format++;
 			continue;
@@ -1425,15 +1520,33 @@ int vsnprintf(char *str, size_t size, const char *format, va_list ap)
 
 		/* ---- unknown ---- */
 		default:
-			if (pos < size - 1)
-				str[pos++] = *format;
+			SP_PUT(*format);
 			format++;
 			continue;
 		}
 	}
 
-	str[pos] = '\0';
+	/* Terminate within the buffer: pos may now exceed it. */
+	str[pos < cap ? pos : cap] = '\0';
 	return (int)pos;
+}
+
+int vsnprintf(char *str, size_t size, const char *format, va_list ap)
+{
+	/* C99: with a NULL buffer or zero size, nothing is written and the
+	 * return value is the length the output would have had.
+	 *
+	 * Implemented by formatting with a one-byte buffer, so the counting is
+	 * done by exactly the same code that does the writing -- there is no
+	 * second implementation to disagree with the first, and no upper limit.
+	 * The previous version formatted into an 8KB stack buffer and returned
+	 * the truncated count, so a two-pass caller sizing a buffer for output
+	 * longer than that under-allocated and then overran it. */
+	if (!str || size == 0) {
+		char dummy[1];
+		return vsnprintf_body(dummy, 1, format, ap);
+	}
+	return vsnprintf_body(str, size, format, ap);
 }
 
 int snprintf(char *str, size_t size, const char *format, ...)
@@ -1449,9 +1562,35 @@ int sprintf(char *str, const char *format, ...)
 {
 	va_list ap;
 	va_start(ap, format);
-	int ret = vsnprintf(str, 4096, format, ap);
+	/* Unbounded, like vsprintf: see the note there.  A 4096 cap protected no
+	 * caller with a smaller buffer and silently truncated those with a
+	 * bigger one. */
+	int ret = vsnprintf(str, (size_t)-1, format, ap);
 	va_end(ap);
 	return ret;
+}
+
+/* vsprintf - the va_list form of sprintf.
+ *
+ * NOT bounded.  It used to cap the output at 4096 bytes on the theory that a
+ * truncated message beats a smashed stack, but that reasoning does not hold:
+ * the cap protects nothing, because a caller whose buffer is smaller than 4096
+ * -- which is most of them -- is overrun exactly as before.  All it added was
+ * silent truncation for the callers whose buffers ARE big enough, turning a
+ * correct program into one that quietly loses output.
+ *
+ * sprintf has no length argument, so the buffer's size is the caller's promise
+ * to keep; there is no size here to check against and pretending otherwise
+ * helped nobody.  Code that wants a guarantee uses snprintf. */
+int vsprintf(char *str, const char *format, va_list ap)
+{
+	return vsnprintf(str, (size_t)-1, format, ap);
+}
+
+/* vprintf - the va_list form of printf.  C89, and missing until now. */
+int vprintf(const char *format, va_list ap)
+{
+	return vfprintf(stdout, format, ap);
 }
 
 int vasprintf(char **strp, const char *format, va_list ap)
@@ -1618,6 +1757,40 @@ int fseeko(FILE *stream, off_t offset, int whence)
 off_t ftello(FILE *stream)
 {
 	return (off_t)ftell(stream);
+}
+
+/* fgetpos / fsetpos -- ISO C's position save/restore pair.
+ *
+ * Built on ftello/fseeko rather than ftell/fseek so a position beyond 2GB
+ * round-trips: off_t is 64-bit here, long is not guaranteed to be anywhere
+ * else, and a truncated position would seek to the wrong place instead of
+ * failing.
+ *
+ * fsetpos() must also discard any pushed-back character and the read-ahead
+ * buffer, which fseeko() already does -- that is the whole reason to route
+ * through it rather than assigning the offset directly. */
+int fgetpos(FILE *stream, fpos_t *pos)
+{
+	off_t off;
+
+	if (!stream || !pos) {
+		errno = EINVAL;
+		return -1;
+	}
+	off = ftello(stream);
+	if (off == (off_t)-1)
+		return -1; /* ftello set errno */
+	pos->__pos = off;
+	return 0;
+}
+
+int fsetpos(FILE *stream, const fpos_t *pos)
+{
+	if (!stream || !pos) {
+		errno = EINVAL;
+		return -1;
+	}
+	return fseeko(stream, pos->__pos, SEEK_SET);
 }
 
 void perror(const char *s)

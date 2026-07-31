@@ -30,6 +30,14 @@ lib       libXau             1.0.12   libxau
 lib       libXdmcp           1.1.5    libxdmcp
 proto     xcb-proto          1.17.0   xcb-proto
 lib       libxcb             1.17.0   libxcb
+# The xcb-util family.  Needed by libnsfb's X display surface, which is how
+# NetSurf draws into an X window: libxcb alone provides the protocol bindings,
+# while the conveniences that surface uses -- ICCCM window properties, image
+# transfer, keysym lookup -- live in these four separate packages.
+xcb       xcb-util           0.4.1    xcb-util
+xcb       xcb-util-image     0.4.1    xcb-util-image
+xcb       xcb-util-keysyms   0.4.1    xcb-util-keysyms
+xcb       xcb-util-wm        0.4.2    xcb-util-wm
 lib       libX11             1.8.13   libx11
 lib       libXext            1.3.6    libxext
 lib       libXrender         0.9.12   libxrender
@@ -96,16 +104,39 @@ font      font-cursor-misc   1.0.4    -  xorg/font/cursor-misc
 lib       libevdev           1.13.6   libevdev
 lib       mtdev              1.1.7    mtdev
 
+# ---- Motif stack, for xnedit ----
+# xnedit is a Motif program, and Motif is not in the base X.Org set.  The chain
+# is expat -> fontconfig -> libXft -> motif: fontconfig parses its XML config
+# with expat, libXft is the client-side font layer over freetype+fontconfig, and
+# Motif draws its text through libXft.  All four are plain C.
+#
+# Section "-" means the package is not an X.Org one, so the Debian pool is the
+# only source; fetch.sh falls back to the newest version Debian carries when the
+# version named here is not in the pool.
+# xbitmaps installs the classic X bitmap files (the root weave, the icons the
+# toolkit draws) plus their pkg-config description.  xsetroot's configure
+# requires it by name -- and Motif #includes <X11/bitmaps/gray> directly, which
+# is why it has to come BEFORE the Motif stack rather than down with the
+# session programs.  It was listed after motif, and that only ever worked
+# because an earlier build had already left the headers in the sysroot; a
+# from-scratch `make distclean && make` failed on it.
+data      xbitmaps           1.1.1    xbitmaps
+-         expat              2.7.3    https://github.com/libexpat/libexpat/releases/download/R_2_7_3/expat-%VERSION%.tar.xz
+-         fontconfig         2.15.0   fontconfig
+lib       libXft             2.3.9    libxft
+-         motif              2.3.8    motif
+# xnedit is a Motif text editor (an NEdit fork with Unicode support).  Published
+# only on GitHub -- neither the x.org archive nor Debian carries it -- so it uses
+# the explicit-URL source.  It has no configure: the build selects one of
+# makefiles/Makefile.<platform>, so the port adds an arm for this system.
+-         xnedit             1.6.3    https://github.com/unixwork/xnedit/archive/refs/tags/v%VERSION%.tar.gz
+
 # ---- the server and its two drivers ----
 xserver   xorg-server        21.1.23  xorg-server
 driver    xf86-input-evdev   2.11.0   xserver-xorg-input-evdev
 driver    xf86-video-fbdev   0.5.0    xserver-xorg-video-fbdev
 
 # ---- session ----
-# xbitmaps installs the classic X bitmap files (the root weave, the icons the
-# toolkit draws) plus their pkg-config description.  xsetroot's configure
-# requires it by name.
-data      xbitmaps           1.1.1    xbitmaps
 app       xinit              1.4.4    xinit
 app       xauth              1.1.4    xauth
 app       xsetroot           1.1.3    -  xorg/app/xsetroot
@@ -117,6 +148,13 @@ app       xterm              400      xterm
 app       xset               1.2.5    -  xorg/app/xset
 app       xrandr             1.5.3    -  xorg/app/xrandr
 app       xclock             1.1.1    -  xorg/app/xclock
+# xload draws a load-average graph.  It reads the figures through getloadavg(),
+# which this system's libc now provides on top of sysinfo(2) -- its other
+# backends poke /dev/kmem or /proc/loadavg, neither of which exists here.
+app       xload              1.1.4    -  xorg/app/xload
+# xcalc is a scientific calculator on the Athena widget set -- the same libXaw
+# and libXt everything else here already uses, so it needs nothing new.
+app       xcalc              1.1.2    -  xorg/app/xcalc
 app       twm                1.0.13   twm
 # libdrm is NOT built.  It is the userspace side of the kernel's direct
 # rendering manager, and there is no DRM device here to talk to: the server is
@@ -129,3 +167,51 @@ app       twm                1.0.13   twm
 # If DRM is ever implemented in the kernel, this is the first package to add
 # back, and that header is the first thing it will need.
 #lib      libdrm             2.4.124  libdrm
+
+# ---- libraries NetSurf needs that are not X.Org ------------------------
+# utf8proc is REQUIRED by netsurf (Unicode normalisation and case folding);
+# libpng and libjpeg decode the two image formats the web is actually made of.
+# Section "-" means not an X.Org package, so the explicit URL is the source.
+#
+# The package NAME must match the directory the tarball unpacks into, because
+# the build driver finds a package's tree by that name -- utf8proc's release is
+# "utf8proc-N", not "libutf8proc-N", even though its pkg-config name is
+# libutf8proc.
+-         utf8proc           2.10.0   https://github.com/JuliaStrings/utf8proc/archive/refs/tags/v%VERSION%.tar.gz
+-         libpng             1.6.44   https://download.sourceforge.net/libpng/libpng-%VERSION%.tar.xz
+-         jpeg               9f       https://www.ijg.org/files/jpegsrc.v%VERSION%.tar.gz
+
+# ---- NetSurf and its core libraries -------------------------------------
+# Not X.Org software, but it lives in this manifest for the same reason xnedit
+# does: it is an X client that has to be built against THIS sysroot, with these
+# toolchain wrappers and this pkg-config.  A second port tree would duplicate
+# all of that to no benefit.
+#
+# Fetched by explicit URL: none is in the x.org archive, and Debian splits them
+# into differently-shaped packages, so the project's own release tarballs are
+# the only source that gives the upstream tree.
+#
+# These do NOT use autotools.  They use NetSurf's own buildsystem -- a set of
+# shared makefiles that each component includes -- so `buildsystem` must be
+# installed into the sysroot first and the build driver treats them specially.
+#
+# Order is dependency order: hubbub and css need parserutils and wapcaplet,
+# dom needs hubbub, and netsurf needs all of them plus libnsfb for its display.
+lib       buildsystem        1.9      https://download.netsurf-browser.org/libs/releases/buildsystem-%VERSION%.tar.gz
+lib       libwapcaplet       0.4.3    https://download.netsurf-browser.org/libs/releases/libwapcaplet-%VERSION%-src.tar.gz
+lib       libparserutils     0.2.5    https://download.netsurf-browser.org/libs/releases/libparserutils-%VERSION%-src.tar.gz
+lib       libhubbub          0.3.8    https://download.netsurf-browser.org/libs/releases/libhubbub-%VERSION%-src.tar.gz
+lib       libcss             0.9.2    https://download.netsurf-browser.org/libs/releases/libcss-%VERSION%-src.tar.gz
+lib       libdom             0.4.2    https://download.netsurf-browser.org/libs/releases/libdom-%VERSION%-src.tar.gz
+lib       libnsutils         0.1.1    https://download.netsurf-browser.org/libs/releases/libnsutils-%VERSION%-src.tar.gz
+lib       libnslog           0.1.3    https://download.netsurf-browser.org/libs/releases/libnslog-%VERSION%-src.tar.gz
+lib       libnsgif           1.0.0    https://download.netsurf-browser.org/libs/releases/libnsgif-%VERSION%-src.tar.gz
+lib       libnsbmp           0.1.7    https://download.netsurf-browser.org/libs/releases/libnsbmp-%VERSION%-src.tar.gz
+lib       libnspsl           0.1.7    https://download.netsurf-browser.org/libs/releases/libnspsl-%VERSION%-src.tar.gz
+lib       libnsfb            0.2.2    https://download.netsurf-browser.org/libs/releases/libnsfb-%VERSION%-src.tar.gz
+# nsgenbind generates NetSurf's JavaScript bindings -- the glue between the
+# Duktape engine (whose source netsurf bundles) and the DOM.  It is a BUILD-time
+# tool: it runs on this machine and emits C, so it is compiled with the host
+# compiler and never ships on the image.
+lib       nsgenbind           0.9      https://download.netsurf-browser.org/libs/releases/nsgenbind-%VERSION%-src.tar.gz
+app       netsurf            3.11     https://download.netsurf-browser.org/netsurf/releases/source/netsurf-%VERSION%-src.tar.gz

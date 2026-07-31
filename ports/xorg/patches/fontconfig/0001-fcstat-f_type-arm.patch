@@ -1,0 +1,24 @@
+Let this platform use the struct statfs f_type arm.
+
+fcstat.c walks a chain of arms to work out a filesystem's type from fstatfs(),
+and ends in "#error BUG: No way to figure out with fstatfs()" when none matches.
+Nothing matched here: the f_fstypename arm is for the BSDs, and the f_type arm
+is gated on __linux__, which this build deliberately undefines.
+
+The f_type arm is nevertheless exactly right for this system.  Its struct statfs
+has f_type, and the kernel fills it with the same filesystem magic numbers the
+arm switches on -- 0x4d44 for FAT (so fontconfig knows that filesystem's mtime
+granularity is too coarse to trust for cache validity) and the ext4 magic
+otherwise.  So this adds the platform to the arm rather than writing a new one.
+
+--- a/src/fcstat.c
++++ b/src/fcstat.c
+@@ -386,7 +386,7 @@
+ #  endif
+ #  if defined(HAVE_STRUCT_STATFS_F_FSTYPENAME)
+ 	p = buf.f_fstypename;
+-#  elif defined(__linux__) || defined (__EMSCRIPTEN__)
++#  elif defined(__linux__) || defined (__EMSCRIPTEN__) || defined(__LIKEOS__)
+ 	switch (buf.f_type)
+ 	{
+ 	case 0x6969: /* nfs */

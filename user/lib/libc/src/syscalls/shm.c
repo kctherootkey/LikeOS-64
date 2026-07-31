@@ -53,10 +53,16 @@ int shm_open(const char *name, int oflag, mode_t mode)
 {
 	char path[128];
 
-	(void)mode; /* the object is created 0600; chmod is not supported */
 	if (shm_build_path(name, path, sizeof(path)) != 0)
 		return -1;
-	return open(path, oflag);
+	/* The mode MUST be forwarded.  It used to be discarded on the grounds
+	 * that objects were always created 0600 -- but open() reads its third
+	 * argument whenever O_CREAT is set, so dropping it here did not mean
+	 * "0600", it meant open() picked up whatever happened to be in the
+	 * argument register.  The kernel honours the mode now, so a shared
+	 * object can actually be created with the permissions the caller
+	 * asked for. */
+	return open(path, oflag, mode);
 }
 
 int shm_unlink(const char *name)

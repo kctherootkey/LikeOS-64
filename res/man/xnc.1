@@ -1,0 +1,188 @@
+XNC(1)                           User Commands                          XNC(1)
+
+NAME
+       xnc - Client program for XNEdit text editor
+
+SYNOPSYS
+       xnc [-read] [-create] [-line n | +n] [-do command]
+          [-ask] [-noask] [-svrname name] [-svrcmd command]
+          [-lm languagemode]
+          [-geometry geometry | -g geometry] [-icon | -iconic]
+          [-display [host]:server[.screen]]
+          [-timeout seconds] [-wait] [-xrm resourcestring]
+          [-tabbed] [-untabbed] [-group]
+          [-V | -version] [-h | -help] [--] [file...]
+
+DESCRIPTION
+       xnc is the client interface to the XNEdit text editor. A server can be
+       started explicitly by running XNEdit in server mode:
+
+        xnedit -server
+
+       If no server is running, xnc will start one unless configured
+       otherwise.  Client/server mode is useful for integrating XNEdit with
+       software development environments, mailers, and other programs; or just
+       as a quick way to open files from the shell command line without
+       starting a new XNEdit session.
+
+OPTIONS
+       -read
+           Open the file read-only regardless of the actual file protection.
+
+       -create
+           Don't warn about file creation when a file doesn't exist.
+
+       -line n, +n
+           Go to line number n.
+
+       -do command
+           Execute  an  XNEdit  macro  or action on the file following the -do
+           argument on the command line.
+
+           If you use this command without  a  filename,  xnc  would  randomly
+           choose one window to focus and execute the macro in.
+
+       -ask, -noask
+           Instructs xnc whether to automatically start a server if one is not
+           available. This overrides the X resource `nc.autoStart'.
+
+       -svrname name
+           Explicitly instructs xnc which server to connect to, an instance of
+           xnedit(1)  with  a  corresponding  -svrname  argument.   By  naming
+           servers, you can run several simultaneously, and direct  files  and
+           commands specifically to any one.
+
+       -svrcmd command
+           The  command  which  xnc uses to start an XNEdit server. It is also
+           settable via the X resource `nc.serverCommand', by default, "xnedit
+           -server".
+
+       -lm languagemode
+           Initial language mode used for editing succeeding files.
+
+       -geometry geometry, -g geometry
+           The initial size and/or location of editor  windows.  The  argument
+           geometry has the form:
+
+             [<width>x<height>][+|-][<xoffset>[+|-]<yoffset>]
+
+           where  `<width>' and `<height>' are the desired width and height of
+           the window, and `<xoffset>' and `<yoffset>' are the  distance  from
+           the  edge  of  the  screen  to the window, + for top or left, - for
+           bottom or right. -geometry can be specified for individual files on
+           the command line.
+
+       -icon, -iconic
+           Initial window state for succeeding files.
+
+       -display [host]:server[.screen]
+           The name of the X server to use. host specifies the machine, server
+           specifies the display  server  number,  and  screen  specifies  the
+           screen  number.   host  or screen can be omitted and default to the
+           local machine, and screen 0.
+
+       -timeout seconds
+           Basic time-out period (in seconds) used in  communication  with  an
+           XNEdit  server.   Default:  10  seconds.  Also  settable  via the X
+           resource `nc.timeOut'.
+
+           Under rare conditions (such  as  a  slow  connection),  it  may  be
+           necessary  to  increase  the  time-out  period.  In most cases, the
+           default is fine.
+
+       -wait
+           Instructs nc not to return to the shell until all files  given  are
+           closed.
+
+           Normally,  xnc returns once the files given in its command line are
+           opened by the server. When this option is given, xnc  returns  only
+           after  the  last file given in this call is closed.  Note that this
+           option affects all files, not only the ones following  this  option
+           in the command line.
+
+       -xrm resourcestring
+           Set the value of an X resource to override a default value.
+
+       -tabbed
+           Open all subsequent files in new tabs. Resets -group option.
+
+       -untabbed
+           Open all subsequent files in new windows. Resets -group option.
+
+       -group
+           Open all subsequent files as tabs in a new window.
+
+       -V, -version
+           Prints   version  and  build  information,  to  be  mentioned  when
+           reporting bugs and problems.
+
+       -h, -help
+           Prints the command line help and then exits.
+
+       --  Treats all subsequent arguments as file names, even if  they  start
+           with  a  dash.   This is so XNEdit can access files that begin with
+           the dash character.
+
+ENVIRONMENT
+       DISPLAY
+           XNEdit requires an X-based workstation or X-Terminal. If  you  have
+           used  telnet or rlogin to access the host Unix system, set the Unix
+           environment variable for your display:
+
+               % setenv DISPLAY devicename:0
+
+NOTES
+       Communication between xnc(1) and xnedit(1) is through the X display. So
+       as long as X windows is set up and  working  properly,  xnc  will  work
+       properly  as  well.  xnc  uses  the `DISPLAY' environment variable, the
+       machine name and  your  user  name  to  find  the  appropriate  server,
+       meaning, if you have several machines sharing a common file system, xnc
+       will  not  be able to find a server that is running on a machine with a
+       different host name, even though it may be  perfectly  appropriate  for
+       editing a given file.
+
+       In  typical Unix style, arguments affect the files which follow them on
+       the command line, for example:
+
+       incorrect:
+             xnc file.c -line 25
+
+       correct:
+             xnc -line 25 file.c
+
+       For more information see XNEdit's online help,  or  xnedit.txt  in  the
+       NEdit distribution kit.
+
+SEE ALSO
+       xnedit(1), X(1), mwm(1), ctags(1), etags(1)
+
+AUTHORS
+       XNEdit  was  written  by  Olaf  Winterman, Mark Edel, Joy Kyriakopulos,
+       Christopher Conrad, Jim Clark, Arnulfo Zepeda-Navratil, Suresh  Ravoor,
+       Tony  Balinski, Max Vohlken, Yunliang Yu, Donna Reid, Arne Forlie, Eddy
+       De Greef, Steve LoBasso, Alexander Mai, Scott Tringali, Thorsten Haude,
+       Steve Haehn, Andrew Hood, Nathaniel Gray and TK Soh.
+
+COPYRIGHT
+       This program is free software; you can redistribute it and/or modify it
+       under the terms of the GNU General Public License as published  by  the
+       Free  Software Foundation; either version 2 of the License, or (at your
+       option) any later version.
+
+       In addition, as a special exception  to  the  GNU  GPL,  the  copyright
+       holders give permission to link the code of this program with the Motif
+       and  Open  Motif libraries (or with modified versions of these that use
+       the same license), and distribute  linked  combinations  including  the
+       two.  You  must obey the GNU General Public License in all respects for
+       all of the code used other than linking with Motif/Open Motif.  If  you
+       modify  this file, you may extend this exception to your version of the
+       file, but you are not obligated to do so. If you do not wish to do  so,
+       delete this exception statement from your version.
+
+       This  program  is  distributed  in the hope that it will be useful, but
+       WITHOUT  ANY  WARRANTY;  without   even   the   implied   warranty   of
+       MERCHANTABILITY  or  FITNESS  FOR  A  PARTICULAR  PURPOSE.  See the GNU
+       General Public License in the Help section  "Distribution  Policy"  for
+       more details.
+
+perl v5.38.2                      2025-03-21                            XNC(1)

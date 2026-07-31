@@ -15,12 +15,13 @@ PIC_CFLAGS = $(CFLAGS) -fPIC
 MALLOC_SRC = src/malloc/malloc.c
 STDIO_SRC = src/stdio/stdio.c
 STRING_SRC = src/string/string.c src/string/fnmatch.c src/string/strnlen.c src/string/glob.c
-STDLIB_SRC = src/stdlib/stdlib.c src/stdlib/getopt.c src/stdlib/mkstemps.c src/stdlib/random.c src/stdlib/spawn.c
+STDLIB_SRC = src/crt/initfini.c src/stdlib/stdlib.c src/stdlib/getopt.c src/stdlib/mkstemps.c src/stdlib/random.c src/stdlib/spawn.c src/stdlib/getloadavg.c src/stdlib/assert.c
 CTYPE_SRC = src/ctype/ctype.c
 TIME_SRC = src/time/time.c
 DIR_SRC = src/dirent/dirent.c
 MATH_SRC = src/math/math.c
 REGEX_SRC = src/regex/regex.c
+ICONV_SRC = src/iconv/iconv.c
 EXTRA_STDIO_SRC = src/stdio/getline.c src/stdio/err.c src/stdio/popen.c src/stdio/vfscanf.c
 SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/shm.c src/syscalls/sysvshm.c src/syscalls/sched.c src/syscalls/socket.c src/syscalls/uio.c src/syscalls/resource.c src/syscalls/pty_util.c
 DLFCN_SRC = src/dl/dlfcn.c
@@ -45,6 +46,7 @@ TIME_OBJ = $(TIME_SRC:.c=.o)
 DIR_OBJ = $(DIR_SRC:.c=.o)
 MATH_OBJ = $(MATH_SRC:.c=.o)
 REGEX_OBJ = $(REGEX_SRC:.c=.o)
+ICONV_OBJ = $(ICONV_SRC:.c=.o)
 SYSCALLS_OBJ = $(SYSCALLS_SRC:.c=.o)
 DLFCN_OBJ = $(DLFCN_SRC:.c=.o)
 PWD_OBJ = $(PWD_SRC:.c=.o)
@@ -59,7 +61,7 @@ CRTN_OBJ = $(CRTN_SRC:.S=.o)
 
 # All static objects (libc – everything except pthread)
 LIBC_OBJ = $(MALLOC_OBJ) $(STDIO_OBJ) $(STRING_OBJ) $(STDLIB_OBJ) \
-           $(CTYPE_OBJ) $(TIME_OBJ) $(DIR_OBJ) $(MATH_OBJ) $(REGEX_OBJ) $(SYSCALLS_OBJ) \
+           $(CTYPE_OBJ) $(TIME_OBJ) $(DIR_OBJ) $(MATH_OBJ) $(REGEX_OBJ) $(ICONV_OBJ) $(SYSCALLS_OBJ) \
            $(NET_OBJ) $(SETJMP_OBJ) $(STACK_CHK_OBJ) $(PWD_OBJ)
 
 ALL_OBJ = $(LIBC_OBJ) $(PTHREAD_OBJ)

@@ -7,7 +7,8 @@
 
 int devfs_init(void);
 int devfs_open(const char *path, int flags, vfs_file_t **out);
-int devfs_open_for_task(const char *path, int flags, vfs_file_t **out,
+int devfs_open_for_task(const char *path, int flags, unsigned int cmode,
+			vfs_file_t **out,
 			task_t *cur);
 int devfs_stat(const char *path, struct kstat *st);
 /* /dev/fd/N + /dev/stdin/stdout/stderr: returns the caller-relative fd the

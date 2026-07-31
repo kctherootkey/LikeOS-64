@@ -1,0 +1,62 @@
+Add a build arm for this platform, and stop the build running its own output.
+
+xnedit has no configure: `make <platform>` picks makefiles/Makefile.<platform>.
+The new arm is the linux one with three changes, each of which matters when
+cross compiling:
+
+  - CC and PKG_CONFIG are overridable, so the port can point them at the cross
+    toolchain instead of the host's.
+  - The host X include paths (-I/usr/X11R6/include, -I/usr/include/X11) are
+    dropped.  The cross compiler already has the target sysroot on its include
+    path; naming the host's as well lets them win, which compiles against one
+    set of structure definitions and links against another.
+  - -lpthread is dropped.  The threads implementation is inside libc on this
+    system, so there is no separate library and asking for one fails.
+
+The Makefile change is separate: the build finishes by running the binary it
+just produced ("source/xnedit -V") to print its version.  That cannot work when
+the binary is for another architecture -- it fails as "cannot execute" and takes
+the build down with it.  Prefixing the recipe line with '-' makes the version
+banner advisory, which is all it was ever meant to be, and changes nothing for a
+native build.
+
+--- a/Makefile	2025-03-21 10:50:57.000000000 +0100
++++ b/Makefile	2026-07-30 15:49:55.959418710 +0200
+@@ -35,7 +35,7 @@
+ 	(cd Xlt;    $(MAKE) -f Makefile.$@ libXlt.a)
+ 	(cd Microline/XmL;    $(MAKE) -f Makefile.$@ libXmL.a)
+ 	(cd source; $(MAKE) -f Makefile.$@ xnedit xnc)
+-	@source/xnedit -V
++	-@source/xnedit -V
+ 
+ # This should not be in the default build, as users may not have Perl
+ # installed.  This is only interesting to developers.
+--- a/makefiles/Makefile.likeos	1970-01-01 01:00:00.000000000 +0100
++++ b/makefiles/Makefile.likeos	2026-07-30 15:49:55.868110802 +0200
+@@ -0,0 +1,26 @@
++# Build arm for LikeOS-64.
++#
++# CC and PKG_CONFIG are overridable so the port can point them at the cross
++# toolchain from the command line; the defaults keep this file usable by hand.
++CC?=cc
++AR=ar
++PKG_CONFIG?=pkg-config
++
++C_OPT_FLAGS?=-O2
++
++# Deliberately NO -I/usr/X11R6/include or -I/usr/include/X11, which the other
++# arms carry: those are the build HOST's X headers.  The cross compiler already
++# has the target sysroot's headers on its include path, and naming host ones
++# would let them win -- which produces a binary compiled against one set of
++# structure definitions and linked against another.
++CFLAGS=$(C_OPT_FLAGS) -std=gnu99 -DUSE_LPR_PRINT_CMD \
++       $(shell $(PKG_CONFIG) --cflags xft fontconfig)
++
++ARFLAGS=-urs
++
++# No -lpthread: the threads implementation lives inside libc on this system, so
++# there is no separate library to link and naming one fails outright.
++LIBS=$(LD_OPT_FLAGS) -lXm -lXt -lX11 -lXrender -lm \
++     $(shell $(PKG_CONFIG) --libs xft fontconfig)
++
++include Makefile.common

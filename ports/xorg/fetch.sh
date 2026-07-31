@@ -92,6 +92,35 @@ fetch_one() {
 	deb=$4
 	repo=$5
 
+	# A fourth source: an explicit URL, given where the Debian source-package
+	# field would go and recognised by its scheme.  %VERSION% in it expands to
+	# the version column.
+	#
+	# Needed for two kinds of package that the three sources above cannot
+	# reach.  One is upstream-only software (xnedit is published on GitHub and
+	# is in neither the x.org archive nor Debian).  The other is a package
+	# whose Debian tarball has the wrong SHAPE: Debian's expat orig tarball is
+	# the project's git layout, with configure.ac one level down in expat/,
+	# and every build script here expects the configure script at the root of
+	# the unpacked tree.  The upstream release tarball is laid out normally.
+	case "$deb" in
+	http://* | https://*)
+		url=$(printf '%s' "$deb" | sed "s|%VERSION%|$version|g")
+		ext=$(printf '%s' "$url" | sed -n 's|.*\(\.tar\.[a-z]*\)$|\1|p')
+		[ -n "$ext" ] || ext=.tar.gz
+		file="$here/$name-$version$ext"
+		[ -f "$file" ] && { echo "  have $(basename "$file")"; return 0; }
+		if curl -fsSL --connect-timeout 20 -o "$file.part" "$url"; then
+			mv "$file.part" "$file"
+			echo "  got  $(basename "$file")  [upstream]"
+			return 0
+		fi
+		rm -f "$file.part"
+		echo "  FAIL $name-$version  (upstream URL)" >&2
+		return 1
+		;;
+	esac
+
 	# Already have it?
 	#
 	# Checked by NAME rather than by the exact file name each source would

@@ -213,7 +213,8 @@ static int devfs_open_pty_slave(int id, vfs_file_t **out)
 	return ST_OK;
 }
 
-static int devfs_open_impl(const char *path, int flags, vfs_file_t **out,
+static int devfs_open_impl(const char *path, int flags, unsigned int cmode,
+			   vfs_file_t **out,
 			   task_t *cur)
 {
 	if (!path || !out)
@@ -255,7 +256,11 @@ static int devfs_open_impl(const char *path, int flags, vfs_file_t **out,
 		if (!obj) {
 			if (!(flags & O_CREAT))
 				return ST_NOT_FOUND;
-			obj = shm_create_get(nm, 0600);
+			/* The mode the caller asked for, already umask-adjusted
+			 * by the syscall layer.  It was a hardcoded 0600, so a
+			 * segment meant to be shared between two users could
+			 * never be opened by the second one. */
+			obj = shm_create_get(nm, cmode & 0777);
 			if (!obj)
 				return ST_NOMEM;
 		} else if ((flags & O_CREAT) && (flags & O_EXCL)) {
@@ -417,10 +422,10 @@ static int devfs_open_impl(const char *path, int flags, vfs_file_t **out,
 	return ST_NOT_FOUND;
 }
 
-int devfs_open_for_task(const char *path, int flags, vfs_file_t **out,
-			task_t *cur)
+int devfs_open_for_task(const char *path, int flags, unsigned int cmode,
+			vfs_file_t **out, task_t *cur)
 {
-	int r = devfs_open_impl(path, flags, out, cur);
+	int r = devfs_open_impl(path, flags, cmode, out, cur);
 	/* Remember the name so a /dev/fd/N symlink can report which node the
 	 * descriptor refers to.  Trailing-slash forms ("/dev/pts/") normalise
 	 * to the directory itself. */
@@ -442,8 +447,9 @@ int devfs_open_for_task(const char *path, int flags, vfs_file_t **out,
 
 int devfs_open(const char *path, int flags, vfs_file_t **out)
 {
-	// Fallback without task context: use console tty for /dev/tty
-	return devfs_open_for_task(path, flags, out, NULL);
+	/* Fallback without task context (the vfs_ops entry point, which carries
+	 * no mode): 0666 is the POSIX default for a creat-style open. */
+	return devfs_open_for_task(path, flags, 0666, out, NULL);
 }
 
 /* The /dev path an open devfs handle was created from, for /dev/fd/N symlink
@@ -1071,6 +1077,28 @@ int devfs_fstat(vfs_file_t *f, struct kstat *st)
 	if (!df)
 		return -EINVAL;
 	uint32_t perm, gid = 0, rmaj, rmin;
+
+	/* Shared memory objects are not devices: they have an owner, a mode and
+	 * a length of their own, and fstat() is how a caller learns the size
+	 * after ftruncate() -- which is exactly what mmap sizing depends on.
+	 * Handled before the device table because none of it applies. */
+	if (df->type == DEVFS_TYPE_SHM && df->shm) {
+		uint64_t now = timer_get_epoch(); /* real wall-clock seconds */
+		mm_memset(st, 0, sizeof(*st));
+		st->st_mode = S_IFREG | (df->shm->mode & 0777);
+		st->st_uid = df->shm->uid;
+		st->st_gid = df->shm->gid;
+		st->st_ino = df->shm->ino;
+		st->st_nlink = 1;
+		st->st_size = (long)df->shm->size;
+		st->st_blksize = 4096;
+		st->st_blocks = (long)(df->shm->npages * 8);
+		st->st_atime = now;
+		st->st_mtime = now;
+		st->st_ctime = now;
+		return ST_OK;
+	}
+
 	switch (df->type) {
 	case DEVFS_TYPE_TTY: /* console opens: report the /dev/tty identity */
 		perm = 0666, gid = DEVFS_GID_TTY, rmaj = 5, rmin = 0;

@@ -1,0 +1,15 @@
+# NetSurf options for LikeOS, installed as /usr/share/netsurf/Choices.
+#
+# NetSurf looks for "Choices" along its resource path -- ~/.netsurf first, then
+# $NETSURFRES, then /usr/share/netsurf -- so a user's own copy still wins over
+# this one.
+#
+# The window size is fixed at start-up and cannot be changed afterwards:
+# libnsfb's X surface allocates one backing image and declares min_size ==
+# max_size, so the window manager correctly refuses to resize it.  1024x768 is
+# a usable default rather than the built-in 800x600.
+window_width:1024
+window_height:768
+
+# Loaded at start-up, and where the Home button goes.
+homepage_url:https://likeos.systemtrap.com

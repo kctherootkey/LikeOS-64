@@ -55,6 +55,15 @@ struct tm *localtime_r(const time_t *timep, struct tm *result);
 time_t mktime(struct tm *tm);
 size_t strftime(char *s, size_t max, const char *format, const struct tm *tm);
 
+/* difftime(): seconds between two times, as a double (ISO C). */
+double difftime(time_t time1, time_t time0);
+
+/* strptime(): the inverse of strftime().  Returns the first unconsumed
+ * character, or NULL if the input does not match the format.  Fields the
+ * format does not mention are left untouched, so several calls can build up
+ * one struct tm. */
+char *strptime(const char *s, const char *format, struct tm *tm);
+
 int nanosleep(const struct timespec *req, struct timespec *rem);
 
 char *ctime(const time_t *timep);

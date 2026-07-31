@@ -12,6 +12,48 @@
 // UNIX socket table
 static unix_socket_t unix_sockets[MAX_UNIX_SOCKETS];
 
+/* Size of a connected socket's data ring.
+ *
+ * Large enough that a client pushing a screenful of pixels does not stall on
+ * every few kilobytes: each stall costs a context switch, and an X client
+ * repainting a window makes thousands of them.  Allocated per connected
+ * socket, so an idle system pays nothing for it. */
+#define UNIX_RING_SIZE 65536
+
+/* Give `s` a data ring if it has none.
+ *
+ * Allocated OUTSIDE the socket lock -- kalloc may sleep -- and installed under
+ * it, so two senders racing to first-use the same peer cannot both install one.
+ * The loser frees its spare and uses the winner's. */
+static int unix_ring_ensure(unix_socket_t *s)
+{
+	uint8_t *nb;
+	uint64_t f;
+
+	if (!s)
+		return -EINVAL;
+	if (__atomic_load_n(&s->buf, __ATOMIC_ACQUIRE))
+		return 0;
+
+	nb = (uint8_t *)kalloc(UNIX_RING_SIZE);
+	if (!nb)
+		return -ENOMEM;
+
+	spin_lock_irqsave(&s->lock, &f);
+	if (s->buf == NULL) {
+		s->buf = nb;
+		s->bufsz = UNIX_RING_SIZE;
+		s->head = 0;
+		s->tail = 0;
+		nb = NULL; /* installed */
+	}
+	spin_unlock_irqrestore(&s->lock, f);
+
+	if (nb)
+		kfree(nb); /* lost the race; the winner's ring is in place */
+	return 0;
+}
+
 // Global table lock — serialises slot allocation, path lookup, and peer
 // linkage.  Without it, two concurrent socket(AF_UNIX,...) calls can both
 // observe the same inactive slot and race on memset/active=1, producing
@@ -339,7 +381,15 @@ int unix_bind(int usockfd, const struct sockaddr_un *addr, socklen_t addrlen)
 	 * I/O that can block, and this lock is held with interrupts disabled.
 	 * Abstract names have no filesystem presence and skip all of it. */
 	if (name[0] != '\0') {
-		int mr = vfs_mknod(pathbuf, S_IFSOCK | 0777);
+		/* 0777 minus the caller's umask, as for any other name a
+		 * process creates.  It used to be a flat 0777, which made every
+		 * bound socket world-writable -- and since connecting requires
+		 * write permission on the node, that silently granted every
+		 * user access to every service on the system.  A server that
+		 * genuinely wants to be reachable by everyone (the X server
+		 * does) chmods the node itself afterwards. */
+		unsigned int smode = 0777 & ~task_umask(sched_current());
+		int mr = vfs_mknod(pathbuf, S_IFSOCK | smode);
 		if (mr != ST_OK) {
 			/* Undo the registration so the name does not stay
 			 * claimed by a socket nobody can reach. */
@@ -540,6 +590,28 @@ int unix_connect(int usockfd, const struct sockaddr_un *addr,
 		return nlen;
 	if (nlen == 0)
 		return -EINVAL; /* no name to connect to */
+	if (nlen > UNIX_PATH_MAX)
+		return -EINVAL;
+
+	/* Connecting to a pathname socket requires WRITE permission on the
+	 * node, which is the rule everywhere else and was missing entirely:
+	 * any user could connect to any bound socket regardless of its mode or
+	 * owner.  An abstract name (leading NUL) has no filesystem presence and
+	 * is exempt, as it is for bind.
+	 *
+	 * Checked here, before the table lock is taken: the VFS lookup can
+	 * block, and that lock is held with interrupts disabled. */
+	if (name[0] != '\0') {
+		char cpathbuf[UNIX_PATH_MAX + 1];
+		int pr;
+
+		for (int i = 0; i < nlen; i++)
+			cpathbuf[i] = name[i];
+		cpathbuf[nlen] = '\0';
+		pr = vfs_permission(cpathbuf, MAY_WRITE);
+		if (pr != ST_OK)
+			return (pr == ST_PERM) ? -EPERM : -EACCES;
+	}
 
 	// Look up listener and enqueue under unix_table_lock so the listener
 	// cannot be closed (and its slot reused) between lookup and enqueue.
@@ -656,11 +728,19 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 			kbuf[i] = src[(size_t)sent + i];
 		smap_enable();
 
+		/* The peer needs a ring before anything can be put in it.
+		 * Done here, outside every lock, because it may sleep. */
+		if (unix_ring_ensure(peer) != 0) {
+			__atomic_fetch_sub(&peer->ref_count, 1,
+					   __ATOMIC_ACQ_REL);
+			return sent > 0 ? sent : -ENOMEM;
+		}
+
 		/* Push into the peer's ring under its lock — kernel memory only. */
 		spin_lock_irqsave(&peer->lock, &irqflags);
 		size_t n = 0;
 		while (n < chunk) {
-			int next = (peer->tail + 1) % (int)sizeof(peer->buf);
+			int next = (peer->tail + 1) % peer->bufsz;
 			if (next == peer->head)
 				break; /* ring full */
 			peer->buf[peer->tail] = kbuf[n];
@@ -671,6 +751,10 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 		if (n)
 			peer->ready = 1;
 		spin_unlock_irqrestore(&peer->lock, irqflags);
+		/* Wake a reader parked on this socket.  OUTSIDE the lock: the
+		 * wake path takes scheduler locks of its own. */
+		if (n)
+			sched_wake_channel(peer);
 		sent += (int)n;
 
 		if (n == chunk)
@@ -684,23 +768,56 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 					   __ATOMIC_ACQ_REL);
 			return -EAGAIN;
 		}
-		// Wait for space — yield so the receiver gets CPU and drains.
-		while ((peer->tail + 1) % (int)sizeof(peer->buf) ==
-		       peer->head) {
-			if (peer->closed) {
-				__atomic_fetch_sub(&peer->ref_count, 1,
-						   __ATOMIC_ACQ_REL);
-				return -EPIPE;
-			}
-			/* Interruptible: send() returns EINTR (no data was
-			 * written yet at this point). */
+		/* Wait for the reader to make space.
+		 *
+		 * PARKED, not spun.  This used to sched_yield in a loop, which
+		 * burns a timeslice per turn and leaves the sender runnable the
+		 * whole time -- with an X client pushing pixels that is most of
+		 * the CPU, and it is why the display felt slow.  Now the sender
+		 * sleeps on the socket and the reader wakes it after draining.
+		 *
+		 * The condition is re-tested under the lock after waking: a
+		 * wake is a hint that something changed, never a promise that
+		 * space is still there when this task runs again. */
+		{
 			task_t *snd_cur = sched_current();
-			if (snd_cur && signal_pending(snd_cur)) {
-				__atomic_fetch_sub(&peer->ref_count, 1,
-						   __ATOMIC_ACQ_REL);
-				return -EINTR;
+
+			spin_lock_irqsave(&peer->lock, &irqflags);
+			while ((peer->tail + 1) % peer->bufsz == peer->head) {
+				if (peer->closed) {
+					spin_unlock_irqrestore(&peer->lock,
+							       irqflags);
+					__atomic_fetch_sub(&peer->ref_count, 1,
+							   __ATOMIC_ACQ_REL);
+					return -EPIPE;
+				}
+				/* Interruptible: send() returns EINTR, and no
+				 * data has been written at this point. */
+				if (snd_cur && signal_pending(snd_cur)) {
+					spin_unlock_irqrestore(&peer->lock,
+							       irqflags);
+					__atomic_fetch_sub(&peer->ref_count, 1,
+							   __ATOMIC_ACQ_REL);
+					return -EINTR;
+				}
+				if (!snd_cur) {
+					spin_unlock_irqrestore(&peer->lock,
+							       irqflags);
+					sched_yield_in_kernel();
+					spin_lock_irqsave(&peer->lock,
+							  &irqflags);
+					continue;
+				}
+				snd_cur->state = TASK_BLOCKED;
+				snd_cur->wait_channel = peer;
+				spin_unlock_irqrestore(&peer->lock, irqflags);
+				sched_schedule();
+				spin_lock_irqsave(&peer->lock, &irqflags);
+				/* sched_schedule() left us RUNNING; do not
+				 * overwrite the state here. */
+				snd_cur->wait_channel = NULL;
 			}
-			sched_yield_in_kernel();
+			spin_unlock_irqrestore(&peer->lock, irqflags);
 		}
 	}
 
@@ -754,13 +871,37 @@ int unix_recv(int usockfd, void *buf, size_t len, int flags)
 			return -ENOTCONN;
 		if (us->nonblock || dontwait)
 			return -EAGAIN;
-		/* Interruptible: recv() returns EINTR when a signal is pending. */
+		/* Wait for data.
+		 *
+		 * PARKED, not spun: the old loop yielded and re-checked, which
+		 * kept an idle reader permanently runnable.  Every X client has
+		 * one of these blocked on its connection, so the waste was
+		 * per-client and constant. */
 		{
 			task_t *rcv_cur = sched_current();
+			uint64_t rf;
+
 			if (rcv_cur && signal_pending(rcv_cur))
 				return -EINTR;
+			if (!rcv_cur) {
+				sched_yield_in_kernel();
+				continue;
+			}
+			spin_lock_irqsave(&us->lock, &rf);
+			/* Re-test under the lock: data or a close may have
+			 * arrived between the check above and here, and a
+			 * sleeper that misses it would never be woken. */
+			if (us->head == us->tail && !us->peer_closed &&
+			    !us->closed) {
+				rcv_cur->state = TASK_BLOCKED;
+				rcv_cur->wait_channel = us;
+				spin_unlock_irqrestore(&us->lock, rf);
+				sched_schedule();
+				rcv_cur->wait_channel = NULL;
+			} else {
+				spin_unlock_irqrestore(&us->lock, rf);
+			}
 		}
-		sched_yield_in_kernel();
 	}
 
 	uint64_t irqflags;
@@ -780,12 +921,17 @@ int unix_recv(int usockfd, void *buf, size_t len, int flags)
 		size_t n = 0;
 		while (n < chunk && us->head != us->tail) {
 			kbuf[n++] = us->buf[us->head];
-			us->head = (us->head + 1) % (int)sizeof(us->buf);
+			us->head = (us->head + 1) % us->bufsz;
 			us->bytes_read++;
 		}
 		if (us->head == us->tail)
 			us->ready = 0;
 		spin_unlock_irqrestore(&us->lock, irqflags);
+
+		/* Space was freed: wake anyone blocked trying to send to us.
+		 * Outside the lock, as on the send side. */
+		if (n)
+			sched_wake_channel(us);
 
 		if (n == 0)
 			break; /* ring empty */
@@ -852,6 +998,12 @@ int unix_close(int usockfd)
 	us->head = 0;
 	us->tail = 0;
 
+	/* Release the data ring with the slot.  Captured here and freed after
+	 * the locks are dropped: kfree must not run with interrupts off. */
+	uint8_t *dead_ring = us->buf;
+	us->buf = NULL;
+	us->bufsz = 0;
+
 	/* Capture the pathname before releasing the slot: the node has to be
 	 * removed from the filesystem, but that is blocking I/O and cannot run
 	 * with these spinlocks held (interrupts are off). */
@@ -870,6 +1022,17 @@ int unix_close(int usockfd)
 
 	spin_unlock_irqrestore(&us->lock, flags);
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
+
+	/* Wake anyone parked on either endpoint.  A sender blocked for space,
+	 * or a reader blocked for data, must be released now -- with the ring
+	 * gone and the peer marked closed, nothing else will ever wake them and
+	 * they would sleep for good.  Done outside the locks, as everywhere
+	 * else, because the wake path takes scheduler locks. */
+	sched_wake_channel(us);
+	if (peer)
+		sched_wake_channel(peer);
+	if (dead_ring)
+		kfree(dead_ring);
 
 	/* Stale sockets otherwise accumulate in /tmp and every later bind to
 	 * the same name fails with EADDRINUSE — which is exactly how a display
@@ -987,9 +1150,15 @@ int unix_poll(int usockfd, short events)
 
 	if (events & POLLOUT) {
 		if (us->peer && !us->peer->closed) {
-			int next = (us->peer->tail + 1) %
-				   (int)sizeof(us->peer->buf);
-			if (next != us->peer->head)
+			/* A peer with no ring yet has never been written to, so
+			 * it is trivially writable -- the ring is allocated on
+			 * the first send.  Testing the modulo first would be a
+			 * divide by zero, and a client polls before it
+			 * writes. */
+			if (us->peer->bufsz == 0)
+				revents |= POLLOUT;
+			else if ((us->peer->tail + 1) % us->peer->bufsz !=
+				 us->peer->head)
 				revents |= POLLOUT;
 		}
 		if (!us->peer || us->peer->closed)

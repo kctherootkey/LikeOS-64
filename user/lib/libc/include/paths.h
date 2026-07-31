@@ -17,5 +17,9 @@
 #define _PATH_VARRUN    "/var/run/"
 #define _PATH_VI        "/usr/bin/vi"
 #define _PATH_MAILDIR   "/var/mail"
+/* Where rwhod deposits one whod.<host> file per host it has heard from.  4.4BSD
+ * kept this in <protocols/rwhod.h>; it belongs here, and that header includes
+ * this one so code written against either spelling compiles. */
+#define _PATH_RWHODIR   "/var/spool/rwho"
 
 #endif /* _PATHS_H */

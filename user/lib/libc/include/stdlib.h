@@ -132,6 +132,11 @@ int mkostemps(char* templ, int suffixlen, int oflags);
 char* mktemp(char* templ);
 char* mkdtemp(char* templ);
 
+/* System load averages over the last 1, 5 and 15 minutes.  Returns the number
+ * of values actually stored (at most 3), or -1 on failure.  Declared here
+ * because that is where both BSD and glibc put it. */
+int getloadavg(double loadavg[], int nelem);
+
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
 

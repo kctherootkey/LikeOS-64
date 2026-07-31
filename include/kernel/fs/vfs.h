@@ -137,7 +137,6 @@ typedef struct {
      * second path resolution.  NULL op => the wrapper reports -EOPNOTSUPP. */
 	int (*getxattr_ino)(unsigned long ino, const char *name, void *val,
 			    unsigned long size);
-
 	/* ---- Optional permission participation --------------------------------
 	 * Filesystem-specific access decision, consulted by vfs_permission()
 	 * BEFORE the generic mode/ACL check.  Returns ST_OK to allow outright,
@@ -154,10 +153,26 @@ typedef struct {
 	 * a bound AF_UNIX socket must be visible in the filesystem — clients
 	 * stat() the path and require S_IFSOCK before connecting.  NULL => the
 	 * filesystem cannot represent such nodes (the wrapper reports
-	 * -EOPNOTSUPP).  Appended deliberately at the END of this structure:
-	 * the per-filesystem tables are positional, so a slot inserted
-	 * anywhere else renumbers every entry after it. */
+	 * -EOPNOTSUPP). */
 	int (*mknod)(const char *path, unsigned int mode);
+	/* Like ->open, but carries the creation mode for O_CREAT.  A filesystem
+	 * that does not list it gets NULL and the wrapper falls back to ->open,
+	 * which creates with a default mode.
+	 *
+	 * ->open cannot simply gain the parameter, because the mode has to reach
+	 * the filesystem that actually allocates the inode, and every other
+	 * caller of ->open is opening a file that already exists.
+	 *
+	 * NOTE for anyone adding an op here: the per-filesystem tables USED to be
+	 * positional, so inserting a member anywhere but the end silently
+	 * renumbered every entry after it.  Adding this one after ->getxattr_ino
+	 * did exactly that -- ext4's ->permission slot ended up holding
+	 * ext4_inode_flags_op, which page-faulted on the first open during boot.
+	 * The tables (ext4_vfs_ops, fat32_vfs_ops) are designated initialisers
+	 * now, so a member may be added anywhere and a wrong slot is a compile
+	 * error rather than a crash.  Keep them that way. */
+	int (*open_mode)(const char *path, int flags, unsigned int mode,
+			 vfs_file_t **out);
 } vfs_ops_t;
 
 struct vfs_file {
@@ -174,6 +189,17 @@ struct vfs_file {
 	 * starved cold-starting processes for seconds under parallel load. */
 	volatile int pagein_busy;
 	volatile int64_t pagein_owner; /* holder task id; stale when !busy */
+	/* Absolute path this handle was opened with, or NULL.
+	 *
+	 * Recorded so a descriptor can be used as the dirfd of an *at()
+	 * syscall: openat/unlinkat/fstatat/faccessat resolve a relative name
+	 * against the directory the descriptor refers to, and nothing else in
+	 * this structure can say which directory that is.
+	 *
+	 * Owned by the VFS layer -- allocated in vfs_open_common() and freed in
+	 * vfs_close(), because the filesystem's ->close frees the structure
+	 * itself and would take this with it. */
+	char *at_path;
 };
 
 // File descriptor flags
@@ -184,6 +210,12 @@ int vfs_register_root(const vfs_ops_t *ops);
 int vfs_register_devfs(const vfs_ops_t *ops);
 int vfs_root_ready(void);
 int vfs_open(const char *path, int flags, vfs_file_t **out);
+/* open() with the creation mode for O_CREAT.  `mode` is the FINAL mode -- the
+ * caller has already applied its umask, matching the convention vfs_mknod()
+ * documents.  Passing the raw mode from userspace would silently ignore the
+ * umask, which is how "create it 0600" ends up world-readable. */
+int vfs_open_mode(const char *path, int flags, unsigned int mode,
+		  vfs_file_t **out);
 int vfs_stat(const char *path, struct kstat *st);
 int vfs_chdir(const char *path);
 long vfs_read(vfs_file_t *f, void *buf, long bytes);
@@ -213,6 +245,18 @@ int vfs_utimensat(const char *path, int64_t mtime_sec, long mtime_nsec);
 int vfs_statfs(const char *path, struct vfs_statfs *out);
 int vfs_fstatfs(vfs_file_t *f, struct vfs_statfs *out);
 int vfs_fstat(vfs_file_t *f, struct kstat *st);
+
+/* POSIX advisory record locks (kernel/fs/frlock.c).  Ownership is the process
+ * (tgid); locks are dropped when it closes any descriptor for the file, or
+ * exits -- both hooks below must stay wired, or a dead process's lock blocks
+ * every later one forever. */
+struct task;
+/* Declared by tag, not the typedef: k_flock_t lives in ke/syscall.h, and this
+ * header must not depend on the syscall layer to be includable. */
+struct k_flock;
+int frlock_fcntl(vfs_file_t *f, int cmd, struct k_flock *flp, struct task *cur);
+void frlock_release_for_task(uint32_t pid);
+void frlock_release_for_file(vfs_file_t *f, uint32_t pid);
 /* Per-inode set-id-strip fast-path (S_NOSEC analog).  vfs_setid_clean() returns
  * nonzero when the inode is known to have no set-id bits to strip (and for any
  * fs lacking the op); vfs_mark_setid_clean() records that state after a strip. */

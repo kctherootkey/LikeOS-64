@@ -1,4 +1,7 @@
 #include <stdio.h>
+#include <sys/ipc.h>
+#include <assert.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -24,6 +27,7 @@
 #include <sys/vfs.h>
 #include <sys/statvfs.h>
 #include <sys/sysinfo.h>
+#include <iconv.h>
 #include <sys/klog.h>
 #include <sys/un.h>
 #include <netdb.h>
@@ -129,6 +133,36 @@ static void __test_pass_impl(const char *name)
 {
 	tests_passed++;
 	printf("  [PASS] %s\n", name);
+}
+
+/* ELF constructors for the MAIN EXECUTABLE.
+ *
+ * These had never run: the dynamic linker runs constructors for shared
+ * libraries but skips the main object, and crt1 did not pick up the slack, so
+ * every __attribute__((constructor)) in a program was silently ignored.  It
+ * took NetSurf to expose it -- libnsfb registers its display surfaces from
+ * constructors, so the browser came up with no surfaces at all.
+ *
+ * Declared here at file scope so the check is what it claims to be: if the
+ * start-up code regresses, ctor_ran stays 0 and the case fails. */
+/* Shared by the umask-across-threads case below: the mask belongs to the
+ * process, so a thread must see the value main set, and a change it makes must
+ * be visible back in main. */
+static volatile mode_t g_umask_seen_in_thread;
+
+static void *umask_thread_fn(void *arg)
+{
+	(void)arg;
+	g_umask_seen_in_thread = umask(0044); /* read the process mask, set a new one */
+	return NULL;
+}
+
+static int g_ctor_ran;
+static int g_ctor_saw_main_before;
+
+__attribute__((constructor)) static void likeos_test_ctor(void)
+{
+	g_ctor_ran = 1;
 }
 
 static void __test_fail_impl(const char *name, const char *file, int line,
@@ -3384,6 +3418,7 @@ static void run_auth_tests(void)
 
 int main(int argc, char **argv)
 {
+	g_ctor_saw_main_before = g_ctor_ran; /* constructors must precede main */
 	/* Hidden mode used by the shebang tests: when testlibc is itself the
 	 * shebang interpreter, dump the exact argv vector and exit. */
 	if (argc > 1 && strncmp(argv[1], "__argv", 6) == 0) {
@@ -4590,7 +4625,7 @@ int main(int argc, char **argv)
 	snprintf(wpath, sizeof(wpath), "%s/WRITE.TXT", _pbase);
 	snprintf(wpath2, sizeof(wpath2), "%s/WRITE2.TXT", _pbase);
 	const char *wmsg1 = "HelloWrite";
-	int wfd = open(wpath, O_CREAT | O_TRUNC | O_WRONLY);
+	int wfd = open(wpath, O_CREAT | O_TRUNC | O_WRONLY, 0644);
 	test_result("open(O_CREAT|O_TRUNC|O_WRONLY) succeeds", wfd >= 0);
 	if (wfd >= 0) {
 		ssize_t w1 = write(wfd, wmsg1, strlen(wmsg1));
@@ -4691,7 +4726,7 @@ int main(int argc, char **argv)
 	snprintf(tdfile, sizeof(tdfile), "%s/TESTDIR/FILE.TXT", _pbase);
 	test_result("mkdir('/TESTDIR') succeeds", mkdir(tdpath, 0777) == 0);
 	test_result("chdir('/TESTDIR') succeeds", chdir(tdpath) == 0);
-	int dfd = open(tdfile, O_CREAT | O_TRUNC | O_WRONLY);
+	int dfd = open(tdfile, O_CREAT | O_TRUNC | O_WRONLY, 0644);
 	test_result("create file in dir", dfd >= 0);
 	if (dfd >= 0) {
 		write(dfd, "X", 1);
@@ -4951,6 +4986,1534 @@ int main(int argc, char **argv)
 			close(mfd);
 		if (sfd >= 0)
 			close(sfd);
+	}
+
+	// ========================================
+	// Test: fcntl advisory record locking
+	// ========================================
+	printf("\n[TEST] fcntl record locks\n");
+	{
+		char lpath[] = "/tmp/likeos_lock_test";
+		int lfd = open(lpath, O_RDWR | O_CREAT | O_TRUNC, 0600);
+		if (lfd < 0) {
+			test_fail("open() for the lock test file");
+		} else {
+			struct flock fl;
+			/* Whole file, the way every real caller spells it. */
+			memset(&fl, 0, sizeof(fl));
+			fl.l_whence = SEEK_SET;
+			fl.l_start = 0;
+			fl.l_len = 0;
+
+			fl.l_type = F_WRLCK;
+			test_result("F_SETLK takes a write lock",
+				    fcntl(lfd, F_SETLK, &fl) == 0);
+
+			/* Re-taking our OWN lock must succeed: locks belong to
+			 * the process, so it can never block itself. */
+			test_result("re-locking our own region succeeds",
+				    fcntl(lfd, F_SETLK, &fl) == 0);
+
+			/* F_GETLK on a region we hold reports it as free -- our
+			 * own locks are not conflicts. */
+			fl.l_type = F_WRLCK;
+			if (fcntl(lfd, F_GETLK, &fl) == 0)
+				test_result("F_GETLK ignores our own lock",
+					    fl.l_type == F_UNLCK);
+			else
+				test_fail("F_GETLK on our own lock");
+
+			/* A second PROCESS must be blocked by it.  This is the
+			 * whole point, and it cannot be tested in one process. */
+			fflush(stdout);
+			pid_t lpid = fork();
+			if (lpid == 0) {
+				struct flock c;
+				int cfd = open(lpath, O_RDWR);
+				int rc = 3;
+				if (cfd >= 0) {
+					memset(&c, 0, sizeof(c));
+					c.l_type = F_WRLCK;
+					c.l_whence = SEEK_SET;
+					c.l_start = 0;
+					c.l_len = 0;
+					errno = 0;
+					/* Must fail, and specifically EAGAIN. */
+					if (fcntl(cfd, F_SETLK, &c) == -1 &&
+					    errno == EAGAIN)
+						rc = 0;
+					else
+						rc = 1;
+					/* And F_GETLK must name the holder. */
+					memset(&c, 0, sizeof(c));
+					c.l_type = F_WRLCK;
+					c.l_whence = SEEK_SET;
+					if (rc == 0 &&
+					    fcntl(cfd, F_GETLK, &c) == 0 &&
+					    c.l_type == F_WRLCK &&
+					    c.l_pid == getppid())
+						rc = 0;
+					else if (rc == 0)
+						rc = 2;
+					close(cfd);
+				}
+				_exit(rc);
+			} else if (lpid > 0) {
+				int lst = 0;
+				waitpid(lpid, &lst, 0);
+				test_result(
+					"another process is blocked with EAGAIN, and F_GETLK names the holder",
+					WIFEXITED(lst) && WEXITSTATUS(lst) == 0);
+			} else {
+				test_fail("fork() for the lock conflict test");
+			}
+
+			/* Unlock, then the same child must succeed. */
+			fl.l_type = F_UNLCK;
+			test_result("F_UNLCK releases",
+				    fcntl(lfd, F_SETLK, &fl) == 0);
+			fflush(stdout);
+			lpid = fork();
+			if (lpid == 0) {
+				struct flock c;
+				int cfd = open(lpath, O_RDWR);
+				int rc = 1;
+				if (cfd >= 0) {
+					memset(&c, 0, sizeof(c));
+					c.l_type = F_WRLCK;
+					c.l_whence = SEEK_SET;
+					if (fcntl(cfd, F_SETLK, &c) == 0)
+						rc = 0;
+					close(cfd);
+				}
+				_exit(rc);
+			} else if (lpid > 0) {
+				int lst = 0;
+				waitpid(lpid, &lst, 0);
+				test_result(
+					"after unlock another process can take it",
+					WIFEXITED(lst) && WEXITSTATUS(lst) == 0);
+			}
+
+			/* A lock must not outlive the process that held it.  The
+			 * child below exits WITHOUT unlocking; if the kernel did
+			 * not clean up, this file would stay locked forever and
+			 * F_SETLKW would spin on it. */
+			fflush(stdout);
+			lpid = fork();
+			if (lpid == 0) {
+				struct flock c;
+				int cfd = open(lpath, O_RDWR);
+				memset(&c, 0, sizeof(c));
+				c.l_type = F_WRLCK;
+				c.l_whence = SEEK_SET;
+				if (cfd >= 0)
+					fcntl(cfd, F_SETLK, &c);
+				_exit(0); /* deliberately no unlock, no close */
+			} else if (lpid > 0) {
+				int lst = 0;
+				waitpid(lpid, &lst, 0);
+				fl.l_type = F_WRLCK;
+				test_result(
+					"a dead process's lock is released on exit",
+					fcntl(lfd, F_SETLK, &fl) == 0);
+				fl.l_type = F_UNLCK;
+				fcntl(lfd, F_SETLK, &fl);
+			}
+
+			/* Read locks are shared: two processes may hold one. */
+			fl.l_type = F_RDLCK;
+			if (fcntl(lfd, F_SETLK, &fl) == 0) {
+				fflush(stdout);
+				lpid = fork();
+				if (lpid == 0) {
+					struct flock c;
+					int cfd = open(lpath, O_RDWR);
+					int rc = 1;
+					if (cfd >= 0) {
+						memset(&c, 0, sizeof(c));
+						c.l_type = F_RDLCK;
+						c.l_whence = SEEK_SET;
+						if (fcntl(cfd, F_SETLK, &c) == 0)
+							rc = 0;
+						close(cfd);
+					}
+					_exit(rc);
+				} else if (lpid > 0) {
+					int lst = 0;
+					waitpid(lpid, &lst, 0);
+					test_result(
+						"two processes may share a read lock",
+						WIFEXITED(lst) &&
+							WEXITSTATUS(lst) == 0);
+				}
+				fl.l_type = F_UNLCK;
+				fcntl(lfd, F_SETLK, &fl);
+			} else {
+				test_fail("F_SETLK read lock");
+			}
+
+			/* SEEK_CUR is refused rather than guessed (the VFS does
+			 * not expose the descriptor offset to the lock layer). */
+			memset(&fl, 0, sizeof(fl));
+			fl.l_type = F_WRLCK;
+			fl.l_whence = SEEK_CUR;
+			errno = 0;
+			test_result("l_whence SEEK_CUR is refused, not guessed",
+				    fcntl(lfd, F_SETLK, &fl) == -1 &&
+					    errno == EINVAL);
+
+			close(lfd);
+			unlink(lpath);
+		}
+	}
+
+	// ========================================
+	// Test: iconv
+	// ========================================
+	printf("\n[TEST] iconv\n");
+	{
+		iconv_t cd;
+		char in[64], out[64];
+		char *ip, *op;
+		size_t il, ol, r;
+
+		/* Name matching ignores case, '-' and '_', so these are all the
+		 * same charset and all must open. */
+		cd = iconv_open("UTF-8", "ISO-8859-1");
+		test_result("iconv_open(UTF-8, ISO-8859-1)", cd != (iconv_t)-1);
+		if (cd != (iconv_t)-1)
+			iconv_close(cd);
+		cd = iconv_open("utf8", "iso88591");
+		test_result("iconv_open is case/punctuation insensitive",
+			    cd != (iconv_t)-1);
+		if (cd != (iconv_t)-1)
+			iconv_close(cd);
+
+		errno = 0;
+		cd = iconv_open("UTF-8", "NO-SUCH-CHARSET-42");
+		test_result("unknown charset -> (iconv_t)-1 + EINVAL",
+			    cd == (iconv_t)-1 && errno == EINVAL);
+
+		/* Latin-1 0xE4 is a-umlaut, U+00E4, which is 0xC3 0xA4 in
+		 * UTF-8.  A wrong decode or encode changes these bytes. */
+		cd = iconv_open("UTF-8", "ISO-8859-1");
+		if (cd != (iconv_t)-1) {
+			in[0] = 'a';
+			in[1] = (char)0xE4;
+			in[2] = 'z';
+			ip = in;
+			il = 3;
+			op = out;
+			ol = sizeof(out);
+			r = iconv(cd, &ip, &il, &op, &ol);
+			test_result("latin1->utf8 converts",
+				    r != (size_t)-1 && il == 0);
+			test_result("latin1->utf8 bytes are correct",
+				    (size_t)(op - out) == 4 &&
+					    (unsigned char)out[0] == 'a' &&
+					    (unsigned char)out[1] == 0xC3 &&
+					    (unsigned char)out[2] == 0xA4 &&
+					    (unsigned char)out[3] == 'z');
+			iconv_close(cd);
+		} else {
+			test_fail("iconv_open for the latin1->utf8 case");
+		}
+
+		/* And back the other way, which must round-trip. */
+		cd = iconv_open("ISO-8859-1", "UTF-8");
+		if (cd != (iconv_t)-1) {
+			in[0] = 'a';
+			in[1] = (char)0xC3;
+			in[2] = (char)0xA4;
+			in[3] = 'z';
+			ip = in;
+			il = 4;
+			op = out;
+			ol = sizeof(out);
+			r = iconv(cd, &ip, &il, &op, &ol);
+			test_result("utf8->latin1 round-trips",
+				    r != (size_t)-1 &&
+					    (size_t)(op - out) == 3 &&
+					    (unsigned char)out[1] == 0xE4);
+			iconv_close(cd);
+		}
+
+		/* A character with no Latin-1 form is an ERROR, not a silent
+		 * substitution: plain iconv reports EILSEQ and only //TRANSLIT
+		 * replaces it.  This is what stops "save as ISO-8859-1" from
+		 * quietly writing a file full of question marks.  U+20AC (euro)
+		 * is E2 82 AC in UTF-8. */
+		cd = iconv_open("ISO-8859-1", "UTF-8");
+		if (cd != (iconv_t)-1) {
+			in[0] = (char)0xE2;
+			in[1] = (char)0x82;
+			in[2] = (char)0xAC;
+			ip = in;
+			il = 3;
+			op = out;
+			ol = sizeof(out);
+			errno = 0;
+			r = iconv(cd, &ip, &il, &op, &ol);
+			test_result("unrepresentable char -> EILSEQ, no substitution",
+				    r == (size_t)-1 && errno == EILSEQ);
+			iconv_close(cd);
+		}
+
+		/* ...and with //TRANSLIT it IS replaced, and counted as a
+		 * non-reversible conversion. */
+		cd = iconv_open("ISO-8859-1//TRANSLIT", "UTF-8");
+		in[0] = (char)0xE2;
+		in[1] = (char)0x82;
+		in[2] = (char)0xAC;
+		ip = in;
+		il = 3;
+		op = out;
+		ol = sizeof(out);
+		out[0] = 0;
+		r = (cd == (iconv_t)-1) ? (size_t)-1 :
+					  iconv(cd, &ip, &il, &op, &ol);
+		test_result("//TRANSLIT substitutes and counts it",
+			    cd != (iconv_t)-1 && r == 1 && out[0] == '?');
+		if (cd != (iconv_t)-1)
+			iconv_close(cd);
+
+		/* ...but ISO-8859-15 DOES have the euro, at 0xA4. */
+		cd = iconv_open("ISO-8859-15", "UTF-8");
+		if (cd != (iconv_t)-1) {
+			in[0] = (char)0xE2;
+			in[1] = (char)0x82;
+			in[2] = (char)0xAC;
+			ip = in;
+			il = 3;
+			op = out;
+			ol = sizeof(out);
+			r = iconv(cd, &ip, &il, &op, &ol);
+			test_result("euro encodes to 0xA4 in ISO-8859-15",
+				    r == 0 && (unsigned char)out[0] == 0xA4);
+			iconv_close(cd);
+		}
+
+		/* Error contract: a truncated sequence is EINVAL (come back with
+		 * more input), an invalid one is EILSEQ (never valid), and a
+		 * full output buffer is E2BIG.  Conflating them makes callers
+		 * either loop forever or give up on good data. */
+		cd = iconv_open("ISO-8859-1", "UTF-8");
+		if (cd != (iconv_t)-1) {
+			in[0] = (char)0xC3; /* first byte of a 2-byte sequence */
+			ip = in;
+			il = 1;
+			op = out;
+			ol = sizeof(out);
+			errno = 0;
+			r = iconv(cd, &ip, &il, &op, &ol);
+			test_result("truncated sequence -> EINVAL",
+				    r == (size_t)-1 && errno == EINVAL);
+
+			in[0] = (char)0x80; /* a bare continuation byte */
+			ip = in;
+			il = 1;
+			op = out;
+			ol = sizeof(out);
+			errno = 0;
+			r = iconv(cd, &ip, &il, &op, &ol);
+			test_result("invalid sequence -> EILSEQ",
+				    r == (size_t)-1 && errno == EILSEQ);
+			iconv_close(cd);
+		}
+
+		cd = iconv_open("UTF-8", "ISO-8859-1");
+		if (cd != (iconv_t)-1) {
+			in[0] = (char)0xE4; /* needs 2 bytes out */
+			ip = in;
+			il = 1;
+			op = out;
+			ol = 1; /* only room for 1 */
+			errno = 0;
+			r = iconv(cd, &ip, &il, &op, &ol);
+			test_result("full output buffer -> E2BIG",
+				    r == (size_t)-1 && errno == E2BIG);
+			test_result("E2BIG consumed no input",
+				    il == 1 && ip == in);
+			iconv_close(cd);
+		}
+
+		/* Over-long forms and surrogates are valid bit patterns but
+		 * invalid UTF-8; accepting them is how decoders become holes.
+		 * 0xC0 0x80 is an over-long NUL. */
+		cd = iconv_open("ISO-8859-1", "UTF-8");
+		if (cd != (iconv_t)-1) {
+			in[0] = (char)0xC0;
+			in[1] = (char)0x80;
+			ip = in;
+			il = 2;
+			op = out;
+			ol = sizeof(out);
+			errno = 0;
+			r = iconv(cd, &ip, &il, &op, &ol);
+			test_result("over-long UTF-8 rejected (EILSEQ)",
+				    r == (size_t)-1 && errno == EILSEQ);
+			iconv_close(cd);
+		}
+
+		/* A code point above the BMP exercises the UTF-16 surrogate
+		 * pairing both ways.  U+1F600 -> D83D DE00. */
+		cd = iconv_open("UTF-16LE", "UTF-8");
+		if (cd != (iconv_t)-1) {
+			in[0] = (char)0xF0;
+			in[1] = (char)0x9F;
+			in[2] = (char)0x98;
+			in[3] = (char)0x80;
+			ip = in;
+			il = 4;
+			op = out;
+			ol = sizeof(out);
+			r = iconv(cd, &ip, &il, &op, &ol);
+			test_result("astral char -> UTF-16 surrogate pair",
+				    r != (size_t)-1 &&
+					    (size_t)(op - out) == 4 &&
+					    (unsigned char)out[0] == 0x3D &&
+					    (unsigned char)out[1] == 0xD8 &&
+					    (unsigned char)out[2] == 0x00 &&
+					    (unsigned char)out[3] == 0xDE);
+			iconv_close(cd);
+		}
+
+		errno = 0;
+		test_result("iconv_close((iconv_t)-1) fails with EBADF",
+			    iconv_close((iconv_t)-1) == -1 && errno == EBADF);
+	}
+
+	// ========================================
+	// Test: O_CREAT file mode and umask
+	//
+	// The mode argument to open() was discarded in three independent
+	// places -- libc passed 0, the syscall ignored it, and ext4 created
+	// every file 0644 -- while umask() was a libc-private variable that
+	// nothing read.  The result was that a program could not create a
+	// private file at all: mkstemp() asks for 0600 and got 0644, so every
+	// temporary file was world-readable.
+	// ========================================
+	printf("\n[TEST] O_CREAT mode and umask\n");
+	{
+		struct stat mst;
+		mode_t oldmask = umask(0);
+		char mpath[] = "/tmp/likeos_mode_test";
+		char dpath[] = "/tmp/likeos_mode_dir";
+
+		unlink(mpath);
+		rmdir(dpath);
+
+		/* The requested mode, with the mask wide open. */
+		int mfd2 = open(mpath, O_RDWR | O_CREAT | O_EXCL, 0600);
+		test_result("open(O_CREAT, 0600) succeeds", mfd2 >= 0);
+		if (mfd2 >= 0) {
+			test_result("...and the file really is 0600",
+				    fstat(mfd2, &mst) == 0 &&
+					    (mst.st_mode & 07777) == 0600);
+			close(mfd2);
+		}
+		/* An existing file's mode must NOT be changed by a later
+		 * O_CREAT open -- POSIX applies the mode only on creation. */
+		mfd2 = open(mpath, O_RDWR | O_CREAT, 0666);
+		test_result("O_CREAT on an existing file leaves its mode alone",
+			    mfd2 >= 0 && fstat(mfd2, &mst) == 0 &&
+				    (mst.st_mode & 07777) == 0600);
+		if (mfd2 >= 0)
+			close(mfd2);
+		unlink(mpath);
+
+		/* 0666 under umask 022 is 0644 ... */
+		umask(0022);
+		mfd2 = open(mpath, O_RDWR | O_CREAT | O_EXCL, 0666);
+		test_result("umask 022 turns 0666 into 0644",
+			    mfd2 >= 0 && fstat(mfd2, &mst) == 0 &&
+				    (mst.st_mode & 07777) == 0644);
+		if (mfd2 >= 0)
+			close(mfd2);
+		unlink(mpath);
+
+		/* ... and under umask 077 it is 0600.  This is the case that
+		 * proves umask() reaches the kernel at all. */
+		umask(0077);
+		mfd2 = open(mpath, O_RDWR | O_CREAT | O_EXCL, 0666);
+		test_result("umask 077 turns 0666 into 0600",
+			    mfd2 >= 0 && fstat(mfd2, &mst) == 0 &&
+				    (mst.st_mode & 07777) == 0600);
+		if (mfd2 >= 0)
+			close(mfd2);
+		unlink(mpath);
+
+		/* umask() returns the PREVIOUS mask -- callers rely on that to
+		 * restore it, and a wrong return value silently leaves the
+		 * process with the wrong mask afterwards. */
+		test_result("umask() returns the previous mask",
+			    umask(0022) == 0077 && umask(0022) == 0022);
+
+		/* mkdir honours mode & ~umask too. */
+		umask(0022);
+		test_result("mkdir(0777) under umask 022 is 0755",
+			    mkdir(dpath, 0777) == 0 &&
+				    stat(dpath, &mst) == 0 &&
+				    (mst.st_mode & 07777) == 0755);
+		rmdir(dpath);
+
+		/* The security payoff: a temporary file is private. */
+		umask(0);
+		char tmpl[] = "/tmp/likeos_modeXXXXXX";
+		int tfd2 = mkstemp(tmpl);
+		test_result("mkstemp() creates a 0600 file, not world-readable",
+			    tfd2 >= 0 && fstat(tfd2, &mst) == 0 &&
+				    (mst.st_mode & 07777) == 0600);
+		if (tfd2 >= 0) {
+			close(tfd2);
+			unlink(tmpl);
+		}
+
+		/* The mask belongs to the PROCESS, so every thread of it shares
+		 * one value: a thread must observe what main set, and a change
+		 * the thread makes must be visible back here.  A per-task copy
+		 * would pass the fork test below and still fail this one. */
+		{
+			pthread_t ut;
+			umask(0027);
+			g_umask_seen_in_thread = 0777;
+			if (pthread_create(&ut, NULL, umask_thread_fn, NULL) == 0) {
+				pthread_join(ut, NULL);
+				test_result("a thread sees the process umask",
+					    g_umask_seen_in_thread == 0027);
+				test_result("...and its change is visible to us",
+					    umask(0022) == 0044);
+			} else {
+				test_fail("pthread_create for the umask test");
+			}
+		}
+
+		/* The mask is per-process state and must survive fork(). */
+		umask(0077);
+		pid_t mpid = fork();
+		if (mpid == 0) {
+			_exit(umask(0) == 0077 ? 0 : 1);
+		} else if (mpid > 0) {
+			int mst2 = 0;
+			waitpid(mpid, &mst2, 0);
+			test_result("umask is inherited across fork()",
+				    WIFEXITED(mst2) && WEXITSTATUS(mst2) == 0);
+		}
+
+		umask(oldmask);
+	}
+
+	// ========================================
+	// Test: difftime / strptime
+	// ========================================
+	printf("\n[TEST] difftime and strptime\n");
+	{
+		struct tm tmv;
+		char *endp;
+
+		test_result("difftime of two times", difftime(100, 40) == 60.0);
+		test_result("difftime is signed", difftime(40, 100) == -60.0);
+		/* Computed in double: subtracting distant time_t values as
+		 * integers can overflow, which is undefined behaviour. */
+		test_result("difftime over a huge span",
+			    difftime((time_t)4000000000LL, (time_t)-4000000000LL) ==
+				    8000000000.0);
+
+		memset(&tmv, 0, sizeof(tmv));
+		endp = strptime("2026-07-31", "%Y-%m-%d", &tmv);
+		test_result("strptime parses an ISO date",
+			    endp != NULL && *endp == '\0' &&
+				    tmv.tm_year == 126 && tmv.tm_mon == 6 &&
+				    tmv.tm_mday == 31);
+		/* The weekday and day-of-year are derived even though the
+		 * format never mentions them -- code that parses a date and
+		 * then reads tm_wday is common, and leaving it zero silently
+		 * means Sunday.  2026-07-31 is a Friday, day 211. */
+		test_result("...and derives tm_wday/tm_yday",
+			    tmv.tm_wday == 5 && tmv.tm_yday == 211);
+
+		memset(&tmv, 0, sizeof(tmv));
+		endp = strptime("Fri Jul 31 12:34:56 2026",
+				"%a %b %e %H:%M:%S %Y", &tmv);
+		test_result("strptime parses a full date and time",
+			    endp != NULL && *endp == '\0' &&
+				    tmv.tm_hour == 12 && tmv.tm_min == 34 &&
+				    tmv.tm_sec == 56 && tmv.tm_wday == 5);
+
+		/* Names are matched case-insensitively, and the FULL name must
+		 * win over the abbreviation: "Sunday" also begins with "Sun",
+		 * so matching the short form first would leave "day" behind. */
+		memset(&tmv, 0, sizeof(tmv));
+		endp = strptime("SUNDAY", "%A", &tmv);
+		test_result("strptime matches a full day name, any case",
+			    endp != NULL && *endp == '\0' && tmv.tm_wday == 0);
+
+		/* Two-digit years follow POSIX: 69-99 are 1900s, 00-68 2000s. */
+		memset(&tmv, 0, sizeof(tmv));
+		strptime("69", "%y", &tmv);
+		test_result("%y 69 is 1969", tmv.tm_year == 69);
+		memset(&tmv, 0, sizeof(tmv));
+		strptime("68", "%y", &tmv);
+		test_result("%y 68 is 2068", tmv.tm_year == 168);
+
+		/* %I with %p. */
+		memset(&tmv, 0, sizeof(tmv));
+		strptime("12:00 AM", "%I:%M %p", &tmv);
+		test_result("12:00 AM is hour 0", tmv.tm_hour == 0);
+		memset(&tmv, 0, sizeof(tmv));
+		strptime("12:00 PM", "%I:%M %p", &tmv);
+		test_result("12:00 PM is hour 12", tmv.tm_hour == 12);
+
+		/* The number reader stops early rather than failing, which is
+		 * what lets unpadded "%H%M%S" input parse at all. */
+		memset(&tmv, 0, sizeof(tmv));
+		endp = strptime("123456", "%H%M%S", &tmv);
+		test_result("%H%M%S splits an unpadded time",
+			    endp != NULL && tmv.tm_hour == 12 &&
+				    tmv.tm_min == 34 && tmv.tm_sec == 56);
+
+		/* ISO 8601 offsets, including the colon form a browser meets in
+		 * HTTP and Atom dates. */
+		memset(&tmv, 0, sizeof(tmv));
+		endp = strptime("2026-07-31T10:20:30+01:30",
+				"%Y-%m-%dT%H:%M:%S%z", &tmv);
+		test_result("strptime consumes a +hh:mm offset",
+			    endp != NULL && *endp == '\0' &&
+				    tmv.tm_hour == 10 && tmv.tm_min == 20);
+		memset(&tmv, 0, sizeof(tmv));
+		endp = strptime("2026-07-31T10:20:30Z", "%Y-%m-%dT%H:%M:%S%z",
+				&tmv);
+		test_result("strptime consumes a Z offset",
+			    endp != NULL && *endp == '\0');
+
+		/* Mismatches return NULL rather than a partial answer. */
+		memset(&tmv, 0, sizeof(tmv));
+		test_result("a non-matching input returns NULL",
+			    strptime("not a date", "%Y-%m-%d", &tmv) == NULL);
+		test_result("an out-of-range month returns NULL",
+			    strptime("13", "%m", &tmv) == NULL);
+
+		/* Trailing input is left for the caller, not an error. */
+		memset(&tmv, 0, sizeof(tmv));
+		endp = strptime("2026-07-31 leftover", "%Y-%m-%d", &tmv);
+		test_result("unconsumed input is returned, not rejected",
+			    endp != NULL && strcmp(endp, " leftover") == 0);
+
+		/* Fields the format does not mention are left alone, which is
+		 * what lets several calls build up one time. */
+		memset(&tmv, 0, sizeof(tmv));
+		tmv.tm_hour = 7;
+		strptime("2026-07-31", "%Y-%m-%d", &tmv);
+		test_result("unmentioned fields are preserved", tmv.tm_hour == 7);
+	}
+
+	// ========================================
+	// Test: unlinkat
+	// ========================================
+	printf("\n[TEST] unlinkat\n");
+	{
+		char ubase[] = "/tmp/likeos_unlinkat";
+		char ufile[128], udir[128];
+		int dfd;
+
+		snprintf(ufile, sizeof(ufile), "%s/file", ubase);
+		snprintf(udir, sizeof(udir), "%s/dir", ubase);
+		/* clean slate from any earlier run */
+		unlink(ufile);
+		rmdir(udir);
+		rmdir(ubase);
+
+		test_result("mkdir the unlinkat test directory",
+			    mkdir(ubase, 0700) == 0);
+		dfd = open(ubase, O_RDONLY);
+		test_result("open the directory for use as a dirfd", dfd >= 0);
+
+		/* AT_FDCWD with an absolute path behaves like unlink(). */
+		{
+			int fd = open(ufile, O_WRONLY | O_CREAT | O_EXCL, 0600);
+			if (fd >= 0)
+				close(fd);
+			test_result("unlinkat(AT_FDCWD) removes a file",
+				    unlinkat(AT_FDCWD, ufile, 0) == 0 &&
+					    access(ufile, F_OK) != 0);
+		}
+
+		/* A relative name is resolved against the dirfd -- the whole
+		 * point of the call. */
+		if (dfd >= 0) {
+			int fd = open(ufile, O_WRONLY | O_CREAT | O_EXCL, 0600);
+			if (fd >= 0)
+				close(fd);
+			test_result("unlinkat(dirfd, \"file\") removes it",
+				    unlinkat(dfd, "file", 0) == 0 &&
+					    access(ufile, F_OK) != 0);
+		}
+
+		/* A directory needs AT_REMOVEDIR, and must be refused without
+		 * it -- otherwise unlink() semantics would silently differ. */
+		test_result("mkdir a subdirectory", mkdir(udir, 0700) == 0);
+		errno = 0;
+		test_result("unlinkat on a directory without AT_REMOVEDIR fails",
+			    unlinkat(AT_FDCWD, udir, 0) != 0);
+		test_result("unlinkat with AT_REMOVEDIR removes it",
+			    unlinkat(AT_FDCWD, udir, AT_REMOVEDIR) == 0 &&
+				    access(udir, F_OK) != 0);
+
+		/* An unimplemented flag must be rejected, not ignored: a caller
+		 * passing one is asking for behaviour we would not deliver. */
+		errno = 0;
+		test_result("an unknown flag is EINVAL",
+			    unlinkat(AT_FDCWD, ufile, 0x40) == -1 &&
+				    errno == EINVAL);
+
+		errno = 0;
+		test_result("unlinkat on a missing name is ENOENT",
+			    unlinkat(AT_FDCWD, "/tmp/likeos_no_such_file_xyz",
+				     0) == -1 &&
+				    errno == ENOENT);
+
+		/* The whole *at() family shares one path-resolution helper, and
+		 * it rejected every real dirfd until unlinkat exposed it.  These
+		 * cover the other three, which were equally broken and had no
+		 * test at all. */
+		if (dfd >= 0) {
+			int fd = open(ufile, O_WRONLY | O_CREAT | O_EXCL, 0600);
+			if (fd >= 0) {
+				write(fd, "xyz", 3);
+				close(fd);
+			}
+
+			fd = openat(dfd, "file", O_RDONLY);
+			test_result("openat(dirfd, \"file\") opens it", fd >= 0);
+			if (fd >= 0)
+				close(fd);
+
+			{
+				struct stat ast;
+				test_result("fstatat(dirfd, \"file\") stats it",
+					    fstatat(dfd, "file", &ast, 0) == 0 &&
+						    ast.st_size == 3);
+			}
+			test_result("faccessat(dirfd, \"file\") succeeds",
+				    faccessat(dfd, "file", F_OK, 0) == 0);
+
+			/* An absolute path ignores the dirfd, as POSIX says. */
+			test_result("an absolute path ignores the dirfd",
+				    faccessat(dfd, ufile, F_OK, 0) == 0);
+
+			/* A dirfd that is not a directory must be ENOTDIR --
+			 * resolving against a regular file would invent a path
+			 * that looks valid and refers to nothing. */
+			{
+				int ffd = open(ufile, O_RDONLY);
+				if (ffd >= 0) {
+					errno = 0;
+					test_result("a non-directory dirfd is ENOTDIR",
+						    faccessat(ffd, "x", F_OK,
+							      0) == -1 &&
+							    errno == ENOTDIR);
+					close(ffd);
+				}
+			}
+
+			errno = 0;
+			test_result("a closed dirfd is EBADF",
+				    faccessat(9999, "x", F_OK, 0) == -1 &&
+					    errno == EBADF);
+
+			unlink(ufile);
+		}
+
+		if (dfd >= 0)
+			close(dfd);
+		rmdir(ubase);
+	}
+
+	// ========================================
+	// Test: shared-memory permissions
+	// ========================================
+	printf("\n[TEST] shared memory permissions\n");
+	{
+		/* Root bypasses IPC permission checks, exactly as CAP_IPC_OWNER
+		 * does on the reference system -- so asserting denial while
+		 * running as root proves nothing.  The denial paths are checked
+		 * in a child that drops privilege; what root does here is
+		 * checked as root, because being allowed IS the correct
+		 * behaviour for it. */
+		const uid_t nobody = 65534;
+		int rid = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0044);
+
+		test_result("shmget creates a segment readable only by others",
+			    rid >= 0);
+		if (rid >= 0) {
+			struct shmid_ds ds;
+			void *p1;
+
+			/* Root: allowed regardless of the mode. */
+			p1 = shmat(rid, NULL, 0);
+			test_result("root may attach read-write despite mode 0044",
+				    p1 != (void *)-1);
+			if (p1 != (void *)-1)
+				shmdt(p1);
+
+			test_result("IPC_STAT reports our uid and mode",
+				    shmctl(rid, IPC_STAT, &ds) == 0 &&
+					    ds.shm_perm.uid == getuid() &&
+					    (ds.shm_perm.mode & 0777) == 0044);
+
+			/* Non-root: the "other" triple applies -- read yes,
+			 * write no. */
+			fflush(stdout);
+			{
+				pid_t sp = fork();
+				if (sp == 0) {
+					int rc = 0;
+					void *a;
+					if (setuid(nobody) != 0)
+						_exit(9);
+					a = shmat(rid, NULL, SHM_RDONLY);
+					if (a == (void *)-1)
+						rc |= 1; /* read should work */
+					else
+						shmdt(a);
+					errno = 0;
+					a = shmat(rid, NULL, 0);
+					if (a != (void *)-1) {
+						rc |= 2; /* write must not */
+						shmdt(a);
+					} else if (errno != EACCES) {
+						rc |= 4;
+					}
+					_exit(rc);
+				} else if (sp > 0) {
+					int st = 0;
+					waitpid(sp, &st, 0);
+					test_result("a non-owner may attach read-only",
+						    WIFEXITED(st) &&
+							    !(WEXITSTATUS(st) & 1));
+					test_result("...but read-write is refused with EACCES",
+						    WIFEXITED(st) &&
+							    !(WEXITSTATUS(st) & 6));
+				}
+			}
+			test_result("the owner may IPC_RMID",
+				    shmctl(rid, IPC_RMID, NULL) == 0);
+		}
+
+		/* shmget() on an EXISTING key must honour the segment's mode
+		 * for a non-owner.  Root would be let through, so again the
+		 * check runs in a child. */
+		{
+			key_t k = (key_t)0x4c494b45; /* "LIKE" */
+			int kid = shmget(k, 0, 0);
+			if (kid >= 0)
+				shmctl(kid, IPC_RMID, NULL);
+
+			kid = shmget(k, 4096, IPC_CREAT | IPC_EXCL | 0044);
+			test_result("shmget creates a 0044 segment by key",
+				    kid >= 0);
+			if (kid >= 0) {
+				test_result("re-getting it for READ succeeds",
+					    shmget(k, 0, 0400) == kid);
+				fflush(stdout);
+				{
+					pid_t sp = fork();
+					if (sp == 0) {
+						int rc = 0;
+						if (setuid(nobody) != 0)
+							_exit(9);
+						if (shmget(k, 0, 0004) < 0)
+							rc |= 1;
+						errno = 0;
+						if (shmget(k, 0, 0002) != -1 ||
+						    errno != EACCES)
+							rc |= 2;
+						_exit(rc);
+					} else if (sp > 0) {
+						int st = 0;
+						waitpid(sp, &st, 0);
+						test_result("a non-owner may get it for read",
+							    WIFEXITED(st) &&
+								    !(WEXITSTATUS(st) & 1));
+						test_result("...but asking for write is EACCES",
+							    WIFEXITED(st) &&
+								    !(WEXITSTATUS(st) & 2));
+					}
+				}
+				shmctl(kid, IPC_RMID, NULL);
+			}
+		}
+
+		/* A read-write segment behaves normally. */
+		{
+			int wid = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+			if (wid >= 0) {
+				void *p2 = shmat(wid, NULL, 0);
+				test_result("shmat read-write on 0600 attaches",
+					    p2 != (void *)-1);
+				if (p2 != (void *)-1) {
+					*(volatile int *)p2 = 0x5a5a;
+					test_result("...and the mapping is writable",
+						    *(volatile int *)p2 == 0x5a5a);
+					shmdt(p2);
+				}
+				shmctl(wid, IPC_RMID, NULL);
+			} else {
+				test_fail("shmget for the read-write segment");
+			}
+		}
+
+		/* POSIX shm: the mode passed to shm_open must be honoured, and
+		 * fstat() on the descriptor must report it -- devfs had no
+		 * fstat case for shm objects at all, so it reported a device
+		 * instead of the object. */
+		{
+			mode_t om = umask(0);
+			int sfd;
+			struct stat sst;
+
+			shm_unlink("/likeos_perm_test");
+			sfd = shm_open("/likeos_perm_test",
+				       O_RDWR | O_CREAT | O_EXCL, 0644);
+			test_result("shm_open creates the object", sfd >= 0);
+			if (sfd >= 0) {
+				test_result("...with the mode that was asked for",
+					    fstat(sfd, &sst) == 0 &&
+						    (sst.st_mode & 0777) == 0644);
+				test_result("...and fstat reports it as a file",
+					    fstat(sfd, &sst) == 0 &&
+						    S_ISREG(sst.st_mode));
+				if (ftruncate(sfd, 8192) == 0)
+					test_result("...and fstat reports the size",
+						    fstat(sfd, &sst) == 0 &&
+							    sst.st_size == 8192);
+				close(sfd);
+				shm_unlink("/likeos_perm_test");
+			}
+			umask(om);
+		}
+	}
+
+	// ========================================
+	// Test: AF_UNIX bulk transfer (ring + park/wake)
+	// ========================================
+	printf("\n[TEST] AF_UNIX bulk transfer\n");
+	{
+		/* Pushes far more than one ringful through a socketpair, which
+		 * is the path that used to spin: the sender filled the ring and
+		 * then sched_yield'd in a loop until the reader drained it.  It
+		 * now parks and is woken, so this exercises ring allocation,
+		 * the full-ring block, the wake on drain, and the wake on
+		 * close.  A lost wake shows up here as a hang, and wrong
+		 * bookkeeping as corrupted data. */
+		int sv[2];
+		const size_t total = 512 * 1024;
+
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+			test_fail("socketpair for the bulk transfer test");
+		} else {
+			pid_t bp;
+			fflush(stdout);
+			bp = fork();
+			if (bp == 0) {
+				/* Child writes a byte pattern. */
+				unsigned char *out = malloc(4096);
+				size_t done = 0;
+				close(sv[0]);
+				if (!out)
+					_exit(2);
+				while (done < total) {
+					size_t n = total - done;
+					if (n > 4096)
+						n = 4096;
+					for (size_t i = 0; i < n; i++)
+						out[i] = (unsigned char)((done + i) & 0xff);
+					ssize_t w = write(sv[1], out, n);
+					if (w <= 0)
+						_exit(3);
+					done += (size_t)w;
+				}
+				free(out);
+				close(sv[1]);
+				_exit(0);
+			} else if (bp > 0) {
+				unsigned char *in = malloc(4096);
+				size_t got = 0;
+				int corrupt = 0, st = 0;
+
+				close(sv[1]);
+				while (in && got < total) {
+					ssize_t r = read(sv[0], in, 4096);
+					if (r <= 0)
+						break;
+					for (ssize_t i = 0; i < r; i++)
+						if (in[i] != (unsigned char)((got + (size_t)i) & 0xff)) {
+							corrupt = 1;
+							break;
+						}
+					got += (size_t)r;
+				}
+				free(in);
+				close(sv[0]);
+				waitpid(bp, &st, 0);
+
+				test_result("512KB crosses a socketpair intact",
+					    got == total && !corrupt);
+				test_result("the writer finished cleanly",
+					    WIFEXITED(st) && WEXITSTATUS(st) == 0);
+			}
+		}
+	}
+
+	// ========================================
+	// Test: AF_UNIX socket node permissions
+	// ========================================
+	printf("\n[TEST] AF_UNIX node permissions\n");
+	{
+		/* A bound socket node used to be created 0777 -- world
+		 * writable -- and since connecting requires write permission on
+		 * the node, that granted every user access to every service.
+		 * It now follows the umask like any other created name. */
+		char spath[] = "/tmp/likeos_uds_perm";
+		mode_t om = umask(022);
+		int sfd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+		unlink(spath);
+		if (sfd >= 0) {
+			struct sockaddr_un sa;
+			struct stat sst;
+
+			memset(&sa, 0, sizeof(sa));
+			sa.sun_family = AF_UNIX;
+			strcpy(sa.sun_path, spath);
+			test_result("bind creates the socket node",
+				    bind(sfd, (struct sockaddr *)&sa,
+					 sizeof(sa)) == 0);
+			test_result("the node is a socket",
+				    stat(spath, &sst) == 0 &&
+					    S_ISSOCK(sst.st_mode));
+			test_result("...and its mode is 0777 & ~umask",
+				    (sst.st_mode & 0777) == 0755);
+
+			/* We own it, so we can still connect to our own
+			 * service -- the new permission check must not lock us
+			 * out.
+			 *
+			 * The connect MUST come from another process: connect()
+			 * blocks until the listener accepts, so calling it in
+			 * the same single-threaded process that owns the
+			 * listening socket deadlocks. */
+			listen(sfd, 1);
+			fflush(stdout);
+			{
+				pid_t cp = fork();
+				if (cp == 0) {
+					int cfd = socket(AF_UNIX, SOCK_STREAM,
+							 0);
+					int r = -1;
+					if (cfd >= 0) {
+						r = connect(cfd,
+							    (struct sockaddr *)
+								    &sa,
+							    sizeof(sa));
+						close(cfd);
+					}
+					_exit(r == 0 ? 0 : 1);
+				} else if (cp > 0) {
+					int afd = accept(sfd, NULL, NULL);
+					int st = 0;
+					waitpid(cp, &st, 0);
+					test_result("the owner can still connect",
+						    afd >= 0 &&
+							    WIFEXITED(st) &&
+							    WEXITSTATUS(st) == 0);
+					if (afd >= 0)
+						close(afd);
+				}
+			}
+			close(sfd);
+			unlink(spath);
+		} else {
+			test_fail("socket(AF_UNIX) for the permission test");
+		}
+		umask(om);
+	}
+
+	// ========================================
+	// Test: strncpy / strncat write bounds
+	// ========================================
+	printf("\n[TEST] strncpy/strncat bounds\n");
+	{
+		/* strncpy must write EXACTLY n bytes and strncat at most n+1.
+		 * Both used to write one byte too many whenever the source was
+		 * shorter than n -- the common case -- because the copy loop
+		 * consumed the source's terminator without decrementing n, so
+		 * the padding step then ran one past the end.  That overflowed
+		 * every exactly-sized buffer in the system, corrupting whatever
+		 * followed it. */
+		char buf[32];
+		int over = 0, wrong = 0;
+
+		for (size_t n = 1; n <= 12; n++) {
+			const char *srcs[] = { "", "a", "ab", "abcdefghij" };
+			for (unsigned k = 0; k < 4; k++) {
+				memset(buf, 0x7E, sizeof(buf));
+				strncpy(buf, srcs[k], n);
+				/* the byte just past n must be untouched */
+				if ((unsigned char)buf[n] != 0x7E)
+					over++;
+				/* and the result must match the definition */
+				{
+					size_t sl = strlen(srcs[k]);
+					size_t c = sl < n ? sl : n;
+					if (memcmp(buf, srcs[k], c) != 0)
+						wrong++;
+					for (size_t z = c; z < n; z++)
+						if (buf[z] != '\0')
+							wrong++;
+				}
+			}
+		}
+		test_result("strncpy writes no byte past n", over == 0);
+		test_result("strncpy pads correctly within n", wrong == 0);
+
+		over = 0;
+		wrong = 0;
+		for (size_t n = 0; n <= 8; n++) {
+			memset(buf, 0x7E, sizeof(buf));
+			strcpy(buf, "XY");
+			strncat(buf, "abcdef", n);
+			{
+				size_t app = 6 < n ? 6 : n;
+				/* "XY" + app chars + one NUL, nothing beyond */
+				if ((unsigned char)buf[2 + app + 1] != 0x7E)
+					over++;
+				if (strlen(buf) != 2 + app)
+					wrong++;
+			}
+		}
+		test_result("strncat writes no byte past n+1", over == 0);
+		test_result("strncat appends exactly min(n, srclen)", wrong == 0);
+	}
+
+	// ========================================
+	// Test: malloc_usable_size is honest
+	// ========================================
+	printf("\n[TEST] malloc_usable_size\n");
+	{
+		/* Writing usable_size bytes into a block must be safe: that is
+		 * the entire contract of the call.  If it OVER-reports, the
+		 * write runs into the next chunk and corrupts a neighbour --
+		 * which is exactly the shape of the netsurf corruption.  Each
+		 * block is bracketed by neighbours holding a known pattern, so
+		 * an over-report shows up as a damaged neighbour. */
+		static const size_t req[] = { 1,   7,	8,    9,    15,	  16,
+					      17,  31,	32,   33,   63,	  64,
+					      65,  100, 127,  128,  129,  255,
+					      256, 257, 1000, 1024, 4095, 4096 };
+		int bad_small = 0, neighbour = 0;
+
+		for (unsigned i = 0; i < sizeof(req) / sizeof(req[0]); i++) {
+			unsigned char *lo = malloc(64);
+			unsigned char *mid = malloc(req[i]);
+			unsigned char *hi = malloc(64);
+			size_t us;
+
+			if (!lo || !mid || !hi) {
+				free(lo);
+				free(mid);
+				free(hi);
+				continue;
+			}
+			memset(lo, 0x11, 64);
+			memset(hi, 0x22, 64);
+
+			us = malloc_usable_size(mid);
+			/* It must never claim LESS than was asked for. */
+			if (us < req[i])
+				bad_small++;
+			/* Filling the whole usable area must not touch either
+			 * neighbour. */
+			memset(mid, 0x33, us);
+			for (int k = 0; k < 64; k++)
+				if (lo[k] != 0x11 || hi[k] != 0x22) {
+					neighbour++;
+					break;
+				}
+			free(lo);
+			free(mid);
+			free(hi);
+		}
+		test_result("usable_size is never less than the request",
+			    bad_small == 0);
+		test_result("filling the usable area leaves neighbours intact",
+			    neighbour == 0);
+	}
+
+	// ========================================
+	// Test: allocator does not hand out a live chunk twice
+	// ========================================
+	printf("\n[TEST] allocator overlap and integrity\n");
+	{
+		/* NetSurf dies reading an object whose memory has been reused
+		 * for unrelated text.  That is either the browser freeing
+		 * something it still references, or this allocator handing the
+		 * same chunk to two live callers.  This separates the two: it
+		 * holds many blocks live at once, stamps each with a unique
+		 * pattern, and re-checks every one after every operation.  If
+		 * malloc ever returns memory that is already in use, one
+		 * block's stamp is overwritten by another's and this fails.
+		 *
+		 * Sizes deliberately straddle the allocator's class
+		 * boundaries -- tcache, fastbin, smallbin, largebin and the
+		 * mmap threshold -- because a reuse bug usually lives at one
+		 * specific boundary. */
+#define AL_N 192
+		static unsigned char *blk[AL_N];
+		static size_t blksz[AL_N];
+		static unsigned char stamp[AL_N];
+		static const size_t sizes[] = { 8,	16,    24,    32,
+						48,	64,    100,   128,
+						200,	256,   500,   1024,
+						2048,	4096,  8192,  16384,
+						32768,	65536, 131072 };
+		unsigned long seed = 20260731UL;
+		int overlaps = 0, corrupt = 0, oom = 0;
+
+		for (int i = 0; i < AL_N; i++)
+			blk[i] = NULL;
+
+		for (int round = 0; round < 4000; round++) {
+			seed = seed * 6364136223846793005UL + 1442695040888963407UL;
+			int i = (int)((seed >> 33) % AL_N);
+			seed = seed * 6364136223846793005UL + 1442695040888963407UL;
+			int op = (int)((seed >> 33) % 3);
+
+			if (blk[i] && op == 0) {
+				/* verify before releasing */
+				for (size_t k = 0; k < blksz[i]; k++)
+					if (blk[i][k] != stamp[i]) {
+						corrupt++;
+						break;
+					}
+				free(blk[i]);
+				blk[i] = NULL;
+			} else if (blk[i] && op == 1) {
+				seed = seed * 6364136223846793005UL +
+				       1442695040888963407UL;
+				size_t ns = sizes[(seed >> 33) %
+						  (sizeof(sizes) / sizeof(sizes[0]))];
+				unsigned char *np = realloc(blk[i], ns);
+				if (!np) {
+					oom++;
+					continue;
+				}
+				/* realloc must preserve the old contents up to
+				 * the smaller of the two sizes */
+				size_t keep = ns < blksz[i] ? ns : blksz[i];
+				for (size_t k = 0; k < keep; k++)
+					if (np[k] != stamp[i]) {
+						corrupt++;
+						break;
+					}
+				blk[i] = np;
+				blksz[i] = ns;
+				memset(blk[i], stamp[i], blksz[i]);
+			} else {
+				if (blk[i])
+					free(blk[i]);
+				seed = seed * 6364136223846793005UL +
+				       1442695040888963407UL;
+				blksz[i] = sizes[(seed >> 33) %
+						 (sizeof(sizes) / sizeof(sizes[0]))];
+				blk[i] = malloc(blksz[i]);
+				if (!blk[i]) {
+					oom++;
+					continue;
+				}
+				stamp[i] = (unsigned char)(i + 1);
+				memset(blk[i], stamp[i], blksz[i]);
+			}
+
+			/* Every live block must still read back as its own
+			 * stamp.  A chunk handed out twice shows up here as
+			 * soon as the second owner writes to it. */
+			if ((round & 63) == 0) {
+				for (int j = 0; j < AL_N; j++) {
+					if (!blk[j])
+						continue;
+					for (size_t k = 0; k < blksz[j]; k++)
+						if (blk[j][k] != stamp[j]) {
+							overlaps++;
+							j = AL_N;
+							break;
+						}
+				}
+			}
+		}
+
+		for (int i = 0; i < AL_N; i++)
+			if (blk[i])
+				free(blk[i]);
+
+		test_result("no live block was overwritten by another",
+			    overlaps == 0);
+		test_result("no block's contents were corrupted", corrupt == 0);
+		test_result("the allocator satisfied every request", oom == 0);
+#undef AL_N
+	}
+
+	// ========================================
+	// Test: snprintf return value (C99)
+	// ========================================
+	printf("\n[TEST] snprintf return value\n");
+	{
+		char sb[8];
+		int n;
+
+		/* C99: the return is the length the output WOULD have had, not
+		 * the number of bytes stored.  It used to be the truncated
+		 * count, so the standard truncation check below could never
+		 * fire and a caller sizing a buffer from the return value
+		 * under-allocated and then overran it. */
+		memset(sb, 'x', sizeof(sb));
+		n = snprintf(sb, sizeof(sb), "0123456789");
+		test_result("snprintf returns the untruncated length", n == 10);
+		test_result("...and truncation is detectable",
+			    n >= (int)sizeof(sb));
+		test_result("...and the buffer holds the prefix, terminated",
+			    strcmp(sb, "0123456") == 0);
+
+		n = snprintf(sb, sizeof(sb), "abc");
+		test_result("a fitting string returns its own length", n == 3);
+		test_result("...and is written whole", strcmp(sb, "abc") == 0);
+
+		/* The two-pass sizing idiom must work at any length -- the old
+		 * NULL/0 path formatted into an 8KB stack buffer and returned
+		 * at most 8191, so anything longer under-allocated. */
+		test_result("snprintf(NULL, 0, ...) measures", 
+			    snprintf(NULL, 0, "%s", "12345") == 5);
+		{
+			char big[9000];
+			char *heap;
+			memset(big, 'A', sizeof(big) - 1);
+			big[sizeof(big) - 1] = '\0';
+			n = snprintf(NULL, 0, "%s", big);
+			test_result("...with no 8KB ceiling", n == 8999);
+			heap = malloc((size_t)n + 1);
+			if (heap) {
+				int m = snprintf(heap, (size_t)n + 1, "%s", big);
+				test_result("...so two-pass sizing is exact",
+					    m == n && strlen(heap) == (size_t)n);
+				free(heap);
+			} else {
+				test_fail("malloc for the two-pass sizing test");
+			}
+		}
+
+		/* size 0 must not touch the buffer at all. */
+		memset(sb, 'x', sizeof(sb));
+		n = snprintf(sb, 0, "hello");
+		test_result("size 0 writes nothing but still measures",
+			    n == 5 && sb[0] == 'x');
+	}
+
+	// ========================================
+	// Test: ELF constructors
+	// ========================================
+	printf("\n[TEST] executable constructors\n");
+	{
+		test_result("a __attribute__((constructor)) ran", g_ctor_ran == 1);
+		/* And it ran BEFORE main, not lazily at first use: the flag was
+		 * already set when main started, which the marker below
+		 * recorded on entry. */
+		test_result("...and it ran before main()",
+			    g_ctor_saw_main_before == 1);
+	}
+
+	// ========================================
+	// Test: assert() namespace hygiene
+	// ========================================
+	printf("\n[TEST] assert namespace\n");
+	{
+		/* assert() must expand to nothing the program can shadow.  It
+		 * used to expand to fprintf(stderr,...)/abort() literally, so a
+		 * local object with one of those names broke compilation --
+		 * NetSurf's tree walker has a `bool abort` and hit exactly
+		 * that.  These locals reproduce the collision: if assert()
+		 * regresses, this file stops COMPILING, which is the strongest
+		 * form the check can take. */
+		int abort = 1;
+		int stderr = 2;
+		int fprintf = 3;
+
+		assert(abort == 1);
+		assert(stderr == 2);
+		assert(fprintf == 3);
+
+		test_result("assert() compiles where abort/stderr/fprintf are shadowed",
+			    abort == 1 && stderr == 2 && fprintf == 3);
+	}
+
+	// ========================================
+	// Test: ISO C stdio limits
+	// ========================================
+	printf("\n[TEST] stdio limit macros\n");
+	{
+		/* Required by ISO C and absent until libpng's tools failed to
+		 * compile for want of FILENAME_MAX.  Checked against the
+		 * standard's minimums and against the limits they are meant to
+		 * mirror, so a later edit to one cannot silently contradict
+		 * the other. */
+		test_result("FILENAME_MAX equals PATH_MAX",
+			    FILENAME_MAX == PATH_MAX);
+		test_result("FOPEN_MAX equals OPEN_MAX", FOPEN_MAX == OPEN_MAX);
+		test_result("FOPEN_MAX is at least the standard's 8",
+			    FOPEN_MAX >= 8);
+		test_result("TMP_MAX is at least the standard's 25",
+			    TMP_MAX >= 25);
+		test_result("FOPEN_MAX does not exceed sysconf(_SC_OPEN_MAX)",
+			    (long)FOPEN_MAX <= sysconf(_SC_OPEN_MAX));
+
+		/* tmpnam() must actually honour L_tmpnam. */
+		{
+			char tn[L_tmpnam];
+			char *r = tmpnam(tn);
+			test_result("tmpnam() fits in L_tmpnam",
+				    r != NULL && strlen(r) < L_tmpnam);
+		}
+
+		/* fgetpos/fsetpos: ISO C's position save/restore.  Added
+		 * because libpng would not compile without fpos_t. */
+		{
+			char fpath[] = "/tmp/likeos_fpos_test";
+			FILE *f = fopen(fpath, "w+");
+			if (f) {
+				fpos_t p1, p2;
+				int c;
+				fputs("ABCDEFGHIJ", f);
+				rewind(f);
+				test_result("fgetpos at start succeeds",
+					    fgetpos(f, &p1) == 0);
+				test_result("read after fgetpos gives 'A'",
+					    fgetc(f) == 'A');
+				(void)fgetc(f); /* B */
+				test_result("fgetpos mid-file succeeds",
+					    fgetpos(f, &p2) == 0);
+				c = fgetc(f);
+				test_result("next byte is 'C'", c == 'C');
+				/* Back to the start... */
+				test_result("fsetpos to the start succeeds",
+					    fsetpos(f, &p1) == 0);
+				test_result("...and reading gives 'A' again",
+					    fgetc(f) == 'A');
+				/* ...and to the saved middle position. */
+				test_result("fsetpos to mid-file succeeds",
+					    fsetpos(f, &p2) == 0);
+				test_result("...and reading gives 'C' again",
+					    fgetc(f) == 'C');
+				/* fsetpos must clear EOF, like fseek does. */
+				fseek(f, 0, SEEK_END);
+				(void)fgetc(f); /* trip EOF */
+				test_result("EOF is set at end of file",
+					    feof(f) != 0);
+				fsetpos(f, &p1);
+				test_result("fsetpos clears the EOF flag",
+					    feof(f) == 0);
+				fclose(f);
+				unlink(fpath);
+			} else {
+				test_fail("fopen for the fgetpos test");
+			}
+		}
+	}
+
+	// ========================================
+	// Test: sysconf processor counts
+	// ========================================
+	printf("\n[TEST] sysconf processor counts\n");
+	{
+		long onln = sysconf(_SC_NPROCESSORS_ONLN);
+		long conf = sysconf(_SC_NPROCESSORS_CONF);
+
+		/* Must never be 0 or -1: callers size thread pools, arena
+		 * counts and -j values by this, and a zero is worse than an
+		 * underestimate -- it turns into a division by zero or an
+		 * empty pool. */
+		test_result("_SC_NPROCESSORS_ONLN is at least 1", onln >= 1);
+		test_result("_SC_NPROCESSORS_CONF is at least 1", conf >= 1);
+		test_result("CONF is not less than ONLN", conf >= onln);
+
+		/* It must also agree with the affinity mask it is derived
+		 * from, which is what makes it a real count rather than a
+		 * hardcoded guess. */
+		{
+			cpu_set_t set;
+			memset(&set, 0, sizeof(set));
+			if (sched_getaffinity(0, sizeof(set), &set) == 0)
+				test_result("ONLN matches the affinity mask",
+					    CPU_COUNT(&set) == (int)onln);
+			else
+				test_result("sched_getaffinity for the cpu count",
+					    0);
+		}
+
+		errno = 0;
+		test_result("an unknown sysconf name is EINVAL",
+			    sysconf(-12345) == -1 && errno == EINVAL);
+	}
+
+	// ========================================
+	// Test: getloadavg
+	// ========================================
+	printf("\n[TEST] getloadavg\n");
+	{
+		double la[3];
+		struct sysinfo si;
+		int n;
+
+		/* The return value is the count STORED, not just success. */
+		la[0] = la[1] = la[2] = -1.0;
+		n = getloadavg(la, 3);
+		test_result("getloadavg(,3) returns 3", n == 3);
+		test_result("all three values were written",
+			    la[0] >= 0.0 && la[1] >= 0.0 && la[2] >= 0.0);
+
+		/* Asking for fewer must write ONLY that many -- a loop that
+		 * ignored nelem would scribble past the caller's array. */
+		la[1] = -1.0;
+		n = getloadavg(la, 1);
+		test_result("getloadavg(,1) returns 1", n == 1);
+		test_result("getloadavg(,1) leaves later elements untouched",
+			    la[1] == -1.0);
+
+		/* More than exist is not an error: it clamps and says so. */
+		n = getloadavg(la, 99);
+		test_result("getloadavg(,99) clamps to 3", n == 3);
+
+		test_result("getloadavg(,0) stores nothing and returns 0",
+			    getloadavg(la, 0) == 0);
+		errno = 0;
+		test_result("getloadavg(,-1) fails with EINVAL",
+			    getloadavg(la, -1) == -1 && errno == EINVAL);
+
+		/* It must agree with the source it is derived from: sysinfo
+		 * reports the same figures as fixed-point <<16. */
+		if (sysinfo(&si) == 0) {
+			double from_si = (double)si.loads[0] / 65536.0;
+			getloadavg(la, 1);
+			double diff = la[0] - from_si;
+			if (diff < 0)
+				diff = -diff;
+			/* Not equality: the average can tick between the two
+			 * calls.  A whole point of load would be a scaling bug,
+			 * which is what this is really checking. */
+			test_result("getloadavg agrees with sysinfo loads[0]",
+				    diff < 1.0);
+		} else {
+			test_fail("sysinfo() for the getloadavg cross-check");
+		}
 	}
 
 	// ========================================
@@ -5322,7 +6885,7 @@ int main(int argc, char **argv)
 		for (size_t i = 0; i < lsize; i++) {
 			lbuf[i] = (char)('A' + (i % 26));
 		}
-		int lfd = open(lpath, O_CREAT | O_TRUNC | O_WRONLY);
+		int lfd = open(lpath, O_CREAT | O_TRUNC | O_WRONLY, 0644);
 		test_result("open large file for write", lfd >= 0);
 		if (lfd >= 0) {
 			ssize_t lw = write(lfd, lbuf, lsize);
@@ -5362,7 +6925,7 @@ int main(int argc, char **argv)
 	char lfn_path1[128];
 	snprintf(lfn_path1, sizeof(lfn_path1),
 		 "%s/this_is_a_long_filename_test.txt", _pbase);
-	int lfn_fd = open(lfn_path1, O_CREAT | O_TRUNC | O_WRONLY);
+	int lfn_fd = open(lfn_path1, O_CREAT | O_TRUNC | O_WRONLY, 0644);
 	test_result("create long filename", lfn_fd >= 0);
 	if (lfn_fd >= 0) {
 		const char *lfn_data = "LFN test data";
@@ -5407,7 +6970,7 @@ int main(int argc, char **argv)
 	char lfn_path2[128];
 	snprintf(lfn_path2, sizeof(lfn_path2), "%s/MixedCaseFileName.TXT",
 		 _pbase);
-	lfn_fd = open(lfn_path2, O_CREAT | O_TRUNC | O_WRONLY);
+	lfn_fd = open(lfn_path2, O_CREAT | O_TRUNC | O_WRONLY, 0644);
 	test_result("create mixed case filename", lfn_fd >= 0);
 	if (lfn_fd >= 0) {
 		write(lfn_fd, "X", 1);
@@ -5440,7 +7003,7 @@ int main(int argc, char **argv)
 	snprintf(lfn_in_dir, sizeof(lfn_in_dir),
 		 "%s/long_directory_name_for_testing/another_long_filename.dat",
 		 _pbase);
-	lfn_fd = open(lfn_in_dir, O_CREAT | O_TRUNC | O_WRONLY);
+	lfn_fd = open(lfn_in_dir, O_CREAT | O_TRUNC | O_WRONLY, 0644);
 	test_result("create file in LFN dir", lfn_fd >= 0);
 	if (lfn_fd >= 0) {
 		write(lfn_fd, "nested", 6);
@@ -5486,7 +7049,7 @@ int main(int argc, char **argv)
 		very_long, sizeof(very_long),
 		"%s/abcdefghijklmnopqrstuvwxyz0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ.longext",
 		_pbase);
-	lfn_fd = open(very_long, O_CREAT | O_TRUNC | O_WRONLY);
+	lfn_fd = open(very_long, O_CREAT | O_TRUNC | O_WRONLY, 0644);
 	test_result("create very long filename", lfn_fd >= 0);
 	if (lfn_fd >= 0) {
 		write(lfn_fd, "V", 1);
@@ -5503,7 +7066,7 @@ int main(int argc, char **argv)
 	char space_name[128];
 	snprintf(space_name, sizeof(space_name),
 		 "%s/file with spaces in name.txt", _pbase);
-	lfn_fd = open(space_name, O_CREAT | O_TRUNC | O_WRONLY);
+	lfn_fd = open(space_name, O_CREAT | O_TRUNC | O_WRONLY, 0644);
 	test_result("create filename with spaces", lfn_fd >= 0);
 	if (lfn_fd >= 0) {
 		write(lfn_fd, "S", 1);
@@ -5520,7 +7083,7 @@ int main(int argc, char **argv)
 	char lowercase_file[128];
 	snprintf(lowercase_file, sizeof(lowercase_file),
 		 "%s/lowercase_only_filename.txt", _pbase);
-	lfn_fd = open(lowercase_file, O_CREAT | O_TRUNC | O_WRONLY);
+	lfn_fd = open(lowercase_file, O_CREAT | O_TRUNC | O_WRONLY, 0644);
 	test_result("create lowercase filename", lfn_fd >= 0);
 	if (lfn_fd >= 0) {
 		close(lfn_fd);
@@ -8433,7 +9996,7 @@ int main(int argc, char **argv)
 	printf("\n[TEST] unlink()\n");
 	{
 		/* Create a test file first */
-		int fd = open(_p_unlink, O_WRONLY | O_CREAT | O_TRUNC);
+		int fd = open(_p_unlink, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		test_result("create tmpdir/unlink_file", fd >= 0);
 		if (fd >= 0) {
 			write(fd, "test", 4);
@@ -8459,7 +10022,7 @@ int main(int argc, char **argv)
 	printf("\n[TEST] rename()\n");
 	{
 		/* Create source file */
-		int fd = open(_p_rsrc, O_WRONLY | O_CREAT | O_TRUNC);
+		int fd = open(_p_rsrc, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		test_result("create tmpdir/rename_src", fd >= 0);
 		if (fd >= 0) {
 			write(fd, "rename_test", 11);
@@ -8496,7 +10059,7 @@ int main(int argc, char **argv)
 	printf("\n[TEST] chmod()\n");
 	{
 		/* chmod should succeed (returns 0 on FAT32) */
-		int fd = open(_p_chmod, O_WRONLY | O_CREAT | O_TRUNC);
+		int fd = open(_p_chmod, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		test_result("create tmpdir/chmod_file", fd >= 0);
 		if (fd >= 0) {
 			close(fd);
@@ -8515,7 +10078,7 @@ int main(int argc, char **argv)
 
 	printf("\n[TEST] chown()\n");
 	{
-		int fd = open(_p_chown, O_WRONLY | O_CREAT | O_TRUNC);
+		int fd = open(_p_chown, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		test_result("create tmpdir/chown_file", fd >= 0);
 		if (fd >= 0) {
 			close(fd);
@@ -8540,7 +10103,7 @@ int main(int argc, char **argv)
 		snprintf(p_lnk, sizeof(p_lnk), "%s/sl_link", _td);
 		snprintf(p_hl, sizeof(p_hl), "%s/hl_link", _td);
 
-		int fd = open(p_tgt, O_WRONLY | O_CREAT | O_TRUNC);
+		int fd = open(p_tgt, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		if (fd >= 0) {
 			write(fd, "linkdata", 8);
 			close(fd);
@@ -8604,7 +10167,7 @@ int main(int argc, char **argv)
 	{
 		char p_cp[128];
 		snprintf(p_cp, sizeof(p_cp), "%s/cperm", _td);
-		int fd = open(p_cp, O_WRONLY | O_CREAT | O_TRUNC);
+		int fd = open(p_cp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		if (fd >= 0) {
 			close(fd);
 			struct stat st;
@@ -8633,7 +10196,7 @@ int main(int argc, char **argv)
 
 	printf("\n[TEST] utimensat()\n");
 	{
-		int fd = open(_p_utime, O_WRONLY | O_CREAT | O_TRUNC);
+		int fd = open(_p_utime, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		test_result("create tmpdir/utime_file", fd >= 0);
 		if (fd >= 0) {
 			close(fd);
@@ -8652,7 +10215,7 @@ int main(int argc, char **argv)
 
 	printf("\n[TEST] utime()\n");
 	{
-		int fd = open(_p_utime, O_WRONLY | O_CREAT | O_TRUNC);
+		int fd = open(_p_utime, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		test_result("utime: create test file", fd >= 0);
 		if (fd >= 0) {
 			close(fd);
@@ -8674,7 +10237,7 @@ int main(int argc, char **argv)
 
 	printf("\n[TEST] utimes()\n");
 	{
-		int fd = open(_p_utime, O_WRONLY | O_CREAT | O_TRUNC);
+		int fd = open(_p_utime, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		test_result("utimes: create test file", fd >= 0);
 		if (fd >= 0) {
 			close(fd);
@@ -9423,7 +10986,7 @@ network_section:
 	// Test 1: sendfile from file to file
 	{
 		// Create a source file with known content
-		int src = open(sf_src, O_WRONLY | O_CREAT | O_TRUNC);
+		int src = open(sf_src, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		test_result("sendfile: create source file", src >= 0);
 		if (src >= 0) {
 			const char *data =
@@ -9435,7 +10998,7 @@ network_section:
 
 			// Open source for reading and dest for writing
 			int in_fd = open(sf_src, O_RDONLY);
-			int out_fd = open(sf_dst, O_WRONLY | O_CREAT | O_TRUNC);
+			int out_fd = open(sf_dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 			test_result("sendfile: open source for read",
 				    in_fd >= 0);
 			test_result("sendfile: open dest for write",
@@ -9480,7 +11043,7 @@ network_section:
 
 	// Test 2: sendfile with offset parameter
 	{
-		int src = open(sf_off, O_WRONLY | O_CREAT | O_TRUNC);
+		int src = open(sf_off, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		if (src >= 0) {
 			const char *data = "AAAAABBBBBCCCCC"; // 15 bytes
 			write(src, data, 15);
@@ -9488,7 +11051,7 @@ network_section:
 
 			int in_fd = open(sf_off, O_RDONLY);
 			int out_fd =
-				open(sf_off_d, O_WRONLY | O_CREAT | O_TRUNC);
+				open(sf_off_d, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 			if (in_fd >= 0 && out_fd >= 0) {
 				// Send 5 bytes starting at offset 5 (the "BBBBB" part)
 				int64_t off = 5;
@@ -9529,7 +11092,7 @@ network_section:
 
 	// Test 3: sendfile from file to socket (via socketpair)
 	{
-		int src = open(sf_sock, O_WRONLY | O_CREAT | O_TRUNC);
+		int src = open(sf_sock, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		if (src >= 0) {
 			const char *data = "socket sendfile data";
 			write(src, data, strlen(data));
@@ -9572,7 +11135,7 @@ network_section:
 
 	// Test 4: sendfile from file to pipe
 	{
-		int src = open(sf_pipe_f, O_WRONLY | O_CREAT | O_TRUNC);
+		int src = open(sf_pipe_f, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		if (src >= 0) {
 			const char *data = "pipe sendfile!";
 			write(src, data, strlen(data));
@@ -9615,13 +11178,13 @@ network_section:
 
 	// Test 5: sendfile with count=0 returns 0
 	{
-		int src = open(sf_zero, O_WRONLY | O_CREAT | O_TRUNC);
+		int src = open(sf_zero, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		if (src >= 0) {
 			write(src, "x", 1);
 			close(src);
 			int in_fd = open(sf_zero, O_RDONLY);
 			int out_fd =
-				open(sf_zero_d, O_WRONLY | O_CREAT | O_TRUNC);
+				open(sf_zero_d, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 			if (in_fd >= 0 && out_fd >= 0) {
 				ssize_t sf = sendfile(out_fd, in_fd, NULL, 0);
 				test_result("sendfile: count=0 returns 0",

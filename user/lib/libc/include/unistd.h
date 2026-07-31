@@ -122,6 +122,7 @@ int isatty(int fd);
 char *ttyname(int fd);
 int ttyname_r(int fd, char *buf, size_t len);
 int unlink(const char* path);
+int unlinkat(int dirfd, const char* pathname, int flags);
 int rename(const char* oldpath, const char* newpath);
 int mkdir(const char* path, unsigned int mode);
 int rmdir(const char* path);
@@ -206,6 +207,11 @@ long sysconf(int name);
 #define _SC_PAGE_SIZE     _SC_PAGESIZE
 #define _SC_OPEN_MAX      4
 #define _SC_CLK_TCK       2
+/* Processor counts.  Values are the reference numbering, like the entries
+ * above, so a program that hardcodes them (some configure scripts do) agrees
+ * with us. */
+#define _SC_NPROCESSORS_CONF  83
+#define _SC_NPROCESSORS_ONLN  84
 
 // confstr
 #define _CS_PATH  0

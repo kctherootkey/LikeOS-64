@@ -216,6 +216,7 @@
 #define SYS_FLISTXATTR 397 // (fd, list, size)
 #define SYS_FREMOVEXATTR 398 // (fd, name)
 #define SYS_DEBUG_DUMP 399 // () root-only: dump TCP/AF_UNIX/PTY tables + tasks
+#define SYS_UNLINKAT 405
 #define SYS_CHROOT 400
 
 // System V shared memory (the MIT-SHM extension's interface)
@@ -302,6 +303,9 @@ typedef struct k_sysinfo {
 #define AT_FDCWD -100
 // faccessat: check using the effective IDs instead of the real IDs
 #define AT_EACCESS 0x200
+// unlinkat: remove a DIRECTORY rather than a file (same value as AT_EACCESS,
+// as in the reference: the two are used by different syscalls and never meet).
+#define AT_REMOVEDIR 0x200
 
 // File descriptor limits
 #define MAX_FDS 1024
@@ -334,6 +338,23 @@ typedef struct k_sysinfo {
 #define F_GETFL 3
 #define F_SETFL 4
 #define F_DUPFD_CLOEXEC 1030
+/* POSIX advisory record locking (see kernel/fs/frlock.c). */
+#define F_GETLK 5
+#define F_SETLK 6
+#define F_SETLKW 7
+#define F_RDLCK 0
+#define F_WRLCK 1
+#define F_UNLCK 2
+
+/* Userspace struct flock, x86-64 layout. */
+typedef struct k_flock {
+	short l_type;
+	short l_whence;
+	int64_t l_start;
+	int64_t l_len;
+	int32_t l_pid;
+} k_flock_t;
+
 #ifndef FD_CLOEXEC
 #define FD_CLOEXEC 1
 #endif
@@ -387,6 +408,7 @@ typedef struct k_sysinfo {
 #define EROFS 30 // Read-only file system
 #define ENAMETOOLONG 36 // File name too long
 #define ENODEV 19 // No such device
+#define ENOLCK 37 // No record locks available (fcntl table full)
 #define ENOSYS 38 // Function not implemented
 #define ENOTEMPTY 39 // Directory not empty
 #define ENODATA 61 // No data available (xattr: no such attribute)

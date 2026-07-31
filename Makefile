@@ -193,6 +193,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/slab.o $(BUILD_DIR)/shm.o \
 			  $(BUILD_DIR)/scrollbar.o \
 			  $(BUILD_DIR)/vfs.o \
+			  $(BUILD_DIR)/frlock.o \
 			  $(BUILD_DIR)/devfs.o \
 			  $(BUILD_DIR)/tty.o \
 			  $(BUILD_DIR)/vt.o \
@@ -294,7 +295,7 @@ LINUX_USB_IMAGE = $(LINUX_USB_BUILD_DIR)/linux-usb.img
 # ---------------------------------------------------------------------------
 ROOT_BIN_PROGS = bash ls cat pwd stat uname shutdown poweroff reboot halt ps cp mv rm \
 	mkdir rmdir ln chmod readlink touch more less clear env kill find df du hexdump \
-	sleep strings file grep wc head tail echo printf free uptime dmesg which date time \
+	sleep strings file grep wc head tail echo printf free uptime nproc dmesg which date time \
 	sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp \
 	traceroute arping dhclient dig nslookup host nano tmux nc openssl curl login \
 	id whoami groups su passwd adduser addgroup deluser delgroup
@@ -402,6 +403,9 @@ $(BUILD_DIR)/scrollbar.o: $(KERNEL_DIR)/io/scrollbar.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/vfs.o: $(KERNEL_DIR)/fs/vfs.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/frlock.o: $(KERNEL_DIR)/fs/frlock.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/devfs.o: $(KERNEL_DIR)/fs/devfs.c | $(BUILD_DIR)
@@ -979,6 +983,11 @@ $(BUILD_DIR)/uptime: userland-libc userland-rtld | $(BUILD_DIR)
 	cp $(USER_DIR)/uptime $@
 	$(STRIP) --strip-unneeded $@
 
+$(BUILD_DIR)/nproc: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) nproc
+	cp $(USER_DIR)/nproc $@
+	$(STRIP) --strip-unneeded $@
+
 $(BUILD_DIR)/dmesg: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) dmesg
 	cp $(USER_DIR)/dmesg $@
@@ -1278,15 +1287,24 @@ $(BUILD_DIR)/openssh/bin/ssh: ports-openssh | $(BUILD_DIR)
 # them on every build costs a few seconds and nothing else.
 #
 # The libraries it links against have to exist first: openssl (the server uses
-# libcrypto for SHA1), zlib (libXfont2), and ncurses (xterm's termcap).
+# libcrypto for SHA1), zlib (libXfont2), ncurses (xterm's termcap) and curl
+# (NetSurf fetches with it).
+#
+# Those four are ports in their own right and install nowhere near the X
+# sysroot, so import-base-libs.sh copies their headers, libraries and
+# pkg-config descriptions into it before anything is built against them.  It
+# has to run HERE rather than by hand: `make distclean` deletes the sysroot,
+# and without this step the next build got all the way to NetSurf before
+# failing to find libcurl.
 # --------------------------------------------------------------------------
 XORG_SYSROOT = $(BUILD_DIR)/xorg-sysroot
 
 .PHONY: ports-xorg
 ports-xorg: userland-libc userland-rtld ports-openssl ports-zlib ports-ncurses \
-		| $(BUILD_DIR)
+		ports-curl | $(BUILD_DIR)
 	ports/xorg/fetch.sh
 	ports/xorg/unpack.sh
+	ports/xorg/import-base-libs.sh
 	ports/xorg/build.sh
 
 # Sentinel the image build depends on.  The server is the last thing that can
@@ -1739,6 +1757,20 @@ bash-manpage:
 # Like bash-manpage this is a maintenance target, not part of the build: the
 # rendered pages are checked in and groff is not a build dependency.  Every
 # page is stored as NAME.1 because LikeOS keeps a single flat man1 catman dir.
+# The footer of an mdoc page names an operating system.  Pages that leave .Os
+# empty get groff's compiled-in default, which is the identity of whatever
+# machine rendered them -- so pages built here came out stamped with the build
+# host's distribution rather than this system's name.  That default is not
+# settable per run (mdoc overwrites a pre-set string when its macros load), so
+# it is detected once and rewritten in the output.  The replacement is padded to
+# the original width to keep the footer's column alignment.
+MANPAGE_HOST_OS = $(shell printf '.Dd x\n.Dt T 1\n.Os\n' \
+	| GROFF_NO_SGR=1 groff -Tascii -mandoc 2>/dev/null | tail -1 | awk '{print $$1}')
+MANPAGE_FIXUP = awk -v old="$(MANPAGE_HOST_OS)" -v new=LikeOS \
+	'BEGIN { if (old == "") old = "\001" ; n = length(old); \
+	         while (length(new) < n) new = new " "; new = substr(new, 1, n) } \
+	 { if (index($$0, old) == 1) sub(/^[^ ]*/, new); print }'
+
 .PHONY: openssh-manpages
 openssh-manpages:
 	@for m in ssh.1 scp.1 sftp.1 ssh-keygen.1 ssh-add.1 ssh-agent.1 \
@@ -1746,7 +1778,7 @@ openssh-manpages:
 		 ssh-pkcs11-helper.8 ssh_config.5 sshd_config.5 moduli.5; do \
 		base=$$(echo $$m | sed 's/\.[0-9]$$//'); \
 		GROFF_NO_SGR=1 groff -Tascii -mandoc ports/openssh-10.4p1/$$m \
-			| col -bx > res/man/$$base.1; \
+			| col -bx | $(MANPAGE_FIXUP) > res/man/$$base.1; \
 		echo "  res/man/$$base.1 ($$(wc -l < res/man/$$base.1) lines)"; \
 	done
 
@@ -1804,7 +1836,7 @@ xorg-manpages:
 		*)    cat="cat"  ;; \
 		esac; \
 		$$cat $$m 2>/dev/null | GROFF_NO_SGR=1 groff -Tascii -mandoc - \
-			2>/dev/null | col -bx > $$out/$$base.1; \
+			2>/dev/null | col -bx | $(MANPAGE_FIXUP) > $$out/$$base.1; \
 		if [ ! -s $$out/$$base.1 ]; then \
 			( cd $$(dirname $$m) && $$cat $$(basename $$m) \
 				2>/dev/null | GROFF_NO_SGR=1 groff -Tascii \

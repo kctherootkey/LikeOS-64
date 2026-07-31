@@ -35,6 +35,19 @@
 #     openssh's fourteen programs are NOT listed here: that port ships its own
 #     .gitignore (see the openssh block below).
 
+# --- tmux port: build output sitting in the tracked source tree.  cmd-parse.c
+#     and cmd-parse.h are what yacc emits from cmd-parse.y, which IS tracked, so
+#     committing them would put two copies of the same grammar under review and
+#     let them drift.  `tmux` is the linked binary.
+/ports/tmux-3.6a/cmd-parse.c
+/ports/tmux-3.6a/cmd-parse.h
+/ports/tmux-3.6a/tmux
+
+# --- openssl port: the link wrapper its Makefile.likeos writes out.  Its own
+#     first line says "Auto-generated ... do not edit", and the rule that
+#     creates it is tracked, so the file itself is derived.
+/ports/openssl-3.5.6/likeos-bin-linker
+
 # --- bash port: everything likeos-generate.sh produces (see GEN_SOURCES and
 #     GEN_STAMP in ports/bash-5.2.37/Makefile.likeos).  `make distclean` in
 #     that tree removes exactly this set, returning it to the upstream tarball
@@ -95,8 +108,10 @@
 #     reaching for the network: with these present it makes no requests at all.
 #
 #     What IS ignored is everything derived from them: the source tree each
-#     tarball unpacks into (ports/xorg/<pkg>/), plus .stamps/ and .logs/, which
-#     the `*/` rule below covers because a gitignore `*` matches a leading dot.
+#     tarball unpacks into (ports/xorg/<pkg>/), plus .stamps/, .logs/ and
+#     .hosttools/ -- the last holds tools built for THIS machine (nsgenbind),
+#     which must never reach the image.  All three are covered by the `*/` rule
+#     below, because a gitignore `*` matches a leading dot.
 #     The build sysroot they install into lives under /build/ and is gone with it.
 /ports/xorg/*/
 #     Re-included: the cross-compile toolchain and the patches we apply to

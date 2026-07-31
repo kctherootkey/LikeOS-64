@@ -2116,7 +2116,8 @@ static void ext4_free_blocks_from(ext4_fs_t *fs, unsigned long ino,
 				  ext4_inode *in, unsigned long from);
 static void ext4_flush_meta(ext4_fs_t *fs);
 
-static int ext4_open_impl(const char *path, int flags, vfs_file_t **out)
+static int ext4_open_impl(const char *path, int flags, unsigned cmode,
+			  vfs_file_t **out)
 {
 	if (!out || !path || !path[0] || !g_ext4_fs)
 		return ST_INVALID;
@@ -2149,7 +2150,15 @@ static int ext4_open_impl(const char *path, int flags, vfs_file_t **out)
 			pgid = pin0.i_gid;
 			pmode = pin0.i_mode;
 		}
-		unsigned nuid = puid, ngid = pgid, nmode = S_IFREG | 0644;
+		/* The mode the caller asked for, not a fixed 0644.  The
+		 * set-id bits are deliberately NOT taken from an O_CREAT
+		 * open: the new file's group comes from the parent directory
+		 * (set-gid directory inheritance), so honouring S_ISGID here
+		 * would let a caller create a file set-gid to a group it does
+		 * not belong to.  A program that genuinely wants a set-id bit
+		 * uses chmod(), which checks that. */
+		unsigned nuid = puid, ngid = pgid,
+			 nmode = S_IFREG | (cmode & 0777);
 		ext4_init_owner(puid, pgid, pmode, 0, &nuid, &ngid, &nmode);
 		unsigned long newino = ext4_alloc_inode(fs, parent, 0);
 		if (newino == 0)
@@ -6857,7 +6866,8 @@ static int ext4_fence_path_excl(const char *path, int follow,
 	return 0;
 }
 
-static int ext4_open(const char *path, int flags, vfs_file_t **out)
+static int ext4_open_locked(const char *path, int flags, unsigned cmode,
+			    vfs_file_t **out)
 {
 	if (flags & (O_CREAT | O_TRUNC)) {
 		/* A truncating open frees the file's data blocks: fence
@@ -6866,22 +6876,36 @@ static int ext4_open(const char *path, int flags, vfs_file_t **out)
 		if (flags & O_TRUNC) {
 			unsigned long ino = 0;
 			if (ext4_fence_path_excl(path, 1, &ino)) {
-				int r = ext4_open_impl(path, flags, out);
+				int r = ext4_open_impl(path, flags, cmode, out);
 				ext4_io_unlock();
 				ext4_iunlock_excl(ino);
 				return r;
 			}
 		}
 		ext4_io_lock();
-		int r = ext4_open_impl(path, flags, out);
+		int r = ext4_open_impl(path, flags, cmode, out);
 		ext4_io_unlock();
 		return r;
 	}
 	ext4_meta_rlock();
-	int r = ext4_open_impl(path, flags, out);
+	int r = ext4_open_impl(path, flags, cmode, out);
 	ext4_meta_runlock();
 	return r;
 }
+
+/* ->open: no caller-supplied mode.  0666 is the POSIX default for creat(). */
+static int ext4_open(const char *path, int flags, vfs_file_t **out)
+{
+	return ext4_open_locked(path, flags, 0666, out);
+}
+
+/* ->open_mode: `mode` is already umask-adjusted by the syscall layer. */
+static int ext4_open_mode(const char *path, int flags, unsigned int mode,
+			  vfs_file_t **out)
+{
+	return ext4_open_locked(path, flags, mode, out);
+}
+
 static int ext4_stat_vfs(const char *path, struct kstat *st)
 {
 	ext4_meta_rlock();
@@ -7313,51 +7337,46 @@ static int ext4_inode_flags_op(unsigned long ino, uint32_t *out_flags)
 }
 
 static const vfs_ops_t ext4_vfs_ops = {
-	ext4_open,
-	ext4_stat_vfs,
-	ext4_read,
-	ext4_write,
-	ext4_seek,
-	ext4_readdir,
-	ext4_truncate,
-	ext4_unlink,
-	ext4_rename,
-	ext4_mkdir,
-	ext4_rmdir,
-	ext4_chdir,
-	ext4_close,
-	ext4_release_locks_for_task,
-	ext4_fsync,
-	/* UNIX-semantics ops */
-	ext4_lstat,
-	ext4_symlink,
-	ext4_readlink,
-	ext4_link,
-	ext4_chmod,
-	ext4_chown,
-	ext4_fchmod_op,
-	ext4_fchown_op,
-	ext4_utimensat,
-	ext4_statfs_op,
-	ext4_fstat_op,
-	ext4_setid_clean_op,
-	ext4_sync_op,
-	/* xattr ops */
-	ext4_getxattr_op,
-	ext4_setxattr_op,
-	ext4_listxattr_op,
-	ext4_removexattr_op,
-	ext4_fgetxattr_op,
-	ext4_fsetxattr_op,
-	ext4_flistxattr_op,
-	ext4_fremovexattr_op,
-	ext4_getxattr_ino_op,
-	/* permission participation: ext4 uses the generic VFS mode/ACL check
-	 * (the ACL is read through getxattr_ino), so no custom decision hook; it
-	 * only contributes the immutable/append-only inode flags. */
-	0, /* permission */
-	ext4_inode_flags_op,
-	ext4_mknod,
+	.open = ext4_open,
+	.stat = ext4_stat_vfs,
+	.read = ext4_read,
+	.write = ext4_write,
+	.seek = ext4_seek,
+	.readdir = ext4_readdir,
+	.truncate = ext4_truncate,
+	.unlink = ext4_unlink,
+	.rename = ext4_rename,
+	.mkdir = ext4_mkdir,
+	.rmdir = ext4_rmdir,
+	.chdir = ext4_chdir,
+	.close = ext4_close,
+	.release_locks_for_task = ext4_release_locks_for_task,
+	.fsync = ext4_fsync,
+	.lstat = ext4_lstat,
+	.symlink = ext4_symlink,
+	.readlink = ext4_readlink,
+	.link = ext4_link,
+	.chmod = ext4_chmod,
+	.chown = ext4_chown,
+	.fchmod = ext4_fchmod_op,
+	.fchown = ext4_fchown_op,
+	.utimensat = ext4_utimensat,
+	.statfs = ext4_statfs_op,
+	.fstat = ext4_fstat_op,
+	.setid_clean = ext4_setid_clean_op,
+	.sync = ext4_sync_op,
+	.getxattr = ext4_getxattr_op,
+	.setxattr = ext4_setxattr_op,
+	.listxattr = ext4_listxattr_op,
+	.removexattr = ext4_removexattr_op,
+	.fgetxattr = ext4_fgetxattr_op,
+	.fsetxattr = ext4_fsetxattr_op,
+	.flistxattr = ext4_flistxattr_op,
+	.fremovexattr = ext4_fremovexattr_op,
+	.getxattr_ino = ext4_getxattr_ino_op,
+	.inode_flags = ext4_inode_flags_op,
+	.mknod = ext4_mknod,
+	.open_mode = ext4_open_mode,
 };
 
 /* ===================================================================

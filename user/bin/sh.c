@@ -1213,7 +1213,7 @@ static int apply_redirects(redirect_t *redirects, int nredirects)
 		switch (r->type) {
 		case TOK_REDIR_OUT:
 		case TOK_REDIR_OUT_FORCE:
-			fd = open(r->filename, O_WRONLY | O_CREAT | O_TRUNC);
+			fd = open(r->filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
 			if (fd < 0) {
 				fprintf(stderr, "sh: %s: %s\n", r->filename,
 					strerror(errno));
@@ -1224,7 +1224,7 @@ static int apply_redirects(redirect_t *redirects, int nredirects)
 			break;
 
 		case TOK_REDIR_APPEND:
-			fd = open(r->filename, O_WRONLY | O_CREAT | O_APPEND);
+			fd = open(r->filename, O_WRONLY | O_CREAT | O_APPEND, 0666);
 			if (fd < 0) {
 				fprintf(stderr, "sh: %s: %s\n", r->filename,
 					strerror(errno));
@@ -1246,7 +1246,7 @@ static int apply_redirects(redirect_t *redirects, int nredirects)
 			break;
 
 		case TOK_REDIR_READWRITE:
-			fd = open(r->filename, O_RDWR | O_CREAT);
+			fd = open(r->filename, O_RDWR | O_CREAT, 0666);
 			if (fd < 0) {
 				fprintf(stderr, "sh: %s: %s\n", r->filename,
 					strerror(errno));
@@ -1257,7 +1257,7 @@ static int apply_redirects(redirect_t *redirects, int nredirects)
 			break;
 
 		case TOK_REDIR_ERR:
-			fd = open(r->filename, O_WRONLY | O_CREAT | O_TRUNC);
+			fd = open(r->filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
 			if (fd < 0) {
 				fprintf(stderr, "sh: %s: %s\n", r->filename,
 					strerror(errno));
@@ -1268,7 +1268,7 @@ static int apply_redirects(redirect_t *redirects, int nredirects)
 			break;
 
 		case TOK_REDIR_ERR_APPEND:
-			fd = open(r->filename, O_WRONLY | O_CREAT | O_APPEND);
+			fd = open(r->filename, O_WRONLY | O_CREAT | O_APPEND, 0666);
 			if (fd < 0) {
 				fprintf(stderr, "sh: %s: %s\n", r->filename,
 					strerror(errno));
@@ -1284,7 +1284,7 @@ static int apply_redirects(redirect_t *redirects, int nredirects)
 
 		case TOK_REDIR_BOTH_OUT:
 		case TOK_REDIR_STDOUT_ERR:
-			fd = open(r->filename, O_WRONLY | O_CREAT | O_TRUNC);
+			fd = open(r->filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
 			if (fd < 0) {
 				fprintf(stderr, "sh: %s: %s\n", r->filename,
 					strerror(errno));
@@ -1296,7 +1296,7 @@ static int apply_redirects(redirect_t *redirects, int nredirects)
 			break;
 
 		case TOK_REDIR_BOTH_APPEND:
-			fd = open(r->filename, O_WRONLY | O_CREAT | O_APPEND);
+			fd = open(r->filename, O_WRONLY | O_CREAT | O_APPEND, 0666);
 			if (fd < 0) {
 				fprintf(stderr, "sh: %s: %s\n", r->filename,
 					strerror(errno));

@@ -28,6 +28,10 @@
 
 // Special dirfd for *at() syscalls
 #define AT_FDCWD    -100
+/* unlinkat(): remove a directory instead of a file.  Shares its value with
+ * AT_EACCESS, as on the reference system -- the two are used by different
+ * syscalls and never appear together. */
+#define AT_REMOVEDIR 0x200
 
 // fcntl commands
 #define F_DUPFD         0
@@ -36,6 +40,27 @@
 #define F_GETFL         3
 #define F_SETFL         4
 #define F_DUPFD_CLOEXEC 1030
+/* POSIX advisory record locking.  Values are the conventional x86-64 ones so
+ * the ABI matches what software expects to find. */
+#define F_GETLK         5
+#define F_SETLK         6
+#define F_SETLKW        7
+
+#define F_RDLCK         0       /* shared read lock */
+#define F_WRLCK         1       /* exclusive write lock */
+#define F_UNLCK         2       /* release */
+
+/* l_len of 0 means "to end of file", which is how a whole-file lock is spelled
+ * (l_start 0, l_len 0).  Locks are ADVISORY: they do not stop a process that
+ * never asks, they coordinate ones that do. */
+struct flock {
+        short l_type;           /* F_RDLCK / F_WRLCK / F_UNLCK */
+        short l_whence;         /* SEEK_SET / SEEK_CUR / SEEK_END */
+        off_t l_start;
+        off_t l_len;
+        pid_t l_pid;            /* F_GETLK: pid holding the conflicting lock */
+};
+
 
 // File descriptor flags
 #define FD_CLOEXEC      1

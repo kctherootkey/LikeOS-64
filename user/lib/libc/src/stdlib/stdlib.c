@@ -73,11 +73,16 @@ int at_quick_exit(void (*func)(void))
 	return atexit(func);
 }
 
+void __libc_run_fini_array(void);
+
 void exit(int status)
 {
 	for (int i = atexit_count - 1; i >= 0; i--)
 		if (atexit_funcs[i])
 			atexit_funcs[i]();
+	/* Destructors run after atexit handlers and before the streams are
+	 * flushed, so anything a destructor prints still reaches the output. */
+	__libc_run_fini_array();
 	fflush(stdout);
 	fflush(stderr);
 	_exit(status);

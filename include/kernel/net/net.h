@@ -1394,8 +1394,20 @@ typedef struct unix_socket {
 	struct unix_socket *peer; // Connected peer
 	struct unix_socket *parent; // Listener (for accepted sockets)
 
-	// Data buffer (bidirectional ring buffer)
-	uint8_t buf[8192];
+	/* Data ring, allocated on first use rather than inlined.
+	 *
+	 * It used to be a fixed uint8_t[8192] inside every one of the
+	 * MAX_UNIX_SOCKETS slots.  Inlining a ring big enough to be useful
+	 * would cost that size times the whole table whether the sockets exist
+	 * or not, so the ring is allocated when a socket first carries data and
+	 * released when it closes.  Listening sockets never carry data and
+	 * never allocate one.
+	 *
+	 * The size matters for throughput: an X client pushing a window's worth
+	 * of pixels through a small ring stalls once per ringful, and every
+	 * stall is a context switch. */
+	uint8_t *buf;
+	int bufsz;
 	int head;
 	int tail;
 	volatile int ready; // Data available

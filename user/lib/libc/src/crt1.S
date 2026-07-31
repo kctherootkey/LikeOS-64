@@ -46,6 +46,18 @@ _start:
     mov     (%r12), %rdi        /* argv[0] */
     call    __libc_set_progname
 
+    /* Run the executable's constructors (.preinit_array/.init_array).
+     *
+     * This has to happen HERE.  The dynamic linker runs constructors for
+     * every shared library but deliberately skips the main object, because
+     * this is the code that is supposed to do that one.  Without it, no
+     * __attribute__((constructor)) function and no C++ static initialiser in
+     * a program ever runs -- silently, with no diagnostic. */
+    mov     %rbx, %rdi
+    mov     %r12, %rsi
+    mov     %r13, %rdx
+    call    __libc_run_init_array
+
     /* Restore argc, argv, envp for main(argc, argv, envp) */
     mov     %rbx, %rdi
     mov     %r12, %rsi
@@ -54,10 +66,11 @@ _start:
     /* Call main(argc, argv, envp) */
     call    main
 
-    /* Exit with main's return value */
+    /* Return from main is equivalent to exit(main(...)): exit() flushes
+     * stdio, runs atexit handlers and the destructors.  Going straight to
+     * the exit syscall here would skip all three. */
     mov     %rax, %rdi
-    mov     $60, %rax
-    syscall
+    call    exit
     hlt
 
 /* Signal return trampoline */

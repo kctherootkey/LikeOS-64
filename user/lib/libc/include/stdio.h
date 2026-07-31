@@ -17,6 +17,24 @@
 #define P_tmpdir "/tmp"
 #define L_tmpnam 20
 
+/* ISO C requires these three in <stdio.h>.  They were missing, which is not a
+ * theoretical gap: libpng's tools use FILENAME_MAX to size a path buffer and
+ * simply failed to compile.
+ *
+ * The values are this system's real limits rather than borrowed constants:
+ *   FILENAME_MAX  PATH_MAX (limits.h) -- the longest path fopen() can open.
+ *   FOPEN_MAX     OPEN_MAX (limits.h) -- a stream needs a descriptor, so no
+ *                 program can have more streams open than the fd table holds.
+ *   TMP_MAX       how many distinct names tmpnam() can return.  It builds
+ *                 "/tmp/tn<pid>_<counter>" into L_tmpnam bytes, so with a
+ *                 five-digit pid there is room for six counter digits; 10000
+ *                 is comfortably inside that and far above the 25 the standard
+ *                 demands.  Understating it is safe, overstating it is not.
+ */
+#define FILENAME_MAX 4096
+#define FOPEN_MAX 256
+#define TMP_MAX 10000
+
 /* Buffering modes for setvbuf */
 #define _IONBF 0   /* unbuffered */
 #define _IOLBF 1   /* line buffered */
@@ -56,6 +74,21 @@ int fseek(FILE* stream, long offset, int whence);
 long ftell(FILE* stream);
 int fseeko(FILE* stream, off_t offset, int whence);
 off_t ftello(FILE* stream);
+
+/* fpos_t and its two functions, required by ISO C.
+ *
+ * A STRUCT, not a bare integer, deliberately.  The standard says fpos_t is an
+ * opaque object type and that a value may only be obtained from fgetpos() and
+ * handed back to fsetpos() -- arithmetic on it is not allowed.  Making it a
+ * typedef for off_t would let such code compile here and then break on any
+ * other system, and would tie our hands if a position ever has to carry more
+ * than a byte offset (a wide-oriented stream's parse state, for instance). */
+typedef struct {
+	off_t __pos;
+} fpos_t;
+
+int fgetpos(FILE* stream, fpos_t* pos);
+int fsetpos(FILE* stream, const fpos_t* pos);
 void rewind(FILE* stream);
 int feof(FILE* stream);
 int ferror(FILE* stream);
@@ -91,6 +124,8 @@ int snprintf(char* str, size_t size, const char* format, ...);
 #include <stdarg.h>
 int vfprintf(FILE* stream, const char* format, va_list ap);
 int vsnprintf(char* str, size_t size, const char* format, va_list ap);
+int vsprintf(char* str, const char* format, va_list ap);
+int vprintf(const char* format, va_list ap);
 int vasprintf(char **strp, const char* format, va_list ap);
 #endif
 int asprintf(char **strp, const char* format, ...);

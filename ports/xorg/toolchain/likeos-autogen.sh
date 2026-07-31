@@ -47,6 +47,16 @@ ac_cv_func_strtod=yes
 ac_cv_have_decl_environ=yes
 ac_cv_file__dev_random=yes
 ac_cv_file__dev_urandom=yes
+# Motif's configure.ac opens with two AC_CHECK_FILE probes for an X.h under
+# /usr/X and /usr/X11R6, purely to pick a default --prefix.  AC_CHECK_FILE
+# ABORTS configure outright when cross compiling ("cannot check for file
+# existence when cross compiling"), so the answer has to be supplied here --
+# and "no" is right: the prefix is passed explicitly below either way.
+ac_cv_file__usr_X_include_X11_X_h=no
+ac_cv_file__usr_X11R6_include_X11_X_h=no
+# AC_FUNC_SETPGRP also refuses to run cross.  This libc's setpgrp() takes no
+# argument (the System V form POSIX standardised), so "void" is yes.
+ac_cv_func_setpgrp_void=yes
 xorg_cv_malloc0_returns_null=no
 
 # How libtool decides whether a -l dependency is a library it understands.

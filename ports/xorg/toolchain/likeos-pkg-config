@@ -22,9 +22,16 @@ PKG_CONFIG_LIBDIR="$SYSROOT/usr/lib/pkgconfig:$SYSROOT/usr/share/pkgconfig"
 export PKG_CONFIG_LIBDIR
 unset PKG_CONFIG_PATH
 
-# Deliberately NOT setting PKG_CONFIG_SYSROOT_DIR: the .pc files are generated
-# with --prefix=/usr but installed under the sysroot, so their -I/-L already
-# need the sysroot prefix added.  Setting both would apply it twice.
+# PKG_CONFIG_SYSROOT_DIR IS set: the .pc files are generated with --prefix=/usr
+# but installed under the sysroot, so every -I and -L they name needs the
+# sysroot prefixed onto it, which is exactly what this does.
+#
+# The catch, worth knowing before trusting an answer from here: pkg-config
+# applies that prefix to `--variable=` queries too.  A package that asks for a
+# .pc variable holding an INSTALL path (libXt's appdefaultdir is the one that
+# bit) gets the sysroot already baked in, and then adds DESTDIR on top -- so it
+# installs into a doubled path.  Where that matters, build.sh passes the path to
+# configure explicitly instead of letting the package ask.
 PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
 export PKG_CONFIG_SYSROOT_DIR
 

@@ -43,3 +43,24 @@ XTerm*scrollKey:		true
 ! outranks anything "XClock*..." can say from a resource file.  They are passed
 ! as command-line options in xinitrc instead, which outrank every resource file.
 ! Setting them here as well would only be a second place to have to remember.
+
+! Motif posts its menus with the "arrow" cursor, which in the X cursor font is
+! the arrow that leans up-RIGHT -- so the pointer flips direction the moment a
+! menu opens in xnedit, while every other pointer on the desktop (and the one
+! MS Windows uses) leans left.  Motif's own default, not a LikeOS choice; the
+! resource lives on XmScreen, so one loose binding covers every Motif client.
+*menuCursor:			left_ptr
+
+! The hand pointer comes from xcalc: its upstream app-defaults file sets
+!   XCalc*Cursor: hand2
+! which is the only hand cursor anywhere in the X tree here.  xclock sets no
+! cursor at all (its app-defaults contains just "XClock.input: false"), so its
+! window inherits the frame's left_ptr.
+!
+! Overridden rather than edited: app-defaults files are installed exactly as
+! their packages ship them, and this file outranks them.  Both classes are
+! named so the pointer is the same everywhere regardless of which window it is
+! over -- the MS-Windows behaviour, where the pointer only changes shape for a
+! reason (resizing, waiting), not per application.
+XCalc*Cursor:			left_ptr
+XClock*Cursor:			left_ptr
