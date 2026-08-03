@@ -732,6 +732,148 @@ void fb_mark_full_dirty(void)
 }
 
 // Flush all dirty regions to the front buffer
+/* =========================================================================
+ * Pointer overlay
+ *
+ * Composited into the front buffer at the end of every flush; never written
+ * into the back buffer.  See the note in <kernel/dev/video/fb.h> for why.
+ * ======================================================================== */
+
+static const uint32_t *g_ptr_img;
+static uint32_t g_ptr_w, g_ptr_h;
+static int g_ptr_x, g_ptr_y;
+static int g_ptr_visible;
+
+/* Straight-alpha blend of an ARGB source over an xRGB background. */
+static inline uint32_t ptr_blend(uint32_t fg, uint32_t bg)
+{
+	uint32_t a = (fg >> 24) & 0xFF;
+	if (a == 0)
+		return bg;
+	if (a == 255)
+		return fg | 0xFF000000u;
+	uint32_t ia = 255 - a;
+	uint32_t r = ((((fg >> 16) & 0xFF) * a) + (((bg >> 16) & 0xFF) * ia)) / 255;
+	uint32_t g = ((((fg >> 8) & 0xFF) * a) + (((bg >> 8) & 0xFF) * ia)) / 255;
+	uint32_t b = (((fg & 0xFF) * a) + ((bg & 0xFF) * ia)) / 255;
+	return 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
+/* Paint the pointer over whatever the flush just put in the front buffer.
+ *
+ * The whole pointer is composited on every flush rather than only the part
+ * that intersects a dirty region.  It costs at most 64x64 pixels and removes
+ * the need to reason about which regions were copied -- and getting that
+ * reasoning wrong shows up as a pointer that intermittently disappears.
+ *
+ * Caller must hold fb_lock and must have issued the sfence that orders the
+ * non-temporal region copies: these are ordinary stores to the same lines, and
+ * an NT store still in flight would otherwise land on top of them.
+ */
+static void fb_pointer_composite_locked(void)
+{
+	if (!g_initialized || !g_ptr_visible || !g_ptr_img)
+		return;
+	if (!g_ptr_w || !g_ptr_h)
+		return;
+
+	for (uint32_t cy = 0; cy < g_ptr_h; cy++) {
+		int sy = g_ptr_y + (int)cy;
+		if (sy < 0)
+			continue;
+		if ((uint32_t)sy >= g_double_buffer.height)
+			break;
+		const uint32_t *src = &g_ptr_img[cy * g_ptr_w];
+		uint32_t row = (uint32_t)sy * g_double_buffer.pitch;
+		for (uint32_t cx = 0; cx < g_ptr_w; cx++) {
+			int sx = g_ptr_x + (int)cx;
+			if (sx < 0)
+				continue;
+			if ((uint32_t)sx >= g_double_buffer.width)
+				break;
+			uint32_t px = src[cx];
+			if (!(px >> 24))
+				continue; /* fully transparent */
+			g_double_buffer.front_buffer[row + (uint32_t)sx] =
+				ptr_blend(px,
+					  g_double_buffer.back_buffer[row +
+								      (uint32_t)sx]);
+		}
+	}
+}
+
+/* Mark the rectangle the pointer occupies at (x, y) dirty, so the next flush
+ * repaints it from the back buffer. */
+static void fb_pointer_mark_locked(int x, int y)
+{
+	if (!g_initialized || !g_ptr_w || !g_ptr_h)
+		return;
+	int x2 = x + (int)g_ptr_w - 1;
+	int y2 = y + (int)g_ptr_h - 1;
+	if (x2 < 0 || y2 < 0)
+		return;
+	if (x < 0)
+		x = 0;
+	if (y < 0)
+		y = 0;
+	if ((uint32_t)x >= g_double_buffer.width ||
+	    (uint32_t)y >= g_double_buffer.height)
+		return;
+	if ((uint32_t)x2 >= g_double_buffer.width)
+		x2 = (int)g_double_buffer.width - 1;
+	if ((uint32_t)y2 >= g_double_buffer.height)
+		y2 = (int)g_double_buffer.height - 1;
+	fb_mark_dirty_unlocked((uint32_t)x, (uint32_t)y, (uint32_t)x2,
+			       (uint32_t)y2);
+}
+
+void fb_pointer_set_image(const uint32_t *argb, uint32_t width,
+			  uint32_t height)
+{
+	uint64_t flags;
+	spin_lock_irqsave(&fb_lock, &flags);
+	/* The old rectangle has to be repainted before the size changes, or a
+	 * larger pointer replaced by a smaller one leaves its edges behind. */
+	fb_pointer_mark_locked(g_ptr_x, g_ptr_y);
+	g_ptr_img = argb;
+	g_ptr_w = width;
+	g_ptr_h = height;
+	fb_pointer_mark_locked(g_ptr_x, g_ptr_y);
+	spin_unlock_irqrestore(&fb_lock, flags);
+}
+
+void fb_pointer_set_visible(int visible)
+{
+	uint64_t flags;
+	spin_lock_irqsave(&fb_lock, &flags);
+	if (g_ptr_visible != (visible ? 1 : 0)) {
+		g_ptr_visible = visible ? 1 : 0;
+		fb_pointer_mark_locked(g_ptr_x, g_ptr_y);
+	}
+	spin_unlock_irqrestore(&fb_lock, flags);
+}
+
+void fb_pointer_move(int x, int y)
+{
+	uint64_t flags;
+	spin_lock_irqsave(&fb_lock, &flags);
+	if (x != g_ptr_x || y != g_ptr_y) {
+		fb_pointer_mark_locked(g_ptr_x, g_ptr_y); /* vacated */
+		g_ptr_x = x;
+		g_ptr_y = y;
+		fb_pointer_mark_locked(g_ptr_x, g_ptr_y); /* newly covered */
+	}
+	spin_unlock_irqrestore(&fb_lock, flags);
+}
+
+void fb_pointer_damage(void)
+{
+	uint64_t flags;
+	spin_lock_irqsave(&fb_lock, &flags);
+	fb_pointer_mark_locked(g_ptr_x, g_ptr_y);
+	spin_unlock_irqrestore(&fb_lock, flags);
+}
+
 void fb_flush_dirty_regions(void)
 {
 	/* Nothing is painted while another program owns the display.
@@ -775,6 +917,7 @@ void fb_flush_dirty_regions_unlocked(void)
 			g_double_buffer.width * g_double_buffer.height;
 		g_double_buffer.full_screen_dirty = 0;
 		g_double_buffer.num_dirty_regions = 0;
+		fb_pointer_composite_locked();
 		hook_accumulate(0, 0, g_double_buffer.width - 1,
 				g_double_buffer.height - 1);
 		return;
@@ -801,6 +944,7 @@ void fb_flush_dirty_regions_unlocked(void)
 		__asm__ volatile("sfence" ::: "memory");
 		g_double_buffer.pixels_copied += total_px;
 		g_double_buffer.num_dirty_regions = 0;
+		fb_pointer_composite_locked();
 		hook_accumulate(0, 0, g_double_buffer.width - 1,
 				g_double_buffer.height - 1);
 		return;
@@ -863,6 +1007,8 @@ void fb_flush_dirty_regions_unlocked(void)
 	if (g_double_buffer.cpu_features & CPU_FEATURE_SSE2) {
 		__asm__ volatile("sfence" ::: "memory");
 	}
+	// Pointer last, on top of everything the copies just placed.
+	fb_pointer_composite_locked();
 	// Clear dirty regions
 	g_double_buffer.num_dirty_regions = 0;
 }

@@ -28,6 +28,12 @@
 #include <kernel/fs/dcache.h>
 #include <kernel/net/net.h>
 #include <kernel/hal/lapic.h>
+
+/* Release tasks blocked in select()/poll()/epoll_wait().  A blocking read or
+ * write parks on the object itself and sched_wake_channel() releases it; a
+ * task multiplexing several descriptors parks on the poll layer's own channel
+ * and only this releases it before its one-tick fallback expires. */
+extern void poll_notify_io_ready(void);
 #include <kernel/dev/rand/random.h>
 #include <kernel/uapi/bug.h>
 
@@ -355,8 +361,12 @@ static int64_t pipe_read_to_user(pipe_end_t *end, uint64_t buf, uint64_t count)
 
 	spin_unlock_irqrestore(&pipe->lock, flags);
 
-	// Wake up writers outside the lock
+	// Wake up writers outside the lock, both the ones blocked on the pipe
+	// itself and the ones multiplexing with select()/poll() -- those park
+	// on the poll layer's channel and nothing here would otherwise release
+	// them before its one-tick fallback expired.
 	sched_wake_channel(pipe);
+	poll_notify_io_ready();
 
 	return (int64_t)to_read;
 }
@@ -446,8 +456,10 @@ static int64_t pipe_write_from_user(pipe_end_t *end, uint64_t buf,
 
 	spin_unlock_irqrestore(&pipe->lock, flags);
 
-	// Wake up any readers blocked on this pipe
+	// Wake up any readers blocked on this pipe -- see the note in
+	// pipe_read_to_user() for why the poll layer needs telling separately.
 	sched_wake_channel(pipe);
+	poll_notify_io_ready();
 
 	return (int64_t)to_write;
 }

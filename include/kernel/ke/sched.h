@@ -637,6 +637,18 @@ void sched_set_need_resched(task_t *t); // Mark task as needing reschedule
 void sched_wake_expired_sleepers(
 	uint64_t current_tick); // Wake tasks whose sleep timer expired
 void sched_wake_channel(void *channel); // Wake all tasks waiting on a channel
+/* Wake at most `max` tasks waiting on `channel`, in ONE pass over the task
+ * list.  For broadcast channels whose waiter count is unbounded and where a
+ * missed wake is self-correcting.
+ *
+ * sched_wake_channel() loops until a batch comes back partial, and its
+ * termination argument -- that a woken task cannot re-block on the channel
+ * before the call returns -- does not hold on SMP: a task woken and enqueued
+ * on another CPU can be dispatched at once, find nothing to do and re-park
+ * while the loop is still running, so the loop keeps finding work and keeps
+ * re-taking the task list lock.  Harmless for a channel with a couple of
+ * waiters; not for one that every polling process in the system waits on. */
+int sched_wake_channel_once(void *channel, int max);
 int sched_claim_wake(task_t *t,
 		     task_state_t from); // Atomic from->READY claim (see sched.c)
 

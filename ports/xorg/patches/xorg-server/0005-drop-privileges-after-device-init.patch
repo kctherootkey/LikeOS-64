@@ -1,0 +1,182 @@
+Drop root after the devices are open, for a setuid-root install.
+
+Xorg is installed setuid root on this system.  It needs root to open the
+framebuffer, the event devices and its log, and nothing after that -- so it
+gives root up as soon as they are open rather than serving a whole session
+with it.  The rationale, and why this is not simply upstream's Xorg.wrap, is in
+the comment block the patch adds to dix/main.c.
+
+A server that has dropped root cannot reopen the input devices, so it cannot
+survive a reset: run it with -noreset, which is what this system's xserverrc
+does.
+
+--- a/dix/main.c
++++ b/dix/main.c
+@@ -117,6 +117,128 @@
+ #include "dpmsproc.h"
+ #endif
+ 
++
++/* ---------------------------------------------------------------------------
++ * Privilege handling for a setuid-root install (LikeOS).
++ *
++ * Xorg is installed setuid root on this system.  It needs root to open the
++ * framebuffer, the event devices and its log, and needs nothing after that --
++ * so it gives root up as soon as they are open rather than serving a whole
++ * session with it.
++ *
++ * The alternative was to put the invoking user in the `video` and `input`
++ * groups.  That is a permanent grant of read/write access to the keyboard and
++ * the screen: the user could read every keystroke typed into any session on
++ * the machine, root's included, and read back what any session displays, and
++ * it outlives the X session entirely.  A setuid binary that gives up what it
++ * does not need is the smaller grant.  It is what upstream reaches for too --
++ * except that upstream's version is Xorg.wrap plus a seat manager, neither of
++ * which exists here.
++ * ------------------------------------------------------------------------ */
++
++#include <sys/types.h>
++#include <unistd.h>
++#include <errno.h>
++#include <string.h>
++
++/*
++ * "Elevated" means started by someone who is not root, from a binary that made
++ * us root.  A server started BY root is not elevated: nothing was granted that
++ * it did not already have, and there is nothing to give back.
++ */
++static int
++likeosPrivsElevated(void)
++{
++    return geteuid() == 0 && getuid() != 0;
++}
++
++/*
++ * Take on the invoking user's identity for one operation.  Returns whether it
++ * changed anything, which is what likeosEuidRestore() needs to know.
++ *
++ * The saved uid stays 0, which is what makes this reversible -- and is exactly
++ * why it is not a substitute for the permanent drop below.
++ */
++static int
++likeosEuidLower(void)
++{
++    if (!likeosPrivsElevated())
++        return 0;
++    if (seteuid(getuid()) != 0)
++        FatalError("failed to lower effective uid: %s\n", strerror(errno));
++    return 1;
++}
++
++static void
++likeosEuidRestore(int lowered)
++{
++    if (!lowered)
++        return;
++    if (seteuid(0) != 0)
++        FatalError("failed to restore effective uid: %s\n", strerror(errno));
++}
++
++/*
++ * Give up root permanently.  Called once the framebuffer, the input devices
++ * and the log are open; from there the server needs only the descriptors it
++ * already holds, and permission is checked at open, not at every read.
++ */
++static void
++likeosDropPrivileges(void)
++{
++    uid_t uid = getuid();
++    gid_t gid = getgid();
++    uid_t r_uid, e_uid, s_uid;
++    gid_t r_gid, e_gid, s_gid;
++    gid_t nogroups[1] = { 0 };
++
++    if (!likeosPrivsElevated())
++        return;
++
++    /*
++     * Supplementary groups first.  setuid() and setgid() do not touch them, so
++     * a server that dropped only the user would keep root's group list and
++     * everything that opens.
++     */
++    if (setgroups(0, nogroups) != 0)
++        FatalError("failed to drop supplementary groups: %s\n",
++                   strerror(errno));
++
++    /*
++     * Group before user, and both through the three-ID calls: setuid() alone
++     * leaves the SAVED uid at 0 on some systems, and a saved 0 can be taken
++     * back with one seteuid().  Dropping the group after the user is not
++     * possible at all -- there is no privilege left to do it with.
++     */
++    if (setresgid(gid, gid, gid) != 0)
++        FatalError("failed to drop group privileges: %s\n", strerror(errno));
++    if (setresuid(uid, uid, uid) != 0)
++        FatalError("failed to drop user privileges: %s\n", strerror(errno));
++
++    /*
++     * Verify rather than assume.  A credential call whose failure goes
++     * unchecked leaves the server running as root while every later decision
++     * believes otherwise, and nothing about the behaviour would say so.
++     */
++    if (getresuid(&r_uid, &e_uid, &s_uid) != 0 ||
++        getresgid(&r_gid, &e_gid, &s_gid) != 0)
++        FatalError("cannot read back credentials after dropping them\n");
++    if (r_uid != uid || e_uid != uid || s_uid != uid ||
++        r_gid != gid || e_gid != gid || s_gid != gid)
++        FatalError("privilege drop did not take effect "
++                   "(uid %ld/%ld/%ld gid %ld/%ld/%ld)\n",
++                   (long) r_uid, (long) e_uid, (long) s_uid,
++                   (long) r_gid, (long) e_gid, (long) s_gid);
++
++    /* And that it cannot be undone. */
++    if (seteuid(0) == 0)
++        FatalError("root could be regained after dropping privileges\n");
++
++    LogMessage(X_INFO, "Dropped privileges to uid %ld gid %ld\n",
++               (long) uid, (long) gid);
++}
++
++
+ extern void Dispatch(void);
+ 
+ CallbackListPtr RootWindowFinalizeCallback = NULL;
+@@ -150,7 +272,18 @@
+         /* Perform any operating system dependent initializations you'd like */
+         OsInit();
+         if (serverGeneration == 1) {
++            /*
++             * As the invoking user: the lock file and the listening socket go
++             * into sticky directories under /tmp, where only the owner may
++             * remove a file -- and the server removes both when it exits, by
++             * which time it has dropped root.  Created as root they would
++             * survive the session, and a stale /tmp/.X0-lock makes every later
++             * start fail with "Server is already active for display".
++             */
++            int lowered = likeosEuidLower();
++
+             CreateWellKnownSockets();
++            likeosEuidRestore(lowered);
+             for (i = 1; i < LimitClients; i++)
+                 clients[i] = NullClient;
+             serverClient = calloc(sizeof(ClientRec), 1);
+@@ -247,6 +380,19 @@
+         InitCoreDevices();
+         InitInput(argc, argv);
+         InitAndStartDevices();
++
++        /*
++         * Everything that needs root is open: the framebuffer and the log from
++         * InitOutput() above, the event devices from InitAndStartDevices()
++         * just now.  Give it up before the first client is served.
++         *
++         * Only on the first generation, because there is no second one: a
++         * server that has dropped root cannot reopen the input devices, so it
++         * must be run with -noreset (this system's xserverrc does).
++         */
++        if (serverGeneration == 1)
++            likeosDropPrivileges();
++
+         ReserveClientIds(serverClient);
+ 
+         dixSaveScreens(serverClient, SCREEN_SAVER_FORCER, ScreenSaverReset);

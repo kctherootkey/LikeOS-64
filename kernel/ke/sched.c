@@ -2051,6 +2051,39 @@ void sched_wake_channel(void *channel)
 	}
 }
 
+/* Single-pass, bounded variant -- see the note in <kernel/ke/sched.h>.
+ *
+ * Same claim rule as sched_wake_channel(): a waiter may be claimed only if it
+ * is also enqueued in this pass, or it would be left READY, off every run
+ * queue and matching no channel -- stranded for good. */
+int sched_wake_channel_once(void *channel, int max)
+{
+	task_t *to_wake[16];
+	int nwake = 0;
+
+	if (!channel || max <= 0)
+		return 0;
+	if (max > (int)(sizeof(to_wake) / sizeof(to_wake[0])))
+		max = (int)(sizeof(to_wake) / sizeof(to_wake[0]));
+
+	uint64_t flags;
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	for (task_t *t = g_task_list_head; t && nwake < max; t = t->next) {
+		if (t->wait_channel == channel &&
+		    sched_claim_wake(t, TASK_BLOCKED)) {
+			t->wait_channel = NULL;
+			t->wakeup_tick = 0;
+			to_wake[nwake++] = t;
+		}
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	for (int i = 0; i < nwake; i++)
+		sched_enqueue_ready(to_wake[i]);
+
+	return nwake;
+}
+
 // Wake tasks whose sleep timer has expired
 void sched_wake_expired_sleepers(uint64_t current_tick)
 {

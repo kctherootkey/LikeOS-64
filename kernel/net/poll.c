@@ -29,9 +29,44 @@ static int g_poll_io_ready;
 // every I/O path that can make a polled fd ready: TTY input, TCP receive, pipe
 // write, etc.  This replaces the old tick-granularity wakeup for interactive
 // workloads, giving sub-millisecond response to keyboard input.
+/* Bumped by every notify.  A poller samples it before scanning its fds and
+ * re-checks it after publishing its blocked state; if it moved, an event
+ * arrived during the scan and the poller re-scans instead of sleeping through
+ * it.  That makes the wake below best-effort rather than load-bearing: no
+ * event can be lost because a producer failed to find the poller parked. */
+static volatile uint64_t g_poll_io_seq;
+
+static inline uint64_t poll_io_seq(void)
+{
+	return __atomic_load_n(&g_poll_io_seq, __ATOMIC_ACQUIRE);
+}
+
+/* How many tasks are parked below.  Read first by the notify so the common
+ * case -- an I/O completion with nobody multiplexing -- costs one atomic load
+ * instead of a scan of the whole task list under its global lock.  That path
+ * is now taken by every AF_UNIX and pipe transfer, so it has to be cheap. */
+static volatile int g_poll_sleepers;
+
+/* Wake tasks parked in poll_sleep_until_next_tick.
+ *
+ * ONE bounded pass, not sched_wake_channel().  Every polling process in the
+ * system parks on this single channel, and this is called from every path that
+ * can make a polled fd ready -- including every AF_UNIX write, which is how an
+ * X client talks to the display server.  sched_wake_channel() loops until a
+ * batch comes back partial, and on SMP a task it woke can be dispatched on
+ * another CPU, find nothing ready and re-park before the loop finishes, so the
+ * loop keeps finding work: it then sits re-taking g_task_list_lock, which is
+ * the lock task exit needs.  A single pass cannot do that, and the sequence
+ * counter above means nothing is lost by capping it. */
 void poll_notify_io_ready(void)
 {
-	sched_wake_channel((void *)&g_poll_io_ready);
+	/* Bumped unconditionally and BEFORE the sleeper test: a poller that is
+	 * between its scan and its park is not counted yet, and the counter is
+	 * what tells it to re-scan rather than sleep. */
+	__atomic_fetch_add(&g_poll_io_seq, 1, __ATOMIC_RELEASE);
+	if (__atomic_load_n(&g_poll_sleepers, __ATOMIC_ACQUIRE) == 0)
+		return;
+	sched_wake_channel_once((void *)&g_poll_io_ready, 16);
 }
 
 // Block the calling task until an I/O event fires or `deadline` is reached
@@ -44,7 +79,7 @@ void poll_notify_io_ready(void)
 // noticing that stdin was ready.  Now the task parks on g_poll_io_ready so any
 // I/O producer can wake it instantly.
 static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
-				       int have_deadline)
+				       int have_deadline, uint64_t seq_before)
 {
 	task_t *cur = sched_current();
 	if (!cur) {
@@ -60,10 +95,39 @@ static void poll_sleep_until_next_tick(uint64_t deadline_ticks,
 		__asm__ volatile("pause");
 		return;
 	}
+
+	__atomic_fetch_add(&g_poll_sleepers, 1, __ATOMIC_ACQ_REL);
 	cur->wait_channel = (void *)&g_poll_io_ready;
 	cur->wakeup_tick = wake;
 	cur->state = TASK_BLOCKED;
+
+	/* Re-check AFTER publishing TASK_BLOCKED, which is the whole point of
+	 * the ordering: a producer that bumps the counter from here on finds
+	 * this task parked and wakes it, and one that bumped it earlier -- while
+	 * the caller was scanning its descriptors, when this task was still
+	 * RUNNING and could not be found -- is caught right here. */
+	if (poll_io_seq() != seq_before) {
+		/* Un-park.  CAS rather than a plain store: a waker may already
+		 * have claimed this task (BLOCKED -> READY) and be about to
+		 * enqueue it, and overwriting its state would leave it READY
+		 * and on a run queue while also running here.  If the CAS
+		 * fails the waker won, so fall through to sched_schedule(),
+		 * which handles being enqueued already. */
+		task_state_t expected = TASK_BLOCKED;
+		if (__atomic_compare_exchange_n(&cur->state, &expected,
+						TASK_RUNNING, false,
+						__ATOMIC_ACQ_REL,
+						__ATOMIC_ACQUIRE)) {
+			cur->wakeup_tick = 0;
+			cur->wait_channel = NULL;
+			__atomic_fetch_sub(&g_poll_sleepers, 1,
+					   __ATOMIC_ACQ_REL);
+			return;
+		}
+	}
+
 	sched_schedule();
+	__atomic_fetch_sub(&g_poll_sleepers, 1, __ATOMIC_ACQ_REL);
 	cur->wakeup_tick = 0;
 	cur->wait_channel = NULL;
 	if (cur->state != TASK_RUNNING)
@@ -242,6 +306,12 @@ int sys_select_internal(int nfds, fd_set *readfds, fd_set *writefds,
 	}
 
 	while (1) {
+		/* Sampled BEFORE the scan below.  An event that arrives while
+		 * the scan is running finds this task still RUNNING and cannot
+		 * park it, so the wake would be lost; the sleep path compares
+		 * this against the counter after publishing its blocked state
+		 * and re-scans instead of sleeping through the event. */
+		uint64_t seq_before = poll_io_seq();
 		int count = 0;
 		fd_set r_out, w_out, e_out;
 		FD_ZERO(&r_out);
@@ -316,7 +386,8 @@ int sys_select_internal(int nfds, fd_set *readfds, fd_set *writefds,
 		}
 
 		poll_sleep_until_next_tick(deadline,
-					   timeout_ticks != (uint64_t)-1);
+					   timeout_ticks != (uint64_t)-1,
+					   seq_before);
 	}
 }
 
@@ -341,6 +412,12 @@ int sys_poll_internal(struct pollfd *fds, int nfds, uint64_t timeout_ticks)
 	}
 
 	while (1) {
+		/* Sampled BEFORE the scan below.  An event that arrives while
+		 * the scan is running finds this task still RUNNING and cannot
+		 * park it, so the wake would be lost; the sleep path compares
+		 * this against the counter after publishing its blocked state
+		 * and re-scans instead of sleeping through the event. */
+		uint64_t seq_before = poll_io_seq();
 		int count = 0;
 
 		for (int i = 0; i < nfds; i++) {
@@ -370,7 +447,8 @@ int sys_poll_internal(struct pollfd *fds, int nfds, uint64_t timeout_ticks)
 		}
 
 		poll_sleep_until_next_tick(deadline,
-					   timeout_ticks != (uint64_t)-1);
+					   timeout_ticks != (uint64_t)-1,
+					   seq_before);
 	}
 }
 
@@ -548,6 +626,12 @@ int epoll_wait_internal(int epfd_idx, struct epoll_event *events, int maxevents,
 	}
 
 	while (1) {
+		/* Sampled BEFORE the scan below.  An event that arrives while
+		 * the scan is running finds this task still RUNNING and cannot
+		 * park it, so the wake would be lost; the sleep path compares
+		 * this against the counter after publishing its blocked state
+		 * and re-scans instead of sleeping through the event. */
+		uint64_t seq_before = poll_io_seq();
 		int count = 0;
 
 		uint64_t fl;
@@ -620,6 +704,7 @@ int epoll_wait_internal(int epfd_idx, struct epoll_event *events, int maxevents,
 		}
 
 		poll_sleep_until_next_tick(deadline,
-					   timeout_ticks != (uint64_t)-1);
+					   timeout_ticks != (uint64_t)-1,
+					   seq_before);
 	}
 }

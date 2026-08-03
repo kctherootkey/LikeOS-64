@@ -7,56 +7,44 @@
 # "$@" and have to be passed through -- dropping them would start a server with
 # no access control at all.
 #
-# The file exists so that a NORMAL USER can run startx.  Nothing here is needed
-# when running as root.
-
-if [ "$(id -u)" = 0 ]; then
-	logfile=/var/log/Xorg.0.log
-else
-	# The server's default log is /var/log/Xorg.0.log, and LogInit() calls
-	# FatalError() when it cannot open OR ROTATE that file -- so a non-root
-	# startx died before it ever touched the hardware.  Making /var/log
-	# group-writable would not have fixed it either: the rotation step still
-	# has to rename a root-owned Xorg.0.log left by an earlier session.
-	#
-	# Per-user, under the user's own data directory, which is where a
-	# rootless server conventionally logs.  Deliberately NOT somewhere in
-	# /tmp: the server opens the log O_CREAT|O_TRUNC and follows symlinks, so
-	# a predictable name in a world-writable directory would let another user
-	# point it at a file of ours.  If HOME is unusable the server stops with
-	# "Cannot open log file", which is the honest outcome.
-	logdir="${XDG_DATA_HOME:-$HOME/.local/share}/xorg"
-	mkdir -p "$logdir" 2>/dev/null
-	logfile="$logdir/Xorg.0.log"
-fi
-
-# The server reaches the display and the input devices through ordinary file
-# permissions: /dev/fb0 is 0660 root:video and /dev/input/event* are 0660
-# root:input.  There is no seat manager here to hand those out to whoever is
-# logged in at the console, so access means group membership.
+# A normal user can run startx, and needs no group membership to do it:
+# /usr/bin/Xorg is installed setuid root (see ports/xorg/stage.sh).
 #
-# Checked up front because the alternative is a permission-denied buried in a
-# log file the user has not been told the location of yet.
-for dev in /dev/fb0 /dev/input/event0 /dev/input/event1; do
-	if [ ! -r "$dev" ] || [ ! -w "$dev" ]; then
-		user=$(id -u -n)
-		echo "startx: $user has no read/write access to $dev" >&2
-		echo "startx:" >&2
-		echo "startx: the X server needs the 'video' and 'input' groups." >&2
-		echo "startx: as root, run:" >&2
-		echo "startx:     adduser $user video" >&2
-		echo "startx:     adduser $user input" >&2
-		echo "startx:" >&2
-		echo "startx: then log out and log in again -- supplementary" >&2
-		echo "startx: groups are established at login, so they do not" >&2
-		echo "startx: apply to a session that is already running." >&2
-		exit 1
-	fi
-done
+# Why setuid rather than groups.  The server has to open the framebuffer and
+# the event devices, which are root-owned, and there is no seat manager here to
+# hand those to whoever is logged in at the console.  The obvious alternative
+# -- putting the user in the `video` and `input` groups -- grants that account
+# permanent read/write access to the keyboard and the screen: enough to read
+# every keystroke typed into any session on the machine, root's included, and
+# to read back what any session is displaying, for as long as the account
+# exists and whether or not X is running.  A setuid binary that gives root up
+# the moment its devices are open is the smaller grant, and the server does
+# exactly that: it drops real, effective and saved IDs together once
+# InitOutput() and InitAndStartDevices() have finished, before it serves a
+# single client, and verifies the drop took effect
+# (ports/xorg/patches/xorg-server/0005-drop-privileges-after-device-init.patch).
+#
+# The log therefore stays at the server's default, /var/log/Xorg.0.log: it is
+# opened -- and rotated -- while the server is still root, then written through
+# the descriptor it already holds.  No per-user log directory is needed, and no
+# -logfile is passed: a setuid server refuses an unsafe path for it anyway.
 
+# -noreset: do nothing when the last client disconnects.
+#
+# Not a preference.  The default is to RESET -- tear the server down to its
+# initial state and re-run the initialisation, which is what opens the input
+# devices.  A server that has dropped root cannot reopen them, so a reset would
+# bring it back up with no keyboard and no pointer.
+#
+# -terminate would avoid that too, but it is a trap here: xinit waits for the
+# server by connecting and then closing that connection, and closing the LAST
+# connection is exactly what arms the terminate.  The session would be racing
+# its own display server's exit.  Doing nothing is what is wanted, and xinit
+# stops the server itself when the session ends.
+#
 # -nolisten tcp: this server is built with LISTEN_TCP=no, so the option only
 # states the intent explicitly and keeps it true if that build setting ever
 # changes.  Clients connect over the AF_UNIX socket and are authorised by the
 # cookie in $XAUTHORITY, which is what stops another local user from attaching
 # to this session's display.
-exec /usr/bin/Xorg -logfile "$logfile" -nolisten tcp "$@"
+exec /usr/bin/Xorg -noreset -nolisten tcp "$@"

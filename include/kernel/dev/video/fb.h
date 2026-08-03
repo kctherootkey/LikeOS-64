@@ -138,6 +138,36 @@ void fb_print_performance_stats(void);
 void fb_reset_performance_stats(void);
 
 // Global state access
+/* ---- Pointer overlay ---------------------------------------------------
+ *
+ * The mouse pointer is composited into the FRONT buffer as the last step of
+ * every flush, and is never written into the back buffer.
+ *
+ * It used to be drawn into the back buffer, after saving the pixels it
+ * covered so they could be put back when it moved.  That save is a snapshot,
+ * and anything the console drew under the pointer made it stale: putting it
+ * back then stamped the old pixels over the new text.  A scroll was worse --
+ * fb_copy_rect moved the drawn pointer along with the text, leaving a second
+ * copy behind, and a second scroll left a third.  Hiding the pointer around
+ * every operation that draws would mean finding all of them and never missing
+ * one; compositing at flush time means there is no saved background to go
+ * stale and no drawn copy to be carried around, so there is nothing to leave
+ * behind.
+ *
+ * `argb` is width*height pixels with straight alpha in the high byte, and
+ * belongs to the caller: it must stay valid until replaced.
+ */
+void fb_pointer_set_image(const uint32_t *argb, uint32_t width,
+			  uint32_t height);
+void fb_pointer_set_visible(int visible);
+/* Move the pointer.  Marks both the vacated and the newly covered rectangle
+ * dirty, so the next flush repaints the first from the back buffer and
+ * composites the pointer into the second. */
+void fb_pointer_move(int x, int y);
+/* Mark the pointer's current rectangle dirty without moving it -- used when
+ * something else has overwritten the screen (a display server exiting). */
+void fb_pointer_damage(void);
+
 extern fb_double_buffer_t *get_fb_double_buffer(void);
 
 #endif // _KERNEL_FB_OPTIMIZE_H_

@@ -499,21 +499,38 @@ static uint64_t elf_setup_stack(uint64_t *pml4, uint64_t stack_top,
 	ax[ac].t = AT_BASE;
 	ax[ac].v = interp_base;
 	ac++;
-	ax[ac].t = AT_UID;
-	ax[ac].v = 0;
-	ac++;
-	ax[ac].t = AT_EUID;
-	ax[ac].v = 0;
-	ac++;
-	ax[ac].t = AT_GID;
-	ax[ac].v = 0;
-	ac++;
-	ax[ac].t = AT_EGID;
-	ax[ac].v = 0;
-	ac++;
-	ax[ac].t = AT_SECURE;
-	ax[ac].v = 0;
-	ac++;
+	/* The credentials the new image starts with.  Reported truthfully rather
+	 * than as zeroes: AT_SECURE is how a loader is told that this exec
+	 * crossed a privilege boundary and that it must ignore anything the
+	 * caller could have planted in the environment.  Our own loader takes
+	 * no library path from the environment at all, so nothing depends on
+	 * this today -- but a loader that grew one and trusted a hardcoded
+	 * "not secure" here would hand root to any user with a setuid binary
+	 * to point it at, and nothing about that would be visible from the
+	 * loader's side. */
+	{
+		task_t *cur = sched_current();
+		uint32_t uid = cur ? cur->cred.uid : 0;
+		uint32_t euid = cur ? cur->cred.euid : 0;
+		uint32_t gid = cur ? cur->cred.gid : 0;
+		uint32_t egid = cur ? cur->cred.egid : 0;
+
+		ax[ac].t = AT_UID;
+		ax[ac].v = uid;
+		ac++;
+		ax[ac].t = AT_EUID;
+		ax[ac].v = euid;
+		ac++;
+		ax[ac].t = AT_GID;
+		ax[ac].v = gid;
+		ac++;
+		ax[ac].t = AT_EGID;
+		ax[ac].v = egid;
+		ac++;
+		ax[ac].t = AT_SECURE;
+		ax[ac].v = (uid != euid || gid != egid) ? 1 : 0;
+		ac++;
+	}
 	ax[ac].t = AT_NULL;
 	ax[ac].v = 0;
 	ac++;

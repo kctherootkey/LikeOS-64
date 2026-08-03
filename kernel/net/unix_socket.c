@@ -9,6 +9,23 @@
 #include <kernel/uapi/bug.h>
 #include <kernel/fs/vfs.h> /* vfs_permission_parent, MAY_* */
 
+/* Wake tasks blocked in select()/poll()/epoll_wait().
+ *
+ * A blocking read() or write() on a socket parks on the socket itself and is
+ * released by sched_wake_channel() below.  A task multiplexing with select()
+ * cannot park there -- it is waiting on many descriptors at once -- so it
+ * parks on the poll layer's own channel, and only poll_notify_io_ready()
+ * releases it.  Without this call such a task slept until the poll layer's
+ * one-tick fallback expired: 10 ms per event at the 100 Hz tick.
+ *
+ * That is the cost of one X11 round trip, and an X client makes hundreds of
+ * them while starting up -- the display server sits in select() on this
+ * transport, so every request it was sent waited a tick before it was even
+ * looked at.  It is why an Xlib program took seconds to appear while a
+ * request-batching xcb one did not.
+ */
+extern void poll_notify_io_ready(void);
+
 // UNIX socket table
 static unix_socket_t unix_sockets[MAX_UNIX_SOCKETS];
 
@@ -641,6 +658,10 @@ int unix_connect(int usockfd, const struct sockaddr_un *addr,
 	spin_unlock_irqrestore(&listener->lock, flags);
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
 
+	/* A listener multiplexing with select() -- which is what a display
+	 * server does -- is waiting on the poll channel, not on this socket. */
+	poll_notify_io_ready();
+
 	// Wait for acceptance (peer link to be set up).  Re-read peer/error
 	// each iteration via volatile so the compiler doesn't hoist.  Yield
 	// rather than pause so the listener task on another CPU (or this
@@ -705,6 +726,13 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 	const uint8_t *src = (const uint8_t *)buf;
 	int sent = 0;
 	uint64_t irqflags;
+	/* Set when this call queued data, cleared when the poll layer has been
+	 * told.  Not done per chunk: the loop runs once per 256 bytes, and a
+	 * large write would otherwise sweep the run queue hundreds of times to
+	 * announce the same thing.  Once per call is enough, plus once more
+	 * before parking -- a poller that has not been told will not read, and
+	 * this task is waiting for it to read. */
+	int poll_pending = 0;
 
 	/* Bounce through a kernel buffer.  User memory must NEVER be touched
 	 * while peer->lock is held: a user page can be demand-paged (lazily
@@ -753,8 +781,10 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 		spin_unlock_irqrestore(&peer->lock, irqflags);
 		/* Wake a reader parked on this socket.  OUTSIDE the lock: the
 		 * wake path takes scheduler locks of its own. */
-		if (n)
+		if (n) {
 			sched_wake_channel(peer);
+			poll_pending = 1;
+		}
 		sent += (int)n;
 
 		if (n == chunk)
@@ -781,6 +811,11 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 		 * space is still there when this task runs again. */
 		{
 			task_t *snd_cur = sched_current();
+
+			if (poll_pending) {
+				poll_notify_io_ready();
+				poll_pending = 0;
+			}
 
 			spin_lock_irqsave(&peer->lock, &irqflags);
 			while ((peer->tail + 1) % peer->bufsz == peer->head) {
@@ -820,6 +855,9 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 			spin_unlock_irqrestore(&peer->lock, irqflags);
 		}
 	}
+
+	if (poll_pending)
+		poll_notify_io_ready();
 
 	// Drop the reference we took above.  If this was the last ref and
 	// peer was already closed, unix_close's deferred-free logic (or
@@ -906,6 +944,9 @@ int unix_recv(int usockfd, void *buf, size_t len, int flags)
 
 	uint64_t irqflags;
 	int received = 0;
+	/* Space was freed for a sender; announce it to select()/poll() once for
+	 * the whole call rather than once per 256-byte chunk. */
+	int poll_freed_space = 0;
 
 	/* Same rule as unix_send: never touch user memory under us->lock.  Drain
 	 * the ring into a kernel buffer with the lock held, then copy out to the
@@ -930,8 +971,10 @@ int unix_recv(int usockfd, void *buf, size_t len, int flags)
 
 		/* Space was freed: wake anyone blocked trying to send to us.
 		 * Outside the lock, as on the send side. */
-		if (n)
+		if (n) {
 			sched_wake_channel(us);
+			poll_freed_space = 1;
+		}
 
 		if (n == 0)
 			break; /* ring empty */
@@ -946,6 +989,9 @@ int unix_recv(int usockfd, void *buf, size_t len, int flags)
 		if (n < chunk)
 			break; /* ring drained */
 	}
+
+	if (poll_freed_space)
+		poll_notify_io_ready();
 
 	return received;
 }
@@ -1031,6 +1077,7 @@ int unix_close(int usockfd)
 	sched_wake_channel(us);
 	if (peer)
 		sched_wake_channel(peer);
+	poll_notify_io_ready();
 	if (dead_ring)
 		kfree(dead_ring);
 

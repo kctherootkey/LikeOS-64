@@ -68,6 +68,24 @@ cp "$SYSROOT/usr/bin/Xorg" "$DEST/usr/bin/Xorg"
 cp "$SYSROOT/usr/bin/xkbcomp" "$DEST/usr/bin/xkbcomp"
 ln -sfn Xorg "$DEST/usr/bin/X"
 
+# Xorg is setuid root.
+#
+# It has to open the framebuffer, the event devices and its log, all of which
+# are root-owned, and it cannot be given those any other way here: there is no
+# seat manager to hand a logged-in user the devices for the duration of a
+# session.  The alternative was to put the user in the `video` and `input`
+# groups, which is a permanent grant of read/write access to the keyboard and
+# the screen -- enough to read every keystroke typed into any session on the
+# machine, root's included, and to read back what any session displays, for as
+# long as the account exists.
+#
+# The server gives root up as soon as those descriptors are open, before it
+# serves a single client (dix/main.c, patched).  Root-owned and NOT
+# group-writable: the point is that only the setuid bit grants this, so nothing
+# else needs to.
+chown 0:0 "$DEST/usr/bin/Xorg" 2>/dev/null || true
+chmod 4755 "$DEST/usr/bin/Xorg"
+
 # cvt computes modelines; small, and the only way to work out a mode by hand.
 [ -f "$SYSROOT/usr/bin/cvt" ] && cp "$SYSROOT/usr/bin/cvt" "$DEST/usr/bin/cvt"
 

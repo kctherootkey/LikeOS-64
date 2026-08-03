@@ -1257,7 +1257,6 @@ void console_scroll_region_up(int n, int top, int bot)
 	uint32_t text_w = console_text_width_pixels();
 	if (cursor_enabled && cursor_shown)
 		draw_cursor_at(cursor_last_x, cursor_last_y, 0);
-	mouse_show_cursor_noflush(0);
 
 	uint32_t move_rows = (uint32_t)(region_rows - n);
 	if (move_rows > 0) {
@@ -1269,7 +1268,6 @@ void console_scroll_region_up(int n, int top, int bot)
 	fb_fill_rect(0, (uint32_t)((top + (int)move_rows) * CHAR_HEIGHT),
 		     text_w, (uint32_t)n * CHAR_HEIGHT, bg_color);
 
-	mouse_show_cursor_noflush(1);
 	console_flush_unless_batch();
 	spin_unlock_irqrestore(&console_lock, flags);
 }
@@ -1298,7 +1296,6 @@ void console_scroll_region_down(int n, int top, int bot)
 	uint32_t text_w = console_text_width_pixels();
 	if (cursor_enabled && cursor_shown)
 		draw_cursor_at(cursor_last_x, cursor_last_y, 0);
-	mouse_show_cursor_noflush(0);
 
 	uint32_t move_rows = (uint32_t)(region_rows - n);
 	if (move_rows > 0) {
@@ -1309,7 +1306,6 @@ void console_scroll_region_down(int n, int top, int bot)
 	fb_fill_rect(0, (uint32_t)(top * CHAR_HEIGHT), text_w,
 		     (uint32_t)n * CHAR_HEIGHT, bg_color);
 
-	mouse_show_cursor_noflush(1);
 	console_flush_unless_batch();
 	spin_unlock_irqrestore(&console_lock, flags);
 }
@@ -1462,8 +1458,6 @@ static void console_scroll_up(void)
 		if (top > bot)
 			return;
 
-		mouse_show_cursor_noflush(0);
-
 		uint32_t sb_total_w =
 			SCROLLBAR_DEFAULT_WIDTH + SCROLLBAR_MARGIN;
 		uint32_t text_w =
@@ -1482,14 +1476,13 @@ static void console_scroll_up(void)
 
 		cursor_y = (uint32_t)bot;
 		cursor_x = 0;
-		mouse_show_cursor_noflush(1);
 		return;
 	}
 
-	// Full-screen scroll (original behavior — preserves scrollback semantics).
-	// Hide mouse cursor before scrolling to prevent artifacts (no VRAM flush)
-	mouse_show_cursor_noflush(0);
-
+	/* Full-screen scroll (original behavior — preserves scrollback
+	 * semantics).  The mouse pointer needs no hiding: it is composited into
+	 * the front buffer at flush time and is not in the back buffer being
+	 * scrolled, so there is nothing here for a copy to smear upward. */
 	uint32_t screen_width = fb_info->horizontal_resolution;
 	uint32_t height = fb_info->vertical_resolution;
 	uint32_t scroll_lines = CHAR_HEIGHT;
@@ -1525,7 +1518,6 @@ static void console_scroll_up(void)
 
 	cursor_y = max_rows - 1;
 	cursor_x = 0;
-	mouse_show_cursor_noflush(1);
 }
 
 // Public: set / clear the active scroll region (0-based, inclusive).
@@ -2277,11 +2269,9 @@ void console_scroll_up_line(void)
 	if (g_sb.viewport_top > 0) {
 		g_sb.viewport_top--;
 		g_sb.at_bottom = 0;
-		mouse_show_cursor(0);
 		console_render_view();
 		console_sync_scrollbar();
 		fb_flush_dirty_regions();
-		mouse_show_cursor(1);
 	}
 }
 
@@ -2296,11 +2286,9 @@ void console_scroll_down_line(void)
 			g_sb.at_bottom = 1;
 		else
 			g_sb.at_bottom = 0;
-		mouse_show_cursor(0);
 		console_render_view();
 		console_sync_scrollbar();
 		fb_flush_dirty_regions();
-		mouse_show_cursor(1);
 	}
 }
 
@@ -2313,11 +2301,9 @@ void console_set_viewport_top(uint32_t line)
 		line = max_vp;
 	g_sb.viewport_top = line;
 	g_sb.at_bottom = (line >= max_vp);
-	mouse_show_cursor(0);
 	console_render_view();
 	console_sync_scrollbar();
 	fb_flush_dirty_regions();
-	mouse_show_cursor(1);
 }
 
 void console_scroll_to_bottom(void)
@@ -2330,11 +2316,9 @@ void console_scroll_to_bottom(void)
 		(eff > g_sb.visible_lines) ? (eff - g_sb.visible_lines) : 0;
 	g_sb.viewport_top = max_vp;
 	g_sb.at_bottom = 1;
-	mouse_show_cursor(0);
 	console_render_view();
 	console_sync_scrollbar();
 	fb_flush_dirty_regions();
-	mouse_show_cursor(1);
 }
 
 void console_handle_mouse_event(int x, int y, uint8_t left_pressed)

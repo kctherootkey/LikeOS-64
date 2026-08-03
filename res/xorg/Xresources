@@ -29,6 +29,19 @@ XTerm*VT100*colorMode:		on
 XTerm*VT100*boldColors:		on
 XTerm*VT100*dynamicColors:	on
 
+! Window size.  xterm's geometry is in CHARACTERS, not pixels -- 80x24 is the
+! built-in default and is a small window on a 1920x1200 screen.
+!
+! 132x43 at the default 6x13 font is 792x559 pixels, which is the ~800x600 a
+! terminal wants to be here; 132 columns is also the conventional wide-terminal
+! width, so output formatted for it lines up.  Change the numbers, not the
+! font, to resize: the pixel size follows from both together.
+!
+! A resource rather than -geometry in the ctwm menu, so an xterm started from a
+! shell is the same size as one started from the menu -- and an explicit
+! -geometry on a command line still outranks this.
+XTerm*VT100.geometry:		132x43
+
 ! Scrollback.  A terminal without it loses everything that scrolls past, which
 ! matters more here than usual: this is where build and boot output is read.
 XTerm*saveLines:		2048
@@ -64,3 +77,36 @@ XTerm*scrollKey:		true
 ! reason (resizing, waiting), not per application.
 XCalc*Cursor:			left_ptr
 XClock*Cursor:			left_ptr
+
+! xcalc's square-root, pi and divide keys.
+!
+! Its app-defaults draws those three in the Adobe Symbol font, which is not an
+! encoding so much as a set of glyphs at arbitrary byte positions: \326\140 is
+! the radical and its overbar, \160 is pi, \270 is the division sign -- but
+! only in that font.  font-adobe-* is not built here, so the label bytes land
+! in the default 8x13 font instead and are read as Latin-1, which is why the
+! square-root key says "Ö`", pi says "p" and divide says "¸".
+!
+! Fixed by naming a font that exists and labels that mean the same thing in it.
+! Divide comes out exactly right: U+00F7 is in Latin-1, so \367 is the real
+! division sign.  Root and pi have no Latin-1 character at all -- the fonts are
+! ISO 10646-1 but a Label draws its bytes 8-bit, so nothing above U+00FF is
+! reachable this way -- and are spelled out instead.
+!
+! Safe to lengthen: XCalc*Command.width is 40 pixels for every key, so a label
+! is centred in a fixed box and cannot reflow the keypad.  40px is five
+! characters at 8x13.
+XCalc*ti.button3.font:		8x13
+XCalc*ti.button3.label:		sqrt
+XCalc*ti.button21.font:		8x13
+XCalc*ti.button21.label:	pi
+XCalc*ti.button35.font:		8x13
+XCalc*ti.button35.label:	\367
+
+! The same three keys in RPN mode (xcalc -rpn), which is a separate widget tree.
+XCalc*hp.button1.font:		8x13
+XCalc*hp.button1.label:		sqrt
+XCalc*hp.button12.font:		8x13
+XCalc*hp.button12.label:	pi
+XCalc*hp.button10.font:		8x13
+XCalc*hp.button10.label:	\367
