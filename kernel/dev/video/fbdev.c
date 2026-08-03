@@ -221,7 +221,13 @@ int fbdev_display_owned(void)
 
 void fbdev_opened(void)
 {
-	g_fb0_opens++;
+	if (g_fb0_opens++ == 0) {
+		/* First open: the display server is taking over.  Take the
+		 * hardware cursor down now -- the device composites it, so it
+		 * would sit on top of whatever that program draws until the
+		 * pointer happened to move. */
+		mouse_console_display_taken();
+	}
 }
 
 void fbdev_closed(void)

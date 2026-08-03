@@ -138,6 +138,9 @@ static void mouse_publish_pointer_image(void)
 // ---------------------------------------------------------------------------
 
 static int g_hw_cursor_defined = 0;
+/* Is the DEVICE currently displaying our hardware cursor?  Tracked so the hide
+ * below happens once rather than on every packet -- see mouse_hw_cursor_update(). */
+static int g_hw_cursor_shown = 0;
 
 // Build + upload the current effective cursor image as a hardware cursor.
 static int mouse_hw_cursor_define(void)
@@ -194,6 +197,39 @@ static int mouse_hw_cursor_define(void)
 	}
 }
 
+/* Take the hardware cursor down for as long as another program owns the screen.
+ *
+ * Clearing the visible flag is what the interface offers, and on its own it is
+ * not enough everywhere: VirtualBox kept drawing ours after being told to stop,
+ * leaving a second pointer on screen beside the one X was drawing.  So a fully
+ * transparent shape is uploaded as well -- a cursor with no opaque pixel cannot
+ * be drawn whatever the host decides about the flag.
+ *
+ * The real shape is dropped with it, so it is uploaded again when the screen
+ * comes back.
+ */
+static void mouse_hw_cursor_hide(void)
+{
+	/* Never written, so it is a whole cursor's worth of zeroes: alpha 0 in
+	 * every pixel.  Sized for the largest cursor the device accepts. */
+	static const uint32_t transparent[CURSOR_MAX_WIDTH * CURSOR_MAX_HEIGHT];
+
+	vmsvga2_cursor_show(0);
+
+	if (vmsvga2_get_caps() & SVGA_CAP_ALPHA_CURSOR) {
+		int w = mouse_state.cursor_w;
+		int h = mouse_state.cursor_h;
+
+		if (w > 0 && h > 0 && w <= CURSOR_MAX_WIDTH &&
+		    h <= CURSOR_MAX_HEIGHT)
+			vmsvga2_cursor_define_alpha((uint32_t)w, (uint32_t)h, 0,
+						    0, transparent);
+	}
+
+	g_hw_cursor_defined = 0; /* the real shape is gone; re-upload it later */
+	g_hw_cursor_shown = 0;
+}
+
 // Returns 1 when the hardware cursor handled this update (no software draw).
 static int mouse_hw_cursor_update(void)
 {
@@ -203,9 +239,19 @@ static int mouse_hw_cursor_update(void)
 	 * The hardware cursor is composited by the DEVICE, so it would appear
 	 * on top of that program's output no matter what the console does --
 	 * hide it, and report the update as handled so the software path does
-	 * not draw one either. */
+	 * not draw one either.
+	 *
+	 * Hidden ONCE, and then the device is left alone.  This used to send a
+	 * position update with the visible flag clear on every packet, which is
+	 * a cursor command however it is labelled: a host that treats any
+	 * cursor update as a reason to display one kept drawing ours, tracking
+	 * the kernel's pointer a little away from the one X was drawing from
+	 * the same movements.  That is the two-pointers-in-lockstep seen under
+	 * VirtualBox.  Not writing the position at all leaves nothing to
+	 * re-assert. */
 	if (fbdev_display_owned()) {
-		vmsvga2_cursor_move(mouse_state.x, mouse_state.y, 0);
+		if (g_hw_cursor_shown)
+			mouse_hw_cursor_hide();
 		mouse_state.last_x = mouse_state.x;
 		mouse_state.last_y = mouse_state.y;
 		return 1;
@@ -224,6 +270,7 @@ static int mouse_hw_cursor_update(void)
 	}
 	vmsvga2_cursor_move(mouse_state.x, mouse_state.y,
 			    mouse_state.cursor_visible);
+	g_hw_cursor_shown = mouse_state.cursor_visible ? 1 : 0;
 	mouse_state.last_x = mouse_state.x;
 	mouse_state.last_y = mouse_state.y;
 	return 1;
@@ -251,6 +298,21 @@ static void mouse_sync_overlay(int hw_handled)
 }
 
 /*
+ * Another program has taken the display.
+ *
+ * Called on the FIRST open of /dev/fb0 rather than waiting for the next mouse
+ * packet to notice: the hardware cursor is composited by the device and would
+ * otherwise sit on top of that program's output until the pointer next moved.
+ */
+void mouse_console_display_taken(void)
+{
+	if (!vmsvga2_active() || !vmsvga2_has_hw_cursor())
+		return;
+	if (g_hw_cursor_shown)
+		mouse_hw_cursor_hide();
+}
+
+/*
  * The display has been handed back to the console: make the pointer work again.
  *
  * On a host with an alpha hardware cursor the console pointer is NOT drawn into
@@ -269,6 +331,7 @@ static void mouse_sync_overlay(int hw_handled)
 void mouse_console_display_released(void)
 {
 	g_hw_cursor_defined = 0;
+	g_hw_cursor_shown = 0;
 	fb_pointer_damage();
 	mouse_state.last_x = mouse_state.x;
 	mouse_state.last_y = mouse_state.y;
@@ -671,6 +734,11 @@ void mouse_set_bounds(int width, int height)
 	 * the moment to work out again which pointer should be drawn.  It also
 	 * clears the uploaded shape, so make the next update re-upload it. */
 	g_hw_cursor_defined = 0;
+	/* Assume the device may still be displaying it: a mode set clears the
+	 * uploaded shape, but whether it also takes the cursor down is the
+	 * host's business.  Claiming it is already hidden would skip the one
+	 * hide that matters when a display server is mid-startup. */
+	g_hw_cursor_shown = 1;
 	fb_pointer_move(mouse_state.x, mouse_state.y);
 	mouse_sync_overlay(mouse_hw_cursor_update());
 	/* Switching the overlay off marks the rectangle it occupied dirty;

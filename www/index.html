@@ -79,6 +79,50 @@
     margin-bottom: 0.3em;
   }
 
+  /* Screenshot gallery.
+     Deliberately wider than .container: the shots are 1920x1200, and shrinking
+     them into an 800px column would make the desktop unreadable.  It breaks
+     out with a negative margin on wide viewports and falls back to the column
+     width on narrow ones. */
+  .shots {
+    margin: 1.6em 0;
+  }
+  .shots-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 18px;
+  }
+  .shot {
+    display: block;
+    text-decoration: none;
+    border: 1px solid #999;
+    background: #f4f4f4;
+    padding: 6px 6px 0 6px;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .shot:hover, .shot:focus {
+    border-color: #0066cc;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+  }
+  .shot img {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  .shot .caption {
+    display: block;
+    padding: 6px 2px;
+    font-size: 0.82em;
+    color: #333;
+    text-align: center;
+  }
+  .shots-note {
+    font-size: 0.85em;
+    color: #555;
+    text-align: center;
+    margin-top: 0.6em;
+  }
+
   /* Canonical URL */
   .canonical {
     margin: 0.8em 0;
@@ -130,6 +174,23 @@
       max-width: 260px;
     }
   }
+
+  /* Wide enough to be worth breaking the shots out of the text column.
+     The width is capped against the viewport as well as at 1180px: a fixed
+     1180 would hang off both edges at viewports just over this breakpoint,
+     and the 56px inset leaves room for a scrollbar so nothing overflows
+     horizontally. */
+  @media (min-width: 1100px) {
+    .shots {
+      --shots-width: min(1180px, calc(100vw - 56px));
+      width: var(--shots-width);
+      margin-left: calc((var(--shots-width) - 100%) / -2);
+      margin-right: calc((var(--shots-width) - 100%) / -2);
+    }
+    .shots-grid {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
 </style>
 <!-- Copyright (c) 2026 Nikolaos Rangos. -->
 </head>
@@ -165,12 +226,12 @@
   <div class="release-block">
     Current development release:
     <p>
-      <span class="release-name">LikeOS 0.2.3-HEAD</span>
+      <span class="release-name">LikeOS 0.2.4-HEAD</span>
     </p>
   </div>
 
   <p>
-    Version 0.2.3 has these key features:
+    Version 0.2.4 has these key features:
   </p>
   <ul>
     <li>64-bit long mode kernel with higher-half mapping.</li>
@@ -180,20 +241,78 @@
     <li>Per-CPU data structures, run queues, and scheduler accounting.</li>
     <li>LAPIC timer setup, IOAPIC routing, TLB shootdown, and SMP-aware locking.</li>
     <li>Preemptive multitasking scheduler with fork, execve, exit, wait4, signals, and pipes.</li>
-    <li>User mode execution in ring 3 with ELF64 binary loading.</li>
-    <li>FAT32 filesystem with VFS and devfs layers.</li>
+    <li>User mode execution in ring 3 with ELF64 binary loading and <tt>#!</tt> scripts.</li>
+    <li><b>ext4 as the root filesystem</b> &mdash; read and write, with extents,
+        hash-indexed directories, extended attributes and a journal &mdash; plus FAT32,
+        VFS and devfs layers.</li>
+    <li><b>Demand paging</b>: anonymous memory, brk, BSS and private file mappings are
+        populated on first touch rather than at exec, alongside copy-on-write fork.</li>
     <li>Dentry cache, inode cache, and page cache with read-ahead and CLOCK-style eviction.</li>
+    <li><b>Multi-user login</b>: init, getty and login with PAM and yescrypt, users and
+        groups, and file permissions enforced in the VFS.</li>
+    <li>POSIX threads, System V and POSIX shared memory, poll/select/epoll, and PTYs.</li>
+    <li><b>UTF-8 throughout</b>: the console decodes it and addresses glyphs by code point,
+        and the C library implements the full multibyte and wide-character interface.</li>
     <li>xHCI USB 3.0 stack and USB mass storage driver.</li>
-    <li>PS/2, PCI, and APIC hardware drivers.</li>
+    <li>PS/2, I2C-HID, PCI, APIC, and ACPI hardware support; VMware SVGA II graphics
+        with a hardware cursor.</li>
     <li>TCP/IP networking stack with BSD-style sockets and multiple NIC drivers.</li>
     <li>Physical and virtual memory management with SLAB allocator, stack canaries, and security protections.</li>
-    <li>Virtual terminals (VTs) with POSIX-like TTY and signal handling.</li>
-    <li>Userland libc with dynamic runtime linker support.</li>
-    <li>Framebuffer console optimizations.</li>
-    <li>Core utilities: sh, ls, cat, cp, mv, rm, grep, find, nano, top, ps, and many more.</li>
-    <li>Ported applications: nano, tmux, netcat, openssl, curl.</li>
+    <li>Virtual terminals (VTs) with POSIX-like TTY, xterm-compatible escape handling, and signal handling.</li>
+    <li>Userland libc with dynamic runtime linker, dlopen, POSIX regular expressions and iconv.</li>
+    <li>Framebuffer console with scrollback, a scrollbar and a mouse pointer.</li>
+    <li>Core utilities: ls, cat, cp, mv, rm, grep, sed, find, top, ps, and many more.</li>
+    <li><b>Ported applications</b>: <b>bash</b> 5.2 as the system shell,
+        <b>OpenSSH</b> 10.4 (client and server), OpenSSL, curl, tmux, nano, and netcat.</li>
+    <li><b>An X.Org desktop</b>: the X server on the framebuffer with the ctwm window
+        manager, <b>xterm</b>, the <b>NetSurf</b> web browser, the <b>XNEdit</b> editor,
+        xcalc, xclock and xload.</li>
     <li>Real hardware support on Lenovo and Dell notebooks, VMware, VirtualBox, and QEMU.</li>
   </ul>
+
+  <hr>
+
+  <!-- Screenshots -->
+  <div class="shots">
+    <div class="shots-grid">
+      <a class="shot" target="_blank" rel="noopener"
+         href="screenshots/LikeOS-64%20bootstrapper-2026-07-30-12-54-19.png">
+        <img src="screenshots/LikeOS-64%20bootstrapper-2026-07-30-12-54-19.png"
+             width="1920" height="1200" loading="lazy"
+             alt="The LikeOS-64 X.Org desktop: ctwm with a desktop bar, an xterm and other clients">
+        <span class="caption">The X.Org desktop &mdash; click for full size</span>
+      </a>
+      <a class="shot" target="_blank" rel="noopener"
+         href="screenshots/LikeOS-64%20bootstrapper-2026-07-31-17-05-17.png">
+        <img src="screenshots/LikeOS-64%20bootstrapper-2026-07-31-17-05-17.png"
+             width="1920" height="1200" loading="lazy"
+             alt="LikeOS-64 running the NetSurf web browser and further X clients">
+        <span class="caption">Applications running under X &mdash; click for full size</span>
+      </a>
+    </div>
+    <p class="shots-note">
+      Shown at 1920&times;1200, which is what <tt>make SCREEN_SIZE=large</tt> asks for.
+    </p>
+  </div>
+
+  <hr>
+
+  <!-- Trying it -->
+  <p>
+    <b>Trying it.</b> At the login prompt, log in as <b>root</b> with the password
+    <b>toor</b>, then type <b>startx</b> to bring up the X.Org desktop. Button&nbsp;1 on
+    the desktop background opens the root menu &mdash; xterm, xcalc, XNEdit, NetSurf
+    &mdash; and &ldquo;Exit session&rdquo; returns to the console. Any user can run
+    <tt>startx</tt>: the X server is installed setuid root and gives root up as soon as
+    it has opened the framebuffer and the input devices, so no group membership is
+    needed.
+  </p>
+
+  <p>
+    Building with <tt>make SCREEN_SIZE=large</tt> asks for a 1920&times;1200 screen
+    instead of the default 1280&times;800, falling back through the usual modes if the
+    display cannot do it.
+  </p>
 
   <hr>
 
@@ -208,10 +327,11 @@
   <p>
     <b>LikeOS</b> is a Unix-like operating system designed to demonstrate modern OS development
     from the ground up. It features a complete userland with process management, syscalls,
-    preemptive multitasking, symmetric multi-processing (SMP), and an interactive shell.
-    The system boots via UEFI, runs on (some) real hardware as well as virtual machines (QEMU,
-    VMware, VirtualBox), and includes a rich set of core utilities and a C library with
-    dynamic linking support.
+    preemptive multitasking, symmetric multi-processing (SMP), a multi-user login, and
+    bash as the interactive shell. The system boots via UEFI from an ext4 root filesystem,
+    runs on (some) real hardware as well as virtual machines (QEMU, VMware, VirtualBox),
+    and includes a rich set of core utilities, a C library with dynamic linking support,
+    TCP/IP networking with OpenSSH, and an X.Org desktop.
   </p>
 
   <p>
@@ -248,7 +368,7 @@
   </p>
 
   <p class="footer-updated">
-    This page last updated <b>June 4<sup>th</sup>, 2026</b>.
+    This page last updated <b>August 3<sup>rd</sup>, 2026</b>.
   </p>
 
   <hr>

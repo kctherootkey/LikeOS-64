@@ -26,6 +26,10 @@
  */
 extern void poll_notify_io_ready(void);
 
+/* Drop the in-flight-sender count taken on a peer socket; defined below, next
+ * to the close path it completes. */
+static void unix_put_sender(unix_socket_t *us);
+
 // UNIX socket table
 static unix_socket_t unix_sockets[MAX_UNIX_SOCKETS];
 
@@ -700,9 +704,10 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 		return -EBADF;
 
 	// Snapshot peer pointer under unix_table_lock so it cannot be set
-	// to a freed-and-reused slot mid-deref.  Once we have a reference
-	// (peer->ref_count++), the slot cannot be freed under us even if
-	// unix_close clears us->peer afterwards.
+	// to a freed-and-reused slot mid-deref.  Once we are counted in
+	// peer->send_active, the slot cannot be freed under us even if
+	// unix_close clears us->peer afterwards -- unix_close decides whether
+	// it may release under the same lock, so the two cannot cross.
 	uint64_t tflags;
 	spin_lock_irqsave(&unix_table_lock, &tflags);
 	unix_socket_t *peer = us->peer;
@@ -715,11 +720,11 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 			return -EDESTADDRREQ;
 		return -ENOTCONN;
 	}
-	__atomic_fetch_add(&peer->ref_count, 1, __ATOMIC_ACQ_REL);
+	__atomic_fetch_add(&peer->send_active, 1, __ATOMIC_ACQ_REL);
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
 
 	if (peer->closed || peer->peer_closed) {
-		__atomic_fetch_sub(&peer->ref_count, 1, __ATOMIC_ACQ_REL);
+		unix_put_sender(peer);
 		return -EPIPE;
 	}
 
@@ -759,8 +764,7 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 		/* The peer needs a ring before anything can be put in it.
 		 * Done here, outside every lock, because it may sleep. */
 		if (unix_ring_ensure(peer) != 0) {
-			__atomic_fetch_sub(&peer->ref_count, 1,
-					   __ATOMIC_ACQ_REL);
+			unix_put_sender(peer);
 			return sent > 0 ? sent : -ENOMEM;
 		}
 
@@ -794,8 +798,7 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 		if (sent > 0)
 			break; /* partial write — report what we sent */
 		if (us->nonblock) {
-			__atomic_fetch_sub(&peer->ref_count, 1,
-					   __ATOMIC_ACQ_REL);
+			unix_put_sender(peer);
 			return -EAGAIN;
 		}
 		/* Wait for the reader to make space.
@@ -822,8 +825,7 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 				if (peer->closed) {
 					spin_unlock_irqrestore(&peer->lock,
 							       irqflags);
-					__atomic_fetch_sub(&peer->ref_count, 1,
-							   __ATOMIC_ACQ_REL);
+					unix_put_sender(peer);
 					return -EPIPE;
 				}
 				/* Interruptible: send() returns EINTR, and no
@@ -831,8 +833,7 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 				if (snd_cur && signal_pending(snd_cur)) {
 					spin_unlock_irqrestore(&peer->lock,
 							       irqflags);
-					__atomic_fetch_sub(&peer->ref_count, 1,
-							   __ATOMIC_ACQ_REL);
+					unix_put_sender(peer);
 					return -EINTR;
 				}
 				if (!snd_cur) {
@@ -862,7 +863,7 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 	// Drop the reference we took above.  If this was the last ref and
 	// peer was already closed, unix_close's deferred-free logic (or
 	// our own dec dropping ref to 0) will tear it down on next close.
-	__atomic_fetch_sub(&peer->ref_count, 1, __ATOMIC_ACQ_REL);
+	unix_put_sender(peer);
 
 	return sent > 0 ? sent : -EAGAIN;
 }
@@ -996,6 +997,78 @@ int unix_recv(int usockfd, void *buf, size_t len, int flags)
 	return received;
 }
 
+/* Mark a socket dead and tell its peer.  Caller holds unix_table_lock and
+ * us->lock; returns the peer so it can be woken once they are dropped.
+ *
+ * Split out from releasing the ring and the slot because the two have entirely
+ * different constraints.  This half must happen the instant the descriptor is
+ * closed, whatever else is in flight -- it is the only thing that makes the
+ * peer's poll() report a hangup.  The other half has to wait for any sender
+ * still writing into the ring.
+ */
+static unix_socket_t *unix_mark_closed_locked(unix_socket_t *us)
+{
+	unix_socket_t *peer = us->peer;
+
+	us->closed = 1;
+	if (peer) {
+		peer->peer_closed = 1;
+		peer->ready = 1; /* release readers parked on it */
+		peer->peer = NULL;
+	}
+	us->peer = NULL;
+	us->connected = 0;
+	return peer;
+}
+
+/* Release the ring and the slot.  Caller holds unix_table_lock and us->lock.
+ * The ring is returned rather than freed: kfree must not run with interrupts
+ * off. */
+static uint8_t *unix_release_locked(unix_socket_t *us)
+{
+	uint8_t *dead_ring = us->buf;
+
+	us->active = 0;
+	us->bound = 0;
+	us->listening = 0;
+	us->head = 0;
+	us->tail = 0;
+	us->buf = NULL;
+	us->bufsz = 0;
+	us->close_pending = 0;
+	return dead_ring;
+}
+
+/* Drop the reference unix_send() took on a peer.
+ *
+ * If this was the last one and a close came in while it was held, that close
+ * could not release the ring -- this sender may have been writing into it --
+ * so it left the job here.  Nothing else will do it: the descriptor is already
+ * gone, so there is no second close to finish what the first started.
+ */
+static void unix_put_sender(unix_socket_t *us)
+{
+	uint64_t tflags, flags;
+	uint8_t *dead_ring = NULL;
+
+	/* Under the table lock, because unix_close() decides whether it may
+	 * release under that same lock: without it the two can both conclude
+	 * the other will do the release, and neither does. */
+	spin_lock_irqsave(&unix_table_lock, &tflags);
+	int old = __atomic_fetch_sub(&us->send_active, 1, __ATOMIC_ACQ_REL);
+	WARN_ON(old <= 0); /* unix_socket send_active underflow */
+
+	if (old == 1 && us->close_pending) {
+		spin_lock_irqsave(&us->lock, &flags);
+		dead_ring = unix_release_locked(us);
+		spin_unlock_irqrestore(&us->lock, flags);
+	}
+	spin_unlock_irqrestore(&unix_table_lock, tflags);
+
+	if (dead_ring)
+		kfree(dead_ring);
+}
+
 // ============================================================================
 // unix_close - Close a UNIX domain socket
 // ============================================================================
@@ -1005,6 +1078,13 @@ int unix_close(int usockfd)
 	if (!us)
 		return -EBADF;
 
+	/* One descriptor of possibly several.  dup(), and every fork() that
+	 * inherits the descriptor table, counts here -- so this is NOT the last
+	 * reference merely because one close arrived, and until it is the
+	 * socket must carry on exactly as before.  Hanging up here instead was
+	 * enough to stop the X server accepting connections: xkbcomp exits
+	 * moments after the server forks it, and its inherited copy of the
+	 * server's descriptors is closed on the way out. */
 	int old = __atomic_fetch_sub(&us->ref_count, 1, __ATOMIC_ACQ_REL);
 	WARN_ON(old <= 0); /* unix_socket ref_count underflow */
 	if (old > 1)
@@ -1013,42 +1093,39 @@ int unix_close(int usockfd)
 	uint64_t tflags;
 	spin_lock_irqsave(&unix_table_lock, &tflags);
 
-	// If a unix_send between dec and lock acquire took a reference, it
-	// bumped ref_count back above 0.  Defer teardown to the caller that
-	// drops the last ref; we just return.
-	if (__atomic_load_n(&us->ref_count, __ATOMIC_ACQUIRE) > 0) {
-		spin_unlock_irqrestore(&unix_table_lock, tflags);
-		return 0;
-	}
-
 	uint64_t flags;
 	spin_lock_irqsave(&us->lock, &flags);
 
-	us->closed = 1;
+	/* Last descriptor gone: mark it dead and tell the peer NOW, whether or
+	 * not a sender is still inside unix_send().
+	 *
+	 * Both peer-link writes happen under unix_table_lock so a concurrent
+	 * unix_send observing us->peer cannot capture the pointer just before
+	 * peer is freed.
+	 *
+	 * This used to be skipped whenever a sender was inside unix_send(),
+	 * deferring the whole teardown "to the caller that drops the last ref"
+	 * -- and no sender ever did it.  The socket stayed marked open for
+	 * good, and since unix_poll() reports a hangup from peer_closed, the
+	 * PEER never saw one either.  A display server polling a client that
+	 * had already exited kept that client's window mapped and unresponsive
+	 * for the rest of the session; a server blocked in unix_send() to it
+	 * waited for ring space nobody would ever free.  Both happened only
+	 * when a send was in flight as the socket closed -- which is exactly
+	 * what closing a window is, since the request to close is a message
+	 * sent to the client. */
+	unix_socket_t *peer = unix_mark_closed_locked(us);
 
-	// Notify peer.  Both peer-link writes happen under unix_table_lock
-	// so a concurrent unix_send observing us->peer cannot capture the
-	// pointer just before peer is freed.
-	unix_socket_t *peer = us->peer;
-	if (peer) {
-		peer->peer_closed = 1;
-		peer->ready = 1; // Wake up readers
-		peer->peer = NULL;
-	}
-
-	us->active = 0;
-	us->bound = 0;
-	us->listening = 0;
-	us->connected = 0;
-	us->peer = NULL;
-	us->head = 0;
-	us->tail = 0;
-
-	/* Release the data ring with the slot.  Captured here and freed after
-	 * the locks are dropped: kfree must not run with interrupts off. */
-	uint8_t *dead_ring = us->buf;
-	us->buf = NULL;
-	us->bufsz = 0;
+	/* The ring and the slot are a different matter: a sender may still be
+	 * writing into the ring, so releasing it here would pull the memory out
+	 * from under it.  Decided under the table lock, which is also where a
+	 * sender joins send_active, so the two cannot both leave it to the
+	 * other. */
+	uint8_t *dead_ring = NULL;
+	if (__atomic_load_n(&us->send_active, __ATOMIC_ACQUIRE) > 0)
+		__atomic_store_n(&us->close_pending, 1, __ATOMIC_RELEASE);
+	else
+		dead_ring = unix_release_locked(us);
 
 	/* Capture the pathname before releasing the slot: the node has to be
 	 * removed from the filesystem, but that is blocking I/O and cannot run
@@ -1070,22 +1147,23 @@ int unix_close(int usockfd)
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
 
 	/* Wake anyone parked on either endpoint.  A sender blocked for space,
-	 * or a reader blocked for data, must be released now -- with the ring
-	 * gone and the peer marked closed, nothing else will ever wake them and
-	 * they would sleep for good.  Done outside the locks, as everywhere
-	 * else, because the wake path takes scheduler locks. */
+	 * or a reader blocked for data, must be released now -- with the peer
+	 * marked closed, nothing else will ever wake them and they would sleep
+	 * for good.  Done outside the locks, as everywhere else, because the
+	 * wake path takes scheduler locks. */
 	sched_wake_channel(us);
 	if (peer)
 		sched_wake_channel(peer);
 	poll_notify_io_ready();
-	if (dead_ring)
-		kfree(dead_ring);
 
 	/* Stale sockets otherwise accumulate in /tmp and every later bind to
 	 * the same name fails with EADDRINUSE — which is exactly how a display
 	 * server refuses to restart after an unclean exit. */
 	if (node_len > 0)
 		vfs_unlink(node_path);
+
+	if (dead_ring)
+		kfree(dead_ring);
 	return 0;
 }
 

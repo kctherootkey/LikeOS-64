@@ -1001,6 +1001,18 @@ int vmsvga2_cursor_show(int visible)
 	} else {
 		svga_write_reg(SVGA_REG_CURSOR_ON, visible ? 1 : 0);
 	}
+	/* Hiding also goes through the legacy register, whichever path was
+	 * used above.
+	 *
+	 * The two are meant to be the same control, but they are implemented
+	 * separately, and a host that honours only one of them leaves the
+	 * cursor on screen after the other has been told to take it away.
+	 * Getting that wrong is visible -- a second pointer beside the one the
+	 * program that owns the display is drawing -- so the hide is asserted
+	 * both ways.  Showing is not: exactly one path should own the position
+	 * updates, and that is decided above. */
+	if (!visible)
+		svga_write_reg(SVGA_REG_CURSOR_ON, 0);
 	spin_unlock_irqrestore(&svga_cursor_lock, f);
 	return 0;
 }

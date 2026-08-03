@@ -2,8 +2,9 @@ LikeOS-64
 =========
 
 A modern 64-bit operating system built from scratch, featuring a Unix-like
-userland with process management, syscalls, multitasking, SMP support, and
-an interactive shell.
+userland with process management, syscalls, multitasking, SMP support, a
+multi-user login, bash as the shell, an ext4 root filesystem, TCP/IP
+networking with OpenSSH, and an X.Org desktop.
 
 Current state
 -------------
@@ -26,14 +27,22 @@ LikeOS-64 is a Unix-like operating system demonstrating modern OS development:
 - Process management: preemptive multitasking scheduler.
 - SMP support: BSP and AP startup with per-CPU scheduling data.
 - UEFI bootloader: GNU-EFI based ELF64 kernel loading.
-- Filesystems: FAT32 with VFS and devfs.
+- Filesystems: ext4 (the root filesystem) and FAT32, with VFS and devfs.
 - Caching strategy: dentry cache, inode cache, and page cache.
+- Demand paging: pages are mapped when they are first touched, not at exec.
+- Multi-user: login with PAM and yescrypt, users, groups, and DAC permission
+  enforcement in the VFS.
 - Networking: TCP/IP stack with BSD-style sockets and multiple NIC drivers.
-- Hardware drivers: xHCI USB 3.0, USB mass storage, PS/2, PCI, APIC.
+- Graphics: X.Org server on the framebuffer, with a window manager, a terminal,
+  a text editor and a web browser.
+- Unicode: UTF-8 end to end -- console, C library, terminal emulator and X.
+- Hardware drivers: xHCI USB 3.0, USB mass storage, PS/2, I2C-HID (unfinished),
+  PCI, APIC, ACPI, and VMware SVGA II.
 - Memory: physical/virtual memory, SLAB allocator, stack canaries, and
   security protections.
-- Virtual terminals, TTY, and signals: VTs with POSIX-like terminal
+- Virtual terminals, TTY, PTYs and signals: VTs with POSIX-like terminal
   and signal handling.
+- Threads: POSIX threads with mutexes, condition variables and TLS.
 - Diagnostics: kernel and user crashlog printing with BUG_ON/WARN_ON asserts.
 
 Feature summary
@@ -66,6 +75,60 @@ Networking
 - Networking utilities: ifconfig, route, arp, ping, traceroute, netstat,
   dhclient, host, dig, nslookup, hostname, and arping.
 
+Filesystems
+~~~~~~~~~~~
+- ext4 is the root filesystem: extents, hash-indexed (htree) directories,
+  extended attributes, and a journal with ordered-data commits.  Both read and
+  write paths are implemented, including extent-tree growth and directory
+  hashing, and the bootloader reads /boot/kernel.elf straight out of it.
+- FAT32 for the EFI System Partition and removable media (mounting removable media is still a pending feature).
+- VFS layer with symlinks, hard links, file locking, and chroot.
+- devfs: /dev/null, /dev/zero, /dev/random, /dev/urandom, /dev/tty, /dev/pts,
+  /dev/fb0, /dev/input/event*, and the disk nodes.
+
+Memory management
+~~~~~~~~~~~~~~~~~
+- Physical page allocator with a bitmap and per-page reference counts.
+- Four-level paging, higher-half kernel, and a RAM-sized direct map.
+- SLAB allocator for kernel objects.
+- Demand paging: anonymous memory, brk, BSS and private file-backed mmap are
+  populated on first touch rather than at exec time, so a large program starts
+  without faulting in what it never reads.
+- Copy-on-write fork, mmap/munmap/mprotect, and guard-paged stacks.
+- System V and POSIX shared memory (used by X clients through MIT-SHM).
+
+Users, login and permissions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- init -> getty -> login, driven by /etc/inittab.
+- PAM stack with a yescrypt-based crypt(3); /etc/passwd, /etc/shadow,
+  /etc/group.
+- Real, effective and saved user and group IDs, supplementary groups, and
+  set-user-ID execution.
+- Discretionary access control enforced in the VFS, with a single privilege
+  chokepoint, so file permissions apply to every path that opens a file.
+- Account tools: id, whoami, groups, su, passwd, adduser, addgroup, deluser,
+  delgroup.
+
+Graphics and input
+~~~~~~~~~~~~~~~~~~
+- Framebuffer console with scrollback, a scrollbar, and a mouse pointer.
+- VMware SVGA II driver with mode setting and a hardware cursor; the UEFI GOP
+  framebuffer is the fallback on hardware without it.
+- /dev/fb0 (fbdev) and /dev/input/event* (evdev), which is what the X server
+  drives.
+- PS/2 keyboard and mouse, USB HID, and I2C-HID touchpads.
+
+Unicode
+~~~~~~~
+- UTF-8 is the encoding everywhere: the console decodes it and addresses glyphs
+  by code point, the terminal emulator tracks character widths, and the C
+  library implements the full multibyte and wide-character interface.
+- Console font is PSF2-capable PSF1 with a Unicode table (Uni2-Terminus16,
+  512 glyphs covering 791 code points: Latin, Greek, Cyrillic, box drawing).
+- Character classification, case mapping and display widths come from tables
+  generated against a reference implementation, and are checked against it over
+  every code point (host/test-unicode.sh).
+
 Caching strategy
 ~~~~~~~~~~~~~~~~
 - Dentry cache:
@@ -85,12 +148,19 @@ Process management and userland
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 - fork, execve, exit, wait4, signals, pipes.
 - User mode execution in ring 3.
-- ELF64 user binary loading.
-- Userland libc and dynamic runtime linker support.
+- ELF64 user binary loading, plus #! script execution.
+- Userland libc and dynamic runtime linker (ld-likeos.so) with dlopen/dlsym.
+- POSIX threads: mutexes, condition variables, barriers, thread-local storage,
+  and futex-based blocking.
+- poll, select and epoll; PTYs for terminal multiplexers and remote logins.
+- POSIX regular expressions, iconv, and locale support.
 
 Virtual terminals and TTY
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 - POSIX-like TTY line discipline and job-control signals.
+- ANSI/VT100/VT220/xterm escape sequence emulation, including the alternate
+  screen, scroll regions and mouse reporting, so full-screen programs work.
+- Pseudo-terminals, which is what tmux, xterm and sshd sessions run on.
 - Per-task TTY output routing for clean crashlog and diagnostics printing.
 
 Security and hardening
@@ -110,27 +180,59 @@ User core utilities
 ~~~~~~~~~~~~~~~~~~~
 Included commands (selection):
 
-- Shell and core navigation: sh, ls, pwd, cd behavior in shell.
-- File tools: cat, cp, mv, rm, mkdir, rmdir, touch, stat, file, find.
-- Text tools: grep, wc, sort, uniq, cut, tr, head, tail, strings, hexdump, nano.
+- Shell: bash 5.2 is /bin/sh -- job control, history, completion, globbing,
+  arrays and arithmetic, all of it.
+- Core navigation: ls, pwd, cd behavior in shell.
+- File tools: cat, cp, mv, rm, mkdir, rmdir, touch, stat, file, find, ln,
+  chmod, readlink.
+- Text tools: grep, sed, expr, wc, sort, uniq, cut, tr, head, tail, more, less,
+  strings, hexdump, nano.
 - System tools: uname, uptime, date, time, ps, top, df, du, free, dmesg.
 - Process tools: kill, sleep.
 - Environment tools: env, which, echo, printf.
 - Power tools: shutdown, poweroff, reboot, halt.
 - Network tools: ifconfig, route, arp, ping, traceroute, netstat, dhclient,
   host, dig, nslookup, hostname, arping.
-- Other utilities: clear, man, yes, true, false.
+- Account tools: id, whoami, groups, su, passwd, adduser, addgroup, deluser,
+  delgroup.
+- Other utilities: clear, man, tty, yes, true, false.
 - Test programs: test_syscalls, test_libc, testmem, teststress, progerr.
 
 Ported applications
 ~~~~~~~~~~~~~~~~~~~
-Third-party software ported to LikeOS-64 (under ports/):
+Third-party software ported to LikeOS-64 (under ports/).  Sources are kept
+byte-identical to upstream; everything that differs is a build file or a patch
+under the port's own directory.
 
-- nano: text editor.
+Shell and terminal:
+
+- bash 5.2: the system shell, installed as /bin/sh.
 - tmux: terminal multiplexer.
+- nano: text editor.
+- ncurses: terminal handling (a LikeOS implementation of the API).
+
+Network and crypto:
+
+- OpenSSH 10.4: ssh, scp, sftp, ssh-keygen, ssh-agent and the rest of the
+  client tools, plus sshd -- so the machine can be logged into over the
+  network as well as out from.
+- OpenSSL 3.5: TLS and crypto library and toolkit.
+- curl 8.14: HTTP/HTTPS and friends.
 - netcat (OpenBSD): networking utility.
-- openssl: TLS/crypto toolkit and library.
-- curl: data transfer client (HTTP/HTTPS, etc.).
+- libevent, zlib, nghttp2: supporting libraries.
+
+X Window System (ports/xorg, ~70 packages):
+
+- X.Org server 21.1 on the framebuffer, with the evdev input driver and the
+  fbdev video driver.  Installed setuid root and drops privileges as soon as
+  its devices are open, so no user needs the video or input groups.
+- ctwm: window manager, with a desktop bar and root menu.
+- xterm: terminal emulator (UTF-8, 256 colour).
+- NetSurf: web browser, with its own layout and rendering engine.
+- XNEdit: Motif text editor.
+- xcalc, xclock, xload, xsetroot, xrandr, xset, xauth: the usual X clients.
+- Toolkits and libraries: libX11, libXt, libXaw, libXft, Motif, freetype,
+  fontconfig, pixman, libpng, libjpeg, xkbcomp and xkeyboard-config.
 
 Build
 -----
@@ -169,8 +271,44 @@ QEMU:
   make qemu          # plain boot from the ext4 GPT disk
   make qemu-usb      # same, plus SLIRP networking (sudo)
 
-At the first login prompt, log in with the username "root" and the
-password "toor".
+Logging in
+~~~~~~~~~~
+At the login prompt, log in as
+
+  login: root
+  password: toor
+
+Change it with passwd, and create an ordinary account with adduser -- the
+system is multi-user and file permissions are enforced, so you not always want to be root.
+
+Starting the graphical desktop
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+From the shell, run
+
+  startx
+
+That brings up the X.Org server with the ctwm window manager, a clock and a
+load graph in the desktop bar.  Button 1 on the desktop background opens the
+root menu: xterm, xcalc, XNEdit, NetSurf, and "Exit session" to come back to
+the console.
+
+Any user can run startx -- the server is installed setuid root and gives root
+up as soon as it has opened the framebuffer and the input devices, so no group
+membership is needed.
+
+Screen resolution
+~~~~~~~~~~~~~~~~~
+The preferred resolution is chosen at build time:
+
+  make SCREEN_SIZE=large       1920x1200 preferred
+                               (falls back to 1920x1080, 1280x800, 1280x768,
+                               1152x864, 1024x768)
+
+  make                         1280x800 preferred
+                               (falls back to 1280x768, 1024x768)
+
+Both the bootloader and the kernel's SVGA driver use the same table, so the
+setting applies whether the mode comes from UEFI or from a mode set later.
 
 Other useful targets:
 
@@ -178,7 +316,47 @@ Other useful targets:
   make usb-write USB_DEVICE=/dev/sdX
   make qemu-realusb USB_DEVICE=/dev/sdb
 
-Linux USB host mode:
+  make SCREEN_SIZE=large       higher preferred resolution (see above)
+  make help                    every target and build variable
+
+Booting a real USB stick in a virtual machine
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  make qemu-realusb USB_DEVICE=/dev/sdb
+
+boots QEMU straight from a stick written by usb-write, which is the way to
+check that the written stick really boots.
+
+This target is console only -- do not run startx under it.  Every disk read
+goes to physical USB hardware through an emulated controller, and X, which
+reads tens of megabytes of libraries, fonts and keymaps before it draws
+anything, is far too slow to be usable that way.
+
+QEMU is the awkward way to do this.  VMware and VirtualBox both boot a real
+stick with X working and need none of what follows -- point the VM at the USB
+device and go.  See "Current state" at the top of this file for what each of
+them supports.
+
+Under QEMU, running X against a real stick is a little tricky: it needs KVM,
+and it is worth driving QEMU through virt-manager rather than by hand.  This
+configuration is known to work:
+
+  1.  Create a new virtual machine in virt-manager.
+  2.  Select manual installation.
+  3.  Choose Debian 13 as the operating system.
+  4.  Give it 2048 MB of RAM and, for example, 4 CPUs.
+  5.  Tick "Customize configuration before install".
+  6.  Under Overview, set Firmware to UEFI with OVMF_CODE_4M.fd.
+  7.  For the NIC, select Bridge and enter your bridge device (virbr0 here).
+  8.  Select e1000e as the NIC model first, then edit the model to e1000 in
+      the XML.
+  9.  Set Video to VGA.
+  10. Boot the machine, connect the external USB device also in qemu, and type "exit" at
+      the UEFI boot prompt.
+
+LikeOS then boots from the stick.  Log in as root with the password toor and
+run startx.
+
+Linux USB host mode (not really needed, for historic reasons):
 
   make distclean
   make linux-usb
@@ -188,12 +366,14 @@ Project structure
 -----------------
 
 - boot/: UEFI bootloader and trampoline.
-- kernel/: kernel subsystems (ke, hal, mm, fs, io).
+- kernel/: kernel subsystems (ke, hal, mm, fs, io, dev, net).
 - include/kernel/: public kernel headers.
 - user/bin/: user programs (core utilities and tests).
 - user/lib/libc/: C library and runtime pieces.
-- host/linux-usb/: Linux host USB builder.
-- ports/: third-party ports.
+- user/lib/rtld/: dynamic linker.
+- res/: files staged into the image (fonts, /etc, X configuration).
+- host/: build-host tools (Linux USB builder, table generators, tests).
+- ports/: third-party ports, including ports/xorg for the X Window System.
 
 Implementation status
 ---------------------
@@ -202,20 +382,26 @@ Completed:
 - UEFI bootloader and ELF64 loading.
 - Multitasking scheduler and userland process model.
 - SMP bring-up and per-CPU kernel infrastructure.
-- Syscall layer, signals, pipes, virtual terminals, and TTY.
-- FAT32, VFS, devfs, and caching layers.
+- Syscall layer, signals, pipes, virtual terminals, TTY, and PTYs.
+- ext4 (read/write, journalled) as the root filesystem; FAT32; VFS; devfs;
+  and the caching layers.
+- Demand paging and copy-on-write fork.
+- Multi-user login: init/getty/login, PAM, yescrypt, and VFS-enforced DAC.
 - xHCI USB stack and USB mass storage.
 - TCP/IP networking stack, sockets, and multiple NIC drivers.
+- POSIX threads, shared memory, poll/select/epoll.
+- UTF-8 and Unicode throughout the console, the C library and X.
+- X.Org server on the framebuffer, with ctwm, xterm, NetSurf and XNEdit.
 - Stack canaries and crashlog/assertion (BUG_ON/WARN_ON) infrastructure.
-- Framebuffer console optimizations.
-- Userland libc and core utilities set.
-- Ported applications: nano, tmux, netcat, openssl, curl.
+- Framebuffer console optimizations and a VMware SVGA II driver.
+- Userland libc, dynamic linker, and the core utilities set.
+- Ports: bash, OpenSSH, OpenSSL, curl, tmux, nano, netcat, and X.Org.
 
 Planned/future work:
-- Additional writable filesystems.
-- More drivers (AHCI/NVMe).
+- More drivers (AHCI/NVMe, more GPUs).
 - Expanded POSIX coverage.
-- GUI and package management improvements.
+- Package management.
+- GTK3 port
 
 Contributing
 ------------

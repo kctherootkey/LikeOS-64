@@ -1438,7 +1438,22 @@ typedef struct unix_socket {
 	uint64_t bytes_read; /* total bytes ever consumed from recv ring */
 
 	spinlock_t lock;
+	/* DESCRIPTORS referring to this socket: one at creation, one more per
+	 * dup() and per fork() that inherits the table, one fewer per close().
+	 * The socket is live while this is above zero -- closing one of several
+	 * descriptors must not disturb the others, and must not tell the peer
+	 * anything. */
 	int ref_count;
+	/* Senders currently inside unix_send() writing into this socket's ring.
+	 * Deliberately NOT ref_count: a sender must delay the RELEASE of the
+	 * ring it is writing into, but it must not delay the hangup, and a
+	 * descriptor must delay both.  Conflating the two makes one of the two
+	 * wrong whichever way the single counter is read. */
+	volatile int send_active;
+	/* The last descriptor is gone and the socket is marked closed, but a
+	 * sender was still inside it, so the ring and the slot could not be
+	 * released.  The last sender out finishes the job (unix_put_sender()). */
+	volatile int close_pending;
 } unix_socket_t;
 
 // UNIX domain socket API
