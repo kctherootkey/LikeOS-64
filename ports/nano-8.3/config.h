@@ -84,7 +84,7 @@
 #define ENABLE_MOUSE      1
 /* #undef ENABLE_NLS */          /* No i18n support */
 #define ENABLE_SPELLER    1      /* External spell checker */
-/* #undef ENABLE_UTF8 */         /* No wide character support yet */
+#define ENABLE_UTF8       1      /* libc has real UTF-8 and Unicode tables */
 
 /* ===== Standard headers ===== */
 #define HAVE_LIMITS_H     1
@@ -205,8 +205,8 @@
 #define HAVE_STRCASESTR   1
 #define HAVE_MKSTEMPS     1
 /* #undef HAVE_CANONICALIZE_FILE_NAME */
-/* #undef HAVE_NL_LANGINFO */
-/* #undef HAVE_LANGINFO_CODESET */
+#define HAVE_NL_LANGINFO   1
+#define HAVE_LANGINFO_CODESET 1
 /* #undef HAVE_MEMRCHR */
 /* #undef HAVE_RAWMEMCHR */
 /* #undef HAVE_MEMPCPY */

@@ -1,17 +1,28 @@
 /*
- * wchar.h - wide character support stub for LikeOS
- * Minimal definitions; full wide character support not implemented.
+ * wchar.h - wide character interface.
+ *
+ * wchar_t is 32 bits (the compiler's own wide type on x86_64), so a wide
+ * character is a Unicode code point and nothing is lost converting to or from
+ * one.  The multibyte encoding is UTF-8 in every locale; see
+ * src/locale/multibyte.c for why that is a decision rather than a gap.
  */
 #ifndef _WCHAR_H
 #define _WCHAR_H
 
 #include <stddef.h>
-#include <bits/multibyte.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <bits/multibyte.h>
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+/* wint_t must hold every wide character plus WEOF, and is unsigned so that
+ * WEOF is distinct from every valid code point rather than aliasing one. */
+#ifndef __wint_t_defined
+#define __wint_t_defined
+typedef unsigned int wint_t;
 #endif
 
 #ifndef WEOF
@@ -19,289 +30,113 @@ extern "C" {
 #endif
 
 #ifndef WCHAR_MIN
-#define WCHAR_MIN 0
+#define WCHAR_MIN __WCHAR_MIN__
 #endif
-
 #ifndef WCHAR_MAX
-#define WCHAR_MAX 0x7FFFFFFF
+#define WCHAR_MAX __WCHAR_MAX__
 #endif
 
-typedef int wint_t;
-#ifndef __wchar_t_defined
-#define __wchar_t_defined
-typedef int wchar_t;
-#endif
-
-/* Multibyte conversion state */
+/* Conversion state for the restartable functions.  __count packs how many
+ * bytes of the character in progress are still outstanding together with how
+ * long the whole sequence is; __value holds the bits assembled so far.  Zero
+ * in both is the initial state, which is what mbsinit() reports on. */
+#ifndef __mbstate_t_defined
+#define __mbstate_t_defined
 typedef struct {
-    unsigned int __count;
-    unsigned int __value;
+	unsigned int __count;
+	unsigned int __value;
 } mbstate_t;
+#endif
 
-/* Minimal multibyte functions */
-static inline int mbsinit(const mbstate_t *ps)
-{
-    return (!ps || ps->__count == 0);
-}
+/* Declared here as well as in <stdio.h>; see the note there. */
+#ifndef __FILE_defined
+#define __FILE_defined
+typedef struct _IO_FILE FILE;
+#endif
 
-static inline size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps)
-{
-    (void)ps;
-    if (!s) return 0;
-    if (n == 0) return (size_t)-2;
-    if (pwc) *pwc = (wchar_t)(unsigned char)*s;
-    return (*s != '\0') ? 1 : 0;
-}
+/* ---- Multibyte <-> wide conversion ---------------------------------- */
+int mbsinit(const mbstate_t *ps);
+size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, mbstate_t *ps);
+size_t mbrlen(const char *s, size_t n, mbstate_t *ps);
+size_t wcrtomb(char *s, wchar_t wc, mbstate_t *ps);
+size_t mbsrtowcs(wchar_t *dst, const char **src, size_t len, mbstate_t *ps);
+size_t wcsrtombs(char *dst, const wchar_t **src, size_t len, mbstate_t *ps);
+size_t mbsnrtowcs(wchar_t *dst, const char **src, size_t nmc, size_t len,
+		  mbstate_t *ps);
+size_t wcsnrtombs(char *dst, const wchar_t **src, size_t nwc, size_t len,
+		  mbstate_t *ps);
+wint_t btowc(int c);
+int wctob(wint_t c);
 
-static inline size_t mbrlen(const char *s, size_t n, mbstate_t *ps)
-{
-    return mbrtowc(0, s, n, ps);
-}
+/* ---- Display width --------------------------------------------------- */
+int wcwidth(wchar_t wc);
+int wcswidth(const wchar_t *s, size_t n);
 
-static inline size_t wcrtomb(char *s, wchar_t wc, mbstate_t *ps)
-{
-    (void)ps;
-    if (!s) return 1;
-    *s = (char)(wc & 0xFF);
-    return 1;
-}
+/* ---- String handling -------------------------------------------------- */
+size_t wcslen(const wchar_t *s);
+size_t wcsnlen(const wchar_t *s, size_t n);
+wchar_t *wcscpy(wchar_t *d, const wchar_t *s);
+wchar_t *wcpcpy(wchar_t *d, const wchar_t *s);
+wchar_t *wcsncpy(wchar_t *d, const wchar_t *s, size_t n);
+wchar_t *wcscat(wchar_t *d, const wchar_t *s);
+wchar_t *wcsncat(wchar_t *d, const wchar_t *s, size_t n);
+int wcscmp(const wchar_t *a, const wchar_t *b);
+int wcsncmp(const wchar_t *a, const wchar_t *b, size_t n);
+int wcscasecmp(const wchar_t *a, const wchar_t *b);
+int wcsncasecmp(const wchar_t *a, const wchar_t *b, size_t n);
+int wcscoll(const wchar_t *a, const wchar_t *b);
+size_t wcsxfrm(wchar_t *d, const wchar_t *s, size_t n);
+wchar_t *wcschr(const wchar_t *s, wchar_t c);
+wchar_t *wcsrchr(const wchar_t *s, wchar_t c);
+wchar_t *wcsstr(const wchar_t *h, const wchar_t *needle);
+wchar_t *wcswcs(const wchar_t *h, const wchar_t *needle);
+size_t wcsspn(const wchar_t *s, const wchar_t *set);
+size_t wcscspn(const wchar_t *s, const wchar_t *set);
+wchar_t *wcspbrk(const wchar_t *s, const wchar_t *set);
+wchar_t *wcstok(wchar_t *s, const wchar_t *sep, wchar_t **save);
+wchar_t *wcsdup(const wchar_t *s);
 
+wchar_t *wmemchr(const wchar_t *s, wchar_t c, size_t n);
+wchar_t *wmemcpy(wchar_t *d, const wchar_t *s, size_t n);
+wchar_t *wmemmove(wchar_t *d, const wchar_t *s, size_t n);
+wchar_t *wmemset(wchar_t *d, wchar_t c, size_t n);
+int wmemcmp(const wchar_t *a, const wchar_t *b, size_t n);
 
+/* ---- Numeric conversion ---------------------------------------------- */
+long wcstol(const wchar_t *s, wchar_t **end, int base);
+unsigned long wcstoul(const wchar_t *s, wchar_t **end, int base);
+long long wcstoll(const wchar_t *s, wchar_t **end, int base);
+unsigned long long wcstoull(const wchar_t *s, wchar_t **end, int base);
+double wcstod(const wchar_t *s, wchar_t **end);
+float wcstof(const wchar_t *s, wchar_t **end);
+long double wcstold(const wchar_t *s, wchar_t **end);
 
+/* ---- Wide character I/O ----------------------------------------------- */
+wint_t fgetwc(FILE *stream);
+wint_t getwc(FILE *stream);
+wint_t getwchar(void);
+wint_t fputwc(wchar_t wc, FILE *stream);
+wint_t putwc(wchar_t wc, FILE *stream);
+wint_t putwchar(wchar_t wc);
+wint_t ungetwc(wint_t wc, FILE *stream);
+wchar_t *fgetws(wchar_t *s, int n, FILE *stream);
+int fputws(const wchar_t *s, FILE *stream);
+int fwide(FILE *stream, int mode);
 
+int fwprintf(FILE *stream, const wchar_t *format, ...);
+int wprintf(const wchar_t *format, ...);
+int swprintf(wchar_t *s, size_t n, const wchar_t *format, ...);
+int vfwprintf(FILE *stream, const wchar_t *format, va_list ap);
+int vwprintf(const wchar_t *format, va_list ap);
+int vswprintf(wchar_t *s, size_t n, const wchar_t *format, va_list ap);
 
-
-
-
-
-static inline int wcwidth(wchar_t wc)
-{
-    if (wc == 0) return 0;
-    if (wc < 32 || wc == 127) return -1;
-    return 1;
-}
-
-static inline size_t wcslen(const wchar_t *s)
-{
-    size_t n = 0;
-    while (*s++) n++;
-    return n;
-}
-
-static inline wchar_t *wcschr(const wchar_t *s, wchar_t c)
-{
-    for (;; s++) {
-        if (*s == c) return (wchar_t *)s;
-        if (*s == L'\0') return 0;
-    }
-}
-
-static inline wchar_t *wcsrchr(const wchar_t *s, wchar_t c)
-{
-    const wchar_t *last = 0;
-    for (;; s++) {
-        if (*s == c) last = s;
-        if (*s == L'\0') return (wchar_t *)last;
-    }
-}
-
-static inline int wcscmp(const wchar_t *a, const wchar_t *b)
-{
-    while (*a && *a == *b) { a++; b++; }
-    return (*a < *b) ? -1 : (*a > *b) ? 1 : 0;
-}
-
-static inline int wcsncmp(const wchar_t *a, const wchar_t *b, size_t n)
-{
-    for (; n; n--, a++, b++) {
-        if (*a != *b) return (*a < *b) ? -1 : 1;
-        if (*a == L'\0') break;
-    }
-    return 0;
-}
-
-static inline int wcscoll(const wchar_t *a, const wchar_t *b)
-{
-    return wcscmp(a, b);  /* C locale collation */
-}
-
-static inline wchar_t *wcscpy(wchar_t *dest, const wchar_t *src)
-{
-    wchar_t *d = dest;
-    while ((*d++ = *src++) != L'\0')
-        ;
-    return dest;
-}
-
-static inline wchar_t *wmemchr(const wchar_t *s, wchar_t c, size_t n)
-{
-    for (; n; n--, s++)
-        if (*s == c) return (wchar_t *)s;
-    return 0;
-}
-
-static inline int wcswidth(const wchar_t *s, size_t n)
-{
-    int w = 0;
-    for (; n && *s; n--, s++) {
-        int cw = wcwidth(*s);
-        if (cw < 0) return -1;
-        w += cw;
-    }
-    return w;
-}
-
-static inline wchar_t towlower(wchar_t wc)
-{
-    if (wc >= 'A' && wc <= 'Z') return wc + 32;
-    return wc;
-}
-
-static inline wchar_t towupper(wchar_t wc)
-{
-    if (wc >= 'a' && wc <= 'z') return wc - 32;
-    return wc;
-}
-
-static inline int btowc(int c)
-{
-    if (c == -1) return WEOF;
-    return (wint_t)(unsigned char)c;
-}
-
-static inline int wctob(wint_t c)
-{
-    if (c == WEOF || c > 255) return -1;
-    return (int)(unsigned char)c;
-}
-
-static inline size_t mbsrtowcs(wchar_t *dest, const char **src, size_t len, mbstate_t *ps)
-{
-    (void)ps;
-    if (!src || !*src) return 0;
-    return mbstowcs(dest, *src, len);
-}
-
-static inline size_t wcsrtombs(char *dest, const wchar_t **src, size_t len, mbstate_t *ps)
-{
-    (void)ps;
-    if (!src || !*src) return 0;
-    return wcstombs(dest, *src, len);
-}
+/* ---- Time ------------------------------------------------------------- */
+struct tm;
+size_t wcsftime(wchar_t *s, size_t n, const wchar_t *format,
+		const struct tm *tm);
 
 #ifdef __cplusplus
 }
 #endif
-
-
-/* The rest of the wide-character string interface.  These mirror their <string.h>
- * counterparts exactly, operating on wchar_t units rather than bytes, and are
- * defined here as inlines for the same reason the existing ones are: they are
- * short, and a caller that includes this header should not need a library
- * symbol for a two-line loop. */
-static inline wchar_t *wcsncpy(wchar_t *d, const wchar_t *s, size_t n)
-{
-    size_t i = 0;
-    for (; i < n && s[i]; i++) d[i] = s[i];
-    for (; i < n; i++) d[i] = 0;          /* pad, per the standard */
-    return d;
-}
-
-static inline wchar_t *wcscat(wchar_t *d, const wchar_t *s)
-{
-    wchar_t *p = d;
-    while (*p) p++;
-    while ((*p++ = *s++)) ;
-    return d;
-}
-
-static inline wchar_t *wcsncat(wchar_t *d, const wchar_t *s, size_t n)
-{
-    wchar_t *p = d;
-    while (*p) p++;
-    while (n-- && *s) *p++ = *s++;
-    *p = 0;                                /* always terminated, unlike wcsncpy */
-    return d;
-}
-
-static inline wchar_t *wcsstr(const wchar_t *h, const wchar_t *nd)
-{
-    if (!*nd) return (wchar_t *)h;
-    for (; *h; h++) {
-        const wchar_t *a = h, *b = nd;
-        while (*a && *b && *a == *b) { a++; b++; }
-        if (!*b) return (wchar_t *)h;
-    }
-    return 0;
-}
-
-static inline size_t wcsspn(const wchar_t *s, const wchar_t *set)
-{
-    size_t n = 0;
-    for (; s[n]; n++) {
-        const wchar_t *p = set;
-        while (*p && *p != s[n]) p++;
-        if (!*p) break;
-    }
-    return n;
-}
-
-static inline size_t wcscspn(const wchar_t *s, const wchar_t *set)
-{
-    size_t n = 0;
-    for (; s[n]; n++) {
-        const wchar_t *p = set;
-        while (*p && *p != s[n]) p++;
-        if (*p) break;
-    }
-    return n;
-}
-
-static inline wchar_t *wcspbrk(const wchar_t *s, const wchar_t *set)
-{
-    s += wcscspn(s, set);
-    return *s ? (wchar_t *)s : 0;
-}
-
-/* Reentrant: the caller owns the cursor, as with strtok_r. */
-static inline wchar_t *wcstok(wchar_t *s, const wchar_t *sep, wchar_t **save)
-{
-    wchar_t *tok;
-    if (!save) return 0;
-    if (!s) s = *save;
-    if (!s) return 0;
-    s += wcsspn(s, sep);
-    if (!*s) { *save = 0; return 0; }
-    tok = s;
-    s += wcscspn(s, sep);
-    if (*s) { *s = 0; *save = s + 1; } else { *save = 0; }
-    return tok;
-}
-
-static inline wchar_t *wmemcpy(wchar_t *d, const wchar_t *s, size_t n)
-{
-    for (size_t i = 0; i < n; i++) d[i] = s[i];
-    return d;
-}
-
-static inline wchar_t *wmemmove(wchar_t *d, const wchar_t *s, size_t n)
-{
-    if (d < s) { for (size_t i = 0; i < n; i++) d[i] = s[i]; }
-    else { while (n--) d[n] = s[n]; }      /* overlapping: copy backwards */
-    return d;
-}
-
-static inline wchar_t *wmemset(wchar_t *d, wchar_t c, size_t n)
-{
-    for (size_t i = 0; i < n; i++) d[i] = c;
-    return d;
-}
-
-static inline int wmemcmp(const wchar_t *a, const wchar_t *b, size_t n)
-{
-    for (size_t i = 0; i < n; i++)
-        if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
-    return 0;
-}
 
 #endif /* _WCHAR_H */

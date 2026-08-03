@@ -40,7 +40,16 @@
 #define _IOLBF 1   /* line buffered */
 #define _IOFBF 2   /* fully buffered */
 
-typedef struct {
+/* FILE is a tagged struct, and the typedef is behind a shared guard, so that
+ * <wchar.h> can declare the wide stream functions without pulling all of
+ * <stdio.h> in -- and so that including both, in either order, defines the
+ * typedef exactly once. */
+#ifndef __FILE_defined
+#define __FILE_defined
+typedef struct _IO_FILE FILE;
+#endif
+
+struct _IO_FILE {
     int fd;
     /* Read buffer */
     unsigned char* buffer;
@@ -57,7 +66,17 @@ typedef struct {
     int error;
     int eof;
     int ungetc_buf;     /* -1 if empty, else the ungotten char */
-} FILE;
+    /* Orientation, per ISO C: 0 = not yet set, <0 = byte, >0 = wide.  A
+     * stream is committed to one or the other by the first read or write and
+     * cannot be mixed afterwards, so the two sets of functions never have to
+     * agree about buffer contents. */
+    int wide_mode;
+    /* Shift state for the wide functions.  UTF-8 is stateless between
+     * characters, but fgetwc has to be able to stop half way through a
+     * sequence and continue on the next call. */
+    unsigned wc_count;
+    unsigned wc_value;
+};
 
 extern FILE* stdin;
 extern FILE* stdout;

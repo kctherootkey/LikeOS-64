@@ -30,9 +30,15 @@ typedef struct {
 #define CONSOLE_SCROLLBACK_LINES 10000
 #define CONSOLE_MAX_LINE_LENGTH 256
 
-// Ring-buffer line
+// Ring-buffer line.
+//
+// Cells hold Unicode code points, not bytes: the console decodes UTF-8 on the
+// way in and looks glyphs up by code point, so a scrollback line has to be able
+// to remember what was written.  A byte-per-cell buffer could only remember the
+// last byte of a multi-byte sequence, and every redraw -- scrolling, a font
+// change, leaving the alt screen -- would repaint mojibake.
 typedef struct {
-	char text[CONSOLE_MAX_LINE_LENGTH];
+	uint32_t text[CONSOLE_MAX_LINE_LENGTH];
 	uint16_t length; // visible length: highest write position ever reached
 	uint16_t
 		write_pos; // current write offset (reset to 0 by CR for overwrite)
@@ -78,9 +84,14 @@ void console_apply_sysfont(void); // Apply loaded system font and redraw screen
 int console_reinit_framebuffer(framebuffer_info_t *fb);
 int console_get_framebuffer_info(framebuffer_info_t *out);
 void console_clear(void);
+// Write one byte of a UTF-8 stream.  Incomplete sequences are held in an
+// internal decoder state until the next byte completes them; an invalid one is
+// replaced with U+FFFD, so no byte sequence can wedge the console.
 void console_putchar(char c);
-void console_putchar_batch(
-	char c); // No VRAM flush — call console_flush() when done
+// Write one already-decoded Unicode code point.  No VRAM flush — call
+// console_flush() when done.  This is the entry point the VT layer uses: it
+// decodes UTF-8 itself because its cell buffer stores code points too.
+void console_putcp_batch(uint32_t cp);
 void console_flush(void); // Rate-limited VRAM flush for batch output
 void console_batch_begin(void); // Begin batch mode (suppresses cursor updates)
 void console_batch_end(void); // End batch mode (unconditional final flush)

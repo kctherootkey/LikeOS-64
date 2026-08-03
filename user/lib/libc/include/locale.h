@@ -1,9 +1,15 @@
 /*
- * locale.h - minimal locale support for LikeOS
- * Stub implementation - LikeOS uses C/POSIX locale only.
+ * locale.h - locale selection.
+ *
+ * One locale is implemented and its character encoding is UTF-8.  setlocale()
+ * still remembers and reports the name it was given, because that is what
+ * programs test before enabling their multibyte code paths.  See
+ * src/locale/locale.c.
  */
 #ifndef _LOCALE_H
 #define _LOCALE_H
+
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,6 +22,16 @@ extern "C" {
 #define LC_MONETARY 4
 #define LC_NUMERIC  5
 #define LC_TIME     6
+
+/* Masks for newlocale().  One bit per category, in the same order. */
+#define LC_COLLATE_MASK  (1 << LC_COLLATE)
+#define LC_CTYPE_MASK    (1 << LC_CTYPE)
+#define LC_MESSAGES_MASK (1 << LC_MESSAGES)
+#define LC_MONETARY_MASK (1 << LC_MONETARY)
+#define LC_NUMERIC_MASK  (1 << LC_NUMERIC)
+#define LC_TIME_MASK     (1 << LC_TIME)
+#define LC_ALL_MASK      (LC_COLLATE_MASK | LC_CTYPE_MASK | LC_MESSAGES_MASK | \
+                          LC_MONETARY_MASK | LC_NUMERIC_MASK | LC_TIME_MASK)
 
 struct lconv {
     char *decimal_point;
@@ -44,43 +60,21 @@ struct lconv {
     char  int_n_sign_posn;
 };
 
-static inline char *setlocale(int category, const char *locale)
-{
-    (void)category;
-    (void)locale;
-    return "C";
-}
+char *setlocale(int category, const char *locale);
+struct lconv *localeconv(void);
 
-static inline struct lconv *localeconv(void)
-{
-    static struct lconv lc = {
-        .decimal_point = ".",
-        .thousands_sep = "",
-        .grouping = "",
-        .int_curr_symbol = "",
-        .currency_symbol = "",
-        .mon_decimal_point = "",
-        .mon_thousands_sep = "",
-        .mon_grouping = "",
-        .positive_sign = "",
-        .negative_sign = "-",
-        .int_frac_digits = 127,
-        .frac_digits = 127,
-        .p_cs_precedes = 127,
-        .p_sep_by_space = 127,
-        .n_cs_precedes = 127,
-        .n_sep_by_space = 127,
-        .p_sign_posn = 127,
-        .n_sign_posn = 127,
-        .int_p_cs_precedes = 127,
-        .int_p_sep_by_space = 127,
-        .int_n_cs_precedes = 127,
-        .int_n_sep_by_space = 127,
-        .int_p_sign_posn = 127,
-        .int_n_sign_posn = 127,
-    };
-    return &lc;
-}
+/* Per-thread locale objects.  There is one locale here, so a locale_t is a
+ * token; the interface exists because software uses it to make formatting
+ * independent of the global locale -- which it already is. */
+struct __locale_struct { int __unused_field; };
+typedef struct __locale_struct *locale_t;
+
+#define LC_GLOBAL_LOCALE ((locale_t)-1)
+
+locale_t newlocale(int mask, const char *locale, locale_t base);
+locale_t duplocale(locale_t loc);
+void freelocale(locale_t loc);
+locale_t uselocale(locale_t loc);
 
 #ifdef __cplusplus
 }

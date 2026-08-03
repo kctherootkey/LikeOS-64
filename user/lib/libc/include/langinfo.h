@@ -1,9 +1,14 @@
 /*
- * langinfo.h - language information for LikeOS
- * Stub - returns C/POSIX locale info.
+ * langinfo.h - locale information items.
+ *
+ * nl_langinfo(CODESET) reports "UTF-8": that is the encoding the console, the
+ * terminal emulator and the tools on this system all use, and a great deal of
+ * software will not enable its multibyte handling until it sees that answer.
  */
 #ifndef _LANGINFO_H
 #define _LANGINFO_H
+
+#include <locale.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,23 +47,37 @@ typedef int nl_item;
 #define NOEXPR     28
 #define ERA        29
 #define T_FMT_AMPM 30
+#define ABDAY_1    31
+#define ABDAY_2    32
+#define ABDAY_3    33
+#define ABDAY_4    34
+#define ABDAY_5    35
+#define ABDAY_6    36
+#define ABDAY_7    37
+#define ABMON_1    38
+#define ABMON_2    39
+#define ABMON_3    40
+#define ABMON_4    41
+#define ABMON_5    42
+#define ABMON_6    43
+#define ABMON_7    44
+#define ABMON_8    45
+#define ABMON_9    46
+#define ABMON_10   47
+#define ABMON_11   48
+#define ABMON_12   49
+#define CRNCYSTR   50
+#define ERA_D_FMT  51
+#define ERA_D_T_FMT 52
+#define ERA_T_FMT  53
+#define ALT_DIGITS 54
 
-static inline char *nl_langinfo(nl_item item)
-{
-    switch (item) {
-        case CODESET:   return "ANSI_X3.4-1968";  /* ASCII */
-        case D_T_FMT:   return "%a %b %e %H:%M:%S %Y";
-        case D_FMT:     return "%m/%d/%y";
-        case T_FMT:     return "%H:%M:%S";
-        case AM_STR:    return "AM";
-        case PM_STR:    return "PM";
-        case RADIXCHAR: return ".";
-        case THOUSEP:   return "";
-        case YESEXPR:   return "^[yY]";
-        case NOEXPR:    return "^[nN]";
-        default:        return "";
-    }
-}
+/* Aliases the standard spells this way. */
+#define RADIXCHAR_ RADIXCHAR
+#define DECIMAL_POINT RADIXCHAR
+#define THOUSANDS_SEP THOUSEP
+
+char *nl_langinfo(nl_item item);
 
 #ifdef __cplusplus
 }

@@ -12,6 +12,7 @@
 #include <kernel/mm/memory.h>
 #include <kernel/ke/sched.h> // For spinlock_t
 #include <kernel/io/sysfont.h> // For external PSF font loading
+#include <kernel/io/unicode.h> // For unicode_width() (cells per code point)
 #include <kernel/ke/timer.h> // For timer_ticks() (flush rate-limiting)
 #include <kernel/uapi/bug.h>
 
@@ -360,7 +361,7 @@ uint32_t vga_to_rgb(uint8_t vga_color)
 
 // ================= Scrollback storage and helpers =================
 // Forward declaration for draw_char used in render before definition
-static void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_color,
+static void draw_char(uint32_t cp, uint32_t x, uint32_t y, uint32_t fg_color,
 		      uint32_t bg_color);
 
 static console_scrollback_t g_sb;
@@ -447,7 +448,7 @@ static void sb_new_line(void)
 	}
 }
 
-static void sb_append_char(char c)
+static void sb_append_char(uint32_t c)
 {
 	console_line_t *line = sb_current_line();
 	if (c == '\n') {
@@ -495,12 +496,29 @@ static void sb_append_char(char c)
 		}
 		return;
 	}
-	if (line->write_pos < CONSOLE_MAX_LINE_LENGTH - 1) {
+	/* A character occupies one cell, or two if it is East Asian wide, or
+	 * none if it is a combining mark -- which attaches to the character
+	 * already stored and must not take a cell of its own. */
+	uint32_t w = unicode_width(c);
+	if (w == 0)
+		return;
+
+	if ((uint32_t)line->write_pos + w < CONSOLE_MAX_LINE_LENGTH) {
 		uint16_t idx = line->write_pos;
 		line->text[idx] = c;
 		line->fg_attrs[idx] = current_vga_fg;
 		line->bg_attrs[idx] = current_vga_bg;
-		line->write_pos++;
+		/* The second cell of a wide character is stored as a space.
+		 * There is no glyph spanning two cells in a fixed-width console
+		 * font, so a space is what is drawn there anyway -- and storing
+		 * it, rather than a marker the renderer has to know about, means
+		 * a later overwrite of either cell behaves like any other. */
+		for (uint32_t k = 1; k < w; k++) {
+			line->text[idx + k] = ' ';
+			line->fg_attrs[idx + k] = current_vga_fg;
+			line->bg_attrs[idx + k] = current_vga_bg;
+		}
+		line->write_pos = (uint16_t)(line->write_pos + w);
 		if (line->write_pos > line->length) {
 			line->length = line->write_pos;
 			line->text[line->length] = '\0';
@@ -730,17 +748,16 @@ static void draw_cursor_at(uint32_t x, uint32_t y, uint8_t show)
 	}
 }
 
-// Draw a character at specific position
+// Draw one Unicode code point at a specific position.
 // Optimized: writes directly to back buffer, marks dirty once per character
-static void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_clr,
+static void draw_char(uint32_t cp, uint32_t x, uint32_t y, uint32_t fg_clr,
 		      uint32_t bg_clr)
 {
-	unsigned char uc = (unsigned char)c;
 	const uint8_t *glyph = (void *)0;
 	uint32_t font_w, font_h, bpr;
 
 	if (sysfont_is_loaded()) {
-		glyph = sysfont_get_glyph(uc);
+		glyph = sysfont_get_glyph(cp);
 		if (!glyph)
 			glyph = sysfont_get_glyph('?');
 		font_w = sysfont_get_width();
@@ -750,8 +767,10 @@ static void draw_char(char c, uint32_t x, uint32_t y, uint32_t fg_clr,
 		BUILD_BUG_ON(
 			DEFAULT_CHAR_HEIGHT >
 			16); /* font_8x16[][16]: fallback glyph array has exactly 16 rows */
-		if (uc >= 128)
-			uc = '?';
+		/* The built-in fallback is a 128-entry ASCII bitmap with no
+		 * Unicode table, so anything above it renders as '?' until the
+		 * real font is loaded off the root filesystem. */
+		unsigned char uc = (cp < 128) ? (unsigned char)cp : '?';
 		glyph = font_8x16[uc];
 		font_w = DEFAULT_CHAR_WIDTH;
 		font_h = DEFAULT_CHAR_HEIGHT;
@@ -1554,16 +1573,50 @@ void console_set_color_rgb(uint32_t fg_rgb, uint32_t bg_rgb)
 	bg_color = bg_rgb;
 }
 
-// Print a single character
+#ifdef SERIAL_ENABLED
+/* Encode a code point as UTF-8 into out[] (at most 4 bytes), returning the
+ * length.  Used to put back on the wire what the decoder took off it. */
+static int utf8_encode(uint32_t cp, char out[4])
+{
+	if (cp < 0x80) {
+		out[0] = (char)cp;
+		return 1;
+	}
+	if (cp < 0x800) {
+		out[0] = (char)(0xC0 | (cp >> 6));
+		out[1] = (char)(0x80 | (cp & 0x3F));
+		return 2;
+	}
+	if (cp < 0x10000) {
+		out[0] = (char)(0xE0 | (cp >> 12));
+		out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+		out[2] = (char)(0x80 | (cp & 0x3F));
+		return 3;
+	}
+	out[0] = (char)(0xF0 | (cp >> 18));
+	out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+	out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+	out[3] = (char)(0x80 | (cp & 0x3F));
+	return 4;
+}
+#endif /* SERIAL_ENABLED */
+
+// Print a single Unicode code point.
 // Internal unlocked version - called when console_lock is already held
-static void console_putchar_unlocked(char c)
+static void console_putcp_unlocked(uint32_t c)
 {
 	if (!fb_info)
 		return;
-		// Mirror to serial (if present) before screen updates
+
+	/* Mirror to serial (if present) before screen updates.  The serial line
+	 * carries UTF-8, so re-encode what the decoder produced rather than
+	 * truncating the code point to a byte. */
 #ifdef SERIAL_ENABLED
 	if (serial_is_available()) {
-		serial_write_char(c);
+		char enc[4];
+		int enc_len = utf8_encode(c, enc);
+		for (int i = 0; i < enc_len; i++)
+			serial_write_char(enc[i]);
 	}
 #endif
 
@@ -1735,13 +1788,22 @@ static void console_putchar_unlocked(char c)
 		}
 		return;
 	}
-	/* Unhandled C0 control characters and DEL are NOT glyphs.  A terminal
-     * ignores the ones it does not act on; drawing them paints whatever the
-     * font happens to hold at that code point.  Lat15-Fixed16 glyph 0x07 is
-     * a full-width bar, so readline's bell — rung on every backspace at an
-     * empty prompt — printed a stray dash per keypress.
+	/* Unhandled C0 control characters, DEL and the C1 range are NOT glyphs.
+     * A terminal ignores the ones it does not act on; drawing them paints
+     * whatever the font happens to hold at that code point.  Terminus glyph
+     * 0x07 is a full-width bar, so readline's bell — rung on every backspace
+     * at an empty prompt — printed a stray dash per keypress.
      * (\n, \r, \t and \b are handled above and never reach here.) */
-	if ((unsigned char)c < 0x20 || (unsigned char)c == 0x7F)
+	if (c < 0x20 || c == 0x7F || (c >= 0x80 && c <= 0x9F))
+		return;
+
+	/* Cells this character occupies.  A combining mark takes none: it
+	 * belongs to the character already on screen, and neither the font nor
+	 * the cell grid can composite the two, so it is consumed without
+	 * moving the cursor.  Advancing for it would put every following
+	 * column one to the right of where the writing program believes it is. */
+	uint32_t cw = unicode_width(c);
+	if (cw == 0)
 		return;
 
 	// Normal printable character
@@ -1750,7 +1812,9 @@ static void console_putchar_unlocked(char c)
 		// If the previous char filled the last column, perform the
 		// deferred wrap NOW (xenl semantics: tmux relies on this so it
 		// can safely paint the bottom-right cell of the screen).
-		if (g_pending_wrap) {
+		// A two-cell character also wraps when only one column is left:
+		// it cannot be split across the line break.
+		if (g_pending_wrap || cursor_x + cw > max_cols) {
 			g_pending_wrap = 0;
 			int region_active =
 				(g_region_top >= 0 && g_region_bot >= 0 &&
@@ -1777,6 +1841,11 @@ static void console_putchar_unlocked(char c)
 		uint32_t px = cursor_x * CHAR_WIDTH;
 		uint32_t py = cursor_y * CHAR_HEIGHT;
 		draw_char(c, px, py, fg_color, bg_color);
+		/* Clear the trailing cell of a wide character, for the same
+		 * reason the scrollback stores a space there. */
+		for (uint32_t k = 1; k < cw && cursor_x + k < max_cols; k++)
+			draw_char(' ', px + k * CHAR_WIDTH, py, fg_color,
+				  bg_color);
 		/* Invalidate the pixel-save only when the glyph physically
          * overwrites the cursor bar (same cell).  If the glyph is at a
          * different cell the bar at cursor_saved_x/y is still intact and
@@ -1785,16 +1854,17 @@ static void console_putchar_unlocked(char c)
          * detect and erase it).  Clearing it here unconditionally was the
          * root cause of ghost cursor bars left on screen after tmux drew
          * characters at non-cursor positions. */
-		if (cursor_saved_x == cursor_x && cursor_saved_y == cursor_y)
+		if (cursor_saved_y == cursor_y && cursor_saved_x >= cursor_x &&
+		    cursor_saved_x < cursor_x + cw)
 			cursor_pixels_saved = 0;
-		if (cursor_x + 1 >= max_cols) {
+		if (cursor_x + cw >= max_cols) {
 			// Don't wrap yet — defer.  Cursor stays glued to the last
 			// column; the actual wrap happens when the next printable
 			// arrives or is forcibly cleared by a cursor-motion op.
 			cursor_x = max_cols - 1;
 			g_pending_wrap = 1;
 		} else {
-			cursor_x++;
+			cursor_x += cw;
 		}
 		// Update cursor tracking AFTER position change so cursor_update knows position changed.
 		// We did NOT draw a cursor here — we drew a glyph — so cursor_shown stays 0.
@@ -1810,6 +1880,70 @@ static void console_putchar_unlocked(char c)
 	}
 }
 
+/* ---- Byte-level UTF-8 decoder for the kprintf / console_puts path -------
+ *
+ * kprintf and friends emit bytes, so the console has to reassemble sequences
+ * itself.  State lives here rather than in the caller because a format string
+ * is written a byte at a time by kvprintf; both it and console_puts hold
+ * console_lock across the whole string, so a sequence is never split between
+ * two CPUs.
+ *
+ * Malformed input yields U+FFFD and resynchronises immediately: a stray 0x80
+ * or a truncated sequence must not swallow the ASCII that follows it, or one
+ * bad byte on a serial line would eat the rest of the message.  Overlong
+ * encodings, surrogates and values past U+10FFFF are rejected for the same
+ * reason a decoder anywhere else rejects them — they are ambiguous.
+ */
+#define UTF8_REPLACEMENT 0xFFFDu
+
+static uint32_t g_utf8_cp; /* code point accumulated so far        */
+static uint32_t g_utf8_min; /* smallest value legal at this length  */
+static uint8_t g_utf8_left; /* continuation bytes still expected    */
+
+static void console_putchar_unlocked(char c)
+{
+	unsigned char b = (unsigned char)c;
+
+	if (g_utf8_left) {
+		if ((b & 0xC0) != 0x80) {
+			/* Not a continuation byte: the sequence in progress is
+			 * broken.  Report it, then reprocess this byte as a
+			 * fresh start rather than consuming it. */
+			g_utf8_left = 0;
+			console_putcp_unlocked(UTF8_REPLACEMENT);
+		} else {
+			g_utf8_cp = (g_utf8_cp << 6) | (uint32_t)(b & 0x3F);
+			if (--g_utf8_left)
+				return;
+			if (g_utf8_cp < g_utf8_min || g_utf8_cp > 0x10FFFF ||
+			    (g_utf8_cp >= 0xD800 && g_utf8_cp <= 0xDFFF))
+				g_utf8_cp = UTF8_REPLACEMENT;
+			console_putcp_unlocked(g_utf8_cp);
+			return;
+		}
+	}
+
+	if (b < 0x80) {
+		console_putcp_unlocked(b);
+	} else if ((b & 0xE0) == 0xC0) {
+		g_utf8_cp = b & 0x1F;
+		g_utf8_min = 0x80;
+		g_utf8_left = 1;
+	} else if ((b & 0xF0) == 0xE0) {
+		g_utf8_cp = b & 0x0F;
+		g_utf8_min = 0x800;
+		g_utf8_left = 2;
+	} else if ((b & 0xF8) == 0xF0) {
+		g_utf8_cp = b & 0x07;
+		g_utf8_min = 0x10000;
+		g_utf8_left = 3;
+	} else {
+		/* 0x80..0xBF with no sequence open, or 0xF8..0xFF which is
+		 * never a lead byte. */
+		console_putcp_unlocked(UTF8_REPLACEMENT);
+	}
+}
+
 // Public locked version - safe for external callers (flushes after every char)
 void console_putchar(char c)
 {
@@ -1820,19 +1954,19 @@ void console_putchar(char c)
 	spin_unlock_irqrestore(&console_lock, flags);
 }
 
-// Batch version - processes character but defers VRAM flush.
+// Batch version - processes one code point but defers the VRAM flush.
 // Caller MUST call console_flush() when the batch is done.
-void console_putchar_batch(char c)
+void console_putcp_batch(uint32_t cp)
 {
 	uint64_t flags;
 	spin_lock_irqsave(&console_lock, &flags);
 	/* Mark LF as a pure row-advance for the tty output path.  The kprintf
-     * direct path (console_putchar_unlocked called without this flag) uses
+     * direct path (console_putcp_unlocked called without this flag) uses
      * ONLCR semantics (LF resets cursor_x).  The tty path handles cursor_x
      * via an explicit CR from OPOST injection or CSI sequences. */
-	if (c == '\n')
+	if (cp == '\n')
 		g_lf_no_cr = 1;
-	console_putchar_unlocked(c);
+	console_putcp_unlocked(cp);
 	g_lf_no_cr = 0;
 	spin_unlock_irqrestore(&console_lock, flags);
 }

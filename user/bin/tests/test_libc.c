@@ -18,6 +18,9 @@
 #include <signal.h>
 #include <errno.h>
 #include <wchar.h>
+#include <wctype.h>
+#include <locale.h>
+#include <langinfo.h>
 #include <fcntl.h>
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -3398,12 +3401,157 @@ static void test_bash_libc_additions(void)
 			    wmemchr(wbuf, L'c', 3) == wbuf + 2);
 	test_result("wcswidth of plain ASCII", wcswidth(wbuf, 3) == 3);
 
-	/* single-byte locale mblen/mbrlen */
+	/* mblen/mbrlen on ASCII, which is one byte per character in UTF-8 too */
 	test_result("mblen semantics",
 		    mblen("a", 1) == 1 && mblen("", 1) == 0 && mblen(0, 0) == 0);
 	mbstate_t ms;
 	memset(&ms, 0, sizeof(ms));
 	test_result("mbrlen semantics", mbrlen("a", 1, &ms) == 1);
+}
+
+/* =========================================================================
+ * UTF-8 and Unicode
+ *
+ * The multibyte encoding is UTF-8 in every locale here, so these are the
+ * functions every program that handles text above ASCII goes through: the
+ * shell measuring a prompt, the editor placing a cursor, the terminal
+ * emulator deciding how many columns a character takes.
+ *
+ * The exhaustive comparison against a reference implementation is a host-side
+ * test (host/test-unicode.sh, every code point).  What runs here is the part
+ * that can only be checked on the real system: that the shared library exports
+ * these, that they agree with each other, and that stdout carries the bytes
+ * through unchanged.
+ * ========================================================================= */
+static void test_unicode(void)
+{
+	printf("\n[TEST] UTF-8 / Unicode\n");
+
+	/* The locale has to name UTF-8, or every program's multibyte handling
+	 * stays switched off no matter how correct the conversions are. */
+	char *loc = setlocale(LC_ALL, "");
+	test_result("setlocale(LC_ALL, \"\") reports a locale",
+		    loc != NULL && loc[0] != '\0');
+	test_result("nl_langinfo(CODESET) is UTF-8",
+		    strcmp(nl_langinfo(CODESET), "UTF-8") == 0);
+	test_result("MB_CUR_MAX is 4", MB_CUR_MAX == 4);
+
+	/* Encode: one character from each sequence length. */
+	char buf[8];
+	memset(buf, 0, sizeof(buf));
+	test_result("wcrtomb 1-byte (U+0041)",
+		    wcrtomb(buf, 0x41, 0) == 1 && (unsigned char)buf[0] == 0x41);
+	test_result("wcrtomb 2-byte (U+00FC)",
+		    wcrtomb(buf, 0xFC, 0) == 2 &&
+			    (unsigned char)buf[0] == 0xC3 &&
+			    (unsigned char)buf[1] == 0xBC);
+	test_result("wcrtomb 3-byte (U+20AC)",
+		    wcrtomb(buf, 0x20AC, 0) == 3 &&
+			    (unsigned char)buf[0] == 0xE2 &&
+			    (unsigned char)buf[1] == 0x82 &&
+			    (unsigned char)buf[2] == 0xAC);
+	test_result("wcrtomb 4-byte (U+1F600)",
+		    wcrtomb(buf, 0x1F600, 0) == 4 &&
+			    (unsigned char)buf[0] == 0xF0 &&
+			    (unsigned char)buf[1] == 0x9F &&
+			    (unsigned char)buf[2] == 0x98 &&
+			    (unsigned char)buf[3] == 0x80);
+
+	/* Decode, including one byte at a time: a stream arrives split. */
+	wchar_t wc = 0;
+	mbstate_t st;
+	memset(&st, 0, sizeof(st));
+	test_result("mbrtowc 2-byte", mbrtowc(&wc, "\xC3\xBC", 2, &st) == 2 &&
+					      wc == 0xFC);
+	memset(&st, 0, sizeof(st));
+	wc = 0;
+	int split_ok = (mbrtowc(&wc, "\xE2", 1, &st) == (size_t)-2) &&
+		       (mbrtowc(&wc, "\x82", 1, &st) == (size_t)-2) &&
+		       (mbrtowc(&wc, "\xAC", 1, &st) == 1) && wc == 0x20AC;
+	test_result("mbrtowc across three calls", split_ok);
+	test_result("mbsinit after a complete character", mbsinit(&st) != 0);
+
+	/* Malformed input must be refused, not guessed at: an overlong form or
+	 * a surrogate half is a way to smuggle a value past a check written
+	 * against its shorter encoding. */
+	memset(&st, 0, sizeof(st));
+	errno = 0;
+	test_result("overlong sequence -> EILSEQ",
+		    mbrtowc(&wc, "\xC0\x80", 2, &st) == (size_t)-1 &&
+			    errno == EILSEQ);
+	memset(&st, 0, sizeof(st));
+	test_result("surrogate half -> EILSEQ",
+		    mbrtowc(&wc, "\xED\xA0\x80", 3, &st) == (size_t)-1);
+	memset(&st, 0, sizeof(st));
+	test_result("stray continuation byte -> EILSEQ",
+		    mbrtowc(&wc, "\x80", 1, &st) == (size_t)-1);
+	memset(&st, 0, sizeof(st));
+	test_result("value above U+10FFFF -> EILSEQ",
+		    mbrtowc(&wc, "\xF5\x80\x80\x80", 4, &st) == (size_t)-1);
+
+	/* Whole-string conversion, round trip.
+	 *
+	 * The literal is split after every escape whose next character is a hex
+	 * digit.  A \x escape consumes as MANY hex digits as follow it, so
+	 * "\xC3\x9Fe" is \xC3 followed by \x9Fe -- one out-of-range value,
+	 * not \x9F and 'e'.  Splitting the literal ends the escape; the
+	 * compiler then joins the pieces. */
+	const char *ger = "Gr\xC3\xBC\xC3\x9F" "e"; /* "Grüße" in UTF-8 */
+	test_result("test's own literal is well-formed UTF-8",
+		    strlen(ger) == 7 && (unsigned char)ger[4] == 0xC3 &&
+			    (unsigned char)ger[5] == 0x9F && ger[6] == 'e');
+	wchar_t wide[16];
+	char back[32];
+	size_t n = mbstowcs(wide, ger, 16);
+	test_result("mbstowcs counts characters, not bytes",
+		    n == 5 && wide[2] == 0xFC && wide[3] == 0xDF);
+	test_result("wcstombs round trip",
+		    wcstombs(back, wide, sizeof(back)) == strlen(ger) &&
+			    strcmp(back, ger) == 0);
+
+	/* Widths.  A combining mark takes no column of its own; a CJK
+	 * ideograph takes two.  Terminal cursor arithmetic depends on both. */
+	test_result("wcwidth ASCII = 1", wcwidth(L'A') == 1);
+	test_result("wcwidth umlaut = 1", wcwidth(0xFC) == 1);
+	test_result("wcwidth combining acute = 0", wcwidth(0x0301) == 0);
+	test_result("wcwidth CJK = 2", wcwidth(0x65E5) == 2);
+	test_result("wcwidth control = -1", wcwidth(0x07) == -1);
+	test_result("wcswidth of a mixed string",
+		    wcswidth(L"a\u00fc\u65e5", 3) == 4);
+
+	/* Classification and case mapping outside ASCII. */
+	test_result("iswalpha(U+00FC)", iswalpha(0xFC) != 0);
+	test_result("iswalpha(U+0410 cyrillic)", iswalpha(0x0410) != 0);
+	test_result("iswupper/iswlower on U+00DC/U+00FC",
+		    iswupper(0xDC) && iswlower(0xFC) && !iswupper(0xFC));
+	test_result("towupper(U+00FC) == U+00DC", towupper(0xFC) == 0xDC);
+	test_result("towlower(U+0410) == U+0430", towlower(0x0410) == 0x0430);
+	test_result("towupper leaves a non-letter alone", towupper(0x20AC) == 0x20AC);
+	test_result("iswctype via wctype(\"alpha\")",
+		    iswctype(0xFC, wctype("alpha")) != 0 &&
+			    iswctype(0x20, wctype("alpha")) == 0);
+	test_result("towctrans via wctrans(\"toupper\")",
+		    towctrans(0xFC, wctrans("toupper")) == 0xDC);
+
+	/* btowc/wctob only convert what is a whole character on its own, which
+	 * in UTF-8 is exactly ASCII. */
+	test_result("btowc/wctob on ASCII",
+		    btowc('A') == (wint_t)'A' && wctob((wint_t)'A') == 'A');
+	test_result("btowc rejects a non-ASCII byte", btowc(0xC3) == WEOF);
+
+	/* printf's wide conversions. */
+	char out[64];
+	int len = snprintf(out, sizeof(out), "[%ls]", L"Gr\u00fc\u00dfe");
+	test_result("printf %ls encodes as UTF-8",
+		    len == 9 && strcmp(out, "[Gr\xC3\xBC\xC3\x9F" "e]") == 0);
+	len = snprintf(out, sizeof(out), "[%lc]", (wint_t)0x20AC);
+	test_result("printf %lc encodes as UTF-8",
+		    len == 5 && strcmp(out, "[\xE2\x82\xAC]") == 0);
+
+	/* The bytes have to survive the write path unchanged -- this is what
+	 * the console and the terminal emulator actually receive. */
+	printf("  literal UTF-8 through stdout: Gr\xC3\xBC\xC3\x9F" "e aus M\xC3\xBCnchen "
+	       "\xE2\x94\x82 \xE2\x94\x80 \xE2\x82\xAC \xCE\xA9 \xD0\x96\n");
 }
 
 static void run_auth_tests(void)
@@ -10515,6 +10663,7 @@ int main(int argc, char **argv)
 	test_xorg_libc_additions();
 	test_dprintf();
 	test_bash_libc_additions();
+	test_unicode();
 	test_syscall_arg_hygiene();
 	test_dup_redirected_stdio();
 

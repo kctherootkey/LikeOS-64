@@ -22,7 +22,11 @@ DIR_SRC = src/dirent/dirent.c
 MATH_SRC = src/math/math.c
 REGEX_SRC = src/regex/regex.c
 ICONV_SRC = src/iconv/iconv.c
-EXTRA_STDIO_SRC = src/stdio/getline.c src/stdio/err.c src/stdio/popen.c src/stdio/vfscanf.c
+# Locale and wide-character support.  unicode.c is generated -- see
+# host/gen-unicode-tables.py.
+LOCALE_SRC = src/locale/locale.c src/locale/multibyte.c src/locale/wctype.c \
+             src/locale/wcwidth.c src/locale/wcstr.c src/locale/unicode.c
+EXTRA_STDIO_SRC = src/stdio/getline.c src/stdio/err.c src/stdio/popen.c src/stdio/vfscanf.c src/stdio/wstdio.c
 SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/shm.c src/syscalls/sysvshm.c src/syscalls/sched.c src/syscalls/socket.c src/syscalls/uio.c src/syscalls/resource.c src/syscalls/pty_util.c
 DLFCN_SRC = src/dl/dlfcn.c
 PWD_SRC = src/pwd/pwd.c src/pwd/grp.c src/pwd/shadow.c src/pwd/creds.c
@@ -47,6 +51,7 @@ DIR_OBJ = $(DIR_SRC:.c=.o)
 MATH_OBJ = $(MATH_SRC:.c=.o)
 REGEX_OBJ = $(REGEX_SRC:.c=.o)
 ICONV_OBJ = $(ICONV_SRC:.c=.o)
+LOCALE_OBJ = $(LOCALE_SRC:.c=.o)
 SYSCALLS_OBJ = $(SYSCALLS_SRC:.c=.o)
 DLFCN_OBJ = $(DLFCN_SRC:.c=.o)
 PWD_OBJ = $(PWD_SRC:.c=.o)
@@ -61,7 +66,7 @@ CRTN_OBJ = $(CRTN_SRC:.S=.o)
 
 # All static objects (libc – everything except pthread)
 LIBC_OBJ = $(MALLOC_OBJ) $(STDIO_OBJ) $(STRING_OBJ) $(STDLIB_OBJ) \
-           $(CTYPE_OBJ) $(TIME_OBJ) $(DIR_OBJ) $(MATH_OBJ) $(REGEX_OBJ) $(ICONV_OBJ) $(SYSCALLS_OBJ) \
+           $(CTYPE_OBJ) $(TIME_OBJ) $(DIR_OBJ) $(MATH_OBJ) $(REGEX_OBJ) $(ICONV_OBJ) $(LOCALE_OBJ) $(SYSCALLS_OBJ) \
            $(NET_OBJ) $(SETJMP_OBJ) $(STACK_CHK_OBJ) $(PWD_OBJ)
 
 ALL_OBJ = $(LIBC_OBJ) $(PTHREAD_OBJ)

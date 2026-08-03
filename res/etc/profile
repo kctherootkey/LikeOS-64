@@ -13,6 +13,15 @@ export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 export PAGER=less
 export EDITOR=nano
 
+# The system locale.  init already exports this and login carries it into the
+# session, so it is normally set by the time this file runs; it is repeated
+# here because this is where someone looks to change it.  The part that matters
+# is the ".UTF-8" suffix: programs read the locale name to decide whether to
+# handle multibyte characters at all, and without it anything above ASCII --
+# an umlaut in a filename, a box-drawing character, a remote host's banner --
+# is treated as a byte per character and comes out mangled.
+[ -n "$LANG" ] || export LANG=en_US.UTF-8
+
 umask 022
 
 # Interactive shells also get the system-wide interactive configuration.

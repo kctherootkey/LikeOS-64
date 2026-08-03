@@ -13,6 +13,7 @@
 
 #include <kernel/io/vt.h>
 #include <kernel/io/console.h>
+#include <kernel/io/unicode.h>
 #include <kernel/mm/memory.h>
 #include <kernel/uapi/bug.h>
 
@@ -349,7 +350,6 @@ static void vt_cells_fill_row_range(struct vt_state *vt, int row, int col_start,
 		col_end = VT_MAX_COLS - 1;
 	vt_cell_t blank;
 	blank.ch = ' ';
-	blank._pad[0] = blank._pad[1] = blank._pad[2] = 0;
 	blank.fg_rgb = vt->resolved_fg_rgb;
 	blank.bg_rgb = vt->resolved_bg_rgb;
 	for (int c = col_start; c <= col_end; c++)
@@ -501,9 +501,8 @@ static void vt_cells_erase_line(struct vt_state *vt, int mode)
  * is needed.  Handles LF implicit scroll, deferred xenl wrap, CR, BS, TAB
  * to keep the cell buffer in sync with what console.c renders.
  * ======================================================================== */
-static void vt_put_char(struct vt_state *vt, char c)
+static void vt_put_char(struct vt_state *vt, uint32_t ch)
 {
-	unsigned char ch = (unsigned char)c;
 	int rows = vt->rows > 0 ? vt->rows : 25;
 	int cols = vt->cols > 0 ? vt->cols : 80;
 	int bot = (vt->scroll_bot >= 0) ? vt->scroll_bot : rows - 1;
@@ -525,7 +524,7 @@ static void vt_put_char(struct vt_state *vt, char c)
 			vt_cells_scroll_up(vt, 1, top, bot);
 		else
 			vt->cur_row++;
-		console_putchar_batch(c);
+		console_putcp_batch(ch);
 		return;
 	}
 
@@ -533,7 +532,7 @@ static void vt_put_char(struct vt_state *vt, char c)
 	if (ch == 0x0D) {
 		vt->pending_wrap = 0;
 		vt->cur_col = 0;
-		console_putchar_batch(c);
+		console_putcp_batch(ch);
 		return;
 	}
 
@@ -546,7 +545,7 @@ static void vt_put_char(struct vt_state *vt, char c)
 			vt->cur_row--;
 			vt->cur_col = cols - 1;
 		}
-		console_putchar_batch(c);
+		console_putcp_batch(ch);
 		return;
 	}
 
@@ -561,8 +560,6 @@ static void vt_put_char(struct vt_state *vt, char c)
 			    vt->cur_col < VT_MAX_COLS) {
 				vt_cell_t blank;
 				blank.ch = ' ';
-				blank._pad[0] = blank._pad[1] = blank._pad[2] =
-					0;
 				blank.fg_rgb = vt->resolved_fg_rgb;
 				blank.bg_rgb = vt->resolved_bg_rgb;
 				vt->cells[vt->cur_row * VT_MAX_COLS +
@@ -573,23 +570,38 @@ static void vt_put_char(struct vt_state *vt, char c)
 		}
 		if (vt->cur_col >= cols)
 			vt->cur_col = cols - 1;
-		console_putchar_batch(c);
+		console_putcp_batch(ch);
 		return;
 	}
 
 	/* ---- Other C0 controls (BEL, SI, SO, ...) and DEL: ignored -----
      * They occupy no cell and move no cursor, so the shadow buffer needs no
      * update; forwarding them made the console draw the font glyph at that
-     * code point (BEL = a full-width bar in Lat15-Fixed16). */
-	if (ch < 0x20 || ch == 0x7F) {
+     * code point (BEL = a full-width bar in Terminus).  The C1 range is
+     * likewise non-printing: a decoded U+0080..U+009F is a control, not the
+     * Latin-1-supplement letter a byte of that value used to draw. */
+	if (ch < 0x20 || ch == 0x7F || (ch >= 0x80 && ch <= 0x9F)) {
 		return;
 	}
 
 	/* ---- Printable character -------------------------------------- */
 
+	/* Cells the character occupies.  This must be the same answer console.c
+	 * reaches -- both call unicode_width() -- or the shadow buffer and the
+	 * screen disagree about which column holds what, and the disagreement
+	 * only shows up later as a corrupted redraw. */
+	int cw = (int)unicode_width(ch);
+	if (cw == 0) {
+		/* Combining mark: belongs to the character already placed, takes
+		 * no cell, moves no cursor.  console.c drops it for the same
+		 * reason, so nothing is forwarded. */
+		return;
+	}
+
 	/* Handle deferred xenl wrap: previous write was at last column.
-     * console.c triggers the wrap on the next printable; mirror it. */
-	if (vt->pending_wrap) {
+     * console.c triggers the wrap on the next printable; mirror it.
+     * A two-cell character also wraps when only one column is left. */
+	if (vt->pending_wrap || vt->cur_col + cw > cols) {
 		vt->pending_wrap = 0;
 		vt->cur_col = 0;
 		if (vt->cur_row < bot)
@@ -598,24 +610,96 @@ static void vt_put_char(struct vt_state *vt, char c)
 			vt_cells_scroll_up(vt, 1, top, bot);
 	}
 
-	/* Write cell into backing store. */
+	/* Write cell into backing store.  The trailing cell of a wide character
+	 * holds a space, matching what console.c stores and draws there. */
 	if (vt->cur_row < VT_MAX_ROWS && vt->cur_col < VT_MAX_COLS) {
 		vt_cell_t cell;
 		cell.ch = ch;
-		cell._pad[0] = cell._pad[1] = cell._pad[2] = 0;
 		cell.fg_rgb = vt->resolved_fg_rgb;
 		cell.bg_rgb = vt->resolved_bg_rgb;
 		vt->cells[vt->cur_row * VT_MAX_COLS + vt->cur_col] = cell;
+		for (int k = 1; k < cw && vt->cur_col + k < VT_MAX_COLS; k++) {
+			cell.ch = ' ';
+			vt->cells[vt->cur_row * VT_MAX_COLS + vt->cur_col + k] =
+				cell;
+		}
 		vt->dirty[vt->cur_row] = 1;
 	}
 
-	console_putchar_batch(c);
+	console_putcp_batch(ch);
 
 	/* Advance cursor; set pending_wrap if we hit the last column. */
-	if (vt->cur_col + 1 >= cols)
+	if (vt->cur_col + cw >= cols)
 		vt->pending_wrap = 1;
 	else
-		vt->cur_col++;
+		vt->cur_col += cw;
+}
+
+/* =========================================================================
+ * UTF-8 input decoding
+ *
+ * Terminal output is a UTF-8 byte stream, but escape sequences are ASCII by
+ * construction, so only bytes that reach the parser's ground state are text.
+ * The decoder therefore lives beside vt_put_char rather than in front of the
+ * parser: a 0x9B byte inside a CSI parameter list is a parameter, not a
+ * malformed character.
+ * ======================================================================== */
+
+#define VT_UTF8_REPLACEMENT 0xFFFDu
+
+/* Report an unfinished sequence and clear the decoder.  Called when a byte
+ * arrives that cannot continue one — an ESC, a control, or a fresh lead byte —
+ * so a truncated character costs exactly one U+FFFD and swallows nothing. */
+static void vt_utf8_abort(struct vt_state *vt)
+{
+	if (vt->utf8_left) {
+		vt->utf8_left = 0;
+		vt_put_char(vt, VT_UTF8_REPLACEMENT);
+	}
+}
+
+/* Feed one ground-state byte through the UTF-8 decoder.  Overlong forms,
+ * surrogates and values past U+10FFFF are rejected: they have no single
+ * meaning, and accepting them would let one encoding of a character slip past
+ * a check written against another. */
+static void vt_feed_text(struct vt_state *vt, unsigned char b)
+{
+	if (vt->utf8_left) {
+		if ((b & 0xC0) == 0x80) {
+			vt->utf8_cp = (vt->utf8_cp << 6) | (uint32_t)(b & 0x3F);
+			if (--vt->utf8_left)
+				return;
+			uint32_t cp = vt->utf8_cp;
+			if (cp < vt->utf8_min || cp > 0x10FFFF ||
+			    (cp >= 0xD800 && cp <= 0xDFFF))
+				cp = VT_UTF8_REPLACEMENT;
+			vt_put_char(vt, cp);
+			return;
+		}
+		/* Not a continuation byte: abandon the sequence, then handle
+		 * this byte below as the start of a new one. */
+		vt_utf8_abort(vt);
+	}
+
+	if (b < 0x80) {
+		vt_put_char(vt, b);
+	} else if ((b & 0xE0) == 0xC0) {
+		vt->utf8_cp = b & 0x1F;
+		vt->utf8_min = 0x80;
+		vt->utf8_left = 1;
+	} else if ((b & 0xF0) == 0xE0) {
+		vt->utf8_cp = b & 0x0F;
+		vt->utf8_min = 0x800;
+		vt->utf8_left = 2;
+	} else if ((b & 0xF8) == 0xF0) {
+		vt->utf8_cp = b & 0x07;
+		vt->utf8_min = 0x10000;
+		vt->utf8_left = 3;
+	} else {
+		/* 0x80..0xBF with nothing open, or 0xF8..0xFF which is never a
+		 * lead byte. */
+		vt_put_char(vt, VT_UTF8_REPLACEMENT);
+	}
 }
 
 /* =========================================================================
@@ -623,7 +707,7 @@ static void vt_put_char(struct vt_state *vt, char c)
  *
  * Used for alt-screen exit (restore main screen) and resize.
  * Iterates every dirty row, sets cursor + color per cell, calls
- * console_putchar_batch.  Runs inside console_batch_begin/end for speed.
+ * console_putcp_batch.  Runs inside console_batch_begin/end for speed.
  * ======================================================================== */
 void vt_flush_dirty(struct vt_state *vt)
 {
@@ -642,7 +726,7 @@ void vt_flush_dirty(struct vt_state *vt)
 			vt_cell_t *cell = &vt->cells[r * VT_MAX_COLS + c];
 			console_set_cursor_pos((uint32_t)r, (uint32_t)c);
 			console_set_color_rgb(cell->fg_rgb, cell->bg_rgb);
-			console_putchar_batch((char)cell->ch);
+			console_putcp_batch(cell->ch);
 		}
 		vt->dirty[r] = 0;
 	}
@@ -686,6 +770,7 @@ void vt_process_char(struct vt_state *vt, char c)
 		if (vt->state == ANSI_OSC || vt->state == ANSI_DCS) {
 			/* handled inside those states */
 		} else {
+			vt_utf8_abort(vt);
 			vt_reset_parser(vt);
 			vt->state = ANSI_ESC;
 			return;
@@ -699,10 +784,11 @@ void vt_process_char(struct vt_state *vt, char c)
 	/* -------------------------------------------------------------- */
 	case ANSI_NORMAL:
 		if (ch == 0x1B) {
+			vt_utf8_abort(vt);
 			vt->state = ANSI_ESC;
 			return;
 		}
-		vt_put_char(vt, c);
+		vt_feed_text(vt, ch);
 		return;
 
 	/* -------------------------------------------------------------- */
@@ -1372,6 +1458,7 @@ void vt_reset(struct vt_state *vt)
 	vt->scroll_bot = -1;
 	vt->saved_valid = 0;
 	vt->pending_wrap = 0;
+	vt->utf8_left = 0; /* drop any half-decoded character */
 	vt_reset_parser(vt);
 	vt_recompute_colors(vt);
 	console_set_scroll_region(-1, -1);

@@ -13,22 +13,19 @@
 #define MAX_ENV_VARS 128
 #define MAX_ENV_SIZE 512
 
-/* Multibyte character maximum - single-byte locale only */
-#define MB_CUR_MAX  1
-#define MB_LEN_MAX  1
+/* Longest multibyte character: four bytes, the most UTF-8 uses.  MB_CUR_MAX is
+ * the same constant rather than a locale-dependent call because there is one
+ * encoding here; code that sizes a buffer with it gets the right answer
+ * whichever it uses.  MB_LEN_MAX is also in <limits.h>, with the same value. */
+#define MB_CUR_MAX  4
+#ifndef MB_LEN_MAX
+#define MB_LEN_MAX  4
+#endif
 
 /* Multibyte conversions.  The C standard puts mbtowc/wctomb/mbstowcs/wcstombs
- * here as well as in <wchar.h>; the shared definition lives in one place so
+ * here as well as in <wchar.h>; the shared declaration lives in one place so
  * the two headers cannot disagree. */
 #include <bits/multibyte.h>
-
-/* Multibyte length, single-byte locale semantics */
-static inline int mblen(const char *s, size_t n)
-{
-    if (!s) return 0;         /* no state-dependent encodings */
-    if (n == 0) return -1;
-    return (*s != '\0') ? 1 : 0;
-}
 
 // Memory allocation
 void* malloc(size_t size);

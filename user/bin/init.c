@@ -57,6 +57,13 @@
 #define CONSOLE      "/dev/console"
 #define PATH_DEFAULT "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+/* The system locale.  Its only job is to name a character set: the encoding
+ * everything here speaks -- console, terminal emulator, filenames, the network
+ * tools -- is UTF-8, and a program that does not see a UTF-8 locale name turns
+ * its multibyte handling off and mangles anything above ASCII.  Set from PID 1
+ * so that every service inherits it, not only login shells. */
+#define LANG_DEFAULT "en_US.UTF-8"
+
 #define MAX_ENTRIES 32
 #define MAX_ARGS    15
 #define MAX_LINE    256
@@ -399,6 +406,7 @@ int main(void)
 	/* Inherited by every service, and used by execvp() to resolve bare
 	 * program names from inittab lines. */
 	setenv("PATH", PATH_DEFAULT, 1);
+	setenv("LANG", LANG_DEFAULT, 1);
 
 	load_inittab();
 

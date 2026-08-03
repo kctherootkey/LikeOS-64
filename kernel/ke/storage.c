@@ -98,7 +98,7 @@ void storage_fs_poll(storage_fs_state_t *state)
 				state->signature_found = 1;
 				kprintf("EXT4: signature /LIKEOS.SIG found on %s (root storage selected)\n",
 					bdev->name);
-				if (sysfont_load("/res/Lat15-Fixed16.psf") ==
+				if (sysfont_load("/res/Uni2-Terminus16.psf") ==
 				    0) {
 					console_apply_sysfont();
 				}
@@ -130,8 +130,8 @@ void storage_fs_poll(storage_fs_state_t *state)
 				kprintf("FAT32: signature /LIKEOS.SIG found on %s (root storage selected)\n",
 					bdev->name);
 
-				// Load system console font from /res/Lat15-Fixed16.psf
-				if (sysfont_load("/res/Lat15-Fixed16.psf") ==
+				// Load system console font from /res/Uni2-Terminus16.psf
+				if (sysfont_load("/res/Uni2-Terminus16.psf") ==
 				    0) {
 					console_apply_sysfont();
 				}

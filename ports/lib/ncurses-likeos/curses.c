@@ -22,6 +22,8 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <wchar.h>
+#include <locale.h>
 
 /* ===================================================================
  * Internal helpers
@@ -68,6 +70,98 @@ static void _emitf(const char *fmt, ...)
     va_end(ap);
     if (n > 0)
         _emit(buf, n);
+}
+
+/* ===================================================================
+ * Characters
+ *
+ * The terminal this library drives speaks UTF-8, so a cell holds a Unicode
+ * code point and the conversion happens at the two edges: when a caller hands
+ * over a byte string, and when a cell is written to the terminal.  Doing it
+ * anywhere else costs column accounting -- a window that thinks "ü" is two
+ * characters wraps a line one column early and never agrees with the screen
+ * about where the cursor is.
+ * =================================================================== */
+
+/* Emit one code point as UTF-8. */
+static void _emit_cp(uint32_t cp)
+{
+    char buf[4];
+    int n;
+    if (cp < 0x80) {
+        buf[0] = (char)cp; n = 1;
+    } else if (cp < 0x800) {
+        buf[0] = (char)(0xC0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3F)); n = 2;
+    } else if (cp < 0x10000) {
+        buf[0] = (char)(0xE0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (char)(0x80 | (cp & 0x3F)); n = 3;
+    } else {
+        buf[0] = (char)(0xF0 | (cp >> 18));
+        buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[3] = (char)(0x80 | (cp & 0x3F)); n = 4;
+    }
+    _emit(buf, n);
+}
+
+/* Translate a VT100 alternate-character-set letter to the Unicode character
+ * it stands for.  This is the map ncurses installs for a UTF-8 terminal;
+ * anything not in it is left as itself. */
+static uint32_t _acs_to_unicode(unsigned char c)
+{
+    switch (c) {
+    case '}': return 0x00A3; /* pound sign      */
+    case '.': return 0x2193; /* arrow down      */
+    case ',': return 0x2190; /* arrow left      */
+    case '+': return 0x2192; /* arrow right     */
+    case '-': return 0x2191; /* arrow up        */
+    case 'h': return 0x2592; /* board of squares*/
+    case '~': return 0x00B7; /* bullet          */
+    case 'a': return 0x2592; /* checker board   */
+    case 'f': return 0x00B0; /* degree symbol   */
+    case '`': return 0x25C6; /* diamond         */
+    case 'z': return 0x2265; /* greater/equal   */
+    case '{': return 0x03C0; /* pi              */
+    case 'y': return 0x2264; /* less/equal      */
+    case '|': return 0x2260; /* not equal       */
+    case 'g': return 0x00B1; /* plus/minus      */
+    case '0': return 0x25AE; /* solid block     */
+    case 'l': return 0x250C; /* upper left      */
+    case 'm': return 0x2514; /* lower left      */
+    case 'k': return 0x2510; /* upper right     */
+    case 'j': return 0x2518; /* lower right     */
+    case 'q': return 0x2500; /* horizontal line */
+    case 'x': return 0x2502; /* vertical line   */
+    case 'n': return 0x253C; /* crossover       */
+    case 't': return 0x251C; /* tee pointing rt */
+    case 'u': return 0x2524; /* tee pointing lft*/
+    case 'v': return 0x2534; /* tee pointing up */
+    case 'w': return 0x252C; /* tee pointing dn */
+    case 'o': return 0x23BA; /* scan line 1     */
+    case 'p': return 0x23BB; /* scan line 3     */
+    case 'r': return 0x23BC; /* scan line 7     */
+    case 's': return 0x23BD; /* scan line 9     */
+    default:  return c;
+    }
+}
+
+/* How many columns a code point occupies on the terminal.  A character with
+ * no width of its own (a combining mark) is not stored as a cell at all; a
+ * control character that reached here is drawn as a space. */
+static int _cp_width(uint32_t cp)
+{
+    int w = wcwidth((wchar_t)cp);
+    return (w < 0) ? 1 : w;
+}
+
+static cell_t _blank_cell(attr_t a)
+{
+    cell_t c;
+    c.ch = ' ';
+    c.attr = a;
+    return c;
 }
 
 /* ===================================================================
@@ -152,7 +246,11 @@ static WINDOW *_alloc_win(int nlines, int ncols, int begy, int begx)
     w->_touched = true;
 
     /* Allocate backing store */
-    w->_line = (chtype **)calloc(nlines, sizeof(chtype *));
+    w->_utf8_cp = 0;
+    w->_utf8_min = 0;
+    w->_utf8_left = 0;
+
+    w->_line = (cell_t **)calloc(nlines, sizeof(cell_t *));
     w->_dirty = (bool *)calloc(nlines, sizeof(bool));
     if (!w->_line || !w->_dirty) {
         free(w->_line);
@@ -161,7 +259,7 @@ static WINDOW *_alloc_win(int nlines, int ncols, int begy, int begx)
         return NULL;
     }
     for (int i = 0; i < nlines; i++) {
-        w->_line[i] = (chtype *)calloc(ncols, sizeof(chtype));
+        w->_line[i] = (cell_t *)calloc(ncols, sizeof(cell_t));
         if (!w->_line[i]) {
             for (int j = 0; j < i; j++) free(w->_line[j]);
             free(w->_line);
@@ -170,7 +268,7 @@ static WINDOW *_alloc_win(int nlines, int ncols, int begy, int begx)
             return NULL;
         }
         for (int j = 0; j < ncols; j++)
-            w->_line[i][j] = ' ';
+            w->_line[i][j] = _blank_cell(A_NORMAL);
         w->_dirty[i] = true;
     }
 
@@ -413,7 +511,7 @@ int wresize(WINDOW *win, int lines, int columns)
     if (!win) return ERR;
 
     /* Reallocate backing store */
-    chtype **new_line = (chtype **)calloc(lines, sizeof(chtype *));
+    cell_t **new_line = (cell_t **)calloc(lines, sizeof(cell_t *));
     bool   *new_dirty = (bool *)calloc(lines, sizeof(bool));
     if (!new_line || !new_dirty) {
         free(new_line);
@@ -422,7 +520,7 @@ int wresize(WINDOW *win, int lines, int columns)
     }
 
     for (int i = 0; i < lines; i++) {
-        new_line[i] = (chtype *)calloc(columns, sizeof(chtype));
+        new_line[i] = (cell_t *)calloc(columns, sizeof(cell_t));
         if (!new_line[i]) {
             for (int j = 0; j < i; j++) free(new_line[j]);
             free(new_line);
@@ -432,12 +530,12 @@ int wresize(WINDOW *win, int lines, int columns)
         /* Copy old data if available */
         if (i <= win->_maxy && win->_line[i]) {
             int copy_cols = (columns < win->_maxx + 1) ? columns : (win->_maxx + 1);
-            memcpy(new_line[i], win->_line[i], copy_cols * sizeof(chtype));
+            memcpy(new_line[i], win->_line[i], copy_cols * sizeof(cell_t));
             for (int j = copy_cols; j < columns; j++)
-                new_line[i][j] = ' ';
+                new_line[i][j] = _blank_cell(A_NORMAL);
         } else {
             for (int j = 0; j < columns; j++)
-                new_line[i][j] = ' ';
+                new_line[i][j] = _blank_cell(A_NORMAL);
         }
         new_dirty[i] = true;
     }
@@ -475,6 +573,75 @@ int wmove(WINDOW *win, int y, int x)
     return OK;
 }
 
+/* Advance the cursor after writing `cols` columns, wrapping and scrolling
+ * exactly as waddch used to.  Split out because the wide path and the
+ * control-character paths both need it. */
+static void _advance(WINDOW *win, int cols)
+{
+    int y = win->_cury;
+    int x = win->_curx + cols;
+
+    if (x > win->_maxx) {
+        x = 0;
+        y++;
+        if (y > win->_maxy) {
+            if (win->_scrollok) {
+                wscrl(win, 1);
+                y = win->_maxy;
+            } else {
+                y = win->_maxy;
+                x = win->_maxx;
+            }
+        }
+    }
+    win->_cury = y;
+    win->_curx = x;
+}
+
+/* Write one code point at the cursor with the given attributes.
+ *
+ * A character two columns wide needs both of them, so it is written as the
+ * cell itself plus a continuation cell (ch == 0).  If only one column is left
+ * on the line it cannot be split across the wrap: the remaining column is
+ * blanked and the character goes at the start of the next line, which is what
+ * a terminal does with it. */
+static void _put_cp(WINDOW *win, uint32_t cp, attr_t a)
+{
+    int w = _cp_width(cp);
+
+    if (w == 0) {
+        /* A combining mark attaches to the character already written; it
+         * takes no cell of its own and must not move the cursor. */
+        return;
+    }
+
+    if (win->_curx + w > win->_maxx + 1) {
+        while (win->_curx <= win->_maxx) {
+            win->_line[win->_cury][win->_curx] = _blank_cell(a);
+            win->_curx++;
+        }
+        win->_dirty[win->_cury] = true;
+        _advance(win, 0);
+        /* _advance only wraps when the cursor is past the last column, which
+         * it now is. */
+    }
+
+    int y = win->_cury;
+    int x = win->_curx;
+    if (y > win->_maxy || x > win->_maxx)
+        return;
+
+    win->_line[y][x].ch = cp;
+    win->_line[y][x].attr = a;
+    for (int i = 1; i < w && x + i <= win->_maxx; i++) {
+        win->_line[y][x + i].ch = 0; /* continuation */
+        win->_line[y][x + i].attr = a;
+    }
+    win->_dirty[y] = true;
+    win->_touched = true;
+    _advance(win, w);
+}
+
 int waddch(WINDOW *win, chtype ch)
 {
     if (!win) return ERR;
@@ -484,13 +651,25 @@ int waddch(WINDOW *win, chtype ch)
 
     if (y > win->_maxy) return ERR;
 
-    char c = (char)(ch & A_CHARTEXT);
+    unsigned char c = (unsigned char)(ch & A_CHARTEXT);
+    attr_t a = ch & ~A_CHARTEXT;
+    if ((a & ~A_ALTCHARSET) == A_NORMAL)
+        a |= win->_attrs;
+
+    /* Alternate character set: the byte is a VT100 line-drawing letter, not
+     * text, so it is translated whole and never enters the UTF-8 decoder. */
+    if (ch & A_ALTCHARSET) {
+        win->_utf8_left = 0;
+        _put_cp(win, _acs_to_unicode(c), a & ~A_ALTCHARSET);
+        return OK;
+    }
 
     /* Handle special characters */
     if (c == '\n') {
+        win->_utf8_left = 0;
         /* Fill rest of line with spaces */
         while (x <= win->_maxx) {
-            win->_line[y][x] = ' ' | (win->_attrs | (ch & ~A_CHARTEXT & ~A_CHARTEXT));
+            win->_line[y][x] = _blank_cell(a);
             x++;
         }
         win->_dirty[y] = true;
@@ -511,15 +690,16 @@ int waddch(WINDOW *win, chtype ch)
     }
 
     if (c == '\r') {
+        win->_utf8_left = 0;
         win->_curx = 0;
         return OK;
     }
 
     if (c == '\t') {
+        win->_utf8_left = 0;
         int spaces = TABSIZE - (x % TABSIZE);
-        for (int i = 0; i < spaces && x <= win->_maxx; i++, x++) {
-            win->_line[y][x] = ' ' | win->_attrs;
-        }
+        for (int i = 0; i < spaces && x <= win->_maxx; i++, x++)
+            win->_line[y][x] = _blank_cell(win->_attrs);
         win->_dirty[y] = true;
         win->_touched = true;
         win->_curx = x;
@@ -527,55 +707,90 @@ int waddch(WINDOW *win, chtype ch)
     }
 
     if (c == '\b') {
+        win->_utf8_left = 0;
         if (win->_curx > 0) win->_curx--;
         return OK;
     }
 
-    if (x <= win->_maxx) {
-        attr_t a = ch & ~A_CHARTEXT;
-        if (a == A_NORMAL)
-            a = win->_attrs;
-        win->_line[y][x] = (ch & A_CHARTEXT) | a;
-        win->_dirty[y] = true;
-        win->_touched = true;
-        x++;
-    }
-
-    if (x > win->_maxx) {
-        x = 0;
-        y++;
-        if (y > win->_maxy) {
-            if (win->_scrollok) {
-                wscrl(win, 1);
-                y = win->_maxy;
-            } else {
-                y = win->_maxy;
-                x = win->_maxx;
-            }
+    /* Text.  waddch is handed one byte at a time, so a multibyte character
+     * arrives across several calls and has to be reassembled here rather than
+     * stored as one cell per byte -- which is what made a window believe an
+     * umlaut occupied two columns. */
+    if (win->_utf8_left) {
+        if ((c & 0xC0) == 0x80) {
+            win->_utf8_cp = (win->_utf8_cp << 6) | (uint32_t)(c & 0x3F);
+            if (--win->_utf8_left)
+                return OK;
+            uint32_t cp = win->_utf8_cp;
+            if (cp < win->_utf8_min || cp > 0x10FFFF ||
+                (cp >= 0xD800 && cp <= 0xDFFF))
+                cp = 0xFFFD;
+            _put_cp(win, cp, a);
+            return OK;
         }
+        /* Not a continuation byte: abandon the partial character and handle
+         * this byte as the start of a new one. */
+        win->_utf8_left = 0;
+        _put_cp(win, 0xFFFD, a);
     }
 
-    win->_cury = y;
-    win->_curx = x;
+    if (c < 0x80) {
+        _put_cp(win, c, a);
+    } else if ((c & 0xE0) == 0xC0) {
+        win->_utf8_cp = c & 0x1F; win->_utf8_min = 0x80;    win->_utf8_left = 1;
+    } else if ((c & 0xF0) == 0xE0) {
+        win->_utf8_cp = c & 0x0F; win->_utf8_min = 0x800;   win->_utf8_left = 2;
+    } else if ((c & 0xF8) == 0xF0) {
+        win->_utf8_cp = c & 0x07; win->_utf8_min = 0x10000; win->_utf8_left = 3;
+    } else {
+        _put_cp(win, 0xFFFD, a);
+    }
+    return OK;
+}
+
+/* Add a byte string, decoding it as UTF-8.  `n < 0` means "to the NUL". */
+static int _waddnstr_bytes(WINDOW *win, const char *str, int n)
+{
+    if (!win || !str) return ERR;
+
+    mbstate_t st;
+    memset(&st, 0, sizeof(st));
+
+    size_t left = (n < 0) ? (size_t)-1 : (size_t)n;
+    while (left && *str) {
+        wchar_t wc;
+        size_t used = mbrtowc(&wc, str, left, &st);
+        if (used == (size_t)-1 || used == (size_t)-2) {
+            /* Malformed or truncated: consume one byte, show a replacement
+             * and resynchronise, so one bad byte costs one cell rather than
+             * the rest of the string. */
+            memset(&st, 0, sizeof(st));
+            _put_cp(win, 0xFFFD, win->_attrs);
+            str++;
+            if (n >= 0) left--;
+            continue;
+        }
+        if (used == 0)
+            break; /* embedded NUL */
+        /* Control characters keep their old meaning; waddch has the logic. */
+        if ((unsigned)wc < 0x20 || wc == 0x7F)
+            waddch(win, (chtype)(unsigned char)*str);
+        else
+            _put_cp(win, (uint32_t)wc, win->_attrs);
+        str += used;
+        if (n >= 0) left -= used;
+    }
     return OK;
 }
 
 int waddstr(WINDOW *win, const char *str)
 {
-    if (!win || !str) return ERR;
-    while (*str)
-        waddch(win, (chtype)(unsigned char)*str++);
-    return OK;
+    return _waddnstr_bytes(win, str, -1);
 }
 
 int waddnstr(WINDOW *win, const char *str, int n)
 {
-    if (!win || !str) return ERR;
-    if (n < 0)
-        return waddstr(win, str);
-    for (int i = 0; i < n && str[i]; i++)
-        waddch(win, (chtype)(unsigned char)str[i]);
-    return OK;
+    return _waddnstr_bytes(win, str, n);
 }
 
 int mvwaddch(WINDOW *win, int y, int x, chtype ch)
@@ -691,8 +906,16 @@ int doupdate(void)
             if (y == curscr->_maxy && x == curscr->_maxx)
                 continue;
 
-            chtype ch = curscr->_line[y][x];
-            attr_t a = ch & ~A_CHARTEXT;
+            cell_t cell = curscr->_line[y][x];
+
+            /* Continuation of a double-width character: the terminal already
+             * advanced over this column when it drew the character in the
+             * one before, so emitting anything here would push the rest of
+             * the line one column right. */
+            if (cell.ch == 0)
+                continue;
+
+            attr_t a = cell.attr & ~A_CHARTEXT;
             short  p = PAIR_NUMBER(a);
             a &= ~A_COLOR;  /* strip color for attribute comparison */
 
@@ -708,12 +931,12 @@ int doupdate(void)
                 last_pair  = p;
             }
 
-            char c = (char)(ch & A_CHARTEXT);
-            if (c < ' ') c = ' ';
-            _emit(&c, 1);
+            uint32_t cp = cell.ch;
+            if (cp < ' ') cp = ' ';
+            _emit_cp(cp);
 
             last_y = y;
-            last_x = x + 1;
+            last_x = x + _cp_width(cp);
         }
         curscr->_dirty[y] = false;
     }
@@ -759,9 +982,10 @@ int werase(WINDOW *win)
     if (!win) return ERR;
     for (int y = 0; y <= win->_maxy; y++) {
         for (int x = 0; x <= win->_maxx; x++)
-            win->_line[y][x] = ' ';
+            win->_line[y][x] = _blank_cell(A_NORMAL);
         win->_dirty[y] = true;
     }
+    win->_utf8_left = 0;
     win->_cury = 0;
     win->_curx = 0;
     win->_touched = true;
@@ -780,7 +1004,7 @@ int wclrtoeol(WINDOW *win)
     if (!win) return ERR;
     int y = win->_cury;
     for (int x = win->_curx; x <= win->_maxx; x++)
-        win->_line[y][x] = ' ';
+        win->_line[y][x] = _blank_cell(A_NORMAL);
     win->_dirty[y] = true;
     win->_touched = true;
     return OK;
@@ -792,7 +1016,7 @@ int wclrtobot(WINDOW *win)
     wclrtoeol(win);
     for (int y = win->_cury + 1; y <= win->_maxy; y++) {
         for (int x = 0; x <= win->_maxx; x++)
-            win->_line[y][x] = ' ';
+            win->_line[y][x] = _blank_cell(A_NORMAL);
         win->_dirty[y] = true;
     }
     win->_touched = true;
@@ -904,24 +1128,24 @@ int wscrl(WINDOW *win, int n)
     if (n > 0) {
         /* Scroll up */
         for (int i = 0; i < n && n <= win->_maxy; i++) {
-            chtype *tmp = win->_line[0];
+            cell_t *tmp = win->_line[0];
             for (int y = 0; y < win->_maxy; y++)
                 win->_line[y] = win->_line[y + 1];
             win->_line[win->_maxy] = tmp;
             /* Clear the new bottom line */
             for (int x = 0; x <= win->_maxx; x++)
-                win->_line[win->_maxy][x] = ' ';
+                win->_line[win->_maxy][x] = _blank_cell(A_NORMAL);
         }
     } else if (n < 0) {
         /* Scroll down */
         n = -n;
         for (int i = 0; i < n && n <= win->_maxy; i++) {
-            chtype *tmp = win->_line[win->_maxy];
+            cell_t *tmp = win->_line[win->_maxy];
             for (int y = win->_maxy; y > 0; y--)
                 win->_line[y] = win->_line[y - 1];
             win->_line[0] = tmp;
             for (int x = 0; x <= win->_maxx; x++)
-                win->_line[0][x] = ' ';
+                win->_line[0][x] = _blank_cell(A_NORMAL);
         }
     }
 

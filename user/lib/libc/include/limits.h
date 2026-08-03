@@ -59,8 +59,11 @@
 #define LLONG_WIDTH     64
 #define ULLONG_WIDTH    64
 
-/* Maximum bytes in a multibyte character (C locale) */
+/* Maximum bytes in a multibyte character: four, the most UTF-8 uses.
+ * <stdlib.h> repeats this under the same guard. */
+#ifndef MB_LEN_MAX
 #define MB_LEN_MAX  4
+#endif
 
 /* POSIX limits */
 #define PATH_MAX    4096

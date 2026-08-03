@@ -1,6 +1,8 @@
 /*
- * wctype.h - wide character classification for LikeOS
- * Minimal implementation treating wide chars as single-byte.
+ * wctype.h - wide character classification and case mapping.
+ *
+ * The answers come from the Unicode Character Database (see
+ * host/gen-unicode-tables.py), so these classify every script, not just ASCII.
  */
 #ifndef _WCTYPE_H
 #define _WCTYPE_H
@@ -11,33 +13,31 @@
 extern "C" {
 #endif
 
+/* Opaque tokens produced by wctype()/wctrans().  Small integers rather than
+ * pointers, so that an invalid one is rejected instead of dereferenced. */
 typedef unsigned long wctype_t;
-typedef const int *wctrans_t;
+typedef long wctrans_t;
 
-static inline int iswalpha(wint_t wc) { return (wc >= 'A' && wc <= 'Z') || (wc >= 'a' && wc <= 'z'); }
-static inline int iswdigit(wint_t wc) { return wc >= '0' && wc <= '9'; }
-static inline int iswalnum(wint_t wc) { return iswalpha(wc) || iswdigit(wc); }
-static inline int iswspace(wint_t wc) { return wc == ' ' || wc == '\t' || wc == '\n' || wc == '\r' || wc == '\f' || wc == '\v'; }
-static inline int iswblank(wint_t wc) { return wc == ' ' || wc == '\t'; }
-static inline int iswprint(wint_t wc) { return wc >= 0x20 && wc < 0x7F; }
-static inline int iswpunct(wint_t wc) { return iswprint(wc) && !iswalnum(wc) && !iswspace(wc); }
-static inline int iswupper(wint_t wc) { return wc >= 'A' && wc <= 'Z'; }
-static inline int iswlower(wint_t wc) { return wc >= 'a' && wc <= 'z'; }
-static inline int iswcntrl(wint_t wc) { return wc < 0x20 || wc == 0x7F; }
-static inline int iswgraph(wint_t wc) { return wc > 0x20 && wc < 0x7F; }
-static inline int iswxdigit(wint_t wc) { return iswdigit(wc) || (wc >= 'a' && wc <= 'f') || (wc >= 'A' && wc <= 'F'); }
+int iswalpha(wint_t wc);
+int iswdigit(wint_t wc);
+int iswalnum(wint_t wc);
+int iswspace(wint_t wc);
+int iswblank(wint_t wc);
+int iswprint(wint_t wc);
+int iswgraph(wint_t wc);
+int iswpunct(wint_t wc);
+int iswupper(wint_t wc);
+int iswlower(wint_t wc);
+int iswcntrl(wint_t wc);
+int iswxdigit(wint_t wc);
 
-static inline wctype_t wctype(const char *name)
-{
-    (void)name;
-    return 0;
-}
+wint_t towupper(wint_t wc);
+wint_t towlower(wint_t wc);
 
-static inline int iswctype(wint_t wc, wctype_t type)
-{
-    (void)wc; (void)type;
-    return 0;
-}
+wctype_t wctype(const char *name);
+int iswctype(wint_t wc, wctype_t type);
+wctrans_t wctrans(const char *name);
+wint_t towctrans(wint_t wc, wctrans_t trans);
 
 #ifdef __cplusplus
 }

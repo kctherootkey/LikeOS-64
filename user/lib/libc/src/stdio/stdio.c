@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <stdarg.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <wchar.h> /* %ls / %lc convert through wcrtomb */
 
 // Standard file streams - with buffering
 static unsigned char __stdin_rbuf[BUFSIZ];
@@ -103,6 +105,11 @@ FILE *fopen(const char *pathname, const char *mode)
 	fp->error = 0;
 	fp->eof = 0;
 	fp->ungetc_buf = -1;
+	/* Orientation is decided by the first read or write, and the wide
+	 * decoder starts in the initial shift state. */
+	fp->wide_mode = 0;
+	fp->wc_count = 0;
+	fp->wc_value = 0;
 
 	return fp;
 }
@@ -450,6 +457,11 @@ FILE *fdopen(int fd, const char *mode)
 	fp->error = 0;
 	fp->eof = 0;
 	fp->ungetc_buf = -1;
+	/* Orientation is decided by the first read or write, and the wide
+	 * decoder starts in the initial shift state. */
+	fp->wide_mode = 0;
+	fp->wc_count = 0;
+	fp->wc_value = 0;
 	return fp;
 }
 
@@ -1090,6 +1102,54 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 
 		/* ---- string ---- */
 		case 's': {
+			/* %ls takes a wide string and converts it to the
+			 * multibyte encoding.  Precision counts BYTES of the
+			 * conversion, and truncation happens on a character
+			 * boundary: half a multibyte character is not a
+			 * character, and emitting one would corrupt every byte
+			 * that follows it in the output. */
+			if (lng) {
+				const wchar_t *ws = va_arg(ap, wchar_t *);
+				char mb[MB_LEN_MAX];
+				int wlen = 0;
+
+				if (!ws) {
+					ws = L"(null)";
+				}
+				/* Measure first, so width padding is right. */
+				for (const wchar_t *w = ws; *w; w++) {
+					size_t n = wcrtomb(mb, *w, 0);
+					if (n == (size_t)-1)
+						break;
+					if (prec >= 0 &&
+					    wlen + (int)n > prec)
+						break;
+					wlen += (int)n;
+				}
+				int wpad = (width > wlen) ? width - wlen : 0;
+
+				if (!fl_minus)
+					for (int p = 0; p < wpad; p++)
+						SP_PUT(' ');
+				int emitted = 0;
+				for (const wchar_t *w = ws; *w; w++) {
+					size_t n = wcrtomb(mb, *w, 0);
+					if (n == (size_t)-1)
+						break;
+					if (emitted + (int)n > wlen)
+						break;
+					for (size_t i = 0; i < n; i++)
+						SP_PUT(mb[i]);
+					emitted += (int)n;
+				}
+				if (fl_minus)
+					for (int p = 0; p < wpad; p++)
+						SP_PUT(' ');
+
+				format++;
+				continue;
+			}
+
 			char *s = va_arg(ap, char *);
 			if (!s)
 				s = "(null)";
@@ -1115,6 +1175,28 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 
 		/* ---- character ---- */
 		case 'c': {
+			/* %lc takes a wint_t and writes the multibyte encoding
+			 * of that character -- one to four bytes, but always a
+			 * single field for width purposes. */
+			if (lng) {
+				char mb[MB_LEN_MAX];
+				wint_t wc = (wint_t)va_arg(ap, int);
+				size_t n = wcrtomb(mb, (wchar_t)wc, 0);
+				if (n == (size_t)-1)
+					n = 0;
+				int wpad = (width > 1) ? width - 1 : 0;
+				if (!fl_minus)
+					for (int p = 0; p < wpad; p++)
+						SP_PUT(' ');
+				for (size_t i = 0; i < n; i++)
+					SP_PUT(mb[i]);
+				if (fl_minus)
+					for (int p = 0; p < wpad; p++)
+						SP_PUT(' ');
+				format++;
+				continue;
+			}
+
 			char c = (char)va_arg(ap, int);
 			int pad = (width > 1) ? width - 1 : 0;
 			if (!fl_minus)

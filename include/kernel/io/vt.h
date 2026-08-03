@@ -25,8 +25,7 @@
 /* Per-cell rendering attributes: the canonical screen backing store.
  * Stored as resolved RGB so cell-level redraw needs no SGR state.      */
 typedef struct {
-	uint8_t ch; /* rendered character (ASCII/Latin-1) */
-	uint8_t _pad[3];
+	uint32_t ch; /* rendered character, as a Unicode code point     */
 	uint32_t fg_rgb; /* resolved foreground RGB (after bold, reverse)  */
 	uint32_t bg_rgb; /* resolved background RGB                        */
 } vt_cell_t;
@@ -103,6 +102,16 @@ struct vt_state {
 	int cur_row;
 	int cur_col;
 	int pending_wrap; /* deferred xenl wrap flag                   */
+
+	/* ---- UTF-8 input decoder ---------------------------------------
+	 * Only bytes reaching the parser's ground state are text; escape
+	 * sequences are ASCII by construction, so the decoder is driven from
+	 * there alone.  A sequence that is still incomplete when an ESC or a
+	 * C0 control arrives is abandoned (reported as U+FFFD), which is what
+	 * keeps one truncated character from swallowing a whole CSI.        */
+	uint32_t utf8_cp; /* code point accumulated so far             */
+	uint32_t utf8_min; /* smallest value legal at this length       */
+	int utf8_left; /* continuation bytes still expected         */
 
 	/* ---- Cell buffer (screen backing store) ------------------------ */
 	vt_cell_t *cells; /* points to g_main_cells or g_alt_cells        */

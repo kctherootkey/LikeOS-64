@@ -26,6 +26,24 @@ typedef uint32_t chtype;
 typedef uint32_t attr_t;
 typedef unsigned long mmask_t;
 
+/* One cell of a window's backing store: a Unicode code point together with
+ * the attribute bits of a chtype.
+ *
+ * A chtype cannot hold both.  A_CHARTEXT is eight bits wide here as it is in
+ * ncurses itself, and it has to stay that way: the A_* constants are passed
+ * through wattron(int), so widening the character field would push the
+ * attribute bits past 32 and truncate them.  ncurses solves this with a
+ * separate cchar_t for its wide interface; this is the same split, done once
+ * and kept private to the backing store.
+ *
+ * A character occupying two columns (wcwidth 2) is stored in two cells: the
+ * first holds it, the second holds ch == 0 as a continuation marker so that
+ * the column arithmetic and the redraw both know the cell is spoken for. */
+typedef struct {
+    uint32_t ch;    /* Unicode code point; 0 = continuation of the cell left */
+    attr_t   attr;  /* A_* bits and COLOR_PAIR; character bits are zero      */
+} cell_t;
+
 typedef struct _win_st {
     int _cury, _curx;       /* current cursor position */
     int _maxy, _maxx;       /* max y/x (0-based, so rows-1 / cols-1) */
@@ -39,9 +57,14 @@ typedef struct _win_st {
     bool _leaveok;          /* leave cursor after update */
     int _delay;             /* input timeout (-1 = blocking) */
     /* backing store */
-    chtype **_line;         /* line contents [_maxy+1][_maxx+1] */
+    cell_t **_line;         /* line contents [_maxy+1][_maxx+1] */
     bool *_dirty;           /* dirty line flags */
     bool _touched;          /* any line dirty */
+    /* UTF-8 assembly state for waddch(), which is handed one byte at a time
+     * and has to reassemble a character across calls. */
+    uint32_t _utf8_cp;
+    uint32_t _utf8_min;
+    int _utf8_left;
 } WINDOW;
 
 typedef struct {
@@ -86,8 +109,13 @@ extern int ESCDELAY;
 #define A_DIM        0x00100000U
 #define A_BOLD       0x00200000U
 #define A_ITALIC     0x00800000U
+/* Alternate character set: the character is a VT100 line-drawing letter to be
+ * translated to its Unicode equivalent on output, which is what the ACS_*
+ * constants below carry.  Same mechanism ncurses uses on a UTF-8 terminal. */
+#define A_ALTCHARSET 0x00400000U
 #define A_CHARTEXT   0x000000FFU
 #define A_COLOR      0x0000FF00U
+#define A_ATTRIBUTES (~(A_CHARTEXT))
 
 #define COLOR_PAIR(n) (((n) & 0xFF) << 8)
 #define PAIR_NUMBER(a) (((a) & A_COLOR) >> 8)
@@ -216,19 +244,41 @@ extern int ESCDELAY;
 #define BUTTON_ALT             0x10000000L
 #define REPORT_MOUSE_POSITION  0x08000000L
 
-/* ===== ACS characters (line drawing) ===== */
+/* ===== ACS characters (line drawing) =====
+ *
+ * The VT100 line-drawing letters, flagged with A_ALTCHARSET so the output
+ * layer knows to translate them to the Unicode box-drawing characters rather
+ * than print the letters themselves.  They used to be plain letters, which
+ * drew nano's separator as a row of 'q'.
+ */
 
-#define ACS_ULCORNER  ('l' | A_NORMAL)
-#define ACS_LLCORNER  ('m' | A_NORMAL)
-#define ACS_URCORNER  ('k' | A_NORMAL)
-#define ACS_LRCORNER  ('j' | A_NORMAL)
-#define ACS_HLINE     ('q' | A_NORMAL)
-#define ACS_VLINE     ('x' | A_NORMAL)
-#define ACS_PLUS      ('n' | A_NORMAL)
-#define ACS_LTEE      ('t' | A_NORMAL)
-#define ACS_RTEE      ('u' | A_NORMAL)
-#define ACS_BTEE      ('v' | A_NORMAL)
-#define ACS_TTEE      ('w' | A_NORMAL)
+#define ACS_ULCORNER  ('l' | A_ALTCHARSET)
+#define ACS_LLCORNER  ('m' | A_ALTCHARSET)
+#define ACS_URCORNER  ('k' | A_ALTCHARSET)
+#define ACS_LRCORNER  ('j' | A_ALTCHARSET)
+#define ACS_HLINE     ('q' | A_ALTCHARSET)
+#define ACS_VLINE     ('x' | A_ALTCHARSET)
+#define ACS_PLUS      ('n' | A_ALTCHARSET)
+#define ACS_LTEE      ('t' | A_ALTCHARSET)
+#define ACS_RTEE      ('u' | A_ALTCHARSET)
+#define ACS_BTEE      ('v' | A_ALTCHARSET)
+#define ACS_TTEE      ('w' | A_ALTCHARSET)
+#define ACS_DIAMOND   ('`' | A_ALTCHARSET)
+#define ACS_CKBOARD   ('a' | A_ALTCHARSET)
+#define ACS_DEGREE    ('f' | A_ALTCHARSET)
+#define ACS_PLMINUS   ('g' | A_ALTCHARSET)
+#define ACS_BULLET    ('~' | A_ALTCHARSET)
+#define ACS_LARROW    (',' | A_ALTCHARSET)
+#define ACS_RARROW    ('+' | A_ALTCHARSET)
+#define ACS_DARROW    ('.' | A_ALTCHARSET)
+#define ACS_UARROW    ('-' | A_ALTCHARSET)
+#define ACS_BOARD     ('h' | A_ALTCHARSET)
+#define ACS_BLOCK     ('0' | A_ALTCHARSET)
+#define ACS_LEQUAL    ('y' | A_ALTCHARSET)
+#define ACS_GEQUAL    ('z' | A_ALTCHARSET)
+#define ACS_PI        ('{' | A_ALTCHARSET)
+#define ACS_NEQUAL    ('|' | A_ALTCHARSET)
+#define ACS_STERLING  ('}' | A_ALTCHARSET)
 
 /* ===== Initialization / termination ===== */
 

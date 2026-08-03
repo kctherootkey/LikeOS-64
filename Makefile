@@ -176,6 +176,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
 			  $(BUILD_DIR)/storage.o \
               $(BUILD_DIR)/console.o \
               $(BUILD_DIR)/sysfont.o \
+              $(BUILD_DIR)/unicode.o \
               $(BUILD_DIR)/cursor.o \
               $(BUILD_DIR)/fb.o \
               $(BUILD_DIR)/vmsvga2.o \
@@ -313,7 +314,7 @@ ROOT_USRLOCAL_BINS = user_test.elf test_libc hello progerr testmem memstat tests
 # the image up to date and wrote the PREVIOUS one to the device -- an edited
 # config that never reached the running system, which looks identical to the
 # edit not working.
-RES_PREREQS = res/Lat15-Fixed16.psf res/left_ptr res/nanorc \
+RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 	res/etc/skel/.profile res/etc/skel/.bashrc \
 	$(wildcard res/man/*.1) $(wildcard res/etc/*) \
 	$(wildcard res/etc/ssl/certs/*) $(wildcard res/xorg/*) \
@@ -349,6 +350,9 @@ $(BUILD_DIR)/console.o: $(KERNEL_DIR)/io/console.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/sysfont.o: $(KERNEL_DIR)/io/sysfont.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/unicode.o: $(KERNEL_DIR)/io/unicode.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/cursor.o: $(KERNEL_DIR)/io/cursor.c | $(BUILD_DIR)
@@ -1417,7 +1421,7 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp user/bin/tests/testbash.sh $(EXT4_STAGING)/usr/local/bin/testbash.sh
 	chmod 755 $(EXT4_STAGING)/usr/local/bin/testbash.sh
 	# Resources, manpages, config
-	cp res/Lat15-Fixed16.psf $(EXT4_STAGING)/res/Lat15-Fixed16.psf
+	cp res/Uni2-Terminus16.psf $(EXT4_STAGING)/res/Uni2-Terminus16.psf
 	cp res/left_ptr          $(EXT4_STAGING)/res/left_ptr
 	cp res/man/*.1           $(EXT4_STAGING)/usr/share/man/man1/
 	# "man sh" shows the bash page: sh IS bash now (see /bin/sh symlink)

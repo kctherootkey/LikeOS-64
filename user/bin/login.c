@@ -121,7 +121,9 @@ static int login_conv(int num_msg, const struct pam_message **msg,
 static void setup_environment(const struct passwd *pw, char *envp[], int *n)
 {
 	static char home[256], user[128], logname[128], shell[256], term[64];
+	static char langv[64];
 	const char *t = getenv("TERM");
+	const char *lang = getenv("LANG");
 
 	snprintf(home, sizeof(home), "HOME=%s", pw->pw_dir);
 	snprintf(user, sizeof(user), "USER=%s", pw->pw_name);
@@ -137,6 +139,13 @@ static void setup_environment(const struct passwd *pw, char *envp[], int *n)
 	envp[(*n)++] = shell;
 	envp[(*n)++] = (char *)"PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 	envp[(*n)++] = term;
+	/* The login environment is built clean rather than inherited, so LANG
+	 * has to be put back explicitly -- and it matters: without a UTF-8
+	 * locale name the shell, the editor and the terminal emulator all fall
+	 * back to treating a byte as a character. */
+	snprintf(langv, sizeof(langv), "LANG=%s", lang && *lang ? lang :
+							 "en_US.UTF-8");
+	envp[(*n)++] = langv;
 	envp[*n] = NULL;
 }
 
@@ -231,7 +240,7 @@ int main(int argc, char *argv[])
 	setlogin(pw->pw_name);
 
 	/* Build a clean login environment. */
-	char *envp[8];
+	char *envp[12]; /* setup_environment fills 7 plus the NULL */
 	int envn;
 	setup_environment(pw, envp, &envn);
 
