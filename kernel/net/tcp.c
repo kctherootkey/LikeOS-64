@@ -1979,6 +1979,8 @@ int tcp_send_data(tcp_conn_t *conn, const uint8_t *data, uint16_t len)
 // ============================================================================
 
 // Idle connection timeout: close ESTABLISHED connections with no data for 5 minutes
+/* Deadline for a connection stuck in a CLOSING state (5 minutes at 100 Hz).
+ * Not applied to ESTABLISHED -- see the note at the use site. */
 #define TCP_IDLE_TIMEOUT_TICKS (300 * 100)
 
 // Disposition of an inbound segment as decided by tcp_validate_incoming().
@@ -3439,15 +3441,29 @@ void tcp_timer_tick(void)
 			tcp_send_ack(conn);
 		}
 
-		// Slow-loris / idle timeout: close connections that have received
-		// nothing for TCP_IDLE_TIMEOUT_TICKS (5 minutes by default).
-		// Covers the closing states too, not just ESTABLISHED: since
-		// retransmit_count only advances on transmits that actually left
-		// the machine, a FIN_WAIT_1/CLOSING/LAST_ACK conn whose sends
-		// keep failing locally (skb exhaustion) would otherwise hold a
-		// table slot forever.
-		if ((conn->state == TCP_STATE_ESTABLISHED ||
-		     conn->state == TCP_STATE_FIN_WAIT_1 ||
+		/* Idle timeout for the CLOSING states only.
+		 *
+		 * Since retransmit_count only advances on transmits that
+		 * actually left the machine, a FIN_WAIT_1/CLOSING/LAST_ACK conn
+		 * whose sends keep failing locally (skb exhaustion) would
+		 * otherwise hold its slot forever.  Those states are supposed to
+		 * be transient, so a deadline on them is right.
+		 *
+		 * ESTABLISHED is deliberately NOT here.  An established
+		 * connection that carries no data is not a broken one -- TCP has
+		 * no requirement that anything ever be sent, and an interactive
+		 * session spends almost all of its life exactly like that.  This
+		 * used to cover ESTABLISHED as a slow-loris defence and killed
+		 * every idle login after five minutes: an ssh session left
+		 * untouched died with ETIMEDOUT, which is indistinguishable from
+		 * the network having failed.
+		 *
+		 * Detecting a peer that really has gone away is what SO_KEEPALIVE
+		 * is for, and it is implemented below: probes after an idle
+		 * period, and the connection fails only when they go unanswered.
+		 * That distinguishes "quiet" from "gone", which a timer on
+		 * silence alone cannot do. */
+		if ((conn->state == TCP_STATE_FIN_WAIT_1 ||
 		     conn->state == TCP_STATE_CLOSING ||
 		     conn->state == TCP_STATE_LAST_ACK) &&
 		    conn->last_rx_tick != 0 &&
