@@ -31,6 +31,13 @@ ac_cv_func_wcwidth=yes
 ac_cv_func_nl_langinfo=yes
 EOF
 
+# configure aborts if configure.ac or any m4/*.m4 is newer than itself ("run
+# autoreconf").  git does not preserve mtimes: a fresh clone/checkout writes
+# files in path order, so m4/*.m4 lands milliseconds after configure and the
+# check fires even though nothing is actually stale.  Nothing here regenerates
+# configure, so re-stamp it as the newest file of the set.
+touch configure
+
 CC="$CC" ./configure \
 	--host=x86_64-unknown-likeos --build="$(gcc -dumpmachine)" \
 	--cache-file=likeos.cache \

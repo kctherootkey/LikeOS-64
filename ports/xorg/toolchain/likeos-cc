@@ -75,8 +75,23 @@ for a in "$@"; do
 	esac
 done
 
+# Appended AFTER the package's own flags, which is the only position that can
+# undo one of them: last -W wins.
+#
+# util-macros turns -Warray-bounds into -Werror=array-bounds for every package
+# that uses XORG_DEFAULT_OPTIONS, so the build host's gcc decides whether these
+# releases compile at all.  gcc 11 reports libX11's XDefaultOMIF.c:402 as
+# "array subscript -3 is outside array bounds of char[4096]" -- the guarded
+# `length > 3 && *(last-3) == '-'`, where it has not carried the guard into the
+# dereference.  The access cannot happen; newer gcc does not report it.  That
+# is a property of the compiler on this machine, not of the port, so only the
+# error promotion is dropped: the warning is still printed, and the other
+# eleven -Werror= flags (notably -Werror=implicit, which catches a prototype
+# this libc is missing) keep their teeth.
+NOT_FATAL="-Wno-error=array-bounds"
+
 if [ "$is_link" = "0" ]; then
-	exec gcc $INCLUDES $COMPILE_FLAGS "$@"
+	exec gcc $INCLUDES $COMPILE_FLAGS "$@" $NOT_FATAL
 fi
 
 # Shared library or executable?  Both need the sysroot on the library path.

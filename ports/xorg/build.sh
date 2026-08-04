@@ -746,7 +746,27 @@ while read -r section name version deb repo rest; do
 		continue
 	fi
 
-	dir=$(find "$here" -maxdepth 1 -type d -name "$name-*" | head -1)
+	# Resolve this package's source tree.
+	#
+	# `$name-*` on its own is ambiguous: xcb-util also matches
+	# xcb-util-image, xcb-util-keysyms and xcb-util-wm.  find returns
+	# directory order -- whatever the filesystem hands back, which differs
+	# between machines -- so `head -1` was picking xcb-util-image on a fresh
+	# clone and configuring the wrong tree, which then failed looking for
+	# the xcb-util it had just been asked to build.
+	#
+	# Take the manifest's version when that tree is present.  It is not
+	# always: fetch.sh falls back to Debian and X.Org GitLab, whose versions
+	# differ from the manifest's.  So the fallback accepts only a suffix
+	# that looks like a version (starts with a digit), which is what rules
+	# out the sibling packages, and sorts so the pick is the same
+	# everywhere.
+	if [ -d "$here/$name-$version" ]; then
+		dir="$here/$name-$version"
+	else
+		dir=$(find "$here" -maxdepth 1 -type d -name "$name-[0-9]*" |
+			sort -V | tail -1)
+	fi
 	if [ -z "$dir" ]; then
 		printf '%-22s no source tree (run unpack.sh)\n' "$name"
 		failed=$((failed + 1))

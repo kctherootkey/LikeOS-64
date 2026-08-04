@@ -1857,6 +1857,11 @@ xorg-manpages:
 	echo "rendered $$n X.Org manual pages into res/man/"
 
 # Install dependencies (Ubuntu/Debian)
+#
+# The newest meson any package in the tree asks for: pixman's meson.build.
+# Raise it when a package that needs more is added.
+MESON_MIN_VERSION = 1.3.0
+
 deps:
 	@echo "Installing build dependencies..."
 	sudo apt update
@@ -1872,7 +1877,44 @@ deps:
 	# autotools nor meson.  groff/man-db render the manual pages
 	# (maintenance target only, but the tools belong on the list).
 	sudo apt install -y meson ninja-build libtool gperf xsltproc xfonts-utils \
-		bison flex cmake groff || true
+		bison flex cmake groff python3-pip || true
+	# The apt meson is not always new enough.  pixman's meson.build asks for
+	# >= 1.3.0 and Ubuntu 22.04 ships 0.61.2, so the port stops there with
+	#
+	#     meson.build:21:0: ERROR: Meson version is 0.61.2 but project requires >= 1.3.0
+	#
+	# which is a property of the build machine, not of the port -- the same
+	# tree builds on a newer distro.  meson is a Python program and upstream
+	# publishes it on PyPI, so pip supplies a current one where apt cannot.
+	# It lands in /usr/local/bin, which precedes /usr/bin, so the newer one
+	# wins without the apt package having to be removed.
+	@have=$$(meson --version 2>/dev/null || echo 0); \
+	need=$(MESON_MIN_VERSION); \
+	if [ "$$(printf '%s\n%s\n' "$$need" "$$have" | sort -V | head -1)" = "$$need" ]; then \
+		echo "meson $$have is new enough (need >= $$need)"; \
+	else \
+		echo "meson $$have is older than $$need -- installing from PyPI"; \
+		sudo pip3 install --upgrade meson || \
+			echo "WARNING: no meson >= $$need; the pixman port will not configure"; \
+	fi
+	# Same shape, for the same reason: xkeyboard-config's rules generator
+	# imports StrEnum, which is in the standard library from Python 3.11.
+	# Below that its meson.build requires the PyPI backport instead, and
+	# stops with
+	#
+	#     rules/meson.build:159:19: ERROR: python3 is missing modules: strenum
+	#
+	# Installed through `python3 -m pip` rather than `pip3`, which on this
+	# machine belongs to a different interpreter than the python3 on PATH --
+	# so pip3 would report success while meson still could not import it.
+	@ver=$$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])'); \
+	if [ "$$(printf '%s\n%s\n' 3.11 "$$ver" | sort -V | head -1)" = "3.11" ]; then \
+		echo "python3 $$ver has StrEnum in the standard library"; \
+	else \
+		echo "python3 $$ver predates StrEnum -- installing the strenum backport"; \
+		python3 -m pip install --user strenum || \
+			echo "WARNING: no strenum; the xkeyboard-config port will not configure"; \
+	fi
 
 # Help target
 help:
