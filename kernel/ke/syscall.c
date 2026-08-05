@@ -2979,18 +2979,17 @@ static int64_t sys_kill(uint64_t pid, uint64_t sig)
 	if (pid == 0) {
 		if (self->pgid <= 0)
 			return -ESRCH;
-		if (sig == 0)
-			return 0; /* our own group always exists */
-		sched_signal_pgrp(self->pgid, (int)sig);
-		return 0;
+		/* Our own group always contains us and we may always signal
+		 * ourselves, so this cannot come back -EPERM; the check only
+		 * skips members belonging to another user, which a group can
+		 * acquire across a setuid exec. */
+		return sched_signal_pgrp_checked(self->pgid, (int)sig);
 	}
 	if ((int64_t)pid < -1) {
-		int pgid = -(int)pid;
-		if (sig == 0) {
-			return sched_pgid_exists(pgid) ? 0 : -ESRCH;
-		}
-		sched_signal_pgrp(pgid, (int)sig);
-		return 0;
+		int64_t pgid = -(int64_t)pid;
+		if (pgid > 0x7fffffff)
+			return -ESRCH;
+		return sched_signal_pgrp_checked((int)pgid, (int)sig);
 	}
 	if ((int64_t)pid == -1) {
 		/* Broadcast: every process the caller may signal, except itself
@@ -5458,6 +5457,19 @@ static int64_t sys_rt_sigtimedwait(uint64_t set_ptr, uint64_t info_ptr,
 	}
 }
 
+/* Shared gate for the signal syscalls that reach a task straight from its id
+ * (rt_sigqueueinfo, tkill, tgkill).  Without it they bypass both guards
+ * sys_kill applies: kernel threads are not signallable at all, and an
+ * unprivileged caller may only signal a task whose credentials match
+ * (signal_permission()).  sig == 0 is the probe form, so the check runs for it
+ * too — that probe IS the permission answer. */
+static int64_t signal_target_check(task_t *target, int sig)
+{
+	if (target->privilege == TASK_KERNEL)
+		return -EPERM;
+	return signal_permission(target, sig);
+}
+
 // SYS_RT_SIGQUEUEINFO - queue signal with info
 static int64_t sys_rt_sigqueueinfo(uint64_t pid, uint64_t sig,
 				   uint64_t info_ptr)
@@ -5470,6 +5482,10 @@ static int64_t sys_rt_sigqueueinfo(uint64_t pid, uint64_t sig,
 	if (!target) {
 		return -ESRCH;
 	}
+
+	int64_t perr = signal_target_check(target, (int)sig);
+	if (perr != 0)
+		return perr;
 
 	siginfo_t info;
 	if (copy_from_user(&info, (void *)info_ptr, sizeof(siginfo_t)) != 0) {
@@ -5583,7 +5599,8 @@ static int64_t sys_sigaltstack(uint64_t ss_ptr, uint64_t old_ss_ptr)
 // SYS_TKILL - send signal to specific thread
 static int64_t sys_tkill(uint64_t tid, uint64_t sig)
 {
-	if (sig <= 0 || sig >= NSIG) {
+	// sig == 0 is the existence/permission probe; only negatives are errors
+	if ((int64_t)tid <= 0 || (int64_t)sig < 0 || sig >= NSIG) {
 		return -EINVAL;
 	}
 
@@ -5592,11 +5609,22 @@ static int64_t sys_tkill(uint64_t tid, uint64_t sig)
 		return -ESRCH;
 	}
 
+	int64_t perr = signal_target_check(target, (int)sig);
+	if (perr != 0)
+		return perr;
+
+	if (sig == 0) {
+		return 0;
+	}
+
+	task_t *self = sched_current();
 	siginfo_t info;
 	mm_memset(&info, 0, sizeof(info));
 	info.si_signo = (int)sig;
 	info.si_code = SI_TKILL;
-	info.si_pid = sched_current() ? sched_current()->id : 0;
+	// si_pid is the sending *process*, i.e. the sender's tgid, not its tid
+	info.si_pid = self ? self->tgid : 0;
+	info.si_uid = self ? self->cred.uid : 0;
 
 	return signal_send(target, (int)sig, &info);
 }
@@ -5606,11 +5634,11 @@ static int64_t sys_tkill(uint64_t tid, uint64_t sig)
 // the target thread belongs to the specified thread group.
 static int64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig)
 {
-	if (tgid <= 0 || tid <= 0) {
+	if ((int64_t)tgid <= 0 || (int64_t)tid <= 0) {
 		return -EINVAL;
 	}
 
-	if (sig < 0 || sig >= 65) {
+	if ((int64_t)sig < 0 || sig >= NSIG) {
 		return -EINVAL;
 	}
 
@@ -5625,17 +5653,23 @@ static int64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig)
 		return -ESRCH; // Thread not in specified group
 	}
 
+	int64_t perr = signal_target_check(target, (int)sig);
+	if (perr != 0)
+		return perr;
+
 	// sig == 0 is a permission check only
 	if (sig == 0) {
 		return 0;
 	}
 
+	task_t *self = sched_current();
 	// Build siginfo
 	siginfo_t info;
 	mm_memset(&info, 0, sizeof(info));
 	info.si_signo = (int)sig;
 	info.si_code = SI_TKILL;
-	info.si_pid = sched_current()->tgid;
+	info.si_pid = self ? self->tgid : 0;
+	info.si_uid = self ? self->cred.uid : 0;
 
 	return signal_send(target, (int)sig, &info);
 }

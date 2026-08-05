@@ -2601,27 +2601,67 @@ int sched_signal_all(task_t *sender, int sig)
 	return delivered ? 0 : -ESRCH;
 }
 
+// Collect targets first to avoid holding task_list_lock during signal delivery
+#define MAX_PGRP_TARGETS 32
+
+/* Snapshot the signallable members of `pgid` (zombies and kernel threads are
+ * not members for signalling purposes).  Delivery takes other locks, so it runs
+ * with the task-list lock dropped, against this snapshot. */
+static int pgrp_collect_targets(int pgid, task_t **out, int max)
+{
+	uint64_t flags;
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	int count = 0;
+	for (task_t *t = g_task_list_head; t && count < max; t = t->next) {
+		if (t->pgid == pgid && t->state != TASK_ZOMBIE &&
+		    t->privilege != TASK_KERNEL) {
+			out[count++] = t;
+		}
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+	return count;
+}
+
+/* Kernel-originated group signal: ^C/^Z on the tty, SIGTTIN/SIGTTOU on a
+ * background tty access, SIGHUP on hangup.  These are the kernel's own signals
+ * and are delivered unconditionally — the task that happens to be current when
+ * the tty driver runs is not the sender, so a credential check here would be
+ * meaningless as well as wrong.  A signal a user process asked for goes through
+ * sched_signal_pgrp_checked() instead. */
 void sched_signal_pgrp(int pgid, int sig)
 {
 	if (pgid <= 0)
 		return;
-	uint64_t flags;
-	spin_lock_irqsave(&g_task_list_lock, &flags);
-// Collect targets first to avoid holding task_list_lock during signal delivery
-#define MAX_PGRP_TARGETS 32
 	task_t *targets[MAX_PGRP_TARGETS];
-	int count = 0;
-	for (task_t *t = g_task_list_head; t && count < MAX_PGRP_TARGETS;
-	     t = t->next) {
-		if (t->pgid == pgid && t->state != TASK_ZOMBIE &&
-		    t->privilege != TASK_KERNEL) {
-			targets[count++] = t;
-		}
-	}
-	spin_unlock_irqrestore(&g_task_list_lock, flags);
+	int count = pgrp_collect_targets(pgid, targets, MAX_PGRP_TARGETS);
 	for (int i = 0; i < count; i++) {
 		sched_signal_task(targets[i], sig);
 	}
+}
+
+/* kill(2)'s group forms (pid == 0 and pid < -1).  Same credential rule as a
+ * targeted kill, applied per member: a member we may not signal is skipped
+ * rather than failing the whole call.  sig == 0 runs the checks and delivers
+ * nothing, which is the existence/permission probe.
+ * Returns 0 if at least one member was signalled, -EPERM if the group has
+ * members but none of them were ours to signal, -ESRCH if it has none. */
+int sched_signal_pgrp_checked(int pgid, int sig)
+{
+	if (pgid <= 0)
+		return -ESRCH;
+	task_t *targets[MAX_PGRP_TARGETS];
+	int count = pgrp_collect_targets(pgid, targets, MAX_PGRP_TARGETS);
+	if (count == 0)
+		return -ESRCH;
+	int delivered = 0;
+	for (int i = 0; i < count; i++) {
+		if (signal_permission(targets[i], sig) != 0)
+			continue;
+		if (sig != 0)
+			sched_signal_task(targets[i], sig);
+		delivered++;
+	}
+	return delivered ? 0 : -EPERM;
 }
 
 int sched_pgid_exists(int pgid)

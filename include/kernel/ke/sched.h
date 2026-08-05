@@ -695,7 +695,12 @@ void sched_set_init_task(task_t *t);
 // True for the kernel's swapper-class tasks (bootstrap + per-CPU idle), which
 // should be hidden from process listings.
 int sched_task_hidden(const task_t *t);
+/* Kernel-originated group signal (tty job control, hangup): unconditional. */
 void sched_signal_pgrp(int pgid, int sig);
+/* kill(2)'s group forms: credential-checked per member, sig == 0 probes.
+ * 0 if any member was signalled, -EPERM if none were permitted, -ESRCH if the
+ * group is empty. */
+int sched_signal_pgrp_checked(int pgid, int sig);
 int sched_signal_all(struct task *sender, int sig);
 int sched_pgid_exists(int pgid);
 struct tty; // forward declaration for dump output
