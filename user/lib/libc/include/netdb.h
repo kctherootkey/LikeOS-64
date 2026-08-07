@@ -1,6 +1,10 @@
 #ifndef _NETDB_H
 #define _NETDB_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/socket.h>
@@ -181,7 +185,7 @@ int dns_query(dns_query_buf_t *buf);
 int net_getinfo(int subcmd, void *buf, int max_entries);
 int dhcp_control(int subcmd);
 int raw_send(int subcmd, uint32_t dst, uint32_t id_seq, uint32_t ttl);
-int raw_recv(int subcmd, void *result, uint32_t param, uint64_t timeout);
+int raw_recv(int subcmd, void *result, uint32_t param, uint64_t timeout_ms);
 
 /* Simplified gethostbyname-style structure */
 struct hostent {
@@ -277,5 +281,9 @@ extern int h_errno;
 /* herror / hstrerror for compatibility with resolv-using code */
 void        herror(const char *s);
 const char *hstrerror(int err);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _NETDB_H */

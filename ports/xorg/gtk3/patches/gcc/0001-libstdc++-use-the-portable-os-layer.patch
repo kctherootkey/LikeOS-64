@@ -1,0 +1,27 @@
+--- a/libstdc++-v3/configure.host
++++ b/libstdc++-v3/configure.host
+@@ -311,6 +311,24 @@
+     ;;
+ esac
+ 
++# LikeOS uses the portable operating-system layer, whatever the OS field of the
++# triple says.  That field is `gnu' only because it is what selects a working
++# set of defaults elsewhere in this configure; the C library underneath is this
++# project's own.
++#
++# os/gnu-linux reaches straight into glibc's internals -- the ctype table
++# (_ISupper and the rest of that bitmask) and the locale model behind it --
++# and neither is reproduced here, so it does not compile.  The portable layer
++# is written against the C standard alone, which is what this library provides.
++#
++# Exactly the reasoning behind the linux-musl arm above: same kernel interface
++# in the triple, different C library, portable layer.
++case "${host}" in
++  *-likeos-*)
++    os_include_dir="os/generic"
++    ;;
++esac
++
+ 
+ # Set any OS-dependent and CPU-dependent bits.
+ # THIS TABLE IS SORTED.  KEEP IT THAT WAY.

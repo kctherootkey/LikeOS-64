@@ -67,8 +67,24 @@
 # define __predict_false(x) __builtin_expect(!!(x), 0)
 #endif
 
-#ifndef __restrict
-# define __restrict restrict
+/* __restrict
+ *
+ * GCC and clang provide this as a KEYWORD, in C++ as well as in C, so there is
+ * nothing to define for them -- and defining it anyway is actively wrong in
+ * C++, where `restrict` is not a keyword at all.  `#define __restrict restrict`
+ * turned every use of it into an undeclared identifier, which is how including
+ * this header before <regex.h> made regcomp's prototype a syntax error.
+ *
+ * The fallbacks are for a compiler that provides neither: nothing in C++ and in
+ * C89, where the qualifier does not exist and dropping it is always safe, and
+ * the real keyword from C99 on.
+ */
+#if !defined __GNUC__ && !defined __clang__ && !defined __restrict
+# if defined __cplusplus || __STDC_VERSION__ < 199901L
+#  define __restrict
+# else
+#  define __restrict restrict
+# endif
 #endif
 
 #ifndef __containerof

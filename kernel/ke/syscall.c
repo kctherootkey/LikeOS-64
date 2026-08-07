@@ -4,6 +4,7 @@
 #include <kernel/ke/sched.h>
 #include <kernel/ke/syscall.h>
 #include <kernel/mm/memory.h>
+#include <kernel/mm/rwsem.h>
 #include <kernel/dev/input/keyboard.h>
 #include <kernel/fs/vfs.h>
 #include <kernel/uapi/status.h>
@@ -600,34 +601,9 @@ typedef struct {
 	long tv_usec;
 } k_timeval_t;
 
-// Find free mmap region slot
-static mmap_region_t *alloc_mmap_region(task_t *task)
-{
-	for (int i = 0; i < TASK_MAX_MMAP; i++) {
-		if (!task->mmap_regions[i].in_use) {
-			/* Scrub the recycled slot: stale fields (device,
-			 * file, lazy) from a previous mapping must never
-			 * leak into a new region. */
-			mm_memset(&task->mmap_regions[i], 0,
-				  sizeof(mmap_region_t));
-			return &task->mmap_regions[i];
-		}
-	}
-	return NULL;
-}
-
-// Find mmap region by address
-static mmap_region_t *find_mmap_region(task_t *task, uint64_t addr)
-{
-	for (int i = 0; i < TASK_MAX_MMAP; i++) {
-		mmap_region_t *r = &task->mmap_regions[i];
-		if (r->in_use && addr >= r->start &&
-		    addr < r->start + r->length) {
-			return r;
-		}
-	}
-	return NULL;
-}
+/* The mmap region table lives in the mm layer: mm_find_mmap_region(),
+ * mm_alloc_mmap_region() and mm_unmap_range_and_regions() (kernel/mm/memory.c,
+ * declared in kernel/mm/memory.h). */
 
 // SYS_READ - read from file descriptor
 static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
@@ -1233,6 +1209,9 @@ static int64_t sys_close(uint64_t fd)
 }
 
 // SYS_LSEEK - reposition file offset
+/* Defined further down, but every fd syscall from here on needs it. */
+static int fd_is_special(vfs_file_t *file);
+
 static int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence)
 {
 	task_t *cur = sched_current();
@@ -1253,9 +1232,10 @@ static int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence)
 
 	vfs_file_t *file = task_fds(cur)[fd];
 
-	// Check for console dup markers - not seekable
-	uint64_t marker = (uint64_t)file;
-	if (marker >= 1 && marker <= 3) {
+	/* Console dup markers, pipes, sockets and epoll instances are not
+	 * seekable -- and must not be handed to vfs_seek, which would take the
+	 * marker for a pointer. */
+	if (fd_is_special(file)) {
 		return -ESPIPE;
 	}
 
@@ -1485,6 +1465,44 @@ static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 		return -EBADF;
 	}
 	vfs_file_t *file = task_fds(cur)[fd];
+
+	/* Classify the tagged fd-table MARKERS before anything dereferences
+	 * `file'.  A socket, an AF_UNIX socket, an epoll instance and a dup'ed
+	 * console descriptor are all stored as small integers, not pointers, so
+	 * handing one to devfs_fstat() reads ->ops out of a bogus address and
+	 * faults the KERNEL.  fstat() on an AF_UNIX socket did exactly that:
+	 * 0x30009 is UNIX_SOCKET_FD_BASE + 9, and Claws Mail took the whole
+	 * system down with it on an ordinary fstat of its own socket.
+	 *
+	 * fd_link_target() above already classifies in this order; this is the
+	 * same set, and pipe_is_end() deliberately rejects every marker so it
+	 * cannot be relied on to catch them. */
+	uint64_t marker = (uint64_t)file;
+	if (marker >= 1 && marker <= 3) {
+		/* Console stdio marker planted by dup2. */
+		st.st_mode = S_IFCHR | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP |
+					S_IROTH | S_IWOTH);
+		st.st_rdev = ((uint64_t)5 << 8) | (marker - 1);
+		st.st_size = 0;
+		return copy_to_user((void *)stat_buf, &st, sizeof(st));
+	}
+	if (IS_SOCKET_FD(file) || IS_UNIX_SOCKET_FD(file)) {
+		st.st_mode = S_IFSOCK | (S_IRUSR | S_IWUSR);
+		st.st_ino = marker;
+		st.st_size = 0;
+		st.st_blksize = 4096;
+		return copy_to_user((void *)stat_buf, &st, sizeof(st));
+	}
+	if (IS_EPOLL_FD(file)) {
+		/* An anonymous inode: no type bits of its own, reported the way
+		 * the conventional interface does -- a regular file the caller
+		 * can neither read nor write through ordinary calls. */
+		st.st_mode = S_IFREG | (S_IRUSR | S_IWUSR);
+		st.st_ino = marker;
+		st.st_size = 0;
+		return copy_to_user((void *)stat_buf, &st, sizeof(st));
+	}
+
 	if (pipe_is_end(file)) {
 		st.st_mode = S_IFIFO | (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP |
 					S_IROTH | S_IWOTH);
@@ -1670,10 +1688,9 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t dirp, uint64_t count)
 	if (fd >= TASK_MAX_FDS || task_fds(cur)[fd] == NULL)
 		return -EBADF;
 	vfs_file_t *file = task_fds(cur)[fd];
-	uint64_t marker = (uint64_t)file;
-	if (marker >= 1 && marker <= 3)
-		return -ENOTDIR;
-	if (pipe_is_end(file))
+	/* Sockets and epoll instances were missing from this check, so
+	 * getdents64() on one reached vfs_readdir with a marker. */
+	if (fd_is_special(file))
 		return -ENOTDIR;
 	long ret = vfs_readdir(file, (void *)dirp, (long)count);
 	if (ret == ST_UNSUPPORTED)
@@ -1917,7 +1934,7 @@ static int64_t sys_shmdt(uint64_t shmaddr)
 	if (!cur || shmaddr == 0)
 		return -EINVAL;
 	cur = task_mm_owner(cur);
-	region = find_mmap_region(cur, shmaddr);
+	region = mm_find_mmap_region(cur, shmaddr);
 	/* Only the exact attach address detaches, as elsewhere. */
 	if (!region || region->start != shmaddr)
 		return -EINVAL;
@@ -2319,9 +2336,16 @@ static int64_t sys_settimeofday(uint64_t tv_ptr, uint64_t tz)
 }
 
 /* True for descriptors not backed by a real vfs_file_t: the stdio console dup
- * markers (1-3), pipe ends, and network / UNIX sockets.  These carry no on-disk
- * metadata, so fchmod/fchown/fsync are no-ops on them — and, importantly, their
- * "pointer" must never be dereferenced as a vfs_file_t. */
+ * markers (1-3), pipe ends, epoll instances, and network / UNIX sockets.  These
+ * carry no on-disk metadata, so fchmod/fchown/fsync are no-ops on them — and,
+ * importantly, their "pointer" must never be dereferenced as a vfs_file_t.
+ *
+ * EVERY fd syscall that reaches into the VFS has to ask this first.  They did
+ * not, and they did not agree with each other about which markers to look for:
+ * fstat() checked none of them and took the kernel down on an ordinary fstat of
+ * an AF_UNIX socket (0x30009 = UNIX_SOCKET_FD_BASE + 9), lseek() caught the
+ * console markers but not sockets, ftruncate() checked nothing at all, and
+ * epoll descriptors were absent from this predicate entirely. */
 static int fd_is_special(vfs_file_t *file)
 {
 	uint64_t marker = (uint64_t)file;
@@ -2330,6 +2354,8 @@ static int fd_is_special(vfs_file_t *file)
 	if (IS_UNIX_SOCKET_FD(file))
 		return 1;
 	if (IS_SOCKET_FD(file))
+		return 1;
+	if (IS_EPOLL_FD(file))
 		return 1;
 	if (pipe_is_end(file))
 		return 1;
@@ -2368,6 +2394,10 @@ static int64_t sys_ftruncate(uint64_t fd, uint64_t length)
 	if (fd >= TASK_MAX_FDS || task_fds(cur)[fd] == NULL)
 		return -EBADF;
 	vfs_file_t *file = task_fds(cur)[fd];
+	/* Only a real file has a length to set; POSIX gives EINVAL for the
+	 * rest, and dereferencing a marker here would fault the kernel. */
+	if (fd_is_special(file))
+		return -EINVAL;
 	int r = vfs_truncate(file, (unsigned long)length);
 	/* Truncating contents drops set-id bits for a non-privileged caller,
      * same as write() (see strip_setid_file for the once-per-inode fast-path). */
@@ -3797,6 +3827,10 @@ static int64_t sys_fsetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 	task_t *cur = sched_current();
 	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
 		return -EBADF;
+	/* An extended attribute belongs to an inode; a marker has none, and
+	 * passing one to the VFS would dereference it. */
+	if (fd_is_special(task_fds(cur)[fd]))
+		return -EOPNOTSUPP;
 	char kname[256];
 	int c = xattr_copy_name(u_name, kname);
 	if (c)
@@ -3839,6 +3873,8 @@ static int64_t sys_fgetxattr(uint64_t fd, uint64_t u_name, uint64_t u_val,
 	task_t *cur = sched_current();
 	if (!cur || fd >= TASK_MAX_FDS || !task_fds(cur)[fd])
 		return -EBADF;
+	if (fd_is_special(task_fds(cur)[fd]))
+		return -EOPNOTSUPP;
 	char kname[256];
 	int c = xattr_copy_name(u_name, kname);
 	if (c)
@@ -4084,7 +4120,32 @@ static int build_at_path(task_t *cur, int dirfd, const char *path, char *out,
 }
 
 // SYS_BRK - set program break
-static int64_t sys_brk(uint64_t new_brk)
+/* ---- address-space syscalls -------------------------------------------
+ *
+ * Every syscall that changes the SHAPE of the address space runs with the
+ * address-space semaphore held for writing, so it cannot race a page fault
+ * (which holds it for reading) on the same address space.  Threads share one
+ * page table, so without this an munmap and a fault on the same address ran
+ * concurrently by default.
+ *
+ * The bodies are written as *_locked() helpers with the ordinary many-return
+ * style, and the wrapper does the acquire/release exactly once -- adding an
+ * unlock to every return path is how one gets missed.
+ */
+#define RUN_WRITE_LOCKED(call)                                       \
+	do {                                                         \
+		task_t *__cur = sched_current();                     \
+		task_t *__mm = task_mm_owner(__cur);                 \
+		int64_t __ret;                                       \
+		if (!__mm)                                           \
+			return -EFAULT;                              \
+		mm_write_lock(&__mm->mmap_lock);                     \
+		__ret = (call);                                      \
+		mm_write_unlock(&__mm->mmap_lock);                   \
+		return __ret;                                        \
+	} while (0)
+
+static int64_t sys_brk_locked(uint64_t new_brk)
 {
 	task_t *cur = sched_current();
 	if (!cur)
@@ -4116,9 +4177,14 @@ static int64_t sys_brk(uint64_t new_brk)
 	return (int64_t)new_brk;
 }
 
+static int64_t sys_brk(uint64_t new_brk)
+{
+	RUN_WRITE_LOCKED(sys_brk_locked(new_brk));
+}
+
 // SYS_MMAP - map memory
-static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
-			uint64_t flags, uint64_t fd, uint64_t offset)
+static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
+			       uint64_t flags, uint64_t fd, uint64_t offset)
 {
 	task_t *cur = sched_current();
 	if (!cur)
@@ -4147,14 +4213,42 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 	}
 
 	// Find a free mmap region slot
-	mmap_region_t *region = alloc_mmap_region(cur);
+	mmap_region_t *region = mm_alloc_mmap_region(cur);
 	if (!region) {
 		/* Loud on purpose: a process that runs out of region slots
 		 * fails every subsequent mmap, which downstream looks like a
-		 * random allocation crash rather than a table limit. */
-		WARN_RATELIMIT(1,
-			       "mmap: pid %d out of mmap regions (max %d)",
-			       cur->id, TASK_MAX_MMAP);
+		 * random allocation crash rather than a table limit -- a
+		 * dlopen() failing here is reported by the loader as "cannot
+		 * find", which sends the reader looking for a missing file.
+		 *
+		 * The breakdown says WHY the table is full, which the bare
+		 * count does not: file-backed entries are libraries and their
+		 * segments (four per shared object, so a large dependency graph
+		 * alone accounts for hundreds), while anonymous ones are heap,
+		 * thread stacks and large allocations.  Whichever dominates is
+		 * where to look. */
+		int n_file = 0, n_anon = 0, n_lazy = 0;
+		uint64_t anon_bytes = 0;
+
+		for (int i = 0; i < TASK_MAX_MMAP; i++) {
+			mmap_region_t *r = &cur->mmap_regions[i];
+
+			if (!r->in_use)
+				continue;
+			if (r->file) {
+				n_file++;
+			} else {
+				n_anon++;
+				anon_bytes += r->length;
+			}
+			if (r->lazy)
+				n_lazy++;
+		}
+		WARN_RATELIMIT(
+			1,
+			"mmap: pid %d out of mmap regions (max %d): %d file-backed, %d anonymous (%llu KB), %d lazy",
+			cur->id, TASK_MAX_MMAP, n_file, n_anon,
+			(unsigned long long)(anon_bytes / 1024), n_lazy);
 		return -ENOMEM;
 	}
 
@@ -4169,6 +4263,16 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 			return -EINVAL;
 		}
 		vaddr = addr;
+
+		/* MAP_FIXED replaces whatever is already here, so tear the old
+		 * mapping down properly: free its pages AND release its region
+		 * records.  Doing this for every MAP_FIXED path (rather than
+		 * only the lazy one, which is all that used to unmap anything)
+		 * is what keeps the region table from filling up -- rtld maps
+		 * every DSO segment this way.  It also stops a stale record
+		 * from shadowing the new mapping in mm_find_mmap_region(), which
+		 * would report the old file and protection for these pages. */
+		mm_unmap_range_and_regions(cur, vaddr, length);
 	} else {
 		// Allocate from mmap area (grows down from below stack)
 		// Move base down first, then return the new base as the start of the mapped region
@@ -4335,8 +4439,9 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 	 *
 	 * MAP_FIXED over an existing mapping must not leave stale pages in
 	 * place (a lazy region would otherwise never fault there and expose
-	 * the old contents), so clear the range first.  This also fixes the
-	 * old eager path silently overwriting live PTEs (leaking the pages). */
+	 * the old contents).  That teardown now happens for every MAP_FIXED
+	 * path where vaddr is settled, above, which also stops the eager path
+	 * from silently overwriting live PTEs and leaking the pages. */
 	/* PROT_NONE takes the lazy path even when MAP_SHARED is asked for: the
 	 * mapping has no accessible contents, so there is nothing for the eager
 	 * path to share, and the fault handler above already refuses PROT_NONE
@@ -4344,11 +4449,8 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 	 * pages that are freely readable — i.e. PROT_NONE would not protect. */
 	bool prot_none = !(prot & (PROT_READ | PROT_WRITE | PROT_EXEC));
 	if (!(flags & MAP_SHARED) || prot_none) {
-		if (flags & MAP_FIXED) {
-			for (uint64_t off = 0; off < length; off += PAGE_SIZE)
-				mm_unmap_page_in_address_space(cur->pml4,
-							       vaddr + off);
-		}
+		/* No unmap here: MAP_FIXED already tore down the old mapping,
+		 * pages and region records both, where vaddr was settled. */
 		if (backing)
 			vfs_incref(backing);
 		region->start = vaddr;
@@ -4431,8 +4533,15 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 	return (int64_t)vaddr;
 }
 
+static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
+			uint64_t flags, uint64_t fd, uint64_t offset)
+{
+	RUN_WRITE_LOCKED(sys_mmap_locked(addr, length, prot, flags, fd,
+					 offset));
+}
+
 // SYS_MUNMAP - unmap memory
-static int64_t sys_munmap(uint64_t addr, uint64_t length)
+static int64_t sys_munmap_locked(uint64_t addr, uint64_t length)
 {
 	task_t *cur = sched_current();
 	if (!cur)
@@ -4448,55 +4557,14 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length)
 
 	length = PAGE_ALIGN(length);
 
-	/* Iterate through all mmap regions that overlap [addr, addr+length).
-     * This supports the common case of a single munmap call covering
-     * multiple contiguous MAP_FIXED regions (e.g. the full span of a DSO). */
-	uint64_t cur_addr = addr;
-	uint64_t end_addr = addr + length;
-	int freed_any = 0;
+	/* Handles the common case of a single munmap call covering multiple
+	 * contiguous MAP_FIXED regions (e.g. the full span of a DSO). */
+	return mm_unmap_range_and_regions(cur, addr, length) ? 0 : -EINVAL;
+}
 
-	while (cur_addr < end_addr) {
-		mmap_region_t *region = find_mmap_region(cur, cur_addr);
-		if (!region) {
-			/* No region covers cur_addr — skip forward one page. */
-			cur_addr += PAGE_SIZE;
-			continue;
-		}
-
-		uint64_t region_end = region->start + region->length;
-		uint64_t unmap_end =
-			(end_addr < region_end) ? end_addr : region_end;
-
-		/* Unmap pages within [cur_addr, unmap_end). */
-		for (uint64_t va = cur_addr; va < unmap_end; va += PAGE_SIZE)
-			mm_unmap_page_in_address_space(cur->pml4, va);
-
-		/* Update or free the region record. */
-		if (cur_addr == region->start && unmap_end == region_end) {
-			region->in_use = false;
-			if (region->file) {
-				vfs_close(region->file);
-				region->file = NULL;
-			}
-			region->lazy = false;
-		} else if (cur_addr == region->start) {
-			/* Keep file_off = offset + (addr - start) invariant
-			 * when the region head is trimmed. */
-			region->offset += unmap_end - region->start;
-			region->start = unmap_end;
-			region->length = region_end - unmap_end;
-		} else if (unmap_end == region_end) {
-			region->length = cur_addr - region->start;
-		} else {
-			/* Mid-region split not supported; leave the region intact
-             * but still unmap the pages. */
-		}
-
-		freed_any = 1;
-		cur_addr = region_end;
-	}
-
-	return freed_any ? 0 : -EINVAL;
+static int64_t sys_munmap(uint64_t addr, uint64_t length)
+{
+	RUN_WRITE_LOCKED(sys_munmap_locked(addr, length));
 }
 
 // SYS_PIPE - create a pipe
@@ -6233,8 +6301,17 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 			child->pml4 = cur->pml4;
 		}
 	} else {
-		// COW clone of address space
-		uint64_t *child_pml4 = mm_clone_address_space(cur->pml4);
+		/* COW clone of address space.  Held for writing for the same
+		 * reason as the fork path in the scheduler: marking the parent
+		 * copy-on-write and taking the child's reference must not be
+		 * interleaved with a fault in another thread resolving the very
+		 * page being marked. */
+		task_t *mm_owner = task_mm_owner(cur);
+		uint64_t *child_pml4;
+
+		mm_write_lock(&mm_owner->mmap_lock);
+		child_pml4 = mm_clone_address_space(cur->pml4);
+		mm_write_unlock(&mm_owner->mmap_lock);
 		if (!child_pml4) {
 			mm_free_guarded_kstack(k_stack_mem, KERNEL_STACK_SIZE);
 			kfree(child);
@@ -6510,15 +6587,47 @@ static void sys_exit_group(uint64_t status)
 	leader->group_exiting = true;
 	leader->group_exit_code = (int)status;
 
-	// Signal all threads in the group to exit (except ourselves)
-	task_t *t = leader;
-	do {
-		if (t != cur && !t->has_exited) {
-			// Send SIGKILL to force immediate termination
-			sched_signal_task(t, SIGKILL);
-		}
-		t = t->thread_group_next;
-	} while (t != leader);
+	/*
+	 * Signal every other thread in the group to exit.
+	 *
+	 * COLLECT under g_task_list_lock, SIGNAL after releasing it.
+	 *
+	 * The list is maintained by thread_group_remove(), which unlinks a
+	 * dying thread under that lock -- and the task_t is freed and poisoned
+	 * shortly afterwards.  Walking it unlocked therefore races a thread
+	 * exiting on another CPU and follows `thread_group_next' straight into
+	 * freed memory: observed as a general protection fault in here with
+	 * t == 0xdeadbeefdeadbeef, taking the whole system down.  It went
+	 * unnoticed for as long as it did because nothing routed an ordinary
+	 * process exit through exit_group; now that _exit() does, every exit
+	 * of a threaded program runs this loop.
+	 *
+	 * Signalling cannot happen under the lock -- sched_signal_task() takes
+	 * scheduler locks and may queue a siginfo -- hence the two passes.
+	 */
+	task_t *targets[TASK_GROUP_KILL_MAX];
+	int ntargets = 0;
+	uint64_t tg_flags;
+
+	spin_lock_irqsave(&g_task_list_lock, &tg_flags);
+	{
+		task_t *t = leader;
+
+		do {
+			if (t != cur && !t->has_exited) {
+				if (ntargets < TASK_GROUP_KILL_MAX)
+					targets[ntargets++] = t;
+				else
+					WARN_ON_ONCE(
+						1); /* exit_group: more threads than the kill batch holds; the rest exit on the next pass */
+			}
+			t = t->thread_group_next;
+		} while (t != leader);
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, tg_flags);
+
+	for (int i = 0; i < ntargets; i++)
+		sched_signal_task(targets[i], SIGKILL);
 
 	// Now exit ourselves
 	sched_mark_task_exited(cur, (int)status);
@@ -6571,6 +6680,8 @@ static int64_t sys_set_tid_address(uint64_t tidptr)
 #define FUTEX_WAIT_BITSET 9
 #define FUTEX_WAKE_BITSET 10
 #define FUTEX_PRIVATE_FLAG 128
+#define FUTEX_CLOCK_REALTIME 256
+#define FUTEX_BITSET_MATCH_ANY 0xFFFFFFFFu
 
 // SYS_FUTEX - fast userspace mutex operations (uses hash-bucket implementation)
 static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
@@ -6578,7 +6689,20 @@ static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 {
 	(void)val3; // Used for FUTEX_CMP_REQUEUE comparison value
 
-	int cmd = op & ~FUTEX_PRIVATE_FLAG;
+	/*
+	 * Strip the modifier bits before dispatching.
+	 *
+	 * FUTEX_CLOCK_REALTIME selects which clock an ABSOLUTE timeout is
+	 * measured against; it is not a command.  Leaving it in the switch
+	 * value meant FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME (265) matched
+	 * nothing and fell through to -ENOSYS -- which is what GLib issues for
+	 * every g_cond_wait_until(), so every timed condition wait in every
+	 * GLib program returned instantly instead of waiting.  A caller that
+	 * treats that as "timed out" then spins; GTK's file chooser loads its
+	 * folder through a GThreadPool that does exactly this, and hung.
+	 */
+	int cmd = op & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
+	int abs_realtime = (op & FUTEX_CLOCK_REALTIME) != 0;
 
 	if (!validate_user_ptr(uaddr, sizeof(uint32_t))) {
 		return -EFAULT;
@@ -6604,7 +6728,59 @@ static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 		return futex_wait(uaddr, (uint32_t)val, timeout_ns);
 	}
 
+	case FUTEX_WAIT_BITSET: {
+		/*
+		 * Like FUTEX_WAIT, except the timeout is ABSOLUTE -- against
+		 * CLOCK_REALTIME when FUTEX_CLOCK_REALTIME is set, else
+		 * CLOCK_MONOTONIC -- and waiters carry a bitset that a
+		 * FUTEX_WAKE_BITSET must match.
+		 *
+		 * The bitset is accepted and ignored: every waiter here is
+		 * created with all bits set, and the only caller in this system
+		 * (GLib) passes FUTEX_BITSET_MATCH_ANY, for which "match all"
+		 * IS the correct answer.  A selective bitset would need the
+		 * value plumbed into futex_wait/futex_wake; there is nothing to
+		 * exercise it yet, and guessing at it would be untested code.
+		 */
+		uint64_t timeout_ns = 0;
+
+		if (timeout) {
+			if (validate_user_ptr(timeout,
+					      sizeof(struct k_timespec))) {
+				struct k_timespec ts;
+
+				smap_disable();
+				ts = *(struct k_timespec *)timeout;
+				smap_enable();
+
+				uint64_t deadline_ns =
+					(uint64_t)ts.tv_sec * 1000000000ULL +
+					(uint64_t)ts.tv_nsec;
+				uint64_t now_ns =
+					timer_get_precise_us() * 1000ULL;
+
+				if (abs_realtime)
+					now_ns += (uint64_t)timer_get_boot_epoch() *
+						  1000000000ULL;
+
+				/* Absolute -> relative, which is what
+				 * futex_wait takes.  An already-past deadline
+				 * must not become an infinite wait: the 0 that
+				 * futex_wait reads as "no timeout" is exactly
+				 * the wrong answer, so report the timeout
+				 * without sleeping. */
+				if (deadline_ns <= now_ns)
+					return -ETIMEDOUT;
+				timeout_ns = deadline_ns - now_ns;
+			}
+		}
+		return futex_wait(uaddr, (uint32_t)val, timeout_ns);
+	}
+
 	case FUTEX_WAKE:
+	case FUTEX_WAKE_BITSET:
+		/* The bitset (val3) is ignored for the reason given above: all
+		 * waiters match, which is right for FUTEX_BITSET_MATCH_ANY. */
 		return futex_wake(uaddr, (int)val);
 
 	case FUTEX_REQUEUE:
@@ -7022,7 +7198,53 @@ static int64_t sys_sched_rr_get_interval(uint64_t pid, uint64_t tp_ptr)
 }
 
 // SYS_MPROTECT - change memory protection
-static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
+/*
+ * madvise(2).  MADV_DONTNEED releases the pages of a range and leaves the
+ * mapping alone, so the next touch reads a fresh zero page; every other advice
+ * is a hint this kernel has nothing to do about, and returns success because
+ * that is what advisory means.
+ *
+ * The one that matters is DONTNEED.  Without it, an allocator wanting to give
+ * physical memory back has only munmap, which cuts the mapping in two and
+ * spends a region record on every trim.
+ */
+static int64_t sys_madvise_locked(uint64_t addr, uint64_t length,
+				  uint64_t advice)
+{
+	task_t *cur = task_mm_owner(sched_current());
+
+	if (!cur)
+		return -EFAULT;
+	if (addr & (PAGE_SIZE - 1))
+		return -EINVAL; /* the address must be page aligned */
+	if (length == 0)
+		return 0;
+	if (addr >= 0x0000800000000000ULL ||
+	    addr + length < addr)
+		return -EINVAL;
+
+	switch (advice) {
+	case MADV_DONTNEED:
+		mm_dontneed_range(cur, addr, length);
+		return 0;
+	case MADV_NORMAL:
+	case MADV_RANDOM:
+	case MADV_SEQUENTIAL:
+	case MADV_WILLNEED:
+	case MADV_DONTDUMP:
+	case MADV_DODUMP:
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int64_t sys_madvise(uint64_t addr, uint64_t length, uint64_t advice)
+{
+	RUN_WRITE_LOCKED(sys_madvise_locked(addr, length, advice));
+}
+
+static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 {
 	task_t *cur = sched_current();
 	if (!cur) {
@@ -7105,6 +7327,11 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
 	smp_tlb_shootdown_sync();
 
 	return 0;
+}
+
+static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot)
+{
+	RUN_WRITE_LOCKED(sys_mprotect_locked(addr, len, prot));
 }
 
 // reboot() magic numbers and commands
@@ -7283,6 +7510,9 @@ static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 		p->start_tick = t->start_tick;
 		p->utime_ticks = t->utime_ticks;
 		p->stime_ticks = t->stime_ticks;
+		/* Only meaningful while the task is actually asleep; a running
+		 * task's last blocking site would be a stale answer. */
+		p->wchan = (t->state == TASK_BLOCKED) ? t->wchan_rip : 0;
 
 		// Real and effective credentials of the process.
 		p->uid = (int)t->cred.uid;
@@ -7304,8 +7534,12 @@ static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 				if (t->mmap_regions[i].in_use)
 					p->vsz += t->mmap_regions[i].length;
 			}
-			// RSS: rough estimate (VSZ/4096 as pages, assume all resident)
-			p->rss = p->vsz / 4096;
+			/* RSS: the pages actually resident, counted from the
+			 * page tables -- not VSZ restated, which is what this
+			 * used to report.  A process that returns physical
+			 * memory but keeps its address space looked like an
+			 * unbounded leak under the old number. */
+			p->rss = mm_count_resident_pages(t->pml4);
 		}
 
 		// Copy comm
@@ -7563,7 +7797,10 @@ sys_select_wrapper(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 		uint64_t tv_sec = 0, tv_usec = 0;
 		copy_from_user(&tv_sec, (void *)a5, 8);
 		copy_from_user(&tv_usec, (void *)(a5 + 8), 8);
-		timeout_ticks = tv_sec * 100 + tv_usec / 10000;
+		/* Converted at the measured tick rate.  This used to assume
+		 * 100Hz, so on a machine whose calibrated rate is ~200Hz every
+		 * select() timeout expired in half the requested time. */
+		timeout_ticks = timer_us_to_ticks(tv_sec * 1000000ULL + tv_usec);
 		if (tv_sec == 0 && tv_usec == 0)
 			timeout_ticks = 0;
 	}
@@ -7601,7 +7838,11 @@ sys_pselect6_wrapper(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 		long tv_nsec = 0;
 		copy_from_user(&tv_sec, (void *)a5, 8);
 		copy_from_user(&tv_nsec, (void *)(a5 + 8), 8);
-		timeout_ticks = tv_sec * 100 + (uint64_t)tv_nsec / 10000000;
+		/* Measured tick rate, rounded up.  `tv_sec * 100 + tv_nsec/1e7'
+		 * assumed a 10ms tick and truncated the remainder, so this
+		 * expired early on both counts. */
+		timeout_ticks = timer_ns_to_ticks(tv_sec * 1000000000ULL +
+						  (uint64_t)tv_nsec);
 		if (tv_sec == 0 && tv_nsec == 0)
 			timeout_ticks = 0;
 	}
@@ -7639,7 +7880,10 @@ sys_poll_wrapper(uint64_t a1, uint64_t a2, uint64_t a3)
 	else if (timeout_ms == 0)
 		timeout_ticks = 0;
 	else
-		timeout_ticks = (uint64_t)timeout_ms / 10;
+		/* Measured tick rate, rounded up: `ms / 10' assumed a 10ms tick
+		 * AND discarded the remainder, so this returned early twice
+		 * over -- a 200ms poll() came back in about 129ms. */
+		timeout_ticks = timer_ms_to_ticks((uint64_t)timeout_ms);
 	int ret = sys_poll_internal(kfds, nfds, timeout_ticks);
 	copy_to_user((void *)a1, kfds, sz);
 	return ret;
@@ -7662,7 +7906,11 @@ sys_ppoll_wrapper(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 		long tv_nsec = 0;
 		copy_from_user(&tv_sec, (void *)a3, 8);
 		copy_from_user(&tv_nsec, (void *)(a3 + 8), 8);
-		timeout_ticks = tv_sec * 100 + (uint64_t)tv_nsec / 10000000;
+		/* Measured tick rate, rounded up.  `tv_sec * 100 + tv_nsec/1e7'
+		 * assumed a 10ms tick and truncated the remainder, so this
+		 * expired early on both counts. */
+		timeout_ticks = timer_ns_to_ticks(tv_sec * 1000000000ULL +
+						  (uint64_t)tv_nsec);
 		if (tv_sec == 0 && tv_nsec == 0)
 			timeout_ticks = 0;
 	}
@@ -7698,7 +7946,10 @@ sys_epoll_wait_wrapper(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 	else if (timeout_ms == 0)
 		timeout_ticks = 0;
 	else
-		timeout_ticks = (uint64_t)timeout_ms / 10;
+		/* Measured tick rate, rounded up: `ms / 10' assumed a 10ms tick
+		 * AND discarded the remainder, so this returned early twice
+		 * over -- a 200ms poll() came back in about 129ms. */
+		timeout_ticks = timer_ms_to_ticks((uint64_t)timeout_ms);
 	int ret = epoll_wait_internal(ep_idx, kevs, maxevents, timeout_ticks);
 	if (ret > 0)
 		copy_to_user((void *)a2, kevs,
@@ -8377,6 +8628,9 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		return sys_sched_rr_get_interval(a1, a2);
 	case SYS_MPROTECT:
 		return sys_mprotect(a1, a2, a3);
+
+	case SYS_MADVISE:
+		return sys_madvise(a1, a2, a3);
 
 	case SYS_REBOOT:
 		return sys_reboot(a1, a2, a3, a4);
@@ -9397,7 +9651,14 @@ dns_str_done:
 
 	case SYS_RAW_RECV: {
 		// a1 = subcmd (1=ICMP reply, 2=ARP reply)
-		// a2 = ptr to result struct, a3 = expected_id or target_ip, a4 = timeout_ticks
+		// a2 = ptr to result struct, a3 = expected_id or target_ip,
+		// a4 = timeout in MILLISECONDS (0 = default).
+		//
+		// Milliseconds, not ticks: the tick rate is measured at boot
+		// and is not a number userspace can know, yet this used to take
+		// a tick count -- so ping, arping and traceroute each did their
+		// own `seconds * 100' and every one of them waited for the
+		// wrong length of time on a machine whose rate was not 100Hz.
 		int subcmd = (int)a1;
 		if (subcmd == 1) {
 			// ICMP reply
@@ -9408,7 +9669,7 @@ dns_str_done:
 			uint16_t seq = 0;
 			uint16_t expected_id = (uint16_t)(a3 >> 16);
 			uint16_t expected_seq = (uint16_t)(a3 & 0xFFFF);
-			uint64_t timeout = a4 ? a4 : 500; // default 5s at 100Hz
+			uint64_t timeout = timer_ms_to_ticks(a4 ? a4 : 5000);
 			uint64_t rtt_us = 0;
 			int ret = icmp_recv_reply(&src_ip, expected_id, &type,
 						  &code, &seq, timeout, &rtt_us,
@@ -9439,7 +9700,7 @@ dns_str_done:
 			if (!validate_user_ptr(a2, 6))
 				return -EFAULT;
 			uint32_t target_ip = (uint32_t)a3;
-			uint64_t timeout = a4 ? a4 : 500;
+			uint64_t timeout = timer_ms_to_ticks(a4 ? a4 : 5000);
 			uint8_t mac[6];
 			int ret = arp_recv_reply(target_ip, mac, timeout);
 			if (ret == 0) {

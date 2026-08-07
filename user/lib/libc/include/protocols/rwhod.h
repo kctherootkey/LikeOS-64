@@ -20,6 +20,10 @@
 #ifndef _PROTOCOLS_RWHOD_H
 #define _PROTOCOLS_RWHOD_H 1
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <stdint.h>
 
@@ -53,5 +57,9 @@ struct whod {
  * are.  Included here because 4.3BSD defined it in this header and code still
  * expects to get it by including only this one. */
 #include <paths.h>
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _PROTOCOLS_RWHOD_H */

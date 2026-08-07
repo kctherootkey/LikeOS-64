@@ -12,7 +12,17 @@ struct vfs_file;
 struct tty;
 struct task;
 
-// Maximum file descriptors per task
+/* Maximum file descriptors per task.
+ *
+ * Userspace must be told the same number: OPEN_MAX in user/lib/libc/limits.h,
+ * which FOPEN_MAX, NOFILE, sysconf(_SC_OPEN_MAX), getdtablesize() and
+ * getrlimit(RLIMIT_NOFILE) all derive from.  They disagreed for a long time --
+ * libc said 256 while this said 1024 -- so anything that sized a table by what
+ * libc reported got a quarter of the descriptors it could actually have.
+ *
+ * Not free to raise: task_t embeds fd_table[] and fd_flags[] (9 KB at 1024, of
+ * a 56 KB task_t) and fork() copies all of it, and files_struct_t embeds the
+ * same pair again.  1024 is what a conventional system offers by default. */
 #define TASK_MAX_FDS 1024
 
 // Maximum memory regions per task (for mmap tracking)
@@ -22,7 +32,22 @@ struct task;
  * dlopen'd driver modules — needs well over a hundred.  Raising this grows
  * task_t; see the note in sched_fork_current() about not copying the table
  * onto the kernel stack. */
-#define TASK_MAX_MMAP 256
+/*
+ * Per-task mmap region slots.
+ *
+ * One slot per PT_LOAD segment, not per library, and a shared object has four
+ * of them (rodata, text, relro, data).  Claws Mail pulls in 58 libraries =
+ * 230 segments before it has mapped a heap, a thread stack or a single
+ * dlopen'd module; at 256 it ran out partway through dlopening the spell
+ * checker, and the loader -- which cannot report "out of address space", only
+ * "cannot find" -- said the library was missing.
+ *
+ * 512 is twice the measured peak.  It is not free: task_t embeds the array, so
+ * this is 40KB per task and fork() memcpy's all of it, which is why it is a
+ * measured number rather than a generous one.  Exhaustion is at least loud now
+ * (the WARN in sys_mmap names the pid and the limit).
+ */
+#define TASK_MAX_MMAP 512
 
 // ============================================================================
 // CPU FEATURE FLAGS
@@ -69,6 +94,36 @@ static inline void spinlock_init(spinlock_t *lock, const char *name)
 	lock->owner_cpu = 0xFFFFFFFF;
 	lock->name = name;
 }
+
+/* ============================================================================
+ * mm_rwsem_t — the address-space read/write semaphore
+ *
+ * A SLEEPING lock, so it may only be taken from process context.  It lives
+ * here rather than in the mm headers because it is embedded in task_t and
+ * spinlock_t is defined just above; the operations are declared in
+ * <kernel/mm/rwsem.h> and implemented in kernel/mm/rwsem.c.
+ *
+ * Held for READING by anything that only walks the address space — the page
+ * fault handlers and the pre-fault shield.  Held for WRITING by anything that
+ * changes its shape: mmap, munmap, mprotect, brk, fork's clone of the parent,
+ * exec's teardown and address-space destruction.  Until this existed, nothing
+ * at all serialised those two groups: threads share one page table, so a fault
+ * and an unmap of the same address ran concurrently by default.
+ * ========================================================================== */
+typedef struct mm_rwsem {
+	volatile int readers; /* active shared holders                     */
+	volatile int writer; /* 1 while exclusive is held                 */
+	volatile uint64_t owner; /* exclusive owner's task id                 */
+	volatile int wdepth; /* exclusive recursion depth                 */
+	volatile int w_wait; /* writers queued (fairness hint)            */
+	spinlock_t lock; /* protects the fields above                 */
+} mm_rwsem_t;
+
+#define MM_RWSEM_INIT(n)                                              \
+	{                                                             \
+		.readers = 0, .writer = 0, .owner = (uint64_t)-1,     \
+		.wdepth = 0, .w_wait = 0, .lock = SPINLOCK_INIT(n)    \
+	}
 
 // Acquire spinlock (SMP-safe using atomic compare-and-swap)
 // On UP systems, we don't spin - interrupts must be disabled by caller
@@ -491,8 +546,30 @@ typedef struct task {
 	// Memory management (legacy - used when mm == NULL)
 	uint64_t brk; // Current program break (heap end)
 	uint64_t brk_start; // Initial program break (heap start)
+	/* Kernel return address of whoever put this task to sleep -- the
+	 * WCHAN.  A hung process otherwise says nothing about WHY it is hung,
+	 * and "ps shows it blocked" is not a diagnosis.  Recorded in
+	 * sched_schedule() from the caller's return address, so no blocking
+	 * site has to remember to set anything, and symbolised offline:
+	 *   rm build/kernel.elf && make NO_STRIP=1
+	 *   addr2line -f -e build/kernel.elf <wchan>
+	 */
+	uint64_t wchan_rip;
+
 	mmap_region_t mmap_regions[TASK_MAX_MMAP]; // mmap'd regions
 	uint64_t mmap_base; // Base address for mmap allocations
+
+	/* Guards this address space: the region table above, mmap_base, brk,
+	 * and the page tables under `pml4`.  Only the THREAD-GROUP LEADER's
+	 * copy is ever used — reach it through task_mm_owner(), exactly like
+	 * the fields it protects. */
+	mm_rwsem_t mmap_lock;
+	/* Depth of this task's SHARED holds of any mmap_lock.  A nested shared
+	 * acquisition (a fault taken while the pre-fault shield already holds
+	 * the lock) must not defer to a queued writer, or the two deadlock:
+	 * the writer waits for the first hold to drain and the first hold
+	 * waits behind the writer.  Mirrors fs_rdepth above. */
+	int mm_rdepth;
 
 	// ========================================================================
 	// THREAD GROUP SUPPORT (POSIX threads / clone)
@@ -680,6 +757,20 @@ task_t *sched_task_by_canary(
 void sched_add_child(task_t *parent, task_t *child); // Add child to parent
 void sched_remove_child(task_t *parent,
 			task_t *child); // Remove child from parent
+/* Tell a task's parent it has finished (wake waitpid, send SIGCHLD, or reap it
+ * when the parent ignores SIGCHLD).  Idempotent. */
+void sched_notify_parent_of_exit(task_t *task);
+
+/* Threads signalled in one batch when a group is torn down. A larger group is
+ * not a correctness problem: group_exiting is already set, so the stragglers go
+ * on the next pass. */
+#define TASK_GROUP_KILL_MAX 64
+
+/* Terminate every OTHER thread of `task`'s group.  Used by exit_group and by a
+ * fatal default-action signal, which ends the PROCESS and not just the thread
+ * that received it. */
+void sched_kill_thread_group(task_t *task, int exit_code);
+
 void sched_reparent_children(
 	task_t *task); // Reparent children to init (task 1)
 uint32_t sched_get_ppid(task_t *task); // Get parent PID

@@ -405,6 +405,21 @@ static void *sysmalloc(struct malloc_state *av, size_t nb);
 static void tcache_maybe_init(void);
 static void malloc_init_once(void);
 
+/* Lower bound on a neighbouring chunk's size, for the sanity checks below.
+ *
+ * The RAW header, flags included -- deliberately not chunksize(), which masks
+ * them off.  A fencepost, the closed 16-byte marker written at the end of an
+ * old top when an arena grows into a new heap, has a size of exactly
+ * CHUNK_HDR_SZ and always carries PREV_INUSE, so its raw header is
+ * CHUNK_HDR_SZ + 1 and passes, while its masked size is CHUNK_HDR_SZ and does
+ * not.  Since the chunk freed immediately after fenceposting has that very
+ * fencepost as its neighbour, comparing the masked size made EVERY growth of a
+ * secondary arena abort the process with a corruption report about memory that
+ * was entirely intact -- and secondary arenas exist only in threaded programs,
+ * so it went unseen until one arrived.
+ */
+#define chunksize_raw(p)   ((p)->mchunk_size)
+
 /* ------------------------------------------------------------------ */
 /* Bin list surgery                                                   */
 /* ------------------------------------------------------------------ */
@@ -940,9 +955,20 @@ static int systrim(struct malloc_state *av, size_t pad)
 }
 
 /* Physically release the used-then-freed page span inside a non-main
- * heap's top chunk.  Interior unmaps of a demand-paged mapping drop the
- * pages while keeping the range valid: the next touch faults in zeros.
- * The last page of the heap is always kept so the unmap stays interior. */
+ * heap's top chunk.
+ *
+ * MADV_DONTNEED, not munmap: it drops the pages and leaves the mapping alone,
+ * so the range keeps reading as zeros when the heap grows back into it.  That
+ * is the whole intent here -- the address space is still ours, only the
+ * physical memory is being returned.
+ *
+ * Unmapping was used for this and it was the wrong tool.  It punches a hole in
+ * the middle of the heap mapping, which the kernel has to record as two
+ * mappings where there was one, so every trim spent one of a fixed number of
+ * mapping records.  A long-running program that allocates and frees in cycles
+ * ran the table out; the mmap() that then failed was nowhere near the trim
+ * that caused it, and the failures it produced (a library unable to allocate,
+ * an encoder silently giving up) pointed nowhere useful. */
 static int heap_release_top(struct malloc_state *av, size_t pad, size_t min_release)
 {
     if (!av->top)
@@ -960,7 +986,7 @@ static int heap_release_top(struct malloc_state *av, size_t pad, size_t min_rele
     if (re <= rs || (size_t)(re - rs) < min_release)
         return 0;
 
-    munmap(rs, (size_t)(re - rs));
+    madvise(rs, (size_t)(re - rs), MADV_DONTNEED);
     if (h->dirty_top > rs)
         h->dirty_top = rs;
     return 1;
@@ -1123,7 +1149,15 @@ static void *_int_malloc(struct malloc_state *av, size_t nb)
                 malloc_printerr("malloc(): invalid size (unsorted)", victim);
             mchunkptr nextu = chunk_at_offset(victim, size);
             size_t nextu_size = chunksize(nextu);
-            if (nextu_size <= CHUNK_HDR_SZ || nextu_size > av->system_mem ||
+            /* Strictly less here, where the other three sites use <=.
+             * victim is FREE -- it is sitting in the unsorted bin -- so the
+             * PREV_INUSE bit of the chunk after it has been cleared, and a
+             * fencepost neighbour's raw header is exactly CHUNK_HDR_SZ rather
+             * than CHUNK_HDR_SZ + 1.  At the free and realloc sites the chunk
+             * is still marked in use and the bit is still set, so <= is right
+             * there and would reject the fencepost here. */
+            if (chunksize_raw(nextu) < CHUNK_HDR_SZ ||
+                nextu_size > av->system_mem ||
                 nextu->mchunk_prev_size != size)
                 malloc_printerr("malloc(): invalid next size (unsorted)", victim);
             if (bck->fd != victim || victim->fd != unsorted)
@@ -1389,7 +1423,7 @@ static void _int_free(struct malloc_state *av, mchunkptr p, int have_lock)
             av->top && (char *)nextp > (char *)av->top)
             malloc_printerr("double free or corruption (out, fast)", p);
         size_t nextsz = chunksize(nextp);
-        if (nextsz <= CHUNK_HDR_SZ || nextsz > av->system_mem)
+        if (chunksize_raw(nextp) <= CHUNK_HDR_SZ || nextsz > av->system_mem)
             malloc_printerr("free(): invalid next size (fast)", p);
 
         unsigned idx = fastbin_index(size);
@@ -1428,7 +1462,8 @@ static void _int_free(struct malloc_state *av, mchunkptr p, int have_lock)
         malloc_printerr("double free or corruption (!prev)", p);
 
     size_t nextsize = chunksize(nextchunk);
-    if (nextsize <= CHUNK_HDR_SZ || nextsize > av->system_mem)
+    if (chunksize_raw(nextchunk) <= CHUNK_HDR_SZ ||
+        nextsize > av->system_mem)
         malloc_printerr("free(): invalid next size (normal)", p);
 
     free_perturb(chunk2mem(p), size - CHUNK_HDR_SZ);
@@ -1672,7 +1707,7 @@ void *realloc(void *oldmem, size_t bytes)
     mchunkptr next = chunk_at_offset(p, oldsize);
     size_t nextsize = chunksize(next);
 
-    if (nextsize <= CHUNK_HDR_SZ || nextsize > av->system_mem)
+    if (chunksize_raw(next) <= CHUNK_HDR_SZ || nextsize > av->system_mem)
         malloc_printerr("realloc(): invalid next size", p);
 
     if (oldsize >= nb) {

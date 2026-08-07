@@ -1,6 +1,10 @@
 #ifndef _SYS_KLOG_H
 #define _SYS_KLOG_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* klogctl operations (same as syslog(2) type argument) */
 #define SYSLOG_ACTION_READ       2
 #define SYSLOG_ACTION_READ_ALL   3
@@ -9,5 +13,9 @@
 #define SYSLOG_ACTION_SIZE_BUFFER 10
 
 int klogctl(int type, char *bufp, int len);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SYS_KLOG_H */

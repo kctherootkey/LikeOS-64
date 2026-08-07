@@ -12,7 +12,22 @@
 
 typedef struct { intmax_t quot, rem; } imaxdiv_t;
 
-#define __PRI64_PREFIX  "ll"
+/*
+ * The length modifier for a 64-bit conversion.
+ *
+ * "l", not "ll", because <stdint.h> defines int64_t as `long` on this target
+ * -- x86-64 is LP64, where long is already 64 bits.  These two headers have to
+ * agree: the macros exist precisely so that a caller can print an int64_t
+ * without knowing which type it is, and if they disagree the promise is broken
+ * in the one place nobody looks.
+ *
+ * It said "ll" and so contradicted <stdint.h>.  With int64_t being long, every
+ * printf("%" PRIi64, x) passed a long to a %lli conversion.  It happened to
+ * work -- the two are the same width and are passed identically -- which is
+ * why it went unnoticed; the compiler says so, and GLib builds with
+ * -Werror=format, which is where it finally surfaced.
+ */
+#define __PRI64_PREFIX  "l"
 #define __PRIPTR_PREFIX "l"
 
 #define PRId8  "d"

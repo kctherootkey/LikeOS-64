@@ -33,6 +33,7 @@
 #include <kernel/ke/sched.h>
 #include <kernel/io/console.h>
 #include <kernel/mm/memory.h>
+#include <kernel/mm/rwsem.h>
 #include <kernel/ke/interrupt.h>
 #include <kernel/uapi/types.h>
 #include <kernel/fs/vfs.h>
@@ -808,6 +809,11 @@ static void task_init_common(task_t *t)
 	t->mmap_base = 0;
 	for (int i = 0; i < TASK_MAX_MMAP; i++)
 		t->mmap_regions[i].in_use = false;
+	/* One address-space lock per task_t; only the group leader's is ever
+	 * taken (see task_mm_owner), but every task_t carries an initialised
+	 * one so a thread that is later promoted to leader has a valid lock. */
+	mm_rwsem_init(&t->mmap_lock, "mmap_lock");
+	t->mm_rdepth = 0;
 
 	// Thread group support
 	t->tgid = t->id; // Will be set properly after id is assigned
@@ -1078,6 +1084,13 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	 * foreign kernel stack (observed: bootstrap task "resumed" inside a
 	 * user task's sys_execve frames → canary mismatch, found == the
 	 * fork-parent's canary live on another CPU). */
+	/* Whoever is about to sleep records where it went to sleep.  Level 0 is
+	 * this function's own return address, which is the blocking call site --
+	 * exactly what is wanted, and it costs one store on a path that is
+	 * about to context-switch anyway.  Taken before the IRQ save so it is
+	 * the caller's address and not something from the switch itself. */
+	void *blocked_at = __builtin_return_address(0);
+
 	uint64_t flags = local_irq_save();
 	percpu_t *cpu = this_cpu();
 	task_t *cur = cpu->current_task;
@@ -1085,6 +1098,11 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 		local_irq_restore(flags);
 		return;
 	}
+
+	/* Only a task that is actually going to sleep has a WCHAN; a voluntary
+	 * yield or a preemption is still runnable and keeps whatever it had. */
+	if (cur->state == TASK_BLOCKED)
+		cur->wchan_rip = (uint64_t)blocked_at;
 
 	spin_lock(&cpu->runqueue_lock);
 
@@ -1558,21 +1576,44 @@ void sched_reparent_children(task_t *task)
 {
 	if (!task)
 		return;
+	/*
+	 * Orphans go to INIT, which reaps them -- not to the bootstrap task,
+	 * which does not.
+	 *
+	 * That is the whole point of reparenting to pid 1: a live child handed
+	 * to a parent that never calls waitpid() becomes a permanent zombie the
+	 * moment it exits, because nobody is left to collect its status.  This
+	 * used to hand them to g_bootstrap_task, and the comment here even said
+	 * bootstrap never waits -- but only the ZOMBIE case was given a way out.
+	 * A LIVE child was simply parked there to become one later.
+	 *
+	 * `claws-mail &' from the window manager's menu is the shape of it: the
+	 * shell that backgrounded it exits at once, the program is reparented,
+	 * and its eventual exit leaves a zombie for good.  One per launch.
+	 *
+	 * Zombies keep the deferred-reap path: their status has no one waiting
+	 * for it, and destroying them here avoids having to wake an init that
+	 * is already blocked in waitpid().
+	 */
+	task_t *reaper = g_init_task;
+
+	/* No init yet (early boot), or init itself is what is dying: bootstrap
+	 * is all that is left.  Deferred reap still catches the zombies. */
+	if (!reaper || reaper == task || reaper->state == TASK_ZOMBIE)
+		reaper = &g_bootstrap_task;
+
 	task_t *child = task->first_child;
 	while (child) {
 		task_t *nxt = child->next_sibling;
-		/* Bootstrap (PID 0) never calls waitpid.  If we'd reparent a
-         * zombie to it, the zombie would live forever.  Queue it for
-         * deferred reaping instead. */
+
 		if (child->state == TASK_ZOMBIE) {
-			child->parent =
-				&g_bootstrap_task; /* keep field consistent */
+			child->parent = reaper; /* keep the field consistent */
 			child->next_sibling = NULL;
 			dead_thread_queue(child);
 		} else {
-			child->parent = &g_bootstrap_task;
-			child->next_sibling = g_bootstrap_task.first_child;
-			g_bootstrap_task.first_child = child;
+			child->parent = reaper;
+			child->next_sibling = reaper->first_child;
+			reaper->first_child = child;
 		}
 		child = nxt;
 	}
@@ -1764,13 +1805,24 @@ task_t *sched_fork_current(void)
 		}
 	}
 
+	/* Cloning write-protects every page of the PARENT as it goes, and takes
+	 * a reference on each.  A page fault in another thread of this process
+	 * must not run in the middle of that: it holds the address-space
+	 * semaphore for reading, and would otherwise be free to resolve a
+	 * copy-on-write page -- deciding the page is unshared and making it
+	 * writable again -- between our marking it and our taking the
+	 * reference.  Parent and child would then share a writable page. */
+	task_t *mm_owner = task_mm_owner(cur);
 	uint64_t *child_pml4;
+
+	mm_write_lock(&mm_owner->mmap_lock);
 	if (has_shared) {
 		child_pml4 = mm_clone_address_space_with_shared(
 			cur->pml4, cur->mmap_regions, TASK_MAX_MMAP);
 	} else {
 		child_pml4 = mm_clone_address_space(cur->pml4);
 	}
+	mm_write_unlock(&mm_owner->mmap_lock);
 	if (!child_pml4) {
 		kfree(child);
 		return NULL;
@@ -2139,6 +2191,124 @@ void sched_wake_expired_sleepers(uint64_t current_tick)
 	}
 }
 
+/*
+ * Tell a task's parent that it has finished: wake a waitpid() sleeper, queue
+ * the SIGCHLD, and -- if the parent does not want zombies -- reap it instead.
+ *
+ * Shared by the two moments a process can actually become reapable: when it
+ * exits with no threads outstanding, and when the LAST thread of a group goes
+ * after the leader has already exited.  The second one had no notification at
+ * all, so a threaded program's leader stayed a zombie for good.
+ *
+ * Safe to call more than once: the first call clears exit_signal (either by
+ * reaping or by sending), and every later one sees zero and does nothing.
+ */
+/*
+ * Terminate every OTHER thread of a task's group.
+ *
+ * A signal whose default action is Term or Core ends the PROCESS, not the
+ * thread that happened to receive it -- POSIX is explicit, and it is what every
+ * program assumes: abort() from a corrupted heap, or a SIGSEGV in one worker,
+ * must take the whole thing down.  Killing only the receiving thread leaves the
+ * rest running, so the program does not die, it HANGS: Claws Mail's malloc
+ * detected heap corruption, called abort(), and the process sat there with its
+ * remaining threads still scheduled.
+ *
+ * Same shape as sys_exit_group(): collect under g_task_list_lock, signal after
+ * releasing it.  The list is maintained under that lock and a dying thread's
+ * task_t is freed shortly after it is unlinked, so walking it unlocked follows
+ * a stale pointer into freed memory.
+ */
+void sched_kill_thread_group(task_t *task, int exit_code)
+{
+	if (!task)
+		return;
+
+	task_t *leader = task->group_leader ? task->group_leader : task;
+
+	leader->group_exiting = true;
+	leader->group_exit_code = exit_code;
+
+	task_t *targets[TASK_GROUP_KILL_MAX];
+	int n = 0;
+	uint64_t flags;
+
+	spin_lock_irqsave(&g_task_list_lock, &flags);
+	{
+		task_t *t = leader;
+
+		do {
+			if (t != task && !t->has_exited &&
+			    n < TASK_GROUP_KILL_MAX)
+				targets[n++] = t;
+			t = t->thread_group_next;
+		} while (t != leader);
+	}
+	spin_unlock_irqrestore(&g_task_list_lock, flags);
+
+	for (int i = 0; i < n; i++)
+		sched_signal_task(targets[i], SIGKILL);
+}
+
+void sched_notify_parent_of_exit(task_t *task)
+{
+	if (!task || task->exit_signal == 0)
+		return;
+
+	task_t *parent = task->parent;
+
+	if (!parent || parent->has_exited)
+		return;
+
+	/*
+	 * A parent that IGNORES SIGCHLD gets no zombies.
+	 *
+	 * POSIX: with SIGCHLD set to SIG_IGN, or a handler carrying
+	 * SA_NOCLDWAIT, a child's status is discarded and it is reaped as it
+	 * exits.  Programs lean on this instead of writing a reaper -- ctwm
+	 * does `signal(SIGCHLD, SIG_IGN)' and then launches everything from its
+	 * root menu without ever calling wait().  Reparenting cannot help: the
+	 * parent is alive and simply never asks.
+	 */
+	if (parent->sighand) {
+		struct k_sigaction *sa = &parent->sighand->action[SIGCHLD];
+
+		if (sa->sa_handler == SIG_IGN ||
+		    (sa->sa_flags & SA_NOCLDWAIT)) {
+			/* Unlink first: waitpid() must not be able to find a
+			 * task that is about to be freed.  Clearing exit_signal
+			 * routes it to dead_thread_queue at the next switch,
+			 * which is the only safe place to free it. */
+			sched_remove_child(parent, task);
+			task->parent = &g_bootstrap_task;
+			task->exit_signal = 0;
+			return;
+		}
+	}
+
+	/* Wake a parent parked in waitpid... */
+	if (parent->state == TASK_BLOCKED && parent->wait_channel == parent)
+		sched_wake_task(parent);
+
+	/* ...and signal one that instead polls and relies on a SIGCHLD handler.
+	 * Both are needed; see the note at the other call site. */
+	{
+		siginfo_t ci;
+
+		mm_memset(&ci, 0, sizeof(ci));
+		ci.si_signo = task->exit_signal;
+		ci.si_pid = (int32_t)task->id;
+		if (task->term_sig != 0) {
+			ci.si_code = CLD_KILLED;
+			ci.si_status = task->term_sig;
+		} else {
+			ci.si_code = CLD_EXITED;
+			ci.si_status = task->exit_code & 0xFF;
+		}
+		signal_send(parent, task->exit_signal, &ci);
+	}
+}
+
 void sched_mark_task_exited(task_t *task, int status)
 {
 	if (!task)
@@ -2259,6 +2429,31 @@ void sched_mark_task_exited(task_t *task, int status)
 	// first waits for the task to stop running on ALL CPUs.
 	// (task->mm and task->pml4 are intentionally kept alive here.)
 
+	/*
+	 * The last thread of a group has gone, and the leader already exited:
+	 * only NOW is the process really over, so only now can its parent be
+	 * told.
+	 *
+	 * sched_mark_task_exited() on the leader suppresses the notification
+	 * while nr_threads > 0 -- correctly, the process is not finished -- but
+	 * nothing ever came back to it afterwards.  exit_group() makes that the
+	 * normal case: the leader marks itself exited while the threads it just
+	 * SIGKILLed are still on their way out, so the parent was never told at
+	 * all and the leader stayed a zombie for the life of the session.  One
+	 * per run of any threaded program; single-threaded ones were never
+	 * affected, which is why xterm was fine and Claws Mail was not.
+	 *
+	 * thread_group_remove() above has already decremented nr_threads, so
+	 * this sees the true count.
+	 */
+	{
+		task_t *ldr = task->group_leader;
+
+		if (ldr && ldr != task && ldr->has_exited &&
+		    ldr->nr_threads == 0 && ldr->exit_signal != 0)
+			sched_notify_parent_of_exit(ldr);
+	}
+
 	/* Close all open fds.  CRITICAL: vfs_close on a regular file calls
      * fat32_close → pagecache_flush_file, which takes the FAT32 sleeping
      * mutex.  Sleeping is illegal with IRQs disabled — and one of the
@@ -2308,14 +2503,6 @@ void sched_mark_task_exited(task_t *task, int status)
 		should_notify_parent = false; // Still have threads running
 	}
 
-	// Wake parent if blocked in waitpid
-	if (should_notify_parent && task->parent &&
-	    task->parent->state == TASK_BLOCKED) {
-		if (task->parent->wait_channel == task->parent) {
-			sched_wake_task(task->parent);
-		}
-	}
-
 	/* Orphan reaping: if this task's parent is bootstrap (PID 0), no one
      * will ever waitpid() on it.  Mark it the same way thread zombies are
      * marked so that the next context switch defers it for reaping.  We
@@ -2325,37 +2512,25 @@ void sched_mark_task_exited(task_t *task, int status)
 		/* Reuse the thread-zombie path: clearing exit_signal makes
          * sched_switch_to() route this task to dead_thread_queue. */
 		task->exit_signal = 0;
+		should_notify_parent = false;
 	}
 
 	local_irq_restore(irq_flags);
 
-	/* Now actually SEND the exit signal (normally SIGCHLD) to the parent.
-	 * Waking a parent that happens to be blocked in waitpid (above) is not
-	 * enough: a parent that instead sits in poll()/select() and relies on a
-	 * SIGCHLD *handler* to learn that a child died never heard anything, so
-	 * it never reaped the child.  That is why an sshd session stayed open
-	 * after its shell exited — sshd polls, and its SIGCHLD handler is what
-	 * triggers sending the exit status and closing the channel.
+	/* Tell the parent, through the one function that knows the policy:
+	 * wake a waitpid() sleeper, queue the SIGCHLD for a parent that polls
+	 * and relies on a handler instead (an sshd session stayed open after
+	 * its shell exited for want of exactly that), or reap the task outright
+	 * when the parent ignores SIGCHLD.
 	 *
-	 * Deliberately outside the IRQ-disabled section above: queuing a
-	 * siginfo allocates, which may sleep.  signal_send() itself is a no-op
-	 * when the parent leaves SIGCHLD at its default (ignored) disposition,
-	 * so a shell that only ever calls waitpid() pays nothing. */
-	if (should_notify_parent && task->parent && !task->parent->has_exited &&
-	    task->exit_signal != 0) {
-		siginfo_t ci;
-		mm_memset(&ci, 0, sizeof(ci));
-		ci.si_signo = task->exit_signal;
-		ci.si_pid = (int32_t)task->id;
-		if (task->term_sig != 0) {
-			ci.si_code = CLD_KILLED;
-			ci.si_status = task->term_sig;
-		} else {
-			ci.si_code = CLD_EXITED;
-			ci.si_status = task->exit_code & 0xFF;
-		}
-		signal_send(task->parent, task->exit_signal, &ci);
-	}
+	 * Deliberately outside the IRQ-disabled section: queuing a siginfo
+	 * allocates, which may sleep.
+	 *
+	 * A thread-group LEADER whose threads have not all gone yet is not
+	 * finished, so should_notify_parent is false here; the last thread to
+	 * leave calls this for it. */
+	if (should_notify_parent)
+		sched_notify_parent_of_exit(task);
 }
 
 // ============================================================================

@@ -337,10 +337,9 @@ int main(int argc, char *argv[])
 		g_sent++;
 
 		/* Wait for reply */
-		uint64_t timeout_ticks = (uint64_t)timeout * 100;
+		uint64_t timeout_ms = (uint64_t)timeout * 1000;
 		icmp_reply_t reply;
-		ret = raw_recv(RAW_RECV_ICMP_REPLY, &reply, id_seq,
-			       timeout_ticks);
+		ret = raw_recv(RAW_RECV_ICMP_REPLY, &reply, id_seq, timeout_ms);
 		if (ret == 0) {
 			gettimeofday(&tv_recv, NULL);
 			g_received++;

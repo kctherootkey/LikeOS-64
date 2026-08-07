@@ -1,6 +1,10 @@
 #ifndef _NETINET_TCP_H
 #define _NETINET_TCP_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 
 // TCP-level (IPPROTO_TCP) sockopts — must match include/kernel/net/net.h.
@@ -64,5 +68,9 @@ struct tcp_info {
     uint32_t tcpi_rcv_space;
     uint32_t tcpi_total_retrans;
 };
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _NETINET_TCP_H */

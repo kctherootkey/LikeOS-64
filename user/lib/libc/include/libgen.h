@@ -10,7 +10,7 @@ extern "C" {
 
 /* Returns the directory component of a pathname.
  * NOTE: may modify the input string. */
-static inline char *dirname(char *path)
+static __inline char *dirname(char *path)
 {
     static char dot[] = ".";
     if (!path || !*path)
@@ -18,7 +18,8 @@ static inline char *dirname(char *path)
 
     /* Find last slash */
     char *last_slash = (char *)0;
-    for (char *p = path; *p; p++) {
+    char *p;
+    for (p = path; *p; p++) {
         if (*p == '/')
             last_slash = p;
     }
@@ -36,7 +37,7 @@ static inline char *dirname(char *path)
 
 /* Returns the filename component of a pathname.
  * NOTE: may modify the input string. */
-static inline char *basename(char *path)
+static __inline char *basename(char *path)
 {
     static char dot[] = ".";
     if (!path || !*path)
@@ -49,7 +50,8 @@ static inline char *basename(char *path)
 
     /* Find last slash */
     char *last_slash = (char *)0;
-    for (char *p = path; *p; p++) {
+    char *p;
+    for (p = path; *p; p++) {
         if (*p == '/')
             last_slash = p;
     }

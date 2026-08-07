@@ -7,6 +7,7 @@
 #include <kernel/ke/smp.h>
 #include <kernel/mm/slab.h>
 #include <kernel/ke/sched.h> // For spinlock_t
+#include <kernel/mm/rwsem.h> // address-space semaphore
 #include <kernel/uapi/bug.h>
 #include <kernel/fs/pagecache.h> // pagecache_get_stats for memstat breakdown
 #include <kernel/fs/vfs.h> // demand paging: file-backed page-in
@@ -906,8 +907,10 @@ uint64_t mm_allocate_physical_page(void)
 	uint64_t phys = mm_state.memory_start + (page * PAGE_SIZE);
 	WARN_ON(phys &
 		(PAGE_SIZE - 1)); /* allocated page is not page-aligned */
+	/* One reference: the one the caller is about to hold.  A page in use
+	 * always counts at least one, so zero unambiguously means free. */
 	if (mm_state.page_refcounts) {
-		mm_state.page_refcounts[page] = 0;
+		mm_state.page_refcounts[page] = 1;
 	}
 
 	spin_unlock_irqrestore(&mm_phys_lock, flags);
@@ -961,8 +964,18 @@ void mm_free_physical_page(uint64_t physical_address)
 		g_alloc_hint = page;
 	}
 
-	// Clear refcount
+	/* Releasing a page that others still reference is the bug this whole
+	 * rewrite is about, so say so.  One reference is normal and expected:
+	 * it is the allocator's own, held by kernel-internal callers (page
+	 * tables, slab, DMA buffers) that never share a page and free it
+	 * directly rather than through mm_put_page().  Zero is what
+	 * mm_put_page() leaves behind when the last reference goes.  Anything
+	 * above one means a live mapping is about to be poisoned. */
 	if (mm_state.page_refcounts) {
+		WARN_RATELIMIT(mm_state.page_refcounts[page] > 1,
+			       "mm_free_physical_page: releasing 0x%lx with %u references still held",
+			       (unsigned long)physical_address,
+			       mm_state.page_refcounts[page]);
 		mm_state.page_refcounts[page] = 0;
 	}
 
@@ -1031,6 +1044,13 @@ uint64_t mm_allocate_contiguous_pages(size_t page_count)
 				for (size_t i = 0; i < page_count; i++) {
 					set_page_bit(start_page + i);
 					mm_state.free_pages--;
+					/* Each frame carries the caller's one
+					 * reference, exactly as the single-page
+					 * allocator does — the run is released
+					 * a frame at a time. */
+					if (mm_state.page_refcounts)
+						mm_state.page_refcounts
+							[start_page + i] = 1;
 				}
 				next_fit_hint = start_page + page_count;
 				uint64_t result = mm_state.memory_start +
@@ -1584,6 +1604,106 @@ void mm_unmap_page(uint64_t virtual_addr)
 	}
 }
 
+/* ============================================================================
+ * Batched unmap: flush first, free second
+ *
+ * Clearing a page-table entry ends the translation on THIS CPU only.  Any
+ * other CPU that has touched the address still holds it in its TLB and will
+ * keep reaching the page until something invalidates it there too.  Releasing
+ * the page before that happens hands it back to the allocator while it is
+ * still reachable -- and since freed pages are poisoned, the old owner starts
+ * reading 0xFEEDFACE out of memory it believes is its own, while a new owner
+ * may be handed the same page.
+ *
+ * So an unmap has to be done in that order: clear the entries, invalidate them
+ * everywhere, and only then drop the references.  This gather collects the
+ * pages of a range so one invalidation covers the whole batch -- tearing down
+ * a 2MB thread stack is 512 pages, and a cross-CPU round trip each would cost
+ * far more than the unmap itself.
+ *
+ * The whole-address-space teardowns do not need this: mm_destroy_address_space
+ * is called only after its callers have already invalidated everywhere (see
+ * sched.c and elf_loader.c, which shoot down immediately before).  It is the
+ * per-range unmap -- munmap, and MAP_FIXED replacing an existing mapping --
+ * that had no cross-CPU invalidation at all.
+ * ========================================================================== */
+
+void mm_tlb_gather_init(struct mm_tlb_gather *g)
+{
+	BUG_ON(g == NULL);
+	g->n = 0;
+}
+
+/* Queue a page whose page-table entry has ALREADY been cleared.  Its reference
+ * is deliberately still held: that is what keeps the page from being reused
+ * before the invalidation below. */
+void mm_tlb_gather_page(struct mm_tlb_gather *g, uint64_t phys)
+{
+	BUG_ON(g == NULL);
+	if (!phys)
+		return;
+	if (g->n == MM_TLB_GATHER_BATCH)
+		mm_tlb_gather_flush(g);
+	g->pages[g->n++] = phys;
+}
+
+void mm_tlb_gather_flush(struct mm_tlb_gather *g)
+{
+	BUG_ON(g == NULL);
+	if (g->n == 0)
+		return;
+
+	/* Invalidate everywhere before a single reference is dropped. */
+	if (sched_is_smp()) {
+		if (likely(!irqs_disabled())) {
+			smp_tlb_shootdown_sync();
+		} else {
+			/* Cannot be done from here: the ack-wait needs to be
+			 * able to service the very interrupts it is waiting on.
+			 * Freeing anyway is no worse than the behaviour this
+			 * replaces, but the caller wants fixing, so name it. */
+			WARN_RATELIMIT(
+				1,
+				"TLB gather flushed with interrupts disabled - other CPUs keep stale translations to pages about to be released");
+		}
+	}
+
+	for (unsigned i = 0; i < g->n; i++)
+		mm_put_page(g->pages[i]);
+	g->n = 0;
+}
+
+/*
+ * Clear one page-table entry and hand its page to the gather.
+ *
+ * The reference is NOT dropped here -- mm_tlb_gather_flush() drops it once the
+ * translation is gone from every CPU.  Returns nothing; a device mapping or an
+ * absent entry simply queues nothing.
+ */
+static void mm_unmap_page_gathered(uint64_t *pml4, uint64_t virtual_addr,
+				   struct mm_tlb_gather *g)
+{
+	uint64_t *pte = mm_get_page_table_from_pml4(pml4, virtual_addr, false);
+	uint64_t phys;
+
+	if (!pte || !(*pte & PAGE_PRESENT))
+		return;
+
+	/* Device MMIO is not allocator-owned: clear the entry, queue nothing. */
+	if (*pte & PAGE_DEVICE) {
+		*pte = 0;
+		if (pml4 == mm_get_current_address_space())
+			mm_flush_tlb(virtual_addr);
+		return;
+	}
+
+	phys = *pte & 0x000FFFFFFFFFF000ULL;
+	*pte = 0;
+	if (pml4 == mm_get_current_address_space())
+		mm_flush_tlb(virtual_addr);
+	mm_tlb_gather_page(g, phys);
+}
+
 // Unmap virtual page in a specific address space
 void mm_unmap_page_in_address_space(uint64_t *pml4, uint64_t virtual_addr)
 {
@@ -1600,26 +1720,346 @@ void mm_unmap_page_in_address_space(uint64_t *pml4, uint64_t virtual_addr)
 			}
 			return;
 		}
-		// Free the physical page - mask out flags (bits 0-11) AND upper reserved/NX bits
+		/* Drop this mapping's reference.  The page goes away only when
+		 * it was the last one, so a page still mapped elsewhere (a COW
+		 * page shared with a forked child, say) survives.  Kernel pages
+		 * hold exactly the allocator's own reference, so the same call
+		 * releases them outright. */
 		uint64_t phys = *pte & 0x000FFFFFFFFFF000ULL;
-		if (phys) {
-			if (*pte & PAGE_USER) {
-				// User page: use refcount to properly handle shared/COW pages.
-				// mm_decref_page returns true when the last reference is dropped
-				// (or if the page was never ref-tracked, i.e. refcount==0).
-				if (mm_decref_page(phys)) {
-					mm_free_physical_page(phys);
-				}
-			} else {
-				mm_free_physical_page(phys);
-			}
-		}
+
 		*pte = 0;
+		if (phys)
+			mm_put_page(phys);
 		// Flush TLB if this is the current address space
 		if (pml4 == mm_get_current_address_space()) {
 			mm_flush_tlb(virtual_addr);
 		}
 	}
+}
+
+/* ---- the task's mmap region table ---------------------------------------
+ *
+ * The records describing what a process has mapped.  They sit next to the
+ * unmap machinery above because the two must move together: a record and its
+ * pages are one thing, and every bug in this area so far has been the two
+ * getting out of step.
+ */
+
+/* Claim a free region slot.  in_use is left false -- the caller sets it once
+ * the mapping is fully built, so a failure part-way leaks nothing. */
+mmap_region_t *mm_alloc_mmap_region(task_t *task)
+{
+	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+		if (!task->mmap_regions[i].in_use) {
+			/* Scrub the recycled slot: stale fields (device,
+			 * file, lazy) from a previous mapping must never
+			 * leak into a new region. */
+			mm_memset(&task->mmap_regions[i], 0,
+				  sizeof(mmap_region_t));
+			return &task->mmap_regions[i];
+		}
+	}
+	return NULL;
+}
+
+/* Find the in-use region covering `addr`, or NULL. */
+mmap_region_t *mm_find_mmap_region(task_t *task, uint64_t addr)
+{
+	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+		mmap_region_t *r = &task->mmap_regions[i];
+		if (r->in_use && addr >= r->start &&
+		    addr < r->start + r->length) {
+			return r;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * Tear down every mapping in [addr, addr+length): free the pages AND release
+ * or trim the mmap_region_t records that covered them.  Returns 1 if anything
+ * was found, 0 if the range held no mapping.
+ *
+ * Both munmap and MAP_FIXED need exactly this.  MAP_FIXED used to unmap the
+ * pages and leave the records behind, so every remap of an existing mapping
+ * burned a region slot permanently -- and rtld does MAP_FIXED for every DSO
+ * segment.  Claws Mail reached the 512-slot cap with 510 records still marked
+ * lazy and 893MB of "anonymous" that no longer existed, after which every
+ * mmap() returned -ENOMEM: GTK could not map its GResource bundle, so
+ * GtkFileChooserDialog's template failed to build and the attach dialog came
+ * up as an empty box with two buttons.
+ */
+/*
+ * Are these two records really one mapping?
+ *
+ * A mapping is identified by what it describes, not by the call that happened
+ * to create it.  Two records that abut and agree on every property are one
+ * region, and recording them separately is what makes the table grow without
+ * bound: a program that trims and re-grows a heap in cycles spends a slot on
+ * every cycle until mmap() starts failing -- far from the code responsible,
+ * and usually inside some library that reports nothing useful.
+ */
+static bool mm_regions_mergeable(const mmap_region_t *a, const mmap_region_t *b)
+{
+	if (!a->in_use || !b->in_use)
+		return false;
+	if (a->start + a->length != b->start) /* must abut exactly */
+		return false;
+	if (a->prot != b->prot || a->flags != b->flags)
+		return false;
+	if (a->lazy != b->lazy || a->device != b->device)
+		return false;
+	if (a->file != b->file)
+		return false;
+	/* Same file: the offsets have to run on without a break, or the two
+	 * halves are showing different parts of it. */
+	if (a->file && a->offset + a->length != b->offset)
+		return false;
+	return true;
+}
+
+/*
+ * Coalesce every run of adjacent, identical records into one.
+ *
+ * Run after anything that changes the shape of the table.  Quadratic in the
+ * worst case over a table of a few hundred entries, which is nothing beside the
+ * page work the same operations do, and it only runs when the shape actually
+ * changed.
+ */
+void mm_merge_mmap_regions(task_t *task)
+{
+	if (!task)
+		return;
+
+	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+		mmap_region_t *a = &task->mmap_regions[i];
+
+		if (!a->in_use)
+			continue;
+		/* Absorb successors for as long as one abuts this record. */
+		for (;;) {
+			int found = -1;
+
+			for (int j = 0; j < TASK_MAX_MMAP; j++) {
+				if (j == i)
+					continue;
+				if (mm_regions_mergeable(a,
+							 &task->mmap_regions[j])) {
+					found = j;
+					break;
+				}
+			}
+			if (found < 0)
+				break;
+			{
+				mmap_region_t *b = &task->mmap_regions[found];
+
+				a->length += b->length;
+				/* Each record held its own reference; the one
+				 * that goes away drops its own. */
+				if (b->file)
+					vfs_close(b->file);
+				b->file = NULL;
+				b->in_use = false;
+				b->length = 0;
+			}
+		}
+	}
+}
+
+/*
+ * Count the pages a task actually has resident.
+ *
+ * Walks the user half of the page tables and counts what is present.  This is
+ * the real resident set: what the process would lose if it were killed, as
+ * opposed to how much address space it has reserved.
+ *
+ * The two are very different numbers here, and reporting one as the other is
+ * misleading in a specific and expensive way: an allocator that hands physical
+ * memory back while keeping its address space -- which is exactly what
+ * releasing pages with MADV_DONTNEED does -- looks like a process leaking
+ * without bound, because the address space only ever grows.
+ */
+uint64_t mm_count_resident_pages(uint64_t *pml4)
+{
+	uint64_t pages = 0;
+
+	if (!pml4)
+		return 0;
+
+	/* User half only; entries 256+ are the kernel's and shared by all. */
+	for (int i = 0; i < 256; i++) {
+		if (!(pml4[i] & PAGE_PRESENT))
+			continue;
+		uint64_t *pdpt =
+			(uint64_t *)phys_to_virt(pml4[i] & PTE_ADDR_MASK);
+
+		for (int j = 0; j < 512; j++) {
+			if (!(pdpt[j] & PAGE_PRESENT))
+				continue;
+			if (pdpt[j] & PAGE_SIZE_FLAG) { /* 1GB */
+				pages += 512ULL * 512ULL;
+				continue;
+			}
+			uint64_t *pd = (uint64_t *)phys_to_virt(pdpt[j] &
+								PTE_ADDR_MASK);
+
+			for (int k = 0; k < 512; k++) {
+				if (!(pd[k] & PAGE_PRESENT))
+					continue;
+				if (pd[k] & PAGE_SIZE_FLAG) { /* 2MB */
+					pages += 512;
+					continue;
+				}
+				uint64_t *pt = (uint64_t *)phys_to_virt(
+					pd[k] & PTE_ADDR_MASK);
+
+				for (int l = 0; l < 512; l++) {
+					/* Device mappings are somebody else's
+					 * memory (a framebuffer BAR); they are
+					 * mapped, not held. */
+					if ((pt[l] & PAGE_PRESENT) &&
+					    !(pt[l] & PAGE_DEVICE))
+						pages++;
+				}
+			}
+		}
+	}
+	return pages;
+}
+
+/*
+ * Drop the pages of [addr, addr+length) without touching the mapping.
+ *
+ * The mapping, its region record and its protections all survive; only the
+ * physical pages go.  A later access finds nothing present, the fault handler
+ * sees the region is still there, and materialises a fresh zero page -- so the
+ * caller gets its memory back and the range keeps reading as zeros.
+ *
+ * This exists because an allocator that trims a heap wants exactly this and
+ * nothing else.  Reaching for munmap instead punches a hole in the middle of a
+ * live mapping, which has to be recorded as two records where there was one,
+ * and costs a region slot on every trim.  A long-running program that allocates
+ * and frees in cycles exhausts the table that way -- the mmap that then fails
+ * is nowhere near the code that caused it, and what it breaks (an allocation
+ * deep inside a library) rarely reports anything useful.
+ *
+ * Only whole pages are released: a partial page at either end still holds live
+ * data belonging to the caller.
+ */
+void mm_dontneed_range(task_t *task, uint64_t addr, uint64_t length)
+{
+	uint64_t start = (addr + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+	uint64_t end = (addr + length) & ~(uint64_t)(PAGE_SIZE - 1);
+	struct mm_tlb_gather gather;
+
+	mm_assert_write_locked(&task->mmap_lock);
+	WARN_ON(irqs_disabled());
+	if (end <= start)
+		return;
+
+	mm_tlb_gather_init(&gather);
+	for (uint64_t va = start; va < end; va += PAGE_SIZE) {
+		mmap_region_t *r = mm_find_mmap_region(task, va);
+
+		/* Only inside a mapping this task actually has, and never a
+		 * file-backed one: dropping those would lose writes that were
+		 * never written back. */
+		if (!r || r->file)
+			continue;
+		mm_unmap_page_gathered(task->pml4, va, &gather);
+	}
+	mm_tlb_gather_flush(&gather);
+}
+
+int mm_unmap_range_and_regions(task_t *task, uint64_t addr, uint64_t length)
+{
+	uint64_t cur_addr = addr;
+	uint64_t end_addr = addr + length;
+	int freed_any = 0;
+	struct mm_tlb_gather gather;
+
+	/* Runs with the address-space semaphore held for writing, from a
+	 * syscall -- so the cross-CPU invalidation the gather performs is
+	 * legal here.  Asserted rather than assumed: flushing with interrupts
+	 * disabled cannot invalidate anywhere but locally. */
+	mm_assert_write_locked(&task->mmap_lock);
+	WARN_ON(irqs_disabled());
+	mm_tlb_gather_init(&gather);
+
+	while (cur_addr < end_addr) {
+		mmap_region_t *region = mm_find_mmap_region(task, cur_addr);
+		if (!region) {
+			/* No region covers cur_addr — skip forward one page. */
+			cur_addr += PAGE_SIZE;
+			continue;
+		}
+
+		uint64_t region_end = region->start + region->length;
+		uint64_t unmap_end =
+			(end_addr < region_end) ? end_addr : region_end;
+
+		/* Clear the entries within [cur_addr, unmap_end).  The pages
+		 * are not released yet -- the gather holds them until every
+		 * CPU has dropped the translation. */
+		for (uint64_t va = cur_addr; va < unmap_end; va += PAGE_SIZE)
+			mm_unmap_page_gathered(task->pml4, va, &gather);
+
+		/* Update or free the region record. */
+		if (cur_addr == region->start && unmap_end == region_end) {
+			region->in_use = false;
+			if (region->file) {
+				vfs_close(region->file);
+				region->file = NULL;
+			}
+			region->lazy = false;
+		} else if (cur_addr == region->start) {
+			/* Keep file_off = offset + (addr - start) invariant
+			 * when the region head is trimmed. */
+			region->offset += unmap_end - region->start;
+			region->start = unmap_end;
+			region->length = region_end - unmap_end;
+		} else if (unmap_end == region_end) {
+			region->length = cur_addr - region->start;
+		} else {
+			/* The range falls strictly inside the region, so the
+			 * two surviving halves need two records.  malloc trims
+			 * the middle out of its mmapped chunks, so this is a
+			 * real case, not a corner: leaving one record spanning
+			 * the hole would let a fault in the freed middle
+			 * silently materialise a fresh anonymous page. */
+			mmap_region_t *tail = mm_alloc_mmap_region(task);
+
+			if (tail) {
+				*tail = *region;
+				tail->start = unmap_end;
+				tail->length = region_end - unmap_end;
+				tail->offset = region->offset +
+					       (unmap_end - region->start);
+				/* Each record closes its own reference. */
+				if (tail->file)
+					vfs_incref(tail->file);
+				tail->in_use = true;
+			}
+			/* With no slot for the tail its pages stay mapped but
+			 * unrecorded -- still better than a record spanning the
+			 * hole, and the table is already exhausted at that
+			 * point, which sys_mmap reports loudly. */
+			region->length = cur_addr - region->start;
+		}
+
+		freed_any = 1;
+		cur_addr = region_end;
+	}
+
+	/* Invalidate on every CPU, then release everything collected above.
+	 * Nothing has been handed back to the allocator before this point. */
+	mm_tlb_gather_flush(&gather);
+	/* Trimming and splitting above may have left records that abut and
+	 * describe the same thing; fold them back together so repeated
+	 * map/unmap cycles cannot grow the table without bound. */
+	mm_merge_mmap_regions(task);
+	return freed_any;
 }
 
 // Get physical address for virtual address
@@ -2550,7 +2990,6 @@ void mm_destroy_address_space(uint64_t *pml4)
 	}
 
 	int pages_freed = 0;
-	int pages_decref_only = 0;
 	int pt_freed = 0;
 
 	// Free user-space page tables (entries 0-255, user space only)
@@ -2584,37 +3023,19 @@ void mm_destroy_address_space(uint64_t *pml4)
 								uint64_t phys =
 									pd[k] &
 									0x000FFFFFFFE00000ULL;
-								if (pd[k] &
-								    PAGE_USER) {
-									// User page - use refcount
-									if (mm_decref_page(
-										    phys)) {
-										for (int p2 = 0;
-										     p2 <
-										     512;
-										     p2++)
-											mm_free_physical_page(
-												phys +
-												(uint64_t)p2 *
-													PAGE_SIZE);
-										pages_freed +=
-											512; // 2MB = 512 4K pages
-									} else {
-										pages_decref_only +=
-											512;
-									}
-								} else {
-									for (int p2 = 0;
-									     p2 <
-									     512;
-									     p2++)
-										mm_free_physical_page(
-											phys +
-											(uint64_t)p2 *
-												PAGE_SIZE);
-									pages_freed +=
-										512;
-								}
+								/* A 2MB mapping covers 512
+								 * frames and each is counted
+								 * on its own, so drop a
+								 * reference from every one --
+								 * releasing only the first
+								 * leaked the other 511. */
+								for (int p2 = 0; p2 < 512;
+								     p2++)
+									mm_put_page(
+										phys +
+										(uint64_t)p2 *
+											PAGE_SIZE);
+								pages_freed += 512;
 							} else {
 								uint64_t pt_phys =
 									pd[k] &
@@ -2637,23 +3058,13 @@ void mm_destroy_address_space(uint64_t *pml4)
 										uint64_t phys =
 											pt[l] &
 											0x000FFFFFFFFFF000ULL;
-										// Check if this is a user page (could be COW shared)
-										if (pt[l] &
-										    PAGE_USER) {
-											// Use refcount - only free if last reference
-											if (mm_decref_page(
-												    phys)) {
-												mm_free_physical_page(
-													phys);
-												pages_freed++;
-											} else {
-												pages_decref_only++;
-											}
-										} else {
-											mm_free_physical_page(
-												phys);
-											pages_freed++;
-										}
+										/* One reference per
+										 * mapping: this one
+										 * goes, and the page
+										 * with it if it was
+										 * the last. */
+										mm_put_page(phys);
+										pages_freed++;
 									}
 								}
 
@@ -2683,7 +3094,6 @@ void mm_destroy_address_space(uint64_t *pml4)
 
 	// Suppress unused variable warnings (used for debugging)
 	(void)pages_freed;
-	(void)pages_decref_only;
 	(void)pt_freed;
 }
 
@@ -2901,9 +3311,52 @@ bool mm_mark_page_cow(uint64_t virtual_addr)
 	return true;
 }
 
+/* ============================================================================
+ * Taking the address-space semaphore from a fault
+ *
+ * A fault handler wants the lock for reading, but it cannot always have it:
+ * the semaphore sleeps, and a fault taken with interrupts already off is a
+ * fault taken while some spinlock is held.  Parking there would deadlock the
+ * lock holder rather than protect it.
+ *
+ * That case is supposed to be impossible.  Every syscall that copies a user
+ * buffer while holding an FS or socket lock runs mm_prefault_user_range()
+ * first, precisely so the fault happens BEFORE the lock is taken.  So a
+ * user-address fault arriving with interrupts disabled means a shield is
+ * missing at some entry point, and it is worth saying so loudly rather than
+ * silently running the fault unsynchronised.
+ *
+ * Returns true when the lock was taken and must be released.
+ * ========================================================================== */
+static bool mm_fault_lock(task_t *mm)
+{
+	if (!mm)
+		return false;
+	if (unlikely(irqs_disabled())) {
+		/* Reported by the fault entry point rather than here: it knows
+		 * the instruction that faulted, and without that this warning
+		 * says only that SOMEBODY is missing a shield.  See the
+		 * matching WARN in exception_handler(). */
+		return false;
+	}
+	mm_read_lock(&mm->mmap_lock);
+	return true;
+}
+
+static void mm_fault_unlock(task_t *mm, bool locked)
+{
+	if (locked)
+		mm_read_unlock(&mm->mmap_lock);
+}
+
 // Handle a COW page fault - allocate new page and copy contents
 // This must be SMP-safe: multiple CPUs may handle COW faults simultaneously
-bool mm_handle_cow_fault(uint64_t fault_addr)
+//
+// The address-space semaphore is taken by the wrapper below, so everything in
+// here runs with the address space held stable for reading: no munmap can pull
+// the region out from under it, and no fork can turn the mapping into a shared
+// one part-way through.
+static bool mm_cow_fault_locked(uint64_t fault_addr)
 {
 	uint64_t page_addr = fault_addr & ~0xFFFULL;
 	uint64_t *pte = mm_get_page_table(page_addr, false);
@@ -2940,101 +3393,151 @@ bool mm_handle_cow_fault(uint64_t fault_addr)
 			kprintf("mm_handle_cow_fault: untracked page copy alloc failed\n");
 			return false;
 		}
+		uint64_t uflags;
+
 		mm_memcpy(phys_to_virt(new_phys), phys_to_virt(old_phys),
 			  PAGE_SIZE);
+		/* Same publish-with-re-check as the counted path below: two
+		 * threads of one process can both reach here for the same page,
+		 * and the loser's copy predates whatever the winner has already
+		 * written into its own.  Nothing is released on this path --
+		 * the source is not allocator-owned -- so losing costs only the
+		 * copy. */
+		spin_lock_irqsave(&mm_refcount_lock, &uflags);
+		if (!(*pte & PAGE_COW) || (*pte & PTE_ADDR_MASK) != old_phys) {
+			spin_unlock_irqrestore(&mm_refcount_lock, uflags);
+			mm_free_physical_page(new_phys);
+			mm_flush_tlb(page_addr);
+			return true;
+		}
 		uint64_t flags = (*pte & 0xFFF) & ~PAGE_COW;
 		flags |= PAGE_WRITABLE;
 		*pte = (*pte & PAGE_NO_EXECUTE) | new_phys | flags;
+		spin_unlock_irqrestore(&mm_refcount_lock, uflags);
 		mm_flush_tlb(page_addr);
 		return true;
 	}
 
-	// Lock the refcount operations to prevent TOCTOU races
-	// We need to atomically: check refcount, decide action, and update state
 	uint64_t irq_flags;
+	struct mm_tlb_gather gather;
+
 	spin_lock_irqsave(&mm_refcount_lock, &irq_flags);
 
 	// Re-check COW flag under lock (another CPU may have resolved it)
 	if (!(*pte & PAGE_COW)) {
 		// Another CPU already resolved this COW fault
 		spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
+		mm_flush_tlb(page_addr);
 		return true;
 	}
 
-	// Read refcount under lock for consistent snapshot
-	uint16_t refcount = __atomic_load_n(&mm_state.page_refcounts[page_idx],
-					    __ATOMIC_ACQUIRE);
-
-	// SMP RACE FIX: Pin old_phys while still holding the lock.
-	// Between our lock release and the mm_memcpy below, a concurrent
-	// mm_destroy_address_space on another CPU (e.g. a fork-child that is
-	// exec'ing) could decrement old_phys's refcount to 0 and free it.
-	// If old_phys is then reallocated and zeroed as a page-table page, our
-	// subsequent mm_memcpy reads garbage and tmux's new heap page is
-	// corrupted — ultimately causing heap-metadata corruption which can
-	// manifest as a "page not present" fault when a corrupted pointer is
-	// later dereferenced.
-	//
-	// Holding an extra reference ("pin") keeps old_phys alive until we
-	// have finished copying from it.  We release the pin after the copy.
-	if (refcount > 0) {
-		mm_incref_page(old_phys);
+	/*
+	 * NOBODY ELSE HAS THIS PAGE: take it, do not copy it.
+	 *
+	 * One reference means one mapping, and that mapping is this one -- the
+	 * count says so unconditionally now that every mapping holds a
+	 * reference.  So the page is already private and copying it would
+	 * produce a byte-identical duplicate and free the original.
+	 *
+	 * This is the common case, not a corner: fork marks parent and child
+	 * COW, the child almost always exec's or exits within a few
+	 * milliseconds, and from then on every page the parent touches is one
+	 * it alone holds.  A shell or a GUI program that forks helpers
+	 * repeatedly used to copy its entire working set back one fault at a
+	 * time, every time.
+	 */
+	if (mm_get_page_refcount(old_phys) == 1) {
+		*pte = (*pte & ~(uint64_t)PAGE_COW) | PAGE_WRITABLE;
+		spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
+		mm_flush_tlb(page_addr);
+		return true;
 	}
+
+	/* Shared with someone.  Pin it so it cannot be released while we copy:
+	 * another CPU could otherwise drop the last other reference -- a forked
+	 * child exec'ing, say -- and the copy would read a freed and poisoned
+	 * page, or one already handed out as somebody else's page table. */
+	mm_get_page(old_phys);
 
 	spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
 
 	// Allocate a new physical page (outside lock for performance)
 	uint64_t new_phys = mm_allocate_physical_page();
 	if (!new_phys) {
-		// Undo the pin before returning on failure
-		if (refcount > 0) {
-			if (mm_decref_page(old_phys))
-				mm_free_physical_page(old_phys);
-		}
+		mm_put_page(old_phys); /* undo the pin */
 		kprintf("mm_handle_cow_fault: Failed to allocate new page\n");
 		return false;
 	}
 
 	// Copy contents from old page to new page via direct map.
-	// old_phys is pinned (if refcount > 0), so it cannot be freed concurrently.
+	// old_phys is pinned, so it cannot be freed concurrently.
 	mm_memcpy(phys_to_virt(new_phys), phys_to_virt(old_phys), PAGE_SIZE);
+
+	/*
+	 * PUBLISH UNDER THE LOCK, AND ONLY IF NOTHING CHANGED.
+	 *
+	 * Threads share a page table, so two of them can fault on the same page
+	 * at once.  Without this re-check both allocated, both copied, and both
+	 * stored their own copy into the entry -- the second store winning.
+	 * Everything the winner's userspace wrote into the first copy in
+	 * between was then discarded, because the loser's copy is a snapshot of
+	 * the page as it was BEFORE either fault was resolved.
+	 *
+	 * The page does not become garbage; it silently reverts.  That is what
+	 * made it so hard to read from the wreckage: an allocator's chunk
+	 * headers go back a few writes and its free lists stop agreeing with
+	 * each other, and an object that was fully constructed comes back with
+	 * half its fields unset.
+	 *
+	 * Losing is not an error -- the winner's copy is live and correct -- so
+	 * throw ours away and let the instruction run again.
+	 */
+	spin_lock_irqsave(&mm_refcount_lock, &irq_flags);
+	if (!(*pte & PAGE_COW) || (*pte & PTE_ADDR_MASK) != old_phys) {
+		spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
+		mm_free_physical_page(new_phys); /* never mapped; ours alone */
+		mm_put_page(old_phys); /* the pin */
+		mm_flush_tlb(page_addr);
+		return true;
+	}
 
 	// Update PTE: remove COW, add writable, point to new page, preserve NX bit
 	uint64_t flags = (*pte & 0xFFF) & ~PAGE_COW;
 	flags |= PAGE_WRITABLE;
 	*pte = (*pte & PAGE_NO_EXECUTE) | new_phys | flags;
+	spin_unlock_irqrestore(&mm_refcount_lock, irq_flags);
 
 	mm_flush_tlb(page_addr);
 
-	// Release the pin on old_phys (undo the mm_incref_page above).
-	// Track whether this decref itself freed old_phys so we don't
-	// attempt a second free when releasing the COW reference below.
-	bool freed = false;
-	if (refcount > 0) {
-		freed = mm_decref_page(old_phys);
-		if (freed)
-			mm_free_physical_page(old_phys);
-	}
+	/* Give back the pin.  It can never be the last reference -- this
+	 * mapping still holds one until the line below -- so this cannot
+	 * release the page, and needs no invalidation of its own. */
+	mm_put_page(old_phys);
 
-	// Release the COW reference to old_phys, unless the pin release
-	// already freed it (which happens when all other sharers decremented
-	// during the copy window, leaving only the pin as the last reference).
-	// Guard with refcount > 0: when refcount was 0 at fault time, old_phys
-	// was already freed by the last child's mm_destroy before the fault even
-	// fired and may have since been reallocated for a different purpose.
-	// Calling mm_free_physical_page on a reallocated page passes the
-	// is_page_allocated check, poisons it with POISON_FREED_PAGE, and
-	// corrupts the new owner — causing cascading page faults and kernel
-	// stack smashes under parallel workloads.
-	if (!freed && refcount > 0) {
-		if (mm_decref_page(old_phys))
-			mm_free_physical_page(old_phys);
-	}
+	/* Now this mapping's own reference.  Through the gather, because other
+	 * CPUs may still translate the faulting address to old_phys: releasing
+	 * it before they are told otherwise would put a page they are still
+	 * reading back into the allocator, which poisons it on the way out. */
+	mm_tlb_gather_init(&gather);
+	mm_tlb_gather_page(&gather, old_phys);
+	mm_tlb_gather_flush(&gather);
 
-	// New page starts with refcount of 0 (private to this process)
-	// We don't need to track it until it's shared via fork again
+	/* new_phys came from the allocator holding one reference, and that is
+	 * exactly the reference the new mapping needs -- nothing further to
+	 * take. */
 
 	return true;
+}
+
+bool mm_handle_cow_fault(uint64_t fault_addr)
+{
+	task_t *cur = sched_current();
+	task_t *mm = task_mm_owner(cur);
+	bool locked = mm_fault_lock(mm);
+	bool ret = mm_cow_fault_locked(fault_addr);
+
+	mm_fault_unlock(mm, locked);
+	return ret;
 }
 
 // ============================================================================
@@ -3073,7 +3576,10 @@ static void pagein_unlock(vfs_file_t *file)
 	__atomic_clear(&file->pagein_busy, __ATOMIC_RELEASE);
 }
 
-int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode)
+/* Body of the demand fault, run with the address-space semaphore held for
+ * reading by the wrapper below.  The region table it consults and the page
+ * tables it installs into are exactly what that lock protects. */
+static int mm_demand_fault_locked(uint64_t fault_addr, int from_kernel_mode)
 {
 	if (fault_addr >= 0x0000800000000000ULL)
 		return 0;
@@ -3197,6 +3703,17 @@ int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode)
 	return 1;
 }
 
+int mm_handle_demand_fault(uint64_t fault_addr, int from_kernel_mode)
+{
+	task_t *cur = sched_current();
+	task_t *mm = task_mm_owner(cur);
+	bool locked = mm_fault_lock(mm);
+	int ret = mm_demand_fault_locked(fault_addr, from_kernel_mode);
+
+	mm_fault_unlock(mm, locked);
+	return ret;
+}
+
 void mm_prefault_user_range(uint64_t addr, uint64_t len, int for_write)
 {
 	if (!len || addr >= 0x0000800000000000ULL)
@@ -3303,17 +3820,20 @@ uint64_t *mm_clone_address_space(uint64_t *src_pml4)
 							PAGE_COW;
 						src_pd[k] = cow_flags;
 						new_pd[k] = cow_flags;
-						// Track refcount for 2MB pages exactly like 4KB pages.
-						// Without this, mm_destroy_address_space on the child
-						// calls mm_decref_page which sees refcount==0 and frees
-						// the 2MB physical page while the parent still has it
-						// mapped — a use-after-free.
-						if (mm_get_page_refcount(
-							    phys_2mb) == 0) {
-							mm_incref_page(
-								phys_2mb);
-						}
-						mm_incref_page(phys_2mb);
+						/* One reference for the mapping being created in the
+						 * child.  No seeding: the parent's own mapping has
+						 * always held one since the page was allocated.
+						 *
+						 * A 2MB mapping covers 512 frames,
+						 * each counted separately, so the
+						 * child's reference is taken on
+						 * every one -- teardown drops one
+						 * from every one to match. */
+						for (int p2 = 0; p2 < 512; p2++)
+							mm_get_page(
+								phys_2mb +
+								(uint64_t)p2 *
+									PAGE_SIZE);
 						local_irq_restore(pte_irq);
 					} else {
 						// Kernel page - just share
@@ -3366,14 +3886,10 @@ uint64_t *mm_clone_address_space(uint64_t *src_pml4)
 							new_pt[l] = cow_flags;
 
 							// Increment page reference count
-							if (mm_get_page_refcount(
-								    phys_page) ==
-							    0) {
-								mm_incref_page(
-									phys_page);
-							}
-							mm_incref_page(
-								phys_page);
+							/* One reference for the mapping being created in the
+							 * child.  No seeding: the parent's own mapping has
+							 * always held one since the page was allocated. */
+							mm_get_page(phys_page);
 							local_irq_restore(
 								pte_irq);
 						} else {
@@ -3485,8 +4001,37 @@ uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
 							    vaddr_base,
 							    regions,
 							    num_regions)) {
-							// Shared - keep same physical page, keep writable
+							/* Shared — same physical
+							 * page, still writable.
+							 *
+							 * It needs a reference
+							 * exactly as much as the
+							 * copy-on-write case
+							 * below: this branch took
+							 * none at all, so the
+							 * first of the two
+							 * address spaces to be
+							 * torn down would drop
+							 * the last reference and
+							 * release 2MB of pages
+							 * the other one still had
+							 * mapped.  One per frame,
+							 * matching how teardown
+							 * releases them. */
+							uint64_t pte_irq =
+								local_irq_save();
+							uint64_t sh_2mb =
+								src_pd[k] &
+								0x000FFFFFFFE00000ULL;
+
 							new_pd[k] = src_pd[k];
+							for (int p2 = 0; p2 < 512;
+							     p2++)
+								mm_get_page(
+									sh_2mb +
+									(uint64_t)p2 *
+										PAGE_SIZE);
+							local_irq_restore(pte_irq);
 						} else {
 							// Not shared - use COW
 							uint64_t pte_irq =
@@ -3501,14 +4046,18 @@ uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
 							src_pd[k] = cow_flags;
 							new_pd[k] = cow_flags;
 							// Fix: track refcount for 2MB COW pages (same as 4KB)
-							if (mm_get_page_refcount(
-								    phys_2mb) ==
-							    0) {
-								mm_incref_page(
-									phys_2mb);
-							}
-							mm_incref_page(
-								phys_2mb);
+							/* One reference for the mapping being created in the
+							 * child.  No seeding: the parent's own mapping has
+							 * always held one since the page was allocated. */
+							/* All 512 frames of the
+							 * 2MB mapping, matching
+							 * teardown. */
+							for (int p2 = 0; p2 < 512;
+							     p2++)
+								mm_get_page(
+									phys_2mb +
+									(uint64_t)p2 *
+										PAGE_SIZE);
 							local_irq_restore(
 								pte_irq);
 						}
@@ -3563,16 +4112,10 @@ uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
 									local_irq_save();
 								new_pt[l] = src_pt
 									[l];
-								// Increment refcount for BOTH parent and child references
-								// (same logic as COW: if never tracked, init to 1 for parent)
-								if (mm_get_page_refcount(
-									    phys_page) ==
-								    0) {
-									mm_incref_page(
-										phys_page);
-								}
-								mm_incref_page(
-									phys_page);
+								/* One reference for the mapping being created in the
+								 * child.  No seeding: the parent's own mapping has
+								 * always held one since the page was allocated. */
+								mm_get_page(phys_page);
 								local_irq_restore(
 									pte_irq);
 							} else {
@@ -3590,14 +4133,10 @@ uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
 									cow_flags;
 
 								// Increment page reference count
-								if (mm_get_page_refcount(
-									    phys_page) ==
-								    0) {
-									mm_incref_page(
-										phys_page);
-								}
-								mm_incref_page(
-									phys_page);
+								/* One reference for the mapping being created in the
+								 * child.  No seeding: the parent's own mapping has
+								 * always held one since the page was allocated. */
+								mm_get_page(phys_page);
 								local_irq_restore(
 									pte_irq);
 							}
@@ -3923,48 +4462,98 @@ void mm_init_page_refcounts(void)
 	}
 }
 
-// Increment reference count for a physical page (SMP-safe)
-void mm_incref_page(uint64_t phys_addr)
+/* ============================================================================
+ * Physical page reference counting
+ *
+ * Every allocated page carries a count of the references to it, and it is
+ * released when that count reaches zero.  mm_allocate_physical_page() returns a
+ * page with a count of ONE: the reference the caller is holding.  Zero means
+ * the page is free, and nothing else.
+ *
+ * That last sentence is the whole point of this rewrite.  The counter used to
+ * mean two different things at once -- a page only ENTERED the refcount system
+ * when it was first shared, so zero meant either "nobody has it" or "nobody is
+ * counting".  Callers could not tell which, so every fork site open-coded
+ *
+ *	if (mm_get_page_refcount(p) == 0)
+ *		mm_incref_page(p);	// pay for the mapping that already existed
+ *	mm_incref_page(p);		// and for the new one
+ *
+ * which is a check-then-act on a counter other CPUs are modifying, and
+ * mm_decref_page() returned "yes, free it" for an untracked page -- so a page
+ * that was mapped twice but counted zero times was released by whichever
+ * mapping went away first, while the other still pointed at it.  Freed pages
+ * are poisoned, so the survivor then read 0xFEEDFACE out of its own memory.
+ *
+ * With a count that starts at one and is taken by every mapping, none of those
+ * cases exist: there is nothing to seed, nothing to test before incrementing,
+ * and no state in which a mapped page has no reference.
+ * ========================================================================== */
+
+/* Take a reference.  The caller must already hold one -- taking a reference to
+ * a page nobody holds is a use-after-free, and says so. */
+void mm_get_page(uint64_t phys_addr)
 {
 	uint64_t idx = page_to_index(phys_addr);
-	if (idx == (uint64_t)-1)
+	uint16_t old;
+
+	if (idx == (uint64_t)-1 || !mm_state.page_refcounts)
 		return;
 
-	// Use atomic increment to avoid races on SMP
-	uint16_t old = __atomic_load_n(&mm_state.page_refcounts[idx],
-				       __ATOMIC_ACQUIRE);
-	if (old < 0xFFFF) {
-		__atomic_fetch_add(&mm_state.page_refcounts[idx], 1,
-				   __ATOMIC_SEQ_CST);
+	old = __atomic_fetch_add(&mm_state.page_refcounts[idx], 1,
+				 __ATOMIC_ACQ_REL);
+	if (unlikely(old == 0)) {
+		WARN(1, "mm_get_page: reference taken on free page 0x%lx (use-after-free)",
+		     (unsigned long)phys_addr);
+	} else if (unlikely(old == 0xFFFF)) {
+		/* Saturated: undo rather than wrap to zero, which would free a
+		 * page that is still mapped in tens of thousands of places. */
+		__atomic_fetch_sub(&mm_state.page_refcounts[idx], 1,
+				   __ATOMIC_ACQ_REL);
+		WARN(1, "mm_get_page: refcount saturated on page 0x%lx",
+		     (unsigned long)phys_addr);
 	}
 }
 
-// Decrement reference count - returns true if page should be freed (SMP-safe)
-bool mm_decref_page(uint64_t phys_addr)
+/* Drop a reference, releasing the page when the last one goes.
+ *
+ * Deliberately frees the page itself instead of returning "you should free
+ * this now": the split version put the decision at every call site, and a
+ * caller that got it wrong either leaked the page or freed one that was still
+ * referenced.
+ */
+void mm_put_page(uint64_t phys_addr)
 {
 	uint64_t idx = page_to_index(phys_addr);
-	if (idx == (uint64_t)-1)
-		return false;
+	uint16_t current;
 
-	// Use a CAS loop so the zero-check and the decrement are atomic together.
-	// A plain load+fetch_sub would have a TOCTOU window: two CPUs could both
-	// read current==1, both proceed to fetch_sub, and one would wrap the
-	// uint16_t refcount to 65535, permanently corrupting the count.
-	uint16_t current = __atomic_load_n(&mm_state.page_refcounts[idx],
-					   __ATOMIC_ACQUIRE);
-	while (current != 0) {
+	if (idx == (uint64_t)-1 || !mm_state.page_refcounts) {
+		/* Outside the tracked range: nothing counts it, so the caller's
+		 * reference is the only one there can be. */
+		mm_free_physical_page(phys_addr);
+		return;
+	}
+
+	/* CAS rather than a plain fetch_sub so the zero-test and the decrement
+	 * are one step: two CPUs could otherwise both read 1, both decrement,
+	 * and one would wrap to 65535. */
+	current = __atomic_load_n(&mm_state.page_refcounts[idx],
+				  __ATOMIC_ACQUIRE);
+	for (;;) {
+		if (unlikely(current == 0)) {
+			WARN(1, "mm_put_page: reference dropped on free page 0x%lx (double free)",
+			     (unsigned long)phys_addr);
+			return;
+		}
 		if (__atomic_compare_exchange_n(&mm_state.page_refcounts[idx],
 						&current, current - 1, false,
 						__ATOMIC_ACQ_REL,
-						__ATOMIC_ACQUIRE)) {
-			// CAS succeeded: we decremented from `current` to `current-1`.
-			return current ==
-			       1; // true iff we just cleared the last reference
-		}
-		// CAS failed: `current` was reloaded with the actual value; retry.
+						__ATOMIC_ACQUIRE))
+			break;
+		/* CAS failed: `current` was reloaded; retry. */
 	}
-	// current == 0: page was never ref-tracked (private) — caller should free it.
-	return true;
+	if (current == 1)
+		mm_free_physical_page(phys_addr);
 }
 
 // Get reference count for a physical page (SMP-safe)

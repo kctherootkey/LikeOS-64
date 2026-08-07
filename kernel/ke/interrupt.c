@@ -1138,16 +1138,17 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 	task_tty_printf(
 		cur, "\nMemory map (mmap regions tracked by syscall layer):\n");
 	if (cur) {
-		mmap_region_t *regions;
-		int count;
-		if (cur->mm) {
-			regions = cur->mm->mmap_regions;
-			count = cur->mm->mmap_count;
-		} else {
-			regions = cur->mmap_regions;
-			count = TASK_MAX_MMAP;
-		}
-		for (int i = 0; i < count; i++) {
+		/* Always the per-task array.  mm_struct carries mmap_regions /
+		 * mmap_count / mmap_capacity too, and every one of them is
+		 * dead: the array is never allocated and the count is never
+		 * incremented, so preferring them (which this used to do
+		 * whenever cur->mm existed, i.e. always) printed an empty map
+		 * for every crash.  sys_mmap records into task->mmap_regions
+		 * and fork copies that array directly. */
+		mmap_region_t *regions = cur->mmap_regions;
+		int shown = 0;
+
+		for (int i = 0; i < TASK_MAX_MMAP; i++) {
 			mmap_region_t *r = &regions[i];
 			if (!r->in_use)
 				continue;
@@ -1157,9 +1158,26 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 			perms[2] = (r->prot & 0x4) ? 'x' : '-';
 			perms[3] = '-';
 			perms[4] = '\0';
-			task_tty_printf(cur, "  %016llx-%016llx %s\n", r->start,
-					r->start + r->length, perms);
+			/* Mark the region the instruction pointer is in, and
+			 * the one the faulting address is in.  A userspace RIP
+			 * on its own says nothing -- shared objects are mapped
+			 * at run time, so the number has to be turned back into
+			 * "this library, this far in" before it means anything.
+			 * The offset is what identifies the code. */
+			const char *tag = "";
+			if (rip >= r->start && rip < r->start + r->length)
+				tag = "  <== RIP";
+			task_tty_printf(cur, "  %016llx-%016llx %s%s%s\n",
+					r->start, r->start + r->length, perms,
+					r->file ? " file" : "", tag);
+			if (rip >= r->start && rip < r->start + r->length)
+				task_tty_printf(cur,
+						"      RIP is at +0x%llx in this mapping\n",
+						rip - r->start);
+			shown++;
 		}
+		if (!shown)
+			task_tty_printf(cur, "  (none recorded)\n");
 	}
 
 	/* Page-table walk of the faulting address — gives the definitive
@@ -1346,7 +1364,6 @@ void exception_handler(uint64_t *regs)
 {
 	uint64_t int_no = regs[REGS_INTNO];
 	uint64_t err_code = regs[REGS_ERRC];
-	uint64_t rip = regs[REGS_RIP];
 	uint64_t cs = regs[REGS_CS];
 	int user_mode = (cs & 0x3) == 0x3;
 
@@ -1377,9 +1394,36 @@ void exception_handler(uint64_t *regs)
 		if (!(err_code & 0x1) && cr2 < 0x8000000000000000ULL) {
 			int irqs_were_on =
 				(regs[REGS_RFLAGS] & 0x200) != 0;
+
+			/*
+			 * A user address faulting from kernel code that has
+			 * interrupts disabled means some entry point is
+			 * touching a user buffer while holding a spinlock,
+			 * without having resolved it first.  Nothing good
+			 * follows: the fault cannot take the address-space
+			 * semaphore (it would park with the spinlock held),
+			 * and if the page is file-backed the page-in sleeps on
+			 * disk I/O with interrupts off -- which is the
+			 * "might_sleep() with IRQs disabled" that appears
+			 * immediately afterwards.
+			 *
+			 * Named from here because this is the only place that
+			 * knows WHICH instruction did it.  Resolve with:
+			 *   rm build/kernel.elf && make DEBUG=1
+			 *   addr2line -f -e build/kernel.elf <rip>
+			 * and give that caller an mm_prefault_user_range()
+			 * before it takes its lock.
+			 */
+			WARN_RATELIMIT(
+				!user_mode && !irqs_were_on,
+				"user address %llx faulted from kernel RIP %llx with interrupts disabled - that caller needs mm_prefault_user_range() before its lock",
+				(unsigned long long)cr2,
+				(unsigned long long)regs[REGS_RIP]);
+
 			if (irqs_were_on)
 				__asm__ volatile("sti" ::: "memory");
-			int resolved = mm_handle_demand_fault(cr2, !user_mode);
+			int resolved =
+				mm_handle_demand_fault(cr2, !user_mode);
 			if (irqs_were_on)
 				__asm__ volatile("cli" ::: "memory");
 			if (resolved) {
@@ -1395,8 +1439,26 @@ void exception_handler(uint64_t *regs)
 		// Handle COW faults on user-space addresses (write + present)
 		// Note: Kernel code can trigger COW when accessing user pages (copy_to_user etc)
 		// so we check the ADDRESS is in user space, not the mode of the fault
+		//
+		// Interrupts are re-enabled here on exactly the same terms as the
+		// demand-paging path above, and for the same underlying reason:
+		// resolving a COW fault takes the address-space semaphore, which
+		// is a SLEEPING lock, and it must also be able to invalidate the
+		// page on other CPUs -- neither is possible while the exception
+		// gate's cleared IF is still in force.  A context that faulted
+		// with interrupts already off (holding a spinlock) stays off; it
+		// should never get here, because the pre-fault shield resolves
+		// COW on user buffers before any such lock is taken.
 		if ((err_code & 0x3) == 0x3 && cr2 < 0x8000000000000000ULL) {
-			if (mm_handle_cow_fault(cr2)) {
+			int irqs_were_on = (regs[REGS_RFLAGS] & 0x200) != 0;
+			bool resolved;
+
+			if (irqs_were_on)
+				__asm__ volatile("sti" ::: "memory");
+			resolved = mm_handle_cow_fault(cr2);
+			if (irqs_were_on)
+				__asm__ volatile("cli" ::: "memory");
+			if (resolved) {
 				irqentry_exit(regs, 0);
 				return;
 			}

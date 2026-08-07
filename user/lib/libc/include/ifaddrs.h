@@ -1,6 +1,10 @@
 #ifndef _IFADDRS_H
 #define _IFADDRS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/socket.h>
 
 struct ifaddrs {
@@ -25,5 +29,9 @@ struct ifaddrs {
 
 int  getifaddrs(struct ifaddrs **ifap);
 void freeifaddrs(struct ifaddrs *ifa);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _IFADDRS_H */

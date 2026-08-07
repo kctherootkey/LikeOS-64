@@ -1,0 +1,207 @@
+#!/bin/sh
+# Cross C++ compiler driver for the port.
+#
+# The C++ counterpart of likeos-cc, and deliberately its mirror image: same
+# sysroot, same libc, same -U flags, same link arrangement.  Anything that has
+# to be true of a LikeOS binary is true here for the same reason, so the two
+# files are meant to be read side by side and changed together.
+#
+# Only two packages in the tree are C++ -- HarfBuzz, which Pango cannot do
+# without, and Enchant -- but a C++ compiler is not something to arrange twice,
+# so this is a general driver rather than a HarfBuzz-shaped one.
+#
+# What is added over likeos-cc:
+#
+#   the C++ header path      -nostdinc removes the C++ standard directories as
+#                            well as the C ones (verified: `g++ -nostdinc -E -v`
+#                            reports an empty search list), so they have to be
+#                            named.  The TARGET's are used when they exist --
+#                            libstdc++ generates a bits/c++config.h describing
+#                            the platform it was configured for, and the build
+#                            host's describes glibc.
+#   -lstdc++ -lgcc_eh        the library and the unwinder.
+#
+# Exceptions work only because the runtime linker exports _dl_find_object: that
+# is how libgcc's unwinder turns a program counter into the PT_GNU_EH_FRAME of
+# the object containing it.  (The older dl_iterate_phdr is exported too, but the
+# unwinder in this compiler's libgcc_eh.a does not use it -- `nm -u` on that
+# archive names only _dl_find_object.)  Without it every throw reaches
+# std::terminate instead of the handler waiting for it, and nothing in the
+# failure says why.  The unwind tables themselves come from user_dyn.lds, which
+# used to discard them.
+
+set -e
+
+self=$0
+case "$self" in
+/*) ;;
+*) self=$(pwd)/$self ;;
+esac
+TOOLCHAIN=$(cd "$(dirname "$self")" && pwd)
+ROOT=$(cd "$TOOLCHAIN/../../.." && pwd)
+
+LIBC="$ROOT/user/lib/libc"
+RTLD="$ROOT/user/lib/rtld"
+LDS="$ROOT/user/bin/user_dyn.lds"
+CRT1="$LIBC/crt1.o"
+SYSROOT="${LIKEOS_SYSROOT:-$ROOT/build/xorg-sysroot}"
+ZLIB="$ROOT/ports/lib/zlib-1.3.1"
+OPENSSL="$ROOT/ports/openssl-3.5.6"
+
+GCC_INC="$(gcc -print-file-name=include)"
+
+# Where the C++ headers come from.
+#
+# The target's, once libstdc++ has been built and installed into the sysroot:
+# include/c++/<version>, the <triple> subdirectory beside it holding the
+# generated bits/c++config.h, and backward/ for the deprecated headers a few
+# packages still include.
+#
+# The build host's are NEVER used, not even as a fallback.  They look like they
+# would do -- the templates are the same source -- but bits/c++config.h and
+# bits/os_defines.h beside them describe the machine that built them, and
+# os_defines.h opens with #include <features.h>, which is glibc's and is not
+# here.  Every compile then fails on a missing header, and the ones that do not
+# fail come out configured for a different C library.
+#
+# So: before libstdc++ has been built there are no C++ headers at all, which is
+# the truth.  libstdc++'s own build does not need them -- it compiles against
+# its source tree and the headers it generates -- and nothing else in the tree
+# is C++ until it exists.
+CXX_INC=""
+cxxroot="$SYSROOT/usr/include/c++"
+if [ -d "$cxxroot" ]; then
+	cxxver=$(ls -1 "$cxxroot" 2>/dev/null | sort -V | tail -1)
+	if [ -n "$cxxver" ] && [ -d "$cxxroot/$cxxver" ]; then
+		CXX_INC="-isystem $cxxroot/$cxxver"
+		for t in "$cxxroot/$cxxver"/*/bits/c++config.h; do
+			[ -f "$t" ] || continue
+			CXX_INC="$CXX_INC -isystem $(dirname "$(dirname "$t")")"
+			break
+		done
+		[ -d "$cxxroot/$cxxver/backward" ] &&
+			CXX_INC="$CXX_INC -isystem $cxxroot/$cxxver/backward"
+	fi
+fi
+
+INCLUDES="-nostdinc $CXX_INC \
+  -isystem $SYSROOT/usr/include \
+  -isystem $LIBC/include \
+  -isystem $ZLIB \
+  -isystem $OPENSSL/include \
+  -isystem $GCC_INC"
+
+# The same set as likeos-cc, and for the same reasons -- see the comments there.
+# -fno-stack-protector in particular: the canary lives at %fs:0x28 and is only
+# valid once libc's thread control block is in place.
+COMPILE_FLAGS="-O2 -fPIC -fno-builtin -mno-red-zone \
+  -fno-stack-protector -fno-strict-aliasing -fno-tree-vectorize \
+  -D__LIKEOS__ -D_GNU_SOURCE \
+  -U__linux__ -U__linux -Ulinux -U__gnu_linux__ -U_LINUX"
+
+# NOT -ffreestanding, which likeos-cc passes.  In C++ it makes the compiler
+# treat the standard library as absent, and libstdc++'s headers then take their
+# freestanding branches: <string>, <vector> and the rest of the STL disappear,
+# which is precisely what Enchant is being built for.
+
+# Every token, including the contents of any response file -- see the long
+# comment on scan_tokens in likeos-cc.  ninja passes `@file` for a link with
+# many objects, and the -shared inside it is what decides whether this is a
+# shared library or an executable.
+scan_tokens() {
+	for a in "$@"; do
+		case "$a" in
+		@?*)
+			[ -f "${a#@}" ] && tr -d "'\"" <"${a#@}"
+			;;
+		*) printf '%s\n' "$a" ;;
+		esac
+	done
+}
+
+is_link=1
+is_shared=0
+set -f # the token list is not a glob pattern
+for tok in $(scan_tokens "$@"); do
+	case "$tok" in
+	-c | -E | -S) is_link=0 ;;
+	-shared) is_shared=1 ;;
+	esac
+done
+set +f
+
+NOT_FATAL="-Wno-error=array-bounds"
+
+if [ "$is_link" = "0" ]; then
+	exec g++ $INCLUDES $COMPILE_FLAGS "$@" $NOT_FATAL
+fi
+
+LIBDIRS="-L$LIBC -L$RTLD -L$SYSROOT/usr/lib -L$ROOT/build -L$OPENSSL"
+NO_HOST_LIBS="-Wl,--sysroot=$SYSROOT"
+RPATH_LINK="-Wl,-rpath-link,$LIBC:$RTLD:$SYSROOT/usr/lib:$ROOT/build:$OPENSSL"
+
+# -lgcc_eh, not -lgcc_s: the shared form is the build host's, and linking it
+# would pull the host C library in behind it.  The archive needs only malloc,
+# abort, memcpy and _dl_find_object, all of which this system has.
+CXXLIBS="-lstdc++ -lc -l:ld-likeos.so -lgcc -lgcc_eh"
+
+# The compiler's own start files, which likeos-cc has no use for and C++ cannot
+# do without.
+#
+# crtbegin defines __dso_handle -- the identity of the object it is linked into.
+# Every static C++ object registers its destructor as
+# __cxa_atexit(destructor, object, &__dso_handle), and without the symbol the
+# link simply fails.  In the shared form it also places a .fini_array entry that
+# calls __cxa_finalize(__dso_handle), which is what runs and REMOVES this
+# library's destructors when it is unloaded: without it dlclose() leaves them on
+# the process-wide list, and exit() later calls a destructor through a pointer
+# into pages that no longer exist.
+#
+# crtend closes what crtbegin opens (__TMC_END__, the end of the frame table).
+# Both are position-dependent -- crtbegin before the objects, crtend after -- so
+# they cannot simply be appended.
+#
+# The S variants in BOTH cases, including for executables.  Those are the
+# position-independent ones, and every executable here is a PIE; the plain
+# crtbegin.o carries an absolute relocation against __TMC_END__ and the link
+# fails outright with "relocation R_X86_64_32 against hidden symbol __TMC_END__
+# can not be used when making a PIE object".  gcc's own driver picks the S
+# variant for -pie for the same reason.
+CRTBEGIN=$(gcc -print-file-name=crtbeginS.o)
+CRTEND=$(gcc -print-file-name=crtendS.o)
+
+# ...unless the caller has already named them.  libstdc++'s own libtool link
+# passes crtbeginS.o and crtendS.o explicitly, and adding a second copy is not
+# harmless -- both define __dso_handle and __TMC_END__, so the link fails with
+# "multiple definition of __dso_handle".
+for a in "$@"; do
+	case "${a##*/}" in
+	crtbegin*.o | crtend*.o)
+		CRTBEGIN=""
+		CRTEND=""
+		break
+		;;
+	esac
+done
+
+# crtend goes LAST, after the libraries -- which is where gcc's own driver puts
+# it (`g++ -pie -v` shows crtbeginS.o, then -lstdc++ -lgcc -lc, then crtendS.o).
+# The object contributes the zero word that terminates the frame table, so
+# anything whose unwind tables are linked after it is past the end as far as the
+# reader is concerned.  With the libraries after it instead, ld rejects the
+# result outright: ".eh_frame_hdr refers to overlapping FDEs".
+if [ "$is_shared" = "1" ]; then
+	exec g++ $INCLUDES $COMPILE_FLAGS -nostdlib -shared \
+		-Wl,--hash-style=gnu -Wl,-Bsymbolic-functions \
+		-Wl,-z,relro \
+		$LIBDIRS $NO_HOST_LIBS $RPATH_LINK \
+		$CRTBEGIN "$@" $CXXLIBS $CRTEND
+fi
+
+exec g++ $INCLUDES $COMPILE_FLAGS \
+	-nostdlib -pie \
+	-Wl,-T,"$LDS" -Wl,--hash-style=gnu -Wl,-z,now -Wl,-z,relro \
+	-Wl,--export-dynamic \
+	-Wl,-rpath,/lib -Wl,-dynamic-linker,/lib/ld-likeos.so \
+	$LIBDIRS $NO_HOST_LIBS $RPATH_LINK \
+	"$CRT1" $CRTBEGIN "$@" $CXXLIBS $CRTEND

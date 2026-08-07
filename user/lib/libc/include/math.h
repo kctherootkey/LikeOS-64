@@ -32,9 +32,48 @@
 #define M_SQRT2       1.41421356237309504880 /* sqrt(2)       */
 #define M_SQRT1_2     0.70710678118654752440 /* 1/sqrt(2)     */
 
+/*
+ * C99 7.12.3 classification and 7.12.14 comparison.
+ *
+ * All type-generic, so each is a macro over a compiler builtin rather than a
+ * function: the argument may be float, double or long double, and the builtin
+ * picks the right one without the header having to declare three of everything.
+ *
+ * The comparison macros are not the same as the operators they resemble.  `a >
+ * b` on a NaN raises the invalid-operation exception; isgreater(a, b) answers
+ * false quietly, which is the point of having them.
+ *
+ * FP_* are the categories fpclassify returns, in the conventional order and
+ * with the conventional values, so a switch written against another system's
+ * header means the same thing here.
+ */
+#define FP_NAN        0
+#define FP_INFINITE   1
+#define FP_ZERO       2
+#define FP_SUBNORMAL  3
+#define FP_NORMAL     4
+
+#define fpclassify(x) \
+	__builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, \
+			     FP_ZERO, (x))
 #define isnan(x)      __builtin_isnan(x)
 #define isinf(x)      __builtin_isinf(x)
 #define isfinite(x)   __builtin_isfinite(x)
+#define isnormal(x)   __builtin_isnormal(x)
+#define signbit(x)    __builtin_signbit(x)
+
+#define isgreater(x, y)      __builtin_isgreater((x), (y))
+#define isgreaterequal(x, y) __builtin_isgreaterequal((x), (y))
+#define isless(x, y)         __builtin_isless((x), (y))
+#define islessequal(x, y)    __builtin_islessequal((x), (y))
+#define islessgreater(x, y)  __builtin_islessgreater((x), (y))
+#define isunordered(x, y)    __builtin_isunordered((x), (y))
+
+/* Rounding directions, as returned by fegetround().  Declared here because
+ * math.h is where FLT_ROUNDS-style code expects to find the names; the values
+ * are the x86 ones, which is what the hardware control word uses. */
+#define FP_ILOGB0   (-2147483647 - 1)
+#define FP_ILOGBNAN (-2147483647 - 1)
 
 #ifdef __cplusplus
 extern "C" {
@@ -51,16 +90,17 @@ double log(double x);
 double exp(double x);
 double sin(double x);
 double cos(double x);
+/* Sine and cosine together, in one hardware instruction rather than two
+ * argument reductions.  A GNU extension; software that draws asks for it. */
+void   sincos(double x, double *s, double *c);
+void   sincosf(float x, float *s, float *c);
+void   sincosl(long double x, long double *s, long double *c);
 
 float fabsf(float x);
 float fmodf(float x, float y);
 float roundf(float x);
 float floorf(float x);
 float ceilf(float x);
-
-#ifdef __cplusplus
-}
-#endif
 
 /* Added for the X.Org port; implemented on the x87 unit in
  * src/math/math.c.  See the comment there on why not series expansions. */
@@ -84,8 +124,24 @@ double copysign(double x, double y);
 double fmin(double a, double b);
 double fmax(double a, double b);
 double fdim(double a, double b);
+/* Quiet NaN, optionally carrying a payload spelled as a string (C99 7.12.11.2).
+ * The C++ standard library declares std::nan on top of these, so <cmath> does
+ * not compile without them -- which is how their absence surfaced. */
+double nan(const char *tag);
+float  nanf(const char *tag);
+long double nanl(const char *tag);
+
+/* Scaling by a power of two, and taking a value apart into mantissa and
+ * exponent.  Exact for every type: they read and write the exponent field
+ * rather than forming 2^e as a value, so an intermediate cannot overflow. */
 double ldexp(double x, int e);
+float  ldexpf(float x, int e);
 double frexp(double x, int *e);
+float  frexpf(float x, int *e);
+double scalbn(double x, int e);
+float  scalbnf(float x, int e);
+double scalbln(double x, long e);
+float  scalblnf(float x, long e);
 double modf(double x, double *iptr);
 float sqrtf(float x);
 float expf(float x);
@@ -140,5 +196,22 @@ long double atanl(long double x);
 long double atan2l(long double y, long double x);
 long double hypotl(long double x, long double y);
 long double copysignl(long double x, long double y);
+/* Taking a long double apart and putting it back together.  Exact: they read
+ * and write the exponent field rather than going through a logarithm. */
+long double frexpl(long double x, int *e);
+long double ldexpl(long double x, int e);
+long double scalbnl(long double x, int e);
+long double scalblnl(long double x, long e);
+
+/* The block closes HERE, at the end of the file.
+ *
+ * It used to close two thirds of the way up, just after the first batch of
+ * float entry points, so everything added below that -- every long double
+ * function, and half the float ones -- was declared with C++ linkage while
+ * being defined with C linkage in math.c.  In C that is invisible; in C++ it
+ * means the caller looks for a mangled name that nothing defines. */
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _MATH_H */

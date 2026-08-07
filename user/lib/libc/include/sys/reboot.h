@@ -1,6 +1,10 @@
 #ifndef _SYS_REBOOT_H
 #define _SYS_REBOOT_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Commands for the reboot() system call */
 #define RB_AUTOBOOT     0x01234567  /* Restart system */
 #define RB_HALT_SYSTEM  0xCDEF0123  /* Halt system, stay powered */
@@ -9,5 +13,9 @@
 #define RB_POWER_OFF    0x4321FEDC  /* Power off system */
 
 int reboot(int cmd);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SYS_REBOOT_H */

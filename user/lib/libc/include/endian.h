@@ -14,6 +14,10 @@
 #ifndef _ENDIAN_H
 #define _ENDIAN_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 #include <byteswap.h>
 
@@ -76,6 +80,10 @@
 #define be64toh(x) ((uint64_t)(x))
 #define le64toh(x) bswap_64(x)
 
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* _ENDIAN_H */

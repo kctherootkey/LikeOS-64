@@ -1,0 +1,119 @@
+# GTK3 port manifest — one line per package, in DEPENDENCY ORDER.
+#
+#   <section>  <name>  <version>  [explicit-URL]  [gitlab-repo]
+#
+# Same format as ../packages.list and read by the same scripts; see ../build.sh
+# for why the two ports share one driver.  Section "-" means the package is not
+# an X.Org one, which is all of them here, so every line carries an explicit
+# download URL with %VERSION% expanded from the version column.
+#
+# The NAME must match the directory the tarball unpacks into, because the build
+# driver finds a package's tree by that name.  Two are not what they look like:
+# GNOME publishes GTK 3.24 as "gtk", not "gtk+", and the DejaVu release is
+# "dejavu-fonts-ttf-<v>".
+#
+# Build order matters and is not alphabetical.  Do not sort this file.
+#
+# NOT here, because the X.Org port already builds them into the same sysroot:
+# zlib (imported by ../import-base-libs.sh), libpng, jpeg, pixman, freetype,
+# fontconfig and expat.  Adding them here would put two versions of each in one
+# sysroot.  Their versions were bumped in ../packages.list for this port.
+
+# ---- C++ runtime --------------------------------------------------------
+# HarfBuzz and Enchant are C++, and nothing in this tree was C++ before them.
+# Only libstdc++-v3 is built out of this tree, with the host compiler and the
+# port's wrappers; the rest of GCC is not touched.  The version tracks the
+# build host's g++ (13.3.0), because that compiler's ABI is what the resulting
+# library has to match.
+-         gcc                13.3.0   https://ftp.gnu.org/gnu/gcc/gcc-%VERSION%/gcc-%VERSION%.tar.xz
+
+# ---- GLib and its dependencies ------------------------------------------
+# libffi is how GObject calls a closure whose signature is only known at run
+# time (signals, bindings); PCRE2 is GRegex.
+-         libffi             3.7.1    https://github.com/libffi/libffi/releases/download/v%VERSION%/libffi-%VERSION%.tar.gz
+-         pcre2              10.47    https://github.com/PCRE2Project/pcre2/releases/download/pcre2-%VERSION%/pcre2-%VERSION%.tar.gz
+# The libc's own iconv covers UTF-8, ASCII, Latin-1 and Latin-9 -- enough for
+# the X core fonts, nowhere near enough for a mail client, which meets whatever
+# charset a message declares.  GNU libiconv renames its entry points to
+# libiconv_open/libiconv/libiconv_close in its header, so the two
+# implementations coexist without either shadowing the other.
+-         libiconv           1.19     https://ftp.gnu.org/gnu/libiconv/libiconv-%VERSION%.tar.gz
+# Only gettext-runtime is built (see make_dirs in ../build.sh): that is libintl,
+# which every package below links for its translations.  gettext-tools is a
+# build-host concern -- the host's own msgfmt compiles the .po files.
+-         gettext            0.26     https://ftp.gnu.org/gnu/gettext/gettext-%VERSION%.tar.xz
+-         glib               2.88.3   https://download.gnome.org/sources/glib/2.88/glib-%VERSION%.tar.xz
+
+# ---- image loading ------------------------------------------------------
+# libpng and jpeg come from the X.Org port; TIFF is the one gdk-pixbuf format
+# nothing else needed yet.
+-         tiff               4.7.2    https://download.osgeo.org/libtiff/tiff-%VERSION%.tar.xz
+
+# ---- text shaping and rendering -----------------------------------------
+# FriBidi resolves the bidirectional algorithm, HarfBuzz maps a string plus a
+# font to positioned glyphs, Cairo rasterises, Pango puts the three together.
+# HarfBuzz is where the C++ runtime above is first used in anger.
+-         fribidi            1.0.16   https://github.com/fribidi/fribidi/releases/download/v%VERSION%/fribidi-%VERSION%.tar.xz
+-         harfbuzz           14.3.0   https://github.com/harfbuzz/harfbuzz/releases/download/%VERSION%/harfbuzz-%VERSION%.tar.xz
+-         cairo              1.18.4   https://cairographics.org/releases/cairo-%VERSION%.tar.xz
+-         pango              1.58.0   https://download.gnome.org/sources/pango/1.58/pango-%VERSION%.tar.xz
+
+# ---- the rest of GTK's foundation ---------------------------------------
+-         gdk-pixbuf         2.44.7   https://download.gnome.org/sources/gdk-pixbuf/2.44/gdk-pixbuf-%VERSION%.tar.xz
+# ATK is the accessibility interface GTK3 implements.  2.38.0 is its final
+# release; there will not be another.
+-         atk                2.38.0   https://download.gnome.org/sources/atk/2.38/atk-%VERSION%.tar.xz
+# libepoxy dispatches OpenGL calls.  GTK3 requires it whether or not there is a
+# GL implementation to dispatch to, and here there is not -- see meson_opts.
+# No release tarball is published for 1.5.10, so this is the tag export.
+-         libepoxy           1.5.10   https://github.com/anholt/libepoxy/archive/refs/tags/%VERSION%.tar.gz
+
+# ---- the toolkit --------------------------------------------------------
+# GNOME publishes the 3.24 series under the module name "gtk", not "gtk+".
+-         gtk                3.24.52  https://download.gnome.org/sources/gtk/3.24/gtk-%VERSION%.tar.xz
+
+# ---- fonts and icons ----------------------------------------------------
+# Not optional and not decoration.  The image ships bitmap PCF fonts only, and
+# Pango renders through FreeType: with no scalable font installed every GTK
+# program comes up with blank or boxed text and no error anywhere.
+#
+# hicolor is the fallback theme GTK's icon lookup requires by specification.
+# Adwaita is pinned to 3.38.0 deliberately -- it is the last release whose icons
+# are PNG.  Every later one is symbolic SVG, which would mean librsvg, which
+# would mean a Rust toolchain.
+-         dejavu-fonts-ttf   2.37     https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-%VERSION%.tar.bz2
+-         hicolor-icon-theme 0.18     https://icon-theme.freedesktop.org/releases/hicolor-icon-theme-%VERSION%.tar.xz
+-         adwaita-icon-theme 3.38.0   https://download.gnome.org/sources/adwaita-icon-theme/3.38/adwaita-icon-theme-%VERSION%.tar.xz
+
+# ---- Claws Mail's dependencies ------------------------------------------
+# startup-notification is how an application tells the window manager it is
+# starting; ctwm shows the busy cursor for it.
+-         startup-notification 0.12   https://www.freedesktop.org/software/startup-notification/releases/startup-notification-%VERSION%.tar.gz
+# The TLS chain.  OpenSSL is already ported and libetpan uses it, but Claws
+# Mail's own transport code speaks to GnuTLS and nothing else, so both are
+# built: GMP for the bignums, nettle for the ciphers, libtasn1 for the
+# certificate parsing.
+-         gmp                6.3.0    https://ftp.gnu.org/gnu/gmp/gmp-%VERSION%.tar.xz
+-         nettle             3.10.2   https://ftp.gnu.org/gnu/nettle/nettle-%VERSION%.tar.gz
+-         libtasn1           4.21.0   https://ftp.gnu.org/gnu/libtasn1/libtasn1-%VERSION%.tar.gz
+-         gnutls             3.8.13   https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-%VERSION%.tar.xz
+# Enchant is a spell-checking abstraction and needs a backend behind it, or
+# every attempt to compose a message opens an error box: Claws asks it for an
+# en_US speller at that moment and takes a refusal as a failure, not as a
+# feature that is switched off.  hunspell is that backend, and the SCOWL en_US
+# dictionary is what hunspell reads -- a checker with no dictionary fails in
+# exactly the same way as no checker at all.
+#
+# hunspell is C++, which the libstdc++ built at the head of this list supports.
+# The dictionary is a zip, the only one in either manifest; unpack.sh grew a
+# case for it because SCOWL publishes nothing else.  Its name carries the
+# upstream spelling (en_US, not en-us) so the archive matches the package.
+-         hunspell           1.7.2    https://github.com/hunspell/hunspell/releases/download/v%VERSION%/hunspell-%VERSION%.tar.gz
+-         hunspell-en_US     2020.12.07 https://downloads.sourceforge.net/wordlist/hunspell-en_US-%VERSION%.zip
+-         enchant            2.8.19   https://github.com/rrthomas/enchant/releases/download/v%VERSION%/enchant-%VERSION%.tar.gz
+# libetpan implements IMAP, POP3, SMTP and NNTP.  A tag export, not a release
+# tarball: it has no configure, so likeos-autogen.sh runs autogen.sh first.
+-         libetpan           1.10.1   https://github.com/dinhvh/libetpan/archive/refs/tags/%VERSION%.tar.gz
+
+# ---- the application ----------------------------------------------------
+-         claws-mail         4.4.0    https://www.claws-mail.org/releases/claws-mail-%VERSION%.tar.xz

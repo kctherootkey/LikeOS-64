@@ -15,6 +15,10 @@
 #ifndef _KERNEL_UAPI_INPUT_H_
 #define _KERNEL_UAPI_INPUT_H_
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Which half of the system is compiling this decides where the fixed-width
 // types come from: the kernel has its own, userspace has <stdint.h>.  The test
 // is __LIKEOS_KERNEL__ and NOT __LIKEOS__ -- the latter is true for userspace
@@ -1016,5 +1020,9 @@ struct input_absinfo {
 	_INPUT_IOW('E', 0xc0 + (abs), struct input_absinfo) // set axis params
 #define EVIOCGMTSLOTS(len) \
 	_INPUT_IOC(_INPUT_IOC_READ, 'E', 0x0a, (len)) // multitouch slot state
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // _KERNEL_UAPI_INPUT_H_

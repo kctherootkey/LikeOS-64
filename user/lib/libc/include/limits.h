@@ -4,6 +4,10 @@
 #ifndef _LIMITS_H
 #define _LIMITS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Number of bits in a char */
 #define CHAR_BIT    8
 
@@ -70,7 +74,15 @@
 #define NAME_MAX    255
 #define LINE_MAX    2048
 #define PIPE_BUF    4096
-#define OPEN_MAX    256
+/* Descriptors per process.  This is the KERNEL's limit, TASK_MAX_FDS in
+ * include/kernel/ke/sched.h -- the two must agree, and they did not: the
+ * kernel has handed out 1024 for a long time while this said 256, so every
+ * program that sized an fd table or a poll array by OPEN_MAX, sysconf() or
+ * getdtablesize() believed it could hold a quarter of what it really could.
+ * Raising it here costs nothing (nothing in libc is dimensioned by it); the
+ * kernel side is a fixed array inside every task_t, which is why that number
+ * is the one to check before changing this one. */
+#define OPEN_MAX    1024
 #define ARG_MAX     131072
 #define NGROUPS_MAX 32
 #define IOV_MAX     1024
@@ -80,5 +92,9 @@
 /* Size limits */
 #define SSIZE_MAX   LONG_MAX
 #define SIZE_MAX    ULONG_MAX
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _LIMITS_H */

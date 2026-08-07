@@ -19,6 +19,10 @@
 #ifndef _SYS_UINPUT_H
 #define _SYS_UINPUT_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 #include <sys/input.h>
 
@@ -83,5 +87,9 @@ struct uinput_user_dev {
 #define UI_GET_SYSNAME(len) \
 	_INPUT_IOC(_INPUT_IOC_READ, UINPUT_IOCTL_BASE, 44, (len))
 #define UI_GET_VERSION _INPUT_IOR(UINPUT_IOCTL_BASE, 45, unsigned int)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // _SYS_UINPUT_H

@@ -192,6 +192,7 @@ KERNEL_OBJS = $(BUILD_DIR)/init.o \
               $(BUILD_DIR)/memory.o \
 			  $(BUILD_DIR)/stack_switch.o \
 			  $(BUILD_DIR)/slab.o $(BUILD_DIR)/shm.o \
+			  $(BUILD_DIR)/mm_rwsem.o \
 			  $(BUILD_DIR)/scrollbar.o \
 			  $(BUILD_DIR)/vfs.o \
 			  $(BUILD_DIR)/frlock.o \
@@ -294,12 +295,12 @@ LINUX_USB_IMAGE = $(LINUX_USB_BUILD_DIR)/linux-usb.img
 #   ROOT_LIBS         -> /lib/<name>
 #   ROOT_USRLOCAL_BINS-> /usr/local/bin/<name> (a few are renamed; see recipe)
 # ---------------------------------------------------------------------------
-ROOT_BIN_PROGS = bash ls cat pwd stat uname shutdown poweroff reboot halt ps cp mv rm \
+ROOT_BIN_PROGS = bash ls cat cmp pwd stat uname shutdown poweroff reboot halt ps cp mv rm \
 	mkdir rmdir ln chmod readlink touch more less clear env kill find df du hexdump \
 	sleep strings file grep wc head tail echo printf free uptime nproc dmesg which date time \
 	sort uniq cut tr sed expr tty yes true false top man hostname ping ifconfig netstat route arp \
 	traceroute arping dhclient dig nslookup host nano tmux nc openssl curl login \
-	id whoami groups su passwd adduser addgroup deluser delgroup
+	id whoami groups su passwd adduser addgroup deluser delgroup kdump
 # System binaries -> /sbin/<name>
 ROOT_SBIN_PROGS = init getty
 ROOT_LIBS = ld-likeos.so libc.so ncurses.so libevent.so libcrypto.so.3 libssl.so.3 \
@@ -318,12 +319,30 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 	res/etc/skel/.profile res/etc/skel/.bashrc \
 	$(wildcard res/man/*.1) $(wildcard res/etc/*) \
 	$(wildcard res/etc/ssl/certs/*) $(wildcard res/xorg/*) \
-	ports/xorg/stage.sh
+	$(wildcard res/xorg/gtk3/*) \
+	$(wildcard res/xorg/gtk3/skel-claws-mail/*) \
+	ports/xorg/stage.sh ports/xorg/gtk3/stage.sh
 
 # Full prerequisite set for the ext4 image (every staged build artifact).
+# The C++ runtime's test program, but only once there is a C++ runtime.
+#
+# Evaluated when this file is read: if the GTK3 port has installed libstdc++
+# into the sysroot, testcxx becomes a prerequisite of the image and is built
+# like anything else.  If it has not, the variable is empty and a tree without
+# that port still builds a working image.
+#
+# It used to be neither -- built by hand with `make build/testcxx' and staged
+# only if it happened to be there.  `make clean' removes everything under
+# build/, so the next image quietly shipped without the one program that
+# proves the C++ runtime works, and the staging script's existence check
+# turned that into silence rather than an error.
+GTK3_TESTCXX := $(shell test -f $(BUILD_DIR)/xorg-sysroot/usr/lib/libstdc++.so \
+	&& echo $(BUILD_DIR)/testcxx)
+
 GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS)) \
 	$(BUILD_DIR)/openssh/bin/ssh \
 	$(BUILD_DIR)/xorg-sysroot/usr/bin/Xorg \
+	$(GTK3_TESTCXX) \
 	$(RES_PREREQS)
 
 # Default target: build the single ext4 GPT USB disk.
@@ -401,6 +420,9 @@ $(BUILD_DIR)/slab.o: $(KERNEL_DIR)/mm/slab.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/shm.o: $(KERNEL_DIR)/mm/shm.c | $(BUILD_DIR)
+	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/mm_rwsem.o: $(KERNEL_DIR)/mm/rwsem.c | $(BUILD_DIR)
 	$(GCC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/scrollbar.o: $(KERNEL_DIR)/io/scrollbar.c | $(BUILD_DIR)
@@ -932,6 +954,11 @@ $(BUILD_DIR)/hexdump: userland-libc userland-rtld | $(BUILD_DIR)
 	cp $(USER_DIR)/hexdump $@
 	$(STRIP) --strip-unneeded $@
 
+$(BUILD_DIR)/cmp: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) cmp
+	cp $(USER_DIR)/cmp $@
+	$(STRIP) --strip-unneeded $@
+
 $(BUILD_DIR)/sleep: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) sleep
 	cp $(USER_DIR)/sleep $@
@@ -995,6 +1022,11 @@ $(BUILD_DIR)/nproc: userland-libc userland-rtld | $(BUILD_DIR)
 $(BUILD_DIR)/dmesg: userland-libc userland-rtld | $(BUILD_DIR)
 	$(MAKE) -C $(USER_DIR) dmesg
 	cp $(USER_DIR)/dmesg $@
+	$(STRIP) --strip-unneeded $@
+
+$(BUILD_DIR)/kdump: userland-libc userland-rtld | $(BUILD_DIR)
+	$(MAKE) -C $(USER_DIR) kdump
+	cp $(USER_DIR)/kdump $@
 	$(STRIP) --strip-unneeded $@
 
 $(BUILD_DIR)/which: userland-libc userland-rtld | $(BUILD_DIR)
@@ -1311,6 +1343,56 @@ ports-xorg: userland-libc userland-rtld ports-openssl ports-zlib ports-ncurses \
 	ports/xorg/import-base-libs.sh
 	ports/xorg/build.sh
 
+# The GTK3 stack and Claws Mail.
+#
+# A sub-port of the X.Org one rather than a tree of its own: it cross-compiles
+# with the same toolchain wrappers into the same sysroot, because a GTK program
+# links against the very libX11 that port built.  Only the manifest differs, and
+# the scripts below are four-line wrappers that say which one to read.
+#
+# Ordered after ports-xorg for the same reason its own manifest is ordered:
+# GTK's X11 backend cannot be configured until the X libraries are installed.
+.PHONY: ports-gtk3
+ports-gtk3: ports-xorg | $(BUILD_DIR)
+	@# Checked HERE rather than left to the package that needs it.  GLib is
+	@# the fifth thing this target builds and the first to require a meson
+	@# newer than Ubuntu 24.04 ships, so without this the build spends
+	@# several minutes succeeding and then stops with meson's own message,
+	@# which says what is wrong but not what to do about it.
+	@have=$$(PATH="$$(pwd)/ports/xorg/.hosttools/bin:$$PATH" meson --version 2>/dev/null || echo 0); \
+	need=$(MESON_MIN_VERSION); \
+	if [ "$$(printf '%s\n%s\n' "$$need" "$$have" | sort -V | head -1)" != "$$need" ]; then \
+		echo "ERROR: meson $$have is too old; GLib requires >= $$need."; \
+		echo "  The apt package is not new enough on this distribution, and"; \
+		echo "  installing one system-wide is refused from Ubuntu 24.04 on."; \
+		echo "  This installs a current meson into the port's own venv,"; \
+		echo "  without root and without touching anything outside the tree:"; \
+		echo "      make deps"; \
+		exit 1; \
+	fi
+	ports/xorg/gtk3/fetch.sh
+	ports/xorg/gtk3/unpack.sh
+	ports/xorg/gtk3/build.sh
+
+# The C++ runtime's own test program.
+#
+# Built with the port's C++ driver rather than the userland one, because it is
+# the only thing in user/bin that is C++ and because it has to link against the
+# libstdc++ in the port sysroot -- which is where the C++ runtime for this
+# system lives, and which does not exist until the GTK3 port has built it.
+#
+# Not a prerequisite of the image: the staging script stages it if it is there
+# and says nothing if it is not, so a tree without the GTK3 port still builds a
+# working image.  Build it with `make build/testcxx` after `make ports-gtk3`.
+$(BUILD_DIR)/testcxx: user/bin/tests/testcxx.cpp | $(BUILD_DIR)
+	@test -f $(XORG_SYSROOT)/usr/lib/libstdc++.so || { \
+		echo "ERROR: no libstdc++ in $(XORG_SYSROOT)."; \
+		echo "  The C++ runtime is built by the GTK3 port:"; \
+		echo "      make ports-gtk3"; \
+		exit 1; \
+	}
+	ports/xorg/toolchain/likeos-c++ -o $@ $<
+
 # Sentinel the image build depends on.  The server is the last thing that can
 # be produced without every library beneath it, so its presence means the whole
 # stack built.
@@ -1424,6 +1506,22 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	cp res/Uni2-Terminus16.psf $(EXT4_STAGING)/res/Uni2-Terminus16.psf
 	cp res/left_ptr          $(EXT4_STAGING)/res/left_ptr
 	cp res/man/*.1           $(EXT4_STAGING)/usr/share/man/man1/
+	# X cursor theme.
+	#
+	# Generated, not committed: the artwork is geometry, so it lives as the
+	# program that draws it (host/gen-cursors.c) rather than as a directory
+	# of binary files nobody can review.  Built with the HOST compiler
+	# because it runs here, at image-build time.
+	#
+	# Without a theme installed libXcursor falls back to the X core cursor
+	# font, whose "watch" is a 1-bit wristwatch; this replaces the busy
+	# cursors with an animated hourglass and leaves every other cursor to
+	# the fallback, which is why the theme is under a megabyte.
+	mkdir -p $(BUILD_DIR)/hosttools
+	$(GCC) -O2 -o $(BUILD_DIR)/hosttools/gen-cursors host/gen-cursors.c -lm
+	mkdir -p $(EXT4_STAGING)/usr/share/icons/LikeOS/cursors
+	$(BUILD_DIR)/hosttools/gen-cursors \
+		$(EXT4_STAGING)/usr/share/icons/LikeOS
 	# "man sh" shows the bash page: sh IS bash now (see /bin/sh symlink)
 	ln -sfn bash.1 $(EXT4_STAGING)/usr/share/man/man1/sh.1
 	cp ports/nano-8.3/syntax/*.nanorc $(EXT4_STAGING)/usr/share/nano/
@@ -1433,6 +1531,10 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	# /bin/sh when the file is missing, whatever the password database says.
 	cp res/etc/shells        $(EXT4_STAGING)/etc/shells
 	cp res/etc/hosts         $(EXT4_STAGING)/etc/hosts
+	# Media types.  Claws Mail reads this to set an attachment's
+	# Content-Type; without it every attachment is sent as
+	# application/octet-stream and the receiving client has to guess.
+	cp res/etc/mime.types    $(EXT4_STAGING)/etc/mime.types
 	cp res/etc/resolv.conf   $(EXT4_STAGING)/etc/resolv.conf
 	# What init (process 1) starts and supervises at boot: the console getty
 	# and the services listed there.
@@ -1492,6 +1594,11 @@ $(GPT_DISK): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(GPT_PREREQS) | $(BUILD_DIR)
 	@# is the failure this whole chain exists to prevent, and a warning in
 	@# the middle of a long build is not seen.
 	ports/xorg/stage.sh $(EXT4_STAGING)
+	# --- GTK3 stack and Claws Mail, staged the same way and for the same
+	# reasons.  Every item inside is guarded on having been built, so this
+	# is a no-op until the port has produced something: an image without
+	# GTK3 is a working image, one that half-contains it is not.
+	ports/xorg/gtk3/stage.sh $(EXT4_STAGING)
 	cp ports/openssl-3.5.6/apps/openssl.cnf $(EXT4_STAGING)/etc/ssl/openssl.cnf
 	cp res/etc/ssl/certs/ca-certificates.crt $(EXT4_STAGING)/etc/ssl/certs/ca-certificates.crt
 	# Signature file selects this device as the OS root; sample text file
@@ -1856,11 +1963,62 @@ xorg-manpages:
 	done; \
 	echo "rendered $$n X.Org manual pages into res/man/"
 
+# Render the manual pages of the GTK3 port, into the same catman directory.
+#
+# By SHIPPED BINARY rather than by what the sysroot contains, which is the
+# opposite of xorg-manpages above and deliberate.  That target walks the
+# sysroot's man1 and names the exceptions to skip; here the exceptions would be
+# the rule -- building this stack leaves about fifty section 1 pages behind for
+# the tiff, jpeg, pcre2, gettext and enchant command-line tools, none of which
+# are staged.  A manual page for a command that does not exist is worse than no
+# page, so the list below is exactly the programs gtk3/stage.sh installs.
+#
+# Most of them have no page at all: fontconfig and GLib are built with their
+# documentation off, since it needs a toolchain whose output nothing here
+# reads.  Only claws-mail actually renders today; the rest are listed so that
+# adding one to the image adds its page without anyone having to remember.
+GTK3_MAN_PROGS = claws-mail gio gsettings gdbus gapplication \
+		 fc-list fc-match fc-cache
+
+.PHONY: gtk3-manpages
+gtk3-manpages:
+	@set -e; \
+	sysroot=$$(pwd)/$(BUILD_DIR)/xorg-sysroot; \
+	if [ ! -d $$sysroot/usr/share/man/man1 ]; then \
+		echo "no sysroot; run make ports-gtk3 first"; exit 1; \
+	fi; \
+	out=$$(cd res/man && pwd); \
+	n=0; \
+	for prog in $(GTK3_MAN_PROGS); do \
+		src=""; \
+		for cand in $$sysroot/usr/share/man/man1/$$prog.1 \
+			    $$sysroot/usr/share/man/man1/$$prog.1.gz; do \
+			[ -f $$cand ] && src=$$cand && break; \
+		done; \
+		[ -n "$$src" ] || continue; \
+		case $$src in \
+		*.gz) cat="zcat" ;; \
+		*)    cat="cat"  ;; \
+		esac; \
+		$$cat $$src 2>/dev/null | GROFF_NO_SGR=1 groff -Tascii \
+			-mandoc - 2>/dev/null | col -bx \
+			| $(MANPAGE_FIXUP) > $$out/$$prog.1; \
+		if [ -s $$out/$$prog.1 ]; then \
+			n=$$((n + 1)); \
+			echo "  res/man/$$prog.1 ($$(wc -l < $$out/$$prog.1) lines)"; \
+		else \
+			rm -f $$out/$$prog.1; \
+			echo "  SKIP $$prog (rendered empty)"; \
+		fi; \
+	done; \
+	echo "rendered $$n GTK3 manual pages into res/man/"
+
 # Install dependencies (Ubuntu/Debian)
 #
-# The newest meson any package in the tree asks for: pixman's meson.build.
-# Raise it when a package that needs more is added.
-MESON_MIN_VERSION = 1.3.0
+# The newest meson any package in the tree asks for: GLib's meson.build, which
+# is well ahead of what Ubuntu 24.04 packages (1.3.2) -- hence the pip install
+# in `deps` below.  Raise it when a package that needs more is added.
+MESON_MIN_VERSION = 1.4.0
 
 deps:
 	@echo "Installing build dependencies..."
@@ -1878,24 +2036,54 @@ deps:
 	# (maintenance target only, but the tools belong on the list).
 	sudo apt install -y meson ninja-build libtool gperf xsltproc xfonts-utils \
 		bison flex cmake groff python3-pip || true
-	# The apt meson is not always new enough.  pixman's meson.build asks for
-	# >= 1.3.0 and Ubuntu 22.04 ships 0.61.2, so the port stops there with
+	# GTK3 port build tooling.  g++ builds the target's libstdc++ and the two
+	# C++ packages above it (HarfBuzz, Enchant); gettext supplies the HOST's
+	# msgfmt, which every package with translations runs at build time;
+	# docbook-xsl is the stylesheet set xsltproc needs to turn GLib's and
+	# GTK's manual-page sources into troff -- without it those packages
+	# configure with man pages silently off.
+	sudo apt install -y g++ gettext docbook-xsl docbook-xml itstool || true
+	# The apt meson is not always new enough.  GLib's meson.build asks for
+	# >= 1.4.0 and Ubuntu 24.04 ships 1.3.2, so the port stops there with
 	#
-	#     meson.build:21:0: ERROR: Meson version is 0.61.2 but project requires >= 1.3.0
+	#     meson.build:1:0: ERROR: Meson version is 1.3.2 but project requires >= 1.4.0
 	#
 	# which is a property of the build machine, not of the port -- the same
 	# tree builds on a newer distro.  meson is a Python program and upstream
 	# publishes it on PyPI, so pip supplies a current one where apt cannot.
-	# It lands in /usr/local/bin, which precedes /usr/bin, so the newer one
-	# wins without the apt package having to be removed.
-	@have=$$(meson --version 2>/dev/null || echo 0); \
+	#
+	# Into a virtual environment belonging to the PORT, not system-wide.
+	# `sudo pip3 install` is refused outright on Debian and Ubuntu from 24.04
+	# (PEP 668, "externally-managed-environment"): the system Python belongs
+	# to the distribution, and overriding that with --break-system-packages
+	# risks the package manager's own Python tools for the sake of one build
+	# dependency.  A venv under ports/xorg/.hosttools needs no root, changes
+	# nothing outside this tree, and sits exactly where the port's other
+	# build-host programs already live -- so `git clean` takes it away with
+	# everything else derived, and nothing is left behind on the machine.
+	#
+	# ports/xorg/build.sh puts that bin directory ahead of $$PATH when it
+	# invokes meson, so the venv copy is found without anything else needing
+	# to know it exists.
+	@have=$$(PATH="$$(pwd)/ports/xorg/.hosttools/bin:$$PATH" meson --version 2>/dev/null || echo 0); \
 	need=$(MESON_MIN_VERSION); \
 	if [ "$$(printf '%s\n%s\n' "$$need" "$$have" | sort -V | head -1)" = "$$need" ]; then \
 		echo "meson $$have is new enough (need >= $$need)"; \
 	else \
-		echo "meson $$have is older than $$need -- installing from PyPI"; \
-		sudo pip3 install --upgrade meson || \
-			echo "WARNING: no meson >= $$need; the pixman port will not configure"; \
+		echo "meson $$have is older than $$need -- installing into the port's own venv"; \
+		venv=ports/xorg/.hosttools/venv; \
+		mkdir -p ports/xorg/.hosttools/bin; \
+		python3 -m venv $$venv 2>/dev/null || { \
+			echo "  python3 -m venv failed; install python3-venv:"; \
+			echo "      sudo apt install -y python3-venv"; \
+			exit 1; \
+		}; \
+		$$venv/bin/pip install --quiet --upgrade "meson>=$$need" || { \
+			echo "WARNING: could not install meson >= $$need into $$venv"; \
+			exit 1; \
+		}; \
+		ln -sfn ../venv/bin/meson ports/xorg/.hosttools/bin/meson; \
+		echo "  meson $$($$venv/bin/meson --version) installed in $$venv"; \
 	fi
 	# Same shape, for the same reason: xkeyboard-config's rules generator
 	# imports StrEnum, which is in the standard library from Python 3.11.

@@ -1,6 +1,10 @@
 #ifndef _STRING_H
 #define _STRING_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 // Memory functions
@@ -47,5 +51,9 @@ int strverscmp(const char* s1, const char* s2);
 /* Locale-aware comparison; the C locale collates by byte value. */
 int strcoll(const char* s1, const char* s2);
 size_t strxfrm(char* dest, const char* src, size_t n);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

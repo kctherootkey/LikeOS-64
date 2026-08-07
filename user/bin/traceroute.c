@@ -290,10 +290,10 @@ int main(int argc, char *argv[])
 				continue;
 			}
 
-			uint64_t timeout_ticks = (uint64_t)wait_max * 100;
+			uint64_t timeout_ms = (uint64_t)wait_max * 1000;
 			icmp_reply_t reply;
 			ret = raw_recv(RAW_RECV_ICMP_REPLY, &reply, id_seq,
-				       timeout_ticks);
+				       timeout_ms);
 			if (ret == 0) {
 				gettimeofday(&tv_recv, NULL);
 				uint32_t src =

@@ -1,0 +1,22 @@
+# Claws Mail defaults for a new account on LikeOS-64.
+#
+# Copied to ~/.claws-mail the first time the program runs, by the copy_dir() of
+# SYSCONFDIR/skel/.claws-mail in src/main.c.  Only the settings that this system
+# actually needs to differ on are listed; every key left out keeps the built-in
+# default, which is how the file is meant to be used.
+#
+# The fonts are the point.  Claws asks for "Sans" and "Monospace", which are
+# fontconfig aliases -- they resolve here, but only because the shipped conf.d
+# maps them, and they resolve to whatever happens to be installed.  Naming the
+# font that IS installed removes the guess: DejaVu is the only scalable family
+# on the image, and Pango renders through FreeType, so an alias that failed to
+# resolve would leave the reader showing blank lines rather than falling back.
+#
+# Sizes are one point larger than upstream's 9, which is chosen for displays
+# considerably denser than the ones this runs on.
+
+message_font_gtk2=DejaVu Sans Mono 10
+print_font_gtk2=DejaVu Sans Mono 10
+small_font_gtk2=DejaVu Sans 9
+normal_font_gtk2=DejaVu Sans 10
+bold_font_gtk2=DejaVu Sans Bold 10

@@ -1,0 +1,16 @@
+--- a/src/low-level/smtp/mailsmtp.c
++++ b/src/low-level/smtp/mailsmtp.c
+@@ -281,7 +281,12 @@
+     if (r != 0)
+       return MAILSMTP_ERROR_HOSTNAME;
+ 
+-#if (defined __linux__ || defined WIN32 || defined __sun)
++/* The real question is whether this platform's struct sockaddr carries a
++   sa_len field, which the BSDs have and Linux, Windows, Solaris -- and LikeOS
++   -- do not.  LikeOS is added here rather than by defining __linux__ for it:
++   its toolchain undefines that deliberately, precisely so a port cannot take a
++   code path meant for a different system without saying so. */
++#if (defined __linux__ || defined WIN32 || defined __sun || defined __LIKEOS__)
+     r = getnameinfo(&addr, addr_len, hostname, HOSTNAME_SIZE, NULL, 0, NI_NUMERICHOST);
+ #else
+     r = getnameinfo(&addr, addr.sa_len, hostname, HOSTNAME_SIZE, NULL, 0, NI_NUMERICHOST);

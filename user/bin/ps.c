@@ -170,7 +170,7 @@ static const col_spec_t col_specs[] = {
 	{ "user", "USER", 8, 0, COL_USER },
 	{ "vsize", "VSZ", 7, 1, COL_VSZ },
 	{ "vsz", "VSZ", 7, 1, COL_VSZ },
-	{ "wchan", "WCHAN", 6, 0, COL_WCHAN },
+	{ "wchan", "WCHAN", 16, 0, COL_WCHAN },
 	{ NULL, NULL, 0, 0, 0 }
 };
 
@@ -829,7 +829,16 @@ static void format_value(const procinfo_t *p, int id, char *buf, size_t sz)
 		snprintf(buf, sz, "%d", p->is_kernel ? 1 : 0);
 		break;
 	case COL_WCHAN:
-		snprintf(buf, sz, "-");
+		/* The kernel address of the call this task is asleep in.  Shown
+		 * as a bare address rather than a symbol because the shipped
+		 * kernel is stripped; resolve it on the build host with
+		 *   addr2line -f -e build/kernel.elf <addr>
+		 * against a NO_STRIP=1 build. */
+		if (p->wchan)
+			snprintf(buf, sz, "%llx",
+				 (unsigned long long)p->wchan);
+		else
+			snprintf(buf, sz, "-");
 		break;
 	case COL_ADDR:
 		snprintf(buf, sz, "-");
@@ -1325,6 +1334,25 @@ static int parse_bsd_opts(int argc, char **argv, int *consumed)
 		consumed[i] = 0;
 		if (argv[i][0] == '-' || argv[i][0] == '\0')
 			continue;
+
+		/*
+		 * An entry with no leading dash is BSD options -- UNLESS the
+		 * previous entry was a UNIX option that takes an argument, in
+		 * which case this IS that argument and belongs to getopt.
+		 *
+		 * Without this check the two syntaxes collide:
+		 * `ps -o pid,comm,state,wchan' had its format list read as a
+		 * bundle of BSD flags and died on "unknown BSD option 'p'".
+		 * The letters are the argument-taking ones from the getopt
+		 * string below; keep the two in step.
+		 */
+		if (argv[i - 1][0] == '-' && argv[i - 1][1] != '-' &&
+		    argv[i - 1][1] != '\0') {
+			char last = argv[i - 1][strlen(argv[i - 1]) - 1];
+
+			if (strchr("pCGguUstoOqk", last))
+				continue;
+		}
 
 		/* This arg looks like BSD options (no leading dash) */
 		consumed[i] = 1;

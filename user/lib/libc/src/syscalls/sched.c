@@ -2,6 +2,7 @@
 #include <sched.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include "syscall.h"
 
 extern int errno;
@@ -170,6 +171,52 @@ int futex_wait(volatile int *uaddr, int val, const struct timespec *timeout)
 		return -1;
 	}
 	return 0;
+}
+
+/*
+ * The absolute-deadline form of futex_wait.
+ *
+ * SYS_FUTEX takes a RELATIVE timeout; POSIX states every deadline it has as an
+ * ABSOLUTE time.  Converting between the two is the caller's job, and callers
+ * that skipped it (pthread_cond_timedwait and pthread_mutex_timedlock both did)
+ * handed the kernel an epoch timestamp as a duration -- about 1.8e9 seconds,
+ * which is not a long timeout but an infinite one.  Neither function could ever
+ * report ETIMEDOUT.
+ *
+ * The remaining time is recomputed on every call rather than once, which is
+ * also what makes a spurious wake harmless: the wait shrinks towards the
+ * deadline instead of restarting from it.  An already-expired deadline waits
+ * not at all, as POSIX requires.
+ *
+ * `abstime' is against CLOCK_REALTIME, the clock POSIX names for all of these
+ * interfaces.  NULL waits indefinitely, exactly as futex_wait(..., NULL) does.
+ */
+int __futex_wait_until(volatile int *uaddr, int val,
+		       const struct timespec *abstime)
+{
+	struct timespec now, rel;
+
+	if (!abstime)
+		return futex_wait(uaddr, val, NULL);
+
+	if (abstime->tv_nsec < 0 || abstime->tv_nsec >= 1000000000L) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	clock_gettime(CLOCK_REALTIME, &now);
+	rel.tv_sec = abstime->tv_sec - now.tv_sec;
+	rel.tv_nsec = abstime->tv_nsec - now.tv_nsec;
+	if (rel.tv_nsec < 0) {
+		rel.tv_nsec += 1000000000L;
+		rel.tv_sec--;
+	}
+	if (rel.tv_sec < 0) {
+		errno = ETIMEDOUT;
+		return -1;
+	}
+
+	return futex_wait(uaddr, val, &rel);
 }
 
 int futex_wake(volatile int *uaddr, int count)

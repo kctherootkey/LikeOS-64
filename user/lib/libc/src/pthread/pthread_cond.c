@@ -21,6 +21,8 @@ extern int errno;
 // Futex operations
 extern int futex_wait(volatile int *uaddr, int val,
 		      const struct timespec *timeout);
+extern int __futex_wait_until(volatile int *uaddr, int val,
+			      const struct timespec *abstime);
 extern int futex_wake(volatile int *uaddr, int count);
 
 // Futex requeue operation
@@ -192,7 +194,12 @@ int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex,
 	// Wait with timeout
 	int timeout_ret = 0;
 	while (cond->seq == seq) {
-		int fret = futex_wait((int *)&cond->seq, seq, abstime);
+		/* Absolute deadline: __futex_wait_until does the conversion the
+		 * kernel's relative timeout needs.  EINTR and spurious wakes
+		 * fall through to the loop condition, which re-checks the
+		 * sequence -- POSIX does not allow this function to report
+		 * either to its caller. */
+		int fret = __futex_wait_until((int *)&cond->seq, seq, abstime);
 		if (fret < 0 && errno == ETIMEDOUT) {
 			timeout_ret = ETIMEDOUT;
 			break;

@@ -266,11 +266,77 @@ uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
 					     const struct mmap_region *regions,
 					     int num_regions);
 
-// Physical page refcounting (for COW)
+/* ---- batched unmap: flush first, free second ---------------------------
+ *
+ * Clearing a page-table entry ends the translation on the local CPU only.
+ * Releasing the page before every other CPU has been told to forget it hands
+ * a still-reachable page back to the allocator -- and freed pages are
+ * poisoned, so the old owner starts reading 0xFEEDFACE out of its own memory.
+ *
+ * Collect the pages of a range here, invalidate once, then release the batch.
+ * See the comment on the definitions in kernel/mm/memory.c for which paths
+ * need this and which are already covered.
+ */
+#define MM_TLB_GATHER_BATCH 64
+struct mm_tlb_gather {
+	uint64_t pages[MM_TLB_GATHER_BATCH];
+	unsigned n;
+};
+
+void mm_tlb_gather_init(struct mm_tlb_gather *g);
+/* Queue a page whose entry is already cleared; its reference is held until the
+ * flush, which is what stops the page being reused too early. */
+void mm_tlb_gather_page(struct mm_tlb_gather *g, uint64_t phys);
+/* Invalidate on every CPU, then drop the batch's references. */
+void mm_tlb_gather_flush(struct mm_tlb_gather *g);
+
+/* ---- the task's mmap region table --------------------------------------
+ *
+ * The records describing a process's mappings, and the teardown that keeps
+ * them in step with the page tables.  These live here rather than in the
+ * syscall layer because they ARE address-space management: the demand-fault
+ * handler above is their other main consumer, and mm_unmap_range_and_regions()
+ * is the only correct way to remove a mapping -- pages and record together.
+ */
+struct task;
+/* Find the in-use region covering `addr`, or NULL. */
+struct mmap_region *mm_find_mmap_region(struct task *task, uint64_t addr);
+/* Claim a free, zeroed region slot (in_use stays false -- the caller sets it
+ * once the mapping is fully built), or NULL when the table is full. */
+struct mmap_region *mm_alloc_mmap_region(struct task *task);
+/* Tear down every mapping in [addr, addr+length): free the pages AND release
+ * or trim the records covering them.  Returns 1 if anything was found.  Both
+ * munmap and MAP_FIXED must use this -- freeing pages without releasing the
+ * records leaks slots until every later mmap() fails with -ENOMEM. */
+int mm_unmap_range_and_regions(struct task *task, uint64_t addr,
+			       uint64_t length);
+/* Release the physical pages backing [addr, addr+length) but KEEP the mapping
+ * and its record.  The next access faults a fresh zero page.  This is what an
+ * allocator wants when it returns memory it may need again shortly -- unmapping
+ * would punch a hole in the mapping and cost a region record each time. */
+void mm_dontneed_range(struct task *task, uint64_t addr, uint64_t length);
+/* Fold adjacent records that describe one continuous mapping back into one.
+ * Without this, repeated split/remap cycles spend a record each time until the
+ * table is full and every later mmap fails. */
+void mm_merge_mmap_regions(struct task *task);
+/* Pages this address space actually has resident -- the real resident set,
+ * as opposed to how much address space has been reserved. */
+uint64_t mm_count_resident_pages(uint64_t *pml4);
+
+/* Physical page reference counting.
+ *
+ * mm_allocate_physical_page() returns a page whose count is ONE -- the
+ * reference the caller now holds.  Zero means the page is free and nothing
+ * else; there is no "allocated but untracked" state, which is what the old
+ * seed-on-first-share counter had and what made a page mapped twice but
+ * counted once releasable by whichever mapping went away first.
+ *
+ * Take a reference for every new mapping of a page, drop one for every mapping
+ * removed.  mm_put_page() releases the page itself when the last reference
+ * goes, so no caller has to decide whether a free is due. */
 void mm_init_page_refcounts(void);
-void mm_incref_page(uint64_t physical_addr);
-bool mm_decref_page(
-	uint64_t physical_addr); // Returns true if refcount reached 0
+void mm_get_page(uint64_t physical_addr);
+void mm_put_page(uint64_t physical_addr);
 uint16_t mm_get_page_refcount(uint64_t physical_addr);
 
 // Kernel Heap Allocator

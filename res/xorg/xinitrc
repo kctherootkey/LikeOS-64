@@ -105,6 +105,15 @@ if [ -x /usr/bin/xload ]; then
 	unset _ncpu
 fi
 
+# Cursor theme.  Xcursor reads the resource file above for most clients, but a
+# program that starts before resources are loaded -- or one that consults the
+# environment first, which Xcursor does -- needs it here too.  The theme is
+# generated at image-build time into /usr/share/icons/LikeOS and supplies the
+# busy cursors; everything else falls back to the X core cursor font.
+XCURSOR_THEME=LikeOS
+XCURSOR_SIZE=32
+export XCURSOR_THEME XCURSOR_SIZE
+
 # No terminal is started here on purpose.  Use "New xterm" on the root menu
 # (button 1 on the background) to open one.  Starting clients from this script
 # only obscures which of them failed and why.

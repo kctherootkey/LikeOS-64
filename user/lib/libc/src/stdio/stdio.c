@@ -657,14 +657,38 @@ void setlinebuf(FILE *stream)
 	setvbuf(stream, NULL, _IOLBF, BUFSIZ);
 }
 
-// Helper function for number to string conversion
-static int num_to_str(long long num, char *buf, int base, int uppercase)
+/*
+ * Digits of a magnitude, in the given base.  UNSIGNED, and it emits no sign:
+ * the caller decides that, because only the caller knows whether the
+ * conversion is a signed one.
+ *
+ * It used to take a `long long` and prefix a '-' of its own whenever the value
+ * came out negative in base 10, which was wrong for both kinds of caller and
+ * for the same reason -- a 64-bit magnitude does not fit in a signed 64-bit
+ * parameter:
+ *
+ *   - %u, %lu, %llu and %zu read an unsigned value correctly and then cast it
+ *     to pass it here.  Anything with the top bit set arrived negative, so
+ *     printf("%lu", (unsigned long)-1) produced "-1" instead of
+ *     18446744073709551615, and every size, count and hash above 2^63 printed
+ *     as a small negative number.
+ *
+ *   - %d and %lld already reduce their argument to a magnitude and print the
+ *     sign themselves.  For LLONG_MIN that magnitude is 2^63, which read back
+ *     as negative here and picked up a SECOND '-': printf("%lld", LLONG_MIN)
+ *     gave "--9223372036854775808", one character longer than the value it was
+ *     asked to print.
+ *
+ * Hex and octal were unaffected only because the sign branch was gated on
+ * base 10, which is what kept %p and %x honest while %lu was not.
+ */
+static int num_to_str(unsigned long long num, char *buf, int base,
+		      int uppercase)
 {
 	const char *digits =
 		uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
 	char temp[64];
 	int i = 0;
-	int is_negative = 0;
 
 	if (num == 0) {
 		buf[0] = '0';
@@ -672,28 +696,63 @@ static int num_to_str(long long num, char *buf, int base, int uppercase)
 		return 1;
 	}
 
-	if (num < 0 && base == 10) {
-		is_negative = 1;
-		num = -num;
-	}
-
-	unsigned long long unum = num;
-	while (unum > 0) {
-		temp[i++] = digits[unum % base];
-		unum /= base;
+	while (num > 0) {
+		temp[i++] = digits[num % (unsigned)base];
+		num /= (unsigned)base;
 	}
 
 	int len = 0;
-	if (is_negative) {
-		buf[len++] = '-';
-	}
-
 	while (i > 0) {
 		buf[len++] = temp[--i];
 	}
 	buf[len] = '\0';
 
 	return len;
+}
+
+/*
+ * Sign of a double, including negative zero.
+ *
+ * `val < 0.0` is FALSE for -0.0, so every float conversion here used to drop
+ * its sign: printf("%f", -0.0) produced "0.000000" where C, and every other
+ * implementation, produce "-0.000000".  The sign of zero is not a curiosity --
+ * it is how a computation reports which side it underflowed from, and dropping
+ * it silently discards that.
+ */
+static int dbl_is_neg(double v)
+{
+	union {
+		double d;
+		unsigned long long u;
+	} b = { .d = v };
+	return (int)(b.u >> 63);
+}
+
+/*
+ * Round a scaled fraction to an integer, breaking exact ties to even.
+ *
+ * The obvious `(unsigned long long)(x + 0.5)` rounds halves AWAY from zero,
+ * which is not what C does: the conversion follows the current rounding
+ * direction, and that is round-to-nearest-even.  The difference shows on every
+ * exactly-representable tie -- "%.0f" of 0.5 came out as 1 rather than 0, and
+ * "%.2f" of 0.125 as 0.13 rather than 0.12 -- so any value landing exactly
+ * halfway printed one ulp high, consistently and in the same direction.
+ *
+ * `int_part` decides the tie when there are no fractional digits to keep, e.g.
+ * "%.0f", where the digit being rounded is the last integer digit: 0.5 goes to
+ * 0 and 1.5 goes to 2, both to even.
+ */
+static unsigned long long round_half_even(double scaled, int have_frac_digits,
+					  unsigned long long int_part)
+{
+	unsigned long long iv = (unsigned long long)scaled;
+	double rem = scaled - (double)iv;
+
+	if (rem > 0.5)
+		return iv + 1;
+	if (rem < 0.5)
+		return iv;
+	return ((have_frac_digits ? iv : int_part) & 1ULL) ? iv + 1 : iv;
 }
 
 /* Store one character if it fits, and count it either way.
@@ -868,7 +927,7 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 					sign = ' ';
 			}
 
-			len = num_to_str((long long)uval, buf, 10, 0);
+			len = num_to_str(uval, buf, 10, 0);
 
 			/* C99 integer precision: at least `prec` digits,
 			 * zero-filled on the left.  A precision of 0 with a
@@ -922,7 +981,7 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 			else if (sht == 2)
 				val = (unsigned char)val;
 
-			len = num_to_str((long long)val, buf, 10, 0);
+			len = num_to_str(val, buf, 10, 0);
 
 			/* C99 integer precision: at least `prec` digits,
 			 * zero-filled on the left.  A precision of 0 with a
@@ -973,7 +1032,7 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 			else if (sht == 2)
 				val = (unsigned char)val;
 
-			len = num_to_str((long long)val, buf, 16,
+			len = num_to_str(val, buf, 16,
 					 *format == 'X');
 			/* C99 integer precision: at least `prec` digits,
 			 * zero-filled on the left.  A precision of 0 with a
@@ -1044,7 +1103,7 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 			else if (sht == 2)
 				val = (unsigned char)val;
 
-			len = num_to_str((long long)val, buf, 8, 0);
+			len = num_to_str(val, buf, 8, 0);
 
 			/* C99 integer precision: at least `prec` digits,
 			 * zero-filled on the left.  A precision of 0 with a
@@ -1090,10 +1149,8 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 			void *ptr = va_arg(ap, void *);
 			SP_PUT('0');
 			SP_PUT('x');
-			len = num_to_str(
-				(long long)(unsigned long long)(unsigned long)
-					ptr,
-				buf, 16, 0);
+			len = num_to_str((unsigned long long)(unsigned long)ptr,
+					 buf, 16, 0);
 			for (int i = 0; i < len; i++)
 				SP_PUT(buf[i]);
 			format++;
@@ -1218,12 +1275,10 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 					     va_arg(ap, double);
 			int fprec = (prec < 0) ? 6 : prec;
 
-			/* Handle negative / sign */
-			int is_neg = 0;
-			if (val < 0.0) {
-				is_neg = 1;
+			/* Handle negative / sign (negative zero included) */
+			int is_neg = dbl_is_neg(val);
+			if (is_neg)
 				val = -val;
-			}
 
 			/* Separate integer and fractional parts.
              * Multiply fractional part by 10^fprec and round. */
@@ -1235,8 +1290,8 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 			for (int i = 0; i < fprec; i++)
 				fmul *= 10;
 
-			unsigned long long frac_val =
-				(unsigned long long)(frac * (double)fmul + 0.5);
+			unsigned long long frac_val = round_half_even(
+				frac * (double)fmul, fprec > 0, int_part);
 			/* Handle rounding overflow (e.g. 9.9999... rounds up) */
 			if (frac_val >= fmul) {
 				frac_val = 0;
@@ -1312,11 +1367,9 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 					     (double)va_arg(ap, long double) :
 					     va_arg(ap, double);
 			int fprec = (prec < 0) ? 6 : prec;
-			int is_neg = 0;
-			if (val < 0.0) {
-				is_neg = 1;
+			int is_neg = dbl_is_neg(val); /* -0.0 counts */
+			if (is_neg)
 				val = -val;
-			}
 
 			/* Compute exponent: normalize val to [1.0, 10.0) */
 			int exponent = 0;
@@ -1337,8 +1390,8 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 			unsigned long long fmul = 1;
 			for (int i = 0; i < fprec; i++)
 				fmul *= 10;
-			unsigned long long frac_val =
-				(unsigned long long)(frac * (double)fmul + 0.5);
+			unsigned long long frac_val = round_half_even(
+				frac * (double)fmul, fprec > 0, int_digit);
 			if (frac_val >= fmul) {
 				frac_val = 0;
 				int_digit++;
@@ -1426,11 +1479,9 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 					     (double)va_arg(ap, long double) :
 					     va_arg(ap, double);
 			int fprec = (prec < 0) ? 6 : (prec == 0 ? 1 : prec);
-			int is_neg = 0;
-			if (val < 0.0) {
-				is_neg = 1;
+			int is_neg = dbl_is_neg(val); /* -0.0 counts */
+			if (is_neg)
 				val = -val;
-			}
 
 			int exponent = 0;
 			double nval = val;
@@ -1445,11 +1496,26 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 				}
 			}
 
-			/* Restore val (we just needed the exponent) */
-			if (is_neg) {
-				/* Re-format using %f or %e style. For simplicity, push the
-                 * value back to its negative form and use 'f' or 'e' logic
-                 * via a recursive snprintf into buf. */
+			/* Rounding to fprec significant digits can carry into
+			 * the next decade -- 999.9995 at %.3g becomes 1000 --
+			 * and the style must be chosen from the exponent the
+			 * value will actually PRINT with, not the one it had
+			 * before rounding.  Deciding first yields "1000" where
+			 * the rule (%e once the exponent reaches the precision)
+			 * calls for "1e+03".
+			 *
+			 * Bounded at 17 digits because that is the most a
+			 * double distinguishes, and because 10^18 is the last
+			 * power of ten that fits the counter below. */
+			if (nval != 0.0 && fprec >= 1 && fprec <= 17) {
+				unsigned long long m = 1;
+				for (int i = 0; i < fprec - 1; i++)
+					m *= 10;
+				unsigned long long r = round_half_even(
+					nval * (double)m, fprec > 1,
+					(unsigned long long)nval);
+				if (r >= m * 10)
+					exponent++;
 			}
 
 			char tmp_buf[80];
@@ -1478,9 +1544,8 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 				unsigned long long fmul = 1;
 				for (int i = 0; i < ep; i++)
 					fmul *= 10;
-				unsigned long long fv =
-					(unsigned long long)(fr * (double)fmul +
-							     0.5);
+				unsigned long long fv = round_half_even(
+					fr * (double)fmul, ep > 0, idig);
 				if (fv >= fmul) {
 					fv = 0;
 					idig++;
@@ -1543,9 +1608,8 @@ static int vsnprintf_body(char *str, size_t size, const char *format,
 				unsigned long long fmul = 1;
 				for (int i = 0; i < fp; i++)
 					fmul *= 10;
-				unsigned long long fv =
-					(unsigned long long)(fr * (double)fmul +
-							     0.5);
+				unsigned long long fv = round_half_even(
+					fr * (double)fmul, fp > 0, ipart);
 				if (fv >= fmul) {
 					fv = 0;
 					ipart++;

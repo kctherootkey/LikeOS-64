@@ -237,10 +237,10 @@ int main(int argc, char *argv[])
 		}
 		g_sent++;
 
-		uint64_t timeout_ticks =
-			(uint64_t)(deadline > 0 ? 1 : interval) * 100;
+		uint64_t timeout_ms =
+			(uint64_t)(deadline > 0 ? 1 : interval) * 1000;
 		uint8_t mac[6];
-		ret = raw_recv(RAW_RECV_ARP_REPLY, mac, dst_ip, timeout_ticks);
+		ret = raw_recv(RAW_RECV_ARP_REPLY, mac, dst_ip, timeout_ms);
 		if (ret == 0) {
 			gettimeofday(&tv_recv, NULL);
 			long rtt_us =

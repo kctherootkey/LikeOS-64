@@ -19,6 +19,10 @@
 #ifndef _SYS_SYSMACROS_H
 #define _SYS_SYSMACROS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 /* The casts matter: dev_t is wider than int, and without them a major number
@@ -34,5 +38,9 @@
 #define gnu_dev_major(dev)        major(dev)
 #define gnu_dev_minor(dev)        minor(dev)
 #define gnu_dev_makedev(maj, min) makedev(maj, min)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SYS_SYSMACROS_H */

@@ -1,0 +1,469 @@
+CLAWS MAIL(1)                    User Manuals                    CLAWS MAIL(1)
+
+NAME
+       Claws Mail - a GTK based fast email and news client
+
+
+SYNOPSIS
+       claws-mail [options]...
+
+
+DESCRIPTION
+       Claws Mail is an email client (and news reader) based on GTK, running
+       on the X Window System, and aiming for:
+              o Quick response
+              o Graceful, and sophisticated interface
+              o Easy configuration, intuitive operation
+              o Abundant features
+
+       Currently implemented features include:
+              o POP3 support
+              o IMAP4rev1 support
+              o integrated NetNews client
+              o unlimited multiple account handling
+              o thread display
+              o filtering
+              o MIME (attachments)
+              o built-in image view
+              o X-Face and (colour) Face support
+              o multiple MH folder support
+              o mbox importing / exporting
+              o external editor support
+              o message queueing
+              o automatic mail checking
+              o draft message function
+              o template function
+              o line-wrapping
+              o clickable URI
+              o XML-based address book
+              o LDAP, vCard, and JPilot support
+              o newly arrived and unread message management
+              o Mew/Wanderlust-like key bind
+              o printing
+              o APOP authentication support
+              o SMTP AUTH support
+              o SSL support (POP3, SMTP, IMAP4rev1)
+              o IPv6 support
+              o drag & drop (partially implemented)
+              o GnuPG support
+              o automake + autoconf support
+              o internationalization of UI messages by gettext
+              o support of many code sets, including UTF-8 (Unicode)
+              o support for plugins
+
+       This list is not complete.
+
+
+OPTIONS
+        --compose [address]
+        --compose-from-file file
+        --subscribe uri
+        --attach file1 [file2]...
+        --insert file1 [file2]...
+        --import-mbox file
+        --receive
+        --receive-all
+        --cancel-receiving
+        --cancel-sending
+        --search folder type request [recursive]
+        --send
+        --status
+        --status folder[/subfolder]
+        --status-full
+        --status-full folder[/subfolder]
+        --statistics
+        --reset-statistics
+        --select  [#mh/mailbox/]folder[/msg|/msgid],  a  file:// uri or an ab-
+       solute path
+        --online
+        --offline
+        --exit
+        --debug
+        --toggle-debug
+        --help
+        --version
+        --version-full
+        --config-dir
+        --alternate-config-dir directory
+        --geometry [WxH][+X+Y]
+
+
+FILES
+       $HOME/Mail
+              Default directory for mail storage.
+
+       $PREFIX/share/claws-mail
+              Global program directory.
+
+       $PREFIX/share/claws-mail/manual
+              Manual files in HTML, PDF, PostScript and plain text format.
+
+       $PREFIX/share/claws-mail/themes
+              Global themes directory.
+
+       $PREFIX/lib/claws-mail/plugins
+              Directory for plugins.
+
+       $PREFIX/include/claws-mail
+              Directory for header files.
+
+       $HOME/.claws-mail
+              Default directory for user's configuration files directory.
+
+       $HOME/.claws-mail/imapcache/*
+              IMAP caches.
+
+       $HOME/.claws-mail/addrbook/*
+              Addressbook files.
+
+       $HOME/.claws-mail/autofaces/*
+              Automatic Faces and X-Faces files for accounts.
+
+       $HOME/.claws-mail/certs/*
+              SSL certificates received from mail servers.
+
+       $HOME/.claws-mail/tagsdb
+              Tags directory.
+
+       $HOME/.claws-mail/templates
+              User-defined templates directory.
+
+       $HOME/.claws-mail/themes
+              User's themes directory.
+
+       $HOME/.claws-mail/accountrc
+              Configuration for account(s).
+
+       $HOME/.claws-mail/actionsrc
+              User-defined custom actions.
+
+       $HOME/.claws-mail/addrbook/attributesrc
+              User-defined address book custom attributes.
+
+       $HOME/.claws-mail/claws.log
+              Claws Mail logfile.
+
+       $HOME/.claws-mail/clawsrc
+              Main configuration file.
+
+       $HOME/.claws-mail/command_history
+              User-specified commands.
+
+       $HOME/.claws-mail/customheaderrc
+              Configuration for custom headers for sending mail.
+
+       $HOME/.claws-mail/dispheaderrc
+              Configuration for custom display of headers in message view.
+
+       $HOME/.claws-mail/extraheaderrc
+              Editable extra headers to be added to compose window combobox.
+
+       $HOME/.claws-mail/folderitemrc
+              All folders' attributes.
+
+       $HOME/.claws-mail/folderlist.xml
+              Folder hierarchy listing.
+
+       $HOME/.claws-mail/matcherrc
+              Filtering and Processing function configuration.
+
+       $HOME/.claws-mail/menurc
+              Menu shortcut-key configuration.
+
+       $HOME/.claws-mail/messagesearch_history
+              User-specified searches in message bodies.
+
+       $HOME/.claws-mail/quicksearch_history
+              User-specified quick-search list.
+
+       $HOME/.claws-mail/messagesearch_history
+              User-specified searches in message bodies.
+
+       $HOME/.claws-mail/oauth2rc
+              Oauth2 configuration.
+
+       $HOME/.claws-mail/summary*_history
+              User-specified searches in message list.
+
+       $HOME/.claws-mail/passwordstorerc
+              User saved passwords.
+
+       $HOME/.claws-mail/tagsrc
+              User-specified tag list.
+
+       $HOME/.claws-mail/toolbar*.xml
+              User-defined custom toolbars.
+
+       %TEMP%\claws-win32.log (Windows only)
+              Claws Mail output file when --debug is enabled. If %TEMP% is not
+              set it defaults to windows directory (usually C:\Windows) or C:\
+              if windows directory is not available.
+
+       %APPDATA%\Claws-mail\claws.log (Windows only)
+              Claws Mail log file.
+
+
+EXAMPLES
+       To run this program the standard way type:
+
+       claws-mail
+
+       Alternatively you can run it with the following options:
+
+       --compose [address]
+              To open a Compose window.
+
+       --compose "mailto:%t?subject=%s&cc=%c&body=%b"
+              This syntax can be used  in  web-browsers  and  CLI  to  open  a
+              pre-populated Compose window. Possible fields after the destina-
+              tion  recipient  are: subject, from, cc, bcc, in-reply-to, body,
+              insert (insert a file in body part, needs an absolute path), at-
+              tach (attach a file, needs an absolute  path,  see  also:  --at-
+              tach).
+
+       --compose-from-file file
+              Open  composition window with data from the given file. Use - as
+              file name for reading from standard input. Content format: head-
+              ers first (To: header required) until an empty  line  is  found,
+              then mail body until end of file.
+
+       --subscribe uri
+              Subscribe to the given URI if possible.
+
+       --attach file1 [file2]...
+              Open composition window with specified files attached.
+
+       --insert file1 [file2]...
+              Open composition window with specified files inserted.
+
+       --receive
+              Receive new messages.
+
+       --receive-all
+              Receive new messages from all accounts.
+
+       --cancel-receiving
+              Cancel receiving of messages.
+
+       --cancel-sending
+              Cancel sending of messages.
+
+       --search folder type request [recursive]
+              Searches mail:
+              folder ex.: "#mh/Mailbox/inbox" or "Mail"
+              type: s[ubject],f[rom],t[o],e[xtended],m[ixed] or g: tag
+              request: search string
+              recursive: false if arg. starts with 0, n, N, f or F
+
+       --send
+              Send all queued messages.
+
+       --status
+              Show the total number of messages:
+              [new][unread][unread answers to marked][total]
+
+       --status folder[/subfolder]
+              Show the total number of messages in the specified folder:
+              [new][unread][unread answers to marked][total]
+
+       --status-full
+              Show the total number of messages per folder:
+              [new][unread][unread answers to marked][total]
+
+       --status-full folder[/subfolder]
+              Show the total number of messages int the specified folder:
+              [new][unread][unread answers to marked][total]
+
+       --statistics
+              Show session statistics.
+
+       --reset-statistics
+              Reset session statistics.
+
+       --select #mh/Mailbox/inbox/123
+       --select file://home/johndoe/Mail/inbox/123
+       --select /home/johndoe/Mail/inbox/123
+              On startup, jump to the specified folder/message.
+
+       --online
+              Start  Claws  Mail  in (or switch to, if already running) online
+              mode.
+
+       --offline
+              Start Claws Mail in (or switch to, if already  running)  offline
+              mode.
+
+       --exit Exit Claws Mail.
+
+       --debug
+              For  debug  mode (on Windows systems output is written to a file
+              instead of standard error output, see Windows only on FILES sec-
+              tion).
+
+       --toggle-debug
+              Toggle debug mode of the running Claws Mail instance.
+
+       --help Display the help message.
+
+       --version
+              Display version number.
+
+       --version-full
+              Display version number and compiled-in features.
+
+       --config-dir
+              Display the CONFIG-DIR.
+
+       --alternate-config-dir dir
+              Start Claws Mail with the configuration stored in the [dir]  di-
+              rectory.
+
+       --geometry [WxH][+X+Y]
+              Set initial X geometry of main window.
+
+
+ENVIRONMENT
+       CLAWS_NO_CRASH
+              If  defined  disables  crash dialog (only if Claws Mail has been
+              built with crash dialog feature enabled).
+
+       DISPLAY
+              Default host and display number to use.
+
+       ETPANSERVER, ETPANPORT
+              When using a tunnel command to  open  server  connections  these
+              temporary  variables  are set to the server name and server port
+              respectively in the environment of the running command.
+
+       GPG_AGENT_INFO
+              The information to access the GPG agent if using  GPG  agent  is
+              enabled  in  GPG  plugin preferences (this is usually set by the
+              agent when launched, otherwise it likely means the GPG agent  is
+              not running).
+
+       G_BROKEN_FILENAMES
+              Assumes that filenames are in the locale encoding rather than in
+              UTF-8.
+
+       HOME   Full path of the user's home directory.
+
+       LC_ALL, LC_CTYPE, LANG
+              Locale  to  use for non-windows systems (the first one not empty
+              is used).
+
+       PILOT_CHARSET
+              If defined overrides default J-Pilot charset (CP1252).
+
+       POSIXLY_CORRECT
+              If defined regular expressions matching follows POSIX standards.
+
+       SESSION_MANAGER
+              If defined tries to use the Session Manager (only if Claws  Mail
+              has been built with libSM feature enabled).
+
+       SHELL  If  defined  overrides  default  shell "sh" used by Spamassassin
+              plugin to launch spamc wrappers.
+
+       SSL_CERT_DIR
+              Use this CA certificates directory instead known system directo-
+              ries.
+
+       SSL_CERT_FILE
+              Use this CA certificates file instead of searching known  system
+              files.
+
+       USER   Used to initialize default "user_id" preference in newly created
+              accounts.
+
+
+BUGS
+       You can search for existing bugs and report new ones on Claws Mail
+       bugzilla:
+              <https://www.thewildbeast.co.uk/claws-mail/bugzilla/>
+
+
+COPYRIGHT
+       1999-2022 The Claws Mail team and Hiroyuki Yamamoto
+
+       Portions are also Copyright:
+       (C) 2007-2009 g10 Code GmbH
+       (C) 1999-2005 Nullsoft, Inc.
+       (C) 1991-1993, 1996-2000, 2001 Free Software Foundation, Inc.
+       (C) 2001 Thomas Link, Hiroyuki Yamamoto
+       (C) 1995-1997 Peter Mattis and Spencer Kimball
+       (C) 1995-1997 Peter Mattis, Spencer Kimball, Josh MacDonald
+       (C) 1997-1998 Jay Painter <jpaint@serv.net><jpaint@gimp.org>
+       (C) 1999-2003 Michael Natterer <mitch@gimp.org>
+       (C) 2000 Evan Martin
+       (C) 1998 Lars Hamann and Stefan Jeske
+       (C) 2005, 2006, 2007, 2009 GNOME Foundation
+       (C) 2004-2006 Christian Hammond
+       (C) 2003-2004 Pawel Salek
+       (C) 2001, 2002 - DINH Viet Hoa
+       (C) 1999-2000, Gael Roualland <gael.roualland@iname.com>
+       (C) 1998-2002 Sendmail, Inc.
+       (C) 2007-2008 Juha Kautto (juha at xfce.org)
+       (C) 1994-2002 World Wide Web Consortium
+       (C) 1999 Graham Davison
+       (C) 1999 Eric Busboom
+       (C) 2000, Eric Busboom, http://www.softwarestudio.org
+       (C) 2002-2007 Randall Hand <yerase@yerot.com>
+       (C) 2001 by Werner Koch <dd9jn@gnu.org>
+       (C) 2004 Apache Software Foundation
+       (C) 2008 Mikkel Kamstrup Erlandsen
+       (C) 2002  Red Hat, Inc.; Copyright 1998, 2001 Tim Janik
+       (C) 2008-2009  Christian Hammond, David Trowbridge
+       (C) 2003-2005  Lars Lindner <lars.lindner@gmx.net>
+       (C) 2004,2005  Nathan J. Conrad <t98502@users.sourceforge.net>
+       (C) 2004 Karl Soderstrom <ks@xanadunet.net>
+       (C) 2000 Helix Code, Inc. (www.helixcode.com)
+
+
+LICENSE
+       This program is free software: you can redistribute it and/or modify it
+       under the terms of the GNU General Public License as published by the
+       Free Software Foundation, either version 3 of the License, or (at your
+       option) any later version.
+
+       See COPYING file on toplevel distribution directory for more license
+       details.
+
+
+AUTHORS
+       The Claws Mail Team
+
+           Holger Berndt            <berndth@users.sf.net>
+           Tristan Chabredier       <wwp@claws-mail.org>
+           Darko Koruga             <darko@users.sf.net>
+           Ricardo Mones Lastra     <ricardo@mones.org>
+           Paul Mangan              <paul@claws-mail.org>
+           Salvatore De Paolis      <iwkse@claws-mail.org>
+           Michael Rasmussen        <mir@datanom.net>
+
+
+       Previous team members
+
+           Ho  Vit  Dinh,  Keith  Edmunds,  Match Grun, Melvin Hadasht, Oliver
+           Haertel, Christoph  Hohmann,  Alfons  Hoogervorst,  Andrej  Kacian,
+           Werner  Koch,  Charles  Lehner,  Colin Leroy, Thorsten Maerz, Pawel
+           Pekala, Leandro A. F. Pereira, Luke Plant, Martin  Schaaf,  Carsten
+           Schurig, Fabien Vantard, Sergey Vlasov and Hiroyuki Yamamoto.
+
+
+SEE ALSO
+       Claws Mail Homepage
+              <https://www.claws-mail.org>
+
+       Claws Mail frequently asked questions
+              <https://www.claws-mail.org/faq>
+
+       Claws Mail online manual
+              <https://www.claws-mail.org/manual>
+
+       Claws Mail plugins
+              <https://www.claws-mail.org/plugins.php>
+
+       X(7), xwininfo(1).
+
+
+The Claws Mail team            February 17, 2024                 CLAWS MAIL(1)

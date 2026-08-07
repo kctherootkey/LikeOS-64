@@ -1,6 +1,10 @@
 #ifndef _SYS_MMAN_H
 #define _SYS_MMAN_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 #include <sys/types.h>
 
@@ -56,5 +60,9 @@ int munlockall(void);
 
 #define MCL_CURRENT 1
 #define MCL_FUTURE  2
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

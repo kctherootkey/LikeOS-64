@@ -1,6 +1,10 @@
 #ifndef _STDIO_H
 #define _STDIO_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -30,9 +34,13 @@
  *                 five-digit pid there is room for six counter digits; 10000
  *                 is comfortably inside that and far above the 25 the standard
  *                 demands.  Understating it is safe, overstating it is not.
+ *
+ * Spelt as literals rather than by including <limits.h>, which <stdio.h> has
+ * no other reason to pull in; test_libc checks the two pairs still agree, so
+ * they cannot drift apart unnoticed.
  */
 #define FILENAME_MAX 4096
-#define FOPEN_MAX 256
+#define FOPEN_MAX 1024
 #define TMP_MAX 10000
 
 /* Buffering modes for setvbuf */
@@ -176,10 +184,24 @@ FILE* freopen(const char *pathname, const char *mode, FILE *stream);
 int dprintf(int fd, const char *format, ...);
 int vdprintf(int fd, const char *format, va_list ap);
 
-/* Implement flockfile/funlockfile as no-ops (single-threaded) */
-static inline void flockfile(FILE *f) { (void)f; }
-static inline void funlockfile(FILE *f) { (void)f; }
-static inline int ftrylockfile(FILE *f) { (void)f; return 0; }
-static inline int getc_unlocked(FILE *f) { return fgetc(f); }
+/*
+ * Implement flockfile/funlockfile as no-ops (single-threaded)
+ *
+ * __inline rather than inline, here and in every other header that defines a
+ * function body.  `inline' is not a keyword in C89, and a system header has to
+ * survive being included by a program compiled that way -- fribidi builds its
+ * command-line tool with -ansi, and every one of these turned into "expected
+ * ';' before 'void'".  __inline is a GCC spelling that means the same thing in
+ * every language mode, which is why the C library headers on other systems use
+ * it too.
+ */
+static __inline void flockfile(FILE *f) { (void)f; }
+static __inline void funlockfile(FILE *f) { (void)f; }
+static __inline int ftrylockfile(FILE *f) { (void)f; return 0; }
+static __inline int getc_unlocked(FILE *f) { return fgetc(f); }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

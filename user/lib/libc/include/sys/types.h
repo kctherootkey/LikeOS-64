@@ -1,6 +1,10 @@
 #ifndef _SYS_TYPES_H
 #define _SYS_TYPES_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 
 typedef int64_t  off_t;
@@ -31,6 +35,20 @@ typedef unsigned short u_short;
 typedef unsigned int   u_int;
 typedef unsigned long  u_long;
 
+/*
+ * The System V spellings of the same three, without the underscore.
+ *
+ * Not standard either, and the two sets have coexisted for so long that
+ * software picks whichever its author learned first -- Claws Mail's key-binding
+ * code uses `uint' in a file that has compiled everywhere for twenty years.
+ * Both sets are declared here for the same reason both are declared on every
+ * other system: the alternative is a build that stops on a type name rather
+ * than on anything meaningful.
+ */
+typedef unsigned int   uint;
+typedef unsigned short ushort;
+typedef unsigned long  ulong;
+
 typedef unsigned char  u_int8_t;
 typedef unsigned short u_int16_t;
 typedef unsigned int   u_int32_t;
@@ -50,5 +68,9 @@ typedef char*    caddr_t;
  * still expects to get them here — libXaw's text widget among it.  Included at
  * the end so the types above are already defined. */
 #include <sys/select.h>
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

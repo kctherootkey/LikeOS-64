@@ -339,6 +339,7 @@ menu "defops"
     "Calculator"	!"xcalc &"
     "Editor"		!"xnedit &"
     "Web browser"	!"netsurf &"
+    "Mail"		!"claws-mail &"
     ""			f.separator
     "Restart ctwm"	f.restart
     "Exit session"	f.quit

@@ -7,6 +7,7 @@
  * (OpenSSH, traceroute, ping) builds unmodified.
  */
 
+#include <sys/cdefs.h>
 #include <stdint.h>
 #include <sys/types.h>
 #include <netinet/in.h>

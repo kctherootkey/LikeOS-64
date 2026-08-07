@@ -1,6 +1,10 @@
 #ifndef _SYSLOG_H
 #define _SYSLOG_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdarg.h>
 
 /* Severity levels */
@@ -49,14 +53,14 @@
 #include <stdio.h>
 
 /* On LikeOS syslog writes to stderr */
-static inline void openlog(const char *ident, int option, int facility)
+static __inline void openlog(const char *ident, int option, int facility)
 {
     (void)ident; (void)option; (void)facility;
 }
-static inline void closelog(void) {}
-static inline int setlogmask(int mask) { (void)mask; return 0xff; }
+static __inline void closelog(void) {}
+static __inline int setlogmask(int mask) { (void)mask; return 0xff; }
 
-static inline void syslog(int priority, const char *fmt, ...)
+static __inline void syslog(int priority, const char *fmt, ...)
 {
     (void)priority;
     va_list ap;
@@ -66,11 +70,15 @@ static inline void syslog(int priority, const char *fmt, ...)
     fputc('\n', stderr);
 }
 
-static inline void vsyslog(int priority, const char *fmt, va_list ap)
+static __inline void vsyslog(int priority, const char *fmt, va_list ap)
 {
     (void)priority;
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SYSLOG_H */

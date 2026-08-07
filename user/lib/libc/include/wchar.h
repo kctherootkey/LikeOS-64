@@ -9,8 +9,29 @@
 #ifndef _WCHAR_H
 #define _WCHAR_H
 
+/*
+ * <stdint.h> is deliberately NOT included, though it used to be.
+ *
+ * Nothing here needs it: wint_t is defined below in terms of `unsigned int',
+ * and WCHAR_MIN/WCHAR_MAX come from the compiler's own __WCHAR_MIN__ and
+ * __WCHAR_MAX__.  It was an include with no user.
+ *
+ * It was also a cycle waiting for the right consumer.  gnulib ships
+ * replacement headers, and its <stdint.h> includes <wchar.h> to find
+ * WCHAR_MIN/WCHAR_MAX.  With this header pulling <stdint.h> back in, a program
+ * including <wchar.h> got:
+ *
+ *     gnulib wchar.h -> this header -> gnulib stdint.h -> gnulib wchar.h
+ *
+ * and the inner visit ran gnulib's declarations while this file was still four
+ * lines in, so mbstate_t did not exist yet.  It failed as "unknown type name
+ * 'mbstate_t'" inside gnulib's own header, which points at neither end of the
+ * loop.  GnuTLS is where it surfaced; every gnulib-bearing package was exposed
+ * to it.
+ *
+ * A header that includes only what it uses cannot be part of such a cycle.
+ */
 #include <stddef.h>
-#include <stdint.h>
 #include <stdarg.h>
 #include <bits/multibyte.h>
 

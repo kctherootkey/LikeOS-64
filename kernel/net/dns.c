@@ -164,7 +164,7 @@ static void dns_cache_insert(const char *hostname, uint32_t ip, uint32_t ttl)
 		    dns_strcmp(dns_cache[i].hostname, hostname) == 0) {
 			dns_cache[i].ip = ip;
 			dns_cache[i].expire_tick =
-				timer_ticks() + (uint64_t)ttl * 1000;
+				timer_ticks() + timer_s_to_ticks(ttl);
 			return;
 		}
 	}
@@ -173,7 +173,10 @@ static void dns_cache_insert(const char *hostname, uint32_t ip, uint32_t ttl)
 	dns_cache_entry_t *e = &dns_cache[dns_cache_next];
 	dns_strcpy(e->hostname, hostname, 64);
 	e->ip = ip;
-	e->expire_tick = timer_ticks() + (uint64_t)ttl * 1000;
+	/* The TTL is in SECONDS.  `ttl * 1000' was neither seconds nor ticks: at
+	 * 100Hz it held every entry for ten times its TTL, and the factor moved
+	 * again with the calibrated tick rate. */
+	e->expire_tick = timer_ticks() + timer_s_to_ticks(ttl);
 	e->valid = 1;
 	dns_cache_next = (dns_cache_next + 1) % DNS_CACHE_SIZE;
 }

@@ -1,6 +1,10 @@
 #ifndef _SYS_SYSINFO_H
 #define _SYS_SYSINFO_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 
 struct sysinfo {
@@ -21,5 +25,9 @@ struct sysinfo {
 };
 
 int sysinfo(struct sysinfo *info);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SYS_SYSINFO_H */

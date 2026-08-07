@@ -24,6 +24,9 @@ static const vfs_ops_t *g_dev_ops = 0;
 #ifndef O_CREAT
 #define O_CREAT 0x0040
 #endif
+#ifndef O_EXCL
+#define O_EXCL 0x0080
+#endif
 #ifndef O_TRUNC
 #define O_TRUNC 0x0200
 #endif
@@ -553,6 +556,30 @@ static int vfs_open_common(const char *path, int flags, unsigned int cmode,
 		struct kstat est;
 		int exists = (vfs_raw_stat(path, &est) == ST_OK);
 		if (exists) {
+			/*
+			 * O_CREAT|O_EXCL means "create this, and fail if it is
+			 * already there".  It was accepted and ignored, so such
+			 * an open SUCCEEDED on an existing file -- and that is
+			 * the one guarantee every unique-temporary-file scheme
+			 * rests on.  mkstemp() generates a candidate name, opens
+			 * it this way, and treats success as proof the name was
+			 * its own; with the check missing, the very first
+			 * candidate always "succeeded" and every caller in the
+			 * process got THE SAME temporary file.
+			 *
+			 * A mail client encoding a message showed it plainly:
+			 * the body part and the attachment part were written to
+			 * one file, so the attachment arrived containing the
+			 * message text.  Lock files, "atomic" create-then-rename
+			 * and anything else built on this primitive were equally
+			 * unprotected.
+			 *
+			 * Decided before the access checks below: the file's own
+			 * permissions do not matter when the answer is that it
+			 * exists at all.
+			 */
+			if ((flags & O_CREAT) && (flags & O_EXCL))
+				return ST_EXISTS;
 			if (want) {
 				/* est was just resolved: decide on it directly
 				 * instead of re-resolving the path. */

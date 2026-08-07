@@ -463,6 +463,91 @@ uint32_t timer_get_frequency(void)
 	return g_frequency;
 }
 
+/*
+ * Duration -> tick count, against the tick rate this machine ACTUALLY has.
+ *
+ * The rate is not 100Hz just because timer_init() asked for it.  LAPIC timer
+ * calibration is approximate in a virtual machine, so timer_calibrate_frequency()
+ * measures the real rate against the RTC and rewrites g_frequency -- it is
+ * routinely around 200 on a VM.  Wall-clock time stays right because everything
+ * that reports time divides by g_frequency; what breaks is the code that
+ * converted a duration to ticks by assuming a 10ms tick, which then expires in
+ * half the time asked for.  A 150ms futex timeout firing after 79ms is that bug,
+ * and select() with a one-second timeout returning in half a second was the same
+ * arithmetic in another place.
+ *
+ * Rounds UP: a timeout may fire late, never early.
+ *
+ * Note for callers arming a deadline as `timer_ticks() + n': the current tick is
+ * already partly spent, so the wake can still land up to one tick early.  Add 1
+ * to the result to cover that -- this returns the conversion, not the guard.
+ */
+uint64_t timer_ns_to_ticks(uint64_t ns)
+{
+	uint64_t freq = g_frequency ? g_frequency : 100;
+	uint64_t secs = ns / 1000000000ULL;
+	uint64_t frac = ns % 1000000000ULL;
+
+	/* An absurd duration saturates rather than wrapping to a short one. */
+	if (secs > (0xFFFFFFFFFFFFFFFFULL / freq) - 1)
+		return 0xFFFFFFFFFFFFFFFFULL;
+
+	return secs * freq + (frac * freq + 999999999ULL) / 1000000000ULL;
+}
+
+uint64_t timer_us_to_ticks(uint64_t us)
+{
+	uint64_t freq = g_frequency ? g_frequency : 100;
+	uint64_t secs = us / 1000000ULL;
+	uint64_t frac = us % 1000000ULL;
+
+	if (secs > (0xFFFFFFFFFFFFFFFFULL / freq) - 1)
+		return 0xFFFFFFFFFFFFFFFFULL;
+
+	return secs * freq + (frac * freq + 999999ULL) / 1000000ULL;
+}
+
+uint64_t timer_ms_to_ticks(uint64_t ms)
+{
+	uint64_t freq = g_frequency ? g_frequency : 100;
+	uint64_t secs = ms / 1000ULL;
+	uint64_t frac = ms % 1000ULL;
+
+	if (secs > (0xFFFFFFFFFFFFFFFFULL / freq) - 1)
+		return 0xFFFFFFFFFFFFFFFFULL;
+
+	return secs * freq + (frac * freq + 999ULL) / 1000ULL;
+}
+
+uint64_t timer_s_to_ticks(uint64_t secs)
+{
+	uint64_t freq = g_frequency ? g_frequency : 100;
+
+	if (secs > 0xFFFFFFFFFFFFFFFFULL / freq)
+		return 0xFFFFFFFFFFFFFFFFULL;
+
+	return secs * freq;
+}
+
+/* The inverse, for reporting a stored tick count back as a duration.  Truncates:
+ * a value that was rounded up on the way in reads back as what was asked for. */
+uint64_t timer_ticks_to_s(uint64_t ticks)
+{
+	uint64_t freq = g_frequency ? g_frequency : 100;
+
+	return ticks / freq;
+}
+
+/* Microseconds in one tick.  For code holding a duration already counted in
+ * ticks -- a TCP timestamp option, whose unit IS the tick -- rather than one it
+ * is about to convert. */
+uint64_t timer_us_per_tick(void)
+{
+	uint64_t freq = g_frequency ? g_frequency : 100;
+
+	return 1000000ULL / freq;
+}
+
 uint64_t timer_get_uptime(void)
 {
 	if (g_pmtimer_available)

@@ -137,6 +137,72 @@ static struct zombie_stack __zombie_stacks[ZOMBIE_STACK_MAX];
 static volatile int __zombie_count = 0;
 static volatile int __zombie_lock = 0;
 
+/* ---- thread stack cache -----------------------------------------------
+ *
+ * Keep a few finished stacks mapped and hand them straight back to the next
+ * pthread_create, instead of unmapping each one and mapping a fresh one.
+ *
+ * A thread stack is 2MB plus a guard page, so a create/join loop otherwise
+ * asks the kernel to build and tear down a 2MB mapping every time round.  That
+ * is expensive on its own, and it is also the churn that address-space races
+ * live in: the more mapping and unmapping a program does, the more chances a
+ * fault has to collide with one.  Reusing the mapping removes both.
+ *
+ * Only JOINED stacks are cached.  pthread_join has already waited for the
+ * kernel to clear the thread's tid_futex, so the thread is provably no longer
+ * executing on it.  A DETACHED thread is still running on its own stack when
+ * it releases it, and must keep using __unmapself -- handing that stack to
+ * another thread would let the new owner start writing to it while the old one
+ * is still finishing its exit.
+ *
+ * The pages stay mapped and keep their contents, which is fine: a stack is
+ * written before it is read, and the new thread's control block is placed over
+ * the old one.  The guard page is already PROT_NONE and stays that way.
+ */
+#define STACK_CACHE_MAX 8
+#define STACK_CACHE_MAX_BYTES (16 * 1024 * 1024)
+
+struct cached_stack {
+	void *base;
+	size_t size;
+};
+
+static struct cached_stack __stack_cache[STACK_CACHE_MAX];
+static int __stack_cache_count;
+static size_t __stack_cache_bytes;
+
+/* Caller holds __zombie_lock.  Returns a stack of exactly `size`, or NULL. */
+static void *__stack_cache_take_locked(size_t size)
+{
+	for (int i = 0; i < __stack_cache_count; i++) {
+		if (__stack_cache[i].size != size)
+			continue;
+		void *base = __stack_cache[i].base;
+
+		__stack_cache_bytes -= __stack_cache[i].size;
+		__stack_cache[i] = __stack_cache[--__stack_cache_count];
+		__stack_cache[__stack_cache_count].base = NULL;
+		__stack_cache[__stack_cache_count].size = 0;
+		return base;
+	}
+	return NULL;
+}
+
+/* Caller holds __zombie_lock.  Returns 1 if the stack was kept (and so must
+ * NOT be unmapped), 0 if the caller should unmap it. */
+static int __stack_cache_put_locked(void *base, size_t size)
+{
+	if (!base || __stack_cache_count >= STACK_CACHE_MAX)
+		return 0;
+	if (__stack_cache_bytes + size > STACK_CACHE_MAX_BYTES)
+		return 0;
+	__stack_cache[__stack_cache_count].base = base;
+	__stack_cache[__stack_cache_count].size = size;
+	__stack_cache_count++;
+	__stack_cache_bytes += size;
+	return 1;
+}
+
 /* Free every entry whose thread has really exited (kernel cleared the
  * tid_futex, or no gate at all); keep the rest.  Caller holds
  * __zombie_lock.  Reading *alive is safe precisely because the entry has
@@ -282,6 +348,14 @@ void __pthread_fork_child(void)
 			__zombie_stacks[zi].alive = NULL;
 		}
 		__zombie_count = 0;
+
+		/* The stack CACHE is deliberately kept.  Unlike a zombie entry,
+		 * a cached stack has no thread running on it -- it was left by
+		 * one that had already been joined -- and fork copied the
+		 * mapping, so the address is just as valid here as in the
+		 * parent.  Dropping it would leak those mappings in the child
+		 * for no reason.  The two address spaces are independent from
+		 * now on, so both may reuse their own copy. */
 	}
 }
 
@@ -474,15 +548,26 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 		// User provided stack
 		stack_base = stack_addr;
 	} else {
-		stack_base = mmap(NULL, total_size, PROT_READ | PROT_WRITE,
-				  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		if (stack_base == MAP_FAILED) {
-			return EAGAIN;
-		}
+		/* A stack left over from a joined thread of the same size is
+		 * ready to use as-is: still mapped, guard page still
+		 * PROT_NONE.  Reusing it saves building and tearing down a 2MB
+		 * mapping for every thread. */
+		__spin_lock(&__zombie_lock);
+		stack_base = __stack_cache_take_locked(total_size);
+		__spin_unlock(&__zombie_lock);
 
-		// Set up guard page (make it non-accessible)
-		if (guard_size > 0) {
-			mprotect(stack_base, guard_size, PROT_NONE);
+		if (!stack_base) {
+			stack_base = mmap(NULL, total_size,
+					  PROT_READ | PROT_WRITE,
+					  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (stack_base == MAP_FAILED) {
+				return EAGAIN;
+			}
+
+			// Set up guard page (make it non-accessible)
+			if (guard_size > 0) {
+				mprotect(stack_base, guard_size, PROT_NONE);
+			}
 		}
 	}
 
@@ -604,6 +689,13 @@ void pthread_exit(void *retval)
 	// before we mark the thread as exited or clear tid_futex
 	__sync_synchronize();
 
+	// Destructors of this thread's thread_local objects, registered through
+	// __cxa_thread_atexit_impl.  They run BEFORE the pthread_key_create
+	// destructors below and well before the stack is released: what they
+	// destroy is this thread's own storage, and once the thread has been
+	// reaped there is nothing left to run them against.
+	__libc_thread_finalize();
+
 	// Call TSD destructors
 	__call_tsd_destructors(tcb);
 
@@ -643,7 +735,11 @@ void pthread_exit(void *retval)
 	// TCB; the kernel clears tid_futex (CLONE_CHILD_CLEARTID) and wakes the
 	// joiner, which frees the stack via the zombie list (alive == NULL,
 	// i.e. never dereferenced).
-	_exit((long)retval);
+	//
+	// __thread_exit, NOT _exit: this ends one thread.  _exit() ends the
+	// whole process (it issues SYS_EXIT_GROUP), which is right for the main
+	// thread above and fatal here.
+	__thread_exit((int)(long)retval);
 
 	// Never reached
 	__builtin_unreachable();
@@ -708,16 +804,40 @@ int pthread_join(pthread_t thread, void **retval)
 	}
 	__spin_unlock(&__thread_list_lock);
 
-	// Queue the stack for deferred cleanup.
-	// We don't munmap immediately because the kernel may still be accessing
-	// the thread's user stack during the final exit path (even after tid_futex
-	// is cleared). The stack will be freed on the next pthread_create call,
-	// when we're certain all previously exited threads have fully terminated.
+	/*
+	 * Free the stack NOW.
+	 *
+	 * The deferral this used to do exists for DETACHED threads, where the
+	 * exiting thread is still running on its own stack and only __unmapself
+	 * may take it away.  A JOINED thread is not in that position: the join
+	 * above waited for tid_futex to reach 0, which the kernel clears once
+	 * the thread is gone, so there is nothing left to run on it.
+	 *
+	 * Deferring anyway meant a joined stack sat on the zombie list until
+	 * some LATER pthread_create came along to sweep it -- and if the program
+	 * stopped making threads, up to ZOMBIE_STACK_MAX of them stayed mapped
+	 * for good.  At 2MB plus a guard each that is 128MB of address space,
+	 * and, worse, 64 kernel mmap-region slots: Claws Mail ran the table out
+	 * at 512 entries, and the dlopen() that then failed was the spell
+	 * checker, which is why it silently stopped working.
+	 *
+	 * Sweep the list as well, so stacks left by earlier detached threads do
+	 * not wait for the next pthread_create either.
+	 */
 	if (stack_base) {
-		/* Joined: pthread_join already waited for tid_futex == 0, the
-		 * thread is provably gone — no liveness gate needed. */
-		__zombie_stack_add(stack_base, stack_size, NULL);
+		/* Keep it for the next thread rather than giving it back.  Safe
+		 * precisely because this thread is joined: the wait above saw
+		 * tid_futex reach 0, so nothing is executing on it any more.
+		 * If the cache is full it is unmapped as before. */
+		int cached;
+
+		__spin_lock(&__zombie_lock);
+		cached = __stack_cache_put_locked(stack_base, stack_size);
+		__spin_unlock(&__zombie_lock);
+		if (!cached)
+			munmap(stack_base, stack_size);
 	}
+	__zombie_stack_cleanup();
 
 	return 0;
 }

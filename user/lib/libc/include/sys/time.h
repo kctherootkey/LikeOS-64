@@ -1,6 +1,10 @@
 #ifndef _SYS_TIME_H
 #define _SYS_TIME_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 #ifndef _STRUCT_TIMEVAL
@@ -48,5 +52,9 @@ int utimes(const char *path, const struct timeval tv[2]);
             (res)->tv_usec += 1000000;                            \
         }                                                         \
     } while (0)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

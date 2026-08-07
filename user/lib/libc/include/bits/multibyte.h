@@ -14,6 +14,10 @@
 #ifndef _BITS_MULTIBYTE_H
 #define _BITS_MULTIBYTE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 int mblen(const char *s, size_t n);
@@ -21,5 +25,9 @@ int mbtowc(wchar_t *pwc, const char *s, size_t n);
 int wctomb(char *s, wchar_t wc);
 size_t mbstowcs(wchar_t *dest, const char *src, size_t n);
 size_t wcstombs(char *dest, const wchar_t *src, size_t n);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _BITS_MULTIBYTE_H */

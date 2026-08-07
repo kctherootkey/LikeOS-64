@@ -1,6 +1,10 @@
 #ifndef _SETJMP_H
 #define _SETJMP_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/cdefs.h>
 
 __BEGIN_DECLS
@@ -21,5 +25,9 @@ int  sigsetjmp(sigjmp_buf env, int savemask);
 void siglongjmp(sigjmp_buf env, int val) __attribute__((__noreturn__));
 
 __END_DECLS
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SETJMP_H */

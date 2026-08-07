@@ -217,6 +217,21 @@
 #define SYS_FREMOVEXATTR 398 // (fd, name)
 #define SYS_DEBUG_DUMP 399 // () root-only: dump TCP/AF_UNIX/PTY tables + tasks
 #define SYS_UNLINKAT 405
+/* madvise(2).  Only MADV_DONTNEED does anything: it releases the physical
+ * pages of a range while LEAVING THE MAPPING IN PLACE, so the next touch
+ * faults a fresh zero page.  That is the conventional way to hand memory back
+ * without giving up the address space, and it is what an allocator needs when
+ * it trims a heap -- using munmap for that punches a hole in the mapping and
+ * costs a region record every time. */
+#define SYS_MADVISE 406
+
+#define MADV_NORMAL 0
+#define MADV_RANDOM 1
+#define MADV_SEQUENTIAL 2
+#define MADV_WILLNEED 3
+#define MADV_DONTNEED 4
+#define MADV_DONTDUMP 16
+#define MADV_DODUMP 17
 #define SYS_CHROOT 400
 
 // System V shared memory (the MIT-SHM extension's interface)
@@ -468,6 +483,9 @@ typedef struct procinfo {
 	uint64_t stime_ticks; // Kernel-mode ticks
 	uint64_t vsz; // Virtual memory size (bytes)
 	uint64_t rss; // Resident set size (pages)
+	/* Kernel address of the call this task is asleep in (0 if not blocked).
+	 * Must stay in step with procinfo_t in the libc's <sys/procinfo.h>. */
+	uint64_t wchan;
 	char comm[256]; // Process name (basename of executable)
 	char cmdline[1024]; // Full command line (argv joined by spaces)
 	char environ[2048]; // Environment (envp joined by spaces)

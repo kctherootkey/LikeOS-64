@@ -378,7 +378,7 @@ int setresgid(int rgid, int egid, int sgid)
 	return 0;
 }
 
-int getresuid(int *ruid, int *euid, int *suid)
+int getresuid(uid_t *ruid, uid_t *euid, uid_t *suid)
 {
 	long ret = syscall3(SYS_GETRESUID, (long)ruid, (long)euid, (long)suid);
 	if (ret < 0) {
@@ -388,7 +388,7 @@ int getresuid(int *ruid, int *euid, int *suid)
 	return 0;
 }
 
-int getresgid(int *rgid, int *egid, int *sgid)
+int getresgid(gid_t *rgid, gid_t *egid, gid_t *sgid)
 {
 	long ret = syscall3(SYS_GETRESGID, (long)rgid, (long)egid, (long)sgid);
 	if (ret < 0) {
@@ -541,7 +541,34 @@ int execvp(const char *file, char *const argv[])
 	return -1;
 }
 
+/*
+ * End the whole PROCESS -- every thread of it.
+ *
+ * SYS_EXIT ends only the calling thread; SYS_EXIT_GROUP ends the thread group.
+ * exit(), _exit() and _Exit() are all defined to terminate the process, and
+ * this used to issue SYS_EXIT: in a threaded program the main thread became an
+ * unreapable zombie while its siblings carried on, several of them parked in
+ * futex_wait() on a lock the departed thread would never release again.  Claws
+ * Mail closing its window left exactly that behind -- a dead leader, three live
+ * threads, and a lock file that stopped it ever being started again.
+ *
+ * A single THREAD exits through __thread_exit() (joinable) or the SYS_EXIT in
+ * clone.S's trampoline (detached).  Those are the only two callers that mean
+ * one thread, and neither goes through here.
+ */
 void _exit(int status)
+{
+	syscall1(SYS_EXIT_GROUP, status);
+	__builtin_unreachable();
+}
+
+/*
+ * End THIS thread only, leaving the rest of the process running.  The counter-
+ * part of _exit() above, and the reason that one could not simply be left as
+ * SYS_EXIT: pthread_exit() on a joinable thread has to return to the joiner,
+ * not take the process down with it.
+ */
+void __thread_exit(int status)
 {
 	syscall1(SYS_EXIT, status);
 	__builtin_unreachable();
@@ -1190,7 +1217,9 @@ long sysconf(int name)
 	case _SC_PAGESIZE:
 		return 4096;
 	case _SC_OPEN_MAX:
-		return 256;
+		/* From the macro, not a second copy of the number: this used to
+		 * be a literal 256 that stayed behind when OPEN_MAX moved. */
+		return OPEN_MAX;
 	case _SC_CLK_TCK:
 		return 100;
 	case _SC_NPROCESSORS_CONF:

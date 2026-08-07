@@ -123,6 +123,7 @@
 
 // Memory protection
 #define SYS_MPROTECT        329
+#define SYS_MADVISE         406
 
 // System management
 #define SYS_REBOOT          330

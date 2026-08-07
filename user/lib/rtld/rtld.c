@@ -84,6 +84,10 @@ typedef struct {
 #define PT_INTERP 3
 #define PT_PHDR 6
 #define PT_TLS 7
+/* The segment describing an object's exception-handling tables.  The C++
+ * unwinder asks the loader for this one by address; see _rtld_find_object. */
+#define PT_GNU_EH_FRAME 0x6474e550
+#define PT_GNU_RELRO 0x6474e552
 
 /* Segment flags */
 #define PF_X 1
@@ -128,6 +132,23 @@ typedef struct {
 #define STB_LOCAL 0
 #define STB_GLOBAL 1
 #define STB_WEAK 2
+/*
+ * A GNU extension: a definition of which the process must contain exactly ONE
+ * instance, however many objects were loaded and whatever their symbol scope.
+ *
+ * C++ puts template and inline statics in this binding -- libstdc++ uses it for
+ * every locale facet's `id' and for std::string's empty representation -- so a
+ * loader that does not recognise it sees no definition at all and reports the
+ * symbol as undefined.  That is precisely what happened: libstdc++ loaded with
+ * forty-odd "undefined symbol: _ZNSt8numpunctIcE2idE" complaints and the first
+ * C++ program died dereferencing one of them.
+ *
+ * Here it is treated exactly as STB_GLOBAL, which gives the guarantee its name
+ * asks for: every object is in one global scope in this loader -- there is no
+ * RTLD_LOCAL -- so the first definition found is the only one anything binds
+ * to, which is the single instance the binding requires.
+ */
+#define STB_GNU_UNIQUE 10
 
 /* Symbol type */
 #define STT_NOTYPE 0
@@ -315,6 +336,12 @@ typedef struct dso {
 	int refcount;
 	int bind_now;
 
+	/* PT_GNU_RELRO: made read-only after relocation (see
+	 * rtld_protect_relro).  relro_done keeps that to once. */
+	uint64_t relro_start;
+	uint64_t relro_len;
+	int relro_done;
+
 	/* For dlclose / munmap */
 	uint64_t map_base;
 	uint64_t map_size;
@@ -338,6 +365,14 @@ static uint64_t g_page_size = 4096;
 static char g_dlerror_buf[256];
 static int g_dlerror_set;
 
+/* Counts of objects added and removed over the process's life, reported through
+ * dl_iterate_phdr().  A caller that caches per-object data -- which the C++
+ * unwinder does, per address range -- compares these between walks to decide
+ * whether its cache is still valid, so they have to move on dlopen and dlclose
+ * or a stale entry is trusted after the library behind it is gone. */
+static unsigned long long g_dl_adds;
+static unsigned long long g_dl_subs;
+
 static void rtld_set_error(const char *msg)
 {
 	size_t i = 0;
@@ -345,6 +380,22 @@ static void rtld_set_error(const char *msg)
 		g_dlerror_buf[i] = msg[i];
 		i++;
 	}
+	g_dlerror_buf[i] = '\0';
+	g_dlerror_set = 1;
+}
+
+/* "<what>: <name>" -- dlerror() has to say WHICH object failed, or a program
+ * probing for several optional libraries cannot tell which probe it is. */
+static void rtld_set_error2(const char *what, const char *name)
+{
+	size_t i = 0, j = 0;
+
+	while (what[i] && i < sizeof(g_dlerror_buf) - 3)
+		g_dlerror_buf[i] = what[i], i++;
+	g_dlerror_buf[i++] = ':';
+	g_dlerror_buf[i++] = ' ';
+	while (name[j] && i < sizeof(g_dlerror_buf) - 1)
+		g_dlerror_buf[i++] = name[j++];
 	g_dlerror_buf[i] = '\0';
 	g_dlerror_set = 1;
 }
@@ -363,6 +414,9 @@ static dso_t *rtld_find_dso(const char *name)
 
 static dso_t *rtld_alloc_dso(void)
 {
+	/* Every object the process gains passes through here, whether at start-up
+	 * or through dlopen, so this is where the add counter belongs. */
+	g_dl_adds++;
 	/* Reuse a previously dlclose'd slot (all fields zeroed) if available. */
 	for (int i = 0; i < g_ndsos; i++) {
 		if (!g_dsos[i].name && !g_dsos[i].symtab) {
@@ -558,7 +612,7 @@ static sym_result_t rtld_lookup_symbol(const char *name, dso_t *skip)
 
 		if (sym && sym->st_shndx != SHN_UNDEF) {
 			uint8_t bind = ELF64_ST_BIND(sym->st_info);
-			if (bind == STB_GLOBAL) {
+			if (bind == STB_GLOBAL || bind == STB_GNU_UNIQUE) {
 				res.sym = sym;
 				res.dso = d;
 				return res;
@@ -853,10 +907,21 @@ void *__tls_get_addr(tls_index_t *ti)
 uint64_t _dl_fixup(dso_t *d, uint64_t reloc_idx)
 	__attribute__((visibility("default")));
 
+/*
+ * Resolve one PLT entry on first call.
+ *
+ * A failure here is FATAL and has to be treated as such.  This used to patch
+ * the GOT slot with 0 and return 0, so the PLT stub jumped straight to address
+ * zero: the process died with RIP=0, no bytes around it to disassemble, no
+ * stack that meant anything, and the one line that explained it ("lazy: _Znwm
+ * not found") already scrolled past.  A program cannot continue past a call it
+ * has no address for, so there is nothing to be gained by returning -- report
+ * which object wanted which symbol, and stop.
+ */
 uint64_t _dl_fixup(dso_t *d, uint64_t reloc_idx)
 {
 	if (!d || !d->jmprel)
-		return 0;
+		rtld_die("PLT relocation on an object with no jump slots");
 
 	const Elf64_Rela *rel = &d->jmprel[reloc_idx];
 	uint64_t sidx = ELF64_R_SYM(rel->r_info);
@@ -864,14 +929,16 @@ uint64_t _dl_fixup(dso_t *d, uint64_t reloc_idx)
 	const char *name = d->strtab + sym->st_name;
 
 	sym_result_t sr = rtld_lookup_symbol(name, NULL);
-	uint64_t addr = 0;
-	if (sr.sym && sr.dso)
-		addr = sr.dso->base + sr.sym->st_value;
-	else {
-		rtld_write_str("ld-likeos.so: lazy: ");
+	if (!sr.sym || !sr.dso) {
+		rtld_write_str("ld-likeos.so: ");
+		rtld_write_str(d->name ? d->name : "?");
+		rtld_write_str(": symbol lookup error: undefined symbol: ");
 		rtld_write_str(name);
-		rtld_write_str(" not found\n");
+		rtld_write_str("\n");
+		rtld_exit(127);
 	}
+
+	uint64_t addr = sr.dso->base + sr.sym->st_value;
 
 	/* Patch the GOT entry */
 	*(uint64_t *)(d->base + rel->r_offset) = addr;
@@ -917,6 +984,7 @@ static void rtld_setup_pltgot(dso_t *d)
 static uint64_t g_lib_mmap_base = 0x7F0001000000ULL;
 
 static dso_t *rtld_load_library(const char *name);
+static void rtld_report_missing(const char *name);
 
 /* Seek+read helper for the header-only load path. */
 static int rtld_pread(int fd, void *buf, size_t n, long off)
@@ -1101,7 +1169,66 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 			d->tls_align = phdrs[i].p_align;
 		}
 	}
+	/* Where this object's program headers live IN THE MAPPED IMAGE.
+	 *
+	 * phnum was recorded here and phdrs was not, which left every library
+	 * loaded from disk with a null table.  Nothing noticed until something
+	 * asked: dl_iterate_phdr() then walked past every one of them and
+	 * reported only the main executable, and _dl_find_object() could not
+	 * resolve an address in a shared library at all -- so a C++ exception
+	 * thrown inside one would find no unwind tables and reach
+	 * std::terminate instead of its handler.
+	 *
+	 * `phdrs' cannot simply be stored: it points into phdr_buf, ONE static
+	 * buffer reused by every call, so every object would end up describing
+	 * whichever library was loaded last.  The mapped copy has to be found
+	 * instead -- through PT_PHDR, which states its own address, or by
+	 * locating the PT_LOAD whose file range covers e_phoff and translating
+	 * that offset into the segment.  Nearly every shared object has the
+	 * former; the latter is what the ones without it need.
+	 */
 	d->phnum = ehdr->e_phnum;
+	d->phdrs = NULL;
+
+	/* PT_GNU_RELRO: the part of the writable data that only needs to be
+	 * writable WHILE relocating -- the GOT, .data.rel.ro, .init_array.
+	 * Recorded now, made read-only once this object is relocated. */
+	d->relro_start = 0;
+	d->relro_len = 0;
+	for (int i = 0; i < ehdr->e_phnum; i++) {
+		if (phdrs[i].p_type == PT_GNU_RELRO) {
+			d->relro_start = d->base + phdrs[i].p_vaddr;
+			d->relro_len = phdrs[i].p_memsz;
+			break;
+		}
+	}
+	for (int i = 0; i < ehdr->e_phnum; i++) {
+		if (phdrs[i].p_type == PT_PHDR) {
+			d->phdrs = (const Elf64_Phdr *)(d->base +
+						       phdrs[i].p_vaddr);
+			break;
+		}
+	}
+	if (!d->phdrs) {
+		uint64_t need = (uint64_t)ehdr->e_phnum * sizeof(Elf64_Phdr);
+
+		for (int i = 0; i < ehdr->e_phnum; i++) {
+			if (phdrs[i].p_type != PT_LOAD)
+				continue;
+			if (ehdr->e_phoff < phdrs[i].p_offset)
+				continue;
+			if (ehdr->e_phoff + need >
+			    phdrs[i].p_offset + phdrs[i].p_filesz)
+				continue;
+			d->phdrs = (const Elf64_Phdr *)(d->base +
+					phdrs[i].p_vaddr +
+					(ehdr->e_phoff - phdrs[i].p_offset));
+			break;
+		}
+	}
+	/* Report nothing rather than a wild pointer if neither route worked. */
+	if (!d->phdrs)
+		d->phnum = 0;
 
 	rtld_parse_dynamic(d);
 	rtld_assign_tls(d);
@@ -1112,7 +1239,8 @@ static dso_t *rtld_load_dso_from_file(const char *path, const char *soname)
 			if (e->d_tag == DT_NEEDED) {
 				const char *need = d->strtab + e->d_un.d_val;
 				if (!rtld_find_dso(need))
-					rtld_load_library(need);
+					if (!rtld_load_library(need))
+						rtld_report_missing(need);
 			}
 	return d;
 
@@ -1145,15 +1273,85 @@ static dso_t *rtld_load_library(const char *name)
 	if (d)
 		return d;
 
+	/* Deliberately silent.  Whether a library that cannot be found is worth
+	 * a message depends entirely on WHO asked for it: a DT_NEEDED entry is
+	 * a hard dependency and its absence is fatal, so those call sites report
+	 * it; a dlopen() is a PROBE, and programs probe for things they expect
+	 * to be missing.  libepoxy asks for libGL.so.1 and libGLX.so.1 on a
+	 * system with no OpenGL, handles the failure perfectly well, and used to
+	 * print two lines of alarming nonsense on the way past.  A failed
+	 * dlopen() reports through dlerror(), which is what dlerror() is for. */
+	return NULL;
+}
+
+/* A DT_NEEDED dependency that could not be found: fatal, and worth saying so. */
+static void rtld_report_missing(const char *name)
+{
 	rtld_write_str("ld-likeos.so: cannot find: ");
 	rtld_write_str(name);
 	rtld_write_str("\n");
-	return NULL;
 }
 
 /* ================================================================== */
 /*  Relocate + Initialise                                             */
 /* ================================================================== */
+
+/*
+ * Make an object's RELRO region read-only, once it has been relocated.
+ *
+ * Everything in there -- the GOT above all -- is written by the loader and by
+ * nothing else afterwards, so leaving it writable for the life of the process
+ * only offers a target.  A stray write into the GOT is not a crash where it
+ * happens: the program keeps running until it next calls through the damaged
+ * slot, and then dies in a PLT stub with nothing to say about who broke it.
+ * That is precisely how Claws Mail died -- jumping through a corrupted slot for
+ * `stat', minutes after whatever wrote it had moved on.
+ *
+ * With the pages read-only the write faults where it is made, with the
+ * offender's own instruction pointer in the crash dump.  And the crash it used
+ * to cause cannot happen at all.
+ *
+ * Requires the object to be linked -z now as well: with lazy binding the GOT
+ * has to stay writable, so anything still resolving on demand is left alone.
+ */
+static void rtld_protect_relro(dso_t *d)
+{
+	if (!d || !d->relro_len || d->relro_done)
+		return;
+
+	/* Both ends round DOWN.  The end especially: p_memsz is page-aligned by
+	 * construction (the linker pads the region out), and rounding it up
+	 * instead would freeze the first page of .data on any object where it
+	 * is not -- which is the sort of damage that shows up much later as an
+	 * inexplicable fault on an ordinary global.
+	 *
+	 * Rounding the start down is safe for the matching reason: -z relro
+	 * makes the linker start the region on a page belonging to the writable
+	 * segment alone, never one shared with the text or rodata above it. */
+	uint64_t start = d->relro_start & ~(uint64_t)(g_page_size - 1);
+	uint64_t end = (d->relro_start + d->relro_len) &
+		       ~(uint64_t)(g_page_size - 1);
+
+	/* An object that still binds lazily has its PLT slots written by the
+	 * resolver, one per first call, for as long as it runs -- so its
+	 * .got.plt cannot be frozen.  Only the three reserved entries at the
+	 * front are written once, at load time.
+	 *
+	 * The stock linker script accounts for that and ends the region at
+	 * pltgot+24, so a lazy object can be protected as it stands; ours puts
+	 * the whole of .got.plt inside, which is only sound because it is
+	 * always paired with -z now.  Deciding from the region itself rather
+	 * than from the flag covers both, and costs one comparison. */
+	if (!d->bind_now && d->pltgot) {
+		uint64_t lazy_from = (uint64_t)d->pltgot + 3 * sizeof(uint64_t);
+		if (end > lazy_from)
+			return;
+	}
+
+	d->relro_done = 1;
+	if (start < end)
+		rtld_mprotect((void *)start, (size_t)(end - start), PROT_READ);
+}
 
 static void rtld_relocate(dso_t *d)
 {
@@ -1283,7 +1481,7 @@ void *_rtld_dlopen(const char *filename, int flags)
 		ld = rtld_load_library(filename);
 	}
 	if (!ld) {
-		rtld_set_error("cannot load shared library");
+		rtld_set_error2("cannot load shared library", filename);
 		return NULL;
 	}
 
@@ -1298,6 +1496,9 @@ void *_rtld_dlopen(const char *filename, int flags)
 	 * so walking backwards relocates and initialises them first. */
 	for (int i = g_ndsos - 1; i >= 0; i--)
 		rtld_relocate(&g_dsos[i]);
+	/* Lock down RELRO for anything newly relocated (see the startup path). */
+	for (int i = 0; i < g_ndsos; i++)
+		rtld_protect_relro(&g_dsos[i]);
 	/* No-op after the first call; a dlopen'd object's slice is initialised
 	 * in rtld_assign_tls() as it is assigned out of the surplus. */
 	rtld_init_tls();
@@ -1353,6 +1554,10 @@ int _rtld_dlclose(void *handle)
      * skip it (symtab/strtab checks will be NULL) and stale pointers into
      * the now-unmapped library pages can never be dereferenced. */
 	rtld_memset(d, 0, sizeof(*d));
+	/* Tells anything caching per-object data that its cache is now stale --
+	 * the pages this object occupied are unmapped, and an entry still
+	 * pointing into them is a fault waiting for the next lookup. */
+	g_dl_subs++;
 	return 0;
 }
 
@@ -1363,6 +1568,227 @@ char *_rtld_dlerror(void)
 		return g_dlerror_buf;
 	}
 	return NULL;
+}
+
+/* ================================================================== */
+/*  Object introspection: _dl_find_object, dl_iterate_phdr, dladdr    */
+/*                                                                    */
+/*  All three answer the same question -- which loaded object covers  */
+/*  this address, and what is in its program headers -- so all three  */
+/*  are here, where the object list is, and libc wraps them.          */
+/*                                                                    */
+/*  _dl_find_object is not an optional extra.  It is how the C++      */
+/*  exception unwinter finds an object's PT_GNU_EH_FRAME from a       */
+/*  program counter: without it every throw ends in std::terminate    */
+/*  rather than in the matching catch, and the failure names neither  */
+/*  the loader nor the missing call.                                  */
+/* ================================================================== */
+
+struct rtld_find_object {
+	unsigned long long dlfo_flags;
+	void *dlfo_map_start;
+	void *dlfo_map_end;
+	void *dlfo_link_map;
+	void *dlfo_eh_frame;
+	unsigned long long __dlfo_reserved[7];
+};
+
+struct rtld_phdr_info {
+	uint64_t dlpi_addr;
+	const char *dlpi_name;
+	const Elf64_Phdr *dlpi_phdr;
+	uint16_t dlpi_phnum;
+	unsigned long long dlpi_adds;
+	unsigned long long dlpi_subs;
+	size_t dlpi_tls_modid;
+	void *dlpi_tls_data;
+};
+
+int _rtld_find_object(void *addr, struct rtld_find_object *result)
+	__attribute__((visibility("default")));
+int _rtld_iterate_phdr(int (*cb)(struct rtld_phdr_info *, size_t, void *),
+		       void *data) __attribute__((visibility("default")));
+int _rtld_dladdr(const void *addr, const char **fname, void **fbase,
+		 const char **sname, void **saddr)
+	__attribute__((visibility("default")));
+
+/* The address range an object occupies: from its lowest PT_LOAD to the end of
+ * its highest.  Derived from the program headers rather than read from
+ * map_base/map_size, because those describe the mapping the loader made and are
+ * not set for the main executable, which the kernel mapped. */
+static void rtld_dso_bounds(const dso_t *d, uint64_t *start, uint64_t *end)
+{
+	uint64_t lo = (uint64_t)-1, hi = 0;
+
+	for (int i = 0; i < d->phnum; i++) {
+		if (d->phdrs[i].p_type != PT_LOAD)
+			continue;
+		uint64_t s = d->base + d->phdrs[i].p_vaddr;
+		uint64_t e = s + d->phdrs[i].p_memsz;
+		if (s < lo)
+			lo = s;
+		if (e > hi)
+			hi = e;
+	}
+	if (lo == (uint64_t)-1)
+		lo = d->base;
+	if (hi < lo)
+		hi = lo;
+	*start = lo;
+	*end = hi;
+}
+
+static dso_t *rtld_dso_for_addr(uint64_t a)
+{
+	for (int i = 0; i < g_ndsos; i++) {
+		dso_t *d = &g_dsos[i];
+		uint64_t lo, hi;
+
+		/* A dlclose()d slot is zeroed, so it has no headers to walk. */
+		if (!d->phdrs || !d->phnum)
+			continue;
+		rtld_dso_bounds(d, &lo, &hi);
+		if (a >= lo && a < hi)
+			return d;
+	}
+	return NULL;
+}
+
+int _rtld_find_object(void *addr, struct rtld_find_object *result)
+{
+	dso_t *d = rtld_dso_for_addr((uint64_t)addr);
+	uint64_t lo, hi;
+
+	if (!d || !result)
+		return -1;
+	rtld_dso_bounds(d, &lo, &hi);
+
+	result->dlfo_flags = 0;
+	result->dlfo_map_start = (void *)lo;
+	result->dlfo_map_end = (void *)hi;
+	result->dlfo_link_map = d;
+	result->dlfo_eh_frame = NULL;
+	for (int i = 0; i < 7; i++)
+		result->__dlfo_reserved[i] = 0;
+
+	/* The unwinder's actual question.  An object without the segment is not
+	 * an error -- it simply has no exception data, and the caller then knows
+	 * to look no further rather than searching a table that is not there. */
+	for (int i = 0; i < d->phnum; i++)
+		if (d->phdrs[i].p_type == PT_GNU_EH_FRAME) {
+			result->dlfo_eh_frame =
+				(void *)(d->base + d->phdrs[i].p_vaddr);
+			break;
+		}
+	return 0;
+}
+
+int _rtld_iterate_phdr(int (*cb)(struct rtld_phdr_info *, size_t, void *),
+		       void *data)
+{
+	if (!cb)
+		return 0;
+	for (int i = 0; i < g_ndsos; i++) {
+		dso_t *d = &g_dsos[i];
+		struct rtld_phdr_info info;
+		int r;
+
+		if (!d->phdrs || !d->phnum)
+			continue;
+		info.dlpi_addr = d->base;
+		/* The main executable is reported with an empty name, which is
+		 * what every caller of this interface expects to identify it
+		 * by; the loader stores a placeholder for its own use. */
+		info.dlpi_name = d->is_main ? "" : d->name;
+		info.dlpi_phdr = d->phdrs;
+		info.dlpi_phnum = d->phnum;
+		info.dlpi_adds = g_dl_adds;
+		info.dlpi_subs = g_dl_subs;
+		info.dlpi_tls_modid = (size_t)d->tls_modid;
+		info.dlpi_tls_data = NULL;
+
+		/* A non-zero return ends the walk and is passed back: the
+		 * caller uses it to say "found it, stop". */
+		r = cb(&info, sizeof(info), data);
+		if (r)
+			return r;
+	}
+	return 0;
+}
+
+/* The defined symbol with the highest address at or below `a`, within one
+ * object.  Walking the symbol table linearly is right here: the hash tables
+ * answer name-to-address, and this is the other direction. */
+static const Elf64_Sym *rtld_sym_for_addr(const dso_t *d, uint64_t a)
+{
+	const Elf64_Sym *best = NULL;
+	uint32_t n = 0;
+
+	if (!d->symtab || !d->strtab)
+		return NULL;
+
+	/* How many symbols there are is not recorded in the dynamic section, so
+	 * it is taken from whichever hash table the object carries: the SysV
+	 * chain has one entry per symbol, and the GNU table's last bucket chain
+	 * ends at the highest index it covers. */
+	if (d->sysv_hash) {
+		n = d->sysv_nchain;
+	} else if (d->gnu_hash && d->gnu_nbuckets) {
+		uint32_t last = 0;
+		for (uint32_t i = 0; i < d->gnu_nbuckets; i++)
+			if (d->gnu_buckets[i] > last)
+				last = d->gnu_buckets[i];
+		if (last < d->gnu_symoffset)
+			return NULL;
+		/* Follow that bucket's chain to its terminator. */
+		while (!(d->gnu_chain[last - d->gnu_symoffset] & 1))
+			last++;
+		n = last + 1;
+	}
+
+	for (uint32_t i = 0; i < n; i++) {
+		const Elf64_Sym *s = &d->symtab[i];
+		uint64_t v;
+
+		if (s->st_shndx == SHN_UNDEF || !s->st_value)
+			continue;
+		v = d->base + s->st_value;
+		if (v > a)
+			continue;
+		/* Prefer the closest match, and among equals the one whose size
+		 * actually covers the address. */
+		if (!best || v > d->base + best->st_value)
+			best = s;
+	}
+	return best;
+}
+
+int _rtld_dladdr(const void *addr, const char **fname, void **fbase,
+		 const char **sname, void **saddr)
+{
+	uint64_t a = (uint64_t)addr;
+	dso_t *d = rtld_dso_for_addr(a);
+	const Elf64_Sym *s;
+
+	if (!d)
+		return 0;
+	if (fname)
+		*fname = d->name;
+	if (fbase)
+		*fbase = (void *)d->base;
+	if (sname)
+		*sname = NULL;
+	if (saddr)
+		*saddr = NULL;
+
+	s = rtld_sym_for_addr(d, a);
+	if (s) {
+		if (sname)
+			*sname = d->strtab + s->st_name;
+		if (saddr)
+			*saddr = (void *)(d->base + s->st_value);
+	}
+	return 1;
 }
 
 /* ================================================================== */
@@ -1452,6 +1878,10 @@ uint64_t _dl_main(uint64_t *sp, uint64_t own_base)
 			main_dso->tls_memsz = mph[i].p_memsz;
 			main_dso->tls_align = mph[i].p_align;
 		}
+		if (mph[i].p_type == PT_GNU_RELRO) {
+			main_dso->relro_start = main_base + mph[i].p_vaddr;
+			main_dso->relro_len = mph[i].p_memsz;
+		}
 	}
 	rtld_parse_dynamic(main_dso);
 	rtld_assign_tls(main_dso);
@@ -1470,6 +1900,12 @@ uint64_t _dl_main(uint64_t *sp, uint64_t own_base)
 	/* ---- Relocate (dependencies first) ---- */
 	for (int i = g_ndsos - 1; i >= 0; i--)
 		rtld_relocate(&g_dsos[i]);
+
+	/* Relocation is done: lock down each object's RELRO region.  After all
+	 * of them, not inside the loop -- an object relocated earlier may still
+	 * be written by a later one's relocations. */
+	for (int i = 0; i < g_ndsos; i++)
+		rtld_protect_relro(&g_dsos[i]);
 
 	/* ---- TLS ----
 	 * Unconditional: even a program with no __thread data needs the block,

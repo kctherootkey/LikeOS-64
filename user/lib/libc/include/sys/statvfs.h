@@ -2,6 +2,10 @@
 #ifndef _SYS_STATVFS_H
 #define _SYS_STATVFS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/vfs.h>
 
 /* statvfs and statfs share the same layout in this implementation */
@@ -35,5 +39,9 @@ struct statvfs {
 
 int statvfs(const char *path, struct statvfs *buf);
 int fstatvfs(int fd, struct statvfs *buf);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SYS_STATVFS_H */

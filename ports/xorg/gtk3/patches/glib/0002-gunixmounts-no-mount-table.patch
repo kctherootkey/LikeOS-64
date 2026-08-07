@@ -1,0 +1,82 @@
+--- a/gio/gunixmounts.c
++++ b/gio/gunixmounts.c
+@@ -1106,6 +1106,49 @@
+   return NULL;
+ }
+ 
++#elif defined (__LIKEOS__)
++
++/*
++ * LikeOS has no mount table, because it has nothing to tabulate: the VFS is
++ * single-mount by design -- one filesystem, always at "/" -- so there is no
++ * /etc/mtab, no /proc/mounts and no getmntent().  df(1) reflects the same
++ * thing, reporting the root filesystem it obtains from statfs("/").
++ *
++ * An empty list is the truthful answer and costs nothing visible: GLib
++ * classifies "/" as system-internal and hides it from volume monitors and file
++ * choosers regardless, so a system reporting only its root mount and one
++ * reporting none look identical to the user.
++ *
++ * Shaped after the QNX branch above, which is here for the same reason.
++ */
++
++static char *
++get_mtab_monitor_file (void)
++{
++  /* Nothing to watch: with a single mount fixed at boot, the set of mounted
++   * filesystems never changes while the system is running. */
++  return NULL;
++}
++
++static GUnixMountEntry **
++_g_unix_mounts_get_from_file (const char *table_path,
++                              uint64_t   *time_read_out,
++                              size_t     *n_entries_out)
++{
++  if (time_read_out != NULL)
++    *time_read_out = 0;
++  if (n_entries_out != NULL)
++    *n_entries_out = 0;
++
++  return NULL;
++}
++
++static GList *
++_g_get_unix_mounts (void)
++{
++  return NULL;
++}
++
+ /* Common code {{{2 */
+ #else
+ #error No _g_get_unix_mounts() implementation for system
+@@ -1716,6 +1759,29 @@
+   if (time_read_out != NULL)
+     *time_read_out = 0;
+   if (n_points_out != NULL)
++    *n_points_out = 0;
++  return NULL;
++}
++
++#elif defined (__LIKEOS__)
++
++/* No /etc/fstab either: what gets mounted is decided by the bootloader and the
++ * kernel, not by a table userspace can read or edit. */
++
++static GList *
++_g_get_unix_mount_points (void)
++{
++  return NULL;
++}
++
++static GUnixMountPoint **
++_g_unix_mount_points_get_from_file (const char *table_path,
++                                    uint64_t   *time_read_out,
++                                    size_t     *n_points_out)
++{
++  if (time_read_out != NULL)
++    *time_read_out = 0;
++  if (n_points_out != NULL)
+     *n_points_out = 0;
+   return NULL;
+ }

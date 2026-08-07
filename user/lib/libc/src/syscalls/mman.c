@@ -58,13 +58,24 @@ int munlockall(void)
 	return 0;
 }
 
-/* madvise is purely advisory; accepting and ignoring the hint is a
- * conforming implementation (like the mlock family above). */
+/*
+ * madvise.  MADV_DONTNEED is the one that does real work: it releases the
+ * physical pages of the range while leaving the mapping in place, so the next
+ * access reads a fresh zero page.  That is how memory is handed back without
+ * giving up the address space -- the alternative, unmapping the range, cuts a
+ * hole in the mapping and costs the kernel a record of it every time.
+ *
+ * The rest are genuinely advisory and the kernel has nothing to do about them,
+ * so they succeed without acting, which is what advisory means.
+ */
 int madvise(void *addr, size_t len, int advice)
 {
-	(void)addr;
-	(void)len;
-	(void)advice;
+	long ret = syscall3(SYS_MADVISE, (long)addr, (long)len, (long)advice);
+
+	if (ret < 0) {
+		errno = (int)-ret;
+		return -1;
+	}
 	return 0;
 }
 

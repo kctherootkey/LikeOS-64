@@ -1,6 +1,10 @@
 #ifndef _TIME_H
 #define _TIME_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 /* time_t is now defined in sys/types.h */
@@ -74,5 +78,9 @@ void tzset(void);
 extern char *tzname[2];
 extern long timezone;
 extern int daylight;
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

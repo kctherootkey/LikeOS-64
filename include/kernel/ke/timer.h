@@ -20,6 +20,16 @@ void timer_stop(void);
 uint64_t timer_ticks(void);
 uint64_t timer_get_epoch(void);
 uint32_t timer_get_frequency(void);
+
+/* Duration -> ticks at the measured tick rate, rounded up.  See timer.c: the
+ * rate is calibrated at boot and is not necessarily the 100Hz that was asked
+ * for, so a hardcoded 10ms tick expires in the wrong amount of time. */
+uint64_t timer_ns_to_ticks(uint64_t ns);
+uint64_t timer_us_to_ticks(uint64_t us);
+uint64_t timer_ms_to_ticks(uint64_t ms);
+uint64_t timer_s_to_ticks(uint64_t secs);
+uint64_t timer_ticks_to_s(uint64_t ticks); /* inverse, truncating */
+uint64_t timer_us_per_tick(void); /* for durations already counted in ticks */
 void timer_calibrate_frequency(void);
 void timer_irq_handler(void);
 uint64_t timer_get_uptime(void); // seconds since boot

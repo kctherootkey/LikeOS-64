@@ -188,7 +188,7 @@ int unix_getname(int usockfd, int peer, struct sockaddr_un *addr,
 		 socklen_t *addrlen)
 {
 	unix_socket_t *us = unix_get(usockfd);
-	unix_socket_t *target;
+	const char *name;
 	socklen_t have, need;
 	int nlen;
 
@@ -198,15 +198,20 @@ int unix_getname(int usockfd, int peer, struct sockaddr_un *addr,
 		return -EFAULT;
 
 	if (peer) {
-		target = us->peer;
-		if (!target || !us->connected)
+		/* The copy taken when the connection was made, NOT `us->peer`.
+		 * A socket that is still open must be able to name the peer it
+		 * was connected to even after that peer has closed, which is
+		 * exactly when callers tend to ask. */
+		if (!us->peer_valid)
 			return -ENOTCONN;
+		name = us->peer_path;
+		nlen = us->peer_path_len;
 	} else {
-		target = us;
+		name = us->path;
+		nlen = us->path_len;
 	}
 
 	have = *addrlen;
-	nlen = target->path_len;
 	if (nlen < 0)
 		nlen = 0;
 	if (nlen > UNIX_PATH_MAX)
@@ -221,7 +226,7 @@ int unix_getname(int usockfd, int peer, struct sockaddr_un *addr,
 	for (int i = 0; i < UNIX_PATH_MAX; i++)
 		addr->sun_path[i] = '\0';
 	for (int i = 0; i < nlen; i++)
-		addr->sun_path[i] = target->path[i];
+		addr->sun_path[i] = name[i];
 
 	*addrlen = need;
 	(void)have; /* truncation is the caller's business, not an error */
@@ -568,6 +573,31 @@ int unix_accept(int usockfd, struct sockaddr_un *addr, socklen_t *addrlen)
 	server->peer = client;
 	client->peer = server;
 	client->connected = 1;
+
+	/* Record each end's view of the other WHILE both are here and the
+	 * table lock is held.  From now on getpeername() reads these copies
+	 * and never follows `peer`, so it keeps working after the far end
+	 * closes -- see the comment on peer_path in the struct. */
+	{
+		int cl = client->path_len;
+
+		if (cl < 0)
+			cl = 0;
+		if (cl > UNIX_PATH_MAX)
+			cl = UNIX_PATH_MAX;
+		for (int i = 0; i < cl; i++)
+			server->peer_path[i] = client->path[i];
+		server->peer_path_len = cl;
+		server->peer_valid = 1;
+
+		/* The client's peer is the accepted socket, which was given the
+		 * listener's name just above -- so this is the address the
+		 * client connected to. */
+		for (int i = 0; i < server->path_len; i++)
+			client->peer_path[i] = server->path[i];
+		client->peer_path_len = server->path_len;
+		client->peer_valid = 1;
+	}
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
 
 	/* Fill addr if requested.  Report the client's own bound name, as raw
@@ -666,12 +696,47 @@ int unix_connect(int usockfd, const struct sockaddr_un *addr,
 	 * server does -- is waiting on the poll channel, not on this socket. */
 	poll_notify_io_ready();
 
-	// Wait for acceptance (peer link to be set up).  Re-read peer/error
-	// each iteration via volatile so the compiler doesn't hoist.  Yield
-	// rather than pause so the listener task on another CPU (or this
-	// CPU) can actually run accept and link us.
+	/*
+	 * Wait for acceptance.
+	 *
+	 * The thing to wait for is `connected', NOT `peer'.
+	 *
+	 * accept() sets both, together, under the table lock: client->peer =
+	 * server and client->connected = 1.  But close() on the accepted end
+	 * clears client->peer back to NULL, while `connected' -- which connect()
+	 * only ever reads, never writes -- stays set for good.  So a loop that
+	 * waits for a non-NULL peer is waiting for a state that a server doing
+	 *
+	 *     fd = accept(...); close(fd);
+	 *
+	 * publishes and withdraws before this task is next scheduled.  Then peer
+	 * is NULL again, error is 0, and the loop below spins for ever on a
+	 * connection that actually completed: the task stays READY, burning a
+	 * CPU, and its parent waits in waitpid() for a child that will never
+	 * exit.  Caught with pid 180 spinning here while its own socket showed
+	 * connected=1, peer_closed=1, peer=NULL.
+	 *
+	 * The connection DID complete, so connect() succeeds; the caller learns
+	 * about the hangup from its first read, exactly as it would anywhere
+	 * else.  Only a peer that closed WITHOUT ever linking us is a refusal.
+	 *
+	 * Re-read through volatile each pass so the compiler cannot hoist any
+	 * of it out, and yield rather than pause so the listener -- which may
+	 * be on this very CPU -- gets to run accept().
+	 */
 	task_t *con_cur = sched_current();
-	while (!*(volatile void **)&us->peer && !*(volatile int *)&us->error) {
+	for (;;) {
+		if (*(volatile int *)&us->connected)
+			break;
+		if (*(volatile int *)&us->error)
+			break;
+		/* Hung up before we were ever linked: nobody is coming. */
+		if (*(volatile int *)&us->peer_closed) {
+			us->peer_closed = 0;
+			return -ECONNREFUSED;
+		}
+		if (*(volatile int *)&us->closed)
+			return -EBADF;
 		if (us->nonblock)
 			return -EINPROGRESS;
 		if (!*(volatile int *)&us->active)
@@ -1219,6 +1284,13 @@ int unix_socketpair(int type, int sv[2])
 	// Link peers
 	s0->peer = s1;
 	s1->peer = s0;
+	/* Both ends are connected, and both are unnamed -- a pair has no
+	 * pathname.  peer_valid still has to be set, or getpeername() on either
+	 * end would report ENOTCONN instead of the correct family-only answer. */
+	s0->peer_path_len = 0;
+	s0->peer_valid = 1;
+	s1->peer_path_len = 0;
+	s1->peer_valid = 1;
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
 
 	sv[0] = MAKE_UNIX_SOCKET_FD(idx0);

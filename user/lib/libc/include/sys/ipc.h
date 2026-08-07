@@ -8,6 +8,10 @@
 #ifndef _SYS_IPC_H
 #define _SYS_IPC_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 typedef int key_t;
@@ -31,5 +35,9 @@ struct ipc_perm {
     unsigned int   mode;
     unsigned int   seq;
 };
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SYS_IPC_H */

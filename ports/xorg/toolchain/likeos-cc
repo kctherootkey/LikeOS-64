@@ -7,9 +7,24 @@
 # openssh port's likeos-cc, extended with the shared sysroot every X package
 # installs its headers, libraries and .pc files into.
 #
-# The include order is load-bearing: LikeOS libc first, then the sysroot, and
-# GCC's own headers LAST.  GCC's directory contains a float.h/stddef.h we do
-# want, but also a stdlib.h etc. we very much do not.
+# The include order is load-bearing: the port sysroot first, then the LikeOS
+# libc, and GCC's own headers LAST.  GCC's directory contains a float.h/stddef.h
+# we do want, but also a stdlib.h etc. we very much do not.
+#
+# Sysroot ahead of libc, rather than the other way round, because of exactly one
+# header: GNU libiconv's.  The libc has an iconv(3) of its own covering four
+# character sets, which is enough for the X core fonts and nowhere near enough
+# for a mail client, so libiconv is ported alongside it.  The two coexist only
+# through libiconv's header, which renames its entry points to libiconv_open and
+# friends -- and with the libc's include directory searched first, that header is
+# never the one that gets included.  The renaming then silently does not happen
+# and every caller binds to the four-charset implementation instead.
+#
+# Nothing is shadowed the other way: the two directories had no file in common
+# when this was changed (verified across all 1127 sysroot headers), so for every
+# package built before it the order is not observable.  A package that installs
+# a header named like one of the libc's would now win, which is the hazard to
+# remember if a build ever starts using a declaration it should not have.
 
 set -e
 
@@ -34,8 +49,8 @@ OPENSSL="$ROOT/ports/openssl-3.5.6"
 GCC_INC="$(gcc -print-file-name=include)"
 
 INCLUDES="-nostdinc \
-  -isystem $LIBC/include \
   -isystem $SYSROOT/usr/include \
+  -isystem $LIBC/include \
   -isystem $ZLIB \
   -isystem $OPENSSL/include \
   -isystem $GCC_INC"
@@ -67,13 +82,44 @@ COMPILE_FLAGS="-O2 -fPIC -fno-builtin -ffreestanding -mno-red-zone \
   -DXOS_USE_MTSAFE_PWDAPI \
   -U__linux__ -U__linux -Ulinux -U__gnu_linux__ -U_LINUX"
 
-# A link step is anything that is not -c / -E / -S.
+# Every token this invocation was given, INCLUDING the contents of any
+# response file.
+#
+# ninja hands the compiler `@some.rsp` when the command line would be too long
+# for the kernel to exec, and meson generates those routinely for a link with
+# several hundred objects.  gcc expands them itself, so the build works -- but
+# this script has to classify the invocation before handing it over, and the
+# flag that decides everything is inside the file rather than on the command
+# line.  Scanning only "$@" saw no -shared when linking libgtk-3.so, took the
+# executable path, and put crt1.o into a shared library: the link then failed
+# with "undefined reference to `main'", naming neither the response file nor
+# the wrapper.
+#
+# Quotes are stripped because a response file may quote a token; only whole
+# tokens are matched, so a FILE named "-shared" cannot be mistaken for the flag.
+scan_tokens() {
+	for a in "$@"; do
+		case "$a" in
+		@?*)
+			[ -f "${a#@}" ] && tr -d "'\"" <"${a#@}"
+			;;
+		*) printf '%s\n' "$a" ;;
+		esac
+	done
+}
+
+# A link step is anything that is not -c / -E / -S; -shared decides between a
+# shared library and an executable.
 is_link=1
-for a in "$@"; do
-	case "$a" in
+is_shared=0
+set -f # the token list is not a glob pattern
+for tok in $(scan_tokens "$@"); do
+	case "$tok" in
 	-c | -E | -S) is_link=0 ;;
+	-shared) is_shared=1 ;;
 	esac
 done
+set +f
 
 # Appended AFTER the package's own flags, which is the only position that can
 # undo one of them: last -W wins.
@@ -95,13 +141,6 @@ if [ "$is_link" = "0" ]; then
 fi
 
 # Shared library or executable?  Both need the sysroot on the library path.
-is_shared=0
-for a in "$@"; do
-	case "$a" in
-	-shared) is_shared=1 ;;
-	esac
-done
-
 LIBDIRS="-L$LIBC -L$RTLD -L$SYSROOT/usr/lib -L$ROOT/build -L$OPENSSL"
 
 # Stop -lfoo from ever reaching a build-host library.
@@ -140,6 +179,7 @@ if [ "$is_shared" = "1" ]; then
 	# says nothing about TLS.
 	exec gcc $INCLUDES $COMPILE_FLAGS -nostdlib -shared \
 		-Wl,--hash-style=gnu -Wl,-Bsymbolic-functions \
+		-Wl,-z,relro \
 		$LIBDIRS $NO_HOST_LIBS $RPATH_LINK "$@" -lc -l:ld-likeos.so -lgcc
 fi
 
@@ -148,7 +188,7 @@ fi
 # modules are dlopen'd and resolve back into the binary's own symbols.
 exec gcc $INCLUDES $COMPILE_FLAGS \
 	-nostdlib -pie \
-	-Wl,-T,"$LDS" -Wl,--hash-style=gnu -Wl,-z,now \
+	-Wl,-T,"$LDS" -Wl,--hash-style=gnu -Wl,-z,now -Wl,-z,relro \
 	-Wl,--export-dynamic \
 	-Wl,-rpath,/lib -Wl,-dynamic-linker,/lib/ld-likeos.so \
 	$LIBDIRS $NO_HOST_LIBS $RPATH_LINK \

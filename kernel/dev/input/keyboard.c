@@ -373,22 +373,41 @@ void keyboard_irq_handler(void)
 	keyboard_buffer_add(scan_code);
 	kb_ps2_in_irq = 0;
 
-	// Debug hotkey: Ctrl+D dumps all task states
+	/*
+	 * Debug hotkeys.  Both dump through kprintf -- tty_printf(NULL) -- and
+	 * NOT to tty_get_active().
+	 *
+	 * This runs in the keyboard interrupt handler, and tty_write()'s path
+	 * for a PTY slave is a blocking enqueue with a wait queue: correct for
+	 * a process writing to its terminal, not something an interrupt handler
+	 * may call.  Whenever the active tty is a pty -- which it is for a
+	 * session inside xterm, tmux or ssh -- the dump was therefore going
+	 * somewhere an IRQ has no business being.
+	 *
+	 * kprintf reaches the console and the serial line without sleeping, and
+	 * it lands in the kernel log, so the tables can also be read back with
+	 * dmesg after the fact rather than having to be caught on screen.
+	 *
+	 * For a dump on demand from a shell, without a keypress, use kdump(1) --
+	 * it calls SYS_DEBUG_DUMP and emits exactly these tables.
+	 */
+
+	// Ctrl+D dumps all task states
 	if (kb_state.ctrl_pressed && !kb_state.alt_pressed &&
 	    scan_code == 0x20) { // 0x20 = 'd'
-		sched_dump_tasks(tty_get_active());
+		sched_dump_tasks(NULL);
 		return;
 	}
 
-	// Debug hotkey: Ctrl+N dumps the TCP connection table + PTY state
+	// Ctrl+N dumps the TCP + AF_UNIX + PTY tables
 	if (kb_state.ctrl_pressed && !kb_state.alt_pressed &&
 	    scan_code == 0x31) { // 0x31 = 'n'
 		extern void tcp_dump_table(struct tty * tty);
 		extern void tty_dump_ptys(struct tty * tty);
 		extern void unix_dump_sockets(struct tty * tty);
-		tcp_dump_table(tty_get_active());
-		unix_dump_sockets(tty_get_active());
-		tty_dump_ptys(tty_get_active());
+		tcp_dump_table(NULL);
+		unix_dump_sockets(NULL);
+		tty_dump_ptys(NULL);
 		return;
 	}
 

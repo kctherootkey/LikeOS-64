@@ -1,6 +1,10 @@
 #ifndef _MALLOC_H
 #define _MALLOC_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 // Core allocation API (also declared in stdlib.h)
@@ -51,6 +55,10 @@ struct mallinfo2 {
 
 struct mallinfo mallinfo(void);
 struct mallinfo2 mallinfo2(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _MALLOC_H */
 

@@ -63,6 +63,31 @@ typedef struct {
 
 int dladdr(const void *addr, Dl_info *info);
 
+/*
+ * Which loaded object covers an address, and where its exception-handling
+ * data is.  This is what a C++ runtime's stack unwinder calls on the way out
+ * of a throw: it turns the faulting program counter into the PT_GNU_EH_FRAME
+ * segment of the object it belongs to.  A program that never throws never
+ * calls it; a program that does cannot work without it.
+ *
+ * Layout is fixed by the interface, not by us -- the unwinder in libgcc is
+ * compiled against it -- so the reserved words stay even though nothing here
+ * writes them.  On x86-64 there is no separate data base and no entry count.
+ *
+ * Returns 0 and fills *result when the address falls inside a loaded object,
+ * -1 when it does not.
+ */
+struct dl_find_object {
+    unsigned long long  dlfo_flags;
+    void               *dlfo_map_start;  /* Lowest mapped address */
+    void               *dlfo_map_end;    /* One past the highest */
+    void               *dlfo_link_map;   /* Loader's handle for the object */
+    void               *dlfo_eh_frame;   /* PT_GNU_EH_FRAME, or NULL */
+    unsigned long long  __dlfo_reserved[7];
+};
+
+int _dl_find_object(void *address, struct dl_find_object *result);
+
 #ifdef __cplusplus
 }
 #endif

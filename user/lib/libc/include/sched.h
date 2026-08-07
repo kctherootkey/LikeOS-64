@@ -53,7 +53,7 @@ typedef struct {
 #define CPU_ISSET(cpu, set) (((set)->bits[0] & (1UL << (cpu))) != 0)
 
 // Count bits set in CPU mask (simple implementation without __builtin_popcount)
-static inline int __cpu_count(const cpu_set_t* set) {
+static __inline int __cpu_count(const cpu_set_t* set) {
     unsigned long v = set->bits[0];
     int count = 0;
     while (v) {

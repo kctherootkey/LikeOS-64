@@ -21,8 +21,19 @@ ROOT=$(cd "$TOOLCHAIN/../../.." && pwd)
 SYSROOT="${LIKEOS_SYSROOT:-$ROOT/build/xorg-sysroot}"
 
 CC="$TOOLCHAIN/likeos-cc"
+# CXX too, even though most packages here are C.
+#
+# An autotools package that builds any C++ at all takes CXX from the
+# environment and falls back to plain `g++' -- the BUILD HOST's compiler,
+# with the host's libraries and the host's C library.  It does not fail
+# where the mistake is: the C parts build correctly with the cross compiler
+# and only the C++ link goes wrong, somewhere much later, complaining about
+# a library that is in the sysroot rather than on this machine.  libtiff is
+# where that first showed up (its optional iostream wrapper) and Enchant,
+# which is C++ throughout, would have hit it next.
+CXX="$TOOLCHAIN/likeos-c++"
 PKG_CONFIG="$TOOLCHAIN/likeos-pkg-config"
-export CC PKG_CONFIG
+export CC CXX PKG_CONFIG
 
 # util-macros installs its m4 into the sysroot; without this every package's
 # configure dies on an undefined XORG_MACROS_VERSION.
@@ -226,6 +237,36 @@ for cfg in configure */configure */*/configure; do
 		sed -i "${ln}s/^\\([[:space:]]*\\)linux\\*)/\\1likeos* | linux*)/" "$cfg"
 	done <.likeos-libtool-arms
 	rm -f .likeos-libtool-arms
+done
+
+# Make sure the package can NAME this system before asking it to build for it.
+#
+# config.sub validates the host triple against a list of operating systems it
+# knows, and x86_64-unknown-likeos is on nobody's list.  Most packages here ship
+# a copy old enough not to care -- startup-notification's is from 2011 and
+# echoes back whatever looks syntactically plausible -- but a recent one rejects
+# it outright and configure stops before it starts:
+#
+#     configure: error: /bin/bash ./config.sub x86_64-unknown-likeos failed
+#
+# So the package's copy is REPLACED, but only when its own answer is no.  A
+# package that already accepts the triple keeps its file: GMP's config.sub, for
+# one, is a wrapper adding CPU spellings of its own around the standard script,
+# and overwriting a working one would throw those away for nothing.
+#
+# configfsf.sub is checked as well, because that wrapper is what GMP delegates
+# to and replacing only the outer file would leave the rejection in place.
+for sub in config.sub configfsf.sub; do
+	[ -f "$sub" ] || continue
+	./"$sub" x86_64-unknown-likeos >/dev/null 2>&1 && continue
+	cp -f "$TOOLCHAIN/config.sub" "$sub"
+	chmod 755 "$sub"
+done
+for guess in config.guess configfsf.guess; do
+	[ -f "$guess" ] || continue
+	./"$guess" >/dev/null 2>&1 && continue
+	cp -f "$TOOLCHAIN/config.guess" "$guess"
+	chmod 755 "$guess"
 done
 
 # Because the scoping above can only err toward NOT rewriting an arm, and

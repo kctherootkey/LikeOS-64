@@ -1033,17 +1033,31 @@ void net_timer_tick(void);
 #define SOCKET_FD_BASE 0x10000UL
 #define EPOLL_FD_BASE 0x20000UL
 #define UNIX_SOCKET_FD_BASE 0x30000UL
-#define MAX_EPOLL_INSTANCES 32
+/* Epoll instances are SYSTEM-WIDE, not per process, so this ceiling is shared
+ * by every program running at once -- and running out is not a soft failure.
+ * GLib probes whether a descriptor is pollable by creating a throwaway epoll
+ * set for it (gio/giounix-private.c, _g_fd_is_pollable), and if epoll_create1
+ * fails it calls g_error(), which ABORTS the process.  So a GTK application
+ * does not degrade when this table is full: it dies.  32 was one X session's
+ * worth with nothing to spare; each instance is ~1.5 KB, so 128 costs ~200 KB
+ * of BSS for four times the headroom. */
+#define MAX_EPOLL_INSTANCES 128
+/* Descriptors watched per instance. */
 #define MAX_EPOLL_ENTRIES 64
-/* Each slot is ~8.6 KB (dominated by its 8 KB ring buffer), so this is a
- * static ~2 MB.  64 was far too tight for parallel load: every socket(),
- * every accept() and every socketpair() end takes a slot, so a handful of
- * concurrent AF_UNIX users could exhaust the table.  Exhaustion is at least
- * reported honestly (unix_create -> -ENOMEM, unix_accept -> -ENOMEM and it
- * sets the waiting client's error), but there is no reason to be that close
- * to the edge.  Bounded by the fd encoding: UNIX_SOCKET_FD_BASE ranges are
- * 0x10000 apart, so anything up to 65536 is representable. */
-#define MAX_UNIX_SOCKETS 256
+/* Also SYSTEM-WIDE.  Every socket(), every accept() and every socketpair() end
+ * takes a slot, and an X session spends two per client connection (the
+ * client's end and the server's accepted end) before the clients' own
+ * socketpairs.  Exhaustion is reported honestly (unix_create -> -ENOMEM,
+ * unix_accept -> -ENOMEM plus the waiting client's error), but for a GTK
+ * program that surfaces as an unexplained failure to reach the display.
+ *
+ * A slot is 656 bytes, so 1024 of them is ~670 KB.  It used to be ~8.6 KB
+ * because the 8 KB data ring was inlined into every slot whether the socket
+ * existed or not; the ring became a pointer allocated on first use, which made
+ * the table an order of magnitude cheaper to widen than the old note here
+ * claimed.  Bounded by the fd encoding: UNIX_SOCKET_FD_BASE ranges are 0x10000
+ * apart, so anything up to 65536 is representable. */
+#define MAX_UNIX_SOCKETS 1024
 
 #define IS_SOCKET_FD(ptr)                      \
 	((uintptr_t)(ptr) >= SOCKET_FD_BASE && \
@@ -1393,6 +1407,23 @@ typedef struct unix_socket {
 	int path_len;
 	struct unix_socket *peer; // Connected peer
 	struct unix_socket *parent; // Listener (for accepted sockets)
+
+	/* The peer's name, COPIED at the moment the connection is made.
+	 *
+	 * getpeername() must keep answering after the far end has closed: the
+	 * connection is over, but this socket is still open and still knows who
+	 * it was talking to, and callers ask precisely when they are cleaning up
+	 * after a peer that has just gone away.  Chasing `peer` instead means the
+	 * answer disappears the instant the other side calls close() -- a plain
+	 * accept-then-close on the server left the client unable to name the
+	 * address it had just successfully connected to.
+	 *
+	 * peer_valid says a connection was made at all; without it there is no
+	 * way to tell "connected to an unnamed socket" (normal: a client that
+	 * never bound) from "never connected" (ENOTCONN). */
+	char peer_path[UNIX_PATH_MAX];
+	int peer_path_len;
+	int peer_valid;
 
 	/* Data ring, allocated on first use rather than inlined.
 	 *

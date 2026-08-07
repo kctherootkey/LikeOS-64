@@ -390,9 +390,12 @@ int raw_send(int subcmd, uint32_t dst, uint32_t id_seq, uint32_t ttl)
 	return (int)ret;
 }
 
-int raw_recv(int subcmd, void *result, uint32_t param, uint64_t timeout)
+/* `timeout_ms' is a duration in milliseconds.  It used to be a count of kernel
+ * timer ticks, which made every caller responsible for a rate it cannot know. */
+int raw_recv(int subcmd, void *result, uint32_t param, uint64_t timeout_ms)
 {
-	long ret = syscall4(SYS_RAW_RECV, subcmd, (long)result, param, timeout);
+	long ret =
+		syscall4(SYS_RAW_RECV, subcmd, (long)result, param, timeout_ms);
 	if (ret < 0) {
 		errno = (int)-ret;
 		return -1;

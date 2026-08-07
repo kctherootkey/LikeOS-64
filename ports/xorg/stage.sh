@@ -34,6 +34,13 @@ mkdir -p "$DEST/lib" "$DEST/usr/bin" "$DEST/etc/X11" \
 # ---------------------------------------------------------------------------
 for f in "$SYSROOT"/usr/lib/*.so.*; do
 	[ -e "$f" ] || continue
+	# libstdc++ installs a debugger script beside the library, named
+	# libstdc++.so.<version>-gdb.py, which this glob matches.  It teaches gdb
+	# to print an std::string readably and is of no use to a system with
+	# neither gdb nor Python on it.
+	case "$f" in
+	*-gdb.py) continue ;;
+	esac
 	base=$(basename "$f")
 	if [ -L "$f" ]; then
 		cp -a "$f" "$DEST/lib/$base"

@@ -11,6 +11,7 @@
  */
 
 #include <dlfcn.h>
+#include <link.h>
 #include <stddef.h>
 
 /* Declarations of the runtime linker functions */
@@ -18,6 +19,11 @@ extern void *_rtld_dlopen(const char *filename, int flags);
 extern void *_rtld_dlsym(void *handle, const char *symbol);
 extern int _rtld_dlclose(void *handle);
 extern char *_rtld_dlerror(void);
+extern int _rtld_find_object(void *addr, struct dl_find_object *result);
+extern int _rtld_iterate_phdr(int (*cb)(struct dl_phdr_info *, size_t, void *),
+			      void *data);
+extern int _rtld_dladdr(const void *addr, const char **fname, void **fbase,
+			const char **sname, void **saddr);
 
 void *dlopen(const char *filename, int flags)
 {
@@ -41,14 +47,28 @@ char *dlerror(void)
 
 int dladdr(const void *addr, Dl_info *info)
 {
-	/* Stub: the runtime linker doesn't expose dladdr yet.
-     * Return 0 (failure) so callers fall back gracefully. */
-	(void)addr;
-	if (info) {
-		info->dli_fname = NULL;
-		info->dli_fbase = NULL;
-		info->dli_sname = NULL;
-		info->dli_saddr = NULL;
-	}
-	return 0;
+	if (!info)
+		return 0;
+	info->dli_fname = NULL;
+	info->dli_fbase = NULL;
+	info->dli_sname = NULL;
+	info->dli_saddr = NULL;
+	/* Unlike the rest of this file, a failure here is not an error to
+	 * report: dladdr() returns zero for an address that belongs to no
+	 * object, and callers use it as the question rather than as an
+	 * assertion.  dlerror() is deliberately left alone. */
+	return _rtld_dladdr(addr, &info->dli_fname, &info->dli_fbase,
+			    &info->dli_sname, &info->dli_saddr);
+}
+
+int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *info, size_t size,
+				    void *data),
+		    void *data)
+{
+	return _rtld_iterate_phdr(callback, data);
+}
+
+int _dl_find_object(void *address, struct dl_find_object *result)
+{
+	return _rtld_find_object(address, result);
 }

@@ -860,8 +860,13 @@ void signal_deliver(task_t *task)
 		switch (action) {
 		case SIG_DFL_TERM:
 		case SIG_DFL_CORE:
-			// Terminate (core dump not implemented)
+			/* Terminate the PROCESS, not just this thread (core dump
+			 * not implemented).  A fatal default action ends every
+			 * thread of the group -- otherwise abort() from one
+			 * thread leaves the others running and the program
+			 * hangs instead of dying. */
 			task->term_sig = signum;
+			sched_kill_thread_group(task, 128 + signum);
 			sched_mark_task_exited(task, 128 + signum);
 			break;
 		case SIG_DFL_STOP:
@@ -926,7 +931,10 @@ void signal_deliver_irq(task_t *task, interrupt_frame_t *frame)
 		switch (action) {
 		case SIG_DFL_TERM:
 		case SIG_DFL_CORE:
+			/* Whole process, not just this thread -- see the note at
+			 * the other default-action site. */
 			task->term_sig = signum;
+			sched_kill_thread_group(task, 128 + signum);
 			sched_mark_task_exited(task, 128 + signum);
 			// Ensure sched_preempt runs after we return to irq_handler,
 			// even if the timer's remaining_ticks hasn't expired yet.

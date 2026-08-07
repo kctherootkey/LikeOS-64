@@ -4,6 +4,10 @@
 #ifndef _PATHS_H
 #define _PATHS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define _PATH_BSHELL    "/bin/sh"
 #define _PATH_CSHELL    "/bin/sh"
 #define _PATH_DEFPATH   "/usr/local/bin:/usr/bin:/bin"
@@ -21,5 +25,9 @@
  * kept this in <protocols/rwhod.h>; it belongs here, and that header includes
  * this one so code written against either spelling compiles. */
 #define _PATH_RWHODIR   "/var/spool/rwho"
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _PATHS_H */

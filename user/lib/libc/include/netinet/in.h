@@ -1,6 +1,10 @@
 #ifndef _NETINET_IN_H
 #define _NETINET_IN_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 #include <sys/socket.h>
 
@@ -94,13 +98,66 @@ struct in_pktinfo {
 #define IPPROTO_IPV6        41
 #define IPPROTO_ICMPV6      58
 
-#define IPV6_V6ONLY         26
+/*
+ * IPv6 socket options (RFC 3493 §5.3, RFC 3542 §4-§6).
+ *
+ * The numbers are the conventional ones, so a program that hardcodes a value
+ * -- and some do -- agrees with a program that uses the name.
+ *
+ * Defining them all is not a claim that the stack implements them: it does not
+ * implement IPv6 at all, and setsockopt(2) reports that.  But a constant that
+ * is merely absent stops a build outright, where one the kernel rejects
+ * produces the error the caller is already written to handle -- GLib sets
+ * IPV6_TCLASS to mark packet priority and treats a failure as "this system
+ * does not offer it", which is exactly right here.
+ */
+#define IPV6_ADDRFORM       1
+#define IPV6_2292PKTINFO    2
+#define IPV6_2292HOPOPTS    3
+#define IPV6_2292DSTOPTS    4
+#define IPV6_2292RTHDR      5
+#define IPV6_2292PKTOPTIONS 6
+#define IPV6_CHECKSUM       7
+#define IPV6_2292HOPLIMIT   8
 #define IPV6_UNICAST_HOPS   16
 #define IPV6_MULTICAST_IF   17
 #define IPV6_MULTICAST_HOPS 18
 #define IPV6_MULTICAST_LOOP 19
 #define IPV6_JOIN_GROUP     20
 #define IPV6_LEAVE_GROUP    21
+#define IPV6_ROUTER_ALERT   22
+#define IPV6_MTU_DISCOVER   23
+#define IPV6_MTU            24
+#define IPV6_RECVERR        25
+#define IPV6_V6ONLY         26
+#define IPV6_JOIN_ANYCAST   27
+#define IPV6_LEAVE_ANYCAST  28
+#define IPV6_RECVPKTINFO    49
+#define IPV6_PKTINFO        50
+#define IPV6_RECVHOPLIMIT   51
+#define IPV6_HOPLIMIT       52
+#define IPV6_RECVHOPOPTS    53
+#define IPV6_HOPOPTS        54
+#define IPV6_RTHDRDSTOPTS   55
+#define IPV6_RECVRTHDR      56
+#define IPV6_RTHDR          57
+#define IPV6_RECVDSTOPTS    58
+#define IPV6_DSTOPTS        59
+#define IPV6_RECVPATHMTU    60
+#define IPV6_PATHMTU        61
+#define IPV6_DONTFRAG       62
+#define IPV6_RECVTCLASS     66
+#define IPV6_TCLASS         67
+
+/* The multicast join/leave structure names RFC 3493 gives these options. */
+#define IPV6_ADD_MEMBERSHIP  IPV6_JOIN_GROUP
+#define IPV6_DROP_MEMBERSHIP IPV6_LEAVE_GROUP
+
+/* Values for IPV6_MTU_DISCOVER. */
+#define IPV6_PMTUDISC_DONT   0
+#define IPV6_PMTUDISC_WANT   1
+#define IPV6_PMTUDISC_DO     2
+#define IPV6_PMTUDISC_PROBE  3
 
 struct in6_addr {
     union {
@@ -124,6 +181,27 @@ struct sockaddr_in6 {
 struct ipv6_mreq {
     struct in6_addr ipv6mr_multiaddr;
     unsigned int    ipv6mr_interface;
+};
+
+/*
+ * The ancillary data IPV6_PKTINFO and IPV6_RECVPKTINFO carry (RFC 3542 §6.6):
+ * which address a datagram arrived on, and through which interface.
+ *
+ * Present because the OPTION NAMES above are.  Software tests for the constant
+ * and takes the structure's existence as implied -- OpenSSL's DTLS code does
+ * exactly that, and adding IPV6_PKTINFO without this broke a port that had
+ * been building for months:
+ *
+ *     error: invalid application of 'sizeof' to incomplete type
+ *            'struct in6_pktinfo'
+ *
+ * which names neither the constant nor the header that gained it.  A socket
+ * option and the data it transfers are one interface; declaring half of it
+ * tells a caller something untrue.
+ */
+struct in6_pktinfo {
+    struct in6_addr ipi6_addr;    /* Source or destination address */
+    unsigned int    ipi6_ifindex; /* Interface index */
 };
 
 extern const struct in6_addr in6addr_any;
@@ -171,23 +249,27 @@ extern const struct in6_addr in6addr_loopback;
 	 ((const uint32_t *)(a))[3] == ((const uint32_t *)(b))[3])
 
 // Byte order conversion
-static inline uint16_t htons(uint16_t x) {
+static __inline uint16_t htons(uint16_t x) {
     return (uint16_t)((x >> 8) | (x << 8));
 }
 
-static inline uint16_t ntohs(uint16_t x) {
+static __inline uint16_t ntohs(uint16_t x) {
     return htons(x);
 }
 
-static inline uint32_t htonl(uint32_t x) {
+static __inline uint32_t htonl(uint32_t x) {
     return ((x >> 24) & 0xFF) |
            ((x >> 8) & 0xFF00) |
            ((x << 8) & 0xFF0000) |
            ((x << 24) & 0xFF000000);
 }
 
-static inline uint32_t ntohl(uint32_t x) {
+static __inline uint32_t ntohl(uint32_t x) {
     return htonl(x);
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _NETINET_IN_H */

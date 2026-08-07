@@ -1,6 +1,10 @@
 #ifndef _TERMIOS_H
 #define _TERMIOS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 typedef unsigned int tcflag_t;
@@ -218,5 +222,9 @@ int tcdrain(int fd);
 int tcflow(int fd, int action);
 int tcsendbreak(int fd, int duration);
 pid_t tcgetsid(int fd);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

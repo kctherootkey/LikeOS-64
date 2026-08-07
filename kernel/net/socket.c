@@ -1245,7 +1245,7 @@ int sock_setsockopt(int sockfd, int level, int optname, const void *optval,
              * regardless of the actual tick rate (e.g. VMware may calibrate
              * g_frequency != 100 Hz).
              * Legacy callers passing a raw millisecond uint64_t (<16 bytes)
-             * still use the old /10 path (assumes 100 Hz). */
+             * take a plain millisecond count, converted the same way. */
 			uint32_t hz = timer_get_frequency();
 			if (hz == 0)
 				hz = 100;
@@ -1258,10 +1258,11 @@ int sock_setsockopt(int sockfd, int level, int optname, const void *optval,
 					(uint64_t)sec * hz +
 					(uint64_t)usec * hz / 1000000ULL;
 			} else if (optlen >= (int)sizeof(uint64_t)) {
-				s->rcv_timeout_ticks =
-					*(const uint64_t *)optval / 10;
+				s->rcv_timeout_ticks = timer_ms_to_ticks(
+					*(const uint64_t *)optval);
 			} else if (optlen >= (int)sizeof(int)) {
-				s->rcv_timeout_ticks = (uint64_t)ival / 10;
+				s->rcv_timeout_ticks =
+					timer_ms_to_ticks((uint64_t)ival);
 			}
 			return 0;
 		}
@@ -1377,11 +1378,14 @@ int sock_setsockopt(int sockfd, int level, int optname, const void *optval,
 			return 0;
 		case TCP_KEEPIDLE:
 			if (s->tcp && ival > 0)
-				s->tcp->keepidle_ticks = (uint32_t)ival * 100;
+				s->tcp->keepidle_ticks = (uint32_t)timer_s_to_ticks(
+					(uint64_t)ival);
 			return 0;
 		case TCP_KEEPINTVL:
 			if (s->tcp && ival > 0)
-				s->tcp->keepintvl_ticks = (uint32_t)ival * 100;
+				s->tcp->keepintvl_ticks =
+					(uint32_t)timer_s_to_ticks(
+						(uint64_t)ival);
 			return 0;
 		case TCP_KEEPCNT:
 			if (s->tcp && ival > 0)
@@ -1539,15 +1543,15 @@ int sock_getsockopt(int sockfd, int level, int optname, void *optval,
 			return 0;
 		case TCP_KEEPIDLE:
 			if (*optlen >= sizeof(int) && s->tcp) {
-				*(int *)optval =
-					(int)(s->tcp->keepidle_ticks / 100);
+				*(int *)optval = (int)timer_ticks_to_s(
+					s->tcp->keepidle_ticks);
 				*optlen = sizeof(int);
 			}
 			return 0;
 		case TCP_KEEPINTVL:
 			if (*optlen >= sizeof(int) && s->tcp) {
-				*(int *)optval =
-					(int)(s->tcp->keepintvl_ticks / 100);
+				*(int *)optval = (int)timer_ticks_to_s(
+					s->tcp->keepintvl_ticks);
 				*optlen = sizeof(int);
 			}
 			return 0;

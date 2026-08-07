@@ -18,6 +18,10 @@
 #ifndef _SYS_ENDIAN_H
 #define _SYS_ENDIAN_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <endian.h>
 
 /* OpenBSD aliases.  Same direction as le16toh()/be16toh(), different name. */
@@ -38,6 +42,10 @@
 #endif
 #ifndef bswap64
 #define bswap64(x) bswap_64(x)
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* _SYS_ENDIAN_H */

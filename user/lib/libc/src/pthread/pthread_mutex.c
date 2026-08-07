@@ -19,6 +19,8 @@ extern int errno;
 // Futex operations
 extern int futex_wait(volatile int *uaddr, int val,
 		      const struct timespec *timeout);
+extern int __futex_wait_until(volatile int *uaddr, int val,
+			      const struct timespec *abstime);
 extern int futex_wake(volatile int *uaddr, int count);
 
 // ============================================================================
@@ -449,9 +451,14 @@ int pthread_mutex_timedlock(pthread_mutex_t *mutex,
 	}
 
 	while (old != MUTEX_UNLOCKED) {
-		// Convert absolute time to relative for futex
-		// (Simplified: real implementation would compute remaining time)
-		int ret = futex_wait(&mutex->state, MUTEX_CONTENDED, abstime);
+		/* The deadline is absolute and the futex timeout is relative;
+		 * __futex_wait_until converts, and recomputes the remaining
+		 * time on each pass so a spurious wake shortens the wait
+		 * rather than restarting it.  EINTR is not reported to the
+		 * caller -- POSIX does not list it for this function -- so the
+		 * loop simply re-tests the lock word. */
+		int ret = __futex_wait_until(&mutex->state, MUTEX_CONTENDED,
+					     abstime);
 		if (ret < 0 && errno == ETIMEDOUT) {
 			return ETIMEDOUT;
 		}

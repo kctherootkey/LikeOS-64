@@ -25,6 +25,12 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <dlfcn.h>
+#include <link.h>
+#include <semaphore.h>
+#include <resolv.h>
+#include <arpa/nameser.h>
+#include <math.h>
+#include <float.h>
 #include <getopt.h>
 #include <sys/procinfo.h>
 #include <sys/vfs.h>
@@ -166,6 +172,53 @@ static int g_ctor_saw_main_before;
 __attribute__((constructor)) static void likeos_test_ctor(void)
 {
 	g_ctor_ran = 1;
+}
+
+/* ------------------------------------------------------------------ *
+ * Exit-handler ordering.
+ *
+ * atexit(3) and __cxa_atexit share one list, because they are one mechanism:
+ * every C++ static destructor is registered through the latter, tagged with
+ * the shared object it belongs to, so that dlclose() can run and remove that
+ * object's destructors before its pages are unmapped.
+ *
+ * Ordering is the observable part and is specified: handlers run in the
+ * reverse of the order they were registered.  Recorded into a buffer here and
+ * checked by the LAST handler, since after that point nothing else runs.
+ * ------------------------------------------------------------------ */
+/* Declared here rather than pulled from a header on purpose: __cxa_atexit is an
+ * entry point of the C++ ABI, not of the C library's public interface.  The
+ * compiler emits calls to it directly and no standard header declares it, which
+ * is why a C program wanting to exercise it has to say what it looks like. */
+extern int __cxa_atexit(void (*fn)(void *), void *arg, void *dso);
+
+static char g_exit_order[8];
+static int g_exit_order_n;
+
+static void exit_mark(char c)
+{
+	if (g_exit_order_n < (int)sizeof(g_exit_order) - 1)
+		g_exit_order[g_exit_order_n++] = c;
+}
+
+static void exit_handler_a(void) { exit_mark('a'); }
+static void exit_handler_b(void) { exit_mark('b'); }
+
+static void exit_handler_cxa(void *arg)
+{
+	exit_mark(*(const char *)arg);
+}
+
+/* Registered FIRST, so it runs LAST and sees the complete record. */
+static void exit_handler_check(void)
+{
+	/* Registration order was check, a, x, b -- so the reverse is b, x, a. */
+	if (g_exit_order_n == 3 && g_exit_order[0] == 'b' &&
+	    g_exit_order[1] == 'x' && g_exit_order[2] == 'a')
+		printf("  [PASS] exit handlers ran in reverse registration order\n");
+	else
+		printf("  [FAIL] exit handlers ran out of order (%.*s)\n",
+		       g_exit_order_n, g_exit_order);
 }
 
 static void __test_fail_impl(const char *name, const char *file, int line,
@@ -646,6 +699,28 @@ static void *simple_thread_fn(void *arg)
 	g_simple_thread_ran = 1;
 	g_simple_thread_arg = (int)(long)arg;
 	return (void *)42L;
+}
+
+/* Copy-on-write stress: several threads write disjoint bytes of the same
+ * fork-shared pages at once, so many of them fault on one page simultaneously.
+ * At file scope on purpose — a nested function would need a stack trampoline,
+ * which will not execute on a non-executable stack. */
+#define COW_THREADS 4
+#define COW_STRESS_LEN (32 * 4096)
+static unsigned char *g_cow_shared;
+static volatile int g_cow_go;
+
+static void *cow_writer_fn(void *arg)
+{
+	long id = (long)arg;
+
+	while (!g_cow_go)
+		;
+	/* Each thread owns one byte in COW_THREADS, so a correct run leaves
+	 * every byte written exactly once. */
+	for (size_t i = (size_t)id; i < COW_STRESS_LEN; i += COW_THREADS)
+		g_cow_shared[i] = (unsigned char)(id + 1);
+	return NULL;
 }
 
 /* For the shared-descriptor-table test: threads of a process share ONE fd
@@ -3562,6 +3637,1654 @@ static void run_auth_tests(void)
 	test_session_creation();
 	test_pam();
 	test_setuid_exec();
+}
+
+/* ------------------------------------------------------------------ *
+ * Loader introspection: dladdr, dl_iterate_phdr, _dl_find_object.
+ *
+ * Three ways of asking the runtime linker the same question -- which loaded
+ * object covers this address -- and all three are load-bearing.  The last one
+ * is how the C++ unwinder finds an object's exception tables from a program
+ * counter: with it absent or wrong, every throw ends in std::terminate rather
+ * than in the handler waiting for it, and nothing in the failure says why.
+ * ------------------------------------------------------------------ */
+static int phdr_walk_count;
+static int phdr_saw_main;
+static int phdr_saw_eh_frame;
+
+static int phdr_visitor(struct dl_phdr_info *info, size_t size, void *data)
+{
+	int *seen_libc = (int *)data;
+
+	if (size < sizeof(*info))
+		return 0;
+	phdr_walk_count++;
+	/* The main executable is the one reported with an empty name. */
+	if (info->dlpi_name && info->dlpi_name[0] == '\0')
+		phdr_saw_main = 1;
+	if (info->dlpi_name && strstr(info->dlpi_name, "libc"))
+		*seen_libc = 1;
+	for (int i = 0; i < info->dlpi_phnum; i++)
+		if (info->dlpi_phdr[i].p_type == PT_GNU_EH_FRAME)
+			phdr_saw_eh_frame = 1;
+	return 0; /* keep walking */
+}
+
+static int phdr_stopper(struct dl_phdr_info *info, size_t size, void *data)
+{
+	(void)info;
+	(void)size;
+	(*(int *)data)++;
+	return 77; /* non-zero ends the walk and is returned to the caller */
+}
+
+static void test_loader_introspection(void)
+{
+	printf("\n[TEST] runtime linker introspection\n");
+
+	/* dladdr on a function in THIS program, and on one in libc. */
+	Dl_info info;
+	memset(&info, 0, sizeof(info));
+	test_result("dladdr() resolves an address in this program",
+		    dladdr((const void *)(uintptr_t)&test_loader_introspection,
+			   &info) != 0);
+	test_result("dladdr() names the containing object",
+		    info.dli_fname != NULL);
+	/* No expectation about dli_sname here.  dladdr resolves names through
+	 * the DYNAMIC symbol table, which is the only one a loaded object
+	 * carries at run time -- a static function is not in it, and this one
+	 * is static.  glibc behaves the same way; the answer is either NULL or
+	 * the nearest exported symbol below the address, and neither is wrong.
+	 * The name lookup is tested against libc below, where the symbol IS
+	 * exported. */
+
+	memset(&info, 0, sizeof(info));
+	test_result("dladdr() resolves an address in libc",
+		    dladdr((const void *)(uintptr_t)&strlen, &info) != 0 &&
+			    info.dli_fbase != NULL);
+	test_result("dladdr() names an exported symbol",
+		    info.dli_sname != NULL &&
+			    strcmp(info.dli_sname, "strlen") == 0);
+	test_result("dladdr() reports the symbol's own address",
+		    info.dli_saddr == (void *)(uintptr_t)&strlen);
+
+	/* An address belonging to no object at all: not an error, just no. */
+	memset(&info, 0, sizeof(info));
+	test_result("dladdr() rejects an unmapped address",
+		    dladdr((const void *)(uintptr_t)0x10, &info) == 0);
+
+	/* dl_iterate_phdr must visit the main executable and every library. */
+	int seen_libc = 0;
+	int rc = dl_iterate_phdr(phdr_visitor, &seen_libc);
+	test_result("dl_iterate_phdr() completed the walk", rc == 0);
+	test_result("dl_iterate_phdr() visited several objects",
+		    phdr_walk_count >= 2);
+	test_result("dl_iterate_phdr() reported the main executable",
+		    phdr_saw_main == 1);
+	test_result("dl_iterate_phdr() reported libc", seen_libc == 1);
+	test_result("some object carries PT_GNU_EH_FRAME (unwind tables)",
+		    phdr_saw_eh_frame == 1);
+
+	/* A callback returning non-zero stops the walk, and that value is what
+	 * comes back -- the usual way of saying "this is the one". */
+	int visits = 0;
+	test_result("dl_iterate_phdr() returns the callback's value",
+		    dl_iterate_phdr(phdr_stopper, &visits) == 77);
+	test_result("dl_iterate_phdr() stopped at the first object",
+		    visits == 1);
+
+	/* _dl_find_object: the unwinder's entry point. */
+	struct dl_find_object dfo;
+	memset(&dfo, 0, sizeof(dfo));
+	test_result("_dl_find_object() resolves an address in this program",
+		    _dl_find_object((void *)(uintptr_t)&test_loader_introspection,
+				    &dfo) == 0);
+	test_result("_dl_find_object() reports the mapping bounds",
+		    dfo.dlfo_map_start != NULL &&
+			    (char *)dfo.dlfo_map_end >
+				    (char *)dfo.dlfo_map_start);
+	test_result("_dl_find_object() found the address inside the mapping",
+		    (char *)(uintptr_t)&test_loader_introspection >=
+				    (char *)dfo.dlfo_map_start &&
+			    (char *)(uintptr_t)&test_loader_introspection <
+				    (char *)dfo.dlfo_map_end);
+	/* This is the field the unwinder actually wants.  A program built
+	 * without unwind tables would have no such segment -- and then no C++
+	 * exception could ever be caught. */
+	test_result("_dl_find_object() reports the exception-frame segment",
+		    dfo.dlfo_eh_frame != NULL);
+
+	memset(&dfo, 0, sizeof(dfo));
+	test_result("_dl_find_object() rejects an unmapped address",
+		    _dl_find_object((void *)(uintptr_t)0x10, &dfo) == -1);
+}
+
+/* ------------------------------------------------------------------ *
+ * Exit handlers.  The ordering check itself runs at exit; this only
+ * registers the handlers and reports that registration succeeded.
+ * ------------------------------------------------------------------ */
+static void test_exit_handlers(void)
+{
+	static const char mark_x = 'x';
+
+	printf("\n[TEST] atexit / __cxa_atexit\n");
+
+	/* Registered first, so it runs last and sees the whole record. */
+	test_result("atexit() accepted the ordering check",
+		    atexit(exit_handler_check) == 0);
+	test_result("atexit() accepted a handler", atexit(exit_handler_a) == 0);
+	/* The C++ form: a handler taking an argument, tagged with the object it
+	 * belongs to.  A NULL handle means the main executable. */
+	test_result("__cxa_atexit() accepted a handler",
+		    __cxa_atexit(exit_handler_cxa, (void *)&mark_x, NULL) == 0);
+	test_result("atexit() accepted a second handler",
+		    atexit(exit_handler_b) == 0);
+	test_result("atexit() rejects a null handler", atexit(NULL) != 0);
+	printf("  (the ordering result is printed at exit, after the summary)\n");
+}
+
+/* ------------------------------------------------------------------ *
+ * C99 floating-point classification and comparison.
+ *
+ * All type-generic macros, so each is exercised on more than one type: a
+ * definition that silently drops to double would still pass a float-only
+ * check.  The comparison macros differ from the operators they resemble in
+ * exactly one way that matters -- they are quiet on NaN -- so that is what is
+ * tested.
+ * ------------------------------------------------------------------ */
+static void test_math_classification(void)
+{
+	printf("\n[TEST] C99 math classification\n");
+
+	volatile double zero = 0.0;
+	double inf = 1.0 / zero;
+	double nan = inf - inf;
+	double sub = 4.9406564584124654e-324; /* smallest subnormal double */
+
+	test_result("fpclassify(1.0) is FP_NORMAL",
+		    fpclassify(1.0) == FP_NORMAL);
+	test_result("fpclassify(0.0) is FP_ZERO", fpclassify(0.0) == FP_ZERO);
+	test_result("fpclassify(inf) is FP_INFINITE",
+		    fpclassify(inf) == FP_INFINITE);
+	test_result("fpclassify(nan) is FP_NAN", fpclassify(nan) == FP_NAN);
+	test_result("fpclassify(subnormal) is FP_SUBNORMAL",
+		    fpclassify(sub) == FP_SUBNORMAL);
+	test_result("fpclassify is type-generic (float)",
+		    fpclassify(1.0f) == FP_NORMAL &&
+			    fpclassify(0.0f) == FP_ZERO);
+
+	test_result("isnormal()", isnormal(1.0) && !isnormal(0.0) &&
+					   !isnormal(sub) && !isnormal(nan));
+	test_result("isfinite()", isfinite(1.0) && !isfinite(inf) &&
+					   !isfinite(nan));
+	test_result("isinf()", isinf(inf) && !isinf(1.0) && !isinf(nan));
+	test_result("isnan()", isnan(nan) && !isnan(1.0) && !isnan(inf));
+
+	/* signbit is about the sign BIT, not about being less than zero: it is
+	 * true for negative zero, which compares equal to zero. */
+	test_result("signbit()", signbit(-1.0) && !signbit(1.0) &&
+					  signbit(-0.0) && !signbit(0.0));
+
+	test_result("isgreater()", isgreater(2.0, 1.0) && !isgreater(1.0, 2.0) &&
+					   !isgreater(1.0, 1.0));
+	test_result("isgreaterequal()",
+		    isgreaterequal(2.0, 1.0) && isgreaterequal(1.0, 1.0) &&
+			    !isgreaterequal(1.0, 2.0));
+	test_result("isless()", isless(1.0, 2.0) && !isless(2.0, 1.0));
+	test_result("islessequal()", islessequal(1.0, 2.0) &&
+					     islessequal(1.0, 1.0) &&
+					     !islessequal(2.0, 1.0));
+	test_result("islessgreater()", islessgreater(1.0, 2.0) &&
+					       islessgreater(2.0, 1.0) &&
+					       !islessgreater(1.0, 1.0));
+
+	/* The quiet-on-NaN property, which is the whole reason these exist. */
+	test_result("comparison macros are false for NaN",
+		    !isgreater(nan, 1.0) && !isless(nan, 1.0) &&
+			    !islessequal(nan, nan) && !isgreaterequal(nan, nan));
+	test_result("isunordered()", isunordered(nan, 1.0) &&
+					     isunordered(1.0, nan) &&
+					     !isunordered(1.0, 2.0));
+}
+
+/* ------------------------------------------------------------------ *
+ * frexpl / ldexpl.
+ *
+ * Taking a long double apart and putting it back together, exactly.  The
+ * defining property is the one worth testing: x == frexpl(x, &e) * 2^e, with
+ * the mantissa in [0.5, 1).  Checked across the whole exponent range, because
+ * a mistake in the 16383 bias shows up at the extremes and nowhere else, and
+ * on subnormals, which have no leading one to take an exponent from and go
+ * down a separate path.
+ * ------------------------------------------------------------------ */
+static void test_long_double_decompose(void)
+{
+	printf("\n[TEST] frexpl / ldexpl\n");
+
+	int e = 12345;
+
+	/* Zero keeps its sign and reports exponent 0. */
+	test_result("frexpl(+0)", frexpl(0.0L, &e) == 0.0L && e == 0);
+	e = 12345;
+	test_result("frexpl(-0) keeps the sign",
+		    signbit(frexpl(-0.0L, &e)) && e == 0);
+
+	test_result("frexpl(1.0) is 0.5 x 2^1",
+		    frexpl(1.0L, &e) == 0.5L && e == 1);
+	test_result("frexpl(0.5) is 0.5 x 2^0",
+		    frexpl(0.5L, &e) == 0.5L && e == 0);
+	test_result("frexpl(-3.0) is -0.75 x 2^2",
+		    frexpl(-3.0L, &e) == -0.75L && e == 2);
+
+	test_result("ldexpl(1.0, 3)", ldexpl(1.0L, 3) == 8.0L);
+	test_result("ldexpl(1.0, -3)", ldexpl(1.0L, -3) == 0.125L);
+	test_result("ldexpl(0.0, 100)", ldexpl(0.0L, 100) == 0.0L);
+	test_result("scalbnl agrees with ldexpl",
+		    scalbnl(3.0L, 5) == ldexpl(3.0L, 5));
+
+	/* The round trip, across every exponent the format has.  This is the
+	 * check that would catch an off-by-one in the bias. */
+	int roundtrip_fails = 0, range_fails = 0;
+	for (int p = -16380; p <= 16380; p++) {
+		long double x = ldexpl(1.0L, p);
+		int ex;
+		long double m;
+
+		if (x == 0.0L || isinf(x))
+			continue;
+		for (int k = 0; k < 2; k++) {
+			long double v = k ? x * 1.5L : x;
+
+			if (v == 0.0L || isinf(v))
+				continue;
+			m = frexpl(v, &ex);
+			if (ldexpl(m, ex) != v)
+				roundtrip_fails++;
+			if (!(m >= 0.5L && m < 1.0L))
+				range_fails++;
+		}
+	}
+	test_result("frexpl/ldexpl round trip over the whole exponent range",
+		    roundtrip_fails == 0);
+	test_result("frexpl mantissa always in [0.5, 1)", range_fails == 0);
+
+	/* Subnormals: no leading one, so a separate path. */
+	long double tiny = LDBL_MIN;
+	int te;
+	long double tm = frexpl(tiny / 2, &te);
+	test_result("frexpl(subnormal) round trips",
+		    ldexpl(tm, te) == tiny / 2);
+	test_result("frexpl(subnormal) mantissa in [0.5, 1)",
+		    tm >= 0.5L && tm < 1.0L);
+
+	/* Infinity and NaN come back unchanged. */
+	volatile long double zerol = 0.0L;
+	long double infl = 1.0L / zerol;
+	test_result("frexpl(inf) returns inf", isinf(frexpl(infl, &e)));
+	test_result("frexpl(nan) returns nan", isnan(frexpl(infl - infl, &e)));
+	test_result("ldexpl(inf, -100) stays inf", isinf(ldexpl(infl, -100)));
+}
+
+/* ------------------------------------------------------------------ *
+ * POSIX semaphores.
+ *
+ * The counting half is easy to check; the part that matters is the blocking
+ * one, because a semaphore whose wait and post race is a semaphore that
+ * deadlocks under load and passes every single-threaded test.  So the cases
+ * below deliberately make threads block and be woken, and make a post arrive
+ * while a waiter is on its way into the kernel.
+ * ------------------------------------------------------------------ */
+static sem_t g_sem;
+static sem_t g_sem_done;
+static volatile int g_sem_counter;
+
+static void *sem_consumer(void *arg)
+{
+	int n = (int)(long)arg;
+
+	for (int i = 0; i < n; i++) {
+		if (sem_wait(&g_sem) != 0)
+			return (void *)1;
+		__atomic_add_fetch(&g_sem_counter, 1, __ATOMIC_SEQ_CST);
+	}
+	sem_post(&g_sem_done);
+	return NULL;
+}
+
+/* ------------------------------------------------------------------ *
+ * Timing helpers for the blocking primitives.
+ *
+ * Two clocks, deliberately.  A POSIX deadline is stated against
+ * CLOCK_REALTIME, so that is what builds one; but CLOCK_REALTIME is
+ * settable and can step, which makes it the wrong instrument for
+ * measuring how long something took.  The measurement is taken on
+ * CLOCK_MONOTONIC, which is what it is for.
+ * ------------------------------------------------------------------ */
+static void deadline_in_ms(struct timespec *ts, long ms)
+{
+	clock_gettime(CLOCK_REALTIME, ts);
+	ts->tv_sec += ms / 1000;
+	ts->tv_nsec += (ms % 1000) * 1000000L;
+	if (ts->tv_nsec >= 1000000000L) {
+		ts->tv_nsec -= 1000000000L;
+		ts->tv_sec++;
+	}
+}
+
+static void mono_now(struct timespec *ts)
+{
+	clock_gettime(CLOCK_MONOTONIC, ts);
+}
+
+static long mono_elapsed_ms(const struct timespec *since)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (now.tv_sec - since->tv_sec) * 1000 +
+	       (now.tv_nsec - since->tv_nsec) / 1000000;
+}
+
+static void *sem_producer(void *arg)
+{
+	int n = (int)(long)arg;
+
+	for (int i = 0; i < n; i++)
+		sem_post(&g_sem);
+	return NULL;
+}
+
+static void test_semaphores(void)
+{
+	sem_t s;
+	int v;
+
+	printf("\n[TEST] POSIX semaphores\n");
+
+	/* Counting, without blocking. */
+	test_result("sem_init(0)", sem_init(&s, 0, 0) == 0);
+	test_result("sem_getvalue() reports the initial count",
+		    sem_getvalue(&s, &v) == 0 && v == 0);
+	test_result("sem_trywait() on an empty semaphore fails EAGAIN",
+		    sem_trywait(&s) == -1 && errno == EAGAIN);
+	test_result("sem_post()", sem_post(&s) == 0);
+	test_result("sem_getvalue() after post",
+		    sem_getvalue(&s, &v) == 0 && v == 1);
+	test_result("sem_trywait() succeeds when available",
+		    sem_trywait(&s) == 0);
+	test_result("count is back to zero",
+		    sem_getvalue(&s, &v) == 0 && v == 0);
+	test_result("sem_wait() does not block when the count is positive",
+		    sem_post(&s) == 0 && sem_wait(&s) == 0);
+	test_result("sem_destroy() with no waiters", sem_destroy(&s) == 0);
+
+	/* pshared is refused rather than silently ignored. */
+	test_result("sem_init(pshared) reports ENOSYS",
+		    sem_init(&s, 1, 0) == -1 && errno == ENOSYS);
+	test_result("sem_open() reports ENOSYS",
+		    sem_open("/x", 0) == SEM_FAILED && errno == ENOSYS);
+
+	/* Timed wait: must actually time out, and must do so at roughly the
+	 * requested time rather than immediately or never. */
+	test_result("sem_init for the timed case", sem_init(&s, 0, 0) == 0);
+	{
+		struct timespec deadline, t0;
+		long elapsed_ms;
+		int r;
+
+		deadline_in_ms(&deadline, 150);
+		mono_now(&t0);
+		r = sem_timedwait(&s, &deadline);
+		elapsed_ms = mono_elapsed_ms(&t0);
+
+		test_result("sem_timedwait() times out",
+			    r == -1 && errno == ETIMEDOUT);
+		/* The tick is 10ms and the kernel rounds a futex timeout up to
+		 * whole ticks, so 150ms is expected to land around 160.  The
+		 * window is wide on both sides because this is checking that a
+		 * wait HAPPENED, not its precision -- returning immediately and
+		 * never returning are the two failures worth catching. */
+		if (elapsed_ms < 100 || elapsed_ms >= 2000)
+			printf("  (measured %ld ms, expected about 150)\n",
+			       elapsed_ms);
+		test_result("sem_timedwait() waited about the right time",
+			    elapsed_ms >= 100 && elapsed_ms < 2000);
+	}
+	/* An already-expired deadline must not block at all. */
+	{
+		struct timespec past;
+
+		clock_gettime(CLOCK_REALTIME, &past);
+		past.tv_sec -= 1;
+		test_result("sem_timedwait() with a past deadline returns at once",
+			    sem_timedwait(&s, &past) == -1 &&
+				    errno == ETIMEDOUT);
+	}
+	sem_destroy(&s);
+
+	/*
+	 * The real test: a consumer that MUST block, woken by a later post.
+	 * If the wait and post race -- if a post can land between the waiter
+	 * checking the count and going to sleep, and be lost -- this hangs
+	 * rather than failing, which is why the counts are small enough to
+	 * finish quickly and large enough to interleave.
+	 */
+	test_result("sem_init for the threaded case",
+		    sem_init(&g_sem, 0, 0) == 0 &&
+			    sem_init(&g_sem_done, 0, 0) == 0);
+	g_sem_counter = 0;
+	{
+		pthread_t consumer, producer;
+		const int N = 200;
+
+		if (pthread_create(&consumer, NULL, sem_consumer,
+				   (void *)(long)N) != 0) {
+			test_result("pthread_create(consumer)", 0);
+		} else {
+			/* Give the consumer time to be genuinely blocked
+			 * before any post arrives, so the wake path is the one
+			 * under test rather than the fast path. */
+			usleep(50000);
+			if (pthread_create(&producer, NULL, sem_producer,
+					   (void *)(long)N) != 0) {
+				test_result("pthread_create(producer)", 0);
+			} else {
+				pthread_join(producer, NULL);
+				pthread_join(consumer, NULL);
+				test_result("every post woke a waiter (no lost wakeup)",
+					    g_sem_counter == N);
+				test_result("the semaphore is drained afterwards",
+					    sem_getvalue(&g_sem, &v) == 0 &&
+						    v == 0);
+			}
+		}
+	}
+	sem_destroy(&g_sem);
+	sem_destroy(&g_sem_done);
+}
+
+/* ------------------------------------------------------------------ *
+ * The DNS stub resolver.
+ *
+ * Message construction and name handling are checked without a network,
+ * because those are the parts that are wrong in ways a lookup would hide: a
+ * malformed query still gets an answer from a forgiving server, and a name
+ * decompressed one byte short still looks like a name.
+ *
+ * The lookups themselves come last and are reported as informational -- a
+ * machine with no route to a nameserver is not a broken resolver.
+ * ------------------------------------------------------------------ */
+/* ====================================================================== *
+ * Timed blocking primitives
+ *
+ * Every one of these takes an ABSOLUTE deadline, while the futex the
+ * kernel exposes takes a RELATIVE timeout.  pthread_cond_timedwait and
+ * pthread_mutex_timedlock both used to hand the deadline straight to the
+ * futex, so a timestamp near 1.8e9 seconds was read as a duration: not a
+ * long timeout but an unreachable one.  Neither function could report
+ * ETIMEDOUT at all, and a program relying on one to bound its wait waited
+ * for ever.
+ *
+ * So each test here asserts two separate things -- that the call returns
+ * ETIMEDOUT, and that it did so after roughly the requested delay.  The
+ * first alone would pass against a function that gives up instantly; the
+ * second alone would pass against one that never times out at all.
+ * ====================================================================== */
+
+static pthread_mutex_t g_tb_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_tb_cmutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_tb_cond = PTHREAD_COND_INITIALIZER;
+static int g_tb_predicate;
+
+/* Holds the mutex long enough for the main thread's timedlock to expire. */
+static void *tb_mutex_holder(void *arg)
+{
+	(void)arg;
+	pthread_mutex_lock(&g_tb_mutex);
+	usleep(600000); /* 600ms -- comfortably past the 150ms deadline */
+	pthread_mutex_unlock(&g_tb_mutex);
+	return NULL;
+}
+
+/* Signals the condition after a delay shorter than the deadline. */
+static void *tb_cond_signaller(void *arg)
+{
+	(void)arg;
+	usleep(120000); /* 120ms, against a 2s deadline */
+	pthread_mutex_lock(&g_tb_cmutex);
+	g_tb_predicate = 1;
+	pthread_cond_signal(&g_tb_cond);
+	pthread_mutex_unlock(&g_tb_cmutex);
+	return NULL;
+}
+
+static volatile sig_atomic_t g_tb_alarms;
+static sem_t g_tb_sem;
+
+static void tb_sigalrm_handler(int sig)
+{
+	(void)sig;
+	g_tb_alarms++;
+}
+
+/* Releases the blocked sem_wait if the signal never gets there, so a broken
+ * interrupt path fails the test instead of wedging the run. */
+static void *tb_sem_watchdog(void *arg)
+{
+	sem_t *s = (sem_t *)arg;
+
+	usleep(2000000);
+	sem_post(s);
+	return NULL;
+}
+
+static void test_timed_blocking(void)
+{
+	printf("\n[TEST] Timed blocking primitives\n");
+
+	/* ---- pthread_mutex_timedlock ---- */
+	{
+		pthread_t th;
+		struct timespec deadline, t0;
+		long elapsed_ms;
+		int r;
+
+		test_result("mutex holder thread starts",
+			    pthread_create(&th, NULL, tb_mutex_holder,
+					   NULL) == 0);
+		usleep(50000); /* let it take the lock */
+
+		deadline_in_ms(&deadline, 150);
+		mono_now(&t0);
+		r = pthread_mutex_timedlock(&g_tb_mutex, &deadline);
+		elapsed_ms = mono_elapsed_ms(&t0);
+
+		if (r != ETIMEDOUT || elapsed_ms >= 2000)
+			printf("  (returned %d after %ld ms)\n", r,
+			       elapsed_ms);
+		test_result("pthread_mutex_timedlock() on a held mutex "
+			    "reports ETIMEDOUT",
+			    r == ETIMEDOUT);
+		test_result("pthread_mutex_timedlock() waited about the "
+			    "right time",
+			    elapsed_ms >= 100 && elapsed_ms < 2000);
+
+		pthread_join(th, NULL);
+
+		/* An uncontended timedlock takes the mutex at once. */
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec += 5;
+		test_result("pthread_mutex_timedlock() succeeds when free",
+			    pthread_mutex_timedlock(&g_tb_mutex,
+						    &deadline) == 0);
+		test_result("...and unlocks",
+			    pthread_mutex_unlock(&g_tb_mutex) == 0);
+
+		/* A deadline already in the past must not block. */
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec -= 1;
+		test_result("mutex holder retakes the lock",
+			    pthread_create(&th, NULL, tb_mutex_holder,
+					   NULL) == 0);
+		usleep(50000);
+		mono_now(&t0);
+		r = pthread_mutex_timedlock(&g_tb_mutex, &deadline);
+		elapsed_ms = mono_elapsed_ms(&t0);
+		test_result("pthread_mutex_timedlock() with a past deadline "
+			    "returns at once",
+			    r == ETIMEDOUT && elapsed_ms < 100);
+		pthread_join(th, NULL);
+	}
+
+	/* ---- pthread_cond_timedwait ---- */
+	{
+		struct timespec deadline, t0;
+		long elapsed_ms;
+		int r;
+
+		/* Nothing will ever signal: this must time out. */
+		pthread_mutex_lock(&g_tb_cmutex);
+		deadline_in_ms(&deadline, 150);
+		mono_now(&t0);
+		r = pthread_cond_timedwait(&g_tb_cond, &g_tb_cmutex,
+					   &deadline);
+		elapsed_ms = mono_elapsed_ms(&t0);
+
+		/* Still inside the critical section: POSIX requires the mutex
+		 * to be reacquired before the call returns, on the timeout
+		 * path as much as any other.  A second attempt to take it must
+		 * therefore find it busy -- if it succeeds, the wait dropped
+		 * the lock and every caller that unlocks afterwards is
+		 * unlocking a mutex it does not hold. */
+		test_result("pthread_cond_timedwait() reacquired the mutex "
+			    "before returning",
+			    pthread_mutex_trylock(&g_tb_cmutex) == EBUSY);
+		pthread_mutex_unlock(&g_tb_cmutex);
+
+		if (r != ETIMEDOUT || elapsed_ms >= 2000)
+			printf("  (returned %d after %ld ms)\n", r,
+			       elapsed_ms);
+		test_result("pthread_cond_timedwait() with no signaller "
+			    "reports ETIMEDOUT",
+			    r == ETIMEDOUT);
+		test_result("pthread_cond_timedwait() waited about the "
+			    "right time",
+			    elapsed_ms >= 100 && elapsed_ms < 2000);
+
+		/* Now one that IS signalled, well inside the deadline: it must
+		 * return 0 and must return early. */
+		{
+			pthread_t th;
+
+			g_tb_predicate = 0;
+			pthread_mutex_lock(&g_tb_cmutex);
+			test_result("signaller thread starts",
+				    pthread_create(&th, NULL,
+						   tb_cond_signaller,
+						   NULL) == 0);
+			deadline_in_ms(&deadline, 2000);
+			mono_now(&t0);
+			r = 0;
+			while (!g_tb_predicate && r == 0)
+				r = pthread_cond_timedwait(&g_tb_cond,
+							   &g_tb_cmutex,
+							   &deadline);
+			elapsed_ms = mono_elapsed_ms(&t0);
+			pthread_mutex_unlock(&g_tb_cmutex);
+			pthread_join(th, NULL);
+
+			test_result("pthread_cond_timedwait() returns 0 when "
+				    "signalled",
+				    r == 0 && g_tb_predicate == 1);
+			test_result("...and returns before the deadline",
+				    elapsed_ms < 1000);
+		}
+
+		/* A deadline already past returns ETIMEDOUT without waiting,
+		 * and still holding the mutex. */
+		pthread_mutex_lock(&g_tb_cmutex);
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec -= 1;
+		mono_now(&t0);
+		r = pthread_cond_timedwait(&g_tb_cond, &g_tb_cmutex,
+					   &deadline);
+		elapsed_ms = mono_elapsed_ms(&t0);
+		pthread_mutex_unlock(&g_tb_cmutex);
+		test_result("pthread_cond_timedwait() with a past deadline "
+			    "returns at once",
+			    r == ETIMEDOUT && elapsed_ms < 100);
+	}
+
+	/* ---- an untimed wait interrupted by a signal ----
+	 *
+	 * sem_wait has no deadline, so ETIMEDOUT is not one of the errors
+	 * POSIX defines for it.  The kernel used to answer ETIMEDOUT for any
+	 * wake futex_wake had not issued -- including a signal -- so a
+	 * sem_wait interrupted by an ordinary SIGALRM came back reporting that
+	 * a wait with no deadline had run out of time.  EINTR is the answer.
+	 *
+	 * This blocks for real, which is the only way to reach that path, so a
+	 * watchdog thread posts the semaphore after two seconds.  If the signal
+	 * fails to interrupt the wait, the test then fails on the assertion
+	 * rather than hanging the whole run. */
+	{
+		sem_t *s = &g_tb_sem;
+		struct sigaction sa, old_sa;
+		struct itimerval it;
+		pthread_t watchdog;
+		struct timespec t0;
+		long elapsed_ms;
+		int r, saved;
+
+		test_result("sem_init for the interrupted case",
+			    sem_init(s, 0, 0) == 0);
+
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = tb_sigalrm_handler;
+		sigemptyset(&sa.sa_mask);
+		sa.sa_flags = 0; /* no SA_RESTART: the wait must be cut short */
+		test_result("SIGALRM handler installed",
+			    sigaction(SIGALRM, &sa, &old_sa) == 0);
+
+		g_tb_alarms = 0;
+		test_result("watchdog thread starts",
+			    pthread_create(&watchdog, NULL, tb_sem_watchdog,
+					   s) == 0);
+
+		/* 150ms one-shot. */
+		memset(&it, 0, sizeof(it));
+		it.it_value.tv_sec = 0;
+		it.it_value.tv_usec = 150000;
+		test_result("setitimer arms the one-shot",
+			    setitimer(ITIMER_REAL, &it, NULL) == 0);
+
+		errno = 0;
+		mono_now(&t0);
+		r = sem_wait(s);
+		saved = errno;
+		elapsed_ms = mono_elapsed_ms(&t0);
+
+		if (!(r == -1 && saved == EINTR))
+			printf("  (sem_wait returned %d, errno %d, after %ld ms)\n",
+			       r, saved, elapsed_ms);
+		test_result("sem_wait() interrupted by a signal fails EINTR",
+			    r == -1 && saved == EINTR);
+		test_result("sem_wait() does not report ETIMEDOUT",
+			    saved != ETIMEDOUT);
+		test_result("the signal handler ran", g_tb_alarms == 1);
+		test_result("...and it was the signal that ended the wait, "
+			    "not the watchdog",
+			    elapsed_ms < 1000);
+
+		/* Disarm, drain whatever the watchdog posted, restore. */
+		memset(&it, 0, sizeof(it));
+		setitimer(ITIMER_REAL, &it, NULL);
+		pthread_join(watchdog, NULL);
+		while (sem_trywait(s) == 0)
+			;
+		sigaction(SIGALRM, &old_sa, NULL);
+		sem_destroy(s);
+	}
+}
+
+/* ====================================================================== *
+ * Kernel timeout accuracy
+ *
+ * Every one of these hands a duration to the kernel, which converts it to
+ * timer ticks.  The tick rate is MEASURED at boot -- calibration routinely
+ * settles near 200Hz on a virtual machine, not the 100Hz that was asked
+ * for -- so any conversion written against an assumed 10ms tick expires in
+ * half the time requested.  select() with a one-second timeout returning in
+ * half a second was exactly that, and it is invisible to a test that only
+ * checks the return value.
+ *
+ * So these measure.  The window is wide enough for tick rounding and VM
+ * jitter, and narrow enough that a factor-of-two error cannot hide in it:
+ * a 200ms request landing at 100ms fails, and so does one landing at 400ms.
+ * ====================================================================== */
+
+#define TIMEOUT_REQ_MS 200
+#define TIMEOUT_LO_MS 150
+#define TIMEOUT_HI_MS 600
+
+static void check_timeout(const char *what, long elapsed_ms)
+{
+	char label[96];
+
+	if (elapsed_ms < TIMEOUT_LO_MS || elapsed_ms > TIMEOUT_HI_MS)
+		printf("  (%s measured %ld ms, requested %d)\n", what,
+		       elapsed_ms, TIMEOUT_REQ_MS);
+
+	snprintf(label, sizeof(label), "%s waited about %d ms", what,
+		 TIMEOUT_REQ_MS);
+	test_result(label, elapsed_ms >= TIMEOUT_LO_MS &&
+				   elapsed_ms <= TIMEOUT_HI_MS);
+}
+
+static void test_timeout_accuracy(void)
+{
+	struct timespec t0;
+	int pfds[2];
+
+	printf("\n[TEST] Kernel timeout accuracy\n");
+
+	/* ---- nanosleep ---- */
+	{
+		struct timespec req;
+
+		req.tv_sec = 0;
+		req.tv_nsec = TIMEOUT_REQ_MS * 1000000L;
+		mono_now(&t0);
+		test_result("nanosleep() returns 0", nanosleep(&req, NULL) == 0);
+		check_timeout("nanosleep()", mono_elapsed_ms(&t0));
+	}
+
+	/* ---- usleep ---- */
+	{
+		mono_now(&t0);
+		test_result("usleep() returns 0",
+			    usleep(TIMEOUT_REQ_MS * 1000) == 0);
+		check_timeout("usleep()", mono_elapsed_ms(&t0));
+	}
+
+	/* A pipe nobody writes to: the read end never becomes readable, so
+	 * select and poll can only come back by timing out. */
+	test_result("pipe for the timeout cases", pipe(pfds) == 0);
+
+	/* ---- select ---- */
+	{
+		fd_set rfds;
+		struct timeval tv;
+		int r;
+
+		FD_ZERO(&rfds);
+		FD_SET(pfds[0], &rfds);
+		tv.tv_sec = 0;
+		tv.tv_usec = TIMEOUT_REQ_MS * 1000;
+
+		mono_now(&t0);
+		r = select(pfds[0] + 1, &rfds, NULL, NULL, &tv);
+		test_result("select() times out with 0", r == 0);
+		check_timeout("select()", mono_elapsed_ms(&t0));
+	}
+
+	/* ---- select with a whole-second timeout ----
+	 *
+	 * Separate from the case above because the seconds and microseconds
+	 * fields were converted by different arithmetic, and only one of them
+	 * has been exercised so far. */
+	{
+		fd_set rfds;
+		struct timeval tv;
+		long elapsed_ms;
+		int r;
+
+		FD_ZERO(&rfds);
+		FD_SET(pfds[0], &rfds);
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+
+		mono_now(&t0);
+		r = select(pfds[0] + 1, &rfds, NULL, NULL, &tv);
+		elapsed_ms = mono_elapsed_ms(&t0);
+		test_result("select() with a 1s timeout returns 0", r == 0);
+		if (elapsed_ms < 800 || elapsed_ms > 2000)
+			printf("  (select(1s) measured %ld ms)\n", elapsed_ms);
+		test_result("select() waited about a second",
+			    elapsed_ms >= 800 && elapsed_ms <= 2000);
+	}
+
+	/* ---- poll ---- */
+	{
+		struct pollfd pfd;
+		int r;
+
+		pfd.fd = pfds[0];
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+
+		mono_now(&t0);
+		r = poll(&pfd, 1, TIMEOUT_REQ_MS);
+		test_result("poll() times out with 0", r == 0);
+		check_timeout("poll()", mono_elapsed_ms(&t0));
+	}
+
+	/* A zero timeout must poll and return immediately, not wait a tick. */
+	{
+		struct pollfd pfd;
+
+		pfd.fd = pfds[0];
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+
+		mono_now(&t0);
+		test_result("poll() with a zero timeout returns 0",
+			    poll(&pfd, 1, 0) == 0);
+		test_result("...and returns immediately",
+			    mono_elapsed_ms(&t0) < 50);
+	}
+
+	close(pfds[0]);
+	close(pfds[1]);
+}
+
+/* ====================================================================== *
+ * fd-table markers vs the file syscalls
+ *
+ * Sockets, AF_UNIX sockets and epoll instances are not backed by a real
+ * open file here: the fd table holds a small TAGGED INTEGER for them
+ * (0x10000, 0x30000 and 0x20000 based) rather than a pointer.  Every
+ * syscall that reaches into the filesystem therefore has to recognise one
+ * before it dereferences anything.
+ *
+ * They did not all do so, and they did not agree with each other about
+ * which markers to look for.  fstat() checked none of them, so fstat() on
+ * an AF_UNIX socket -- an entirely ordinary thing for a program to do, and
+ * what Claws Mail did -- read a vfs_file_t out of the address 0x30009 and
+ * took the KERNEL down. lseek() caught the console markers but not
+ * sockets; ftruncate() checked nothing at all.
+ *
+ * So this calls each of them on each kind of descriptor.  Every case below
+ * either returns an answer or fails with an errno; none of them may bring
+ * the system down, which is what makes this worth running at all.
+ * ====================================================================== */
+
+static void test_fd_marker_syscalls(void)
+{
+	int sv[2], pfd[2], tcp, ep;
+	struct stat st;
+
+	printf("\n[TEST] fd markers vs the file syscalls\n");
+
+	/* ---- AF_UNIX socket: the one that crashed the kernel ---- */
+	test_result("socketpair(AF_UNIX)",
+		    socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+
+	memset(&st, 0, sizeof(st));
+	test_result("fstat() on an AF_UNIX socket returns", fstat(sv[0], &st) == 0);
+	test_result("...and reports a socket", S_ISSOCK(st.st_mode));
+
+	errno = 0;
+	test_result("lseek() on a socket fails ESPIPE",
+		    lseek(sv[0], 0, SEEK_SET) == (off_t)-1 && errno == ESPIPE);
+	errno = 0;
+	test_result("ftruncate() on a socket fails EINVAL",
+		    ftruncate(sv[0], 0) == -1 && errno == EINVAL);
+
+	close(sv[0]);
+	close(sv[1]);
+
+	/* ---- network socket ---- */
+	tcp = socket(AF_INET, SOCK_STREAM, 0);
+	test_result("socket(AF_INET)", tcp >= 0);
+	if (tcp >= 0) {
+		memset(&st, 0, sizeof(st));
+		test_result("fstat() on a network socket returns",
+			    fstat(tcp, &st) == 0);
+		test_result("...and reports a socket", S_ISSOCK(st.st_mode));
+		errno = 0;
+		test_result("lseek() on a network socket fails ESPIPE",
+			    lseek(tcp, 0, SEEK_SET) == (off_t)-1 &&
+				    errno == ESPIPE);
+		close(tcp);
+	}
+
+	/* ---- epoll instance ---- */
+	ep = epoll_create1(0);
+	test_result("epoll_create1()", ep >= 0);
+	if (ep >= 0) {
+		memset(&st, 0, sizeof(st));
+		test_result("fstat() on an epoll fd returns",
+			    fstat(ep, &st) == 0);
+		errno = 0;
+		test_result("lseek() on an epoll fd fails ESPIPE",
+			    lseek(ep, 0, SEEK_SET) == (off_t)-1 &&
+				    errno == ESPIPE);
+		close(ep);
+	}
+
+	/* ---- pipe ---- */
+	test_result("pipe()", pipe(pfd) == 0);
+	memset(&st, 0, sizeof(st));
+	test_result("fstat() on a pipe returns", fstat(pfd[0], &st) == 0);
+	test_result("...and reports a FIFO", S_ISFIFO(st.st_mode));
+	errno = 0;
+	test_result("lseek() on a pipe fails ESPIPE",
+		    lseek(pfd[0], 0, SEEK_SET) == (off_t)-1 && errno == ESPIPE);
+	errno = 0;
+	test_result("ftruncate() on a pipe fails EINVAL",
+		    ftruncate(pfd[0], 0) == -1 && errno == EINVAL);
+	close(pfd[0]);
+	close(pfd[1]);
+
+	/* ---- a dup'ed console descriptor ----
+	 *
+	 * dup2 plants its own small marker (1-3) for stdio, so a descriptor
+	 * that came from one is a fourth kind of non-pointer entry. */
+	{
+		int d = dup(STDOUT_FILENO);
+
+		test_result("dup(stdout)", d >= 0);
+		if (d >= 0) {
+			memset(&st, 0, sizeof(st));
+			test_result("fstat() on a dup'ed console fd returns",
+				    fstat(d, &st) == 0);
+			test_result("...and reports a character device",
+				    S_ISCHR(st.st_mode));
+			close(d);
+		}
+	}
+}
+
+/* ====================================================================== *
+ * Lock contention stress
+ *
+ * The existing mutex test runs two threads incrementing a counter, which
+ * is a critical section a few instructions long: two threads can be inside
+ * it simultaneously and still produce the right total most of the time.
+ * It proves the lock exists, not that it excludes.
+ *
+ * These check exclusion DIRECTLY -- a thread marks the critical section as
+ * occupied, works for a moment, and verifies the mark is still its own --
+ * and then rebuild the structure GObject keeps its signal registry in: a
+ * sorted array mutated under one lock and binary-searched afterwards.  A
+ * lock that lets two writers overlap leaves that array unsorted, and every
+ * later lookup fails while the data is all still there, which is exactly
+ * what "signal 'pressed' is invalid for GtkGestureMultiPress" looks like
+ * from the outside.
+ * ====================================================================== */
+
+#define LC_THREADS 4
+#define LC_ITERS 20000
+
+static pthread_mutex_t lc_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile int lc_occupant; /* 0 = free, else thread index */
+static volatile int lc_overlaps;
+static long lc_counter;
+
+static void *lc_exclusion_thread(void *arg)
+{
+	int me = (int)(long)arg + 1;
+
+	for (int i = 0; i < LC_ITERS; i++) {
+		pthread_mutex_lock(&lc_mutex);
+		/* Nobody may be inside. */
+		if (lc_occupant != 0)
+			__atomic_add_fetch(&lc_overlaps, 1, __ATOMIC_SEQ_CST);
+		lc_occupant = me;
+		/* Stay a while: an exclusion bug needs a window to happen in. */
+		for (volatile int s = 0; s < 20; s++)
+			;
+		/* Still ours? */
+		if (lc_occupant != me)
+			__atomic_add_fetch(&lc_overlaps, 1, __ATOMIC_SEQ_CST);
+		lc_counter++; /* deliberately non-atomic: the lock is the guard */
+		lc_occupant = 0;
+		pthread_mutex_unlock(&lc_mutex);
+	}
+	return NULL;
+}
+
+/* The GBSearchArray shape: keys inserted in sorted position under a lock. */
+#define LC_KEYS 2000
+static pthread_mutex_t lc_arr_mutex = PTHREAD_MUTEX_INITIALIZER;
+static unsigned lc_keys[LC_KEYS];
+static int lc_nkeys;
+
+static void *lc_insert_thread(void *arg)
+{
+	int me = (int)(long)arg;
+
+	for (int i = 0; i < LC_KEYS / LC_THREADS; i++) {
+		unsigned key = (unsigned)(i * LC_THREADS + me) * 7919u;
+
+		pthread_mutex_lock(&lc_arr_mutex);
+		if (lc_nkeys < LC_KEYS) {
+			/* insertion sort step -- a read-modify-write over the
+			 * whole array, so an overlapping writer corrupts the
+			 * ORDER rather than just losing a value */
+			int pos = lc_nkeys;
+			while (pos > 0 && lc_keys[pos - 1] > key) {
+				lc_keys[pos] = lc_keys[pos - 1];
+				pos--;
+			}
+			lc_keys[pos] = key;
+			lc_nkeys++;
+		}
+		pthread_mutex_unlock(&lc_arr_mutex);
+	}
+	return NULL;
+}
+
+static pthread_once_t lc_once = PTHREAD_ONCE_INIT;
+static volatile int lc_once_runs;
+
+static void lc_once_fn(void)
+{
+	__atomic_add_fetch(&lc_once_runs, 1, __ATOMIC_SEQ_CST);
+}
+
+static void *lc_once_thread(void *arg)
+{
+	(void)arg;
+	for (int i = 0; i < 100; i++)
+		pthread_once(&lc_once, lc_once_fn);
+	return NULL;
+}
+
+static pthread_rwlock_t lc_rw = PTHREAD_RWLOCK_INITIALIZER;
+static volatile int lc_writers_in;
+static volatile int lc_readers_in;
+static volatile int lc_rw_violations;
+
+static void *lc_rw_thread(void *arg)
+{
+	int me = (int)(long)arg;
+
+	for (int i = 0; i < 4000; i++) {
+		if ((i + me) % 4 == 0) {
+			pthread_rwlock_wrlock(&lc_rw);
+			__atomic_add_fetch(&lc_writers_in, 1, __ATOMIC_SEQ_CST);
+			if (lc_writers_in != 1 || lc_readers_in != 0)
+				__atomic_add_fetch(&lc_rw_violations, 1,
+						   __ATOMIC_SEQ_CST);
+			for (volatile int s = 0; s < 20; s++)
+				;
+			__atomic_sub_fetch(&lc_writers_in, 1, __ATOMIC_SEQ_CST);
+			pthread_rwlock_unlock(&lc_rw);
+		} else {
+			pthread_rwlock_rdlock(&lc_rw);
+			__atomic_add_fetch(&lc_readers_in, 1, __ATOMIC_SEQ_CST);
+			if (lc_writers_in != 0)
+				__atomic_add_fetch(&lc_rw_violations, 1,
+						   __ATOMIC_SEQ_CST);
+			for (volatile int s = 0; s < 10; s++)
+				;
+			__atomic_sub_fetch(&lc_readers_in, 1, __ATOMIC_SEQ_CST);
+			pthread_rwlock_unlock(&lc_rw);
+		}
+	}
+	return NULL;
+}
+
+static void test_lock_contention(void)
+{
+	pthread_t th[LC_THREADS];
+	int i;
+
+	printf("\n[TEST] Lock contention stress\n");
+
+	/* ---- mutual exclusion ---- */
+	lc_occupant = 0;
+	lc_overlaps = 0;
+	lc_counter = 0;
+	for (i = 0; i < LC_THREADS; i++)
+		if (pthread_create(&th[i], NULL, lc_exclusion_thread,
+				   (void *)(long)i) != 0)
+			break;
+	test_result("all exclusion threads started", i == LC_THREADS);
+	for (int j = 0; j < i; j++)
+		pthread_join(th[j], NULL);
+
+	if (lc_overlaps)
+		printf("  (%d overlapping entries into the critical section)\n",
+		       lc_overlaps);
+	test_result("no two threads inside the mutex at once",
+		    lc_overlaps == 0);
+	if (lc_counter != (long)LC_THREADS * LC_ITERS)
+		printf("  (counter %ld, expected %ld)\n", lc_counter,
+		       (long)LC_THREADS * LC_ITERS);
+	test_result("every critical section ran exactly once",
+		    lc_counter == (long)LC_THREADS * LC_ITERS);
+
+	/* ---- a sorted array built under the lock ---- */
+	lc_nkeys = 0;
+	for (i = 0; i < LC_THREADS; i++)
+		if (pthread_create(&th[i], NULL, lc_insert_thread,
+				   (void *)(long)i) != 0)
+			break;
+	test_result("all insert threads started", i == LC_THREADS);
+	for (int j = 0; j < i; j++)
+		pthread_join(th[j], NULL);
+
+	test_result("every key was inserted", lc_nkeys == LC_KEYS);
+	{
+		int sorted = 1;
+		for (int k = 1; k < lc_nkeys; k++)
+			if (lc_keys[k - 1] > lc_keys[k]) {
+				printf("  (order broken at %d: %u > %u)\n", k,
+				       lc_keys[k - 1], lc_keys[k]);
+				sorted = 0;
+				break;
+			}
+		/* This is the one that matters: an array that is intact but
+		 * out of order still binary-searches to "not found". */
+		test_result("the array is still sorted (binary search works)",
+			    sorted);
+	}
+
+	/* ---- pthread_once under contention ---- */
+	lc_once_runs = 0;
+	for (i = 0; i < LC_THREADS; i++)
+		if (pthread_create(&th[i], NULL, lc_once_thread, NULL) != 0)
+			break;
+	test_result("all once threads started", i == LC_THREADS);
+	for (int j = 0; j < i; j++)
+		pthread_join(th[j], NULL);
+	test_result("pthread_once ran the initialiser exactly once",
+		    lc_once_runs == 1);
+
+	/* ---- rwlock exclusion ---- */
+	lc_writers_in = lc_readers_in = lc_rw_violations = 0;
+	for (i = 0; i < LC_THREADS; i++)
+		if (pthread_create(&th[i], NULL, lc_rw_thread,
+				   (void *)(long)i) != 0)
+			break;
+	test_result("all rwlock threads started", i == LC_THREADS);
+	for (int j = 0; j < i; j++)
+		pthread_join(th[j], NULL);
+	if (lc_rw_violations)
+		printf("  (%d exclusion violations)\n", lc_rw_violations);
+	test_result("rwlock kept writers exclusive of readers",
+		    lc_rw_violations == 0);
+}
+
+/* ====================================================================== *
+ * Orphan reaping
+ *
+ * A process whose parent dies before it does is reparented -- and it must
+ * be reparented to something that CALLS WAITPID, or its exit status is
+ * never collected and it stays a zombie for the life of the system.
+ *
+ * That is what pid 1 is for.  Orphans here used to be handed to the
+ * bootstrap task instead, which never waits, so every background program
+ * started from a shell that exits -- `claws-mail &' from the window
+ * manager's menu, say -- left one permanent zombie behind per launch.
+ *
+ * The test builds exactly that shape: a child that forks a grandchild and
+ * exits immediately, leaving the grandchild orphaned mid-flight.
+ * ====================================================================== */
+
+static void test_orphan_reaping(void)
+{
+	int pipefd[2];
+	pid_t child;
+	int status = 0;
+	pid_t orphan = -1;
+
+	printf("\n[TEST] Orphan reaping\n");
+
+	test_result("pipe for the orphan's pid", pipe(pipefd) == 0);
+
+	child = fork();
+	if (child == 0) {
+		/* Middle process: fork the orphan, report its pid, and exit at
+		 * once so the orphan outlives us. */
+		pid_t g = fork();
+
+		if (g == 0) {
+			close(pipefd[0]);
+			close(pipefd[1]);
+			/* Outlive the parent, then exit.  Its status has
+			 * nowhere to go but the reaper it was handed to. */
+			usleep(300000);
+			_exit(7);
+		}
+		{
+			pid_t v = g;
+			ssize_t w = write(pipefd[1], &v, sizeof v);
+			(void)w;
+		}
+		close(pipefd[0]);
+		close(pipefd[1]);
+		_exit(0);
+	}
+	test_result("fork for the orphan test", child > 0);
+
+	close(pipefd[1]);
+	if (read(pipefd[0], &orphan, sizeof orphan) != (ssize_t)sizeof orphan)
+		orphan = -1;
+	close(pipefd[0]);
+	test_result("the middle process reported the orphan's pid", orphan > 0);
+
+	/* Reap the middle process; the orphan is now parentless. */
+	while (waitpid(child, &status, 0) < 0 && errno == EINTR)
+		;
+	test_result("middle process exited", WIFEXITED(status));
+
+	/*
+	 * The orphan exits ~300ms from now.  Whoever adopted it has to collect
+	 * it: poll the process table until it is gone.  A reaper that never
+	 * waits leaves it ZOMBIE for ever, so a generous timeout that still
+	 * fails is exactly the signal wanted.
+	 */
+	if (orphan > 0) {
+		int max = 512;
+		procinfo_t *buf = malloc((size_t)max * sizeof(procinfo_t));
+		int gone = 0;
+		int zombie_seen = 0;
+
+		test_result("procinfo buffer", buf != NULL);
+		for (int tries = 0; buf && tries < 100 && !gone; tries++) {
+			int n = getprocinfo(buf, max);
+			int found = 0;
+
+			for (int i = 0; i < n; i++) {
+				if (buf[i].pid != orphan)
+					continue;
+				found = 1;
+				if (buf[i].state == 4) /* ZOMBIE */
+					zombie_seen = 1;
+				break;
+			}
+			if (!found)
+				gone = 1;
+			else
+				usleep(100000);
+		}
+		if (!gone)
+			printf("  (pid %d still present after 10s%s)\n", orphan,
+			       zombie_seen ? ", as a ZOMBIE" : "");
+		test_result("the orphan was reaped, not left a zombie", gone);
+		free(buf);
+	}
+}
+
+/* ====================================================================== *
+ * Raw futex operations
+ *
+ * The libc only ever issues FUTEX_WAIT and FUTEX_WAKE, so the other
+ * commands had no coverage at all -- and one that nothing here called was
+ * simply missing from the kernel.  GLib calls it directly: every
+ * g_cond_wait_until() is FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME, and
+ * with the clock bit left in the dispatch value it matched no command and
+ * returned instantly.  A timed wait that never waits turns into a spin,
+ * which is how GTK's file chooser hung.
+ *
+ * So these go through syscall() directly rather than the libc wrappers --
+ * testing the wrappers would not have caught it.
+ * ====================================================================== */
+
+/* The syscall number, spelled out here: <sys/syscall.h> does not export it
+ * and the point of this section is to bypass the libc wrappers entirely. */
+#define SYS_FUTEX 315
+
+#define FUTEX_WAIT_OP 0
+#define FUTEX_WAKE_OP 1
+#define FUTEX_WAIT_BITSET_OP 9
+#define FUTEX_WAKE_BITSET_OP 10
+#define FUTEX_PRIVATE 128
+#define FUTEX_CLOCK_REALTIME_FLAG 256
+#define FUTEX_MATCH_ANY 0xFFFFFFFFu
+
+static int futex_word;
+
+static void *futex_waker_thread(void *arg)
+{
+	(void)arg;
+	usleep(200000);
+	__atomic_store_n(&futex_word, 1, __ATOMIC_SEQ_CST);
+	syscall(SYS_FUTEX, (long)&futex_word, FUTEX_WAKE_OP | FUTEX_PRIVATE,
+		1, 0, 0, 0);
+	return NULL;
+}
+
+/*
+ * printf conversions that were wrong, and are the kind of wrong that is hard
+ * to notice: the value printed is plausible, just not the value passed.
+ *
+ * These are the exact cases host/test-printf.sh found by comparing this libc's
+ * formatter against glibc.  They are repeated here because the host test
+ * exercises the SOURCE and this one exercises the libc that actually shipped
+ * on the image -- a build or link that picked up a different formatter would
+ * pass one and fail the other.
+ */
+static void test_printf_conversions(void)
+{
+	char b[64];
+	int n;
+
+	printf("\n[TEST] printf conversions\n");
+
+	/* Unsigned conversions above 2^63 were formatted as signed, because
+	 * the digit routine took a signed argument: every size, count and
+	 * hash with the top bit set printed as a small negative number. */
+	snprintf(b, sizeof(b), "%lu", (unsigned long)-1);
+	test_result("%lu of ULONG_MAX",
+		    strcmp(b, "18446744073709551615") == 0);
+
+	snprintf(b, sizeof(b), "%llu", (unsigned long long)-1);
+	test_result("%llu of ULLONG_MAX",
+		    strcmp(b, "18446744073709551615") == 0);
+
+	snprintf(b, sizeof(b), "%zu", (size_t)-1);
+	test_result("%zu of SIZE_MAX", strcmp(b, "18446744073709551615") == 0);
+
+	snprintf(b, sizeof(b), "%llu", 9223372036854775808ULL);
+	test_result("%llu of 2^63", strcmp(b, "9223372036854775808") == 0);
+
+	/* The same defect from the other side: %lld reduces its argument to a
+	 * magnitude and prints its own sign, and for LLONG_MIN that magnitude
+	 * read back as negative and picked up a SECOND '-'. */
+	snprintf(b, sizeof(b), "%lld", (long long)-9223372036854775807LL - 1);
+	test_result("%lld of LLONG_MIN",
+		    strcmp(b, "-9223372036854775808") == 0);
+
+	/* Hex and octal were always right -- the sign branch was gated on
+	 * base 10 -- so they are the control for the above. */
+	snprintf(b, sizeof(b), "%llx", (unsigned long long)-1);
+	test_result("%llx of ULLONG_MAX", strcmp(b, "ffffffffffffffff") == 0);
+
+	/* Ties round to even, not away from zero. */
+	snprintf(b, sizeof(b), "%.0f", 0.5);
+	test_result("%.0f of 0.5 is 0", strcmp(b, "0") == 0);
+	snprintf(b, sizeof(b), "%.0f", 1.5);
+	test_result("%.0f of 1.5 is 2", strcmp(b, "2") == 0);
+	snprintf(b, sizeof(b), "%.0f", 2.5);
+	test_result("%.0f of 2.5 is 2", strcmp(b, "2") == 0);
+	snprintf(b, sizeof(b), "%.2f", 0.125);
+	test_result("%.2f of 0.125 is 0.12", strcmp(b, "0.12") == 0);
+
+	/* Negative zero keeps its sign; `val < 0.0` does not see it. */
+	snprintf(b, sizeof(b), "%f", -0.0);
+	test_result("%f of -0.0 keeps the sign",
+		    strcmp(b, "-0.000000") == 0);
+	snprintf(b, sizeof(b), "%g", -0.0);
+	test_result("%g of -0.0 keeps the sign", strcmp(b, "-0") == 0);
+
+	/* %g picks its style from the exponent the value PRINTS with: at
+	 * three significant digits 999.9995 rounds to 1000, whose exponent
+	 * has reached the precision, so it goes to %e style. */
+	snprintf(b, sizeof(b), "%.3g", 999.9995);
+	test_result("%.3g of 999.9995 is 1e+03", strcmp(b, "1e+03") == 0);
+	snprintf(b, sizeof(b), "%.3g", 1.5);
+	test_result("%.3g of 1.5 is 1.5", strcmp(b, "1.5") == 0);
+
+	/* snprintf returns the length the output WOULD have had, and the
+	 * measure-then-fill pattern underneath g_strdup_printf depends on the
+	 * two passes agreeing exactly. */
+	n = snprintf(NULL, 0, "%s-%d", "abc", 12345);
+	test_result("snprintf(NULL,0) measures", n == 9);
+	{
+		char small[4];
+		n = snprintf(small, sizeof(small), "%s", "abcdefgh");
+		test_result("snprintf reports untruncated length", n == 8);
+		test_result("snprintf truncates and terminates",
+			    strcmp(small, "abc") == 0);
+	}
+
+	/* %p is of one form for every pointer, null included, so that output
+	 * written with it reads back with strtoul. */
+	snprintf(b, sizeof(b), "%p", (void *)0);
+	test_result("%p of NULL is 0x0", strcmp(b, "0x0") == 0);
+}
+
+static void test_futex_ops(void)
+{
+	struct timespec deadline, t0;
+	long elapsed_ms;
+	long r;
+
+	printf("\n[TEST] Raw futex operations\n");
+
+	/* ---- FUTEX_WAIT_BITSET with an absolute CLOCK_REALTIME deadline ----
+	 * Exactly the call GLib makes.  It must WAIT and then report a
+	 * timeout, not return immediately. */
+	futex_word = 0;
+	deadline_in_ms(&deadline, 200);
+	mono_now(&t0);
+	r = syscall(SYS_FUTEX, (long)&futex_word,
+		    FUTEX_WAIT_BITSET_OP | FUTEX_PRIVATE |
+			    FUTEX_CLOCK_REALTIME_FLAG,
+		    0, (long)&deadline, 0, (long)FUTEX_MATCH_ANY);
+	elapsed_ms = mono_elapsed_ms(&t0);
+
+	if (elapsed_ms < 150)
+		printf("  (returned %ld after only %ld ms)\n", r, elapsed_ms);
+	test_result("FUTEX_WAIT_BITSET is implemented (not ENOSYS)",
+		    !(r < 0 && errno == ENOSYS));
+	test_result("FUTEX_WAIT_BITSET waits for its absolute deadline",
+		    elapsed_ms >= 150 && elapsed_ms <= 800);
+
+	/* An already-past deadline must report a timeout at once -- and must
+	 * NOT be mistaken for "no timeout", which would block for ever. */
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec -= 1;
+	mono_now(&t0);
+	r = syscall(SYS_FUTEX, (long)&futex_word,
+		    FUTEX_WAIT_BITSET_OP | FUTEX_PRIVATE |
+			    FUTEX_CLOCK_REALTIME_FLAG,
+		    0, (long)&deadline, 0, (long)FUTEX_MATCH_ANY);
+	test_result("FUTEX_WAIT_BITSET with a past deadline returns at once",
+		    mono_elapsed_ms(&t0) < 100);
+
+	/* ---- a real wake, through the bitset command ---- */
+	{
+		pthread_t th;
+
+		futex_word = 0;
+		test_result("waker thread starts",
+			    pthread_create(&th, NULL, futex_waker_thread,
+					   NULL) == 0);
+		deadline_in_ms(&deadline, 5000);
+		mono_now(&t0);
+		while (__atomic_load_n(&futex_word, __ATOMIC_SEQ_CST) == 0) {
+			r = syscall(SYS_FUTEX, (long)&futex_word,
+				    FUTEX_WAIT_BITSET_OP | FUTEX_PRIVATE |
+					    FUTEX_CLOCK_REALTIME_FLAG,
+				    0, (long)&deadline, 0,
+				    (long)FUTEX_MATCH_ANY);
+			if (r < 0 && errno == ETIMEDOUT)
+				break;
+		}
+		elapsed_ms = mono_elapsed_ms(&t0);
+		pthread_join(th, NULL);
+		test_result("FUTEX_WAIT_BITSET is woken by a FUTEX_WAKE",
+			    __atomic_load_n(&futex_word, __ATOMIC_SEQ_CST) == 1);
+		test_result("...and woke on the post, not the deadline",
+			    elapsed_ms < 2000);
+	}
+
+	/* ---- FUTEX_WAKE_BITSET on nobody: 0 woken, not an error ---- */
+	futex_word = 0;
+	errno = 0;
+	r = syscall(SYS_FUTEX, (long)&futex_word,
+		    FUTEX_WAKE_BITSET_OP | FUTEX_PRIVATE, 1, 0, 0,
+		    (long)FUTEX_MATCH_ANY);
+	test_result("FUTEX_WAKE_BITSET with no waiters returns 0", r == 0);
+}
+
+static void test_resolver(void)
+{
+	unsigned char msg[NS_PACKETSZ];
+	char name[NS_MAXDNAME];
+	int n;
+
+	printf("\n[TEST] DNS stub resolver\n");
+
+	test_result("res_init() finds at least one nameserver",
+		    res_init() >= 0);
+	test_result("res_init() filled in the state",
+		    (_res.options & RES_INIT) != 0 && _res.nscount > 0);
+	test_result("resolv.conf's nameserver is an INET address",
+		    _res.nsaddr_list[0].sin_family == AF_INET &&
+			    _res.nsaddr_list[0].sin_port == htons(53));
+
+	/* Name encoding: "www.example.com" -> \3www\7example\3com\0 */
+	n = dn_comp("www.example.com", msg, sizeof(msg), NULL, NULL);
+	test_result("dn_comp() encodes a name to the expected length",
+		    n == 17);
+	test_result("dn_comp() writes the label lengths",
+		    msg[0] == 3 && msg[4] == 7 && msg[12] == 3 &&
+			    msg[16] == 0);
+	test_result("dn_comp() rejects an over-long label",
+		    dn_comp("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+			    "aaaaaaaaaaaaaaaaa.com",
+			    msg, sizeof(msg), NULL, NULL) == -1);
+	test_result("dn_comp() encodes the root as one zero byte",
+		    dn_comp("", msg, sizeof(msg), NULL, NULL) == 1 &&
+			    msg[0] == 0);
+	test_result("dn_comp() accepts a trailing dot",
+		    dn_comp("example.com.", msg, sizeof(msg), NULL, NULL) == 13);
+
+	/* And back again. */
+	n = dn_comp("www.example.com", msg, sizeof(msg), NULL, NULL);
+	test_result("dn_expand() round-trips a name",
+		    dn_expand(msg, msg + n, msg, name, sizeof(name)) == n &&
+			    strcmp(name, "www.example.com") == 0);
+	test_result("dn_skipname() reports the encoded length",
+		    dn_skipname(msg, msg + n) == n);
+
+	/* Compression: a name that ends in a pointer back to an earlier one.
+	 * Built by hand, because this is the case a live lookup exercises and
+	 * a hand-written buffer can get exactly wrong on purpose. */
+	{
+		unsigned char m[64];
+		int qn;
+
+		memset(m, 0, sizeof(m));
+		qn = dn_comp("example.com", m + 12, sizeof(m) - 12, NULL, NULL);
+		/* "www" followed by a pointer to offset 12. */
+		m[12 + qn] = 3;
+		m[12 + qn + 1] = 'w';
+		m[12 + qn + 2] = 'w';
+		m[12 + qn + 3] = 'w';
+		m[12 + qn + 4] = 0xc0;
+		m[12 + qn + 5] = 12;
+		test_result("dn_expand() follows a compression pointer",
+			    dn_expand(m, m + sizeof(m), m + 12 + qn, name,
+				      sizeof(name)) == 6 &&
+				    strcmp(name, "www.example.com") == 0);
+
+		/* A pointer to itself must be refused, not looped on. */
+		m[40] = 0xc0;
+		m[41] = 40;
+		test_result("dn_expand() refuses a self-referential pointer",
+			    dn_expand(m, m + sizeof(m), m + 40, name,
+				      sizeof(name)) == -1);
+		/* A pointer forwards is equally a loop. */
+		m[42] = 0xc0;
+		m[43] = 44;
+		test_result("dn_expand() refuses a forward pointer",
+			    dn_expand(m, m + sizeof(m), m + 42, name,
+				      sizeof(name)) == -1);
+	}
+
+	/* A query message: header, then one question. */
+	n = res_mkquery(ns_o_query, "example.com", C_IN, T_MX, NULL, 0, NULL,
+			msg, sizeof(msg));
+	test_result("res_mkquery() builds a message", n == 12 + 13 + 4);
+	test_result("res_mkquery() asks one question",
+		    ((msg[4] << 8) | msg[5]) == 1);
+	test_result("res_mkquery() sets the recursion-desired bit",
+		    (msg[2] & 0x01) != 0);
+	test_result("res_mkquery() records the type and class",
+		    ((msg[n - 4] << 8) | msg[n - 3]) == T_MX &&
+			    ((msg[n - 2] << 8) | msg[n - 1]) == C_IN);
+	test_result("res_mkquery() answers no questions itself",
+		    ((msg[6] << 8) | msg[7]) == 0);
+	{
+		/* Two queries must not share an identifier: a resolver that
+		 * numbers them predictably lets anything that sees one reply
+		 * forge the next. */
+		unsigned char m2[NS_PACKETSZ];
+		int seen_same = 0;
+
+		for (int i = 0; i < 8; i++) {
+			int a = res_mkquery(ns_o_query, "a.example", C_IN, T_A,
+					    NULL, 0, NULL, msg, sizeof(msg));
+			int b = res_mkquery(ns_o_query, "a.example", C_IN, T_A,
+					    NULL, 0, NULL, m2, sizeof(m2));
+			if (a < 0 || b < 0)
+				break;
+			if (msg[0] == m2[0] && msg[1] == m2[1])
+				seen_same++;
+		}
+		test_result("res_mkquery() varies the query identifier",
+			    seen_same == 0);
+	}
+	test_result("res_mkquery() refuses a buffer that cannot hold the header",
+		    res_mkquery(ns_o_query, "example.com", C_IN, T_A, NULL, 0,
+				NULL, msg, 4) == -1);
+
+	/* Live lookups.  Reported, never counted: a machine with no route to a
+	 * nameserver is not a broken resolver, and this suite has to pass
+	 * without a network. */
+	{
+		unsigned char ans[NS_PACKETSZ];
+		int r = res_query("example.com", C_IN, T_A, ans, sizeof(ans));
+
+		if (r > 0) {
+			printf("  [INFO] res_query(example.com A) answered %d bytes,"
+			       " %d records\n", r, (ans[6] << 8) | ans[7]);
+			r = res_query("example.com", C_IN, T_MX, ans,
+				      sizeof(ans));
+			printf("  [INFO] res_query(example.com MX) -> %d\n", r);
+		} else {
+			printf("  [INFO] no live DNS (h_errno=%d); the offline"
+			       " cases above are what was checked\n", h_errno);
+		}
+	}
 }
 
 int main(int argc, char **argv)
@@ -11757,6 +13480,145 @@ network_section:
 				unlink(sp2);
 			}
 
+			/* getpeername() must survive the peer closing.
+			 *
+			 * The connection is over, but this socket is still open
+			 * and still knows who it was talking to — and that is
+			 * exactly when a program asks, while cleaning up after
+			 * a peer that just went away.  This used to follow a
+			 * pointer to the peer socket, so the answer vanished
+			 * the moment the other end called close(): an ordinary
+			 * accept-then-close left the client unable to name the
+			 * address it had just connected to.  The name is now
+			 * copied when the connection is made.
+			 *
+			 * Done entirely in one process (no fork) so the close
+			 * ordering is deterministic rather than a race. */
+			{
+				char sp3[80];
+				int srv3, cli3 = -1, acc3 = -1;
+				struct sockaddr_un sa3;
+				socklen_t sl3;
+
+				snprintf(sp3, sizeof(sp3),
+					 "/tmp/lktest_peerclose_%d", (int)getpid());
+				unlink(sp3);
+				memset(&sa3, 0, sizeof(sa3));
+				sa3.sun_family = AF_UNIX;
+				strncpy(sa3.sun_path, sp3,
+					sizeof(sa3.sun_path) - 1);
+				sl3 = (socklen_t)(offsetof(struct sockaddr_un,
+							   sun_path) +
+						  strlen(sp3));
+
+				srv3 = socket(AF_UNIX, SOCK_STREAM, 0);
+				if (srv3 >= 0 &&
+				    bind(srv3, (struct sockaddr *)&sa3, sl3) == 0 &&
+				    listen(srv3, 4) == 0) {
+					cli3 = socket(AF_UNIX, SOCK_STREAM, 0);
+					if (cli3 >= 0) {
+						int cr3;
+
+						/* The connect MUST be
+						 * non-blocking here: connect()
+						 * on this system does not
+						 * return until the listener
+						 * has accept()ed, and the
+						 * accept is on this very
+						 * thread.  A blocking connect
+						 * would queue the connection
+						 * and then wait for an accept
+						 * that can never run. */
+						fcntl(cli3, F_SETFL, O_NONBLOCK);
+						errno = 0;
+						cr3 = connect(cli3,
+							      (struct sockaddr *)&sa3,
+							      sl3);
+						if (cr3 == 0 ||
+						    errno == EINPROGRESS ||
+						    errno == EAGAIN)
+							acc3 = accept(srv3, NULL,
+								      NULL);
+					}
+
+					int had_conn3 = (acc3 >= 0);
+
+					test_result("peer-close: connection established",
+						    had_conn3);
+
+					/* Drop the far end, then ask. */
+					if (acc3 >= 0)
+						close(acc3);
+
+					if (cli3 >= 0 && had_conn3) {
+						struct sockaddr_un pn3;
+						socklen_t pl3 = sizeof(pn3);
+						int r3;
+
+						memset(&pn3, 0, sizeof(pn3));
+						errno = 0;
+						r3 = getpeername(cli3,
+								 (struct sockaddr *)&pn3,
+								 &pl3);
+						test_result("getpeername works after the peer closed",
+							    r3 == 0);
+						test_result("...and still reports the peer's path",
+							    r3 == 0 &&
+								    pn3.sun_family == AF_UNIX &&
+								    strcmp(pn3.sun_path, sp3) == 0);
+					}
+				} else {
+					test_fail("peer-close: setup failed");
+				}
+				if (cli3 >= 0)
+					close(cli3);
+				if (srv3 >= 0)
+					close(srv3);
+				unlink(sp3);
+			}
+
+			/* An unconnected socket has no peer to name, and must
+			 * say so rather than inventing one from a recycled
+			 * table slot. */
+			{
+				int lone = socket(AF_UNIX, SOCK_STREAM, 0);
+
+				if (lone >= 0) {
+					struct sockaddr_un pn4;
+					socklen_t pl4 = sizeof(pn4);
+
+					memset(&pn4, 0, sizeof(pn4));
+					errno = 0;
+					test_result("getpeername on an unconnected socket -> ENOTCONN",
+						    getpeername(lone,
+								(struct sockaddr *)&pn4,
+								&pl4) < 0 &&
+							    errno == ENOTCONN);
+					close(lone);
+				}
+			}
+
+			/* Both ends of a socketpair are connected and unnamed:
+			 * getpeername must succeed and report the family, not
+			 * fail as if there were no connection. */
+			{
+				int sv4[2];
+
+				if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv4) == 0) {
+					struct sockaddr_un pn5;
+					socklen_t pl5 = sizeof(pn5);
+
+					memset(&pn5, 0, sizeof(pn5));
+					test_result("getpeername on a socketpair end",
+						    getpeername(sv4[0],
+								(struct sockaddr *)&pn5,
+								&pl5) == 0 &&
+							    pn5.sun_family == AF_UNIX);
+					close(sv4[0]);
+					close(sv4[1]);
+				}
+			}
+
 			/* A second bind to the same name must be refused, and
 			 * with the address-in-use error rather than a generic
 			 * failure. */
@@ -12050,6 +13912,1439 @@ network_section:
 		int ret = dns_resolve("localhost", &ip);
 		test_result("dns: localhost resolves to 127.0.0.1",
 			    ret == 0 && ip == 0x7F000001);
+	}
+
+	// ========================================
+	// Copy-on-write and address-space integrity
+	// ========================================
+	printf("\n--- Copy-on-write / address space ---\n");
+
+	{
+		const size_t cow_len = 64 * 4096;
+		unsigned char *cow;
+
+		/* 1. The basic guarantee: after fork, each side's writes are
+		 *    private.  If a page is ever handed to both sides writable
+		 *    -- which is what happens when a fault decides a shared
+		 *    page is unshared -- the two see each other's bytes. */
+		cow = mmap(NULL, cow_len, PROT_READ | PROT_WRITE,
+			   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (cow == MAP_FAILED) {
+			test_fail("cow: mmap failed");
+		} else {
+			pid_t kid;
+			int st = 0;
+
+			memset(cow, 0xA5, cow_len);
+			kid = fork();
+			if (kid == 0) {
+				/* Child rewrites every page, then checks it
+				 * sees only its own bytes. */
+				int ok = 1;
+
+				memset(cow, 0x3C, cow_len);
+				for (size_t i = 0; i < cow_len; i++)
+					if (cow[i] != 0x3C)
+						ok = 0;
+				_exit(ok ? 0 : 1);
+			}
+			if (kid > 0) {
+				int parent_ok = 1;
+
+				/* Parent writes a different pattern at the
+				 * same time. */
+				memset(cow, 0x5A, cow_len);
+				while (waitpid(kid, &st, 0) < 0 && errno == EINTR)
+					;
+				for (size_t i = 0; i < cow_len; i++)
+					if (cow[i] != 0x5A)
+						parent_ok = 0;
+				test_result("cow: child sees only its own writes",
+					    WIFEXITED(st) && WEXITSTATUS(st) == 0);
+				test_result("cow: parent sees only its own writes",
+					    parent_ok);
+			} else {
+				test_fail("cow: fork failed");
+			}
+			munmap(cow, cow_len);
+		}
+
+		/* 2. Once the child is gone the parent holds the only
+		 *    reference, so writing must not corrupt anything -- this is
+		 *    the path that now reuses the page instead of copying it. */
+		cow = mmap(NULL, cow_len, PROT_READ | PROT_WRITE,
+			   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (cow != MAP_FAILED) {
+			pid_t kid;
+			int st = 0, ok = 1;
+
+			for (size_t i = 0; i < cow_len; i++)
+				cow[i] = (unsigned char)(i * 7);
+			kid = fork();
+			if (kid == 0)
+				_exit(0); /* exit at once, dropping its share */
+			if (kid > 0) {
+				while (waitpid(kid, &st, 0) < 0 && errno == EINTR)
+					;
+				/* Every page is now exclusively ours. */
+				for (size_t i = 0; i < cow_len; i++)
+					cow[i] = (unsigned char)(i * 13);
+				for (size_t i = 0; i < cow_len; i++)
+					if (cow[i] != (unsigned char)(i * 13))
+						ok = 0;
+				test_result("cow: exclusive page reuse keeps contents",
+					    ok);
+			}
+			munmap(cow, cow_len);
+		}
+
+		/* 3. THE lost-write test.  Several threads write distinct
+		 *    bytes of the same fork-shared pages at once, so many of
+		 *    them fault on the same page simultaneously.  A fault that
+		 *    publishes its copy without re-checking loses every write
+		 *    made between the two copies -- the page does not become
+		 *    garbage, it silently reverts to an earlier version. */
+		{
+			pthread_t th[COW_THREADS];
+			int ok = 1;
+
+			g_cow_go = 0;
+			g_cow_shared = mmap(NULL, COW_STRESS_LEN,
+					    PROT_READ | PROT_WRITE,
+					    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (g_cow_shared == MAP_FAILED) {
+				test_fail("cow-threads: mmap failed");
+			} else {
+				pid_t kid;
+				int st = 0;
+
+				memset(g_cow_shared, 0, COW_STRESS_LEN);
+				/* fork() marks it all copy-on-write; the child
+				 * lingers so the pages stay shared while the
+				 * threads race on them. */
+				kid = fork();
+				if (kid == 0) {
+					usleep(200000);
+					_exit(0);
+				}
+
+				for (long t = 0; t < COW_THREADS; t++)
+					if (pthread_create(&th[t], NULL,
+							   cow_writer_fn,
+							   (void *)t) != 0)
+						ok = 0;
+				g_cow_go = 1;
+				for (int t = 0; t < COW_THREADS; t++)
+					pthread_join(th[t], NULL);
+
+				for (size_t i = 0; i < COW_STRESS_LEN; i++) {
+					if (g_cow_shared[i] !=
+					    (unsigned char)((i % COW_THREADS) +
+							    1)) {
+						ok = 0;
+						break;
+					}
+				}
+				test_result("cow: concurrent faults on one page lose no writes",
+					    ok);
+				if (kid > 0)
+					while (waitpid(kid, &st, 0) < 0 &&
+					       errno == EINTR)
+						;
+				munmap(g_cow_shared, COW_STRESS_LEN);
+			}
+		}
+
+		/* 4. Unmapping must not hand a page back while another mapping
+		 *    still reads it.  Cycle map/touch/unmap hard, then verify
+		 *    a long-lived buffer was never overwritten -- freed pages
+		 *    are filled with a poison pattern, so a page released too
+		 *    early shows up as that pattern in live memory. */
+		{
+			const size_t keep_len = 16 * 4096;
+			unsigned char *keep =
+				mmap(NULL, keep_len, PROT_READ | PROT_WRITE,
+				     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			int ok = 1;
+
+			if (keep == MAP_FAILED) {
+				test_fail("unmap-churn: mmap failed");
+			} else {
+				for (size_t i = 0; i < keep_len; i++)
+					keep[i] = (unsigned char)(i * 31 + 5);
+
+				for (int round = 0; round < 64; round++) {
+					unsigned char *tmp = mmap(
+						NULL, 32 * 4096,
+						PROT_READ | PROT_WRITE,
+						MAP_PRIVATE | MAP_ANONYMOUS, -1,
+						0);
+					if (tmp == MAP_FAILED)
+						continue;
+					memset(tmp, round & 0xFF, 32 * 4096);
+					munmap(tmp, 32 * 4096);
+				}
+
+				for (size_t i = 0; i < keep_len; i++) {
+					if (keep[i] !=
+					    (unsigned char)(i * 31 + 5)) {
+						ok = 0;
+						break;
+					}
+				}
+				test_result("unmap churn does not disturb a live mapping",
+					    ok);
+				munmap(keep, keep_len);
+			}
+		}
+	}
+
+	// ========================================
+	// File-backed private mmap
+	// ========================================
+	printf("\n--- file-backed mmap ---\n");
+
+	{
+		/* A read-only MAP_PRIVATE mapping of a file is how a program
+		 * hands a file's bytes to something that wants a pointer -- an
+		 * IMAP client uploading a queued message does exactly this,
+		 * mmapping the file and writing those bytes to the socket.
+		 *
+		 * The interesting sizes are the ones that are NOT a whole
+		 * number of pages, and especially the ones that cross a page
+		 * boundary: the first page comes straight from the file, the
+		 * last is a partial read whose tail must read as zeros, and a
+		 * mapping of a few bytes must not be confused with one of a
+		 * few thousand. */
+		static const size_t sizes[] = { 100, 4095, 4096, 4097, 5000,
+						8192, 12000 };
+
+		for (unsigned si = 0; si < sizeof(sizes) / sizeof(sizes[0]);
+		     si++) {
+			size_t sz = sizes[si];
+			char path[64];
+			int fd;
+			unsigned char *map;
+			int ok = 1;
+
+			snprintf(path, sizeof(path), "/tmp/lktest_mmap_%u_%d",
+				 si, (int)getpid());
+			unlink(path);
+			fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+			if (fd < 0) {
+				test_fail("file-mmap: create failed");
+				continue;
+			}
+			/* A pattern that differs on every byte, so a page read
+			 * from the wrong offset cannot look correct.  Built in
+			 * memory and written in ONE call: a byte-at-a-time
+			 * write() loop is tens of thousands of syscalls, each
+			 * taking the filesystem's locks, which makes this test
+			 * crawl and starves anything else running beside it --
+			 * and tests nothing that a single write does not. */
+			{
+				unsigned char *src = malloc(sz);
+
+				if (!src) {
+					test_fail("file-mmap: out of memory");
+					close(fd);
+					unlink(path);
+					continue;
+				}
+				for (size_t i = 0; i < sz; i++)
+					src[i] = (unsigned char)((i * 7 +
+								  (i >> 8)) ^
+								 0x5A);
+				ok = (write(fd, src, sz) == (ssize_t)sz);
+				free(src);
+			}
+			close(fd);
+			if (!ok) {
+				test_fail("file-mmap: write failed");
+				unlink(path);
+				continue;
+			}
+
+			fd = open(path, O_RDONLY);
+			if (fd < 0) {
+				test_fail("file-mmap: reopen failed");
+				unlink(path);
+				continue;
+			}
+			map = mmap(NULL, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+			if (map == MAP_FAILED) {
+				test_fail("file-mmap: mmap failed");
+				close(fd);
+				unlink(path);
+				continue;
+			}
+
+			for (size_t i = 0; i < sz; i++) {
+				unsigned char want =
+					(unsigned char)((i * 7 + (i >> 8)) ^ 0x5A);
+				if (map[i] != want) {
+					ok = 0;
+					break;
+				}
+			}
+			{
+				char name[80];
+
+				snprintf(name, sizeof(name),
+					 "mmap of a %u-byte file reads it back exactly",
+					 (unsigned)sz);
+				test_result(name, ok);
+			}
+
+			/* Bytes between the end of the file and the end of the
+			 * last page must read as zeros, not as whatever the
+			 * page held before. */
+			if (sz % 4096) {
+				size_t tail_from = sz;
+				size_t tail_to = (sz + 4095) & ~(size_t)4095;
+				int zeros = 1;
+
+				for (size_t i = tail_from; i < tail_to; i++)
+					if (map[i] != 0)
+						zeros = 0;
+				test_result("mmap tail past EOF reads as zeros",
+					    zeros);
+			}
+
+			munmap(map, sz);
+			close(fd);
+			unlink(path);
+		}
+	}
+
+	{
+		/* The exact shape an IMAP client uses to upload a message:
+		 * write the file with stdio, close it, then stat() it, mmap
+		 * st_size bytes and hand those bytes to the network.
+		 *
+		 * If stat() reports MORE bytes than the file holds, the mapping
+		 * beyond the real end reads as zeros -- and those NULs go out
+		 * as part of the message.  A server that validates its input
+		 * rejects the whole thing, which is what gmail's "Invalid
+		 * character in literal" is.  So the invariant under test is
+		 * that st_size, the bytes readable, and the bytes mappable all
+		 * agree exactly.
+		 *
+		 * Sizes bracket a real queued message with a small attachment
+		 * (~3.3 KB), plus the page boundary either side of it. */
+		static const size_t qsizes[] = { 1500, 3368, 4095, 4096, 4097,
+						 6000 };
+
+		for (unsigned qi = 0; qi < sizeof(qsizes) / sizeof(qsizes[0]);
+		     qi++) {
+			size_t want = qsizes[qi];
+			char path[64];
+			FILE *f;
+			unsigned char *src;
+			struct stat st;
+			int fd, ok = 1;
+
+			snprintf(path, sizeof(path), "/tmp/lktest_queue_%u_%d",
+				 qi, (int)getpid());
+			unlink(path);
+
+			src = malloc(want);
+			if (!src) {
+				test_fail("queue-mmap: out of memory");
+				continue;
+			}
+			/* '| 1' guarantees no byte is ever zero, so any NUL
+			 * found later came from us, not from the data. */
+			for (size_t i = 0; i < want; i++)
+				src[i] = (unsigned char)(((i * 31) ^ (i >> 5)) |
+							 1);
+
+			f = fopen(path, "wb");
+			if (!f || fwrite(src, 1, want, f) != want ||
+			    fclose(f) != 0) {
+				test_fail("queue-mmap: stdio write failed");
+				free(src);
+				unlink(path);
+				continue;
+			}
+
+			if (stat(path, &st) != 0) {
+				test_fail("queue-mmap: stat failed");
+				free(src);
+				unlink(path);
+				continue;
+			}
+			{
+				char nm[96];
+
+				snprintf(nm, sizeof(nm),
+					 "stat() size matches what was written (%u bytes)",
+					 (unsigned)want);
+				test_result(nm, (size_t)st.st_size == want);
+			}
+
+			fd = open(path, O_RDONLY);
+			if (fd >= 0) {
+				unsigned char *map =
+					mmap(NULL, (size_t)st.st_size, PROT_READ,
+					     MAP_PRIVATE, fd, 0);
+
+				if (map == MAP_FAILED) {
+					test_fail("queue-mmap: mmap failed");
+				} else {
+					size_t nuls = 0;
+
+					for (size_t i = 0;
+					     i < (size_t)st.st_size; i++) {
+						if (map[i] == 0)
+							nuls++;
+						if (i < want && map[i] != src[i])
+							ok = 0;
+					}
+					{
+						char nm[96];
+
+						snprintf(nm, sizeof(nm),
+							 "mmap of a %u-byte file matches it byte for byte",
+							 (unsigned)want);
+						test_result(nm, ok);
+					}
+					/* The decisive one: a NUL inside the
+					 * range stat() called file content
+					 * means zero-fill leaked into data a
+					 * program would transmit. */
+					test_result("no NUL bytes within the stat()ed length",
+						    nuls == 0);
+					munmap(map, (size_t)st.st_size);
+				}
+				close(fd);
+			} else {
+				test_fail("queue-mmap: reopen failed");
+			}
+			free(src);
+			unlink(path);
+		}
+	}
+
+	// ========================================
+	// Releasing pages without losing the mapping
+	// ========================================
+	printf("\n--- MADV_DONTNEED / region accounting ---\n");
+
+	{
+		/* MADV_DONTNEED gives the physical pages back and KEEPS the
+		 * mapping: the range must still be readable afterwards, and
+		 * must read as zeros. */
+		const size_t len = 64 * 4096;
+		unsigned char *m = mmap(NULL, len, PROT_READ | PROT_WRITE,
+					MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+		if (m == MAP_FAILED) {
+			test_fail("dontneed: mmap failed");
+		} else {
+			int ok = 1;
+
+			memset(m, 0xC7, len);
+			/* Drop the middle, keeping the first and last page so
+			 * the released span is strictly interior. */
+			test_result("madvise(MADV_DONTNEED) succeeds",
+				    madvise(m + 4096, len - 2 * 4096,
+					    MADV_DONTNEED) == 0);
+
+			/* Still mapped: reading must not fault. */
+			for (size_t i = 4096; i < len - 4096; i++)
+				if (m[i] != 0)
+					ok = 0;
+			test_result("released pages read back as zeros", ok);
+
+			/* The pages either side were not asked for and must be
+			 * untouched. */
+			ok = 1;
+			for (size_t i = 0; i < 4096; i++)
+				if (m[i] != 0xC7)
+					ok = 0;
+			for (size_t i = len - 4096; i < len; i++)
+				if (m[i] != 0xC7)
+					ok = 0;
+			test_result("pages outside the range are untouched", ok);
+
+			/* And it is still writable afterwards. */
+			memset(m, 0x5B, len);
+			ok = 1;
+			for (size_t i = 0; i < len; i++)
+				if (m[i] != 0x5B)
+					ok = 0;
+			test_result("the mapping is still usable after DONTNEED",
+				    ok);
+			munmap(m, len);
+		}
+	}
+
+	{
+		/* The regression that made an allocator run the kernel's
+		 * mapping table dry: trim and re-grow in a loop.  Each cycle
+		 * used to split one mapping into two and spend a record; after
+		 * a few hundred, every mmap in the process failed -- far from
+		 * the code responsible.  Records that abut and match are folded
+		 * back together now, so this must be able to run indefinitely.
+		 */
+		const size_t len = 32 * 4096;
+		int ok = 1;
+
+		for (int cycle = 0; cycle < 400 && ok; cycle++) {
+			unsigned char *m =
+				mmap(NULL, len, PROT_READ | PROT_WRITE,
+				     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+			if (m == MAP_FAILED) {
+				ok = 0;
+				break;
+			}
+			memset(m, 0x11, len);
+			/* Interior release, then touch it again. */
+			if (madvise(m + 4096, len - 2 * 4096, MADV_DONTNEED) != 0)
+				ok = 0;
+			memset(m + 4096, 0x22, len - 2 * 4096);
+			munmap(m, len);
+		}
+		test_result("400 map/trim/regrow/unmap cycles do not exhaust the mapping table",
+			    ok);
+
+		/* And a plain map/unmap loop must not leak records either. */
+		ok = 1;
+		for (int cycle = 0; cycle < 400 && ok; cycle++) {
+			void *m = mmap(NULL, 16 * 4096, PROT_READ | PROT_WRITE,
+				       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+			if (m == MAP_FAILED) {
+				ok = 0;
+				break;
+			}
+			munmap(m, 16 * 4096);
+		}
+		test_result("400 plain map/unmap cycles do not exhaust the mapping table",
+			    ok);
+	}
+
+	// ========================================
+	// Distinct files created back to back
+	// ========================================
+	printf("\n--- back-to-back file creation ---\n");
+
+	{
+		/* Two files made in the same directory within microseconds of
+		 * each other, with names differing only in their last few
+		 * characters -- exactly what mkstemp() produces, and exactly
+		 * what a MIME encoder does when it writes one temporary file
+		 * per part of a message.
+		 *
+		 * Each must keep its OWN contents.  If opening the second by
+		 * name yields the first one's data, a message ends up with one
+		 * part's content inside another and nothing reports an error,
+		 * because every call involved succeeded.
+		 */
+		const int NFILES = 8;
+		char dir[64];
+		char paths[8][96];
+		int ok = 1, created = 0;
+
+		snprintf(dir, sizeof(dir), "/tmp/lktest_b2b_%d", (int)getpid());
+		mkdir(dir, 0700);
+
+		/* Create them all first, closing each, so the writes are as
+		 * close together as claws' are. */
+		for (int i = 0; i < NFILES; i++) {
+			FILE *f;
+
+			snprintf(paths[i], sizeof(paths[i]),
+				 "%s/claws.AAAAA%c", dir, 'A' + i);
+			f = fopen(paths[i], "wb");
+			if (!f) {
+				ok = 0;
+				break;
+			}
+			/* Content unique to this file and nothing like the
+			 * others in length or bytes. */
+			for (int r = 0; r <= i; r++)
+				fprintf(f, "file%d-line%d\n", i, r);
+			if (fclose(f) != 0)
+				ok = 0;
+			created++;
+		}
+		test_result("creating several files back to back succeeds",
+			    ok && created == NFILES);
+
+		/* Now read every one back and check it has ITS OWN content. */
+		for (int i = 0; i < created && ok; i++) {
+			FILE *f = fopen(paths[i], "rb");
+			char line[64];
+			int lines = 0;
+
+			if (!f) {
+				ok = 0;
+				break;
+			}
+			while (fgets(line, sizeof(line), f)) {
+				char want[64];
+
+				snprintf(want, sizeof(want), "file%d-line%d\n",
+					 i, lines);
+				if (strcmp(line, want) != 0)
+					ok = 0;
+				lines++;
+			}
+			fclose(f);
+			if (lines != i + 1)
+				ok = 0;
+		}
+		test_result("each file read back by name has its own contents",
+			    ok);
+
+		/* Same again with both files open at once, which is closer to
+		 * what an encoder does: source open for reading while the
+		 * destination is open for writing. */
+		if (created == NFILES) {
+			FILE *a = fopen(paths[0], "rb");
+			FILE *b = fopen(paths[1], "rb");
+			char la[64] = { 0 }, lb[64] = { 0 };
+			int both = 0;
+
+			if (a && b) {
+				if (fgets(la, sizeof(la), a) &&
+				    fgets(lb, sizeof(lb), b))
+					both = (strcmp(la, "file0-line0\n") == 0 &&
+						strcmp(lb, "file1-line0\n") == 0);
+			}
+			if (a)
+				fclose(a);
+			if (b)
+				fclose(b);
+			test_result("two files open at once do not alias each other",
+				    both);
+		}
+
+		for (int i = 0; i < created; i++)
+			unlink(paths[i]);
+		rmdir(dir);
+	}
+
+	// ========================================
+	// Two equal-length temp files, the encoder's exact chain
+	// ========================================
+	printf("\n--- paired temp files (encoder chain) ---\n");
+
+	{
+		/* The full sequence a MIME encoder runs for a message with one
+		 * attachment, reproduced exactly:
+		 *
+		 *   mkstemp -> fdopen("w+") -> fputs -> fclose      (part 1)
+		 *   mkstemp -> fdopen("w+") -> fputs -> fclose      (part 2)
+		 *   stat both, then reopen BOTH by name and read
+		 *
+		 * Two details make this different from the pieces already
+		 * tested above, and both are true of the real case: the files
+		 * are created back to back in ONE directory, and they are the
+		 * SAME LENGTH.  A 5-byte message body and a 3-byte attachment
+		 * encoded to base64 both come to exactly 5 bytes, so a reader
+		 * that returns the wrong file still returns the right number of
+		 * bytes and nothing downstream notices.  Every earlier test
+		 * here gave its files different lengths, which is precisely why
+		 * they could not have caught this.
+		 *
+		 * Repeated, because a fault that depends on allocation or
+		 * descriptor reuse need not show on the first attempt.
+		 */
+		char dir[64];
+		int ok = 1, rounds = 0;
+
+		snprintf(dir, sizeof(dir), "/tmp/lktest_pair_%d", (int)getpid());
+		mkdir(dir, 0700);
+
+		for (int round = 0; round < 32 && ok; round++) {
+			char t1[96], t2[96];
+			int f1, f2;
+			FILE *o1, *o2;
+			/* Same length, different content -- as in the real
+			 * case, where one is text and one is its base64. */
+			static const char *c1 = "test\n";
+			static const char *c2 = "aGkK\n";
+			struct stat s1, s2;
+			char r1[32], r2[32];
+			FILE *i1, *i2;
+
+			snprintf(t1, sizeof(t1), "%s/claws.XXXXXX", dir);
+			snprintf(t2, sizeof(t2), "%s/claws.XXXXXX", dir);
+
+			/* --- part 1 --- */
+			f1 = mkstemp(t1);
+			if (f1 < 0) { ok = 0; break; }
+			o1 = fdopen(f1, "w+");
+			if (!o1) { close(f1); ok = 0; break; }
+			if (fputs(c1, o1) == EOF)
+				ok = 0;
+			if (fclose(o1) != 0)
+				ok = 0;
+
+			/* --- part 2, created while part 1 still exists --- */
+			f2 = mkstemp(t2);
+			if (f2 < 0) { ok = 0; break; }
+			o2 = fdopen(f2, "w+");
+			if (!o2) { close(f2); ok = 0; break; }
+			if (fputs(c2, o2) == EOF)
+				ok = 0;
+			if (fclose(o2) != 0)
+				ok = 0;
+
+			if (!ok)
+				break;
+
+			/* Two distinct names. */
+			if (strcmp(t1, t2) == 0)
+				ok = 0;
+
+			/* Both must be exactly what was written. */
+			if (stat(t1, &s1) != 0 || stat(t2, &s2) != 0)
+				ok = 0;
+			else if ((size_t)s1.st_size != strlen(c1) ||
+				 (size_t)s2.st_size != strlen(c2))
+				ok = 0;
+
+			/* Reopen BOTH by name, as the writer does, and check
+			 * each carries its own content -- not the other's. */
+			memset(r1, 0, sizeof(r1));
+			memset(r2, 0, sizeof(r2));
+			i1 = fopen(t1, "rb");
+			i2 = fopen(t2, "rb");
+			if (!i1 || !i2) {
+				ok = 0;
+			} else {
+				if (fread(r1, 1, sizeof(r1) - 1, i1) !=
+				    strlen(c1))
+					ok = 0;
+				if (fread(r2, 1, sizeof(r2) - 1, i2) !=
+				    strlen(c2))
+					ok = 0;
+				if (strcmp(r1, c1) != 0 || strcmp(r2, c2) != 0)
+					ok = 0;
+			}
+			if (i1)
+				fclose(i1);
+			if (i2)
+				fclose(i2);
+
+			unlink(t1);
+			unlink(t2);
+			rounds++;
+		}
+
+		test_result("paired equal-length temp files each keep their own content",
+			    ok && rounds == 32);
+		rmdir(dir);
+	}
+
+	{
+		/* Same chain, but with the SOURCE file open for reading while
+		 * the destination is being written -- which is what the encoder
+		 * actually does: read the attachment, write the encoded copy.
+		 * Three descriptors are live at once. */
+		char dir[64], src[96], t1[96], t2[96];
+		int ok = 1;
+
+		snprintf(dir, sizeof(dir), "/tmp/lktest_enc2_%d", (int)getpid());
+		mkdir(dir, 0700);
+		snprintf(src, sizeof(src), "%s/source", dir);
+
+		{
+			FILE *f = fopen(src, "wb");
+
+			if (!f || fwrite("hi\n", 1, 3, f) != 3 ||
+			    fclose(f) != 0)
+				ok = 0;
+		}
+
+		if (ok) {
+			FILE *in, *o1, *o2, *v1, *v2;
+			int f1, f2;
+			char b[32], r1[32], r2[32];
+
+			snprintf(t1, sizeof(t1), "%s/claws.XXXXXX", dir);
+			snprintf(t2, sizeof(t2), "%s/claws.XXXXXX", dir);
+
+			/* part 1: message text -> its own temp file */
+			f1 = mkstemp(t1);
+			o1 = (f1 >= 0) ? fdopen(f1, "w+") : NULL;
+			if (!o1 || fputs("test\n", o1) == EOF ||
+			    fclose(o1) != 0)
+				ok = 0;
+
+			/* part 2: read the source while writing the temp */
+			in = fopen(src, "rb");
+			f2 = mkstemp(t2);
+			o2 = (f2 >= 0) ? fdopen(f2, "w+") : NULL;
+			if (!in || !o2) {
+				ok = 0;
+			} else {
+				size_t n = fread(b, 1, sizeof(b), in);
+
+				if (n != 3 || memcmp(b, "hi\n", 3) != 0)
+					ok = 0;
+				/* stand-in for the encoded form */
+				if (fputs("aGkK\n", o2) == EOF)
+					ok = 0;
+				if (fclose(o2) != 0)
+					ok = 0;
+				fclose(in);
+			}
+
+			/* Now read both back, as the writer does. */
+			memset(r1, 0, sizeof(r1));
+			memset(r2, 0, sizeof(r2));
+			v1 = fopen(t1, "rb");
+			v2 = fopen(t2, "rb");
+			if (!v1 || !v2) {
+				ok = 0;
+			} else {
+				fread(r1, 1, sizeof(r1) - 1, v1);
+				fread(r2, 1, sizeof(r2) - 1, v2);
+				if (strcmp(r1, "test\n") != 0)
+					ok = 0;
+				if (strcmp(r2, "aGkK\n") != 0)
+					ok = 0;
+			}
+			if (v1)
+				fclose(v1);
+			if (v2)
+				fclose(v2);
+			unlink(t1);
+			unlink(t2);
+		}
+		test_result("encoder chain with the source open keeps the parts separate",
+			    ok);
+		unlink(src);
+		rmdir(dir);
+	}
+
+	// ========================================
+	// read() must write every byte it claims to return
+	// ========================================
+	printf("\n--- read() fills what it counts ---\n");
+
+	{
+		/* A read that returns the right COUNT without copying the data
+		 * is invisible to every caller: the length is right, no error
+		 * is set, and the destination keeps whatever it held before.
+		 * When the destination is a recycled buffer -- and a freed
+		 * stdio buffer is handed straight back by the allocator -- the
+		 * caller silently emits the PREVIOUS file's contents at the
+		 * new file's length.
+		 *
+		 * Pre-poison the destination so a skipped copy cannot hide.
+		 */
+		char dir[64], path[96];
+		static const int sizes[] = { 1,    2,	5,    7,   16,	 31,
+					     32,   63,	64,   127, 128,	 511,
+					     512,  1000, 1023, 1024, 4095, 4096,
+					     4097, 8192 };
+		int nsz = (int)(sizeof(sizes) / sizeof(sizes[0]));
+		int ok = 1, first_bad = -1;
+
+		snprintf(dir, sizeof(dir), "/tmp/lktest_rdfill_%d", (int)getpid());
+		mkdir(dir, 0700);
+
+		for (int k = 0; k < nsz && ok; k++) {
+			int sz = sizes[k];
+			char *want = malloc((size_t)sz);
+			char *dst = malloc((size_t)sz + 16);
+			int fd;
+			ssize_t n;
+
+			if (!want || !dst) {
+				free(want);
+				free(dst);
+				ok = 0;
+				break;
+			}
+			for (int i = 0; i < sz; i++)
+				want[i] = (char)('a' + ((i + k) % 26));
+
+			snprintf(path, sizeof(path), "%s/f%d", dir, k);
+			fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+			if (fd < 0 || write(fd, want, (size_t)sz) != sz ||
+			    close(fd) != 0) {
+				ok = 0;
+				first_bad = k;
+				free(want);
+				free(dst);
+				break;
+			}
+
+			/* Poison, then read the file back in one call. */
+			memset(dst, 0x5A, (size_t)sz + 16);
+			fd = open(path, O_RDONLY);
+			if (fd < 0) {
+				ok = 0;
+				first_bad = k;
+				free(want);
+				free(dst);
+				break;
+			}
+			n = read(fd, dst, (size_t)sz);
+			close(fd);
+
+			if (n != sz || memcmp(dst, want, (size_t)sz) != 0) {
+				ok = 0;
+				first_bad = k;
+				printf("  size %d: read returned %ld, contents %s\n",
+				       sz, (long)n,
+				       (n == sz && dst[0] == 0x5A) ?
+					       "UNTOUCHED (poison survived)" :
+					       "wrong");
+			}
+			/* Nothing past the requested length may be touched. */
+			for (int i = 0; i < 16; i++)
+				if (dst[sz + i] != 0x5A) {
+					ok = 0;
+					first_bad = k;
+					printf("  size %d: read wrote %d bytes past the end\n",
+					       sz, i + 1);
+					break;
+				}
+
+			unlink(path);
+			free(want);
+			free(dst);
+		}
+		if (!ok && first_bad >= 0)
+			printf("  first failing size: %d\n", sizes[first_bad]);
+		test_result("read() copies every byte it reports", ok);
+
+		/* Same, but reading a freshly written file through a buffer the
+		 * allocator just handed back from a previous file's read -- the
+		 * exact shape of the two-part MIME writer. */
+		ok = 1;
+		{
+			char pbig[96], psml[96];
+			char *b;
+			int fd;
+			ssize_t n;
+
+			snprintf(pbig, sizeof(pbig), "%s/big", dir);
+			snprintf(psml, sizeof(psml), "%s/small", dir);
+
+			fd = open(pbig, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+			if (fd < 0 ||
+			    write(fd, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n", 32) !=
+				    32 ||
+			    close(fd) != 0)
+				ok = 0;
+			fd = open(psml, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+			if (fd < 0 || write(fd, "aGkK\n", 5) != 5 ||
+			    close(fd) != 0)
+				ok = 0;
+
+			/* Read the big file into a buffer, free it. */
+			b = malloc(4096);
+			if (!b)
+				ok = 0;
+			if (ok) {
+				fd = open(pbig, O_RDONLY);
+				if (fd < 0 || read(fd, b, 4096) != 32)
+					ok = 0;
+				if (fd >= 0)
+					close(fd);
+				free(b);
+			}
+			/* Ask for one back -- very likely the same block, still
+			 * holding the A's -- and read the small file into it. */
+			if (ok) {
+				b = malloc(4096);
+				if (!b) {
+					ok = 0;
+				} else {
+					fd = open(psml, O_RDONLY);
+					n = (fd < 0) ? -1 : read(fd, b, 4096);
+					if (fd >= 0)
+						close(fd);
+					if (n != 5 ||
+					    memcmp(b, "aGkK\n", 5) != 0) {
+						ok = 0;
+						printf("  recycled buffer: read returned %ld, got '%.5s'\n",
+						       (long)n, b);
+					}
+					free(b);
+				}
+			}
+			unlink(pbig);
+			unlink(psml);
+		}
+		test_result("read() into a recycled buffer yields the new file",
+			    ok);
+
+		rmdir(dir);
+	}
+
+	// ========================================
+	// fread must fill the buffer it reports filling
+	// ========================================
+	printf("\n--- fread after close/reopen ---\n");
+
+	{
+		/* The sequence a MIME writer performs for a two-part message,
+		 * with the detail that matters: ONE stack buffer, reused.
+		 *
+		 *   open part 1 -> fseek(0) -> fread(n1) -> close
+		 *   open part 2 -> fseek(0) -> fread(n2) -> close      n2 < n1
+		 *
+		 * If the second fread reports n2 bytes without actually copying
+		 * them, the caller writes out whatever the first read left in
+		 * the buffer -- the right NUMBER of bytes with the wrong
+		 * contents, and no error anywhere.  A 32-byte message body
+		 * followed by a 5-byte attachment comes out as the first five
+		 * bytes of the body.
+		 */
+		char dir[64], pa[96], pb[96];
+		char buf[4096]; /* reused across both reads, as the writer does */
+		int ok = 1;
+
+		snprintf(dir, sizeof(dir), "/tmp/lktest_reuse_%d", (int)getpid());
+		mkdir(dir, 0700);
+		snprintf(pa, sizeof(pa), "%s/big", dir);
+		snprintf(pb, sizeof(pb), "%s/small", dir);
+
+		{
+			FILE *f = fopen(pa, "wb");
+			/* 31 'A' and a newline, like a short message body. */
+			if (!f || fwrite("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n", 1,
+					 32, f) != 32 || fclose(f) != 0)
+				ok = 0;
+			f = fopen(pb, "wb");
+			/* 5 bytes, like "hi\n" once base64-encoded. */
+			if (!f || fwrite("aGkK\n", 1, 5, f) != 5 ||
+			    fclose(f) != 0)
+				ok = 0;
+		}
+		test_result("reuse: both files written", ok);
+
+		if (ok) {
+			FILE *f;
+			size_t n;
+
+			memset(buf, 0, sizeof(buf));
+
+			/* --- first part: the larger file --- */
+			f = fopen(pa, "rb");
+			if (!f) {
+				ok = 0;
+			} else {
+				if (fseek(f, 0, SEEK_SET) != 0)
+					ok = 0;
+				n = fread(buf, 1, 32, f);
+				if (n != 32 ||
+				    memcmp(buf, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+					   32) != 0)
+					ok = 0;
+				fclose(f);
+			}
+			test_result("reuse: the larger file reads correctly", ok);
+
+			/* --- second part: the smaller file, same buffer --- */
+			ok = 1;
+			f = fopen(pb, "rb");
+			if (!f) {
+				ok = 0;
+			} else {
+				if (fseek(f, 0, SEEK_SET) != 0)
+					ok = 0;
+				n = fread(buf, 1, 5, f);
+				if (n != 5)
+					ok = 0;
+				/* THE test: these five bytes must be the second
+				 * file's, not the first five left in the buffer
+				 * by the read above. */
+				if (memcmp(buf, "aGkK\n", 5) != 0)
+					ok = 0;
+				fclose(f);
+			}
+			test_result("reuse: the smaller file's own bytes land in the buffer",
+				    ok);
+
+			/* Same again with several sizes, since the fault may
+			 * depend on how the two lengths relate. */
+			ok = 1;
+			for (int k = 0; k < 6 && ok; k++) {
+				static const int sizes[] = { 1, 5, 17, 63,
+							     100, 1000 };
+				char pc[96];
+				FILE *w;
+				int sz = sizes[k];
+
+				snprintf(pc, sizeof(pc), "%s/s%d", dir, k);
+				w = fopen(pc, "wb");
+				if (!w) {
+					ok = 0;
+					break;
+				}
+				for (int i = 0; i < sz; i++)
+					fputc('0' + (k % 10), w);
+				fclose(w);
+
+				/* Dirty the buffer with the big file first. */
+				w = fopen(pa, "rb");
+				if (w) {
+					fread(buf, 1, 32, w);
+					fclose(w);
+				}
+				/* Then read the small one into the same buffer. */
+				w = fopen(pc, "rb");
+				if (!w) {
+					ok = 0;
+				} else {
+					n = fread(buf, 1, (size_t)sz, w);
+					if (n != (size_t)sz)
+						ok = 0;
+					for (int i = 0; i < sz; i++)
+						if (buf[i] != '0' + (k % 10))
+							ok = 0;
+					fclose(w);
+				}
+				unlink(pc);
+			}
+			test_result("reuse: holds for every size after a larger read",
+				    ok);
+		}
+
+		unlink(pa);
+		unlink(pb);
+		rmdir(dir);
+	}
+
+	// ========================================
+	// A recycled inode must not carry the old file's contents
+	// ========================================
+	printf("\n--- reused inode numbers ---\n");
+
+	{
+		/* Delete a file, create another; the number the first one had
+		 * is handed straight back.  Anything the kernel still caches
+		 * under that number belongs to the DEAD file, so the new file
+		 * reads back as the old one's bytes -- at the new file's own,
+		 * correctly reported, length.  Right size, wrong contents, no
+		 * error: the caller cannot tell.
+		 *
+		 * A MIME writer producing a message body and then an
+		 * attachment does exactly this, and emits the first N bytes of
+		 * the body as the attachment.
+		 */
+		char dir[64], pa[96], pb[96];
+		char rd[128];
+		struct stat st;
+		int ok = 1, rounds = 24;
+
+		snprintf(dir, sizeof(dir), "/tmp/lktest_inoreuse_%d",
+			 (int)getpid());
+		mkdir(dir, 0700);
+		snprintf(pa, sizeof(pa), "%s/first", dir);
+		snprintf(pb, sizeof(pb), "%s/second", dir);
+
+		for (int r = 0; r < rounds && ok; r++) {
+			int fd;
+			ssize_t n;
+			/* Distinct per round so a stale page from ANY earlier
+			 * round is recognisable, and deliberately longer than
+			 * what replaces it. */
+			char big[64];
+			int biglen = 32;
+
+			for (int i = 0; i < biglen; i++)
+				big[i] = (char)('A' + (r % 26));
+
+			/* 1. write the first file... */
+			fd = open(pa, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+			if (fd < 0 || write(fd, big, (size_t)biglen) != biglen ||
+			    close(fd) != 0) {
+				ok = 0;
+				break;
+			}
+			/* 2. ...and read it, so it is definitely cached. */
+			fd = open(pa, O_RDONLY);
+			if (fd < 0 || read(fd, rd, sizeof(rd)) != biglen) {
+				ok = 0;
+				if (fd >= 0)
+					close(fd);
+				break;
+			}
+			close(fd);
+
+			/* 3. delete it, freeing the inode number. */
+			if (unlink(pa) != 0) {
+				ok = 0;
+				break;
+			}
+
+			/* 4. create a shorter file, which likely lands on the
+			 *    number just freed. */
+			fd = open(pb, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+			if (fd < 0 || write(fd, "aGkK\n", 5) != 5 ||
+			    close(fd) != 0) {
+				ok = 0;
+				break;
+			}
+
+			/* 5. length and contents must describe the SAME file. */
+			if (stat(pb, &st) != 0 || st.st_size != 5) {
+				printf("  round %d: stat says %ld bytes, expected 5\n",
+				       r, (long)st.st_size);
+				ok = 0;
+				break;
+			}
+			memset(rd, 0, sizeof(rd));
+			fd = open(pb, O_RDONLY);
+			n = (fd < 0) ? -1 : read(fd, rd, sizeof(rd));
+			if (fd >= 0)
+				close(fd);
+			if (n != 5 || memcmp(rd, "aGkK\n", 5) != 0) {
+				printf("  round %d: read returned %ld, got '%.5s'",
+				       r, (long)n, rd);
+				if (n > 0 && rd[0] == 'A' + (r % 26))
+					printf("  <- the deleted file's bytes");
+				printf("\n");
+				ok = 0;
+				break;
+			}
+			unlink(pb);
+		}
+		test_result("a new file never reads the deleted file's contents",
+			    ok);
+
+		unlink(pa);
+		unlink(pb);
+		rmdir(dir);
+	}
+
+	// ========================================
+	// O_EXCL and the temp-file sequence
+	// ========================================
+	printf("\n--- O_EXCL / temp files ---\n");
+
+	{
+		/* O_CREAT|O_EXCL must FAIL on a file that already exists.
+		 * Everything that needs a name nobody else has -- mkstemp(),
+		 * lock files, create-then-rename -- is built on exactly this
+		 * and on nothing else.  It was accepted and ignored, so the
+		 * first candidate name always "succeeded". */
+		char path[64];
+		int a, b;
+
+		snprintf(path, sizeof(path), "/tmp/lktest_excl_%d",
+			 (int)getpid());
+		unlink(path);
+
+		a = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+		test_result("O_CREAT|O_EXCL creates a file that is not there",
+			    a >= 0);
+
+		errno = 0;
+		b = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+		test_result("O_CREAT|O_EXCL refuses a file that already exists",
+			    b < 0 && errno == EEXIST);
+		if (b >= 0)
+			close(b);
+
+		/* Without O_EXCL the same open must still succeed. */
+		b = open(path, O_RDWR | O_CREAT, 0600);
+		test_result("O_CREAT alone still opens an existing file",
+			    b >= 0);
+		if (b >= 0)
+			close(b);
+		if (a >= 0)
+			close(a);
+		unlink(path);
+	}
+
+	{
+		/* mkstemp() must hand out a DIFFERENT file every time, and one
+		 * that did not exist before.  With O_EXCL ignored this could
+		 * silently return the same file twice, and two users of it
+		 * would write over each other -- which is how a mail client
+		 * ended up with one MIME part's content inside another. */
+		char t1[] = "/tmp/lktest_mkstempXXXXXX";
+		char t2[] = "/tmp/lktest_mkstempXXXXXX";
+		int f1 = mkstemp(t1);
+		int f2 = mkstemp(t2);
+
+		test_result("mkstemp returns a usable descriptor", f1 >= 0);
+		test_result("a second mkstemp also succeeds", f2 >= 0);
+		test_result("the two temporary files have different names",
+			    f1 >= 0 && f2 >= 0 && strcmp(t1, t2) != 0);
+
+		/* Writing to one must not disturb the other. */
+		if (f1 >= 0 && f2 >= 0) {
+			char rb[16];
+			ssize_t n;
+
+			write(f1, "AAAA", 4);
+			write(f2, "BBBB", 4);
+			lseek(f1, 0, SEEK_SET);
+			memset(rb, 0, sizeof(rb));
+			n = read(f1, rb, sizeof(rb));
+			test_result("temporary files do not share storage",
+				    n == 4 && memcmp(rb, "AAAA", 4) == 0);
+		}
+		if (f1 >= 0) {
+			close(f1);
+			unlink(t1);
+		}
+		if (f2 >= 0) {
+			close(f2);
+			unlink(t2);
+		}
+	}
+
+	{
+		/* The exact sequence a MIME encoder uses to build a part:
+		 * mkstemp, fdopen the descriptor "w+", write the encoded text
+		 * with fputs/fputc, close, then stat and read it back.  A
+		 * silent failure anywhere here makes the encoder give up and
+		 * emit the ORIGINAL bytes under an encoded header -- which is
+		 * a corrupt attachment with no error message anywhere. */
+		char tpl[] = "/tmp/lktest_encXXXXXX";
+		int fd = mkstemp(tpl);
+		FILE *out;
+		int werr = 0;
+
+		if (fd < 0) {
+			test_fail("enc-seq: mkstemp failed");
+		} else if ((out = fdopen(fd, "w+")) == NULL) {
+			test_fail("enc-seq: fdopen(\"w+\") failed");
+			close(fd);
+			unlink(tpl);
+		} else {
+			struct stat st;
+			static const char *b64 = "aGVsbG8gd29ybGQK";
+
+			for (int r = 0; r < 4; r++) {
+				if (fputs(b64, out) == EOF)
+					werr = 1;
+				if (fputc('\n', out) == EOF)
+					werr = 1;
+			}
+			test_result("fputs/fputc to an fdopen(\"w+\") stream never fail",
+				    !werr);
+			test_result("closing the encoder stream succeeds",
+				    fclose(out) == 0);
+
+			{
+				size_t want = (strlen(b64) + 1) * 4;
+
+				test_result("the encoded file has the size that was written",
+					    stat(tpl, &st) == 0 &&
+						    (size_t)st.st_size == want);
+			}
+			{
+				FILE *in = fopen(tpl, "rb");
+				char line[64];
+				int lines = 0, bad = 0;
+
+				if (in) {
+					while (fgets(line, sizeof(line), in)) {
+						size_t l = strlen(line);
+
+						if (l && line[l - 1] == '\n')
+							line[--l] = '\0';
+						if (strcmp(line, b64) != 0)
+							bad = 1;
+						lines++;
+					}
+					fclose(in);
+				}
+				test_result("every encoded line reads back exactly",
+					    lines == 4 && !bad);
+			}
+			unlink(tpl);
+		}
+	}
+
+	// ========================================
+	// abort() and thread stack reuse
+	// ========================================
+	printf("\n--- abort / thread stacks ---\n");
+
+	{
+		/* abort() must end the process even when SIGABRT is blocked.
+		 * A worker thread that masks signals so one thread handles
+		 * them is an ordinary reason for the mask to be set, and an
+		 * allocator that detects corruption and calls abort() must not
+		 * be defeated by it -- the program would carry on with a
+		 * corrupt heap. */
+		pid_t kid = fork();
+
+		if (kid == 0) {
+			sigset_t all;
+
+			sigfillset(&all);
+			sigprocmask(SIG_BLOCK, &all, NULL);
+			abort();
+			_exit(0); /* must not be reached */
+		}
+		if (kid > 0) {
+			int st = 0;
+
+			while (waitpid(kid, &st, 0) < 0 && errno == EINTR)
+				;
+			test_result("abort() kills the process with SIGABRT blocked",
+				    !(WIFEXITED(st) && WEXITSTATUS(st) == 0));
+			test_result("abort() reports a signal death, not an exit",
+				    WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT);
+		} else {
+			test_fail("abort-blocked: fork failed");
+		}
+	}
+
+	{
+		/* Finished thread stacks are kept and handed to the next
+		 * thread, so a create/join loop must not grow the address
+		 * space without bound.  Before, each round mapped and unmapped
+		 * 2MB plus a guard -- churn that also cost a kernel region
+		 * slot per live stack, which is what exhausted the table. */
+		void *lo = sbrk(0);
+		int ok = 1;
+
+		for (int i = 0; i < 24; i++) {
+			pthread_t t;
+
+			if (pthread_create(&t, NULL, simple_thread_fn,
+					   (void *)(long)i) != 0) {
+				ok = 0;
+				break;
+			}
+			if (pthread_join(t, NULL) != 0) {
+				ok = 0;
+				break;
+			}
+		}
+		test_result("create/join many threads in sequence", ok);
+
+		/* The reuse itself: after the loop a fresh thread should get a
+		 * stack back from the cache rather than a new mapping.  Check
+		 * it runs correctly -- a wrongly recycled stack shows up as a
+		 * thread that never runs or faults immediately. */
+		{
+			pthread_t t;
+			void *ret = NULL;
+
+			g_simple_thread_ran = 0;
+			if (pthread_create(&t, NULL, simple_thread_fn,
+					   (void *)7L) == 0 &&
+			    pthread_join(t, &ret) == 0) {
+				test_result("a recycled thread stack still runs its thread",
+					    g_simple_thread_ran == 1 &&
+						    g_simple_thread_arg == 7 &&
+						    ret == (void *)42L);
+			} else {
+				test_fail("stack reuse: create/join failed");
+			}
+		}
+		(void)lo;
 	}
 
 	// ========================================
@@ -15536,6 +18831,20 @@ network_skip:;
 		unlink(suf);
 		rmdir(sdir);
 	}
+
+	test_loader_introspection();
+	test_exit_handlers();
+	test_math_classification();
+	test_long_double_decompose();
+	test_semaphores();
+	test_timed_blocking();
+	test_timeout_accuracy();
+	test_fd_marker_syscalls();
+	test_lock_contention();
+	test_orphan_reaping();
+	test_printf_conversions();
+	test_futex_ops();
+	test_resolver();
 
 	// ========================================
 	// Summary

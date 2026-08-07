@@ -796,8 +796,13 @@ static uint32_t tcp_generate_isn(uint32_t src_ip, uint32_t dst_ip,
 
 	uint64_t hash = siphash_2_4(tcp_isn_secret, data, 12);
 
-	// Time component: advance ~64K per second (timer is 100Hz, so ticks/4 * 256)
-	uint32_t time_comp = (uint32_t)((timer_ticks() / 4) << 8);
+	/* Time component: advance ~64K per second, whatever the tick rate.  The
+	 * old form assumed 100Hz (ticks/4 << 8) and so ran at the wrong speed
+	 * wherever the calibrated rate differs. */
+	uint64_t hz = timer_get_frequency();
+	if (hz == 0)
+		hz = 100;
+	uint32_t time_comp = (uint32_t)(timer_ticks() * 65536ULL / hz);
 
 	return (uint32_t)hash + time_comp;
 }
@@ -935,7 +940,8 @@ static void tcp_update_rtt(tcp_conn_t *conn, uint32_t r_us)
 		// SRTT := (1-alpha)*SRTT + alpha*R, alpha=1/8
 		conn->srtt_us = (conn->srtt_us * 7 + r_us) / 8;
 	}
-	// RTO = SRTT + max(G, 4*RTTVAR), G=10ms granularity (timer is 100Hz)
+	// RTO = SRTT + max(G, 4*RTTVAR); all of it in microseconds, so this is
+	// independent of the tick rate (the conversion happens in tcp_rto_ticks)
 	uint64_t rto = (uint64_t)conn->srtt_us + 4ULL * conn->rttvar_us;
 	if (rto < TCP_RTO_MIN_US)
 		rto = TCP_RTO_MIN_US;
@@ -1066,8 +1072,8 @@ static tcp_conn_t *tcp_conn_alloc(uint8_t *rx_buf, uint8_t *tx_buf,
 
 	/* Disable Nagle by default (see the Nagle-deadlock note in the design). */
 	conn->nodelay = 1;
-	conn->keepidle_ticks = 7200 * 100; // 2 hours
-	conn->keepintvl_ticks = 75 * 100; // 75 s
+	conn->keepidle_ticks = (uint32_t)timer_s_to_ticks(7200); // 2 hours
+	conn->keepintvl_ticks = (uint32_t)timer_s_to_ticks(75); // 75 s
 	conn->keepcnt = 9;
 	conn->last_rx_tick = timer_ticks();
 
@@ -1922,7 +1928,8 @@ int tcp_send_data(tcp_conn_t *conn, const uint8_t *data, uint16_t len)
 		// TCP_CORK: hold partial segments up to ~200ms unless filled
 		if (conn->cork && seg_len < seg_mss) {
 			if (conn->cork_deadline == 0)
-				conn->cork_deadline = timer_ticks() + 20;
+				conn->cork_deadline =
+					timer_ticks() + timer_ms_to_ticks(200);
 			if (timer_ticks() < conn->cork_deadline)
 				break;
 			conn->cork_deadline = 0;
@@ -1979,9 +1986,12 @@ int tcp_send_data(tcp_conn_t *conn, const uint8_t *data, uint16_t len)
 // ============================================================================
 
 // Idle connection timeout: close ESTABLISHED connections with no data for 5 minutes
-/* Deadline for a connection stuck in a CLOSING state (5 minutes at 100 Hz).
- * Not applied to ESTABLISHED -- see the note at the use site. */
-#define TCP_IDLE_TIMEOUT_TICKS (300 * 100)
+/* Deadline for a connection stuck in a CLOSING state, in SECONDS.  Converted at
+ * the use site against the measured tick rate rather than baked in here as a
+ * tick count: the rate is calibrated at boot and is not necessarily 100Hz, and
+ * a constant like `300 * 100' silently becomes two and a half minutes when it
+ * is 200.  Not applied to ESTABLISHED -- see the note at the use site. */
+#define TCP_IDLE_TIMEOUT_SECS 300
 
 // Disposition of an inbound segment as decided by tcp_validate_incoming().
 typedef enum {
@@ -2781,9 +2791,18 @@ established_segment:
 					uint32_t now_ts = tcp_ts_now_for(conn);
 					uint32_t elapsed_ticks =
 						now_ts - pop.tsecr;
-					// each TS unit = one 100Hz tick = 10ms = 10000us
-					tcp_update_rtt(conn,
-						       elapsed_ticks * 10000U);
+					/* A TS unit IS one tick (tcp_ts_now_for
+					 * builds the option straight from
+					 * timer_ticks), so the microseconds it
+					 * represents depend on the measured tick
+					 * rate.  Hardcoding 10000 over-stated
+					 * every RTT sample at any other rate,
+					 * and an over-stated RTT inflates the
+					 * RTO it feeds. */
+					tcp_update_rtt(
+						conn,
+						(uint32_t)(elapsed_ticks *
+							   timer_us_per_tick()));
 					rtt_sampled = 1;
 				}
 				if (!rtt_sampled) {
@@ -3008,7 +3027,8 @@ established_segment:
                      * Nagle on the sending side and stalls TLS handshakes
                      * by half a second per round-trip. */
 					conn->delayed_ack_deadline =
-						timer_ticks() + 4;
+						timer_ticks() +
+						timer_ms_to_ticks(40);
 				}
 			} else if ((int32_t)(seq - conn->rcv_nxt) > 0 &&
 				   payload_len <= TCP_MSS) {
@@ -3150,7 +3170,8 @@ established_segment:
 				} else {
 					conn->state = TCP_STATE_FIN_WAIT_2;
 					conn->fin_wait_2_deadline =
-						timer_ticks() + 6000; // 60s
+						timer_ticks() +
+						timer_s_to_ticks(60);
 					// An out-of-order FIN (data hole still
 					// unfilled) just gets a dup-ACK; the
 					// peer retransmits and the FIN is
@@ -3467,7 +3488,8 @@ void tcp_timer_tick(void)
 		     conn->state == TCP_STATE_CLOSING ||
 		     conn->state == TCP_STATE_LAST_ACK) &&
 		    conn->last_rx_tick != 0 &&
-		    (now - conn->last_rx_tick) > TCP_IDLE_TIMEOUT_TICKS) {
+		    (now - conn->last_rx_tick) >
+			    timer_s_to_ticks(TCP_IDLE_TIMEOUT_SECS)) {
 			tcp_fail_connection(conn, ETIMEDOUT);
 			goto unlock_conn;
 		}

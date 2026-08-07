@@ -1,6 +1,10 @@
 #ifndef _SYS_IOCTL_H
 #define _SYS_IOCTL_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 
 // ioctl request codes (Linux-compatible)
@@ -71,5 +75,9 @@
 #define SIOCRTMSG       0x890D
 
 int ioctl(int fd, unsigned long request, void* argp);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -15,7 +15,7 @@ PIC_CFLAGS = $(CFLAGS) -fPIC
 MALLOC_SRC = src/malloc/malloc.c
 STDIO_SRC = src/stdio/stdio.c
 STRING_SRC = src/string/string.c src/string/fnmatch.c src/string/strnlen.c src/string/glob.c
-STDLIB_SRC = src/crt/initfini.c src/stdlib/stdlib.c src/stdlib/getopt.c src/stdlib/mkstemps.c src/stdlib/random.c src/stdlib/spawn.c src/stdlib/getloadavg.c src/stdlib/assert.c
+STDLIB_SRC = src/crt/initfini.c src/stdlib/stdlib.c src/stdlib/cxa_atexit.c src/stdlib/getopt.c src/stdlib/mkstemps.c src/stdlib/random.c src/stdlib/spawn.c src/stdlib/getloadavg.c src/stdlib/assert.c
 CTYPE_SRC = src/ctype/ctype.c
 TIME_SRC = src/time/time.c
 DIR_SRC = src/dirent/dirent.c
@@ -26,12 +26,12 @@ ICONV_SRC = src/iconv/iconv.c
 # host/gen-unicode-tables.py.
 LOCALE_SRC = src/locale/locale.c src/locale/multibyte.c src/locale/wctype.c \
              src/locale/wcwidth.c src/locale/wcstr.c src/locale/unicode.c
-EXTRA_STDIO_SRC = src/stdio/getline.c src/stdio/err.c src/stdio/popen.c src/stdio/vfscanf.c src/stdio/wstdio.c
+EXTRA_STDIO_SRC = src/stdio/getline.c src/stdio/err.c src/stdio/popen.c src/stdio/vfscanf.c src/stdio/wstdio.c src/stdio/stdio_ext.c
 SYSCALLS_SRC = src/syscalls/unistd.c src/syscalls/mman.c src/syscalls/signal.c src/syscalls/termios.c src/syscalls/pty.c src/syscalls/shm.c src/syscalls/sysvshm.c src/syscalls/sched.c src/syscalls/socket.c src/syscalls/uio.c src/syscalls/resource.c src/syscalls/pty_util.c
 DLFCN_SRC = src/dl/dlfcn.c
 PWD_SRC = src/pwd/pwd.c src/pwd/grp.c src/pwd/shadow.c src/pwd/creds.c
-NET_SRC = src/net/inet.c src/net/getaddrinfo.c src/net/getifaddrs.c src/net/netdb_extra.c
-PTHREAD_SRC = src/pthread/pthread.c src/pthread/pthread_mutex.c src/pthread/pthread_cond.c src/pthread/pthread_sync.c src/pthread/pthread_tsd.c
+NET_SRC = src/net/inet.c src/net/getaddrinfo.c src/net/getifaddrs.c src/net/netdb_extra.c src/net/resolv.c
+PTHREAD_SRC = src/pthread/pthread.c src/pthread/pthread_mutex.c src/pthread/pthread_cond.c src/pthread/pthread_sync.c src/pthread/pthread_tsd.c src/pthread/semaphore.c
 STACK_CHK_SRC = src/stack_chk.c
 PTHREAD_ASM = src/pthread/clone.S
 SETJMP_ASM  = src/setjmp.S
@@ -91,9 +91,16 @@ $(LIBC_A): $(ALL_OBJ)
 	$(AR) rcs $@ $^
 
 # ---- Shared library (libc.so — includes pthread) ----
+# --eh-frame-hdr builds the .eh_frame_hdr section and the PT_GNU_EH_FRAME
+# program header that names it.  gcc passes it when IT drives the link, but this
+# one calls ld directly, so it has to be stated: without it a C++ exception
+# thrown through a libc callback -- a qsort comparator, a signal handler -- has
+# no unwind tables for these frames and reaches std::terminate instead of the
+# handler waiting for it.
 $(LIBC_SO): $(LIBC_PIC)
 	$(LD) -shared -nostdlib -Bsymbolic-functions --hash-style=gnu \
-	    -soname libc.so -o $@ $^
+		-z relro \
+	    --eh-frame-hdr -soname libc.so -o $@ $^
 
 # ---- CRT objects ----
 $(CRT0): $(CRT0_OBJ)

@@ -4,6 +4,10 @@
 #ifndef _ICONV_H
 #define _ICONV_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 /* Opaque conversion descriptor.  POSIX says only that it is a type suitable
@@ -30,5 +34,9 @@ size_t iconv(iconv_t cd, char **inbuf, size_t *inbytesleft, char **outbuf,
 	     size_t *outbytesleft);
 
 int iconv_close(iconv_t cd);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _ICONV_H */

@@ -304,55 +304,8 @@ void if_freenameindex(struct if_nameindex *ptr)
 	(void)ptr;
 }
 
-// ===== res_init: parse /etc/resolv.conf =====
-//
-// resolver(5) syntax (BSD/POSIX 4.4 style):
-//   nameserver <ipv4>
-//   search    <domain> [domain ...]
-//   domain    <domain>
-//   options   timeout:N attempts:N ndots:N
-//   sortlist  <ipv4/mask>
-//   ;  or  #   comment to end of line
-//
-// We honour `nameserver` (programs the kernel resolver via set_dns_server)
-// and silently accept the rest -- they're advisory for the stub resolver
-// and don't affect the kernel.
-
-int res_init(void)
-{
-	FILE *f = fopen("/etc/resolv.conf", "r");
-	if (!f)
-		return 0;
-	int installed = 0;
-	char line[256];
-	while (fgets(line, sizeof(line), f)) {
-		char *p = line;
-		while (*p == ' ' || *p == '\t')
-			p++;
-		if (*p == '#' || *p == ';' || *p == '\n' || *p == 0)
-			continue;
-		// Tokenize first word.
-		char *kw = p;
-		while (*p && *p != ' ' && *p != '\t' && *p != '\n')
-			p++;
-		if (!*p)
-			continue;
-		*p++ = 0;
-		if (strcmp(kw, "nameserver") != 0)
-			continue;
-		while (*p == ' ' || *p == '\t')
-			p++;
-		char *val = p;
-		while (*p && *p != ' ' && *p != '\t' && *p != '\n' &&
-		       *p != '#' && *p != ';')
-			p++;
-		*p = 0;
-		struct in_addr a;
-		if (inet_aton(val, &a) == 0)
-			continue; // skip IPv6 / garbage
-		if (set_dns_server(NULL, a.s_addr) == 0)
-			installed++;
-	}
-	fclose(f);
-	return installed;
-}
+/* res_init() moved to net/resolv.c, where the rest of the resolver now lives.
+ * It keeps this file's behaviour -- programming the kernel resolver from
+ * /etc/resolv.conf and returning how many servers it installed -- and
+ * additionally fills in the _res state that res_query() and friends read.
+ */

@@ -1,6 +1,10 @@
 #ifndef _UNISTD_H
 #define _UNISTD_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -77,8 +81,12 @@ int setreuid(int ruid, int euid);
 int setregid(int rgid, int egid);
 int setresuid(int ruid, int euid, int suid);
 int setresgid(int rgid, int egid, int sgid);
-int getresuid(int* ruid, int* euid, int* suid);
-int getresgid(int* rgid, int* egid, int* sgid);
+/* Pointers to uid_t and gid_t, not to int.  Every other system declares them
+ * that way, and software that has to prototype them itself -- GLib does,
+ * because they are missing from some systems' headers -- writes the
+ * conventional signature and then collides with one that does not match. */
+int getresuid(uid_t* ruid, uid_t* euid, uid_t* suid);
+int getresgid(gid_t* rgid, gid_t* egid, gid_t* sgid);
 int initgroups(const char* user, gid_t group);
 
 // Process groups / terminal
@@ -171,6 +179,9 @@ int execvp(const char* file, char* const argv[]);
 int execl(const char *pathname, const char *arg, ... /*, (char *)NULL */);
 int execlp(const char *file, const char *arg, ... /*, (char *)NULL */);
 void _exit(int status) __attribute__((noreturn));
+/* Ends THIS thread only; _exit() above ends the whole process (SYS_EXIT_GROUP).
+ * Used by pthread_exit() on a joinable thread -- not an application interface. */
+void __thread_exit(int status) __attribute__((noreturn));
 
 // Timestamps
 int futimens(int fd, const struct timespec times[2]);
@@ -229,5 +240,9 @@ unsigned long getauxval(unsigned long type);
 
 // Generic syscall entry point
 long syscall(long number, ...);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

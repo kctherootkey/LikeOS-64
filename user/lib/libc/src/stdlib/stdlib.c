@@ -55,31 +55,19 @@ static void env_sync(void)
 	environ = env_vec;
 }
 
-/* atexit / at_quick_exit — simple fixed-size table */
-#define ATEXIT_MAX 32
-static void (*atexit_funcs[ATEXIT_MAX])(void);
-static int atexit_count = 0;
-
-int atexit(void (*func)(void))
-{
-	if (atexit_count >= ATEXIT_MAX)
-		return -1;
-	atexit_funcs[atexit_count++] = func;
-	return 0;
-}
-
-int at_quick_exit(void (*func)(void))
-{
-	return atexit(func);
-}
-
+/* atexit / at_quick_exit and the exit handler list live in cxa_atexit.c: they
+ * are the same mechanism as the C++ static-destructor registry, which has to
+ * record which shared object each handler came from so dlclose() can run and
+ * remove that object's handlers before its pages go away. */
 void __libc_run_fini_array(void);
+void __cxa_finalize(void *dso);
 
 void exit(int status)
 {
-	for (int i = atexit_count - 1; i >= 0; i--)
-		if (atexit_funcs[i])
-			atexit_funcs[i]();
+	/* NULL means every handler regardless of which object registered it:
+	 * atexit(3) handlers, and the destructors of every static C++ object
+	 * still standing.  Most recently registered first. */
+	__cxa_finalize(NULL);
 	/* Destructors run after atexit handlers and before the streams are
 	 * flushed, so anything a destructor prints still reaches the output. */
 	__libc_run_fini_array();
@@ -93,19 +81,45 @@ void quick_exit(int status)
 	exit(status);
 }
 
+/* C99 7.20.4.4.  Deliberately none of exit()'s work: no handlers, no
+ * destructors, no flush -- a caller reaching for this one has decided that
+ * running them is the wrong thing, usually because it is a child process that
+ * would otherwise flush a buffer its parent already owns. */
+void _Exit(int status)
+{
+	_exit(status);
+}
+
 void abort(void)
 {
 	/* POSIX: abort() must raise SIGABRT so the process terminates with a
 	 * signal (WIFSIGNALED true), not a normal exit.  The old _exit(1) made
 	 * a heap-corruption / assertion abort indistinguishable from a benign
 	 * exit(1), so a parent (teststress) waiting on the child could not tell
-	 * a crash from an ordinary failure and did not stop.  Send SIGABRT to
-	 * ourselves; if a handler catches it and returns, reset the disposition
-	 * to default and re-raise so we cannot be trapped forever, then fall
-	 * back to _exit as a last resort. */
+	 * a crash from an ordinary failure and did not stop.
+	 *
+	 * SIGABRT must be UNBLOCKED first.  abort() is defined to end the
+	 * process whatever the caller has done to its signal mask, and a
+	 * blocked SIGABRT would otherwise just sit pending: the allocator would
+	 * detect heap corruption, call abort(), and the program would carry on
+	 * running with a corrupt heap.  Worker threads that mask signals so
+	 * only one thread handles them are an ordinary reason for the mask to
+	 * be set, so this is not a hypothetical case.
+	 *
+	 * If a handler catches it and returns, restore the default action,
+	 * unblock again (the handler may have re-blocked it) and re-raise, so
+	 * abort() cannot be trapped into returning.  _exit is the last resort. */
 	extern int raise(int sig);
+	sigset_t abrt_set;
+
+	sigemptyset(&abrt_set);
+	sigaddset(&abrt_set, SIGABRT);
+	sigprocmask(SIG_UNBLOCK, &abrt_set, NULL);
+
 	raise(SIGABRT);
+
 	signal(SIGABRT, SIG_DFL);
+	sigprocmask(SIG_UNBLOCK, &abrt_set, NULL);
 	raise(SIGABRT);
 	_exit(127);
 }

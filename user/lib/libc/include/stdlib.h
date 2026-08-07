@@ -1,6 +1,10 @@
 #ifndef _STDLIB_H
 #define _STDLIB_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 /* Environment storage limits.
@@ -50,6 +54,13 @@ double atof(const char* nptr);
 
 // Process control
 void exit(int status) __attribute__((noreturn));
+/*
+ * C99 7.20.4.4: terminate without running atexit handlers, C++ static
+ * destructors or stream flushes.  The same thing _exit(2) does, and named
+ * separately because _exit is POSIX and this is the C standard's spelling --
+ * code that includes only <stdlib.h> is entitled to find it here.
+ */
+void _Exit(int status) __attribute__((noreturn));
 void abort(void) __attribute__((noreturn));
 
 // Environment
@@ -141,5 +152,9 @@ int getloadavg(double loadavg[], int nelem);
 int atexit(void (*func)(void));
 int at_quick_exit(void (*func)(void));
 void quick_exit(int status);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -328,12 +328,22 @@ int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns)
 		       key, bucket_idx, bucket_count(bucket->head));
 
 	// Set wakeup time if timeout specified
+	uint64_t deadline_tick = 0;
 	if (timeout_ns > 0) {
-		uint64_t ticks =
-			(timeout_ns / 10000000) + 1; // Convert to ~10ms ticks
+		/* Against the MEASURED tick rate, not an assumed 10ms one: the
+		 * boot calibration routinely settles near 200Hz on a virtual
+		 * machine, and dividing by a hardcoded 10ms then expired every
+		 * timeout in half the time asked for.  The +1 covers the tick
+		 * already in progress, which is otherwise credited in full. */
+		uint64_t ticks = timer_ns_to_ticks(timeout_ns) + 1;
 		WARN_ON(ticks ==
 			0); /* futex timeout ticks is zero - underflow in timeout conversion */
-		cur->wakeup_tick = timer_ticks() + ticks;
+		deadline_tick = timer_ticks() + ticks;
+		cur->wakeup_tick = deadline_tick;
+	} else {
+		/* No timeout: make sure a value left over from an earlier
+		 * timed sleep cannot wake this task straight back up. */
+		cur->wakeup_tick = 0;
 	}
 
 	spin_unlock_irqrestore(&bucket->lock, flags);
@@ -376,7 +386,32 @@ int futex_wait(uint64_t uaddr, uint32_t expected_val, uint64_t timeout_ns)
 
 	kfree(waiter);
 
-	return was_woken ? 0 : -ETIMEDOUT;
+	if (was_woken)
+		return 0;
+
+	/*
+	 * Not woken by futex_wake, so this is a timeout, a signal, or a
+	 * spurious wake -- and they are three different answers.  Reporting
+	 * them all as ETIMEDOUT (which is what this used to do) is wrong in
+	 * both directions: a caller waiting without any timeout at all was
+	 * told its wait "timed out", and a caller with a timeout was told the
+	 * deadline had passed the moment any signal arrived, however long was
+	 * actually left.  sem_wait() turning a stray SIGALRM into a failure,
+	 * and sem_timedwait() returning ETIMEDOUT after no measurable wait,
+	 * are both that bug.
+	 *
+	 * The deadline is the authority on whether time ran out, so it is what
+	 * decides: if it exists and has passed, this is ETIMEDOUT.  Everything
+	 * else -- a signal, a spurious wake, and a wait that had no deadline to
+	 * miss in the first place -- is EINTR, which tells the caller to
+	 * re-check its condition and go round again.  Signals and spurious
+	 * wakes are not distinguished from each other because the caller must
+	 * do the same thing for both, and every futex user here already does.
+	 */
+	if (deadline_tick != 0 && timer_ticks() >= deadline_tick)
+		return -ETIMEDOUT;
+
+	return -EINTR;
 }
 
 int futex_wake(uint64_t uaddr, int nr_wake)

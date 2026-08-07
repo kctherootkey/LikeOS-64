@@ -114,4 +114,10 @@ static inline struct __pthread* __pthread_self(void) {
 // TSD destructor caller (defined in pthread_tsd.c)
 extern void __pthread_tsd_run_destructors(void);
 
+// Destructors for this thread's `thread_local` objects, registered through
+// __cxa_thread_atexit_impl (defined in stdlib/cxa_atexit.c).  Distinct from the
+// TSD destructors above: those belong to a pthread_key_t and are keyed by it,
+// these belong to an object the compiler laid out in this thread's TLS block.
+extern void __libc_thread_finalize(void);
+
 #endif /* _PTHREAD_INTERNAL_H */

@@ -1,6 +1,10 @@
 #ifndef _SYS_PROCINFO_H
 #define _SYS_PROCINFO_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 
 /* Process information structure (matches kernel procinfo_t) */
@@ -26,6 +30,12 @@ typedef struct procinfo {
     uint64_t stime_ticks;   /* Kernel-mode ticks */
     uint64_t vsz;           /* Virtual memory size (bytes) */
     uint64_t rss;           /* Resident set size (pages) */
+    /* Kernel address of the call that put this task to sleep -- the WCHAN.
+     * 0 when the task is not blocked.  Symbolise it with:
+     *   rm build/kernel.elf && make NO_STRIP=1
+     *   addr2line -f -e build/kernel.elf <wchan>
+     * A process that is hung tells you nothing without this. */
+    uint64_t wchan;
     char    comm[256];      /* Process name (basename of executable) */
     char    cmdline[1024];  /* Full command line (argv joined by spaces) */
     char    environ[2048];  /* Environment (envp joined by spaces) */
@@ -37,5 +47,9 @@ typedef struct procinfo {
  * max_count: number of entries the array can hold
  * Returns:   number of entries filled, or -1 on error (errno set) */
 int getprocinfo(procinfo_t* buf, int max_count);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SYS_PROCINFO_H */

@@ -1,6 +1,10 @@
 #ifndef _SYS_EPOLL_H
 #define _SYS_EPOLL_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 
 // Epoll event flags
@@ -43,5 +47,9 @@ int epoll_wait(int epfd, struct epoll_event *events,
                int maxevents, int timeout);
 int epoll_pwait(int epfd, struct epoll_event *events,
                 int maxevents, int timeout, const void *sigmask);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SYS_EPOLL_H */

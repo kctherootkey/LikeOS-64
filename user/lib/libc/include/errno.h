@@ -1,6 +1,10 @@
 #ifndef _ERRNO_H
 #define _ERRNO_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern int errno;
 
 // Error codes
@@ -53,6 +57,7 @@ extern int errno;
 #define ENOSR          63  /* Out of streams resources */
 #define ENOLINK        67  /* Link has been severed */
 #define EPROTO         71  /* Protocol error */
+#define EMULTIHOP      72  /* Multihop attempted */
 #define EBADMSG        74  /* Not a data message */
 #define EOVERFLOW      75  /* Value too large for defined data type */
 #define EILSEQ         84  /* Illegal byte sequence */
@@ -85,6 +90,7 @@ extern int errno;
 #define EADDRNOTAVAIL  99  /* Cannot assign requested address */
 #define ENETDOWN       100 /* Network is down */
 #define ENETUNREACH    101 /* Network is unreachable */
+#define ENETRESET      102 /* Network dropped connection on reset */
 #define ECONNABORTED   103 /* Software caused connection abort */
 #define ECONNRESET     104 /* Connection reset by peer */
 #define ENOBUFS        105 /* No buffer space available */
@@ -102,7 +108,12 @@ extern int errno;
 #define EUSERS         87  /* Too many users */
 #define EDQUOT         122 /* Disk quota exceeded */
 #define EREMOTE        66  /* Object is remote */
+#define ECANCELED      125 /* Operation canceled */
 #define EOWNERDEAD     130 /* Owner died */
 #define ENOTRECOVERABLE 131 /* State not recoverable */
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

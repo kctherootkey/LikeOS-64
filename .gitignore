@@ -120,6 +120,12 @@
 #     excludes the directory itself, so git still descends into these two.)
 !/ports/xorg/toolchain/
 !/ports/xorg/patches/
+#     Re-included for the same reasons: the GTK3 sub-port, which is a manifest
+#     and a set of wrapper scripts rather than a second build system, and then
+#     the same three rules again one level down for what IT derives.
+!/ports/xorg/gtk3/
+/ports/xorg/gtk3/*/
+!/ports/xorg/gtk3/patches/
 #     Not listed, therefore tracked, and all required to build from a clone:
 #     packages.list (the manifest), fetch/unpack/build/stage/clean.sh, and
 #     checksums.sha256 (records which upstream bytes a build used).

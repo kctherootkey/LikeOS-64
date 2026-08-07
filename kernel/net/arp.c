@@ -12,7 +12,6 @@
 // ARP Table
 // ============================================================================
 #define ARP_TABLE_SIZE 64
-#define ARP_ENTRY_TIMEOUT (300 * 100) // 300 seconds in ticks (100Hz)
 
 typedef struct {
 	uint32_t ip;
@@ -39,9 +38,10 @@ static spinlock_t arp_lock = SPINLOCK_INIT("arp");
 // pending-list lock dropped.
 // ============================================================================
 #define ARP_PENDING_MAX 128
-#define ARP_PENDING_TIMEOUT                           \
-	100 // 1 s at 100 Hz; entries older than this \
-		// are dropped on the next learn / probe.
+/* Entries older than this are dropped on the next learn / probe.  In SECONDS:
+ * converted at the use site, because the tick rate is measured at boot and a
+ * baked-in tick count means a different duration on a different machine. */
+#define ARP_PENDING_TIMEOUT_SECS 1
 
 typedef struct arp_pending {
 	int in_use;
@@ -84,7 +84,7 @@ int arp_queue_pending(net_device_t *dev, uint32_t next_hop_ip, sk_buff_t *skb)
 	for (int i = 0; i < ARP_PENDING_MAX; i++) {
 		if (arp_pending_pool[i].in_use &&
 		    now - arp_pending_pool[i].enqueued_tick >
-			    ARP_PENDING_TIMEOUT) {
+			    timer_s_to_ticks(ARP_PENDING_TIMEOUT_SECS)) {
 			expired_skbs[expired_count++] = arp_pending_pool[i].skb;
 			arp_pending_pool[i].in_use = 0;
 			arp_pending_pool[i].skb = NULL;
@@ -132,7 +132,7 @@ static void arp_drain_pending(uint32_t ip, const uint8_t mac[ETH_ALEN])
 		if (!arp_pending_pool[i].in_use)
 			continue;
 		if (now - arp_pending_pool[i].enqueued_tick >
-		    ARP_PENDING_TIMEOUT) {
+		    timer_s_to_ticks(ARP_PENDING_TIMEOUT_SECS)) {
 			expired_skbs[expired_count++] = arp_pending_pool[i].skb;
 			arp_pending_pool[i].in_use = 0;
 			arp_pending_pool[i].skb = NULL;
@@ -497,8 +497,8 @@ int arp_probe(net_device_t *dev, uint32_t ip)
 	for (int probe = 0; probe < 3; probe++) {
 		eth_send(dev, eth_broadcast_addr, ETH_P_ARP, pkt,
 			 sizeof(arp_header_t));
-		// Wait ~200ms (20 ticks at 100Hz) for any reply.
-		uint64_t deadline = timer_ticks() + 20;
+		// Wait ~200ms for any reply, at the measured tick rate.
+		uint64_t deadline = timer_ticks() + timer_ms_to_ticks(200);
 		while (timer_ticks() < deadline) {
 			if (arp_reply_ready && arp_reply_ip == ip)
 				return -1;

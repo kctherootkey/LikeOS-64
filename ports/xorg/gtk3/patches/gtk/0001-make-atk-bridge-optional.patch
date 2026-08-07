@@ -1,0 +1,68 @@
+--- a/meson.build
++++ b/meson.build
+@@ -565,7 +565,22 @@
+   xfixes_dep     = dependency('xfixes', required: false)
+   xcomposite_dep = dependency('xcomposite', required: false)
+   fontconfig_dep = dependency('fontconfig', fallback: ['fontconfig', 'fontconfig_dep'])
+-  atkbridge_dep  = dependency('atk-bridge-2.0', version: at_spi2_atk_req)
++  # The accessibility bridge, which connects ATK to AT-SPI over D-Bus.
++  #
++  # Optional rather than required.  GTK asks for it whenever the X11 backend is
++  # built, on the reasonable assumption that a system with X has a desktop
++  # session -- but it is a separate stack (at-spi2-atk, at-spi2-core, a D-Bus
++  # daemon and a session bus), and a system with none of that has nothing for
++  # the bridge to talk to.  Without it GTK is fully functional and assistive
++  # technologies cannot attach, which is the honest outcome here: there is no
++  # screen reader on this system to attach with.
++  #
++  # The two places that use it are guarded on HAVE_ATK_BRIDGE below.  They were
++  # guarded on GDK_WINDOWING_X11, which conflates "drawing through X" with "an
++  # accessibility bus is present" -- true on a desktop, not true here.
++  atkbridge_dep  = dependency('atk-bridge-2.0', version: at_spi2_atk_req,
++                              required: false)
++  cdata.set('HAVE_ATK_BRIDGE', atkbridge_dep.found())
+ 
+   backend_immodules += ['xim']
+ 
+@@ -584,7 +599,20 @@
+     x11_pkgs += ['xdamage']
+   endif
+ 
+-  atk_pkgs += ['atk-bridge-2.0']
++  # Only claim it in gtk+-3.0.pc when it is actually there.
++  #
++  # A .pc file's Requires.private is a promise to whoever links this library:
++  # pkg-config resolves the whole chain, so naming a package that is not
++  # installed makes every consumer's configure fail -- Claws Mail's stopped
++  # with "Package 'atk-bridge-2.0', required by 'gtk+-3.0', not found", which
++  # points at GTK rather than at the missing bridge.
++  #
++  # Guarded the same way as xdamage and xcursor just above; the dependency is
++  # optional now (see the note where atkbridge_dep is declared) and its
++  # advertisement has to follow it.
++  if atkbridge_dep.found()
++    atk_pkgs += ['atk-bridge-2.0']
++  endif
+ 
+   cdata.set('HAVE_XDAMAGE', xdamage_dep.found() ? 1 : false)
+   cdata.set('HAVE_XCURSOR', xcursor_dep.found() ? 1 : false)
+--- a/gtk/a11y/gtkaccessibility.c
++++ b/gtk/a11y/gtkaccessibility.c
+@@ -37,7 +37,7 @@
+ #include <gtk/gtktogglebutton.h>
+ #include <gtk/gtkaccessible.h>
+ 
+-#ifdef GDK_WINDOWING_X11
++#if defined(GDK_WINDOWING_X11) && defined(HAVE_ATK_BRIDGE)
+ #include <atk-bridge.h>
+ #endif
+ 
+@@ -986,7 +986,7 @@
+   _gtk_accessibility_override_atk_util ();
+   do_window_event_initialization ();
+ 
+-#ifdef GDK_WINDOWING_X11
++#if defined(GDK_WINDOWING_X11) && defined(HAVE_ATK_BRIDGE)
+   atk_bridge_adaptor_init (NULL, NULL);
+ #endif
+ 

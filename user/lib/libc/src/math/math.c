@@ -227,6 +227,52 @@ double cos(double x)
 	return r;
 }
 
+/* Both at once.
+ *
+ * A GNU extension rather than a standard function, and worth having as more
+ * than a convenience wrapper: fsincos computes the pair in ONE instruction,
+ * where calling sin() and cos() separately does the argument reduction and the
+ * polynomial evaluation twice.  Software that rotates or draws circles asks
+ * for it by name -- GTK's GL demo does, which is where its absence showed.
+ *
+ * fsincos leaves cos in ST(0) and sin in ST(1), which is what "=t" and "=u"
+ * name.  Its argument domain is |x| < 2^63, the same as the fsin and fcos
+ * above; outside that all three leave the operand untouched, which is a
+ * property of this file's trigonometry generally rather than of this function.
+ */
+void sincos(double x, double *s, double *c)
+{
+	double sn, cs;
+
+	__asm__("fsincos" : "=t"(cs), "=u"(sn) : "0"(x));
+	if (s)
+		*s = sn;
+	if (c)
+		*c = cs;
+}
+
+void sincosf(float x, float *s, float *c)
+{
+	double sn, cs;
+
+	sincos((double)x, &sn, &cs);
+	if (s)
+		*s = (float)sn;
+	if (c)
+		*c = (float)cs;
+}
+
+void sincosl(long double x, long double *s, long double *c)
+{
+	long double sn, cs;
+
+	__asm__("fsincos" : "=t"(cs), "=u"(sn) : "0"(x));
+	if (s)
+		*s = sn;
+	if (c)
+		*c = cs;
+}
+
 double tan(double x)
 {
 	double r, discard;
@@ -347,24 +393,88 @@ double fdim(double a, double b)
 	return (a > b) ? a - b : 0.0;
 }
 
+/* Quiet NaN.
+ *
+ * The argument is a payload: an implementation may encode it in the NaN's
+ * significand so that a program can tell one NaN from another.  This one
+ * ignores it and returns the default quiet NaN, which the standard permits
+ * ("if the argument is not a valid n-char sequence ... the result is a quiet
+ * NaN") and which is what every caller here actually wants -- the payload is
+ * used by numerical debuggers, and nothing on this system reads it back. */
+double nan(const char *tag)
+{
+	(void)tag;
+	return __builtin_nan("");
+}
+
+float nanf(const char *tag)
+{
+	(void)tag;
+	return __builtin_nanf("");
+}
+
+long double nanl(const char *tag)
+{
+	(void)tag;
+	return __builtin_nanl("");
+}
+
+/* The double and float halves of the scaling family.
+ *
+ * All of them go through the long double primitives at the bottom of this
+ * file, which read and write the exponent field directly.  Scaling by a power
+ * of two is EXACT in the 80-bit format -- its exponent range is far wider than
+ * either of these types -- so converting the result back rounds exactly once
+ * and lands on the correctly rounded answer, subnormal results included.
+ *
+ * ldexp used to be `x * exp2((double) e)' and frexp used to recover the
+ * exponent with floor(log2(fabs(x))).  Both were wrong at the ends of the
+ * range, not merely slow: the intermediate 2^e overflows to infinity for e
+ * above 1023 even when x * 2^e is perfectly representable, so
+ * ldexp(5e-324, 1074) -- the smallest subnormal scaled up to exactly 1.0 --
+ * returned infinity.  Reading the exponent field cannot overflow, because it
+ * never forms 2^e as a value at all. */
 double ldexp(double x, int e)
 {
-	return x * exp2((double)e);
+	return (double)ldexpl((long double)x, e);
+}
+
+float ldexpf(float x, int e)
+{
+	return (float)ldexpl((long double)x, e);
 }
 
 double frexp(double x, int *e)
 {
-	double l;
+	return (double)frexpl((long double)x, e);
+}
 
-	if (x == 0.0 || x != x) {
-		if (e)
-			*e = 0;
-		return x;
-	}
-	l = floor(log2(fabs(x))) + 1.0;
-	if (e)
-		*e = (int)l;
-	return x / exp2(l);
+float frexpf(float x, int *e)
+{
+	return (float)frexpl((long double)x, e);
+}
+
+/* scalbn is the same operation under the name C99 gives it for radix-2
+ * systems, which this is; scalbln takes a long count.  Software asks for one
+ * spelling or the other depending on its age -- HarfBuzz uses scalbnf. */
+double scalbn(double x, int e)
+{
+	return ldexp(x, e);
+}
+
+float scalbnf(float x, int e)
+{
+	return ldexpf(x, e);
+}
+
+double scalbln(double x, long e)
+{
+	return (double)scalblnl((long double)x, e);
+}
+
+float scalblnf(float x, long e)
+{
+	return (float)scalblnl((long double)x, e);
 }
 
 double modf(double x, double *iptr)
@@ -515,4 +625,105 @@ long double hypotl(long double x, long double y)
 long double copysignl(long double x, long double y)
 {
 	return __builtin_copysignl(x, y);
+}
+
+/* frexpl / ldexpl — taking a long double apart and putting it back together.
+ *
+ * These are how software that formats floating point by hand gets at the
+ * exponent: gnulib's printf implementation, which GLib carries, refuses to
+ * configure without them ("frexpl() is missing or broken beyond repair").
+ *
+ * Deliberately NOT written in terms of log2l and powl, the way frexp above is
+ * written in terms of log2 and exp2.  That approach goes through a
+ * transcendental to recover a value that is sitting in the exponent field, so
+ * it is approximate where this operation is exact -- and for a long double the
+ * whole point is the extra range and precision.  These read the bits instead.
+ *
+ * The x87 80-bit format, which is what a long double is here:
+ *
+ *     bits 0..63    the significand, WITH its leading integer bit stored
+ *                   explicitly (unlike float and double, which imply it)
+ *     bits 64..78   the exponent, biased by 16383
+ *     bit 79        the sign
+ *     bits 80..127  padding, so the type is 16 bytes and stays aligned
+ */
+union ldbits {
+	long double f;
+	struct {
+		uint64_t m;  /* significand */
+		uint16_t se; /* sign in bit 15, biased exponent below it */
+		uint16_t pad[3];
+	} i;
+};
+
+long double frexpl(long double x, int *e)
+{
+	union ldbits u = { .f = x };
+	int ee = u.i.se & 0x7fff;
+	int dummy;
+
+	if (!e)
+		e = &dummy; /* every path below writes it */
+
+	if (ee == 0) {
+		/* Zero, or subnormal.  A subnormal has no leading one to
+		 * report an exponent against, so scale it into the normal
+		 * range first and take the scaling back off the answer.  2^64
+		 * is more than the width of the significand, so one step is
+		 * always enough. */
+		if (x != 0.0L) {
+			x = frexpl(x * 0x1p64L, e);
+			*e -= 64;
+		} else {
+			*e = 0;
+		}
+		return x;
+	}
+	if (ee == 0x7fff) {
+		/* Infinity or NaN.  The standard leaves *e unspecified; zero
+		 * is the least surprising thing to leave behind. */
+		*e = 0;
+		return x;
+	}
+
+	/* A normal value is 1.significand x 2^(ee - 16383), and the result
+	 * wants 0.5 <= |m| < 1 -- so the exponent is one larger and the
+	 * significand is that of a value in [0.5, 1), which is the biased
+	 * exponent 16382. */
+	*e = ee - 0x3ffe;
+	u.i.se &= 0x8000;
+	u.i.se |= 0x3ffe;
+	return u.f;
+}
+
+long double ldexpl(long double x, int e)
+{
+	long double r;
+
+	/* fscale multiplies by 2 raised to the truncated integer in ST(1), and
+	 * is exact.  It needs no special cases: zero and infinity scale to
+	 * themselves, a NaN propagates, and a result too large or too small for
+	 * the format saturates to infinity or to zero the same way an ordinary
+	 * multiplication would. */
+	__asm__("fscale" : "=t"(r) : "0"(x), "u"((long double)e));
+	return r;
+}
+
+/* Same operation under the name C99 gives it for radix-2 systems, which this
+ * is.  Software asks for one or the other depending on its age. */
+long double scalbnl(long double x, int e)
+{
+	return ldexpl(x, e);
+}
+
+long double scalblnl(long double x, long e)
+{
+	/* Clamped rather than truncated: a count this large has already
+	 * overflowed or underflowed the format, and saturating keeps that
+	 * answer instead of wrapping it into a small one. */
+	if (e > 100000L)
+		e = 100000L;
+	else if (e < -100000L)
+		e = -100000L;
+	return ldexpl(x, (int)e);
 }

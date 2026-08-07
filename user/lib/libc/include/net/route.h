@@ -1,6 +1,10 @@
 #ifndef _NET_ROUTE_H
 #define _NET_ROUTE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/socket.h>
 
 /* Route flags */
@@ -34,5 +38,9 @@ struct arpreq {
     struct sockaddr arp_netmask;
     char            arp_dev[IFNAMSIZ];
 };
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _NET_ROUTE_H */

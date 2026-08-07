@@ -29,7 +29,7 @@ int ffsll(long long i);
  * the name is already taken lets both conventions coexist, which is what a
  * caller including both headers needs. */
 #ifndef bzero
-static inline void bzero(void *s, size_t n)
+static __inline void bzero(void *s, size_t n)
 {
     unsigned char *p = (unsigned char *)s;
     while (n--) *p++ = 0;
@@ -37,7 +37,7 @@ static inline void bzero(void *s, size_t n)
 #endif
 
 #ifndef bcopy
-static inline void bcopy(const void *src, void *dst, size_t n)
+static __inline void bcopy(const void *src, void *dst, size_t n)
 {
     const unsigned char *s = (const unsigned char *)src;
     unsigned char *d = (unsigned char *)dst;
@@ -46,7 +46,7 @@ static inline void bcopy(const void *src, void *dst, size_t n)
 #endif
 
 #ifndef index
-static inline char *index(const char *s, int c)
+static __inline char *index(const char *s, int c)
 {
     while (*s) {
         if (*s == (char)c) return (char *)s;
@@ -57,7 +57,7 @@ static inline char *index(const char *s, int c)
 #endif
 
 #ifndef rindex
-static inline char *rindex(const char *s, int c)
+static __inline char *rindex(const char *s, int c)
 {
     const char *last = (char *)0;
     while (*s) {

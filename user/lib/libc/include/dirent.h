@@ -1,6 +1,10 @@
 #ifndef _DIRENT_H
 #define _DIRENT_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 #include <sys/types.h>
 
@@ -48,5 +52,9 @@ int scandir(const char* dirp, struct dirent*** namelist,
             int (*compar)(const struct dirent**, const struct dirent**));
 int alphasort(const struct dirent** a, const struct dirent** b);
 int versionsort(const struct dirent** a, const struct dirent** b);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

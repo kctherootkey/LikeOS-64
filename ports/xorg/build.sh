@@ -18,9 +18,22 @@ set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
-list="$here/packages.list"
-stamps="$here/.stamps"
-logs="$here/.logs"
+
+# Which package set this run drives.
+#
+# The X.Org manifest is the default.  A sub-port -- ports/xorg/gtk3 -- points
+# LIKEOS_PORT_DIR at its own directory and reuses this driver unchanged, so
+# there is one cross-build arrangement for two package sets rather than a second
+# copy of it that has to be fixed twice.
+#
+# Only the package set moves.  $here stays ports/xorg throughout, because the
+# toolchain wrappers, the host-tool directory and the sysroot are SHARED: a GTK
+# program links against the same libX11 the X port built, with the same compiler
+# driver, so there is nothing to separate.
+port=$(cd "${LIKEOS_PORT_DIR:-$here}" && pwd)
+list="$port/packages.list"
+stamps="$port/.stamps"
+logs="$port/.logs"
 SYSROOT="${LIKEOS_SYSROOT:-$root/build/xorg-sysroot}"
 export LIKEOS_SYSROOT="$SYSROOT"
 
@@ -232,6 +245,86 @@ pkg_opts() {
 	libXft)
 		echo "--disable-specs --without-xmlto --without-fop"
 		;;
+	# ---- the TLS chain, for Claws Mail ---------------------------------
+	#
+	# --disable-doc throughout, for the reason every X.Org package here has
+	# its documentation off: the manual is Texinfo, building it needs
+	# makeinfo on the BUILD host, and what it produces is a .info file that
+	# nothing on the image can read -- this system's manual is a flat
+	# directory of preformatted man pages.  libtasn1 is where that first
+	# stopped a build, and only at `make install', after everything real had
+	# already compiled.
+	libtasn1) echo "--disable-doc --disable-gtk-doc" ;;
+	gnutls)
+		# p11-kit is smart-card and PKCS#11 support: another library, a
+		# module directory and a daemon, for hardware nothing here can
+		# reach.  The included unistring avoids porting libunistring for
+		# the handful of Unicode routines GnuTLS uses.  The tools
+		# (certtool, gnutls-cli) are diagnostics for a machine with a
+		# terminal and time to spend; Claws links the library.
+		echo "--disable-doc --disable-tests --disable-tools \
+		      --without-p11-kit --with-included-unistring \
+		      --without-tpm --without-tpm2 --disable-libdane \
+		      --disable-guile"
+		;;
+	enchant)
+		# hunspell is the backend, and the only one: aspell, nuspell,
+		# hspell, voikko and zemberek are not ported, and Enchant tries
+		# every provider it was built with before giving up.  Claws asks
+		# for an en_US speller the moment a compose window opens and
+		# treats a refusal as an error, so "no backend" is not a quiet
+		# degradation -- it is a dialog box every time.
+		echo "--enable-hunspell --disable-aspell --disable-nuspell \
+		      --disable-applespell --disable-hspell --disable-voikko \
+		      --disable-zemberek"
+		;;
+	hunspell)
+		# The tools (hunspell, munch, unmunch, hzip) are not staged, but
+		# their build is cheap and turning it off is not an option the
+		# package offers.  ncurses and readline are, and neither is
+		# wanted for a library nothing types at interactively.
+		echo "--without-ui --disable-static"
+		;;
+	libetpan)
+		# The mail protocols.  OpenSSL is already on the image and is
+		# what libetpan uses for its own TLS; GnuTLS is what Claws uses
+		# for its.  Both are built, so both are enabled and the two
+		# halves of the application agree about which connections are
+		# encrypted.
+		echo "--with-openssl --with-gnutls --without-sasl \
+		      --disable-db --disable-dependency-tracking"
+		;;
+	claws-mail)
+		# Off: everything needing a desktop session bus, a system
+		# service or a toolchain this system does not have.  --disable-svg
+		# in particular keeps librsvg -- and with it a Rust toolchain --
+		# out of the dependency graph, for the same reason the Adwaita
+		# icon theme is pinned to its last PNG release.
+		echo "--disable-dbus --disable-gnome --disable-libnotify \
+		      --disable-gpgme --disable-compface --disable-ldap \
+		      --disable-jpilot --disable-networkmanager-support \
+		      --disable-svg --disable-valgrind --disable-manual \
+		      --enable-gnutls --enable-enchant --enable-libetpan"
+		;;
+	gettext)
+		# The bindings for languages this system has no runtime for, and
+		# the pieces of the tools that would otherwise be configured.
+		# --without-emacs: the Lisp mode is for editing .po files on the
+		# build host.  --disable-openmp: it would link the host's libgomp
+		# and with it the host libc, which then collides with ours over
+		# errno -- the same reason pixman has it off.
+		#
+		# NOT --disable-nls, which is the obvious-looking flag and is
+		# exactly wrong here.  For an ordinary package it means "do not
+		# translate this program"; for gettext itself it means "do not
+		# build libintl", and the build then completes, reports success
+		# and installs nothing -- USE_NLS=no leaves libintl.la as a
+		# noinst convenience library that never reaches the sysroot.
+		# The next package to want -lintl is where that surfaces.
+		echo "--disable-java --disable-csharp --disable-d \
+		      --disable-modula2 --disable-openmp --disable-curses \
+		      --disable-rpath --without-emacs --disable-acl"
+		;;
 	motif)
 		# --disable-printing avoids libXp, the old X print extension:
 		# Motif only needs it for print-to-Xp, and porting a dead
@@ -264,6 +357,71 @@ pkg_opts() {
 	esac
 }
 
+# Options for the NATIVE half of a needs_host_build() package.  Everything the
+# generators do not need is switched off: this build exists to produce five
+# small programs, not a second copy of the library to develop against.
+meson_host_opts() {
+	case "$1" in
+	glib)
+		echo "-Dtests=false -Dinstalled_tests=false -Dnls=disabled \
+		      -Dman-pages=disabled -Dintrospection=disabled \
+		      -Dselinux=disabled -Dlibmount=disabled -Ddtrace=false \
+		      -Dsystemtap=false -Dsysprof=disabled -Dglib_debug=disabled \
+		      -Ddefault_library=static"
+		;;
+	*) echo "" ;;
+	esac
+}
+
+# Per-package environment for the configure run.
+#
+# Almost always empty.  This is for the case where a package decides something
+# about the platform from a hardcoded list of operating-system names rather than
+# by testing for it -- a list this system will never be on.  Autoconf caches
+# such answers in a gt_cv_/ac_cv_ variable, and a cache variable already set in
+# the environment is taken as given and the test skipped, so the answer can be
+# supplied without patching a generated configure script.
+#
+# Only for answers that are TRUE here.  Setting one of these to defeat a test
+# that is telling the truth would hide a real gap rather than fill it.
+pkg_env() {
+	# Answers that hold for EVERY package, because they are facts about this
+	# system rather than about any one of them.  A cache variable a package
+	# does not use is simply ignored, so stating them once is safe and keeps
+	# the next gnulib-bearing package from failing the same way.
+	#
+	# gt_cv_locale_fake: gnulib calls a locale_t "fake" when it is a token
+	# rather than a description -- when newlocale() cannot produce distinct
+	# locales and the object carries no per-category names.  That is exactly
+	# what this libc has: one locale, one singleton object, and newlocale()
+	# returns it whatever it is asked for.
+	#
+	# gnulib decides this from a list of OS names (OpenBSD, Android) and
+	# answers "no" for anything it does not recognise, which then selects
+	# code that reads names out of the locale object.  There are none to
+	# read, so the build stops at "#error Please port gnulib
+	# getlocalename_l-unsafe.c to your platform".  Saying yes selects
+	# gnulib's own name-tracking path, written for precisely this situation.
+	# gettext hit it first; GnuTLS, carrying its own copy of gnulib, hit the
+	# identical wall three packages later.
+	common="gt_cv_locale_fake=yes"
+
+	case "$1" in
+	startup-notification)
+		# "Does realloc(NULL, n) behave as malloc(n)?"  Answered by
+		# RUNNING a test program, which a cross build cannot do, and
+		# with no cached fallback -- so configure stops rather than
+		# guessing.
+		#
+		# It does: realloc() in this libc opens with
+		# `if (!oldmem) return malloc(bytes);`, which is what C89
+		# required and every standard since has repeated.
+		echo "$common lf_cv_sane_realloc=yes"
+		;;
+	*) echo "$common" ;;
+	esac
+}
+
 # Per-package meson options, the counterpart of pkg_opts() above.
 meson_opts() {
 	case "$1" in
@@ -282,6 +440,102 @@ meson_opts() {
 	libpciaccess) echo "-Dzlib=disabled" ;;
 	xkeyboard-config) echo "-Dcompat-rules=true -Dxorg-rules-symlinks=true" ;;
 	libdrm) echo "-Dtests=false -Dcairo-tests=disabled -Dman-pages=disabled" ;;
+
+	# ---- the GTK3 stack ------------------------------------------------
+	#
+	# Two themes run through all of these.  Tests and benchmarks are off
+	# everywhere: they are built for the TARGET and so cannot be run here,
+	# and they reach for interfaces the libraries themselves do not (it was
+	# HarfBuzz's GPU test, not HarfBuzz, that first wanted std::nan).
+	# Introspection and documentation are off for the same reason
+	# throughout the X port -- both need a toolchain whose output nothing
+	# on the image consumes.
+	glib)
+		echo "-Dlibmount=disabled -Dselinux=disabled -Dxattr=false \
+		      -Dintrospection=disabled -Ddtrace=false -Dsystemtap=false \
+		      -Dsysprof=disabled -Dtests=false -Dinstalled_tests=false \
+		      -Dman-pages=disabled -Dglib_debug=disabled -Dnls=enabled"
+		;;
+	fribidi) echo "-Ddocs=false -Dbin=false -Dtests=false" ;;
+	harfbuzz)
+		# cairo is disabled deliberately: HarfBuzz uses it only for its
+		# own view/trace utilities, and enabling it would make HarfBuzz
+		# and Cairo mutually dependent -- Cairo wants HarfBuzz for
+		# cairo-ft.  The utilities go with it, which is no loss; nothing
+		# on the image runs hb-view.
+		echo "-Dglib=enabled -Dgobject=enabled -Dfreetype=enabled \
+		      -Dcairo=disabled -Dicu=disabled -Dchafa=disabled \
+		      -Dtests=disabled -Ddocs=disabled -Dbenchmark=disabled \
+		      -Dutilities=disabled -Dintrospection=disabled"
+		;;
+	cairo)
+		# symbol-lookup wants libbfd, which is a build-host debugging
+		# convenience; tee and the platform backends are for systems
+		# this is not.
+		echo "-Dxlib=enabled -Dxcb=enabled -Dfreetype=enabled \
+		      -Dfontconfig=enabled -Dpng=enabled -Dzlib=enabled \
+		      -Dglib=enabled -Dtests=disabled -Dgtk_doc=false \
+		      -Dspectre=disabled -Dsymbol-lookup=disabled \
+		      -Dquartz=disabled -Dtee=disabled -Dxlib-xcb=disabled"
+		;;
+	pango)
+		echo "-Dintrospection=disabled -Dgtk_doc=false \
+		      -Dbuild-testsuite=false -Dcairo=enabled \
+		      -Dfreetype=enabled -Dfontconfig=enabled \
+		      -Dlibthai=disabled -Dsysprof=disabled"
+		;;
+	gdk-pixbuf)
+		# builtin_loaders=all is the important one: it compiles the
+		# image loaders INTO the library, so no loaders.cache has to be
+		# produced by running a target binary -- neither at build time,
+		# where it could not run, nor on first boot, where it would need
+		# a writable cache directory and a program to write it.
+		#
+		# legacy_xpm and others BOTH default to disabled, and a mail
+		# client built around XPM icons needs both.  Claws Mail compiles
+		# its icon set in as XPM data arrays and builds every one of
+		# them through gdk_pixbuf_new_from_xpm_data(), which is served
+		# by the `legacy-xpm' loader and nothing else -- without it the
+		# program starts with no icons at all, several hundred
+		# "Image type \"legacy-xpm\" is not supported" warnings, and a
+		# NULL pixbuf handed to every GTK call that expected one.
+		# `others' covers the loaders for .xpm and .xbm FILES (and pnm,
+		# tga, icns, qtif), which are what a theme or a user-supplied
+		# icon arrives as.
+		echo "-Dbuiltin_loaders=all -Dpng=enabled -Djpeg=enabled \
+		      -Dtiff=enabled -Dlegacy_xpm=enabled -Dothers=enabled \
+		      -Dintrospection=disabled -Dman=false \
+		      -Dtests=false -Dinstalled_tests=false \
+		      -Dgio_sniffing=false -Ddocumentation=false"
+		;;
+	atk) echo "-Dintrospection=false -Ddocs=false" ;;
+	libepoxy)
+		# GLX stays ON even though there is no OpenGL on this system.
+		#
+		# It is tempting to switch it off, and wrong: -Dglx=no omits
+		# epoxy/glx.h and the GLX entry points altogether, and GTK's X11
+		# backend includes that header unconditionally
+		# (gdkglcontext-x11.h) -- so GTK then does not compile at all.
+		#
+		# Leaving it on costs nothing at runtime.  Epoxy is a DISPATCH
+		# library: it resolves GL entry points lazily through dlopen, so
+		# a build with GLX support does not require libGL to exist.
+		# Where there is none, epoxy_has_glx() answers no, GDK reports
+		# that it cannot create a GL context, and GTK draws through
+		# cairo -- which is what happens here.
+		#
+		# EGL stays off: it is what the Wayland backend uses, and that
+		# backend is not built.
+		echo "-Dglx=yes -Degl=no -Dx11=true -Dtests=false -Ddocs=false"
+		;;
+	gtk)
+		echo "-Dx11_backend=true -Dwayland_backend=false \
+		      -Dbroadway_backend=false -Dprint_backends=file \
+		      -Dintrospection=false -Dgtk_doc=false -Dman=true \
+		      -Ddemos=false -Dexamples=false -Dtests=false \
+		      -Dinstalled_tests=false -Dcolord=no \
+		      -Dcloudproviders=false -Dprofiler=false -Dtracker3=false"
+		;;
 	*) echo "" ;;
 	esac
 }
@@ -336,6 +590,28 @@ make_dirs() {
 	# include/ has the public header, src/ the library; only sxpm (the
 	# viewer demo) is skipped.
 	libXpm) echo "-C include -C src" ;;
+	# libtasn1: the library, not the tools and not the tests.
+	#
+	# `SUBDIRS += fuzz tests' is unconditional -- there is no configure flag
+	# for it -- and tests/ generates its fixtures by RUNNING asn1Parser,
+	# which has just been cross-compiled.  It fails as "cannot execute:
+	# required file not found", which names the program rather than the
+	# reason: what is missing is this system's dynamic loader, on the build
+	# host, where it was never going to be.
+	#
+	# lib/ alone is what GnuTLS links, and it installs libtasn1.pc with it.
+	# src/ is the three command-line ASN.1 tools, which nothing here runs.
+	libtasn1) echo "-C lib" ;;
+	# gettext: libintl and nothing else.
+	#
+	# The tarball is four projects.  gettext-runtime holds libintl -- the
+	# library every package above links for its translations, and the only
+	# part of this that belongs on the target.  gettext-tools (msgfmt,
+	# msgmerge, xgettext) are BUILD-host programs: they turn .po files into
+	# .mo at build time, the build host already has them, and a copy
+	# compiled for the target could not be run by the thing that needs it.
+	# libtextstyle exists only to make those tools' output colourful.
+	gettext) echo "-C gettext-runtime" ;;
 	# Motif: the library and its headers, not the development toolchain.
 	#
 	# lib/ is libXm and libMrm, include/ the public headers -- that is
@@ -358,8 +634,32 @@ make_dirs() {
 }
 
 # Build and install, either the whole tree or just the named subdirectories.
+# Anything that has to exist in the sysroot BEFORE a package installs into it.
+#
+# The counterpart of post_install(), and needed for the same kind of reason: a
+# package's own install rules can assume a directory that only exists because
+# something was installed there, and with a feature switched off nothing is.
+pre_install() {
+	case "$1" in
+	enchant)
+		# providers/Makefile ends its install with
+		# `cd $(pkglibdir) && rm -f *.a', tidying away static copies of
+		# the spell-checking backends.  Creating the directory first
+		# keeps that cd from failing after the library itself has been
+		# installed correctly -- it used to fail outright, when no
+		# backend was built and nothing ever created the directory.
+		#
+		# It is also where Enchant looks for provider modules at run
+		# time, so it has to exist either way.
+		mkdir -p "$SYSROOT/usr/lib/enchant-2" || return 1
+		;;
+	esac
+	return 0
+}
+
 build_subdirs() {
 	dirs=$(make_dirs "$1" | sed 's/-C //g')
+	pre_install "$1" || return 1
 	if [ -z "$dirs" ]; then
 		make -j"$(nproc)" && make install DESTDIR="$SYSROOT"
 		return $?
@@ -440,9 +740,140 @@ is_meson() {
 	[ -f "$2/meson.build" ] && [ ! -f "$2/configure" ] && [ ! -f "$2/autogen.sh" ]
 }
 
+# ...with one exception, by name: a package that ships BOTH and whose meson
+# build is the one upstream maintains.  is_meson() answers "autotools" for all
+# of these, because a generated `configure` is present and it cannot know that
+# the autotools side is the deprecated one.  GTK's in particular is a stub that
+# no longer builds several of its own subdirectories.
+prefers_meson() {
+	case "$1" in
+	gtk | harfbuzz | fribidi) return 0 ;;
+	esac
+	return 1
+}
+
 is_cmake() {
 	[ -f "$2/CMakeLists.txt" ] && [ ! -f "$2/meson.build" ] &&
 		[ ! -f "$2/configure" ] && [ ! -f "$2/autogen.sh" ]
+}
+
+# Packages whose build produces programs that packages ABOVE them have to RUN.
+#
+# Same problem nsgenbind has (see the netsurf arm below), one level worse: a
+# cross-built generator is a target binary and cannot execute here.  GLib is the
+# acute case -- glib-compile-resources, glib-genmarshal, glib-mkenums,
+# glib-compile-schemas and gdbus-codegen generate source for nearly everything
+# above it, and GTK's build alone invokes the first of those hundreds of times.
+#
+# So GLib is built TWICE from one tree: natively into $HOSTTOOLS for the
+# generators, then cross for the library.  Both from the same tarball, which is
+# what keeps the generator and the library in step -- the build host's own GLib
+# is a different version, and on this machine is not installed at all.
+#
+# One manifest line and one stamp: the two builds are two halves of porting
+# GLib, not two packages, and nothing else can use half of it.
+needs_host_build() {
+	case "$1" in
+	glib) return 0 ;;
+	esac
+	return 1
+}
+
+# Packages that build nothing at all: a tarball of finished files, where
+# "installing" means copying the ones that are wanted into the sysroot.
+#
+# By name, because there is nothing to detect: an absent configure script means
+# a data package here and a git export needing autoreconf three lines below.
+is_dataonly() {
+	case "$1" in
+	dejavu-fonts-ttf) return 0 ;;
+	hunspell-en_US) return 0 ;;
+	esac
+	return 1
+}
+
+# What such a package contributes.  Run with the source tree as the working
+# directory; $SYSROOT is where it goes.
+install_data() {
+	case "$1" in
+	dejavu-fonts-ttf)
+		# Twelve faces of the twenty-two shipped: the regular, bold,
+		# oblique and bold-oblique of each of the three families a user
+		# interface asks for by generic name -- sans-serif, monospace
+		# and serif.
+		#
+		# The rest are left out deliberately.  Condensed and ExtraLight
+		# are design variants nothing here selects, and MathTeXGyre is
+		# for typesetting mathematics; carrying all of them would put
+		# 9.8MB on the image to make 4MB of difference to what can be
+		# displayed.
+		mkdir -p "$SYSROOT/usr/share/fonts/truetype/dejavu" || return 1
+		for face in DejaVuSans DejaVuSansMono DejaVuSerif; do
+			for style in "" -Bold -Oblique -BoldOblique; do
+				f="ttf/$face$style.ttf"
+				[ -f "$f" ] || continue
+				cp -f "$f" \
+					"$SYSROOT/usr/share/fonts/truetype/dejavu/" ||
+					return 1
+			done
+		done
+		;;
+	hunspell-en_US)
+		# /usr/share/hunspell is not a choice: Enchant's hunspell
+		# provider builds its search list from g_get_system_data_dirs()
+		# with the provider's own name appended, so it looks in
+		# <datadir>/hunspell and nowhere else.  A dictionary installed
+		# anywhere more imaginative is a dictionary hunspell never finds.
+		#
+		# The pair is what a dictionary IS: the .dic holds the words and
+		# the .aff the affix rules that generate the rest of the forms
+		# from them.  Either one alone is useless.
+		mkdir -p "$SYSROOT/usr/share/hunspell" || return 1
+		for f in en_US.aff en_US.dic; do
+			[ -f "$f" ] || {
+				echo "install_data: $f missing" >&2
+				return 1
+			}
+			cp -f "$f" "$SYSROOT/usr/share/hunspell/" || return 1
+		done
+
+		# The matching rules that come with the fonts: the 57-* files
+		# make DejaVu what the generic family names resolve to, which is
+		# what a toolkit asking for "Sans" ends up with, and the 20-*
+		# ones turn hinting off at the sizes where it hurts.
+		#
+		# Into conf.d rather than conf.avail: that split exists so a
+		# package manager can enable a rule by symlinking it, and there
+		# is no package manager here -- a rule in conf.avail alone would
+		# simply never take effect.
+		mkdir -p "$SYSROOT/etc/fonts/conf.d" || return 1
+		for c in fontconfig/*.conf; do
+			[ -f "$c" ] || continue
+			cp -f "$c" "$SYSROOT/etc/fonts/conf.d/" || return 1
+		done
+		;;
+	esac
+	return 0
+}
+
+# Packages whose tree must NOT be distcleaned between builds, because their
+# sources are generated and the generator is not installed here.
+#
+# Enchant is written in Vala.  Its tarball ships both the .vala originals and
+# the .c files valac produced from them, exactly so that building it does not
+# require valac -- and `make distclean' deletes the .c files, because upstream
+# assumes anyone running it has the compiler to regenerate them.  The result is
+# a tree that built once and cannot build again: "cc1: fatal error: ./pwl.c: No
+# such file or directory", naming a file that was there an hour ago.
+#
+# (This also corrects an assumption in the port's plan, which had Enchant down
+# as a C++ package needing the STL.  It is C++ only in the sense that valac
+# emits C; nothing in it uses the standard C++ library.)
+keeps_generated_sources() {
+	case "$1" in
+	enchant) return 0 ;;
+	esac
+	return 1
 }
 
 # Packages with no configure at all: a hand-written Makefile per platform, built
@@ -647,6 +1078,93 @@ build_one() {
 					post_install "$name"
 			fi
 		) >"$log" 2>&1
+	elif [ "$name" = gcc ]; then
+		# Not GCC: only libstdc++-v3 out of its tree, which is an
+		# autotools project of its own and configures standalone.
+		#
+		# The compiler stays the build host's.  What is needed here is
+		# the LIBRARY built for this system -- against this libc, with
+		# this libc's headers -- and the host g++ produces that
+		# perfectly well through the wrappers.  Building a whole cross
+		# GCC would produce a second compiler that generates the same
+		# code as the one already installed.
+		#
+		# --enable-clocale=generic matters more than it looks.  The
+		# glibc locale model wants the entire *_l family (strtod_l,
+		# isalpha_l, per-category newlocale ...), which this libc does
+		# not have; `generic' uses the C locale only and drops the
+		# dependency.  The counterpart for the ctype table is a patch to
+		# configure.host, since that choice has no configure flag.
+		#
+		# The host triple names this system in the VENDOR field --
+		# x86_64-likeos-gnu -- for two reasons.  It differs from the
+		# build triple, so configure treats this as a cross build and
+		# never tries to run a test program; and libstdc++'s
+		# crossconfig.m4 has no arm for an unknown system, so the OS
+		# field has to be one it recognises.
+		(
+			cd "$dir" || exit 1
+			rm -rf .likeos-build
+			mkdir -p .likeos-build
+			cd .likeos-build || exit 1
+
+			cfg="../libstdc++-v3/configure"
+			args="--host=x86_64-likeos-gnu
+			      --build=$(../config.guess)
+			      --prefix=/usr
+			      --disable-multilib --disable-nls
+			      --disable-libstdcxx-pch
+			      --enable-clocale=generic"
+
+			# Configure runs TWICE, and the second run is not
+			# belt-and-braces.
+			#
+			# The gthreads probe compiles a program that includes
+			# gthr-default.h -- the threading layer, generated from
+			# libgcc/gthr-posix.h by config.status at the END of a
+			# configure run.  On a first run it does not exist yet,
+			# the probe fails to compile, and libstdc++ concludes the
+			# system has no threads: no std::mutex, no std::thread,
+			# and tzdb.cc then fails to build because it uses them.
+			#
+			# In a full GCC build the top level supplies that header
+			# from the libgcc build directory, which is configured
+			# first.  Standalone there is nothing to supply it, so
+			# the first run generates it and the second is told where
+			# it is.  Both levels are needed: bits/ so the probe's
+			# own #include "gthr.h" finds the generated one, and its
+			# parent so that file's #include <bits/gthr-default.h>
+			# resolves.
+			CC="$here/toolchain/likeos-cc" \
+			CXX="$here/toolchain/likeos-c++" \
+			AR=ar RANLIB=ranlib \
+				$cfg $args >/dev/null || exit 1
+
+			g="$PWD/include/x86_64-likeos-gnu"
+			[ -f "$g/bits/gthr-default.h" ] || {
+				echo "no gthr-default.h after configure" >&2
+				exit 1
+			}
+			CC="$here/toolchain/likeos-cc" \
+			CXX="$here/toolchain/likeos-c++" \
+			AR=ar RANLIB=ranlib \
+			CXXFLAGS="-O2 -I$g/bits -I$g" \
+				$cfg $args || exit 1
+
+			grep -q '^#define _GLIBCXX_HAS_GTHREADS' config.h || {
+				echo "gthreads still off; std::mutex would be missing" >&2
+				exit 1
+			}
+
+			make -j"$(nproc)" &&
+				make install DESTDIR="$SYSROOT" &&
+				post_install "$name"
+		) >"$log" 2>&1
+	elif is_dataonly "$name"; then
+		(
+			cd "$dir" || exit 1
+			install_data "$name" && post_install "$name"
+		) >"$log" 2>&1
 	elif is_plainmake "$name"; then
 		(
 			cd "$dir" || exit 1
@@ -661,17 +1179,38 @@ build_one() {
 				make install DESTDIR="$SYSROOT" PREFIX=/usr &&
 				post_install "$name"
 		) >"$log" 2>&1
-	elif is_meson "$name" "$dir"; then
+	elif prefers_meson "$name" || is_meson "$name" "$dir"; then
 		(
 			cd "$dir" || exit 1
+
+			# The native half first, for packages whose generators
+			# the rest of the stack runs.  Its prefix is $HOSTTOOLS,
+			# NOT the sysroot: what comes out is built for this
+			# machine and must never be a candidate for the image.
+			if needs_host_build "$name"; then
+				rm -rf .likeos-host
+				# Same PATH as the cross half below: it is
+				# what finds the port's own meson, which on a
+				# distribution that refuses a system-wide pip
+				# install is the only one new enough.
+				PATH="$HOSTTOOLS/bin:$PATH" \
+					meson setup .likeos-host \
+					--prefix="$HOSTTOOLS" \
+					--libdir="$HOSTTOOLS/lib" \
+					$(meson_host_opts "$name") &&
+					PATH="$HOSTTOOLS/bin:$PATH" \
+						meson install -C .likeos-host ||
+					exit 1
+			fi
+
 			rm -rf .likeos-build
-			PATH="$here/toolchain:$PATH" \
+			PATH="$here/toolchain:$HOSTTOOLS/bin:$PATH" \
 				meson setup .likeos-build \
 				--cross-file "$here/toolchain/likeos-cross.ini" \
 				--prefix=/usr --libdir=/usr/lib \
 				-Ddefault_library=shared \
 				$(meson_opts "$name") &&
-				DESTDIR="$SYSROOT" PATH="$here/toolchain:$PATH" \
+				DESTDIR="$SYSROOT" PATH="$here/toolchain:$HOSTTOOLS/bin:$PATH" \
 					meson install -C .likeos-build &&
 					post_install "$name"
 		) >"$log" 2>&1
@@ -706,8 +1245,19 @@ build_one() {
 			#
 			# Reconfiguring is cheap; finding that class of bug is
 			# not.
-			[ -f Makefile ] && make distclean >/dev/null 2>&1
-			"$here/toolchain/likeos-autogen.sh" $(pkg_opts "$name") &&
+			#
+			# ...except where distclean removes SOURCE.  A package
+			# whose sources are generated from something else ships
+			# the generated copies in its release tarball so the
+			# generator is not a build dependency -- and its
+			# distclean deletes them, on the assumption that
+			# whoever runs it can make them again.  Here nobody
+			# can.  See keeps_generated_sources().
+			if ! keeps_generated_sources "$name"; then
+				[ -f Makefile ] && make distclean >/dev/null 2>&1
+			fi
+			env $(pkg_env "$name") \
+				"$here/toolchain/likeos-autogen.sh" $(pkg_opts "$name") &&
 				host_tools "$name" &&
 				build_subdirs "$name" &&
 				post_install "$name"
@@ -761,10 +1311,10 @@ while read -r section name version deb repo rest; do
 	# that looks like a version (starts with a digit), which is what rules
 	# out the sibling packages, and sorts so the pick is the same
 	# everywhere.
-	if [ -d "$here/$name-$version" ]; then
-		dir="$here/$name-$version"
+	if [ -d "$port/$name-$version" ]; then
+		dir="$port/$name-$version"
 	else
-		dir=$(find "$here" -maxdepth 1 -type d -name "$name-[0-9]*" |
+		dir=$(find "$port" -maxdepth 1 -type d -name "$name-[0-9]*" |
 			sort -V | tail -1)
 	fi
 	if [ -z "$dir" ]; then

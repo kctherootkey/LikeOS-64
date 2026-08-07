@@ -1,6 +1,10 @@
 #ifndef _SYS_STAT_H
 #define _SYS_STAT_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <sys/types.h>
 #include <time.h>
 
@@ -70,5 +74,9 @@ int fchmod(int fd, mode_t mode);
 mode_t umask(mode_t mask);
 int mknod(const char* path, mode_t mode, dev_t dev);
 int mkfifo(const char* path, mode_t mode);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

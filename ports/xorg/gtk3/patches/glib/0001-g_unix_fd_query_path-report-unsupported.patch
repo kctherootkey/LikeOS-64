@@ -1,0 +1,27 @@
+--- a/glib/glib-unix.c
++++ b/glib/glib-unix.c
+@@ -1006,6 +1006,24 @@
+   g_set_error (error, G_FILE_ERROR, G_FILE_ERROR_NOSYS,
+                "g_unix_fd_query_path() not supported on HURD");
+   return NULL;
++#elif defined (__LIKEOS__)
++  /*
++   * LikeOS is in the same position as Hurd above: /dev/fd/%u exists and opens
++   * the same descriptor, but it cannot be read back as a name.  A descriptor
++   * there does not carry the path it was opened under -- the kernel stores no
++   * such string -- so /dev/fd/N reports what the object IS ("file:[inode]",
++   * "socket:[n]", "pipe:[n]") rather than where it was found, exactly as
++   * /proc/self/fd does for a socket or a pipe on other systems.
++   *
++   * Reporting that honestly is better than the alternatives.  Answering with
++   * the "file:[inode]" text would hand back a string that looks like a path
++   * and is not one, and every caller would then fail somewhere further away
++   * than here.
++   */
++  g_set_error (error, G_FILE_ERROR, G_FILE_ERROR_NOSYS,
++               "g_unix_fd_query_path() not supported on LikeOS: a file "
++               "descriptor does not carry the path it was opened under");
++  return NULL;
+ #else
+   #error "g_unix_fd_query_path() not supported on this platform"
+ #endif

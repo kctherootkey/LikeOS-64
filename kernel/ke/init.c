@@ -271,7 +271,7 @@ __no_stack_protector void continue_system_startup(void)
 	// and routing are ready for the very first user command.
 	{
 		uint64_t dhcp_deadline =
-			timer_ticks() + 500; // 5 seconds at 100 Hz
+			timer_ticks() + timer_s_to_ticks(5);
 		while (!dhcp_configured() && timer_ticks() < dhcp_deadline) {
 			__asm__ volatile("hlt"); // sleep until next interrupt
 		}

@@ -19,7 +19,10 @@
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
-list="$here/packages.list"
+# Which package set to unpack; see the comment in build.sh.  Tarballs, source
+# trees and patches all live beside the manifest that names them.
+port=$(cd "${LIKEOS_PORT_DIR:-$here}" && pwd)
+list="$port/packages.list"
 
 want=$*
 done_n=0
@@ -36,8 +39,8 @@ while read -r section name version deb repo rest; do
 	# often supplies an older release, and the tree should still be
 	# unpacked and built.  fetch.sh reports which version it took.
 	tarball=""
-	for cand in "$here/$name-"*.tar.xz "$here/$name-"*.tar.gz \
-		"$here/$name-"*.tar.bz2; do
+	for cand in "$port/$name-"*.tar.xz "$port/$name-"*.tar.gz \
+		"$port/$name-"*.tar.bz2 "$port/$name-"*.zip; do
 		[ -f "$cand" ] || continue
 		tarball="$cand"
 		break
@@ -51,23 +54,48 @@ while read -r section name version deb repo rest; do
 	# Recover the version from the filename so the directory matches the
 	# tarball rather than the pin.
 	base=$(basename "$tarball")
-	have_ver=$(printf '%s' "$base" | sed "s/^$name-//; s/\.tar\..*$//")
-	dest="$here/$name-$have_ver"
+	have_ver=$(printf '%s' "$base" |
+		sed "s/^$name-//; s/\.tar\..*$//; s/\.zip$//")
+	dest="$port/$name-$have_ver"
 	if [ -d "$dest" ]; then
 		echo "  have $name-$have_ver/"
 		done_n=$((done_n + 1))
 		continue
 	fi
 
-	tmp="$here/.unpack.$$"
+	tmp="$port/.unpack.$$"
 	rm -rf "$tmp"
 	mkdir -p "$tmp"
-	if ! tar xf "$tarball" -C "$tmp" 2>/dev/null; then
-		echo "  FAIL $name-$have_ver (cannot unpack $base)" >&2
-		rm -rf "$tmp"
-		fail_n=$((fail_n + 1))
-		continue
-	fi
+	case "$base" in
+	*.zip)
+		# A zip, for the one upstream that publishes nothing else: the
+		# SCOWL hunspell dictionaries.  Its members sit at the archive
+		# root rather than under a directory, so the directory that every
+		# other source arrives with is created here and the members are
+		# extracted straight into it.
+		if ! command -v unzip >/dev/null 2>&1; then
+			echo "  FAIL $name-$have_ver (unzip missing; run make deps)" >&2
+			rm -rf "$tmp"
+			fail_n=$((fail_n + 1))
+			continue
+		fi
+		mkdir -p "$tmp/$name-$have_ver"
+		if ! unzip -q "$tarball" -d "$tmp/$name-$have_ver" 2>/dev/null; then
+			echo "  FAIL $name-$have_ver (cannot unpack $base)" >&2
+			rm -rf "$tmp"
+			fail_n=$((fail_n + 1))
+			continue
+		fi
+		;;
+	*)
+		if ! tar xf "$tarball" -C "$tmp" 2>/dev/null; then
+			echo "  FAIL $name-$have_ver (cannot unpack $base)" >&2
+			rm -rf "$tmp"
+			fail_n=$((fail_n + 1))
+			continue
+		fi
+		;;
+	esac
 
 	# Exactly one top-level directory is expected; take it whatever it is
 	# called, which is what absorbs the GitLab naming difference.
@@ -85,9 +113,9 @@ while read -r section name version deb repo rest; do
 	# here, never edited into the tree by hand.  The tarball stays pristine
 	# and every deviation from upstream is one reviewable file that survives
 	# a re-unpack -- an in-place edit would be silently lost by the next one.
-	if [ -d "$here/patches/$name" ]; then
+	if [ -d "$port/patches/$name" ]; then
 		patched_ac=0
-		for p in "$here/patches/$name"/*.patch; do
+		for p in "$port/patches/$name"/*.patch; do
 			[ -f "$p" ] || continue
 			if ! (cd "$dest" && patch -p1 --forward --silent <"$p"); then
 				echo "  FAIL $name-$have_ver (patch $(basename "$p"))" >&2

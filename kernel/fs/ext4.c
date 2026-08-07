@@ -581,10 +581,11 @@ static int ext4_txn_lookup(ext4_fs_t *fs, unsigned long pbn, void *buf)
  * still holds pre-epoch content, so reads must come from here; (2) the source
  * for the eventual checkpoint writeback.  Bounded by EXT4_CKPT_MAX_BLOCKS.
  *
- * Revoke records are NOT needed: the only journalled blocks our driver ever
- * frees are directory blocks (rmdir); freeing any block that still has a journal
- * copy sets s_force_ckpt, which checkpoints + empties the log right after the op,
- * so no stale journal copy of a freed/reused block can ever be replayed.
+ * Revoke records are NOT needed, and no checkpoint is forced either: freeing a
+ * block drops its journal copy from s_txn / s_ckpt (ext4_drop_journal_copy).
+ * Both live only in memory until ext4_journal_flush writes the batch, so a copy
+ * that is forgotten was never on disk and can never be replayed over the
+ * block's next use -- the same guarantee a revoke gives, without the I/O.
  * Serialized entirely by ext4_io_lock, like s_txn.
  * =================================================================== */
 #define EXT4_CKPT_MAX_BLOCKS 256 /* pending unique-block cap (memory)  */
@@ -608,7 +609,6 @@ static struct {
 static unsigned long s_jhead; /* next free journal log block        */
 static int s_epoch_open; /* committed, un-checkpointed txns?    */
 static uint32_t s_epoch_seq; /* sequence of the epoch's first txn   */
-static int s_force_ckpt; /* a journalled block was freed        */
 static void ext4_checkpoint(ext4_fs_t *fs);
 
 /* Merge one block into the epoch pending set (latest content wins). */
@@ -673,18 +673,53 @@ static int ext4_ckpt_lookup(ext4_fs_t *fs, unsigned long pbn, void *buf)
 	return 0;
 }
 
-/* Does `pbn` still have an outstanding journal copy (current op or epoch)?  If
- * so, freeing it requires a checkpoint before the block can be reused, else a
- * crash could replay the stale copy over the block's new use. */
-static int ext4_blk_journalled(unsigned long pbn)
+/*
+ * Drop any in-memory journal copy of a block that is being FREED.
+ *
+ * This is what a jbd2 revoke record is for, obtained here for nothing: both
+ * s_txn (the running transaction) and s_ckpt (the committed-but-not-yet-
+ * checkpointed batch) live only in memory -- ext4_journal_flush() writes the
+ * batch to the log, checkpoints it to its final locations, empties the log and
+ * resets s_ckpt.n to 0 in one go.  So a copy sitting in either of them has
+ * never reached the disk, and simply forgetting it means there is nothing that
+ * could ever be replayed over the block's next use.
+ *
+ * What this replaces: setting a force-checkpoint flag, which made the very next
+ * commit do a full durable journal flush -- log write, checkpoint, two device
+ * syncs -- on the spot.  Deleting a file typically frees blocks written moments
+ * earlier and therefore still in the batch, so EVERY unlink forced one.  Claws
+ * Mail removes its cache and temporary files as it exits, which is why exiting
+ * took five to seven seconds of USB round trips.
+ *
+ * The data buffers are owned by the arrays and reused across flushes (see
+ * ext4_ckpt_merge: a slot allocates only if its pointer is NULL), so removal
+ * swaps the entry with the last one and keeps BOTH buffers -- overwriting the
+ * pointer would leak a block-sized allocation per freed block.
+ */
+static void ext4_drop_journal_copy(unsigned long pbn)
 {
-	for (unsigned i = 0; i < s_txn.n; i++)
-		if (s_txn.blk[i] == pbn)
-			return 1;
-	for (unsigned i = 0; i < s_ckpt.n; i++)
-		if (s_ckpt.blk[i] == pbn)
-			return 1;
-	return 0;
+	for (unsigned i = 0; i < s_txn.n; i++) {
+		if (s_txn.blk[i] != pbn)
+			continue;
+		uint8_t *keep = s_txn.data[i];
+
+		s_txn.blk[i] = s_txn.blk[s_txn.n - 1];
+		s_txn.data[i] = s_txn.data[s_txn.n - 1];
+		s_txn.data[s_txn.n - 1] = keep;
+		s_txn.n--;
+		break;
+	}
+	for (unsigned i = 0; i < s_ckpt.n; i++) {
+		if (s_ckpt.blk[i] != pbn)
+			continue;
+		uint8_t *keep = s_ckpt.data[i];
+
+		s_ckpt.blk[i] = s_ckpt.blk[s_ckpt.n - 1];
+		s_ckpt.data[i] = s_ckpt.data[s_ckpt.n - 1];
+		s_ckpt.data[s_ckpt.n - 1] = keep;
+		s_ckpt.n--;
+		break;
+	}
 }
 
 /* ===================================================================
@@ -1014,7 +1049,6 @@ int ext4_io_release_if_owner(uint64_t task_id)
 		 * and stays — it is checkpointed/replayed normally. */
 		s_txn.active = 0;
 		s_txn.n = 0;
-		s_force_ckpt = 0;
 		ext4_io_locked = 0;
 		ext4_io_owner = (uint64_t)-1;
 		ext4_io_depth = 0;
@@ -3043,6 +3077,26 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino,
 			fs->sb_copy.s_free_inodes_count--;
 			ext4_gd_dirty(fs, g);
 			ext4_bg_unlock(g);
+			/* This number almost certainly belonged to a file that
+			 * has since been deleted.  Both caches are keyed by
+			 * inode number, so whatever is still held under it
+			 * describes the DEAD file: the new file would then be
+			 * read back as the old one's bytes, at the new file's
+			 * own (correctly stat'd) length — the right size, the
+			 * wrong contents, and no error anywhere.
+			 *
+			 * Conventional practice attaches the cache to the
+			 * in-core inode, which is torn down with the file, so
+			 * a recycled number starts empty by construction.
+			 * Keyed by number, the equivalent has to be explicit,
+			 * and it belongs HERE rather than only at the points
+			 * where an inode is freed: a file unlinked while still
+			 * open has its pages faulted straight back in by its
+			 * last reader, after the unlink invalidated them.
+			 * Allocation is the one point every new file passes
+			 * through, whatever became of the previous owner. */
+			icache_remove(EXT4_BID_ENC(ino, 0));
+			pagecache_invalidate_file(EXT4_BID_ENC(ino, 0));
 			kfree(bm);
 			return ino;
 		}
@@ -3129,13 +3183,13 @@ static void ext4_free_blocks_run(ext4_fs_t *fs, unsigned long start,
 				  i; /* blocks of the run in group */
 		if (n > len)
 			n = len;
-		/* Any block still holding a journal copy must be checkpointed before reuse
-         * (see the s_ckpt comment) — this is why no jbd2 revoke records are needed. */
+		/* A freed block's journal copy must never be replayed over its
+		 * next use.  Both copies are in memory only, so forget them --
+		 * see ext4_drop_journal_copy().  This used to force a full
+		 * durable checkpoint instead, which made every unlink of a
+		 * recently-written file wait on the device. */
 		for (unsigned long k = 0; k < n; k++)
-			if (ext4_blk_journalled(start + k)) {
-				s_force_ckpt = 1;
-				break;
-			}
+			ext4_drop_journal_copy(start + k);
 		if (!bm) {
 			bm = (uint8_t *)kalloc(fs->block_size);
 			if (!bm)
@@ -8090,8 +8144,8 @@ static void ext4_checkpoint(ext4_fs_t *fs)
  * with ONE device sync, then recorded in the in-memory epoch pending set
  * (s_ckpt) — it is NOT checkpointed to its final location yet.  Steady-state
  * cost is therefore one sync per op; the 2-sync checkpoint (ext4_checkpoint) is
- * amortised over a whole epoch and runs only when the log/pending set fills, an
- * op frees a still-journalled block (s_force_ckpt), or on fsync/sync.
+ * amortised over a whole epoch and runs only when the log/pending set fills, the
+ * batch fills, or on fsync/sync.
  *
  * Crash safety: recovery reads s_start (the epoch start, == j_first, made
  * durable by the epoch's first commit sync) and replays every committed txn in
@@ -8103,9 +8157,10 @@ static void ext4_checkpoint(ext4_fs_t *fs)
  * never letting an epoch wrap (we checkpoint before the head reaches j_maxlen)
  * mean a stale older epoch left in the log can never extend the new chain.
  * Data blocks are written in place during the op and flushed by the commit sync
- * ("ordered").  No jbd2 revoke records: the only journalled blocks we free are
- * directory blocks, and freeing any still-journalled block forces a checkpoint
- * (s_force_ckpt) that empties the log before the block can be reused.
+ * ("ordered").  No jbd2 revoke records are needed: a journal copy lives only in
+ * memory until this function writes it, so a block that is freed simply has its
+ * copy dropped from the in-memory batch (ext4_drop_journal_copy) and there is
+ * nothing left that could be replayed over the block's next use.
  * =================================================================== */
 /* Durably commit the whole in-memory batch (s_ckpt) as ONE journal transaction,
  * then checkpoint it to its final locations and empty the log.  Called lazily —
@@ -8313,10 +8368,8 @@ static void ext4_txn_flush(ext4_fs_t *fs)
 
 	/* Flush durably only when the batch is full, or this op freed a block that
      * still has a journal copy (it must be checkpointed before reuse). */
-	if (s_force_ckpt || s_ckpt.n >= EXT4_JOURNAL_BATCH) {
+	if (s_ckpt.n >= EXT4_JOURNAL_BATCH)
 		ext4_journal_flush(fs);
-		s_force_ckpt = 0;
-	}
 }
 
 /* Clean the journal: checkpoint any open epoch to its final locations, mark the
@@ -8631,7 +8684,6 @@ int ext4_mount(const block_device_t *bdev, ext4_fs_t *out)
 				s_jhead = out->j_first;
 				s_epoch_open = 0;
 				s_ckpt.n = 0;
-				s_force_ckpt = 0;
 				s_epoch_seq = 0;
 
 				/* Make the journal a well-formed csum-v3 journal on a

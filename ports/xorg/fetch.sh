@@ -31,8 +31,12 @@
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
-list="$here/packages.list"
-sums="$here/checksums.sha256"
+# Which package set to fetch; see the comment in build.sh.  Tarballs and the
+# checksum file live beside the manifest that names them, so a sub-port records
+# its own provenance rather than appending to the X.Org port's.
+port=$(cd "${LIKEOS_PORT_DIR:-$here}" && pwd)
+list="$port/packages.list"
+sums="$port/checksums.sha256"
 
 XORG_BASE="https://www.x.org/releases/individual"
 DEBIAN_BASE="https://deb.debian.org/debian/pool/main"
@@ -70,7 +74,7 @@ fetch_gitlab() {
 	fi
 	gproj=$(basename "$grepo")
 	gtag="$gname-$gver"
-	gfile="$here/$gname-$gver.tar.gz"
+	gfile="$port/$gname-$gver.tar.gz"
 
 	[ -f "$gfile" ] && { echo "  have $(basename "$gfile")"; return 0; }
 
@@ -107,8 +111,13 @@ fetch_one() {
 	http://* | https://*)
 		url=$(printf '%s' "$deb" | sed "s|%VERSION%|$version|g")
 		ext=$(printf '%s' "$url" | sed -n 's|.*\(\.tar\.[a-z]*\)$|\1|p')
+		# .zip as well, for the SCOWL dictionary: without this the
+		# archive is saved under a .tar.gz name it is not, and unpack.sh
+		# cannot tell what it is holding.
+		[ -n "$ext" ] ||
+			ext=$(printf '%s' "$url" | sed -n 's|.*\(\.zip\)$|\1|p')
 		[ -n "$ext" ] || ext=.tar.gz
-		file="$here/$name-$version$ext"
+		file="$port/$name-$version$ext"
 		[ -f "$file" ] && { echo "  have $(basename "$file")"; return 0; }
 		if curl -fsSL --connect-timeout 20 -o "$file.part" "$url"; then
 			mv "$file.part" "$file"
@@ -134,7 +143,7 @@ fetch_one() {
 	#
 	# unpack.sh takes the version from the tarball on disk for the same
 	# reason, so matching on the name here is consistent with it.
-	existing=$(ls "$here/$name"-*.tar.* 2>/dev/null | head -1)
+	existing=$(ls "$port/$name"-*.tar.* 2>/dev/null | head -1)
 	if [ -n "$existing" ]; then
 		echo "  have $(basename "$existing")"
 		return 0
@@ -148,7 +157,7 @@ fetch_one() {
 		ctwm) url=$(ctwm_url "$version") ;;
 		*) url="$XORG_BASE/$section/$name-$version.$ext" ;;
 		esac
-		file="$here/$(basename "$url")"
+		file="$port/$(basename "$url")"
 
 		if [ -f "$file" ]; then
 			echo "  have $(basename "$file")"
@@ -188,7 +197,7 @@ fetch_one() {
 		[ -z "$v" ] && continue
 		for ext in tar.xz tar.gz tar.bz2; do
 			url="$DEBIAN_BASE/$d/$deb/${deb}_${v}.orig.$ext"
-			file="$here/$name-$v.$ext"
+			file="$port/$name-$v.$ext"
 			[ -f "$file" ] && { echo "  have $(basename "$file")"; return 0; }
 			if curl -fsSL --connect-timeout 20 -o "$file.part" "$url"; then
 				mv "$file.part" "$file"
@@ -228,7 +237,7 @@ done <"$list"
 
 # Record what we have, so a later run verifies instead of re-downloading and a
 # substituted tarball is noticed.
-( cd "$here" && sha256sum *.tar.* 2>/dev/null | sort -k2 ) >"$sums.new"
+( cd "$port" && sha256sum *.tar.* 2>/dev/null | sort -k2 ) >"$sums.new"
 if [ -s "$sums.new" ]; then
 	mv "$sums.new" "$sums"
 	echo "checksums written to $(basename "$sums")"

@@ -1,6 +1,10 @@
 #ifndef _SYS_SOCKET_H
 #define _SYS_SOCKET_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 #include <stddef.h>
 
@@ -8,6 +12,23 @@
 #define SOCK_STREAM     1
 #define SOCK_DGRAM      2
 #define SOCK_RAW        3
+/* Reliable datagrams and sequenced packets are not implemented; socket(2)
+ * rejects them.  The names exist because software switches on a socket type it
+ * was given and needs every case to be nameable -- GLib's GSocket maps its
+ * enumeration onto these and does not compile without them. */
+#define SOCK_RDM        4
+#define SOCK_SEQPACKET  5
+
+/*
+ * The largest listen(2) backlog this system will honour.
+ *
+ * 16, which is what the kernel actually enforces -- see the clamps in
+ * tcp_listen() and unix_listen().  Not the 128 or 4096 other systems use:
+ * a program passing SOMAXCONN means "give me as much queue as you have", and
+ * the number should be that rather than an aspiration the kernel silently
+ * reduces.
+ */
+#define SOMAXCONN       16
 
 // Socket type flags
 #define SOCK_NONBLOCK   0x0800
@@ -152,5 +173,9 @@ int getsockopt(int sockfd, int level, int optname,
                void *optval, socklen_t *optlen);
 int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SYS_SOCKET_H */
