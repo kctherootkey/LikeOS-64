@@ -336,12 +336,25 @@ RES_PREREQS = res/Uni2-Terminus16.psf res/left_ptr res/nanorc \
 # build/, so the next image quietly shipped without the one program that
 # proves the C++ runtime works, and the staging script's existence check
 # turned that into silence rather than an error.
-GTK3_TESTCXX := $(shell test -f $(BUILD_DIR)/xorg-sysroot/usr/lib/libstdc++.so \
-	&& echo $(BUILD_DIR)/testcxx)
+# Sentinel for the GTK3 stack, on the same principle as the X server's below:
+# a file that exists only once the port has built, so the image depends on the
+# port having RUN rather than on a test of what happens to be lying around.
+#
+# This was a $(shell test -f .../libstdc++.so) assigned with `:=`, which make
+# evaluates while PARSING the makefile -- necessarily before anything is built.
+# After `make distclean` the sysroot is gone at that moment, so it expanded to
+# nothing and the image was left with no GTK3 prerequisite at all: the port
+# never ran, and gtk3/stage.sh, which is deliberately silent when there is
+# nothing to stage, produced an image with no Claws Mail and said nothing.  It
+# only appeared to work after `make clean`, which keeps the sysroot and so
+# leaves the parse-time test looking at the PREVIOUS build's output.
+GTK3_CLAWS = $(BUILD_DIR)/xorg-sysroot/usr/bin/claws-mail
+GTK3_TESTCXX = $(BUILD_DIR)/testcxx
 
 GPT_PREREQS = $(addprefix $(BUILD_DIR)/,$(ROOT_BIN_PROGS) $(ROOT_SBIN_PROGS) $(ROOT_LIBS) $(ROOT_USRLOCAL_BINS)) \
 	$(BUILD_DIR)/openssh/bin/ssh \
 	$(BUILD_DIR)/xorg-sysroot/usr/bin/Xorg \
+	$(GTK3_CLAWS) \
 	$(GTK3_TESTCXX) \
 	$(RES_PREREQS)
 
@@ -1381,10 +1394,11 @@ ports-gtk3: ports-xorg | $(BUILD_DIR)
 # libstdc++ in the port sysroot -- which is where the C++ runtime for this
 # system lives, and which does not exist until the GTK3 port has built it.
 #
-# Not a prerequisite of the image: the staging script stages it if it is there
-# and says nothing if it is not, so a tree without the GTK3 port still builds a
-# working image.  Build it with `make build/testcxx` after `make ports-gtk3`.
-$(BUILD_DIR)/testcxx: user/bin/tests/testcxx.cpp | $(BUILD_DIR)
+# Built as part of the image, and ordered AFTER the GTK3 sentinel rather than
+# merely needing the same port: the two are independent entries in the image's
+# prerequisite list, so under -j make is free to start this one first, and it
+# would then fail on a libstdc++ that was still being built.
+$(BUILD_DIR)/testcxx: user/bin/tests/testcxx.cpp $(GTK3_CLAWS) | $(BUILD_DIR)
 	@test -f $(XORG_SYSROOT)/usr/lib/libstdc++.so || { \
 		echo "ERROR: no libstdc++ in $(XORG_SYSROOT)."; \
 		echo "  The C++ runtime is built by the GTK3 port:"; \
@@ -1409,6 +1423,24 @@ $(XORG_SYSROOT)/usr/bin/Xorg: ports-xorg | $(BUILD_DIR)
 		echo "  packages are built, but the sysroot they install into"; \
 		echo "  is not there.  Rebuild it with:"; \
 		echo "      ports/xorg/clean.sh && make"; \
+		exit 1; \
+	}
+
+# The same sentinel for the GTK3 stack.  Claws Mail is the last package its
+# manifest builds and links against nearly everything below it, so its presence
+# means the whole stack -- GLib, GTK, Cairo, Pango, the C++ runtime, libetpan --
+# is installed in the sysroot.
+#
+# Checks rather than assumes, for the reason given above: without a recipe that
+# verifies its own target, a rule reports success for a file that was never
+# created and the missing program is not noticed until the image is booted.
+$(GTK3_CLAWS): ports-gtk3 | $(BUILD_DIR)
+	@test -x $@ || { \
+		echo "ERROR: $@ is missing after building the GTK3 port."; \
+		echo "  The per-package stamps in ports/xorg/gtk3/.stamps say"; \
+		echo "  the packages are built, but the sysroot they install"; \
+		echo "  into is not there.  Rebuild it with:"; \
+		echo "      ports/xorg/gtk3/clean.sh && make"; \
 		exit 1; \
 	}
 
