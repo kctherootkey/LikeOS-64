@@ -350,24 +350,46 @@ static void task_close_open_files(task_t *task)
 
 		for (int i = 0; i < TASK_MAX_MMAP; i++) {
 			mmap_region_t *r = &owner->mmap_regions[i];
-			if (r->in_use && r->file) {
+			vfs_file_t *f = NULL;
+
+			/* Take the reference OUT of the slot, atomically, and
+			 * close only what this thread actually took.
+			 *
+			 * The table belongs to the leader and is shared, but
+			 * the test above is `owner->nr_threads != 0' -- and
+			 * several threads of one group exit at once, which is
+			 * exactly what a fatal signal or exit_group() does.
+			 * More than one of them observes the count at zero and
+			 * every one of those runs this loop over the SAME
+			 * table, with no lock.  Reading `r->file' and clearing
+			 * it as two separate steps let two threads both see the
+			 * same pointer and both release it: one reference,
+			 * closed twice.  Seen as "vfs_close refcount underflow"
+			 * on a file-backed mapping while a threaded program was
+			 * exiting.
+			 *
+			 * An exchange makes the slot the arbiter: whoever swaps
+			 * the pointer out owns it, everyone else gets NULL and
+			 * skips.  No new lock, and it does not matter how many
+			 * threads run this. */
+			if (r->in_use)
+				f = __atomic_exchange_n(&r->file, NULL,
+							__ATOMIC_ACQ_REL);
+			if (f) {
 				/* Crash-abandon safety: if this task died
 				 * holding the file's page-in flag (its exit was
 				 * abandoned mid fault, e.g. a kernel oops), the
 				 * fork-family faulters sharing the handle would
 				 * spin forever.  Clear it while the file is
 				 * still pinned by our reference. */
-				if (r->file->pagein_busy &&
-				    (r->file->pagein_owner ==
-					     (int64_t)task->id ||
-				     r->file->pagein_owner ==
-					     (int64_t)owner->id)) {
-					r->file->pagein_owner = -1;
-					__atomic_clear(&r->file->pagein_busy,
+				if (f->pagein_busy &&
+				    (f->pagein_owner == (int64_t)task->id ||
+				     f->pagein_owner == (int64_t)owner->id)) {
+					f->pagein_owner = -1;
+					__atomic_clear(&f->pagein_busy,
 						       __ATOMIC_RELEASE);
 				}
-				vfs_close(r->file);
-				r->file = NULL;
+				vfs_close(f);
 			}
 			r->in_use = false;
 			r->lazy = false;

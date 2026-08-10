@@ -1207,10 +1207,22 @@ int vfs_close(vfs_file_t *f)
 	// Guard against refcount underflow (double-close).
 	// If old <= 0, someone already closed this file; undo the decrement and bail.
 	if (old <= 0) {
+		/* Someone released a reference they did not hold.  Undo it and
+		 * say enough to find them: the object address alone proves a
+		 * double close happened but not what was closed or by whom.
+		 *
+		 * The caller's return address is the useful half -- symbolize
+		 * it on the build host with
+		 *     addr2line -f -e build/kernel.elf <caller>
+		 * (build unstripped first: make NO_STRIP=1).  at_path names the
+		 * file when it has one, which is what identifies a file-backed
+		 * mapping released twice as opposed to a descriptor. */
+		void *caller = __builtin_return_address(0);
+
 		__sync_fetch_and_add(&f->refcount, 1); // undo
 		WARN(1, "vfs_close refcount underflow on %p (old=%d)", f, old);
-		kprintf("vfs_close: BUG refcount underflow on %p (old=%d)\n", f,
-			old);
+		kprintf("vfs_close: BUG refcount underflow on %p (old=%d) path=%s caller=%p\n",
+			f, old, f->at_path ? f->at_path : "(none)", caller);
 		return ST_INVALID;
 	}
 
