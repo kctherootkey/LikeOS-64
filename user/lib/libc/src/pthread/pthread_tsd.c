@@ -10,7 +10,6 @@
 #include <errno.h>
 #include "pthread_internal.h"
 
-extern int errno;
 
 // ============================================================================
 // GLOBAL TSD STATE

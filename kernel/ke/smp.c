@@ -875,6 +875,77 @@ void smp_tlb_shootdown_sync(void)
 	}
 }
 
+/*
+ * Does any CPU other than this one have the address space rooted at
+ * `pml4_phys` loaded?
+ *
+ * Two relaxed loads per CPU and no lock, against roughly a microsecond for an
+ * interrupt round trip to each of them.
+ */
+static bool tlb_mm_loaded_elsewhere(uint64_t pml4_phys)
+{
+	uint32_t online = percpu_get_online_count();
+	uint32_t my_cpu = this_cpu_id();
+
+	/* Publish this CPU's page-table writes BEFORE concluding that nobody
+	 * needs to hear about them.  A CPU that joins the address space after
+	 * this point cannot be holding anything stale: it publishes its own
+	 * arrival before loading CR3, and the load itself is serializing, so
+	 * it walks the tables as they are now. */
+	__asm__ volatile("mfence" ::: "memory");
+
+	for (uint32_t c = 0; c < online; c++) {
+		percpu_t *p;
+
+		if (c == my_cpu)
+			continue;
+		p = percpu_get(c);
+		if (!p)
+			continue;
+		/* Both slots: a CPU mid-switch counts as holding the address
+		 * space it is leaving AND the one it is entering. */
+		if (__atomic_load_n(&p->mmu_active_pml4, __ATOMIC_ACQUIRE) ==
+			    pml4_phys ||
+		    __atomic_load_n(&p->mmu_incoming_pml4, __ATOMIC_ACQUIRE) ==
+			    pml4_phys)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Invalidate translations for ONE address space.
+ *
+ * The broadcast version has to interrupt every CPU, because the mappings it is
+ * usually called for -- kernel text, the direct map, slab pages -- are shared
+ * by every address space in the system.  The mappings of a single process are
+ * not: only a CPU actually running one of its threads can hold them.
+ *
+ * So this asks first.  When no other CPU has the address space loaded there is
+ * nothing to invalidate anywhere, and the right number of interrupts is none.
+ * That is the normal case for the one that matters most -- an address space
+ * being torn down, whose last thread has already left it -- where the broadcast
+ * version instead interrupted every CPU on the machine several times per dying
+ * thread and waited for each to answer.
+ *
+ * When somebody does hold it, fall through to the broadcast: a CPU that has the
+ * address space loaded has to be told, and telling the others as well is a
+ * wasted interrupt rather than a wrong answer.
+ */
+void smp_tlb_shootdown_mm_sync(uint64_t pml4_phys)
+{
+	if (g_smp_others_halted)
+		return;
+	if (percpu_get_online_count() <= 1)
+		return;
+
+	/* A root of zero means "no particular address space" -- be safe. */
+	if (pml4_phys && !tlb_mm_loaded_elsewhere(pml4_phys))
+		return;
+
+	smp_tlb_shootdown_sync();
+}
+
 void smp_halt_others(void)
 {
 	lapic_send_ipi_all_excl_self(IPI_HALT_VECTOR);

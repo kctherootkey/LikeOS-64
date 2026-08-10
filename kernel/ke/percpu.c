@@ -161,80 +161,18 @@ uint32_t percpu_get_online_count(void)
 // Per-CPU Run Queue Functions
 // ============================================================================
 
-void percpu_runqueue_enqueue(task_t *task)
-{
-	percpu_t *cpu = this_cpu();
-	uint64_t flags;
-
-	spin_lock_irqsave(&cpu->runqueue_lock, &flags);
-
-	task->next = NULL;
-
-	if (cpu->runqueue_tail) {
-		cpu->runqueue_tail->next = task;
-		cpu->runqueue_tail = task;
-	} else {
-		cpu->runqueue_head = task;
-		cpu->runqueue_tail = task;
-	}
-
-	cpu->runqueue_length++;
-
-	spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
-}
-
-task_t *percpu_runqueue_dequeue(void)
-{
-	percpu_t *cpu = this_cpu();
-	uint64_t flags;
-	task_t *task = NULL;
-
-	spin_lock_irqsave(&cpu->runqueue_lock, &flags);
-
-	if (cpu->runqueue_head) {
-		task = cpu->runqueue_head;
-		cpu->runqueue_head = task->next;
-
-		if (!cpu->runqueue_head) {
-			cpu->runqueue_tail = NULL;
-		}
-
-		WARN_ON(cpu->runqueue_length ==
-			0); /* runqueue_length is 0 but runqueue_head was non-NULL: list count is inconsistent */
-		cpu->runqueue_length--;
-		task->next = NULL;
-	}
-
-	spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
-
-	return task;
-}
-
-void percpu_runqueue_enqueue_cpu(uint32_t cpu_id, task_t *task)
-{
-	if (cpu_id >= MAX_CPUS || !g_percpu_ptrs[cpu_id]) {
-		return;
-	}
-
-	percpu_t *cpu = g_percpu_ptrs[cpu_id];
-	uint64_t flags;
-
-	spin_lock_irqsave(&cpu->runqueue_lock, &flags);
-
-	task->next = NULL;
-
-	if (cpu->runqueue_tail) {
-		cpu->runqueue_tail->next = task;
-		cpu->runqueue_tail = task;
-	} else {
-		cpu->runqueue_head = task;
-		cpu->runqueue_tail = task;
-	}
-
-	cpu->runqueue_length++;
-
-	spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
-}
+/* percpu_runqueue_enqueue/_dequeue/_enqueue_cpu used to live here, and they
+ * were a second implementation of the run queue over the SAME
+ * runqueue_head/tail/length fields the scheduler uses -- linked through
+ * `task->next', which is the GLOBAL TASK LIST pointer, not `task->rq_next'.
+ *
+ * Anything calling them would have corrupted the global task list, built a
+ * queue the scheduler cannot walk, and left on_rq false on a task the queue
+ * still points at -- which is exactly the state rq_enqueue_locked() reports as
+ * "already in queue".  Nothing did call them; they were dead, and deleted
+ * rather than left as a trap for whoever wired them up next.  The run queue
+ * has one implementation, in sched.c.
+ */
 
 uint32_t percpu_runqueue_length(uint32_t cpu_id)
 {

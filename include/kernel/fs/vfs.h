@@ -12,6 +12,11 @@ typedef long ssize_t; // signed size for read return
 typedef unsigned long uintptr_t;
 
 #define VFS_MAX_PATH 256
+/* Longest single name between two slashes, as POSIX NAME_MAX.  Anything that
+ * takes a path apart must allow for this: a buffer that holds less does not
+ * merely truncate, it turns the tail of one name into another component and
+ * so names a different file. */
+#define VFS_NAME_MAX 255
 
 /* Inode attribute flags the VFS enforces independently of the rwx mode bits,
  * reported by a filesystem's optional inode_flags op.  These gate modification

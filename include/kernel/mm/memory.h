@@ -25,9 +25,9 @@
 #define KERNEL_OFFSET 0xFFFFFFFF80000000ULL // Higher-half kernel base
 
 // Direct map region - maps ALL physical memory to a high virtual address
-// This is the Linux-style approach: no identity mapping after boot.
+// This is the conventional approach: no identity mapping after boot.
 // Physical address 0 maps to PHYS_MAP_BASE, phys addr X maps to PHYS_MAP_BASE + X
-// PML4 index 272 = 0xFFFF880000000000 (like Linux's direct map)
+// PML4 index 272 = 0xFFFF880000000000
 #define PHYS_MAP_BASE 0xFFFF880000000000ULL
 #define PHYS_MAP_PML4_INDEX 272 // (PHYS_MAP_BASE >> 39) & 0x1FF
 
@@ -48,6 +48,31 @@ static inline bool is_direct_map_addr(uint64_t addr)
 {
 	return (addr >= PHYS_MAP_BASE) &&
 	       (addr < (PHYS_MAP_BASE + 0x400000000ULL)); // 16GB
+}
+
+/* Could this value plausibly be a pointer to a kernel object?
+ *
+ * The descriptor table stores several kinds of thing in one slot: small
+ * integers tagging a console stream, a network socket or an epoll instance,
+ * and real pointers to kernel objects.  Telling a pointer from a tag means
+ * reading a magic field out of the candidate, and that read must never be
+ * attempted on a value that is not a kernel address at all -- which is what
+ * this answers, before any dereference.
+ *
+ * BOTH kernel ranges are accepted, and that is the point.  An allocation up to
+ * the slab's size limit is returned from the slab's own virtual range, while a
+ * larger one is served straight out of the direct map.  A predicate that knows
+ * only about the first quietly stops recognising an object on the day its
+ * structure grows past that limit -- a failure with no symptom at the point of
+ * the mistake.
+ */
+static inline bool kptr_plausible(uint64_t addr)
+{
+	if (addr < 0x100000ULL)
+		return false; /* a tagged marker, not a pointer */
+	if (addr >= KERNEL_OFFSET)
+		return true; /* higher-half kernel, including the slab */
+	return is_direct_map_addr(addr);
 }
 
 // Check if a physical address is covered by the bootloader's direct map (16GB)
@@ -281,9 +306,31 @@ uint64_t *mm_clone_address_space_with_shared(uint64_t *src_pml4,
 struct mm_tlb_gather {
 	uint64_t pages[MM_TLB_GATHER_BATCH];
 	unsigned n;
+	/* Physical root of the address space being unmapped, so the flush can
+	 * ask which CPUs actually have it loaded instead of interrupting all
+	 * of them.  Zero means "unknown" and falls back to a broadcast. */
+	uint64_t pml4_phys;
 };
 
-void mm_tlb_gather_init(struct mm_tlb_gather *g);
+/* ---- batched release ----------------------------------------------------
+ *
+ * Releasing pages one at a time costs an acquire/release of a global lock and
+ * an interrupt-off window each, which is the dominant cost of tearing down a
+ * large address space -- and, because a CPU queued behind that lock waits with
+ * interrupts disabled, it stalls the TLB shootdown acknowledgements other CPUs
+ * are blocked on.  These take the lock once for the whole batch.
+ *
+ * Both are callable only from a preemptible context.
+ */
+#define MM_FREE_BATCH_MAX 64
+/* Release pages outright: the caller holds the only reference to each. */
+void mm_free_physical_pages_batch(const uint64_t *phys, unsigned n);
+/* Drop one reference on each, releasing those that reach zero. */
+void mm_put_pages_batch(const uint64_t *phys, unsigned n);
+
+/* `pml4` is the address space the pages are being unmapped from; pass NULL
+ * only if it is genuinely not known, which costs a broadcast per flush. */
+void mm_tlb_gather_init(struct mm_tlb_gather *g, uint64_t *pml4);
 /* Queue a page whose entry is already cleared; its reference is held until the
  * flush, which is what stops the page being reused too early. */
 void mm_tlb_gather_page(struct mm_tlb_gather *g, uint64_t phys);

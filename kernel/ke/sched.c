@@ -68,6 +68,35 @@ spinlock_t g_task_list_lock = SPINLOCK_INIT("task_list");
 // Updated under g_task_list_lock but readable lock-free for pre-allocation.
 static int g_task_list_count = 0;
 
+/* Serialises a waitpid() sleeper against the children it is waiting for.
+ *
+ * waitpid() has to decide "nothing to report yet, go to sleep" and a child has
+ * to decide "something to report, wake the parent" — and if those two run at
+ * the same time on different CPUs, the wake can land in the gap and be lost:
+ *
+ *   parent CPU                       child CPU
+ *   scan children: none exited
+ *                                    has_exited = true
+ *                                    parent->state? RUNNING → no wake
+ *   state = TASK_BLOCKED
+ *   sched_schedule()                 ← asleep, with nothing left to wake it
+ *
+ * The old code disabled interrupts around the parent's scan, which excludes a
+ * timer on the SAME cpu and nothing whatsoever on another one; the child's
+ * side moved out of its own IRQ-off section long ago.  And nothing recovers
+ * from a lost wakeup here: sched_wake_expired_sleepers() only re-wakes tasks
+ * with a timeout armed or a signal pending, and waitpid has neither — SIGCHLD
+ * defaults to ignore, so signal_send() drops it without touching the parent.
+ * The result is a permanent hang, and the program it hangs is whichever one
+ * happened to fork: every g_spawn()/system()/popen() reaps a child this way,
+ * which is why "click a link" could wedge a whole GUI with no message.
+ *
+ * Both sides take this lock around their decision, so one of them always sees
+ * the other's: either the parent sees the exit and does not sleep, or it is
+ * already marked BLOCKED when the child looks.  Held for a handful of field
+ * accesses only — the wake itself happens after the release. */
+spinlock_t g_wait_lock = SPINLOCK_INIT("waitpid");
+
 // SMP mode flag – when true, use per-CPU current task and run queues
 int g_smp_initialized = 0;
 
@@ -238,34 +267,28 @@ static void task_close_open_files(task_t *task)
 	if (!task)
 		return;
 	if (task->files) {
-		/* Descriptors live in the shared files_struct and are released
-		 * by the last thread's files_struct_put below.  The in-task
-		 * array was emptied when the table was promoted to shared (see
-		 * the CLONE_FILES path in sys_clone), so this loop normally
-		 * finds nothing — it stays as a belt-and-braces sweep. */
+		/* The descriptors are owned by the SHARED files_struct, and the
+		 * last thread to let go of it releases them.  The task's own
+		 * fd_table[] was emptied when the table was promoted to shared
+		 * (the CLONE_FILES path in sys_clone), so anything still in it
+		 * is a stale duplicate of an entry the shared table already
+		 * owns -- not a reference this task holds.
+		 *
+		 * What stood here RELEASED those entries and then called
+		 * files_struct_put() as well, so every leftover was let go of
+		 * twice: once here and once by the shared table.  With several
+		 * threads of one process dying together -- which is what a
+		 * fatal signal to a threaded program is -- that frees objects
+		 * other threads are still using, and eventually the slab page
+		 * itself goes back.  Observed as a kernel page fault in here
+		 * reading an unmapped slab address while tearing down the
+		 * second of three claws-mail threads.
+		 *
+		 * Clear them, do not release them.  Dropping a reference this
+		 * task never owned cannot be made safe by ordering. */
 		for (int i = 0; i < TASK_MAX_FDS; i++) {
 			if (task->fd_table[i]) {
-				uint64_t marker = (uint64_t)task->fd_table[i];
-				if (marker >= 1 && marker <= 3) {
-					/* stdio markers — no refcount */
-				} else if (IS_SOCKET_FD(task->fd_table[i])) {
-					int idx = SOCKET_FD_IDX(
-						task->fd_table[i]);
-					sock_close(idx);
-				} else if (IS_UNIX_SOCKET_FD(
-						   task->fd_table[i])) {
-					int ufd = (int)(uintptr_t)
-							  task->fd_table[i];
-					unix_close(ufd);
-				} else if (IS_EPOLL_FD(task->fd_table[i])) {
-					epoll_put(EPOLL_FD_IDX(
-						task->fd_table[i]));
-				} else if (pipe_is_end(task->fd_table[i])) {
-					pipe_close_end((pipe_end_t *)task
-							       ->fd_table[i]);
-				} else {
-					vfs_close(task->fd_table[i]);
-				}
+				WARN_ON_ONCE(1); /* stale fd in a shared table */
 				task->fd_table[i] = NULL;
 			}
 		}
@@ -282,15 +305,15 @@ static void task_close_open_files(task_t *task)
 						task->fd_table[i]);
 					task->fd_table[i] = NULL;
 					sock_close(idx);
-				} else if (IS_UNIX_SOCKET_FD(
-						   task->fd_table[i])) {
-					int ufd = (int)(uintptr_t)
-							  task->fd_table[i];
+				} else if (unix_sock_is(task->fd_table[i])) {
+					unix_socket_t *ufd =
+						(unix_socket_t *)
+							task->fd_table[i];
 					task->fd_table[i] = NULL;
 					unix_close(ufd);
 				} else if (IS_EPOLL_FD(task->fd_table[i])) {
-					int idx = EPOLL_FD_IDX(
-						task->fd_table[i]);
+					int idx =
+						EPOLL_FD_IDX(task->fd_table[i]);
 					task->fd_table[i] = NULL;
 					epoll_put(idx);
 				} else if (pipe_is_end(task->fd_table[i])) {
@@ -306,12 +329,27 @@ static void task_close_open_files(task_t *task)
 	}
 
 	/* Demand paging: release the file references pinned by lazy
-	 * file-backed regions.  Leader-only — threads carry a stale copy of
-	 * the leader's region table without their own references (only
-	 * fork adds a reference per copy). */
-	if (!task->group_leader || task->group_leader == task) {
+	 * file-backed regions.  The table belongs to the group leader --
+	 * threads carry a stale copy of it without their own references (only
+	 * fork adds a reference per copy), and task_mm_owner() routes every
+	 * thread's lookups back to the leader's.
+	 *
+	 * So it can only be cleared once the LAST thread has gone, not merely
+	 * when the leader has.  exit_group() makes the difference routine: the
+	 * leader marks itself exited while the threads it just killed are
+	 * still on their way out, and emptying the shared table there pulls
+	 * the mappings out from under them.  Every fault they take afterwards
+	 * finds no region covering the address and becomes a fatal signal --
+	 * so each surviving thread paid a fault storm, a crash report and a
+	 * park, on every exit of every threaded program. */
+	{
+		task_t *owner = task->group_leader ? task->group_leader : task;
+
+		if (owner->nr_threads != 0)
+			return;
+
 		for (int i = 0; i < TASK_MAX_MMAP; i++) {
-			mmap_region_t *r = &task->mmap_regions[i];
+			mmap_region_t *r = &owner->mmap_regions[i];
 			if (r->in_use && r->file) {
 				/* Crash-abandon safety: if this task died
 				 * holding the file's page-in flag (its exit was
@@ -320,7 +358,10 @@ static void task_close_open_files(task_t *task)
 				 * spin forever.  Clear it while the file is
 				 * still pinned by our reference. */
 				if (r->file->pagein_busy &&
-				    r->file->pagein_owner == (int64_t)task->id) {
+				    (r->file->pagein_owner ==
+					     (int64_t)task->id ||
+				     r->file->pagein_owner ==
+					     (int64_t)owner->id)) {
 					r->file->pagein_owner = -1;
 					__atomic_clear(&r->file->pagein_busy,
 						       __ATOMIC_RELEASE);
@@ -477,7 +518,8 @@ static inline void switch_address_space(task_t *prev, task_t *next)
 		// concurrent use when it runs on another CPU.
 		uint64_t cpu_kernel_stack = g_kernel_task_krsp[this_cpu_id()];
 		if (!cpu_kernel_stack)
-			cpu_kernel_stack = tss_get_kernel_stack(); /* pre-init */
+			cpu_kernel_stack =
+				tss_get_kernel_stack(); /* pre-init */
 		tss_set_kernel_stack(cpu_kernel_stack);
 		this_cpu()->syscall_kernel_rsp = cpu_kernel_stack;
 	}
@@ -492,14 +534,58 @@ static inline void switch_address_space(task_t *prev, task_t *next)
 	uint64_t actual_cr3;
 	__asm__ volatile("mov %%cr3, %0" : "=r"(actual_cr3));
 	uint64_t next_phys = virt_to_phys(next_pml4);
+
 	if ((actual_cr3 & ~0xFFFULL) != next_phys) {
+		/* mm_switch_address_space() records which address space this
+		 * CPU holds as part of loading it; see sched_mmu_track_enter. */
 		mm_switch_address_space(next_pml4);
+	} else {
+		/* Already loaded.  Still record it: on this CPU's first pass
+		 * the slot is zero, and an address space nobody admits to
+		 * holding is one that gets invalidated nowhere. */
+		sched_mmu_track_done(next_phys);
 	}
 
 	// Load TLS (FS base) for the next task
 	if (next->privilege == TASK_USER) {
 		task_load_tls(next);
 	}
+}
+
+/* ============================================================================
+ * Which address space is this CPU using?
+ *
+ * Recorded so that invalidating one process's mappings can interrupt only the
+ * CPUs that actually hold them -- usually none, once its last thread has left.
+ * See the two slots in percpu.h for why there are two rather than one.
+ *
+ * Called around every CR3 load that changes address space, from
+ * mm_switch_address_space(), which is the single point all of them go through.
+ * Both are no-ops until SMP is up: the slots are only ever read by a shootdown,
+ * and a shootdown on one CPU has nothing to do.
+ * ========================================================================== */
+
+void sched_mmu_track_enter(uint64_t pml4_phys)
+{
+	if (!sched_is_smp())
+		return;
+	/* Join the incoming set BEFORE the load: from here until the CR3 write
+	 * retires this CPU is counted as holding both address spaces, which is
+	 * the safe direction to be wrong in. */
+	__atomic_store_n(&this_cpu()->mmu_incoming_pml4, pml4_phys,
+			 __ATOMIC_SEQ_CST);
+	__asm__ volatile("mfence" ::: "memory");
+}
+
+void sched_mmu_track_done(uint64_t pml4_phys)
+{
+	if (!sched_is_smp())
+		return;
+	/* Leave the outgoing set only AFTER the load has retired. */
+	__atomic_store_n(&this_cpu()->mmu_active_pml4, pml4_phys,
+			 __ATOMIC_SEQ_CST);
+	__asm__ volatile("mfence" ::: "memory");
+	__atomic_store_n(&this_cpu()->mmu_incoming_pml4, 0, __ATOMIC_SEQ_CST);
 }
 
 // ============================================================================
@@ -542,7 +628,8 @@ static void task_list_remove(task_t *t)
  * torn list at worst misses a match; it must never fault (a #PF here would
  * turn a parked false positive into a real crash).  no_stack_protector: this
  * runs while GS:104 is in a known-inconsistent state. */
-__attribute__((no_stack_protector)) task_t *sched_task_by_canary(uint64_t canary)
+__attribute__((no_stack_protector)) task_t *
+sched_task_by_canary(uint64_t canary)
 {
 	int depth = 0;
 	for (task_t *t = g_task_list_head; t && depth < 4096;
@@ -571,16 +658,92 @@ static void rq_enqueue_locked(percpu_t *cpu, task_t *task)
 	 * arithmetic against percpu_get(0) printed garbage; use the real id. */
 	uint32_t cpu_id = cpu->cpu_id;
 
-	// Prevent double-enqueue
+	/* Already queued.  Refusing is right -- it is queued, so it will run --
+	 * but only if it is REALLY queued.  If `on_rq' is set while the task is
+	 * in no queue at all, refusing here throws the wakeup away and the task
+	 * sleeps until something unrelated happens to kick it.  For a thread
+	 * doing request/reply work that is a timer tick per exchange instead of
+	 * microseconds, which is indistinguishable from "the network is slow".
+	 *
+	 * So say which case it is.  Walking the queues costs nothing on a path
+	 * that is already broken and about to print, and it is the difference
+	 * between a report that names the defect and one that only proves a
+	 * defect exists: `linked=' 0 means a lost wakeup and a stranded task,
+	 * non-zero means a genuine concurrent enqueue.  `owner=' says which
+	 * lock actually protects on_rq, which is the field this whole scheme
+	 * turns on -- if it is not cpu_id, the caller tested it under the wrong
+	 * lock and that is the bug. */
 	if (task->on_rq) {
+		int linked = 0;
+		uint32_t where = (uint32_t)-1;
+
+		for (uint32_t i = 0; i < MAX_CPUS; i++) {
+			percpu_t *p = percpu_get(i);
+
+			if (!p)
+				continue;
+			/* Best effort, and bounded: this holds only THIS
+			 * processor's lock (taking another here, while the
+			 * caller holds ours, is a deadlock), and it is walking
+			 * lists that are known to be inconsistent.  Validate
+			 * every link and cap the walk so a corrupted list
+			 * cannot fault or spin with interrupts off. */
+			task_t *t = p->runqueue_head;
+
+			for (int n = 0; task_ptr_ok(t) && n < 4096; n++) {
+				if (t == task) {
+					linked++;
+					where = i;
+					break;
+				}
+				t = t->rq_next;
+			}
+		}
 		WARN_ON(task->on_rq); /* double-enqueue detected */
-		kprintf("BUG: double-enqueue pid %d cpu %u\n", task->id,
-			cpu_id);
+		kprintf("BUG: double-enqueue pid %d into cpu %u: owner=%u state=%d linked=%d on=%d len=%u\n",
+			task->id, cpu_id, task->on_cpu, (int)task->state, linked,
+			(int)where, cpu->runqueue_length);
 		return;
 	}
 	if (cpu->runqueue_head == task || cpu->runqueue_tail == task) {
-		kprintf("BUG: pid %d already in queue cpu %u\n", task->id,
-			cpu_id);
+		/* The task says it is not queued, yet this queue still points
+		 * at it: the flag and the list disagree.
+		 *
+		 * Refusing the enqueue -- which is what this did -- leaves the
+		 * task in neither state.  It is not on a run queue, so nothing
+		 * will run it, and the flag says it is not queued, so nothing
+		 * will try again: it is stranded for the rest of the boot.
+		 * For a kernel service thread that is one processor's softirq
+		 * work stopping permanently, reported once and then silent.
+		 *
+		 * Repair the stale reference and queue it properly.  The list
+		 * ends up consistent either way, and the task runs.  Whatever
+		 * left the two out of step is a separate defect; the detail
+		 * below is what identifies it, since the two cases have quite
+		 * different causes -- a head reference means a dequeue that
+		 * did not finish, a tail-only reference means an unlink that
+		 * did not fix up the end of the list.
+		 */
+		WARN_ON_ONCE(1);
+		kprintf("BUG: pid %d stale in cpu %u queue (head=%d tail=%d len=%u state=%d on_cpu=%u) - repairing\n",
+			task->id, cpu_id, cpu->runqueue_head == task,
+			cpu->runqueue_tail == task, cpu->runqueue_length,
+			(int)task->state, task->on_cpu);
+
+		/* Agree with the QUEUE, and touch nothing else.
+		 *
+		 * The queue already holds this task, so the cheapest correct
+		 * thing is to mark it queued and let the next dequeue take it.
+		 *
+		 * What stood here spliced the task out and re-inserted it,
+		 * which meant trusting rq_next on a list already known to be
+		 * inconsistent -- and walking that list to find its end, with
+		 * the runqueue lock held and interrupts off.  A stale link
+		 * there is a walk through freed memory or a loop that never
+		 * terminates, on the one code path whose whole purpose is to
+		 * cope with the list being wrong.  Repairing a structure by
+		 * reading the parts of it that are suspect is no repair. */
+		task->on_rq = true;
 		return;
 	}
 	if (task->state == TASK_RUNNING) {
@@ -590,6 +753,27 @@ static void rq_enqueue_locked(percpu_t *cpu, task_t *task)
 			cpu_id);
 		return;
 	}
+
+	/* Make the ownership rule true by construction, here, at the one place
+	 * every enqueue passes through.
+	 *
+	 * Everything that touches a queued task -- rq_remove(),
+	 * sched_enqueue_ready(), the balancer -- finds it by way of `on_cpu',
+	 * and reads or writes `on_rq' under the lock of the processor `on_cpu'
+	 * names.  If a task is ever linked into one queue while `on_cpu' names
+	 * another, that lock protects nothing: the field is then read with no
+	 * synchronisation at all, and the task can be linked twice or unlinked
+	 * from a list it was never on.
+	 *
+	 * Every caller already sets this correctly before calling, so this is a
+	 * no-op for all of them -- which is the point.  It costs one store, it
+	 * cannot be forgotten by a caller added later, and it repairs the state
+	 * instead of leaving a queue and a flag disagreeing.
+	 *
+	 * It must come AFTER the checks above: those diagnose a task that is
+	 * already queued somewhere, and repointing `on_cpu' first would hide
+	 * which queue that was. */
+	task->on_cpu = cpu_id;
 
 	task->rq_next = NULL;
 	task->on_rq = true;
@@ -627,6 +811,36 @@ static task_t *rq_dequeue_locked(percpu_t *cpu)
 		}
 	}
 	return task;
+}
+
+/* A task whose sp == 0 is committed to a CPU (see the note above
+ * ctx_switch_asm): every other CPU must refuse to resume it, and the refusal
+ * puts it back on the queue so its owner can finish and hand it back.
+ *
+ * That is right while the condition is transient -- a switch in flight lasts
+ * microseconds.  When it is not, the queue holds a task that can never be
+ * picked, the CPU re-queues it on every tick, and the machine ends up with a
+ * processor scheduling busily while running nothing but its idle task, for the
+ * rest of the boot, without printing a thing.  Observed as a run queue stuck
+ * at length 1 with an unchanging head while its CPU stays on idle.
+ *
+ * Count consecutive refusals and name the task once the count is far past
+ * anything a switch in flight could explain.  This repairs nothing on purpose:
+ * resuming a task whose stack another processor may still be using is the
+ * corruption the sp == 0 rule exists to prevent.  It reports which task is
+ * stuck and which CPU it is committed to -- what a fix needs, and what the
+ * silent version never gave anyone.
+ */
+#define SCHED_SP0_REFUSAL_WARN 1000u
+
+static void rq_note_sp0_refusal(task_t *task)
+{
+	if (++task->sp0_refusals != SCHED_SP0_REFUSAL_WARN)
+		return;
+	WARN_ON_ONCE(1);
+	kprintf("BUG: pid %d stuck unrunnable (sp=0) after %u refusals - committed to cpu %u, state %d, wchan %llx\n",
+		task->id, task->sp0_refusals, task->on_cpu, (int)task->state,
+		(unsigned long long)task->wchan_rip);
 }
 
 /* Unlink `task` from one CPU's run queue if it is linked there.  Returns 1
@@ -716,26 +930,181 @@ void sched_enqueue_ready(task_t *task)
 	if (!task || is_idle_task(task))
 		return;
 
+	/* THE OWNERSHIP RULE, which everything below exists to obey:
+	 *
+	 *   `on_rq' belongs to the run queue lock of the processor named by
+	 *   `on_cpu', and `on_cpu' itself may only change while that same lock
+	 *   is held (the migration below, and sched_balance_pull(), are the
+	 *   only writers once a task is live -- both hold it).
+	 *
+	 * The consequence is easy to get wrong: `on_cpu' has to be READ before
+	 * its lock can be taken, and the task can migrate in that window.  The
+	 * lock then guards a different queue than the one the task is on, and
+	 * `on_rq' is tested with nothing holding it still -- so two processors
+	 * both read "not queued" and both link the task, or one of them finds
+	 * `on_rq' already set once inside rq_enqueue_locked().  That is exactly
+	 * what "BUG: double-enqueue pid N cpu M" was reporting: not a bad
+	 * caller, but this function testing a field it did not own.
+	 *
+	 * Re-reading `on_cpu' after the lock is held closes it.  If it still
+	 * names the processor whose lock we took, the task cannot move (moving
+	 * it needs that lock), so the test-and-set of `on_rq' is atomic with
+	 * respect to every other run queue operation.  If it does not, we
+	 * locked the wrong processor: drop it and start again. */
 	uint32_t target_cpu = task->on_cpu;
-	percpu_t *cpu = percpu_get(target_cpu);
 
-	if (!cpu) {
-		target_cpu = 0;
-		task->on_cpu = 0;
-		cpu = percpu_get(0);
+	for (int attempt = 0;; attempt++) {
+		uint32_t owner_cpu = task->on_cpu;
+		percpu_t *owner = percpu_get(owner_cpu);
+
+		if (!owner) {
+			/* No per-processor area to queue on: there is nothing
+			 * safe to do here, and every line below dereferences
+			 * it.  Reading through it anyway faults at a small
+			 * address with interrupts off, which is reported as a
+			 * stray user access from the kernel rather than as
+			 * what it is. */
+			owner_cpu = 0;
+			owner = percpu_get(0);
+			if (WARN_ON(owner == NULL))
+				return;
+			task->on_cpu = owner_cpu;
+		}
+
+		/* Put it where it can run NOW, not where it ran last.
+		 *
+		 * Waking a task onto the processor it last used is right when
+		 * that processor is free -- its data is still in that cache.
+		 * It is wrong when that processor is busy and others are idle:
+		 * the task then waits behind whatever is running, which for two
+		 * threads passing work back and forth means they share one
+		 * processor and take turns by timeslice while the rest of the
+		 * machine does nothing.  A request and its reply then cost
+		 * timer ticks instead of microseconds.
+		 *
+		 * Decided before the locks are taken, deliberately.  It reads
+		 * other processors' queue lengths, which nothing here can hold
+		 * still anyway; a stale answer costs a worse placement, never
+		 * correctness, because the decision is re-validated under the
+		 * locks below before anything is written.  After too many
+		 * retries, stop trying to move it -- a placement is not worth
+		 * spinning for, and staying put always has a valid lock order. */
+		uint32_t dest_cpu = owner_cpu;
+		percpu_t *dest = owner;
+
+		if (g_smp_initialized && !task->on_rq && attempt < 16) {
+			/* "Free" means nothing queued AND nothing running but
+			 * the idle task.  A running task is not on its own run
+			 * queue, so queue length alone calls a fully occupied
+			 * processor free -- which is how a thread waking the
+			 * thread it is talking to kept landing on top of
+			 * itself. */
+			task_t *src_cur = owner->current_task;
+			int src_busy = owner->runqueue_length > 0 ||
+				       (src_cur && !is_idle_task(src_cur));
+
+			if (src_busy) {
+				uint32_t ncpus = smp_get_cpu_count();
+
+				for (uint32_t i = 0; i < ncpus; i++) {
+					percpu_t *cand;
+					task_t *cand_cur;
+
+					if (i == owner_cpu)
+						continue;
+					/* A task pinned to a set of processors
+					 * may only go to one of them. */
+					if (task->cpu_affinity &&
+					    !(task->cpu_affinity & (1ULL << i)))
+						continue;
+					cand = percpu_get(i);
+					if (!cand || cand->runqueue_length != 0)
+						continue;
+					cand_cur = cand->current_task;
+					if (cand_cur && !is_idle_task(cand_cur))
+						continue; /* busy running */
+					dest_cpu = i;
+					dest = cand;
+					break;
+				}
+			}
+		}
+
+		/* Lock the owner, and the destination too when they differ.
+		 * Always lowest processor number first, so two wakeups moving
+		 * tasks in opposite directions cannot each hold what the other
+		 * wants. */
+		percpu_t *lo = owner, *hi = NULL;
+		uint64_t flags, flags2 = 0;
+
+		if (dest != owner) {
+			lo = (owner_cpu < dest_cpu) ? owner : dest;
+			hi = (owner_cpu < dest_cpu) ? dest : owner;
+		}
+
+		spin_lock_irqsave(&lo->runqueue_lock, &flags);
+		if (hi)
+			spin_lock_irqsave(&hi->runqueue_lock, &flags2);
+
+		/* The window is closed here: if the task moved while we were
+		 * taking these, we hold the wrong queue and know nothing about
+		 * `on_rq'.  Drop everything and start over rather than write
+		 * through a lock that does not cover the field. */
+		if (task->on_cpu != owner_cpu) {
+			if (hi)
+				spin_unlock_irqrestore(&hi->runqueue_lock,
+						       flags2);
+			spin_unlock_irqrestore(&lo->runqueue_lock, flags);
+			if (attempt > 1000) {
+				WARN_ON_ONCE(1);
+				kprintf("BUG: pid %d migrates faster than it can be queued - giving up\n",
+					task->id);
+				return;
+			}
+			continue;
+		}
+
+		if (!task->on_rq && task->state == TASK_READY) {
+			if (dest != owner)
+				task->on_cpu = dest_cpu;
+			rq_enqueue_locked(dest, task);
+			target_cpu = dest_cpu;
+		} else {
+			/* Already queued, or no longer runnable.  Either way
+			 * there is nothing to do, and it is NOT an error: a
+			 * task can be woken by two paths at once, and the
+			 * second one arriving to find the first has done its
+			 * work
+			 * is the ordinary case. */
+			target_cpu = owner_cpu;
+		}
+
+		if (hi)
+			spin_unlock_irqrestore(&hi->runqueue_lock, flags2);
+		spin_unlock_irqrestore(&lo->runqueue_lock, flags);
+		break;
 	}
-
-	uint64_t flags;
-	spin_lock_irqsave(&cpu->runqueue_lock, &flags);
-
-	if (!task->on_rq && task->state == TASK_READY) {
-		rq_enqueue_locked(cpu, task);
-	}
-	spin_unlock_irqrestore(&cpu->runqueue_lock, flags);
 
 	// If enqueued to a remote CPU, send IPI to wake it from HLT
 	if (g_smp_initialized && target_cpu != this_cpu_id()) {
 		smp_send_reschedule(target_cpu);
+		return;
+	}
+
+	/* Woken onto the processor we are running on: ask for a switch rather
+	 * than letting it wait for the next timer interrupt.
+	 *
+	 * Without this a task woken locally sits on the runqueue until the
+	 * running task's slice expires -- tens of milliseconds for what should
+	 * take microseconds.  The waker is usually about to block anyway (it
+	 * just handed over the data), so this mostly costs nothing; when the
+	 * waker keeps running, it gives up the processor at the next
+	 * opportunity instead of holding it to the end of its slice. */
+	{
+		task_t *cur = sched_current();
+
+		if (cur && cur != task && !is_idle_task(cur))
+			cur->need_resched = 1;
 	}
 }
 
@@ -749,6 +1118,7 @@ static void task_init_common(task_t *t)
 	t->next = NULL;
 	t->rq_next = NULL;
 	t->on_rq = false;
+	t->syscall_unix_ref = NULL;
 	t->on_cpu = 0;
 	t->cpu_affinity = 0; // 0 = allowed on all CPUs
 	t->user_stack_top = 0;
@@ -1148,8 +1518,10 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	if (next->sp == 0 || next->state == TASK_ZOMBIE) {
 		WARN_ON(next->state == TASK_ZOMBIE &&
 			!is_idle_task(next)); /* zombie dequeued onto CPU */
-		if (!is_idle_task(next) && next->state != TASK_ZOMBIE)
+		if (!is_idle_task(next) && next->state != TASK_ZOMBIE) {
+			rq_note_sp0_refusal(next);
 			rq_enqueue_locked(cpu, next);
+		}
 		next = cpu->idle_task;
 		// idle_task might be cur (e.g. idle calling schedule) — handle below
 	}
@@ -1242,6 +1614,7 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
      * corrupted and the next return-to-user iretq consumes garbage
      * (observed as a userspace crash with RIP=0 and kernel register/RSP
      * values leaked into user mode). */
+	next->sp0_refusals = 0; /* it is running: the refusal run ends here */
 	uint64_t *next_sp = next->sp;
 	next->sp = 0;
 	ctx_switch_asm(&prev->sp, next_sp);
@@ -1278,7 +1651,15 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	if (me && (me->has_exited || me->state == TASK_ZOMBIE)) {
 		for (;;) {
 			sched_schedule(); /* should never return */
-			__asm__ volatile("cli; hlt");
+			/* Interrupts ON across the halt.  A CPU halted with IF
+			 * clear has nothing left that can wake it -- no timer,
+			 * no IPI -- so it stops here permanently, and while it
+			 * is stopped it cannot acknowledge a TLB shootdown,
+			 * which wedges every other CPU waiting on one.  Every
+			 * other park site in the kernel already halts with
+			 * interrupts enabled for exactly this reason; this one
+			 * was missed. */
+			__asm__ volatile("sti; hlt");
 		}
 	}
 }
@@ -1335,8 +1716,10 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 
 	// Check sp BEFORE enqueueing cur — fall through to idle if next is bad
 	if (next->sp == 0 || next->state == TASK_ZOMBIE) {
-		if (!is_idle_task(next) && next->state != TASK_ZOMBIE)
+		if (!is_idle_task(next) && next->state != TASK_ZOMBIE) {
+			rq_note_sp0_refusal(next);
 			rq_enqueue_locked(cpu, next);
+		}
 		next = cpu->idle_task;
 	}
 
@@ -1400,6 +1783,7 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 	/* SMP double-run guard — zero next->sp before switching; see the
      * detailed comment in sched_schedule().  Prevents another CPU from
      * resuming a task while this CPU is still on its kernel stack. */
+	next->sp0_refusals = 0; /* it is running: the refusal run ends here */
 	uint64_t *next_sp = next->sp;
 	next->sp = 0;
 	ctx_switch_asm(&prev->sp, next_sp);
@@ -1472,10 +1856,10 @@ static void task_trampoline(void)
 		cur->state = TASK_ZOMBIE;
 		cur->has_exited = true;
 	}
-	for (;;) {
-		sched_schedule();
-		__asm__ volatile("hlt");
-	}
+	/* Shared park: releases anything this task still owns, and halts with
+	 * interrupts enabled.  The bare `hlt` this replaces could stop the CPU
+	 * for good if it was reached with them off. */
+	sched_exit_park();
 }
 
 // Called from fork_child_return (assembly) to perform the same post-switch
@@ -1508,10 +1892,90 @@ void sched_after_fork_child(void)
 	}
 }
 
+/*
+ * A processor with nothing to run takes work from the busiest one.
+ *
+ * Choosing where a task runs when it wakes is not enough on its own: it only
+ * decides for a task that was asleep.  Two threads that stay runnable -- passing
+ * work back and forth, say -- are placed once and then never reconsidered, so
+ * they can share one processor by timeslice while the rest of the machine sits
+ * idle.  Nothing moves them, because nothing ever asks again.
+ *
+ * So the question is asked from the other side: a processor about to have
+ * nothing to do looks at the others and takes some of their backlog.
+ *
+ * Two properties keep it stable rather than thrashing:
+ *
+ *   - It only takes from a queue holding more than one task, and never takes
+ *     the last one.  Moving a lone task back and forth between two processors
+ *     costs its cache and gains nothing.
+ *   - It takes exactly one task per attempt.  If more remain, the next
+ *     processor to run out asks again.
+ *
+ * Both runqueue locks are held for the move, lowest processor number first, so
+ * a task is never in two queues and two balancers in opposite directions cannot
+ * each hold what the other needs.  The task actually running on the source is
+ * not on its runqueue, so it is never a candidate.
+ *
+ * Returns 1 if a task was taken.
+ */
+/* Retire the boot thread and hand its processor to the scheduler.
+ *
+ * Everything the boot thread still did after init -- polling the USB, input and
+ * storage controllers -- is a task now, so the context that ran it has nothing
+ * left to do.  It must not stay as what the boot processor runs when nothing
+ * else is ready: it is exempt from preemption, so a task queued there would
+ * wait for it to call into the scheduler rather than be run when it is woken,
+ * and a reschedule asked for meanwhile would be dropped.  That made the boot
+ * processor the one place where runnable work could pile up, and it is also
+ * where every task starts, since on_cpu is zero until something moves it.
+ *
+ * Blocked with nothing that can wake it, the task is simply never chosen again;
+ * the processor picks its idle task and behaves like every other one.  The boot
+ * stack is abandoned along with it, which is what makes this one-way.
+ *
+ * Never returns. */
+void sched_bsp_park(void)
+{
+	task_t *self = sched_current();
+
+	BUG_ON(self == NULL);
+	BUG_ON(!is_bootstrap_task(self));
+
+	for (;;) {
+		self->wait_channel = NULL;
+		self->wakeup_tick = 0;
+		self->state = TASK_BLOCKED;
+		sched_schedule();
+		/* Nothing holds a reference with which to wake this, so getting
+		 * here at all means something enqueued it by mistake.  Halting
+		 * would take the processor down with it; go back to sleep. */
+		WARN_ON_ONCE(1);
+		__asm__ volatile("sti");
+		__asm__ volatile("hlt");
+	}
+}
+
 static void idle_entry(void *arg)
 {
 	(void)arg;
 	for (;;) {
+		/* Reap here as well as on the scheduler's voluntary paths.
+		 *
+		 * dead_thread_reap() is deliberately kept out of sched_preempt()
+		 * -- it runs in interrupt context, where the TLB shootdown its
+		 * callee performs cannot wait for acknowledgements.  That left
+		 * the voluntary paths as the only ones that reap, and this loop
+		 * never enters the scheduler at all, so a CPU with nothing to
+		 * run made no teardown progress whatsoever.  Exactly the state a
+		 * machine is in just after the last window closes: the work that
+		 * frees a departing process was waiting on some unrelated task
+		 * deciding to block.
+		 *
+		 * Here it is process context on the idle task's own stack with
+		 * interrupts enabled, which is what the reaper asks for. */
+		dead_thread_reap();
+
 		__asm__ volatile("sti");
 		__asm__ volatile("hlt");
 	}
@@ -1620,6 +2084,98 @@ void sched_reparent_children(task_t *task)
 	task->first_child = NULL;
 }
 
+/* ============================================================================
+ * Release the exiting thread's address space, in its own context
+ *
+ * A dying process used to keep every page it had until some *other* task
+ * happened to enter the scheduler voluntarily, because that is the only place
+ * the reaper runs.  For a mail client that meant holding on to the better part
+ * of a gigabyte after the window had already closed, and the release itself
+ * then ran on the scheduling tail of whatever unrelated task was picked next.
+ *
+ * The thread that is leaving is the right one to do this, and now is the right
+ * time: it has nothing left to do, it is not on any run queue, and it is
+ * running with interrupts on where the work can be interrupted like any other.
+ *
+ * Idempotent, so the park loop below can call it without checking.
+ * ========================================================================== */
+void exit_mm_self(task_t *task)
+{
+	mm_struct_t *mm;
+	uint64_t *pml4;
+
+	if (!task)
+		return;
+
+	/* This has to be the running task -- it switches CR3 -- and it must
+	 * already be unrunnable, which is what makes "no other CPU can pick
+	 * it up mid-teardown" true rather than hopeful. */
+	BUG_ON(task != sched_current());
+	BUG_ON(task->on_rq);
+	might_sleep();
+
+	mm = task->mm;
+	pml4 = task->pml4;
+	if (!mm && !pml4)
+		return; /* already done */
+
+	/* An address space reached through a shared record must be the same
+	 * one the task points at, or the wrong tables get taken apart. */
+	WARN_ON(mm && mm->pml4 && mm->pml4 != pml4);
+
+	/* Stop advertising ownership of user memory BEFORE giving it up.
+	 * copy_to_user/copy_from_user test exactly this, so a preemption in
+	 * this window finds a task that says it cannot reach user addresses --
+	 * which by the next line is true.  Reversed, the same window has the
+	 * kernel faulting on a user address for a task that no longer has
+	 * one mapped. */
+	task->pml4 = NULL;
+	task->mm = NULL;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+
+	/* Leave the address space before destroying it.  The kernel's own
+	 * tables carry this stack and the direct map -- both live in entries
+	 * every address space shares -- so there is solid ground to stand on
+	 * while the walk below frees the rest. */
+	mm_switch_address_space(g_kernel_pml4);
+
+	if (mm)
+		mm_struct_put(mm);
+	else
+		mm_destroy_address_space(pml4);
+}
+
+/*
+ * Where a thread that is finished goes.
+ *
+ * Gives back its address space first, then waits to be taken off the books.
+ * Interrupts stay ON across the halt: a CPU halted with them off has nothing
+ * that can wake it and cannot acknowledge an address-space invalidation, which
+ * takes every other CPU down with it.
+ */
+__attribute__((noreturn)) void sched_exit_park(void)
+{
+	task_t *me = sched_current();
+
+	WARN_ON_ONCE(me && !me->has_exited && me->state != TASK_ZOMBIE);
+
+	/* Interrupts on before anything else.  One of the ways in here is the
+	 * tail of an interrupt that was about to return to user code, so they
+	 * may still be off -- and releasing an address space is far too much
+	 * work to do in that state: it would hold off the timer, the
+	 * invalidation acknowledgements other CPUs wait on, and every device.
+	 * Nothing here returns to the interrupted context, and the loop below
+	 * runs with them on regardless, so there is nothing to preserve. */
+	__asm__ volatile("sti");
+
+	exit_mm_self(me);
+
+	for (;;) {
+		sched_schedule(); /* should not return */
+		__asm__ volatile("sti; hlt");
+	}
+}
+
 void sched_remove_task(task_t *task)
 {
 	if (!task || task == &g_bootstrap_task || task == &g_idle_task)
@@ -1719,8 +2275,14 @@ void sched_remove_task(task_t *task)
 	// SMP barrier: Before destroying address space, ensure no other CPU has
 	// TLB entries pointing to pages we're about to free. This prevents races
 	// where another CPU uses stale TLB entries to access freed/reallocated pages.
+	/* Aimed at this task's address space rather than broadcast: nobody else
+	 * can hold its translations, and the spin above has already established
+	 * that the task is not running anywhere, so this is normally free. */
 	if (smp_is_enabled()) {
-		smp_tlb_shootdown_sync();
+		if (task->pml4)
+			smp_tlb_shootdown_mm_sync(virt_to_phys(task->pml4));
+		else
+			smp_tlb_shootdown_sync();
 	}
 
 	// Release mm_struct (deferred from sched_mark_task_exited).
@@ -1873,7 +2435,22 @@ task_t *sched_fork_current(void)
 	child->kernel_stack_base = k_stack_mem;
 	child->rq_next = NULL;
 	child->on_rq = false;
-	child->parent = cur;
+	/* The whole task struct was copied, so the child would otherwise
+	 * inherit the reference the PARENT is holding for the syscall it is
+	 * inside right now -- and release it on the way out of fork, giving
+	 * back a reference it never took. */
+	child->syscall_unix_ref = NULL;
+	/* A child belongs to the PROCESS that forked it, never to the thread
+	 * inside it that made the call.
+	 *
+	 * Recording the calling thread means no other thread can reap the child
+	 * -- waitpid() walks its own child list and reports ECHILD -- and
+	 * getppid() in the child answers with a thread id that names no process.
+	 * A program that runs a thread per connection and forks a helper from it
+	 * hits both at once, and neither reports anything: the helper is never
+	 * collected, and the code that asked about its parent is quietly told
+	 * something untrue. */
+	child->parent = cur->group_leader ? cur->group_leader : cur;
 	child->first_child = NULL;
 	child->next_sibling = NULL;
 	child->exit_code = 0;
@@ -1926,7 +2503,10 @@ task_t *sched_fork_current(void)
 	signal_fork_copy(child, cur);
 
 	// Add to parent's child list
-	sched_add_child(cur, child);
+	/* The process adopts the child, not the thread that called fork().
+	 * sched_add_child() assigns ->parent itself, so this is the assignment
+	 * that decides it -- see the note above where the field is first set. */
+	sched_add_child(cur->group_leader ? cur->group_leader : cur, child);
 
 	// Duplicate file descriptors
 	for (int i = 0; i < TASK_MAX_FDS; i++) {
@@ -1946,12 +2526,14 @@ task_t *sched_fork_current(void)
 					__atomic_fetch_add(&s->ref_count, 1,
 							   __ATOMIC_ACQ_REL);
 				child->fd_table[i] = task_fds(cur)[i];
-			} else if (IS_UNIX_SOCKET_FD(task_fds(cur)[i])) {
-				unix_socket_t *us = unix_get(
-					(int)(uintptr_t)task_fds(cur)[i]);
-				if (us)
-					__atomic_fetch_add(&us->ref_count, 1,
-							   __ATOMIC_ACQ_REL);
+			} else if (unix_sock_is(task_fds(cur)[i])) {
+				unix_socket_t *us =
+					(unix_socket_t *)task_fds(cur)[i];
+				/* Both counters together: the descriptor
+				 * count that decides the hangup, and the
+				 * reference that keeps the socket in
+				 * existence. */
+				unix_sock_fdget(us);
 				child->fd_table[i] = task_fds(cur)[i];
 			} else if (IS_EPOLL_FD(task_fds(cur)[i])) {
 				/* The child gets its own descriptor onto the
@@ -2167,8 +2749,7 @@ void sched_wake_expired_sleepers(uint64_t current_tick)
 		// Check sleep timer
 		if (t->state == TASK_BLOCKED && t->wakeup_tick != 0 &&
 		    current_tick >= t->wakeup_tick) {
-			if (nwake < 16 &&
-			    sched_claim_wake(t, TASK_BLOCKED)) {
+			if (nwake < 16 && sched_claim_wake(t, TASK_BLOCKED)) {
 				t->wakeup_tick = 0;
 				to_wake[nwake++] = t;
 			}
@@ -2176,8 +2757,7 @@ void sched_wake_expired_sleepers(uint64_t current_tick)
 
 		// Wake blocked tasks with pending signals
 		if (t->state == TASK_BLOCKED && signal_pending(t)) {
-			if (nwake < 16 &&
-			    sched_claim_wake(t, TASK_BLOCKED)) {
+			if (nwake < 16 && sched_claim_wake(t, TASK_BLOCKED)) {
 				t->wakeup_tick = 0;
 				to_wake[nwake++] = t;
 			}
@@ -2219,12 +2799,43 @@ void sched_wake_expired_sleepers(uint64_t current_tick)
  * task_t is freed shortly after it is unlinked, so walking it unlocked follows
  * a stale pointer into freed memory.
  */
+/* A task pointer that came out of a list which may have been corrupted,
+ * checked before anything dereferences it.
+ *
+ * The guards in the ring walks below used to test for NULL alone, which cannot
+ * catch what actually goes wrong: a task_t freed while something still refers
+ * to it reads back as the slab's free poison, and 0xfeedfacefeedface is not
+ * NULL -- it is a non-canonical address, so touching it is a general
+ * protection fault rather than a page fault.  Taken with the task-list lock
+ * held and interrupts off, that fault cannot be recovered from at all: the
+ * processor wedges still holding the lock and the whole machine halts, instead
+ * of one process dying.  Observed exactly so, with RAX = 0xfeedfacefeedface,
+ * under two testlibc runs in parallel.
+ *
+ * kptr_plausible() rejects the poison and every other value that is not a
+ * kernel address, before the read that would fault. */
+bool task_ptr_ok(const task_t *t)
+{
+	return t && kptr_plausible((uint64_t)(uintptr_t)t);
+}
+
 void sched_kill_thread_group(task_t *task, int exit_code)
 {
 	if (!task)
 		return;
 
 	task_t *leader = task->group_leader ? task->group_leader : task;
+
+	/* Validated BEFORE the two writes below, which are made with no lock
+	 * held: group_leader is a bare pointer and nothing clears it in the
+	 * surviving threads, so a leader that has already been reaped is
+	 * written straight into freed memory -- and then walked from. */
+	if (!task_ptr_ok(leader)) {
+		WARN_ON_ONCE(1);
+		kprintf("BUG: pid %d group_leader is unusable (%p) - group not killed\n",
+			task->id, (void *)leader);
+		return;
+	}
 
 	leader->group_exiting = true;
 	leader->group_exit_code = exit_code;
@@ -2236,12 +2847,35 @@ void sched_kill_thread_group(task_t *task, int exit_code)
 	spin_lock_irqsave(&g_task_list_lock, &flags);
 	{
 		task_t *t = leader;
+		int guard = 0;
 
 		do {
 			if (t != task && !t->has_exited &&
 			    n < TASK_GROUP_KILL_MAX)
 				targets[n++] = t;
 			t = t->thread_group_next;
+			/* A ring that does not lead back to its leader is
+			 * broken, and following it dereferences whatever it
+			 * happens to point at.  That matters far more here
+			 * than it looks: this walk runs with the task-list
+			 * lock held and interrupts off, where a fault cannot
+			 * be recovered from -- the processor wedges still
+			 * holding the lock and takes the whole machine with
+			 * it, instead of one process dying.  Observed as a
+			 * read of address 0x80 (a NULL task's has_exited)
+			 * while killing a process that had just been sent a
+			 * fatal signal.
+			 *
+			 * Stop and say so.  Whatever broke the ring is a
+			 * separate defect; it must not be able to cost the
+			 * system. */
+			if (!task_ptr_ok(t) ||
+			    ++guard > TASK_GROUP_KILL_MAX * 4) {
+				WARN_ON_ONCE(1);
+				kprintf("BUG: thread group ring of tgid %d broken at %p (guard %d)\n",
+					leader->id, (void *)t, guard);
+				break;
+			}
 		} while (t != leader);
 	}
 	spin_unlock_irqrestore(&g_task_list_lock, flags);
@@ -2279,16 +2913,49 @@ void sched_notify_parent_of_exit(task_t *task)
 			 * task that is about to be freed.  Clearing exit_signal
 			 * routes it to dead_thread_queue at the next switch,
 			 * which is the only safe place to free it. */
+			uint64_t wflags;
+			int wake;
+
+			spin_lock_irqsave(&g_wait_lock, &wflags);
 			sched_remove_child(parent, task);
 			task->parent = &g_bootstrap_task;
 			task->exit_signal = 0;
+			wake = (parent->state == TASK_BLOCKED &&
+				parent->wait_channel == parent);
+			spin_unlock_irqrestore(&g_wait_lock, wflags);
+
+			/* A parent that ignores SIGCHLD *and* calls waitpid()
+			 * anyway still has to be let go: POSIX says the wait
+			 * blocks until every child is gone and then fails with
+			 * ECHILD, and we have just taken away the last thing it
+			 * could have been waiting for.  Leaving it asleep here
+			 * hangs it forever — the reaping it is waiting for has
+			 * already happened. */
+			if (wake)
+				sched_wake_task(parent);
 			return;
 		}
 	}
 
-	/* Wake a parent parked in waitpid... */
-	if (parent->state == TASK_BLOCKED && parent->wait_channel == parent)
-		sched_wake_task(parent);
+	/* Wake a parent parked in waitpid...
+	 *
+	 * Under g_wait_lock, so that a parent deciding to sleep at this exact
+	 * moment either sees our has_exited (set before we got here) and stays
+	 * awake, or is already marked BLOCKED when we look.  The wake goes
+	 * outside the lock: sched_wake_task() enqueues, which takes runqueue
+	 * locks, and the claim CAS inside it makes a redundant wake a no-op. */
+	{
+		uint64_t wflags;
+		int wake;
+
+		spin_lock_irqsave(&g_wait_lock, &wflags);
+		wake = (parent->state == TASK_BLOCKED &&
+			parent->wait_channel == parent);
+		spin_unlock_irqrestore(&g_wait_lock, wflags);
+
+		if (wake)
+			sched_wake_task(parent);
+	}
 
 	/* ...and signal one that instead polls and relies on a SIGCHLD handler.
 	 * Both are needed; see the note at the other call site. */
@@ -2898,7 +3565,8 @@ void sched_dump_tasks(struct tty *tty)
 				tty,
 				"  CPU%u: rq_len=%u ctx_sw=%llu head_pid=%d cur=%d in_ctxsw=%d nr=%d rem=%d\n",
 				c, rq_len, ctx_sw, head_pid, ct ? ct->id : -1,
-				cpu->in_context_switch, ct ? ct->need_resched : 0,
+				cpu->in_context_switch,
+				ct ? ct->need_resched : 0,
 				ct ? ct->remaining_ticks : 0);
 		}
 	}
@@ -2968,8 +3636,7 @@ void sched_dump_tasks(struct tty *tty)
 			snaps[i].ppid, snaps[i].on_cpu, sn, snaps[i].on_rq,
 			snaps[i].nr_threads, snaps[i].is_leader,
 			snaps[i].last_rip, snaps[i].user_rip,
-			(uint64_t)snaps[i].sp,
-			(uint64_t)snaps[i].wait_channel);
+			(uint64_t)snaps[i].sp, (uint64_t)snaps[i].wait_channel);
 	}
 	tty_printf(
 		tty,
@@ -3073,7 +3740,16 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 	if (!cur)
 		return;
 
-	// Don't preempt the bootstrap task - it's handling critical init code
+	/* Don't preempt the bootstrap task - it's handling critical init code.
+	 *
+	 * This cannot be relaxed: the bootstrap task is not a schedulable
+	 * context.  It has no entry point and no stack of its own (sp = 0), and
+	 * its canary belongs to the boot processor, so switching away from it
+	 * puts it on a runqueue where it can be resumed -- or migrated -- as
+	 * though it could run.
+	 *
+	 * It only has to hold until boot finishes: sched_bsp_park() then retires
+	 * it and the boot processor becomes an ordinary one. */
 	if (is_bootstrap_task(cur))
 		return;
 
@@ -3121,8 +3797,10 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 
 	// Check sp BEFORE enqueueing cur — fall through to idle if next is bad
 	if (next->sp == 0 || next->state == TASK_ZOMBIE) {
-		if (!is_idle_task(next) && next->state != TASK_ZOMBIE)
+		if (!is_idle_task(next) && next->state != TASK_ZOMBIE) {
+			rq_note_sp0_refusal(next);
 			rq_enqueue_locked(cpu, next);
+		}
 		next = cpu->idle_task;
 	}
 
@@ -3190,6 +3868,7 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 	/* SMP double-run guard — zero next->sp before switching; see the
      * detailed comment in sched_schedule().  Prevents another CPU from
      * resuming a task while this CPU is still on its kernel stack. */
+	next->sp0_refusals = 0; /* it is running: the refusal run ends here */
 	uint64_t *next_sp = next->sp;
 	next->sp = 0;
 	ctx_switch_asm(&prev->sp, next_sp);
@@ -3605,6 +4284,28 @@ void thread_group_remove(task_t *thread)
 		leader->nr_threads--;
 	}
 
+	/* The leader is NOT replaced when it leaves first, and must not be.
+	 *
+	 * A group leader that exits while its threads run stays a zombie: it
+	 * is the task carrying the tgid, the task ps shows as the process, and
+	 * the task the parent reaps.  sched_mark_task_exited() is built around
+	 * that -- a leader with threads left sets should_notify_parent = false,
+	 * and the LAST thread to leave calls sched_notify_parent_of_exit() on
+	 * the leader's behalf.
+	 *
+	 * Promoting a successor here (which this briefly did, to stop a freed
+	 * leader being dereferenced) repointed every thread's group_leader at
+	 * the new task while the zombie the parent had to reap was still the
+	 * old one.  Nothing then notified anybody about it, and every run of a
+	 * threaded program left a permanent zombie behind.
+	 *
+	 * The freed-leader problem it was trying to solve is a LIFETIME
+	 * problem: the leader's task_t must not be freed while any thread
+	 * still refers to it.  Repointing the references away is not a fix for
+	 * that, and it breaks the exit protocol.  task_ptr_ok() in the ring
+	 * walks keeps a stale pointer from taking the machine down until the
+	 * lifetime is fixed properly. */
+
 	// Clear thread's group links
 	thread->thread_group_next = thread;
 	thread->thread_group_prev = thread;
@@ -3730,7 +4431,15 @@ void mm_struct_put(mm_struct_t *mm)
 		// Other CPUs may still have stale TLB entries pointing to pages
 		// we're about to free. Without this, those CPUs could access
 		// freed/reallocated memory causing corruption or triple faults.
-		if (smp_is_enabled()) {
+		//
+		/* Only the CPUs actually running a thread of this address space
+		 * can hold its translations, and by the time its last reference
+		 * goes there are no such threads left -- so this normally sends
+		 * no interrupts at all, where the broadcast form interrupted
+		 * every CPU and waited for each to answer. */
+		if (smp_is_enabled() && mm->pml4) {
+			smp_tlb_shootdown_mm_sync(virt_to_phys(mm->pml4));
+		} else if (smp_is_enabled()) {
 			smp_tlb_shootdown_sync();
 		}
 		if (mm->pml4) {
@@ -3797,12 +4506,14 @@ files_struct_t *files_struct_clone(files_struct_t *src)
 					__atomic_fetch_add(&s->ref_count, 1,
 							   __ATOMIC_ACQ_REL);
 				files->fd_table[i] = src->fd_table[i];
-			} else if (IS_UNIX_SOCKET_FD(src->fd_table[i])) {
-				unix_socket_t *us = unix_get(
-					(int)(uintptr_t)src->fd_table[i]);
-				if (us)
-					__atomic_fetch_add(&us->ref_count, 1,
-							   __ATOMIC_ACQ_REL);
+			} else if (unix_sock_is(src->fd_table[i])) {
+				unix_socket_t *us =
+					(unix_socket_t *)src->fd_table[i];
+				/* Both counters together: the descriptor
+				 * count that decides the hangup, and the
+				 * reference that keeps the socket in
+				 * existence. */
+				unix_sock_fdget(us);
 				files->fd_table[i] = src->fd_table[i];
 			} else if (IS_EPOLL_FD(src->fd_table[i])) {
 				epoll_get(EPOLL_FD_IDX(src->fd_table[i]));
@@ -3850,10 +4561,10 @@ void files_struct_put(files_struct_t *files)
 						files->fd_table[i]);
 					files->fd_table[i] = NULL;
 					sock_close(idx);
-				} else if (IS_UNIX_SOCKET_FD(
-						   files->fd_table[i])) {
-					int ufd = (int)(uintptr_t)
-							  files->fd_table[i];
+				} else if (unix_sock_is(files->fd_table[i])) {
+					unix_socket_t *ufd =
+						(unix_socket_t *)
+							files->fd_table[i];
 					files->fd_table[i] = NULL;
 					unix_close(ufd);
 				} else if (IS_EPOLL_FD(files->fd_table[i])) {

@@ -1,6 +1,7 @@
 #include <unistd.h>
 #include <stdio.h>    /* snprintf: fchdir builds a /dev/fd path */
 #include <errno.h>
+#include "../pthread/pthread_internal.h"
 #include <limits.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -27,7 +28,25 @@
 #include <sys/xattr.h>
 #include "syscall.h"
 
-int errno = 0;
+/* Fallback errno for contexts with no thread control block: a statically
+ * linked program whose loader reserved none, or anything running before
+ * __pthread_init.  Named, not `errno', because <errno.h> now makes that an
+ * expression rather than an object. */
+int __errno_fallback = 0;
+
+/* POSIX requires errno to be thread-local.  The thread control block the
+ * loader installs at %fs holds this thread's copy; the self pointer at
+ * offset 0 is what proves a block is actually there, since %fs may be
+ * unset or point at unrelated memory before threading is initialised. */
+int *__errno_location(void)
+{
+	struct __pthread *tcb;
+
+	__asm__ volatile("mov %%fs:0, %0" : "=r"(tcb));
+	if (!tcb || tcb->self != tcb)
+		return &__errno_fallback;
+	return &tcb->errno_val;
+}
 
 int open(const char *pathname, int flags, ...)
 {

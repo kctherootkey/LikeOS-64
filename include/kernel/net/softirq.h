@@ -27,6 +27,11 @@ enum {
 	SOFTIRQ_NET_TX = 1, // future use
 	SOFTIRQ_TIMER = 2, // drain the deferred connection-free queue
 	SOFTIRQ_TCP_TIMER = 3, // run the per-connection TCP timer sweep
+	/* Drain the deferred free queue of AF_UNIX sockets.  A vector of its
+	 * own rather than sharing SOFTIRQ_TIMER, which TCP already registers a
+	 * handler on -- one handler per vector, and registering twice warns
+	 * and loses one of them. */
+	SOFTIRQ_UNIX = 4,
 	NR_SOFTIRQ = 32
 };
 

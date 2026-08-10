@@ -30,7 +30,14 @@
 #define POISON_FREED_PAGE 0xFEEDFACEU
 #define POISON_UNINIT_PAGE 0xCCCCCCCCU
 
-/* Fill *bytes* bytes at *dest* with a repeating 32-bit *pattern*. */
+/* Fill *bytes* bytes at *dest* with a repeating 32-bit *pattern*.
+ *
+ * Debug builds only, and every caller is gated to match.  Poisoning on the
+ * release paths used to be unconditional, which cost a write of every byte
+ * being freed -- close to a gigabyte for a large process on its way out, all
+ * of it inside the physical allocator's global lock with interrupts disabled,
+ * and none of it ever read back in a production build. */
+#if DEBUG
 static void mm_poison_fill(void *dest, uint32_t pattern, size_t bytes)
 {
 	uint8_t *ptr = (uint8_t *)dest;
@@ -84,6 +91,7 @@ static void mm_poison_fill(void *dest, uint32_t pattern, size_t bytes)
 		break;
 	}
 }
+#endif /* DEBUG */
 
 // ============================================================================
 // SMP LOCKING
@@ -950,12 +958,30 @@ void mm_free_physical_page(uint64_t physical_address)
 		return; // Already free
 	}
 
-	/* Always poison the page before marking it free.  We hold the lock and
-     * the page bit is still set, so no other CPU can grab the page yet. */
+	/* Poison the page before marking it free, in debug builds only.  We hold
+     * the lock and the page bit is still set, so no other CPU can grab the
+     * page yet.
+     *
+     * This used to run unconditionally, and it was the single most expensive
+     * thing a large process did on its way out.  Tearing down a 900MB address
+     * space freed ~230,000 pages, each one a 4KB store loop inside this
+     * global lock with interrupts disabled -- close to a gigabyte of stores
+     * that nothing ever reads back.  Worse than the raw cost: a CPU waiting
+     * for this lock waits with interrupts off (spin_lock_irqsave disables
+     * before it spins), so it cannot acknowledge the TLB shootdown IPI that
+     * some other CPU is blocked waiting for.  The page freeing starved the
+     * acknowledgements, the shootdowns ran into their one-second deadline,
+     * and closing a mail client took two minutes.
+     *
+     * The allocation path above has always been gated this way, and in
+     * non-debug builds it zeroes every page it hands out -- so poisoning here
+     * meant writing every page twice for no observable effect. */
+#if DEBUG
 	if (is_phys_in_direct_map(physical_address)) {
 		mm_poison_fill(phys_to_virt(physical_address),
 			       POISON_FREED_PAGE, PAGE_SIZE);
 	}
+#endif
 	clear_page_bit(page);
 	mm_state.free_pages++;
 
@@ -980,6 +1006,161 @@ void mm_free_physical_page(uint64_t physical_address)
 	}
 
 	spin_unlock_irqrestore(&mm_phys_lock, flags);
+}
+
+/* ============================================================================
+ * Batched release
+ *
+ * mm_free_physical_page() takes a global lock with interrupts disabled, so
+ * releasing a page costs an acquire/release pair and an interrupt-off window
+ * each.  For one page that is noise.  For an address space it is the whole
+ * cost: a 900MB process is ~230,000 pages, which is 230,000 of each, back to
+ * back, on a lock every other CPU's allocator needs.
+ *
+ * It is not only slow, it is actively harmful to the rest of the machine.
+ * spin_lock_irqsave() disables interrupts BEFORE it spins, so every CPU
+ * queued behind this lock is sitting with interrupts off and cannot
+ * acknowledge a TLB shootdown -- which is what a third CPU is blocked waiting
+ * for.  Long enough and that wait hits its deadline, and the exit that caused
+ * it is measured in minutes.
+ *
+ * Freeing in batches takes the lock a few times per hundred pages instead of
+ * once per page, and bounds each interrupt-off window to the arithmetic for
+ * one batch -- roughly a microsecond -- with an interrupt window between
+ * every one.
+ * ========================================================================== */
+
+void mm_free_physical_pages_batch(const uint64_t *phys, unsigned n)
+{
+	uint64_t flags;
+	unsigned i;
+
+	if (n == 0)
+		return;
+	BUG_ON(phys == NULL);
+	BUG_ON(n > MM_FREE_BATCH_MAX);
+
+#if DEBUG
+	/* The poison pass below deliberately runs with the lock dropped, so a
+	 * caller already in atomic context would defeat the point.  Only a
+	 * constraint in debug builds -- without the poison there is nothing
+	 * between the two halves and the release is safe from anywhere. */
+	might_sleep();
+	{
+		uint64_t poison = 0; /* bit i: phys[i] is ours to poison */
+
+		/* Decide what to poison with the lock held, then poison with it
+		 * dropped.  The page bits are deliberately left SET across the
+		 * poison pass: while a bit is set no other CPU can be handed
+		 * that page, which is what makes it safe to write to it without
+		 * holding anything. */
+		spin_lock_irqsave(&mm_phys_lock, &flags);
+		for (i = 0; i < n; i++) {
+			uint64_t page;
+
+			if (phys[i] < mm_state.memory_start ||
+			    phys[i] >= mm_state.memory_end)
+				continue;
+			page = (phys[i] - mm_state.memory_start) / PAGE_SIZE;
+			if (is_page_allocated(page))
+				poison |= 1ULL << i;
+		}
+		spin_unlock_irqrestore(&mm_phys_lock, flags);
+
+		for (i = 0; i < n; i++) {
+			if (!(poison & (1ULL << i)))
+				continue;
+			if (is_phys_in_direct_map(phys[i]))
+				mm_poison_fill(phys_to_virt(phys[i]),
+					       POISON_FREED_PAGE, PAGE_SIZE);
+		}
+	}
+#endif
+
+	/* Release.  This pass is the authoritative one: it re-checks every
+	 * entry and is the only place that reports a double free, so the
+	 * debug pass above stays silent about what it skips. */
+	spin_lock_irqsave(&mm_phys_lock, &flags);
+	for (i = 0; i < n; i++) {
+		uint64_t pa = phys[i];
+		uint64_t page;
+
+		VM_BUG_ON(pa & (PAGE_SIZE - 1));
+		if (pa < mm_state.memory_start || pa >= mm_state.memory_end)
+			continue;
+
+		page = (pa - mm_state.memory_start) / PAGE_SIZE;
+		if (!is_page_allocated(page)) {
+			WARN(1, "mm_free_physical_pages_batch: double-free of page at 0x%lx",
+			     (unsigned long)pa);
+			continue;
+		}
+
+		/* Same invariant mm_free_physical_page() documents: one
+		 * reference is the allocator's own, anything above one means a
+		 * live mapping is about to be released. */
+		if (mm_state.page_refcounts) {
+			WARN_RATELIMIT(mm_state.page_refcounts[page] > 1,
+				       "mm_free_physical_pages_batch: releasing 0x%lx with %u references still held",
+				       (unsigned long)pa,
+				       mm_state.page_refcounts[page]);
+			mm_state.page_refcounts[page] = 0;
+		}
+
+		clear_page_bit(page);
+		mm_state.free_pages++;
+		if (page < g_alloc_hint)
+			g_alloc_hint = page;
+	}
+	spin_unlock_irqrestore(&mm_phys_lock, flags);
+}
+
+/* Drop a reference on each of `n` pages, releasing those whose last reference
+ * goes, in one batch.  The refcount half is lock-free (a CAS per page, exactly
+ * as mm_put_page does it); only the pages that actually reach zero reach the
+ * allocator, and they go together. */
+void mm_put_pages_batch(const uint64_t *phys, unsigned n)
+{
+	uint64_t release[MM_FREE_BATCH_MAX];
+	unsigned nrelease = 0;
+	unsigned i;
+
+	if (n == 0)
+		return;
+	BUG_ON(phys == NULL);
+	BUG_ON(n > MM_FREE_BATCH_MAX);
+
+	for (i = 0; i < n; i++) {
+		uint64_t idx = page_to_index(phys[i]);
+		uint16_t current;
+
+		if (idx == (uint64_t)-1 || !mm_state.page_refcounts) {
+			/* Untracked: the caller's reference is the only one
+			 * there can be. */
+			release[nrelease++] = phys[i];
+			continue;
+		}
+
+		current = __atomic_load_n(&mm_state.page_refcounts[idx],
+					  __ATOMIC_ACQUIRE);
+		for (;;) {
+			if (unlikely(current == 0)) {
+				WARN(1, "mm_put_pages_batch: reference dropped on free page 0x%lx (double free)",
+				     (unsigned long)phys[i]);
+				break;
+			}
+			if (__atomic_compare_exchange_n(
+				    &mm_state.page_refcounts[idx], &current,
+				    current - 1, false, __ATOMIC_ACQ_REL,
+				    __ATOMIC_ACQUIRE))
+				break;
+			/* CAS failed: `current` was reloaded; retry. */
+		}
+		if (current == 1)
+			release[nrelease++] = phys[i];
+	}
+
+	mm_free_physical_pages_batch(release, nrelease);
 }
 
 // Get free pages count
@@ -1068,9 +1249,19 @@ uint64_t mm_allocate_contiguous_pages(size_t page_count)
 // Free contiguous physical pages
 void mm_free_contiguous_pages(uint64_t physical_address, size_t page_count)
 {
+	uint64_t batch[MM_FREE_BATCH_MAX];
+	unsigned n = 0;
+
+	/* In batches, so a large run costs a few acquisitions of the global
+	 * allocator lock rather than one per frame. */
 	for (size_t i = 0; i < page_count; i++) {
-		mm_free_physical_page(physical_address + (i * PAGE_SIZE));
+		if (n == MM_FREE_BATCH_MAX) {
+			mm_free_physical_pages_batch(batch, n);
+			n = 0;
+		}
+		batch[n++] = physical_address + (i * PAGE_SIZE);
 	}
+	mm_free_physical_pages_batch(batch, n);
 }
 
 // VIRTUAL MEMORY MANAGER IMPLEMENTATION
@@ -1628,10 +1819,15 @@ void mm_unmap_page(uint64_t virtual_addr)
  * that had no cross-CPU invalidation at all.
  * ========================================================================== */
 
-void mm_tlb_gather_init(struct mm_tlb_gather *g)
+/* The gather hands its array straight to the batched release, so it must not
+ * be the larger of the two. */
+BUILD_BUG_ON(MM_TLB_GATHER_BATCH > MM_FREE_BATCH_MAX);
+
+void mm_tlb_gather_init(struct mm_tlb_gather *g, uint64_t *pml4)
 {
 	BUG_ON(g == NULL);
 	g->n = 0;
+	g->pml4_phys = pml4 ? virt_to_phys(pml4) : 0;
 }
 
 /* Queue a page whose page-table entry has ALREADY been cleared.  Its reference
@@ -1653,10 +1849,13 @@ void mm_tlb_gather_flush(struct mm_tlb_gather *g)
 	if (g->n == 0)
 		return;
 
-	/* Invalidate everywhere before a single reference is dropped. */
+	/* Invalidate everywhere before a single reference is dropped.  These
+	 * are one process's mappings, so only the CPUs running its threads can
+	 * be holding them -- usually none by the time a process is being torn
+	 * down, in which case this costs nothing at all. */
 	if (sched_is_smp()) {
 		if (likely(!irqs_disabled())) {
-			smp_tlb_shootdown_sync();
+			smp_tlb_shootdown_mm_sync(g->pml4_phys);
 		} else {
 			/* Cannot be done from here: the ack-wait needs to be
 			 * able to service the very interrupts it is waiting on.
@@ -1668,8 +1867,10 @@ void mm_tlb_gather_flush(struct mm_tlb_gather *g)
 		}
 	}
 
-	for (unsigned i = 0; i < g->n; i++)
-		mm_put_page(g->pages[i]);
+	/* One acquisition of the physical allocator's lock for the whole batch
+	 * rather than one per page.  The array is already sized to the batch
+	 * maximum, so it goes straight through. */
+	mm_put_pages_batch(g->pages, g->n);
 	g->n = 0;
 }
 
@@ -1759,6 +1960,17 @@ mmap_region_t *mm_alloc_mmap_region(task_t *task)
 			return &task->mmap_regions[i];
 		}
 	}
+
+	/* Out of region slots.  Every mapping from here on fails with ENOMEM,
+	 * and a program does not experience that as "no more mappings" -- it
+	 * experiences it as an allocation returning nothing, reported by
+	 * whichever library happened to ask, in terms that have nothing to do
+	 * with mappings.  Say it plainly here instead, once per boot, so the
+	 * next occurrence does not have to be deduced from the symptom. */
+	WARN_RATELIMIT(
+		1,
+		"mmap: %s (pid %d) has used all %d region slots; further mappings will fail",
+		task->comm[0] ? task->comm : "?", task->id, TASK_MAX_MMAP);
 	return NULL;
 }
 
@@ -1773,6 +1985,43 @@ mmap_region_t *mm_find_mmap_region(task_t *task, uint64_t addr)
 		}
 	}
 	return NULL;
+}
+
+/*
+ * The region covering *addr if there is one, otherwise the next region above
+ * it -- with *addr moved forward to that region's start.  NULL when nothing
+ * remains at or above *addr.
+ *
+ * This is what lets a walk cross a gap in one step.  Advancing a page at a
+ * time instead means a full scan of the region table for every 4KB of empty
+ * address space, and these tables run close to their limit in the programs
+ * that unmap the most: a single call over a large sparse range spent longer
+ * looking for regions that were not there than it did on the pages that were.
+ */
+static mmap_region_t *mm_region_at_or_after(task_t *task, uint64_t *addr)
+{
+	mmap_region_t *best = mm_find_mmap_region(task, *addr);
+
+	if (best)
+		return best;
+
+	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+		mmap_region_t *r = &task->mmap_regions[i];
+
+		if (!r->in_use || r->start < *addr)
+			continue;
+		/* A record of no length describes nothing, and callers advance
+		 * by the region's extent -- returning one would leave them
+		 * exactly where they were, forever.  Nothing should produce
+		 * one, so say so rather than just stepping over it. */
+		if (WARN_ON(r->length == 0))
+			continue;
+		if (!best || r->start < best->start)
+			best = r;
+	}
+	if (best)
+		*addr = best->start;
+	return best;
 }
 
 /*
@@ -1821,39 +2070,78 @@ static bool mm_regions_mergeable(const mmap_region_t *a, const mmap_region_t *b)
 /*
  * Coalesce every run of adjacent, identical records into one.
  *
- * Run after anything that changes the shape of the table.  Quadratic in the
- * worst case over a table of a few hundred entries, which is nothing beside the
- * page work the same operations do, and it only runs when the shape actually
- * changed.
+ * Run after anything that changes the shape of the table.
+ *
+ * Records only ever merge with records they abut, so putting them in address
+ * order first turns the whole job into one pass: each record absorbs its
+ * successors for as long as they join on, and every record is looked at once.
+ *
+ * The straightforward version compared every record against every other one,
+ * which is the square of the table size on every call -- and the programs that
+ * unmap most are exactly the ones whose tables run close to full, so it was
+ * always the worst case, roughly a quarter of a million comparisons for each
+ * munmap().  A process that trims and regrows its heap does that thousands of
+ * times on its way out.
  */
 void mm_merge_mmap_regions(task_t *task)
 {
+	/* Slot indices, not pointers: a quarter of the stack footprint. */
+	uint16_t order[TASK_MAX_MMAP];
+	int n = 0;
+
 	if (!task)
 		return;
 
+	BUILD_BUG_ON(TASK_MAX_MMAP > 0xFFFF);
+
 	for (int i = 0; i < TASK_MAX_MMAP; i++) {
-		mmap_region_t *a = &task->mmap_regions[i];
+		if (task->mmap_regions[i].in_use)
+			order[n++] = (uint16_t)i;
+	}
+	if (n < 2)
+		return;
 
-		if (!a->in_use)
-			continue;
-		/* Absorb successors for as long as one abuts this record. */
-		for (;;) {
-			int found = -1;
+	/* Shell sort by start address: short, no recursion, no scratch, and
+	 * unbothered by whatever order the slots happen to have been handed
+	 * out in -- which is arbitrary, since freed slots are reused. */
+	{
+		static const int gaps[] = { 127, 57, 23, 10, 4, 1 };
 
-			for (int j = 0; j < TASK_MAX_MMAP; j++) {
-				if (j == i)
-					continue;
-				if (mm_regions_mergeable(a,
-							 &task->mmap_regions[j])) {
-					found = j;
-					break;
+		for (unsigned g = 0; g < sizeof(gaps) / sizeof(gaps[0]); g++) {
+			int gap = gaps[g];
+
+			for (int i = gap; i < n; i++) {
+				uint16_t key = order[i];
+				uint64_t key_start =
+					task->mmap_regions[key].start;
+				int j = i;
+
+				while (j >= gap &&
+				       task->mmap_regions[order[j - gap]].start >
+					       key_start) {
+					order[j] = order[j - gap];
+					j -= gap;
 				}
+				order[j] = key;
 			}
-			if (found < 0)
-				break;
-			{
-				mmap_region_t *b = &task->mmap_regions[found];
+		}
+	}
 
+	/* One pass in address order.  Each record absorbs the run of records
+	 * that join on to it, and the walk resumes past that run, so nothing
+	 * is examined twice. */
+	{
+		int i = 0;
+
+		while (i < n) {
+			mmap_region_t *a = &task->mmap_regions[order[i]];
+			int j = i + 1;
+
+			while (j < n) {
+				mmap_region_t *b = &task->mmap_regions[order[j]];
+
+				if (!mm_regions_mergeable(a, b))
+					break;
 				a->length += b->length;
 				/* Each record held its own reference; the one
 				 * that goes away drops its own. */
@@ -1862,7 +2150,9 @@ void mm_merge_mmap_regions(task_t *task)
 				b->file = NULL;
 				b->in_use = false;
 				b->length = 0;
+				j++;
 			}
+			i = j;
 		}
 	}
 }
@@ -1958,16 +2248,35 @@ void mm_dontneed_range(task_t *task, uint64_t addr, uint64_t length)
 	if (end <= start)
 		return;
 
-	mm_tlb_gather_init(&gather);
-	for (uint64_t va = start; va < end; va += PAGE_SIZE) {
-		mmap_region_t *r = mm_find_mmap_region(task, va);
+	/* Region by region, not page by page.  The lookup is a scan of the
+	 * whole region table, so doing it per page made the cost of a trim
+	 * depend on the size of the range squared against the table -- a 64MB
+	 * heap released in one call is 16,384 pages, each paying a 512-entry
+	 * scan, for a table that describes at most a few hundred mappings. */
+	mm_tlb_gather_init(&gather, task->pml4);
+	{
+		uint64_t va = start;
 
-		/* Only inside a mapping this task actually has, and never a
-		 * file-backed one: dropping those would lose writes that were
-		 * never written back. */
-		if (!r || r->file)
-			continue;
-		mm_unmap_page_gathered(task->pml4, va, &gather);
+		while (va < end) {
+			mmap_region_t *r = mm_region_at_or_after(task, &va);
+			uint64_t region_end, stop;
+
+			if (!r || va >= end)
+				break;
+
+			region_end = r->start + r->length;
+			stop = (end < region_end) ? end : region_end;
+
+			/* Only inside a mapping this task actually has, and
+			 * never a file-backed one: dropping those would lose
+			 * writes that were never written back. */
+			if (!r->file) {
+				for (; va < stop; va += PAGE_SIZE)
+					mm_unmap_page_gathered(task->pml4, va,
+							       &gather);
+			}
+			va = stop;
+		}
 	}
 	mm_tlb_gather_flush(&gather);
 }
@@ -1985,15 +2294,16 @@ int mm_unmap_range_and_regions(task_t *task, uint64_t addr, uint64_t length)
 	 * disabled cannot invalidate anywhere but locally. */
 	mm_assert_write_locked(&task->mmap_lock);
 	WARN_ON(irqs_disabled());
-	mm_tlb_gather_init(&gather);
+	mm_tlb_gather_init(&gather, task->pml4);
 
 	while (cur_addr < end_addr) {
-		mmap_region_t *region = mm_find_mmap_region(task, cur_addr);
-		if (!region) {
-			/* No region covers cur_addr — skip forward one page. */
-			cur_addr += PAGE_SIZE;
-			continue;
-		}
+		/* Crossing a gap costs one step, not one per page: unmapping a
+		 * large sparse range used to scan the whole region table for
+		 * every 4KB of address space that held nothing. */
+		mmap_region_t *region = mm_region_at_or_after(task, &cur_addr);
+
+		if (!region || cur_addr >= end_addr)
+			break;
 
 		uint64_t region_end = region->start + region->length;
 		uint64_t unmap_end =
@@ -2511,9 +2821,12 @@ void kfree(void *ptr)
 	block->magic = HEAP_MAGIC_FREE;
 	block->is_free = 1;
 
-	/* Always poison the freed payload to catch use-after-free. */
+	/* Poison the freed payload to catch use-after-free (debug builds only,
+	 * matching the allocation path above). */
+#if DEBUG
 	mm_poison_fill((uint8_t *)block + sizeof(heap_block_t), 0xDEADBEEFU,
 		       block->size);
+#endif
 
 	// Update statistics
 	mm_state.heap_used -= block->size + sizeof(heap_block_t);
@@ -2966,11 +3279,32 @@ uint64_t *mm_create_user_address_space(void)
 	return new_pml4;
 }
 
+/* Queue one leaf frame of a dying address space for release, flushing the
+ * batch whenever it fills.  See mm_free_physical_pages_batch(): the point is
+ * to take the allocator's global lock a few times per hundred frames instead
+ * of once per frame. */
+static void destroy_put_page(uint64_t *batch, unsigned *n, uint64_t phys)
+{
+	if (*n == MM_FREE_BATCH_MAX) {
+		mm_put_pages_batch(batch, *n);
+		*n = 0;
+	}
+	batch[(*n)++] = phys;
+}
+
 // Destroy an address space and free all user pages
 void mm_destroy_address_space(uint64_t *pml4)
 {
+	uint64_t batch[MM_FREE_BATCH_MAX];
+	unsigned nbatch = 0;
+
 	if (!pml4)
 		return;
+
+	/* Runs preemptibly by contract: the batched release below drops the
+	 * allocator lock between batches precisely so interrupts can be
+	 * serviced, and a caller in atomic context would defeat that. */
+	might_sleep();
 
 	// pml4 is a virtual address (via phys_to_virt)
 	// Calculate the physical address for freeing
@@ -2986,7 +3320,12 @@ void mm_destroy_address_space(uint64_t *pml4)
 	// exits and mm_struct_put is called before the scheduler switches.
 	uint64_t current_cr3 = get_cr3() & ~0xFFFULL;
 	if (pml4_phys == current_cr3) {
+		/* Tracked like any other switch: this CPU is leaving the
+		 * address space it is about to take apart, and must stop being
+		 * counted as a holder of it. */
+		sched_mmu_track_enter(g_kernel_pml4_phys);
 		set_cr3(g_kernel_pml4_phys);
+		sched_mmu_track_done(g_kernel_pml4_phys);
 	}
 
 	int pages_freed = 0;
@@ -3031,10 +3370,12 @@ void mm_destroy_address_space(uint64_t *pml4)
 								 * leaked the other 511. */
 								for (int p2 = 0; p2 < 512;
 								     p2++)
-									mm_put_page(
+									destroy_put_page(
+										batch,
+										&nbatch,
 										phys +
-										(uint64_t)p2 *
-											PAGE_SIZE);
+											(uint64_t)p2 *
+												PAGE_SIZE);
 								pages_freed += 512;
 							} else {
 								uint64_t pt_phys =
@@ -3063,7 +3404,10 @@ void mm_destroy_address_space(uint64_t *pml4)
 										 * goes, and the page
 										 * with it if it was
 										 * the last. */
-										mm_put_page(phys);
+										destroy_put_page(
+											batch,
+											&nbatch,
+											phys);
 										pages_freed++;
 									}
 								}
@@ -3088,6 +3432,10 @@ void mm_destroy_address_space(uint64_t *pml4)
 		}
 	}
 
+	/* Release whatever the last batch still holds. */
+	mm_put_pages_batch(batch, nbatch);
+	nbatch = 0;
+
 	// Free the PML4 itself
 	free_pt_page(pml4_phys);
 	pt_freed++;
@@ -3104,7 +3452,15 @@ void mm_switch_address_space(uint64_t *pml4)
 	if (pml4) {
 		// Convert virtual address back to physical for CR3
 		uint64_t pml4_phys = virt_to_phys(pml4);
+
+		/* Every address-space change goes through here, so this is
+		 * where this CPU records what it is holding.  A CPU that loads
+		 * an address space without saying so would be skipped by an
+		 * invalidation for it and keep using translations that have
+		 * already been taken away. */
+		sched_mmu_track_enter(pml4_phys);
 		set_cr3(pml4_phys);
+		sched_mmu_track_done(pml4_phys);
 	}
 }
 
@@ -3518,7 +3874,14 @@ static bool mm_cow_fault_locked(uint64_t fault_addr)
 	 * CPUs may still translate the faulting address to old_phys: releasing
 	 * it before they are told otherwise would put a page they are still
 	 * reading back into the allocator, which poisons it on the way out. */
-	mm_tlb_gather_init(&gather);
+	{
+		/* This fault is against the running task's address space --
+		 * mm_get_page_table() above resolved through it -- so that is
+		 * the only one whose translations can need invalidating. */
+		task_t *faulting = sched_current();
+
+		mm_tlb_gather_init(&gather, faulting ? faulting->pml4 : NULL);
+	}
 	mm_tlb_gather_page(&gather, old_phys);
 	mm_tlb_gather_flush(&gather);
 

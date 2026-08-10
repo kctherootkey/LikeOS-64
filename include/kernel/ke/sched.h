@@ -382,6 +382,10 @@ typedef struct task {
 	uint32_t on_cpu; // CPU this task is currently assigned to
 	uint64_t cpu_affinity; // Bitmask of allowed CPUs (0 = all CPUs allowed)
 	bool on_rq; // Whether currently in a per-CPU run queue
+	/* Consecutive times a pick refused this task for sp == 0 and put it
+	 * back on the queue.  Reset the moment it is actually picked, so a
+	 * large value means "committed to a CPU that never gave it back". */
+	uint32_t sp0_refusals;
 	int id;
 
 	// Preemption support
@@ -500,6 +504,15 @@ typedef struct task {
 	uint64_t syscall_r15; // Callee-saved
 	uint64_t
 		syscall_kernel_rsp; // Kernel RSP for syscall return (set before call)
+
+	/* A unix socket resolved from a descriptor by the current syscall, held
+	 * for the length of that syscall so a sibling thread closing the same
+	 * descriptor cannot destroy it mid-call.  Taken where the descriptor is
+	 * resolved, released in one place when the syscall returns -- the
+	 * alternative was a matching release on every early return of every
+	 * socket syscall, which is how a reference gets leaked and a slot never
+	 * comes back. */
+	struct unix_socket *syscall_unix_ref;
 
 	// Process name (set from argv[0] basename on execve)
 	char comm[256];
@@ -684,6 +697,9 @@ void sched_schedule(
 	void); // Core preemptive scheduler - switch to next ready task
 void sched_yield_in_kernel(void); // In-kernel cooperative yield (no syscall)
 void sched_run_ready(void);
+/* Retire the boot thread so the boot processor schedules like any other.
+ * Called once, at the end of init, and never returns. */
+void sched_bsp_park(void);
 task_t *sched_current(void);
 int sched_has_user_tasks(void); // Check if any user tasks are running
 
@@ -729,8 +745,36 @@ int sched_wake_channel_once(void *channel, int max);
 int sched_claim_wake(task_t *t,
 		     task_state_t from); // Atomic from->READY claim (see sched.c)
 
+/* Release the running task's address space now, in its own context, rather
+ * than leaving it for the reaper.  Idempotent; the task must already be
+ * unrunnable.  Called from sched_exit_park(). */
+void exit_mm_self(task_t *task);
+
+/* Where a finished thread goes: releases its address space, then parks with
+ * interrupts enabled until it is reaped.  Never returns. */
+__attribute__((noreturn)) void sched_exit_park(void);
+
+/* Record which address space this CPU holds, around a CR3 load.
+ *
+ * `_enter` before the load, `_done` after it, both with the PHYSICAL page-table
+ * root.  Between the two the CPU counts as holding the address space it is
+ * leaving and the one it is entering, which is what makes it safe to invalidate
+ * only the CPUs that are listed: naming one too many wastes an interrupt,
+ * naming one too few leaves it using translations that have been withdrawn.
+ *
+ * Callers go through mm_switch_address_space(); these are exposed only for the
+ * few places that load CR3 directly. */
+void sched_mmu_track_enter(uint64_t pml4_phys);
+void sched_mmu_track_done(uint64_t pml4_phys);
+
 // Global task list lock (protects the all-tasks linked list)
 extern spinlock_t g_task_list_lock;
+
+/* Closes the sleep/wake race between waitpid() and the children it waits on.
+ * Taken by the parent around "check for a reportable child, then mark myself
+ * BLOCKED", and by a child around "is my parent asleep in waitpid?".  See the
+ * long note at its definition in sched.c. */
+extern spinlock_t g_wait_lock;
 
 // SMP support
 void sched_enable_smp(
@@ -806,7 +850,12 @@ void sched_print_tasks(void); // Panic-safe: dump tasks via kprintf
 void thread_group_init(
 	task_t *leader); // Initialize task as thread group leader
 void thread_group_add(task_t *leader, task_t *thread); // Add thread to group
-void thread_group_remove(task_t *thread); // Remove thread from group
+void thread_group_remove(task_t *thread);
+/* True if `t' is safe to dereference: non-NULL and a kernel address.  Used by
+ * the thread-group ring walks, where a freed task_t reads back as the slab
+ * poison -- non-NULL, non-canonical, and fatal to touch with the task-list
+ * lock held and interrupts off. */
+bool task_ptr_ok(const task_t *t); // Remove thread from group
 int thread_group_count(task_t *task); // Get number of threads in group
 void thread_group_signal_all(task_t *task,
 			     int sig); // Signal all threads in group

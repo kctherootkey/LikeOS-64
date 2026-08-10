@@ -183,8 +183,8 @@ static short fd_poll_one(int fd, short events)
 	}
 
 	// UNIX socket fd marker
-	if (IS_UNIX_SOCKET_FD(entry)) {
-		return (short)unix_poll((int)(uintptr_t)entry, events);
+	if (unix_sock_is(entry)) {
+		return (short)unix_poll((unix_socket_t *)entry, events);
 	}
 
 	// Epoll fd marker

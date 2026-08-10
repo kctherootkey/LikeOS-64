@@ -38,6 +38,17 @@ struct vfs_superblock; /* forward — see vfs_sb.h                    */
 // Dirty writeback interval in timer ticks (~100 Hz, so 500 = ~5 seconds)
 #define PC_WRITEBACK_INTERVAL 500
 
+/* Most pages that may be waiting to be written before a writer is made to do
+ * the writing itself.  8MB: enough that ordinary bursts never touch it, small
+ * enough that un-reclaimable data cannot crowd out the rest of the system. */
+#define PC_DIRTY_LIMIT_PAGES 2048
+
+/* Pages a throttled writer stores before it is let go, even if more remain.
+ * 256 (1MB) is a few times a typical write, so the limit is pushed back
+ * without the writer disappearing for as long as the whole backlog takes --
+ * in a graphical program the stalled thread is also answering the display. */
+#define PC_DIRTY_WRITEBACK_BATCH 256
+
 // ============================================================================
 // Page flags
 // ============================================================================
@@ -47,6 +58,15 @@ struct vfs_superblock; /* forward — see vfs_sb.h                    */
 #define PC_PAGE_REFERENCED 0x04 // Accessed since last CLOCK sweep
 #define PC_PAGE_LOCKED 0x08 // Page locked for I/O (do not evict)
 #define PC_PAGE_READAHEAD 0x10 // Page was fetched by read-ahead
+/* Detached from the cache while somebody still held it.
+ *
+ * Invalidation (unlink, truncate, an open that truncates) must make a page
+ * unreachable at once, but it must not release the frame while another
+ * processor is still copying into or out of it -- that hands the frame to a new
+ * owner with a write already in flight against it, and the damage surfaces far
+ * away as corrupted data in an unrelated program.  Such a page is taken off
+ * every list, marked with this, and freed by whoever releases it. */
+#define PC_PAGE_DEAD 0x20
 
 // ============================================================================
 // Structures
@@ -127,6 +147,35 @@ void pagecache_mark_dirty(pc_page_t *page);
 // Flush all dirty pages for a specific file (cluster_id) to disk.
 // Called on close, fsync.  Acquires the FS-wide I/O lock through the
 // globally-registered superblock (g_root_sb) internally.
+/* Obtain a page in order to WRITE into it.
+ *
+ * `full_page` says the caller will replace every byte, which lets the read of
+ * the old contents be skipped.  A page past the current end of file is allowed
+ * -- a write may extend it -- and starts as zeros.
+ *
+ * The caller copies its data in and then calls pagecache_mark_dirty(): the page
+ * must not be advertised for writeback before it holds what is to be written. */
+/* The returned page is HELD: it cannot be reclaimed or written back until the
+ * caller releases it.  Without that, reclaim on another processor is free to
+ * take the frame -- the page is clean until the copy finishes -- and the copy
+ * lands in memory belonging to somebody else.  Release with exactly one of
+ * pagecache_write_end() (published) or pagecache_write_abort() (discarded). */
+pc_page_t *pagecache_get_for_write(unsigned long cluster_id,
+				   unsigned long page_index,
+				   unsigned long file_size,
+				   struct vfs_superblock *sb,
+				   unsigned long start_cluster, int full_page);
+
+/* Publish the write and release the hold. */
+void pagecache_write_end(pc_page_t *page);
+/* Release the hold without publishing: the write failed. */
+void pagecache_write_abort(pc_page_t *page);
+
+/* Store the dirty pages of a set of files in ONE pass over the dirty list.
+ * Flushing a set one file at a time costs a full walk per file, including for
+ * files with nothing dirty -- worse than flushing everything. */
+int pagecache_flush_fileset(const unsigned long *ids, unsigned nids);
+
 int pagecache_flush_file(unsigned long cluster_id);
 
 // Flush all dirty pages globally. Called by periodic writeback timer.
@@ -185,5 +234,22 @@ void pagecache_get_stats(pc_stats_t *stats);
 // Called from timer IRQ handler every PC_WRITEBACK_INTERVAL ticks.
 // Schedules dirty writeback (deferred to a non-IRQ context).
 void pagecache_timer_tick(uint64_t ticks);
+
+/* Perform the periodic writeback the timer flagged, if one is due.
+ *
+ * Call only from a context holding NO filesystem lock: writing back takes the
+ * I/O lock exclusively, and doing that while holding the metadata lock shared
+ * -- which every read does -- deadlocks. */
+int pagecache_writeback_if_due(void);
+
+/* Bound the amount of written-but-not-yet-stored data: past PC_DIRTY_LIMIT_PAGES
+ * the caller writes it back itself.  Every dirty page is un-reclaimable until
+ * stored, so without this a steady writer consumes memory the system cannot get
+ * back and later allocations fail.  Call from the write path, which can block. */
+int pagecache_balance_dirty(void);
+
+/* Store at most `max_pages` dirty pages and return, whether or not more
+ * remain.  For callers that must not be held up by the size of the backlog. */
+int pagecache_flush_bounded(unsigned long max_pages);
 
 #endif // _KERNEL_PAGECACHE_H_

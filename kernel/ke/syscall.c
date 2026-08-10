@@ -537,10 +537,11 @@ static vfs_file_t *fd_dup_entry(vfs_file_t *entry)
 			__atomic_fetch_add(&s->ref_count, 1, __ATOMIC_ACQ_REL);
 		return entry;
 	}
-	if (IS_UNIX_SOCKET_FD(entry)) {
-		unix_socket_t *us = unix_get((int)(uintptr_t)entry);
-		if (us)
-			__atomic_fetch_add(&us->ref_count, 1, __ATOMIC_ACQ_REL);
+	if (unix_sock_is(entry)) {
+		/* Both counters together: the descriptor count that decides
+		 * the hangup, and the reference that keeps the socket alive
+		 * for as long as any descriptor names it. */
+		unix_sock_fdget((unix_socket_t *)entry);
 		return entry;
 	}
 	if (IS_EPOLL_FD(entry)) {
@@ -554,8 +555,13 @@ static vfs_file_t *fd_dup_entry(vfs_file_t *entry)
 	return vfs_dup(entry);
 }
 
-/* Drop the reference held by one descriptor slot.  Mirror of fd_dup_entry. */
-static void fd_release_entry(vfs_file_t *entry)
+/* Drop the reference held by one descriptor slot.  Mirror of fd_dup_entry.
+ *
+ * Not static: a filesystem or socket object that has queued a descriptor of
+ * its own -- an in-band descriptor sent over a socket and never received --
+ * has to release it when it is destroyed, and it cannot know what kind of
+ * thing the queued entry is. */
+void fd_release_entry(vfs_file_t *entry)
 {
 	uint64_t marker = (uint64_t)entry;
 	if (!entry || (marker >= 1 && marker <= 3))
@@ -564,8 +570,8 @@ static void fd_release_entry(vfs_file_t *entry)
 		sock_close(SOCKET_FD_IDX(entry));
 		return;
 	}
-	if (IS_UNIX_SOCKET_FD(entry)) {
-		unix_close((int)(uintptr_t)entry);
+	if (unix_sock_is(entry)) {
+		unix_close((unix_socket_t *)entry);
 		return;
 	}
 	if (IS_EPOLL_FD(entry)) {
@@ -582,10 +588,63 @@ static void fd_release_entry(vfs_file_t *entry)
 	vfs_close(entry);
 }
 
+/* Read descriptor `fd` and take a reference on whatever it holds, with the
+ * read and the reference-take in ONE locked region.
+ *
+ * fd_dup_entry() alone is not enough, because its caller has to read the slot
+ * first: between that read and the reference being taken, a sibling thread
+ * sharing this descriptor table can close the same descriptor and drop the
+ * last reference.  The duplicate then names an object that is already being
+ * destroyed.  While a socket was identified by a table index that was merely
+ * re-checked for liveness, this was survivable; once it is a counted object,
+ * this is the one remaining hole through which a dead one can be brought back.
+ *
+ * Every kind but one takes its reference with a single atomic, so the whole
+ * operation fits inside the lock.  A pipe end is the exception: duplicating it
+ * allocates a second end object, and the allocator must never run with this
+ * lock held -- it can unmap a slab page and wait for every processor to
+ * acknowledge the shootdown, which a processor spinning here with interrupts
+ * off cannot do.  So that case allocates unlocked and then re-reads the slot
+ * to confirm the descriptor still names the same object, discarding the
+ * duplicate if it does not.  That check narrows the window rather than closing
+ * it -- reading the candidate's magic is itself unsynchronised -- which is
+ * exactly the behaviour pipes have today, and is left for a separate change.
+ */
+static vfs_file_t *fd_dup_entry_at(task_t *cur, int fd)
+{
+	uint64_t flags;
+	vfs_file_t *entry;
+	vfs_file_t *copy = NULL;
+
+	if (!cur || fd < 0 || fd >= TASK_MAX_FDS)
+		return NULL;
+
+	fds_lock(cur, &flags);
+	entry = task_fds(cur)[fd];
+	if (entry && !pipe_is_end(entry))
+		copy = fd_dup_entry(entry);
+	fds_unlock(cur, flags);
+
+	if (copy || !entry)
+		return copy;
+
+	copy = fd_dup_entry(entry);
+	if (!copy)
+		return NULL;
+
+	fds_lock(cur, &flags);
+	int same = (task_fds(cur)[fd] == entry);
+	fds_unlock(cur, flags);
+	if (!same) {
+		fd_release_entry(copy);
+		return NULL;
+	}
+	return copy;
+}
+
 // Forward declarations for helper syscalls used before definition
 static int64_t sys_getpid(void);
 static void sys_exit(uint64_t status);
-
 
 // Minimal uname struct (kernel-side)
 typedef struct {
@@ -671,8 +730,8 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 	}
 
 	// UNIX socket fd - read via unix_recv
-	if (IS_UNIX_SOCKET_FD(file)) {
-		return unix_recv((int)(uintptr_t)file, (void *)buf,
+	if (unix_sock_is(file)) {
+		return unix_recv((unix_socket_t *)file, (void *)buf,
 				 (size_t)count, 0);
 	}
 
@@ -763,8 +822,8 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
 	}
 
 	// UNIX socket fd - write via unix_send
-	if (IS_UNIX_SOCKET_FD(file)) {
-		return unix_send((int)(uintptr_t)file, (const void *)buf,
+	if (unix_sock_is(file)) {
+		return unix_send((unix_socket_t *)file, (const void *)buf,
 				 (size_t)count, 0);
 	}
 
@@ -804,6 +863,41 @@ static int build_at_path(task_t *cur, int dirfd, const char *path, char *out,
 			 size_t out_size);
 static int normalize_path(const char *base, const char *path, char *out,
 			  size_t out_size);
+
+/*
+ * Resolve a path against THIS task's working directory (and chroot), in place.
+ *
+ * Every syscall that names a file has to do this before the VFS sees the name.
+ * A relative path that gets through unresolved is resolved much further down,
+ * against a single "current directory" that the entire system shares -- so it
+ * names whatever directory some other process happened to change into last.
+ * The result is a call that operates on a completely different file than the
+ * caller meant, or reports that a file it had just successfully stat'd does not
+ * exist.  Rename was the one that showed it: a mail client found its
+ * configuration directory, failed to rename it, and refused to start.
+ */
+static int canon_task_path(char *path, size_t size)
+{
+	task_t *cur = sched_current();
+	char full[VFS_MAX_PATH];
+	int ret;
+	size_t i;
+
+	if (!cur || !path || size < 2)
+		return -EINVAL;
+
+	ret = build_at_path(cur, AT_FDCWD, path, full, sizeof(full));
+	if (ret != 0)
+		return ret;
+
+	for (i = 0; i + 1 < size && full[i]; i++)
+		path[i] = full[i];
+	path[i] = '\0';
+	/* Truncating would name a different file; refuse instead. */
+	if (full[i] != '\0')
+		return -ENAMETOOLONG;
+	return 0;
+}
 
 // Convert VFS status codes to negative errno values
 static int vfs_status_to_errno(int st)
@@ -1010,7 +1104,8 @@ static int64_t sys_open(uint64_t pathname, uint64_t flags, uint64_t mode)
 		int pr = devfs_open_perm(cur, path, flags);
 		if (pr < 0)
 			return pr;
-		ret = devfs_open_for_task(path, (int)flags, creat_mode(cur, mode), &file, cur);
+		ret = devfs_open_for_task(path, (int)flags,
+					  creat_mode(cur, mode), &file, cur);
 		if (ret == ST_OK && file) {
 			file->refcount = 1;
 			file->flags = (int)flags;
@@ -1095,7 +1190,8 @@ static int64_t sys_openat(uint64_t dirfd, uint64_t pathname, uint64_t flags,
 		int pr = devfs_open_perm(cur, full, flags);
 		if (pr < 0)
 			return pr;
-		ret = devfs_open_for_task(full, (int)flags, creat_mode(cur, mode), &file, cur);
+		ret = devfs_open_for_task(full, (int)flags,
+					  creat_mode(cur, mode), &file, cur);
 		if (ret == ST_OK && file) {
 			file->refcount = 1;
 			file->flags = (int)flags;
@@ -1170,9 +1266,8 @@ static int64_t sys_close(uint64_t fd)
 	 * file's identity (dev/ino) is what the locks are keyed on. */
 	{
 		vfs_file_t *lf = task_fds(cur)[fd];
-		if (lf && !IS_SOCKET_FD(lf) && !IS_UNIX_SOCKET_FD(lf) &&
-		    !IS_EPOLL_FD(lf) && !pipe_is_end(lf) &&
-		    (uintptr_t)lf > 3)
+		if (lf && !IS_SOCKET_FD(lf) && !unix_sock_is(lf) &&
+		    !IS_EPOLL_FD(lf) && !pipe_is_end(lf) && (uintptr_t)lf > 3)
 			frlock_release_for_file(lf, (uint32_t)cur->tgid);
 	}
 
@@ -1202,8 +1297,8 @@ static int64_t sys_close(uint64_t fd)
 	 * in a way the caller could act on. */
 	if (IS_SOCKET_FD(file))
 		return sock_close(SOCKET_FD_IDX(file));
-	if (IS_UNIX_SOCKET_FD(file))
-		return unix_close((int)(uintptr_t)file);
+	if (unix_sock_is(file))
+		return unix_close((unix_socket_t *)file);
 	fd_release_entry(file);
 	return 0;
 }
@@ -1273,8 +1368,12 @@ static int fd_link_target(task_t *cur, int fd, char *out, size_t cap)
 		n = ksnprintf(out, cap, "/dev/tty");
 	} else if (IS_SOCKET_FD(entry)) {
 		n = ksnprintf(out, cap, "socket:[%d]", SOCKET_FD_IDX(entry));
-	} else if (IS_UNIX_SOCKET_FD(entry)) {
-		n = ksnprintf(out, cap, "socket:[%d]", (int)(uintptr_t)entry);
+	} else if (unix_sock_is(entry)) {
+		/* The socket's own small id, never its address: this string is
+		 * handed to userspace, and the descriptor now holds a kernel
+		 * pointer. */
+		n = ksnprintf(out, cap, "socket:[%d]",
+			      (int)((unix_socket_t *)entry)->id);
 	} else if (IS_EPOLL_FD(entry)) {
 		n = ksnprintf(out, cap, "anon_inode:[eventpoll]");
 	} else if (pipe_is_end(entry)) {
@@ -1486,9 +1585,14 @@ static int64_t sys_fstat(uint64_t fd, uint64_t stat_buf)
 		st.st_size = 0;
 		return copy_to_user((void *)stat_buf, &st, sizeof(st));
 	}
-	if (IS_SOCKET_FD(file) || IS_UNIX_SOCKET_FD(file)) {
+	if (IS_SOCKET_FD(file) || unix_sock_is(file)) {
 		st.st_mode = S_IFSOCK | (S_IRUSR | S_IWUSR);
-		st.st_ino = marker;
+		/* A UNIX socket descriptor is a kernel pointer now, so the
+		 * inode number comes from the socket's own small id.  The
+		 * value goes to userspace; the address must not. */
+		st.st_ino = unix_sock_is(file) ?
+				    (unsigned long)((unix_socket_t *)file)->id :
+				    marker;
 		st.st_size = 0;
 		st.st_blksize = 4096;
 		return copy_to_user((void *)stat_buf, &st, sizeof(st));
@@ -1827,8 +1931,8 @@ static int64_t sys_shmget(uint64_t key, uint64_t size, uint64_t shmflg)
 		return -EINVAL;
 
 	int existed = 0;
-	o = shm_sysv_get((int)key, size, create, excl, (unsigned)(shmflg & 0777),
-			 &id);
+	o = shm_sysv_get((int)key, size, create, excl,
+			 (unsigned)(shmflg & 0777), &id);
 	if (!o) {
 		if (excl && create)
 			return -EEXIST;
@@ -2095,7 +2199,6 @@ static int64_t sys_umask(uint64_t mask)
 	return (int64_t)task_set_umask(cur, (uint32_t)mask);
 }
 
-
 /* Real credential syscalls.  Operate on the current task's embedded
  * cred; the set*-id permission rules live in cred.c.  Enforcement of file
  * permissions against these IDs is done by the perm_check and perm_traverse helpers above. */
@@ -2351,7 +2454,7 @@ static int fd_is_special(vfs_file_t *file)
 	uint64_t marker = (uint64_t)file;
 	if (marker >= 1 && marker <= 3)
 		return 1;
-	if (IS_UNIX_SOCKET_FD(file))
+	if (unix_sock_is(file))
 		return 1;
 	if (IS_SOCKET_FD(file))
 		return 1;
@@ -2446,9 +2549,8 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 	 * their own handling rather than reach this. */
 	if (cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW) {
 		vfs_file_t *lf = task_fds(cur)[fd];
-		if (!lf || IS_SOCKET_FD(lf) || IS_UNIX_SOCKET_FD(lf) ||
-		    IS_EPOLL_FD(lf) || pipe_is_end(lf) ||
-		    (uintptr_t)lf <= 3)
+		if (!lf || IS_SOCKET_FD(lf) || unix_sock_is(lf) ||
+		    IS_EPOLL_FD(lf) || pipe_is_end(lf) || (uintptr_t)lf <= 3)
 			return -EBADF;
 		k_flock_t kfl;
 		if (!arg || !validate_user_ptr(arg, sizeof(kfl)))
@@ -2533,8 +2635,8 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 	}
 
 	// UNIX socket fd markers
-	if (IS_UNIX_SOCKET_FD(file)) {
-		unix_socket_t *us = unix_get((int)(uintptr_t)file);
+	if (unix_sock_is(file)) {
+		unix_socket_t *us = (unix_socket_t *)file;
 		if (!us)
 			return -EBADF;
 		if (cmd == F_GETFL) {
@@ -2683,8 +2785,8 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t argp)
 	 * itself (scp hit this — ssh probes its socketpair with tcgetattr).
 	 * The numeric marker tests come first because they dereference
 	 * nothing. */
-	if (IS_UNIX_SOCKET_FD(file)) {
-		unix_socket_t *us = unix_get((int)(uintptr_t)file);
+	if (unix_sock_is(file)) {
+		unix_socket_t *us = (unix_socket_t *)file;
 		if (!us)
 			return -EBADF;
 		if (req == 0x5421 /* FIONBIO */) {
@@ -2867,7 +2969,7 @@ static void ticks_to_timeval(uint64_t ticks, int64_t *sec, int64_t *usec)
 	*usec = (int64_t)((ticks % freq) * (1000000 / freq));
 }
 
-#define K_RUSAGE_SELF     0
+#define K_RUSAGE_SELF 0
 #define K_RUSAGE_CHILDREN (-1)
 
 static int64_t sys_getrusage(uint64_t who, uint64_t uptr)
@@ -3057,6 +3159,9 @@ static int64_t sys_unlink(uint64_t pathname)
 	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
 	if (cret != 0)
 		return cret;
+	cret = canon_task_path(kpath, sizeof(kpath));
+	if (cret != 0)
+		return cret;
 
 	int pr = perm_check_remove(
 		kpath); /* parent write+search, + sticky bit */
@@ -3086,6 +3191,13 @@ static int64_t sys_rename(uint64_t oldpath, uint64_t newpath)
 	if (cret != 0)
 		return cret;
 
+	cret = canon_task_path(koldpath, sizeof(koldpath));
+	if (cret != 0)
+		return cret;
+	cret = canon_task_path(knewpath, sizeof(knewpath));
+	if (cret != 0)
+		return cret;
+
 	int pr = perm_check_remove(
 		koldpath); /* remove source (+ sticky)        */
 	if (pr < 0)
@@ -3111,6 +3223,9 @@ static int64_t sys_mkdir(uint64_t pathname, uint64_t mode)
 	// Copy user path to kernel buffer first
 	char kpath[VFS_MAX_PATH];
 	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (cret != 0)
+		return cret;
+	cret = canon_task_path(kpath, sizeof(kpath));
 	if (cret != 0)
 		return cret;
 
@@ -3142,6 +3257,9 @@ static int64_t sys_rmdir(uint64_t pathname)
 	// Copy user path to kernel buffer first
 	char kpath[VFS_MAX_PATH];
 	int cret = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (cret != 0)
+		return cret;
+	cret = canon_task_path(kpath, sizeof(kpath));
 	if (cret != 0)
 		return cret;
 
@@ -3219,6 +3337,12 @@ static int64_t sys_link(uint64_t oldpath, uint64_t newpath)
 	c = copy_user_path((const char *)newpath, knew, sizeof(knew));
 	if (c)
 		return c;
+	c = canon_task_path(kold, sizeof(kold));
+	if (c)
+		return c;
+	c = canon_task_path(knew, sizeof(knew));
+	if (c)
+		return c;
 	int pr = perm_check_parent(
 		knew, MAY_WRITE | MAY_EXEC); /* write the new dir */
 	if (pr < 0)
@@ -3239,6 +3363,12 @@ static int64_t sys_symlink(uint64_t target, uint64_t linkpath)
 	c = copy_user_path((const char *)linkpath, klink, sizeof(klink));
 	if (c)
 		return c;
+	/* Only the link's own name.  `target` is the link's CONTENT, stored
+	 * verbatim: resolving it would turn a relative symlink into an absolute
+	 * one naming a different file. */
+	c = canon_task_path(klink, sizeof(klink));
+	if (c)
+		return c;
 	int pr = perm_check_parent(
 		klink, MAY_WRITE | MAY_EXEC); /* write the new dir */
 	if (pr < 0)
@@ -3254,6 +3384,9 @@ static int64_t sys_readlink(uint64_t pathname, uint64_t buf, uint64_t bufsiz)
 {
 	char kpath[VFS_MAX_PATH];
 	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (c)
+		return c;
+	c = canon_task_path(kpath, sizeof(kpath));
 	if (c)
 		return c;
 	int tr = perm_traverse(kpath); /* search on every ancestor dir */
@@ -3299,6 +3432,9 @@ static int64_t sys_chmod(uint64_t pathname, uint64_t mode)
 {
 	char kpath[VFS_MAX_PATH];
 	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (c)
+		return c;
+	c = canon_task_path(kpath, sizeof(kpath));
 	if (c)
 		return c;
 	unsigned new_mode = (unsigned)mode;
@@ -3349,6 +3485,9 @@ static int64_t sys_chown(uint64_t pathname, uint64_t owner, uint64_t group)
 {
 	char kpath[VFS_MAX_PATH];
 	int c = copy_user_path((const char *)pathname, kpath, sizeof(kpath));
+	if (c)
+		return c;
+	c = canon_task_path(kpath, sizeof(kpath));
 	if (c)
 		return c;
 	/* Changing the owner is root-only; a non-root owner may change the
@@ -3538,6 +3677,9 @@ static int64_t sys_statfs(uint64_t u_path, uint64_t u_buf)
 	if (err)
 		return err;
 	err = copy_from_user(kpath, (const void *)u_path, plen + 1);
+	if (err)
+		return err;
+	err = canon_task_path(kpath, sizeof(kpath));
 	if (err)
 		return err;
 
@@ -3987,10 +4129,21 @@ static int normalize_path(const char *base, const char *path, char *out,
 			i++;
 		if (!combined[i])
 			break;
-		char segment[64];
+		/* One name, which POSIX allows to be NAME_MAX bytes.
+		 *
+		 * This buffer used to hold 64, and the loop below simply
+		 * stopped copying when it filled -- without advancing past the
+		 * rest of the name.  The remainder was then taken for the NEXT
+		 * component, so "…/averylongname.ext" quietly became
+		 * "…/averylongnam/e.ext": a different file, in a directory that
+		 * does not exist.  Every path with a component over 63
+		 * characters was affected, which is why creating one could
+		 * succeed and removing it could not. */
+		char segment[VFS_NAME_MAX + 1];
 		size_t si = 0;
-		while (combined[i] && combined[i] != '/' &&
-		       si < sizeof(segment) - 1) {
+		while (combined[i] && combined[i] != '/') {
+			if (si >= sizeof(segment) - 1)
+				return -ENAMETOOLONG;
 			segment[si++] = combined[i++];
 		}
 		segment[si] = '\0';
@@ -4095,8 +4248,8 @@ static int build_at_path(task_t *cur, int dirfd, const char *path, char *out,
 			return -EBADF;
 		/* The marker descriptors (sockets, epoll, pipes, the console)
 		 * are not files and have no path; a directory is required. */
-		if (IS_SOCKET_FD(df) || IS_UNIX_SOCKET_FD(df) ||
-		    IS_EPOLL_FD(df) || pipe_is_end(df) || (uintptr_t)df <= 3)
+		if (IS_SOCKET_FD(df) || unix_sock_is(df) || IS_EPOLL_FD(df) ||
+		    pipe_is_end(df) || (uintptr_t)df <= 3)
 			return -ENOTDIR;
 		if (!df->at_path)
 			return -ENOTDIR;
@@ -4132,17 +4285,17 @@ static int build_at_path(task_t *cur, int dirfd, const char *path, char *out,
  * style, and the wrapper does the acquire/release exactly once -- adding an
  * unlock to every return path is how one gets missed.
  */
-#define RUN_WRITE_LOCKED(call)                                       \
-	do {                                                         \
-		task_t *__cur = sched_current();                     \
-		task_t *__mm = task_mm_owner(__cur);                 \
-		int64_t __ret;                                       \
-		if (!__mm)                                           \
-			return -EFAULT;                              \
-		mm_write_lock(&__mm->mmap_lock);                     \
-		__ret = (call);                                      \
-		mm_write_unlock(&__mm->mmap_lock);                   \
-		return __ret;                                        \
+#define RUN_WRITE_LOCKED(call)                       \
+	do {                                         \
+		task_t *__cur = sched_current();     \
+		task_t *__mm = task_mm_owner(__cur); \
+		int64_t __ret;                       \
+		if (!__mm)                           \
+			return -EFAULT;              \
+		mm_write_lock(&__mm->mmap_lock);     \
+		__ret = (call);                      \
+		mm_write_unlock(&__mm->mmap_lock);   \
+		return __ret;                        \
 	} while (0)
 
 static int64_t sys_brk_locked(uint64_t new_brk)
@@ -4310,7 +4463,7 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			return -EBADF;
 		uint64_t marker = (uint64_t)task_fds(caller)[fd];
 		if (marker <= 3 || IS_SOCKET_FD(task_fds(caller)[fd]) ||
-		    IS_UNIX_SOCKET_FD(task_fds(caller)[fd]) ||
+		    unix_sock_is(task_fds(caller)[fd]) ||
 		    IS_EPOLL_FD(task_fds(caller)[fd]) ||
 		    pipe_is_end(task_fds(caller)[fd]))
 			return -ENODEV;
@@ -4354,10 +4507,9 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			for (uint64_t off = 0; off < length; off += PAGE_SIZE) {
 				uint64_t phys = shm_page_phys(
 					sobj, (offset + off) / PAGE_SIZE);
-				if (!phys ||
-				    !mm_map_page_in_address_space(
-					    cur->pml4, vaddr + off, phys,
-					    shm_flags)) {
+				if (!phys || !mm_map_page_in_address_space(
+						     cur->pml4, vaddr + off,
+						     phys, shm_flags)) {
 					for (uint64_t cl = 0; cl < off;
 					     cl += PAGE_SIZE)
 						mm_unmap_page_in_address_space(
@@ -4384,8 +4536,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			 * them back to the physical allocator — they belong to
 			 * the shm object, not to this address space. */
 			region->device = true;
-			region->device_phys = shm_page_phys(sobj, offset /
-								     PAGE_SIZE);
+			region->device_phys =
+				shm_page_phys(sobj, offset / PAGE_SIZE);
 			region->in_use = true;
 			return (int64_t)vaddr;
 		}
@@ -4393,8 +4545,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 
 	if (backing && devfs_is_fb0(backing)) {
 		uint64_t dev_phys = fbdev_mmap_phys(offset, length);
-		uint64_t dev_flags = page_flags | PAGE_DEVICE |
-				     PAGE_WRITE_THROUGH;
+		uint64_t dev_flags =
+			page_flags | PAGE_DEVICE | PAGE_WRITE_THROUGH;
 
 		if (!dev_phys) {
 			if (!(flags & MAP_FIXED))
@@ -4402,12 +4554,10 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			return -ENODEV;
 		}
 		for (uint64_t off = 0; off < length; off += PAGE_SIZE) {
-			if (!mm_map_page_in_address_space(cur->pml4,
-							  vaddr + off,
-							  dev_phys + off,
-							  dev_flags)) {
-				for (uint64_t cl = 0; cl < off;
-				     cl += PAGE_SIZE)
+			if (!mm_map_page_in_address_space(
+				    cur->pml4, vaddr + off, dev_phys + off,
+				    dev_flags)) {
+				for (uint64_t cl = 0; cl < off; cl += PAGE_SIZE)
 					mm_unmap_page_in_address_space(
 						cur->pml4, vaddr + cl);
 				if (!(flags & MAP_FIXED))
@@ -4536,8 +4686,8 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 			uint64_t flags, uint64_t fd, uint64_t offset)
 {
-	RUN_WRITE_LOCKED(sys_mmap_locked(addr, length, prot, flags, fd,
-					 offset));
+	RUN_WRITE_LOCKED(
+		sys_mmap_locked(addr, length, prot, flags, fd, offset));
 }
 
 // SYS_MUNMAP - unmap memory
@@ -4647,10 +4797,7 @@ __attribute__((noreturn)) static void sys_exit(uint64_t status)
      * is serviced (unblocking the rest of the system) and the timer's
      * sched_preempt() evacuates this zombie to the idle task via its own
      * idle fallback, so we are switched off this CPU at the next tick. */
-	for (;;) {
-		sched_schedule();
-		__asm__ volatile("sti; hlt");
-	}
+	sched_exit_park();
 }
 
 // DEPRECATED: These global externs are no longer used directly.
@@ -4767,7 +4914,13 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 		return -EFAULT;
 
 	// Check if there are any children at all
-	if (!cur->first_child) {
+	/* Children hang off the thread-group leader: they belong to the process,
+	 * so any thread of it may wait for them.  Only the child list is read
+	 * through the leader -- everything else here, above all the blocking,
+	 * belongs to the thread that actually called. */
+	task_t *owner = cur->group_leader ? cur->group_leader : cur;
+
+	if (!owner->first_child) {
 		return -ECHILD;
 	}
 
@@ -4783,7 +4936,7 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 		 *   pid == -1 any child
 		 *   pid == 0  any child in the caller's process group
 		 *   pid < -1  any child in process group -pid */
-		for (task_t *c = cur->first_child; c; c = c->next_sibling) {
+		for (task_t *c = owner->first_child; c; c = c->next_sibling) {
 			if (pid > 0 && c->id != (uint32_t)pid)
 				continue;
 			if (pid == 0 && c->pgid != cur->pgid)
@@ -4897,17 +5050,33 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 			return -EINTR;
 		}
 
-		// Block until a child exits or we get a signal
-		// CRITICAL: Disable interrupts to prevent race with child exit.
-		// The child's exit path checks parent->state under IRQ-disabled section.
-		// We must set BLOCKED atomically with respect to that check.
-		uint64_t irq_flags = local_irq_save();
+		/* Block until a child exits or we get a signal.
+		 *
+		 * The re-check and the transition to BLOCKED happen under
+		 * g_wait_lock, which is the same lock a child takes to look at
+		 * whether its parent is asleep here.  That is what makes the
+		 * decision safe: if a child exits during this window it either
+		 * gets the lock first — and we see has_exited below and never
+		 * sleep — or it gets it after us, and finds us already BLOCKED
+		 * with wait_channel set, so it wakes us.
+		 *
+		 * Interrupts-off alone (what this used to do) excludes a timer
+		 * on THIS cpu and nothing at all on the others, so on SMP the
+		 * wake could fall in the gap.  Nothing recovers from that: a
+		 * waitpid sleeper arms no timeout, and SIGCHLD's default action
+		 * is ignore so it is never left pending — the periodic sweep
+		 * that re-wakes blocked tasks has no reason to touch it, and it
+		 * sleeps for good.
+		 *
+		 * Also caught here: a child that vanished entirely (a parent
+		 * ignoring SIGCHLD has its children reaped as they exit).  The
+		 * list can go empty while we are in this loop, and the scan at
+		 * the top of it turns that into the ECHILD it should be. */
+		uint64_t irq_flags;
+		spin_lock_irqsave(&g_wait_lock, &irq_flags);
 
-		// Re-check for reportable children under lock to close the race
-		// window where a child exits (or stops/continues) between our
-		// scan above and setting BLOCKED
 		bool found_zombie = false;
-		task_t *zombie_check = cur->first_child;
+		task_t *zombie_check = owner->first_child;
 		while (zombie_check) {
 			if (zombie_check->has_exited ||
 			    ((options & 2) && zombie_check->jc_stop_signo) ||
@@ -4918,16 +5087,20 @@ static int64_t sys_waitpid(int64_t pid, uint64_t status_ptr, uint64_t options,
 			zombie_check = zombie_check->next_sibling;
 		}
 
-		if (found_zombie) {
-			// A child exited while we were about to block - retry the loop
-			local_irq_restore(irq_flags);
-			continue; // Jump to top of while(1) to reap the zombie
+		if (found_zombie || !owner->first_child) {
+			/* Something to report, or nothing left to wait for:
+			 * either way the top of the loop decides, not us. */
+			spin_unlock_irqrestore(&g_wait_lock, irq_flags);
+			continue;
 		}
 
-		// No zombie found under lock, safe to block
-		cur->state = TASK_BLOCKED;
+		/* wait_channel before state: a reader that sees BLOCKED must
+		 * also see the channel it is blocked on.  (Both stores are
+		 * under the lock, so this only matters for the lock-free
+		 * glances other wakers take.) */
 		cur->wait_channel = cur; // Waiting for our own children
-		local_irq_restore(irq_flags);
+		cur->state = TASK_BLOCKED;
+		spin_unlock_irqrestore(&g_wait_lock, irq_flags);
 
 		sched_schedule();
 		// NOTE: Do NOT set cur->state = TASK_READY here!
@@ -5208,10 +5381,12 @@ static int64_t sys_dup_from(uint64_t oldfd, int from)
 		return -EBADF;
 
 	/* Take the reference BEFORE claiming a slot, so the install step stays
-	 * a single locked store (and so a failed install releases cleanly). */
-	vfs_file_t *copy = fd_dup_entry(task_fds(cur)[oldfd]);
+	 * a single locked store (and so a failed install releases cleanly).
+	 * Read and reference together, so a sibling thread closing this same
+	 * descriptor cannot slip between the two. */
+	vfs_file_t *copy = fd_dup_entry_at(cur, (int)oldfd);
 	if (!copy)
-		return -ENOMEM; /* only a pipe end can fail to duplicate */
+		return -EBADF; /* closed under us, or a pipe end would not dup */
 
 	/* fd_install_from clears FD_CLOEXEC on the new slot, which is what
 	 * POSIX requires of a duplicate — and what a slot recycled from a
@@ -5258,9 +5433,9 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd)
 	if (task_fd_is_console(cur, oldfd)) {
 		copy = (vfs_file_t *)(oldfd + 1); /* console stdio marker */
 	} else {
-		copy = fd_dup_entry(task_fds(cur)[oldfd]);
+		copy = fd_dup_entry_at(cur, (int)oldfd);
 		if (!copy)
-			return -ENOMEM;
+			return -EBADF;
 	}
 
 	// POSIX: dup2 implicitly closes newfd if it is open — INCLUDING fds
@@ -6075,12 +6250,14 @@ static int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_ptr)
 		// single-threaded process the two agree exactly.
 		{
 			task_t *cur = sched_current();
-			uint64_t ticks = cur ? cur->utime_ticks + cur->stime_ticks : 0;
+			uint64_t ticks =
+				cur ? cur->utime_ticks + cur->stime_ticks : 0;
 			uint32_t freq = timer_get_frequency();
 			if (freq == 0)
 				freq = 100;
 			tp.tv_sec = (int64_t)(ticks / freq);
-			tp.tv_nsec = (int64_t)((ticks % freq) * (1000000000ULL / freq));
+			tp.tv_nsec = (int64_t)((ticks % freq) *
+					       (1000000000ULL / freq));
 		}
 		break;
 	default:
@@ -6380,7 +6557,8 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 			 * effective one — the wholesale task copy duplicated
 			 * cur->fd_flags, which is the empty legacy array once
 			 * the caller became part of a thread group. */
-			child->fd_flags[i] = task_get_fd_flags(cur, (unsigned)i);
+			child->fd_flags[i] =
+				task_get_fd_flags(cur, (unsigned)i);
 			/* Every descriptor KIND has to be duplicated the way its
 			 * own type demands.  This used to fall through to
 			 * vfs_dup() for anything that was not a console marker
@@ -6389,7 +6567,8 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 			 * so vfs_dup dereferenced it.  fd_dup_entry classifies
 			 * first (and takes the socket refcounts fork already
 			 * took). */
-			child->fd_table[i] = src_fd ? fd_dup_entry(src_fd) : NULL;
+			child->fd_table[i] =
+				src_fd ? fd_dup_entry(src_fd) : NULL;
 		}
 	}
 
@@ -6583,6 +6762,19 @@ static void sys_exit_group(uint64_t status)
 	if (!leader)
 		leader = cur;
 
+	/* Same check, and for the same reason, as sched_kill_thread_group():
+	 * group_leader is a bare pointer that nothing clears in the surviving
+	 * threads, and the writes just below are made with no lock held.  A
+	 * leader that has already been freed is written into poisoned memory
+	 * and then walked from, which faults non-recoverably once the lock is
+	 * taken.  Fall back to this thread's own group of one. */
+	if (leader != cur && !task_ptr_ok(leader)) {
+		WARN_ON_ONCE(1);
+		kprintf("BUG: pid %d group_leader is unusable (%p) - exiting this thread only\n",
+			cur->id, (void *)leader);
+		leader = cur;
+	}
+
 	// Mark the group as exiting to prevent new threads
 	leader->group_exiting = true;
 	leader->group_exit_code = (int)status;
@@ -6605,29 +6797,70 @@ static void sys_exit_group(uint64_t status)
 	 * Signalling cannot happen under the lock -- sched_signal_task() takes
 	 * scheduler locks and may queue a siginfo -- hence the two passes.
 	 */
-	task_t *targets[TASK_GROUP_KILL_MAX];
+	/* The batch has to hold the WHOLE group.
+	 *
+	 * A fixed array used to cap it, and the threads past the cap were
+	 * dropped with a warning -- nothing ever came back for them.  That
+	 * leaves live threads running in a process whose parent has already
+	 * been told it finished, still holding its descriptors and its
+	 * address space.  Size the batch from the group instead, and fall
+	 * back to the on-stack array only when it fits, so the common case
+	 * allocates nothing on the exit path. */
+	task_t *stack_targets[TASK_GROUP_KILL_MAX];
+	task_t **targets = stack_targets;
+	int capacity = TASK_GROUP_KILL_MAX;
 	int ntargets = 0;
+	int overflow = 0;
 	uint64_t tg_flags;
+
+	if (leader->nr_threads >= TASK_GROUP_KILL_MAX) {
+		/* +2: one for the leader, one for a thread that appeared
+		 * between reading the count and taking the lock. */
+		int want = leader->nr_threads + 2;
+		task_t **big = kalloc((size_t)want * sizeof(task_t *));
+
+		if (big) {
+			targets = big;
+			capacity = want;
+		}
+	}
 
 	spin_lock_irqsave(&g_task_list_lock, &tg_flags);
 	{
 		task_t *t = leader;
+		int guard = 0;
 
 		do {
 			if (t != cur && !t->has_exited) {
-				if (ntargets < TASK_GROUP_KILL_MAX)
+				if (ntargets < capacity)
 					targets[ntargets++] = t;
 				else
-					WARN_ON_ONCE(
-						1); /* exit_group: more threads than the kill batch holds; the rest exit on the next pass */
+					overflow++;
 			}
 			t = t->thread_group_next;
+			/* Same guard as sched_kill_thread_group: a broken ring
+			 * followed with this lock held and interrupts off
+			 * wedges the processor rather than the process. */
+			if (!task_ptr_ok(t) ||
+			    ++guard > capacity + TASK_GROUP_KILL_MAX) {
+				WARN_ON_ONCE(1);
+				kprintf("BUG: thread group ring of tgid %d broken at %p (guard %d)\n",
+					leader->id, (void *)t, guard);
+				break;
+			}
 		} while (t != leader);
 	}
 	spin_unlock_irqrestore(&g_task_list_lock, tg_flags);
 
+	/* Only reachable if the group grew past the count we sized against,
+	 * which group_exiting is supposed to prevent. */
+	WARN_ON(overflow != 0);
+
 	for (int i = 0; i < ntargets; i++)
 		sched_signal_task(targets[i], SIGKILL);
+
+	if (targets != stack_targets)
+		kfree(targets);
 
 	// Now exit ourselves
 	sched_mark_task_exited(cur, (int)status);
@@ -6636,10 +6869,7 @@ static void sys_exit_group(uint64_t status)
 	 * rare zombie edge case, and a bare `hlt` here (without STI and without
 	 * retrying the switch) parks the CPU for a full timer tick per exit —
 	 * and with IRQs off would wedge TLB shootdowns (see sys_exit). */
-	for (;;) {
-		sched_schedule();
-		__asm__ volatile("sti; hlt");
-	}
+	sched_exit_park();
 }
 
 // SYS_GETTID - get thread ID (unique per thread)
@@ -6760,8 +6990,10 @@ static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
 					timer_get_precise_us() * 1000ULL;
 
 				if (abs_realtime)
-					now_ns += (uint64_t)timer_get_boot_epoch() *
-						  1000000000ULL;
+					now_ns +=
+						(uint64_t)
+							timer_get_boot_epoch() *
+						1000000000ULL;
 
 				/* Absolute -> relative, which is what
 				 * futex_wait takes.  An already-past deadline
@@ -7219,8 +7451,7 @@ static int64_t sys_madvise_locked(uint64_t addr, uint64_t length,
 		return -EINVAL; /* the address must be page aligned */
 	if (length == 0)
 		return 0;
-	if (addr >= 0x0000800000000000ULL ||
-	    addr + length < addr)
+	if (addr >= 0x0000800000000000ULL || addr + length < addr)
 		return -EINVAL;
 
 	switch (advice) {
@@ -7306,8 +7537,8 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 		 * must survive protection changes — losing PAGE_DEVICE would
 		 * make a later unmap free BAR memory into the allocator. */
 		{
-			uint64_t *pte = mm_get_page_table_from_pml4(
-				pml4, vaddr, false);
+			uint64_t *pte =
+				mm_get_page_table_from_pml4(pml4, vaddr, false);
 			if (pte && (*pte & PAGE_DEVICE))
 				page_flags |= PAGE_DEVICE |
 					      (*pte & (PAGE_WRITE_THROUGH |
@@ -7611,8 +7842,8 @@ static int64_t sys_sysinfo(uint64_t info_ptr)
 	info.totalhigh = 0;
 	info.freehigh = 0;
 	info.mem_unit = 1; // byte granularity
-	info.cached = mstats.pagecache_pages * PAGE_SIZE +
-		      icache_mem_bytes() + dcache_mem_bytes();
+	info.cached = mstats.pagecache_pages * PAGE_SIZE + icache_mem_bytes() +
+		      dcache_mem_bytes();
 	info.available = info.freeram + info.bufferram + info.cached;
 
 	if (copy_to_user((void *)info_ptr, &info, sizeof(info)) != 0)
@@ -7695,18 +7926,38 @@ static int sock_idx_from_fd(uint64_t fd)
 	return SOCKET_FD_IDX(entry);
 }
 
-// Helper: check if process fd is a UNIX socket and return the raw UNIX socket fd
-static int unix_sock_fd_from_fd(uint64_t fd)
+/* Resolve a descriptor to a UNIX socket, and hold the socket for the rest of
+ * this syscall.
+ *
+ * The descriptor read and the reference are taken together under the
+ * descriptor-table lock, so a sibling thread closing the same descriptor
+ * cannot slip between them.  The reference is parked on the task and released
+ * by syscall_handler() once the call returns -- one acquire, one release,
+ * rather than a release on each of the many early returns these arms have. */
+static unix_socket_t *unix_sock_from_fd(uint64_t fd)
 {
 	task_t *cur = sched_current();
+	uint64_t lflags;
+	void *entry;
+
 	if (!cur || fd >= TASK_MAX_FDS)
-		return -EBADF;
-	void *entry = task_fds(cur)[fd];
-	if (!entry)
-		return -EBADF;
-	if (!IS_UNIX_SOCKET_FD(entry))
-		return -ENOTSOCK;
-	return (int)(uintptr_t)entry; // Return the raw UNIX socket FD marker
+		return NULL;
+
+	fds_lock(cur, &lflags);
+	entry = task_fds(cur)[fd];
+	if (!entry || !unix_sock_is(entry)) {
+		fds_unlock(cur, lflags);
+		return NULL;
+	}
+	/* One resolution per syscall: every arm resolves a1 once.  A second
+	 * would strand the first reference, so say so rather than leak. */
+	WARN_ON_ONCE(cur->syscall_unix_ref != NULL);
+	if (!cur->syscall_unix_ref)
+		cur->syscall_unix_ref =
+			unix_sock_lookup_hold((unix_socket_t *)entry);
+	fds_unlock(cur, lflags);
+
+	return cur->syscall_unix_ref;
 }
 
 // Helper: extract epoll index from a process fd
@@ -7800,7 +8051,8 @@ sys_select_wrapper(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
 		/* Converted at the measured tick rate.  This used to assume
 		 * 100Hz, so on a machine whose calibrated rate is ~200Hz every
 		 * select() timeout expired in half the requested time. */
-		timeout_ticks = timer_us_to_ticks(tv_sec * 1000000ULL + tv_usec);
+		timeout_ticks =
+			timer_us_to_ticks(tv_sec * 1000000ULL + tv_usec);
 		if (tv_sec == 0 && tv_usec == 0)
 			timeout_ticks = 0;
 	}
@@ -7963,14 +8215,17 @@ sys_epoll_wait_wrapper(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4)
 // kept out of syscall_handler_inner to avoid bloating the kernel stack.
 // ---------------------------------------------------------------------------
 
-__attribute__((noinline)) static int unix_do_sendmsg(int ufd,
+__attribute__((noinline)) static int unix_do_sendmsg(unix_socket_t *ufd,
 						     struct msghdr *kmsg)
 {
-	unix_socket_t *us = unix_get(ufd);
+	unix_socket_t *us = ufd;
 	if (!us)
 		return -EBADF;
-	unix_socket_t *peer = us->peer;
-	if (!peer || !peer->active)
+	/* The peer is deliberately NOT resolved here.  Reading it once and
+	 * using it further down is what let an in-band descriptor be queued on
+	 * a socket that had been replaced in the meantime; unix_send_fd()
+	 * finds and pins it for the length of the operation instead. */
+	if (!us->connected)
 		return -ENOTCONN;
 
 	/* Process control data first so the fd arrives before (or with) the
@@ -8007,47 +8262,20 @@ __attribute__((noinline)) static int unix_do_sendmsg(int ufd,
 					int sfd = fds[i];
 					if (sfd < 0 || sfd >= TASK_MAX_FDS)
 						continue;
-					void *entry = task_fds(cur)[sfd];
+					/* Take the reference that keeps the
+					 * entry alive until the peer receives
+					 * it -- the sender may close its own
+					 * descriptor first.
+					 *
+					 * Read and reference happen together:
+					 * this open-coded the whole of
+					 * fd_dup_entry, including its race
+					 * against a sibling thread closing the
+					 * same descriptor between the two. */
+					void *entry = fd_dup_entry_at(cur, sfd);
 					if (!entry)
 						continue;
-					/* Bump the underlying refcount so the entry survives
-                     * if the sender closes its fd before the peer reads it. */
-					uintptr_t marker = (uintptr_t)entry;
-					if (marker >= 1 && marker <= 3) {
-						/* stdio markers — opaque, no refcount */
-					} else if (IS_SOCKET_FD(entry)) {
-						net_socket_t *s = sock_get(
-							SOCKET_FD_IDX(entry));
-						if (s)
-							__atomic_fetch_add(
-								&s->ref_count,
-								1,
-								__ATOMIC_ACQ_REL);
-					} else if (IS_UNIX_SOCKET_FD(entry)) {
-						unix_socket_t *xs = unix_get(
-							(int)(uintptr_t)entry);
-						if (xs)
-							__atomic_fetch_add(
-								&xs->ref_count,
-								1,
-								__ATOMIC_ACQ_REL);
-					} else if (IS_EPOLL_FD(entry)) {
-						/* The child gets its own
-						 * descriptor onto the same
-						 * instance, so the instance
-						 * gains a reference. */
-						epoll_get(EPOLL_FD_IDX(entry));
-					} else if (pipe_is_end(entry)) {
-						pipe_end_t *ne = pipe_dup_end(
-							(pipe_end_t *)entry);
-						if (ne)
-							entry = ne;
-					} else {
-						entry = vfs_dup(entry);
-						if (!entry)
-							continue;
-					}
-					(void)unix_push_fd(peer, entry);
+					(void)unix_send_fd(us, entry);
 				}
 			}
 			off += CMSG_ALIGN(cmsg->cmsg_len);
@@ -8104,10 +8332,10 @@ __attribute__((noinline)) static int unix_do_sendmsg(int ufd,
 	return (int)sent_total;
 }
 
-__attribute__((noinline)) static int unix_do_recvmsg(int ufd,
+__attribute__((noinline)) static int unix_do_recvmsg(unix_socket_t *ufd,
 						     struct msghdr *kmsg)
 {
-	unix_socket_t *us = unix_get(ufd);
+	unix_socket_t *us = ufd;
 	if (!us)
 		return -EBADF;
 
@@ -8220,26 +8448,18 @@ __attribute__((noinline)) static int unix_do_recvmsg(int ufd,
 			 * at the next exec. */
 			int newfd = cur ? fd_install_from(cur, entry, 0) : -1;
 			if (newfd < 0) {
-				/* No fd slot available — drop the entry's reference. */
-				uintptr_t marker = (uintptr_t)entry;
-				if (marker > 3 && IS_SOCKET_FD(entry)) {
-					net_socket_t *s =
-						sock_get(SOCKET_FD_IDX(entry));
-					if (s)
-						__atomic_fetch_sub(
-							&s->ref_count, 1,
-							__ATOMIC_ACQ_REL);
-				} else if (marker > 3 &&
-					   IS_UNIX_SOCKET_FD(entry)) {
-					unix_socket_t *xs =
-						unix_get((int)(uintptr_t)entry);
-					if (xs)
-						__atomic_fetch_sub(
-							&xs->ref_count, 1,
-							__ATOMIC_ACQ_REL);
-				} else if (marker > 3 && pipe_is_end(entry)) {
-					pipe_close_end((pipe_end_t *)entry);
-				}
+				/* No descriptor slot: give the reference back.
+				 *
+				 * Exactly the mirror of the fd_dup_entry_at()
+				 * that took it, which is the point of routing
+				 * it through the same place.  Hand-written, it
+				 * unwound only some of what had been taken --
+				 * it knew a socket had a descriptor count but
+				 * not that the socket also had a lifetime
+				 * reference, and it had no case at all for a
+				 * regular file, so those were simply kept
+				 * forever. */
+				fd_release_entry((vfs_file_t *)entry);
 				kmsg->msg_flags |= MSG_CTRUNC;
 				kmsg->msg_controllen = 0;
 			} else {
@@ -8659,59 +8879,65 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 
 	// ====== Socket syscalls ======
 	case SYS_SOCKET: {
+		/* Both descriptor flags are honoured here.
+		 *
+		 * SOCK_CLOEXEC was masked off the type and then forgotten, so
+		 * a socket asked to close on exec did not -- it was inherited
+		 * by every program the process went on to run.  socketpair()
+		 * and accept4() both honour it; only this one did not.
+		 *
+		 * The slot is claimed from 3 upward, as it always has been.
+		 * fd_install() would start at 0 and hand out a freed stdio
+		 * descriptor, which is correct by the letter of the standard
+		 * and a behaviour change this call has never had -- not
+		 * something to introduce in passing while fixing a flag. */
 		int real_type = (int)a2 & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
-		if ((int)a1 == AF_UNIX) {
-			int ufd = unix_create(real_type);
-			if (ufd < 0)
-				return ufd;
-			task_t *cur = sched_current();
-			if (!cur) {
-				unix_close(ufd);
-				return -EFAULT;
-			}
-			for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-				if (task_fds(cur)[_fd] == NULL) {
-					task_fds(cur)[_fd] =
-						(void *)(uintptr_t)ufd;
-					if ((int)a2 & SOCK_NONBLOCK) {
-						unix_socket_t *_s =
-							unix_get(ufd);
-						if (_s)
-							_s->nonblock = 1;
-					}
-					return _fd;
-				}
-			}
-			unix_close(ufd);
-			return -EMFILE;
-		}
-		int sock_idx = sock_create((int)a1, real_type, (int)a3);
-		if (sock_idx < 0)
-			return sock_idx;
-		// Allocate a process fd pointing to the socket
 		task_t *cur = sched_current();
-		if (!cur) {
-			sock_close(sock_idx);
+		int newfd;
+
+		if (!cur)
 			return -EFAULT;
-		}
-		for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-			if (task_fds(cur)[_fd] == NULL) {
-				task_fds(cur)[_fd] = MAKE_SOCKET_FD(sock_idx);
-				if ((int)a2 & SOCK_NONBLOCK) {
-					net_socket_t *_s = sock_get(sock_idx);
-					if (_s)
-						_s->nonblock = 1;
-				}
-				return _fd;
+
+		if ((int)a1 == AF_UNIX) {
+			unix_socket_t *ufd = NULL;
+			int rc = unix_create(real_type, &ufd);
+
+			if (rc < 0)
+				return rc;
+			if ((int)a2 & SOCK_NONBLOCK) {
+				ufd->nonblock = 1;
+			}
+			newfd = fd_install_from(cur, (vfs_file_t *)ufd, 3);
+			if (newfd < 0) {
+				unix_close(ufd);
+				return newfd;
+			}
+		} else {
+			int sock_idx = sock_create((int)a1, real_type, (int)a3);
+
+			if (sock_idx < 0)
+				return sock_idx;
+			if ((int)a2 & SOCK_NONBLOCK) {
+				net_socket_t *_s = sock_get(sock_idx);
+
+				if (_s)
+					_s->nonblock = 1;
+			}
+			newfd = fd_install_from(cur, MAKE_SOCKET_FD(sock_idx),
+						3);
+			if (newfd < 0) {
+				sock_close(sock_idx);
+				return newfd;
 			}
 		}
-		sock_close(sock_idx);
-		return -EMFILE;
+		if ((int)a2 & SOCK_CLOEXEC)
+			task_set_fd_flags(cur, (unsigned)newfd, FD_CLOEXEC);
+		return newfd;
 	}
 
 	case SYS_BIND: {
-		int ufd = unix_sock_fd_from_fd(a1);
-		if (ufd >= 0) {
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		if (ufd) {
 			/* Validate and copy only the DECLARED length, into a
 			 * zeroed structure.
 			 *
@@ -8747,8 +8973,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	}
 
 	case SYS_LISTEN: {
-		int ufd = unix_sock_fd_from_fd(a1);
-		if (ufd >= 0)
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		if (ufd)
 			return unix_listen(ufd, (int)a2);
 		int idx = sock_idx_from_fd(a1);
 		if (idx < 0)
@@ -8757,45 +8983,44 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	}
 
 	case SYS_ACCEPT: {
-		int ufd = unix_sock_fd_from_fd(a1);
-		if (ufd >= 0) {
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		if (ufd) {
 			struct sockaddr_un kaddr;
 			socklen_t kaddrlen = sizeof(struct sockaddr_un);
-			int new_ufd = unix_accept(ufd, &kaddr, &kaddrlen);
-			if (new_ufd < 0)
-				return new_ufd;
+			unix_socket_t *new_ufd = NULL;
+			int arc = unix_accept(ufd, &kaddr, &kaddrlen, &new_ufd);
+
+			if (arc < 0)
+				return arc;
 			task_t *cur = sched_current();
 			if (!cur) {
 				unix_close(new_ufd);
 				return -EFAULT;
 			}
-			for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-				if (task_fds(cur)[_fd] == NULL) {
-					task_fds(cur)[_fd] =
-						(void *)(uintptr_t)new_ufd;
-					if (a2 && a3) {
-						if (validate_user_ptr(
-							    a2,
-							    sizeof(struct
-								   sockaddr_un)))
-							copy_to_user(
-								(void *)a2,
-								&kaddr,
-								sizeof(struct
-								       sockaddr_un));
-						if (validate_user_ptr(
-							    a3,
-							    sizeof(socklen_t)))
-							copy_to_user(
-								(void *)a3,
-								&kaddrlen,
-								sizeof(socklen_t));
-					}
-					return _fd;
-				}
+			/* fd_install_from, not a hand-rolled scan: claiming
+			 * the slot and storing the socket must be one locked
+			 * step, or two threads accepting on the same listener
+			 * at the same moment are handed the same number and
+			 * one of the two connections is simply lost.  From 3,
+			 * as this call has always allocated. */
+			int newfd =
+				fd_install_from(cur, (vfs_file_t *)new_ufd, 3);
+
+			if (newfd < 0) {
+				unix_close(new_ufd);
+				return newfd;
 			}
-			unix_close(new_ufd);
-			return -EMFILE;
+			if (a2 && a3) {
+				if (validate_user_ptr(
+					    a2, sizeof(struct sockaddr_un)))
+					copy_to_user(
+						(void *)a2, &kaddr,
+						sizeof(struct sockaddr_un));
+				if (validate_user_ptr(a3, sizeof(socklen_t)))
+					copy_to_user((void *)a3, &kaddrlen,
+						     sizeof(socklen_t));
+			}
+			return newfd;
 		}
 		int idx = sock_idx_from_fd(a1);
 		if (idx < 0)
@@ -8811,34 +9036,31 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			sock_close(new_sock_idx);
 			return -EFAULT;
 		}
-		for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-			if (task_fds(cur)[_fd] == NULL) {
-				task_fds(cur)[_fd] =
-					MAKE_SOCKET_FD(new_sock_idx);
-				if (a2 && a3) {
-					if (validate_user_ptr(
-						    a2,
-						    sizeof(struct sockaddr_in)))
-						copy_to_user(
-							(void *)a2, &kaddr,
-							sizeof(struct
-							       sockaddr_in));
-					if (validate_user_ptr(
-						    a3, sizeof(socklen_t)))
-						copy_to_user((void *)a3,
-							     &kaddrlen,
-							     sizeof(socklen_t));
-				}
-				return _fd;
+		{
+			int newfd = fd_install_from(
+				cur, MAKE_SOCKET_FD(new_sock_idx), 3);
+
+			if (newfd < 0) {
+				sock_close(new_sock_idx);
+				return newfd;
 			}
+			if (a2 && a3) {
+				if (validate_user_ptr(
+					    a2, sizeof(struct sockaddr_in)))
+					copy_to_user(
+						(void *)a2, &kaddr,
+						sizeof(struct sockaddr_in));
+				if (validate_user_ptr(a3, sizeof(socklen_t)))
+					copy_to_user((void *)a3, &kaddrlen,
+						     sizeof(socklen_t));
+			}
+			return newfd;
 		}
-		sock_close(new_sock_idx);
-		return -EMFILE;
 	}
 
 	case SYS_CONNECT: {
-		int ufd = unix_sock_fd_from_fd(a1);
-		if (ufd >= 0) {
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		if (ufd) {
 			/* Validate and copy only the DECLARED length, into a
 			 * zeroed structure.
 			 *
@@ -8874,8 +9096,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	}
 
 	case SYS_SENDTO: {
-		int ufd = unix_sock_fd_from_fd(a1);
-		if (ufd >= 0) {
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		if (ufd) {
 			if (!validate_user_ptr(a2, a3))
 				return -EFAULT;
 			return unix_send(ufd, (const void *)a2, (size_t)a3,
@@ -8898,8 +9120,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	}
 
 	case SYS_RECVFROM: {
-		int ufd = unix_sock_fd_from_fd(a1);
-		if (ufd >= 0) {
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		if (ufd) {
 			if (!validate_user_ptr(a2, a3))
 				return -EFAULT;
 			return unix_recv(ufd, (void *)a2, (size_t)a3, (int)a4);
@@ -8921,8 +9143,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	}
 
 	case SYS_SEND: {
-		int ufd = unix_sock_fd_from_fd(a1);
-		if (ufd >= 0) {
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		if (ufd) {
 			if (!validate_user_ptr(a2, a3))
 				return -EFAULT;
 			return unix_send(ufd, (const void *)a2, (size_t)a3,
@@ -8937,8 +9159,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	}
 
 	case SYS_RECV: {
-		int ufd = unix_sock_fd_from_fd(a1);
-		if (ufd >= 0) {
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		if (ufd) {
 			if (!validate_user_ptr(a2, a3))
 				return -EFAULT;
 			return unix_recv(ufd, (void *)a2, (size_t)a3, (int)a4);
@@ -8952,8 +9174,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	}
 
 	case SYS_SHUTDOWN: {
-		int ufd = unix_sock_fd_from_fd(a1);
-		if (ufd >= 0)
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		if (ufd)
 			return unix_shutdown(ufd, (int)a2);
 		int idx = sock_idx_from_fd(a1);
 		if (idx < 0)
@@ -9019,9 +9241,9 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		 * so it sends none and the server rejects it with
 		 * "Authorization required, but no authorization protocol
 		 * specified".  Neither message mentions getpeername(). */
-		int ufd = unix_sock_fd_from_fd(a1);
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
 
-		if (ufd >= 0) {
+		if (ufd) {
 			struct sockaddr_un ukaddr;
 			socklen_t ulen = sizeof(struct sockaddr_un);
 			int uret;
@@ -9038,8 +9260,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			{
 				socklen_t cap = ulen;
 
-				if (a3 && validate_user_ptr(a3,
-							    sizeof(socklen_t))) {
+				if (a3 &&
+				    validate_user_ptr(a3, sizeof(socklen_t))) {
 					socklen_t given = 0;
 
 					copy_from_user(&given, (const void *)a3,
@@ -9047,11 +9269,10 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 					if (given < cap)
 						cap = given;
 				}
-				if (a2 && cap > 0 &&
-				    validate_user_ptr(a2, cap))
+				if (a2 && cap > 0 && validate_user_ptr(a2, cap))
 					copy_to_user((void *)a2, &ukaddr, cap);
-				if (a3 && validate_user_ptr(a3,
-							    sizeof(socklen_t)))
+				if (a3 &&
+				    validate_user_ptr(a3, sizeof(socklen_t)))
 					copy_to_user((void *)a3, &ulen,
 						     sizeof(socklen_t));
 			}
@@ -9080,9 +9301,9 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		 * so it sends none and the server rejects it with
 		 * "Authorization required, but no authorization protocol
 		 * specified".  Neither message mentions getsockname(). */
-		int ufd = unix_sock_fd_from_fd(a1);
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
 
-		if (ufd >= 0) {
+		if (ufd) {
 			struct sockaddr_un ukaddr;
 			socklen_t ulen = sizeof(struct sockaddr_un);
 			int uret;
@@ -9099,8 +9320,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			{
 				socklen_t cap = ulen;
 
-				if (a3 && validate_user_ptr(a3,
-							    sizeof(socklen_t))) {
+				if (a3 &&
+				    validate_user_ptr(a3, sizeof(socklen_t))) {
 					socklen_t given = 0;
 
 					copy_from_user(&given, (const void *)a3,
@@ -9108,11 +9329,10 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 					if (given < cap)
 						cap = given;
 				}
-				if (a2 && cap > 0 &&
-				    validate_user_ptr(a2, cap))
+				if (a2 && cap > 0 && validate_user_ptr(a2, cap))
 					copy_to_user((void *)a2, &ukaddr, cap);
-				if (a3 && validate_user_ptr(a3,
-							    sizeof(socklen_t)))
+				if (a3 &&
+				    validate_user_ptr(a3, sizeof(socklen_t)))
 					copy_to_user((void *)a3, &ulen,
 						     sizeof(socklen_t));
 			}
@@ -9140,7 +9360,7 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		if ((int)a1 == AF_UNIX) {
 			int real_type =
 				(int)a2 & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
-			int usv[2];
+			unix_socket_t *usv[2];
 			int ret = unix_socketpair(real_type, usv);
 			if (ret < 0)
 				return ret;
@@ -9156,13 +9376,13 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			 * close-on-exec from whatever previously used those
 			 * slots and vanish across the next exec. */
 			int pfd[2];
-			pfd[0] = fd_install(cur, (vfs_file_t *)(uintptr_t)usv[0]);
+			pfd[0] = fd_install(cur, (vfs_file_t *)usv[0]);
 			if (pfd[0] < 0) {
 				unix_close(usv[0]);
 				unix_close(usv[1]);
 				return pfd[0];
 			}
-			pfd[1] = fd_install(cur, (vfs_file_t *)(uintptr_t)usv[1]);
+			pfd[1] = fd_install(cur, (vfs_file_t *)usv[1]);
 			if (pfd[1] < 0) {
 				task_fds(cur)[pfd[0]] = NULL;
 				unix_close(usv[0]);
@@ -9176,12 +9396,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 						  FD_CLOEXEC);
 			}
 			if ((int)a2 & SOCK_NONBLOCK) {
-				unix_socket_t *u0 = unix_get(usv[0]);
-				unix_socket_t *u1 = unix_get(usv[1]);
-				if (u0)
-					u0->nonblock = 1;
-				if (u1)
-					u1->nonblock = 1;
+				usv[0]->nonblock = 1;
+				usv[1]->nonblock = 1;
 			}
 			copy_to_user((void *)a4, pfd, 2 * sizeof(int));
 			return 0;
@@ -9223,51 +9439,47 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 	}
 
 	case SYS_ACCEPT4: {
-		int ufd = unix_sock_fd_from_fd(a1);
-		if (ufd >= 0) {
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		if (ufd) {
 			struct sockaddr_un kaddr;
 			socklen_t kaddrlen = sizeof(struct sockaddr_un);
-			int new_ufd = unix_accept(ufd, &kaddr, &kaddrlen);
-			if (new_ufd < 0)
-				return new_ufd;
+			unix_socket_t *new_ufd = NULL;
+			int arc = unix_accept(ufd, &kaddr, &kaddrlen, &new_ufd);
+
+			if (arc < 0)
+				return arc;
 			task_t *cur = sched_current();
 			if (!cur) {
 				unix_close(new_ufd);
 				return -EFAULT;
 			}
-			for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-				if (task_fds(cur)[_fd] == NULL) {
-					task_fds(cur)[_fd] =
-						(void *)(uintptr_t)new_ufd;
-					if ((int)a4 & SOCK_NONBLOCK) {
-						unix_socket_t *_s =
-							unix_get(new_ufd);
-						if (_s)
-							_s->nonblock = 1;
-					}
-					if (a2 && a3) {
-						if (validate_user_ptr(
-							    a2,
-							    sizeof(struct
-								   sockaddr_un)))
-							copy_to_user(
-								(void *)a2,
-								&kaddr,
-								sizeof(struct
-								       sockaddr_un));
-						if (validate_user_ptr(
-							    a3,
-							    sizeof(socklen_t)))
-							copy_to_user(
-								(void *)a3,
-								&kaddrlen,
-								sizeof(socklen_t));
-					}
-					return _fd;
-				}
+			if ((int)a4 & SOCK_NONBLOCK)
+				new_ufd->nonblock = 1;
+			/* One locked step, and both flags honoured.
+			 * SOCK_CLOEXEC was accepted and then ignored here, so
+			 * a connection asked to close on exec was inherited by
+			 * every program the process went on to run. */
+			int newfd =
+				fd_install_from(cur, (vfs_file_t *)new_ufd, 3);
+
+			if (newfd < 0) {
+				unix_close(new_ufd);
+				return newfd;
 			}
-			unix_close(new_ufd);
-			return -EMFILE;
+			if ((int)a4 & SOCK_CLOEXEC)
+				task_set_fd_flags(cur, (unsigned)newfd,
+						  FD_CLOEXEC);
+			if (a2 && a3) {
+				if (validate_user_ptr(
+					    a2, sizeof(struct sockaddr_un)))
+					copy_to_user(
+						(void *)a2, &kaddr,
+						sizeof(struct sockaddr_un));
+				if (validate_user_ptr(a3, sizeof(socklen_t)))
+					copy_to_user((void *)a3, &kaddrlen,
+						     sizeof(socklen_t));
+			}
+			return newfd;
 		}
 		int idx = sock_idx_from_fd(a1);
 		if (idx < 0)
@@ -9283,29 +9495,29 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 			sock_close(new_sock_idx);
 			return -EFAULT;
 		}
-		for (int _fd = 3; _fd < TASK_MAX_FDS; _fd++) {
-			if (task_fds(cur)[_fd] == NULL) {
-				task_fds(cur)[_fd] =
-					MAKE_SOCKET_FD(new_sock_idx);
-				if (a2 && a3) {
-					if (validate_user_ptr(
-						    a2,
-						    sizeof(struct sockaddr_in)))
-						copy_to_user(
-							(void *)a2, &kaddr,
-							sizeof(struct
-							       sockaddr_in));
-					if (validate_user_ptr(
-						    a3, sizeof(socklen_t)))
-						copy_to_user((void *)a3,
-							     &kaddrlen,
-							     sizeof(socklen_t));
-				}
-				return _fd;
+		{
+			int newfd = fd_install_from(
+				cur, MAKE_SOCKET_FD(new_sock_idx), 3);
+
+			if (newfd < 0) {
+				sock_close(new_sock_idx);
+				return newfd;
 			}
+			if ((int)a4 & SOCK_CLOEXEC)
+				task_set_fd_flags(cur, (unsigned)newfd,
+						  FD_CLOEXEC);
+			if (a2 && a3) {
+				if (validate_user_ptr(
+					    a2, sizeof(struct sockaddr_in)))
+					copy_to_user(
+						(void *)a2, &kaddr,
+						sizeof(struct sockaddr_in));
+				if (validate_user_ptr(a3, sizeof(socklen_t)))
+					copy_to_user((void *)a3, &kaddrlen,
+						     sizeof(socklen_t));
+			}
+			return newfd;
 		}
-		sock_close(new_sock_idx);
-		return -EMFILE;
 	}
 
 	case SYS_SENDMSG: {
@@ -9314,8 +9526,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		struct msghdr kmsg;
 		copy_from_user(&kmsg, (const void *)a2, sizeof(struct msghdr));
 
-		int ufd = unix_sock_fd_from_fd(a1);
-		if (ufd >= 0)
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		if (ufd)
 			return unix_do_sendmsg(ufd, &kmsg);
 
 		int idx = sock_idx_from_fd(a1);
@@ -9330,8 +9542,8 @@ static int64_t syscall_handler_inner(uint64_t num, uint64_t a1, uint64_t a2,
 		struct msghdr kmsg;
 		copy_from_user(&kmsg, (const void *)a2, sizeof(struct msghdr));
 
-		int ufd = unix_sock_fd_from_fd(a1);
-		if (ufd >= 0) {
+		unix_socket_t *ufd = unix_sock_from_fd(a1);
+		if (ufd) {
 			int ret = unix_do_recvmsg(ufd, &kmsg);
 			if (ret >= 0)
 				copy_to_user((void *)a2, &kmsg,
@@ -9867,6 +10079,16 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
 	int64_t ret = syscall_handler_inner(num, a1, a2, a3, a4, a5, a6);
 
+	/* Release the socket this syscall held, if it resolved one.  Here
+	 * rather than in each arm: the arms return from many places, and a
+	 * missed release permanently claims the socket. */
+	if (cur && cur->syscall_unix_ref) {
+		struct unix_socket *held = cur->syscall_unix_ref;
+
+		cur->syscall_unix_ref = NULL;
+		unix_sock_put_ref(held);
+	}
+
 	// Check for pending signals before returning to userspace.
 	// Skip for:
 	//   * SYS_EXIT       — task is already being torn down.
@@ -9929,10 +10151,12 @@ int64_t syscall_handler(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 	cur = sched_current();
 	if (cur && cur->privilege == TASK_USER &&
 	    (cur->has_exited || cur->state == TASK_ZOMBIE)) {
-		for (;;) {
-			sched_schedule();
-			__asm__ volatile("sti; hlt");
-		}
+		/* This is where the threads of an exiting group actually end
+		 * up: signalling a thread never tears it down in place, so
+		 * each one unwinds its own syscall and arrives here, in its
+		 * own context with interrupts on -- the right place to give
+		 * its address space back. */
+		sched_exit_park();
 	}
 	return ret;
 }

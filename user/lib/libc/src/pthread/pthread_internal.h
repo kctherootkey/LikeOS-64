@@ -79,8 +79,24 @@ struct __pthread {
     void* malloc_tcache;            // Per-thread allocation cache (or dead sentinel)
     void* malloc_arena;             // Arena this thread is attached to
 
+    /* errno, per POSIX: one copy PER THREAD.
+     *
+     * It used to be a single process-wide global, which is not merely a
+     * standards deviation -- it silently breaks any code that tests errno
+     * after a failed call, because another thread's syscall (or one of the
+     * libc functions that deliberately zero errno) can overwrite it in
+     * between.  libxcb decides an X connection is dead unless a failing
+     * read reports EAGAIN or EINTR, so a mail client with worker threads
+     * lost its display at random: the read failed with EAGAIN as usual and
+     * a different thread had already replaced the value by the time it was
+     * read back.
+     *
+     * Carved out of the padding below, so every preceding offset is
+     * unchanged -- stack_guard in particular must stay at %fs:0x28. */
+    int errno_val;
+
     // Padding to ensure alignment
-    char _pad[32];
+    char _pad[28];
 };
 
 /* The loader reserves exactly LIKEOS_TCB_RESERVE bytes at the thread pointer

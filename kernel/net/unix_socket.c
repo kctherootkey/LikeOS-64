@@ -26,9 +26,12 @@
  */
 extern void poll_notify_io_ready(void);
 
-/* Drop the in-flight-sender count taken on a peer socket; defined below, next
- * to the close path it completes. */
-static void unix_put_sender(unix_socket_t *us);
+/* Reference counting.  Defined together further down, next to the close path
+ * they serve; see the block comment there for the rules. */
+static void unix_hold(unix_socket_t *us);
+static int unix_tryhold(unix_socket_t *us);
+static void unix_put(unix_socket_t *us);
+static void unix_hangup_and_put(unix_socket_t *s);
 
 // UNIX socket table
 static unix_socket_t unix_sockets[MAX_UNIX_SOCKETS];
@@ -40,6 +43,11 @@ static unix_socket_t unix_sockets[MAX_UNIX_SOCKETS];
  * repainting a window makes thousands of them.  Allocated per connected
  * socket, so an idle system pays nothing for it. */
 #define UNIX_RING_SIZE 65536
+
+/* "UNXSCK64" -- 64 bits so it cannot collide with the low half of a kernel
+ * pointer, which is what sits at offset 0 of a vfs_file. */
+#define UNIX_SOCK_MAGIC 0x554E5853434B3634ULL
+static uint64_t s_unix_next_id = 1;
 
 /* Give `s` a data ring if it has none.
  *
@@ -184,10 +192,9 @@ static int uds_name_from_addr(const struct sockaddr_un *addr, socklen_t addrlen,
  * truncated address and a length larger than it passed, which is how it knows
  * to try again with a bigger one (libxcb does exactly this).
  */
-int unix_getname(int usockfd, int peer, struct sockaddr_un *addr,
+int unix_getname(unix_socket_t *us, int peer, struct sockaddr_un *addr,
 		 socklen_t *addrlen)
 {
-	unix_socket_t *us = unix_get(usockfd);
 	const char *name;
 	socklen_t have, need;
 	int nlen;
@@ -236,15 +243,20 @@ int unix_getname(int usockfd, int peer, struct sockaddr_un *addr,
 // ============================================================================
 // unix_get - Get unix socket by index (from FD)
 // ============================================================================
-unix_socket_t *unix_get(int usockfd)
+/* Is this descriptor-table value a UNIX socket?
+ *
+ * Safe to call on ANY value the table can hold.  The small tagged integers --
+ * console streams, network sockets, epoll handles -- are rejected numerically
+ * before anything is dereferenced, and the pointer is range-checked before its
+ * first word is read.  The magic is 64 bits so it cannot collide with the low
+ * half of a pointer, which is what a vfs_file keeps at offset 0. */
+bool unix_sock_is(const void *p)
 {
-	BUG_ON(usockfd < 0);
-	int idx = UNIX_SOCKET_FD_IDX(usockfd);
-	if (idx < 0 || idx >= MAX_UNIX_SOCKETS)
-		return NULL;
-	if (!unix_sockets[idx].active)
-		return NULL;
-	return &unix_sockets[idx];
+	if (!p)
+		return false;
+	if (!kptr_plausible((uint64_t)(uintptr_t)p))
+		return false;
+	return ((const unix_socket_t *)p)->magic == UNIX_SOCK_MAGIC;
 }
 
 // ============================================================================
@@ -303,7 +315,7 @@ static unix_socket_t *unix_find_by_name_locked(const char *name, int len)
 // ============================================================================
 // unix_create - Create a new UNIX domain socket
 // ============================================================================
-int unix_create(int type)
+int unix_create(int type, unix_socket_t **out)
 {
 	might_sleep();
 	if (type != SOCK_STREAM && type != SOCK_DGRAM)
@@ -328,18 +340,22 @@ int unix_create(int type)
 	us->active = 1;
 	us->type = type;
 	us->ref_count = 1;
+	refcount_set(&us->refcount, 1);
+	us->magic = UNIX_SOCK_MAGIC;
+	us->id = s_unix_next_id++;
 	spinlock_init(&us->lock, "unix_sock");
 
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
-	return MAKE_UNIX_SOCKET_FD(idx);
+	*out = us;
+	return 0;
 }
 
 // ============================================================================
 // unix_bind - Bind a UNIX socket to a pathname or abstract name
 // ============================================================================
-int unix_bind(int usockfd, const struct sockaddr_un *addr, socklen_t addrlen)
+int unix_bind(unix_socket_t *us, const struct sockaddr_un *addr,
+	      socklen_t addrlen)
 {
-	unix_socket_t *us = unix_get(usockfd);
 	if (!us)
 		return -EBADF;
 	if (us->bound)
@@ -444,9 +460,8 @@ int unix_bind(int usockfd, const struct sockaddr_un *addr, socklen_t addrlen)
 // ============================================================================
 // unix_listen - Mark a UNIX socket as listening
 // ============================================================================
-int unix_listen(int usockfd, int backlog)
+int unix_listen(unix_socket_t *us, int backlog)
 {
-	unix_socket_t *us = unix_get(usockfd);
 	if (!us)
 		return -EBADF;
 	if (us->type != SOCK_STREAM)
@@ -466,9 +481,9 @@ int unix_listen(int usockfd, int backlog)
 // ============================================================================
 // unix_accept - Accept a connection on a listening socket
 // ============================================================================
-int unix_accept(int usockfd, struct sockaddr_un *addr, socklen_t *addrlen)
+int unix_accept(unix_socket_t *us, struct sockaddr_un *addr, socklen_t *addrlen,
+		unix_socket_t **out)
 {
-	unix_socket_t *us = unix_get(usockfd);
 	if (!us)
 		return -EBADF;
 	if (!us->listening)
@@ -502,103 +517,33 @@ int unix_accept(int usockfd, struct sockaddr_un *addr, socklen_t *addrlen)
 
 	uint64_t flags;
 	spin_lock_irqsave(&us->lock, &flags);
-	unix_socket_t *client = NULL;
+	unix_socket_t *server = NULL;
 	if (us->accept_head != us->accept_tail) {
 		int h = us->accept_head;
 		if (h >= 0 && h < 16) {
-			client = us->accept_queue[h];
+			server = us->accept_queue[h];
 			us->accept_queue[h] = NULL;
 			us->accept_head = (h + 1) % 16;
 		}
 	}
 	spin_unlock_irqrestore(&us->lock, flags);
 
-	if (!client)
+	if (!server)
 		return -EAGAIN;
 
-	// Allocate server-side socket — must hold table lock across the slot
-	// scan + memset + active=1 publish so no concurrent unix_create can
-	// alias the same slot (the bug that caused random kernel UAF crashes
-	// after many teststress iterations).
-	uint64_t tflags;
-	spin_lock_irqsave(&unix_table_lock, &tflags);
-	int new_idx = unix_alloc_locked();
-	if (new_idx < 0) {
-		spin_unlock_irqrestore(&unix_table_lock, tflags);
-		client->error = ECONNREFUSED;
-		client->connected = 0;
-		return -ENOMEM;
-	}
-
-	unix_socket_t *server = &unix_sockets[new_idx];
-	uint8_t *p = (uint8_t *)server;
-	for (int i = 0; i < (int)sizeof(unix_socket_t); i++)
-		p[i] = 0;
-	server->active = 1;
-	server->type = SOCK_STREAM;
-	server->connected = 1;
-	server->ref_count = 1;
-	server->parent = us;
-
-	/* The accepted socket carries the listener's name.
+	/* The dequeued entry carries the reference its queue slot held, and it
+	 * is an ALREADY ESTABLISHED connection: connect() built both ends and
+	 * linked them before making it visible here.  This function no longer
+	 * creates anything -- it hands over what is already there, and the
+	 * queue's reference becomes the new descriptor's.
 	 *
-	 * It is the address the client connected TO, so it is what the client's
-	 * getpeername() must report and what getsockname() on this end must
-	 * report as well.  Without it the client sees a peer with no name, and
-	 * anything that identifies a connection by the socket it arrived on
-	 * cannot.
-	 *
-	 * `bound` is deliberately NOT set: the name belongs to the listener,
-	 * this socket merely reports it.  unix_find_by_name_locked() only
-	 * considers bound sockets, so the copy can never satisfy a lookup and
-	 * a later bind to the same path still sees it as free.
-	 */
-	{
-		int pl = us->path_len;
-
-		if (pl < 0)
-			pl = 0;
-		if (pl > UNIX_PATH_MAX)
-			pl = UNIX_PATH_MAX;
-		for (int i = 0; i < pl; i++)
-			server->path[i] = us->path[i];
-		server->path_len = pl;
+	 * A connection whose client went away while it waited is skipped
+	 * rather than handed out: it would be dead on arrival, and its
+	 * teardown still has to happen. */
+	if (server->closed) {
+		unix_hangup_and_put(server);
+		return -EAGAIN;
 	}
-
-	spinlock_init(&server->lock, "unix_sock");
-
-	// Link peers under the table lock so close cannot race with the
-	// bidirectional pointer write (close clears peer->peer = NULL also
-	// under unix_table_lock — see unix_close).
-	server->peer = client;
-	client->peer = server;
-	client->connected = 1;
-
-	/* Record each end's view of the other WHILE both are here and the
-	 * table lock is held.  From now on getpeername() reads these copies
-	 * and never follows `peer`, so it keeps working after the far end
-	 * closes -- see the comment on peer_path in the struct. */
-	{
-		int cl = client->path_len;
-
-		if (cl < 0)
-			cl = 0;
-		if (cl > UNIX_PATH_MAX)
-			cl = UNIX_PATH_MAX;
-		for (int i = 0; i < cl; i++)
-			server->peer_path[i] = client->path[i];
-		server->peer_path_len = cl;
-		server->peer_valid = 1;
-
-		/* The client's peer is the accepted socket, which was given the
-		 * listener's name just above -- so this is the address the
-		 * client connected to. */
-		for (int i = 0; i < server->path_len; i++)
-			client->peer_path[i] = server->path[i];
-		client->peer_path_len = server->path_len;
-		client->peer_valid = 1;
-	}
-	spin_unlock_irqrestore(&unix_table_lock, tflags);
 
 	/* Fill addr if requested.  Report the client's own bound name, as raw
 	 * bytes plus a matching addrlen — the connecting side is normally
@@ -608,26 +553,29 @@ int unix_accept(int usockfd, struct sockaddr_un *addr, socklen_t *addrlen)
 		for (int i = 0; i < UNIX_PATH_MAX; i++)
 			addr->sun_path[i] = 0;
 		addr->sun_family = AF_UNIX;
-		int cl = client->path_len;
+		/* From the copy recorded at connect time, not by following the
+		 * peer: the client may already have closed. */
+		int cl = server->peer_path_len;
+
 		if (cl < 0)
 			cl = 0;
 		if (cl > UNIX_PATH_MAX)
 			cl = UNIX_PATH_MAX;
 		for (int i = 0; i < cl; i++)
-			addr->sun_path[i] = client->path[i];
+			addr->sun_path[i] = server->peer_path[i];
 		*addrlen = (socklen_t)(sizeof(sa_family_t) + cl);
 	}
 
-	return MAKE_UNIX_SOCKET_FD(new_idx);
+	*out = server;
+	return 0;
 }
 
 // ============================================================================
 // unix_connect - Connect to a bound/listening UNIX socket
 // ============================================================================
-int unix_connect(int usockfd, const struct sockaddr_un *addr,
+int unix_connect(unix_socket_t *us, const struct sockaddr_un *addr,
 		 socklen_t addrlen)
 {
-	unix_socket_t *us = unix_get(usockfd);
 	if (!us)
 		return -EBADF;
 	if (us->connected)
@@ -664,120 +612,184 @@ int unix_connect(int usockfd, const struct sockaddr_un *addr,
 			return (pr == ST_PERM) ? -EPERM : -EACCES;
 	}
 
-	// Look up listener and enqueue under unix_table_lock so the listener
-	// cannot be closed (and its slot reused) between lookup and enqueue.
-	uint64_t tflags;
+	/* Build the connection here, and hand the SERVER end to the listener.
+	 *
+	 * What this replaces queued the CLIENT and then waited for accept() to
+	 * build the other end and link the two.  That made connect() depend on
+	 * the listener getting round to accepting, so a program that connects
+	 * and accepts on one thread -- a legitimate thing to do, and what a
+	 * self-connection test does -- deadlocked: connect waited for an
+	 * accept that could not run.  It also meant a half-built connection
+	 * was visible to accept() before either end was linked.
+	 *
+	 * Conventionally connect() completes as soon as the connection is
+	 * queued; accept() merely hands an established connection to the
+	 * application.  So the server end is created here, the pair is linked
+	 * in one step, and only then does it become visible to accept().
+	 */
+	unix_socket_t *server = NULL;
+	unix_socket_t *listener = NULL;
+	uint64_t tflags, flags;
+
+	/* Take a reference on the listener before letting go of the table
+	 * lock: everything below can sleep. */
 	spin_lock_irqsave(&unix_table_lock, &tflags);
-	unix_socket_t *listener = unix_find_by_name_locked(name, nlen);
-	if (!listener || !listener->listening) {
-		spin_unlock_irqrestore(&unix_table_lock, tflags);
-		return -ECONNREFUSED;
-	}
-
-	uint64_t flags;
-	spin_lock_irqsave(&listener->lock, &flags);
-
-	// Check accept queue capacity
-	int next = (listener->accept_tail + 1) % 16;
-	if (next == listener->accept_head) {
-		spin_unlock_irqrestore(&listener->lock, flags);
-		spin_unlock_irqrestore(&unix_table_lock, tflags);
-		return -ECONNREFUSED;
-	}
-
-	// Enqueue ourselves
-	listener->accept_queue[listener->accept_tail] = us;
-	listener->accept_tail = next;
-	listener->accept_ready = 1;
-	spin_unlock_irqrestore(&listener->lock, flags);
+	listener = unix_find_by_name_locked(name, nlen);
+	if (listener && !listener->listening)
+		listener = NULL;
+	if (listener && !unix_tryhold(listener))
+		listener = NULL;
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
+	if (!listener)
+		return -ECONNREFUSED;
+
+	/* The rings are obtained with no lock held -- allocating can sleep. */
+	if (unix_ring_ensure(us) != 0) {
+		unix_put(listener);
+		return -ENOMEM;
+	}
+
+	spin_lock_irqsave(&unix_table_lock, &tflags);
+	{
+		int new_idx = unix_alloc_locked();
+
+		if (new_idx < 0) {
+			spin_unlock_irqrestore(&unix_table_lock, tflags);
+			unix_put(listener);
+			return -ENOMEM;
+		}
+		server = &unix_sockets[new_idx];
+		uint8_t *p = (uint8_t *)server;
+
+		for (int i = 0; i < (int)sizeof(unix_socket_t); i++)
+			p[i] = 0;
+		server->active = 1;
+		server->type = SOCK_STREAM;
+		server->magic = UNIX_SOCK_MAGIC;
+		server->id = s_unix_next_id++;
+		/* One descriptor's worth, and one reference: accept() hands
+		 * both to the caller.  Until then the queue holds the
+		 * reference on the listener's behalf. */
+		server->ref_count = 1;
+		refcount_set(&server->refcount, 1);
+		server->parent = listener;
+		spinlock_init(&server->lock, "unix_sock");
+
+		/* The accepted end reports the listener's name: it is the
+		 * address the client connected TO.  `bound` stays clear -- the
+		 * name belongs to the listener, this socket merely reports it,
+		 * and a lookup only considers bound sockets. */
+		{
+			int pl = listener->path_len;
+
+			if (pl < 0)
+				pl = 0;
+			if (pl > UNIX_PATH_MAX)
+				pl = UNIX_PATH_MAX;
+			for (int i = 0; i < pl; i++)
+				server->path[i] = listener->path[i];
+			server->path_len = pl;
+		}
+
+		/* Link both directions in one step, under the lock where the
+		 * link is also severed.  Each direction holds a reference, so
+		 * neither end can be destroyed while the other points at it. */
+		server->peer = us;
+		us->peer = server;
+		unix_hold(us); /* for server->peer */
+		unix_hold(server); /* for us->peer */
+		server->connected = 1;
+		us->connected = 1;
+
+		/* Each end's view of the other, recorded now and never chased
+		 * again -- getpeername() must keep answering after the far end
+		 * closes. */
+		{
+			int cl = us->path_len;
+
+			if (cl < 0)
+				cl = 0;
+			if (cl > UNIX_PATH_MAX)
+				cl = UNIX_PATH_MAX;
+			for (int i = 0; i < cl; i++)
+				server->peer_path[i] = us->path[i];
+			server->peer_path_len = cl;
+			server->peer_valid = 1;
+
+			for (int i = 0; i < server->path_len; i++)
+				us->peer_path[i] = server->path[i];
+			us->peer_path_len = server->path_len;
+			us->peer_valid = 1;
+		}
+	}
+	spin_unlock_irqrestore(&unix_table_lock, tflags);
+
+	/* Publish it to the listener LAST, so accept() can never see a
+	 * half-built connection.  A full backlog is refused rather than
+	 * waited on, which is what this driver has always done. */
+	spin_lock_irqsave(&listener->lock, &flags);
+	{
+		int next = (listener->accept_tail + 1) % 16;
+
+		if (!listener->listening || next == listener->accept_head) {
+			spin_unlock_irqrestore(&listener->lock, flags);
+			/* Unwind: tear the pair down again and give the
+			 * caller its socket back as it was.
+			 *
+			 * Severing the link stamps peer_closed on this end --
+			 * correct for a connection that existed and ended, and
+			 * wrong here, where none ever did.  Left set, the
+			 * caller's next poll() reports a hangup and its next
+			 * read() an end of file, on a socket that is simply
+			 * unconnected.  connect() failed; the socket must be
+			 * as good as new. */
+			unix_hangup_and_put(server);
+			spin_lock_irqsave(&us->lock, &flags);
+			us->peer_closed = 0;
+			us->connected = 0;
+			us->ready = 0;
+			spin_unlock_irqrestore(&us->lock, flags);
+			unix_put(listener);
+			return -ECONNREFUSED;
+		}
+		listener->accept_queue[listener->accept_tail] = server;
+		listener->accept_tail = next;
+		listener->accept_ready = 1;
+	}
+	spin_unlock_irqrestore(&listener->lock, flags);
 
 	/* A listener multiplexing with select() -- which is what a display
 	 * server does -- is waiting on the poll channel, not on this socket. */
+	sched_wake_channel(listener);
 	poll_notify_io_ready();
-
-	/*
-	 * Wait for acceptance.
-	 *
-	 * The thing to wait for is `connected', NOT `peer'.
-	 *
-	 * accept() sets both, together, under the table lock: client->peer =
-	 * server and client->connected = 1.  But close() on the accepted end
-	 * clears client->peer back to NULL, while `connected' -- which connect()
-	 * only ever reads, never writes -- stays set for good.  So a loop that
-	 * waits for a non-NULL peer is waiting for a state that a server doing
-	 *
-	 *     fd = accept(...); close(fd);
-	 *
-	 * publishes and withdraws before this task is next scheduled.  Then peer
-	 * is NULL again, error is 0, and the loop below spins for ever on a
-	 * connection that actually completed: the task stays READY, burning a
-	 * CPU, and its parent waits in waitpid() for a child that will never
-	 * exit.  Caught with pid 180 spinning here while its own socket showed
-	 * connected=1, peer_closed=1, peer=NULL.
-	 *
-	 * The connection DID complete, so connect() succeeds; the caller learns
-	 * about the hangup from its first read, exactly as it would anywhere
-	 * else.  Only a peer that closed WITHOUT ever linking us is a refusal.
-	 *
-	 * Re-read through volatile each pass so the compiler cannot hoist any
-	 * of it out, and yield rather than pause so the listener -- which may
-	 * be on this very CPU -- gets to run accept().
-	 */
-	task_t *con_cur = sched_current();
-	for (;;) {
-		if (*(volatile int *)&us->connected)
-			break;
-		if (*(volatile int *)&us->error)
-			break;
-		/* Hung up before we were ever linked: nobody is coming. */
-		if (*(volatile int *)&us->peer_closed) {
-			us->peer_closed = 0;
-			return -ECONNREFUSED;
-		}
-		if (*(volatile int *)&us->closed)
-			return -EBADF;
-		if (us->nonblock)
-			return -EINPROGRESS;
-		if (!*(volatile int *)&us->active)
-			return -EBADF;
-		/* Interruptible: POSIX connect() returns EINTR. */
-		if (con_cur && signal_pending(con_cur))
-			return -EINTR;
-		sched_yield_in_kernel();
-	}
-
-	if (us->error) {
-		int err = us->error;
-		us->error = 0;
-		return -err;
-	}
-
+	unix_put(listener);
 	return 0;
 }
 
-// ============================================================================
-// unix_send - Send data on a connected UNIX socket
-// ============================================================================
-int unix_send(int usockfd, const void *buf, size_t len, int flags)
+int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags)
 {
 	might_sleep();
 	BUG_ON(buf == NULL && len > 0);
 	(void)flags;
-	unix_socket_t *us = unix_get(usockfd);
 	if (!us)
 		return -EBADF;
 
-	// Snapshot peer pointer under unix_table_lock so it cannot be set
-	// to a freed-and-reused slot mid-deref.  Once we are counted in
-	// peer->send_active, the slot cannot be freed under us even if
-	// unix_close clears us->peer afterwards -- unix_close decides whether
-	// it may release under the same lock, so the two cannot cross.
+	/* Take a reference on the peer and keep it for the whole call.
+	 *
+	 * The pointer is read under the table lock, which is where the peer
+	 * link is severed, so it cannot be captured just as the link is being
+	 * torn down; and the reference then keeps that socket in existence
+	 * until this send is finished with it, however soon its own descriptors
+	 * go away.  What is being prevented is not the peer closing -- that is
+	 * ordinary and reported as EPIPE -- but the slot being handed to a
+	 * different socket while this call is still writing into it. */
 	uint64_t tflags;
 	spin_lock_irqsave(&unix_table_lock, &tflags);
 	unix_socket_t *peer = us->peer;
-	if (!peer || !peer->active) {
-		spin_unlock_irqrestore(&unix_table_lock, tflags);
+	if (peer && !unix_tryhold(peer))
+		peer = NULL; /* already being destroyed */
+	spin_unlock_irqrestore(&unix_table_lock, tflags);
+	if (!peer) {
 		/* Peer already closed our side — return EPIPE (not ENOTCONN) */
 		if (us->peer_closed)
 			return -EPIPE;
@@ -785,11 +797,9 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 			return -EDESTADDRREQ;
 		return -ENOTCONN;
 	}
-	__atomic_fetch_add(&peer->send_active, 1, __ATOMIC_ACQ_REL);
-	spin_unlock_irqrestore(&unix_table_lock, tflags);
 
 	if (peer->closed || peer->peer_closed) {
-		unix_put_sender(peer);
+		unix_put(peer);
 		return -EPIPE;
 	}
 
@@ -829,7 +839,7 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 		/* The peer needs a ring before anything can be put in it.
 		 * Done here, outside every lock, because it may sleep. */
 		if (unix_ring_ensure(peer) != 0) {
-			unix_put_sender(peer);
+			unix_put(peer);
 			return sent > 0 ? sent : -ENOMEM;
 		}
 
@@ -863,7 +873,7 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 		if (sent > 0)
 			break; /* partial write — report what we sent */
 		if (us->nonblock) {
-			unix_put_sender(peer);
+			unix_put(peer);
 			return -EAGAIN;
 		}
 		/* Wait for the reader to make space.
@@ -890,7 +900,7 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 				if (peer->closed) {
 					spin_unlock_irqrestore(&peer->lock,
 							       irqflags);
-					unix_put_sender(peer);
+					unix_put(peer);
 					return -EPIPE;
 				}
 				/* Interruptible: send() returns EINTR, and no
@@ -898,7 +908,7 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 				if (snd_cur && signal_pending(snd_cur)) {
 					spin_unlock_irqrestore(&peer->lock,
 							       irqflags);
-					unix_put_sender(peer);
+					unix_put(peer);
 					return -EINTR;
 				}
 				if (!snd_cur) {
@@ -925,10 +935,11 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 	if (poll_pending)
 		poll_notify_io_ready();
 
-	// Drop the reference we took above.  If this was the last ref and
-	// peer was already closed, unix_close's deferred-free logic (or
-	// our own dec dropping ref to 0) will tear it down on next close.
-	unix_put_sender(peer);
+	/* Let go of the peer.  If its descriptors have gone in the meantime,
+	 * this is the last reference and the socket is destroyed here -- which
+	 * is the point of holding one: the ring being written into above could
+	 * not be freed while this call was still using it. */
+	unix_put(peer);
 
 	return sent > 0 ? sent : -EAGAIN;
 }
@@ -936,11 +947,10 @@ int unix_send(int usockfd, const void *buf, size_t len, int flags)
 // ============================================================================
 // unix_recv - Receive data from a connected UNIX socket
 // ============================================================================
-int unix_recv(int usockfd, void *buf, size_t len, int flags)
+int unix_recv(unix_socket_t *us, void *buf, size_t len, int flags)
 {
 	might_sleep();
 	BUG_ON(buf == NULL && len > 0);
-	unix_socket_t *us = unix_get(usockfd);
 	if (!us)
 		return -EBADF;
 
@@ -966,11 +976,24 @@ int unix_recv(int usockfd, void *buf, size_t len, int flags)
 			return -EBADF;
 		if (*(volatile int *)&us->peer_closed)
 			return 0;
-		volatile unix_socket_t *const *peer_slot =
-			(volatile unix_socket_t *const *)&us->peer;
-		unix_socket_t *p = (unix_socket_t *)*peer_slot;
-		if (p && *(volatile int *)&p->closed)
-			return 0;
+		if (*(volatile int *)&us->shut_rd)
+			return 0; /* this end asked for no more reads */
+		/* End of file is decided from THIS socket's own state and
+		 * nothing else.
+		 *
+		 * What stood here chased us->peer and returned 0 if that socket
+		 * looked closed -- with no lock and nothing keeping the peer in
+		 * existence.  A peer whose slot had been recycled read as
+		 * closed whenever its new occupant was, and a live reader was
+		 * handed a clean end of file on a connection that was still
+		 * open.  read() returning 0 sets no errno, so a program that
+		 * trusted it exited quietly with whatever errno happened to be
+		 * lying around -- which is precisely how a graphical client
+		 * vanished mid-session reporting "Success".
+		 *
+		 * peer_closed above is the honest signal: the peer's own
+		 * teardown sets it, under the lock, on the socket it is
+		 * hanging up.  Nothing has to be inferred by looking. */
 		if (!us->connected && us->type == SOCK_STREAM)
 			return -ENOTCONN;
 		if (us->nonblock || dontwait)
@@ -1071,75 +1094,239 @@ int unix_recv(int usockfd, void *buf, size_t len, int flags)
  * peer's poll() report a hangup.  The other half has to wait for any sender
  * still writing into the ring.
  */
-static unix_socket_t *unix_mark_closed_locked(unix_socket_t *us)
+/* The peer link is a pair of references, one in each direction, and severing
+ * it drops both.  The one this socket held on its peer is handed to the caller
+ * along with the pointer -- it is what keeps the peer alive to be woken.  The
+ * one the peer held on THIS socket has no such carrier, so *drop_self says it
+ * is owed, to be paid once the locks are dropped. */
+static unix_socket_t *unix_mark_closed_locked(unix_socket_t *us, int *drop_self)
 {
 	unix_socket_t *peer = us->peer;
 
+	*drop_self = 0;
 	us->closed = 1;
 	if (peer) {
 		peer->peer_closed = 1;
 		peer->ready = 1; /* release readers parked on it */
 		peer->peer = NULL;
+		*drop_self = 1; /* peer->peer no longer references us */
 	}
 	us->peer = NULL;
 	us->connected = 0;
 	return peer;
 }
 
-/* Release the ring and the slot.  Caller holds unix_table_lock and us->lock.
- * The ring is returned rather than freed: kfree must not run with interrupts
- * off. */
-static uint8_t *unix_release_locked(unix_socket_t *us)
+/* ---- Reference counting -------------------------------------------------
+ *
+ * The slot a socket occupies is released when the last reference goes, and not
+ * before.  That is the whole of it, and it is what makes a bare
+ * unix_socket_t * a stable identity: while anyone holds one, the memory cannot
+ * become a different socket.
+ *
+ * Before this, the only counter was of DESCRIPTORS, and everything else --
+ * the peer link, entries queued on a listener, an operation in flight -- kept
+ * a raw pointer with nothing behind it.  A socket that closed while one of
+ * those pointers existed freed its slot, the next socket created took it, and
+ * the holder of the stale pointer then read and wrote a stranger's state.
+ * Nothing faulted, because the array is always mapped; what happened instead
+ * was that an unrelated connection was told its peer had hung up.
+ *
+ * Rules:
+ *   - unix_hold() needs a reference already held, so it cannot resurrect.
+ *   - unix_tryhold() is for a pointer found by searching the table; it
+ *     refuses a socket already at zero and must be called with the table
+ *     lock held, which is what makes "found" and "still alive" one decision.
+ *   - unix_put() must be called with NO unix lock held: the last one frees
+ *     the ring, and kfree cannot run with interrupts off.  Callers that drop
+ *     a reference while holding a lock stash the pointer and put it after.
+ */
+static void unix_hold(unix_socket_t *us)
 {
-	uint8_t *dead_ring = us->buf;
-
-	us->active = 0;
-	us->bound = 0;
-	us->listening = 0;
-	us->head = 0;
-	us->tail = 0;
-	us->buf = NULL;
-	us->bufsz = 0;
-	us->close_pending = 0;
-	return dead_ring;
+	BUG_ON(us == NULL);
+	refcount_inc(&us->refcount);
 }
 
-/* Drop the reference unix_send() took on a peer.
- *
- * If this was the last one and a close came in while it was held, that close
- * could not release the ring -- this sender may have been writing into it --
- * so it left the job here.  Nothing else will do it: the descriptor is already
- * gone, so there is no second close to finish what the first started.
- */
-static void unix_put_sender(unix_socket_t *us)
+static int unix_tryhold(unix_socket_t *us)
+{
+	lockdep_assert_held(&unix_table_lock);
+	if (!us)
+		return 0;
+	return refcount_inc_not_zero(&us->refcount);
+}
+
+static void unix_put(unix_socket_t *us)
 {
 	uint64_t tflags, flags;
 	uint8_t *dead_ring = NULL;
 
-	/* Under the table lock, because unix_close() decides whether it may
-	 * release under that same lock: without it the two can both conclude
-	 * the other will do the release, and neither does. */
-	spin_lock_irqsave(&unix_table_lock, &tflags);
-	int old = __atomic_fetch_sub(&us->send_active, 1, __ATOMIC_ACQ_REL);
-	WARN_ON(old <= 0); /* unix_socket send_active underflow */
+	if (!us)
+		return;
+	if (!refcount_dec_and_test(&us->refcount))
+		return;
 
-	if (old == 1 && us->close_pending) {
-		spin_lock_irqsave(&us->lock, &flags);
-		dead_ring = unix_release_locked(us);
-		spin_unlock_irqrestore(&us->lock, flags);
+	/* Last reference gone, so nothing can reach this socket again: a
+	 * lookup by name holds the table lock and refuses a zero count, and
+	 * the descriptors, the peer link and every queue entry have all let
+	 * go.  Only now does the slot go back. */
+	/* Descriptors sent over this socket and never received belong to it,
+	 * and are closed with it.
+	 *
+	 * Nothing did that: an in-band descriptor is queued with its reference
+	 * already taken, and only a receiver ever took one off the queue.  A
+	 * socket that closed with fds still queued -- the far end exited, or
+	 * simply never read them -- left every one of those references held
+	 * for the rest of the boot.  For a program that passes descriptors
+	 * routinely, that is a file, a pipe or another socket kept alive by
+	 * nobody, and the process that appeared to close it never finding out.
+	 *
+	 * Collected under the lock and released after it: releasing can close
+	 * a socket or a pipe of its own, which takes locks and can free. */
+	void *dead_fds[16];
+	int n_dead = 0;
+
+	spin_lock_irqsave(&unix_table_lock, &tflags);
+	spin_lock_irqsave(&us->lock, &flags);
+	WARN_ON(us->peer != NULL); /* destroyed still linked to a peer */
+	WARN_ON(us->accept_head !=
+		us->accept_tail); /* destroyed with connections queued */
+	while (us->pending_fd_head != us->pending_fd_tail && n_dead < 16) {
+		dead_fds[n_dead++] = us->pending_fds[us->pending_fd_head];
+		us->pending_fds[us->pending_fd_head] = NULL;
+		us->pending_fd_head = (us->pending_fd_head + 1) % 16;
 	}
+	dead_ring = us->buf;
+	us->buf = NULL;
+	us->bufsz = 0;
+	us->head = 0;
+	us->tail = 0;
+	us->bound = 0;
+	us->listening = 0;
+	us->active = 0;
+	/* Last, and before the slot can be handed out again: a stale pointer
+	 * to this socket now fails identification rather than passing it. */
+	us->magic = 0;
+	spin_unlock_irqrestore(&us->lock, flags);
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
+
+	for (int i = 0; i < n_dead; i++)
+		fd_release_entry((vfs_file_t *)dead_fds[i]);
 
 	if (dead_ring)
 		kfree(dead_ring);
 }
 
+/* Queue an in-band descriptor for this socket's peer.
+ *
+ * The peer is found and pinned in here, rather than by the caller.  The
+ * syscall layer used to read us->peer with no lock and no reference and then
+ * hand the pointer on to be used later -- by which time it could name a
+ * different socket entirely.  Which peer a socket has is this layer's
+ * business, and so is keeping it alive for the length of the operation.
+ */
+int unix_send_fd(unix_socket_t *us, void *entry)
+{
+	uint64_t tflags;
+	unix_socket_t *peer;
+	int r;
+
+	if (!us || !entry)
+		return -EINVAL;
+
+	spin_lock_irqsave(&unix_table_lock, &tflags);
+	peer = us->peer;
+	if (peer && !unix_tryhold(peer))
+		peer = NULL;
+	spin_unlock_irqrestore(&unix_table_lock, tflags);
+	if (!peer)
+		return -ENOTCONN;
+
+	r = unix_push_fd(peer, entry);
+	unix_put(peer);
+	return r;
+}
+
+/* Resolve a descriptor marker to its socket AND take a reference, so the
+ * caller can go on using the pointer even if the descriptor it came from is
+ * closed underneath it.
+ *
+ * Without this, every syscall resolved its descriptor to a bare pointer and
+ * then used it for the length of the call.  A sibling thread closing that same
+ * descriptor in the meantime dropped the last reference and destroyed the
+ * socket while the first thread was still working on it -- the one hole left
+ * in the lifetime model once the peer, the queues and the descriptors all held
+ * references of their own.
+ *
+ * Taken under the table lock and refusing a socket already at zero, so
+ * "found" and "still alive" are one decision. */
+unix_socket_t *unix_sock_lookup_hold(unix_socket_t *us)
+{
+	uint64_t flags;
+
+	if (!us)
+		return NULL;
+	spin_lock_irqsave(&unix_table_lock, &flags);
+	if (!unix_tryhold(us))
+		us = NULL;
+	spin_unlock_irqrestore(&unix_table_lock, flags);
+	return us;
+}
+
+/* Release a reference taken by unix_sock_lookup_hold().  Must be called with
+ * no unix lock held -- the last one destroys the socket. */
+void unix_sock_put_ref(unix_socket_t *us)
+{
+	unix_put(us);
+}
+
+/* Tear a connection down from one end and release the caller's reference.
+ *
+ * The same two halves as closing a descriptor -- publish the hangup so the
+ * peer's poll() and read() report it, then let go -- for the cases where there
+ * is no descriptor to close: a connection built by connect() that the listener
+ * never accepted, and one queued on a listener that is going away. */
+static void unix_hangup_and_put(unix_socket_t *s)
+{
+	uint64_t tflags, flags;
+	unix_socket_t *peer;
+	int drop_self = 0;
+
+	if (!s)
+		return;
+
+	spin_lock_irqsave(&unix_table_lock, &tflags);
+	spin_lock_irqsave(&s->lock, &flags);
+	peer = unix_mark_closed_locked(s, &drop_self);
+	spin_unlock_irqrestore(&s->lock, flags);
+	spin_unlock_irqrestore(&unix_table_lock, tflags);
+
+	sched_wake_channel(s);
+	if (peer) {
+		sched_wake_channel(peer);
+		unix_put(peer); /* the reference s->peer held */
+	}
+	if (drop_self)
+		unix_put(s); /* the reference peer->peer held on s */
+	unix_put(s); /* the caller's own */
+	poll_notify_io_ready();
+}
+
+void unix_sock_fdget(unix_socket_t *us)
+{
+	uint64_t flags;
+
+	if (!us)
+		return;
+	spin_lock_irqsave(&us->lock, &flags);
+	us->ref_count++;
+	spin_unlock_irqrestore(&us->lock, flags);
+	unix_hold(us);
+}
+
 // ============================================================================
 // unix_close - Close a UNIX domain socket
 // ============================================================================
-int unix_close(int usockfd)
+int unix_close(unix_socket_t *us)
 {
-	unix_socket_t *us = unix_get(usockfd);
 	if (!us)
 		return -EBADF;
 
@@ -1150,15 +1337,21 @@ int unix_close(int usockfd)
 	 * enough to stop the X server accepting connections: xkbcomp exits
 	 * moments after the server forks it, and its inherited copy of the
 	 * server's descriptors is closed on the way out. */
-	int old = __atomic_fetch_sub(&us->ref_count, 1, __ATOMIC_ACQ_REL);
+	uint64_t flags;
+	spin_lock_irqsave(&us->lock, &flags);
+	int old = us->ref_count--;
 	WARN_ON(old <= 0); /* unix_socket ref_count underflow */
-	if (old > 1)
+	spin_unlock_irqrestore(&us->lock, flags);
+	if (old > 1) {
+		/* Still other descriptors: this close only gives back the
+		 * reference that this one descriptor held. */
+		unix_put(us);
 		return 0;
+	}
 
 	uint64_t tflags;
 	spin_lock_irqsave(&unix_table_lock, &tflags);
 
-	uint64_t flags;
 	spin_lock_irqsave(&us->lock, &flags);
 
 	/* Last descriptor gone: mark it dead and tell the peer NOW, whether or
@@ -1179,18 +1372,30 @@ int unix_close(int usockfd)
 	 * when a send was in flight as the socket closed -- which is exactly
 	 * what closing a window is, since the request to close is a message
 	 * sent to the client. */
-	unix_socket_t *peer = unix_mark_closed_locked(us);
+	int drop_self = 0;
+	unix_socket_t *peer = unix_mark_closed_locked(us, &drop_self);
 
-	/* The ring and the slot are a different matter: a sender may still be
-	 * writing into the ring, so releasing it here would pull the memory out
-	 * from under it.  Decided under the table lock, which is also where a
-	 * sender joins send_active, so the two cannot both leave it to the
-	 * other. */
-	uint8_t *dead_ring = NULL;
-	if (__atomic_load_n(&us->send_active, __ATOMIC_ACQUIRE) > 0)
-		__atomic_store_n(&us->close_pending, 1, __ATOMIC_RELEASE);
-	else
-		dead_ring = unix_release_locked(us);
+	/* The ring and the slot are a different matter, and they are no longer
+	 * decided here at all: whoever still holds a reference -- a sender
+	 * writing into the ring, a listener holding this in its queue -- keeps
+	 * the socket alive, and the last of them to let go destroys it.  What
+	 * used to stand here was a hand-rolled version of that for the one case
+	 * that had been noticed, and it could not cover the others. */
+
+	/* Anything still queued on this socket belongs to it and must be
+	 * released with it.  A listener closing with connections waiting used
+	 * to abandon them: nothing ever removed a queue entry except accept(),
+	 * so the reference was lost and the slot never came back. */
+	unix_socket_t *orphans[16];
+	int n_orphans = 0;
+	while (us->accept_head != us->accept_tail) {
+		unix_socket_t *q = us->accept_queue[us->accept_head];
+
+		us->accept_queue[us->accept_head] = NULL;
+		us->accept_head = (us->accept_head + 1) % 16;
+		if (q && n_orphans < 16)
+			orphans[n_orphans++] = q;
+	}
 
 	/* Capture the pathname before releasing the slot: the node has to be
 	 * removed from the filesystem, but that is blocking I/O and cannot run
@@ -1221,21 +1426,40 @@ int unix_close(int usockfd)
 		sched_wake_channel(peer);
 	poll_notify_io_ready();
 
+	/* Tell each abandoned client the connection is not coming, then let go
+	 * of the reference its queue entry held.  Outside the locks: waking
+	 * takes scheduler locks, and the last put frees a ring. */
+	/* Each queued entry is a fully built connection that was never
+	 * accepted.  Tearing it down is what tells its client the far end has
+	 * gone -- reads return end of file, writes EPIPE -- which is what a
+	 * connection reset before it was ever served should look like. */
+	for (int i = 0; i < n_orphans; i++)
+		unix_hangup_and_put(orphans[i]);
+	if (n_orphans)
+		poll_notify_io_ready();
+
 	/* Stale sockets otherwise accumulate in /tmp and every later bind to
 	 * the same name fails with EADDRINUSE — which is exactly how a display
 	 * server refuses to restart after an unclean exit. */
 	if (node_len > 0)
 		vfs_unlink(node_path);
 
-	if (dead_ring)
-		kfree(dead_ring);
+	/* The peer link's two references, now that no lock is held. */
+	if (peer)
+		unix_put(peer); /* the one us->peer held */
+	if (drop_self)
+		unix_put(us); /* the one peer->peer held on us */
+
+	/* And finally the one this descriptor held.  Last, so that every step
+	 * above ran on a socket that was certainly still there. */
+	unix_put(us);
 	return 0;
 }
 
 // ============================================================================
 // unix_socketpair - Create a pair of connected UNIX domain sockets
 // ============================================================================
-int unix_socketpair(int type, int sv[2])
+int unix_socketpair(int type, unix_socket_t *sv[2])
 {
 	if (type != SOCK_STREAM && type != SOCK_DGRAM)
 		return -EINVAL;
@@ -1269,6 +1493,9 @@ int unix_socketpair(int type, int sv[2])
 	s0->type = type;
 	s0->connected = 1;
 	s0->ref_count = 1;
+	refcount_set(&s0->refcount, 1);
+	s0->magic = UNIX_SOCK_MAGIC;
+	s0->id = s_unix_next_id++;
 	spinlock_init(&s0->lock, "unix_sock");
 
 	// Initialize s1
@@ -1279,11 +1506,17 @@ int unix_socketpair(int type, int sv[2])
 	s1->type = type;
 	s1->connected = 1;
 	s1->ref_count = 1;
+	refcount_set(&s1->refcount, 1);
+	s1->magic = UNIX_SOCK_MAGIC;
+	s1->id = s_unix_next_id++;
 	spinlock_init(&s1->lock, "unix_sock");
 
-	// Link peers
+	// Link peers.  Each direction holds a reference, so closing one end
+	// cannot free it while the other still points at it.
 	s0->peer = s1;
 	s1->peer = s0;
+	unix_hold(s1); /* for s0->peer */
+	unix_hold(s0); /* for s1->peer */
 	/* Both ends are connected, and both are unnamed -- a pair has no
 	 * pathname.  peer_valid still has to be set, or getpeername() on either
 	 * end would report ENOTCONN instead of the correct family-only answer. */
@@ -1293,8 +1526,8 @@ int unix_socketpair(int type, int sv[2])
 	s1->peer_valid = 1;
 	spin_unlock_irqrestore(&unix_table_lock, tflags);
 
-	sv[0] = MAKE_UNIX_SOCKET_FD(idx0);
-	sv[1] = MAKE_UNIX_SOCKET_FD(idx1);
+	sv[0] = s0;
+	sv[1] = s1;
 
 	return 0;
 }
@@ -1302,24 +1535,61 @@ int unix_socketpair(int type, int sv[2])
 // ============================================================================
 // unix_shutdown - Shutdown part of a UNIX socket connection
 // ============================================================================
-int unix_shutdown(int usockfd, int how)
+int unix_shutdown(unix_socket_t *us, int how)
 {
-	unix_socket_t *us = unix_get(usockfd);
 	if (!us)
 		return -EBADF;
 	if (!us->connected)
 		return -ENOTCONN;
 
 	if (how == SHUT_WR || how == SHUT_RDWR) {
-		// Stop writing — signal peer
-		if (us->peer) {
-			us->peer->peer_closed = 1;
-			us->peer->ready = 1;
+		/* Tell the peer this end will send no more.
+		 *
+		 * The peer is pinned first.  This used to write straight
+		 * through us->peer with no lock and no check that it was still
+		 * a socket at all -- and shutdown(SHUT_RDWR) is what a client
+		 * library calls on its way out, so it ran at exactly the moment
+		 * sockets were being torn down around it. */
+		uint64_t tflags, flags;
+		unix_socket_t *peer;
+
+		spin_lock_irqsave(&unix_table_lock, &tflags);
+		peer = us->peer;
+		if (peer && !unix_tryhold(peer))
+			peer = NULL;
+		spin_unlock_irqrestore(&unix_table_lock, tflags);
+
+		if (peer) {
+			spin_lock_irqsave(&peer->lock, &flags);
+			peer->peer_closed = 1;
+			peer->ready = 1;
+			spin_unlock_irqrestore(&peer->lock, flags);
+			sched_wake_channel(peer);
+			poll_notify_io_ready();
+			unix_put(peer);
 		}
 	}
 	if (how == SHUT_RD || how == SHUT_RDWR) {
-		// Stop reading
-		us->peer_closed = 1;
+		/* Stop reading.
+		 *
+		 * peer_closed is deliberately NOT set here.  It means "the far
+		 * end hung up", and poll() reports a hangup from it -- so
+		 * setting it on ourselves made this socket report POLLHUP to
+		 * its own owner for ever after, on a connection the peer was
+		 * still happily using.  A client library that shuts down its
+		 * read side and keeps writing was thereby told its connection
+		 * had died.
+		 *
+		 * What SHUT_RD owes the caller is that reads return end of
+		 * file, which shut_rd below expresses without claiming
+		 * anything about the peer. */
+		uint64_t flags;
+
+		spin_lock_irqsave(&us->lock, &flags);
+		us->shut_rd = 1;
+		spin_unlock_irqrestore(&us->lock, flags);
+		sched_wake_channel(us);
+		poll_notify_io_ready();
 	}
 
 	return 0;
@@ -1328,44 +1598,101 @@ int unix_shutdown(int usockfd, int how)
 // ============================================================================
 // unix_poll - Poll a UNIX socket for events
 // ============================================================================
-int unix_poll(int usockfd, short events)
+/* Report what this socket can do right now.
+ *
+ * Everything is read into locals first, under the appropriate lock, and the
+ * answer is computed from those.  That is not tidiness -- it is the fix.
+ *
+ * This function used to take no lock at all and dereference us->peer five
+ * separate times, with nothing keeping that socket in existence.  A peer whose
+ * slot had been recycled answered for whoever now occupied it, so an unrelated
+ * socket closing anywhere in the system could make this report POLLHUP on a
+ * healthy connection.  A program multiplexing with poll() -- which every
+ * graphical client does -- treats a hangup it did not ask for as the
+ * connection dying and closes it on the spot, and the poll layer hands our
+ * answer to userspace unmasked, so a single invented bit was a lost session.
+ *
+ * The two reads of the peer's ring size were their own hazard: a release
+ * setting it to zero between them turned the modulo into a division by zero
+ * in the kernel.  One snapshot cannot disagree with itself.
+ */
+int unix_poll(unix_socket_t *us, short events)
 {
-	unix_socket_t *us = unix_get(usockfd);
 	if (!us)
 		return 0;
 
 	short revents = 0;
+	uint64_t flags, tflags;
+	unix_socket_t *peer;
+	int have_data, listening, has_pending, closed, error, peer_closed;
+	int shut_rd;
+
+	spin_lock_irqsave(&us->lock, &flags);
+	have_data = (us->head != us->tail);
+	listening = us->listening;
+	has_pending = (us->accept_head != us->accept_tail);
+	closed = us->closed;
+	error = us->error;
+	peer_closed = us->peer_closed;
+	shut_rd = us->shut_rd;
+	spin_unlock_irqrestore(&us->lock, flags);
+
+	/* The peer is pinned for exactly as long as it is looked at.  Taken
+	 * under the table lock because that is where the link is severed. */
+	spin_lock_irqsave(&unix_table_lock, &tflags);
+	peer = us->peer;
+	if (peer && !unix_tryhold(peer))
+		peer = NULL;
+	spin_unlock_irqrestore(&unix_table_lock, tflags);
+
+	int peer_gone = 1, peer_writable = 0;
+
+	if (peer) {
+		spin_lock_irqsave(&peer->lock, &flags);
+		peer_gone = peer->closed;
+		if (!peer_gone) {
+			/* A peer with no ring yet has never been written to,
+			 * so it is trivially writable -- the ring is allocated
+			 * on the first send.  Testing the modulo first would
+			 * be a divide by zero, and a client polls before it
+			 * writes. */
+			int bufsz = peer->bufsz;
+
+			peer_writable =
+				(bufsz == 0) ||
+				((peer->tail + 1) % bufsz != peer->head);
+		}
+		spin_unlock_irqrestore(&peer->lock, flags);
+	}
 
 	if (events & POLLIN) {
-		if (us->head != us->tail)
+		if (have_data)
 			revents |= POLLIN;
-		if (us->peer_closed || (us->peer && us->peer->closed))
+		if (peer_closed)
 			revents |= POLLIN | POLLHUP;
-		if (us->listening && us->accept_head != us->accept_tail)
+		/* Readable, because a read returns end of file at once -- but
+		 * NOT a hangup: this end asked to stop reading, the connection
+		 * is still up, and a caller that is told otherwise drops it. */
+		if (shut_rd)
+			revents |= POLLIN;
+		if (listening && has_pending)
 			revents |= POLLIN;
 	}
 
 	if (events & POLLOUT) {
-		if (us->peer && !us->peer->closed) {
-			/* A peer with no ring yet has never been written to, so
-			 * it is trivially writable -- the ring is allocated on
-			 * the first send.  Testing the modulo first would be a
-			 * divide by zero, and a client polls before it
-			 * writes. */
-			if (us->peer->bufsz == 0)
-				revents |= POLLOUT;
-			else if ((us->peer->tail + 1) % us->peer->bufsz !=
-				 us->peer->head)
-				revents |= POLLOUT;
-		}
-		if (!us->peer || us->peer->closed)
+		if (peer && !peer_gone && peer_writable)
+			revents |= POLLOUT;
+		if (!peer || peer_gone)
 			revents |= POLLHUP;
 	}
 
-	if (us->closed)
+	if (closed)
 		revents |= POLLHUP;
-	if (us->error)
+	if (error)
 		revents |= POLLERR;
+
+	if (peer)
+		unix_put(peer);
 
 	return revents;
 }
@@ -1456,10 +1783,12 @@ void unix_dump_sockets(struct tty *tty)
 		unix_socket_t *u = &unix_sockets[i];
 		if (!*(volatile int *)&u->active)
 			continue;
-		unix_socket_t *peer = (unix_socket_t *)*(volatile unix_socket_t *
-							 *const *)&u->peer;
-		unix_socket_t *par = (unix_socket_t *)*(volatile unix_socket_t *
-						       *const *)&u->parent;
+		unix_socket_t *peer =
+			(unix_socket_t *)*(
+				volatile unix_socket_t * *const *)&u->peer;
+		unix_socket_t *par =
+			(unix_socket_t *)*(
+				volatile unix_socket_t * *const *)&u->parent;
 		/* Render the raw name.  An abstract name starts with NUL and is
 		 * not a C string, so print it as @<rest> with NULs shown as '.'
 		 * rather than handing printf a string that stops at byte 0. */
@@ -1486,10 +1815,11 @@ void unix_dump_sockets(struct tty *tty)
 			tty,
 			"u%d ref=%d ty=%d bnd=%d lsn=%d con=%d cls=%d pcls=%d ah=%d at=%d h=%d t=%d peer=%d par=%d nlen=%d name=%s\n",
 			i, u->ref_count, u->type, u->bound, u->listening,
-			u->connected, u->closed, u->peer_closed,
-			u->accept_head, u->accept_tail, u->head, u->tail,
+			u->connected, u->closed, u->peer_closed, u->accept_head,
+			u->accept_tail, u->head, u->tail,
 			peer ? (int)(peer - unix_sockets) : -1,
 			par ? (int)(par - unix_sockets) : -1, nlen, nm);
 	}
+
 	tty_printf(tty, "=====================\n");
 }

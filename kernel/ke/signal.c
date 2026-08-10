@@ -191,13 +191,24 @@ int signal_send(task_t *task, int sig, siginfo_t *info)
 {
 	BUG_ON(task == NULL);
 	WARN_ON(sig <= 0 || sig >= NSIG);
-	WARN_ON_ONCE(
-		task->has_exited ||
-		task->state ==
-			TASK_ZOMBIE); /* sending signal to already-exited task: pending cross-CPU kill after exit */
 	if (!task || sig <= 0 || sig >= NSIG) {
 		return -EINVAL;
 	}
+
+	/* A task that has already exited takes the signal and discards it.
+	 *
+	 * Signalling a child that exited but has not been waited for is
+	 * ordinary and correct -- there is no way for the sender to know, since
+	 * the exit can happen between deciding to signal and doing it, and the
+	 * name stays valid until it is reaped.  So this reports success and
+	 * does nothing, which is what the caller is entitled to.
+	 *
+	 * Falling through instead would mark a signal pending on something that
+	 * will never run again, and allocate a queued description of it that
+	 * only the reap will release.  This used to warn about the situation
+	 * rather than handle it, which made a legal race look like a defect. */
+	if (task->has_exited || task->state == TASK_ZOMBIE)
+		return 0;
 
 	task_signal_state_t *sigstate = &task->signals;
 	struct k_sigaction *act = &sigstate->action[sig];
@@ -824,11 +835,28 @@ void signal_notify_jobctl(task_t *task, int signum, int stopped)
 	ci.si_status = signum;
 	signal_send(parent, SIGCHLD, &ci);
 	/* Wake a parent blocked in waitpid (wait_channel == itself) via the
-	 * claim CAS; a spurious wake is safe, the waitpid loop rechecks. */
-	if (parent->wait_channel == parent &&
-	    sched_claim_wake(parent, TASK_BLOCKED)) {
-		parent->wait_channel = NULL;
-		sched_enqueue_ready(parent);
+	 * claim CAS; a spurious wake is safe, the waitpid loop rechecks.
+	 *
+	 * The look at the parent goes under g_wait_lock for the same reason the
+	 * exit path's does: the jc_ fields above are set before we take it, so
+	 * a parent deciding to sleep right now either sees them and stays
+	 * awake, or is already BLOCKED here and gets woken.  Without that,
+	 * WUNTRACED/WCONTINUED waits lose the wake and hang — the same trap as
+	 * the exit notification, and this one has no signal to fall back on
+	 * either. */
+	{
+		uint64_t wflags;
+		int wake;
+
+		spin_lock_irqsave(&g_wait_lock, &wflags);
+		wake = (parent->wait_channel == parent &&
+			parent->state == TASK_BLOCKED);
+		spin_unlock_irqrestore(&g_wait_lock, wflags);
+
+		if (wake && sched_claim_wake(parent, TASK_BLOCKED)) {
+			parent->wait_channel = NULL;
+			sched_enqueue_ready(parent);
+		}
 	}
 }
 

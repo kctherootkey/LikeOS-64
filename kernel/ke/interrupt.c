@@ -1343,10 +1343,11 @@ static void irqentry_exit(uint64_t *regs, int allow_preempt)
 			 * (see sys_exit): halting with IRQs off stops this CPU
 			 * from acking TLB-shootdown IPIs and wedges the others. */
 			if (cur->has_exited || cur->state == TASK_ZOMBIE) {
-				for (;;) {
-					sched_schedule();
-					__asm__ volatile("sti; hlt");
-				}
+				/* Safe to give the address space back from
+				 * here: this is the return path to USER mode,
+				 * so the interrupted context holds no kernel
+				 * pointers into it. */
+				sched_exit_park();
 			}
 		}
 	}
@@ -1563,11 +1564,11 @@ void exception_handler(uint64_t *regs)
 				sched_mark_task_exited(cur, 128 + fault_sig);
 			}
 		}
-		/* Task is dead: park until the timer preempts us away; the
-		 * zombie is reaped via the deferred_zombie path. */
-		for (;;) {
-			__asm__ volatile("sti; hlt");
-		}
+		/* Task is dead: release its address space and park until it is
+		 * reaped.  This used to be a bare halt waiting for the timer,
+		 * which cost a full tick per thread and left everything the
+		 * task owned held until the reaper eventually got to it. */
+		sched_exit_park();
 	}
 
 	/* Kernel-mode fatal exception — print Oops and halt */

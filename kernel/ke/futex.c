@@ -204,28 +204,49 @@ static inline uint32_t futex_hash_fn(uint64_t key)
 	return (uint32_t)(key % FUTEX_HASH_BUCKETS);
 }
 
+/*
+ * Which process does a private futex belong to?
+ *
+ * The thread-group id, mixed into the user address.  Every thread that shares
+ * an address space shares a tgid, which is exactly the scope a private futex
+ * has, and a fork child gets its own.
+ *
+ * This used to be the address of the process's top-level page table.  That is
+ * a stable identifier only for as long as the page is not handed to somebody
+ * else, and page tables are recycled from a stack -- most-recently-freed
+ * first -- so the next process to start is the one most likely to be given the
+ * very same page, and with it the very same futex keys.  Any waiter left
+ * behind by the process that died then matches wakes belonging to the new one.
+ * Releasing address spaces promptly, rather than leaving them to a reaper,
+ * turns that from unlikely into the common case.
+ *
+ * DO NOT use mm_get_physical_address() for private keys: it walks from the
+ * current CR3 and can return inconsistent results (including 0) depending on
+ * timing and which CPU the thread runs on.
+ */
+static uint64_t futex_private_key(uint64_t tgid, uint64_t uaddr)
+{
+	/* Multiplied rather than shifted so that two processes cannot collide
+	 * merely by using the same address, whatever the id happens to be. */
+	return (tgid * 0x9E3779B97F4A7C15ULL) ^ uaddr;
+}
+
 // Get the key for a futex address
 // - Shared futexes: physical address (same across processes)
-// - Private futexes: combine PML4 base with virtual address
+// - Private futexes: the owning process, combined with the virtual address
 static uint64_t futex_get_key(uint64_t uaddr, bool shared)
 {
 	if (shared) {
 		// For shared futexes, use physical address as key
 		return mm_get_physical_address(uaddr);
 	} else {
-		// For private futexes, combine PML4 virtual address with user address.
-		// All CLONE_VM threads share the same task->pml4 pointer, so the
-		// kernel virtual address is a stable, unique per-process identifier.
-		// DO NOT use mm_get_physical_address() here: it walks the page tables
-		// starting from the current CR3, and can return inconsistent results
-		// (including 0) depending on timing and which CPU the thread runs on.
 		task_t *cur = sched_current();
-		uint64_t pml4_id = cur && cur->pml4 ? (uint64_t)cur->pml4 : 0;
-		return pml4_id ^ uaddr;
+
+		return futex_private_key(cur ? (uint64_t)cur->tgid : 0, uaddr);
 	}
 }
 
-// Variant of futex_get_key that uses a specific task's PML4 instead of
+// Variant of futex_get_key that uses a specific task instead of
 // sched_current().  Needed when performing futex operations on behalf of
 // a different task (e.g. sched_mark_task_exited called from a cross-CPU
 // SIGKILL sender where sched_current() is the sender, not the victim).
@@ -235,9 +256,8 @@ static uint64_t futex_get_key_for_task(uint64_t uaddr, bool shared,
 	if (shared) {
 		return mm_get_physical_address(uaddr);
 	} else {
-		uint64_t pml4_id =
-			task && task->pml4 ? (uint64_t)task->pml4 : 0;
-		return pml4_id ^ uaddr;
+		return futex_private_key(task ? (uint64_t)task->tgid : 0,
+					 uaddr);
 	}
 }
 

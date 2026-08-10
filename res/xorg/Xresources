@@ -44,6 +44,18 @@ XTerm*VT100.geometry:		132x43
 
 ! Scrollback.  A terminal without it loses everything that scrolls past, which
 ! matters more here than usual: this is where build and boot output is read.
+/* Alt+key sends ESC-prefixed key, not the key with bit 7 set.
+ *
+ * xterm's default is eightBitInput: true, which encodes Meta+key as
+ * key|0x80 -- and in a UTF-8 locale it then encodes THAT as a character,
+ * so Alt+Tab arrives as U+0089 = the two bytes \302\211.  With no window
+ * manager grabbing Alt+Tab, that lands in the shell, and the next thing
+ * typed is glued onto it: bash reports $'\302\211cat': command not found.
+ *
+ * metaSendsEscape is what every terminal has done for decades and what
+ * readline expects for its Alt- bindings. */
+XTerm*metaSendsEscape:		true
+
 XTerm*saveLines:		2048
 
 ! Send-to-scrollback on output is off, so a program drawing a full-screen

@@ -86,14 +86,13 @@ static int elf_image_read(const uint8_t *whole, vfs_file_t *file,
 //     all — they are recorded as file-backed lazy regions (tagged file_idx)
 //     and paged in from `file` on first touch.  Writable segments (small
 //     .data) are read eagerly; BSS stays lazy-anonymous as before.
-static int elf_load_segments_ex(const Elf64_Ehdr *ehdr,
-				const Elf64_Phdr *phdrs, const uint8_t *whole,
-				vfs_file_t *file, size_t elf_size,
-				uint64_t *pml4, uint64_t base_offset,
-				int file_idx, elf_load_result_t *result)
+static int elf_load_segments_ex(const Elf64_Ehdr *ehdr, const Elf64_Phdr *phdrs,
+				const uint8_t *whole, vfs_file_t *file,
+				size_t elf_size, uint64_t *pml4,
+				uint64_t base_offset, int file_idx,
+				elf_load_result_t *result)
 {
-	BUG_ON(ehdr == NULL || phdrs == NULL || pml4 == NULL ||
-	       result == NULL);
+	BUG_ON(ehdr == NULL || phdrs == NULL || pml4 == NULL || result == NULL);
 	BUG_ON(whole == NULL && file == NULL);
 
 	result->load_base = ~0ULL;
@@ -206,9 +205,8 @@ static int elf_load_segments_ex(const Elf64_Ehdr *ehdr,
 			lazy_file_seg = 1;
 		}
 
-		for (uint64_t va = vaddr_start; lazy_file_seg == 0 &&
-						va < vaddr_end;
-		     va += PAGE_SIZE) {
+		for (uint64_t va = vaddr_start;
+		     lazy_file_seg == 0 && va < vaddr_end; va += PAGE_SIZE) {
 			// Copy window of file data that falls within this page.
 			// The segment occupies user addresses [seg_vaddr, seg_vaddr+p_filesz)
 			// for file-backed data and [seg_vaddr+p_filesz, seg_end) for BSS (zeros).
@@ -266,8 +264,8 @@ static int elf_load_segments_ex(const Elf64_Ehdr *ehdr,
 
 		// Record the pure-BSS page range (if any) for lazy zero-fill.
 		{
-			uint64_t lazy_lo = (seg_vaddr + ph->p_filesz + 0xFFF) &
-					   ~0xFFFULL;
+			uint64_t lazy_lo =
+				(seg_vaddr + ph->p_filesz + 0xFFF) & ~0xFFFULL;
 			if (vaddr_end > lazy_lo &&
 			    result->num_lazy_regions < ELF_MAX_LAZY_REGIONS) {
 				uint64_t rprot = PROT_READ;
@@ -307,8 +305,7 @@ static int elf_load_segments(const void *elf_data, size_t elf_size,
 {
 	const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)elf_data;
 	const Elf64_Phdr *phdrs =
-		(const Elf64_Phdr *)((const uint8_t *)elf_data +
-				     ehdr->e_phoff);
+		(const Elf64_Phdr *)((const uint8_t *)elf_data + ehdr->e_phoff);
 	return elf_load_segments_ex(ehdr, phdrs, (const uint8_t *)elf_data,
 				    NULL, elf_size, pml4, base_offset, 0,
 				    result);
@@ -321,9 +318,8 @@ static int elf_load_segments(const void *elf_data, size_t elf_size,
  * The caller owns `file` and must keep it open until the lazy regions
  * have been registered on the task (registration takes its own refs).
  * base_override: ~0ULL = automatic (ET_DYN → 0x400000), else explicit. */
-int elf_load_user_file(vfs_file_t *file, uint64_t *pml4,
-		       uint64_t base_override, int file_idx,
-		       elf_load_result_t *result)
+int elf_load_user_file(vfs_file_t *file, uint64_t *pml4, uint64_t base_override,
+		       int file_idx, elf_load_result_t *result)
 {
 	if (!file || !pml4 || !result)
 		return -1;
@@ -901,6 +897,18 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	setup_user_tls_canary(pml4, cur);
 
 	cur->pml4 = pml4;
+	/* And the shared record, if this process has one.
+	 *
+	 * Any process that has ever created a thread carries an mm_struct, and
+	 * it keeps its own copy of the page-table root.  Updating only the task
+	 * left that copy pointing at the address space destroyed a few lines
+	 * below -- so the next release of the mm_struct handed a long-dead page
+	 * table to be taken apart a second time, feeding the page-table pool
+	 * memory it had already been given.  Harmless only for as long as
+	 * nothing routed an ordinary exit through the mm_struct; the teardown
+	 * path does. */
+	if (cur->mm)
+		cur->mm->pml4 = pml4;
 	cur->brk_start = lr.brk_start;
 	cur->brk = lr.brk_start;
 	cur->user_stack_top = USER_STACK_TOP_EXEC;
@@ -950,8 +958,9 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 				int idx = SOCKET_FD_IDX(task_fds(cur)[i]);
 				task_fds(cur)[i] = NULL;
 				sock_close(idx);
-			} else if (IS_UNIX_SOCKET_FD(task_fds(cur)[i])) {
-				int ufd = (int)(uintptr_t)task_fds(cur)[i];
+			} else if (unix_sock_is(task_fds(cur)[i])) {
+				unix_socket_t *ufd =
+					(unix_socket_t *)task_fds(cur)[i];
 				task_fds(cur)[i] = NULL;
 				unix_close(ufd);
 			} else if (IS_EPOLL_FD(task_fds(cur)[i])) {
@@ -974,7 +983,12 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	}
 
 	mm_switch_address_space(pml4);
-	if (smp_is_enabled())
+	/* The address space being discarded is the one to invalidate, not the
+	 * one just loaded -- and only on CPUs that still have it.  This CPU has
+	 * already left it on the line above. */
+	if (smp_is_enabled() && old)
+		smp_tlb_shootdown_mm_sync(virt_to_phys(old));
+	else if (smp_is_enabled())
 		smp_tlb_shootdown_sync();
 	if (old)
 		mm_destroy_address_space(old);

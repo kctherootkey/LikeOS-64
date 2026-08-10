@@ -5,7 +5,14 @@
 extern "C" {
 #endif
 
-extern int errno;
+/* errno is per-thread, as POSIX requires.  It is a macro rather than an
+ * object: there is no single `errno' variable to link against, which is
+ * deliberate -- code compiled against the old process-wide global would
+ * otherwise keep reading that global while libc wrote the thread-local copy,
+ * and the mismatch would be silent.  Without the symbol, it is a link error
+ * instead, and the object simply needs rebuilding. */
+int *__errno_location(void);
+#define errno (*__errno_location())
 
 // Error codes
 #define EPERM           1  /* Operation not permitted */

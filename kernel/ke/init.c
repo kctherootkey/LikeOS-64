@@ -44,6 +44,52 @@ static uint64_t
 	g_smp_trampoline_address; // Saved SMP trampoline address from bootloader
 static uint64_t g_boot_epoch_saved; // Saved boot epoch from UEFI GetTime
 
+/* Poll the controllers that have no interrupt to announce themselves: USB
+ * hotplug, the boot controllers, the input devices, and storage arrival.
+ *
+ * This used to be the tail of the boot sequence, run by the boot thread in a
+ * loop that never ended.  That made the boot processor unavailable for
+ * scheduling -- the boot thread cannot be preempted, so anything queued there
+ * was served once per lap of this loop, after every poll below, instead of when
+ * it became runnable.  As a task it is ordinary work: it runs where there is
+ * room for it, it is preempted like anything else, and the processor it happens
+ * to be on is still free to run everything else.
+ *
+ * Console input is handled here too, so the sleep is short: it bounds how long
+ * a keystroke can wait.  When there was input, come straight back round --
+ * somebody is typing, and more is likely already waiting. */
+static uint8_t g_devpoll_stack[16384] __attribute__((aligned(16)));
+
+static void devpoll_thread(void *arg)
+{
+	(void)arg;
+
+	for (;;) {
+		int handled_input = userinit_tick();
+
+		xhci_boot_poll(&g_xhci_boot);
+		xhci_hotplug_poll(&g_xhci);
+		xhci_hotplug_poll(&g_xhci_hid);
+		usbhid_poll();
+		storage_fs_poll(&g_storage_state);
+
+		if (!handled_input) {
+			task_t *self = sched_current();
+
+			if (self) {
+				self->wait_channel = (void *)&g_devpoll_stack;
+				self->wakeup_tick = timer_ticks() + 1;
+				self->state = TASK_BLOCKED;
+				sched_schedule();
+				self->wakeup_tick = 0;
+				self->wait_channel = NULL;
+				if (self->state != TASK_RUNNING)
+					self->state = TASK_RUNNING;
+			}
+		}
+	}
+}
+
 __no_stack_protector void kernel_main(boot_info_t *boot_info)
 {
 	BUG_ON(boot_info == NULL);
@@ -281,18 +327,19 @@ __no_stack_protector void continue_system_startup(void)
 	storage_fs_set_ready(&g_storage_state);
 	keyboard_activate();
 
-	while (1) {
-		__asm__ volatile("sti");
-		int handled_input = userinit_tick();
-		xhci_boot_poll(&g_xhci_boot);
-		xhci_hotplug_poll(&g_xhci);
-		xhci_hotplug_poll(&g_xhci_hid);
-		usbhid_poll();
-		storage_fs_poll(&g_storage_state);
-		sched_run_ready();
+	{
+		task_t *t = sched_add_task(devpoll_thread, 0, g_devpoll_stack,
+					   sizeof(g_devpoll_stack));
+		const char *nm = "kdevpoll";
+		unsigned i = 0;
 
-		if (!handled_input) {
-			__asm__ volatile("hlt");
-		}
+		BUG_ON(t == NULL);
+		for (; nm[i] && i < sizeof(t->comm) - 1; i++)
+			t->comm[i] = nm[i];
+		t->comm[i] = '\0';
 	}
+
+	/* The boot thread's work is done, and it must not stay as what this
+	 * processor runs when nothing else is ready -- see sched_bsp_park(). */
+	sched_bsp_park();
 }

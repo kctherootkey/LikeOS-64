@@ -14,7 +14,6 @@
 #include "../syscalls/syscall.h"
 #include "pthread_internal.h"
 
-extern int errno;
 
 // Futex operations
 extern int futex_wait(volatile int *uaddr, int val,

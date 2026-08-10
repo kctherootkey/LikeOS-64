@@ -419,10 +419,15 @@ static void slab_free_page(slab_page_t *slab)
 	uint64_t phys_addr = slab->phys_addr;
 	uint64_t virt_addr = (uint64_t)slab;
 
-	/* Always poison the entire page through the virtual mapping while it is still
-     * mapped.  Any stale kernel pointer into this virtual range will read back
-     * 0xFEEDFACE, making use-after-free immediately visible. */
+	/* Poison the entire page through the virtual mapping while it is still
+     * mapped, in debug builds only.  Any stale kernel pointer into this
+     * virtual range then reads back 0xFEEDFACE, making use-after-free
+     * immediately visible.  Gated to match the allocation path: on the way
+     * out of a large process this runs often enough to matter, and nothing
+     * in a production build ever reads the pattern back. */
+#if DEBUG
 	slab_poison_fill((void *)virt_addr, POISON_FREED_PAGE, PAGE_SIZE);
+#endif
 
 	// Unmap the virtual address (includes TLB shootdown on SMP)
 	mm_unmap_page(virt_addr);
@@ -773,7 +778,8 @@ void slab_free(void *ptr)
 		uint64_t virt_addr = (uint64_t)large_header;
 		size_t alloc_bytes = page_count * PAGE_SIZE;
 
-		/* Always poison the user payload before unmapping. */
+		/* Poison the user payload before unmapping (debug builds only). */
+#if DEBUG
 		{
 			size_t header_sz = sizeof(large_alloc_header_t);
 			slab_poison_fill((uint8_t *)virt_addr + header_sz,
@@ -782,6 +788,9 @@ void slab_free(void *ptr)
 						 alloc_bytes - header_sz :
 						 0);
 		}
+#else
+		(void)alloc_bytes;
+#endif
 
 		/* Direct-map allocation (see slab_alloc): nothing was mapped, so
 		 * there is nothing to unmap and no TLB shootdown to pay — just
@@ -890,9 +899,14 @@ void slab_free(void *ptr)
 	// Was this slab full?
 	bool was_full = (slab->free_count == 0);
 
-	/* Always poison the object while we hold the lock.  The bitmap bit is
-     * still set so no other CPU can observe the partial write. */
+	/* Poison the object while we hold the lock (debug builds only).  The
+     * bitmap bit is still set so no other CPU can observe the partial write.
+     * Gated to match slab_alloc: this runs under the cache lock with
+     * interrupts disabled, once per freed object, and a process teardown
+     * frees a great many of them. */
+#if DEBUG
 	slab_poison_fill(ptr, POISON_FREED_SLAB, cache->object_size);
+#endif
 
 	// Mark object as free
 	bitmap_clear(slab->bitmap, obj_idx);

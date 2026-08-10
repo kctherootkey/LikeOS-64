@@ -114,6 +114,17 @@ void smp_tlb_shootdown(void);
 // Use this when virtual addresses are about to be recycled after unmapping.
 void smp_tlb_shootdown_sync(void);
 
+/* The same, for mappings belonging to ONE address space, named by the physical
+ * address of its page-table root.
+ *
+ * Only a CPU running a thread of that address space can hold its translations,
+ * so when none does there is nothing to invalidate and no interrupt is sent.
+ * That is the ordinary case while tearing a process down.  Use the broadcast
+ * form above for anything in the kernel's own mappings -- text, the direct map,
+ * slab pages -- which every address space shares.
+ */
+void smp_tlb_shootdown_mm_sync(uint64_t pml4_phys);
+
 // Called by TLB shootdown IPI handler to acknowledge completion
 void smp_tlb_shootdown_ack(void);
 

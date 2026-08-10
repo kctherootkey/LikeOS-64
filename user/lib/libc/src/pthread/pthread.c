@@ -15,7 +15,6 @@
 #include "../syscalls/syscall.h"
 #include "pthread_internal.h"
 
-extern int errno;
 
 // ============================================================================
 // CONSTANTS

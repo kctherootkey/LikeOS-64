@@ -4,7 +4,7 @@
 
 #include <kernel/uapi/types.h>
 
-// Syscall numbers - Linux-compatible where possible
+// Syscall numbers - matching the conventional x86-64 numbering where possible
 #define SYS_READ 0
 #define SYS_WRITE 1
 #define SYS_OPEN 2
@@ -491,5 +491,15 @@ typedef struct procinfo {
 	char environ[2048]; // Environment (envp joined by spaces)
 	char cwd[256]; // Current working directory
 } procinfo_t;
+
+/* Drop the reference held by one descriptor-table slot, whatever kind of
+ * object the slot holds -- a file, a pipe end, a socket, an epoll instance.
+ *
+ * Exported because a kernel object can itself hold a descriptor: one sent
+ * in-band over a socket and never received still owes a release when the
+ * socket carrying it is destroyed, and the socket cannot know what kind of
+ * thing it is holding. */
+struct vfs_file;
+void fd_release_entry(struct vfs_file *entry);
 
 #endif // _KERNEL_SYSCALL_H_

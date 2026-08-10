@@ -123,8 +123,30 @@ struct percpu {
 	// Currently executing syscall number (-1 = not in syscall)
 	int current_syscall_nr;
 
+	/* Which address space this CPU is using, by physical page-table root --
+	 * what CR3 actually holds, not which task or thread group it belongs
+	 * to.  Keyed that way because most processes here have no shared
+	 * mm_struct at all (a forked child runs on task->pml4 alone), and a
+	 * record hung off the shared structure would describe none of them.
+	 *
+	 * TWO slots, because one cannot answer the question correctly.
+	 * Entering an address space has to be published BEFORE the CR3 load,
+	 * or an invalidation for it skips a CPU that has already begun caching
+	 * its translations.  Leaving one has to be published AFTER, or an
+	 * invalidation skips a CPU that still holds them.  A single field
+	 * cannot do both, and the window it gets wrong is precisely the one
+	 * that matters: an address space being torn down.
+	 *
+	 * With two, a CPU counts as holding BOTH across the switch.  Naming
+	 * one CPU too many costs a redundant interrupt; naming one too few
+	 * lets a CPU keep reaching a page that has been handed to somebody
+	 * else.
+	 */
+	volatile uint64_t mmu_active_pml4; /* in this CPU's CR3 now      */
+	volatile uint64_t mmu_incoming_pml4; /* about to be loaded, or 0   */
+
 	// Padding to ensure page alignment and cache line separation
-	uint8_t padding[PERCPU_SIZE - 316]; // +64 for the sigreturn register block
+	uint8_t padding[PERCPU_SIZE - 332]; // +64 sigreturn block, +16 mmu slots
 } __attribute__((aligned(64)));
 
 typedef struct percpu percpu_t;
@@ -331,15 +353,6 @@ uint32_t percpu_get_online_count(void);
 // ============================================================================
 // Per-CPU Run Queue Functions
 // ============================================================================
-
-// Enqueue task to this CPU's run queue
-void percpu_runqueue_enqueue(task_t *task);
-
-// Dequeue next task from this CPU's run queue
-task_t *percpu_runqueue_dequeue(void);
-
-// Enqueue task to specific CPU's run queue
-void percpu_runqueue_enqueue_cpu(uint32_t cpu_id, task_t *task);
 
 // Get run queue length for a CPU
 uint32_t percpu_runqueue_length(uint32_t cpu_id);

@@ -157,6 +157,78 @@ static void __test_pass_impl(const char *name)
 /* Shared by the umask-across-threads case below: the mask belongs to the
  * process, so a thread must see the value main set, and a change it makes must
  * be visible back in main. */
+
+/* ---- fork() from a thread: the guarantees a threaded program forks on ----
+ *
+ * A mail client reaches this constantly: it runs a thread per connection and
+ * forks a helper for each name lookup and each external command.  What those
+ * helpers do to themselves must not reach the process that spawned them, and
+ * the ways that can go wrong are all silent -- the parent does not fault, it
+ * simply loses descriptors, or exits with the child's status, and there is
+ * nothing in any log to say why.
+ *
+ * The child is deliberately forked from a NON-MAIN thread.  Forking from main
+ * exercises none of this: the interesting question is what a child inherits
+ * from a thread that is not its process's leader. */
+static volatile int g_forkthr_ok;
+static volatile pid_t g_forkthr_child;
+static volatile pid_t g_forkthr_child_getppid;
+static volatile int g_forkthr_status;
+static volatile int g_forkthr_sees_sibling;
+static int g_forkthr_pipe[2];
+static int g_forkthr_spare_fd = -1;
+
+/* A second thread that simply stays alive, so the process has a thread the
+ * child must NOT have inherited. */
+static void *forkthr_bystander(void *arg)
+{
+	volatile int *stop = (volatile int *)arg;
+
+	while (!*stop)
+		usleep(1000);
+	return NULL;
+}
+
+static void *forkthr_body(void *arg)
+{
+	pid_t pid;
+
+	(void)arg;
+
+	pid = fork();
+	if (pid == 0) {
+		/* Child.  Single-threaded by definition, holding a private copy
+		 * of the descriptor table.
+		 *
+		 * Report through the pipe before touching anything, then do
+		 * what a real helper does: close every descriptor it did not
+		 * ask for, and exit non-zero.  If the table were shared rather
+		 * than copied, that loop would shut the parent's connections --
+		 * which is exactly how a program loses its display without ever
+		 * being told. */
+		pid_t me = getpid(), parent = getppid();
+		int maxopen = 64, i;
+
+		write(g_forkthr_pipe[1], &me, sizeof(me));
+		write(g_forkthr_pipe[1], &parent, sizeof(parent));
+		close(g_forkthr_pipe[1]);
+
+		for (i = 3; i < maxopen; i++)
+			close(i);
+
+		_exit(1);
+	}
+
+	if (pid < 0) {
+		g_forkthr_ok = -1;
+		return NULL;
+	}
+
+	g_forkthr_child = pid;
+	g_forkthr_ok = 1;
+	return NULL;
+}
+
 static volatile mode_t g_umask_seen_in_thread;
 
 static void *umask_thread_fn(void *arg)
@@ -3983,6 +4055,227 @@ static long mono_elapsed_ms(const struct timespec *since)
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	return (now.tv_sec - since->tv_sec) * 1000 +
 	       (now.tv_nsec - since->tv_nsec) / 1000000;
+}
+
+/*
+ * The far end of a request/reply connection: read a little, send it straight
+ * back, until the near end goes away.
+ *
+ * Deliberately over a bound socket rather than a socketpair, and deliberately
+ * two-way, because that is what a display connection is and neither property
+ * is exercised by sending bulk data one way through a socketpair.
+ */
+static int echo_listen_fd;
+static int echo_fd;
+static volatile int echo_ready; /* 1 = accepted, -1 = failed */
+
+static void *echo_peer(void *arg)
+{
+	unsigned char buf[512];
+
+	(void)arg;
+	/* Accept from THIS thread, before the other end connects.
+	 *
+	 * connect() does not complete until somebody accepts, so a single
+	 * thread that connects and then accepts waits for itself and never
+	 * moves -- which is exactly what the first version of this test did.
+	 * The socket table shows it plainly when it happens: the listener has
+	 * a connection queued and the client is still unconnected. */
+	echo_fd = accept(echo_listen_fd, NULL, NULL);
+	if (echo_fd < 0) {
+		echo_ready = -1;
+		return (void *)1;
+	}
+	echo_ready = 1;
+
+	for (;;) {
+		ssize_t r = read(echo_fd, buf, sizeof(buf));
+		ssize_t done = 0;
+
+		if (r <= 0)
+			return NULL; /* near end closed: done */
+		while (done < r) {
+			ssize_t w = write(echo_fd, buf + done,
+					  (size_t)(r - done));
+
+			if (w <= 0)
+				return (void *)1;
+			done += w;
+		}
+	}
+}
+
+/*
+ * A byte stream whose every position has a known value.
+ *
+ * Position-dependent on purpose: if the stream loses a byte, repeats one, or
+ * delivers two writes out of order, everything after that point disagrees, and
+ * the offset of the first disagreement says exactly where it happened.  A
+ * checksum over the whole thing would only say "somewhere".
+ */
+static unsigned char stream_byte(unsigned long off)
+{
+	return (unsigned char)((off * 31u) + (unsigned)(off >> 7) + 17u);
+}
+
+#define STREAM_TOTAL (4u * 1024u * 1024u)
+static int stream_fd;
+
+/*
+ * Push that stream through a socket as fast as it will go, in small writes of
+ * varying size.
+ *
+ * This is the shape of a protocol connection -- a display server, say -- rather
+ * than a file copy: thousands of small writes rather than a few large ones, and
+ * no two the same size.  A stream that only survives being written in neat
+ * page-sized pieces looks perfect to a bulk-transfer test and still loses a
+ * byte here, and one lost byte does not corrupt one message, it desynchronises
+ * every message after it.
+ */
+static void *stream_producer(void *arg)
+{
+	unsigned char buf[1400];
+	unsigned long off = 0;
+	unsigned seed = 12345u;
+
+	(void)arg;
+	while (off < STREAM_TOTAL) {
+		unsigned n, done = 0;
+
+		seed = seed * 1103515245u + 12345u;
+		n = 1u + (seed >> 16) % sizeof(buf);
+		if (off + n > STREAM_TOTAL)
+			n = (unsigned)(STREAM_TOTAL - off);
+		for (unsigned i = 0; i < n; i++)
+			buf[i] = stream_byte(off + i);
+
+		while (done < n) {
+			ssize_t w = write(stream_fd, buf + done, n - done);
+
+			if (w <= 0)
+				return (void *)1;
+			done += (unsigned)w;
+		}
+		off += n;
+	}
+	return NULL;
+}
+
+/*
+ * One writer among several, each owning its own file.
+ *
+ * Fills it with a pattern derived from the writer's index, so a page that
+ * strayed between files shows up as the wrong bytes rather than as a crash.
+ * Returns NULL on success, non-NULL on failure, which the joiner checks.
+ */
+#define CACHE_WRITERS 4
+#define CACHE_WRITER_BYTES 65536
+static int cache_writer_arg[CACHE_WRITERS];
+
+static void *cache_writer_body(void *arg)
+{
+	int idx = *(int *)arg;
+	char path[64];
+	unsigned char buf[512];
+	int fd;
+	size_t done = 0;
+
+	snprintf(path, sizeof(path), "/tmp/cache_w%d_%d", (int)getpid(), idx);
+	unlink(path);
+	fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+	if (fd < 0)
+		return (void *)1;
+
+	while (done < CACHE_WRITER_BYTES) {
+		size_t n = sizeof(buf);
+
+		if (done + n > CACHE_WRITER_BYTES)
+			n = CACHE_WRITER_BYTES - done;
+		for (size_t i = 0; i < n; i++)
+			buf[i] = (unsigned char)(idx * 7 + done + i);
+		if (write(fd, buf, n) != (ssize_t)n) {
+			close(fd);
+			return (void *)2;
+		}
+		done += n;
+	}
+	close(fd);
+	return NULL;
+}
+
+/*
+ * Several threads appending to ONE file, serialised by a lock they share.
+ *
+ * The distinct-file case above asks whether two writers can corrupt each
+ * other's pages.  This asks the harder half: whether two writers hitting the
+ * SAME page interleave correctly.  Every append is smaller than a page, so
+ * most of them land in a page another thread has already dirtied -- the case
+ * where a copy into the page and the marking of it as dirty have to stay in
+ * the right order, and where the file's growing length is read by one thread
+ * while another is extending it.
+ *
+ * The lock is the program's, not the kernel's: append-under-a-lock is what a
+ * program that shares a log file does, and it is the pattern the result can
+ * be checked against, since each record is written whole.
+ */
+#define SHARED_APPENDERS 4
+#define SHARED_APPEND_RECS 200
+#define SHARED_APPEND_RECLEN 37 /* not a divisor of a page: pages straddle */
+static pthread_mutex_t shared_append_lock = PTHREAD_MUTEX_INITIALIZER;
+static int shared_append_fd = -1;
+static int shared_append_arg[SHARED_APPENDERS];
+
+static void *shared_append_body(void *arg)
+{
+	int idx = *(int *)arg;
+	char rec[SHARED_APPEND_RECLEN];
+
+	for (int i = 0; i < SHARED_APPEND_RECS; i++) {
+		memset(rec, 'A' + idx, sizeof(rec));
+		rec[sizeof(rec) - 1] = '\n';
+		pthread_mutex_lock(&shared_append_lock);
+		ssize_t w = write(shared_append_fd, rec, sizeof(rec));
+		pthread_mutex_unlock(&shared_append_lock);
+		if (w != (ssize_t)sizeof(rec))
+			return (void *)1;
+	}
+	return NULL;
+}
+
+/*
+ * Exit-handler ordering and scale.
+ *
+ * Handlers must run most-recently-registered first, so a countdown that starts
+ * at the number registered and expects to reach zero verifies both that every
+ * one ran and that they ran in the right order.  Anything out of place makes
+ * the child exit non-zero.
+ */
+#define ATEXIT_SCALE_N 5000
+static volatile int atexit_expect;
+
+static void atexit_order_probe(void)
+{
+	if (atexit_expect <= 0)
+		_exit(6); /* ran more times than were registered */
+	atexit_expect--;
+	if (atexit_expect == 0)
+		_exit(0); /* the last one: report success from here */
+}
+
+/*
+ * A thread that is alive and blocked when its process exits.
+ *
+ * Deliberately parked in a call that sleeps rather than spinning: what the
+ * teardown test wants is a thread the kernel has to interrupt and unwind, not
+ * one that happens to be on a run queue.  It is never expected to return --
+ * the process goes away underneath it.
+ */
+static void *teardown_thread_body(void *arg)
+{
+	(void)arg;
+	for (;;)
+		usleep(100000);
+	return NULL;
 }
 
 static void *sem_producer(void *arg)
@@ -14424,6 +14717,2642 @@ network_section:
 		}
 		test_result("400 plain map/unmap cycles do not exhaust the mapping table",
 			    ok);
+	}
+
+	{
+		/* Unmapping across holes.
+		 *
+		 * A range with gaps in it used to be walked a page at a time,
+		 * and every one of those pages paid a full scan of the process
+		 * mapping table looking for a record that was not there.  The
+		 * cost was the size of the address range multiplied by the size
+		 * of the table, for address space that held nothing at all.
+		 *
+		 * Build a deliberately holey span -- alternate mappings and
+		 * gaps -- then unmap the whole thing in one call.  What is
+		 * being asserted is that it completes promptly and that the
+		 * mappings really went away. */
+		const size_t chunk = 16 * 4096;
+		void *base;
+		int ok = 1;
+		long ms;
+		struct timespec t0;
+
+		/* One big reservation, then punch it into alternating pieces so
+		 * the gaps are real address space rather than another
+		 * mapping. */
+		base = mmap(NULL, 64 * chunk, PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (base == MAP_FAILED) {
+			test_fail("sparse unmap: reservation failed");
+		} else {
+			for (int i = 0; i < 64; i += 2) {
+				if (munmap((char *)base + (size_t)i * chunk,
+					   chunk) != 0)
+					ok = 0;
+			}
+			test_result("punching alternate holes in a reservation succeeds",
+				    ok);
+
+			/* Touch what is left so the pages are really there. */
+			for (int i = 1; i < 64; i += 2)
+				memset((char *)base + (size_t)i * chunk, 0x3D,
+				       chunk);
+
+			mono_now(&t0);
+			ok = (munmap(base, 64 * chunk) == 0);
+			ms = mono_elapsed_ms(&t0);
+			test_result("unmapping a range full of holes succeeds", ok);
+			if (ms >= 5000)
+				printf("  sparse unmap took %ld ms\n", ms);
+			test_result("unmapping a range full of holes is prompt",
+				    ms < 5000);
+		}
+	}
+
+
+	// ========================================
+	// fork() from a thread
+	// ========================================
+	printf("\n--- fork from a thread ---\n");
+
+	{
+		/* POSIX: the child of fork() is a new process containing a
+		 * single thread -- a replica of the calling thread -- with its
+		 * own process id and its own copy of the descriptor table.
+		 * Ending it ends it alone.
+		 *
+		 * Every check here is something a threaded program that forks
+		 * helpers depends on without ever testing for it, and every
+		 * failure mode is invisible from userspace: no signal, no
+		 * message, just a process that is suddenly gone or a
+		 * connection that is suddenly closed. */
+		pthread_t bystander, forker;
+		volatile int stop = 0;
+		pid_t child_pid = 0, child_ppid = 0;
+		int st = 0;
+		ssize_t n;
+		char probe[8];
+		char path[64];
+
+		snprintf(path, sizeof(path), "/tmp/forkthr_%d.dat",
+			 (int)getpid());
+
+		g_forkthr_ok = 0;
+		g_forkthr_child = 0;
+
+		/* A descriptor the child will try to close.  If the table is
+		 * shared, this is unusable afterwards in the parent. */
+		g_forkthr_spare_fd = open(path, O_RDWR | O_CREAT | O_TRUNC,
+					  0644);
+		test_result("fork-thread: opened a descriptor to guard",
+			    g_forkthr_spare_fd >= 3);
+
+		test_result("fork-thread: pipe created",
+			    pipe(g_forkthr_pipe) == 0);
+
+		if (pthread_create(&bystander, NULL, forkthr_bystander,
+				   (void *)&stop) != 0) {
+			test_fail("fork-thread: bystander thread");
+		} else if (pthread_create(&forker, NULL, forkthr_body,
+					  NULL) != 0) {
+			test_fail("fork-thread: forking thread");
+			stop = 1;
+			pthread_join(bystander, NULL);
+		} else {
+			pthread_join(forker, NULL);
+			test_result("fork-thread: fork() from a non-main "
+				    "thread succeeded",
+				    g_forkthr_ok == 1 && g_forkthr_child > 0);
+
+			close(g_forkthr_pipe[1]);
+			n = read(g_forkthr_pipe[0], &child_pid,
+				 sizeof(child_pid));
+			test_result("fork-thread: child reported its pid",
+				    n == (ssize_t)sizeof(child_pid));
+			n = read(g_forkthr_pipe[0], &child_ppid,
+				 sizeof(child_ppid));
+			test_result("fork-thread: child reported its parent",
+				    n == (ssize_t)sizeof(child_ppid));
+			close(g_forkthr_pipe[0]);
+
+			/* The child is a process of its own, not a thread of
+			 * this one. */
+			test_result("fork-thread: child has its own pid",
+				    child_pid == g_forkthr_child &&
+					    child_pid != getpid());
+			/* getppid() names the PROCESS that forked, never the
+			 * thread inside it that made the call. */
+			test_result("fork-thread: child's parent is the "
+				    "process, not the calling thread",
+				    child_ppid == getpid());
+
+			/* Reap it.  _exit(1) in the child must be exactly
+			 * that: status 1, no signal, and this process still
+			 * running to observe it. */
+			test_result("fork-thread: waitpid reaped the child",
+				    waitpid(child_pid, &st, 0) == child_pid);
+			test_result("fork-thread: child exited normally",
+				    WIFEXITED(st) != 0);
+			test_result("fork-thread: child's _exit(1) reported "
+				    "as status 1",
+				    WIFEXITED(st) && WEXITSTATUS(st) == 1);
+			test_result("fork-thread: child was not signalled",
+				    WIFSIGNALED(st) == 0);
+
+			/* The whole point: this process is still here.  If the
+			 * child's exit had reached its parent's thread group,
+			 * there would be nothing left to run this line. */
+			test_pass("fork-thread: parent survived the child's "
+				  "_exit");
+
+			/* And the descriptor table was a copy: the child's
+			 * close-everything loop cannot have touched ours. */
+			n = write(g_forkthr_spare_fd, "alive", 5);
+			test_result("fork-thread: parent's descriptor survived "
+				    "the child closing its own",
+				    n == 5);
+			test_result("fork-thread: parent's descriptor still "
+				    "seeks",
+				    lseek(g_forkthr_spare_fd, 0, SEEK_SET) == 0);
+			n = read(g_forkthr_spare_fd, probe, 5);
+			test_result("fork-thread: parent's descriptor still "
+				    "reads back",
+				    n == 5 && memcmp(probe, "alive", 5) == 0);
+
+			stop = 1;
+			pthread_join(bystander, NULL);
+		}
+
+		if (g_forkthr_spare_fd >= 0)
+			close(g_forkthr_spare_fd);
+		unlink(path);
+	}
+
+	// ========================================
+	// How long a process takes to go away
+	// ========================================
+	printf("\n--- process teardown ---\n");
+
+	{
+		/* The headline case: a process with a large resident set exits,
+		 * and the time measured is from "the child has finished its
+		 * work" to "the parent has reaped it" -- that is, the teardown
+		 * alone, with the child's setup excluded.
+		 *
+		 * This used to be minutes rather than milliseconds.  Every page
+		 * was released individually under one global lock with
+		 * interrupts disabled, and each release wrote the whole page
+		 * with a poison pattern that nothing ever read.  A CPU waiting
+		 * for that lock waits with interrupts off, so it could not
+		 * acknowledge the address-space invalidations other CPUs were
+		 * blocked on, and those ran into their timeout instead.
+		 *
+		 * The bound below is deliberately loose.  It is not a
+		 * performance target; it is the line between "frees the address
+		 * space" and "grinds through it one page at a time". */
+		size_t mb = 128;
+		int pfd[2];
+
+		if (pipe(pfd) != 0) {
+			test_fail("teardown: pipe failed");
+		} else {
+			pid_t pid = fork();
+
+			if (pid < 0) {
+				test_fail("teardown: fork failed");
+				close(pfd[0]);
+				close(pfd[1]);
+			} else if (pid == 0) {
+				char *m = MAP_FAILED;
+				size_t len = 0;
+
+				close(pfd[0]);
+				/* Take what we can get: a smaller resident set
+				 * still exercises the same path, and a machine
+				 * short of memory should not fail the run. */
+				while (mb >= 16) {
+					len = mb * 1024 * 1024;
+					m = mmap(NULL, len,
+						 PROT_READ | PROT_WRITE,
+						 MAP_PRIVATE | MAP_ANONYMOUS,
+						 -1, 0);
+					if (m != MAP_FAILED)
+						break;
+					mb /= 2;
+				}
+				if (m != MAP_FAILED) {
+					/* Touch every page: reserving address
+					 * space costs nothing to tear down, and
+					 * resident pages are the point. */
+					for (size_t off = 0; off < len;
+					     off += 4096)
+						m[off] = 0x9E;
+				}
+				/* "Setup done" -- the parent starts timing
+				 * here, then we leave immediately. */
+				{
+					char c = (m != MAP_FAILED) ? 'y' : 'n';
+
+					if (write(pfd[1], &c, 1) != 1)
+						_exit(2);
+				}
+				exit(0);
+			} else {
+				char c = 0;
+				long ms;
+				struct timespec t0;
+				int status = 0;
+				ssize_t r;
+
+				close(pfd[1]);
+				r = read(pfd[0], &c, 1);
+				mono_now(&t0);
+				test_result("teardown: child reported its setup",
+					    r == 1);
+				test_result("teardown: child mapped its working set",
+					    c == 'y');
+
+				test_result("teardown: the child is reaped",
+					    waitpid(pid, &status, 0) == pid);
+				ms = mono_elapsed_ms(&t0);
+				test_result("teardown: the child exited cleanly",
+					    WIFEXITED(status) &&
+						    WEXITSTATUS(status) == 0);
+				printf("  a %zu MB process took %ld ms to go away\n",
+				       mb, ms);
+				test_result("teardown: a large process goes away promptly",
+					    ms < 10000);
+				close(pfd[0]);
+			}
+		}
+	}
+
+	{
+		/* The same, for a process with several threads.
+		 *
+		 * A thread group exits by killing its members and waiting for
+		 * each to leave on its own; every one of them has an address
+		 * space to release and a stack to give back.  The parent must
+		 * not be told the process is over until the last of them has
+		 * gone, and that must not take appreciably longer than one
+		 * thread does. */
+		int pfd[2];
+
+		if (pipe(pfd) != 0) {
+			test_fail("threaded teardown: pipe failed");
+		} else {
+			pid_t pid = fork();
+
+			if (pid < 0) {
+				test_fail("threaded teardown: fork failed");
+				close(pfd[0]);
+				close(pfd[1]);
+			} else if (pid == 0) {
+				pthread_t th[8];
+				int made = 0;
+
+				close(pfd[0]);
+				for (int i = 0; i < 8; i++) {
+					if (pthread_create(&th[i], NULL,
+							   teardown_thread_body,
+							   NULL) == 0)
+						made++;
+				}
+				/* Give each thread a moment to reach its
+				 * blocking call, so exit really is tearing down
+				 * live threads. */
+				usleep(200000);
+				{
+					char c = (made == 8) ? 'y' : 'n';
+
+					if (write(pfd[1], &c, 1) != 1)
+						_exit(2);
+				}
+				exit(0);
+			} else {
+				char c = 0;
+				long ms;
+				struct timespec t0;
+				int status = 0;
+				ssize_t r;
+
+				close(pfd[1]);
+				r = read(pfd[0], &c, 1);
+				mono_now(&t0);
+				test_result("threaded teardown: child reported its setup",
+					    r == 1);
+				test_result("threaded teardown: all threads started",
+					    c == 'y');
+
+				test_result("threaded teardown: the child is reaped",
+					    waitpid(pid, &status, 0) == pid);
+				ms = mono_elapsed_ms(&t0);
+				test_result("threaded teardown: the child exited cleanly",
+					    WIFEXITED(status) &&
+						    WEXITSTATUS(status) == 0);
+				printf("  an 8-thread process took %ld ms to go away\n",
+				       ms);
+				test_result("threaded teardown: a threaded process goes away promptly",
+					    ms < 10000);
+				close(pfd[0]);
+			}
+		}
+	}
+
+	{
+		/* Repeated spawn and exit.
+		 *
+		 * One teardown being fast is not the same as teardown being
+		 * correct: releasing pages in batches means a mistake in the
+		 * batching leaks them or, worse, releases one twice.  Neither
+		 * shows up on a single run.  Cycle through enough short-lived
+		 * children with a real working set that anything not given back
+		 * would run the machine out of memory, and require every one of
+		 * them to be reaped. */
+		const int cycles = 60;
+		int reaped = 0;
+		int clean = 1;
+		long ms;
+		struct timespec t0;
+
+		mono_now(&t0);
+		for (int i = 0; i < cycles; i++) {
+			pid_t pid = fork();
+			int status = 0;
+
+			if (pid < 0)
+				break;
+			if (pid == 0) {
+				const size_t len = 8 * 1024 * 1024;
+				char *m = mmap(NULL, len, PROT_READ | PROT_WRITE,
+					       MAP_PRIVATE | MAP_ANONYMOUS, -1,
+					       0);
+
+				if (m == MAP_FAILED)
+					_exit(3);
+				for (size_t off = 0; off < len; off += 4096)
+					m[off] = 0x27;
+				exit(0);
+			}
+			if (waitpid(pid, &status, 0) != pid)
+				break;
+			reaped++;
+			if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+				clean = 0;
+		}
+		ms = mono_elapsed_ms(&t0);
+		printf("  %d spawn/exit cycles in %ld ms\n", reaped, ms);
+		test_result("every short-lived child is reaped",
+			    reaped == cycles);
+		test_result("every short-lived child exits cleanly", clean);
+		/* If pages were not really returned, the later children could
+		 * not have mapped and touched their working set at all -- which
+		 * the exit status above already caught -- so this is purely
+		 * about the time it took. */
+		test_result("repeated spawn/exit stays prompt", ms < 30000);
+	}
+
+	{
+		/* exit() must flush every open stream, not just the standard
+		 * ones.  A program that writes a file and leaves it open at
+		 * exit had those bytes discarded without a word -- which shows
+		 * up much later as a truncated config or a half-written cache
+		 * file, nowhere near the code that wrote it.
+		 *
+		 * Checked through a child, because it is the child's exit that
+		 * has to do the flushing. */
+		char path[64];
+
+		snprintf(path, sizeof(path), "/tmp/exitflush_%d",
+			 (int)getpid());
+		pid_t pid;
+
+		unlink(path);
+		pid = fork();
+		if (pid < 0) {
+			test_fail("exit flush: fork failed");
+		} else if (pid == 0) {
+			FILE *f = fopen(path, "w");
+
+			if (!f)
+				_exit(4);
+			/* Well under the buffer size, so nothing reaches the
+			 * file unless something flushes it. */
+			fputs("written but never closed", f);
+			exit(0); /* deliberately no fclose */
+		} else {
+			int status = 0;
+			char buf[64] = { 0 };
+			FILE *f;
+
+			waitpid(pid, &status, 0);
+			test_result("exit flush: child exited cleanly",
+				    WIFEXITED(status) &&
+					    WEXITSTATUS(status) == 0);
+
+			f = fopen(path, "r");
+			if (!f) {
+				test_fail("exit flush: the file was not created");
+			} else {
+				size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+
+				fclose(f);
+				buf[n] = '\0';
+				test_result("exit() flushes a stream the program left open",
+					    strcmp(buf,
+						   "written but never closed") ==
+						    0);
+			}
+			unlink(path);
+		}
+	}
+
+	{
+		/* fflush(NULL) means all of them, in this process. */
+		char path[64];
+
+		snprintf(path, sizeof(path), "/tmp/fflushall_%d",
+			 (int)getpid());
+		FILE *f = fopen(path, "w");
+
+		if (!f) {
+			test_fail("fflush(NULL): could not create the file");
+		} else {
+			char buf[32] = { 0 };
+			FILE *r;
+
+			fputs("buffered", f);
+			test_result("fflush(NULL) succeeds", fflush(NULL) == 0);
+
+			r = fopen(path, "r");
+			if (!r) {
+				test_fail("fflush(NULL): could not reopen");
+			} else {
+				size_t n = fread(buf, 1, sizeof(buf) - 1, r);
+
+				fclose(r);
+				buf[n] = '\0';
+				test_result("fflush(NULL) flushes a stream other than stdout",
+					    strcmp(buf, "buffered") == 0);
+			}
+			fclose(f);
+			unlink(path);
+		}
+	}
+
+	{
+		/* Exit handlers run most-recently-registered first, and the
+		 * time it takes has to grow with their number rather than with
+		 * its square.  The walk used to restart from the beginning
+		 * after every single handler, so a program with a few thousand
+		 * static destructors -- which is what loading a large graphical
+		 * stack produces -- paid for all of them many times over.
+		 *
+		 * Registered in a child, because they only run when it exits;
+		 * the child verifies the ordering itself and reports through
+		 * its exit status. */
+		pid_t pid = fork();
+
+		if (pid < 0) {
+			test_fail("atexit scale: fork failed");
+		} else if (pid == 0) {
+			int ok = 1;
+
+			for (int i = 0; i < ATEXIT_SCALE_N; i++) {
+				if (atexit(atexit_order_probe) != 0) {
+					ok = 0;
+					break;
+				}
+			}
+			atexit_expect = ATEXIT_SCALE_N;
+			if (!ok)
+				_exit(5);
+			/* atexit_order_probe counts down; exit status is
+			 * decided by the last handler to run. */
+			exit(0);
+		} else {
+			int status = 0;
+			long ms;
+			struct timespec t0;
+
+			mono_now(&t0);
+			test_result("atexit scale: the child is reaped",
+				    waitpid(pid, &status, 0) == pid);
+			ms = mono_elapsed_ms(&t0);
+			printf("  %d atexit handlers ran in %ld ms\n",
+			       ATEXIT_SCALE_N, ms);
+			test_result("every atexit handler runs, in reverse order",
+				    WIFEXITED(status) &&
+					    WEXITSTATUS(status) == 0);
+			test_result("atexit handlers do not cost the square of their number",
+				    ms < 5000);
+		}
+	}
+
+	// ========================================
+	// poll() never reports a live connection as gone
+	// ========================================
+	printf("\n--- unix poll under traffic ---\n");
+
+	{
+		/* Drive a named socket the way a display connection is driven:
+		 * send a request, wait in poll(), read the reply, repeat, many
+		 * thousands of times.
+		 *
+		 * What is being watched for is not data corruption -- the
+		 * stream test above covers that -- but poll() saying the
+		 * connection has hung up or errored while the other end is
+		 * plainly still there.  A program that trusts that answer
+		 * concludes its connection is gone and exits, without a crash,
+		 * without a signal, and without the far end noticing anything.
+		 * There is no way to tell that apart from a clean exit
+		 * afterwards, which is why it has to be caught here.
+		 *
+		 * Bound socket, not a socketpair, and two-way, not one: those
+		 * are the two things a display connection does that bulk
+		 * transfer tests do not. */
+		char sock_path[64];
+
+		snprintf(sock_path, sizeof(sock_path),
+			 "/tmp/polltraffic_%d.sock", (int)getpid());
+		const int rounds = 20000;
+		int lfd, cfd = -1, ok = 1;
+		struct sockaddr_un sa;
+		pthread_t peer;
+		int made_peer = 0;
+		int bad_revents = 0, bad_echo = 0, poll_timeouts = 0;
+		int first_bad = 0;
+
+		unlink(sock_path);
+		lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+		memset(&sa, 0, sizeof(sa));
+		sa.sun_family = AF_UNIX;
+		strncpy(sa.sun_path, sock_path, sizeof(sa.sun_path) - 1);
+
+		if (lfd < 0 || bind(lfd, (struct sockaddr *)&sa, sizeof(sa)) ||
+		    listen(lfd, 4)) {
+			test_fail("poll traffic: could not set up the socket");
+			if (lfd >= 0)
+				close(lfd);
+		} else {
+			/* The far end must be waiting in accept() before this
+			 * end connects; see echo_peer. */
+			echo_listen_fd = lfd;
+			echo_ready = 0;
+			if (pthread_create(&peer, NULL, echo_peer, NULL) !=
+			    0) {
+				test_fail("poll traffic: no peer thread");
+				ok = 0;
+			} else {
+				made_peer = 1;
+				cfd = socket(AF_UNIX, SOCK_STREAM, 0);
+				if (cfd < 0 ||
+				    connect(cfd, (struct sockaddr *)&sa,
+					    sizeof(sa))) {
+					test_fail("poll traffic: connect failed");
+					ok = 0;
+				}
+				while (ok && echo_ready == 0)
+					sched_yield();
+				if (echo_ready < 0) {
+					test_fail("poll traffic: accept failed");
+					ok = 0;
+				}
+			}
+
+			if (ok && made_peer) {
+				long ms;
+				struct timespec t0;
+
+				mono_now(&t0);
+				for (int i = 0; i < rounds && ok; i++) {
+					struct pollfd pfd;
+					unsigned char req[24], rep[24];
+					unsigned len = 4 + (unsigned)(i % 20);
+					ssize_t got = 0;
+
+					for (unsigned k = 0; k < len; k++)
+						req[k] = (unsigned char)(i + k);
+					if (write(cfd, req, len) !=
+					    (ssize_t)len) {
+						ok = 0;
+						break;
+					}
+
+					while (got < (ssize_t)len) {
+						ssize_t r;
+
+						pfd.fd = cfd;
+						pfd.events = POLLIN;
+						pfd.revents = 0;
+						if (poll(&pfd, 1, 5000) == 0) {
+							poll_timeouts++;
+							ok = 0;
+							break;
+						}
+						/* The connection is open at
+						 * both ends for the whole
+						 * loop, so these must never
+						 * appear. */
+						if (pfd.revents &
+						    (POLLHUP | POLLERR |
+						     POLLNVAL)) {
+							if (!bad_revents)
+								first_bad = i;
+							bad_revents =
+								pfd.revents;
+							ok = 0;
+							break;
+						}
+						r = read(cfd, rep + got,
+							 len - (unsigned)got);
+						if (r <= 0) {
+							ok = 0;
+							break;
+						}
+						got += r;
+					}
+					if (!ok)
+						break;
+					if (memcmp(req, rep, len) != 0) {
+						bad_echo = 1;
+						first_bad = i;
+						ok = 0;
+						break;
+					}
+				}
+				ms = mono_elapsed_ms(&t0);
+
+				test_result("poll traffic: connection stayed usable throughout",
+					    ok);
+				printf("  %d request/reply rounds in %ld ms\n",
+				       rounds, ms);
+				if (bad_revents)
+					printf("  POLL CALLED A LIVE CONNECTION DEAD at round %d (revents=0x%x)\n",
+					       first_bad, bad_revents);
+				if (poll_timeouts)
+					printf("  POLL MISSED A WAKEUP (%d timeouts)\n",
+					       poll_timeouts);
+				if (bad_echo)
+					printf("  REPLY DID NOT MATCH at round %d\n",
+					       first_bad);
+
+				close(cfd);
+				pthread_join(peer, NULL);
+				close(echo_fd);
+			} else if (cfd >= 0) {
+				close(cfd);
+			}
+			close(lfd);
+			unlink(sock_path);
+		}
+	}
+
+	// ========================================
+	// A socket stream stays exact under rate
+	// ========================================
+	printf("\n--- unix stream integrity ---\n");
+
+	{
+		/* Send several megabytes through a socket in small writes of
+		 * varying size, as fast as the two ends can go, and check that
+		 * what arrives is exactly what was sent -- every byte, in
+		 * order, none missing, none repeated.
+		 *
+		 * The existing socket tests move bulk data in large pieces and
+		 * ask whether it survives.  This asks a harder question at a
+		 * far higher message rate, because that is what a protocol
+		 * connection does, and because a single byte lost there does
+		 * not damage one message: it desynchronises the connection
+		 * permanently, and the far end drops the client rather than
+		 * reporting anything.  A program dying that way leaves no crash
+		 * and no error -- only an exit.
+		 *
+		 * The first disagreeing offset is printed, since where the
+		 * stream slipped is the whole diagnosis. */
+		int sv[2];
+		pthread_t prod;
+		long ms;
+		struct timespec t0;
+
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+			test_fail("unix stream: socketpair failed");
+		} else {
+			unsigned char rbuf[4096];
+			unsigned long got = 0, bad_off = 0;
+			int ok = 1, mismatch = 0, short_read = 0;
+
+			stream_fd = sv[1];
+			mono_now(&t0);
+			if (pthread_create(&prod, NULL, stream_producer,
+					   NULL) != 0) {
+				test_fail("unix stream: could not start the writer");
+				close(sv[0]);
+				close(sv[1]);
+			} else {
+				while (got < STREAM_TOTAL) {
+					ssize_t r = read(sv[0], rbuf,
+							 sizeof(rbuf));
+
+					if (r <= 0) {
+						short_read = 1;
+						ok = 0;
+						break;
+					}
+					for (ssize_t i = 0; i < r; i++) {
+						if (rbuf[i] !=
+						    stream_byte(got +
+								(unsigned long)i)) {
+							bad_off = got +
+								  (unsigned long)i;
+							mismatch = 1;
+							ok = 0;
+							break;
+						}
+					}
+					if (!ok)
+						break;
+					got += (unsigned long)r;
+				}
+				ms = mono_elapsed_ms(&t0);
+
+				{
+					void *pr = NULL;
+
+					pthread_join(prod, &pr);
+					test_result("unix stream: the writer sent everything",
+						    pr == NULL);
+				}
+				test_result("unix stream: every byte arrived, in order",
+					    ok && got == STREAM_TOTAL);
+				printf("  %lu of %u bytes in %ld ms\n", got,
+				       STREAM_TOTAL, ms);
+				if (mismatch)
+					printf("  STREAM SLIPPED at byte %lu (%lu KB in)\n",
+					       bad_off, bad_off / 1024);
+				if (short_read)
+					printf("  STREAM ENDED EARLY after %lu bytes\n",
+					       got);
+				close(sv[0]);
+				close(sv[1]);
+			}
+		}
+	}
+
+	// ========================================
+	// AF_UNIX socket lifetime
+	// ========================================
+	printf("\n--- unix socket lifetime ---\n");
+
+	{
+		/* An abandoned connect must not be able to reach into an
+		 * unrelated socket.
+		 *
+		 * A connect() that is never accepted leaves an entry on the
+		 * listener's queue.  If the connecting socket is then closed,
+		 * that entry has to stop referring to it -- because the next
+		 * socket created takes its place, and the listener's accept()
+		 * would otherwise link that new, unrelated socket into a
+		 * connection it knows nothing about.
+		 *
+		 * The victim then has a peer it never asked for.  Its writes
+		 * go to a stranger instead of to the socket it is actually
+		 * paired with, and when that stranger closes, the victim is
+		 * told its peer hung up.  A program multiplexing with poll() --
+		 * which every graphical client does -- treats an unrequested
+		 * POLLHUP as the connection dying and closes it on the spot.
+		 * That is what makes such a program vanish mid-run with no
+		 * error worth reading: the read that follows returns a clean
+		 * end of file, which sets no errno at all, so whatever the
+		 * program prints is whichever errno was last left lying about.
+		 *
+		 * Each round below reproduces that in order: queue a connect
+		 * and abandon it, let the next socket take the freed place,
+		 * then accept.  The three checks are that the write still goes
+		 * where it was addressed, that poll() does not invent a
+		 * hangup, and that read() does not invent an end of file.
+		 */
+		char lpath[64];
+		struct sockaddr_un la;
+		int lfd;
+		const int rounds = 24;
+		int bad_route = 0, bad_hup = 0, bad_eof = 0;
+		int setup_fail = 0, accepted = 0;
+
+		snprintf(lpath, sizeof(lpath), "/tmp/uxlife_%d.sock",
+			 (int)getpid());
+		unlink(lpath);
+		memset(&la, 0, sizeof(la));
+		la.sun_family = AF_UNIX;
+		strncpy(la.sun_path, lpath, sizeof(la.sun_path) - 1);
+
+		lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (lfd < 0 ||
+		    bind(lfd, (struct sockaddr *)&la, sizeof(la)) != 0 ||
+		    listen(lfd, 8) != 0) {
+			test_fail("lifetime: could not set up the listener");
+			if (lfd >= 0)
+				close(lfd);
+		} else {
+			/* Non-blocking, so a round where nothing is pending
+			 * reports that instead of hanging the suite. */
+			fcntl(lfd, F_SETFL, O_NONBLOCK);
+
+			for (int r = 0; r < rounds; r++) {
+				int cfd, vp[2], afd;
+				struct pollfd pfd;
+				char b;
+
+				/* Queue a connection and walk away from it.
+				 * Non-blocking, because a blocking connect
+				 * waits for the accept and there would be
+				 * nothing to abandon. */
+				cfd = socket(AF_UNIX, SOCK_STREAM, 0);
+				if (cfd < 0) {
+					setup_fail++;
+					continue;
+				}
+				fcntl(cfd, F_SETFL, O_NONBLOCK);
+				connect(cfd, (struct sockaddr *)&la,
+					sizeof(la));
+				close(cfd);
+
+				/* The next socket created is the one that
+				 * takes the place just freed. */
+				if (socketpair(AF_UNIX, SOCK_STREAM, 0, vp) !=
+				    0) {
+					setup_fail++;
+					continue;
+				}
+				fcntl(vp[0], F_SETFL, O_NONBLOCK);
+				fcntl(vp[1], F_SETFL, O_NONBLOCK);
+
+				/* It is a working pair before the accept. */
+				b = 0;
+				if (write(vp[0], "A", 1) != 1 ||
+				    read(vp[1], &b, 1) != 1 || b != 'A') {
+					setup_fail++;
+					close(vp[0]);
+					close(vp[1]);
+					continue;
+				}
+
+				/* Accept the abandoned connection. */
+				afd = accept(lfd, NULL, NULL);
+				if (afd >= 0)
+					accepted++;
+
+				/* 1. The pair must still be a pair. */
+				b = 0;
+				if (write(vp[0], "B", 1) != 1 ||
+				    read(vp[1], &b, 1) != 1 || b != 'B')
+					bad_route++;
+
+				/* Closing the accepted end must say nothing
+				 * about a socket it is not connected to. */
+				if (afd >= 0)
+					close(afd);
+
+				/* 2. No hangup: vp[1] is still open. */
+				pfd.fd = vp[0];
+				pfd.events = POLLIN;
+				pfd.revents = 0;
+				if (poll(&pfd, 1, 0) >= 0 &&
+				    (pfd.revents &
+				     (POLLHUP | POLLERR | POLLNVAL)))
+					bad_hup++;
+
+				/* 3. No end of file: vp[1] is still open, so
+				 * an empty non-blocking read is EAGAIN. */
+				b = 0;
+				if (read(vp[0], &b, 1) == 0)
+					bad_eof++;
+
+				close(vp[0]);
+				close(vp[1]);
+			}
+			close(lfd);
+			unlink(lpath);
+
+			test_result("lifetime: an abandoned connect does not misroute another socket's data",
+				    bad_route == 0);
+			test_result("lifetime: an abandoned connect does not make poll() report a hangup",
+				    bad_hup == 0);
+			test_result("lifetime: an abandoned connect does not make read() report end of file",
+				    bad_eof == 0);
+
+			/* Printed either way: a round that accepted nothing
+			 * exercised nothing, so a clean result with a low
+			 * count here means the test did not run, not that the
+			 * kernel is right. */
+			printf("  %d/%d rounds accepted the abandoned connection\n",
+			       accepted, rounds);
+			if (bad_route || bad_hup || bad_eof)
+				printf("  %d misrouted, %d invented a hangup, %d invented EOF\n",
+				       bad_route, bad_hup, bad_eof);
+			if (setup_fail)
+				printf("  %d/%d rounds could not be set up\n",
+				       setup_fail, rounds);
+		}
+	}
+
+	{
+		/* connect() and accept() on ONE thread.
+		 *
+		 * connect() completes as soon as the connection is queued: the
+		 * far end is built by connect itself, and accept() hands over
+		 * something already established.  Before that, connect waited
+		 * for the accept, so this sequence deadlocked -- a legitimate
+		 * pattern, and the reason every other test here has to fork or
+		 * set O_NONBLOCK first.
+		 *
+		 * Deliberately BLOCKING on both calls: with O_NONBLOCK the old
+		 * behaviour also completed, so a non-blocking version of this
+		 * test would have passed all along and proved nothing.
+		 */
+		char lpath[64];
+		struct sockaddr_un la;
+		int lfd, cfd, afd;
+
+		snprintf(lpath, sizeof(lpath), "/tmp/uxself_%d", (int)getpid());
+		unlink(lpath);
+		memset(&la, 0, sizeof(la));
+		la.sun_family = AF_UNIX;
+		strncpy(la.sun_path, lpath, sizeof(la.sun_path) - 1);
+
+		lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+		test_result("self-connect: listener",
+			    lfd >= 0 &&
+				    bind(lfd, (struct sockaddr *)&la,
+					 sizeof(la)) == 0 &&
+				    listen(lfd, 4) == 0);
+
+		cfd = socket(AF_UNIX, SOCK_STREAM, 0);
+		test_result("self-connect: connect returns without an accept",
+			    cfd >= 0 && connect(cfd, (struct sockaddr *)&la,
+						sizeof(la)) == 0);
+
+		afd = accept(lfd, NULL, NULL);
+		test_result("self-connect: accept hands over the connection",
+			    afd >= 0);
+
+		if (cfd >= 0 && afd >= 0) {
+			char b = 0;
+
+			test_result("self-connect: client to server",
+				    write(cfd, "x", 1) == 1 &&
+					    read(afd, &b, 1) == 1 && b == 'x');
+			b = 0;
+			test_result("self-connect: server to client",
+				    write(afd, "y", 1) == 1 &&
+					    read(cfd, &b, 1) == 1 && b == 'y');
+		}
+		if (afd >= 0)
+			close(afd);
+		if (cfd >= 0)
+			close(cfd);
+		if (lfd >= 0)
+			close(lfd);
+		unlink(lpath);
+	}
+
+	{
+		/* A listener that closes with connections queued.
+		 *
+		 * Those are established connections nobody accepted.  Closing
+		 * the listener has to take them down, or their clients wait
+		 * for a server that is never coming -- and the sockets are
+		 * never reclaimed.  The client should see the far end gone,
+		 * exactly as it would if the server had accepted and then
+		 * closed. */
+		char lpath[64];
+		struct sockaddr_un la;
+		int lfd, c[3];
+		int ok = 1;
+
+		snprintf(lpath, sizeof(lpath), "/tmp/uxdrain_%d",
+			 (int)getpid());
+		unlink(lpath);
+		memset(&la, 0, sizeof(la));
+		la.sun_family = AF_UNIX;
+		strncpy(la.sun_path, lpath, sizeof(la.sun_path) - 1);
+
+		lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (lfd < 0 ||
+		    bind(lfd, (struct sockaddr *)&la, sizeof(la)) != 0 ||
+		    listen(lfd, 4) != 0) {
+			test_fail("drain: listener");
+			if (lfd >= 0)
+				close(lfd);
+		} else {
+			for (int i = 0; i < 3; i++) {
+				c[i] = socket(AF_UNIX, SOCK_STREAM, 0);
+				if (c[i] < 0 ||
+				    connect(c[i], (struct sockaddr *)&la,
+					    sizeof(la)) != 0)
+					ok = 0;
+			}
+			test_result("drain: three connections queued", ok);
+
+			close(lfd); /* never accepted any of them */
+
+			for (int i = 0; i < 3; i++) {
+				char b = 0;
+
+				if (c[i] < 0)
+					continue;
+				/* The far end is gone, so a read reports end
+				 * of file rather than waiting for ever. */
+				if (read(c[i], &b, 1) != 0)
+					ok = 0;
+				close(c[i]);
+			}
+			test_result("drain: every client sees the far end gone",
+				    ok);
+			unlink(lpath);
+		}
+	}
+
+	{
+		/* Passing a descriptor over a unix socket, and what happens to
+		 * it when nobody collects it.
+		 *
+		 * A descriptor sent in band is queued on the receiving socket
+		 * with its reference already taken, and only a receiver ever
+		 * takes one off that queue.  So the interesting case is not
+		 * the one that works -- it is the message that is never read:
+		 * the socket closes still holding it, and if nothing releases
+		 * it then the file behind it is kept open by nobody, for good.
+		 *
+		 * That cannot be observed directly from here, so it is done
+		 * many times over: a descriptor kept alive per round would
+		 * exhaust the table, and the final send is what fails when it
+		 * has.
+		 */
+		int sv[2];
+
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+			test_fail("scm: socketpair");
+		} else {
+			char path[64];
+			int fd, ok = 1;
+			struct msghdr msg;
+			struct iovec iov;
+			char cbuf[CMSG_SPACE(sizeof(int))];
+			struct cmsghdr *c;
+			char byte = 'F';
+
+			snprintf(path, sizeof(path), "/tmp/scm_%d",
+				 (int)getpid());
+			unlink(path);
+			fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+			test_result("scm: a file to pass", fd >= 0);
+
+			if (fd >= 0 && write(fd, "PASSED", 6) == 6) {
+				memset(&msg, 0, sizeof(msg));
+				memset(cbuf, 0, sizeof(cbuf));
+				iov.iov_base = &byte;
+				iov.iov_len = 1;
+				msg.msg_iov = &iov;
+				msg.msg_iovlen = 1;
+				msg.msg_control = cbuf;
+				msg.msg_controllen = sizeof(cbuf);
+				c = CMSG_FIRSTHDR(&msg);
+				c->cmsg_level = SOL_SOCKET;
+				c->cmsg_type = SCM_RIGHTS;
+				c->cmsg_len = CMSG_LEN(sizeof(int));
+				*(int *)CMSG_DATA(c) = fd;
+				test_result("scm: send a descriptor",
+					    sendmsg(sv[0], &msg, 0) == 1);
+
+				/* Receive it and read through it: the far side
+				 * must get a working descriptor onto the same
+				 * file, not a copy of the number. */
+				char rb = 0;
+				char got[8];
+				int newfd = -1;
+
+				memset(&msg, 0, sizeof(msg));
+				memset(cbuf, 0, sizeof(cbuf));
+				iov.iov_base = &rb;
+				iov.iov_len = 1;
+				msg.msg_iov = &iov;
+				msg.msg_iovlen = 1;
+				msg.msg_control = cbuf;
+				msg.msg_controllen = sizeof(cbuf);
+				test_result("scm: receive it",
+					    recvmsg(sv[1], &msg, 0) == 1 &&
+						    rb == 'F');
+				c = CMSG_FIRSTHDR(&msg);
+				if (c && c->cmsg_type == SCM_RIGHTS &&
+				    c->cmsg_len == CMSG_LEN(sizeof(int)))
+					newfd = *(int *)CMSG_DATA(c);
+				test_result("scm: a descriptor came with it",
+					    newfd >= 0 && newfd != fd);
+				memset(got, 0, sizeof(got));
+				test_result("scm: it reads the same file",
+					    newfd >= 0 &&
+						    lseek(newfd, 0,
+							  SEEK_SET) == 0 &&
+						    read(newfd, got, 6) == 6 &&
+						    memcmp(got, "PASSED",
+							   6) == 0);
+				if (newfd >= 0)
+					close(newfd);
+				test_result("scm: no truncation was reported",
+					    (msg.msg_flags & MSG_CTRUNC) == 0);
+			}
+			if (fd >= 0)
+				close(fd);
+			close(sv[0]);
+			close(sv[1]);
+
+			/* Now the case that leaks: send and never receive,
+			 * then close both ends.  Repeated far more times than
+			 * the descriptor table holds, so a reference kept per
+			 * round runs it out. */
+			for (int i = 0; i < 200 && ok; i++) {
+				int p[2], f;
+
+				if (socketpair(AF_UNIX, SOCK_STREAM, 0, p) !=
+				    0) {
+					ok = 0;
+					break;
+				}
+				f = open(path, O_RDONLY);
+				if (f < 0) {
+					ok = 0;
+					close(p[0]);
+					close(p[1]);
+					break;
+				}
+				memset(&msg, 0, sizeof(msg));
+				memset(cbuf, 0, sizeof(cbuf));
+				iov.iov_base = &byte;
+				iov.iov_len = 1;
+				msg.msg_iov = &iov;
+				msg.msg_iovlen = 1;
+				msg.msg_control = cbuf;
+				msg.msg_controllen = sizeof(cbuf);
+				c = CMSG_FIRSTHDR(&msg);
+				c->cmsg_level = SOL_SOCKET;
+				c->cmsg_type = SCM_RIGHTS;
+				c->cmsg_len = CMSG_LEN(sizeof(int));
+				*(int *)CMSG_DATA(c) = f;
+				if (sendmsg(p[0], &msg, 0) != 1)
+					ok = 0;
+				/* Deliberately never received. */
+				close(f);
+				close(p[0]);
+				close(p[1]);
+			}
+			test_result("scm: 200 unreceived descriptors do not exhaust anything",
+				    ok);
+
+			/* If the references had been kept, this is where it
+			 * shows: nothing is left to open with. */
+			int probe = open(path, O_RDONLY);
+
+			test_result("scm: the system can still open a file afterwards",
+				    probe >= 0);
+			if (probe >= 0)
+				close(probe);
+			unlink(path);
+		}
+	}
+
+	// ========================================
+	// Writes go through the cache
+	// ========================================
+	printf("\n--- cached writes ---\n");
+
+	{
+		/* Writes land in the page cache and are written back later.
+		 * Two things have to hold for that to be safe, and they are
+		 * what this checks:
+		 *
+		 *  - a read must see what was just written, without any flush
+		 *    in between.  Reads have always come from the cache; writes
+		 *    used to go past it, so a file could read back as its old
+		 *    contents.
+		 *  - what reaches the device must be the same bytes.  fsync
+		 *    forces the writeback, and reopening afterwards reads the
+		 *    device copy through a fresh page.
+		 */
+		char path[64];
+
+		snprintf(path, sizeof(path), "/tmp/cached_wr_%d",
+			 (int)getpid());
+		const size_t len = 128 * 1024; /* several writeback runs */
+		unsigned char *out = malloc(len);
+		unsigned char *in = malloc(len);
+		int fd;
+
+		if (!out || !in) {
+			test_fail("cached write: out of memory");
+		} else {
+			for (size_t i = 0; i < len; i++)
+				out[i] = (unsigned char)(i * 31 + (i >> 8));
+
+			unlink(path);
+			fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+			if (fd < 0) {
+				test_fail("cached write: could not create");
+			} else {
+				ssize_t w = write(fd, out, len);
+
+				test_result("cached write: the whole buffer was written",
+					    w == (ssize_t)len);
+
+				/* Read it back with no flush: this is the cache
+				 * answering, and it must agree. */
+				test_result("cached write: rewind",
+					    lseek(fd, 0, SEEK_SET) == 0);
+				memset(in, 0, len);
+				test_result("cached write: read back the whole buffer",
+					    read(fd, in, len) == (ssize_t)len);
+				test_result("cached write: a read sees the write immediately",
+					    memcmp(out, in, len) == 0);
+
+				/* Force it out, then read it back through a
+				 * fresh open so the device copy is what is
+				 * being compared. */
+				test_result("cached write: fsync succeeds",
+					    fsync(fd) == 0);
+				close(fd);
+
+				fd = open(path, O_RDONLY);
+				if (fd < 0) {
+					test_fail("cached write: could not reopen");
+				} else {
+					memset(in, 0, len);
+					test_result("cached write: reread after fsync",
+						    read(fd, in, len) ==
+							    (ssize_t)len);
+					test_result("cached write: what reached the device matches",
+						    memcmp(out, in, len) == 0);
+					close(fd);
+				}
+			}
+
+			/* Partial writes inside an existing page must keep the
+			 * bytes around them -- the page is read in first, then
+			 * only the written range is replaced. */
+			fd = open(path, O_RDWR);
+			if (fd >= 0) {
+				unsigned char probe[8];
+
+				test_result("cached write: seek into a page",
+					    lseek(fd, 4096 + 100, SEEK_SET) ==
+						    4096 + 100);
+				test_result("cached write: partial write",
+					    write(fd, "MARKER", 6) == 6);
+				test_result("cached write: seek back",
+					    lseek(fd, 4096 + 94, SEEK_SET) ==
+						    4096 + 94);
+				memset(probe, 0, sizeof(probe));
+				test_result("cached write: read around it",
+					    read(fd, probe, 8) == 8);
+				/* The six bytes before the marker must still be
+				 * the original contents. */
+				test_result("cached write: bytes before a partial write survive",
+					    memcmp(probe, out + 4096 + 94, 6) ==
+						    0);
+				close(fd);
+			}
+
+			unlink(path);
+			free(out);
+			free(in);
+		}
+	}
+
+	{
+		/* A write past the end of the file leaves a gap, and the gap
+		 * has to read as zeros.
+		 *
+		 * A page beyond anything the file has ever held is not read
+		 * from the device -- there is nothing there to read -- so it
+		 * starts as whatever the page frame last contained.  If that
+		 * is not cleared, the hole in this file reads back as
+		 * somebody else's data: a page that belonged to another
+		 * program a moment ago, handed over in full.  That is the
+		 * difference between a sparse file and a disclosure.
+		 *
+		 * The gap is deliberately several pages wide and not page
+		 * aligned at either end, so it covers whole untouched pages
+		 * as well as the partial ones on both sides of it. */
+		char path[64];
+		int fd;
+
+		snprintf(path, sizeof(path), "/tmp/cached_gap_%d",
+			 (int)getpid());
+		unlink(path);
+		fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+		if (fd < 0) {
+			test_fail("gap: could not create");
+		} else {
+			const off_t far = 5 * 4096 + 1234;
+			const size_t gap = (size_t)far - 10;
+			unsigned char *back = malloc(gap);
+			int ok = 1;
+
+			test_result("gap: write ten bytes at the start",
+				    write(fd, "0123456789", 10) == 10);
+			test_result("gap: seek well past the end",
+				    lseek(fd, far, SEEK_SET) == far);
+			test_result("gap: write past the end",
+				    write(fd, "END", 3) == 3);
+
+			/* Read the hole back before anything is flushed: this
+			 * is the page cache answering with pages it created
+			 * rather than read. */
+			test_result("gap: seek back into the hole",
+				    lseek(fd, 10, SEEK_SET) == 10);
+			if (!back) {
+				test_fail("gap: out of memory");
+			} else {
+				memset(back, 0xAA, gap);
+				test_result("gap: read the whole hole",
+					    read(fd, back, gap) ==
+						    (ssize_t)gap);
+				for (size_t i = 0; i < gap; i++)
+					if (back[i] != 0) {
+						ok = 0;
+						break;
+					}
+				test_result("gap: every byte of the hole is zero",
+					    ok);
+			}
+
+			/* And again from the device, which is a different
+			 * source for the same bytes: the hole may have been
+			 * written out as real blocks by now. */
+			test_result("gap: fsync", fsync(fd) == 0);
+			close(fd);
+			fd = open(path, O_RDONLY);
+			if (fd < 0 || !back) {
+				test_fail("gap: could not reopen");
+			} else {
+				ok = 1;
+				memset(back, 0xAA, gap);
+				test_result("gap: reread the hole after a reopen",
+					    lseek(fd, 10, SEEK_SET) == 10 &&
+						    read(fd, back, gap) ==
+							    (ssize_t)gap);
+				for (size_t i = 0; i < gap; i++)
+					if (back[i] != 0) {
+						ok = 0;
+						break;
+					}
+				test_result("gap: it is still all zeros on the device",
+					    ok);
+				close(fd);
+			}
+			free(back);
+			unlink(path);
+		}
+	}
+
+	{
+		/* Writing into a hole that ftruncate made.
+		 *
+		 * An extending ftruncate gives a file a size and no blocks:
+		 * the whole of it is a hole.  A write landing in there needs
+		 * blocks that do not exist, and "how many blocks does the file
+		 * have" cannot be answered from its size, which is what made
+		 * this fail with EIO -- nothing was allocated, and then the
+		 * write found no block to put the data in.
+		 *
+		 * The write is deliberately smaller than a block and not
+		 * aligned to one, so the block it creates sticks out on both
+		 * sides.  What sticks out was a hole a moment ago and read as
+		 * zeros; it has to go on reading as zeros now that a real
+		 * block -- with a previous owner -- is behind it. */
+		char path[64];
+		int fd;
+
+		snprintf(path, sizeof(path), "/tmp/trunc_hole_%d",
+			 (int)getpid());
+		unlink(path);
+		fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+		if (fd < 0) {
+			test_fail("truncate hole: could not create");
+		} else {
+			const off_t len = 1024 * 1024;
+			const off_t at = 500000;
+			struct stat st;
+
+			test_result("truncate hole: extend to a megabyte",
+				    ftruncate(fd, len) == 0);
+			test_result("truncate hole: the size took",
+				    fstat(fd, &st) == 0 && st.st_size == len);
+
+			test_result("truncate hole: seek into the hole",
+				    lseek(fd, at, SEEK_SET) == at);
+			test_result("truncate hole: writing into it succeeds",
+				    write(fd, "MIDDLE", 6) == 6);
+			test_result("truncate hole: the write did not change the size",
+				    fstat(fd, &st) == 0 && st.st_size == len);
+
+			/* Read the whole file: everything except those six
+			 * bytes must be zero, before any flush and again from
+			 * the device. */
+			for (int pass = 0; pass < 2; pass++) {
+				unsigned char *all = malloc((size_t)len);
+				int ok = 1;
+
+				if (pass == 1) {
+					test_result("truncate hole: fsync",
+						    fsync(fd) == 0);
+					close(fd);
+					fd = open(path, O_RDONLY);
+					if (fd < 0) {
+						test_fail("truncate hole: could not reopen");
+						free(all);
+						break;
+					}
+				}
+				if (!all) {
+					test_fail("truncate hole: out of memory");
+					break;
+				}
+				memset(all, 0xAA, (size_t)len);
+				ok = (lseek(fd, 0, SEEK_SET) == 0 &&
+				      read(fd, all, (size_t)len) ==
+					      (ssize_t)len);
+				test_result(pass == 0 ?
+						    "truncate hole: the whole file reads back" :
+						    "truncate hole: the whole file reads back from the device",
+					    ok);
+				if (ok) {
+					if (memcmp(all + at, "MIDDLE", 6) != 0)
+						ok = 0;
+					for (off_t i = 0; i < len && ok; i++) {
+						if (i >= at && i < at + 6)
+							continue;
+						if (all[i] != 0)
+							ok = 0;
+					}
+				}
+				test_result(pass == 0 ?
+						    "truncate hole: only the six written bytes are non-zero" :
+						    "truncate hole: only the six written bytes are non-zero on the device",
+					    ok);
+				free(all);
+			}
+			close(fd);
+			unlink(path);
+		}
+	}
+
+	{
+		/* Closing without fsync must not lose the data.
+		 *
+		 * fsync is a promise about WHEN the data is on the device, not
+		 * about WHETHER.  A program that never calls it -- which is
+		 * most of them -- still expects the file it wrote to be there
+		 * afterwards.  Since write() now returns having touched
+		 * nothing, that expectation rests entirely on writeback
+		 * running on its own, so it is worth stating as a test rather
+		 * than assuming.
+		 *
+		 * The files are read back through a fresh open, and there are
+		 * enough of them that the cache cannot simply still be holding
+		 * every one. */
+		const int files = 40;
+		char path[80];
+		int ok = 1;
+
+		for (int i = 0; i < files && ok; i++) {
+			int fd;
+			char payload[64];
+
+			snprintf(path, sizeof(path), "/tmp/nosync_%d_%d",
+				 (int)getpid(), i);
+			unlink(path);
+			fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+			if (fd < 0) {
+				ok = 0;
+				break;
+			}
+			snprintf(payload, sizeof(payload),
+				 "file %d written without fsync", i);
+			if (write(fd, payload, strlen(payload)) !=
+			    (ssize_t)strlen(payload))
+				ok = 0;
+			close(fd); /* deliberately no fsync */
+		}
+		test_result("no fsync: every file was written", ok);
+
+		for (int i = 0; i < files && ok; i++) {
+			int fd;
+			char payload[64], back[64];
+			ssize_t r;
+
+			snprintf(path, sizeof(path), "/tmp/nosync_%d_%d",
+				 (int)getpid(), i);
+			snprintf(payload, sizeof(payload),
+				 "file %d written without fsync", i);
+			fd = open(path, O_RDONLY);
+			if (fd < 0) {
+				ok = 0;
+				break;
+			}
+			memset(back, 0, sizeof(back));
+			r = read(fd, back, sizeof(back));
+			if (r != (ssize_t)strlen(payload) ||
+			    memcmp(back, payload, (size_t)r) != 0)
+				ok = 0;
+			close(fd);
+		}
+		test_result("no fsync: every file reads back exactly what was written",
+			    ok);
+
+		for (int i = 0; i < files; i++) {
+			snprintf(path, sizeof(path), "/tmp/nosync_%d_%d",
+				 (int)getpid(), i);
+			unlink(path);
+		}
+	}
+
+	{
+		/* Volume, in small unaligned pieces.
+		 *
+		 * The shape a program produces when it writes a file through a
+		 * buffered stream: many small writes, not one large one, and
+		 * not landing on block boundaries.  Each of those used to be a
+		 * read of the block, a merge and a write back, synchronously.
+		 *
+		 * The dirty limit is a separate test below -- 6 MB is under
+		 * it, so this one does not reach the throttle. */
+		char path[64];
+		const size_t total = 6 * 1024 * 1024;
+
+		/* Per-process name: copies of this suite run at the same
+		 * time, and a shared name means they delete each other's
+		 * files rather than testing anything. */
+		snprintf(path, sizeof(path), "/tmp/cached_volume_%d",
+			 (int)getpid());
+		const size_t piece = 700; /* neither a block nor a divisor */
+		unsigned char *chunk = malloc(piece);
+		int fd, ok = 1;
+		long ms;
+		struct timespec t0;
+
+		if (!chunk) {
+			test_fail("volume: out of memory");
+		} else {
+			unlink(path);
+			fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+			if (fd < 0) {
+				test_fail("volume: could not create");
+			} else {
+				size_t done = 0;
+				unsigned long seq = 0;
+
+				mono_now(&t0);
+				while (done < total && ok) {
+					for (size_t i = 0; i < piece; i++)
+						chunk[i] = (unsigned char)(seq +
+									   i);
+					if (write(fd, chunk, piece) !=
+					    (ssize_t)piece)
+						ok = 0;
+					done += piece;
+					seq++;
+				}
+				ms = mono_elapsed_ms(&t0);
+				close(fd);
+				test_result("volume: every small write succeeded",
+					    ok);
+				printf("  %zu KB in %zu-byte writes took %ld ms\n",
+				       done / 1024, piece, ms);
+
+				/* Read it all back and check every byte: a
+				 * partial page that was written, evicted and
+				 * re-read has to come back identical. */
+				fd = open(path, O_RDONLY);
+				if (fd < 0) {
+					test_fail("volume: could not reopen");
+				} else {
+					unsigned char *back = malloc(piece);
+					size_t got = 0;
+					unsigned long vseq = 0;
+
+					ok = (back != NULL);
+					while (ok && got < done) {
+						ssize_t r = read(fd, back,
+								 piece);
+
+						if (r != (ssize_t)piece) {
+							ok = 0;
+							break;
+						}
+						for (size_t i = 0; i < piece;
+						     i++)
+							if (back[i] !=
+							    (unsigned char)(vseq +
+									    i)) {
+								ok = 0;
+								break;
+							}
+						got += piece;
+						vseq++;
+					}
+					test_result("volume: every byte reads back as written",
+						    ok);
+					free(back);
+					close(fd);
+				}
+				unlink(path);
+			}
+			free(chunk);
+		}
+	}
+
+	{
+		/* Far more unwritten data than the cache is allowed to hold.
+		 *
+		 * A dirty page cannot be reclaimed until it has been stored,
+		 * so a program writing faster than the device absorbs is
+		 * consuming memory the system is NOT free to take back.  The
+		 * bound on that is what makes such a program slow down instead
+		 * of the machine running out; without it the failure lands on
+		 * whoever allocates next, which is some unrelated program.
+		 *
+		 * 32 MB against a limit of 8 MB, written without pausing, so
+		 * the throttle is crossed several times over.  What is
+		 * asserted is that it completes, that the data is right, and
+		 * that free memory afterwards is in the same region as before
+		 * -- not that any particular amount was reclaimed, which
+		 * depends on what else the system is doing. */
+		char path[64];
+		const size_t total = 32 * 1024 * 1024;
+		const size_t piece = 4000; /* just under a page, so pages
+					    * straddle and every one is dirtied */
+		unsigned char *chunk = malloc(piece);
+		struct sysinfo si;
+		unsigned long free_before = 0, free_after = 0;
+		int have_si = 0;
+		int fd, ok = 1;
+
+		snprintf(path, sizeof(path), "/tmp/dirty_limit_%d",
+			 (int)getpid());
+		if (!chunk) {
+			test_fail("dirty limit: out of memory");
+		} else {
+			if (sysinfo(&si) == 0) {
+				free_before = (unsigned long)si.freeram;
+				have_si = 1;
+			}
+			unlink(path);
+			fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+			if (fd < 0) {
+				test_fail("dirty limit: could not create");
+			} else {
+				size_t done = 0;
+				unsigned long seq = 0;
+
+				while (done < total && ok) {
+					for (size_t i = 0; i < piece; i++)
+						chunk[i] = (unsigned char)(seq +
+									   i);
+					if (write(fd, chunk, piece) !=
+					    (ssize_t)piece)
+						ok = 0;
+					done += piece;
+					seq++;
+				}
+				close(fd);
+				test_result("dirty limit: writing far past the limit completes",
+					    ok);
+
+				fd = open(path, O_RDONLY);
+				if (fd < 0) {
+					test_fail("dirty limit: could not reopen");
+				} else {
+					unsigned char *back = malloc(piece);
+					size_t got = 0;
+					unsigned long vseq = 0;
+
+					ok = (back != NULL);
+					while (ok && got < done) {
+						ssize_t r = read(fd, back,
+								 piece);
+
+						if (r != (ssize_t)piece) {
+							ok = 0;
+							break;
+						}
+						for (size_t i = 0; i < piece;
+						     i++)
+							if (back[i] !=
+							    (unsigned char)(vseq +
+									    i)) {
+								ok = 0;
+								break;
+							}
+						got += piece;
+						vseq++;
+					}
+					test_result("dirty limit: every byte is still correct",
+						    ok);
+					free(back);
+					close(fd);
+				}
+				unlink(path);
+
+				/* Memory must come back.  A generous floor:
+				 * the point is to catch dirty pages that were
+				 * never reclaimable at all, which shows up as
+				 * free memory that never recovers, not as a
+				 * few percent either way. */
+				if (have_si && sysinfo(&si) == 0) {
+					free_after = (unsigned long)si.freeram;
+					printf("  free memory %lu KB before, %lu KB after 32 MB of writes\n",
+					       free_before / 1024,
+					       free_after / 1024);
+					test_result("dirty limit: free memory did not collapse",
+						    free_after >
+							    free_before / 2);
+				}
+			}
+			free(chunk);
+		}
+	}
+
+	{
+		/* Metadata must be visible immediately, with no flush.
+		 *
+		 * Size is recorded in memory now and stored later, so the
+		 * question is whether the in-memory copy is the one everybody
+		 * reads.  It has to be: a program that writes and then stats
+		 * its own file must not see the size it had before. */
+		char path[64];
+		int fd;
+
+		snprintf(path, sizeof(path), "/tmp/cached_meta_%d",
+			 (int)getpid());
+
+		unlink(path);
+		fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+		if (fd < 0) {
+			test_fail("metadata: could not create");
+		} else {
+			struct stat st;
+
+			test_result("metadata: write 5000 bytes",
+				    write(fd, "x", 1) == 1 &&
+					    lseek(fd, 4999, SEEK_SET) == 4999 &&
+					    write(fd, "y", 1) == 1);
+			memset(&st, 0, sizeof(st));
+			test_result("metadata: fstat with no flush",
+				    fstat(fd, &st) == 0);
+			test_result("metadata: the new size is visible at once",
+				    st.st_size == 5000);
+			close(fd);
+
+			/* And it must still be right through a fresh open,
+			 * which is what proves it was actually stored. */
+			memset(&st, 0, sizeof(st));
+			test_result("metadata: stat after close",
+				    stat(path, &st) == 0);
+			test_result("metadata: the size survived the close",
+				    st.st_size == 5000);
+			unlink(path);
+		}
+	}
+
+	{
+		/* A size that has not reached the device yet is still the
+		 * file's size.
+		 *
+		 * A write that stays inside blocks the file already owns no
+		 * longer stores the inode -- the new length is kept in memory
+		 * and written back later.  Everything that can ask for a
+		 * length has to get the new one anyway, or a program writes a
+		 * few bytes, reopens the file and finds them missing.
+		 *
+		 * The appends below are deliberately small: 100 bytes at a
+		 * time crosses a 4096-byte block boundary only once every
+		 * forty-odd writes, so almost every one of them takes the
+		 * deferred path.  No fsync anywhere -- that would store the
+		 * inode and test nothing. */
+		char path[64];
+		int fd;
+		int ok = 1;
+		off_t expect = 0;
+
+		snprintf(path, sizeof(path), "/tmp/defer_size_%d",
+			 (int)getpid());
+		unlink(path);
+		fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+		if (fd < 0) {
+			test_fail("deferred size: could not create");
+		} else {
+			char chunk[100];
+			struct stat st;
+
+			memset(chunk, 'd', sizeof(chunk));
+			for (int i = 0; i < 50 && ok; i++) {
+				if (write(fd, chunk, sizeof(chunk)) !=
+				    (ssize_t)sizeof(chunk)) {
+					ok = 0;
+					break;
+				}
+				expect += (off_t)sizeof(chunk);
+				/* Visible through the open handle at once. */
+				if (fstat(fd, &st) != 0 ||
+				    st.st_size != expect) {
+					ok = 0;
+					break;
+				}
+				/* And by name, which is a different route to
+				 * the same inode. */
+				if (stat(path, &st) != 0 ||
+				    st.st_size != expect) {
+					ok = 0;
+					break;
+				}
+			}
+			test_result("deferred size: every append is visible immediately, by handle and by name",
+				    ok);
+			close(fd);
+
+			/* Reopening reads the length from the inode.  This is
+			 * the case that fails outright if a deferred size is
+			 * not applied to what a read of the inode returns:
+			 * the file reports whichever length was last stored,
+			 * and reads stop there. */
+			memset(&st, 0, sizeof(st));
+			test_result("deferred size: the length is right after a close and stat",
+				    stat(path, &st) == 0 &&
+					    st.st_size == expect);
+
+			fd = open(path, O_RDONLY);
+			if (fd < 0) {
+				test_fail("deferred size: could not reopen");
+			} else {
+				char *back = malloc((size_t)expect + 1);
+				ssize_t r = -1;
+
+				if (back)
+					r = read(fd, back, (size_t)expect + 1);
+				test_result("deferred size: the whole file reads back",
+					    r == (ssize_t)expect);
+				ok = (r == (ssize_t)expect);
+				for (ssize_t i = 0; i < r && ok; i++)
+					if (back[i] != 'd')
+						ok = 0;
+				test_result("deferred size: and every byte of it is what was written",
+					    ok);
+				free(back);
+				close(fd);
+			}
+
+			/* Truncate replaces a pending length rather than
+			 * losing to it: a stale record laid back over the
+			 * inode would report the pre-truncate size. */
+			fd = open(path, O_WRONLY);
+			if (fd >= 0) {
+				test_result("deferred size: truncate",
+					    ftruncate(fd, 17) == 0);
+				close(fd);
+				memset(&st, 0, sizeof(st));
+				test_result("deferred size: the truncated length is what is reported",
+					    stat(path, &st) == 0 &&
+						    st.st_size == 17);
+			}
+
+			/* And an O_TRUNC open, which is the other way a
+			 * pending length gets superseded. */
+			fd = open(path, O_WRONLY | O_TRUNC);
+			if (fd >= 0) {
+				close(fd);
+				memset(&st, 0, sizeof(st));
+				test_result("deferred size: O_TRUNC leaves the file empty",
+					    stat(path, &st) == 0 &&
+						    st.st_size == 0);
+			}
+			unlink(path);
+		}
+	}
+
+	{
+		/* More files written at once than the pending-size table
+		 * holds.
+		 *
+		 * Past its capacity a write goes back to storing the inode on
+		 * the spot -- slower, and it has to still be correct.  The
+		 * count is deliberately well over the table's size so that
+		 * both paths are taken within one loop. */
+		const int files = 96;
+		char path[80];
+		int ok = 1;
+
+		for (int i = 0; i < files && ok; i++) {
+			int fd;
+
+			snprintf(path, sizeof(path), "/tmp/defer_many_%d_%d",
+				 (int)getpid(), i);
+			unlink(path);
+			fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+			if (fd < 0) {
+				ok = 0;
+				break;
+			}
+			/* Two short appends: the first allocates, the second
+			 * is the deferred case. */
+			if (write(fd, "aaaa", 4) != 4 ||
+			    write(fd, "bbb", 3) != 3)
+				ok = 0;
+			close(fd);
+		}
+		test_result("many pending sizes: every file was written", ok);
+
+		for (int i = 0; i < files && ok; i++) {
+			struct stat st;
+
+			snprintf(path, sizeof(path), "/tmp/defer_many_%d_%d",
+				 (int)getpid(), i);
+			if (stat(path, &st) != 0 || st.st_size != 7)
+				ok = 0;
+		}
+		test_result("many pending sizes: every file reports 7 bytes",
+			    ok);
+
+		for (int i = 0; i < files; i++) {
+			snprintf(path, sizeof(path), "/tmp/defer_many_%d_%d",
+				 (int)getpid(), i);
+			unlink(path);
+		}
+	}
+
+	{
+		/* Several threads writing their own files at once.
+		 *
+		 * The cache is shared and its dirty list is global, so the
+		 * interesting question is whether two writers can corrupt each
+		 * other's pages or each other's accounting.  Each thread owns
+		 * one file and fills it with a pattern only it produces. */
+		pthread_t th[CACHE_WRITERS];
+		int made = 0;
+		int ok = 1;
+
+		for (int i = 0; i < CACHE_WRITERS; i++) {
+			cache_writer_arg[i] = i;
+			if (pthread_create(&th[i], NULL, cache_writer_body,
+					   &cache_writer_arg[i]) == 0)
+				made++;
+			else
+				break;
+		}
+		test_result("threaded writes: all writers started",
+			    made == CACHE_WRITERS);
+		for (int i = 0; i < made; i++) {
+			void *r = NULL;
+
+			pthread_join(th[i], &r);
+			if (r != NULL)
+				ok = 0;
+		}
+		test_result("threaded writes: every writer reported success",
+			    ok);
+
+		/* Verify from this thread, after they have all finished. */
+		ok = 1;
+		for (int i = 0; i < made; i++) {
+			char path[64];
+			unsigned char buf[CACHE_WRITER_BYTES];
+			int fd;
+
+			snprintf(path, sizeof(path), "/tmp/cache_w%d_%d",
+				 (int)getpid(), i);
+			fd = open(path, O_RDONLY);
+			if (fd < 0) {
+				ok = 0;
+				break;
+			}
+			if (read(fd, buf, sizeof(buf)) !=
+			    (ssize_t)sizeof(buf)) {
+				ok = 0;
+			} else {
+				for (size_t k = 0; k < sizeof(buf); k++)
+					if (buf[k] !=
+					    (unsigned char)(i * 7 + k)) {
+						ok = 0;
+						break;
+					}
+			}
+			close(fd);
+			unlink(path);
+		}
+		test_result("threaded writes: each file holds only its own data",
+			    ok);
+	}
+
+	{
+		/* Several threads appending to the SAME file, under a lock.
+		 *
+		 * The case above gives every writer its own file, so no two of
+		 * them ever touch one page.  Here they all do: the records are
+		 * 37 bytes, so a page holds a hundred of them and every thread
+		 * writes into a page the others have already dirtied.  Each
+		 * record is one repeated character, so a record that came out
+		 * mixed -- two copies interleaved into one page -- is visible
+		 * directly in the result rather than only as a wrong total. */
+		pthread_t th[SHARED_APPENDERS];
+		char path[64];
+		int made = 0, ok = 1;
+		const size_t expect = (size_t)SHARED_APPENDERS *
+				      SHARED_APPEND_RECS * SHARED_APPEND_RECLEN;
+
+		snprintf(path, sizeof(path), "/tmp/shared_append_%d",
+			 (int)getpid());
+		unlink(path);
+		shared_append_fd = open(path, O_CREAT | O_WRONLY | O_APPEND,
+					0644);
+		test_result("shared append: create the file",
+			    shared_append_fd >= 0);
+
+		if (shared_append_fd >= 0) {
+			for (int i = 0; i < SHARED_APPENDERS; i++) {
+				shared_append_arg[i] = i;
+				if (pthread_create(&th[i], NULL,
+						   shared_append_body,
+						   &shared_append_arg[i]) == 0)
+					made++;
+				else
+					break;
+			}
+			test_result("shared append: all appenders started",
+				    made == SHARED_APPENDERS);
+			for (int i = 0; i < made; i++) {
+				void *r = NULL;
+
+				pthread_join(th[i], &r);
+				if (r != NULL)
+					ok = 0;
+			}
+			test_result("shared append: every appender reported success",
+				    ok);
+			close(shared_append_fd);
+			shared_append_fd = -1;
+
+			struct stat st;
+
+			test_result("shared append: the file is exactly as long as what was written",
+				    stat(path, &st) == 0 &&
+					    st.st_size == (off_t)expect);
+
+			/* Every record must be intact and from one writer, and
+			 * each writer's records must all be there. */
+			int fd = open(path, O_RDONLY);
+			if (fd < 0) {
+				test_fail("shared append: could not reopen");
+			} else {
+				int counts[SHARED_APPENDERS];
+				char rec[SHARED_APPEND_RECLEN];
+				ssize_t r;
+
+				for (int i = 0; i < SHARED_APPENDERS; i++)
+					counts[i] = 0;
+				ok = 1;
+				while ((r = read(fd, rec, sizeof(rec))) ==
+				       (ssize_t)sizeof(rec)) {
+					int who = rec[0] - 'A';
+
+					if (who < 0 || who >= SHARED_APPENDERS ||
+					    rec[sizeof(rec) - 1] != '\n') {
+						ok = 0;
+						break;
+					}
+					for (size_t i = 0;
+					     i < sizeof(rec) - 1; i++)
+						if (rec[i] != 'A' + who) {
+							ok = 0;
+							break;
+						}
+					if (!ok)
+						break;
+					counts[who]++;
+				}
+				if (r != 0)
+					ok = 0; /* trailing partial record */
+				test_result("shared append: every record is whole and from a single writer",
+					    ok);
+				for (int i = 0; i < SHARED_APPENDERS; i++)
+					if (counts[i] != SHARED_APPEND_RECS)
+						ok = 0;
+				test_result("shared append: every writer's records all arrived",
+					    ok);
+				close(fd);
+			}
+			unlink(path);
+		}
+	}
+
+	// ========================================
+	// Name lookups
+	// ========================================
+	printf("\n--- dentry cache ---\n");
+
+	{
+		/* Path lookups are answered from a cache now, so every check
+		 * here is really the same question asked twice: does the cache
+		 * still agree with the filesystem after something changed it?
+		 *
+		 * A lookup cache that is merely fast is easy.  One that is
+		 * fast and never answers with what USED to be true is the
+		 * whole difficulty, and each block below is one way of being
+		 * wrong that costs a user their file. */
+		char dir[64], a[128], b[128];
+		struct stat st;
+		int fd, ok;
+
+		snprintf(dir, sizeof(dir), "/tmp/dcache_%d", (int)getpid());
+		rmdir(dir);
+		test_result("dentry: make a directory to work in",
+			    mkdir(dir, 0755) == 0);
+
+		snprintf(a, sizeof(a), "%s/alpha", dir);
+		snprintf(b, sizeof(b), "%s/beta", dir);
+
+		/* A name that does not exist, and then does.
+		 *
+		 * The first stat records "not here" -- that negative answer is
+		 * what makes searching a PATH cheap, because most of the
+		 * directories on it do not hold the program.  It also has to
+		 * be thrown away the moment the name appears, or the file is
+		 * created successfully and then cannot be found. */
+		unlink(a);
+		test_result("dentry: a name that does not exist is not found",
+			    stat(a, &st) != 0 && errno == ENOENT);
+		test_result("dentry: asking twice gives the same answer",
+			    stat(a, &st) != 0 && errno == ENOENT);
+		fd = open(a, O_CREAT | O_WRONLY, 0644);
+		test_result("dentry: create it", fd >= 0);
+		if (fd >= 0) {
+			write(fd, "alpha", 5);
+			close(fd);
+		}
+		test_result("dentry: a name that has just appeared is found",
+			    stat(a, &st) == 0);
+		test_result("dentry: and it is the file that was written",
+			    st.st_size == 5);
+
+		/* The same name created and removed over and over.
+		 *
+		 * Each round asks for the answer both before and after the
+		 * change, so a cache that updates late -- or not at all --
+		 * fails on the round after the one that broke it, not
+		 * silently. */
+		ok = 1;
+		for (int i = 0; i < 20 && ok; i++) {
+			if (stat(a, &st) != 0)
+				ok = 0;
+			if (ok && unlink(a) != 0)
+				ok = 0;
+			if (ok && stat(a, &st) == 0)
+				ok = 0; /* removed, must not be found */
+			if (ok) {
+				fd = open(a, O_CREAT | O_WRONLY | O_TRUNC,
+					  0644);
+				if (fd < 0)
+					ok = 0;
+				else {
+					if (write(fd, "x", 1) != 1)
+						ok = 0;
+					close(fd);
+				}
+			}
+			if (ok && stat(a, &st) != 0)
+				ok = 0; /* created, must be found */
+		}
+		test_result("dentry: 20 rounds of create/stat/unlink/recreate track reality",
+			    ok);
+
+		/* Rename moves the name.
+		 *
+		 * Two entries change at once: the old one stops being an
+		 * answer and the new one starts.  Getting only half of that
+		 * right leaves the file reachable under both names, or under
+		 * neither. */
+		unlink(b);
+		test_result("dentry: rename", rename(a, b) == 0);
+		test_result("dentry: the old name is gone",
+			    stat(a, &st) != 0 && errno == ENOENT);
+		test_result("dentry: the new name is there", stat(b, &st) == 0);
+		fd = open(b, O_RDONLY);
+		if (fd < 0) {
+			test_fail("dentry: could not open the renamed file");
+		} else {
+			char buf[8];
+			ssize_t r = read(fd, buf, sizeof(buf));
+
+			test_result("dentry: the renamed file still holds its data",
+				    r == 1 && buf[0] == 'x');
+			close(fd);
+		}
+		test_result("dentry: rename back", rename(b, a) == 0);
+		test_result("dentry: found under the original name again",
+			    stat(a, &st) == 0);
+		unlink(a);
+
+		/* Case matters.
+		 *
+		 * This cache is shared with a filesystem whose names are
+		 * case-insensitive, and folding case here would make these two
+		 * the same entry -- one file answering for the other, with no
+		 * error anywhere to say so. */
+		{
+			char upper[128], lower[128];
+			struct stat su, sl;
+
+			snprintf(upper, sizeof(upper), "%s/CaseTest", dir);
+			snprintf(lower, sizeof(lower), "%s/casetest", dir);
+			unlink(upper);
+			unlink(lower);
+
+			fd = open(upper, O_CREAT | O_WRONLY, 0644);
+			if (fd >= 0) {
+				write(fd, "UPPER", 5);
+				close(fd);
+			}
+			test_result("dentry: create a mixed-case name", fd >= 0);
+			/* Looked up before the other one exists, so the miss
+			 * is what gets remembered. */
+			test_result("dentry: the differently-cased name does not exist yet",
+				    stat(lower, &st) != 0);
+
+			fd = open(lower, O_CREAT | O_WRONLY, 0644);
+			if (fd >= 0) {
+				write(fd, "lowercase", 9);
+				close(fd);
+			}
+			test_result("dentry: create the lower-case name too",
+				    fd >= 0);
+			test_result("dentry: both names exist",
+				    stat(upper, &su) == 0 &&
+					    stat(lower, &sl) == 0);
+			test_result("dentry: they are two different files",
+				    su.st_ino != sl.st_ino && su.st_size == 5 &&
+					    sl.st_size == 9);
+			/* Removing one must not remove the other. */
+			test_result("dentry: remove one of them",
+				    unlink(upper) == 0);
+			test_result("dentry: the other is still there",
+				    stat(lower, &sl) == 0 && sl.st_size == 9);
+			test_result("dentry: the removed one is gone",
+				    stat(upper, &su) != 0);
+			unlink(lower);
+		}
+
+		/* The same name in two directories.
+		 *
+		 * The cache is keyed by (directory, name).  If the directory
+		 * were not part of the key -- or the two keys collided --
+		 * "notes" in one directory would answer for "notes" in the
+		 * other, which is the failure that silently hands a program
+		 * the wrong file. */
+		{
+			char d1[128], d2[128], f1[192], f2[192];
+			struct stat s1, s2;
+
+			snprintf(d1, sizeof(d1), "%s/one", dir);
+			snprintf(d2, sizeof(d2), "%s/two", dir);
+			snprintf(f1, sizeof(f1), "%s/notes", d1);
+			snprintf(f2, sizeof(f2), "%s/notes", d2);
+
+			test_result("dentry: two directories",
+				    mkdir(d1, 0755) == 0 &&
+					    mkdir(d2, 0755) == 0);
+			fd = open(f1, O_CREAT | O_WRONLY, 0644);
+			if (fd >= 0) {
+				write(fd, "one", 3);
+				close(fd);
+			}
+			/* Absent from the second directory -- remembered as
+			 * absent THERE, and it must stay present in the first. */
+			test_result("dentry: the name is only in the first",
+				    stat(f1, &s1) == 0 && stat(f2, &s2) != 0);
+			fd = open(f2, O_CREAT | O_WRONLY, 0644);
+			if (fd >= 0) {
+				write(fd, "twotwo", 6);
+				close(fd);
+			}
+			test_result("dentry: now it is in both",
+				    stat(f1, &s1) == 0 && stat(f2, &s2) == 0);
+			test_result("dentry: and they are different files",
+				    s1.st_size == 3 && s2.st_size == 6);
+
+			/* A directory removed and remade under the same name.
+			 * Its inode number can be handed straight back, and
+			 * anything still cached under that number would make
+			 * the new directory answer with the old one's
+			 * children. */
+			test_result("dentry: empty and remove the first directory",
+				    unlink(f1) == 0 && rmdir(d1) == 0);
+			test_result("dentry: make it again", mkdir(d1, 0755) == 0);
+			test_result("dentry: the new directory is empty",
+				    stat(f1, &s1) != 0 && errno == ENOENT);
+
+			unlink(f2);
+			rmdir(d1);
+			rmdir(d2);
+		}
+
+		/* ".." after a directory moves.
+		 *
+		 * A directory's parent is an entry in the directory itself,
+		 * looked up like any other name -- so it is cached like any
+		 * other name, and a rename that moves the directory has to
+		 * take that entry with it.  Left behind, ".." leads back to a
+		 * parent the directory no longer has. */
+		{
+			char p1[128], p2[128], sub[192], moved[192];
+			char dotdot[224];
+			struct stat sp, sd;
+
+			snprintf(p1, sizeof(p1), "%s/parent1", dir);
+			snprintf(p2, sizeof(p2), "%s/parent2", dir);
+			snprintf(sub, sizeof(sub), "%s/child", p1);
+			snprintf(moved, sizeof(moved), "%s/child", p2);
+			snprintf(dotdot, sizeof(dotdot), "%s/child/..", p2);
+
+			test_result("dentry: two parents and a child",
+				    mkdir(p1, 0755) == 0 &&
+					    mkdir(p2, 0755) == 0 &&
+					    mkdir(sub, 0755) == 0);
+			/* Resolve ".." while it still points at the first
+			 * parent, so there is something cached to go stale. */
+			{
+				char before[224];
+
+				snprintf(before, sizeof(before), "%s/child/..",
+					 p1);
+				test_result("dentry: \"..\" points at the first parent",
+					    stat(before, &sp) == 0 &&
+						    stat(p1, &sd) == 0 &&
+						    sp.st_ino == sd.st_ino);
+			}
+			test_result("dentry: move the child",
+				    rename(sub, moved) == 0);
+			test_result("dentry: \"..\" now points at the second parent",
+				    stat(dotdot, &sp) == 0 &&
+					    stat(p2, &sd) == 0 &&
+					    sp.st_ino == sd.st_ino);
+
+			rmdir(moved);
+			rmdir(p1);
+			rmdir(p2);
+		}
+
+		/* Timing, printed rather than asserted.  The absolute numbers
+		 * are the device's to decide; what makes a regression obvious
+		 * is that these two used to cost a directory scan each. */
+		{
+			const int reps = 2000;
+			char missing[128];
+			struct timespec t0;
+			long ms_hit, ms_miss;
+
+			snprintf(missing, sizeof(missing), "%s/absent", dir);
+			fd = open(a, O_CREAT | O_WRONLY, 0644);
+			if (fd >= 0)
+				close(fd);
+
+			mono_now(&t0);
+			for (int i = 0; i < reps; i++)
+				stat(a, &st);
+			ms_hit = mono_elapsed_ms(&t0);
+
+			mono_now(&t0);
+			for (int i = 0; i < reps; i++)
+				stat(missing, &st);
+			ms_miss = mono_elapsed_ms(&t0);
+
+			printf("  %d stat() of an existing name: %ld ms\n",
+			       reps, ms_hit);
+			printf("  %d stat() of a name that is not there: %ld ms\n",
+			       reps, ms_miss);
+			unlink(a);
+		}
+
+		rmdir(dir);
+	}
+
+	// ========================================
+	// What one durable close costs
+	// ========================================
+	printf("\n--- fsync cost ---\n");
+
+	{
+		/* Programs that care about their data call fsync on every file
+		 * they close -- a mail client does it for every mailbox and
+		 * index it writes.  So the per-fsync cost is multiplied by the
+		 * number of files, and anything fsync does beyond making this
+		 * file durable is paid for over and over.
+		 *
+		 * It used to go on to mark the whole journal clean, which added
+		 * two device cache flushes and made the next write set the
+		 * needs-recovery flag again with a third.  Saving a mailbox
+		 * took twenty seconds.
+		 *
+		 * The bound here is loose on purpose -- the device dictates the
+		 * absolute number.  The printed figure is the thing to watch. */
+		const int files = 50;
+		long ms_sync, ms_plain;
+		struct timespec t0;
+		int ok = 1;
+		char path[128];
+
+		mono_now(&t0);
+		for (int i = 0; i < files && ok; i++) {
+			int fd;
+
+			snprintf(path, sizeof(path), "/tmp/fsync_%d_%d",
+				 (int)getpid(), i);
+			fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+			if (fd < 0) {
+				ok = 0;
+				break;
+			}
+			if (write(fd, "durable payload\n", 16) != 16)
+				ok = 0;
+			if (fsync(fd) != 0)
+				ok = 0;
+			close(fd);
+		}
+		ms_sync = mono_elapsed_ms(&t0);
+		test_result("fsync: every file was written durably", ok);
+		printf("  %d files written and fsync'd in %ld ms\n", files,
+		       ms_sync);
+
+		/* The same work without asking for durability, as a baseline
+		 * for what the fsyncs themselves cost. */
+		mono_now(&t0);
+		for (int i = 0; i < files; i++) {
+			int fd;
+
+			snprintf(path, sizeof(path), "/tmp/fsyncb_%d_%d",
+				 (int)getpid(), i);
+			fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+			if (fd < 0)
+				continue;
+			(void)!write(fd, "durable payload\n", 16);
+			close(fd);
+		}
+		ms_plain = mono_elapsed_ms(&t0);
+		printf("  %d files written without fsync in %ld ms\n", files,
+		       ms_plain);
+
+		for (int i = 0; i < files; i++) {
+			snprintf(path, sizeof(path), "/tmp/fsync_%d_%d",
+				 (int)getpid(), i);
+			unlink(path);
+			snprintf(path, sizeof(path), "/tmp/fsyncb_%d_%d",
+				 (int)getpid(), i);
+			unlink(path);
+		}
+
+		test_result("fsync: durable writes complete in reasonable time",
+			    ms_sync < 30000);
+
+		/* A second fsync with nothing changed in between has nothing to
+		 * make durable and must not repeat the work. */
+		{
+			char idle_path[64];
+			int fd;
+
+			snprintf(idle_path, sizeof(idle_path),
+				 "/tmp/fsync_idle_%d", (int)getpid());
+			fd = open(idle_path, O_CREAT | O_WRONLY, 0644);
+
+			if (fd < 0) {
+				test_fail("fsync: could not create the file");
+			} else {
+				long first, second;
+
+				(void)!write(fd, "x", 1);
+				mono_now(&t0);
+				fsync(fd);
+				first = mono_elapsed_ms(&t0);
+				mono_now(&t0);
+				fsync(fd);
+				second = mono_elapsed_ms(&t0);
+				printf("  fsync %ld ms, then %ld ms with nothing changed\n",
+				       first, second);
+				test_result("fsync with nothing to do is not more expensive",
+					    second <= first + 50);
+				close(fd);
+				unlink(idle_path);
+			}
+		}
+	}
+
+	// ========================================
+	// Relative paths follow the caller's directory
+	// ========================================
+	printf("\n--- relative paths ---\n");
+
+	{
+		/* A relative path must be resolved against the CALLING task's
+		 * working directory.  It used to be resolved much further down,
+		 * against a single directory shared by every process -- so a
+		 * call naming "x" operated on whichever directory some other
+		 * process had most recently changed into.
+		 *
+		 * The way it showed up: stat() said a file was there and
+		 * rename() said it was not, in the same program, moments apart.
+		 * So the shape of this test is exactly that -- create through a
+		 * relative name, then require every other call to agree about
+		 * it. */
+		char dir[64];
+
+		snprintf(dir, sizeof(dir), "/tmp/relpath_%d", (int)getpid());
+		char cwd_before[512];
+		int ok = 1;
+
+		if (!getcwd(cwd_before, sizeof(cwd_before)))
+			cwd_before[0] = '\0';
+
+		rmdir(dir);
+		if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+			test_fail("relpath: could not create the directory");
+		} else if (chdir(dir) != 0) {
+			test_fail("relpath: could not enter the directory");
+		} else {
+			struct stat st;
+			int fd = open("marker", O_CREAT | O_WRONLY | O_TRUNC,
+				      0644);
+
+			test_result("relpath: create through a relative name",
+				    fd >= 0);
+			if (fd >= 0) {
+				(void)!write(fd, "x", 1);
+				close(fd);
+			}
+
+			/* Everything below names the same file relatively. */
+			test_result("relpath: stat agrees the file exists",
+				    stat("marker", &st) == 0);
+			test_result("relpath: access agrees the file exists",
+				    access("marker", F_OK) == 0);
+
+			/* The one that was broken. */
+			test_result("relpath: rename finds what stat just found",
+				    rename("marker", "marker2") == 0);
+			test_result("relpath: the renamed file is there",
+				    stat("marker2", &st) == 0);
+			test_result("relpath: the old name is gone",
+				    stat("marker", &st) != 0);
+
+			/* And the absolute name must describe the same file. */
+			{
+				char abs[96];
+
+				snprintf(abs, sizeof(abs), "%s/marker2", dir);
+				test_result("relpath: the absolute name agrees",
+					    stat(abs, &st) == 0);
+			}
+
+			test_result("relpath: unlink through a relative name",
+				    unlink("marker2") == 0);
+
+			/* A long single name, reached relatively.
+			 *
+			 * Taking a path apart component by component used to
+			 * use a 64-byte buffer and simply stop copying when it
+			 * filled -- without skipping the rest of the name, so
+			 * the tail became the NEXT component: "averylongname"
+			 * turned into "averylongnam/e".  A different file, in a
+			 * directory that does not exist.  Creating through a
+			 * path that skipped the split worked, and removing it
+			 * afterwards did not. */
+			const char *longname =
+				"abcdefghijklmnopqrstuvwxyz0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ.longext";
+			int lfd = open(longname, O_CREAT | O_WRONLY | O_TRUNC,
+				       0644);
+
+			test_result("relpath: create a 71-character name", lfd >= 0);
+			if (lfd >= 0)
+				close(lfd);
+			test_result("relpath: stat the long name",
+				    stat(longname, &st) == 0);
+			test_result("relpath: the long name was not split",
+				    access(longname, F_OK) == 0);
+			test_result("relpath: unlink the long name",
+				    unlink(longname) == 0);
+
+			if (cwd_before[0] && chdir(cwd_before) != 0)
+				ok = 0;
+			test_result("relpath: returned to the original directory",
+				    ok);
+			rmdir(dir);
+		}
 	}
 
 	// ========================================

@@ -140,21 +140,38 @@ int at_quick_exit(void (*func)(void))
  *
  * Each entry is cleared BEFORE it is called.  A handler is entitled to call
  * exit() itself, and to register further handlers while running; clearing first
- * is what stops the same destructor running twice in either case.  The list is
- * re-scanned from the head each time round for the same reason: it can have
- * grown since the last call.
+ * is what stops the same destructor running twice in either case.
+ *
+ * The walk keeps its place between handlers instead of starting over after each
+ * one.  Starting over was the obvious way to honour "a handler may register
+ * more", but it re-examined every entry already dealt with, so the work grew
+ * with the square of the number of handlers -- and a program that loads a
+ * hundred shared objects registers a great many.  A pass now runs to the end,
+ * and only begins again if the list actually changed while it was running,
+ * which is the case the re-scan was there for.
  */
 void __cxa_finalize(void *dso)
 {
-	for (;;) {
-		void (*fn)(void *) = NULL;
-		void *arg = NULL;
+	exit_lock_acquire();
 
-		exit_lock_acquire();
-		for (struct exit_block *b = exit_head; b && !fn; b = b->next) {
-			for (int i = b->count - 1; i >= 0; i--) {
+	for (;;) {
+		/* The shape of the list at the start of this pass.  New
+		 * handlers can only appear in the head block -- either as more
+		 * entries in it, or as a new block in front -- so these two
+		 * values are enough to notice one. */
+		struct exit_block *pass_head = exit_head;
+		int pass_head_count = exit_head ? exit_head->count : 0;
+		struct exit_block *b = exit_head;
+		int i = pass_head_count - 1;
+
+		while (b) {
+			void (*fn)(void *) = NULL;
+			void *arg = NULL;
+
+			while (i >= 0) {
 				struct exit_handler *h = &b->h[i];
 
+				i--;
 				if (!h->fn)
 					continue;
 				if (dso && h->dso != dso)
@@ -164,13 +181,35 @@ void __cxa_finalize(void *dso)
 				h->fn = NULL;
 				break;
 			}
-		}
-		exit_lock_release();
 
-		if (!fn)
-			return;
-		fn(arg);
+			if (!fn) {
+				b = b->next;
+				i = b ? b->count - 1 : -1;
+				continue;
+			}
+
+			/* Dropped across the call: a handler may register more,
+			 * or call exit() and come back through here. */
+			exit_lock_release();
+			fn(arg);
+			exit_lock_acquire();
+
+			/* If the list grew under us, this position is no longer
+			 * meaningful -- start a fresh pass, which picks up the
+			 * new entries first. */
+			if (exit_head != pass_head ||
+			    (exit_head && exit_head->count != pass_head_count))
+				break;
+		}
+
+		/* Another pass only if something changed; otherwise the list
+		 * holds nothing more for this dso. */
+		if (exit_head == pass_head &&
+		    (!exit_head || exit_head->count == pass_head_count))
+			break;
 	}
+
+	exit_lock_release();
 }
 
 /*

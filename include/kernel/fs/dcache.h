@@ -35,6 +35,11 @@
 #define DC_VALID 0x01 // Entry is valid
 #define DC_NEGATIVE 0x02 // Negative entry (name does not exist)
 #define DC_DIRECTORY 0x04 // Entry is a directory
+/* This entry was made through the case-sensitive interface below, and is
+ * found only through it.  The two interfaces hash and compare names
+ * differently, so an entry made by one is not addressable by the other; the
+ * flag makes that a stated rule rather than a consequence. */
+#define DC_CASE_SENSITIVE 0x08
 
 // ============================================================================
 // Structures
@@ -104,6 +109,55 @@ void dcache_invalidate(unsigned long parent_cluster, const char *name);
 
 // Invalidate the entire cache (e.g., filesystem unmount).
 void dcache_invalidate_all(void);
+
+// ============================================================================
+// Case-sensitive interface
+// ============================================================================
+
+/* The entry points above fold case, which is what FAT32 needs and what ext4
+ * must not have: on ext4 "Makefile" and "makefile" are two different files,
+ * and a cache that cannot tell them apart answers one with the other.
+ *
+ * These are the same cache with the folding removed.  Nothing else about it
+ * changes -- same buckets, same LRU, same eviction, and the two invalidation
+ * calls above work on entries of either kind, because they key on the parent
+ * alone.
+ *
+ * Entries made through here are found only through here (DC_CASE_SENSITIVE),
+ * and the two sets are kept apart by their keys as well: ext4 tags its parent
+ * ids, so an inode number and a FAT32 cluster number never collide.
+ */
+
+/* What a lookup answers with.
+ *
+ * Copied out under the cache's own lock rather than handed back as a pointer.
+ * dcache_lookup() returns the entry itself, which is only safe for as long as
+ * nothing evicts it -- and eviction runs on whichever processor inserts next,
+ * so "as long as" is not a duration the caller can establish.  The value is
+ * three words; copying it removes the question entirely.
+ */
+typedef struct dc_result {
+	unsigned long ino; // The filesystem's id for the name
+	unsigned long size; // Size in bytes, if the filesystem tracks it here
+	unsigned int attr; // Filesystem-defined; bit 0x10 == directory
+} dc_result_t;
+
+#define DC_LOOKUP_MISS 0 // Nothing cached for this name
+#define DC_LOOKUP_FOUND 1 // Cached, and it exists (*out filled in)
+#define DC_LOOKUP_NEGATIVE 2 // Cached, and it is known NOT to exist
+
+// Look up `name` in `parent`, comparing case-sensitively.
+int dcache_lookup_cs(unsigned long parent, const char *name, dc_result_t *out);
+
+// Record that `name` in `parent` exists and names `ino`.
+void dcache_insert_cs(unsigned long parent, const char *name, unsigned long ino,
+		      unsigned long size, unsigned int attr);
+
+// Record that `name` in `parent` does not exist.
+void dcache_insert_negative_cs(unsigned long parent, const char *name);
+
+// Forget whatever was recorded for `name` in `parent`.
+void dcache_invalidate_cs(unsigned long parent, const char *name);
 
 // Statistics
 typedef struct dc_stats {

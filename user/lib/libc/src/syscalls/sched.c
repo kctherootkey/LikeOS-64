@@ -5,7 +5,6 @@
 #include <time.h>
 #include "syscall.h"
 
-extern int errno;
 
 // SYS_YIELD - voluntarily yield the CPU
 int sched_yield(void)

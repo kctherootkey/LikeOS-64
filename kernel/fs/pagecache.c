@@ -85,6 +85,15 @@ static spinlock_t pc_lru_lock = SPINLOCK_INIT("pc_lru");
 static pc_page_t pc_dirty_sentinel;
 static spinlock_t pc_dirty_lock = SPINLOCK_INIT("pc_dirty");
 
+/* How many pages are on that list.
+ *
+ * Counted by list membership rather than by the dirty flag: membership has
+ * exactly two chokepoints, both below and both under pc_dirty_lock, whereas
+ * the flag is cleared in half a dozen places and a count that drifts either
+ * throttles writers that need not wait or fails to throttle the ones that
+ * must.  Guarded by pc_dirty_lock. */
+static unsigned long pc_dirty_pages;
+
 // Statistics
 static volatile uint64_t pc_stat_hits;
 static volatile uint64_t pc_stat_misses;
@@ -155,16 +164,24 @@ static inline void dirty_list_add(pc_page_t *page)
 	page->dirty_prev = &pc_dirty_sentinel;
 	pc_dirty_sentinel.dirty_next->dirty_prev = page;
 	pc_dirty_sentinel.dirty_next = page;
+	pc_dirty_pages++;
 }
 
 static inline void dirty_list_remove(pc_page_t *page)
 {
+	/* Membership is what the count tracks, so a remove that removes
+	 * nothing must not decrement it. */
+	if (!page->dirty_prev && !page->dirty_next)
+		return;
 	if (page->dirty_prev)
 		page->dirty_prev->dirty_next = page->dirty_next;
 	if (page->dirty_next)
 		page->dirty_next->dirty_prev = page->dirty_prev;
 	page->dirty_prev = 0;
 	page->dirty_next = 0;
+	WARN_ON(pc_dirty_pages == 0);
+	if (pc_dirty_pages)
+		pc_dirty_pages--;
 }
 
 // ============================================================================
@@ -559,13 +576,28 @@ void pagecache_reclaim_if_needed(void)
 	if (!pc_initialized)
 		return;
 	uint64_t free = mm_get_free_pages();
+
+	/* Reclaim never writes dirty pages back from here, however short of
+	 * memory we are.
+	 *
+	 * This runs from inside a cache lookup, and a lookup is reached from
+	 * the read path, which holds the metadata lock SHARED.  Writing a page
+	 * back takes the filesystem's I/O lock for writing, and asking for a
+	 * writer while a reader is held is a deadlock -- reachable the moment
+	 * anything puts dirty pages in this cache.
+	 *
+	 * Clean pages can still be dropped, which is what relieves the
+	 * pressure; the dirty ones are handed to the thread whose job that is,
+	 * and become reclaimable once it has written them. */
 	if (free < PC_LOW_WATERMARK_PAGES) {
-		// Aggressive: reclaim enough to get above high watermark
 		unsigned long target = PC_HIGH_WATERMARK_PAGES - free;
+
 		if (target > pc_stat_total_pages)
 			target = pc_stat_total_pages;
 		if (target > 0)
-			pagecache_shrink(target, 1);
+			pagecache_shrink(target, 0);
+		/* Ask for writeback so the dirty pages stop being unreclaimable. */
+		pc_writeback_pending = 1;
 	} else if (free < PC_HIGH_WATERMARK_PAGES) {
 		// Gentle: reclaim a small batch
 		pagecache_shrink(32, 0);
@@ -824,11 +856,18 @@ pc_page_t *pagecache_get(unsigned long cluster_id, unsigned long page_index,
 	if (!pc_initialized || !sb || start_cluster < 2)
 		return 0;
 
-	// Check memory pressure first and do deferred writeback
-	if (pc_writeback_pending) {
-		pc_writeback_pending = 0;
-		pagecache_flush_all();
-	}
+	/* Deferred writeback does NOT happen here.
+	 *
+	 * Writing back takes the filesystem's I/O lock exclusively, and this is
+	 * reached from the read path, which holds the metadata lock SHARED.
+	 * Taking a writer while holding a reader is a deadlock, and it was only
+	 * ever dormant because nothing put dirty pages in this cache for it to
+	 * find -- writes went straight to the device.  Once they stopped doing
+	 * that, the first read after a write wedged the machine.
+	 *
+	 * The periodic flush belongs where no filesystem lock is held: the
+	 * commit thread picks it up (see the ordered-data flush in the journal
+	 * commit), which is a context that owns its locks from the outside. */
 
 	// 1. Try cache lookup (no I/O lock needed)
 	pc_page_t *pg = pagecache_lookup(cluster_id, page_index);
@@ -970,6 +1009,385 @@ void pagecache_mark_dirty(pc_page_t *page)
 // Flush dirty pages for a specific file
 // ============================================================================
 
+/* ---- Writeback: merge neighbouring pages into one device command ---------
+ *
+ * What a block device charges for is the command, not the bytes: a hundred
+ * separate 4KB writes cost a hundred round trips, while the same hundred pages
+ * written as one command cost one.  Dirty pages that sit next to each other on
+ * the device are therefore gathered and written together.
+ *
+ * They have to be copied to do it.  Cache pages are individual frames scattered
+ * through memory, and a transfer needs one buffer, so a run is assembled in
+ * this staging buffer first.  A memory copy against a device round trip is not
+ * a close contest.
+ */
+#define PC_WB_RUN_MAX 32 /* pages per command -- 128KB */
+static uint8_t *pc_wb_bounce;
+static unsigned long pc_wb_bounce_pages;
+
+static void pc_wb_bounce_init(void)
+{
+	if (pc_wb_bounce || pc_wb_bounce_pages)
+		return;
+	pc_wb_bounce = (uint8_t *)kalloc(PC_WB_RUN_MAX * PAGE_SIZE);
+	/* Recorded even on failure so this is attempted once: without the
+	 * buffer writeback still works, one page per command. */
+	pc_wb_bounce_pages = pc_wb_bounce ? PC_WB_RUN_MAX : 0;
+}
+
+/* Retire one written-back page: no longer dirty, no longer held for I/O. */
+static void pc_wb_retire(pc_page_t *p)
+{
+	uint64_t flags;
+
+	p->flags &= ~(PC_PAGE_DIRTY | PC_PAGE_LOCKED);
+	__sync_fetch_and_add(&pc_stat_writebacks, 1);
+	spin_lock_irqsave(&pc_dirty_lock, &flags);
+	dirty_list_remove(p);
+	spin_unlock_irqrestore(&pc_dirty_lock, flags);
+	/* Detached while it was being written back: we are the last reference. */
+	if (p->flags & PC_PAGE_DEAD)
+		pc_page_free(p);
+}
+
+/*
+ * Write a batch of locked, dirty pages, merging neighbours.
+ *
+ * Only for the case where a block is exactly a page, which is what this
+ * filesystem uses; the caller keeps its own per-page path for the others.
+ * Returns the number of pages written.  Anything it could not place -- a page
+ * with no block behind it -- is left dirty and unlocked for a later attempt.
+ *
+ * Must be called with the filesystem's I/O lock held: it walks the block
+ * mapping, which the lock protects.
+ */
+static int pc_writeback_batch(vfs_superblock_t *sb, pc_page_t **batch, int n)
+{
+	unsigned long lbas[PC_WB_RUN_MAX];
+	pc_page_t *run[PC_WB_RUN_MAX];
+	const block_device_t *bdev = vfs_sb_bdev(sb);
+	unsigned long ss = vfs_sb_sector_size(sb);
+	unsigned long eoc = vfs_sb_end_of_chain(sb);
+	unsigned long reserved_meta = vfs_sb_reserved_meta_block(sb);
+	unsigned long spp = PAGE_SIZE / ss; /* sectors per page */
+	int wrote = 0;
+	int nrun = 0;
+
+	/* This issues device commands and takes buffers, so it must be reached
+	 * from a context that may block -- never from one with interrupts off. */
+	might_sleep();
+	BUG_ON(sb == NULL);
+	BUG_ON(batch == NULL);
+	VM_BUG_ON(n > PC_WB_RUN_MAX);
+
+	pc_wb_bounce_init();
+
+	/* Address order, so that pages which are adjacent on the device end up
+	 * adjacent here.  The dirty list is in the order pages were first
+	 * written, which is not the same thing -- and out of order, no two
+	 * pages ever look mergeable.  Insertion sort: a batch is small and
+	 * usually close to sorted already. */
+	for (int i = 1; i < n; i++) {
+		pc_page_t *key = batch[i];
+		int j = i - 1;
+
+		while (j >= 0 &&
+		       (batch[j]->cluster_id > key->cluster_id ||
+			(batch[j]->cluster_id == key->cluster_id &&
+			 batch[j]->page_index > key->page_index))) {
+			batch[j + 1] = batch[j];
+			j--;
+		}
+		batch[j + 1] = key;
+	}
+
+	for (int i = 0; i <= n; i++) {
+		pc_page_t *p = (i < n) ? batch[i] : 0;
+		unsigned long lba = 0;
+		int mergeable = 0;
+
+		if (p) {
+			unsigned long blk =
+				pc_walk_chain(sb, p->cluster_id, p->page_index);
+
+			if (blk == 0 || blk >= eoc ||
+			    (reserved_meta && blk == reserved_meta)) {
+				/* Nothing to write it to.  Leave it dirty --
+				 * dropping it would lose the data silently --
+				 * but SAY SO.
+				 *
+				 * A dirty page with no block behind it can
+				 * never be stored and never becomes
+				 * reclaimable, so it is not one lost write: it
+				 * is a page held forever, and enough of them
+				 * exhaust memory.  Whoever dirtied it should
+				 * have established that the block existed.
+				 * Silence here turns that mistake into an
+				 * out-of-memory failure somewhere unrelated. */
+				/* The id in hex as well as decimal: filesystems
+				 * encode fields into it (ext4 packs a tag, an
+				 * inode number and a logical index), and the
+				 * decimal form of a tagged id is unreadable. */
+				WARN_RATELIMIT(
+					1,
+					"pagecache: dirty page (file %lu = 0x%lx, page %lu, blk %lu, flags 0x%x) has no block behind it - cannot be stored",
+					p->cluster_id, p->cluster_id,
+					p->page_index, blk,
+					(unsigned)p->flags);
+				p->flags &= ~PC_PAGE_LOCKED;
+				p = 0;
+			} else {
+				lba = vfs_sb_block_to_lba(sb, blk);
+				/* LBA 0 is the boot block, used as the sentinel
+				 * for a hole -- never file data. */
+				if (lba == 0) {
+					p->flags &= ~PC_PAGE_LOCKED;
+					p = 0;
+				}
+			}
+		}
+
+		if (p && nrun > 0 && nrun < PC_WB_RUN_MAX &&
+		    lba == lbas[nrun - 1] + spp)
+			mergeable = 1;
+
+		/* Flush the run whenever this page cannot extend it. */
+		if (nrun > 0 && (!p || !mergeable)) {
+			int ok;
+
+			if (pc_wb_bounce && nrun > 1) {
+				for (int k = 0; k < nrun; k++)
+					mm_memcpy(pc_wb_bounce +
+							  (unsigned long)k *
+								  PAGE_SIZE,
+						  run[k]->data, PAGE_SIZE);
+				ok = (pc_write_sectors(bdev, lbas[0],
+						       spp * (unsigned long)nrun,
+						       pc_wb_bounce) == 0);
+			} else {
+				ok = 1;
+				for (int k = 0; k < nrun; k++)
+					if (pc_write_sectors(bdev, lbas[k], spp,
+							     run[k]->data) != 0)
+						ok = 0;
+			}
+
+			for (int k = 0; k < nrun; k++) {
+				if (ok) {
+					pc_wb_retire(run[k]);
+					wrote++;
+				} else {
+					/* Still dirty: it did not reach the
+					 * device, and forgetting that loses it. */
+					run[k]->flags &= ~PC_PAGE_LOCKED;
+				}
+			}
+			nrun = 0;
+		}
+
+		if (p) {
+			run[nrun] = p;
+			lbas[nrun] = lba;
+			nrun++;
+		}
+	}
+	VM_BUG_ON(nrun != 0);
+	return wrote;
+}
+
+/*
+ * Obtain the page covering `page_index` so the caller can write into it.
+ *
+ * The counterpart of pagecache_get() for the write path, and it differs in two
+ * ways that matter:
+ *
+ *  - A write covering the WHOLE page needs no read first.  Every byte is about
+ *    to be replaced, so fetching the old contents off the device is pure cost.
+ *    A write covering only part of one must read them, or the bytes outside the
+ *    written range would come back as whatever the page frame last held.
+ *
+ *  - A write may extend the file, so a page past the current end is legitimate.
+ *    There is nothing on the device for it yet, and it starts as zeros -- which
+ *    is what the unwritten part of a file reads as.
+ *
+ * The page is returned dirty-able but NOT yet dirty: the caller copies its data
+ * in and then calls pagecache_mark_dirty(), so a page is never advertised as
+ * needing writeback before it holds what is to be written back.
+ */
+pc_page_t *pagecache_get_for_write(unsigned long cluster_id,
+				   unsigned long page_index,
+				   unsigned long file_size,
+				   struct vfs_superblock *sb,
+				   unsigned long start_cluster, int full_page)
+{
+	pc_page_t *pg;
+	unsigned long file_pages;
+
+	might_sleep();
+	VM_BUG_ON(sb == NULL);
+	VM_BUG_ON(start_cluster < 2);
+	if (!pc_initialized || !sb || start_cluster < 2)
+		return 0;
+
+	pg = pagecache_lookup(cluster_id, page_index);
+	if (pg) {
+		__sync_fetch_and_add(&pc_stat_hits, 1);
+		pg->flags |= PC_PAGE_LOCKED;
+		return pg;
+	}
+
+	__sync_fetch_and_add(&pc_stat_misses, 1);
+	file_pages = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+	if (full_page || page_index >= file_pages) {
+		/* Nothing worth preserving: either the caller replaces every
+		 * byte, or the page lies past anything the file has held. */
+		pc_page_t *np;
+
+		pagecache_reclaim_if_needed();
+		np = pc_page_alloc();
+		if (!np)
+			return 0;
+		np->cluster_id = cluster_id;
+		np->page_index = page_index;
+		/* Zeroed, not merely claimed.  A partial write beyond the end
+		 * of the file must read back as zeros outside its own range,
+		 * never as whatever the previous owner of the frame left. */
+		mm_memset(np->data, 0, PAGE_SIZE);
+		np->flags = PC_PAGE_VALID | PC_PAGE_REFERENCED;
+		pg = pagecache_insert(np);
+		if (pg != np)
+			pc_page_free(np);
+		if (pg)
+			pg->flags |= PC_PAGE_LOCKED;
+		return pg;
+	}
+
+	/* Partial write inside the file: the existing contents are part of the
+	 * result, so read them the ordinary way. */
+	pg = pagecache_get(cluster_id, page_index, file_size, sb,
+			   start_cluster);
+	if (pg)
+		pg->flags |= PC_PAGE_LOCKED;
+	return pg;
+}
+
+/*
+ * Finish a write into a page taken with pagecache_get_for_write().
+ *
+ * Publishes the data -- the page becomes dirty only now, never before it holds
+ * what is to be stored -- and releases the hold taken at the start.
+ *
+ * That hold is not bookkeeping.  Between handing a page out for writing and the
+ * caller finishing its copy, the page is a perfectly ordinary clean cache page,
+ * and reclaim on another processor is entitled to take it: it is not dirty, so
+ * nothing is lost by dropping it, and the frame goes back to the allocator.
+ * The copy then lands in memory belonging to whoever was given that frame next.
+ * The damage appears far from here and looks nothing like a filesystem problem
+ * -- a corrupted network buffer, a program exiting without a word.
+ */
+void pagecache_write_end(pc_page_t *page)
+{
+	if (!page)
+		return;
+	/* Detached while we held it -- the file it belonged to was truncated or
+	 * removed, so there is nothing to publish and nobody to publish it to.
+	 * We are the last reference; the frame goes back here. */
+	if (page->flags & PC_PAGE_DEAD) {
+		page->flags &= ~PC_PAGE_LOCKED;
+		pc_page_free(page);
+		return;
+	}
+	pagecache_mark_dirty(page);
+	page->flags &= ~PC_PAGE_LOCKED;
+}
+
+/* Release a page taken for writing WITHOUT publishing it: the write failed and
+ * the page holds nothing worth storing. */
+void pagecache_write_abort(pc_page_t *page)
+{
+	if (!page)
+		return;
+	if (page->flags & PC_PAGE_DEAD) {
+		page->flags &= ~PC_PAGE_LOCKED;
+		pc_page_free(page);
+		return;
+	}
+	page->flags &= ~PC_PAGE_LOCKED;
+}
+
+/*
+ * Store the dirty pages of a SET of files, in one pass over the dirty list.
+ *
+ * The per-file entry point below walks the whole list to find one file's
+ * pages.  Calling it once per file therefore costs a full walk per file --
+ * including for files that have nothing dirty -- which is worse than the
+ * flush-everything it was meant to improve on.  A commit knows the whole set
+ * up front, so it should pay for one walk, not one per member.
+ */
+int pagecache_flush_fileset(const unsigned long *ids, unsigned nids)
+{
+	int wrote = 0;
+	uint64_t flags;
+
+	might_sleep();
+	BUG_ON(nids > 0 && ids == NULL);
+	if (!pc_initialized || nids == 0)
+		return 0;
+
+#define FLUSH_SET_BATCH 32
+	pc_page_t *batch[FLUSH_SET_BATCH];
+	int batch_count;
+
+	do {
+		batch_count = 0;
+		spin_lock_irqsave(&pc_dirty_lock, &flags);
+		pc_page_t *pg = pc_dirty_sentinel.dirty_next;
+		while (pg != &pc_dirty_sentinel &&
+		       batch_count < FLUSH_SET_BATCH) {
+			if ((pg->flags & PC_PAGE_DIRTY) &&
+			    !(pg->flags & PC_PAGE_LOCKED)) {
+				for (unsigned i = 0; i < nids; i++) {
+					if (pg->cluster_id == ids[i]) {
+						pg->flags |= PC_PAGE_LOCKED;
+						batch[batch_count++] = pg;
+						break;
+					}
+				}
+			}
+			pg = pg->dirty_next;
+		}
+		spin_unlock_irqrestore(&pc_dirty_lock, flags);
+
+		if (batch_count == 0)
+			break;
+
+		vfs_superblock_t *sb = g_root_sb;
+		if (!sb) {
+			for (int i = 0; i < batch_count; i++)
+				batch[i]->flags &= ~PC_PAGE_LOCKED;
+			break;
+		}
+		vfs_sb_lock_io(sb);
+		if (vfs_sb_block_size(sb) == PAGE_SIZE) {
+			wrote += pc_writeback_batch(sb, batch, batch_count);
+		} else {
+			/* Block sizes that do not match a page keep the
+			 * per-file path; this set walk is for the common one. */
+			for (int i = 0; i < batch_count; i++)
+				batch[i]->flags &= ~PC_PAGE_LOCKED;
+			vfs_sb_unlock_io(sb);
+			for (unsigned i = 0; i < nids; i++)
+				wrote += pagecache_flush_file(ids[i]);
+			break;
+		}
+		vfs_sb_unlock_io(sb);
+	} while (batch_count == FLUSH_SET_BATCH);
+
+#undef FLUSH_SET_BATCH
+	return wrote;
+}
+
 int pagecache_flush_file(unsigned long cluster_id)
 {
 	might_sleep();
@@ -1023,6 +1441,17 @@ int pagecache_flush_file(unsigned long cluster_id)
 		unsigned long reserved_meta = vfs_sb_reserved_meta_block(sb);
 
 		vfs_sb_lock_io(sb);
+
+		/* The ordinary case here: one block per page, so neighbouring
+		 * pages sit on consecutive sectors and can go to the device
+		 * together.  The per-page path below still covers the block
+		 * sizes that do not divide evenly. */
+		if (bs == PAGE_SIZE) {
+			wrote += pc_writeback_batch(sb, batch, batch_count);
+			vfs_sb_unlock_io(sb);
+			continue;
+		}
+
 		for (int i = 0; i < batch_count; i++) {
 			pc_page_t *p = batch[i];
 
@@ -1130,7 +1559,47 @@ int pagecache_flush_file(unsigned long cluster_id)
 // Flush all dirty pages
 // ============================================================================
 
-int pagecache_flush_all(void)
+static int pagecache_flush_all_batch(void);
+
+/*
+ * Store up to `max_pages` dirty pages and stop, whether or not any remain.
+ *
+ * The bound is the point.  A writer that is made to do writeback must be
+ * charged a piece of work proportional to what it produced, not the whole
+ * backlog: the thread paying it is an ordinary program in the middle of a
+ * write(), and in a graphical program that same thread is also servicing its
+ * display connection.  Handing it every dirty page in the system stalls it for
+ * as long as that takes, which is not a slow write -- it is a program that
+ * stops answering, and the far end eventually gives up on it.
+ *
+ * Returns the number of pages stored.
+ */
+int pagecache_flush_bounded(unsigned long max_pages)
+{
+	unsigned long done = 0;
+
+	might_sleep();
+	if (!pc_initialized || max_pages == 0)
+		return 0;
+
+	while (done < max_pages) {
+		int n = pagecache_flush_all_batch();
+
+		if (n <= 0)
+			break;
+		done += (unsigned long)n;
+	}
+	return (int)done;
+}
+
+/*
+ * Store ONE batch of dirty pages, wherever they belong, and return how many.
+ *
+ * Split out so that callers can choose how much work to take on: the periodic
+ * writeback wants everything, a writer being throttled wants a bounded amount.
+ * Returns 0 when there is nothing left to store.
+ */
+static int pagecache_flush_all_batch(void)
 {
 	might_sleep();
 	if (!pc_initialized)
@@ -1141,6 +1610,9 @@ int pagecache_flush_all(void)
 	pc_page_t *batch[FLUSH_ALL_BATCH];
 	int batch_count;
 
+	/* Runs once.  Kept as a loop so that the `break` and `continue` inside
+	 * still mean "this batch is finished", which is what they meant when
+	 * this was the body of the flush-everything loop. */
 	do {
 		batch_count = 0;
 		uint64_t flags;
@@ -1174,6 +1646,17 @@ int pagecache_flush_all(void)
 		unsigned long reserved_meta = vfs_sb_reserved_meta_block(sb);
 
 		vfs_sb_lock_io(sb);
+
+		/* The ordinary case here: one block per page, so neighbouring
+		 * pages sit on consecutive sectors and can go to the device
+		 * together.  The per-page path below still covers the block
+		 * sizes that do not divide evenly. */
+		if (bs == PAGE_SIZE) {
+			wrote += pc_writeback_batch(sb, batch, batch_count);
+			vfs_sb_unlock_io(sb);
+			continue;
+		}
+
 		for (int i = 0; i < batch_count; i++) {
 			pc_page_t *p = batch[i];
 
@@ -1266,10 +1749,24 @@ int pagecache_flush_all(void)
 			spin_unlock_irqrestore(&pc_dirty_lock, df);
 		}
 		vfs_sb_unlock_io(sb);
-
-	} while (batch_count == FLUSH_ALL_BATCH);
+	} while (0);
 
 #undef FLUSH_ALL_BATCH
+	return wrote;
+}
+
+int pagecache_flush_all(void)
+{
+	int wrote = 0;
+
+	might_sleep();
+	for (;;) {
+		int n = pagecache_flush_all_batch();
+
+		if (n <= 0)
+			break;
+		wrote += n;
+	}
 	return wrote;
 }
 
@@ -1337,7 +1834,17 @@ void pagecache_invalidate_file(unsigned long cluster_id)
 				dirty_list_remove(pg);
 				spin_unlock_irqrestore(&pc_dirty_lock, df);
 
-				pc_page_free(pg);
+				/* Free it only if nobody is using it.  A held
+				 * page is being copied into or out of right
+				 * now; releasing the frame here would hand it
+				 * to a new owner with that copy still in
+				 * flight.  It is already off every list, so
+				 * nothing can find it again -- the holder
+				 * frees it when it lets go. */
+				if (pg->flags & PC_PAGE_LOCKED)
+					pg->flags |= PC_PAGE_DEAD;
+				else
+					pc_page_free(pg);
 				__sync_fetch_and_sub(&pc_stat_total_pages, 1);
 
 				// Re-acquire bucket lock and restart scan (chain modified)
@@ -1385,7 +1892,17 @@ void pagecache_invalidate_range(unsigned long cluster_id,
 				dirty_list_remove(pg);
 				spin_unlock_irqrestore(&pc_dirty_lock, df);
 
-				pc_page_free(pg);
+				/* Free it only if nobody is using it.  A held
+				 * page is being copied into or out of right
+				 * now; releasing the frame here would hand it
+				 * to a new owner with that copy still in
+				 * flight.  It is already off every list, so
+				 * nothing can find it again -- the holder
+				 * frees it when it lets go. */
+				if (pg->flags & PC_PAGE_LOCKED)
+					pg->flags |= PC_PAGE_DEAD;
+				else
+					pc_page_free(pg);
 				__sync_fetch_and_sub(&pc_stat_total_pages, 1);
 
 				spin_lock_irqsave(&pc_hash[b].lock, &flags);
@@ -1426,7 +1943,12 @@ void pagecache_invalidate_all(void)
 			dirty_list_remove(pg);
 			spin_unlock_irqrestore(&pc_dirty_lock, df);
 
-			pc_page_free(pg);
+			/* Same rule as the other invalidations: a held page is
+			 * detached now and freed by whoever releases it. */
+			if (pg->flags & PC_PAGE_LOCKED)
+				pg->flags |= PC_PAGE_DEAD;
+			else
+				pc_page_free(pg);
 			__sync_fetch_and_sub(&pc_stat_total_pages, 1);
 
 			pg = next;
@@ -1507,6 +2029,66 @@ void pagecache_get_stats(pc_stats_t *stats)
 // ============================================================================
 // Timer callback
 // ============================================================================
+
+/*
+ * Keep the amount of written-but-not-yet-stored data bounded.
+ *
+ * A cached write returns without touching the device, which is the point of it
+ * -- but it also means a program can dirty pages faster than they are written
+ * back, and every dirty page is a page that cannot be reclaimed until it has
+ * been.  Left alone, a program writing steadily consumes all of memory: not as
+ * cache, which would be given back, but as data that MUST be kept.  What
+ * follows is allocation failures in whichever program asks next.
+ *
+ * So past a limit the writer is made to do the writing.  Charging it to the
+ * program producing the data is the point -- it is what makes a fast writer
+ * slow down instead of the machine running out.
+ *
+ * Callers must be able to block, and must not be holding a lock that writeback
+ * needs from the outside; the write path qualifies, holding the filesystem's
+ * I/O lock (which is recursive) for writing.
+ */
+int pagecache_balance_dirty(void)
+{
+	unsigned long dirty;
+	uint64_t flags;
+
+	if (!pc_initialized)
+		return 0;
+
+	spin_lock_irqsave(&pc_dirty_lock, &flags);
+	dirty = pc_dirty_pages;
+	spin_unlock_irqrestore(&pc_dirty_lock, flags);
+
+	if (dirty < PC_DIRTY_LIMIT_PAGES)
+		return 0;
+
+	/* Enough to make progress against the limit, not enough to become a
+	 * stall.  Whatever is still outstanding is the writeback thread's to
+	 * finish; the next write() that is still over the limit takes another
+	 * turn. */
+	might_sleep();
+	return pagecache_flush_bounded(PC_DIRTY_WRITEBACK_BATCH);
+}
+
+/*
+ * Do the periodic writeback the timer asked for, if it is due.
+ *
+ * Split from the timer (which cannot block) and from the cache lookups (which
+ * run holding filesystem locks, where taking the I/O lock exclusively would
+ * deadlock).  The caller must hold no filesystem lock -- a thread whose whole
+ * job is this, rather than one that happened to touch a file.
+ */
+int pagecache_writeback_if_due(void)
+{
+	if (!pc_initialized)
+		return 0;
+	if (!pc_writeback_pending)
+		return 0;
+	might_sleep();
+	pc_writeback_pending = 0;
+	return pagecache_flush_all();
+}
 
 void pagecache_timer_tick(uint64_t ticks)
 {

@@ -77,9 +77,10 @@ static uint16_t alloc_ephemeral_port(net_socket_t *s)
 	spin_lock_irqsave(&g_port_alloc_lock, &flags);
 	uint16_t port = 0;
 	for (int attempt = 0; attempt < 128; attempt++) {
-		uint16_t cand = (uint16_t)(49152 +
-					   (((uint32_t)(start - 49152) + attempt) %
-					    16384));
+		uint16_t cand =
+			(uint16_t)(49152 +
+				   (((uint32_t)(start - 49152) + attempt) %
+				    16384));
 		int in_use = 0;
 		for (int i = 0; i < NET_MAX_SOCKETS; i++) {
 			if (sockets[i].active && sockets[i].bound &&
@@ -462,7 +463,8 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 		int err = conn->error;
 		conn->owner_socket = NULL;
 		s->tcp = NULL;
-		tcp_close(conn); // drive teardown (we still hold the socket ref)
+		tcp_close(
+			conn); // drive teardown (we still hold the socket ref)
 		tcp_conn_release(conn); // drop the socket reference
 		return -err;
 	}
@@ -481,8 +483,9 @@ int sock_connect(int sockfd, const struct sockaddr_in *addr)
 		kprintf("tcp: connect %u.%u.%u.%u:%u completed without establishing to "
 			"it (state=%d rport=%u mine=%d) -> ECONNREFUSED\n",
 			(dst_ip >> 24) & 0xff, (dst_ip >> 16) & 0xff,
-			(dst_ip >> 8) & 0xff, dst_ip & 0xff, dst_port, conn->state,
-			conn->remote_port, conn->owner_socket == s);
+			(dst_ip >> 8) & 0xff, dst_ip & 0xff, dst_port,
+			conn->state, conn->remote_port,
+			conn->owner_socket == s);
 		if (conn->owner_socket == s) {
 			conn->owner_socket = NULL;
 			tcp_close(conn);
@@ -686,7 +689,8 @@ int sock_recvfrom(int sockfd, void *buf, size_t len, int flags,
 				if (__atomic_compare_exchange_n(
 					    &udp_cur->state, &expected,
 					    TASK_RUNNING, false,
-					    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+					    __ATOMIC_ACQ_REL,
+					    __ATOMIC_ACQUIRE)) {
 					udp_cur->wait_channel = NULL;
 					udp_cur->wakeup_tick = 0;
 					continue;
@@ -1378,8 +1382,9 @@ int sock_setsockopt(int sockfd, int level, int optname, const void *optval,
 			return 0;
 		case TCP_KEEPIDLE:
 			if (s->tcp && ival > 0)
-				s->tcp->keepidle_ticks = (uint32_t)timer_s_to_ticks(
-					(uint64_t)ival);
+				s->tcp->keepidle_ticks =
+					(uint32_t)timer_s_to_ticks(
+						(uint64_t)ival);
 			return 0;
 		case TCP_KEEPINTVL:
 			if (s->tcp && ival > 0)
@@ -1775,7 +1780,10 @@ int sock_accept4(int sockfd, struct sockaddr_in *addr, socklen_t *addrlen,
 		net_socket_t *ns = &sockets[newfd];
 		ns->nonblock = 1;
 	}
-	// SOCK_CLOEXEC is noted but not enforced (no exec in this OS context)
+	/* SOCK_CLOEXEC is a property of the DESCRIPTOR, not of the socket, so
+	 * it is applied by the syscall layer once the descriptor exists.  The
+	 * note that used to stand here -- that it needed no enforcing because
+	 * nothing execs -- has not been true for a long time. */
 	return newfd;
 }
 
@@ -2516,7 +2524,16 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 		return -EBADF;
 	uintptr_t in_marker = (uintptr_t)in_file;
 	// Reject sockets, pipes, console markers as input
-	if (IS_SOCKET_FD(in_file) || IS_EPOLL_FD(in_file))
+	//
+	// AF_UNIX belongs in this list and was missing from it.  Its marker is
+	// a small tagged integer that is neither an AF_INET socket, an epoll
+	// handle, a console stream nor a pipe end, so it passed every test
+	// here and fell through to the regular-file path -- where the value
+	// was handed to the filesystem layer as a vfs_file pointer and
+	// dereferenced.  A descriptor kind that is merely unrecognised must be
+	// refused, never assumed to be a file.
+	if (IS_SOCKET_FD(in_file) || IS_EPOLL_FD(in_file) ||
+	    unix_sock_is(in_file))
 		return -EINVAL;
 	if (in_marker <= 3) // console markers
 		return -EINVAL;
@@ -2545,6 +2562,11 @@ int sock_sendfile(int out_fd, int in_fd, int64_t *offset, size_t count)
 		out_sock_idx = SOCKET_FD_IDX(out_entry);
 	} else if (out_entry && pipe_is_end(out_entry)) {
 		out_is_pipe = 1;
+	} else if (out_entry && unix_sock_is(out_entry)) {
+		/* Refused explicitly, for the same reason as the input side:
+		 * the fall-through below treats everything it does not
+		 * recognise as a regular file. */
+		return -EINVAL;
 	} else if (out_marker == 2 || out_marker == 3 ||
 		   (!out_entry && (out_fd == 1 || out_fd == 2))) {
 		out_is_console = 1;

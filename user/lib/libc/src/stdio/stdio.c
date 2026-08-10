@@ -56,6 +56,71 @@ FILE *stdin = &__stdin;
 FILE *stdout = &__stdout;
 FILE *stderr = &__stderr;
 
+/* ------------------------------------------------------------------ */
+/* Every stream that is open                                           */
+/*                                                                     */
+/* fflush(NULL) is defined to flush all of them, and exit() has to do  */
+/* the same before the process goes -- otherwise anything a program    */
+/* wrote to a stream it did not fclose is simply lost, silently, which  */
+/* is the sort of thing that shows up much later as a truncated config */
+/* or half-written cache file.  Only stdout and stderr were being      */
+/* flushed.                                                            */
+/*                                                                     */
+/* Kept alongside the streams rather than as a link inside FILE: the   */
+/* structure is shared with everything already compiled against this   */
+/* library, and growing it would mean rebuilding all of it.            */
+/* ------------------------------------------------------------------ */
+static FILE **open_streams;
+static size_t open_streams_len;
+static size_t open_streams_cap;
+
+/* A spin lock, for the same reason the exit handlers use one: this runs
+ * before the threading machinery is up and after other threads may be gone. */
+static volatile int streams_lock;
+
+static void streams_lock_acquire(void)
+{
+	while (__atomic_exchange_n(&streams_lock, 1, __ATOMIC_ACQUIRE))
+		__builtin_ia32_pause();
+}
+
+static void streams_lock_release(void)
+{
+	__atomic_store_n(&streams_lock, 0, __ATOMIC_RELEASE);
+}
+
+/* Best effort: a stream that cannot be recorded still works, it just will not
+ * be flushed by fflush(NULL).  Failing the fopen instead would be worse. */
+static void stream_register(FILE *fp)
+{
+	streams_lock_acquire();
+	if (open_streams_len == open_streams_cap) {
+		size_t ncap = open_streams_cap ? open_streams_cap * 2 : 8;
+		FILE **n = realloc(open_streams, ncap * sizeof(*n));
+
+		if (!n) {
+			streams_lock_release();
+			return;
+		}
+		open_streams = n;
+		open_streams_cap = ncap;
+	}
+	open_streams[open_streams_len++] = fp;
+	streams_lock_release();
+}
+
+static void stream_unregister(FILE *fp)
+{
+	streams_lock_acquire();
+	for (size_t i = 0; i < open_streams_len; i++) {
+		if (open_streams[i] == fp) {
+			open_streams[i] = open_streams[--open_streams_len];
+			break;
+		}
+	}
+	streams_lock_release();
+}
+
 FILE *fopen(const char *pathname, const char *mode)
 {
 	if (!pathname || !mode) {
@@ -111,6 +176,7 @@ FILE *fopen(const char *pathname, const char *mode)
 	fp->wc_count = 0;
 	fp->wc_value = 0;
 
+	stream_register(fp);
 	return fp;
 }
 
@@ -121,6 +187,7 @@ int fclose(FILE *stream)
 	}
 
 	fflush(stream);
+	stream_unregister(stream);
 	int result = close(stream->fd);
 	if (stream != stdin && stream != stdout && stream != stderr) {
 		free(stream->buffer);
@@ -462,6 +529,8 @@ FILE *fdopen(int fd, const char *mode)
 	fp->wide_mode = 0;
 	fp->wc_count = 0;
 	fp->wc_value = 0;
+
+	stream_register(fp);
 	return fp;
 }
 
@@ -527,9 +596,29 @@ int puts(const char *s)
 int fflush(FILE *stream)
 {
 	if (!stream) {
-		/* Flush all open streams — at minimum stdout */
-		__flush_wbuf(stdout);
-		return 0;
+		/* Every open stream, as the standard says -- not just stdout.
+		 * Anything a program wrote and did not fclose used to be
+		 * discarded here without a word. */
+		int ret = 0;
+
+		if (__flush_wbuf(stdout) == EOF)
+			ret = EOF;
+		if (__flush_wbuf(stderr) == EOF)
+			ret = EOF;
+
+		streams_lock_acquire();
+		for (size_t i = 0; i < open_streams_len; i++) {
+			FILE *fp = open_streams[i];
+
+			/* The lock is held across the writes.  Registration and
+			 * removal only touch the array, so this cannot deadlock
+			 * against them -- and dropping it to walk a list another
+			 * thread may be reshuffling would be worse. */
+			if (fp && __flush_wbuf(fp) == EOF)
+				ret = EOF;
+		}
+		streams_lock_release();
+		return ret;
 	}
 	return __flush_wbuf(stream);
 }

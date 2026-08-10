@@ -6,6 +6,7 @@
 
 #include <kernel/uapi/types.h>
 #include <kernel/ke/sched.h> // spinlock_t
+#include <kernel/uapi/bug.h> // refcount_t
 
 // ============================================================================
 // Network Configuration
@@ -1032,7 +1033,8 @@ void net_timer_tick(void);
 // ============================================================================
 #define SOCKET_FD_BASE 0x10000UL
 #define EPOLL_FD_BASE 0x20000UL
-#define UNIX_SOCKET_FD_BASE 0x30000UL
+/* 0x30000 was the UNIX socket marker range.  Retired: a UNIX socket
+ * descriptor now holds the socket itself.  Do not reuse this range. */
 /* Epoll instances are SYSTEM-WIDE, not per process, so this ceiling is shared
  * by every program running at once -- and running out is not a soft failure.
  * GLib probes whether a descriptor is pollable by creating a throwaway epoll
@@ -1073,12 +1075,10 @@ void net_timer_tick(void);
 #define MAKE_EPOLL_FD(idx) \
 	((struct vfs_file *)(EPOLL_FD_BASE + (unsigned)(idx)))
 
-#define IS_UNIX_SOCKET_FD(ptr)                      \
-	((uintptr_t)(ptr) >= UNIX_SOCKET_FD_BASE && \
-	 (uintptr_t)(ptr) < UNIX_SOCKET_FD_BASE + MAX_UNIX_SOCKETS)
-#define UNIX_SOCKET_FD_IDX(ptr) ((int)((uintptr_t)(ptr) - UNIX_SOCKET_FD_BASE))
-#define MAKE_UNIX_SOCKET_FD(idx) \
-	((struct vfs_file *)(UNIX_SOCKET_FD_BASE + (unsigned)(idx)))
+/* A UNIX socket descriptor holds the socket ITSELF, not an index into a
+ * table.  0x30000 is retired and must not be reused as a marker range.
+ * Identify one with unix_sock_is(); see its definition for why that is safe
+ * to call on any descriptor-table value. */
 
 // ============================================================================
 // Scatter/Gather I/O (sendmsg/recvmsg)
@@ -1379,6 +1379,18 @@ struct sockaddr_un {
 
 // UNIX domain socket (kernel internal)
 typedef struct unix_socket {
+	/* MUST stay first.  A descriptor table entry is one of several kinds
+	 * of thing -- a small tagged integer, a pipe end, a file, a socket --
+	 * and telling them apart means reading a known value out of the
+	 * candidate.  pipe_end_t keeps its own magic at offset 0 for the same
+	 * reason, so the two predicates read the same place and cannot mistake
+	 * each other's objects.  Cleared before the memory is released, so a
+	 * stale pointer fails identification rather than passing it. */
+	uint64_t magic;
+	/* A small stable number to report to userspace -- st_ino, /proc/self/fd
+	 * -- in place of the address.  The address is a kernel pointer now and
+	 * must never be handed out. */
+	uint64_t id;
 	int active;
 	int type; // SOCK_STREAM or SOCK_DGRAM
 	int bound;
@@ -1443,6 +1455,13 @@ typedef struct unix_socket {
 	int tail;
 	volatile int ready; // Data available
 	volatile int peer_closed; // Peer has closed
+	/* shutdown(SHUT_RD) was applied to THIS end: reads return end of file.
+	 *
+	 * Deliberately not peer_closed, which means "the far end hung up" and
+	 * is what poll() reports a hangup from.  Setting that on ourselves made
+	 * a socket report POLLHUP to its own owner for ever, on a connection
+	 * the peer was still using quite happily. */
+	volatile int shut_rd;
 
 	// Accept queue (for listening sockets)
 	struct unix_socket *accept_queue[16];
@@ -1471,45 +1490,72 @@ typedef struct unix_socket {
 	spinlock_t lock;
 	/* DESCRIPTORS referring to this socket: one at creation, one more per
 	 * dup() and per fork() that inherits the table, one fewer per close().
-	 * The socket is live while this is above zero -- closing one of several
-	 * descriptors must not disturb the others, and must not tell the peer
-	 * anything. */
+	 * The socket is CONNECTED while this is above zero -- closing one of
+	 * several descriptors must not disturb the others, and must not tell
+	 * the peer anything.  Reaching zero is the hangup, and nothing else. */
 	int ref_count;
-	/* Senders currently inside unix_send() writing into this socket's ring.
-	 * Deliberately NOT ref_count: a sender must delay the RELEASE of the
-	 * ring it is writing into, but it must not delay the hangup, and a
-	 * descriptor must delay both.  Conflating the two makes one of the two
-	 * wrong whichever way the single counter is read. */
-	volatile int send_active;
-	/* The last descriptor is gone and the socket is marked closed, but a
-	 * sender was still inside it, so the ring and the slot could not be
-	 * released.  The last sender out finishes the job (unix_put_sender()). */
-	volatile int close_pending;
+	/* MEMORY lifetime, which is a different question from the hangup.
+	 *
+	 * The slot stays claimed while this is above zero, so a pointer to this
+	 * socket cannot quietly become a pointer to a DIFFERENT one.  That was
+	 * the whole difficulty: sockets live in a fixed array, so a stale
+	 * pointer never faults -- it silently reads whichever socket now
+	 * occupies the slot, and the damage surfaces somewhere else entirely,
+	 * as a connection that reports a hangup it was never told about.
+	 *
+	 * Everything that can outlive the descriptors holds one: the peer link,
+	 * each entry queued on a listener, and every operation in flight.  The
+	 * socket is destroyed exactly once, when the last of them lets go.
+	 *
+	 * This replaces two ad-hoc counters (senders in flight, and a flag
+	 * saying the release had been left to them).  They were an attempt to
+	 * answer this question for one caller at a time; a reference count
+	 * answers it for all of them. */
+	refcount_t refcount;
 } unix_socket_t;
 
 // UNIX domain socket API
-int unix_create(int type);
-int unix_bind(int usockfd, const struct sockaddr_un *addr, socklen_t addrlen);
+int unix_create(int type, unix_socket_t **out);
+int unix_bind(unix_socket_t *us, const struct sockaddr_un *addr,
+	      socklen_t addrlen);
 /* Fill in this socket's name (peer == 0) or its peer's (peer == 1).
  * *addrlen is in/out: buffer size in, required size out. */
-int unix_getname(int usockfd, int peer, struct sockaddr_un *addr,
+int unix_getname(unix_socket_t *us, int peer, struct sockaddr_un *addr,
 		 socklen_t *addrlen);
-int unix_listen(int usockfd, int backlog);
-int unix_accept(int usockfd, struct sockaddr_un *addr, socklen_t *addrlen);
-int unix_connect(int usockfd, const struct sockaddr_un *addr,
+int unix_listen(unix_socket_t *us, int backlog);
+int unix_accept(unix_socket_t *us, struct sockaddr_un *addr,
+		socklen_t *addrlen, unix_socket_t **out);
+int unix_connect(unix_socket_t *us, const struct sockaddr_un *addr,
 		 socklen_t addrlen);
-int unix_send(int usockfd, const void *buf, size_t len, int flags);
-int unix_recv(int usockfd, void *buf, size_t len, int flags);
-int unix_close(int usockfd);
-int unix_socketpair(int type, int sv[2]);
-int unix_shutdown(int usockfd, int how);
-unix_socket_t *unix_get(int usockfd);
-int unix_poll(int usockfd, short events);
+int unix_send(unix_socket_t *us, const void *buf, size_t len, int flags);
+int unix_recv(unix_socket_t *us, void *buf, size_t len, int flags);
+int unix_close(unix_socket_t *us);
+int unix_socketpair(int type, unix_socket_t *sv[2]);
+int unix_shutdown(unix_socket_t *us, int how);
+
+int unix_poll(unix_socket_t *us, short events);
+/* Take one more DESCRIPTOR reference on an already-referenced socket: what
+ * dup() and every fork() inheriting the table owe it.  Both counters move
+ * together, under the socket's lock, so a close running at the same moment
+ * cannot see one without the other. */
+void unix_sock_fdget(unix_socket_t *us);
+/* Resolve a descriptor marker to its socket, taking a reference that keeps it
+ * alive for as long as the caller holds it.  Release with unix_sock_put_ref().
+ * Returns NULL if the marker names no live socket. */
+unix_socket_t *unix_sock_lookup_hold(unix_socket_t *us);
+/* Is this descriptor-table value a UNIX socket?  Safe on any value: numeric
+ * markers are rejected before anything is dereferenced. */
+bool unix_sock_is(const void *p);
+void unix_sock_put_ref(unix_socket_t *us);
 /* SCM_RIGHTS file-descriptor passing helpers.  push() enqueues an
  * fd_table entry (already ref-counted by caller) onto the receiver's
  * queue; pop() removes the head entry.  Both return 0 on success or a
  * negative errno (EAGAIN if queue full / empty). */
 int unix_push_fd(unix_socket_t *sock, void *entry);
+/* Queue an in-band descriptor for `us`'s PEER, finding and pinning that peer
+ * inside the socket layer.  Callers must not resolve the peer themselves: a
+ * peer pointer read once and used later can name a different socket. */
+int unix_send_fd(unix_socket_t *us, void *entry);
 int unix_pop_fd(unix_socket_t *sock, void **out_entry);
 /* Peek the byte offset associated with the head of the pending-fd queue,
  * if any.  Returns 0 on success and stores the absolute byte offset (in

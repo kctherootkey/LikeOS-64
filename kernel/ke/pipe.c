@@ -14,12 +14,15 @@ bool pipe_is_end(const void *ptr)
 	 * encoded as small integers too, and reading ->magic out of one of
 	 * those faults the kernel.  Callers are expected to classify markers
 	 * first, but this predicate is invoked from many fd paths, so it must
-	 * be safe on any fd-table value.  A real pipe_end_t comes from kalloc
-	 * and therefore lives far above this bound. */
+	 * be safe on any fd-table value.
+	 *
+	 * The bound this used to apply by hand accepted only the higher-half
+	 * kernel range, which held for a pipe end because it is 24 bytes and
+	 * so always comes from the slab.  kptr_plausible() accepts the direct
+	 * map as well, so the test does not depend on the size of the object
+	 * being asked about -- see its comment. */
 	uintptr_t v = (uintptr_t)ptr;
-	if (v < 0x100000)
-		return false;
-	if (v < 0xffffffff80000000ULL && v > 0x00007fffffffffffULL)
+	if (!kptr_plausible((uint64_t)v))
 		return false;
 	const pipe_end_t *end = (const pipe_end_t *)ptr;
 	return end->magic == PIPE_MAGIC;

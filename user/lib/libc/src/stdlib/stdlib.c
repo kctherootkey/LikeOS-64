@@ -62,6 +62,7 @@ static void env_sync(void)
 void __libc_run_fini_array(void);
 void __cxa_finalize(void *dso);
 
+
 void exit(int status)
 {
 	/* NULL means every handler regardless of which object registered it:
@@ -71,8 +72,9 @@ void exit(int status)
 	/* Destructors run after atexit handlers and before the streams are
 	 * flushed, so anything a destructor prints still reaches the output. */
 	__libc_run_fini_array();
-	fflush(stdout);
-	fflush(stderr);
+	/* Every open stream, not only the standard two.  Anything a program
+	 * wrote to a file it did not fclose was being thrown away here. */
+	fflush(NULL);
 	_exit(status);
 }
 

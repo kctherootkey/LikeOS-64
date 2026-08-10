@@ -488,6 +488,9 @@ static int ext4_write_block_direct(ext4_fs_t *fs, unsigned long pbn,
 static void ext4_txn_flush(ext4_fs_t *fs); /* defined with the journal code */
 static void
 ext4_journal_clean(ext4_fs_t *fs); /* mark journal empty on sync     */
+/* Record that this transaction wrote data into `ino`, so the commit stores
+ * that data before the metadata describing it.  Defined with the journal. */
+static void ext4_ordered_add(unsigned long ino);
 static int ext4_wb_flush(ext4_fs_t *fs); /* flush the data write-back buffer */
 /* Record a metadata-corruption error + apply the errors=
  * policy (remount-ro latch / panic / continue).  Defined after ext4_write_super. */
@@ -1466,6 +1469,146 @@ static unsigned long ext4_inode_table_block(ext4_fs_t *fs,
 
 /* Read raw on-disk inode `ino` into `out`.  Also returns, when requested, the
  * physical block + byte offset of the inode (for O(1) writeback later). */
+/* ---- Deferred inode updates ---------------------------------------------
+ *
+ * A write() changes two things about an inode that nothing else does: its
+ * size and its timestamps.  Storing them is a read-modify-write of a
+ * 4KB inode-table block through the journal, and it used to happen on every
+ * single write() call -- so a program writing a file in 700-byte pieces paid
+ * for one per piece, over and over, against the same block.
+ *
+ * The conventional answer is to keep the change in memory and store it later,
+ * in one go.  What makes that safe is not the deferral itself but the rule
+ * that comes with it: while an update is pending, the in-core copy -- not the
+ * device -- is what every reader gets.  Without that, open() reads the size
+ * off the device and a file closed and reopened reports the length it had at
+ * whichever write last happened to store it, with reads stopping there.
+ *
+ * That rule is enforced in one place.  Both routes to an inode
+ * (ext4_read_inode_loc, and ext4_get_inode_cached in front of it) apply the
+ * pending change to what they hand back, so there is no such thing as a
+ * reader that sees the stale value -- stat, open, the writeback path and
+ * every future caller included.
+ *
+ * Only size and timestamps are ever deferred.  A write that ALLOCATES stores
+ * the inode immediately, because the block map lives in the inode too, and a
+ * deferred copy of that would leave the filesystem not knowing it owns the
+ * blocks the data went into.
+ *
+ * Fixed size, and deliberately so: no allocation, therefore usable from
+ * anywhere, and a program writing to more files at once than this holds does
+ * not fail -- it falls back to storing immediately, which is what the driver
+ * did for all of them before.
+ */
+#define EXT4_DI_MAX 64
+static struct {
+	unsigned long ino; /* 0 = empty */
+	uint64_t size;
+	uint32_t mtime;
+	uint32_t ctime;
+} s_di[EXT4_DI_MAX];
+static unsigned s_di_n;
+/* A leaf lock: nothing is taken under it and nothing under it sleeps, so it is
+ * safe from any context that can reach an inode read.  Guarding the table this
+ * way rather than relying on the metadata lock means a reader that reaches an
+ * inode by some path not yet audited still sees the pending value. */
+static spinlock_t s_di_lock = SPINLOCK_INIT("ext4_di");
+
+/* Record a pending size/time update.  Returns 0 if there was no room, in which
+ * case the caller must store the inode itself. */
+static int ext4_di_record(unsigned long ino, uint64_t size, uint32_t mtime,
+			  uint32_t ctime)
+{
+	uint64_t flags;
+	int done = 0;
+
+	if (ino == 0)
+		return 0;
+	spin_lock_irqsave(&s_di_lock, &flags);
+	for (unsigned i = 0; i < s_di_n; i++) {
+		if (s_di[i].ino == ino) {
+			s_di[i].size = size;
+			s_di[i].mtime = mtime;
+			s_di[i].ctime = ctime;
+			done = 1;
+			break;
+		}
+	}
+	if (!done && s_di_n < EXT4_DI_MAX) {
+		s_di[s_di_n].ino = ino;
+		s_di[s_di_n].size = size;
+		s_di[s_di_n].mtime = mtime;
+		s_di[s_di_n].ctime = ctime;
+		s_di_n++;
+		done = 1;
+	}
+	spin_unlock_irqrestore(&s_di_lock, flags);
+	return done;
+}
+
+/* Forget the pending update for `ino`: it has just been stored, or the inode
+ * it described no longer exists. */
+static void ext4_di_clear(unsigned long ino)
+{
+	uint64_t flags;
+
+	if (ino == 0)
+		return;
+	spin_lock_irqsave(&s_di_lock, &flags);
+	for (unsigned i = 0; i < s_di_n; i++) {
+		if (s_di[i].ino == ino) {
+			s_di[i] = s_di[s_di_n - 1];
+			s_di[s_di_n - 1].ino = 0;
+			s_di_n--;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&s_di_lock, flags);
+}
+
+/* Is there an update pending for this inode? */
+static int ext4_di_pending(unsigned long ino)
+{
+	uint64_t flags;
+	int found = 0;
+
+	if (ino == 0)
+		return 0;
+	spin_lock_irqsave(&s_di_lock, &flags);
+	for (unsigned i = 0; i < s_di_n; i++)
+		if (s_di[i].ino == ino) {
+			found = 1;
+			break;
+		}
+	spin_unlock_irqrestore(&s_di_lock, flags);
+	return found;
+}
+
+/* Overlay the pending update onto a freshly-read inode.
+ *
+ * Idempotent, so applying it twice on the way through the parsed-inode cache
+ * costs nothing and cannot get it wrong.
+ */
+static void ext4_di_apply(unsigned long ino, ext4_inode *in)
+{
+	uint64_t flags;
+
+	if (!in || ino == 0)
+		return;
+	spin_lock_irqsave(&s_di_lock, &flags);
+	for (unsigned i = 0; i < s_di_n; i++) {
+		if (s_di[i].ino != ino)
+			continue;
+		in->i_size_lo = (uint32_t)s_di[i].size;
+		if ((in->i_mode & S_IFMT) == S_IFREG)
+			in->i_size_high = (uint32_t)(s_di[i].size >> 32);
+		in->i_mtime = s_di[i].mtime;
+		in->i_ctime = s_di[i].ctime;
+		break;
+	}
+	spin_unlock_irqrestore(&s_di_lock, flags);
+}
+
 static int ext4_read_inode_loc(ext4_fs_t *fs, unsigned long ino,
 			       ext4_inode *out, unsigned long *out_block,
 			       unsigned *out_off)
@@ -1534,6 +1677,13 @@ static int ext4_read_inode_loc(ext4_fs_t *fs, unsigned long ino,
 	mm_memcpy(out, buf + off, copy);
 	ext4_bput(buf);
 
+	/* What is on the device is not necessarily what the file is.  If a
+	 * write has changed the size or the timestamps and that change has not
+	 * been stored yet, this is where it is put back -- every reader of an
+	 * inode arrives here or at the cache in front of it, so there is no
+	 * route by which the stale value escapes. */
+	ext4_di_apply(ino, out);
+
 	if (out_block)
 		*out_block = blk;
 	if (out_off)
@@ -1581,6 +1731,13 @@ static int ext4_get_inode_cached(ext4_fs_t *fs, unsigned long ino,
 		if (s_ic[i].ino == ino) {
 			mm_memcpy(out, &s_ic[i].inode, sizeof(*out));
 			spin_unlock_irqrestore(&s_ic_lock, flags);
+			/* The same rule as on the device path below: a pending
+			 * size or timestamp is what the file actually has.
+			 * This copy is normally already current -- the write
+			 * path updates it in place -- but it is also whatever
+			 * some earlier reader left here, so it is overlaid
+			 * rather than trusted.  Doing it twice is harmless. */
+			ext4_di_apply(ino, out);
 			return 1;
 		}
 	spin_unlock_irqrestore(&s_ic_lock, flags);
@@ -1593,6 +1750,42 @@ static int ext4_get_inode_cached(ext4_fs_t *fs, unsigned long ino,
 	s_ic[slot].ino = ino;
 	spin_unlock_irqrestore(&s_ic_lock, flags);
 	return 1;
+}
+
+/*
+ * Replace the cached copy of one inode with a newer one.
+ *
+ * The alternative, and what the write path used to do, is to empty the whole
+ * cache whenever any inode changes.  That is correct but throws away seven
+ * other inodes to update one, and the very next thing a write does is map a
+ * block through the inode it just changed -- so the entry it needs is read back
+ * off the device, once per write() call.
+ *
+ * Updating in place keeps the map lookups that follow a write in memory, and
+ * leaves the other entries alone.  Inserts if the inode was not cached: the
+ * caller has the freshest copy there is, so it is worth keeping.
+ */
+static void ext4_inode_cache_update(unsigned long ino, const ext4_inode *in)
+{
+	uint64_t flags;
+
+	if (ino == 0 || !in)
+		return;
+	spin_lock_irqsave(&s_ic_lock, &flags);
+	for (int i = 0; i < EXT4_IC_ENTRIES; i++) {
+		if (s_ic[i].ino == ino) {
+			mm_memcpy(&s_ic[i].inode, in, sizeof(s_ic[i].inode));
+			spin_unlock_irqrestore(&s_ic_lock, flags);
+			return;
+		}
+	}
+	{
+		unsigned slot = s_ic_next++ % EXT4_IC_ENTRIES;
+
+		mm_memcpy(&s_ic[slot].inode, in, sizeof(s_ic[slot].inode));
+		s_ic[slot].ino = ino;
+	}
+	spin_unlock_irqrestore(&s_ic_lock, flags);
 }
 
 static inline void ext4_inode_cache_drop(unsigned long ino)
@@ -1910,9 +2103,21 @@ static int ext4_sb_write_inode(vfs_superblock_t *sb, ic_inode_t *inode)
 				       (uint32_t)inode->size < in.i_size_lo,
 			       "ext4: dir ino %lu i_size reverting %u -> %u (stale inode-block RMW / corruption)",
 			       ino, in.i_size_lo, (uint32_t)inode->size);
-		in.i_size_lo = (uint32_t)inode->size;
-		if ((in.i_mode & S_IFMT) == S_IFREG)
-			in.i_size_high = (uint32_t)(inode->size >> 32);
+		/* Take the size from the generic cache only when the write path
+		 * has nothing pending for this inode.
+		 *
+		 * When it does, the read above has already put that size in,
+		 * and it is the better of the two: it is written by the code
+		 * that computed the length, while this one is a copy kept per
+		 * open handle, which two handles on the same file can move
+		 * backwards between them.  Preferring it here would persist
+		 * the shorter length AND discard the pending record in the
+		 * same step, so the difference would not be recoverable. */
+		if (!ext4_di_pending(ino)) {
+			in.i_size_lo = (uint32_t)inode->size;
+			if ((in.i_mode & S_IFMT) == S_IFREG)
+				in.i_size_high = (uint32_t)(inode->size >> 32);
+		}
 		ext4_inode_cache_flush();
 		ext4_write_inode_struct(fs, ino, &in);
 		rc = 0;
@@ -1947,13 +2152,160 @@ static void ext4_sb_attach(ext4_fs_t *fs)
  * Directory traversal + path resolution
  * =================================================================== */
 
-/* Look up `name` (length name_len) in directory inode `dir_ino`.
- * On success returns ST_OK and sets *out_ino (and *out_ftype if non-NULL). */
-static int ext4_dir_lookup(ext4_fs_t *fs, unsigned long dir_ino,
-			   const char *name, unsigned name_len,
-			   unsigned long *out_ino, unsigned *out_ftype)
+/* ---- Dentry cache -------------------------------------------------------
+ *
+ * Every path resolution used to read the directory off the device, component
+ * by component, on every open, stat, access and unlink.  A program that opens
+ * a few thousand files pays for a few thousand directory scans, and a $PATH
+ * search pays for one per directory that does NOT hold the program.
+ *
+ * So the answers are remembered: name -> inode, keyed by the directory the
+ * name is in.  Failures are remembered too -- a negative entry -- which is
+ * what makes the $PATH case cheap, because "not here" is the answer that
+ * dominates it.
+ *
+ * Two properties of this cache are worth stating rather than leaving to be
+ * rediscovered:
+ *
+ *  - It is maintained, not invalidated.  A create adds the entry it just
+ *    made, a delete removes exactly the one it removed.  Both happen in
+ *    ext4_dir_add and ext4_dir_del, which is where EVERY directory mutation
+ *    in this driver goes through -- create, unlink, mkdir, rmdir, rename,
+ *    symlink and link all reach the device that way, so none of them can be
+ *    forgotten here by being added later.
+ *
+ *  - Nothing needs a lock of its own.  Lookups run under the metadata lock
+ *    SHARED and mutations under it EXCLUSIVE, so a mutation cannot interleave
+ *    with a lookup; the cache's internal locking then handles two concurrent
+ *    lookups.  Entries are made only AFTER the device operation has
+ *    succeeded, so a failed mutation leaves nothing behind.
+ *
+ * The key is the inode number in the same encoded form the page and inode
+ * caches use.  Encoding it keeps ext4's keys out of the range FAT32's cluster
+ * numbers occupy: the caches are shared, and two filesystems must not be able
+ * to name the same entry.
+ */
+#define EXT4_DC_PARENT(ino) EXT4_BID_ENC((ino), 0)
+
+/* Longest name an ext4 directory entry can hold (name_len is one byte). */
+#define EXT4_NAME_LEN 255
+
+/* The lookup interface takes a NUL-terminated name; this driver passes names
+ * as a pointer plus a length, which is not always the same thing.  Copying is
+ * a few dozen bytes against the directory scan it avoids. */
+static int ext4_dc_name(const char *name, unsigned name_len, char *out,
+			unsigned cap)
+{
+	if (name_len == 0 || name_len >= cap)
+		return 0;
+	mm_memcpy(out, name, name_len);
+	out[name_len] = '\0';
+	return 1;
+}
+
+/* Consult the cache.  Returns ST_OK (with *out_ino / *out_ftype filled in),
+ * ST_NOT_FOUND for a remembered failure, or ST_UNSUPPORTED for "not cached,
+ * ask the device" -- a value no directory lookup produces, so a caller cannot
+ * confuse it with a real answer. */
+static int ext4_dc_lookup(unsigned long dir_ino, const char *name,
+			  unsigned name_len, unsigned long *out_ino,
+			  unsigned *out_ftype)
+{
+	char nm[EXT4_NAME_LEN + 1];
+	dc_result_t res;
+
+	if (!ext4_dc_name(name, name_len, nm, sizeof(nm)))
+		return ST_UNSUPPORTED;
+
+	switch (dcache_lookup_cs(EXT4_DC_PARENT(dir_ino), nm, &res)) {
+	case DC_LOOKUP_FOUND:
+		if (out_ino)
+			*out_ino = res.ino;
+		if (out_ftype)
+			*out_ftype = res.attr;
+		return ST_OK;
+	case DC_LOOKUP_NEGATIVE:
+		return ST_NOT_FOUND;
+	default:
+		return ST_UNSUPPORTED;
+	}
+}
+
+static void ext4_dc_add(unsigned long dir_ino, const char *name,
+			unsigned name_len, unsigned long child_ino,
+			unsigned ftype)
+{
+	char nm[EXT4_NAME_LEN + 1];
+
+	if (child_ino == 0)
+		return;
+	if (!ext4_dc_name(name, name_len, nm, sizeof(nm)))
+		return;
+	/* The file type is stored as ext4 records it in the directory entry.
+	 * The cache's own directory hint (bit 0x10) is left unset: nothing
+	 * here reads it, because ext4 takes what it needs from the inode.
+	 *
+	 * The size is deliberately NOT stored, hence the zero.  ext4 keeps a
+	 * file's size in its inode and nowhere else, so caching a copy of it
+	 * against a NAME would mean every write had to find and update that
+	 * copy -- and a missed update is a file that stats short and reads
+	 * truncated.  A name resolves to an inode here; the inode answers for
+	 * everything else. */
+	dcache_insert_cs(EXT4_DC_PARENT(dir_ino), nm, child_ino, 0, ftype);
+}
+
+static void ext4_dc_add_negative(unsigned long dir_ino, const char *name,
+				 unsigned name_len)
+{
+	char nm[EXT4_NAME_LEN + 1];
+
+	if (!ext4_dc_name(name, name_len, nm, sizeof(nm)))
+		return;
+	dcache_insert_negative_cs(EXT4_DC_PARENT(dir_ino), nm);
+}
+
+static void ext4_dc_del(unsigned long dir_ino, const char *name,
+			unsigned name_len)
+{
+	char nm[EXT4_NAME_LEN + 1];
+
+	if (!ext4_dc_name(name, name_len, nm, sizeof(nm)))
+		return;
+	/* Removed rather than turned into a negative entry.  Both are correct,
+	 * and removing is the one that stays correct if a future caller ever
+	 * puts the name back without going through ext4_dir_add. */
+	dcache_invalidate_cs(EXT4_DC_PARENT(dir_ino), nm);
+}
+
+/* Forget everything cached under `ino` as a directory.
+ *
+ * Needed at the two points where an inode number stops meaning what it meant:
+ * when a directory is removed, and when a number is handed out again. */
+static void ext4_dc_drop_dir(unsigned long ino)
+{
+	if (ino == 0)
+		return;
+	dcache_invalidate_dir(EXT4_DC_PARENT(ino));
+}
+
+/* Look up `name` (length name_len) in directory inode `dir_ino`, on the device.
+ * On success returns ST_OK and sets *out_ino (and *out_ftype if non-NULL).
+ *
+ * *out_complete says whether every block of the directory was actually read.
+ * A "not found" from a scan that skipped a block it could not read is not the
+ * same statement as a "not found" from a scan that read all of them: the first
+ * may be a transient device error, and remembering it would make that error
+ * permanent for as long as the entry survives. */
+static int ext4_dir_lookup_disk(ext4_fs_t *fs, unsigned long dir_ino,
+				const char *name, unsigned name_len,
+				unsigned long *out_ino, unsigned *out_ftype,
+				int *out_complete)
 {
 	ext4_inode din;
+	int complete = 1;
+
+	if (out_complete)
+		*out_complete = 0;
 	if (!ext4_get_inode_cached(fs, dir_ino, &din) ||
 	    (din.i_mode & S_IFMT) != S_IFDIR)
 		return ST_NOT_FOUND;
@@ -1968,9 +2320,11 @@ static int ext4_dir_lookup(ext4_fs_t *fs, unsigned long dir_ino,
 	for (unsigned long b = 0; b < nblocks; b++) {
 		unsigned long pbn = ext4_block_map(fs, dir_ino, b);
 		if (pbn == 0)
-			continue; /* sparse dir block (rare) */
-		if (ext4_read_block(fs, pbn, blk) != ST_OK)
+			continue; /* sparse dir block (rare): genuinely empty */
+		if (ext4_read_block(fs, pbn, blk) != ST_OK) {
+			complete = 0;
 			continue;
+		}
 		if (!ext4_mbc_verified(pbn)) {
 			if (!ext4_dir_csum_ok(fs, dir_ino, gen, blk)) {
 				ext4_bput(blk);
@@ -1988,6 +2342,7 @@ static int ext4_dir_lookup(ext4_fs_t *fs, unsigned long dir_ino,
 			if (rec < 8 || off + rec > fs->block_size) {
 				WARN_ON_ONCE(
 					1); /* bad dir rec_len — stop scanning this block */
+				complete = 0;
 				break;
 			}
 			if (de->inode != 0 && de->name_len == name_len &&
@@ -1996,13 +2351,65 @@ static int ext4_dir_lookup(ext4_fs_t *fs, unsigned long dir_ino,
 				if (out_ftype)
 					*out_ftype = de->file_type;
 				ext4_bput(blk);
+				if (out_complete)
+					*out_complete = 1;
 				return ST_OK;
 			}
 			off += rec;
 		}
 	}
 	ext4_bput(blk);
+	if (out_complete)
+		*out_complete = complete;
 	return ST_NOT_FOUND;
+}
+
+/*
+ * Look up `name` in directory `dir_ino`, through the dentry cache.
+ *
+ * A hit answers without touching the device at all.  A miss does the scan
+ * above and then records what it found, so the next caller does not repeat it.
+ *
+ * "." is not cached: path resolution never asks for it (it means the directory
+ * that was already reached), so an entry for it would only take up room.
+ */
+static int ext4_dir_lookup(ext4_fs_t *fs, unsigned long dir_ino,
+			   const char *name, unsigned name_len,
+			   unsigned long *out_ino, unsigned *out_ftype)
+{
+	unsigned long ino = 0;
+	unsigned ftype = 0;
+	int complete = 0;
+	int r;
+
+	if (!out_ino)
+		return ST_INVALID;
+
+	r = ext4_dc_lookup(dir_ino, name, name_len, &ino, &ftype);
+	if (r != ST_UNSUPPORTED) {
+		if (r == ST_OK) {
+			*out_ino = ino;
+			if (out_ftype)
+				*out_ftype = ftype;
+		}
+		return r;
+	}
+
+	r = ext4_dir_lookup_disk(fs, dir_ino, name, name_len, &ino, &ftype,
+				 &complete);
+	if (r == ST_OK) {
+		*out_ino = ino;
+		if (out_ftype)
+			*out_ftype = ftype;
+		ext4_dc_add(dir_ino, name, name_len, ino, ftype);
+	} else if (r == ST_NOT_FOUND && complete) {
+		/* Remembered only when the whole directory was read.  This is
+		 * the entry that makes searching a $PATH cheap: most of the
+		 * directories on it do not hold the program, and without it
+		 * each of them is rescanned on every command. */
+		ext4_dc_add_negative(dir_ino, name, name_len);
+	}
+	return r;
 }
 
 /* Read a symlink's target into buf (NUL-terminated).  Fast symlinks (<60B,
@@ -2224,6 +2631,8 @@ static int ext4_open_impl(const char *path, int flags, unsigned cmode,
 		in.i_size_high = 0;
 		in.i_mtime = in.i_ctime = (uint32_t)timer_get_epoch();
 		ext4_inode_cache_flush();
+		/* Superseded by the truncation -- see ext4_truncate_impl. */
+		ext4_di_clear(ino);
 		ext4_write_inode_struct(fs, ino, &in);
 		pagecache_invalidate_file(EXT4_BID_ENC(ino, 0));
 		icache_chain_invalidate(EXT4_BID_ENC(ino, 0));
@@ -2957,12 +3366,18 @@ static int ext4_write_inode_struct(ext4_fs_t *fs, unsigned long ino,
 	unsigned long byte = (unsigned long)index * fs->inode_size;
 	unsigned long blk = itbl + byte / fs->block_size;
 	unsigned off = byte % fs->block_size;
-	uint8_t *buf = (uint8_t *)kalloc(fs->block_size);
+	/* From the block pool, not kalloc: at a 4KB block size kalloc takes the
+	 * allocator's large path -- a mapping set up and torn down, the
+	 * teardown shooting down the other processors' TLBs -- and this runs on
+	 * every metadata update the driver makes.  The pool hands back a buffer
+	 * that already exists, and degrades to kalloc only if all of them are
+	 * in use. */
+	uint8_t *buf = (uint8_t *)ext4_bget(fs);
 	if (!buf)
 		return ST_NOMEM;
 	int st = ext4_read_block(fs, blk, buf);
 	if (st != ST_OK) {
-		kfree(buf);
+		ext4_bput(buf);
 		return st;
 	}
 	unsigned copy = fs->inode_size < sizeof(ext4_inode) ?
@@ -2992,9 +3407,81 @@ static int ext4_write_inode_struct(ext4_fs_t *fs, unsigned long ino,
 	ext4_inode_csum_set(fs, ino,
 			    buf + off); /* over the full on-disk inode */
 	st = ext4_write_block(fs, blk, buf);
-	kfree(buf);
+	ext4_bput(buf);
 	ext4_inode_cache_drop(ino); /* parsed-inode cache now stale */
+	/* Whatever was pending for this inode has just been stored -- `in` came
+	 * from a read, and every read has the pending change applied to it, so
+	 * the bytes that went to the device include it.  Only on success: a
+	 * failed write leaves the change still owed, and forgetting it here
+	 * would lose it silently. */
+	if (st == ST_OK)
+		ext4_di_clear(ino);
 	return st;
+}
+
+/*
+ * Store every inode with a pending size/timestamp update.
+ *
+ * The data comes first, and not as a courtesy: a size that reaches the device
+ * before the blocks it covers describes, after a crash, blocks that were never
+ * written -- which is to say whatever their previous owner left in them.  So
+ * the pages of exactly these files are stored first, in one pass, and only
+ * then the inodes.
+ *
+ * Each store clears its own record (see ext4_write_inode_struct), so the list
+ * empties itself and an inode whose write failed stays on it.
+ *
+ * The caller must hold the metadata lock exclusively: this writes metadata.
+ */
+static void ext4_di_flush(ext4_fs_t *fs)
+{
+	unsigned long inos[EXT4_DI_MAX];
+	uint64_t sizes[EXT4_DI_MAX];
+	unsigned long ids[EXT4_DI_MAX];
+	unsigned n = 0;
+	uint64_t flags;
+
+	might_sleep();
+	if (!fs)
+		return;
+
+	spin_lock_irqsave(&s_di_lock, &flags);
+	for (unsigned i = 0; i < s_di_n; i++) {
+		inos[n] = s_di[i].ino;
+		sizes[n] = s_di[i].size;
+		n++;
+	}
+	spin_unlock_irqrestore(&s_di_lock, flags);
+	if (n == 0)
+		return;
+
+	for (unsigned i = 0; i < n; i++)
+		ids[i] = EXT4_BID_ENC(inos[i], 0);
+	pagecache_flush_fileset(ids, n);
+
+	for (unsigned i = 0; i < n; i++) {
+		ext4_inode in;
+
+		/* Read brings the pending change back with it, so what is
+		 * written is the current state of the file. */
+		if (ext4_read_inode_loc(fs, inos[i], &in, 0, 0) != ST_OK)
+			continue;
+		/* The read must have come back carrying the pending size.
+		 *
+		 * If it did not, ext4_di_apply is not reaching this path, and
+		 * the write below is about to store the size the device
+		 * already had and then drop the record -- which is the one way
+		 * this design loses a file's length outright.  Nothing else
+		 * would report it: the write succeeds, the file simply ends up
+		 * shorter than it was.  Whoever holds the lock cannot have
+		 * changed it underneath us, so a mismatch is a broken overlay
+		 * and not a race. */
+		WARN_RATELIMIT(ext4_inode_size(&in) != sizes[i],
+			       "ext4: inode %lu pending size %lu not applied on read (got %lu) - deferred size would be lost",
+			       inos[i], (unsigned long)sizes[i],
+			       ext4_inode_size(&in));
+		ext4_write_inode_struct(fs, inos[i], &in);
+	}
 }
 
 /* bg_itable_unused: count of never-used inodes at the tail of the group's inode
@@ -3097,6 +3584,17 @@ static unsigned long ext4_alloc_inode(ext4_fs_t *fs, unsigned long parent_ino,
 			 * through, whatever became of the previous owner. */
 			icache_remove(EXT4_BID_ENC(ino, 0));
 			pagecache_invalidate_file(EXT4_BID_ENC(ino, 0));
+			/* Same argument for the names: if this number last
+			 * belonged to a directory, whatever is still cached
+			 * under it describes that directory's contents, and
+			 * the new one would answer lookups with the dead
+			 * one's children. */
+			ext4_dc_drop_dir(ino);
+			/* And for a pending size: it describes the file that
+			 * used to have this number.  Left in place it would be
+			 * laid over the new file's inode on every read, giving
+			 * it the dead one's length. */
+			ext4_di_clear(ino);
 			kfree(bm);
 			return ino;
 		}
@@ -4643,7 +5141,7 @@ static inline unsigned ext4_dirent_len(unsigned name_len)
  * htree (hash-indexed directory) write support.
  *
  * On-disk an htree dir keeps its real entries in plain leaf blocks (read by the
- * linear scanner in ext4_dir_lookup) plus an index: block 0 is a dx_root
+ * linear scanner in ext4_dir_lookup_disk) plus an index: block 0 is a dx_root
  * (dot/dotdot + dx_root_info + a sorted {hash,logical-block} array), and for
  * deep trees, interior dx_node blocks.  We hash the name, descend the index to
  * the target leaf, insert there, and on a full leaf split it and propagate a new
@@ -5397,9 +5895,9 @@ out:
 	return rc;
 }
 
-static int ext4_dir_add(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
-			unsigned name_len, unsigned long child_ino,
-			unsigned ftype)
+static int ext4_dir_add_disk(ext4_fs_t *fs, unsigned long dir_ino,
+			     const char *name, unsigned name_len,
+			     unsigned long child_ino, unsigned ftype)
 {
 	ext4_inode din;
 	if (ext4_read_inode_loc(fs, dir_ino, &din, 0, 0) != ST_OK)
@@ -5520,12 +6018,38 @@ static int ext4_dir_add(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
 	return ST_OK;
 }
 
+/*
+ * Add `name` to `dir_ino` and tell the dentry cache about it.
+ *
+ * The cache is updated only once the entry is on the device, so a failed add
+ * leaves nothing claiming the name exists.  Every way this driver creates a
+ * name -- create, mkdir, mknod, symlink, link, the destination half of a
+ * rename -- arrives here, which is why the maintenance is here and not spread
+ * across all of them.
+ *
+ * A name that had a negative entry gets it replaced rather than merely
+ * dropped: the insert removes whatever was there first.  That is the case
+ * where a program stats a file, does not find it, creates it, and stats it
+ * again -- and must find it the second time.
+ */
+static int ext4_dir_add(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
+			unsigned name_len, unsigned long child_ino,
+			unsigned ftype)
+{
+	int st = ext4_dir_add_disk(fs, dir_ino, name, name_len, child_ino,
+				   ftype);
+
+	if (st == ST_OK)
+		ext4_dc_add(dir_ino, name, name_len, child_ino, ftype);
+	return st;
+}
+
 /* Remove `name` from directory `dir_ino`.  Returns the removed child inode in
  * *out_child (and its file_type in *out_ft).  Coalesces the freed record into
  * the previous entry. */
-static int ext4_dir_del(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
-			unsigned name_len, unsigned long *out_child,
-			unsigned *out_ft)
+static int ext4_dir_del_disk(ext4_fs_t *fs, unsigned long dir_ino,
+			     const char *name, unsigned name_len,
+			     unsigned long *out_child, unsigned *out_ft)
 {
 	ext4_inode din;
 	if (ext4_read_inode_loc(fs, dir_ino, &din, 0, 0) != ST_OK)
@@ -5583,6 +6107,48 @@ static int ext4_dir_del(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
 	}
 	kfree(blk);
 	return ST_NOT_FOUND;
+}
+
+/*
+ * Remove `name` from `dir_ino` and tell the dentry cache about it.
+ *
+ * The counterpart of ext4_dir_add, and the same argument: unlink, rmdir and
+ * both halves of a rename all remove names through here, so this is the one
+ * place that has to remember to say so.
+ */
+static int ext4_dir_del(ext4_fs_t *fs, unsigned long dir_ino, const char *name,
+			unsigned name_len, unsigned long *out_child,
+			unsigned *out_ft)
+{
+	unsigned long child = 0;
+	unsigned ft = 0;
+	int st;
+
+	st = ext4_dir_del_disk(fs, dir_ino, name, name_len, &child, &ft);
+	if (out_child)
+		*out_child = child;
+	if (out_ft)
+		*out_ft = ft;
+	if (st != ST_OK)
+		return st;
+
+	ext4_dc_del(dir_ino, name, name_len);
+
+	/* A name that led to a directory takes that directory's own cached
+	 * entries with it.
+	 *
+	 * Two cases need it.  A removed directory leaves "." and ".." behind,
+	 * keyed by its inode number, waiting for that number to be handed to
+	 * something else.  And a directory MOVED by a rename keeps a ".."
+	 * that now points at the parent it no longer has -- rename removes the
+	 * old name through here, so dropping the entries here covers it.
+	 *
+	 * EXT4_FT_UNKNOWN is treated the same way: a filesystem without the
+	 * filetype feature records every entry as unknown, and guessing wrong
+	 * in that direction only costs a rescan. */
+	if (ft == EXT4_FT_DIR || ft == EXT4_FT_UNKNOWN)
+		ext4_dc_drop_dir(child);
+	return st;
 }
 
 /* Split a path into parent directory inode + final component name. */
@@ -5714,6 +6280,90 @@ static int ext4_create_inode(ext4_fs_t *fs, unsigned long ino, unsigned mode,
 				    &in); /* zeroes stale ibody xattrs */
 }
 
+/*
+ * Write zeros over [from, to) of a file, through the page cache.
+ *
+ * Allocation hands out blocks without clearing them, so a block that has just
+ * become part of a file still holds what its previous owner put there.  Any
+ * part of such a block that the write itself does not cover has to be cleared,
+ * or reading it returns somebody else's data -- not merely wrong bytes, but
+ * the contents of a file that was deleted.
+ *
+ * Doing it through the cache rather than the device means a read sees the
+ * zeros at once instead of after a writeback, and a whole page of them costs
+ * no device read on the way in.
+ *
+ * `file_size` is the size the file had BEFORE this write, which is what
+ * decides whether a page is past the end and can be created empty.
+ *
+ * ONLY blocks the file actually has are written.  A range with no block
+ * behind it is skipped, and that is not a shortcut -- it is the whole point:
+ * an unmapped block already reads as zeros, so there is nothing stale in it to
+ * cover.  Dirtying a page over one would also be actively wrong, because
+ * writeback would then have nowhere to put it, would leave it dirty and
+ * unreclaimable for good, and would say so once per page.
+ *
+ * Returns 0, or 1 if a page could not be obtained.
+ */
+static int ext4_zero_range(ext4_fs_t *fs, unsigned long chain_id,
+			   unsigned long file_size, unsigned long from,
+			   unsigned long to)
+{
+	unsigned long ino = EXT4_BID_INO(chain_id);
+	unsigned long bs = fs->block_size;
+	unsigned long done = 0;
+
+	might_sleep();
+	if (bs == 0)
+		return 1;
+	while (from < to) {
+		/* One block at a time, because whether it needs clearing is a
+		 * per-block question: a page can span several of them, and a
+		 * file can have one mapped next to one that is not. */
+		unsigned long lb = from / bs;
+		unsigned long blk_end = (lb + 1) * bs;
+		unsigned long seg_end = (to < blk_end) ? to : blk_end;
+
+		if (ext4_block_map(fs, ino, lb) == 0) {
+			from = seg_end; /* a hole: already reads as zeros */
+			continue;
+		}
+
+		while (from < seg_end) {
+			unsigned long page_idx = from / PAGE_SIZE;
+			unsigned page_off = (unsigned)(from % PAGE_SIZE);
+			unsigned avail = PAGE_SIZE - page_off;
+			unsigned chunk = (seg_end - from < avail) ?
+						 (unsigned)(seg_end - from) :
+						 avail;
+			int full_page = (page_off == 0 && chunk == PAGE_SIZE);
+			pc_page_t *pg = pagecache_get_for_write(
+				chain_id, page_idx, file_size, &fs->sb,
+				chain_id, full_page);
+
+			if (!pg || !pg->data)
+				return 1;
+			BUG_ON(page_off + chunk > PAGE_SIZE);
+			mm_memset(pg->data + page_off, 0, chunk);
+			ext4_ordered_add(ino);
+			pagecache_write_end(pg);
+			from += chunk;
+
+			/* A hole can be far larger than the write that created
+			 * it -- a seek to a gigabyte followed by one byte is a
+			 * gigabyte of it -- and every page of it is dirty and
+			 * therefore unreclaimable until stored.  Give the
+			 * writeback a turn on the way through rather than
+			 * filling memory first. */
+			if (++done >= PC_DIRTY_WRITEBACK_BATCH) {
+				done = 0;
+				pagecache_balance_dirty();
+			}
+		}
+	}
+	return 0;
+}
+
 static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 {
 	if (!f || !buf)
@@ -5737,9 +6387,19 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 		return ST_IO;
 
 	unsigned long cur_size = ext4_inode_size(&in);
+	/* Whether this call gave the file new blocks.  Extents have to be on the
+	 * device before the data they describe, so that case still stores the
+	 * inode; a write within blocks the file already owns does not. */
+	int allocated_blocks = 0;
+	/* Whether the first / last block this write touches had to be created
+	 * for it.  A block that did not exist a moment ago holds whatever its
+	 * previous owner left, so the parts of it this write does NOT cover
+	 * have to be cleared -- see the zeroing below. */
+	int head_created = 0, tail_created = 0;
 	unsigned long have = (cur_size + fs->block_size - 1) / fs->block_size;
 	unsigned long need = (end + fs->block_size - 1) / fs->block_size;
 	if (need > have) {
+		allocated_blocks = 1;
 		unsigned got = ext4_alloc_blocks_for_file(
 			fs, ef->ino, &in, have, (unsigned)(need - have));
 		if (got == 0) {
@@ -5754,6 +6414,78 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 		}
 	}
 
+	/* Blocks inside the file that the write lands on but the file does not
+	 * actually have.
+	 *
+	 * `have` counts blocks by SIZE, which equals the number of blocks a
+	 * file owns only when it has no holes.  A file extended by ftruncate
+	 * has a size and no blocks at all: a later write inside that range
+	 * found `need <= have`, allocated nothing, and then failed with -EIO
+	 * on a block that was never there.  A hole left by an earlier
+	 * seek-and-write is the same story.
+	 *
+	 * So the range this write actually covers is checked block by block,
+	 * and whatever is missing is created.  Only that range -- the rest of
+	 * the file stays sparse, which is what it is for.
+	 */
+	{
+		unsigned long bs = fs->block_size;
+		unsigned long first_lb = ef->pos / bs;
+		unsigned long last_lb =
+			(end > ef->pos) ? (end - 1) / bs : first_lb;
+		unsigned long lb = first_lb;
+
+		/* ext4_block_map reads the inode through the parsed cache, so
+		 * an allocation it has not been told about still looks like a
+		 * hole -- and this loop would then try to fill the same gap
+		 * again, mapping two extents over one logical block.  Tell it
+		 * first, and again after every allocation below. */
+		ext4_inode_cache_update(ef->ino, &in);
+
+		while (lb <= last_lb) {
+			unsigned long run_start, run = 0;
+
+			if (ext4_block_map(fs, ef->ino, lb) != 0) {
+				lb++;
+				continue;
+			}
+			run_start = lb;
+			while (lb <= last_lb &&
+			       ext4_block_map(fs, ef->ino, lb) == 0) {
+				run++;
+				lb++;
+			}
+
+			unsigned got = ext4_alloc_blocks_for_file(
+				fs, ef->ino, &in, run_start, (unsigned)run);
+
+			if (got == 0) {
+				ext4_flush_meta(fs);
+				return -ENOSPC;
+			}
+			allocated_blocks = 1;
+			if (run_start == first_lb)
+				head_created = 1;
+			if (run_start + got > last_lb)
+				tail_created = 1;
+			ext4_inode_cache_update(ef->ino, &in);
+
+			if (got < run) {
+				/* Ran out part way through the gap: the write
+				 * can only reach as far as what was created. */
+				unsigned long max_end = (run_start + got) * bs;
+
+				if (max_end <= ef->pos) {
+					ext4_flush_meta(fs);
+					return -ENOSPC;
+				}
+				end = max_end;
+				bytes = (long)(end - ef->pos);
+				break;
+			}
+		}
+	}
+
 	/* Persist the inode ONCE: new extents (if any) + final size + mtime, so
      * the data loop's block_map sees the extents and we avoid a second write. */
 	unsigned long newsize = (end > cur_size) ? end : cur_size;
@@ -5764,8 +6496,42 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 		uint64_t now = timer_get_epoch();
 		in.i_mtime = in.i_ctime = (uint32_t)now;
 	}
-	ext4_inode_cache_flush();
-	ext4_write_inode_struct(fs, ef->ino, &in);
+	/* The in-core copy is the current one from here on, and the block
+	 * mapping that writeback performs reads through it -- so it is updated
+	 * rather than dropped.  Emptying the whole cache, which is what this
+	 * did, meant re-reading from the device the very inode the next line of
+	 * this function needs. */
+	ext4_inode_cache_update(ef->ino, &in);
+
+	/* The inode reaches the device now only if it has to.
+	 *
+	 * It has to when this write ALLOCATED, because the block map is part
+	 * of the inode: a deferred copy of that would leave the filesystem not
+	 * knowing it owns the blocks the data is about to go into, and the
+	 * writeback that follows would have nowhere to put the pages.
+	 *
+	 * A write within blocks the file already owns changes only the size
+	 * and the timestamps, and those are recorded instead -- one small
+	 * memory update in place of a read-modify-write of a 4KB inode-table
+	 * block through the journal, per write() call.  A program writing a
+	 * file in 700-byte pieces crosses a block boundary once every six of
+	 * them, so five out of six stop paying for it.
+	 *
+	 * What makes that safe is ext4_di_apply: every route to an inode puts
+	 * the pending change back before handing it over, so open(), stat()
+	 * and the writeback path all see the size the file actually has, not
+	 * the one the device last heard about.  If there is no room to record
+	 * it, it is stored the old way -- slower, never wrong. */
+	if (allocated_blocks ||
+	    !ext4_di_record(ef->ino, newsize, in.i_mtime, in.i_ctime)) {
+		ext4_write_inode_struct(fs, ef->ino, &in);
+		/* Publish the copy that actually reached the device, not the
+		 * one on the way there: ext4_write_inode_struct may adjust the
+		 * inode as it stores it, and a cached copy missing those
+		 * adjustments would hand them back to the next writer to store
+		 * again. */
+		ext4_inode_cache_update(ef->ino, &in);
+	}
 
 	/* Write the data.  When journalling is on, full blocks are accumulated into
      * the persistent write-back buffer (s_wbounce) and flushed to disk as ONE big
@@ -5777,154 +6543,170 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
      * these blocks.  Partial edge blocks are read-modify-written directly (after
      * flushing pending data so the on-disk block is current).  With NO journal,
      * data is written directly as before — no deferral. */
-	unsigned wb_cap = (fs->j_enabled && s_wbounce &&
-			   s_wbounce_bytes >= fs->block_size) ?
-				  (unsigned)(s_wbounce_bytes / fs->block_size) :
-				  0;
 	unsigned long write_start = ef->pos;
 	unsigned long pos = ef->pos, remaining = (unsigned long)bytes,
 		      written = 0;
+	unsigned long chain_id = EXT4_BID_ENC(ef->ino, 0);
 	const uint8_t *src = (const uint8_t *)buf;
 	int io_err = 0;
+	/* The data goes into the page cache, not to the device.
+	 *
+	 * write() owes the caller that a later read sees these bytes.  It does
+	 * not owe them a disk that has already been touched.  Putting them in
+	 * the cache and marking the page dirty satisfies that at once, and
+	 * leaves the device work to be done later, in large pieces, by
+	 * writeback or by an explicit fsync.
+	 *
+	 * What this replaces went to the device inside write() itself, and had
+	 * to: a write covering part of a block became a read of that block, a
+	 * merge, and a write back, synchronously, every time.  A program
+	 * writing a file in small pieces paid a device round trip per piece,
+	 * and repeated writes to the same block paid it repeatedly.  Here the
+	 * second and later writes to a page are memory copies.
+	 *
+	 * It also settles an inconsistency: reads have always come from this
+	 * cache while writes went past it, so a file could be read back as its
+	 * old contents until something dropped the page. */
+
+	/* A write that starts past the end of the file leaves a hole behind it,
+	 * and the hole must read as zeros.
+	 *
+	 * Nothing was making it do so.  Allocation reserves blocks in the
+	 * bitmap and maps them into the extent tree; it does not clear them,
+	 * so a block handed to this file still holds what its previous owner
+	 * put there.  The write covers only its own range, so every block
+	 * between the old end of file and the start of the new data keeps that
+	 * content -- and a read of the hole returns it.  That is not merely
+	 * wrong bytes: those blocks belonged to somebody else's file, and this
+	 * hands them to whoever can read this one.
+	 *
+	 * So the hole is written, as zeros, through the same cache the data
+	 * goes through -- which means a read sees zeros at once rather than
+	 * after a writeback, and a whole page of hole costs no device read on
+	 * the way in.
+	 *
+	 * The cost falls only where the hole is.  An ordinary append starts at
+	 * exactly the old end of file, so there is no hole and this does
+	 * nothing at all. */
+	if (write_start > cur_size) {
+		unsigned long hend = (write_start < end) ? write_start : end;
+
+		if (ext4_zero_range(fs, chain_id, cur_size, cur_size, hend))
+			io_err = 1;
+	}
+
+	/* The same argument for a block created INSIDE the file.
+	 *
+	 * Filling a gap gives the file blocks that are not new to the device,
+	 * and this write covers only its own range of them.  Every block
+	 * between the first and the last is covered end to end; the two at the
+	 * edges can stick out, and what sticks out is still the previous
+	 * owner's data.  Before this it read as zeros, because an unmapped
+	 * block does, and it has to go on reading as zeros now that it is
+	 * mapped. */
+	if (!io_err && head_created) {
+		unsigned long bs = fs->block_size;
+		unsigned long head_from = (write_start / bs) * bs;
+
+		if (head_from < write_start &&
+		    ext4_zero_range(fs, chain_id, cur_size, head_from,
+				    write_start))
+			io_err = 1;
+	}
+	if (!io_err && tail_created && end > write_start) {
+		unsigned long bs = fs->block_size;
+		unsigned long tail_to = ((end - 1) / bs + 1) * bs;
+
+		if (tail_to > end &&
+		    ext4_zero_range(fs, chain_id, cur_size, end, tail_to))
+			io_err = 1;
+	}
+
+	/* Only from here on is user memory read, so only from here on does the
+	 * access check need lifting.  The hole above is kernel work. */
 	smap_disable();
-	while (remaining) {
-		unsigned long lidx = pos / fs->block_size;
-		unsigned boff = pos % fs->block_size;
-		unsigned chunk = fs->block_size - boff;
-		if (chunk > remaining)
-			chunk = (unsigned)remaining;
-		unsigned long pbn = ext4_block_map(fs, ef->ino, lidx);
-		if (pbn == 0) {
+	while (remaining && !io_err) {
+		unsigned long page_idx = pos / PAGE_SIZE;
+		unsigned page_off = (unsigned)(pos % PAGE_SIZE);
+		unsigned avail = PAGE_SIZE - page_off;
+		unsigned chunk = (remaining < avail) ? (unsigned)remaining :
+						       avail;
+		/* Replacing the page entirely means its previous contents need
+		 * not be fetched first. */
+		int full_page = (page_off == 0 && chunk == PAGE_SIZE);
+		pc_page_t *pg;
+
+		/* Every block behind this page must already exist.
+		 *
+		 * The old loop checked this before writing, because it wrote to
+		 * the block directly and needed its address.  Caching the write
+		 * removes the need for the address here -- but not the need for
+		 * the check.  A page with no block behind it cannot be written
+		 * back at all: writeback would find nothing to map it to, leave
+		 * it dirty, and move on.  The data would be lost with no error
+		 * ever reported, the page would never become reclaimable, and
+		 * enough of them would exhaust memory.  Refuse the write
+		 * instead, exactly as before. */
+		{
+			unsigned long bs = fs->block_size;
+			unsigned long first = ((unsigned long)page_idx *
+					       PAGE_SIZE) /
+					      bs;
+			unsigned long nblk = (PAGE_SIZE + bs - 1) / bs;
+
+			if (nblk == 0)
+				nblk = 1;
+			for (unsigned long b = 0; b < nblk; b++) {
+				unsigned long byte_off =
+					((unsigned long)page_idx * PAGE_SIZE) +
+					b * bs;
+
+				/* Only blocks this write actually covers. */
+				if (byte_off >= pos + chunk)
+					break;
+				if (byte_off + bs <= pos)
+					continue;
+				if (ext4_block_map(fs, ef->ino, first + b) ==
+				    0) {
+					io_err = 1;
+					break;
+				}
+			}
+			if (io_err)
+				break;
+		}
+
+		pg = pagecache_get_for_write(chain_id, page_idx, cur_size,
+					     &fs->sb, chain_id, full_page);
+		if (!pg || !pg->data) {
 			io_err = 1;
 			break;
 		}
-		if (boff != 0 || chunk != fs->block_size) {
-			/* Partial block: flush pending data (this block may be buffered, and
-             * for ordering), then read-modify-write the single block directly.
-             * After the flush s_wbounce is free, so reuse it as the RMW scratch. */
-			if (ext4_wb_flush(fs) != ST_OK) {
-				io_err = 1;
-				break;
-			}
-			uint8_t *pb = s_wbounce, *pb_owned = 0;
-			if (!pb) {
-				pb_owned = (uint8_t *)kalloc(fs->block_size);
-				pb = pb_owned;
-			}
-			if (!pb) {
-				io_err = 1;
-				break;
-			}
-			if (ext4_read_sectors(
-				    fs->bdev,
-				    fs->part_lba_offset +
-					    pbn * fs->sectors_per_block,
-				    fs->sectors_per_block, pb) != ST_OK)
-				mm_memset(pb, 0, fs->block_size);
-			mm_memcpy(pb + boff, src + written, chunk);
-			int w = ext4_write_sectors(
-				fs->bdev,
-				fs->part_lba_offset +
-					pbn * fs->sectors_per_block,
-				fs->sectors_per_block, pb);
-			if (pb_owned)
-				kfree(pb_owned);
-			if (w != ST_OK) {
-				io_err = 1;
-				break;
-			}
-			pos += chunk;
-			written += chunk;
-			remaining -= chunk;
-		} else {
-			/* Gather the run of contiguous full blocks present in this write(). */
-			unsigned run = 1;
-			while (remaining -
-				       (unsigned long)run * fs->block_size >=
-			       fs->block_size) {
-				if (ext4_block_map(fs, ef->ino, lidx + run) !=
-				    pbn + run)
-					break;
-				run++;
-			}
-			if (wb_cap == 0) {
-				/* No write-back buffer (no journal / unavailable): write directly
-                 * through a one-block scratch, contiguous run by run. */
-				for (unsigned r = 0; r < run; r++) {
-					uint8_t *pb = (uint8_t *)kalloc(
-						fs->block_size);
-					if (!pb) {
-						io_err = 1;
-						break;
-					}
-					mm_memcpy(
-						pb,
-						src + written +
-							(unsigned long)r *
-								fs->block_size,
-						fs->block_size);
-					int w = ext4_write_sectors(
-						fs->bdev,
-						fs->part_lba_offset +
-							(pbn +
-							 r) * fs->sectors_per_block,
-						fs->sectors_per_block, pb);
-					kfree(pb);
-					if (w != ST_OK) {
-						io_err = 1;
-						break;
-					}
-				}
-				if (io_err)
-					break;
-			} else {
-				/* Append the run to the write-back buffer, flushing when it can't
-                 * extend the buffered run (other file / non-adjacent) or fills. */
-				unsigned r = 0;
-				while (r < run) {
-					if (s_wb_len > 0 &&
-					    (s_wb_ino != ef->ino ||
-					     s_wb_pbn + s_wb_len != pbn + r)) {
-						if (ext4_wb_flush(fs) !=
-						    ST_OK) {
-							io_err = 1;
-							break;
-						}
-					}
-					if (s_wb_len == 0) {
-						s_wb_ino = ef->ino;
-						s_wb_pbn = pbn + r;
-					}
-					unsigned take = run - r;
-					if (s_wb_len + take > wb_cap)
-						take = wb_cap - s_wb_len;
-					mm_memcpy(
-						s_wbounce +
-							(unsigned long)s_wb_len *
-								fs->block_size,
-						src + written +
-							(unsigned long)r *
-								fs->block_size,
-						(unsigned long)take *
-							fs->block_size);
-					s_wb_len += take;
-					r += take;
-					if (s_wb_len == wb_cap) {
-						if (ext4_wb_flush(fs) !=
-						    ST_OK) {
-							io_err = 1;
-							break;
-						}
-					}
-				}
-				if (io_err)
-					break;
-			}
-			unsigned long n = (unsigned long)run * fs->block_size;
-			pos += n;
-			written += n;
-			remaining -= n;
-		}
+		BUG_ON(page_off + chunk > PAGE_SIZE);
+		/* Two threads writing the same page do not race here, and it
+		 * is worth saying why rather than leaving it to be worked out
+		 * again: ext4_write takes the per-inode lock EXCLUSIVELY, so
+		 * only one write() to a given file is ever inside this loop.
+		 * Two threads writing the same page of the same file are
+		 * serialised by that lock; two writing different files never
+		 * share a page, because a page belongs to one inode.
+		 *
+		 * What the lock does NOT cover is reclaim and writeback on
+		 * another processor, which is what the page is held for --
+		 * see pagecache_get_for_write. */
+		mm_memcpy(pg->data + page_off, src + written, chunk);
+		/* This transaction now owes an ordered store for this file. */
+		ext4_ordered_add(ef->ino);
+		/* Publish and release together.  The page was held from the
+		 * moment it was handed over: until the copy is finished it is
+		 * an ordinary clean page that reclaim on another processor
+		 * would be entitled to take, and the copy would then land in
+		 * somebody else's memory. */
+		pagecache_write_end(pg);
+
+		pos += chunk;
+		written += chunk;
+		remaining -= chunk;
 	}
 	smap_enable();
 
@@ -5936,19 +6718,31 @@ static long ext4_write_impl(vfs_file_t *f, const void *buf, long bytes)
 		ef->size = ef->pos;
 	if (ef->inode)
 		icache_update_size((ic_inode_t *)ef->inode, ef->size);
-	/* Drop cached pages so subsequent reads see the freshly written data.
-     * A pure append that begins at or beyond the page-rounded end of the file
-     * only touches fresh pages that were never read — hence never cached — so the
-     * whole-file page scan (O(hash buckets) per call) is pure overhead in the
-     * common sequential-write path.  Only scan when the write can overlap a page
-     * that may already be cached. */
-	{
-		unsigned long old_pg_end = (cur_size + 4095UL) &
-					   ~4095UL; /* pagecache page = 4KB */
-		if (write_start < old_pg_end)
-			pagecache_invalidate_file(EXT4_BID_ENC(ef->ino, 0));
-	}
+	/* The cached pages are NOT dropped here.
+	 *
+	 * They hold what was just written, and until writeback runs they are
+	 * the only copy of it -- discarding them discards the write.  That is
+	 * exactly what the line this replaces did once the data stopped going
+	 * straight to the device: an append or an overwrite reported success
+	 * and then read back as the file's previous contents, while a write
+	 * starting at offset zero of an empty file survived, because the
+	 * old-page test cannot be true for it.
+	 *
+	 * Dropping them was right while a write went past the cache and left it
+	 * holding a stale copy.  The cache is now where the data is, and there
+	 * is nothing else to tell.
+	 *
+	 * The block-chain cache still needs telling: the allocation above may
+	 * have given the file new blocks, so the map from file offset to disk
+	 * block has changed, and writeback is about to use it. */
+	(void)write_start;
 	icache_chain_invalidate(EXT4_BID_ENC(ef->ino, 0));
+
+	/* Having produced dirty pages, take a turn at storing them if too many
+	 * are waiting.  Charged to the writer deliberately: it is what makes a
+	 * program writing faster than the device can absorb slow down, instead
+	 * of the machine filling with data it is not allowed to discard. */
+	pagecache_balance_dirty();
 	ext4_flush_meta(fs); /* batch the deferred GDT/superblock writeback */
 	return (long)written;
 }
@@ -5982,6 +6776,12 @@ static int ext4_truncate_impl(vfs_file_t *f, unsigned long size)
 	uint64_t now = timer_get_epoch();
 	in.i_mtime = in.i_ctime = (uint32_t)now;
 	ext4_inode_cache_flush();
+	/* Any size a write left pending is superseded by this one, and dropped
+	 * before the store rather than after it: if the store fails the file
+	 * keeps the size it has on the device, which is what a failed truncate
+	 * should leave behind -- not the length it had before the truncate was
+	 * asked for. */
+	ext4_di_clear(ef->ino);
 	int st = ext4_write_inode_struct(fs, ef->ino, &in);
 	ef->size = size;
 	if (ef->pos > size)
@@ -6839,6 +7639,12 @@ static int ext4_fsync(vfs_file_t *f)
 		if (ef->inode)
 			icache_flush((ic_inode_t *)ef->inode);
 	}
+	/* fsync means "this file is on the device when I return", and a size
+	 * held only in memory is part of what that promises.  Everything
+	 * pending is stored, not just this file's: the set is small, and one
+	 * pass is cheaper than working out which of them matters. */
+	if (g_ext4_fs)
+		ext4_di_flush(g_ext4_fs);
 	if (g_ext4_fs)
 		ext4_flush_meta(g_ext4_fs);
 	/* Merge this op into the batch, then durably commit + clean the journal: an
@@ -6864,6 +7670,9 @@ static int ext4_sync_op(void)
 	ext4_io_lock();
 	ext4_resync_gd_from_bitmaps(
 		g_ext4_fs); /* GD free counts/csums <- bitmaps (ground truth) */
+	/* Sizes and timestamps held in memory are part of what sync() is being
+	 * asked to make durable. */
+	ext4_di_flush(g_ext4_fs);
 	ext4_flush_meta(g_ext4_fs);
 	ext4_txn_flush(g_ext4_fs);
 	ext4_journal_clean(g_ext4_fs);
@@ -8173,6 +8982,99 @@ static void ext4_checkpoint(ext4_fs_t *fs)
  * final homes (checkpoint), which is itself made durable before the log is
  * emptied (s_start=0).  Between flushes the on-disk log is empty, so a crash
  * outside the brief flush window replays nothing. */
+/* ---- Ordered data: which inodes this transaction must store first --------
+ *
+ * Metadata that points at freshly written blocks must not reach the device
+ * before the blocks do.  Otherwise a crash in between leaves an inode whose
+ * extents name blocks that were never written -- and what is read back is
+ * whatever those blocks held for their previous owner, which is somebody
+ * else's data.
+ *
+ * The obvious way to guarantee it is to store EVERY dirty page before every
+ * commit.  It is correct, and it is also why an unrelated program doing a
+ * small write() could be held up for as long as the whole system's backlog
+ * took to write: commits run inside write(), and the bill goes to whoever is
+ * standing there.
+ *
+ * Only the files this transaction actually wrote to need ordering.  So each
+ * write records its inode here, and the commit stores exactly those.  A
+ * program that wrote nothing pays nothing.
+ *
+ * Guarded by the filesystem I/O lock, which every writer and the commit both
+ * hold exclusively -- no separate lock, and none needed.
+ */
+#define EXT4_ORDERED_INIT_CAP 64
+static unsigned long *s_ord_ino;
+static unsigned s_ord_n;
+static unsigned s_ord_cap;
+/* Set when an inode could not be recorded.  The set is then incomplete, so the
+ * commit falls back to storing everything -- slower, never wrong. */
+static int s_ord_overflow;
+
+static void ext4_ordered_add(unsigned long ino)
+{
+	if (ino == 0)
+		return;
+
+	for (unsigned i = 0; i < s_ord_n; i++)
+		if (s_ord_ino[i] == ino)
+			return; /* already recorded */
+
+	if (s_ord_n == s_ord_cap) {
+		unsigned ncap = s_ord_cap ? s_ord_cap * 2 :
+					    EXT4_ORDERED_INIT_CAP;
+		unsigned long *n =
+			(unsigned long *)kalloc(ncap * sizeof(unsigned long));
+
+		if (!n) {
+			/* Cannot record it, so the set no longer describes the
+			 * transaction.  Say so; the commit will store
+			 * everything rather than miss this inode. */
+			s_ord_overflow = 1;
+			return;
+		}
+		for (unsigned i = 0; i < s_ord_n; i++)
+			n[i] = s_ord_ino[i];
+		if (s_ord_ino)
+			kfree(s_ord_ino);
+		s_ord_ino = n;
+		s_ord_cap = ncap;
+	}
+	s_ord_ino[s_ord_n++] = ino;
+}
+
+/*
+ * Store the data this transaction is responsible for, and forget it.
+ *
+ * Returns non-zero if anything was written, so the caller knows whether a
+ * barrier is needed before the commit.
+ */
+static int ext4_ordered_flush(void)
+{
+	int wrote = 0;
+
+	might_sleep();
+
+	if (s_ord_overflow) {
+		/* The record is incomplete -- store everything instead of
+		 * guessing which inode was missed. */
+		WARN_ON_ONCE(1);
+		wrote = pagecache_flush_all();
+		s_ord_overflow = 0;
+		s_ord_n = 0;
+		return wrote;
+	}
+
+	/* One pass over the dirty list for the whole set, not one per file. */
+	if (s_ord_n) {
+		for (unsigned i = 0; i < s_ord_n; i++)
+			s_ord_ino[i] = EXT4_BID_ENC(s_ord_ino[i], 0);
+		wrote = pagecache_flush_fileset(s_ord_ino, s_ord_n);
+	}
+	s_ord_n = 0;
+	return wrote;
+}
+
 static void ext4_journal_flush(ext4_fs_t *fs)
 {
 	if (!fs || !fs->j_enabled || !fs->j_sb_buf)
@@ -8181,9 +9083,22 @@ static void ext4_journal_flush(ext4_fs_t *fs)
      * durable BEFORE this transaction commits the metadata that references those
      * blocks, so a crash can never expose stale block contents through committed
      * metadata.  One extra sync here is cheap — this runs per batch, not per op. */
-	if (s_wb_len > 0) {
-		ext4_wb_flush(fs);
-		ext4_dev_sync(fs, "ordered-data");
+	{
+		/* Store the data this transaction wrote before the metadata
+		 * describing it -- and only that data.  Which inodes those are
+		 * was recorded as the writes happened; see ext4_ordered_add.
+		 *
+		 * Taking the filesystem I/O lock again from here is safe: it is
+		 * recursive and only the outermost release commits, so this
+		 * cannot re-enter the journal. */
+		int data_written = ext4_ordered_flush();
+
+		if (s_wb_len > 0) {
+			ext4_wb_flush(fs);
+			data_written++;
+		}
+		if (data_written > 0)
+			ext4_dev_sync(fs, "ordered-data");
 	}
 	unsigned n = s_ckpt.n;
 	if (n == 0)
@@ -8785,10 +9700,36 @@ static void ext4_flush_thread(void *arg)
 			if (self->state != TASK_RUNNING)
 				self->state = TASK_RUNNING;
 		}
-		if (g_ext4_fs && g_ext4_fs->j_enabled) {
+		/* Store whatever the cache is holding, if the timer has asked
+		 * for it.  This thread is the place for it: it holds no
+		 * filesystem lock, so it may take the I/O lock for writing.
+		 * Doing the same from a cache lookup would mean asking for that
+		 * lock while a reader already holds the metadata lock, which
+		 * does not end. */
+		pagecache_writeback_if_due();
+
+		/* s_di_n is read without its lock on purpose: it is only being
+		 * asked "is there anything to do", and a stale answer costs one
+		 * interval, not correctness.  It is here so that a filesystem
+		 * with no journal -- which has no batch to commit and would
+		 * otherwise skip this whole block -- still stores the sizes
+		 * write() left in memory on a timer. */
+		if (g_ext4_fs && (g_ext4_fs->j_enabled || s_di_n)) {
 			ext4_io_lock();
-			ext4_journal_flush(
-				g_ext4_fs); /* commit + checkpoint the batch (no-op if empty) */
+			/* Sizes and timestamps that write() left in memory get
+			 * stored here, on the same schedule and for the same
+			 * reason as the pages: this thread holds no filesystem
+			 * lock coming in, so it can take the metadata lock
+			 * exclusively, and a program is not made to wait for
+			 * it.  The inode blocks it writes join this thread's
+			 * own transaction and are committed by the release of
+			 * the lock below, so they reach the log on the next
+			 * pass rather than this one -- which is what a
+			 * five-second commit interval means in any case. */
+			ext4_di_flush(g_ext4_fs);
+			if (g_ext4_fs->j_enabled)
+				ext4_journal_flush(
+					g_ext4_fs); /* commit + checkpoint the batch (no-op if empty) */
 			ext4_io_unlock();
 		}
 	}

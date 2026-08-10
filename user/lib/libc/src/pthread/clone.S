@@ -99,14 +99,17 @@ clone:
     pop     %r12
     pop     %rbx
     pop     %rbp
-    // Set errno and return -1
+    /* Set errno and return -1.
+     *
+     * errno is per-thread now, so there is no `errno' object to store into:
+     * __errno_location() returns THIS thread's copy.  Note also that what
+     * stood here stored %rax -- eight bytes -- into an int, writing four
+     * bytes past it.  The store below is 32-bit, which is what errno is. */
     neg     %rax                // Make errno positive
-#ifdef __PIC__
-    mov     errno@GOTPCREL(%rip), %rcx
-    mov     %rax, (%rcx)
-#else
-    mov     %rax, errno(%rip)   // Store in errno
-#endif
+    push    %rax                // saves the value AND aligns rsp to 16
+    call    __errno_location@PLT
+    pop     %rcx                // rcx is call-clobbered: free to use here
+    mov     %ecx, (%rax)        // 32-bit store; errno is an int
     mov     $-1, %rax
     ret
 
@@ -131,13 +134,12 @@ clone:
     ud2
 
 .Lerror_inval:
-    mov     $22, %rax           // EINVAL = 22
-#ifdef __PIC__
-    mov     errno@GOTPCREL(%rip), %rcx
-    mov     %rax, (%rcx)
-#else
-    mov     %rax, errno(%rip)
-#endif
+    /* Reached before the prologue pushes anything, so rsp is still
+     * 8 mod 16 here and the call needs realigning by hand. */
+    sub     $8, %rsp
+    call    __errno_location@PLT
+    add     $8, %rsp
+    movl    $22, (%rax)         // EINVAL = 22, into this thread's errno
     mov     $-1, %rax
     ret
 
