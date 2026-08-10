@@ -690,6 +690,12 @@ void sched_init(void);
 int sched_alloc_task_id(void);
 task_t *sched_add_task(task_entry_t entry, void *arg, void *stack_mem,
 		       size_t stack_size);
+/* Same, for a kernel thread that must run on one specific processor (per-CPU
+ * service threads).  The binding has to be made here rather than by the caller
+ * afterwards: the returned task may already be queued, and `on_cpu' names the
+ * run queue that owns it. */
+task_t *sched_add_task_on_cpu(task_entry_t entry, void *arg, void *stack_mem,
+			      size_t stack_size, uint32_t cpu);
 task_t *sched_add_user_task(task_entry_t entry, void *arg, uint64_t *pml4,
 			    uint64_t user_stack, uint64_t kernel_stack);
 void sched_tick(void);

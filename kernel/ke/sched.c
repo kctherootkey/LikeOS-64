@@ -1,34 +1,15 @@
-// LikeOS-64 Per-CPU Preemptive Scheduler
-// ============================================================================
-// SCHEDULER TYPE: O(1) RR with Preemption
-// ============================================================================
-//
-// This is a simple O(1) preemptive RR scheduler with per-CPU run
-// queues. Both enqueue and dequeue operations are O(1) using FIFO linked lists.
-//
-// Key characteristics:
-//   - Time complexity: O(1) for enqueue, dequeue, and context switch
-//   - Scheduling policy: RR with fixed time slices (SCHED_TIME_SLICE)
-//   - Preemption: Timer-driven preemptive multitasking via sched_preempt()
-//   - SMP support: True per-CPU run queues with load balancing
-//   - No priority levels (all tasks are equal priority)
-//
-// Architecture:
-//   - Each CPU has its own run queue (percpu->runqueue_head/tail) protected
-//     by percpu->runqueue_lock.  schedule() / sched_preempt() only touch the
-//     *local* CPU's queue – zero cross-CPU lock contention in the hot path.
-//   - A global all-tasks linked list (g_task_list_head, via task->next)
-//     protected by g_task_list_lock is used for administrative operations
-//     (find_by_id, wake_channel, signal delivery, dump, etc.).  These are
-//     cold paths where a global lock is acceptable.
-//   - task->rq_next links the task into a per-CPU run queue.
-//   - task->on_cpu records which CPU the task is assigned to.
-//   - load_balance() is called periodically by the BSP timer to pull tasks
-//     from the busiest CPU to the least-loaded one.
-//
-// Pre-SMP boot: sched_init() runs before percpu_init(), so per-CPU data is
-// not yet available.  We use a simple legacy path until sched_enable_smp()
-// is called by smp_init().
+/*
+ * LikeOS-64 per-CPU preemptive scheduler
+ *
+ * Round-robin over per-CPU run queues, O(1) enqueue and dequeue, no priorities:
+ * every runnable task gets SCHED_TIME_SLICE ticks before the timer preempts it.
+ * task->rq_next links a task into one run queue; task->next links it into the
+ * global task list, which is for lookup, signals and ps -- never scheduling.
+ * The rule the whole file rests on: task->on_rq is protected by the run queue
+ * lock of the processor named by task->on_cpu, and on_cpu changes only under
+ * that lock -- so re-read on_cpu after locking, because the task may have
+ * migrated in the window between reading it and taking its lock.
+ */
 
 #include <kernel/ke/sched.h>
 #include <kernel/io/console.h>
@@ -1130,6 +1111,58 @@ void sched_enqueue_ready(task_t *task)
 	}
 }
 
+/* Put the outgoing task back on a run queue -- which is not always this one.
+ *
+ * Called by all three switch paths with this processor's run queue lock held,
+ * just before they switch away from `cur'.  Returns NULL when it is done, or
+ * the task when the caller must finish the job by handing it to
+ * sched_enqueue_ready() AFTER dropping the lock.
+ *
+ * `on_rq' is protected by the run queue lock of the processor named in
+ * `on_cpu'.  While this task was running here it could have been woken by
+ * another processor -- the "mark myself BLOCKED, then call the scheduler"
+ * window that every kernel service thread has -- and that wakeup claims it
+ * READY and queues it on the processor `on_cpu' names, which need not be this
+ * one.  Linking it into this queue as well is the double-enqueue that
+ * rq_enqueue_locked() reports: "owner=0 linked=1", owned by and already linked
+ * on processor 0, being queued a second time by processor 4.
+ *
+ * Doing nothing in that case is NOT safe, and assuming it was is what stopped
+ * the network: `on_cpu' naming another processor proves that processor OWNS the
+ * task, not that it has it queued.  A task pinned to a processor it is not
+ * currently queued on -- which is how a service thread looks between being
+ * created and first being woken -- was then dropped from every run queue at its
+ * first preemption, with nothing left to enqueue it and nothing to wake, since
+ * a wakeup only ever finds a task through its channel or its queue.  ksoftirqd
+ * went that way, and with it the only context that drains the network receive
+ * softirq, so a DHCP reply sat in the receive queue and no address was ever
+ * configured.
+ *
+ * sched_enqueue_ready() is the one path that can queue a task onto a processor
+ * that is not this one: it takes the OWNER's lock, re-reads `on_cpu' under it,
+ * and enqueues only if the task really is on no queue.  A no-op when a waker
+ * got there first, and the recovery when nobody did.  It is called after the
+ * lock is dropped because it takes another run queue lock of its own, and this
+ * one is already held. */
+static task_t *rq_requeue_current_locked(percpu_t *cpu, task_t *cur)
+{
+	lockdep_assert_held(&cpu->runqueue_lock);
+	BUG_ON(cpu == NULL);
+	BUG_ON(cur == NULL);
+
+	if (cur->has_exited || is_idle_task(cur) || cur->on_rq)
+		return NULL;
+	if (cur->state != TASK_READY && cur->state != TASK_RUNNING)
+		return NULL;
+
+	cur->state = TASK_READY;
+	if (cur->on_cpu == cpu->cpu_id) {
+		rq_enqueue_locked(cpu, cur);
+		return NULL;
+	}
+	return cur;
+}
+
 // ============================================================================
 // TASK INITIALIZER HELPER
 // ============================================================================
@@ -1281,8 +1314,15 @@ void sched_init(void)
 		SCHED_TIME_SLICE);
 }
 
-task_t *sched_add_task(task_entry_t entry, void *arg, void *stack_mem,
-		       size_t stack_size)
+/* pin_cpu < 0 places the thread wherever there is room; otherwise it is bound
+ * to that processor.  The binding is established HERE, before the thread is
+ * queued, because `on_cpu' names the run queue that owns the task: writing it
+ * afterwards leaves it naming one processor while the task is linked on
+ * another, and every rule in this file then protects the wrong queue.  There is
+ * no window in which a caller could do it itself -- the task is runnable and
+ * another processor may already be running it by the time this returns. */
+static task_t *sched_add_kthread(task_entry_t entry, void *arg, void *stack_mem,
+				 size_t stack_size, int pin_cpu)
 {
 	BUG_ON(entry == NULL);
 	BUG_ON(stack_mem == NULL);
@@ -1321,6 +1361,10 @@ task_t *sched_add_task(task_entry_t entry, void *arg, void *stack_mem,
 	t->id = sched_alloc_task_id();
 	task_init_common(t);
 	t->on_cpu = 0; // Default to BSP
+	if (pin_cpu >= 0 && pin_cpu < MAX_CPUS) {
+		t->on_cpu = (uint32_t)pin_cpu;
+		t->cpu_affinity = (1ULL << pin_cpu);
+	}
 
 	// Add to global task list
 	task_list_add(t);
@@ -1328,11 +1372,29 @@ task_t *sched_add_task(task_entry_t entry, void *arg, void *stack_mem,
 	// For idle task: don't add to run queue (it's the fallback)
 	// For normal tasks: enqueue to run queue if SMP is ready
 	if (!is_idle && g_smp_initialized) {
-		t->on_cpu = percpu_find_least_loaded_cpu();
+		if (pin_cpu < 0)
+			t->on_cpu = percpu_find_least_loaded_cpu();
 		t->state = TASK_READY;
+		/* Honours cpu_affinity, so a pinned thread is queued on the
+		 * processor it is pinned to and stays there. */
 		sched_enqueue_ready(t);
 	}
 	return t;
+}
+
+task_t *sched_add_task(task_entry_t entry, void *arg, void *stack_mem,
+		       size_t stack_size)
+{
+	return sched_add_kthread(entry, arg, stack_mem, stack_size, -1);
+}
+
+task_t *sched_add_task_on_cpu(task_entry_t entry, void *arg, void *stack_mem,
+			      size_t stack_size, uint32_t cpu)
+{
+	WARN_ON_ONCE(cpu >= MAX_CPUS);
+	if (cpu >= MAX_CPUS)
+		return NULL;
+	return sched_add_kthread(entry, arg, stack_mem, stack_size, (int)cpu);
 }
 
 task_t *sched_add_user_task(task_entry_t entry, void *arg, uint64_t *pml4,
@@ -1559,15 +1621,10 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 	}
 
 	// We have a valid different task to switch to
-	// Now enqueue current if it's runnable (voluntary yield)
-	// Check !cur->on_rq to avoid double-enqueue when wake_channel
-	// already enqueued this task while it was still running as cur.
-	if (!cur->has_exited &&
-	    (cur->state == TASK_READY || cur->state == TASK_RUNNING) &&
-	    !is_idle_task(cur) && !cur->on_rq) {
-		cur->state = TASK_READY;
-		rq_enqueue_locked(cpu, cur);
-	}
+	// Now enqueue current if it's runnable (voluntary yield).
+	// See rq_requeue_current_locked(): it may hand the task back for a
+	// remote enqueue that cannot be done under this lock.
+	task_t *requeue_remote = rq_requeue_current_locked(cpu, cur);
 
 	task_t *prev = cur;
 
@@ -1578,6 +1635,14 @@ __attribute__((no_stack_protector)) void sched_schedule(void)
 
 	// Release lock but keep interrupts DISABLED through the context switch.
 	spin_unlock(&cpu->runqueue_lock);
+
+	/* Safe here and not earlier: this takes the owning processor's run
+	 * queue lock, and safe at all because a task that is running has
+	 * sp == 0 (see the double-run guard below), so a processor that
+	 * dequeues it before ctx_switch_asm has published its stack pointer
+	 * refuses it and puts it back. */
+	if (requeue_remote)
+		sched_enqueue_ready(requeue_remote);
 
 	// Switch address space BEFORE updating current_task.  sched_remove_task
 	// on another CPU spins on (p->current_task == task) to decide when it is
@@ -1753,12 +1818,10 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 		return;
 	}
 
-	// We have a valid different task - now enqueue current if runnable
-	if (!cur->has_exited && !is_idle_task(cur) &&
-	    (cur->state == TASK_READY || cur->state == TASK_RUNNING)) {
-		cur->state = TASK_READY;
-		rq_enqueue_locked(cpu, cur);
-	}
+	/* We have a valid different task - now enqueue current if runnable.
+	 * The on_rq test this path was missing entirely, and the remote case
+	 * it implies, are both in rq_requeue_current_locked(). */
+	task_t *requeue_remote = rq_requeue_current_locked(cpu, cur);
 
 	task_t *prev = cur;
 
@@ -1772,6 +1835,9 @@ __attribute__((no_stack_protector)) void sched_run_ready(void)
 	// Release lock but keep interrupts DISABLED through the context switch
 	// (same race prevention as in sched_schedule).
 	spin_unlock(&cpu->runqueue_lock);
+
+	if (requeue_remote)
+		sched_enqueue_ready(requeue_remote);
 
 	// Switch address space before updating current_task (same rationale as
 	// sched_schedule — see the detailed comment there).
@@ -3837,15 +3903,10 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 	}
 
 	// We have a valid different task to switch to
-	// Now enqueue current if it's runnable (not idle, not exited)
-	// Check !cur->on_rq to avoid double-enqueue when wake_channel
-	// already enqueued this task while it was still running as cur.
-	if (!cur->has_exited &&
-	    (cur->state == TASK_READY || cur->state == TASK_RUNNING) &&
-	    !is_idle_task(cur) && !cur->on_rq) {
-		cur->state = TASK_READY;
-		rq_enqueue_locked(cpu, cur);
-	}
+	// Now enqueue current if it's runnable (not idle, not exited).
+	// See rq_requeue_current_locked(): it may hand the task back for a
+	// remote enqueue that cannot be done under this lock.
+	task_t *requeue_remote = rq_requeue_current_locked(cpu, cur);
 
 	next->remaining_ticks = SCHED_TIME_SLICE;
 
@@ -3859,6 +3920,9 @@ __attribute__((no_stack_protector)) void sched_preempt(interrupt_frame_t *frame)
 
 	// Release lock but keep interrupts disabled through the switch
 	spin_unlock(&cpu->runqueue_lock);
+
+	if (requeue_remote)
+		sched_enqueue_ready(requeue_remote);
 
 	// Switch address space before updating current_task (same rationale as
 	// sched_schedule — see the detailed comment there).

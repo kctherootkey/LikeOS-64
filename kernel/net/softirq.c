@@ -259,17 +259,24 @@ void ksoftirqd_start_all(void)
 				cpu);
 			continue;
 		}
-		task_t *t =
-			sched_add_task(ksoftirqd_main, (void *)(uintptr_t)cpu,
-				       stack, KSOFTIRQD_STACK_SIZE);
+		/* Pinned at creation, not afterwards.  This thread drains the
+		 * softirqs pending on ONE processor -- the one it runs on --
+		 * so it has to be that processor's, and the scheduler has to
+		 * be told before the thread is queued: `on_cpu' names the run
+		 * queue that owns a task, and writing it once the task is
+		 * already queued elsewhere leaves the two disagreeing.  A task
+		 * in that state is dropped from every run queue the first time
+		 * it is switched out, and nothing can wake it again -- which
+		 * took the network receive path down with it. */
+		task_t *t = sched_add_task_on_cpu(ksoftirqd_main,
+						  (void *)(uintptr_t)cpu, stack,
+						  KSOFTIRQD_STACK_SIZE, cpu);
 		if (!t) {
 			kprintf("ksoftirqd: failed to create thread for CPU %u\n",
 				cpu);
 			mm_free_guarded_kstack(stack, KSOFTIRQD_STACK_SIZE);
 			continue;
 		}
-		t->on_cpu = cpu;
-		t->cpu_affinity = (1ULL << cpu);
 		/* Name shown by ps as "[ksoftirqd/N]" (kernel-thread bracket added
          * by ps when t->privilege == TASK_KERNEL). */
 		{
