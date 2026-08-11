@@ -365,7 +365,17 @@ void mm_dontneed_range(struct task *task, uint64_t addr, uint64_t length);
 /* Fold adjacent records that describe one continuous mapping back into one.
  * Without this, repeated split/remap cycles spend a record each time until the
  * table is full and every later mmap fails. */
+/* Region-table lifecycle.  The table is grown on demand rather than reserved,
+ * so every task owns an allocation that has to be created, copied on fork and
+ * released at teardown. */
+bool mm_regions_init(struct task *task);
+void mm_regions_free(struct task *task);
+bool mm_regions_clone(struct task *dst, const struct task *src);
 void mm_merge_mmap_regions(struct task *task);
+/* Coalesce one freshly installed region with the neighbours it abuts.  Call
+ * after every successful mmap: without it the region table only ever grows,
+ * because merging used to happen on munmap alone. */
+void mm_merge_region_neighbours(struct task *task, struct mmap_region *region);
 /* Pages this address space actually has resident -- the real resident set,
  * as opposed to how much address space has been reserved. */
 uint64_t mm_count_resident_pages(uint64_t *pml4);

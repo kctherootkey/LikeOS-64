@@ -1,0 +1,23 @@
+--- a/src/desktop.c
++++ b/src/desktop.c
+@@ -4993,6 +4993,20 @@
+     gtk_window_move(GTK_WINDOW(self), geom.x, geom.y);
+     gtk_widget_set_app_paintable((GtkWidget*)self, TRUE);
+     gtk_window_set_type_hint(GTK_WINDOW(self), GDK_WINDOW_TYPE_HINT_DESKTOP);
++    /* Give the desktop a WM_NAME.
++     *
++     * It had none: gtk_window_set_title() was never called on it, so the
++     * window reached the window manager nameless.  That is not merely untidy
++     * -- it makes the window impossible to single out in a window manager's
++     * configuration.  twm-family managers match rules by WM_NAME first and
++     * then res_name/res_class, and res_name/res_class are "pcmanfm" for the
++     * desktop and for every file-manager window alike, so without a name
++     * there is no way to write a rule that applies to the desktop only.
++     *
++     * The type hint above is the right mechanism and stays; this is what
++     * makes an explicit rule possible for a window manager that does not act
++     * on _NET_WM_WINDOW_TYPE_DESKTOP. */
++    gtk_window_set_title(GTK_WINDOW(self), "pcmanfm-desktop");
+     gtk_widget_add_events((GtkWidget*)self,
+                         GDK_POINTER_MOTION_MASK |
+                         GDK_BUTTON_PRESS_MASK |

@@ -1,4 +1,3 @@
-#
 # $XConsortium: system.twmrc,v 1.8 91/04/23 21:10:58 gildea Exp $
 #
 # Default twm configuration file; needs to be kept small to conserve string
@@ -40,28 +39,16 @@ UseThreeDWMap
 # press still reaches the application and a click that also selects text or
 # presses a button behaves normally.
 #
-# RaiseOnClick is deliberately NOT set, and that is not a style choice.
+# RaiseOnClick is set, and is safe, because the desktop is pinned to the bottom
+# plane by an explicit rule -- see the OnTopPriority block further down.
 #
-# ctwm does not recognise PCManFM's desktop as a desktop window: f.identify
-# reports `OnTopPriority = 0' for it, which is the NORMAL plane (a window ctwm
-# had typed as _NET_WM_WINDOW_TYPE_DESKTOP would report -8, since
-# EwmhGetInitPriority gives it EWMH_PRI_DESKTOP).  With RaiseOnClick on, a
-# window in the normal plane comes to the front when clicked -- and the desktop
-# is full-screen, so clicking the background put it over every other window.
-# That is what made "all the ctwm controls disappear", and it is also why a
-# click aimed at a file-manager window afterwards landed on the desktop instead
-# and opened the root menu.
-#
-# Raising is still available where it belongs: button 1 on a title bar is
-# f.function "move-or-raise", and button 2 there is f.raiselower.
-#
-# The underlying question -- why ctwm does not see the DESKTOP type when
-# PCManFM does set it in fm_desktop_constructor -- is still open.  To settle it,
-# run `xprop' and click the desktop background: if _NET_WM_WINDOW_TYPE is
-# _NET_WM_WINDOW_TYPE_DESKTOP then the fault is in ctwm's reading of it, and if
-# the property is absent it is GTK's or PCManFM's.  Once that is fixed the
-# desktop sits in the -8 plane and RaiseOnClick could come back.
+# It had to be removed for a while: ctwm treats PCManFM's full-screen desktop as
+# an ordinary window, and a window in the normal plane comes to the front when
+# clicked, so clicking the background put the desktop over the whole session.
+# Pinning it to -8 removes that, and clicking a window body to raise it -- which
+# is the point of RaiseOnClick -- works again.
 ClickToFocus
+RaiseOnClick
 
 #
 # Minimise into the taskbar instead of onto the desktop.
@@ -329,6 +316,44 @@ Function "move-or-iconify" { f.move f.deltastop f.iconify }
 # click either activates the entry under the pointer or dismisses it.
 #
 StayUpMenus
+
+#
+# PCManFM's desktop, named explicitly.
+#
+# ctwm is built with EWMH and does read _NET_WM_WINDOW_TYPE (EwmhGetProperties,
+# add_window.c), and PCManFM does set the DESKTOP type hint in
+# fm_desktop_constructor -- but f.identify reports `OnTopPriority = 0' for that
+# window, which is the NORMAL plane.  A window ctwm had typed as a desktop
+# would report -8, since EwmhGetInitPriority hands it EWMH_PRI_DESKTOP.  Every
+# link in that chain checks out on its own and the result still says the type
+# never arrives, so this states it outright rather than relying on it.
+#
+# Keyed on WM_NAME, which the port patch
+# 0003-name-the-desktop-window-so-a-wm-rule-can-match-it gives the window.  It
+# has to be the name: ctwm's LookInList matches WM_NAME, then res_name, then
+# res_class, and res_name/res_class are "pcmanfm" for the desktop AND for every
+# file-manager window, so a rule keyed on either would pin the file manager to
+# the bottom too.
+#
+# -8 is the same plane EWMH_PRI_DESKTOP would have given it: below everything,
+# so no click can lift it over the session.  NoTitle and NoBorder match what
+# EwmhHasTitle/EwmhHasBorder return for a desktop-typed window.
+#
+OnTopPriority -8
+{
+    "pcmanfm-desktop"
+}
+
+NoTitle
+{
+    "pcmanfm-desktop"
+}
+
+NoBorder
+{
+    "pcmanfm-desktop"
+}
+
 
 Button1 =	: root		: f.menu "defops"
 Button2 =	: root		: f.menu "windowops"

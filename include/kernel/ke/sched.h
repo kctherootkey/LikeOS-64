@@ -47,7 +47,22 @@ struct task;
  * measured number rather than a generous one.  Exhaustion is at least loud now
  * (the WARN in sys_mmap names the pid and the limit).
  */
-#define TASK_MAX_MMAP 512
+/* Ceiling on a process's mapped regions, NOT a preallocation.
+ *
+ * The table used to be an array of this size inlined into every task_t, which
+ * put a hard floor under the limit: at 80 bytes a record, 65530 entries would
+ * be 5 MB in each task_t, and a task_t is allocated per THREAD.  It is now
+ * grown on demand from MMAP_REGIONS_INITIAL, so an ordinary process pays for
+ * the few dozen regions it has and only a process that really maps this much
+ * pays for the table.  That is the arrangement every other system uses: the
+ * number is a limit to refuse past, not memory to reserve.
+ *
+ * Kept under 0xFFFF because the merge pass indexes slots with uint16_t. */
+#define TASK_MAX_MMAP 65530
+/* What a task starts with.  Big enough that a normal program never grows the
+ * table (a shell, an editor and an X client all sit well under this), small
+ * enough that a task_t costs a few kilobytes rather than megabytes. */
+#define MMAP_REGIONS_INITIAL 64
 
 // ============================================================================
 // CPU FEATURE FLAGS
@@ -569,7 +584,13 @@ typedef struct task {
 	 */
 	uint64_t wchan_rip;
 
-	mmap_region_t mmap_regions[TASK_MAX_MMAP]; // mmap'd regions
+	/* Grown on demand; mmap_capacity entries, never above TASK_MAX_MMAP.
+	 * Every task owns its own allocation -- a thread's is left empty
+	 * because task_mm_owner() routes every lookup to the group leader,
+	 * and fork gives the child a fresh copy rather than the parent's
+	 * pointer. */
+	mmap_region_t *mmap_regions;
+	uint32_t mmap_capacity;
 	uint64_t mmap_base; // Base address for mmap allocations
 
 	/* Guards this address space: the region table above, mmap_base, brk,

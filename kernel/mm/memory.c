@@ -1962,15 +1962,126 @@ void mm_unmap_page_in_address_space(uint64_t *pml4, uint64_t virtual_addr)
  * getting out of step.
  */
 
+/* Give a task its region table.  Called once, when the task is created. */
+bool mm_regions_init(task_t *task)
+{
+	size_t bytes;
+
+	if (!task)
+		return false;
+	bytes = (size_t)MMAP_REGIONS_INITIAL * sizeof(mmap_region_t);
+	task->mmap_regions = (mmap_region_t *)kalloc(bytes);
+	if (!task->mmap_regions) {
+		task->mmap_capacity = 0;
+		return false;
+	}
+	mm_memset(task->mmap_regions, 0, bytes);
+	task->mmap_capacity = MMAP_REGIONS_INITIAL;
+	return true;
+}
+
+/* Release it.  Every task owns its own allocation, including a thread's empty
+ * one, so this is unconditional at teardown. */
+void mm_regions_free(task_t *task)
+{
+	if (!task || !task->mmap_regions)
+		return;
+	kfree(task->mmap_regions);
+	task->mmap_regions = NULL;
+	task->mmap_capacity = 0;
+}
+
+/* Replace a task's table with a copy of `src`'s.
+ *
+ * fork() builds the child by copying the parent's task_t wholesale, which
+ * copies the POINTER -- parent and child would share one table and free it
+ * twice.  This gives the child its own, with the parent's contents; the file
+ * references those records hold are taken by the caller, which is the only
+ * place that knows whether it is cloning an address space or starting an
+ * empty one. */
+bool mm_regions_clone(task_t *dst, const task_t *src)
+{
+	size_t bytes;
+	uint32_t cap;
+
+	if (!dst || !src)
+		return false;
+	cap = src->mmap_capacity ? src->mmap_capacity : MMAP_REGIONS_INITIAL;
+	bytes = (size_t)cap * sizeof(mmap_region_t);
+	dst->mmap_regions = (mmap_region_t *)kalloc(bytes);
+	if (!dst->mmap_regions) {
+		dst->mmap_capacity = 0;
+		return false;
+	}
+	mm_memset(dst->mmap_regions, 0, bytes);
+	if (src->mmap_regions && src->mmap_capacity)
+		mm_memcpy(dst->mmap_regions, src->mmap_regions,
+			  (size_t)src->mmap_capacity * sizeof(mmap_region_t));
+	dst->mmap_capacity = cap;
+	return true;
+}
+
+/* Double the table, up to the ceiling.  Returns false only when the ceiling is
+ * reached or memory has run out -- both of which mean the next mmap fails. */
+static bool mm_regions_grow(task_t *task)
+{
+	uint32_t old_cap = task->mmap_capacity;
+	uint32_t new_cap;
+	mmap_region_t *grown;
+	size_t bytes;
+
+	if (old_cap >= TASK_MAX_MMAP)
+		return false;
+	new_cap = old_cap ? old_cap * 2 : MMAP_REGIONS_INITIAL;
+	if (new_cap > TASK_MAX_MMAP)
+		new_cap = TASK_MAX_MMAP;
+
+	bytes = (size_t)new_cap * sizeof(mmap_region_t);
+	grown = (mmap_region_t *)kalloc(bytes);
+	if (!grown)
+		return false;
+	mm_memset(grown, 0, bytes);
+	if (task->mmap_regions && old_cap)
+		mm_memcpy(grown, task->mmap_regions,
+			  (size_t)old_cap * sizeof(mmap_region_t));
+
+	/* Callers hold pointers into the table only for the duration of a
+	 * single mmap, under the address-space write lock, and this runs
+	 * before any such pointer is handed out -- so swapping the array is
+	 * safe here and nowhere else. */
+	kfree(task->mmap_regions);
+	task->mmap_regions = grown;
+	task->mmap_capacity = new_cap;
+	return true;
+}
+
 /* Claim a free region slot.  in_use is left false -- the caller sets it once
  * the mapping is fully built, so a failure part-way leaks nothing. */
 mmap_region_t *mm_alloc_mmap_region(task_t *task)
 {
-	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+	if (!task->mmap_regions && !mm_regions_init(task))
+		return NULL;
+
+	for (uint32_t i = 0; i < task->mmap_capacity; i++) {
 		if (!task->mmap_regions[i].in_use) {
 			/* Scrub the recycled slot: stale fields (device,
 			 * file, lazy) from a previous mapping must never
 			 * leak into a new region. */
+			mm_memset(&task->mmap_regions[i], 0,
+				  sizeof(mmap_region_t));
+			return &task->mmap_regions[i];
+		}
+	}
+
+	/* Full: grow, then take the first free slot of the enlarged table.  The
+	 * scan is repeated rather than assuming where the new space begins --
+	 * the growth is a doubling except at the ceiling, where it is clamped.
+	 * The table starts small and doubles, so a process pays for the regions
+	 * it has rather than for the ceiling. */
+	if (mm_regions_grow(task)) {
+		for (uint32_t i = 0; i < task->mmap_capacity; i++) {
+			if (task->mmap_regions[i].in_use)
+				continue;
 			mm_memset(&task->mmap_regions[i], 0,
 				  sizeof(mmap_region_t));
 			return &task->mmap_regions[i];
@@ -1993,7 +2104,7 @@ mmap_region_t *mm_alloc_mmap_region(task_t *task)
 /* Find the in-use region covering `addr`, or NULL. */
 mmap_region_t *mm_find_mmap_region(task_t *task, uint64_t addr)
 {
-	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+	for (uint32_t i = 0; i < task->mmap_capacity; i++) {
 		mmap_region_t *r = &task->mmap_regions[i];
 		if (r->in_use && addr >= r->start &&
 		    addr < r->start + r->length) {
@@ -2021,7 +2132,7 @@ static mmap_region_t *mm_region_at_or_after(task_t *task, uint64_t *addr)
 	if (best)
 		return best;
 
-	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+	for (uint32_t i = 0; i < task->mmap_capacity; i++) {
 		mmap_region_t *r = &task->mmap_regions[i];
 
 		if (!r->in_use || r->start < *addr)
@@ -2084,6 +2195,63 @@ static bool mm_regions_mergeable(const mmap_region_t *a, const mmap_region_t *b)
 }
 
 /*
+ * Coalesce a freshly installed region with the neighbours it abuts.
+ *
+ * mmap() had no merge step at all: only munmap() ran one.  So every mmap()
+ * consumed a slot even when the new mapping simply continued an existing one
+ * with identical protection, flags and backing -- which is the normal shape of
+ * a heap growing, of an allocator taking another arena, and of a program that
+ * maps and releases as it works.  A conventional Unix coalesces adjacent
+ * mappings as they are made; without that the table only ever grew, and a
+ * long-lived process ran out of slots with most of them describing pieces of
+ * what should have been a handful of runs.  Browsing directories in a file
+ * manager did it in a few dozen steps, after which every further mmap failed
+ * and the session wedged.
+ *
+ * Two single scans are enough and no sort is needed, unlike the whole-table
+ * pass below.  Regions never overlap, so at most one record can begin exactly
+ * where this one ends and at most one can end exactly where it begins: absorb
+ * the successor, then let the predecessor absorb the result.  That also covers
+ * a mapping dropped exactly into a hole between two others, which collapses
+ * all three into one.
+ */
+void mm_merge_region_neighbours(task_t *task, mmap_region_t *region)
+{
+	if (!task || !region || !region->in_use)
+		return;
+
+	for (uint32_t i = 0; i < task->mmap_capacity; i++) {
+		mmap_region_t *b = &task->mmap_regions[i];
+
+		if (b == region || !mm_regions_mergeable(region, b))
+			continue;
+		region->length += b->length;
+		/* Each record held its own reference; the one that goes away
+		 * drops its own. */
+		if (b->file)
+			vfs_close(b->file);
+		b->file = NULL;
+		b->in_use = false;
+		b->length = 0;
+		break;
+	}
+
+	for (uint32_t i = 0; i < task->mmap_capacity; i++) {
+		mmap_region_t *a = &task->mmap_regions[i];
+
+		if (a == region || !mm_regions_mergeable(a, region))
+			continue;
+		a->length += region->length;
+		if (region->file)
+			vfs_close(region->file);
+		region->file = NULL;
+		region->in_use = false;
+		region->length = 0;
+		break;
+	}
+}
+
+/*
  * Coalesce every run of adjacent, identical records into one.
  *
  * Run after anything that changes the shape of the table.
@@ -2101,21 +2269,34 @@ static bool mm_regions_mergeable(const mmap_region_t *a, const mmap_region_t *b)
  */
 void mm_merge_mmap_regions(task_t *task)
 {
-	/* Slot indices, not pointers: a quarter of the stack footprint. */
-	uint16_t order[TASK_MAX_MMAP];
+	/* Slot indices, not pointers: a quarter of the footprint.
+	 *
+	 * On the heap, not the stack.  This was `uint16_t order[TASK_MAX_MMAP]'
+	 * back when the table was a fixed 512 entries; at the ceiling the table
+	 * now allows that is 127 KB of a 16 KB kernel stack, which is not a
+	 * near miss but an immediate overflow.  It is sized by what the task
+	 * actually has, so the ordinary case allocates a few hundred bytes. */
+	uint16_t *order;
 	int n = 0;
 
-	if (!task)
+	if (!task || !task->mmap_regions)
 		return;
 
 	BUILD_BUG_ON(TASK_MAX_MMAP > 0xFFFF);
 
-	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+	order = (uint16_t *)kalloc((size_t)task->mmap_capacity *
+				   sizeof(uint16_t));
+	if (!order)
+		return; /* Coalescing is an optimisation; skipping it is safe. */
+
+	for (uint32_t i = 0; i < task->mmap_capacity; i++) {
 		if (task->mmap_regions[i].in_use)
 			order[n++] = (uint16_t)i;
 	}
-	if (n < 2)
+	if (n < 2) {
+		kfree(order);
 		return;
+	}
 
 	/* Shell sort by start address: short, no recursion, no scratch, and
 	 * unbothered by whatever order the slots happen to have been handed
@@ -2171,6 +2352,8 @@ void mm_merge_mmap_regions(task_t *task)
 			i = j;
 		}
 	}
+
+	kfree(order);
 }
 
 /*
@@ -3980,7 +4163,7 @@ static int mm_demand_fault_locked(uint64_t fault_addr, int from_kernel_mode)
 			    PAGE_NO_EXECUTE;
 		found = 1;
 	} else {
-		for (int i = 0; i < TASK_MAX_MMAP; i++) {
+		for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
 			mmap_region_t *r = &mm->mmap_regions[i];
 			if (!r->in_use || !r->lazy)
 				continue;

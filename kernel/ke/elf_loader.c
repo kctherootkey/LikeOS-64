@@ -914,7 +914,7 @@ uint64_t elf_exec_replace(const char *path, char *const argv[],
 	cur->user_stack_top = USER_STACK_TOP_EXEC;
 	/* Clear stale mmap_region slots inherited from parent via fork+exec,
 	 * releasing any file references pinned for demand paging. */
-	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+	for (uint32_t i = 0; i < cur->mmap_capacity; i++) {
 		if (cur->mmap_regions[i].in_use && cur->mmap_regions[i].file)
 			vfs_close(cur->mmap_regions[i].file);
 		cur->mmap_regions[i].file = NULL;

@@ -1148,7 +1148,7 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 		mmap_region_t *regions = cur->mmap_regions;
 		int shown = 0;
 
-		for (int i = 0; i < TASK_MAX_MMAP; i++) {
+		for (uint32_t i = 0; i < cur->mmap_capacity; i++) {
 			mmap_region_t *r = &regions[i];
 			if (!r->in_use)
 				continue;
@@ -1223,7 +1223,7 @@ static void report_userspace_crash_detailed(task_t *cur, uint64_t *regs,
 
 				if ((v >> 47) != 0 || v < 0x1000)
 					continue;
-				for (int r = 0; r < TASK_MAX_MMAP; r++) {
+				for (uint32_t r = 0; r < cur->mmap_capacity; r++) {
 					mmap_region_t *reg =
 						&cur->mmap_regions[r];
 

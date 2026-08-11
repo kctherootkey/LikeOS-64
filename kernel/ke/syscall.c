@@ -4383,7 +4383,7 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		int n_file = 0, n_anon = 0, n_lazy = 0;
 		uint64_t anon_bytes = 0;
 
-		for (int i = 0; i < TASK_MAX_MMAP; i++) {
+		for (uint32_t i = 0; i < cur->mmap_capacity; i++) {
 			mmap_region_t *r = &cur->mmap_regions[i];
 
 			if (!r->in_use)
@@ -4539,6 +4539,7 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 			region->device_phys =
 				shm_page_phys(sobj, offset / PAGE_SIZE);
 			region->in_use = true;
+			mm_merge_region_neighbours(cur, region);
 			return (int64_t)vaddr;
 		}
 	}
@@ -4579,6 +4580,7 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		region->device = true;
 		region->device_phys = dev_phys;
 		region->in_use = true;
+		mm_merge_region_neighbours(cur, region);
 		return (int64_t)vaddr;
 	}
 
@@ -4612,6 +4614,7 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 		region->lazy = true;
 		region->file = backing;
 		region->in_use = true;
+		mm_merge_region_neighbours(cur, region);
 		return (int64_t)vaddr;
 	}
 
@@ -4679,6 +4682,7 @@ static int64_t sys_mmap_locked(uint64_t addr, uint64_t length, uint64_t prot,
 	region->lazy = false;
 	region->file = NULL;
 	region->in_use = true;
+	mm_merge_region_neighbours(cur, region);
 
 	return (int64_t)vaddr;
 }
@@ -6413,6 +6417,19 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	// Initialize child from parent
 	mm_memcpy(child, cur, sizeof(task_t));
 
+	/* The copy above duplicated the POINTER to the parent's region table,
+	 * not the table.  A CLONE_VM thread gets an empty one of its own --
+	 * its bookkeeping is owner-routed to the group leader and it must hold
+	 * no references of its own -- while a fork child gets a copy of the
+	 * parent's.  Sharing the pointer would have the two free one
+	 * allocation twice. */
+	if (share_vm ? !mm_regions_init(child) :
+		       !mm_regions_clone(child, cur)) {
+		mm_free_guarded_kstack(k_stack_mem, KERNEL_STACK_SIZE);
+		kfree(child);
+		return -ENOMEM;
+	}
+
 	/* Fresh kernel-stack canary — same rationale as sched_fork_current:
 	 * the wholesale copy duplicated the parent's canary; the child's only
 	 * kernel context is the hand-built fork_child_return frame, so no live
@@ -6426,7 +6443,7 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	 * leader) and must NOT take references — the leader-only release at
 	 * exit would not balance them. */
 	if (!share_vm) {
-		for (int i = 0; i < TASK_MAX_MMAP; i++) {
+		for (uint32_t i = 0; i < child->mmap_capacity; i++) {
 			if (child->mmap_regions[i].in_use &&
 			    child->mmap_regions[i].file)
 				vfs_incref(child->mmap_regions[i].file);
@@ -6711,12 +6728,8 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
 	child->robust_list = NULL;
 	child->robust_list_len = 0;
 
-	// Copy mmap regions (if not sharing VM)
-	if (!share_vm) {
-		for (int i = 0; i < TASK_MAX_MMAP; i++) {
-			child->mmap_regions[i] = cur->mmap_regions[i];
-		}
-	}
+	/* The region table was given to the child by mm_regions_clone() right
+	 * after the task_t copy, which is the only place it can be done. */
 
 	// Assign child to parent's CPU (same rationale as sched_fork_current)
 	child->on_cpu = cur->on_cpu;
@@ -7566,7 +7579,7 @@ static int64_t sys_mprotect_locked(uint64_t addr, uint64_t len, uint64_t prot)
 	 * supported, same granularity policy as munmap). */
 	{
 		task_t *mm = task_mm_owner(cur);
-		for (int i = 0; i < TASK_MAX_MMAP; i++) {
+		for (uint32_t i = 0; i < mm->mmap_capacity; i++) {
 			mmap_region_t *r = &mm->mmap_regions[i];
 			if (!r->in_use)
 				continue;
@@ -7815,7 +7828,7 @@ static int64_t sys_getprocinfo(uint64_t buf_ptr, uint64_t max_count)
 			// User stack (assume 2MB)
 			p->vsz += 2 * 1024 * 1024;
 			// mmap regions
-			for (int i = 0; i < TASK_MAX_MMAP; i++) {
+			for (uint32_t i = 0; i < t->mmap_capacity; i++) {
 				if (t->mmap_regions[i].in_use)
 					p->vsz += t->mmap_regions[i].length;
 			}

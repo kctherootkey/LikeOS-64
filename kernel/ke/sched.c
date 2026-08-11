@@ -341,7 +341,7 @@ static void task_close_open_files(task_t *task)
 		if (owner->nr_threads != 0)
 			return;
 
-		for (int i = 0; i < TASK_MAX_MMAP; i++) {
+		for (uint32_t i = 0; i < owner->mmap_capacity; i++) {
 			mmap_region_t *r = &owner->mmap_regions[i];
 			vfs_file_t *f = NULL;
 
@@ -1244,8 +1244,12 @@ static void task_init_common(task_t *t)
 	t->brk_start = 0;
 	t->brk = 0;
 	t->mmap_base = 0;
-	for (int i = 0; i < TASK_MAX_MMAP; i++)
-		t->mmap_regions[i].in_use = false;
+	/* The table is allocated, not inlined, so it starts empty by
+	 * construction.  A task that cannot get one still runs: the first
+	 * mmap() retries the allocation and fails with ENOMEM if it cannot. */
+	t->mmap_regions = NULL;
+	t->mmap_capacity = 0;
+	mm_regions_init(t);
 	/* One address-space lock per task_t; only the group leader's is ever
 	 * taken (see task_mm_owner), but every task_t carries an initialised
 	 * one so a thread that is later promoted to leader has a valid lock. */
@@ -2565,6 +2569,10 @@ void sched_remove_task(task_t *task)
 		}
 	}
 
+	/* The region table is a separate allocation now, and every task owns
+	 * one -- including a thread's empty one.  Released here, with the
+	 * task_t it belongs to. */
+	mm_regions_free(task);
 	kfree(task);
 }
 
@@ -2578,7 +2586,7 @@ int task_register_lazy_region(task_t *task, uint64_t start, uint64_t length,
 {
 	if (!task || !length)
 		return -1;
-	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+	for (uint32_t i = 0; i < task->mmap_capacity; i++) {
 		mmap_region_t *r = &task->mmap_regions[i];
 		if (r->in_use)
 			continue;
@@ -2616,7 +2624,7 @@ task_t *sched_fork_current(void)
 	 * a local array here would put TASK_MAX_MMAP * 2 uint64s on a 16 KB
 	 * kernel stack, which does not survive a large TASK_MAX_MMAP. */
 	bool has_shared = false;
-	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+	for (uint32_t i = 0; i < cur->mmap_capacity; i++) {
 		if (cur->mmap_regions[i].in_use &&
 		    (cur->mmap_regions[i].flags & MAP_SHARED)) {
 			has_shared = true;
@@ -2637,7 +2645,7 @@ task_t *sched_fork_current(void)
 	mm_write_lock(&mm_owner->mmap_lock);
 	if (has_shared) {
 		child_pml4 = mm_clone_address_space_with_shared(
-			cur->pml4, cur->mmap_regions, TASK_MAX_MMAP);
+			cur->pml4, cur->mmap_regions, cur->mmap_capacity);
 	} else {
 		child_pml4 = mm_clone_address_space(cur->pml4);
 	}
@@ -2660,6 +2668,16 @@ task_t *sched_fork_current(void)
 	// Copy parent
 	mm_memcpy(child, cur, sizeof(task_t));
 
+	/* The copy above duplicated the POINTER to the parent's region table,
+	 * not the table.  Give the child its own with the parent's contents --
+	 * otherwise the two share one allocation and both free it. */
+	if (!mm_regions_clone(child, cur)) {
+		mm_free_guarded_kstack(k_stack_mem, KERNEL_STACK_SIZE);
+		mm_destroy_address_space(child_pml4);
+		kfree(child);
+		return NULL;
+	}
+
 	/* Fresh kernel-stack canary: the wholesale copy above duplicated the
 	 * parent's.  The child's kernel context is only the hand-built
 	 * fork_child_return frame (no live C frames carry the old value), so
@@ -2670,7 +2688,7 @@ task_t *sched_fork_current(void)
 	/* Demand paging: the child inherits the region table by value; each
 	 * file-backed region pins its backing file with a reference, so the
 	 * child needs its own. */
-	for (int i = 0; i < TASK_MAX_MMAP; i++) {
+	for (uint32_t i = 0; i < child->mmap_capacity; i++) {
 		if (child->mmap_regions[i].in_use &&
 		    child->mmap_regions[i].file)
 			vfs_incref(child->mmap_regions[i].file);
@@ -2811,10 +2829,8 @@ task_t *sched_fork_current(void)
 		}
 	}
 
-	// Copy mmap regions
-	for (int i = 0; i < TASK_MAX_MMAP; i++) {
-		child->mmap_regions[i] = cur->mmap_regions[i];
-	}
+	/* The region table was copied by mm_regions_clone() above, which had to
+	 * run immediately after the task_t copy; nothing to do here. */
 
 	// Add to global task list
 	uint64_t flags;
